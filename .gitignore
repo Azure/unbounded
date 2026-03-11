@@ -9,6 +9,7 @@ dist/
 
 # Developer Stuff
 hack/scratch
+tmp/
 
 # Kubernetes
 .kube/

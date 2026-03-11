@@ -1,0 +1,56 @@
+# Build stage
+FROM mcr.microsoft.com/azurelinux/base/core:3.0 AS builder
+
+# Install build dependencies
+RUN tdnf install -y \
+    build-essential \
+    golang \
+    make \
+    gcc \
+    git \
+    ca-certificates \
+    && tdnf clean all
+
+# Set up Go environment
+ENV CGO_ENABLED=1
+ENV GOPATH=/go
+ENV PATH=$PATH:/go/bin
+
+# Install gofumpt and golangci-lint for the build
+RUN go install mvdan.cc/gofumpt@latest && \
+    go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
+
+# Set working directory
+WORKDIR /src
+
+# Copy go mod files first for better caching
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy the rest of the source code
+COPY . .
+
+RUN make machina
+
+# Runtime stage
+FROM mcr.microsoft.com/azurelinux/base/core:3.0
+
+# Install runtime dependencies
+RUN tdnf install -y \
+    ca-certificates \
+    && tdnf clean all
+
+# Create unbounded directory
+RUN mkdir -p /unbounded/bin
+
+# Copy the built binaries from the builder stage
+COPY --from=builder /src/bin/machina /unbounded/bin/machina
+
+# Add unbounded bin to PATH
+ENV PATH="/unbounded/bin:${PATH}"
+
+# Set working directory
+WORKDIR /unbounded
+
+# Default entrypoint
+ENTRYPOINT ["/unbounded/bin/machina"]

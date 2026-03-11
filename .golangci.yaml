@@ -1,0 +1,103 @@
+version: "2"
+run:
+  # Lint code behind all build tags used as well.
+  build-tags:
+    - int
+    - integrationtest
+  # With default 1m timeout CI sometimes fails.
+  timeout: 5m
+linters:
+  disable:
+    # Unlikely to ever Enable
+    # =======================
+
+    # Measures a subjective "cognitive complexity" of functions. Highly subjective
+    # and likely to cause people to write silly code to avoid the linter.
+    - gocognit
+
+    # We use replace directives extensively for well-understood reasons.
+    - gomoddirectives
+  settings:
+    errcheck:
+      # Treat type assertion as erroneous operation, though assertions should be avoided in general.
+      check-type-assertions: true
+      # Don't allow assigning an error to '_' identifier to avoid error checking.
+      check-blank: true
+    godot:
+      period: true
+
+      # too strict, makes documenting unexported stuff annoying as devs usually start them with a lowercase
+      # like "frobNob is ..."
+      capital: false
+    godox:
+      keywords:
+        - "BAD"
+        - "BUG"
+        - "FIX"
+        - "FIXME"
+        - "HACK"
+        - "TODO"
+    govet:
+      # In most cases we do not care about the slowdown caused by misaligned fields and having them e.g. grouped is
+      # better for readability.
+      disable:
+        - fieldalignment
+      # Ensure also optional linters are enabled in Vet to provide extra consistency.
+      enable-all: true
+    nolintlint:
+      # Disabling linters should be justified to make sure the problem cannot actually be resolved.
+      require-explanation: true
+      # Require explicitly specifying which linter is disabled to avoid hiding problems.
+      require-specific: true
+    varnamelen:
+      ignore-decls:
+        - t test.Context
+    wsl_v5:
+      # By default, force error checking to happen right after the erroneous statement.
+      allow-first-in-block: true
+      allow-whole-block: false
+      branch-max-lines: 2
+      enable:
+        - err 
+    generated: lax
+    rules:
+      # Allow shadowing 'err' variables as this is convention. Other shadowing should still be avoided.
+      - linters:
+          - govet
+        text: 'shadow: declaration of "err" shadows declaration at line'
+    paths:
+      - examples$
+      - hack/scratch
+
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - gocyclo
+          - errcheck
+          - dupl
+          - gosec
+
+issues:
+  # Always show all issues found for stable output and to make it easier to go over them.
+  max-issues-per-linter: 0
+  max-same-issues: 0
+formatters:
+  enable:
+    - gofmt
+    - gofumpt
+    - goimports
+  settings:
+    gci:
+      # Configure name of internal metrics which should be imported as a 3rd group, which is a common pattern.
+      sections:
+        - standard
+        - default
+    gofumpt:
+      # Enables only grouping of the arguments with the same type, the more consistency we can get, the better.
+      extra-rules: true
+  exclusions:
+    generated: lax
+    paths:
+      - examples$
+
