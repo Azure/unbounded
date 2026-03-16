@@ -6,12 +6,22 @@ GOTEST=$(GOCMD) test
 GOMOD=$(GOCMD) mod
 GOLINT=golangci-lint run -c .golangci.yaml
 
+FORGE_BIN=bin/forge
+FORGE_CMD=./hack/cmd/forge
+
 MACHINA_BIN=bin/machina
 MACHINA_CMD=./cmd/machina
 MACHINA_TAG ?= latest
 MACHINA_REGISTRY=stargatetmedev.azurecr.io
 MACHINA_IMAGE=$(MACHINA_REGISTRY)/machina:$(MACHINA_TAG)
 CONTAINER_ENGINE ?= podman
+
+forge:
+	$(GOFMT) -w $(FORGE_CMD)
+	$(GOLINT) --fix -E wsl_v5 $(FORGE_CMD)/...
+	$(GOLINT) $(FORGE_CMD)/...
+	$(GOTEST) $(FORGE_CMD)/...
+	$(GOBUILD) -o $(FORGE_BIN) $(FORGE_CMD)/main.go
 
 machina:
 	$(GOFMT) -w $(MACHINA_CMD)

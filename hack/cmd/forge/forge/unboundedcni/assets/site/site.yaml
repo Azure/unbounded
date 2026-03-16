@@ -1,0 +1,15 @@
+---
+apiVersion: unbounded.aks.azure.com/v1alpha1
+kind: Site
+metadata:
+  name: "{{ .SiteName }}"
+spec:
+  nodeCidrs:
+  {{- range .NodeCIDRs }}
+    - {{ . }}
+  {{- end }}
+  podCidrAssignments:
+    - cidrBlocks:
+      {{- range .PodCIDRs }}
+        - {{ . }}
+      {{- end }}

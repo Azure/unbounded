@@ -59,24 +59,23 @@ linters:
       branch-max-lines: 2
       enable:
         - err 
+
+  exclusions:
     generated: lax
     rules:
       # Allow shadowing 'err' variables as this is convention. Other shadowing should still be avoided.
       - linters:
           - govet
         text: 'shadow: declaration of "err" shadows declaration at line'
-    paths:
-      - examples$
-      - hack/scratch
-
-  exclusions:
-    rules:
       - path: _test\.go
         linters:
           - gocyclo
           - errcheck
           - dupl
           - gosec
+    paths:
+      - examples$
+      - hack/scratch
 
 issues:
   # Always show all issues found for stable output and to make it easier to go over them.

@@ -1,0 +1,12 @@
+---
+apiVersion: unbounded.aks.azure.com/v1alpha1
+kind: SiteGatewayPoolAssignment
+metadata:
+  name: "{{ .SiteName }}"
+spec:
+  sites:
+  {{- range .SiteNames }}
+    - {{ . }}
+  {{- end }}
+  gatewayPools:
+    - "{{ .GatewayPoolName }}"

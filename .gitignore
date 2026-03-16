@@ -39,3 +39,6 @@ vendor/
 # OS generated
 .DS_Store
 Thumbs.db
+
+# AI Tools
+.opencode
