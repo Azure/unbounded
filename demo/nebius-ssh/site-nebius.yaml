@@ -1,0 +1,14 @@
+apiVersion: unbounded.aks.azure.com/v1alpha1
+kind: Site
+metadata:
+  name: site-nebius
+spec:
+  nodeCidrs:
+    - 172.20.0.0/16
+  podCidrAssignments:
+    - assignmentEnabled: true
+      cidrBlocks:
+        - 10.200.0.0/16
+      nodeBlockSizes:
+        ipv4: 24
+      priority: 100

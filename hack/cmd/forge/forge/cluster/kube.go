@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -17,7 +18,7 @@ func applyBootstrapToken(ctx context.Context, logger *slog.Logger, kubeCli kuber
 	logger.Info("Checking for existing bootstrap token", "forge", forgeName)
 
 	existingToken, err := kube.GetBootstrapToken(ctx, kubeCli)
-	if err != nil {
+	if err != nil && !errors.Is(err, kube.ErrBootstrapTokenNotFound) {
 		return nil, fmt.Errorf("get existing bootstrap token: %w", err)
 	}
 

@@ -125,9 +125,12 @@ func addSiteCmd(siteCmdContext *siteCommandContext, site *azuredev.Datacenter) *
 
 func addPoolCmd(siteCmdContext *siteCommandContext, site *azuredev.Datacenter) *cobra.Command {
 	mp := azuredev.MachinePool{
-		Count:      2,
-		Size:       "standard_d2ads_v6",
-		SSHKeyPair: &infra.SSHKeyPair{},
+		Count:             2,
+		Size:              "standard_d2ads_v6",
+		SSHKeyPair:        &infra.SSHKeyPair{},
+		BackendPort:       22,
+		FrontendPortStart: 22001,
+		FrontendPortEnd:   22999,
 	}
 
 	c := &cobra.Command{

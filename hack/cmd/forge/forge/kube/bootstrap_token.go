@@ -3,6 +3,7 @@ package kube
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"math/big"
 	"strings"
@@ -10,6 +11,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 )
+
+// ErrBootstrapTokenNotFound is returned by GetBootstrapToken when no matching
+// bootstrap token secret exists in the cluster.
+var ErrBootstrapTokenNotFound = errors.New("bootstrap token not found")
 
 const (
 	alphanumeric = "abcdefghijklmnopqrstuvwxyz0123456789"
@@ -55,7 +60,7 @@ func GetBootstrapToken(ctx context.Context, kubeCli kubernetes.Interface) (*Boot
 		}
 	}
 
-	return nil, fmt.Errorf("bootstrap token not found")
+	return nil, ErrBootstrapTokenNotFound
 }
 
 func GenerateBootstrapIDAndToken() (string, string, error) {
