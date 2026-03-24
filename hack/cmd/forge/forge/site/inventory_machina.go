@@ -6,7 +6,7 @@ import (
 	"regexp"
 	"strings"
 
-	machinav1alpha3 "github.com/project-unbounded/unbounded-kube/cmd/machina/machina/api/v1alpha3"
+	machinav1alpha3 "github.com/project-unbounded/unbounded-kube/api/v1alpha3"
 	"github.com/project-unbounded/unbounded-kube/hack/cmd/forge/forge/site/azuredev"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/yaml"

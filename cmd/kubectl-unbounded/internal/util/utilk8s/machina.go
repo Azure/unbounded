@@ -8,7 +8,7 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	unboundedv1alpha3 "github.com/project-unbounded/unbounded-kube/cmd/machina/machina/api/v1alpha3"
+	unboundedv1alpha3 "github.com/project-unbounded/unbounded-kube/api/v1alpha3"
 )
 
 var scheme = runtime.NewScheme()

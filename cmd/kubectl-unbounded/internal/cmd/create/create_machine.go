@@ -14,9 +14,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/yaml"
 
+	unboundedv1alpha3 "github.com/project-unbounded/unbounded-kube/api/v1alpha3"
 	"github.com/project-unbounded/unbounded-kube/cmd/kubectl-unbounded/internal/defaults"
 	"github.com/project-unbounded/unbounded-kube/cmd/kubectl-unbounded/internal/util/utilk8s"
-	unboundedv1alpha3 "github.com/project-unbounded/unbounded-kube/cmd/machina/machina/api/v1alpha3"
 )
 
 type CreateMachineOptions struct {

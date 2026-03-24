@@ -3,7 +3,7 @@
 package v1alpha3
 
 //go:generate controller-gen object paths=.
-//go:generate controller-gen crd paths=. output:crd:dir=../../../../../deploy/machina/crd
+//go:generate controller-gen crd paths=. output:crd:dir=../../deploy/machina/crd
 
 import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
