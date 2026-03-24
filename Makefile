@@ -19,7 +19,9 @@ MACHINA_REGISTRY=stargatetmedev.azurecr.io
 MACHINA_IMAGE=$(MACHINA_REGISTRY)/machina:$(MACHINA_TAG)
 CONTAINER_ENGINE ?= podman
 
-.PHONY: fmt lint test kubectl-unbounded forge machina machina-oci machina-oci-push gomod
+.PHONY: all fmt lint test kubectl-unbounded forge machina machina-oci machina-oci-push gomod
+
+all: kubectl-unbounded forge machina
 
 fmt:
 	$(GOFMT) -w .
