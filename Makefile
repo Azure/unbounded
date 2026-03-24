@@ -6,6 +6,9 @@ GOTEST=$(GOCMD) test
 GOMOD=$(GOCMD) mod
 GOLINT=golangci-lint run -c .golangci.yaml
 
+KUBECTL_UNBOUNDED_BIN=bin/kubectl-unbounded
+KUBECTL_UNBOUNDED_CMD=./cmd/kubectl-unbounded
+
 FORGE_BIN=bin/forge
 FORGE_CMD=./hack/cmd/forge
 
@@ -16,18 +19,25 @@ MACHINA_REGISTRY=stargatetmedev.azurecr.io
 MACHINA_IMAGE=$(MACHINA_REGISTRY)/machina:$(MACHINA_TAG)
 CONTAINER_ENGINE ?= podman
 
-forge:
-	$(GOFMT) -w $(FORGE_CMD)
-	$(GOLINT) --fix -E wsl_v5 $(FORGE_CMD)/...
-	$(GOLINT) $(FORGE_CMD)/...
-	$(GOTEST) $(FORGE_CMD)/...
+.PHONY: fmt lint test kubectl-unbounded forge machina machina-oci machina-oci-push gomod
+
+fmt:
+	$(GOFMT) -w .
+
+lint: fmt
+	$(GOLINT) --fix -E wsl_v5 ./...
+	$(GOLINT) ./...
+
+test: lint
+	$(GOTEST) ./...
+
+kubectl-unbounded: test
+	$(GOBUILD) -o $(KUBECTL_UNBOUNDED_BIN) $(KUBECTL_UNBOUNDED_CMD)/main.go
+
+forge: test
 	$(GOBUILD) -o $(FORGE_BIN) $(FORGE_CMD)/main.go
 
-machina:
-	$(GOFMT) -w $(MACHINA_CMD)
-	$(GOLINT) --fix -E wsl_v5 $(MACHINA_CMD)/...
-	$(GOLINT) $(MACHINA_CMD)/...
-	$(GOTEST) $(MACHINA_CMD)/...
+machina: test
 	$(GOBUILD) -o $(MACHINA_BIN) $(MACHINA_CMD)/main.go
 
 machina-oci:

@@ -97,6 +97,7 @@ func RenderCNI(p Params) ([]byte, error) {
 	}
 
 	buf := &bytes.Buffer{}
+
 	for _, tmpl := range templates {
 		t, err := template.New(tmpl.name).Parse(tmpl.content)
 		if err != nil {
@@ -254,7 +255,7 @@ func applyResources(ctx context.Context, k8sClient client.Client, data []byte, o
 			return fmt.Errorf("applying %s %q: %w", obj.GetKind(), obj.GetName(), err)
 		}
 
-		fmt.Fprintf(out, "%s/%s applied\n", obj.GetKind(), obj.GetName())
+		fmt.Fprintf(out, "%s/%s applied\n", obj.GetKind(), obj.GetName()) //nolint:errcheck // Best-effort status message to stdout.
 	}
 
 	return nil

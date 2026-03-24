@@ -120,7 +120,7 @@ func ensureSSHKeySecret(ctx context.Context, configFlags *genericclioptions.Conf
 
 		_, err = clientset.CoreV1().Secrets(defaults.SSHSecretNamespace).Get(ctx, defaults.SSHSecretName, metav1.GetOptions{})
 		if err == nil {
-			fmt.Fprintf(streams.ErrOut, "SSH key secret %s/%s already exists, skipping generation\n",
+			fmt.Fprintf(streams.ErrOut, "SSH key secret %s/%s already exists, skipping generation\n", //nolint:errcheck // Best-effort status message to stderr.
 				defaults.SSHSecretNamespace, defaults.SSHSecretName)
 
 			return data, nil
@@ -134,7 +134,7 @@ func ensureSSHKeySecret(ctx context.Context, configFlags *genericclioptions.Conf
 			return nil, err
 		}
 
-		fmt.Fprintf(streams.ErrOut, "SSH private key imported from %s\n", sshPrivateKey)
+		fmt.Fprintf(streams.ErrOut, "SSH private key imported from %s\n", sshPrivateKey) //nolint:errcheck // Best-effort status message to stderr.
 
 		return append(data, sshData...), nil
 	}
@@ -155,7 +155,7 @@ func ensureSSHKeySecret(ctx context.Context, configFlags *genericclioptions.Conf
 		return nil, fmt.Errorf("writing public key to %s: %w", pubKeyFile, err)
 	}
 
-	fmt.Fprintf(streams.ErrOut, "SSH public key saved to %s\n", pubKeyFile)
+	fmt.Fprintf(streams.ErrOut, "SSH public key saved to %s\n", pubKeyFile) //nolint:errcheck // Best-effort status message to stderr.
 
 	return append(data, sshData...), nil
 }

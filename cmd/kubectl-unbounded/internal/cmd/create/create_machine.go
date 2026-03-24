@@ -77,7 +77,7 @@ func (opts *CreateMachineOptions) AddFlags(cmd *cobra.Command) {
 
 	flags.BoolVar(&opts.PrintOnly, "print-only", false, "If true, print the Machine YAML to stdout instead of creating it in the cluster")
 
-	cmd.MarkFlagRequired("host") //nolint:errcheck
+	cmd.MarkFlagRequired("host") //nolint:errcheck // Flag is defined just above; error is impossible.
 }
 
 func (opts *CreateMachineOptions) buildMachine(name string) *unboundedv1alpha3.Machine {
@@ -161,13 +161,15 @@ func (opts *CreateMachineOptions) resolveSSHSecret(ctx context.Context, clientse
 	}
 
 	if len(secrets.Items) == 0 {
-		fmt.Fprintf(errOut, "Warning: no default SSH secret found in %s (label %s=%s). "+
+		fmt.Fprintf(errOut, "Warning: no default SSH secret found in %s (label %s=%s). "+ //nolint:errcheck // Best-effort warning to stderr.
 			"Specify --ssh-secret-name or run 'kubectl unbounded setup' first.\n",
 			defaults.SSHSecretNamespace, defaults.LabelKeyDefaultSSHSecret, defaults.LabelValueDefaultSSHSecret)
+
 		return nil
 	}
 
 	opts.SSHSecretName = secrets.Items[0].Name
+
 	return nil
 }
 
@@ -185,13 +187,15 @@ func (opts *CreateMachineOptions) resolveBootstrapTokenSecret(ctx context.Contex
 	}
 
 	if len(secrets.Items) == 0 {
-		fmt.Fprintf(errOut, "Warning: no default bootstrap token secret found in kube-system (label %s=%s). "+
+		fmt.Fprintf(errOut, "Warning: no default bootstrap token secret found in kube-system (label %s=%s). "+ //nolint:errcheck // Best-effort warning to stderr.
 			"Specify --bootstrap-token-secret or run 'kubectl unbounded setup' first.\n",
 			defaults.LabelKeyDefaultBootstrapTokenSecret, defaults.LabelValueDefaultBootstrapTokenSecret)
+
 		return nil
 	}
 
 	opts.BootstrapTokenSecretName = secrets.Items[0].Name
+
 	return nil
 }
 
@@ -227,7 +231,9 @@ func (opts *CreateMachineOptions) Run(ctx context.Context, name string, streams 
 		if err != nil {
 			return fmt.Errorf("marshalling machine: %w", err)
 		}
+
 		_, err = streams.Out.Write(data)
+
 		return err
 	}
 
@@ -240,6 +246,7 @@ func (opts *CreateMachineOptions) Run(ctx context.Context, name string, streams 
 		return fmt.Errorf("creating machine %q: %w", name, err)
 	}
 
-	fmt.Fprintf(streams.Out, "machine/%s created\n", name)
+	fmt.Fprintf(streams.Out, "machine/%s created\n", name) //nolint:errcheck // Best-effort status message to stdout.
+
 	return nil
 }
