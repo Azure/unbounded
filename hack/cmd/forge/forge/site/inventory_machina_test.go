@@ -101,19 +101,17 @@ func TestWriteInventoryAsMachina(t *testing.T) {
 	// Should contain the document separator between the two machines.
 	require.Equal(t, 1, strings.Count(output, "---\n"))
 
-	// Spot-check apiVersion, kind, names, namespace, ip, port.
-	require.Contains(t, output, "apiVersion: machina.unboundedkube.io/v1alpha2")
+	// Spot-check apiVersion, kind, names, host.
+	require.Contains(t, output, "apiVersion: unbounded-kube.io/v1alpha3")
 	require.Contains(t, output, "kind: Machine")
 	require.Contains(t, output, "name: 20.48.100.5-50001")
 	require.Contains(t, output, "name: 20.48.100.5-50002")
-	require.Contains(t, output, "namespace: machina-system")
-	require.Contains(t, output, "ip: 20.48.100.5")
-	require.Contains(t, output, "port: 50001")
-	require.Contains(t, output, "port: 50002")
+	require.Contains(t, output, "host: 20.48.100.5:50001")
+	require.Contains(t, output, "host: 20.48.100.5:50002")
 
 	// Check vm-name annotations.
-	require.Contains(t, output, "forge.unboundedkube.io/vm-name: vmss_0")
-	require.Contains(t, output, "forge.unboundedkube.io/vm-name: vmss_1")
+	require.Contains(t, output, "forge.unbounded-kube.io/vm-name: vmss_0")
+	require.Contains(t, output, "forge.unbounded-kube.io/vm-name: vmss_1")
 }
 
 func TestWriteInventoryAsMachina_Empty(t *testing.T) {
@@ -146,5 +144,5 @@ func TestWriteInventoryAsMachina_SingleMachine(t *testing.T) {
 	require.NotContains(t, buf.String(), "---")
 
 	// Check vm-name annotation.
-	require.Contains(t, buf.String(), "forge.unboundedkube.io/vm-name: vmss_0")
+	require.Contains(t, buf.String(), "forge.unbounded-kube.io/vm-name: vmss_0")
 }

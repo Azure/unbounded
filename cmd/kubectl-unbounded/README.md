@@ -7,31 +7,26 @@ nodes. Machines are bootstrapped over SSH using kubeadm.
 
 - A running Kubernetes cluster with the machina controller deployed
   (see `deploy/machina/`).
-- The Machine and MachineModel CRDs installed
-  (`kubectl apply -f deploy/machina/crd/`).
+- The Machine CRD installed (`kubectl apply -f deploy/machina/crd/`).
 - SSH access from the controller pod to the target machines (directly or
-  through a jumpbox).
+  through a bastion host).
 
 ## Quick Start
 
-The typical workflow has three steps: **setup** the cluster, **create a
-MachineModel**, then **create Machines**.
+The typical workflow has two steps: **setup** the cluster, then **create
+Machines**.
 
 ```bash
 # 1. Prepare the cluster (RBAC, kubeadm configs, bootstrap token, SSH key)
 kubectl unbounded setup
 
-# 2. Create a machine model (defines how machines are provisioned)
-kubectl unbounded create machinemodel mymodel --ssh-username azureuser
-
-# 3. Add machines — each one will be bootstrapped as a node via SSH
+# 2. Add machines — each one will be bootstrapped as a node via SSH
 kubectl unbounded create worker-01 --host 10.0.0.5
 kubectl unbounded create worker-02 --host 10.0.0.6
 ```
 
-After step 3 the machina controller takes over: it probes each machine over
-TCP, SSHs in, runs the install script, and waits for the node to join the
-cluster.
+After step 2 the machina controller takes over: it probes each machine over
+SSH, runs the install script, and waits for the node to join the cluster.
 
 ## Commands
 
@@ -44,9 +39,9 @@ resources that enable `kubeadm join` on remote machines.
 
 By default, the command also generates an Ed25519 SSH key pair and stores it as
 a Secret in the `machina-system` namespace. The secret is labeled for
-auto-discovery by `kubectl unbounded create machinemodel`. Use `--no-ssh-key`
-to skip SSH key generation entirely, or `--ssh-private-key` to import an
-existing private key instead of generating a new one.
+auto-discovery by `kubectl unbounded create`. Use `--no-ssh-key` to skip SSH
+key generation entirely, or `--ssh-private-key` to import an existing private
+key instead of generating a new one.
 
 Resources created:
 
@@ -55,10 +50,10 @@ Resources created:
 - ConfigMaps `cluster-info` (kube-public), `kubeadm-config` and `kubelet-config`
   (kube-system).
 - A `bootstrap.kubernetes.io/token` Secret in kube-system, labeled
-  `unbounded.project-unbounded.io/default-bootstrap-token=true` for
+   `unbounded-kube.io/default-bootstrap-token=true` for
   auto-discovery by subsequent commands.
 - An SSH key Secret `machina-ssh` in `machina-system`, labeled
-  `unbounded.project-unbounded.io/default-ssh-secret=true` for auto-discovery
+   `unbounded-kube.io/default-ssh-secret=true` for auto-discovery
   (unless `--no-ssh-key` is specified).
 
 ```bash
@@ -73,58 +68,34 @@ Use `kubectl unbounded setup --help` for the full list of flags.
 
 ---
 
-### `kubectl unbounded create machinemodel NAME`
+### `kubectl unbounded create NAME --host HOST`
 
-Creates a MachineModel resource that defines SSH credentials, an agent install
-script, and Kubernetes provisioning settings. Multiple machines can reference
-the same model.
+Creates a Machine resource with all SSH credentials, bastion configuration,
+and Kubernetes settings inlined. The machina controller then takes over:
+
+1. **Pending** — Probes the machine over SSH until it is reachable.
+2. **Provisioning** — The controller SSHs in (optionally through the bastion),
+   copies the install script, and executes it with `sudo -E bash`.
+3. **Joining** — Script succeeded. The controller waits for a Node with
+   `unbounded-kube.io/machine=<name>` to appear.
+4. **Ready** — Node exists. The machine is now a cluster member.
 
 The command auto-discovers two secrets by well-known labels so you don't have
 to specify them explicitly:
 
 - **SSH key secret** — looked up in `machina-system` by label
-  `unbounded.project-unbounded.io/default-ssh-secret=true` (created
+   `unbounded-kube.io/default-ssh-secret=true` (created
   automatically by `kubectl unbounded setup`).
 - **Bootstrap token secret** — looked up in `kube-system` by label
-  `unbounded.project-unbounded.io/default-bootstrap-token=true` (created
+   `unbounded-kube.io/default-bootstrap-token=true` (created
   automatically by `kubectl unbounded setup`).
 
 If neither secret is found, the command prints a warning and continues.
 
-If no install script is provided via `--agent-install-script` or
-`--agent-install-script-file`, the built-in AKS Flex Node install script is
-used as the default.
-
-```bash
-kubectl unbounded create machinemodel mymodel --ssh-username azureuser
-kubectl unbounded create machinemodel mymodel --ssh-username ubuntu --agent-install-script-file ./my-install.sh
-kubectl unbounded create machinemodel mymodel --ssh-username azureuser --print-only
-```
-
-Use `kubectl unbounded create machinemodel --help` for the full list of flags.
-
----
-
-### `kubectl unbounded create NAME --host HOST`
-
-Creates a Machine resource. The machina controller then takes over:
-
-1. **Pending** — Probes the machine over TCP until it is reachable.
-2. **Ready** — Machine is reachable. If a model is referenced, provisioning
-   begins.
-3. **Provisioning** — The controller SSHs in (optionally through the model's
-   jumpbox), copies the install script, and executes it with `sudo -E bash`.
-4. **Provisioned** — Script succeeded. The controller waits for a Node with
-   label `machina.project-unbounded.io/machine=<name>` to appear.
-5. **Joined** — Node exists. The machine is now a cluster member.
-
-If `--model` is omitted, the command auto-resolves the first available
-MachineModel in the cluster.
-
 ```bash
 kubectl unbounded create worker-01 --host 10.0.0.5
 kubectl unbounded create worker-02 --host 10.0.0.6 --port 2222
-kubectl unbounded create worker-03 --host 10.0.0.7 --model mymodel
+kubectl unbounded create worker-03 --host 10.0.0.7 --ssh-username ubuntu
 kubectl unbounded create worker-01 --host 10.0.0.5 --print-only
 ```
 
@@ -141,20 +112,17 @@ kubectl unbounded setup
 # --- Step 2: Copy the generated public key to target machines ---
 kubectl get secret machina-ssh -n machina-system -o jsonpath='{.data.ssh-publickey}' | base64 -d
 
-# --- Step 3: Create a machine model ---
-kubectl unbounded create machinemodel default --ssh-username azureuser
-
-# --- Step 4: Create machines ---
+# --- Step 3: Create machines ---
 kubectl unbounded create vm-east-1 --host 10.0.1.10
 kubectl unbounded create vm-west-1 --host 10.0.2.20
 
-# --- Step 5: Watch progress ---
+# --- Step 4: Watch progress ---
 kubectl get machines -w
-# NAME        HOST        PORT  MODEL    PHASE         NODE         AGE
-# vm-east-1   10.0.1.10   22    default  Provisioning                2m
-# vm-west-1   10.0.2.20   22    default  Pending                     1m
-# vm-east-1   10.0.1.10   22    default  Joined        vm-east-1     5m
-# vm-west-1   10.0.2.20   22    default  Joined        vm-west-1     6m
+# NAME        HOST             PHASE          AGE
+# vm-east-1   10.0.1.10        Provisioning   2m
+# vm-west-1   10.0.2.20        Pending        1m
+# vm-east-1   10.0.1.10        Ready          5m
+# vm-west-1   10.0.2.20        Ready          6m
 ```
 
 ## `--print-only` Output Reference
@@ -279,7 +247,7 @@ metadata:
   namespace: kube-system
   name: bootstrap-token-a1b2c3
   labels:
-    unbounded.project-unbounded.io/default-bootstrap-token: "true"
+    unbounded-kube.io/default-bootstrap-token: "true"
 type: bootstrap.kubernetes.io/token
 stringData:
   auth-extra-groups: system:bootstrappers:kubeadm:default-node-token
@@ -292,42 +260,24 @@ stringData:
 </details>
 
 <details>
-<summary><code>kubectl unbounded create machinemodel mymodel --ssh-username azureuser --print-only</code></summary>
-
-```yaml
-apiVersion: machina.stargate.io/v1alpha2
-kind: MachineModel
-metadata:
-  name: mymodel
-spec:
-  sshUsername: azureuser
-  sshPrivateKeyRef:
-    name: machina-ssh
-  agentInstallScript: |
-    #!/usr/bin/env bash
-    ...                          # built-in AKS Flex Node install script
-  kubernetesProfile:
-    version: v1.34.0
-    bootstrapTokenRef:
-      name: bootstrap-token-a1b2c3
-```
-
-</details>
-
-<details>
 <summary><code>kubectl unbounded create worker-01 --host 10.0.0.5 --print-only</code></summary>
 
 ```yaml
-apiVersion: machina.stargate.io/v1alpha2
+apiVersion: unbounded-kube.io/v1alpha3
 kind: Machine
 metadata:
   name: worker-01
 spec:
   ssh:
-    host: 10.0.0.5
-    port: 22
-  modelRef:
-    name: mymodel
+    host: "10.0.0.5:22"
+    username: azureuser
+    privateKeyRef:
+      name: machina-ssh
+      key: ssh-privatekey
+  kubernetes:
+    version: v1.34.0
+    bootstrapTokenRef:
+      name: bootstrap-token-a1b2c3
 ```
 
 </details>

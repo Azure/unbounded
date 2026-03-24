@@ -8,17 +8,17 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	machinav1alpha2 "github.com/project-unbounded/unbounded-kube/cmd/machina/machina/api/v1alpha2"
+	unboundedv1alpha3 "github.com/project-unbounded/unbounded-kube/cmd/machina/machina/api/v1alpha3"
 )
 
 var scheme = runtime.NewScheme()
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
-	utilruntime.Must(machinav1alpha2.AddToScheme(scheme))
+	utilruntime.Must(unboundedv1alpha3.AddToScheme(scheme))
 }
 
-// NewClientFromCLIOpts creates a new Kubernetes client with the machina API scheme registered.
+// NewClientFromCLIOpts creates a new Kubernetes client with the unbounded API scheme registered.
 func NewClientFromCLIOpts(opts *genericclioptions.ConfigFlags) (client.Client, error) {
 	restConfig, err := opts.ToRESTConfig()
 	if err != nil {

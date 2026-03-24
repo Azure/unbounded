@@ -44,19 +44,15 @@ metadata:
   name: machina-controller
 rules:
   # Machine controller
-  - apiGroups: ["machina.unboundedkube.io"]
+  - apiGroups: ["unbounded-kube.io"]
     resources: ["machines"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  - apiGroups: ["machina.unboundedkube.io"]
+  - apiGroups: ["unbounded-kube.io"]
     resources: ["machines/status"]
     verbs: ["get", "update", "patch"]
-  - apiGroups: ["machina.unboundedkube.io"]
+  - apiGroups: ["unbounded-kube.io"]
     resources: ["machines/finalizers"]
     verbs: ["update"]
-  # MachineModel (read-only)
-  - apiGroups: ["machina.unboundedkube.io"]
-    resources: ["machinemodels"]
-    verbs: ["get", "list", "watch"]
   # Secrets (SSH keys, bootstrap tokens)
   - apiGroups: [""]
     resources: ["secrets"]

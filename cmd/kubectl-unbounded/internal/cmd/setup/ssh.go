@@ -22,8 +22,8 @@ import (
 
 // generateSSHKeySecret generates an Ed25519 SSH key pair and returns the
 // serialized YAML for a Secret in machina-system, labeled for auto-discovery
-// by "kubectl unbounded create machinemodel". It also returns the public key
-// in authorized_keys format so the caller can persist it locally.
+// by "kubectl unbounded create". It also returns the public key in
+// authorized_keys format so the caller can persist it locally.
 func generateSSHKeySecret() (secretYAML, pubKeyBytes []byte, err error) {
 	_, privKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {

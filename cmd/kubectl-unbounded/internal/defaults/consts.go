@@ -1,10 +1,10 @@
 package defaults
 
 const (
-	LabelKeyDefaultBootstrapTokenSecret   = "unbounded.project-unbounded.io/default-bootstrap-token"
+	LabelKeyDefaultBootstrapTokenSecret   = "unbounded-kube.io/default-bootstrap-token"
 	LabelValueDefaultBootstrapTokenSecret = "true"
 
-	LabelKeyDefaultSSHSecret   = "unbounded.project-unbounded.io/default-ssh-secret"
+	LabelKeyDefaultSSHSecret   = "unbounded-kube.io/default-ssh-secret"
 	LabelValueDefaultSSHSecret = "true"
 
 	// SSHSecretNamespace is the namespace where SSH secrets are stored.

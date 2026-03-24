@@ -110,7 +110,7 @@ metadata:
   namespace: kube-system
   name: bootstrap-token-{{ .TokenID }}
   labels:
-    unbounded.project-unbounded.io/default-bootstrap-token: "true"
+    unbounded-kube.io/default-bootstrap-token: "true"
 type: bootstrap.kubernetes.io/token
 stringData:
   auth-extra-groups: system:bootstrappers:kubeadm:default-node-token

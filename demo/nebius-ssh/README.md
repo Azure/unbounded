@@ -201,24 +201,14 @@ Use the generated public key from step 2 to create a VM on Nebius:
 
 Note the public IP from the output (e.g. `<NEBIUS_PUBLIC_IP>`).
 
-### Step 5: Create a MachineModel
+### Step 5: Create a Machine pointing to the Nebius VM
 
-Create a MachineModel with default settings. This auto-discovers the SSH key
-and bootstrap token secrets created by `setup`, and uses the built-in AKS Flex
-Node bootstrap script:
-
-```bash
-kubectl unbounded create machinemodel test-model --ssh-username ubuntu
-```
-
-### Step 6: Create a Machine pointing to the Nebius VM
-
-Create a Machine resource targeting the Nebius VM's public IP. The `--ssh-user`
+Create a Machine resource targeting the Nebius VM's public IP. The `--ssh-username`
 flag sets the SSH username for this specific machine (the Nebius default is
 `ubuntu`):
 
 ```bash
-kubectl unbounded create test1 --host <NEBIUS_PUBLIC_IP>
+kubectl unbounded create test1 --host <NEBIUS_PUBLIC_IP> --ssh-username ubuntu
 ```
 
 The controller will probe the machine, SSH in, run the bootstrap script, and
@@ -226,7 +216,7 @@ wait for the node to join the cluster.
 
 ### Result
 
-Once the machine reaches the `Joined` phase, the Nebius VM appears as a
+Once the machine reaches the `Ready` phase, the Nebius VM appears as a
 Kubernetes node:
 
 ```
@@ -239,8 +229,8 @@ aks-system-28199687-vmss000002       Ready    <none>   103m   v1.34.2   172.16.1
 computeinstance-e00yyy3zge8n23pawz   Ready    <none>   8s     v1.34.2   172.20.0.34   <none>          Ubuntu 22.04.5 LTS   5.15.0-170-generic   containerd://2.0.4
 
 $ kubectl get machine
-NAME    HOST            PORT   MODEL        PHASE    NODE                                 AGE
-test1   <NEBIUS_PUBLIC_IP>   22     test-model   Joined   computeinstance-e00yyy3zge8n23pawz   18s
+NAME    HOST                 PHASE   AGE
+test1   <NEBIUS_PUBLIC_IP>   Ready   18s
 ```
 
 The Nebius VM (`computeinstance-e00yyy3zge8n23pawz`) is now a fully functional

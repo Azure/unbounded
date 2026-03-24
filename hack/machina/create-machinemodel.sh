@@ -1,48 +1,43 @@
 #!/usr/bin/env bash
 #
-# Creates a MachineModel custom resource along with its SSH private key Secret.
+# Creates an SSH private key Secret for use with Machine resources.
 #
 # Usage:
-#   hack/machina/create-machinemodel.sh <cluster-name> <model-name> -s <agent-install-script> -b <bootstrap-token-secret-name>
+#   hack/machina/create-machinemodel.sh <cluster-name> <secret-name> -b <bootstrap-token-secret-name>
 #
 # Example:
-#   hack/machina/create-machinemodel.sh dcdevy26w10r0 my-model \
-#     -s ./scripts/install.sh \
+#   hack/machina/create-machinemodel.sh dcdevy26w10r0 machina-ssh \
 #     -b bootstrap-token-abc123
 #
 # The script will:
-#   1. Create a Secret (named <model-name>-ssh) in machina-system from
+#   1. Create a Secret (named <secret-name>) in machina-system from
 #      ~/.stargate/<cluster-name>/ssh/id_rsa
-#   2. Apply a cluster-scoped MachineModel CR that references that Secret,
-#      embeds the agent install script, and sets up the kubernetesProfile
-#      with the given bootstrap token secret.
+#   2. Print an example Machine CR that references the Secret.
 #
 # Environment:
-#   SSH_USER      SSH username (default: stargate)
+#   SSH_USER      SSH username (default: azureuser)
 #
 set -euo pipefail
 
-SSH_USER="${SSH_USER:-stargate}"
+SSH_USER="${SSH_USER:-azureuser}"
 SECRET_NAMESPACE="machina-system"
 
 # ── Inputs ───────────────────────────────────────────────────────────────────
 CLUSTER_NAME="${1:-}"
-MODEL_NAME="${2:-}"
+SECRET_NAME="${2:-}"
 shift 2 2>/dev/null || true
 
-SCRIPT_PATH=""
 BOOTSTRAP_TOKEN_SECRET=""
 
-while getopts "s:b:" opt; do
+while getopts "b:" opt; do
   case "$opt" in
-    s) SCRIPT_PATH="$OPTARG" ;;
     b) BOOTSTRAP_TOKEN_SECRET="$OPTARG" ;;
     *) ;;
   esac
 done
 
-if [[ -z "$CLUSTER_NAME" || -z "$MODEL_NAME" || -z "$SCRIPT_PATH" || -z "$BOOTSTRAP_TOKEN_SECRET" ]]; then
-  echo "Usage: $(basename "$0") <cluster-name> <model-name> -s <agent-install-script> -b <bootstrap-token-secret-name>" >&2
+if [[ -z "$CLUSTER_NAME" || -z "$SECRET_NAME" ]]; then
+  echo "Usage: $(basename "$0") <cluster-name> <secret-name> [-b <bootstrap-token-secret-name>]" >&2
   exit 1
 fi
 
@@ -53,13 +48,6 @@ if [[ ! -f "$SSH_KEY_PATH" ]]; then
   exit 1
 fi
 
-if [[ ! -f "$SCRIPT_PATH" ]]; then
-  echo "Error: Agent install script not found at ${SCRIPT_PATH}" >&2
-  exit 1
-fi
-
-SECRET_NAME="${MODEL_NAME}-ssh"
-
 # ── Step 1: Create the SSH Secret ────────────────────────────────────────────
 echo "Creating Secret ${SECRET_NAME} in namespace ${SECRET_NAMESPACE}..."
 kubectl create secret generic "$SECRET_NAME" \
@@ -67,30 +55,31 @@ kubectl create secret generic "$SECRET_NAME" \
   --from-file=ssh-privatekey="$SSH_KEY_PATH" \
   --dry-run=client -o yaml | kubectl apply -f -
 
-# ── Step 2: Apply the MachineModel ──────────────────────────────────────────
-echo "Applying MachineModel ${MODEL_NAME}..."
-
-# Indent the script content by 4 spaces for YAML block scalar embedding.
-SCRIPT_CONTENT="$(sed 's/^/    /' "$SCRIPT_PATH")"
-
-cat <<EOF | kubectl apply -f -
-apiVersion: machina.unboundedkube.io/v1alpha2
-kind: MachineModel
-metadata:
-  name: ${MODEL_NAME}
-spec:
-  sshUsername: ${SSH_USER}
-  sshPrivateKeyRef:
-    name: ${SECRET_NAME}
-    key: ssh-privatekey
-  agentInstallScript: |
-${SCRIPT_CONTENT}
-  kubernetesProfile:
-    bootstrapTokenRef:
-      name: ${BOOTSTRAP_TOKEN_SECRET}
-EOF
-
+# ── Step 2: Print example Machine CR ────────────────────────────────────────
 echo ""
-echo "Done."
-echo "  Secret:       ${SECRET_NAMESPACE}/${SECRET_NAME}"
-echo "  MachineModel: ${MODEL_NAME}"
+echo "Done. Secret created: ${SECRET_NAMESPACE}/${SECRET_NAME}"
+echo ""
+echo "Example Machine CR referencing this secret:"
+echo ""
+
+BOOTSTRAP_BLOCK=""
+if [[ -n "$BOOTSTRAP_TOKEN_SECRET" ]]; then
+  BOOTSTRAP_BLOCK="  kubernetes:
+    bootstrapTokenRef:
+      name: ${BOOTSTRAP_TOKEN_SECRET}"
+fi
+
+cat <<EOF
+apiVersion: unbounded-kube.io/v1alpha3
+kind: Machine
+metadata:
+  name: <machine-name>
+spec:
+  ssh:
+    host: "<ip>:<port>"
+    username: ${SSH_USER}
+    privateKeyRef:
+      name: ${SECRET_NAME}
+      key: ssh-privatekey
+${BOOTSTRAP_BLOCK}
+EOF

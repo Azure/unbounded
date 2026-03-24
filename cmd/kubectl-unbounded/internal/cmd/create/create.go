@@ -9,26 +9,23 @@ import (
 
 const (
 	createExample = `
-	# Create a machine on host myserver:22
-	%[1]s create mymachine --host myserver --port 22
+	# Create a machine on host myserver (SSH port 22)
+	%[1]s create mymachine --host myserver
 
-	# Create a machine with custom model
-	%[1]s create mymachine --host myserver --port 22 --model mymodel
+	# Create a machine with a custom SSH port
+	%[1]s create mymachine --host myserver --port 2222
+
+	# Create a machine with SSH credentials and bootstrap config
+	%[1]s create mymachine --host myserver --ssh-username azureuser --ssh-secret-name my-ssh-key --bootstrap-token-secret my-token
+
+	# Create a machine with a bastion host
+	%[1]s create mymachine --host myserver --bastion-host bastion.example.com
+
+	# Create a machine with node labels
+	%[1]s create mymachine --host myserver --bootstrap-token-secret my-token --node-labels "env=prod,region=us-east"
 
 	# Print the machine YAML to stdout without creating it in the cluster
-	%[1]s create mymachine --host myserver --port 22 --print-only
-
-	# Create a machine model with default bootstrap settings
-	%[1]s create machinemodel mymodel
-
-	# Create a machine model with custom bootstrap settings
-	%[1]s create machinemodel mymodel --agent-install-script 'echo hello'
-
-	# Create a machine model with an install script loaded from a file
-	%[1]s create machinemodel mymodel --agent-install-script-file ./agent-install.sh
-
-	# Print the machine model YAML to stdout without creating it in the cluster
-	%[1]s create machinemodel mymodel --agent-install-script-file ./agent-install.sh --print-only
+	%[1]s create mymachine --host myserver --print-only
 `
 )
 
@@ -47,8 +44,6 @@ func New(streams genericiooptions.IOStreams) *cobra.Command {
 	}
 
 	opts.AddFlags(cmd)
-
-	cmd.AddCommand(createMachineModelCommand(streams))
 
 	return cmd
 }

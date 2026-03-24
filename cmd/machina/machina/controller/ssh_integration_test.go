@@ -21,12 +21,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	machinav1alpha2 "github.com/project-unbounded/unbounded-kube/cmd/machina/machina/api/v1alpha2"
+	unboundedv1alpha3 "github.com/project-unbounded/unbounded-kube/cmd/machina/machina/api/v1alpha3"
+	"github.com/project-unbounded/unbounded-kube/internal/provision"
 )
-
-// ---------------------------------------------------------------------------
-// In-process SSH test server
-// ---------------------------------------------------------------------------
 
 // sshTestServer is an in-process SSH server used for integration tests.
 type sshTestServer struct {
@@ -35,7 +32,6 @@ type sshTestServer struct {
 	host     string
 	port     int
 
-	// mu protects executedCommands and exitCode.
 	mu               sync.Mutex
 	executedCommands []sshExecutedCommand
 	exitCode         int
@@ -46,7 +42,6 @@ type sshExecutedCommand struct {
 	stdin   []byte
 }
 
-// newSSHTestServer creates and starts an in-process SSH server with no auth.
 func newSSHTestServer(t *testing.T) *sshTestServer {
 	t.Helper()
 
@@ -82,7 +77,6 @@ func newSSHTestServer(t *testing.T) *sshTestServer {
 	return srv
 }
 
-// newSSHTestServerWithAuth creates an SSH server requiring public key auth.
 func newSSHTestServerWithAuth(t *testing.T, authorizedKey ssh.PublicKey) *sshTestServer {
 	t.Helper()
 
@@ -201,9 +195,6 @@ func (s *sshTestServer) handleSession(t *testing.T, newChan ssh.NewChannel) {
 				_ = req.Reply(true, nil)
 			}
 
-			// Read all stdin from the client. The client will close the
-			// write side of the channel when its stdin buffer is drained,
-			// which causes io.Copy to return.
 			var stdinBuf bytes.Buffer
 
 			done := make(chan struct{})
@@ -214,7 +205,6 @@ func (s *sshTestServer) handleSession(t *testing.T, newChan ssh.NewChannel) {
 				close(done)
 			}()
 
-			// Wait for stdin EOF or timeout.
 			select {
 			case <-done:
 			case <-time.After(2 * time.Second):
@@ -307,10 +297,6 @@ func (s *sshTestServer) setExitCode(code int) {
 func (s *sshTestServer) address() string {
 	return fmt.Sprintf("%s:%d", s.host, s.port)
 }
-
-// ---------------------------------------------------------------------------
-// Helper: generate RSA key pair
-// ---------------------------------------------------------------------------
 
 func generateTestRSAKey(t *testing.T) (*rsa.PrivateKey, ssh.Signer) {
 	t.Helper()
@@ -417,18 +403,18 @@ func TestSSH_AuthRejectedWithWrongKey(t *testing.T) {
 	require.Error(t, err, "should fail with wrong key")
 }
 
-func TestSSH_JumpboxConnection(t *testing.T) {
+func TestSSH_BastionConnection(t *testing.T) {
 	t.Parallel()
 
 	targetSrv := newSSHTestServer(t)
-	jumpSrv := newSSHTestServer(t)
+	bastionSrv := newSSHTestServer(t)
 
-	jumpClient, err := ssh.Dial("tcp", jumpSrv.address(), noAuthClientConfig())
+	bastionClient, err := ssh.Dial("tcp", bastionSrv.address(), noAuthClientConfig())
 	require.NoError(t, err)
 
-	defer jumpClient.Close()
+	defer bastionClient.Close()
 
-	conn, err := jumpClient.Dial("tcp", targetSrv.address())
+	conn, err := bastionClient.Dial("tcp", targetSrv.address())
 	require.NoError(t, err)
 
 	ncc, chans, reqs, err := ssh.NewClientConn(conn, targetSrv.address(), noAuthClientConfig())
@@ -561,46 +547,34 @@ func TestProvisionMachine_EndToEnd(t *testing.T) {
 	_, signer := generateTestRSAKey(t)
 
 	s := runtime.NewScheme()
-	require.NoError(t, machinav1alpha2.AddToScheme(s))
+	require.NoError(t, unboundedv1alpha3.AddToScheme(s))
 	require.NoError(t, corev1.AddToScheme(s))
 
-	model := &machinav1alpha2.MachineModel{
+	machine := &unboundedv1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:       "test-model",
-			Generation: 1,
+			Name: "test-machine",
 		},
-		Spec: machinav1alpha2.MachineModelSpec{
-			SSHUsername: "testuser",
-			SSHPrivateKeyRef: machinav1alpha2.SecretKeySelector{
-				Name: "ssh-key-secret",
-				Key:  "ssh-privatekey",
+		Spec: unboundedv1alpha3.MachineSpec{
+			SSH: &unboundedv1alpha3.SSHSpec{
+				Host:     fmt.Sprintf("%s:%d", srv.host, srv.port),
+				Username: "testuser",
+				PrivateKeyRef: unboundedv1alpha3.SecretKeySelector{
+					Name: "ssh-key-secret",
+					Key:  "ssh-privatekey",
+				},
 			},
-			AgentInstallScript: "#!/bin/bash\necho provisioning",
-			KubernetesProfile: &machinav1alpha2.KubernetesProfile{
+			Kubernetes: &unboundedv1alpha3.KubernetesSpec{
 				Version: "1.34.0",
-				BootstrapTokenRef: machinav1alpha2.LocalObjectReference{
+				BootstrapTokenRef: unboundedv1alpha3.LocalObjectReference{
 					Name: "bootstrap-token-abc123",
 				},
 			},
 		},
 	}
 
-	machine := &machinav1alpha2.Machine{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "test-machine",
-		},
-		Spec: machinav1alpha2.MachineSpec{
-			SSH: machinav1alpha2.MachineSSHSpec{
-				Host: srv.host,
-				Port: int32(srv.port),
-			},
-			ModelRef: &machinav1alpha2.LocalObjectReference{Name: "test-model"},
-		},
-	}
-
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(s).
-		WithObjects(machine, model).
+		WithObjects(machine).
 		Build()
 
 	reconciler := &MachineReconciler{
@@ -617,7 +591,7 @@ func TestProvisionMachine_EndToEnd(t *testing.T) {
 
 	sshConfig := sshTestClientConfig(signer)
 
-	err := reconciler.provisionMachine(context.Background(), machine, model, sshConfig, "abc123.secret")
+	err := reconciler.provisionMachine(context.Background(), machine, sshConfig, "abc123.secret")
 	require.NoError(t, err)
 
 	commands := srv.getExecutedCommands()
@@ -627,7 +601,8 @@ func TestProvisionMachine_EndToEnd(t *testing.T) {
 	require.Contains(t, commands[0].command, "cat >")
 	require.Contains(t, commands[0].command, remoteScriptPath)
 	require.Contains(t, commands[0].command, "chmod +x")
-	require.Equal(t, "#!/bin/bash\necho provisioning", string(commands[0].stdin))
+	// The script content now comes from provision.AKSFlexInstallScript().
+	require.Equal(t, provision.AKSFlexInstallScript(), string(commands[0].stdin))
 
 	// Command 2: script execution with env vars.
 	require.Contains(t, commands[1].command, "sudo -E bash")
@@ -638,7 +613,7 @@ func TestProvisionMachine_EndToEnd(t *testing.T) {
 	require.Contains(t, commands[1].command, "abc123.secret")
 	require.Contains(t, commands[1].command, "CA_CERT_BASE64")
 	require.Contains(t, commands[1].command, "KUBE_VERSION")
-	require.Contains(t, commands[1].command, "v1.34.0") // Model overrides cluster version.
+	require.Contains(t, commands[1].command, "v1.34.0") // Machine spec overrides cluster version.
 	require.Contains(t, commands[1].command, "CLUSTER_DNS")
 	require.Contains(t, commands[1].command, "CLUSTER_RG")
 	require.Contains(t, commands[1].command, "MACHINA_MACHINE_NAME")
@@ -656,26 +631,21 @@ func TestProvisionMachine_CleanupAlwaysRuns(t *testing.T) {
 	_, signer := generateTestRSAKey(t)
 
 	s := runtime.NewScheme()
-	require.NoError(t, machinav1alpha2.AddToScheme(s))
+	require.NoError(t, unboundedv1alpha3.AddToScheme(s))
 	require.NoError(t, corev1.AddToScheme(s))
 
-	model := &machinav1alpha2.MachineModel{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-model", Generation: 1},
-		Spec: machinav1alpha2.MachineModelSpec{
-			SSHUsername:        "testuser",
-			SSHPrivateKeyRef:   machinav1alpha2.SecretKeySelector{Name: "ssh-key-secret"},
-			AgentInstallScript: "#!/bin/bash\nexit 1",
-		},
-	}
-
-	machine := &machinav1alpha2.Machine{
+	machine := &unboundedv1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-machine"},
-		Spec: machinav1alpha2.MachineSpec{
-			SSH: machinav1alpha2.MachineSSHSpec{Host: srv.host, Port: int32(srv.port)},
+		Spec: unboundedv1alpha3.MachineSpec{
+			SSH: &unboundedv1alpha3.SSHSpec{
+				Host:          fmt.Sprintf("%s:%d", srv.host, srv.port),
+				Username:      "testuser",
+				PrivateKeyRef: unboundedv1alpha3.SecretKeySelector{Name: "ssh-key-secret"},
+			},
 		},
 	}
 
-	fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, model).Build()
+	fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(machine).Build()
 
 	reconciler := &MachineReconciler{
 		Client:      fakeClient,
@@ -685,8 +655,7 @@ func TestProvisionMachine_CleanupAlwaysRuns(t *testing.T) {
 
 	sshConfig := sshTestClientConfig(signer)
 
-	// With exitCode=0 all commands succeed; we verify all 3 execute.
-	err := reconciler.provisionMachine(context.Background(), machine, model, sshConfig, "")
+	err := reconciler.provisionMachine(context.Background(), machine, sshConfig, "")
 	require.NoError(t, err)
 
 	commands := srv.getExecutedCommands()
@@ -702,26 +671,21 @@ func TestProvisionMachine_EnvVarsInCommand(t *testing.T) {
 	_, signer := generateTestRSAKey(t)
 
 	s := runtime.NewScheme()
-	require.NoError(t, machinav1alpha2.AddToScheme(s))
+	require.NoError(t, unboundedv1alpha3.AddToScheme(s))
 	require.NoError(t, corev1.AddToScheme(s))
 
-	model := &machinav1alpha2.MachineModel{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-model", Generation: 1},
-		Spec: machinav1alpha2.MachineModelSpec{
-			SSHUsername:        "testuser",
-			SSHPrivateKeyRef:   machinav1alpha2.SecretKeySelector{Name: "ssh-key-secret"},
-			AgentInstallScript: "#!/bin/bash\necho test",
-		},
-	}
-
-	machine := &machinav1alpha2.Machine{
+	machine := &unboundedv1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "my-special-machine"},
-		Spec: machinav1alpha2.MachineSpec{
-			SSH: machinav1alpha2.MachineSSHSpec{Host: srv.host, Port: int32(srv.port)},
+		Spec: unboundedv1alpha3.MachineSpec{
+			SSH: &unboundedv1alpha3.SSHSpec{
+				Host:          fmt.Sprintf("%s:%d", srv.host, srv.port),
+				Username:      "testuser",
+				PrivateKeyRef: unboundedv1alpha3.SecretKeySelector{Name: "ssh-key-secret"},
+			},
 		},
 	}
 
-	fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, model).Build()
+	fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(machine).Build()
 
 	reconciler := &MachineReconciler{
 		Client: fakeClient,
@@ -737,7 +701,7 @@ func TestProvisionMachine_EnvVarsInCommand(t *testing.T) {
 
 	sshConfig := sshTestClientConfig(signer)
 
-	err := reconciler.provisionMachine(context.Background(), machine, model, sshConfig, "tok123.secret456")
+	err := reconciler.provisionMachine(context.Background(), machine, sshConfig, "tok123.secret456")
 	require.NoError(t, err)
 
 	commands := srv.getExecutedCommands()
@@ -762,26 +726,21 @@ func TestProvisionMachine_NilClusterInfo(t *testing.T) {
 	_, signer := generateTestRSAKey(t)
 
 	s := runtime.NewScheme()
-	require.NoError(t, machinav1alpha2.AddToScheme(s))
+	require.NoError(t, unboundedv1alpha3.AddToScheme(s))
 	require.NoError(t, corev1.AddToScheme(s))
 
-	model := &machinav1alpha2.MachineModel{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-model", Generation: 1},
-		Spec: machinav1alpha2.MachineModelSpec{
-			SSHUsername:        "testuser",
-			SSHPrivateKeyRef:   machinav1alpha2.SecretKeySelector{Name: "ssh-key-secret"},
-			AgentInstallScript: "#!/bin/bash\necho test",
-		},
-	}
-
-	machine := &machinav1alpha2.Machine{
+	machine := &unboundedv1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-machine"},
-		Spec: machinav1alpha2.MachineSpec{
-			SSH: machinav1alpha2.MachineSSHSpec{Host: srv.host, Port: int32(srv.port)},
+		Spec: unboundedv1alpha3.MachineSpec{
+			SSH: &unboundedv1alpha3.SSHSpec{
+				Host:          fmt.Sprintf("%s:%d", srv.host, srv.port),
+				Username:      "testuser",
+				PrivateKeyRef: unboundedv1alpha3.SecretKeySelector{Name: "ssh-key-secret"},
+			},
 		},
 	}
 
-	fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, model).Build()
+	fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(machine).Build()
 
 	reconciler := &MachineReconciler{
 		Client:      fakeClient,
@@ -791,7 +750,7 @@ func TestProvisionMachine_NilClusterInfo(t *testing.T) {
 
 	sshConfig := sshTestClientConfig(signer)
 
-	err := reconciler.provisionMachine(context.Background(), machine, model, sshConfig, "")
+	err := reconciler.provisionMachine(context.Background(), machine, sshConfig, "")
 	require.NoError(t, err)
 
 	commands := srv.getExecutedCommands()
@@ -811,30 +770,25 @@ func TestProvisionMachine_KubeVersionPrefixing(t *testing.T) {
 	_, signer := generateTestRSAKey(t)
 
 	s := runtime.NewScheme()
-	require.NoError(t, machinav1alpha2.AddToScheme(s))
+	require.NoError(t, unboundedv1alpha3.AddToScheme(s))
 	require.NoError(t, corev1.AddToScheme(s))
 
-	model := &machinav1alpha2.MachineModel{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-model", Generation: 1},
-		Spec: machinav1alpha2.MachineModelSpec{
-			SSHUsername:        "testuser",
-			SSHPrivateKeyRef:   machinav1alpha2.SecretKeySelector{Name: "ssh-key-secret"},
-			AgentInstallScript: "#!/bin/bash\necho test",
-			KubernetesProfile: &machinav1alpha2.KubernetesProfile{
+	machine := &unboundedv1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-machine"},
+		Spec: unboundedv1alpha3.MachineSpec{
+			SSH: &unboundedv1alpha3.SSHSpec{
+				Host:          fmt.Sprintf("%s:%d", srv.host, srv.port),
+				Username:      "testuser",
+				PrivateKeyRef: unboundedv1alpha3.SecretKeySelector{Name: "ssh-key-secret"},
+			},
+			Kubernetes: &unboundedv1alpha3.KubernetesSpec{
 				Version:           "1.34.0",
-				BootstrapTokenRef: machinav1alpha2.LocalObjectReference{Name: "bt"},
+				BootstrapTokenRef: unboundedv1alpha3.LocalObjectReference{Name: "bt"},
 			},
 		},
 	}
 
-	machine := &machinav1alpha2.Machine{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-machine"},
-		Spec: machinav1alpha2.MachineSpec{
-			SSH: machinav1alpha2.MachineSSHSpec{Host: srv.host, Port: int32(srv.port)},
-		},
-	}
-
-	fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, model).Build()
+	fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(machine).Build()
 
 	reconciler := &MachineReconciler{
 		Client:      fakeClient,
@@ -843,7 +797,7 @@ func TestProvisionMachine_KubeVersionPrefixing(t *testing.T) {
 	}
 
 	sshConfig := sshTestClientConfig(signer)
-	err := reconciler.provisionMachine(context.Background(), machine, model, sshConfig, "")
+	err := reconciler.provisionMachine(context.Background(), machine, sshConfig, "")
 	require.NoError(t, err)
 
 	commands := srv.getExecutedCommands()
@@ -852,49 +806,52 @@ func TestProvisionMachine_KubeVersionPrefixing(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// dialViaJumpHost integration tests
+// dialViaBastion integration tests
 // ---------------------------------------------------------------------------
 
-func TestDialViaJumpHost_Integration(t *testing.T) {
+func TestDialViaBastion_Integration(t *testing.T) {
 	t.Parallel()
 
 	targetSrv := newSSHTestServer(t)
-	jumpSrv := newSSHTestServer(t)
+	bastionSrv := newSSHTestServer(t)
 
 	rsaKey, _ := generateTestRSAKey(t)
 	pemBytes := marshalPrivateKeyPEM(t, rsaKey)
 
 	s := runtime.NewScheme()
-	require.NoError(t, machinav1alpha2.AddToScheme(s))
+	require.NoError(t, unboundedv1alpha3.AddToScheme(s))
 	require.NoError(t, corev1.AddToScheme(s))
 
-	jumpKeySecret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "jump-key-secret", Namespace: "machina-system"},
+	bastionKeySecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "bastion-key-secret", Namespace: "machina-system"},
 		Data:       map[string][]byte{"ssh-privatekey": pemBytes},
 	}
 
-	fakeClient := fake.NewClientBuilder().
-		WithScheme(s).
-		WithObjects(jumpKeySecret).
-		Build()
-
-	model := &machinav1alpha2.MachineModel{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-model"},
-		Spec: machinav1alpha2.MachineModelSpec{
-			SSHUsername:        "testuser",
-			SSHPrivateKeyRef:   machinav1alpha2.SecretKeySelector{Name: "target-key-secret"},
-			AgentInstallScript: "#!/bin/bash\necho test",
-			Jumpbox: &machinav1alpha2.JumpboxConfig{
-				Host:        jumpSrv.host,
-				Port:        int32(jumpSrv.port),
-				SSHUsername: "jumpuser",
-				SSHPrivateKeyRef: &machinav1alpha2.SecretKeySelector{
-					Name: "jump-key-secret",
-					Key:  "ssh-privatekey",
+	machine := &unboundedv1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-machine"},
+		Spec: unboundedv1alpha3.MachineSpec{
+			SSH: &unboundedv1alpha3.SSHSpec{
+				Host:     fmt.Sprintf("%s:%d", targetSrv.host, targetSrv.port),
+				Username: "testuser",
+				PrivateKeyRef: unboundedv1alpha3.SecretKeySelector{
+					Name: "target-key-secret",
+				},
+				Bastion: &unboundedv1alpha3.BastionSSHSpec{
+					Host:     fmt.Sprintf("%s:%d", bastionSrv.host, bastionSrv.port),
+					Username: "bastionuser",
+					PrivateKeyRef: &unboundedv1alpha3.SecretKeySelector{
+						Name: "bastion-key-secret",
+						Key:  "ssh-privatekey",
+					},
 				},
 			},
 		},
 	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(bastionKeySecret).
+		Build()
 
 	reconciler := &MachineReconciler{
 		Client: fakeClient,
@@ -903,9 +860,9 @@ func TestDialViaJumpHost_Integration(t *testing.T) {
 
 	targetConfig := noAuthClientConfig()
 
-	sshClient, err := reconciler.dialViaJumpHost(
+	sshClient, err := reconciler.dialViaBastion(
 		context.Background(),
-		model,
+		machine,
 		targetSrv.address(),
 		targetConfig,
 	)
@@ -918,53 +875,55 @@ func TestDialViaJumpHost_Integration(t *testing.T) {
 
 	defer session.Close()
 
-	err = session.Run("echo via-jumpbox")
+	err = session.Run("echo via-bastion")
 	require.NoError(t, err)
 
 	commands := targetSrv.getExecutedCommands()
 	require.Len(t, commands, 1)
-	require.Equal(t, "echo via-jumpbox", commands[0].command)
+	require.Equal(t, "echo via-bastion", commands[0].command)
 }
 
-func TestDialViaJumpHost_FallsBackToModelKey(t *testing.T) {
+func TestDialViaBastion_FallsBackToMachineKey(t *testing.T) {
 	t.Parallel()
 
 	targetSrv := newSSHTestServer(t)
-	jumpSrv := newSSHTestServer(t)
+	bastionSrv := newSSHTestServer(t)
 
 	rsaKey, _ := generateTestRSAKey(t)
 	pemBytes := marshalPrivateKeyPEM(t, rsaKey)
 
 	s := runtime.NewScheme()
-	require.NoError(t, machinav1alpha2.AddToScheme(s))
+	require.NoError(t, unboundedv1alpha3.AddToScheme(s))
 	require.NoError(t, corev1.AddToScheme(s))
 
-	modelKeySecret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "model-key-secret", Namespace: "machina-system"},
+	machineKeySecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "machine-key-secret", Namespace: "machina-system"},
 		Data:       map[string][]byte{"ssh-privatekey": pemBytes},
+	}
+
+	// Bastion has no PrivateKeyRef — should fall back to machine's SSH key.
+	machine := &unboundedv1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-machine"},
+		Spec: unboundedv1alpha3.MachineSpec{
+			SSH: &unboundedv1alpha3.SSHSpec{
+				Host:     fmt.Sprintf("%s:%d", targetSrv.host, targetSrv.port),
+				Username: "testuser",
+				PrivateKeyRef: unboundedv1alpha3.SecretKeySelector{
+					Name: "machine-key-secret",
+					Key:  "ssh-privatekey",
+				},
+				Bastion: &unboundedv1alpha3.BastionSSHSpec{
+					Host:     fmt.Sprintf("%s:%d", bastionSrv.host, bastionSrv.port),
+					Username: "bastionuser",
+				},
+			},
+		},
 	}
 
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(s).
-		WithObjects(modelKeySecret).
+		WithObjects(machineKeySecret).
 		Build()
-
-	model := &machinav1alpha2.MachineModel{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-model"},
-		Spec: machinav1alpha2.MachineModelSpec{
-			SSHUsername: "testuser",
-			SSHPrivateKeyRef: machinav1alpha2.SecretKeySelector{
-				Name: "model-key-secret",
-				Key:  "ssh-privatekey",
-			},
-			AgentInstallScript: "#!/bin/bash\necho test",
-			Jumpbox: &machinav1alpha2.JumpboxConfig{
-				Host:        jumpSrv.host,
-				Port:        int32(jumpSrv.port),
-				SSHUsername: "jumpuser",
-			},
-		},
-	}
 
 	reconciler := &MachineReconciler{
 		Client: fakeClient,
@@ -973,9 +932,9 @@ func TestDialViaJumpHost_FallsBackToModelKey(t *testing.T) {
 
 	targetConfig := noAuthClientConfig()
 
-	sshClient, err := reconciler.dialViaJumpHost(
+	sshClient, err := reconciler.dialViaBastion(
 		context.Background(),
-		model,
+		machine,
 		targetSrv.address(),
 		targetConfig,
 	)
@@ -992,42 +951,44 @@ func TestDialViaJumpHost_FallsBackToModelKey(t *testing.T) {
 	require.NoError(t, err)
 }
 
-func TestDialViaJumpHost_DefaultPort(t *testing.T) {
+func TestDialViaBastion_DefaultPort(t *testing.T) {
 	t.Parallel()
 
 	rsaKey, _ := generateTestRSAKey(t)
 	pemBytes := marshalPrivateKeyPEM(t, rsaKey)
 
 	s := runtime.NewScheme()
-	require.NoError(t, machinav1alpha2.AddToScheme(s))
+	require.NoError(t, unboundedv1alpha3.AddToScheme(s))
 	require.NoError(t, corev1.AddToScheme(s))
 
-	jumpKeySecret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "jump-key-secret", Namespace: "machina-system"},
+	bastionKeySecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "bastion-key-secret", Namespace: "machina-system"},
 		Data:       map[string][]byte{"ssh-privatekey": pemBytes},
 	}
 
-	fakeClient := fake.NewClientBuilder().
-		WithScheme(s).
-		WithObjects(jumpKeySecret).
-		Build()
-
-	model := &machinav1alpha2.MachineModel{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-model"},
-		Spec: machinav1alpha2.MachineModelSpec{
-			SSHUsername:        "testuser",
-			SSHPrivateKeyRef:   machinav1alpha2.SecretKeySelector{Name: "key"},
-			AgentInstallScript: "echo test",
-			Jumpbox: &machinav1alpha2.JumpboxConfig{
-				Host: "127.0.0.1",
-				Port: 0,
-				SSHPrivateKeyRef: &machinav1alpha2.SecretKeySelector{
-					Name: "jump-key-secret",
-					Key:  "ssh-privatekey",
+	// Bastion host has no port — hostPort() should default to :22.
+	machine := &unboundedv1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-machine"},
+		Spec: unboundedv1alpha3.MachineSpec{
+			SSH: &unboundedv1alpha3.SSHSpec{
+				Host:          "127.0.0.1:9999",
+				Username:      "testuser",
+				PrivateKeyRef: unboundedv1alpha3.SecretKeySelector{Name: "key"},
+				Bastion: &unboundedv1alpha3.BastionSSHSpec{
+					Host: "127.0.0.1",
+					PrivateKeyRef: &unboundedv1alpha3.SecretKeySelector{
+						Name: "bastion-key-secret",
+						Key:  "ssh-privatekey",
+					},
 				},
 			},
 		},
 	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(bastionKeySecret).
+		Build()
 
 	reconciler := &MachineReconciler{
 		Client: fakeClient,
@@ -1040,12 +1001,12 @@ func TestDialViaJumpHost_DefaultPort(t *testing.T) {
 		Timeout:         1 * time.Second,
 	}
 
-	_, err := reconciler.dialViaJumpHost(
+	_, err := reconciler.dialViaBastion(
 		context.Background(),
-		model,
+		machine,
 		"127.0.0.1:9999",
 		targetConfig,
 	)
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "dial jumpbox")
+	require.Contains(t, err.Error(), "dial bastion")
 }

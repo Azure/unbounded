@@ -6,7 +6,7 @@ import (
 	"regexp"
 	"strings"
 
-	machinav1alpha1 "github.com/project-unbounded/unbounded-kube/cmd/machina/machina/api/v1alpha2"
+	machinav1alpha3 "github.com/project-unbounded/unbounded-kube/cmd/machina/machina/api/v1alpha3"
 	"github.com/project-unbounded/unbounded-kube/hack/cmd/forge/forge/site/azuredev"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/yaml"
@@ -51,21 +51,20 @@ func machinaNameFromInventory(m azuredev.Machine) string {
 // of machina Machine custom resources that can be applied with kubectl.
 func WriteInventoryAsMachina(w io.Writer, inventory *azuredev.Inventory) error {
 	for i, m := range inventory.Machines {
-		machine := machinav1alpha1.Machine{
+		machine := machinav1alpha3.Machine{
 			TypeMeta: metav1.TypeMeta{
-				APIVersion: machinav1alpha1.GroupVersion.String(),
+				APIVersion: machinav1alpha3.GroupVersion.String(),
 				Kind:       "Machine",
 			},
 			ObjectMeta: metav1.ObjectMeta{
 				Name: machinaNameFromInventory(m),
 				Annotations: map[string]string{
-					"forge.unboundedkube.io/vm-name": m.Name,
+					"forge.unbounded-kube.io/vm-name": m.Name,
 				},
 			},
-			Spec: machinav1alpha1.MachineSpec{
-				SSH: machinav1alpha1.MachineSSHSpec{
-					Host: m.IPAddress,
-					Port: int32(m.Port),
+			Spec: machinav1alpha3.MachineSpec{
+				SSH: &machinav1alpha3.SSHSpec{
+					Host: fmt.Sprintf("%s:%d", m.IPAddress, m.Port),
 				},
 			},
 		}

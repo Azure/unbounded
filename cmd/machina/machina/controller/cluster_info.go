@@ -32,8 +32,8 @@ type ClusterInfo struct {
 
 	// KubeVersion is the Kubernetes server version (e.g. "v1.34.2") obtained
 	// from the API server's /version endpoint. It is used as the default
-	// KUBE_VERSION for bootstrap scripts unless a MachineModel's
-	// KubernetesProfile overrides it.
+	// KUBE_VERSION for bootstrap scripts unless the Machine's
+	// Spec.Kubernetes.Version overrides it.
 	KubeVersion string
 }
 
@@ -121,8 +121,8 @@ func ResolveClusterInfo(ctx context.Context, k kubernetes.Interface) (*ClusterIn
 
 	// ---------------------------------------------------------------
 	// KUBE_VERSION – Kubernetes server version from the /version endpoint.
-	// Used as the default for bootstrap scripts; MachineModel's
-	// KubernetesProfile.Version can override it.
+	// Used as the default for bootstrap scripts; Machine's
+	// Spec.Kubernetes.Version can override it.
 	// ---------------------------------------------------------------
 	sv, err := k.Discovery().ServerVersion()
 	if err != nil {

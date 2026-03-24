@@ -74,15 +74,13 @@ kubectl unbounded setup \
     --ssh-private-key=<ssh-private-key-file> \
     --node-cidr=<node-cidr>`
 
-kubectl unbounded create machinemodel mymodel --ssh-username <ssh-user>
+kubectl unbounded create worker-01 --host <host-ip-or-name> --port <port> --ssh-username <ssh-user>
+kubectl unbounded create worker-02 --host <host-ip-or-name> --port <port> --ssh-username <ssh-user>
 
-kubectl unbounded create worker-01 --host <host-ip-or-name> --port <port>
-kubectl unbounded create worker-02 --host <host-ip-or-name> --port <port>
-
-# watch machines. should moved from Ready -> Provisioning -> Provisioned -> Joined
+# watch machines. should move from Pending -> Provisioning -> Joining -> Ready
 watch 'kubectl get mach'
-NAME      HOST            PORT    MODEL     PHASE          NODE                          AGE
-worker0   40.85.222.227   51001   mymodel   Joined         pal2forge-dc1-ubdemo-000000   19m
-worker1   40.85.222.227   51002   mymodel   Provisioning                                 2s
+NAME      HOST            PHASE          AGE
+worker0   40.85.222.227   Ready          19m
+worker1   40.85.222.227   Provisioning   2s
 ``` 
 

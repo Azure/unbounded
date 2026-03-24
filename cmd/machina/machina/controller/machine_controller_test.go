@@ -17,106 +17,78 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	machinav1alpha2 "github.com/project-unbounded/unbounded-kube/cmd/machina/machina/api/v1alpha2"
+	unboundedv1alpha3 "github.com/project-unbounded/unbounded-kube/cmd/machina/machina/api/v1alpha3"
 )
 
 // ---------------------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------------------
 
-// mockReachabilityChecker is a mock implementation of ReachabilityChecker for testing.
 type mockReachabilityChecker struct {
 	err error
-	// calledHost and calledPort record the last invocation for assertions.
-	calledHost string
-	calledPort int32
 }
 
-func (m *mockReachabilityChecker) CheckReachable(_ context.Context, host string, port int32) error {
-	m.calledHost = host
-	m.calledPort = port
-
+func (m *mockReachabilityChecker) CheckReachable(_ context.Context, _ string) error {
 	return m.err
 }
 
-// mockProvisioner is a mock implementation of MachineProvisioner for testing.
 type mockProvisioner struct {
-	err    error
-	called bool
-	// Capture args for assertions.
-	machine        *machinav1alpha2.Machine
-	model          *machinav1alpha2.MachineModel
+	err            error
+	called         bool
+	machine        *unboundedv1alpha3.Machine
 	bootstrapToken string
 }
 
 func (m *mockProvisioner) ProvisionMachine(
 	_ context.Context,
-	machine *machinav1alpha2.Machine,
-	model *machinav1alpha2.MachineModel,
+	machine *unboundedv1alpha3.Machine,
 	_ *ssh.ClientConfig,
 	bootstrapToken string,
 	_ *ClusterInfo,
 ) error {
 	m.called = true
 	m.machine = machine
-	m.model = model
 	m.bootstrapToken = bootstrapToken
 
 	return m.err
 }
 
-// newTestScheme creates a runtime.Scheme with v1alpha2 and core types.
 func newTestScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
 
 	s := runtime.NewScheme()
-	require.NoError(t, machinav1alpha2.AddToScheme(s))
+	require.NoError(t, unboundedv1alpha3.AddToScheme(s))
 	require.NoError(t, corev1.AddToScheme(s))
 
 	return s
 }
 
-// newTestMachine creates a Machine for tests with sensible defaults.
-func newTestMachine(name, host string, port int32, modelRef *machinav1alpha2.LocalObjectReference) *machinav1alpha2.Machine {
-	return &machinav1alpha2.Machine{
+// newTestMachine builds a Machine with SSH config inline.
+// Pass kubernetes as nil for reachable-only machines (no provisioning).
+func newTestMachine(name, host, username string, kubernetes *unboundedv1alpha3.KubernetesSpec) *unboundedv1alpha3.Machine {
+	return &unboundedv1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: name,
 		},
-		Spec: machinav1alpha2.MachineSpec{
-			SSH: machinav1alpha2.MachineSSHSpec{
-				Host: host,
-				Port: port,
+		Spec: unboundedv1alpha3.MachineSpec{
+			SSH: &unboundedv1alpha3.SSHSpec{
+				Host:          host,
+				Username:      username,
+				PrivateKeyRef: unboundedv1alpha3.SecretKeySelector{Name: "ssh-key-secret"},
 			},
-			ModelRef: modelRef,
+			Kubernetes: kubernetes,
 		},
 	}
 }
 
-// newTestModel creates a MachineModel for tests with sensible defaults.
-func newTestModel(name string) *machinav1alpha2.MachineModel {
-	return &machinav1alpha2.MachineModel{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:       name,
-			Generation: 1,
-		},
-		Spec: machinav1alpha2.MachineModelSpec{
-			SSHUsername: "testuser",
-			SSHPrivateKeyRef: machinav1alpha2.SecretKeySelector{
-				Name: "ssh-key-secret",
-				Key:  "ssh-privatekey",
-			},
-			AgentInstallScript: "#!/bin/bash\necho hello",
-			KubernetesProfile: &machinav1alpha2.KubernetesProfile{
-				Version: "1.34.0",
-				BootstrapTokenRef: machinav1alpha2.LocalObjectReference{
-					Name: "bootstrap-token-abc123",
-				},
-			},
-		},
+// defaultKubernetes returns a KubernetesSpec with sensible test defaults.
+func defaultKubernetes() *unboundedv1alpha3.KubernetesSpec {
+	return &unboundedv1alpha3.KubernetesSpec{
+		Version:           "v1.34.0",
+		BootstrapTokenRef: unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-abc123"},
 	}
 }
 
-// newSSHKeySecret creates a Secret containing a test SSH private key.
 func newSSHKeySecret(name string) *corev1.Secret {
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -129,7 +101,6 @@ func newSSHKeySecret(name string) *corev1.Secret {
 	}
 }
 
-// newBootstrapTokenSecret creates a bootstrap token Secret in kube-system.
 func newBootstrapTokenSecret(name string) *corev1.Secret {
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -143,7 +114,6 @@ func newBootstrapTokenSecret(name string) *corev1.Secret {
 	}
 }
 
-// startTCPListener starts a TCP listener on a random port and returns the port and cleanup function.
 func startTCPListener(t *testing.T) (int, func()) {
 	t.Helper()
 
@@ -158,7 +128,16 @@ func startTCPListener(t *testing.T) (int, func()) {
 	}
 }
 
-// testRSAPrivateKey is a test RSA private key for SSH tests.
+func findCondition(conditions []metav1.Condition, condType string) *metav1.Condition {
+	for i := range conditions {
+		if conditions[i].Type == condType {
+			return &conditions[i]
+		}
+	}
+
+	return nil
+}
+
 // DO NOT use this key for anything other than testing.
 const testRSAPrivateKey = `-----BEGIN OPENSSH PRIVATE KEY-----
 b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABFwAAAAdzc2gtcn
@@ -198,13 +177,12 @@ func TestMachineReconciler_Reconcile(t *testing.T) {
 	s := newTestScheme(t)
 
 	tests := []struct {
-		name              string
-		machine           *machinav1alpha2.Machine
-		checkErr          error
-		expectedPhase     machinav1alpha2.MachinePhase
-		expectedRequeue   time.Duration
-		expectedCondition metav1.ConditionStatus
-		expectNotFound    bool
+		name            string
+		machine         *unboundedv1alpha3.Machine
+		checkErr        error
+		expectedPhase   unboundedv1alpha3.MachinePhase
+		expectedRequeue time.Duration
+		expectNotFound  bool
 	}{
 		{
 			name:           "machine not found returns no error",
@@ -212,36 +190,29 @@ func TestMachineReconciler_Reconcile(t *testing.T) {
 			expectNotFound: true,
 		},
 		{
-			name:              "reachable machine without modelRef transitions to Ready",
-			machine:           newTestMachine("test-machine", "10.0.0.1", 22, nil),
-			checkErr:          nil,
-			expectedPhase:     machinav1alpha2.MachinePhaseReady,
-			expectedRequeue:   RequeueAfterReady,
-			expectedCondition: metav1.ConditionTrue,
+			name:            "reachable machine without kubernetes config transitions to Ready",
+			machine:         newTestMachine("test-machine", "192.168.1.100:22", "testuser", nil),
+			expectedPhase:   unboundedv1alpha3.MachinePhaseReady,
+			expectedRequeue: RequeueAfterReady,
 		},
 		{
-			name:              "unreachable machine stays Pending",
-			machine:           newTestMachine("test-machine", "10.0.0.1", 22, nil),
-			checkErr:          fmt.Errorf("TCP dial 10.0.0.1:22: connection refused"),
-			expectedPhase:     machinav1alpha2.MachinePhasePending,
-			expectedRequeue:   RequeueAfterPending,
-			expectedCondition: metav1.ConditionFalse,
+			name:            "unreachable machine stays Pending",
+			machine:         newTestMachine("test-machine", "192.168.1.100:22", "testuser", nil),
+			checkErr:        fmt.Errorf("TCP dial 192.168.1.100:22: connection refused"),
+			expectedPhase:   unboundedv1alpha3.MachinePhasePending,
+			expectedRequeue: RequeueAfterPending,
 		},
 		{
-			name:              "port defaults to 22 when not specified",
-			machine:           newTestMachine("test-machine", "10.0.0.1", 0, nil),
-			checkErr:          nil,
-			expectedPhase:     machinav1alpha2.MachinePhaseReady,
-			expectedRequeue:   RequeueAfterReady,
-			expectedCondition: metav1.ConditionTrue,
+			name:            "host without port defaults to 22",
+			machine:         newTestMachine("test-machine", "192.168.1.100", "testuser", nil),
+			expectedPhase:   unboundedv1alpha3.MachinePhaseReady,
+			expectedRequeue: RequeueAfterReady,
 		},
 		{
-			name:              "custom port is respected",
-			machine:           newTestMachine("test-machine", "10.0.0.1", 2222, nil),
-			checkErr:          nil,
-			expectedPhase:     machinav1alpha2.MachinePhaseReady,
-			expectedRequeue:   RequeueAfterReady,
-			expectedCondition: metav1.ConditionTrue,
+			name:            "custom port is respected",
+			machine:         newTestMachine("test-machine", "192.168.1.100:2222", "testuser", nil),
+			expectedPhase:   unboundedv1alpha3.MachinePhaseReady,
+			expectedRequeue: RequeueAfterReady,
 		},
 	}
 
@@ -263,9 +234,7 @@ func TestMachineReconciler_Reconcile(t *testing.T) {
 			}
 
 			req := ctrl.Request{
-				NamespacedName: types.NamespacedName{
-					Name: "test-machine",
-				},
+				NamespacedName: types.NamespacedName{Name: "test-machine"},
 			}
 
 			result, err := reconciler.Reconcile(context.Background(), req)
@@ -280,19 +249,50 @@ func TestMachineReconciler_Reconcile(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, tt.expectedRequeue, result.RequeueAfter)
 
-			var updated machinav1alpha2.Machine
+			var updated unboundedv1alpha3.Machine
 
 			err = fakeClient.Get(context.Background(), req.NamespacedName, &updated)
 			require.NoError(t, err)
 
 			require.Equal(t, tt.expectedPhase, updated.Status.Phase)
-			require.NotNil(t, updated.Status.LastProbeTime)
 
-			require.Len(t, updated.Status.Conditions, 1)
-			require.Equal(t, "Ready", updated.Status.Conditions[0].Type)
-			require.Equal(t, tt.expectedCondition, updated.Status.Conditions[0].Status)
+			// SSHReachable condition should be present.
+			sshCond := findCondition(updated.Status.Conditions, unboundedv1alpha3.MachineConditionSSHReachable)
+			require.NotNil(t, sshCond, "SSHReachable condition should be set")
 		})
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Machine with nil SSH spec is skipped
+// ---------------------------------------------------------------------------
+
+func TestMachineReconciler_NilSSHSpec_Skipped(t *testing.T) {
+	t.Parallel()
+
+	s := newTestScheme(t)
+
+	machine := &unboundedv1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-machine"},
+		Spec:       unboundedv1alpha3.MachineSpec{},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(machine).
+		WithStatusSubresource(machine).
+		Build()
+
+	reconciler := &MachineReconciler{
+		Client: fakeClient,
+		Scheme: s,
+	}
+
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-machine"}}
+
+	result, err := reconciler.Reconcile(context.Background(), req)
+	require.NoError(t, err)
+	require.Equal(t, ctrl.Result{}, result)
 }
 
 // ---------------------------------------------------------------------------
@@ -304,15 +304,13 @@ func TestMachineReconciler_Provisioning_Success(t *testing.T) {
 
 	s := newTestScheme(t)
 
-	model := newTestModel("gpu-model")
-	machine := newTestMachine("test-machine", "10.0.0.1", 22,
-		&machinav1alpha2.LocalObjectReference{Name: "gpu-model"})
+	machine := newTestMachine("test-machine", "10.0.0.1:22", "testuser", defaultKubernetes())
 	sshSecret := newSSHKeySecret("ssh-key-secret")
 	bootstrapSecret := newBootstrapTokenSecret("bootstrap-token-abc123")
 
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(s).
-		WithObjects(machine, model, sshSecret, bootstrapSecret).
+		WithObjects(machine, sshSecret, bootstrapSecret).
 		WithStatusSubresource(machine).
 		Build()
 
@@ -320,7 +318,7 @@ func TestMachineReconciler_Provisioning_Success(t *testing.T) {
 	reconciler := &MachineReconciler{
 		Client:              fakeClient,
 		Scheme:              s,
-		ReachabilityChecker: &mockReachabilityChecker{err: nil},
+		ReachabilityChecker: &mockReachabilityChecker{},
 		Provisioner:         provisioner,
 		ClusterInfo: &ClusterInfo{
 			APIServer:    "api.example.com:443",
@@ -333,30 +331,100 @@ func TestMachineReconciler_Provisioning_Success(t *testing.T) {
 
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-machine"}}
 
-	// First reconcile: sets Provisioning and then calls provisioner.
 	result, err := reconciler.Reconcile(context.Background(), req)
 	require.NoError(t, err)
 	require.True(t, provisioner.called, "provisioner should have been called")
-	require.Equal(t, "abc123.def456ghi789jkl0", provisioner.bootstrapToken)
-	require.Equal(t, RequeueAfterProvisioned, result.RequeueAfter)
+	require.Equal(t, RequeueAfterJoining, result.RequeueAfter)
 
-	// Check machine ended up Provisioned.
-	var updated machinav1alpha2.Machine
+	var updated unboundedv1alpha3.Machine
 
 	err = fakeClient.Get(context.Background(), req.NamespacedName, &updated)
 	require.NoError(t, err)
-	require.Equal(t, machinav1alpha2.MachinePhaseProvisioned, updated.Status.Phase)
-	require.Equal(t, int64(1), updated.Status.ProvisionedModelGeneration)
+	require.Equal(t, unboundedv1alpha3.MachinePhaseJoining, updated.Status.Phase)
+
+	// Provisioned condition should be set.
+	provCond := findCondition(updated.Status.Conditions, unboundedv1alpha3.MachineConditionProvisioned)
+	require.NotNil(t, provCond, "Provisioned condition should be set")
+	require.Equal(t, metav1.ConditionTrue, provCond.Status)
 }
 
-func TestMachineReconciler_Provisioning_ModelNotFound(t *testing.T) {
+func TestMachineReconciler_Provisioning_ProvisionerFails(t *testing.T) {
 	t.Parallel()
 
 	s := newTestScheme(t)
 
-	// Machine references a model that doesn't exist.
-	machine := newTestMachine("test-machine", "10.0.0.1", 22,
-		&machinav1alpha2.LocalObjectReference{Name: "missing-model"})
+	machine := newTestMachine("test-machine", "10.0.0.1:22", "testuser", defaultKubernetes())
+	sshSecret := newSSHKeySecret("ssh-key-secret")
+	bootstrapSecret := newBootstrapTokenSecret("bootstrap-token-abc123")
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(machine, sshSecret, bootstrapSecret).
+		WithStatusSubresource(machine).
+		Build()
+
+	provisioner := &mockProvisioner{err: fmt.Errorf("SSH connection refused")}
+	reconciler := &MachineReconciler{
+		Client:              fakeClient,
+		Scheme:              s,
+		ReachabilityChecker: &mockReachabilityChecker{},
+		Provisioner:         provisioner,
+		ClusterInfo:         &ClusterInfo{},
+	}
+
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-machine"}}
+
+	result, err := reconciler.Reconcile(context.Background(), req)
+	require.NoError(t, err)
+	require.Equal(t, RequeueAfterFailed, result.RequeueAfter)
+
+	var updated unboundedv1alpha3.Machine
+
+	err = fakeClient.Get(context.Background(), req.NamespacedName, &updated)
+	require.NoError(t, err)
+	require.Equal(t, unboundedv1alpha3.MachinePhaseFailed, updated.Status.Phase)
+	require.Contains(t, updated.Status.Message, "SSH connection refused")
+}
+
+func TestMachineReconciler_Provisioning_JoiningSkipsReProvision(t *testing.T) {
+	t.Parallel()
+
+	s := newTestScheme(t)
+
+	machine := newTestMachine("test-machine", "10.0.0.1:22", "testuser", defaultKubernetes())
+	machine.Status = unboundedv1alpha3.MachineStatus{
+		Phase: unboundedv1alpha3.MachinePhaseJoining,
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(machine).
+		WithStatusSubresource(machine).
+		Build()
+
+	provisioner := &mockProvisioner{}
+	reconciler := &MachineReconciler{
+		Client:              fakeClient,
+		Scheme:              s,
+		ReachabilityChecker: &mockReachabilityChecker{},
+		Provisioner:         provisioner,
+	}
+
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-machine"}}
+
+	result, err := reconciler.Reconcile(context.Background(), req)
+	require.NoError(t, err)
+	require.False(t, provisioner.called, "provisioner should NOT be called — Joining phase routes to Node join")
+	require.Equal(t, RequeueAfterJoining, result.RequeueAfter)
+}
+
+func TestMachineReconciler_Provisioning_SSHKeyNotFound(t *testing.T) {
+	t.Parallel()
+
+	s := newTestScheme(t)
+
+	machine := newTestMachine("test-machine", "10.0.0.1:22", "testuser", defaultKubernetes())
+	// No SSH key secret created.
 
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(s).
@@ -367,7 +435,7 @@ func TestMachineReconciler_Provisioning_ModelNotFound(t *testing.T) {
 	reconciler := &MachineReconciler{
 		Client:              fakeClient,
 		Scheme:              s,
-		ReachabilityChecker: &mockReachabilityChecker{err: nil},
+		ReachabilityChecker: &mockReachabilityChecker{},
 	}
 
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-machine"}}
@@ -376,207 +444,120 @@ func TestMachineReconciler_Provisioning_ModelNotFound(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, RequeueAfterFailed, result.RequeueAfter)
 
-	var updated machinav1alpha2.Machine
+	var updated unboundedv1alpha3.Machine
 
 	err = fakeClient.Get(context.Background(), req.NamespacedName, &updated)
 	require.NoError(t, err)
-	require.Equal(t, machinav1alpha2.MachinePhaseFailed, updated.Status.Phase)
-	require.Contains(t, updated.Status.Message, "not found")
-}
-
-func TestMachineReconciler_Provisioning_ProvisionerFails(t *testing.T) {
-	t.Parallel()
-
-	s := newTestScheme(t)
-
-	model := newTestModel("gpu-model")
-	machine := newTestMachine("test-machine", "10.0.0.1", 22,
-		&machinav1alpha2.LocalObjectReference{Name: "gpu-model"})
-	sshSecret := newSSHKeySecret("ssh-key-secret")
-	bootstrapSecret := newBootstrapTokenSecret("bootstrap-token-abc123")
-
-	fakeClient := fake.NewClientBuilder().
-		WithScheme(s).
-		WithObjects(machine, model, sshSecret, bootstrapSecret).
-		WithStatusSubresource(machine).
-		Build()
-
-	provisioner := &mockProvisioner{err: fmt.Errorf("SSH connection refused")}
-	reconciler := &MachineReconciler{
-		Client:              fakeClient,
-		Scheme:              s,
-		ReachabilityChecker: &mockReachabilityChecker{err: nil},
-		Provisioner:         provisioner,
-		ClusterInfo:         &ClusterInfo{},
-	}
-
-	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-machine"}}
-
-	result, err := reconciler.Reconcile(context.Background(), req)
-	require.NoError(t, err)
-	require.Equal(t, RequeueAfterFailed, result.RequeueAfter)
-
-	var updated machinav1alpha2.Machine
-
-	err = fakeClient.Get(context.Background(), req.NamespacedName, &updated)
-	require.NoError(t, err)
-	require.Equal(t, machinav1alpha2.MachinePhaseFailed, updated.Status.Phase)
-	require.Contains(t, updated.Status.Message, "SSH connection refused")
-}
-
-func TestMachineReconciler_Provisioning_AlreadyProvisionedSameGeneration(t *testing.T) {
-	t.Parallel()
-
-	s := newTestScheme(t)
-
-	model := newTestModel("gpu-model")
-	machine := newTestMachine("test-machine", "10.0.0.1", 22,
-		&machinav1alpha2.LocalObjectReference{Name: "gpu-model"})
-	machine.Status = machinav1alpha2.MachineStatus{
-		Phase:                      machinav1alpha2.MachinePhaseProvisioned,
-		ProvisionedModelGeneration: 1, // Same as model.Generation
-	}
-
-	fakeClient := fake.NewClientBuilder().
-		WithScheme(s).
-		WithObjects(machine, model).
-		WithStatusSubresource(machine).
-		Build()
-
-	provisioner := &mockProvisioner{}
-	reconciler := &MachineReconciler{
-		Client:              fakeClient,
-		Scheme:              s,
-		ReachabilityChecker: &mockReachabilityChecker{err: nil},
-		Provisioner:         provisioner,
-	}
-
-	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-machine"}}
-
-	result, err := reconciler.Reconcile(context.Background(), req)
-	require.NoError(t, err)
-	require.False(t, provisioner.called, "provisioner should NOT be called when already provisioned at same generation")
-	require.Equal(t, RequeueAfterProvisioned, result.RequeueAfter)
-}
-
-func TestMachineReconciler_Provisioned_NodeJoinInsteadOfReProvision(t *testing.T) {
-	t.Parallel()
-
-	s := newTestScheme(t)
-
-	model := newTestModel("gpu-model")
-	model.Generation = 2 // Model has been updated
-
-	machine := newTestMachine("test-machine", "10.0.0.1", 22,
-		&machinav1alpha2.LocalObjectReference{Name: "gpu-model"})
-	machine.Status = machinav1alpha2.MachineStatus{
-		Phase:                      machinav1alpha2.MachinePhaseProvisioned,
-		ProvisionedModelGeneration: 1, // Old generation — but Provisioned routes to reconcileNodeJoin now
-	}
-
-	sshSecret := newSSHKeySecret("ssh-key-secret")
-	bootstrapSecret := newBootstrapTokenSecret("bootstrap-token-abc123")
-
-	fakeClient := fake.NewClientBuilder().
-		WithScheme(s).
-		WithObjects(machine, model, sshSecret, bootstrapSecret).
-		WithStatusSubresource(machine).
-		Build()
-
-	provisioner := &mockProvisioner{}
-	reconciler := &MachineReconciler{
-		Client:              fakeClient,
-		Scheme:              s,
-		ReachabilityChecker: &mockReachabilityChecker{err: nil},
-		Provisioner:         provisioner,
-		ClusterInfo:         &ClusterInfo{},
-	}
-
-	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-machine"}}
-
-	result, err := reconciler.Reconcile(context.Background(), req)
-	require.NoError(t, err)
-	require.False(t, provisioner.called, "provisioner should NOT be called — Provisioned phase routes to Node join")
-	require.Equal(t, RequeueAfterProvisioned, result.RequeueAfter)
-
-	var updated machinav1alpha2.Machine
-
-	err = fakeClient.Get(context.Background(), req.NamespacedName, &updated)
-	require.NoError(t, err)
-	require.Equal(t, machinav1alpha2.MachinePhaseProvisioned, updated.Status.Phase)
-	require.Equal(t, int64(1), updated.Status.ProvisionedModelGeneration, "generation should NOT be updated")
-}
-
-func TestMachineReconciler_Provisioning_NoKubernetesProfile(t *testing.T) {
-	t.Parallel()
-
-	s := newTestScheme(t)
-
-	model := newTestModel("gpu-model")
-	model.Spec.KubernetesProfile = nil // No kubernetes profile
-
-	machine := newTestMachine("test-machine", "10.0.0.1", 22,
-		&machinav1alpha2.LocalObjectReference{Name: "gpu-model"})
-	sshSecret := newSSHKeySecret("ssh-key-secret")
-
-	fakeClient := fake.NewClientBuilder().
-		WithScheme(s).
-		WithObjects(machine, model, sshSecret).
-		WithStatusSubresource(machine).
-		Build()
-
-	provisioner := &mockProvisioner{}
-	reconciler := &MachineReconciler{
-		Client:              fakeClient,
-		Scheme:              s,
-		ReachabilityChecker: &mockReachabilityChecker{err: nil},
-		Provisioner:         provisioner,
-		ClusterInfo:         &ClusterInfo{},
-	}
-
-	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-machine"}}
-
-	result, err := reconciler.Reconcile(context.Background(), req)
-	require.NoError(t, err)
-	require.True(t, provisioner.called)
-	require.Equal(t, "", provisioner.bootstrapToken, "bootstrap token should be empty when no kubernetes profile")
-	require.Equal(t, RequeueAfterProvisioned, result.RequeueAfter)
-}
-
-func TestMachineReconciler_Provisioning_SSHKeyNotFound(t *testing.T) {
-	t.Parallel()
-
-	s := newTestScheme(t)
-
-	model := newTestModel("gpu-model")
-	machine := newTestMachine("test-machine", "10.0.0.1", 22,
-		&machinav1alpha2.LocalObjectReference{Name: "gpu-model"})
-	// No SSH key secret created.
-
-	fakeClient := fake.NewClientBuilder().
-		WithScheme(s).
-		WithObjects(machine, model).
-		WithStatusSubresource(machine).
-		Build()
-
-	reconciler := &MachineReconciler{
-		Client:              fakeClient,
-		Scheme:              s,
-		ReachabilityChecker: &mockReachabilityChecker{err: nil},
-	}
-
-	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-machine"}}
-
-	result, err := reconciler.Reconcile(context.Background(), req)
-	require.NoError(t, err)
-	require.Equal(t, RequeueAfterFailed, result.RequeueAfter)
-
-	var updated machinav1alpha2.Machine
-
-	err = fakeClient.Get(context.Background(), req.NamespacedName, &updated)
-	require.NoError(t, err)
-	require.Equal(t, machinav1alpha2.MachinePhaseFailed, updated.Status.Phase)
+	require.Equal(t, unboundedv1alpha3.MachinePhaseFailed, updated.Status.Phase)
 	require.Contains(t, updated.Status.Message, "SSH config")
+}
+
+func TestMachineReconciler_Provisioning_BootstrapTokenSecretMissing(t *testing.T) {
+	t.Parallel()
+
+	s := newTestScheme(t)
+
+	machine := newTestMachine("test-machine", "10.0.0.1:22", "testuser", defaultKubernetes())
+	sshSecret := newSSHKeySecret("ssh-key-secret")
+	// No bootstrap token secret created.
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(machine, sshSecret).
+		WithStatusSubresource(machine).
+		Build()
+
+	reconciler := &MachineReconciler{
+		Client:              fakeClient,
+		Scheme:              s,
+		ReachabilityChecker: &mockReachabilityChecker{},
+	}
+
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-machine"}}
+
+	result, err := reconciler.Reconcile(context.Background(), req)
+	require.NoError(t, err)
+	require.Equal(t, RequeueAfterFailed, result.RequeueAfter)
+
+	var updated unboundedv1alpha3.Machine
+
+	err = fakeClient.Get(context.Background(), req.NamespacedName, &updated)
+	require.NoError(t, err)
+	require.Equal(t, unboundedv1alpha3.MachinePhaseFailed, updated.Status.Phase)
+	require.Contains(t, updated.Status.Message, "bootstrap token")
+}
+
+// ---------------------------------------------------------------------------
+// Provisioning phase gate tests
+// ---------------------------------------------------------------------------
+
+func TestMachineReconciler_ProvisioningPhaseIsNotReProvisionable(t *testing.T) {
+	t.Parallel()
+
+	s := newTestScheme(t)
+
+	machine := newTestMachine("test-machine", "10.0.0.1:22", "testuser", defaultKubernetes())
+	machine.Status = unboundedv1alpha3.MachineStatus{
+		Phase: unboundedv1alpha3.MachinePhaseProvisioning,
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(machine).
+		WithStatusSubresource(machine).
+		Build()
+
+	provisioner := &mockProvisioner{}
+	reconciler := &MachineReconciler{
+		Client:              fakeClient,
+		Scheme:              s,
+		ReachabilityChecker: &mockReachabilityChecker{},
+		Provisioner:         provisioner,
+	}
+
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-machine"}}
+
+	result, err := reconciler.Reconcile(context.Background(), req)
+	require.NoError(t, err)
+	require.False(t, provisioner.called, "provisioner should not be called when already Provisioning")
+	require.Equal(t, RequeueAfterPending, result.RequeueAfter)
+}
+
+func TestMachineReconciler_Provisioning_RetryFromFailed(t *testing.T) {
+	t.Parallel()
+
+	s := newTestScheme(t)
+
+	machine := newTestMachine("test-machine", "10.0.0.1:22", "testuser", defaultKubernetes())
+	machine.Status = unboundedv1alpha3.MachineStatus{
+		Phase:   unboundedv1alpha3.MachinePhaseFailed,
+		Message: "Previous provisioning failed",
+	}
+
+	sshSecret := newSSHKeySecret("ssh-key-secret")
+	bootstrapSecret := newBootstrapTokenSecret("bootstrap-token-abc123")
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(machine, sshSecret, bootstrapSecret).
+		WithStatusSubresource(machine).
+		Build()
+
+	provisioner := &mockProvisioner{}
+	reconciler := &MachineReconciler{
+		Client:              fakeClient,
+		Scheme:              s,
+		ReachabilityChecker: &mockReachabilityChecker{},
+		Provisioner:         provisioner,
+		ClusterInfo:         &ClusterInfo{},
+	}
+
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-machine"}}
+
+	result, err := reconciler.Reconcile(context.Background(), req)
+	require.NoError(t, err)
+	require.True(t, provisioner.called, "provisioner should be called to retry from Failed phase")
+	require.Equal(t, RequeueAfterJoining, result.RequeueAfter)
 }
 
 // ---------------------------------------------------------------------------
@@ -600,7 +581,7 @@ func TestGetSecretValue(t *testing.T) {
 		reconciler := &MachineReconciler{Client: fakeClient, Scheme: s}
 
 		val, err := reconciler.getSecretValue(context.Background(),
-			&machinav1alpha2.SecretKeySelector{Name: "my-secret", Key: "custom-key"})
+			&unboundedv1alpha3.SecretKeySelector{Name: "my-secret", Key: "custom-key"})
 		require.NoError(t, err)
 		require.Equal(t, "secret-value", val)
 	})
@@ -617,7 +598,7 @@ func TestGetSecretValue(t *testing.T) {
 		reconciler := &MachineReconciler{Client: fakeClient, Scheme: s}
 
 		val, err := reconciler.getSecretValue(context.Background(),
-			&machinav1alpha2.SecretKeySelector{Name: "my-secret"})
+			&unboundedv1alpha3.SecretKeySelector{Name: "my-secret"})
 		require.NoError(t, err)
 		require.Equal(t, "my-key", val)
 	})
@@ -629,7 +610,7 @@ func TestGetSecretValue(t *testing.T) {
 		reconciler := &MachineReconciler{Client: fakeClient, Scheme: s}
 
 		_, err := reconciler.getSecretValue(context.Background(),
-			&machinav1alpha2.SecretKeySelector{Name: "missing-secret"})
+			&unboundedv1alpha3.SecretKeySelector{Name: "missing-secret"})
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "missing-secret")
 	})
@@ -646,7 +627,7 @@ func TestGetSecretValue(t *testing.T) {
 		reconciler := &MachineReconciler{Client: fakeClient, Scheme: s}
 
 		_, err := reconciler.getSecretValue(context.Background(),
-			&machinav1alpha2.SecretKeySelector{Name: "my-secret", Key: "missing-key"})
+			&unboundedv1alpha3.SecretKeySelector{Name: "my-secret", Key: "missing-key"})
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "missing-key")
 	})
@@ -727,9 +708,9 @@ func TestBuildSSHConfig(t *testing.T) {
 		fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(sshSecret).Build()
 		reconciler := &MachineReconciler{Client: fakeClient, Scheme: s}
 
-		model := newTestModel("test-model")
+		machine := newTestMachine("test-machine", "10.0.0.1:22", "testuser", nil)
 
-		cfg, err := reconciler.buildSSHConfig(context.Background(), model)
+		cfg, err := reconciler.buildSSHConfig(context.Background(), machine)
 		require.NoError(t, err)
 		require.Equal(t, "testuser", cfg.User)
 		require.Equal(t, SSHConnectTimeout, cfg.Timeout)
@@ -744,10 +725,9 @@ func TestBuildSSHConfig(t *testing.T) {
 		fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(sshSecret).Build()
 		reconciler := &MachineReconciler{Client: fakeClient, Scheme: s}
 
-		model := newTestModel("test-model")
-		model.Spec.SSHUsername = ""
+		machine := newTestMachine("test-machine", "10.0.0.1:22", "", nil)
 
-		cfg, err := reconciler.buildSSHConfig(context.Background(), model)
+		cfg, err := reconciler.buildSSHConfig(context.Background(), machine)
 		require.NoError(t, err)
 		require.Equal(t, "azureuser", cfg.User)
 	})
@@ -758,9 +738,9 @@ func TestBuildSSHConfig(t *testing.T) {
 		fakeClient := fake.NewClientBuilder().WithScheme(s).Build()
 		reconciler := &MachineReconciler{Client: fakeClient, Scheme: s}
 
-		model := newTestModel("test-model")
+		machine := newTestMachine("test-machine", "10.0.0.1:22", "testuser", nil)
 
-		_, err := reconciler.buildSSHConfig(context.Background(), model)
+		_, err := reconciler.buildSSHConfig(context.Background(), machine)
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "SSH private key")
 	})
@@ -776,9 +756,9 @@ func TestBuildSSHConfig(t *testing.T) {
 		fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(secret).Build()
 		reconciler := &MachineReconciler{Client: fakeClient, Scheme: s}
 
-		model := newTestModel("test-model")
+		machine := newTestMachine("test-machine", "10.0.0.1:22", "testuser", nil)
 
-		_, err := reconciler.buildSSHConfig(context.Background(), model)
+		_, err := reconciler.buildSSHConfig(context.Background(), machine)
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "parse SSH private key")
 	})
@@ -798,7 +778,7 @@ func TestDefaultReachabilityChecker_CheckReachable(t *testing.T) {
 		defer cleanup()
 
 		checker := &DefaultReachabilityChecker{Timeout: time.Second}
-		err := checker.CheckReachable(context.Background(), "127.0.0.1", int32(port))
+		err := checker.CheckReachable(context.Background(), fmt.Sprintf("127.0.0.1:%d", port))
 
 		require.NoError(t, err)
 	})
@@ -807,17 +787,17 @@ func TestDefaultReachabilityChecker_CheckReachable(t *testing.T) {
 		t.Parallel()
 
 		checker := &DefaultReachabilityChecker{Timeout: 100 * time.Millisecond}
-		err := checker.CheckReachable(context.Background(), "127.0.0.1", 59999)
+		err := checker.CheckReachable(context.Background(), "127.0.0.1:59999")
 
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "TCP dial 127.0.0.1:59999")
 	})
 
-	t.Run("unreachable on invalid IP", func(t *testing.T) {
+	t.Run("unreachable on invalid host", func(t *testing.T) {
 		t.Parallel()
 
 		checker := &DefaultReachabilityChecker{Timeout: 100 * time.Millisecond}
-		err := checker.CheckReachable(context.Background(), "invalid-ip", 22)
+		err := checker.CheckReachable(context.Background(), "invalid-ip:22")
 
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "TCP dial invalid-ip:22")
@@ -830,9 +810,20 @@ func TestDefaultReachabilityChecker_CheckReachable(t *testing.T) {
 		defer cleanup()
 
 		checker := &DefaultReachabilityChecker{}
-		err := checker.CheckReachable(context.Background(), "127.0.0.1", int32(port))
+		err := checker.CheckReachable(context.Background(), fmt.Sprintf("127.0.0.1:%d", port))
 
 		require.NoError(t, err)
+	})
+
+	t.Run("host without port defaults to 22", func(t *testing.T) {
+		t.Parallel()
+
+		// Use a non-routable IP to guarantee connection failure.
+		checker := &DefaultReachabilityChecker{Timeout: 100 * time.Millisecond}
+		err := checker.CheckReachable(context.Background(), "192.0.2.1")
+
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "TCP dial 192.0.2.1:22")
 	})
 
 	t.Run("respects context cancellation", func(t *testing.T) {
@@ -842,7 +833,7 @@ func TestDefaultReachabilityChecker_CheckReachable(t *testing.T) {
 		cancel()
 
 		checker := &DefaultReachabilityChecker{Timeout: 5 * time.Second}
-		err := checker.CheckReachable(ctx, "127.0.0.1", 22)
+		err := checker.CheckReachable(ctx, "127.0.0.1:22")
 
 		require.Error(t, err)
 	})
@@ -857,14 +848,14 @@ func TestMachineReconciler_UpdateStatus_ConditionUpdate(t *testing.T) {
 
 	s := newTestScheme(t)
 
-	machine := newTestMachine("test-machine", "10.0.0.1", 22, nil)
-	machine.Status = machinav1alpha2.MachineStatus{
-		Phase: machinav1alpha2.MachinePhasePending,
+	machine := newTestMachine("test-machine", "10.0.0.1:22", "testuser", nil)
+	machine.Status = unboundedv1alpha3.MachineStatus{
+		Phase: unboundedv1alpha3.MachinePhasePending,
 		Conditions: []metav1.Condition{
 			{
-				Type:               "Ready",
+				Type:               unboundedv1alpha3.MachineConditionSSHReachable,
 				Status:             metav1.ConditionFalse,
-				Reason:             "Pending",
+				Reason:             "Unreachable",
 				Message:            "Machine is not reachable",
 				LastTransitionTime: metav1.Now(),
 			},
@@ -880,7 +871,7 @@ func TestMachineReconciler_UpdateStatus_ConditionUpdate(t *testing.T) {
 	reconciler := &MachineReconciler{
 		Client:              fakeClient,
 		Scheme:              s,
-		ReachabilityChecker: &mockReachabilityChecker{err: nil},
+		ReachabilityChecker: &mockReachabilityChecker{},
 	}
 
 	req := ctrl.Request{
@@ -890,16 +881,15 @@ func TestMachineReconciler_UpdateStatus_ConditionUpdate(t *testing.T) {
 	_, err := reconciler.Reconcile(context.Background(), req)
 	require.NoError(t, err)
 
-	var updated machinav1alpha2.Machine
+	var updated unboundedv1alpha3.Machine
 
 	err = fakeClient.Get(context.Background(), req.NamespacedName, &updated)
 	require.NoError(t, err)
 
-	// Should still have only one condition (updated, not added).
-	require.Len(t, updated.Status.Conditions, 1)
-	require.Equal(t, "Ready", updated.Status.Conditions[0].Type)
-	require.Equal(t, metav1.ConditionTrue, updated.Status.Conditions[0].Status)
-	require.Equal(t, "Ready", updated.Status.Conditions[0].Reason)
+	sshCond := findCondition(updated.Status.Conditions, unboundedv1alpha3.MachineConditionSSHReachable)
+	require.NotNil(t, sshCond)
+	require.Equal(t, metav1.ConditionTrue, sshCond.Status)
+	require.Equal(t, "Reachable", sshCond.Reason)
 }
 
 func TestMachineReconciler_UpdateStatus_PhaseDeterminesRequeue(t *testing.T) {
@@ -909,22 +899,20 @@ func TestMachineReconciler_UpdateStatus_PhaseDeterminesRequeue(t *testing.T) {
 
 	tests := []struct {
 		name            string
-		phase           machinav1alpha2.MachinePhase
+		phase           unboundedv1alpha3.MachinePhase
 		expectedRequeue time.Duration
 	}{
-		{"Ready requeues at Ready interval", machinav1alpha2.MachinePhaseReady, RequeueAfterReady},
-		{"Provisioned requeues at Provisioned interval", machinav1alpha2.MachinePhaseProvisioned, RequeueAfterProvisioned},
-		{"Failed requeues at Failed interval", machinav1alpha2.MachinePhaseFailed, RequeueAfterFailed},
-		{"Pending requeues at Pending interval", machinav1alpha2.MachinePhasePending, RequeueAfterPending},
-		{"Joined requeues at Joined interval", machinav1alpha2.MachinePhaseJoined, RequeueAfterJoined},
-		{"Orphaned requeues at Orphaned interval", machinav1alpha2.MachinePhaseOrphaned, RequeueAfterOrphaned},
+		{"Ready requeues at Ready interval", unboundedv1alpha3.MachinePhaseReady, RequeueAfterReady},
+		{"Joining requeues at Joining interval", unboundedv1alpha3.MachinePhaseJoining, RequeueAfterJoining},
+		{"Failed requeues at Failed interval", unboundedv1alpha3.MachinePhaseFailed, RequeueAfterFailed},
+		{"Pending requeues at Pending interval", unboundedv1alpha3.MachinePhasePending, RequeueAfterPending},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			machine := newTestMachine("test-machine", "10.0.0.1", 22, nil)
+			machine := newTestMachine("test-machine", "10.0.0.1:22", "testuser", nil)
 
 			fakeClient := fake.NewClientBuilder().
 				WithScheme(s).
@@ -937,349 +925,11 @@ func TestMachineReconciler_UpdateStatus_PhaseDeterminesRequeue(t *testing.T) {
 				Scheme: s,
 			}
 
-			result, err := reconciler.updateStatus(context.Background(), machine, tt.phase, "test message", 0)
+			result, err := reconciler.updateStatus(context.Background(), machine, tt.phase, "test message")
 			require.NoError(t, err)
 			require.Equal(t, tt.expectedRequeue, result.RequeueAfter)
 		})
 	}
-}
-
-// ---------------------------------------------------------------------------
-// findMachinesForModel tests
-// ---------------------------------------------------------------------------
-
-func TestFindMachinesForModel(t *testing.T) {
-	t.Parallel()
-
-	s := newTestScheme(t)
-
-	model := newTestModel("gpu-model")
-
-	machine1 := newTestMachine("machine-1", "10.0.0.1", 22,
-		&machinav1alpha2.LocalObjectReference{Name: "gpu-model"})
-	machine2 := newTestMachine("machine-2", "10.0.0.2", 22,
-		&machinav1alpha2.LocalObjectReference{Name: "other-model"})
-	machine3 := newTestMachine("machine-3", "10.0.0.3", 22,
-		&machinav1alpha2.LocalObjectReference{Name: "gpu-model"})
-	machine4 := newTestMachine("machine-4", "10.0.0.4", 22, nil) // no modelRef
-
-	fakeClient := fake.NewClientBuilder().
-		WithScheme(s).
-		WithObjects(machine1, machine2, machine3, machine4).
-		Build()
-
-	reconciler := &MachineReconciler{
-		Client: fakeClient,
-		Scheme: s,
-	}
-
-	requests := reconciler.findMachinesForModel(context.Background(), model)
-	require.Len(t, requests, 2)
-
-	names := make(map[string]bool)
-	for _, req := range requests {
-		names[req.Name] = true
-	}
-
-	require.True(t, names["machine-1"])
-	require.True(t, names["machine-3"])
-	require.False(t, names["machine-2"])
-	require.False(t, names["machine-4"])
-}
-
-func TestFindMachinesForModel_DifferentModelName(t *testing.T) {
-	t.Parallel()
-
-	s := newTestScheme(t)
-
-	model := newTestModel("gpu-model")
-
-	// Machine referencing a different model name should NOT be included.
-	machine := newTestMachine("machine-1", "10.0.0.1", 22,
-		&machinav1alpha2.LocalObjectReference{Name: "other-model"})
-
-	fakeClient := fake.NewClientBuilder().
-		WithScheme(s).
-		WithObjects(machine).
-		Build()
-
-	reconciler := &MachineReconciler{
-		Client: fakeClient,
-		Scheme: s,
-	}
-
-	requests := reconciler.findMachinesForModel(context.Background(), model)
-	require.Len(t, requests, 0)
-}
-
-// ---------------------------------------------------------------------------
-// Reachability checker captures correct args
-// ---------------------------------------------------------------------------
-
-func TestMachineReconciler_CheckerCalledWithCorrectArgs(t *testing.T) {
-	t.Parallel()
-
-	s := newTestScheme(t)
-
-	t.Run("uses specified port", func(t *testing.T) {
-		t.Parallel()
-
-		machine := newTestMachine("test-machine", "10.0.0.1", 2222, nil)
-
-		fakeClient := fake.NewClientBuilder().
-			WithScheme(s).
-			WithObjects(machine).
-			WithStatusSubresource(machine).
-			Build()
-
-		checker := &mockReachabilityChecker{err: nil}
-		reconciler := &MachineReconciler{
-			Client:              fakeClient,
-			Scheme:              s,
-			ReachabilityChecker: checker,
-		}
-
-		req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-machine"}}
-		_, err := reconciler.Reconcile(context.Background(), req)
-		require.NoError(t, err)
-		require.Equal(t, "10.0.0.1", checker.calledHost)
-		require.Equal(t, int32(2222), checker.calledPort)
-	})
-
-	t.Run("defaults port to 22", func(t *testing.T) {
-		t.Parallel()
-
-		machine := newTestMachine("test-machine", "10.0.0.1", 0, nil)
-
-		fakeClient := fake.NewClientBuilder().
-			WithScheme(s).
-			WithObjects(machine).
-			WithStatusSubresource(machine).
-			Build()
-
-		checker := &mockReachabilityChecker{err: nil}
-		reconciler := &MachineReconciler{
-			Client:              fakeClient,
-			Scheme:              s,
-			ReachabilityChecker: checker,
-		}
-
-		req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-machine"}}
-		_, err := reconciler.Reconcile(context.Background(), req)
-		require.NoError(t, err)
-		require.Equal(t, int32(22), checker.calledPort)
-	})
-}
-
-// ---------------------------------------------------------------------------
-// Provisioning phase gate tests
-// ---------------------------------------------------------------------------
-
-func TestMachineReconciler_ProvisioningPhaseIsNotReProvisionable(t *testing.T) {
-	t.Parallel()
-
-	s := newTestScheme(t)
-
-	model := newTestModel("gpu-model")
-	model.Generation = 2
-
-	machine := newTestMachine("test-machine", "10.0.0.1", 22,
-		&machinav1alpha2.LocalObjectReference{Name: "gpu-model"})
-	machine.Status = machinav1alpha2.MachineStatus{
-		Phase: machinav1alpha2.MachinePhaseProvisioning,
-	}
-
-	fakeClient := fake.NewClientBuilder().
-		WithScheme(s).
-		WithObjects(machine, model).
-		WithStatusSubresource(machine).
-		Build()
-
-	provisioner := &mockProvisioner{}
-	reconciler := &MachineReconciler{
-		Client:              fakeClient,
-		Scheme:              s,
-		ReachabilityChecker: &mockReachabilityChecker{err: nil},
-		Provisioner:         provisioner,
-	}
-
-	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-machine"}}
-
-	result, err := reconciler.Reconcile(context.Background(), req)
-	require.NoError(t, err)
-	require.False(t, provisioner.called, "provisioner should not be called when already Provisioning")
-	require.Equal(t, RequeueAfterPending, result.RequeueAfter)
-}
-
-// ---------------------------------------------------------------------------
-// Config tests
-// ---------------------------------------------------------------------------
-
-func TestDefaultConfig(t *testing.T) {
-	t.Parallel()
-
-	cfg := DefaultConfig()
-	require.Equal(t, ":8080", cfg.MetricsAddr)
-	require.Equal(t, ":8081", cfg.ProbeAddr)
-	require.False(t, cfg.EnableLeaderElection)
-	require.Equal(t, 10, cfg.MaxConcurrentReconciles)
-}
-
-// ---------------------------------------------------------------------------
-// Scheme registration test
-// ---------------------------------------------------------------------------
-
-func TestSchemeRegistration(t *testing.T) {
-	t.Parallel()
-
-	s := newTestScheme(t)
-
-	// Verify Machine and MachineModel are registered.
-	gvks, _, err := s.ObjectKinds(&machinav1alpha2.Machine{})
-	require.NoError(t, err)
-	require.Len(t, gvks, 1)
-	require.Equal(t, "Machine", gvks[0].Kind)
-	require.Equal(t, "v1alpha2", gvks[0].Version)
-
-	gvks, _, err = s.ObjectKinds(&machinav1alpha2.MachineModel{})
-	require.NoError(t, err)
-	require.Len(t, gvks, 1)
-	require.Equal(t, "MachineModel", gvks[0].Kind)
-	require.Equal(t, "v1alpha2", gvks[0].Version)
-}
-
-// ---------------------------------------------------------------------------
-// Edge case: machine with modelRef but missing bootstrap token secret
-// ---------------------------------------------------------------------------
-
-func TestMachineReconciler_Provisioning_BootstrapTokenSecretMissing(t *testing.T) {
-	t.Parallel()
-
-	s := newTestScheme(t)
-
-	model := newTestModel("gpu-model")
-	machine := newTestMachine("test-machine", "10.0.0.1", 22,
-		&machinav1alpha2.LocalObjectReference{Name: "gpu-model"})
-	sshSecret := newSSHKeySecret("ssh-key-secret")
-	// No bootstrap token secret created.
-
-	fakeClient := fake.NewClientBuilder().
-		WithScheme(s).
-		WithObjects(machine, model, sshSecret).
-		WithStatusSubresource(machine).
-		Build()
-
-	reconciler := &MachineReconciler{
-		Client:              fakeClient,
-		Scheme:              s,
-		ReachabilityChecker: &mockReachabilityChecker{err: nil},
-	}
-
-	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-machine"}}
-
-	result, err := reconciler.Reconcile(context.Background(), req)
-	require.NoError(t, err)
-	require.Equal(t, RequeueAfterFailed, result.RequeueAfter)
-
-	var updated machinav1alpha2.Machine
-
-	err = fakeClient.Get(context.Background(), req.NamespacedName, &updated)
-	require.NoError(t, err)
-	require.Equal(t, machinav1alpha2.MachinePhaseFailed, updated.Status.Phase)
-	require.Contains(t, updated.Status.Message, "bootstrap token")
-}
-
-// ---------------------------------------------------------------------------
-// findMachinesForModel with list error
-// ---------------------------------------------------------------------------
-
-func TestFindMachinesForModel_ListError(t *testing.T) {
-	t.Parallel()
-
-	s := newTestScheme(t)
-
-	// Use a scheme without Machine registered to force a list error.
-	emptyScheme := runtime.NewScheme()
-
-	model := newTestModel("gpu-model")
-
-	fakeClient := fake.NewClientBuilder().WithScheme(emptyScheme).Build()
-	reconciler := &MachineReconciler{
-		Client: fakeClient,
-		Scheme: s,
-	}
-
-	requests := reconciler.findMachinesForModel(context.Background(), model)
-	require.Nil(t, requests)
-}
-
-// ---------------------------------------------------------------------------
-// Provisioning from Failed phase (retry)
-// ---------------------------------------------------------------------------
-
-func TestMachineReconciler_Provisioning_RetryFromFailed(t *testing.T) {
-	t.Parallel()
-
-	s := newTestScheme(t)
-
-	model := newTestModel("gpu-model")
-	machine := newTestMachine("test-machine", "10.0.0.1", 22,
-		&machinav1alpha2.LocalObjectReference{Name: "gpu-model"})
-	machine.Status = machinav1alpha2.MachineStatus{
-		Phase:   machinav1alpha2.MachinePhaseFailed,
-		Message: "Previous provisioning failed",
-	}
-
-	sshSecret := newSSHKeySecret("ssh-key-secret")
-	bootstrapSecret := newBootstrapTokenSecret("bootstrap-token-abc123")
-
-	fakeClient := fake.NewClientBuilder().
-		WithScheme(s).
-		WithObjects(machine, model, sshSecret, bootstrapSecret).
-		WithStatusSubresource(machine).
-		Build()
-
-	provisioner := &mockProvisioner{}
-	reconciler := &MachineReconciler{
-		Client:              fakeClient,
-		Scheme:              s,
-		ReachabilityChecker: &mockReachabilityChecker{err: nil},
-		Provisioner:         provisioner,
-		ClusterInfo:         &ClusterInfo{},
-	}
-
-	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-machine"}}
-
-	result, err := reconciler.Reconcile(context.Background(), req)
-	require.NoError(t, err)
-	require.True(t, provisioner.called, "provisioner should be called to retry from Failed phase")
-	require.Equal(t, RequeueAfterProvisioned, result.RequeueAfter)
-}
-
-// ---------------------------------------------------------------------------
-// Multiple machines - only matching ones get enqueued
-// ---------------------------------------------------------------------------
-
-func TestFindMachinesForModel_NoMatchingMachines(t *testing.T) {
-	t.Parallel()
-
-	s := newTestScheme(t)
-
-	model := newTestModel("gpu-model")
-
-	machine1 := newTestMachine("machine-1", "10.0.0.1", 22,
-		&machinav1alpha2.LocalObjectReference{Name: "other-model"})
-	machine2 := newTestMachine("machine-2", "10.0.0.2", 22, nil)
-
-	fakeClient := fake.NewClientBuilder().
-		WithScheme(s).
-		WithObjects(machine1, machine2).
-		Build()
-
-	reconciler := &MachineReconciler{Client: fakeClient, Scheme: s}
-
-	requests := reconciler.findMachinesForModel(context.Background(), model)
-	require.Len(t, requests, 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -1300,7 +950,7 @@ func TestFindMachineForNode(t *testing.T) {
 		node := &corev1.Node{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:   "worker-1",
-				Labels: map[string]string{MachinaNodeLabel: "my-machine"},
+				Labels: map[string]string{MachineNodeLabel: "my-machine"},
 			},
 		}
 
@@ -1350,16 +1000,14 @@ func TestFindMachineForNode(t *testing.T) {
 // reconcileNodeJoin tests
 // ---------------------------------------------------------------------------
 
-func TestReconcileNodeJoin_Provisioned_NoNode(t *testing.T) {
+func TestReconcileNodeJoin_Joining_NoNode(t *testing.T) {
 	t.Parallel()
 
 	s := newTestScheme(t)
 
-	machine := newTestMachine("test-machine", "10.0.0.1", 22,
-		&machinav1alpha2.LocalObjectReference{Name: "gpu-model"})
-	machine.Status = machinav1alpha2.MachineStatus{
-		Phase:                      machinav1alpha2.MachinePhaseProvisioned,
-		ProvisionedModelGeneration: 1,
+	machine := newTestMachine("test-machine", "10.0.0.1:22", "testuser", defaultKubernetes())
+	machine.Status = unboundedv1alpha3.MachineStatus{
+		Phase: unboundedv1alpha3.MachinePhaseJoining,
 	}
 
 	fakeClient := fake.NewClientBuilder().
@@ -1371,38 +1019,36 @@ func TestReconcileNodeJoin_Provisioned_NoNode(t *testing.T) {
 	reconciler := &MachineReconciler{
 		Client:              fakeClient,
 		Scheme:              s,
-		ReachabilityChecker: &mockReachabilityChecker{err: nil},
+		ReachabilityChecker: &mockReachabilityChecker{},
 	}
 
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-machine"}}
 
 	result, err := reconciler.Reconcile(context.Background(), req)
 	require.NoError(t, err)
-	require.Equal(t, RequeueAfterProvisioned, result.RequeueAfter)
+	require.Equal(t, RequeueAfterJoining, result.RequeueAfter)
 
-	var updated machinav1alpha2.Machine
+	var updated unboundedv1alpha3.Machine
 
 	err = fakeClient.Get(context.Background(), req.NamespacedName, &updated)
 	require.NoError(t, err)
-	require.Equal(t, machinav1alpha2.MachinePhaseProvisioned, updated.Status.Phase)
+	require.Equal(t, unboundedv1alpha3.MachinePhaseJoining, updated.Status.Phase)
 }
 
-func TestReconcileNodeJoin_Provisioned_NodeFound(t *testing.T) {
+func TestReconcileNodeJoin_Joining_NodeFound(t *testing.T) {
 	t.Parallel()
 
 	s := newTestScheme(t)
 
-	machine := newTestMachine("test-machine", "10.0.0.1", 22,
-		&machinav1alpha2.LocalObjectReference{Name: "gpu-model"})
-	machine.Status = machinav1alpha2.MachineStatus{
-		Phase:                      machinav1alpha2.MachinePhaseProvisioned,
-		ProvisionedModelGeneration: 1,
+	machine := newTestMachine("test-machine", "10.0.0.1:22", "testuser", defaultKubernetes())
+	machine.Status = unboundedv1alpha3.MachineStatus{
+		Phase: unboundedv1alpha3.MachinePhaseJoining,
 	}
 
 	node := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   "worker-1",
-			Labels: map[string]string{MachinaNodeLabel: "test-machine"},
+			Labels: map[string]string{MachineNodeLabel: "test-machine"},
 		},
 	}
 
@@ -1415,41 +1061,42 @@ func TestReconcileNodeJoin_Provisioned_NodeFound(t *testing.T) {
 	reconciler := &MachineReconciler{
 		Client:              fakeClient,
 		Scheme:              s,
-		ReachabilityChecker: &mockReachabilityChecker{err: nil},
+		ReachabilityChecker: &mockReachabilityChecker{},
 	}
 
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-machine"}}
 
 	result, err := reconciler.Reconcile(context.Background(), req)
 	require.NoError(t, err)
-	require.Equal(t, RequeueAfterJoined, result.RequeueAfter)
+	require.Equal(t, RequeueAfterReady, result.RequeueAfter)
 
-	var updated machinav1alpha2.Machine
+	var updated unboundedv1alpha3.Machine
 
 	err = fakeClient.Get(context.Background(), req.NamespacedName, &updated)
 	require.NoError(t, err)
-	require.Equal(t, machinav1alpha2.MachinePhaseJoined, updated.Status.Phase)
-	require.NotNil(t, updated.Status.NodeRef)
-	require.Equal(t, "worker-1", updated.Status.NodeRef.Name)
+	require.Equal(t, unboundedv1alpha3.MachinePhaseReady, updated.Status.Phase)
 }
 
-func TestReconcileNodeJoin_Joined_NodeStillExists(t *testing.T) {
+func TestReconcileNodeJoin_Ready_NodeStillExists(t *testing.T) {
 	t.Parallel()
 
 	s := newTestScheme(t)
 
-	machine := newTestMachine("test-machine", "10.0.0.1", 22,
-		&machinav1alpha2.LocalObjectReference{Name: "gpu-model"})
-	machine.Status = machinav1alpha2.MachineStatus{
-		Phase:                      machinav1alpha2.MachinePhaseJoined,
-		ProvisionedModelGeneration: 1,
-		NodeRef:                    &machinav1alpha2.NodeReference{Name: "worker-1"},
+	k8s := defaultKubernetes()
+	k8s.NodeRef = &unboundedv1alpha3.LocalObjectReference{Name: "worker-1"}
+
+	machine := newTestMachine("test-machine", "10.0.0.1:22", "testuser", k8s)
+	machine.Status = unboundedv1alpha3.MachineStatus{
+		Phase: unboundedv1alpha3.MachinePhaseReady,
+		Conditions: []metav1.Condition{
+			{Type: unboundedv1alpha3.MachineConditionProvisioned, Status: metav1.ConditionTrue, Reason: "Provisioned"},
+		},
 	}
 
 	node := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   "worker-1",
-			Labels: map[string]string{MachinaNodeLabel: "test-machine"},
+			Labels: map[string]string{MachineNodeLabel: "test-machine"},
 		},
 	}
 
@@ -1462,27 +1109,30 @@ func TestReconcileNodeJoin_Joined_NodeStillExists(t *testing.T) {
 	reconciler := &MachineReconciler{
 		Client:              fakeClient,
 		Scheme:              s,
-		ReachabilityChecker: &mockReachabilityChecker{err: nil},
+		ReachabilityChecker: &mockReachabilityChecker{},
 	}
 
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-machine"}}
 
 	result, err := reconciler.Reconcile(context.Background(), req)
 	require.NoError(t, err)
-	require.Equal(t, RequeueAfterJoined, result.RequeueAfter)
+	require.Equal(t, RequeueAfterReady, result.RequeueAfter)
 }
 
-func TestReconcileNodeJoin_Joined_NodeDisappears(t *testing.T) {
+func TestReconcileNodeJoin_Ready_NodeDisappears(t *testing.T) {
 	t.Parallel()
 
 	s := newTestScheme(t)
 
-	machine := newTestMachine("test-machine", "10.0.0.1", 22,
-		&machinav1alpha2.LocalObjectReference{Name: "gpu-model"})
-	machine.Status = machinav1alpha2.MachineStatus{
-		Phase:                      machinav1alpha2.MachinePhaseJoined,
-		ProvisionedModelGeneration: 1,
-		NodeRef:                    &machinav1alpha2.NodeReference{Name: "worker-1"},
+	k8s := defaultKubernetes()
+	k8s.NodeRef = &unboundedv1alpha3.LocalObjectReference{Name: "worker-1"}
+
+	machine := newTestMachine("test-machine", "10.0.0.1:22", "testuser", k8s)
+	machine.Status = unboundedv1alpha3.MachineStatus{
+		Phase: unboundedv1alpha3.MachinePhaseReady,
+		Conditions: []metav1.Condition{
+			{Type: unboundedv1alpha3.MachineConditionProvisioned, Status: metav1.ConditionTrue, Reason: "Provisioned"},
+		},
 	}
 
 	// No Node in the cluster — it disappeared.
@@ -1495,40 +1145,37 @@ func TestReconcileNodeJoin_Joined_NodeDisappears(t *testing.T) {
 	reconciler := &MachineReconciler{
 		Client:              fakeClient,
 		Scheme:              s,
-		ReachabilityChecker: &mockReachabilityChecker{err: nil},
+		ReachabilityChecker: &mockReachabilityChecker{},
 	}
 
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-machine"}}
 
 	result, err := reconciler.Reconcile(context.Background(), req)
 	require.NoError(t, err)
-	require.Equal(t, RequeueAfterOrphaned, result.RequeueAfter)
+	require.Equal(t, RequeueAfterJoining, result.RequeueAfter)
 
-	var updated machinav1alpha2.Machine
+	var updated unboundedv1alpha3.Machine
 
 	err = fakeClient.Get(context.Background(), req.NamespacedName, &updated)
 	require.NoError(t, err)
-	require.Equal(t, machinav1alpha2.MachinePhaseOrphaned, updated.Status.Phase)
+	require.Equal(t, unboundedv1alpha3.MachinePhaseJoining, updated.Status.Phase)
 	require.Contains(t, updated.Status.Message, "Node disappeared")
 }
 
-func TestReconcileNodeJoin_Orphaned_NodeReappears(t *testing.T) {
+func TestReconcileNodeJoin_Joining_NodeReappears(t *testing.T) {
 	t.Parallel()
 
 	s := newTestScheme(t)
 
-	machine := newTestMachine("test-machine", "10.0.0.1", 22,
-		&machinav1alpha2.LocalObjectReference{Name: "gpu-model"})
-	machine.Status = machinav1alpha2.MachineStatus{
-		Phase:                      machinav1alpha2.MachinePhaseOrphaned,
-		ProvisionedModelGeneration: 1,
-		NodeRef:                    &machinav1alpha2.NodeReference{Name: "worker-1"},
+	machine := newTestMachine("test-machine", "10.0.0.1:22", "testuser", defaultKubernetes())
+	machine.Status = unboundedv1alpha3.MachineStatus{
+		Phase: unboundedv1alpha3.MachinePhaseJoining,
 	}
 
 	node := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   "worker-1",
-			Labels: map[string]string{MachinaNodeLabel: "test-machine"},
+			Labels: map[string]string{MachineNodeLabel: "test-machine"},
 		},
 	}
 
@@ -1541,35 +1188,30 @@ func TestReconcileNodeJoin_Orphaned_NodeReappears(t *testing.T) {
 	reconciler := &MachineReconciler{
 		Client:              fakeClient,
 		Scheme:              s,
-		ReachabilityChecker: &mockReachabilityChecker{err: nil},
+		ReachabilityChecker: &mockReachabilityChecker{},
 	}
 
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-machine"}}
 
 	result, err := reconciler.Reconcile(context.Background(), req)
 	require.NoError(t, err)
-	require.Equal(t, RequeueAfterJoined, result.RequeueAfter)
+	require.Equal(t, RequeueAfterReady, result.RequeueAfter)
 
-	var updated machinav1alpha2.Machine
+	var updated unboundedv1alpha3.Machine
 
 	err = fakeClient.Get(context.Background(), req.NamespacedName, &updated)
 	require.NoError(t, err)
-	require.Equal(t, machinav1alpha2.MachinePhaseJoined, updated.Status.Phase)
-	require.NotNil(t, updated.Status.NodeRef)
-	require.Equal(t, "worker-1", updated.Status.NodeRef.Name)
+	require.Equal(t, unboundedv1alpha3.MachinePhaseReady, updated.Status.Phase)
 }
 
-func TestReconcileNodeJoin_Orphaned_StillOrphaned(t *testing.T) {
+func TestReconcileNodeJoin_Joining_StillWaiting(t *testing.T) {
 	t.Parallel()
 
 	s := newTestScheme(t)
 
-	machine := newTestMachine("test-machine", "10.0.0.1", 22,
-		&machinav1alpha2.LocalObjectReference{Name: "gpu-model"})
-	machine.Status = machinav1alpha2.MachineStatus{
-		Phase:                      machinav1alpha2.MachinePhaseOrphaned,
-		ProvisionedModelGeneration: 1,
-		NodeRef:                    &machinav1alpha2.NodeReference{Name: "worker-1"},
+	machine := newTestMachine("test-machine", "10.0.0.1:22", "testuser", defaultKubernetes())
+	machine.Status = unboundedv1alpha3.MachineStatus{
+		Phase: unboundedv1alpha3.MachinePhaseJoining,
 	}
 
 	// No Node in the cluster.
@@ -1582,21 +1224,51 @@ func TestReconcileNodeJoin_Orphaned_StillOrphaned(t *testing.T) {
 	reconciler := &MachineReconciler{
 		Client:              fakeClient,
 		Scheme:              s,
-		ReachabilityChecker: &mockReachabilityChecker{err: nil},
+		ReachabilityChecker: &mockReachabilityChecker{},
 	}
 
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-machine"}}
 
 	result, err := reconciler.Reconcile(context.Background(), req)
 	require.NoError(t, err)
-	require.Equal(t, RequeueAfterOrphaned, result.RequeueAfter)
+	require.Equal(t, RequeueAfterJoining, result.RequeueAfter)
 
-	var updated machinav1alpha2.Machine
+	var updated unboundedv1alpha3.Machine
 
 	err = fakeClient.Get(context.Background(), req.NamespacedName, &updated)
 	require.NoError(t, err)
-	require.Equal(t, machinav1alpha2.MachinePhaseOrphaned, updated.Status.Phase)
+	require.Equal(t, unboundedv1alpha3.MachinePhaseJoining, updated.Status.Phase)
 }
 
-// Ensure fake client is used for interface compatibility check.
+// ---------------------------------------------------------------------------
+// Config tests
+// ---------------------------------------------------------------------------
+
+func TestDefaultConfig(t *testing.T) {
+	t.Parallel()
+
+	cfg := DefaultConfig()
+	require.Equal(t, ":8080", cfg.MetricsAddr)
+	require.Equal(t, ":8081", cfg.ProbeAddr)
+	require.False(t, cfg.EnableLeaderElection)
+	require.Equal(t, 10, cfg.MaxConcurrentReconciles)
+}
+
+// ---------------------------------------------------------------------------
+// Scheme registration test
+// ---------------------------------------------------------------------------
+
+func TestSchemeRegistration(t *testing.T) {
+	t.Parallel()
+
+	s := newTestScheme(t)
+
+	gvks, _, err := s.ObjectKinds(&unboundedv1alpha3.Machine{})
+	require.NoError(t, err)
+	require.Len(t, gvks, 1)
+	require.Equal(t, "Machine", gvks[0].Kind)
+	require.Equal(t, "v1alpha3", gvks[0].Version)
+}
+
+// Ensure fake client satisfies the client.Client interface.
 var _ client.Client = (fake.NewClientBuilder().Build())

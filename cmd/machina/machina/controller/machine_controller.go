@@ -11,6 +11,7 @@ import (
 	"golang.org/x/crypto/ssh"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -19,7 +20,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	machinav1alpha2 "github.com/project-unbounded/unbounded-kube/cmd/machina/machina/api/v1alpha2"
+	stderrs "errors"
+
+	unboundedv1alpha3 "github.com/project-unbounded/unbounded-kube/cmd/machina/machina/api/v1alpha3"
+	"github.com/project-unbounded/unbounded-kube/internal/provision"
 )
 
 const (
@@ -32,16 +36,10 @@ const (
 	// RequeueAfterFailed is the requeue interval for machines in Failed phase.
 	RequeueAfterFailed = 1 * time.Minute
 
-	// RequeueAfterProvisioned is the requeue interval for machines in
-	// Provisioned phase. Short interval because we are waiting for the
+	// RequeueAfterJoining is the requeue interval for machines in
+	// Joining phase. Short interval because we are waiting for the
 	// Node to appear with the matching label.
-	RequeueAfterProvisioned = 30 * time.Second
-
-	// RequeueAfterJoined is the requeue interval for machines in Joined phase.
-	RequeueAfterJoined = 5 * time.Minute
-
-	// RequeueAfterOrphaned is the requeue interval for machines in Orphaned phase.
-	RequeueAfterOrphaned = 1 * time.Minute
+	RequeueAfterJoining = 30 * time.Second
 
 	// TCPProbeTimeout is the timeout for TCP connection probes.
 	TCPProbeTimeout = 10 * time.Second
@@ -54,19 +52,20 @@ const (
 	remoteScriptPath = "/tmp/machina-agent-install.sh"
 
 	// SecretNamespaceMachinaSystem is the namespace where SSH key secrets
-	// must reside. Machine and MachineModel are cluster-scoped, so we use
-	// a fixed namespace for secret lookup.
+	// must reside. Machine is cluster-scoped, so we use a fixed namespace
+	// for secret lookup.
 	SecretNamespaceMachinaSystem = "machina-system"
 
-	// MachinaNodeLabel is the label key applied to Nodes that correspond
+	// MachineNodeLabel is the label key applied to Nodes that correspond
 	// to a Machine. The value is the Machine name.
-	MachinaNodeLabel = "machina.project-unbounded.io/machine"
+	MachineNodeLabel = "unbounded-kube.io/machine"
 )
 
 // ReachabilityChecker checks if a machine is reachable via TCP.
-// Returns nil if reachable, or an error describing why the machine is unreachable.
+// The host string may include a port (e.g. "1.2.3.4:2222"); when no port
+// is present, the default SSH port 22 is assumed.
 type ReachabilityChecker interface {
-	CheckReachable(ctx context.Context, host string, port int32) error
+	CheckReachable(ctx context.Context, host string) error
 }
 
 // DefaultReachabilityChecker implements ReachabilityChecker using TCP dial.
@@ -74,10 +73,10 @@ type DefaultReachabilityChecker struct {
 	Timeout time.Duration
 }
 
-// CheckReachable checks if the machine is reachable via TCP on the specified port.
-// Returns nil if reachable, or the dial error if not.
-func (c *DefaultReachabilityChecker) CheckReachable(ctx context.Context, host string, port int32) error {
-	address := fmt.Sprintf("%s:%d", host, port)
+// CheckReachable checks if the machine is reachable via TCP.
+// The host string may contain a port; if not, port 22 is used.
+func (c *DefaultReachabilityChecker) CheckReachable(ctx context.Context, host string) error {
+	address := hostPort(host)
 
 	timeout := c.Timeout
 	if timeout == 0 {
@@ -96,9 +95,33 @@ func (c *DefaultReachabilityChecker) CheckReachable(ctx context.Context, host st
 	return nil
 }
 
+// hostPort ensures the host string contains a port. If no port is present,
+// ":22" is appended.
+func hostPort(host string) string {
+	// If SplitHostPort succeeds, the host already includes a port.
+	if _, _, err := net.SplitHostPort(host); err == nil {
+		return host
+	} else {
+		var addrErr *net.AddrError
+		// For errors other than "missing port in address", return the host unchanged.
+		if !stderrs.As(err, &addrErr) || addrErr == nil || addrErr.Err != "missing port in address" {
+			return host
+		}
+	}
+
+	// At this point, the address is missing a port. Normalize bracketed IPv6
+	// literals like "[2001:db8::1]" by trimming the outer brackets before
+	// calling JoinHostPort to avoid double-bracketing.
+	if len(host) > 2 && host[0] == '[' && host[len(host)-1] == ']' {
+		host = host[1 : len(host)-1]
+	}
+
+	return net.JoinHostPort(host, "22")
+}
+
 // MachineProvisioner handles the actual provisioning of a machine via SSH.
 type MachineProvisioner interface {
-	ProvisionMachine(ctx context.Context, machine *machinav1alpha2.Machine, model *machinav1alpha2.MachineModel, sshConfig *ssh.ClientConfig, bootstrapToken string, clusterInfo *ClusterInfo) error
+	ProvisionMachine(ctx context.Context, machine *unboundedv1alpha3.Machine, sshConfig *ssh.ClientConfig, bootstrapToken string, clusterInfo *ClusterInfo) error
 }
 
 // MachineReconciler reconciles a Machine object.
@@ -111,10 +134,9 @@ type MachineReconciler struct {
 	MaxConcurrentReconciles int
 }
 
-// +kubebuilder:rbac:groups=machina.unboundedkube.io,resources=machines,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=machina.unboundedkube.io,resources=machines/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=machina.unboundedkube.io,resources=machines/finalizers,verbs=update
-// +kubebuilder:rbac:groups=machina.unboundedkube.io,resources=machinemodels,verbs=get;list;watch
+// +kubebuilder:rbac:groups=unbounded-kube.io,resources=machines,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=unbounded-kube.io,resources=machines/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=unbounded-kube.io,resources=machines/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 
 // Reconcile handles Machine reconciliation: reachability checks and provisioning.
@@ -122,7 +144,7 @@ func (r *MachineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	logger := log.FromContext(ctx)
 
 	// Fetch the Machine.
-	var machine machinav1alpha2.Machine
+	var machine unboundedv1alpha3.Machine
 	if err := r.Get(ctx, req.NamespacedName, &machine); err != nil {
 		if errors.IsNotFound(err) {
 			return ctrl.Result{}, nil
@@ -133,13 +155,13 @@ func (r *MachineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, err
 	}
 
-	logger.Info("Reconciling Machine", "name", machine.Name, "host", machine.Spec.SSH.Host, "port", machine.Spec.SSH.Port)
-
-	// Set default port if not specified.
-	port := machine.Spec.SSH.Port
-	if port == 0 {
-		port = 22
+	// Machines without SSH configuration are not managed by this controller.
+	if machine.Spec.SSH == nil {
+		logger.Info("Machine has no SSH config, skipping", "name", machine.Name)
+		return ctrl.Result{}, nil
 	}
+
+	logger.Info("Reconciling Machine", "name", machine.Name, "host", machine.Spec.SSH.Host)
 
 	// Use injected checker or default.
 	checker := r.ReachabilityChecker
@@ -148,59 +170,51 @@ func (r *MachineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	// Check if we can reach the machine via TCP.
-	if err := checker.CheckReachable(ctx, machine.Spec.SSH.Host, port); err != nil {
-		logger.Info("Machine is not reachable", "name", machine.Name, "host", machine.Spec.SSH.Host, "port", port, "error", err)
+	if err := checker.CheckReachable(ctx, machine.Spec.SSH.Host); err != nil {
+		logger.Info("Machine is not reachable", "name", machine.Name, "host", machine.Spec.SSH.Host, "error", err)
 
-		return r.updateStatus(ctx, &machine, machinav1alpha2.MachinePhasePending,
-			fmt.Sprintf("Machine is not reachable: %v", err), 0)
+		r.setSSHReachableCondition(&machine, metav1.ConditionFalse, "Unreachable", fmt.Sprintf("Machine is not reachable: %v", err))
+
+		return r.updateStatus(ctx, &machine, unboundedv1alpha3.MachinePhasePending,
+			fmt.Sprintf("Machine is not reachable: %v", err))
 	}
 
-	// Machine is reachable. If there is no modelRef we just mark it Ready.
-	if machine.Spec.ModelRef == nil {
-		return r.updateStatus(ctx, &machine, machinav1alpha2.MachinePhaseReady, "Machine is reachable", 0)
+	r.setSSHReachableCondition(&machine, metav1.ConditionTrue, "Reachable", "Machine is reachable via SSH")
+
+	// If there is no kubernetes configuration we just mark it Ready.
+	if machine.Spec.Kubernetes == nil {
+		return r.updateStatus(ctx, &machine, unboundedv1alpha3.MachinePhaseReady, "Machine is reachable")
 	}
 
-	// If the machine is in a Node-lifecycle phase, handle Node join/orphan.
+	// If the machine is in a Node-lifecycle phase and was previously
+	// provisioned, handle Node join. A machine that is Ready but was never
+	// provisioned (e.g. it was reachable with no kubernetes config, then
+	// kubernetes config was added) needs to go through provisioning first.
 	switch machine.Status.Phase {
-	case machinav1alpha2.MachinePhaseProvisioned,
-		machinav1alpha2.MachinePhaseJoined,
-		machinav1alpha2.MachinePhaseOrphaned:
+	case unboundedv1alpha3.MachinePhaseJoining:
 		return r.reconcileNodeJoin(ctx, &machine)
+	case unboundedv1alpha3.MachinePhaseReady:
+		if wasProvisioned(&machine) {
+			return r.reconcileNodeJoin(ctx, &machine)
+		}
 	}
 
-	// Machine has a modelRef — determine if provisioning is needed.
+	// Machine has kubernetes config — determine if provisioning is needed.
 	return r.reconcileProvisioning(ctx, &machine)
 }
 
 // reconcileProvisioning handles the provisioning lifecycle for a machine that
-// is reachable and has a modelRef.
-func (r *MachineReconciler) reconcileProvisioning(ctx context.Context, machine *machinav1alpha2.Machine) (ctrl.Result, error) {
+// is reachable and has kubernetes configuration.
+func (r *MachineReconciler) reconcileProvisioning(ctx context.Context, machine *unboundedv1alpha3.Machine) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	// Fetch the referenced MachineModel.
-	var model machinav1alpha2.MachineModel
-
-	modelKey := client.ObjectKey{
-		Name: machine.Spec.ModelRef.Name,
-	}
-	if err := r.Get(ctx, modelKey, &model); err != nil {
-		if errors.IsNotFound(err) {
-			return r.updateStatus(ctx, machine, machinav1alpha2.MachinePhaseFailed,
-				fmt.Sprintf("MachineModel %q not found", machine.Spec.ModelRef.Name), 0)
-		}
-
-		logger.Error(err, "Failed to get MachineModel")
-
-		return ctrl.Result{}, err
-	}
-
 	// Check if provisioning is needed.
-	// Only provision from Ready, Pending, Failed, or initial empty phases.
-	// Provisioned, Joined, and Orphaned are handled by reconcileNodeJoin.
+	// Only provision from Pending, Failed, Ready (never provisioned), or
+	// initial empty phases. Joining is handled by reconcileNodeJoin.
 	switch machine.Status.Phase {
-	case machinav1alpha2.MachinePhaseReady,
-		machinav1alpha2.MachinePhasePending,
-		machinav1alpha2.MachinePhaseFailed,
+	case unboundedv1alpha3.MachinePhasePending,
+		unboundedv1alpha3.MachinePhaseFailed,
+		unboundedv1alpha3.MachinePhaseReady,
 		"": // initial empty phase
 		// proceed
 	default:
@@ -208,35 +222,32 @@ func (r *MachineReconciler) reconcileProvisioning(ctx context.Context, machine *
 		return ctrl.Result{RequeueAfter: RequeueAfterPending}, nil
 	}
 
-	// Build SSH config.
-	sshConfig, err := r.buildSSHConfig(ctx, &model)
+	// Build SSH config from the Machine's spec.
+	sshConfig, err := r.buildSSHConfig(ctx, machine)
 	if err != nil {
-		return r.updateStatus(ctx, machine, machinav1alpha2.MachinePhaseFailed,
-			fmt.Sprintf("Failed to build SSH config: %v", err), 0)
+		return r.updateStatus(ctx, machine, unboundedv1alpha3.MachinePhaseFailed,
+			fmt.Sprintf("Failed to build SSH config: %v", err))
 	}
 
-	// Get bootstrap token if kubernetes profile is configured.
-	var bootstrapToken string
-	if model.Spec.KubernetesProfile != nil {
-		bootstrapToken, err = r.getBootstrapToken(ctx, model.Spec.KubernetesProfile.BootstrapTokenRef.Name)
-		if err != nil {
-			return r.updateStatus(ctx, machine, machinav1alpha2.MachinePhaseFailed,
-				fmt.Sprintf("Failed to get bootstrap token: %v", err), 0)
-		}
+	// Get bootstrap token.
+	bootstrapToken, err := r.getBootstrapToken(ctx, machine.Spec.Kubernetes.BootstrapTokenRef.Name)
+	if err != nil {
+		return r.updateStatus(ctx, machine, unboundedv1alpha3.MachinePhaseFailed,
+			fmt.Sprintf("Failed to get bootstrap token: %v", err))
 	}
 
 	// Set phase to Provisioning.
-	if _, err := r.updateStatus(ctx, machine, machinav1alpha2.MachinePhaseProvisioning,
-		"Provisioning machine", 0); err != nil {
+	if _, err := r.updateStatus(ctx, machine, unboundedv1alpha3.MachinePhaseProvisioning,
+		"Provisioning machine"); err != nil {
 		return ctrl.Result{}, err
 	}
 
 	// Provision the machine.
 	var provisionErr error
 	if r.Provisioner != nil {
-		provisionErr = r.Provisioner.ProvisionMachine(ctx, machine, &model, sshConfig, bootstrapToken, r.ClusterInfo)
+		provisionErr = r.Provisioner.ProvisionMachine(ctx, machine, sshConfig, bootstrapToken, r.ClusterInfo)
 	} else {
-		provisionErr = r.provisionMachine(ctx, machine, &model, sshConfig, bootstrapToken)
+		provisionErr = r.provisionMachine(ctx, machine, sshConfig, bootstrapToken)
 	}
 
 	if provisionErr != nil {
@@ -247,8 +258,8 @@ func (r *MachineReconciler) reconcileProvisioning(ctx context.Context, machine *
 			return ctrl.Result{}, err
 		}
 
-		return r.updateStatus(ctx, machine, machinav1alpha2.MachinePhaseFailed,
-			fmt.Sprintf("Provisioning failed: %v", provisionErr), 0)
+		return r.updateStatus(ctx, machine, unboundedv1alpha3.MachinePhaseFailed,
+			fmt.Sprintf("Provisioning failed: %v", provisionErr))
 	}
 
 	logger.Info("Machine provisioned successfully", "machine", machine.Name)
@@ -258,13 +269,22 @@ func (r *MachineReconciler) reconcileProvisioning(ctx context.Context, machine *
 		return ctrl.Result{}, err
 	}
 
-	return r.updateStatus(ctx, machine, machinav1alpha2.MachinePhaseProvisioned,
-		"Machine provisioned successfully", model.Generation)
+	// Set the Provisioned condition with the current generation.
+	apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
+		Type:               unboundedv1alpha3.MachineConditionProvisioned,
+		Status:             metav1.ConditionTrue,
+		Reason:             "Provisioned",
+		Message:            "Machine provisioned successfully",
+		ObservedGeneration: machine.Generation,
+	})
+
+	return r.updateStatus(ctx, machine, unboundedv1alpha3.MachinePhaseJoining,
+		"Machine provisioned successfully, waiting for Node to join")
 }
 
-// buildSSHConfig creates SSH client configuration from the model.
-func (r *MachineReconciler) buildSSHConfig(ctx context.Context, model *machinav1alpha2.MachineModel) (*ssh.ClientConfig, error) {
-	privateKey, err := r.getSecretValue(ctx, &model.Spec.SSHPrivateKeyRef)
+// buildSSHConfig creates SSH client configuration from the Machine's SSH spec.
+func (r *MachineReconciler) buildSSHConfig(ctx context.Context, machine *unboundedv1alpha3.Machine) (*ssh.ClientConfig, error) {
+	privateKey, err := r.getSecretValue(ctx, &machine.Spec.SSH.PrivateKeyRef)
 	if err != nil {
 		return nil, fmt.Errorf("get SSH private key: %w", err)
 	}
@@ -274,7 +294,7 @@ func (r *MachineReconciler) buildSSHConfig(ctx context.Context, model *machinav1
 		return nil, fmt.Errorf("parse SSH private key: %w", err)
 	}
 
-	username := model.Spec.SSHUsername
+	username := machine.Spec.SSH.Username
 	if username == "" {
 		username = "azureuser"
 	}
@@ -290,7 +310,7 @@ func (r *MachineReconciler) buildSSHConfig(ctx context.Context, model *machinav1
 }
 
 // getSecretValue retrieves a value from a secret in the machina-system namespace.
-func (r *MachineReconciler) getSecretValue(ctx context.Context, ref *machinav1alpha2.SecretKeySelector) (string, error) {
+func (r *MachineReconciler) getSecretValue(ctx context.Context, ref *unboundedv1alpha3.SecretKeySelector) (string, error) {
 	var secret corev1.Secret
 	if err := r.Get(ctx, client.ObjectKey{Namespace: SecretNamespaceMachinaSystem, Name: ref.Name}, &secret); err != nil {
 		return "", fmt.Errorf("get secret %s: %w", ref.Name, err)
@@ -333,28 +353,22 @@ func (r *MachineReconciler) getBootstrapToken(ctx context.Context, secretName st
 // provisionMachine provisions a single machine via SSH.
 func (r *MachineReconciler) provisionMachine(
 	ctx context.Context,
-	machine *machinav1alpha2.Machine,
-	model *machinav1alpha2.MachineModel,
+	machine *unboundedv1alpha3.Machine,
 	sshConfig *ssh.ClientConfig,
 	bootstrapToken string,
 ) error {
 	logger := log.FromContext(ctx)
 
-	port := machine.Spec.SSH.Port
-	if port == 0 {
-		port = 22
-	}
-
-	address := fmt.Sprintf("%s:%d", machine.Spec.SSH.Host, port)
+	address := hostPort(machine.Spec.SSH.Host)
 
 	var (
 		sshClient *ssh.Client
 		err       error
 	)
 
-	// Handle jumpbox if configured.
-	if model.Spec.Jumpbox != nil {
-		sshClient, err = r.dialViaJumpHost(ctx, model, address, sshConfig)
+	// Handle bastion if configured.
+	if machine.Spec.SSH.Bastion != nil {
+		sshClient, err = r.dialViaBastion(ctx, machine, address, sshConfig)
 	} else {
 		sshClient, err = ssh.Dial("tcp", address, sshConfig)
 	}
@@ -373,7 +387,9 @@ func (r *MachineReconciler) provisionMachine(
 		return fmt.Errorf("create SSH session for script copy: %w", err)
 	}
 
-	copySession.Stdin = bytes.NewBufferString(model.Spec.AgentInstallScript)
+	agentInstallScript := provision.AKSFlexInstallScript()
+
+	copySession.Stdin = bytes.NewBufferString(agentInstallScript)
 
 	if runErr := copySession.Run(fmt.Sprintf("cat > %s && chmod +x %s", remoteScriptPath, remoteScriptPath)); runErr != nil {
 		copySession.Close() //nolint:errcheck // Best-effort close after failed run.
@@ -404,8 +420,8 @@ func (r *MachineReconciler) provisionMachine(
 		k8sVersion = r.ClusterInfo.KubeVersion
 	}
 
-	if model.Spec.KubernetesProfile != nil && model.Spec.KubernetesProfile.Version != "" {
-		k8sVersion = model.Spec.KubernetesProfile.Version
+	if machine.Spec.Kubernetes != nil && machine.Spec.Kubernetes.Version != "" {
+		k8sVersion = machine.Spec.Kubernetes.Version
 	}
 
 	if k8sVersion != "" && !strings.HasPrefix(k8sVersion, "v") {
@@ -423,6 +439,11 @@ func (r *MachineReconciler) provisionMachine(
 		clusterDNS = r.ClusterInfo.ClusterDNS
 		clusterRG = r.ClusterInfo.ClusterRG
 	}
+
+	// Node labels are currently not propagated to the install script.
+	// The NODE_LABELS env var is intentionally left empty until the
+	// embedded AKS Flex Node install script supports consuming it.
+	nodeLabels := ""
 
 	logger.Info("Executing agent install script", "machine", machine.Name)
 
@@ -446,6 +467,7 @@ func (r *MachineReconciler) provisionMachine(
 			`export CLUSTER_DNS=%q; `+
 			`export CLUSTER_RG=%q; `+
 			`export MACHINA_MACHINE_NAME=%q; `+
+			`export NODE_LABELS=%q; `+
 			`sudo -E bash %s`,
 		apiServer,
 		bootstrapToken,
@@ -454,6 +476,7 @@ func (r *MachineReconciler) provisionMachine(
 		clusterDNS,
 		clusterRG,
 		machine.Name,
+		nodeLabels,
 		remoteScriptPath,
 	)
 
@@ -466,122 +489,92 @@ func (r *MachineReconciler) provisionMachine(
 	return nil
 }
 
-// dialViaJumpHost establishes SSH connection through a jumpbox.
-func (r *MachineReconciler) dialViaJumpHost(
+// dialViaBastion establishes an SSH connection through a bastion host.
+func (r *MachineReconciler) dialViaBastion(
 	ctx context.Context,
-	model *machinav1alpha2.MachineModel,
+	machine *unboundedv1alpha3.Machine,
 	targetAddress string,
 	targetConfig *ssh.ClientConfig,
 ) (*ssh.Client, error) {
-	jumpbox := model.Spec.Jumpbox
+	bastion := machine.Spec.SSH.Bastion
 
-	jumpPort := jumpbox.Port
-	if jumpPort == 0 {
-		jumpPort = 22
+	bastionAddress := hostPort(bastion.Host)
+
+	bastionUsername := bastion.Username
+	if bastionUsername == "" {
+		bastionUsername = "azureuser"
 	}
 
-	jumpUsername := jumpbox.SSHUsername
-	if jumpUsername == "" {
-		jumpUsername = "azureuser"
-	}
-
-	// Get jumpbox key — fall back to model's key if not specified.
-	var jumpKeyRef *machinav1alpha2.SecretKeySelector
-	if jumpbox.SSHPrivateKeyRef != nil {
-		jumpKeyRef = jumpbox.SSHPrivateKeyRef
+	// Get bastion key — fall back to machine's key if not specified.
+	var bastionKeyRef *unboundedv1alpha3.SecretKeySelector
+	if bastion.PrivateKeyRef != nil {
+		bastionKeyRef = bastion.PrivateKeyRef
 	} else {
-		jumpKeyRef = &model.Spec.SSHPrivateKeyRef
+		bastionKeyRef = &machine.Spec.SSH.PrivateKeyRef
 	}
 
-	jumpPrivateKey, err := r.getSecretValue(ctx, jumpKeyRef)
+	bastionPrivateKey, err := r.getSecretValue(ctx, bastionKeyRef)
 	if err != nil {
-		return nil, fmt.Errorf("get jumpbox SSH private key: %w", err)
+		return nil, fmt.Errorf("get bastion SSH private key: %w", err)
 	}
 
-	jumpSigner, err := ssh.ParsePrivateKey([]byte(jumpPrivateKey))
+	bastionSigner, err := ssh.ParsePrivateKey([]byte(bastionPrivateKey))
 	if err != nil {
-		return nil, fmt.Errorf("parse jumpbox SSH private key: %w", err)
+		return nil, fmt.Errorf("parse bastion SSH private key: %w", err)
 	}
 
-	jumpConfig := &ssh.ClientConfig{
-		User: jumpUsername,
+	bastionConfig := &ssh.ClientConfig{
+		User: bastionUsername,
 		Auth: []ssh.AuthMethod{
-			ssh.PublicKeys(jumpSigner),
+			ssh.PublicKeys(bastionSigner),
 		},
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec
 		Timeout:         SSHConnectTimeout,
 	}
 
-	jumpAddress := fmt.Sprintf("%s:%d", jumpbox.Host, jumpPort)
-
-	jumpClient, err := ssh.Dial("tcp", jumpAddress, jumpConfig)
+	bastionClient, err := ssh.Dial("tcp", bastionAddress, bastionConfig)
 	if err != nil {
-		return nil, fmt.Errorf("dial jumpbox: %w", err)
+		return nil, fmt.Errorf("dial bastion: %w", err)
 	}
 
-	conn, err := jumpClient.Dial("tcp", targetAddress)
+	conn, err := bastionClient.Dial("tcp", targetAddress)
 	if err != nil {
-		jumpClient.Close() //nolint:errcheck // Best-effort close after dial failure.
-		return nil, fmt.Errorf("dial target through jumpbox: %w", err)
+		bastionClient.Close() //nolint:errcheck // Best-effort close after dial failure.
+		return nil, fmt.Errorf("dial target through bastion: %w", err)
 	}
 
 	ncc, chans, reqs, err := ssh.NewClientConn(conn, targetAddress, targetConfig)
 	if err != nil {
-		conn.Close()       //nolint:errcheck // Best-effort close after handshake failure.
-		jumpClient.Close() //nolint:errcheck // Best-effort close after handshake failure.
+		conn.Close()          //nolint:errcheck // Best-effort close after handshake failure.
+		bastionClient.Close() //nolint:errcheck // Best-effort close after handshake failure.
 
-		return nil, fmt.Errorf("create client connection through jumpbox: %w", err)
+		return nil, fmt.Errorf("create client connection through bastion: %w", err)
 	}
 
 	return ssh.NewClient(ncc, chans, reqs), nil
 }
 
+// setSSHReachableCondition updates the SSHReachable condition on the machine.
+func (r *MachineReconciler) setSSHReachableCondition(machine *unboundedv1alpha3.Machine, status metav1.ConditionStatus, reason, message string) {
+	apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
+		Type:    unboundedv1alpha3.MachineConditionSSHReachable,
+		Status:  status,
+		Reason:  reason,
+		Message: message,
+	})
+}
+
 // updateStatus updates the machine status and returns the appropriate result.
 func (r *MachineReconciler) updateStatus(
 	ctx context.Context,
-	machine *machinav1alpha2.Machine,
-	phase machinav1alpha2.MachinePhase,
+	machine *unboundedv1alpha3.Machine,
+	phase unboundedv1alpha3.MachinePhase,
 	message string,
-	modelGeneration int64,
 ) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
 	machine.Status.Phase = phase
 	machine.Status.Message = message
-	machine.Status.LastProbeTime = &metav1.Time{Time: time.Now()}
-
-	if phase == machinav1alpha2.MachinePhaseProvisioned && modelGeneration > 0 {
-		machine.Status.ProvisionedModelGeneration = modelGeneration
-	}
-
-	// Update condition.
-	condition := metav1.Condition{
-		Type:               "Ready",
-		Status:             metav1.ConditionFalse,
-		Reason:             string(phase),
-		Message:            message,
-		LastTransitionTime: metav1.Now(),
-	}
-
-	if phase == machinav1alpha2.MachinePhaseReady || phase == machinav1alpha2.MachinePhaseProvisioned || phase == machinav1alpha2.MachinePhaseJoined {
-		condition.Status = metav1.ConditionTrue
-	}
-
-	// Update or add the condition.
-	found := false
-
-	for i, c := range machine.Status.Conditions {
-		if c.Type == condition.Type {
-			machine.Status.Conditions[i] = condition
-			found = true
-
-			break
-		}
-	}
-
-	if !found {
-		machine.Status.Conditions = append(machine.Status.Conditions, condition)
-	}
 
 	if err := r.Status().Update(ctx, machine); err != nil {
 		logger.Error(err, "Failed to update Machine status")
@@ -592,15 +585,11 @@ func (r *MachineReconciler) updateStatus(
 
 	// Determine requeue interval based on phase.
 	switch phase {
-	case machinav1alpha2.MachinePhaseReady:
+	case unboundedv1alpha3.MachinePhaseReady:
 		return ctrl.Result{RequeueAfter: RequeueAfterReady}, nil
-	case machinav1alpha2.MachinePhaseProvisioned:
-		return ctrl.Result{RequeueAfter: RequeueAfterProvisioned}, nil
-	case machinav1alpha2.MachinePhaseJoined:
-		return ctrl.Result{RequeueAfter: RequeueAfterJoined}, nil
-	case machinav1alpha2.MachinePhaseOrphaned:
-		return ctrl.Result{RequeueAfter: RequeueAfterOrphaned}, nil
-	case machinav1alpha2.MachinePhaseFailed:
+	case unboundedv1alpha3.MachinePhaseJoining:
+		return ctrl.Result{RequeueAfter: RequeueAfterJoining}, nil
+	case unboundedv1alpha3.MachinePhaseFailed:
 		return ctrl.Result{RequeueAfter: RequeueAfterFailed}, nil
 	default:
 		return ctrl.Result{RequeueAfter: RequeueAfterPending}, nil
@@ -615,11 +604,7 @@ func (r *MachineReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&machinav1alpha2.Machine{}).
-		Watches(
-			&machinav1alpha2.MachineModel{},
-			handler.EnqueueRequestsFromMapFunc(r.findMachinesForModel),
-		).
+		For(&unboundedv1alpha3.Machine{}).
 		Watches(
 			&corev1.Node{},
 			handler.EnqueueRequestsFromMapFunc(r.findMachineForNode),
@@ -628,42 +613,15 @@ func (r *MachineReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-// findMachinesForModel finds all machines that reference the given model.
-func (r *MachineReconciler) findMachinesForModel(ctx context.Context, obj client.Object) []ctrl.Request {
-	model, ok := obj.(*machinav1alpha2.MachineModel)
-	if !ok {
-		return nil
-	}
-
-	var machines machinav1alpha2.MachineList
-	if err := r.List(ctx, &machines); err != nil {
-		return nil
-	}
-
-	var requests []ctrl.Request
-
-	for _, machine := range machines.Items {
-		if machine.Spec.ModelRef != nil && machine.Spec.ModelRef.Name == model.Name {
-			requests = append(requests, ctrl.Request{
-				NamespacedName: client.ObjectKey{
-					Name: machine.Name,
-				},
-			})
-		}
-	}
-
-	return requests
-}
-
 // findMachineForNode maps a Node event to the Machine that owns it (if any)
-// by looking at the MachinaNodeLabel label on the Node.
+// by looking at the MachineNodeLabel label on the Node.
 func (r *MachineReconciler) findMachineForNode(_ context.Context, obj client.Object) []ctrl.Request {
 	node, ok := obj.(*corev1.Node)
 	if !ok {
 		return nil
 	}
 
-	machineName, found := node.Labels[MachinaNodeLabel]
+	machineName, found := node.Labels[MachineNodeLabel]
 	if !found || machineName == "" {
 		return nil
 	}
@@ -675,67 +633,83 @@ func (r *MachineReconciler) findMachineForNode(_ context.Context, obj client.Obj
 
 // reconcileNodeJoin handles the Node lifecycle for a provisioned Machine.
 // It looks for a Node with the matching label and transitions the Machine
-// between Provisioned, Joined, and Orphaned phases.
-func (r *MachineReconciler) reconcileNodeJoin(ctx context.Context, machine *machinav1alpha2.Machine) (ctrl.Result, error) {
+// between Joining and Ready phases.
+func (r *MachineReconciler) reconcileNodeJoin(ctx context.Context, machine *unboundedv1alpha3.Machine) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	// Look for a Node with the matching label.
+	// Determine the node name to look for. If the machine has a nodeRef in
+	// its kubernetes spec, use that; otherwise look up by label.
 	var nodeList corev1.NodeList
-	if err := r.List(ctx, &nodeList, client.MatchingLabels{MachinaNodeLabel: machine.Name}); err != nil {
-		logger.Error(err, "Failed to list Nodes for Machine", "machine", machine.Name)
-		return ctrl.Result{}, err
+
+	if machine.Spec.Kubernetes != nil && machine.Spec.Kubernetes.NodeRef != nil {
+		// Look for the specific node by name.
+		var node corev1.Node
+		if err := r.Get(ctx, client.ObjectKey{Name: machine.Spec.Kubernetes.NodeRef.Name}, &node); err != nil {
+			if errors.IsNotFound(err) {
+				// Node doesn't exist yet; handled below.
+			} else {
+				logger.Error(err, "Failed to get Node for Machine", "machine", machine.Name)
+				return ctrl.Result{}, err
+			}
+		} else {
+			nodeList.Items = append(nodeList.Items, node)
+		}
+	} else {
+		// Look for a Node with the matching label.
+		if err := r.List(ctx, &nodeList, client.MatchingLabels{MachineNodeLabel: machine.Name}); err != nil {
+			logger.Error(err, "Failed to list Nodes for Machine", "machine", machine.Name)
+			return ctrl.Result{}, err
+		}
 	}
 
 	switch machine.Status.Phase {
-	case machinav1alpha2.MachinePhaseProvisioned:
+	case unboundedv1alpha3.MachinePhaseJoining:
 		if len(nodeList.Items) == 0 {
 			// Still waiting for Node to appear.
-			return ctrl.Result{RequeueAfter: RequeueAfterProvisioned}, nil
+			return ctrl.Result{RequeueAfter: RequeueAfterJoining}, nil
 		}
 
-		// Node found — transition to Joined.
+		// Node found — transition to Ready.
 		node := &nodeList.Items[0]
 
-		logger.Info("Node found for Machine, transitioning to Joined",
+		logger.Info("Node found for Machine, transitioning to Ready",
 			"machine", machine.Name, "node", node.Name)
 
-		machine.Status.NodeRef = &machinav1alpha2.NodeReference{Name: node.Name}
+		// Update nodeRef in the kubernetes spec if not already set.
+		if machine.Spec.Kubernetes != nil && machine.Spec.Kubernetes.NodeRef == nil {
+			machine.Spec.Kubernetes.NodeRef = &unboundedv1alpha3.LocalObjectReference{Name: node.Name}
 
-		return r.updateStatus(ctx, machine, machinav1alpha2.MachinePhaseJoined,
-			fmt.Sprintf("Node %s joined", node.Name), 0)
-
-	case machinav1alpha2.MachinePhaseJoined:
-		if len(nodeList.Items) > 0 {
-			// Node still exists — stay Joined.
-			return ctrl.Result{RequeueAfter: RequeueAfterJoined}, nil
+			if err := r.Update(ctx, machine); err != nil {
+				logger.Error(err, "Failed to update Machine spec with nodeRef", "machine", machine.Name)
+				return ctrl.Result{}, err
+			}
 		}
 
-		// Node disappeared — transition to Orphaned.
-		logger.Info("Node disappeared for Machine, transitioning to Orphaned",
+		return r.updateStatus(ctx, machine, unboundedv1alpha3.MachinePhaseReady,
+			fmt.Sprintf("Node %s joined", node.Name))
+
+	case unboundedv1alpha3.MachinePhaseReady:
+		if len(nodeList.Items) > 0 {
+			// Node still exists — stay Ready.
+			return ctrl.Result{RequeueAfter: RequeueAfterReady}, nil
+		}
+
+		// Node disappeared — transition back to Joining so we wait for
+		// it to come back (or re-provision on the next cycle).
+		logger.Info("Node disappeared for Machine, transitioning to Joining",
 			"machine", machine.Name)
 
-		return r.updateStatus(ctx, machine, machinav1alpha2.MachinePhaseOrphaned,
-			"Node disappeared", 0)
-
-	case machinav1alpha2.MachinePhaseOrphaned:
-		if len(nodeList.Items) == 0 {
-			// Still orphaned.
-			return ctrl.Result{RequeueAfter: RequeueAfterOrphaned}, nil
-		}
-
-		// Node reappeared — transition back to Joined.
-		node := &nodeList.Items[0]
-
-		logger.Info("Node reappeared for Machine, transitioning to Joined",
-			"machine", machine.Name, "node", node.Name)
-
-		machine.Status.NodeRef = &machinav1alpha2.NodeReference{Name: node.Name}
-
-		return r.updateStatus(ctx, machine, machinav1alpha2.MachinePhaseJoined,
-			fmt.Sprintf("Node %s rejoined", node.Name), 0)
+		return r.updateStatus(ctx, machine, unboundedv1alpha3.MachinePhaseJoining,
+			"Node disappeared, waiting for Node to rejoin")
 
 	default:
 		// Should not be called for other phases, but handle gracefully.
 		return ctrl.Result{}, nil
 	}
+}
+
+// wasProvisioned returns true if the machine has a Provisioned condition set to True.
+func wasProvisioned(machine *unboundedv1alpha3.Machine) bool {
+	cond := apimeta.FindStatusCondition(machine.Status.Conditions, unboundedv1alpha3.MachineConditionProvisioned)
+	return cond != nil && cond.Status == metav1.ConditionTrue
 }
