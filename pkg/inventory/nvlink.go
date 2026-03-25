@@ -2,10 +2,12 @@ package inventory
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -30,13 +32,13 @@ var imexNodeLine = regexp.MustCompile(
 // collectIMEXNeighbors runs `nvidia-imex-ctl -H` and parses the output into
 // NeighborRecords for the neighbors table. Returns nil, nil if the command is
 // not available.
-func collectIMEXNeighbors(hostID string) ([]NeighborRecord, error) {
+func collectIMEXNeighbors(ctx context.Context, hostID string) ([]NeighborRecord, error) {
 	path, err := exec.LookPath("nvidia-imex-ctl")
 	if err != nil {
 		return nil, nil // not installed, nothing to collect
 	}
 
-	out, err := exec.Command(path, "-H").Output()
+	out, err := exec.CommandContext(ctx, path, "-H").Output()
 	if err != nil {
 		return nil, fmt.Errorf("nvidia-imex-ctl: %w", err)
 	}
@@ -58,8 +60,10 @@ func parseIMEXOutput(hostID string, data []byte) ([]NeighborRecord, error) {
 			continue
 		}
 
-		nodeIdx := 0
-		fmt.Sscanf(m[1], "%d", &nodeIdx)
+		nodeIdx, err := strconv.Atoi(m[1])
+		if err != nil {
+			continue
+		}
 
 		attrs := IMEXNodeAttributes{
 			NodeIndex: nodeIdx,
@@ -83,13 +87,19 @@ func parseIMEXOutput(hostID string, data []byte) ([]NeighborRecord, error) {
 // printIMEXNeighbors prints discovered IMEX peers to stdout.
 func printIMEXNeighbors(neighbors []NeighborRecord) {
 	fmt.Printf("IMEX Domain Peers Found: %d\n", len(neighbors))
+
 	for i, n := range neighbors {
 		var attrs IMEXNodeAttributes
-		_ = json.Unmarshal(n.Attributes, &attrs)
+
+		if err := json.Unmarshal(n.Attributes, &attrs); err != nil {
+			continue
+		}
+
 		marker := " "
 		if attrs.IsLocal {
 			marker = "*"
 		}
+
 		fmt.Printf("  %sNode %d (%s): %s  %-13s  version=%s  host=%s\n",
 			marker, i, attrs.IPAddress, attrs.Status, "", attrs.Version, attrs.Hostname)
 	}

@@ -1,6 +1,7 @@
 package inventory
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -36,6 +37,7 @@ func DiskToRecord(d *DiskInfo, hostID string) DeviceRecord {
 	if serial == "" {
 		serial = "disk-" + d.Name
 	}
+
 	return DeviceRecord{
 		DeviceType:     DeviceTypeDisk,
 		DeviceName:     d.Name,
@@ -68,13 +70,14 @@ type DiskInfo struct {
 }
 
 // collectDiskInfo discovers block devices and returns info for each disk.
-func collectDiskInfo() ([]DiskInfo, error) {
+func collectDiskInfo(ctx context.Context) ([]DiskInfo, error) {
 	entries, err := os.ReadDir("/sys/block")
 	if err != nil {
 		return nil, fmt.Errorf("failed to read /sys/block: %w", err)
 	}
 
 	var disks []DiskInfo
+
 	for _, e := range entries {
 		name := e.Name()
 
@@ -95,7 +98,7 @@ func collectDiskInfo() ([]DiskInfo, error) {
 		disk.Speed = readLinkSpeed(name, base)
 		disk.SerialNumber = readDiskSerial(name)
 		disk.Firmware = readDiskFirmware(name)
-		disk.Driver, disk.DriverVersion = readDiskDriver(name, base)
+		disk.Driver, disk.DriverVersion = readDiskDriver(ctx, name, base)
 
 		disks = append(disks, disk)
 	}
@@ -109,6 +112,7 @@ func readBlockDeviceSize(base string) uint64 {
 	if sizeStr == "" {
 		return 0
 	}
+
 	var sectors uint64
 	if _, err := fmt.Sscanf(sizeStr, "%d", &sectors); err != nil {
 		return 0
@@ -130,6 +134,7 @@ func detectDiskType(name, base string) DiskType {
 	if err == nil && strings.Contains(devicePath, "/nvme") {
 		return DiskTypeNVMe
 	}
+
 	subsystem, err := filepath.EvalSymlinks(filepath.Join(base, "device", "subsystem"))
 	if err == nil && strings.HasSuffix(subsystem, "/nvme") {
 		return DiskTypeNVMe
@@ -150,6 +155,7 @@ func detectDiskType(name, base string) DiskType {
 		if discardGran != "" && discardGran != "0" {
 			return DiskTypeSSD
 		}
+
 		return DiskTypeHDD
 	}
 
@@ -163,6 +169,7 @@ func readLinkSpeed(name, base string) string {
 		deviceLink, err := os.Readlink(filepath.Join(base, "device"))
 		if err == nil {
 			pciDir := filepath.Join(base, "device", deviceLink)
+
 			speed := readSysfsField(filepath.Join(pciDir, "current_link_speed"))
 			if speed != "" {
 				return speed
@@ -200,10 +207,8 @@ func readDiskSerial(name string) string {
 	// NVMe exposes serial under the nvme controller.
 	if strings.HasPrefix(name, "nvme") {
 		// e.g., nvme0n1 → controller is nvme0.
-		ctrl := strings.TrimRight(name, "0123456789")
-		if strings.HasSuffix(ctrl, "n") {
-			ctrl = strings.TrimSuffix(ctrl, "n")
-		}
+		ctrl := strings.TrimSuffix(strings.TrimRight(name, "0123456789"), "n")
+
 		serial = readSysfsField(filepath.Join("/sys/class/nvme", ctrl, "serial"))
 		if serial != "" {
 			return serial
@@ -220,6 +225,7 @@ func readDiskFirmware(name string) string {
 	if fw != "" {
 		return fw
 	}
+
 	fw = readSysfsField(filepath.Join("/sys/block", name, "device", "rev"))
 	if fw != "" {
 		return fw
@@ -227,10 +233,8 @@ func readDiskFirmware(name string) string {
 
 	// NVMe: firmware is under the controller.
 	if strings.HasPrefix(name, "nvme") {
-		ctrl := strings.TrimRight(name, "0123456789")
-		if strings.HasSuffix(ctrl, "n") {
-			ctrl = strings.TrimSuffix(ctrl, "n")
-		}
+		ctrl := strings.TrimSuffix(strings.TrimRight(name, "0123456789"), "n")
+
 		fw = readSysfsField(filepath.Join("/sys/class/nvme", ctrl, "firmware_rev"))
 		if fw != "" {
 			return fw
@@ -246,11 +250,12 @@ func readSysfsField(path string) string {
 	if err != nil {
 		return ""
 	}
+
 	return strings.TrimSpace(string(data))
 }
 
 // readDiskDriver determines the driver and its version for a block device.
-func readDiskDriver(name, base string) (string, string) {
+func readDiskDriver(ctx context.Context, name, base string) (string, string) {
 	var driverName string
 
 	// Direct device driver symlink (works for NVMe and some others).
@@ -269,7 +274,8 @@ func readDiskDriver(name, base string) (string, string) {
 		return "", ""
 	}
 
-	version := readDriverVersion(driverName)
+	version := readDriverVersion(ctx, driverName)
+
 	return driverName, version
 }
 
@@ -283,13 +289,16 @@ func readScsiHostDriver(base string) string {
 
 	// Walk path components to find "hostN".
 	parts := strings.Split(devicePath, "/")
+
 	var hostName string
+
 	for _, p := range parts {
 		if strings.HasPrefix(p, "host") {
 			hostName = p
 			break
 		}
 	}
+
 	if hostName == "" {
 		return ""
 	}
@@ -299,48 +308,58 @@ func readScsiHostDriver(base string) string {
 }
 
 // readDriverVersion gets the version of a kernel module via modinfo.
-func readDriverVersion(driverName string) string {
-	out, err := exec.Command("modinfo", "-F", "version", driverName).Output()
+func readDriverVersion(ctx context.Context, driverName string) string {
+	out, err := exec.CommandContext(ctx, "modinfo", "-F", "version", driverName).Output()
 	if err != nil {
 		return ""
 	}
+
 	v := strings.TrimSpace(string(out))
 	if v != "" {
 		return v
 	}
 
 	// Some built-in modules don't have a version field; try vermagic.
-	out, err = exec.Command("modinfo", "-F", "vermagic", driverName).Output()
+	out, err = exec.CommandContext(ctx, "modinfo", "-F", "vermagic", driverName).Output()
 	if err != nil {
 		return ""
 	}
+
 	fields := strings.Fields(string(out))
 	if len(fields) > 0 {
 		return fields[0] + " (kernel)"
 	}
+
 	return ""
 }
 
 // printDiskInfo prints the collected disk information to stdout.
 func printDiskInfo(disks []DiskInfo) {
 	fmt.Printf("Disks Found:     %d\n", len(disks))
+
 	for i, d := range disks {
 		fmt.Printf("\n  Disk %d (%s):\n", i, d.Name)
 		fmt.Printf("    Type:          %s\n", d.Type)
 		fmt.Printf("    Size:          %s\n", formatBytes(d.SizeBytes))
+
 		if d.SerialNumber != "" {
 			fmt.Printf("    Serial Number: %s\n", d.SerialNumber)
 		}
+
 		if d.Firmware != "" {
 			fmt.Printf("    Firmware:      %s\n", d.Firmware)
 		}
+
 		fmt.Printf("    Block Size:    %s\n", d.BlockSize)
+
 		if d.Speed != "" {
 			fmt.Printf("    Speed:         %s\n", d.Speed)
 		}
+
 		if d.Driver != "" {
 			fmt.Printf("    Driver:        %s\n", d.Driver)
 		}
+
 		if d.DriverVersion != "" {
 			fmt.Printf("    Driver Ver:    %s\n", d.DriverVersion)
 		}

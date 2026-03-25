@@ -1,6 +1,7 @@
 package inventory
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -32,10 +33,12 @@ func ChassisToRecord(c *ChassisInfo, hostID string) DeviceRecord {
 	if name == "" {
 		name = "System"
 	}
+
 	serial := c.SerialNumber
 	if serial == "" {
 		serial = "chassis-0"
 	}
+
 	return DeviceRecord{
 		DeviceType:     DeviceTypeChassis,
 		DeviceName:     name,
@@ -54,10 +57,11 @@ func ChassisToRecord(c *ChassisInfo, hostID string) DeviceRecord {
 // collectChassisInfo reads system/motherboard identity from DMI sysfs entries.
 // When DMI sysfs is unavailable it still returns a ChassisInfo populated with
 // whatever fallback identifier can be found (product_uuid or machine-id).
-func collectChassisInfo() (*ChassisInfo, error) {
+func collectChassisInfo(_ context.Context) (*ChassisInfo, error) {
 	dmiBase := "/sys/class/dmi/id"
 
 	info := &ChassisInfo{}
+
 	var collectErr error
 
 	if _, err := os.Stat(dmiBase); err != nil {
@@ -70,7 +74,11 @@ func collectChassisInfo() (*ChassisInfo, error) {
 	}
 
 	info.IsVirtual = detectVirtual(dmiBase)
-	info.Hostname, _ = os.Hostname()
+
+	hostname, err := os.Hostname()
+	if err == nil {
+		info.Hostname = hostname
+	}
 
 	// If no usable DMI serial was found, fall back to the SMBIOS product
 	// UUID or the systemd machine-id as a stable host identifier.
@@ -88,9 +96,11 @@ func fallbackHostIdentifier(dmiBase string) string {
 	if uuid := readSysfsField(filepath.Join(dmiBase, "product_uuid")); uuid != "" && !isDMIPlaceholder(uuid) {
 		return uuid
 	}
+
 	if mid := readSysfsField("/etc/machine-id"); mid != "" {
 		return mid
 	}
+
 	return ""
 }
 
@@ -103,6 +113,7 @@ func readDMIField(dmiBase string, candidates ...string) string {
 			return val
 		}
 	}
+
 	return ""
 }
 
@@ -113,6 +124,7 @@ func isDMIPlaceholder(s string) bool {
 	case "to be filled by o.e.m.", "default string", "not specified", "not available", "none", "n/a", "unknown":
 		return true
 	}
+
 	return false
 }
 
@@ -155,20 +167,26 @@ func detectVirtual(dmiBase string) bool {
 // printChassisInfo prints the collected chassis information to stdout.
 func printChassisInfo(c *ChassisInfo) {
 	fmt.Println("Chassis / System:")
+
 	if c.Manufacturer != "" {
 		fmt.Printf("  Manufacturer:  %s\n", c.Manufacturer)
 	}
+
 	if c.Model != "" {
 		fmt.Printf("  Model:         %s\n", c.Model)
 	}
+
 	if c.SerialNumber != "" {
 		fmt.Printf("  Serial Number: %s\n", c.SerialNumber)
 	}
+
 	if c.Hostname != "" {
 		fmt.Printf("  Hostname:      %s\n", c.Hostname)
 	}
+
 	if c.BIOSVersion != "" {
 		fmt.Printf("  BIOS Version:  %s\n", c.BIOSVersion)
 	}
+
 	fmt.Printf("  Virtual:       %t\n", c.IsVirtual)
 }

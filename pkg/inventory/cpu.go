@@ -2,6 +2,7 @@ package inventory
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -27,10 +28,12 @@ func CPUToRecord(c *CPUInfo, hostID string) DeviceRecord {
 	if name == "" {
 		name = "CPU"
 	}
+
 	serial := strings.Join(c.SerialNumbers, ",")
 	if serial == "" {
 		serial = "cpu-0"
 	}
+
 	return DeviceRecord{
 		DeviceType:     DeviceTypeCPU,
 		DeviceName:     name,
@@ -65,12 +68,17 @@ type CPUInfo struct {
 }
 
 // collectCpuInfo reads /proc/cpuinfo and returns a CPUInfo.
-func collectCpuInfo() (*CPUInfo, error) {
+func collectCpuInfo(ctx context.Context) (*CPUInfo, error) {
 	f, err := os.Open("/proc/cpuinfo")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open /proc/cpuinfo: %w", err)
 	}
-	defer f.Close()
+
+	defer func() {
+		if cerr := f.Close(); cerr != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to close /proc/cpuinfo: %v\n", cerr)
+		}
+	}()
 
 	type rawCPU struct {
 		modelName    string
@@ -83,6 +91,7 @@ func collectCpuInfo() (*CPUInfo, error) {
 	}
 
 	var cpus []rawCPU
+
 	current := rawCPU{}
 	hasProcessor := false
 	physicalIDs := make(map[string]struct{})
@@ -97,10 +106,13 @@ func collectCpuInfo() (*CPUInfo, error) {
 				if current.physicalID != "" {
 					physicalIDs[current.physicalID] = struct{}{}
 				}
+
 				cpus = append(cpus, current)
 			}
+
 			current = rawCPU{}
 			hasProcessor = false
+
 			continue
 		}
 
@@ -108,6 +120,7 @@ func collectCpuInfo() (*CPUInfo, error) {
 		if len(parts) != 2 {
 			continue
 		}
+
 		key := strings.TrimSpace(parts[0])
 		val := strings.TrimSpace(parts[1])
 
@@ -130,6 +143,7 @@ func collectCpuInfo() (*CPUInfo, error) {
 			current.physicalID = val
 		}
 	}
+
 	if err := scanner.Err(); err != nil {
 		return nil, fmt.Errorf("error reading /proc/cpuinfo: %w", err)
 	}
@@ -139,6 +153,7 @@ func collectCpuInfo() (*CPUInfo, error) {
 		if current.physicalID != "" {
 			physicalIDs[current.physicalID] = struct{}{}
 		}
+
 		cpus = append(cpus, current)
 	}
 
@@ -156,7 +171,7 @@ func collectCpuInfo() (*CPUInfo, error) {
 	}
 
 	threadsPerCore := computeThreadsPerCore(first.siblings, first.cpuCores)
-	serials := collectCpuSerials()
+	serials := collectCpuSerials(ctx)
 
 	return &CPUInfo{
 		ModelName:        first.modelName,
@@ -174,13 +189,14 @@ func collectCpuInfo() (*CPUInfo, error) {
 
 // collectCpuSerials reads CPU serial numbers from dmidecode (SMBIOS).
 // Returns nil if dmidecode is unavailable or no serials are populated.
-func collectCpuSerials() []string {
-	out, err := exec.Command("dmidecode", "-t", "processor").Output()
+func collectCpuSerials(ctx context.Context) []string {
+	out, err := exec.CommandContext(ctx, "dmidecode", "-t", "processor").Output()
 	if err != nil {
 		return nil
 	}
 
 	var serials []string
+
 	for _, line := range strings.Split(string(out), "\n") {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "Serial Number:") {
@@ -190,6 +206,7 @@ func collectCpuSerials() []string {
 			}
 		}
 	}
+
 	return serials
 }
 
@@ -198,13 +215,16 @@ func computeThreadsPerCore(siblings, cores string) string {
 	if siblings == "" || cores == "" {
 		return "unknown"
 	}
+
 	var s, c int
 	if _, err := fmt.Sscanf(siblings, "%d", &s); err != nil {
 		return "unknown"
 	}
+
 	if _, err := fmt.Sscanf(cores, "%d", &c); err != nil || c == 0 {
 		return "unknown"
 	}
+
 	return fmt.Sprintf("%d", s/c)
 }
 
@@ -213,13 +233,16 @@ func detectArchitecture(flags []string) string {
 	if len(flags) == 0 {
 		return "unknown"
 	}
+
 	flagSet := make(map[string]struct{}, len(flags))
 	for _, f := range flags {
 		flagSet[f] = struct{}{}
 	}
+
 	if _, ok := flagSet["lm"]; ok {
 		return "x86_64"
 	}
+
 	return "x86"
 }
 

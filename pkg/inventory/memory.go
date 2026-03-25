@@ -1,6 +1,7 @@
 package inventory
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -26,13 +27,9 @@ type DIMMAttributes struct {
 func MemoryToRecord(m *MemoryInfo, hostID string) DeviceRecord {
 	var dimms []DIMMAttributes
 	for _, d := range m.DIMMs {
-		dimms = append(dimms, DIMMAttributes{
-			Locator:      d.Locator,
-			Size:         d.Size,
-			Speed:        d.Speed,
-			SerialNumber: d.SerialNumber,
-		})
+		dimms = append(dimms, DIMMAttributes(d))
 	}
+
 	return DeviceRecord{
 		DeviceType:     DeviceTypeMemory,
 		DeviceName:     "System Memory",
@@ -60,13 +57,13 @@ type MemoryInfo struct {
 }
 
 // collectMemoryInfo gathers system memory information.
-func collectMemoryInfo() (*MemoryInfo, error) {
+func collectMemoryInfo(ctx context.Context) (*MemoryInfo, error) {
 	total, err := readTotalMemory()
 	if err != nil {
 		return nil, fmt.Errorf("failed to read total memory: %w", err)
 	}
 
-	dimms := collectDIMMInfo()
+	dimms := collectDIMMInfo(ctx)
 
 	return &MemoryInfo{
 		TotalBytes: total,
@@ -87,10 +84,12 @@ func readTotalMemory() (uint64, error) {
 			if len(fields) < 2 {
 				return 0, fmt.Errorf("unexpected MemTotal format: %s", line)
 			}
+
 			kb, err := strconv.ParseUint(fields[1], 10, 64)
 			if err != nil {
 				return 0, fmt.Errorf("failed to parse MemTotal: %w", err)
 			}
+
 			return kb * 1024, nil // convert kB to bytes
 		}
 	}
@@ -100,14 +99,17 @@ func readTotalMemory() (uint64, error) {
 
 // collectDIMMInfo reads per-DIMM details from dmidecode (SMBIOS type 17).
 // Returns nil if dmidecode is unavailable or requires elevated privileges.
-func collectDIMMInfo() []DIMMInfo {
-	out, err := exec.Command("dmidecode", "-t", "memory").Output()
+func collectDIMMInfo(ctx context.Context) []DIMMInfo {
+	out, err := exec.CommandContext(ctx, "dmidecode", "-t", "memory").Output()
 	if err != nil {
 		return nil
 	}
 
-	var dimms []DIMMInfo
-	var current DIMMInfo
+	var (
+		dimms   []DIMMInfo
+		current DIMMInfo
+	)
+
 	inDevice := false
 
 	for _, line := range strings.Split(string(out), "\n") {
@@ -118,8 +120,10 @@ func collectDIMMInfo() []DIMMInfo {
 			if inDevice {
 				dimms = appendDIMM(dimms, current)
 			}
+
 			current = DIMMInfo{}
 			inDevice = true
+
 			continue
 		}
 
@@ -131,6 +135,7 @@ func collectDIMMInfo() []DIMMInfo {
 		if len(parts) != 2 {
 			continue
 		}
+
 		key := strings.TrimSpace(parts[0])
 		val := strings.TrimSpace(parts[1])
 
@@ -159,6 +164,7 @@ func appendDIMM(dimms []DIMMInfo, d DIMMInfo) []DIMMInfo {
 	if d.Size == "" || strings.EqualFold(d.Size, "No Module Installed") {
 		return dimms
 	}
+
 	return append(dimms, d)
 }
 
@@ -181,8 +187,10 @@ func formatBytes(b uint64) string {
 // printMemoryInfo prints the collected memory information to stdout.
 func printMemoryInfo(mem *MemoryInfo) {
 	fmt.Printf("Total Memory:    %s\n", formatBytes(mem.TotalBytes))
+
 	if len(mem.DIMMs) > 0 {
 		fmt.Printf("DIMMs Installed: %d\n", len(mem.DIMMs))
+
 		for i, d := range mem.DIMMs {
 			fmt.Printf("\n  DIMM %d:\n", i)
 			fmt.Printf("    Locator:       %s\n", d.Locator)

@@ -1,6 +1,7 @@
 package inventory
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os/exec"
@@ -10,47 +11,18 @@ import (
 // LLDPNeighborAttributes holds the parsed LLDP TLV fields for a single
 // neighbor discovered on a local interface.
 type LLDPNeighborAttributes struct {
-	ChassisID     string `json:"chassis_id"`
-	PortID        string `json:"port_id"`
-	PortDesc      string `json:"port_desc"`
-	SystemName    string `json:"system_name"`
-	SystemDesc    string `json:"system_desc"`
-	MgmtAddresses string `json:"mgmt_addresses"`
-}
-
-// lldpctlInterface is the per-interface structure returned by `lldpctl -f json`.
-type lldpctlInterface struct {
-	Interface string `json:"interface"`
-	Chassis   struct {
-		ID struct {
-			Value string `json:"value"`
-		} `json:"id"`
-		Name   []struct{ Value string } `json:"name"`
-		Descr  []struct{ Value string } `json:"descr"`
-		MgmtIP []struct{ Value string } `json:"mgmt-ip"`
-	} `json:"chassis"`
-	Port struct {
-		ID struct {
-			Value string `json:"value"`
-		} `json:"id"`
-		Descr []struct{ Value string } `json:"descr"`
-	} `json:"port"`
-}
-
-// lldpctlOutput is the top-level JSON structure from `lldpctl -f json`.
-type lldpctlOutput struct {
-	Lldp struct {
-		Interface []struct {
-			Name     string             `json:"-"`
-			Neighbor []lldpctlInterface `json:"chassis"`
-		} `json:"interface"`
-	} `json:"lldp"`
+	ChassisID         string `json:"chassisId"`
+	PortID            string `json:"portId"`
+	PortDescription   string `json:"portDesc"`
+	SystemName        string `json:"systemName"`
+	SystemDescription string `json:"systemDesc"`
+	MgmtAddresses     string `json:"mgmtAddresses"`
 }
 
 // collectLLDPNeighbors runs `lldpctl -f json` and parses the output into
 // NeighborRecords ready for insertion into the neighbors table.
-func collectLLDPNeighbors(hostID string) ([]NeighborRecord, error) {
-	out, err := exec.Command("lldpctl", "-f", "json").Output()
+func collectLLDPNeighbors(ctx context.Context, hostID string) ([]NeighborRecord, error) {
+	out, err := exec.CommandContext(ctx, "lldpctl", "-f", "json").Output()
 	if err != nil {
 		return nil, fmt.Errorf("lldpctl: %w", err)
 	}
@@ -81,14 +53,7 @@ func parseLLDPNeighbors(hostID string, data []byte) ([]NeighborRecord, error) {
 
 	for localIface, neighbors := range interfaces {
 		for _, n := range neighbors {
-			attrs := LLDPNeighborAttributes{
-				ChassisID:     n.ChassisID,
-				PortID:        n.PortID,
-				PortDesc:      n.PortDesc,
-				SystemName:    n.SystemName,
-				SystemDesc:    n.SystemDesc,
-				MgmtAddresses: n.MgmtAddresses,
-			}
+			attrs := LLDPNeighborAttributes(n)
 			records = append(records, NeighborRecord{
 				HostIdentifier: hostID,
 				LocalInterface: localIface,
@@ -102,12 +67,12 @@ func parseLLDPNeighbors(hostID string, data []byte) ([]NeighborRecord, error) {
 
 // parsedNeighbor is an intermediate representation used during JSON parsing.
 type parsedNeighbor struct {
-	ChassisID     string
-	PortID        string
-	PortDesc      string
-	SystemName    string
-	SystemDesc    string
-	MgmtAddresses string
+	ChassisID         string
+	PortID            string
+	PortDescription   string
+	SystemName        string
+	SystemDescription string
+	MgmtAddresses     string
 }
 
 // parseLLDPInterfaces extracts per-interface neighbor lists from the raw "lldp"
@@ -124,6 +89,7 @@ func parseLLDPInterfaces(lldpRaw json.RawMessage) (map[string][]parsedNeighbor, 
 	if err := json.Unmarshal(lldpRaw, &wrapper); err != nil {
 		return nil, fmt.Errorf("lldpctl: failed to parse lldp block: %w", err)
 	}
+
 	if wrapper.Interface == nil {
 		return result, nil
 	}
@@ -134,11 +100,13 @@ func parseLLDPInterfaces(lldpRaw json.RawMessage) (map[string][]parsedNeighbor, 
 		for _, raw := range ifaceArray {
 			parseInterfaceObject(raw, result)
 		}
+
 		return result, nil
 	}
 
 	// Fall back to single object.
 	parseInterfaceObject(wrapper.Interface, result)
+
 	return result, nil
 }
 
@@ -168,51 +136,87 @@ func extractNeighbor(data json.RawMessage) parsedNeighbor {
 		return n
 	}
 
-	// Chassis is usually an object keyed by chassis name.
+	// Chassis is an object keyed by the system name.
 	if entry.Chassis != nil {
 		var chassisMap map[string]json.RawMessage
 		if err := json.Unmarshal(entry.Chassis, &chassisMap); err == nil {
-			for _, cData := range chassisMap {
+			for chassisName, cData := range chassisMap {
+				n.SystemName = chassisName
+
 				var c struct {
-					ID     []struct{ Value string } `json:"id"`
-					Name   []struct{ Value string } `json:"name"`
-					Descr  []struct{ Value string } `json:"descr"`
-					MgmtIP json.RawMessage          `json:"mgmt-ip"`
+					ID     json.RawMessage `json:"id"`
+					Descr  json.RawMessage `json:"descr"`
+					MgmtIP json.RawMessage `json:"mgmt-ip"`
 				}
 				if err := json.Unmarshal(cData, &c); err == nil {
-					if len(c.ID) > 0 {
-						n.ChassisID = c.ID[0].Value
-					}
-					if len(c.Name) > 0 {
-						n.SystemName = c.Name[0].Value
-					}
-					if len(c.Descr) > 0 {
-						n.SystemDesc = c.Descr[0].Value
-					}
+					n.ChassisID = extractIDValue(c.ID)
+					n.SystemDescription = extractStringOrValue(c.Descr)
 					n.MgmtAddresses = parseMgmtAddresses(c.MgmtIP)
 				}
+
 				break // take only the first chassis entry
 			}
 		}
 	}
 
-	// Port may be an object with id/descr.
+	// Port fields.
 	if entry.Port != nil {
 		var p struct {
-			ID    []struct{ Value string } `json:"id"`
-			Descr []struct{ Value string } `json:"descr"`
+			ID    json.RawMessage `json:"id"`
+			Descr json.RawMessage `json:"descr"`
 		}
 		if err := json.Unmarshal(entry.Port, &p); err == nil {
-			if len(p.ID) > 0 {
-				n.PortID = p.ID[0].Value
-			}
-			if len(p.Descr) > 0 {
-				n.PortDesc = p.Descr[0].Value
-			}
+			n.PortID = extractIDValue(p.ID)
+			n.PortDescription = extractStringOrValue(p.Descr)
 		}
 	}
 
 	return n
+}
+
+// extractIDValue parses an "id" field that may be a single object
+// {"type":"...","value":"..."} or an array of such objects.
+func extractIDValue(raw json.RawMessage) string {
+	if raw == nil {
+		return ""
+	}
+	// Try single object first (most common lldpctl output).
+	var single struct{ Value string }
+	if err := json.Unmarshal(raw, &single); err == nil && single.Value != "" {
+		return single.Value
+	}
+	// Try array of objects.
+	var arr []struct{ Value string }
+	if err := json.Unmarshal(raw, &arr); err == nil && len(arr) > 0 {
+		return arr[0].Value
+	}
+
+	return ""
+}
+
+// extractStringOrValue parses a field that may be a plain JSON string, a
+// single {"value":"..."} object, or an array of such objects.
+func extractStringOrValue(raw json.RawMessage) string {
+	if raw == nil {
+		return ""
+	}
+	// Try plain string (lldpctl uses this for "descr").
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	// Try single object.
+	var single struct{ Value string }
+	if err := json.Unmarshal(raw, &single); err == nil && single.Value != "" {
+		return single.Value
+	}
+	// Try array of objects.
+	var arr []struct{ Value string }
+	if err := json.Unmarshal(raw, &arr); err == nil && len(arr) > 0 {
+		return arr[0].Value
+	}
+
+	return ""
 }
 
 // parseMgmtAddresses handles the mgmt-ip field which can be a single string
@@ -231,6 +235,7 @@ func parseMgmtAddresses(raw json.RawMessage) string {
 				addrs = append(addrs, a.Value)
 			}
 		}
+
 		return strings.Join(addrs, ",")
 	}
 
@@ -246,25 +251,38 @@ func parseMgmtAddresses(raw json.RawMessage) string {
 // printLLDPNeighbors prints discovered LLDP neighbors to stdout.
 func printLLDPNeighbors(neighbors []NeighborRecord) {
 	fmt.Printf("LLDP Neighbors Found: %d\n", len(neighbors))
+
 	for i, n := range neighbors {
 		var attrs LLDPNeighborAttributes
-		_ = json.Unmarshal(n.Attributes, &attrs)
+
+		if err := json.Unmarshal(n.Attributes, &attrs); err != nil {
+			fmt.Printf("\n  Neighbor %d (%s): <failed to parse attributes: %v>\n", i, n.LocalInterface, err)
+
+			continue
+		}
+
 		fmt.Printf("\n  Neighbor %d (%s):\n", i, n.LocalInterface)
+
 		if attrs.ChassisID != "" {
 			fmt.Printf("    Chassis ID:  %s\n", attrs.ChassisID)
 		}
+
 		if attrs.PortID != "" {
 			fmt.Printf("    Port ID:     %s\n", attrs.PortID)
 		}
-		if attrs.PortDesc != "" {
-			fmt.Printf("    Port Desc:   %s\n", attrs.PortDesc)
+
+		if attrs.PortDescription != "" {
+			fmt.Printf("    Port Description:   %s\n", attrs.PortDescription)
 		}
+
 		if attrs.SystemName != "" {
 			fmt.Printf("    System Name: %s\n", attrs.SystemName)
 		}
-		if attrs.SystemDesc != "" {
-			fmt.Printf("    System Desc: %s\n", attrs.SystemDesc)
+
+		if attrs.SystemDescription != "" {
+			fmt.Printf("    System Description: %s\n", attrs.SystemDescription)
 		}
+
 		if attrs.MgmtAddresses != "" {
 			fmt.Printf("    Mgmt Addrs:  %s\n", attrs.MgmtAddresses)
 		}

@@ -46,17 +46,23 @@ func mustMarshal(v any) json.RawMessage {
 	if err != nil {
 		panic("inventory: failed to marshal attributes: " + err.Error())
 	}
+
 	return data
 }
 
 // ensureDB opens the database at dbPath (creating the file if needed) and
 // ensures all required tables exist.
-func ensureDB(dbPath string) error {
+func ensureDB(dbPath string) (retErr error) {
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return fmt.Errorf("failed to open database: %w", err)
 	}
-	defer db.Close()
+
+	defer func() {
+		if cerr := db.Close(); cerr != nil && retErr == nil {
+			retErr = fmt.Errorf("failed to close database: %w", cerr)
+		}
+	}()
 
 	const createTable = `
 CREATE TABLE IF NOT EXISTS inventory (
@@ -91,12 +97,17 @@ CREATE TABLE IF NOT EXISTS neighbors (
 
 // upsertRecords inserts new DeviceRecords or updates existing ones (matched by
 // serial_number). A row is only updated when device_name or attributes differ.
-func upsertRecords(dbPath string, records []DeviceRecord) error {
+func upsertRecords(dbPath string, records []DeviceRecord) (retErr error) {
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return fmt.Errorf("failed to open database: %w", err)
 	}
-	defer db.Close()
+
+	defer func() {
+		if cerr := db.Close(); cerr != nil && retErr == nil {
+			retErr = fmt.Errorf("failed to close database: %w", cerr)
+		}
+	}()
 
 	tx, err := db.Begin()
 	if err != nil {
@@ -120,7 +131,12 @@ WHERE device_name     != excluded.device_name
 	if err != nil {
 		return fmt.Errorf("failed to prepare upsert: %w", err)
 	}
-	defer stmt.Close()
+
+	defer func() {
+		if cerr := stmt.Close(); cerr != nil && retErr == nil {
+			retErr = fmt.Errorf("failed to close statement: %w", cerr)
+		}
+	}()
 
 	for _, r := range records {
 		if _, err := stmt.Exec(string(r.DeviceType), r.DeviceName, r.HostIdentifier, r.SerialNumber, string(r.Attributes)); err != nil {
@@ -133,12 +149,17 @@ WHERE device_name     != excluded.device_name
 
 // upsertNeighbors inserts new NeighborRecords or updates existing ones
 // (matched by host_identifier + local_interface).
-func upsertNeighbors(dbPath string, records []NeighborRecord) error {
+func upsertNeighbors(dbPath string, records []NeighborRecord) (retErr error) {
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return fmt.Errorf("failed to open database: %w", err)
 	}
-	defer db.Close()
+
+	defer func() {
+		if cerr := db.Close(); cerr != nil && retErr == nil {
+			retErr = fmt.Errorf("failed to close database: %w", cerr)
+		}
+	}()
 
 	tx, err := db.Begin()
 	if err != nil {
@@ -157,7 +178,12 @@ WHERE attributes != excluded.attributes;`
 	if err != nil {
 		return fmt.Errorf("failed to prepare neighbor upsert: %w", err)
 	}
-	defer stmt.Close()
+
+	defer func() {
+		if cerr := stmt.Close(); cerr != nil && retErr == nil {
+			retErr = fmt.Errorf("failed to close statement: %w", cerr)
+		}
+	}()
 
 	for _, r := range records {
 		if _, err := stmt.Exec(r.HostIdentifier, r.LocalInterface, string(r.Attributes)); err != nil {

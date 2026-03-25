@@ -3,6 +3,7 @@ package inventory
 import (
 	"context"
 	"fmt"
+	"os"
 
 	ipmi "github.com/bougou/go-ipmi"
 )
@@ -33,6 +34,7 @@ func BMCToRecord(b *BMCInfo, hostID string) DeviceRecord {
 	if serial == "" {
 		serial = "bmc-0"
 	}
+
 	return DeviceRecord{
 		DeviceType:     DeviceTypeBMC,
 		DeviceName:     "BMC",
@@ -51,17 +53,21 @@ func BMCToRecord(b *BMCInfo, hostID string) DeviceRecord {
 
 // collectBMCInfo attempts to discover a baseboard management controller via the
 // local /dev/ipmi0 device. Returns nil (no error) when no BMC is present.
-func collectBMCInfo() (*BMCInfo, error) {
+func collectBMCInfo(ctx context.Context) (*BMCInfo, error) {
 	client, err := ipmi.NewOpenClient()
 	if err != nil {
 		return nil, nil // no IPMI device available
 	}
 
-	ctx := context.Background()
 	if err := client.Connect(ctx); err != nil {
 		return nil, nil // cannot connect to BMC
 	}
-	defer client.Close(ctx)
+
+	defer func() {
+		if cerr := client.Close(ctx); cerr != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to close IPMI client: %v\n", cerr)
+		}
+	}()
 
 	info := &BMCInfo{}
 
@@ -89,21 +95,27 @@ func collectBMCInfo() (*BMCInfo, error) {
 // printBMCInfo prints the collected BMC information to stdout.
 func printBMCInfo(b *BMCInfo) {
 	fmt.Println("BMC (Out-of-Band Management):")
+
 	if b.IPAddr != "" {
 		fmt.Printf("  IP Address:    %s\n", b.IPAddr)
 	}
+
 	if b.SubnetMask != "" {
 		fmt.Printf("  Subnet Mask:   %s\n", b.SubnetMask)
 	}
+
 	if b.MACAddr != "" {
 		fmt.Printf("  MAC Address:   %s\n", b.MACAddr)
 	}
+
 	if b.Gateway != "" {
 		fmt.Printf("  Gateway:       %s\n", b.Gateway)
 	}
+
 	if b.IPSource != "" {
 		fmt.Printf("  IP Source:     %s\n", b.IPSource)
 	}
+
 	if b.Firmware != "" {
 		fmt.Printf("  Firmware:      %s\n", b.Firmware)
 	}

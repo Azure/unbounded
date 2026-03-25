@@ -1,6 +1,7 @@
 package inventory
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os"
@@ -25,6 +26,7 @@ func NICToRecord(n *NICInfo, hostID string) DeviceRecord {
 	if serial == "" {
 		serial = "nic-" + n.Name
 	}
+
 	return DeviceRecord{
 		DeviceType:     DeviceTypeNIC,
 		DeviceName:     n.Name,
@@ -53,13 +55,14 @@ type NICInfo struct {
 }
 
 // collectNICInfo discovers physical network interfaces and returns info for each.
-func collectNICInfo() ([]NICInfo, error) {
+func collectNICInfo(ctx context.Context) ([]NICInfo, error) {
 	entries, err := os.ReadDir("/sys/class/net")
 	if err != nil {
 		return nil, fmt.Errorf("failed to read /sys/class/net: %w", err)
 	}
 
 	var nics []NICInfo
+
 	for _, e := range entries {
 		name := e.Name()
 
@@ -76,7 +79,7 @@ func collectNICInfo() ([]NICInfo, error) {
 			LinkSpeed: readNICLinkSpeed(base),
 			MTU:       readSysfsField(filepath.Join(base, "mtu")),
 			Driver:    readNICDriver(base),
-			Firmware:  readNICFirmware(name),
+			Firmware:  readNICFirmware(ctx, name),
 			IPAddrs:   readNICAddresses(name),
 		}
 
@@ -91,6 +94,7 @@ func collectNICInfo() ([]NICInfo, error) {
 func isPhysicalNIC(name string) bool {
 	devicePath := filepath.Join("/sys/class/net", name, "device")
 	_, err := os.Stat(devicePath)
+
 	return err == nil
 }
 
@@ -100,6 +104,7 @@ func readNICDriver(base string) string {
 	if err != nil {
 		return ""
 	}
+
 	return filepath.Base(link)
 }
 
@@ -111,6 +116,7 @@ func readNICLinkSpeed(base string) string {
 	if speed == "" || speed == "-1" {
 		return ""
 	}
+
 	return speed + " Mbps"
 }
 
@@ -120,52 +126,63 @@ func readNICAddresses(name string) []string {
 	if err != nil {
 		return nil
 	}
+
 	addrs, err := iface.Addrs()
 	if err != nil {
 		return nil
 	}
 
 	var ips []string
+
 	for _, a := range addrs {
 		// a.String() returns "ip/mask" (CIDR notation).
 		ip := strings.Split(a.String(), "/")[0]
 		ips = append(ips, ip)
 	}
+
 	return ips
 }
 
 // readNICFirmware reads the firmware version of a NIC using ethtool.
-func readNICFirmware(name string) string {
-	out, err := exec.Command("ethtool", "-i", name).Output()
+func readNICFirmware(ctx context.Context, name string) string {
+	out, err := exec.CommandContext(ctx, "ethtool", "-i", name).Output()
 	if err != nil {
 		return ""
 	}
+
 	for _, line := range strings.Split(string(out), "\n") {
 		if strings.HasPrefix(line, "firmware-version:") {
 			return strings.TrimSpace(strings.TrimPrefix(line, "firmware-version:"))
 		}
 	}
+
 	return ""
 }
 
 // printNICInfo prints the collected NIC information to stdout.
 func printNICInfo(nics []NICInfo) {
 	fmt.Printf("NICs Found:      %d\n", len(nics))
+
 	for i, n := range nics {
 		fmt.Printf("\n  NIC %d (%s):\n", i, n.Name)
 		fmt.Printf("    MAC Address:   %s\n", n.MACAddr)
+
 		if len(n.IPAddrs) > 0 {
 			fmt.Printf("    IP Addresses:  %s\n", strings.Join(n.IPAddrs, ", "))
 		}
+
 		if n.Driver != "" {
 			fmt.Printf("    Driver:        %s\n", n.Driver)
 		}
+
 		if n.Firmware != "" {
 			fmt.Printf("    Firmware:      %s\n", n.Firmware)
 		}
+
 		if n.LinkSpeed != "" {
 			fmt.Printf("    Link Speed:    %s\n", n.LinkSpeed)
 		}
+
 		if n.MTU != "" {
 			fmt.Printf("    MTU:           %s\n", n.MTU)
 		}

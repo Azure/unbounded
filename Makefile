@@ -81,10 +81,10 @@ inventory: inventory-amd64 inventory-arm64
 	esac; \
 	ln -sf inventory-$$ARCH $(INVENTORY_BIN)
 
-inventory-amd64:
+inventory-amd64: test
 	GOOS=linux GOARCH=amd64 $(GOBUILD) -o $(INVENTORY_BIN)-amd64 $(INVENTORY_CMD)/main.go
 
-inventory-arm64:
+inventory-arm64: test
 	GOOS=linux GOARCH=arm64 $(GOBUILD) -o $(INVENTORY_BIN)-arm64 $(INVENTORY_CMD)/main.go
 
 machina: test

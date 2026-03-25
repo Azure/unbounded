@@ -9,8 +9,10 @@ import (
 )
 
 func main() {
-	var debug bool
-	var dbPath string
+	var (
+		debug  bool
+		dbPath string
+	)
 
 	rootCmd := &cobra.Command{
 		Use:   "inventory",
