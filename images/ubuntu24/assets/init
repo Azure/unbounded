@@ -1,0 +1,237 @@
+#!/bin/sh
+# Unbounded Metal installer initrd /init script.
+# Overlaid on top of the Ubuntu netboot initrd via a second cpio archive.
+# Downloads a compressed raw disk image over HTTP, writes it to disk,
+# injects cloud-init datasource configuration, and reboots.
+#
+# Expected kernel cmdline parameters:
+#   unbounded.image_url=<url>    URL of the gzipped raw disk image
+#   unbounded.serve_url=<url>    Base URL of the unbounded-metal serve instance
+#   unbounded.disk=<dev>         Target block device (default: auto-detect largest)
+#   unbounded.ds_url=<url>       cloud-init NoCloud datasource seed URL
+#   ip=<ip>::<gw>:<mask>::<iface>:none  Static IP configuration
+
+set -e
+
+mkdir -p /proc /sys /dev /tmp /run /mnt
+mount -t proc proc /proc 2>/dev/null || true
+mount -t sysfs sysfs /sys 2>/dev/null || true
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+
+# Send all output through the kernel log so it appears on every console
+# (tty0, ttyS0, etc.), not just /dev/console.
+exec >/dev/kmsg 2>&1
+
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+log()   { echo "unbounded-metal: $*"; }
+fatal() { log "FATAL: $*"; exec sh; }
+
+# Retry a command with logging. Usage: retry <attempts> <delay> <desc> <cmd...>
+retry() {
+    local n="$1" delay="$2" desc="$3" i; shift 3
+    for i in $(seq 1 "$n"); do
+        if "$@"; then
+            [ "$i" -gt 1 ] && log "$desc succeeded (attempt $i/$n)"
+            return 0
+        fi
+        [ "$i" -eq "$n" ] && return 1
+        log "$desc failed (attempt $i/$n), retrying in ${delay}s"
+        sleep "$delay"
+    done
+}
+
+log "installer starting"
+
+# ── Load essential modules ──
+for mod in virtio_pci virtio_blk ahci sd_mod nvme; do
+    modprobe "$mod" 2>/dev/null || true
+done
+for mod in virtio_net e1000 e1000e igb ixgbe i40e ice \
+           mlx5_core mlx4_core bnxt_en tg3 be2net ena; do
+    modprobe "$mod" 2>/dev/null || true
+done
+for f in /lib/modules/"$(uname -r)"/kernel/drivers/net/ethernet/*/*.ko* \
+         /lib/modules/"$(uname -r)"/kernel/drivers/net/ethernet/*/*/*.ko*; do
+    [ -e "$f" ] || continue
+    mod=$(basename "$f"); mod=${mod%.ko*}
+    modprobe "$mod" 2>/dev/null || true
+done
+
+# ── Wait for network interface ──
+log "waiting for network interface"
+IFACE=""
+find_iface() {
+    IFACE=$(ls /sys/class/net/ 2>/dev/null | grep -v lo | head -1)
+    [ -n "$IFACE" ]
+}
+retry 30 1 "find network interface" find_iface || fatal "no network interface found"
+
+# ── Parse kernel command line ──
+CMDLINE=$(cat /proc/cmdline)
+get_param() {
+    for tok in $CMDLINE; do
+        case "$tok" in ${1}=*) echo "${tok#"${1}"=}"; return 0 ;; esac
+    done
+    return 1
+}
+
+IMAGE_URL=$(get_param unbounded.image_url) || fatal "unbounded.image_url not set"
+SERVE_URL=$(get_param unbounded.serve_url || true)
+TARGET_DISK=$(get_param unbounded.disk || true)
+DS_URL=$(get_param unbounded.ds_url || true)
+NODE_NAME=$(get_param unbounded.node_name || true)
+NODE_NAMESPACE=$(get_param unbounded.node_namespace || true)
+APISERVER_URL=$(get_param unbounded.apiserver_url || true)
+
+# ── Configure network ──
+mask2cidr() {
+    local cidr=0
+    for octet in $(echo "$1" | tr '.' ' '); do
+        case "$octet" in
+            255) cidr=$((cidr + 8)) ;; 254) cidr=$((cidr + 7)) ;;
+            252) cidr=$((cidr + 6)) ;; 248) cidr=$((cidr + 5)) ;;
+            240) cidr=$((cidr + 4)) ;; 224) cidr=$((cidr + 3)) ;;
+            192) cidr=$((cidr + 2)) ;; 128) cidr=$((cidr + 1)) ;;
+        esac
+    done
+    echo "$cidr"
+}
+
+IP_PARAM=$(get_param ip || true)
+if [ -n "$IP_PARAM" ]; then
+    CLIENT_IP=$(echo "$IP_PARAM" | cut -d: -f1)
+    GW=$(echo "$IP_PARAM" | cut -d: -f3)
+    MASK=$(echo "$IP_PARAM" | cut -d: -f4)
+    IFACE_PARAM=$(echo "$IP_PARAM" | cut -d: -f6)
+
+    case "$MASK" in
+        *.*.*.*) PREFIX=$(mask2cidr "$MASK") ;;
+        *)       PREFIX="$MASK" ;;
+    esac
+
+    if [ -n "$IFACE_PARAM" ] && [ -e "/sys/class/net/$IFACE_PARAM" ]; then
+        IFACE="$IFACE_PARAM"
+    fi
+
+    log "configuring $IFACE with $CLIENT_IP/$PREFIX gw $GW"
+    retry 5 2 "link up $IFACE" ip link set "$IFACE" up || fatal "failed to bring up $IFACE"
+    retry 3 1 "add address" ip addr add "$CLIENT_IP/$PREFIX" dev "$IFACE" || true
+    retry 3 1 "add default route" ip route add default via "$GW" dev "$IFACE" || true
+
+    log "waiting for carrier on $IFACE"
+    check_carrier() { [ "$(cat "/sys/class/net/$IFACE/carrier" 2>/dev/null)" = "1" ]; }
+    retry 30 1 "carrier detect on $IFACE" check_carrier \
+        || log "WARNING: no carrier on $IFACE, continuing anyway"
+fi
+
+# ── Detect target disk ──
+if [ -z "$TARGET_DISK" ]; then
+    log "waiting for block devices"
+    find_disk() {
+        TARGET_DISK="" MAX_SIZE=0
+        for disk in /sys/block/sd* /sys/block/nvme* /sys/block/vd*; do
+            [ -e "$disk" ] || continue
+            SIZE=$(cat "$disk/size" 2>/dev/null || echo 0)
+            if [ "$SIZE" -gt "$MAX_SIZE" ]; then
+                MAX_SIZE=$SIZE
+                TARGET_DISK="/dev/$(basename "$disk")"
+            fi
+        done
+        [ -n "$TARGET_DISK" ]
+    }
+    retry 30 1 "find block device" find_disk || fatal "no target disk found"
+fi
+log "target disk: $TARGET_DISK"
+
+# ── Download and write disk image ──
+# The server may return 503 while the image is still being prepared;
+# retry until the download succeeds.
+log "downloading disk image from $IMAGE_URL"
+retry 120 5 "download disk image" wget -q -O /tmp/disk.img.gz "$IMAGE_URL" \
+    || fatal "failed to download disk image after 120 attempts"
+
+log "writing disk image to $TARGET_DISK"
+write_image() { gunzip -c /tmp/disk.img.gz | dd of="$TARGET_DISK" bs=4194304; }
+retry 3 5 "write disk image" write_image || fatal "failed to write disk image"
+rm -f /tmp/disk.img.gz
+sync
+log "disk image written"
+
+# ── Re-read partition table ──
+retry 5 2 "re-read partition table" blockdev --rereadpt "$TARGET_DISK" \
+    || log "WARNING: could not re-read partition table"
+sleep 2
+
+# ── Inject cloud-init datasource configuration ──
+if [ -n "$DS_URL" ]; then
+    log "injecting cloud-init datasource: $DS_URL"
+
+    # Find the root partition (largest ext4/xfs partition on the target disk).
+    # Ubuntu cloud images typically have: partition 1 = ESP, partition 2 = root.
+    find_root_part() {
+        for suffix in 2 1 p2 p1; do
+            [ -b "${TARGET_DISK}${suffix}" ] && { ROOT_PART="${TARGET_DISK}${suffix}"; return 0; }
+        done
+        return 1
+    }
+    ROOT_PART=""
+    retry 10 2 "find root partition" find_root_part || fatal "no root partition found on $TARGET_DISK"
+
+    retry 5 2 "mount $ROOT_PART" mount "$ROOT_PART" /mnt || fatal "failed to mount $ROOT_PART"
+
+    mkdir -p /mnt/etc/cloud/cloud.cfg.d
+    cat > /mnt/etc/cloud/cloud.cfg.d/99-unbounded-metal.cfg <<CLOUDINIT
+datasource_list: [NoCloud]
+datasource:
+  NoCloud:
+    seedfrom: ${DS_URL}
+CLOUDINIT
+    rm -f /mnt/etc/cloud/cloud-init.disabled
+    log "wrote cloud-init datasource config"
+
+    if [ -n "$SERVE_URL" ] || [ -n "$NODE_NAME" ] || [ -n "$APISERVER_URL" ]; then
+        mkdir -p /mnt/etc/unbounded-metal
+        cat > /mnt/etc/unbounded-metal/config <<UMCONFIG
+SERVE_URL=${SERVE_URL}
+NODE_NAME=${NODE_NAME}
+NODE_NAMESPACE=${NODE_NAMESPACE}
+APISERVER_URL=${APISERVER_URL}
+UMCONFIG
+        log "wrote /etc/unbounded-metal/config"
+    fi
+
+    if [ -n "$SERVE_URL" ]; then
+        mkdir -p /mnt/etc/kubernetes /mnt/var/lib/kubelet /mnt/etc/systemd/system/kubelet.service.d
+
+        retry 30 5 "download bootstrap-kubelet.conf" \
+            wget -q -O /mnt/etc/kubernetes/bootstrap-kubelet.conf "$SERVE_URL/bootstrap-kubelet.conf" \
+            || fatal "failed to download bootstrap-kubelet.conf"
+        log "wrote /etc/kubernetes/bootstrap-kubelet.conf"
+
+        retry 30 5 "download kubelet-config.yaml" \
+            wget -q -O /mnt/var/lib/kubelet/config.yaml "$SERVE_URL/kubelet-config.yaml" \
+            || fatal "failed to download kubelet-config.yaml"
+        log "wrote /var/lib/kubelet/config.yaml"
+
+        retry 30 5 "download kubelet-dropin.conf" \
+            wget -q -O /mnt/etc/systemd/system/kubelet.service.d/10-unbounded-metal.conf "$SERVE_URL/kubelet-dropin.conf" \
+            || fatal "failed to download kubelet-dropin.conf"
+        log "wrote kubelet service drop-in"
+    fi
+
+    sync
+    umount /mnt
+    log "cloud-init configured on $ROOT_PART"
+fi
+
+# ── Disable PXE so the next boot uses the installed disk ──
+if [ -n "$SERVE_URL" ]; then
+    log "disabling PXE boot"
+    retry 5 2 "disable PXE" wget -q -O /dev/null "$SERVE_URL/pxe/disable" \
+        || log "WARNING: failed to disable PXE boot"
+fi
+
+log "installation complete, rebooting"
+sleep 2
+retry 3 2 "reboot" reboot -f || fatal "failed to reboot"

@@ -1,7 +1,8 @@
 # kubectl unbounded
 
-A kubectl plugin for joining remote machines to a Kubernetes cluster as worker
-nodes. Machines are bootstrapped over SSH using kubeadm.
+A kubectl plugin for managing remote machines in a Kubernetes cluster. It
+supports joining machines over SSH using kubeadm, as well as bare metal
+provisioning via PXE and Redfish (metalman).
 
 ## Prerequisites
 
@@ -100,6 +101,39 @@ kubectl unbounded create worker-01 --host 10.0.0.5 --print-only
 ```
 
 Use `kubectl unbounded create --help` for the full list of flags.
+
+---
+
+### `kubectl unbounded reboot NAME`
+
+Reboots a Machine via its Redfish BMC. The command increments the Machine's
+reboot counter and watches the resource until the controller completes the
+power cycle.
+
+```bash
+kubectl unbounded reboot node-01
+kubectl unbounded reboot node-01 --reimage
+kubectl unbounded reboot node-01 -n my-namespace
+```
+
+Use `kubectl unbounded reboot --help` for the full list of flags.
+
+---
+
+### `kubectl unbounded serve-pxe`
+
+Runs PXE servers and the BMC control loop. This is the metalman controller —
+it provides DHCP, TFTP, HTTP, and Redfish reconciliation for bare metal
+provisioning. See the [metalman README](../metalman/README.md) for details on
+DHCP modes, pools, and the security model.
+
+```bash
+kubectl unbounded serve-pxe --dhcp-interface=eth0
+kubectl unbounded serve-pxe --pool=rack-a --dhcp-interface=eth0
+kubectl unbounded serve-pxe --bind-address=10.0.0.1 --http-port=8880
+```
+
+Use `kubectl unbounded serve-pxe --help` for the full list of flags.
 
 ## End-to-End Example
 

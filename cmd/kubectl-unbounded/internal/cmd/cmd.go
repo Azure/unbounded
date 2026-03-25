@@ -6,6 +6,7 @@ import (
 
 	"github.com/project-unbounded/unbounded-kube/cmd/kubectl-unbounded/internal/cmd/create"
 	"github.com/project-unbounded/unbounded-kube/cmd/kubectl-unbounded/internal/cmd/setup"
+	metalman "github.com/project-unbounded/unbounded-kube/cmd/metalman/commands"
 )
 
 func New(streams genericiooptions.IOStreams) *cobra.Command {
@@ -17,6 +18,8 @@ func New(streams genericiooptions.IOStreams) *cobra.Command {
 	cmd.AddCommand(
 		setup.New(streams),
 		create.New(streams),
+		metalman.RebootCmd(),
+		metalman.ServePXECmd(),
 	)
 
 	return cmd

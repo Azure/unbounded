@@ -1,0 +1,1246 @@
+package redfish
+
+import (
+	"crypto/sha256"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	v1alpha3 "github.com/project-unbounded/unbounded-kube/api/v1alpha3"
+)
+
+const testToken = "test-auth-token"
+
+// testSessionAuth handles Redfish session creation, deletion, and
+// authentication for test BMC servers. Returns true if the request is
+// authenticated and should be processed further, or false if the response
+// has already been written (session lifecycle or auth failure).
+func testSessionAuth(w http.ResponseWriter, r *http.Request) bool {
+	if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/SessionService/Sessions") {
+		var body struct {
+			UserName string `json:"UserName"`
+			Password string `json:"Password"`
+		}
+		json.NewDecoder(r.Body).Decode(&body)
+
+		if body.UserName != "admin" || body.Password != "secret" {
+			http.Error(w, "bad credentials", http.StatusUnauthorized)
+			return false
+		}
+
+		w.Header().Set("X-Auth-Token", testToken)
+		w.Header().Set("Location", "/redfish/v1/SessionService/Sessions/1")
+		w.WriteHeader(http.StatusCreated)
+
+		return false
+	}
+
+	if r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/SessionService/Sessions/") {
+		w.WriteHeader(http.StatusNoContent)
+		return false
+	}
+
+	if r.Header.Get("X-Auth-Token") == testToken {
+		return true
+	}
+
+	user, pass, ok := r.BasicAuth()
+	if ok && user == "admin" && pass == "secret" {
+		return true
+	}
+
+	http.Error(w, "unauthorized", http.StatusUnauthorized)
+
+	return false
+}
+
+func TestRedfishRebootCycle(t *testing.T) {
+	var powerState atomic.Value
+	powerState.Store("On")
+
+	var forceOffCalls, onCalls atomic.Int64
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			json.NewEncoder(w).Encode(map[string]any{
+				"PowerState": powerState.Load().(string),
+				"Boot": map[string]string{
+					"BootSourceOverrideTarget":  "Pxe",
+					"BootSourceOverrideEnabled": "Continuous",
+				},
+				"Links": map[string]any{
+					"Chassis": []map[string]any{
+						{"@odata.id": "/redfish/v1/Chassis/Chassis.Embedded.1"},
+					},
+				},
+			})
+
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/Actions/ComputerSystem.Reset"):
+			var body struct {
+				ResetType string `json:"ResetType"`
+			}
+			json.NewDecoder(r.Body).Decode(&body)
+
+			switch body.ResetType {
+			case "ForceOff":
+				forceOffCalls.Add(1)
+				powerState.Store("Off")
+			case "On":
+				onCalls.Add(1)
+				powerState.Store("On")
+			}
+
+			w.WriteHeader(http.StatusOK)
+
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	fp := tlsServerFingerprint(srv)
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"},
+		Data:       map[string][]byte{"password": []byte("secret")},
+	}
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-01", Namespace: "default"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				ImageRef:   v1alpha3.LocalObjectReference{Name: "test-image"},
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:f0", IPv4: "10.0.0.1", SubnetMask: "255.255.255.0"}},
+				Redfish: &v1alpha3.RedfishSpec{
+					URL:         srv.URL,
+					Username:    "admin",
+					DeviceID:    "System.Embedded.1",
+					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
+				},
+			},
+			Operations: &v1alpha3.OperationsSpec{
+				RebootCounter:  1,
+				ReimageCounter: 1,
+			},
+		},
+		Status: v1alpha3.MachineStatus{
+			Redfish: &v1alpha3.RedfishStatus{CertFingerprint: fp},
+		},
+	}
+
+	scheme := testScheme(t)
+	fc := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(node, secret).
+		WithStatusSubresource(node).
+		Build()
+
+	reconciler := &Reconciler{Client: fc, Pool: NewPool()}
+	ctx := t.Context()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "node-01", Namespace: "default"}}
+
+	// First reconcile: machine is On, should send ForceOff and set
+	// PoweredOff=False with Reason=PoweringOff.
+	var updated v1alpha3.Machine
+
+	_, err := reconciler.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("reconcile 1: %v", err)
+	}
+
+	if forceOffCalls.Load() != 1 {
+		t.Fatalf("expected 1 ForceOff call, got %d", forceOffCalls.Load())
+	}
+
+	if err := fc.Get(ctx, req.NamespacedName, &updated); err != nil {
+		t.Fatal(err)
+	}
+
+	poweredOffCond := meta.FindStatusCondition(updated.Status.Conditions, conditionPoweredOff)
+	if poweredOffCond == nil || poweredOffCond.Status != metav1.ConditionFalse || poweredOffCond.Reason != "PoweringOff" {
+		t.Fatalf("expected PoweredOff=False/PoweringOff, got %+v", poweredOffCond)
+	}
+
+	// Second reconcile: machine still not off — should NOT send ForceOff again,
+	// just requeue.
+	powerState.Store("On")
+
+	result, err := reconciler.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("reconcile 2: %v", err)
+	}
+
+	if forceOffCalls.Load() != 1 {
+		t.Fatalf("expected no additional ForceOff call, got %d", forceOffCalls.Load())
+	}
+
+	if result.RequeueAfter == 0 {
+		t.Fatal("expected requeue while waiting for power off")
+	}
+
+	// Third reconcile: machine is now Off, should set PoweredOff=True.
+	powerState.Store("Off")
+
+	_, err = reconciler.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("reconcile 3: %v", err)
+	}
+
+	if err := fc.Get(ctx, req.NamespacedName, &updated); err != nil {
+		t.Fatal(err)
+	}
+
+	if !meta.IsStatusConditionTrue(updated.Status.Conditions, conditionPoweredOff) {
+		t.Fatal("expected PoweredOff=True after ForceOff completed")
+	}
+
+	// Fourth reconcile: PoweredOff is True, machine still Off, should send On
+	// and update condition reason to PoweringOn.
+	powerState.Store("Off")
+
+	_, err = reconciler.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("reconcile 4: %v", err)
+	}
+
+	if onCalls.Load() != 1 {
+		t.Fatalf("expected 1 On call, got %d", onCalls.Load())
+	}
+
+	if err := fc.Get(ctx, req.NamespacedName, &updated); err != nil {
+		t.Fatal(err)
+	}
+
+	if !meta.IsStatusConditionTrue(updated.Status.Conditions, conditionPoweredOff) {
+		t.Fatal("expected PoweredOff=True to persist after sending On")
+	}
+
+	poweredOffCond = meta.FindStatusCondition(updated.Status.Conditions, conditionPoweredOff)
+	if poweredOffCond == nil || poweredOffCond.Reason != "PoweringOn" {
+		t.Fatalf("expected PoweredOff reason=PoweringOn, got %+v", poweredOffCond)
+	}
+
+	// Fifth reconcile: machine still Off but On was already sent — should not
+	// send On again, just requeue.
+	powerState.Store("Off")
+
+	result, err = reconciler.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("reconcile 5: %v", err)
+	}
+
+	if onCalls.Load() != 1 {
+		t.Fatalf("expected no additional On call, got %d", onCalls.Load())
+	}
+
+	if result.RequeueAfter == 0 {
+		t.Fatal("expected requeue while waiting for power on")
+	}
+
+	// Simulate machine completing power-on.
+	powerState.Store("On")
+
+	// Sixth reconcile: machine is On + PoweredOff=True, clear condition and increment reboots.
+	_, err = reconciler.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("reconcile 6: %v", err)
+	}
+
+	if err := fc.Get(ctx, req.NamespacedName, &updated); err != nil {
+		t.Fatal(err)
+	}
+
+	if meta.IsStatusConditionTrue(updated.Status.Conditions, conditionPoweredOff) {
+		t.Fatal("expected PoweredOff to be cleared after verifying power On")
+	}
+
+	if updated.Status.Operations == nil || updated.Status.Operations.RebootCounter != 1 {
+		var got int64
+		if updated.Status.Operations != nil {
+			got = updated.Status.Operations.RebootCounter
+		}
+
+		t.Fatalf("expected operations.rebootCounter=1, got %d", got)
+	}
+
+	reimagedCond := meta.FindStatusCondition(updated.Status.Conditions, conditionReimaged)
+	if reimagedCond == nil || reimagedCond.Status != metav1.ConditionFalse || reimagedCond.Reason != "Pending" {
+		t.Fatalf("expected Reimaged=False/Pending, got %+v", reimagedCond)
+	}
+
+	if reimagedCond.Message != "image=test-image" {
+		t.Fatalf("expected Reimaged message 'image=test-image', got %q", reimagedCond.Message)
+	}
+
+	// Seventh reconcile: reboots match — no-op (timeout is handled by the
+	// lifecycle controller, not the redfish reconciler).
+	prevForceOff := forceOffCalls.Load()
+	prevOn := onCalls.Load()
+
+	_, err = reconciler.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("reconcile 7: %v", err)
+	}
+
+	if forceOffCalls.Load() != prevForceOff || onCalls.Load() != prevOn {
+		t.Fatal("expected no additional Redfish calls after reboot completed")
+	}
+}
+
+func TestRedfishTLSCertPinning(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{"PowerState": "On"})
+	}))
+	defer srv.Close()
+
+	wrongFP := formatFingerprint(make([]byte, 32))
+	s := &bmcSession{
+		httpClient: newHttpClient(wrongFP),
+		baseURL:    srv.URL,
+	}
+
+	_, _, err := s.get(t.Context(), "/redfish/v1/Systems/1")
+	if err == nil {
+		t.Fatal("expected TLS cert pinning error, got nil")
+	}
+
+	if !strings.Contains(err.Error(), "mismatch") {
+		t.Fatalf("expected mismatch error, got: %v", err)
+	}
+}
+
+func TestRedfishTOFUCertCapture(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	expectedFP := tlsServerFingerprint(srv)
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"},
+		Data:       map[string][]byte{"password": []byte("secret")},
+	}
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-tofu", Namespace: "default"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				ImageRef:   v1alpha3.LocalObjectReference{Name: "test-image"},
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:f1", IPv4: "10.0.0.2", SubnetMask: "255.255.255.0"}},
+				Redfish: &v1alpha3.RedfishSpec{
+					URL:         srv.URL,
+					Username:    "admin",
+					DeviceID:    "System.Embedded.1",
+					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
+				},
+			},
+			Operations: &v1alpha3.OperationsSpec{
+				ReimageCounter: 1,
+			},
+		},
+	}
+
+	scheme := testScheme(t)
+	fc := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(node, secret).
+		WithStatusSubresource(node).
+		Build()
+
+	reconciler := &Reconciler{Client: fc, Pool: NewPool()}
+	ctx := t.Context()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "node-tofu", Namespace: "default"}}
+
+	_, err := reconciler.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	var updated v1alpha3.Machine
+	if err := fc.Get(ctx, req.NamespacedName, &updated); err != nil {
+		t.Fatal(err)
+	}
+
+	if updated.Status.Redfish == nil || updated.Status.Redfish.CertFingerprint == "" {
+		t.Fatal("expected TLS cert fingerprint to be populated after TOFU")
+	}
+
+	if updated.Status.Redfish.CertFingerprint != expectedFP {
+		t.Fatalf("fingerprint mismatch: got %s, want %s", updated.Status.Redfish.CertFingerprint, expectedFP)
+	}
+}
+
+func TestRedfishExactlyOnceSemantics(t *testing.T) {
+	var resetCalls atomic.Int64
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			json.NewEncoder(w).Encode(map[string]string{"PowerState": "On"})
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/Actions/ComputerSystem.Reset"):
+			resetCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	fp := tlsServerFingerprint(srv)
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"},
+		Data:       map[string][]byte{"password": []byte("secret")},
+	}
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-once", Namespace: "default"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				ImageRef:   v1alpha3.LocalObjectReference{Name: "test-image"},
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:f4", IPv4: "10.0.0.5", SubnetMask: "255.255.255.0"}},
+				Redfish: &v1alpha3.RedfishSpec{
+					URL:         srv.URL,
+					Username:    "admin",
+					DeviceID:    "System.Embedded.1",
+					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
+				},
+			},
+			Operations: &v1alpha3.OperationsSpec{
+				RebootCounter:  3,
+				ReimageCounter: 1,
+			},
+		},
+		Status: v1alpha3.MachineStatus{
+			Redfish:    &v1alpha3.RedfishStatus{CertFingerprint: fp},
+			Operations: &v1alpha3.OperationsStatus{RebootCounter: 3},
+			Conditions: []metav1.Condition{
+				{
+					Type:   conditionBootOrderConfigSupported,
+					Status: metav1.ConditionFalse,
+					Reason: "NotSupported",
+				},
+			},
+		},
+	}
+
+	scheme := testScheme(t)
+	fc := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(node, secret).
+		WithStatusSubresource(node).
+		Build()
+
+	reconciler := &Reconciler{Client: fc, Pool: NewPool()}
+	ctx := t.Context()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "node-once", Namespace: "default"}}
+
+	for i := range 5 {
+		_, err := reconciler.Reconcile(ctx, req)
+		if err != nil {
+			t.Fatalf("reconcile %d: %v", i, err)
+		}
+	}
+
+	if resetCalls.Load() != 0 {
+		t.Fatalf("expected 0 reset calls when reboots == observedReboots, got %d", resetCalls.Load())
+	}
+}
+
+func TestFormatFingerprint(t *testing.T) {
+	input := []byte{0xab, 0xcd, 0xef, 0x01}
+	got := formatFingerprint(input)
+
+	want := "ab:cd:ef:01"
+	if got != want {
+		t.Fatalf("FormatFingerprint = %q, want %q", got, want)
+	}
+}
+
+func TestBootOrderConfigPxeOn(t *testing.T) {
+	var (
+		patchCalls atomic.Int64
+		patchBody  map[string]any
+	)
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			json.NewEncoder(w).Encode(map[string]any{
+				"PowerState": "On",
+				"Boot": map[string]string{
+					"BootSourceOverrideTarget":  "Hdd",
+					"BootSourceOverrideEnabled": "Once",
+				},
+				"Links": map[string]any{
+					"Chassis": []map[string]any{
+						{"@odata.id": "/redfish/v1/Chassis/1"},
+					},
+				},
+			})
+
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			patchCalls.Add(1)
+			json.NewDecoder(r.Body).Decode(&patchBody)
+			w.WriteHeader(http.StatusOK)
+
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	fp := tlsServerFingerprint(srv)
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"},
+		Data:       map[string][]byte{"password": []byte("secret")},
+	}
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-boot-pxe", Namespace: "default"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				ImageRef:   v1alpha3.LocalObjectReference{Name: "test-image"},
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b0", IPv4: "10.0.0.30", SubnetMask: "255.255.255.0"}},
+				Redfish: &v1alpha3.RedfishSpec{
+					URL:         srv.URL,
+					Username:    "admin",
+					DeviceID:    "System.Embedded.1",
+					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
+				},
+			},
+			Operations: &v1alpha3.OperationsSpec{
+				ReimageCounter: 1,
+			},
+		},
+		Status: v1alpha3.MachineStatus{
+			Redfish: &v1alpha3.RedfishStatus{CertFingerprint: fp},
+		},
+	}
+
+	scheme := testScheme(t)
+	fc := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(node, secret).
+		WithStatusSubresource(node).
+		Build()
+
+	reconciler := &Reconciler{Client: fc, Pool: NewPool()}
+	ctx := t.Context()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "node-boot-pxe", Namespace: "default"}}
+
+	_, err := reconciler.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	if patchCalls.Load() != 1 {
+		t.Fatalf("expected 1 PATCH call, got %d", patchCalls.Load())
+	}
+
+	boot, ok := patchBody["Boot"].(map[string]any)
+	if !ok {
+		t.Fatal("expected Boot in PATCH body")
+	}
+
+	if boot["BootSourceOverrideTarget"] != "Pxe" {
+		t.Fatalf("expected BootSourceOverrideTarget=Pxe, got %v", boot["BootSourceOverrideTarget"])
+	}
+
+	if boot["BootSourceOverrideEnabled"] != "Continuous" {
+		t.Fatalf("expected BootSourceOverrideEnabled=Continuous, got %v", boot["BootSourceOverrideEnabled"])
+	}
+}
+
+func TestBootOrderConfigPxeOff(t *testing.T) {
+	var (
+		patchCalls atomic.Int64
+		patchBody  map[string]any
+	)
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			json.NewEncoder(w).Encode(map[string]any{
+				"PowerState": "On",
+				"Boot": map[string]string{
+					"BootSourceOverrideTarget":  "Pxe",
+					"BootSourceOverrideEnabled": "Continuous",
+				},
+				"Links": map[string]any{
+					"Chassis": []map[string]any{
+						{"@odata.id": "/redfish/v1/Chassis/1"},
+					},
+				},
+			})
+
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			patchCalls.Add(1)
+			json.NewDecoder(r.Body).Decode(&patchBody)
+			w.WriteHeader(http.StatusOK)
+
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	fp := tlsServerFingerprint(srv)
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"},
+		Data:       map[string][]byte{"password": []byte("secret")},
+	}
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-boot-hdd", Namespace: "default"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				ImageRef:   v1alpha3.LocalObjectReference{Name: "test-image"},
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b1", IPv4: "10.0.0.31", SubnetMask: "255.255.255.0"}},
+				Redfish: &v1alpha3.RedfishSpec{
+					URL:         srv.URL,
+					Username:    "admin",
+					DeviceID:    "System.Embedded.1",
+					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
+				},
+			},
+		},
+		Status: v1alpha3.MachineStatus{
+			Redfish: &v1alpha3.RedfishStatus{CertFingerprint: fp},
+		},
+	}
+
+	scheme := testScheme(t)
+	fc := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(node, secret).
+		WithStatusSubresource(node).
+		Build()
+
+	reconciler := &Reconciler{Client: fc, Pool: NewPool()}
+	ctx := t.Context()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "node-boot-hdd", Namespace: "default"}}
+
+	_, err := reconciler.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	if patchCalls.Load() != 1 {
+		t.Fatalf("expected 1 PATCH call, got %d", patchCalls.Load())
+	}
+
+	boot, ok := patchBody["Boot"].(map[string]any)
+	if !ok {
+		t.Fatal("expected Boot in PATCH body")
+	}
+
+	if _, hasTarget := boot["BootSourceOverrideTarget"]; hasTarget {
+		t.Fatalf("expected no BootSourceOverrideTarget, got %v", boot["BootSourceOverrideTarget"])
+	}
+
+	if boot["BootSourceOverrideEnabled"] != "Disabled" {
+		t.Fatalf("expected BootSourceOverrideEnabled=Disabled, got %v", boot["BootSourceOverrideEnabled"])
+	}
+}
+
+func TestBootOrderConfigNoOp(t *testing.T) {
+	var patchCalls atomic.Int64
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			json.NewEncoder(w).Encode(map[string]any{
+				"PowerState": "On",
+				"Boot": map[string]string{
+					"BootSourceOverrideTarget":  "Pxe",
+					"BootSourceOverrideEnabled": "Continuous",
+				},
+				"Links": map[string]any{
+					"Chassis": []map[string]any{
+						{"@odata.id": "/redfish/v1/Chassis/1"},
+					},
+				},
+			})
+
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			patchCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	fp := tlsServerFingerprint(srv)
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"},
+		Data:       map[string][]byte{"password": []byte("secret")},
+	}
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-boot-noop", Namespace: "default"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				ImageRef:   v1alpha3.LocalObjectReference{Name: "test-image"},
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b2", IPv4: "10.0.0.32", SubnetMask: "255.255.255.0"}},
+				Redfish: &v1alpha3.RedfishSpec{
+					URL:         srv.URL,
+					Username:    "admin",
+					DeviceID:    "System.Embedded.1",
+					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
+				},
+			},
+			Operations: &v1alpha3.OperationsSpec{
+				ReimageCounter: 1,
+			},
+		},
+		Status: v1alpha3.MachineStatus{
+			Redfish: &v1alpha3.RedfishStatus{CertFingerprint: fp},
+		},
+	}
+
+	scheme := testScheme(t)
+	fc := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(node, secret).
+		WithStatusSubresource(node).
+		Build()
+
+	reconciler := &Reconciler{Client: fc, Pool: NewPool()}
+	ctx := t.Context()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "node-boot-noop", Namespace: "default"}}
+
+	_, err := reconciler.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	if patchCalls.Load() != 0 {
+		t.Fatalf("expected 0 PATCH calls for no-op, got %d", patchCalls.Load())
+	}
+}
+
+func TestBootOrderConfigNoOpPxeOff(t *testing.T) {
+	var patchCalls atomic.Int64
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			json.NewEncoder(w).Encode(map[string]any{
+				"PowerState": "On",
+				"Boot": map[string]string{
+					"BootSourceOverrideTarget":  "None",
+					"BootSourceOverrideEnabled": "Disabled",
+				},
+				"Links": map[string]any{
+					"Chassis": []map[string]any{
+						{"@odata.id": "/redfish/v1/Chassis/1"},
+					},
+				},
+			})
+
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			patchCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	fp := tlsServerFingerprint(srv)
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"},
+		Data:       map[string][]byte{"password": []byte("secret")},
+	}
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-boot-noop-off", Namespace: "default"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				ImageRef:   v1alpha3.LocalObjectReference{Name: "test-image"},
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b5", IPv4: "10.0.0.35", SubnetMask: "255.255.255.0"}},
+				Redfish: &v1alpha3.RedfishSpec{
+					URL:         srv.URL,
+					Username:    "admin",
+					DeviceID:    "System.Embedded.1",
+					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
+				},
+			},
+		},
+		Status: v1alpha3.MachineStatus{
+			Redfish: &v1alpha3.RedfishStatus{CertFingerprint: fp},
+		},
+	}
+
+	scheme := testScheme(t)
+	fc := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(node, secret).
+		WithStatusSubresource(node).
+		Build()
+
+	reconciler := &Reconciler{Client: fc, Pool: NewPool()}
+	ctx := t.Context()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "node-boot-noop-off", Namespace: "default"}}
+
+	_, err := reconciler.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	if patchCalls.Load() != 0 {
+		t.Fatalf("expected 0 PATCH calls for no-op, got %d", patchCalls.Load())
+	}
+}
+
+func TestBootOrderConfigPxeOffDisableFallbackToHdd(t *testing.T) {
+	var (
+		patchCalls    atomic.Int64
+		lastPatchBody map[string]any
+	)
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			json.NewEncoder(w).Encode(map[string]any{
+				"PowerState": "On",
+				"Boot": map[string]string{
+					"BootSourceOverrideTarget":  "Pxe",
+					"BootSourceOverrideEnabled": "Continuous",
+				},
+				"Links": map[string]any{
+					"Chassis": []map[string]any{
+						{"@odata.id": "/redfish/v1/Chassis/1"},
+					},
+				},
+			})
+
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			patchCalls.Add(1)
+
+			var body map[string]any
+			json.NewDecoder(r.Body).Decode(&body)
+			lastPatchBody = body
+
+			boot, _ := body["Boot"].(map[string]any)
+			if boot["BootSourceOverrideEnabled"] == "Disabled" {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+
+			w.WriteHeader(http.StatusOK)
+
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	fp := tlsServerFingerprint(srv)
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"},
+		Data:       map[string][]byte{"password": []byte("secret")},
+	}
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-boot-fallback", Namespace: "default"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				ImageRef:   v1alpha3.LocalObjectReference{Name: "test-image"},
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b6", IPv4: "10.0.0.36", SubnetMask: "255.255.255.0"}},
+				Redfish: &v1alpha3.RedfishSpec{
+					URL:         srv.URL,
+					Username:    "admin",
+					DeviceID:    "System.Embedded.1",
+					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
+				},
+			},
+		},
+		Status: v1alpha3.MachineStatus{
+			Redfish: &v1alpha3.RedfishStatus{CertFingerprint: fp},
+		},
+	}
+
+	scheme := testScheme(t)
+	fc := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(node, secret).
+		WithStatusSubresource(node).
+		Build()
+
+	reconciler := &Reconciler{Client: fc, Pool: NewPool()}
+	ctx := t.Context()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "node-boot-fallback", Namespace: "default"}}
+
+	_, err := reconciler.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	if patchCalls.Load() != 2 {
+		t.Fatalf("expected 2 PATCH calls (Disabled then Hdd fallback), got %d", patchCalls.Load())
+	}
+
+	boot, ok := lastPatchBody["Boot"].(map[string]any)
+	if !ok {
+		t.Fatal("expected Boot in last PATCH body")
+	}
+
+	if boot["BootSourceOverrideTarget"] != "Hdd" {
+		t.Fatalf("expected fallback BootSourceOverrideTarget=Hdd, got %v", boot["BootSourceOverrideTarget"])
+	}
+
+	if boot["BootSourceOverrideEnabled"] != "Continuous" {
+		t.Fatalf("expected fallback BootSourceOverrideEnabled=Continuous, got %v", boot["BootSourceOverrideEnabled"])
+	}
+}
+
+func TestBootOrderConfigNoOpPxeOffHdd(t *testing.T) {
+	var patchCalls atomic.Int64
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			json.NewEncoder(w).Encode(map[string]any{
+				"PowerState": "On",
+				"Boot": map[string]string{
+					"BootSourceOverrideTarget":  "Hdd",
+					"BootSourceOverrideEnabled": "Continuous",
+				},
+				"Links": map[string]any{
+					"Chassis": []map[string]any{
+						{"@odata.id": "/redfish/v1/Chassis/1"},
+					},
+				},
+			})
+
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			patchCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	fp := tlsServerFingerprint(srv)
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"},
+		Data:       map[string][]byte{"password": []byte("secret")},
+	}
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-boot-noop-hdd", Namespace: "default"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				ImageRef:   v1alpha3.LocalObjectReference{Name: "test-image"},
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b7", IPv4: "10.0.0.37", SubnetMask: "255.255.255.0"}},
+				Redfish: &v1alpha3.RedfishSpec{
+					URL:         srv.URL,
+					Username:    "admin",
+					DeviceID:    "System.Embedded.1",
+					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
+				},
+			},
+		},
+		Status: v1alpha3.MachineStatus{
+			Redfish: &v1alpha3.RedfishStatus{CertFingerprint: fp},
+		},
+	}
+
+	scheme := testScheme(t)
+	fc := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(node, secret).
+		WithStatusSubresource(node).
+		Build()
+
+	reconciler := &Reconciler{Client: fc, Pool: NewPool()}
+	ctx := t.Context()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "node-boot-noop-hdd", Namespace: "default"}}
+
+	_, err := reconciler.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	if patchCalls.Load() != 0 {
+		t.Fatalf("expected 0 PATCH calls for Hdd+Continuous no-op, got %d", patchCalls.Load())
+	}
+}
+
+func TestBootOrderConfigUnsupported(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			json.NewEncoder(w).Encode(map[string]any{
+				"PowerState": "On",
+				"Boot": map[string]string{
+					"BootSourceOverrideTarget":  "None",
+					"BootSourceOverrideEnabled": "Disabled",
+				},
+				"Links": map[string]any{
+					"Chassis": []map[string]any{
+						{"@odata.id": "/redfish/v1/Chassis/1"},
+					},
+				},
+			})
+
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			http.NotFound(w, r)
+
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	fp := tlsServerFingerprint(srv)
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"},
+		Data:       map[string][]byte{"password": []byte("secret")},
+	}
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-boot-unsup", Namespace: "default"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				ImageRef:   v1alpha3.LocalObjectReference{Name: "test-image"},
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b3", IPv4: "10.0.0.33", SubnetMask: "255.255.255.0"}},
+				Redfish: &v1alpha3.RedfishSpec{
+					URL:         srv.URL,
+					Username:    "admin",
+					DeviceID:    "System.Embedded.1",
+					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
+				},
+			},
+			Operations: &v1alpha3.OperationsSpec{
+				ReimageCounter: 1,
+			},
+		},
+		Status: v1alpha3.MachineStatus{
+			Redfish: &v1alpha3.RedfishStatus{CertFingerprint: fp},
+		},
+	}
+
+	scheme := testScheme(t)
+	fc := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(node, secret).
+		WithStatusSubresource(node).
+		Build()
+
+	reconciler := &Reconciler{Client: fc, Pool: NewPool()}
+	ctx := t.Context()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "node-boot-unsup", Namespace: "default"}}
+
+	_, err := reconciler.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	var updated v1alpha3.Machine
+	if err := fc.Get(ctx, req.NamespacedName, &updated); err != nil {
+		t.Fatal(err)
+	}
+
+	bootCond := meta.FindStatusCondition(updated.Status.Conditions, conditionBootOrderConfigSupported)
+	if bootCond == nil {
+		t.Fatal("expected BootOrderConfigSupported condition to be set")
+	}
+
+	if bootCond.Status != metav1.ConditionFalse {
+		t.Fatalf("expected BootOrderConfigSupported=False, got %s", bootCond.Status)
+	}
+
+	if bootCond.Reason != "NotSupported" {
+		t.Fatalf("expected reason NotSupported, got %s", bootCond.Reason)
+	}
+}
+
+func TestBootOrderConfigTransientError(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			json.NewEncoder(w).Encode(map[string]any{
+				"PowerState": "On",
+				"Boot": map[string]string{
+					"BootSourceOverrideTarget":  "None",
+					"BootSourceOverrideEnabled": "Disabled",
+				},
+				"Links": map[string]any{
+					"Chassis": []map[string]any{
+						{"@odata.id": "/redfish/v1/Chassis/1"},
+					},
+				},
+			})
+
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			w.WriteHeader(http.StatusServiceUnavailable)
+
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	fp := tlsServerFingerprint(srv)
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"},
+		Data:       map[string][]byte{"password": []byte("secret")},
+	}
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-boot-503", Namespace: "default"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				ImageRef:   v1alpha3.LocalObjectReference{Name: "test-image"},
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b4", IPv4: "10.0.0.34", SubnetMask: "255.255.255.0"}},
+				Redfish: &v1alpha3.RedfishSpec{
+					URL:         srv.URL,
+					Username:    "admin",
+					DeviceID:    "System.Embedded.1",
+					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
+				},
+			},
+			Operations: &v1alpha3.OperationsSpec{
+				ReimageCounter: 1,
+			},
+		},
+		Status: v1alpha3.MachineStatus{
+			Redfish: &v1alpha3.RedfishStatus{CertFingerprint: fp},
+		},
+	}
+
+	scheme := testScheme(t)
+	fc := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(node, secret).
+		WithStatusSubresource(node).
+		Build()
+
+	reconciler := &Reconciler{Client: fc, Pool: NewPool()}
+	ctx := t.Context()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "node-boot-503", Namespace: "default"}}
+
+	_, err := reconciler.Reconcile(ctx, req)
+	if err == nil {
+		t.Fatal("expected transient error to be returned, got nil")
+	}
+
+	var updated v1alpha3.Machine
+	if err := fc.Get(ctx, req.NamespacedName, &updated); err != nil {
+		t.Fatal(err)
+	}
+
+	bootCond := meta.FindStatusCondition(updated.Status.Conditions, conditionBootOrderConfigSupported)
+	if bootCond != nil {
+		t.Fatalf("expected BootOrderConfigSupported condition NOT to be set on transient error, got %+v", bootCond)
+	}
+}
+
+func testScheme(t *testing.T) *runtime.Scheme {
+	t.Helper()
+
+	s := runtime.NewScheme()
+	if err := v1alpha3.AddToScheme(s); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := corev1.AddToScheme(s); err != nil {
+		t.Fatal(err)
+	}
+
+	return s
+}
+
+func tlsServerFingerprint(srv *httptest.Server) string {
+	raw := srv.TLS.Certificates[0].Certificate[0]
+	h := sha256.Sum256(raw)
+
+	return formatFingerprint(h[:])
+}

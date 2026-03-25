@@ -1,0 +1,118 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: metalman-controller
+  namespace: machina-system
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: metalman-bootstrap
+  namespace: machina-system
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: metalman-controller
+  namespace: machina-system
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  - apiGroups: [""]
+    resources: ["serviceaccounts/token"]
+    verbs: ["create"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: metalman-controller
+  namespace: machina-system
+subjects:
+  - kind: ServiceAccount
+    name: metalman-controller
+    namespace: machina-system
+roleRef:
+  kind: Role
+  name: metalman-controller
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: metalman-controller
+rules:
+  # Machine controller
+  - apiGroups: ["unbounded-kube.io"]
+    resources: ["machines"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["unbounded-kube.io"]
+    resources: ["machines/status"]
+    verbs: ["get", "update", "patch"]
+  # Image controller
+  - apiGroups: ["unbounded-kube.io"]
+    resources: ["images"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["unbounded-kube.io"]
+    resources: ["images/status"]
+    verbs: ["get", "update", "patch"]
+  # Secrets (Redfish passwords)
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: metalman-controller
+subjects:
+  - kind: ServiceAccount
+    name: metalman-controller
+    namespace: machina-system
+roleRef:
+  kind: ClusterRole
+  name: metalman-controller
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# Allow bootstrap tokens issued for the metalman-bootstrap SA to create
+# certificate signing requests (kubelet TLS bootstrap).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: metalman:node-bootstrapper
+subjects:
+  - kind: ServiceAccount
+    name: metalman-bootstrap
+    namespace: machina-system
+roleRef:
+  kind: ClusterRole
+  name: system:node-bootstrapper
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# Auto-approve kubelet client certificate requests from the bootstrap SA.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: metalman:node-autoapprove-bootstrap
+subjects:
+  - kind: ServiceAccount
+    name: metalman-bootstrap
+    namespace: machina-system
+roleRef:
+  kind: ClusterRole
+  name: system:certificates.k8s.io:certificatesigningrequests:nodeclient
+  apiGroup: rbac.authorization.k8s.io

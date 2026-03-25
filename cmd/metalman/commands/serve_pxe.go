@@ -1,0 +1,251 @@
+package commands
+
+import (
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"time"
+
+	v1alpha3 "github.com/project-unbounded/unbounded-kube/api/v1alpha3"
+	"github.com/project-unbounded/unbounded-kube/cmd/metalman/internal/attestation"
+	"github.com/project-unbounded/unbounded-kube/cmd/metalman/internal/dhcp"
+	"github.com/project-unbounded/unbounded-kube/cmd/metalman/internal/indexing"
+	"github.com/project-unbounded/unbounded-kube/cmd/metalman/internal/lifecycle"
+	"github.com/project-unbounded/unbounded-kube/cmd/metalman/internal/netboot"
+	"github.com/project-unbounded/unbounded-kube/cmd/metalman/internal/redfish"
+	"github.com/spf13/cobra"
+	"k8s.io/client-go/kubernetes"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/healthz"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+)
+
+// ServePXECmd returns a cobra.Command that runs PXE servers and the BMC control loop.
+func ServePXECmd() *cobra.Command {
+	var (
+		pool          string
+		cacheDir      string
+		maxDownloads  int
+		bindAddress   string
+		httpPort      int
+		healthPort    int
+		dhcpInterface string
+		dhcpPort      int
+		apiserverURL  string
+		serveURL      string
+		leaseDuration time.Duration
+		renewDeadline time.Duration
+		retryPeriod   time.Duration
+	)
+
+	cmd := &cobra.Command{
+		Use:   "serve-pxe",
+		Short: "Run PXE servers and BMC control loop",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			ctx := ctrl.SetupSignalHandler()
+			cfg := ctrl.GetConfigOrDie()
+
+			selector, err := PoolSelector(pool)
+			if err != nil {
+				return fmt.Errorf("building pool selector: %w", err)
+			}
+
+			leID := LeaderElectionID(pool)
+
+			scheme := BuildScheme()
+
+			mgr, err := ctrl.NewManager(cfg, manager.Options{
+				Scheme:                        scheme,
+				LeaderElection:                true,
+				LeaderElectionID:              leID,
+				LeaderElectionNamespace:       "machina-system",
+				LeaseDuration:                 &leaseDuration,
+				RenewDeadline:                 &renewDeadline,
+				RetryPeriod:                   &retryPeriod,
+				LeaderElectionReleaseOnCancel: true,
+				Metrics:                       metricsserver.Options{BindAddress: "0"},
+				HealthProbeBindAddress:        fmt.Sprintf(":%d", healthPort),
+				Cache: cache.Options{
+					ByObject: map[client.Object]cache.ByObject{
+						&v1alpha3.Machine{}: {Label: selector},
+					},
+				},
+			})
+			if err != nil {
+				return fmt.Errorf("creating manager: %w", err)
+			}
+
+			if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
+				return fmt.Errorf("adding healthz check: %w", err)
+			}
+
+			if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
+				return fmt.Errorf("adding readyz check: %w", err)
+			}
+
+			if err := mgr.GetFieldIndexer().IndexField(ctx, &v1alpha3.Machine{}, indexing.IndexNodeByMAC,
+				indexing.IndexNodeByMACFunc); err != nil {
+				return fmt.Errorf("indexing by MAC: %w", err)
+			}
+
+			if err := mgr.GetFieldIndexer().IndexField(ctx, &v1alpha3.Machine{}, indexing.IndexNodeByIP,
+				indexing.IndexNodeByIPFunc); err != nil {
+				return fmt.Errorf("indexing by IP: %w", err)
+			}
+
+			if err := os.MkdirAll(filepath.Join(cacheDir, "sha256"), 0o755); err != nil {
+				return fmt.Errorf("creating cache dir: %w", err)
+			}
+
+			clientset, err := kubernetes.NewForConfig(cfg)
+			if err != nil {
+				return fmt.Errorf("creating clientset: %w", err)
+			}
+
+			clusterCA := attestation.ClusterCAFromConfig(cfg)
+
+			serverIP := net.ParseIP(bindAddress)
+			if serveURL == "" {
+				ip := serverIP
+				if ip.IsUnspecified() {
+					detected, err := OutboundIP()
+					if err != nil {
+						return fmt.Errorf("detecting outbound IP for --serve-url default: %w", err)
+					}
+
+					ip = detected
+					serverIP = detected
+				}
+
+				serveURL = fmt.Sprintf("http://%s:%d", ip, httpPort)
+			}
+
+			if apiserverURL == "" {
+				apiserverURL = cfg.Host
+			}
+
+			if err := (&netboot.ImageReconciler{
+				Client:       mgr.GetClient(),
+				CacheDir:     cacheDir,
+				MaxDownloads: maxDownloads,
+			}).SetupWithManager(mgr); err != nil {
+				return fmt.Errorf("setting up Image reconciler: %w", err)
+			}
+
+			redfishPool := redfish.NewPool()
+			defer redfishPool.Close()
+
+			if err := (&redfish.Reconciler{Client: mgr.GetClient(), Pool: redfishPool}).SetupWithManager(mgr); err != nil {
+				return fmt.Errorf("setting up Redfish reconciler: %w", err)
+			}
+
+			if err := (&lifecycle.Reconciler{Client: mgr.GetClient()}).SetupWithManager(mgr); err != nil {
+				return fmt.Errorf("setting up Lifecycle reconciler: %w", err)
+			}
+
+			resolver := netboot.FileResolver{
+				CacheDir:     cacheDir,
+				Reader:       mgr.GetClient(),
+				ApiserverURL: apiserverURL,
+				ServeURL:     serveURL,
+			}
+
+			dhcpServerIP := serverIP
+
+			if dhcpInterface != "" {
+				ifIP, err := InterfaceIPv4(dhcpInterface)
+				if err != nil {
+					return fmt.Errorf("detecting IPv4 address of interface %s: %w", dhcpInterface, err)
+				}
+
+				dhcpServerIP = ifIP
+			}
+
+			dhcpServer := &dhcp.Server{
+				Interface: dhcpInterface,
+				Port:      dhcpPort,
+				Reader:    mgr.GetClient(),
+				ServerIP:  dhcpServerIP,
+			}
+			if err := mgr.Add(dhcpServer); err != nil {
+				return fmt.Errorf("adding DHCP server: %w", err)
+			}
+
+			tftpServer := &netboot.TFTPServer{
+				BindAddr:     bindAddress,
+				FileResolver: resolver,
+			}
+			if err := mgr.Add(tftpServer); err != nil {
+				return fmt.Errorf("adding TFTP server: %w", err)
+			}
+
+			attestHandler := &attestation.Handler{
+				Clientset:      clientset,
+				ClusterCA:      clusterCA,
+				LookupNodeByIP: resolver.LookupNodeByIP,
+				StatusUpdater:  &StatusUpdater{Client: mgr.GetClient()},
+			}
+
+			httpMux := http.NewServeMux()
+			httpMux.HandleFunc("POST /attest", attestHandler.Attest)
+
+			httpServer := &netboot.HTTPServer{
+				BindAddr:     bindAddress,
+				Port:         httpPort,
+				Client:       mgr.GetClient(),
+				Mux:          httpMux,
+				FileResolver: resolver,
+			}
+			if err := mgr.Add(httpServer); err != nil {
+				return fmt.Errorf("adding HTTP server: %w", err)
+			}
+
+			poolDisplay := pool
+			if poolDisplay == "" {
+				poolDisplay = "(unlabeled nodes)"
+			}
+
+			PrintConfig("pool", poolDisplay)
+			PrintConfig("leader-election", leID)
+			PrintConfig("serve-url", serveURL)
+			PrintConfig("cache-dir", cacheDir)
+			PrintConfig("dhcp-interface", dhcpInterface)
+			PrintConfig("dhcp-port", fmt.Sprintf("%d", dhcpPort))
+			fmt.Println()
+
+			if dhcpInterface != "" {
+				PrintService("DHCP", fmt.Sprintf("%s:%d", dhcpInterface, dhcpPort))
+			} else {
+				PrintService("DHCP", fmt.Sprintf("0.0.0.0:%d (relay)", dhcpPort))
+			}
+
+			PrintService("TFTP", fmt.Sprintf("%s:69", bindAddress))
+			PrintService("HTTP", fmt.Sprintf("%s:%d", bindAddress, httpPort))
+			PrintService("Redfish", "reconciler")
+			PrintReady()
+
+			return mgr.Start(ctx)
+		},
+	}
+
+	cmd.Flags().StringVar(&pool, "pool", "", "Pool label value to select Machines")
+	cmd.Flags().StringVar(&cacheDir, "cache-dir", DefaultCacheDir(), "Local directory for cached image artifacts")
+	cmd.Flags().IntVar(&maxDownloads, "max-downloads", 8, "Maximum concurrent file downloads")
+	cmd.Flags().StringVar(&bindAddress, "bind-address", "0.0.0.0", "IP address to bind servers")
+	cmd.Flags().IntVar(&httpPort, "http-port", 8880, "Port for the HTTP artifact server")
+	cmd.Flags().IntVar(&healthPort, "health-port", 8081, "Port for the health/readiness probe server")
+	cmd.Flags().StringVar(&dhcpInterface, "dhcp-interface", "", "Network interface for broadcast DHCP (omit for relay/unicast mode)")
+	cmd.Flags().IntVar(&dhcpPort, "dhcp-port", 67, "UDP port for the DHCP server")
+	cmd.Flags().StringVar(&apiserverURL, "apiserver-url", "", "External URL of the Kubernetes API server (for templates)")
+	cmd.Flags().StringVar(&serveURL, "serve-url", "", "External URL of this serve instance")
+	cmd.Flags().DurationVar(&leaseDuration, "leader-elect-lease-duration", 15*time.Second, "Duration that non-leader candidates will wait before attempting to acquire leadership")
+	cmd.Flags().DurationVar(&renewDeadline, "leader-elect-renew-deadline", 10*time.Second, "Duration the acting leader will retry refreshing leadership before giving up")
+	cmd.Flags().DurationVar(&retryPeriod, "leader-elect-retry-period", 2*time.Second, "Duration between leader election retries")
+
+	return cmd
+}
