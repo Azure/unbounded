@@ -8,15 +8,6 @@ import (
 	"strings"
 )
 
-// ChassisAttributes contains chassis/motherboard-specific fields stored in DeviceRecord.Attributes.
-type ChassisAttributes struct {
-	Manufacturer string `json:"manufacturer"`
-	Model        string `json:"model"`
-	Hostname     string `json:"hostname"`
-	BIOSVersion  string `json:"bios_version,omitempty"`
-	IsVirtual    bool   `json:"is_virtual"`
-}
-
 // ChassisInfo holds information about the system chassis / motherboard.
 type ChassisInfo struct {
 	Manufacturer string
@@ -27,8 +18,8 @@ type ChassisInfo struct {
 	IsVirtual    bool
 }
 
-// ChassisToRecord converts a ChassisInfo into a DeviceRecord.
-func ChassisToRecord(c *ChassisInfo, hostID string) DeviceRecord {
+// chassisToRecord converts a ChassisInfo into a DeviceRecord.
+func chassisToRecord(c *ChassisInfo, hostID string) DeviceRecord {
 	name := c.Model
 	if name == "" {
 		name = "System"
@@ -44,7 +35,7 @@ func ChassisToRecord(c *ChassisInfo, hostID string) DeviceRecord {
 		DeviceName:     name,
 		HostIdentifier: hostID,
 		SerialNumber:   serial,
-		Attributes: mustMarshal(ChassisAttributes{
+		Attributes: mustMarshal(ChassisInfo{
 			Manufacturer: c.Manufacturer,
 			Model:        c.Model,
 			Hostname:     c.Hostname,
@@ -54,10 +45,11 @@ func ChassisToRecord(c *ChassisInfo, hostID string) DeviceRecord {
 	}
 }
 
-// collectChassisInfo reads system/motherboard identity from DMI sysfs entries.
-// When DMI sysfs is unavailable it still returns a ChassisInfo populated with
+// collectChassisInfo reads system/motherboard identity from DMI sysfs entries
+// and returns it as a slice of DeviceRecord plus the derived host identifier.
+// When DMI sysfs is unavailable it still returns a record populated with
 // whatever fallback identifier can be found (product_uuid or machine-id).
-func collectChassisInfo(_ context.Context) (*ChassisInfo, error) {
+func collectChassisInfo(_ context.Context, debug bool) ([]DeviceRecord, string, error) {
 	dmiBase := "/sys/class/dmi/id"
 
 	info := &ChassisInfo{}
@@ -86,7 +78,13 @@ func collectChassisInfo(_ context.Context) (*ChassisInfo, error) {
 		info.SerialNumber = fallbackHostIdentifier(dmiBase)
 	}
 
-	return info, collectErr
+	if debug {
+		printChassisInfo(info)
+	}
+
+	hostID := info.SerialNumber
+
+	return []DeviceRecord{chassisToRecord(info, hostID)}, hostID, collectErr
 }
 
 // fallbackHostIdentifier returns a stable unique identifier for the host when

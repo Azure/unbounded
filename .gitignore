@@ -1,6 +1,7 @@
 # Build artifacts
 bin/
 dist/
+inventory.db
 *.exe
 *.exe~
 *.dll

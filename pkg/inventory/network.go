@@ -10,39 +10,6 @@ import (
 	"strings"
 )
 
-// NICAttributes contains network interface-specific fields stored in DeviceRecord.Attributes.
-type NICAttributes struct {
-	MACAddr   string   `json:"mac_address"`
-	IPAddrs   []string `json:"ip_addresses,omitempty"`
-	Driver    string   `json:"driver,omitempty"`
-	Firmware  string   `json:"firmware,omitempty"`
-	LinkSpeed string   `json:"link_speed,omitempty"`
-	MTU       string   `json:"mtu,omitempty"`
-}
-
-// NICToRecord converts a NICInfo into a DeviceRecord.
-func NICToRecord(n *NICInfo, hostID string) DeviceRecord {
-	serial := n.MACAddr
-	if serial == "" {
-		serial = "nic-" + n.Name
-	}
-
-	return DeviceRecord{
-		DeviceType:     DeviceTypeNIC,
-		DeviceName:     n.Name,
-		HostIdentifier: hostID,
-		SerialNumber:   serial,
-		Attributes: mustMarshal(NICAttributes{
-			MACAddr:   n.MACAddr,
-			IPAddrs:   n.IPAddrs,
-			Driver:    n.Driver,
-			Firmware:  n.Firmware,
-			LinkSpeed: n.LinkSpeed,
-			MTU:       n.MTU,
-		}),
-	}
-}
-
 // NICInfo holds information about a single network interface.
 type NICInfo struct {
 	Name      string
@@ -54,8 +21,31 @@ type NICInfo struct {
 	MTU       string
 }
 
-// collectNICInfo discovers physical network interfaces and returns info for each.
-func collectNICInfo(ctx context.Context) ([]NICInfo, error) {
+// nicToRecord converts a NICInfo into a DeviceRecord.
+func nicToRecord(n *NICInfo, hostID string) DeviceRecord {
+	serial := n.MACAddr
+	if serial == "" {
+		serial = "nic-" + n.Name
+	}
+
+	return DeviceRecord{
+		DeviceType:     DeviceTypeNIC,
+		DeviceName:     n.Name,
+		HostIdentifier: hostID,
+		SerialNumber:   serial,
+		Attributes: mustMarshal(NICInfo{
+			MACAddr:   n.MACAddr,
+			IPAddrs:   n.IPAddrs,
+			Driver:    n.Driver,
+			Firmware:  n.Firmware,
+			LinkSpeed: n.LinkSpeed,
+			MTU:       n.MTU,
+		}),
+	}
+}
+
+// collectNICInfo discovers physical network interfaces and returns them as device records.
+func collectNICInfo(ctx context.Context, hostID string, debug bool) ([]DeviceRecord, error) {
 	entries, err := os.ReadDir("/sys/class/net")
 	if err != nil {
 		return nil, fmt.Errorf("failed to read /sys/class/net: %w", err)
@@ -86,7 +76,16 @@ func collectNICInfo(ctx context.Context) ([]NICInfo, error) {
 		nics = append(nics, nic)
 	}
 
-	return nics, nil
+	if debug {
+		printNICInfo(nics)
+	}
+
+	var records []DeviceRecord
+	for i := range nics {
+		records = append(records, nicToRecord(&nics[i], hostID))
+	}
+
+	return records, nil
 }
 
 // isPhysicalNIC returns true if the interface appears to be a physical NIC

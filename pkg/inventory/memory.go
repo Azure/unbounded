@@ -9,37 +9,10 @@ import (
 	"strings"
 )
 
-// MemoryAttributes contains memory-specific fields stored in DeviceRecord.Attributes.
-type MemoryAttributes struct {
-	TotalBytes uint64           `json:"total_bytes"`
-	DIMMs      []DIMMAttributes `json:"dimms,omitempty"`
-}
-
-// DIMMAttributes describes a single DIMM slot.
-type DIMMAttributes struct {
-	Locator      string `json:"locator,omitempty"`
-	Size         string `json:"size,omitempty"`
-	Speed        string `json:"speed,omitempty"`
-	SerialNumber string `json:"serial_number,omitempty"`
-}
-
-// MemoryToRecord converts a MemoryInfo into a DeviceRecord.
-func MemoryToRecord(m *MemoryInfo, hostID string) DeviceRecord {
-	var dimms []DIMMAttributes
-	for _, d := range m.DIMMs {
-		dimms = append(dimms, DIMMAttributes(d))
-	}
-
-	return DeviceRecord{
-		DeviceType:     DeviceTypeMemory,
-		DeviceName:     "System Memory",
-		HostIdentifier: hostID,
-		SerialNumber:   "system-memory",
-		Attributes: mustMarshal(MemoryAttributes{
-			TotalBytes: m.TotalBytes,
-			DIMMs:      dimms,
-		}),
-	}
+// MemoryInfo holds information about the system's memory.
+type MemoryInfo struct {
+	TotalBytes uint64
+	DIMMs      []DIMMInfo
 }
 
 // DIMMInfo holds information about a single memory DIMM.
@@ -50,14 +23,27 @@ type DIMMInfo struct {
 	SerialNumber string
 }
 
-// MemoryInfo holds information about the system's memory.
-type MemoryInfo struct {
-	TotalBytes uint64
-	DIMMs      []DIMMInfo
+// memoryToRecord converts a MemoryInfo into a DeviceRecord.
+func memoryToRecord(m *MemoryInfo, hostID string) DeviceRecord {
+	var dimms []DIMMInfo
+	for _, d := range m.DIMMs {
+		dimms = append(dimms, DIMMInfo(d))
+	}
+
+	return DeviceRecord{
+		DeviceType:     DeviceTypeMemory,
+		DeviceName:     "System Memory",
+		HostIdentifier: hostID,
+		SerialNumber:   "system-memory",
+		Attributes: mustMarshal(MemoryInfo{
+			TotalBytes: m.TotalBytes,
+			DIMMs:      dimms,
+		}),
+	}
 }
 
-// collectMemoryInfo gathers system memory information.
-func collectMemoryInfo(ctx context.Context) (*MemoryInfo, error) {
+// collectMemoryInfo gathers system memory information and returns it as device records.
+func collectMemoryInfo(ctx context.Context, hostID string, debug bool) ([]DeviceRecord, error) {
 	total, err := readTotalMemory()
 	if err != nil {
 		return nil, fmt.Errorf("failed to read total memory: %w", err)
@@ -65,10 +51,16 @@ func collectMemoryInfo(ctx context.Context) (*MemoryInfo, error) {
 
 	dimms := collectDIMMInfo(ctx)
 
-	return &MemoryInfo{
+	info := &MemoryInfo{
 		TotalBytes: total,
 		DIMMs:      dimms,
-	}, nil
+	}
+
+	if debug {
+		printMemoryInfo(info)
+	}
+
+	return []DeviceRecord{memoryToRecord(info, hostID)}, nil
 }
 
 // readTotalMemory reads total system memory from /proc/meminfo.

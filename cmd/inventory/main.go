@@ -17,8 +17,8 @@ func main() {
 	rootCmd := &cobra.Command{
 		Use:   "inventory",
 		Short: "Collect node inventory data",
-		Run: func(cmd *cobra.Command, args []string) {
-			inventory.CollectInventory(debug, dbPath)
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return inventory.Execute(debug, dbPath)
 		},
 	}
 

@@ -9,21 +9,22 @@ import (
 	"strings"
 )
 
-// CPUAttributes contains CPU-specific fields stored in DeviceRecord.Attributes.
-type CPUAttributes struct {
-	Architecture     string   `json:"architecture"`
-	Flags            []string `json:"flags,omitempty"`
-	Microcode        string   `json:"microcode,omitempty"`
-	CoresPerCPU      string   `json:"cores_per_cpu,omitempty"`
-	ThreadsPerCore   string   `json:"threads_per_core,omitempty"`
-	AddressSizes     string   `json:"address_sizes,omitempty"`
-	SerialNumbers    []string `json:"serial_numbers,omitempty"`
-	LogicalCPUCount  int      `json:"logical_cpu_count"`
-	PhysicalCPUCount int      `json:"physical_cpu_count"`
+// CPUInfo holds information about the system's CPUs.
+type CPUInfo struct {
+	ModelName        string
+	Architecture     string
+	Flags            []string
+	Microcode        string
+	CoresPerCPU      string
+	ThreadsPerCore   string
+	AddressSizes     string
+	SerialNumbers    []string
+	LogicalCPUCount  int
+	PhysicalCPUCount int
 }
 
-// CPUToRecord converts a CPUInfo into a DeviceRecord.
-func CPUToRecord(c *CPUInfo, hostID string) DeviceRecord {
+// cpuToRecord converts a CPUInfo into a DeviceRecord.
+func cpuToRecord(c *CPUInfo, hostID string) DeviceRecord {
 	name := c.ModelName
 	if name == "" {
 		name = "CPU"
@@ -39,7 +40,7 @@ func CPUToRecord(c *CPUInfo, hostID string) DeviceRecord {
 		DeviceName:     name,
 		HostIdentifier: hostID,
 		SerialNumber:   serial,
-		Attributes: mustMarshal(CPUAttributes{
+		Attributes: mustMarshal(CPUInfo{
 			Architecture:     c.Architecture,
 			Flags:            c.Flags,
 			Microcode:        c.Microcode,
@@ -53,22 +54,8 @@ func CPUToRecord(c *CPUInfo, hostID string) DeviceRecord {
 	}
 }
 
-// CPUInfo holds information about the system's CPUs.
-type CPUInfo struct {
-	ModelName        string
-	Architecture     string
-	Flags            []string
-	Microcode        string
-	CoresPerCPU      string
-	ThreadsPerCore   string
-	AddressSizes     string
-	SerialNumbers    []string
-	LogicalCPUCount  int
-	PhysicalCPUCount int
-}
-
-// collectCpuInfo reads /proc/cpuinfo and returns a CPUInfo.
-func collectCpuInfo(ctx context.Context) (*CPUInfo, error) {
+// collectCpuInfo reads /proc/cpuinfo and returns CPU device records.
+func collectCpuInfo(ctx context.Context, hostID string, debug bool) ([]DeviceRecord, error) {
 	f, err := os.Open("/proc/cpuinfo")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open /proc/cpuinfo: %w", err)
@@ -158,7 +145,7 @@ func collectCpuInfo(ctx context.Context) (*CPUInfo, error) {
 	}
 
 	if len(cpus) == 0 {
-		return &CPUInfo{}, nil
+		return nil, nil
 	}
 
 	// Use the first CPU's info as representative.
@@ -173,7 +160,7 @@ func collectCpuInfo(ctx context.Context) (*CPUInfo, error) {
 	threadsPerCore := computeThreadsPerCore(first.siblings, first.cpuCores)
 	serials := collectCpuSerials(ctx)
 
-	return &CPUInfo{
+	info := &CPUInfo{
 		ModelName:        first.modelName,
 		Architecture:     arch,
 		Flags:            first.flags,
@@ -184,7 +171,13 @@ func collectCpuInfo(ctx context.Context) (*CPUInfo, error) {
 		SerialNumbers:    serials,
 		LogicalCPUCount:  len(cpus),
 		PhysicalCPUCount: physCount,
-	}, nil
+	}
+
+	if debug {
+		printCpuInfo(info)
+	}
+
+	return []DeviceRecord{cpuToRecord(info, hostID)}, nil
 }
 
 // collectCpuSerials reads CPU serial numbers from dmidecode (SMBIOS).

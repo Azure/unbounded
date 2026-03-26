@@ -10,18 +10,6 @@ import (
 	"strings"
 )
 
-// GPUAttributes contains GPU-specific fields stored in DeviceRecord.Attributes.
-type GPUAttributes struct {
-	PCIAddress    string `json:"pci_address"`
-	Vendor        string `json:"vendor,omitempty"`
-	Model         string `json:"model,omitempty"`
-	VRAM          string `json:"vram,omitempty"`
-	Firmware      string `json:"firmware,omitempty"`
-	Driver        string `json:"driver,omitempty"`
-	DriverVersion string `json:"driver_version,omitempty"`
-	NUMANode      string `json:"numa_node,omitempty"`
-}
-
 // GPUInfo holds information about a single GPU.
 type GPUInfo struct {
 	Name          string
@@ -36,8 +24,8 @@ type GPUInfo struct {
 	NUMANode      string
 }
 
-// GPUToRecord converts a GPUInfo into a DeviceRecord.
-func GPUToRecord(g *GPUInfo, hostID string) DeviceRecord {
+// gpuToRecord converts a GPUInfo into a DeviceRecord.
+func gpuToRecord(g *GPUInfo, hostID string) DeviceRecord {
 	serial := g.SerialNumber
 	if serial == "" {
 		serial = "gpu-" + g.PCIAddress
@@ -48,7 +36,7 @@ func GPUToRecord(g *GPUInfo, hostID string) DeviceRecord {
 		DeviceName:     g.Name,
 		HostIdentifier: hostID,
 		SerialNumber:   serial,
-		Attributes: mustMarshal(GPUAttributes{
+		Attributes: mustMarshal(GPUInfo{
 			PCIAddress:    g.PCIAddress,
 			Vendor:        g.Vendor,
 			Model:         g.Model,
@@ -62,8 +50,8 @@ func GPUToRecord(g *GPUInfo, hostID string) DeviceRecord {
 }
 
 // collectGPUInfo detects GPUs by scanning the PCI bus for display/3D controller
-// class devices. It enriches with lspci and vendor-specific tools when available.
-func collectGPUInfo(ctx context.Context) ([]GPUInfo, error) {
+// class devices and returns them as device records.
+func collectGPUInfo(ctx context.Context, hostID string, debug bool) ([]DeviceRecord, error) {
 	gpus, err := scanPCIForGPUs()
 	if err != nil {
 		return nil, err
@@ -85,7 +73,16 @@ func collectGPUInfo(ctx context.Context) ([]GPUInfo, error) {
 		enrichFromSysfs(ctx, &gpus[i])
 	}
 
-	return gpus, nil
+	if debug {
+		printGPUInfo(gpus)
+	}
+
+	var records []DeviceRecord
+	for i := range gpus {
+		records = append(records, gpuToRecord(&gpus[i], hostID))
+	}
+
+	return records, nil
 }
 
 // scanPCIForGPUs walks /sys/bus/pci/devices looking for VGA-compatible (0x0300)

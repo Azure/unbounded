@@ -19,43 +19,6 @@ const (
 	DiskTypeUnknown DiskType = "unknown"
 )
 
-// DiskAttributes contains disk-specific fields stored in DeviceRecord.Attributes.
-type DiskAttributes struct {
-	Type          string `json:"type"`
-	SizeBytes     uint64 `json:"size_bytes"`
-	SerialNumber  string `json:"serial_number,omitempty"`
-	Firmware      string `json:"firmware,omitempty"`
-	BlockSize     string `json:"block_size,omitempty"`
-	Speed         string `json:"speed,omitempty"`
-	Driver        string `json:"driver,omitempty"`
-	DriverVersion string `json:"driver_version,omitempty"`
-}
-
-// DiskToRecord converts a DiskInfo into a DeviceRecord.
-func DiskToRecord(d *DiskInfo, hostID string) DeviceRecord {
-	serial := d.SerialNumber
-	if serial == "" {
-		serial = "disk-" + d.Name
-	}
-
-	return DeviceRecord{
-		DeviceType:     DeviceTypeDisk,
-		DeviceName:     d.Name,
-		HostIdentifier: hostID,
-		SerialNumber:   serial,
-		Attributes: mustMarshal(DiskAttributes{
-			Type:          string(d.Type),
-			SizeBytes:     d.SizeBytes,
-			SerialNumber:  d.SerialNumber,
-			Firmware:      d.Firmware,
-			BlockSize:     d.BlockSize,
-			Speed:         d.Speed,
-			Driver:        d.Driver,
-			DriverVersion: d.DriverVersion,
-		}),
-	}
-}
-
 // DiskInfo holds information about a single storage device.
 type DiskInfo struct {
 	Name          string
@@ -69,8 +32,34 @@ type DiskInfo struct {
 	DriverVersion string
 }
 
-// collectDiskInfo discovers block devices and returns info for each disk.
-func collectDiskInfo(ctx context.Context) ([]DiskInfo, error) {
+// diskToRecord converts a DiskInfo into a DeviceRecord.
+func diskToRecord(d *DiskInfo, hostID string) DeviceRecord {
+	serial := d.SerialNumber
+	if serial == "" {
+		serial = "disk-" + d.Name
+	}
+
+	return DeviceRecord{
+		DeviceType:     DeviceTypeDisk,
+		DeviceName:     d.Name,
+		HostIdentifier: hostID,
+		SerialNumber:   serial,
+		Attributes: mustMarshal(DiskInfo{
+			Name:          d.Name,
+			Type:          d.Type,
+			SizeBytes:     d.SizeBytes,
+			SerialNumber:  d.SerialNumber,
+			Firmware:      d.Firmware,
+			BlockSize:     d.BlockSize,
+			Speed:         d.Speed,
+			Driver:        d.Driver,
+			DriverVersion: d.DriverVersion,
+		}),
+	}
+}
+
+// collectDiskInfo discovers block devices and returns them as device records.
+func collectDiskInfo(ctx context.Context, hostID string, debug bool) ([]DeviceRecord, error) {
 	entries, err := os.ReadDir("/sys/block")
 	if err != nil {
 		return nil, fmt.Errorf("failed to read /sys/block: %w", err)
@@ -103,7 +92,16 @@ func collectDiskInfo(ctx context.Context) ([]DiskInfo, error) {
 		disks = append(disks, disk)
 	}
 
-	return disks, nil
+	if debug {
+		printDiskInfo(disks)
+	}
+
+	var records []DeviceRecord
+	for i := range disks {
+		records = append(records, diskToRecord(&disks[i], hostID))
+	}
+
+	return records, nil
 }
 
 // readBlockDeviceSize reads the device size in bytes from sysfs.

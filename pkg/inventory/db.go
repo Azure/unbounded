@@ -1,6 +1,7 @@
 package inventory
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -37,6 +38,34 @@ type NeighborRecord struct {
 	HostIdentifier string          `json:"host_identifier"`
 	LocalInterface string          `json:"local_interface"`
 	Attributes     json.RawMessage `json:"attributes"`
+}
+
+type Inventory struct {
+	DeviceRecords   []DeviceRecord
+	NeighborRecords []NeighborRecord
+}
+
+func (r *Inventory) localDWriter(ctx context.Context, dbPath string) (retErr error) {
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return fmt.Errorf("failed to open database: %w", err)
+	}
+
+	defer func() {
+		if cerr := db.Close(); cerr != nil && retErr == nil {
+			retErr = fmt.Errorf("failed to close database: %w", cerr)
+		}
+	}()
+
+	if err := upsertDevices(ctx, db, r.DeviceRecords); err != nil {
+		return fmt.Errorf("failed to upsert device records: %w", err)
+	}
+
+	if err := upsertNeighbors(ctx, db, r.NeighborRecords); err != nil {
+		return fmt.Errorf("failed to upsert neighbor records: %w", err)
+	}
+
+	return nil
 }
 
 // mustMarshal serialises v to JSON. Panics on error (attribute structs are
@@ -95,26 +124,9 @@ CREATE TABLE IF NOT EXISTS neighbors (
 	return nil
 }
 
-// upsertRecords inserts new DeviceRecords or updates existing ones (matched by
+// upsertDevices inserts new DeviceRecords or updates existing ones (matched by
 // serial_number). A row is only updated when device_name or attributes differ.
-func upsertRecords(dbPath string, records []DeviceRecord) (retErr error) {
-	db, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		return fmt.Errorf("failed to open database: %w", err)
-	}
-
-	defer func() {
-		if cerr := db.Close(); cerr != nil && retErr == nil {
-			retErr = fmt.Errorf("failed to close database: %w", cerr)
-		}
-	}()
-
-	tx, err := db.Begin()
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback() //nolint:errcheck
-
+func upsertDevices(ctx context.Context, db *sql.DB, records []DeviceRecord) (retErr error) {
 	const upsertSQL = `
 INSERT INTO inventory (device_type, device_name, host_identifier, serial_number, attributes)
 VALUES (?, ?, ?, ?, ?)
@@ -127,7 +139,13 @@ WHERE device_name     != excluded.device_name
    OR host_identifier != excluded.host_identifier
    OR attributes      != excluded.attributes;`
 
-	stmt, err := tx.Prepare(upsertSQL)
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	stmt, err := tx.PrepareContext(ctx, upsertSQL)
 	if err != nil {
 		return fmt.Errorf("failed to prepare upsert: %w", err)
 	}
@@ -149,24 +167,7 @@ WHERE device_name     != excluded.device_name
 
 // upsertNeighbors inserts new NeighborRecords or updates existing ones
 // (matched by host_identifier + local_interface).
-func upsertNeighbors(dbPath string, records []NeighborRecord) (retErr error) {
-	db, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		return fmt.Errorf("failed to open database: %w", err)
-	}
-
-	defer func() {
-		if cerr := db.Close(); cerr != nil && retErr == nil {
-			retErr = fmt.Errorf("failed to close database: %w", cerr)
-		}
-	}()
-
-	tx, err := db.Begin()
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback() //nolint:errcheck
-
+func upsertNeighbors(ctx context.Context, db *sql.DB, records []NeighborRecord) (retErr error) {
 	const upsertSQL = `
 INSERT INTO neighbors (host_identifier, local_interface, attributes)
 VALUES (?, ?, ?)
@@ -174,7 +175,13 @@ ON CONFLICT(host_identifier, local_interface) DO UPDATE SET
     attributes = excluded.attributes
 WHERE attributes != excluded.attributes;`
 
-	stmt, err := tx.Prepare(upsertSQL)
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	stmt, err := tx.PrepareContext(ctx, upsertSQL)
 	if err != nil {
 		return fmt.Errorf("failed to prepare neighbor upsert: %w", err)
 	}

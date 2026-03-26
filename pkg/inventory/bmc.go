@@ -8,16 +8,6 @@ import (
 	ipmi "github.com/bougou/go-ipmi"
 )
 
-// BMCAttributes contains BMC network fields stored in DeviceRecord.Attributes.
-type BMCAttributes struct {
-	IPAddr     string `json:"ip_address,omitempty"`
-	SubnetMask string `json:"subnet_mask,omitempty"`
-	MACAddr    string `json:"mac_address,omitempty"`
-	Gateway    string `json:"gateway,omitempty"`
-	IPSource   string `json:"ip_source,omitempty"`
-	Firmware   string `json:"firmware,omitempty"`
-}
-
 // BMCInfo holds information about an out-of-band management controller.
 type BMCInfo struct {
 	MACAddr    string
@@ -28,8 +18,8 @@ type BMCInfo struct {
 	Firmware   string
 }
 
-// BMCToRecord converts a BMCInfo into a DeviceRecord.
-func BMCToRecord(b *BMCInfo, hostID string) DeviceRecord {
+// bmcToRecord converts a BMCInfo into a DeviceRecord.
+func bmcToRecord(b *BMCInfo, hostID string) DeviceRecord {
 	serial := b.MACAddr
 	if serial == "" {
 		serial = "bmc-0"
@@ -40,7 +30,7 @@ func BMCToRecord(b *BMCInfo, hostID string) DeviceRecord {
 		DeviceName:     "BMC",
 		HostIdentifier: hostID,
 		SerialNumber:   serial,
-		Attributes: mustMarshal(BMCAttributes{
+		Attributes: mustMarshal(BMCInfo{
 			IPAddr:     b.IPAddr,
 			SubnetMask: b.SubnetMask,
 			MACAddr:    b.MACAddr,
@@ -52,8 +42,8 @@ func BMCToRecord(b *BMCInfo, hostID string) DeviceRecord {
 }
 
 // collectBMCInfo attempts to discover a baseboard management controller via the
-// local /dev/ipmi0 device. Returns nil (no error) when no BMC is present.
-func collectBMCInfo(ctx context.Context) (*BMCInfo, error) {
+// local /dev/ipmi0 device. Returns an empty slice when no BMC is present.
+func collectBMCInfo(ctx context.Context, hostID string, debug bool) ([]DeviceRecord, error) {
 	client, err := ipmi.NewOpenClient()
 	if err != nil {
 		return nil, nil // no IPMI device available
@@ -89,7 +79,11 @@ func collectBMCInfo(ctx context.Context) (*BMCInfo, error) {
 		return nil, nil
 	}
 
-	return info, nil
+	if debug {
+		printBMCInfo(info)
+	}
+
+	return []DeviceRecord{bmcToRecord(info, hostID)}, nil
 }
 
 // printBMCInfo prints the collected BMC information to stdout.
