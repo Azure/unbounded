@@ -12,6 +12,9 @@ KUBECTL_UNBOUNDED_CMD=./cmd/kubectl-unbounded
 FORGE_BIN=bin/forge
 FORGE_CMD=./hack/cmd/forge
 
+INVENTORY_BIN=bin/inventory
+INVENTORY_CMD=./cmd/inventory
+
 MACHINA_BIN=bin/machina
 MACHINA_CMD=./cmd/machina
 MACHINA_TAG ?= latest
@@ -25,7 +28,7 @@ BLOB_CONTAINER ?= release
 
 KUBECTL_PLUGIN_PLATFORMS = linux-amd64 linux-arm64 darwin-amd64 darwin-arm64
 
-.PHONY: all fmt lint test kubectl-unbounded kubectl-unbounded-cross krew-manifest forge machina machina-oci machina-oci-push metalman metalman-oci metalman-oci-push gomod images/ubuntu24/image.yaml push-blobs
+.PHONY: all fmt lint test kubectl-unbounded kubectl-unbounded-cross krew-manifest forge inventory inventory-amd64 inventory-arm64 machina machina-oci machina-oci-push metalman metalman-oci metalman-oci-push gomod images/ubuntu24/image.yaml push-blobs
 
 all: kubectl-unbounded forge machina
 
@@ -68,6 +71,21 @@ krew-manifest: kubectl-unbounded-cross
 
 forge: test
 	$(GOBUILD) -o $(FORGE_BIN) $(FORGE_CMD)/main.go
+
+inventory: inventory-amd64 inventory-arm64
+	@HOST_ARCH=$$(uname -m); \
+	case "$$HOST_ARCH" in \
+		x86_64)  ARCH=amd64 ;; \
+		aarch64) ARCH=arm64 ;; \
+		*)       echo "unsupported architecture: $$HOST_ARCH" >&2; exit 1 ;; \
+	esac; \
+	ln -sf inventory-$$ARCH $(INVENTORY_BIN)
+
+inventory-amd64: test
+	GOOS=linux GOARCH=amd64 $(GOBUILD) -o $(INVENTORY_BIN)-amd64 $(INVENTORY_CMD)/main.go
+
+inventory-arm64: test
+	GOOS=linux GOARCH=arm64 $(GOBUILD) -o $(INVENTORY_BIN)-arm64 $(INVENTORY_CMD)/main.go
 
 machina: test
 	$(GOBUILD) -o $(MACHINA_BIN) $(MACHINA_CMD)/main.go

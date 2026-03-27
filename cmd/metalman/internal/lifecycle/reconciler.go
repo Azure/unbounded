@@ -58,6 +58,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	log.Info("reimage timed out, triggering retry", "elapsed", elapsed)
 	meta.RemoveStatusCondition(&node.Status.Conditions, conditionReimaged)
+
 	if node.Status.Operations.RebootCounter > 0 {
 		node.Status.Operations.RebootCounter--
 	}
