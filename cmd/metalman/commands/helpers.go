@@ -3,6 +3,7 @@ package commands
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -106,6 +107,35 @@ func OutboundIP() (net.IP, error) {
 	defer conn.Close() //nolint:errcheck // Best-effort close of UDP probe connection.
 
 	return conn.LocalAddr().(*net.UDPAddr).IP, nil //nolint:errcheck // Type is guaranteed by net.Dial("udp", ...).
+}
+
+// InterfaceForIP returns the name of the network interface that holds the given IP address.
+func InterfaceForIP(ip net.IP) (string, error) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return "", fmt.Errorf("listing network interfaces: %w", err)
+	}
+
+	for _, iface := range ifaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			slog.Warn("unablbe to read addresses from interface %q: %s", iface.Name, err)
+			continue
+		}
+
+		for _, addr := range addrs {
+			ipnet, ok := addr.(*net.IPNet)
+			if !ok {
+				continue
+			}
+
+			if ipnet.IP.Equal(ip) {
+				return iface.Name, nil
+			}
+		}
+	}
+
+	return "", fmt.Errorf("no interface found for IP %s", ip)
 }
 
 func InterfaceIPv4(name string) (net.IP, error) {

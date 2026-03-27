@@ -28,19 +28,20 @@ import (
 // ServePXECmd returns a cobra.Command that runs PXE servers and the BMC control loop.
 func ServePXECmd() *cobra.Command {
 	var (
-		pool          string
-		cacheDir      string
-		maxDownloads  int
-		bindAddress   string
-		httpPort      int
-		healthPort    int
-		dhcpInterface string
-		dhcpPort      int
-		apiserverURL  string
-		serveURL      string
-		leaseDuration time.Duration
-		renewDeadline time.Duration
-		retryPeriod   time.Duration
+		pool              string
+		cacheDir          string
+		maxDownloads      int
+		bindAddress       string
+		httpPort          int
+		healthPort        int
+		dhcpInterface     string
+		dhcpAutoInterface bool
+		dhcpPort          int
+		apiserverURL      string
+		serveURL          string
+		leaseDuration     time.Duration
+		renewDeadline     time.Duration
+		retryPeriod       time.Duration
 	)
 
 	cmd := &cobra.Command{
@@ -155,7 +156,20 @@ func ServePXECmd() *cobra.Command {
 				ServeURL:     serveURL,
 			}
 
+			if dhcpInterface != "" && dhcpAutoInterface {
+				return fmt.Errorf("--dhcp-interface and --dhcp-auto-interface are mutually exclusive")
+			}
+
 			dhcpServerIP := serverIP
+
+			if dhcpAutoInterface {
+				detected, err := InterfaceForIP(serverIP)
+				if err != nil {
+					return fmt.Errorf("detecting interface for server IP %s: %w", serverIP, err)
+				}
+
+				dhcpInterface = detected
+			}
 
 			if dhcpInterface != "" {
 				ifIP, err := InterfaceIPv4(dhcpInterface)
@@ -240,6 +254,7 @@ func ServePXECmd() *cobra.Command {
 	cmd.Flags().IntVar(&httpPort, "http-port", 8880, "Port for the HTTP artifact server")
 	cmd.Flags().IntVar(&healthPort, "health-port", 8081, "Port for the health/readiness probe server")
 	cmd.Flags().StringVar(&dhcpInterface, "dhcp-interface", "", "Network interface for broadcast DHCP (omit for relay/unicast mode)")
+	cmd.Flags().BoolVar(&dhcpAutoInterface, "dhcp-auto-interface", false, "Auto-detect the DHCP interface from the server IP")
 	cmd.Flags().IntVar(&dhcpPort, "dhcp-port", 67, "UDP port for the DHCP server")
 	cmd.Flags().StringVar(&apiserverURL, "apiserver-url", "", "External URL of the Kubernetes API server (for templates)")
 	cmd.Flags().StringVar(&serveURL, "serve-url", "", "External URL of this serve instance")

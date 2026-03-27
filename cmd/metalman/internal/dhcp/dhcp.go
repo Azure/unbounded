@@ -106,6 +106,13 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, m *dhcpv4.DHCPv4) {
 		return
 	}
 
+	// In relay-only mode (no interface configured), only respond to packets
+	// forwarded by a DHCP relay agent. Relay agents set the GatewayIPAddr
+	// (giaddr) field; direct client packets leave it zeroed.
+	if s.Interface == "" && (m.GatewayIPAddr == nil || m.GatewayIPAddr.IsUnspecified()) {
+		return
+	}
+
 	mac := strings.ToLower(m.ClientHWAddr.String())
 	log := slog.With("mac", mac, "type", m.MessageType().String())
 

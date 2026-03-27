@@ -34,8 +34,9 @@ func TestDHCPHandler(t *testing.T) {
 
 	reader := newFakeReader(t, node)
 	srv := &Server{
-		Reader:   reader,
-		ServerIP: serverIP,
+		Interface: "eth0",
+		Reader:    reader,
+		ServerIP:  serverIP,
 	}
 
 	discover, err := dhcpv4.NewDiscovery(mac)
@@ -120,8 +121,9 @@ func TestDHCPHandlerPXE(t *testing.T) {
 
 	reader := newFakeReader(t, image, node)
 	srv := &Server{
-		Reader:   reader,
-		ServerIP: serverIP,
+		Interface: "eth0",
+		Reader:    reader,
+		ServerIP:  serverIP,
 	}
 
 	discover, err := dhcpv4.NewDiscovery(mac)
@@ -172,8 +174,9 @@ func TestDHCPHandlerUnknownMAC(t *testing.T) {
 
 	reader := newFakeReader(t)
 	srv := &Server{
-		Reader:   reader,
-		ServerIP: serverIP,
+		Interface: "eth0",
+		Reader:    reader,
+		ServerIP:  serverIP,
 	}
 
 	discover, err := dhcpv4.NewDiscovery(mac)
@@ -208,8 +211,9 @@ func TestDHCPHandlerRequest(t *testing.T) {
 
 	reader := newFakeReader(t, node)
 	srv := &Server{
-		Reader:   reader,
-		ServerIP: serverIP,
+		Interface: "eth0",
+		Reader:    reader,
+		ServerIP:  serverIP,
 	}
 
 	discover, err := dhcpv4.NewDiscovery(mac)
@@ -270,8 +274,9 @@ func TestDHCPHandlerNoImageAllowsPXEDiscover(t *testing.T) {
 
 	reader := newFakeReader(t, node)
 	srv := &Server{
-		Reader:   reader,
-		ServerIP: serverIP,
+		Interface: "eth0",
+		Reader:    reader,
+		ServerIP:  serverIP,
 	}
 
 	discover, err := dhcpv4.NewDiscovery(mac)
@@ -324,8 +329,9 @@ func TestDHCPHandlerNoImageAllowsHTTPBootDiscover(t *testing.T) {
 
 	reader := newFakeReader(t, node)
 	srv := &Server{
-		Reader:   reader,
-		ServerIP: serverIP,
+		Interface: "eth0",
+		Reader:    reader,
+		ServerIP:  serverIP,
 	}
 
 	discover, err := dhcpv4.NewDiscovery(mac)
@@ -378,8 +384,9 @@ func TestDHCPHandlerPXEDisabledAllowsNonPXEDiscover(t *testing.T) {
 
 	reader := newFakeReader(t, node)
 	srv := &Server{
-		Reader:   reader,
-		ServerIP: serverIP,
+		Interface: "eth0",
+		Reader:    reader,
+		ServerIP:  serverIP,
 	}
 
 	// Normal DHCP discover without PXE vendor class (e.g. from OS DHCP client)
@@ -403,6 +410,44 @@ func TestDHCPHandlerPXEDisabledAllowsNonPXEDiscover(t *testing.T) {
 
 	if resp.MessageType() != dhcpv4.MessageTypeOffer {
 		t.Errorf("expected Offer, got %s", resp.MessageType())
+	}
+}
+
+func TestDHCPHandlerRelayOnlyRejectsDirectPacket(t *testing.T) {
+	mac, _ := net.ParseMAC("aa:bb:cc:dd:ee:f0")
+	serverIP := net.ParseIP("10.0.1.254").To4()
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-01"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{DHCPLeases: []v1alpha3.DHCPLease{{
+				MAC:        "aa:bb:cc:dd:ee:f0",
+				IPv4:       "10.0.1.10",
+				SubnetMask: "255.255.255.0",
+			}}},
+		},
+	}
+
+	reader := newFakeReader(t, node)
+	srv := &Server{
+		// Interface intentionally left empty: relay-only mode.
+		Reader:   reader,
+		ServerIP: serverIP,
+	}
+
+	discover, err := dhcpv4.NewDiscovery(mac)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// No GatewayIPAddr set — this is a direct client packet, not from a relay.
+	conn := &fakePacketConn{}
+	peer := &net.UDPAddr{IP: net.ParseIP("10.0.1.10"), Port: 68}
+
+	srv.handler(conn, peer, discover)
+
+	if conn.written != nil {
+		t.Error("expected no response for direct (non-relay) packet in relay-only mode")
 	}
 }
 
