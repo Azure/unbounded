@@ -119,6 +119,22 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	if bootOrderCond == nil || bootOrderCond.Status != metav1.ConditionFalse {
 		if err := c.BootOrderConfig(ctx, log, pendingReimage); err != nil {
 			if errors.Is(err, ErrUnsupported) {
+				// BMCs commonly reject boot order changes during POST.
+				// Only conclude the feature is permanently unsupported
+				// once the system has converged into a known power state
+				// (On or Off). Transient states like PoweringOn indicate
+				// the system is still in POST where rejections are expected.
+				state, psErr := c.PowerState(ctx)
+				if psErr != nil {
+					return ctrl.Result{}, fmt.Errorf("getting power state: %w", psErr)
+				}
+
+				if !strings.EqualFold(state, "On") && !strings.EqualFold(state, "Off") {
+					log.Info("boot order config rejected during transient power state, retrying",
+						"powerState", state, "err", err)
+					return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+				}
+
 				log.Info("boot order config not supported", "err", err)
 				meta.SetStatusCondition(&node.Status.Conditions, metav1.Condition{
 					Type:               conditionBootOrderConfigSupported,

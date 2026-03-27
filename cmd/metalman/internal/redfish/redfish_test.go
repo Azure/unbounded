@@ -1135,6 +1135,130 @@ func TestBootOrderConfigUnsupported(t *testing.T) {
 	}
 }
 
+func TestBootOrderConfigUnsupportedDuringPOST(t *testing.T) {
+	var powerState atomic.Value
+	powerState.Store("PoweringOn")
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			json.NewEncoder(w).Encode(map[string]any{
+				"PowerState": powerState.Load().(string),
+				"Boot": map[string]string{
+					"BootSourceOverrideTarget":  "None",
+					"BootSourceOverrideEnabled": "Disabled",
+				},
+				"Links": map[string]any{
+					"Chassis": []map[string]any{
+						{"@odata.id": "/redfish/v1/Chassis/1"},
+					},
+				},
+			})
+
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			http.NotFound(w, r)
+
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	fp := tlsServerFingerprint(srv)
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"},
+		Data:       map[string][]byte{"password": []byte("secret")},
+	}
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-boot-post", Namespace: "default"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				ImageRef:   v1alpha3.LocalObjectReference{Name: "test-image"},
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b8", IPv4: "10.0.0.38", SubnetMask: "255.255.255.0"}},
+				Redfish: &v1alpha3.RedfishSpec{
+					URL:         srv.URL,
+					Username:    "admin",
+					DeviceID:    "System.Embedded.1",
+					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
+				},
+			},
+			Operations: &v1alpha3.OperationsSpec{
+				ReimageCounter: 1,
+			},
+		},
+		Status: v1alpha3.MachineStatus{
+			Redfish: &v1alpha3.RedfishStatus{CertFingerprint: fp},
+		},
+	}
+
+	scheme := testScheme(t)
+	fc := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(node, secret).
+		WithStatusSubresource(node).
+		Build()
+
+	reconciler := &Reconciler{Client: fc, Pool: NewPool()}
+	ctx := t.Context()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "node-boot-post", Namespace: "default"}}
+
+	// First reconcile: system is POSTing (PoweringOn), boot order PATCH
+	// returns 404. Should NOT set the unsupported condition — just requeue.
+	result, err := reconciler.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("reconcile 1: %v", err)
+	}
+
+	if result.RequeueAfter == 0 {
+		t.Fatal("expected requeue while system is in transient power state")
+	}
+
+	var updated v1alpha3.Machine
+	if err := fc.Get(ctx, req.NamespacedName, &updated); err != nil {
+		t.Fatal(err)
+	}
+
+	bootCond := meta.FindStatusCondition(updated.Status.Conditions, conditionBootOrderConfigSupported)
+	if bootCond != nil {
+		t.Fatalf("expected BootOrderConfigSupported condition NOT to be set during POST, got %+v", bootCond)
+	}
+
+	// Simulate POST completing — system is now On.
+	powerState.Store("On")
+
+	// Second reconcile: system is On, boot order PATCH still returns 404.
+	// Should now set the unsupported condition.
+	_, err = reconciler.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("reconcile 2: %v", err)
+	}
+
+	if err := fc.Get(ctx, req.NamespacedName, &updated); err != nil {
+		t.Fatal(err)
+	}
+
+	bootCond = meta.FindStatusCondition(updated.Status.Conditions, conditionBootOrderConfigSupported)
+	if bootCond == nil {
+		t.Fatal("expected BootOrderConfigSupported condition to be set after system reached stable state")
+	}
+
+	if bootCond.Status != metav1.ConditionFalse {
+		t.Fatalf("expected BootOrderConfigSupported=False, got %s", bootCond.Status)
+	}
+
+	if bootCond.Reason != "NotSupported" {
+		t.Fatalf("expected reason NotSupported, got %s", bootCond.Reason)
+	}
+}
+
 func TestBootOrderConfigTransientError(t *testing.T) {
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !testSessionAuth(w, r) {
