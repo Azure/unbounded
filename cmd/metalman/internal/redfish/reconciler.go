@@ -21,9 +21,19 @@ import (
 )
 
 const (
-	conditionPoweredOff               = "PoweredOff"
-	conditionBootOrderConfigSupported = "BootOrderConfigSupported"
-	conditionReimaged                 = "Reimaged"
+	// Condition types set by this controller.
+	condPoweredOff    = "PoweredOff"
+	condBootSupported = "BootOrderConfigSupported"
+	condReimaged      = "Reimaged"
+
+	// Condition reasons.
+	reasonPoweringOff  = "PoweringOff"
+	reasonForceOff     = "ForceOff"
+	reasonPoweringOn   = "PoweringOn"
+	reasonNotSupported = "NotSupported"
+	reasonPending      = "Pending"
+
+	powerActionTimeout = 5 * time.Minute
 )
 
 type Reconciler struct {
@@ -36,19 +46,19 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&v1alpha3.Machine{}).
 		WithEventFilter(predicate.Funcs{
 			CreateFunc: func(e event.CreateEvent) bool {
-				node, ok := e.Object.(*v1alpha3.Machine)
-				return ok && node.Spec.PXE != nil && node.Spec.PXE.Redfish != nil
+				m, ok := e.Object.(*v1alpha3.Machine)
+				return ok && m.Spec.PXE != nil && m.Spec.PXE.Redfish != nil
 			},
 			UpdateFunc: func(e event.UpdateEvent) bool {
-				node, ok := e.ObjectNew.(*v1alpha3.Machine)
-				return ok && node.Spec.PXE != nil && node.Spec.PXE.Redfish != nil
+				m, ok := e.ObjectNew.(*v1alpha3.Machine)
+				return ok && m.Spec.PXE != nil && m.Spec.PXE.Redfish != nil
 			},
 			DeleteFunc: func(e event.DeleteEvent) bool {
 				return false
 			},
 			GenericFunc: func(e event.GenericEvent) bool {
-				node, ok := e.Object.(*v1alpha3.Machine)
-				return ok && node.Spec.PXE != nil && node.Spec.PXE.Redfish != nil
+				m, ok := e.Object.(*v1alpha3.Machine)
+				return ok && m.Spec.PXE != nil && m.Spec.PXE.Redfish != nil
 			},
 		}).
 		Complete(r)
@@ -57,46 +67,44 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := slog.With("node", req.Name, "namespace", req.Namespace)
 
-	var node v1alpha3.Machine
-	if err := r.Client.Get(ctx, req.NamespacedName, &node); err != nil {
+	var machine v1alpha3.Machine
+	if err := r.Client.Get(ctx, req.NamespacedName, &machine); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-
-	if node.Spec.PXE == nil || node.Spec.PXE.Redfish == nil {
+	if machine.Spec.PXE == nil || machine.Spec.PXE.Redfish == nil {
 		return ctrl.Result{}, nil
 	}
 
-	if node.Spec.Operations == nil {
-		node.Spec.Operations = &v1alpha3.OperationsSpec{}
+	rf := machine.Spec.PXE.Redfish
+	if machine.Spec.Operations == nil {
+		machine.Spec.Operations = &v1alpha3.OperationsSpec{}
+	}
+	if machine.Status.Operations == nil {
+		machine.Status.Operations = &v1alpha3.OperationsStatus{}
 	}
 
-	if node.Status.Operations == nil {
-		node.Status.Operations = &v1alpha3.OperationsStatus{}
+	// TOFU: capture TLS cert fingerprint on first connection.
+	fingerprint := ""
+	if machine.Status.Redfish != nil {
+		fingerprint = machine.Status.Redfish.CertFingerprint
 	}
-
-	rf := node.Spec.PXE.Redfish
-
-	existingFingerprint := ""
-	if node.Status.Redfish != nil {
-		existingFingerprint = node.Status.Redfish.CertFingerprint
-	}
-
-	if existingFingerprint == "" {
+	if fingerprint == "" {
 		fp, err := CaptureFingerprint(ctx, rf.URL)
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("capturing TLS cert fingerprint: %w", err)
 		}
 
-		if node.Status.Redfish == nil {
-			node.Status.Redfish = &v1alpha3.RedfishStatus{}
+		if machine.Status.Redfish == nil {
+			machine.Status.Redfish = &v1alpha3.RedfishStatus{}
 		}
 
-		node.Status.Redfish.CertFingerprint = fp
+		machine.Status.Redfish.CertFingerprint = fp
 		log.Info("TOFU: captured TLS cert fingerprint", "fingerprint", fp)
 
-		return ctrl.Result{}, r.Client.Status().Update(ctx, &node)
+		return ctrl.Result{}, r.Client.Status().Update(ctx, &machine)
 	}
 
+	// Retrieve Redfish password from Secret.
 	var secret corev1.Secret
 	if err := r.Client.Get(ctx, types.NamespacedName{
 		Name:      rf.PasswordRef.Name,
@@ -104,20 +112,20 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}, &secret); err != nil {
 		return ctrl.Result{}, fmt.Errorf("getting Redfish password secret: %w", err)
 	}
-
 	password := string(secret.Data[rf.PasswordRef.Key])
 
-	c, err := r.Pool.Get(ctx, rf.URL, existingFingerprint, rf.Username, password, rf.DeviceID)
+	// Acquire Redfish client.
+	c, err := r.Pool.Get(ctx, rf.URL, fingerprint, rf.Username, password, rf.DeviceID)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("getting Redfish client: %w", err)
 	}
 
-	// Boot order configuration (only attempt if not known unsupported).
-	bootOrderCond := meta.FindStatusCondition(node.Status.Conditions, conditionBootOrderConfigSupported)
+	// Boot order configuration (skip if known unsupported).
+	pendingReimage := machine.Spec.Operations.ReimageCounter > machine.Status.Operations.ReimageCounter
 
-	pendingReimage := node.Spec.Operations.ReimageCounter > node.Status.Operations.ReimageCounter
-	if bootOrderCond == nil || bootOrderCond.Status != metav1.ConditionFalse {
-		if err := c.BootOrderConfig(ctx, log, pendingReimage); err != nil {
+	bootCond := meta.FindStatusCondition(machine.Status.Conditions, condBootSupported)
+	if bootCond == nil || bootCond.Status != metav1.ConditionFalse {
+		if err := r.reconcileBootOrder(ctx, log, &machine, c, pendingReimage); err != nil {
 			if errors.Is(err, ErrUnsupported) {
 				// BMCs commonly reject boot order changes during POST.
 				// Only conclude the feature is permanently unsupported
@@ -129,119 +137,166 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 					return ctrl.Result{}, fmt.Errorf("getting power state: %w", psErr)
 				}
 
-				if !strings.EqualFold(state, "On") && !strings.EqualFold(state, "Off") {
+				if !strings.EqualFold(string(state), "On") && !strings.EqualFold(string(state), "Off") {
 					log.Info("boot order config rejected during transient power state, retrying",
 						"powerState", state, "err", err)
 					return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 				}
 
 				log.Info("boot order config not supported", "err", err)
-				meta.SetStatusCondition(&node.Status.Conditions, metav1.Condition{
-					Type:               conditionBootOrderConfigSupported,
+				meta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
+					Type:               condBootSupported,
 					Status:             metav1.ConditionFalse,
-					Reason:             "NotSupported",
-					ObservedGeneration: node.Generation,
+					Reason:             reasonNotSupported,
+					ObservedGeneration: machine.Generation,
 				})
 
-				return ctrl.Result{}, r.Client.Status().Update(ctx, &node)
+				return ctrl.Result{}, r.Client.Status().Update(ctx, &machine)
 			}
 
 			return ctrl.Result{}, fmt.Errorf("configuring boot order: %w", err)
 		}
 	}
 
-	if node.Spec.Operations.RebootCounter <= node.Status.Operations.RebootCounter {
+	// No reboot pending — done.
+	if machine.Spec.Operations.RebootCounter <= machine.Status.Operations.RebootCounter {
 		return ctrl.Result{}, nil
 	}
 
-	poweredOff := meta.IsStatusConditionTrue(node.Status.Conditions, conditionPoweredOff)
-	if !poweredOff {
-		state, err := c.PowerState(ctx)
-		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("getting power state: %w", err)
-		}
-
-		if !strings.EqualFold(state, "Off") {
-			cond := meta.FindStatusCondition(node.Status.Conditions, conditionPoweredOff)
-			if cond != nil && cond.Reason == "PoweringOff" {
-				// ForceOff was already sent — wait for it to take effect.
-				return ctrl.Result{RequeueAfter: time.Second}, nil
-			}
-
-			log.Info("sending ForceOff", "currentState", state)
-
-			if err := c.Reset(ctx, "ForceOff"); err != nil {
-				return ctrl.Result{}, fmt.Errorf("sending ForceOff: %w", err)
-			}
-
-			meta.SetStatusCondition(&node.Status.Conditions, metav1.Condition{
-				Type:               conditionPoweredOff,
-				Status:             metav1.ConditionFalse,
-				Reason:             "PoweringOff",
-				Message:            fmt.Sprintf("target reboots: %d", node.Spec.Operations.RebootCounter),
-				ObservedGeneration: node.Generation,
-			})
-
-			return ctrl.Result{}, r.Client.Status().Update(ctx, &node)
-		}
-
-		log.Info("machine confirmed powered off, setting condition")
-		meta.SetStatusCondition(&node.Status.Conditions, metav1.Condition{
-			Type:               conditionPoweredOff,
-			Status:             metav1.ConditionTrue,
-			Reason:             "ForceOff",
-			Message:            fmt.Sprintf("target reboots: %d", node.Spec.Operations.RebootCounter),
-			ObservedGeneration: node.Generation,
-		})
-
-		return ctrl.Result{}, r.Client.Status().Update(ctx, &node)
+	// Reboot cycle: ForceOff → confirm Off → On → confirm On → complete.
+	if !meta.IsStatusConditionTrue(machine.Status.Conditions, condPoweredOff) {
+		return r.reconcilePowerOff(ctx, log, &machine, c)
 	}
 
-	// PoweredOff is True: check actual power state to decide next step.
+	return r.reconcilePowerOn(ctx, log, &machine, c, pendingReimage)
+}
+
+// reconcileBootOrder ensures the boot source override matches the desired state.
+// Returns ErrUnsupported if the BMC does not support boot order configuration.
+func (r *Reconciler) reconcileBootOrder(ctx context.Context, log *slog.Logger, machine *v1alpha3.Machine, c *Client, pendingReimage bool) error {
+	config, err := c.GetBootConfig(ctx)
+	if err != nil {
+		return err
+	}
+
+	if pendingReimage {
+		if config.Target == BootTargetPxe && config.Enabled == BootContinuous {
+			return nil // Already set to PXE boot.
+		}
+		log.Info("setting boot source override to PXE", "currentTarget", config.Target, "currentEnabled", config.Enabled)
+		return c.SetBootOverride(ctx, BootTargetPxe, BootContinuous)
+	}
+
+	if config.Enabled == BootDisabled ||
+		(config.Target == BootTargetHdd && config.Enabled == BootContinuous) {
+		return nil // Already disabled or set to HDD.
+	}
+
+	log.Info("disabling boot source override", "currentTarget", config.Target, "currentEnabled", config.Enabled)
+	return c.DisableBootOverride(ctx)
+}
+
+// reconcilePowerOff drives the machine to the Off state by sending ForceOff
+// and polling until the BMC reports Off.
+func (r *Reconciler) reconcilePowerOff(ctx context.Context, log *slog.Logger, machine *v1alpha3.Machine, c *Client) (ctrl.Result, error) {
 	state, err := c.PowerState(ctx)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("getting power state: %w", err)
 	}
 
-	if strings.EqualFold(state, "Off") {
-		cond := meta.FindStatusCondition(node.Status.Conditions, conditionPoweredOff)
-		if cond != nil && cond.Reason == "PoweringOn" {
-			// On was already sent — wait for it to take effect.
-			return ctrl.Result{RequeueAfter: time.Second}, nil
-		}
-
-		log.Info("sending On")
-
-		if err := c.Reset(ctx, "On"); err != nil {
-			return ctrl.Result{}, fmt.Errorf("sending On: %w", err)
-		}
-
-		meta.SetStatusCondition(&node.Status.Conditions, metav1.Condition{
-			Type:               conditionPoweredOff,
+	if state == PowerOff {
+		log.Info("machine confirmed powered off, setting condition")
+		meta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
+			Type:               condPoweredOff,
 			Status:             metav1.ConditionTrue,
-			Reason:             "PoweringOn",
-			Message:            fmt.Sprintf("target reboots: %d", node.Spec.Operations.RebootCounter),
-			ObservedGeneration: node.Generation,
+			Reason:             reasonForceOff,
+			Message:            fmt.Sprintf("target reboots: %d", machine.Spec.Operations.RebootCounter),
+			ObservedGeneration: machine.Generation,
 		})
 
-		return ctrl.Result{}, r.Client.Status().Update(ctx, &node)
+		return ctrl.Result{}, r.Client.Status().Update(ctx, machine)
 	}
 
-	// Machine reports On — clear PoweredOff and complete the reboot cycle.
-	log.Info("machine confirmed powered on, completing reboot cycle")
-	meta.RemoveStatusCondition(&node.Status.Conditions, conditionPoweredOff)
+	// Machine is still on. Check if ForceOff was already sent.
+	cond := meta.FindStatusCondition(machine.Status.Conditions, condPoweredOff)
+	if cond != nil && cond.Reason == reasonPoweringOff {
+		if time.Since(cond.LastTransitionTime.Time) < powerActionTimeout {
+			return ctrl.Result{RequeueAfter: time.Second}, nil // Wait for ForceOff to take effect.
+		}
 
-	if pendingReimage {
-		meta.SetStatusCondition(&node.Status.Conditions, metav1.Condition{
-			Type:               conditionReimaged,
-			Status:             metav1.ConditionFalse,
-			Reason:             "Pending",
-			Message:            "image=" + node.Spec.PXE.ImageRef.Name,
-			ObservedGeneration: node.Generation,
-		})
+		log.Info("ForceOff timed out, retrying", "elapsed", time.Since(cond.LastTransitionTime.Time))
 	}
 
-	node.Status.Operations.RebootCounter = node.Spec.Operations.RebootCounter
+	log.Info("sending ForceOff", "currentState", state)
+	if err := c.Reset(ctx, ResetForceOff); err != nil {
+		return ctrl.Result{}, fmt.Errorf("sending ForceOff: %w", err)
+	}
 
-	return ctrl.Result{}, r.Client.Status().Update(ctx, &node)
+	// Remove before set so LastTransitionTime is reset on retries.
+	meta.RemoveStatusCondition(&machine.Status.Conditions, condPoweredOff)
+	meta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
+		Type:               condPoweredOff,
+		Status:             metav1.ConditionFalse,
+		Reason:             reasonPoweringOff,
+		Message:            fmt.Sprintf("target reboots: %d", machine.Spec.Operations.RebootCounter),
+		ObservedGeneration: machine.Generation,
+	})
+
+	return ctrl.Result{}, r.Client.Status().Update(ctx, machine)
+}
+
+// reconcilePowerOn drives the machine from Off to On and completes the
+// reboot cycle.
+func (r *Reconciler) reconcilePowerOn(ctx context.Context, log *slog.Logger, machine *v1alpha3.Machine, c *Client, pendingReimage bool) (ctrl.Result, error) {
+	state, err := c.PowerState(ctx)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("getting power state: %w", err)
+	}
+
+	if state != PowerOff {
+		// Machine is on — complete the reboot cycle.
+		log.Info("machine confirmed powered on, completing reboot cycle")
+		meta.RemoveStatusCondition(&machine.Status.Conditions, condPoweredOff)
+
+		if pendingReimage {
+			meta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
+				Type:               condReimaged,
+				Status:             metav1.ConditionFalse,
+				Reason:             reasonPending,
+				Message:            "image=" + machine.Spec.PXE.ImageRef.Name,
+				ObservedGeneration: machine.Generation,
+			})
+		}
+
+		machine.Status.Operations.RebootCounter = machine.Spec.Operations.RebootCounter
+
+		return ctrl.Result{}, r.Client.Status().Update(ctx, machine)
+	}
+
+	// Machine is still off. Check if On was already sent.
+	cond := meta.FindStatusCondition(machine.Status.Conditions, condPoweredOff)
+	if cond != nil && cond.Reason == reasonPoweringOn {
+		if time.Since(cond.LastTransitionTime.Time) < powerActionTimeout {
+			return ctrl.Result{RequeueAfter: time.Second}, nil // Wait for On to take effect.
+		}
+
+		log.Info("On timed out, retrying", "elapsed", time.Since(cond.LastTransitionTime.Time))
+	}
+
+	log.Info("sending On")
+	if err := c.Reset(ctx, ResetOn); err != nil {
+		return ctrl.Result{}, fmt.Errorf("sending On: %w", err)
+	}
+
+	// Remove before set so LastTransitionTime is reset on retries.
+	meta.RemoveStatusCondition(&machine.Status.Conditions, condPoweredOff)
+	meta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
+		Type:               condPoweredOff,
+		Status:             metav1.ConditionTrue,
+		Reason:             reasonPoweringOn,
+		Message:            fmt.Sprintf("target reboots: %d", machine.Spec.Operations.RebootCounter),
+		ObservedGeneration: machine.Generation,
+	})
+
+	return ctrl.Result{}, r.Client.Status().Update(ctx, machine)
 }

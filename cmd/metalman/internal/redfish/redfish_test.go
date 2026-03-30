@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -175,7 +176,7 @@ func TestRedfishRebootCycle(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	poweredOffCond := meta.FindStatusCondition(updated.Status.Conditions, conditionPoweredOff)
+	poweredOffCond := meta.FindStatusCondition(updated.Status.Conditions, condPoweredOff)
 	if poweredOffCond == nil || poweredOffCond.Status != metav1.ConditionFalse || poweredOffCond.Reason != "PoweringOff" {
 		t.Fatalf("expected PoweredOff=False/PoweringOff, got %+v", poweredOffCond)
 	}
@@ -209,7 +210,7 @@ func TestRedfishRebootCycle(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !meta.IsStatusConditionTrue(updated.Status.Conditions, conditionPoweredOff) {
+	if !meta.IsStatusConditionTrue(updated.Status.Conditions, condPoweredOff) {
 		t.Fatal("expected PoweredOff=True after ForceOff completed")
 	}
 
@@ -230,11 +231,11 @@ func TestRedfishRebootCycle(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !meta.IsStatusConditionTrue(updated.Status.Conditions, conditionPoweredOff) {
+	if !meta.IsStatusConditionTrue(updated.Status.Conditions, condPoweredOff) {
 		t.Fatal("expected PoweredOff=True to persist after sending On")
 	}
 
-	poweredOffCond = meta.FindStatusCondition(updated.Status.Conditions, conditionPoweredOff)
+	poweredOffCond = meta.FindStatusCondition(updated.Status.Conditions, condPoweredOff)
 	if poweredOffCond == nil || poweredOffCond.Reason != "PoweringOn" {
 		t.Fatalf("expected PoweredOff reason=PoweringOn, got %+v", poweredOffCond)
 	}
@@ -269,7 +270,7 @@ func TestRedfishRebootCycle(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if meta.IsStatusConditionTrue(updated.Status.Conditions, conditionPoweredOff) {
+	if meta.IsStatusConditionTrue(updated.Status.Conditions, condPoweredOff) {
 		t.Fatal("expected PoweredOff to be cleared after verifying power On")
 	}
 
@@ -282,7 +283,7 @@ func TestRedfishRebootCycle(t *testing.T) {
 		t.Fatalf("expected operations.rebootCounter=1, got %d", got)
 	}
 
-	reimagedCond := meta.FindStatusCondition(updated.Status.Conditions, conditionReimaged)
+	reimagedCond := meta.FindStatusCondition(updated.Status.Conditions, condReimaged)
 	if reimagedCond == nil || reimagedCond.Status != metav1.ConditionFalse || reimagedCond.Reason != "Pending" {
 		t.Fatalf("expected Reimaged=False/Pending, got %+v", reimagedCond)
 	}
@@ -306,6 +307,268 @@ func TestRedfishRebootCycle(t *testing.T) {
 	}
 }
 
+func TestRedfishPowerOnTimeoutRetry(t *testing.T) {
+	var powerState atomic.Value
+	powerState.Store("Off")
+
+	var onCalls atomic.Int64
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			json.NewEncoder(w).Encode(map[string]any{
+				"PowerState": powerState.Load().(string),
+				"Boot": map[string]string{
+					"BootSourceOverrideTarget":  "Pxe",
+					"BootSourceOverrideEnabled": "Continuous",
+				},
+				"Links": map[string]any{
+					"Chassis": []map[string]any{
+						{"@odata.id": "/redfish/v1/Chassis/Chassis.Embedded.1"},
+					},
+				},
+			})
+
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/Actions/ComputerSystem.Reset"):
+			var body struct {
+				ResetType string `json:"ResetType"`
+			}
+			json.NewDecoder(r.Body).Decode(&body)
+
+			if body.ResetType == "On" {
+				onCalls.Add(1)
+			}
+
+			w.WriteHeader(http.StatusOK)
+
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	fp := tlsServerFingerprint(srv)
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"},
+		Data:       map[string][]byte{"password": []byte("secret")},
+	}
+
+	// Machine is stuck in PoweringOn state with a stale LastTransitionTime
+	// that exceeds powerActionTimeout — this reproduces the deadlock from
+	// bug.yaml where the On command was lost and never retried.
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-stuck", Namespace: "default"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				ImageRef:   v1alpha3.LocalObjectReference{Name: "test-image"},
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:f5", IPv4: "10.0.0.6", SubnetMask: "255.255.255.0"}},
+				Redfish: &v1alpha3.RedfishSpec{
+					URL:         srv.URL,
+					Username:    "admin",
+					DeviceID:    "System.Embedded.1",
+					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
+				},
+			},
+			Operations: &v1alpha3.OperationsSpec{
+				RebootCounter:  22,
+				ReimageCounter: 22,
+			},
+		},
+		Status: v1alpha3.MachineStatus{
+			Redfish:    &v1alpha3.RedfishStatus{CertFingerprint: fp},
+			Operations: &v1alpha3.OperationsStatus{RebootCounter: 21, ReimageCounter: 20},
+			Conditions: []metav1.Condition{
+				{
+					Type:               condPoweredOff,
+					Status:             metav1.ConditionTrue,
+					Reason:             "PoweringOn",
+					Message:            "target reboots: 22",
+					LastTransitionTime: metav1.NewTime(time.Now().Add(-48 * time.Hour)),
+				},
+			},
+		},
+	}
+
+	scheme := testScheme(t)
+	fc := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(node, secret).
+		WithStatusSubresource(node).
+		Build()
+
+	reconciler := &Reconciler{Client: fc, Pool: NewPool()}
+	ctx := t.Context()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "node-stuck", Namespace: "default"}}
+
+	// Reconcile should detect the timeout and retry the On command instead
+	// of silently requeueing forever.
+	_, err := reconciler.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	if onCalls.Load() != 1 {
+		t.Fatalf("expected On command to be retried after timeout, got %d calls", onCalls.Load())
+	}
+
+	var updated v1alpha3.Machine
+	if err := fc.Get(ctx, req.NamespacedName, &updated); err != nil {
+		t.Fatal(err)
+	}
+
+	cond := meta.FindStatusCondition(updated.Status.Conditions, condPoweredOff)
+	if cond == nil {
+		t.Fatal("expected PoweredOff condition to exist after retry")
+	}
+
+	if cond.Reason != "PoweringOn" {
+		t.Fatalf("expected reason PoweringOn, got %s", cond.Reason)
+	}
+
+	// LastTransitionTime should have been reset (much more recent than the
+	// stale 48-hour-old timestamp).
+	if time.Since(cond.LastTransitionTime.Time) > time.Minute {
+		t.Fatalf("expected LastTransitionTime to be reset, but it is %v old", time.Since(cond.LastTransitionTime.Time))
+	}
+}
+
+func TestRedfishForceOffTimeoutRetry(t *testing.T) {
+	var powerState atomic.Value
+	powerState.Store("On")
+
+	var forceOffCalls atomic.Int64
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			json.NewEncoder(w).Encode(map[string]any{
+				"PowerState": powerState.Load().(string),
+				"Boot": map[string]string{
+					"BootSourceOverrideTarget":  "Pxe",
+					"BootSourceOverrideEnabled": "Continuous",
+				},
+				"Links": map[string]any{
+					"Chassis": []map[string]any{
+						{"@odata.id": "/redfish/v1/Chassis/Chassis.Embedded.1"},
+					},
+				},
+			})
+
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/Actions/ComputerSystem.Reset"):
+			var body struct {
+				ResetType string `json:"ResetType"`
+			}
+			json.NewDecoder(r.Body).Decode(&body)
+
+			if body.ResetType == "ForceOff" {
+				forceOffCalls.Add(1)
+			}
+
+			w.WriteHeader(http.StatusOK)
+
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	fp := tlsServerFingerprint(srv)
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"},
+		Data:       map[string][]byte{"password": []byte("secret")},
+	}
+
+	// Machine is stuck in PoweringOff state with a stale LastTransitionTime.
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-stuck-off", Namespace: "default"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				ImageRef:   v1alpha3.LocalObjectReference{Name: "test-image"},
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:f6", IPv4: "10.0.0.7", SubnetMask: "255.255.255.0"}},
+				Redfish: &v1alpha3.RedfishSpec{
+					URL:         srv.URL,
+					Username:    "admin",
+					DeviceID:    "System.Embedded.1",
+					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
+				},
+			},
+			Operations: &v1alpha3.OperationsSpec{
+				RebootCounter: 1,
+			},
+		},
+		Status: v1alpha3.MachineStatus{
+			Redfish: &v1alpha3.RedfishStatus{CertFingerprint: fp},
+			Conditions: []metav1.Condition{
+				{
+					Type:               condPoweredOff,
+					Status:             metav1.ConditionFalse,
+					Reason:             "PoweringOff",
+					Message:            "target reboots: 1",
+					LastTransitionTime: metav1.NewTime(time.Now().Add(-10 * time.Minute)),
+				},
+				{
+					Type:   condBootSupported,
+					Status: metav1.ConditionFalse,
+					Reason: "NotSupported",
+				},
+			},
+		},
+	}
+
+	scheme := testScheme(t)
+	fc := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(node, secret).
+		WithStatusSubresource(node).
+		Build()
+
+	reconciler := &Reconciler{Client: fc, Pool: NewPool()}
+	ctx := t.Context()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "node-stuck-off", Namespace: "default"}}
+
+	// Reconcile should detect the timeout and retry the ForceOff command.
+	_, err := reconciler.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	if forceOffCalls.Load() != 1 {
+		t.Fatalf("expected ForceOff to be retried after timeout, got %d calls", forceOffCalls.Load())
+	}
+
+	var updated v1alpha3.Machine
+	if err := fc.Get(ctx, req.NamespacedName, &updated); err != nil {
+		t.Fatal(err)
+	}
+
+	cond := meta.FindStatusCondition(updated.Status.Conditions, condPoweredOff)
+	if cond == nil {
+		t.Fatal("expected PoweredOff condition to exist after retry")
+	}
+
+	if cond.Reason != "PoweringOff" {
+		t.Fatalf("expected reason PoweringOff, got %s", cond.Reason)
+	}
+
+	if time.Since(cond.LastTransitionTime.Time) > time.Minute {
+		t.Fatalf("expected LastTransitionTime to be reset, but it is %v old", time.Since(cond.LastTransitionTime.Time))
+	}
+}
+
 func TestRedfishTLSCertPinning(t *testing.T) {
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"PowerState": "On"})
@@ -314,11 +577,11 @@ func TestRedfishTLSCertPinning(t *testing.T) {
 
 	wrongFP := formatFingerprint(make([]byte, 32))
 	s := &bmcSession{
-		httpClient: newHttpClient(wrongFP),
+		httpClient: newHTTPClient(wrongFP),
 		baseURL:    srv.URL,
 	}
 
-	_, _, err := s.get(t.Context(), "/redfish/v1/Systems/1")
+	_, _, err := s.do(t.Context(), http.MethodGet, "/redfish/v1/Systems/1", nil)
 	if err == nil {
 		t.Fatal("expected TLS cert pinning error, got nil")
 	}
@@ -441,7 +704,7 @@ func TestRedfishExactlyOnceSemantics(t *testing.T) {
 			Operations: &v1alpha3.OperationsStatus{RebootCounter: 3},
 			Conditions: []metav1.Condition{
 				{
-					Type:   conditionBootOrderConfigSupported,
+					Type:   condBootSupported,
 					Status: metav1.ConditionFalse,
 					Reason: "NotSupported",
 				},
@@ -1122,7 +1385,7 @@ func TestBootOrderConfigUnsupported(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	bootCond := meta.FindStatusCondition(updated.Status.Conditions, conditionBootOrderConfigSupported)
+	bootCond := meta.FindStatusCondition(updated.Status.Conditions, condBootSupported)
 	if bootCond == nil {
 		t.Fatal("expected BootOrderConfigSupported condition to be set")
 	}
@@ -1227,7 +1490,7 @@ func TestBootOrderConfigUnsupportedDuringPOST(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	bootCond := meta.FindStatusCondition(updated.Status.Conditions, conditionBootOrderConfigSupported)
+	bootCond := meta.FindStatusCondition(updated.Status.Conditions, condBootSupported)
 	if bootCond != nil {
 		t.Fatalf("expected BootOrderConfigSupported condition NOT to be set during POST, got %+v", bootCond)
 	}
@@ -1246,7 +1509,7 @@ func TestBootOrderConfigUnsupportedDuringPOST(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	bootCond = meta.FindStatusCondition(updated.Status.Conditions, conditionBootOrderConfigSupported)
+	bootCond = meta.FindStatusCondition(updated.Status.Conditions, condBootSupported)
 	if bootCond == nil {
 		t.Fatal("expected BootOrderConfigSupported condition to be set after system reached stable state")
 	}
@@ -1342,7 +1605,7 @@ func TestBootOrderConfigTransientError(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	bootCond := meta.FindStatusCondition(updated.Status.Conditions, conditionBootOrderConfigSupported)
+	bootCond := meta.FindStatusCondition(updated.Status.Conditions, condBootSupported)
 	if bootCond != nil {
 		t.Fatalf("expected BootOrderConfigSupported condition NOT to be set on transient error, got %+v", bootCond)
 	}

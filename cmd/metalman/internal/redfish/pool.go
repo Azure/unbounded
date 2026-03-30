@@ -48,6 +48,21 @@ func (p *Pool) Get(ctx context.Context, url, certSHA256, user, pass, deviceID st
 	}
 
 	p.mu.Lock()
+
+	// Another goroutine may have created an entry while we were dialing.
+	if e, ok := p.clients[url]; ok {
+		if e.user == user && e.pass == pass {
+			// Use the existing entry; close our redundant connection.
+			p.mu.Unlock()
+			c.Close()
+
+			return e.client, nil
+		}
+
+		// Credentials changed; close the stale entry.
+		e.client.Close()
+	}
+
 	p.clients[url] = &entry{client: c, user: user, pass: pass}
 	p.mu.Unlock()
 

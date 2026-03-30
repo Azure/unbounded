@@ -17,6 +17,44 @@ import (
 // ErrUnsupported indicates the BMC does not support the requested operation.
 var ErrUnsupported = errors.New("not supported by BMC")
 
+// PowerState represents the power state of a Redfish system.
+type PowerState string
+
+const (
+	PowerOn  PowerState = "On"
+	PowerOff PowerState = "Off"
+)
+
+// ResetType represents a Redfish ComputerSystem.Reset action type.
+type ResetType string
+
+const (
+	ResetForceOff ResetType = "ForceOff"
+	ResetOn       ResetType = "On"
+)
+
+// BootTarget represents a Redfish boot source override target.
+type BootTarget string
+
+const (
+	BootTargetPxe BootTarget = "Pxe"
+	BootTargetHdd BootTarget = "Hdd"
+)
+
+// BootEnabled represents a Redfish boot source override enabled mode.
+type BootEnabled string
+
+const (
+	BootContinuous BootEnabled = "Continuous"
+	BootDisabled   BootEnabled = "Disabled"
+)
+
+// BootConfig holds the current boot source override configuration.
+type BootConfig struct {
+	Target  BootTarget
+	Enabled BootEnabled
+}
+
 // Client provides Redfish operations against a single BMC.
 // Created via Pool.Get or Dial. Must be closed when no longer needed.
 type Client struct {
@@ -28,7 +66,7 @@ type Client struct {
 // It creates a Redfish session (falling back to basic auth) and
 // resolves the device ID. The caller must call Close when done.
 func Dial(ctx context.Context, url, certSHA256, user, pass, deviceID string) (*Client, error) {
-	httpClient := newHttpClient(certSHA256)
+	httpClient := newHTTPClient(certSHA256)
 	s := &bmcSession{
 		httpClient: httpClient,
 		baseURL:    url,
@@ -46,7 +84,7 @@ func Dial(ctx context.Context, url, certSHA256, user, pass, deviceID string) (*C
 
 	id, err := resolveDeviceID(ctx, s, deviceID)
 	if err != nil {
-		s.delete()
+		s.close()
 		return nil, err
 	}
 
@@ -55,24 +93,23 @@ func Dial(ctx context.Context, url, certSHA256, user, pass, deviceID string) (*C
 
 // Close releases the client's Redfish session.
 func (c *Client) Close() {
-	c.session.delete()
+	c.session.close()
 }
 
-// PowerState returns the current power state (e.g. "On", "Off").
-func (c *Client) PowerState(ctx context.Context) (string, error) {
+// PowerState returns the current power state of the system.
+func (c *Client) PowerState(ctx context.Context) (PowerState, error) {
 	path := fmt.Sprintf("/redfish/v1/Systems/%s", c.deviceID)
 
-	data, status, err := c.session.get(ctx, path)
+	data, status, err := c.session.do(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return "", err
 	}
-
 	if status != http.StatusOK {
 		return "", fmt.Errorf("unexpected status %d from %s: %s", status, path, data)
 	}
 
 	var result struct {
-		PowerState string `json:"PowerState"`
+		PowerState PowerState `json:"PowerState"`
 	}
 	if err := json.Unmarshal(data, &result); err != nil {
 		return "", fmt.Errorf("parsing power state: %w", err)
@@ -81,131 +118,109 @@ func (c *Client) PowerState(ctx context.Context) (string, error) {
 	return result.PowerState, nil
 }
 
-// Reset sends a ComputerSystem.Reset action (e.g. "ForceOff", "On").
-func (c *Client) Reset(ctx context.Context, resetType string) error {
+// Reset sends a ComputerSystem.Reset action.
+func (c *Client) Reset(ctx context.Context, resetType ResetType) error {
 	path := fmt.Sprintf("/redfish/v1/Systems/%s/Actions/ComputerSystem.Reset", c.deviceID)
-	body := map[string]string{"ResetType": resetType}
+	body := map[string]ResetType{"ResetType": resetType}
 
-	data, status, err := c.session.post(ctx, path, body)
+	data, status, err := c.session.do(ctx, http.MethodPost, path, body)
 	if err != nil {
 		return err
 	}
-
-	if status != http.StatusOK && status != http.StatusNoContent && status != http.StatusAccepted {
+	if !isSuccessStatus(status) {
 		return fmt.Errorf("unexpected status %d from reset %s: %s", status, resetType, data)
 	}
 
 	return nil
 }
 
-// BootOrderConfig sets or clears the boot source override.
-// Returns ErrUnsupported if the BMC does not support boot order PATCH.
-func (c *Client) BootOrderConfig(ctx context.Context, log *slog.Logger, pendingReimage bool) error {
+// GetBootConfig returns the current boot source override configuration.
+func (c *Client) GetBootConfig(ctx context.Context) (BootConfig, error) {
 	path := fmt.Sprintf("/redfish/v1/Systems/%s", c.deviceID)
 
-	data, status, err := c.session.get(ctx, path)
+	data, status, err := c.session.do(ctx, http.MethodGet, path, nil)
 	if err != nil {
-		return err
+		return BootConfig{}, err
 	}
-
 	if status != http.StatusOK {
-		return fmt.Errorf("unexpected status %d from %s: %s", status, path, data)
+		return BootConfig{}, fmt.Errorf("unexpected status %d from %s: %s", status, path, data)
 	}
 
 	var system struct {
 		Boot struct {
-			BootSourceOverrideTarget  string `json:"BootSourceOverrideTarget"`
-			BootSourceOverrideEnabled string `json:"BootSourceOverrideEnabled"`
+			BootSourceOverrideTarget  BootTarget  `json:"BootSourceOverrideTarget"`
+			BootSourceOverrideEnabled BootEnabled `json:"BootSourceOverrideEnabled"`
 		} `json:"Boot"`
 	}
 	if err := json.Unmarshal(data, &system); err != nil {
-		return fmt.Errorf("parsing system boot config: %w", err)
+		return BootConfig{}, fmt.Errorf("parsing system boot config: %w", err)
 	}
 
-	var body map[string]any
+	return BootConfig{
+		Target:  system.Boot.BootSourceOverrideTarget,
+		Enabled: system.Boot.BootSourceOverrideEnabled,
+	}, nil
+}
 
-	if pendingReimage {
-		if system.Boot.BootSourceOverrideTarget == "Pxe" && system.Boot.BootSourceOverrideEnabled == "Continuous" {
-			return nil
-		}
+// SetBootOverride sets the boot source override target and enabled mode.
+// Returns ErrUnsupported if the BMC does not support the PATCH.
+func (c *Client) SetBootOverride(ctx context.Context, target BootTarget, enabled BootEnabled) error {
+	path := fmt.Sprintf("/redfish/v1/Systems/%s", c.deviceID)
 
-		body = map[string]any{
-			"Boot": map[string]string{
-				"BootSourceOverrideTarget":  "Pxe",
-				"BootSourceOverrideEnabled": "Continuous",
-			},
-		}
-
-		log.Info("setting boot source override to PXE",
-			"currentTarget", system.Boot.BootSourceOverrideTarget,
-			"currentEnabled", system.Boot.BootSourceOverrideEnabled)
-	} else {
-		if system.Boot.BootSourceOverrideEnabled == "Disabled" ||
-			(system.Boot.BootSourceOverrideTarget == "Hdd" && system.Boot.BootSourceOverrideEnabled == "Continuous") {
-			return nil
-		}
-
-		body = map[string]any{
-			"Boot": map[string]string{
-				"BootSourceOverrideEnabled": "Disabled",
-			},
-		}
-
-		log.Info("disabling boot source override",
-			"currentTarget", system.Boot.BootSourceOverrideTarget,
-			"currentEnabled", system.Boot.BootSourceOverrideEnabled)
+	body := map[string]any{
+		"Boot": map[string]string{
+			"BootSourceOverrideTarget":  string(target),
+			"BootSourceOverrideEnabled": string(enabled),
+		},
 	}
 
-	_, patchStatus, err := c.session.patch(ctx, path, body)
+	_, status, err := c.session.do(ctx, http.MethodPatch, path, body)
 	if err != nil {
 		return err
 	}
-
-	if statusUnsupported(patchStatus) {
-		if !pendingReimage {
-			// Some BMCs do not support disabling the boot source override.
-			// Fall back to setting it to Hdd, which prevents PXE boot.
-			log.Info("falling back to Hdd boot source override",
-				"currentTarget", system.Boot.BootSourceOverrideTarget,
-				"currentEnabled", system.Boot.BootSourceOverrideEnabled)
-
-			body = map[string]any{
-				"Boot": map[string]string{
-					"BootSourceOverrideTarget":  "Hdd",
-					"BootSourceOverrideEnabled": "Continuous",
-				},
-			}
-
-			_, patchStatus, err = c.session.patch(ctx, path, body)
-			if err != nil {
-				return err
-			}
-
-			if statusUnsupported(patchStatus) {
-				return fmt.Errorf("boot order config PATCH returned %d: %w", patchStatus, ErrUnsupported)
-			}
-
-			if patchStatus != http.StatusOK && patchStatus != http.StatusNoContent && patchStatus != http.StatusAccepted {
-				return fmt.Errorf("unexpected status %d from boot order PATCH", patchStatus)
-			}
-
-			return nil
-		}
-
-		return fmt.Errorf("boot order config PATCH returned %d: %w", patchStatus, ErrUnsupported)
+	if isUnsupportedStatus(status) {
+		return fmt.Errorf("boot override PATCH returned %d: %w", status, ErrUnsupported)
 	}
-
-	if patchStatus != http.StatusOK && patchStatus != http.StatusNoContent && patchStatus != http.StatusAccepted {
-		return fmt.Errorf("unexpected status %d from boot order PATCH", patchStatus)
+	if !isSuccessStatus(status) {
+		return fmt.Errorf("unexpected status %d from boot override PATCH", status)
 	}
 
 	return nil
 }
 
+// DisableBootOverride disables the boot source override. If the BMC does
+// not support disabling, it falls back to setting Hdd/Continuous.
+// Returns ErrUnsupported if neither approach works.
+func (c *Client) DisableBootOverride(ctx context.Context) error {
+	path := fmt.Sprintf("/redfish/v1/Systems/%s", c.deviceID)
+
+	body := map[string]any{
+		"Boot": map[string]string{
+			"BootSourceOverrideEnabled": string(BootDisabled),
+		},
+	}
+
+	_, status, err := c.session.do(ctx, http.MethodPatch, path, body)
+	if err != nil {
+		return err
+	}
+	if isSuccessStatus(status) {
+		return nil
+	}
+	if !isUnsupportedStatus(status) {
+		return fmt.Errorf("unexpected status %d from boot override PATCH", status)
+	}
+
+	// Some BMCs do not support disabling the boot source override.
+	// Fall back to setting Hdd/Continuous, which prevents PXE boot.
+	slog.Info("BMC does not support Disabled boot override, falling back to Hdd")
+	return c.SetBootOverride(ctx, BootTargetHdd, BootContinuous)
+}
+
 // CaptureFingerprint connects to a BMC without cert pinning and returns
 // the SHA256 fingerprint of its TLS certificate (for TOFU).
 func CaptureFingerprint(ctx context.Context, url string) (string, error) {
-	httpClient := newHttpClient("")
+	httpClient := newHTTPClient("")
 	defer httpClient.CloseIdleConnections()
 
 	endpoint := strings.TrimRight(url, "/") + "/redfish/v1/"
@@ -230,9 +245,9 @@ func CaptureFingerprint(ctx context.Context, url string) (string, error) {
 	return formatFingerprint(sha256Sum(resp.TLS.PeerCertificates[0].Raw)), nil
 }
 
-// newHttpClient returns an *http.Client with TLS cert pinning.
-// If certSHA256 is empty (TOFU), any certificate is accepted.
-func newHttpClient(certSHA256 string) *http.Client {
+// newHTTPClient returns an *http.Client with TLS cert pinning.
+// If certSHA256 is empty (TOFU mode), any certificate is accepted.
+func newHTTPClient(certSHA256 string) *http.Client {
 	return &http.Client{
 		Timeout: 30 * time.Second,
 		Transport: &http.Transport{
@@ -242,7 +257,6 @@ func newHttpClient(certSHA256 string) *http.Client {
 					if certSHA256 == "" {
 						return nil
 					}
-
 					if len(cs.PeerCertificates) == 0 {
 						return fmt.Errorf("no TLS peer certificates")
 					}
@@ -259,18 +273,17 @@ func newHttpClient(certSHA256 string) *http.Client {
 	}
 }
 
-// resolveDeviceID returns the given deviceID if non-empty, or discovers it by
-// querying /redfish/v1/Systems and returning the first (typically only) member.
+// resolveDeviceID returns the given deviceID if non-empty, or discovers it
+// by querying /redfish/v1/Systems and returning the first member.
 func resolveDeviceID(ctx context.Context, s *bmcSession, deviceID string) (string, error) {
 	if deviceID != "" {
 		return deviceID, nil
 	}
 
-	data, status, err := s.get(ctx, "/redfish/v1/Systems")
+	data, status, err := s.do(ctx, http.MethodGet, "/redfish/v1/Systems", nil)
 	if err != nil {
 		return "", err
 	}
-
 	if status != http.StatusOK {
 		return "", fmt.Errorf("unexpected status %d from /redfish/v1/Systems: %s", status, data)
 	}
@@ -283,10 +296,10 @@ func resolveDeviceID(ctx context.Context, s *bmcSession, deviceID string) (strin
 	if err := json.Unmarshal(data, &collection); err != nil {
 		return "", fmt.Errorf("parsing Systems collection: %w", err)
 	}
-
 	if len(collection.Members) == 0 {
 		return "", fmt.Errorf("no members in /redfish/v1/Systems")
 	}
+
 	// Extract the system ID from the last path segment.
 	id := collection.Members[0].ODataID
 	if i := strings.LastIndex(id, "/"); i >= 0 {
@@ -296,7 +309,12 @@ func resolveDeviceID(ctx context.Context, s *bmcSession, deviceID string) (strin
 	return id, nil
 }
 
-// statusUnsupported returns true for HTTP status codes that indicate the BMC
+// isSuccessStatus returns true for HTTP status codes indicating success.
+func isSuccessStatus(code int) bool {
+	return code == http.StatusOK || code == http.StatusNoContent || code == http.StatusAccepted
+}
+
+// isUnsupportedStatus returns true for HTTP status codes that indicate the BMC
 // permanently does not support the requested resource or operation. Per the
 // Redfish specification (DSP0266 §8.3):
 //   - 400: request body contains unsupported property values
@@ -304,7 +322,7 @@ func resolveDeviceID(ctx context.Context, s *bmcSession, deviceID string) (strin
 //   - 405: resource exists but does not support the HTTP method
 //   - 410: resource has been permanently removed
 //   - 501: service does not implement the HTTP method at all
-func statusUnsupported(code int) bool {
+func isUnsupportedStatus(code int) bool {
 	return code == http.StatusBadRequest ||
 		code == http.StatusNotFound ||
 		code == http.StatusMethodNotAllowed ||
