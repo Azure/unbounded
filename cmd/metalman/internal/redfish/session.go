@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -16,10 +17,12 @@ import (
 type bmcSession struct {
 	httpClient *http.Client
 	baseURL    string
-	token      string // X-Auth-Token; empty means basic-auth fallback
 	user       string
 	pass       string
-	location   string // session URI for DELETE
+
+	mu       sync.Mutex
+	token    string // X-Auth-Token; empty means basic-auth fallback
+	location string // session URI for DELETE
 }
 
 func createSession(ctx context.Context, httpClient *http.Client, baseURL, user, pass string) (token, location string, err error) {
@@ -67,16 +70,46 @@ func createSession(ctx context.Context, httpClient *http.Client, baseURL, user, 
 	return token, location, nil
 }
 
-func (s *bmcSession) get(ctx context.Context, path string) ([]byte, int, error) {
+// reauth creates a new Redfish session, replacing an expired token.
+func (s *bmcSession) reauth(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	token, location, err := createSession(ctx, s.httpClient, s.baseURL, s.user, s.pass)
+	if err != nil {
+		return err
+	}
+
+	s.token = token
+	s.location = location
+	return nil
+}
+
+// doRequest sends an HTTP request with session or basic-auth credentials
+// and returns the raw response body, status code, and any transport error.
+func (s *bmcSession) doRequest(ctx context.Context, method, path string, body []byte) ([]byte, int, error) {
 	url := strings.TrimRight(s.baseURL, "/") + path
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	var bodyReader io.Reader
+	if body != nil {
+		bodyReader = bytes.NewReader(body)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
 	if err != nil {
 		return nil, 0, err
 	}
 
-	if s.token != "" {
-		req.Header.Set("X-Auth-Token", s.token)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	s.mu.Lock()
+	token := s.token
+	s.mu.Unlock()
+
+	if token != "" {
+		req.Header.Set("X-Auth-Token", token)
 	} else if s.user != "" {
 		req.SetBasicAuth(s.user, s.pass)
 	}
@@ -93,93 +126,75 @@ func (s *bmcSession) get(ctx context.Context, path string) ([]byte, int, error) 
 	}
 
 	return data, resp.StatusCode, nil
+}
+
+// tokenSet reports whether the session has an auth token (vs basic-auth fallback).
+func (s *bmcSession) tokenSet() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.token != ""
+}
+
+func (s *bmcSession) get(ctx context.Context, path string) ([]byte, int, error) {
+	data, status, err := s.doRequest(ctx, http.MethodGet, path, nil)
+	if err == nil && status == http.StatusUnauthorized && s.tokenSet() {
+		if s.reauth(ctx) == nil {
+			return s.doRequest(ctx, http.MethodGet, path, nil)
+		}
+	}
+	return data, status, err
 }
 
 func (s *bmcSession) post(ctx context.Context, path string, body any) ([]byte, int, error) {
-	url := strings.TrimRight(s.baseURL, "/") + path
-
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return nil, 0, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
-	if err != nil {
-		return nil, 0, err
+	data, status, err := s.doRequest(ctx, http.MethodPost, path, payload)
+	if err == nil && status == http.StatusUnauthorized && s.tokenSet() {
+		if s.reauth(ctx) == nil {
+			return s.doRequest(ctx, http.MethodPost, path, payload)
+		}
 	}
-
-	req.Header.Set("Content-Type", "application/json")
-
-	if s.token != "" {
-		req.Header.Set("X-Auth-Token", s.token)
-	} else if s.user != "" {
-		req.SetBasicAuth(s.user, s.pass)
-	}
-
-	resp, err := s.httpClient.Do(req)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer resp.Body.Close() //nolint:errcheck // Best-effort close of HTTP response body.
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, resp.StatusCode, err
-	}
-
-	return data, resp.StatusCode, nil
+	return data, status, err
 }
 
 func (s *bmcSession) patch(ctx context.Context, path string, body any) ([]byte, int, error) {
-	url := strings.TrimRight(s.baseURL, "/") + path
-
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return nil, 0, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, url, bytes.NewReader(payload))
-	if err != nil {
-		return nil, 0, err
+	data, status, err := s.doRequest(ctx, http.MethodPatch, path, payload)
+	if err == nil && status == http.StatusUnauthorized && s.tokenSet() {
+		if s.reauth(ctx) == nil {
+			return s.doRequest(ctx, http.MethodPatch, path, payload)
+		}
 	}
-
-	req.Header.Set("Content-Type", "application/json")
-
-	if s.token != "" {
-		req.Header.Set("X-Auth-Token", s.token)
-	} else if s.user != "" {
-		req.SetBasicAuth(s.user, s.pass)
-	}
-
-	resp, err := s.httpClient.Do(req)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer resp.Body.Close() //nolint:errcheck // Best-effort close of HTTP response body.
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, resp.StatusCode, err
-	}
-
-	return data, resp.StatusCode, nil
+	return data, status, err
 }
 
 // delete removes the session from the BMC (best-effort).
 func (s *bmcSession) delete() {
-	if s.location == "" || s.token == "" {
+	s.mu.Lock()
+	location := s.location
+	token := s.token
+	s.mu.Unlock()
+
+	if location == "" || token == "" {
 		return
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, s.location, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, location, nil)
 	if err != nil {
 		return
 	}
 
-	req.Header.Set("X-Auth-Token", s.token)
+	req.Header.Set("X-Auth-Token", token)
 
 	resp, err := s.httpClient.Do(req)
 	if err != nil {

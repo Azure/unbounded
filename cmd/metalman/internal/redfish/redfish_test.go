@@ -3,6 +3,7 @@ package redfish
 import (
 	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1344,6 +1345,101 @@ func TestBootOrderConfigTransientError(t *testing.T) {
 	bootCond := meta.FindStatusCondition(updated.Status.Conditions, conditionBootOrderConfigSupported)
 	if bootCond != nil {
 		t.Fatalf("expected BootOrderConfigSupported condition NOT to be set on transient error, got %+v", bootCond)
+	}
+}
+
+func TestSessionExpiryRetry(t *testing.T) {
+	var (
+		sessionCount atomic.Int64
+		currentToken atomic.Value
+	)
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Session creation — assigns a unique token per session.
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/SessionService/Sessions") {
+			var body struct {
+				UserName string `json:"UserName"`
+				Password string `json:"Password"`
+			}
+			json.NewDecoder(r.Body).Decode(&body)
+
+			if body.UserName != "admin" || body.Password != "secret" {
+				http.Error(w, "bad credentials", http.StatusUnauthorized)
+				return
+			}
+
+			n := sessionCount.Add(1)
+			token := fmt.Sprintf("token-%d", n)
+			currentToken.Store(token)
+
+			w.Header().Set("X-Auth-Token", token)
+			w.Header().Set("Location", "/redfish/v1/SessionService/Sessions/1")
+			w.WriteHeader(http.StatusCreated)
+
+			return
+		}
+
+		if r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/SessionService/Sessions/") {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		// Authenticate: token must match the current valid token.
+		tok := r.Header.Get("X-Auth-Token")
+		valid, _ := currentToken.Load().(string)
+		if tok != valid {
+			user, pass, ok := r.BasicAuth()
+			if !ok || user != "admin" || pass != "secret" {
+				http.Error(w, "session expired", http.StatusUnauthorized)
+				return
+			}
+		}
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/1"):
+			json.NewEncoder(w).Encode(map[string]string{"PowerState": "On"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	fp := tlsServerFingerprint(srv)
+	pool := NewPool()
+	defer pool.Close()
+
+	ctx := t.Context()
+	c, err := pool.Get(ctx, srv.URL, fp, "admin", "secret", "1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Request succeeds with the initial session token.
+	state, err := c.PowerState(ctx)
+	if err != nil {
+		t.Fatalf("initial request failed: %v", err)
+	}
+	if state != "On" {
+		t.Fatalf("expected power state On, got %s", state)
+	}
+
+	// Simulate BMC session timeout by invalidating the current token.
+	currentToken.Store("expired-by-bmc")
+
+	// The client's cached token is now stale. The next request should
+	// get a 401, transparently re-authenticate, and retry successfully.
+	state, err = c.PowerState(ctx)
+	if err != nil {
+		t.Fatalf("request after session expiry failed (expected transparent retry): %v", err)
+	}
+	if state != "On" {
+		t.Fatalf("expected power state On after re-auth, got %s", state)
+	}
+
+	// Exactly two sessions should have been created: the initial Dial
+	// and the automatic re-authentication after expiry.
+	if got := sessionCount.Load(); got != 2 {
+		t.Fatalf("expected 2 sessions (initial + reauth), got %d", got)
 	}
 }
 
