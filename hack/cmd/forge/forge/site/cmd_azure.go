@@ -1,12 +1,14 @@
 package site
 
 import (
+	"bytes"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/project-unbounded/unbounded-kube/hack/cmd/forge/forge/cluster"
 	"github.com/project-unbounded/unbounded-kube/hack/cmd/forge/forge/infra"
-	"github.com/project-unbounded/unbounded-kube/hack/cmd/forge/forge/kube"
 	"github.com/project-unbounded/unbounded-kube/hack/cmd/forge/forge/site/azuredev"
 	"github.com/spf13/cobra"
 )
@@ -20,7 +22,6 @@ const (
 func azureSiteCommandGroup(parent *cobra.Command, siteCmdContext *siteCommandContext) {
 	site := &azuredev.Datacenter{
 		WorkerNodeCIDR: "10.1.0.0/16",
-		WorkerPodCIDR:  "100.125.0.0/16",
 	}
 
 	g := &cobra.Command{
@@ -36,15 +37,7 @@ func azureSiteCommandGroup(parent *cobra.Command, siteCmdContext *siteCommandCon
 }
 
 func addSiteCmd(siteCmdContext *siteCommandContext, site *azuredev.Datacenter) *cobra.Command {
-	mp := azuredev.MachinePool{
-		Name:              "worker",
-		Count:             0,
-		Size:              "standard_d2ads_v6",
-		SSHKeyPair:        &infra.SSHKeyPair{},
-		BackendPort:       22,
-		FrontendPortStart: 22001,
-		FrontendPortEnd:   22999,
-	}
+	kp := &infra.SSHKeyPair{}
 
 	c := &cobra.Command{
 		Use:   "add",
@@ -77,33 +70,27 @@ func addSiteCmd(siteCmdContext *siteCommandContext, site *azuredev.Datacenter) *
 			site.KubeCli = clusterDetails.KubeCli
 			site.Kubectl = clusterDetails.Kubectl
 
-			bootstrapTok, err := kube.GetBootstrapToken(cmd.Context(), site.KubeCli)
-			if err != nil {
-				return fmt.Errorf("get forge node bootstrap token: %w", err)
-			}
-
-			site.BootstrapToken = bootstrapTok
-
-			mp.SSHKeyPair.Logger = site.Logger
-
-			// no need to make this complicated and create per-Site SSH keys for development.
-			if mp.SSHKeyPair.PublicKeyPath == "" {
-				mp.SSHKeyPair.PublicKeyPath = dataDir.UnboundedForgePath("ssh", fmt.Sprintf("%s.pub", siteCmdContext.clusterName))
-			}
-
 			if err := site.ApplyDatacenterSite(cmd.Context()); err != nil {
 				return fmt.Errorf("apply datacenter site: %w", err)
 			}
 
-			userData, err := site.GetWorkerUserData()
-			if err != nil {
-				return fmt.Errorf("get worker user data: %w", err)
-			}
+			if site.SSHBastion {
+				kp.Logger = site.Logger
 
-			mp.UserData = userData
+				// no need to make this complicated and create per-Site SSH keys for development.
+				if kp.PublicKeyPath == "" {
+					kp.PublicKeyPath = dataDir.UnboundedForgePath("ssh", fmt.Sprintf("%s.pub", siteCmdContext.clusterName))
+				}
 
-			if err := site.ApplyDatacenterSitePool(cmd.Context(), mp); err != nil {
-				return fmt.Errorf("apply datacenter site machine pool: %w", err)
+				// The bastion pool needs its SSH key pair resolved before provisioning so that
+				// GetOrGenerate is called with the correct path.
+				if err := kp.GetOrGenerate(); err != nil {
+					return fmt.Errorf("get or generate SSH key pair for bastion: %w", err)
+				}
+
+				if err := site.ApplySSHBastion(ctx, kp); err != nil {
+					return fmt.Errorf("apply ssh bastion: %w", err)
+				}
 			}
 
 			return nil
@@ -113,12 +100,13 @@ func addSiteCmd(siteCmdContext *siteCommandContext, site *azuredev.Datacenter) *
 	c.Flags().StringVar(&siteCmdContext.CloudName, "azure", azureDefaultCloud, "Azure cloud name")
 	c.Flags().StringVar(&siteCmdContext.SubscriptionID, "subscription", azureDefaultSubscription, "Azure subscription ID")
 	c.Flags().StringVar(&siteCmdContext.Location, "location", azureDefaultLocation, "Azure location")
-	c.Flags().IntVar(&mp.Count, "worker-vm-count", mp.Count, "Number of worker nodes to create")
-	c.Flags().StringVar(&mp.Size, "worker-vm-size", mp.Size, "VM size to use for worker nodes")
 	c.Flags().StringVar(&site.WorkerNodeCIDR, "worker-node-cidr", site.WorkerNodeCIDR, "CIDR range to use for work nodes")
-	c.Flags().StringVar(&site.WorkerPodCIDR, "worker-pod-cidr", site.WorkerPodCIDR, "CIDR range to use for pods on worker nodes")
-	c.Flags().StringVar(&mp.SSHKeyPair.PublicKeyPath, "worker-ssh-public-key", "", "SSH public key (set empty or 'auto' to generate a new key pair)")
 	c.Flags().BoolVar(&site.AddUnboundedCNISiteConfig, "add-unbounded-cni-site", site.AddUnboundedCNISiteConfig, "Add an unbounded-cni site configuration automatically")
+	c.Flags().BoolVar(&site.SSHBastion, "ssh-bastion", site.SSHBastion, "Provision an SSH bastion (jump host) for the site")
+	c.Flags().StringVar(&site.SSHBastionVMSize, "ssh-bastion-vm-size", "Standard_D2ads_v6", "VM size to use for the SSH bastion")
+	c.Flags().BoolVar(&site.SSHBastionDisableDirectAccess, "ssh-bastion-disable-direct-access", site.SSHBastionDisableDirectAccess, "Disable direct SSH access to worker pools, forcing access through the bastion")
+	c.Flags().StringVar(&kp.PublicKeyPath, "ssh-public-key", "", "SSH public key (leave empty to generate a new key pair)")
+	c.Flags().StringVar(&kp.PrivateKeyPath, "ssh-private-key", "", "SSH private key (leave empty to generate a new key pair)")
 
 	return c
 }
@@ -162,13 +150,6 @@ func addPoolCmd(siteCmdContext *siteCommandContext, site *azuredev.Datacenter) *
 			site.KubeCli = clusterDetails.KubeCli
 			site.Kubectl = clusterDetails.Kubectl
 
-			bootstrapTok, err := kube.GetBootstrapToken(cmd.Context(), site.KubeCli)
-			if err != nil {
-				return fmt.Errorf("get forge node bootstrap token: %w", err)
-			}
-
-			site.BootstrapToken = bootstrapTok
-
 			mp.SSHKeyPair.Logger = site.Logger
 
 			// no need to make this complicated and create per-Site SSH keys for development.
@@ -183,8 +164,8 @@ func addPoolCmd(siteCmdContext *siteCommandContext, site *azuredev.Datacenter) *
 	c.Flags().StringVar(&siteCmdContext.CloudName, "azure", azureDefaultCloud, "Azure cloud name")
 	c.Flags().StringVar(&siteCmdContext.SubscriptionID, "subscription", azureDefaultSubscription, "Azure subscription ID")
 	c.Flags().StringVar(&siteCmdContext.Location, "location", azureDefaultLocation, "Azure location")
-	c.Flags().StringVar(&mp.SSHKeyPair.PublicKeyPath, "ssh-public-key", "", "SSH public key (set empty or 'auto' to generate a new key pair)")
-	c.Flags().StringVar(&mp.SSHKeyPair.PrivateKeyPath, "ssh-private-key", "", "SSH private key (set empty or 'auto' to generate a new key pair)")
+	c.Flags().StringVar(&mp.SSHKeyPair.PublicKeyPath, "ssh-public-key", "", "SSH public key (leave empty to generate a new key pair)")
+	c.Flags().StringVar(&mp.SSHKeyPair.PrivateKeyPath, "ssh-private-key", "", "SSH private key (leave empty to generate a new key pair)")
 	c.Flags().StringVar(&mp.Name, "name", mp.Name, "Name of the machine pool to add")
 	c.Flags().IntVar(&mp.Count, "count", mp.Count, "Number of worker nodes to create in the pool")
 	c.Flags().StringVar(&mp.Size, "size", mp.Size, "VM size to use for worker nodes in the pool")
@@ -198,9 +179,14 @@ func addPoolCmd(siteCmdContext *siteCommandContext, site *azuredev.Datacenter) *
 
 func addInventoryCmd(siteCmdContext *siteCommandContext, site *azuredev.Datacenter) *cobra.Command {
 	var (
-		outputFormat string
-		namespace    string
-		matchPrefix  string
+		outputFormat              string
+		namespace                 string
+		matchPrefix               string
+		machinaBastion            bool
+		machinaSSHSecretRef       string
+		machBastionSSHSecret      string
+		machinaSSHUsername        string
+		machinaBastionSSHUsername string
 	)
 
 	c := &cobra.Command{
@@ -222,6 +208,24 @@ func addInventoryCmd(siteCmdContext *siteCommandContext, site *azuredev.Datacent
 			site.DataDir = dataDir
 			site.Name = siteCmdContext.siteName
 
+			ctx := cmd.Context()
+
+			// Check whether the bastion disable-direct-access tag is set on the RG.
+			rgMan := infra.ResourceGroupManager{
+				Client: site.AzureCli.ResourceGroupsClientV2,
+				Logger: siteCmdContext.Logger,
+			}
+
+			rg, err := rgMan.Get(ctx, site.Name)
+			if err != nil {
+				return fmt.Errorf("get resource group: %w", err)
+			}
+
+			directAccessDisabled := rgTagEquals(rg.Tags, "forge.bastion.disable-direct-access", "1")
+
+			// Determine whether we need bastion-aware inventory (private IPs via VMSS query).
+			useDirectQuery := directAccessDisabled || machinaBastion
+
 			inventoryGetter := azuredev.InventoryGetter{
 				AzureCli:          site.AzureCli,
 				ResourceGroupName: site.Name,
@@ -229,9 +233,21 @@ func addInventoryCmd(siteCmdContext *siteCommandContext, site *azuredev.Datacent
 				SSHBackendPort:    22,
 			}
 
-			inventory, err := inventoryGetter.Get(cmd.Context())
-			if err != nil {
-				return fmt.Errorf("get inventory: %w", err)
+			var inventory *azuredev.Inventory
+
+			if useDirectQuery {
+				// Workers may have no NAT rules, or caller wants private IPs with bastion.
+				// Query VMSS instances directly for private IPs.
+				inventory, err = inventoryGetter.GetDirect(ctx)
+				if err != nil {
+					return fmt.Errorf("get direct inventory: %w", err)
+				}
+			} else {
+				// Standard NAT-based inventory with public IPs.
+				inventory, err = inventoryGetter.Get(ctx)
+				if err != nil {
+					return fmt.Errorf("get inventory: %w", err)
+				}
 			}
 
 			// Filter machines by VM name prefix if requested.
@@ -246,21 +262,113 @@ func addInventoryCmd(siteCmdContext *siteCommandContext, site *azuredev.Datacent
 				inventory.Machines = filtered
 			}
 
-			if outputFormat == "machina" {
-				return WriteInventoryAsMachina(cmd.OutOrStdout(), inventory)
-			}
+			switch outputFormat {
+			case "machina":
+				var bastionHost string
+				if machinaBastion && inventory.Bastion != nil {
+					bastionHost = machineHost(inventory.Bastion.IPAddress, inventory.Bastion.Port)
+				}
 
-			for _, vm := range inventory.Machines {
-				fmt.Printf("%s => %s:%d\n", vm.Name, vm.IPAddress, vm.Port)
-			}
+				opts := MachinaInventoryOptions{
+					Site:               siteCmdContext.siteName,
+					BastionHost:        bastionHost,
+					SSHUsername:        machinaSSHUsername,
+					BastionSSHUsername: machinaBastionSSHUsername,
+				}
 
-			return nil
+				if machinaSSHSecretRef != "" {
+					ref, err := parseSecretKeyRef(machinaSSHSecretRef)
+					if err != nil {
+						return fmt.Errorf("parse --machina-ssh-secret-ref: %w", err)
+					}
+
+					opts.SSHSecretRef = &ref
+				}
+
+				if machBastionSSHSecret != "" {
+					ref, err := parseSecretKeyRef(machBastionSSHSecret)
+					if err != nil {
+						return fmt.Errorf("parse --machina-bastion-ssh-secret-ref: %w", err)
+					}
+
+					opts.BastionSSHSecretRef = &ref
+				}
+
+				return WriteInventoryAsMachina(cmd.OutOrStdout(), inventory, opts)
+			case "ssh":
+				sshUser := "kubedev"
+				privateKeyPath := dataDir.UnboundedForgePath("ssh", siteCmdContext.clusterName)
+				sshConfigPath := dataDir.UnboundedForgePath("ssh", siteCmdContext.siteName)
+
+				// Render the SSH config into a buffer so we can write it to both file and stdout.
+				var buf bytes.Buffer
+				if err := WriteInventoryAsSSH(&buf, inventory, siteCmdContext.siteName, sshUser, privateKeyPath); err != nil {
+					return fmt.Errorf("render ssh config: %w", err)
+				}
+
+				// Write the config to the data directory.
+				if err := os.MkdirAll(filepath.Dir(sshConfigPath), 0o700); err != nil {
+					return fmt.Errorf("create ssh config directory: %w", err)
+				}
+
+				if err := os.WriteFile(sshConfigPath, buf.Bytes(), 0o600); err != nil {
+					return fmt.Errorf("write ssh config: %w", err)
+				}
+
+				// Write to stdout with a comment header indicating the file path.
+				w := cmd.OutOrStdout()
+
+				if _, err := fmt.Fprintf(w, "# SSH config for site %q (written to %s)\n", siteCmdContext.siteName, sshConfigPath); err != nil {
+					return err
+				}
+
+				if _, err := fmt.Fprintf(w, "# Usage: ssh -F %s <host>\n", sshConfigPath); err != nil {
+					return err
+				}
+
+				if _, err := w.Write(buf.Bytes()); err != nil {
+					return err
+				}
+
+				return nil
+			default:
+				if inventory.Bastion != nil {
+					if _, err := fmt.Fprintf(cmd.OutOrStdout(), "bastion => %s:%d\n", inventory.Bastion.IPAddress, inventory.Bastion.Port); err != nil {
+						return err
+					}
+				}
+
+				for _, vm := range inventory.Machines {
+					if _, err := fmt.Fprintf(cmd.OutOrStdout(), "%s => %s:%d\n", vm.Name, vm.IPAddress, vm.Port); err != nil {
+						return err
+					}
+				}
+
+				return nil
+			}
 		},
 	}
 
-	c.Flags().StringVarP(&outputFormat, "output", "o", "", "Output format (machina)")
+	c.Flags().StringVarP(&outputFormat, "output", "o", "", "Output format (machina, ssh)")
 	c.Flags().StringVar(&namespace, "namespace", "default", "Kubernetes namespace for machina output")
 	c.Flags().StringVar(&matchPrefix, "match-prefix", "", "Only include machines whose VM name starts with this prefix")
+	c.Flags().BoolVar(&machinaBastion, "machina-bastion", false, "When used with --output=machina, configure each Machine CR with spec.ssh.bastion using the bastion's public IP")
+	c.Flags().StringVar(&machinaSSHSecretRef, "machina-ssh-secret-ref", "", "Secret reference for spec.ssh.privateKeyRef in format [$namespace/]$name[:$key] (default namespace: machina-system)")
+	c.Flags().StringVar(&machBastionSSHSecret, "machina-bastion-ssh-secret-ref", "", "Secret reference for spec.ssh.bastion.privateKeyRef in format [$namespace/]$name[:$key] (default namespace: machina-system)")
+	c.Flags().StringVar(&machinaSSHUsername, "machina-ssh-username", "kubedev", "SSH username for spec.ssh.username on each Machine CR")
+	c.Flags().StringVar(&machinaBastionSSHUsername, "machina-bastion-ssh-username", "kubedev", "SSH username for spec.ssh.bastion.username on each Machine CR")
 
 	return c
+}
+
+// rgTagEquals returns true if the resource group tags contain the given key with
+// the given value.
+func rgTagEquals(tags map[string]*string, key, value string) bool {
+	if tags == nil {
+		return false
+	}
+
+	v, ok := tags[key]
+
+	return ok && v != nil && *v == value
 }

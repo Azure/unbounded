@@ -1295,7 +1295,7 @@ func TestHTTPServer_DisablePXE(t *testing.T) {
 			statusReimage, specReimage)
 	}
 
-	reimagedCond := findCondition(updated.Status.Conditions, conditionReimaged)
+	reimagedCond := findCondition(updated.Status.Conditions, v1alpha3.MachineConditionReimaged)
 	if reimagedCond == nil || reimagedCond.Status != metav1.ConditionTrue || reimagedCond.Reason != "Succeeded" {
 		t.Fatalf("expected Reimaged=True/Succeeded, got %+v", reimagedCond)
 	}

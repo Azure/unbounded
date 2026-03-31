@@ -50,17 +50,18 @@ func RunManager(ctx context.Context, cfg Config) error {
 
 	// Resolve cluster-level values once at startup. These rarely change and
 	// are threaded into every bootstrap script invocation.
-	clusterInfo, err := ResolveClusterInfo(ctx, kubeClient)
+	clusterInfo, err := ResolveClusterInfo(ctx, cfg, kubeClient)
 	if err != nil {
 		return fmt.Errorf("resolve cluster info: %w", err)
 	}
 
 	// Setup Machine controller — handles both reachability and provisioning.
 	if err := (&MachineReconciler{
-		Client:                  mgr.GetClient(),
-		Scheme:                  mgr.GetScheme(),
-		ClusterInfo:             clusterInfo,
-		MaxConcurrentReconciles: cfg.MaxConcurrentReconciles,
+		Client:                      mgr.GetClient(),
+		Scheme:                      mgr.GetScheme(),
+		ClusterInfo:                 clusterInfo,
+		MaxConcurrentReconciles:     cfg.MaxConcurrentReconciles,
+		ProvisioningTimeoutDuration: cfg.ProvisioningTimeout,
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup Machine controller: %w", err)
 	}

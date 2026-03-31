@@ -2,12 +2,11 @@ package azuredev
 
 import (
 	"context"
-	"embed"
-	"encoding/base64"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
-	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
@@ -17,14 +16,14 @@ import (
 	"github.com/project-unbounded/unbounded-kube/hack/cmd/forge/forge/azsdk"
 	"github.com/project-unbounded/unbounded-kube/hack/cmd/forge/forge/cluster"
 	"github.com/project-unbounded/unbounded-kube/hack/cmd/forge/forge/infra"
-	"github.com/project-unbounded/unbounded-kube/hack/cmd/forge/forge/kube"
-	"github.com/project-unbounded/unbounded-kube/hack/cmd/forge/forge/unboundedcni"
-	"gopkg.in/yaml.v3"
+	"github.com/project-unbounded/unbounded-kube/internal/kube"
 	"k8s.io/client-go/kubernetes"
 )
 
-//go:embed assets
-var assets embed.FS
+const (
+	tagBastionDisableDirectAccess = "forge.bastion.disable-direct-access"
+	bastionPoolName               = "bastion"
+)
 
 type MachinePool struct {
 	Name              string
@@ -41,18 +40,20 @@ type MachinePool struct {
 type Datacenter struct {
 	AzureCli                  *azsdk.ClientSet
 	KubeCli                   kubernetes.Interface
-	Kubectl                   func(context.Context) *exec.Cmd
+	Kubectl                   kube.KubectlFunc
 	Logger                    *slog.Logger
 	Name                      string
 	Location                  string
 	WorkerNodeCIDR            string
-	WorkerPodCIDR             string
 	PeerWithCluster           bool
-	BootstrapToken            *kube.BootstrapToken
 	ClusterDetails            *cluster.ClusterDetails
 	DataDir                   cluster.DataDir
 	ExtraMachinePools         []MachinePool
 	AddUnboundedCNISiteConfig bool
+
+	SSHBastion                    bool
+	SSHBastionVMSize              string
+	SSHBastionDisableDirectAccess bool
 }
 
 func (d *Datacenter) ApplyDatacenterSite(ctx context.Context) error {
@@ -66,25 +67,20 @@ func (d *Datacenter) ApplyDatacenterSite(ctx context.Context) error {
 		Logger: l,
 	}
 
-	// Sometimes it's preferable to not provision the Site as part of setting up the DC. For example, because you
-	// are developing a tool that wants to manage the site.
-	if d.AddUnboundedCNISiteConfig {
-		// Perform the CNI site configuration early as it will validate whether the CIDRs are
-		// in use already and prevent creating a whole DC site with overlapping CIDRs which is
-		// then annoying to clean up.
-		l.Info("Applying datacenter site configuration")
+	l.Info("Applying datacenter resource group")
 
-		if err := d.installAndConfigureSiteCNI(ctx); err != nil {
-			return fmt.Errorf("error installing unbounded-cni site cloudConfig: %w", err)
+	rgDesired := armresources.ResourceGroup{
+		Name:     to.Ptr(d.Name),
+		Location: to.Ptr(d.Location),
+	}
+
+	if d.SSHBastionDisableDirectAccess {
+		rgDesired.Tags = map[string]*string{
+			tagBastionDisableDirectAccess: to.Ptr("1"),
 		}
 	}
 
-	l.Info("Applying datacenter resource group")
-
-	rg, err := rgMan.CreateOrUpdate(ctx, armresources.ResourceGroup{
-		Name:     to.Ptr(d.Name),
-		Location: to.Ptr(d.Location),
-	})
+	rg, err := rgMan.CreateOrUpdate(ctx, rgDesired)
 	if err != nil {
 		return fmt.Errorf("error creating datacenter resource group: %v", err)
 	}
@@ -238,28 +234,37 @@ func (d *Datacenter) ApplyDatacenterSitePool(ctx context.Context, mp MachinePool
 		putLoadBalancerBackendPool(frontendLoadBalancer.loadBalancer, backend)
 	}
 
-	inboundRule := getLoadBalancerInboundNatRuleByName(inboundRuleName, frontendLoadBalancer.loadBalancer.Properties.InboundNatRules)
-	if inboundRule == nil {
-		inboundRule = &armnetwork.InboundNatRule{
-			Name: to.Ptr(inboundRuleName),
-			Properties: &armnetwork.InboundNatRulePropertiesFormat{
-				Protocol:               to.Ptr(armnetwork.TransportProtocolTCP),
-				FrontendPortRangeStart: to.Ptr(mp.FrontendPortStart),
-				FrontendPortRangeEnd:   to.Ptr(mp.FrontendPortEnd),
-				BackendPort:            to.Ptr(mp.BackendPort),
-				FrontendIPConfiguration: &armnetwork.SubResource{
-					ID: to.Ptr(fmt.Sprintf("%s/frontendIPConfigurations/%s", *frontendLoadBalancer.loadBalancer.ID, *frontend.Name)),
-				},
-				BackendAddressPool: &armnetwork.SubResource{
-					ID: to.Ptr(fmt.Sprintf("%s/backendAddressPools/%s", *frontendLoadBalancer.loadBalancer.ID, *backend.Name)),
-				},
-				EnableFloatingIP:     to.Ptr(false),
-				EnableTCPReset:       to.Ptr(true),
-				IdleTimeoutInMinutes: to.Ptr[int32](4),
-			},
-		}
+	// When the bastion disable-direct-access tag is set on the resource group, skip creating inbound NAT
+	// rules for non-bastion pools. This forces SSH access to go through the bastion host.
+	isBastionPool := strings.Contains(mp.Name, bastionPoolName)
+	directAccessDisabled := hasResourceGroupTag(rg, tagBastionDisableDirectAccess, "1")
 
-		putLoadBalancerInboundNatRule(frontendLoadBalancer.loadBalancer, inboundRule)
+	if !directAccessDisabled || isBastionPool {
+		inboundRule := getLoadBalancerInboundNatRuleByName(inboundRuleName, frontendLoadBalancer.loadBalancer.Properties.InboundNatRules)
+		if inboundRule == nil {
+			inboundRule = &armnetwork.InboundNatRule{
+				Name: to.Ptr(inboundRuleName),
+				Properties: &armnetwork.InboundNatRulePropertiesFormat{
+					Protocol:               to.Ptr(armnetwork.TransportProtocolTCP),
+					FrontendPortRangeStart: to.Ptr(mp.FrontendPortStart),
+					FrontendPortRangeEnd:   to.Ptr(mp.FrontendPortEnd),
+					BackendPort:            to.Ptr(mp.BackendPort),
+					FrontendIPConfiguration: &armnetwork.SubResource{
+						ID: to.Ptr(fmt.Sprintf("%s/frontendIPConfigurations/%s", *frontendLoadBalancer.loadBalancer.ID, *frontend.Name)),
+					},
+					BackendAddressPool: &armnetwork.SubResource{
+						ID: to.Ptr(fmt.Sprintf("%s/backendAddressPools/%s", *frontendLoadBalancer.loadBalancer.ID, *backend.Name)),
+					},
+					EnableFloatingIP:     to.Ptr(false),
+					EnableTCPReset:       to.Ptr(true),
+					IdleTimeoutInMinutes: to.Ptr[int32](4),
+				},
+			}
+
+			putLoadBalancerInboundNatRule(frontendLoadBalancer.loadBalancer, inboundRule)
+		}
+	} else {
+		l.Info("Skipping inbound NAT rule for pool (direct SSH access disabled via bastion tag)", "pool", mp.Name)
 	}
 
 	outboundRule := getLoadBalancerOutboundRuleByName(outboundRuleName, frontendLoadBalancer.loadBalancer.Properties.OutboundRules)
@@ -351,88 +356,155 @@ func (d *Datacenter) ApplyDatacenterSitePool(ctx context.Context, mp MachinePool
 	return nil
 }
 
-func (d *Datacenter) installAndConfigureSiteCNI(ctx context.Context) error {
-	d.Logger.Info("Applying site configuration")
+// ApplySSHBastion provisions a single-instance VMSS bastion pool that serves as an SSH jump host for
+// the datacenter site. The bastion reuses the same SSH key pair as the worker pools and is placed in
+// the same subnet. After provisioning, an SSH config file is written to the forge data directory.
+func (d *Datacenter) ApplySSHBastion(ctx context.Context, workerSSHKeyPair *infra.SSHKeyPair) error {
+	l := d.Logger.With("dc", "azuredev", "name", d.Name)
 
-	cniPath := d.DataDir.SitePath("cni")
-	if err := os.MkdirAll(cniPath, 0o700); err != nil {
-		return fmt.Errorf("error creating site cni directory: %w", err)
+	vmSize := d.SSHBastionVMSize
+	if vmSize == "" {
+		vmSize = "Standard_D2ads_v6"
 	}
 
-	if err := unboundedcni.ApplySiteManifest(ctx, d.Logger, d.Kubectl, cniPath, unboundedcni.SiteConfig{
-		SiteName:  d.Name,
-		NodeCIDRs: []string{d.WorkerNodeCIDR},
-		PodCIDRs:  []string{d.WorkerPodCIDR},
-	}); err != nil {
-		return fmt.Errorf("error applying site %q manifest: %w", d.Name, err)
+	bastionPool := MachinePool{
+		Name:              bastionPoolName,
+		Count:             1,
+		Size:              vmSize,
+		SSHKeyPair:        workerSSHKeyPair,
+		BackendPort:       22,
+		FrontendPortStart: 22,
+		FrontendPortEnd:   22,
+		// No UserData -- the bastion does not join Kubernetes.
 	}
 
-	d.Logger.Info("Applying site gateway assignment", "site", d.Name, "gateway", d.ClusterDetails.GatewayPoolName)
+	l.Info("Applying SSH bastion pool")
 
-	if err := unboundedcni.ApplySiteGatewayPoolAssignmentManifest(ctx, d.Logger, d.Kubectl, cniPath, unboundedcni.SiteGatewayPoolAssignment{
-		SiteName:        d.Name,
-		SiteNames:       []string{d.Name},
-		GatewayPoolName: d.ClusterDetails.GatewayPoolName,
-	}); err != nil {
-		return fmt.Errorf("error applying site gateway assignment manifest: %w", err)
+	if err := d.ApplyDatacenterSitePool(ctx, bastionPool); err != nil {
+		return fmt.Errorf("apply bastion pool: %w", err)
 	}
+
+	// Resolve the bastion's public IP address from the frontend IP created for its pool.
+	bastionPublicIPName := fmt.Sprintf("%s-%s", d.Name, bastionPoolName)
+
+	ipMan := infra.PublicIPAddressManager{
+		Client: d.AzureCli.NetworkPublicIPAddressesClientV2,
+		Logger: l,
+	}
+
+	bastionIP, err := ipMan.Get(ctx, d.Name, bastionPublicIPName)
+	if err != nil {
+		return fmt.Errorf("get bastion public IP: %w", err)
+	}
+
+	if bastionIP.Properties == nil || bastionIP.Properties.IPAddress == nil {
+		return fmt.Errorf("bastion public IP address not yet allocated")
+	}
+
+	publicIPAddress := *bastionIP.Properties.IPAddress
+
+	sshUser := "kubedev"
+
+	privateKeyPath := workerSSHKeyPair.PrivateKeyPath
+	if privateKeyPath == "" {
+		privateKeyPath = strings.TrimSuffix(workerSSHKeyPair.PublicKeyPath, ".pub")
+	}
+
+	sshConfigPath := d.DataDir.UnboundedForgePath("ssh", d.Name)
+	if err := writeSSHConfig(sshConfigPath, d.Name, publicIPAddress, d.WorkerNodeCIDR, sshUser, privateKeyPath); err != nil {
+		return fmt.Errorf("write ssh config: %w", err)
+	}
+
+	l.Info("SSH bastion provisioned",
+		"publicIP", publicIPAddress,
+		"sshConfig", sshConfigPath,
+		"usage", fmt.Sprintf("ssh -F %s <worker-private-ip>", sshConfigPath),
+	)
 
 	return nil
 }
 
-func (d *Datacenter) GetWorkerUserData() (string, error) {
-	if d.BootstrapToken == nil {
-		return "", fmt.Errorf("node bootstrap token is not set, cannot render worker user data")
-	}
-
-	bootstrapScript, err := assets.ReadFile("assets/worker.sh")
+// writeSSHConfig writes an SSH configuration file that sets up ProxyJump through the bastion host
+// for accessing worker nodes by their private IP addresses.
+func writeSSHConfig(path, siteName, bastionIP, workerNodeCIDR, sshUser, privateKeyPath string) error {
+	hostPattern, err := cidrToSSHPattern(workerNodeCIDR)
 	if err != nil {
-		return "", fmt.Errorf("read custom data file: %w", err)
+		return fmt.Errorf("convert CIDR to SSH host pattern: %w", err)
 	}
 
-	runCmd := fmt.Sprintf("env API_SERVER=%q BOOTSTRAP_TOKEN=%q KUBE_VERSION=%q CLUSTER_RG=%q CA_CERT_BASE64=%q /tmp/bootstrap.sh",
-		fmt.Sprintf("%s:443", *d.ClusterDetails.KubernetesCluster.Properties.Fqdn),
-		d.BootstrapToken.String(),
-		*d.ClusterDetails.KubernetesCluster.Properties.KubernetesVersion,
-		*d.ClusterDetails.NodesResourceGroup.Name,
-		base64.StdEncoding.EncodeToString(d.ClusterDetails.KubeCACertificateData))
+	bastionHost := fmt.Sprintf("bastion-%s", siteName)
 
-	cc := cloudConfig{
-		RunCmd: []string{runCmd},
-		WriteFiles: []writeFile{
-			{
-				Path:        "/tmp/bootstrap.sh",
-				Permissions: "0755",
-				Content:     string(bootstrapScript),
-			},
-		},
+	config := fmt.Sprintf(`# SSH bastion config for site %s
+# Usage: ssh -F %s <worker-private-ip>
+Host %s
+    HostName %s
+    User %s
+    IdentityFile %s
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+
+Host %s
+    User %s
+    IdentityFile %s
+    ProxyJump %s
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+`,
+		siteName, path,
+		bastionHost, bastionIP, sshUser, privateKeyPath,
+		hostPattern, sshUser, privateKeyPath, bastionHost,
+	)
+
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("create ssh config directory: %w", err)
 	}
 
-	ccRendered, err := renderCloudConfig(cc)
-	if err != nil {
-		return "", fmt.Errorf("render cloud config: %w", err)
-	}
-
-	return base64.StdEncoding.EncodeToString(ccRendered), nil
+	return os.WriteFile(path, []byte(config), 0o600)
 }
 
-type writeFile struct {
-	Content     string `yaml:"content"`
-	Owner       string `yaml:"owner,omitempty"`
-	Path        string `yaml:"path"`
-	Permissions string `yaml:"permissions"`
-}
-
-type cloudConfig struct {
-	RunCmd     []string    `yaml:"runcmd"`
-	WriteFiles []writeFile `yaml:"write_files"`
-}
-
-func renderCloudConfig(cc cloudConfig) ([]byte, error) {
-	b, err := yaml.Marshal(cc)
+// cidrToSSHPattern converts a CIDR like "10.1.0.0/16" to an SSH Host pattern like "10.1.*".
+// It replaces trailing zero octets (based on the mask) with wildcards.
+func cidrToSSHPattern(cidr string) (string, error) {
+	_, ipNet, err := net.ParseCIDR(cidr)
 	if err != nil {
-		return b, fmt.Errorf("marshal cloud config: %w", err)
+		return "", fmt.Errorf("parse CIDR %q: %w", cidr, err)
 	}
 
-	return append([]byte("#cloud-config\n"), b...), nil
+	ip := ipNet.IP.To4()
+	if ip == nil {
+		return "", fmt.Errorf("only IPv4 CIDRs are supported, got %q", cidr)
+	}
+
+	mask := ipNet.Mask
+
+	var parts []string
+
+	for i := 0; i < 4; i++ {
+		switch mask[i] {
+		case 0xff:
+			parts = append(parts, fmt.Sprintf("%d", ip[i]))
+		case 0:
+			parts = append(parts, "*")
+		default:
+			// Partial mask octet (e.g. /12 or /20) -- use wildcard from here on.
+			for j := i; j < 4; j++ {
+				parts = append(parts, "*")
+			}
+
+			return strings.Join(parts, "."), nil
+		}
+	}
+
+	return strings.Join(parts, "."), nil
+}
+
+func hasResourceGroupTag(rg *armresources.ResourceGroup, key, value string) bool {
+	if rg.Tags == nil {
+		return false
+	}
+
+	v, ok := rg.Tags[key]
+
+	return ok && v != nil && *v == value
 }

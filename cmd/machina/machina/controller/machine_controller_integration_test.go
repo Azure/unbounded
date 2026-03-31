@@ -686,10 +686,18 @@ func TestIntegration_ProvisioningPhaseBlocksReProvision(t *testing.T) {
 		ClusterInfo:         &ClusterInfo{},
 	}
 
-	// Reconcile: Machine is already Provisioning -> should not call provisioner.
+	// Reconcile: Machine is already Provisioning with no Provisioning
+	// condition -> treated as stale, transitions to Failed.
 	result, _ := reconcileHelper(t, reconciler, "m1")
 	require.False(t, provisioner.called, "should not re-provision while Provisioning")
-	require.Equal(t, RequeueAfterPending, result.RequeueAfter)
+	require.Equal(t, RequeueAfterFailed, result.RequeueAfter)
+
+	var updated unboundedv1alpha3.Machine
+
+	err := fakeClient.Get(context.Background(), types.NamespacedName{Name: "m1"}, &updated)
+	require.NoError(t, err)
+	require.Equal(t, unboundedv1alpha3.MachinePhaseFailed, updated.Status.Phase)
+	require.Contains(t, updated.Status.Message, "timed out")
 }
 
 // ---------------------------------------------------------------------------

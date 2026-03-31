@@ -4,8 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"net"
-	"os"
+	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -40,28 +39,17 @@ type ClusterInfo struct {
 // ResolveClusterInfo queries the Kubernetes API to populate all four dynamic
 // values needed by the bootstrap script. It is intended to be called once at
 // controller startup so the results can be reused across reconcile loops.
-func ResolveClusterInfo(ctx context.Context, k kubernetes.Interface) (*ClusterInfo, error) {
+func ResolveClusterInfo(ctx context.Context, cfg Config, k kubernetes.Interface) (*ClusterInfo, error) {
 	logger := ctrl.Log.WithName("cluster-info")
 	info := &ClusterInfo{}
 
-	// ---------------------------------------------------------------
-	// API_SERVER – derived from KUBERNETES_SERVICE_HOST env var.
-	// The machina pod must carry the annotation
-	//   kubernetes.azure.com/set-kube-service-host-fqdn: "true"
-	// so the AKS mutating webhook replaces the in-cluster VIP with the
-	// public FQDN.
-	// ---------------------------------------------------------------
-	host := os.Getenv("KUBERNETES_SERVICE_HOST")
-	if host == "" {
-		return nil, fmt.Errorf("KUBERNETES_SERVICE_HOST env var is not set")
+	if cfg.APIServerEndpoint == "" {
+		return nil, fmt.Errorf("API server endpoint not set in config")
 	}
 
-	port := os.Getenv("KUBERNETES_SERVICE_PORT")
-	if port == "" {
-		port = "443"
-	}
+	cfg.APIServerEndpoint = strings.TrimPrefix(cfg.APIServerEndpoint, "https://")
+	info.APIServer = cfg.APIServerEndpoint
 
-	info.APIServer = net.JoinHostPort(host, port)
 	logger.Info("Resolved API server", "apiServer", info.APIServer)
 
 	// ---------------------------------------------------------------

@@ -22,6 +22,7 @@ func hostKernel() (string, error) {
 		if b == 0 {
 			break
 		}
+
 		buf = append(buf, byte(b))
 	}
 

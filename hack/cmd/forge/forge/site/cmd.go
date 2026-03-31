@@ -6,14 +6,14 @@ import (
 )
 
 type siteCommandContext struct {
-	cmd.CommandContext
+	*cmd.CommandContext
 	clusterName string
 	siteName    string
 }
 
 func CommandGroup(parent *cobra.Command, parentCmdCtx *cmd.CommandContext) {
 	cmdCtx := &siteCommandContext{
-		CommandContext: *parentCmdCtx,
+		CommandContext: parentCmdCtx,
 	}
 
 	siteGroup := &cobra.Command{

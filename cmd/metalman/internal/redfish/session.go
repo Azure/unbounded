@@ -93,6 +93,7 @@ func (s *bmcSession) doOnce(ctx context.Context, method, path string, body any) 
 	url := strings.TrimRight(s.baseURL, "/") + path
 
 	var bodyReader io.Reader
+
 	if body != nil {
 		payload, err := json.Marshal(body)
 		if err != nil {

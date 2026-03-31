@@ -99,8 +99,8 @@ func (m *datacenterComputeManager) createOrUpdate(ctx context.Context, cfg machi
 				StorageProfile: &armcompute.VirtualMachineScaleSetStorageProfile{
 					ImageReference: &armcompute.ImageReference{
 						Publisher: to.Ptr("Canonical"),
-						Offer:     to.Ptr("0001-com-ubuntu-server-jammy"),
-						SKU:       to.Ptr("22_04-lts-gen2"),
+						Offer:     to.Ptr("ubuntu-24_04-lts"),
+						SKU:       to.Ptr("server"),
 						Version:   to.Ptr("latest"),
 					},
 					OSDisk: &armcompute.VirtualMachineScaleSetOSDisk{

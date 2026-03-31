@@ -71,6 +71,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	if err := r.Client.Get(ctx, req.NamespacedName, &machine); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+
 	if machine.Spec.PXE == nil || machine.Spec.PXE.Redfish == nil {
 		return ctrl.Result{}, nil
 	}
@@ -79,6 +80,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	if machine.Spec.Operations == nil {
 		machine.Spec.Operations = &v1alpha3.OperationsSpec{}
 	}
+
 	if machine.Status.Operations == nil {
 		machine.Status.Operations = &v1alpha3.OperationsStatus{}
 	}
@@ -88,6 +90,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	if machine.Status.Redfish != nil {
 		fingerprint = machine.Status.Redfish.CertFingerprint
 	}
+
 	if fingerprint == "" {
 		fp, err := CaptureFingerprint(ctx, rf.URL)
 		if err != nil {
@@ -112,6 +115,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}, &secret); err != nil {
 		return ctrl.Result{}, fmt.Errorf("getting Redfish password secret: %w", err)
 	}
+
 	password := string(secret.Data[rf.PasswordRef.Key])
 
 	// Acquire Redfish client.
@@ -140,6 +144,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 				if !strings.EqualFold(string(state), "On") && !strings.EqualFold(string(state), "Off") {
 					log.Info("boot order config rejected during transient power state, retrying",
 						"powerState", state, "err", err)
+
 					return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 				}
 
@@ -183,7 +188,9 @@ func (r *Reconciler) reconcileBootOrder(ctx context.Context, log *slog.Logger, m
 		if config.Target == BootTargetPxe && config.Enabled == BootContinuous {
 			return nil // Already set to PXE boot.
 		}
+
 		log.Info("setting boot source override to PXE", "currentTarget", config.Target, "currentEnabled", config.Enabled)
+
 		return c.SetBootOverride(ctx, BootTargetPxe, BootContinuous)
 	}
 
@@ -193,6 +200,7 @@ func (r *Reconciler) reconcileBootOrder(ctx context.Context, log *slog.Logger, m
 	}
 
 	log.Info("disabling boot source override", "currentTarget", config.Target, "currentEnabled", config.Enabled)
+
 	return c.DisableBootOverride(ctx)
 }
 
@@ -228,6 +236,7 @@ func (r *Reconciler) reconcilePowerOff(ctx context.Context, log *slog.Logger, ma
 	}
 
 	log.Info("sending ForceOff", "currentState", state)
+
 	if err := c.Reset(ctx, ResetForceOff); err != nil {
 		return ctrl.Result{}, fmt.Errorf("sending ForceOff: %w", err)
 	}
@@ -284,6 +293,7 @@ func (r *Reconciler) reconcilePowerOn(ctx context.Context, log *slog.Logger, mac
 	}
 
 	log.Info("sending On")
+
 	if err := c.Reset(ctx, ResetOn); err != nil {
 		return ctrl.Result{}, fmt.Errorf("sending On: %w", err)
 	}

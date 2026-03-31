@@ -3,16 +3,19 @@ package controller
 import (
 	"fmt"
 	"os"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
 // Config holds the controller configuration.
 type Config struct {
-	MetricsAddr             string `yaml:"metricsAddr"`
-	ProbeAddr               string `yaml:"probeAddr"`
-	EnableLeaderElection    bool   `yaml:"enableLeaderElection"`
-	MaxConcurrentReconciles int    `yaml:"maxConcurrentReconciles"`
+	APIServerEndpoint       string        `yaml:"apiServerEndpoint"`
+	MetricsAddr             string        `yaml:"metricsAddr"`
+	ProbeAddr               string        `yaml:"probeAddr"`
+	EnableLeaderElection    bool          `yaml:"enableLeaderElection"`
+	MaxConcurrentReconciles int           `yaml:"maxConcurrentReconciles"`
+	ProvisioningTimeout     time.Duration `yaml:"provisioningTimeout"`
 }
 
 // DefaultConfig returns a config with default values.
@@ -22,6 +25,7 @@ func DefaultConfig() Config {
 		ProbeAddr:               ":8081",
 		EnableLeaderElection:    false,
 		MaxConcurrentReconciles: 10,
+		ProvisioningTimeout:     ProvisioningTimeout,
 	}
 }
 

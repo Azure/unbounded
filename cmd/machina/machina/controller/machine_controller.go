@@ -41,6 +41,9 @@ const (
 	// Node to appear with the matching label.
 	RequeueAfterJoining = 30 * time.Second
 
+	// TODO: Make this configurable
+	ProvisioningTimeout = 5 * time.Minute
+
 	// TCPProbeTimeout is the timeout for TCP connection probes.
 	TCPProbeTimeout = 10 * time.Second
 
@@ -62,20 +65,33 @@ const (
 )
 
 // ReachabilityChecker checks if a machine is reachable via TCP.
-// The host string may include a port (e.g. "1.2.3.4:2222"); when no port
-// is present, the default SSH port 22 is assumed.
+// When a bastion is configured, the check dials through the bastion's
+// SSH tunnel to probe the target; otherwise a direct TCP dial is used.
 type ReachabilityChecker interface {
-	CheckReachable(ctx context.Context, host string) error
+	CheckReachable(ctx context.Context, machine *unboundedv1alpha3.Machine) error
 }
 
 // DefaultReachabilityChecker implements ReachabilityChecker using TCP dial.
+// When the Machine has a bastion configured, it first establishes an SSH
+// connection to the bastion and then TCP-dials the target through the tunnel.
 type DefaultReachabilityChecker struct {
+	Client  client.Reader
 	Timeout time.Duration
 }
 
 // CheckReachable checks if the machine is reachable via TCP.
-// The host string may contain a port; if not, port 22 is used.
-func (c *DefaultReachabilityChecker) CheckReachable(ctx context.Context, host string) error {
+// For machines behind a bastion, the probe is routed through the bastion's
+// SSH tunnel. For direct machines, a plain TCP dial is performed.
+func (c *DefaultReachabilityChecker) CheckReachable(ctx context.Context, machine *unboundedv1alpha3.Machine) error {
+	if machine.Spec.SSH.Bastion != nil {
+		return c.checkReachableViaBastion(ctx, machine)
+	}
+
+	return c.checkReachableDirect(ctx, machine.Spec.SSH.Host)
+}
+
+// checkReachableDirect performs a direct TCP dial to the host.
+func (c *DefaultReachabilityChecker) checkReachableDirect(ctx context.Context, host string) error {
 	address := hostPort(host)
 
 	timeout := c.Timeout
@@ -91,6 +107,67 @@ func (c *DefaultReachabilityChecker) CheckReachable(ctx context.Context, host st
 	}
 
 	defer conn.Close() //nolint:errcheck // Best-effort close of probe connection.
+
+	return nil
+}
+
+// checkReachableViaBastion establishes an SSH connection to the bastion and
+// then TCP-dials the target through the bastion tunnel.
+func (c *DefaultReachabilityChecker) checkReachableViaBastion(ctx context.Context, machine *unboundedv1alpha3.Machine) error {
+	bastion := machine.Spec.SSH.Bastion
+	bastionAddress := hostPort(bastion.Host)
+	targetAddress := hostPort(machine.Spec.SSH.Host)
+
+	bastionUsername := bastion.Username
+	if bastionUsername == "" {
+		bastionUsername = "azureuser"
+	}
+
+	// Resolve bastion key — fall back to machine's key if not specified.
+	var bastionKeyRef *unboundedv1alpha3.SecretKeySelector
+	if bastion.PrivateKeyRef != nil {
+		bastionKeyRef = bastion.PrivateKeyRef
+	} else {
+		bastionKeyRef = &machine.Spec.SSH.PrivateKeyRef
+	}
+
+	bastionPrivateKey, err := getSecretValue(ctx, c.Client, bastionKeyRef)
+	if err != nil {
+		return fmt.Errorf("get bastion SSH private key: %w", err)
+	}
+
+	bastionSigner, err := ssh.ParsePrivateKey([]byte(bastionPrivateKey))
+	if err != nil {
+		return fmt.Errorf("parse bastion SSH private key: %w", err)
+	}
+
+	timeout := c.Timeout
+	if timeout == 0 {
+		timeout = TCPProbeTimeout
+	}
+
+	bastionConfig := &ssh.ClientConfig{
+		User: bastionUsername,
+		Auth: []ssh.AuthMethod{
+			ssh.PublicKeys(bastionSigner),
+		},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec
+		Timeout:         timeout,
+	}
+
+	bastionClient, err := ssh.Dial("tcp", bastionAddress, bastionConfig)
+	if err != nil {
+		return fmt.Errorf("SSH dial bastion %s: %w", bastionAddress, err)
+	}
+
+	defer bastionClient.Close() //nolint:errcheck // Best-effort close of bastion probe connection.
+
+	conn, err := bastionClient.Dial("tcp", targetAddress)
+	if err != nil {
+		return fmt.Errorf("TCP dial %s through bastion %s: %w", targetAddress, bastionAddress, err)
+	}
+
+	defer conn.Close() //nolint:errcheck // Best-effort close of tunnel probe connection.
 
 	return nil
 }
@@ -127,11 +204,12 @@ type MachineProvisioner interface {
 // MachineReconciler reconciles a Machine object.
 type MachineReconciler struct {
 	client.Client
-	Scheme                  *runtime.Scheme
-	ReachabilityChecker     ReachabilityChecker
-	Provisioner             MachineProvisioner
-	ClusterInfo             *ClusterInfo
-	MaxConcurrentReconciles int
+	Scheme                      *runtime.Scheme
+	ReachabilityChecker         ReachabilityChecker
+	Provisioner                 MachineProvisioner
+	ClusterInfo                 *ClusterInfo
+	MaxConcurrentReconciles     int
+	ProvisioningTimeoutDuration time.Duration
 }
 
 // +kubebuilder:rbac:groups=unbounded-kube.io,resources=machines,verbs=get;list;watch;create;update;patch;delete
@@ -166,12 +244,18 @@ func (r *MachineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// Use injected checker or default.
 	checker := r.ReachabilityChecker
 	if checker == nil {
-		checker = &DefaultReachabilityChecker{}
+		checker = &DefaultReachabilityChecker{Client: r.Client}
 	}
 
 	// Check if we can reach the machine via TCP.
-	if err := checker.CheckReachable(ctx, machine.Spec.SSH.Host); err != nil {
-		logger.Info("Machine is not reachable", "name", machine.Name, "host", machine.Spec.SSH.Host, "error", err)
+	// When a bastion is configured the probe is routed through it.
+	if err := checker.CheckReachable(ctx, &machine); err != nil {
+		probeHost := machine.Spec.SSH.Host
+		if machine.Spec.SSH.Bastion != nil {
+			probeHost = machine.Spec.SSH.Bastion.Host + " -> " + machine.Spec.SSH.Host
+		}
+
+		logger.Info("Machine is not reachable", "name", machine.Name, "host", probeHost, "error", err)
 
 		r.setSSHReachableCondition(&machine, metav1.ConditionFalse, "Unreachable", fmt.Sprintf("Machine is not reachable: %v", err))
 
@@ -218,8 +302,27 @@ func (r *MachineReconciler) reconcileProvisioning(ctx context.Context, machine *
 		"": // initial empty phase
 		// proceed
 	default:
-		// If already Provisioning, just requeue.
-		return ctrl.Result{RequeueAfter: RequeueAfterPending}, nil
+		// Machine is in Provisioning phase. Check if the provisioning
+		// attempt has been running too long (e.g. controller restarted
+		// while provisioning was in progress).
+		provCond := apimeta.FindStatusCondition(machine.Status.Conditions, unboundedv1alpha3.MachineConditionProvisioning)
+		if provCond != nil && provCond.Status == metav1.ConditionTrue {
+			elapsed := time.Since(provCond.LastTransitionTime.Time)
+			if elapsed < r.provisioningTimeout() {
+				logger.Info("Machine is being provisioned, requeueing",
+					"machine", machine.Name, "elapsed", elapsed.Round(time.Second))
+
+				return ctrl.Result{RequeueAfter: RequeueAfterPending}, nil
+			}
+		}
+
+		// Either the condition is missing (pre-existing Provisioning
+		// machine without the condition) or the timeout has elapsed.
+		// Transition to Failed so the normal retry flow picks it up.
+		logger.Info("Provisioning timed out, transitioning to Failed", "machine", machine.Name)
+
+		return r.updateStatus(ctx, machine, unboundedv1alpha3.MachinePhaseFailed,
+			fmt.Sprintf("Provisioning timed out after %s", r.provisioningTimeout()))
 	}
 
 	// Build SSH config from the Machine's spec.
@@ -236,7 +339,14 @@ func (r *MachineReconciler) reconcileProvisioning(ctx context.Context, machine *
 			fmt.Sprintf("Failed to get bootstrap token: %v", err))
 	}
 
-	// Set phase to Provisioning.
+	// Set phase to Provisioning and record when provisioning started.
+	apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
+		Type:    unboundedv1alpha3.MachineConditionProvisioning,
+		Status:  metav1.ConditionTrue,
+		Reason:  "InProgress",
+		Message: "Provisioning in progress",
+	})
+
 	if _, err := r.updateStatus(ctx, machine, unboundedv1alpha3.MachinePhaseProvisioning,
 		"Provisioning machine"); err != nil {
 		return ctrl.Result{}, err
@@ -258,6 +368,13 @@ func (r *MachineReconciler) reconcileProvisioning(ctx context.Context, machine *
 			return ctrl.Result{}, err
 		}
 
+		apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
+			Type:    unboundedv1alpha3.MachineConditionProvisioning,
+			Status:  metav1.ConditionFalse,
+			Reason:  "Failed",
+			Message: fmt.Sprintf("Provisioning failed: %v", provisionErr),
+		})
+
 		return r.updateStatus(ctx, machine, unboundedv1alpha3.MachinePhaseFailed,
 			fmt.Sprintf("Provisioning failed: %v", provisionErr))
 	}
@@ -269,7 +386,15 @@ func (r *MachineReconciler) reconcileProvisioning(ctx context.Context, machine *
 		return ctrl.Result{}, err
 	}
 
-	// Set the Provisioned condition with the current generation.
+	// Set the Provisioned condition with the current generation and clear
+	// the Provisioning condition.
+	apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
+		Type:    unboundedv1alpha3.MachineConditionProvisioning,
+		Status:  metav1.ConditionFalse,
+		Reason:  "Completed",
+		Message: "Provisioning completed successfully",
+	})
+
 	apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
 		Type:               unboundedv1alpha3.MachineConditionProvisioned,
 		Status:             metav1.ConditionTrue,
@@ -284,7 +409,7 @@ func (r *MachineReconciler) reconcileProvisioning(ctx context.Context, machine *
 
 // buildSSHConfig creates SSH client configuration from the Machine's SSH spec.
 func (r *MachineReconciler) buildSSHConfig(ctx context.Context, machine *unboundedv1alpha3.Machine) (*ssh.ClientConfig, error) {
-	privateKey, err := r.getSecretValue(ctx, &machine.Spec.SSH.PrivateKeyRef)
+	privateKey, err := getSecretValue(ctx, r.Client, &machine.Spec.SSH.PrivateKeyRef)
 	if err != nil {
 		return nil, fmt.Errorf("get SSH private key: %w", err)
 	}
@@ -310,9 +435,9 @@ func (r *MachineReconciler) buildSSHConfig(ctx context.Context, machine *unbound
 }
 
 // getSecretValue retrieves a value from a secret in the machina-system namespace.
-func (r *MachineReconciler) getSecretValue(ctx context.Context, ref *unboundedv1alpha3.SecretKeySelector) (string, error) {
+func getSecretValue(ctx context.Context, reader client.Reader, ref *unboundedv1alpha3.SecretKeySelector) (string, error) {
 	var secret corev1.Secret
-	if err := r.Get(ctx, client.ObjectKey{Namespace: SecretNamespaceMachinaSystem, Name: ref.Name}, &secret); err != nil {
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: SecretNamespaceMachinaSystem, Name: ref.Name}, &secret); err != nil {
 		return "", fmt.Errorf("get secret %s: %w", ref.Name, err)
 	}
 
@@ -513,7 +638,7 @@ func (r *MachineReconciler) dialViaBastion(
 		bastionKeyRef = &machine.Spec.SSH.PrivateKeyRef
 	}
 
-	bastionPrivateKey, err := r.getSecretValue(ctx, bastionKeyRef)
+	bastionPrivateKey, err := getSecretValue(ctx, r.Client, bastionKeyRef)
 	if err != nil {
 		return nil, fmt.Errorf("get bastion SSH private key: %w", err)
 	}
@@ -594,6 +719,16 @@ func (r *MachineReconciler) updateStatus(
 	default:
 		return ctrl.Result{RequeueAfter: RequeueAfterPending}, nil
 	}
+}
+
+// provisioningTimeout returns the configured provisioning timeout, falling
+// back to the ProvisioningTimeout constant when not explicitly set.
+func (r *MachineReconciler) provisioningTimeout() time.Duration {
+	if r.ProvisioningTimeoutDuration > 0 {
+		return r.ProvisioningTimeoutDuration
+	}
+
+	return ProvisioningTimeout
 }
 
 // SetupWithManager sets up the controller with the Manager.

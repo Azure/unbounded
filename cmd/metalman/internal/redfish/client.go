@@ -104,6 +104,7 @@ func (c *Client) PowerState(ctx context.Context) (PowerState, error) {
 	if err != nil {
 		return "", err
 	}
+
 	if status != http.StatusOK {
 		return "", fmt.Errorf("unexpected status %d from %s: %s", status, path, data)
 	}
@@ -127,6 +128,7 @@ func (c *Client) Reset(ctx context.Context, resetType ResetType) error {
 	if err != nil {
 		return err
 	}
+
 	if !isSuccessStatus(status) {
 		return fmt.Errorf("unexpected status %d from reset %s: %s", status, resetType, data)
 	}
@@ -142,6 +144,7 @@ func (c *Client) GetBootConfig(ctx context.Context) (BootConfig, error) {
 	if err != nil {
 		return BootConfig{}, err
 	}
+
 	if status != http.StatusOK {
 		return BootConfig{}, fmt.Errorf("unexpected status %d from %s: %s", status, path, data)
 	}
@@ -178,9 +181,11 @@ func (c *Client) SetBootOverride(ctx context.Context, target BootTarget, enabled
 	if err != nil {
 		return err
 	}
+
 	if isUnsupportedStatus(status) {
 		return fmt.Errorf("boot override PATCH returned %d: %w", status, ErrUnsupported)
 	}
+
 	if !isSuccessStatus(status) {
 		return fmt.Errorf("unexpected status %d from boot override PATCH", status)
 	}
@@ -204,9 +209,11 @@ func (c *Client) DisableBootOverride(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+
 	if isSuccessStatus(status) {
 		return nil
 	}
+
 	if !isUnsupportedStatus(status) {
 		return fmt.Errorf("unexpected status %d from boot override PATCH", status)
 	}
@@ -214,6 +221,7 @@ func (c *Client) DisableBootOverride(ctx context.Context) error {
 	// Some BMCs do not support disabling the boot source override.
 	// Fall back to setting Hdd/Continuous, which prevents PXE boot.
 	slog.Info("BMC does not support Disabled boot override, falling back to Hdd")
+
 	return c.SetBootOverride(ctx, BootTargetHdd, BootContinuous)
 }
 
@@ -257,6 +265,7 @@ func newHTTPClient(certSHA256 string) *http.Client {
 					if certSHA256 == "" {
 						return nil
 					}
+
 					if len(cs.PeerCertificates) == 0 {
 						return fmt.Errorf("no TLS peer certificates")
 					}
@@ -284,6 +293,7 @@ func resolveDeviceID(ctx context.Context, s *bmcSession, deviceID string) (strin
 	if err != nil {
 		return "", err
 	}
+
 	if status != http.StatusOK {
 		return "", fmt.Errorf("unexpected status %d from /redfish/v1/Systems: %s", status, data)
 	}
@@ -296,6 +306,7 @@ func resolveDeviceID(ctx context.Context, s *bmcSession, deviceID string) (strin
 	if err := json.Unmarshal(data, &collection); err != nil {
 		return "", fmt.Errorf("parsing Systems collection: %w", err)
 	}
+
 	if len(collection.Members) == 0 {
 		return "", fmt.Errorf("no members in /redfish/v1/Systems")
 	}

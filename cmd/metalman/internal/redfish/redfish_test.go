@@ -1649,6 +1649,7 @@ func TestSessionExpiryRetry(t *testing.T) {
 
 		// Authenticate: token must match the current valid token.
 		tok := r.Header.Get("X-Auth-Token")
+
 		valid, _ := currentToken.Load().(string)
 		if tok != valid {
 			user, pass, ok := r.BasicAuth()
@@ -1668,10 +1669,12 @@ func TestSessionExpiryRetry(t *testing.T) {
 	defer srv.Close()
 
 	fp := tlsServerFingerprint(srv)
+
 	pool := NewPool()
 	defer pool.Close()
 
 	ctx := t.Context()
+
 	c, err := pool.Get(ctx, srv.URL, fp, "admin", "secret", "1")
 	if err != nil {
 		t.Fatal(err)
@@ -1682,6 +1685,7 @@ func TestSessionExpiryRetry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("initial request failed: %v", err)
 	}
+
 	if state != "On" {
 		t.Fatalf("expected power state On, got %s", state)
 	}
@@ -1695,6 +1699,7 @@ func TestSessionExpiryRetry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request after session expiry failed (expected transparent retry): %v", err)
 	}
+
 	if state != "On" {
 		t.Fatalf("expected power state On after re-auth, got %s", state)
 	}

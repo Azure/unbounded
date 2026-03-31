@@ -5,16 +5,13 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v4"
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v7"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
 	"github.com/project-unbounded/unbounded-kube/hack/cmd/forge/forge/azsdk"
 	"github.com/project-unbounded/unbounded-kube/hack/cmd/forge/forge/infra"
 	"github.com/project-unbounded/unbounded-kube/hack/cmd/forge/forge/kube"
-	"github.com/project-unbounded/unbounded-kube/hack/cmd/forge/forge/unboundedcni"
 	"k8s.io/client-go/kubernetes"
 )
 
@@ -30,20 +27,17 @@ type DatacenterConfig struct {
 }
 
 type CreateCluster struct {
-	Azure                  *azsdk.ClientSet
-	Name                   string
-	Location               string
-	Logger                 *slog.Logger
-	SystemPoolNodeSKU      string
-	SystemPoolNodeCount    int32
-	GatewayPoolNodeSKU     string
-	GatewayPoolNodeCount   int32
-	SSHDir                 string
-	DataDir                DataDir
-	DatacenterConfig       *DatacenterConfig
-	UnboundedCNIReleaseURL string
-	ControllerImage        string
-	NodeImage              string
+	Azure                *azsdk.ClientSet
+	Name                 string
+	Location             string
+	Logger               *slog.Logger
+	SystemPoolNodeSKU    string
+	SystemPoolNodeCount  int32
+	GatewayPoolNodeSKU   string
+	GatewayPoolNodeCount int32
+	SSHDir               string
+	DataDir              DataDir
+	DatacenterConfig     *DatacenterConfig
 }
 
 type CreateClusterOutput struct {
@@ -92,29 +86,6 @@ func (cc *CreateCluster) Do(ctx context.Context) (*CreateClusterOutput, error) {
 
 	kubectl := kube.Kubectl(os.Environ(), kubeconfigPath)
 
-	getClusterDetails := GetClusterDetails{
-		Name: *rg.Name,
-		ManagedClusterGetter: &infra.AzureKubernetesClusterManager{
-			ManagedClustersCli: cc.Azure.ManagedClustersClient,
-			Logger:             cc.Logger,
-		},
-		GetVirtualNetwork: (&infra.VirtualNetworkManager{
-			Client: cc.Azure.NetworkVirtualNetworksClientV2,
-			Logger: cc.Logger,
-		}).GetVirtualNetworkByNamePrefix,
-		GetResourceGroup: (&infra.ResourceGroupManager{
-			Client: cc.Azure.ResourceGroupsClientV2,
-			Logger: cc.Logger,
-		}).Get,
-		DataDir: cc.DataDir,
-		Logger:  cc.Logger,
-	}
-
-	clusterResources, err := getClusterDetails.Get(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("get management cluster details: %w", err)
-	}
-
 	out := &CreateClusterOutput{
 		ClusterName:            *cluster.Name,
 		FQDN:                   *cluster.Properties.Fqdn,
@@ -124,10 +95,6 @@ func (cc *CreateCluster) Do(ctx context.Context) (*CreateClusterOutput, error) {
 		KubeconfigPath:         kubeconfigPath,
 	}
 
-	if err := cc.applyCNI(ctx, rg, clusterResources.VirtualNetwork, kubeCli, kubectl); err != nil {
-		return nil, fmt.Errorf("apply CNI: %w", err)
-	}
-
 	cc.Logger.Info("Applying datacenter node bootstrap token")
 
 	if _, err := applyBootstrapToken(ctx, cc.Logger, kubeCli, kubectl, *cluster.Name, cc.DataDir); err != nil {
@@ -135,36 +102,6 @@ func (cc *CreateCluster) Do(ctx context.Context) (*CreateClusterOutput, error) {
 	}
 
 	return out, nil
-}
-
-func (cc *CreateCluster) applyCNI(
-	ctx context.Context,
-	clusterResourceGroup *armresources.ResourceGroup,
-	clusterVirtualNetwork *armnetwork.VirtualNetwork,
-	kubeCli kubernetes.Interface,
-	kubectl func(context.Context) *exec.Cmd,
-) error {
-	installer := unboundedcni.Connector{
-		AzureCli:                 cc.Azure,
-		KubeCli:                  kubeCli,
-		Kubectl:                  kubectl,
-		Logger:                   cc.Logger,
-		ClusterResourceGroup:     clusterResourceGroup,
-		ClusterVirtualNetwork:    clusterVirtualNetwork,
-		DataDir:                  cc.DataDir.UnboundedForgePath("cni"),
-		GatewayPoolName:          defaultGatewayPoolName,
-		GatewayPoolType:          "External",
-		GatewayPoolAgentPoolName: defaultGatewayPoolAgentPoolName,
-		UnboundedCNIReleaseURL:   cc.UnboundedCNIReleaseURL,
-		ControllerImage:          cc.ControllerImage,
-		NodeImage:                cc.NodeImage,
-	}
-
-	if err := installer.ProvisionClusterConnectivity(ctx); err != nil {
-		return fmt.Errorf("provision cluster cni: %w", err)
-	}
-
-	return nil
 }
 
 func (cc *CreateCluster) createResourceGroup(ctx context.Context) (*armresources.ResourceGroup, error) {

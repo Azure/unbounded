@@ -39,11 +39,13 @@ func RunCmd(ctx context.Context, logger *slog.Logger, newCmd func(context.Contex
 
 	go func() {
 		defer wg.Done()
+
 		streamLogs(ctx, logger, stdout, slog.LevelDebug)
 	}()
 
 	go func() {
 		defer wg.Done()
+
 		streamLogs(ctx, logger, stderr, slog.LevelError)
 	}()
 
@@ -84,11 +86,13 @@ func OutputCmd(ctx context.Context, logger *slog.Logger, name string, args ...st
 
 	go func() {
 		defer wg.Done()
+
 		streamLogs(ctx, logger, io.TeeReader(stdout, &buf), slog.LevelDebug)
 	}()
 
 	go func() {
 		defer wg.Done()
+
 		streamLogs(ctx, logger, stderr, slog.LevelError)
 	}()
 

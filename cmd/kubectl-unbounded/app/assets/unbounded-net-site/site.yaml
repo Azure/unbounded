@@ -1,0 +1,17 @@
+---
+apiVersion: net.unbounded-kube.io/v1alpha1
+kind: Site
+metadata:
+  name: {{ .SiteName }}
+  labels:
+    unbounded-kube.io/site: "{{ .SiteName }}"
+spec:
+  nodeCidrs:
+  {{- range .NodeCIDRs }}
+    - {{ . }}
+  {{- end }}
+  podCidrAssignments:
+    - cidrBlocks:
+      {{- range .PodCIDRs }}
+        - {{ . }}
+      {{- end }}

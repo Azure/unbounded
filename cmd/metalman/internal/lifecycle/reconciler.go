@@ -14,8 +14,7 @@ import (
 )
 
 const (
-	reimageTimeout    = 30 * time.Minute // TODO: Make this configurable
-	conditionReimaged = "Reimaged"
+	reimageTimeout = 30 * time.Minute // TODO: Make this configurable
 )
 
 type Reconciler struct {
@@ -46,7 +45,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, nil
 	}
 
-	reimagedCond := meta.FindStatusCondition(node.Status.Conditions, conditionReimaged)
+	reimagedCond := meta.FindStatusCondition(node.Status.Conditions, v1alpha3.MachineConditionReimaged)
 	if reimagedCond == nil || reimagedCond.Status != metav1.ConditionFalse {
 		return ctrl.Result{}, nil
 	}
@@ -57,7 +56,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	log.Info("reimage timed out, triggering retry", "elapsed", elapsed)
-	meta.RemoveStatusCondition(&node.Status.Conditions, conditionReimaged)
+	meta.RemoveStatusCondition(&node.Status.Conditions, v1alpha3.MachineConditionReimaged)
 
 	if node.Status.Operations.RebootCounter > 0 {
 		node.Status.Operations.RebootCounter--

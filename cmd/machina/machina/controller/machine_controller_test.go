@@ -28,7 +28,7 @@ type mockReachabilityChecker struct {
 	err error
 }
 
-func (m *mockReachabilityChecker) CheckReachable(_ context.Context, _ string) error {
+func (m *mockReachabilityChecker) CheckReachable(_ context.Context, _ *unboundedv1alpha3.Machine) error {
 	return m.err
 }
 
@@ -346,6 +346,12 @@ func TestMachineReconciler_Provisioning_Success(t *testing.T) {
 	provCond := findCondition(updated.Status.Conditions, unboundedv1alpha3.MachineConditionProvisioned)
 	require.NotNil(t, provCond, "Provisioned condition should be set")
 	require.Equal(t, metav1.ConditionTrue, provCond.Status)
+
+	// Provisioning condition should be cleared (False/Completed).
+	provingCond := findCondition(updated.Status.Conditions, unboundedv1alpha3.MachineConditionProvisioning)
+	require.NotNil(t, provingCond, "Provisioning condition should be present")
+	require.Equal(t, metav1.ConditionFalse, provingCond.Status)
+	require.Equal(t, "Completed", provingCond.Reason)
 }
 
 func TestMachineReconciler_Provisioning_ProvisionerFails(t *testing.T) {
@@ -384,6 +390,12 @@ func TestMachineReconciler_Provisioning_ProvisionerFails(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, unboundedv1alpha3.MachinePhaseFailed, updated.Status.Phase)
 	require.Contains(t, updated.Status.Message, "SSH connection refused")
+
+	// Provisioning condition should be cleared (False/Failed).
+	provingCond := findCondition(updated.Status.Conditions, unboundedv1alpha3.MachineConditionProvisioning)
+	require.NotNil(t, provingCond, "Provisioning condition should be present")
+	require.Equal(t, metav1.ConditionFalse, provingCond.Status)
+	require.Equal(t, "Failed", provingCond.Reason)
 }
 
 func TestMachineReconciler_Provisioning_JoiningSkipsReProvision(t *testing.T) {
@@ -491,11 +503,113 @@ func TestMachineReconciler_Provisioning_BootstrapTokenSecretMissing(t *testing.T
 // Provisioning phase gate tests
 // ---------------------------------------------------------------------------
 
-func TestMachineReconciler_ProvisioningPhaseIsNotReProvisionable(t *testing.T) {
+// ---------------------------------------------------------------------------
+// Provisioning timeout tests
+// ---------------------------------------------------------------------------
+
+func TestMachineReconciler_ProvisioningPhase_TimesOutToFailed(t *testing.T) {
 	t.Parallel()
 
 	s := newTestScheme(t)
 
+	machine := newTestMachine("test-machine", "10.0.0.1:22", "testuser", defaultKubernetes())
+	machine.Status = unboundedv1alpha3.MachineStatus{
+		Phase: unboundedv1alpha3.MachinePhaseProvisioning,
+		Conditions: []metav1.Condition{
+			{
+				Type:               unboundedv1alpha3.MachineConditionProvisioning,
+				Status:             metav1.ConditionTrue,
+				Reason:             "InProgress",
+				Message:            "Provisioning in progress",
+				LastTransitionTime: metav1.NewTime(time.Now().Add(-10 * time.Minute)),
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(machine).
+		WithStatusSubresource(machine).
+		Build()
+
+	provisioner := &mockProvisioner{}
+	reconciler := &MachineReconciler{
+		Client:              fakeClient,
+		Scheme:              s,
+		ReachabilityChecker: &mockReachabilityChecker{},
+		Provisioner:         provisioner,
+	}
+
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-machine"}}
+
+	result, err := reconciler.Reconcile(context.Background(), req)
+	require.NoError(t, err)
+	require.False(t, provisioner.called, "provisioner should NOT be called when timing out")
+	require.Equal(t, RequeueAfterFailed, result.RequeueAfter)
+
+	var updated unboundedv1alpha3.Machine
+
+	err = fakeClient.Get(context.Background(), req.NamespacedName, &updated)
+	require.NoError(t, err)
+	require.Equal(t, unboundedv1alpha3.MachinePhaseFailed, updated.Status.Phase)
+	require.Contains(t, updated.Status.Message, "timed out")
+}
+
+func TestMachineReconciler_ProvisioningPhase_RecentProvisioningRequeues(t *testing.T) {
+	t.Parallel()
+
+	s := newTestScheme(t)
+
+	machine := newTestMachine("test-machine", "10.0.0.1:22", "testuser", defaultKubernetes())
+	machine.Status = unboundedv1alpha3.MachineStatus{
+		Phase: unboundedv1alpha3.MachinePhaseProvisioning,
+		Conditions: []metav1.Condition{
+			{
+				Type:               unboundedv1alpha3.MachineConditionProvisioning,
+				Status:             metav1.ConditionTrue,
+				Reason:             "InProgress",
+				Message:            "Provisioning in progress",
+				LastTransitionTime: metav1.NewTime(time.Now().Add(-1 * time.Minute)),
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(machine).
+		WithStatusSubresource(machine).
+		Build()
+
+	provisioner := &mockProvisioner{}
+	reconciler := &MachineReconciler{
+		Client:              fakeClient,
+		Scheme:              s,
+		ReachabilityChecker: &mockReachabilityChecker{},
+		Provisioner:         provisioner,
+	}
+
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-machine"}}
+
+	result, err := reconciler.Reconcile(context.Background(), req)
+	require.NoError(t, err)
+	require.False(t, provisioner.called, "provisioner should NOT be called — still within timeout")
+	require.Equal(t, RequeueAfterPending, result.RequeueAfter)
+
+	// Phase should remain Provisioning (no status update).
+	var updated unboundedv1alpha3.Machine
+
+	err = fakeClient.Get(context.Background(), req.NamespacedName, &updated)
+	require.NoError(t, err)
+	require.Equal(t, unboundedv1alpha3.MachinePhaseProvisioning, updated.Status.Phase)
+}
+
+func TestMachineReconciler_ProvisioningPhase_MissingConditionTimesOut(t *testing.T) {
+	t.Parallel()
+
+	s := newTestScheme(t)
+
+	// Machine in Provisioning phase but without the Provisioning condition
+	// (e.g. pre-existing machine from before this feature was added).
 	machine := newTestMachine("test-machine", "10.0.0.1:22", "testuser", defaultKubernetes())
 	machine.Status = unboundedv1alpha3.MachineStatus{
 		Phase: unboundedv1alpha3.MachinePhaseProvisioning,
@@ -519,8 +633,15 @@ func TestMachineReconciler_ProvisioningPhaseIsNotReProvisionable(t *testing.T) {
 
 	result, err := reconciler.Reconcile(context.Background(), req)
 	require.NoError(t, err)
-	require.False(t, provisioner.called, "provisioner should not be called when already Provisioning")
-	require.Equal(t, RequeueAfterPending, result.RequeueAfter)
+	require.False(t, provisioner.called, "provisioner should NOT be called")
+	require.Equal(t, RequeueAfterFailed, result.RequeueAfter)
+
+	var updated unboundedv1alpha3.Machine
+
+	err = fakeClient.Get(context.Background(), req.NamespacedName, &updated)
+	require.NoError(t, err)
+	require.Equal(t, unboundedv1alpha3.MachinePhaseFailed, updated.Status.Phase)
+	require.Contains(t, updated.Status.Message, "timed out")
 }
 
 func TestMachineReconciler_Provisioning_RetryFromFailed(t *testing.T) {
@@ -578,9 +699,8 @@ func TestGetSecretValue(t *testing.T) {
 		}
 
 		fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(secret).Build()
-		reconciler := &MachineReconciler{Client: fakeClient, Scheme: s}
 
-		val, err := reconciler.getSecretValue(context.Background(),
+		val, err := getSecretValue(context.Background(), fakeClient,
 			&unboundedv1alpha3.SecretKeySelector{Name: "my-secret", Key: "custom-key"})
 		require.NoError(t, err)
 		require.Equal(t, "secret-value", val)
@@ -595,9 +715,8 @@ func TestGetSecretValue(t *testing.T) {
 		}
 
 		fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(secret).Build()
-		reconciler := &MachineReconciler{Client: fakeClient, Scheme: s}
 
-		val, err := reconciler.getSecretValue(context.Background(),
+		val, err := getSecretValue(context.Background(), fakeClient,
 			&unboundedv1alpha3.SecretKeySelector{Name: "my-secret"})
 		require.NoError(t, err)
 		require.Equal(t, "my-key", val)
@@ -607,9 +726,8 @@ func TestGetSecretValue(t *testing.T) {
 		t.Parallel()
 
 		fakeClient := fake.NewClientBuilder().WithScheme(s).Build()
-		reconciler := &MachineReconciler{Client: fakeClient, Scheme: s}
 
-		_, err := reconciler.getSecretValue(context.Background(),
+		_, err := getSecretValue(context.Background(), fakeClient,
 			&unboundedv1alpha3.SecretKeySelector{Name: "missing-secret"})
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "missing-secret")
@@ -624,9 +742,8 @@ func TestGetSecretValue(t *testing.T) {
 		}
 
 		fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(secret).Build()
-		reconciler := &MachineReconciler{Client: fakeClient, Scheme: s}
 
-		_, err := reconciler.getSecretValue(context.Background(),
+		_, err := getSecretValue(context.Background(), fakeClient,
 			&unboundedv1alpha3.SecretKeySelector{Name: "my-secret", Key: "missing-key"})
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "missing-key")
@@ -778,7 +895,9 @@ func TestDefaultReachabilityChecker_CheckReachable(t *testing.T) {
 		defer cleanup()
 
 		checker := &DefaultReachabilityChecker{Timeout: time.Second}
-		err := checker.CheckReachable(context.Background(), fmt.Sprintf("127.0.0.1:%d", port))
+		machine := newTestMachine("m", fmt.Sprintf("127.0.0.1:%d", port), "u", nil)
+
+		err := checker.CheckReachable(context.Background(), machine)
 
 		require.NoError(t, err)
 	})
@@ -787,7 +906,9 @@ func TestDefaultReachabilityChecker_CheckReachable(t *testing.T) {
 		t.Parallel()
 
 		checker := &DefaultReachabilityChecker{Timeout: 100 * time.Millisecond}
-		err := checker.CheckReachable(context.Background(), "127.0.0.1:59999")
+		machine := newTestMachine("m", "127.0.0.1:59999", "u", nil)
+
+		err := checker.CheckReachable(context.Background(), machine)
 
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "TCP dial 127.0.0.1:59999")
@@ -797,7 +918,9 @@ func TestDefaultReachabilityChecker_CheckReachable(t *testing.T) {
 		t.Parallel()
 
 		checker := &DefaultReachabilityChecker{Timeout: 100 * time.Millisecond}
-		err := checker.CheckReachable(context.Background(), "invalid-ip:22")
+		machine := newTestMachine("m", "invalid-ip:22", "u", nil)
+
+		err := checker.CheckReachable(context.Background(), machine)
 
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "TCP dial invalid-ip:22")
@@ -810,7 +933,9 @@ func TestDefaultReachabilityChecker_CheckReachable(t *testing.T) {
 		defer cleanup()
 
 		checker := &DefaultReachabilityChecker{}
-		err := checker.CheckReachable(context.Background(), fmt.Sprintf("127.0.0.1:%d", port))
+		machine := newTestMachine("m", fmt.Sprintf("127.0.0.1:%d", port), "u", nil)
+
+		err := checker.CheckReachable(context.Background(), machine)
 
 		require.NoError(t, err)
 	})
@@ -820,7 +945,9 @@ func TestDefaultReachabilityChecker_CheckReachable(t *testing.T) {
 
 		// Use a non-routable IP to guarantee connection failure.
 		checker := &DefaultReachabilityChecker{Timeout: 100 * time.Millisecond}
-		err := checker.CheckReachable(context.Background(), "192.0.2.1")
+		machine := newTestMachine("m", "192.0.2.1", "u", nil)
+
+		err := checker.CheckReachable(context.Background(), machine)
 
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "TCP dial 192.0.2.1:22")
@@ -833,7 +960,9 @@ func TestDefaultReachabilityChecker_CheckReachable(t *testing.T) {
 		cancel()
 
 		checker := &DefaultReachabilityChecker{Timeout: 5 * time.Second}
-		err := checker.CheckReachable(ctx, "127.0.0.1:22")
+		machine := newTestMachine("m", "127.0.0.1:22", "u", nil)
+
+		err := checker.CheckReachable(ctx, machine)
 
 		require.Error(t, err)
 	})
@@ -1252,6 +1381,7 @@ func TestDefaultConfig(t *testing.T) {
 	require.Equal(t, ":8081", cfg.ProbeAddr)
 	require.False(t, cfg.EnableLeaderElection)
 	require.Equal(t, 10, cfg.MaxConcurrentReconciles)
+	require.Equal(t, ProvisioningTimeout, cfg.ProvisioningTimeout)
 }
 
 // ---------------------------------------------------------------------------

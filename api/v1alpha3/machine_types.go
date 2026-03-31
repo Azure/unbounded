@@ -46,6 +46,19 @@ const (
 	// reachable via SSH. The lastTransitionTime and message fields are
 	// updated on probe results.
 	MachineConditionSSHReachable = "SSHReachable"
+
+	// MachineConditionProvisioning indicates that the machine is
+	// currently being provisioned. The lastTransitionTime records when
+	// provisioning started, which is used to detect stale provisioning
+	// attempts (e.g. after a controller restart).
+	MachineConditionProvisioning = "Provisioning"
+
+	// MachineConditionReimaged indicates the state of a reimage operation.
+	// Status is set to False (with Reason "Pending") when a reimage begins,
+	// and True (with Reason "Succeeded") when the reimage completes.
+	// The lastTransitionTime records when the reimage started, which is
+	// used to detect stale reimage attempts.
+	MachineConditionReimaged = "Reimaged"
 )
 
 // Annotation keys.

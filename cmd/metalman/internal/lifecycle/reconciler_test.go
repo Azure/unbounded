@@ -27,7 +27,7 @@ func TestReimageTimeout(t *testing.T) {
 			Operations: &v1alpha3.OperationsStatus{RebootCounter: 1},
 			Conditions: []metav1.Condition{
 				{
-					Type:               conditionReimaged,
+					Type:               v1alpha3.MachineConditionReimaged,
 					Status:             metav1.ConditionFalse,
 					Reason:             "Pending",
 					Message:            "image=test-image",
@@ -57,7 +57,7 @@ func TestReimageTimeout(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reimagedCond := meta.FindStatusCondition(updated.Status.Conditions, conditionReimaged)
+	reimagedCond := meta.FindStatusCondition(updated.Status.Conditions, v1alpha3.MachineConditionReimaged)
 	if reimagedCond != nil {
 		t.Fatalf("expected Reimaged condition to be removed, got %+v", reimagedCond)
 	}
@@ -80,7 +80,7 @@ func TestReimageTimeoutNotYetExpired(t *testing.T) {
 			Operations: &v1alpha3.OperationsStatus{RebootCounter: 1},
 			Conditions: []metav1.Condition{
 				{
-					Type:               conditionReimaged,
+					Type:               v1alpha3.MachineConditionReimaged,
 					Status:             metav1.ConditionFalse,
 					Reason:             "Pending",
 					Message:            "image=test-image",
@@ -173,7 +173,7 @@ func TestNoOpWhenReimageSucceeded(t *testing.T) {
 			Operations: &v1alpha3.OperationsStatus{RebootCounter: 1},
 			Conditions: []metav1.Condition{
 				{
-					Type:               conditionReimaged,
+					Type:               v1alpha3.MachineConditionReimaged,
 					Status:             metav1.ConditionTrue,
 					Reason:             "Succeeded",
 					LastTransitionTime: metav1.NewTime(time.Now().Add(-20 * time.Minute)),

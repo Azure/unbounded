@@ -23,17 +23,10 @@ type datacenterFrontendManager struct {
 }
 
 type datacenterFrontend struct {
-	// publicIP     *armnetwork.PublicIPAddress
 	loadBalancer *armnetwork.LoadBalancer
 }
 
 func (m *datacenterFrontendManager) CreateOrUpdate(ctx context.Context) (*datacenterFrontend, error) {
-	//m.logger.Info("Applying datacenter frontend public IP")
-	//
-	//publicIP, err := m.createOrUpdatePublicIP(ctx)
-	//if err != nil {
-	//	return nil, fmt.Errorf("create or update frontend public IP: %w", err)
-	//}
 	m.logger.Info("Applying datacenter frontend load balancer")
 
 	loadBalancer, err := m.createOrUpdateLoadBalancer(ctx, nil)
@@ -48,15 +41,6 @@ func (m *datacenterFrontendManager) CreateOrUpdate(ctx context.Context) (*datace
 }
 
 func (m *datacenterFrontendManager) GetFrontend(ctx context.Context) (*datacenterFrontend, error) {
-	//ipMan := infra.PublicIPAddressManager{
-	//	Client: m.azureCli.NetworkPublicIPAddressesClientV2,
-	//	Logger: m.logger,
-	//}
-
-	//ip, err := ipMan.Get(ctx, *m.resourceGroup.Name, frontendIPName)
-	//if err != nil {
-	//	return nil, fmt.Errorf("get frontend public IP: %w", err)
-	//}
 	lbMan := infra.LoadBalancerManager{
 		Client: m.azureCli.NetworkLoadBalancersClientV2,
 		Logger: m.logger,
@@ -101,8 +85,6 @@ func (m *datacenterFrontendManager) CreateOrUpdatePublicIP(ctx context.Context, 
 
 func (m *datacenterFrontendManager) createOrUpdateLoadBalancer(ctx context.Context, _ *armnetwork.PublicIPAddress) (*armnetwork.LoadBalancer, error) {
 	loadBalancerName := frontendLBName
-	// loadBalancerID := fmt.Sprintf("%s/providers/Microsoft.Network/loadBalancers/%s", *m.resourceGroup.ID, loadBalancerName)
-	// loadBalancerFrontendName := "fe-1"
 
 	desired := armnetwork.LoadBalancer{
 		Name:     to.Ptr(loadBalancerName),
@@ -111,20 +93,7 @@ func (m *datacenterFrontendManager) createOrUpdateLoadBalancer(ctx context.Conte
 			Name: to.Ptr(armnetwork.LoadBalancerSKUNameStandard),
 			Tier: to.Ptr(armnetwork.LoadBalancerSKUTierRegional),
 		},
-		Properties: &armnetwork.LoadBalancerPropertiesFormat{
-			//FrontendIPConfigurations: []*armnetwork.FrontendIPConfiguration{
-			//	{
-			//		Name: to.Ptr(loadBalancerFrontendName),
-			//		Properties: &armnetwork.FrontendIPConfigurationPropertiesFormat{
-			//			PublicIPAddress: &armnetwork.PublicIPAddress{
-			//				ID: frontendIP.ID,
-			//			},
-			//			PrivateIPAddressVersion:   to.Ptr(armnetwork.IPVersionIPv4),
-			//			PrivateIPAllocationMethod: to.Ptr(armnetwork.IPAllocationMethodDynamic),
-			//		},
-			//	},
-			//},
-		},
+		Properties: &armnetwork.LoadBalancerPropertiesFormat{},
 	}
 
 	lbMan := infra.LoadBalancerManager{

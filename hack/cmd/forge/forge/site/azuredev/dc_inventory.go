@@ -11,6 +11,10 @@ import (
 
 type Inventory struct {
 	Machines []Machine
+	// Bastion is the SSH bastion (jump host) machine, if one exists.
+	// It is separated from the regular Machines list so callers can
+	// handle it independently.
+	Bastion *Machine
 }
 
 type Machine struct {
@@ -26,6 +30,8 @@ type InventoryGetter struct {
 	SSHBackendPort    int32
 }
 
+// Get returns the machine inventory by querying the load balancer's inbound NAT rule port mappings.
+// Machines in bastion backend pools are separated into the Inventory.Bastion field.
 func (g *InventoryGetter) Get(ctx context.Context) (*Inventory, error) {
 	// For each frontend IP configuration get the public IP address. Then for each backend pool associated with
 	// the frontend IP get the associated network interface for the attached VMSS. With that information
@@ -102,6 +108,9 @@ func (g *InventoryGetter) Get(ctx context.Context) (*Inventory, error) {
 			continue
 		}
 
+		// Determine whether this backend pool belongs to the bastion.
+		isBastion := isBastionPool(*bePool.Name)
+
 		backendPool, err := backendPoolCli.Get(ctx, g.ResourceGroupName, g.LoadBalancerName, *bePool.Name, nil)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get backend pool %s: %w", *bePool.Name, err)
@@ -158,16 +167,136 @@ func (g *InventoryGetter) Get(ctx context.Context) (*Inventory, error) {
 					continue
 				}
 
-				inventory.Machines = append(inventory.Machines, Machine{
+				machine := Machine{
 					Name:      vmName,
 					IPAddress: frontendIP,
 					Port:      int(*m.FrontendPort),
-				})
+				}
+
+				if isBastion {
+					inventory.Bastion = &machine
+				} else {
+					inventory.Machines = append(inventory.Machines, machine)
+				}
 			}
 		}
 	}
 
 	return inventory, nil
+}
+
+// GetDirect returns the machine inventory by querying VMSS instances directly for their private IP
+// addresses. This is used when workers have no inbound NAT rules (i.e. direct access is disabled).
+// The bastion's public IP is resolved from the "<resourceGroup>-bastion" public IP resource.
+func (g *InventoryGetter) GetDirect(ctx context.Context) (*Inventory, error) {
+	inventory := &Inventory{
+		Machines: []Machine{},
+	}
+
+	vmssCli := g.AzureCli.ComputeVMScaleSetClientV2
+	vmssVMCli := g.AzureCli.ComputeVMScaleSetVMClientV2
+	nicCli := g.AzureCli.NetworkInterfacesClientV2
+
+	// List all VMSSes in the resource group.
+	pager := vmssCli.NewListPager(g.ResourceGroupName, nil)
+	for pager.More() {
+		page, err := pager.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("list VMSS: %w", err)
+		}
+
+		for _, vmss := range page.Value {
+			if vmss.Name == nil {
+				continue
+			}
+
+			vmssName := *vmss.Name
+			isBastion := isBastionPool(vmssName)
+
+			// List instances in this VMSS.
+			vmPager := vmssVMCli.NewListPager(g.ResourceGroupName, vmssName, nil)
+			for vmPager.More() {
+				vmPage, err := vmPager.NextPage(ctx)
+				if err != nil {
+					return nil, fmt.Errorf("list VMSS VMs for %s: %w", vmssName, err)
+				}
+
+				for _, vm := range vmPage.Value {
+					if vm.InstanceID == nil {
+						continue
+					}
+
+					instanceID := *vm.InstanceID
+
+					vmName := vmssName + "_" + instanceID
+					if vm.Properties != nil && vm.Properties.OSProfile != nil && vm.Properties.OSProfile.ComputerName != nil {
+						vmName = *vm.Properties.OSProfile.ComputerName
+					}
+
+					// Get the NIC for this instance to read its private IP.
+					nic, err := nicCli.GetVirtualMachineScaleSetNetworkInterface(ctx, g.ResourceGroupName, vmssName, instanceID, "main", nil)
+					if err != nil {
+						return nil, fmt.Errorf("get NIC for %s instance %s: %w", vmssName, instanceID, err)
+					}
+
+					privateIP := extractPrivateIP(&nic.Interface)
+					if privateIP == "" {
+						continue
+					}
+
+					machine := Machine{
+						Name:      vmName,
+						IPAddress: privateIP,
+						Port:      22,
+					}
+
+					if isBastion {
+						// For the bastion, resolve the public IP instead.
+						bastionPublicIPName := g.ResourceGroupName + "-" + bastionPoolName
+
+						pubIP, err := g.AzureCli.NetworkPublicIPAddressesClientV2.Get(ctx, g.ResourceGroupName, bastionPublicIPName, nil)
+						if err != nil {
+							return nil, fmt.Errorf("get bastion public IP: %w", err)
+						}
+
+						if pubIP.Properties == nil || pubIP.Properties.IPAddress == nil {
+							return nil, fmt.Errorf("bastion public IP address not yet allocated")
+						}
+
+						machine.IPAddress = *pubIP.Properties.IPAddress
+						inventory.Bastion = &machine
+					} else {
+						inventory.Machines = append(inventory.Machines, machine)
+					}
+				}
+			}
+		}
+	}
+
+	return inventory, nil
+}
+
+// isBastionPool returns true if the backend pool or VMSS name identifies a bastion pool.
+// Pool names are prefixed with the site name (e.g. "mysite-bastion").
+func isBastionPool(name string) bool {
+	return strings.HasSuffix(name, "-"+bastionPoolName) || name == bastionPoolName
+}
+
+// extractPrivateIP reads the first private IP address from a network interface.
+func extractPrivateIP(nic *armnetwork.Interface) string {
+	if nic.Properties == nil {
+		return ""
+	}
+
+	for _, ipConfig := range nic.Properties.IPConfigurations {
+		if ipConfig.Properties == nil || ipConfig.Properties.PrivateIPAddress == nil {
+			continue
+		}
+
+		return *ipConfig.Properties.PrivateIPAddress
+	}
+
+	return ""
 }
 
 // getPublicIPFromID retrieves a public IP address resource from its full resource ID.

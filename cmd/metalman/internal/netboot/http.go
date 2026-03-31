@@ -17,8 +17,6 @@ import (
 	v1alpha3 "github.com/project-unbounded/unbounded-kube/api/v1alpha3"
 )
 
-const conditionReimaged = "Reimaged"
-
 type HTTPServer struct {
 	BindAddr string
 	Port     int
@@ -173,7 +171,7 @@ func (h *HTTPServer) handleDisablePXE(w http.ResponseWriter, r *http.Request) {
 	}
 
 	meta.SetStatusCondition(&node.Status.Conditions, metav1.Condition{
-		Type:               conditionReimaged,
+		Type:               v1alpha3.MachineConditionReimaged,
 		Status:             metav1.ConditionTrue,
 		Reason:             "Succeeded",
 		Message:            "image=" + imageName,

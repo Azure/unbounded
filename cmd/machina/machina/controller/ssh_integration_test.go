@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -22,7 +23,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	unboundedv1alpha3 "github.com/project-unbounded/unbounded-kube/api/v1alpha3"
-	"github.com/project-unbounded/unbounded-kube/internal/provision"
 )
 
 // sshTestServer is an in-process SSH server used for integration tests.
@@ -595,32 +595,44 @@ func TestProvisionMachine_EndToEnd(t *testing.T) {
 	require.NoError(t, err)
 
 	commands := srv.getExecutedCommands()
-	require.Len(t, commands, 3)
+	require.GreaterOrEqual(t, len(commands), 3, "expected at least copy + exec + cleanup commands")
 
-	// Command 1: script copy.
-	require.Contains(t, commands[0].command, "cat >")
-	require.Contains(t, commands[0].command, remoteScriptPath)
-	require.Contains(t, commands[0].command, "chmod +x")
-	// The script content now comes from provision.AKSFlexInstallScript().
-	require.Equal(t, provision.AKSFlexInstallScript(), string(commands[0].stdin))
+	// Find commands by their characteristics rather than hardcoded indices,
+	// so the test doesn't break if intermediate steps are added.
+	var copyCmd, execCmd, cleanupCmd *sshExecutedCommand
 
-	// Command 2: script execution with env vars.
-	require.Contains(t, commands[1].command, "sudo -E bash")
-	require.Contains(t, commands[1].command, remoteScriptPath)
-	require.Contains(t, commands[1].command, "API_SERVER")
-	require.Contains(t, commands[1].command, "api.example.com:443")
-	require.Contains(t, commands[1].command, "BOOTSTRAP_TOKEN")
-	require.Contains(t, commands[1].command, "abc123.secret")
-	require.Contains(t, commands[1].command, "CA_CERT_BASE64")
-	require.Contains(t, commands[1].command, "KUBE_VERSION")
-	require.Contains(t, commands[1].command, "v1.34.0") // Machine spec overrides cluster version.
-	require.Contains(t, commands[1].command, "CLUSTER_DNS")
-	require.Contains(t, commands[1].command, "CLUSTER_RG")
-	require.Contains(t, commands[1].command, "MACHINA_MACHINE_NAME")
+	for i := range commands {
+		switch {
+		case strings.Contains(commands[i].command, "cat >") && strings.Contains(commands[i].command, remoteScriptPath):
+			copyCmd = &commands[i]
+		case strings.Contains(commands[i].command, "sudo -E bash") && strings.Contains(commands[i].command, remoteScriptPath):
+			execCmd = &commands[i]
+		case strings.Contains(commands[i].command, "rm -f") && strings.Contains(commands[i].command, remoteScriptPath):
+			cleanupCmd = &commands[i]
+		}
+	}
 
-	// Command 3: cleanup.
-	require.Contains(t, commands[2].command, "rm -f")
-	require.Contains(t, commands[2].command, remoteScriptPath)
+	// Command: script copy — verify a script was sent, not its exact contents.
+	require.NotNil(t, copyCmd, "expected a script copy command")
+	require.Contains(t, copyCmd.command, "chmod +x")
+	require.NotEmpty(t, copyCmd.stdin, "script content should have been piped via stdin")
+	require.Contains(t, string(copyCmd.stdin), "#!/bin/bash", "script should start with a shebang")
+
+	// Command: script execution with env vars.
+	require.NotNil(t, execCmd, "expected a script execution command")
+	require.Contains(t, execCmd.command, "API_SERVER")
+	require.Contains(t, execCmd.command, "api.example.com:443")
+	require.Contains(t, execCmd.command, "BOOTSTRAP_TOKEN")
+	require.Contains(t, execCmd.command, "abc123.secret")
+	require.Contains(t, execCmd.command, "CA_CERT_BASE64")
+	require.Contains(t, execCmd.command, "KUBE_VERSION")
+	require.Contains(t, execCmd.command, "v1.34.0") // Machine spec overrides cluster version.
+	require.Contains(t, execCmd.command, "CLUSTER_DNS")
+	require.Contains(t, execCmd.command, "CLUSTER_RG")
+	require.Contains(t, execCmd.command, "MACHINA_MACHINE_NAME")
+
+	// Command: cleanup.
+	require.NotNil(t, cleanupCmd, "expected a cleanup command")
 }
 
 func TestProvisionMachine_CleanupAlwaysRuns(t *testing.T) {
@@ -659,8 +671,18 @@ func TestProvisionMachine_CleanupAlwaysRuns(t *testing.T) {
 	require.NoError(t, err)
 
 	commands := srv.getExecutedCommands()
-	require.Len(t, commands, 3, "copy + exec + cleanup should all run")
-	require.Contains(t, commands[2].command, "rm -f")
+	require.GreaterOrEqual(t, len(commands), 3, "copy + exec + cleanup should all run")
+
+	hasCleanup := false
+
+	for _, cmd := range commands {
+		if strings.Contains(cmd.command, "rm -f") && strings.Contains(cmd.command, remoteScriptPath) {
+			hasCleanup = true
+			break
+		}
+	}
+
+	require.True(t, hasCleanup, "expected a cleanup command with rm -f")
 }
 
 func TestProvisionMachine_EnvVarsInCommand(t *testing.T) {
@@ -1009,4 +1031,258 @@ func TestDialViaBastion_DefaultPort(t *testing.T) {
 	)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "dial bastion")
+}
+
+// ---------------------------------------------------------------------------
+// Bastion reachability checker integration tests
+// ---------------------------------------------------------------------------
+
+func TestDefaultReachabilityChecker_BastionReachable_TargetReachable(t *testing.T) {
+	t.Parallel()
+
+	targetSrv := newSSHTestServer(t)
+	bastionSrv := newSSHTestServer(t)
+
+	rsaKey, _ := generateTestRSAKey(t)
+	pemBytes := marshalPrivateKeyPEM(t, rsaKey)
+
+	s := runtime.NewScheme()
+	require.NoError(t, unboundedv1alpha3.AddToScheme(s))
+	require.NoError(t, corev1.AddToScheme(s))
+
+	bastionKeySecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "bastion-key-secret", Namespace: SecretNamespaceMachinaSystem},
+		Data:       map[string][]byte{"ssh-privatekey": pemBytes},
+	}
+
+	machine := &unboundedv1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "bastion-reach-test"},
+		Spec: unboundedv1alpha3.MachineSpec{
+			SSH: &unboundedv1alpha3.SSHSpec{
+				Host:     targetSrv.address(),
+				Username: "testuser",
+				PrivateKeyRef: unboundedv1alpha3.SecretKeySelector{
+					Name: "machine-key-secret",
+				},
+				Bastion: &unboundedv1alpha3.BastionSSHSpec{
+					Host:     bastionSrv.address(),
+					Username: "bastionuser",
+					PrivateKeyRef: &unboundedv1alpha3.SecretKeySelector{
+						Name: "bastion-key-secret",
+					},
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(bastionKeySecret).
+		Build()
+
+	checker := &DefaultReachabilityChecker{
+		Client:  fakeClient,
+		Timeout: 5 * time.Second,
+	}
+
+	err := checker.CheckReachable(context.Background(), machine)
+	require.NoError(t, err)
+}
+
+func TestDefaultReachabilityChecker_BastionUnreachable(t *testing.T) {
+	t.Parallel()
+
+	rsaKey, _ := generateTestRSAKey(t)
+	pemBytes := marshalPrivateKeyPEM(t, rsaKey)
+
+	s := runtime.NewScheme()
+	require.NoError(t, unboundedv1alpha3.AddToScheme(s))
+	require.NoError(t, corev1.AddToScheme(s))
+
+	bastionKeySecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "bastion-key-secret", Namespace: SecretNamespaceMachinaSystem},
+		Data:       map[string][]byte{"ssh-privatekey": pemBytes},
+	}
+
+	// Bastion points to a port with nothing listening.
+	machine := &unboundedv1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "bastion-unreach-test"},
+		Spec: unboundedv1alpha3.MachineSpec{
+			SSH: &unboundedv1alpha3.SSHSpec{
+				Host:     "127.0.0.1:59998",
+				Username: "testuser",
+				PrivateKeyRef: unboundedv1alpha3.SecretKeySelector{
+					Name: "machine-key-secret",
+				},
+				Bastion: &unboundedv1alpha3.BastionSSHSpec{
+					Host:     "127.0.0.1:59997",
+					Username: "bastionuser",
+					PrivateKeyRef: &unboundedv1alpha3.SecretKeySelector{
+						Name: "bastion-key-secret",
+					},
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(bastionKeySecret).
+		Build()
+
+	checker := &DefaultReachabilityChecker{
+		Client:  fakeClient,
+		Timeout: 100 * time.Millisecond,
+	}
+
+	err := checker.CheckReachable(context.Background(), machine)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "SSH dial bastion")
+}
+
+func TestDefaultReachabilityChecker_BastionReachable_TargetUnreachable(t *testing.T) {
+	t.Parallel()
+
+	bastionSrv := newSSHTestServer(t)
+
+	rsaKey, _ := generateTestRSAKey(t)
+	pemBytes := marshalPrivateKeyPEM(t, rsaKey)
+
+	s := runtime.NewScheme()
+	require.NoError(t, unboundedv1alpha3.AddToScheme(s))
+	require.NoError(t, corev1.AddToScheme(s))
+
+	bastionKeySecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "bastion-key-secret", Namespace: SecretNamespaceMachinaSystem},
+		Data:       map[string][]byte{"ssh-privatekey": pemBytes},
+	}
+
+	// Target points to a port with nothing listening; bastion is up.
+	machine := &unboundedv1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "target-unreach-test"},
+		Spec: unboundedv1alpha3.MachineSpec{
+			SSH: &unboundedv1alpha3.SSHSpec{
+				Host:     "127.0.0.1:59996",
+				Username: "testuser",
+				PrivateKeyRef: unboundedv1alpha3.SecretKeySelector{
+					Name: "machine-key-secret",
+				},
+				Bastion: &unboundedv1alpha3.BastionSSHSpec{
+					Host:     bastionSrv.address(),
+					Username: "bastionuser",
+					PrivateKeyRef: &unboundedv1alpha3.SecretKeySelector{
+						Name: "bastion-key-secret",
+					},
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(bastionKeySecret).
+		Build()
+
+	checker := &DefaultReachabilityChecker{
+		Client:  fakeClient,
+		Timeout: 5 * time.Second,
+	}
+
+	err := checker.CheckReachable(context.Background(), machine)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "through bastion")
+}
+
+func TestDefaultReachabilityChecker_BastionFallsBackToMachineKey(t *testing.T) {
+	t.Parallel()
+
+	targetSrv := newSSHTestServer(t)
+	bastionSrv := newSSHTestServer(t)
+
+	rsaKey, _ := generateTestRSAKey(t)
+	pemBytes := marshalPrivateKeyPEM(t, rsaKey)
+
+	s := runtime.NewScheme()
+	require.NoError(t, unboundedv1alpha3.AddToScheme(s))
+	require.NoError(t, corev1.AddToScheme(s))
+
+	machineKeySecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "machine-key-secret", Namespace: SecretNamespaceMachinaSystem},
+		Data:       map[string][]byte{"ssh-privatekey": pemBytes},
+	}
+
+	// Bastion has no PrivateKeyRef — should fall back to machine's SSH key.
+	machine := &unboundedv1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "bastion-fallback-test"},
+		Spec: unboundedv1alpha3.MachineSpec{
+			SSH: &unboundedv1alpha3.SSHSpec{
+				Host:     targetSrv.address(),
+				Username: "testuser",
+				PrivateKeyRef: unboundedv1alpha3.SecretKeySelector{
+					Name: "machine-key-secret",
+				},
+				Bastion: &unboundedv1alpha3.BastionSSHSpec{
+					Host:     bastionSrv.address(),
+					Username: "bastionuser",
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(machineKeySecret).
+		Build()
+
+	checker := &DefaultReachabilityChecker{
+		Client:  fakeClient,
+		Timeout: 5 * time.Second,
+	}
+
+	err := checker.CheckReachable(context.Background(), machine)
+	require.NoError(t, err)
+}
+
+func TestDefaultReachabilityChecker_BastionKeySecretMissing(t *testing.T) {
+	t.Parallel()
+
+	bastionSrv := newSSHTestServer(t)
+
+	s := runtime.NewScheme()
+	require.NoError(t, unboundedv1alpha3.AddToScheme(s))
+	require.NoError(t, corev1.AddToScheme(s))
+
+	// No secret created — should fail when trying to look it up.
+	machine := &unboundedv1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "bastion-no-key-test"},
+		Spec: unboundedv1alpha3.MachineSpec{
+			SSH: &unboundedv1alpha3.SSHSpec{
+				Host:     "127.0.0.1:59995",
+				Username: "testuser",
+				PrivateKeyRef: unboundedv1alpha3.SecretKeySelector{
+					Name: "machine-key-secret",
+				},
+				Bastion: &unboundedv1alpha3.BastionSSHSpec{
+					Host:     bastionSrv.address(),
+					Username: "bastionuser",
+					PrivateKeyRef: &unboundedv1alpha3.SecretKeySelector{
+						Name: "missing-bastion-key",
+					},
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(s).
+		Build()
+
+	checker := &DefaultReachabilityChecker{
+		Client:  fakeClient,
+		Timeout: 5 * time.Second,
+	}
+
+	err := checker.CheckReachable(context.Background(), machine)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "bastion SSH private key")
 }

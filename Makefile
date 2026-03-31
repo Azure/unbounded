@@ -6,9 +6,6 @@ GOTEST=$(GOCMD) test
 GOMOD=$(GOCMD) mod
 GOLINT=golangci-lint run -c .golangci.yaml
 
-KUBECTL_UNBOUNDED_BIN=bin/kubectl-unbounded
-KUBECTL_UNBOUNDED_CMD=./cmd/kubectl-unbounded
-
 FORGE_BIN=bin/forge
 FORGE_CMD=./hack/cmd/forge
 
@@ -41,6 +38,9 @@ lint: fmt
 
 test: lint
 	$(GOTEST) ./...
+
+KUBECTL_UNBOUNDED_BIN=bin/kubectl-unbounded
+KUBECTL_UNBOUNDED_CMD=./cmd/kubectl-unbounded
 
 kubectl-unbounded: test
 	$(GOBUILD) -o $(KUBECTL_UNBOUNDED_BIN) $(KUBECTL_UNBOUNDED_CMD)/main.go
@@ -105,6 +105,11 @@ machina-oci:
 
 machina-oci-push: machina-oci
 	$(CONTAINER_ENGINE) push $(MACHINA_IMAGE)
+
+machina-run: machina
+	kubectl scale deployment/machina-controller --replicas=0 -n machina-system
+	kubectl get configmap machina-config -n machina-system -o jsonpath='{.data.config\.yaml}' > hack/machina-config.yaml
+	$(MACHINA_BIN) controller --config=hack/machina-config.yaml
 
 METALMAN_TAG ?= latest
 METALMAN_REGISTRY=stargatetmedev.azurecr.io

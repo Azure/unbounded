@@ -1,0 +1,12 @@
+---
+apiVersion: unbounded.aks.azure.com/v1alpha1
+kind: SiteGatewayPoolAssignment
+metadata:
+  name: {{ .SiteName }}
+  labels:
+    unbounded-kube.io/site: "{{ .SiteName }}"
+spec:
+  sites:
+    - {{ .SiteName }}
+  gatewayPools:
+    - gw-main

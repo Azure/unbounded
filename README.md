@@ -1,86 +1,54 @@
-# Unbounded Kubernetes - Kubernetes without Boundaries
+# Unbounded Kubernetes - Kubernetes without Borders
 
-Core components of Project Unbounded which enable Kubernetes users to run worker Nodes anywhere and connect them back to your central control plane.
+The unbounded-kube project enables Kubernetes operators to provision worker nodes anywhere and connect them back to a
+central control plane.
 
-# Getting Started
+## Setup 
 
-We will have binaries published soon. In the meantime you need to build from source:
+1. A running Kubernetes cluster with a `kubeconfig` file that has access to the cluster.
+2. `kubectl-unbounded` installed and on your `PATH`. Download it from the releases or build it from source
+   with `make kubectl-unbounded`.
+3. One or more nodes with the label `unbounded-kube.io/unbounded-net-gateway=true` that can be used as the network
+   gateway for your unbounded sites. These nodes also need to allow UDP traffic on ports `51820-51899` for WireGuard.
 
-## Install `kubectl-unbounded`
+## Initial Site Creation
 
-```bash
-make kubectl-unbounded
-export PATH=$PATH:$(pwd)/bin
+A "Site" is a location where you have Machines you want to connect back to your cluster. You can have multiple sites. 
+Each site has its own network configuration and set of machines. You use `kubectl-unbounded` to initialize a new site
+and then register machines to provision.
 
-# test it works
-kubectl unbounded --help
-```
-
-## Prerequisites
-
-1. `kubectl-unbounded` installed and on your `PATH`
-2. Kubernetes cluster that you have access to a `kubeconfig` file for.
-   - Kube-unbounded developers are encouraged to use
-         the Forge tool in this repo for development and testing, but any Kubernetes cluster should work. See Forge 
-         [README](hack/cmd/forge/README.md) for details.
-
-## CNI Setup
-
-**NOTE: If you're using the Forge tool you can skip this section.**
-
-You need to have one or more nodes with `UDP/51820-51899` open for WireGuard connectivity. That node should become
-`<node-name>` in the command below:
+| Option                | Description                                                                                                                                                                     |
+|-----------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `--name`              | Name of the site.                                                                                                                                                               |
+| `--cluster-node-cidr` | The node CIDR of your existing cluster.                                                                                                                                         |
+| `--cluster-pod-cidr`  | The pod CIDR of your existing cluster.                                                                                                                                          |
+| `--node-cidr`         | The node CIDR for your new site. This is the CIDR range that will be used for the nodes in this site. It should not overlap with your existing cluster's node CIDR or pod CIDR. |
+| `--pod-cidr`          | The pod CIDR for your new site. This is the CIDR range that will be used for the pods in this site. It should not overlap with your existing cluster's node CIDR or pod CIDR.   |
 
 ```bash
-kubectl label node <node-name> "unbounded.aks.azure.com/gateway=true"
+kubectl unbounded site init \
+  --name hello-unbounded \
+  --cluster-node-cidr <cidr> \
+  --cluster-pod-cidr <cidr \
+  --node-cidr <cidr> \
+  --pod-cidr <cidr
 ```
 
-Download a recent `unbounded-cni` release from https://github.com/azure-management-and-platforms/aks-unbounded-cni/ then
-install the CNI.
+## Add your first Machine!
 
-```
-mkdir -p /tmp/unbounded-cni
-tar -xzf unbounded-cni.tar.gz -C /tmp/unbounded-cni
-kubectl apply -R -f /tmp/unbounded-cni
-```
-
-## Install Machina
-
-Machina provisions machines to join them to your cluster.
+| Option                | Description                                                                                                                                                  |
+|-----------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `--site`              | Name of the site.                                                                                                                                            |
+| `--name`              | Name of the machine. This will become the node name in Kubernetes once the machine is provisioned and joined to the cluster.                                 |
+| `--host`              | The host and port where the machine can be reached. This should be in the format `<ip>[:port]`. If no port is specified, the default port `22` will be used. |
+| `--ssh-username`      | The username to use when connecting to the machine over SSH.                                                                                                 | 
+| `--ssh-private-key`   | The path to the SSH private key to use when connecting to the machine over SSH. This key should have access to the machine specified in `--host`.            |
 
 ```bash
-kubectl apply -Rf deploy/machina
+kubectl unbounded site add-machine \
+  --site hello-unbounded \
+  --name node0 \
+  --host <ip>[:port] \
+  --ssh-username <username> \
+  --ssh-private-key <path-to-ssh-key>
 ```
-
-## Adding Nodes
-
-Assume you have a couple running computers somewhere and they are reachable with an `$host:$port` combination. You
-also have an SSH key pair for reaching these nodes.
-
-In `unbounded-kube` a place where external nodes are hosted is called a "Site". To bootstrap new nodes you need to know
-the `--node-cidr` for the machine's in your Site.
-
-```bash
-# If used Forge you can use this command:
-FORGE_NAME=<your forge cluster name>
-
-kubectl unbounded setup \
-    --ssh-private-key=~/.unbounded-forge/$FORGE_NAME/ssh/$FORGE_NAME \
-    --node-cidr=$(az network vnet show -g $FORGE_NAME-dc1 -n main --query "addressSpace.addressPrefixes[0]" -o tsv | tr -d '\n')
-
-# If you DID NOT use Forge you can use this command but you need to fill in the 
-# parameters yourself.
-kubectl unbounded setup \
-    --ssh-private-key=<ssh-private-key-file> \
-    --node-cidr=<node-cidr>`
-
-kubectl unbounded create worker-01 --host <host-ip-or-name> --port <port> --ssh-username <ssh-user>
-kubectl unbounded create worker-02 --host <host-ip-or-name> --port <port> --ssh-username <ssh-user>
-
-# watch machines. should move from Pending -> Provisioning -> Joining -> Ready
-watch 'kubectl get mach'
-NAME      HOST            PHASE          AGE
-worker0   40.85.222.227   Ready          19m
-worker1   40.85.222.227   Provisioning   2s
-``` 
-
