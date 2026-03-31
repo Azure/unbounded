@@ -84,7 +84,7 @@ spec:
 | `Pending` | Machine is not reachable. The controller retries every 30 seconds. |
 | `Ready` | Machine is reachable but has no `modelRef`, or has not yet been provisioned. |
 | `Provisioning` | SSH session is active and the install script is running. |
-| `Provisioned` | Install script completed successfully. The controller polls every 30 seconds for a Node with the label `machina.project-unbounded.io/machine=<machine-name>` to appear. |
+| `Provisioned` | Install script completed successfully. The controller polls every 30 seconds for a Node with the label `unbounded-kube.io/machine=<machine-name>` to appear. |
 | `Joined` | A Node with the matching label exists. `status.nodeRef` is set. The controller polls every 5 minutes to ensure the Node is still present. |
 | `Orphaned` | The machine was previously `Joined` but the corresponding Node has disappeared. The controller polls every 1 minute for the Node to reappear. If the Node reappears, the machine transitions back to `Joined`. |
 | `Failed` | Reachability check succeeded but provisioning failed (model not found, SSH error, script error). The controller retries every 60 seconds. |
@@ -92,7 +92,7 @@ spec:
 #### Node label convention
 
 When the agent bootstraps a Node, it must apply the label
-`machina.project-unbounded.io/machine=<machine-name>`. The controller watches for Nodes with
+`unbounded-kube.io/machine=<machine-name>`. The controller watches for Nodes with
 this label and uses it to transition machines through the `Provisioned` → `Joined` → `Orphaned`
 lifecycle.
 
