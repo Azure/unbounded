@@ -1,0 +1,37 @@
+apiVersion: krew.googlecontainertools.github.com/v1alpha2
+kind: Plugin
+metadata:
+  name: unbounded
+spec:
+  version: "${VERSION}"
+  homepage: https://github.com/${REPO}
+  shortDescription: Manage unbounded Kubernetes worker nodes
+  platforms:
+  - selector:
+      matchLabels:
+        os: linux
+        arch: amd64
+    uri: https://github.com/${REPO}/releases/download/${VERSION}/kubectl-unbounded-linux-amd64.tar.gz
+    sha256: "${SHA_LINUX_AMD64}"
+    bin: kubectl-unbounded
+  - selector:
+      matchLabels:
+        os: linux
+        arch: arm64
+    uri: https://github.com/${REPO}/releases/download/${VERSION}/kubectl-unbounded-linux-arm64.tar.gz
+    sha256: "${SHA_LINUX_ARM64}"
+    bin: kubectl-unbounded
+  - selector:
+      matchLabels:
+        os: darwin
+        arch: amd64
+    uri: https://github.com/${REPO}/releases/download/${VERSION}/kubectl-unbounded-darwin-amd64.tar.gz
+    sha256: "${SHA_DARWIN_AMD64}"
+    bin: kubectl-unbounded
+  - selector:
+      matchLabels:
+        os: darwin
+        arch: arm64
+    uri: https://github.com/${REPO}/releases/download/${VERSION}/kubectl-unbounded-darwin-arm64.tar.gz
+    sha256: "${SHA_DARWIN_ARM64}"
+    bin: kubectl-unbounded

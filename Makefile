@@ -15,8 +15,8 @@ INVENTORY_CMD=./cmd/inventory
 MACHINA_BIN=bin/machina
 MACHINA_CMD=./cmd/machina
 MACHINA_TAG ?= latest
-MACHINA_REGISTRY=stargatetmedev.azurecr.io
-MACHINA_IMAGE=$(MACHINA_REGISTRY)/machina:$(MACHINA_TAG)
+CONTAINER_REGISTRY ?= stargatetmedev.azurecr.io
+MACHINA_IMAGE=$(CONTAINER_REGISTRY)/machina:$(MACHINA_TAG)
 CONTAINER_ENGINE ?= podman
 
 VERSION ?= v0.0.4
@@ -112,8 +112,7 @@ machina-run: machina
 	$(MACHINA_BIN) controller --config=hack/machina-config.yaml
 
 METALMAN_TAG ?= latest
-METALMAN_REGISTRY=stargatetmedev.azurecr.io
-METALMAN_IMAGE=$(METALMAN_REGISTRY)/metalman:$(METALMAN_TAG)
+METALMAN_IMAGE=$(CONTAINER_REGISTRY)/metalman:$(METALMAN_TAG)
 
 metalman-oci:
 	$(CONTAINER_ENGINE) build -t metalman:$(METALMAN_TAG) -t $(METALMAN_IMAGE) -f ./cmd/metalman/oci/Containerfile .
