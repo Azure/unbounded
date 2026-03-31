@@ -387,7 +387,7 @@ func (r *MachineReconciler) provisionMachine(
 		return fmt.Errorf("create SSH session for script copy: %w", err)
 	}
 
-	agentInstallScript := provision.AKSFlexInstallScript()
+	agentInstallScript := provision.UnboundedAgentInstallScript()
 
 	copySession.Stdin = bytes.NewBufferString(agentInstallScript)
 

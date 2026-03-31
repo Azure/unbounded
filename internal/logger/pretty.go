@@ -41,14 +41,7 @@ type consoleHandler struct {
 	attrColors   map[string]color.Attribute
 }
 
-//var colorScheme = map[string]color.Attribute{
-//	"field":                  color.FgCyan,
-//	slog.LevelDebug.String(): color.FgHiBlack,
-//	slog.LevelWarn.String():  color.FgYellow,
-//	slog.LevelInfo.String():  color.FgGreen,
-//	slog.LevelError.String(): color.FgRed,
-//}
-
+// PrettyFieldHandlerOptions configures the pretty console log handler.
 type PrettyFieldHandlerOptions struct {
 	Level      slog.Leveler
 	AttrOrder  []string

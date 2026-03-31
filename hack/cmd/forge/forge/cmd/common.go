@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	"github.com/project-unbounded/unbounded-kube/hack/cmd/forge/forge/azsdk"
-	"github.com/project-unbounded/unbounded-kube/hack/cmd/forge/internal/logger"
+	"github.com/project-unbounded/unbounded-kube/internal/logger"
 )
 
 type CommandContext struct {

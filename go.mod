@@ -25,6 +25,7 @@ require (
 	github.com/go-logr/logr v1.4.3
 	github.com/golang-jwt/jwt/v5 v5.3.0
 	github.com/google/go-tpm v0.9.8
+	github.com/google/renameio/v2 v2.0.2
 	github.com/insomniacslk/dhcp v0.0.0-20260220084031-5adc3eb26f91
 	github.com/lima-vm/go-qcow2reader v0.7.1
 	github.com/pin/tftp/v3 v3.2.0
@@ -32,6 +33,7 @@ require (
 	github.com/spf13/pflag v1.0.9
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/crypto v0.48.0
+	golang.org/x/sync v0.19.0
 	gopkg.in/yaml.v3 v3.0.1
 	k8s.io/api v0.35.2
 	k8s.io/apimachinery v0.35.2
@@ -118,7 +120,6 @@ require (
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
 	golang.org/x/net v0.49.0 // indirect
 	golang.org/x/oauth2 v0.30.0 // indirect
-	golang.org/x/sync v0.19.0 // indirect
 	golang.org/x/sys v0.42.0 // indirect
 	golang.org/x/term v0.40.0 // indirect
 	golang.org/x/text v0.34.0 // indirect

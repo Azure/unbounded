@@ -11,6 +11,7 @@ inventory.db
 # Developer Stuff
 hack/scratch
 tmp/
+.vm/
 
 # Kubernetes
 .kube/
