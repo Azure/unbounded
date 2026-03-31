@@ -16,7 +16,7 @@ export KUBE_VERSION
 
 _LABELS="kubernetes.azure.com/managed=false"
 _LABELS="${_LABELS},kubernetes.azure.com/cluster=${CLUSTER_RG}"
-_LABELS="${_LABELS},unbounded-kube.io/machine/machine=${MACHINA_MACHINE_NAME}"
+_LABELS="${_LABELS},unbounded-kube.io/machine=${MACHINA_MACHINE_NAME}"
 if [ -n "${NODE_LABELS}" ]; then
     NODE_LABELS="${NODE_LABELS},${_LABELS}"
 else
