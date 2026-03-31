@@ -12,6 +12,9 @@ FORGE_CMD=./hack/cmd/forge
 INVENTORY_BIN=bin/inventory
 INVENTORY_CMD=./cmd/inventory
 
+AGENT_BIN=bin/unbounded-agent
+AGENT_CMD=./cmd/agent
+
 MACHINA_BIN=bin/machina
 MACHINA_CMD=./cmd/machina
 MACHINA_TAG ?= latest
@@ -25,7 +28,7 @@ BLOB_CONTAINER ?= release
 
 KUBECTL_PLUGIN_PLATFORMS = linux-amd64 linux-arm64 darwin-amd64 darwin-arm64
 
-.PHONY: all fmt lint test kubectl-unbounded kubectl-unbounded-cross krew-manifest forge inventory inventory-amd64 inventory-arm64 machina machina-oci machina-oci-push metalman metalman-oci metalman-oci-push gomod images/ubuntu24/image.yaml push-blobs
+.PHONY: all fmt lint test kubectl-unbounded kubectl-unbounded-cross krew-manifest forge inventory inventory-amd64 inventory-arm64 unbounded-agent machina machina-oci machina-oci-push metalman metalman-oci metalman-oci-push gomod images/ubuntu24/image.yaml push-blobs
 
 all: kubectl-unbounded forge machina
 
@@ -86,6 +89,9 @@ inventory-amd64: test
 
 inventory-arm64: test
 	GOOS=linux GOARCH=arm64 $(GOBUILD) -o $(INVENTORY_BIN)-arm64 $(INVENTORY_CMD)/main.go
+
+unbounded-agent: test
+	GOOS=linux $(GOBUILD) -o $(AGENT_BIN) $(AGENT_CMD)/main.go
 
 machina: test
 	$(GOBUILD) -o $(MACHINA_BIN) $(MACHINA_CMD)/main.go

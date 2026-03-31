@@ -15,6 +15,19 @@ builds:
       - amd64
       - arm64
 
+  - id: unbounded-agent
+    main: ./cmd/agent
+    binary: unbounded-agent
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+
 archives:
   - id: kubectl-unbounded
     ids:
@@ -22,6 +35,13 @@ archives:
     formats:
       - tar.gz
     name_template: "kubectl-unbounded-{{ .Os }}-{{ .Arch }}"
+
+  - id: unbounded-agent
+    ids:
+      - unbounded-agent
+    formats:
+      - tar.gz
+    name_template: "unbounded-agent-{{ .Os }}-{{ .Arch }}"
 
 checksum:
   name_template: "checksums.txt"
