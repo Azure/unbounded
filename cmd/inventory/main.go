@@ -4,8 +4,9 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/project-unbounded/unbounded-kube/pkg/inventory"
 	"github.com/spf13/cobra"
+
+	"github.com/project-unbounded/unbounded-kube/pkg/inventory"
 )
 
 func main() {

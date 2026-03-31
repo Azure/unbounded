@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/golang-jwt/jwt/v5"
+
 	"github.com/project-unbounded/unbounded-kube/hack/cmd/forge/forge/azsdk"
 )
 

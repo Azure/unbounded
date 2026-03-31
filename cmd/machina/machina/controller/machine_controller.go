@@ -579,10 +579,10 @@ func (r *MachineReconciler) provisionMachine(
 
 	defer execSession.Close() //nolint:errcheck // Best-effort close of exec session.
 
-	var output bytes.Buffer
+	var stdout, stderr bytes.Buffer
 
-	execSession.Stdout = &output
-	execSession.Stderr = &output
+	execSession.Stdout = &stdout
+	execSession.Stderr = &stderr
 
 	cmd := fmt.Sprintf(
 		`export API_SERVER=%q; `+
@@ -606,10 +606,10 @@ func (r *MachineReconciler) provisionMachine(
 	)
 
 	if err := execSession.Run(cmd); err != nil {
-		return fmt.Errorf("run agent install script: %w (output: %s)", err, output.String())
+		return fmt.Errorf("run agent install script: %w (stdout: %s) (stderr: %s)", err, stdout.String(), stderr.String())
 	}
 
-	logger.Info("Agent install script completed", "machine", machine.Name, "output", output.String())
+	logger.Info("Agent install script completed", "machine", machine.Name, "stdout", stdout.String(), "stderr", stderr.String())
 
 	return nil
 }

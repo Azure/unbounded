@@ -58,7 +58,7 @@ linters:
       allow-whole-block: false
       branch-max-lines: 2
       enable:
-        - err 
+        - err
 
   exclusions:
     generated: lax
@@ -92,11 +92,14 @@ formatters:
       sections:
         - standard
         - default
+        - prefix(github.com/project-unbounded/unbounded-kube)
     gofumpt:
       # Enables only grouping of the arguments with the same type, the more consistency we can get, the better.
       extra-rules: true
+    goimports:
+      local-prefixes:
+        - github.com/project-unbounded/unbounded-kube
   exclusions:
     generated: lax
     paths:
       - examples$
-

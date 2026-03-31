@@ -4,13 +4,14 @@ import (
 	"context"
 	"fmt"
 
-	v1alpha3 "github.com/project-unbounded/unbounded-kube/api/v1alpha3"
 	"github.com/spf13/cobra"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/tools/clientcmd"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	v1alpha3 "github.com/project-unbounded/unbounded-kube/api/v1alpha3"
 )
 
 // RebootCmd returns a cobra.Command that reboots a Machine via Redfish.

@@ -8,13 +8,6 @@ import (
 	"path/filepath"
 	"time"
 
-	v1alpha3 "github.com/project-unbounded/unbounded-kube/api/v1alpha3"
-	"github.com/project-unbounded/unbounded-kube/cmd/metalman/internal/attestation"
-	"github.com/project-unbounded/unbounded-kube/cmd/metalman/internal/dhcp"
-	"github.com/project-unbounded/unbounded-kube/cmd/metalman/internal/indexing"
-	"github.com/project-unbounded/unbounded-kube/cmd/metalman/internal/lifecycle"
-	"github.com/project-unbounded/unbounded-kube/cmd/metalman/internal/netboot"
-	"github.com/project-unbounded/unbounded-kube/cmd/metalman/internal/redfish"
 	"github.com/spf13/cobra"
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -23,6 +16,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+
+	v1alpha3 "github.com/project-unbounded/unbounded-kube/api/v1alpha3"
+	"github.com/project-unbounded/unbounded-kube/cmd/metalman/internal/attestation"
+	"github.com/project-unbounded/unbounded-kube/cmd/metalman/internal/dhcp"
+	"github.com/project-unbounded/unbounded-kube/cmd/metalman/internal/indexing"
+	"github.com/project-unbounded/unbounded-kube/cmd/metalman/internal/lifecycle"
+	"github.com/project-unbounded/unbounded-kube/cmd/metalman/internal/netboot"
+	"github.com/project-unbounded/unbounded-kube/cmd/metalman/internal/redfish"
 )
 
 // ServePXECmd returns a cobra.Command that runs PXE servers and the BMC control loop.

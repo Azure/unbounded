@@ -13,8 +13,6 @@ import (
 	"os"
 	"text/template"
 
-	"github.com/project-unbounded/unbounded-kube/cmd/machina/machina/controller"
-	"github.com/project-unbounded/unbounded-kube/internal/kube"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -22,6 +20,9 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/project-unbounded/unbounded-kube/cmd/machina/machina/controller"
+	"github.com/project-unbounded/unbounded-kube/internal/kube"
 )
 
 //go:embed assets/unbounded-net-site/*.yaml

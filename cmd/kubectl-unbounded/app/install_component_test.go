@@ -17,7 +17,6 @@ import (
 	"testing/fstest"
 	"time"
 
-	machinadeploy "github.com/project-unbounded/unbounded-kube/deploy/machina"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -26,6 +25,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+
+	machinadeploy "github.com/project-unbounded/unbounded-kube/deploy/machina"
 )
 
 // discardLogger returns a logger that discards all output.

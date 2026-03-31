@@ -9,8 +9,9 @@ import (
 	"os/exec"
 	"path/filepath"
 
-	"github.com/project-unbounded/unbounded-kube/hack/cmd/forge/forge/kube"
 	"k8s.io/client-go/kubernetes"
+
+	"github.com/project-unbounded/unbounded-kube/hack/cmd/forge/forge/kube"
 )
 
 func applyBootstrapToken(ctx context.Context, logger *slog.Logger, kubeCli kubernetes.Interface, kubectl func(context.Context) *exec.Cmd, forgeName string, dataDir DataDir) (*kube.BootstrapToken, error) {

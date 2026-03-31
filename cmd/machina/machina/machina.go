@@ -4,8 +4,9 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/project-unbounded/unbounded-kube/cmd/machina/machina/controller"
 	"github.com/spf13/cobra"
+
+	"github.com/project-unbounded/unbounded-kube/cmd/machina/machina/controller"
 )
 
 func Run() {

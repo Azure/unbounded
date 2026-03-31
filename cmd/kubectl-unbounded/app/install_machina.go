@@ -5,8 +5,9 @@ import (
 	"net/http"
 	"time"
 
-	machinadeploy "github.com/project-unbounded/unbounded-kube/deploy/machina"
 	"k8s.io/client-go/kubernetes"
+
+	machinadeploy "github.com/project-unbounded/unbounded-kube/deploy/machina"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )

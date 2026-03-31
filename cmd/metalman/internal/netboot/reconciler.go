@@ -14,11 +14,12 @@ import (
 	"sync"
 
 	qcow2reader "github.com/lima-vm/go-qcow2reader"
-	v1alpha3 "github.com/project-unbounded/unbounded-kube/api/v1alpha3"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	v1alpha3 "github.com/project-unbounded/unbounded-kube/api/v1alpha3"
 )
 
 type ImageReconciler struct {

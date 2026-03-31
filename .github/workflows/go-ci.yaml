@@ -1,0 +1,67 @@
+name: Go CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v7
+        with:
+          version: v2.10.1
+          args: --timeout=10m
+          only-new-issues: true
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Verify go.mod tidy
+        run: |
+          go mod tidy
+          if [ -n "$(git diff --name-only go.mod go.sum)" ]; then
+            echo "::error::go.mod or go.sum is not tidy. Run 'go mod tidy' and commit the changes."
+            git diff go.mod go.sum
+            exit 1
+          fi
+
+      - name: Run tests
+        run: go test -v ./... -race -coverprofile=coverage.out -covermode=atomic
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+          retention-days: 7

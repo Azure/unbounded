@@ -6,9 +6,10 @@ import (
 	"os"
 
 	"github.com/go-logr/logr"
-	"github.com/project-unbounded/unbounded-kube/cmd/metalman/commands"
 	"github.com/spf13/cobra"
 	ctrl "sigs.k8s.io/controller-runtime"
+
+	"github.com/project-unbounded/unbounded-kube/cmd/metalman/commands"
 )
 
 var version = "dev"

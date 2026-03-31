@@ -5,9 +5,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/require"
+
 	machinav1alpha3 "github.com/project-unbounded/unbounded-kube/api/v1alpha3"
 	"github.com/project-unbounded/unbounded-kube/hack/cmd/forge/forge/site/azuredev"
-	"github.com/stretchr/testify/require"
 )
 
 func TestMachinaNameFromInventory(t *testing.T) {

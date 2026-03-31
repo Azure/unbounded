@@ -6,6 +6,7 @@ import (
 	"log/slog"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/keyvault/armkeyvault"
+
 	"github.com/project-unbounded/unbounded-kube/hack/cmd/forge/forge/azsdk"
 	"github.com/project-unbounded/unbounded-kube/hack/cmd/forge/forge/validate"
 )

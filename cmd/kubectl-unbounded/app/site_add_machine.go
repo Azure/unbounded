@@ -8,8 +8,6 @@ import (
 	"net"
 	"os"
 
-	"github.com/project-unbounded/unbounded-kube/api/v1alpha3"
-	"github.com/project-unbounded/unbounded-kube/internal/kube"
 	"github.com/spf13/cobra"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	v1 "k8s.io/client-go/applyconfigurations/core/v1"
@@ -17,6 +15,9 @@ import (
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/yaml"
+
+	"github.com/project-unbounded/unbounded-kube/api/v1alpha3"
+	"github.com/project-unbounded/unbounded-kube/internal/kube"
 )
 
 type siteAddMachineHandler struct {

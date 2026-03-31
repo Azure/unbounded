@@ -5,11 +5,12 @@ import (
 	"io"
 	"strings"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/yaml"
+
 	machinav1alpha3 "github.com/project-unbounded/unbounded-kube/api/v1alpha3"
 	"github.com/project-unbounded/unbounded-kube/hack/cmd/forge/forge/site/azuredev"
 	"github.com/project-unbounded/unbounded-kube/internal/kube"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"sigs.k8s.io/yaml"
 )
 
 // machinaNameFromInventory builds a Machine CR name from the site name, LB IP,
