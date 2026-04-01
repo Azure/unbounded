@@ -15,6 +15,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/yaml"
 )
 
 // writeTempSSHKey writes dummy SSH key content to a temp file and returns the path.
@@ -638,9 +639,189 @@ func TestSiteAddMachineCommand(t *testing.T) {
 		"name", "ssh-private-key", "ssh-secret-name",
 		"bastion-host", "bastion-ssh-secret-name",
 		"bastion-ssh-username", "bastion-ssh-private-key",
-		"kubeconfig",
+		"kubeconfig", "node-label",
 	} {
 		f := cmd.Flags().Lookup(flagName)
 		require.NotNilf(t, f, "flag --%s should exist", flagName)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// parseNodeLabels() tests
+// ---------------------------------------------------------------------------
+
+func TestParseNodeLabels(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		entries   []string
+		want      map[string]string
+		expectErr string
+	}{
+		{
+			name:    "nil input",
+			entries: nil,
+			want:    nil,
+		},
+		{
+			name:    "empty input",
+			entries: []string{},
+			want:    nil,
+		},
+		{
+			name:    "single label",
+			entries: []string{"kubernetes.azure.com/managed=false"},
+			want:    map[string]string{"kubernetes.azure.com/managed": "false"},
+		},
+		{
+			name:    "multiple labels",
+			entries: []string{"env=prod", "tier=frontend"},
+			want:    map[string]string{"env": "prod", "tier": "frontend"},
+		},
+		{
+			name:    "value with equals sign",
+			entries: []string{"annotation=key=value"},
+			want:    map[string]string{"annotation": "key=value"},
+		},
+		{
+			name:    "empty value",
+			entries: []string{"key="},
+			want:    map[string]string{"key": ""},
+		},
+		{
+			name:      "missing equals sign",
+			entries:   []string{"nope"},
+			expectErr: `"nope" is not a valid key=value pair`,
+		},
+		{
+			name:      "duplicate key",
+			entries:   []string{"env=prod", "env=staging"},
+			expectErr: `duplicate label key "env"`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := parseNodeLabels(tt.entries)
+
+			if tt.expectErr != "" {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tt.expectErr)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, tt.want, got)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// validate() tests for --node-label
+// ---------------------------------------------------------------------------
+
+func TestSiteAddMachineHandler_Validate_NodeLabels(t *testing.T) {
+	t.Parallel()
+
+	sshKeyPath := writeTempSSHKey(t)
+	kubeconfigPath := writeTempKubeconfig(t)
+
+	base := siteAddMachineHandler{
+		siteName:          "dc1",
+		name:              "dc1-10.0.0.5",
+		host:              "10.0.0.5",
+		hostSSHUsername:   "admin",
+		hostSSHPrivateKey: sshKeyPath,
+		sshSecretName:     "ssh-dc1",
+		kubeconfigPath:    kubeconfigPath,
+	}
+
+	tests := []struct {
+		name       string
+		nodeLabels []string
+		expectErr  string
+	}{
+		{
+			name:       "valid labels",
+			nodeLabels: []string{"env=prod", "tier=frontend"},
+		},
+		{
+			name:       "no labels",
+			nodeLabels: nil,
+		},
+		{
+			name:       "invalid format",
+			nodeLabels: []string{"nope"},
+			expectErr:  "invalid --node-label",
+		},
+		{
+			name:       "duplicate keys",
+			nodeLabels: []string{"env=prod", "env=staging"},
+			expectErr:  "duplicate label key",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			h := base
+			h.nodeLabels = tt.nodeLabels
+
+			err := h.validate()
+
+			if tt.expectErr != "" {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tt.expectErr)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// execute() test for --node-label
+// ---------------------------------------------------------------------------
+
+func TestSiteAddMachineHandler_Execute_WithNodeLabels(t *testing.T) {
+	t.Parallel()
+
+	sshKeyPath := writeTempSSHKey(t)
+
+	var appliedData []byte
+
+	kubeResourcesCli := fakeclient.NewClientBuilder().
+		WithInterceptorFuncs(interceptor.Funcs{
+			Apply: func(_ context.Context, _ client.WithWatch, obj runtime.ApplyConfiguration, _ ...client.ApplyOption) error {
+				// Marshal the applied object so we can inspect it.
+				appliedData, _ = yaml.Marshal(obj)
+				return nil
+			},
+		}).
+		Build()
+
+	kubeCli := fake.NewClientset(newBootstrapTokenSecret("dc1"))
+
+	h := &siteAddMachineHandler{
+		siteName:          "dc1",
+		host:              "10.0.0.5",
+		hostSSHUsername:   "admin",
+		hostSSHPrivateKey: sshKeyPath,
+		nodeLabels:        []string{"kubernetes.azure.com/managed=false", "env=prod"},
+		kubeCli:           kubeCli,
+		kubeResourcesCli:  kubeResourcesCli,
+		logger:            discardLogger(),
+	}
+
+	h.setDefaults()
+
+	err := h.executeAfterValidation(context.Background())
+	require.NoError(t, err)
+
+	// The applied YAML should contain the node labels.
+	require.Contains(t, string(appliedData), "kubernetes.azure.com/managed")
+	require.Contains(t, string(appliedData), "env: prod")
 }

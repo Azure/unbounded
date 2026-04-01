@@ -201,6 +201,11 @@ type KubernetesSpec struct {
 	// +optional
 	NodeLabels map[string]string `json:"nodeLabels,omitempty"`
 
+	// RegisterWithTaints are taints passed to kubelet's --register-with-taints flag.
+	// Each entry uses the standard Kubernetes taint format: key=value:Effect.
+	// +optional
+	RegisterWithTaints []string `json:"registerWithTaints,omitempty"`
+
 	// BootstrapTokenRef references a bootstrap token Secret in
 	// kube-system. The secret must be of type
 	// bootstrap.kubernetes.io/token with the well-known keys

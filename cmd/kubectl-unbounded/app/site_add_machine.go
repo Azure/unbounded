@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -27,6 +28,10 @@ type siteAddMachineHandler struct {
 	// name is the name of the machine. If empty, it is derived from the host.
 	// The site name is always prefixed: ${site}-${name}.
 	name string
+
+	// nodeLabels are key=value pairs passed to kubelet's --node-labels flag.
+	// Each entry must be in the form "key=value".
+	nodeLabels []string
 
 	// host is the IP or DNS name and optionally port. If the port is omitted, it defaults to 22.
 	host string
@@ -164,6 +169,12 @@ func (h *siteAddMachineHandler) executeAfterValidation(ctx context.Context) erro
 		return fmt.Errorf("resolving Kubernetes version: %w", err)
 	}
 
+	// Parse node labels from the repeated --node-label flags.
+	nodeLabels, err := parseNodeLabels(h.nodeLabels)
+	if err != nil {
+		return fmt.Errorf("parsing node labels: %w", err)
+	}
+
 	// Build the Machine resource.
 	m := v1alpha3.Machine{
 		TypeMeta: metav1.TypeMeta{
@@ -184,7 +195,8 @@ func (h *siteAddMachineHandler) executeAfterValidation(ctx context.Context) erro
 				},
 			},
 			Kubernetes: &v1alpha3.KubernetesSpec{
-				Version: sv.GitVersion,
+				Version:    sv.GitVersion,
+				NodeLabels: nodeLabels,
 				BootstrapTokenRef: v1alpha3.LocalObjectReference{
 					Name: fmt.Sprintf("bootstrap-token-%s", bootstrapToken.ID),
 				},
@@ -299,7 +311,37 @@ func (h *siteAddMachineHandler) validate() error {
 		return fmt.Errorf("kubeconfig %q is not readable", h.kubeconfigPath)
 	}
 
+	if _, err := parseNodeLabels(h.nodeLabels); err != nil {
+		return fmt.Errorf("invalid --node-label: %w", err)
+	}
+
 	return nil
+}
+
+// parseNodeLabels converts a slice of "key=value" strings into a map.
+// It returns an error if any entry is missing an "=" separator or if
+// duplicate keys are detected.
+func parseNodeLabels(entries []string) (map[string]string, error) {
+	if len(entries) == 0 {
+		return nil, nil
+	}
+
+	labels := make(map[string]string, len(entries))
+
+	for _, entry := range entries {
+		k, v, ok := strings.Cut(entry, "=")
+		if !ok {
+			return nil, fmt.Errorf("%q is not a valid key=value pair", entry)
+		}
+
+		if _, exists := labels[k]; exists {
+			return nil, fmt.Errorf("duplicate label key %q", k)
+		}
+
+		labels[k] = v
+	}
+
+	return labels, nil
 }
 
 func siteAddMachineCommand() *cobra.Command {
@@ -324,6 +366,7 @@ func siteAddMachineCommand() *cobra.Command {
 	cmd.Flags().StringVar(&handler.bastionSSHUsername, "bastion-ssh-username", "", "SSH username for the bastion (defaults to --ssh-username)")
 	cmd.Flags().StringVar(&handler.bastionSSHPrivateKey, "bastion-ssh-private-key", "", "Path to SSH private key file for the bastion (defaults to --ssh-private-key)")
 	cmd.Flags().StringVar(&handler.kubeconfigPath, "kubeconfig", "", "Path to kubeconfig file")
+	cmd.Flags().StringArrayVar(&handler.nodeLabels, "node-label", nil, "Label in key=value format to pass to kubelet (can be repeated)")
 
 	if err := cmd.MarkFlagRequired("site"); err != nil {
 		panic(err)

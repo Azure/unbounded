@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -23,6 +24,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	unboundedv1alpha3 "github.com/project-unbounded/unbounded-kube/api/v1alpha3"
+	"github.com/project-unbounded/unbounded-kube/internal/provision"
 )
 
 // sshTestServer is an in-process SSH server used for integration tests.
@@ -595,19 +597,21 @@ func TestProvisionMachine_EndToEnd(t *testing.T) {
 	require.NoError(t, err)
 
 	commands := srv.getExecutedCommands()
-	require.GreaterOrEqual(t, len(commands), 3, "expected at least copy + exec + cleanup commands")
+	require.GreaterOrEqual(t, len(commands), 4, "expected at least copy + config upload + exec + cleanup commands")
 
 	// Find commands by their characteristics rather than hardcoded indices,
 	// so the test doesn't break if intermediate steps are added.
-	var copyCmd, execCmd, cleanupCmd *sshExecutedCommand
+	var copyCmd, configCmd, execCmd, cleanupCmd *sshExecutedCommand
 
 	for i := range commands {
 		switch {
 		case strings.Contains(commands[i].command, "cat >") && strings.Contains(commands[i].command, remoteScriptPath):
 			copyCmd = &commands[i]
+		case strings.Contains(commands[i].command, "cat >") && strings.Contains(commands[i].command, remoteConfigPath):
+			configCmd = &commands[i]
 		case strings.Contains(commands[i].command, "sudo -E bash") && strings.Contains(commands[i].command, remoteScriptPath):
 			execCmd = &commands[i]
-		case strings.Contains(commands[i].command, "rm -f") && strings.Contains(commands[i].command, remoteScriptPath):
+		case strings.Contains(commands[i].command, "rm -f"):
 			cleanupCmd = &commands[i]
 		}
 	}
@@ -618,21 +622,28 @@ func TestProvisionMachine_EndToEnd(t *testing.T) {
 	require.NotEmpty(t, copyCmd.stdin, "script content should have been piped via stdin")
 	require.Contains(t, string(copyCmd.stdin), "#!/bin/bash", "script should start with a shebang")
 
-	// Command: script execution with env vars.
-	require.NotNil(t, execCmd, "expected a script execution command")
-	require.Contains(t, execCmd.command, "API_SERVER")
-	require.Contains(t, execCmd.command, "api.example.com:443")
-	require.Contains(t, execCmd.command, "BOOTSTRAP_TOKEN")
-	require.Contains(t, execCmd.command, "abc123.secret")
-	require.Contains(t, execCmd.command, "CA_CERT_BASE64")
-	require.Contains(t, execCmd.command, "KUBE_VERSION")
-	require.Contains(t, execCmd.command, "v1.34.0") // Machine spec overrides cluster version.
-	require.Contains(t, execCmd.command, "CLUSTER_DNS")
-	require.Contains(t, execCmd.command, "CLUSTER_RG")
-	require.Contains(t, execCmd.command, "MACHINA_MACHINE_NAME")
+	// Command: config upload — verify JSON config was sent.
+	require.NotNil(t, configCmd, "expected a config upload command")
 
-	// Command: cleanup.
+	var agentConfig provision.AgentConfig
+	require.NoError(t, json.Unmarshal(configCmd.stdin, &agentConfig), "config stdin should be valid JSON")
+	require.Equal(t, "test-machine", agentConfig.MachineName)
+	require.Equal(t, "dGVzdC1jYQ==", agentConfig.Cluster.CaCertBase64)
+	require.Equal(t, "10.0.0.10", agentConfig.Cluster.ClusterDNS)
+	require.Equal(t, "v1.34.0", agentConfig.Cluster.Version) // Machine spec overrides cluster version.
+	require.Equal(t, "api.example.com:443", agentConfig.Kubelet.ApiServer)
+	require.Equal(t, "abc123.secret", agentConfig.Kubelet.BootstrapToken)
+	require.Equal(t, "test-machine", agentConfig.Kubelet.Labels[MachineNodeLabel])
+
+	// Command: script execution with UNBOUNDED_AGENT_CONFIG_FILE.
+	require.NotNil(t, execCmd, "expected a script execution command")
+	require.Contains(t, execCmd.command, "UNBOUNDED_AGENT_CONFIG_FILE")
+	require.Contains(t, execCmd.command, remoteConfigPath)
+
+	// Command: cleanup — should remove both script and config.
 	require.NotNil(t, cleanupCmd, "expected a cleanup command")
+	require.Contains(t, cleanupCmd.command, remoteScriptPath)
+	require.Contains(t, cleanupCmd.command, remoteConfigPath)
 }
 
 func TestProvisionMachine_CleanupAlwaysRuns(t *testing.T) {
@@ -671,21 +682,21 @@ func TestProvisionMachine_CleanupAlwaysRuns(t *testing.T) {
 	require.NoError(t, err)
 
 	commands := srv.getExecutedCommands()
-	require.GreaterOrEqual(t, len(commands), 3, "copy + exec + cleanup should all run")
+	require.GreaterOrEqual(t, len(commands), 4, "copy + config upload + exec + cleanup should all run")
 
 	hasCleanup := false
 
 	for _, cmd := range commands {
-		if strings.Contains(cmd.command, "rm -f") && strings.Contains(cmd.command, remoteScriptPath) {
+		if strings.Contains(cmd.command, "rm -f") && strings.Contains(cmd.command, remoteScriptPath) && strings.Contains(cmd.command, remoteConfigPath) {
 			hasCleanup = true
 			break
 		}
 	}
 
-	require.True(t, hasCleanup, "expected a cleanup command with rm -f")
+	require.True(t, hasCleanup, "expected a cleanup command with rm -f for both script and config")
 }
 
-func TestProvisionMachine_EnvVarsInCommand(t *testing.T) {
+func TestProvisionMachine_ConfigFile(t *testing.T) {
 	t.Parallel()
 
 	srv := newSSHTestServer(t)
@@ -727,17 +738,29 @@ func TestProvisionMachine_EnvVarsInCommand(t *testing.T) {
 	require.NoError(t, err)
 
 	commands := srv.getExecutedCommands()
-	require.GreaterOrEqual(t, len(commands), 2)
 
-	execCmd := commands[1].command
+	// Find the config upload command.
+	var configCmd *sshExecutedCommand
 
-	require.Contains(t, execCmd, `API_SERVER="k8s.example.com:6443"`)
-	require.Contains(t, execCmd, `BOOTSTRAP_TOKEN="tok123.secret456"`)
-	require.Contains(t, execCmd, `CA_CERT_BASE64="Y2VydC1kYXRh"`)
-	require.Contains(t, execCmd, `KUBE_VERSION="v1.33.1"`)
-	require.Contains(t, execCmd, `CLUSTER_DNS="10.96.0.10"`)
-	require.Contains(t, execCmd, `CLUSTER_RG="my-resource-group"`)
-	require.Contains(t, execCmd, `MACHINA_MACHINE_NAME="my-special-machine"`)
+	for i := range commands {
+		if strings.Contains(commands[i].command, "cat >") && strings.Contains(commands[i].command, remoteConfigPath) {
+			configCmd = &commands[i]
+			break
+		}
+	}
+
+	require.NotNil(t, configCmd, "expected a config upload command")
+
+	var agentConfig provision.AgentConfig
+	require.NoError(t, json.Unmarshal(configCmd.stdin, &agentConfig))
+
+	require.Equal(t, "my-special-machine", agentConfig.MachineName)
+	require.Equal(t, "Y2VydC1kYXRh", agentConfig.Cluster.CaCertBase64)
+	require.Equal(t, "10.96.0.10", agentConfig.Cluster.ClusterDNS)
+	require.Equal(t, "v1.33.1", agentConfig.Cluster.Version)
+	require.Equal(t, "k8s.example.com:6443", agentConfig.Kubelet.ApiServer)
+	require.Equal(t, "tok123.secret456", agentConfig.Kubelet.BootstrapToken)
+	require.Equal(t, "my-special-machine", agentConfig.Kubelet.Labels[MachineNodeLabel])
 }
 
 func TestProvisionMachine_NilClusterInfo(t *testing.T) {
@@ -776,12 +799,27 @@ func TestProvisionMachine_NilClusterInfo(t *testing.T) {
 	require.NoError(t, err)
 
 	commands := srv.getExecutedCommands()
-	require.GreaterOrEqual(t, len(commands), 2)
 
-	execCmd := commands[1].command
-	require.Contains(t, execCmd, `API_SERVER=""`)
-	require.Contains(t, execCmd, `BOOTSTRAP_TOKEN=""`)
-	require.Contains(t, execCmd, `KUBE_VERSION=""`)
+	// Find the config upload command.
+	var configCmd *sshExecutedCommand
+
+	for i := range commands {
+		if strings.Contains(commands[i].command, "cat >") && strings.Contains(commands[i].command, remoteConfigPath) {
+			configCmd = &commands[i]
+			break
+		}
+	}
+
+	require.NotNil(t, configCmd, "expected a config upload command")
+
+	var agentConfig provision.AgentConfig
+	require.NoError(t, json.Unmarshal(configCmd.stdin, &agentConfig))
+
+	require.Equal(t, "test-machine", agentConfig.MachineName)
+	require.Equal(t, "", agentConfig.Cluster.ClusterDNS)
+	require.Equal(t, "", agentConfig.Cluster.Version)
+	require.Equal(t, "", agentConfig.Kubelet.ApiServer)
+	require.Equal(t, "", agentConfig.Kubelet.BootstrapToken)
 }
 
 func TestProvisionMachine_KubeVersionPrefixing(t *testing.T) {
@@ -823,8 +861,151 @@ func TestProvisionMachine_KubeVersionPrefixing(t *testing.T) {
 	require.NoError(t, err)
 
 	commands := srv.getExecutedCommands()
-	execCmd := commands[1].command
-	require.Contains(t, execCmd, `KUBE_VERSION="v1.34.0"`)
+
+	// Find the config upload command.
+	var configCmd *sshExecutedCommand
+
+	for i := range commands {
+		if strings.Contains(commands[i].command, "cat >") && strings.Contains(commands[i].command, remoteConfigPath) {
+			configCmd = &commands[i]
+			break
+		}
+	}
+
+	require.NotNil(t, configCmd, "expected a config upload command")
+
+	var agentConfig provision.AgentConfig
+	require.NoError(t, json.Unmarshal(configCmd.stdin, &agentConfig))
+
+	require.Equal(t, "v1.34.0", agentConfig.Cluster.Version)
+}
+
+func TestProvisionMachine_LabelMerge(t *testing.T) {
+	t.Parallel()
+
+	srv := newSSHTestServer(t)
+
+	_, signer := generateTestRSAKey(t)
+
+	s := runtime.NewScheme()
+	require.NoError(t, unboundedv1alpha3.AddToScheme(s))
+	require.NoError(t, corev1.AddToScheme(s))
+
+	machine := &unboundedv1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "label-test-machine"},
+		Spec: unboundedv1alpha3.MachineSpec{
+			SSH: &unboundedv1alpha3.SSHSpec{
+				Host:          fmt.Sprintf("%s:%d", srv.host, srv.port),
+				Username:      "testuser",
+				PrivateKeyRef: unboundedv1alpha3.SecretKeySelector{Name: "ssh-key-secret"},
+			},
+			Kubernetes: &unboundedv1alpha3.KubernetesSpec{
+				BootstrapTokenRef: unboundedv1alpha3.LocalObjectReference{Name: "bt"},
+				NodeLabels: map[string]string{
+					"env":            "production",
+					"team":           "platform",
+					MachineNodeLabel: "user-override", // User label wins over controller-injected.
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(machine).Build()
+
+	reconciler := &MachineReconciler{
+		Client:      fakeClient,
+		Scheme:      s,
+		ClusterInfo: &ClusterInfo{},
+	}
+
+	sshConfig := sshTestClientConfig(signer)
+
+	err := reconciler.provisionMachine(context.Background(), machine, sshConfig, "")
+	require.NoError(t, err)
+
+	commands := srv.getExecutedCommands()
+
+	var configCmd *sshExecutedCommand
+
+	for i := range commands {
+		if strings.Contains(commands[i].command, "cat >") && strings.Contains(commands[i].command, remoteConfigPath) {
+			configCmd = &commands[i]
+			break
+		}
+	}
+
+	require.NotNil(t, configCmd, "expected a config upload command")
+
+	var agentConfig provision.AgentConfig
+	require.NoError(t, json.Unmarshal(configCmd.stdin, &agentConfig))
+
+	// User-defined labels should be present.
+	require.Equal(t, "production", agentConfig.Kubelet.Labels["env"])
+	require.Equal(t, "platform", agentConfig.Kubelet.Labels["team"])
+
+	// User label overrides controller-injected label on conflict.
+	require.Equal(t, "user-override", agentConfig.Kubelet.Labels[MachineNodeLabel])
+}
+
+func TestProvisionMachine_Taints(t *testing.T) {
+	t.Parallel()
+
+	srv := newSSHTestServer(t)
+
+	_, signer := generateTestRSAKey(t)
+
+	s := runtime.NewScheme()
+	require.NoError(t, unboundedv1alpha3.AddToScheme(s))
+	require.NoError(t, corev1.AddToScheme(s))
+
+	machine := &unboundedv1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "taint-test-machine"},
+		Spec: unboundedv1alpha3.MachineSpec{
+			SSH: &unboundedv1alpha3.SSHSpec{
+				Host:          fmt.Sprintf("%s:%d", srv.host, srv.port),
+				Username:      "testuser",
+				PrivateKeyRef: unboundedv1alpha3.SecretKeySelector{Name: "ssh-key-secret"},
+			},
+			Kubernetes: &unboundedv1alpha3.KubernetesSpec{
+				BootstrapTokenRef: unboundedv1alpha3.LocalObjectReference{Name: "bt"},
+				RegisterWithTaints: []string{
+					"dedicated=gpu:NoSchedule",
+					"special=true:NoExecute",
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(machine).Build()
+
+	reconciler := &MachineReconciler{
+		Client:      fakeClient,
+		Scheme:      s,
+		ClusterInfo: &ClusterInfo{},
+	}
+
+	sshConfig := sshTestClientConfig(signer)
+
+	err := reconciler.provisionMachine(context.Background(), machine, sshConfig, "")
+	require.NoError(t, err)
+
+	commands := srv.getExecutedCommands()
+
+	var configCmd *sshExecutedCommand
+
+	for i := range commands {
+		if strings.Contains(commands[i].command, "cat >") && strings.Contains(commands[i].command, remoteConfigPath) {
+			configCmd = &commands[i]
+			break
+		}
+	}
+
+	require.NotNil(t, configCmd, "expected a config upload command")
+
+	var agentConfig provision.AgentConfig
+	require.NoError(t, json.Unmarshal(configCmd.stdin, &agentConfig))
+
+	require.Equal(t, []string{"dedicated=gpu:NoSchedule", "special=true:NoExecute"}, agentConfig.Kubelet.RegisterWithTaints)
 }
 
 // ---------------------------------------------------------------------------

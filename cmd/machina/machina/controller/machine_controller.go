@@ -3,6 +3,7 @@ package controller
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"strings"
@@ -53,6 +54,10 @@ const (
 	// remoteScriptPath is the path where the agent install script is
 	// copied to on the remote machine.
 	remoteScriptPath = "/tmp/machina-agent-install.sh"
+
+	// remoteConfigPath is the path where the agent JSON config file is
+	// uploaded on the remote machine.
+	remoteConfigPath = "/tmp/unbounded-agent.json"
 
 	// SecretNamespaceMachinaSystem is the namespace where SSH key secrets
 	// must reside. Machine is cluster-scoped, so we use a fixed namespace
@@ -523,23 +528,23 @@ func (r *MachineReconciler) provisionMachine(
 
 	copySession.Close() //nolint:errcheck // Session is done; close error is not actionable.
 
-	// Step 2: Always clean up the script when we are done, regardless of
-	// whether execution succeeds or fails.
+	// Step 2: Always clean up the script and config when we are done,
+	// regardless of whether execution succeeds or fails.
 	defer func() {
 		cleanupSession, cleanupErr := sshClient.NewSession()
 		if cleanupErr != nil {
-			logger.Error(cleanupErr, "Failed to create SSH session for script cleanup", "machine", machine.Name)
+			logger.Error(cleanupErr, "Failed to create SSH session for cleanup", "machine", machine.Name)
 			return
 		}
 
 		defer cleanupSession.Close() //nolint:errcheck // Best-effort close of cleanup session.
 
-		if cleanupErr = cleanupSession.Run(fmt.Sprintf("rm -f %s", remoteScriptPath)); cleanupErr != nil {
-			logger.Error(cleanupErr, "Failed to clean up agent install script", "machine", machine.Name)
+		if cleanupErr = cleanupSession.Run(fmt.Sprintf("rm -f %s %s", remoteScriptPath, remoteConfigPath)); cleanupErr != nil {
+			logger.Error(cleanupErr, "Failed to clean up remote files", "machine", machine.Name)
 		}
 	}()
 
-	// Step 3: Build environment variables and execute the script.
+	// Step 3: Build the agent config and upload it as JSON.
 	k8sVersion := ""
 	if r.ClusterInfo != nil {
 		k8sVersion = r.ClusterInfo.KubeVersion
@@ -556,20 +561,67 @@ func (r *MachineReconciler) provisionMachine(
 	apiServer := ""
 	caCertBase64 := ""
 	clusterDNS := ""
-	clusterRG := ""
 
 	if r.ClusterInfo != nil {
 		apiServer = r.ClusterInfo.APIServer
 		caCertBase64 = r.ClusterInfo.CACertBase64
 		clusterDNS = r.ClusterInfo.ClusterDNS
-		clusterRG = r.ClusterInfo.ClusterRG
 	}
 
-	// Node labels are currently not propagated to the install script.
-	// The NODE_LABELS env var is intentionally left empty until the
-	// embedded AKS Flex Node install script supports consuming it.
-	nodeLabels := ""
+	// Controller-injected labels (low priority — user labels win).
+	labels := map[string]string{
+		MachineNodeLabel: machine.Name,
+	}
 
+	// Merge user-defined labels on top.
+	if machine.Spec.Kubernetes != nil {
+		for k, v := range machine.Spec.Kubernetes.NodeLabels {
+			labels[k] = v
+		}
+	}
+
+	var taints []string
+	if machine.Spec.Kubernetes != nil {
+		taints = machine.Spec.Kubernetes.RegisterWithTaints
+	}
+
+	agentConfig := provision.AgentConfig{
+		MachineName: machine.Name,
+		Cluster: provision.AgentClusterConfig{
+			CaCertBase64: caCertBase64,
+			ClusterDNS:   clusterDNS,
+			Version:      k8sVersion,
+		},
+		Kubelet: provision.AgentKubeletConfig{
+			ApiServer:          apiServer,
+			BootstrapToken:     bootstrapToken,
+			Labels:             labels,
+			RegisterWithTaints: taints,
+		},
+	}
+
+	configJSON, err := json.Marshal(agentConfig)
+	if err != nil {
+		return fmt.Errorf("marshal agent config: %w", err)
+	}
+
+	logger.Info("Uploading agent config to remote machine", "machine", machine.Name)
+
+	configSession, err := sshClient.NewSession()
+	if err != nil {
+		return fmt.Errorf("create SSH session for config upload: %w", err)
+	}
+
+	configSession.Stdin = bytes.NewReader(configJSON)
+
+	if runErr := configSession.Run(fmt.Sprintf("cat > %s", remoteConfigPath)); runErr != nil {
+		configSession.Close() //nolint:errcheck // Best-effort close after failed run.
+		return fmt.Errorf("upload agent config to remote: %w", runErr)
+	}
+
+	configSession.Close() //nolint:errcheck // Session is done; close error is not actionable.
+
+	// Step 4: Execute the installation script with the config file path.
 	logger.Info("Executing agent install script", "machine", machine.Name)
 
 	execSession, err := sshClient.NewSession()
@@ -585,23 +637,8 @@ func (r *MachineReconciler) provisionMachine(
 	execSession.Stderr = &stderr
 
 	cmd := fmt.Sprintf(
-		`export API_SERVER=%q; `+
-			`export BOOTSTRAP_TOKEN=%q; `+
-			`export CA_CERT_BASE64=%q; `+
-			`export KUBE_VERSION=%q; `+
-			`export CLUSTER_DNS=%q; `+
-			`export CLUSTER_RG=%q; `+
-			`export MACHINA_MACHINE_NAME=%q; `+
-			`export NODE_LABELS=%q; `+
-			`sudo -E bash %s`,
-		apiServer,
-		bootstrapToken,
-		caCertBase64,
-		k8sVersion,
-		clusterDNS,
-		clusterRG,
-		machine.Name,
-		nodeLabels,
+		`UNBOUNDED_AGENT_CONFIG_FILE=%q sudo -E bash %s`,
+		remoteConfigPath,
 		remoteScriptPath,
 	)
 
