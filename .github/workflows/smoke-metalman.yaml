@@ -1,0 +1,71 @@
+name: Smoke Metalman
+
+on:
+  pull_request:
+    paths:
+      - cmd/metalman/**
+      - internal/metalman/**
+      - deploy/metalman/**
+      - hack/smoke.py
+      - images/ubuntu24/**
+      - go.mod
+      - go.sum
+      - .github/workflows/smoke-metalman.yaml
+  push:
+    branches: [main]
+    paths:
+      - cmd/metalman/**
+      - internal/metalman/**
+      - api/v1alpha3/**
+      - deploy/metalman/**
+      - deploy/machina/crd/**
+      - deploy/machina/01-namespace.yaml
+      - hack/smoke.py
+      - images/ubuntu24/**
+      - go.mod
+      - go.sum
+      - .github/workflows/smoke-metalman.yaml
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            dnsmasq qemu-kvm libvirt-daemon-system libvirt-clients virtinst \
+            ovmf qemu-utils swtpm swtpm-tools \
+            python3-pip python3-yaml cpio iptables
+
+      - name: Start libvirt
+        run: sudo systemctl start libvirtd
+
+      - name: Install sushy-tools
+        run: sudo pip3 install --break-system-packages --ignore-installed sushy-tools
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: kind
+
+      - name: Run smoke test
+        run: |
+          sudo mkdir -p /root/.kube
+          sudo cp "${KUBECONFIG:-$HOME/.kube/config}" /root/.kube/config
+          sudo -E env "PATH=$PATH" python3 hack/smoke.py

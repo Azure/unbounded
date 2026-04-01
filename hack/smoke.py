@@ -398,7 +398,7 @@ def main() -> None:
 
     log("Applying deploy manifests (CRDs, namespace, RBAC)")
     kubectl(["apply", "--server-side", "--force-conflicts", "-f", str(REPO_ROOT / "deploy" / "machina" / "01-namespace.yaml")])
-    kubectl(["apply", "--server-side", "--force-conflicts", "-f", str(REPO_ROOT / "deploy" / "crd")])
+    kubectl(["apply", "--server-side", "--force-conflicts", "-f", str(REPO_ROOT / "deploy" / "machina" / "crd")])
     kubectl(["apply", "--server-side", "--force-conflicts", "-f", str(REPO_ROOT / "deploy" / "metalman" / "01-rbac.yaml")])
 
     log("Creating Kubernetes resources")
