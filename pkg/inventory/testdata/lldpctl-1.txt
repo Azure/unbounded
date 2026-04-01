@@ -1,0 +1,62 @@
+{
+  "lldp": {
+    "interface": [
+      {
+        "eno1": {
+          "via": "LLDP",
+          "rid": "1",
+          "age": "54 days, 21:18:44",
+          "chassis": {
+            "sample-upstream-switch": {
+              "id": {
+                "type": "mac",
+                "value": "e7:db:10:b3:ca:34"
+              },
+              "descr": "sample switch OS description",
+              "capability": {
+                "type": "Bridge",
+                "enabled": true
+              }
+            }
+          },
+          "port": {
+            "id": {
+              "type": "ifalias",
+              "value": "27"
+            },
+            "descr": "sample-port-desc-1",
+            "ttl": "120"
+          }
+        }
+      },
+      {
+        "eno2": {
+          "via": "LLDP",
+          "rid": "1",
+          "age": "54 days, 20:36:39",
+          "chassis": {
+            "sample-upstream-switch": {
+              "id": {
+                "type": "mac",
+                "value": "e7:db:10:b3:ca:34"
+              },
+              "descr": "sample switch OS description",
+              "capability": {
+                "type": "Bridge",
+                "enabled": true
+              }
+            }
+          },
+          "port": {
+            "id": {
+              "type": "ifalias",
+              "value": "28"
+            },
+            "descr": "sample-port-desc-2",
+            "ttl": "120"
+          }
+        }
+      }
+    ]
+  }
+}

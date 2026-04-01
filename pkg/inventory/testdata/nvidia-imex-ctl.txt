@@ -1,0 +1,50 @@
+Connectivity Table Legend:
+I - Invalid - Node wasn't reachable, no connection status available
+N - Never Connected
+R - Recovering - Connection was lost, but clean up has not yet been triggered.
+D - Disconnected - Connection was lost, and clean up has been triggreed.
+A - Authenticating - If GSSAPI enabled, client has initiated mutual authentication.
+!V! - Version mismatch, communication disabled.
+!M! - Node map mismatch, communication disabled.
+!A! - Authentication error, communication disabled.
+C - Connected - Ready for operation
+
+3/31/2026 16:57:17.721
+Nodes:
+Node #0   - 1.1.1.1            - READY                - Version: 580.95.09       - Hostname: node-01
+Node #1   - 1.1.1.2            - UNAVAILABLE          - Version:                 - Hostname: node-02
+Node #2   - 1.1.1.3            - READY                - Version: 580.95.09       - Hostname: node-03
+Node #3   - 1.1.1.4            - UNAVAILABLE          - Version:                 - Hostname: node-04
+Node #4   * 1.1.1.5 *          - READY                - Version: 580.95.09       - Hostname: node-05
+Node #5   - 1.1.1.6            - READY                - Version: 580.95.09       - Hostname: node-06
+Node #6   - 1.1.1.7            - READY                - Version: 580.95.09       - Hostname: node-07
+Node #7   - 1.1.1.8            - READY                - Version: 580.95.09       - Hostname: node-08
+Node #8   - 1.1.1.9            - READY                - Version: 580.95.09       - Hostname: node-09
+Node #9   - 1.1.1.10           - READY                - Version: 580.95.09       - Hostname: node-10
+Node #10  - 1.1.1.11           - READY                - Version: 580.95.09       - Hostname: node-11
+Node #11  - 1.1.1.12           - READY                - Version: 580.95.09       - Hostname: node-12
+Node #12  - 1.1.1.13           - READY                - Version: 580.95.09       - Hostname: node-13
+Node #13  - 1.1.1.14           - READY                - Version: 580.95.09       - Hostname: node-14
+Node #14  - 1.1.1.15           - READY                - Version: 580.95.09       - Hostname: node-15
+Node #15  - 1.1.1.16           - READY                - Version: 580.95.09       - Hostname: node-16
+Node #16  - 1.1.1.17           - READY                - Version: 580.95.09       - Hostname: node-17
+
+ Nodes From\To  0   1   2   3   4   5   6   7   8   9   10  11  12  13  14  15  16
+       0        C   N   C   N   C   C   C   C   C   C   C   C   C   C   C   C   C
+       1        I   I   I   I   I   I   I   I   I   I   I   I   I   I   I   I   I
+       2        C   N   C   N   C   C   C   C   C   C   C   C   C   C   C   C   C
+       3        I   I   I   I   I   I   I   I   I   I   I   I   I   I   I   I   I
+       4        C   N   C   N   C   C   C   C   C   C   C   C   C   C   C   C   C
+       5        C   N   C   N   C   C   C   C   C   C   C   C   C   C   C   C   C
+       6        C   N   C   N   C   C   C   C   C   C   C   C   C   C   C   C   C
+       7        C   N   C   N   C   C   C   C   C   C   C   C   C   C   C   C   C
+       8        C   N   C   N   C   C   C   C   C   C   C   C   C   C   C   C   C
+       9        C   N   C   N   C   C   C   C   C   C   C   C   C   C   C   C   C
+      10        C   N   C   N   C   C   C   C   C   C   C   C   C   C   C   C   C
+      11        C   N   C   N   C   C   C   C   C   C   C   C   C   C   C   C   C
+      12        C   N   C   N   C   C   C   C   C   C   C   C   C   C   C   C   C
+      13        C   N   C   N   C   C   C   C   C   C   C   C   C   C   C   C   C
+      14        C   N   C   N   C   C   C   C   C   C   C   C   C   C   C   C   C
+      15        C   N   C   N   C   C   C   C   C   C   C   C   C   C   C   C   C
+      16        C   N   C   N   C   C   C   C   C   C   C   C   C   C   C   C   C
+Domain State: DEGRADED

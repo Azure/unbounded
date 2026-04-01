@@ -1,0 +1,1574 @@
+{
+  "lldp": {
+    "interface": [
+      {
+        "be0p0": {
+          "via": "LLDP",
+          "rid": "23",
+          "age": "1 day, 00:01:29",
+          "chassis": {
+            "sample-upstream-switch-1": {
+              "id": {
+                "type": "mac",
+                "value": "e7:db:10:b3:ca:35"
+              },
+              "descr": "sample switch OS description",
+              "mgmt-ip": "d38:4c15:01e7:8568:a77b:8c34:53eb:568f",
+              "mgmt-iface": "2",
+              "capability": [
+                {
+                  "type": "Bridge",
+                  "enabled": true
+                },
+                {
+                  "type": "Router",
+                  "enabled": true
+                },
+                {
+                  "type": "Wlan",
+                  "enabled": false
+                },
+                {
+                  "type": "Station",
+                  "enabled": false
+                }
+              ]
+            }
+          },
+          "port": {
+            "id": {
+              "type": "local",
+              "value": "etp7a"
+            },
+            "descr": "sample-port-desc-1",
+            "ttl": "120",
+            "auto-negotiation": {
+              "supported": false,
+              "enabled": false,
+              "current": "100GbaseCR4 - 100GBASE-R PCS/PMA over 4 lane shielded copper balanced cable"
+            }
+          }
+        }
+      },
+      {
+        "be0p1": {
+          "via": "LLDP",
+          "rid": "4",
+          "age": "1 day, 00:01:29",
+          "chassis": {
+            "sample-upstream-switch-2": {
+              "id": {
+                "type": "mac",
+                "value": "e7:db:10:b3:ca:36"
+              },
+              "descr": "sample switch OS description",
+              "mgmt-ip": "5d21:e784:26e0:450a:a917:702d:bd09:65f1",
+              "mgmt-iface": "2",
+              "capability": [
+                {
+                  "type": "Bridge",
+                  "enabled": false
+                },
+                {
+                  "type": "Router",
+                  "enabled": true
+                },
+                {
+                  "type": "Wlan",
+                  "enabled": false
+                },
+                {
+                  "type": "Station",
+                  "enabled": false
+                }
+              ]
+            }
+          },
+          "port": {
+            "id": {
+              "type": "local",
+              "value": "etp7a"
+            },
+            "descr": "sample-port-desc-2",
+            "ttl": "120",
+            "auto-negotiation": {
+              "supported": false,
+              "enabled": false,
+              "current": "100GbaseCR4 - 100GBASE-R PCS/PMA over 4 lane shielded copper balanced cable"
+            }
+          }
+        }
+      },
+      {
+        "be0p2": {
+          "via": "LLDP",
+          "rid": "10",
+          "age": "1 day, 00:01:29",
+          "chassis": {
+            "sample-upstream-switch-3": {
+              "id": {
+                "type": "local",
+                "value": "sample-upstream-switch-3"
+              },
+              "descr": "sample switch OS description",
+              "mgmt-ip": "4b83:6647:5f2c:b80b:2a1a:6eb2:fe10:395c",
+              "mgmt-iface": "2",
+              "capability": [
+                {
+                  "type": "Bridge",
+                  "enabled": false
+                },
+                {
+                  "type": "Router",
+                  "enabled": true
+                },
+                {
+                  "type": "Wlan",
+                  "enabled": false
+                },
+                {
+                  "type": "Station",
+                  "enabled": false
+                }
+              ]
+            }
+          },
+          "port": {
+            "id": {
+              "type": "local",
+              "value": "etp7a"
+            },
+            "descr": "sample-port-desc-3",
+            "ttl": "120",
+            "auto-negotiation": {
+              "supported": false,
+              "enabled": false,
+              "current": "100GbaseCR4 - 100GBASE-R PCS/PMA over 4 lane shielded copper balanced cable"
+            }
+          }
+        }
+      },
+      {
+        "be0p3": {
+          "via": "LLDP",
+          "rid": "16",
+          "age": "1 day, 00:01:29",
+          "chassis": {
+            "sample-upstream-switch-4": {
+              "id": {
+                "type": "mac",
+                "value": "e7:db:10:b3:ca:37"
+              },
+              "descr": "sample switch OS description",
+              "mgmt-ip": "3976:f353:aeb6:ca35:eef1:be1d:3cfb:1607",
+              "mgmt-iface": "2",
+              "capability": [
+                {
+                  "type": "Bridge",
+                  "enabled": true
+                },
+                {
+                  "type": "Router",
+                  "enabled": true
+                },
+                {
+                  "type": "Wlan",
+                  "enabled": false
+                },
+                {
+                  "type": "Station",
+                  "enabled": false
+                }
+              ]
+            }
+          },
+          "port": {
+            "id": {
+              "type": "local",
+              "value": "etp7a"
+            },
+            "descr": "sample-port-desc-4",
+            "ttl": "120",
+            "auto-negotiation": {
+              "supported": false,
+              "enabled": false,
+              "current": "100GbaseCR4 - 100GBASE-R PCS/PMA over 4 lane shielded copper balanced cable"
+            }
+          }
+        }
+      },
+      {
+        "be0p4": {
+          "via": "LLDP",
+          "rid": "29",
+          "age": "1 day, 00:01:28",
+          "chassis": {
+            "sample-upstream-switch-5": {
+              "id": {
+                "type": "mac",
+                "value": "e7:db:10:b3:ca:38"
+              },
+              "descr": "sample switch OS description",
+              "mgmt-ip": "49bc:5275:2a51:f531:ce8a:6d3a:f071:d749",
+              "mgmt-iface": "2",
+              "capability": [
+                {
+                  "type": "Bridge",
+                  "enabled": true
+                },
+                {
+                  "type": "Router",
+                  "enabled": true
+                },
+                {
+                  "type": "Wlan",
+                  "enabled": false
+                },
+                {
+                  "type": "Station",
+                  "enabled": false
+                }
+              ]
+            }
+          },
+          "port": {
+            "id": {
+              "type": "local",
+              "value": "etp7a"
+            },
+            "descr": "sample-port-desc-5",
+            "ttl": "120",
+            "auto-negotiation": {
+              "supported": false,
+              "enabled": false,
+              "current": "100GbaseCR4 - 100GBASE-R PCS/PMA over 4 lane shielded copper balanced cable"
+            }
+          }
+        }
+      },
+      {
+        "be0p5": {
+          "via": "LLDP",
+          "rid": "13",
+          "age": "1 day, 00:01:29",
+          "chassis": {
+            "sample-upstream-switch-6": {
+              "id": {
+                "type": "mac",
+                "value": "e7:db:10:b3:ca:39"
+              },
+              "descr": "sample switch OS description",
+              "mgmt-ip": "9ef3:4fb0:9a39:17ac:838c:28d5:aa74:0b4c",
+              "mgmt-iface": "2",
+              "capability": [
+                {
+                  "type": "Bridge",
+                  "enabled": true
+                },
+                {
+                  "type": "Router",
+                  "enabled": true
+                },
+                {
+                  "type": "Wlan",
+                  "enabled": false
+                },
+                {
+                  "type": "Station",
+                  "enabled": false
+                }
+              ]
+            }
+          },
+          "port": {
+            "id": {
+              "type": "local",
+              "value": "etp7a"
+            },
+            "descr": "sample-port-desc-6",
+            "ttl": "120",
+            "auto-negotiation": {
+              "supported": false,
+              "enabled": false,
+              "current": "100GbaseCR4 - 100GBASE-R PCS/PMA over 4 lane shielded copper balanced cable"
+            }
+          }
+        }
+      },
+      {
+        "be0p6": {
+          "via": "LLDP",
+          "rid": "19",
+          "age": "1 day, 00:01:29",
+          "chassis": {
+            "sample-upstream-switch-7": {
+              "id": {
+                "type": "mac",
+                "value": "e7:db:10:b3:ca:40"
+              },
+              "descr": "sample switch OS description",
+              "mgmt-ip": "81e8:d1d9:7374:1d5a:fd60:e81a:7efc:6eac",
+              "mgmt-iface": "2",
+              "capability": [
+                {
+                  "type": "Bridge",
+                  "enabled": true
+                },
+                {
+                  "type": "Router",
+                  "enabled": true
+                },
+                {
+                  "type": "Wlan",
+                  "enabled": false
+                },
+                {
+                  "type": "Station",
+                  "enabled": false
+                }
+              ]
+            }
+          },
+          "port": {
+            "id": {
+              "type": "local",
+              "value": "etp7a"
+            },
+            "descr": "sample-port-desc-7",
+            "ttl": "120",
+            "auto-negotiation": {
+              "supported": false,
+              "enabled": false,
+              "current": "100GbaseCR4 - 100GBASE-R PCS/PMA over 4 lane shielded copper balanced cable"
+            }
+          }
+        }
+      },
+      {
+        "be0p7": {
+          "via": "LLDP",
+          "rid": "12",
+          "age": "1 day, 00:01:29",
+          "chassis": {
+            "sample-upstream-switch-8": {
+              "id": {
+                "type": "mac",
+                "value": "e7:db:10:b3:ca:41"
+              },
+              "descr": "sample switch OS description",
+              "mgmt-ip": "f09a:7e68:d9b1:22e0:f34f:1dab:0b8a:4690",
+              "mgmt-iface": "2",
+              "capability": [
+                {
+                  "type": "Bridge",
+                  "enabled": true
+                },
+                {
+                  "type": "Router",
+                  "enabled": true
+                },
+                {
+                  "type": "Wlan",
+                  "enabled": false
+                },
+                {
+                  "type": "Station",
+                  "enabled": false
+                }
+              ]
+            }
+          },
+          "port": {
+            "id": {
+              "type": "local",
+              "value": "etp7a"
+            },
+            "descr": "sample-port-desc-8",
+            "ttl": "120",
+            "auto-negotiation": {
+              "supported": false,
+              "enabled": false,
+              "current": "100GbaseCR4 - 100GBASE-R PCS/PMA over 4 lane shielded copper balanced cable"
+            }
+          }
+        }
+      },
+      {
+        "be1p0": {
+          "via": "LLDP",
+          "rid": "7",
+          "age": "1 day, 00:01:29",
+          "chassis": {
+            "sample-upstream-switch-9": {
+              "id": {
+                "type": "mac",
+                "value": "e7:db:10:b3:ca:42"
+              },
+              "descr": "sample switch OS description",
+              "mgmt-ip": "dbef:d65c:e674:5579:179f:0d20:5b0d:9831",
+              "mgmt-iface": "2",
+              "capability": [
+                {
+                  "type": "Bridge",
+                  "enabled": true
+                },
+                {
+                  "type": "Router",
+                  "enabled": true
+                },
+                {
+                  "type": "Wlan",
+                  "enabled": false
+                },
+                {
+                  "type": "Station",
+                  "enabled": false
+                }
+              ]
+            }
+          },
+          "port": {
+            "id": {
+              "type": "local",
+              "value": "etp7a"
+            },
+            "descr": "sample-port-desc-9",
+            "ttl": "120",
+            "auto-negotiation": {
+              "supported": false,
+              "enabled": false,
+              "current": "100GbaseCR4 - 100GBASE-R PCS/PMA over 4 lane shielded copper balanced cable"
+            }
+          }
+        }
+      },
+      {
+        "be1p1": {
+          "via": "LLDP",
+          "rid": "21",
+          "age": "1 day, 00:01:29",
+          "chassis": {
+            "sample-upstream-switch-10": {
+              "id": {
+                "type": "mac",
+                "value": "e7:db:10:b3:ca:43"
+              },
+              "descr": "sample switch OS description",
+              "mgmt-ip": "4bcd:e7f4:928a:7cfa:e82c:b108:e741:6772",
+              "mgmt-iface": "2",
+              "capability": [
+                {
+                  "type": "Bridge",
+                  "enabled": true
+                },
+                {
+                  "type": "Router",
+                  "enabled": true
+                },
+                {
+                  "type": "Wlan",
+                  "enabled": false
+                },
+                {
+                  "type": "Station",
+                  "enabled": false
+                }
+              ]
+            }
+          },
+          "port": {
+            "id": {
+              "type": "local",
+              "value": "etp7a"
+            },
+            "descr": "sample-port-desc-10",
+            "ttl": "120",
+            "auto-negotiation": {
+              "supported": false,
+              "enabled": false,
+              "current": "100GbaseCR4 - 100GBASE-R PCS/PMA over 4 lane shielded copper balanced cable"
+            }
+          }
+        }
+      },
+      {
+        "be1p2": {
+          "via": "LLDP",
+          "rid": "22",
+          "age": "1 day, 00:01:29",
+          "chassis": {
+            "sample-upstream-switch-11": {
+              "id": {
+                "type": "mac",
+                "value": "e7:db:10:b3:ca:44"
+              },
+              "descr": "sample switch OS description",
+              "mgmt-ip": "d000:440b:ff36:1001:ab09:2a95:8520:c4e3",
+              "mgmt-iface": "2",
+              "capability": [
+                {
+                  "type": "Bridge",
+                  "enabled": true
+                },
+                {
+                  "type": "Router",
+                  "enabled": true
+                },
+                {
+                  "type": "Wlan",
+                  "enabled": false
+                },
+                {
+                  "type": "Station",
+                  "enabled": false
+                }
+              ]
+            }
+          },
+          "port": {
+            "id": {
+              "type": "local",
+              "value": "etp7a"
+            },
+            "descr": "sample-port-desc-11",
+            "ttl": "120",
+            "auto-negotiation": {
+              "supported": false,
+              "enabled": false,
+              "current": "100GbaseCR4 - 100GBASE-R PCS/PMA over 4 lane shielded copper balanced cable"
+            }
+          }
+        }
+      },
+      {
+        "be1p3": {
+          "via": "LLDP",
+          "rid": "15",
+          "age": "1 day, 00:01:29",
+          "chassis": {
+            "sample-upstream-switch-12": {
+              "id": {
+                "type": "mac",
+                "value": "e7:db:10:b3:ca:45"
+              },
+              "descr": "sample switch OS description",
+              "mgmt-ip": "ae9e:5538:513e:d3fb:abc1:cb89:9158:af7e",
+              "mgmt-iface": "2",
+              "capability": [
+                {
+                  "type": "Bridge",
+                  "enabled": true
+                },
+                {
+                  "type": "Router",
+                  "enabled": true
+                },
+                {
+                  "type": "Wlan",
+                  "enabled": false
+                },
+                {
+                  "type": "Station",
+                  "enabled": false
+                }
+              ]
+            }
+          },
+          "port": {
+            "id": {
+              "type": "local",
+              "value": "etp7a"
+            },
+            "descr": "sample-port-desc-12",
+            "ttl": "120",
+            "auto-negotiation": {
+              "supported": false,
+              "enabled": false,
+              "current": "100GbaseCR4 - 100GBASE-R PCS/PMA over 4 lane shielded copper balanced cable"
+            }
+          }
+        }
+      },
+      {
+        "be1p4": {
+          "via": "LLDP",
+          "rid": "24",
+          "age": "1 day, 00:01:29",
+          "chassis": {
+            "sample-upstream-switch-13": {
+              "id": {
+                "type": "mac",
+                "value": "e7:db:10:b3:ca:46"
+              },
+              "descr": "sample switch OS description",
+              "mgmt-ip": "a697:f440:408e:2178:2e62:a21c:1bd5:4f32",
+              "mgmt-iface": "2",
+              "capability": [
+                {
+                  "type": "Bridge",
+                  "enabled": true
+                },
+                {
+                  "type": "Router",
+                  "enabled": true
+                },
+                {
+                  "type": "Wlan",
+                  "enabled": false
+                },
+                {
+                  "type": "Station",
+                  "enabled": false
+                }
+              ]
+            }
+          },
+          "port": {
+            "id": {
+              "type": "local",
+              "value": "etp7a"
+            },
+            "descr": "sample-port-desc-13",
+            "ttl": "120",
+            "auto-negotiation": {
+              "supported": false,
+              "enabled": false,
+              "current": "100GbaseCR4 - 100GBASE-R PCS/PMA over 4 lane shielded copper balanced cable"
+            }
+          }
+        }
+      },
+      {
+        "be1p5": {
+          "via": "LLDP",
+          "rid": "5",
+          "age": "1 day, 00:01:29",
+          "chassis": {
+            "sample-upstream-switch-14": {
+              "id": {
+                "type": "mac",
+                "value": "e7:db:10:b3:ca:47"
+              },
+              "descr": "sample switch OS description",
+              "mgmt-ip": "efa4:3bb8:a03c:6bf6:a34e:99a9:7097:930a",
+              "mgmt-iface": "2",
+              "capability": [
+                {
+                  "type": "Bridge",
+                  "enabled": true
+                },
+                {
+                  "type": "Router",
+                  "enabled": true
+                },
+                {
+                  "type": "Wlan",
+                  "enabled": false
+                },
+                {
+                  "type": "Station",
+                  "enabled": false
+                }
+              ]
+            }
+          },
+          "port": {
+            "id": {
+              "type": "local",
+              "value": "etp7a"
+            },
+            "descr": "sample-port-desc-14",
+            "ttl": "120",
+            "auto-negotiation": {
+              "supported": false,
+              "enabled": false,
+              "current": "100GbaseCR4 - 100GBASE-R PCS/PMA over 4 lane shielded copper balanced cable"
+            }
+          }
+        }
+      },
+      {
+        "be1p6": {
+          "via": "LLDP",
+          "rid": "30",
+          "age": "1 day, 00:01:28",
+          "chassis": {
+            "sample-upstream-switch-15": {
+              "id": {
+                "type": "mac",
+                "value": "e7:db:10:b3:ca:48"
+              },
+              "descr": "sample switch OS description",
+              "mgmt-ip": "5f67:7c06:385b:7025:ad0e:f17f:753f:5639",
+              "mgmt-iface": "2",
+              "capability": [
+                {
+                  "type": "Bridge",
+                  "enabled": true
+                },
+                {
+                  "type": "Router",
+                  "enabled": true
+                },
+                {
+                  "type": "Wlan",
+                  "enabled": false
+                },
+                {
+                  "type": "Station",
+                  "enabled": false
+                }
+              ]
+            }
+          },
+          "port": {
+            "id": {
+              "type": "local",
+              "value": "etp7a"
+            },
+            "descr": "sample-port-desc-15",
+            "ttl": "120",
+            "auto-negotiation": {
+              "supported": false,
+              "enabled": false,
+              "current": "100GbaseCR4 - 100GBASE-R PCS/PMA over 4 lane shielded copper balanced cable"
+            }
+          }
+        }
+      },
+      {
+        "be1p7": {
+          "via": "LLDP",
+          "rid": "18",
+          "age": "1 day, 00:01:29",
+          "chassis": {
+            "sample-upstream-switch-16": {
+              "id": {
+                "type": "mac",
+                "value": "e7:db:10:b3:ca:49"
+              },
+              "descr": "sample switch OS description",
+              "mgmt-ip": "20c6:a26b:88d1:951c:7841:dddf:9d23:0f81",
+              "mgmt-iface": "2",
+              "capability": [
+                {
+                  "type": "Bridge",
+                  "enabled": true
+                },
+                {
+                  "type": "Router",
+                  "enabled": true
+                },
+                {
+                  "type": "Wlan",
+                  "enabled": false
+                },
+                {
+                  "type": "Station",
+                  "enabled": false
+                }
+              ]
+            }
+          },
+          "port": {
+            "id": {
+              "type": "local",
+              "value": "etp7a"
+            },
+            "descr": "sample-port-desc-16",
+            "ttl": "120",
+            "auto-negotiation": {
+              "supported": false,
+              "enabled": false,
+              "current": "100GbaseCR4 - 100GBASE-R PCS/PMA over 4 lane shielded copper balanced cable"
+            }
+          }
+        }
+      },
+      {
+        "be2p0": {
+          "via": "LLDP",
+          "rid": "28",
+          "age": "1 day, 00:01:28",
+          "chassis": {
+            "sample-upstream-switch-17": {
+              "id": {
+                "type": "mac",
+                "value": "e7:db:10:b3:ca:50"
+              },
+              "descr": "sample switch OS description",
+              "mgmt-ip": "ae30:8fb9:28b6:a781:4b16:bddc:3da4:9ff9",
+              "mgmt-iface": "2",
+              "capability": [
+                {
+                  "type": "Bridge",
+                  "enabled": true
+                },
+                {
+                  "type": "Router",
+                  "enabled": true
+                },
+                {
+                  "type": "Wlan",
+                  "enabled": false
+                },
+                {
+                  "type": "Station",
+                  "enabled": false
+                }
+              ]
+            }
+          },
+          "port": {
+            "id": {
+              "type": "local",
+              "value": "etp7a"
+            },
+            "descr": "sample-port-desc-17",
+            "ttl": "120",
+            "auto-negotiation": {
+              "supported": false,
+              "enabled": false,
+              "current": "100GbaseCR4 - 100GBASE-R PCS/PMA over 4 lane shielded copper balanced cable"
+            }
+          }
+        }
+      },
+      {
+        "be2p1": {
+          "via": "LLDP",
+          "rid": "27",
+          "age": "1 day, 00:01:28",
+          "chassis": {
+            "sample-upstream-switch-18": {
+              "id": {
+                "type": "mac",
+                "value": "e7:db:10:b3:ca:51"
+              },
+              "descr": "sample switch OS description",
+              "mgmt-ip": "57d8:67a8:0f9f:c833:2b28:df1d:e199:3c75",
+              "mgmt-iface": "2",
+              "capability": [
+                {
+                  "type": "Bridge",
+                  "enabled": true
+                },
+                {
+                  "type": "Router",
+                  "enabled": true
+                },
+                {
+                  "type": "Wlan",
+                  "enabled": false
+                },
+                {
+                  "type": "Station",
+                  "enabled": false
+                }
+              ]
+            }
+          },
+          "port": {
+            "id": {
+              "type": "local",
+              "value": "etp7a"
+            },
+            "descr": "sample-port-desc-18",
+            "ttl": "120",
+            "auto-negotiation": {
+              "supported": false,
+              "enabled": false,
+              "current": "100GbaseCR4 - 100GBASE-R PCS/PMA over 4 lane shielded copper balanced cable"
+            }
+          }
+        }
+      },
+      {
+        "be2p2": {
+          "via": "LLDP",
+          "rid": "32",
+          "age": "1 day, 00:01:28",
+          "chassis": {
+            "sample-upstream-switch-19": {
+              "id": {
+                "type": "mac",
+                "value": "e7:db:10:b3:ca:52"
+              },
+              "descr": "sample switch OS description",
+              "mgmt-ip": "88a1:7306:be1a:9fb4:6e96:b4da:ec4d:59e9",
+              "mgmt-iface": "2",
+              "capability": [
+                {
+                  "type": "Bridge",
+                  "enabled": true
+                },
+                {
+                  "type": "Router",
+                  "enabled": true
+                },
+                {
+                  "type": "Wlan",
+                  "enabled": false
+                },
+                {
+                  "type": "Station",
+                  "enabled": false
+                }
+              ]
+            }
+          },
+          "port": {
+            "id": {
+              "type": "local",
+              "value": "etp7a"
+            },
+            "descr": "sample-port-desc-19",
+            "ttl": "120",
+            "auto-negotiation": {
+              "supported": false,
+              "enabled": false,
+              "current": "100GbaseCR4 - 100GBASE-R PCS/PMA over 4 lane shielded copper balanced cable"
+            }
+          }
+        }
+      },
+      {
+        "be2p3": {
+          "via": "LLDP",
+          "rid": "17",
+          "age": "1 day, 00:01:29",
+          "chassis": {
+            "sample-upstream-switch-20": {
+              "id": {
+                "type": "mac",
+                "value": "e7:db:10:b3:ca:53"
+              },
+              "descr": "sample switch OS description",
+              "mgmt-ip": "d597:4c69:e19e:bf74:d7cf:0ef1:9861:ed93",
+              "mgmt-iface": "2",
+              "capability": [
+                {
+                  "type": "Bridge",
+                  "enabled": true
+                },
+                {
+                  "type": "Router",
+                  "enabled": true
+                },
+                {
+                  "type": "Wlan",
+                  "enabled": false
+                },
+                {
+                  "type": "Station",
+                  "enabled": false
+                }
+              ]
+            }
+          },
+          "port": {
+            "id": {
+              "type": "local",
+              "value": "etp7a"
+            },
+            "descr": "sample-port-desc-20",
+            "ttl": "120",
+            "auto-negotiation": {
+              "supported": false,
+              "enabled": false,
+              "current": "100GbaseCR4 - 100GBASE-R PCS/PMA over 4 lane shielded copper balanced cable"
+            }
+          }
+        }
+      },
+      {
+        "be2p4": {
+          "via": "LLDP",
+          "rid": "31",
+          "age": "1 day, 00:01:28",
+          "chassis": {
+            "sample-upstream-switch-21": {
+              "id": {
+                "type": "mac",
+                "value": "e7:db:10:b3:ca:54"
+              },
+              "descr": "sample switch OS description",
+              "mgmt-ip": "8f86:60a5:66ed:c490:6683:2c99:2a0c:1296",
+              "mgmt-iface": "2",
+              "capability": [
+                {
+                  "type": "Bridge",
+                  "enabled": true
+                },
+                {
+                  "type": "Router",
+                  "enabled": true
+                },
+                {
+                  "type": "Wlan",
+                  "enabled": false
+                },
+                {
+                  "type": "Station",
+                  "enabled": false
+                }
+              ]
+            }
+          },
+          "port": {
+            "id": {
+              "type": "local",
+              "value": "etp7a"
+            },
+            "descr": "sample-port-desc-21",
+            "ttl": "120",
+            "auto-negotiation": {
+              "supported": false,
+              "enabled": false,
+              "current": "100GbaseCR4 - 100GBASE-R PCS/PMA over 4 lane shielded copper balanced cable"
+            }
+          }
+        }
+      },
+      {
+        "be2p5": {
+          "via": "LLDP",
+          "rid": "14",
+          "age": "1 day, 00:01:29",
+          "chassis": {
+            "sample-upstream-switch-22": {
+              "id": {
+                "type": "mac",
+                "value": "e7:db:10:b3:ca:55"
+              },
+              "descr": "sample switch OS description",
+              "mgmt-ip": "ccae:5da8:1fc8:3382:e443:b84b:68f1:1849",
+              "mgmt-iface": "2",
+              "capability": [
+                {
+                  "type": "Bridge",
+                  "enabled": true
+                },
+                {
+                  "type": "Router",
+                  "enabled": true
+                },
+                {
+                  "type": "Wlan",
+                  "enabled": false
+                },
+                {
+                  "type": "Station",
+                  "enabled": false
+                }
+              ]
+            }
+          },
+          "port": {
+            "id": {
+              "type": "local",
+              "value": "etp7a"
+            },
+            "descr": "sample-port-desc-22",
+            "ttl": "120",
+            "auto-negotiation": {
+              "supported": false,
+              "enabled": false,
+              "current": "100GbaseCR4 - 100GBASE-R PCS/PMA over 4 lane shielded copper balanced cable"
+            }
+          }
+        }
+      },
+      {
+        "be2p6": {
+          "via": "LLDP",
+          "rid": "26",
+          "age": "1 day, 00:01:28",
+          "chassis": {
+            "sample-upstream-switch-23": {
+              "id": {
+                "type": "mac",
+                "value": "e7:db:10:b3:ca:56"
+              },
+              "descr": "sample switch OS description",
+              "mgmt-ip": "7736:ee6b:0859:1dec:cbe0:fa3c:7b32:03ec",
+              "mgmt-iface": "2",
+              "capability": [
+                {
+                  "type": "Bridge",
+                  "enabled": true
+                },
+                {
+                  "type": "Router",
+                  "enabled": true
+                },
+                {
+                  "type": "Wlan",
+                  "enabled": false
+                },
+                {
+                  "type": "Station",
+                  "enabled": false
+                }
+              ]
+            }
+          },
+          "port": {
+            "id": {
+              "type": "local",
+              "value": "etp7a"
+            },
+            "descr": "sample-port-desc-23",
+            "ttl": "120",
+            "auto-negotiation": {
+              "supported": false,
+              "enabled": false,
+              "current": "100GbaseCR4 - 100GBASE-R PCS/PMA over 4 lane shielded copper balanced cable"
+            }
+          }
+        }
+      },
+      {
+        "be2p7": {
+          "via": "LLDP",
+          "rid": "25",
+          "age": "1 day, 00:01:29",
+          "chassis": {
+            "sample-upstream-switch-24": {
+              "id": {
+                "type": "mac",
+                "value": "e7:db:10:b3:ca:57"
+              },
+              "descr": "sample switch OS description",
+              "mgmt-ip": "97fd:c004:8117:ac38:0c4d:77d6:f21c:2035",
+              "mgmt-iface": "2",
+              "capability": [
+                {
+                  "type": "Bridge",
+                  "enabled": true
+                },
+                {
+                  "type": "Router",
+                  "enabled": true
+                },
+                {
+                  "type": "Wlan",
+                  "enabled": false
+                },
+                {
+                  "type": "Station",
+                  "enabled": false
+                }
+              ]
+            }
+          },
+          "port": {
+            "id": {
+              "type": "local",
+              "value": "etp7a"
+            },
+            "descr": "sample-port-desc-24",
+            "ttl": "120",
+            "auto-negotiation": {
+              "supported": false,
+              "enabled": false,
+              "current": "100GbaseCR4 - 100GBASE-R PCS/PMA over 4 lane shielded copper balanced cable"
+            }
+          }
+        }
+      },
+      {
+        "be3p0": {
+          "via": "LLDP",
+          "rid": "8",
+          "age": "1 day, 00:01:29",
+          "chassis": {
+            "sample-upstream-switch-25": {
+              "id": {
+                "type": "mac",
+                "value": "e7:db:10:b3:ca58"
+              },
+              "descr": "sample switch OS description",
+              "mgmt-ip": "83c9:84ac:5fec:676c:2802:6098:8b05:aa81",
+              "mgmt-iface": "2",
+              "capability": [
+                {
+                  "type": "Bridge",
+                  "enabled": true
+                },
+                {
+                  "type": "Router",
+                  "enabled": true
+                },
+                {
+                  "type": "Wlan",
+                  "enabled": false
+                },
+                {
+                  "type": "Station",
+                  "enabled": false
+                }
+              ]
+            }
+          },
+          "port": {
+            "id": {
+              "type": "local",
+              "value": "etp7a"
+            },
+            "descr": "sample-port-desc-25",
+            "ttl": "120",
+            "auto-negotiation": {
+              "supported": false,
+              "enabled": false,
+              "current": "100GbaseCR4 - 100GBASE-R PCS/PMA over 4 lane shielded copper balanced cable"
+            }
+          }
+        }
+      },
+      {
+        "be3p1": {
+          "via": "LLDP",
+          "rid": "2",
+          "age": "1 day, 00:01:29",
+          "chassis": {
+            "sample-upstream-switch-26": {
+              "id": {
+                "type": "mac",
+                "value": "e7:db:10:b3:ca:59"
+              },
+              "descr": "sample switch OS description",
+              "mgmt-ip": "5c96:b4e2:d2a3:c182:d447:7721:f25d:4eb6",
+              "mgmt-iface": "2",
+              "capability": [
+                {
+                  "type": "Bridge",
+                  "enabled": true
+                },
+                {
+                  "type": "Router",
+                  "enabled": true
+                },
+                {
+                  "type": "Wlan",
+                  "enabled": false
+                },
+                {
+                  "type": "Station",
+                  "enabled": false
+                }
+              ]
+            }
+          },
+          "port": {
+            "id": {
+              "type": "local",
+              "value": "etp7a"
+            },
+            "descr": "sample-port-desc-26",
+            "ttl": "120",
+            "auto-negotiation": {
+              "supported": false,
+              "enabled": false,
+              "current": "100GbaseCR4 - 100GBASE-R PCS/PMA over 4 lane shielded copper balanced cable"
+            }
+          }
+        }
+      },
+      {
+        "be3p2": {
+          "via": "LLDP",
+          "rid": "9",
+          "age": "1 day, 00:01:29",
+          "chassis": {
+            "sample-upstream-switch-27": {
+              "id": {
+                "type": "mac",
+                "value": "e7:db:10:b3:ca:60"
+              },
+              "descr": "sample switch OS description",
+              "mgmt-ip": "e2ed:f767:1a2c:08d6:fff1:4b49:66bb:03b2",
+              "mgmt-iface": "2",
+              "capability": [
+                {
+                  "type": "Bridge",
+                  "enabled": true
+                },
+                {
+                  "type": "Router",
+                  "enabled": true
+                },
+                {
+                  "type": "Wlan",
+                  "enabled": false
+                },
+                {
+                  "type": "Station",
+                  "enabled": false
+                }
+              ]
+            }
+          },
+          "port": {
+            "id": {
+              "type": "local",
+              "value": "etp7a"
+            },
+            "descr": "sample-port-desc-27",
+            "ttl": "120",
+            "auto-negotiation": {
+              "supported": false,
+              "enabled": false,
+              "current": "100GbaseCR4 - 100GBASE-R PCS/PMA over 4 lane shielded copper balanced cable"
+            }
+          }
+        }
+      },
+      {
+        "be3p3": {
+          "via": "LLDP",
+          "rid": "6",
+          "age": "1 day, 00:01:29",
+          "chassis": {
+            "sample-upstream-switch-28": {
+              "id": {
+                "type": "mac",
+                "value": "e7:db:10:b3:ca:61"
+              },
+              "descr": "sample switch OS description",
+              "mgmt-ip": "1de5:942b:c56f:150d:b027:e392:161d:d5c7",
+              "mgmt-iface": "2",
+              "capability": [
+                {
+                  "type": "Bridge",
+                  "enabled": true
+                },
+                {
+                  "type": "Router",
+                  "enabled": true
+                },
+                {
+                  "type": "Wlan",
+                  "enabled": false
+                },
+                {
+                  "type": "Station",
+                  "enabled": false
+                }
+              ]
+            }
+          },
+          "port": {
+            "id": {
+              "type": "local",
+              "value": "etp7a"
+            },
+            "descr": "sample-port-desc-28",
+            "ttl": "120",
+            "auto-negotiation": {
+              "supported": false,
+              "enabled": false,
+              "current": "100GbaseCR4 - 100GBASE-R PCS/PMA over 4 lane shielded copper balanced cable"
+            }
+          }
+        }
+      },
+      {
+        "be3p4": {
+          "via": "LLDP",
+          "rid": "11",
+          "age": "1 day, 00:01:29",
+          "chassis": {
+            "sample-upstream-switch-29": {
+              "id": {
+                "type": "mac",
+                "value": "e7:db:10:b3:ca:62"
+              },
+              "descr": "sample switch OS description",
+              "mgmt-ip": "7e11:c8f4:d76b:ebf8:970e:c2a5:d34f:aee2",
+              "mgmt-iface": "2",
+              "capability": [
+                {
+                  "type": "Bridge",
+                  "enabled": true
+                },
+                {
+                  "type": "Router",
+                  "enabled": true
+                },
+                {
+                  "type": "Wlan",
+                  "enabled": false
+                },
+                {
+                  "type": "Station",
+                  "enabled": false
+                }
+              ]
+            }
+          },
+          "port": {
+            "id": {
+              "type": "local",
+              "value": "etp7a"
+            },
+            "descr": "sample-port-desc-29",
+            "ttl": "120",
+            "auto-negotiation": {
+              "supported": false,
+              "enabled": false,
+              "current": "100GbaseCR4 - 100GBASE-R PCS/PMA over 4 lane shielded copper balanced cable"
+            }
+          }
+        }
+      },
+      {
+        "be3p5": {
+          "via": "LLDP",
+          "rid": "20",
+          "age": "1 day, 00:01:29",
+          "chassis": {
+            "sample-upstream-switch-30": {
+              "id": {
+                "type": "mac",
+                "value": "e7:db:10:b3:ca:63"
+              },
+              "descr": "sample switch OS description",
+              "mgmt-ip": "df42:bf46:b4d1:e38f:4472:7280:ae42:feea",
+              "mgmt-iface": "2",
+              "capability": [
+                {
+                  "type": "Bridge",
+                  "enabled": true
+                },
+                {
+                  "type": "Router",
+                  "enabled": true
+                },
+                {
+                  "type": "Wlan",
+                  "enabled": false
+                },
+                {
+                  "type": "Station",
+                  "enabled": false
+                }
+              ]
+            }
+          },
+          "port": {
+            "id": {
+              "type": "local",
+              "value": "etp7a"
+            },
+            "descr": "sample-port-desc-30",
+            "ttl": "120",
+            "auto-negotiation": {
+              "supported": false,
+              "enabled": false,
+              "current": "100GbaseCR4 - 100GBASE-R PCS/PMA over 4 lane shielded copper balanced cable"
+            }
+          }
+        }
+      },
+      {
+        "be3p6": {
+          "via": "LLDP",
+          "rid": "1",
+          "age": "1 day, 00:01:29",
+          "chassis": {
+            "sample-upstream-switch-31": {
+              "id": {
+                "type": "mac",
+                "value": "e7:db:10:b3:ca:64"
+              },
+              "descr": "sample switch OS description",
+              "mgmt-ip": "64f9:6d35:2d99:e8b6:d6b3:756a:b0dd:258e",
+              "mgmt-iface": "2",
+              "capability": [
+                {
+                  "type": "Bridge",
+                  "enabled": true
+                },
+                {
+                  "type": "Router",
+                  "enabled": true
+                },
+                {
+                  "type": "Wlan",
+                  "enabled": false
+                },
+                {
+                  "type": "Station",
+                  "enabled": false
+                }
+              ]
+            }
+          },
+          "port": {
+            "id": {
+              "type": "local",
+              "value": "etp7a"
+            },
+            "descr": "sample-port-desc-31",
+            "ttl": "120",
+            "auto-negotiation": {
+              "supported": false,
+              "enabled": false,
+              "current": "100GbaseCR4 - 100GBASE-R PCS/PMA over 4 lane shielded copper balanced cable"
+            }
+          }
+        }
+      },
+      {
+        "be3p7": {
+          "via": "LLDP",
+          "rid": "3",
+          "age": "1 day, 00:01:29",
+          "chassis": {
+            "sample-upstream-switch-32": {
+              "id": {
+                "type": "mac",
+                "value": "e7:db:10:b3:ca:65"
+              },
+              "descr": "sample switch OS description",
+              "mgmt-ip": "52b:d312:008e:4b3a:20bd:11f5:37b4:f087",
+              "mgmt-iface": "2",
+              "capability": [
+                {
+                  "type": "Bridge",
+                  "enabled": true
+                },
+                {
+                  "type": "Router",
+                  "enabled": true
+                },
+                {
+                  "type": "Wlan",
+                  "enabled": false
+                },
+                {
+                  "type": "Station",
+                  "enabled": false
+                }
+              ]
+            }
+          },
+          "port": {
+            "id": {
+              "type": "local",
+              "value": "etp7a"
+            },
+            "descr": "sample-port-desc-32",
+            "ttl": "120",
+            "auto-negotiation": {
+              "supported": false,
+              "enabled": false,
+              "current": "100GbaseCR4 - 100GBASE-R PCS/PMA over 4 lane shielded copper balanced cable"
+            }
+          }
+        }
+      }
+    ]
+  }
+}
