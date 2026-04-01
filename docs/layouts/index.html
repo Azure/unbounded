@@ -1,0 +1,29 @@
+{{ define "main" }}
+<section class="hero">
+  <h1>{{ .Site.Title }}</h1>
+  <p class="tagline">{{ .Site.Params.description }}</p>
+  <div class="hero-links">
+    <a href="{{ "guides/getting-started/" | relURL }}" class="btn btn-primary">Get Started</a>
+    <a href="{{ "reference/" | relURL }}" class="btn btn-secondary">Reference</a>
+  </div>
+</section>
+
+<section class="overview">
+  <div class="grid">
+    <div class="card">
+      <h3>Cloud Bootstrapping (SSH)</h3>
+      <p>Join Linux machines to your cluster using SSH.</p>
+      <a href="{{ "guides/ssh" | relURL }}">Get Started</a>
+    </div>
+    <div class="card">
+	  <h3>Bare Metal (PXE)</h3>
+      <p>Netboot bare metal machines into your cluster.</p>
+      <a href="{{ "guides/pxe" | relURL }}">Get Started</a>
+    </div>
+    <div class="card">
+	  <h3>Built-in Networking</h3>
+      <p><a href="https://github.com/project-unbounded/unbounded-net">unbounded-net</a> provides a transparent and secure pod overlay network across datacenters and cloud providers.</p>
+    </div>
+  </div>
+</section>
+{{ end }}

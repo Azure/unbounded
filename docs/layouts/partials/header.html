@@ -1,0 +1,10 @@
+<header class="site-header">
+  <nav>
+    <a href="{{ "" | relURL }}" class="site-title">{{ .Site.Title }}</a>
+    <ul>
+      {{- range .Site.Menus.main }}
+      <li><a href="{{ .URL | relURL }}"{{ if hasPrefix $.RelPermalink .URL }} class="active"{{ end }}{{ if strings.HasPrefix .URL "http" }} target="_blank" rel="noopener"{{ end }}>{{ .Name }}</a></li>
+      {{- end }}
+    </ul>
+  </nav>
+</header>

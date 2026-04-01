@@ -1,0 +1,29 @@
+baseURL = "https://project-unbounded.github.io/unbounded-kube/"
+languageCode = "en-us"
+title = "Unbounded Kube"
+
+[markup]
+  [markup.highlight]
+    noClasses = false
+    style = "monokai"
+  [markup.goldmark]
+    [markup.goldmark.renderer]
+      unsafe = true
+
+[params]
+  description = "Run nodes across multiple cloud providers and bare-metal infrastructure to form a unified Kubernetes cluster, no matter where your infrastructure lives."
+  repo = "https://github.com/project-unbounded/unbounded-kube"
+
+[menu]
+  [[menu.main]]
+    name = "Guides"
+    url = "/guides/"
+    weight = 1
+  [[menu.main]]
+    name = "Reference"
+    url = "/reference/"
+    weight = 2
+  [[menu.main]]
+    name = "GitHub"
+    url = "https://github.com/project-unbounded/unbounded-kube"
+    weight = 3
