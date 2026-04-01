@@ -9,6 +9,9 @@ import (
 	"strings"
 )
 
+// memInfoPath is the standard location of the kernel memory info file.
+const memInfoPath = "/proc/meminfo"
+
 // MemoryInfo holds information about the system's memory.
 type MemoryInfo struct {
 	TotalBytes uint64
@@ -43,8 +46,13 @@ func memoryToRecord(m *MemoryInfo, hostID string) DeviceRecord {
 }
 
 // collectMemoryInfo gathers system memory information and returns it as device records.
-func collectMemoryInfo(ctx context.Context, hostID string, debug bool) ([]DeviceRecord, error) {
-	total, err := readTotalMemory()
+// memInfoPath overrides the default /proc/meminfo location when non-empty.
+func collectMemoryInfo(ctx context.Context, hostID string, debug bool, memInfoPath string) ([]DeviceRecord, error) {
+	if memInfoPath == "" {
+		return nil, fmt.Errorf("memInfoPath cannot be empty")
+	}
+
+	total, err := readTotalMemory(memInfoPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read total memory: %w", err)
 	}
@@ -63,9 +71,9 @@ func collectMemoryInfo(ctx context.Context, hostID string, debug bool) ([]Device
 	return []DeviceRecord{memoryToRecord(info, hostID)}, nil
 }
 
-// readTotalMemory reads total system memory from /proc/meminfo.
-func readTotalMemory() (uint64, error) {
-	data, err := os.ReadFile("/proc/meminfo")
+// readTotalMemory reads total system memory from the given meminfo path.
+func readTotalMemory(memInfoPath string) (uint64, error) {
+	data, err := os.ReadFile(memInfoPath)
 	if err != nil {
 		return 0, err
 	}

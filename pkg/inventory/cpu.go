@@ -7,7 +7,11 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"syscall"
 )
+
+// cpuInfoPath is the standard location of the kernel CPU info file.
+const cpuInfoPath = "/proc/cpuinfo"
 
 // CPUInfo holds information about the system's CPUs.
 type CPUInfo struct {
@@ -54,16 +58,21 @@ func cpuToRecord(c *CPUInfo, hostID string) DeviceRecord {
 	}
 }
 
-// collectCpuInfo reads /proc/cpuinfo and returns CPU device records.
-func collectCpuInfo(ctx context.Context, hostID string, debug bool) ([]DeviceRecord, error) {
-	f, err := os.Open("/proc/cpuinfo")
+// collectCpuInfo reads cpuinfo and returns CPU device records.
+// cpuInfoPath overrides the default /proc/cpuinfo location when non-empty.
+func collectCpuInfo(ctx context.Context, hostID string, debug bool, cpuInfoPath string) ([]DeviceRecord, error) {
+	if cpuInfoPath == "" {
+		return nil, fmt.Errorf("cpuInfoPath cannot be empty")
+	}
+
+	f, err := os.Open(cpuInfoPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open /proc/cpuinfo: %w", err)
+		return nil, fmt.Errorf("failed to open %s: %w", cpuInfoPath, err)
 	}
 
 	defer func() {
 		if cerr := f.Close(); cerr != nil {
-			fmt.Fprintf(os.Stderr, "warning: failed to close /proc/cpuinfo: %v\n", cerr)
+			fmt.Fprintf(os.Stderr, "warning: failed to close %s: %v\n", cpuInfoPath, cerr)
 		}
 	}()
 
@@ -150,7 +159,7 @@ func collectCpuInfo(ctx context.Context, hostID string, debug bool) ([]DeviceRec
 
 	// Use the first CPU's info as representative.
 	first := cpus[0]
-	arch := detectArchitecture(first.flags)
+	arch := detectArchitecture()
 
 	physCount := len(physicalIDs)
 	if physCount == 0 {
@@ -221,22 +230,26 @@ func computeThreadsPerCore(siblings, cores string) string {
 	return fmt.Sprintf("%d", s/c)
 }
 
-// detectArchitecture infers the instruction set from CPU flags.
-func detectArchitecture(flags []string) string {
-	if len(flags) == 0 {
+// detectArchitecture returns the machine architecture from the uname syscall
+// (e.g. "x86_64", "aarch64").
+func detectArchitecture() string {
+	var utsname syscall.Utsname
+	if err := syscall.Uname(&utsname); err != nil {
 		return "unknown"
 	}
 
-	flagSet := make(map[string]struct{}, len(flags))
-	for _, f := range flags {
-		flagSet[f] = struct{}{}
+	// Utsname.Machine is [65]int8; convert to string.
+	var buf []byte
+
+	for _, b := range utsname.Machine {
+		if b == 0 {
+			break
+		}
+
+		buf = append(buf, byte(b))
 	}
 
-	if _, ok := flagSet["lm"]; ok {
-		return "x86_64"
-	}
-
-	return "x86"
+	return string(buf)
 }
 
 // printCpuInfo prints the collected CPU information to stdout.

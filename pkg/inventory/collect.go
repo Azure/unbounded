@@ -28,14 +28,14 @@ func CollectInventory(ctx context.Context, debug bool) (*Inventory, error) {
 
 	records.DeviceRecords = append(records.DeviceRecords, bmcRecords...)
 
-	cpuRecords, err := collectCpuInfo(ctx, hostID, debug)
+	cpuRecords, err := collectCpuInfo(ctx, hostID, debug, cpuInfoPath)
 	if err != nil {
 		fmt.Printf("Error collecting CPU info: %v\n", err)
 	}
 
 	records.DeviceRecords = append(records.DeviceRecords, cpuRecords...)
 
-	memRecords, err := collectMemoryInfo(ctx, hostID, debug)
+	memRecords, err := collectMemoryInfo(ctx, hostID, debug, memInfoPath)
 	if err != nil {
 		fmt.Printf("Error collecting memory info: %v\n", err)
 	}
