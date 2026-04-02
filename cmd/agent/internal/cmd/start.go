@@ -16,6 +16,7 @@ import (
 	"github.com/project-unbounded/unbounded-kube/cmd/agent/internal/phases/host"
 	"github.com/project-unbounded/unbounded-kube/cmd/agent/internal/phases/nodestart"
 	"github.com/project-unbounded/unbounded-kube/cmd/agent/internal/phases/rootfs"
+	"github.com/project-unbounded/unbounded-kube/internal/provision"
 )
 
 func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
@@ -29,12 +30,17 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 
 			cmdCtx.Setup()
 
-			rootFSGoalState, err := resolveRootFSGoalState()
+			cfg, err := loadConfig()
 			if err != nil {
 				return err
 			}
 
-			nodeStartGoalState, err := resolveNodeStartGoalState()
+			rootFSGoalState, err := resolveRootFSGoalState(cfg)
+			if err != nil {
+				return err
+			}
+
+			nodeStartGoalState, err := resolveNodeStartGoalState(cfg)
 			if err != nil {
 				return err
 			}
@@ -73,21 +79,14 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 }
 
 // ref: cmd/machina/machina/controller/machine_controller.go
-func resolveRootFSGoalState() (*goalstates.RootFS, error) {
+func resolveRootFSGoalState(cfg *provision.AgentConfig) (*goalstates.RootFS, error) {
 	// TODO: investigate whether the rootfs name can be decoupled from the
 	// machine name. Using a fixed rootfs name (e.g. "node") would simplify
 	// tool invocations (machinectl, systemctl) and allow the nspawn unit to
 	// be templated once. For now we derive it from the machine name so the
 	// rootfs identity matches what the controller expects.
-	machineName, err := requiredEnv("MACHINA_MACHINE_NAME")
-	if err != nil {
-		return nil, err
-	}
-
-	kubeVersion, err := requiredEnv("KUBE_VERSION")
-	if err != nil {
-		return nil, err
-	}
+	machineName := cfg.MachineName
+	kubeVersion := cfg.Cluster.Version
 
 	kernel, err := hostKernel() //nolint:staticcheck // SA4023: non-Linux stub always errors; this is intentional.
 	if err != nil {             //nolint:staticcheck // SA4023: see above.
@@ -125,18 +124,15 @@ func resolveRootFSGoalState() (*goalstates.RootFS, error) {
 }
 
 // ref: cmd/machina/machina/controller/machine_controller.go
-func resolveNodeStartGoalState() (*goalstates.NodeStart, error) {
-	machineName, err := requiredEnv("MACHINA_MACHINE_NAME")
-	if err != nil {
-		return nil, err
-	}
+func resolveNodeStartGoalState(cfg *provision.AgentConfig) (*goalstates.NodeStart, error) {
+	machineName := cfg.MachineName
 
 	kernel, err := hostKernel() //nolint:staticcheck // SA4023: non-Linux stub always errors; this is intentional.
 	if err != nil {             //nolint:staticcheck // SA4023: see above.
 		return nil, err
 	}
 
-	kubelet, err := resolveKubeletGoalState()
+	kubelet, err := resolveKubeletGoalState(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -150,58 +146,25 @@ func resolveNodeStartGoalState() (*goalstates.NodeStart, error) {
 	}, nil
 }
 
-func resolveKubeletGoalState() (goalstates.Kubelet, error) {
+func resolveKubeletGoalState(cfg *provision.AgentConfig) (goalstates.Kubelet, error) {
 	var zero goalstates.Kubelet
 
-	apiServer, err := requiredEnv("API_SERVER")
+	caCert, err := base64.StdEncoding.DecodeString(cfg.Cluster.CaCertBase64)
 	if err != nil {
-		return zero, err
-	}
-	// FIXME: should we set the scheme in machina side?
-	if !strings.HasPrefix(apiServer, "https://") {
-		apiServer = "https://" + apiServer
+		return zero, fmt.Errorf("decode CaCertBase64: %w", err)
 	}
 
-	bootstrapToken, err := requiredEnv("BOOTSTRAP_TOKEN")
-	if err != nil {
-		return zero, err
-	}
-
-	caCertB64, err := requiredEnv("CA_CERT_BASE64")
-	if err != nil {
-		return zero, err
-	}
-
-	caCert, err := base64.StdEncoding.DecodeString(caCertB64)
-	if err != nil {
-		return zero, fmt.Errorf("decode CA_CERT_BASE64: %w", err)
-	}
-
-	clusterDNS, err := requiredEnv("CLUSTER_DNS")
-	if err != nil {
-		return zero, err
-	}
-
-	// NODE_LABELS is optional; parse "key1=val1,key2=val2" format.
-	labels := make(map[string]string)
-
-	if raw := strings.TrimSpace(os.Getenv("NODE_LABELS")); raw != "" {
-		for _, pair := range strings.Split(raw, ",") {
-			k, v, ok := strings.Cut(pair, "=")
-			if !ok {
-				return zero, fmt.Errorf("invalid NODE_LABELS entry %q", pair)
-			}
-
-			labels[k] = v
-		}
+	labels := cfg.Kubelet.Labels
+	if labels == nil {
+		labels = make(map[string]string)
 	}
 
 	return goalstates.Kubelet{
 		KubeletBinPath: filepath.Join("/"+goalstates.BinDir, "kubelet"),
-		BootstrapToken: bootstrapToken,
-		APIServer:      apiServer,
+		BootstrapToken: cfg.Kubelet.BootstrapToken,
+		APIServer:      cfg.Kubelet.ApiServer,
 		CACertData:     caCert,
-		ClusterDNS:     clusterDNS,
+		ClusterDNS:     cfg.Cluster.ClusterDNS,
 		NodeLabels:     labels,
 	}, nil
 }

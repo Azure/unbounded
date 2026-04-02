@@ -12,6 +12,7 @@ inventory.db
 hack/scratch
 tmp/
 .vm/
+unbounded-agent-config-dev.json
 
 # Kubernetes
 .kube/

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# aks-config.sh — Extract unbounded-agent configuration from an AKS kubeconfig.
+# aks-config.sh — Extract unbounded-agent configuration from an AKS kubeconfig
+# and write a JSON config file matching the AgentConfig schema.
 #
 # Usage:
 #   ./aks-config.sh <kubeconfig> [machine-name]
@@ -8,18 +9,17 @@
 #   kubeconfig    - path to the kubeconfig file for the target AKS cluster
 #   machine-name  - optional machine name (default: "agent-vm")
 #
-# The script prints shell variable assignments that can be eval'd or sourced:
-#   eval "$(./aks-config.sh /path/to/kubeconfig)"
+# The script writes unbounded-agent-config-dev.json at the repo root.
+# Inside the qemu VM the repo is mounted at /agent, so the agent can read it
+# directly:
 #
-# Outputs:
-#   MACHINA_MACHINE_NAME  - machine name
-#   KUBE_VERSION          - kubernetes version without the "v" prefix
-#   API_SERVER            - API server endpoint
-#   BOOTSTRAP_TOKEN       - bootstrap token (<token-id>.<token-secret>)
-#   CA_CERT_BASE64        - base64-encoded CA certificate
-#   CLUSTER_DNS           - cluster DNS service IP
-#   NODE_LABELS           - node labels including managed=false and cluster RG
+#   UNBOUNDED_AGENT_CONFIG_FILE=/agent/unbounded-agent-config-dev.json unbounded-agent start
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../../.." && pwd)"
+
+OUTPUT_FILE="${REPO_ROOT}/unbounded-agent-config-dev.json"
 
 usage() {
     echo "Usage: $0 <kubeconfig> [machine-name]" >&2
@@ -35,6 +35,7 @@ MACHINE_NAME="${2:-agent-vm}"
 
 [[ -f "$KUBECONFIG" ]] || die "kubeconfig not found: $KUBECONFIG"
 command -v kubectl >/dev/null 2>&1 || die "kubectl is required but not found in PATH"
+command -v jq >/dev/null 2>&1 || die "jq is required but not found in PATH"
 
 export KUBECONFIG
 
@@ -46,9 +47,8 @@ api_server=$(kubectl config view --raw -o jsonpath='{.clusters[0].cluster.server
 ca_cert_b64=$(kubectl config view --raw -o jsonpath='{.clusters[0].cluster.certificate-authority-data}')
 [[ -n "$ca_cert_b64" ]] || die "could not extract CA certificate from kubeconfig"
 
-# --- KUBE_VERSION (without "v" prefix) ---
-kube_version=$(kubectl version -o json 2>/dev/null \
-    | python3 -c "import json,sys; print(json.load(sys.stdin)['serverVersion']['gitVersion'].lstrip('v'))" 2>/dev/null) || true
+# --- KUBE_VERSION ---
+kube_version=$(kubectl version -o json 2>/dev/null | jq -r '.serverVersion.gitVersion') || true
 [[ -n "$kube_version" ]] || die "could not determine Kubernetes version from cluster"
 
 # --- CLUSTER_DNS ---
@@ -87,22 +87,36 @@ done <<< "$token_names"
 [[ -n "$token_id" && -n "$token_secret" ]] || die "no valid bootstrap token found in kube-system secrets"
 bootstrap_token="${token_id}.${token_secret}"
 
-# --- NODE RESOURCE GROUP (for NODE_LABELS) ---
-# Extract from existing node labels.
+# --- NODE RESOURCE GROUP (for Labels) ---
 cluster_rg=$(kubectl get nodes -o jsonpath='{.items[0].metadata.labels.kubernetes\.azure\.com/cluster}' 2>/dev/null) || true
 
-node_labels="kubernetes.azure.com/managed=false"
-if [[ -n "$cluster_rg" ]]; then
-    node_labels="${node_labels},kubernetes.azure.com/cluster=${cluster_rg}"
-fi
+# --- Build labels object ---
+labels=$(jq -n --arg rg "$cluster_rg" '
+    {"kubernetes.azure.com/managed": "false"}
+    | if $rg != "" then . + {"kubernetes.azure.com/cluster": $rg} else . end
+')
 
-# --- Output ---
-cat <<EOF
-export MACHINA_MACHINE_NAME='${MACHINE_NAME}'
-export KUBE_VERSION='${kube_version}'
-export API_SERVER='${api_server}'
-export BOOTSTRAP_TOKEN='${bootstrap_token}'
-export CA_CERT_BASE64='${ca_cert_b64}'
-export CLUSTER_DNS='${cluster_dns}'
-export NODE_LABELS='${node_labels}'
-EOF
+# --- Render JSON config ---
+jq -n \
+    --arg machineName "$MACHINE_NAME" \
+    --arg caCert      "$ca_cert_b64" \
+    --arg clusterDNS  "$cluster_dns" \
+    --arg version     "$kube_version" \
+    --arg apiServer   "$api_server" \
+    --arg token       "$bootstrap_token" \
+    --argjson labels  "$labels" \
+'{
+    MachineName: $machineName,
+    Cluster: {
+        CaCertBase64: $caCert,
+        ClusterDNS:   $clusterDNS,
+        Version:      $version
+    },
+    Kubelet: {
+        ApiServer:      $apiServer,
+        BootstrapToken: $token,
+        Labels:         $labels
+    }
+}' > "$OUTPUT_FILE"
+
+echo "Wrote agent config to ${OUTPUT_FILE}"

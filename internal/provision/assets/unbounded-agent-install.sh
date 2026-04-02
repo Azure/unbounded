@@ -4,9 +4,9 @@ set -eo pipefail
 # Required environment variable:
 #   UNBOUNDED_AGENT_CONFIG_FILE - path to the JSON agent config file
 #
-# The script reads the JSON config and exports environment variables that
-# the current agent binary expects. This bridges the structured config
-# format with the legacy env-var-based interface.
+# The agent binary reads the config file directly via the same environment
+# variable, so this script only needs to validate it exists, download the
+# agent, and run it.
 
 if [ -z "${UNBOUNDED_AGENT_CONFIG_FILE}" ]; then
     echo "UNBOUNDED_AGENT_CONFIG_FILE is not set" >&2
@@ -17,62 +17,6 @@ if [ ! -f "${UNBOUNDED_AGENT_CONFIG_FILE}" ]; then
     echo "config file not found: ${UNBOUNDED_AGENT_CONFIG_FILE}" >&2
     exit 1
 fi
-
-# ---------------------------------------------------------------------------
-# JSON parsing helpers — prefer jq, fall back to python3.
-# ---------------------------------------------------------------------------
-if command -v jq &>/dev/null; then
-    _json_get() { jq -r "$1 // \"\"" "${UNBOUNDED_AGENT_CONFIG_FILE}"; }
-    _json_labels() {
-        jq -r '
-            .Kubelet.Labels // {}
-            | to_entries
-            | map("\(.key)=\(.value)")
-            | join(",")
-        ' "${UNBOUNDED_AGENT_CONFIG_FILE}"
-    }
-elif command -v python3 &>/dev/null; then
-    _json_get() {
-        python3 -c "
-import json, sys, functools, operator
-with open('${UNBOUNDED_AGENT_CONFIG_FILE}') as f:
-    d = json.load(f)
-keys = sys.argv[1].lstrip('.').split('.')
-try:
-    v = functools.reduce(operator.getitem, keys, d)
-except (KeyError, TypeError):
-    v = ''
-print(v if v is not None else '')
-" "$1"
-    }
-    _json_labels() {
-        python3 -c "
-import json
-with open('${UNBOUNDED_AGENT_CONFIG_FILE}') as f:
-    d = json.load(f)
-labels = d.get('Kubelet', {}).get('Labels') or {}
-print(','.join(f'{k}={v}' for k, v in labels.items()))
-"
-    }
-else
-    echo "neither jq nor python3 found; cannot parse config" >&2
-    exit 1
-fi
-
-# ---------------------------------------------------------------------------
-# Map JSON config to environment variables for backwards compatibility.
-# ---------------------------------------------------------------------------
-export MACHINA_MACHINE_NAME="$(_json_get '.MachineName')"
-export API_SERVER="$(_json_get '.Kubelet.ApiServer')"
-export BOOTSTRAP_TOKEN="$(_json_get '.Kubelet.BootstrapToken')"
-export CA_CERT_BASE64="$(_json_get '.Cluster.CaCertBase64')"
-export CLUSTER_DNS="$(_json_get '.Cluster.ClusterDNS')"
-
-KUBE_VERSION="$(_json_get '.Cluster.Version')"
-KUBE_VERSION="${KUBE_VERSION#v}"
-export KUBE_VERSION
-
-export NODE_LABELS="$(_json_labels)"
 
 # ---------------------------------------------------------------------------
 # Download and run the agent.

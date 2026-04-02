@@ -47,36 +47,42 @@ VM_IP=$(cat .vm/agent-vm.ip)
 
 ### Gather Cluster Configuration
 
-The agent requires several environment variables to join a cluster. For AKS clusters,
-use the bundled helper script to extract them from a kubeconfig:
+The agent requires a JSON config file to join a cluster. For AKS clusters,
+use the bundled helper script to extract the config from a kubeconfig:
 
 ```bash
-# Print the required env vars (eval to export them into the current shell)
+# Write agent config JSON to unbounded-agent-config-dev.json at repo root
 ./hack/agent/.agents/skills/unbounded-agent-qemu-vm-e2e/scripts/aks-config.sh <kubeconfig> [machine-name]
 
 # Example:
-eval "$(./hack/agent/.agents/skills/unbounded-agent-qemu-vm-e2e/scripts/aks-config.sh ~/.kube/my-aks-config)"
+./hack/agent/.agents/skills/unbounded-agent-qemu-vm-e2e/scripts/aks-config.sh ~/.kube/my-aks-config
 ```
 
-The script outputs `export` statements for all required variables:
+The script writes a JSON file matching the `AgentConfig` schema (see `internal/provision/agent_config.go`):
 
-| Variable               | Description                                         |
-|------------------------|-----------------------------------------------------|
-| `MACHINA_MACHINE_NAME` | nspawn machine name (default: `agent-vm`)           |
-| `KUBE_VERSION`         | Kubernetes version without `v` prefix (e.g. `1.34.3`) |
-| `API_SERVER`           | API server endpoint URL                             |
-| `BOOTSTRAP_TOKEN`      | Bootstrap token in `<id>.<secret>` format           |
-| `CA_CERT_BASE64`       | Base64-encoded cluster CA certificate               |
-| `CLUSTER_DNS`          | Cluster DNS service IP                              |
-| `NODE_LABELS`          | Node labels (includes `managed=false` and cluster RG) |
+```json
+{
+  "MachineName": "agent-vm",
+  "Cluster": {
+    "CaCertBase64": "...",
+    "ClusterDNS": "10.0.0.10",
+    "Version": "v1.34.3"
+  },
+  "Kubelet": {
+    "ApiServer": "https://...",
+    "BootstrapToken": "<id>.<secret>",
+    "Labels": {
+      "kubernetes.azure.com/managed": "false"
+    }
+  }
+}
+```
 
 **Notes**:
 
 - The script uses the first valid bootstrap token it finds with
   `usage-bootstrap-authentication=true`.
-- `KUBE_VERSION` must **not** have a `v` prefix — the agent prepends it internally,
-  and passing `v1.34.3` results in download URLs with `vv1.34.3` which fail with 404.
-- For non-AKS clusters, set the environment variables manually.
+- For non-AKS clusters, write `unbounded-agent-config-dev.json` at the repo root manually.
 
 ### Perform Node Start
 
@@ -85,22 +91,14 @@ The script outputs `export` statements for all required variables:
 GOOS=linux GOARCH=$(uname -m) go build -o bin/unbounded-agent ./cmd/agent # change GOARCH to match the vm arch
 
 # 2. Get the cluster config (for AKS clusters)
-eval "$(./hack/agent/.agents/skills/unbounded-agent-qemu-vm-e2e/scripts/aks-config.sh <kubeconfig>)"
+./hack/agent/.agents/skills/unbounded-agent-qemu-vm-e2e/scripts/aks-config.sh <kubeconfig>
 
 # 3. Run the agent inside the VM via SSH (the repo is mounted at /agent via virtio-9p,
-#    so the freshly-built binary is already available).
+#    so the freshly-built binary and config file are already available).
 #    On Linux, VM_IP is localhost and add -p 2222.
 #    See below examples for commands to run in different scenarios.
 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@${VM_IP} \
-  "sudo \
-    MACHINA_MACHINE_NAME=${MACHINA_MACHINE_NAME} \
-    KUBE_VERSION=${KUBE_VERSION} \
-    API_SERVER=${API_SERVER} \
-    BOOTSTRAP_TOKEN=${BOOTSTRAP_TOKEN} \
-    CA_CERT_BASE64=${CA_CERT_BASE64} \
-    CLUSTER_DNS=${CLUSTER_DNS} \
-    NODE_LABELS=${NODE_LABELS} \
-    /agent/bin/unbounded-agent start"
+  "sudo UNBOUNDED_AGENT_CONFIG_FILE=/agent/unbounded-agent-config-dev.json /agent/bin/unbounded-agent start"
 ```
 
 A successful node join should result in seeing the node registered in the target k8s cluster.
@@ -108,7 +106,7 @@ A successful node join should result in seeing the node registered in the target
 **Notes**:
 
 - Inside the VM, you have root permission.
-- Use the mounted binary under `/agent` inside the VM, no need to scp.
+- The repo is mounted at `/agent` inside the VM — both the binary and config file are available without scp.
 - Prompt and confirm with user for the kubeconfig / target cluster to connect before running.
 - Refer to `internal/provision/assets/unbounded-agent-install.sh` for other options.
 - The node showing with `NotReady` state is fine as long as kubelet / containerd logs are looking correctly.
@@ -118,17 +116,9 @@ A successful node join should result in seeing the node registered in the target
 Join to an AKS cluster with debug log level:
 
 ```bash
-eval "$(./hack/agent/.agents/skills/unbounded-agent-qemu-vm-e2e/scripts/aks-config.sh /path/to/kubeconfig)"
+./hack/agent/.agents/skills/unbounded-agent-qemu-vm-e2e/scripts/aks-config.sh /path/to/kubeconfig
 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@${VM_IP} \
-  "sudo \
-    MACHINA_MACHINE_NAME=${MACHINA_MACHINE_NAME} \
-    KUBE_VERSION=${KUBE_VERSION} \
-    API_SERVER=${API_SERVER} \
-    BOOTSTRAP_TOKEN=${BOOTSTRAP_TOKEN} \
-    CA_CERT_BASE64=${CA_CERT_BASE64} \
-    CLUSTER_DNS=${CLUSTER_DNS} \
-    NODE_LABELS=${NODE_LABELS} \
-    /agent/bin/unbounded-agent start --debug"
+  "sudo UNBOUNDED_AGENT_CONFIG_FILE=/agent/unbounded-agent-config-dev.json /agent/bin/unbounded-agent start --debug"
 ```
 
 Capture logs to a file for later analysis (recommended):
