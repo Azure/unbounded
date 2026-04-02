@@ -128,7 +128,7 @@ The machina controller drives the following phases:
 | Label | Applied to | Description |
 |-------|-----------|-------------|
 | `unbounded-kube.io/machine` | Node | Maps the Node back to its Machine CR. Set during provisioning. |
-| `unbounded-kube.io/pool` | Machine | Scopes a metalman instance to a subset of Machines. |
+| `unbounded-kube.io/site` | Machine | Scopes a metalman instance to a subset of Machines. |
 | `unbounded-kube.io/default-bootstrap-token` | Secret | Marks a Secret as the default bootstrap token for auto-discovery. |
 
 **Annotations:**
@@ -190,7 +190,7 @@ kind: Machine
 metadata:
   name: baremetal-01
   labels:
-    unbounded-kube.io/pool: lab
+    unbounded-kube.io/site: lab
 spec:
   ssh:
     host: "10.0.0.60"

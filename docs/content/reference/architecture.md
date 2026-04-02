@@ -82,8 +82,8 @@ Runs three reconcilers and four network servers:
 | HTTP server (TCP/8880)  | Kernel, initrd, Go-templated configs, `/attest` (TPM), `/pxe/disable`. |
 | Health server (TCP/8081)| Liveness and readiness probes.                              |
 
-Pool-based scoping: the `--pool` flag and the `unbounded-kube.io/pool` label
-restrict each instance to a subset of Machines. Leader election is per-pool.
+Site-based scoping: the `--site` flag and the `unbounded-kube.io/site` label
+restrict each instance to a subset of Machines. Leader election is per-site.
 
 ### kubectl-unbounded -- CLI Plugin
 

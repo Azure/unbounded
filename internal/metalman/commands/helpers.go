@@ -18,7 +18,7 @@ import (
 	v1alpha3 "github.com/project-unbounded/unbounded-kube/api/v1alpha3"
 )
 
-const poolLabel = "unbounded-kube.io/pool"
+const siteLabel = "unbounded-kube.io/site"
 
 // ANSI color/style codes for terminal output.
 const (
@@ -46,20 +46,20 @@ func BuildScheme() *runtime.Scheme {
 	return s
 }
 
-func PoolSelector(pool string) (labels.Selector, error) {
+func SiteSelector(site string) (labels.Selector, error) {
 	var (
 		op   selection.Operator
 		vals []string
 	)
 
-	if pool != "" {
+	if site != "" {
 		op = selection.Equals
-		vals = []string{pool}
+		vals = []string{site}
 	} else {
 		op = selection.DoesNotExist
 	}
 
-	req, err := labels.NewRequirement(poolLabel, op, vals)
+	req, err := labels.NewRequirement(siteLabel, op, vals)
 	if err != nil {
 		return nil, err
 	}
@@ -76,12 +76,12 @@ func DefaultCacheDir() string {
 	return filepath.Join(home, ".unbounded", "metalman", "cache")
 }
 
-func LeaderElectionID(pool string) string {
-	if pool == "" {
+func LeaderElectionID(site string) string {
+	if site == "" {
 		return "metalman"
 	}
 
-	return "metalman-" + pool
+	return "metalman-" + site
 }
 
 func PrintStep(msg string) {
@@ -120,7 +120,7 @@ func InterfaceForIP(ip net.IP) (string, error) {
 	for _, iface := range ifaces {
 		addrs, err := iface.Addrs()
 		if err != nil {
-			slog.Warn("unablbe to read addresses from interface %q: %s", iface.Name, err)
+			slog.Warn("unable to read addresses from interface %q: %s", iface.Name, err)
 			continue
 		}
 

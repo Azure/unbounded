@@ -13,6 +13,7 @@ func Run() {
 	}
 
 	root.AddCommand(siteCommandGroup())
+	root.AddCommand(machineCommandGroup())
 
 	if err := root.Execute(); err != nil {
 		os.Exit(1)

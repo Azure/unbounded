@@ -13,7 +13,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/project-unbounded/unbounded-kube/api/v1alpha3"
-	"github.com/project-unbounded/unbounded-kube/cmd/metalman/internal/indexing"
+	"github.com/project-unbounded/unbounded-kube/internal/metalman/indexing"
 )
 
 // ErrNotYetDownloaded is returned when an HTTP-sourced file has not yet been

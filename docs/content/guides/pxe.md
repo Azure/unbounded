@@ -35,7 +35,7 @@ Key `serve-pxe` flags (set via the Deployment):
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--dhcp-interface` | *(none — relay mode)* | NIC for broadcast DHCP |
-| `--pool` | *(none)* | Scope to machines with a specific pool label |
+| `--site` | *(none)* | Scope to machines with a specific site label |
 | `--http-port` | 8880 | HTTP server port |
 | `--cache-dir` | `~/.unbounded/metalman/cache` | Local cache for downloaded images |
 | `--apiserver-url` | | External Kubernetes API URL |
@@ -64,7 +64,7 @@ kind: Machine
 metadata:
   name: server-01
   labels:
-    unbounded-kube.io/pool: rack-a
+    unbounded-kube.io/site: rack-a
 spec:
   pxe:
     imageRef:
@@ -114,39 +114,31 @@ Metalman uses TPM 2.0 to securely deliver a bootstrap token without embedding se
 
 The `metalman-bootstrap` ServiceAccount has RBAC for `system:node-bootstrapper` and `certificatesigningrequests:nodeclient` auto-approval.
 
-## Pool Isolation
+## Site Isolation
 
-Use the `--pool` flag to scope a metalman instance to machines labeled `unbounded-kube.io/pool=<value>`. Each pool gets its own leader-election lease.
+Use the `--site` flag to scope a metalman instance to machines labeled `unbounded-kube.io/site=<value>`. Each site gets its own leader-election lease.
 
 Run separate metalman instances for different racks or network segments:
 
 ```bash
 # Instance for rack-a
-metalman serve-pxe --pool=rack-a --dhcp-interface=eth1
+metalman serve-pxe --site=rack-a --dhcp-interface=eth1
 
 # Instance for rack-b
-metalman serve-pxe --pool=rack-b --dhcp-interface=eth2
+metalman serve-pxe --site=rack-b --dhcp-interface=eth2
 ```
 
 ## Operations
 
 Metalman uses counter-based operations. Increment a spec counter above the corresponding status counter to trigger an action.
 
-**Reboot** a machine:
+**Reboot** a machine by incrementing the `rebootCounter`:
 
-```bash
-metalman reboot server-01
-```
+**Reimage** a machine (PXE reinstall) by incrementing both counters.
 
-**Reimage** a machine (PXE reinstall):
+The lifecycle reconciler enforces a 30-minute timeout for reimaging and automatically retries on timeout.
 
-```bash
-metalman reboot server-01 --reimage
-```
-
-The `--reimage` flag increments both `rebootCounter` and `reimageCounter`. The lifecycle reconciler enforces a 30-minute timeout for reimaging and automatically retries on timeout.
-
-You can also edit the Machine CR directly:
+Edit the Machine CR directly:
 
 ```yaml
 spec:

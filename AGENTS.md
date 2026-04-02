@@ -24,6 +24,7 @@ unbounded-kube is organized into several directories:
 ## Building and Testing
 
 - To build `machina` use `make machina` which runs formatters, lint tests, go test and go build.
+- To build `metalman` use `make metalman` which runs formatters, lint, tests, and builds the binary.
 
 ## Coding Standards
 

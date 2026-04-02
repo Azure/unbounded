@@ -1,6 +1,10 @@
 package app
 
-import "github.com/spf13/cobra"
+import (
+	"github.com/spf13/cobra"
+
+	metalmancmd "github.com/project-unbounded/unbounded-kube/internal/metalman/commands"
+)
 
 func siteCommandGroup() *cobra.Command {
 	cmd := &cobra.Command{
@@ -10,7 +14,9 @@ func siteCommandGroup() *cobra.Command {
 
 	cmd.AddCommand(
 		siteInitCommand(),
-		siteAddMachineCommand())
+		siteAddMachineCommand(),
+		deployPXECommand(),
+		metalmancmd.ServePXECmd())
 
 	return cmd
 }

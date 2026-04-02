@@ -6,6 +6,8 @@ Metalman commands are available through the `kubectl unbounded` plugin. A
 dedicated `metalman` binary is also shipped as a container image for running
 the PXE server inside a cluster.
 
+Run `metalman version` to print the binary version.
+
 ## Usage
 
 ```bash
@@ -34,13 +36,14 @@ spec:
       passwordRef:
         name: bmc-node-01-pass
         namespace: default
+        key: password
 EOF
 
 # Store the BMC's Redfish password
-kubectl create secret generic bmc-pass --from-literal=password=example-password
+kubectl create secret generic bmc-node-01-pass --from-literal=password=example-password
 
-# Reboot the node into PXE
-kubectl unbounded reboot node-01 --reimage
+# Reimage the node via PXE
+kubectl unbounded machine reimage node-01
 ```
 
 
@@ -48,7 +51,7 @@ kubectl unbounded reboot node-01 --reimage
 
 ### Controller
 
-`kubectl unbounded serve-pxe` runs a single long-lived process that provides
+`kubectl unbounded site serve-pxe` runs a single long-lived process that provides
 everything needed to PXE-boot and manage bare metal hosts:
 
 | Service | Default Port | Protocol | Purpose |
@@ -62,12 +65,40 @@ The controller also runs reconcilers for Image resources (downloading and
 caching artifacts) and Machine resources with Redfish BMC specs (power
 management, boot order configuration).
 
-When deployed inside a cluster, the metalman container image uses the same
-command:
+When deployed inside a cluster, the container entrypoint is `metalman` and the
+`site deploy-pxe` command passes `serve-pxe` as an argument:
 
 ```bash
-metalman serve-pxe [flags]
+metalman serve-pxe --site=<site> [flags]
 ```
+
+#### Deploying with `site deploy-pxe`
+
+`kubectl unbounded site deploy-pxe` is a convenience command that creates (or
+updates) a Kubernetes Deployment running `metalman serve-pxe` for a given
+site. The Deployment is server-side applied into the `machina-system`
+namespace.
+
+```bash
+# Deploy the PXE server for a site called "rack-a"
+kubectl unbounded site deploy-pxe --site=rack-a
+```
+
+The resulting Deployment (`metalman-controller-<site>`) runs with host networking for DHCP.
+It exposes ports 8880/tcp (HTTP), 8081/tcp (health), 67/udp (DHCP), and 69/udp (TFTP).
+
+`site deploy-pxe` flags:
+
+- `--site` — Site name (required; scopes the PXE instance to machines
+  labeled `unbounded-kube.io/site=<site>`).
+- `--image` — Container image for the PXE deployment (default: build-time
+  value or `metalman:latest`).
+- `--kubeconfig` — Path to kubeconfig file.
+
+The generated Deployment uses host networking, a `CriticalAddonsOnly`
+toleration, DNS policy `ClusterFirstWithHostNet`, and a node selector
+`unbounded-kube.io/site=<site>`. Resource requests are 100m CPU / 128Mi
+memory with limits of 500m CPU / 256Mi memory.
 
 #### DHCP Modes
 
@@ -76,13 +107,18 @@ The DHCP server operates in one of two modes depending on whether
 
 - **Interface mode** (`--dhcp-interface=eth0`): Binds to a network interface
   and listens for broadcast DHCP traffic. Use this when the controller is
-  directly attached to the provisioning network. This mode implies leader
-  election — two instances on the same network might cause conflicts.
+  directly attached to the provisioning network.
 
-- **Relay mode** (no `--dhcp-interface`): Listens on a UDP port for unicast
-  packets only. Use this when a DHCP relay agent forwards requests from a
-  remote subnet. Leader election is not required because relay agents send
-  unicast traffic to a specific address.
+- **Auto-interface mode** (`--dhcp-auto-interface`): Automatically detects
+  the network interface from the server bind address. Mutually exclusive
+  with `--dhcp-interface`.
+
+- **Relay mode** (no `--dhcp-interface` or `--dhcp-auto-interface`): Listens
+  on a UDP port for unicast packets only. Use this when a DHCP relay agent
+  forwards requests from a remote subnet.
+
+Leader election is always enabled regardless of DHCP mode. Each site gets
+its own leader-election lease (`metalman-<site>`).
 
 #### Security Model
 
@@ -95,23 +131,23 @@ Bootstrap tokens are delivered using the standard TPM 2.0 credential encryption 
 The client's endorsement key (EK) public key is stored in `status.tpm.ekPublicKey` when first seen.
 So it's possible to prove that the bootstrap token was delivered only to trusted hosts.
 
-#### Pools
+#### Sites
 
-The `--pool` flag scopes a `serve-pxe` instance to a subset of Machines. The
-value is matched against the `unbounded-kube.io/pool` label on Machine
+The `--site` flag scopes a `site serve-pxe` instance to a subset of Machines. The
+value is matched against the `unbounded-kube.io/site` label on Machine
 resources:
 
 ```bash
-# Manage only Machines labeled pool=rack-a
-kubectl unbounded serve-pxe --pool=rack-a --dhcp-interface=eth0
+# Manage only Machines labeled site=rack-a
+kubectl unbounded site serve-pxe --site=rack-a --dhcp-interface=eth0
 
 # Manage only unlabeled Machines (the default)
-kubectl unbounded serve-pxe --dhcp-interface=eth0
+kubectl unbounded site serve-pxe --dhcp-interface=eth0
 ```
 
-Each pool gets its own leader-election lease (`metalman-<pool>`), so
-multiple pools can coexist on one cluster with independent HA. A `serve-pxe`
-instance with no `--pool` manages Machines that do not have the pool label
+Each site gets its own leader-election lease (`metalman-<site>`), so
+multiple sites can coexist on one cluster with independent HA. A `site serve-pxe`
+instance with no `--site` manages Machines that do not have the site label
 at all.
 
 ### Images
@@ -124,7 +160,7 @@ served during PXE boot. Files can come from three sources:
   with node-specific IPs and kernel parameters).
 - **Static** — inline content embedded in the CR (plain text or base64).
 
-See [`images/ubuntu24/build.py`](images/ubuntu24/build.py) for the build script
+See [`images/ubuntu24/build.py`](../../images/ubuntu24/build.py) for the build script
 that produces a complete example Image CR booting Ubuntu 24.04 from upstream
 netboot artifacts. Run `make images/ubuntu24` to generate `image.yaml`.
 
@@ -178,6 +214,7 @@ spec:
       passwordRef:
         name: bmc-node-01-pass
         namespace: default
+        key: password
 ```
 
 The BMC password is read from a Secret in the same namespace (key: `password`).
@@ -188,7 +225,7 @@ requests.
 To reimage a node with BMC access:
 
 ```bash
-kubectl unbounded reboot --reimage node-01
+kubectl unbounded machine reimage node-01
 ```
 
 This increments `spec.operations.reimageCounter` and `spec.operations.rebootCounter`. The

@@ -21,7 +21,7 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TMPDIR = Path(tempfile.mkdtemp())
 os.chmod(TMPDIR, 0o755)
-POOL = "smoke"
+SITE = "smoke"
 NODE_NAME = "smoke-node"
 NODE_NS = "default"
 API_GROUP = "unbounded-kube.io"
@@ -41,6 +41,7 @@ ARTIFACT_DIR = TMPDIR / "artifacts"
 SERVE_URL = f"http://{SERVER_IP}:{HTTP_PORT}"
 IMAGE_NAME = "ubuntu-24-04"
 BINARY = REPO_ROOT / "bin" / "metalman"
+KUBECTL_UNBOUNDED = REPO_ROOT / "bin" / "kubectl-unbounded"
 SERIAL_SOCK = TMPDIR / "console.sock"
 
 KUBECTL = "kubectl"
@@ -151,7 +152,7 @@ def clean_libvirt() -> None:
     run_quiet(["sudo", "pkill", "-f", "metalman"])
     # Delete stale leader-election leases so new processes acquire immediately.
     run_quiet([KUBECTL, "-n", "machina-system", "delete", "lease",
-               f"metalman-{POOL}"])
+               f"metalman-{SITE}"])
     time.sleep(1)
 
 
@@ -385,8 +386,9 @@ def main() -> None:
     time.sleep(2)
     check_procs()
 
-    log("Building metalman")
+    log("Building metalman and kubectl-unbounded")
     run(["go", "build", "-o", str(BINARY), "./cmd/metalman"], cwd=str(REPO_ROOT))
+    run(["go", "build", "-o", str(KUBECTL_UNBOUNDED), "./cmd/kubectl-unbounded"], cwd=str(REPO_ROOT))
 
     log("Cleaning up stale Kubernetes resources")
     run_quiet([KUBECTL, "-n", NODE_NS, "delete", "secret", "bmc-pass"])
@@ -441,7 +443,7 @@ def main() -> None:
         "kind": "Machine",
         "metadata": {
             "name": NODE_NAME,
-            "labels": {f"{API_GROUP}/pool": POOL},
+            "labels": {f"{API_GROUP}/site": SITE},
         },
         "spec": {
             "pxe": {
@@ -468,7 +470,7 @@ def main() -> None:
 
     log("Starting metalman serve-pxe")
     proc = spawn([
-        str(BINARY), "serve-pxe", f"--pool={POOL}", f"--bind-address={SERVER_IP}",
+        str(BINARY), "serve-pxe", f"--site={SITE}", f"--bind-address={SERVER_IP}",
         f"--cache-dir={CACHE_DIR}", f"--apiserver-url={server_url}",
         f"--serve-url={SERVE_URL}", "--dhcp-interface=virbr-smoke",
         "--leader-elect-lease-duration=60s",
@@ -480,8 +482,8 @@ def main() -> None:
     time.sleep(2)
     check_procs()
 
-    log("Triggering reboot with reimage")
-    run([str(BINARY), "reboot", NODE_NAME, "--reimage", "-n", NODE_NS])
+    log("Triggering reimage")
+    run([str(KUBECTL_UNBOUNDED), "machine", "reimage", NODE_NAME])
 
     log("Waiting for kubelet to join the cluster...")
     wait_k8s_node(NODE_NAME, timeout=900)

@@ -9,7 +9,7 @@ import (
 	"github.com/spf13/cobra"
 	ctrl "sigs.k8s.io/controller-runtime"
 
-	"github.com/project-unbounded/unbounded-kube/cmd/metalman/commands"
+	"github.com/project-unbounded/unbounded-kube/internal/metalman/commands"
 )
 
 var version = "dev"
@@ -21,7 +21,7 @@ func main() {
 		Use:   "metalman",
 		Short: "Bare metal provisioning for Kubernetes",
 	}
-	root.AddCommand(commands.RebootCmd(), commands.ServePXECmd())
+	root.AddCommand(commands.ServePXECmd())
 	root.AddCommand(&cobra.Command{
 		Use:   "version",
 		Short: "Print version",

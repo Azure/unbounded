@@ -44,16 +44,17 @@ test: lint
 
 KUBECTL_UNBOUNDED_BIN=bin/kubectl-unbounded
 KUBECTL_UNBOUNDED_CMD=./cmd/kubectl-unbounded
+KUBECTL_UNBOUNDED_LDFLAGS=-X github.com/project-unbounded/unbounded-kube/cmd/kubectl-unbounded/app.MetalmanImage=$(METALMAN_IMAGE)
 
 kubectl-unbounded: test
-	$(GOBUILD) -o $(KUBECTL_UNBOUNDED_BIN) $(KUBECTL_UNBOUNDED_CMD)/main.go
+	$(GOBUILD) -ldflags '$(KUBECTL_UNBOUNDED_LDFLAGS)' -o $(KUBECTL_UNBOUNDED_BIN) $(KUBECTL_UNBOUNDED_CMD)/main.go
 
 kubectl-unbounded-cross:
 	@for p in $(KUBECTL_PLUGIN_PLATFORMS); do \
 		os=$${p%%-*}; \
 		arch=$${p##*-}; \
 		echo "Building kubectl-unbounded for $$os/$$arch..."; \
-		GOOS=$$os GOARCH=$$arch $(GOBUILD) -o bin/kubectl-unbounded-$$p $(KUBECTL_UNBOUNDED_CMD)/main.go; \
+		GOOS=$$os GOARCH=$$arch $(GOBUILD) -ldflags '$(KUBECTL_UNBOUNDED_LDFLAGS)' -o bin/kubectl-unbounded-$$p $(KUBECTL_UNBOUNDED_CMD)/main.go; \
 		mkdir -p bin/tar-staging; \
 		cp bin/kubectl-unbounded-$$p bin/tar-staging/kubectl-unbounded; \
 		tar -czf bin/kubectl-unbounded-$$p.tar.gz -C bin/tar-staging kubectl-unbounded; \
@@ -100,10 +101,10 @@ METALMAN_BIN=bin/metalman
 METALMAN_CMD=./cmd/metalman
 
 metalman:
-	$(GOFMT) -w $(METALMAN_CMD)
-	$(GOLINT) --fix -E wsl_v5 $(METALMAN_CMD)/...
-	$(GOLINT) $(METALMAN_CMD)/...
-	$(GOTEST) $(METALMAN_CMD)/...
+	$(GOFMT) -w $(METALMAN_CMD) ./internal/metalman
+	$(GOLINT) --fix -E wsl_v5 $(METALMAN_CMD)/... ./internal/metalman/...
+	$(GOLINT) $(METALMAN_CMD)/... ./internal/metalman/...
+	$(GOTEST) $(METALMAN_CMD)/... ./internal/metalman/...
 	$(GOBUILD) -o $(METALMAN_BIN) $(METALMAN_CMD)/main.go
 
 machina-oci:

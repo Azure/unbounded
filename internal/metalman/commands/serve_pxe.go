@@ -18,18 +18,18 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	v1alpha3 "github.com/project-unbounded/unbounded-kube/api/v1alpha3"
-	"github.com/project-unbounded/unbounded-kube/cmd/metalman/internal/attestation"
-	"github.com/project-unbounded/unbounded-kube/cmd/metalman/internal/dhcp"
-	"github.com/project-unbounded/unbounded-kube/cmd/metalman/internal/indexing"
-	"github.com/project-unbounded/unbounded-kube/cmd/metalman/internal/lifecycle"
-	"github.com/project-unbounded/unbounded-kube/cmd/metalman/internal/netboot"
-	"github.com/project-unbounded/unbounded-kube/cmd/metalman/internal/redfish"
+	"github.com/project-unbounded/unbounded-kube/internal/metalman/attestation"
+	"github.com/project-unbounded/unbounded-kube/internal/metalman/dhcp"
+	"github.com/project-unbounded/unbounded-kube/internal/metalman/indexing"
+	"github.com/project-unbounded/unbounded-kube/internal/metalman/lifecycle"
+	"github.com/project-unbounded/unbounded-kube/internal/metalman/netboot"
+	"github.com/project-unbounded/unbounded-kube/internal/metalman/redfish"
 )
 
 // ServePXECmd returns a cobra.Command that runs PXE servers and the BMC control loop.
 func ServePXECmd() *cobra.Command {
 	var (
-		pool              string
+		site              string
 		cacheDir          string
 		maxDownloads      int
 		bindAddress       string
@@ -52,12 +52,12 @@ func ServePXECmd() *cobra.Command {
 			ctx := ctrl.SetupSignalHandler()
 			cfg := ctrl.GetConfigOrDie()
 
-			selector, err := PoolSelector(pool)
+			selector, err := SiteSelector(site)
 			if err != nil {
-				return fmt.Errorf("building pool selector: %w", err)
+				return fmt.Errorf("building site selector: %w", err)
 			}
 
-			leID := LeaderElectionID(pool)
+			leID := LeaderElectionID(site)
 
 			scheme := BuildScheme()
 
@@ -220,12 +220,12 @@ func ServePXECmd() *cobra.Command {
 				return fmt.Errorf("adding HTTP server: %w", err)
 			}
 
-			poolDisplay := pool
-			if poolDisplay == "" {
-				poolDisplay = "(unlabeled nodes)"
+			siteDisplay := site
+			if siteDisplay == "" {
+				siteDisplay = "(unlabeled nodes)"
 			}
 
-			PrintConfig("pool", poolDisplay)
+			PrintConfig("site", siteDisplay)
 			PrintConfig("leader-election", leID)
 			PrintConfig("serve-url", serveURL)
 			PrintConfig("cache-dir", cacheDir)
@@ -248,7 +248,7 @@ func ServePXECmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&pool, "pool", "", "Pool label value to select Machines")
+	cmd.Flags().StringVar(&site, "site", "", "Site label value to select Machines")
 	cmd.Flags().StringVar(&cacheDir, "cache-dir", DefaultCacheDir(), "Local directory for cached image artifacts")
 	cmd.Flags().IntVar(&maxDownloads, "max-downloads", 8, "Maximum concurrent file downloads")
 	cmd.Flags().StringVar(&bindAddress, "bind-address", "0.0.0.0", "IP address to bind servers")
