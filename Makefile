@@ -28,11 +28,20 @@ BLOB_CONTAINER ?= release
 
 KUBECTL_PLUGIN_PLATFORMS = linux-amd64 linux-arm64 darwin-amd64 darwin-arm64
 
-.PHONY: all fmt lint test check-deps kubectl-unbounded kubectl-unbounded-cross krew-manifest forge inventory inventory-amd64 inventory-arm64 unbounded-agent machina machina-oci machina-oci-push metalman metalman-oci metalman-oci-push gomod images/ubuntu24/image.yaml push-blobs
+.PHONY: all help fmt lint test check-deps kubectl-unbounded kubectl-unbounded-cross krew-manifest forge inventory inventory-amd64 inventory-arm64 unbounded-agent machina machina-oci machina-oci-push metalman metalman-oci metalman-oci-push gomod images/ubuntu24/image.yaml push-blobs
 
-all: kubectl-unbounded forge machina
+##@ General
 
-check-deps:
+all: kubectl-unbounded forge machina ## Build kubectl-unbounded, forge, and machina (default)
+
+help: ## Show this help
+	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} \
+	/^[a-zA-Z_0-9-]+:.*?##/ { printf "  \033[36m%-28s\033[0m %s\n", $$1, $$2 } \
+	/^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) }' $(MAKEFILE_LIST)
+
+##@ Development
+
+check-deps: ## Verify required tools (gofumpt, golangci-lint v2) are installed
 	@command -v $(GOFMT) >/dev/null 2>&1 || \
 		{ echo "error: $(GOFMT) not found. Install it with:"; \
 		  echo "  go install mvdan.cc/gofumpt@latest"; exit 1; }
@@ -45,24 +54,25 @@ check-deps:
 		  echo "  Install v2 with:"; \
 		  echo "  go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest"; exit 1; }
 
-fmt: check-deps
+fmt: check-deps ## Format all Go source files with gofumpt
 	$(GOFMT) -w .
 
-lint: fmt
+lint: fmt ## Run golangci-lint (implies fmt)
 	$(GOLINT) --fix -E wsl_v5 ./...
 	$(GOLINT) ./...
 
-test: lint
+test: lint ## Run all tests (implies lint)
 	$(GOTEST) ./...
 
-KUBECTL_UNBOUNDED_BIN=bin/kubectl-unbounded
-KUBECTL_UNBOUNDED_CMD=./cmd/kubectl-unbounded
-KUBECTL_UNBOUNDED_LDFLAGS=-X github.com/project-unbounded/unbounded-kube/cmd/kubectl-unbounded/app.MetalmanImage=$(METALMAN_IMAGE)
+gomod: ## Tidy go.mod and go.sum
+	GOPROXY=direct $(GOMOD) tidy
 
-kubectl-unbounded: test
+##@ Build
+
+kubectl-unbounded: test ## Build the kubectl-unbounded plugin (implies test)
 	$(GOBUILD) -ldflags '$(KUBECTL_UNBOUNDED_LDFLAGS)' -o $(KUBECTL_UNBOUNDED_BIN) $(KUBECTL_UNBOUNDED_CMD)/main.go
 
-kubectl-unbounded-cross:
+kubectl-unbounded-cross: ## Cross-compile kubectl-unbounded for all supported platforms
 	@for p in $(KUBECTL_PLUGIN_PLATFORMS); do \
 		os=$${p%%-*}; \
 		arch=$${p##*-}; \
@@ -74,7 +84,7 @@ kubectl-unbounded-cross:
 		rm -rf bin/tar-staging; \
 	done
 
-krew-manifest: kubectl-unbounded-cross
+krew-manifest: kubectl-unbounded-cross ## Generate the krew plugin manifest with checksums
 	@cp deploy/krew/unbounded.yaml.tmpl bin/unbounded.yaml
 	@sed -i 's|{{VERSION}}|$(VERSION)|g' bin/unbounded.yaml
 	@sed -i 's|{{STORAGE_ACCOUNT}}|$(STORAGE_ACCOUNT)|g' bin/unbounded.yaml
@@ -86,10 +96,10 @@ krew-manifest: kubectl-unbounded-cross
 	done
 	@echo "Generated krew manifest: bin/unbounded.yaml"
 
-forge: test
+forge: test ## Build the forge dev tool (implies test)
 	$(GOBUILD) -o $(FORGE_BIN) $(FORGE_CMD)/main.go
 
-inventory: inventory-amd64 inventory-arm64
+inventory: inventory-amd64 inventory-arm64 ## Build inventory for amd64 and arm64, symlink to host arch
 	@HOST_ARCH=$$(uname -m); \
 	case "$$HOST_ARCH" in \
 		x86_64)  ARCH=amd64 ;; \
@@ -98,35 +108,37 @@ inventory: inventory-amd64 inventory-arm64
 	esac; \
 	ln -sf inventory-$$ARCH $(INVENTORY_BIN)
 
-inventory-amd64: test
+inventory-amd64: test ## Build inventory for linux/amd64 (implies test)
 	GOOS=linux GOARCH=amd64 $(GOBUILD) -o $(INVENTORY_BIN)-amd64 $(INVENTORY_CMD)/main.go
 
-inventory-arm64: test
+inventory-arm64: test ## Build inventory for linux/arm64 (implies test)
 	GOOS=linux GOARCH=arm64 $(GOBUILD) -o $(INVENTORY_BIN)-arm64 $(INVENTORY_CMD)/main.go
 
-unbounded-agent: test
+unbounded-agent: test ## Build the unbounded-agent for linux (implies test)
 	GOOS=linux $(GOBUILD) -o $(AGENT_BIN) $(AGENT_CMD)/main.go
 
-machina: test
+machina: test ## Build the machina controller (implies test)
 	$(GOBUILD) -o $(MACHINA_BIN) $(MACHINA_CMD)/main.go
 
 METALMAN_BIN=bin/metalman
 METALMAN_CMD=./cmd/metalman
 
-metalman: check-deps
+metalman: check-deps ## Format, lint, test, and build metalman
 	$(GOFMT) -w $(METALMAN_CMD) ./internal/metalman
 	$(GOLINT) --fix -E wsl_v5 $(METALMAN_CMD)/... ./internal/metalman/...
 	$(GOLINT) $(METALMAN_CMD)/... ./internal/metalman/...
 	$(GOTEST) $(METALMAN_CMD)/... ./internal/metalman/...
 	$(GOBUILD) -o $(METALMAN_BIN) $(METALMAN_CMD)/main.go
 
-machina-oci:
+##@ Container Images
+
+machina-oci: ## Build the machina container image
 	$(CONTAINER_ENGINE) build -t machina:$(MACHINA_TAG) -t $(MACHINA_IMAGE) -f ./cmd/machina/oci/Containerfile .
 
-machina-oci-push: machina-oci
+machina-oci-push: machina-oci ## Build and push the machina container image
 	$(CONTAINER_ENGINE) push $(MACHINA_IMAGE)
 
-machina-run: machina
+machina-run: machina ## Replace the in-cluster machina with a locally built binary
 	kubectl scale deployment/machina-controller --replicas=0 -n machina-system
 	kubectl get configmap machina-config -n machina-system -o jsonpath='{.data.config\.yaml}' > hack/machina-config.yaml
 	$(MACHINA_BIN) controller --config=hack/machina-config.yaml
@@ -134,16 +146,18 @@ machina-run: machina
 METALMAN_TAG ?= latest
 METALMAN_IMAGE=$(CONTAINER_REGISTRY)/metalman:$(METALMAN_TAG)
 
-metalman-oci:
+metalman-oci: ## Build the metalman container image
 	$(CONTAINER_ENGINE) build -t metalman:$(METALMAN_TAG) -t $(METALMAN_IMAGE) -f ./cmd/metalman/oci/Containerfile .
 
-metalman-oci-push: metalman-oci
+metalman-oci-push: metalman-oci ## Build and push the metalman container image
 	$(CONTAINER_ENGINE) push $(METALMAN_IMAGE)
 
-images/ubuntu24/image.yaml:
+##@ Release
+
+images/ubuntu24/image.yaml: ## Generate the ubuntu24 image manifest
 	cd images/ubuntu24 && python3 build.py -o image.yaml
 
-push-blobs: images/ubuntu24/image.yaml krew-manifest
+push-blobs: images/ubuntu24/image.yaml krew-manifest ## Upload release artifacts to Azure Blob Storage
 	@az storage blob upload \
 		--file images/ubuntu24/image.yaml \
 		--container-name $(BLOB_CONTAINER) \
@@ -171,5 +185,6 @@ push-blobs: images/ubuntu24/image.yaml krew-manifest
 		--overwrite
 	@echo "Uploaded krew manifest to https://$(STORAGE_ACCOUNT).blob.core.windows.net/$(BLOB_CONTAINER)/$(VERSION)/unbounded.yaml"
 
-gomod:
-	GOPROXY=direct $(GOMOD) tidy
+KUBECTL_UNBOUNDED_BIN=bin/kubectl-unbounded
+KUBECTL_UNBOUNDED_CMD=./cmd/kubectl-unbounded
+KUBECTL_UNBOUNDED_LDFLAGS=-X github.com/project-unbounded/unbounded-kube/cmd/kubectl-unbounded/app.MetalmanImage=$(METALMAN_IMAGE)
