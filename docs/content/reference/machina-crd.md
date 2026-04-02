@@ -317,3 +317,16 @@ Machine.spec.pxe.redfish.passwordRef ──► Secret
 Machine.spec.kubernetes.bootstrapTokenRef ► Secret     (kube-system namespace)
 Machine ◄──── unbounded-kube.io/machine ────► Node     (bidirectional via label)
 ```
+
+## See Also
+
+- **[SSH Guide]({{< relref "guides/ssh" >}})** -- SSH provisioning walkthrough
+  using these CRDs.
+- **[PXE Guide]({{< relref "guides/pxe" >}})** -- Bare-metal provisioning
+  walkthrough using Machine and Image.
+- **[Networking CRDs]({{< relref "reference/networking/custom-resources" >}})**
+  -- Site, GatewayPool, and related CRDs from unbounded-net.
+- **[CLI Reference]({{< relref "reference/cli" >}})** -- The `kubectl unbounded`
+  commands that create these resources.
+- **[Architecture]({{< relref "reference/architecture" >}})** -- How these
+  CRDs drive the provisioning pipelines.

@@ -1,28 +1,100 @@
 {{ define "main" }}
 <section class="hero">
   <h1>{{ .Site.Title }}</h1>
-  <p class="tagline">{{ .Site.Params.description }}</p>
+  <p class="tagline tagline-answer">
+    Add any Linux machine to your Kubernetes cluster &mdash; cloud, on-prem,
+    bare metal, or edge &mdash; no matter where it lives or what network it's on.
+  </p>
   <div class="hero-links">
     <a href="{{ "guides/getting-started/" | relURL }}" class="btn btn-primary">Get Started</a>
-    <a href="{{ "reference/" | relURL }}" class="btn btn-secondary">Reference</a>
+    <a href="{{ "concepts/" | relURL }}" class="btn btn-secondary">Learn the Concepts</a>
+  </div>
+</section>
+
+<section class="home-components">
+  <h2>How It Works</h2>
+  <p class="home-components-lead">Four provisioning paths, one control plane.</p>
+  <div class="grid grid-4">
+    <div class="card">
+      <h3>machina</h3>
+      <p>Provisions remote machines over SSH. Point it at a Linux host and it handles kubelet install, bootstrap, and node lifecycle.</p>
+      <a href="{{ "guides/ssh" | relURL }}">SSH Guide &rarr;</a>
+    </div>
+    <div class="card">
+      <h3>cloud&#8209;init</h3>
+      <p>Spin up GPU and compute instances on Nebius, CoreWeave, OCI, Azure, AWS, and more. Nodes join automatically on first boot via cloud&#8209;init user&#8209;data.</p>
+      <a href="{{ "guides/cloud-api" | relURL }}">Cloud API Guide &rarr;</a>
+    </div>
+    <div class="card">
+      <h3>metalman</h3>
+      <p>PXE-boots bare-metal servers with bundled DHCP, TFTP, and HTTP. Integrates Redfish BMC and TPM&nbsp;2.0 attestation.</p>
+      <a href="{{ "concepts/bare-metal" | relURL }}">Bare Metal &rarr;</a>
+    </div>
+    <div class="card">
+      <h3>unbounded-net</h3>
+      <p>CNI plugin providing pod-to-pod connectivity across sites via WireGuard, GENEVE, VXLAN, or IPIP tunnels.</p>
+      <a href="{{ "concepts/networking" | relURL }}">Networking &rarr;</a>
+    </div>
+  </div>
+</section>
+
+<section class="home-steps">
+  <div class="home-steps-inner">
+    <h2>Get Up and Running</h2>
+    <ol class="steps-list">
+      <li>
+        <span class="step-num">1</span>
+        <div>
+          <strong><a href="{{ "guides/getting-started/#install-kubectl-unbounded" | relURL }}">Install the kubectl plugin</a></strong>
+        </div>
+      </li>
+      <li>
+        <span class="step-num">2</span>
+        <div>
+          <strong><a href="{{ "guides/getting-started/#initialize-a-site" | relURL }}">Initialize a site</a></strong>
+          <span class="step-desc">&mdash; sets up networking and the machina controller</span>
+        </div>
+      </li>
+      <li>
+        <span class="step-num">3</span>
+        <div>
+          <strong><a href="{{ "guides/getting-started/#add-machines" | relURL }}">Add machines</a></strong>
+          <span class="step-desc">&mdash; via SSH, cloud-init, or PXE</span>
+        </div>
+      </li>
+      <li>
+        <span class="step-num">4</span>
+        <div>
+          <strong>Watch them join</strong>
+          <span class="step-desc">&mdash; Pending &rarr; Provisioning &rarr; Joining &rarr; Ready</span>
+        </div>
+      </li>
+    </ol>
   </div>
 </section>
 
 <section class="overview">
+  <h2>Explore the Docs</h2>
   <div class="grid">
     <div class="card">
-      <h3>Cloud Bootstrapping (SSH)</h3>
+      <h3>Core Concepts</h3>
+      <p>Architecture, components, and design decisions behind Project Unbounded.</p>
+      <a href="{{ "concepts/overview" | relURL }}">Read Overview &rarr;</a>
+    </div>
+    <div class="card">
+      <h3>Cloud Bootstrapping</h3>
       <p>Join Linux machines to your cluster using SSH.</p>
-      <a href="{{ "guides/ssh" | relURL }}">Get Started</a>
+      <a href="{{ "guides/ssh" | relURL }}">SSH Guide &rarr;</a>
     </div>
     <div class="card">
 	  <h3>Bare Metal (PXE)</h3>
       <p>Netboot bare metal machines into your cluster.</p>
-      <a href="{{ "guides/pxe" | relURL }}">Get Started</a>
+      <a href="{{ "guides/pxe" | relURL }}">PXE Guide &rarr;</a>
     </div>
     <div class="card">
-	  <h3>Built-in Networking</h3>
-      <p><a href="https://github.com/project-unbounded/unbounded-net">unbounded-net</a> provides a transparent and secure pod overlay network across datacenters and cloud providers.</p>
+	  <h3>Networking Reference</h3>
+      <p>CRDs, configuration, routing flows, and operations for unbounded-net.</p>
+      <a href="{{ "reference/networking" | relURL }}">Reference &rarr;</a>
     </div>
   </div>
 </section>

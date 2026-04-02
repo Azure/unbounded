@@ -174,3 +174,16 @@ spec:
 - The reimage timeout is fixed at 30 minutes.
 - The Image CRD status has no fields — there is no visibility into download progress.
 - Cloud-init user-data hardcodes the Kubernetes v1.32 APT repository.
+
+## See Also
+
+- **[Bare Metal Concepts]({{< relref "concepts/bare-metal" >}})** -- Deeper
+  explanation of PXE boot, DHCP modes, TPM attestation, and pool isolation.
+- **[Project Overview]({{< relref "concepts/overview" >}})** -- How metalman
+  fits into the broader system.
+- **[CRD Reference]({{< relref "reference/machina-crd" >}})** -- Complete
+  Machine and Image API specification.
+- **[Architecture]({{< relref "reference/architecture" >}})** -- Internal
+  design of the PXE provisioning pipeline.
+- **[SSH Guide]({{< relref "guides/ssh" >}})** -- Alternative provisioning
+  path for machines with an existing OS.

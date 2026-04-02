@@ -12,7 +12,7 @@ central control plane. It adds:
 
 - **CRD-driven lifecycle management** for remote machines (`Machine`, `Image`).
 - **Two provisioning paths**: SSH-based (machina) and PXE-based (metalman).
-- **Cross-site networking** via WireGuard tunnels (unbounded-cni, separate repo).
+- **Cross-site networking** via WireGuard tunnels ([unbounded-net]({{< relref "concepts/networking" >}}), separate repo).
 
 ```
                   ┌─────────────────────────────────┐
@@ -255,3 +255,18 @@ Container images are multi-stage builds on Azure Linux 3.0, built with
 `podman`. CRDs are generated with `controller-gen` v0.20.1.
 
 **Build toolchain:** Go 1.25.7, controller-runtime v0.23.3.
+
+## See Also
+
+- **[Project Overview]({{< relref "concepts/overview" >}})** -- Conceptual
+  introduction to the system components.
+- **[Networking Concepts]({{< relref "concepts/networking" >}})** -- How
+  unbounded-net provides cross-site pod connectivity.
+- **[Networking Reference]({{< relref "reference/networking" >}})** -- Full
+  unbounded-net CRDs, configuration, routing flows, and operations.
+- **[Bare Metal Concepts]({{< relref "concepts/bare-metal" >}})** -- PXE boot,
+  TPM attestation, and metalman internals.
+- **[CLI Reference]({{< relref "reference/cli" >}})** -- `kubectl unbounded`
+  command and flag reference.
+- **[CRD Reference]({{< relref "reference/machina-crd" >}})** -- Machine and
+  Image API specification.

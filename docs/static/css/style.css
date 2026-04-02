@@ -170,11 +170,109 @@ a:hover {
   color: var(--color-accent);
 }
 
+/* ── Home: components section ────────────────────────────── */
+.home-components {
+  max-width: var(--max-width);
+  margin: 0 auto;
+  padding: 3.5rem 1.5rem 3rem;
+  text-align: center;
+}
+
+.home-components h2 {
+  font-size: 1.4rem;
+  font-weight: 700;
+  margin-bottom: 0.5rem;
+}
+
+.home-components-lead {
+  color: var(--color-text-secondary);
+  font-size: 1rem;
+  margin-bottom: 2rem;
+}
+
+.grid-3 {
+  grid-template-columns: repeat(3, 1fr);
+}
+
+.grid-4 {
+  grid-template-columns: repeat(4, 1fr);
+}
+
+.home-components .card {
+  text-align: left;
+}
+
+.home-components .card h3 {
+  font-family: var(--font-mono);
+  font-size: 1rem;
+  color: var(--color-accent);
+}
+
+/* ── Home: steps section ─────────────────────────────────── */
+.home-steps {
+  background: var(--color-hero-bg);
+  border-top: 1px solid var(--color-border);
+  border-bottom: 1px solid var(--color-border);
+  padding: 3.5rem 1.5rem;
+}
+
+.home-steps-inner {
+  max-width: 36rem;
+  margin: 0 auto;
+}
+
+.home-steps h2 {
+  font-size: 1.4rem;
+  font-weight: 700;
+  text-align: center;
+  margin-bottom: 2rem;
+}
+
+.steps-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+}
+
+.steps-list li {
+  display: flex;
+  align-items: baseline;
+  gap: 1rem;
+}
+
+.step-num {
+  flex-shrink: 0;
+  width: 2rem;
+  height: 2rem;
+  line-height: 2rem;
+  text-align: center;
+  font-size: 0.85rem;
+  font-weight: 700;
+  color: var(--color-accent);
+  border: 1.5px solid var(--color-accent);
+  border-radius: 50%;
+}
+
+.step-desc {
+  color: var(--color-text-secondary);
+  font-size: 0.9rem;
+}
+
 /* ── Overview grid ────────────────────────────────────────── */
 .overview {
   max-width: var(--max-width);
   margin: 0 auto;
-  padding: 3rem 1.5rem 4rem;
+  padding: 3.5rem 1.5rem 4rem;
+}
+
+.overview > h2 {
+  font-size: 1.4rem;
+  font-weight: 700;
+  text-align: center;
+  margin-bottom: 2rem;
 }
 
 .grid {
@@ -408,6 +506,14 @@ details[open] summary {
   }
 
   .grid {
+    grid-template-columns: 1fr;
+  }
+
+  .grid-3 {
+    grid-template-columns: 1fr;
+  }
+
+  .grid-4 {
     grid-template-columns: 1fr;
   }
 }
