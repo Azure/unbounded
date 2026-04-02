@@ -9,7 +9,7 @@ RUN apt-get update \
     curl \
     ca-certificates \
     iproute2 \
-    iptables \
+    nftables \
     kmod \
     udev \
     procps \

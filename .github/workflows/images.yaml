@@ -1,0 +1,100 @@
+name: Build Container Images
+
+on:
+  push:
+    tags:
+      - "images/*/*"
+
+  workflow_dispatch:
+    inputs:
+      image:
+        description: "Image to build (directory name under images/, e.g. \"agent-ubuntu2404\")"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  CONTAINER_REGISTRY: ghcr.io/${{ github.repository_owner }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Resolve the image name and tag from the trigger context.
+  #
+  #   Tag push  (images/<name>/<version>)  →  <name>:<version>
+  #   workflow_dispatch                     →  <name>:<sha>
+  # ---------------------------------------------------------------------------
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      name: ${{ steps.resolve.outputs.name }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      context: ${{ steps.resolve.outputs.context }}
+      file: ${{ steps.resolve.outputs.file }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve image name and tag
+        id: resolve
+        run: |
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            # Tag is like "images/agent-ubuntu2404/v1.0.0"
+            ref="${{ github.ref_name }}"            # e.g. images/agent-ubuntu2404/v1.0.0
+            name=$(echo "$ref" | cut -d/ -f2)       # e.g. agent-ubuntu2404
+            tag=$(echo "$ref" | cut -d/ -f3-)       # e.g. v1.0.0
+          else
+            # workflow_dispatch
+            name="${{ inputs.image }}"
+            tag="${{ github.sha }}"
+          fi
+
+          context="images/${name}"
+          file="${context}/Containerfile"
+
+          if [[ ! -f "$file" ]]; then
+            echo "::error::No Containerfile found at ${file}"
+            exit 1
+          fi
+
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "context=${context}" >> "$GITHUB_OUTPUT"
+          echo "file=${file}" >> "$GITHUB_OUTPUT"
+
+          echo "Image: ${name}:${tag}"
+          echo "Containerfile: ${file}"
+
+  # ---------------------------------------------------------------------------
+  # Build and push multi-arch container image.
+  # ---------------------------------------------------------------------------
+  build:
+    needs: resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: linux/amd64,linux/arm64
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ needs.resolve.outputs.context }}
+          file: ${{ needs.resolve.outputs.file }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.CONTAINER_REGISTRY }}/${{ needs.resolve.outputs.name }}:${{ needs.resolve.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

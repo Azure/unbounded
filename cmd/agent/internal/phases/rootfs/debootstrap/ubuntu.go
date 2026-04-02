@@ -54,7 +54,7 @@ func (b *ubuntu) Do(ctx context.Context) error {
 		"curl",
 		"ca-certificates",
 		"iproute2",
-		"iptables",
+		"nftables",
 		"kmod",
 		"udev",
 		"procps",
