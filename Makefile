@@ -28,11 +28,24 @@ BLOB_CONTAINER ?= release
 
 KUBECTL_PLUGIN_PLATFORMS = linux-amd64 linux-arm64 darwin-amd64 darwin-arm64
 
-.PHONY: all fmt lint test kubectl-unbounded kubectl-unbounded-cross krew-manifest forge inventory inventory-amd64 inventory-arm64 unbounded-agent machina machina-oci machina-oci-push metalman metalman-oci metalman-oci-push gomod images/ubuntu24/image.yaml push-blobs
+.PHONY: all fmt lint test check-deps kubectl-unbounded kubectl-unbounded-cross krew-manifest forge inventory inventory-amd64 inventory-arm64 unbounded-agent machina machina-oci machina-oci-push metalman metalman-oci metalman-oci-push gomod images/ubuntu24/image.yaml push-blobs
 
 all: kubectl-unbounded forge machina
 
-fmt:
+check-deps:
+	@command -v $(GOFMT) >/dev/null 2>&1 || \
+		{ echo "error: $(GOFMT) not found. Install it with:"; \
+		  echo "  go install mvdan.cc/gofumpt@latest"; exit 1; }
+	@command -v golangci-lint >/dev/null 2>&1 || \
+		{ echo "error: golangci-lint not found. Install it with:"; \
+		  echo "  go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest"; exit 1; }
+	@golangci-lint --version 2>&1 | grep -qE 'version v?2\.' || \
+		{ echo "error: golangci-lint v2 is required (.golangci.yaml uses version: \"2\")."; \
+		  echo "  Your installed version: $$(golangci-lint --version 2>&1 | head -1)"; \
+		  echo "  Install v2 with:"; \
+		  echo "  go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest"; exit 1; }
+
+fmt: check-deps
 	$(GOFMT) -w .
 
 lint: fmt
@@ -100,7 +113,7 @@ machina: test
 METALMAN_BIN=bin/metalman
 METALMAN_CMD=./cmd/metalman
 
-metalman:
+metalman: check-deps
 	$(GOFMT) -w $(METALMAN_CMD) ./internal/metalman
 	$(GOLINT) --fix -E wsl_v5 $(METALMAN_CMD)/... ./internal/metalman/...
 	$(GOLINT) $(METALMAN_CMD)/... ./internal/metalman/...
