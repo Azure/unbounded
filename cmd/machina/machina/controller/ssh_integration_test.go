@@ -586,7 +586,6 @@ func TestProvisionMachine_EndToEnd(t *testing.T) {
 			APIServer:    "api.example.com:443",
 			CACertBase64: "dGVzdC1jYQ==",
 			ClusterDNS:   "10.0.0.10",
-			ClusterRG:    "mc_rg",
 			KubeVersion:  "v1.34.2",
 		},
 	}
@@ -727,7 +726,6 @@ func TestProvisionMachine_ConfigFile(t *testing.T) {
 			APIServer:    "k8s.example.com:6443",
 			CACertBase64: "Y2VydC1kYXRh",
 			ClusterDNS:   "10.96.0.10",
-			ClusterRG:    "my-resource-group",
 			KubeVersion:  "v1.33.1",
 		},
 	}
@@ -904,7 +902,7 @@ func TestProvisionMachine_LabelMerge(t *testing.T) {
 				NodeLabels: map[string]string{
 					"env":            "production",
 					"team":           "platform",
-					MachineNodeLabel: "user-override", // User label wins over controller-injected.
+					MachineNodeLabel: "user-override", // Controller-injected label wins over this.
 				},
 			},
 		},
@@ -943,8 +941,8 @@ func TestProvisionMachine_LabelMerge(t *testing.T) {
 	require.Equal(t, "production", agentConfig.Kubelet.Labels["env"])
 	require.Equal(t, "platform", agentConfig.Kubelet.Labels["team"])
 
-	// User label overrides controller-injected label on conflict.
-	require.Equal(t, "user-override", agentConfig.Kubelet.Labels[MachineNodeLabel])
+	// Controller-injected label overrides user label on conflict.
+	require.Equal(t, "label-test-machine", agentConfig.Kubelet.Labels[MachineNodeLabel])
 }
 
 func TestProvisionMachine_Taints(t *testing.T) {
@@ -1006,6 +1004,80 @@ func TestProvisionMachine_Taints(t *testing.T) {
 	require.NoError(t, json.Unmarshal(configCmd.stdin, &agentConfig))
 
 	require.Equal(t, []string{"dedicated=gpu:NoSchedule", "special=true:NoExecute"}, agentConfig.Kubelet.RegisterWithTaints)
+}
+
+func TestProvisionMachine_ProviderLabelsOverride(t *testing.T) {
+	t.Parallel()
+
+	srv := newSSHTestServer(t)
+
+	_, signer := generateTestRSAKey(t)
+
+	s := runtime.NewScheme()
+	require.NoError(t, unboundedv1alpha3.AddToScheme(s))
+	require.NoError(t, corev1.AddToScheme(s))
+
+	machine := &unboundedv1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "provider-label-machine"},
+		Spec: unboundedv1alpha3.MachineSpec{
+			SSH: &unboundedv1alpha3.SSHSpec{
+				Host:          fmt.Sprintf("%s:%d", srv.host, srv.port),
+				Username:      "testuser",
+				PrivateKeyRef: unboundedv1alpha3.SecretKeySelector{Name: "ssh-key-secret"},
+			},
+			Kubernetes: &unboundedv1alpha3.KubernetesSpec{
+				BootstrapTokenRef: unboundedv1alpha3.LocalObjectReference{Name: "bt"},
+				NodeLabels: map[string]string{
+					"env": "production",
+					// User tries to override provider label — provider should win.
+					"kubernetes.azure.com/managed": "true",
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(machine).Build()
+
+	reconciler := &MachineReconciler{
+		Client: fakeClient,
+		Scheme: s,
+		ClusterInfo: &ClusterInfo{
+			Provider: &aksProvider{clusterName: "mc_rg_test_eastus"},
+		},
+	}
+
+	sshConfig := sshTestClientConfig(signer)
+
+	err := reconciler.provisionMachine(context.Background(), machine, sshConfig, "")
+	require.NoError(t, err)
+
+	commands := srv.getExecutedCommands()
+
+	var configCmd *sshExecutedCommand
+
+	for i := range commands {
+		if strings.Contains(commands[i].command, "cat >") && strings.Contains(commands[i].command, remoteConfigPath) {
+			configCmd = &commands[i]
+			break
+		}
+	}
+
+	require.NotNil(t, configCmd, "expected a config upload command")
+
+	var agentConfig provision.AgentConfig
+	require.NoError(t, json.Unmarshal(configCmd.stdin, &agentConfig))
+
+	// User label is preserved.
+	require.Equal(t, "production", agentConfig.Kubelet.Labels["env"])
+
+	// Provider label overrides user-specified value.
+	require.Equal(t, "false", agentConfig.Kubelet.Labels["kubernetes.azure.com/managed"])
+
+	// Provider label for cluster name is injected.
+	require.Equal(t, "mc_rg_test_eastus", agentConfig.Kubelet.Labels["kubernetes.azure.com/cluster"])
+
+	// Controller-injected label is present.
+	require.Equal(t, "provider-label-machine", agentConfig.Kubelet.Labels[MachineNodeLabel])
 }
 
 // ---------------------------------------------------------------------------

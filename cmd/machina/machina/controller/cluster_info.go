@@ -25,9 +25,9 @@ type ClusterInfo struct {
 	// ClusterDNS is the ClusterIP of the kube-dns Service in kube-system.
 	ClusterDNS string
 
-	// ClusterRG is the Azure node resource group read from a system-mode
-	// node's kubernetes.azure.com/cluster label.
-	ClusterRG string
+	// Provider is the detected cluster provider (e.g. AKS). It is nil
+	// when the provider cannot be determined.
+	Provider Provider
 
 	// KubeVersion is the Kubernetes server version (e.g. "v1.34.2") obtained
 	// from the API server's /version endpoint. It is used as the default
@@ -84,28 +84,14 @@ func ResolveClusterInfo(ctx context.Context, cfg Config, k kubernetes.Interface)
 	logger.Info("Resolved cluster DNS", "clusterDNS", info.ClusterDNS)
 
 	// ---------------------------------------------------------------
-	// CLUSTER_RG – kubernetes.azure.com/cluster label on a system node.
+	// Provider – detect the cluster provider (e.g. AKS).
 	// ---------------------------------------------------------------
-	nodes, err := k.CoreV1().Nodes().List(ctx, metav1.ListOptions{
-		LabelSelector: "kubernetes.azure.com/mode=system",
-		Limit:         1,
-	})
+	provider, err := detectProvider(ctx, k)
 	if err != nil {
-		return nil, fmt.Errorf("list system-mode nodes: %w", err)
+		return nil, fmt.Errorf("detect provider: %w", err)
 	}
 
-	if len(nodes.Items) == 0 {
-		return nil, fmt.Errorf("no nodes found with label kubernetes.azure.com/mode=system")
-	}
-
-	clusterRG, ok := nodes.Items[0].Labels["kubernetes.azure.com/cluster"]
-	if !ok || clusterRG == "" {
-		return nil, fmt.Errorf("system-mode node %q is missing kubernetes.azure.com/cluster label",
-			nodes.Items[0].Name)
-	}
-
-	info.ClusterRG = clusterRG
-	logger.Info("Resolved cluster resource group", "clusterRG", info.ClusterRG)
+	info.Provider = provider
 
 	// ---------------------------------------------------------------
 	// KUBE_VERSION – Kubernetes server version from the /version endpoint.
@@ -123,11 +109,16 @@ func ResolveClusterInfo(ctx context.Context, cfg Config, k kubernetes.Interface)
 	// ---------------------------------------------------------------
 	// Summary
 	// ---------------------------------------------------------------
+	providerID := "none"
+	if info.Provider != nil {
+		providerID = info.Provider.ID()
+	}
+
 	logger.Info("All cluster info resolved successfully",
 		"apiServer", info.APIServer,
 		"caCertBase64Length", len(info.CACertBase64),
 		"clusterDNS", info.ClusterDNS,
-		"clusterRG", info.ClusterRG,
+		"provider", providerID,
 		"kubeVersion", info.KubeVersion,
 	)
 

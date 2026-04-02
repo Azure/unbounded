@@ -568,14 +568,21 @@ func (r *MachineReconciler) provisionMachine(
 		clusterDNS = r.ClusterInfo.ClusterDNS
 	}
 
-	// Controller-injected labels (low priority — user labels win).
-	labels := map[string]string{
-		MachineNodeLabel: machine.Name,
-	}
+	// User-defined labels (lowest priority).
+	labels := map[string]string{}
 
-	// Merge user-defined labels on top.
 	if machine.Spec.Kubernetes != nil {
 		for k, v := range machine.Spec.Kubernetes.NodeLabels {
+			labels[k] = v
+		}
+	}
+
+	// Controller-injected labels override user labels.
+	labels[MachineNodeLabel] = machine.Name
+
+	// Provider-injected labels override everything.
+	if r.ClusterInfo != nil && r.ClusterInfo.Provider != nil {
+		for k, v := range r.ClusterInfo.Provider.DefaultLabels() {
 			labels[k] = v
 		}
 	}

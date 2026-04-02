@@ -324,7 +324,6 @@ func TestMachineReconciler_Provisioning_Success(t *testing.T) {
 			APIServer:    "api.example.com:443",
 			CACertBase64: "dGVzdC1jYQ==",
 			ClusterDNS:   "10.0.0.10",
-			ClusterRG:    "mc_rg",
 			KubeVersion:  "v1.34.2",
 		},
 	}
