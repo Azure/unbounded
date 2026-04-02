@@ -125,3 +125,18 @@ Machines transition through phases as they are provisioned and joined to the clu
 ```bash
 watch 'kubectl get machines'
 ```
+
+## Next Steps
+
+- **[Project Overview]({{< relref "concepts/overview" >}})** -- Understand how
+  the components fit together.
+- **[SSH Guide]({{< relref "guides/ssh" >}})** -- Deep dive into SSH
+  provisioning, bastion hosts, and troubleshooting.
+- **[PXE Guide]({{< relref "guides/pxe" >}})** -- Boot bare-metal servers
+  using metalman.
+- **[Networking Concepts]({{< relref "concepts/networking" >}})** -- Learn how
+  cross-site pod networking works.
+- **[CLI Reference]({{< relref "reference/cli" >}})** -- Full flag reference
+  for all `kubectl unbounded` commands.
+- **[CRD Reference]({{< relref "reference/machina-crd" >}})** -- Machine and
+  Image API specification.

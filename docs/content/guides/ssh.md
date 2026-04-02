@@ -16,7 +16,7 @@ resulting Node.
 - Linux (x86_64 or aarch64) with `bash`, `curl`, `tar`, and `sudo`
 - A user account with passwordless sudo
 - SSH server listening (port 22 by default)
-- Outbound internet access to download the AKS Flex Node binary and Kubernetes binaries
+- Outbound internet access to download the unbounded-kube agent binary and Kubernetes binaries
 - Outbound HTTPS to the Kubernetes API server
 
 **Cluster requirements:**
@@ -218,3 +218,18 @@ HTTPS connectivity to the API server.
 SSH keys are stored as Kubernetes Secrets in the `machina-system` namespace.
 The install script runs as root via `sudo -E bash`. All binary downloads use
 HTTPS. Supported key types: Ed25519, RSA, ECDSA.
+
+## See Also
+
+- **[Getting Started]({{< relref "guides/getting-started" >}})** -- Quickstart
+  covering the same flow with less detail.
+- **[Project Overview]({{< relref "concepts/overview" >}})** -- How machina fits
+  into the broader system.
+- **[Networking Concepts]({{< relref "concepts/networking" >}})** -- How
+  WireGuard tunnels and cross-site routing work.
+- **[CLI Reference]({{< relref "reference/cli" >}})** -- Full flag reference
+  for `site init` and `site add-machine`.
+- **[CRD Reference]({{< relref "reference/machina-crd" >}})** -- Complete
+  Machine and Image API specification.
+- **[Architecture]({{< relref "reference/architecture" >}})** -- Internal
+  design of the SSH provisioning pipeline.
