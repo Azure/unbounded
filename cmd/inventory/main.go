@@ -6,7 +6,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/project-unbounded/unbounded-kube/pkg/inventory"
+	"github.com/project-unbounded/unbounded-kube/internal/inventory"
 )
 
 func main() {

@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 
-	ipmi "github.com/bougou/go-ipmi"
+	"github.com/bougou/go-ipmi"
 )
 
 // BMCInfo holds information about an out-of-band management controller.
