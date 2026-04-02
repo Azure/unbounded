@@ -16,10 +16,10 @@ type Task interface {
 	Do(ctx context.Context) error
 }
 
-// executeTask logs start, then runs t.Do, then logs completion or failure in the
+// ExecuteTask logs start, then runs t.Do, then logs completion or failure in the
 // "wide" format: task name, start time, status and elapsed duration.
 // Any panic from t.Do is recovered, converted to an error, and logged as a failure.
-func executeTask(ctx context.Context, log *slog.Logger, t Task) (err error) {
+func ExecuteTask(ctx context.Context, log *slog.Logger, t Task) (err error) {
 	name := t.Name()
 	start := time.Now()
 
@@ -69,7 +69,7 @@ func (s *serial) Name() string { return taskGroupName("serial", s.tasks) }
 
 func (s *serial) Do(ctx context.Context) error {
 	for _, t := range s.tasks {
-		if err := executeTask(ctx, s.log, t); err != nil {
+		if err := ExecuteTask(ctx, s.log, t); err != nil {
 			return fmt.Errorf("%s: %w", t.Name(), err)
 		}
 	}
@@ -97,7 +97,7 @@ func (p *parallel) Do(ctx context.Context) error {
 
 	for _, t := range p.tasks {
 		eg.Go(func() error {
-			if err := executeTask(ctx, p.log, t); err != nil {
+			if err := ExecuteTask(ctx, p.log, t); err != nil {
 				return fmt.Errorf("%s: %w", t.Name(), err)
 			}
 

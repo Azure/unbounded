@@ -1,0 +1,19 @@
+# TODO: switch to debootstrap-based base image once we have the container registry set up
+FROM docker.io/library/ubuntu:noble
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    systemd \
+    systemd-sysv \
+    dbus \
+    curl \
+    ca-certificates \
+    iproute2 \
+    iptables \
+    kmod \
+    udev \
+    procps \
+    wireguard-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+# TODO: pre-install containerd / runc / kubernetes binaries

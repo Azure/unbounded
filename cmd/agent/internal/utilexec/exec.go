@@ -150,10 +150,3 @@ func Sysctl() func(context.Context) *exec.Cmd {
 		return exec.CommandContext(ctx, "sysctl")
 	}
 }
-
-// Debootstrap returns a command factory for debootstrap.
-func Debootstrap() func(context.Context) *exec.Cmd {
-	return func(ctx context.Context) *exec.Cmd {
-		return exec.CommandContext(ctx, "debootstrap")
-	}
-}

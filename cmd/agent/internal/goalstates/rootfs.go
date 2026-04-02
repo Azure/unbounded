@@ -9,9 +9,17 @@ type RootFS struct {
 	ServiceOverrideFile string // e.g. /etc/systemd/system/systemd-nspawn@node.service.d/override.conf
 	HostArch            string
 	HostKernel          string // running kernel version from uname -r, e.g. "6.8.0-45-generic"
+	Hostname            string // host hostname, written into the rootfs so the nspawn container inherits it
 	ContainerdVersion   string
 	RunCVersion         string
 	CNIPluginVersion    string
 	KubernetesVersion   string
+
+	// OCIImage is the fully-qualified OCI image reference (e.g.
+	// "ghcr.io/org/repo:tag") used to bootstrap the machine rootfs.
+	// The image must use OCI media types and include a platform manifest
+	// matching the host architecture.
+	OCIImage string
+
 	// TODO: declare GPU device & driver settings
 }

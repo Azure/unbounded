@@ -94,6 +94,14 @@ func resolveRootFSGoalState() (*goalstates.RootFS, error) {
 		return nil, err
 	}
 
+	hostname, err := os.Hostname()
+	if err != nil {
+		return nil, fmt.Errorf("get host hostname: %w", err)
+	}
+
+	// allow passing in through env var
+	ociImage := strings.TrimSpace(os.Getenv("AGENT_OCI_IMAGE"))
+
 	return &goalstates.RootFS{
 		MachineDir: filepath.Join("/var/lib/machines", machineName),
 		NSpawnConfigFile: filepath.Join(
@@ -107,10 +115,12 @@ func resolveRootFSGoalState() (*goalstates.RootFS, error) {
 		),
 		HostArch:          runtime.GOARCH,
 		HostKernel:        kernel,
+		Hostname:          hostname,
 		ContainerdVersion: goalstates.ContainerdVersion, // FIXME: allow overriding
 		RunCVersion:       goalstates.RunCVersion,       // FIXME allow overriding
 		CNIPluginVersion:  goalstates.CNIPluginVersion,  // FIXME: allow overriding
 		KubernetesVersion: kubeVersion,
+		OCIImage:          ociImage,
 	}, nil
 }
 

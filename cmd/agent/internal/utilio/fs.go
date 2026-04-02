@@ -3,9 +3,31 @@ package utilio
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 )
+
+// IsDirEmpty reports whether dir is empty or does not exist.
+func IsDirEmpty(dir string) (bool, error) {
+	f, err := os.Open(dir)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return true, nil
+	case err != nil:
+		return false, err
+	}
+
+	defer func() { _ = f.Close() }() //nolint:errcheck // best effort close
+
+	_, err = f.Readdirnames(1)
+	if errors.Is(err, io.EOF) {
+		// no entry read
+		return true, nil
+	}
+
+	return false, err
+}
 
 // CleanDir removes everything in a directory, but not the directory itself.
 func CleanDir(path string) (retErr error) {
