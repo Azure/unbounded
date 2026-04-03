@@ -56,7 +56,6 @@ done
 
 require_cmd kubectl "Install kubectl: https://kubernetes.io/docs/tasks/tools/"
 require_cmd az      "Install the Azure CLI: https://aka.ms/installazurecli"
-require_cmd python3 "Install Python 3.x: https://www.python.org/downloads/"
 
 az account show --output none 2>/dev/null \
   || die "not logged in to Azure. Run: az login"
@@ -82,38 +81,32 @@ if [[ -z "$OPT_SUBSCRIPTION" ]] || [[ -z "$OPT_RESOURCE_GROUP" ]] || [[ -z "$OPT
     || die "not an AKS cluster (providerID: $PROVIDER_ID). This script supports AKS only."
 
   read -r DETECTED_SUB DETECTED_NODE_RG DETECTED_RG DETECTED_CLUSTER DETECTED_LOCATION < <(
-    python3 - "$PROVIDER_ID" <<'PYEOF'
-import re, sys
+    # Extract subscription and node resource group from the providerID path.
+    # Format: azure:///subscriptions/{sub}/resourceGroups/{nodeRG}/...
+    remainder="${PROVIDER_ID#azure:///subscriptions/}"
+    DETECTED_SUB="${remainder%%/*}"
+    remainder="${remainder#*/resourceGroups/}"
+    node_rg="${remainder%%/*}"
 
-pid = sys.argv[1]
-m = re.match(r'azure:///subscriptions/([^/]+)/resourceGroups/([^/]+)/', pid, re.IGNORECASE)
-if not m:
-    print("", "", "", "", "", flush=True)
-    sys.exit(0)
-
-sub     = m.group(1)
-node_rg = m.group(2)
-
-# AKS node resource group convention: MC_{rg}_{cluster}_{location}
-# The prefix is case-insensitive; Azure lowercases it.
-if not re.match(r'mc_', node_rg, re.IGNORECASE):
-    print("", "", "", "", "", flush=True)
-    sys.exit(0)
-
-# Strip the "mc_" prefix then split; cluster=second-to-last, location=last,
-# rg=everything in between (handles underscores in the RG name).
-inner  = node_rg[3:]                    # jawilder-test_test_canadacentral
-parts  = inner.split('_')
-if len(parts) < 3:
-    print("", "", "", "", "", flush=True)
-    sys.exit(0)
-
-location = parts[-1]
-cluster  = parts[-2]
-rg       = '_'.join(parts[:-2])
-
-print(sub, node_rg, rg, cluster, location, flush=True)
-PYEOF
+    # AKS node resource group convention: MC_{rg}_{cluster}_{location}
+    node_rg_lower="${node_rg,,}"
+    if [[ "$node_rg_lower" != mc_* ]]; then
+      echo "" "" "" "" ""
+    else
+      inner="${node_rg:3}"   # strip leading "MC_" or "mc_"
+      # Split on '_'; location=last, cluster=second-to-last, rg=everything before.
+      IFS='_' read -ra parts <<< "$inner"
+      n="${#parts[@]}"
+      if [[ $n -lt 3 ]]; then
+        echo "" "" "" "" ""
+      else
+        location="${parts[$((n-1))]}"
+        cluster="${parts[$((n-2))]}"
+        rg="${parts[*]:0:$((n-2))}"
+        rg="${rg// /_}"
+        echo "$DETECTED_SUB" "$node_rg" "$rg" "$cluster" "$location"
+      fi
+    fi
   )
 
   [[ -z "$DETECTED_SUB" ]] && die "could not parse providerID '$PROVIDER_ID'. Pass --subscription, --resource-group, and --cluster-name explicitly."
@@ -148,26 +141,42 @@ fi
 # ── fetch pod and service CIDRs from az aks show ──────────────────────────────
 
 echo "Fetching network profile from AKS..."
-AKS_JSON=$(az aks show \
+mapfile -t _cidrs < <(az aks show \
   --subscription "$SUB" \
   --resource-group "$RG" \
   --name "$CLUSTER" \
-  --output json)
-
-read -r POD_CIDR SERVICE_CIDR < <(python3 - "$AKS_JSON" <<'PYEOF'
-import json, sys
-d = json.loads(sys.argv[1])
-np = d.get("networkProfile", {})
-pod_cidr     = np.get("podCidr") or ""
-service_cidr = np.get("serviceCidr") or ""
-print(pod_cidr, service_cidr, flush=True)
-PYEOF
-)
+  --query "[networkProfile.podCidr, networkProfile.serviceCidr]" \
+  --output tsv)
+POD_CIDR="${_cidrs[0]:-}"
+SERVICE_CIDR="${_cidrs[1]:-}"
 
 [[ -z "$POD_CIDR" ]]     && die "could not determine pod CIDR from AKS network profile. Pass --cluster-pod-cidr explicitly to kubectl unbounded site init."
 [[ -z "$SERVICE_CIDR" ]] && die "could not determine service CIDR from AKS network profile. Pass --cluster-service-cidr explicitly to kubectl unbounded site init."
 
-# ── find node subnet CIDR from VNet ──────────────────────────────────────────
+# ip4_to_int <a.b.c.d> — print the IPv4 address as a decimal integer.
+ip4_to_int() {
+  local IFS=.
+  read -r a b c d <<< "$1"
+  echo $(( (a << 24) | (b << 16) | (c << 8) | d ))
+}
+
+# subnet_contains_all <prefix/len> <newline-separated IPs>
+# Returns 0 (true) if every IP is within the subnet, 1 otherwise.
+subnet_contains_all() {
+  local prefix="${1%/*}"
+  local len="${1#*/}"
+  local mask=$(( 0xFFFFFFFF << (32 - len) & 0xFFFFFFFF ))
+  local net_int
+  net_int=$(ip4_to_int "$prefix")
+  local network=$(( net_int & mask ))
+  while IFS= read -r ip; do
+    [[ -z "$ip" ]] && continue
+    local ip_int
+    ip_int=$(ip4_to_int "$ip")
+    [[ $(( ip_int & mask )) -eq $network ]] || return 1
+  done <<< "$2"
+  return 0
+}
 
 echo "Fetching VNet subnets from node resource group..."
 
@@ -176,39 +185,14 @@ NODE_IPS=$(kubectl "${KUBECTL_CTX_ARGS[@]}" get nodes \
 
 [[ -z "$NODE_IPS" ]] && die "could not retrieve node internal IPs."
 
-VNET_JSON=$(az network vnet list \
+NODE_CIDR=$(az network vnet list \
   --subscription "$SUB" \
   --resource-group "$NODE_RG" \
-  --output json)
-
-NODE_CIDR=$(python3 - "$VNET_JSON" "$NODE_IPS" <<'PYEOF'
-import ipaddress, json, sys
-
-vnets    = json.loads(sys.argv[1])
-node_ips = [ipaddress.ip_address(ip.strip()) for ip in sys.argv[2].strip().splitlines() if ip.strip()]
-
-candidates = []
-for vnet in vnets:
-    for subnet in vnet.get("subnets", []):
-        prefix = subnet.get("addressPrefix") or ""
-        if not prefix:
-            continue
-        try:
-            net = ipaddress.ip_network(prefix, strict=False)
-        except ValueError:
-            continue
-        if all(ip in net for ip in node_ips):
-            candidates.append(net)
-
-if not candidates:
-    print("", flush=True)
-    sys.exit(0)
-
-# Pick the most specific (smallest) subnet that contains all node IPs.
-candidates.sort(key=lambda n: n.prefixlen, reverse=True)
-print(str(candidates[0]), flush=True)
-PYEOF
-)
+  --query "[].subnets[].addressPrefix" \
+  --output tsv | while IFS= read -r prefix; do
+    [[ -z "$prefix" ]] && continue
+    subnet_contains_all "$prefix" "$NODE_IPS" && echo "$prefix" && break
+  done)
 
 [[ -z "$NODE_CIDR" ]] && die "could not find a VNet subnet containing all node IPs. Pass --cluster-node-cidr explicitly to kubectl unbounded site init."
 
