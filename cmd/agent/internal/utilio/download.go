@@ -4,6 +4,8 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -123,4 +125,71 @@ func DownloadToLocalFile(ctx context.Context, url, filename string, perm os.File
 	defer body.Close() //nolint:errcheck // body close
 
 	return InstallFile(filename, body, perm)
+}
+
+// DownloadWithSHA256Verification downloads content from the given URL and verifies it against the SHA256
+// checksum fetched from checksumURL. The checksum file is expected to contain a hex-encoded SHA256 hash
+// (optionally followed by whitespace and a filename, which is ignored).
+//
+// NOTE: we assume the filename is trusted and cleaned without path traversal characters.
+func DownloadWithSHA256Verification(ctx context.Context, url, checksumURL, filename string, perm os.FileMode) error {
+	expectedHash, err := fetchSHA256(ctx, checksumURL)
+	if err != nil {
+		return fmt.Errorf("fetch checksum from %q: %w", checksumURL, err)
+	}
+
+	body, err := downloadFromRemote(ctx, url)
+	if err != nil {
+		return err
+	}
+	defer body.Close() //nolint:errcheck // body close
+
+	hasher := sha256.New()
+	teeReader := io.TeeReader(body, hasher)
+
+	if err := InstallFile(filename, teeReader, perm); err != nil {
+		return err
+	}
+
+	actualHash := hex.EncodeToString(hasher.Sum(nil))
+	if actualHash != expectedHash {
+		// Remove the file that failed verification.
+		_ = os.Remove(filename) //nolint:errcheck // best-effort cleanup
+		return fmt.Errorf("SHA256 mismatch for %q: expected %s, got %s", url, expectedHash, actualHash)
+	}
+
+	return nil
+}
+
+// fetchSHA256 downloads and parses a SHA256 checksum file. The file is expected to contain a hex-encoded
+// hash, optionally followed by whitespace and a filename (standard sha256sum output format).
+func fetchSHA256(ctx context.Context, checksumURL string) (string, error) {
+	body, err := downloadFromRemote(ctx, checksumURL)
+	if err != nil {
+		return "", err
+	}
+	defer body.Close() //nolint:errcheck // body close
+
+	// Checksum files are small; limit to 1 KiB to prevent abuse.
+	raw, err := io.ReadAll(io.LimitReader(body, 1024))
+	if err != nil {
+		return "", fmt.Errorf("read checksum body: %w", err)
+	}
+
+	// Parse: the file may be just the hex hash, or "hash  filename\n" (sha256sum format).
+	hashStr := strings.TrimSpace(string(raw))
+	if fields := strings.Fields(hashStr); len(fields) >= 1 {
+		hashStr = fields[0]
+	}
+
+	if len(hashStr) != sha256.Size*2 {
+		return "", fmt.Errorf("invalid SHA256 hash length %d in checksum file", len(hashStr))
+	}
+
+	// Validate that the string is valid hex.
+	if _, err := hex.DecodeString(hashStr); err != nil {
+		return "", fmt.Errorf("invalid hex in checksum file: %w", err)
+	}
+
+	return hashStr, nil
 }
