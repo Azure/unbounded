@@ -39,7 +39,6 @@ MACHINE_NAME="${2:-agent-vm}"
 
 [[ -f "$KUBECONFIG" ]] || die "kubeconfig not found: $KUBECONFIG"
 command -v kubectl >/dev/null 2>&1 || die "kubectl is required but not found in PATH"
-command -v jq >/dev/null 2>&1 || die "jq is required but not found in PATH"
 
 export KUBECONFIG
 
@@ -52,7 +51,10 @@ ca_cert_b64=$(kubectl config view --raw -o jsonpath='{.clusters[0].cluster.certi
 [[ -n "$ca_cert_b64" ]] || die "could not extract CA certificate from kubeconfig"
 
 # --- KUBE_VERSION ---
-kube_version=$(kubectl version -o json 2>/dev/null | jq -r '.serverVersion.gitVersion') || true
+# The second "gitVersion" entry in the JSON output is the server version.
+kube_version=$(kubectl version -o json 2>/dev/null \
+    | grep '"gitVersion"' | tail -1 \
+    | tr -d ' ",' | cut -d: -f2) || true
 [[ -n "$kube_version" ]] || die "could not determine Kubernetes version from cluster"
 
 # --- CLUSTER_DNS ---
@@ -94,42 +96,41 @@ bootstrap_token="${token_id}.${token_secret}"
 # --- NODE RESOURCE GROUP (for Labels) ---
 cluster_rg=$(kubectl get nodes -o jsonpath='{.items[0].metadata.labels.kubernetes\.azure\.com/cluster}' 2>/dev/null) || true
 
-# --- Build labels object ---
-labels=$(jq -n --arg rg "$cluster_rg" '
-    {"kubernetes.azure.com/managed": "false"}
-    | if $rg != "" then . + {"kubernetes.azure.com/cluster": $rg} else . end
-')
+# --- Build labels JSON object ---
+labels_json="\"kubernetes.azure.com/managed\": \"false\""
+if [[ -n "$cluster_rg" ]]; then
+    labels_json+=", \"kubernetes.azure.com/cluster\": \"${cluster_rg}\""
+fi
 
-# --- Build taints array ---
+# --- Build taints JSON array ---
 # REGISTER_WITH_TAINTS is optional; split comma-separated entries into a JSON array.
-taints="[]"
+taints_json="[]"
 if [[ -n "${REGISTER_WITH_TAINTS:-}" ]]; then
-    taints=$(printf '%s' "$REGISTER_WITH_TAINTS" | jq -R 'split(",")')
+    taints_json="["
+    IFS=',' read -ra taint_parts <<< "$REGISTER_WITH_TAINTS"
+    first=true
+    for t in "${taint_parts[@]}"; do
+        $first || taints_json+=","
+        taints_json+="\"${t}\""
+        first=false
+    done
+    taints_json+="]"
 fi
 
 # --- Render JSON config ---
-jq -n \
-    --arg machineName "$MACHINE_NAME" \
-    --arg caCert      "$ca_cert_b64" \
-    --arg clusterDNS  "$cluster_dns" \
-    --arg version     "$kube_version" \
-    --arg apiServer   "$api_server" \
-    --arg token       "$bootstrap_token" \
-    --argjson labels  "$labels" \
-    --argjson taints  "$taints" \
-'{
-    MachineName: $machineName,
-    Cluster: {
-        CaCertBase64: $caCert,
-        ClusterDNS:   $clusterDNS,
-        Version:      $version
-    },
-    Kubelet: {
-        ApiServer:          $apiServer,
-        BootstrapToken:     $token,
-        Labels:             $labels,
-        RegisterWithTaints: $taints
-    }
-}' > "$OUTPUT_FILE"
+printf '{\n' > "$OUTPUT_FILE"
+printf '  "MachineName": "%s",\n'  "$MACHINE_NAME"          >> "$OUTPUT_FILE"
+printf '  "Cluster": {\n'                                    >> "$OUTPUT_FILE"
+printf '    "CaCertBase64": "%s",\n' "$ca_cert_b64"          >> "$OUTPUT_FILE"
+printf '    "ClusterDNS": "%s",\n'   "$cluster_dns"          >> "$OUTPUT_FILE"
+printf '    "Version": "%s"\n'       "$kube_version"         >> "$OUTPUT_FILE"
+printf '  },\n'                                              >> "$OUTPUT_FILE"
+printf '  "Kubelet": {\n'                                    >> "$OUTPUT_FILE"
+printf '    "ApiServer": "%s",\n'      "$api_server"         >> "$OUTPUT_FILE"
+printf '    "BootstrapToken": "%s",\n' "$bootstrap_token"    >> "$OUTPUT_FILE"
+printf '    "Labels": {%s},\n'         "$labels_json"        >> "$OUTPUT_FILE"
+printf '    "RegisterWithTaints": %s\n' "$taints_json"       >> "$OUTPUT_FILE"
+printf '  }\n'                                               >> "$OUTPUT_FILE"
+printf '}\n'                                                 >> "$OUTPUT_FILE"
 
 echo "Wrote agent config to ${OUTPUT_FILE}"
