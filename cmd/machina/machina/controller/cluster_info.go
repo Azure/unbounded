@@ -9,6 +9,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
+
+	"github.com/project-unbounded/unbounded-kube/internal/cloudprovider"
 )
 
 // ClusterInfo holds cluster-level values resolved once at startup and passed
@@ -27,7 +29,7 @@ type ClusterInfo struct {
 
 	// Provider is the detected cluster provider (e.g. AKS). It is nil
 	// when the provider cannot be determined.
-	Provider Provider
+	Provider cloudprovider.Provider
 
 	// KubeVersion is the Kubernetes server version (e.g. "v1.34.2") obtained
 	// from the API server's /version endpoint. It is used as the default
@@ -86,7 +88,7 @@ func ResolveClusterInfo(ctx context.Context, cfg Config, k kubernetes.Interface)
 	// ---------------------------------------------------------------
 	// Provider – detect the cluster provider (e.g. AKS).
 	// ---------------------------------------------------------------
-	provider, err := detectProvider(ctx, k)
+	provider, err := cloudprovider.DetectProvider(ctx, k)
 	if err != nil {
 		return nil, fmt.Errorf("detect provider: %w", err)
 	}

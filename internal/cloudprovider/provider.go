@@ -1,4 +1,4 @@
-package controller
+package cloudprovider
 
 import (
 	"context"
@@ -22,29 +22,29 @@ type Provider interface {
 	DefaultLabels() map[string]string
 }
 
-// aksProvider implements Provider for Azure Kubernetes Service clusters.
-type aksProvider struct {
-	// clusterName is the value of the kubernetes.azure.com/cluster label
+// AKSProvider implements Provider for Azure Kubernetes Service clusters.
+type AKSProvider struct {
+	// ClusterName is the value of the kubernetes.azure.com/cluster label
 	// read from a system-mode node.
-	clusterName string
+	ClusterName string
 }
 
-func (p *aksProvider) ID() string {
+func (p *AKSProvider) ID() string {
 	return "microsoft-aks"
 }
 
-func (p *aksProvider) DefaultLabels() map[string]string {
+func (p *AKSProvider) DefaultLabels() map[string]string {
 	return map[string]string{
 		"kubernetes.azure.com/managed": "false",
-		"kubernetes.azure.com/cluster": p.clusterName,
+		"kubernetes.azure.com/cluster": p.ClusterName,
 	}
 }
 
-// detectProvider probes the cluster to identify the Kubernetes provider.
+// DetectProvider probes the cluster to identify the Kubernetes provider.
 // It returns nil when the provider cannot be determined (e.g. vanilla
 // Kubernetes, on-prem, k3s). A non-nil error indicates a transient
 // failure during detection, not an unknown provider.
-func detectProvider(ctx context.Context, k kubernetes.Interface) (Provider, error) {
+func DetectProvider(ctx context.Context, k kubernetes.Interface) (Provider, error) {
 	logger := ctrl.Log.WithName("provider-detection")
 
 	// AKS: check for the aks-cluster-metadata ConfigMap in kube-public.
@@ -81,5 +81,5 @@ func detectProvider(ctx context.Context, k kubernetes.Interface) (Provider, erro
 
 	logger.Info("Resolved AKS cluster name", "clusterName", clusterName)
 
-	return &aksProvider{clusterName: clusterName}, nil
+	return &AKSProvider{ClusterName: clusterName}, nil
 }

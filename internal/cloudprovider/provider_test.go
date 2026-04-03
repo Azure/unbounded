@@ -1,4 +1,4 @@
-package controller
+package cloudprovider
 
 import (
 	"context"
@@ -31,7 +31,7 @@ func TestDetectProvider_AKS(t *testing.T) {
 		},
 	)
 
-	provider, err := detectProvider(context.Background(), kubeCli)
+	provider, err := DetectProvider(context.Background(), kubeCli)
 	require.NoError(t, err)
 	require.NotNil(t, provider)
 	require.Equal(t, "microsoft-aks", provider.ID())
@@ -47,7 +47,7 @@ func TestDetectProvider_NotAKS(t *testing.T) {
 	// No aks-cluster-metadata ConfigMap — vanilla cluster.
 	kubeCli := fake.NewClientset()
 
-	provider, err := detectProvider(context.Background(), kubeCli)
+	provider, err := DetectProvider(context.Background(), kubeCli)
 	require.NoError(t, err)
 	require.Nil(t, provider)
 }
@@ -65,7 +65,7 @@ func TestDetectProvider_AKS_NoSystemNodes(t *testing.T) {
 		// No nodes with kubernetes.azure.com/mode=system.
 	)
 
-	provider, err := detectProvider(context.Background(), kubeCli)
+	provider, err := DetectProvider(context.Background(), kubeCli)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "no nodes found")
 	require.Nil(t, provider)
@@ -92,7 +92,7 @@ func TestDetectProvider_AKS_MissingClusterLabel(t *testing.T) {
 		},
 	)
 
-	provider, err := detectProvider(context.Background(), kubeCli)
+	provider, err := DetectProvider(context.Background(), kubeCli)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "missing kubernetes.azure.com/cluster label")
 	require.Nil(t, provider)
@@ -101,7 +101,7 @@ func TestDetectProvider_AKS_MissingClusterLabel(t *testing.T) {
 func TestAKSProvider_DefaultLabels(t *testing.T) {
 	t.Parallel()
 
-	p := &aksProvider{clusterName: "mc_rg_test_eastus"}
+	p := &AKSProvider{ClusterName: "mc_rg_test_eastus"}
 	require.Equal(t, "microsoft-aks", p.ID())
 
 	labels := p.DefaultLabels()

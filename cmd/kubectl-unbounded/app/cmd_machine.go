@@ -11,6 +11,7 @@ func machineCommandGroup() *cobra.Command {
 	cmd.AddCommand(
 		machineRebootCommand(),
 		machineReimageCommand(),
+		machineManualBootstrapCommand(),
 	)
 
 	return cmd

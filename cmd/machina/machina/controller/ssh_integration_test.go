@@ -24,6 +24,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	unboundedv1alpha3 "github.com/project-unbounded/unbounded-kube/api/v1alpha3"
+	"github.com/project-unbounded/unbounded-kube/internal/cloudprovider"
 	"github.com/project-unbounded/unbounded-kube/internal/provision"
 )
 
@@ -1042,7 +1043,7 @@ func TestProvisionMachine_ProviderLabelsOverride(t *testing.T) {
 		Client: fakeClient,
 		Scheme: s,
 		ClusterInfo: &ClusterInfo{
-			Provider: &aksProvider{clusterName: "mc_rg_test_eastus"},
+			Provider: &cloudprovider.AKSProvider{ClusterName: "mc_rg_test_eastus"},
 		},
 	}
 
