@@ -160,11 +160,12 @@ func resolveKubeletGoalState(cfg *provision.AgentConfig) (goalstates.Kubelet, er
 	}
 
 	return goalstates.Kubelet{
-		KubeletBinPath: filepath.Join("/"+goalstates.BinDir, "kubelet"),
-		BootstrapToken: cfg.Kubelet.BootstrapToken,
-		APIServer:      cfg.Kubelet.ApiServer,
-		CACertData:     caCert,
-		ClusterDNS:     cfg.Cluster.ClusterDNS,
-		NodeLabels:     labels,
+		KubeletBinPath:     filepath.Join("/"+goalstates.BinDir, "kubelet"),
+		BootstrapToken:     cfg.Kubelet.BootstrapToken,
+		APIServer:          cfg.Kubelet.ApiServer,
+		CACertData:         caCert,
+		ClusterDNS:         cfg.Cluster.ClusterDNS,
+		NodeLabels:         labels,
+		RegisterWithTaints: cfg.Kubelet.RegisterWithTaints,
 	}, nil
 }

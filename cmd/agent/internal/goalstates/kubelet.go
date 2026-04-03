@@ -22,4 +22,9 @@ type Kubelet struct {
 
 	// NodeLabels are key=value labels applied to the node at registration.
 	NodeLabels map[string]string
+
+	// RegisterWithTaints are taints applied to the node at registration.
+	// Each entry uses the kubelet format: "key=value:effect"
+	// (e.g. "dedicated=gpu:NoSchedule").
+	RegisterWithTaints []string
 }

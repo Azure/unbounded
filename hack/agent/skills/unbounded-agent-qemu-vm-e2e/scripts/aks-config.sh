@@ -9,6 +9,10 @@
 #   kubeconfig    - path to the kubeconfig file for the target AKS cluster
 #   machine-name  - optional machine name (default: "agent-vm")
 #
+# Environment variables:
+#   REGISTER_WITH_TAINTS - optional comma-separated taints in "key=value:effect"
+#                          format (e.g. "dedicated=gpu:NoSchedule,workload=ml:PreferNoSchedule")
+#
 # The script writes unbounded-agent-config-dev.json at the repo root.
 # Inside the qemu VM the repo is mounted at /agent, so the agent can read it
 # directly:
@@ -96,6 +100,13 @@ labels=$(jq -n --arg rg "$cluster_rg" '
     | if $rg != "" then . + {"kubernetes.azure.com/cluster": $rg} else . end
 ')
 
+# --- Build taints array ---
+# REGISTER_WITH_TAINTS is optional; split comma-separated entries into a JSON array.
+taints="[]"
+if [[ -n "${REGISTER_WITH_TAINTS:-}" ]]; then
+    taints=$(printf '%s' "$REGISTER_WITH_TAINTS" | jq -R 'split(",")')
+fi
+
 # --- Render JSON config ---
 jq -n \
     --arg machineName "$MACHINE_NAME" \
@@ -105,6 +116,7 @@ jq -n \
     --arg apiServer   "$api_server" \
     --arg token       "$bootstrap_token" \
     --argjson labels  "$labels" \
+    --argjson taints  "$taints" \
 '{
     MachineName: $machineName,
     Cluster: {
@@ -113,9 +125,10 @@ jq -n \
         Version:      $version
     },
     Kubelet: {
-        ApiServer:      $apiServer,
-        BootstrapToken: $token,
-        Labels:         $labels
+        ApiServer:          $apiServer,
+        BootstrapToken:     $token,
+        Labels:             $labels,
+        RegisterWithTaints: $taints
     }
 }' > "$OUTPUT_FILE"
 

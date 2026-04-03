@@ -119,6 +119,10 @@ func (c *configureKubelet) ensureKubeletDropIns() error {
 	// deterministic output.
 	nodeLabels := formatNodeLabels(spec.NodeLabels)
 
+	// Format taints as a comma-separated "key=value:effect" string, sorted
+	// for deterministic output.
+	registerWithTaints := formatRegisterWithTaints(spec.RegisterWithTaints)
+
 	dropIns := []struct {
 		name string
 		data any
@@ -134,9 +138,10 @@ func (c *configureKubelet) ensureKubeletDropIns() error {
 		{
 			name: "20-node-config.conf",
 			data: map[string]any{
-				"NodeLabels":   nodeLabels,
-				"ClientCAFile": goalstates.KubeletAPIServerCACertPath,
-				"ClusterDNS":   spec.ClusterDNS,
+				"NodeLabels":         nodeLabels,
+				"RegisterWithTaints": registerWithTaints,
+				"ClientCAFile":       goalstates.KubeletAPIServerCACertPath,
+				"ClusterDNS":         spec.ClusterDNS,
 			},
 		},
 		{
@@ -200,4 +205,19 @@ func formatNodeLabels(labels map[string]string) string {
 	}
 
 	return strings.Join(pairs, ",")
+}
+
+// formatRegisterWithTaints formats a slice of taints as a sorted,
+// comma-separated string suitable for the kubelet --register-with-taints flag.
+// Each entry is expected to already be in "key=value:effect" format.
+func formatRegisterWithTaints(taints []string) string {
+	if len(taints) == 0 {
+		return ""
+	}
+
+	sorted := make([]string, len(taints))
+	copy(sorted, taints)
+	sort.Strings(sorted)
+
+	return strings.Join(sorted, ",")
 }

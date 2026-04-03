@@ -116,6 +116,12 @@ func loadConfigFromEnv() (*provision.AgentConfig, error) {
 		}
 	}
 
+	// REGISTER_WITH_TAINTS is optional; parse "key=val:effect,..." format.
+	var taints []string
+	if raw := strings.TrimSpace(os.Getenv("REGISTER_WITH_TAINTS")); raw != "" {
+		taints = strings.Split(raw, ",")
+	}
+
 	return &provision.AgentConfig{
 		MachineName: machineName,
 		Cluster: provision.AgentClusterConfig{
@@ -124,9 +130,10 @@ func loadConfigFromEnv() (*provision.AgentConfig, error) {
 			Version:      kubeVersion,
 		},
 		Kubelet: provision.AgentKubeletConfig{
-			ApiServer:      apiServer,
-			BootstrapToken: bootstrapToken,
-			Labels:         labels,
+			ApiServer:          apiServer,
+			BootstrapToken:     bootstrapToken,
+			Labels:             labels,
+			RegisterWithTaints: taints,
 		},
 	}, nil
 }

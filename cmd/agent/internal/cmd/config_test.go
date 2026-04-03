@@ -35,6 +35,10 @@ func sampleConfig() provision.AgentConfig {
 			Labels: map[string]string{
 				"env": "test",
 			},
+			RegisterWithTaints: []string{
+				"dedicated=gpu:NoSchedule",
+				"workload=ml:PreferNoSchedule",
+			},
 		},
 	}
 }
@@ -56,6 +60,7 @@ func TestLoadConfig_FromFile(t *testing.T) {
 	assert.Equal(t, "https://api.example.com:443", got.Kubelet.ApiServer)
 	assert.Equal(t, "abc123.secret456", got.Kubelet.BootstrapToken)
 	assert.Equal(t, map[string]string{"env": "test"}, got.Kubelet.Labels)
+	assert.Equal(t, []string{"dedicated=gpu:NoSchedule", "workload=ml:PreferNoSchedule"}, got.Kubelet.RegisterWithTaints)
 }
 
 func TestLoadConfig_FromFile_VersionWithoutPrefix(t *testing.T) {
@@ -101,6 +106,7 @@ func TestLoadConfig_FromEnv(t *testing.T) {
 	t.Setenv("CA_CERT_BASE64", "ZW52LWNh")
 	t.Setenv("CLUSTER_DNS", "10.96.0.10")
 	t.Setenv("NODE_LABELS", "env=staging,team=infra")
+	t.Setenv("REGISTER_WITH_TAINTS", "dedicated=gpu:NoSchedule,workload=ml:PreferNoSchedule")
 
 	got, err := loadConfig()
 	require.NoError(t, err)
@@ -112,6 +118,7 @@ func TestLoadConfig_FromEnv(t *testing.T) {
 	assert.Equal(t, "https://api.env.example.com:443", got.Kubelet.ApiServer)
 	assert.Equal(t, "envtok.envsec", got.Kubelet.BootstrapToken)
 	assert.Equal(t, map[string]string{"env": "staging", "team": "infra"}, got.Kubelet.Labels)
+	assert.Equal(t, []string{"dedicated=gpu:NoSchedule", "workload=ml:PreferNoSchedule"}, got.Kubelet.RegisterWithTaints)
 }
 
 func TestLoadConfig_FromEnv_NoLabels(t *testing.T) {
@@ -124,11 +131,13 @@ func TestLoadConfig_FromEnv_NoLabels(t *testing.T) {
 	t.Setenv("CA_CERT_BASE64", "Y2E=")
 	t.Setenv("CLUSTER_DNS", "10.0.0.10")
 	t.Setenv("NODE_LABELS", "")
+	t.Setenv("REGISTER_WITH_TAINTS", "")
 
 	got, err := loadConfig()
 	require.NoError(t, err)
 
 	assert.Empty(t, got.Kubelet.Labels)
+	assert.Empty(t, got.Kubelet.RegisterWithTaints)
 }
 
 func TestLoadConfig_FromEnv_MissingRequired(t *testing.T) {
@@ -178,4 +187,34 @@ func TestLoadConfig_FilePreferredOverEnv(t *testing.T) {
 
 	assert.Equal(t, "test-machine", got.MachineName)
 	assert.Equal(t, "https://api.example.com:443", got.Kubelet.ApiServer)
+}
+
+func TestLoadConfig_FromFile_NoTaints(t *testing.T) {
+	cfg := sampleConfig()
+	cfg.Kubelet.RegisterWithTaints = nil
+	path := writeConfigFile(t, cfg)
+
+	t.Setenv(configFileEnv, path)
+
+	got, err := loadConfig()
+	require.NoError(t, err)
+	assert.Empty(t, got.Kubelet.RegisterWithTaints)
+}
+
+func TestLoadConfig_FromEnv_WithTaintsSingle(t *testing.T) {
+	t.Setenv(configFileEnv, "")
+
+	t.Setenv("MACHINA_MACHINE_NAME", "taint-machine")
+	t.Setenv("KUBE_VERSION", "1.33.0")
+	t.Setenv("API_SERVER", "api.example.com:443")
+	t.Setenv("BOOTSTRAP_TOKEN", "tok.sec")
+	t.Setenv("CA_CERT_BASE64", "Y2E=")
+	t.Setenv("CLUSTER_DNS", "10.0.0.10")
+	t.Setenv("NODE_LABELS", "")
+	t.Setenv("REGISTER_WITH_TAINTS", "dedicated=gpu:NoSchedule")
+
+	got, err := loadConfig()
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"dedicated=gpu:NoSchedule"}, got.Kubelet.RegisterWithTaints)
 }
