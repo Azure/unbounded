@@ -1,0 +1,54 @@
+name: Security - CodeQL
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "**.go"
+      - "go.mod"
+      - "go.sum"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "**.go"
+      - "go.mod"
+      - "go.sum"
+  # Run weekly to catch newly disclosed vulnerability patterns even without code changes.
+  schedule:
+    - cron: "25 3 * * 1"
+
+permissions:
+  contents: read
+  # Required to upload results to the GitHub Security tab.
+  security-events: write
+
+jobs:
+  codeql:
+    name: CodeQL Analysis
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: go
+          # Use the security-and-quality query suite for comprehensive coverage.
+          queries: security-and-quality
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:go"
