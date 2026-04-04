@@ -76,13 +76,6 @@ spec:
                     description: NodeLabels are labels passed to kubelet's --node-labels
                       flag.
                     type: object
-                  registerWithTaints:
-                    description: |-
-                      RegisterWithTaints are taints passed to kubelet's --register-with-taints flag.
-                      Each entry uses the standard Kubernetes taint format: key=value:Effect.
-                    items:
-                      type: string
-                    type: array
                   nodeRef:
                     description: NodeRef references the Node that corresponds to this
                       Machine.
@@ -93,6 +86,13 @@ spec:
                     required:
                     - name
                     type: object
+                  registerWithTaints:
+                    description: |-
+                      RegisterWithTaints are taints passed to kubelet's --register-with-taints flag.
+                      Each entry uses the standard Kubernetes taint format: key=value:Effect.
+                    items:
+                      type: string
+                    type: array
                   version:
                     description: |-
                       Version is the Kubernetes version to install (e.g., "v1.34.0").

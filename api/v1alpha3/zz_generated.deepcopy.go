@@ -205,6 +205,11 @@ func (in *KubernetesSpec) DeepCopyInto(out *KubernetesSpec) {
 			(*out)[key] = val
 		}
 	}
+	if in.RegisterWithTaints != nil {
+		in, out := &in.RegisterWithTaints, &out.RegisterWithTaints
+		*out = make([]string, len(*in))
+		copy(*out, *in)
+	}
 	out.BootstrapTokenRef = in.BootstrapTokenRef
 }
 

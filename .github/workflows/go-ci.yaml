@@ -110,6 +110,10 @@ jobs:
     name: Dependency Review
     runs-on: ubuntu-latest
     # Only meaningful on pull_request events — requires a base commit to diff against.
+    # Requires GitHub Advanced Security (Dependency Graph) to be enabled on the repository.
+    # continue-on-error allows the job to run opportunistically without blocking PRs on repos
+    # where Advanced Security is not available.
+    continue-on-error: true
     if: github.event_name == 'pull_request'
     steps:
       - name: Checkout
