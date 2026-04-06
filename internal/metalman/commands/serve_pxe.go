@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
@@ -108,6 +109,22 @@ func ServePXECmd() *cobra.Command {
 				return fmt.Errorf("creating clientset: %w", err)
 			}
 
+			sv, err := clientset.Discovery().ServerVersion()
+			if err != nil {
+				return fmt.Errorf("resolving cluster Kubernetes version: %w", err)
+			}
+			kubeVersion := sv.GitVersion
+
+			// Resolve cluster DNS from the kube-dns Service ClusterIP.
+			dnsSvc, err := clientset.CoreV1().Services("kube-system").Get(ctx, "kube-dns", metav1.GetOptions{})
+			if err != nil {
+				return fmt.Errorf("resolving cluster DNS: %w", err)
+			}
+			clusterDNS := dnsSvc.Spec.ClusterIP
+			if clusterDNS == "" {
+				return fmt.Errorf("kube-dns Service has no ClusterIP")
+			}
+
 			clusterCA := attestation.ClusterCAFromConfig(cfg)
 
 			serverIP := net.ParseIP(bindAddress)
@@ -151,10 +168,12 @@ func ServePXECmd() *cobra.Command {
 			}
 
 			resolver := netboot.FileResolver{
-				Cache:        ociCache,
-				Reader:       mgr.GetClient(),
-				ApiserverURL: apiserverURL,
-				ServeURL:     serveURL,
+				Cache:             ociCache,
+				Reader:            mgr.GetClient(),
+				ApiserverURL:      apiserverURL,
+				ServeURL:          serveURL,
+				KubernetesVersion: kubeVersion,
+				ClusterDNS:        clusterDNS,
 			}
 
 			if dhcpInterface != "" && dhcpAutoInterface {

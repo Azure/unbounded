@@ -28,10 +28,12 @@ type ResolvedFile struct {
 }
 
 type FileResolver struct {
-	Cache        *OCICache
-	Reader       client.Reader
-	ApiserverURL string
-	ServeURL     string
+	Cache             *OCICache
+	Reader            client.Reader
+	ApiserverURL      string
+	ServeURL          string
+	KubernetesVersion string
+	ClusterDNS        string
 }
 
 func (f *FileResolver) LookupNodeByIP(ctx context.Context, ip string) (*v1alpha3.Machine, error) {
@@ -67,9 +69,11 @@ func (f *FileResolver) ResolveFileByPath(ctx context.Context, path string, node 
 
 		if node != nil {
 			data, err := renderTemplate(string(content), templateData{
-				Machine:      node,
-				ApiserverURL: f.ApiserverURL,
-				ServeURL:     f.ServeURL,
+				Machine:           node,
+				ApiserverURL:      f.ApiserverURL,
+				ServeURL:          f.ServeURL,
+				KubernetesVersion: f.KubernetesVersion,
+				ClusterDNS:        f.ClusterDNS,
 			})
 			if err != nil {
 				return nil, err
@@ -87,9 +91,11 @@ func (f *FileResolver) ResolveFileByPath(ctx context.Context, path string, node 
 }
 
 type templateData struct {
-	Machine      *v1alpha3.Machine
-	ApiserverURL string
-	ServeURL     string
+	Machine           *v1alpha3.Machine
+	ApiserverURL      string
+	ServeURL          string
+	KubernetesVersion string
+	ClusterDNS        string
 }
 
 var (

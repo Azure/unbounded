@@ -239,16 +239,14 @@ configuration (e.g. `dhcpBootImageName`).
   vmlinuz              # Linux kernel
   initrd               # Initramfs
   init.cpio            # Custom init overlay
+  unbounded-agent      # Agent binary (handles attestation, kubelet setup)
   metadata.yaml        # Image configuration (dhcpBootImageName, etc.)
   grub/
     grub.cfg.tmpl      # GRUB config template (rendered per-machine)
   cloud-init/
-    user-data          # Cloud-init user-data
+    user-data.tmpl     # Cloud-init user-data template
     meta-data.tmpl     # Cloud-init meta-data template
     vendor-data.tmpl   # Cloud-init vendor-data template
-  bootstrap-kubelet.conf.tmpl  # Kubelet bootstrap kubeconfig template
-  kubelet-config.yaml.tmpl     # Kubelet configuration template
-  kubelet-dropin.conf.tmpl     # Kubelet systemd drop-in template
 ```
 
 ### Template data
@@ -260,6 +258,8 @@ Templates receive the following data object:
 | `.Machine` | *Machine | The Machine CR that initiated the request. |
 | `.ApiserverURL` | string | External Kubernetes API server URL. |
 | `.ServeURL` | string | External metalman HTTP URL. |
+| `.KubernetesVersion` | string | Resolved Kubernetes version for the machine. |
+| `.ClusterDNS` | string | Cluster DNS service IP. |
 
 ### Building images
 

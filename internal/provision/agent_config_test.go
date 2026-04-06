@@ -108,11 +108,70 @@ func TestAgentConfig_EmptyFields(t *testing.T) {
 
 	kubelet := parsed["Kubelet"].(map[string]interface{})
 	require.Equal(t, "", kubelet["ApiServer"])
-	require.Equal(t, "", kubelet["BootstrapToken"])
 	require.Nil(t, kubelet["Labels"])
 	require.Nil(t, kubelet["RegisterWithTaints"])
 
 	// OCIImage has omitempty so should be absent from zero-value config.
 	_, hasOCIImage := parsed["OCIImage"]
 	require.False(t, hasOCIImage, "OCIImage should be omitted when empty")
+
+	// Attest should be omitted when nil.
+	require.Nil(t, parsed["Attest"])
+}
+
+func TestAgentConfig_WithAttest(t *testing.T) {
+	t.Parallel()
+
+	cfg := AgentConfig{
+		MachineName: "metal-node-1",
+		Cluster: AgentClusterConfig{
+			CaCertBase64: "dGVzdC1jYQ==",
+			ClusterDNS:   "10.0.0.10",
+			Version:      "v1.34.0",
+		},
+		Kubelet: AgentKubeletConfig{
+			ApiServer: "api.example.com:443",
+			Labels: map[string]string{
+				"kubernetes.azure.com/managed": "false",
+			},
+		},
+		Attest: &AgentAttestConfig{
+			URL: "http://10.0.0.1:8880",
+		},
+	}
+
+	data, err := json.Marshal(cfg)
+	require.NoError(t, err)
+
+	var decoded AgentConfig
+	require.NoError(t, json.Unmarshal(data, &decoded))
+
+	require.Equal(t, cfg.MachineName, decoded.MachineName)
+	require.Equal(t, cfg.Cluster, decoded.Cluster)
+	require.NotNil(t, decoded.Attest)
+	require.Equal(t, "http://10.0.0.1:8880", decoded.Attest.URL)
+	// BootstrapToken should be empty when using attestation.
+	require.Empty(t, decoded.Kubelet.BootstrapToken)
+}
+
+func TestAgentConfig_AttestOmittedWhenNil(t *testing.T) {
+	t.Parallel()
+
+	cfg := AgentConfig{
+		MachineName: "ssh-node",
+		Kubelet: AgentKubeletConfig{
+			BootstrapToken: "abc123.secret456",
+		},
+	}
+
+	data, err := json.Marshal(cfg)
+	require.NoError(t, err)
+
+	// Attest should not appear in JSON output when nil.
+	require.NotContains(t, string(data), "Attest")
+
+	var decoded AgentConfig
+	require.NoError(t, json.Unmarshal(data, &decoded))
+	require.Nil(t, decoded.Attest)
+	require.Equal(t, "abc123.secret456", decoded.Kubelet.BootstrapToken)
 }

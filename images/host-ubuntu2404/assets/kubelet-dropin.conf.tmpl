@@ -1,7 +1,0 @@
-[Service]
-ExecStartPre=/bin/bash -c "test -f /etc/kubernetes/kubelet.conf || /usr/local/bin/unbounded-metal-attest 2>/dev/ttyS0"
-ExecStart=
-ExecStart=/usr/bin/kubelet --bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf --config=/var/lib/kubelet/config.yaml --node-labels=kubernetes.azure.com/managed=false,kubernetes.azure.com/cluster=unbounded-metal --v=2
-StandardOutput=journal+console
-StandardError=journal+console
-TTYPath=/dev/ttyS0

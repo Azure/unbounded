@@ -14,53 +14,43 @@ users:
   sudo: ALL=(ALL) NOPASSWD:ALL
 ssh_pwauth: false
 write_files:
-- path: /etc/modules-load.d/k8s.conf
+- path: /etc/unbounded-agent/config.json
+  permissions: '0600'
   content: |
-    overlay
-    br_netfilter
-- path: /etc/sysctl.d/k8s.conf
-  content: |
-    net.bridge.bridge-nf-call-iptables  = 1
-    net.bridge.bridge-nf-call-ip6tables = 1
-    net.ipv4.ip_forward                 = 1
-- path: /etc/containerd/config.toml
-  defer: true
-  content: |
-    version = 2
-    [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
-      runtime_type = "io.containerd.runc.v2"
-    [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
-      SystemdCgroup = true
-- path: /usr/local/bin/unbounded-metal-attest
-  permissions: '0755'
-  content: |
-    @@ATTEST_SCRIPT@@
+    {
+      "MachineName": "{{ .Machine.Name }}",
+      "Cluster": {
+        "CaCertBase64": "",
+        "ClusterDNS": "{{ .ClusterDNS }}",
+        "Version": "{{ .KubernetesVersion }}"
+      },
+      "Kubelet": {
+        "ApiServer": "{{ .ApiserverURL }}",
+        "Labels": {
+          "kubernetes.azure.com/managed": "false",
+          "kubernetes.azure.com/cluster": "unbounded-metal"
+        }
+      },
+      "Attest": {
+        "URL": "{{ .ServeURL }}"
+      }
+    }
 - path: /etc/cloud/cloud-init.disabled
   defer: true
   content: ''
-apt:
-  sources:
-    docker:
-      source: deb [arch=amd64] https://download.docker.com/linux/ubuntu noble stable
-      keyid: 9DC858229FC7DD38854AE2D88D81803C0EBFCD88
-    kubernetes:
-      source: deb [arch=amd64] https://pkgs.k8s.io/core:/stable:/v1.32/deb/ /
-      keyid: 234654DA9A296436
 packages:
-- containerd.io
-- kubelet
-- tpm2-tools
-- python3-cryptography
+- curl
 runcmd:
-- - modprobe
-  - overlay
-- - modprobe
-  - br_netfilter
-- - sysctl
-  - --system
-- - systemctl
-  - restart
-  - containerd
-- - systemctl
-  - start
-  - kubelet
+- - /bin/bash
+  - -c
+  - |
+    set -eo pipefail
+    AGENT_URL="{{ .ServeURL }}/unbounded-agent"
+    AGENT_BIN="/usr/local/bin/unbounded-agent"
+    echo "Downloading unbounded-agent..."
+    curl -fsSL -o "${AGENT_BIN}" "${AGENT_URL}"
+    chmod +x "${AGENT_BIN}"
+    export UNBOUNDED_AGENT_CONFIG_FILE=/etc/unbounded-agent/config.json
+    echo "Running unbounded-agent start..."
+    "${AGENT_BIN}" start
+    echo "Node bootstrap complete."

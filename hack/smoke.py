@@ -426,7 +426,7 @@ def main() -> None:
 
     log("Building host-ubuntu2404 OCI image")
     run(["docker", "build", "-t", IMAGE_NAME,
-         "-f", str(IMAGE_DIR / "Containerfile"), str(IMAGE_DIR)])
+         "-f", str(IMAGE_DIR / "Containerfile"), str(REPO_ROOT)])
 
     log("Pushing host-ubuntu2404 OCI image to local registry")
     run(["docker", "push", IMAGE_NAME])

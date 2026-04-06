@@ -109,6 +109,7 @@ func TestLoadConfig_FromEnv(t *testing.T) {
 	t.Setenv("CLUSTER_DNS", "10.96.0.10")
 	t.Setenv("NODE_LABELS", "env=staging,team=infra")
 	t.Setenv("REGISTER_WITH_TAINTS", "dedicated=gpu:NoSchedule,workload=ml:PreferNoSchedule")
+	t.Setenv("AGENT_ATTEST_URL", "")
 
 	got, err := loadConfig()
 	require.NoError(t, err)
@@ -121,6 +122,7 @@ func TestLoadConfig_FromEnv(t *testing.T) {
 	assert.Equal(t, "envtok.envsec", got.Kubelet.BootstrapToken)
 	assert.Equal(t, map[string]string{"env": "staging", "team": "infra"}, got.Kubelet.Labels)
 	assert.Equal(t, []string{"dedicated=gpu:NoSchedule", "workload=ml:PreferNoSchedule"}, got.Kubelet.RegisterWithTaints)
+	assert.Nil(t, got.Attest)
 }
 
 func TestLoadConfig_FromEnv_NoLabels(t *testing.T) {
@@ -214,9 +216,76 @@ func TestLoadConfig_FromEnv_WithTaintsSingle(t *testing.T) {
 	t.Setenv("CLUSTER_DNS", "10.0.0.10")
 	t.Setenv("NODE_LABELS", "")
 	t.Setenv("REGISTER_WITH_TAINTS", "dedicated=gpu:NoSchedule")
+	t.Setenv("AGENT_ATTEST_URL", "")
 
 	got, err := loadConfig()
 	require.NoError(t, err)
 
 	assert.Equal(t, []string{"dedicated=gpu:NoSchedule"}, got.Kubelet.RegisterWithTaints)
+}
+
+func TestLoadConfig_FromEnv_WithAttestURL(t *testing.T) {
+	t.Setenv(configFileEnv, "")
+
+	t.Setenv("MACHINA_MACHINE_NAME", "metal-node")
+	t.Setenv("KUBE_VERSION", "1.34.0")
+	t.Setenv("API_SERVER", "api.example.com:443")
+	t.Setenv("CA_CERT_BASE64", "Y2E=")
+	t.Setenv("CLUSTER_DNS", "10.0.0.10")
+	t.Setenv("AGENT_ATTEST_URL", "http://10.0.0.1:8880")
+	// BOOTSTRAP_TOKEN is not set — attestation replaces it.
+	t.Setenv("BOOTSTRAP_TOKEN", "")
+
+	got, err := loadConfig()
+	require.NoError(t, err)
+
+	assert.Equal(t, "metal-node", got.MachineName)
+	assert.NotNil(t, got.Attest)
+	assert.Equal(t, "http://10.0.0.1:8880", got.Attest.URL)
+	assert.Empty(t, got.Kubelet.BootstrapToken)
+}
+
+func TestLoadConfig_FromEnv_NoTokenAndNoAttest(t *testing.T) {
+	// Without AGENT_ATTEST_URL, BOOTSTRAP_TOKEN is required.
+	t.Setenv(configFileEnv, "")
+
+	t.Setenv("MACHINA_MACHINE_NAME", "machine")
+	t.Setenv("KUBE_VERSION", "1.33.0")
+	t.Setenv("API_SERVER", "api.example.com:443")
+	t.Setenv("CA_CERT_BASE64", "Y2E=")
+	t.Setenv("CLUSTER_DNS", "10.0.0.10")
+	t.Setenv("BOOTSTRAP_TOKEN", "")
+	t.Setenv("AGENT_ATTEST_URL", "")
+
+	_, err := loadConfig()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "BOOTSTRAP_TOKEN")
+}
+
+func TestLoadConfig_FromFile_WithAttest(t *testing.T) {
+	cfg := provision.AgentConfig{
+		MachineName: "metal-node-file",
+		Cluster: provision.AgentClusterConfig{
+			CaCertBase64: "dGVzdC1jYQ==",
+			ClusterDNS:   "10.0.0.10",
+			Version:      "v1.34.0",
+		},
+		Kubelet: provision.AgentKubeletConfig{
+			ApiServer: "api.example.com:443",
+		},
+		Attest: &provision.AgentAttestConfig{
+			URL: "http://192.168.1.1:8880",
+		},
+	}
+	path := writeConfigFile(t, cfg)
+
+	t.Setenv(configFileEnv, path)
+
+	got, err := loadConfig()
+	require.NoError(t, err)
+
+	assert.Equal(t, "metal-node-file", got.MachineName)
+	assert.NotNil(t, got.Attest)
+	assert.Equal(t, "http://192.168.1.1:8880", got.Attest.URL)
+	assert.Empty(t, got.Kubelet.BootstrapToken)
 }

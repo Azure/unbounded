@@ -57,6 +57,9 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 					host.DisableSwap(log),
 				),
 
+				// TPM Attestation (no-op when not configured).
+				host.ApplyAttestation(log, cfg.Attest, cfg.MachineName, nodeStartGoalState),
+
 				// Phase 2: rootfs
 				rootfs.EnsureNSpawnWorkspace(log, rootFSGoalState),
 				phases.Parallel(log,

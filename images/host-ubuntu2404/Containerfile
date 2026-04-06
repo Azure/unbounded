@@ -1,3 +1,14 @@
+# ── Build the unbounded-agent binary ────────────────────────────────
+FROM docker.io/library/golang:1.25 AS gobuilder
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /unbounded-agent ./cmd/agent
+
+# ── Assemble host image artifacts ───────────────────────────────────
 FROM docker.io/library/debian:bookworm-slim AS build
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -14,19 +25,10 @@ RUN mkdir -p /artifacts && \
     curl -fSL -o /artifacts/initrd      "${UBUNTU_NETBOOT_BASE}/initrd"
 
 # ── Build init.cpio overlay ─────────────────────────────────────────
-COPY assets/init /tmp/initrd-root/init
+COPY images/host-ubuntu2404/assets/init /tmp/initrd-root/init
 RUN chmod 755 /tmp/initrd-root/init && \
     cd /tmp/initrd-root && \
     find . -print0 | cpio --create --format=newc --quiet --null > /artifacts/init.cpio
-
-# ── Generate user-data (inject attest script into template) ─────────
-COPY assets/unbounded-metal-attest.py /tmp/unbounded-metal-attest.py
-COPY assets/user-data.tmpl            /tmp/user-data.tmpl
-COPY assets/generate-user-data.sh     /tmp/generate-user-data.sh
-RUN sh /tmp/generate-user-data.sh \
-        /tmp/unbounded-metal-attest.py \
-        /tmp/user-data.tmpl \
-        > /tmp/user-data
 
 # ── Assemble /disk directory ────────────────────────────────────────
 RUN mkdir -p /disk/grub /disk/cloud-init
@@ -37,16 +39,15 @@ RUN cp /artifacts/shimx64.efi /artifacts/grubx64.efi \
        /artifacts/init.cpio   /disk/
 
 # Templates and static configs from assets/.
-COPY assets/grub.cfg.tmpl               /disk/grub/grub.cfg.tmpl
-COPY assets/meta-data.tmpl              /disk/cloud-init/meta-data.tmpl
-COPY assets/vendor-data.tmpl            /disk/cloud-init/vendor-data.tmpl
-COPY assets/bootstrap-kubelet.conf.tmpl /disk/bootstrap-kubelet.conf.tmpl
-COPY assets/kubelet-config.yaml.tmpl    /disk/kubelet-config.yaml.tmpl
-COPY assets/kubelet-dropin.conf.tmpl    /disk/kubelet-dropin.conf.tmpl
-COPY assets/metadata.yaml              /disk/metadata.yaml
+COPY images/host-ubuntu2404/assets/grub.cfg.tmpl               /disk/grub/grub.cfg.tmpl
+COPY images/host-ubuntu2404/assets/meta-data.tmpl              /disk/cloud-init/meta-data.tmpl
+COPY images/host-ubuntu2404/assets/vendor-data.tmpl            /disk/cloud-init/vendor-data.tmpl
+COPY images/host-ubuntu2404/assets/metadata.yaml              /disk/metadata.yaml
 
-# Generated user-data.
-RUN cp /tmp/user-data /disk/cloud-init/user-data
+# User-data is now a Go template rendered per-node by metalman.
+# The unbounded-agent handles kubelet/containerd/TPM attestation
+# internally, so no attest script injection or kubelet configs are needed.
+COPY images/host-ubuntu2404/assets/user-data.tmpl             /disk/cloud-init/user-data.tmpl
 
 # ── Download and convert Ubuntu cloud image to raw+gzip ─────────────
 ARG UBUNTU_CLOUDIMG_URL=https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-amd64.img
@@ -56,6 +57,9 @@ RUN curl -fSL -o /tmp/cloudimg.qcow2 "${UBUNTU_CLOUDIMG_URL}" && \
     rm /tmp/cloudimg.qcow2 && \
     gzip -1 /tmp/disk.img && \
     mv /tmp/disk.img.gz /disk/disk.img.gz
+
+# ── Agent binary built from source ──────────────────────────────────
+COPY --from=gobuilder /unbounded-agent /disk/unbounded-agent
 
 FROM scratch
 COPY --from=build /disk /disk

@@ -59,7 +59,7 @@ docker build -t ghcr.io/project-unbounded/images/host-ubuntu2404:v1 .
 docker push ghcr.io/project-unbounded/images/host-ubuntu2404:v1
 ```
 
-Template context includes `.Machine`, `.ApiserverURL`, and `.ServeURL`.
+Template context includes `.Machine`, `.ApiserverURL`, `.ServeURL`, `.KubernetesVersion`, and `.ClusterDNS`.
 
 See the [CRD Reference]({{< relref "/reference/machina-crd" >}}) for the full Machine spec.
 
@@ -106,19 +106,19 @@ Store BMC passwords in a Secret referenced by `passwordRef`. See the [CRD Refere
    - Loads storage and network drivers, configures the static IP from kernel cmdline.
    - Downloads the gzip-compressed raw disk image over HTTP (retries up to 120 times).
    - Writes the image to the largest block device via `dd`.
-   - Mounts the root filesystem and injects cloud-init config, kubelet configs, and the bootstrap kubeconfig.
+   - Mounts the root filesystem and injects cloud-init config and the agent configuration.
    - Calls `/pxe/disable` on metalman to signal completion, then reboots.
-5. **First boot.** cloud-init installs containerd, kubelet, and tpm2-tools.
-6. **Node join.** kubelet starts with the TPM attestation credential plugin (see below), TLS-bootstraps, and the node reaches `Ready`.
+5. **First boot.** cloud-init downloads the `unbounded-agent` binary from metalman and runs `unbounded-agent start`.
+6. **Node join.** The agent installs containerd and kubelet, performs TPM attestation to obtain a bootstrap token (see below), configures kubelet, and starts it. The node TLS-bootstraps and reaches `Ready`.
 
 ## TPM Attestation
 
 Metalman uses TPM 2.0 to securely deliver a bootstrap token without embedding secrets in the image.
 
-1. On first boot, the `unbounded-metal-attest.py` ExecCredential plugin creates a TPM Endorsement Key (EK) and Storage Root Key (SRK), then POSTs them to metalman's `/attest` endpoint.
+1. On first boot, the `unbounded-agent` creates a TPM Endorsement Key (EK) and Storage Root Key (SRK), then POSTs them to metalman's `/attest` endpoint.
 2. Metalman performs trust-on-first-use (TOFU): it stores the EK public key in `status.tpm.ekPublicKey`. Subsequent attestations from a different EK are rejected (HTTP 403).
 3. Metalman wraps an AES-256 key via `tpm2.CreateCredential` (bound to the EK and SRK), then encrypts a 1-hour ServiceAccount token with AES-256-GCM and returns both to the client.
-4. The TPM `ActivateCredential` operation recovers the AES key, decrypts the token, and kubelet uses it for TLS bootstrapping.
+4. The agent uses the TPM `ActivateCredential` operation to recover the AES key, decrypts the token, and writes a bootstrap kubeconfig for kubelet to use during TLS bootstrapping.
 
 The `metalman-bootstrap` ServiceAccount has RBAC for `system:node-bootstrapper` and `certificatesigningrequests:nodeclient` auto-approval.
 
@@ -171,7 +171,6 @@ spec:
 
 - Only Ubuntu 24.04 images are currently supported.
 - The reimage timeout is fixed at 30 minutes.
-- Cloud-init user-data hardcodes the Kubernetes v1.32 APT repository.
 
 ## See Also
 

@@ -201,25 +201,6 @@ UMCONFIG
         log "wrote /etc/unbounded-metal/config"
     fi
 
-    if [ -n "$SERVE_URL" ]; then
-        mkdir -p /mnt/etc/kubernetes /mnt/var/lib/kubelet /mnt/etc/systemd/system/kubelet.service.d
-
-        retry 30 5 "download bootstrap-kubelet.conf" \
-            wget -q -O /mnt/etc/kubernetes/bootstrap-kubelet.conf "$SERVE_URL/bootstrap-kubelet.conf" \
-            || fatal "failed to download bootstrap-kubelet.conf"
-        log "wrote /etc/kubernetes/bootstrap-kubelet.conf"
-
-        retry 30 5 "download kubelet-config.yaml" \
-            wget -q -O /mnt/var/lib/kubelet/config.yaml "$SERVE_URL/kubelet-config.yaml" \
-            || fatal "failed to download kubelet-config.yaml"
-        log "wrote /var/lib/kubelet/config.yaml"
-
-        retry 30 5 "download kubelet-dropin.conf" \
-            wget -q -O /mnt/etc/systemd/system/kubelet.service.d/10-unbounded-metal.conf "$SERVE_URL/kubelet-dropin.conf" \
-            || fatal "failed to download kubelet-dropin.conf"
-        log "wrote kubelet service drop-in"
-    fi
-
     sync
     umount /mnt
     log "cloud-init configured on $ROOT_PART"

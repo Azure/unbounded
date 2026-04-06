@@ -89,11 +89,6 @@ func loadConfigFromEnv() (*provision.AgentConfig, error) {
 		return nil, err
 	}
 
-	bootstrapToken, err := requiredEnv("BOOTSTRAP_TOKEN")
-	if err != nil {
-		return nil, err
-	}
-
 	caCertB64, err := requiredEnv("CA_CERT_BASE64")
 	if err != nil {
 		return nil, err
@@ -102,6 +97,20 @@ func loadConfigFromEnv() (*provision.AgentConfig, error) {
 	clusterDNS, err := requiredEnv("CLUSTER_DNS")
 	if err != nil {
 		return nil, err
+	}
+
+	// AGENT_ATTEST_URL is optional; when set it enables TPM attestation and
+	// BOOTSTRAP_TOKEN is not required.
+	attestURL := strings.TrimSpace(os.Getenv("AGENT_ATTEST_URL"))
+
+	var bootstrapToken string
+	if attestURL == "" {
+		bootstrapToken, err = requiredEnv("BOOTSTRAP_TOKEN")
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		bootstrapToken = strings.TrimSpace(os.Getenv("BOOTSTRAP_TOKEN"))
 	}
 
 	// NODE_LABELS is optional; parse "key1=val1,key2=val2" format.
@@ -124,7 +133,7 @@ func loadConfigFromEnv() (*provision.AgentConfig, error) {
 		taints = strings.Split(raw, ",")
 	}
 
-	return &provision.AgentConfig{
+	cfg := &provision.AgentConfig{
 		MachineName: machineName,
 		Cluster: provision.AgentClusterConfig{
 			CaCertBase64: caCertB64,
@@ -137,5 +146,13 @@ func loadConfigFromEnv() (*provision.AgentConfig, error) {
 			Labels:             labels,
 			RegisterWithTaints: taints,
 		},
-	}, nil
+	}
+
+	if attestURL != "" {
+		cfg.Attest = &provision.AgentAttestConfig{
+			URL: attestURL,
+		}
+	}
+
+	return cfg, nil
 }
