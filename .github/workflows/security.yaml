@@ -23,6 +23,8 @@ permissions:
   contents: read
   # Required to upload results to the GitHub Security tab.
   security-events: write
+  # Required by CodeQL analyze action to read workflow run metadata.
+  actions: read
 
 jobs:
   codeql:
@@ -39,16 +41,18 @@ jobs:
           cache-dependency-path: go.sum
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
+        uses: github/codeql-action/init@v4
         with:
           languages: go
           # Use the security-and-quality query suite for comprehensive coverage.
           queries: security-and-quality
 
-      - name: Autobuild
-        uses: github/codeql-action/autobuild@v3
+      - name: Build
+        # Build explicitly rather than using autobuild so we don't trigger
+        # Makefile targets that require dev tools (gofumpt, golangci-lint).
+        run: go build ./...
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
+        uses: github/codeql-action/analyze@v4
         with:
           category: "/language:go"
