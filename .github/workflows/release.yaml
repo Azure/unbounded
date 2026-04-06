@@ -56,9 +56,9 @@ jobs:
       matrix:
         component:
           - name: machina
-            file: cmd/machina/oci/Containerfile
+            file: images/machina/Containerfile
           - name: metalman
-            file: cmd/metalman/oci/Containerfile
+            file: images/metalman/Containerfile
     steps:
       - uses: actions/checkout@v4
 

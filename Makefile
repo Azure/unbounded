@@ -18,7 +18,7 @@ AGENT_CMD=./cmd/agent
 MACHINA_BIN=bin/machina
 MACHINA_CMD=./cmd/machina
 MACHINA_TAG ?= latest
-CONTAINER_REGISTRY ?= stargatetmedev.azurecr.io
+CONTAINER_REGISTRY ?= ghcr.io/project-unbounded
 MACHINA_IMAGE=$(CONTAINER_REGISTRY)/machina:$(MACHINA_TAG)
 CONTAINER_ENGINE ?= podman
 
@@ -28,7 +28,7 @@ BLOB_CONTAINER ?= release
 
 KUBECTL_PLUGIN_PLATFORMS = linux-amd64 linux-arm64 darwin-amd64 darwin-arm64
 
-.PHONY: all help fmt lint test check-deps kubectl-unbounded kubectl-unbounded-cross krew-manifest forge inventory inventory-amd64 inventory-arm64 unbounded-agent machina machina-oci machina-oci-push metalman metalman-oci metalman-oci-push gomod images/ubuntu24/image.yaml push-blobs
+.PHONY: all help fmt lint test check-deps kubectl-unbounded kubectl-unbounded-cross krew-manifest forge inventory inventory-amd64 inventory-arm64 unbounded-agent machina machina-oci machina-oci-push machina-manifests metalman metalman-oci metalman-oci-push gomod images/ubuntu24/image.yaml push-blobs
 
 ##@ General
 
@@ -69,7 +69,7 @@ gomod: ## Tidy go.mod and go.sum
 
 ##@ Build
 
-kubectl-unbounded: test ## Build the kubectl-unbounded plugin (implies test)
+kubectl-unbounded: test machina-manifests ## Build the kubectl-unbounded plugin (implies test)
 	$(GOBUILD) -ldflags '$(KUBECTL_UNBOUNDED_LDFLAGS)' -o $(KUBECTL_UNBOUNDED_BIN) $(KUBECTL_UNBOUNDED_CMD)/main.go
 
 kubectl-unbounded-cross: ## Cross-compile kubectl-unbounded for all supported platforms
@@ -133,10 +133,14 @@ metalman: check-deps ## Format, lint, test, and build metalman
 ##@ Container Images
 
 machina-oci: ## Build the machina container image
-	$(CONTAINER_ENGINE) build -t machina:$(MACHINA_TAG) -t $(MACHINA_IMAGE) -f ./cmd/machina/oci/Containerfile .
+	$(CONTAINER_ENGINE) build -t machina:$(MACHINA_TAG) -t $(MACHINA_IMAGE) -f ./images/machina/Containerfile .
 
 machina-oci-push: machina-oci ## Build and push the machina container image
 	$(CONTAINER_ENGINE) push $(MACHINA_IMAGE)
+
+machina-manifests: ## Stamp the machina deployment manifest with the container image
+	@sed -i 's|image: .*|image: $(MACHINA_IMAGE)|' deploy/machina/04-deployment.yaml
+	@echo "Updated deploy/machina/04-deployment.yaml → image: $(MACHINA_IMAGE)"
 
 machina-run: machina ## Replace the in-cluster machina with a locally built binary
 	kubectl scale deployment/machina-controller --replicas=0 -n machina-system
@@ -147,7 +151,7 @@ METALMAN_TAG ?= latest
 METALMAN_IMAGE=$(CONTAINER_REGISTRY)/metalman:$(METALMAN_TAG)
 
 metalman-oci: ## Build the metalman container image
-	$(CONTAINER_ENGINE) build -t metalman:$(METALMAN_TAG) -t $(METALMAN_IMAGE) -f ./cmd/metalman/oci/Containerfile .
+	$(CONTAINER_ENGINE) build -t metalman:$(METALMAN_TAG) -t $(METALMAN_IMAGE) -f ./images/metalman/Containerfile .
 
 metalman-oci-push: metalman-oci ## Build and push the metalman container image
 	$(CONTAINER_ENGINE) push $(METALMAN_IMAGE)

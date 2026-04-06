@@ -14,10 +14,12 @@ import (
 
 func writeConfigFile(t *testing.T, cfg provision.AgentConfig) string {
 	t.Helper()
+
 	data, err := json.Marshal(cfg)
 	require.NoError(t, err)
 	path := filepath.Join(t.TempDir(), "agent-config.json")
 	require.NoError(t, os.WriteFile(path, data, 0o644))
+
 	return path
 }
 

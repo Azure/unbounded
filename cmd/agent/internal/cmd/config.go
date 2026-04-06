@@ -106,12 +106,14 @@ func loadConfigFromEnv() (*provision.AgentConfig, error) {
 
 	// NODE_LABELS is optional; parse "key1=val1,key2=val2" format.
 	labels := make(map[string]string)
+
 	if raw := strings.TrimSpace(os.Getenv("NODE_LABELS")); raw != "" {
 		for _, pair := range strings.Split(raw, ",") {
 			k, v, ok := strings.Cut(pair, "=")
 			if !ok {
 				return nil, fmt.Errorf("invalid NODE_LABELS entry %q", pair)
 			}
+
 			labels[k] = v
 		}
 	}

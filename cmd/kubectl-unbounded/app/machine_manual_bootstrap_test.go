@@ -309,6 +309,7 @@ func TestManualBootstrapHandler_RenderScript(t *testing.T) {
 	require.Greater(t, secondMarker, 0, "second AGENT_CONFIG_EOF marker not found")
 
 	jsonData := scriptBytes[jsonStart : jsonStart+secondMarker-1] // -1 to strip trailing newline
+
 	var parsed provision.AgentConfig
 	require.NoError(t, json.Unmarshal(jsonData, &parsed))
 	require.Equal(t, "test-node", parsed.MachineName)

@@ -45,6 +45,7 @@ func (d *downloadRootFS) Do(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("check machine directory %s: %w", d.machineDir, err)
 	}
+
 	if !empty {
 		d.log.Warn("machine directory is not empty, skipping rootfs bootstrap", slog.String("dir", d.machineDir))
 		return nil

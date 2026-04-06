@@ -8,6 +8,9 @@ builds:
       - CGO_ENABLED=0
     ldflags:
       - -s -w
+    hooks:
+      pre:
+        - make machina-manifests MACHINA_TAG={{ .Tag }}
     goos:
       - linux
       - darwin
