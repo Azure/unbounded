@@ -1,0 +1,61 @@
+FROM docker.io/library/debian:bookworm-slim AS build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        cpio curl ca-certificates qemu-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Download netboot artifacts ──────────────────────────────────────
+ARG UBUNTU_NETBOOT_BASE=https://releases.ubuntu.com/24.04.2/netboot/amd64
+
+RUN mkdir -p /artifacts && \
+    curl -fSL -o /artifacts/shimx64.efi "${UBUNTU_NETBOOT_BASE}/bootx64.efi" && \
+    curl -fSL -o /artifacts/grubx64.efi "${UBUNTU_NETBOOT_BASE}/grubx64.efi" && \
+    curl -fSL -o /artifacts/vmlinuz     "${UBUNTU_NETBOOT_BASE}/linux"       && \
+    curl -fSL -o /artifacts/initrd      "${UBUNTU_NETBOOT_BASE}/initrd"
+
+# ── Build init.cpio overlay ─────────────────────────────────────────
+COPY assets/init /tmp/initrd-root/init
+RUN chmod 755 /tmp/initrd-root/init && \
+    cd /tmp/initrd-root && \
+    find . -print0 | cpio --create --format=newc --quiet --null > /artifacts/init.cpio
+
+# ── Generate user-data (inject attest script into template) ─────────
+COPY assets/unbounded-metal-attest.py /tmp/unbounded-metal-attest.py
+COPY assets/user-data.tmpl            /tmp/user-data.tmpl
+COPY assets/generate-user-data.sh     /tmp/generate-user-data.sh
+RUN sh /tmp/generate-user-data.sh \
+        /tmp/unbounded-metal-attest.py \
+        /tmp/user-data.tmpl \
+        > /tmp/user-data
+
+# ── Assemble /disk directory ────────────────────────────────────────
+RUN mkdir -p /disk/grub /disk/cloud-init
+
+# Binary boot artifacts.
+RUN cp /artifacts/shimx64.efi /artifacts/grubx64.efi \
+       /artifacts/vmlinuz     /artifacts/initrd       \
+       /artifacts/init.cpio   /disk/
+
+# Templates and static configs from assets/.
+COPY assets/grub.cfg.tmpl               /disk/grub/grub.cfg.tmpl
+COPY assets/meta-data.tmpl              /disk/cloud-init/meta-data.tmpl
+COPY assets/vendor-data.tmpl            /disk/cloud-init/vendor-data.tmpl
+COPY assets/bootstrap-kubelet.conf.tmpl /disk/bootstrap-kubelet.conf.tmpl
+COPY assets/kubelet-config.yaml.tmpl    /disk/kubelet-config.yaml.tmpl
+COPY assets/kubelet-dropin.conf.tmpl    /disk/kubelet-dropin.conf.tmpl
+COPY assets/metadata.yaml              /disk/metadata.yaml
+
+# Generated user-data.
+RUN cp /tmp/user-data /disk/cloud-init/user-data
+
+# ── Download and convert Ubuntu cloud image to raw+gzip ─────────────
+ARG UBUNTU_CLOUDIMG_URL=https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-amd64.img
+
+RUN curl -fSL -o /tmp/cloudimg.qcow2 "${UBUNTU_CLOUDIMG_URL}" && \
+    qemu-img convert -f qcow2 -O raw /tmp/cloudimg.qcow2 /tmp/disk.img && \
+    rm /tmp/cloudimg.qcow2 && \
+    gzip -1 /tmp/disk.img && \
+    mv /tmp/disk.img.gz /disk/disk.img.gz
+
+FROM scratch
+COPY --from=build /disk /disk

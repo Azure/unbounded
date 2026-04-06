@@ -28,7 +28,7 @@ BLOB_CONTAINER ?= release
 
 KUBECTL_PLUGIN_PLATFORMS = linux-amd64 linux-arm64 darwin-amd64 darwin-arm64
 
-.PHONY: all help fmt lint test check-deps kubectl-unbounded kubectl-unbounded-cross krew-manifest forge inventory inventory-amd64 inventory-arm64 unbounded-agent machina machina-oci machina-oci-push machina-manifests metalman metalman-oci metalman-oci-push gomod images/ubuntu24/image.yaml push-blobs
+.PHONY: all help fmt lint test check-deps kubectl-unbounded kubectl-unbounded-cross krew-manifest forge inventory inventory-amd64 inventory-arm64 unbounded-agent machina machina-oci machina-oci-push machina-manifests metalman metalman-oci metalman-oci-push gomod push-blobs
 
 ##@ General
 
@@ -158,18 +158,7 @@ metalman-oci-push: metalman-oci ## Build and push the metalman container image
 
 ##@ Release
 
-images/ubuntu24/image.yaml: ## Generate the ubuntu24 image manifest
-	cd images/ubuntu24 && python3 build.py -o image.yaml
-
-push-blobs: images/ubuntu24/image.yaml krew-manifest ## Upload release artifacts to Azure Blob Storage
-	@az storage blob upload \
-		--file images/ubuntu24/image.yaml \
-		--container-name $(BLOB_CONTAINER) \
-		--name $(VERSION)/images/ubuntu24/image.yaml \
-		--account-name $(STORAGE_ACCOUNT) \
-		--account-key $(AZURE_STORAGE_KEY) \
-		--overwrite
-	@echo "Uploaded ubuntu24 image to https://$(STORAGE_ACCOUNT).blob.core.windows.net/$(BLOB_CONTAINER)/$(VERSION)/images/ubuntu24/image.yaml"
+push-blobs: krew-manifest ## Upload release artifacts to Azure Blob Storage
 	@for p in $(KUBECTL_PLUGIN_PLATFORMS); do \
 		az storage blob upload \
 			--file bin/kubectl-unbounded-$$p.tar.gz \

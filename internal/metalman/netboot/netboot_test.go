@@ -1,10 +1,7 @@
 package netboot
 
 import (
-	"compress/gzip"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -12,27 +9,19 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
-	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	v1alpha3 "github.com/project-unbounded/unbounded-kube/api/v1alpha3"
 	"github.com/project-unbounded/unbounded-kube/internal/metalman/indexing"
 )
-
-func sha256Hex(data []byte) string {
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:])
-}
 
 func newScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
@@ -45,185 +34,54 @@ func newScheme(t *testing.T) *runtime.Scheme {
 	return s
 }
 
-func TestImageReconciler_DownloadAndCache(t *testing.T) {
-	vmlinuzData := []byte("fake-vmlinuz-content-1234567890")
-	initrdData := []byte("fake-initrd-content-0987654321")
+// populateOCICache creates a fake OCI cache directory structure for testing.
+// Files are placed under {cacheDir}/oci/{digest}/disk/.
+func populateOCICache(cacheDir, digest string, files map[string][]byte) error {
+	safe := fmt.Sprintf("sha256_%s", digest)
+	diskDir := filepath.Join(cacheDir, "oci", safe, "disk")
 
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/vmlinuz":
-			w.Write(vmlinuzData)
-		case "/initrd":
-			w.Write(initrdData)
-		default:
-			http.NotFound(w, r)
+	for path, content := range files {
+		fullPath := filepath.Join(diskDir, path)
+		if err := os.MkdirAll(filepath.Dir(fullPath), 0o755); err != nil {
+			return err
 		}
-	}))
-	defer ts.Close()
 
-	image := &v1alpha3.Image{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-image"},
-		Spec: v1alpha3.ImageSpec{
-			DHCPBootImageName: "shimx64.efi",
-			Files: []v1alpha3.File{
-				{
-					Path: "images/test-image/vmlinuz",
-					HTTP: &v1alpha3.HTTPSource{
-						URL:    ts.URL + "/vmlinuz",
-						SHA256: sha256Hex(vmlinuzData),
-					},
-				},
-				{
-					Path: "images/test-image/initrd",
-					HTTP: &v1alpha3.HTTPSource{
-						URL:    ts.URL + "/initrd",
-						SHA256: sha256Hex(initrdData),
-					},
-				},
-			},
-		},
+		if err := os.WriteFile(fullPath, content, 0o644); err != nil {
+			return err
+		}
 	}
 
-	scheme := newScheme(t)
-	fc := fake.NewClientBuilder().WithScheme(scheme).WithObjects(image).Build()
-	cacheDir := t.TempDir()
-
-	reconciler := &ImageReconciler{
-		Client:   fc,
-		CacheDir: cacheDir,
-	}
-
-	result, err := reconciler.Reconcile(t.Context(), ctrl.Request{
-		NamespacedName: types.NamespacedName{Name: "test-image"},
-	})
-	if err != nil {
-		t.Fatalf("reconcile failed: %v", err)
-	}
-
-	if result.RequeueAfter != 0 {
-		t.Fatalf("unexpected requeue: %v", result.RequeueAfter)
-	}
-
-	gotVmlinuz, err := os.ReadFile(cachePath(cacheDir, sha256Hex(vmlinuzData), ""))
-	if err != nil {
-		t.Fatalf("reading vmlinuz: %v", err)
-	}
-
-	if string(gotVmlinuz) != string(vmlinuzData) {
-		t.Errorf("vmlinuz content mismatch: got %q", gotVmlinuz)
-	}
-
-	gotInitrd, err := os.ReadFile(cachePath(cacheDir, sha256Hex(initrdData), ""))
-	if err != nil {
-		t.Fatalf("reading initrd: %v", err)
-	}
-
-	if string(gotInitrd) != string(initrdData) {
-		t.Errorf("initrd content mismatch: got %q", gotInitrd)
-	}
-
-	// Re-reconcile should be a no-op (files already cached with correct checksum)
-	result, err = reconciler.Reconcile(t.Context(), ctrl.Request{
-		NamespacedName: types.NamespacedName{Name: "test-image"},
-	})
-	if err != nil {
-		t.Fatalf("second reconcile failed: %v", err)
-	}
-
-	if result.RequeueAfter != 0 {
-		t.Fatalf("unexpected requeue on second reconcile: %v", result.RequeueAfter)
-	}
+	return nil
 }
 
-func TestImageReconciler_ChecksumMismatch(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("actual-content"))
-	}))
-	defer ts.Close()
+// setupOCICache creates an OCICache populated with test files.
+func setupOCICache(t *testing.T, imageRef, digest string, files map[string][]byte) *OCICache {
+	t.Helper()
 
-	image := &v1alpha3.Image{
-		ObjectMeta: metav1.ObjectMeta{Name: "bad-image"},
-		Spec: v1alpha3.ImageSpec{
-			DHCPBootImageName: "shimx64.efi",
-			Files: []v1alpha3.File{
-				{
-					Path: "images/bad-image/vmlinuz",
-					HTTP: &v1alpha3.HTTPSource{
-						URL:    ts.URL + "/vmlinuz",
-						SHA256: "0000000000000000000000000000000000000000000000000000000000000000",
-					},
-				},
-			},
-		},
-	}
-
-	scheme := newScheme(t)
-	fc := fake.NewClientBuilder().WithScheme(scheme).WithObjects(image).Build()
 	cacheDir := t.TempDir()
+	cache := NewOCICache(cacheDir)
 
-	reconciler := &ImageReconciler{
-		Client:   fc,
-		CacheDir: cacheDir,
+	if err := populateOCICache(cacheDir, digest, files); err != nil {
+		t.Fatal(err)
 	}
 
-	result, err := reconciler.Reconcile(t.Context(), ctrl.Request{
-		NamespacedName: types.NamespacedName{Name: "bad-image"},
-	})
-	if err != nil {
-		t.Fatalf("reconcile should not return error for checksum mismatch: %v", err)
-	}
+	cache.SetDigest(imageRef, "sha256:"+digest)
 
-	if result.RequeueAfter != 0 {
-		t.Fatalf("should not requeue on checksum mismatch: %v", result.RequeueAfter)
-	}
-
-	_, err = os.Stat(cachePath(cacheDir, "0000000000000000000000000000000000000000000000000000000000000000", ""))
-	if err == nil {
-		t.Error("file should not exist after checksum mismatch")
-	}
-}
-
-func TestImageReconciler_Deletion(t *testing.T) {
-	scheme := newScheme(t)
-	fc := fake.NewClientBuilder().WithScheme(scheme).Build()
-
-	reconciler := &ImageReconciler{
-		Client:   fc,
-		CacheDir: t.TempDir(),
-	}
-
-	_, err := reconciler.Reconcile(t.Context(), ctrl.Request{
-		NamespacedName: types.NamespacedName{Name: "deleted-image"},
-	})
-	if err != nil {
-		t.Fatalf("reconcile failed: %v", err)
-	}
+	return cache
 }
 
 func TestHTTPServer_ServeFiles(t *testing.T) {
 	vmlinuzData := []byte("test-vmlinuz-binary-data")
-	cacheDir := t.TempDir()
 
-	os.MkdirAll(filepath.Join(cacheDir, "sha256"), 0o755)
-	os.WriteFile(cachePath(cacheDir, sha256Hex(vmlinuzData), ""), vmlinuzData, 0o644)
-
-	img := &v1alpha3.Image{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-image"},
-		Spec: v1alpha3.ImageSpec{
-			Files: []v1alpha3.File{
-				{
-					Path: "images/test-image/vmlinuz",
-					HTTP: &v1alpha3.HTTPSource{URL: "https://example.com/vmlinuz", SHA256: sha256Hex(vmlinuzData)},
-				},
-			},
-		},
-	}
+	cache := setupOCICache(t, "ghcr.io/test/image:v1", "abc123", map[string][]byte{
+		"vmlinuz": vmlinuzData,
+	})
 
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-serve"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
-				ImageRef:   v1alpha3.LocalObjectReference{Name: "test-image"},
+				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:01", IPv4: "10.0.1.50", SubnetMask: "255.255.255.0"}},
 			},
 			Operations: &v1alpha3.OperationsSpec{ReimageCounter: 1},
@@ -233,14 +91,14 @@ func TestHTTPServer_ServeFiles(t *testing.T) {
 	scheme := newScheme(t)
 	fc := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(node, img).
+		WithObjects(node).
 		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
 		Build()
 
 	srv := &HTTPServer{
 		FileResolver: FileResolver{
-			CacheDir: cacheDir,
-			Reader:   fc,
+			Cache:  cache,
+			Reader: fc,
 		},
 	}
 
@@ -272,7 +130,7 @@ func TestHTTPServer_ServeFiles(t *testing.T) {
 	}
 
 	// Test serving cached file (with source IP identification)
-	req, _ := http.NewRequest("GET", ts.URL+"/images/test-image/vmlinuz", nil)
+	req, _ := http.NewRequest("GET", ts.URL+"/vmlinuz", nil)
 	req.Header.Set("X-Forwarded-For", "10.0.1.50")
 
 	resp, err = http.DefaultClient.Do(req)
@@ -292,7 +150,7 @@ func TestHTTPServer_ServeFiles(t *testing.T) {
 	}
 
 	// Test 404 for unknown file
-	req, _ = http.NewRequest("GET", ts.URL+"/images/nonexistent/foo", nil)
+	req, _ = http.NewRequest("GET", ts.URL+"/nonexistent/foo", nil)
 	req.Header.Set("X-Forwarded-For", "10.0.1.50")
 
 	resp, err = http.DefaultClient.Do(req)
@@ -307,7 +165,7 @@ func TestHTTPServer_ServeFiles(t *testing.T) {
 	}
 
 	// Test 404 for unknown source IP
-	resp, err = http.Get(ts.URL + "/images/test-image/vmlinuz")
+	resp, err = http.Get(ts.URL + "/vmlinuz")
 	if err != nil {
 		t.Fatalf("GET vmlinuz (unknown IP): %v", err)
 	}
@@ -320,34 +178,23 @@ func TestHTTPServer_ServeFiles(t *testing.T) {
 }
 
 func TestHTTPServer_TemplateRendered(t *testing.T) {
-	cacheDir := t.TempDir()
-
 	bootTemplate := `set default=0
 menuentry "Install" {
-  linux /images/{{ .Image.Name }}/vmlinuz hostname={{ .Machine.Name }} ip={{ (index .Machine.Spec.PXE.DHCPLeases 0).IPv4 }}
+  linux /vmlinuz hostname={{ .Machine.Name }} ip={{ (index .Machine.Spec.PXE.DHCPLeases 0).IPv4 }}
 }`
+
+	cache := setupOCICache(t, "ghcr.io/test/image:v1", "tmpl123", map[string][]byte{
+		"grub/grub.cfg.tmpl": []byte(bootTemplate),
+	})
 
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-01"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
-				ImageRef:   v1alpha3.LocalObjectReference{Name: "test-image"},
+				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:f0", IPv4: "10.0.1.10", SubnetMask: "255.255.255.0"}},
 			},
 			Operations: &v1alpha3.OperationsSpec{ReimageCounter: 1},
-		},
-	}
-
-	img := &v1alpha3.Image{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-image"},
-		Spec: v1alpha3.ImageSpec{
-			DHCPBootImageName: "shimx64.efi",
-			Files: []v1alpha3.File{
-				{
-					Path:     "boot.cfg",
-					Template: &v1alpha3.TemplateSource{Content: bootTemplate},
-				},
-			},
 		},
 	}
 
@@ -355,13 +202,13 @@ menuentry "Install" {
 
 	fc := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(node, img).
+		WithObjects(node).
 		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
 		Build()
 
 	srv := &HTTPServer{
 		FileResolver: FileResolver{
-			CacheDir:     cacheDir,
+			Cache:        cache,
 			Reader:       fc,
 			ApiserverURL: "https://k8s.example.com",
 			ServeURL:     "http://10.0.1.1:8080",
@@ -374,19 +221,19 @@ menuentry "Install" {
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 
-	req, _ := http.NewRequest("GET", ts.URL+"/boot.cfg", nil)
+	req, _ := http.NewRequest("GET", ts.URL+"/grub/grub.cfg", nil)
 	req.Header.Set("X-Forwarded-For", "10.0.1.10")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		t.Fatalf("GET /boot.cfg: %v", err)
+		t.Fatalf("GET /grub/grub.cfg: %v", err)
 	}
 
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("boot.cfg status: got %d, want 200, body: %s", resp.StatusCode, body)
+		t.Fatalf("grub.cfg status: got %d, want 200, body: %s", resp.StatusCode, body)
 	}
 
 	bodyStr := string(body)
@@ -397,33 +244,21 @@ menuentry "Install" {
 	if !strings.Contains(bodyStr, "ip=10.0.1.10") {
 		t.Errorf("rendered config should contain ip=10.0.1.10, got:\n%s", bodyStr)
 	}
-
-	if !strings.Contains(bodyStr, "/images/test-image/vmlinuz") {
-		t.Errorf("rendered config should contain image name, got:\n%s", bodyStr)
-	}
 }
 
 func TestHTTPServer_TemplateVerbatim(t *testing.T) {
-	cacheDir := t.TempDir()
 	staticConfig := "network:\n  version: 2\n  ethernets:\n    eth0:\n      dhcp4: false\n"
 
-	img := &v1alpha3.Image{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-image"},
-		Spec: v1alpha3.ImageSpec{
-			Files: []v1alpha3.File{
-				{
-					Path:     "configs/test-image/network-config",
-					Template: &v1alpha3.TemplateSource{Content: staticConfig},
-				},
-			},
-		},
-	}
+	// Static file (no .tmpl suffix) served verbatim from disk
+	cache := setupOCICache(t, "ghcr.io/test/image:v1", "verb123", map[string][]byte{
+		"cloud-init/user-data": []byte(staticConfig),
+	})
 
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-verbatim"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
-				ImageRef:   v1alpha3.LocalObjectReference{Name: "test-image"},
+				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:02", IPv4: "10.0.1.51", SubnetMask: "255.255.255.0"}},
 			},
 			Operations: &v1alpha3.OperationsSpec{ReimageCounter: 1},
@@ -433,14 +268,14 @@ func TestHTTPServer_TemplateVerbatim(t *testing.T) {
 	scheme := newScheme(t)
 	fc := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(node, img).
+		WithObjects(node).
 		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
 		Build()
 
 	srv := &HTTPServer{
 		FileResolver: FileResolver{
-			CacheDir: cacheDir,
-			Reader:   fc,
+			Cache:  cache,
+			Reader: fc,
 		},
 	}
 
@@ -450,7 +285,7 @@ func TestHTTPServer_TemplateVerbatim(t *testing.T) {
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 
-	req, _ := http.NewRequest("GET", ts.URL+"/configs/test-image/network-config", nil)
+	req, _ := http.NewRequest("GET", ts.URL+"/cloud-init/user-data", nil)
 	req.Header.Set("X-Forwarded-For", "10.0.1.51")
 
 	resp, err := http.DefaultClient.Do(req)
@@ -471,26 +306,17 @@ func TestHTTPServer_TemplateVerbatim(t *testing.T) {
 }
 
 func TestHTTPServer_StaticFile(t *testing.T) {
-	cacheDir := t.TempDir()
 	staticContent := "autoinstall:\n  version: 1\n  identity:\n    hostname: server\n"
 
-	img := &v1alpha3.Image{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-image"},
-		Spec: v1alpha3.ImageSpec{
-			Files: []v1alpha3.File{
-				{
-					Path:   "configs/test-image/autoinstall",
-					Static: &v1alpha3.StaticSource{Content: staticContent},
-				},
-			},
-		},
-	}
+	cache := setupOCICache(t, "ghcr.io/test/image:v1", "static123", map[string][]byte{
+		"cloud-init/user-data": []byte(staticContent),
+	})
 
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-static"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
-				ImageRef:   v1alpha3.LocalObjectReference{Name: "test-image"},
+				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:03", IPv4: "10.0.1.52", SubnetMask: "255.255.255.0"}},
 			},
 			Operations: &v1alpha3.OperationsSpec{ReimageCounter: 1},
@@ -500,14 +326,14 @@ func TestHTTPServer_StaticFile(t *testing.T) {
 	scheme := newScheme(t)
 	fc := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(node, img).
+		WithObjects(node).
 		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
 		Build()
 
 	srv := &HTTPServer{
 		FileResolver: FileResolver{
-			CacheDir: cacheDir,
-			Reader:   fc,
+			Cache:  cache,
+			Reader: fc,
 		},
 	}
 
@@ -517,7 +343,7 @@ func TestHTTPServer_StaticFile(t *testing.T) {
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 
-	req, _ := http.NewRequest("GET", ts.URL+"/configs/test-image/autoinstall", nil)
+	req, _ := http.NewRequest("GET", ts.URL+"/cloud-init/user-data", nil)
 	req.Header.Set("X-Forwarded-For", "10.0.1.52")
 
 	resp, err := http.DefaultClient.Do(req)
@@ -535,43 +361,23 @@ func TestHTTPServer_StaticFile(t *testing.T) {
 	if string(body) != staticContent {
 		t.Errorf("static body mismatch: got %q, want %q", body, staticContent)
 	}
-
-	if ct := resp.Header.Get("Content-Type"); ct != "text/plain" {
-		t.Errorf("Content-Type: got %q, want %q", ct, "text/plain")
-	}
 }
 
 func TestHTTPServer_UnknownSourceIP(t *testing.T) {
-	cacheDir := t.TempDir()
-
-	vmlinuzData := []byte("some-binary-data")
-
-	os.MkdirAll(filepath.Join(cacheDir, "sha256"), 0o755)
-	os.WriteFile(cachePath(cacheDir, sha256Hex(vmlinuzData), ""), vmlinuzData, 0o644)
-
-	img := &v1alpha3.Image{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-image"},
-		Spec: v1alpha3.ImageSpec{
-			Files: []v1alpha3.File{
-				{
-					Path: "images/test-image/vmlinuz",
-					HTTP: &v1alpha3.HTTPSource{URL: "https://example.com/vmlinuz", SHA256: sha256Hex(vmlinuzData)},
-				},
-			},
-		},
-	}
+	cache := setupOCICache(t, "ghcr.io/test/image:v1", "unkn123", map[string][]byte{
+		"vmlinuz": []byte("some-binary-data"),
+	})
 
 	scheme := newScheme(t)
 	fc := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(img).
 		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
 		Build()
 
 	srv := &HTTPServer{
 		FileResolver: FileResolver{
-			CacheDir: cacheDir,
-			Reader:   fc,
+			Cache:  cache,
+			Reader: fc,
 		},
 	}
 
@@ -582,7 +388,7 @@ func TestHTTPServer_UnknownSourceIP(t *testing.T) {
 	defer ts.Close()
 
 	// No node registered -- requests from any IP should get 404
-	req, _ := http.NewRequest("GET", ts.URL+"/images/test-image/vmlinuz", nil)
+	req, _ := http.NewRequest("GET", ts.URL+"/vmlinuz", nil)
 	req.Header.Set("X-Forwarded-For", "10.99.99.99")
 
 	resp, err := http.DefaultClient.Do(req)
@@ -598,14 +404,11 @@ func TestHTTPServer_UnknownSourceIP(t *testing.T) {
 }
 
 func TestTemplateRendering(t *testing.T) {
-	tmpl := `Node: {{ .Machine.Name }}, Image: {{ .Image.Name }}, API: {{ .ApiserverURL }}, Serve: {{ .ServeURL }}`
+	tmpl := `Node: {{ .Machine.Name }}, API: {{ .ApiserverURL }}, Serve: {{ .ServeURL }}`
 
 	data := templateData{
 		Machine: &v1alpha3.Machine{
 			ObjectMeta: metav1.ObjectMeta{Name: "test-node"},
-		},
-		Image: &v1alpha3.Image{
-			ObjectMeta: metav1.ObjectMeta{Name: "test-image"},
 		},
 		ApiserverURL: "https://k8s.example.com",
 		ServeURL:     "http://10.0.1.1:8080",
@@ -616,7 +419,7 @@ func TestTemplateRendering(t *testing.T) {
 		t.Fatalf("RenderTemplate: %v", err)
 	}
 
-	expected := "Node: test-node, Image: test-image, API: https://k8s.example.com, Serve: http://10.0.1.1:8080"
+	expected := "Node: test-node, API: https://k8s.example.com, Serve: http://10.0.1.1:8080"
 	if string(result) != expected {
 		t.Errorf("template result: got %q, want %q", result, expected)
 	}
@@ -627,12 +430,15 @@ func TestHTTPServer_Start_Shutdown(t *testing.T) {
 	fc := fake.NewClientBuilder().WithScheme(scheme).Build()
 
 	port := freePort(t)
+
+	cache := NewOCICache(t.TempDir())
+
 	srv := &HTTPServer{
 		BindAddr: "127.0.0.1",
 		Port:     port,
 		FileResolver: FileResolver{
-			CacheDir: t.TempDir(),
-			Reader:   fc,
+			Cache:  cache,
+			Reader: fc,
 		},
 	}
 
@@ -665,102 +471,30 @@ func TestHTTPServer_Start_Shutdown(t *testing.T) {
 	}
 }
 
-func TestImageReconciler_UpdateFile(t *testing.T) {
-	data1 := []byte("version-1")
-	data2 := []byte("version-2")
-
-	var serveData []byte
-
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write(serveData)
-	}))
-	defer ts.Close()
-
-	serveData = data1
-	image := &v1alpha3.Image{
-		ObjectMeta: metav1.ObjectMeta{Name: "update-image"},
-		Spec: v1alpha3.ImageSpec{
-			DHCPBootImageName: "shimx64.efi",
-			Files: []v1alpha3.File{{
-				Path: "images/update-image/file.bin",
-				HTTP: &v1alpha3.HTTPSource{URL: ts.URL + "/file.bin", SHA256: sha256Hex(data1)},
-			}},
-		},
-	}
-
-	scheme := newScheme(t)
-	fc := fake.NewClientBuilder().WithScheme(scheme).WithObjects(image).Build()
-	cacheDir := t.TempDir()
-
-	reconciler := &ImageReconciler{Client: fc, CacheDir: cacheDir}
-
-	_, err := reconciler.Reconcile(t.Context(), ctrl.Request{
-		NamespacedName: types.NamespacedName{Name: "update-image"},
-	})
-	if err != nil {
-		t.Fatalf("first reconcile: %v", err)
-	}
-
-	got, _ := os.ReadFile(cachePath(cacheDir, sha256Hex(data1), ""))
-	if string(got) != string(data1) {
-		t.Fatalf("first reconcile: got %q, want %q", got, data1)
-	}
-
-	// Update the image spec with new data
-	serveData = data2
-
-	var current v1alpha3.Image
-	fc.Get(t.Context(), types.NamespacedName{Name: "update-image"}, &current)
-	current.Spec.Files[0].HTTP.SHA256 = sha256Hex(data2)
-	fc.Update(t.Context(), &current)
-
-	_, err = reconciler.Reconcile(t.Context(), ctrl.Request{
-		NamespacedName: types.NamespacedName{Name: "update-image"},
-	})
-	if err != nil {
-		t.Fatalf("second reconcile: %v", err)
-	}
-
-	got, _ = os.ReadFile(cachePath(cacheDir, sha256Hex(data2), ""))
-	if string(got) != string(data2) {
-		t.Errorf("second reconcile: got %q, want %q", got, data2)
-	}
-}
-
 func TestTFTPServer_ResolveFileByPath(t *testing.T) {
 	vmlinuzData := []byte("tftp-vmlinuz-data")
-	cacheDir := t.TempDir()
 
-	os.MkdirAll(filepath.Join(cacheDir, "sha256"), 0o755)
-	os.WriteFile(cachePath(cacheDir, sha256Hex(vmlinuzData), ""), vmlinuzData, 0o644)
-
-	img := &v1alpha3.Image{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-image"},
-		Spec: v1alpha3.ImageSpec{
-			Files: []v1alpha3.File{{
-				Path: "images/test-image/vmlinuz",
-				HTTP: &v1alpha3.HTTPSource{URL: "https://example.com/vmlinuz", SHA256: sha256Hex(vmlinuzData)},
-			}},
-		},
-	}
+	cache := setupOCICache(t, "ghcr.io/test/image:v1", "tftp123", map[string][]byte{
+		"vmlinuz": vmlinuzData,
+	})
 
 	scheme := newScheme(t)
-	fc := fake.NewClientBuilder().WithScheme(scheme).WithObjects(img).Build()
+	fc := fake.NewClientBuilder().WithScheme(scheme).Build()
 
 	srv := &TFTPServer{
 		FileResolver: FileResolver{
-			CacheDir: cacheDir,
-			Reader:   fc,
+			Cache:  cache,
+			Reader: fc,
 		},
 	}
 
-	resolved, err := srv.ResolveFileByPath(t.Context(), "images/test-image/vmlinuz", nil, "test-image")
+	resolved, err := srv.ResolveFileByPath(t.Context(), "vmlinuz", nil, "ghcr.io/test/image:v1")
 	if err != nil {
 		t.Fatalf("ResolveFileByPath: %v", err)
 	}
 
 	if resolved.DiskPath == "" {
-		t.Fatal("expected DiskPath to be set for HTTP-sourced file")
+		t.Fatal("expected DiskPath to be set for static file")
 	}
 
 	data, err := os.ReadFile(resolved.DiskPath)
@@ -773,43 +507,38 @@ func TestTFTPServer_ResolveFileByPath(t *testing.T) {
 	}
 
 	// Test not found (wrong image)
-	_, err = srv.ResolveFileByPath(t.Context(), "images/test-image/vmlinuz", nil, "nonexistent-image")
+	_, err = srv.ResolveFileByPath(t.Context(), "vmlinuz", nil, "ghcr.io/test/nonexistent:v1")
 	if err == nil {
 		t.Error("expected error for nonexistent image")
 	}
 
 	// Test not found (wrong path)
-	_, err = srv.ResolveFileByPath(t.Context(), "images/nonexistent/foo", nil, "test-image")
+	_, err = srv.ResolveFileByPath(t.Context(), "nonexistent/foo", nil, "ghcr.io/test/image:v1")
 	if err == nil {
 		t.Error("expected error for nonexistent file")
 	}
 }
 
 func TestTFTPServer_TemplateVerbatim(t *testing.T) {
-	cacheDir := t.TempDir()
 	staticData := "static-config-data"
 
-	img := &v1alpha3.Image{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-image"},
-		Spec: v1alpha3.ImageSpec{
-			Files: []v1alpha3.File{{
-				Path:     "configs/static",
-				Template: &v1alpha3.TemplateSource{Content: staticData},
-			}},
-		},
-	}
+	// When requesting "configs/static", it finds configs/static.tmpl and renders as template
+	// Since node is nil, template content is returned verbatim
+	cache := setupOCICache(t, "ghcr.io/test/image:v1", "tftptmpl123", map[string][]byte{
+		"configs/static.tmpl": []byte(staticData),
+	})
 
 	scheme := newScheme(t)
-	fc := fake.NewClientBuilder().WithScheme(scheme).WithObjects(img).Build()
+	fc := fake.NewClientBuilder().WithScheme(scheme).Build()
 
 	srv := &TFTPServer{
 		FileResolver: FileResolver{
-			CacheDir: cacheDir,
-			Reader:   fc,
+			Cache:  cache,
+			Reader: fc,
 		},
 	}
 
-	resolved, err := srv.ResolveFileByPath(t.Context(), "configs/static", nil, "test-image")
+	resolved, err := srv.ResolveFileByPath(t.Context(), "configs/static", nil, "ghcr.io/test/image:v1")
 	if err != nil {
 		t.Fatalf("ResolveFileByPath: %v", err)
 	}
@@ -820,36 +549,38 @@ func TestTFTPServer_TemplateVerbatim(t *testing.T) {
 }
 
 func TestTFTPServer_StaticFile(t *testing.T) {
-	cacheDir := t.TempDir()
 	staticData := "static-config-no-template"
 
-	img := &v1alpha3.Image{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-image"},
-		Spec: v1alpha3.ImageSpec{
-			Files: []v1alpha3.File{{
-				Path:   "configs/static",
-				Static: &v1alpha3.StaticSource{Content: staticData},
-			}},
-		},
-	}
+	cache := setupOCICache(t, "ghcr.io/test/image:v1", "tftpstatic123", map[string][]byte{
+		"configs/static": []byte(staticData),
+	})
 
 	scheme := newScheme(t)
-	fc := fake.NewClientBuilder().WithScheme(scheme).WithObjects(img).Build()
+	fc := fake.NewClientBuilder().WithScheme(scheme).Build()
 
 	srv := &TFTPServer{
 		FileResolver: FileResolver{
-			CacheDir: cacheDir,
-			Reader:   fc,
+			Cache:  cache,
+			Reader: fc,
 		},
 	}
 
-	resolved, err := srv.ResolveFileByPath(t.Context(), "configs/static", nil, "test-image")
+	resolved, err := srv.ResolveFileByPath(t.Context(), "configs/static", nil, "ghcr.io/test/image:v1")
 	if err != nil {
 		t.Fatalf("ResolveFileByPath: %v", err)
 	}
 
-	if string(resolved.Data) != staticData {
-		t.Errorf("data mismatch: got %q, want %q", resolved.Data, staticData)
+	if resolved.DiskPath == "" {
+		t.Fatal("expected DiskPath for static file")
+	}
+
+	data, err := os.ReadFile(resolved.DiskPath)
+	if err != nil {
+		t.Fatalf("reading: %v", err)
+	}
+
+	if string(data) != staticData {
+		t.Errorf("data mismatch: got %q, want %q", data, staticData)
 	}
 }
 
@@ -888,88 +619,39 @@ func TestHTTPServer_EndToEnd_MixedSources(t *testing.T) {
 	initrdData := []byte("e2e-initrd-binary")
 	bootTemplate := `set root=(tftp)
 menuentry "Install {{ .Machine.Name }}" {
-  linux /images/{{ .Image.Name }}/vmlinuz
-  initrd /images/{{ .Image.Name }}/initrd
+  linux /vmlinuz
+  initrd /initrd
 }`
 	staticConfig := "autoinstall: true"
 
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/vmlinuz":
-			w.Write(vmlinuzData)
-		case "/initrd":
-			w.Write(initrdData)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer ts.Close()
+	cache := setupOCICache(t, "ghcr.io/test/e2e:v1", "e2e123", map[string][]byte{
+		"vmlinuz":              vmlinuzData,
+		"initrd":               initrdData,
+		"grub/grub.cfg.tmpl":   []byte(bootTemplate),
+		"cloud-init/user-data": []byte(staticConfig),
+	})
 
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "e2e-node"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
-				ImageRef:   v1alpha3.LocalObjectReference{Name: "e2e-image"},
+				Image:      "ghcr.io/test/e2e:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:00:11:22", IPv4: "10.0.3.10", SubnetMask: "255.255.255.0"}},
 			},
 			Operations: &v1alpha3.OperationsSpec{ReimageCounter: 1},
 		},
 	}
 
-	img := &v1alpha3.Image{
-		ObjectMeta: metav1.ObjectMeta{Name: "e2e-image"},
-		Spec: v1alpha3.ImageSpec{
-			DHCPBootImageName: "shimx64.efi",
-			Files: []v1alpha3.File{
-				{
-					Path: "images/e2e-image/vmlinuz",
-					HTTP: &v1alpha3.HTTPSource{URL: ts.URL + "/vmlinuz", SHA256: sha256Hex(vmlinuzData)},
-				},
-				{
-					Path: "images/e2e-image/initrd",
-					HTTP: &v1alpha3.HTTPSource{URL: ts.URL + "/initrd", SHA256: sha256Hex(initrdData)},
-				},
-				{
-					Path:     "boot.cfg",
-					Template: &v1alpha3.TemplateSource{Content: bootTemplate},
-				},
-				{
-					Path:   "configs/e2e-image/autoinstall",
-					Static: &v1alpha3.StaticSource{Content: staticConfig},
-				},
-			},
-		},
-	}
-
-	cacheDir := t.TempDir()
-
 	scheme := newScheme(t)
 	fc := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(img, node).
+		WithObjects(node).
 		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
 		Build()
 
-	// Step 1: Reconcile to download HTTP files
-	reconciler := &ImageReconciler{Client: fc, CacheDir: cacheDir}
-
-	_, err := reconciler.Reconcile(t.Context(), ctrl.Request{
-		NamespacedName: types.NamespacedName{Name: "e2e-image"},
-	})
-	if err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-
-	// Verify files are cached
-	gotVmlinuz, _ := os.ReadFile(cachePath(cacheDir, sha256Hex(vmlinuzData), ""))
-	if string(gotVmlinuz) != string(vmlinuzData) {
-		t.Fatalf("vmlinuz mismatch after reconcile")
-	}
-
-	// Step 2: Create HTTP server and test serving
 	httpSrv := &HTTPServer{
 		FileResolver: FileResolver{
-			CacheDir:     cacheDir,
+			Cache:        cache,
 			Reader:       fc,
 			ApiserverURL: "https://k8s.example.com",
 			ServeURL:     "http://10.0.3.1:8080",
@@ -986,8 +668,8 @@ menuentry "Install {{ .Machine.Name }}" {
 	httpTS := httptest.NewServer(mux)
 	defer httpTS.Close()
 
-	// Test vmlinuz via HTTP (with source IP identification)
-	req, _ := http.NewRequest("GET", httpTS.URL+"/images/e2e-image/vmlinuz", nil)
+	// Test vmlinuz via HTTP
+	req, _ := http.NewRequest("GET", httpTS.URL+"/vmlinuz", nil)
 	req.Header.Set("X-Forwarded-For", "10.0.3.10")
 	resp, _ := http.DefaultClient.Do(req)
 	body, _ := io.ReadAll(resp.Body)
@@ -997,19 +679,19 @@ menuentry "Install {{ .Machine.Name }}" {
 		t.Errorf("HTTP vmlinuz mismatch")
 	}
 
-	// Test boot config with IP identification
-	req, _ = http.NewRequest("GET", httpTS.URL+"/boot.cfg", nil)
+	// Test boot config (template rendered)
+	req, _ = http.NewRequest("GET", httpTS.URL+"/grub/grub.cfg", nil)
 	req.Header.Set("X-Forwarded-For", "10.0.3.10")
 	resp, _ = http.DefaultClient.Do(req)
 	body, _ = io.ReadAll(resp.Body)
 	resp.Body.Close()
 
 	if !strings.Contains(string(body), "Install e2e-node") {
-		t.Errorf("boot.cfg should contain node name, got:\n%s", body)
+		t.Errorf("grub.cfg should contain node name, got:\n%s", body)
 	}
 
-	// Test static template serving (with source IP identification)
-	req, _ = http.NewRequest("GET", httpTS.URL+"/configs/e2e-image/autoinstall", nil)
+	// Test static file serving
+	req, _ = http.NewRequest("GET", httpTS.URL+"/cloud-init/user-data", nil)
 	req.Header.Set("X-Forwarded-For", "10.0.3.10")
 	resp, _ = http.DefaultClient.Do(req)
 	body, _ = io.ReadAll(resp.Body)
@@ -1019,8 +701,8 @@ menuentry "Install {{ .Machine.Name }}" {
 		t.Errorf("static config mismatch: got %q", body)
 	}
 
-	// Test 404 for file not in this node's image
-	req, _ = http.NewRequest("GET", httpTS.URL+"/images/nonexistent/foo", nil)
+	// Test 404 for file not in this image
+	req, _ = http.NewRequest("GET", httpTS.URL+"/nonexistent/foo", nil)
 	req.Header.Set("X-Forwarded-For", "10.0.3.10")
 	resp, _ = http.DefaultClient.Do(req)
 	resp.Body.Close()
@@ -1031,39 +713,23 @@ menuentry "Install {{ .Machine.Name }}" {
 }
 
 func TestHTTPServer_CrossImageIsolation(t *testing.T) {
-	cacheDir := t.TempDir()
-
 	alphaData := []byte("alpha-vmlinuz")
 	betaData := []byte("beta-vmlinuz")
 
-	os.MkdirAll(filepath.Join(cacheDir, "sha256"), 0o755)
-	os.WriteFile(cachePath(cacheDir, sha256Hex(alphaData), ""), alphaData, 0o644)
-	os.WriteFile(cachePath(cacheDir, sha256Hex(betaData), ""), betaData, 0o644)
+	cacheDir := t.TempDir()
+	cache := NewOCICache(cacheDir)
 
-	alphaImage := &v1alpha3.Image{
-		ObjectMeta: metav1.ObjectMeta{Name: "alpha-image"},
-		Spec: v1alpha3.ImageSpec{
-			Files: []v1alpha3.File{{
-				Path: "images/alpha-image/vmlinuz",
-				HTTP: &v1alpha3.HTTPSource{URL: "https://example.com/alpha", SHA256: sha256Hex(alphaData)},
-			}},
-		},
-	}
-	betaImage := &v1alpha3.Image{
-		ObjectMeta: metav1.ObjectMeta{Name: "beta-image"},
-		Spec: v1alpha3.ImageSpec{
-			Files: []v1alpha3.File{{
-				Path: "images/beta-image/vmlinuz",
-				HTTP: &v1alpha3.HTTPSource{URL: "https://example.com/beta", SHA256: sha256Hex(betaData)},
-			}},
-		},
-	}
+	populateOCICache(cacheDir, "alpha111", map[string][]byte{"vmlinuz": alphaData})
+	populateOCICache(cacheDir, "beta222", map[string][]byte{"vmlinuz": betaData})
+
+	cache.SetDigest("ghcr.io/test/alpha:v1", "sha256:alpha111")
+	cache.SetDigest("ghcr.io/test/beta:v1", "sha256:beta222")
 
 	alphaNode := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "alpha-node"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
-				ImageRef:   v1alpha3.LocalObjectReference{Name: "alpha-image"},
+				Image:      "ghcr.io/test/alpha:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:aa:aa:aa:aa:aa", IPv4: "10.0.10.1", SubnetMask: "255.255.255.0"}},
 			},
 			Operations: &v1alpha3.OperationsSpec{ReimageCounter: 1},
@@ -1073,7 +739,7 @@ func TestHTTPServer_CrossImageIsolation(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "beta-node"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
-				ImageRef:   v1alpha3.LocalObjectReference{Name: "beta-image"},
+				Image:      "ghcr.io/test/beta:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "bb:bb:bb:bb:bb:bb", IPv4: "10.0.10.2", SubnetMask: "255.255.255.0"}},
 			},
 			Operations: &v1alpha3.OperationsSpec{ReimageCounter: 1},
@@ -1083,14 +749,14 @@ func TestHTTPServer_CrossImageIsolation(t *testing.T) {
 	scheme := newScheme(t)
 	fc := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(alphaNode, betaNode, alphaImage, betaImage).
+		WithObjects(alphaNode, betaNode).
 		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
 		Build()
 
 	srv := &HTTPServer{
 		FileResolver: FileResolver{
-			CacheDir: cacheDir,
-			Reader:   fc,
+			Cache:  cache,
+			Reader: fc,
 		},
 	}
 
@@ -1101,7 +767,7 @@ func TestHTTPServer_CrossImageIsolation(t *testing.T) {
 	defer ts.Close()
 
 	// Alpha node can access its own image's files
-	req, _ := http.NewRequest("GET", ts.URL+"/images/alpha-image/vmlinuz", nil)
+	req, _ := http.NewRequest("GET", ts.URL+"/vmlinuz", nil)
 	req.Header.Set("X-Forwarded-For", "10.0.10.1")
 	resp, _ := http.DefaultClient.Do(req)
 	body, _ := io.ReadAll(resp.Body)
@@ -1115,18 +781,8 @@ func TestHTTPServer_CrossImageIsolation(t *testing.T) {
 		t.Errorf("alpha vmlinuz mismatch: got %q", body)
 	}
 
-	// Alpha node CANNOT access beta's image files
-	req, _ = http.NewRequest("GET", ts.URL+"/images/beta-image/vmlinuz", nil)
-	req.Header.Set("X-Forwarded-For", "10.0.10.1")
-	resp, _ = http.DefaultClient.Do(req)
-	resp.Body.Close()
-
-	if resp.StatusCode != http.StatusNotFound {
-		t.Errorf("alpha accessing beta image: got %d, want 404", resp.StatusCode)
-	}
-
 	// Beta node can access its own image's files
-	req, _ = http.NewRequest("GET", ts.URL+"/images/beta-image/vmlinuz", nil)
+	req, _ = http.NewRequest("GET", ts.URL+"/vmlinuz", nil)
 	req.Header.Set("X-Forwarded-For", "10.0.10.2")
 	resp, _ = http.DefaultClient.Do(req)
 	body, _ = io.ReadAll(resp.Body)
@@ -1139,36 +795,17 @@ func TestHTTPServer_CrossImageIsolation(t *testing.T) {
 	if string(body) != string(betaData) {
 		t.Errorf("beta vmlinuz mismatch: got %q", body)
 	}
-
-	// Beta node CANNOT access alpha's image files
-	req, _ = http.NewRequest("GET", ts.URL+"/images/alpha-image/vmlinuz", nil)
-	req.Header.Set("X-Forwarded-For", "10.0.10.2")
-	resp, _ = http.DefaultClient.Do(req)
-	resp.Body.Close()
-
-	if resp.StatusCode != http.StatusNotFound {
-		t.Errorf("beta accessing alpha image: got %d, want 404", resp.StatusCode)
-	}
 }
 
 func TestHTTPServer_503WhenFileNotDownloaded(t *testing.T) {
-	cacheDir := t.TempDir()
-
-	img := &v1alpha3.Image{
-		ObjectMeta: metav1.ObjectMeta{Name: "pending-image"},
-		Spec: v1alpha3.ImageSpec{
-			Files: []v1alpha3.File{{
-				Path: "images/pending-image/vmlinuz",
-				HTTP: &v1alpha3.HTTPSource{URL: "https://example.com/vmlinuz", SHA256: "abc123"},
-			}},
-		},
-	}
+	// Cache with NO digest set for the image
+	cache := NewOCICache(t.TempDir())
 
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "pending-node"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
-				ImageRef:   v1alpha3.LocalObjectReference{Name: "pending-image"},
+				Image:      "ghcr.io/test/pending:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:10", IPv4: "10.0.5.10", SubnetMask: "255.255.255.0"}},
 			},
 			Operations: &v1alpha3.OperationsSpec{ReimageCounter: 1},
@@ -1178,12 +815,12 @@ func TestHTTPServer_503WhenFileNotDownloaded(t *testing.T) {
 	scheme := newScheme(t)
 	fc := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(node, img).
+		WithObjects(node).
 		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
 		Build()
 
 	srv := &HTTPServer{
-		FileResolver: FileResolver{CacheDir: cacheDir, Reader: fc},
+		FileResolver: FileResolver{Cache: cache, Reader: fc},
 	}
 
 	mux := http.NewServeMux()
@@ -1192,8 +829,8 @@ func TestHTTPServer_503WhenFileNotDownloaded(t *testing.T) {
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 
-	// File exists in image spec but not on disk -- should get 503
-	req, _ := http.NewRequest("GET", ts.URL+"/images/pending-image/vmlinuz", nil)
+	// File not yet pulled -- should get 503
+	req, _ := http.NewRequest("GET", ts.URL+"/vmlinuz", nil)
 	req.Header.Set("X-Forwarded-For", "10.0.5.10")
 
 	resp, err := http.DefaultClient.Do(req)
@@ -1213,16 +850,11 @@ func TestHTTPServer_503WhenFileNotDownloaded(t *testing.T) {
 }
 
 func TestResolveFile_NotYetDownloaded(t *testing.T) {
-	cacheDir := t.TempDir()
+	cache := NewOCICache(t.TempDir())
 
-	resolver := FileResolver{CacheDir: cacheDir, Reader: nil}
+	resolver := FileResolver{Cache: cache, Reader: nil}
 
-	file := v1alpha3.File{
-		Path: "images/test-image/vmlinuz",
-		HTTP: &v1alpha3.HTTPSource{URL: "https://example.com/vmlinuz", SHA256: "abc123"},
-	}
-
-	_, err := resolver.resolveFile(file, nil, nil)
+	_, err := resolver.ResolveFileByPath(t.Context(), "vmlinuz", nil, "ghcr.io/test/missing:v1")
 	if !errors.Is(err, ErrNotYetDownloaded) {
 		t.Fatalf("expected ErrNotYetDownloaded, got: %v", err)
 	}
@@ -1233,12 +865,14 @@ func TestHTTPServer_DisablePXE(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "pxe-node"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
-				ImageRef:   v1alpha3.LocalObjectReference{Name: "test-image"},
+				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:20", IPv4: "10.0.6.10", SubnetMask: "255.255.255.0"}},
 			},
 			Operations: &v1alpha3.OperationsSpec{ReimageCounter: 1},
 		},
 	}
+
+	cache := NewOCICache(t.TempDir())
 
 	scheme := newScheme(t)
 	fc := fake.NewClientBuilder().
@@ -1250,7 +884,7 @@ func TestHTTPServer_DisablePXE(t *testing.T) {
 
 	srv := &HTTPServer{
 		Client:       fc,
-		FileResolver: FileResolver{CacheDir: t.TempDir(), Reader: fc},
+		FileResolver: FileResolver{Cache: cache, Reader: fc},
 	}
 
 	mux := http.NewServeMux()
@@ -1275,9 +909,9 @@ func TestHTTPServer_DisablePXE(t *testing.T) {
 		t.Errorf("expected 200, got %d", resp.StatusCode)
 	}
 
-	// Verify the Machine status was patched so reimage counter matches spec
+	// Verify the Machine status was patched
 	var updated v1alpha3.Machine
-	if err := fc.Get(t.Context(), types.NamespacedName{Name: "pxe-node"}, &updated); err != nil {
+	if err := fc.Get(t.Context(), client.ObjectKeyFromObject(node), &updated); err != nil {
 		t.Fatalf("getting updated node: %v", err)
 	}
 
@@ -1300,8 +934,8 @@ func TestHTTPServer_DisablePXE(t *testing.T) {
 		t.Fatalf("expected Reimaged=True/Succeeded, got %+v", reimagedCond)
 	}
 
-	if reimagedCond.Message != "image=test-image" {
-		t.Fatalf("expected Reimaged message 'image=test-image', got %q", reimagedCond.Message)
+	if reimagedCond.Message != "image=ghcr.io/test/image:v1" {
+		t.Fatalf("expected Reimaged message 'image=ghcr.io/test/image:v1', got %q", reimagedCond.Message)
 	}
 
 	// Second call should be idempotent (still 200)
@@ -1321,6 +955,8 @@ func TestHTTPServer_DisablePXE(t *testing.T) {
 }
 
 func TestHTTPServer_DisablePXE_UnknownIP(t *testing.T) {
+	cache := NewOCICache(t.TempDir())
+
 	scheme := newScheme(t)
 	fc := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -1329,7 +965,7 @@ func TestHTTPServer_DisablePXE_UnknownIP(t *testing.T) {
 
 	srv := &HTTPServer{
 		Client:       fc,
-		FileResolver: FileResolver{CacheDir: t.TempDir(), Reader: fc},
+		FileResolver: FileResolver{Cache: cache, Reader: fc},
 	}
 
 	mux := http.NewServeMux()
@@ -1354,87 +990,152 @@ func TestHTTPServer_DisablePXE_UnknownIP(t *testing.T) {
 	}
 }
 
-func TestImageReconciler_ConcurrencyLimit(t *testing.T) {
-	const (
-		maxDownloads = 2
-		numFiles     = 10
-	)
-
-	var (
-		concurrent    atomic.Int32
-		maxConcurrent atomic.Int32
-	)
-
-	// Pre-generate unique data for each file so they have distinct SHA256s
-	fileContents := make([][]byte, numFiles)
-	for i := range numFiles {
-		fileContents[i] = []byte(fmt.Sprintf("download-data-%d", i))
-	}
-
-	// HTTP server that tracks concurrent requests
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		cur := concurrent.Add(1)
-		defer concurrent.Add(-1)
-
-		for {
-			old := maxConcurrent.Load()
-			if cur <= old || maxConcurrent.CompareAndSwap(old, cur) {
-				break
-			}
-		}
-
-		time.Sleep(50 * time.Millisecond) // hold the slot briefly
-		// Serve unique content based on request path
-		fmt.Fprintf(w, "download-data-%s", strings.TrimPrefix(r.URL.Path, "/file-"))
-	}))
-	defer ts.Close()
-
-	files := make([]v1alpha3.File, numFiles)
-	for i := range numFiles {
-		files[i] = v1alpha3.File{
-			Path: fmt.Sprintf("images/conc-image/file-%d", i),
-			HTTP: &v1alpha3.HTTPSource{URL: fmt.Sprintf("%s/file-%d", ts.URL, i), SHA256: sha256Hex(fileContents[i])},
-		}
-	}
-
-	image := &v1alpha3.Image{
-		ObjectMeta: metav1.ObjectMeta{Name: "conc-image"},
-		Spec:       v1alpha3.ImageSpec{Files: files},
-	}
-
-	scheme := newScheme(t)
-	fc := fake.NewClientBuilder().WithScheme(scheme).WithObjects(image).Build()
+func TestOCICache_Metadata(t *testing.T) {
 	cacheDir := t.TempDir()
+	cache := NewOCICache(cacheDir)
 
-	reconciler := &ImageReconciler{
-		Client:       fc,
-		CacheDir:     cacheDir,
-		MaxDownloads: maxDownloads,
+	digest := "testdigest123"
+	metadataContent := "dhcpBootImageName: shimx64.efi\n"
+
+	if err := populateOCICache(cacheDir, digest, map[string][]byte{
+		"metadata.yaml": []byte(metadataContent),
+	}); err != nil {
+		t.Fatal(err)
 	}
 
-	result, err := reconciler.Reconcile(t.Context(), ctrl.Request{
-		NamespacedName: types.NamespacedName{Name: "conc-image"},
-	})
+	cache.SetDigest("ghcr.io/test/image:v1", "sha256:"+digest)
+
+	meta, err := cache.MetadataForRef("ghcr.io/test/image:v1")
 	if err != nil {
-		t.Fatalf("reconcile failed: %v", err)
+		t.Fatalf("MetadataForRef: %v", err)
 	}
 
-	if result.RequeueAfter != 0 {
-		t.Fatalf("unexpected requeue: %v", result.RequeueAfter)
+	if meta.DHCPBootImageName != "shimx64.efi" {
+		t.Errorf("DHCPBootImageName: got %q, want %q", meta.DHCPBootImageName, "shimx64.efi")
+	}
+}
+
+func TestOCICache_MetadataNoFile(t *testing.T) {
+	cacheDir := t.TempDir()
+	cache := NewOCICache(cacheDir)
+
+	digest := "nometa123"
+
+	if err := populateOCICache(cacheDir, digest, map[string][]byte{
+		"vmlinuz": []byte("kernel"),
+	}); err != nil {
+		t.Fatal(err)
 	}
 
-	if got := maxConcurrent.Load(); got > maxDownloads {
-		t.Errorf("max concurrent downloads: got %d, want <= %d", got, maxDownloads)
+	cache.SetDigest("ghcr.io/test/image:v1", "sha256:"+digest)
+
+	meta, err := cache.MetadataForRef("ghcr.io/test/image:v1")
+	if err != nil {
+		t.Fatalf("MetadataForRef: %v", err)
 	}
 
-	// Verify all files were downloaded
-	for i := range numFiles {
-		data, err := os.ReadFile(cachePath(cacheDir, sha256Hex(fileContents[i]), ""))
-		if err != nil {
-			t.Errorf("file-%d not downloaded: %v", i, err)
-		} else if string(data) != string(fileContents[i]) {
-			t.Errorf("file-%d content mismatch", i)
+	if meta.DHCPBootImageName != "" {
+		t.Errorf("expected empty DHCPBootImageName, got %q", meta.DHCPBootImageName)
+	}
+}
+
+func TestOCICache_ResolvePath(t *testing.T) {
+	cacheDir := t.TempDir()
+	cache := NewOCICache(cacheDir)
+
+	digest := "resolve123"
+
+	if err := populateOCICache(cacheDir, digest, map[string][]byte{
+		"vmlinuz":            []byte("kernel"),
+		"grub/grub.cfg.tmpl": []byte("template content"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	cache.SetDigest("ghcr.io/test/image:v1", "sha256:"+digest)
+
+	// Static file
+	diskPath, isTemplate, err := cache.ResolvePath("ghcr.io/test/image:v1", "vmlinuz")
+	if err != nil {
+		t.Fatalf("ResolvePath static: %v", err)
+	}
+
+	if isTemplate {
+		t.Error("vmlinuz should not be a template")
+	}
+
+	if !filepath.IsAbs(diskPath) {
+		t.Errorf("expected absolute path, got %q", diskPath)
+	}
+
+	// Template file (.tmpl suffix stripped in request)
+	_, isTemplate, err = cache.ResolvePath("ghcr.io/test/image:v1", "grub/grub.cfg")
+	if err != nil {
+		t.Fatalf("ResolvePath template: %v", err)
+	}
+
+	if !isTemplate {
+		t.Error("grub/grub.cfg should be resolved as template (via grub/grub.cfg.tmpl)")
+	}
+
+	// Not found
+	_, _, err = cache.ResolvePath("ghcr.io/test/image:v1", "nonexistent")
+	if err == nil {
+		t.Error("expected error for nonexistent file")
+	}
+}
+
+func TestOCICache_ResolvePath_PathTraversal(t *testing.T) {
+	cacheDir := t.TempDir()
+	cache := NewOCICache(cacheDir)
+
+	digest := "traversal123"
+
+	// Place a file outside the cache that a traversal might reach.
+	secret := filepath.Join(cacheDir, "secret.txt")
+	if err := os.WriteFile(secret, []byte("secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := populateOCICache(cacheDir, digest, map[string][]byte{
+		"vmlinuz": []byte("kernel"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	cache.SetDigest("ghcr.io/test/image:v1", "sha256:"+digest)
+
+	traversalCases := []string{
+		"../../../secret.txt",     // escapes diskDir to cacheDir root
+		"../../../../etc/passwd",  // escapes past cacheDir
+		"sub/../../../secret.txt", // sub-dir traversal escaping diskDir
+	}
+
+	for _, tc := range traversalCases {
+		_, _, err := cache.ResolvePath("ghcr.io/test/image:v1", tc)
+		if err == nil {
+			t.Errorf("expected error for traversal path %q, got none", tc)
 		}
+	}
+
+	// Absolute path must be rejected.
+	_, _, err := cache.ResolvePath("ghcr.io/test/image:v1", "/etc/passwd")
+	if err == nil {
+		t.Error("expected error for absolute path, got none")
+	}
+
+	// Path resolving to diskDir itself must be rejected.
+	for _, dots := range []string{".", ""} {
+		_, _, err := cache.ResolvePath("ghcr.io/test/image:v1", dots)
+		if err == nil {
+			t.Errorf("expected error for path %q resolving to diskDir, got none", dots)
+		}
+	}
+
+	// Valid relative path must still work.
+	_, _, err = cache.ResolvePath("ghcr.io/test/image:v1", "vmlinuz")
+	if err != nil {
+		t.Errorf("expected success for valid relative path, got: %v", err)
 	}
 }
 
@@ -1467,173 +1168,6 @@ func waitForHTTP(t *testing.T, url string, timeout time.Duration) {
 	}
 
 	t.Fatalf("timed out waiting for %s", url)
-}
-
-// createTestQcow2 uses qemu-img to create a small qcow2 file with known
-// raw content. Returns the qcow2 file path and the expected raw content.
-func createTestQcow2(t *testing.T) (qcow2Path string, rawContent []byte) {
-	t.Helper()
-
-	if _, err := exec.LookPath("qemu-img"); err != nil {
-		t.Skip("qemu-img not available, skipping qcow2 test")
-	}
-
-	dir := t.TempDir()
-
-	// Create a small raw image with known content
-	rawPath := filepath.Join(dir, "test.raw")
-	rawSize := 1024 * 1024 // 1 MiB
-	rawContent = make([]byte, rawSize)
-	// Write a recognizable pattern
-	for i := range rawContent {
-		rawContent[i] = byte(i % 251) // prime modulus to avoid trivial patterns
-	}
-
-	if err := os.WriteFile(rawPath, rawContent, 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	// Convert raw -> qcow2
-	qcow2Path = filepath.Join(dir, "test.qcow2")
-
-	cmd := exec.CommandContext(t.Context(), "qemu-img", "convert", "-f", "raw", "-O", "qcow2", rawPath, qcow2Path)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("qemu-img convert failed: %v\n%s", err, out)
-	}
-
-	return qcow2Path, rawContent
-}
-
-func TestImageReconciler_ConvertQcow2ToRawGz(t *testing.T) {
-	qcow2Path, expectedRaw := createTestQcow2(t)
-
-	qcow2Data, err := os.ReadFile(qcow2Path)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	qcow2SHA := sha256Hex(qcow2Data)
-
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write(qcow2Data)
-	}))
-	defer ts.Close()
-
-	image := &v1alpha3.Image{
-		ObjectMeta: metav1.ObjectMeta{Name: "convert-image"},
-		Spec: v1alpha3.ImageSpec{
-			Files: []v1alpha3.File{
-				{
-					Path: "images/convert-image/disk.img.gz",
-					HTTP: &v1alpha3.HTTPSource{
-						URL:     ts.URL + "/ubuntu-cloudimg.qcow2",
-						SHA256:  qcow2SHA,
-						Convert: "UnpackQcow2",
-					},
-				},
-			},
-		},
-	}
-
-	scheme := newScheme(t)
-	fc := fake.NewClientBuilder().WithScheme(scheme).WithObjects(image).Build()
-	cacheDir := t.TempDir()
-
-	reconciler := &ImageReconciler{Client: fc, CacheDir: cacheDir}
-
-	result, err := reconciler.Reconcile(t.Context(), ctrl.Request{
-		NamespacedName: types.NamespacedName{Name: "convert-image"},
-	})
-	if err != nil {
-		t.Fatalf("reconcile failed: %v", err)
-	}
-
-	if result.RequeueAfter != 0 {
-		t.Fatalf("unexpected requeue: %v", result.RequeueAfter)
-	}
-
-	// Verify the converted file exists and is valid raw+gzip
-	convertedPath := cachePath(cacheDir, qcow2SHA, "UnpackQcow2")
-
-	f, err := os.Open(convertedPath)
-	if err != nil {
-		t.Fatalf("converted file not found: %v", err)
-	}
-	defer f.Close()
-
-	gr, err := gzip.NewReader(f)
-	if err != nil {
-		t.Fatalf("not a valid gzip file: %v", err)
-	}
-	defer gr.Close()
-
-	gotRaw, err := io.ReadAll(gr)
-	if err != nil {
-		t.Fatalf("reading gzipped raw data: %v", err)
-	}
-
-	if len(gotRaw) != len(expectedRaw) {
-		t.Fatalf("raw size mismatch: got %d, want %d", len(gotRaw), len(expectedRaw))
-	}
-
-	if string(gotRaw) != string(expectedRaw) {
-		t.Error("raw content mismatch after qcow2 -> raw+gz conversion")
-	}
-
-	// Re-reconcile should skip re-download (content-addressed cache check)
-	var downloadCount atomic.Int32
-
-	ts.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		downloadCount.Add(1)
-		w.Write(qcow2Data)
-	})
-
-	result, err = reconciler.Reconcile(t.Context(), ctrl.Request{
-		NamespacedName: types.NamespacedName{Name: "convert-image"},
-	})
-	if err != nil {
-		t.Fatalf("second reconcile failed: %v", err)
-	}
-
-	if result.RequeueAfter != 0 {
-		t.Fatalf("unexpected requeue on second reconcile: %v", result.RequeueAfter)
-	}
-
-	if downloadCount.Load() != 0 {
-		t.Error("second reconcile should not re-download (content-addressed cache hit)")
-	}
-}
-
-func TestImageReconciler_ConvertUnsupportedMethod(t *testing.T) {
-	scheme := newScheme(t)
-
-	image := &v1alpha3.Image{
-		ObjectMeta: metav1.ObjectMeta{Name: "bad-convert-image"},
-		Spec: v1alpha3.ImageSpec{
-			Files: []v1alpha3.File{{
-				Path: "images/test/disk.img.gz",
-				HTTP: &v1alpha3.HTTPSource{
-					URL:     "https://example.com/image.qcow2",
-					SHA256:  "0000000000000000000000000000000000000000000000000000000000000000",
-					Convert: "SomethingUnsupported",
-				},
-			}},
-		},
-	}
-
-	fc := fake.NewClientBuilder().WithScheme(scheme).WithObjects(image).Build()
-	reconciler := &ImageReconciler{Client: fc, CacheDir: t.TempDir()}
-
-	_, err := reconciler.Reconcile(t.Context(), ctrl.Request{
-		NamespacedName: types.NamespacedName{Name: "bad-convert-image"},
-	})
-	if err == nil {
-		t.Fatal("expected error for unsupported convert method")
-	}
-
-	if !strings.Contains(err.Error(), "unsupported convert value") {
-		t.Errorf("error should contain %q, got: %v", "unsupported convert value", err)
-	}
 }
 
 func findCondition(conditions []metav1.Condition, condType string) *metav1.Condition {

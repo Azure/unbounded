@@ -176,9 +176,10 @@ type RedfishSpec struct {
 
 // PXESpec defines PXE boot configuration for a Machine.
 type PXESpec struct {
-	// ImageRef references an Image CR used for PXE booting.
+	// Image is an OCI image reference containing netboot artifacts.
+	// Example: "ghcr.io/project-unbounded/images/host-ubuntu2404:v1"
 	// +kubebuilder:validation:Required
-	ImageRef LocalObjectReference `json:"imageRef"`
+	Image string `json:"image"`
 
 	// DHCPLeases defines static DHCP leases for PXE booting.
 	// +optional

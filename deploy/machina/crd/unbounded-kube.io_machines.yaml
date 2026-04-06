@@ -161,15 +161,11 @@ spec:
                       - subnetMask
                       type: object
                     type: array
-                  imageRef:
-                    description: ImageRef references an Image CR used for PXE booting.
-                    properties:
-                      name:
-                        description: Name of the referenced resource.
-                        type: string
-                    required:
-                    - name
-                    type: object
+                  image:
+                    description: |-
+                      Image is an OCI image reference containing netboot artifacts.
+                      Example: "ghcr.io/project-unbounded/images/host-ubuntu2404:v1"
+                    type: string
                   redfish:
                     description: Redfish configures optional Redfish BMC access.
                     properties:
@@ -208,7 +204,7 @@ spec:
                     - username
                     type: object
                 required:
-                - imageRef
+                - image
                 type: object
               ssh:
                 description: |-

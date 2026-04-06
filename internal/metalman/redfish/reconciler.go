@@ -43,6 +43,7 @@ type Reconciler struct {
 
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
+		Named("redfish").
 		For(&v1alpha3.Machine{}).
 		WithEventFilter(predicate.Funcs{
 			CreateFunc: func(e event.CreateEvent) bool {
@@ -272,7 +273,7 @@ func (r *Reconciler) reconcilePowerOn(ctx context.Context, log *slog.Logger, mac
 				Type:               condReimaged,
 				Status:             metav1.ConditionFalse,
 				Reason:             reasonPending,
-				Message:            "image=" + machine.Spec.PXE.ImageRef.Name,
+				Message:            "image=" + machine.Spec.PXE.Image,
 				ObservedGeneration: machine.Generation,
 			})
 		}

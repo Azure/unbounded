@@ -31,7 +31,6 @@ func ServePXECmd() *cobra.Command {
 	var (
 		site              string
 		cacheDir          string
-		maxDownloads      int
 		bindAddress       string
 		httpPort          int
 		healthPort        int
@@ -131,12 +130,13 @@ func ServePXECmd() *cobra.Command {
 				apiserverURL = cfg.Host
 			}
 
-			if err := (&netboot.ImageReconciler{
-				Client:       mgr.GetClient(),
-				CacheDir:     cacheDir,
-				MaxDownloads: maxDownloads,
+			ociCache := netboot.NewOCICache(cacheDir)
+
+			if err := (&netboot.OCIReconciler{
+				Client: mgr.GetClient(),
+				Cache:  ociCache,
 			}).SetupWithManager(mgr); err != nil {
-				return fmt.Errorf("setting up Image reconciler: %w", err)
+				return fmt.Errorf("setting up OCI reconciler: %w", err)
 			}
 
 			redfishPool := redfish.NewPool()
@@ -151,7 +151,7 @@ func ServePXECmd() *cobra.Command {
 			}
 
 			resolver := netboot.FileResolver{
-				CacheDir:     cacheDir,
+				Cache:        ociCache,
 				Reader:       mgr.GetClient(),
 				ApiserverURL: apiserverURL,
 				ServeURL:     serveURL,
@@ -186,6 +186,7 @@ func ServePXECmd() *cobra.Command {
 				Port:      dhcpPort,
 				Reader:    mgr.GetClient(),
 				ServerIP:  dhcpServerIP,
+				OCICache:  ociCache,
 			}
 			if err := mgr.Add(dhcpServer); err != nil {
 				return fmt.Errorf("adding DHCP server: %w", err)
@@ -250,7 +251,6 @@ func ServePXECmd() *cobra.Command {
 
 	cmd.Flags().StringVar(&site, "site", "", "Site label value to select Machines")
 	cmd.Flags().StringVar(&cacheDir, "cache-dir", DefaultCacheDir(), "Local directory for cached image artifacts")
-	cmd.Flags().IntVar(&maxDownloads, "max-downloads", 8, "Maximum concurrent file downloads")
 	cmd.Flags().StringVar(&bindAddress, "bind-address", "0.0.0.0", "IP address to bind servers")
 	cmd.Flags().IntVar(&httpPort, "http-port", 8880, "Port for the HTTP artifact server")
 	cmd.Flags().IntVar(&healthPort, "health-port", 8081, "Port for the health/readiness probe server")

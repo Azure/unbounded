@@ -11,9 +11,6 @@ Run `metalman version` to print the binary version.
 ## Usage
 
 ```bash
-# Apply a pre-built Image manifest
-kubectl apply -f https://github.com/TODO/releases/latest/download/ubuntu-24-04.yaml
-
 # Create a Machine
 kubectl apply -f - <<EOF
 apiVersion: unbounded-kube.io/v1alpha3
@@ -22,8 +19,7 @@ metadata:
   name: node-01
 spec:
   pxe:
-    imageRef:
-      name: ubuntu-24-04
+    image: ghcr.io/project-unbounded/images/host-ubuntu2404:v1
     dhcpLeases:
     - mac: "aa:bb:cc:dd:ee:01"
       ipv4: "10.0.0.11"
@@ -61,9 +57,9 @@ everything needed to PXE-boot and manage bare metal hosts:
 | HTTP    | 8880/tcp    | HTTP     | Artifact serving, templated configs, attestation endpoints |
 | Health  | 8081/tcp    | HTTP     | Liveness/readiness probes |
 
-The controller also runs reconcilers for Image resources (downloading and
-caching artifacts) and Machine resources with Redfish BMC specs (power
-management, boot order configuration).
+The controller also runs reconcilers for OCI image pulling (downloading and
+caching netboot images from container registries) and Machine resources with
+Redfish BMC specs (power management, boot order configuration).
 
 When deployed inside a cluster, the container entrypoint is `metalman` and the
 `site deploy-pxe` command passes `serve-pxe` as an argument:
@@ -152,17 +148,23 @@ at all.
 
 ### Images
 
-An Image is a cluster-scoped custom resource that declares the set of files
-served during PXE boot. Files can come from three sources:
+Netboot images are standard OCI container images built `FROM scratch` that
+contain all files needed for PXE booting a machine under `/disk/`. This
+follows the kubevirt containerDisk convention. Files
+with a `.tmpl` suffix are Go templates rendered per-machine at serve time;
+other files are served verbatim. A `metadata.yaml` file provides image-level
+configuration (e.g. `dhcpBootImageName`).
 
-- **HTTP** — downloaded from a URL, SHA256-verified, and cached locally on disk.
-- **Template** — Go templates rendered per-node at serve time (e.g. grub.cfg
-  with node-specific IPs and kernel parameters).
-- **Static** — inline content embedded in the CR (plain text or base64).
+Images are built, tagged, and pushed using standard container tooling:
 
-See [`images/ubuntu24/build.py`](../../images/ubuntu24/build.py) for the build script
-that produces a complete example Image CR booting Ubuntu 24.04 from upstream
-netboot artifacts. Run `make images/ubuntu24` to generate `image.yaml`.
+```bash
+docker build -t ghcr.io/project-unbounded/images/host-ubuntu2404:v1 .
+docker push ghcr.io/project-unbounded/images/host-ubuntu2404:v1
+```
+
+The OCI image layout is the one described above: boot artifacts live under
+`/disk/`, `.tmpl` files are rendered per-machine at serve time, and
+`metadata.yaml` carries image-level configuration.
 
 ### Machine
 
@@ -176,8 +178,7 @@ metadata:
   name: node-01
 spec:
   pxe:
-    imageRef:
-      name: ubuntu-24-04
+    image: ghcr.io/project-unbounded/images/host-ubuntu2404:v1
     dhcpLeases:
     - mac: "aa:bb:cc:dd:ee:01"
       ipv4: "10.0.0.11"
@@ -201,8 +202,7 @@ metadata:
   name: node-01
 spec:
   pxe:
-    imageRef:
-      name: ubuntu-24-04
+    image: ghcr.io/project-unbounded/images/host-ubuntu2404:v1
     dhcpLeases:
     - mac: "aa:bb:cc:dd:ee:01"
       ipv4: "10.0.0.11"

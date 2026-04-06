@@ -29,8 +29,8 @@ infrastructure:
 │              │◄─DHCP──│  │ DHCP │ │ TFTP │ │ HTTP │     │
 │   PXE ROM    │──────► │  └──────┘ └──────┘ └──────┘     │
 │              │◄─TFTP──│                                  │
-│   bootloader │        │  Machine CR    Image CR          │
-│              │◄─HTTP──│  (NIC specs)   (boot artifacts)  │
+│   bootloader │        │  Machine CR                      │
+│              │◄─HTTP──│  (NIC specs)   (OCI boot images) │
 │   kernel +   │        └──────────────────────────────────┘
 │   initramfs  │
 │              │──────► Kubernetes API (bootstrap token)
@@ -46,8 +46,8 @@ The boot flow in detail:
 2. **TFTP Boot** -- The firmware downloads the bootloader via TFTP.
 
 3. **HTTP Artifacts** -- The bootloader fetches the kernel, initramfs, and
-   configuration files from metalman's HTTP server. These are defined by the
-   **Image** CRD.
+   configuration files from metalman's HTTP server. These are sourced from
+   OCI netboot images referenced by the Machine's `spec.pxe.image` field.
 
 4. **Kernel Boot** -- The machine boots into the downloaded kernel and
    initramfs.
@@ -76,25 +76,29 @@ metalman supports two DHCP modes depending on your network topology:
   unicast DHCP forwarded by a DHCP relay agent. Use this when metalman and
   the machines are on different subnets.
 
-### Image CRD
+### OCI Netboot Images
 
-The `Image` custom resource defines the boot artifacts that metalman serves.
-Each file in an Image can come from one of three sources:
+Netboot images are standard OCI container images built `FROM scratch` that
+contain all files needed for PXE booting a machine under `/disk/`. Files with a
+`.tmpl` suffix are Go templates rendered per-machine at serve time; other files
+are served verbatim. A `metadata.yaml` file provides image-level configuration
+(e.g. `dhcpBootImageName`).
 
-| Source | Description |
+| Aspect | Description |
 |--------|-------------|
-| **http** | Download from a URL (cached locally) |
-| **template** | Rendered from a Go template with per-machine context (e.g., kernel command line) |
-| **static** | Inline content embedded directly in the CR |
+| **Binary artifacts** | Kernel, initramfs, bootloader — served verbatim from the OCI image |
+| **Templates** | Files with `.tmpl` suffix — rendered from Go templates with per-machine context (e.g., kernel command line) |
+| **Configuration** | `metadata.yaml` — image-level settings such as the DHCP boot filename |
 
-Images are cluster-scoped and referenced by Machine resources via
-`spec.pxe.imageRef`.
+OCI images are referenced by Machine resources via `spec.pxe.image` and are
+pulled and cached locally by the OCI reconciler.
 
 ### Machine CRD (PXE Fields)
 
 For PXE-provisioned machines, the `Machine` resource includes:
 
-- **`spec.pxe.imageRef`** -- Reference to the Image CR defining boot artifacts.
+- **`spec.pxe.image`** -- OCI image reference containing netboot artifacts
+  (e.g. `"ghcr.io/project-unbounded/images/host-ubuntu2404:v1"`).
 - **`spec.pxe.dhcpLeases`** -- NIC specifications: MAC address and IP
   assignment for each interface.
 - **`spec.pxe.redfish`** -- Optional BMC connection details (endpoint, username,
@@ -141,6 +145,6 @@ when they differ.
 - **[PXE Guide]({{< relref "guides/pxe" >}})** -- Step-by-step walkthrough
   for deploying metalman and booting your first bare-metal node.
 - **[CRD Reference]({{< relref "reference/machina-crd" >}})** -- Full API
-  specification for Machine and Image resources.
+  specification for the Machine resource.
 - **[Architecture Reference]({{< relref "reference/architecture" >}})** --
   How metalman fits into the broader system.

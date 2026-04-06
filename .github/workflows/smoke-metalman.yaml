@@ -7,7 +7,7 @@ on:
       - internal/metalman/**
       - deploy/metalman/**
       - hack/smoke.py
-      - images/ubuntu24/**
+      - images/host-ubuntu2404/**
       - go.mod
       - go.sum
       - .github/workflows/smoke-metalman.yaml
@@ -21,7 +21,7 @@ on:
       - deploy/machina/crd/**
       - deploy/machina/01-namespace.yaml
       - hack/smoke.py
-      - images/ubuntu24/**
+      - images/host-ubuntu2404/**
       - go.mod
       - go.sum
       - .github/workflows/smoke-metalman.yaml

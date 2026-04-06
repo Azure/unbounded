@@ -2,6 +2,8 @@ package dhcp
 
 import (
 	"net"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -13,6 +15,7 @@ import (
 
 	v1alpha3 "github.com/project-unbounded/unbounded-kube/api/v1alpha3"
 	"github.com/project-unbounded/unbounded-kube/internal/metalman/indexing"
+	"github.com/project-unbounded/unbounded-kube/internal/metalman/netboot"
 )
 
 func TestDHCPHandler(t *testing.T) {
@@ -101,17 +104,12 @@ func TestDHCPHandlerPXE(t *testing.T) {
 	mac, _ := net.ParseMAC("aa:bb:cc:dd:ee:f1")
 	serverIP := net.ParseIP("10.0.1.254").To4()
 
-	image := &v1alpha3.Image{
-		ObjectMeta: metav1.ObjectMeta{Name: "ubuntu-24-04"},
-		Spec: v1alpha3.ImageSpec{
-			DHCPBootImageName: "shimx64.efi",
-		},
-	}
+	imageRef := "ghcr.io/test/ubuntu-24-04:v1"
 
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-02"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{ImageRef: v1alpha3.LocalObjectReference{Name: "ubuntu-24-04"}, DHCPLeases: []v1alpha3.DHCPLease{{
+			PXE: &v1alpha3.PXESpec{Image: imageRef, DHCPLeases: []v1alpha3.DHCPLease{{
 				MAC:        "aa:bb:cc:dd:ee:f1",
 				IPv4:       "10.0.1.11",
 				SubnetMask: "255.255.255.0",
@@ -119,11 +117,29 @@ func TestDHCPHandlerPXE(t *testing.T) {
 		},
 	}
 
-	reader := newFakeReader(t, image, node)
+	// Set up OCI cache with metadata for the image ref.
+	cacheDir := t.TempDir()
+	ociCache := netboot.NewOCICache(cacheDir)
+
+	digest := "sha256:abcdef1234567890"
+	ociCache.SetDigest(imageRef, digest)
+
+	diskDir := filepath.Join(ociCache.DiskDir(digest))
+	if err := os.MkdirAll(diskDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(diskDir, "metadata.yaml"),
+		[]byte("dhcpBootImageName: shimx64.efi\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	reader := newFakeReader(t, node)
 	srv := &Server{
 		Interface: "eth0",
 		Reader:    reader,
 		ServerIP:  serverIP,
+		OCICache:  ociCache,
 	}
 
 	discover, err := dhcpv4.NewDiscovery(mac)

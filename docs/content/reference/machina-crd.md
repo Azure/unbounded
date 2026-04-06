@@ -1,12 +1,12 @@
 ---
 title: "CRD Reference"
 weight: 2
-description: "API reference for Machine and Image custom resources."
+description: "API reference for the Machine custom resource."
 ---
 
 API group: `unbounded-kube.io/v1alpha3`
 
-This document describes the two custom resource definitions shipped with the project: **Machine** and **Image**.
+This document describes the custom resource definition shipped with the project: **Machine**.
 
 ## Machine
 
@@ -52,7 +52,7 @@ PXE boot configuration consumed by the metalman controller.
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `pxe` | PXESpec | No | — | PXE boot configuration. |
-| `pxe.imageRef.name` | string | Yes | — | Name of the Image CR to boot from. |
+| `pxe.image` | string | Yes | — | OCI image reference containing netboot artifacts (e.g. `"ghcr.io/project-unbounded/images/host-ubuntu2404:v1"`). |
 | `pxe.dhcpLeases` | []DHCPLease | No | — | Static DHCP leases served during PXE boot. |
 | `pxe.dhcpLeases[].ipv4` | string | Yes | — | Static IPv4 address to assign. |
 | `pxe.dhcpLeases[].mac` | string | Yes | — | NIC MAC address (matched case-insensitively). |
@@ -198,8 +198,7 @@ spec:
       name: ssh-key
       namespace: machina-system
   pxe:
-    imageRef:
-      name: ubuntu-24-04
+    image: ghcr.io/project-unbounded/images/host-ubuntu2404:v1
     dhcpLeases:
     - ipv4: "10.0.0.60"
       mac: "aa:bb:cc:dd:ee:ff"
@@ -221,39 +220,36 @@ spec:
 
 ---
 
-## Image
+## Netboot OCI Images
 
-| Property | Value |
-|----------|-------|
-| Kind | `Image` |
-| Plural | `images` |
-| Short name | `img` |
-| Scope | Cluster |
-| Status subresource | Yes (empty struct) |
+Netboot images are standard OCI container images built `FROM scratch` that
+contain all files needed for PXE booting a machine under `/disk/`. This follows
+the kubevirt containerDisk convention.
 
-**Printer columns:**
+Files with a `.tmpl` suffix are Go templates rendered per-machine at serve time;
+other files are served verbatim. A `metadata.yaml` file provides image-level
+configuration (e.g. `dhcpBootImageName`).
 
-| Name | JSON Path | Description |
-|------|-----------|-------------|
-| Boot Image | `.spec.dhcpBootImageName` | Filename returned in DHCP responses |
-| Age | standard | Time since creation |
+### Image layout
 
-### spec
-
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| `dhcpBootImageName` | string | No | — | Boot filename included in DHCP responses (e.g. `"shimx64.efi"`). |
-| `files` | []File | No | — | List of boot files served over TFTP/HTTP. |
-| `files[].path` | string | Yes | — | Request path for TFTP/HTTP. |
-| `files[].http` | *HTTPSource | No | — | File sourced from an HTTP URL. Mutually exclusive with `template` and `static`. |
-| `files[].http.url` | string | Yes | — | Download URL. |
-| `files[].http.sha256` | string | Yes | — | Expected SHA-256 checksum. |
-| `files[].http.convert` | string | No | — | Post-download conversion. Supported: `"UnpackQcow2"` (qcow2 to raw+gzip). |
-| `files[].template` | *TemplateSource | No | — | File rendered from a Go template. Mutually exclusive with `http` and `static`. |
-| `files[].template.content` | string | Yes | — | Go `text/template` string. |
-| `files[].static` | *StaticSource | No | — | Inline file content. Mutually exclusive with `http` and `template`. |
-| `files[].static.content` | string | Yes | — | Raw file content. |
-| `files[].static.encoding` | string | No | — | Content encoding. Supported: `"base64"`. |
+```
+/disk/
+  shimx64.efi          # UEFI bootloader (served via TFTP and HTTP)
+  grubx64.efi          # GRUB bootloader
+  vmlinuz              # Linux kernel
+  initrd               # Initramfs
+  init.cpio            # Custom init overlay
+  metadata.yaml        # Image configuration (dhcpBootImageName, etc.)
+  grub/
+    grub.cfg.tmpl      # GRUB config template (rendered per-machine)
+  cloud-init/
+    user-data          # Cloud-init user-data
+    meta-data.tmpl     # Cloud-init meta-data template
+    vendor-data.tmpl   # Cloud-init vendor-data template
+  bootstrap-kubelet.conf.tmpl  # Kubelet bootstrap kubeconfig template
+  kubelet-config.yaml.tmpl     # Kubelet configuration template
+  kubelet-dropin.conf.tmpl     # Kubelet systemd drop-in template
+```
 
 ### Template data
 
@@ -262,56 +258,35 @@ Templates receive the following data object:
 | Field | Type | Description |
 |-------|------|-------------|
 | `.Machine` | *Machine | The Machine CR that initiated the request. |
-| `.Image` | *Image | The Image CR being served. |
 | `.ApiserverURL` | string | External Kubernetes API server URL. |
 | `.ServeURL` | string | External metalman HTTP URL. |
 
-### File resolution
+### Building images
 
-- **HTTP** files are downloaded to a content-addressed cache (`<cache>/sha256/<hash>`). A `503` is returned while the download is still in progress.
-- **Template** files are rendered per-Machine on every request.
-- **Static** files are served as-is, or base64-decoded when `encoding: base64` is set.
+Images are built, tagged, and pushed using standard container tooling:
 
-### Example
+```bash
+docker build -t ghcr.io/project-unbounded/images/host-ubuntu2404:v1 .
+docker push ghcr.io/project-unbounded/images/host-ubuntu2404:v1
+```
+
+See `images/host-ubuntu2404/` for an example Containerfile.
+
+### metadata.yaml
 
 ```yaml
-apiVersion: unbounded-kube.io/v1alpha3
-kind: Image
-metadata:
-  name: ubuntu-24-04
-spec:
-  dhcpBootImageName: shimx64.efi
-  files:
-  - path: shimx64.efi
-    http:
-      url: https://releases.ubuntu.com/24.04.2/netboot/amd64/bootx64.efi
-      sha256: 6fe6e1bcbe6cf6baec8e056d40361ca1aa715cc04ddcc2855351de060b84350b
-  - path: grub/grub.cfg
-    template:
-      content: |
-        set timeout=5
-        menuentry "Install" {
-          linux /vmlinuz autoinstall ds=nocloud-net;s={{ .ServeURL }}/cloud-init/ ---
-          initrd /initrd
-        }
-  - path: cloud-init/user-data
-    template:
-      content: |
-        #cloud-config
-        hostname: {{ .Machine.Name }}
-  - path: disk.img.gz
-    http:
-      url: https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img
-      sha256: 5c3ddb00f60bc455dac0862fabe9d8bacec46c33ac1751143c5c3683404b110d
-      convert: UnpackQcow2
+dhcpBootImageName: shimx64.efi
 ```
+
+The `dhcpBootImageName` field specifies the boot filename included in DHCP
+responses (option 67).
 
 ---
 
 ## CRD relationships
 
 ```
-Machine.spec.pxe.imageRef ──────────────► Image        (by name)
+Machine.spec.pxe.image ─────────────────► OCI Image    (by reference)
 Machine.spec.ssh.privateKeyRef ─────────► Secret       (machina-system namespace)
 Machine.spec.pxe.redfish.passwordRef ──► Secret
 Machine.spec.kubernetes.bootstrapTokenRef ► Secret     (kube-system namespace)
@@ -323,7 +298,7 @@ Machine ◄──── unbounded-kube.io/machine ────► Node     (bidi
 - **[SSH Guide]({{< relref "guides/ssh" >}})** -- SSH provisioning walkthrough
   using these CRDs.
 - **[PXE Guide]({{< relref "guides/pxe" >}})** -- Bare-metal provisioning
-  walkthrough using Machine and Image.
+  walkthrough using Machine and OCI netboot images.
 - **[Networking CRDs]({{< relref "reference/networking/custom-resources" >}})**
   -- Site, GatewayPool, and related CRDs from unbounded-net.
 - **[CLI Reference]({{< relref "reference/cli" >}})** -- The `kubectl unbounded`

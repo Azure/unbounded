@@ -10,7 +10,7 @@ Unbounded Kube extends a standard Kubernetes cluster so that worker Nodes can
 run in any environment -- cloud, on-premises, or edge -- and join back to a
 central control plane. It adds:
 
-- **CRD-driven lifecycle management** for remote machines (`Machine`, `Image`).
+- **CRD-driven lifecycle management** for remote machines (`Machine`).
 - **Two provisioning paths**: SSH-based (machina) and PXE-based (metalman).
 - **Cross-site networking** via WireGuard tunnels ([unbounded-net]({{< relref "concepts/networking" >}}), separate repo).
 
@@ -21,7 +21,7 @@ central control plane. It adds:
                   │  │ machina │    │ metalman │    │
                   │  └────┬────┘    └────┬─────┘    │
                   │       │              │          │
-                  │   Machine / Image CRDs          │
+                  │   Machine CRDs                     │
                   └───────┬──────────────┬──────────┘
                           │              │
              SSH (TCP/22) │              │ PXE (DHCP/TFTP/HTTP)
@@ -74,7 +74,7 @@ Runs three reconcilers and four network servers:
 
 | Reconciler / Server     | Role                                                        |
 |-------------------------|-------------------------------------------------------------|
-| ImageReconciler         | Downloads, SHA-256-verifies, and caches files from `Image` CRs. Supports qcow2-to-raw conversion. |
+| OCIReconciler           | Pulls and caches OCI netboot images from container registries. |
 | Redfish Reconciler      | BMC power control and boot order via Redfish REST. TOFU TLS cert pinning. |
 | Lifecycle Reconciler    | Detects 30-min reimage timeout and triggers automatic retry. |
 | DHCP server (UDP/67)    | Static IP assignment by MAC address.                        |
@@ -113,7 +113,7 @@ Represents a host and drives its lifecycle.
 | Spec field            | Description |
 |-----------------------|-------------|
 | `spec.ssh`            | SSH connectivity (host, port, user, privateKeyRef) and optional bastion config. |
-| `spec.pxe`            | PXE config: imageRef, dhcpLeases, redfish settings. |
+| `spec.pxe`            | PXE config: OCI image reference, dhcpLeases, redfish settings. |
 | `spec.kubernetes`     | Kubernetes version, bootstrapTokenRef, nodeRef, nodeLabels. |
 | `spec.operations`     | Reboot and reimage counters. |
 
@@ -124,14 +124,13 @@ Additional conditions such as `PoweredOff` and `BootOrderConfigSupported` may
 be set by the metalman controller but are not defined as constants in the
 Machine types.
 
-### Image (cluster-scoped, short name: `img`)
+### Netboot OCI Images
 
-Defines PXE boot artifacts served by metalman.
-
-| Spec field                 | Description |
-|----------------------------|-------------|
-| `spec.dhcpBootImageName`   | Filename returned in DHCP option 67. |
-| `spec.files[]`             | List of file entries: `http` (url + sha256 + convert), `template` (Go template content), or `static` (literal content + encoding). |
+Netboot images are standard OCI container images referenced by
+`Machine.spec.pxe.image`. They contain all files needed for PXE booting under
+`/disk/`. Files with a `.tmpl` suffix are Go templates rendered per-machine at
+serve time. A `metadata.yaml` provides image-level configuration (e.g.
+`dhcpBootImageName`).
 
 ### Resource relationships
 
@@ -139,7 +138,7 @@ Defines PXE boot artifacts served by metalman.
 Secret (machina-system)  ◄── Machine.spec.ssh.privateKeyRef
 Secret (machina-system)  ◄── Machine.spec.pxe.redfish.passwordRef
 Secret (kube-system)     ◄── Machine.spec.kubernetes.bootstrapTokenRef
-Image                    ◄── Machine.spec.pxe.imageRef
+OCI Image                ◄── Machine.spec.pxe.image
 Node                     ◄──► Machine   (linked by label unbounded-kube.io/machine=<name>)
 ```
 
@@ -244,7 +243,7 @@ numbered YAML files (no Helm or Kustomize).
 
 | Directory | Contents |
 |-----------|----------|
-| `deploy/crd/` | `Machine` and `Image` CRD definitions. |
+| `deploy/crd/` | `Machine` CRD definition. |
 | `deploy/machina/` | Namespace, RBAC, ConfigMap, Deployment, Service. |
 | `deploy/metalman/` | RBAC, Deployment. |
 
@@ -268,5 +267,5 @@ Container images are multi-stage builds on Azure Linux 3.0, built with
   TPM attestation, and metalman internals.
 - **[CLI Reference]({{< relref "reference/cli" >}})** -- `kubectl unbounded`
   command and flag reference.
-- **[CRD Reference]({{< relref "reference/machina-crd" >}})** -- Machine and
-  Image API specification.
+- **[CRD Reference]({{< relref "reference/machina-crd" >}})** -- Machine
+  API specification.

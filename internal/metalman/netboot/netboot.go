@@ -3,11 +3,9 @@ package netboot
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
-	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
+	"sync"
 	"text/template"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -16,21 +14,21 @@ import (
 	"github.com/project-unbounded/unbounded-kube/internal/metalman/indexing"
 )
 
-// ErrNotYetDownloaded is returned when an HTTP-sourced file has not yet been
-// downloaded to the local cache by the ImageReconciler.
-var ErrNotYetDownloaded = errors.New("file not yet downloaded")
+// ErrNotYetDownloaded is returned when an OCI image has not yet been
+// pulled and unpacked to the local cache.
+var ErrNotYetDownloaded = fmt.Errorf("file not yet downloaded")
 
-// ResolvedFile is the result of resolving a file from an Image spec. For
-// HTTP-sourced files, DiskPath is set so callers can stream from disk. For
-// template and static files, Data holds the rendered content.
+// ResolvedFile is the result of resolving a file from an OCI image.
+// For static files on disk, DiskPath is set so callers can stream from disk.
+// For template files, Data holds the rendered content.
 type ResolvedFile struct {
-	DiskPath    string // on-disk path for HTTP-sourced cached files
-	Data        []byte // rendered content for template/static files
+	DiskPath    string // on-disk path for static files
+	Data        []byte // rendered content for template files
 	ContentType string // MIME type hint for the response
 }
 
 type FileResolver struct {
-	CacheDir     string
+	Cache        *OCICache
 	Reader       client.Reader
 	ApiserverURL string
 	ServeURL     string
@@ -50,39 +48,26 @@ func (f *FileResolver) LookupNodeByIP(ctx context.Context, ip string) (*v1alpha3
 }
 
 func (f *FileResolver) ResolveFileByPath(ctx context.Context, path string, node *v1alpha3.Machine, imageRef string) (*ResolvedFile, error) {
-	var img v1alpha3.Image
-	if err := f.Reader.Get(ctx, client.ObjectKey{Name: imageRef}, &img); err != nil {
-		return nil, fmt.Errorf("image %q not found: %w", imageRef, err)
-	}
-
-	for _, file := range img.Spec.Files {
-		if file.Path == path {
-			return f.resolveFile(file, node, &img)
-		}
-	}
-
-	return nil, fmt.Errorf("file not found: %s", path)
-}
-
-func (f *FileResolver) resolveFile(file v1alpha3.File, node *v1alpha3.Machine, img *v1alpha3.Image) (*ResolvedFile, error) {
-	if file.HTTP != nil {
-		diskPath := cachePath(f.CacheDir, file.HTTP.SHA256, file.HTTP.Convert)
-		if _, err := os.Stat(diskPath); err != nil {
-			if os.IsNotExist(err) {
-				return nil, ErrNotYetDownloaded
-			}
-
-			return nil, fmt.Errorf("checking cached file %s: %w", file.Path, err)
+	diskPath, isTemplate, err := f.Cache.ResolvePath(imageRef, path)
+	if err != nil {
+		// Check if the image just hasn't been pulled yet
+		digest := f.Cache.DigestFor(imageRef)
+		if digest == "" {
+			return nil, ErrNotYetDownloaded
 		}
 
-		return &ResolvedFile{DiskPath: diskPath}, nil
+		return nil, fmt.Errorf("file not found: %s", path)
 	}
 
-	if file.Template != nil {
+	if isTemplate {
+		content, err := os.ReadFile(diskPath)
+		if err != nil {
+			return nil, fmt.Errorf("reading template %s: %w", path, err)
+		}
+
 		if node != nil {
-			data, err := renderTemplate(file.Template.Content, templateData{
+			data, err := renderTemplate(string(content), templateData{
 				Machine:      node,
-				Image:        img,
 				ApiserverURL: f.ApiserverURL,
 				ServeURL:     f.ServeURL,
 			})
@@ -93,62 +78,50 @@ func (f *FileResolver) resolveFile(file v1alpha3.File, node *v1alpha3.Machine, i
 			return &ResolvedFile{Data: data, ContentType: "text/plain"}, nil
 		}
 
-		return &ResolvedFile{Data: []byte(file.Template.Content), ContentType: "text/plain"}, nil
+		// No node context — return template content verbatim
+		return &ResolvedFile{Data: content, ContentType: "text/plain"}, nil
 	}
 
-	if file.Static != nil {
-		data, err := staticContent(file.Static)
-		if err != nil {
-			return nil, err
-		}
-
-		ct := "text/plain"
-		if file.Static.Encoding == "base64" {
-			ct = "application/octet-stream"
-		}
-
-		return &ResolvedFile{Data: data, ContentType: ct}, nil
-	}
-
-	return nil, fmt.Errorf("file %s has no source", file.Path)
-}
-
-func staticContent(s *v1alpha3.StaticSource) ([]byte, error) {
-	if s.Encoding == "base64" {
-		return base64.StdEncoding.DecodeString(s.Content)
-	}
-
-	return []byte(s.Content), nil
+	// Static file — serve from disk
+	return &ResolvedFile{DiskPath: diskPath}, nil
 }
 
 type templateData struct {
 	Machine      *v1alpha3.Machine
-	Image        *v1alpha3.Image
 	ApiserverURL string
 	ServeURL     string
 }
 
+var (
+	templateFuncMap = template.FuncMap{}
+	templatePool    = sync.Pool{
+		New: func() any {
+			return new(bytes.Buffer)
+		},
+	}
+)
+
 func renderTemplate(tmplStr string, data templateData) ([]byte, error) {
-	t, err := template.New("").Parse(tmplStr)
+	t, err := template.New("").Funcs(templateFuncMap).Parse(tmplStr)
 	if err != nil {
 		return nil, fmt.Errorf("parsing template: %w", err)
 	}
 
-	var buf bytes.Buffer
-	if err := t.Execute(&buf, data); err != nil {
+	buf, ok := templatePool.Get().(*bytes.Buffer)
+	if !ok {
+		buf = new(bytes.Buffer)
+	}
+
+	buf.Reset()
+
+	defer templatePool.Put(buf)
+
+	if err := t.Execute(buf, data); err != nil {
 		return nil, fmt.Errorf("executing template: %w", err)
 	}
 
-	return buf.Bytes(), nil
-}
+	result := make([]byte, buf.Len())
+	copy(result, buf.Bytes())
 
-// cachePath returns the on-disk path for a content-addressed cached file
-// identified by its SHA256 checksum and optional conversion method.
-func cachePath(cacheDir, sha256sum, convert string) string {
-	name := sha256sum
-	if convert != "" {
-		name += "." + convert
-	}
-
-	return filepath.Join(cacheDir, "sha256", name)
+	return result, nil
 }

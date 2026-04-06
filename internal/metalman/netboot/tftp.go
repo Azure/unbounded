@@ -58,7 +58,7 @@ func (t *TFTPServer) readHandler(filename string, rf io.ReaderFrom) error {
 		return fmt.Errorf("node %s has no PXE config", node.Name)
 	}
 
-	resolved, err := t.ResolveFileByPath(ctx, filename, node, node.Spec.PXE.ImageRef.Name)
+	resolved, err := t.ResolveFileByPath(ctx, filename, node, node.Spec.PXE.Image)
 	if err != nil {
 		log.Error("resolving file", "node", node.Name, "err", err)
 		return err

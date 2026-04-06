@@ -27,7 +27,6 @@ require (
 	github.com/google/go-tpm v0.9.8
 	github.com/google/renameio/v2 v2.0.2
 	github.com/insomniacslk/dhcp v0.0.0-20260220084031-5adc3eb26f91
-	github.com/lima-vm/go-qcow2reader v0.7.1
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/opencontainers/umoci v0.6.0
 	github.com/pin/tftp/v3 v3.2.0

@@ -11,11 +11,11 @@ import (
 
 	"github.com/insomniacslk/dhcp/dhcpv4"
 	"github.com/insomniacslk/dhcp/dhcpv4/server4"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/project-unbounded/unbounded-kube/api/v1alpha3"
 	"github.com/project-unbounded/unbounded-kube/internal/metalman/indexing"
+	"github.com/project-unbounded/unbounded-kube/internal/metalman/netboot"
 )
 
 type Server struct {
@@ -23,6 +23,7 @@ type Server struct {
 	Port      int
 	Reader    client.Reader
 	ServerIP  net.IP
+	OCICache  *netboot.OCICache
 }
 
 func (s *Server) NeedLeaderElection() bool {
@@ -182,23 +183,15 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, m *dhcpv4.DHCPv4) {
 		}
 	}
 
-	if node.Spec.PXE.ImageRef.Name != "" {
-		var image v1alpha3.Image
-		if err := s.Reader.Get(ctx, client.ObjectKey{Name: node.Spec.PXE.ImageRef.Name}, &image); err != nil {
-			if apierrors.IsNotFound(err) {
-				log.Warn("image not found for machine", "image", node.Spec.PXE.ImageRef.Name, "node", node.Name)
-			} else {
-				log.Error("looking up Image CR", "imageRef", node.Spec.PXE.ImageRef.Name, "err", err)
-			}
-
-			return
+	if node.Spec.PXE.Image != "" && s.OCICache != nil {
+		meta, err := s.OCICache.MetadataForRef(node.Spec.PXE.Image)
+		if err != nil {
+			log.Warn("OCI image metadata not available", "image", node.Spec.PXE.Image, "err", err)
+		} else if meta.DHCPBootImageName != "" {
+			resp.UpdateOption(dhcpv4.OptTFTPServerName(s.ServerIP.String()))
+			resp.UpdateOption(dhcpv4.OptBootFileName(meta.DHCPBootImageName))
+			resp.ServerIPAddr = s.ServerIP
 		}
-
-		bootfile := image.Spec.DHCPBootImageName
-
-		resp.UpdateOption(dhcpv4.OptTFTPServerName(s.ServerIP.String()))
-		resp.UpdateOption(dhcpv4.OptBootFileName(bootfile))
-		resp.ServerIPAddr = s.ServerIP
 	}
 
 	switch m.MessageType() {

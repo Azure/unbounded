@@ -60,13 +60,6 @@ rules:
   - apiGroups: ["unbounded-kube.io"]
     resources: ["machines/status"]
     verbs: ["get", "update", "patch"]
-  # Image controller
-  - apiGroups: ["unbounded-kube.io"]
-    resources: ["images"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["unbounded-kube.io"]
-    resources: ["images/status"]
-    verbs: ["get", "update", "patch"]
   # Secrets (Redfish passwords)
   - apiGroups: [""]
     resources: ["secrets"]

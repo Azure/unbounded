@@ -33,7 +33,7 @@ tunnels. It supports four provisioning paths and a unified networking layer.
   |  | machina |  | metalman |  |  Karpenter  |   |
   |  +----+----+  +----+-----+  +------+------+   |
   |       |            |               |          |
-  |          Machine / Image CRDs                 |
+  |          Machine CRDs                          |
   +-------+------------+---------------+----------+
           |            |               |
     SSH   |    PXE     |   Cloud API   |
@@ -132,13 +132,12 @@ The system is driven by Kubernetes custom resources:
 | CRD | API Group | Scope | Purpose |
 |-----|-----------|-------|---------|
 | **Machine** | `unbounded-kube.io` | Cluster | Represents a remote host to be provisioned (SSH, cloud API, or PXE) |
-| **Image** | `unbounded-kube.io` | Cluster | Defines PXE boot artifacts (kernel, initramfs, configs) |
 | **Site** | `net.unbounded-kube.io` | Cluster | Groups nodes by internal IP range; allocates pod CIDRs |
 | **GatewayPool** | `net.unbounded-kube.io` | Cluster | Defines a set of gateway nodes for inter-site routing |
 | **SitePeering** | `net.unbounded-kube.io` | Cluster | Enables direct node-to-node tunnels between sites |
 
 For full API specifications, see the
-[CRD Reference]({{< relref "reference/machina-crd" >}}) (Machine/Image) and
+[CRD Reference]({{< relref "reference/machina-crd" >}}) (Machine) and
 [Networking CRDs]({{< relref "reference/networking/custom-resources" >}})
 (Site/GatewayPool/SitePeering and related resources).
 

@@ -1,0 +1,22 @@
+{{ if le .Machine.Spec.Operations.ReimageCounter .Machine.Status.Operations.ReimageCounter }}
+insmod part_gpt
+search --no-floppy --set=root --file /EFI/ubuntu/shimx64.efi
+chainloader /EFI/ubuntu/shimx64.efi
+boot
+{{ end }}
+set default=0
+set timeout=0
+
+menuentry "Unbounded Metal Install" {
+  linux /vmlinuz \
+    unbounded.image_url={{ .ServeURL }}/disk.img.gz \
+    unbounded.serve_url={{ .ServeURL }} \
+    unbounded.ds_url={{ .ServeURL }}/cloud-init/ \
+    unbounded.node_name={{ .Machine.Name }} \
+    unbounded.node_namespace={{ .Machine.Namespace }} \
+    unbounded.apiserver_url={{ .ApiserverURL }} \
+    ip={{ (index .Machine.Spec.PXE.DHCPLeases 0).IPv4 }}::{{ (index .Machine.Spec.PXE.DHCPLeases 0).Gateway }}:{{ (index .Machine.Spec.PXE.DHCPLeases 0).SubnetMask }}::eth0:none \
+    console=tty0 console=ttyS0,115200n8 \
+    ---
+  initrd /initrd /init.cpio
+}

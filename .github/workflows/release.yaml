@@ -44,9 +44,6 @@ jobs:
           tar -czf dist/deploy.tar.gz deploy/
           gh release upload "${VERSION}" dist/deploy.tar.gz --clobber
 
-          make images/ubuntu24/image.yaml
-          gh release upload "${VERSION}" images/ubuntu24/image.yaml#ubuntu24-image.yaml --clobber
-
           export VERSION="${GITHUB_REF_NAME}"
           export REPO="project-unbounded/unbounded-kube"
           export SHA_LINUX_AMD64=$(sha256sum dist/kubectl-unbounded-linux-amd64.tar.gz | awk '{print $1}')

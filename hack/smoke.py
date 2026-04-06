@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import atexit
-import hashlib
 import json
 import os
 import signal
@@ -39,7 +38,9 @@ HTTP_PORT = 8880
 CACHE_DIR = TMPDIR / "cache"
 ARTIFACT_DIR = TMPDIR / "artifacts"
 SERVE_URL = f"http://{SERVER_IP}:{HTTP_PORT}"
-IMAGE_NAME = "ubuntu-24-04"
+REGISTRY_PORT = 5555
+REGISTRY_CONTAINER = "unbounded-smoke-registry"
+IMAGE_NAME = f"localhost:{REGISTRY_PORT}/unbounded/host-ubuntu2404:smoke"
 BINARY = REPO_ROOT / "bin" / "metalman"
 KUBECTL_UNBOUNDED = REPO_ROOT / "bin" / "kubectl-unbounded"
 SERIAL_SOCK = TMPDIR / "console.sock"
@@ -48,8 +49,7 @@ KUBECTL = "kubectl"
 VIRSH = ["virsh", "--connect", "qemu:///system"]
 DEVNULL = subprocess.DEVNULL
 
-BUILD_SCRIPT = REPO_ROOT / "images" / "ubuntu24" / "build.py"
-IMAGE_YAML = TMPDIR / "image.yaml"
+IMAGE_DIR = REPO_ROOT / "images" / "host-ubuntu2404"
 
 _procs: list[subprocess.Popen[Any]] = []
 
@@ -150,6 +150,8 @@ def clean_libvirt() -> None:
     run_quiet(["sudo", "pkill", "-f", "sushy-emulator"])
     # Kill any leftover metalman serve-pxe from a previous run.
     run_quiet(["sudo", "pkill", "-f", "metalman"])
+    # Stop and remove leftover local registry container.
+    run_quiet(["docker", "rm", "-f", REGISTRY_CONTAINER])
     # Delete stale leader-election leases so new processes acquire immediately.
     run_quiet([KUBECTL, "-n", "machina-system", "delete", "lease",
                f"metalman-{SITE}"])
@@ -396,7 +398,7 @@ def main() -> None:
     run_quiet([KUBECTL, "delete", "node", NODE_NAME])
     # Remove stale CRDs so that a version change (e.g. storedVersions
     # referencing an old API version) does not block the fresh apply.
-    run_quiet([KUBECTL, "delete", "crd", f"images.{API_GROUP}", f"machines.{API_GROUP}"])
+    run_quiet([KUBECTL, "delete", "crd", f"machines.{API_GROUP}"])
 
     log("Applying deploy manifests (CRDs, namespace, RBAC)")
     kubectl(["apply", "--server-side", "--force-conflicts", "-f", str(REPO_ROOT / "deploy" / "machina" / "01-namespace.yaml")])
@@ -407,34 +409,27 @@ def main() -> None:
     kubectl(["-n", NODE_NS, "create", "secret", "generic",
              "bmc-pass", "--from-literal=password="])
 
-    log("Building ubuntu image")
-    build_artifact_dir = REPO_ROOT / "artifacts" / "ubuntu-24-04"
-    run([
-        sys.executable, str(BUILD_SCRIPT),
-        f"--artifact-url={SERVE_URL}",
-        f"--artifact-dir={build_artifact_dir}",
-        f"--output={IMAGE_YAML}",
-    ])
+    log("Starting local OCI registry")
+    run_quiet(["docker", "rm", "-f", REGISTRY_CONTAINER])
+    run(["docker", "run", "-d", "--name", REGISTRY_CONTAINER,
+         "-p", f"{REGISTRY_PORT}:5000", "registry:2"])
+    # Wait for the registry to be ready.
+    for _ in range(30):
+        try:
+            import urllib.request
+            urllib.request.urlopen(f"http://localhost:{REGISTRY_PORT}/v2/")
+            break
+        except Exception:
+            time.sleep(0.5)
+    else:
+        die("Local OCI registry did not become ready")
 
-    log("  Pre-populating cache with locally-built artifacts")
-    sha256_dir = CACHE_DIR / "sha256"
-    sha256_dir.mkdir(parents=True, exist_ok=True)
-    for name in ["shimx64.efi", "grubx64.efi", "vmlinuz", "initrd", "init.cpio", "disk.img.gz"]:
-        src = build_artifact_dir / name
-        if not src.exists():
-            continue
-        h = hashlib.sha256()
-        with open(src, "rb") as fh:
-            for chunk in iter(lambda: fh.read(1 << 16), b""):
-                h.update(chunk)
-        sha = h.hexdigest()
-        dst = sha256_dir / sha
-        if not dst.exists():
-            shutil.copy2(src, dst)
-            log(f"    Cached {name} -> sha256/{sha}")
+    log("Building host-ubuntu2404 OCI image")
+    run(["docker", "build", "-t", IMAGE_NAME,
+         "-f", str(IMAGE_DIR / "Containerfile"), str(IMAGE_DIR)])
 
-    log("  Applying ubuntu image resources")
-    kubectl(["apply", "--server-side", "--force-conflicts", "-f", str(IMAGE_YAML)])
+    log("Pushing host-ubuntu2404 OCI image to local registry")
+    run(["docker", "push", IMAGE_NAME])
 
     server_url = apiserver_url()
     log(f"  API server URL: {server_url}")
@@ -447,7 +442,7 @@ def main() -> None:
         },
         "spec": {
             "pxe": {
-                "imageRef": {"name": IMAGE_NAME},
+                "image": IMAGE_NAME,
                 "redfish": {
                     "url": sushy_url,
                     "username": "",
@@ -470,7 +465,7 @@ def main() -> None:
 
     log("Starting metalman serve-pxe")
     proc = spawn([
-        str(BINARY), "serve-pxe", f"--site={SITE}", f"--bind-address={SERVER_IP}",
+        "sudo", str(BINARY), "serve-pxe", f"--site={SITE}", f"--bind-address={SERVER_IP}",
         f"--cache-dir={CACHE_DIR}", f"--apiserver-url={server_url}",
         f"--serve-url={SERVE_URL}", "--dhcp-interface=virbr-smoke",
         "--leader-elect-lease-duration=60s",

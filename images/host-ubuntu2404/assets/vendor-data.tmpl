@@ -1,0 +1,5 @@
+#cloud-config
+reporting:
+  unbounded:
+    type: webhook
+    endpoint: {{ .ServeURL }}/cloudinit/log

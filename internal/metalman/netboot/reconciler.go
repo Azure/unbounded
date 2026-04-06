@@ -1,322 +1,320 @@
 package netboot
 
 import (
-	"compress/gzip"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
-	"sync"
+	"time"
 
-	qcow2reader "github.com/lima-vm/go-qcow2reader"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	ispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/opencontainers/umoci"
+	"github.com/opencontainers/umoci/oci/casext/mediatype"
+	"github.com/opencontainers/umoci/oci/layer"
+	"oras.land/oras-go/v2"
+	"oras.land/oras-go/v2/content/oci"
+	"oras.land/oras-go/v2/registry/remote"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1alpha3 "github.com/project-unbounded/unbounded-kube/api/v1alpha3"
 )
 
-type ImageReconciler struct {
-	Client       client.Client
-	CacheDir     string
-	MaxDownloads int
+// Docker media types that are structurally compatible with OCI equivalents.
+const (
+	dockerMediaTypeManifest     = "application/vnd.docker.distribution.manifest.v2+json"
+	dockerMediaTypeManifestList = "application/vnd.docker.distribution.manifest.list.v2+json"
+	dockerMediaTypeConfig       = "application/vnd.docker.container.image.v1+json"
+	dockerMediaTypeLayer        = "application/vnd.docker.image.rootfs.diff.tar"
+	dockerMediaTypeLayerGzip    = "application/vnd.docker.image.rootfs.diff.tar.gzip"
+	dockerMediaTypeForeignLayer = "application/vnd.docker.image.rootfs.foreign.diff.tar.gzip"
+)
 
-	semOnce sync.Once
-	sem     chan struct{}
-}
-
-func (r *ImageReconciler) initSem() {
-	r.semOnce.Do(func() {
-		n := r.MaxDownloads
-		if n <= 0 {
-			n = 8
+func init() {
+	// Register parsers for Docker V2 media types so that umoci's
+	// FromDescriptor returns parsed Go structs (ispec.Manifest, ispec.Index,
+	// ispec.Image) instead of raw readers.  Docker V2 manifests and manifest
+	// lists are structurally compatible with their OCI counterparts, so
+	// simple JSON decoding into the OCI types is sufficient.
+	mediatype.RegisterTarget(dockerMediaTypeManifest)
+	mediatype.RegisterParser(dockerMediaTypeManifest, func(rdr io.Reader) (any, error) {
+		var m ispec.Manifest
+		if rdr == nil {
+			return m, nil
 		}
 
-		r.sem = make(chan struct{}, n)
+		if err := json.NewDecoder(rdr).Decode(&m); err != nil {
+			return nil, fmt.Errorf("decode Docker manifest: %w", err)
+		}
+
+		return m, nil
+	})
+
+	mediatype.RegisterParser(dockerMediaTypeManifestList, func(rdr io.Reader) (any, error) {
+		var idx ispec.Index
+		if rdr == nil {
+			return idx, nil
+		}
+
+		if err := json.NewDecoder(rdr).Decode(&idx); err != nil {
+			return nil, fmt.Errorf("decode Docker manifest list: %w", err)
+		}
+
+		return idx, nil
+	})
+
+	mediatype.RegisterParser(dockerMediaTypeConfig, func(rdr io.Reader) (any, error) {
+		var img ispec.Image
+		if rdr == nil {
+			return img, nil
+		}
+
+		if err := json.NewDecoder(rdr).Decode(&img); err != nil {
+			return nil, fmt.Errorf("decode Docker image config: %w", err)
+		}
+
+		return img, nil
 	})
 }
 
-func (r *ImageReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	r.initSem()
-	return ctrl.NewControllerManagedBy(mgr).For(&v1alpha3.Image{}).Complete(r)
+// imageResyncInterval is how often the reconciler re-resolves remote tags
+// to detect updated images pushed under the same tag.
+const imageResyncInterval = 5 * time.Minute
+
+// OCIReconciler watches Machine CRs and pulls their referenced OCI images.
+// Work items are deduplicated by image reference so that multiple machines
+// sharing the same image only trigger a single download.
+type OCIReconciler struct {
+	Client client.Client
+	Cache  *OCICache
 }
 
-func (r *ImageReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	r.initSem()
+func (r *OCIReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	return ctrl.NewControllerManagedBy(mgr).
+		Named("oci-image").
+		Watches(&v1alpha3.Machine{}, handler.EnqueueRequestsFromMapFunc(r.mapMachineToImage)).
+		Complete(r)
+}
 
+// mapMachineToImage maps a Machine event to a reconcile request keyed by
+// image reference. This ensures that multiple machines referencing the same
+// image produce only one work item in the queue.
+func (r *OCIReconciler) mapMachineToImage(_ context.Context, obj client.Object) []reconcile.Request {
+	machine, ok := obj.(*v1alpha3.Machine)
+	if !ok {
+		return nil
+	}
+
+	if machine.Spec.PXE == nil || machine.Spec.PXE.Image == "" {
+		return nil
+	}
+
+	return []reconcile.Request{
+		{NamespacedName: client.ObjectKey{Name: machine.Spec.PXE.Image}},
+	}
+}
+
+func (r *OCIReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	var image v1alpha3.Image
-	if err := r.Client.Get(ctx, req.NamespacedName, &image); err != nil {
-		if apierrors.IsNotFound(err) {
-			return ctrl.Result{}, nil
-		}
+	// req.Name is the OCI image reference, mapped from Machine events.
+	imageRef := req.Name
 
-		return ctrl.Result{}, err
+	// Always resolve the remote digest so we detect tag updates.
+	remoteDigest, repo, err := r.resolveRemoteDigest(ctx, imageRef)
+	if err != nil {
+		logger.Error(err, "resolving OCI image digest", "image", imageRef)
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
-	if err := os.MkdirAll(filepath.Join(r.CacheDir, "sha256"), 0o755); err != nil {
-		return ctrl.Result{}, fmt.Errorf("creating cache dir: %w", err)
+	// Check if we already have this exact digest cached.
+	existingDigest := r.Cache.DigestFor(imageRef)
+	if existingDigest == remoteDigest && r.Cache.IsCached(remoteDigest) {
+		return ctrl.Result{RequeueAfter: imageResyncInterval}, nil
 	}
 
-	type downloadResult struct {
-		path       string
-		networkErr bool
-		fatalErr   error
+	logger.Info("pulling OCI image", "image", imageRef, "digest", remoteDigest)
+
+	if err := r.pullAndUnpack(ctx, imageRef, remoteDigest, repo); err != nil {
+		logger.Error(err, "pulling OCI image", "image", imageRef)
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
-	var (
-		wg      sync.WaitGroup
-		mu      sync.Mutex
-		results []downloadResult
-	)
+	r.Cache.SetDigest(imageRef, remoteDigest)
+	logger.Info("OCI image cached", "image", imageRef, "digest", remoteDigest)
 
-	for _, file := range image.Spec.Files {
-		if file.HTTP == nil {
-			continue
-		}
-
-		file := file // capture loop variable
-
-		wg.Add(1)
-
-		go func() {
-			defer wg.Done()
-
-			select {
-			case r.sem <- struct{}{}:
-				defer func() { <-r.sem }()
-			case <-ctx.Done():
-				return
-			}
-
-			if file.HTTP.Convert != "" {
-				switch file.HTTP.Convert {
-				case "UnpackQcow2":
-				default:
-					mu.Lock()
-
-					results = append(results, downloadResult{path: file.Path, fatalErr: fmt.Errorf("unsupported convert value %q", file.HTTP.Convert)})
-
-					mu.Unlock()
-
-					return
-				}
-			}
-
-			destPath := cachePath(r.CacheDir, file.HTTP.SHA256, file.HTTP.Convert)
-			if _, err := os.Stat(destPath); err == nil {
-				return // already cached
-			}
-
-			logger.Info("downloading file", "path", file.Path, "url", file.HTTP.URL)
-
-			var err error
-			if file.HTTP.Convert != "" {
-				err = downloadAndConvertFile(ctx, destPath, file.HTTP.URL, file.HTTP.SHA256, file.HTTP.Convert)
-			} else {
-				err = downloadFile(ctx, destPath, file.HTTP.URL, file.HTTP.SHA256)
-			}
-
-			if err != nil {
-				mu.Lock()
-
-				if strings.Contains(err.Error(), "checksum mismatch") {
-					logger.Error(err, "checksum mismatch, not requeueing", "path", file.Path)
-				} else {
-					logger.Error(err, "download failed", "path", file.Path)
-					results = append(results, downloadResult{path: file.Path, networkErr: true})
-				}
-
-				mu.Unlock()
-			} else {
-				logger.Info("file cached", "path", file.Path)
-			}
-		}()
-	}
-
-	wg.Wait()
-
-	var networkErr bool
-
-	for _, res := range results {
-		if res.fatalErr != nil {
-			return ctrl.Result{}, res.fatalErr
-		}
-
-		if res.networkErr {
-			networkErr = true
-		}
-	}
-
-	if networkErr {
-		return ctrl.Result{RequeueAfter: 30_000_000_000}, nil // 30s
-	}
-
-	return ctrl.Result{}, nil
+	return ctrl.Result{RequeueAfter: imageResyncInterval}, nil
 }
 
-func downloadFile(ctx context.Context, destPath, url, expectedSHA256 string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+// newRepository creates a remote.Repository for the given image reference,
+// configuring plain HTTP for localhost registries.
+func newRepository(imageRef string) (*remote.Repository, error) {
+	repo, err := remote.NewRepository(imageRef)
 	if err != nil {
-		return fmt.Errorf("creating request: %w", err)
+		return nil, fmt.Errorf("parsing image reference %q: %w", imageRef, err)
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	// Use plain HTTP for localhost registries (common in development and testing).
+	host := repo.Reference.Host()
+	if host == "localhost" || strings.HasPrefix(host, "localhost:") ||
+		host == "127.0.0.1" || strings.HasPrefix(host, "127.0.0.1:") {
+		repo.PlainHTTP = true
+	}
+
+	return repo, nil
+}
+
+// resolveRemoteDigest resolves the tag or digest in an image reference to its
+// canonical digest by querying the remote registry.
+func (r *OCIReconciler) resolveRemoteDigest(ctx context.Context, imageRef string) (string, *remote.Repository, error) {
+	repo, err := newRepository(imageRef)
 	if err != nil {
-		return fmt.Errorf("downloading %s: %w", url, err)
-	}
-	defer resp.Body.Close() //nolint:errcheck // Best-effort close of HTTP response body.
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("downloading %s: status %d", url, resp.StatusCode)
+		return "", nil, err
 	}
 
-	tmpFile, err := os.CreateTemp(filepath.Dir(destPath), ".tmp-*")
+	tagOrDigest := repo.Reference.Reference
+
+	desc, err := repo.Resolve(ctx, tagOrDigest)
 	if err != nil {
-		return fmt.Errorf("creating temp file: %w", err)
+		return "", nil, fmt.Errorf("resolving image %q: %w", imageRef, err)
 	}
 
-	tmpPath := tmpFile.Name()
+	return desc.Digest.String(), repo, nil
+}
 
-	defer func() {
-		tmpFile.Close()    //nolint:errcheck // Best-effort close of temp file on cleanup.
-		os.Remove(tmpPath) //nolint:errcheck // Best-effort removal of temp file.
-	}()
-
-	hasher := sha256.New()
-	if _, err := io.Copy(tmpFile, io.TeeReader(resp.Body, hasher)); err != nil {
-		return fmt.Errorf("writing temp file: %w", err)
+func (r *OCIReconciler) pullAndUnpack(ctx context.Context, imageRef, imageDigest string, repo *remote.Repository) error {
+	// Check if already cached (another reconcile may have beaten us).
+	if r.Cache.IsCached(imageDigest) {
+		return nil
 	}
 
-	if err := tmpFile.Close(); err != nil {
-		return fmt.Errorf("closing temp file: %w", err)
+	imageDir := r.Cache.ImageDir(imageDigest)
+
+	if err := os.MkdirAll(imageDir, 0o755); err != nil {
+		return fmt.Errorf("creating image dir: %w", err)
 	}
 
-	actualSHA256 := hex.EncodeToString(hasher.Sum(nil))
-	if actualSHA256 != expectedSHA256 {
-		return fmt.Errorf("checksum mismatch for %s: got %s, want %s", url, actualSHA256, expectedSHA256)
+	tagOrDigest := repo.Reference.Reference
+
+	// Create a temporary directory for the OCI layout store.
+	layoutDir, err := os.MkdirTemp("", "metalman-oci-*")
+	if err != nil {
+		return fmt.Errorf("create temp dir for OCI layout: %w", err)
+	}
+	defer os.RemoveAll(layoutDir) //nolint:errcheck // best effort cleanup
+
+	store, err := oci.New(layoutDir)
+	if err != nil {
+		return fmt.Errorf("create OCI layout store: %w", err)
 	}
 
-	if err := os.Rename(tmpPath, destPath); err != nil {
-		return fmt.Errorf("renaming temp file: %w", err)
+	// Copy (pull) the image from the remote repository into the local OCI layout.
+	if _, err := oras.Copy(ctx, repo, tagOrDigest, store, tagOrDigest, oras.DefaultCopyOptions); err != nil {
+		return fmt.Errorf("pull image %q: %w", imageRef, err)
+	}
+
+	// Unpack the OCI layout into the image directory using umoci.
+	if err := unpackOCILayout(ctx, layoutDir, tagOrDigest, imageDir); err != nil {
+		os.RemoveAll(imageDir) //nolint:errcheck // Clean up partial unpack.
+		return fmt.Errorf("unpack OCI image: %w", err)
+	}
+
+	// Verify /disk/ directory exists (kubevirt containerDisk convention).
+	diskDir := r.Cache.DiskDir(imageDigest)
+	if _, err := os.Stat(diskDir); err != nil {
+		os.RemoveAll(imageDir) //nolint:errcheck // Clean up partial unpack.
+		return fmt.Errorf("OCI image missing /disk directory")
 	}
 
 	return nil
 }
 
-// downloadAndConvertFile downloads a source file, verifies its SHA256 against
-// expectedSHA256, converts it according to the convert method, and atomically
-// writes the result to destPath.
-func downloadAndConvertFile(ctx context.Context, destPath, url, expectedSHA256, convert string) error {
-	dir := filepath.Dir(destPath)
-
-	// Download to a temp file
-	tmpSrc, err := os.CreateTemp(dir, ".tmp-src-*")
-	if err != nil {
-		return fmt.Errorf("creating temp source file: %w", err)
+// convertDockerMediaTypes rewrites Docker V2 media types in a manifest to
+// their OCI equivalents in-place.  Docker V2 and OCI blobs are structurally
+// identical; only the MIME types differ.  umoci's UnpackRootfs strictly
+// checks for OCI media types, so this conversion is required when pulling
+// images produced by `docker build`.
+func convertDockerMediaTypes(m *ispec.Manifest) {
+	// Config blob.
+	switch m.Config.MediaType {
+	case dockerMediaTypeConfig:
+		m.Config.MediaType = ispec.MediaTypeImageConfig
 	}
 
-	tmpSrcPath := tmpSrc.Name()
-	defer os.Remove(tmpSrcPath) //nolint:errcheck // Best-effort removal of temp source file.
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		tmpSrc.Close() //nolint:errcheck // Best-effort close before returning error.
-		return fmt.Errorf("creating request: %w", err)
+	// Layer blobs.
+	for i := range m.Layers {
+		switch m.Layers[i].MediaType {
+		case dockerMediaTypeLayerGzip:
+			m.Layers[i].MediaType = ispec.MediaTypeImageLayerGzip
+		case dockerMediaTypeLayer:
+			m.Layers[i].MediaType = ispec.MediaTypeImageLayer
+		case dockerMediaTypeForeignLayer:
+			m.Layers[i].MediaType = ispec.MediaTypeImageLayerNonDistributableGzip //nolint:staticcheck // matching deprecated OCI type
+		}
 	}
 
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		tmpSrc.Close() //nolint:errcheck // Best-effort close before returning error.
-		return fmt.Errorf("downloading %s: %w", url, err)
+	// Manifest media type itself (stored in the descriptor that points to
+	// this manifest — not inside the manifest JSON — but some tools also
+	// set MediaType inside the manifest body).
+	switch m.MediaType {
+	case dockerMediaTypeManifest:
+		m.MediaType = ispec.MediaTypeImageManifest
 	}
-	defer resp.Body.Close() //nolint:errcheck // Best-effort close of HTTP response body.
-
-	if resp.StatusCode != http.StatusOK {
-		tmpSrc.Close() //nolint:errcheck // Best-effort close before returning error.
-		return fmt.Errorf("downloading %s: status %d", url, resp.StatusCode)
-	}
-
-	hasher := sha256.New()
-	if _, err := io.Copy(tmpSrc, io.TeeReader(resp.Body, hasher)); err != nil {
-		tmpSrc.Close() //nolint:errcheck // Best-effort close before returning error.
-		return fmt.Errorf("writing source temp file: %w", err)
-	}
-
-	if err := tmpSrc.Close(); err != nil {
-		return fmt.Errorf("closing source temp file: %w", err)
-	}
-
-	actualSHA256 := hex.EncodeToString(hasher.Sum(nil))
-	if actualSHA256 != expectedSHA256 {
-		return fmt.Errorf("checksum mismatch for %s: got %s, want %s", url, actualSHA256, expectedSHA256)
-	}
-
-	// Convert source to target encoding
-	return convertFile(tmpSrcPath, destPath, convert)
 }
 
-// convertFile reads srcPath and writes destPath according to the convert
-// method. "UnpackQcow2" reads a qcow2 image and writes raw gzip-compressed
-// data.
-func convertFile(srcPath, destPath, convert string) error {
-	if convert != "UnpackQcow2" {
-		return fmt.Errorf("unsupported convert method %q", convert)
-	}
-
-	srcFile, err := os.Open(srcPath)
+// unpackOCILayout opens an OCI image layout at layoutDir and unpacks the
+// image tagged with the given tag into destDir using umoci. It picks the
+// first available manifest (netboot images are single-platform).
+func unpackOCILayout(ctx context.Context, layoutDir, tag, destDir string) error {
+	engine, err := umoci.OpenLayout(layoutDir)
 	if err != nil {
-		return fmt.Errorf("opening source: %w", err)
+		return fmt.Errorf("open OCI layout %q: %w", layoutDir, err)
 	}
-	defer srcFile.Close() //nolint:errcheck // Best-effort close of source file.
+	defer engine.Close() //nolint:errcheck // best effort close
 
-	img, err := qcow2reader.Open(srcFile)
+	descriptorPaths, err := engine.ResolveReference(ctx, tag)
 	if err != nil {
-		return fmt.Errorf("opening qcow2: %w", err)
-	}
-	defer img.Close() //nolint:errcheck // Best-effort close of qcow2 image.
-
-	size := img.Size()
-	if size < 0 {
-		return fmt.Errorf("qcow2 image has unknown size")
+		return fmt.Errorf("resolve tag %q: %w", tag, err)
 	}
 
-	tmpDst, err := os.CreateTemp(filepath.Dir(destPath), ".tmp-dst-*")
+	if len(descriptorPaths) == 0 {
+		return fmt.Errorf("tag %q not found in OCI layout", tag)
+	}
+
+	// Use the first descriptor — netboot images are single-platform.
+	dp := descriptorPaths[0]
+
+	blob, err := engine.FromDescriptor(ctx, dp.Descriptor())
 	if err != nil {
-		return fmt.Errorf("creating temp dest file: %w", err)
+		return fmt.Errorf("read manifest blob for tag %q: %w", tag, err)
+	}
+	defer blob.Close() //nolint:errcheck // best effort close
+
+	manifest, ok := blob.Data.(ispec.Manifest)
+	if !ok {
+		return fmt.Errorf("tag %q does not point to an OCI manifest (got %T)", tag, blob.Data)
 	}
 
-	tmpDstPath := tmpDst.Name()
-	defer os.Remove(tmpDstPath) //nolint:errcheck // Best-effort removal of temp dest file.
+	// Convert Docker media types to OCI equivalents so that umoci's strict
+	// media-type checks pass. Docker V2 images use different MIME types for
+	// the config and layer blobs but are structurally identical to OCI.
+	convertDockerMediaTypes(&manifest)
 
-	gw := gzip.NewWriter(tmpDst)
-
-	r := io.NewSectionReader(img, 0, size)
-	if _, err := io.Copy(gw, r); err != nil {
-		gw.Close()     //nolint:errcheck // Best-effort close before returning error.
-		tmpDst.Close() //nolint:errcheck // Best-effort close before returning error.
-
-		return fmt.Errorf("streaming conversion: %w", err)
+	unpackOpts := &layer.UnpackOptions{
+		OnDiskFormat: layer.DirRootfs{
+			MapOptions: layer.MapOptions{
+				Rootless: true,
+			},
+		},
 	}
 
-	if err := gw.Close(); err != nil {
-		tmpDst.Close() //nolint:errcheck // Best-effort close before returning error.
-		return fmt.Errorf("closing gzip writer: %w", err)
-	}
-
-	if err := tmpDst.Close(); err != nil {
-		return fmt.Errorf("closing temp dest file: %w", err)
-	}
-
-	if err := os.Rename(tmpDstPath, destPath); err != nil {
-		return fmt.Errorf("renaming converted file: %w", err)
+	if err := layer.UnpackRootfs(ctx, engine, destDir, manifest, unpackOpts); err != nil {
+		return fmt.Errorf("unpack rootfs: %w", err)
 	}
 
 	return nil

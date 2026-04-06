@@ -8,7 +8,7 @@ description: "Netboot bare metal machines into your cluster."
 
 Metalman is a controller that PXE-boots bare-metal servers and joins them to your Kubernetes cluster. It bundles DHCP, TFTP, and HTTP servers into a single binary, integrates with Redfish BMCs for remote power management, and uses TPM 2.0 attestation for secure bootstrap token delivery.
 
-API group: `unbounded-kube.io/v1alpha3`. CRDs: **Machine** (`mach`) and **Image** (`img`), both cluster-scoped.
+API group: `unbounded-kube.io/v1alpha3`. CRD: **Machine** (`mach`), cluster-scoped.
 
 ## Prerequisites
 
@@ -44,19 +44,28 @@ Key `serve-pxe` flags (set via the Deployment):
 
 When `--dhcp-interface` is set, metalman binds to the interface for broadcast DHCP, and the DHCP server requires leader election. Without it, metalman accepts relayed (unicast) DHCP packets and the DHCP server responds regardless of leader status. Leader election always runs at the manager level for the reconcilers.
 
-## Image CRD
+## Netboot Images
 
-An Image defines the PXE boot artifacts (kernel, initrd, disk image, GRUB config, etc.). Files are declared with one of three source types:
+Netboot images are standard OCI container images built `FROM scratch` that
+contain all files needed for PXE booting a machine under `/disk/`. Files with a
+`.tmpl` suffix are Go templates rendered per-machine at serve time; other files
+are served verbatim. A `metadata.yaml` file provides image-level configuration
+(e.g. `dhcpBootImageName`).
 
-- **`http`** — downloaded from a URL, SHA256-verified, and cached locally. Supports `convert: UnpackQcow2` for qcow2-to-raw+gzip conversion.
-- **`template`** — Go `text/template` rendered per-Machine. Template context includes `.Machine`, `.Image`, `.ApiserverURL`, and `.ServeURL`.
-- **`static`** — inline content, with optional base64 encoding.
+Images are built, tagged, and pushed using standard container tooling:
 
-See the [CRD Reference]({{< relref "/reference/machina-crd" >}}) for the full Image spec.
+```bash
+docker build -t ghcr.io/project-unbounded/images/host-ubuntu2404:v1 .
+docker push ghcr.io/project-unbounded/images/host-ubuntu2404:v1
+```
+
+Template context includes `.Machine`, `.ApiserverURL`, and `.ServeURL`.
+
+See the [CRD Reference]({{< relref "/reference/machina-crd" >}}) for the full Machine spec.
 
 ## Machine CRD
 
-A Machine represents a single bare-metal host. The `spec.pxe` section ties together the image, network config, and BMC credentials:
+A Machine represents a single bare-metal host. The `spec.pxe` section ties together the OCI image, network config, and BMC credentials:
 
 ```yaml
 apiVersion: unbounded-kube.io/v1alpha3
@@ -67,8 +76,7 @@ metadata:
     unbounded-kube.io/site: rack-a
 spec:
   pxe:
-    imageRef:
-      name: ubuntu-24-04
+    image: ghcr.io/project-unbounded/images/host-ubuntu2404:v1
     dhcpLeases:
     - ipv4: "10.10.0.50"
       mac: "aa:bb:cc:dd:ee:ff"
@@ -93,7 +101,7 @@ Store BMC passwords in a Secret referenced by `passwordRef`. See the [CRD Refere
 
 1. **Machine CR created.** The Redfish reconciler sets the boot device to PXE and power-cycles the server (ForceOff → On).
 2. **PXE boot.** DHCP assigns the static IP by MAC. TFTP serves `shimx64.efi`, which chainloads GRUB over HTTP.
-3. **GRUB decision.** A rendered `grub.cfg` checks `reimageCounter` against status: if counter is ahead, boot the PXE installer; otherwise chainload the local OS.
+3. **GRUB decision.** A rendered `grub.cfg` (from a `.tmpl` file in the OCI image) checks `reimageCounter` against status: if counter is ahead, boot the PXE installer; otherwise chainload the local OS.
 4. **Installer (initrd overlay).** An init script in the initrd:
    - Loads storage and network drivers, configures the static IP from kernel cmdline.
    - Downloads the gzip-compressed raw disk image over HTTP (retries up to 120 times).
@@ -162,9 +170,7 @@ spec:
 ## Limitations
 
 - Only Ubuntu 24.04 images are currently supported.
-- Image conversion is limited to qcow2 (via `UnpackQcow2`).
 - The reimage timeout is fixed at 30 minutes.
-- The Image CRD status has no fields — there is no visibility into download progress.
 - Cloud-init user-data hardcodes the Kubernetes v1.32 APT repository.
 
 ## See Also
@@ -174,7 +180,7 @@ spec:
 - **[Project Overview]({{< relref "concepts/overview" >}})** -- How metalman
   fits into the broader system.
 - **[CRD Reference]({{< relref "reference/machina-crd" >}})** -- Complete
-  Machine and Image API specification.
+  Machine API specification.
 - **[Architecture]({{< relref "reference/architecture" >}})** -- Internal
   design of the PXE provisioning pipeline.
 - **[SSH Guide]({{< relref "guides/ssh" >}})** -- Alternative provisioning

@@ -130,7 +130,7 @@ func TestRedfishRebootCycle(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "node-01", Namespace: "default"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
-				ImageRef:   v1alpha3.LocalObjectReference{Name: "test-image"},
+				Image:      "ghcr.io/test/test-image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:f0", IPv4: "10.0.0.1", SubnetMask: "255.255.255.0"}},
 				Redfish: &v1alpha3.RedfishSpec{
 					URL:         srv.URL,
@@ -288,8 +288,8 @@ func TestRedfishRebootCycle(t *testing.T) {
 		t.Fatalf("expected Reimaged=False/Pending, got %+v", reimagedCond)
 	}
 
-	if reimagedCond.Message != "image=test-image" {
-		t.Fatalf("expected Reimaged message 'image=test-image', got %q", reimagedCond.Message)
+	if reimagedCond.Message != "image=ghcr.io/test/test-image:v1" {
+		t.Fatalf("expected Reimaged message 'image=ghcr.io/test/test-image:v1', got %q", reimagedCond.Message)
 	}
 
 	// Seventh reconcile: reboots match — no-op (timeout is handled by the
@@ -368,7 +368,7 @@ func TestRedfishPowerOnTimeoutRetry(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "node-stuck", Namespace: "default"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
-				ImageRef:   v1alpha3.LocalObjectReference{Name: "test-image"},
+				Image:      "ghcr.io/test/test-image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:f5", IPv4: "10.0.0.6", SubnetMask: "255.255.255.0"}},
 				Redfish: &v1alpha3.RedfishSpec{
 					URL:         srv.URL,
@@ -498,7 +498,7 @@ func TestRedfishForceOffTimeoutRetry(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "node-stuck-off", Namespace: "default"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
-				ImageRef:   v1alpha3.LocalObjectReference{Name: "test-image"},
+				Image:      "ghcr.io/test/test-image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:f6", IPv4: "10.0.0.7", SubnetMask: "255.255.255.0"}},
 				Redfish: &v1alpha3.RedfishSpec{
 					URL:         srv.URL,
@@ -608,7 +608,7 @@ func TestRedfishTOFUCertCapture(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "node-tofu", Namespace: "default"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
-				ImageRef:   v1alpha3.LocalObjectReference{Name: "test-image"},
+				Image:      "ghcr.io/test/test-image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:f1", IPv4: "10.0.0.2", SubnetMask: "255.255.255.0"}},
 				Redfish: &v1alpha3.RedfishSpec{
 					URL:         srv.URL,
@@ -685,7 +685,7 @@ func TestRedfishExactlyOnceSemantics(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "node-once", Namespace: "default"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
-				ImageRef:   v1alpha3.LocalObjectReference{Name: "test-image"},
+				Image:      "ghcr.io/test/test-image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:f4", IPv4: "10.0.0.5", SubnetMask: "255.255.255.0"}},
 				Redfish: &v1alpha3.RedfishSpec{
 					URL:         srv.URL,
@@ -795,7 +795,7 @@ func TestBootOrderConfigPxeOn(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "node-boot-pxe", Namespace: "default"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
-				ImageRef:   v1alpha3.LocalObjectReference{Name: "test-image"},
+				Image:      "ghcr.io/test/test-image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b0", IPv4: "10.0.0.30", SubnetMask: "255.255.255.0"}},
 				Redfish: &v1alpha3.RedfishSpec{
 					URL:         srv.URL,
@@ -897,7 +897,7 @@ func TestBootOrderConfigPxeOff(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "node-boot-hdd", Namespace: "default"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
-				ImageRef:   v1alpha3.LocalObjectReference{Name: "test-image"},
+				Image:      "ghcr.io/test/test-image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b1", IPv4: "10.0.0.31", SubnetMask: "255.255.255.0"}},
 				Redfish: &v1alpha3.RedfishSpec{
 					URL:         srv.URL,
@@ -992,7 +992,7 @@ func TestBootOrderConfigNoOp(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "node-boot-noop", Namespace: "default"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
-				ImageRef:   v1alpha3.LocalObjectReference{Name: "test-image"},
+				Image:      "ghcr.io/test/test-image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b2", IPv4: "10.0.0.32", SubnetMask: "255.255.255.0"}},
 				Redfish: &v1alpha3.RedfishSpec{
 					URL:         srv.URL,
@@ -1077,7 +1077,7 @@ func TestBootOrderConfigNoOpPxeOff(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "node-boot-noop-off", Namespace: "default"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
-				ImageRef:   v1alpha3.LocalObjectReference{Name: "test-image"},
+				Image:      "ghcr.io/test/test-image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b5", IPv4: "10.0.0.35", SubnetMask: "255.255.255.0"}},
 				Redfish: &v1alpha3.RedfishSpec{
 					URL:         srv.URL,
@@ -1173,7 +1173,7 @@ func TestBootOrderConfigPxeOffDisableFallbackToHdd(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "node-boot-fallback", Namespace: "default"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
-				ImageRef:   v1alpha3.LocalObjectReference{Name: "test-image"},
+				Image:      "ghcr.io/test/test-image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b6", IPv4: "10.0.0.36", SubnetMask: "255.255.255.0"}},
 				Redfish: &v1alpha3.RedfishSpec{
 					URL:         srv.URL,
@@ -1268,7 +1268,7 @@ func TestBootOrderConfigNoOpPxeOffHdd(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "node-boot-noop-hdd", Namespace: "default"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
-				ImageRef:   v1alpha3.LocalObjectReference{Name: "test-image"},
+				Image:      "ghcr.io/test/test-image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b7", IPv4: "10.0.0.37", SubnetMask: "255.255.255.0"}},
 				Redfish: &v1alpha3.RedfishSpec{
 					URL:         srv.URL,
@@ -1347,7 +1347,7 @@ func TestBootOrderConfigUnsupported(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "node-boot-unsup", Namespace: "default"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
-				ImageRef:   v1alpha3.LocalObjectReference{Name: "test-image"},
+				Image:      "ghcr.io/test/test-image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b3", IPv4: "10.0.0.33", SubnetMask: "255.255.255.0"}},
 				Redfish: &v1alpha3.RedfishSpec{
 					URL:         srv.URL,
@@ -1446,7 +1446,7 @@ func TestBootOrderConfigUnsupportedDuringPOST(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "node-boot-post", Namespace: "default"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
-				ImageRef:   v1alpha3.LocalObjectReference{Name: "test-image"},
+				Image:      "ghcr.io/test/test-image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b8", IPv4: "10.0.0.38", SubnetMask: "255.255.255.0"}},
 				Redfish: &v1alpha3.RedfishSpec{
 					URL:         srv.URL,
@@ -1567,7 +1567,7 @@ func TestBootOrderConfigTransientError(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "node-boot-503", Namespace: "default"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
-				ImageRef:   v1alpha3.LocalObjectReference{Name: "test-image"},
+				Image:      "ghcr.io/test/test-image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b4", IPv4: "10.0.0.34", SubnetMask: "255.255.255.0"}},
 				Redfish: &v1alpha3.RedfishSpec{
 					URL:         srv.URL,

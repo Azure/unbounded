@@ -88,7 +88,7 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resolved, err := h.ResolveFileByPath(r.Context(), path, node, node.Spec.PXE.ImageRef.Name)
+	resolved, err := h.ResolveFileByPath(r.Context(), path, node, node.Spec.PXE.Image)
 	if err != nil {
 		if errors.Is(err, ErrNotYetDownloaded) {
 			log.Info("file not yet downloaded", "node", node.Name)
@@ -167,7 +167,7 @@ func (h *HTTPServer) handleDisablePXE(w http.ResponseWriter, r *http.Request) {
 
 	imageName := ""
 	if node.Spec.PXE != nil {
-		imageName = node.Spec.PXE.ImageRef.Name
+		imageName = node.Spec.PXE.Image
 	}
 
 	meta.SetStatusCondition(&node.Status.Conditions, metav1.Condition{
