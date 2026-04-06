@@ -49,6 +49,25 @@ archives:
 checksum:
   name_template: "checksums.txt"
 
+# Sign the checksums file with cosign using keyless (Sigstore OIDC) signing.
+# This ties the signature to the GitHub Actions OIDC identity — no long-lived keys required.
+signs:
+  - cmd: cosign
+    certificate: "${artifact}.pem"
+    args:
+      - sign-blob
+      - "--output-certificate=${certificate}"
+      - "--output-signature=${signature}"
+      - "${artifact}"
+      - "--yes"
+    artifacts: checksum
+    output: true
+
+# Generate an SPDX SBOM for each binary archive using syft.
+sboms:
+  - artifacts: archive
+    args: ["$artifact", "--output", "spdx-json=$document"]
+
 changelog:
   sort: asc
   filters:
