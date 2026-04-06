@@ -70,9 +70,9 @@ type manualBootstrapHandler struct {
 	// taints are taint strings passed through to kubelet --register-with-taints.
 	taints []string
 
-	// ociImage is an optional OCI image reference for the agent. When set, the
-	// bootstrap script exports AGENT_OCI_IMAGE so the install script can use
-	// a container image instead of downloading a standalone binary.
+	// ociImage is an optional OCI image reference for the agent. When set,
+	// it is included in the AgentConfig JSON so the agent uses a container
+	// image to bootstrap the machine rootfs instead of debootstrap.
 	ociImage string
 
 	// kubernetesVersion overrides the Kubernetes version that would otherwise
@@ -260,6 +260,7 @@ func (h *manualBootstrapHandler) buildAgentConfig(ctx context.Context) (*provisi
 			Labels:             labels,
 			RegisterWithTaints: h.taints,
 		},
+		OCIImage: h.ociImage,
 	}, nil
 }
 
@@ -275,10 +276,6 @@ type manualBootstrapTemplateData struct {
 	// InstallScript is the full install script embedded verbatim inside a
 	// heredoc that is piped to bash.
 	InstallScript string
-
-	// OCIImage is an optional OCI image reference. When non-empty the
-	// template exports AGENT_OCI_IMAGE before running the install script.
-	OCIImage string
 }
 
 // renderScript produces a self-contained bash script that writes the agent
@@ -294,7 +291,6 @@ func (h *manualBootstrapHandler) renderScript(cfg *provision.AgentConfig) (strin
 		MachineName:     cfg.MachineName,
 		AgentConfigJSON: string(configJSON),
 		InstallScript:   provision.UnboundedAgentInstallScript(),
-		OCIImage:        h.ociImage,
 	}
 
 	t, err := template.New("node-bootstrap").Parse(manualBootstrapTemplate)
@@ -322,7 +318,6 @@ func (h *manualBootstrapHandler) renderCloudInit(cfg *provision.AgentConfig) (st
 		MachineName:     cfg.MachineName,
 		AgentConfigJSON: string(configJSON),
 		InstallScript:   provision.UnboundedAgentInstallScript(),
-		OCIImage:        h.ociImage,
 	}
 
 	funcMap := template.FuncMap{
@@ -389,7 +384,7 @@ Examples:
 	cmd.Flags().StringVar(&handler.kubeconfigPath, "kubeconfig", "", "Path to kubeconfig file")
 	cmd.Flags().StringArrayVar(&handler.nodeLabels, "node-label", nil, "Label in key=value format to pass to kubelet (can be repeated)")
 	cmd.Flags().StringArrayVar(&handler.taints, "register-with-taint", nil, "Taint to register on the node (can be repeated)")
-	cmd.Flags().StringVar(&handler.ociImage, "oci-image", "", "OCI image reference for the agent (sets AGENT_OCI_IMAGE)")
+	cmd.Flags().StringVar(&handler.ociImage, "oci-image", "", "OCI image reference for the agent rootfs")
 	cmd.Flags().StringVar(&handler.kubernetesVersion, "kubernetes-version", "", "Override the Kubernetes version (default: auto-detected from API server)")
 	cmd.Flags().StringVar(&handler.variant, "variant", "script", "Output format: script or cloud-init")
 

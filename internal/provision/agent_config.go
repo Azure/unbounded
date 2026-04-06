@@ -7,6 +7,11 @@ type AgentConfig struct {
 	MachineName string             `json:"MachineName"`
 	Cluster     AgentClusterConfig `json:"Cluster"`
 	Kubelet     AgentKubeletConfig `json:"Kubelet"`
+
+	// OCIImage is the fully-qualified OCI image reference (e.g.
+	// "ghcr.io/org/repo:tag") used to bootstrap the machine rootfs.
+	// When empty the agent falls back to debootstrap.
+	OCIImage string `json:"OCIImage,omitempty"`
 }
 
 // AgentClusterConfig holds the cluster-level values the agent needs to

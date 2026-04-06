@@ -353,6 +353,92 @@ func TestMachineReconciler_Provisioning_Success(t *testing.T) {
 	require.Equal(t, "Completed", provingCond.Reason)
 }
 
+func TestMachineReconciler_Provisioning_SetsAgentStatus(t *testing.T) {
+	t.Parallel()
+
+	s := newTestScheme(t)
+
+	machine := newTestMachine("test-machine", "10.0.0.1:22", "testuser", defaultKubernetes())
+	machine.Spec.Agent = &unboundedv1alpha3.AgentSpec{
+		Image: "ghcr.io/project-unbounded/rootfs:v1.0.0",
+	}
+
+	sshSecret := newSSHKeySecret("ssh-key-secret")
+	bootstrapSecret := newBootstrapTokenSecret("bootstrap-token-abc123")
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(machine, sshSecret, bootstrapSecret).
+		WithStatusSubresource(machine).
+		Build()
+
+	provisioner := &mockProvisioner{}
+	reconciler := &MachineReconciler{
+		Client:              fakeClient,
+		Scheme:              s,
+		ReachabilityChecker: &mockReachabilityChecker{},
+		Provisioner:         provisioner,
+		ClusterInfo:         &ClusterInfo{KubeVersion: "v1.34.0"},
+	}
+
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-machine"}}
+
+	_, err := reconciler.Reconcile(context.Background(), req)
+	require.NoError(t, err)
+	require.True(t, provisioner.called)
+
+	var updated unboundedv1alpha3.Machine
+
+	err = fakeClient.Get(context.Background(), req.NamespacedName, &updated)
+	require.NoError(t, err)
+	require.Equal(t, unboundedv1alpha3.MachinePhaseJoining, updated.Status.Phase)
+
+	// Agent status should reflect the applied spec.
+	require.NotNil(t, updated.Status.Agent, "Status.Agent should be set after provisioning")
+	require.Equal(t, "ghcr.io/project-unbounded/rootfs:v1.0.0", updated.Status.Agent.Image)
+}
+
+func TestMachineReconciler_Provisioning_NoAgentSpec_NilAgentStatus(t *testing.T) {
+	t.Parallel()
+
+	s := newTestScheme(t)
+
+	machine := newTestMachine("test-machine", "10.0.0.1:22", "testuser", defaultKubernetes())
+	// No Agent spec set.
+
+	sshSecret := newSSHKeySecret("ssh-key-secret")
+	bootstrapSecret := newBootstrapTokenSecret("bootstrap-token-abc123")
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(machine, sshSecret, bootstrapSecret).
+		WithStatusSubresource(machine).
+		Build()
+
+	provisioner := &mockProvisioner{}
+	reconciler := &MachineReconciler{
+		Client:              fakeClient,
+		Scheme:              s,
+		ReachabilityChecker: &mockReachabilityChecker{},
+		Provisioner:         provisioner,
+		ClusterInfo:         &ClusterInfo{KubeVersion: "v1.34.0"},
+	}
+
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-machine"}}
+
+	_, err := reconciler.Reconcile(context.Background(), req)
+	require.NoError(t, err)
+
+	var updated unboundedv1alpha3.Machine
+
+	err = fakeClient.Get(context.Background(), req.NamespacedName, &updated)
+	require.NoError(t, err)
+	require.Equal(t, unboundedv1alpha3.MachinePhaseJoining, updated.Status.Phase)
+
+	// Agent status should remain nil when no Agent spec is provided.
+	require.Nil(t, updated.Status.Agent, "Status.Agent should be nil when Spec.Agent is not set")
+}
+
 func TestMachineReconciler_Provisioning_ProvisionerFails(t *testing.T) {
 	t.Parallel()
 

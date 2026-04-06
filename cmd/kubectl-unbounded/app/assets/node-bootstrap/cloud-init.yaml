@@ -19,7 +19,4 @@ write_files:
 
 runcmd:
   - export UNBOUNDED_AGENT_CONFIG_FILE=/etc/unbounded-agent/config.json
-{{- if .OCIImage }}
-  - export AGENT_OCI_IMAGE="{{ .OCIImage }}"
-{{- end }}
   - bash /usr/local/bin/unbounded-agent-install.sh

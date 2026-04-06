@@ -20,9 +20,7 @@ export UNBOUNDED_AGENT_CONFIG_FILE
 cat > "${UNBOUNDED_AGENT_CONFIG_FILE}" <<'AGENT_CONFIG_EOF'
 {{ .AgentConfigJSON }}
 AGENT_CONFIG_EOF
-{{ if .OCIImage }}
-export AGENT_OCI_IMAGE="{{ .OCIImage }}"
-{{ end }}
+
 # -----------------------------------------------------------------
 # Embedded install script
 # -----------------------------------------------------------------

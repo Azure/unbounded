@@ -408,6 +408,13 @@ func (r *MachineReconciler) reconcileProvisioning(ctx context.Context, machine *
 		ObservedGeneration: machine.Generation,
 	})
 
+	// Publish the applied agent settings so they're observable on the status.
+	if machine.Spec.Agent != nil {
+		machine.Status.Agent = &unboundedv1alpha3.AgentStatus{
+			Image: machine.Spec.Agent.Image,
+		}
+	}
+
 	return r.updateStatus(ctx, machine, unboundedv1alpha3.MachinePhaseJoining,
 		"Machine provisioned successfully, waiting for Node to join")
 }
@@ -592,6 +599,11 @@ func (r *MachineReconciler) provisionMachine(
 		taints = machine.Spec.Kubernetes.RegisterWithTaints
 	}
 
+	var ociImage string
+	if machine.Spec.Agent != nil {
+		ociImage = machine.Spec.Agent.Image
+	}
+
 	agentConfig := provision.AgentConfig{
 		MachineName: machine.Name,
 		Cluster: provision.AgentClusterConfig{
@@ -605,6 +617,7 @@ func (r *MachineReconciler) provisionMachine(
 			Labels:             labels,
 			RegisterWithTaints: taints,
 		},
+		OCIImage: ociImage,
 	}
 
 	configJSON, err := json.Marshal(agentConfig)

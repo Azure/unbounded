@@ -83,6 +83,10 @@ type MachineSpec struct {
 	// +optional
 	Kubernetes *KubernetesSpec `json:"kubernetes,omitempty"`
 
+	// Agent contains settings for the unbounded node agent.
+	// +optional
+	Agent *AgentSpec `json:"agent,omitempty"`
+
 	// Operations contains counter-based operation triggers.
 	// +optional
 	Operations *OperationsSpec `json:"operations,omitempty"`
@@ -214,6 +218,14 @@ type KubernetesSpec struct {
 	BootstrapTokenRef LocalObjectReference `json:"bootstrapTokenRef"`
 }
 
+// AgentSpec defines settings for the unbounded node agent.
+type AgentSpec struct {
+	// Image is the OCI image reference used for provisioning the
+	// nspawn machine (e.g. "ghcr.io/org/repo:tag").
+	// +kubebuilder:validation:Required
+	Image string `json:"image"`
+}
+
 // OperationsSpec defines counter-based operation triggers.
 // Controllers compare spec counters against status counters to
 // determine if an operation is needed.
@@ -269,6 +281,10 @@ type MachineStatus struct {
 	// +optional
 	TPM *TPMStatus `json:"tpm,omitempty"`
 
+	// Agent holds the applied agent settings.
+	// +optional
+	Agent *AgentStatus `json:"agent,omitempty"`
+
 	// Operations holds the last-observed operation counters.
 	// +optional
 	Operations *OperationsStatus `json:"operations,omitempty"`
@@ -309,6 +325,13 @@ type TPMStatus struct {
 	// EKPublicKey is the TPM endorsement key public key, written
 	// when the PXE boot image requests a bootstrap token.
 	EKPublicKey string `json:"ekPublicKey,omitempty"`
+}
+
+// AgentStatus holds the applied agent settings for the machine.
+type AgentStatus struct {
+	// Image is the OCI image reference that was applied to the
+	// nspawn machine.
+	Image string `json:"image,omitempty"`
 }
 
 // OperationsStatus holds the last-observed operation counters.

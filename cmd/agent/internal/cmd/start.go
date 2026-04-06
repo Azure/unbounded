@@ -103,8 +103,12 @@ func resolveRootFSGoalState(cfg *provision.AgentConfig) (*goalstates.RootFS, err
 		return nil, fmt.Errorf("get host hostname: %w", err)
 	}
 
-	// allow passing in through env var
-	ociImage := strings.TrimSpace(os.Getenv("AGENT_OCI_IMAGE"))
+	// Prefer OCIImage from config; fall back to AGENT_OCI_IMAGE env var
+	// for backward compatibility with older bootstrap scripts.
+	ociImage := cfg.OCIImage
+	if ociImage == "" {
+		ociImage = strings.TrimSpace(os.Getenv("AGENT_OCI_IMAGE"))
+	}
 
 	return &goalstates.RootFS{
 		MachineDir: filepath.Join("/var/lib/machines", machineName),

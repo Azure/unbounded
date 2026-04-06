@@ -26,6 +26,7 @@ func TestAgentConfig_MarshalJSON(t *testing.T) {
 			},
 			RegisterWithTaints: []string{"dedicated=gpu:NoSchedule"},
 		},
+		OCIImage: "ghcr.io/project-unbounded/agent:v1.0.0",
 	}
 
 	data, err := json.Marshal(cfg)
@@ -51,6 +52,8 @@ func TestAgentConfig_MarshalJSON(t *testing.T) {
 	taints := kubelet["RegisterWithTaints"].([]interface{})
 	require.Len(t, taints, 1)
 	require.Equal(t, "dedicated=gpu:NoSchedule", taints[0])
+
+	require.Equal(t, "ghcr.io/project-unbounded/agent:v1.0.0", parsed["OCIImage"])
 }
 
 func TestAgentConfig_RoundTrip(t *testing.T) {
@@ -69,6 +72,7 @@ func TestAgentConfig_RoundTrip(t *testing.T) {
 			Labels:             map[string]string{"key": "value"},
 			RegisterWithTaints: []string{"key=value:NoSchedule", "key2=value2:NoExecute"},
 		},
+		OCIImage: "ghcr.io/project-unbounded/rootfs:v2.0.0",
 	}
 
 	data, err := json.Marshal(original)
@@ -81,6 +85,7 @@ func TestAgentConfig_RoundTrip(t *testing.T) {
 	require.Equal(t, original.Cluster, decoded.Cluster)
 	require.Equal(t, original.Kubelet.Labels, decoded.Kubelet.Labels)
 	require.Equal(t, original.Kubelet.RegisterWithTaints, decoded.Kubelet.RegisterWithTaints)
+	require.Equal(t, original.OCIImage, decoded.OCIImage)
 }
 
 func TestAgentConfig_EmptyFields(t *testing.T) {
@@ -106,4 +111,8 @@ func TestAgentConfig_EmptyFields(t *testing.T) {
 	require.Equal(t, "", kubelet["BootstrapToken"])
 	require.Nil(t, kubelet["Labels"])
 	require.Nil(t, kubelet["RegisterWithTaints"])
+
+	// OCIImage has omitempty so should be absent from zero-value config.
+	_, hasOCIImage := parsed["OCIImage"]
+	require.False(t, hasOCIImage, "OCIImage should be omitted when empty")
 }

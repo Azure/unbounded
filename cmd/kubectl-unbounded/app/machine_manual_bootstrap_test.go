@@ -170,6 +170,7 @@ func TestManualBootstrapHandler_BuildAgentConfig(t *testing.T) {
 		machineName: "my-node",
 		nodeLabels:  []string{"env=prod"},
 		taints:      []string{"dedicated=gpu:NoSchedule"},
+		ociImage:    "ghcr.io/project-unbounded/rootfs:v1",
 		kubeCli:     kubeCli,
 		kubeConfig:  &rest.Config{Host: "https://my-api-server:6443"},
 		logger:      discardLogger(),
@@ -186,6 +187,7 @@ func TestManualBootstrapHandler_BuildAgentConfig(t *testing.T) {
 	require.Contains(t, cfg.Kubelet.BootstrapToken, "abc123.")
 	require.Equal(t, map[string]string{"env": "prod"}, cfg.Kubelet.Labels)
 	require.Equal(t, []string{"dedicated=gpu:NoSchedule"}, cfg.Kubelet.RegisterWithTaints)
+	require.Equal(t, "ghcr.io/project-unbounded/rootfs:v1", cfg.OCIImage)
 }
 
 func TestManualBootstrapHandler_BuildAgentConfig_KubernetesVersionOverride(t *testing.T) {
@@ -362,22 +364,38 @@ func TestManualBootstrapHandler_RenderCloudInit(t *testing.T) {
 		require.Contains(t, output, "UNBOUNDED_AGENT_CONFIG_FILE=/etc/unbounded-agent/config.json")
 		require.Contains(t, output, "bash /usr/local/bin/unbounded-agent-install.sh")
 
-		// Should NOT contain AGENT_OCI_IMAGE when not set.
+		// AGENT_OCI_IMAGE env var should not be present (OCI image is in the JSON config).
 		require.NotContains(t, output, "AGENT_OCI_IMAGE")
 	})
 
 	t.Run("with OCI image", func(t *testing.T) {
 		t.Parallel()
 
-		withOCI := &manualBootstrapHandler{
-			ociImage: "ghcr.io/project-unbounded/agent:latest",
-			logger:   discardLogger(),
+		cfgWithOCI := &provision.AgentConfig{
+			MachineName: "test-node",
+			Cluster: provision.AgentClusterConfig{
+				CaCertBase64: "dGVzdA==",
+				ClusterDNS:   "10.0.0.10",
+				Version:      "v1.30.0",
+			},
+			Kubelet: provision.AgentKubeletConfig{
+				ApiServer:      "https://api-server:6443",
+				BootstrapToken: "abc123.0123456789abcdef",
+				Labels:         map[string]string{"env": "prod"},
+			},
+			OCIImage: "ghcr.io/project-unbounded/agent:latest",
 		}
 
-		output, err := withOCI.renderCloudInit(cfg)
+		withOCI := &manualBootstrapHandler{
+			logger: discardLogger(),
+		}
+
+		output, err := withOCI.renderCloudInit(cfgWithOCI)
 		require.NoError(t, err)
 
-		require.Contains(t, output, `AGENT_OCI_IMAGE="ghcr.io/project-unbounded/agent:latest"`)
+		// OCIImage should appear in the JSON config, not as a separate env var.
+		require.Contains(t, output, `"OCIImage": "ghcr.io/project-unbounded/agent:latest"`)
+		require.NotContains(t, output, "AGENT_OCI_IMAGE")
 	})
 }
 

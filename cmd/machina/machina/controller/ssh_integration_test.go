@@ -1007,6 +1007,66 @@ func TestProvisionMachine_Taints(t *testing.T) {
 	require.Equal(t, []string{"dedicated=gpu:NoSchedule", "special=true:NoExecute"}, agentConfig.Kubelet.RegisterWithTaints)
 }
 
+func TestProvisionMachine_OCIImage(t *testing.T) {
+	t.Parallel()
+
+	srv := newSSHTestServer(t)
+
+	_, signer := generateTestRSAKey(t)
+
+	s := runtime.NewScheme()
+	require.NoError(t, unboundedv1alpha3.AddToScheme(s))
+	require.NoError(t, corev1.AddToScheme(s))
+
+	machine := &unboundedv1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "oci-image-machine"},
+		Spec: unboundedv1alpha3.MachineSpec{
+			SSH: &unboundedv1alpha3.SSHSpec{
+				Host:          fmt.Sprintf("%s:%d", srv.host, srv.port),
+				Username:      "testuser",
+				PrivateKeyRef: unboundedv1alpha3.SecretKeySelector{Name: "ssh-key-secret"},
+			},
+			Kubernetes: &unboundedv1alpha3.KubernetesSpec{
+				BootstrapTokenRef: unboundedv1alpha3.LocalObjectReference{Name: "bt"},
+			},
+			Agent: &unboundedv1alpha3.AgentSpec{
+				Image: "ghcr.io/project-unbounded/rootfs:v1.0.0",
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(machine).Build()
+
+	reconciler := &MachineReconciler{
+		Client:      fakeClient,
+		Scheme:      s,
+		ClusterInfo: &ClusterInfo{},
+	}
+
+	sshConfig := sshTestClientConfig(signer)
+
+	err := reconciler.provisionMachine(context.Background(), machine, sshConfig, "")
+	require.NoError(t, err)
+
+	commands := srv.getExecutedCommands()
+
+	var configCmd *sshExecutedCommand
+
+	for i := range commands {
+		if strings.Contains(commands[i].command, "cat >") && strings.Contains(commands[i].command, remoteConfigPath) {
+			configCmd = &commands[i]
+			break
+		}
+	}
+
+	require.NotNil(t, configCmd, "expected a config upload command")
+
+	var agentConfig provision.AgentConfig
+	require.NoError(t, json.Unmarshal(configCmd.stdin, &agentConfig))
+
+	require.Equal(t, "ghcr.io/project-unbounded/rootfs:v1.0.0", agentConfig.OCIImage)
+}
+
 func TestProvisionMachine_ProviderLabelsOverride(t *testing.T) {
 	t.Parallel()
 
