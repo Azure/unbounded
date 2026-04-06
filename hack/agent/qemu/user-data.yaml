@@ -25,16 +25,23 @@ packages:
 mounts:
   - ["agent", "/agent", "9p", "trans=virtio,version=9p2000.L,nofail", "0", "0"]
 
+# Write files
+write_files:
+  # Enable serial console (ttyS0) for QEMU log capture on subsequent boots.
+  # Cloud images may not have this enabled by default.
+  - path: /etc/default/grub.d/99-serial-console.cfg
+    content: |
+      GRUB_CMDLINE_LINUX="$GRUB_CMDLINE_LINUX console=ttyS0,115200n8"
+    permissions: "0644"
+
 # Run commands on first boot
 runcmd:
   - mkdir -p /agent
   - mount -a
-  - echo "hello, world"
-
-# Write files
-write_files:
-  - path: /etc/agent/provisioned
-    content: |
-      provisioned=true
-      timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-    permissions: "0644"
+  - mkdir -p /etc/agent
+  - |
+    cat > /etc/agent/provisioned <<'EOF'
+    provisioned=true
+    EOF
+  - update-grub
+  - 'echo "cloud-init: done"'

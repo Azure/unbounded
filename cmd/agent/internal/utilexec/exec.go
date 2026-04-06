@@ -150,3 +150,10 @@ func Sysctl() func(context.Context) *exec.Cmd {
 		return exec.CommandContext(ctx, "sysctl")
 	}
 }
+
+// Systemctl returns a command factory for systemctl.
+func Systemctl() func(context.Context) *exec.Cmd {
+	return func(ctx context.Context) *exec.Cmd {
+		return exec.CommandContext(ctx, "systemctl")
+	}
+}

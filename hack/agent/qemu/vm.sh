@@ -324,9 +324,47 @@ EOF
     MACHINE_ARGS=""
     QEMU_BIN=""
 
+    # Determine accelerator first — CPU model may depend on whether we have hardware virt.
+    case "$(uname -s)" in
+        Darwin)
+            if sysctl -n kern.hv_support 2>/dev/null | grep -q 1; then
+                ACCEL="-accel hvf"
+            fi
+            ;;
+        Linux)
+            if [[ -r /dev/kvm ]]; then
+                # On WSL2, KVM (nested AMD SVM / Hyper-V) does not implement all
+                # MSRs that the Ubuntu 6.8+ kernel requires (e.g. KVM clock MSRs).
+                # The guest triple-faults silently on boot.  Detect WSL2 by checking
+                # the kernel release string and, if so, verify that ignore_msrs is
+                # enabled.  If not, skip KVM and fall back to TCG emulation.
+                if uname -r | grep -qi "microsoft"; then
+                    local ignore_msrs
+                    ignore_msrs="$(cat /sys/module/kvm/parameters/ignore_msrs 2>/dev/null || echo N)"
+                    if [[ "${ignore_msrs}" == "Y" ]]; then
+                        ACCEL="-accel kvm"
+                    else
+                        warn "WSL2 detected: KVM (nested SVM) is incompatible with Ubuntu 24.04 without ignore_msrs=Y."
+                        warn "To enable KVM on WSL2, run once as root:"
+                        warn "  echo 1 | sudo tee /sys/module/kvm/parameters/ignore_msrs"
+                        warn "Falling back to TCG software emulation (slower)."
+                        ACCEL=""
+                    fi
+                else
+                    ACCEL="-accel kvm"
+                fi
+            fi
+            ;;
+    esac
+
     if [[ "${GUEST_ARCH}" == "arm64" ]]; then
         QEMU_BIN="qemu-system-aarch64"
-        MACHINE_ARGS="-machine virt -cpu host"
+        # -cpu host requires hardware virt (HVF/KVM); fall back to max for TCG.
+        if [[ -n "${ACCEL}" ]]; then
+            MACHINE_ARGS="-machine virt -cpu host"
+        else
+            MACHINE_ARGS="-machine virt -cpu max"
+        fi
 
         # Locate UEFI firmware for aarch64
         UEFI_FW=""
@@ -346,21 +384,13 @@ EOF
         MACHINE_ARGS="${MACHINE_ARGS} -bios ${UEFI_FW}"
     else
         QEMU_BIN="qemu-system-x86_64"
-        MACHINE_ARGS="-cpu host"
+        # -cpu host requires hardware virt (HVF/KVM); fall back to qemu64 for TCG.
+        if [[ -n "${ACCEL}" ]]; then
+            MACHINE_ARGS="-cpu host"
+        else
+            MACHINE_ARGS="-cpu qemu64"
+        fi
     fi
-
-    case "$(uname -s)" in
-        Darwin)
-            if sysctl -n kern.hv_support 2>/dev/null | grep -q 1; then
-                ACCEL="-accel hvf"
-            fi
-            ;;
-        Linux)
-            if [[ -r /dev/kvm ]]; then
-                ACCEL="-accel kvm"
-            fi
-            ;;
-    esac
 
     # ---------------------------------------------------------------
     # Launch VM in background
@@ -461,7 +491,7 @@ EOF
 
     info "Waiting for SSH to become available on ${VM_SSH_TARGET}:${VM_SSH_PORT}..."
 
-    MAX_ATTEMPTS=60
+    MAX_ATTEMPTS=120
     ATTEMPT=0
     while [[ ${ATTEMPT} -lt ${MAX_ATTEMPTS} ]]; do
         ATTEMPT=$((ATTEMPT + 1))

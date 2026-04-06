@@ -50,7 +50,12 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 			return phases.Serial(log,
 				// Phase 1: host
 				host.InstallPackages(log),
-				host.ConfigureOS(log),
+				phases.Parallel(log,
+					host.ConfigureOS(log),
+					host.ConfigureNFTables(log),
+					host.DisableDocker(log),
+					host.DisableSwap(log),
+				),
 
 				// Phase 2: rootfs
 				rootfs.EnsureNSpawnWorkspace(log, rootFSGoalState),

@@ -16,10 +16,12 @@ import (
 // - systemd-container: provides systemd-nspawn for running containers.
 // - debootstrap: used to bootstrap a Debian rootfs.
 // - curl: used for downloading resources.
+// - nftables: provides nft, used by nftables-flush.service to reset firewall rules.
 var requiredPackages = []string{
 	"systemd-container",
 	"debootstrap",
 	"curl",
+	"nftables",
 }
 
 type installPackages struct {

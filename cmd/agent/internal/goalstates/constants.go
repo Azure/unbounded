@@ -1,6 +1,9 @@
 package goalstates
 
 const (
+	// ConfigDir is the host-level configuration directory for unbounded-kube.
+	ConfigDir = "/etc/unbounded-kube"
+
 	SystemdNSpawnDir = "/etc/systemd/nspawn"
 	SystemdSystemDir = "/etc/systemd/system"
 )
