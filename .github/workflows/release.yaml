@@ -93,7 +93,7 @@ jobs:
           tags: scan/${{ matrix.component.name }}:${{ github.ref_name }}
 
       - name: Scan with Trivy before pushing
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@v0.35.0
         with:
           image-ref: scan/${{ matrix.component.name }}:${{ github.ref_name }}
           format: table
