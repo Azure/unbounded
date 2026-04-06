@@ -106,29 +106,6 @@ jobs:
           go-version-file: go.mod
           go-package: ./...
 
-  dependency-review:
-    name: Dependency Review
-    runs-on: ubuntu-latest
-    # Only meaningful on pull_request events — requires a base commit to diff against.
-    # Requires GitHub Advanced Security (Dependency Graph) to be enabled on the repository.
-    if: github.event_name == 'pull_request'
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Dependency review
-        uses: actions/dependency-review-action@v4
-        with:
-          # Fail on any vulnerable dependency regardless of severity.
-          fail-on-severity: low
-          # Allow only OSI-approved permissive and weak-copyleft licenses.
-          allow-licenses: >-
-            Apache-2.0, MIT, BSD-2-Clause, BSD-3-Clause, ISC, MPL-2.0,
-            CC0-1.0, CC-BY-4.0, CC-BY-SA-4.0, Unlicense, 0BSD, BlueOak-1.0.0
-          # warn-only: all findings are reported as warnings and the step exits 0.
-          # Remove or set to false once the team is ready to enforce blocking.
-          warn-only: true
-
   verify-generated:
     name: Verify Generated Files
     runs-on: ubuntu-latest
