@@ -21,7 +21,7 @@ on:
 
 permissions:
   contents: read
-  # Required to upload results to the GitHub Security tab.
+  # Required to upload results to the GitHub Security tab (needs Advanced Security on private repos).
   security-events: write
   # Required by CodeQL analyze action to read workflow run metadata.
   actions: read
@@ -30,6 +30,10 @@ jobs:
   codeql:
     name: CodeQL Analysis
     runs-on: ubuntu-latest
+    # The SARIF upload step requires GitHub Advanced Security (paid for private repos).
+    # continue-on-error keeps this job non-blocking until Advanced Security is enabled.
+    # The analysis itself still runs and finds issues; results are saved as an artifact.
+    continue-on-error: true
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -53,6 +57,18 @@ jobs:
         run: go build ./...
 
       - name: Perform CodeQL Analysis
+        id: analyze
         uses: github/codeql-action/analyze@v4
         with:
           category: "/language:go"
+          # Save the SARIF output so findings are accessible as a workflow artifact
+          # even when the Security tab upload fails due to missing Advanced Security.
+          output: codeql-results
+
+      - name: Upload SARIF as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codeql-sarif
+          path: codeql-results/
+          retention-days: 30
