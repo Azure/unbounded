@@ -1,0 +1,193 @@
+name: Agent E2E Kind
+
+on:
+  pull_request:
+    paths:
+      - cmd/agent/**
+      - internal/provision/**
+      - internal/kube/**
+      - hack/agent/e2e-kind/**
+      - go.mod
+      - go.sum
+      - .github/workflows/agent-e2e-kind.yaml
+  push:
+    branches: [main]
+    paths:
+      - cmd/agent/**
+      - internal/provision/**
+      - internal/kube/**
+      - hack/agent/e2e-kind/**
+      - go.mod
+      - go.sum
+      - .github/workflows/agent-e2e-kind.yaml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  agent-e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      KIND_CLUSTER_NAME: kind
+      VM_NAME: agent-e2e
+      VM_SUBNET: "192.168.100"
+      VM_IP: "192.168.100.10"
+      AGENT_MACHINE_NAME: agent-e2e
+      AGENT_OCI_IMAGE: ghcr.io/project-unbounded/agent-ubuntu2404:ce67830106f97c953fbbf2313156197a5eb3d39c
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 qemu-utils genisoimage \
+            iptables
+
+      - name: Create Kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: ${{ env.KIND_CLUSTER_NAME }}
+          version: v0.29.0
+
+      - name: Configure Kind cluster networking for VM
+        run: |
+          set -euo pipefail
+          KIND_CONTAINER="${KIND_CLUSTER_NAME}-control-plane"
+          KIND_IP=$(docker inspect "${KIND_CONTAINER}" \
+              --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
+          if [[ -z "${KIND_IP}" ]]; then
+            echo "::error::Could not determine Kind control-plane container IP"
+            exit 1
+          fi
+          echo "[INFO] Kind control-plane IP: ${KIND_IP}"
+          BRIDGE="virbr-e2e"
+
+          # Allow forwarding between the VM bridge and Docker bridge.
+          sudo iptables -I FORWARD -i "${BRIDGE}" -j ACCEPT
+          sudo iptables -I FORWARD -o "${BRIDGE}" -j ACCEPT
+
+          # Docker may insert raw PREROUTING DROP rules that block non-Docker
+          # traffic to container IPs. Insert an ACCEPT so the VM can reach the
+          # Kind API server.
+          sudo iptables -t raw -I PREROUTING -i "${BRIDGE}" -j ACCEPT
+
+          # Add a route inside the Kind container so it can reach the VM subnet.
+          echo "[INFO] Adding route inside Kind container for ${VM_SUBNET}.0/24..."
+          docker exec "${KIND_CONTAINER}" \
+              ip route replace "${VM_SUBNET}.0/24" via 172.18.0.1
+
+          # Patch kindnet so CONTROL_PLANE_ENDPOINT uses the container IP instead
+          # of the hostname (which is unresolvable from the VM).
+          echo "[INFO] Patching kindnet DaemonSet for VM-reachable control plane endpoint..."
+          PATCH=$(cat <<EOF
+          {
+            "spec": {
+              "template": {
+                "spec": {
+                  "containers": [{
+                    "name": "kindnet-cni",
+                    "env": [
+                      {"name": "CONTROL_PLANE_ENDPOINT", "value": "${KIND_IP}:6443"}
+                    ]
+                  }]
+                }
+              }
+            }
+          }
+          EOF
+          )
+          kubectl -n kube-system patch daemonset kindnet \
+              --type=strategic -p "${PATCH}"
+
+          echo "[INFO] Waiting for kindnet rollout..."
+          kubectl -n kube-system rollout status daemonset/kindnet --timeout=60s
+
+      - name: Create QEMU VM
+        run: python3 ./hack/agent/e2e-kind/e2e.py create-vm
+
+      - name: Run agent to join VM to cluster
+        run: python3 ./hack/agent/e2e-kind/e2e.py run-agent
+
+      - name: Wait for node to become Ready
+        run: python3 ./hack/agent/e2e-kind/e2e.py wait-for-node
+
+      - name: Validate workload on agent node
+        run: python3 ./hack/agent/e2e-kind/e2e.py validate-workload
+
+      - name: Collect VM logs
+        if: always()
+        run: |
+          mkdir -p logs
+          VM_DIR=".vm-e2e"
+          # Collect VM serial console log
+          cp "${VM_DIR}/${VM_NAME}.log" logs/vm-serial.log 2>/dev/null || true
+          SSH="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -i ${VM_DIR}/ssh/id_ed25519 ubuntu@${VM_IP}"
+          # Collect full journal from the VM host (best-effort)
+          $SSH "sudo journalctl --no-pager -l" > logs/vm-journal.log 2>/dev/null || true
+          # Collect unbounded-agent logs from the VM host
+          $SSH "sudo journalctl -u unbounded-agent --no-pager -l" > logs/vm-unbounded-agent.log 2>/dev/null || true
+          # Kubelet and containerd run inside the nspawn container, not on
+          # the host.  Use 'journalctl -M <machine>' to read the container
+          # journal, and fall back to machinectl shell if that doesn't work.
+          MACHINE="${AGENT_MACHINE_NAME}"
+          $SSH "sudo journalctl -M ${MACHINE} --no-pager -l" > logs/nspawn-journal.log 2>/dev/null || true
+          $SSH "sudo journalctl -M ${MACHINE} -u kubelet --no-pager -l" > logs/nspawn-kubelet.log 2>/dev/null || true
+          $SSH "sudo journalctl -M ${MACHINE} -u containerd --no-pager -l" > logs/nspawn-containerd.log 2>/dev/null || true
+          # Also list running machines and their status
+          $SSH "sudo machinectl list --no-pager" > logs/vm-machines.txt 2>/dev/null || true
+          $SSH "sudo machinectl status ${MACHINE} --no-pager" > logs/vm-machine-status.txt 2>/dev/null || true
+          # List systemd units inside the container
+          $SSH "sudo machinectl shell ${MACHINE} /usr/bin/systemctl list-units --no-pager" > logs/nspawn-units.txt 2>/dev/null || true
+
+      - name: Collect cluster state
+        if: always()
+        run: |
+          mkdir -p logs
+          kubectl get nodes -o wide > logs/nodes.txt 2>&1 || true
+          kubectl describe nodes > logs/nodes-describe.txt 2>&1 || true
+          kubectl get pods -A -o wide > logs/pods.txt 2>&1 || true
+          kubectl get events -A --sort-by='.lastTimestamp' > logs/events.txt 2>&1 || true
+          # Collect kubelet logs from the Kind control-plane
+          docker exec kind-control-plane journalctl -u kubelet --no-pager -l > logs/kind-kubelet.log 2>&1 || true
+          # Collect kube-apiserver logs (critical for diagnosing TLS bootstrap / RBAC issues)
+          docker exec kind-control-plane crictl logs $(docker exec kind-control-plane crictl ps -a --name kube-apiserver -q 2>/dev/null | head -1) > logs/kube-apiserver.log 2>&1 || true
+          # Dump all ClusterRoleBindings to see what RBAC kubeadm/Kind created
+          kubectl get clusterrolebindings -o wide > logs/clusterrolebindings.txt 2>&1 || true
+          kubectl get clusterrolebindings -o yaml > logs/clusterrolebindings-full.yaml 2>&1 || true
+          # List CSRs to see if the kubelet attempted TLS bootstrap
+          kubectl get csr -o wide > logs/csrs.txt 2>&1 || true
+          kubectl describe csr > logs/csrs-describe.txt 2>&1 || true
+          # Dump bootstrap token secrets (redact token-secret values)
+          kubectl get secrets -n kube-system -l 'kubernetes.io/legacy-token-last-used' -o wide > logs/bootstrap-tokens.txt 2>&1 || true
+          kubectl get secrets -n kube-system --field-selector type=bootstrap.kubernetes.io/token -o yaml > logs/bootstrap-token-secrets.yaml 2>&1 || true
+          # Collect workload test pod details
+          kubectl describe pods -n e2e-workload-test > logs/workload-pods-describe.txt 2>&1 || true
+          kubectl logs -n e2e-workload-test --all-containers --prefix e2e-hello > logs/workload-hello.log 2>&1 || true
+          kubectl logs -n e2e-workload-test --all-containers --prefix e2e-dns-test > logs/workload-dns.log 2>&1 || true
+
+      - name: Upload logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: agent-e2e-kind-logs
+          path: logs/
+          retention-days: 30
+
+      - name: Cleanup
+        if: always()
+        run: python3 ./hack/agent/e2e-kind/e2e.py cleanup
