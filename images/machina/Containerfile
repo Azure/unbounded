@@ -30,7 +30,7 @@ RUN go mod download
 # Copy the rest of the source code
 COPY ../../ .
 
-RUN make machina
+RUN make machina-build
 
 # Runtime stage
 FROM mcr.microsoft.com/azurelinux/base/core:3.0

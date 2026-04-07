@@ -28,7 +28,7 @@ BLOB_CONTAINER ?= release
 
 KUBECTL_PLUGIN_PLATFORMS = linux-amd64 linux-arm64 darwin-amd64 darwin-arm64
 
-.PHONY: all help fmt lint test check-deps kubectl-unbounded kubectl-unbounded-cross krew-manifest forge inventory inventory-amd64 inventory-arm64 unbounded-agent machina machina-oci machina-oci-push machina-manifests metalman metalman-oci metalman-oci-push gomod push-blobs
+.PHONY: all help fmt lint test check-deps kubectl-unbounded kubectl-unbounded-cross krew-manifest forge inventory inventory-amd64 inventory-arm64 unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests metalman metalman-build metalman-oci metalman-oci-push gomod push-blobs
 
 ##@ General
 
@@ -117,11 +117,16 @@ inventory-arm64: test ## Build inventory for linux/arm64 (implies test)
 unbounded-agent: test ## Build the unbounded-agent for linux (implies test)
 	GOOS=linux $(GOBUILD) -o $(AGENT_BIN) $(AGENT_CMD)/main.go
 
-machina: test ## Build the machina controller (implies test)
+machina-build: machina-manifests ## Build the machina binary (no lint/test)
 	$(GOBUILD) -o $(MACHINA_BIN) $(MACHINA_CMD)/main.go
+
+machina: test machina-build ## Build the machina controller (implies test)
 
 METALMAN_BIN=bin/metalman
 METALMAN_CMD=./cmd/metalman
+
+metalman-build: ## Build the metalman binary (no lint/test)
+	$(GOBUILD) -o $(METALMAN_BIN) $(METALMAN_CMD)/main.go
 
 metalman: check-deps ## Format, lint, test, and build metalman
 	$(GOFMT) -w $(METALMAN_CMD) ./internal/metalman

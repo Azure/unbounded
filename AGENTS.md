@@ -23,8 +23,10 @@ unbounded-kube is organized into several directories:
 
 ## Building and Testing
 
-- To build `machina` use `make machina` which runs formatters, lint tests, go test and go build.
+- To build `machina` use `make machina` which runs formatters, lint, tests, and go build.
+- To build `machina` without lint/test use `make machina-build` (used in Containerfiles).
 - To build `metalman` use `make metalman` which runs formatters, lint, tests, and builds the binary.
+- To build `metalman` without lint/test use `make metalman-build` (used in Containerfiles).
 
 ## Coding Standards
 
