@@ -16,6 +16,7 @@ import (
 	"github.com/google/go-tpm-tools/simulator"
 	"github.com/google/go-tpm/tpm2"
 	"github.com/google/go-tpm/tpm2/transport"
+	"github.com/project-unbounded/unbounded-kube/internal/helpers"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -152,6 +153,10 @@ func (n *nonClosingTPM) Close() error { return nil }
 // call it without tearing down the simulator mid-test.
 func openSimulatorForE2E(t *testing.T) transport.TPMCloser {
 	t.Helper()
+
+	if !helpers.CgoEnabled {
+		t.Skipf("skipping because the TPU simulator requires CGO, which is disabled")
+	}
 
 	sim, err := simulator.Get()
 	require.NoError(t, err)
