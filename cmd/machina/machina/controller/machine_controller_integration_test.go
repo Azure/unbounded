@@ -105,7 +105,7 @@ func TestIntegration_FullProvisioningLifecycle(t *testing.T) {
 	t.Parallel()
 
 	s := newIntegrationScheme(t)
-	sshKeySecret := newSSHKeySecret("key")
+	sshKeySecret := newSSHKeySecret(t, "key")
 
 	bootstrapSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -243,7 +243,7 @@ func TestIntegration_JoiningStaysJoiningWithoutNode(t *testing.T) {
 	t.Parallel()
 
 	s := newIntegrationScheme(t)
-	sshKeySecret := newSSHKeySecret("key")
+	sshKeySecret := newSSHKeySecret(t, "key")
 
 	bootstrapSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -317,7 +317,7 @@ func TestIntegration_ProvisioningFailureThenRetry(t *testing.T) {
 	t.Parallel()
 
 	s := newIntegrationScheme(t)
-	sshKeySecret := newSSHKeySecret("key")
+	sshKeySecret := newSSHKeySecret(t, "key")
 
 	bootstrapSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -401,7 +401,7 @@ func TestIntegration_AddKubernetesConfigToReadyMachine(t *testing.T) {
 	t.Parallel()
 
 	s := newIntegrationScheme(t)
-	sshKeySecret := newSSHKeySecret("key")
+	sshKeySecret := newSSHKeySecret(t, "key")
 
 	bootstrapSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -469,7 +469,7 @@ func TestIntegration_JoiningMachineBecomesUnreachable(t *testing.T) {
 	t.Parallel()
 
 	s := newIntegrationScheme(t)
-	sshKeySecret := newSSHKeySecret("key")
+	sshKeySecret := newSSHKeySecret(t, "key")
 
 	bootstrapSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -545,7 +545,7 @@ func TestIntegration_MultipleMachines(t *testing.T) {
 	t.Parallel()
 
 	s := newIntegrationScheme(t)
-	sshKeySecret := newSSHKeySecret("key")
+	sshKeySecret := newSSHKeySecret(t, "key")
 
 	bootstrapSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -738,7 +738,7 @@ func TestIntegration_ConditionTransitions(t *testing.T) {
 	t.Parallel()
 
 	s := newIntegrationScheme(t)
-	sshKeySecret := newSSHKeySecret("key")
+	sshKeySecret := newSSHKeySecret(t, "key")
 
 	bootstrapSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -828,7 +828,7 @@ func TestIntegration_ProvisioningWithBootstrapToken(t *testing.T) {
 	t.Parallel()
 
 	s := newIntegrationScheme(t)
-	sshKeySecret := newSSHKeySecret("key")
+	sshKeySecret := newSSHKeySecret(t, "key")
 
 	bootstrapSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -887,7 +887,7 @@ func TestIntegration_BootstrapTokenMissing(t *testing.T) {
 	t.Parallel()
 
 	s := newIntegrationScheme(t)
-	sshKeySecret := newSSHKeySecret("key")
+	sshKeySecret := newSSHKeySecret(t, "key")
 
 	machine := &unboundedv1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "m1"},
@@ -936,7 +936,7 @@ func TestIntegration_JoiningToReadyToJoining(t *testing.T) {
 	t.Parallel()
 
 	s := newIntegrationScheme(t)
-	sshKeySecret := newSSHKeySecret("key")
+	sshKeySecret := newSSHKeySecret(t, "key")
 
 	bootstrapSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1050,7 +1050,7 @@ func TestIntegration_ReadyMachineBecomesUnreachable(t *testing.T) {
 	t.Parallel()
 
 	s := newIntegrationScheme(t)
-	sshKeySecret := newSSHKeySecret("key")
+	sshKeySecret := newSSHKeySecret(t, "key")
 
 	bootstrapSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{

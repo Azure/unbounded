@@ -89,14 +89,16 @@ func defaultKubernetes() *unboundedv1alpha3.KubernetesSpec {
 	}
 }
 
-func newSSHKeySecret(name string) *corev1.Secret {
+func newSSHKeySecret(t *testing.T, name string) *corev1.Secret {
+	t.Helper()
+
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: SecretNamespaceMachinaSystem,
 		},
 		Data: map[string][]byte{
-			"ssh-privatekey": []byte(testRSAPrivateKey),
+			"ssh-privatekey": generateTestSSHKeyPEM(t),
 		},
 	}
 }
@@ -138,34 +140,15 @@ func findCondition(conditions []metav1.Condition, condType string) *metav1.Condi
 	return nil
 }
 
-// DO NOT use this key for anything other than testing.
-const testRSAPrivateKey = `-----BEGIN OPENSSH PRIVATE KEY-----
-b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABFwAAAAdzc2gtcn
-NhAAAAAwEAAQAAAQEAlmJuT3YxODWuH1okayWYjtyNAYSbbC2BcJ5fJz+t498f0sUbhKmH
-wYyJRrNnhsZtSzsWmxLQff55+UFjBKcRYjLryqQ2ga+xqRSWSNqbrEIgENz5Nn4+1wSYzd
-TInK1WYL6MRYr8+4PwNWMV++08Wp3dGQAr+caLoQ6Ei25mCy9KH/1rfd6e214JDFpIulTt
-DHRQH8BtSCEt9FW8G97lj4xGFYsWi7zFrqckJ8D7MHGG0nO7xuSpFZ6HnrlCG7ABe2Iqkf
-RfvAhgb+UBL0XiBOLVEvuzdty1dBcOQhTwuFXetkvzzY3t3v0m8+x3xIq28BpJ13AgSatk
-vAj7DVb07wAAA9DH7Mphx+zKYQAAAAdzc2gtcnNhAAABAQCWYm5PdjE4Na4fWiRrJZiO3I
-0BhJtsLYFwnl8nP63j3x/SxRuEqYfBjIlGs2eGxm1LOxabEtB9/nn5QWMEpxFiMuvKpDaB
-r7GpFJZI2pusQiAQ3Pk2fj7XBJjN1MicrVZgvoxFivz7g/A1YxX77Txand0ZACv5xouhDo
-SLbmYLL0of/Wt93p7bXgkMWki6VO0MdFAfwG1IIS30Vbwb3uWPjEYVixaLvMWupyQnwPsw
-cYbSc7vG5KkVnoeeuUIbsAF7YiqR9F+8CGBv5QEvReIE4tUS+7N23LV0Fw5CFPC4Vd62S/
-PNje3e/Sbz7HfEirbwGknXcCBJq2S8CPsNVvTvAAAAAwEAAQAAAQAQT7/gTZUcIDJxQyFF
-H/BSuphuzDfhfXQXR45RnwYY+9gjT+7irlLDyx8OtKHri/VJ3jBfBKTpraMERrPbStXHXX
-eW5MXmvixahxmf8FpHTmrU+WrsnrfpMZ3zYXubBvAiETj8yA0VqONynvtA9qP/vjS/o/Wh
-I4h8oSr+Rqy51K419o2mRJGxWK2ynp6AMZzL98SHsrCCRNvVIEQqV8l9vgHTc2n4RaZ4lT
-4Q6HS1oO67yQ9JOXfD0o5ly1xlF7KcrVkForipFDUfgsT87Rs7qdl2oilyelhIHYWPBCcT
-GP8P+FDA9eK21hrk7CaY24fKLWWZmFTF2y3OsQ6lVRgJAAAAgQDEjXTSejDhjC/iJKfqyi
-Kk1bLLReSRvFlix92wLjKCZxtiKV0mt9H4SwITKW+YZVZOoMHNhYZR170MMTLIOxcSHq/K
-HqCJyVGzCATBzMY+AX9JdrhRKrVahHup/BTuigYBE3l/lJp2W4P58S8Ylew1AqqjUnz1nL
-zeaMNvnDfPUgAAAIEAyIN3/vdxQNWw8xFDglqiAA8IquH0Igu68jmaa8QBgRWm0XwaLT93
-mli2OGXYqvJNUyPy5awVDROmz1izDrHmOCycFXnHKw7RvRVAVC6sh7758pnilq4vCsFiOM
-IkHn9FMGu517Y+Oa00sDWSmGcep9F/Sc5cNnXpCV71Ut2/hZkAAACBAL//yDlyYMOZuypa
-gzlxW/17KIjvrWxQyaBMAWcwjt8i2jeFwE4qDaVpgbBP7MHA3ULDaph50p3shzl+jkCBdq
-2wqL4Rr3kSqt0OsfuTflrgJsA1ArWVPbE8ZFst8vFUTn3kBwlfS/hgpIzkBO9DtD4E8Hew
-j0yoopZbn4UqwdPHAAAAE3BoaWxAd29ya2JveC1jYW13aW4BAgMEBQYH
------END OPENSSH PRIVATE KEY-----`
+// generateTestSSHKeyPEM creates a fresh RSA private key in PEM format for testing.
+// It uses generateTestRSAKey and marshalPrivateKeyPEM from ssh_integration_test.go.
+func generateTestSSHKeyPEM(t *testing.T) []byte {
+	t.Helper()
+
+	key, _ := generateTestRSAKey(t)
+
+	return marshalPrivateKeyPEM(t, key)
+}
 
 // ---------------------------------------------------------------------------
 // Reconcile tests
@@ -305,7 +288,7 @@ func TestMachineReconciler_Provisioning_Success(t *testing.T) {
 	s := newTestScheme(t)
 
 	machine := newTestMachine("test-machine", "10.0.0.1:22", "testuser", defaultKubernetes())
-	sshSecret := newSSHKeySecret("ssh-key-secret")
+	sshSecret := newSSHKeySecret(t, "ssh-key-secret")
 	bootstrapSecret := newBootstrapTokenSecret("bootstrap-token-abc123")
 
 	fakeClient := fake.NewClientBuilder().
@@ -363,7 +346,7 @@ func TestMachineReconciler_Provisioning_SetsAgentStatus(t *testing.T) {
 		Image: "ghcr.io/project-unbounded/rootfs:v1.0.0",
 	}
 
-	sshSecret := newSSHKeySecret("ssh-key-secret")
+	sshSecret := newSSHKeySecret(t, "ssh-key-secret")
 	bootstrapSecret := newBootstrapTokenSecret("bootstrap-token-abc123")
 
 	fakeClient := fake.NewClientBuilder().
@@ -406,7 +389,7 @@ func TestMachineReconciler_Provisioning_NoAgentSpec_NilAgentStatus(t *testing.T)
 	machine := newTestMachine("test-machine", "10.0.0.1:22", "testuser", defaultKubernetes())
 	// No Agent spec set.
 
-	sshSecret := newSSHKeySecret("ssh-key-secret")
+	sshSecret := newSSHKeySecret(t, "ssh-key-secret")
 	bootstrapSecret := newBootstrapTokenSecret("bootstrap-token-abc123")
 
 	fakeClient := fake.NewClientBuilder().
@@ -445,7 +428,7 @@ func TestMachineReconciler_Provisioning_ProvisionerFails(t *testing.T) {
 	s := newTestScheme(t)
 
 	machine := newTestMachine("test-machine", "10.0.0.1:22", "testuser", defaultKubernetes())
-	sshSecret := newSSHKeySecret("ssh-key-secret")
+	sshSecret := newSSHKeySecret(t, "ssh-key-secret")
 	bootstrapSecret := newBootstrapTokenSecret("bootstrap-token-abc123")
 
 	fakeClient := fake.NewClientBuilder().
@@ -555,7 +538,7 @@ func TestMachineReconciler_Provisioning_BootstrapTokenSecretMissing(t *testing.T
 	s := newTestScheme(t)
 
 	machine := newTestMachine("test-machine", "10.0.0.1:22", "testuser", defaultKubernetes())
-	sshSecret := newSSHKeySecret("ssh-key-secret")
+	sshSecret := newSSHKeySecret(t, "ssh-key-secret")
 	// No bootstrap token secret created.
 
 	fakeClient := fake.NewClientBuilder().
@@ -740,7 +723,7 @@ func TestMachineReconciler_Provisioning_RetryFromFailed(t *testing.T) {
 		Message: "Previous provisioning failed",
 	}
 
-	sshSecret := newSSHKeySecret("ssh-key-secret")
+	sshSecret := newSSHKeySecret(t, "ssh-key-secret")
 	bootstrapSecret := newBootstrapTokenSecret("bootstrap-token-abc123")
 
 	fakeClient := fake.NewClientBuilder().
@@ -905,7 +888,7 @@ func TestBuildSSHConfig(t *testing.T) {
 	t.Run("builds valid SSH config", func(t *testing.T) {
 		t.Parallel()
 
-		sshSecret := newSSHKeySecret("ssh-key-secret")
+		sshSecret := newSSHKeySecret(t, "ssh-key-secret")
 
 		fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(sshSecret).Build()
 		reconciler := &MachineReconciler{Client: fakeClient, Scheme: s}
@@ -922,7 +905,7 @@ func TestBuildSSHConfig(t *testing.T) {
 	t.Run("defaults to azureuser when username is empty", func(t *testing.T) {
 		t.Parallel()
 
-		sshSecret := newSSHKeySecret("ssh-key-secret")
+		sshSecret := newSSHKeySecret(t, "ssh-key-secret")
 
 		fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(sshSecret).Build()
 		reconciler := &MachineReconciler{Client: fakeClient, Scheme: s}
