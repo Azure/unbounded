@@ -1,0 +1,36 @@
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # Group all action updates into a single PR.
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # Group Go module updates by package prefix.
+    groups:
+      azure:
+        patterns:
+          - "github.com/Azure/*"
+      golang:
+        patterns:
+          - "golang.org/*"
+      kubernetes:
+        patterns:
+          - "k8s.io/*"
+          - "sigs.k8s.io/*"
+      everything-else:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "github.com/Azure/*"
+          - "golang.org/*"
+          - "k8s.io/*"
+          - "sigs.k8s.io/*"
