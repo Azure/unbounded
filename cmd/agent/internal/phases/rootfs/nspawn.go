@@ -1,10 +1,12 @@
 package rootfs
 
 import (
+	"bytes"
 	"context"
-	_ "embed"
+	"embed"
 	"fmt"
 	"log/slog"
+	"text/template"
 
 	"github.com/project-unbounded/unbounded-kube/cmd/agent/internal/goalstates"
 	"github.com/project-unbounded/unbounded-kube/cmd/agent/internal/phases"
@@ -13,11 +15,12 @@ import (
 	"github.com/project-unbounded/unbounded-kube/cmd/agent/internal/utilio"
 )
 
-//go:embed assets/nspawn.conf
-var nspawnConfig []byte
+//go:embed assets/nspawn.conf assets/service-override.conf
+var nspawnAssets embed.FS
 
-//go:embed assets/service-override.conf
-var serviceOverrideConfig []byte
+var nspawnTemplates = template.Must(
+	template.New("nspawn").ParseFS(nspawnAssets, "assets/nspawn.conf", "assets/service-override.conf"),
+)
 
 type ensureNSpawnWorkspace struct {
 	log       *slog.Logger
@@ -39,14 +42,8 @@ func (e *ensureNSpawnWorkspace) Do(ctx context.Context) error {
 		return fmt.Errorf("bootstrap machine directory %s: %w", e.goalState.MachineDir, err)
 	}
 
-	// Write the .nspawn configuration file.
-	if err := utilio.WriteFile(e.goalState.NSpawnConfigFile, nspawnConfig, 0o644); err != nil {
-		return fmt.Errorf("write nspawn config %s: %w", e.goalState.NSpawnConfigFile, err)
-	}
-
-	// Write the systemd service override drop-in.
-	if err := utilio.WriteFile(e.goalState.ServiceOverrideFile, serviceOverrideConfig, 0o644); err != nil {
-		return fmt.Errorf("write service override %s: %w", e.goalState.ServiceOverrideFile, err)
+	if err := e.writeNSpawnConfigs(); err != nil {
+		return err
 	}
 
 	return nil
@@ -62,4 +59,40 @@ func (e *ensureNSpawnWorkspace) bootstrapWorkspace(ctx context.Context) error {
 	}
 
 	return phases.ExecuteTask(ctx, e.log, bootstrapTask)
+}
+
+// writeNSpawnConfigs renders the nspawn and service-override templates with GPU
+// device data (when present) and writes them to their configured paths.
+func (e *ensureNSpawnWorkspace) writeNSpawnConfigs() error {
+	templateData := map[string]any{
+		"NvidiaGPUDevicePaths": e.goalState.Nvidia.GPUDevicePaths,
+		"NvidiaLibDirMounts":   e.goalState.Nvidia.LibDirMounts,
+	}
+
+	if len(e.goalState.Nvidia.GPUDevicePaths) > 0 {
+		e.log.Info("GPU devices detected, configuring nspawn bind-mounts",
+			"count", len(e.goalState.Nvidia.GPUDevicePaths))
+	}
+
+	// Render and write the .nspawn configuration file.
+	nspawnBuf := &bytes.Buffer{}
+	if err := nspawnTemplates.ExecuteTemplate(nspawnBuf, "nspawn.conf", templateData); err != nil {
+		return fmt.Errorf("render nspawn config template: %w", err)
+	}
+
+	if err := utilio.WriteFile(e.goalState.NSpawnConfigFile, nspawnBuf.Bytes(), 0o644); err != nil {
+		return fmt.Errorf("write nspawn config %s: %w", e.goalState.NSpawnConfigFile, err)
+	}
+
+	// Render and write the systemd service override drop-in.
+	overrideBuf := &bytes.Buffer{}
+	if err := nspawnTemplates.ExecuteTemplate(overrideBuf, "service-override.conf", templateData); err != nil {
+		return fmt.Errorf("render service override template: %w", err)
+	}
+
+	if err := utilio.WriteFile(e.goalState.ServiceOverrideFile, overrideBuf.Bytes(), 0o644); err != nil {
+		return fmt.Errorf("write service override %s: %w", e.goalState.ServiceOverrideFile, err)
+	}
+
+	return nil
 }

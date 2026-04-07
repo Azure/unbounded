@@ -60,11 +60,6 @@ func (b *ubuntu) Do(ctx context.Context) error {
 		"procps",
 		"nano",
 		"wireguard-tools",
-		// FIXME: cannot install linux headers here even with
-		//   --extra-suites=noble noble-updates noble-security noble-backports
-		// seeing error when trying to install libpam-modules-bin
-		// Deferring this step to nodestart phase for now
-		// "linux-headers-" + hostKernel,
 	}
 
 	if err := utilexec.RunCmd(ctx, b.log, debootstrapCmd,

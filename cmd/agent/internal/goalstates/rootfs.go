@@ -21,5 +21,8 @@ type RootFS struct {
 	// matching the host architecture.
 	OCIImage string
 
-	// TODO: declare GPU device & driver settings
+	// Nvidia holds NVIDIA GPU state discovered on the host: device paths,
+	// driver library mappings, and bind-mount specifications for the nspawn
+	// container. Empty on non-GPU hosts.
+	Nvidia NvidiaHost
 }

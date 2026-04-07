@@ -52,8 +52,8 @@ type configureOS struct {
 
 // ConfigureOS returns a task that writes OS-level configuration files into the machine rootfs
 // so that kubelet and container networking work correctly inside systemd-nspawn.
-// This includes an arch-specific apt sources.list so that packages (e.g.
-// linux-headers) can be installed inside the machine during the nodestart phase.
+// This includes an arch-specific apt sources.list so that packages can be
+// installed inside the machine during the nodestart phase.
 //
 // NOTE: The apt sources are hard-coded to Ubuntu Noble at this moment.
 func ConfigureOS(goalState *goalstates.RootFS) phases.Task {

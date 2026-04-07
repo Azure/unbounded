@@ -2,6 +2,7 @@ package goalstates
 
 import "path/filepath"
 
+// Containerd describes the containerd configuration goal state.
 type Containerd struct {
 	SandboxImage      string
 	ContainerdBinPath string
@@ -12,14 +13,8 @@ type Containerd struct {
 	NvidiaRuntime     NvidiaRuntime
 }
 
-type NvidiaRuntime struct {
-	Enabled                    bool
-	RuntimeClassName           string
-	RuntimePath                string
-	DisableSetAsDefaultRuntime bool
-}
-
-func DefaultContainerd() Containerd {
+// ResolveContainerd returns the containerd configuration goal state.
+func ResolveContainerd() Containerd {
 	return Containerd{
 		SandboxImage:      SandboxImage,
 		ContainerdBinPath: filepath.Join("/"+BinDir, "containerd"),
@@ -27,11 +22,6 @@ func DefaultContainerd() Containerd {
 		CNIBinDir:         CNIBinDir,
 		CNIConfDir:        CNIConfigDir,
 		MetricsAddress:    ContainerdMetricsAddress,
-		NvidiaRuntime: NvidiaRuntime{
-			Enabled:                    false,
-			RuntimeClassName:           NvidiaRuntimeClassName,
-			RuntimePath:                NvidiaContainerRuntimePath,
-			DisableSetAsDefaultRuntime: false,
-		},
+		NvidiaRuntime:     resolveNvidiaRuntime(),
 	}
 }

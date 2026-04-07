@@ -46,7 +46,7 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 				return err
 			}
 
-			nodeStartGoalState, err := resolveNodeStartGoalState(cfg)
+			nodeStartGoalState, err := resolveNodeStartGoalState(cfg, rootFSGoalState.Nvidia)
 			if err != nil {
 				return err
 			}
@@ -82,7 +82,7 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 					nodestart.ConfigureKubelet(nodeStartGoalState),
 				),
 				nodestart.StartNSpawnMachine(log, nodeStartGoalState),
-				nodestart.InstallKernelHeader(log, nodeStartGoalState),
+				nodestart.SetupNVIDIA(log, nodeStartGoalState),
 				nodestart.StartContainerd(log, nodeStartGoalState),
 				nodestart.StartKubelet(log, nodeStartGoalState),
 			).Do(ctx)
@@ -119,6 +119,11 @@ func resolveRootFSGoalState(cfg *provision.AgentConfig) (*goalstates.RootFS, err
 		ociImage = strings.TrimSpace(os.Getenv("AGENT_OCI_IMAGE"))
 	}
 
+	nvidia, err := goalstates.ResolveNvidiaHost(runtime.GOARCH)
+	if err != nil {
+		return nil, err
+	}
+
 	return &goalstates.RootFS{
 		MachineDir: filepath.Join("/var/lib/machines", machineName),
 		NSpawnConfigFile: filepath.Join(
@@ -138,17 +143,13 @@ func resolveRootFSGoalState(cfg *provision.AgentConfig) (*goalstates.RootFS, err
 		CNIPluginVersion:  goalstates.CNIPluginVersion,  // FIXME: allow overriding
 		KubernetesVersion: kubeVersion,
 		OCIImage:          ociImage,
+		Nvidia:            nvidia,
 	}, nil
 }
 
 // ref: cmd/machina/machina/controller/machine_controller.go
-func resolveNodeStartGoalState(cfg *provision.AgentConfig) (*goalstates.NodeStart, error) {
+func resolveNodeStartGoalState(cfg *provision.AgentConfig, nvidia goalstates.NvidiaHost) (*goalstates.NodeStart, error) {
 	machineName := cfg.MachineName
-
-	kernel, err := hostKernel() //nolint:staticcheck // SA4023: non-Linux stub always errors; this is intentional.
-	if err != nil {             //nolint:staticcheck // SA4023: see above.
-		return nil, err
-	}
 
 	kubelet, err := resolveKubeletGoalState(cfg)
 	if err != nil {
@@ -158,9 +159,9 @@ func resolveNodeStartGoalState(cfg *provision.AgentConfig) (*goalstates.NodeStar
 	return &goalstates.NodeStart{
 		MachineName: machineName,
 		MachineDir:  filepath.Join("/var/lib/machines", machineName),
-		HostKernel:  kernel,
-		Containerd:  goalstates.DefaultContainerd(),
+		Containerd:  goalstates.ResolveContainerd(),
 		Kubelet:     kubelet,
+		Nvidia:      nvidia,
 	}, nil
 }
 
