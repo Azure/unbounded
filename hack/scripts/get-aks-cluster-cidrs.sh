@@ -80,36 +80,52 @@ if [[ -z "$OPT_SUBSCRIPTION" ]] || [[ -z "$OPT_RESOURCE_GROUP" ]] || [[ -z "$OPT
   [[ "$PROVIDER_ID" == azure://* ]] \
     || die "not an AKS cluster (providerID: $PROVIDER_ID). This script supports AKS only."
 
-  read -r DETECTED_SUB DETECTED_NODE_RG DETECTED_RG DETECTED_CLUSTER DETECTED_LOCATION < <(
-    # Extract subscription and node resource group from the providerID path.
-    # Format: azure:///subscriptions/{sub}/resourceGroups/{nodeRG}/...
-    remainder="${PROVIDER_ID#azure:///subscriptions/}"
-    DETECTED_SUB="${remainder%%/*}"
-    remainder="${remainder#*/resourceGroups/}"
-    node_rg="${remainder%%/*}"
+  # Extract subscription and node resource group from the providerID path.
+  # Format: azure:///subscriptions/{sub}/resourceGroups/{nodeRG}/...
+  remainder="${PROVIDER_ID#azure:///subscriptions/}"
+  DETECTED_SUB="${remainder%%/*}"
+  remainder="${remainder#*/resourceGroups/}"
+  DETECTED_NODE_RG="${remainder%%/*}"
 
-    # AKS node resource group convention: MC_{rg}_{cluster}_{location}
-    node_rg_lower="${node_rg,,}"
-    if [[ "$node_rg_lower" != mc_* ]]; then
-      echo "" "" "" "" ""
-    else
-      inner="${node_rg:3}"   # strip leading "MC_" or "mc_"
-      # Split on '_'; location=last, cluster=second-to-last, rg=everything before.
-      IFS='_' read -ra parts <<< "$inner"
-      n="${#parts[@]}"
-      if [[ $n -lt 3 ]]; then
-        echo "" "" "" "" ""
-      else
-        location="${parts[$((n-1))]}"
-        cluster="${parts[$((n-2))]}"
-        rg="${parts[*]:0:$((n-2))}"
-        rg="${rg// /_}"
-        echo "$DETECTED_SUB" "$node_rg" "$rg" "$cluster" "$location"
-      fi
+  [[ -z "$DETECTED_SUB" ]] && die "could not parse subscription from providerID '$PROVIDER_ID'. Pass --subscription explicitly."
+  [[ -z "$DETECTED_NODE_RG" ]] && die "could not parse node resource group from providerID '$PROVIDER_ID'. Pass --resource-group and --cluster-name explicitly."
+
+  DETECTED_RG=""
+  DETECTED_CLUSTER=""
+  DETECTED_LOCATION=""
+
+  # Strategy 1: Try the AKS node resource group convention MC_{rg}_{cluster}_{location}.
+  node_rg_lower="${DETECTED_NODE_RG,,}"
+  if [[ "$node_rg_lower" == mc_* ]]; then
+    inner="${DETECTED_NODE_RG:3}"   # strip leading "MC_" or "mc_"
+    # Split on '_'; location=last, cluster=second-to-last, rg=everything before.
+    IFS='_' read -ra parts <<< "$inner"
+    n="${#parts[@]}"
+    if [[ $n -ge 3 ]]; then
+      DETECTED_LOCATION="${parts[$((n-1))]}"
+      DETECTED_CLUSTER="${parts[$((n-2))]}"
+      DETECTED_RG="${parts[*]:0:$((n-2))}"
+      DETECTED_RG="${DETECTED_RG// /_}"
     fi
-  )
+  fi
 
-  [[ -z "$DETECTED_SUB" ]] && die "could not parse providerID '$PROVIDER_ID'. Pass --subscription, --resource-group, and --cluster-name explicitly."
+  # Strategy 2: If MC_ parsing didn't work, query Azure for the AKS cluster
+  # whose nodeResourceGroup matches what we extracted from the providerID.
+  if [[ -z "$DETECTED_RG" ]] || [[ -z "$DETECTED_CLUSTER" ]]; then
+    echo "Node resource group '$DETECTED_NODE_RG' does not follow the MC_ convention. Querying Azure for cluster identity..."
+    mapfile -t _cluster_info < <(
+      az aks list \
+        --subscription "$DETECTED_SUB" \
+        --query "[?nodeResourceGroup=='${DETECTED_NODE_RG}'] | [0].[resourceGroup, name, location]" \
+        --output tsv 2>/dev/null || true
+    )
+    DETECTED_RG="${_cluster_info[0]:-}"
+    DETECTED_CLUSTER="${_cluster_info[1]:-}"
+    DETECTED_LOCATION="${_cluster_info[2]:-}"
+  fi
+
+  [[ -z "$DETECTED_RG" ]] || [[ -z "$DETECTED_CLUSTER" ]] && \
+    die "could not detect AKS cluster for node resource group '$DETECTED_NODE_RG'. Pass --subscription, --resource-group, and --cluster-name explicitly."
 
   SUB="${OPT_SUBSCRIPTION:-$DETECTED_SUB}"
   NODE_RG="$DETECTED_NODE_RG"
@@ -150,7 +166,11 @@ mapfile -t _cidrs < <(az aks show \
 POD_CIDR="${_cidrs[0]:-}"
 SERVICE_CIDR="${_cidrs[1]:-}"
 
-[[ -z "$POD_CIDR" ]]     && die "could not determine pod CIDR from AKS network profile. Pass --cluster-pod-cidr explicitly to kubectl unbounded site init."
+# Azure CLI returns the literal string "None" for null values in tsv output.
+[[ "$POD_CIDR" == "None" ]]     && POD_CIDR=""
+[[ "$SERVICE_CIDR" == "None" ]] && SERVICE_CIDR=""
+
+[[ -z "$POD_CIDR" ]]     && die "cluster has no pod CIDR in its network profile (possibly BYO CNI). Pass --cluster-pod-cidr explicitly to kubectl unbounded site init."
 [[ -z "$SERVICE_CIDR" ]] && die "could not determine service CIDR from AKS network profile. Pass --cluster-service-cidr explicitly to kubectl unbounded site init."
 
 # ip4_to_int <a.b.c.d> — print the IPv4 address as a decimal integer.
@@ -181,7 +201,8 @@ subnet_contains_all() {
 echo "Fetching VNet subnets from node resource group..."
 
 NODE_IPS=$(kubectl "${KUBECTL_CTX_ARGS[@]}" get nodes \
-  -o jsonpath='{range .items[*]}{range .status.addresses[?(@.type=="InternalIP")]}{.address}{"\n"}{end}{end}')
+  -o jsonpath='{range .items[?(@.spec.providerID)]}{range .status.addresses[?(@.type=="InternalIP")]}{.address}{"\n"}{end}{end}' \
+  | grep -v '^$')
 
 [[ -z "$NODE_IPS" ]] && die "could not retrieve node internal IPs."
 

@@ -1,10 +1,15 @@
 {{ define "main" }}
 <section class="hero">
-  <h1>{{ .Site.Title }}</h1>
-  <p class="tagline tagline-answer">
+  <h1 class="hero-title">Kubernetes Without Boundaries</h1>
+  <p class="tagline">
     Add any Linux machine to your Kubernetes cluster &mdash; cloud, on-prem,
     bare metal, or edge &mdash; no matter where it lives or what network it's on.
   </p>
+  <div class="hero-diagram">
+    <img src="{{ "img/unbounded-overview.svg" | relURL }}"
+         alt="Three sites — bare metal, public cloud, and AI infrastructure — connected to a central Kubernetes control plane through WireGuard tunnels and direct L3 links."
+         width="960" height="480" />
+  </div>
   <div class="hero-links">
     <a href="{{ "guides/getting-started/" | relURL }}" class="btn btn-primary">Get Started</a>
     <a href="{{ "concepts/" | relURL }}" class="btn btn-secondary">Learn the Concepts</a>

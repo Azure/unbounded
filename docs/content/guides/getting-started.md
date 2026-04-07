@@ -1,142 +1,259 @@
 ---
 title: "Getting Started"
 weight: 1
-description: "Install Unbounded Kube and join your first remote node."
+description: "Create an AKS cluster with Unbounded Kube and join your first remote node."
 ---
 
-## Prerequisites
+This guide creates an AKS cluster configured for Unbounded Kube and joins a
+remote node to it. You'll have a working multi-site cluster in a few minutes.
 
-1. A Kubernetes cluster that you have access to via a `kubeconfig` file.
-   Developers are encouraged to use the [Forge](https://github.com/project-unbounded/unbounded-kube/tree/main/hack/cmd/forge) tool for development and testing, but any cluster works.
-2. One or more cluster nodes with `UDP/51820-51899` open for WireGuard connectivity, labeled as gateway nodes.
-3. Remote machines reachable via SSH.
+![Quickstart architecture: AKS cluster with gateway nodes connected to a remote site over WireGuard](../../img/quickstart-architecture.svg)
 
-## Install kubectl-unbounded
+> Already have a Kubernetes cluster? See the
+> [Bring Your Own Cluster]({{< relref "guides/existing-cluster" >}}) guide.
 
-Download the latest release for your platform from the [releases page](https://github.com/project-unbounded/unbounded-kube/releases/latest):
+## What You'll Do
+
+1. **[Install the prerequisites](#1-install-the-prerequisites)** -- az CLI, kubectl, and the unbounded plugin
+2. **[Create the cluster](#2-create-the-cluster)** -- one command to create AKS with gateways
+3. **[Add a remote node](#3-add-a-remote-node)** -- pipe a bootstrap script over SSH
+4. **[Verify connectivity](#4-verify-connectivity)** -- watch the node join
+
+---
+
+## 1. Install the Prerequisites
+
+> **You'll need:** An Azure subscription, a terminal, and a remote Linux machine
+> (x86_64 or arm64) with SSH access.
+
+Install the Azure CLI, kubectl, and the unbounded kubectl plugin:
 
 ```bash
-# Linux (amd64)
-curl -L https://github.com/project-unbounded/unbounded-kube/releases/latest/download/kubectl-unbounded-linux-amd64.tar.gz | tar -xz
+# Azure CLI
+curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+az login
+
+# kubectl
+az aks install-cli
+
+# kubectl-unbounded (Linux amd64)
+curl -sL https://github.com/project-unbounded/unbounded-kube/releases/latest/download/kubectl-unbounded-linux-amd64.tar.gz | tar xz
 sudo mv kubectl-unbounded /usr/local/bin/
+```
 
-# macOS (Apple Silicon)
-curl -L https://github.com/project-unbounded/unbounded-kube/releases/latest/download/kubectl-unbounded-darwin-arm64.tar.gz | tar -xz
+<details>
+<summary>macOS (Apple Silicon)</summary>
+
+```bash
+# kubectl-unbounded (macOS arm64)
+curl -sL https://github.com/project-unbounded/unbounded-kube/releases/latest/download/kubectl-unbounded-darwin-arm64.tar.gz | tar xz
 sudo mv kubectl-unbounded /usr/local/bin/
-
-# verify
-kubectl unbounded --help
 ```
 
-## Prepare Gateway Nodes
+</details>
 
-Before initializing a site, at least one cluster node must be labeled as a
-WireGuard gateway. Open `UDP/51820-51899` on the node and then label it:
+Verify:
 
 ```bash
-kubectl label node <node-name> "unbounded-kube.io/unbounded-net-gateway=true"
+az version && kubectl version --client && kubectl unbounded --help
 ```
 
-`kubectl unbounded site init` will verify that a labeled gateway node exists
-and will fail with an error if none is found.
+---
 
-## Initialize a Site
+## 2. Create the Cluster
 
-A **Site** represents a remote location where external machines are hosted.
-The `kubectl unbounded site init` command bootstraps everything needed to
-connect a site to your cluster: it installs the unbounded-net CNI plugin,
-creates site resources, generates a bootstrap token, configures kubeadm
-RBAC/ConfigMaps, and installs the machina controller.
+Download and run the quickstart script:
 
 ```bash
-kubectl unbounded site init \
-    --name my-site \
-    --cluster-node-cidr 10.224.0.0/16 \
-    --cluster-pod-cidr 10.244.0.0/16 \
-    --node-cidr 10.225.0.0/16 \
-    --pod-cidr 10.245.0.0/16
+curl -fsSLO https://raw.githubusercontent.com/project-unbounded/unbounded-kube/main/hack/scripts/aks-quickstart.sh
+chmod +x aks-quickstart.sh
+
+./aks-quickstart.sh create \
+    --name my-unbounded \
+    --location eastus \
+    --remote-node-cidr 192.168.1.0/24 \
+    --remote-pod-cidr 10.245.0.0/16
 ```
 
-### Required flags
+> **This takes about 8 minutes.** The script creates an AKS cluster, adds a
+> gateway node pool, and runs `kubectl unbounded site init` to install the
+> networking stack.
 
 | Flag | Description |
 |------|-------------|
-| `--name` | Name of the site |
-| `--cluster-node-cidr` | CIDR used by the cluster for node IPs |
-| `--cluster-pod-cidr` | CIDR used by the cluster for pod IPs |
-| `--node-cidr` | CIDR to assign to node IPs at this site |
-| `--pod-cidr` | CIDR to assign to pod IPs at this site |
+| `--name` | Cluster name (also used as the Azure resource group) |
+| `--location` | Azure region |
+| `--remote-node-cidr` | Subnet of your remote machines (e.g. `192.168.1.0/24`). Must not overlap with the AKS VNet. |
+| `--remote-pod-cidr` | IP range to allocate for pods at the remote site (e.g. `10.245.0.0/16`). Must not overlap with the cluster's pod or service CIDRs. |
 
-### Optional flags
+<details>
+<summary>All options</summary>
 
-| Flag | Description |
-|------|-------------|
-| `--kubeconfig` | Path to kubeconfig file |
-| `--cni-manifests` | Path or HTTPS URL to CNI manifests (defaults to a known release) |
-| `--machina-manifests` | Path or HTTPS URL to machina manifests (uses embedded manifests if omitted) |
-| `--cluster-service-cidr` | Service CIDR of the cluster (derived from kube-dns if omitted) |
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--name` | *(required)* | Cluster name |
+| `--resource-group` | same as `--name` | Azure resource group |
+| `--location` | `canadacentral` | Azure region |
+| `--k8s-version` | AKS default | Kubernetes version |
+| `--system-pool-sku` | `Standard_D2ads_v6` | System pool VM size |
+| `--system-pool-count` | `2` | System pool node count |
+| `--gateway-pool-sku` | `Standard_D2ads_v6` | Gateway pool VM size |
+| `--gateway-pool-count` | `2` | Gateway pool node count |
+| `--service-cidr` | `10.0.0.0/16` | Kubernetes service CIDR |
+| `--site-name` | `remote` | Remote site name |
+| `--remote-node-cidr` | *(required)* | Subnet of remote machines (must not overlap AKS VNet) |
+| `--remote-pod-cidr` | *(required)* | Pod CIDR for remote site (must not overlap cluster pod/service CIDRs) |
+| `--ssh-key` | auto-generated | Path to SSH public key |
+| `--public-ip-strategy` | `node` | `node` (per-node public IP) or `lb` (load balancer) |
 
-## Add Machines
+</details>
 
-Once the site is initialized, register remote machines with
-`kubectl unbounded site add-machine`. Each machine must be reachable via SSH.
+---
 
-```bash
-kubectl unbounded site add-machine \
-    --site my-site \
-    --host 10.0.0.5 \
-    --ssh-username ubuntu \
-    --ssh-private-key ~/.ssh/id_rsa
+## 3. Add a Remote Node
 
-kubectl unbounded site add-machine \
-    --site my-site \
-    --host 10.0.0.6:2222 \
-    --ssh-username ubuntu \
-    --ssh-private-key ~/.ssh/id_rsa
-```
-
-### Required flags
-
-| Flag | Description |
-|------|-------------|
-| `--site` | Name of the site (must already be initialized) |
-| `--host` | Host IP, optionally with port (e.g. `10.0.0.5` or `10.0.0.5:2222`) |
-| `--ssh-username` | SSH username for connecting to the machine |
-
-### Optional flags
-
-| Flag | Description |
-|------|-------------|
-| `--name` | Machine name (derived from host if omitted; site name is always prefixed) |
-| `--ssh-private-key` | Path to SSH private key file (required if no bastion is configured) |
-| `--ssh-secret-name` | Kubernetes secret name for SSH credentials (defaults to `ssh-$site`) |
-| `--bastion-host` | Bastion host and optionally port (e.g. `5.6.7.8` or `5.6.7.8:2222`) |
-| `--bastion-ssh-username` | SSH username for the bastion (defaults to `--ssh-username`) |
-| `--bastion-ssh-private-key` | Path to SSH private key file for the bastion (defaults to `--ssh-private-key`) |
-| `--bastion-ssh-secret-name` | Kubernetes secret name for bastion SSH credentials (defaults to `--ssh-secret-name`) |
-| `--kubeconfig` | Path to kubeconfig file |
-
-## Watch Progress
-
-Machines transition through phases as they are provisioned and joined to the cluster:
-
-**Pending** &rarr; **Provisioning** &rarr; **Joining** &rarr; **Ready**
+Generate a bootstrap script and pipe it to your remote machine over SSH:
 
 ```bash
-watch 'kubectl get machines'
+kubectl unbounded machine manual-bootstrap my-node --site remote \
+    | ssh user@<host> sudo bash
 ```
+
+> Replace `user@<host>` with the SSH user and IP of your remote machine.
+> The node installs the Unbounded agent, opens a WireGuard tunnel to the
+> gateway nodes, and registers with the cluster.
+
+---
+
+## 4. Verify Connectivity
+
+Watch the node join the cluster:
+
+```bash
+kubectl get nodes -w
+```
+
+After a few minutes your remote node appears with status **Ready**.
+
+### Test pod networking
+
+Deploy a test pod on the remote node and verify cross-site connectivity:
+
+```bash
+# Run a pod on the remote node
+kubectl run test-remote --image=busybox --restart=Never \
+    --overrides='{"spec":{"nodeSelector":{"net.unbounded-kube.io/site":"remote"}}}' \
+    -- sleep 3600
+
+# Get a cluster node's internal IP
+CLUSTER_NODE_IP=$(kubectl get nodes -l 'net.unbounded-kube.io/site=cluster' \
+    -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+
+# Ping a cluster node from the remote pod (cross-site, over WireGuard)
+kubectl exec test-remote -- ping -c 3 "$CLUSTER_NODE_IP"
+
+# Run a pod on a cluster node and curl it from the remote pod
+kubectl run test-cluster --image=nginx --restart=Never \
+    --overrides='{"spec":{"nodeSelector":{"net.unbounded-kube.io/site":"cluster"}}}'
+kubectl wait --for=condition=ready pod/test-cluster --timeout=60s
+CLUSTER_POD_IP=$(kubectl get pod test-cluster -o jsonpath='{.status.podIP}')
+kubectl exec test-remote -- wget -qO- "http://$CLUSTER_POD_IP"
+
+# Clean up
+kubectl delete pod test-remote test-cluster
+```
+
+If the ping and wget succeed, pod networking is working across sites through the
+WireGuard tunnels.
+
+---
+
+## What the Script Creates
+
+The quickstart script automates AKS infrastructure setup and then delegates to
+[`kubectl unbounded site init`]({{< relref "reference/cli" >}}) for the
+Kubernetes-level configuration. Here's what each piece does.
+
+### AKS Cluster (BYO CNI)
+
+Created with `--network-plugin none` so AKS does not install a default CNI.
+unbounded-net replaces it and handles both local pod networking and cross-site
+routing through WireGuard. If your cluster already has a CNI (e.g. Azure CNI,
+Cilium, Calico), that works too -- see the
+[Existing Cluster]({{< relref "guides/existing-cluster" >}}) guide for the
+different configuration needed.
+
+### Gateway Node Pool
+
+A dedicated `gwmain` pool separate from the system pool:
+
+- **Per-node public IPs** -- remote nodes connect directly to gateway IPs to
+  establish WireGuard tunnels
+- **UDP 51820-51899 open** -- AKS `AllowedHostPorts` creates the NSG rules
+  automatically
+- **Tainted** `CriticalAddonsOnly=true:NoSchedule` -- only networking
+  components run here
+- **Labeled** `unbounded-kube.io/unbounded-net-gateway=true` -- tells
+  unbounded-net which nodes are gateways
+
+### unbounded-net CNI
+
+The networking plugin that connects sites. A **controller** allocates pod CIDRs
+and manages WireGuard keys. A **node agent** (DaemonSet) configures WireGuard
+interfaces and programs routes. Cross-site traffic is encrypted; intra-site
+traffic uses GENEVE.
+
+If your remote site already has private L3 connectivity to the cluster (e.g.
+Azure ExpressRoute, VPN Gateway, or AWS Direct Connect), you can skip the
+WireGuard overlay entirely and route directly over the existing link. See
+[Externally Peered Sites]({{< relref "concepts/networking#externally-peered-sites" >}})
+for the `SitePeering` configuration.
+
+### Site Resources
+
+- **GatewayPool** (`gw-main`) -- selects gateway-labeled nodes for routing
+- **Site** -- defines network ranges; one for the AKS nodes (`cluster`), one
+  for your remote site
+- **SiteGatewayPoolAssignment** -- links each site to the gateway pool
+
+### Machina Controller and Bootstrap Token
+
+[Machina]({{< relref "reference/machina-crd" >}}) handles SSH-based node
+provisioning. A bootstrap token in `kube-system` lets new nodes authenticate
+during the join process. The `manual-bootstrap` command embeds this token into
+the install script.
+
+If you already have provisioned hosts with SSH access (e.g. GPU nodes from a
+third-party provider), machina can provision them automatically -- see the
+[SSH Guide]({{< relref "guides/ssh" >}}) for details. Other provisioning
+methods are also supported:
+
+- **[Cloud API]({{< relref "guides/cloud-api" >}})** -- provision cloud VMs
+  via Karpenter
+- **[PXE Boot]({{< relref "guides/pxe" >}})** -- boot bare-metal servers with
+  metalman
+
+---
+
+## Cleanup
+
+Delete the resource group to remove all Azure resources:
+
+```bash
+az group delete --name my-unbounded --yes --no-wait
+```
+
+---
 
 ## Next Steps
 
-- **[Project Overview]({{< relref "concepts/overview" >}})** -- Understand how
-  the components fit together.
-- **[SSH Guide]({{< relref "guides/ssh" >}})** -- Deep dive into SSH
-  provisioning, bastion hosts, and troubleshooting.
-- **[PXE Guide]({{< relref "guides/pxe" >}})** -- Boot bare-metal servers
-  using metalman.
-- **[Networking Concepts]({{< relref "concepts/networking" >}})** -- Learn how
-  cross-site pod networking works.
-- **[CLI Reference]({{< relref "reference/cli" >}})** -- Full flag reference
-  for all `kubectl unbounded` commands.
-- **[CRD Reference]({{< relref "reference/machina-crd" >}})** -- Machine and
-  Image API specification.
+- **[Project Overview]({{< relref "concepts/overview" >}})** -- how the
+  components fit together
+- **[Bring Your Own Cluster]({{< relref "guides/existing-cluster" >}})** --
+  add Unbounded to an existing cluster
+- **[SSH Guide]({{< relref "guides/ssh" >}})** -- bastion hosts,
+  troubleshooting, and the full provisioning lifecycle
+- **[Networking Concepts]({{< relref "concepts/networking" >}})** -- cross-site
+  pod networking deep dive
+- **[CLI Reference]({{< relref "reference/cli" >}})** -- all
+  `kubectl unbounded` commands and flags

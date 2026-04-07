@@ -1,6 +1,6 @@
 ---
 title: "Cloud Bootstrapping (SSH)"
-weight: 2
+weight: 3
 description: "Join Linux machines to your cluster using SSH."
 ---
 

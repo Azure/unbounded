@@ -115,16 +115,32 @@ a:hover {
   padding: 5rem 1.5rem 4rem;
 }
 
-.hero h1 {
-  font-size: 2.25rem;
+/* ── Hero diagram ────────────────────────────────────────── */
+.hero-diagram {
+  margin: 2.5rem auto 2.5rem;
+  max-width: 56rem;
+}
+
+.hero-diagram img {
+  width: 100%;
+  height: auto;
+}
+
+.hero h1,
+.hero .hero-title {
+  font-size: 2.75rem;
   font-weight: 800;
-  letter-spacing: -0.025em;
-  margin-bottom: 0.75rem;
+  letter-spacing: -0.03em;
+  margin-bottom: 0;
+  background: linear-gradient(135deg, #4d8eff 0%, #a78bfa 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
 }
 
 .tagline {
   max-width: 36rem;
-  margin: 0 auto 2rem;
+  margin: 0 auto 1rem;
   color: var(--color-text-secondary);
   font-size: 1.1rem;
 }
@@ -382,6 +398,37 @@ pre {
   overflow-x: auto;
   margin-bottom: 1.5rem;
   line-height: 1.55;
+  position: relative;
+}
+
+pre .copy-btn {
+  position: absolute;
+  top: 0.5rem;
+  right: 0.5rem;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  padding: 0.25rem;
+  line-height: 0;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+pre:hover .copy-btn {
+  opacity: 1;
+}
+
+pre .copy-btn:hover {
+  color: var(--color-accent);
+  border-color: var(--color-accent);
+}
+
+pre .copy-btn svg {
+  width: 1rem;
+  height: 1rem;
+  display: block;
 }
 
 pre code {
@@ -492,8 +539,9 @@ details[open] summary {
     padding: 3rem 1rem 2.5rem;
   }
 
-  .hero h1 {
-    font-size: 1.65rem;
+  .hero h1,
+  .hero .hero-title {
+    font-size: 2rem;
   }
 
   .hero-links {
