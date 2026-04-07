@@ -31,7 +31,6 @@ jobs:
     outputs:
       name: ${{ steps.resolve.outputs.name }}
       tag: ${{ steps.resolve.outputs.tag }}
-      context: ${{ steps.resolve.outputs.context }}
       file: ${{ steps.resolve.outputs.file }}
     steps:
       - uses: actions/checkout@v4
@@ -50,8 +49,7 @@ jobs:
             tag="${{ github.sha }}"
           fi
 
-          context="images/${name}"
-          file="${context}/Containerfile"
+          file="images/${name}/Containerfile"
 
           if [[ ! -f "$file" ]]; then
             echo "::error::No Containerfile found at ${file}"
@@ -60,7 +58,6 @@ jobs:
 
           echo "name=${name}" >> "$GITHUB_OUTPUT"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
-          echo "context=${context}" >> "$GITHUB_OUTPUT"
           echo "file=${file}" >> "$GITHUB_OUTPUT"
 
           echo "Image: ${name}:${tag}"
@@ -91,7 +88,7 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
-          context: ${{ needs.resolve.outputs.context }}
+          context: .
           file: ${{ needs.resolve.outputs.file }}
           platforms: linux/amd64,linux/arm64
           push: true
