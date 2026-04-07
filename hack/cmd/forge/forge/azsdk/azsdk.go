@@ -188,11 +188,7 @@ func Setup(cfg AuthConfig) (azcore.TokenCredential, *azcore.ClientOptions, error
 }
 
 func CloudConfig(cloudName string) (azcorecloud.Configuration, error) {
-	// TODO <phlombar@microsoft.com> 2026-02-3: Currently only support AzurePublicCloud.
-	//
-	// Stripped from Aksiknife. We don't need multi-cloud support here right now. This code
-	// depended on cloudenv which is not desired at this point in time. If we need to test
-	// in an alternate AzureCloud use the filesystem loading path above.
+	// TODO <plombardi89> 2026-02-3: Currently only support AzurePublicCloud.
 	if cloudName != "AzurePublicCloud" {
 		return azcorecloud.Configuration{}, fmt.Errorf("unsupported cloud name %q", cloudName)
 	}

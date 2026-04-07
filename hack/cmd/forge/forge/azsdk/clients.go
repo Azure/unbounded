@@ -373,27 +373,6 @@ func configureClientOptions(userAgent string, opts policy.ClientOptions, _ []pol
 		ClientOptions: opts,
 	}
 
-	// TODO <phlombar@microsoft.com> 2026-02-03: None of this matters right now
-	//
-	// Apply policies to the client.
-	//clientOptions.PerRetryPolicies = append(clientOptions.PerRetryPolicies, userAgentPolicy{
-	//	userAgent: userAgent,
-	//})
-	//
-	//// Apply any additional custom policies.
-	//if len(policies) > 0 {
-	//	clientOptions.PerRetryPolicies = append(clientOptions.PerRetryPolicies, policies...)
-	//}
-	//
-	//// Don't register the resource provider for the client, assume they are already registered.
-	//clientOptions.DisableRPRegistration = true
-	//
-	//// This overrides the default retry policy for transient errors.
-	//clientOptions.Retry.ShouldRetry = shouldRetryWhen(
-	//	shouldRetryOnStatusCode(defaultAzureTemporaryErrorStatusCodes()...),
-	//	shouldRetryOnConnectionResetByPeerError,
-	//)
-
 	return clientOptions, userAgent, nil
 }
 
