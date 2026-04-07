@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # aks-quickstart.sh -- Create or configure an AKS cluster for unbounded-kube
-# with gateway node pools, unbounded-net CNI, machina controller, and
-# bootstrap tokens.
+# with gateway node pools and all required networking infrastructure.
+#
+# The script handles AKS infrastructure (resource group, cluster, gateway node
+# pool) and delegates Kubernetes-level setup to `kubectl unbounded site init`,
+# which installs unbounded-net, creates site resources, deploys the machina
+# controller, and generates bootstrap tokens.
 #
 # Usage:
 #   aks-quickstart.sh create [options]     Create a new AKS cluster from scratch
@@ -23,7 +27,6 @@
 #   --ssh-key PATH               Path to SSH public key (auto-generated if omitted)
 #   --public-ip-strategy STRAT   node (per-node public IP) or lb (load balancer)
 #                                (default: node)
-#   --cni-version VERSION        unbounded-net version (default: latest release)
 #   -h, --help                   Show this help and exit
 #
 # Setup options:
@@ -36,7 +39,6 @@
 #   --remote-node-cidr CIDR      CIDR for remote site nodes (required)
 #   --remote-pod-cidr CIDR       CIDR for remote site pods (required)
 #   --public-ip-strategy STRAT   node or lb (default: node)
-#   --cni-version VERSION        unbounded-net version (default: latest release)
 #   --context NAME               kubeconfig context (default: current)
 #   -h, --help                   Show this help and exit
 #
@@ -55,7 +57,6 @@ set -euo pipefail
 GATEWAY_LABEL="unbounded-kube.io/unbounded-net-gateway=true"
 GATEWAY_TAINT="CriticalAddonsOnly=true:NoSchedule"
 WIREGUARD_PORTS="51820-51899/udp"
-UNBOUNDED_NET_REPO="https://github.com/project-unbounded/unbounded-net"
 
 # Defaults
 DEFAULT_LOCATION="canadacentral"
@@ -206,7 +207,10 @@ preflight() {
   require_cmd kubectl "Install kubectl: https://kubernetes.io/docs/tasks/tools/"
   require_cmd curl    "Install curl for downloading manifests."
   require_cmd jq      "Install jq: https://stedolan.github.io/jq/download/"
-  require_cmd openssl "Install openssl for generating bootstrap tokens."
+
+  # kubectl-unbounded is required for site init and manual-bootstrap.
+  kubectl unbounded --help >/dev/null 2>&1 \
+    || die "kubectl-unbounded not found. Install it from: https://github.com/project-unbounded/unbounded-kube/releases/latest"
 
   az account show --output none 2>/dev/null \
     || die "not logged in to Azure. Run: az login"
@@ -420,389 +424,23 @@ do_site_init() {
   local cluster_service_cidr="$4"
   local remote_node_cidr="$5"
   local remote_pod_cidr="$6"
-  local cni_version="${7:-}"
 
-  # Step 1: Verify gateway nodes exist.
-  log "Verifying gateway nodes..."
-  local gw_node_count
-  gw_node_count=$(kubectl "${KUBECTL_CTX_ARGS[@]}" get nodes \
-    -l "$GATEWAY_LABEL" \
-    -o name 2>/dev/null | wc -l || true)
+  log "Running kubectl unbounded site init..."
 
-  (( gw_node_count > 0 )) || die "no nodes with label $GATEWAY_LABEL found. Ensure the gateway node pool is running."
-  info "Found $gw_node_count gateway node(s)"
+  local ctx_args=()
+  if [[ ${#KUBECTL_CTX_ARGS[@]} -gt 0 ]]; then
+    ctx_args=("${KUBECTL_CTX_ARGS[@]}")
+  fi
 
-  # Step 2: Install unbounded-net CNI.
-  install_unbounded_net "$cni_version"
+  kubectl "${ctx_args[@]}" unbounded site init \
+    --name "$site_name" \
+    --cluster-node-cidr "$cluster_node_cidr" \
+    --cluster-pod-cidr "$cluster_pod_cidr" \
+    --cluster-service-cidr "$cluster_service_cidr" \
+    --node-cidr "$remote_node_cidr" \
+    --pod-cidr "$remote_pod_cidr"
 
-  # Step 3: Create GatewayPool CR.
-  create_gateway_pool_cr
-
-  # Step 4: Create cluster site resources.
-  # The controller needs Site CRs to assign nodes to sites and allocate pod
-  # CIDRs.  Nodes will not become Ready until their CNI is configured, which
-  # requires a pod CIDR from the controller, which requires a matching Site.
-  create_site_cr "cluster" "$cluster_node_cidr" "$cluster_pod_cidr"
-
-  # Step 5: Create remote site resources.
-  create_site_cr "$site_name" "$remote_node_cidr" "$remote_pod_cidr"
-
-  # Step 6: Wait for nodes to become Ready.
-  # Now that the CNI is installed and Site CRs exist, the controller can
-  # allocate pod CIDRs and the node agent can configure networking.
-  wait_for_nodes_ready "$GATEWAY_LABEL" 300
-
-  # Step 7: Create bootstrap token.
-  create_bootstrap_token "$site_name"
-
-  # Step 8: Apply flex agent kubeadm config.
-  apply_flex_agent_config "$cluster_service_cidr"
-
-  # Step 9: Install machina controller.
-  install_machina
-
-  # Step 10: Print summary.
   print_summary "$site_name"
-}
-
-install_unbounded_net() {
-  local cni_version="${1:-}"
-
-  # Resolve "latest" or empty to the actual latest release tag.
-  if [[ -z "$cni_version" ]] || [[ "$cni_version" == "latest" ]]; then
-    log "Resolving latest unbounded-net release..."
-    cni_version=$(curl -sI -o /dev/null -w '%{url_effective}' -L "${UNBOUNDED_NET_REPO}/releases/latest" \
-      | grep -oP 'tag/\K.*')
-    [[ -n "$cni_version" ]] || die "could not resolve latest unbounded-net release"
-    info "Latest version: $cni_version"
-  fi
-
-  local release_url="${UNBOUNDED_NET_REPO}/releases/download/${cni_version}/unbounded-net-manifests-${cni_version}.tar.gz"
-
-  log "Installing unbounded-net CNI ${cni_version}..."
-
-  local tmpdir
-  tmpdir=$(mktemp -d)
-  trap "rm -rf '$tmpdir'" RETURN
-
-  info "Downloading $release_url"
-  curl -fsSL "$release_url" | tar xz -C "$tmpdir"
-
-  # Apply all manifests recursively — the tarball contains subdirectories
-  # (crds/, controller/, node/) alongside top-level namespace/configmap YAMLs.
-  # --force-conflicts is needed on re-runs because the unbounded-net controller
-  # takes ownership of caBundle fields on its webhooks and API service at runtime.
-  kubectl "${KUBECTL_CTX_ARGS[@]}" apply -R -f "$tmpdir/" --server-side --force-conflicts 2>&1 | \
-    while IFS= read -r line; do info "$line"; done
-
-  log "Waiting for unbounded-net controller to be ready..."
-  kubectl "${KUBECTL_CTX_ARGS[@]}" -n unbounded-net rollout status deployment/unbounded-net-controller \
-    --timeout=120s 2>&1 | while IFS= read -r line; do info "$line"; done
-
-  info "unbounded-net CNI installed"
-}
-
-create_gateway_pool_cr() {
-  log "Creating GatewayPool 'gw-main'..."
-  kubectl "${KUBECTL_CTX_ARGS[@]}" apply --server-side -f - <<'EOF'
----
-apiVersion: net.unbounded-kube.io/v1alpha1
-kind: GatewayPool
-metadata:
-  name: gw-main
-spec:
-  nodeSelector:
-    unbounded-kube.io/unbounded-net-gateway: "true"
-  type: External
-EOF
-  info "GatewayPool 'gw-main' created"
-}
-
-create_site_cr() {
-  local site_name="$1"
-  local node_cidr="$2"
-  local pod_cidr="$3"
-
-  log "Creating Site and SiteGatewayPoolAssignment for '$site_name'..."
-
-  kubectl "${KUBECTL_CTX_ARGS[@]}" apply --server-side -f - <<EOF
----
-apiVersion: net.unbounded-kube.io/v1alpha1
-kind: Site
-metadata:
-  name: ${site_name}
-  labels:
-    unbounded-kube.io/site: "${site_name}"
-spec:
-  nodeCidrs:
-    - ${node_cidr}
-  podCidrAssignments:
-    - cidrBlocks:
-        - ${pod_cidr}
----
-apiVersion: net.unbounded-kube.io/v1alpha1
-kind: SiteGatewayPoolAssignment
-metadata:
-  name: ${site_name}
-  labels:
-    unbounded-kube.io/site: "${site_name}"
-spec:
-  sites:
-    - ${site_name}
-  gatewayPools:
-    - gw-main
-EOF
-  info "Site '$site_name' created"
-}
-
-create_bootstrap_token() {
-  local site_name="$1"
-
-  log "Creating bootstrap token for site '$site_name'..."
-
-  # Check if a token already exists for this site.
-  local existing
-  existing=$(kubectl "${KUBECTL_CTX_ARGS[@]}" get secrets -n kube-system \
-    -l "unbounded-kube.io/site=${site_name}" \
-    --field-selector type=bootstrap.kubernetes.io/token \
-    -o name 2>/dev/null || true)
-
-  if [[ -n "$existing" ]]; then
-    info "Bootstrap token already exists for site '$site_name', skipping"
-    # Extract the existing token for the summary.
-    BOOTSTRAP_TOKEN=$(kubectl "${KUBECTL_CTX_ARGS[@]}" get "$existing" -n kube-system \
-      -o jsonpath='{.data.token-id}' 2>/dev/null | base64 -d 2>/dev/null || true)
-    local secret
-    secret=$(kubectl "${KUBECTL_CTX_ARGS[@]}" get "$existing" -n kube-system \
-      -o jsonpath='{.data.token-secret}' 2>/dev/null | base64 -d 2>/dev/null || true)
-    if [[ -n "$BOOTSTRAP_TOKEN" ]] && [[ -n "$secret" ]]; then
-      BOOTSTRAP_TOKEN="${BOOTSTRAP_TOKEN}.${secret}"
-    else
-      BOOTSTRAP_TOKEN="(existing — retrieve from secret $existing)"
-    fi
-    return 0
-  fi
-
-  local token_id token_secret
-  token_id=$(openssl rand -hex 3)
-  token_secret=$(openssl rand -hex 8)
-
-  kubectl "${KUBECTL_CTX_ARGS[@]}" apply --server-side -f - <<EOF
-apiVersion: v1
-kind: Secret
-metadata:
-  name: bootstrap-token-${token_id}
-  namespace: kube-system
-  labels:
-    unbounded-kube.io/default-bootstrap-token: "true"
-    unbounded-kube.io/site: "${site_name}"
-type: bootstrap.kubernetes.io/token
-stringData:
-  token-id: "${token_id}"
-  token-secret: "${token_secret}"
-  usage-bootstrap-authentication: "true"
-  usage-bootstrap-signing: "true"
-  auth-extra-groups: "system:bootstrappers:kubeadm:default-node-token"
-EOF
-
-  BOOTSTRAP_TOKEN="${token_id}.${token_secret}"
-  info "Bootstrap token created: ${BOOTSTRAP_TOKEN}"
-}
-
-apply_flex_agent_config() {
-  local service_cidr="$1"
-
-  log "Applying flex agent kubeadm config..."
-
-  # Extract CA certificate from kubeconfig.
-  local ca_data
-  ca_data=$(kubectl "${KUBECTL_CTX_ARGS[@]}" config view --raw \
-    -o jsonpath='{.clusters[0].cluster.certificate-authority-data}')
-  [[ -n "$ca_data" ]] || die "could not extract CA certificate from kubeconfig"
-
-  # Extract API server URL.
-  local server_url
-  server_url=$(kubectl "${KUBECTL_CTX_ARGS[@]}" config view --raw \
-    -o jsonpath='{.clusters[0].cluster.server}')
-  [[ -n "$server_url" ]] || die "could not extract API server URL from kubeconfig"
-
-  # Get Kubernetes version.
-  local k8s_version
-  k8s_version=$(kubectl "${KUBECTL_CTX_ARGS[@]}" version -o json 2>/dev/null \
-    | jq -r '.serverVersion.gitVersion')
-  [[ -n "$k8s_version" ]] && [[ "$k8s_version" != "null" ]] \
-    || die "could not determine Kubernetes version"
-
-  info "server:     $server_url"
-  info "k8s:        $k8s_version"
-  info "service:    $service_cidr"
-
-  kubectl "${KUBECTL_CTX_ARGS[@]}" apply --server-side -f - <<EOF
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  namespace: kube-system
-  name: kubeadm:nodes-kubeadm-config
-rules:
-- verbs: ["get"]
-  apiGroups: [""]
-  resources: ["configmaps"]
-  resourceNames: ["kubeadm-config"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  namespace: kube-system
-  name: kubeadm:nodes-kubeadm-config
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: kubeadm:nodes-kubeadm-config
-subjects:
-- kind: Group
-  name: system:bootstrappers:kubeadm:default-node-token
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  namespace: kube-system
-  name: kubeadm:kubelet-config
-rules:
-- verbs: ["get"]
-  apiGroups: [""]
-  resources: ["configmaps"]
-  resourceNames: ["kubelet-config"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  namespace: kube-system
-  name: kubeadm:kubelet-config
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: kubeadm:kubelet-config
-subjects:
-- kind: Group
-  name: system:bootstrappers:kubeadm:default-node-token
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: kubeadm:get-nodes
-rules:
-- verbs: ["get"]
-  apiGroups: [""]
-  resources: ["nodes"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: kubeadm:get-nodes
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: kubeadm:get-nodes
-subjects:
-- kind: Group
-  name: system:bootstrappers:kubeadm:default-node-token
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  namespace: kube-public
-  name: cluster-info
-data:
-  kubeconfig: |
-    apiVersion: v1
-    kind: Config
-    clusters:
-    - cluster:
-        certificate-authority-data: ${ca_data}
-        server: ${server_url}
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  namespace: kube-system
-  name: kubeadm-config
-data:
-  ClusterConfiguration: |
-    apiVersion: kubeadm.k8s.io/v1beta4
-    kind: ClusterConfiguration
-    kubernetesVersion: ${k8s_version}
-    networking:
-      serviceSubnet: ${service_cidr}
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  namespace: kube-system
-  name: kubelet-config
-data:
-  kubelet: |
-    apiVersion: kubelet.config.k8s.io/v1beta1
-    kind: KubeletConfiguration
-EOF
-
-  info "Flex agent kubeadm config applied"
-}
-
-install_machina() {
-  log "Installing machina controller..."
-
-  local script_dir repo_root
-  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  repo_root="$(cd "$script_dir/../.." && pwd)"
-
-  local machina_dir="$repo_root/deploy/machina"
-  [[ -d "$machina_dir" ]] || die "machina manifests not found at $machina_dir. Are you running from the unbounded-kube repository?"
-
-  # Apply namespace first so the ConfigMap can be created.
-  kubectl "${KUBECTL_CTX_ARGS[@]}" apply --server-side -f "$machina_dir/01-namespace.yaml" 2>&1 | \
-    while IFS= read -r line; do info "$line"; done
-
-  # Apply CRD.
-  kubectl "${KUBECTL_CTX_ARGS[@]}" apply --server-side -f "$machina_dir/crd/unbounded-kube.io_machines.yaml" 2>&1 | \
-    while IFS= read -r line; do info "$line"; done
-
-  # Apply RBAC.
-  kubectl "${KUBECTL_CTX_ARGS[@]}" apply --server-side -f "$machina_dir/02-rbac.yaml" 2>&1 | \
-    while IFS= read -r line; do info "$line"; done
-
-  # Generate custom config with API server endpoint (skip the default 03-config.yaml).
-  local server_url
-  server_url=$(kubectl "${KUBECTL_CTX_ARGS[@]}" config view --raw \
-    -o jsonpath='{.clusters[0].cluster.server}')
-
-  kubectl "${KUBECTL_CTX_ARGS[@]}" apply --server-side -f - <<EOF
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: machina-config
-  namespace: machina-system
-data:
-  config.yaml: |
-    # Machina Controller Configuration
-    apiServerEndpoint: "${server_url}"
-    metricsAddr: ":8080"
-    probeAddr: ":8081"
-    enableLeaderElection: false
-    maxConcurrentReconciles: 50
-EOF
-
-  # Apply deployment and service.
-  kubectl "${KUBECTL_CTX_ARGS[@]}" apply --server-side -f "$machina_dir/04-deployment.yaml" 2>&1 | \
-    while IFS= read -r line; do info "$line"; done
-  kubectl "${KUBECTL_CTX_ARGS[@]}" apply --server-side -f "$machina_dir/05-service.yaml" 2>&1 | \
-    while IFS= read -r line; do info "$line"; done
-
-  log "Waiting for machina controller to be ready..."
-  kubectl "${KUBECTL_CTX_ARGS[@]}" -n machina-system rollout status deployment/machina-controller \
-    --timeout=120s 2>&1 | while IFS= read -r line; do info "$line"; done
-
-  info "Machina controller installed"
 }
 
 print_summary() {
@@ -855,7 +493,6 @@ cmd_create() {
   local site_name="$DEFAULT_SITE_NAME"
   local remote_node_cidr="" remote_pod_cidr="" ssh_key=""
   local public_ip_strategy="$DEFAULT_PUBLIC_IP_STRATEGY"
-  local cni_version=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -873,7 +510,6 @@ cmd_create() {
       --remote-pod-cidr)     remote_pod_cidr="$2";     shift 2 ;;
       --ssh-key)             ssh_key="$2";             shift 2 ;;
       --public-ip-strategy)  public_ip_strategy="$2";  shift 2 ;;
-      --cni-version)         cni_version="$2";         shift 2 ;;
       -h|--help)             usage ;;
       *) die "unknown option: $1. Use --help for usage." ;;
     esac
@@ -981,8 +617,8 @@ cmd_create() {
   # Step 6: Detect cluster CIDRs.
   detect_cluster_cidrs
 
-  # Step 7: Run site init (installs CNI, which makes nodes Ready).
-  do_site_init "$site_name" "$CLUSTER_NODE_CIDR" "$CLUSTER_POD_CIDR" "$CLUSTER_SERVICE_CIDR" "$remote_node_cidr" "$remote_pod_cidr" "$cni_version"
+  # Step 7: Run site init (installs CNI, creates site resources, deploys machina).
+  do_site_init "$site_name" "$CLUSTER_NODE_CIDR" "$CLUSTER_POD_CIDR" "$CLUSTER_SERVICE_CIDR" "$remote_node_cidr" "$remote_pod_cidr"
 }
 
 # ── cmd: setup ───────────────────────────────────────────────────────────────
@@ -995,7 +631,6 @@ cmd_setup() {
   local remote_node_cidr="" remote_pod_cidr=""
   local public_ip_strategy="$DEFAULT_PUBLIC_IP_STRATEGY"
   local context=""
-  local cni_version=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1008,7 +643,6 @@ cmd_setup() {
       --remote-node-cidr)    remote_node_cidr="$2";    shift 2 ;;
       --remote-pod-cidr)     remote_pod_cidr="$2";     shift 2 ;;
       --public-ip-strategy)  public_ip_strategy="$2";  shift 2 ;;
-      --cni-version)         cni_version="$2";         shift 2 ;;
       --context)             context="$2";             shift 2 ;;
       -h|--help)             usage ;;
       *) die "unknown option: $1. Use --help for usage." ;;
@@ -1070,8 +704,8 @@ cmd_setup() {
   # Step 5: Detect cluster CIDRs.
   detect_cluster_cidrs
 
-  # Step 6: Run site init (installs CNI, which makes nodes Ready).
-  do_site_init "$site_name" "$CLUSTER_NODE_CIDR" "$CLUSTER_POD_CIDR" "$CLUSTER_SERVICE_CIDR" "$remote_node_cidr" "$remote_pod_cidr" "$cni_version"
+  # Step 6: Run site init (installs CNI, creates site resources, deploys machina).
+  do_site_init "$site_name" "$CLUSTER_NODE_CIDR" "$CLUSTER_POD_CIDR" "$CLUSTER_SERVICE_CIDR" "$remote_node_cidr" "$remote_pod_cidr"
 }
 
 # ── main ─────────────────────────────────────────────────────────────────────
@@ -1084,7 +718,6 @@ NODE_RG=""
 CLUSTER_NODE_CIDR=""
 CLUSTER_POD_CIDR=""
 CLUSTER_SERVICE_CIDR=""
-BOOTSTRAP_TOKEN=""
 KUBECTL_CTX_ARGS=()
 
 main() {
