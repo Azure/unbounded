@@ -16,9 +16,10 @@ import (
 	"github.com/google/go-tpm-tools/simulator"
 	"github.com/google/go-tpm/tpm2"
 	"github.com/google/go-tpm/tpm2/transport"
-	"github.com/project-unbounded/unbounded-kube/internal/helpers"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/project-unbounded/unbounded-kube/internal/helpers"
 )
 
 // TestParseTPM2B tests the TPM2B wire-format parser.
