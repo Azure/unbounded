@@ -6,6 +6,7 @@ on:
       - "v*"
 
 permissions:
+  actions: read
   contents: write
   packages: write
   # Required for keyless cosign signing via Sigstore OIDC.
