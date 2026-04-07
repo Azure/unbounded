@@ -23,6 +23,7 @@ func Run() {
 
 	root.AddCommand(
 		newCmdStart(cmdCtx),
+		newCmdVersion(),
 	)
 
 	if err := root.Execute(); err != nil {

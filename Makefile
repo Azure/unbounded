@@ -14,6 +14,7 @@ INVENTORY_CMD=./cmd/inventory
 
 AGENT_BIN=bin/unbounded-agent
 AGENT_CMD=./cmd/agent
+AGENT_LDFLAGS=-X github.com/project-unbounded/unbounded-kube/internal/version.Version=$(VERSION) -X github.com/project-unbounded/unbounded-kube/internal/version.GitCommit=$(shell git rev-parse --short HEAD)
 
 MACHINA_BIN=bin/machina
 MACHINA_CMD=./cmd/machina
@@ -115,7 +116,7 @@ inventory-arm64: test ## Build inventory for linux/arm64 (implies test)
 	GOOS=linux GOARCH=arm64 $(GOBUILD) -o $(INVENTORY_BIN)-arm64 $(INVENTORY_CMD)/main.go
 
 unbounded-agent: test ## Build the unbounded-agent for linux (implies test)
-	GOOS=linux $(GOBUILD) -o $(AGENT_BIN) $(AGENT_CMD)/main.go
+	GOOS=linux $(GOBUILD) -ldflags '$(AGENT_LDFLAGS)' -o $(AGENT_BIN) $(AGENT_CMD)/main.go
 
 machina-build: machina-manifests ## Build the machina binary (no lint/test)
 	$(GOBUILD) -o $(MACHINA_BIN) $(MACHINA_CMD)/main.go

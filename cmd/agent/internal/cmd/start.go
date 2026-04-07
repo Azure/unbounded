@@ -17,6 +17,7 @@ import (
 	"github.com/project-unbounded/unbounded-kube/cmd/agent/internal/phases/nodestart"
 	"github.com/project-unbounded/unbounded-kube/cmd/agent/internal/phases/rootfs"
 	"github.com/project-unbounded/unbounded-kube/internal/provision"
+	"github.com/project-unbounded/unbounded-kube/internal/version"
 )
 
 func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
@@ -29,6 +30,11 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 			defer cancel()
 
 			cmdCtx.Setup()
+
+			cmdCtx.Logger.Info("starting unbounded-agent",
+				"version", version.Version,
+				"commit", version.GitCommit,
+			)
 
 			cfg, err := loadConfig()
 			if err != nil {

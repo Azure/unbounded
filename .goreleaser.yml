@@ -25,6 +25,8 @@ builds:
       - CGO_ENABLED=0
     ldflags:
       - -s -w
+      - -X github.com/project-unbounded/unbounded-kube/internal/version.Version={{ .Version }}
+      - -X github.com/project-unbounded/unbounded-kube/internal/version.GitCommit={{ .ShortCommit }}
     goos:
       - linux
     goarch:
