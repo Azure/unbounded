@@ -276,6 +276,11 @@ type manualBootstrapTemplateData struct {
 	// InstallScript is the full install script embedded verbatim inside a
 	// heredoc that is piped to bash.
 	InstallScript string
+
+	// UninstallScript is the full uninstall script with the machine name
+	// baked in. It is written to /usr/local/bin/unbounded-agent-uninstall.sh
+	// on the target host so the node can be cleanly removed later.
+	UninstallScript string
 }
 
 // renderScript produces a self-contained bash script that writes the agent
@@ -291,6 +296,7 @@ func (h *manualBootstrapHandler) renderScript(cfg *provision.AgentConfig) (strin
 		MachineName:     cfg.MachineName,
 		AgentConfigJSON: string(configJSON),
 		InstallScript:   provision.UnboundedAgentInstallScript(),
+		UninstallScript: provision.UnboundedAgentUninstallScript(cfg.MachineName),
 	}
 
 	t, err := template.New("node-bootstrap").Parse(manualBootstrapTemplate)
@@ -318,6 +324,7 @@ func (h *manualBootstrapHandler) renderCloudInit(cfg *provision.AgentConfig) (st
 		MachineName:     cfg.MachineName,
 		AgentConfigJSON: string(configJSON),
 		InstallScript:   provision.UnboundedAgentInstallScript(),
+		UninstallScript: provision.UnboundedAgentUninstallScript(cfg.MachineName),
 	}
 
 	funcMap := template.FuncMap{
