@@ -51,3 +51,6 @@ docs/.hugo_build.lock
 
 # AI Tools
 .opencode
+
+# Python
+__pycache__/

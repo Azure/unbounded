@@ -128,6 +128,18 @@ jobs:
       - name: Validate workload on agent node
         run: python3 ./hack/agent/e2e-kind/e2e.py validate-workload
 
+      - name: Reset agent on VM
+        run: python3 ./hack/agent/e2e-kind/e2e.py reset-agent
+
+      - name: Rejoin agent to cluster
+        run: python3 ./hack/agent/e2e-kind/e2e.py run-agent
+
+      - name: Wait for node to become Ready (rejoin)
+        run: python3 ./hack/agent/e2e-kind/e2e.py wait-for-node
+
+      - name: Validate workload on rejoined agent node
+        run: python3 ./hack/agent/e2e-kind/e2e.py validate-workload
+
       - name: Collect VM logs
         if: always()
         run: |
