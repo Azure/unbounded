@@ -1303,6 +1303,129 @@ func TestOCICache_ResolvePath_PathTraversal(t *testing.T) {
 	}
 }
 
+func TestHandleCloudInitLog_StartEvent(t *testing.T) {
+	srv := &HTTPServer{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /cloudinit/log", srv.handleCloudInitLog)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	body := strings.NewReader(`{"name":"init-network/config-ssh","description":"running config-ssh with frequency once-per-instance","event_type":"start","origin":"cloudinit","timestamp":1775657336.9020026}`)
+
+	req, _ := http.NewRequest("POST", ts.URL+"/cloudinit/log", body)
+	req.Header.Set("X-Forwarded-For", "10.0.1.50")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /cloudinit/log: %v", err)
+	}
+
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200, got %d", resp.StatusCode)
+	}
+}
+
+func TestHandleCloudInitLog_FinishEvent(t *testing.T) {
+	srv := &HTTPServer{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /cloudinit/log", srv.handleCloudInitLog)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	body := strings.NewReader(`{"name":"init-network/config-ssh","description":"config-ssh ran successfully and took 0.001 seconds","event_type":"finish","origin":"cloudinit","timestamp":1775657336.9020026,"result":"SUCCESS"}`)
+
+	req, _ := http.NewRequest("POST", ts.URL+"/cloudinit/log", body)
+	req.Header.Set("X-Forwarded-For", "10.0.1.50")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /cloudinit/log: %v", err)
+	}
+
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200, got %d", resp.StatusCode)
+	}
+}
+
+func TestHandleCloudInitLog_InvalidJSON(t *testing.T) {
+	srv := &HTTPServer{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /cloudinit/log", srv.handleCloudInitLog)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	body := strings.NewReader(`not-json-at-all`)
+
+	req, _ := http.NewRequest("POST", ts.URL+"/cloudinit/log", body)
+	req.Header.Set("X-Forwarded-For", "10.0.1.50")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /cloudinit/log: %v", err)
+	}
+
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 even for invalid JSON (graceful fallback), got %d", resp.StatusCode)
+	}
+}
+
+func TestHandleCloudInitLog_EmptyBody(t *testing.T) {
+	srv := &HTTPServer{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /cloudinit/log", srv.handleCloudInitLog)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	req, _ := http.NewRequest("POST", ts.URL+"/cloudinit/log", strings.NewReader(""))
+	req.Header.Set("X-Forwarded-For", "10.0.1.50")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /cloudinit/log: %v", err)
+	}
+
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 for empty body, got %d", resp.StatusCode)
+	}
+}
+
+func TestHandleCloudInitLog_UnknownEventType(t *testing.T) {
+	srv := &HTTPServer{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /cloudinit/log", srv.handleCloudInitLog)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	body := strings.NewReader(`{"name":"modules-config","description":"some custom event","event_type":"custom","origin":"cloudinit","timestamp":1775657336.0}`)
+
+	req, _ := http.NewRequest("POST", ts.URL+"/cloudinit/log", body)
+	req.Header.Set("X-Forwarded-For", "10.0.1.50")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /cloudinit/log: %v", err)
+	}
+
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200, got %d", resp.StatusCode)
+	}
+}
+
 func freePort(t *testing.T) int {
 	t.Helper()
 
