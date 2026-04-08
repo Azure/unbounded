@@ -19,12 +19,17 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build \
     -o /unbounded-agent ./cmd/agent
 
 # ── Assemble host image artifacts ───────────────────────────────────
-FROM docker.io/library/debian:bookworm-slim@sha256:4724b8cc51e33e398f0e2e15e18d5ec2851ff0c2280647e1310bc1642182655d AS build
+# IMPORTANT: This stage MUST use the same Ubuntu release as the netboot
+# initrd (currently 24.04 / Noble).  The init.cpio overlay copies shared
+# libraries (libc, ld-linux, etc.) for efibootmgr into the initrd.  If
+# these come from a different distro (e.g. Debian Bookworm with glibc 2.36)
+# they overwrite the Ubuntu libs and break /bin/sh which requires glibc 2.38.
+FROM docker.io/library/ubuntu:24.04 AS build
 
 ARG TARGETARCH
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        cpio curl ca-certificates qemu-utils libguestfs-tools linux-image-${TARGETARCH} \
+        cpio curl ca-certificates qemu-utils libguestfs-tools linux-image-generic \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Download netboot artifacts ──────────────────────────────────────
