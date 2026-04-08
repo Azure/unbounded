@@ -38,7 +38,6 @@ Key `serve-pxe` flags (set via the Deployment):
 | `--site` | *(none)* | Scope to machines with a specific site label |
 | `--http-port` | 8880 | HTTP server port |
 | `--cache-dir` | `~/.unbounded/metalman/cache` | Local cache for downloaded images |
-| `--apiserver-url` | | External Kubernetes API URL |
 | `--health-port` | 8081 | Health/readiness probe port |
 | `--serve-url` | | External URL of this metalman instance |
 

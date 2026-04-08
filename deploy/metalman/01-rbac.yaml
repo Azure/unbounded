@@ -48,6 +48,34 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
 
 ---
+# Allow metalman-controller to read the cluster-info ConfigMap from kube-public.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: metalman-controller
+  namespace: kube-public
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["cluster-info"]
+    verbs: ["get"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: metalman-controller
+  namespace: kube-public
+subjects:
+  - kind: ServiceAccount
+    name: metalman-controller
+    namespace: machina-system
+roleRef:
+  kind: Role
+  name: metalman-controller
+  apiGroup: rbac.authorization.k8s.io
+
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:

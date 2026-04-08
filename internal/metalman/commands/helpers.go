@@ -12,10 +12,13 @@ import (
 	"path/filepath"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/selection"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
@@ -140,6 +143,34 @@ func InterfaceForIP(ip net.IP) (string, error) {
 	}
 
 	return "", fmt.Errorf("no interface found for IP %s", ip)
+}
+
+// ResolveApiserverURL reads the standard cluster-info ConfigMap from the
+// kube-public namespace and returns the Kubernetes API server URL contained
+// in the embedded kubeconfig. Every conformant cluster publishes this
+// ConfigMap, making it the canonical way to discover the external API
+// server endpoint.
+func ResolveApiserverURL(ctx context.Context, clientset kubernetes.Interface) (string, error) {
+	cm, err := clientset.CoreV1().ConfigMaps(metav1.NamespacePublic).Get(ctx, "cluster-info", metav1.GetOptions{})
+	if err != nil {
+		return "", fmt.Errorf("get cluster-info ConfigMap from kube-public: %w", err)
+	}
+
+	kubeconfig, ok := cm.Data["kubeconfig"]
+	if !ok {
+		return "", fmt.Errorf("kubeconfig key not found in cluster-info ConfigMap")
+	}
+
+	cfg, err := clientcmd.RESTConfigFromKubeConfig([]byte(kubeconfig))
+	if err != nil {
+		return "", fmt.Errorf("parsing kubeconfig from cluster-info ConfigMap: %w", err)
+	}
+
+	if cfg.Host == "" {
+		return "", fmt.Errorf("cluster-info kubeconfig has no server URL")
+	}
+
+	return cfg.Host, nil
 }
 
 func InterfaceIPv4(name string) (net.IP, error) {
