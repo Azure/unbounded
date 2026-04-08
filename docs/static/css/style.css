@@ -78,10 +78,19 @@ a:hover {
 }
 
 .site-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
   font-weight: 700;
   font-size: 1.05rem;
   color: var(--color-text);
   letter-spacing: -0.01em;
+}
+
+.site-logo {
+  width: 1.6rem;
+  height: 1.6rem;
+  flex-shrink: 0;
 }
 
 .site-title:hover {
