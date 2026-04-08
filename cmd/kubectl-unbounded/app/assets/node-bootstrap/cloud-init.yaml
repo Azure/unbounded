@@ -17,11 +17,6 @@ write_files:
     content: |
 {{ .InstallScript | indent 6 }}
 
-  - path: /usr/local/bin/unbounded-agent-uninstall.sh
-    permissions: "0755"
-    content: |
-{{ .UninstallScript | indent 6 }}
-
 runcmd:
   - export UNBOUNDED_AGENT_CONFIG_FILE=/etc/unbounded-agent/config.json
   - bash /usr/local/bin/unbounded-agent-install.sh

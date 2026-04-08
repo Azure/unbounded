@@ -22,15 +22,6 @@ cat > "${UNBOUNDED_AGENT_CONFIG_FILE}" <<'AGENT_CONFIG_EOF'
 AGENT_CONFIG_EOF
 
 # -----------------------------------------------------------------
-# Write uninstall script
-# -----------------------------------------------------------------
-
-cat > /usr/local/bin/unbounded-agent-uninstall.sh <<'UNINSTALL_SCRIPT_EOF'
-{{ .UninstallScript }}
-UNINSTALL_SCRIPT_EOF
-chmod +x /usr/local/bin/unbounded-agent-uninstall.sh
-
-# -----------------------------------------------------------------
 # Embedded install script
 # -----------------------------------------------------------------
 

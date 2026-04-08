@@ -150,6 +150,7 @@ done
 echo "Removing agent binaries and configuration..."
 rm -f /usr/local/bin/unbounded-agent
 rm -f /usr/local/bin/unbounded-agent-install.sh
+rm -f /usr/local/bin/unbounded-agent-uninstall.sh
 rm -rf /etc/unbounded-agent
 rm -rf /tmp/unbounded-agent
 rm -f /tmp/unbounded-agent-config.*.json
@@ -160,11 +161,8 @@ rm -f /tmp/unbounded-agent-config.*.json
 echo "Reloading systemd daemon..."
 systemctl daemon-reload
 
-# -----------------------------------------------------------------
-# 13. Self-delete
-# -----------------------------------------------------------------
 echo ""
-echo "Unbounded-kube node ${MACHINE_NAME} has been fully uninstalled."
+echo "Unbounded-kube node ${MACHINE_NAME} has been fully reset."
 echo ""
 echo "NOTE: The Kubernetes Node object must be deleted separately from the"
 echo "cluster, for example:"
@@ -172,4 +170,3 @@ echo "  kubectl delete node ${MACHINE_NAME}"
 echo ""
 echo "You may need to reboot the host to ensure all kernel modules and"
 echo "network state are fully cleared."
-rm -f /usr/local/bin/unbounded-agent-uninstall.sh

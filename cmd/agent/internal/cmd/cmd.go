@@ -23,6 +23,7 @@ func Run() {
 
 	root.AddCommand(
 		newCmdStart(cmdCtx),
+		newCmdReset(cmdCtx),
 		newCmdVersion(),
 	)
 
