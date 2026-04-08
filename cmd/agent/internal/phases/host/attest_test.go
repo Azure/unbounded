@@ -163,6 +163,7 @@ func openSimulatorForE2E(t *testing.T) transport.TPMCloser {
 	require.NoError(t, err)
 
 	tpmDev := transport.FromReadWriteCloser(sim)
+
 	t.Cleanup(func() { tpmDev.Close() })
 
 	return &nonClosingTPM{TPM: tpmDev}
