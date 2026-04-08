@@ -35,7 +35,7 @@ var siteTemplatesPrototype embed.FS
 var flexAgentTemplates embed.FS
 
 const (
-	unboundedCNIRelease = "https://github.com/project-unbounded/unbounded-net/releases/download/v1.0.1/unbounded-net-manifests-v1.0.1.tar.gz"
+	unboundedCNIRelease = "https://github.com/project-unbounded/unbounded-net/releases/download/v1.1.2/unbounded-net-manifests-v1.1.2.tar.gz"
 )
 
 // usePrototypeCNI returns true when UB_PROTOTYPE_UNBOUNDED_CNI=1 is set,
