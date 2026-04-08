@@ -425,6 +425,167 @@ func TestTemplateRendering(t *testing.T) {
 	}
 }
 
+func TestTemplateRendering_AgentImageSet(t *testing.T) {
+	tmpl := `Image: {{ .AgentImage }}`
+
+	data := templateData{
+		Machine: &v1alpha3.Machine{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-node"},
+		},
+		AgentImage: "ghcr.io/org/rootfs:v1",
+	}
+
+	result, err := renderTemplate(tmpl, data)
+	if err != nil {
+		t.Fatalf("RenderTemplate: %v", err)
+	}
+
+	expected := "Image: ghcr.io/org/rootfs:v1"
+	if string(result) != expected {
+		t.Errorf("template result: got %q, want %q", result, expected)
+	}
+}
+
+func TestTemplateRendering_AgentImageUnset(t *testing.T) {
+	tmpl := `before{{ if .AgentImage }}OCIImage{{ end }}after`
+
+	data := templateData{
+		Machine: &v1alpha3.Machine{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-node"},
+		},
+	}
+
+	result, err := renderTemplate(tmpl, data)
+	if err != nil {
+		t.Fatalf("RenderTemplate: %v", err)
+	}
+
+	if strings.Contains(string(result), "OCIImage") {
+		t.Errorf("expected no OCIImage in output when AgentImage is empty, got %q", result)
+	}
+
+	expected := "beforeafter"
+	if string(result) != expected {
+		t.Errorf("template result: got %q, want %q", result, expected)
+	}
+}
+
+func TestUserDataTemplate_WithAgentImage(t *testing.T) {
+	userDataTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "host-ubuntu2404", "assets", "user-data.tmpl"))
+	if err != nil {
+		t.Fatalf("reading user-data.tmpl: %v", err)
+	}
+
+	data := templateData{
+		Machine: &v1alpha3.Machine{
+			ObjectMeta: metav1.ObjectMeta{Name: "agent-img-node"},
+		},
+		ApiserverURL:      "https://k8s.example.com",
+		ServeURL:          "http://10.0.1.1:8080",
+		KubernetesVersion: "1.30.0",
+		ClusterDNS:        "10.96.0.10",
+		AgentImage:        "ghcr.io/org/rootfs:v1",
+	}
+
+	result, err := renderTemplate(string(userDataTmpl), data)
+	if err != nil {
+		t.Fatalf("renderTemplate: %v", err)
+	}
+
+	body := string(result)
+	if !strings.Contains(body, `"OCIImage": "ghcr.io/org/rootfs:v1"`) {
+		t.Errorf("expected OCIImage in rendered user-data, got:\n%s", body)
+	}
+
+	if !strings.Contains(body, `"MachineName": "agent-img-node"`) {
+		t.Errorf("expected MachineName in rendered user-data, got:\n%s", body)
+	}
+}
+
+func TestUserDataTemplate_WithoutAgentImage(t *testing.T) {
+	userDataTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "host-ubuntu2404", "assets", "user-data.tmpl"))
+	if err != nil {
+		t.Fatalf("reading user-data.tmpl: %v", err)
+	}
+
+	data := templateData{
+		Machine: &v1alpha3.Machine{
+			ObjectMeta: metav1.ObjectMeta{Name: "no-agent-node"},
+		},
+		ApiserverURL:      "https://k8s.example.com",
+		ServeURL:          "http://10.0.1.1:8080",
+		KubernetesVersion: "1.30.0",
+		ClusterDNS:        "10.96.0.10",
+	}
+
+	result, err := renderTemplate(string(userDataTmpl), data)
+	if err != nil {
+		t.Fatalf("renderTemplate: %v", err)
+	}
+
+	body := string(result)
+	if strings.Contains(body, "OCIImage") {
+		t.Errorf("expected no OCIImage in rendered user-data when AgentImage is empty, got:\n%s", body)
+	}
+
+	if !strings.Contains(body, `"MachineName": "no-agent-node"`) {
+		t.Errorf("expected MachineName in rendered user-data, got:\n%s", body)
+	}
+}
+
+func TestResolveFileByPath_AgentImage(t *testing.T) {
+	tmplContent := `{{ .AgentImage }}`
+
+	cache := setupOCICache(t, "ghcr.io/test/image:v1", "agentimg123", map[string][]byte{
+		"config.tmpl": []byte(tmplContent),
+	})
+
+	scheme := newScheme(t)
+	fc := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+	resolver := FileResolver{
+		Cache:             cache,
+		Reader:            fc,
+		ApiserverURL:      "https://k8s.example.com",
+		ServeURL:          "http://10.0.1.1:8080",
+		KubernetesVersion: "1.30.0",
+		ClusterDNS:        "10.96.0.10",
+	}
+
+	// With agent image set
+	nodeWithAgent := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-with-agent"},
+		Spec: v1alpha3.MachineSpec{
+			Agent: &v1alpha3.AgentSpec{
+				Image: "ghcr.io/org/rootfs:v1",
+			},
+		},
+	}
+
+	resolved, err := resolver.ResolveFileByPath(t.Context(), "config", nodeWithAgent, "ghcr.io/test/image:v1")
+	if err != nil {
+		t.Fatalf("ResolveFileByPath with agent: %v", err)
+	}
+
+	if !strings.Contains(string(resolved.Data), "ghcr.io/org/rootfs:v1") {
+		t.Errorf("expected agent image in rendered template, got %q", resolved.Data)
+	}
+
+	// Without agent image (spec.agent is nil)
+	nodeWithoutAgent := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-without-agent"},
+	}
+
+	resolved, err = resolver.ResolveFileByPath(t.Context(), "config", nodeWithoutAgent, "ghcr.io/test/image:v1")
+	if err != nil {
+		t.Fatalf("ResolveFileByPath without agent: %v", err)
+	}
+
+	if strings.TrimSpace(string(resolved.Data)) != "" {
+		t.Errorf("expected empty agent image in rendered template, got %q", resolved.Data)
+	}
+}
+
 func TestHTTPServer_Start_Shutdown(t *testing.T) {
 	scheme := newScheme(t)
 	fc := fake.NewClientBuilder().WithScheme(scheme).Build()

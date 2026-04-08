@@ -68,12 +68,18 @@ func (f *FileResolver) ResolveFileByPath(ctx context.Context, path string, node 
 		}
 
 		if node != nil {
+			agentImage := ""
+			if node.Spec.Agent != nil {
+				agentImage = node.Spec.Agent.Image
+			}
+
 			data, err := renderTemplate(string(content), templateData{
 				Machine:           node,
 				ApiserverURL:      f.ApiserverURL,
 				ServeURL:          f.ServeURL,
 				KubernetesVersion: f.KubernetesVersion,
 				ClusterDNS:        f.ClusterDNS,
+				AgentImage:        agentImage,
 			})
 			if err != nil {
 				return nil, err
@@ -96,6 +102,7 @@ type templateData struct {
 	ServeURL          string
 	KubernetesVersion string
 	ClusterDNS        string
+	AgentImage        string
 }
 
 var (

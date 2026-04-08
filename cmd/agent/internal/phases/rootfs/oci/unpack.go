@@ -11,7 +11,13 @@ import (
 	"github.com/opencontainers/umoci"
 	"github.com/opencontainers/umoci/oci/casext"
 	"github.com/opencontainers/umoci/oci/layer"
+
+	"github.com/project-unbounded/unbounded-kube/internal/ociutil"
 )
+
+func init() {
+	ociutil.RegisterDockerParsers()
+}
 
 // unpackOCILayout opens an OCI image layout at layoutDir and unpacks the image
 // tagged with the given tag into destDir. It uses umoci for spec-compliant
@@ -53,6 +59,11 @@ func unpackOCILayout(ctx context.Context, log *slog.Logger, hostArch, layoutDir,
 	if !ok {
 		return fmt.Errorf("tag %q does not point to an OCI manifest (got %T)", tag, blob.Data)
 	}
+
+	// Convert Docker media types to OCI equivalents so that umoci's strict
+	// media-type checks pass. Docker V2 images use different MIME types for
+	// the config and layer blobs but are structurally identical to OCI.
+	ociutil.ConvertDockerMediaTypes(&manifest)
 
 	log.Info("unpacking OCI image layers",
 		slog.Int("layers", len(manifest.Layers)),
@@ -97,6 +108,14 @@ func selectPlatformDescriptor(hostArch string, paths []casext.DescriptorPath) (c
 
 			checked = append(checked, fmt.Sprintf("%s/%s", step.Platform.OS, step.Platform.Architecture))
 		}
+	}
+
+	// Single-platform images pushed without a manifest index have no
+	// platform metadata in the descriptor walk.  If there is exactly one
+	// descriptor and we found no platform annotations at all, assume the
+	// image matches (the common single-arch case).
+	if len(paths) == 1 && len(checked) == 0 {
+		return paths[0], nil
 	}
 
 	err := fmt.Errorf(

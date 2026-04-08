@@ -41,6 +41,12 @@ SERVE_URL = f"http://{SERVER_IP}:{HTTP_PORT}"
 REGISTRY_PORT = 5555
 REGISTRY_CONTAINER = "unbounded-smoke-registry"
 IMAGE_NAME = f"localhost:{REGISTRY_PORT}/unbounded/host-ubuntu2404:smoke"
+AGENT_IMAGE_DIR = REPO_ROOT / "images" / "agent-ubuntu2404"
+AGENT_IMAGE_NAME = f"localhost:{REGISTRY_PORT}/unbounded/agent-ubuntu2404:smoke"
+# The agent runs inside a VM on an isolated libvirt network. "localhost" inside
+# the VM resolves to the VM's own loopback, not the host.  Use the host's
+# bridge IP so the VM can reach the registry over the virtual network.
+AGENT_IMAGE_NAME_VM = f"{SERVER_IP}:{REGISTRY_PORT}/unbounded/agent-ubuntu2404:smoke"
 BINARY = REPO_ROOT / "bin" / "metalman"
 KUBECTL_UNBOUNDED = REPO_ROOT / "bin" / "kubectl-unbounded"
 SERIAL_SOCK = TMPDIR / "console.sock"
@@ -431,6 +437,13 @@ def main() -> None:
     log("Pushing host-ubuntu2404 OCI image to local registry")
     run(["docker", "push", IMAGE_NAME])
 
+    log("Building agent-ubuntu2404 OCI image")
+    run(["docker", "build", "-t", AGENT_IMAGE_NAME,
+         "-f", str(AGENT_IMAGE_DIR / "Containerfile"), str(AGENT_IMAGE_DIR)])
+
+    log("Pushing agent-ubuntu2404 OCI image to local registry")
+    run(["docker", "push", AGENT_IMAGE_NAME])
+
     server_url = apiserver_url()
     log(f"  API server URL: {server_url}")
     protonode = {
@@ -457,6 +470,9 @@ def main() -> None:
                     "dns": [DNS_SERVER],
                 }],
             },
+            "agent": {
+                "image": AGENT_IMAGE_NAME_VM,
+            },
         },
     }
     kubectl(["apply", "-f", "-"], input=json.dumps(protonode).encode(),
@@ -482,6 +498,7 @@ def main() -> None:
 
     log("Waiting for kubelet to join the cluster...")
     wait_k8s_node(NODE_NAME, timeout=900)
+    assert_node_ready(NODE_NAME, timeout=300)
 
     log("")
     log("Smoke test PASSED")

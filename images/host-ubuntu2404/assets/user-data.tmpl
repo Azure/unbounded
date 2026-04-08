@@ -30,7 +30,8 @@ write_files:
           "kubernetes.azure.com/managed": "false",
           "kubernetes.azure.com/cluster": "unbounded-metal"
         }
-      },
+      },{{ if .AgentImage }}
+      "OCIImage": "{{ .AgentImage }}",{{ end }}
       "Attest": {
         "URL": "{{ .ServeURL }}"
       }
@@ -38,19 +39,12 @@ write_files:
 - path: /etc/cloud/cloud-init.disabled
   defer: true
   content: ''
-packages:
-- curl
 runcmd:
 - - /bin/bash
   - -c
   - |
     set -eo pipefail
-    AGENT_URL="{{ .ServeURL }}/unbounded-agent"
-    AGENT_BIN="/usr/local/bin/unbounded-agent"
-    echo "Downloading unbounded-agent..."
-    curl -fsSL -o "${AGENT_BIN}" "${AGENT_URL}"
-    chmod +x "${AGENT_BIN}"
     export UNBOUNDED_AGENT_CONFIG_FILE=/etc/unbounded-agent/config.json
     echo "Running unbounded-agent start..."
-    "${AGENT_BIN}" start
+    /usr/local/bin/unbounded-agent start
     echo "Node bootstrap complete."

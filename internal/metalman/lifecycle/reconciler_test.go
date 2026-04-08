@@ -1,9 +1,12 @@
 package lifecycle
 
 import (
+	"log/slog"
+	"os"
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -13,6 +16,11 @@ import (
 
 	v1alpha3 "github.com/project-unbounded/unbounded-kube/api/v1alpha3"
 )
+
+func TestMain(m *testing.M) {
+	ctrl.SetLogger(logr.FromSlogHandler(slog.Default().Handler()))
+	os.Exit(m.Run())
+}
 
 func TestReimageTimeout(t *testing.T) {
 	node := &v1alpha3.Machine{

@@ -4,13 +4,16 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -21,6 +24,11 @@ import (
 
 	v1alpha3 "github.com/project-unbounded/unbounded-kube/api/v1alpha3"
 )
+
+func TestMain(m *testing.M) {
+	ctrl.SetLogger(logr.FromSlogHandler(slog.Default().Handler()))
+	os.Exit(m.Run())
+}
 
 const testToken = "test-auth-token"
 

@@ -13,6 +13,7 @@ import (
 
 	"github.com/project-unbounded/unbounded-kube/cmd/agent/internal/phases"
 	"github.com/project-unbounded/unbounded-kube/cmd/agent/internal/utilio"
+	"github.com/project-unbounded/unbounded-kube/internal/ociutil"
 )
 
 type downloadRootFS struct {
@@ -86,6 +87,9 @@ func (d *downloadRootFS) pullAndUnpack(ctx context.Context, ref, tag string) err
 	if err != nil {
 		return fmt.Errorf("connect to remote repository %q: %w", ref, err)
 	}
+
+	// Use plain HTTP for loopback and private-network registries.
+	ociutil.ConfigurePlainHTTP(repo)
 
 	// Copy (pull) the image from the remote repository into the local OCI layout.
 	desc, err := oras.Copy(ctx, repo, tag, store, tag, oras.DefaultCopyOptions)

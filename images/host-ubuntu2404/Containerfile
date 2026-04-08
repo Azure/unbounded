@@ -12,7 +12,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /unbounded-agent ./cmd/age
 FROM docker.io/library/debian:bookworm-slim AS build
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        cpio curl ca-certificates qemu-utils \
+        cpio curl ca-certificates qemu-utils libguestfs-tools linux-image-amd64 \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Download netboot artifacts ──────────────────────────────────────
@@ -52,9 +52,18 @@ COPY images/host-ubuntu2404/assets/user-data.tmpl             /disk/cloud-init/u
 # ── Download and convert Ubuntu cloud image to raw+gzip ─────────────
 ARG UBUNTU_CLOUDIMG_URL=https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-amd64.img
 
+# Copy the agent binary from the builder so we can inject it into the
+# cloud image before gzipping.  It is also placed at /disk/unbounded-agent
+# (below) so metalman can serve it to other provisioning paths.
+COPY --from=gobuilder /unbounded-agent /tmp/unbounded-agent
+
 RUN curl -fSL -o /tmp/cloudimg.qcow2 "${UBUNTU_CLOUDIMG_URL}" && \
     qemu-img convert -f qcow2 -O raw /tmp/cloudimg.qcow2 /tmp/disk.img && \
     rm /tmp/cloudimg.qcow2 && \
+    LIBGUESTFS_BACKEND=direct virt-customize -a /tmp/disk.img \
+        --mkdir /usr/local/bin \
+        --copy-in /tmp/unbounded-agent:/usr/local/bin \
+        --chmod 0755:/usr/local/bin/unbounded-agent && \
     gzip -1 /tmp/disk.img && \
     mv /tmp/disk.img.gz /disk/disk.img.gz
 

@@ -2,16 +2,12 @@ package netboot
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"os"
-	"strings"
 	"time"
 
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/opencontainers/umoci"
-	"github.com/opencontainers/umoci/oci/casext/mediatype"
 	"github.com/opencontainers/umoci/oci/layer"
 	"oras.land/oras-go/v2"
 	"oras.land/oras-go/v2/content/oci"
@@ -23,63 +19,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1alpha3 "github.com/project-unbounded/unbounded-kube/api/v1alpha3"
-)
-
-// Docker media types that are structurally compatible with OCI equivalents.
-const (
-	dockerMediaTypeManifest     = "application/vnd.docker.distribution.manifest.v2+json"
-	dockerMediaTypeManifestList = "application/vnd.docker.distribution.manifest.list.v2+json"
-	dockerMediaTypeConfig       = "application/vnd.docker.container.image.v1+json"
-	dockerMediaTypeLayer        = "application/vnd.docker.image.rootfs.diff.tar"
-	dockerMediaTypeLayerGzip    = "application/vnd.docker.image.rootfs.diff.tar.gzip"
-	dockerMediaTypeForeignLayer = "application/vnd.docker.image.rootfs.foreign.diff.tar.gzip"
+	"github.com/project-unbounded/unbounded-kube/internal/ociutil"
 )
 
 func init() {
-	// Register parsers for Docker V2 media types so that umoci's
-	// FromDescriptor returns parsed Go structs (ispec.Manifest, ispec.Index,
-	// ispec.Image) instead of raw readers.  Docker V2 manifests and manifest
-	// lists are structurally compatible with their OCI counterparts, so
-	// simple JSON decoding into the OCI types is sufficient.
-	mediatype.RegisterTarget(dockerMediaTypeManifest)
-	mediatype.RegisterParser(dockerMediaTypeManifest, func(rdr io.Reader) (any, error) {
-		var m ispec.Manifest
-		if rdr == nil {
-			return m, nil
-		}
-
-		if err := json.NewDecoder(rdr).Decode(&m); err != nil {
-			return nil, fmt.Errorf("decode Docker manifest: %w", err)
-		}
-
-		return m, nil
-	})
-
-	mediatype.RegisterParser(dockerMediaTypeManifestList, func(rdr io.Reader) (any, error) {
-		var idx ispec.Index
-		if rdr == nil {
-			return idx, nil
-		}
-
-		if err := json.NewDecoder(rdr).Decode(&idx); err != nil {
-			return nil, fmt.Errorf("decode Docker manifest list: %w", err)
-		}
-
-		return idx, nil
-	})
-
-	mediatype.RegisterParser(dockerMediaTypeConfig, func(rdr io.Reader) (any, error) {
-		var img ispec.Image
-		if rdr == nil {
-			return img, nil
-		}
-
-		if err := json.NewDecoder(rdr).Decode(&img); err != nil {
-			return nil, fmt.Errorf("decode Docker image config: %w", err)
-		}
-
-		return img, nil
-	})
+	ociutil.RegisterDockerParsers()
 }
 
 // imageResyncInterval is how often the reconciler re-resolves remote tags
@@ -152,19 +96,15 @@ func (r *OCIReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 }
 
 // newRepository creates a remote.Repository for the given image reference,
-// configuring plain HTTP for localhost registries.
+// configuring plain HTTP for loopback and private-network registries.
 func newRepository(imageRef string) (*remote.Repository, error) {
 	repo, err := remote.NewRepository(imageRef)
 	if err != nil {
 		return nil, fmt.Errorf("parsing image reference %q: %w", imageRef, err)
 	}
 
-	// Use plain HTTP for localhost registries (common in development and testing).
-	host := repo.Reference.Host()
-	if host == "localhost" || strings.HasPrefix(host, "localhost:") ||
-		host == "127.0.0.1" || strings.HasPrefix(host, "127.0.0.1:") {
-		repo.PlainHTTP = true
-	}
+	// Use plain HTTP for loopback and private-network registries.
+	ociutil.ConfigurePlainHTTP(repo)
 
 	return repo, nil
 }
@@ -234,39 +174,6 @@ func (r *OCIReconciler) pullAndUnpack(ctx context.Context, imageRef, imageDigest
 	return nil
 }
 
-// convertDockerMediaTypes rewrites Docker V2 media types in a manifest to
-// their OCI equivalents in-place.  Docker V2 and OCI blobs are structurally
-// identical; only the MIME types differ.  umoci's UnpackRootfs strictly
-// checks for OCI media types, so this conversion is required when pulling
-// images produced by `docker build`.
-func convertDockerMediaTypes(m *ispec.Manifest) {
-	// Config blob.
-	switch m.Config.MediaType {
-	case dockerMediaTypeConfig:
-		m.Config.MediaType = ispec.MediaTypeImageConfig
-	}
-
-	// Layer blobs.
-	for i := range m.Layers {
-		switch m.Layers[i].MediaType {
-		case dockerMediaTypeLayerGzip:
-			m.Layers[i].MediaType = ispec.MediaTypeImageLayerGzip
-		case dockerMediaTypeLayer:
-			m.Layers[i].MediaType = ispec.MediaTypeImageLayer
-		case dockerMediaTypeForeignLayer:
-			m.Layers[i].MediaType = ispec.MediaTypeImageLayerNonDistributableGzip //nolint:staticcheck // matching deprecated OCI type
-		}
-	}
-
-	// Manifest media type itself (stored in the descriptor that points to
-	// this manifest — not inside the manifest JSON — but some tools also
-	// set MediaType inside the manifest body).
-	switch m.MediaType {
-	case dockerMediaTypeManifest:
-		m.MediaType = ispec.MediaTypeImageManifest
-	}
-}
-
 // unpackOCILayout opens an OCI image layout at layoutDir and unpacks the
 // image tagged with the given tag into destDir using umoci. It picks the
 // first available manifest (netboot images are single-platform).
@@ -303,7 +210,7 @@ func unpackOCILayout(ctx context.Context, layoutDir, tag, destDir string) error 
 	// Convert Docker media types to OCI equivalents so that umoci's strict
 	// media-type checks pass. Docker V2 images use different MIME types for
 	// the config and layer blobs but are structurally identical to OCI.
-	convertDockerMediaTypes(&manifest)
+	ociutil.ConvertDockerMediaTypes(&manifest)
 
 	unpackOpts := &layer.UnpackOptions{
 		OnDiskFormat: layer.DirRootfs{
