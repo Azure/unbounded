@@ -3,10 +3,12 @@ package cmd
 import (
 	"encoding/base64"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -41,7 +43,7 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 				return err
 			}
 
-			rootFSGoalState, err := resolveRootFSGoalState(cfg)
+			rootFSGoalState, err := resolveRootFSGoalState(cmdCtx.Logger, cfg)
 			if err != nil {
 				return err
 			}
@@ -93,7 +95,7 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 }
 
 // ref: cmd/machina/machina/controller/machine_controller.go
-func resolveRootFSGoalState(cfg *provision.AgentConfig) (*goalstates.RootFS, error) {
+func resolveRootFSGoalState(log *slog.Logger, cfg *provision.AgentConfig) (*goalstates.RootFS, error) {
 	// TODO: investigate whether the rootfs name can be decoupled from the
 	// machine name. Using a fixed rootfs name (e.g. "node") would simplify
 	// tool invocations (machinectl, systemctl) and allow the nspawn unit to
@@ -112,17 +114,12 @@ func resolveRootFSGoalState(cfg *provision.AgentConfig) (*goalstates.RootFS, err
 		return nil, fmt.Errorf("get host hostname: %w", err)
 	}
 
-	// Prefer OCIImage from config; fall back to AGENT_OCI_IMAGE env var
-	// for backward compatibility with older bootstrap scripts.
-	ociImage := cfg.OCIImage
-	if ociImage == "" {
-		ociImage = strings.TrimSpace(os.Getenv("AGENT_OCI_IMAGE"))
-	}
-
 	nvidia, err := goalstates.ResolveNvidiaHost(runtime.GOARCH)
 	if err != nil {
 		return nil, err
 	}
+
+	ociImage := resolveOCIImage(log, cfg.OCIImage, len(nvidia.GPUDevicePaths) > 0)
 
 	return &goalstates.RootFS{
 		MachineDir: filepath.Join("/var/lib/machines", machineName),
@@ -187,4 +184,39 @@ func resolveKubeletGoalState(cfg *provision.AgentConfig) (goalstates.Kubelet, er
 		NodeLabels:         labels,
 		RegisterWithTaints: cfg.Kubelet.RegisterWithTaints,
 	}, nil
+}
+
+// resolveOCIImage determines the OCI image to use for the nspawn rootfs.
+//
+// The priority is: configImage (from the agent config) >
+// AGENT_DISABLE_OCI_IMAGE env var > AGENT_OCI_IMAGE env var > built-in
+// default selected by GPU presence.
+//
+// When AGENT_DISABLE_OCI_IMAGE is set to a truthy value (e.g. "1", "true"),
+// OCI-based rootfs provisioning is disabled and the agent falls back to
+// debootstrap.
+func resolveOCIImage(log *slog.Logger, configImage string, nvidiaGPUAvailable bool) string {
+	if configImage != "" {
+		return configImage
+	}
+
+	if disabled, err := strconv.ParseBool(os.Getenv("AGENT_DISABLE_OCI_IMAGE")); err == nil && disabled {
+		log.Info("OCI image usage disabled via AGENT_DISABLE_OCI_IMAGE, falling back to debootstrap")
+		return ""
+	}
+
+	if v := strings.TrimSpace(os.Getenv("AGENT_OCI_IMAGE")); v != "" {
+		return v
+	}
+
+	var image string
+	if nvidiaGPUAvailable {
+		image = goalstates.DefaultNvidiaOCImage
+	} else {
+		image = goalstates.DefaultOCIImage
+	}
+
+	log.Info("no OCI image configured, using default", "image", image)
+
+	return image
 }

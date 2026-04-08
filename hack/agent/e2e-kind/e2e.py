@@ -44,7 +44,6 @@ VM_DIR = Path(os.environ.get("VM_DIR", str(REPO_ROOT / ".vm-e2e")))
 
 KIND_CLUSTER_NAME = os.environ.get("KIND_CLUSTER_NAME", "kind")
 AGENT_MACHINE_NAME = os.environ.get("AGENT_MACHINE_NAME", "agent-e2e")
-AGENT_OCI_IMAGE = os.environ.get("AGENT_OCI_IMAGE", "")
 AGENT_DEBUG = os.environ.get("AGENT_DEBUG", "")
 
 BRIDGE_NAME = "virbr-e2e"
@@ -457,11 +456,6 @@ def _run_agent_inner(agent_url: str) -> None:
             "RegisterWithTaints": [],
         },
     }
-    if AGENT_OCI_IMAGE:
-        agent_config["OCIImage"] = AGENT_OCI_IMAGE
-        log(f"Using OCI image for rootfs: {AGENT_OCI_IMAGE}")
-    else:
-        log("No OCI image specified, agent will use debootstrap")
 
     agent_config_path.write_text(json.dumps(agent_config, indent=2))
     agent_config_path.chmod(0o600)  # restrict access; contains bootstrap token

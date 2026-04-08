@@ -35,7 +35,6 @@ jobs:
       VM_SUBNET: "192.168.100"
       VM_IP: "192.168.100.10"
       AGENT_MACHINE_NAME: agent-e2e
-      AGENT_OCI_IMAGE: ghcr.io/project-unbounded/agent-ubuntu2404:ce67830106f97c953fbbf2313156197a5eb3d39c
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
