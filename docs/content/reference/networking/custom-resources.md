@@ -436,15 +436,7 @@ deterministic name order and the first profile is kept.
 
 ## CRD Relationships
 
-```
-  Site ──owns──→ SiteNodeSlice (max 500 nodes per slice)
-  Site ──contains──→ Node (matched by nodeCidrs)
-  GatewayPool ──selects──→ Node (matched by nodeSelector)
-  GatewayPool ──contains──→ GatewayPoolNode
-  SitePeering ──peers──→ Site (2+ sites)
-  SiteGatewayPoolAssignment ──assigns──→ Site + GatewayPool
-  GatewayPoolPeering ──peers──→ GatewayPool (2+ pools)
-```
+![Networking CRD relationships: Site owns SiteNodeSlice and contains Nodes, GatewayPool selects Nodes and contains GatewayPoolNodes, SitePeering peers Sites, SiteGatewayPoolAssignment assigns Site to GatewayPool, GatewayPoolPeering peers GatewayPools](../../../img/networking-crd-relationships.svg)
 
 ## Next Steps
 

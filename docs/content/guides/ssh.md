@@ -11,13 +11,9 @@ resulting Node.
 
 ## Prerequisites
 
-**Target machines** must have:
-
-- Linux (x86_64 or aarch64) with `bash`, `curl`, `tar`, and `sudo`
-- A user account with passwordless sudo
-- SSH server listening (port 22 by default)
-- Outbound internet access to download the unbounded-kube agent binary and Kubernetes binaries
-- Outbound HTTPS to the Kubernetes API server
+{{< callout type="note" >}}
+**Target machines** must have: Linux (x86_64 or aarch64) with `bash`, `curl`, `tar`, and `sudo`; a user account with passwordless sudo; SSH server listening (port 22 by default); outbound internet access to download binaries; and outbound HTTPS to the Kubernetes API server.
+{{< /callout >}}
 
 **Cluster requirements:**
 
@@ -73,9 +69,9 @@ kubectl unbounded site add-machine \
 The three flags `--site`, `--host`, and `--ssh-username` are required.
 `--ssh-private-key` is also required unless bastion flags are provided.
 
-The SSH private key is read from disk and stored as a Kubernetes Secret named
-`ssh-<site>` (e.g. `ssh-mysite`) in the `machina-system` namespace. If the
-Secret already exists, it is updated.
+{{< callout type="important" >}}
+The SSH private key is read from disk and stored as a Kubernetes Secret named `ssh-<site>` (e.g. `ssh-mysite`) in the `machina-system` namespace. If the Secret already exists, it is updated. Ensure your cluster's RBAC restricts access to Secrets in `machina-system`.
+{{< /callout >}}
 
 The machine name is automatically prefixed with the site name. For example,
 `--name worker-01` with `--site mysite` produces a Machine named
@@ -214,10 +210,9 @@ hasn't registered. SSH into the target and check `journalctl -u kubelet` for
 join errors. Verify the bootstrap token hasn't expired and that the machine has
 HTTPS connectivity to the API server.
 
-**Security considerations** -- SSH host key verification is currently disabled.
-SSH keys are stored as Kubernetes Secrets in the `machina-system` namespace.
-The install script runs as root via `sudo -E bash`. All binary downloads use
-HTTPS. Supported key types: Ed25519, RSA, ECDSA.
+{{< callout type="warning" >}}
+**Security considerations** -- SSH host key verification is currently disabled. SSH keys are stored as Kubernetes Secrets in the `machina-system` namespace. The install script runs as root via `sudo -E bash`. Ensure you trust the network path between the machina controller and target machines. All binary downloads use HTTPS. Supported key types: Ed25519, RSA, ECDSA.
+{{< /callout >}}
 
 ## See Also
 

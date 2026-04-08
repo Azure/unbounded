@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 620 340" font-family="Inter, -apple-system, BlinkMacSystemFont, sans-serif">
+  <defs>
+    <marker id="arrowD" markerWidth="7" markerHeight="5" refX="3.5" refY="5" orient="auto">
+      <path d="M0,0 L3.5,5 L7,0" fill="none" stroke="#4d8eff" stroke-width="1.2"/>
+    </marker>
+    <marker id="arrowR" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto">
+      <path d="M0,0 L7,2.5 L0,5" fill="none" stroke="#4d8eff" stroke-width="1.2"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="620" height="340" rx="12" fill="#111113"/>
+
+  <!-- Title -->
+  <text x="310" y="25" text-anchor="middle" fill="#e4e4e7" font-size="13" font-weight="700">Protocol Selection Algorithm</text>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- Entry: CRD scope value                             -->
+  <!-- ═══════════════════════════════════════════════════ -->
+  <rect x="165" y="45" width="150" height="30" rx="6" fill="#18181b" stroke="#a78bfa" stroke-width="1.5" stroke-opacity="0.6"/>
+  <text x="240" y="65" text-anchor="middle" fill="#a78bfa" font-size="11" font-weight="600">CRD scope value</text>
+
+  <line x1="240" y1="75" x2="240" y2="95" stroke="#4d8eff" stroke-width="1.5" marker-end="url(#arrowD)"/>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- Decision 1: nil or "Auto"?                         -->
+  <!-- ═══════════════════════════════════════════════════ -->
+  <rect x="155" y="100" width="170" height="36" rx="8" fill="#1e1e22" stroke="#2a2a2e" stroke-width="1.5"/>
+  <text x="240" y="123" text-anchor="middle" fill="#e4e4e7" font-size="11" font-weight="600">nil or "Auto"?</text>
+
+  <!-- No branch -> explicit protocol -->
+  <line x1="325" y1="118" x2="395" y2="118" stroke="#4d8eff" stroke-width="1.5" marker-end="url(#arrowR)"/>
+  <text x="360" y="112" text-anchor="middle" fill="#a0a0a8" font-size="10">no</text>
+
+  <rect x="400" y="103" width="195" height="32" rx="6" fill="#18181b" stroke="#34d399" stroke-width="1.5" stroke-opacity="0.6"/>
+  <text x="497" y="124" text-anchor="middle" fill="#34d399" font-size="11" font-weight="600">Use the explicit protocol</text>
+
+  <!-- Yes branch -> down -->
+  <line x1="240" y1="136" x2="240" y2="162" stroke="#4d8eff" stroke-width="1.5" marker-end="url(#arrowD)"/>
+  <text x="255" y="153" fill="#a0a0a8" font-size="10">yes</text>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- Decision 2: Uses external / public IPs?            -->
+  <!-- ═══════════════════════════════════════════════════ -->
+  <rect x="125" y="167" width="230" height="36" rx="8" fill="#1e1e22" stroke="#2a2a2e" stroke-width="1.5"/>
+  <text x="240" y="190" text-anchor="middle" fill="#e4e4e7" font-size="11" font-weight="600">Uses external / public IPs?</text>
+
+  <!-- Yes branch -> WireGuard -->
+  <line x1="355" y1="185" x2="395" y2="185" stroke="#4d8eff" stroke-width="1.5" marker-end="url(#arrowR)"/>
+  <text x="375" y="179" text-anchor="middle" fill="#a0a0a8" font-size="10">yes</text>
+
+  <rect x="400" y="168" width="195" height="36" rx="6" fill="#18181b" stroke="#4d8eff" stroke-width="1.5" stroke-opacity="0.6"/>
+  <!-- lock icon -->
+  <rect x="412" y="179" width="10" height="7" rx="1.5" fill="none" stroke="#4d8eff" stroke-width="0.9"/>
+  <path d="M414,179 L414,176 A3,3 0 0,1 420,176 L420,179" fill="none" stroke="#4d8eff" stroke-width="0.9"/>
+  <text x="430" y="191" fill="#4d8eff" font-size="11" font-weight="600">WireGuard</text>
+  <text x="497" y="191" fill="#a0a0a8" font-size="9">(security-wins)</text>
+
+  <!-- No branch -> down -->
+  <line x1="240" y1="203" x2="240" y2="230" stroke="#4d8eff" stroke-width="1.5" marker-end="url(#arrowD)"/>
+  <text x="255" y="220" fill="#a0a0a8" font-size="10">no</text>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- Result: Use ConfigMap preferred-private-encap       -->
+  <!-- ═══════════════════════════════════════════════════ -->
+  <rect x="105" y="235" width="270" height="80" rx="8" fill="#18181b" stroke="#2a2a2e" stroke-width="1.5"/>
+  <text x="240" y="260" text-anchor="middle" fill="#e4e4e7" font-size="11" font-weight="600">Use ConfigMap</text>
+  <text x="240" y="280" text-anchor="middle" fill="#a0a0a8" font-size="10" font-family="'SF Mono', 'Fira Code', monospace">--preferred-private-encap</text>
+  <text x="240" y="305" text-anchor="middle" fill="#a0a0a8" font-size="10">(default: <tspan fill="#34d399" font-weight="600">GENEVE</tspan>)</text>
+</svg>

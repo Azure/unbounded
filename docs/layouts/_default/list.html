@@ -1,16 +1,48 @@
 {{ define "main" }}
-<section class="content-list">
+<section class="content-list" data-pagefind-body>
+  {{- partial "breadcrumbs.html" . }}
   <h1>{{ .Title }}</h1>
+  {{ with .Params.description }}<p class="section-description">{{ . }}</p>{{ end }}
   {{ .Content }}
-  <ul class="page-list">
-    {{- range .Pages }}
-    <li>
-      <a href="{{ .RelPermalink }}">
-        <strong>{{ .Title }}</strong>
-        {{ with .Params.description }}<span class="desc">{{ . }}</span>{{ end }}
-      </a>
-    </li>
+  {{- $regularPages := .RegularPages -}}
+  {{- $sections := .Sections -}}
+  {{- if gt (len $sections) 0 }}
+  {{/* Has subsections — show grouped cards */}}
+  {{- if gt (len $regularPages) 0 }}
+  <div class="grid grid-cards">
+    {{- range $regularPages }}
+    <a href="{{ .RelPermalink }}" class="card card-link">
+      <h3>{{ .Title }}</h3>
+      {{ with .Params.description }}<p>{{ . }}</p>{{ end }}
+      <span class="card-arrow">&rarr;</span>
+    </a>
     {{- end }}
-  </ul>
+  </div>
+  {{- end }}
+  {{- range $sections }}
+  <h2 class="subsection-heading">{{ .Title }}</h2>
+  {{ with .Params.description }}<p class="subsection-desc">{{ . }}</p>{{ end }}
+  <div class="grid grid-cards">
+    {{- range .Pages }}
+    <a href="{{ .RelPermalink }}" class="card card-link">
+      <h3>{{ .Title }}</h3>
+      {{ with .Params.description }}<p>{{ . }}</p>{{ end }}
+      <span class="card-arrow">&rarr;</span>
+    </a>
+    {{- end }}
+  </div>
+  {{- end }}
+  {{ else }}
+  {{/* Flat section — show cards for all pages */}}
+  <div class="grid grid-cards">
+    {{- range .Pages }}
+    <a href="{{ .RelPermalink }}" class="card card-link">
+      <h3>{{ .Title }}</h3>
+      {{ with .Params.description }}<p>{{ . }}</p>{{ end }}
+      <span class="card-arrow">&rarr;</span>
+    </a>
+    {{- end }}
+  </div>
+  {{ end }}
 </section>
 {{ end }}

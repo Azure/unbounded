@@ -86,6 +86,10 @@ chmod +x aks-quickstart.sh
 | `--remote-node-cidr` | Subnet of your remote machines (e.g. `192.168.1.0/24`). Must not overlap with the AKS VNet. |
 | `--remote-pod-cidr` | IP range to allocate for pods at the remote site (e.g. `10.245.0.0/16`). Must not overlap with the cluster's pod or service CIDRs. |
 
+{{< callout type="warning" >}}
+The `--remote-node-cidr` and `--remote-pod-cidr` ranges must not overlap with the AKS VNet, pod CIDR, or service CIDR. Overlapping ranges will cause routing failures that are difficult to diagnose after the cluster is running.
+{{< /callout >}}
+
 <details>
 <summary>All options</summary>
 
@@ -203,11 +207,9 @@ and manages WireGuard keys. A **node agent** (DaemonSet) configures WireGuard
 interfaces and programs routes. Cross-site traffic is encrypted; intra-site
 traffic uses GENEVE.
 
-If your remote site already has private L3 connectivity to the cluster (e.g.
-Azure ExpressRoute, VPN Gateway, or AWS Direct Connect), you can skip the
-WireGuard overlay entirely and route directly over the existing link. See
-[Externally Peered Sites]({{< relref "concepts/networking#externally-peered-sites" >}})
-for the `SitePeering` configuration.
+{{< callout type="tip" >}}
+If your remote site already has private L3 connectivity to the cluster (e.g. Azure ExpressRoute, VPN Gateway, or AWS Direct Connect), you can skip the WireGuard overlay entirely and route directly over the existing link. See [Externally Peered Sites]({{< relref "concepts/networking#externally-peered-sites" >}}) for the `SitePeering` configuration.
+{{< /callout >}}
 
 ### Site Resources
 
@@ -238,6 +240,10 @@ methods are also supported:
 ## Cleanup
 
 Delete the resource group to remove all Azure resources:
+
+{{< callout type="warning" >}}
+This permanently deletes the entire resource group and all resources within it, including the AKS cluster, gateway nodes, and networking configuration. This action cannot be undone.
+{{< /callout >}}
 
 ```bash
 az group delete --name my-unbounded --yes --no-wait

@@ -21,13 +21,122 @@
       btn.addEventListener("click", function () {
         var code = pre.querySelector("code");
         var text = (code || pre).textContent;
-        navigator.clipboard.writeText(text).then(function () {
+        function onSuccess() {
           btn.innerHTML = checkIcon;
           setTimeout(function () { btn.innerHTML = copyIcon; }, 1500);
-        });
+        }
+        if (navigator.clipboard && window.isSecureContext) {
+          navigator.clipboard.writeText(text).then(onSuccess);
+        } else {
+          var ta = document.createElement("textarea");
+          ta.value = text;
+          ta.style.position = "fixed";
+          ta.style.left = "-9999px";
+          document.body.appendChild(ta);
+          ta.select();
+          try { document.execCommand("copy"); onSuccess(); } catch(e) {}
+          document.body.removeChild(ta);
+        }
       });
       pre.appendChild(btn);
     });
+
+    // ── TOC active-heading tracking ──────────────────────────
+    var toc = document.querySelector(".toc-sidebar #TableOfContents");
+    if (toc) {
+      var tocLinks = toc.querySelectorAll("a");
+      var headings = [];
+      tocLinks.forEach(function (link) {
+        var id = decodeURIComponent(link.getAttribute("href").slice(1));
+        var el = document.getElementById(id);
+        if (el) headings.push({ el: el, link: link });
+      });
+
+      function updateActive() {
+        var scrollY = window.scrollY;
+        var offset = 100;
+        var current = null;
+        for (var i = 0; i < headings.length; i++) {
+          if (headings[i].el.getBoundingClientRect().top + window.scrollY - offset <= scrollY) {
+            current = headings[i];
+          }
+        }
+        tocLinks.forEach(function (l) { l.classList.remove("active"); });
+        if (current) current.link.classList.add("active");
+      }
+
+      window.addEventListener("scroll", updateActive, { passive: true });
+      updateActive();
+    }
+
+    // ── Search modal ──────────────────────────────────────────
+    var pagefind = null;
+    var modal = document.getElementById("search-modal");
+    var input = document.getElementById("search-input");
+    var results = document.getElementById("search-results");
+    var trigger = document.getElementById("search-trigger");
+    var backdrop = modal ? modal.querySelector(".search-modal-backdrop") : null;
+    var closeBtn = document.getElementById("search-close");
+
+    function openSearch() {
+      if (!modal) return;
+      modal.hidden = false;
+      document.body.style.overflow = "hidden";
+      input.value = "";
+      results.innerHTML = "";
+      setTimeout(function() { input.focus(); }, 50);
+      if (!pagefind) {
+        import("{{ "pagefind/pagefind.js" | relURL }}")
+          .then(function(pf) { pagefind = pf; pagefind.init(); })
+          .catch(function() { results.innerHTML = '<p class="search-no-results">Search index not found. Run <code>pagefind --site public/</code> after building.</p>'; });
+      }
+    }
+
+    function closeSearch() {
+      if (!modal) return;
+      modal.hidden = true;
+      document.body.style.overflow = "";
+    }
+
+    if (trigger) trigger.addEventListener("click", openSearch);
+    if (backdrop) backdrop.addEventListener("click", closeSearch);
+    if (closeBtn) closeBtn.addEventListener("click", closeSearch);
+
+    document.addEventListener("keydown", function(e) {
+      if (e.key === "/" && !modal.hidden === false && document.activeElement.tagName !== "INPUT" && document.activeElement.tagName !== "TEXTAREA") {
+        e.preventDefault();
+        openSearch();
+      }
+      if (e.key === "Escape" && modal && !modal.hidden) {
+        closeSearch();
+      }
+    });
+
+    var debounce;
+    if (input) {
+      input.addEventListener("input", function() {
+        clearTimeout(debounce);
+        var query = input.value.trim();
+        if (!query) { results.innerHTML = ""; return; }
+        debounce = setTimeout(function() {
+          if (!pagefind) return;
+          pagefind.search(query).then(function(search) {
+            if (!search.results.length) {
+              results.innerHTML = '<p class="search-no-results">No results for "' + query.replace(/</g,"&lt;") + '"</p>';
+              return;
+            }
+            Promise.all(search.results.slice(0, 8).map(function(r) { return r.data(); })).then(function(items) {
+              results.innerHTML = items.map(function(item) {
+                return '<a href="' + item.url + '" class="search-result">'
+                  + '<span class="search-result-title">' + item.meta.title + '</span>'
+                  + '<span class="search-result-excerpt">' + item.excerpt + '</span>'
+                  + '</a>';
+              }).join("");
+            });
+          });
+        }, 200);
+      });
+    }
   });
   </script>
 </body>

@@ -9,6 +9,10 @@ title = "Unbounded Kube"
   [markup.goldmark]
     [markup.goldmark.renderer]
       unsafe = true
+  [markup.tableOfContents]
+    startLevel = 2
+    endLevel = 3
+    ordered = false
 
 [params]
   description = "Run nodes across multiple cloud providers and bare-metal infrastructure to form a unified Kubernetes cluster, no matter where your infrastructure lives."
@@ -17,15 +21,15 @@ title = "Unbounded Kube"
 [menu]
   [[menu.main]]
     name = "Guides"
-    url = "/guides/"
+    pageRef = "/guides"
     weight = 1
   [[menu.main]]
     name = "Concepts"
-    url = "/concepts/"
+    pageRef = "/concepts"
     weight = 2
   [[menu.main]]
     name = "Reference"
-    url = "/reference/"
+    pageRef = "/reference"
     weight = 3
   [[menu.main]]
     name = "GitHub"

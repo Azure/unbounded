@@ -51,6 +51,7 @@
         <span class="step-num">1</span>
         <div>
           <strong><a href="{{ "guides/getting-started/#install-kubectl-unbounded" | relURL }}">Install the kubectl plugin</a></strong>
+          <code class="step-output">$ kubectl unbounded --help</code>
         </div>
       </li>
       <li>
@@ -58,6 +59,7 @@
         <div>
           <strong><a href="{{ "guides/getting-started/#initialize-a-site" | relURL }}">Initialize a site</a></strong>
           <span class="step-desc">&mdash; sets up networking and the machina controller</span>
+          <code class="step-output">$ kubectl unbounded site init --name mysite ...</code>
         </div>
       </li>
       <li>
@@ -65,6 +67,7 @@
         <div>
           <strong><a href="{{ "guides/getting-started/#add-machines" | relURL }}">Add machines</a></strong>
           <span class="step-desc">&mdash; via SSH, cloud-init, or PXE</span>
+          <code class="step-output">$ kubectl unbounded site add-machine --host 10.0.0.5 ...</code>
         </div>
       </li>
       <li>
@@ -72,6 +75,7 @@
         <div>
           <strong>Watch them join</strong>
           <span class="step-desc">&mdash; Pending &rarr; Provisioning &rarr; Joining &rarr; Ready</span>
+          <code class="step-output">$ kubectl get machines -w</code>
         </div>
       </li>
     </ol>
@@ -80,27 +84,38 @@
 
 <section class="overview">
   <h2>Explore the Docs</h2>
-  <div class="grid">
-    <div class="card">
-      <h3>Core Concepts</h3>
-      <p>Architecture, components, and design decisions behind Project Unbounded.</p>
-      <a href="{{ "concepts/overview" | relURL }}">Read Overview &rarr;</a>
-    </div>
-    <div class="card">
-      <h3>Cloud Bootstrapping</h3>
-      <p>Join Linux machines to your cluster using SSH.</p>
-      <a href="{{ "guides/ssh" | relURL }}">SSH Guide &rarr;</a>
-    </div>
-    <div class="card">
-	  <h3>Bare Metal (PXE)</h3>
-      <p>Netboot bare metal machines into your cluster.</p>
-      <a href="{{ "guides/pxe" | relURL }}">PXE Guide &rarr;</a>
-    </div>
-    <div class="card">
-	  <h3>Networking Reference</h3>
-      <p>CRDs, configuration, routing flows, and operations for unbounded-net.</p>
-      <a href="{{ "reference/networking" | relURL }}">Reference &rarr;</a>
-    </div>
+  <p class="overview-lead">Jump to what you need.</p>
+  <div class="grid grid-3">
+    <a href="{{ "guides/ssh" | relURL }}" class="card card-link">
+      <h3>Add a Remote Node via SSH</h3>
+      <p>Point machina at any reachable Linux host and watch it join your cluster.</p>
+      <span class="card-arrow">&rarr;</span>
+    </a>
+    <a href="{{ "guides/pxe" | relURL }}" class="card card-link">
+      <h3>PXE Boot Bare-Metal Servers</h3>
+      <p>Netboot machines with metalman's DHCP, TFTP, and HTTP stack.</p>
+      <span class="card-arrow">&rarr;</span>
+    </a>
+    <a href="{{ "guides/cloud-api" | relURL }}" class="card card-link">
+      <h3>Connect Cloud Instances</h3>
+      <p>Spin up GPU or compute instances and have them join via cloud-init.</p>
+      <span class="card-arrow">&rarr;</span>
+    </a>
+    <a href="{{ "reference/networking/" | relURL }}" class="card card-link">
+      <h3>Set Up Cross-Site Networking</h3>
+      <p>WireGuard tunnels, GENEVE overlays, and eBPF routing across sites.</p>
+      <span class="card-arrow">&rarr;</span>
+    </a>
+    <a href="{{ "guides/existing-cluster" | relURL }}" class="card card-link">
+      <h3>Deploy to an Existing Cluster</h3>
+      <p>Add Unbounded to a cluster you already have running.</p>
+      <span class="card-arrow">&rarr;</span>
+    </a>
+    <a href="{{ "reference/architecture" | relURL }}" class="card card-link">
+      <h3>Understand the Architecture</h3>
+      <p>Controllers, CRDs, provisioning flows, and network topology.</p>
+      <span class="card-arrow">&rarr;</span>
+    </a>
   </div>
 </section>
 {{ end }}

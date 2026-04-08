@@ -32,27 +32,7 @@ The agent's GPU support spans two bootstrap phases: **rootfs** (nspawn
 configuration) and **node-start** (runtime setup inside the container). The
 full sequence is:
 
-```
-  Host (with NVIDIA drivers)
-  ┌──────────────────────────────────────────────────────────┐
-  │  /dev/nvidia0..N, /dev/nvidiactl, /dev/nvidia-uvm, ...  │
-  │  /dev/nvidia-caps/*, /dev/dri/card*, /dev/dri/renderD*   │
-  │  /usr/lib/x86_64-linux-gnu/libcuda.so.*, libnvidia-*    │
-  └──────────────┬───────────────────────────────────────────┘
-                 │
-                 │  bind-mount devices + libraries
-                 ▼
-  nspawn Container
-  ┌──────────────────────────────────────────────────────────┐
-  │  /dev/nvidia0..N  (bind-mounted from host)               │
-  │  /run/host-nvidia/0/libcuda.so.* (read-only bind-mount)  │
-  │  /usr/lib/x86_64-linux-gnu/libcuda.so.* -> /run/host-*  │
-  │                                                          │
-  │  nvidia-ctk cdi generate -> /etc/cdi/nvidia.yaml         │
-  │  containerd + nvidia-container-runtime                   │
-  │  kubelet                                                 │
-  └──────────────────────────────────────────────────────────┘
-```
+![NVIDIA GPU architecture: Host devices and libraries bind-mounted into nspawn container running nvidia-ctk, containerd with nvidia runtime, and kubelet](../../../img/gpu-nvidia-host-container.svg)
 
 1. **Device discovery.** Scans `/dev` for NVIDIA device nodes (per-GPU,
    control, UVM, capability, and DRI render nodes). If none are found, the

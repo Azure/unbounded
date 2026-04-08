@@ -1,6 +1,84 @@
 {{ define "main" }}
+{{- $hasTOC := gt (len .Fragments.Headings) 0 -}}
+{{- $sectionPages := .CurrentSection.Pages -}}
+{{- $hasSectionNav := gt (len $sectionPages) 1 -}}
+{{- $hasSidebar := or $hasTOC $hasSectionNav -}}
+{{ if $hasSidebar }}
+<div class="page-with-toc">
+  <aside class="toc-sidebar" aria-label="Page navigation">
+    <div class="toc-inner">
+      {{- if $hasSectionNav }}
+      <span class="toc-heading">In this section</span>
+      <ul class="section-nav">
+        {{- range $sectionPages }}
+        <li{{ if eq $.RelPermalink .RelPermalink }} class="active"{{ end }}>
+          {{- if eq $.RelPermalink .RelPermalink -}}
+          <span>{{ .Title }}</span>
+          {{- else -}}
+          <a href="{{ .RelPermalink }}">{{ .Title }}</a>
+          {{- end -}}
+        </li>
+        {{- end }}
+      </ul>
+      {{- end }}
+      {{- if and $hasTOC $hasSectionNav }}
+      <hr class="toc-divider">
+      {{- end }}
+      {{- if $hasTOC }}
+      <span class="toc-heading">On this page</span>
+      {{ .TableOfContents }}
+      {{- end }}
+    </div>
+  </aside>
+  <article class="content-single" data-pagefind-body>
+    {{- partial "breadcrumbs.html" . }}
+    <h1>{{ .Title }}</h1>
+    {{ with .Params.description }}<p class="page-description">{{ . }}</p>{{ end }}
+    {{ .Content }}
+    {{- if .File }}
+    <div class="edit-link">
+      <a href="{{ .Site.Params.repo }}/edit/main/docs/content/{{ .File.Path }}" target="_blank" rel="noopener">
+        <svg viewBox="0 0 16 16" fill="currentColor" class="edit-icon"><path d="M11.013 1.427a1.75 1.75 0 0 1 2.474 0l1.086 1.086a1.75 1.75 0 0 1 0 2.474l-8.61 8.61c-.21.21-.47.364-.756.445l-3.251.93a.75.75 0 0 1-.927-.928l.929-3.25c.081-.286.235-.547.445-.758zm1.414 1.06a.25.25 0 0 0-.354 0L3.46 11.1a.25.25 0 0 0-.063.108l-.558 1.953 1.953-.558a.249.249 0 0 0 .108-.063l8.614-8.613a.25.25 0 0 0 0-.354z"/></svg>
+        Edit this page on GitHub
+      </a>
+    </div>
+    {{- end }}
+    {{- $prev := .PrevInSection -}}
+    {{- $next := .NextInSection -}}
+    {{- if or $prev $next }}
+    <nav class="prev-next" aria-label="Previous and next pages">
+      {{- if $prev }}
+      <a href="{{ $prev.RelPermalink }}" class="prev-next-link prev-link">
+        <span class="prev-next-label">&larr; Previous</span>
+        <span class="prev-next-title">{{ $prev.Title }}</span>
+      </a>
+      {{- else }}
+      <span></span>
+      {{- end }}
+      {{- if $next }}
+      <a href="{{ $next.RelPermalink }}" class="prev-next-link next-link">
+        <span class="prev-next-label">Next &rarr;</span>
+        <span class="prev-next-title">{{ $next.Title }}</span>
+      </a>
+      {{- end }}
+    </nav>
+    {{- end }}
+  </article>
+</div>
+{{ else }}
 <article class="content-single">
+  {{- partial "breadcrumbs.html" . }}
   <h1>{{ .Title }}</h1>
+  {{ with .Params.description }}<p class="page-description">{{ . }}</p>{{ end }}
   {{ .Content }}
+  {{- if .File }}
+  <div class="edit-link">
+    <a href="{{ .Site.Params.repo }}/edit/main/docs/content/{{ .File.Path }}" target="_blank" rel="noopener">
+      <svg viewBox="0 0 16 16" fill="currentColor" class="edit-icon"><path d="M11.013 1.427a1.75 1.75 0 0 1 2.474 0l1.086 1.086a1.75 1.75 0 0 1 0 2.474l-8.61 8.61c-.21.21-.47.364-.756.445l-3.251.93a.75.75 0 0 1-.927-.928l.929-3.25c.081-.286.235-.547.445-.758zm1.414 1.06a.25.25 0 0 0-.354 0L3.46 11.1a.25.25 0 0 0-.063.108l-.558 1.953 1.953-.558a.249.249 0 0 0 .108-.063l8.614-8.613a.25.25 0 0 0 0-.354z"/></svg>
+      Edit this page on GitHub
+    </a>
+  </div>
+  {{- end }}
 </article>
+{{ end }}
 {{ end }}

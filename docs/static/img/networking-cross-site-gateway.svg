@@ -1,0 +1,146 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 400" font-family="Inter, -apple-system, BlinkMacSystemFont, sans-serif">
+  <defs>
+    <marker id="arrowD" markerWidth="7" markerHeight="5" refX="3.5" refY="5" orient="auto">
+      <path d="M0,0 L3.5,5 L7,0" fill="none" stroke="#4d8eff" stroke-width="1.2"/>
+    </marker>
+    <marker id="arrowR" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto">
+      <path d="M0,0 L7,2.5 L0,5" fill="none" stroke="#4d8eff" stroke-width="1.2"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="820" height="400" rx="12" fill="#111113"/>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- Column 1: Site 1 Worker                            -->
+  <!-- ═══════════════════════════════════════════════════ -->
+  <rect x="10" y="10" width="185" height="375" rx="8" fill="none" stroke="#2a2a2e" stroke-width="1.5"/>
+  <text x="102" y="30" text-anchor="middle" fill="#e4e4e7" font-size="11" font-weight="700">Site 1 Worker</text>
+
+  <rect x="27" y="40" width="150" height="24" rx="4" fill="#18181b" stroke="#34d399" stroke-width="0.8" stroke-opacity="0.5"/>
+  <text x="102" y="57" text-anchor="middle" fill="#34d399" font-size="10" font-weight="600">Pod (src)</text>
+  <line x1="102" y1="64" x2="102" y2="76" stroke="#4d8eff" stroke-width="1" marker-end="url(#arrowD)"/>
+
+  <rect x="42" y="79" width="120" height="22" rx="4" fill="#1e1e22" stroke="#2a2a2e" stroke-width="0.8"/>
+  <text x="102" y="94" text-anchor="middle" fill="#a0a0a8" font-size="9" font-family="'SF Mono', 'Fira Code', monospace">cbr0</text>
+  <line x1="102" y1="101" x2="102" y2="113" stroke="#4d8eff" stroke-width="1" marker-end="url(#arrowD)"/>
+
+  <rect x="22" y="116" width="160" height="24" rx="4" fill="#1e1e22" stroke="#a78bfa" stroke-width="0.8" stroke-opacity="0.5"/>
+  <text x="102" y="133" text-anchor="middle" fill="#a78bfa" font-size="9">unbounded0 -> BPF</text>
+  <line x1="102" y1="140" x2="102" y2="152" stroke="#4d8eff" stroke-width="1" marker-end="url(#arrowD)"/>
+
+  <rect x="22" y="155" width="160" height="24" rx="4" fill="#1e1e22" stroke="#a78bfa" stroke-width="0.8" stroke-opacity="0.5"/>
+  <text x="102" y="172" text-anchor="middle" fill="#a78bfa" font-size="8">LPM -> redirect(wg51821)</text>
+  <line x1="102" y1="179" x2="102" y2="191" stroke="#4d8eff" stroke-width="1" marker-end="url(#arrowD)"/>
+
+  <rect x="22" y="194" width="160" height="28" rx="4" fill="#1e1e22" stroke="#4d8eff" stroke-width="0.8" stroke-opacity="0.5"/>
+  <rect x="32" y="202" width="8" height="6" rx="1" fill="none" stroke="#4d8eff" stroke-width="0.7"/>
+  <path d="M34,202 L34,200 A2,2 0 0,1 38,200 L38,202" fill="none" stroke="#4d8eff" stroke-width="0.7"/>
+  <text x="48" y="212" fill="#4d8eff" font-size="9" font-weight="600">wg51821 encrypt</text>
+  <line x1="102" y1="222" x2="102" y2="234" stroke="#4d8eff" stroke-width="1" marker-end="url(#arrowD)"/>
+
+  <rect x="42" y="237" width="120" height="22" rx="4" fill="#18181b" stroke="#2a2a2e" stroke-width="0.8"/>
+  <text x="102" y="252" text-anchor="middle" fill="#a0a0a8" font-size="9" font-family="'SF Mono', 'Fira Code', monospace">eth0</text>
+
+  <!-- LAN arrow right -->
+  <line x1="162" y1="248" x2="205" y2="248" stroke="#4d8eff" stroke-width="1.2" marker-end="url(#arrowR)"/>
+  <text x="183" y="270" text-anchor="middle" fill="#a0a0a8" font-size="7">LAN</text>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- Column 2: Site 1 Gateway                           -->
+  <!-- ═══════════════════════════════════════════════════ -->
+  <rect x="208" y="10" width="195" height="375" rx="8" fill="none" stroke="#4d8eff" stroke-width="1.5" stroke-opacity="0.5"/>
+  <text x="305" y="30" text-anchor="middle" fill="#e4e4e7" font-size="11" font-weight="700">Site 1 Gateway</text>
+
+  <rect x="225" y="40" width="160" height="22" rx="4" fill="#1e1e22" stroke="#2a2a2e" stroke-width="0.8"/>
+  <text x="305" y="55" text-anchor="middle" fill="#a0a0a8" font-size="9" font-family="'SF Mono', 'Fira Code', monospace">eth0</text>
+  <line x1="305" y1="62" x2="305" y2="74" stroke="#4d8eff" stroke-width="1" marker-end="url(#arrowD)"/>
+
+  <rect x="225" y="77" width="160" height="22" rx="4" fill="#1e1e22" stroke="#4d8eff" stroke-width="0.8" stroke-opacity="0.4"/>
+  <text x="305" y="93" text-anchor="middle" fill="#a0a0a8" font-size="9">wg51821 (decrypt)</text>
+  <line x1="305" y1="99" x2="305" y2="111" stroke="#4d8eff" stroke-width="1" marker-end="url(#arrowD)"/>
+
+  <text x="305" y="124" text-anchor="middle" fill="#a0a0a8" font-size="8">kernel fwd</text>
+  <line x1="305" y1="128" x2="305" y2="140" stroke="#4d8eff" stroke-width="1" marker-end="url(#arrowD)"/>
+
+  <rect x="225" y="143" width="160" height="22" rx="4" fill="#1e1e22" stroke="#a78bfa" stroke-width="0.8" stroke-opacity="0.5"/>
+  <text x="305" y="158" text-anchor="middle" fill="#a78bfa" font-size="9">unbounded0 -> BPF</text>
+  <line x1="305" y1="165" x2="305" y2="177" stroke="#4d8eff" stroke-width="1" marker-end="url(#arrowD)"/>
+
+  <rect x="225" y="180" width="160" height="22" rx="4" fill="#1e1e22" stroke="#a78bfa" stroke-width="0.8" stroke-opacity="0.5"/>
+  <text x="305" y="195" text-anchor="middle" fill="#a78bfa" font-size="8">LPM -> redirect(wg51822)</text>
+  <line x1="305" y1="202" x2="305" y2="214" stroke="#4d8eff" stroke-width="1" marker-end="url(#arrowD)"/>
+
+  <rect x="225" y="217" width="160" height="28" rx="4" fill="#1e1e22" stroke="#4d8eff" stroke-width="0.8" stroke-opacity="0.5"/>
+  <rect x="235" y="225" width="8" height="6" rx="1" fill="none" stroke="#4d8eff" stroke-width="0.7"/>
+  <path d="M237,225 L237,223 A2,2 0 0,1 241,223 L241,225" fill="none" stroke="#4d8eff" stroke-width="0.7"/>
+  <text x="251" y="235" fill="#4d8eff" font-size="9" font-weight="600">wg51822 encrypt</text>
+  <line x1="305" y1="245" x2="305" y2="257" stroke="#4d8eff" stroke-width="1" marker-end="url(#arrowD)"/>
+
+  <rect x="225" y="260" width="160" height="22" rx="4" fill="#18181b" stroke="#2a2a2e" stroke-width="0.8"/>
+  <text x="305" y="275" text-anchor="middle" fill="#a0a0a8" font-size="9">eth0 (public IP)</text>
+
+  <!-- WAN arrow right -->
+  <line x1="385" y1="271" x2="415" y2="271" stroke="#4d8eff" stroke-width="2" stroke-dasharray="6,4" marker-end="url(#arrowR)"/>
+  <text x="400" y="290" text-anchor="middle" fill="#4d8eff" font-size="8" font-weight="600">WAN</text>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- Column 3: Site 2 Gateway                           -->
+  <!-- ═══════════════════════════════════════════════════ -->
+  <rect x="418" y="10" width="195" height="375" rx="8" fill="none" stroke="#4d8eff" stroke-width="1.5" stroke-opacity="0.5"/>
+  <text x="515" y="30" text-anchor="middle" fill="#e4e4e7" font-size="11" font-weight="700">Site 2 Gateway</text>
+
+  <rect x="435" y="40" width="160" height="22" rx="4" fill="#18181b" stroke="#2a2a2e" stroke-width="0.8"/>
+  <text x="515" y="55" text-anchor="middle" fill="#a0a0a8" font-size="9">eth0 (public IP)</text>
+  <line x1="515" y1="62" x2="515" y2="74" stroke="#4d8eff" stroke-width="1" marker-end="url(#arrowD)"/>
+
+  <rect x="435" y="77" width="160" height="22" rx="4" fill="#1e1e22" stroke="#4d8eff" stroke-width="0.8" stroke-opacity="0.4"/>
+  <text x="515" y="93" text-anchor="middle" fill="#a0a0a8" font-size="9">wg (decrypt)</text>
+  <line x1="515" y1="99" x2="515" y2="111" stroke="#4d8eff" stroke-width="1" marker-end="url(#arrowD)"/>
+
+  <text x="515" y="124" text-anchor="middle" fill="#a0a0a8" font-size="8">kernel fwd</text>
+  <line x1="515" y1="128" x2="515" y2="140" stroke="#4d8eff" stroke-width="1" marker-end="url(#arrowD)"/>
+
+  <rect x="435" y="143" width="160" height="22" rx="4" fill="#1e1e22" stroke="#a78bfa" stroke-width="0.8" stroke-opacity="0.5"/>
+  <text x="515" y="158" text-anchor="middle" fill="#a78bfa" font-size="9">unbounded0 -> BPF</text>
+  <line x1="515" y1="165" x2="515" y2="177" stroke="#4d8eff" stroke-width="1" marker-end="url(#arrowD)"/>
+
+  <rect x="435" y="180" width="160" height="22" rx="4" fill="#1e1e22" stroke="#a78bfa" stroke-width="0.8" stroke-opacity="0.5"/>
+  <text x="515" y="195" text-anchor="middle" fill="#a78bfa" font-size="8">set_tunnel_key -> redirect(geneve0)</text>
+  <line x1="515" y1="202" x2="515" y2="214" stroke="#4d8eff" stroke-width="1" marker-end="url(#arrowD)"/>
+
+  <rect x="435" y="217" width="160" height="22" rx="4" fill="#1e1e22" stroke="#2a2a2e" stroke-width="0.8"/>
+  <text x="515" y="233" text-anchor="middle" fill="#a0a0a8" font-size="9">geneve0 (encap)</text>
+  <line x1="515" y1="239" x2="515" y2="251" stroke="#4d8eff" stroke-width="1" marker-end="url(#arrowD)"/>
+
+  <rect x="435" y="254" width="160" height="22" rx="4" fill="#18181b" stroke="#2a2a2e" stroke-width="0.8"/>
+  <text x="515" y="269" text-anchor="middle" fill="#a0a0a8" font-size="9" font-family="'SF Mono', 'Fira Code', monospace">eth0</text>
+
+  <!-- LAN arrow right -->
+  <line x1="595" y1="265" x2="625" y2="265" stroke="#4d8eff" stroke-width="1.2" marker-end="url(#arrowR)"/>
+  <text x="610" y="284" text-anchor="middle" fill="#a0a0a8" font-size="7">LAN</text>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- Column 4: Site 2 Worker                            -->
+  <!-- ═══════════════════════════════════════════════════ -->
+  <rect x="628" y="10" width="185" height="375" rx="8" fill="none" stroke="#2a2a2e" stroke-width="1.5"/>
+  <text x="720" y="30" text-anchor="middle" fill="#e4e4e7" font-size="11" font-weight="700">Site 2 Worker</text>
+
+  <rect x="645" y="40" width="150" height="22" rx="4" fill="#18181b" stroke="#2a2a2e" stroke-width="0.8"/>
+  <text x="720" y="55" text-anchor="middle" fill="#a0a0a8" font-size="9" font-family="'SF Mono', 'Fira Code', monospace">eth0</text>
+  <line x1="720" y1="62" x2="720" y2="74" stroke="#4d8eff" stroke-width="1" marker-end="url(#arrowD)"/>
+
+  <rect x="645" y="77" width="150" height="22" rx="4" fill="#1e1e22" stroke="#2a2a2e" stroke-width="0.8"/>
+  <text x="720" y="93" text-anchor="middle" fill="#a0a0a8" font-size="9">geneve0 (decap)</text>
+  <line x1="720" y1="99" x2="720" y2="111" stroke="#4d8eff" stroke-width="1" marker-end="url(#arrowD)"/>
+
+  <text x="720" y="124" text-anchor="middle" fill="#a0a0a8" font-size="8">kernel routing</text>
+  <line x1="720" y1="128" x2="720" y2="140" stroke="#4d8eff" stroke-width="1" marker-end="url(#arrowD)"/>
+
+  <rect x="660" y="143" width="120" height="22" rx="4" fill="#1e1e22" stroke="#2a2a2e" stroke-width="0.8"/>
+  <text x="720" y="158" text-anchor="middle" fill="#a0a0a8" font-size="9" font-family="'SF Mono', 'Fira Code', monospace">cbr0</text>
+  <line x1="720" y1="165" x2="720" y2="177" stroke="#4d8eff" stroke-width="1" marker-end="url(#arrowD)"/>
+
+  <rect x="645" y="180" width="150" height="24" rx="4" fill="#18181b" stroke="#34d399" stroke-width="0.8" stroke-opacity="0.5"/>
+  <text x="720" y="197" text-anchor="middle" fill="#34d399" font-size="10" font-weight="600">Pod (dst)</text>
+</svg>

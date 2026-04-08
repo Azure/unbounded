@@ -22,21 +22,7 @@ PXE (Preboot Execution Environment) is a firmware feature that lets a machine
 boot from the network instead of a local disk. metalman acts as the PXE
 infrastructure:
 
-```
-┌──────────────┐        ┌──────────────────────────────────┐
-│  Bare-Metal  │        │         metalman                 │
-│   Machine    │        │  ┌──────┐ ┌──────┐ ┌──────┐     │
-│              │◄─DHCP──│  │ DHCP │ │ TFTP │ │ HTTP │     │
-│   PXE ROM    │──────► │  └──────┘ └──────┘ └──────┘     │
-│              │◄─TFTP──│                                  │
-│   bootloader │        │  Machine CR                      │
-│              │◄─HTTP──│  (NIC specs)   (OCI boot images) │
-│   kernel +   │        └──────────────────────────────────┘
-│   initramfs  │
-│              │──────► Kubernetes API (bootstrap token)
-│   kubelet    │
-└──────────────┘
-```
+![PXE boot flow: Bare-Metal Machine boots via DHCP, TFTP, and HTTP from metalman, then joins the Kubernetes API with a bootstrap token](../../img/bare-metal-pxe-boot.svg)
 
 The boot flow in detail:
 
