@@ -4,7 +4,6 @@
 package cmd
 
 import (
-	"context"
 	"encoding/base64"
 	"fmt"
 	"log/slog"
@@ -47,15 +46,7 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 				return err
 			}
 
-			log := cmdCtx.Logger
-
-			// Resolve the rootfs goal state in two steps:
-			// 1. Build the base goal state with NVIDIA discovery (NVIDIA
-			//    drivers are loaded by the host before the agent starts).
-			// 2. After the host phase completes (which loads KVM modules
-			//    via modprobe), resolve KVM devices and stamp them onto
-			//    the goal state before the rootfs phase uses it.
-			rootFSGoalState, err := resolveRootFSGoalState(log, cfg)
+			rootFSGoalState, err := resolveRootFSGoalState(cmdCtx.Logger, cfg)
 			if err != nil {
 				return err
 			}
@@ -65,6 +56,8 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 				return err
 			}
 
+			log := cmdCtx.Logger
+
 			return phases.Serial(log,
 				// Phase 1: host
 				host.InstallPackages(log),
@@ -73,18 +66,7 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 					host.ConfigureNFTables(log),
 					host.DisableDocker(log),
 					host.DisableSwap(log),
-					host.LoadKVMModules(log),
 				),
-
-				// Resolve KVM devices now that modules are loaded.
-				phases.TaskFunc("resolve-kvm-devices", func(ctx context.Context) error {
-					rootFSGoalState.KVM = goalstates.ResolveKVMHost()
-					if len(rootFSGoalState.KVM.DevicePaths) > 0 {
-						log.Info("KVM devices discovered",
-							"devices", rootFSGoalState.KVM.DevicePaths)
-					}
-					return nil
-				}),
 
 				// TPM Attestation (no-op when not configured).
 				host.ApplyAttestation(log, cfg.Attest, cfg.MachineName, nodeStartGoalState),
