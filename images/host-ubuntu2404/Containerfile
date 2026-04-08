@@ -41,11 +41,11 @@ RUN mkdir -p /artifacts && \
         NETBOOT_URL="https://cdimage.ubuntu.com/releases/noble/release/ubuntu-24.04.4-netboot-arm64.tar.gz"; \
         curl -fSL -o /tmp/netboot.tar.gz "${NETBOOT_URL}" && \
         tar -xzf /tmp/netboot.tar.gz -C /tmp && \
-        cp /tmp/bootaa64.efi   /artifacts/shimaa64.efi && \
-        cp /tmp/grubaa64.efi   /artifacts/grubaa64.efi && \
-        cp /tmp/linux           /artifacts/vmlinuz && \
-        cp /tmp/initrd          /artifacts/initrd && \
-        rm -rf /tmp/netboot.tar.gz /tmp/*.efi /tmp/linux /tmp/initrd; \
+        cp /tmp/arm64/bootaa64.efi   /artifacts/shimaa64.efi && \
+        cp /tmp/arm64/grubaa64.efi   /artifacts/grubaa64.efi && \
+        cp /tmp/arm64/linux           /artifacts/vmlinuz && \
+        cp /tmp/arm64/initrd          /artifacts/initrd && \
+        rm -rf /tmp/netboot.tar.gz /tmp/arm64; \
     else \
         echo "Unsupported architecture: ${TARGETARCH}" >&2; exit 1; \
     fi
