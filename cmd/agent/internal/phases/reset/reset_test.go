@@ -57,7 +57,7 @@ func TestRemoveFileIfExists(t *testing.T) {
 		t.Parallel()
 
 		// Should not panic or error.
-		removeFileIfExists("/tmp/nonexistent-" + t.Name())
+		removeFileIfExists(filepath.Join(t.TempDir(), "nonexistent-file"))
 	})
 }
 
@@ -81,7 +81,7 @@ func TestRemoveAllIfExists(t *testing.T) {
 	t.Run("path does not exist", func(t *testing.T) {
 		t.Parallel()
 
-		err := removeAllIfExists("/tmp/nonexistent-" + t.Name())
+		err := removeAllIfExists(filepath.Join(t.TempDir(), "nonexistent-dir"))
 		require.NoError(t, err)
 	})
 }
