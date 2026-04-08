@@ -31,15 +31,18 @@ func (t *stopMachine) Do(ctx context.Context) error {
 
 	t.log.Info("stopping nspawn machine", "machine", t.machineName)
 
-	// Attempt graceful stop.
-	_ = utilexec.RunCmd(ctx, t.log, utilexec.Machinectl(), "stop", t.machineName)
+	// Stop the systemd service that manages the nspawn container. This
+	// properly tears down mount namespaces and cgroups so that
+	// machinectl remove can succeed.
+	serviceName := fmt.Sprintf("systemd-nspawn@%s.service", t.machineName)
+	_ = utilexec.RunCmd(ctx, t.log, utilexec.Systemctl(), "stop", serviceName)
 
 	// Wait up to 30 seconds for the machine to fully stop.
 	if t.waitForGone(ctx, 30*time.Second) {
 		return nil
 	}
 
-	// Force terminate if still running.
+	// Force terminate if still registered.
 	if machineExists(ctx, t.log, t.machineName) {
 		t.log.Warn("machine did not stop gracefully, terminating", "machine", t.machineName)
 		_ = utilexec.RunCmd(ctx, t.log, utilexec.Machinectl(), "terminate", t.machineName)
@@ -88,22 +91,30 @@ func (t *removeMachine) Do(ctx context.Context) error {
 
 	t.log.Info("removing machine rootfs", "machine", t.machineName, "dir", machineDir)
 
-	// Wait for the machine to be fully gone before attempting removal.
-	// machinectl remove will fail with "Device or resource busy" if the
-	// machine's processes haven't fully terminated.
-	const waitTimeout = 30 * time.Second
+	// Retry machinectl remove with backoff. The image may briefly remain
+	// "busy" after the systemd-nspawn service stops while cgroup and mount
+	// teardown completes asynchronously.
+	const (
+		retryTimeout  = 60 * time.Second
+		retryInterval = 2 * time.Second
+	)
 
-	deadline := time.Now().Add(waitTimeout)
-	for machineExists(ctx, t.log, t.machineName) && time.Now().Before(deadline) {
+	deadline := time.Now().Add(retryTimeout)
+	for time.Now().Before(deadline) {
+		err := utilexec.RunCmd(ctx, t.log, utilexec.Machinectl(), "remove", t.machineName)
+		if err == nil {
+			return nil // machinectl removed both image metadata and directory
+		}
+
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(time.Second):
+		case <-time.After(retryInterval):
 		}
 	}
 
-	// Try machinectl remove first.
-	_ = utilexec.RunCmd(ctx, t.log, utilexec.Machinectl(), "remove", t.machineName)
+	// Fallback: force-remove the directory if machinectl keeps failing.
+	t.log.Warn("machinectl remove did not succeed, force-removing directory", "dir", machineDir)
 
 	return removeAllIfExists(machineDir)
 }
