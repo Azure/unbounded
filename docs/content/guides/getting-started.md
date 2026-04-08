@@ -116,6 +116,21 @@ The `--remote-node-cidr` and `--remote-pod-cidr` ranges must not overlap with th
 
 ## 3. Add a Remote Node
 
+{{< callout type="tip" >}}
+Don't have a remote machine handy? The quickstart script can create an Azure VM
+for you in its own resource group and VNet:
+
+```bash
+./aks-quickstart.sh create-azure-vm \
+    --name my-remote-vm \
+    --location eastus
+```
+
+The command reads the node CIDR from the `remote` site created in the previous
+step and provisions an Ubuntu 24.04 LTS VM with SSH access. See
+`./aks-quickstart.sh create-azure-vm --help` for all options.
+{{< /callout >}}
+
 Generate a bootstrap script and pipe it to your remote machine over SSH:
 
 ```bash

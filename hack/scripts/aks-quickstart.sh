@@ -8,8 +8,9 @@
 # controller, and generates bootstrap tokens.
 #
 # Usage:
-#   aks-quickstart.sh create [options]     Create a new AKS cluster from scratch
-#   aks-quickstart.sh setup  [options]     Add gateways to an existing AKS cluster
+#   aks-quickstart.sh create    [options]  Create a new AKS cluster from scratch
+#   aks-quickstart.sh setup     [options]  Add gateways to an existing AKS cluster
+#   aks-quickstart.sh create-azure-vm [options]  Create a remote-site VM in its own resource group
 #
 # Create options:
 #   --name NAME                  Cluster name (required)
@@ -42,6 +43,17 @@
 #   --context NAME               kubeconfig context (default: current)
 #   -h, --help                   Show this help and exit
 #
+# Create-azure-vm options:
+#   --name NAME                  VM name (required)
+#   --resource-group NAME        Azure resource group for the VM (defaults to --name)
+#   --location LOCATION          Azure region (default: canadacentral)
+#   --vm-size SKU                VM SKU (default: Standard_D2ads_v6)
+#   --site-name NAME             Remote site name to read node CIDR from (default: remote)
+#   --remote-node-cidr CIDR      Override VNet CIDR instead of reading from site
+#   --ssh-key PATH               Path to SSH public key (default: ~/.ssh/id_rsa.pub)
+#   --admin-username USER        VM admin username (default: azureuser)
+#   -h, --help                   Show this help and exit
+#
 # Public IP strategies:
 #   node  Each gateway node gets its own public IP via AKS EnableNodePublicIP.
 #         This is the simplest approach and matches what forge does internally.
@@ -67,6 +79,9 @@ DEFAULT_GATEWAY_POOL_COUNT="2"
 DEFAULT_SERVICE_CIDR="10.0.0.0/16"
 DEFAULT_SITE_NAME="remote"
 DEFAULT_PUBLIC_IP_STRATEGY="node"
+DEFAULT_VM_SIZE="Standard_D2ads_v6"
+DEFAULT_VM_IMAGE="Canonical:ubuntu-24_04-lts:server:latest"
+DEFAULT_VM_ADMIN_USERNAME="azureuser"
 
 # AKS default pod CIDR used when NetworkPlugin=none (BYO CNI) leaves the
 # network profile's podCidr empty.  This is the standard Kubernetes default.
@@ -211,6 +226,14 @@ preflight() {
   # kubectl-unbounded is required for site init and manual-bootstrap.
   kubectl unbounded --help >/dev/null 2>&1 \
     || die "kubectl-unbounded not found. Install it from: https://github.com/project-unbounded/unbounded-kube/releases/latest"
+
+  az account show --output none 2>/dev/null \
+    || die "not logged in to Azure. Run: az login"
+}
+
+preflight_vm() {
+  require_cmd az      "Install the Azure CLI: https://aka.ms/installazurecli"
+  require_cmd kubectl "Install kubectl: https://kubernetes.io/docs/tasks/tools/"
 
   az account show --output none 2>/dev/null \
     || die "not logged in to Azure. Run: az login"
@@ -708,6 +731,134 @@ cmd_setup() {
   do_site_init "$site_name" "$CLUSTER_NODE_CIDR" "$CLUSTER_POD_CIDR" "$CLUSTER_SERVICE_CIDR" "$remote_node_cidr" "$remote_pod_cidr"
 }
 
+# ── cmd: create-azure-vm ───────────────────────────────────────────────────────────
+
+cmd_create_vm() {
+  local name="" resource_group="" location="$DEFAULT_LOCATION"
+  local vm_size="$DEFAULT_VM_SIZE"
+  local site_name="$DEFAULT_SITE_NAME"
+  local remote_node_cidr=""
+  local ssh_key="$HOME/.ssh/id_rsa.pub"
+  local admin_username="$DEFAULT_VM_ADMIN_USERNAME"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name)                name="$2";               shift 2 ;;
+      --resource-group)      resource_group="$2";      shift 2 ;;
+      --location)            location="$2";            shift 2 ;;
+      --vm-size)             vm_size="$2";             shift 2 ;;
+      --site-name)           site_name="$2";           shift 2 ;;
+      --remote-node-cidr)    remote_node_cidr="$2";    shift 2 ;;
+      --ssh-key)             ssh_key="$2";             shift 2 ;;
+      --admin-username)      admin_username="$2";      shift 2 ;;
+      -h|--help)             usage ;;
+      *) die "unknown option: $1. Use --help for usage." ;;
+    esac
+  done
+
+  # Validate required parameters.
+  [[ -n "$name" ]] || die "--name is required"
+
+  [[ -f "$ssh_key" ]] || die "SSH public key not found at $ssh_key. Provide --ssh-key or generate one with ssh-keygen."
+
+  # Infer remote node CIDR from the site resource, unless provided via --remote-node-cidr.
+  if [[ -z "$remote_node_cidr" ]]; then
+    log "Fetching remote node CIDR from site '$site_name'..."
+    remote_node_cidr=$(kubectl get site "$site_name" \
+      -o jsonpath='{.spec.nodeCidrs[0]}' 2>/dev/null || true)
+
+    [[ -n "$remote_node_cidr" ]] \
+      || die "could not read node CIDR from site '$site_name'. Ensure the site exists (kubectl get site) or pass --remote-node-cidr CIDR manually."
+
+    info "Using node CIDR from site '$site_name': $remote_node_cidr"
+  fi
+
+  is_valid_cidr "$remote_node_cidr" \
+    || die "invalid remote node CIDR: $remote_node_cidr"
+
+  resource_group="${resource_group:-${name}-rg}"
+
+  local vnet_name="${name}-vnet"
+  local subnet_name="${name}-subnet"
+
+  # Step 1: Create resource group.
+  log "Creating resource group '$resource_group' in '$location'..."
+  az group create \
+    --name "$resource_group" \
+    --location "$location" \
+    --output none
+  info "Resource group ready"
+
+  # Step 2: Create VNet + subnet using the remote-node-cidr.
+  log "Creating VNet '$vnet_name' with address space '$remote_node_cidr'..."
+  az network vnet create \
+    --resource-group "$resource_group" \
+    --name "$vnet_name" \
+    --address-prefixes "$remote_node_cidr" \
+    --subnet-name "$subnet_name" \
+    --subnet-prefixes "$remote_node_cidr" \
+    --location "$location" \
+    --output none
+  info "VNet '$vnet_name' with subnet '$subnet_name' ($remote_node_cidr) created"
+
+  # Step 3: Create the VM with Ubuntu 24.04 LTS and the local SSH key.
+  log "Creating VM '$name' (image: $DEFAULT_VM_IMAGE, size: $vm_size)..."
+  az vm create \
+    --resource-group "$resource_group" \
+    --name "$name" \
+    --image "$DEFAULT_VM_IMAGE" \
+    --size "$vm_size" \
+    --vnet-name "$vnet_name" \
+    --subnet "$subnet_name" \
+    --admin-username "$admin_username" \
+    --ssh-key-values "$ssh_key" \
+    --public-ip-sku Standard \
+    --output table
+  info "VM '$name' created"
+
+  # Print summary.
+  local public_ip
+  public_ip=$(az vm show \
+    --resource-group "$resource_group" \
+    --name "$name" \
+    --show-details \
+    --query publicIps \
+    --output tsv 2>/dev/null || true)
+
+  local private_ip
+  private_ip=$(az vm show \
+    --resource-group "$resource_group" \
+    --name "$name" \
+    --show-details \
+    --query privateIps \
+    --output tsv 2>/dev/null || true)
+
+  echo
+  echo -e "${GREEN}============================================================${NC}"
+  echo -e "${GREEN} Remote-Site VM Created${NC}"
+  echo -e "${GREEN}============================================================${NC}"
+  echo
+  echo "  VM Name:           $name"
+  echo "  Resource Group:    $resource_group"
+  echo "  Location:          $location"
+  echo "  VM Size:           $vm_size"
+  echo "  Image:             $DEFAULT_VM_IMAGE"
+  echo "  VNet / Subnet:     $vnet_name / $subnet_name ($remote_node_cidr)"
+  echo "  Admin User:        $admin_username"
+  echo "  Public IP:         ${public_ip:-n/a}"
+  echo "  Private IP:        ${private_ip:-n/a}"
+  echo
+  echo -e "${GREEN}------------------------------------------------------------${NC}"
+  echo -e "${GREEN} Bootstrap the VM as a Remote Node${NC}"
+  echo -e "${GREEN}------------------------------------------------------------${NC}"
+  echo
+  echo "  kubectl unbounded machine manual-bootstrap ${name} --site ${site_name} \\"
+  echo "      | ssh ${admin_username}@${public_ip:-<public-ip>} sudo bash"
+  echo
+  echo -e "${GREEN}------------------------------------------------------------${NC}"
+  echo
+}
+
 # ── main ─────────────────────────────────────────────────────────────────────
 
 # Global state set by various functions.
@@ -728,13 +879,17 @@ main() {
   local subcommand="$1"
   shift
 
-  preflight
+  case "$subcommand" in
+    create-azure-vm) preflight_vm ;;
+    create|setup) preflight ;;
+    -h|--help) usage ;;
+    *) die "unknown subcommand: $subcommand. Use 'create', 'setup', or 'create-azure-vm'." ;;
+  esac
 
   case "$subcommand" in
-    create) cmd_create "$@" ;;
-    setup)  cmd_setup "$@" ;;
-    -h|--help) usage ;;
-    *) die "unknown subcommand: $subcommand. Use 'create' or 'setup'." ;;
+    create)    cmd_create "$@" ;;
+    setup)     cmd_setup "$@" ;;
+    create-azure-vm) cmd_create_vm "$@" ;;
   esac
 }
 
