@@ -564,11 +564,16 @@ def validate_workload() -> None:
 
     timeout_secs = 300
 
-    # Create test namespace
+    # Create test namespace (idempotent)
     log(f"Creating test namespace '{TEST_NS}'...")
     ns_yaml = capture([KUBECTL, "create", "namespace", TEST_NS,
                        "--dry-run=client", "-o", "yaml"])
     kubectl(["apply", "-f", "-"], input=ns_yaml.encode())
+
+    # Clean up any stale pods from a previous run (e.g. after reset + rejoin)
+    for pod_name in ("e2e-hello", "e2e-dns-test"):
+        run_quiet([KUBECTL, "delete", "pod", pod_name, "-n", TEST_NS,
+                   "--ignore-not-found"], check=False)
 
     # Deploy hello pod
     log(f"Deploying test pod on node '{AGENT_MACHINE_NAME}'...")

@@ -35,19 +35,8 @@ func (t *stopMachine) Do(ctx context.Context) error {
 	_ = utilexec.RunCmd(ctx, t.log, utilexec.Machinectl(), "stop", t.machineName)
 
 	// Wait up to 30 seconds for the machine to fully stop.
-	const stopTimeout = 30 * time.Second
-
-	deadline := time.Now().Add(stopTimeout)
-	for time.Now().Before(deadline) {
-		if !machineExists(ctx, t.log, t.machineName) {
-			return nil
-		}
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(time.Second):
-		}
+	if t.waitForGone(ctx, 30*time.Second) {
+		return nil
 	}
 
 	// Force terminate if still running.
@@ -55,15 +44,30 @@ func (t *stopMachine) Do(ctx context.Context) error {
 		t.log.Warn("machine did not stop gracefully, terminating", "machine", t.machineName)
 		_ = utilexec.RunCmd(ctx, t.log, utilexec.Machinectl(), "terminate", t.machineName)
 
-		// Brief pause to let terminate take effect.
+		// Wait up to 15 seconds for the terminate to take full effect.
+		t.waitForGone(ctx, 15*time.Second)
+	}
+
+	return ctx.Err()
+}
+
+// waitForGone polls machineExists until the machine disappears or the timeout
+// elapses. Returns true if the machine is gone.
+func (t *stopMachine) waitForGone(ctx context.Context, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if !machineExists(ctx, t.log, t.machineName) {
+			return true
+		}
+
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(2 * time.Second):
+			return false
+		case <-time.After(time.Second):
 		}
 	}
 
-	return nil
+	return !machineExists(ctx, t.log, t.machineName)
 }
 
 type removeMachine struct {
@@ -84,10 +88,22 @@ func (t *removeMachine) Do(ctx context.Context) error {
 
 	t.log.Info("removing machine rootfs", "machine", t.machineName, "dir", machineDir)
 
-	// Try machinectl remove first.
-	if machineExists(ctx, t.log, t.machineName) {
-		_ = utilexec.RunCmd(ctx, t.log, utilexec.Machinectl(), "remove", t.machineName)
+	// Wait for the machine to be fully gone before attempting removal.
+	// machinectl remove will fail with "Device or resource busy" if the
+	// machine's processes haven't fully terminated.
+	const waitTimeout = 30 * time.Second
+
+	deadline := time.Now().Add(waitTimeout)
+	for machineExists(ctx, t.log, t.machineName) && time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
+		}
 	}
+
+	// Try machinectl remove first.
+	_ = utilexec.RunCmd(ctx, t.log, utilexec.Machinectl(), "remove", t.machineName)
 
 	return removeAllIfExists(machineDir)
 }
