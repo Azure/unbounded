@@ -67,6 +67,7 @@ signs:
       - "--yes"
     artifacts: checksum
     output: true
+    signature: "${artifact}.bundle.json"
 
 # Generate an SPDX SBOM for each binary archive using syft.
 sboms:
