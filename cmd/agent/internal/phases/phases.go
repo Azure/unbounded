@@ -19,6 +19,21 @@ type Task interface {
 	Do(ctx context.Context) error
 }
 
+// taskFunc is a lightweight Task adapter for a closure.
+type taskFunc struct {
+	name string
+	fn   func(ctx context.Context) error
+}
+
+// TaskFunc returns a Task backed by a plain function. Use this for small
+// inline tasks that don't warrant a dedicated struct.
+func TaskFunc(name string, fn func(ctx context.Context) error) Task {
+	return &taskFunc{name: name, fn: fn}
+}
+
+func (t *taskFunc) Name() string                 { return t.name }
+func (t *taskFunc) Do(ctx context.Context) error { return t.fn(ctx) }
+
 // ExecuteTask logs start, then runs t.Do, then logs completion or failure in the
 // "wide" format: task name, start time, status and elapsed duration.
 // Any panic from t.Do is recovered, converted to an error, and logged as a failure.
