@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 700 420" font-family="Inter, -apple-system, BlinkMacSystemFont, sans-serif">
+
+  <!-- Background -->
+  <rect width="700" height="420" rx="12" fill="#111113"/>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- Host                                               -->
+  <!-- ═══════════════════════════════════════════════════ -->
+  <rect x="30" y="15" width="640" height="390" rx="10" fill="none" stroke="#2a2a2e" stroke-width="1.5"/>
+  <text x="55" y="40" fill="#a0a0a8" font-size="11" font-weight="600">Host</text>
+
+  <!-- Host-side components -->
+  <rect x="55" y="55" width="180" height="40" rx="6" fill="#18181b" stroke="#4d8eff" stroke-width="1" stroke-opacity="0.5"/>
+  <text x="145" y="80" text-anchor="middle" fill="#e4e4e7" font-size="11" font-weight="600">unbounded-agent</text>
+
+  <rect x="255" y="55" width="130" height="40" rx="6" fill="#18181b" stroke="#2a2a2e" stroke-width="1"/>
+  <text x="320" y="80" text-anchor="middle" fill="#a0a0a8" font-size="11" font-weight="500">machinectl</text>
+
+  <rect x="405" y="55" width="130" height="40" rx="6" fill="#18181b" stroke="#2a2a2e" stroke-width="1"/>
+  <text x="470" y="80" text-anchor="middle" fill="#a0a0a8" font-size="11" font-weight="500">systemd-nspawn</text>
+
+  <!-- Kernel / sysctl box -->
+  <rect x="555" y="55" width="100" height="40" rx="6" fill="#18181b" stroke="#2a2a2e" stroke-width="1"/>
+  <text x="605" y="74" text-anchor="middle" fill="#a0a0a8" font-size="10" font-weight="500">kernel</text>
+  <text x="605" y="88" text-anchor="middle" fill="#a0a0a8" font-size="9" font-family="'SF Mono', 'Fira Code', monospace">sysctl, modules</text>
+
+  <!-- Shared network namespace label -->
+  <rect x="55" y="108" width="600" height="24" rx="4" fill="#1e1e22" stroke="#4d8eff" stroke-width="0.8" stroke-opacity="0.4"/>
+  <text x="355" y="124" text-anchor="middle" fill="#4d8eff" font-size="10" font-weight="600">Shared network namespace (VirtualEthernet=no)</text>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- nspawn Container                                   -->
+  <!-- ═══════════════════════════════════════════════════ -->
+  <rect x="55" y="150" width="600" height="240" rx="10" fill="none" stroke="#a78bfa" stroke-width="1.5" stroke-opacity="0.5"/>
+  <text x="80" y="175" fill="#a78bfa" font-size="12" font-weight="700">nspawn container</text>
+  <text x="253" y="175" fill="#a0a0a8" font-size="10" font-family="'SF Mono', 'Fira Code', monospace">/var/lib/machines/&lt;MachineName&gt;</text>
+
+  <!-- systemd PID 1 -->
+  <rect x="80" y="190" width="550" height="30" rx="6" fill="#18181b" stroke="#a78bfa" stroke-width="1" stroke-opacity="0.4"/>
+  <text x="355" y="210" text-anchor="middle" fill="#e4e4e7" font-size="11" font-weight="600">systemd (PID 1)</text>
+
+  <!-- containerd -->
+  <rect x="80" y="235" width="170" height="55" rx="6" fill="#18181b" stroke="#2a2a2e" stroke-width="1"/>
+  <text x="165" y="258" text-anchor="middle" fill="#e4e4e7" font-size="11" font-weight="600">containerd</text>
+  <text x="165" y="275" text-anchor="middle" fill="#a0a0a8" font-size="9" font-family="'SF Mono', 'Fira Code', monospace">+ runc</text>
+
+  <!-- kubelet -->
+  <rect x="270" y="235" width="170" height="55" rx="6" fill="#18181b" stroke="#34d399" stroke-width="1" stroke-opacity="0.5"/>
+  <text x="355" y="268" text-anchor="middle" fill="#34d399" font-size="11" font-weight="600">kubelet</text>
+
+  <!-- CNI plugins -->
+  <rect x="460" y="235" width="170" height="55" rx="6" fill="#18181b" stroke="#2a2a2e" stroke-width="1"/>
+  <text x="545" y="258" text-anchor="middle" fill="#e4e4e7" font-size="11" font-weight="600">CNI plugins</text>
+  <text x="545" y="275" text-anchor="middle" fill="#a0a0a8" font-size="9" font-family="'SF Mono', 'Fira Code', monospace">/opt/cni/bin</text>
+
+  <!-- Pod containers -->
+  <rect x="80" y="305" width="550" height="36" rx="6" fill="#1e1e22" stroke="#2a2a2e" stroke-width="1"/>
+  <text x="355" y="328" text-anchor="middle" fill="#a0a0a8" font-size="11" font-weight="500">Pod containers (managed by containerd/runc)</text>
+
+  <!-- Isolation labels on the nspawn boundary -->
+  <text x="80" y="367" fill="#a78bfa" font-size="9" font-weight="500">Isolated: filesystem, PID namespace, cgroup subtree</text>
+  <text x="480" y="367" fill="#4d8eff" font-size="9" font-weight="500">Shared: network, kernel</text>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- Interaction arrows                                 -->
+  <!-- ═══════════════════════════════════════════════════ -->
+
+  <!-- Agent to container: filesystem writes before boot -->
+  <line x1="145" y1="95" x2="145" y2="148" stroke="#a78bfa" stroke-width="1.5" stroke-dasharray="5,3"/>
+  <path d="M139,142 L145,150 L151,142" fill="none" stroke="#a78bfa" stroke-width="1.5"/>
+
+  <!-- machinectl to container: start/stop -->
+  <line x1="320" y1="95" x2="320" y2="148" stroke="#a78bfa" stroke-width="1.5" stroke-dasharray="5,3"/>
+  <path d="M314,142 L320,150 L326,142" fill="none" stroke="#a78bfa" stroke-width="1.5"/>
+
+  <!-- systemd-nspawn to container: process -->
+  <line x1="470" y1="95" x2="470" y2="148" stroke="#a78bfa" stroke-width="1.5" stroke-dasharray="5,3"/>
+  <path d="M464,142 L470,150 L476,142" fill="none" stroke="#a78bfa" stroke-width="1.5"/>
+
+  <!-- Labels on arrows -->
+  <text x="90" y="130" fill="#a0a0a8" font-size="8">fs writes</text>
+  <text x="280" y="130" fill="#a0a0a8" font-size="8">start/stop</text>
+  <text x="438" y="130" fill="#a0a0a8" font-size="8">runs container</text>
+</svg>

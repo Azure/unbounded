@@ -20,9 +20,10 @@ in sequence:
    kernel parameters for Kubernetes networking, and disables services that
    conflict with kubelet (Docker, swap).
 2. **Rootfs preparation** (`rootfs`) -- detects host settings such as CPU
-   architecture and NVIDIA GPU devices, creates a `systemd-nspawn` machine
-   rootfs (from an OCI image or debootstrap), and downloads containerd, runc,
-   CNI plugins, and Kubernetes binaries.
+   architecture and NVIDIA GPU devices, creates a
+   [systemd-nspawn]({{< relref "reference/agent/nspawn" >}}) machine rootfs
+   (from an OCI image), and downloads containerd, runc, CNI
+   plugins, and Kubernetes binaries.
 3. **Node start** (`node-start`) -- boots the nspawn machine and starts
    containerd and kubelet inside it. Kubelet performs TLS bootstrapping against
    the API server using the configured bootstrap token.
@@ -180,3 +181,5 @@ and that GPU devices are visible under `/dev/nvidia*`.
   fits into the broader system.
 - **[Architecture Reference]({{< relref "reference/architecture" >}})** -- Deep
   dive into component internals.
+- **[nspawn Isolation]({{< relref "reference/agent/nspawn" >}})** -- How the
+  agent uses systemd-nspawn to isolate worker node components.
