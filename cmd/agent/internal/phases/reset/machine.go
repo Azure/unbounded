@@ -36,8 +36,10 @@ func (t *stopMachine) Do(ctx context.Context) error {
 	// machinectl remove can succeed.
 	serviceName := fmt.Sprintf("systemd-nspawn@%s.service", t.machineName)
 
-	if err := utilexec.RunCmd(ctx, t.log, utilexec.Systemctl(), "stop", serviceName); err != nil {
-		t.log.Warn("failed to stop nspawn service (may already be stopped)", "service", serviceName, "error", err)
+	if !serviceIsActive(ctx, t.log, serviceName) {
+		t.log.Info("nspawn service already inactive, skipping stop", "service", serviceName)
+	} else if err := utilexec.RunCmd(ctx, t.log, utilexec.Systemctl(), "stop", serviceName); err != nil {
+		t.log.Warn("failed to stop nspawn service", "service", serviceName, "error", err)
 	}
 
 	// Wait up to 30 seconds for the machine to fully stop.
@@ -129,5 +131,11 @@ func (t *removeMachine) Do(ctx context.Context) error {
 // machineExists checks whether the named nspawn machine is known to machinectl.
 func machineExists(ctx context.Context, log *slog.Logger, name string) bool {
 	err := utilexec.RunCmd(ctx, log, utilexec.Machinectl(), "show", name)
+	return err == nil
+}
+
+// serviceIsActive returns true if the named systemd service is currently active.
+func serviceIsActive(ctx context.Context, log *slog.Logger, service string) bool {
+	err := utilexec.RunCmd(ctx, log, utilexec.Systemctl(), "is-active", "--quiet", service)
 	return err == nil
 }
