@@ -690,6 +690,63 @@ def validate_workload() -> None:
 
 
 # ---------------------------------------------------------------------------
+# reset-agent
+# ---------------------------------------------------------------------------
+def reset_agent() -> None:
+    """Run unbounded-agent reset on the VM and verify the node is removed."""
+
+    if not SSH_KEY.exists():
+        die(f"SSH key not found: {SSH_KEY}. Run create-vm first.")
+
+    log(f"Running 'unbounded-agent reset' on VM for machine '{AGENT_MACHINE_NAME}'...")
+    run([
+        "timeout", "300",
+        "ssh", *SSH_OPTS, "-o", "ServerAliveInterval=30", SSH_TARGET,
+        f"sudo UNBOUNDED_AGENT_CONFIG_FILE=/tmp/agent-config.json unbounded-agent reset",
+    ])
+    log("Agent reset completed on VM")
+
+    # Verify the node is removed from the cluster
+    node_timeout = int(os.environ.get("NODE_TIMEOUT", "120"))
+    log(f"Waiting for node '{AGENT_MACHINE_NAME}' to be removed (timeout: {node_timeout}s)...")
+
+    # Delete the node object from the cluster (reset only cleans up the host,
+    # the node object must be removed separately).
+    run_quiet([KUBECTL, "delete", "node", AGENT_MACHINE_NAME, "--ignore-not-found"], check=False)
+
+    elapsed = 0
+    while elapsed < node_timeout:
+        ret = subprocess.run(
+            [KUBECTL, "get", "node", AGENT_MACHINE_NAME, "-o", "name"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        if ret.returncode != 0:
+            log(f"Node '{AGENT_MACHINE_NAME}' removed after {elapsed}s")
+            break
+        if elapsed > 0 and elapsed % 30 == 0:
+            log(f"  ({elapsed}s) Node still present...")
+        time.sleep(5)
+        elapsed += 5
+    else:
+        die(f"Timed out waiting for node '{AGENT_MACHINE_NAME}' to be removed after {node_timeout}s")
+
+    # Verify the nspawn machine is no longer running on the VM
+    log("Verifying nspawn machine is stopped on VM...")
+    result = subprocess.run(
+        ["ssh", *SSH_OPTS, SSH_TARGET,
+         f"sudo machinectl show {AGENT_MACHINE_NAME}"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    if result.returncode == 0:
+        die(f"nspawn machine '{AGENT_MACHINE_NAME}' is still running after reset")
+    log(f"nspawn machine '{AGENT_MACHINE_NAME}' is not running")
+
+    log("============================================")
+    log("  Agent reset PASSED")
+    log("============================================")
+
+
+# ---------------------------------------------------------------------------
 # cleanup
 # ---------------------------------------------------------------------------
 def cleanup() -> None:
@@ -752,6 +809,7 @@ COMMANDS = {
     "run-agent": run_agent,
     "wait-for-node": wait_for_node,
     "validate-workload": validate_workload,
+    "reset-agent": reset_agent,
     "cleanup": cleanup,
 }
 
