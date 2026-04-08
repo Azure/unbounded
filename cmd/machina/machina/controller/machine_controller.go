@@ -30,20 +30,6 @@ import (
 )
 
 const (
-	// RequeueAfterReady is the requeue interval for machines in Ready phase.
-	RequeueAfterReady = 5 * time.Minute
-
-	// RequeueAfterPending is the requeue interval for machines in Pending phase.
-	RequeueAfterPending = 30 * time.Second
-
-	// RequeueAfterFailed is the requeue interval for machines in Failed phase.
-	RequeueAfterFailed = 1 * time.Minute
-
-	// RequeueAfterJoining is the requeue interval for machines in
-	// Joining phase. Short interval because we are waiting for the
-	// Node to appear with the matching label.
-	RequeueAfterJoining = 30 * time.Second
-
 	// TODO: Make this configurable
 	ProvisioningTimeout = 5 * time.Minute
 
@@ -288,6 +274,23 @@ func (r *MachineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if wasProvisioned(&machine) {
 			return r.reconcileNodeJoin(ctx, &machine)
 		}
+	case unboundedv1alpha3.MachinePhaseRebooting:
+		// Metalman is driving a reboot cycle; back off until the phase
+		// changes. Phase is set by metalman's phase.Set() helper and
+		// is purely informational.
+		logger.Info("Machine is in metalman-managed phase, backing off",
+			"name", machine.Name, "phase", machine.Status.Phase)
+		return ctrl.Result{}, nil
+	}
+
+	// Metalman uses Provisioning phase for PXE reimaging. If the
+	// Reimaged condition is False, metalman is actively PXE booting
+	// the machine — back off until the condition clears.
+	reimagedCond := apimeta.FindStatusCondition(machine.Status.Conditions, unboundedv1alpha3.MachineConditionReimaged)
+	if reimagedCond != nil && reimagedCond.Status == metav1.ConditionFalse {
+		logger.Info("Machine is being reimaged by metalman, backing off",
+			"name", machine.Name)
+		return ctrl.Result{}, nil
 	}
 
 	// Machine has kubernetes config — determine if provisioning is needed.
@@ -316,10 +319,10 @@ func (r *MachineReconciler) reconcileProvisioning(ctx context.Context, machine *
 		if provCond != nil && provCond.Status == metav1.ConditionTrue {
 			elapsed := time.Since(provCond.LastTransitionTime.Time)
 			if elapsed < r.provisioningTimeout() {
-				logger.Info("Machine is being provisioned, requeueing",
+				logger.Info("Machine is being provisioned, backing off",
 					"machine", machine.Name, "elapsed", elapsed.Round(time.Second))
 
-				return ctrl.Result{RequeueAfter: RequeueAfterPending}, nil
+				return ctrl.Result{}, nil
 			}
 		}
 
@@ -711,6 +714,9 @@ func (r *MachineReconciler) setSSHReachableCondition(machine *unboundedv1alpha3.
 }
 
 // updateStatus updates the machine status and returns the appropriate result.
+// The status update triggers a watch event which re-enqueues the Machine,
+// so no explicit requeue is needed on the success path. On error, we return
+// the error to let the controller-runtime work queue handle backoff/retry.
 func (r *MachineReconciler) updateStatus(
 	ctx context.Context,
 	machine *unboundedv1alpha3.Machine,
@@ -724,22 +730,12 @@ func (r *MachineReconciler) updateStatus(
 
 	if err := r.Status().Update(ctx, machine); err != nil {
 		logger.Error(err, "Failed to update Machine status")
-		return ctrl.Result{RequeueAfter: RequeueAfterPending}, err
+		return ctrl.Result{}, err
 	}
 
 	logger.Info("Updated Machine status", "name", machine.Name, "phase", phase)
 
-	// Determine requeue interval based on phase.
-	switch phase {
-	case unboundedv1alpha3.MachinePhaseReady:
-		return ctrl.Result{RequeueAfter: RequeueAfterReady}, nil
-	case unboundedv1alpha3.MachinePhaseJoining:
-		return ctrl.Result{RequeueAfter: RequeueAfterJoining}, nil
-	case unboundedv1alpha3.MachinePhaseFailed:
-		return ctrl.Result{RequeueAfter: RequeueAfterFailed}, nil
-	default:
-		return ctrl.Result{RequeueAfter: RequeueAfterPending}, nil
-	}
+	return ctrl.Result{}, nil
 }
 
 // provisioningTimeout returns the configured provisioning timeout, falling
@@ -821,8 +817,9 @@ func (r *MachineReconciler) reconcileNodeJoin(ctx context.Context, machine *unbo
 	switch machine.Status.Phase {
 	case unboundedv1alpha3.MachinePhaseJoining:
 		if len(nodeList.Items) == 0 {
-			// Still waiting for Node to appear.
-			return ctrl.Result{RequeueAfter: RequeueAfterJoining}, nil
+			// Still waiting for Node to appear. The Node watch will
+			// trigger reconciliation when a matching Node is created.
+			return ctrl.Result{}, nil
 		}
 
 		// Node found — transition to Ready.
@@ -846,8 +843,9 @@ func (r *MachineReconciler) reconcileNodeJoin(ctx context.Context, machine *unbo
 
 	case unboundedv1alpha3.MachinePhaseReady:
 		if len(nodeList.Items) > 0 {
-			// Node still exists — stay Ready.
-			return ctrl.Result{RequeueAfter: RequeueAfterReady}, nil
+			// Node still exists — stay Ready. The Node watch will
+			// trigger reconciliation if the Node is deleted.
+			return ctrl.Result{}, nil
 		}
 
 		// Node disappeared — transition back to Joining so we wait for

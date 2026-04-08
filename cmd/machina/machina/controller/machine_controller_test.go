@@ -179,26 +179,26 @@ func TestMachineReconciler_Reconcile(t *testing.T) {
 			name:            "reachable machine without kubernetes config transitions to Ready",
 			machine:         newTestMachine("test-machine", "192.168.1.100:22", "testuser", nil),
 			expectedPhase:   unboundedv1alpha3.MachinePhaseReady,
-			expectedRequeue: RequeueAfterReady,
+			expectedRequeue: 0,
 		},
 		{
 			name:            "unreachable machine stays Pending",
 			machine:         newTestMachine("test-machine", "192.168.1.100:22", "testuser", nil),
 			checkErr:        fmt.Errorf("TCP dial 192.168.1.100:22: connection refused"),
 			expectedPhase:   unboundedv1alpha3.MachinePhasePending,
-			expectedRequeue: RequeueAfterPending,
+			expectedRequeue: 0,
 		},
 		{
 			name:            "host without port defaults to 22",
 			machine:         newTestMachine("test-machine", "192.168.1.100", "testuser", nil),
 			expectedPhase:   unboundedv1alpha3.MachinePhaseReady,
-			expectedRequeue: RequeueAfterReady,
+			expectedRequeue: 0,
 		},
 		{
 			name:            "custom port is respected",
 			machine:         newTestMachine("test-machine", "192.168.1.100:2222", "testuser", nil),
 			expectedPhase:   unboundedv1alpha3.MachinePhaseReady,
-			expectedRequeue: RequeueAfterReady,
+			expectedRequeue: 0,
 		},
 	}
 
@@ -319,7 +319,7 @@ func TestMachineReconciler_Provisioning_Success(t *testing.T) {
 	result, err := reconciler.Reconcile(context.Background(), req)
 	require.NoError(t, err)
 	require.True(t, provisioner.called, "provisioner should have been called")
-	require.Equal(t, RequeueAfterJoining, result.RequeueAfter)
+	require.Equal(t, time.Duration(0), result.RequeueAfter)
 
 	var updated unboundedv1alpha3.Machine
 
@@ -453,7 +453,7 @@ func TestMachineReconciler_Provisioning_ProvisionerFails(t *testing.T) {
 
 	result, err := reconciler.Reconcile(context.Background(), req)
 	require.NoError(t, err)
-	require.Equal(t, RequeueAfterFailed, result.RequeueAfter)
+	require.Equal(t, time.Duration(0), result.RequeueAfter)
 
 	var updated unboundedv1alpha3.Machine
 
@@ -498,7 +498,7 @@ func TestMachineReconciler_Provisioning_JoiningSkipsReProvision(t *testing.T) {
 	result, err := reconciler.Reconcile(context.Background(), req)
 	require.NoError(t, err)
 	require.False(t, provisioner.called, "provisioner should NOT be called — Joining phase routes to Node join")
-	require.Equal(t, RequeueAfterJoining, result.RequeueAfter)
+	require.Equal(t, time.Duration(0), result.RequeueAfter)
 }
 
 func TestMachineReconciler_Provisioning_SSHKeyNotFound(t *testing.T) {
@@ -525,7 +525,7 @@ func TestMachineReconciler_Provisioning_SSHKeyNotFound(t *testing.T) {
 
 	result, err := reconciler.Reconcile(context.Background(), req)
 	require.NoError(t, err)
-	require.Equal(t, RequeueAfterFailed, result.RequeueAfter)
+	require.Equal(t, time.Duration(0), result.RequeueAfter)
 
 	var updated unboundedv1alpha3.Machine
 
@@ -560,7 +560,7 @@ func TestMachineReconciler_Provisioning_BootstrapTokenSecretMissing(t *testing.T
 
 	result, err := reconciler.Reconcile(context.Background(), req)
 	require.NoError(t, err)
-	require.Equal(t, RequeueAfterFailed, result.RequeueAfter)
+	require.Equal(t, time.Duration(0), result.RequeueAfter)
 
 	var updated unboundedv1alpha3.Machine
 
@@ -616,7 +616,7 @@ func TestMachineReconciler_ProvisioningPhase_TimesOutToFailed(t *testing.T) {
 	result, err := reconciler.Reconcile(context.Background(), req)
 	require.NoError(t, err)
 	require.False(t, provisioner.called, "provisioner should NOT be called when timing out")
-	require.Equal(t, RequeueAfterFailed, result.RequeueAfter)
+	require.Equal(t, time.Duration(0), result.RequeueAfter)
 
 	var updated unboundedv1alpha3.Machine
 
@@ -664,7 +664,7 @@ func TestMachineReconciler_ProvisioningPhase_RecentProvisioningRequeues(t *testi
 	result, err := reconciler.Reconcile(context.Background(), req)
 	require.NoError(t, err)
 	require.False(t, provisioner.called, "provisioner should NOT be called — still within timeout")
-	require.Equal(t, RequeueAfterPending, result.RequeueAfter)
+	require.Equal(t, time.Duration(0), result.RequeueAfter)
 
 	// Phase should remain Provisioning (no status update).
 	var updated unboundedv1alpha3.Machine
@@ -705,7 +705,7 @@ func TestMachineReconciler_ProvisioningPhase_MissingConditionTimesOut(t *testing
 	result, err := reconciler.Reconcile(context.Background(), req)
 	require.NoError(t, err)
 	require.False(t, provisioner.called, "provisioner should NOT be called")
-	require.Equal(t, RequeueAfterFailed, result.RequeueAfter)
+	require.Equal(t, time.Duration(0), result.RequeueAfter)
 
 	var updated unboundedv1alpha3.Machine
 
@@ -749,7 +749,7 @@ func TestMachineReconciler_Provisioning_RetryFromFailed(t *testing.T) {
 	result, err := reconciler.Reconcile(context.Background(), req)
 	require.NoError(t, err)
 	require.True(t, provisioner.called, "provisioner should be called to retry from Failed phase")
-	require.Equal(t, RequeueAfterJoining, result.RequeueAfter)
+	require.Equal(t, time.Duration(0), result.RequeueAfter)
 }
 
 // ---------------------------------------------------------------------------
@@ -1092,20 +1092,19 @@ func TestMachineReconciler_UpdateStatus_ConditionUpdate(t *testing.T) {
 	require.Equal(t, "Reachable", sshCond.Reason)
 }
 
-func TestMachineReconciler_UpdateStatus_PhaseDeterminesRequeue(t *testing.T) {
+func TestMachineReconciler_UpdateStatus_NoRequeue(t *testing.T) {
 	t.Parallel()
 
 	s := newTestScheme(t)
 
 	tests := []struct {
-		name            string
-		phase           unboundedv1alpha3.MachinePhase
-		expectedRequeue time.Duration
+		name  string
+		phase unboundedv1alpha3.MachinePhase
 	}{
-		{"Ready requeues at Ready interval", unboundedv1alpha3.MachinePhaseReady, RequeueAfterReady},
-		{"Joining requeues at Joining interval", unboundedv1alpha3.MachinePhaseJoining, RequeueAfterJoining},
-		{"Failed requeues at Failed interval", unboundedv1alpha3.MachinePhaseFailed, RequeueAfterFailed},
-		{"Pending requeues at Pending interval", unboundedv1alpha3.MachinePhasePending, RequeueAfterPending},
+		{"Ready returns no requeue", unboundedv1alpha3.MachinePhaseReady},
+		{"Joining returns no requeue", unboundedv1alpha3.MachinePhaseJoining},
+		{"Failed returns no requeue", unboundedv1alpha3.MachinePhaseFailed},
+		{"Pending returns no requeue", unboundedv1alpha3.MachinePhasePending},
 	}
 
 	for _, tt := range tests {
@@ -1127,7 +1126,7 @@ func TestMachineReconciler_UpdateStatus_PhaseDeterminesRequeue(t *testing.T) {
 
 			result, err := reconciler.updateStatus(context.Background(), machine, tt.phase, "test message")
 			require.NoError(t, err)
-			require.Equal(t, tt.expectedRequeue, result.RequeueAfter)
+			require.Equal(t, time.Duration(0), result.RequeueAfter)
 		})
 	}
 }
@@ -1226,7 +1225,7 @@ func TestReconcileNodeJoin_Joining_NoNode(t *testing.T) {
 
 	result, err := reconciler.Reconcile(context.Background(), req)
 	require.NoError(t, err)
-	require.Equal(t, RequeueAfterJoining, result.RequeueAfter)
+	require.Equal(t, time.Duration(0), result.RequeueAfter)
 
 	var updated unboundedv1alpha3.Machine
 
@@ -1268,7 +1267,7 @@ func TestReconcileNodeJoin_Joining_NodeFound(t *testing.T) {
 
 	result, err := reconciler.Reconcile(context.Background(), req)
 	require.NoError(t, err)
-	require.Equal(t, RequeueAfterReady, result.RequeueAfter)
+	require.Equal(t, time.Duration(0), result.RequeueAfter)
 
 	var updated unboundedv1alpha3.Machine
 
@@ -1316,7 +1315,7 @@ func TestReconcileNodeJoin_Ready_NodeStillExists(t *testing.T) {
 
 	result, err := reconciler.Reconcile(context.Background(), req)
 	require.NoError(t, err)
-	require.Equal(t, RequeueAfterReady, result.RequeueAfter)
+	require.Equal(t, time.Duration(0), result.RequeueAfter)
 }
 
 func TestReconcileNodeJoin_Ready_NodeDisappears(t *testing.T) {
@@ -1352,7 +1351,7 @@ func TestReconcileNodeJoin_Ready_NodeDisappears(t *testing.T) {
 
 	result, err := reconciler.Reconcile(context.Background(), req)
 	require.NoError(t, err)
-	require.Equal(t, RequeueAfterJoining, result.RequeueAfter)
+	require.Equal(t, time.Duration(0), result.RequeueAfter)
 
 	var updated unboundedv1alpha3.Machine
 
@@ -1395,7 +1394,7 @@ func TestReconcileNodeJoin_Joining_NodeReappears(t *testing.T) {
 
 	result, err := reconciler.Reconcile(context.Background(), req)
 	require.NoError(t, err)
-	require.Equal(t, RequeueAfterReady, result.RequeueAfter)
+	require.Equal(t, time.Duration(0), result.RequeueAfter)
 
 	var updated unboundedv1alpha3.Machine
 
@@ -1431,7 +1430,7 @@ func TestReconcileNodeJoin_Joining_StillWaiting(t *testing.T) {
 
 	result, err := reconciler.Reconcile(context.Background(), req)
 	require.NoError(t, err)
-	require.Equal(t, RequeueAfterJoining, result.RequeueAfter)
+	require.Equal(t, time.Duration(0), result.RequeueAfter)
 
 	var updated unboundedv1alpha3.Machine
 

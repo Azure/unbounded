@@ -19,6 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
+	"github.com/Azure/unbounded-kube/internal/metalman/phase"
 )
 
 // cloudInitEvent represents a cloud-init webhook reporting event.
@@ -209,6 +210,8 @@ func (h *HTTPServer) handleDisablePXE(w http.ResponseWriter, r *http.Request) {
 		Message:            "image=" + imageName,
 		ObservedGeneration: node.Generation,
 	})
+
+	phase.Set(node)
 
 	if err := h.Client.Status().Update(r.Context(), node); err != nil {
 		log.Error("updating Machine status", "node", node.Name, "err", err)

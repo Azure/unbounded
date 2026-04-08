@@ -14,6 +14,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
+	"github.com/Azure/unbounded-kube/internal/metalman/phase"
 )
 
 const (
@@ -64,6 +65,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	if node.Status.Operations.RebootCounter > 0 {
 		node.Status.Operations.RebootCounter--
 	}
+
+	phase.Set(&node)
 
 	return ctrl.Result{}, r.Client.Status().Update(ctx, &node)
 }
