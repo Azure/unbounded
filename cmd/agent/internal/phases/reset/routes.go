@@ -44,7 +44,7 @@ func (t *cleanupRoutes) Do(ctx context.Context) error {
 
 		// Flush the routing table.
 		cmd := exec.CommandContext(ctx, "ip", "route", "flush", "table", tableStr)
-		_ = cmd.Run()
+		cmd.Run() //nolint:errcheck // Best-effort flush; table may be empty or not exist.
 	}
 
 	return nil

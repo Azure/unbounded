@@ -41,7 +41,7 @@ func (t *removeAgentArtifacts) Do(_ context.Context) error {
 	}
 
 	// Remove temp config files matching /tmp/unbounded-agent-config.*.json.
-	matches, _ := filepath.Glob("/tmp/unbounded-agent-config.*.json")
+	matches, _ := filepath.Glob("/tmp/unbounded-agent-config.*.json") //nolint:errcheck // Pattern is valid; only errors on malformed globs.
 	for _, m := range matches {
 		removeFileIfExists(m)
 	}

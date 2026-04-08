@@ -35,7 +35,7 @@ func (t *stopMachine) Do(ctx context.Context) error {
 	// properly tears down mount namespaces and cgroups so that
 	// machinectl remove can succeed.
 	serviceName := fmt.Sprintf("systemd-nspawn@%s.service", t.machineName)
-	_ = utilexec.RunCmd(ctx, t.log, utilexec.Systemctl(), "stop", serviceName)
+	utilexec.RunCmd(ctx, t.log, utilexec.Systemctl(), "stop", serviceName) //nolint:errcheck // Best-effort stop; machine may already be stopped.
 
 	// Wait up to 30 seconds for the machine to fully stop.
 	if t.waitForGone(ctx, 30*time.Second) {
@@ -45,7 +45,7 @@ func (t *stopMachine) Do(ctx context.Context) error {
 	// Force terminate if still registered.
 	if machineExists(ctx, t.log, t.machineName) {
 		t.log.Warn("machine did not stop gracefully, terminating", "machine", t.machineName)
-		_ = utilexec.RunCmd(ctx, t.log, utilexec.Machinectl(), "terminate", t.machineName)
+		utilexec.RunCmd(ctx, t.log, utilexec.Machinectl(), "terminate", t.machineName) //nolint:errcheck // Best-effort terminate; we poll for disappearance below.
 
 		// Wait up to 15 seconds for the terminate to take full effect.
 		t.waitForGone(ctx, 15*time.Second)

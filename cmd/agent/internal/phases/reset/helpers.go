@@ -6,7 +6,7 @@ import (
 
 // removeFileIfExists removes a file if it exists, ignoring errors.
 func removeFileIfExists(path string) {
-	_ = os.Remove(path)
+	os.Remove(path) //nolint:errcheck // Best-effort cleanup; file may not exist.
 }
 
 // removeAllIfExists removes a path and all children if it exists.
