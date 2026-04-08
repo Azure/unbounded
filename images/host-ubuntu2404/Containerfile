@@ -1,28 +1,52 @@
 # ── Build the unbounded-agent binary ────────────────────────────────
-FROM docker.io/library/golang:1.26 AS gobuilder
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26 AS gobuilder
+
+ARG TARGETARCH
+ARG VERSION=dev
 
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /unbounded-agent ./cmd/agent
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build \
+    -ldflags "-s -w \
+      -X github.com/project-unbounded/unbounded-kube/internal/version.Version=${VERSION} \
+      -X github.com/project-unbounded/unbounded-kube/internal/version.GitCommit=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" \
+    -o /unbounded-agent ./cmd/agent
 
 # ── Assemble host image artifacts ───────────────────────────────────
 FROM docker.io/library/debian:bookworm-slim AS build
 
+ARG TARGETARCH
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        cpio curl ca-certificates qemu-utils libguestfs-tools linux-image-amd64 \
+        cpio curl ca-certificates qemu-utils libguestfs-tools linux-image-${TARGETARCH} \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Download netboot artifacts ──────────────────────────────────────
-ARG UBUNTU_NETBOOT_BASE=https://releases.ubuntu.com/24.04.2/netboot/amd64
-
+# Ubuntu netboot layout differs by architecture:
+#   amd64: individual files at releases.ubuntu.com
+#   arm64: tarball at cdimage.ubuntu.com (individual URLs are unavailable)
 RUN mkdir -p /artifacts && \
-    curl -fSL -o /artifacts/shimx64.efi "${UBUNTU_NETBOOT_BASE}/bootx64.efi" && \
-    curl -fSL -o /artifacts/grubx64.efi "${UBUNTU_NETBOOT_BASE}/grubx64.efi" && \
-    curl -fSL -o /artifacts/vmlinuz     "${UBUNTU_NETBOOT_BASE}/linux"       && \
-    curl -fSL -o /artifacts/initrd      "${UBUNTU_NETBOOT_BASE}/initrd"
+    if [ "${TARGETARCH}" = "amd64" ]; then \
+        NETBOOT_BASE="https://releases.ubuntu.com/24.04.2/netboot/amd64"; \
+        curl -fSL -o /artifacts/shim.efi   "${NETBOOT_BASE}/bootx64.efi" && \
+        curl -fSL -o /artifacts/grub.efi   "${NETBOOT_BASE}/grubx64.efi" && \
+        curl -fSL -o /artifacts/vmlinuz    "${NETBOOT_BASE}/linux"       && \
+        curl -fSL -o /artifacts/initrd     "${NETBOOT_BASE}/initrd"; \
+    elif [ "${TARGETARCH}" = "arm64" ]; then \
+        NETBOOT_URL="https://cdimage.ubuntu.com/releases/noble/release/ubuntu-24.04.4-netboot-arm64.tar.gz"; \
+        curl -fSL -o /tmp/netboot.tar.gz "${NETBOOT_URL}" && \
+        tar -xzf /tmp/netboot.tar.gz -C /tmp && \
+        cp /tmp/bootaa64.efi   /artifacts/shim.efi && \
+        cp /tmp/grubaa64.efi   /artifacts/grub.efi && \
+        cp /tmp/linux           /artifacts/vmlinuz && \
+        cp /tmp/initrd          /artifacts/initrd && \
+        rm -rf /tmp/netboot.tar.gz /tmp/*.efi /tmp/linux /tmp/initrd; \
+    else \
+        echo "Unsupported architecture: ${TARGETARCH}" >&2; exit 1; \
+    fi
 
 # ── Build init.cpio overlay ─────────────────────────────────────────
 COPY images/host-ubuntu2404/assets/init /tmp/initrd-root/init
@@ -33,10 +57,10 @@ RUN chmod 755 /tmp/initrd-root/init && \
 # ── Assemble /disk directory ────────────────────────────────────────
 RUN mkdir -p /disk/grub /disk/cloud-init
 
-# Binary boot artifacts.
-RUN cp /artifacts/shimx64.efi /artifacts/grubx64.efi \
-       /artifacts/vmlinuz     /artifacts/initrd       \
-       /artifacts/init.cpio   /disk/
+# Binary boot artifacts (architecture-neutral names for metalman).
+RUN cp /artifacts/shim.efi  /artifacts/grub.efi \
+       /artifacts/vmlinuz   /artifacts/initrd   \
+       /artifacts/init.cpio /disk/
 
 # Templates and static configs from assets/.
 COPY images/host-ubuntu2404/assets/grub.cfg.tmpl               /disk/grub/grub.cfg.tmpl
@@ -50,7 +74,8 @@ COPY images/host-ubuntu2404/assets/metadata.yaml              /disk/metadata.yam
 COPY images/host-ubuntu2404/assets/user-data.tmpl             /disk/cloud-init/user-data.tmpl
 
 # ── Download and convert Ubuntu cloud image to raw+gzip ─────────────
-ARG UBUNTU_CLOUDIMG_URL=https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-amd64.img
+# Cloud image URL is parameterized by architecture.
+ARG UBUNTU_CLOUDIMG_URL=https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-${TARGETARCH}.img
 
 # Copy the agent binary from the builder so we can inject it into the
 # cloud image before gzipping.  It is also placed at /disk/unbounded-agent

@@ -1,6 +1,30 @@
 name: Release
 
 on:
+  # Automated release via GitHub Actions UI — computes next version from latest tag.
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump level"
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        default: patch
+      prerelease:
+        description: "Mark as pre-release"
+        required: false
+        type: boolean
+        default: false
+      dry_run:
+        description: "Dry run (validate without publishing)"
+        required: false
+        type: boolean
+        default: false
+
+  # Manual release via tag push — skips version computation.
   push:
     tags:
       - "v*"
@@ -14,8 +38,61 @@ permissions:
   # Required for attaching SBOMs and provenance attestations.
   attestations: write
 
+# ---------------------------------------------------------------------------
+# Compute the release version.
+#
+#   workflow_dispatch  →  bump latest tag by selected level (patch/minor/major)
+#   tag push           →  use the pushed tag as-is
+# ---------------------------------------------------------------------------
 jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Compute version
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            # Tag push — use the tag directly.
+            TAG="${{ github.ref_name }}"
+          else
+            # workflow_dispatch — bump latest semver tag.
+            LATEST=$(git tag --list 'v*' --sort=-version:refname | head -n1)
+            if [[ -z "$LATEST" ]]; then
+              LATEST="v0.0.0"
+            fi
+
+            # Strip leading 'v' and split into components.
+            SEMVER="${LATEST#v}"
+            IFS='.' read -r MAJOR MINOR PATCH <<< "$SEMVER"
+
+            case "${{ inputs.bump }}" in
+              major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+              minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+              patch) PATCH=$((PATCH + 1)) ;;
+            esac
+
+            TAG="v${MAJOR}.${MINOR}.${PATCH}"
+          fi
+
+          # VERSION is the tag without the leading 'v' (used by GoReleaser).
+          VERSION="${TAG#v}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Release: ${TAG} (version: ${VERSION})"
+
+  # ---------------------------------------------------------------------------
+  # Build binaries with GoReleaser, sign checksums, generate SBOMs,
+  # and upload deploy manifests + krew manifest to the GitHub Release.
+  # ---------------------------------------------------------------------------
   release:
+    needs: version
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -26,6 +103,13 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # Create and push the tag if this is a workflow_dispatch (tag push already has it).
+      - name: Create tag
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          git tag "${{ needs.version.outputs.tag }}"
+          git push origin "${{ needs.version.outputs.tag }}"
+
       - name: Install cosign
         uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
 
@@ -35,28 +119,44 @@ jobs:
       - uses: goreleaser/goreleaser-action@ec59f474b9834571250b370d4735c50f8e2d1e29 # v7.0.0
         with:
           version: "~> v2"
-          args: release --clean
+          args: release --clean ${{ inputs.dry_run == true && '--skip=publish' || '' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GORELEASER_CURRENT_TAG: ${{ needs.version.outputs.tag }}
 
       - name: Upload manifests
+        if: inputs.dry_run != true
         run: |
-          VERSION="${GITHUB_REF_NAME}"
-          tar -czf dist/deploy.tar.gz deploy/
-          gh release upload "${VERSION}" dist/deploy.tar.gz --clobber
+          TAG="${{ needs.version.outputs.tag }}"
 
-          export VERSION="${GITHUB_REF_NAME}"
+          tar -czf dist/deploy.tar.gz deploy/
+          gh release upload "${TAG}" dist/deploy.tar.gz --clobber
+
+          export VERSION="${TAG}"
           export REPO="project-unbounded/unbounded-kube"
           export SHA_LINUX_AMD64=$(sha256sum dist/kubectl-unbounded-linux-amd64.tar.gz | awk '{print $1}')
           export SHA_LINUX_ARM64=$(sha256sum dist/kubectl-unbounded-linux-arm64.tar.gz | awk '{print $1}')
           export SHA_DARWIN_AMD64=$(sha256sum dist/kubectl-unbounded-darwin-amd64.tar.gz | awk '{print $1}')
           export SHA_DARWIN_ARM64=$(sha256sum dist/kubectl-unbounded-darwin-arm64.tar.gz | awk '{print $1}')
           envsubst < hack/krew-manifest.yaml > dist/unbounded.yaml
-          gh release upload "${VERSION}" dist/unbounded.yaml --clobber
+          gh release upload "${TAG}" dist/unbounded.yaml --clobber
+
+          # Mark as prerelease if requested.
+          if [[ "${{ inputs.prerelease }}" == "true" ]]; then
+            gh release edit "${TAG}" --prerelease
+          fi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  # ---------------------------------------------------------------------------
+  # Build, scan, sign, and push multi-arch container images.
+  #
+  # machina and metalman are Trivy-scanned (they contain OS packages).
+  # host-ubuntu2404 is a scratch image with only data files — skip Trivy.
+  # All images are signed with cosign and have SBOMs attested.
+  # ---------------------------------------------------------------------------
   images:
+    needs: version
     runs-on: ubuntu-latest
     env:
       CONTAINER_REGISTRY: ghcr.io/${{ github.repository_owner }}
@@ -65,58 +165,77 @@ jobs:
         component:
           - name: machina
             file: images/machina/Containerfile
+            trivy: true
           - name: metalman
             file: images/metalman/Containerfile
+            trivy: true
+          - name: host-ubuntu2404
+            file: images/host-ubuntu2404/Containerfile
+            trivy: false
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Install cosign
         uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
 
-      - uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+      - uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4.0.0
+        with:
+          platforms: linux/amd64,linux/arm64
+
+      - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
-
-      - name: Build image (load locally for scanning)
+      # Trivy scan on a single-platform local build (only for images with OS packages).
+      - name: Build image for scanning
+        if: matrix.component.trivy
         uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7.0.0
         with:
           context: .
           file: ${{ matrix.component.file }}
           push: false
           load: true
-          tags: scan/${{ matrix.component.name }}:${{ github.ref_name }}
+          build-args: VERSION=${{ needs.version.outputs.tag }}
+          tags: scan/${{ matrix.component.name }}:${{ needs.version.outputs.tag }}
 
-      - name: Scan with Trivy before pushing
+      - name: Scan with Trivy
+        if: matrix.component.trivy
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
         with:
-          image-ref: scan/${{ matrix.component.name }}:${{ github.ref_name }}
+          image-ref: scan/${{ matrix.component.name }}:${{ needs.version.outputs.tag }}
           format: table
           severity: CRITICAL,HIGH
-          # Fail the release if critical or high CVEs are found in the final image.
           exit-code: "1"
 
+      # Multi-arch build and push.
       - name: Build and push image
         id: push
         uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7.0.0
         with:
           context: .
           file: ${{ matrix.component.file }}
-          push: true
+          platforms: linux/amd64,linux/arm64
+          push: ${{ inputs.dry_run != true }}
+          build-args: VERSION=${{ needs.version.outputs.tag }}
           tags: |
-            ${{ env.CONTAINER_REGISTRY }}/${{ matrix.component.name }}:${{ github.ref_name }}
+            ${{ env.CONTAINER_REGISTRY }}/${{ matrix.component.name }}:${{ needs.version.outputs.tag }}
             ${{ env.CONTAINER_REGISTRY }}/${{ matrix.component.name }}:latest
+          cache-from: type=gha,scope=${{ matrix.component.name }}
+          cache-to: type=gha,scope=${{ matrix.component.name }},mode=max
 
-      - name: Sign container image (keyless cosign)
-        # Sign the specific digest to ensure the signature is immutably tied to this exact image.
+      - name: Sign container image
+        if: inputs.dry_run != true
         run: |
           cosign sign --yes \
             "${{ env.CONTAINER_REGISTRY }}/${{ matrix.component.name }}@${{ steps.push.outputs.digest }}"
 
       - name: Generate and attach SBOM
+        if: inputs.dry_run != true
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           image: ${{ env.CONTAINER_REGISTRY }}/${{ matrix.component.name }}@${{ steps.push.outputs.digest }}
@@ -127,6 +246,7 @@ jobs:
           output-file: sbom-${{ matrix.component.name }}.spdx.json
 
       - name: Attest SBOM to image
+        if: inputs.dry_run != true
         run: |
           cosign attest --yes \
             --predicate sbom-${{ matrix.component.name }}.spdx.json \

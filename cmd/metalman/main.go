@@ -10,9 +10,8 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	"github.com/project-unbounded/unbounded-kube/internal/metalman/commands"
+	"github.com/project-unbounded/unbounded-kube/internal/version"
 )
-
-var version = "dev"
 
 func main() {
 	ctrl.SetLogger(logr.FromSlogHandler(slog.Default().Handler()))
@@ -26,7 +25,7 @@ func main() {
 		Use:   "version",
 		Short: "Print version",
 		Run: func(_ *cobra.Command, _ []string) {
-			fmt.Println(version)
+			fmt.Println(version.String())
 		},
 	})
 
