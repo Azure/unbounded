@@ -1,9 +1,0 @@
----
-apiVersion: unbounded.aks.azure.com/v1alpha1
-kind: GatewayPool
-metadata:
-  name: gw-main
-spec:
-  nodeSelector:
-    unbounded-kube.io/unbounded-net-gateway: "true"
-  type: External

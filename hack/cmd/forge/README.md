@@ -78,7 +78,6 @@ bin/forge site azure add \
 | `--subscription` | `44654aed-2753-4b88-9142-af7132933b6b` | Azure subscription ID |
 | `--location` | `canadacentral` | Azure location |
 | `--worker-node-cidr` | `10.1.0.0/16` | CIDR range to use for worker nodes |
-| `--add-unbounded-cni-site` | `false` | Add an unbounded-cni site configuration automatically |
 | `--ssh-bastion` | `false` | Provision an SSH bastion (jump host) for the site |
 | `--ssh-bastion-vm-size` | `Standard_D2ads_v6` | VM size to use for the SSH bastion |
 | `--ssh-bastion-disable-direct-access` | `false` | Disable direct SSH access to worker pools, forcing access through the bastion |

@@ -215,7 +215,6 @@ kubectl unbounded site add-machine \
 | Variable | Description |
 |----------|-------------|
 | `KUBECONFIG` | Fallback kubeconfig path when `--kubeconfig` is not provided |
-| `UB_PROTOTYPE_UNBOUNDED_CNI` | When set to `1`, uses the older unbounded-cni v0.7.x namespace and assets (development only) |
 
 ## See Also
 

@@ -770,24 +770,6 @@ func TestNewInstallUnboundedCNI(t *testing.T) {
 	require.Equal(t, 5*time.Second, iu.pollInterval)
 }
 
-func TestNewInstallUnboundedCNI_Prototype(t *testing.T) {
-	t.Setenv("UB_PROTOTYPE_UNBOUNDED_CNI", "1")
-
-	logger := discardLogger()
-	kubeResourcesCli := fakeclient.NewClientBuilder().Build()
-	kubeCli := fake.NewClientset()
-	httpCli := &http.Client{Timeout: 30 * time.Second}
-
-	iu := newInstallUnboundedCNI("https://example.com/cni.tar.gz", httpCli, logger, kubeResourcesCli, kubeCli)
-
-	require.NotNil(t, iu)
-	require.Equal(t, "unbounded-cni", iu.namespace)
-	require.Equal(t, "unbounded-cni-controller", iu.controllerName)
-	require.Equal(t, "unbounded-cni", iu.tempPrefix)
-	require.Equal(t, 5*time.Minute, iu.waitTimeout)
-	require.Equal(t, 5*time.Second, iu.pollInterval)
-}
-
 // ---------------------------------------------------------------------------
 // copyFile standalone tests
 // ---------------------------------------------------------------------------

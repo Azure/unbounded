@@ -175,7 +175,7 @@ The `site-nebius.yaml` declares the Nebius subnet CIDR (`172.20.0.0/16`) and
 the pod CIDR block (`10.200.0.0/16`) to assign to nodes at that site:
 
 ```yaml
-apiVersion: unbounded.aks.azure.com/v1alpha1
+apiVersion: net.unbounded-kube.io/v1alpha1
 kind: Site
 metadata:
   name: site-nebius

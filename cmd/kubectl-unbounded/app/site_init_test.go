@@ -402,50 +402,6 @@ func TestEnsureUnboundedSite_DefaultTemplates(t *testing.T) {
 	require.NotContains(t, string(appliedYAML), "unbounded.aks.azure.com/v1alpha1")
 }
 
-func TestEnsureUnboundedSite_PrototypeTemplates(t *testing.T) {
-	t.Setenv("UB_PROTOTYPE_UNBOUNDED_CNI", "1")
-
-	kubeResourcesCli := fakeclient.NewClientBuilder().
-		WithInterceptorFuncs(interceptor.Funcs{
-			Apply: func(_ context.Context, _ client.WithWatch, _ runtime.ApplyConfiguration, _ ...client.ApplyOption) error {
-				return nil
-			},
-		}).
-		Build()
-
-	cfg := unboundedSiteConfig{
-		SiteName:  "test-site",
-		NodeCIDRs: []string{"10.0.0.0/24"},
-		PodCIDRs:  []string{"10.1.0.0/24"},
-		Manifests: []string{"site.yaml"},
-	}
-
-	h := &siteInitHandler{
-		kubeResourcesCli: kubeResourcesCli,
-		logger:           discardLogger(),
-	}
-
-	err := h.ensureUnboundedSite(context.Background(), cfg)
-	require.NoError(t, err)
-
-	// Verify prototype mode uses unbounded.aks.azure.com apiVersion.
-	content, err := siteTemplatesPrototype.ReadFile("assets/unbounded-cni-site/site.yaml")
-	require.NoError(t, err)
-	require.Contains(t, string(content), "unbounded.aks.azure.com/v1alpha1")
-	require.NotContains(t, string(content), "net.unbounded-kube.io/v1alpha1")
-}
-
-// TestSiteInitCommand_PrototypeCNIDefault verifies that when
-// UB_PROTOTYPE_UNBOUNDED_CNI=1, the --cni-manifests flag defaults to empty.
-func TestSiteInitCommand_PrototypeCNIDefault(t *testing.T) {
-	t.Setenv("UB_PROTOTYPE_UNBOUNDED_CNI", "1")
-
-	cmd := siteInitCommand()
-	f := cmd.Flags().Lookup("cni-manifests")
-	require.NotNil(t, f)
-	require.Equal(t, "", f.DefValue, "prototype mode should default --cni-manifests to empty")
-}
-
 // TestSiteInitCommand_DefaultCNIManifests verifies the default --cni-manifests
 // value points to the unbounded-net release when prototype mode is off.
 func TestSiteInitCommand_DefaultCNIManifests(t *testing.T) {

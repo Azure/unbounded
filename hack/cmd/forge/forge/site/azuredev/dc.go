@@ -39,18 +39,17 @@ type MachinePool struct {
 }
 
 type Datacenter struct {
-	AzureCli                  *azsdk.ClientSet
-	KubeCli                   kubernetes.Interface
-	Kubectl                   kube.KubectlFunc
-	Logger                    *slog.Logger
-	Name                      string
-	Location                  string
-	WorkerNodeCIDR            string
-	PeerWithCluster           bool
-	ClusterDetails            *cluster.ClusterDetails
-	DataDir                   cluster.DataDir
-	ExtraMachinePools         []MachinePool
-	AddUnboundedCNISiteConfig bool
+	AzureCli          *azsdk.ClientSet
+	KubeCli           kubernetes.Interface
+	Kubectl           kube.KubectlFunc
+	Logger            *slog.Logger
+	Name              string
+	Location          string
+	WorkerNodeCIDR    string
+	PeerWithCluster   bool
+	ClusterDetails    *cluster.ClusterDetails
+	DataDir           cluster.DataDir
+	ExtraMachinePools []MachinePool
 
 	SSHBastion                    bool
 	SSHBastionVMSize              string

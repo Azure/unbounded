@@ -22,16 +22,6 @@ type installUnboundedCNI struct {
 }
 
 func newInstallUnboundedCNI(fileOrURL string, httpClient *http.Client, logger *slog.Logger, kubeResourcesCli client.Client, kubeCli kubernetes.Interface) *installUnboundedCNI {
-	ns := unboundedCNINamespace
-	controller := unboundedCNIControllerName
-	prefix := "unbounded-net"
-
-	if usePrototypeCNI() {
-		ns = "unbounded-cni"
-		controller = "unbounded-cni-controller"
-		prefix = "unbounded-cni"
-	}
-
 	return &installUnboundedCNI{
 		kubeComponentInstaller: &kubeComponentInstaller{
 			fileOrURL:        fileOrURL,
@@ -39,11 +29,11 @@ func newInstallUnboundedCNI(fileOrURL string, httpClient *http.Client, logger *s
 			logger:           logger,
 			kubeResourcesCli: kubeResourcesCli,
 			kubeCli:          kubeCli,
-			namespace:        ns,
-			controllerName:   controller,
+			namespace:        unboundedCNINamespace,
+			controllerName:   unboundedCNIControllerName,
 			waitTimeout:      5 * time.Minute,
 			pollInterval:     5 * time.Second,
-			tempPrefix:       prefix,
+			tempPrefix:       "unbounded-net",
 		},
 	}
 }

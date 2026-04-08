@@ -10,7 +10,6 @@ import (
 	"io/fs"
 	"log/slog"
 	"net"
-	"os"
 	"text/template"
 
 	"github.com/spf13/cobra"
@@ -28,22 +27,12 @@ import (
 //go:embed assets/unbounded-net-site/*.yaml
 var siteTemplates embed.FS
 
-//go:embed assets/unbounded-cni-site/*.yaml
-var siteTemplatesPrototype embed.FS
-
 //go:embed assets/flexagent-temp/*.yaml
 var flexAgentTemplates embed.FS
 
 const (
 	unboundedCNIRelease = "https://github.com/project-unbounded/unbounded-net/releases/download/v1.1.2/unbounded-net-manifests-v1.1.2.tar.gz"
 )
-
-// usePrototypeCNI returns true when UB_PROTOTYPE_UNBOUNDED_CNI=1 is set,
-// switching the plugin to use the older unbounded-cni v0.7.x assets and
-// namespace instead of unbounded-net v1.x.
-func usePrototypeCNI() bool {
-	return os.Getenv("UB_PROTOTYPE_UNBOUNDED_CNI") == "1"
-}
 
 // siteInitHandler is responsible for handling initial unbounded-kube bootstrap and also ensuring a site
 // is ready for machines to be added to it. The handler performs the following duties:
@@ -347,11 +336,6 @@ func (h *siteInitHandler) ensureUnboundedSite(ctx context.Context, cfg unbounded
 	templateFS := siteTemplates
 	templateDir := "assets/unbounded-net-site/"
 
-	if usePrototypeCNI() {
-		templateFS = siteTemplatesPrototype
-		templateDir = "assets/unbounded-cni-site/"
-	}
-
 	for _, name := range cfg.Manifests {
 		path := templateDir + name
 
@@ -556,12 +540,7 @@ func siteInitCommand() *cobra.Command {
 		},
 	}
 
-	cniDefault := unboundedCNIRelease
-	if usePrototypeCNI() {
-		cniDefault = ""
-	}
-
-	cmd.Flags().StringVar(&handler.cniManifests, "cni-manifests", cniDefault, "Path or https URL to CNI plugin manifests")
+	cmd.Flags().StringVar(&handler.cniManifests, "cni-manifests", unboundedCNIRelease, "Path or https URL to CNI plugin manifests")
 	cmd.Flags().StringVar(&handler.machinaManifests, "machina-manifests", "", "Path or https URL to Machina manifests (uses embedded manifests if omitted)")
 	cmd.Flags().StringVar(&handler.kubeconfigPath, "kubeconfig", "", "Path to kubeconfig file")
 	cmd.Flags().StringVar(&handler.name, "name", "", "The name of the site")

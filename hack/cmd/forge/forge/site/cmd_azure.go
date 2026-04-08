@@ -102,7 +102,6 @@ func addSiteCmd(siteCmdContext *siteCommandContext, site *azuredev.Datacenter) *
 	c.Flags().StringVar(&siteCmdContext.SubscriptionID, "subscription", azureDefaultSubscription, "Azure subscription ID")
 	c.Flags().StringVar(&siteCmdContext.Location, "location", azureDefaultLocation, "Azure location")
 	c.Flags().StringVar(&site.WorkerNodeCIDR, "worker-node-cidr", site.WorkerNodeCIDR, "CIDR range to use for work nodes")
-	c.Flags().BoolVar(&site.AddUnboundedCNISiteConfig, "add-unbounded-cni-site", site.AddUnboundedCNISiteConfig, "Add an unbounded-cni site configuration automatically")
 	c.Flags().BoolVar(&site.SSHBastion, "ssh-bastion", site.SSHBastion, "Provision an SSH bastion (jump host) for the site")
 	c.Flags().StringVar(&site.SSHBastionVMSize, "ssh-bastion-vm-size", "Standard_D2ads_v6", "VM size to use for the SSH bastion")
 	c.Flags().BoolVar(&site.SSHBastionDisableDirectAccess, "ssh-bastion-disable-direct-access", site.SSHBastionDisableDirectAccess, "Disable direct SSH access to worker pools, forcing access through the bastion")
