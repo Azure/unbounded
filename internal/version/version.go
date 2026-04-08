@@ -7,7 +7,11 @@
 //	                    -X github.com/project-unbounded/unbounded-kube/internal/version.GitCommit=abc1234"
 package version
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/spf13/cobra"
+)
 
 // Version is the semantic version of the binary.
 // Set at build time; defaults to "dev" for local builds.
@@ -20,4 +24,15 @@ var GitCommit = "unknown"
 // String returns a human-readable version string.
 func String() string {
 	return fmt.Sprintf("%s (commit: %s)", Version, GitCommit)
+}
+
+// Command returns a cobra command that prints the version string.
+func Command() *cobra.Command {
+	return &cobra.Command{
+		Use:   "version",
+		Short: "Print version",
+		Run: func(_ *cobra.Command, _ []string) {
+			fmt.Println(String())
+		},
+	}
 }

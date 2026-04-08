@@ -1,5 +1,9 @@
 # Unbounded Kubernetes - Kubernetes without Borders
 
+[![Release](https://img.shields.io/github/v/release/project-unbounded/unbounded-kube?style=flat-square)](https://github.com/project-unbounded/unbounded-kube/releases/latest)
+[![Go CI](https://img.shields.io/github/actions/workflow/status/project-unbounded/unbounded-kube/go-ci.yaml?branch=main&label=CI&style=flat-square)](https://github.com/project-unbounded/unbounded-kube/actions/workflows/go-ci.yaml)
+[![License](https://img.shields.io/github/license/project-unbounded/unbounded-kube?style=flat-square)](LICENSE)
+
 ## WARNING: Project is in Early Development
 
 **This project is in early development and while we feel comfortable it can be used for experimentation and prototyping right now there are still rough edges and potential for breaking changes. Please report your experiences through the Issue Tracker so we can help!**

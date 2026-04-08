@@ -7,6 +7,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/project-unbounded/unbounded-kube/cmd/machina/machina/controller"
+	"github.com/project-unbounded/unbounded-kube/internal/version"
 )
 
 func Run() {
@@ -16,6 +17,7 @@ func Run() {
 	}
 
 	root.AddCommand(controller.NewCommand())
+	root.AddCommand(version.Command())
 
 	if err := root.Execute(); err != nil {
 		fmt.Printf("error: %v\n", err)

@@ -44,9 +44,11 @@ func parseManifest(rdr io.Reader) (any, error) {
 	if rdr == nil {
 		return m, nil
 	}
+
 	if err := json.NewDecoder(rdr).Decode(&m); err != nil {
 		return nil, fmt.Errorf("decode Docker manifest: %w", err)
 	}
+
 	return m, nil
 }
 
@@ -55,9 +57,11 @@ func parseIndex(rdr io.Reader) (any, error) {
 	if rdr == nil {
 		return idx, nil
 	}
+
 	if err := json.NewDecoder(rdr).Decode(&idx); err != nil {
 		return nil, fmt.Errorf("decode Docker manifest list: %w", err)
 	}
+
 	return idx, nil
 }
 
@@ -66,9 +70,11 @@ func parseImage(rdr io.Reader) (any, error) {
 	if rdr == nil {
 		return img, nil
 	}
+
 	if err := json.NewDecoder(rdr).Decode(&img); err != nil {
 		return nil, fmt.Errorf("decode Docker image config: %w", err)
 	}
+
 	return img, nil
 }
 

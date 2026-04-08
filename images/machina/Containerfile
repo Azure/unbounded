@@ -31,7 +31,9 @@ RUN go mod download
 # Copy the rest of the source code
 COPY ../../ .
 
-RUN make machina-build
+# VERSION is passed from the release workflow to inject version metadata via ldflags.
+ARG VERSION=dev
+RUN make machina-build VERSION=${VERSION}
 
 # Runtime stage
 FROM mcr.microsoft.com/azurelinux/base/core:3.0

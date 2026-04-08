@@ -8,6 +8,9 @@ builds:
       - CGO_ENABLED=0
     ldflags:
       - -s -w
+      - -X github.com/project-unbounded/unbounded-kube/internal/version.Version={{ .Version }}
+      - -X github.com/project-unbounded/unbounded-kube/internal/version.GitCommit={{ .ShortCommit }}
+      - -X github.com/project-unbounded/unbounded-kube/cmd/kubectl-unbounded/app.MetalmanImage=ghcr.io/project-unbounded/metalman:v{{ .Version }}
     hooks:
       pre:
         - make machina-manifests MACHINA_TAG={{ .Tag }}
@@ -72,10 +75,21 @@ sboms:
 
 changelog:
   sort: asc
+  groups:
+    - title: Features
+      regexp: '^.*?feat(\(.+\))??!?:.+$'
+      order: 0
+    - title: Bug Fixes
+      regexp: '^.*?fix(\(.+\))??!?:.+$'
+      order: 1
+    - title: Other
+      order: 999
   filters:
     exclude:
       - "^docs:"
       - "^test:"
+      - "^ci:"
+      - "^chore:"
 
 release:
   github:

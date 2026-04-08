@@ -30,12 +30,15 @@ func TestConvertDockerMediaTypes(t *testing.T) {
 	if m.MediaType != ispec.MediaTypeImageManifest {
 		t.Errorf("manifest MediaType = %q, want %q", m.MediaType, ispec.MediaTypeImageManifest)
 	}
+
 	if m.Config.MediaType != ispec.MediaTypeImageConfig {
 		t.Errorf("config MediaType = %q, want %q", m.Config.MediaType, ispec.MediaTypeImageConfig)
 	}
+
 	if m.Layers[0].MediaType != ispec.MediaTypeImageLayerGzip {
 		t.Errorf("layer[0] MediaType = %q, want %q", m.Layers[0].MediaType, ispec.MediaTypeImageLayerGzip)
 	}
+
 	if m.Layers[1].MediaType != ispec.MediaTypeImageLayer {
 		t.Errorf("layer[1] MediaType = %q, want %q", m.Layers[1].MediaType, ispec.MediaTypeImageLayer)
 	}
@@ -65,9 +68,11 @@ func TestConvertDockerMediaTypes_OCI_Noop(t *testing.T) {
 	if m.MediaType != ispec.MediaTypeImageManifest {
 		t.Errorf("manifest MediaType = %q, want %q", m.MediaType, ispec.MediaTypeImageManifest)
 	}
+
 	if m.Config.MediaType != ispec.MediaTypeImageConfig {
 		t.Errorf("config MediaType = %q, want %q", m.Config.MediaType, ispec.MediaTypeImageConfig)
 	}
+
 	if m.Layers[0].MediaType != ispec.MediaTypeImageLayerGzip {
 		t.Errorf("layer[0] MediaType = %q, want %q", m.Layers[0].MediaType, ispec.MediaTypeImageLayerGzip)
 	}
@@ -83,14 +88,17 @@ func TestRegisterDockerParsers_ParseManifest(t *testing.T) {
 	RegisterDockerParsers()
 
 	rdr := strings.NewReader(`{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.v2+json"}`)
+
 	result, err := parseManifest(rdr)
 	if err != nil {
 		t.Fatalf("parseManifest: %v", err)
 	}
+
 	m, ok := result.(ispec.Manifest)
 	if !ok {
 		t.Fatalf("parseManifest returned %T, want ispec.Manifest", result)
 	}
+
 	if m.SchemaVersion != 2 {
 		t.Errorf("SchemaVersion = %d, want 2", m.SchemaVersion)
 	}
@@ -101,6 +109,7 @@ func TestRegisterDockerParsers_ParseManifest_NilReader(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseManifest(nil): %v", err)
 	}
+
 	if _, ok := result.(ispec.Manifest); !ok {
 		t.Fatalf("parseManifest(nil) returned %T, want ispec.Manifest", result)
 	}
@@ -108,10 +117,12 @@ func TestRegisterDockerParsers_ParseManifest_NilReader(t *testing.T) {
 
 func TestRegisterDockerParsers_ParseIndex(t *testing.T) {
 	rdr := strings.NewReader(`{"schemaVersion":2,"manifests":[]}`)
+
 	result, err := parseIndex(rdr)
 	if err != nil {
 		t.Fatalf("parseIndex: %v", err)
 	}
+
 	if _, ok := result.(ispec.Index); !ok {
 		t.Fatalf("parseIndex returned %T, want ispec.Index", result)
 	}
@@ -119,14 +130,17 @@ func TestRegisterDockerParsers_ParseIndex(t *testing.T) {
 
 func TestRegisterDockerParsers_ParseImage(t *testing.T) {
 	rdr := strings.NewReader(`{"architecture":"amd64","os":"linux"}`)
+
 	result, err := parseImage(rdr)
 	if err != nil {
 		t.Fatalf("parseImage: %v", err)
 	}
+
 	img, ok := result.(ispec.Image)
 	if !ok {
 		t.Fatalf("parseImage returned %T, want ispec.Image", result)
 	}
+
 	if img.Architecture != "amd64" {
 		t.Errorf("Architecture = %q, want %q", img.Architecture, "amd64")
 	}
@@ -146,6 +160,7 @@ func TestParsers_NilReader(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parse(nil): %v", err)
 			}
+
 			if result == nil {
 				t.Fatal("parse(nil) returned nil")
 			}
