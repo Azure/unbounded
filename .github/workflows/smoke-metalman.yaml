@@ -8,7 +8,7 @@ on:
     paths:
       - cmd/metalman/**
       - internal/metalman/**
-      - deploy/metalman/**
+      - deploy/machina/**
       - hack/smoke-metalman.py
       - images/host-ubuntu2404/**
       - go.mod
@@ -20,9 +20,7 @@ on:
       - cmd/metalman/**
       - internal/metalman/**
       - api/v1alpha3/**
-      - deploy/metalman/**
-      - deploy/machina/crd/**
-      - deploy/machina/01-namespace.yaml
+      - deploy/machina/**
       - hack/smoke-metalman.py
       - images/host-ubuntu2404/**
       - go.mod

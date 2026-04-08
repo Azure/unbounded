@@ -25,7 +25,7 @@ Apply the CRDs and controller manifests:
 
 ```bash
 kubectl apply -f deploy/machina/crd/
-kubectl apply -f deploy/metalman/
+kubectl apply -f deploy/machina/
 ```
 
 This creates the `unbounded-kube` namespace, ServiceAccounts (`metalman-controller`, `metalman-bootstrap`), RBAC roles, and a Deployment.

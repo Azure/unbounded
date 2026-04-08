@@ -19,17 +19,14 @@ metadata:
   name: metalman-controller
   namespace: unbounded-kube
 rules:
-  - apiGroups: [""]
-    resources: ["configmaps"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Leader election
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  - apiGroups: [""]
-    resources: ["events"]
-    verbs: ["create", "patch"]
+    verbs: ["get", "create", "update"]
+  # Bootstrap token creation (scoped to metalman-bootstrap SA)
   - apiGroups: [""]
     resources: ["serviceaccounts/token"]
+    resourceNames: ["metalman-bootstrap"]
     verbs: ["create"]
 
 ---
@@ -48,7 +45,7 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
 
 ---
-# Allow metalman-controller to read the cluster-info ConfigMap from kube-public.
+# Allow metalman-controller to read cluster metadata ConfigMaps from kube-public.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -57,7 +54,7 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["configmaps"]
-    resourceNames: ["cluster-info"]
+    resourceNames: ["cluster-info", "kube-root-ca.crt", "aks-cluster-metadata"]
     verbs: ["get"]
 
 ---
@@ -66,6 +63,34 @@ kind: RoleBinding
 metadata:
   name: metalman-controller
   namespace: kube-public
+subjects:
+  - kind: ServiceAccount
+    name: metalman-controller
+    namespace: machina-system
+roleRef:
+  kind: Role
+  name: metalman-controller
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# Allow metalman-controller to read the kube-dns Service from kube-system.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: metalman-controller
+  namespace: kube-system
+rules:
+  - apiGroups: [""]
+    resources: ["services"]
+    resourceNames: ["kube-dns"]
+    verbs: ["get"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: metalman-controller
+  namespace: kube-system
 subjects:
   - kind: ServiceAccount
     name: metalman-controller
@@ -87,15 +112,15 @@ rules:
     verbs: ["get", "list", "watch"]
   - apiGroups: ["unbounded-kube.io"]
     resources: ["machines/status"]
-    verbs: ["get", "update", "patch"]
+    verbs: ["update"]
   # Secrets (Redfish passwords)
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["get", "list", "watch"]
-  # Services (cluster DNS resolution)
+    verbs: ["get"]
+  # Nodes (cloud provider detection)
   - apiGroups: [""]
-    resources: ["services"]
-    verbs: ["get", "list", "watch"]
+    resources: ["nodes"]
+    verbs: ["list"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
