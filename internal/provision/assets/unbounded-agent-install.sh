@@ -9,7 +9,7 @@ set -eo pipefail
 # agent, and run it.
 #
 # Optional environment variables:
-#   AGENT_VERSION         - unbounded-agent release version (default: "v0.0.5")
+#   AGENT_VERSION         - unbounded-agent release version (default: "v0.0.10")
 #   AGENT_URL             - override the download URL for the unbounded-agent tarball
 #   AGENT_DEBUG           - enable debug mode for unbounded-agent (e.g. "1", "true", "yes")
 
@@ -26,7 +26,7 @@ fi
 # ---------------------------------------------------------------------------
 # Download and run the agent.
 # ---------------------------------------------------------------------------
-AGENT_VERSION="${AGENT_VERSION:-v0.0.5}"
+AGENT_VERSION="${AGENT_VERSION:-v0.0.10}"
 
 arch="$(uname -m)"
 case "$arch" in
