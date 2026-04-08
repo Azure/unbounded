@@ -8,7 +8,7 @@ import (
 	"log/slog"
 	"os/exec"
 
-	"github.com/project-unbounded/unbounded-kube/hack/cmd/forge/internal/helpers"
+	"github.com/project-unbounded/unbounded-kube/internal/helpers"
 )
 
 func Kubectl(env []string, kubeconfig string) func(context.Context) *exec.Cmd {

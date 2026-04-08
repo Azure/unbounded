@@ -2,8 +2,11 @@ package azuredev
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"log/slog"
+	"math/big"
+	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/keyvault/armkeyvault"
@@ -11,7 +14,6 @@ import (
 
 	"github.com/project-unbounded/unbounded-kube/hack/cmd/forge/forge/azsdk"
 	"github.com/project-unbounded/unbounded-kube/hack/cmd/forge/forge/infra"
-	"github.com/project-unbounded/unbounded-kube/hack/cmd/forge/internal/helpers"
 )
 
 const (
@@ -27,7 +29,7 @@ type datacenterSecretsManager struct {
 }
 
 func (m *datacenterSecretsManager) keyVaultName() string {
-	return fmt.Sprintf("main-%s", helpers.UniqueID(*m.resourceGroup.ID))
+	return fmt.Sprintf("main-%s", uniqueID(*m.resourceGroup.ID))
 }
 
 func (m *datacenterSecretsManager) PutSSHSecrets(ctx context.Context, names map[string]*string, username string, keyPair *infra.SSHKeyPair) error {
@@ -146,4 +148,9 @@ func (m *datacenterSecretsManager) createOrUpdateKeyVault(ctx context.Context) (
 	}
 
 	return applied, nil
+}
+
+func uniqueID(s string) string {
+	hash := sha256.Sum256([]byte(strings.ToLower(s)))
+	return new(big.Int).SetBytes(hash[:]).Text(36)[:10]
 }
