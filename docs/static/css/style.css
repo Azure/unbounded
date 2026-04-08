@@ -107,6 +107,13 @@ a:hover {
   text-decoration: none;
 }
 
+.icon-github {
+  width: 1rem;
+  height: 1rem;
+  vertical-align: -0.15em;
+  margin-right: 0.3em;
+}
+
 /* ── Hero ─────────────────────────────────────────────────── */
 .hero {
   background: var(--color-hero-bg);
@@ -389,6 +396,103 @@ a:hover {
   margin: 1.5rem 0;
 }
 
+/* ── Table of Contents sidebar ───────────────────────────── */
+.page-with-toc {
+  display: flex;
+  max-width: 84rem;
+  margin: 0 auto;
+  padding: 0 1.5rem;
+}
+
+.page-with-toc .content-single {
+  flex: 1;
+  min-width: 0;
+  max-width: var(--max-width);
+  padding: 2.5rem 0 4rem;
+  margin: 0;
+}
+
+.toc-sidebar {
+  width: 18rem;
+  flex-shrink: 0;
+  padding-top: 2.5rem;
+  margin-right: 2.5rem;
+}
+
+.toc-inner {
+  position: sticky;
+  top: calc(var(--nav-height) + 1.5rem);
+  max-height: calc(100vh - var(--nav-height) - 3rem);
+  overflow-y: auto;
+  padding-bottom: 2rem;
+}
+
+.toc-inner::-webkit-scrollbar {
+  width: 3px;
+}
+
+.toc-inner::-webkit-scrollbar-thumb {
+  background: var(--color-border);
+  border-radius: 3px;
+}
+
+.toc-heading {
+  display: block;
+  font-size: 0.8rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--color-text-secondary);
+  margin-bottom: 0.75rem;
+}
+
+.toc-sidebar #TableOfContents {
+  border-left: 1px solid var(--color-border);
+}
+
+.toc-sidebar #TableOfContents ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.toc-sidebar #TableOfContents > ul > li > a {
+  font-weight: 600;
+}
+
+.toc-sidebar #TableOfContents li {
+  margin: 0;
+}
+
+.toc-sidebar #TableOfContents a {
+  display: block;
+  padding: 0.35rem 0 0.35rem 1rem;
+  font-size: 0.875rem;
+  line-height: 1.5;
+  color: var(--color-text-secondary);
+  border-left: 2px solid transparent;
+  margin-left: -1px;
+  text-decoration: none;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.toc-sidebar #TableOfContents a:hover {
+  color: var(--color-accent-hover);
+  text-decoration: none;
+}
+
+.toc-sidebar #TableOfContents a.active {
+  color: var(--color-accent);
+  border-left-color: var(--color-accent);
+}
+
+/* Nested h3 items indented */
+.toc-sidebar #TableOfContents ul ul a {
+  padding-left: 1.75rem;
+  font-weight: 400;
+  font-size: 0.825rem;
+}
+
 /* ── Code ─────────────────────────────────────────────────── */
 code {
   font-family: var(--font-mono);
@@ -542,6 +646,22 @@ details[open] summary {
 }
 
 /* ── Responsive ───────────────────────────────────────────── */
+@media (max-width: 960px) {
+  .toc-sidebar {
+    display: none;
+  }
+
+  .page-with-toc {
+    display: block;
+  }
+
+  .page-with-toc .content-single {
+    padding: 2.5rem 0 4rem;
+    max-width: var(--max-width);
+    margin: 0 auto;
+  }
+}
+
 @media (max-width: 640px) {
   .hero {
     padding: 3rem 1rem 2.5rem;

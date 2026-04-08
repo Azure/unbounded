@@ -1,6 +1,23 @@
 {{ define "main" }}
+{{- $toc := .TableOfContents -}}
+{{- $hasTOC := and $toc (not (eq $toc "<nav id=\"TableOfContents\"></nav>")) -}}
+{{ if $hasTOC }}
+<div class="page-with-toc">
+  <aside class="toc-sidebar" aria-label="Table of contents">
+    <div class="toc-inner">
+      <span class="toc-heading">On this page</span>
+      {{ $toc }}
+    </div>
+  </aside>
+  <article class="content-single">
+    <h1>{{ .Title }}</h1>
+    {{ .Content }}
+  </article>
+</div>
+{{ else }}
 <article class="content-single">
   <h1>{{ .Title }}</h1>
   {{ .Content }}
 </article>
+{{ end }}
 {{ end }}

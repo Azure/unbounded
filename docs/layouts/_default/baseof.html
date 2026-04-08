@@ -28,6 +28,34 @@
       });
       pre.appendChild(btn);
     });
+
+    // ── TOC active-heading tracking ──────────────────────────
+    var toc = document.querySelector(".toc-sidebar #TableOfContents");
+    if (toc) {
+      var tocLinks = toc.querySelectorAll("a");
+      var headings = [];
+      tocLinks.forEach(function (link) {
+        var id = decodeURIComponent(link.getAttribute("href").slice(1));
+        var el = document.getElementById(id);
+        if (el) headings.push({ el: el, link: link });
+      });
+
+      function updateActive() {
+        var scrollY = window.scrollY;
+        var offset = 100;
+        var current = null;
+        for (var i = 0; i < headings.length; i++) {
+          if (headings[i].el.getBoundingClientRect().top + window.scrollY - offset <= scrollY) {
+            current = headings[i];
+          }
+        }
+        tocLinks.forEach(function (l) { l.classList.remove("active"); });
+        if (current) current.link.classList.add("active");
+      }
+
+      window.addEventListener("scroll", updateActive, { passive: true });
+      updateActive();
+    }
   });
   </script>
 </body>
