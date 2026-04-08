@@ -30,6 +30,18 @@ tunnels. It supports four provisioning paths and a unified networking layer.
 
 ## Components
 
+### unbounded-agent -- Node Bootstrap Agent
+
+**unbounded-agent** is a single binary that is delivered to each provisioned
+host -- via SSH, cloud-init, PXE image, or other mechanisms -- to turn it into
+a Kubernetes worker node. It detects host settings such as CPU architecture and
+GPU devices, prepares the host, and creates a `systemd-nspawn` machine to run
+the worker node components (kubelet, containerd, etc.) inside of it. Its
+behavior is configured through a JSON config file.
+
+See the [Agent guide]({{< relref "guides/agent" >}}) for a hands-on walkthrough
+and implementation details.
+
 ### machina -- SSH Provisioning Controller
 
 **machina** is a Kubernetes controller that provisions remote Linux machines
