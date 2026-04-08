@@ -428,14 +428,14 @@ func TestTemplateRendering(t *testing.T) {
 	}
 }
 
-func TestTemplateRendering_AgentImageSet(t *testing.T) {
-	tmpl := `Image: {{ .AgentImage }}`
+func TestTemplateRendering_AgentConfigJSONSet(t *testing.T) {
+	tmpl := `Config: {{ .AgentConfigJSON }}`
 
 	data := templateData{
 		Machine: &v1alpha3.Machine{
 			ObjectMeta: metav1.ObjectMeta{Name: "test-node"},
 		},
-		AgentImage: "ghcr.io/org/rootfs:v1",
+		AgentConfigJSON: `{"MachineName":"test-node"}`,
 	}
 
 	result, err := renderTemplate(tmpl, data)
@@ -443,14 +443,14 @@ func TestTemplateRendering_AgentImageSet(t *testing.T) {
 		t.Fatalf("RenderTemplate: %v", err)
 	}
 
-	expected := "Image: ghcr.io/org/rootfs:v1"
+	expected := `Config: {"MachineName":"test-node"}`
 	if string(result) != expected {
 		t.Errorf("template result: got %q, want %q", result, expected)
 	}
 }
 
-func TestTemplateRendering_AgentImageUnset(t *testing.T) {
-	tmpl := `before{{ if .AgentImage }}OCIImage{{ end }}after`
+func TestTemplateRendering_AgentConfigJSONUnset(t *testing.T) {
+	tmpl := `before{{ if .AgentConfigJSON }}config{{ end }}after`
 
 	data := templateData{
 		Machine: &v1alpha3.Machine{
@@ -463,8 +463,8 @@ func TestTemplateRendering_AgentImageUnset(t *testing.T) {
 		t.Fatalf("RenderTemplate: %v", err)
 	}
 
-	if strings.Contains(string(result), "OCIImage") {
-		t.Errorf("expected no OCIImage in output when AgentImage is empty, got %q", result)
+	if strings.Contains(string(result), "config") {
+		t.Errorf("expected no config in output when AgentConfigJSON is empty, got %q", result)
 	}
 
 	expected := "beforeafter"
@@ -479,15 +479,33 @@ func TestUserDataTemplate_WithAgentImage(t *testing.T) {
 		t.Fatalf("reading user-data.tmpl: %v", err)
 	}
 
+	agentConfigJSON := `{
+    "MachineName": "agent-img-node",
+    "Cluster": {
+      "CaCertBase64": "",
+      "ClusterDNS": "10.96.0.10",
+      "Version": "v1.30.0"
+    },
+    "Kubelet": {
+      "ApiServer": "https://k8s.example.com",
+      "Labels": {
+        "unbounded-kube.io/machine": "agent-img-node"
+      },
+      "RegisterWithTaints": null
+    },
+    "OCIImage": "ghcr.io/org/rootfs:v1",
+    "Attest": {
+      "URL": "http://10.0.1.1:8080"
+    }
+  }`
+
 	data := templateData{
 		Machine: &v1alpha3.Machine{
 			ObjectMeta: metav1.ObjectMeta{Name: "agent-img-node"},
 		},
-		ApiserverURL:      "https://k8s.example.com",
-		ServeURL:          "http://10.0.1.1:8080",
-		KubernetesVersion: "1.30.0",
-		ClusterDNS:        "10.96.0.10",
-		AgentImage:        "ghcr.io/org/rootfs:v1",
+		ApiserverURL:    "https://k8s.example.com",
+		ServeURL:        "http://10.0.1.1:8080",
+		AgentConfigJSON: agentConfigJSON,
 	}
 
 	result, err := renderTemplate(string(userDataTmpl), data)
@@ -511,14 +529,32 @@ func TestUserDataTemplate_WithoutAgentImage(t *testing.T) {
 		t.Fatalf("reading user-data.tmpl: %v", err)
 	}
 
+	agentConfigJSON := `{
+    "MachineName": "no-agent-node",
+    "Cluster": {
+      "CaCertBase64": "",
+      "ClusterDNS": "10.96.0.10",
+      "Version": "v1.30.0"
+    },
+    "Kubelet": {
+      "ApiServer": "https://k8s.example.com",
+      "Labels": {
+        "unbounded-kube.io/machine": "no-agent-node"
+      },
+      "RegisterWithTaints": null
+    },
+    "Attest": {
+      "URL": "http://10.0.1.1:8080"
+    }
+  }`
+
 	data := templateData{
 		Machine: &v1alpha3.Machine{
 			ObjectMeta: metav1.ObjectMeta{Name: "no-agent-node"},
 		},
-		ApiserverURL:      "https://k8s.example.com",
-		ServeURL:          "http://10.0.1.1:8080",
-		KubernetesVersion: "1.30.0",
-		ClusterDNS:        "10.96.0.10",
+		ApiserverURL:    "https://k8s.example.com",
+		ServeURL:        "http://10.0.1.1:8080",
+		AgentConfigJSON: agentConfigJSON,
 	}
 
 	result, err := renderTemplate(string(userDataTmpl), data)
@@ -536,8 +572,8 @@ func TestUserDataTemplate_WithoutAgentImage(t *testing.T) {
 	}
 }
 
-func TestResolveFileByPath_AgentImage(t *testing.T) {
-	tmplContent := `{{ .AgentImage }}`
+func TestResolveFileByPath_AgentConfig(t *testing.T) {
+	tmplContent := `{{ .AgentConfigJSON }}`
 
 	cache := setupOCICache(t, "ghcr.io/test/image:v1", "agentimg123", map[string][]byte{
 		"config.tmpl": []byte(tmplContent),
@@ -574,6 +610,10 @@ func TestResolveFileByPath_AgentImage(t *testing.T) {
 		t.Errorf("expected agent image in rendered template, got %q", resolved.Data)
 	}
 
+	if !strings.Contains(string(resolved.Data), `"MachineName": "node-with-agent"`) {
+		t.Errorf("expected MachineName in rendered template, got %q", resolved.Data)
+	}
+
 	// Without agent image (spec.agent is nil)
 	nodeWithoutAgent := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-without-agent"},
@@ -584,8 +624,12 @@ func TestResolveFileByPath_AgentImage(t *testing.T) {
 		t.Fatalf("ResolveFileByPath without agent: %v", err)
 	}
 
-	if strings.TrimSpace(string(resolved.Data)) != "" {
-		t.Errorf("expected empty agent image in rendered template, got %q", resolved.Data)
+	if strings.Contains(string(resolved.Data), "OCIImage") {
+		t.Errorf("expected no OCIImage in rendered template when agent image is empty, got %q", resolved.Data)
+	}
+
+	if !strings.Contains(string(resolved.Data), `"MachineName": "node-without-agent"`) {
+		t.Errorf("expected MachineName in rendered template, got %q", resolved.Data)
 	}
 }
 

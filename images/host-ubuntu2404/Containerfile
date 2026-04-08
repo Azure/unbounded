@@ -74,6 +74,32 @@ RUN chmod 755 /tmp/initrd-root/init && \
     INTERP=$(ldd /usr/bin/efibootmgr | awk '/ld-linux/{print $1}') && \
     mkdir -p "/tmp/initrd-root$(dirname "$INTERP")" && \
     cp "$INTERP" "/tmp/initrd-root${INTERP}" && \
+    # Copy kernel modules into the overlay so modprobe can load network
+    # and storage drivers.  The Ubuntu netboot initrd is a minimal
+    # Debian-Installer image that does not ship ethernet driver modules;
+    # without them no NIC appears and the installer panics.
+    KVER=$(ls /lib/modules | head -1) && \
+    KMOD="/tmp/initrd-root/lib/modules/${KVER}" && \
+    mkdir -p "${KMOD}/kernel/drivers/net" \
+             "${KMOD}/kernel/drivers/scsi" \
+             "${KMOD}/kernel/drivers/ata" \
+             "${KMOD}/kernel/drivers/nvme" \
+             "${KMOD}/kernel/drivers/virtio" \
+             "${KMOD}/kernel/drivers/block" && \
+    cp -a "/lib/modules/${KVER}/kernel/drivers/net/." \
+           "${KMOD}/kernel/drivers/net/" && \
+    cp -a "/lib/modules/${KVER}/kernel/drivers/scsi/." \
+           "${KMOD}/kernel/drivers/scsi/" && \
+    cp -a "/lib/modules/${KVER}/kernel/drivers/ata/." \
+           "${KMOD}/kernel/drivers/ata/" && \
+    cp -a "/lib/modules/${KVER}/kernel/drivers/nvme/." \
+           "${KMOD}/kernel/drivers/nvme/" && \
+    cp -a "/lib/modules/${KVER}/kernel/drivers/virtio/." \
+           "${KMOD}/kernel/drivers/virtio/" && \
+    cp -a "/lib/modules/${KVER}/kernel/drivers/block/." \
+           "${KMOD}/kernel/drivers/block/" && \
+    # modules.dep and map files so modprobe can resolve dependencies.
+    depmod -b /tmp/initrd-root "${KVER}" && \
     cd /tmp/initrd-root && \
     find . -print0 | cpio --create --format=newc --quiet --null > /artifacts/init.cpio
 

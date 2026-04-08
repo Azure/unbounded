@@ -8,6 +8,9 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	v1alpha3 "github.com/project-unbounded/unbounded-kube/api/v1alpha3"
 )
 
 func TestAgentConfig_MarshalJSON(t *testing.T) {
@@ -177,4 +180,188 @@ func TestAgentConfig_AttestOmittedWhenNil(t *testing.T) {
 	require.NoError(t, json.Unmarshal(data, &decoded))
 	require.Nil(t, decoded.Attest)
 	require.Equal(t, "abc123.secret456", decoded.Kubelet.BootstrapToken)
+}
+
+func TestBuildAgentConfig_FullyPopulated(t *testing.T) {
+	t.Parallel()
+
+	machine := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-machine"},
+		Spec: v1alpha3.MachineSpec{
+			Kubernetes: &v1alpha3.KubernetesSpec{
+				Version:            "v1.34.0",
+				NodeLabels:         map[string]string{"env": "prod", "team": "infra"},
+				RegisterWithTaints: []string{"dedicated=gpu:NoSchedule"},
+			},
+			Agent: &v1alpha3.AgentSpec{Image: "ghcr.io/org/rootfs:v1"},
+		},
+	}
+
+	cfg := BuildAgentConfig(BuildAgentConfigParams{
+		Machine:        machine,
+		APIServer:      "api.example.com:443",
+		CACertBase64:   "dGVzdC1jYQ==",
+		ClusterDNS:     "10.0.0.10",
+		KubeVersion:    "v1.33.0", // should be overridden by Machine spec
+		ProviderLabels: map[string]string{"provider-key": "provider-val"},
+		BootstrapToken: "abc123.secret456",
+	})
+
+	require.Equal(t, "my-machine", cfg.MachineName)
+	require.Equal(t, "dGVzdC1jYQ==", cfg.Cluster.CaCertBase64)
+	require.Equal(t, "10.0.0.10", cfg.Cluster.ClusterDNS)
+	require.Equal(t, "v1.34.0", cfg.Cluster.Version) // Machine spec overrides KubeVersion
+	require.Equal(t, "api.example.com:443", cfg.Kubelet.ApiServer)
+	require.Equal(t, "abc123.secret456", cfg.Kubelet.BootstrapToken)
+	require.Equal(t, "ghcr.io/org/rootfs:v1", cfg.OCIImage)
+	require.Nil(t, cfg.Attest)
+
+	// Labels: user + machine + provider
+	require.Equal(t, "prod", cfg.Kubelet.Labels["env"])
+	require.Equal(t, "infra", cfg.Kubelet.Labels["team"])
+	require.Equal(t, "my-machine", cfg.Kubelet.Labels[MachineNodeLabel])
+	require.Equal(t, "provider-val", cfg.Kubelet.Labels["provider-key"])
+	require.Equal(t, "true", cfg.Kubelet.Labels["node.cloudprovider.kubernetes.io/exclude-from-external-cloud-provider"])
+
+	require.Equal(t, []string{"dedicated=gpu:NoSchedule"}, cfg.Kubelet.RegisterWithTaints)
+}
+
+func TestBuildAgentConfig_NilKubernetesSpec(t *testing.T) {
+	t.Parallel()
+
+	machine := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "bare-machine"},
+	}
+
+	cfg := BuildAgentConfig(BuildAgentConfigParams{
+		Machine:     machine,
+		APIServer:   "api.example.com:443",
+		KubeVersion: "v1.33.0",
+	})
+
+	require.Equal(t, "bare-machine", cfg.MachineName)
+	require.Equal(t, "v1.33.0", cfg.Cluster.Version)
+
+	// Machine label and common labels should be present.
+	require.Equal(t, "bare-machine", cfg.Kubelet.Labels[MachineNodeLabel])
+	require.Equal(t, "true", cfg.Kubelet.Labels["node.cloudprovider.kubernetes.io/exclude-from-external-cloud-provider"])
+	require.Len(t, cfg.Kubelet.Labels, 2)
+	require.Nil(t, cfg.Kubelet.RegisterWithTaints)
+	require.Empty(t, cfg.OCIImage)
+}
+
+func TestBuildAgentConfig_VersionPrefixNormalization(t *testing.T) {
+	t.Parallel()
+
+	machine := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "version-test"},
+		Spec: v1alpha3.MachineSpec{
+			Kubernetes: &v1alpha3.KubernetesSpec{
+				Version: "1.34.0", // no "v" prefix
+			},
+		},
+	}
+
+	cfg := BuildAgentConfig(BuildAgentConfigParams{
+		Machine: machine,
+	})
+
+	require.Equal(t, "v1.34.0", cfg.Cluster.Version)
+}
+
+func TestBuildAgentConfig_VersionFromKubeVersionFallback(t *testing.T) {
+	t.Parallel()
+
+	machine := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "fallback-test"},
+	}
+
+	cfg := BuildAgentConfig(BuildAgentConfigParams{
+		Machine:     machine,
+		KubeVersion: "1.33.0", // no "v" prefix, should be normalized
+	})
+
+	require.Equal(t, "v1.33.0", cfg.Cluster.Version)
+}
+
+func TestBuildAgentConfig_LabelPriority(t *testing.T) {
+	t.Parallel()
+
+	machine := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "label-test"},
+		Spec: v1alpha3.MachineSpec{
+			Kubernetes: &v1alpha3.KubernetesSpec{
+				NodeLabels: map[string]string{
+					"user-label":     "user-value",
+					MachineNodeLabel: "user-override",   // should be overridden
+					"provider-key":   "user-tries-this", // should be overridden by provider
+				},
+			},
+		},
+	}
+
+	cfg := BuildAgentConfig(BuildAgentConfigParams{
+		Machine:        machine,
+		ProviderLabels: map[string]string{"provider-key": "provider-wins"},
+	})
+
+	require.Equal(t, "user-value", cfg.Kubelet.Labels["user-label"])
+	require.Equal(t, "label-test", cfg.Kubelet.Labels[MachineNodeLabel])  // controller-injected wins over user
+	require.Equal(t, "provider-wins", cfg.Kubelet.Labels["provider-key"]) // provider wins over user
+}
+
+func TestBuildAgentConfig_NilProviderLabels(t *testing.T) {
+	t.Parallel()
+
+	machine := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "nil-provider"},
+		Spec: v1alpha3.MachineSpec{
+			Kubernetes: &v1alpha3.KubernetesSpec{
+				NodeLabels: map[string]string{"key": "value"},
+			},
+		},
+	}
+
+	cfg := BuildAgentConfig(BuildAgentConfigParams{
+		Machine:        machine,
+		ProviderLabels: nil, // should be safe
+	})
+
+	require.Equal(t, "value", cfg.Kubelet.Labels["key"])
+	require.Equal(t, "nil-provider", cfg.Kubelet.Labels[MachineNodeLabel])
+	require.Equal(t, "true", cfg.Kubelet.Labels["node.cloudprovider.kubernetes.io/exclude-from-external-cloud-provider"])
+	require.Len(t, cfg.Kubelet.Labels, 3)
+}
+
+func TestBuildAgentConfig_WithAttestURL(t *testing.T) {
+	t.Parallel()
+
+	machine := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "attest-node"},
+	}
+
+	cfg := BuildAgentConfig(BuildAgentConfigParams{
+		Machine:   machine,
+		AttestURL: "http://10.0.0.1:8880",
+	})
+
+	require.NotNil(t, cfg.Attest)
+	require.Equal(t, "http://10.0.0.1:8880", cfg.Attest.URL)
+	require.Empty(t, cfg.Kubelet.BootstrapToken)
+}
+
+func TestBuildAgentConfig_WithoutAttestURL(t *testing.T) {
+	t.Parallel()
+
+	machine := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "no-attest-node"},
+	}
+
+	cfg := BuildAgentConfig(BuildAgentConfigParams{
+		Machine:        machine,
+		BootstrapToken: "tok.sec",
+	})
+
+	require.Nil(t, cfg.Attest)
+	require.Equal(t, "tok.sec", cfg.Kubelet.BootstrapToken)
 }

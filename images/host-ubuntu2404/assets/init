@@ -44,6 +44,10 @@ retry() {
 log "installer starting"
 
 # ── Load essential modules ──
+KVER=$(uname -r)
+if [ ! -d "/lib/modules/${KVER}" ]; then
+    log "WARNING: /lib/modules/${KVER} not found, modules may fail to load"
+fi
 for mod in virtio_pci virtio_blk ahci sd_mod nvme; do
     modprobe "$mod" 2>/dev/null || true
 done
@@ -51,8 +55,8 @@ for mod in virtio_net e1000 e1000e igb ixgbe i40e ice \
            mlx5_core mlx4_core bnxt_en tg3 be2net ena; do
     modprobe "$mod" 2>/dev/null || true
 done
-for f in /lib/modules/"$(uname -r)"/kernel/drivers/net/ethernet/*/*.ko* \
-         /lib/modules/"$(uname -r)"/kernel/drivers/net/ethernet/*/*/*.ko*; do
+for f in /lib/modules/"${KVER}"/kernel/drivers/net/ethernet/*/*.ko* \
+         /lib/modules/"${KVER}"/kernel/drivers/net/ethernet/*/*/*.ko*; do
     [ -e "$f" ] || continue
     mod=$(basename "$f"); mod=${mod%.ko*}
     modprobe "$mod" 2>/dev/null || true

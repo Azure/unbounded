@@ -8,9 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"maps"
 	"net"
-	"strings"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -28,7 +26,6 @@ import (
 	stderrs "errors"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
-	"github.com/Azure/unbounded-kube/internal/cloudprovider"
 	"github.com/Azure/unbounded-kube/internal/provision"
 )
 
@@ -71,7 +68,7 @@ const (
 
 	// MachineNodeLabel is the label key applied to Nodes that correspond
 	// to a Machine. The value is the Machine name.
-	MachineNodeLabel = "unbounded-kube.io/machine"
+	MachineNodeLabel = provision.MachineNodeLabel
 )
 
 // ReachabilityChecker checks if a machine is reachable via TCP.
@@ -562,14 +559,6 @@ func (r *MachineReconciler) provisionMachine(
 		k8sVersion = r.ClusterInfo.KubeVersion
 	}
 
-	if machine.Spec.Kubernetes != nil && machine.Spec.Kubernetes.Version != "" {
-		k8sVersion = machine.Spec.Kubernetes.Version
-	}
-
-	if k8sVersion != "" && !strings.HasPrefix(k8sVersion, "v") {
-		k8sVersion = "v" + k8sVersion
-	}
-
 	apiServer := ""
 	caCertBase64 := ""
 	clusterDNS := ""
@@ -580,54 +569,20 @@ func (r *MachineReconciler) provisionMachine(
 		clusterDNS = r.ClusterInfo.ClusterDNS
 	}
 
-	// User-defined labels (lowest priority).
-	labels := map[string]string{}
-
-	if machine.Spec.Kubernetes != nil {
-		for k, v := range machine.Spec.Kubernetes.NodeLabels {
-			labels[k] = v
-		}
-	}
-
-	// Controller-injected labels override user labels.
-	labels[MachineNodeLabel] = machine.Name
-
-	// Provider-injected labels override everything.
+	var providerLabels map[string]string
 	if r.ClusterInfo != nil && r.ClusterInfo.Provider != nil {
-		for k, v := range r.ClusterInfo.Provider.DefaultLabels() {
-			labels[k] = v
-		}
+		providerLabels = r.ClusterInfo.Provider.DefaultLabels()
 	}
 
-	// Common labels are applied unconditionally to every node provisioned
-	// by unbounded, regardless of the detected cloud provider.
-	maps.Copy(labels, cloudprovider.CommonDefaultLabels())
-
-	var taints []string
-	if machine.Spec.Kubernetes != nil {
-		taints = machine.Spec.Kubernetes.RegisterWithTaints
-	}
-
-	var ociImage string
-	if machine.Spec.Agent != nil {
-		ociImage = machine.Spec.Agent.Image
-	}
-
-	agentConfig := provision.AgentConfig{
-		MachineName: machine.Name,
-		Cluster: provision.AgentClusterConfig{
-			CaCertBase64: caCertBase64,
-			ClusterDNS:   clusterDNS,
-			Version:      k8sVersion,
-		},
-		Kubelet: provision.AgentKubeletConfig{
-			ApiServer:          apiServer,
-			BootstrapToken:     bootstrapToken,
-			Labels:             labels,
-			RegisterWithTaints: taints,
-		},
-		OCIImage: ociImage,
-	}
+	agentConfig := provision.BuildAgentConfig(provision.BuildAgentConfigParams{
+		Machine:        machine,
+		APIServer:      apiServer,
+		CACertBase64:   caCertBase64,
+		ClusterDNS:     clusterDNS,
+		KubeVersion:    k8sVersion,
+		ProviderLabels: providerLabels,
+		BootstrapToken: bootstrapToken,
+	})
 
 	configJSON, err := json.Marshal(agentConfig)
 	if err != nil {

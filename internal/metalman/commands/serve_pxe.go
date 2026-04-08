@@ -4,6 +4,7 @@
 package commands
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net"
 	"net/http"
@@ -22,6 +23,7 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	v1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
+	"github.com/Azure/unbounded-kube/internal/cloudprovider"
 	"github.com/Azure/unbounded-kube/internal/metalman/attestation"
 	"github.com/Azure/unbounded-kube/internal/metalman/dhcp"
 	"github.com/Azure/unbounded-kube/internal/metalman/indexing"
@@ -129,6 +131,31 @@ func ServePXECmd() *cobra.Command {
 				return fmt.Errorf("kube-dns Service has no ClusterIP")
 			}
 
+			// Resolve CA certificate from kube-root-ca.crt ConfigMap.
+			cm, err := clientset.CoreV1().ConfigMaps(metav1.NamespacePublic).Get(ctx, "kube-root-ca.crt", metav1.GetOptions{})
+			if err != nil {
+				return fmt.Errorf("get kube-root-ca.crt ConfigMap from kube-public: %w", err)
+			}
+
+			caCert, ok := cm.Data["ca.crt"]
+			if !ok {
+				return fmt.Errorf("ca.crt key not found in kube-root-ca.crt ConfigMap")
+			}
+
+			caCertBase64 := base64.StdEncoding.EncodeToString([]byte(caCert))
+
+			// Detect cloud provider for default node labels.
+			var providerLabels map[string]string
+
+			provider, err := cloudprovider.DetectProvider(ctx, clientset)
+			if err != nil {
+				return fmt.Errorf("detect provider: %w", err)
+			}
+
+			if provider != nil {
+				providerLabels = provider.DefaultLabels()
+			}
+
 			clusterCA := attestation.ClusterCAFromConfig(cfg)
 
 			serverIP := net.ParseIP(bindAddress)
@@ -181,6 +208,8 @@ func ServePXECmd() *cobra.Command {
 				ServeURL:          serveURL,
 				KubernetesVersion: kubeVersion,
 				ClusterDNS:        clusterDNS,
+				CACertBase64:      caCertBase64,
+				ProviderLabels:    providerLabels,
 			}
 
 			if dhcpInterface != "" && dhcpAutoInterface {

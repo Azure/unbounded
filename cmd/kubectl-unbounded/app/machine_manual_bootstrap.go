@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"maps"
 	"os"
 	"strings"
 	"text/template"
@@ -23,6 +22,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
+	unboundedv1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
 	"github.com/Azure/unbounded-kube/internal/cloudprovider"
 	"github.com/Azure/unbounded-kube/internal/kube"
 	"github.com/Azure/unbounded-kube/internal/provision"
@@ -227,14 +227,15 @@ func (h *manualBootstrapHandler) buildAgentConfig(ctx context.Context) (*provisi
 		return nil, fmt.Errorf("kube-dns Service has no ClusterIP")
 	}
 
-	// Parse node labels.
+	// Parse node labels from CLI flags.
 	labels, err := parseNodeLabels(h.nodeLabels)
 	if err != nil {
 		return nil, fmt.Errorf("parsing node labels: %w", err)
 	}
 
-	// Detect cloud provider and merge its default labels. Provider labels
-	// override user-supplied labels, matching the machina controller behaviour.
+	// Detect cloud provider for default node labels.
+	var providerLabels map[string]string
+
 	provider, err := cloudprovider.DetectProvider(ctx, h.kubeCli)
 	if err != nil {
 		h.logger.Warn("cloud provider detection failed, continuing without provider labels", "error", err)
@@ -242,37 +243,32 @@ func (h *manualBootstrapHandler) buildAgentConfig(ctx context.Context) (*provisi
 
 	if provider != nil {
 		h.logger.Info("detected cloud provider", "provider", provider.ID())
-
-		if labels == nil {
-			labels = make(map[string]string)
-		}
-
-		maps.Copy(labels, provider.DefaultLabels())
+		providerLabels = provider.DefaultLabels()
 	}
 
-	// Common labels are applied unconditionally to every node provisioned
-	// by unbounded, regardless of the detected cloud provider.
-	if labels == nil {
-		labels = make(map[string]string)
+	// Build a Machine object from CLI flags for the canonical config builder.
+	machine := &unboundedv1alpha3.Machine{}
+	machine.Name = h.machineName
+	machine.Spec.Kubernetes = &unboundedv1alpha3.KubernetesSpec{
+		NodeLabels:         labels,
+		RegisterWithTaints: h.taints,
 	}
 
-	maps.Copy(labels, cloudprovider.CommonDefaultLabels())
+	if h.ociImage != "" {
+		machine.Spec.Agent = &unboundedv1alpha3.AgentSpec{Image: h.ociImage}
+	}
 
-	return &provision.AgentConfig{
-		MachineName: h.machineName,
-		Cluster: provision.AgentClusterConfig{
-			CaCertBase64: caCertBase64,
-			ClusterDNS:   clusterDNS,
-			Version:      k8sVersion,
-		},
-		Kubelet: provision.AgentKubeletConfig{
-			ApiServer:          apiServer,
-			BootstrapToken:     bootstrapToken,
-			Labels:             labels,
-			RegisterWithTaints: h.taints,
-		},
-		OCIImage: h.ociImage,
-	}, nil
+	cfg := provision.BuildAgentConfig(provision.BuildAgentConfigParams{
+		Machine:        machine,
+		APIServer:      apiServer,
+		CACertBase64:   caCertBase64,
+		ClusterDNS:     clusterDNS,
+		KubeVersion:    k8sVersion,
+		ProviderLabels: providerLabels,
+		BootstrapToken: bootstrapToken,
+	})
+
+	return &cfg, nil
 }
 
 // manualBootstrapTemplateData holds the values injected into the
