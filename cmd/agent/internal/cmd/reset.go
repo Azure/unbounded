@@ -66,21 +66,13 @@ The machine name is resolved in this order:
 				// Step 5: Remove the machine rootfs.
 				reset.RemoveMachine(log, name),
 
-				// Step 6-9: Remove services and restore host configuration.
-				phases.Parallel(log,
-					reset.RemoveNFTables(log),
-					reset.RemoveSysctlConfig(log),
-					reset.RestoreDocker(log),
-					reset.RestoreSwap(log),
-				),
-
-				// Step 10: Clean up policy routing rules.
+				// Step 6: Clean up policy routing rules.
 				reset.CleanupRoutes(log),
 
-				// Step 11: Remove agent binaries and config.
+				// Step 7: Remove agent binaries and config.
 				reset.RemoveAgentArtifacts(log),
 
-				// Step 12: Reload systemd.
+				// Step 8: Reload systemd.
 				reset.ReloadSystemd(log),
 			).Do(ctx)
 		},

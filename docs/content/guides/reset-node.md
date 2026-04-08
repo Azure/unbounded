@@ -57,13 +57,9 @@ The reset command performs the following steps in order:
 3. **Removes WireGuard keys** -- cleans up `/etc/wireguard/server.priv` and `server.pub`
 4. **Removes nspawn configuration** -- deletes `.nspawn` config and systemd overrides
 5. **Removes the machine rootfs** -- deletes `/var/lib/machines/<name>`
-6. **Removes nftables flush service** -- disables the service and removes `/etc/unbounded-kube`
-7. **Removes sysctl configuration** -- deletes `/etc/sysctl.d/99-kubernetes.conf` and reloads
-8. **Restores Docker** -- unmasks Docker service and socket
-9. **Restores swap** -- restores `/etc/fstab` from backup and re-enables swap
-10. **Cleans up routing** -- removes policy routing rules and flushes routing tables
-11. **Removes agent binaries** -- deletes the agent binary and config artifacts
-12. **Reloads systemd** -- picks up all configuration changes
+6. **Cleans up routing** -- removes policy routing rules and flushes routing tables
+7. **Removes agent binaries** -- deletes the agent binary and config artifacts
+8. **Reloads systemd** -- picks up all configuration changes
 
 The command is **idempotent** -- it is safe to run multiple times.
 

@@ -1,7 +1,6 @@
 package reset
 
 import (
-	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -9,34 +8,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-func TestRestoreSwap_NoBackup(t *testing.T) {
-	t.Parallel()
-
-	task := &restoreSwap{log: slog.Default()}
-
-	// When there is no fstab.bak, the task should succeed without error.
-	err := task.Do(t.Context())
-	require.NoError(t, err)
-}
-
-func TestRestoreSwap_WithBackup(t *testing.T) {
-	// This test creates temp files to simulate fstab and fstab.bak.
-	dir := t.TempDir()
-
-	fstab := filepath.Join(dir, "fstab")
-	fstabBak := filepath.Join(dir, "fstab.bak")
-
-	// Write the "modified" fstab and original backup.
-	require.NoError(t, os.WriteFile(fstab, []byte("# modified\n"), 0o644))
-	require.NoError(t, os.WriteFile(fstabBak, []byte("original content\n"), 0o644))
-
-	// We can't easily test the full Do() method because it uses hardcoded
-	// paths, but we can verify the helpers are sound.
-	content, err := os.ReadFile(fstabBak)
-	require.NoError(t, err)
-	assert.Equal(t, "original content\n", string(content))
-}
 
 func TestRemoveFileIfExists(t *testing.T) {
 	t.Parallel()
