@@ -1,5 +1,5 @@
 # ── Build the unbounded-agent binary ────────────────────────────────
-FROM docker.io/library/golang:1.25 AS gobuilder
+FROM docker.io/library/golang:1.26 AS gobuilder
 
 WORKDIR /src
 COPY go.mod go.sum ./
