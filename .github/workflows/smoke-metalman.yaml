@@ -9,7 +9,7 @@ on:
       - cmd/metalman/**
       - internal/metalman/**
       - deploy/metalman/**
-      - hack/smoke.py
+      - hack/smoke-metalman.py
       - images/host-ubuntu2404/**
       - go.mod
       - go.sum
@@ -23,7 +23,7 @@ on:
       - deploy/metalman/**
       - deploy/machina/crd/**
       - deploy/machina/01-namespace.yaml
-      - hack/smoke.py
+      - hack/smoke-metalman.py
       - images/host-ubuntu2404/**
       - go.mod
       - go.sum
@@ -74,4 +74,4 @@ jobs:
         run: |
           sudo mkdir -p /root/.kube
           sudo cp "${KUBECONFIG:-$HOME/.kube/config}" /root/.kube/config
-          sudo -E env "PATH=$PATH" python3 hack/smoke.py
+          sudo -E env "PATH=$PATH" python3 hack/smoke-metalman.py
