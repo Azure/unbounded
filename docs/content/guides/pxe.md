@@ -116,7 +116,10 @@ Store BMC passwords in a Secret referenced by `passwordRef`. See the [CRD Refere
 Metalman uses TPM 2.0 to securely deliver a bootstrap token without embedding secrets in the image.
 
 1. On first boot, the `unbounded-agent` creates a TPM Endorsement Key (EK) and Storage Root Key (SRK), then POSTs them to metalman's `/attest` endpoint.
-2. Metalman performs trust-on-first-use (TOFU): it stores the EK public key in `status.tpm.ekPublicKey`. Subsequent attestations from a different EK are rejected (HTTP 403).
+{{< callout type="important" >}}
+Metalman uses trust-on-first-use (TOFU) for TPM attestation: once a machine's EK public key is stored in `status.tpm.ekPublicKey`, any attestation from a different EK is rejected (HTTP 403). If a TPM is legitimately replaced, you must clear `status.tpm.ekPublicKey` from the Machine CR before the machine can re-enroll.
+{{< /callout >}}
+
 3. Metalman wraps an AES-256 key via `tpm2.CreateCredential` (bound to the EK and SRK), then encrypts a 1-hour ServiceAccount token with AES-256-GCM and returns both to the client.
 4. The agent uses the TPM `ActivateCredential` operation to recover the AES key, decrypts the token, and writes a bootstrap kubeconfig for kubelet to use during TLS bootstrapping.
 
@@ -157,6 +160,10 @@ spec:
 
 ## Troubleshooting
 
+{{< callout type="warning" >}}
+Running metalman's DHCP server on a network segment that already has an active DHCP server will cause conflicts. Ensure metalman is the only DHCP server on the PXE segment, or use relay mode to isolate DHCP traffic.
+{{< /callout >}}
+
 **Machine stuck in reimaging.** Check metalman logs for HTTP download errors. Verify the target machine can reach metalman on TCP/8880. The lifecycle reconciler will auto-retry after the 30-minute timeout.
 
 **DHCP not responding.** Confirm `--dhcp-interface` points to the correct NIC (broadcast mode) or that your relay agent forwards to metalman's DHCP port. Check that no other DHCP server is competing on the same segment.
@@ -169,8 +176,9 @@ spec:
 
 ## Limitations
 
-- Only Ubuntu 24.04 images are currently supported.
-- The reimage timeout is fixed at 30 minutes.
+{{< callout type="note" >}}
+Only Ubuntu 24.04 images are currently supported. The reimage timeout is fixed at 30 minutes.
+{{< /callout >}}
 
 ## See Also
 

@@ -21,15 +21,15 @@ title = "Unbounded Kube"
 [menu]
   [[menu.main]]
     name = "Guides"
-    url = "/guides/"
+    pageRef = "/guides"
     weight = 1
   [[menu.main]]
     name = "Concepts"
-    url = "/concepts/"
+    pageRef = "/concepts"
     weight = 2
   [[menu.main]]
     name = "Reference"
-    url = "/reference/"
+    pageRef = "/reference"
     weight = 3
   [[menu.main]]
     name = "GitHub"

@@ -4,9 +4,9 @@ weight: 4
 description: "Provision cloud instances from GPU and compute providers and join them to your cluster automatically via cloud-init."
 ---
 
-> **This guide is currently under development.** The Cloud API provisioning
-> path and its tooling are still being designed and built. The concepts below
-> describe the intended architecture. Check back for updates.
+{{< callout type="warning" >}}
+This guide is currently under development. The Cloud API provisioning path and its tooling are still being designed and built. The concepts below describe the intended architecture and are subject to change.
+{{< /callout >}}
 
 ## Overview
 

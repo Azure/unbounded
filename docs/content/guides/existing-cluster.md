@@ -26,9 +26,9 @@ You'll label gateway nodes, initialize a site, and join remote machines.
 > **You'll need:** A Kubernetes cluster with `kubeconfig` access, one or more
 > cluster nodes with UDP 51820-51899 open, and remote machines reachable via SSH.
 
-> **CNI requirement:** Unbounded-net replaces the cluster's CNI. Your cluster
-> must be created with `--network-plugin none` (BYO CNI mode). If it uses Azure
-> CNI, Calico, or kubenet, you'll need to recreate it with this setting.
+{{< callout type="warning" >}}
+Unbounded-net replaces the cluster's CNI. Your cluster must be created with `--network-plugin none` (BYO CNI mode). If it already uses Azure CNI, Calico, or kubenet, you will need to recreate the cluster with this setting. This cannot be changed after cluster creation.
+{{< /callout >}}
 
 Install the kubectl-unbounded plugin:
 
@@ -65,8 +65,9 @@ At least one cluster node must be labeled as a WireGuard gateway. Open
 kubectl label node <node-name> "unbounded-kube.io/unbounded-net-gateway=true"
 ```
 
-> `kubectl unbounded site init` checks for this label and fails if no gateway
-> nodes are found.
+{{< callout type="important" >}}
+`kubectl unbounded site init` checks for the gateway label and fails if no labeled nodes are found. You must also ensure UDP ports 51820-51899 are open on the gateway node's firewall before proceeding -- the init command does not open these ports for you.
+{{< /callout >}}
 
 ---
 
@@ -105,9 +106,9 @@ kubectl unbounded site init \
 
 </details>
 
-> **AKS users:** The `aks-quickstart.sh setup` command can auto-detect your
-> cluster's CIDRs and add a properly configured gateway node pool. See the
-> [Getting Started]({{< relref "guides/getting-started" >}}) guide for details.
+{{< callout type="tip" >}}
+**AKS users:** The `aks-quickstart.sh setup` command can auto-detect your cluster's CIDRs and add a properly configured gateway node pool. See the [Getting Started]({{< relref "guides/getting-started" >}}) guide for details.
+{{< /callout >}}
 
 ---
 
