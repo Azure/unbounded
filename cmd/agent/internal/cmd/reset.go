@@ -93,7 +93,7 @@ func resolveMachineName(flagValue string) (string, error) {
 
 // runResetScript executes the rendered uninstall script via bash.
 func runResetScript(ctx context.Context, script string) error {
-	cmd := exec.CommandContext(ctx, "bash", "-eo", "pipefail")
+	cmd := exec.CommandContext(ctx, "bash", "-e", "-o", "pipefail")
 	cmd.Stdin = strings.NewReader(script)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
