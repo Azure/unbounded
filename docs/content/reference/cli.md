@@ -75,7 +75,7 @@ Initialize a new unbounded-kube site. This command:
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--cluster-service-cidr` | `string` | *(auto-detected from kube-dns)* | Service CIDR of the cluster (e.g. `10.0.0.0/16`) |
-| `--cni-manifests` | `string` | unbounded-net v1.0.1 release URL | Path to a local file/directory or HTTPS URL for CNI manifests |
+| `--cni-manifests` | `string` | unbounded-net v1.1.2 release URL | Path to a local file/directory or HTTPS URL for CNI manifests |
 | `--machina-manifests` | `string` | *(embedded manifests)* | Path to a local file/directory or HTTPS URL for machina manifests |
 | `--kubeconfig` | `string` | `$KUBECONFIG` or default | Path to kubeconfig file |
 
