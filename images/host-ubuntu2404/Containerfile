@@ -28,19 +28,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Ubuntu netboot layout differs by architecture:
 #   amd64: individual files at releases.ubuntu.com
 #   arm64: tarball at cdimage.ubuntu.com (individual URLs are unavailable)
+# File names follow UEFI convention: shimx64/grubx64 (amd64), shimaa64/grubaa64 (arm64).
+# metalman looks up the boot filename from metadata.yaml (dhcpBootImageName).
 RUN mkdir -p /artifacts && \
     if [ "${TARGETARCH}" = "amd64" ]; then \
         NETBOOT_BASE="https://releases.ubuntu.com/24.04.2/netboot/amd64"; \
-        curl -fSL -o /artifacts/shim.efi   "${NETBOOT_BASE}/bootx64.efi" && \
-        curl -fSL -o /artifacts/grub.efi   "${NETBOOT_BASE}/grubx64.efi" && \
-        curl -fSL -o /artifacts/vmlinuz    "${NETBOOT_BASE}/linux"       && \
-        curl -fSL -o /artifacts/initrd     "${NETBOOT_BASE}/initrd"; \
+        curl -fSL -o /artifacts/shimx64.efi  "${NETBOOT_BASE}/bootx64.efi" && \
+        curl -fSL -o /artifacts/grubx64.efi  "${NETBOOT_BASE}/grubx64.efi" && \
+        curl -fSL -o /artifacts/vmlinuz      "${NETBOOT_BASE}/linux"       && \
+        curl -fSL -o /artifacts/initrd       "${NETBOOT_BASE}/initrd"; \
     elif [ "${TARGETARCH}" = "arm64" ]; then \
         NETBOOT_URL="https://cdimage.ubuntu.com/releases/noble/release/ubuntu-24.04.4-netboot-arm64.tar.gz"; \
         curl -fSL -o /tmp/netboot.tar.gz "${NETBOOT_URL}" && \
         tar -xzf /tmp/netboot.tar.gz -C /tmp && \
-        cp /tmp/bootaa64.efi   /artifacts/shim.efi && \
-        cp /tmp/grubaa64.efi   /artifacts/grub.efi && \
+        cp /tmp/bootaa64.efi   /artifacts/shimaa64.efi && \
+        cp /tmp/grubaa64.efi   /artifacts/grubaa64.efi && \
         cp /tmp/linux           /artifacts/vmlinuz && \
         cp /tmp/initrd          /artifacts/initrd && \
         rm -rf /tmp/netboot.tar.gz /tmp/*.efi /tmp/linux /tmp/initrd; \
@@ -57,16 +59,26 @@ RUN chmod 755 /tmp/initrd-root/init && \
 # ── Assemble /disk directory ────────────────────────────────────────
 RUN mkdir -p /disk/grub /disk/cloud-init
 
-# Binary boot artifacts (architecture-neutral names for metalman).
-RUN cp /artifacts/shim.efi  /artifacts/grub.efi \
-       /artifacts/vmlinuz   /artifacts/initrd   \
-       /artifacts/init.cpio /disk/
+# Binary boot artifacts (architecture-specific EFI names for metalman TFTP).
+RUN cp /artifacts/vmlinuz /artifacts/initrd /artifacts/init.cpio /disk/ && \
+    if [ "${TARGETARCH}" = "amd64" ]; then \
+        cp /artifacts/shimx64.efi /artifacts/grubx64.efi /disk/; \
+    elif [ "${TARGETARCH}" = "arm64" ]; then \
+        cp /artifacts/shimaa64.efi /artifacts/grubaa64.efi /disk/; \
+    fi
 
 # Templates and static configs from assets/.
 COPY images/host-ubuntu2404/assets/grub.cfg.tmpl               /disk/grub/grub.cfg.tmpl
 COPY images/host-ubuntu2404/assets/meta-data.tmpl              /disk/cloud-init/meta-data.tmpl
 COPY images/host-ubuntu2404/assets/vendor-data.tmpl            /disk/cloud-init/vendor-data.tmpl
-COPY images/host-ubuntu2404/assets/metadata.yaml              /disk/metadata.yaml
+
+# Generate metadata.yaml with the correct boot image name for this architecture.
+# metalman reads dhcpBootImageName to tell PXE clients which file to request via TFTP.
+RUN if [ "${TARGETARCH}" = "amd64" ]; then \
+        echo "dhcpBootImageName: shimx64.efi" > /disk/metadata.yaml; \
+    elif [ "${TARGETARCH}" = "arm64" ]; then \
+        echo "dhcpBootImageName: shimaa64.efi" > /disk/metadata.yaml; \
+    fi
 
 # User-data is now a Go template rendered per-node by metalman.
 # The unbounded-agent handles kubelet/containerd/TPM attestation
