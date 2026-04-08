@@ -57,6 +57,12 @@ for f in /lib/modules/"$(uname -r)"/kernel/drivers/net/ethernet/*/*.ko* \
     mod=$(basename "$f"); mod=${mod%.ko*}
     modprobe "$mod" 2>/dev/null || true
 done
+# FAT/VFAT is needed to mount the EFI System Partition later.
+for mod in nls_cp437 nls_ascii nls_utf8 fat vfat; do
+    modprobe "$mod" 2>/dev/null || true
+done
+# efivarfs is needed for efibootmgr to create NVRAM entries.
+modprobe efivarfs 2>/dev/null || true
 
 # ── Wait for network interface ──
 log "waiting for network interface"
@@ -204,6 +210,62 @@ UMCONFIG
     sync
     umount /mnt
     log "cloud-init configured on $ROOT_PART"
+fi
+
+# ── Create UEFI NVRAM boot entry for the installed disk ──
+# After dd'ing the cloud image the ESP contains a bootloader but the
+# firmware has no Boot#### NVRAM variable pointing at it.  Without one,
+# OVMF (and many physical BMCs) will skip the disk and PXE-boot again.
+if [ -d /sys/firmware/efi ]; then
+    log "creating UEFI boot entry for local disk"
+
+    # Mount efivarfs so efibootmgr can read/write NVRAM variables.
+    if ! mountpoint -q /sys/firmware/efi/efivars 2>/dev/null; then
+        mount -t efivarfs efivarfs /sys/firmware/efi/efivars 2>/dev/null || true
+    fi
+
+    # Discover the EFI System Partition.  Ubuntu cloud images use
+    # partition 15; fall back to partition 1 for standard layouts.
+    ESP_PART=""
+    for suffix in 15 1 p15 p1; do
+        if [ -b "${TARGET_DISK}${suffix}" ]; then
+            ESP_PART="${TARGET_DISK}${suffix}"
+            ESP_NUM="${suffix#p}"
+            break
+        fi
+    done
+
+    if [ -n "$ESP_PART" ] && command -v efibootmgr >/dev/null 2>&1; then
+        # Verify shimx64.efi exists on the ESP before creating the entry.
+        mkdir -p /mnt/esp
+        if mount -t vfat "$ESP_PART" /mnt/esp 2>/dev/null; then
+            if [ -f /mnt/esp/EFI/ubuntu/shimx64.efi ]; then
+                LOADER='\EFI\ubuntu\shimx64.efi'
+            elif [ -f /mnt/esp/EFI/BOOT/BOOTX64.EFI ]; then
+                LOADER='\EFI\BOOT\BOOTX64.EFI'
+            else
+                LOADER=""
+                log "WARNING: no EFI bootloader found on ESP"
+            fi
+            umount /mnt/esp
+
+            if [ -n "$LOADER" ]; then
+                efibootmgr --create \
+                    --disk "$TARGET_DISK" \
+                    --part "$ESP_NUM" \
+                    --loader "$LOADER" \
+                    --label "ubuntu" 2>&1 \
+                    && log "UEFI boot entry created (${LOADER} on part ${ESP_NUM})" \
+                    || log "WARNING: efibootmgr failed, PXE chainloader will be used as fallback"
+            fi
+        else
+            log "WARNING: could not mount ESP $ESP_PART"
+        fi
+    else
+        log "WARNING: efibootmgr not available or no ESP found, skipping NVRAM entry"
+    fi
+else
+    log "not booted in UEFI mode, skipping NVRAM boot entry"
 fi
 
 # ── Disable PXE so the next boot uses the installed disk ──

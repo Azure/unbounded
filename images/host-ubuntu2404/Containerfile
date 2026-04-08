@@ -54,8 +54,21 @@ RUN mkdir -p /artifacts && \
     fi
 
 # ── Build init.cpio overlay ─────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends efibootmgr && \
+    rm -rf /var/lib/apt/lists/*
+
 COPY images/host-ubuntu2404/assets/init /tmp/initrd-root/init
 RUN chmod 755 /tmp/initrd-root/init && \
+    mkdir -p /tmp/initrd-root/usr/bin /tmp/initrd-root/usr/lib && \
+    cp /usr/bin/efibootmgr /tmp/initrd-root/usr/bin/ && \
+    for lib in $(ldd /usr/bin/efibootmgr | awk '/=>/{print $3}'); do \
+        mkdir -p "/tmp/initrd-root$(dirname "$lib")" && \
+        cp "$lib" "/tmp/initrd-root${lib}"; \
+    done && \
+    # Also copy the dynamic linker so efibootmgr can run in the initrd.
+    INTERP=$(ldd /usr/bin/efibootmgr | awk '/ld-linux/{print $1}') && \
+    mkdir -p "/tmp/initrd-root$(dirname "$INTERP")" && \
+    cp "$INTERP" "/tmp/initrd-root${INTERP}" && \
     cd /tmp/initrd-root && \
     find . -print0 | cpio --create --format=newc --quiet --null > /artifacts/init.cpio
 
