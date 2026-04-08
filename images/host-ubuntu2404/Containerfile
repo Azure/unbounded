@@ -33,17 +33,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Download netboot artifacts ──────────────────────────────────────
+# We only download the EFI shim, GRUB, and the base initrd from the
+# netboot server.  The vmlinuz comes from the linux-image-generic
+# package installed above so it always matches the kernel modules we
+# bundle into init.cpio.  A version mismatch between the booted kernel
+# and the modules causes modprobe to silently fail, leaving no NIC
+# drivers loaded and panicking the installer.
+#
 # Ubuntu netboot layout differs by architecture:
 #   amd64: individual files at releases.ubuntu.com
 #   arm64: tarball at cdimage.ubuntu.com (individual URLs are unavailable)
 # File names follow UEFI convention: shimx64/grubx64 (amd64), shimaa64/grubaa64 (arm64).
 # metalman looks up the boot filename from metadata.yaml (dhcpBootImageName).
 RUN mkdir -p /artifacts && \
+    KVER=$(ls /lib/modules | head -1) && \
+    cp "/boot/vmlinuz-${KVER}" /artifacts/vmlinuz && \
     if [ "${TARGETARCH}" = "amd64" ]; then \
         NETBOOT_BASE="https://releases.ubuntu.com/24.04.2/netboot/amd64"; \
         curl -fSL -o /artifacts/shimx64.efi  "${NETBOOT_BASE}/bootx64.efi" && \
         curl -fSL -o /artifacts/grubx64.efi  "${NETBOOT_BASE}/grubx64.efi" && \
-        curl -fSL -o /artifacts/vmlinuz      "${NETBOOT_BASE}/linux"       && \
         curl -fSL -o /artifacts/initrd       "${NETBOOT_BASE}/initrd"; \
     elif [ "${TARGETARCH}" = "arm64" ]; then \
         NETBOOT_URL="https://cdimage.ubuntu.com/releases/noble/release/ubuntu-24.04.4-netboot-arm64.tar.gz"; \
@@ -51,7 +59,6 @@ RUN mkdir -p /artifacts && \
         tar -xzf /tmp/netboot.tar.gz -C /tmp && \
         cp /tmp/arm64/bootaa64.efi   /artifacts/shimaa64.efi && \
         cp /tmp/arm64/grubaa64.efi   /artifacts/grubaa64.efi && \
-        cp /tmp/arm64/linux           /artifacts/vmlinuz && \
         cp /tmp/arm64/initrd          /artifacts/initrd && \
         rm -rf /tmp/netboot.tar.gz /tmp/arm64; \
     else \
