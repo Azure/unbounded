@@ -1,16 +1,15 @@
 package cmd
 
 import (
-	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"os/signal"
 	"strings"
 
 	"github.com/spf13/cobra"
 
-	"github.com/project-unbounded/unbounded-kube/internal/provision"
+	"github.com/project-unbounded/unbounded-kube/cmd/agent/internal/phases"
+	"github.com/project-unbounded/unbounded-kube/cmd/agent/internal/phases/reset"
 	"github.com/project-unbounded/unbounded-kube/internal/version"
 )
 
@@ -48,11 +47,42 @@ The machine name is resolved in this order:
 				return err
 			}
 
-			cmdCtx.Logger.Info("resetting host", "machine", name)
+			log := cmdCtx.Logger
+			log.Info("resetting host", "machine", name)
 
-			script := provision.UnboundedAgentUninstallScript(name)
+			return phases.Serial(log,
+				// Step 1: Stop the nspawn machine.
+				reset.StopMachine(log, name),
 
-			return runResetScript(ctx, script)
+				// Step 2-3: Remove network interfaces and WireGuard keys.
+				phases.Parallel(log,
+					reset.RemoveNetworkInterfaces(log),
+					reset.RemoveWireGuardKeys(log),
+				),
+
+				// Step 4: Remove nspawn configuration files.
+				reset.RemoveNSpawnConfig(log, name),
+
+				// Step 5: Remove the machine rootfs.
+				reset.RemoveMachine(log, name),
+
+				// Step 6-9: Remove services and restore host configuration.
+				phases.Parallel(log,
+					reset.RemoveNFTables(log),
+					reset.RemoveSysctlConfig(log),
+					reset.RestoreDocker(log),
+					reset.RestoreSwap(log),
+				),
+
+				// Step 10: Clean up policy routing rules.
+				reset.CleanupRoutes(log),
+
+				// Step 11: Remove agent binaries and config.
+				reset.RemoveAgentArtifacts(log),
+
+				// Step 12: Reload systemd.
+				reset.ReloadSystemd(log),
+			).Do(ctx)
 		},
 	}
 
@@ -89,18 +119,4 @@ func resolveMachineName(flagValue string) (string, error) {
 		"machine name is required: use --machine-name flag or ensure agent config is available via %s or %s",
 		configFileEnv, defaultConfigPath,
 	)
-}
-
-// runResetScript executes the rendered uninstall script via bash.
-func runResetScript(ctx context.Context, script string) error {
-	cmd := exec.CommandContext(ctx, "bash", "-e", "-o", "pipefail")
-	cmd.Stdin = strings.NewReader(script)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("reset script failed: %w", err)
-	}
-
-	return nil
 }
