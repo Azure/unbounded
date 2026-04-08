@@ -15,6 +15,9 @@ RUN tdnf install -y \
 ENV CGO_ENABLED=1
 ENV GOPATH=/go
 ENV GOTOOLCHAIN=auto
+# Azure Linux 3.0's Go package restricts GOTOOLCHAIN to "local" by default.
+# Allow "auto" so that go install can download the required toolchain.
+ENV MS_GOTOOLCHAIN_ALLOW_NON_LOCAL=1
 ENV PATH=$PATH:/go/bin
 
 # Install gofumpt and golangci-lint for the build
