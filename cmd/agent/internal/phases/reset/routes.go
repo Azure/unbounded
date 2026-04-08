@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"os/exec"
 
 	"github.com/project-unbounded/unbounded-kube/cmd/agent/internal/phases"
+	"github.com/project-unbounded/unbounded-kube/cmd/agent/internal/utilexec"
 )
 
 // wireguardTableStart and wireguardTableEnd define the range of routing table
@@ -36,15 +36,13 @@ func (t *cleanupRoutes) Do(ctx context.Context) error {
 
 		// Remove all ip rules pointing to this table.
 		for {
-			cmd := exec.CommandContext(ctx, "ip", "rule", "del", "table", tableStr)
-			if err := cmd.Run(); err != nil {
+			if err := utilexec.RunCmd(ctx, t.log, utilexec.Ip(), "rule", "del", "table", tableStr); err != nil {
 				break // no more rules for this table
 			}
 		}
 
 		// Flush the routing table.
-		cmd := exec.CommandContext(ctx, "ip", "route", "flush", "table", tableStr)
-		cmd.Run() //nolint:errcheck // Best-effort flush; table may be empty or not exist.
+		utilexec.RunCmd(ctx, t.log, utilexec.Ip(), "route", "flush", "table", tableStr) //nolint:errcheck // Best-effort flush; table may be empty or not exist.
 	}
 
 	return nil

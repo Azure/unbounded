@@ -137,6 +137,13 @@ func AptGet() func(context.Context) *exec.Cmd {
 	}
 }
 
+// Ip returns a command factory for the ip networking utility.
+func Ip() func(context.Context) *exec.Cmd {
+	return func(ctx context.Context) *exec.Cmd {
+		return exec.CommandContext(ctx, "ip")
+	}
+}
+
 // Machinectl returns a command factory for machinectl.
 func Machinectl() func(context.Context) *exec.Cmd {
 	return func(ctx context.Context) *exec.Cmd {
