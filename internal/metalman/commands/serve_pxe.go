@@ -113,6 +113,7 @@ func ServePXECmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("resolving cluster Kubernetes version: %w", err)
 			}
+
 			kubeVersion := sv.GitVersion
 
 			// Resolve cluster DNS from the kube-dns Service ClusterIP.
@@ -120,6 +121,7 @@ func ServePXECmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("resolving cluster DNS: %w", err)
 			}
+
 			clusterDNS := dnsSvc.Spec.ClusterIP
 			if clusterDNS == "" {
 				return fmt.Errorf("kube-dns Service has no ClusterIP")
