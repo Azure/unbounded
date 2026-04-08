@@ -14,6 +14,7 @@ RUN tdnf install -y \
 # Set up Go environment
 ENV CGO_ENABLED=1
 ENV GOPATH=/go
+ENV GOTOOLCHAIN=auto
 ENV PATH=$PATH:/go/bin
 
 # Install gofumpt and golangci-lint for the build
