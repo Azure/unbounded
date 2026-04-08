@@ -29,7 +29,7 @@ func (t *removeAgentArtifacts) Do(_ context.Context) error {
 		"/usr/local/bin/unbounded-agent-install.sh",
 		"/usr/local/bin/unbounded-agent-uninstall.sh",
 	} {
-		removeFileIfExists(path)
+		removeFileIfExists(t.log, path)
 	}
 
 	// Remove directories.
@@ -37,13 +37,13 @@ func (t *removeAgentArtifacts) Do(_ context.Context) error {
 		"/etc/unbounded-agent",
 		"/tmp/unbounded-agent",
 	} {
-		removeAllIfExists(dir) //nolint:errcheck // best-effort cleanup
+		removeAllIfExists(t.log, dir)
 	}
 
 	// Remove temp config files matching /tmp/unbounded-agent-config.*.json.
 	matches, _ := filepath.Glob("/tmp/unbounded-agent-config.*.json") //nolint:errcheck // Pattern is valid; only errors on malformed globs.
 	for _, m := range matches {
-		removeFileIfExists(m)
+		removeFileIfExists(t.log, m)
 	}
 
 	return nil

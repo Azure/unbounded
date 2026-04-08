@@ -35,7 +35,10 @@ func (t *stopMachine) Do(ctx context.Context) error {
 	// properly tears down mount namespaces and cgroups so that
 	// machinectl remove can succeed.
 	serviceName := fmt.Sprintf("systemd-nspawn@%s.service", t.machineName)
-	utilexec.RunCmd(ctx, t.log, utilexec.Systemctl(), "stop", serviceName) //nolint:errcheck // Best-effort stop; machine may already be stopped.
+
+	if err := utilexec.RunCmd(ctx, t.log, utilexec.Systemctl(), "stop", serviceName); err != nil {
+		t.log.Warn("failed to stop nspawn service (may already be stopped)", "service", serviceName, "error", err)
+	}
 
 	// Wait up to 30 seconds for the machine to fully stop.
 	if t.waitForGone(ctx, 30*time.Second) {
@@ -45,7 +48,10 @@ func (t *stopMachine) Do(ctx context.Context) error {
 	// Force terminate if still registered.
 	if machineExists(ctx, t.log, t.machineName) {
 		t.log.Warn("machine did not stop gracefully, terminating", "machine", t.machineName)
-		utilexec.RunCmd(ctx, t.log, utilexec.Machinectl(), "terminate", t.machineName) //nolint:errcheck // Best-effort terminate; we poll for disappearance below.
+
+		if err := utilexec.RunCmd(ctx, t.log, utilexec.Machinectl(), "terminate", t.machineName); err != nil {
+			t.log.Warn("failed to terminate machine", "machine", t.machineName, "error", err)
+		}
 
 		// Wait up to 15 seconds for the terminate to take full effect.
 		t.waitForGone(ctx, 15*time.Second)
@@ -115,8 +121,9 @@ func (t *removeMachine) Do(ctx context.Context) error {
 
 	// Fallback: force-remove the directory if machinectl keeps failing.
 	t.log.Warn("machinectl remove did not succeed, force-removing directory", "dir", machineDir)
+	removeAllIfExists(t.log, machineDir)
 
-	return removeAllIfExists(machineDir)
+	return nil
 }
 
 // machineExists checks whether the named nspawn machine is known to machinectl.

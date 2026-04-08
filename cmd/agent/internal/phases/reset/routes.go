@@ -42,7 +42,9 @@ func (t *cleanupRoutes) Do(ctx context.Context) error {
 		}
 
 		// Flush the routing table.
-		utilexec.RunCmd(ctx, t.log, utilexec.Ip(), "route", "flush", "table", tableStr) //nolint:errcheck // Best-effort flush; table may be empty or not exist.
+		if err := utilexec.RunCmd(ctx, t.log, utilexec.Ip(), "route", "flush", "table", tableStr); err != nil {
+			t.log.Warn("failed to flush routing table (may be empty)", "table", tableStr, "error", err)
+		}
 	}
 
 	return nil

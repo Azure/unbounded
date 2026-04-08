@@ -3,13 +3,14 @@ package reset
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"strings"
 
 	"github.com/project-unbounded/unbounded-kube/cmd/agent/internal/phases"
+	"github.com/project-unbounded/unbounded-kube/cmd/agent/internal/utilexec"
 )
 
 // knownOverlayInterfaces lists the tunnel and overlay interfaces created by
@@ -37,7 +38,7 @@ func (t *removeNetworkInterfaces) Name() string { return "remove-network-interfa
 
 func (t *removeNetworkInterfaces) Do(ctx context.Context) error {
 	// Remove WireGuard interfaces (wg51820, wg51821, ...).
-	wgIfaces, err := listWireGuardInterfaces(ctx)
+	wgIfaces, err := listWireGuardInterfaces(ctx, t.log)
 	if err != nil {
 		t.log.Warn("failed to list WireGuard interfaces", "error", err)
 	}
@@ -49,7 +50,7 @@ func (t *removeNetworkInterfaces) Do(ctx context.Context) error {
 
 	// Remove tunnel and overlay interfaces.
 	for _, iface := range knownOverlayInterfaces {
-		if linkExists(ctx, iface) {
+		if linkExists(t.log, iface) {
 			t.log.Info("removing interface", "interface", iface)
 			deleteLink(ctx, t.log, iface)
 		}
@@ -77,7 +78,7 @@ func (t *removeWireGuardKeys) Do(_ context.Context) error {
 		"/etc/wireguard/server.priv",
 		"/etc/wireguard/server.pub",
 	} {
-		removeFileIfExists(path)
+		removeFileIfExists(t.log, path)
 	}
 
 	return nil
@@ -85,17 +86,15 @@ func (t *removeWireGuardKeys) Do(_ context.Context) error {
 
 // listWireGuardInterfaces returns the names of all WireGuard interfaces (names
 // matching wg[0-9]*) visible on the host.
-func listWireGuardInterfaces(ctx context.Context) ([]string, error) {
-	cmd := exec.CommandContext(ctx, "ip", "-o", "link", "show")
-
-	out, err := cmd.Output()
+func listWireGuardInterfaces(ctx context.Context, log *slog.Logger) ([]string, error) {
+	out, err := utilexec.OutputCmd(ctx, log, "ip", "-o", "link", "show")
 	if err != nil {
 		return nil, fmt.Errorf("ip link show: %w", err)
 	}
 
 	var ifaces []string
 
-	scanner := bufio.NewScanner(strings.NewReader(string(out)))
+	scanner := bufio.NewScanner(strings.NewReader(out))
 	for scanner.Scan() {
 		// Each line looks like: "2: wg51820: <...> ..."
 		// The interface name is the second field, with a trailing colon.
@@ -134,23 +133,28 @@ func isWireGuardInterface(name string) bool {
 	return true
 }
 
-// linkExists checks whether a network interface exists.
-func linkExists(ctx context.Context, name string) bool {
-	cmd := exec.CommandContext(ctx, "ip", "link", "show", name)
-	cmd.Stdout = nil
-	cmd.Stderr = nil
+// linkExists checks whether a network interface exists by looking up its
+// entry in /sys/class/net. This avoids shelling out and cleanly distinguishes
+// "not found" from real errors.
+func linkExists(log *slog.Logger, name string) bool {
+	_, err := os.Stat(fmt.Sprintf("/sys/class/net/%s", name))
+	if err == nil {
+		return true
+	}
 
-	return cmd.Run() == nil
+	if errors.Is(err, os.ErrNotExist) {
+		return false
+	}
+
+	log.Warn("failed to check interface existence", "interface", name, "error", err)
+
+	return false
 }
 
-// deleteLink removes a network interface, ignoring errors if the interface
-// does not exist.
+// deleteLink removes a network interface, logging a warning if the operation
+// fails (e.g. the interface was already removed).
 func deleteLink(ctx context.Context, log *slog.Logger, name string) {
-	cmd := exec.CommandContext(ctx, "ip", "link", "delete", name)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Run(); err != nil {
-		log.Debug("failed to delete interface (may already be gone)", "interface", name, "error", err)
+	if err := utilexec.RunCmd(ctx, log, utilexec.Ip(), "link", "delete", name); err != nil {
+		log.Warn("failed to delete interface (may already be gone)", "interface", name, "error", err)
 	}
 }

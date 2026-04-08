@@ -28,8 +28,8 @@ func (t *removeNSpawnConfig) Do(_ context.Context) error {
 
 	t.log.Info("removing nspawn configuration", "nspawn_file", nspawnFile, "override_dir", overrideDir)
 
-	removeFileIfExists(nspawnFile)
-	removeAllIfExists(overrideDir) //nolint:errcheck // best-effort cleanup
+	removeFileIfExists(t.log, nspawnFile)
+	removeAllIfExists(t.log, overrideDir)
 
 	return nil
 }
