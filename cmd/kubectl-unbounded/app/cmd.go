@@ -1,7 +1,6 @@
 package app
 
 import (
-	"fmt"
 	"os"
 
 	"github.com/spf13/cobra"
@@ -17,13 +16,7 @@ func Run() {
 
 	root.AddCommand(siteCommandGroup())
 	root.AddCommand(machineCommandGroup())
-	root.AddCommand(&cobra.Command{
-		Use:   "version",
-		Short: "Print version",
-		Run: func(_ *cobra.Command, _ []string) {
-			fmt.Println(version.String())
-		},
-	})
+	root.AddCommand(version.Command())
 
 	if err := root.Execute(); err != nil {
 		os.Exit(1)

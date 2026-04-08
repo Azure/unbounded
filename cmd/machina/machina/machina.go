@@ -17,13 +17,7 @@ func Run() {
 	}
 
 	root.AddCommand(controller.NewCommand())
-	root.AddCommand(&cobra.Command{
-		Use:   "version",
-		Short: "Print version",
-		Run: func(_ *cobra.Command, _ []string) {
-			fmt.Println(version.String())
-		},
-	})
+	root.AddCommand(version.Command())
 
 	if err := root.Execute(); err != nil {
 		fmt.Printf("error: %v\n", err)
