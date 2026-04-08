@@ -41,7 +41,7 @@ KUBECTL_UNBOUNDED_LDFLAGS=$(VERSION_LDFLAGS) -X github.com/project-unbounded/unb
 METALMAN_TAG ?= latest
 METALMAN_IMAGE=$(CONTAINER_REGISTRY)/metalman:$(METALMAN_TAG)
 
-.PHONY: all help fmt lint test check-deps kubectl-unbounded forge inventory inventory-amd64 inventory-arm64 unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests metalman metalman-build metalman-oci metalman-oci-push gomod
+.PHONY: all help fmt lint test check-deps kubectl-unbounded forge inventory inventory-amd64 inventory-arm64 unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve
 
 ##@ General
 
@@ -143,3 +143,11 @@ metalman-oci: ## Build the metalman container image
 
 metalman-oci-push: metalman-oci ## Build and push the metalman container image
 	$(CONTAINER_ENGINE) push $(METALMAN_IMAGE)
+
+##@ Documentation
+
+docs-serve: ## Start a local Hugo dev server with live-reload
+	@command -v hugo >/dev/null 2>&1 || \
+		{ echo "error: hugo not found. Install it from:"; \
+		  echo "  https://gohugo.io/installation/"; exit 1; }
+	cd docs && hugo server
