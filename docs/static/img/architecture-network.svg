@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 740 240" font-family="Inter, -apple-system, BlinkMacSystemFont, sans-serif">
+  <defs>
+    <marker id="arrowR" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6" fill="none" stroke="#4d8eff" stroke-width="1.5"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="740" height="240" rx="12" fill="#111113"/>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- Remote Site (left)                                 -->
+  <!-- ═══════════════════════════════════════════════════ -->
+  <rect x="30" y="20" width="220" height="200" rx="10" fill="none" stroke="#2a2a2e" stroke-width="1.5"/>
+  <text x="140" y="48" text-anchor="middle" fill="#e4e4e7" font-size="14" font-weight="700">Remote Site</text>
+
+  <!-- Node + Pods box -->
+  <rect x="55" y="70" width="170" height="60" rx="8" fill="#18181b" stroke="#2a2a2e" stroke-width="1"/>
+  <text x="140" y="97" text-anchor="middle" fill="#e4e4e7" font-size="12" font-weight="600">Node + Pods</text>
+  <text x="140" y="118" text-anchor="middle" fill="#a0a0a8" font-size="10">workloads</text>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- WireGuard tunnel (center)                          -->
+  <!-- ═══════════════════════════════════════════════════ -->
+  <line x1="250" y1="100" x2="470" y2="80" stroke="#4d8eff" stroke-width="2" stroke-dasharray="8,5" marker-end="url(#arrowR)"/>
+
+  <!-- WireGuard label -->
+  <rect x="310" y="55" width="100" height="22" rx="4" fill="#18181b" stroke="#4d8eff" stroke-width="0.8" stroke-opacity="0.5"/>
+  <!-- lock icon -->
+  <rect x="318" y="59" width="10" height="8" rx="1.5" fill="none" stroke="#4d8eff" stroke-width="1"/>
+  <path d="M320,59 L320,56 A3,3 0 0,1 326,56 L326,59" fill="none" stroke="#4d8eff" stroke-width="1"/>
+  <text x="334" y="70" fill="#4d8eff" font-size="10" font-weight="600">WireGuard</text>
+
+  <text x="360" y="98" text-anchor="middle" fill="#a0a0a8" font-size="9">UDP 51820-51899</text>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- Control-Plane Cluster (right)                      -->
+  <!-- ═══════════════════════════════════════════════════ -->
+  <rect x="470" y="20" width="240" height="200" rx="10" fill="none" stroke="#2a2a2e" stroke-width="1.5"/>
+  <text x="590" y="48" text-anchor="middle" fill="#e4e4e7" font-size="14" font-weight="700">Control-Plane Cluster</text>
+
+  <!-- Gateway Node box -->
+  <rect x="500" y="65" width="180" height="48" rx="8" fill="#18181b" stroke="#4d8eff" stroke-width="1.5" stroke-opacity="0.5"/>
+  <text x="590" y="86" text-anchor="middle" fill="#e4e4e7" font-size="12" font-weight="600">Gateway Node</text>
+  <text x="590" y="103" text-anchor="middle" fill="#a0a0a8" font-size="10">(public IP)</text>
+
+  <!-- vxlan / routing line -->
+  <line x1="590" y1="113" x2="590" y2="155" stroke="#a0a0a8" stroke-width="1.5"/>
+  <text x="630" y="138" fill="#a0a0a8" font-size="9">vxlan / routing</text>
+
+  <!-- Cluster Pods box -->
+  <rect x="500" y="155" width="180" height="48" rx="8" fill="#18181b" stroke="#2a2a2e" stroke-width="1"/>
+  <text x="590" y="184" text-anchor="middle" fill="#e4e4e7" font-size="12" font-weight="600">Cluster Pods</text>
+</svg>

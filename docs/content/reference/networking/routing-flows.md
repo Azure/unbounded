@@ -30,39 +30,7 @@ interface by BPF LPM lookups.
 
 Pod-to-pod traffic between two nodes in the same site:
 
-```
-  Node A (source)                              Node B (destination)
-  ┌─────────────────┐                          ┌─────────────────┐
-  │ Pod (src)        │                          │ Pod (dst)        │
-  │   ↓              │                          │   ↑              │
-  │ cbr0             │                          │ cbr0             │
-  │   ↓              │                          │   ↑              │
-  │ kernel routing   │                          │ kernel routing   │
-  │ (supernet route  │                          │ (local table:    │
-  │  on unbounded0)  │                          │  dst on cbr0)    │
-  │   ↓              │                          │   ↑              │
-  │ unbounded0       │                          │ unbounded0       │
-  │ TC egress BPF    │                          │   ↑              │
-  │   ↓              │                          │   │              │
-  │ LPM lookup in    │                          │   │              │
-  │ unbounded_       │                          │   │              │
-  │ endpoints_v4     │                          │   │              │
-  │   ↓              │                          │   │              │
-  │ set_tunnel_key   │                          │   │              │
-  │ (remote_ip, vni) │                          │   │              │
-  │   ↓              │                          │   │              │
-  │ derive inner     │                          │   │              │
-  │ dst MAC          │                          │   │              │
-  │   ↓              │                          │   │              │
-  │ bpf_redirect     │                          │   │              │
-  │ (geneve0)        │                          │ geneve0          │
-  │   ↓              │                          │ (GENEVE decap)   │
-  │ geneve0          │                          │   ↑              │
-  │ (GENEVE encap)   │                          │   │              │
-  │   ↓              │                          │   │              │
-  │ eth0  ───────────┼──── UDP 6081 ───────────→│ eth0             │
-  └─────────────────┘                          └─────────────────┘
-```
+![Intra-site GENEVE flow: Node A sends from Pod through cbr0, kernel routing, unbounded0 TC egress BPF with LPM lookup, set_tunnel_key, bpf_redirect to geneve0, GENEVE encap over UDP 6081 to Node B which decapsulates and delivers to destination Pod](../../../img/networking-intra-site-geneve.svg)
 
 **Step by step:**
 
@@ -88,28 +56,7 @@ Pod-to-pod traffic between two nodes in the same site:
 
 Traffic between pods in different sites, transiting through gateway nodes:
 
-```
-  Site 1 Worker         Site 1 Gateway        Site 2 Gateway        Site 2 Worker
-  ┌────────────┐       ┌──────────────┐      ┌──────────────┐      ┌────────────┐
-  │ Pod (src)  │       │              │      │              │      │ Pod (dst)  │
-  │  ↓         │       │              │      │              │      │  ↑         │
-  │ cbr0       │       │              │      │              │      │ cbr0       │
-  │  ↓         │       │              │      │              │      │  ↑         │
-  │ unbounded0 │       │ wg51821      │      │ wg (decrypt) │      │ unbounded0 │
-  │ BPF→redir  │       │ (decrypt)    │      │  ↓           │      │ BPF→redir  │
-  │ (wg51821)  │       │  ↓           │      │ unbounded0   │      │ (geneve0)  │
-  │  ↓         │       │ unbounded0   │      │ BPF→redir    │      │  ↑         │
-  │ wg51821    │       │ BPF→redir    │      │ (geneve0)    │      │ geneve0    │
-  │ (encrypt)  │       │ (wg51822)    │      │  ↓           │      │ (decap)    │
-  │  ↓         │       │  ↓           │      │ geneve0      │      │  ↑         │
-  │ eth0 ──────┼──LAN─→│ eth0         │      │ (encap)      │      │ eth0       │
-  └────────────┘       │  ↓           │      │  ↓           │      └────────────┘
-                       │ wg51822      │      │ eth0  ───LAN─┼─────→│            │
-                       │ (encrypt)    │      └──────────────┘      └────────────┘
-                       │  ↓           │
-                       │ eth0 (pub)───┼──WAN──→ eth0 (pub)
-                       └──────────────┘
-```
+![Cross-site via gateway WireGuard flow: Site 1 Worker through BPF redirect to WireGuard, Site 1 Gateway decrypts and re-encrypts to WAN, Site 2 Gateway decrypts and sends via GENEVE to Site 2 Worker](../../../img/networking-cross-site-gateway.svg)
 
 **Step by step:**
 
@@ -130,15 +77,7 @@ request using connmark, fwmark, and policy routing:
 
 **Framework:**
 
-```
-  Ingress (PREROUTING):
-    1. CONNMARK --restore-mark   (reply packets get fwmark)
-    2. For NEW pkts on wg<port>: CONNMARK --set-mark N
-
-  Egress (OUTPUT):
-    3. CONNMARK --restore-mark   (locally-generated replies get fwmark)
-    4. ip rule: fwmark N → lookup table N (routes out same WG interface)
-```
+![Symmetric routing framework: Ingress PREROUTING with CONNMARK restore and set for new packets, Egress OUTPUT with CONNMARK restore and ip rule fwmark lookup for same WireGuard interface routing](../../../img/networking-symmetric-routing.svg)
 
 Each gateway WireGuard interface gets its own:
 - **Routing table**: Table number = WireGuard port (e.g., 51821).
@@ -227,27 +166,7 @@ Identical to eBPF mode. Kernel routes point directly to `wg<port>` interfaces.
 
 ### Resolution Algorithm
 
-```
-  CRD scope value
-       ↓
-  ┌──────────────────┐
-  │ nil or "Auto"?   │── no ──→ Use the explicit protocol
-  └──────────────────┘
-       │ yes
-       ↓
-  ┌──────────────────┐
-  │ Uses external /  │── yes ──→ WireGuard (security-wins)
-  │ public IPs?      │
-  └──────────────────┘
-       │ no
-       ↓
-  ┌──────────────────┐
-  │ Use ConfigMap    │
-  │ --preferred-     │
-  │ private-encap    │
-  │ (default: GENEVE)│
-  └──────────────────┘
-```
+![Protocol selection algorithm: CRD scope value checked for Auto, then external IP check triggers WireGuard, otherwise use ConfigMap preferred-private-encap defaulting to GENEVE](../../../img/networking-protocol-selection.svg)
 
 ### SGPA Override and Fallback
 

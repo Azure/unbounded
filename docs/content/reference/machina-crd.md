@@ -232,22 +232,7 @@ configuration (e.g. `dhcpBootImageName`).
 
 ### Image layout
 
-```
-/disk/
-  shimx64.efi          # UEFI bootloader (served via TFTP and HTTP)
-  grubx64.efi          # GRUB bootloader
-  vmlinuz              # Linux kernel
-  initrd               # Initramfs
-  init.cpio            # Custom init overlay
-  unbounded-agent      # Agent binary (handles attestation, kubelet setup)
-  metadata.yaml        # Image configuration (dhcpBootImageName, etc.)
-  grub/
-    grub.cfg.tmpl      # GRUB config template (rendered per-machine)
-  cloud-init/
-    user-data.tmpl     # Cloud-init user-data template
-    meta-data.tmpl     # Cloud-init meta-data template
-    vendor-data.tmpl   # Cloud-init vendor-data template
-```
+![Netboot OCI image filesystem layout under /disk/: shimx64.efi, grubx64.efi, vmlinuz, initrd, init.cpio, unbounded-agent, metadata.yaml, grub/grub.cfg.tmpl, cloud-init templates](../../img/machina-netboot-layout.svg)
 
 ### Template data
 
@@ -285,13 +270,7 @@ responses (option 67).
 
 ## CRD relationships
 
-```
-Machine.spec.pxe.image ─────────────────► OCI Image    (by reference)
-Machine.spec.ssh.privateKeyRef ─────────► Secret       (machina-system namespace)
-Machine.spec.pxe.redfish.passwordRef ──► Secret
-Machine.spec.kubernetes.bootstrapTokenRef ► Secret     (kube-system namespace)
-Machine ◄──── unbounded-kube.io/machine ────► Node     (bidirectional via label)
-```
+![Machine CRD relationships: Machine spec fields reference OCI Image, Secrets in machina-system and kube-system namespaces, with bidirectional Machine-Node link via label](../../img/machina-crd-relationships.svg)
 
 ## See Also
 

@@ -1,0 +1,111 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 700 340" font-family="Inter, -apple-system, BlinkMacSystemFont, sans-serif">
+  <defs>
+    <marker id="arrowR" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto">
+      <path d="M0,0 L7,2.5 L0,5" fill="none" stroke="#4d8eff" stroke-width="1.2"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="700" height="340" rx="12" fill="#111113"/>
+
+  <!-- Title -->
+  <text x="350" y="28" text-anchor="middle" fill="#e4e4e7" font-size="14" font-weight="700">Networking CRD Relationships</text>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- Left column: Source CRDs                           -->
+  <!-- ═══════════════════════════════════════════════════ -->
+
+  <!-- Site -->
+  <rect x="30" y="55" width="100" height="32" rx="6" fill="#18181b" stroke="#4d8eff" stroke-width="1.5" stroke-opacity="0.6"/>
+  <text x="80" y="76" text-anchor="middle" fill="#e4e4e7" font-size="12" font-weight="700">Site</text>
+
+  <!-- GatewayPool -->
+  <rect x="30" y="155" width="120" height="32" rx="6" fill="#18181b" stroke="#4d8eff" stroke-width="1.5" stroke-opacity="0.6"/>
+  <text x="90" y="176" text-anchor="middle" fill="#e4e4e7" font-size="12" font-weight="700">GatewayPool</text>
+
+  <!-- SitePeering -->
+  <rect x="30" y="225" width="115" height="32" rx="6" fill="#18181b" stroke="#2a2a2e" stroke-width="1.5"/>
+  <text x="87" y="246" text-anchor="middle" fill="#e4e4e7" font-size="12" font-weight="600">SitePeering</text>
+
+  <!-- SiteGatewayPoolAssignment -->
+  <rect x="30" y="270" width="230" height="32" rx="6" fill="#18181b" stroke="#2a2a2e" stroke-width="1.5"/>
+  <text x="145" y="291" text-anchor="middle" fill="#e4e4e7" font-size="11" font-weight="600">SiteGatewayPoolAssignment</text>
+
+  <!-- GatewayPoolPeering -->
+  <rect x="30" y="315" width="175" height="20" rx="5" fill="#18181b" stroke="#2a2a2e" stroke-width="1"/>
+  <text x="117" y="330" text-anchor="middle" fill="#a0a0a8" font-size="10" font-weight="500">GatewayPoolPeering</text>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- Right column: Target CRDs / Entities               -->
+  <!-- ═══════════════════════════════════════════════════ -->
+
+  <!-- SiteNodeSlice -->
+  <rect x="370" y="45" width="160" height="32" rx="6" fill="#18181b" stroke="#34d399" stroke-width="1.5" stroke-opacity="0.6"/>
+  <text x="450" y="66" text-anchor="middle" fill="#34d399" font-size="12" font-weight="600">SiteNodeSlice</text>
+
+  <!-- Node (from Site) -->
+  <rect x="370" y="90" width="90" height="32" rx="6" fill="#18181b" stroke="#34d399" stroke-width="1.5" stroke-opacity="0.6"/>
+  <text x="415" y="111" text-anchor="middle" fill="#34d399" font-size="12" font-weight="600">Node</text>
+
+  <!-- Node (from GatewayPool) -->
+  <rect x="370" y="140" width="90" height="32" rx="6" fill="#18181b" stroke="#34d399" stroke-width="1.5" stroke-opacity="0.6"/>
+  <text x="415" y="161" text-anchor="middle" fill="#34d399" font-size="12" font-weight="600">Node</text>
+
+  <!-- GatewayPoolNode -->
+  <rect x="370" y="185" width="155" height="32" rx="6" fill="#18181b" stroke="#34d399" stroke-width="1.5" stroke-opacity="0.6"/>
+  <text x="447" y="206" text-anchor="middle" fill="#34d399" font-size="12" font-weight="600">GatewayPoolNode</text>
+
+  <!-- Site (target of SitePeering) -->
+  <rect x="370" y="225" width="125" height="32" rx="6" fill="#18181b" stroke="#4d8eff" stroke-width="1" stroke-opacity="0.5"/>
+  <text x="432" y="246" text-anchor="middle" fill="#e4e4e7" font-size="12" font-weight="600">Site (2+)</text>
+
+  <!-- Site + GatewayPool (target of SGPA) -->
+  <rect x="370" y="270" width="200" height="32" rx="6" fill="#18181b" stroke="#4d8eff" stroke-width="1" stroke-opacity="0.5"/>
+  <text x="470" y="291" text-anchor="middle" fill="#e4e4e7" font-size="12" font-weight="600">Site + GatewayPool</text>
+
+  <!-- GatewayPool (target of GatewayPoolPeering) -->
+  <rect x="370" y="311" width="170" height="24" rx="5" fill="#18181b" stroke="#4d8eff" stroke-width="1" stroke-opacity="0.4"/>
+  <text x="455" y="328" text-anchor="middle" fill="#a0a0a8" font-size="10" font-weight="500">GatewayPool (2+)</text>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- Relationship arrows                                -->
+  <!-- ═══════════════════════════════════════════════════ -->
+
+  <!-- Site -> SiteNodeSlice: owns -->
+  <line x1="130" y1="61" x2="363" y2="61" stroke="#4d8eff" stroke-width="1.5" marker-end="url(#arrowR)"/>
+  <rect x="200" y="49" width="80" height="17" rx="3" fill="#1e1e22" stroke="#2a2a2e" stroke-width="0.8"/>
+  <text x="240" y="61" text-anchor="middle" fill="#a0a0a8" font-size="9" font-weight="500">owns</text>
+  <text x="555" y="66" fill="#a0a0a8" font-size="9">(max 500 nodes/slice)</text>
+
+  <!-- Site -> Node: contains -->
+  <line x1="130" y1="78" x2="363" y2="106" stroke="#4d8eff" stroke-width="1.5" marker-end="url(#arrowR)"/>
+  <rect x="200" y="85" width="80" height="17" rx="3" fill="#1e1e22" stroke="#2a2a2e" stroke-width="0.8"/>
+  <text x="240" y="97" text-anchor="middle" fill="#a0a0a8" font-size="9" font-weight="500">contains</text>
+  <text x="480" y="111" fill="#a0a0a8" font-size="9">(matched by nodeCidrs)</text>
+
+  <!-- GatewayPool -> Node: selects -->
+  <line x1="150" y1="162" x2="363" y2="156" stroke="#4d8eff" stroke-width="1.5" marker-end="url(#arrowR)"/>
+  <rect x="215" y="150" width="80" height="17" rx="3" fill="#1e1e22" stroke="#2a2a2e" stroke-width="0.8"/>
+  <text x="255" y="162" text-anchor="middle" fill="#a0a0a8" font-size="9" font-weight="500">selects</text>
+  <text x="480" y="161" fill="#a0a0a8" font-size="9">(by nodeSelector)</text>
+
+  <!-- GatewayPool -> GatewayPoolNode: contains -->
+  <line x1="150" y1="180" x2="363" y2="201" stroke="#4d8eff" stroke-width="1.5" marker-end="url(#arrowR)"/>
+  <rect x="215" y="186" width="80" height="17" rx="3" fill="#1e1e22" stroke="#2a2a2e" stroke-width="0.8"/>
+  <text x="255" y="198" text-anchor="middle" fill="#a0a0a8" font-size="9" font-weight="500">contains</text>
+
+  <!-- SitePeering -> Site (2+): peers -->
+  <line x1="145" y1="241" x2="363" y2="241" stroke="#4d8eff" stroke-width="1.5" marker-end="url(#arrowR)"/>
+  <rect x="215" y="233" width="80" height="17" rx="3" fill="#1e1e22" stroke="#2a2a2e" stroke-width="0.8"/>
+  <text x="255" y="245" text-anchor="middle" fill="#a0a0a8" font-size="9" font-weight="500">peers</text>
+
+  <!-- SGPA -> Site + GatewayPool: assigns -->
+  <line x1="260" y1="286" x2="363" y2="286" stroke="#4d8eff" stroke-width="1.5" marker-end="url(#arrowR)"/>
+  <rect x="278" y="278" width="80" height="17" rx="3" fill="#1e1e22" stroke="#2a2a2e" stroke-width="0.8"/>
+  <text x="318" y="290" text-anchor="middle" fill="#a0a0a8" font-size="9" font-weight="500">assigns</text>
+
+  <!-- GatewayPoolPeering -> GatewayPool (2+): peers -->
+  <line x1="205" y1="325" x2="363" y2="323" stroke="#4d8eff" stroke-width="1.2" marker-end="url(#arrowR)"/>
+  <rect x="248" y="316" width="60" height="16" rx="3" fill="#1e1e22" stroke="#2a2a2e" stroke-width="0.8"/>
+  <text x="278" y="328" text-anchor="middle" fill="#a0a0a8" font-size="8" font-weight="500">peers</text>
+</svg>

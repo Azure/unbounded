@@ -22,35 +22,7 @@ kernel routing tables.
 
 ### High-Level Architecture
 
-```
-  Control Plane
-  ┌─────────────────────────────────────────────────┐
-  │  unbounded-net-controller (Leader Elected)       │
-  │   ├── Site Controller                            │
-  │   │    ├── Labels nodes, assigns podCIDRs        │
-  │   │    └── Creates SiteNodeSlice objects          │
-  │   └── GatewayPool Controller                     │
-  │        ├── Updates GatewayPool status             │
-  │        └── Creates GatewayPoolNode objects        │
-  └─────────────────────────────────────────────────┘
-
-  Custom Resources
-  ┌──────────────────────────────────────────────────┐
-  │  Site  SiteNodeSlice  GatewayPool  GatewayPoolNode│
-  │  SitePeering  SiteGatewayPoolAssignment           │
-  │  GatewayPoolPeering                               │
-  └──────────────────────────────────────────────────┘
-
-  Data Plane (per Node)
-  ┌──────────────────────────────────────────────────┐
-  │  Node Agent (DaemonSet)                           │
-  │   ├── CNI bridge config                          │
-  │   ├── WireGuard interface management             │
-  │   ├── eBPF: unbounded0 + TC egress BPF program  │
-  │   │    └── LPM trie maps → geneve0/vxlan0/ipip0 │
-  │   └── Gateway health monitoring (UDP probes)     │
-  └──────────────────────────────────────────────────┘
-```
+![unbounded-net high-level architecture: Control Plane with Site and GatewayPool controllers, Custom Resources tier, and per-Node Data Plane with eBPF, WireGuard, and gateway health monitoring](../../../img/networking-architecture-overview.svg)
 
 ## Component Details
 
@@ -214,28 +186,11 @@ grows.
 
 ### Same-Site Pod-to-Pod (eBPF, GENEVE)
 
-```
-  Pod A → cbr0 → kernel routing → unbounded0 → TC egress BPF
-    → LPM lookup → set_tunnel_key(remote_ip, vni)
-    → bpf_redirect(geneve0) → GENEVE encap → eth0
-    → [LAN, UDP 6081]
-    → eth0 → geneve0 (decap) → kernel routing → cbr0 → Pod B
-```
+![Same-site pod-to-pod flow: Pod A through cbr0, kernel routing, unbounded0, TC egress BPF with LPM lookup, GENEVE encap over LAN to Pod B](../../../img/networking-same-site-flow.svg)
 
 ### Cross-Site Pod-to-Pod (via Gateway, WireGuard)
 
-```
-  Pod A (Site 1)
-    → cbr0 → kernel → unbounded0 → BPF → bpf_redirect(wg51821)
-    → WireGuard encrypt → eth0 → [LAN]
-    → Site 1 Gateway wg51821 (decrypt) → kernel fwd
-      → unbounded0 → BPF → bpf_redirect(wg51822)
-      → WireGuard encrypt → eth0 → [WAN/Internet]
-    → Site 2 Gateway wg<port> (decrypt) → kernel fwd
-      → unbounded0 → BPF → set_tunnel_key → bpf_redirect(geneve0)
-      → GENEVE encap → eth0 → [LAN]
-    → Site 2 Worker geneve0 (decap) → kernel → cbr0 → Pod B
-```
+![Cross-site pod-to-pod flow via gateway: Pod A on Site 1 Worker through WireGuard to Site 1 Gateway, WAN to Site 2 Gateway, GENEVE to Site 2 Worker, delivered to Pod B](../../../img/networking-cross-site-flow.svg)
 
 ### Gateway Health Checks
 
@@ -297,14 +252,7 @@ and are ready for immediate failover.
 Gateways start in a "New" state and must prove connectivity before being marked
 healthy. The state machine:
 
-```
-  New → (N successes) → Healthy
-  Healthy → (1 failure) → Degraded
-  Degraded → (success) → Healthy
-  Degraded → (N failures) → Unhealthy (routes deprioritized)
-  Unhealthy → (1 success) → Recovering
-  Recovering → (N successes) → Healthy
-```
+![Gateway health state machine: New to Healthy (N successes), Healthy to Degraded (1 failure), Degraded to Unhealthy (N failures) with routes deprioritized, Unhealthy to Recovering (1 success), Recovering to Healthy (N successes)](../../../img/networking-gateway-health.svg)
 
 Recovery requires the same number of successes as failures to go down
 (symmetric recovery).

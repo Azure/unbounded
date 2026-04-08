@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 700 380" font-family="Inter, -apple-system, BlinkMacSystemFont, sans-serif">
+  <defs>
+    <marker id="arrowDown" markerWidth="8" markerHeight="6" refX="4" refY="6" orient="auto">
+      <path d="M0,0 L4,6 L8,0" fill="none" stroke="#a78bfa" stroke-width="1.5"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="700" height="380" rx="12" fill="#111113"/>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- Host (top)                                         -->
+  <!-- ═══════════════════════════════════════════════════ -->
+  <rect x="40" y="20" width="620" height="110" rx="10" fill="none" stroke="#a78bfa" stroke-width="1.5" stroke-opacity="0.5"/>
+  <text x="350" y="48" text-anchor="middle" fill="#e4e4e7" font-size="14" font-weight="700">Host</text>
+  <text x="350" y="65" text-anchor="middle" fill="#a0a0a8" font-size="11">(with NVIDIA drivers)</text>
+
+  <!-- GPU chip icon -->
+  <rect x="55" y="30" width="16" height="16" rx="2" fill="none" stroke="#a78bfa" stroke-width="0.9"/>
+  <line x1="51" y1="35" x2="55" y2="35" stroke="#a78bfa" stroke-width="0.7"/>
+  <line x1="51" y1="40" x2="55" y2="40" stroke="#a78bfa" stroke-width="0.7"/>
+  <line x1="71" y1="35" x2="75" y2="35" stroke="#a78bfa" stroke-width="0.7"/>
+  <line x1="71" y1="40" x2="75" y2="40" stroke="#a78bfa" stroke-width="0.7"/>
+  <line x1="60" y1="26" x2="60" y2="30" stroke="#a78bfa" stroke-width="0.7"/>
+  <line x1="65" y1="26" x2="65" y2="30" stroke="#a78bfa" stroke-width="0.7"/>
+  <line x1="60" y1="46" x2="60" y2="50" stroke="#a78bfa" stroke-width="0.7"/>
+  <line x1="65" y1="46" x2="65" y2="50" stroke="#a78bfa" stroke-width="0.7"/>
+
+  <!-- /dev/ devices box -->
+  <rect x="65" y="80" width="280" height="36" rx="6" fill="#18181b" stroke="#2a2a2e" stroke-width="1"/>
+  <text x="75" y="95" fill="#a78bfa" font-size="10" font-weight="600" font-family="'SF Mono', 'Fira Code', monospace">/dev/</text>
+  <text x="108" y="95" fill="#a0a0a8" font-size="10" font-family="'SF Mono', 'Fira Code', monospace">nvidia0..N, nvidiactl, nvidia-uvm</text>
+  <text x="75" y="110" fill="#a0a0a8" font-size="10" font-family="'SF Mono', 'Fira Code', monospace">nvidia-caps/*, dri/card*, dri/renderD*</text>
+
+  <!-- /usr/lib/ libraries box -->
+  <rect x="365" y="80" width="275" height="36" rx="6" fill="#18181b" stroke="#2a2a2e" stroke-width="1"/>
+  <text x="375" y="95" fill="#a78bfa" font-size="10" font-weight="600" font-family="'SF Mono', 'Fira Code', monospace">/usr/lib/</text>
+  <text x="430" y="95" fill="#a0a0a8" font-size="10" font-family="'SF Mono', 'Fira Code', monospace">x86_64-linux-gnu/</text>
+  <text x="375" y="110" fill="#a0a0a8" font-size="10" font-family="'SF Mono', 'Fira Code', monospace">libcuda.so.*, libnvidia-ml.so.*</text>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- Bind-mount arrow                                   -->
+  <!-- ═══════════════════════════════════════════════════ -->
+  <line x1="200" y1="130" x2="200" y2="165" stroke="#a78bfa" stroke-width="2" stroke-dasharray="6,4" marker-end="url(#arrowDown)"/>
+  <line x1="500" y1="130" x2="500" y2="165" stroke="#a78bfa" stroke-width="2" stroke-dasharray="6,4" marker-end="url(#arrowDown)"/>
+
+  <text x="350" y="152" text-anchor="middle" fill="#a78bfa" font-size="10" font-weight="600">bind-mount devices + libraries</text>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- nspawn Container (bottom)                          -->
+  <!-- ═══════════════════════════════════════════════════ -->
+  <rect x="40" y="170" width="620" height="190" rx="10" fill="none" stroke="#a78bfa" stroke-width="1.5" stroke-opacity="0.5"/>
+  <text x="350" y="198" text-anchor="middle" fill="#e4e4e7" font-size="14" font-weight="700">nspawn Container</text>
+
+  <!-- Bind-mounted devices -->
+  <rect x="65" y="210" width="275" height="36" rx="6" fill="#18181b" stroke="#2a2a2e" stroke-width="1"/>
+  <text x="75" y="225" fill="#a78bfa" font-size="10" font-weight="600" font-family="'SF Mono', 'Fira Code', monospace">/dev/nvidia0..N</text>
+  <text x="75" y="240" fill="#a0a0a8" font-size="9">(bind-mounted from host)</text>
+
+  <!-- Bind-mounted libraries -->
+  <rect x="360" y="210" width="280" height="36" rx="6" fill="#18181b" stroke="#2a2a2e" stroke-width="1"/>
+  <text x="370" y="225" fill="#a78bfa" font-size="10" font-weight="600" font-family="'SF Mono', 'Fira Code', monospace">/run/host-nvidia/0/</text>
+  <text x="370" y="240" fill="#a0a0a8" font-size="9">libcuda.so.* (read-only bind-mount)</text>
+
+  <!-- Runtime components row -->
+  <rect x="65" y="260" width="180" height="30" rx="6" fill="#18181b" stroke="#a78bfa" stroke-width="1" stroke-opacity="0.4"/>
+  <text x="75" y="280" fill="#a0a0a8" font-size="10" font-family="'SF Mono', 'Fira Code', monospace">nvidia-ctk cdi generate</text>
+
+  <rect x="260" y="260" width="230" height="30" rx="6" fill="#18181b" stroke="#a78bfa" stroke-width="1" stroke-opacity="0.4"/>
+  <text x="270" y="280" fill="#a0a0a8" font-size="10" font-family="'SF Mono', 'Fira Code', monospace">containerd + nvidia-container-runtime</text>
+
+  <rect x="505" y="260" width="135" height="30" rx="6" fill="#18181b" stroke="#34d399" stroke-width="1" stroke-opacity="0.5"/>
+  <text x="572" y="280" text-anchor="middle" fill="#34d399" font-size="11" font-weight="600">kubelet</text>
+
+  <!-- CDI spec output -->
+  <rect x="65" y="305" width="220" height="24" rx="4" fill="#1e1e22" stroke="#2a2a2e" stroke-width="0.8"/>
+  <text x="75" y="322" fill="#a0a0a8" font-size="9" font-family="'SF Mono', 'Fira Code', monospace">-> /etc/cdi/nvidia.yaml</text>
+
+  <!-- Symlinks note -->
+  <rect x="360" y="305" width="280" height="24" rx="4" fill="#1e1e22" stroke="#2a2a2e" stroke-width="0.8"/>
+  <text x="370" y="322" fill="#a0a0a8" font-size="9" font-family="'SF Mono', 'Fira Code', monospace">libcuda.so.* -> /run/host-nvidia/ symlinks</text>
+</svg>

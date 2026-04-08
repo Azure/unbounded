@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 260" font-family="Inter, -apple-system, BlinkMacSystemFont, sans-serif">
+  <defs>
+    <marker id="arrowL" markerWidth="8" markerHeight="6" refX="0" refY="3" orient="auto">
+      <path d="M8,0 L0,3 L8,6" fill="none" stroke="#4d8eff" stroke-width="1.5"/>
+    </marker>
+    <marker id="arrowR" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6" fill="none" stroke="#4d8eff" stroke-width="1.5"/>
+    </marker>
+    <marker id="arrowBiL" markerWidth="8" markerHeight="6" refX="0" refY="3" orient="auto">
+      <path d="M8,0 L0,3 L8,6" fill="none" stroke="#34d399" stroke-width="1.5"/>
+    </marker>
+    <marker id="arrowBiR" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6" fill="none" stroke="#34d399" stroke-width="1.5"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="760" height="260" rx="12" fill="#111113"/>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- Left column: Referenced Resources                  -->
+  <!-- ═══════════════════════════════════════════════════ -->
+
+  <!-- Secret (machina-system) - SSH key -->
+  <rect x="30" y="22" width="220" height="36" rx="6" fill="#18181b" stroke="#a78bfa" stroke-width="1" stroke-opacity="0.6"/>
+  <!-- lock icon -->
+  <rect x="42" y="32" width="10" height="8" rx="1.5" fill="none" stroke="#a78bfa" stroke-width="0.9"/>
+  <path d="M44,32 L44,29 A3,3 0 0,1 50,29 L50,32" fill="none" stroke="#a78bfa" stroke-width="0.9"/>
+  <text x="60" y="45" fill="#e4e4e7" font-size="11" font-weight="600">Secret</text>
+  <text x="106" y="45" fill="#a0a0a8" font-size="10">(machina-system)</text>
+
+  <!-- Secret (machina-system) - Redfish password -->
+  <rect x="30" y="72" width="220" height="36" rx="6" fill="#18181b" stroke="#a78bfa" stroke-width="1" stroke-opacity="0.6"/>
+  <rect x="42" y="82" width="10" height="8" rx="1.5" fill="none" stroke="#a78bfa" stroke-width="0.9"/>
+  <path d="M44,82 L44,79 A3,3 0 0,1 50,79 L50,82" fill="none" stroke="#a78bfa" stroke-width="0.9"/>
+  <text x="60" y="95" fill="#e4e4e7" font-size="11" font-weight="600">Secret</text>
+  <text x="106" y="95" fill="#a0a0a8" font-size="10">(machina-system)</text>
+
+  <!-- Secret (kube-system) -->
+  <rect x="30" y="122" width="220" height="36" rx="6" fill="#18181b" stroke="#a78bfa" stroke-width="1" stroke-opacity="0.6"/>
+  <rect x="42" y="132" width="10" height="8" rx="1.5" fill="none" stroke="#a78bfa" stroke-width="0.9"/>
+  <path d="M44,132 L44,129 A3,3 0 0,1 50,129 L50,132" fill="none" stroke="#a78bfa" stroke-width="0.9"/>
+  <text x="60" y="145" fill="#e4e4e7" font-size="11" font-weight="600">Secret</text>
+  <text x="106" y="145" fill="#a0a0a8" font-size="10">(kube-system)</text>
+
+  <!-- OCI Image -->
+  <rect x="30" y="172" width="220" height="36" rx="6" fill="#18181b" stroke="#34d399" stroke-width="1" stroke-opacity="0.6"/>
+  <!-- container icon -->
+  <rect x="42" y="181" width="12" height="10" rx="2" fill="none" stroke="#34d399" stroke-width="0.9"/>
+  <line x1="42" y1="185" x2="54" y2="185" stroke="#34d399" stroke-width="0.6"/>
+  <line x1="48" y1="181" x2="48" y2="191" stroke="#34d399" stroke-width="0.6"/>
+  <text x="62" y="195" fill="#e4e4e7" font-size="11" font-weight="600">OCI Image</text>
+
+  <!-- Node -->
+  <rect x="30" y="222" width="220" height="36" rx="6" fill="#18181b" stroke="#34d399" stroke-width="1" stroke-opacity="0.6"/>
+  <text x="140" y="245" text-anchor="middle" fill="#e4e4e7" font-size="11" font-weight="600">Node</text>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- Right column: Machine spec fields                  -->
+  <!-- ═══════════════════════════════════════════════════ -->
+
+  <text x="460" y="45" fill="#a0a0a8" font-size="11" font-family="'SF Mono', 'Fira Code', monospace">Machine.spec.ssh.privateKeyRef</text>
+  <text x="460" y="95" fill="#a0a0a8" font-size="11" font-family="'SF Mono', 'Fira Code', monospace">Machine.spec.pxe.redfish.passwordRef</text>
+  <text x="460" y="145" fill="#a0a0a8" font-size="11" font-family="'SF Mono', 'Fira Code', monospace">Machine.spec.kubernetes.bootstrapTokenRef</text>
+  <text x="460" y="195" fill="#a0a0a8" font-size="11" font-family="'SF Mono', 'Fira Code', monospace">Machine.spec.pxe.image</text>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- Arrows: resource ◄── spec field                    -->
+  <!-- ═══════════════════════════════════════════════════ -->
+
+  <line x1="250" y1="40" x2="452" y2="40" stroke="#4d8eff" stroke-width="1.5" marker-start="url(#arrowL)"/>
+  <line x1="250" y1="90" x2="452" y2="90" stroke="#4d8eff" stroke-width="1.5" marker-start="url(#arrowL)"/>
+  <line x1="250" y1="140" x2="452" y2="140" stroke="#4d8eff" stroke-width="1.5" marker-start="url(#arrowL)"/>
+  <line x1="250" y1="190" x2="452" y2="190" stroke="#4d8eff" stroke-width="1.5" marker-start="url(#arrowL)"/>
+
+  <!-- Node ◄──► Machine (bidirectional, green) -->
+  <line x1="250" y1="240" x2="452" y2="240" stroke="#34d399" stroke-width="1.5" marker-start="url(#arrowBiL)" marker-end="url(#arrowBiR)"/>
+  <text x="460" y="237" fill="#e4e4e7" font-size="11" font-weight="600">Machine</text>
+  <text x="460" y="252" fill="#a0a0a8" font-size="10" font-family="'SF Mono', 'Fira Code', monospace">label: unbounded-kube.io/machine=&lt;name&gt;</text>
+</svg>

@@ -26,32 +26,7 @@ servers. These are gaps that Project Unbounded fills.
 worker nodes can run anywhere and join back to the cluster over encrypted
 tunnels. It supports four provisioning paths and a unified networking layer.
 
-```
-  +-----------------------------------------------+
-  |           Control-Plane Cluster               |
-  |  +---------+  +----------+  +-------------+   |
-  |  | machina |  | metalman |  |  Karpenter  |   |
-  |  +----+----+  +----+-----+  +------+------+   |
-  |       |            |               |          |
-  |          Machine CRDs                          |
-  +-------+------------+---------------+----------+
-          |            |               |
-    SSH   |    PXE     |   Cloud API   |
-  (TCP/22)|  (DHCP/    |  + cloud-init |
-          | TFTP/HTTP) |               |
-  +-------v----+  +----v-------+  +---v-----------------+
-  | Remote     |  | Bare-Metal |  | Cloud Instance      |
-  | Node       |  | Node       |  | (Nebius, CoreWeave, |
-  | (cloud/    |  |            |  |  OCI, Azure, AWS..) |
-  | edge)      |  |            |  |                     |
-  +------------+  +------------+  +---------------------+
-        ^               ^                    ^
-        |   WireGuard / direct L3            |
-        +-------------------+----------------+
-                            |
-                     Gateway Nodes
-                  (UDP/51820-51899)
-```
+![Project Unbounded overview: Control Plane connected to Bare Metal (PXE Boot), Public Cloud (cloud-init), and AI Infrastructure (SSH) sites via WireGuard and Direct L3 networking](../../img/unbounded-overview.svg)
 
 ## Components
 

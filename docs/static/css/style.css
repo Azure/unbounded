@@ -381,6 +381,14 @@ a:hover {
   border-radius: 0 4px 4px 0;
 }
 
+/* ── Content images ───────────────────────────────────────── */
+.content-single img {
+  max-width: 100%;
+  height: auto;
+  display: block;
+  margin: 1.5rem 0;
+}
+
 /* ── Code ─────────────────────────────────────────────────── */
 code {
   font-family: var(--font-mono);

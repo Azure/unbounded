@@ -14,29 +14,7 @@ central control plane. It adds:
 - **Two provisioning paths**: SSH-based (machina) and PXE-based (metalman).
 - **Cross-site networking** via WireGuard tunnels ([unbounded-net]({{< relref "concepts/networking" >}}), separate repo).
 
-```
-                  ┌─────────────────────────────────┐
-                  │      Control-Plane Cluster      │
-                  │  ┌─────────┐    ┌──────────┐    │
-                  │  │ machina │    │ metalman │    │
-                  │  └────┬────┘    └────┬─────┘    │
-                  │       │              │          │
-                  │   Machine CRDs                     │
-                  └───────┬──────────────┬──────────┘
-                          │              │
-             SSH (TCP/22) │              │ PXE (DHCP/TFTP/HTTP)
-                          │              │
-              ┌───────────▼──┐   ┌───────▼──────────┐
-              │  Remote Node │   │ Bare-Metal Node  │
-              │  (cloud/edge)│   │  (on-prem/edge)  │
-              └──────────────┘   └──────────────────┘
-                       ▲                  ▲
-                       │   WireGuard UDP  │
-                       └──────┬───────────┘
-                              │
-                       Gateway Nodes
-                    (UDP/51820-51899)
-```
+![Architecture overview: Control-Plane Cluster with machina and metalman controllers, provisioning Remote Nodes via SSH and Bare-Metal Nodes via PXE, connected through WireGuard Gateway Nodes](../../img/architecture-overview.svg)
 
 ## Components
 
@@ -134,13 +112,7 @@ serve time. A `metadata.yaml` provides image-level configuration (e.g.
 
 ### Resource relationships
 
-```
-Secret (machina-system)  ◄── Machine.spec.ssh.privateKeyRef
-Secret (machina-system)  ◄── Machine.spec.pxe.redfish.passwordRef
-Secret (kube-system)     ◄── Machine.spec.kubernetes.bootstrapTokenRef
-OCI Image                ◄── Machine.spec.pxe.image
-Node                     ◄──► Machine   (linked by label unbounded-kube.io/machine=<name>)
-```
+![Resource relationships: Secrets and OCI Images referenced by Machine spec fields, with bidirectional Node-Machine link via label](../../img/architecture-resource-relationships.svg)
 
 ## Network Architecture
 
@@ -157,45 +129,13 @@ WireGuard-based CNI plugin.
 - Clusters are created with `NetworkPlugin: None`; unbounded-cni replaces the
   default CNI.
 
-```
-  Remote Site                         Control-Plane Cluster
- ┌──────────────┐    WireGuard UDP   ┌──────────────────────┐
- │  Node + Pods ├───────────────────►│  Gateway Node (pub)  │
- └──────────────┘    51820-51899     │  ▲                   │
-                                     │  │ vxlan / routing   │
-                                     │  ▼                   │
-                                     │  Cluster Pods        │
-                                     └──────────────────────┘
-```
+![Network architecture: Remote Site node connects via WireGuard UDP tunnel to Gateway Node in Control-Plane Cluster, which routes to Cluster Pods via vxlan](../../img/architecture-network.svg)
 
 ## Provisioning Pipelines
 
 ### SSH Path (machina)
 
-```
-kubectl unbounded site add-machine
-        │
-        ▼
-   Machine CR created
-        │
-        ▼
-   machina reconciles ──► TCP probe ──► SSH connect ──► copy install script
-        │                                                      │
-        │                                                      ▼
-        │                                               execute script
-        │                                        (API_SERVER, BOOTSTRAP_TOKEN,
-        │                                         CA_CERT_BASE64, KUBE_VERSION)
-        │                                                      │
-        │                                                      ▼
-        │                                           kubelet joins cluster
-        │                                                      │
-        ▼                                                      │
-   Node appears with label ◄───────────────────────────────────┘
-   unbounded-kube.io/machine=<name>
-        │
-        ▼
-   Machine phase → Ready
-```
+![SSH provisioning pipeline: kubectl add-machine creates Machine CR, machina reconciles with TCP probe, SSH connect, script execution, kubelet joins, Node appears, Machine becomes Ready](../../img/architecture-ssh-provisioning.svg)
 
 Requeue intervals: Pending 30s, Failed 60s, Joining 30s, Ready 5m.
 

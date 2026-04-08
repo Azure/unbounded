@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 440 380" font-family="Inter, -apple-system, BlinkMacSystemFont, sans-serif">
+  <!-- Background -->
+  <rect width="440" height="380" rx="12" fill="#111113"/>
+
+  <!-- Title -->
+  <text x="220" y="28" text-anchor="middle" fill="#e4e4e7" font-size="14" font-weight="700">Netboot OCI Image Layout</text>
+
+  <!-- Root directory -->
+  <rect x="30" y="45" width="380" height="320" rx="8" fill="none" stroke="#2a2a2e" stroke-width="1.5"/>
+
+  <!-- /disk/ label -->
+  <rect x="50" y="55" width="60" height="22" rx="4" fill="#18181b" stroke="#a78bfa" stroke-width="1" stroke-opacity="0.5"/>
+  <text x="80" y="70" text-anchor="middle" fill="#a78bfa" font-size="12" font-weight="700" font-family="'SF Mono', 'Fira Code', monospace">/disk/</text>
+
+  <!-- File entries (monospace, tree-style) -->
+  <!-- shimx64.efi -->
+  <text x="70" y="102" fill="#e4e4e7" font-size="11" font-family="'SF Mono', 'Fira Code', monospace">shimx64.efi</text>
+  <text x="230" y="102" fill="#a0a0a8" font-size="10">UEFI bootloader (TFTP + HTTP)</text>
+
+  <!-- grubx64.efi -->
+  <text x="70" y="124" fill="#e4e4e7" font-size="11" font-family="'SF Mono', 'Fira Code', monospace">grubx64.efi</text>
+  <text x="230" y="124" fill="#a0a0a8" font-size="10">GRUB bootloader</text>
+
+  <!-- vmlinuz -->
+  <text x="70" y="146" fill="#e4e4e7" font-size="11" font-family="'SF Mono', 'Fira Code', monospace">vmlinuz</text>
+  <text x="230" y="146" fill="#a0a0a8" font-size="10">Linux kernel</text>
+
+  <!-- initrd -->
+  <text x="70" y="168" fill="#e4e4e7" font-size="11" font-family="'SF Mono', 'Fira Code', monospace">initrd</text>
+  <text x="230" y="168" fill="#a0a0a8" font-size="10">Initramfs</text>
+
+  <!-- init.cpio -->
+  <text x="70" y="190" fill="#e4e4e7" font-size="11" font-family="'SF Mono', 'Fira Code', monospace">init.cpio</text>
+  <text x="230" y="190" fill="#a0a0a8" font-size="10">Custom init overlay</text>
+
+  <!-- unbounded-agent -->
+  <text x="70" y="212" fill="#34d399" font-size="11" font-weight="600" font-family="'SF Mono', 'Fira Code', monospace">unbounded-agent</text>
+  <text x="230" y="212" fill="#a0a0a8" font-size="10">Agent binary</text>
+
+  <!-- metadata.yaml -->
+  <text x="70" y="234" fill="#e4e4e7" font-size="11" font-family="'SF Mono', 'Fira Code', monospace">metadata.yaml</text>
+  <text x="230" y="234" fill="#a0a0a8" font-size="10">Image config</text>
+
+  <!-- Separator line -->
+  <line x1="55" y1="248" x2="395" y2="248" stroke="#2a2a2e" stroke-width="0.5"/>
+
+  <!-- grub/ directory -->
+  <rect x="60" y="258" width="50" height="18" rx="3" fill="#1e1e22" stroke="#2a2a2e" stroke-width="0.8"/>
+  <text x="85" y="271" text-anchor="middle" fill="#4d8eff" font-size="10" font-weight="600" font-family="'SF Mono', 'Fira Code', monospace">grub/</text>
+
+  <text x="95" y="292" fill="#e4e4e7" font-size="11" font-family="'SF Mono', 'Fira Code', monospace">grub.cfg.tmpl</text>
+  <text x="250" y="292" fill="#a0a0a8" font-size="10">GRUB config template</text>
+
+  <!-- Separator line -->
+  <line x1="55" y1="304" x2="395" y2="304" stroke="#2a2a2e" stroke-width="0.5"/>
+
+  <!-- cloud-init/ directory -->
+  <rect x="60" y="314" width="90" height="18" rx="3" fill="#1e1e22" stroke="#2a2a2e" stroke-width="0.8"/>
+  <text x="105" y="327" text-anchor="middle" fill="#4d8eff" font-size="10" font-weight="600" font-family="'SF Mono', 'Fira Code', monospace">cloud-init/</text>
+
+  <text x="95" y="348" fill="#e4e4e7" font-size="11" font-family="'SF Mono', 'Fira Code', monospace">user-data.tmpl</text>
+
+  <text x="260" y="348" fill="#e4e4e7" font-size="11" font-family="'SF Mono', 'Fira Code', monospace">meta-data.tmpl</text>
+
+  <text x="95" y="366" fill="#e4e4e7" font-size="11" font-family="'SF Mono', 'Fira Code', monospace">vendor-data.tmpl</text>
+
+  <!-- .tmpl badge -->
+  <rect x="310" y="310" width="80" height="18" rx="3" fill="#1e1e22" stroke="#a78bfa" stroke-width="0.8" stroke-opacity="0.5"/>
+  <text x="350" y="323" text-anchor="middle" fill="#a78bfa" font-size="8" font-weight="600">.tmpl = Go tpl</text>
+</svg>
