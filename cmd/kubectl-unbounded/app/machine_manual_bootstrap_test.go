@@ -316,6 +316,17 @@ func TestManualBootstrapHandler_RenderScript(t *testing.T) {
 	require.NoError(t, json.Unmarshal(jsonData, &parsed))
 	require.Equal(t, "test-node", parsed.MachineName)
 	require.Equal(t, "https://api-server:6443", parsed.Kubelet.ApiServer)
+
+	// Should contain the uninstall script written to disk.
+	require.Contains(t, script, "/usr/local/bin/unbounded-agent-uninstall.sh")
+	require.Contains(t, script, "UNINSTALL_SCRIPT_EOF")
+	require.Contains(t, script, "chmod +x /usr/local/bin/unbounded-agent-uninstall.sh")
+
+	// The uninstall script should have the machine name baked in.
+	require.Contains(t, script, `MACHINE_NAME="test-node"`)
+
+	// The uninstall script must not contain the placeholder.
+	require.NotContains(t, script, "UNBOUNDED_MACHINE_NAME_PLACEHOLDER")
 }
 
 func TestManualBootstrapHandler_RenderCloudInit(t *testing.T) {
@@ -366,6 +377,11 @@ func TestManualBootstrapHandler_RenderCloudInit(t *testing.T) {
 
 		// AGENT_OCI_IMAGE env var should not be present (OCI image is in the JSON config).
 		require.NotContains(t, output, "AGENT_OCI_IMAGE")
+
+		// Must contain the uninstall script.
+		require.Contains(t, output, "/usr/local/bin/unbounded-agent-uninstall.sh")
+		require.Contains(t, output, `MACHINE_NAME="test-node"`)
+		require.NotContains(t, output, "UNBOUNDED_MACHINE_NAME_PLACEHOLDER")
 	})
 
 	t.Run("with OCI image", func(t *testing.T) {
