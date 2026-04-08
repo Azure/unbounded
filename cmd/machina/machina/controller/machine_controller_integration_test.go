@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
@@ -93,12 +92,12 @@ func TestIntegration_PendingToReady_NoKubernetes(t *testing.T) {
 	result, m := reconcileHelper(t, reconciler, "m1")
 	require.Equal(t, unboundedv1alpha3.MachinePhaseReady, m.Status.Phase)
 	require.Equal(t, "Machine is reachable", m.Status.Message)
-	require.Equal(t, time.Duration(0), result.RequeueAfter)
+	require.Equal(t, RequeueAfterReady, result.RequeueAfter)
 
 	// Reconcile 2: Still reachable, still no kubernetes config -> stays Ready.
 	result, m = reconcileHelper(t, reconciler, "m1")
 	require.Equal(t, unboundedv1alpha3.MachinePhaseReady, m.Status.Phase)
-	require.Equal(t, time.Duration(0), result.RequeueAfter)
+	require.Equal(t, RequeueAfterReady, result.RequeueAfter)
 }
 
 // ---------------------------------------------------------------------------
@@ -159,7 +158,7 @@ func TestIntegration_FullProvisioningLifecycle(t *testing.T) {
 	require.True(t, provisioner.called, "provisioner should have been called")
 	require.Equal(t, unboundedv1alpha3.MachinePhaseJoining, m.Status.Phase)
 	require.Contains(t, m.Status.Message, "provisioned successfully")
-	require.Equal(t, time.Duration(0), result.RequeueAfter)
+	require.Equal(t, RequeueAfterJoining, result.RequeueAfter)
 
 	// Verify Provisioned condition is True.
 	require.NotEmpty(t, m.Status.Conditions)
@@ -182,7 +181,7 @@ func TestIntegration_FullProvisioningLifecycle(t *testing.T) {
 	result, m = reconcileHelper(t, reconciler, "m1")
 	require.False(t, provisioner.called, "should not re-provision while in Joining phase")
 	require.Equal(t, unboundedv1alpha3.MachinePhaseJoining, m.Status.Phase)
-	require.Equal(t, time.Duration(0), result.RequeueAfter)
+	require.Equal(t, RequeueAfterJoining, result.RequeueAfter)
 }
 
 // ---------------------------------------------------------------------------
@@ -223,7 +222,7 @@ func TestIntegration_UnreachableThenReachable(t *testing.T) {
 	result, m := reconcileHelper(t, reconciler, "m1")
 	require.Equal(t, unboundedv1alpha3.MachinePhasePending, m.Status.Phase)
 	require.Contains(t, m.Status.Message, "not reachable")
-	require.Equal(t, time.Duration(0), result.RequeueAfter)
+	require.Equal(t, RequeueAfterPending, result.RequeueAfter)
 
 	// Reconcile 2: Still unreachable -> still Pending.
 	result, m = reconcileHelper(t, reconciler, "m1")
@@ -235,7 +234,7 @@ func TestIntegration_UnreachableThenReachable(t *testing.T) {
 	// Reconcile 3: Now reachable, no kubernetes config -> Ready.
 	result, m = reconcileHelper(t, reconciler, "m1")
 	require.Equal(t, unboundedv1alpha3.MachinePhaseReady, m.Status.Phase)
-	require.Equal(t, time.Duration(0), result.RequeueAfter)
+	require.Equal(t, RequeueAfterReady, result.RequeueAfter)
 }
 
 // ---------------------------------------------------------------------------
@@ -303,14 +302,14 @@ func TestIntegration_JoiningStaysJoiningWithoutNode(t *testing.T) {
 	result, m := reconcileHelper(t, reconciler, "m1")
 	require.False(t, provisioner.called, "should not re-provision while in Joining phase")
 	require.Equal(t, unboundedv1alpha3.MachinePhaseJoining, m.Status.Phase)
-	require.Equal(t, time.Duration(0), result.RequeueAfter)
+	require.Equal(t, RequeueAfterJoining, result.RequeueAfter)
 
 	// Reconcile 3: Still Joining, still goes through Node join check.
 	provisioner.called = false
 	result, m = reconcileHelper(t, reconciler, "m1")
 	require.False(t, provisioner.called)
 	require.Equal(t, unboundedv1alpha3.MachinePhaseJoining, m.Status.Phase)
-	require.Equal(t, time.Duration(0), result.RequeueAfter)
+	require.Equal(t, RequeueAfterJoining, result.RequeueAfter)
 }
 
 // ---------------------------------------------------------------------------
@@ -370,7 +369,7 @@ func TestIntegration_ProvisioningFailureThenRetry(t *testing.T) {
 	result, m := reconcileHelper(t, reconciler, "m1")
 	require.Equal(t, unboundedv1alpha3.MachinePhaseFailed, m.Status.Phase)
 	require.Contains(t, m.Status.Message, "Provisioning failed")
-	require.Equal(t, time.Duration(0), result.RequeueAfter)
+	require.Equal(t, RequeueAfterFailed, result.RequeueAfter)
 	require.True(t, provisioner.called)
 
 	// Verify SSHReachable condition is True (machine was reachable).
@@ -394,7 +393,7 @@ func TestIntegration_ProvisioningFailureThenRetry(t *testing.T) {
 	result, m = reconcileHelper(t, reconciler, "m1")
 	require.True(t, provisioner.called, "provisioner should be called on retry from Failed")
 	require.Equal(t, unboundedv1alpha3.MachinePhaseJoining, m.Status.Phase)
-	require.Equal(t, time.Duration(0), result.RequeueAfter)
+	require.Equal(t, RequeueAfterJoining, result.RequeueAfter)
 }
 
 // ---------------------------------------------------------------------------
@@ -529,7 +528,7 @@ func TestIntegration_JoiningMachineBecomesUnreachable(t *testing.T) {
 	result, m := reconcileHelper(t, reconciler, "m1")
 	require.Equal(t, unboundedv1alpha3.MachinePhasePending, m.Status.Phase)
 	require.Contains(t, m.Status.Message, "not reachable")
-	require.Equal(t, time.Duration(0), result.RequeueAfter)
+	require.Equal(t, RequeueAfterPending, result.RequeueAfter)
 
 	// Machine comes back.
 	checker.err = nil
@@ -694,7 +693,7 @@ func TestIntegration_ProvisioningPhaseBlocksReProvision(t *testing.T) {
 	// condition -> treated as stale, transitions to Failed.
 	result, _ := reconcileHelper(t, reconciler, "m1")
 	require.False(t, provisioner.called, "should not re-provision while Provisioning")
-	require.Equal(t, time.Duration(0), result.RequeueAfter)
+	require.Equal(t, RequeueAfterFailed, result.RequeueAfter)
 
 	var updated unboundedv1alpha3.Machine
 
@@ -929,7 +928,7 @@ func TestIntegration_BootstrapTokenMissing(t *testing.T) {
 	require.Equal(t, unboundedv1alpha3.MachinePhaseFailed, m.Status.Phase)
 	require.Contains(t, m.Status.Message, "bootstrap token")
 	require.False(t, provisioner.called, "provisioner should not be called when token is missing")
-	require.Equal(t, time.Duration(0), result.RequeueAfter)
+	require.Equal(t, RequeueAfterFailed, result.RequeueAfter)
 }
 
 // ---------------------------------------------------------------------------
@@ -991,14 +990,14 @@ func TestIntegration_JoiningToReadyToJoining(t *testing.T) {
 	result, m := reconcileHelper(t, reconciler, "m1")
 	require.True(t, provisioner.called)
 	require.Equal(t, unboundedv1alpha3.MachinePhaseJoining, m.Status.Phase)
-	require.Equal(t, time.Duration(0), result.RequeueAfter)
+	require.Equal(t, RequeueAfterJoining, result.RequeueAfter)
 
 	// Reconcile 2: Joining, no Node -> stays Joining.
 	provisioner.called = false
 	result, m = reconcileHelper(t, reconciler, "m1")
 	require.False(t, provisioner.called)
 	require.Equal(t, unboundedv1alpha3.MachinePhaseJoining, m.Status.Phase)
-	require.Equal(t, time.Duration(0), result.RequeueAfter)
+	require.Equal(t, RequeueAfterJoining, result.RequeueAfter)
 
 	// Create a Node with matching label.
 	node := &corev1.Node{
@@ -1014,12 +1013,12 @@ func TestIntegration_JoiningToReadyToJoining(t *testing.T) {
 	require.Equal(t, unboundedv1alpha3.MachinePhaseReady, m.Status.Phase)
 	require.NotNil(t, m.Spec.Kubernetes.NodeRef)
 	require.Equal(t, "node-1", m.Spec.Kubernetes.NodeRef.Name)
-	require.Equal(t, time.Duration(0), result.RequeueAfter)
+	require.Equal(t, RequeueAfterReady, result.RequeueAfter)
 
 	// Reconcile 4: Ready + Node still exists -> stays Ready.
 	result, m = reconcileHelper(t, reconciler, "m1")
 	require.Equal(t, unboundedv1alpha3.MachinePhaseReady, m.Status.Phase)
-	require.Equal(t, time.Duration(0), result.RequeueAfter)
+	require.Equal(t, RequeueAfterReady, result.RequeueAfter)
 
 	// Delete the Node.
 	require.NoError(t, fakeClient.Delete(ctx, node))
@@ -1027,7 +1026,7 @@ func TestIntegration_JoiningToReadyToJoining(t *testing.T) {
 	// Reconcile 5: Ready + Node gone -> Joining (waiting for Node to rejoin).
 	result, m = reconcileHelper(t, reconciler, "m1")
 	require.Equal(t, unboundedv1alpha3.MachinePhaseJoining, m.Status.Phase)
-	require.Equal(t, time.Duration(0), result.RequeueAfter)
+	require.Equal(t, RequeueAfterJoining, result.RequeueAfter)
 
 	// Recreate the Node.
 	node = &corev1.Node{
@@ -1043,7 +1042,7 @@ func TestIntegration_JoiningToReadyToJoining(t *testing.T) {
 	require.Equal(t, unboundedv1alpha3.MachinePhaseReady, m.Status.Phase)
 	require.NotNil(t, m.Spec.Kubernetes.NodeRef)
 	require.Equal(t, "node-1", m.Spec.Kubernetes.NodeRef.Name)
-	require.Equal(t, time.Duration(0), result.RequeueAfter)
+	require.Equal(t, RequeueAfterReady, result.RequeueAfter)
 }
 
 // ---------------------------------------------------------------------------
@@ -1124,7 +1123,7 @@ func TestIntegration_ReadyMachineBecomesUnreachable(t *testing.T) {
 	result, m := reconcileHelper(t, reconciler, "m1")
 	require.Equal(t, unboundedv1alpha3.MachinePhasePending, m.Status.Phase)
 	require.Contains(t, m.Status.Message, "not reachable")
-	require.Equal(t, time.Duration(0), result.RequeueAfter)
+	require.Equal(t, RequeueAfterPending, result.RequeueAfter)
 }
 
 // ---------------------------------------------------------------------------
@@ -1162,129 +1161,4 @@ func TestIntegration_MachineWithoutSSHIsSkipped(t *testing.T) {
 	var updated unboundedv1alpha3.Machine
 	require.NoError(t, fakeClient.Get(context.Background(), client.ObjectKey{Name: "m1"}, &updated))
 	require.Empty(t, updated.Status.Phase)
-}
-
-// ---------------------------------------------------------------------------
-// Metalman guard: Rebooting phase causes machina to back off
-// ---------------------------------------------------------------------------
-
-func TestIntegration_RebootingPhaseBacksOff(t *testing.T) {
-	t.Parallel()
-
-	s := newIntegrationScheme(t)
-
-	machine := &unboundedv1alpha3.Machine{
-		ObjectMeta: metav1.ObjectMeta{Name: "m1"},
-		Spec: unboundedv1alpha3.MachineSpec{
-			SSH: &unboundedv1alpha3.SSHSpec{
-				Host:          "10.0.0.1:22",
-				PrivateKeyRef: unboundedv1alpha3.SecretKeySelector{Name: "key"},
-			},
-			Kubernetes: &unboundedv1alpha3.KubernetesSpec{
-				Version:           "v1.34.0",
-				BootstrapTokenRef: unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-abc123"},
-			},
-		},
-	}
-
-	fakeClient := fake.NewClientBuilder().
-		WithScheme(s).
-		WithObjects(machine).
-		WithStatusSubresource(&unboundedv1alpha3.Machine{}).
-		Build()
-
-	// Set the initial status (fake client strips status on create).
-	machine.Status.Phase = unboundedv1alpha3.MachinePhaseRebooting
-	machine.Status.Message = "Rebooting"
-	require.NoError(t, fakeClient.Status().Update(context.Background(), machine))
-
-	checker := &mockReachabilityChecker{}
-	provisioner := &mockProvisioner{}
-
-	reconciler := &MachineReconciler{
-		Client:              fakeClient,
-		Scheme:              s,
-		ReachabilityChecker: checker,
-		Provisioner:         provisioner,
-	}
-
-	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{
-		NamespacedName: types.NamespacedName{Name: "m1"},
-	})
-	require.NoError(t, err)
-	require.Equal(t, ctrl.Result{}, result)
-
-	// Verify machina did not provision or change the phase.
-	require.False(t, provisioner.called, "provisioner should not be called during Rebooting phase")
-
-	var updated unboundedv1alpha3.Machine
-	require.NoError(t, fakeClient.Get(context.Background(), client.ObjectKey{Name: "m1"}, &updated))
-	require.Equal(t, unboundedv1alpha3.MachinePhaseRebooting, updated.Status.Phase)
-}
-
-// ---------------------------------------------------------------------------
-// Metalman guard: Reimaged=False condition causes machina to back off
-// ---------------------------------------------------------------------------
-
-func TestIntegration_ReimageInProgressBacksOff(t *testing.T) {
-	t.Parallel()
-
-	s := newIntegrationScheme(t)
-
-	machine := &unboundedv1alpha3.Machine{
-		ObjectMeta: metav1.ObjectMeta{Name: "m1"},
-		Spec: unboundedv1alpha3.MachineSpec{
-			SSH: &unboundedv1alpha3.SSHSpec{
-				Host:          "10.0.0.1:22",
-				PrivateKeyRef: unboundedv1alpha3.SecretKeySelector{Name: "key"},
-			},
-			Kubernetes: &unboundedv1alpha3.KubernetesSpec{
-				Version:           "v1.34.0",
-				BootstrapTokenRef: unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-abc123"},
-			},
-		},
-	}
-
-	fakeClient := fake.NewClientBuilder().
-		WithScheme(s).
-		WithObjects(machine).
-		WithStatusSubresource(&unboundedv1alpha3.Machine{}).
-		Build()
-
-	// Set the initial status (fake client strips status on create).
-	machine.Status.Phase = unboundedv1alpha3.MachinePhaseProvisioning
-	machine.Status.Message = "PXE booting into new image"
-	machine.Status.Conditions = []metav1.Condition{
-		{
-			Type:               unboundedv1alpha3.MachineConditionReimaged,
-			Status:             metav1.ConditionFalse,
-			Reason:             "Pending",
-			LastTransitionTime: metav1.Now(),
-		},
-	}
-	require.NoError(t, fakeClient.Status().Update(context.Background(), machine))
-
-	checker := &mockReachabilityChecker{}
-	provisioner := &mockProvisioner{}
-
-	reconciler := &MachineReconciler{
-		Client:              fakeClient,
-		Scheme:              s,
-		ReachabilityChecker: checker,
-		Provisioner:         provisioner,
-	}
-
-	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{
-		NamespacedName: types.NamespacedName{Name: "m1"},
-	})
-	require.NoError(t, err)
-	require.Equal(t, ctrl.Result{}, result)
-
-	// Verify machina did not provision or change the phase.
-	require.False(t, provisioner.called, "provisioner should not be called during PXE reimage")
-
-	var updated unboundedv1alpha3.Machine
-	require.NoError(t, fakeClient.Get(context.Background(), client.ObjectKey{Name: "m1"}, &updated))
-	require.Equal(t, unboundedv1alpha3.MachinePhaseProvisioning, updated.Status.Phase)
-	require.Equal(t, "PXE booting into new image", updated.Status.Message)
 }

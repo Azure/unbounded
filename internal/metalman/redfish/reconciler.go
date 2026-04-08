@@ -21,7 +21,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	v1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
-	"github.com/Azure/unbounded-kube/internal/metalman/phase"
 )
 
 const (
@@ -109,8 +108,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		machine.Status.Redfish.CertFingerprint = fp
 		log.Info("TOFU: captured TLS cert fingerprint", "fingerprint", fp)
 
-		phase.Set(&machine)
-
 		return ctrl.Result{}, r.Client.Status().Update(ctx, &machine)
 	}
 
@@ -162,8 +159,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 					Reason:             reasonNotSupported,
 					ObservedGeneration: machine.Generation,
 				})
-
-				phase.Set(&machine)
 
 				return ctrl.Result{}, r.Client.Status().Update(ctx, &machine)
 			}
@@ -231,8 +226,6 @@ func (r *Reconciler) reconcilePowerOff(ctx context.Context, log *slog.Logger, ma
 			ObservedGeneration: machine.Generation,
 		})
 
-		phase.Set(machine)
-
 		return ctrl.Result{}, r.Client.Status().Update(ctx, machine)
 	}
 
@@ -262,8 +255,6 @@ func (r *Reconciler) reconcilePowerOff(ctx context.Context, log *slog.Logger, ma
 		ObservedGeneration: machine.Generation,
 	})
 
-	phase.Set(machine)
-
 	return ctrl.Result{}, r.Client.Status().Update(ctx, machine)
 }
 
@@ -291,8 +282,6 @@ func (r *Reconciler) reconcilePowerOn(ctx context.Context, log *slog.Logger, mac
 		}
 
 		machine.Status.Operations.RebootCounter = machine.Spec.Operations.RebootCounter
-
-		phase.Set(machine)
 
 		return ctrl.Result{}, r.Client.Status().Update(ctx, machine)
 	}
@@ -322,8 +311,6 @@ func (r *Reconciler) reconcilePowerOn(ctx context.Context, log *slog.Logger, mac
 		Message:            fmt.Sprintf("target reboots: %d", machine.Spec.Operations.RebootCounter),
 		ObservedGeneration: machine.Generation,
 	})
-
-	phase.Set(machine)
 
 	return ctrl.Result{}, r.Client.Status().Update(ctx, machine)
 }
