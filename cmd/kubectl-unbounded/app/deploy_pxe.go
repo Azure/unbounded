@@ -81,7 +81,7 @@ func buildPXEDeployment(p deployPXEParams) *acappsv1.DeploymentApplyConfiguratio
 						WithName("metalman").
 						WithImage(p.Image).
 						WithImagePullPolicy(corev1.PullAlways).
-						WithArgs("serve-pxe", "--site="+p.Site).
+						WithArgs("serve-pxe", "--site="+p.Site, "--dhcp-auto-interface").
 						WithPorts(
 							accorev1.ContainerPort().
 								WithContainerPort(8880).
