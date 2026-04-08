@@ -8,16 +8,20 @@ and at the edge, without being limited by the location of your control plane.
 
 unbounded-kube is organized into several directories:
 
+- `api/` - where API definitions for custom resources are located.
 - `bin/` - where generated binary artifacts should be placed.
 - `cmd/` - where the sources for each binary artifact are located. Each subdirectory corresponds to a binary artifact.
   - `agent` - sources for the unbounded-agent.
-  - `kubectl-plugin` - sources for the `kubectl unbounded` plugin.
+  - `inventory` - sources for the inventory controller.
+  - `kubectl-unbounded` - sources for the `kubectl unbounded` plugin.
   - `machina` - sources for the machina controller.
+  - `metalman` - sources for the metalman controller.
 - `deploy/` - component manifests for deploying on a Kubernetes cluster.
 - `docs/` - documentation for the project.
 - `hack/` - where development tools and scripts are located.
   - `cmd/` - development tools that are built as Go binaries.
   - `scratch/` - scratch space for quick go experiments.
+- `images/` - where OCI image definitions and related assets for building container images are located.
 - `internal/` - where shared but internal to this project packages are located.
 - `tmp/` - project local temporary directory for intermediate stuff that will be cleaned up quickly.
 
@@ -43,6 +47,7 @@ unbounded-kube is organized into several directories:
     - Large cross-package refactors.
     - New dependencies with broad impact.
     - Destructive data or migration changes.
+    - Removal of _test.go or Test* functions or subtests.
 - **Never**
     - Commit secrets, credentials, or tokens.
     - Edit generated files by hand when a generation workflow exists.
