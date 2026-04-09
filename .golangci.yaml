@@ -7,6 +7,8 @@ run:
   # With default 1m timeout CI sometimes fails.
   timeout: 5m
 linters:
+  enable:
+    - goheader
   disable:
     # Unlikely to ever Enable
     # =======================
@@ -18,6 +20,10 @@ linters:
     # We use replace directives extensively for well-understood reasons.
     - gomoddirectives
   settings:
+    goheader:
+      template: |-
+        Copyright (c) Microsoft Corporation.
+        Licensed under the MIT License.
     errcheck:
       # Treat type assertion as erroneous operation, though assertions should be avoided in general.
       check-type-assertions: true
