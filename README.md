@@ -53,7 +53,7 @@ kubectl unbounded site init \
 | `--ssh-private-key`   | The path to the SSH private key to use when connecting to the machine over SSH. This key should have access to the machine specified in `--host`.            |
 
 ```bash
-kubectl unbounded machine create \
+kubectl unbounded machine register \
   --site hello-unbounded \
   --name node0 \
   --host <ip>[:port] \

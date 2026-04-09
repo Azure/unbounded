@@ -137,7 +137,7 @@ The flow varies by provisioning path, but all paths share the same final steps:
 1. **`kubectl unbounded site init`** prepares the cluster: installs
    unbounded-net, creates Site and GatewayPool resources, generates a bootstrap
    token, and deploys the machina controller.
-2. **`kubectl unbounded machine create`** creates a `Machine` resource with
+2. **`kubectl unbounded machine register`** creates a `Machine` resource with
    SSH connection details.
 3. **machina** SSHs into the host, runs the install script, and waits for the
    node to register.

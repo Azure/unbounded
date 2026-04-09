@@ -48,129 +48,129 @@ func writeTempKubeconfig(t *testing.T) string {
 // setDefaults() tests
 // ---------------------------------------------------------------------------
 
-func TestMachineCreateHandler_SetDefaults(t *testing.T) {
+func TestMachineRegisterHandler_SetDefaults(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
 		name   string
-		before machineCreateHandler
-		check  func(t *testing.T, h *machineCreateHandler)
+		before machineRegisterHandler
+		check  func(t *testing.T, h *machineRegisterHandler)
 	}{
 		{
 			name: "name derived from host IP",
-			before: machineCreateHandler{
+			before: machineRegisterHandler{
 				siteName: "dc1",
 				host:     "10.0.0.5",
 			},
-			check: func(t *testing.T, h *machineCreateHandler) {
+			check: func(t *testing.T, h *machineRegisterHandler) {
 				require.Equal(t, "dc1-10.0.0.5", h.name)
 			},
 		},
 		{
 			name: "name derived from host IP:port",
-			before: machineCreateHandler{
+			before: machineRegisterHandler{
 				siteName: "dc1",
 				host:     "10.0.0.5:2222",
 			},
-			check: func(t *testing.T, h *machineCreateHandler) {
+			check: func(t *testing.T, h *machineRegisterHandler) {
 				require.Equal(t, "dc1-10.0.0.5-2222", h.name)
 			},
 		},
 		{
 			name: "name derived from hostname",
-			before: machineCreateHandler{
+			before: machineRegisterHandler{
 				siteName: "dc1",
 				host:     "my-server.example.com",
 			},
-			check: func(t *testing.T, h *machineCreateHandler) {
+			check: func(t *testing.T, h *machineRegisterHandler) {
 				require.Equal(t, "dc1-my-server.example.com", h.name)
 			},
 		},
 		{
 			name: "name derived from hostname with special chars",
-			before: machineCreateHandler{
+			before: machineRegisterHandler{
 				siteName: "dc1",
 				host:     "My_Server:2222",
 			},
-			check: func(t *testing.T, h *machineCreateHandler) {
+			check: func(t *testing.T, h *machineRegisterHandler) {
 				require.Equal(t, "dc1-my-server-2222", h.name)
 			},
 		},
 		{
 			name: "explicit name gets site prefix",
-			before: machineCreateHandler{
+			before: machineRegisterHandler{
 				siteName: "dc1",
 				name:     "worker-1",
 				host:     "10.0.0.5",
 			},
-			check: func(t *testing.T, h *machineCreateHandler) {
+			check: func(t *testing.T, h *machineRegisterHandler) {
 				require.Equal(t, "dc1-worker-1", h.name)
 			},
 		},
 		{
 			name: "ssh secret name defaults to ssh-site",
-			before: machineCreateHandler{
+			before: machineRegisterHandler{
 				siteName: "dc1",
 				host:     "10.0.0.5",
 			},
-			check: func(t *testing.T, h *machineCreateHandler) {
+			check: func(t *testing.T, h *machineRegisterHandler) {
 				require.Equal(t, "ssh-dc1", h.sshSecretName)
 			},
 		},
 		{
 			name: "ssh secret name preserved when explicit",
-			before: machineCreateHandler{
+			before: machineRegisterHandler{
 				siteName:      "dc1",
 				host:          "10.0.0.5",
 				sshSecretName: "my-custom-secret",
 			},
-			check: func(t *testing.T, h *machineCreateHandler) {
+			check: func(t *testing.T, h *machineRegisterHandler) {
 				require.Equal(t, "my-custom-secret", h.sshSecretName)
 			},
 		},
 		{
 			name: "bastion username defaults to host ssh username",
-			before: machineCreateHandler{
+			before: machineRegisterHandler{
 				siteName:        "dc1",
 				host:            "10.0.0.5",
 				hostSSHUsername: "admin",
 				bastionHost:     "5.6.7.8",
 			},
-			check: func(t *testing.T, h *machineCreateHandler) {
+			check: func(t *testing.T, h *machineRegisterHandler) {
 				require.Equal(t, "admin", h.bastionSSHUsername)
 			},
 		},
 		{
 			name: "bastion ssh private key defaults to host ssh private key",
-			before: machineCreateHandler{
+			before: machineRegisterHandler{
 				siteName:          "dc1",
 				host:              "10.0.0.5",
 				hostSSHPrivateKey: "/path/to/key",
 				bastionHost:       "5.6.7.8",
 			},
-			check: func(t *testing.T, h *machineCreateHandler) {
+			check: func(t *testing.T, h *machineRegisterHandler) {
 				require.Equal(t, "/path/to/key", h.bastionSSHPrivateKey)
 			},
 		},
 		{
 			name: "bastion secret name defaults to ssh secret name",
-			before: machineCreateHandler{
+			before: machineRegisterHandler{
 				siteName:    "dc1",
 				host:        "10.0.0.5",
 				bastionHost: "5.6.7.8",
 			},
-			check: func(t *testing.T, h *machineCreateHandler) {
+			check: func(t *testing.T, h *machineRegisterHandler) {
 				require.Equal(t, "ssh-dc1", h.bastionSSHSecretName)
 			},
 		},
 		{
 			name: "no bastion defaults when no bastion host",
-			before: machineCreateHandler{
+			before: machineRegisterHandler{
 				siteName:        "dc1",
 				host:            "10.0.0.5",
 				hostSSHUsername: "admin",
 			},
-			check: func(t *testing.T, h *machineCreateHandler) {
+			check: func(t *testing.T, h *machineRegisterHandler) {
 				require.Empty(t, h.bastionSSHUsername)
 				require.Empty(t, h.bastionSSHPrivateKey)
 				require.Empty(t, h.bastionSSHSecretName)
@@ -178,7 +178,7 @@ func TestMachineCreateHandler_SetDefaults(t *testing.T) {
 		},
 		{
 			name: "bastion explicit values preserved",
-			before: machineCreateHandler{
+			before: machineRegisterHandler{
 				siteName:             "dc1",
 				host:                 "10.0.0.5",
 				hostSSHUsername:      "admin",
@@ -188,7 +188,7 @@ func TestMachineCreateHandler_SetDefaults(t *testing.T) {
 				bastionSSHPrivateKey: "/path/to/bastion-key",
 				bastionSSHSecretName: "bastion-secret",
 			},
-			check: func(t *testing.T, h *machineCreateHandler) {
+			check: func(t *testing.T, h *machineRegisterHandler) {
 				require.Equal(t, "bastion-user", h.bastionSSHUsername)
 				require.Equal(t, "/path/to/bastion-key", h.bastionSSHPrivateKey)
 				require.Equal(t, "bastion-secret", h.bastionSSHSecretName)
@@ -211,7 +211,7 @@ func TestMachineCreateHandler_SetDefaults(t *testing.T) {
 // validate() tests
 // ---------------------------------------------------------------------------
 
-func TestMachineCreateHandler_Validate(t *testing.T) {
+func TestMachineRegisterHandler_Validate(t *testing.T) {
 	t.Parallel()
 
 	sshKeyPath := writeTempSSHKey(t)
@@ -219,12 +219,12 @@ func TestMachineCreateHandler_Validate(t *testing.T) {
 
 	tests := []struct {
 		name      string
-		handler   machineCreateHandler
+		handler   machineRegisterHandler
 		expectErr string
 	}{
 		{
 			name: "valid: all required fields",
-			handler: machineCreateHandler{
+			handler: machineRegisterHandler{
 				siteName:          "dc1",
 				name:              "dc1-10.0.0.5",
 				host:              "10.0.0.5",
@@ -236,7 +236,7 @@ func TestMachineCreateHandler_Validate(t *testing.T) {
 		},
 		{
 			name: "valid: with bastion",
-			handler: machineCreateHandler{
+			handler: machineRegisterHandler{
 				siteName:             "dc1",
 				name:                 "dc1-10.0.0.5",
 				host:                 "10.0.0.5",
@@ -252,7 +252,7 @@ func TestMachineCreateHandler_Validate(t *testing.T) {
 		},
 		{
 			name: "valid: bastion only (no host SSH key)",
-			handler: machineCreateHandler{
+			handler: machineRegisterHandler{
 				siteName:             "dc1",
 				name:                 "dc1-10.0.0.5",
 				host:                 "10.0.0.5",
@@ -267,7 +267,7 @@ func TestMachineCreateHandler_Validate(t *testing.T) {
 		},
 		{
 			name: "missing site name",
-			handler: machineCreateHandler{
+			handler: machineRegisterHandler{
 				host:              "10.0.0.5",
 				hostSSHUsername:   "admin",
 				hostSSHPrivateKey: sshKeyPath,
@@ -277,7 +277,7 @@ func TestMachineCreateHandler_Validate(t *testing.T) {
 		},
 		{
 			name: "missing host",
-			handler: machineCreateHandler{
+			handler: machineRegisterHandler{
 				siteName:          "dc1",
 				hostSSHUsername:   "admin",
 				hostSSHPrivateKey: sshKeyPath,
@@ -287,7 +287,7 @@ func TestMachineCreateHandler_Validate(t *testing.T) {
 		},
 		{
 			name: "missing ssh username",
-			handler: machineCreateHandler{
+			handler: machineRegisterHandler{
 				siteName:          "dc1",
 				host:              "10.0.0.5",
 				hostSSHPrivateKey: sshKeyPath,
@@ -297,7 +297,7 @@ func TestMachineCreateHandler_Validate(t *testing.T) {
 		},
 		{
 			name: "missing ssh private key when no bastion",
-			handler: machineCreateHandler{
+			handler: machineRegisterHandler{
 				siteName:        "dc1",
 				host:            "10.0.0.5",
 				hostSSHUsername: "admin",
@@ -307,7 +307,7 @@ func TestMachineCreateHandler_Validate(t *testing.T) {
 		},
 		{
 			name: "ssh private key file not readable",
-			handler: machineCreateHandler{
+			handler: machineRegisterHandler{
 				siteName:          "dc1",
 				host:              "10.0.0.5",
 				hostSSHUsername:   "admin",
@@ -318,7 +318,7 @@ func TestMachineCreateHandler_Validate(t *testing.T) {
 		},
 		{
 			name: "bastion ssh private key file not readable",
-			handler: machineCreateHandler{
+			handler: machineRegisterHandler{
 				siteName:             "dc1",
 				host:                 "10.0.0.5",
 				hostSSHUsername:      "admin",
@@ -331,7 +331,7 @@ func TestMachineCreateHandler_Validate(t *testing.T) {
 		},
 		{
 			name: "kubeconfig not readable",
-			handler: machineCreateHandler{
+			handler: machineRegisterHandler{
 				siteName:          "dc1",
 				host:              "10.0.0.5",
 				hostSSHUsername:   "admin",
@@ -382,7 +382,7 @@ func newBootstrapTokenSecret(siteName string) *corev1.Secret {
 	}
 }
 
-func TestMachineCreateHandler_Execute_SSHOnly(t *testing.T) {
+func TestMachineRegisterHandler_Execute_SSHOnly(t *testing.T) {
 	t.Parallel()
 
 	sshKeyPath := writeTempSSHKey(t)
@@ -401,7 +401,7 @@ func TestMachineCreateHandler_Execute_SSHOnly(t *testing.T) {
 
 	kubeCli := fake.NewClientset(newBootstrapTokenSecret("dc1"))
 
-	h := &machineCreateHandler{
+	h := &machineRegisterHandler{
 		siteName:          "dc1",
 		host:              "10.0.0.5",
 		hostSSHUsername:   "admin",
@@ -430,7 +430,7 @@ func TestMachineCreateHandler_Execute_SSHOnly(t *testing.T) {
 	require.Equal(t, "dc1-10.0.0.5", h.name)
 }
 
-func TestMachineCreateHandler_Execute_WithBastion(t *testing.T) {
+func TestMachineRegisterHandler_Execute_WithBastion(t *testing.T) {
 	t.Parallel()
 
 	hostKeyPath := writeTempSSHKey(t)
@@ -453,7 +453,7 @@ func TestMachineCreateHandler_Execute_WithBastion(t *testing.T) {
 
 	kubeCli := fake.NewClientset(newBootstrapTokenSecret("dc1"))
 
-	h := &machineCreateHandler{
+	h := &machineRegisterHandler{
 		siteName:             "dc1",
 		host:                 "10.0.0.5:2222",
 		hostSSHUsername:      "admin",
@@ -491,7 +491,7 @@ func TestMachineCreateHandler_Execute_WithBastion(t *testing.T) {
 	require.Equal(t, "dc1-10.0.0.5-2222", h.name)
 }
 
-func TestMachineCreateHandler_Execute_BastionSharedSecret(t *testing.T) {
+func TestMachineRegisterHandler_Execute_BastionSharedSecret(t *testing.T) {
 	t.Parallel()
 
 	sshKeyPath := writeTempSSHKey(t)
@@ -509,7 +509,7 @@ func TestMachineCreateHandler_Execute_BastionSharedSecret(t *testing.T) {
 
 	kubeCli := fake.NewClientset(newBootstrapTokenSecret("dc1"))
 
-	h := &machineCreateHandler{
+	h := &machineRegisterHandler{
 		siteName:          "dc1",
 		host:              "10.0.0.5",
 		hostSSHUsername:   "admin",
@@ -538,7 +538,7 @@ func TestMachineCreateHandler_Execute_BastionSharedSecret(t *testing.T) {
 	require.Len(t, appliedObjects, 1)
 }
 
-func TestMachineCreateHandler_Execute_NoBootstrapToken(t *testing.T) {
+func TestMachineRegisterHandler_Execute_NoBootstrapToken(t *testing.T) {
 	t.Parallel()
 
 	sshKeyPath := writeTempSSHKey(t)
@@ -554,7 +554,7 @@ func TestMachineCreateHandler_Execute_NoBootstrapToken(t *testing.T) {
 	// No bootstrap token pre-seeded.
 	kubeCli := fake.NewClientset()
 
-	h := &machineCreateHandler{
+	h := &machineRegisterHandler{
 		siteName:          "dc1",
 		host:              "10.0.0.5",
 		hostSSHUsername:   "admin",
@@ -571,7 +571,7 @@ func TestMachineCreateHandler_Execute_NoBootstrapToken(t *testing.T) {
 	require.Contains(t, err.Error(), "bootstrap token")
 }
 
-func TestMachineCreateHandler_Execute_BastionOnlyNoHostKey(t *testing.T) {
+func TestMachineRegisterHandler_Execute_BastionOnlyNoHostKey(t *testing.T) {
 	t.Parallel()
 
 	bastionKeyPath := writeTempSSHKey(t)
@@ -589,7 +589,7 @@ func TestMachineCreateHandler_Execute_BastionOnlyNoHostKey(t *testing.T) {
 
 	kubeCli := fake.NewClientset(newBootstrapTokenSecret("dc1"))
 
-	h := &machineCreateHandler{
+	h := &machineRegisterHandler{
 		siteName:             "dc1",
 		host:                 "10.0.0.5",
 		hostSSHUsername:      "admin",
@@ -620,15 +620,15 @@ func TestMachineCreateHandler_Execute_BastionOnlyNoHostKey(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// machineCreateCommand() cobra wiring test
+// machineRegisterCommand() cobra wiring test
 // ---------------------------------------------------------------------------
 
-func TestMachineCreateCommand(t *testing.T) {
+func TestMachineRegisterCommand(t *testing.T) {
 	t.Parallel()
 
-	cmd := machineCreateCommand()
+	cmd := machineRegisterCommand()
 
-	require.Equal(t, "create", cmd.Use)
+	require.Equal(t, "register", cmd.Use)
 	require.NotNil(t, cmd.RunE)
 
 	// Verify required flags exist.
@@ -725,13 +725,13 @@ func TestParseNodeLabels(t *testing.T) {
 // validate() tests for --node-label
 // ---------------------------------------------------------------------------
 
-func TestMachineCreateHandler_Validate_NodeLabels(t *testing.T) {
+func TestMachineRegisterHandler_Validate_NodeLabels(t *testing.T) {
 	t.Parallel()
 
 	sshKeyPath := writeTempSSHKey(t)
 	kubeconfigPath := writeTempKubeconfig(t)
 
-	base := machineCreateHandler{
+	base := machineRegisterHandler{
 		siteName:          "dc1",
 		name:              "dc1-10.0.0.5",
 		host:              "10.0.0.5",
@@ -789,7 +789,7 @@ func TestMachineCreateHandler_Validate_NodeLabels(t *testing.T) {
 // execute() test for --node-label
 // ---------------------------------------------------------------------------
 
-func TestMachineCreateHandler_Execute_WithNodeLabels(t *testing.T) {
+func TestMachineRegisterHandler_Execute_WithNodeLabels(t *testing.T) {
 	t.Parallel()
 
 	sshKeyPath := writeTempSSHKey(t)
@@ -808,7 +808,7 @@ func TestMachineCreateHandler_Execute_WithNodeLabels(t *testing.T) {
 
 	kubeCli := fake.NewClientset(newBootstrapTokenSecret("dc1"))
 
-	h := &machineCreateHandler{
+	h := &machineRegisterHandler{
 		siteName:          "dc1",
 		host:              "10.0.0.5",
 		hostSSHUsername:   "admin",

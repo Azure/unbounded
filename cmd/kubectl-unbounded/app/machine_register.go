@@ -24,7 +24,7 @@ import (
 	"github.com/Azure/unbounded-kube/internal/kube"
 )
 
-type machineCreateHandler struct {
+type machineRegisterHandler struct {
 	// siteName is the name of the site that contains the machine.
 	siteName string
 
@@ -80,7 +80,7 @@ type machineCreateHandler struct {
 	logger *slog.Logger
 }
 
-func (h *machineCreateHandler) execute(ctx context.Context) error {
+func (h *machineRegisterHandler) execute(ctx context.Context) error {
 	if h.logger == nil {
 		h.logger = slog.Default()
 	}
@@ -96,7 +96,7 @@ func (h *machineCreateHandler) execute(ctx context.Context) error {
 
 // executeAfterValidation contains the core logic that runs after setDefaults and validate.
 // It is separated so tests can pre-inject clients and skip kubeconfig validation.
-func (h *machineCreateHandler) executeAfterValidation(ctx context.Context) error {
+func (h *machineRegisterHandler) executeAfterValidation(ctx context.Context) error {
 	// Allow tests to pre-inject clients by skipping creation when already set.
 	if h.kubeCli == nil {
 		kubeCli, kubeConfig, err := kube.ClientAndConfigFromFile(h.kubeconfigPath)
@@ -240,7 +240,7 @@ func (h *machineCreateHandler) executeAfterValidation(ctx context.Context) error
 	return nil
 }
 
-func (h *machineCreateHandler) setDefaults() {
+func (h *machineRegisterHandler) setDefaults() {
 	h.kubeconfigPath = getKubeconfigPath(h.kubeconfigPath)
 
 	// Default the SSH secret name to "ssh-${site}".
@@ -274,7 +274,7 @@ func (h *machineCreateHandler) setDefaults() {
 	}
 }
 
-func (h *machineCreateHandler) validate() error {
+func (h *machineRegisterHandler) validate() error {
 	if isEmpty(h.siteName) {
 		return errors.New("site name is required")
 	}
@@ -347,12 +347,12 @@ func parseNodeLabels(entries []string) (map[string]string, error) {
 	return labels, nil
 }
 
-func machineCreateCommand() *cobra.Command {
-	handler := machineCreateHandler{}
+func machineRegisterCommand() *cobra.Command {
+	handler := machineRegisterHandler{}
 
 	cmd := &cobra.Command{
-		Use:   "create",
-		Short: "Create a machine for the site",
+		Use:   "register",
+		Short: "Register a machine to the site",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return handler.execute(cmd.Context())
 		},
