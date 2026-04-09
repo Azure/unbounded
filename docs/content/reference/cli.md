@@ -113,7 +113,16 @@ kubectl unbounded site init \
 
 ---
 
-### `kubectl unbounded site add-machine`
+### `kubectl unbounded machine`
+
+Manage unbounded-kube machines.
+
+This is a command group with no action of its own. Use one of the subcommands
+below.
+
+---
+
+### `kubectl unbounded machine create`
 
 Register a machine to an existing site. This command:
 
@@ -165,7 +174,7 @@ Register a machine to an existing site. This command:
 **Direct SSH:**
 
 ```bash
-kubectl unbounded site add-machine \
+kubectl unbounded machine create \
   --site dc1 \
   --host 10.0.0.5 \
   --ssh-username admin \
@@ -175,7 +184,7 @@ kubectl unbounded site add-machine \
 **With explicit machine name:**
 
 ```bash
-kubectl unbounded site add-machine \
+kubectl unbounded machine create \
   --site dc1 \
   --name worker-1 \
   --host 10.0.0.5 \
@@ -186,7 +195,7 @@ kubectl unbounded site add-machine \
 **With bastion (shared credentials):**
 
 ```bash
-kubectl unbounded site add-machine \
+kubectl unbounded machine create \
   --site dc1 \
   --host 10.0.0.5:2222 \
   --ssh-username admin \
@@ -197,7 +206,7 @@ kubectl unbounded site add-machine \
 **With bastion (separate credentials):**
 
 ```bash
-kubectl unbounded site add-machine \
+kubectl unbounded machine create \
   --site dc1 \
   --host 10.0.0.5 \
   --ssh-username admin \
@@ -219,7 +228,7 @@ kubectl unbounded site add-machine \
 ## See Also
 
 - **[Getting Started]({{< relref "guides/getting-started" >}})** -- Walks
-  through `site init` and `add-machine` step by step.
+  through `site init` and `machine create` step by step.
 - **[SSH Guide]({{< relref "guides/ssh" >}})** -- Detailed SSH provisioning
   walkthrough with examples.
 - **[CRD Reference]({{< relref "reference/machina-crd" >}})** -- Full Machine

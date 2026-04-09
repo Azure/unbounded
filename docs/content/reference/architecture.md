@@ -65,12 +65,12 @@ restrict each instance to a subset of Machines. Leader election is per-site.
 
 ### kubectl-unbounded -- CLI Plugin
 
-Binary `cmd/kubectl-unbounded`. Provides the `kubectl unbounded site` subcommands:
+Binary `cmd/kubectl-unbounded`. Provides subcommands:
 
 | Subcommand         | Purpose |
 |--------------------|---------|
 | `site init`        | Initializes a new site: installs CNI, machina, creates RBAC, bootstrap token, and site resources. |
-| `site add-machine` | Registers a machine to a site, creating a `Machine` CR with auto-discovery of SSH secrets and bootstrap tokens. |
+| `machine create`   | Registers a machine to a site, creating a `Machine` CR with auto-discovery of SSH secrets and bootstrap tokens. |
 
 ### inventory -- Hardware Collector
 
@@ -136,7 +136,7 @@ WireGuard-based CNI plugin.
 
 ### SSH Path (machina)
 
-![SSH provisioning pipeline: kubectl add-machine creates Machine CR, machina reconciles with TCP probe, SSH connect, script execution, kubelet joins, Node appears, Machine becomes Ready](../../img/architecture-ssh-provisioning.svg)
+![SSH provisioning pipeline: kubectl machine create creates Machine CR, machina reconciles with TCP probe, SSH connect, script execution, kubelet joins, Node appears, Machine becomes Ready](../../img/architecture-ssh-provisioning.svg)
 
 Requeue intervals: Pending 30s, Failed 60s, Joining 30s, Ready 5m.
 
