@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package reset
 
 import (
@@ -6,8 +9,8 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/project-unbounded/unbounded-kube/cmd/agent/internal/phases"
-	"github.com/project-unbounded/unbounded-kube/cmd/agent/internal/utilexec"
+	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases"
+	"github.com/Azure/unbounded-kube/cmd/agent/internal/utilexec"
 )
 
 type stopMachine struct {

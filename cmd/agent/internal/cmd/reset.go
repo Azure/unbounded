@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package cmd
 
 import (
@@ -8,9 +11,9 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/project-unbounded/unbounded-kube/cmd/agent/internal/phases"
-	"github.com/project-unbounded/unbounded-kube/cmd/agent/internal/phases/reset"
-	"github.com/project-unbounded/unbounded-kube/internal/version"
+	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases"
+	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases/reset"
+	"github.com/Azure/unbounded-kube/internal/version"
 )
 
 // defaultConfigPath is the well-known location for the agent config file

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package kube
 
 import (
@@ -8,7 +11,7 @@ import (
 	"log/slog"
 	"os/exec"
 
-	"github.com/project-unbounded/unbounded-kube/internal/helpers"
+	"github.com/Azure/unbounded-kube/internal/helpers"
 )
 
 func Kubectl(env []string, kubeconfig string) func(context.Context) *exec.Cmd {

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package cmd
 
 import (
@@ -6,7 +9,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/project-unbounded/unbounded-kube/internal/provision"
+	"github.com/Azure/unbounded-kube/internal/provision"
 )
 
 const configFileEnv = "UNBOUNDED_AGENT_CONFIG_FILE"

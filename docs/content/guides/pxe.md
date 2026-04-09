@@ -55,8 +55,8 @@ are served verbatim. A `metadata.yaml` file provides image-level configuration
 Images are built, tagged, and pushed using standard container tooling:
 
 ```bash
-docker build -t ghcr.io/project-unbounded/images/host-ubuntu2404:v1 .
-docker push ghcr.io/project-unbounded/images/host-ubuntu2404:v1
+docker build -t ghcr.io/azure/images/host-ubuntu2404:v1 .
+docker push ghcr.io/azure/images/host-ubuntu2404:v1
 ```
 
 Template context includes `.Machine`, `.ApiserverURL`, `.ServeURL`, `.KubernetesVersion`, and `.ClusterDNS`.
@@ -76,7 +76,7 @@ metadata:
     unbounded-kube.io/site: rack-a
 spec:
   pxe:
-    image: ghcr.io/project-unbounded/images/host-ubuntu2404:v1
+    image: ghcr.io/azure/images/host-ubuntu2404:v1
     dhcpLeases:
     - ipv4: "10.10.0.50"
       mac: "aa:bb:cc:dd:ee:ff"

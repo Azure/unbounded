@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package cmd
 
 import (
@@ -9,7 +12,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/project-unbounded/unbounded-kube/internal/provision"
+	"github.com/Azure/unbounded-kube/internal/provision"
 )
 
 func writeConfigFile(t *testing.T, cfg provision.AgentConfig) string {

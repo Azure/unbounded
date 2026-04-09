@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package rootfs
 
 import (
@@ -6,9 +9,9 @@ import (
 	"fmt"
 	"path/filepath"
 
-	"github.com/project-unbounded/unbounded-kube/cmd/agent/internal/goalstates"
-	"github.com/project-unbounded/unbounded-kube/cmd/agent/internal/phases"
-	"github.com/project-unbounded/unbounded-kube/cmd/agent/internal/utilio"
+	"github.com/Azure/unbounded-kube/cmd/agent/internal/goalstates"
+	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases"
+	"github.com/Azure/unbounded-kube/cmd/agent/internal/utilio"
 )
 
 // /dev/kmsg workaround: kubelet expects /dev/kmsg for kernel log access, but

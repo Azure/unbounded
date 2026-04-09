@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package reset
 
 import (
@@ -5,8 +8,8 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/project-unbounded/unbounded-kube/cmd/agent/internal/goalstates"
-	"github.com/project-unbounded/unbounded-kube/cmd/agent/internal/phases"
+	"github.com/Azure/unbounded-kube/cmd/agent/internal/goalstates"
+	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases"
 )
 
 type removeNSpawnConfig struct {

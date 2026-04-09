@@ -1,8 +1,8 @@
 # Unbounded Kubernetes - Kubernetes without Borders
 
-[![Release](https://img.shields.io/github/v/release/project-unbounded/unbounded-kube?style=flat-square)](https://github.com/project-unbounded/unbounded-kube/releases/latest)
-[![Go CI](https://img.shields.io/github/actions/workflow/status/project-unbounded/unbounded-kube/go-ci.yaml?branch=main&label=CI&style=flat-square)](https://github.com/project-unbounded/unbounded-kube/actions/workflows/go-ci.yaml)
-[![License](https://img.shields.io/github/license/project-unbounded/unbounded-kube?style=flat-square)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/Azure/unbounded-kube?style=flat-square)](https://github.com/Azure/unbounded-kube/releases/latest)
+[![Go CI](https://img.shields.io/github/actions/workflow/status/Azure/unbounded-kube/go-ci.yaml?branch=main&label=CI&style=flat-square)](https://github.com/Azure/unbounded-kube/actions/workflows/go-ci.yaml)
+[![License](https://img.shields.io/github/license/Azure/unbounded-kube?style=flat-square)](LICENSE)
 
 ## WARNING: Project is in Early Development
 
@@ -60,3 +60,22 @@ kubectl unbounded site add-machine \
   --ssh-username <username> \
   --ssh-private-key <path-to-ssh-key>
 ```
+
+## Contributing
+
+This project welcomes contributions and suggestions. See [CONTRIBUTING.md](CONTRIBUTING.md) for
+details.
+
+## Third-Party Dependencies
+
+This project uses third-party open source libraries. See the [NOTICE](NOTICE) file for
+attributions and license information.
+
+## Trademarks
+
+This project may contain trademarks or logos for projects, products, or services. Authorized use of
+Microsoft trademarks or logos is subject to and must follow
+[Microsoft's Trademark & Brand Guidelines](https://www.microsoft.com/en-us/legal/intellectualproperty/trademarks/usage/general).
+Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or
+imply Microsoft sponsorship. Any use of third-party trademarks or logos are subject to those
+third-party's policies.

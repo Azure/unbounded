@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package machina
 
 import (
@@ -6,8 +9,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/project-unbounded/unbounded-kube/cmd/machina/machina/controller"
-	"github.com/project-unbounded/unbounded-kube/internal/version"
+	"github.com/Azure/unbounded-kube/cmd/machina/machina/controller"
+	"github.com/Azure/unbounded-kube/internal/version"
 )
 
 func Run() {

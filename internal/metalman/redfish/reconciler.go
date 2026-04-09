@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package redfish
 
 import (
@@ -17,7 +20,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
-	v1alpha3 "github.com/project-unbounded/unbounded-kube/api/v1alpha3"
+	v1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
 )
 
 const (

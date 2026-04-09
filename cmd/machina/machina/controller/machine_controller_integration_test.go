@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package controller
 
 import (
@@ -14,7 +17,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	unboundedv1alpha3 "github.com/project-unbounded/unbounded-kube/api/v1alpha3"
+	unboundedv1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
 )
 
 // ---------------------------------------------------------------------------

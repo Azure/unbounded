@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package azuredev
 
 import (
@@ -12,8 +15,8 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/keyvault/armkeyvault"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
 
-	"github.com/project-unbounded/unbounded-kube/hack/cmd/forge/forge/azsdk"
-	"github.com/project-unbounded/unbounded-kube/hack/cmd/forge/forge/infra"
+	"github.com/Azure/unbounded-kube/hack/cmd/forge/forge/azsdk"
+	"github.com/Azure/unbounded-kube/hack/cmd/forge/forge/infra"
 )
 
 const (

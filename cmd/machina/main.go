@@ -1,6 +1,9 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package main
 
-import "github.com/project-unbounded/unbounded-kube/cmd/machina/machina"
+import "github.com/Azure/unbounded-kube/cmd/machina/machina"
 
 func main() {
 	machina.Run()

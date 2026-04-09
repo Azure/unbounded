@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package forge
 
 import (
@@ -8,9 +11,9 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/project-unbounded/unbounded-kube/hack/cmd/forge/forge/cluster"
-	"github.com/project-unbounded/unbounded-kube/hack/cmd/forge/forge/cmd"
-	"github.com/project-unbounded/unbounded-kube/hack/cmd/forge/forge/site"
+	"github.com/Azure/unbounded-kube/hack/cmd/forge/forge/cluster"
+	"github.com/Azure/unbounded-kube/hack/cmd/forge/forge/cmd"
+	"github.com/Azure/unbounded-kube/hack/cmd/forge/forge/site"
 )
 
 func Run() {

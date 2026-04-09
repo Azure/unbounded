@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package reset
 
 import (
@@ -9,8 +12,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/project-unbounded/unbounded-kube/cmd/agent/internal/phases"
-	"github.com/project-unbounded/unbounded-kube/cmd/agent/internal/utilexec"
+	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases"
+	"github.com/Azure/unbounded-kube/cmd/agent/internal/utilexec"
 )
 
 // knownOverlayInterfaces lists the tunnel and overlay interfaces created by

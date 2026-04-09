@@ -52,7 +52,7 @@ PXE boot configuration consumed by the metalman controller.
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `pxe` | PXESpec | No | — | PXE boot configuration. |
-| `pxe.image` | string | Yes | — | OCI image reference containing netboot artifacts (e.g. `"ghcr.io/project-unbounded/images/host-ubuntu2404:v1"`). |
+| `pxe.image` | string | Yes | — | OCI image reference containing netboot artifacts (e.g. `"ghcr.io/azure/images/host-ubuntu2404:v1"`). |
 | `pxe.dhcpLeases` | []DHCPLease | No | — | Static DHCP leases served during PXE boot. |
 | `pxe.dhcpLeases[].ipv4` | string | Yes | — | Static IPv4 address to assign. |
 | `pxe.dhcpLeases[].mac` | string | Yes | — | NIC MAC address (matched case-insensitively). |
@@ -198,7 +198,7 @@ spec:
       name: ssh-key
       namespace: machina-system
   pxe:
-    image: ghcr.io/project-unbounded/images/host-ubuntu2404:v1
+    image: ghcr.io/azure/images/host-ubuntu2404:v1
     dhcpLeases:
     - ipv4: "10.0.0.60"
       mac: "aa:bb:cc:dd:ee:ff"
@@ -251,8 +251,8 @@ Templates receive the following data object:
 Images are built, tagged, and pushed using standard container tooling:
 
 ```bash
-docker build -t ghcr.io/project-unbounded/images/host-ubuntu2404:v1 .
-docker push ghcr.io/project-unbounded/images/host-ubuntu2404:v1
+docker build -t ghcr.io/azure/images/host-ubuntu2404:v1 .
+docker push ghcr.io/azure/images/host-ubuntu2404:v1
 ```
 
 See `images/host-ubuntu2404/` for an example Containerfile.

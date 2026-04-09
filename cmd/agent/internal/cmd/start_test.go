@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package cmd
 
 import (
@@ -6,7 +9,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	"github.com/project-unbounded/unbounded-kube/cmd/agent/internal/goalstates"
+	"github.com/Azure/unbounded-kube/cmd/agent/internal/goalstates"
 )
 
 // discardLogger returns a logger that silently drops all output.

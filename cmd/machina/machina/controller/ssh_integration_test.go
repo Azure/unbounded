@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package controller
 
 import (
@@ -23,9 +26,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	unboundedv1alpha3 "github.com/project-unbounded/unbounded-kube/api/v1alpha3"
-	"github.com/project-unbounded/unbounded-kube/internal/cloudprovider"
-	"github.com/project-unbounded/unbounded-kube/internal/provision"
+	unboundedv1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
+	"github.com/Azure/unbounded-kube/internal/cloudprovider"
+	"github.com/Azure/unbounded-kube/internal/provision"
 )
 
 // sshTestServer is an in-process SSH server used for integration tests.
@@ -1036,7 +1039,7 @@ func TestProvisionMachine_OCIImage(t *testing.T) {
 				BootstrapTokenRef: unboundedv1alpha3.LocalObjectReference{Name: "bt"},
 			},
 			Agent: &unboundedv1alpha3.AgentSpec{
-				Image: "ghcr.io/project-unbounded/rootfs:v1.0.0",
+				Image: "ghcr.io/azure/rootfs:v1.0.0",
 			},
 		},
 	}
@@ -1070,7 +1073,7 @@ func TestProvisionMachine_OCIImage(t *testing.T) {
 	var agentConfig provision.AgentConfig
 	require.NoError(t, json.Unmarshal(configCmd.stdin, &agentConfig))
 
-	require.Equal(t, "ghcr.io/project-unbounded/rootfs:v1.0.0", agentConfig.OCIImage)
+	require.Equal(t, "ghcr.io/azure/rootfs:v1.0.0", agentConfig.OCIImage)
 }
 
 func TestProvisionMachine_ProviderLabelsOverride(t *testing.T) {

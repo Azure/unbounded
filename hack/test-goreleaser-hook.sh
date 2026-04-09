@@ -10,7 +10,7 @@ set -euo pipefail
 
 TAG="v0.0.0-test"
 MANIFEST="deploy/machina/04-deployment.yaml"
-EXPECTED_IMAGE="ghcr.io/project-unbounded/machina:${TAG}"
+EXPECTED_IMAGE="ghcr.io/azure/machina:${TAG}"
 
 # Save the original manifest so we can restore it on exit.
 cleanup() {

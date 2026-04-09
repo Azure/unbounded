@@ -11,8 +11,8 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build \
     -ldflags "-s -w \
-      -X github.com/project-unbounded/unbounded-kube/internal/version.Version=${VERSION} \
-      -X github.com/project-unbounded/unbounded-kube/internal/version.GitCommit=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" \
+      -X github.com/Azure/unbounded-kube/internal/version.Version=${VERSION} \
+      -X github.com/Azure/unbounded-kube/internal/version.GitCommit=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" \
     -o /unbounded-agent ./cmd/agent
 
 # ── Assemble host image artifacts ───────────────────────────────────

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package app
 
 import (
@@ -13,8 +16,8 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/rest"
 
-	"github.com/project-unbounded/unbounded-kube/internal/cloudprovider"
-	"github.com/project-unbounded/unbounded-kube/internal/provision"
+	"github.com/Azure/unbounded-kube/internal/cloudprovider"
+	"github.com/Azure/unbounded-kube/internal/provision"
 )
 
 // ---------------------------------------------------------------------------
@@ -171,7 +174,7 @@ func TestManualBootstrapHandler_BuildAgentConfig(t *testing.T) {
 		machineName: "my-node",
 		nodeLabels:  []string{"env=prod"},
 		taints:      []string{"dedicated=gpu:NoSchedule"},
-		ociImage:    "ghcr.io/project-unbounded/rootfs:v1",
+		ociImage:    "ghcr.io/azure/rootfs:v1",
 		kubeCli:     kubeCli,
 		kubeConfig:  &rest.Config{Host: "https://my-api-server:6443"},
 		logger:      discardLogger(),
@@ -189,7 +192,7 @@ func TestManualBootstrapHandler_BuildAgentConfig(t *testing.T) {
 	require.Equal(t, "prod", cfg.Kubelet.Labels["env"])
 	require.Equal(t, "true", cfg.Kubelet.Labels[cloudprovider.ExcludeFromCloudProviderLabel])
 	require.Equal(t, []string{"dedicated=gpu:NoSchedule"}, cfg.Kubelet.RegisterWithTaints)
-	require.Equal(t, "ghcr.io/project-unbounded/rootfs:v1", cfg.OCIImage)
+	require.Equal(t, "ghcr.io/azure/rootfs:v1", cfg.OCIImage)
 }
 
 func TestManualBootstrapHandler_BuildAgentConfig_KubernetesVersionOverride(t *testing.T) {
@@ -394,7 +397,7 @@ func TestManualBootstrapHandler_RenderCloudInit(t *testing.T) {
 				BootstrapToken: "abc123.0123456789abcdef",
 				Labels:         map[string]string{"env": "prod"},
 			},
-			OCIImage: "ghcr.io/project-unbounded/agent:latest",
+			OCIImage: "ghcr.io/azure/agent:latest",
 		}
 
 		withOCI := &manualBootstrapHandler{
@@ -405,7 +408,7 @@ func TestManualBootstrapHandler_RenderCloudInit(t *testing.T) {
 		require.NoError(t, err)
 
 		// OCIImage should appear in the JSON config, not as a separate env var.
-		require.Contains(t, output, `"OCIImage": "ghcr.io/project-unbounded/agent:latest"`)
+		require.Contains(t, output, `"OCIImage": "ghcr.io/azure/agent:latest"`)
 		require.NotContains(t, output, "AGENT_OCI_IMAGE")
 	})
 }

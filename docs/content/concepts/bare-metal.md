@@ -84,7 +84,7 @@ pulled and cached locally by the OCI reconciler.
 For PXE-provisioned machines, the `Machine` resource includes:
 
 - **`spec.pxe.image`** -- OCI image reference containing netboot artifacts
-  (e.g. `"ghcr.io/project-unbounded/images/host-ubuntu2404:v1"`).
+  (e.g. `"ghcr.io/azure/images/host-ubuntu2404:v1"`).
 - **`spec.pxe.dhcpLeases`** -- NIC specifications: MAC address and IP
   assignment for each interface.
 - **`spec.pxe.redfish`** -- Optional BMC connection details (endpoint, username,

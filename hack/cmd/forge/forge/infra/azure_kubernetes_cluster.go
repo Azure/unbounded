@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package infra
 
 import (
@@ -11,8 +14,8 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v4"
 
-	"github.com/project-unbounded/unbounded-kube/hack/cmd/forge/forge/azsdk"
-	"github.com/project-unbounded/unbounded-kube/hack/cmd/forge/forge/validate"
+	"github.com/Azure/unbounded-kube/hack/cmd/forge/forge/azsdk"
+	"github.com/Azure/unbounded-kube/hack/cmd/forge/forge/validate"
 )
 
 type ManagedClusterBuilder struct {

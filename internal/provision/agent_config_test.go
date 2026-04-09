@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package provision
 
 import (
@@ -26,7 +29,7 @@ func TestAgentConfig_MarshalJSON(t *testing.T) {
 			},
 			RegisterWithTaints: []string{"dedicated=gpu:NoSchedule"},
 		},
-		OCIImage: "ghcr.io/project-unbounded/agent:v1.0.0",
+		OCIImage: "ghcr.io/azure/agent:v1.0.0",
 	}
 
 	data, err := json.Marshal(cfg)
@@ -53,7 +56,7 @@ func TestAgentConfig_MarshalJSON(t *testing.T) {
 	require.Len(t, taints, 1)
 	require.Equal(t, "dedicated=gpu:NoSchedule", taints[0])
 
-	require.Equal(t, "ghcr.io/project-unbounded/agent:v1.0.0", parsed["OCIImage"])
+	require.Equal(t, "ghcr.io/azure/agent:v1.0.0", parsed["OCIImage"])
 }
 
 func TestAgentConfig_RoundTrip(t *testing.T) {
@@ -72,7 +75,7 @@ func TestAgentConfig_RoundTrip(t *testing.T) {
 			Labels:             map[string]string{"key": "value"},
 			RegisterWithTaints: []string{"key=value:NoSchedule", "key2=value2:NoExecute"},
 		},
-		OCIImage: "ghcr.io/project-unbounded/rootfs:v2.0.0",
+		OCIImage: "ghcr.io/azure/rootfs:v2.0.0",
 	}
 
 	data, err := json.Marshal(original)

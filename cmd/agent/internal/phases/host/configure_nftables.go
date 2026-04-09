@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package host
 
 import (
@@ -9,10 +12,10 @@ import (
 	"path/filepath"
 	"text/template"
 
-	"github.com/project-unbounded/unbounded-kube/cmd/agent/internal/goalstates"
-	"github.com/project-unbounded/unbounded-kube/cmd/agent/internal/phases"
-	"github.com/project-unbounded/unbounded-kube/cmd/agent/internal/utilexec"
-	"github.com/project-unbounded/unbounded-kube/cmd/agent/internal/utilio"
+	"github.com/Azure/unbounded-kube/cmd/agent/internal/goalstates"
+	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases"
+	"github.com/Azure/unbounded-kube/cmd/agent/internal/utilexec"
+	"github.com/Azure/unbounded-kube/cmd/agent/internal/utilio"
 )
 
 const (

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package nodestart
 
 import (
@@ -7,8 +10,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/project-unbounded/unbounded-kube/cmd/agent/internal/goalstates"
-	"github.com/project-unbounded/unbounded-kube/cmd/agent/internal/phases"
+	"github.com/Azure/unbounded-kube/cmd/agent/internal/goalstates"
+	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases"
 )
 
 type setupNVIDIA struct {

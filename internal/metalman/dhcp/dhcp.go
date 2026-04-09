@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package dhcp
 
 import (
@@ -13,9 +16,9 @@ import (
 	"github.com/insomniacslk/dhcp/dhcpv4/server4"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	v1alpha3 "github.com/project-unbounded/unbounded-kube/api/v1alpha3"
-	"github.com/project-unbounded/unbounded-kube/internal/metalman/indexing"
-	"github.com/project-unbounded/unbounded-kube/internal/metalman/netboot"
+	v1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
+	"github.com/Azure/unbounded-kube/internal/metalman/indexing"
+	"github.com/Azure/unbounded-kube/internal/metalman/netboot"
 )
 
 type Server struct {

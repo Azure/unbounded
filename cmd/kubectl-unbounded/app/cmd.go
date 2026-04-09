@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package app
 
 import (
@@ -5,7 +8,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/project-unbounded/unbounded-kube/internal/version"
+	"github.com/Azure/unbounded-kube/internal/version"
 )
 
 func Run() {

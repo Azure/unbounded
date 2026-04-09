@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package azuredev
 
 import (
@@ -15,10 +18,10 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
 	"k8s.io/client-go/kubernetes"
 
-	"github.com/project-unbounded/unbounded-kube/hack/cmd/forge/forge/azsdk"
-	"github.com/project-unbounded/unbounded-kube/hack/cmd/forge/forge/cluster"
-	"github.com/project-unbounded/unbounded-kube/hack/cmd/forge/forge/infra"
-	"github.com/project-unbounded/unbounded-kube/internal/kube"
+	"github.com/Azure/unbounded-kube/hack/cmd/forge/forge/azsdk"
+	"github.com/Azure/unbounded-kube/hack/cmd/forge/forge/cluster"
+	"github.com/Azure/unbounded-kube/hack/cmd/forge/forge/infra"
+	"github.com/Azure/unbounded-kube/internal/kube"
 )
 
 const (

@@ -133,7 +133,7 @@ jobs:
           gh release upload "${TAG}" dist/deploy.tar.gz --clobber
 
           export VERSION="${TAG}"
-          export REPO="project-unbounded/unbounded-kube"
+          export REPO="Azure/unbounded-kube"
           export SHA_LINUX_AMD64=$(sha256sum dist/kubectl-unbounded-linux-amd64.tar.gz | awk '{print $1}')
           export SHA_LINUX_ARM64=$(sha256sum dist/kubectl-unbounded-linux-arm64.tar.gz | awk '{print $1}')
           export SHA_DARWIN_AMD64=$(sha256sum dist/kubectl-unbounded-darwin-amd64.tar.gz | awk '{print $1}')
@@ -178,6 +178,9 @@ jobs:
             platforms: linux/amd64
             trivy: false
     steps:
+      - name: Normalize container registry
+        run: echo "CONTAINER_REGISTRY=${CONTAINER_REGISTRY,,}" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Install cosign

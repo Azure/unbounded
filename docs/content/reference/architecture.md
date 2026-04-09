@@ -81,7 +81,7 @@ Results are stored in a local SQLite database.
 ## Custom Resources
 
 API group `unbounded-kube.io`, version `v1alpha3`. CRD manifests live in
-`deploy/crd/`. See the [CRD Reference]({{< ref "reference/machina-crd" >}}) for
+`deploy/machina/crd/`. See the [CRD Reference]({{< ref "reference/machina-crd" >}}) for
 full field documentation.
 
 ### Machine (cluster-scoped, short name: `mach`)
@@ -184,7 +184,7 @@ numbered YAML files (no Helm or Kustomize).
 
 | Directory | Contents |
 |-----------|----------|
-| `deploy/crd/` | `Machine` CRD definition. |
+| `deploy/machina/crd/` | `Machine` CRD definition. |
 | `deploy/machina/` | Namespace, RBAC, ConfigMap, Deployment, Service. |
 | `deploy/metalman/` | RBAC, Deployment. |
 

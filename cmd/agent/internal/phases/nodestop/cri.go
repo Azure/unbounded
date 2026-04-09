@@ -1,9 +1,12 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package nodestop
 
 import (
 	"context"
 
-	"github.com/project-unbounded/unbounded-kube/cmd/agent/internal/phases"
+	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases"
 )
 
 type stopContainerd struct{}

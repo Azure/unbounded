@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package goalstates
 
 // RootFS defines the goal state of the machine root fs.

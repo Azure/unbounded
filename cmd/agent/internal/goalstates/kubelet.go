@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package goalstates
 
 // Kubelet defines the goal state for the kubelet configuration.
