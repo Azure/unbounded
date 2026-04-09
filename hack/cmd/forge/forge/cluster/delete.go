@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package cluster
 
 import (
@@ -5,8 +8,8 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/project-unbounded/unbounded-kube/hack/cmd/forge/forge/azsdk"
-	"github.com/project-unbounded/unbounded-kube/hack/cmd/forge/forge/infra"
+	"github.com/Azure/unbounded-kube/hack/cmd/forge/forge/azsdk"
+	"github.com/Azure/unbounded-kube/hack/cmd/forge/forge/infra"
 )
 
 type DeleteCluster struct {

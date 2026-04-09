@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package controller
 
 import (
@@ -24,9 +27,9 @@ import (
 
 	stderrs "errors"
 
-	unboundedv1alpha3 "github.com/project-unbounded/unbounded-kube/api/v1alpha3"
-	"github.com/project-unbounded/unbounded-kube/internal/cloudprovider"
-	"github.com/project-unbounded/unbounded-kube/internal/provision"
+	unboundedv1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
+	"github.com/Azure/unbounded-kube/internal/cloudprovider"
+	"github.com/Azure/unbounded-kube/internal/provision"
 )
 
 const (

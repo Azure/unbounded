@@ -33,7 +33,7 @@ wg --version
 
 ### Installation Steps
 
-1. **Deploy CRDs**: `kubectl apply -f deploy/crds/`
+1. **Deploy CRDs**: `kubectl apply -f deploy/machina/crd/`
 2. **Deploy Controller**: `kubectl apply -f deploy/controller/`
 3. **Deploy Node Agent**: `kubectl apply -f deploy/node/`
 4. **Create Sites**: Define Site resources with `nodeCidrs` and
@@ -348,7 +348,7 @@ need backup.
 
 ### Recovery
 
-1. Restore CRDs: `kubectl apply -f deploy/crds/`
+1. Restore CRDs: `kubectl apply -f deploy/machina/crd/`
 2. Restore resources from backup YAMLs.
 3. Deploy controller and node agent.
 4. Re-apply gateway labels.

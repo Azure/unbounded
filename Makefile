@@ -18,7 +18,7 @@ AGENT_CMD=./cmd/agent
 MACHINA_BIN=bin/machina
 MACHINA_CMD=./cmd/machina
 MACHINA_TAG ?= latest
-CONTAINER_REGISTRY ?= ghcr.io/project-unbounded
+CONTAINER_REGISTRY ?= ghcr.io/azure
 MACHINA_IMAGE=$(CONTAINER_REGISTRY)/machina:$(MACHINA_TAG)
 CONTAINER_ENGINE ?= podman
 
@@ -33,10 +33,10 @@ VERSION ?= $(shell git describe --tags --always 2>/dev/null || echo dev)
 GIT_COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 
 # Shared ldflags for injecting version metadata into all binaries.
-VERSION_LDFLAGS=-X github.com/project-unbounded/unbounded-kube/internal/version.Version=$(VERSION) -X github.com/project-unbounded/unbounded-kube/internal/version.GitCommit=$(GIT_COMMIT)
+VERSION_LDFLAGS=-X github.com/Azure/unbounded-kube/internal/version.Version=$(VERSION) -X github.com/Azure/unbounded-kube/internal/version.GitCommit=$(GIT_COMMIT)
 
 # kubectl-unbounded also stamps the metalman image reference.
-KUBECTL_UNBOUNDED_LDFLAGS=$(VERSION_LDFLAGS) -X github.com/project-unbounded/unbounded-kube/cmd/kubectl-unbounded/app.MetalmanImage=$(METALMAN_IMAGE)
+KUBECTL_UNBOUNDED_LDFLAGS=$(VERSION_LDFLAGS) -X github.com/Azure/unbounded-kube/cmd/kubectl-unbounded/app.MetalmanImage=$(METALMAN_IMAGE)
 
 METALMAN_TAG ?= latest
 METALMAN_IMAGE=$(CONTAINER_REGISTRY)/metalman:$(METALMAN_TAG)

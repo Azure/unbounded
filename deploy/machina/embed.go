@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 // Package machina embeds the Machina controller deployment manifests so they
 // can be bundled into binaries that need to apply them (e.g. the kubectl
 // plugin). The manifests remain the single source of truth in this directory.

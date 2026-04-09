@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 // Package ociutil provides shared helpers for OCI registry operations.
 package ociutil
 

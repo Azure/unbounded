@@ -1,10 +1,13 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 // Package version exposes build-time version metadata.
 //
 // The variables Version and GitCommit are intended to be set at compile time
 // via -ldflags:
 //
-//	go build -ldflags "-X github.com/project-unbounded/unbounded-kube/internal/version.Version=v1.0.0
-//	                    -X github.com/project-unbounded/unbounded-kube/internal/version.GitCommit=abc1234"
+//	go build -ldflags "-X github.com/Azure/unbounded-kube/internal/version.Version=v1.0.0
+//	                    -X github.com/Azure/unbounded-kube/internal/version.GitCommit=abc1234"
 package version
 
 import (

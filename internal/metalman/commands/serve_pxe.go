@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package commands
 
 import (
@@ -18,13 +21,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
-	v1alpha3 "github.com/project-unbounded/unbounded-kube/api/v1alpha3"
-	"github.com/project-unbounded/unbounded-kube/internal/metalman/attestation"
-	"github.com/project-unbounded/unbounded-kube/internal/metalman/dhcp"
-	"github.com/project-unbounded/unbounded-kube/internal/metalman/indexing"
-	"github.com/project-unbounded/unbounded-kube/internal/metalman/lifecycle"
-	"github.com/project-unbounded/unbounded-kube/internal/metalman/netboot"
-	"github.com/project-unbounded/unbounded-kube/internal/metalman/redfish"
+	v1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
+	"github.com/Azure/unbounded-kube/internal/metalman/attestation"
+	"github.com/Azure/unbounded-kube/internal/metalman/dhcp"
+	"github.com/Azure/unbounded-kube/internal/metalman/indexing"
+	"github.com/Azure/unbounded-kube/internal/metalman/lifecycle"
+	"github.com/Azure/unbounded-kube/internal/metalman/netboot"
+	"github.com/Azure/unbounded-kube/internal/metalman/redfish"
 )
 
 // ServePXECmd returns a cobra.Command that runs PXE servers and the BMC control loop.

@@ -97,7 +97,7 @@ hands-on walkthrough.
 
 ### unbounded-net -- Multi-Site Networking
 
-**[unbounded-net](https://github.com/project-unbounded/unbounded-net)** is a
+**[unbounded-net](https://github.com/Azure/unbounded-net)** is a
 CNI plugin and multi-site networking system. It provides transparent pod-to-pod
 connectivity across sites by:
 

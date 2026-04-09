@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package app
 
 import (
@@ -20,7 +23,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"github.com/project-unbounded/unbounded-kube/internal/kube"
+	"github.com/Azure/unbounded-kube/internal/kube"
 )
 
 const (

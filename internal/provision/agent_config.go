@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package provision
 
 // AgentConfig is the configuration document uploaded to the remote machine

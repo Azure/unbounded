@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package v1alpha3
 
 import (
@@ -177,7 +180,7 @@ type RedfishSpec struct {
 // PXESpec defines PXE boot configuration for a Machine.
 type PXESpec struct {
 	// Image is an OCI image reference containing netboot artifacts.
-	// Example: "ghcr.io/project-unbounded/images/host-ubuntu2404:v1"
+	// Example: "ghcr.io/azure/images/host-ubuntu2404:v1"
 	// +kubebuilder:validation:Required
 	Image string `json:"image"`
 

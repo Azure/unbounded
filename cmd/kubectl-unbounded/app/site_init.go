@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package app
 
 import (
@@ -20,8 +23,8 @@ import (
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"github.com/project-unbounded/unbounded-kube/cmd/machina/machina/controller"
-	"github.com/project-unbounded/unbounded-kube/internal/kube"
+	"github.com/Azure/unbounded-kube/cmd/machina/machina/controller"
+	"github.com/Azure/unbounded-kube/internal/kube"
 )
 
 //go:embed assets/unbounded-net-site/*.yaml
@@ -31,7 +34,7 @@ var siteTemplates embed.FS
 var flexAgentTemplates embed.FS
 
 const (
-	unboundedCNIRelease = "https://github.com/project-unbounded/unbounded-net/releases/download/v1.1.2/unbounded-net-manifests-v1.1.2.tar.gz"
+	unboundedCNIRelease = "https://github.com/Azure/unbounded-net/releases/download/v1.1.2/unbounded-net-manifests-v1.1.2.tar.gz"
 )
 
 // siteInitHandler is responsible for handling initial unbounded-kube bootstrap and also ensuring a site

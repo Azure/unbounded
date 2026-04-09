@@ -109,7 +109,7 @@ A successful run looks like this (timestamps shortened for readability):
 [I] [apply-attestation] completed duration=12.81µs status=ok
 [I] [ensure-nspawn-workspace] started
 [I] [oci-download-rootfs] started
-[I] pulling OCI image image=ghcr.io/project-unbounded/agent-ubuntu2404:... dest=/var/lib/machines/my-node
+[I] pulling OCI image image=ghcr.io/azure/agent-ubuntu2404:... dest=/var/lib/machines/my-node
 [I] OCI image extraction complete dest=/var/lib/machines/my-node
 [I] [oci-download-rootfs] completed duration=2.10s status=ok
 [I] [ensure-nspawn-workspace] completed duration=2.23s status=ok

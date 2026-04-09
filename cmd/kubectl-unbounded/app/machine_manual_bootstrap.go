@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package app
 
 import (
@@ -20,9 +23,9 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
-	"github.com/project-unbounded/unbounded-kube/internal/cloudprovider"
-	"github.com/project-unbounded/unbounded-kube/internal/kube"
-	"github.com/project-unbounded/unbounded-kube/internal/provision"
+	"github.com/Azure/unbounded-kube/internal/cloudprovider"
+	"github.com/Azure/unbounded-kube/internal/kube"
+	"github.com/Azure/unbounded-kube/internal/provision"
 )
 
 //go:embed assets/node-bootstrap/script.sh

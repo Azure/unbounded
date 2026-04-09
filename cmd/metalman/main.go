@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package main
 
 import (
@@ -8,8 +11,8 @@ import (
 	"github.com/spf13/cobra"
 	ctrl "sigs.k8s.io/controller-runtime"
 
-	"github.com/project-unbounded/unbounded-kube/internal/metalman/commands"
-	"github.com/project-unbounded/unbounded-kube/internal/version"
+	"github.com/Azure/unbounded-kube/internal/metalman/commands"
+	"github.com/Azure/unbounded-kube/internal/version"
 )
 
 func main() {

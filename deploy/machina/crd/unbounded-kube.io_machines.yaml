@@ -164,7 +164,7 @@ spec:
                   image:
                     description: |-
                       Image is an OCI image reference containing netboot artifacts.
-                      Example: "ghcr.io/project-unbounded/images/host-ubuntu2404:v1"
+                      Example: "ghcr.io/azure/images/host-ubuntu2404:v1"
                     type: string
                   redfish:
                     description: Redfish configures optional Redfish BMC access.

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package goalstates
 
 const (
@@ -43,8 +46,8 @@ const (
 
 	// Default OCI images for the nspawn rootfs when no image is explicitly
 	// configured or set via AGENT_OCI_IMAGE.
-	DefaultOCIImage      = "ghcr.io/project-unbounded/agent-ubuntu2404:v20260408"
-	DefaultNvidiaOCImage = "ghcr.io/project-unbounded/agent-ubuntu2404-nvidia:v20260408"
+	DefaultOCIImage      = "ghcr.io/azure/agent-ubuntu2404:v20260408"
+	DefaultNvidiaOCImage = "ghcr.io/azure/agent-ubuntu2404-nvidia:v20260408"
 
 	SystemdUnitContainerd   = "containerd.service"
 	ContainerdConfigPath    = "/etc/containerd/config.toml"

@@ -19,7 +19,7 @@ metadata:
   name: node-01
 spec:
   pxe:
-    image: ghcr.io/project-unbounded/images/host-ubuntu2404:v1
+    image: ghcr.io/azure/images/host-ubuntu2404:v1
     dhcpLeases:
     - mac: "aa:bb:cc:dd:ee:01"
       ipv4: "10.0.0.11"
@@ -158,8 +158,8 @@ configuration (e.g. `dhcpBootImageName`).
 Images are built, tagged, and pushed using standard container tooling:
 
 ```bash
-docker build -t ghcr.io/project-unbounded/images/host-ubuntu2404:v1 .
-docker push ghcr.io/project-unbounded/images/host-ubuntu2404:v1
+docker build -t ghcr.io/azure/images/host-ubuntu2404:v1 .
+docker push ghcr.io/azure/images/host-ubuntu2404:v1
 ```
 
 The OCI image layout is the one described above: boot artifacts live under
@@ -178,7 +178,7 @@ metadata:
   name: node-01
 spec:
   pxe:
-    image: ghcr.io/project-unbounded/images/host-ubuntu2404:v1
+    image: ghcr.io/azure/images/host-ubuntu2404:v1
     dhcpLeases:
     - mac: "aa:bb:cc:dd:ee:01"
       ipv4: "10.0.0.11"
@@ -202,7 +202,7 @@ metadata:
   name: node-01
 spec:
   pxe:
-    image: ghcr.io/project-unbounded/images/host-ubuntu2404:v1
+    image: ghcr.io/azure/images/host-ubuntu2404:v1
     dhcpLeases:
     - mac: "aa:bb:cc:dd:ee:01"
       ipv4: "10.0.0.11"

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package oci
 
 import (
@@ -12,7 +15,7 @@ import (
 	"github.com/opencontainers/umoci/oci/casext"
 	"github.com/opencontainers/umoci/oci/layer"
 
-	"github.com/project-unbounded/unbounded-kube/internal/ociutil"
+	"github.com/Azure/unbounded-kube/internal/ociutil"
 )
 
 func init() {

@@ -133,7 +133,7 @@ jobs:
           gh release upload "${TAG}" dist/deploy.tar.gz --clobber
 
           export VERSION="${TAG}"
-          export REPO="project-unbounded/unbounded-kube"
+          export REPO="Azure/unbounded-kube"
           export SHA_LINUX_AMD64=$(sha256sum dist/kubectl-unbounded-linux-amd64.tar.gz | awk '{print $1}')
           export SHA_LINUX_ARM64=$(sha256sum dist/kubectl-unbounded-linux-arm64.tar.gz | awk '{print $1}')
           export SHA_DARWIN_AMD64=$(sha256sum dist/kubectl-unbounded-darwin-amd64.tar.gz | awk '{print $1}')

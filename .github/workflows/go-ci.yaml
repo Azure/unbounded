@@ -125,7 +125,7 @@ jobs:
 
       - name: Regenerate deepcopy and CRD manifests
         run: |
-          controller-gen object paths="./api/..."
+          controller-gen object:headerFile=hack/boilerplate.go.txt paths="./api/..."
           controller-gen crd paths="./api/..." output:crd:artifacts:config=deploy/machina/crd
 
       - name: Check for drift in generated files

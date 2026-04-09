@@ -1,4 +1,4 @@
-baseURL = "https://project-unbounded.github.io/unbounded-kube/"
+baseURL = "https://Azure.github.io/unbounded-kube/"
 languageCode = "en-us"
 title = "Unbounded Kube"
 
@@ -16,7 +16,7 @@ title = "Unbounded Kube"
 
 [params]
   description = "Run nodes across multiple cloud providers and bare-metal infrastructure to form a unified Kubernetes cluster, no matter where your infrastructure lives."
-  repo = "https://github.com/project-unbounded/unbounded-kube"
+  repo = "https://github.com/Azure/unbounded-kube"
 
 [menu]
   [[menu.main]]
@@ -33,5 +33,5 @@ title = "Unbounded Kube"
     weight = 3
   [[menu.main]]
     name = "GitHub"
-    url = "https://github.com/project-unbounded/unbounded-kube"
+    url = "https://github.com/Azure/unbounded-kube"
     weight = 4

@@ -8,9 +8,9 @@ builds:
       - CGO_ENABLED=0
     ldflags:
       - -s -w
-      - -X github.com/project-unbounded/unbounded-kube/internal/version.Version={{ .Version }}
-      - -X github.com/project-unbounded/unbounded-kube/internal/version.GitCommit={{ .ShortCommit }}
-      - -X github.com/project-unbounded/unbounded-kube/cmd/kubectl-unbounded/app.MetalmanImage=ghcr.io/project-unbounded/metalman:v{{ .Version }}
+      - -X github.com/Azure/unbounded-kube/internal/version.Version={{ .Version }}
+      - -X github.com/Azure/unbounded-kube/internal/version.GitCommit={{ .ShortCommit }}
+      - -X github.com/Azure/unbounded-kube/cmd/kubectl-unbounded/app.MetalmanImage=ghcr.io/azure/metalman:v{{ .Version }}
     hooks:
       pre:
         - make machina-manifests MACHINA_TAG={{ .Tag }}
@@ -28,8 +28,8 @@ builds:
       - CGO_ENABLED=0
     ldflags:
       - -s -w
-      - -X github.com/project-unbounded/unbounded-kube/internal/version.Version={{ .Version }}
-      - -X github.com/project-unbounded/unbounded-kube/internal/version.GitCommit={{ .ShortCommit }}
+      - -X github.com/Azure/unbounded-kube/internal/version.Version={{ .Version }}
+      - -X github.com/Azure/unbounded-kube/internal/version.GitCommit={{ .ShortCommit }}
     goos:
       - linux
     goarch:
@@ -94,6 +94,6 @@ changelog:
 
 release:
   github:
-    owner: project-unbounded
+    owner: Azure
     name: unbounded-kube
   prerelease: auto

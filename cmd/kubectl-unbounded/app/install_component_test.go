@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package app
 
 import (
@@ -26,7 +29,7 @@ import (
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
-	machinadeploy "github.com/project-unbounded/unbounded-kube/deploy/machina"
+	machinadeploy "github.com/Azure/unbounded-kube/deploy/machina"
 )
 
 // discardLogger returns a logger that discards all output.

@@ -18,7 +18,7 @@ The plugin binary can also be invoked directly as `kubectl-unbounded`.
 ## Installation
 
 Download the plugin binary from the
-[GitHub releases](https://github.com/project-unbounded/unbounded-kube/releases)
+[GitHub releases](https://github.com/Azure/unbounded-kube/releases)
 page and place it on your `PATH`. kubectl automatically discovers plugins named
 `kubectl-<name>`.
 

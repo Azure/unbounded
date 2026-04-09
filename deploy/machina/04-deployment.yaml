@@ -35,7 +35,7 @@ spec:
             name: machina-config
       containers:
         - name: machina-controller
-          image: ghcr.io/project-unbounded/machina:latest
+          image: ghcr.io/azure/machina:latest
           imagePullPolicy: Always
           args:
             - controller

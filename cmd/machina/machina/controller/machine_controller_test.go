@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package controller
 
 import (
@@ -17,7 +20,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	unboundedv1alpha3 "github.com/project-unbounded/unbounded-kube/api/v1alpha3"
+	unboundedv1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
 )
 
 // ---------------------------------------------------------------------------
@@ -343,7 +346,7 @@ func TestMachineReconciler_Provisioning_SetsAgentStatus(t *testing.T) {
 
 	machine := newTestMachine("test-machine", "10.0.0.1:22", "testuser", defaultKubernetes())
 	machine.Spec.Agent = &unboundedv1alpha3.AgentSpec{
-		Image: "ghcr.io/project-unbounded/rootfs:v1.0.0",
+		Image: "ghcr.io/azure/rootfs:v1.0.0",
 	}
 
 	sshSecret := newSSHKeySecret(t, "ssh-key-secret")
@@ -378,7 +381,7 @@ func TestMachineReconciler_Provisioning_SetsAgentStatus(t *testing.T) {
 
 	// Agent status should reflect the applied spec.
 	require.NotNil(t, updated.Status.Agent, "Status.Agent should be set after provisioning")
-	require.Equal(t, "ghcr.io/project-unbounded/rootfs:v1.0.0", updated.Status.Agent.Image)
+	require.Equal(t, "ghcr.io/azure/rootfs:v1.0.0", updated.Status.Agent.Image)
 }
 
 func TestMachineReconciler_Provisioning_NoAgentSpec_NilAgentStatus(t *testing.T) {

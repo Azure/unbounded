@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package host
 
 import (
@@ -19,7 +22,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/project-unbounded/unbounded-kube/internal/helpers"
+	"github.com/Azure/unbounded-kube/internal/helpers"
 )
 
 // TestParseTPM2B tests the TPM2B wire-format parser.

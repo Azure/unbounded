@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package site
 
 import (
@@ -8,9 +11,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/yaml"
 
-	machinav1alpha3 "github.com/project-unbounded/unbounded-kube/api/v1alpha3"
-	"github.com/project-unbounded/unbounded-kube/hack/cmd/forge/forge/site/azuredev"
-	"github.com/project-unbounded/unbounded-kube/internal/kube"
+	machinav1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
+	"github.com/Azure/unbounded-kube/hack/cmd/forge/forge/site/azuredev"
+	"github.com/Azure/unbounded-kube/internal/kube"
 )
 
 // machinaNameFromInventory builds a Machine CR name from the site name, LB IP,
