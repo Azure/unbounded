@@ -41,11 +41,7 @@ type Provider interface {
 }
 
 // AKSProvider implements Provider for Azure Kubernetes Service clusters.
-type AKSProvider struct {
-	// ClusterName is the value of the kubernetes.azure.com/cluster label
-	// read from a system-mode node.
-	ClusterName string
-}
+type AKSProvider struct{}
 
 func (p *AKSProvider) ID() string {
 	return "microsoft-aks"
@@ -54,7 +50,6 @@ func (p *AKSProvider) ID() string {
 func (p *AKSProvider) DefaultLabels() map[string]string {
 	return map[string]string{
 		"kubernetes.azure.com/managed": "false",
-		"kubernetes.azure.com/cluster": p.ClusterName,
 	}
 }
 
@@ -78,26 +73,5 @@ func DetectProvider(ctx context.Context, k kubernetes.Interface) (Provider, erro
 
 	logger.Info("AKS provider detected")
 
-	// Read the kubernetes.azure.com/cluster label from a system-mode node.
-	nodes, err := k.CoreV1().Nodes().List(ctx, metav1.ListOptions{
-		LabelSelector: "kubernetes.azure.com/mode=system",
-		Limit:         1,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("list system-mode nodes: %w", err)
-	}
-
-	if len(nodes.Items) == 0 {
-		return nil, fmt.Errorf("AKS detected but no nodes found with label kubernetes.azure.com/mode=system")
-	}
-
-	clusterName, ok := nodes.Items[0].Labels["kubernetes.azure.com/cluster"]
-	if !ok || clusterName == "" {
-		return nil, fmt.Errorf("AKS detected but system-mode node %q is missing kubernetes.azure.com/cluster label",
-			nodes.Items[0].Name)
-	}
-
-	logger.Info("Resolved AKS cluster name", "clusterName", clusterName)
-
-	return &AKSProvider{ClusterName: clusterName}, nil
+	return &AKSProvider{}, nil
 }

@@ -1112,7 +1112,7 @@ func TestProvisionMachine_ProviderLabelsOverride(t *testing.T) {
 		Client: fakeClient,
 		Scheme: s,
 		ClusterInfo: &ClusterInfo{
-			Provider: &cloudprovider.AKSProvider{ClusterName: "mc_rg_test_eastus"},
+			Provider: &cloudprovider.AKSProvider{},
 		},
 	}
 
@@ -1143,8 +1143,7 @@ func TestProvisionMachine_ProviderLabelsOverride(t *testing.T) {
 	// Provider label overrides user-specified value.
 	require.Equal(t, "false", agentConfig.Kubelet.Labels["kubernetes.azure.com/managed"])
 
-	// Provider label for cluster name is injected.
-	require.Equal(t, "mc_rg_test_eastus", agentConfig.Kubelet.Labels["kubernetes.azure.com/cluster"])
+	// kubernetes.azure.com/cluster label is no longer applied to unbounded-managed nodes.
 
 	// Controller-injected label is present.
 	require.Equal(t, "provider-label-machine", agentConfig.Kubelet.Labels[MachineNodeLabel])

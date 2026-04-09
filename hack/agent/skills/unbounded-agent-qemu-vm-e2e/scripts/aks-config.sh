@@ -93,14 +93,8 @@ done <<< "$token_names"
 [[ -n "$token_id" && -n "$token_secret" ]] || die "no valid bootstrap token found in kube-system secrets"
 bootstrap_token="${token_id}.${token_secret}"
 
-# --- NODE RESOURCE GROUP (for Labels) ---
-cluster_rg=$(kubectl get nodes -o jsonpath='{.items[0].metadata.labels.kubernetes\.azure\.com/cluster}' 2>/dev/null) || true
-
 # --- Build labels JSON object ---
 labels_json="\"kubernetes.azure.com/managed\": \"false\""
-if [[ -n "$cluster_rg" ]]; then
-    labels_json+=", \"kubernetes.azure.com/cluster\": \"${cluster_rg}\""
-fi
 
 # --- Build taints JSON array ---
 # REGISTER_WITH_TAINTS is optional; split comma-separated entries into a JSON array.
