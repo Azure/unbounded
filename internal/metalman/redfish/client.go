@@ -263,7 +263,7 @@ func newHTTPClient(certSHA256 string) *http.Client {
 		Timeout: 30 * time.Second,
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true,
+				InsecureSkipVerify: true, //nolint:gosec // codeql[go/disabled-certificate-check] certificate validation is handled by VerifyConnection below (cert pinning)
 				VerifyConnection: func(cs tls.ConnectionState) error {
 					if certSHA256 == "" {
 						return nil

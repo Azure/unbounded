@@ -1,5 +1,5 @@
 # Build stage
-FROM mcr.microsoft.com/azurelinux/base/core:3.0 AS builder
+FROM mcr.microsoft.com/azurelinux/base/core:3.0@sha256:35149ae8dd179684f969944f54a337c665a64e702486154eb44253fb39c2505b AS builder
 
 # Install build dependencies
 RUN tdnf install -y \
@@ -39,7 +39,7 @@ ARG VERSION=dev
 RUN make machina-build VERSION=${VERSION}
 
 # Runtime stage
-FROM mcr.microsoft.com/azurelinux/base/core:3.0
+FROM mcr.microsoft.com/azurelinux/base/core:3.0@sha256:35149ae8dd179684f969944f54a337c665a64e702486154eb44253fb39c2505b
 
 # Install runtime dependencies
 RUN tdnf install -y \

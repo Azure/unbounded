@@ -68,7 +68,7 @@ func DecompressTarGzFromRemote(ctx context.Context, url string) iter.Seq2[*TarFi
 		tarReader := tar.NewReader(gzipStream)
 
 		for {
-			header, err := tarReader.Next()
+			header, err := tarReader.Next() // codeql[go/zipslip] path traversal is prevented by cleanedTarEntryName below
 			if errors.Is(err, io.EOF) {
 				break
 			}
