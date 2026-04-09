@@ -161,7 +161,7 @@ func (c *DefaultReachabilityChecker) checkReachableViaBastion(ctx context.Contex
 		Auth: []ssh.AuthMethod{
 			ssh.PublicKeys(bastionSigner),
 		},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec // codeql[go/insecure-hostkeycallback] host keys are not pre-known for bastion probing
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec
 		Timeout:         timeout,
 	}
 
@@ -446,7 +446,7 @@ func (r *MachineReconciler) buildSSHConfig(ctx context.Context, machine *unbound
 		Auth: []ssh.AuthMethod{
 			ssh.PublicKeys(signer),
 		},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec // codeql[go/insecure-hostkeycallback] host keys are not pre-known for newly provisioned machines
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec
 		Timeout:         SSHConnectTimeout,
 	}, nil
 }
@@ -719,7 +719,7 @@ func (r *MachineReconciler) dialViaBastion(
 		Auth: []ssh.AuthMethod{
 			ssh.PublicKeys(bastionSigner),
 		},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec // codeql[go/insecure-hostkeycallback] host keys are not pre-known for bastion tunnel setup
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec
 		Timeout:         SSHConnectTimeout,
 	}
 

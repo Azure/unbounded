@@ -457,7 +457,7 @@ def _run_agent_inner(agent_url: str) -> None:
         },
     }
 
-    agent_config_path.write_text(json.dumps(agent_config, indent=2))  # codeql[py/clear-text-storage-sensitive-data] bootstrap token is ephemeral and used only in CI test VMs
+    agent_config_path.write_text(json.dumps(agent_config, indent=2))
     agent_config_path.chmod(0o600)  # restrict access; contains bootstrap token
     log(f"Agent config written to {agent_config_path}")
 
