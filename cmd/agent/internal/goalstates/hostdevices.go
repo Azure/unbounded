@@ -3,19 +3,24 @@
 
 package goalstates
 
-import "os"
+import (
+	"os"
+	"sort"
+)
 
 const kvmDevicePath = "/dev/kvm"
 
 // DiscoverHostDevicePaths probes the host for device nodes that should be
-// bind-mounted into the nspawn container and returns their paths. Currently
-// discovers the KVM character device (/dev/kvm) when present.
+// bind-mounted into the nspawn container and returns their paths in a stable
+// order so that repeated calls produce the same config output.
 func DiscoverHostDevicePaths() []string {
 	var paths []string
 
 	if p := discoverKVMDevicePath(kvmDevicePath); p != "" {
 		paths = append(paths, p)
 	}
+
+	sort.Strings(paths)
 
 	return paths
 }

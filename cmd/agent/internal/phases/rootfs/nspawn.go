@@ -90,7 +90,7 @@ func (e *ensureNSpawnWorkspace) writeNSpawnConfigs() error {
 
 	if len(e.goalState.HostDevicePaths) > 0 {
 		e.log.Info("host devices detected, configuring nspawn bind-mounts",
-			"paths", e.goalState.HostDevicePaths)
+			"count", len(e.goalState.HostDevicePaths))
 	}
 
 	if len(e.goalState.Nvidia.GPUDevicePaths) > 0 {
