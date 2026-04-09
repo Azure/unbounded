@@ -68,9 +68,9 @@ func (e *ensureNSpawnWorkspace) bootstrapWorkspace(ctx context.Context) error {
 // service-override.conf templates. Using a struct (rather than map[string]any)
 // lets us attach helper methods that the templates can call directly.
 type nspawnTemplateData struct {
-	HostDevicePaths     []string
+	HostDevicePaths      []string
 	NvidiaGPUDevicePaths []string
-	NvidiaLibDirMounts  []goalstates.NvidiaLibDirMount
+	NvidiaLibDirMounts   []goalstates.NvidiaLibDirMount
 }
 
 // HasFilesSection reports whether the rendered nspawn config requires a
