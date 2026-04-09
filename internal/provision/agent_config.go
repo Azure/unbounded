@@ -7,15 +7,8 @@ import (
 	"maps"
 	"strings"
 
-	v1alpha3 "github.com/project-unbounded/unbounded-kube/api/v1alpha3"
-	"github.com/project-unbounded/unbounded-kube/internal/cloudprovider"
-)
-
-const (
-	// MachineNodeLabel is the label key applied to Nodes that correspond
-	// to a Machine. The value is the Machine name. It is injected into
-	// every AgentConfig by BuildAgentConfig.
-	MachineNodeLabel = "unbounded-kube.io/machine"
+	v1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
+	"github.com/Azure/unbounded-kube/internal/cloudprovider"
 )
 
 // AgentConfig is the configuration document uploaded to the remote machine
@@ -36,11 +29,6 @@ type AgentConfig struct {
 	// performs TPM attestation on the host instead of requiring a static
 	// BootstrapToken in Kubelet config.
 	Attest *AgentAttestConfig `json:"Attest,omitempty"`
-
-	// Network configures optional host-level networking that must be
-	// applied before the agent starts (e.g. static routes for
-	// cross-subnet control-plane access).
-	Network *AgentNetworkConfig `json:"Network,omitempty"`
 }
 
 // AgentClusterConfig holds the cluster-level values the agent needs to
@@ -68,28 +56,10 @@ type AgentAttestConfig struct {
 	URL string `json:"URL"`
 }
 
-// AgentNetworkConfig holds optional host networking configuration that
-// must be applied before the node bootstrap runs.
-type AgentNetworkConfig struct {
-	// GatewayRoutes is a list of IP addresses that should be made
-	// reachable as gateways on the node's primary interface. Each
-	// entry results in a /32 host route (ip route add <ip>/32 dev
-	// <iface>) so that the kernel treats the address as directly
-	// connected for nexthop resolution.
-	//
-	// This is needed when the CNI plugin (e.g. kindnet) adds routes
-	// of the form "10.244.x.0/24 via <control-plane-IP>" and the
-	// control-plane IP is not on a directly-connected subnet.
-	GatewayRoutes []string `json:"GatewayRoutes,omitempty"`
-}
-
-// BuildAgentConfigParams holds the inputs for BuildAgentConfig.
-// Cluster-level values are resolved once at controller startup and reused
-// across reconcile loops. Machine-level values come from the Machine object.
-type BuildAgentConfigParams struct {
-	// Machine is the Machine object to build the config for.
-	Machine *v1alpha3.Machine
-
+// ClusterEndpoint holds the cluster-level connection parameters needed to
+// build agent configuration. These values are typically resolved once at
+// controller startup and reused across reconcile loops.
+type ClusterEndpoint struct {
 	// APIServer is the Kubernetes API server endpoint (e.g.
 	// "my-cluster-dns.hcp.eastus.azmk8s.io:443").
 	APIServer string
@@ -104,6 +74,17 @@ type BuildAgentConfigParams struct {
 	// used as a fallback when the Machine's Spec.Kubernetes.Version is
 	// empty.
 	KubeVersion string
+}
+
+// BuildAgentConfigParams holds the inputs for BuildAgentConfig.
+// Cluster-level values are resolved once at controller startup and reused
+// across reconcile loops. Machine-level values come from the Machine object.
+type BuildAgentConfigParams struct {
+	// Machine is the Machine object to build the config for.
+	Machine *v1alpha3.Machine
+
+	// Cluster holds the cluster-level connection parameters.
+	Cluster ClusterEndpoint
 
 	// ProviderLabels are cloud-provider-injected labels that override
 	// all other labels. These are typically resolved from
@@ -118,11 +99,6 @@ type BuildAgentConfigParams struct {
 	// TPM-based attestation (e.g. "http://10.0.0.1:8880"). When non-empty
 	// an Attest section is included in the config.
 	AttestURL string
-
-	// GatewayRoutes is an optional list of IP addresses that should be
-	// made directly reachable on the node's primary interface so that
-	// CNI plugins can use them as nexthops. See AgentNetworkConfig.
-	GatewayRoutes []string
 }
 
 // BuildAgentConfig constructs an AgentConfig from a Machine and cluster-level
@@ -132,14 +108,13 @@ type BuildAgentConfigParams struct {
 //
 // Label priority (lowest to highest):
 //  1. User-defined labels from Machine.Spec.Kubernetes.NodeLabels.
-//  2. Controller-injected label: "unbounded-kube.io/machine" = Machine.Name.
-//  3. Common labels applied unconditionally (e.g. cloud provider exclusion).
-//  4. Provider-injected labels from params.ProviderLabels.
+//  2. Common labels applied unconditionally (e.g. cloud provider exclusion).
+//  3. Provider-injected labels from params.ProviderLabels.
 func BuildAgentConfig(params BuildAgentConfigParams) AgentConfig {
 	machine := params.Machine
 
 	// Resolve Kubernetes version: Machine spec overrides cluster default.
-	k8sVersion := params.KubeVersion
+	k8sVersion := params.Cluster.KubeVersion
 	if machine.Spec.Kubernetes != nil && machine.Spec.Kubernetes.Version != "" {
 		k8sVersion = machine.Spec.Kubernetes.Version
 	}
@@ -154,8 +129,6 @@ func BuildAgentConfig(params BuildAgentConfigParams) AgentConfig {
 	if machine.Spec.Kubernetes != nil {
 		maps.Copy(labels, machine.Spec.Kubernetes.NodeLabels)
 	}
-
-	labels[MachineNodeLabel] = machine.Name
 
 	// Common labels are applied unconditionally to every node provisioned
 	// by unbounded, regardless of the detected cloud provider.
@@ -178,12 +151,12 @@ func BuildAgentConfig(params BuildAgentConfigParams) AgentConfig {
 	cfg := AgentConfig{
 		MachineName: machine.Name,
 		Cluster: AgentClusterConfig{
-			CaCertBase64: params.CACertBase64,
-			ClusterDNS:   params.ClusterDNS,
+			CaCertBase64: params.Cluster.CACertBase64,
+			ClusterDNS:   params.Cluster.ClusterDNS,
 			Version:      k8sVersion,
 		},
 		Kubelet: AgentKubeletConfig{
-			ApiServer:          params.APIServer,
+			ApiServer:          params.Cluster.APIServer,
 			BootstrapToken:     params.BootstrapToken,
 			Labels:             labels,
 			RegisterWithTaints: taints,
@@ -193,10 +166,6 @@ func BuildAgentConfig(params BuildAgentConfigParams) AgentConfig {
 
 	if params.AttestURL != "" {
 		cfg.Attest = &AgentAttestConfig{URL: params.AttestURL}
-	}
-
-	if len(params.GatewayRoutes) > 0 {
-		cfg.Network = &AgentNetworkConfig{GatewayRoutes: params.GatewayRoutes}
 	}
 
 	return cfg

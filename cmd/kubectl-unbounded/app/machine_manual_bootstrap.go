@@ -259,11 +259,13 @@ func (h *manualBootstrapHandler) buildAgentConfig(ctx context.Context) (*provisi
 	}
 
 	cfg := provision.BuildAgentConfig(provision.BuildAgentConfigParams{
-		Machine:        machine,
-		APIServer:      apiServer,
-		CACertBase64:   caCertBase64,
-		ClusterDNS:     clusterDNS,
-		KubeVersion:    k8sVersion,
+		Machine: machine,
+		Cluster: provision.ClusterEndpoint{
+			APIServer:    apiServer,
+			CACertBase64: caCertBase64,
+			ClusterDNS:   clusterDNS,
+			KubeVersion:  k8sVersion,
+		},
 		ProviderLabels: providerLabels,
 		BootstrapToken: bootstrapToken,
 	})

@@ -4,8 +4,8 @@
 package commands
 
 import (
-	"encoding/base64"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -47,7 +47,6 @@ func ServePXECmd() *cobra.Command {
 		leaseDuration     time.Duration
 		renewDeadline     time.Duration
 		retryPeriod       time.Duration
-		gatewayRoutes     []string
 	)
 
 	cmd := &cobra.Command{
@@ -114,6 +113,19 @@ func ServePXECmd() *cobra.Command {
 				return fmt.Errorf("creating clientset: %w", err)
 			}
 
+			// Detect cloud provider for default node labels. These are
+			// static and resolved once at startup.
+			var providerLabels map[string]string
+
+			provider, err := cloudprovider.DetectProvider(ctx, clientset)
+			if err != nil {
+				return fmt.Errorf("detect provider: %w", err)
+			}
+
+			if provider != nil {
+				providerLabels = provider.DefaultLabels()
+			}
+
 			sv, err := clientset.Discovery().ServerVersion()
 			if err != nil {
 				return fmt.Errorf("resolving cluster Kubernetes version: %w", err)
@@ -132,29 +144,17 @@ func ServePXECmd() *cobra.Command {
 				return fmt.Errorf("kube-dns Service has no ClusterIP")
 			}
 
-			// Resolve CA certificate from kube-root-ca.crt ConfigMap.
-			cm, err := clientset.CoreV1().ConfigMaps(metav1.NamespacePublic).Get(ctx, "kube-root-ca.crt", metav1.GetOptions{})
+			// Watch the cluster-info ConfigMap in kube-public for API
+			// server URL and CA certificate. This is the only watched
+			// cluster-level resource; DNS and version are resolved once
+			// at startup above.
+			clusterInfoWatcher, err := NewClusterInfoWatcher(ctx, clientset, slog.Default())
 			if err != nil {
-				return fmt.Errorf("get kube-root-ca.crt ConfigMap from kube-public: %w", err)
+				return fmt.Errorf("creating cluster-info watcher: %w", err)
 			}
 
-			caCert, ok := cm.Data["ca.crt"]
-			if !ok {
-				return fmt.Errorf("ca.crt key not found in kube-root-ca.crt ConfigMap")
-			}
-
-			caCertBase64 := base64.StdEncoding.EncodeToString([]byte(caCert))
-
-			// Detect cloud provider for default node labels.
-			var providerLabels map[string]string
-
-			provider, err := cloudprovider.DetectProvider(ctx, clientset)
-			if err != nil {
-				return fmt.Errorf("detect provider: %w", err)
-			}
-
-			if provider != nil {
-				providerLabels = provider.DefaultLabels()
+			if err := mgr.Add(clusterInfoWatcher); err != nil {
+				return fmt.Errorf("adding cluster-info watcher: %w", err)
 			}
 
 			clusterCA := attestation.ClusterCAFromConfig(cfg)
@@ -173,13 +173,6 @@ func ServePXECmd() *cobra.Command {
 				}
 
 				serveURL = fmt.Sprintf("http://%s:%d", ip, httpPort)
-			}
-
-			// Resolve the external API server URL from the standard cluster-info
-			// ConfigMap in the kube-public namespace.
-			apiserverURL, err := ResolveApiserverURL(ctx, clientset)
-			if err != nil {
-				return fmt.Errorf("resolving API server URL: %w", err)
 			}
 
 			ociCache := netboot.NewOCICache(cacheDir)
@@ -205,13 +198,11 @@ func ServePXECmd() *cobra.Command {
 			resolver := netboot.FileResolver{
 				Cache:             ociCache,
 				Reader:            mgr.GetClient(),
-				ApiserverURL:      apiserverURL,
+				Cluster:           clusterInfoWatcher,
 				ServeURL:          serveURL,
 				KubernetesVersion: kubeVersion,
 				ClusterDNS:        clusterDNS,
-				CACertBase64:      caCertBase64,
 				ProviderLabels:    providerLabels,
-				GatewayRoutes:     gatewayRoutes,
 			}
 
 			if dhcpInterface != "" && dhcpAutoInterface {
@@ -318,7 +309,6 @@ func ServePXECmd() *cobra.Command {
 	cmd.Flags().DurationVar(&leaseDuration, "leader-elect-lease-duration", 15*time.Second, "Duration that non-leader candidates will wait before attempting to acquire leadership")
 	cmd.Flags().DurationVar(&renewDeadline, "leader-elect-renew-deadline", 10*time.Second, "Duration the acting leader will retry refreshing leadership before giving up")
 	cmd.Flags().DurationVar(&retryPeriod, "leader-elect-retry-period", 2*time.Second, "Duration between leader election retries")
-	cmd.Flags().StringSliceVar(&gatewayRoutes, "gateway-routes", nil, "Comma-separated list of IPs to inject as /32 host routes on worker nodes for cross-subnet gateway reachability")
 
 	return cmd
 }

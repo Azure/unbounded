@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import atexit
+import base64
 import json
 import os
 import signal
@@ -53,6 +54,7 @@ AGENT_IMAGE_NAME_VM = f"{SERVER_IP}:{REGISTRY_PORT}/unbounded/agent-ubuntu2404:s
 BINARY = REPO_ROOT / "bin" / "metalman"
 KUBECTL_UNBOUNDED = REPO_ROOT / "bin" / "kubectl-unbounded"
 SERIAL_SOCK = TMPDIR / "console.sock"
+QGA_SOCK = TMPDIR / "qga.sock"
 
 KUBECTL = "kubectl"
 VIRSH = ["virsh", "--connect", "qemu:///system"]
@@ -69,6 +71,10 @@ def log(msg: str) -> None:
 
 def die(msg: str) -> None:
     print(f"FAIL: {msg}", file=sys.stderr)
+    try:
+        collect_debug_logs()
+    except Exception as e:
+        log(f"  (debug log collection failed: {e})")
     sys.exit(1)
 
 
@@ -143,6 +149,92 @@ def forward_console(sock_path: Path) -> None:
 
         # Socket closed — VM probably rebooted.  Retry.
         time.sleep(1)
+
+
+def guest_exec(command: str, timeout: int = 30) -> tuple[int, str, str]:
+    """Execute a command inside the VM via the QEMU guest agent.
+
+    Returns (exit_code, stdout, stderr).  Requires the guest agent channel
+    to be configured on the VM and the qemu-guest-agent service running
+    inside the guest.
+    """
+    exec_req = json.dumps({
+        "execute": "guest-exec",
+        "arguments": {
+            "path": "/bin/bash",
+            "arg": ["-c", command],
+            "capture-output": True,
+        },
+    })
+    result = subprocess.run(
+        [*VIRSH, "qemu-agent-command", VM_NAME, exec_req],
+        capture_output=True, text=True, timeout=10,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"guest-exec failed: {result.stderr.strip()}")
+    pid = json.loads(result.stdout)["return"]["pid"]
+
+    # Poll guest-exec-status until the process exits.
+    deadline = time.monotonic() + timeout
+    while True:
+        status_req = json.dumps({
+            "execute": "guest-exec-status",
+            "arguments": {"pid": pid},
+        })
+        result = subprocess.run(
+            [*VIRSH, "qemu-agent-command", VM_NAME, status_req],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"guest-exec-status failed: {result.stderr.strip()}")
+        status = json.loads(result.stdout)["return"]
+        if status.get("exited"):
+            exit_code = status.get("exitcode", -1)
+            stdout = base64.b64decode(status.get("out-data", "")).decode("utf-8", errors="replace")
+            stderr = base64.b64decode(status.get("err-data", "")).decode("utf-8", errors="replace")
+            return exit_code, stdout, stderr
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"guest-exec pid {pid} did not exit within {timeout}s")
+        time.sleep(0.5)
+
+
+def collect_debug_logs() -> None:
+    """Use the QEMU guest agent to dump kubelet and agent debug information.
+
+    Best-effort: failures are logged but do not abort the test.
+    """
+    log("Collecting debug logs from VM via QEMU guest agent...")
+    commands = [
+        ("systemctl status", "systemctl --no-pager status"),
+        ("unbounded-agent journal", "journalctl --no-pager -n 200 -u cloud-final.service"),
+        ("machinectl list", "machinectl list --no-pager"),
+        ("nspawn machine status", f"machinectl status {NODE_NAME} --no-pager"),
+        ("kubelet journal (nspawn)", (
+            f"systemd-run --pipe --wait --machine={NODE_NAME} "
+            "journalctl --no-pager -n 200 -u kubelet.service"
+        )),
+        ("containerd journal (nspawn)", (
+            f"systemd-run --pipe --wait --machine={NODE_NAME} "
+            "journalctl --no-pager -n 100 -u containerd.service"
+        )),
+        ("kubelet service status (nspawn)", (
+            f"systemd-run --pipe --wait --machine={NODE_NAME} "
+            "systemctl --no-pager status kubelet.service"
+        )),
+    ]
+    for label, cmd in commands:
+        log(f"  --- {label} ---")
+        try:
+            exit_code, stdout, stderr = guest_exec(cmd, timeout=30)
+            if stdout:
+                sys.stderr.write(stdout)
+                sys.stderr.flush()
+            if stderr:
+                sys.stderr.write(stderr)
+                sys.stderr.flush()
+        except (RuntimeError, TimeoutError, subprocess.TimeoutExpired, OSError) as e:
+            log(f"  (failed to collect {label}: {e})")
+    log("  --- end debug logs ---")
 
 
 def clean_libvirt() -> None:
@@ -389,6 +481,7 @@ def main() -> None:
         "--boot", f"uefi,loader=/usr/share/OVMF/OVMF_CODE_4M.fd,nvram={ovmf_vars},hd,network",
         "--tpm", "backend.type=emulator,backend.version=2.0",
         "--serial", f"unix,path={SERIAL_SOCK},mode=bind",
+        "--channel", f"unix,path={QGA_SOCK},mode=bind,target.type=virtio,target.name=org.qemu.guest_agent.0",
         "--os-variant", "generic",
         "--noautoconsole", "--noreboot", "--import",
     ], check=True)
@@ -510,7 +603,6 @@ def main() -> None:
         "sudo", str(BINARY), "serve-pxe", f"--site={SITE}", f"--bind-address={SERVER_IP}",
         f"--cache-dir={CACHE_DIR}",
         f"--serve-url={SERVE_URL}", "--dhcp-interface=virbr-smoke",
-        f"--gateway-routes={kind_ip}",
         "--leader-elect-lease-duration=60s",
         "--leader-elect-renew-deadline=40s",
         "--leader-elect-retry-period=5s",

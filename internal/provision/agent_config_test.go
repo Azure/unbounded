@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	v1alpha3 "github.com/project-unbounded/unbounded-kube/api/v1alpha3"
+	v1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
 )
 
 func TestAgentConfig_MarshalJSON(t *testing.T) {
@@ -27,8 +27,8 @@ func TestAgentConfig_MarshalJSON(t *testing.T) {
 			ApiServer:      "api.example.com:443",
 			BootstrapToken: "abc123.secret456",
 			Labels: map[string]string{
-				"unbounded-kube.io/machine": "my-machine",
-				"env":                       "prod",
+				"app": "my-machine",
+				"env": "prod",
 			},
 			RegisterWithTaints: []string{"dedicated=gpu:NoSchedule"},
 		},
@@ -52,7 +52,7 @@ func TestAgentConfig_MarshalJSON(t *testing.T) {
 	require.Equal(t, "api.example.com:443", kubelet["ApiServer"])
 	require.Equal(t, "abc123.secret456", kubelet["BootstrapToken"])
 	labels := kubelet["Labels"].(map[string]interface{})
-	require.Equal(t, "my-machine", labels["unbounded-kube.io/machine"])
+	require.Equal(t, "my-machine", labels["app"])
 	require.Equal(t, "prod", labels["env"])
 
 	taints := kubelet["RegisterWithTaints"].([]interface{})
@@ -204,10 +204,12 @@ func TestBuildAgentConfig(t *testing.T) {
 						Agent: &v1alpha3.AgentSpec{Image: "ghcr.io/org/rootfs:v1"},
 					},
 				},
-				APIServer:      "api.example.com:443",
-				CACertBase64:   "dGVzdC1jYQ==",
-				ClusterDNS:     "10.0.0.10",
-				KubeVersion:    "v1.33.0", // should be overridden by Machine spec
+				Cluster: ClusterEndpoint{
+					APIServer:    "api.example.com:443",
+					CACertBase64: "dGVzdC1jYQ==",
+					ClusterDNS:   "10.0.0.10",
+					KubeVersion:  "v1.33.0", // should be overridden by Machine spec
+				},
 				ProviderLabels: map[string]string{"provider-key": "provider-val"},
 				BootstrapToken: "abc123.secret456",
 			},
@@ -221,10 +223,9 @@ func TestBuildAgentConfig(t *testing.T) {
 				require.Equal(t, "ghcr.io/org/rootfs:v1", cfg.OCIImage)
 				require.Nil(t, cfg.Attest)
 
-				// Labels: user + machine + common + provider
+				// Labels: user + common + provider
 				require.Equal(t, "prod", cfg.Kubelet.Labels["env"])
 				require.Equal(t, "infra", cfg.Kubelet.Labels["team"])
-				require.Equal(t, "my-machine", cfg.Kubelet.Labels[MachineNodeLabel])
 				require.Equal(t, "provider-val", cfg.Kubelet.Labels["provider-key"])
 				require.Equal(t, "true", cfg.Kubelet.Labels["node.cloudprovider.kubernetes.io/exclude-from-external-cloud-provider"])
 
@@ -237,17 +238,18 @@ func TestBuildAgentConfig(t *testing.T) {
 				Machine: &v1alpha3.Machine{
 					ObjectMeta: metav1.ObjectMeta{Name: "bare-machine"},
 				},
-				APIServer:   "api.example.com:443",
-				KubeVersion: "v1.33.0",
+				Cluster: ClusterEndpoint{
+					APIServer:   "api.example.com:443",
+					KubeVersion: "v1.33.0",
+				},
 			},
 			assert: func(t *testing.T, cfg AgentConfig) {
 				require.Equal(t, "bare-machine", cfg.MachineName)
 				require.Equal(t, "v1.33.0", cfg.Cluster.Version)
 
-				// Machine label and common labels should be present.
-				require.Equal(t, "bare-machine", cfg.Kubelet.Labels[MachineNodeLabel])
+				// Common labels should be present.
 				require.Equal(t, "true", cfg.Kubelet.Labels["node.cloudprovider.kubernetes.io/exclude-from-external-cloud-provider"])
-				require.Len(t, cfg.Kubelet.Labels, 2)
+				require.Len(t, cfg.Kubelet.Labels, 1)
 				require.Nil(t, cfg.Kubelet.RegisterWithTaints)
 				require.Empty(t, cfg.OCIImage)
 			},
@@ -274,7 +276,9 @@ func TestBuildAgentConfig(t *testing.T) {
 				Machine: &v1alpha3.Machine{
 					ObjectMeta: metav1.ObjectMeta{Name: "fallback-test"},
 				},
-				KubeVersion: "1.33.0", // no "v" prefix, should be normalized
+				Cluster: ClusterEndpoint{
+					KubeVersion: "1.33.0", // no "v" prefix, should be normalized
+				},
 			},
 			assert: func(t *testing.T, cfg AgentConfig) {
 				require.Equal(t, "v1.33.0", cfg.Cluster.Version)
@@ -288,9 +292,8 @@ func TestBuildAgentConfig(t *testing.T) {
 					Spec: v1alpha3.MachineSpec{
 						Kubernetes: &v1alpha3.KubernetesSpec{
 							NodeLabels: map[string]string{
-								"user-label":     "user-value",
-								MachineNodeLabel: "user-override",   // should be overridden
-								"provider-key":   "user-tries-this", // should be overridden by provider
+								"user-label":   "user-value",
+								"provider-key": "user-tries-this", // should be overridden by provider
 							},
 						},
 					},
@@ -299,7 +302,6 @@ func TestBuildAgentConfig(t *testing.T) {
 			},
 			assert: func(t *testing.T, cfg AgentConfig) {
 				require.Equal(t, "user-value", cfg.Kubelet.Labels["user-label"])
-				require.Equal(t, "label-test", cfg.Kubelet.Labels[MachineNodeLabel])  // controller-injected wins over user
 				require.Equal(t, "provider-wins", cfg.Kubelet.Labels["provider-key"]) // provider wins over user
 			},
 		},
@@ -318,9 +320,8 @@ func TestBuildAgentConfig(t *testing.T) {
 			},
 			assert: func(t *testing.T, cfg AgentConfig) {
 				require.Equal(t, "value", cfg.Kubelet.Labels["key"])
-				require.Equal(t, "nil-provider", cfg.Kubelet.Labels[MachineNodeLabel])
 				require.Equal(t, "true", cfg.Kubelet.Labels["node.cloudprovider.kubernetes.io/exclude-from-external-cloud-provider"])
-				require.Len(t, cfg.Kubelet.Labels, 3)
+				require.Len(t, cfg.Kubelet.Labels, 2)
 			},
 		},
 		{
@@ -348,30 +349,6 @@ func TestBuildAgentConfig(t *testing.T) {
 			assert: func(t *testing.T, cfg AgentConfig) {
 				require.Nil(t, cfg.Attest)
 				require.Equal(t, "tok.sec", cfg.Kubelet.BootstrapToken)
-			},
-		},
-		{
-			name: "with gateway routes",
-			params: BuildAgentConfigParams{
-				Machine: &v1alpha3.Machine{
-					ObjectMeta: metav1.ObjectMeta{Name: "gw-node"},
-				},
-				GatewayRoutes: []string{"172.18.0.2", "10.0.0.1"},
-			},
-			assert: func(t *testing.T, cfg AgentConfig) {
-				require.NotNil(t, cfg.Network)
-				require.Equal(t, []string{"172.18.0.2", "10.0.0.1"}, cfg.Network.GatewayRoutes)
-			},
-		},
-		{
-			name: "without gateway routes",
-			params: BuildAgentConfigParams{
-				Machine: &v1alpha3.Machine{
-					ObjectMeta: metav1.ObjectMeta{Name: "no-gw-node"},
-				},
-			},
-			assert: func(t *testing.T, cfg AgentConfig) {
-				require.Nil(t, cfg.Network)
 			},
 		},
 	}

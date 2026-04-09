@@ -211,10 +211,10 @@ menuentry "Install" {
 
 	srv := &HTTPServer{
 		FileResolver: FileResolver{
-			Cache:        cache,
-			Reader:       fc,
-			ApiserverURL: "https://k8s.example.com",
-			ServeURL:     "http://10.0.1.1:8080",
+			Cache:    cache,
+			Reader:   fc,
+			Cluster:  &StaticClusterInfo{Info: ClusterInfo{ApiserverURL: "https://k8s.example.com"}},
+			ServeURL: "http://10.0.1.1:8080",
 		},
 	}
 
@@ -489,7 +489,7 @@ func TestUserDataTemplate_WithAgentImage(t *testing.T) {
     "Kubelet": {
       "ApiServer": "https://k8s.example.com",
       "Labels": {
-        "unbounded-kube.io/machine": "agent-img-node"
+        "node.cloudprovider.kubernetes.io/exclude-from-external-cloud-provider": "true"
       },
       "RegisterWithTaints": null
     },
@@ -539,7 +539,7 @@ func TestUserDataTemplate_WithoutAgentImage(t *testing.T) {
     "Kubelet": {
       "ApiServer": "https://k8s.example.com",
       "Labels": {
-        "unbounded-kube.io/machine": "no-agent-node"
+        "node.cloudprovider.kubernetes.io/exclude-from-external-cloud-provider": "true"
       },
       "RegisterWithTaints": null
     },
@@ -583,9 +583,11 @@ func TestResolveFileByPath_AgentConfig(t *testing.T) {
 	fc := fake.NewClientBuilder().WithScheme(scheme).Build()
 
 	resolver := FileResolver{
-		Cache:             cache,
-		Reader:            fc,
-		ApiserverURL:      "https://k8s.example.com",
+		Cache:  cache,
+		Reader: fc,
+		Cluster: &StaticClusterInfo{Info: ClusterInfo{
+			ApiserverURL: "https://k8s.example.com",
+		}},
 		ServeURL:          "http://10.0.1.1:8080",
 		KubernetesVersion: "1.30.0",
 		ClusterDNS:        "10.96.0.10",
@@ -859,10 +861,10 @@ menuentry "Install {{ .Machine.Name }}" {
 
 	httpSrv := &HTTPServer{
 		FileResolver: FileResolver{
-			Cache:        cache,
-			Reader:       fc,
-			ApiserverURL: "https://k8s.example.com",
-			ServeURL:     "http://10.0.3.1:8080",
+			Cache:    cache,
+			Reader:   fc,
+			Cluster:  &StaticClusterInfo{Info: ClusterInfo{ApiserverURL: "https://k8s.example.com"}},
+			ServeURL: "http://10.0.3.1:8080",
 		},
 	}
 

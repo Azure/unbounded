@@ -59,11 +59,6 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 			log := cmdCtx.Logger
 
 			return phases.Serial(log,
-				// Phase 0: pre-bootstrap networking
-				// Apply gateway host-routes so that CNI (e.g. kindnet)
-				// can install pod-CIDR routes with cross-subnet gateways.
-				host.ConfigureGatewayRoutes(log, cfg.Network),
-
 				// Phase 1: host
 				host.InstallPackages(log),
 				phases.Parallel(log,

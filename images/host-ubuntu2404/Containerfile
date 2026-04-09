@@ -19,11 +19,6 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build \
     -o /unbounded-agent ./cmd/agent
 
 # ── Assemble host image artifacts ───────────────────────────────────
-# IMPORTANT: This stage MUST use the same Ubuntu release as the netboot
-# initrd (currently 24.04 / Noble).  The init.cpio overlay copies shared
-# libraries (libc, ld-linux, etc.) for efibootmgr into the initrd.  If
-# these come from a different distro (e.g. Debian Bookworm with glibc 2.36)
-# they overwrite the Ubuntu libs and break /bin/sh which requires glibc 2.38.
 FROM docker.io/library/ubuntu:24.04 AS build
 
 ARG TARGETARCH
@@ -33,13 +28,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Download netboot artifacts ──────────────────────────────────────
-# We only download the EFI shim, GRUB, and the base initrd from the
-# netboot server.  The vmlinuz comes from the linux-image-generic
-# package installed above so it always matches the kernel modules we
-# bundle into init.cpio.  A version mismatch between the booted kernel
-# and the modules causes modprobe to silently fail, leaving no NIC
-# drivers loaded and panicking the installer.
-#
 # Ubuntu netboot layout differs by architecture:
 #   amd64: individual files at releases.ubuntu.com
 #   arm64: tarball at cdimage.ubuntu.com (individual URLs are unavailable)

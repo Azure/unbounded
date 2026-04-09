@@ -455,7 +455,7 @@ def _run_agent_inner(agent_url: str) -> None:
         "Kubelet": {
             "ApiServer": api_server,
             "BootstrapToken": bootstrap_token,
-            "Labels": {"unbounded-kube.io/machine": AGENT_MACHINE_NAME},
+            "Labels": {},
             "RegisterWithTaints": [],
         },
     }
