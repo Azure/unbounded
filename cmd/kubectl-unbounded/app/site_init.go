@@ -83,6 +83,12 @@ type siteInitHandler struct {
 	// When not provided it is derived from the kube-dns Service ClusterIP.
 	clusterServiceCIDR string
 
+	// manageCniPlugin controls whether unbounded-net manages the CNI plugin
+	// for the site. When false, the Site is configured with manageCniPlugin: false
+	// so that an existing CNI (e.g. Cilium, Calico) handles intra-site networking.
+	// Defaults to true.
+	manageCniPlugin bool
+
 	// kubeCli is the kubernetes client interface.
 	kubeCli kubernetes.Interface
 
@@ -148,9 +154,10 @@ func (h *siteInitHandler) execute(ctx context.Context) error {
 	}
 
 	if err := h.ensureUnboundedSite(ctx, unboundedSiteConfig{
-		SiteName:  "cluster",
-		NodeCIDRs: []string{h.clusterNodeCIDR},
-		PodCIDRs:  []string{h.clusterPodCIDR},
+		SiteName:        "cluster",
+		NodeCIDRs:       []string{h.clusterNodeCIDR},
+		PodCIDRs:        []string{h.clusterPodCIDR},
+		ManageCniPlugin: h.manageCniPlugin,
 		Manifests: []string{
 			"gatewaypool.yaml",
 			"site.yaml",
@@ -161,9 +168,10 @@ func (h *siteInitHandler) execute(ctx context.Context) error {
 	}
 
 	if err := h.ensureUnboundedSite(ctx, unboundedSiteConfig{
-		SiteName:  h.name,
-		NodeCIDRs: []string{h.nodeCIDR},
-		PodCIDRs:  []string{h.podCIDR},
+		SiteName:        h.name,
+		NodeCIDRs:       []string{h.nodeCIDR},
+		PodCIDRs:        []string{h.podCIDR},
+		ManageCniPlugin: h.manageCniPlugin,
 		Manifests: []string{
 			"site.yaml",
 			"sitegatewaypoolassignment.yaml",
@@ -285,6 +293,10 @@ type unboundedSiteConfig struct {
 	NodeCIDRs []string
 	PodCIDRs  []string
 	Manifests []string
+	// ManageCniPlugin controls whether unbounded-net manages the CNI plugin.
+	// When false, the template emits manageCniPlugin: false so that an
+	// existing CNI (e.g. Cilium, Calico) is left in place.
+	ManageCniPlugin bool
 }
 
 func (h *siteInitHandler) ensureMachinaIsRunning(ctx context.Context) error {
@@ -549,6 +561,7 @@ func siteInitCommand() *cobra.Command {
 	cmd.Flags().StringVar(&handler.nodeCIDR, "node-cidr", "", "The node CIDR")
 	cmd.Flags().StringVar(&handler.podCIDR, "pod-cidr", "", "The pod CIDR")
 	cmd.Flags().StringVar(&handler.clusterServiceCIDR, "cluster-service-cidr", "", "The Service CIDR of the cluster (e.g. 10.0.0.0/16); derived from kube-dns if omitted")
+	cmd.Flags().BoolVar(&handler.manageCniPlugin, "manage-cni-plugin", true, "Whether unbounded-net manages the CNI plugin; set to false when the cluster already has a CNI (e.g. Cilium, Calico)")
 
 	if err := cmd.MarkFlagRequired("name"); err != nil {
 		panic(err)

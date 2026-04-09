@@ -378,10 +378,11 @@ func TestEnsureUnboundedSite_DefaultTemplates(t *testing.T) {
 	//
 	// Since the fake Apply doesn't give us raw bytes, we render manually.
 	cfg := unboundedSiteConfig{
-		SiteName:  "test-site",
-		NodeCIDRs: []string{"10.0.0.0/24"},
-		PodCIDRs:  []string{"10.1.0.0/24"},
-		Manifests: []string{"site.yaml"},
+		SiteName:        "test-site",
+		NodeCIDRs:       []string{"10.0.0.0/24"},
+		PodCIDRs:        []string{"10.1.0.0/24"},
+		ManageCniPlugin: true,
+		Manifests:       []string{"site.yaml"},
 	}
 
 	h := &siteInitHandler{
@@ -409,4 +410,91 @@ func TestSiteInitCommand_DefaultCNIManifests(t *testing.T) {
 	f := cmd.Flags().Lookup("cni-manifests")
 	require.NotNil(t, f)
 	require.Equal(t, unboundedCNIRelease, f.DefValue)
+}
+
+func TestSiteInitCommand_ManageCniPluginFlag(t *testing.T) {
+	cmd := siteInitCommand()
+	f := cmd.Flags().Lookup("manage-cni-plugin")
+	require.NotNil(t, f, "--manage-cni-plugin flag should exist")
+	require.Equal(t, "true", f.DefValue, "default should be true")
+}
+
+func TestEnsureUnboundedSite_ManageCniPluginFalse(t *testing.T) {
+	kubeResourcesCli := fakeclient.NewClientBuilder().
+		WithInterceptorFuncs(interceptor.Funcs{
+			Apply: func(_ context.Context, _ client.WithWatch, _ runtime.ApplyConfiguration, _ ...client.ApplyOption) error {
+				return nil
+			},
+		}).
+		Build()
+
+	cfg := unboundedSiteConfig{
+		SiteName:        "test-site",
+		NodeCIDRs:       []string{"10.0.0.0/24"},
+		PodCIDRs:        []string{"10.1.0.0/24"},
+		ManageCniPlugin: false,
+		Manifests:       []string{"site.yaml"},
+	}
+
+	h := &siteInitHandler{
+		kubeResourcesCli: kubeResourcesCli,
+		logger:           discardLogger(),
+	}
+
+	err := h.ensureUnboundedSite(context.Background(), cfg)
+	require.NoError(t, err)
+
+	// Render the template directly and verify manageCniPlugin: false appears.
+	content, err := siteTemplates.ReadFile("assets/unbounded-net-site/site.yaml")
+	require.NoError(t, err)
+
+	tmpl, err := template.New("site.yaml").Parse(string(content))
+	require.NoError(t, err)
+
+	var buf strings.Builder
+	require.NoError(t, tmpl.Execute(&buf, cfg))
+
+	rendered := buf.String()
+	assert.Contains(t, rendered, "manageCniPlugin: false")
+	assert.Contains(t, rendered, "name: test-site")
+}
+
+func TestEnsureUnboundedSite_ManageCniPluginTrue(t *testing.T) {
+	kubeResourcesCli := fakeclient.NewClientBuilder().
+		WithInterceptorFuncs(interceptor.Funcs{
+			Apply: func(_ context.Context, _ client.WithWatch, _ runtime.ApplyConfiguration, _ ...client.ApplyOption) error {
+				return nil
+			},
+		}).
+		Build()
+
+	cfg := unboundedSiteConfig{
+		SiteName:        "test-site",
+		NodeCIDRs:       []string{"10.0.0.0/24"},
+		PodCIDRs:        []string{"10.1.0.0/24"},
+		ManageCniPlugin: true,
+		Manifests:       []string{"site.yaml"},
+	}
+
+	h := &siteInitHandler{
+		kubeResourcesCli: kubeResourcesCli,
+		logger:           discardLogger(),
+	}
+
+	err := h.ensureUnboundedSite(context.Background(), cfg)
+	require.NoError(t, err)
+
+	// Render the template directly and verify manageCniPlugin does NOT appear.
+	content, err := siteTemplates.ReadFile("assets/unbounded-net-site/site.yaml")
+	require.NoError(t, err)
+
+	tmpl, err := template.New("site.yaml").Parse(string(content))
+	require.NoError(t, err)
+
+	var buf strings.Builder
+	require.NoError(t, tmpl.Execute(&buf, cfg))
+
+	rendered := buf.String()
+	assert.NotContains(t, rendered, "manageCniPlugin")
+	assert.Contains(t, rendered, "name: test-site")
 }

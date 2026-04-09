@@ -26,8 +26,10 @@ You'll label gateway nodes, initialize a site, and join remote machines.
 > **You'll need:** A Kubernetes cluster with `kubeconfig` access, one or more
 > cluster nodes with UDP 51820-51899 open, and remote machines reachable via SSH.
 
-{{< callout type="warning" >}}
-Unbounded-net replaces the cluster's CNI. Your cluster must be created with `--network-plugin none` (BYO CNI mode). If it already uses Azure CNI, Calico, or kubenet, you will need to recreate the cluster with this setting. This cannot be changed after cluster creation.
+{{< callout type="info" >}}
+**Clusters with an existing CNI** (e.g. Cilium, Calico, Azure CNI): Unbounded works alongside your existing CNI. Pass `--manage-cni-plugin=false` when running `site init`, or set `manageCniPlugin: false` on the Site resource after creation. See the [manageCniPlugin reference]({{< relref "reference/networking/custom-resources#managecniplugin-behavior" >}}) for details.
+
+**Clusters without a CNI** (created with `--network-plugin none`): No extra configuration is needed — unbounded-net will serve as the CNI.
 {{< /callout >}}
 
 Install the kubectl-unbounded plugin:
@@ -103,6 +105,7 @@ kubectl unbounded site init \
 | `--cni-manifests` | Path or URL to CNI manifests (defaults to a known release) |
 | `--machina-manifests` | Path or URL to machina manifests (uses embedded manifests if omitted) |
 | `--cluster-service-cidr` | Service CIDR (derived from kube-dns if omitted) |
+| `--manage-cni-plugin` | Set to `false` when the cluster already has a CNI (default: `true`) |
 
 </details>
 

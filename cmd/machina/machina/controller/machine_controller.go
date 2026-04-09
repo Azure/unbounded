@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net"
 	"strings"
 	"time"
@@ -24,6 +25,7 @@ import (
 	stderrs "errors"
 
 	unboundedv1alpha3 "github.com/project-unbounded/unbounded-kube/api/v1alpha3"
+	"github.com/project-unbounded/unbounded-kube/internal/cloudprovider"
 	"github.com/project-unbounded/unbounded-kube/internal/provision"
 )
 
@@ -593,6 +595,10 @@ func (r *MachineReconciler) provisionMachine(
 			labels[k] = v
 		}
 	}
+
+	// Common labels are applied unconditionally to every node provisioned
+	// by unbounded, regardless of the detected cloud provider.
+	maps.Copy(labels, cloudprovider.CommonDefaultLabels())
 
 	var taints []string
 	if machine.Spec.Kubernetes != nil {

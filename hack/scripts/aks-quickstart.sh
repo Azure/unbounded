@@ -708,9 +708,13 @@ cmd_setup() {
   else
     echo
     warn "This AKS cluster uses network plugin '$network_plugin'."
-    warn "unbounded-net requires NetworkPlugin=none (BYO CNI mode)."
+    warn "This quickstart script expects NetworkPlugin=none (BYO CNI mode)."
     warn ""
-    warn "To use unbounded-kube, recreate the cluster with:"
+    warn "If the cluster has an existing CNI (e.g. Cilium, Calico, Azure CNI),"
+    warn "you can still use unbounded-kube by following the Existing Cluster guide"
+    warn "and passing --manage-cni-plugin=false to 'kubectl unbounded site init'."
+    warn ""
+    warn "Alternatively, recreate the cluster with:"
     warn "  az aks create ... --network-plugin none"
     warn ""
     warn "Or use 'aks-quickstart.sh create' to create a new cluster."

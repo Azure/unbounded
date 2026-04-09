@@ -247,6 +247,14 @@ func (h *manualBootstrapHandler) buildAgentConfig(ctx context.Context) (*provisi
 		maps.Copy(labels, provider.DefaultLabels())
 	}
 
+	// Common labels are applied unconditionally to every node provisioned
+	// by unbounded, regardless of the detected cloud provider.
+	if labels == nil {
+		labels = make(map[string]string)
+	}
+
+	maps.Copy(labels, cloudprovider.CommonDefaultLabels())
+
 	return &provision.AgentConfig{
 		MachineName: h.machineName,
 		Cluster: provision.AgentClusterConfig{
