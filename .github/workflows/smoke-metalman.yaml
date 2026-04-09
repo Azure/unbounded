@@ -27,6 +27,9 @@ on:
       - .github/workflows/smoke-metalman.yaml
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   smoke:
     runs-on: ubuntu-24.04
