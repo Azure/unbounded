@@ -7,17 +7,21 @@ import "os"
 
 const kvmDevicePath = "/dev/kvm"
 
-// DiscoverKVMDevice checks whether the KVM character device is present on the
-// host. When present, the device path is returned so it can be bind-mounted
-// into the nspawn container, allowing workloads inside the container to use
-// hardware virtualisation. Returns an empty string when the device is absent.
-func DiscoverKVMDevice() string {
-	return discoverKVMDevicePath(kvmDevicePath)
+// DiscoverHostDevicePaths probes the host for device nodes that should be
+// bind-mounted into the nspawn container and returns their paths. Currently
+// discovers the KVM character device (/dev/kvm) when present.
+func DiscoverHostDevicePaths() []string {
+	var paths []string
+
+	if p := discoverKVMDevicePath(kvmDevicePath); p != "" {
+		paths = append(paths, p)
+	}
+
+	return paths
 }
 
-// discoverKVMDevicePath is the testable core of DiscoverKVMDevice. It checks
-// whether path exists on the filesystem and returns it when found, or an empty
-// string when not found or on any stat error.
+// discoverKVMDevicePath checks whether path exists on the filesystem and
+// returns it when accessible, or an empty string on any error.
 func discoverKVMDevicePath(path string) string {
 	if _, err := os.Stat(path); err != nil {
 		// Treat any error (including permission denied) as absent; the
