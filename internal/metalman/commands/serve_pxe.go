@@ -47,6 +47,7 @@ func ServePXECmd() *cobra.Command {
 		leaseDuration     time.Duration
 		renewDeadline     time.Duration
 		retryPeriod       time.Duration
+		gatewayRoutes     []string
 	)
 
 	cmd := &cobra.Command{
@@ -210,6 +211,7 @@ func ServePXECmd() *cobra.Command {
 				ClusterDNS:        clusterDNS,
 				CACertBase64:      caCertBase64,
 				ProviderLabels:    providerLabels,
+				GatewayRoutes:     gatewayRoutes,
 			}
 
 			if dhcpInterface != "" && dhcpAutoInterface {
@@ -316,6 +318,7 @@ func ServePXECmd() *cobra.Command {
 	cmd.Flags().DurationVar(&leaseDuration, "leader-elect-lease-duration", 15*time.Second, "Duration that non-leader candidates will wait before attempting to acquire leadership")
 	cmd.Flags().DurationVar(&renewDeadline, "leader-elect-renew-deadline", 10*time.Second, "Duration the acting leader will retry refreshing leadership before giving up")
 	cmd.Flags().DurationVar(&retryPeriod, "leader-elect-retry-period", 2*time.Second, "Duration between leader election retries")
+	cmd.Flags().StringSliceVar(&gatewayRoutes, "gateway-routes", nil, "Comma-separated list of IPs to inject as /32 host routes on worker nodes for cross-subnet gateway reachability")
 
 	return cmd
 }

@@ -32,6 +32,7 @@ NET_NAME = "unbounded-metal-smoke"
 SUBNET = "192.168.200"
 SERVER_IP = f"{SUBNET}.1"
 NODE_IP = f"{SUBNET}.10"
+KIND_SMOKE_IP = f"{SUBNET}.2"  # IP assigned to the kind container on virbr-smoke
 GATEWAY = SERVER_IP
 DNS_SERVER = "8.8.8.8"
 MAC_ADDRESS = "52:54:00:aa:bb:01"
@@ -154,6 +155,8 @@ def clean_libvirt() -> None:
         run_quiet(cmd)
     # Remove stale bridge left behind by a previous net-destroy.
     run_quiet(["sudo", "ip", "link", "delete", "virbr-smoke"])
+    # Remove veth pair used to connect kind container to virbr-smoke.
+    run_quiet(["sudo", "ip", "link", "delete", "veth-kind-smoke"])
     # Kill any leftover sushy-emulator from a previous run.
     run_quiet(["sudo", "pkill", "-f", "sushy-emulator"])
     # Kill any leftover metalman serve-pxe from a previous run.
@@ -325,21 +328,41 @@ def main() -> None:
     # can reach the kind API server.
     run(["sudo", "iptables", "-t", "raw", "-I", "PREROUTING",
          "-i", "virbr-smoke", "-j", "ACCEPT"])
-    # Add a route inside the kind container so it can reach the VM subnet.
-    # Without this, kindnet on the control-plane can't add routes for the
-    # smoke-node's pod CIDR and crash-loops.
-    log("Adding route inside kind container for VM subnet")
+
+    # Connect the kind container directly to virbr-smoke so that the VM
+    # subnet is *directly reachable* from inside the container.  Kindnet
+    # adds routes of the form "10.244.x.0/24 via <nodeIP>"; the kernel
+    # rejects these when the gateway is only reachable via an indirect
+    # route.  A direct L2 link avoids this.
+    log("Attaching kind container to virbr-smoke bridge")
+    kind_pid = run(
+        ["docker", "inspect", "kind-control-plane", "--format", "{{.State.Pid}}"],
+        capture_output=True, text=True,
+    ).stdout.strip()
     kind_ip = run(
         ["docker", "inspect", "kind-control-plane",
          "--format", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}"],
         capture_output=True, text=True,
     ).stdout.strip()
-    run(["docker", "exec", "kind-control-plane",
-         "ip", "route", "replace", f"{SUBNET}.0/24", "via", "172.18.0.1"])
+    # Clean up any leftover veth from a previous run.
+    run_quiet(["sudo", "ip", "link", "delete", "veth-kind-smoke"], check=False)
+    # Create a veth pair: host-side attaches to virbr-smoke, container-side
+    # gets an IP on the VM subnet.
+    run(["sudo", "ip", "link", "add", "veth-kind-smoke", "type", "veth",
+         "peer", "name", "eth-smoke"])
+    run(["sudo", "ip", "link", "set", "veth-kind-smoke", "master", "virbr-smoke"])
+    run(["sudo", "ip", "link", "set", "veth-kind-smoke", "up"])
+    # Move the peer into the kind container's network namespace.
+    run(["sudo", "ip", "link", "set", "eth-smoke", "netns", kind_pid])
+    run(["sudo", "nsenter", "-t", kind_pid, "-n",
+         "ip", "addr", "add", f"{KIND_SMOKE_IP}/24", "dev", "eth-smoke"])
+    run(["sudo", "nsenter", "-t", kind_pid, "-n",
+         "ip", "link", "set", "eth-smoke", "up"])
 
     # Kindnet's CONTROL_PLANE_ENDPOINT defaults to "kind-control-plane:6443"
     # which is unresolvable from the bare-metal VM (it's not in Docker's DNS).
-    # Patch it to use the kind container's actual IP.
+    # Patch it to use the kind container's Docker IP which the VM can reach
+    # through its default gateway.
     log("Patching kindnet DaemonSet for VM-reachable control plane endpoint")
     patch = json.dumps({
         "spec": {"template": {"spec": {"containers": [{
@@ -487,6 +510,7 @@ def main() -> None:
         "sudo", str(BINARY), "serve-pxe", f"--site={SITE}", f"--bind-address={SERVER_IP}",
         f"--cache-dir={CACHE_DIR}",
         f"--serve-url={SERVE_URL}", "--dhcp-interface=virbr-smoke",
+        f"--gateway-routes={kind_ip}",
         "--leader-elect-lease-duration=60s",
         "--leader-elect-renew-deadline=40s",
         "--leader-elect-retry-period=5s",

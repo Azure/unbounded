@@ -41,6 +41,7 @@ type FileResolver struct {
 	ClusterDNS        string
 	CACertBase64      string
 	ProviderLabels    map[string]string
+	GatewayRoutes     []string
 }
 
 func (f *FileResolver) LookupNodeByIP(ctx context.Context, ip string) (*v1alpha3.Machine, error) {
@@ -83,6 +84,7 @@ func (f *FileResolver) ResolveFileByPath(ctx context.Context, path string, node 
 				KubeVersion:    f.KubernetesVersion,
 				ProviderLabels: f.ProviderLabels,
 				AttestURL:      f.ServeURL,
+				GatewayRoutes:  f.GatewayRoutes,
 			})
 
 			// The MarshalIndent prefix "    " (4 spaces) must match the

@@ -350,6 +350,30 @@ func TestBuildAgentConfig(t *testing.T) {
 				require.Equal(t, "tok.sec", cfg.Kubelet.BootstrapToken)
 			},
 		},
+		{
+			name: "with gateway routes",
+			params: BuildAgentConfigParams{
+				Machine: &v1alpha3.Machine{
+					ObjectMeta: metav1.ObjectMeta{Name: "gw-node"},
+				},
+				GatewayRoutes: []string{"172.18.0.2", "10.0.0.1"},
+			},
+			assert: func(t *testing.T, cfg AgentConfig) {
+				require.NotNil(t, cfg.Network)
+				require.Equal(t, []string{"172.18.0.2", "10.0.0.1"}, cfg.Network.GatewayRoutes)
+			},
+		},
+		{
+			name: "without gateway routes",
+			params: BuildAgentConfigParams{
+				Machine: &v1alpha3.Machine{
+					ObjectMeta: metav1.ObjectMeta{Name: "no-gw-node"},
+				},
+			},
+			assert: func(t *testing.T, cfg AgentConfig) {
+				require.Nil(t, cfg.Network)
+			},
+		},
 	}
 
 	for _, tt := range tests {

@@ -36,6 +36,11 @@ type AgentConfig struct {
 	// performs TPM attestation on the host instead of requiring a static
 	// BootstrapToken in Kubelet config.
 	Attest *AgentAttestConfig `json:"Attest,omitempty"`
+
+	// Network configures optional host-level networking that must be
+	// applied before the agent starts (e.g. static routes for
+	// cross-subnet control-plane access).
+	Network *AgentNetworkConfig `json:"Network,omitempty"`
 }
 
 // AgentClusterConfig holds the cluster-level values the agent needs to
@@ -61,6 +66,21 @@ type AgentAttestConfig struct {
 	// "http://10.0.0.1:8880"). The agent appends "/attest" to this URL
 	// when performing TPM attestation.
 	URL string `json:"URL"`
+}
+
+// AgentNetworkConfig holds optional host networking configuration that
+// must be applied before the node bootstrap runs.
+type AgentNetworkConfig struct {
+	// GatewayRoutes is a list of IP addresses that should be made
+	// reachable as gateways on the node's primary interface. Each
+	// entry results in a /32 host route (ip route add <ip>/32 dev
+	// <iface>) so that the kernel treats the address as directly
+	// connected for nexthop resolution.
+	//
+	// This is needed when the CNI plugin (e.g. kindnet) adds routes
+	// of the form "10.244.x.0/24 via <control-plane-IP>" and the
+	// control-plane IP is not on a directly-connected subnet.
+	GatewayRoutes []string `json:"GatewayRoutes,omitempty"`
 }
 
 // BuildAgentConfigParams holds the inputs for BuildAgentConfig.
@@ -98,6 +118,11 @@ type BuildAgentConfigParams struct {
 	// TPM-based attestation (e.g. "http://10.0.0.1:8880"). When non-empty
 	// an Attest section is included in the config.
 	AttestURL string
+
+	// GatewayRoutes is an optional list of IP addresses that should be
+	// made directly reachable on the node's primary interface so that
+	// CNI plugins can use them as nexthops. See AgentNetworkConfig.
+	GatewayRoutes []string
 }
 
 // BuildAgentConfig constructs an AgentConfig from a Machine and cluster-level
@@ -168,6 +193,10 @@ func BuildAgentConfig(params BuildAgentConfigParams) AgentConfig {
 
 	if params.AttestURL != "" {
 		cfg.Attest = &AgentAttestConfig{URL: params.AttestURL}
+	}
+
+	if len(params.GatewayRoutes) > 0 {
+		cfg.Network = &AgentNetworkConfig{GatewayRoutes: params.GatewayRoutes}
 	}
 
 	return cfg
