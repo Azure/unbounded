@@ -635,6 +635,9 @@ func TestProvisionMachine_EndToEnd(t *testing.T) {
 	require.Equal(t, "abc123.secret", agentConfig.Kubelet.BootstrapToken)
 	require.Equal(t, "test-machine", agentConfig.Kubelet.Labels[MachineNodeLabel])
 
+	// Common labels are always applied.
+	require.Equal(t, "true", agentConfig.Kubelet.Labels[cloudprovider.ExcludeFromCloudProviderLabel])
+
 	// Command: script execution with UNBOUNDED_AGENT_CONFIG_FILE.
 	require.NotNil(t, execCmd, "expected a script execution command")
 	require.Contains(t, execCmd.command, "UNBOUNDED_AGENT_CONFIG_FILE")
@@ -944,6 +947,9 @@ func TestProvisionMachine_LabelMerge(t *testing.T) {
 
 	// Controller-injected label overrides user label on conflict.
 	require.Equal(t, "label-test-machine", agentConfig.Kubelet.Labels[MachineNodeLabel])
+
+	// Common labels are always applied.
+	require.Equal(t, "true", agentConfig.Kubelet.Labels[cloudprovider.ExcludeFromCloudProviderLabel])
 }
 
 func TestProvisionMachine_Taints(t *testing.T) {
@@ -1139,6 +1145,9 @@ func TestProvisionMachine_ProviderLabelsOverride(t *testing.T) {
 
 	// Controller-injected label is present.
 	require.Equal(t, "provider-label-machine", agentConfig.Kubelet.Labels[MachineNodeLabel])
+
+	// Common labels are always applied.
+	require.Equal(t, "true", agentConfig.Kubelet.Labels[cloudprovider.ExcludeFromCloudProviderLabel])
 }
 
 // ---------------------------------------------------------------------------

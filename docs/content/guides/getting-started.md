@@ -196,11 +196,11 @@ Kubernetes-level configuration. Here's what each piece does.
 ### AKS Cluster (BYO CNI)
 
 Created with `--network-plugin none` so AKS does not install a default CNI.
-unbounded-net replaces it and handles both local pod networking and cross-site
-routing through WireGuard. If your cluster already has a CNI (e.g. Azure CNI,
-Cilium, Calico), that works too -- see the
-[Existing Cluster]({{< relref "guides/existing-cluster" >}}) guide for the
-different configuration needed.
+unbounded-net serves as the CNI and handles both local pod networking and
+cross-site routing through WireGuard. If your cluster already has a CNI
+(e.g. Azure CNI, Cilium, Calico), that works too -- pass
+`--manage-cni-plugin=false` to `site init` and see the
+[Existing Cluster]({{< relref "guides/existing-cluster" >}}) guide for details.
 
 ### Gateway Node Pool
 

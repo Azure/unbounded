@@ -126,8 +126,9 @@ WireGuard-based CNI plugin.
 - Pods and Services are routable across sites.
 - CRDs: `GatewayPool`, `Site` (nodeCidrs, podCidrAssignments),
   `SiteGatewayPoolAssignment`.
-- Clusters are created with `NetworkPlugin: None`; unbounded-cni replaces the
-  default CNI.
+- Clusters without an existing CNI are created with `NetworkPlugin: None` and
+  unbounded-net serves as the CNI. Clusters with an existing CNI (e.g. Cilium,
+  Calico) set `manageCniPlugin: false` on the Site resource.
 
 ![Network architecture: Remote Site node connects via WireGuard UDP tunnel to Gateway Node in Control-Plane Cluster, which routes to Cluster Pods via vxlan](../../img/architecture-network.svg)
 

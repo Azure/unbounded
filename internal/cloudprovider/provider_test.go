@@ -110,3 +110,18 @@ func TestAKSProvider_DefaultLabels(t *testing.T) {
 	require.Equal(t, "false", labels["kubernetes.azure.com/managed"])
 	require.Equal(t, "mc_rg_test_eastus", labels["kubernetes.azure.com/cluster"])
 }
+
+func TestCommonDefaultLabels(t *testing.T) {
+	t.Parallel()
+
+	labels := CommonDefaultLabels()
+
+	require.Contains(t, labels, ExcludeFromCloudProviderLabel)
+	require.Equal(t, "true", labels[ExcludeFromCloudProviderLabel])
+}
+
+func TestExcludeFromCloudProviderLabel_Constant(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, "node.cloudprovider.kubernetes.io/exclude-from-external-cloud-provider", ExcludeFromCloudProviderLabel)
+}

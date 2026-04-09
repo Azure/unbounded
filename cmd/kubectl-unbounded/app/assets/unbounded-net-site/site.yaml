@@ -6,6 +6,9 @@ metadata:
   labels:
     unbounded-kube.io/site: "{{ .SiteName }}"
 spec:
+  {{- if not .ManageCniPlugin }}
+  manageCniPlugin: false
+  {{- end }}
   nodeCidrs:
   {{- range .NodeCIDRs }}
     - {{ . }}

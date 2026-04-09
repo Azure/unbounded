@@ -24,6 +24,7 @@ import (
 	stderrs "errors"
 
 	unboundedv1alpha3 "github.com/project-unbounded/unbounded-kube/api/v1alpha3"
+	"github.com/project-unbounded/unbounded-kube/internal/cloudprovider"
 	"github.com/project-unbounded/unbounded-kube/internal/provision"
 )
 
@@ -592,6 +593,12 @@ func (r *MachineReconciler) provisionMachine(
 		for k, v := range r.ClusterInfo.Provider.DefaultLabels() {
 			labels[k] = v
 		}
+	}
+
+	// Common labels are applied unconditionally to every node provisioned
+	// by unbounded, regardless of the detected cloud provider.
+	for k, v := range cloudprovider.CommonDefaultLabels() {
+		labels[k] = v
 	}
 
 	var taints []string
