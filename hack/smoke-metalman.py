@@ -363,6 +363,15 @@ def _probe_vm_network() -> None:
             log(f"    [{label}] (failed: {e})")
 
 
+def _vm_is_running() -> bool:
+    """Return True if the VM domain is in 'running' state."""
+    result = subprocess.run(
+        [*VIRSH, "domstate", VM_NAME],
+        capture_output=True, text=True,
+    )
+    return result.returncode == 0 and "running" in result.stdout.strip()
+
+
 def machine_status() -> str | None:
     """Return a short summary of Machine conditions, or None."""
     result = subprocess.run(
@@ -391,6 +400,17 @@ def wait_k8s_node(name: str, timeout: int = 1800) -> None:
                 if status != last_status:
                     last_status = status
                 log(f"    ({elapsed}s) Machine conditions: {status or 'none'}")
+
+                # Check if the VM is still alive; bail early if it crashed.
+                if not _vm_is_running():
+                    # Log host disk free space to help diagnose qcow2 growth.
+                    df = subprocess.run(
+                        ["df", "-h", str(TMPDIR)],
+                        capture_output=True, text=True,
+                    )
+                    log(f"    Host disk:\n{df.stdout}")
+                    die(f"VM '{VM_NAME}' is no longer running (crashed or shut down)")
+
                 # Run network diagnostics once after 180s if still stuck.
                 if elapsed >= 180 and not net_diag_done:
                     net_diag_done = True
@@ -594,6 +614,14 @@ def main() -> None:
     log("Pushing agent-ubuntu2404 OCI image to local registry")
     run(["docker", "push", AGENT_IMAGE_NAME])
 
+    # Reclaim disk space consumed by Docker build cache.  The host-ubuntu2404
+    # build downloads a ~2 GB Ubuntu cloud image and converts it to raw; the
+    # intermediate layers are no longer needed once the images are pushed.
+    # Only prune the build cache (not running container images) to avoid
+    # disturbing the registry container.
+    log("Pruning Docker build cache to free disk space")
+    run_quiet(["docker", "builder", "prune", "-af"], check=False)
+
     server_url = apiserver_url()
     log(f"  API server URL: {server_url}")
     protonode = {
@@ -646,6 +674,10 @@ def main() -> None:
 
     log("Triggering reimage")
     run([str(KUBECTL_UNBOUNDED), "machine", "reimage", NODE_NAME])
+
+    # Log free space so we can correlate disk exhaustion with VM failures.
+    df = subprocess.run(["df", "-h", str(TMPDIR)], capture_output=True, text=True)
+    log(f"  Host disk after image builds:\n{df.stdout.strip()}")
 
     log("Waiting for kubelet to join the cluster...")
     wait_k8s_node(NODE_NAME, timeout=900)
