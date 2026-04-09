@@ -144,6 +144,7 @@ func resolveRootFSGoalState(log *slog.Logger, cfg *provision.AgentConfig) (*goal
 		KubernetesVersion: kubeVersion,
 		OCIImage:          ociImage,
 		Nvidia:            nvidia,
+		KVMDevicePath:     goalstates.DiscoverKVMDevice(),
 	}, nil
 }
 

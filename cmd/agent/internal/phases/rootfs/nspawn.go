@@ -70,11 +70,16 @@ func (e *ensureNSpawnWorkspace) writeNSpawnConfigs() error {
 	templateData := map[string]any{
 		"NvidiaGPUDevicePaths": e.goalState.Nvidia.GPUDevicePaths,
 		"NvidiaLibDirMounts":   e.goalState.Nvidia.LibDirMounts,
+		"KVMDevicePath":        e.goalState.KVMDevicePath,
 	}
 
 	if len(e.goalState.Nvidia.GPUDevicePaths) > 0 {
 		e.log.Info("GPU devices detected, configuring nspawn bind-mounts",
 			"count", len(e.goalState.Nvidia.GPUDevicePaths))
+	}
+
+	if e.goalState.KVMDevicePath != "" {
+		e.log.Info("KVM device detected, configuring nspawn bind-mount", "path", e.goalState.KVMDevicePath)
 	}
 
 	// Render and write the .nspawn configuration file.

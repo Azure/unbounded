@@ -90,6 +90,10 @@ driver libraries into the container, and grants the necessary cgroup device
 permissions. See [NVIDIA GPU Support]({{< relref "reference/gpu/nvidia" >}}) for
 the full GPU pipeline.
 
+When the KVM character device (`/dev/kvm`) is present on the host, the agent
+automatically bind-mounts it into the container so that workloads inside the
+container can use hardware virtualisation (e.g. QEMU/KVM virtual machines).
+
 The configuration is written to two files on the host before the machine boots:
 
 | File | Path |
@@ -107,6 +111,7 @@ The configuration is written to two files on the host before the machine boots:
 | `VirtualEthernet=no` | nspawn config | Shares the host network namespace. |
 | `SYSTEMD_NSPAWN_UNIFIED_HIERARCHY=1` | Service override | Forces cgroups v2 inside the container. |
 | `SYSTEMD_NSPAWN_API_VFS_WRITABLE=network` | Service override | Makes `/proc/sys/net` writable for CNI and kube-proxy. |
+| `Bind=/dev/kvm` | nspawn config | KVM device bind-mount (auto-generated when `/dev/kvm` is present). |
 | `Bind=` / `BindReadOnly=` | nspawn config | GPU device and library bind-mounts (auto-generated when GPUs are present). |
 | `DeviceAllow=` | Service override | Cgroup device permissions for GPU nodes (auto-generated when GPUs are present). |
 

@@ -28,4 +28,10 @@ type RootFS struct {
 	// driver library mappings, and bind-mount specifications for the nspawn
 	// container. Empty on non-GPU hosts.
 	Nvidia NvidiaHost
+
+	// KVMDevicePath is the path to the KVM character device on the host
+	// (e.g. /dev/kvm). When non-empty the nspawn configuration will
+	// bind-mount this device into the container so that workloads can use
+	// hardware virtualisation. Empty on hosts without KVM support.
+	KVMDevicePath string
 }
