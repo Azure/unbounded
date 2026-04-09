@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net"
 	"strings"
 	"time"
@@ -597,9 +598,7 @@ func (r *MachineReconciler) provisionMachine(
 
 	// Common labels are applied unconditionally to every node provisioned
 	// by unbounded, regardless of the detected cloud provider.
-	for k, v := range cloudprovider.CommonDefaultLabels() {
-		labels[k] = v
-	}
+	maps.Copy(labels, cloudprovider.CommonDefaultLabels())
 
 	var taints []string
 	if machine.Spec.Kubernetes != nil {
