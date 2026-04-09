@@ -600,7 +600,8 @@ def main() -> None:
 
     log("Starting metalman serve-pxe")
     proc = spawn([
-        "sudo", str(BINARY), "serve-pxe", f"--site={SITE}", f"--bind-address={SERVER_IP}",
+        "sudo", "env", f"METALMAN_APISERVER_URL={server_url}",
+        str(BINARY), "serve-pxe", f"--site={SITE}", f"--bind-address={SERVER_IP}",
         f"--cache-dir={CACHE_DIR}",
         f"--serve-url={SERVE_URL}", "--dhcp-interface=virbr-smoke",
         "--leader-elect-lease-duration=60s",

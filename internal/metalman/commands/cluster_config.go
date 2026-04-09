@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"log/slog"
+	"os"
 	"sync"
 	"time"
 
@@ -16,6 +17,15 @@ import (
 	"github.com/Azure/unbounded-kube/internal/metalman/netboot"
 )
 
+const (
+	// apiserverURLOverrideEnv, when set, overrides the API server URL
+	// discovered from the cluster-info ConfigMap in kube-public. The CA
+	// certificate is still read from the ConfigMap. This is useful in
+	// test environments (e.g. kind) where the ConfigMap contains a
+	// hostname that is unreachable from provisioned nodes.
+	apiserverURLOverrideEnv = "METALMAN_APISERVER_URL"
+)
+
 // ClusterInfoWatcher watches the cluster-info ConfigMap in the kube-public
 // namespace and provides up-to-date API server URL and CA certificate to
 // the FileResolver through the ClusterInfoProvider interface.
@@ -23,8 +33,9 @@ import (
 // It uses a shared informer so that changes at runtime (e.g. API server
 // URL rotation) are picked up automatically.
 type ClusterInfoWatcher struct {
-	clientset kubernetes.Interface
-	log       *slog.Logger
+	clientset            kubernetes.Interface
+	log                  *slog.Logger
+	apiserverURLOverride string
 
 	mu   sync.RWMutex
 	info netboot.ClusterInfo
@@ -34,14 +45,23 @@ type ClusterInfoWatcher struct {
 // and CA certificate from the cluster-info ConfigMap in kube-public. It
 // performs an initial synchronous resolve so that values are available
 // before the first template render.
+//
+// If the METALMAN_APISERVER_URL environment variable is set, its value
+// overrides the API server URL from the ConfigMap on every refresh. The
+// CA certificate is always read from the ConfigMap.
 func NewClusterInfoWatcher(
 	ctx context.Context,
 	clientset kubernetes.Interface,
 	log *slog.Logger,
 ) (*ClusterInfoWatcher, error) {
 	w := &ClusterInfoWatcher{
-		clientset: clientset,
-		log:       log,
+		clientset:            clientset,
+		log:                  log,
+		apiserverURLOverride: os.Getenv(apiserverURLOverrideEnv),
+	}
+
+	if w.apiserverURLOverride != "" {
+		log.Info("using API server URL override", "env", apiserverURLOverrideEnv, "url", w.apiserverURLOverride)
 	}
 
 	// Perform initial synchronous resolve so values are available
@@ -96,15 +116,20 @@ func (w *ClusterInfoWatcher) refresh(ctx context.Context) error {
 		return fmt.Errorf("resolving cluster info: %w", err)
 	}
 
+	apiserverURL := resolved.ApiserverURL
+	if w.apiserverURLOverride != "" {
+		apiserverURL = w.apiserverURLOverride
+	}
+
 	w.mu.Lock()
 	w.info = netboot.ClusterInfo{
-		ApiserverURL: resolved.ApiserverURL,
+		ApiserverURL: apiserverURL,
 		CACertBase64: base64.StdEncoding.EncodeToString(resolved.CACertPEM),
 	}
 	w.mu.Unlock()
 
 	w.log.Info("cluster-info refreshed",
-		"apiserverURL", resolved.ApiserverURL,
+		"apiserverURL", apiserverURL,
 	)
 
 	return nil

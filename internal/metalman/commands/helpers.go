@@ -179,13 +179,13 @@ func ResolveClusterInfo(ctx context.Context, clientset kubernetes.Interface) (*C
 		return nil, fmt.Errorf("cluster-info kubeconfig has no server URL")
 	}
 
-	if len(cfg.TLSClientConfig.CAData) == 0 {
+	if len(cfg.CAData) == 0 {
 		return nil, fmt.Errorf("cluster-info kubeconfig has no CA certificate")
 	}
 
 	return &ClusterInfo{
 		ApiserverURL: cfg.Host,
-		CACertPEM:    cfg.TLSClientConfig.CAData,
+		CACertPEM:    cfg.CAData,
 	}, nil
 }
 
