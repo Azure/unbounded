@@ -70,6 +70,9 @@ jobs:
     needs: resolve
     runs-on: ubuntu-latest
     steps:
+      - name: Normalize container registry
+        run: echo "CONTAINER_REGISTRY=${CONTAINER_REGISTRY,,}" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4.0.0
