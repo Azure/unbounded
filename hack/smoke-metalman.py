@@ -205,6 +205,15 @@ def collect_debug_logs() -> None:
     """
     log("Collecting debug logs from VM via QEMU guest agent...")
     commands = [
+        # Network diagnostics — must come first to diagnose download hangs.
+        ("resolv.conf", "cat /etc/resolv.conf"),
+        ("ip addr", "ip -4 addr show"),
+        ("ip route", "ip route show"),
+        ("dns test (dl.k8s.io)", "timeout 5 getent hosts dl.k8s.io || echo 'DNS FAILED'"),
+        ("curl test (dl.k8s.io)", "timeout 10 curl -sS -o /dev/null -w '%{http_code}' https://dl.k8s.io/ || echo 'CURL FAILED'"),
+        ("dns test (github.com)", "timeout 5 getent hosts github.com || echo 'DNS FAILED'"),
+        ("iptables nat", "iptables -t nat -L -n 2>/dev/null || nft list ruleset 2>/dev/null | head -60"),
+        # Agent and service logs.
         ("systemctl status", "systemctl --no-pager status"),
         ("unbounded-agent journal", "journalctl --no-pager -n 200 -u cloud-final.service"),
         ("machinectl list", "machinectl list --no-pager"),
@@ -337,6 +346,23 @@ def apiserver_url() -> str:
     return url
 
 
+def _probe_vm_network() -> None:
+    """Run quick network diagnostics inside the VM via guest agent."""
+    log("  Probing VM network (one-time diagnostic)...")
+    for label, cmd in [
+        ("resolv.conf", "cat /etc/resolv.conf"),
+        ("ip route", "ip route show"),
+        ("dns dl.k8s.io", "timeout 5 getent hosts dl.k8s.io 2>&1 || echo 'DNS FAILED'"),
+        ("curl dl.k8s.io", "timeout 10 curl -sSf -o /dev/null -w '%{http_code}' https://dl.k8s.io/ 2>&1 || echo 'CURL FAILED'"),
+    ]:
+        try:
+            _, stdout, stderr = guest_exec(cmd, timeout=15)
+            out = (stdout + stderr).strip()
+            log(f"    [{label}] {out}")
+        except Exception as e:
+            log(f"    [{label}] (failed: {e})")
+
+
 def machine_status() -> str | None:
     """Return a short summary of Machine conditions, or None."""
     result = subprocess.run(
@@ -352,6 +378,7 @@ def machine_status() -> str | None:
 def wait_k8s_node(name: str, timeout: int = 1800) -> None:
     log(f"  Waiting for Kubernetes Node '{name}' to appear...")
     last_status: str | None = None
+    net_diag_done = False
     for elapsed in range(timeout):
         check_procs()
         result = subprocess.run(
@@ -364,6 +391,10 @@ def wait_k8s_node(name: str, timeout: int = 1800) -> None:
                 if status != last_status:
                     last_status = status
                 log(f"    ({elapsed}s) Machine conditions: {status or 'none'}")
+                # Run network diagnostics once after 180s if still stuck.
+                if elapsed >= 180 and not net_diag_done:
+                    net_diag_done = True
+                    _probe_vm_network()
             time.sleep(1)
             continue
         log(f"  Node '{name}' appeared in cluster")
