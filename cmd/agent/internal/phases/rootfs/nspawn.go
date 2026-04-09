@@ -64,12 +64,33 @@ func (e *ensureNSpawnWorkspace) bootstrapWorkspace(ctx context.Context) error {
 	return phases.ExecuteTask(ctx, e.log, bootstrapTask)
 }
 
-// writeNSpawnConfigs renders the nspawn and service-override templates with GPU
-// device data (when present) and writes them to their configured paths.
+// nspawnTemplateData holds the data passed to the nspawn.conf and
+// service-override.conf templates. Using a struct (rather than map[string]any)
+// lets us attach helper methods that the templates can call directly.
+type nspawnTemplateData struct {
+	HostDevicePaths      []string
+	NvidiaGPUDevicePaths []string
+	NvidiaLibDirMounts   []goalstates.NvidiaLibDirMount
+}
+
+// HasFilesSection reports whether the rendered nspawn config requires a
+// [Files] section. Templates call this to avoid emitting an empty section.
+func (d nspawnTemplateData) HasFilesSection() bool {
+	return len(d.HostDevicePaths) > 0 || len(d.NvidiaGPUDevicePaths) > 0
+}
+
+// writeNSpawnConfigs renders the nspawn and service-override templates with
+// device and GPU data (when present) and writes them to their configured paths.
 func (e *ensureNSpawnWorkspace) writeNSpawnConfigs() error {
-	templateData := map[string]any{
-		"NvidiaGPUDevicePaths": e.goalState.Nvidia.GPUDevicePaths,
-		"NvidiaLibDirMounts":   e.goalState.Nvidia.LibDirMounts,
+	templateData := nspawnTemplateData{
+		HostDevicePaths:      e.goalState.HostDevicePaths,
+		NvidiaGPUDevicePaths: e.goalState.Nvidia.GPUDevicePaths,
+		NvidiaLibDirMounts:   e.goalState.Nvidia.LibDirMounts,
+	}
+
+	if len(e.goalState.HostDevicePaths) > 0 {
+		e.log.Info("host devices detected, configuring nspawn bind-mounts",
+			"count", len(e.goalState.HostDevicePaths))
 	}
 
 	if len(e.goalState.Nvidia.GPUDevicePaths) > 0 {
