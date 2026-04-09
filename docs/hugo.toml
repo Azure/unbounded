@@ -1,4 +1,4 @@
-baseURL = "https://Azure.github.io/unbounded-kube/"
+baseURL = "/"
 languageCode = "en-us"
 title = "Unbounded Kube"
 
