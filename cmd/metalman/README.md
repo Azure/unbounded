@@ -72,7 +72,7 @@ metalman serve-pxe --site=<site> [flags]
 
 `kubectl unbounded site deploy-pxe` is a convenience command that creates (or
 updates) a Kubernetes Deployment running `metalman serve-pxe` for a given
-site. The Deployment is server-side applied into the `machina-system`
+site. The Deployment is server-side applied into the `unbounded-kube`
 namespace.
 
 ```bash

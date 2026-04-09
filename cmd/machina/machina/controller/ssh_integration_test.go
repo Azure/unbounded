@@ -1171,7 +1171,7 @@ func TestDialViaBastion_Integration(t *testing.T) {
 	require.NoError(t, corev1.AddToScheme(s))
 
 	bastionKeySecret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "bastion-key-secret", Namespace: "machina-system"},
+		ObjectMeta: metav1.ObjectMeta{Name: "bastion-key-secret", Namespace: "unbounded-kube"},
 		Data:       map[string][]byte{"ssh-privatekey": pemBytes},
 	}
 
@@ -1245,7 +1245,7 @@ func TestDialViaBastion_FallsBackToMachineKey(t *testing.T) {
 	require.NoError(t, corev1.AddToScheme(s))
 
 	machineKeySecret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "machine-key-secret", Namespace: "machina-system"},
+		ObjectMeta: metav1.ObjectMeta{Name: "machine-key-secret", Namespace: "unbounded-kube"},
 		Data:       map[string][]byte{"ssh-privatekey": pemBytes},
 	}
 
@@ -1310,7 +1310,7 @@ func TestDialViaBastion_DefaultPort(t *testing.T) {
 	require.NoError(t, corev1.AddToScheme(s))
 
 	bastionKeySecret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "bastion-key-secret", Namespace: "machina-system"},
+		ObjectMeta: metav1.ObjectMeta{Name: "bastion-key-secret", Namespace: "unbounded-kube"},
 		Data:       map[string][]byte{"ssh-privatekey": pemBytes},
 	}
 
@@ -1377,7 +1377,7 @@ func TestDefaultReachabilityChecker_BastionReachable_TargetReachable(t *testing.
 	require.NoError(t, corev1.AddToScheme(s))
 
 	bastionKeySecret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "bastion-key-secret", Namespace: SecretNamespaceMachinaSystem},
+		ObjectMeta: metav1.ObjectMeta{Name: "bastion-key-secret", Namespace: SecretNamespaceUnboundedKube},
 		Data:       map[string][]byte{"ssh-privatekey": pemBytes},
 	}
 
@@ -1426,7 +1426,7 @@ func TestDefaultReachabilityChecker_BastionUnreachable(t *testing.T) {
 	require.NoError(t, corev1.AddToScheme(s))
 
 	bastionKeySecret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "bastion-key-secret", Namespace: SecretNamespaceMachinaSystem},
+		ObjectMeta: metav1.ObjectMeta{Name: "bastion-key-secret", Namespace: SecretNamespaceUnboundedKube},
 		Data:       map[string][]byte{"ssh-privatekey": pemBytes},
 	}
 
@@ -1479,7 +1479,7 @@ func TestDefaultReachabilityChecker_BastionReachable_TargetUnreachable(t *testin
 	require.NoError(t, corev1.AddToScheme(s))
 
 	bastionKeySecret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "bastion-key-secret", Namespace: SecretNamespaceMachinaSystem},
+		ObjectMeta: metav1.ObjectMeta{Name: "bastion-key-secret", Namespace: SecretNamespaceUnboundedKube},
 		Data:       map[string][]byte{"ssh-privatekey": pemBytes},
 	}
 
@@ -1533,7 +1533,7 @@ func TestDefaultReachabilityChecker_BastionFallsBackToMachineKey(t *testing.T) {
 	require.NoError(t, corev1.AddToScheme(s))
 
 	machineKeySecret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "machine-key-secret", Namespace: SecretNamespaceMachinaSystem},
+		ObjectMeta: metav1.ObjectMeta{Name: "machine-key-secret", Namespace: SecretNamespaceUnboundedKube},
 		Data:       map[string][]byte{"ssh-privatekey": pemBytes},
 	}
 

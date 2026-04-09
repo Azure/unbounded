@@ -54,7 +54,7 @@ over SSH. Given a `Machine` custom resource with SSH connection details, it:
 4. Watches for the corresponding `Node` object and transitions the Machine
    through its lifecycle phases.
 
-machina is deployed as a `Deployment` in the `machina-system` namespace and is
+machina is deployed as a `Deployment` in the `unbounded-kube` namespace and is
 installed automatically by `kubectl unbounded site init`.
 
 See the [SSH guide]({{< relref "guides/ssh" >}}) for a hands-on walkthrough

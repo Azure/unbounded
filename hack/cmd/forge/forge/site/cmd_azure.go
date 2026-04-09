@@ -356,8 +356,8 @@ func addInventoryCmd(siteCmdContext *siteCommandContext, site *azuredev.Datacent
 	c.Flags().StringVar(&namespace, "namespace", "default", "Kubernetes namespace for machina output")
 	c.Flags().StringVar(&matchPrefix, "match-prefix", "", "Only include machines whose VM name starts with this prefix")
 	c.Flags().BoolVar(&machinaBastion, "machina-bastion", false, "When used with --output=machina, configure each Machine CR with spec.ssh.bastion using the bastion's public IP")
-	c.Flags().StringVar(&machinaSSHSecretRef, "machina-ssh-secret-ref", "", "Secret reference for spec.ssh.privateKeyRef in format [$namespace/]$name[:$key] (default namespace: machina-system)")
-	c.Flags().StringVar(&machBastionSSHSecret, "machina-bastion-ssh-secret-ref", "", "Secret reference for spec.ssh.bastion.privateKeyRef in format [$namespace/]$name[:$key] (default namespace: machina-system)")
+	c.Flags().StringVar(&machinaSSHSecretRef, "machina-ssh-secret-ref", "", "Secret reference for spec.ssh.privateKeyRef in format [$namespace/]$name[:$key] (default namespace: unbounded-kube)")
+	c.Flags().StringVar(&machBastionSSHSecret, "machina-bastion-ssh-secret-ref", "", "Secret reference for spec.ssh.bastion.privateKeyRef in format [$namespace/]$name[:$key] (default namespace: unbounded-kube)")
 	c.Flags().StringVar(&machinaSSHUsername, "machina-ssh-username", "kubedev", "SSH username for spec.ssh.username on each Machine CR")
 	c.Flags().StringVar(&machinaBastionSSHUsername, "machina-bastion-ssh-username", "kubedev", "SSH username for spec.ssh.bastion.username on each Machine CR")
 

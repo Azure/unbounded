@@ -21,20 +21,20 @@
   <!-- Left column: Referenced Resources                  -->
   <!-- ═══════════════════════════════════════════════════ -->
 
-  <!-- Secret (machina-system) - SSH key -->
+  <!-- Secret (unbounded-kube) - SSH key -->
   <rect x="30" y="22" width="220" height="36" rx="6" fill="#18181b" stroke="#a78bfa" stroke-width="1" stroke-opacity="0.6"/>
   <!-- lock icon -->
   <rect x="42" y="32" width="10" height="8" rx="1.5" fill="none" stroke="#a78bfa" stroke-width="0.9"/>
   <path d="M44,32 L44,29 A3,3 0 0,1 50,29 L50,32" fill="none" stroke="#a78bfa" stroke-width="0.9"/>
   <text x="60" y="45" fill="#e4e4e7" font-size="11" font-weight="600">Secret</text>
-  <text x="106" y="45" fill="#a0a0a8" font-size="10">(machina-system)</text>
+  <text x="106" y="45" fill="#a0a0a8" font-size="10">(unbounded-kube)</text>
 
-  <!-- Secret (machina-system) - Redfish password -->
+  <!-- Secret (unbounded-kube) - Redfish password -->
   <rect x="30" y="72" width="220" height="36" rx="6" fill="#18181b" stroke="#a78bfa" stroke-width="1" stroke-opacity="0.6"/>
   <rect x="42" y="82" width="10" height="8" rx="1.5" fill="none" stroke="#a78bfa" stroke-width="0.9"/>
   <path d="M44,82 L44,79 A3,3 0 0,1 50,79 L50,82" fill="none" stroke="#a78bfa" stroke-width="0.9"/>
   <text x="60" y="95" fill="#e4e4e7" font-size="11" font-weight="600">Secret</text>
-  <text x="106" y="95" fill="#a0a0a8" font-size="10">(machina-system)</text>
+  <text x="106" y="95" fill="#a0a0a8" font-size="10">(unbounded-kube)</text>
 
   <!-- Secret (kube-system) -->
   <rect x="30" y="122" width="220" height="36" rx="6" fill="#18181b" stroke="#a78bfa" stroke-width="1" stroke-opacity="0.6"/>

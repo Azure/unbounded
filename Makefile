@@ -134,8 +134,8 @@ machina-manifests: ## Stamp the machina deployment manifest with the container i
 	@echo "Updated deploy/machina/04-deployment.yaml → image: $(MACHINA_IMAGE)"
 
 machina-run: machina ## Replace the in-cluster machina with a locally built binary
-	kubectl scale deployment/machina-controller --replicas=0 -n machina-system
-	kubectl get configmap machina-config -n machina-system -o jsonpath='{.data.config\.yaml}' > hack/machina-config.yaml
+	kubectl scale deployment/machina-controller --replicas=0 -n unbounded-kube
+	kubectl get configmap machina-config -n unbounded-kube -o jsonpath='{.data.config\.yaml}' > hack/machina-config.yaml
 	$(MACHINA_BIN) controller --config=hack/machina-config.yaml
 
 metalman-oci: ## Build the metalman container image

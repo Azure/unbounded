@@ -46,7 +46,7 @@ type siteAddMachineHandler struct {
 	hostSSHPrivateKey string
 
 	// sshSecretName is the name of the Kubernetes secret that holds SSH credentials.
-	// Defaults to "ssh-${siteName}" in the machina-system namespace.
+	// Defaults to "ssh-${siteName}" in the unbounded-kube namespace.
 	sshSecretName string
 
 	// bastionHost is the IP or DNS name and optionally port that Machina connects to first before jumping to host.

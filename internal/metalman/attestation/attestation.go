@@ -35,7 +35,7 @@ import (
 
 const (
 	BootstrapSAName      = "metalman-bootstrap"
-	BootstrapSANamespace = "machina-system"
+	BootstrapSANamespace = "unbounded-kube"
 
 	// maxRequestBodySize limits attestation request bodies to 1 MiB.
 	maxRequestBodySize = 1 << 20
