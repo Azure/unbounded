@@ -28,7 +28,7 @@ kubectl apply -f deploy/machina/crd/
 kubectl apply -f deploy/metalman/
 ```
 
-This creates the `machina-system` namespace, ServiceAccounts (`metalman-controller`, `metalman-bootstrap`), RBAC roles, and a Deployment.
+This creates the `unbounded-kube` namespace, ServiceAccounts (`metalman-controller`, `metalman-bootstrap`), RBAC roles, and a Deployment.
 
 Key `serve-pxe` flags (set via the Deployment):
 
@@ -88,7 +88,7 @@ spec:
       username: admin
       passwordRef:
         name: bmc-passwords
-        namespace: machina-system
+        namespace: unbounded-kube
         key: bmc-01
   operations:
     rebootCounter: 0

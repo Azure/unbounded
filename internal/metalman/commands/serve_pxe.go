@@ -65,7 +65,7 @@ func ServePXECmd() *cobra.Command {
 				Scheme:                        scheme,
 				LeaderElection:                true,
 				LeaderElectionID:              leID,
-				LeaderElectionNamespace:       "machina-system",
+				LeaderElectionNamespace:       "unbounded-kube",
 				LeaseDuration:                 &leaseDuration,
 				RenewDeadline:                 &renewDeadline,
 				RetryPeriod:                   &retryPeriod,

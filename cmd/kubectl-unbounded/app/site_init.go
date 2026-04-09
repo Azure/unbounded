@@ -307,7 +307,7 @@ func (h *siteInitHandler) ensureMachinaIsRunning(ctx context.Context) error {
 		FieldManager: fieldManagerID,
 	}
 
-	// Ensure the machina-system namespace exists before applying the
+	// Ensure the unbounded-kube namespace exists before applying the
 	// ConfigMap — the namespace manifest is part of the installer bundle
 	// but we need it earlier.
 	nsApply := v1.Namespace(machinaNamespace)
@@ -320,7 +320,7 @@ func (h *siteInitHandler) ensureMachinaIsRunning(ctx context.Context) error {
 		return fmt.Errorf("marshaling machina controller config: %w", err)
 	}
 
-	s := v1.ConfigMap("machina-config", "machina-system").
+	s := v1.ConfigMap("machina-config", "unbounded-kube").
 		WithData(map[string]string{
 			"config.yaml": string(b),
 		})

@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: machina-controller
-  namespace: machina-system
+  namespace: unbounded-kube
   labels:
     app: machina-controller
 spec:

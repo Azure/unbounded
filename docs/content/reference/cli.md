@@ -58,7 +58,7 @@ Initialize a new unbounded-kube site. This command:
    uses local manifests).
 4. Creates unbounded-net Site and GatewayPool resources.
 5. Creates a bootstrap token for the site.
-6. Installs the machina controller in the `machina-system` namespace.
+6. Installs the machina controller in the `unbounded-kube` namespace.
 
 #### Required Flags
 

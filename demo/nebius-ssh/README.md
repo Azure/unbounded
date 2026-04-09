@@ -154,7 +154,7 @@ kubectl apply -f deploy/machina/
 
 This creates the RBAC resources, kubeadm configs, a bootstrap token, and an
 Ed25519 SSH key pair. The public key is saved locally as `unbounded_ed25519.pub`
-and the private key is stored as a Secret in the `machina-system` namespace.
+and the private key is stored as a Secret in the `unbounded-kube` namespace.
 
 ```bash
 kubectl unbounded setup

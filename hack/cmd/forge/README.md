@@ -132,7 +132,7 @@ bin/forge site azure inventory \
 | `--namespace` | | `default` | Kubernetes namespace for machina output |
 | `--match-prefix` | | | Only include machines whose VM name starts with this prefix |
 | `--machina-bastion` | | `false` | When used with `--output=machina`, configure each Machine CR with `spec.ssh.bastion` using the bastion's public IP |
-| `--machina-ssh-secret-ref` | | | Secret reference for `spec.ssh.privateKeyRef` in format `[$namespace/]$name[:$key]` (default namespace: machina-system) |
-| `--machina-bastion-ssh-secret-ref` | | | Secret reference for `spec.ssh.bastion.privateKeyRef` in format `[$namespace/]$name[:$key]` (default namespace: machina-system) |
+| `--machina-ssh-secret-ref` | | | Secret reference for `spec.ssh.privateKeyRef` in format `[$namespace/]$name[:$key]` (default namespace: unbounded-kube) |
+| `--machina-bastion-ssh-secret-ref` | | | Secret reference for `spec.ssh.bastion.privateKeyRef` in format `[$namespace/]$name[:$key]` (default namespace: unbounded-kube) |
 | `--machina-ssh-username` | | `kubedev` | SSH username for `spec.ssh.username` on each Machine CR |
 | `--machina-bastion-ssh-username` | | `kubedev` | SSH username for `spec.ssh.bastion.username` on each Machine CR |

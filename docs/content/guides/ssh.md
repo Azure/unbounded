@@ -32,7 +32,7 @@ This single command handles:
 - Creating site resources for both the cluster and the new site
 - Creating a **bootstrap token** Secret in `kube-system` (labeled `unbounded-kube.io/site=<name>`)
 - Setting up kubeadm-compatible RBAC and ConfigMaps
-- Installing the **machina controller** in the `machina-system` namespace
+- Installing the **machina controller** in the `unbounded-kube` namespace
 
 ```bash
 kubectl unbounded site init \
@@ -55,7 +55,7 @@ All five flags above are required. Optional flags:
 ## Creating Machines
 
 Use `kubectl unbounded site add-machine` to register a machine with the site.
-The command creates an SSH key Secret in `machina-system` and applies a Machine
+The command creates an SSH key Secret in `unbounded-kube` and applies a Machine
 CR to the cluster:
 
 ```bash
@@ -70,7 +70,7 @@ The three flags `--site`, `--host`, and `--ssh-username` are required.
 `--ssh-private-key` is also required unless bastion flags are provided.
 
 {{< callout type="important" >}}
-The SSH private key is read from disk and stored as a Kubernetes Secret named `ssh-<site>` (e.g. `ssh-mysite`) in the `machina-system` namespace. If the Secret already exists, it is updated. Ensure your cluster's RBAC restricts access to Secrets in `machina-system`.
+The SSH private key is read from disk and stored as a Kubernetes Secret named `ssh-<site>` (e.g. `ssh-mysite`) in the `unbounded-kube` namespace. If the Secret already exists, it is updated. Ensure your cluster's RBAC restricts access to Secrets in `unbounded-kube`.
 {{< /callout >}}
 
 The machine name is automatically prefixed with the site name. For example,
@@ -103,7 +103,7 @@ spec:
     username: ubuntu
     privateKeyRef:
       name: ssh-mysite
-      namespace: machina-system
+      namespace: unbounded-kube
       key: ssh-private-key
   kubernetes:
     version: "v1.34.0"
@@ -156,7 +156,7 @@ spec:
     username: ubuntu
     privateKeyRef:
       name: ssh-mysite
-      namespace: machina-system
+      namespace: unbounded-kube
       key: ssh-private-key
     bastion:
       host: "bastion.example.com"
@@ -199,7 +199,7 @@ groups.
 or script error:
 
 ```bash
-kubectl logs -n machina-system deploy/machina-controller
+kubectl logs -n unbounded-kube deploy/machina-controller
 ```
 
 Common causes: missing or incorrect SSH key Secret, wrong username, target
@@ -211,7 +211,7 @@ join errors. Verify the bootstrap token hasn't expired and that the machine has
 HTTPS connectivity to the API server.
 
 {{< callout type="warning" >}}
-**Security considerations** -- SSH host key verification is currently disabled. SSH keys are stored as Kubernetes Secrets in the `machina-system` namespace. The install script runs as root via `sudo -E bash`. Ensure you trust the network path between the machina controller and target machines. All binary downloads use HTTPS. Supported key types: Ed25519, RSA, ECDSA.
+**Security considerations** -- SSH host key verification is currently disabled. SSH keys are stored as Kubernetes Secrets in the `unbounded-kube` namespace. The install script runs as root via `sudo -E bash`. Ensure you trust the network path between the machina controller and target machines. All binary downloads use HTTPS. Supported key types: Ed25519, RSA, ECDSA.
 {{< /callout >}}
 
 ## See Also

@@ -26,7 +26,7 @@ import (
 var MetalmanImage = "metalman:latest"
 
 const (
-	deployPXENamespace = "machina-system"
+	deployPXENamespace = "unbounded-kube"
 )
 
 // deployPXEParams holds the values needed to build the PXE Deployment.
@@ -181,7 +181,7 @@ func deployPXECommand() *cobra.Command {
 		Short: "Deploy the PXE server for a site",
 		Long: `Deploy (or update) a Kubernetes Deployment running metalman serve-pxe
 for a given site. The Deployment is server-side applied into the
-machina-system namespace.`,
+unbounded-kube namespace.`,
 		SilenceUsage: true,
 		Args:         cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {

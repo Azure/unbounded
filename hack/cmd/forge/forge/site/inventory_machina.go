@@ -22,7 +22,7 @@ func machinaNameFromInventory(site string, m azuredev.Machine) string {
 
 // parseSecretKeyRef parses a secret reference string in the format
 // "[$namespace/]$secret-name[:$key]" into a SecretKeySelector.
-// When $namespace/ is omitted, it defaults to "machina-system".
+// When $namespace/ is omitted, it defaults to "unbounded-kube".
 // When :$key is omitted, the Key field is left empty (relying on kubebuilder
 // defaults).
 func parseSecretKeyRef(ref string) (machinav1alpha3.SecretKeySelector, error) {
@@ -45,7 +45,7 @@ func parseSecretKeyRef(ref string) (machinav1alpha3.SecretKeySelector, error) {
 		sel.Namespace = namespaceName[:idx]
 		sel.Name = namespaceName[idx+1:]
 	} else {
-		sel.Namespace = "machina-system"
+		sel.Namespace = "unbounded-kube"
 		sel.Name = namespaceName
 	}
 

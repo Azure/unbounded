@@ -235,27 +235,27 @@ func TestParseSecretKeyRef(t *testing.T) {
 	}{
 		{
 			name:  "full format",
-			input: "machina-system/machina-ssh:ssh-private-key",
+			input: "unbounded-kube/machina-ssh:ssh-private-key",
 			expected: machinav1alpha3.SecretKeySelector{
-				Namespace: "machina-system",
+				Namespace: "unbounded-kube",
 				Name:      "machina-ssh",
 				Key:       "ssh-private-key",
 			},
 		},
 		{
-			name:  "no namespace defaults to machina-system",
+			name:  "no namespace defaults to unbounded-kube",
 			input: "machina-ssh:ssh-private-key",
 			expected: machinav1alpha3.SecretKeySelector{
-				Namespace: "machina-system",
+				Namespace: "unbounded-kube",
 				Name:      "machina-ssh",
 				Key:       "ssh-private-key",
 			},
 		},
 		{
 			name:  "no key omits key field",
-			input: "machina-system/machina-ssh",
+			input: "unbounded-kube/machina-ssh",
 			expected: machinav1alpha3.SecretKeySelector{
-				Namespace: "machina-system",
+				Namespace: "unbounded-kube",
 				Name:      "machina-ssh",
 			},
 		},
@@ -263,7 +263,7 @@ func TestParseSecretKeyRef(t *testing.T) {
 			name:  "bare name only",
 			input: "machina-ssh",
 			expected: machinav1alpha3.SecretKeySelector{
-				Namespace: "machina-system",
+				Namespace: "unbounded-kube",
 				Name:      "machina-ssh",
 			},
 		},
@@ -282,7 +282,7 @@ func TestParseSecretKeyRef(t *testing.T) {
 		},
 		{
 			name:      "namespace slash but no name errors",
-			input:     "machina-system/",
+			input:     "unbounded-kube/",
 			expectErr: true,
 		},
 	}
@@ -313,7 +313,7 @@ func TestWriteInventoryAsMachina_WithSSHSecretRef(t *testing.T) {
 	}
 
 	ref := machinav1alpha3.SecretKeySelector{
-		Namespace: "machina-system",
+		Namespace: "unbounded-kube",
 		Name:      "machina-ssh",
 		Key:       "ssh-private-key",
 	}
@@ -330,7 +330,7 @@ func TestWriteInventoryAsMachina_WithSSHSecretRef(t *testing.T) {
 	output := buf.String()
 	require.Contains(t, output, "privateKeyRef:")
 	require.Contains(t, output, "name: machina-ssh")
-	require.Contains(t, output, "namespace: machina-system")
+	require.Contains(t, output, "namespace: unbounded-kube")
 	require.Contains(t, output, "key: ssh-private-key")
 }
 
@@ -349,13 +349,13 @@ func TestWriteInventoryAsMachina_WithBastionSecretRef(t *testing.T) {
 	}
 
 	sshRef := machinav1alpha3.SecretKeySelector{
-		Namespace: "machina-system",
+		Namespace: "unbounded-kube",
 		Name:      "machina-ssh",
 		Key:       "ssh-private-key",
 	}
 
 	bastionRef := machinav1alpha3.SecretKeySelector{
-		Namespace: "machina-system",
+		Namespace: "unbounded-kube",
 		Name:      "bastion-ssh",
 		Key:       "bastion-key",
 	}
