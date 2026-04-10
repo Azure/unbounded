@@ -7,12 +7,10 @@ import (
 	"bytes"
 	"context"
 	"embed"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
-	"net"
 	"text/template"
 
 	"github.com/spf13/cobra"
@@ -29,9 +27,6 @@ import (
 
 //go:embed assets/unbounded-net-site/*.yaml
 var siteTemplates embed.FS
-
-//go:embed assets/flexagent-temp/*.yaml
-var flexAgentTemplates embed.FS
 
 const (
 	unboundedCNIRelease = "https://github.com/Azure/unbounded-net/releases/download/v1.1.2/unbounded-net-manifests-v1.1.2.tar.gz"
@@ -81,10 +76,6 @@ type siteInitHandler struct {
 	// to the cluster for this site. This is temporarily required to support installing the
 	// machina controller until we have public downloadable releases coming from that repository.
 	machinaManifests string
-
-	// clusterServiceCIDR is the Service CIDR of the cluster (e.g. "10.0.0.0/16").
-	// When not provided it is derived from the kube-dns Service ClusterIP.
-	clusterServiceCIDR string
 
 	// manageCniPlugin controls whether unbounded-net manages the CNI plugin
 	// for the site. When false, the Site is configured with manageCniPlugin: false
@@ -185,13 +176,6 @@ func (h *siteInitHandler) execute(ctx context.Context) error {
 
 	if err := h.ensureBootstrapToken(ctx); err != nil {
 		return fmt.Errorf("ensuring bootstrap token for site %s: %w", h.name, err)
-	}
-
-	// TEMPORARY!!!
-	// THIS IS ONLY NEEDED UNTIL THE FLEX AGENT NODE IS DEPRECATED IN FAVOR OF THE NEW AGENT. IT DOES
-	// A BUNCH OF KUBEADM STUFF WE DO NOT NEED.
-	if err := h.ensureFlexAgentConfig(ctx); err != nil {
-		return fmt.Errorf("ensuring flex agent config for site %s: %w", h.name, err)
 	}
 
 	if err := h.ensureMachinaIsRunning(ctx); err != nil {
@@ -382,146 +366,6 @@ func (h *siteInitHandler) ensureUnboundedSite(ctx context.Context, cfg unbounded
 	return nil
 }
 
-// flexAgentTemplateData holds the values injected into the flexagent-temp
-// manifest templates that set up kubeadm-compatible RBAC and ConfigMaps.
-type flexAgentTemplateData struct {
-	// CertificateAuthorityData is the base64-encoded cluster CA certificate.
-	CertificateAuthorityData string
-
-	// Server is the HTTPS URL of the Kubernetes API server.
-	Server string
-
-	// KubernetesVersion is the cluster's Kubernetes version (e.g. "v1.34.3").
-	KubernetesVersion string
-
-	// ServiceSubnet is the cluster Service CIDR (e.g. "10.0.0.0/16").
-	ServiceSubnet string
-}
-
-// ensureFlexAgentConfig renders and applies the embedded flexagent-temp
-// manifest templates. These create the RBAC rules and ConfigMaps that
-// kubeadm expects on a control plane so that remote worker nodes can
-// perform a bootstrap-token based kubeadm join against a managed cluster
-// (e.g. AKS) that was not bootstrapped by kubeadm.
-func (h *siteInitHandler) ensureFlexAgentConfig(ctx context.Context) error {
-	h.logger.Info("Ensuring flex agent kubeadm config")
-
-	// CA certificate from kube-root-ca.crt ConfigMap in kube-public.
-	cm, err := h.kubeCli.CoreV1().ConfigMaps(metav1.NamespacePublic).Get(ctx, "kube-root-ca.crt", metav1.GetOptions{})
-	if err != nil {
-		return fmt.Errorf("get kube-root-ca.crt ConfigMap: %w", err)
-	}
-
-	caCert, ok := cm.Data["ca.crt"]
-	if !ok {
-		return fmt.Errorf("ca.crt key not found in kube-root-ca.crt ConfigMap")
-	}
-
-	caCertBase64 := base64.StdEncoding.EncodeToString([]byte(caCert))
-
-	// Kubernetes version from the API server.
-	sv, err := h.kubeCli.Discovery().ServerVersion()
-	if err != nil {
-		return fmt.Errorf("get server version: %w", err)
-	}
-
-	// Service CIDR — use the flag value or derive from kube-dns.
-	serviceCIDR := h.clusterServiceCIDR
-	if serviceCIDR == "" {
-		derived, err := deriveServiceCIDR(ctx, h.kubeCli)
-		if err != nil {
-			return fmt.Errorf("derive service CIDR from kube-dns: %w", err)
-		}
-
-		serviceCIDR = derived
-	}
-
-	data := flexAgentTemplateData{
-		CertificateAuthorityData: caCertBase64,
-		Server:                   h.kubeConfig.Host,
-		KubernetesVersion:        sv.GitVersion,
-		ServiceSubnet:            serviceCIDR,
-	}
-
-	h.logger.Info("Flex agent template data resolved",
-		"server", data.Server,
-		"kubernetesVersion", data.KubernetesVersion,
-		"serviceSubnet", data.ServiceSubnet,
-		"caCertBase64Length", len(data.CertificateAuthorityData),
-	)
-
-	buf := &bytes.Buffer{}
-
-	entries, err := fs.ReadDir(flexAgentTemplates, "assets/flexagent-temp")
-	if err != nil {
-		return fmt.Errorf("reading flexagent-temp directory: %w", err)
-	}
-
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-
-		path := "assets/flexagent-temp/" + entry.Name()
-
-		content, err := fs.ReadFile(flexAgentTemplates, path)
-		if err != nil {
-			return fmt.Errorf("reading flex agent template %s: %w", entry.Name(), err)
-		}
-
-		t, err := template.New(entry.Name()).Parse(string(content))
-		if err != nil {
-			return fmt.Errorf("parsing flex agent template %s: %w", entry.Name(), err)
-		}
-
-		if err := t.Execute(buf, data); err != nil {
-			return fmt.Errorf("rendering flex agent template %s: %w", entry.Name(), err)
-		}
-
-		if buf.Len() > 0 && buf.Bytes()[buf.Len()-1] != '\n' {
-			buf.WriteByte('\n')
-		}
-	}
-
-	if err := kube.ApplyManifests(ctx, h.logger, h.kubeResourcesCli, fieldManagerID, buf.Bytes()); err != nil {
-		return fmt.Errorf("applying flex agent manifests: %w", err)
-	}
-
-	h.logger.Info("Flex agent kubeadm config applied")
-
-	return nil
-}
-
-// deriveServiceCIDR infers the cluster Service CIDR from the kube-dns
-// Service ClusterIP. It masks the IP to a /16 network. For example,
-// if kube-dns has ClusterIP 10.0.0.10, the result is "10.0.0.0/16".
-func deriveServiceCIDR(ctx context.Context, kubeCli kubernetes.Interface) (string, error) {
-	svc, err := kubeCli.CoreV1().Services(metav1.NamespaceSystem).Get(ctx, "kube-dns", metav1.GetOptions{})
-	if err != nil {
-		return "", fmt.Errorf("get kube-dns Service: %w", err)
-	}
-
-	if svc.Spec.ClusterIP == "" {
-		return "", fmt.Errorf("kube-dns Service has no ClusterIP")
-	}
-
-	ip := net.ParseIP(svc.Spec.ClusterIP)
-	if ip == nil {
-		return "", fmt.Errorf("invalid kube-dns ClusterIP: %s", svc.Spec.ClusterIP)
-	}
-
-	ip = ip.To4()
-	if ip == nil {
-		return "", fmt.Errorf("kube-dns ClusterIP %s is not IPv4", svc.Spec.ClusterIP)
-	}
-
-	// Apply a /16 mask to get the network address.
-	mask := net.CIDRMask(16, 32)
-	network := ip.Mask(mask)
-
-	return fmt.Sprintf("%s/16", network.String()), nil
-}
-
 func (h *siteInitHandler) ensureBootstrapToken(ctx context.Context) error {
 	tok, err := kube.GetBootstrapTokenForSite(ctx, h.kubeCli, h.name)
 	if err != nil && !errors.Is(err, kube.ErrBootstrapTokenNotFound) {
@@ -563,7 +407,6 @@ func siteInitCommand() *cobra.Command {
 	cmd.Flags().StringVar(&handler.clusterPodCIDR, "cluster-pod-cidr", "", "The cluster pod cidr")
 	cmd.Flags().StringVar(&handler.nodeCIDR, "node-cidr", "", "The node CIDR")
 	cmd.Flags().StringVar(&handler.podCIDR, "pod-cidr", "", "The pod CIDR")
-	cmd.Flags().StringVar(&handler.clusterServiceCIDR, "cluster-service-cidr", "", "The Service CIDR of the cluster (e.g. 10.0.0.0/16); derived from kube-dns if omitted")
 	cmd.Flags().BoolVar(&handler.manageCniPlugin, "manage-cni-plugin", true, "Whether unbounded-net manages the CNI plugin; set to false when the cluster already has a CNI (e.g. Cilium, Calico)")
 
 	if err := cmd.MarkFlagRequired("name"); err != nil {

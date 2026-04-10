@@ -31,7 +31,6 @@ This single command handles:
 - Installing the unbounded-net CNI plugin
 - Creating site resources for both the cluster and the new site
 - Creating a **bootstrap token** Secret in `kube-system` (labeled `unbounded-kube.io/site=<name>`)
-- Setting up kubeadm-compatible RBAC and ConfigMaps
 - Installing the **machina controller** in the `unbounded-kube` namespace
 
 ```bash
@@ -50,7 +49,6 @@ All five flags above are required. Optional flags:
 | `--cni-manifests` | Path or HTTPS URL to CNI plugin manifests (defaults to the bundled release) |
 | `--machina-manifests` | Path or HTTPS URL to machina manifests (uses embedded manifests if omitted) |
 | `--kubeconfig` | Path to kubeconfig file |
-| `--cluster-service-cidr` | The cluster Service CIDR (e.g. `10.0.0.0/16`); derived from the kube-dns ClusterIP if omitted |
 
 ## Creating Machines
 
