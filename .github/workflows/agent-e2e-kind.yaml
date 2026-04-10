@@ -88,21 +88,6 @@ jobs:
           # Kind API server.
           sudo iptables -t raw -I PREROUTING -i "${BRIDGE}" -j ACCEPT
 
-          # Connect the Kind container directly to the VM bridge via a veth
-          # pair so that the VM subnet is directly reachable at L2. This is
-          # required because kindnet adds routes of the form
-          # "10.244.x.0/24 via <nodeIP>" and the kernel rejects these when
-          # the gateway is only reachable via an indirect route.
-          echo "[INFO] Attaching Kind container to ${BRIDGE} bridge..."
-          KIND_PID=$(docker inspect "${KIND_CONTAINER}" --format '{{.State.Pid}}')
-          sudo ip link delete veth-kind-e2e 2>/dev/null || true
-          sudo ip link add veth-kind-e2e type veth peer name eth-e2e
-          sudo ip link set veth-kind-e2e master "${BRIDGE}"
-          sudo ip link set veth-kind-e2e up
-          sudo ip link set eth-e2e netns "${KIND_PID}"
-          sudo nsenter -t "${KIND_PID}" -n ip addr add "${VM_SUBNET}.2/24" dev eth-e2e
-          sudo nsenter -t "${KIND_PID}" -n ip link set eth-e2e up
-
           # Patch kindnet so CONTROL_PLANE_ENDPOINT uses the container IP instead
           # of the hostname (which is unresolvable from the VM).
           echo "[INFO] Patching kindnet DaemonSet for VM-reachable control plane endpoint..."
@@ -131,6 +116,27 @@ jobs:
 
       - name: Create QEMU VM
         run: python3 ./hack/agent/e2e-kind/e2e.py create-vm
+
+      - name: Attach Kind container to VM bridge
+        run: |
+          set -euo pipefail
+          KIND_CONTAINER="${KIND_CLUSTER_NAME}-control-plane"
+          BRIDGE="virbr-e2e"
+
+          # Connect the Kind container directly to the VM bridge via a veth
+          # pair so that the VM subnet is directly reachable at L2. This is
+          # required because kindnet adds routes of the form
+          # "10.244.x.0/24 via <nodeIP>" and the kernel rejects these when
+          # the gateway is only reachable via an indirect route.
+          echo "[INFO] Attaching Kind container to ${BRIDGE} bridge..."
+          KIND_PID=$(docker inspect "${KIND_CONTAINER}" --format '{{.State.Pid}}')
+          sudo ip link delete veth-kind-e2e 2>/dev/null || true
+          sudo ip link add veth-kind-e2e type veth peer name eth-e2e
+          sudo ip link set veth-kind-e2e master "${BRIDGE}"
+          sudo ip link set veth-kind-e2e up
+          sudo ip link set eth-e2e netns "${KIND_PID}"
+          sudo nsenter -t "${KIND_PID}" -n ip addr add "${VM_SUBNET}.2/24" dev eth-e2e
+          sudo nsenter -t "${KIND_PID}" -n ip link set eth-e2e up
 
       - name: Run agent to join VM to cluster
         run: python3 ./hack/agent/e2e-kind/e2e.py run-agent
