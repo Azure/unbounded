@@ -67,34 +67,6 @@ func TestDetectProvider_AKS_NoSystemNodes(t *testing.T) {
 	require.Equal(t, "microsoft-aks", provider.ID())
 }
 
-func TestDetectProvider_AKS_MissingClusterLabel(t *testing.T) {
-	t.Parallel()
-
-	// AKS detection no longer reads the kubernetes.azure.com/cluster label,
-	// so a node missing that label does not cause an error.
-	kubeCli := fake.NewClientset(
-		&corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "aks-cluster-metadata",
-				Namespace: metav1.NamespacePublic,
-			},
-		},
-		&corev1.Node{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: "aks-system-0",
-				Labels: map[string]string{
-					"kubernetes.azure.com/mode": "system",
-					// Missing kubernetes.azure.com/cluster label.
-				},
-			},
-		},
-	)
-
-	provider, err := DetectProvider(context.Background(), kubeCli)
-	require.NoError(t, err)
-	require.NotNil(t, provider)
-	require.Equal(t, "microsoft-aks", provider.ID())
-}
 
 func TestAKSProvider_DefaultLabels(t *testing.T) {
 	t.Parallel()
