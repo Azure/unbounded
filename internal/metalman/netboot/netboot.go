@@ -6,6 +6,7 @@ package netboot
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"sync"
@@ -15,6 +16,7 @@ import (
 
 	v1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
 	"github.com/Azure/unbounded-kube/internal/metalman/indexing"
+	"github.com/Azure/unbounded-kube/internal/provision"
 )
 
 // ErrNotYetDownloaded is returned when an OCI image has not yet been
@@ -30,13 +32,38 @@ type ResolvedFile struct {
 	ContentType string // MIME type hint for the response
 }
 
+// ClusterInfo holds the API server URL and CA certificate discovered from
+// the cluster-info ConfigMap in kube-public. These values may change at
+// runtime (e.g. API server URL rotation), so they are provided through
+// ClusterInfoProvider rather than stored statically.
+type ClusterInfo struct {
+	ApiserverURL string
+	CACertBase64 string
+}
+
+// ClusterInfoProvider returns the current cluster-info snapshot.
+// Implementations should be safe for concurrent use.
+type ClusterInfoProvider interface {
+	ClusterInfo() ClusterInfo
+}
+
+// StaticClusterInfo is a ClusterInfoProvider that returns a fixed
+// configuration. Useful for tests and simple deployments where runtime
+// refresh is not needed.
+type StaticClusterInfo struct {
+	Info ClusterInfo
+}
+
+func (s *StaticClusterInfo) ClusterInfo() ClusterInfo { return s.Info }
+
 type FileResolver struct {
 	Cache             *OCICache
 	Reader            client.Reader
-	ApiserverURL      string
+	Cluster           ClusterInfoProvider
 	ServeURL          string
 	KubernetesVersion string
 	ClusterDNS        string
+	ProviderLabels    map[string]string
 }
 
 func (f *FileResolver) LookupNodeByIP(ctx context.Context, ip string) (*v1alpha3.Machine, error) {
@@ -71,18 +98,34 @@ func (f *FileResolver) ResolveFileByPath(ctx context.Context, path string, node 
 		}
 
 		if node != nil {
-			agentImage := ""
-			if node.Spec.Agent != nil {
-				agentImage = node.Spec.Agent.Image
+			ci := f.Cluster.ClusterInfo()
+
+			agentConfig := provision.BuildAgentConfig(provision.BuildAgentConfigParams{
+				Machine: node,
+				Cluster: provision.ClusterEndpoint{
+					APIServer:    ci.ApiserverURL,
+					CACertBase64: ci.CACertBase64,
+					ClusterDNS:   f.ClusterDNS,
+					KubeVersion:  f.KubernetesVersion,
+				},
+				ProviderLabels: f.ProviderLabels,
+				AttestURL:      f.ServeURL,
+			})
+
+			// The MarshalIndent prefix "    " (4 spaces) must match the
+			// indentation level of the {{ .AgentConfigJSON }} placeholder
+			// inside user-data.tmpl so that all lines of the multi-line
+			// JSON are properly indented within the YAML content: | block.
+			agentConfigJSON, err := json.MarshalIndent(agentConfig, "    ", "  ")
+			if err != nil {
+				return nil, fmt.Errorf("marshal agent config: %w", err)
 			}
 
 			data, err := renderTemplate(string(content), templateData{
-				Machine:           node,
-				ApiserverURL:      f.ApiserverURL,
-				ServeURL:          f.ServeURL,
-				KubernetesVersion: f.KubernetesVersion,
-				ClusterDNS:        f.ClusterDNS,
-				AgentImage:        agentImage,
+				Machine:         node,
+				ApiserverURL:    ci.ApiserverURL,
+				ServeURL:        f.ServeURL,
+				AgentConfigJSON: string(agentConfigJSON),
 			})
 			if err != nil {
 				return nil, err
@@ -100,12 +143,10 @@ func (f *FileResolver) ResolveFileByPath(ctx context.Context, path string, node 
 }
 
 type templateData struct {
-	Machine           *v1alpha3.Machine
-	ApiserverURL      string
-	ServeURL          string
-	KubernetesVersion string
-	ClusterDNS        string
-	AgentImage        string
+	Machine         *v1alpha3.Machine
+	ApiserverURL    string
+	ServeURL        string
+	AgentConfigJSON string
 }
 
 var (

@@ -52,18 +52,18 @@ func (t *TFTPServer) readHandler(filename string, rf io.ReaderFrom) error {
 
 	node, err := t.LookupNodeByIP(ctx, ip)
 	if err != nil {
-		log.Error("no node for source IP", "err", err)
+		log.Warn("no node for source IP", "err", err)
 		return fmt.Errorf("no node for source IP %s: %w", ip, err)
 	}
 
 	if node.Spec.PXE == nil {
-		log.Error("node has no PXE config", "node", node.Name)
+		log.Warn("node has no PXE config", "node", node.Name)
 		return fmt.Errorf("node %s has no PXE config", node.Name)
 	}
 
 	resolved, err := t.ResolveFileByPath(ctx, filename, node, node.Spec.PXE.Image)
 	if err != nil {
-		log.Error("resolving file", "node", node.Name, "err", err)
+		log.Warn("resolving file", "node", node.Name, "err", err)
 		return err
 	}
 
