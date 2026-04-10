@@ -17,7 +17,7 @@ These flags apply to all commands:
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
 | `--cloud` | `-a` | `AzurePublicCloud` | Azure cloud name |
-| `--subscription` | `-s` | `44654aed-2753-4b88-9142-af7132933b6b` | Azure subscription ID |
+| `--subscription` | `-s` | `<your-subscription-id>` | Azure subscription ID |
 | `--log-format` | | `text` | Log format (`text` or `json`) |
 
 ## Create the Cluster
@@ -75,7 +75,7 @@ bin/forge site azure add \
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--azure` | `AzurePublicCloud` | Azure cloud name |
-| `--subscription` | `44654aed-2753-4b88-9142-af7132933b6b` | Azure subscription ID |
+| `--subscription` | `<your-subscription-id>` | Azure subscription ID |
 | `--location` | `canadacentral` | Azure location |
 | `--worker-node-cidr` | `10.1.0.0/16` | CIDR range to use for worker nodes |
 | `--ssh-bastion` | `false` | Provision an SSH bastion (jump host) for the site |
@@ -100,7 +100,7 @@ bin/forge site azure add-pool \
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--azure` | `AzurePublicCloud` | Azure cloud name |
-| `--subscription` | `44654aed-2753-4b88-9142-af7132933b6b` | Azure subscription ID |
+| `--subscription` | `<your-subscription-id>` | Azure subscription ID |
 | `--location` | `canadacentral` | Azure location |
 | `--name` | | Name of the machine pool to add |
 | `--count` | `2` | Number of worker nodes to create in the pool |

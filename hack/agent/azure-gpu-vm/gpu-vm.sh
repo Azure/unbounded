@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 #
 # gpu-vm.sh - Manage Azure GPU VMs with NVIDIA drivers.
 #

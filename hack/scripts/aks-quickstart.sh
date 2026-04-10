@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 # aks-quickstart.sh -- Create or configure an AKS cluster for unbounded-kube
 # with gateway node pools and all required networking infrastructure.
 #

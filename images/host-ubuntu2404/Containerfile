@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 # ── Build the unbounded-agent binary ────────────────────────────────
 FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26@sha256:ec4debba7b371fb2eaa6169a72fc61ad93b9be6a9ae9da2a010cb81a760d36e7 AS gobuilder
 

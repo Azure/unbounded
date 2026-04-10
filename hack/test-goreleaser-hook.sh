@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 # hack/test-goreleaser-hook.sh
 #
 # Tests that the goreleaser pre-hook correctly stamps the machina
