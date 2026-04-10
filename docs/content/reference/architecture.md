@@ -185,8 +185,7 @@ numbered YAML files (no Helm or Kustomize).
 | Directory | Contents |
 |-----------|----------|
 | `deploy/machina/crd/` | `Machine` CRD definition. |
-| `deploy/machina/` | Namespace, RBAC, ConfigMap, Deployment, Service. |
-| `deploy/metalman/` | RBAC, Deployment. |
+| `deploy/machina/` | Namespace, RBAC (machina + metalman), ConfigMap, Deployment, Service. |
 
 Resource defaults for both controllers: 100m CPU / 128Mi memory requests,
 500m CPU / 256Mi memory limits. Both tolerate `CriticalAddonsOnly`.

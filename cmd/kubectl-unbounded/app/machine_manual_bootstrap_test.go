@@ -189,8 +189,7 @@ func TestManualBootstrapHandler_BuildAgentConfig(t *testing.T) {
 	require.NotEmpty(t, cfg.Cluster.CaCertBase64)
 	require.NotEmpty(t, cfg.Cluster.Version) // fake client returns empty string but it's still set
 	require.Contains(t, cfg.Kubelet.BootstrapToken, "abc123.")
-	require.Equal(t, "prod", cfg.Kubelet.Labels["env"])
-	require.Equal(t, "true", cfg.Kubelet.Labels[cloudprovider.ExcludeFromCloudProviderLabel])
+	require.Equal(t, map[string]string{"env": "prod", cloudprovider.ExcludeFromCloudProviderLabel: "true"}, cfg.Kubelet.Labels)
 	require.Equal(t, []string{"dedicated=gpu:NoSchedule"}, cfg.Kubelet.RegisterWithTaints)
 	require.Equal(t, "ghcr.io/azure/rootfs:v1", cfg.OCIImage)
 }

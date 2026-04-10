@@ -840,6 +840,7 @@ func TestMaterializeEmbeddedFS(t *testing.T) {
 		"03-config.yaml",
 		"04-deployment.yaml",
 		"05-service.yaml",
+		"06-metalman-rbac.yaml",
 	} {
 		info, err := os.Stat(filepath.Join(dir, name))
 		require.NoError(t, err, "expected %s to exist", name)

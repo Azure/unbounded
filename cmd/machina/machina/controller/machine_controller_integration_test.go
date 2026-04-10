@@ -999,11 +999,10 @@ func TestIntegration_JoiningToReadyToJoining(t *testing.T) {
 	require.Equal(t, unboundedv1alpha3.MachinePhaseJoining, m.Status.Phase)
 	require.Equal(t, RequeueAfterJoining, result.RequeueAfter)
 
-	// Create a Node with matching label.
+	// Create a Node with name matching the machine (convention).
 	node := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:   "node-1",
-			Labels: map[string]string{MachineNodeLabel: "m1"},
+			Name: "m1",
 		},
 	}
 	require.NoError(t, fakeClient.Create(ctx, node))
@@ -1012,7 +1011,7 @@ func TestIntegration_JoiningToReadyToJoining(t *testing.T) {
 	result, m = reconcileHelper(t, reconciler, "m1")
 	require.Equal(t, unboundedv1alpha3.MachinePhaseReady, m.Status.Phase)
 	require.NotNil(t, m.Spec.Kubernetes.NodeRef)
-	require.Equal(t, "node-1", m.Spec.Kubernetes.NodeRef.Name)
+	require.Equal(t, "m1", m.Spec.Kubernetes.NodeRef.Name)
 	require.Equal(t, RequeueAfterReady, result.RequeueAfter)
 
 	// Reconcile 4: Ready + Node still exists -> stays Ready.
@@ -1031,8 +1030,7 @@ func TestIntegration_JoiningToReadyToJoining(t *testing.T) {
 	// Recreate the Node.
 	node = &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:   "node-1",
-			Labels: map[string]string{MachineNodeLabel: "m1"},
+			Name: "m1",
 		},
 	}
 	require.NoError(t, fakeClient.Create(ctx, node))
@@ -1041,7 +1039,7 @@ func TestIntegration_JoiningToReadyToJoining(t *testing.T) {
 	result, m = reconcileHelper(t, reconciler, "m1")
 	require.Equal(t, unboundedv1alpha3.MachinePhaseReady, m.Status.Phase)
 	require.NotNil(t, m.Spec.Kubernetes.NodeRef)
-	require.Equal(t, "node-1", m.Spec.Kubernetes.NodeRef.Name)
+	require.Equal(t, "m1", m.Spec.Kubernetes.NodeRef.Name)
 	require.Equal(t, RequeueAfterReady, result.RequeueAfter)
 }
 
@@ -1104,11 +1102,10 @@ func TestIntegration_ReadyMachineBecomesUnreachable(t *testing.T) {
 	_, m := reconcileHelper(t, reconciler, "m1")
 	require.Equal(t, unboundedv1alpha3.MachinePhaseJoining, m.Status.Phase)
 
-	// Create Node and reconcile to Ready.
+	// Create Node with name matching machine and reconcile to Ready.
 	node := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:   "node-1",
-			Labels: map[string]string{MachineNodeLabel: "m1"},
+			Name: "m1",
 		},
 	}
 	require.NoError(t, fakeClient.Create(ctx, node))
