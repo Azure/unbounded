@@ -33,7 +33,6 @@ const (
 
 // requiredKubeBinaries lists the Kubernetes binaries that must be present for a valid installation.
 var requiredKubeBinaries = []string{
-	"kubeadm",
 	"kubelet",
 	"kubectl",
 	"kube-proxy",
