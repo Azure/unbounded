@@ -54,3 +54,4 @@ docs/.hugo_build.lock
 
 # Python
 __pycache__/
+docs/superpowers/

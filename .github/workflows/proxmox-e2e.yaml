@@ -1,0 +1,242 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+name: Proxmox E2E
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: proxmox-e2e
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    runs-on: self-hosted
+    timeout-minutes: 15
+    env:
+      VMID_1: ""
+      VMID_2: ""
+      SSH_DIR: ""
+      CLOUD_IMAGE: "/var/cache/proxmox-e2e/ubuntu-24.04-minimal-cloudimg-amd64.img"
+      IMAGE_URL: "https://cloud-images.ubuntu.com/minimal/releases/noble/release/ubuntu-24.04-minimal-cloudimg-amd64.img"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Compute VMIDs
+        id: vmids
+        run: |
+          OFFSET=$(( ${{ github.run_id }} % 499 ))
+          VMID_1=$(( 9000 + OFFSET ))
+          VMID_2=$(( 9500 + OFFSET ))
+          echo "vmid1=${VMID_1}" >> "$GITHUB_OUTPUT"
+          echo "vmid2=${VMID_2}" >> "$GITHUB_OUTPUT"
+          echo "[INFO] VMID_1=${VMID_1}  VMID_2=${VMID_2}"
+
+      - name: Generate ephemeral SSH key
+        id: ssh
+        run: |
+          SSH_DIR="/tmp/proxmox-e2e-${{ github.run_id }}"
+          mkdir -p "${SSH_DIR}"
+          ssh-keygen -t ed25519 -f "${SSH_DIR}/id_ed25519" -N "" -q
+          echo "dir=${SSH_DIR}" >> "$GITHUB_OUTPUT"
+          echo "[INFO] SSH key generated at ${SSH_DIR}/id_ed25519"
+
+      - name: Download cloud image
+        run: |
+          sudo mkdir -p "$(dirname "${CLOUD_IMAGE}")"
+          if [[ -f "${CLOUD_IMAGE}" ]]; then
+            echo "[INFO] Cloud image already cached at ${CLOUD_IMAGE}"
+          else
+            echo "[INFO] Downloading Ubuntu 24.04 Minimal cloud image..."
+            sudo curl -fSL -o "${CLOUD_IMAGE}" "${IMAGE_URL}"
+            echo "[INFO] Download complete"
+          fi
+
+      - name: Create VM 1
+        env:
+          VMID: ${{ steps.vmids.outputs.vmid1 }}
+          SSH_DIR: ${{ steps.ssh.outputs.dir }}
+        run: |
+          set -euo pipefail
+          echo "[INFO] Creating VM ${VMID}..."
+          sudo qm create "${VMID}" \
+            --name "e2e-vm1-run${{ github.run_id }}" \
+            --cores 2 \
+            --memory 4096 \
+            --agent enabled=1 \
+            --net0 virtio,bridge=vmbr0 \
+            --ostype l26 \
+            --scsihw virtio-scsi-single \
+            --serial0 socket \
+            --vga serial0
+
+          echo "[INFO] Importing disk..."
+          sudo qm disk import "${VMID}" "${CLOUD_IMAGE}" local-lvm
+          sudo qm set "${VMID}" --scsi0 "local-lvm:vm-${VMID}-disk-0"
+          sudo qm set "${VMID}" --ide2 local-lvm:cloudinit
+          sudo qm set "${VMID}" \
+            --ciuser ubuntu \
+            --sshkeys "${SSH_DIR}/id_ed25519.pub" \
+            --ipconfig0 ip=dhcp
+          sudo qm disk resize "${VMID}" scsi0 128G
+          sudo qm set "${VMID}" --boot order=scsi0
+
+          echo "[INFO] Starting VM ${VMID}..."
+          sudo qm start "${VMID}"
+          echo "[INFO] VM ${VMID} started"
+
+      - name: Create VM 2
+        env:
+          VMID: ${{ steps.vmids.outputs.vmid2 }}
+          SSH_DIR: ${{ steps.ssh.outputs.dir }}
+        run: |
+          set -euo pipefail
+          echo "[INFO] Creating VM ${VMID}..."
+          sudo qm create "${VMID}" \
+            --name "e2e-vm2-run${{ github.run_id }}" \
+            --cores 2 \
+            --memory 4096 \
+            --agent enabled=1 \
+            --net0 virtio,bridge=vmbr0 \
+            --ostype l26 \
+            --scsihw virtio-scsi-single \
+            --serial0 socket \
+            --vga serial0
+
+          echo "[INFO] Importing disk..."
+          sudo qm disk import "${VMID}" "${CLOUD_IMAGE}" local-lvm
+          sudo qm set "${VMID}" --scsi0 "local-lvm:vm-${VMID}-disk-0"
+          sudo qm set "${VMID}" --ide2 local-lvm:cloudinit
+          sudo qm set "${VMID}" \
+            --ciuser ubuntu \
+            --sshkeys "${SSH_DIR}/id_ed25519.pub" \
+            --ipconfig0 ip=dhcp
+          sudo qm disk resize "${VMID}" scsi0 128G
+          sudo qm set "${VMID}" --boot order=scsi0
+
+          echo "[INFO] Starting VM ${VMID}..."
+          sudo qm start "${VMID}"
+          echo "[INFO] VM ${VMID} started"
+
+      - name: Discover VM 1 IP
+        id: ip1
+        env:
+          VMID: ${{ steps.vmids.outputs.vmid1 }}
+        run: |
+          set -euo pipefail
+          echo "[INFO] Waiting for guest agent on VM ${VMID}..."
+          for i in $(seq 1 36); do
+            if IFACES=$(sudo qm agent "${VMID}" network-get-interfaces 2>/dev/null); then
+              IP=$(echo "${IFACES}" | jq -r '
+                [.[] | select(.name != "lo") | .["ip-addresses"][]?
+                 | select(.["ip-address-type"] == "ipv4")]
+                | first | .["ip-address"] // empty')
+              if [[ -n "${IP}" ]]; then
+                echo "ip=${IP}" >> "$GITHUB_OUTPUT"
+                echo "[INFO] VM ${VMID} IP: ${IP}"
+                exit 0
+              fi
+            fi
+            echo "[INFO] Attempt ${i}/36 — waiting 5s..."
+            sleep 5
+          done
+          echo "::error::Timed out waiting for VM ${VMID} IP (3 minutes)"
+          exit 1
+
+      - name: Discover VM 2 IP
+        id: ip2
+        env:
+          VMID: ${{ steps.vmids.outputs.vmid2 }}
+        run: |
+          set -euo pipefail
+          echo "[INFO] Waiting for guest agent on VM ${VMID}..."
+          for i in $(seq 1 36); do
+            if IFACES=$(sudo qm agent "${VMID}" network-get-interfaces 2>/dev/null); then
+              IP=$(echo "${IFACES}" | jq -r '
+                [.[] | select(.name != "lo") | .["ip-addresses"][]?
+                 | select(.["ip-address-type"] == "ipv4")]
+                | first | .["ip-address"] // empty')
+              if [[ -n "${IP}" ]]; then
+                echo "ip=${IP}" >> "$GITHUB_OUTPUT"
+                echo "[INFO] VM ${VMID} IP: ${IP}"
+                exit 0
+              fi
+            fi
+            echo "[INFO] Attempt ${i}/36 — waiting 5s..."
+            sleep 5
+          done
+          echo "::error::Timed out waiting for VM ${VMID} IP (3 minutes)"
+          exit 1
+
+      - name: Verify SSH to VM 1
+        env:
+          SSH_DIR: ${{ steps.ssh.outputs.dir }}
+          VM_IP: ${{ steps.ip1.outputs.ip }}
+        run: |
+          set -euo pipefail
+          echo "[INFO] Verifying SSH to VM 1 at ${VM_IP}..."
+          ssh -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=10 \
+              -i "${SSH_DIR}/id_ed25519" \
+              "ubuntu@${VM_IP}" \
+              "hostname && echo 'SSH OK'"
+
+      - name: Verify SSH to VM 2
+        env:
+          SSH_DIR: ${{ steps.ssh.outputs.dir }}
+          VM_IP: ${{ steps.ip2.outputs.ip }}
+        run: |
+          set -euo pipefail
+          echo "[INFO] Verifying SSH to VM 2 at ${VM_IP}..."
+          ssh -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=10 \
+              -i "${SSH_DIR}/id_ed25519" \
+              "ubuntu@${VM_IP}" \
+              "hostname && echo 'SSH OK'"
+
+      - name: Summary
+        run: |
+          echo "## Proxmox E2E VMs" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| VM | VMID | IP |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|----|------|----|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| VM 1 | ${{ steps.vmids.outputs.vmid1 }} | ${{ steps.ip1.outputs.ip }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| VM 2 | ${{ steps.vmids.outputs.vmid2 }} | ${{ steps.ip2.outputs.ip }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "SSH verified to both VMs ✅" >> "$GITHUB_STEP_SUMMARY"
+
+      # ── Cleanup (always runs) ──────────────────────────────────
+      - name: Cleanup VMs
+        if: always()
+        env:
+          VMID_1: ${{ steps.vmids.outputs.vmid1 }}
+          VMID_2: ${{ steps.vmids.outputs.vmid2 }}
+        run: |
+          set -uo pipefail
+          for VMID in "${VMID_1}" "${VMID_2}"; do
+            if [[ -z "${VMID}" ]]; then
+              continue
+            fi
+            echo "[INFO] Cleaning up VM ${VMID}..."
+            sudo qm stop "${VMID}" 2>/dev/null || true
+            sleep 2
+            sudo qm destroy "${VMID}" --destroy-unreferenced-disks 1 2>/dev/null || true
+            echo "[INFO] VM ${VMID} destroyed"
+          done
+
+      - name: Cleanup SSH keys
+        if: always()
+        run: |
+          SSH_DIR="/tmp/proxmox-e2e-${{ github.run_id }}"
+          if [[ -d "${SSH_DIR}" ]]; then
+            rm -rf "${SSH_DIR}"
+            echo "[INFO] Removed ${SSH_DIR}"
+          fi
