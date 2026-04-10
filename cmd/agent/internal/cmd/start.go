@@ -81,6 +81,13 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 					rootfs.DisableResolved(rootFSGoalState),
 				),
 
+				// Register a Machine CR for this node if one does not already
+				// exist. This supports dynamic environments (manual-bootstrap,
+				// cloud-init) where a Machine CR may not have been pre-created.
+				// Must run after ApplyAttestation so the bootstrap token is
+				// fully resolved, and before kubelet starts.
+				nodestart.RegisterMachine(log, nodeStartGoalState),
+
 				// Phase 3: node-start
 				phases.Parallel(log,
 					nodestart.ConfigureContainerd(nodeStartGoalState),
