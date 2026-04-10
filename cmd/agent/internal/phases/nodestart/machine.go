@@ -131,7 +131,8 @@ func (r *registerMachine) buildMachine(token string) v1alpha3.Machine {
 }
 
 // bootstrapTokenID returns the token-id portion of a bootstrap token that
-// follows the "<token-id>.<token-secret>" format.
+// follows the "<token-id>.<token-secret>" format. If the token contains no
+// dot, the entire token string is returned unchanged.
 func bootstrapTokenID(token string) string {
 	if i := strings.IndexByte(token, '.'); i >= 0 {
 		return token[:i]
