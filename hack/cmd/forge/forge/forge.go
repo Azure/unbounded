@@ -19,7 +19,7 @@ import (
 func Run() {
 	rootCfg := cmd.CommandContext{
 		CloudName:      "AzurePublicCloud",
-		SubscriptionID: "44654aed-2753-4b88-9142-af7132933b6b",
+		SubscriptionID: "",
 		LogFormat:      "text",
 		DataDir:        filepath.Join("~/.unbounded-forge"),
 	}

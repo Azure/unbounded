@@ -1,5 +1,8 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 # ── Build the unbounded-agent binary ────────────────────────────────
-FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26 AS gobuilder
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26@sha256:ec4debba7b371fb2eaa6169a72fc61ad93b9be6a9ae9da2a010cb81a760d36e7 AS gobuilder
 
 ARG TARGETARCH
 ARG VERSION=dev
@@ -16,7 +19,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build \
     -o /unbounded-agent ./cmd/agent
 
 # ── Assemble host image artifacts ───────────────────────────────────
-FROM docker.io/library/debian:bookworm-slim AS build
+FROM docker.io/library/debian:bookworm-slim@sha256:4724b8cc51e33e398f0e2e15e18d5ec2851ff0c2280647e1310bc1642182655d AS build
 
 ARG TARGETARCH
 

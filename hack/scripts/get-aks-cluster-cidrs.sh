@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 # get-aks-cluster-cidrs.sh -- Detect CIDRs for an AKS cluster and print a
 # ready-to-paste "kubectl unbounded site init" command.
 #

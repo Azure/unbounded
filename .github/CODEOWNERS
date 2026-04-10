@@ -1,0 +1,5 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# Default owners for all files in the repository.
+* @Azure/unbounded-dev

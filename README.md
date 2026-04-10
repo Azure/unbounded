@@ -1,75 +1,195 @@
-# Unbounded Kubernetes - Kubernetes without Borders
+<p align="center">
+  <img src="docs/static/img/icon.svg" alt="Unbounded Kubernetes" width="120">
+</p>
 
-[![Release](https://img.shields.io/github/v/release/Azure/unbounded-kube?style=flat-square)](https://github.com/Azure/unbounded-kube/releases/latest)
-[![Go CI](https://img.shields.io/github/actions/workflow/status/Azure/unbounded-kube/go-ci.yaml?branch=main&label=CI&style=flat-square)](https://github.com/Azure/unbounded-kube/actions/workflows/go-ci.yaml)
-[![License](https://img.shields.io/github/license/Azure/unbounded-kube?style=flat-square)](LICENSE)
+<h1 align="center">Unbounded Kubernetes</h1>
 
-## WARNING: Project is in Early Development
+<p align="center">
+  <em>Run Kubernetes worker nodes anywhere — across clouds, on-prem, and at the edge — connected back to a single control plane.</em>
+</p>
 
-**This project is in early development and while we feel comfortable it can be used for experimentation and prototyping right now there are still rough edges and potential for breaking changes. Please report your experiences through the Issue Tracker so we can help!**
+<p align="center">
+  <a href="https://github.com/Azure/unbounded-kube/releases/latest"><img src="https://img.shields.io/github/v/release/Azure/unbounded-kube?style=flat-square" alt="Release"></a>
+  <a href="https://github.com/Azure/unbounded-kube/actions/workflows/go-ci.yaml"><img src="https://img.shields.io/github/actions/workflow/status/Azure/unbounded-kube/go-ci.yaml?branch=main&label=CI&style=flat-square" alt="Go CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/Azure/unbounded-kube?style=flat-square" alt="License"></a>
+</p>
 
-The unbounded-kube project enables Kubernetes operators to provision worker nodes anywhere and connect them back to a
-central control plane.
+---
 
-## Setup 
+> **Early Development** — This project is under active development. It is suitable
+> for experimentation and prototyping, but expect rough edges and breaking changes.
+> Please report issues on the [Issue Tracker](https://github.com/Azure/unbounded-kube/issues).
 
-1. A running Kubernetes cluster with a `kubeconfig` file that has access to the cluster.
-2. `kubectl-unbounded` installed and on your `PATH`. Download it from the releases or build it from source
-   with `make kubectl-unbounded`.
-3. One or more nodes with the label `unbounded-kube.io/unbounded-net-gateway=true` that can be used as the network
-   gateway for your unbounded sites. These nodes also need to allow UDP traffic on ports `51820-51899` for WireGuard.
+## What is Unbounded Kubernetes?
 
-## Initial Site Creation
+Kubernetes assumes all worker nodes share a network — a single VPC in the cloud
+or a flat LAN on-premises. That model breaks when you need compute in multiple
+locations: a second cloud region, GPU capacity from a specialized provider,
+on-prem hardware behind a NAT, or edge devices at remote sites.
 
-A "Site" is a location where you have Machines you want to connect back to your cluster. You can have multiple sites. 
-Each site has its own network configuration and set of machines. You use `kubectl-unbounded` to initialize a new site
-and then register machines to provision.
+**Unbounded Kubernetes** extends any conformant Kubernetes control plane so that
+worker nodes can run anywhere and join back to the cluster over encrypted
+tunnels. It provides multiple provisioning paths and a unified networking layer
+so that pods, services, and DNS work transparently across sites.
 
-| Option                | Description                                                                                                                                                                     |
-|-----------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `--name`              | Name of the site.                                                                                                                                                               |
-| `--cluster-node-cidr` | The node CIDR of your existing cluster.                                                                                                                                         |
-| `--cluster-pod-cidr`  | The pod CIDR of your existing cluster.                                                                                                                                          |
-| `--node-cidr`         | The node CIDR for your new site. This is the CIDR range that will be used for the nodes in this site. It should not overlap with your existing cluster's node CIDR or pod CIDR. |
-| `--pod-cidr`          | The pod CIDR for your new site. This is the CIDR range that will be used for the pods in this site. It should not overlap with your existing cluster's node CIDR or pod CIDR.   |
+<p align="center">
+  <img src="docs/static/img/unbounded-overview.svg" alt="Unbounded Kubernetes overview: Control Plane connected to Bare Metal (PXE Boot), Public Cloud (cloud-init), and AI Infrastructure (SSH) sites via WireGuard and Direct L3 networking" width="800">
+</p>
+
+For a deeper dive, see the [Project Overview](https://azure.github.io/unbounded-kube/concepts/overview/).
+
+## Key Features
+
+- **Multi-site networking** — Transparent pod-to-pod connectivity across sites using WireGuard, GENEVE, VXLAN, IPIP, or direct routing with an eBPF or netlink dataplane.
+- **SSH-based provisioning** — Join existing Linux machines to the cluster over SSH with a single command.
+- **Cloud API provisioning** — Auto-provision instances from Nebius, CoreWeave, OCI, Azure, AWS, and others via Karpenter in response to unschedulable pods.
+- **Bare-metal PXE boot** — PXE-boot servers with integrated DHCP, TFTP, HTTP, Redfish BMC power management, and TPM 2.0 attestation.
+- **Works with any conformant Kubernetes** — AKS, EKS, GKE, kubeadm, k3s, and more. Bring your own cluster or use the quickstart script.
+- **GPU support** — Automatic detection and configuration of NVIDIA GPUs on provisioned nodes.
+
+## Components
+
+| Component | Description | Details |
+|-----------|-------------|---------|
+| **[unbounded-agent](https://azure.github.io/unbounded-kube/guides/agent/)** | Single binary delivered to hosts to bootstrap them as Kubernetes worker nodes using `systemd-nspawn`. | [Agent Guide](https://azure.github.io/unbounded-kube/guides/agent/) |
+| **[machina](https://azure.github.io/unbounded-kube/guides/ssh/)** | Kubernetes controller that provisions remote Linux machines over SSH. | [SSH Guide](https://azure.github.io/unbounded-kube/guides/ssh/), [CRD Reference](https://azure.github.io/unbounded-kube/reference/machina-crd/) |
+| **[metalman](https://azure.github.io/unbounded-kube/guides/pxe/)** | Controller for PXE-booting bare-metal servers with DHCP, TFTP, HTTP, Redfish BMC, and TPM 2.0. | [PXE Guide](https://azure.github.io/unbounded-kube/guides/pxe/), [Bare Metal Concepts](https://azure.github.io/unbounded-kube/concepts/bare-metal/) |
+| **[unbounded-net](https://github.com/Azure/unbounded-net)** | CNI plugin and multi-site networking system for cross-site pod connectivity. | [Networking Concepts](https://azure.github.io/unbounded-kube/concepts/networking/) |
+| **kubectl-unbounded** | kubectl plugin for initializing sites, adding machines, and managing the cluster. | [CLI Reference](https://azure.github.io/unbounded-kube/reference/cli/) |
+
+## Quick Start
+
+Get a working multi-site cluster in under 10 minutes. This creates an AKS cluster
+and joins a remote node to it. Already have a cluster? See the
+[Bring Your Own Cluster](https://azure.github.io/unbounded-kube/guides/existing-cluster/) guide.
+
+<p align="center">
+  <img src="docs/static/img/quickstart-architecture.svg" alt="Quickstart architecture: AKS cluster with gateway nodes connected to a remote site over WireGuard" width="700">
+</p>
+
+### 1. Install the kubectl plugin
 
 ```bash
-kubectl unbounded site init \
-  --name hello-unbounded \
-  --cluster-node-cidr <cidr> \
-  --cluster-pod-cidr <cidr \
-  --node-cidr <cidr> \
-  --pod-cidr <cidr
+# Linux amd64
+curl -sL https://github.com/Azure/unbounded-kube/releases/latest/download/kubectl-unbounded-linux-amd64.tar.gz | tar xz
+sudo mv kubectl-unbounded /usr/local/bin/
 ```
 
-## Add your first Machine!
-
-| Option                | Description                                                                                                                                                  |
-|-----------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `--site`              | Name of the site.                                                                                                                                            |
-| `--name`              | Name of the machine. This will become the node name in Kubernetes once the machine is provisioned and joined to the cluster.                                 |
-| `--host`              | The host and port where the machine can be reached. This should be in the format `<ip>[:port]`. If no port is specified, the default port `22` will be used. |
-| `--ssh-username`      | The username to use when connecting to the machine over SSH.                                                                                                 | 
-| `--ssh-private-key`   | The path to the SSH private key to use when connecting to the machine over SSH. This key should have access to the machine specified in `--host`.            |
+<details>
+<summary>macOS (Apple Silicon)</summary>
 
 ```bash
-kubectl unbounded machine register \
-  --site hello-unbounded \
-  --name node0 \
-  --host <ip>[:port] \
-  --ssh-username <username> \
-  --ssh-private-key <path-to-ssh-key>
+curl -sL https://github.com/Azure/unbounded-kube/releases/latest/download/kubectl-unbounded-darwin-arm64.tar.gz | tar xz
+sudo mv kubectl-unbounded /usr/local/bin/
 ```
+
+</details>
+
+### 2. Create the cluster
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/Azure/unbounded-kube/main/hack/scripts/aks-quickstart.sh
+chmod +x aks-quickstart.sh
+
+./aks-quickstart.sh create \
+    --name my-unbounded \
+    --location eastus \
+    --remote-node-cidr 192.168.1.0/24 \
+    --remote-pod-cidr 10.245.0.0/16
+```
+
+> This takes about 8 minutes. The script creates an AKS cluster, adds a gateway
+> node pool, and runs `kubectl unbounded site init` to install the networking stack.
+
+### 3. Add a remote node
+
+```bash
+kubectl unbounded machine manual-bootstrap my-node --site remote \
+    | ssh user@<host> sudo bash
+```
+
+> Replace `user@<host>` with the SSH user and IP of your remote machine.
+
+### 4. Verify
+
+```bash
+kubectl get nodes -w
+```
+
+After a few minutes your remote node appears with status **Ready**.
+
+For the full walkthrough including pod networking verification, see the
+[Getting Started Guide](https://azure.github.io/unbounded-kube/guides/getting-started/).
+
+## Documentation
+
+Full documentation is available at **[azure.github.io/unbounded-kube](https://azure.github.io/unbounded-kube/)**.
+
+| | |
+|---|---|
+| **Concepts** | [Project Overview](https://azure.github.io/unbounded-kube/concepts/overview/) · [Networking](https://azure.github.io/unbounded-kube/concepts/networking/) · [Bare Metal](https://azure.github.io/unbounded-kube/concepts/bare-metal/) |
+| **Guides** | [Getting Started](https://azure.github.io/unbounded-kube/guides/getting-started/) · [Existing Cluster](https://azure.github.io/unbounded-kube/guides/existing-cluster/) · [SSH Provisioning](https://azure.github.io/unbounded-kube/guides/ssh/) · [Cloud API](https://azure.github.io/unbounded-kube/guides/cloud-api/) · [PXE Boot](https://azure.github.io/unbounded-kube/guides/pxe/) · [Agent](https://azure.github.io/unbounded-kube/guides/agent/) |
+| **Reference** | [Architecture](https://azure.github.io/unbounded-kube/reference/architecture/) · [CLI](https://azure.github.io/unbounded-kube/reference/cli/) · [Machine CRD](https://azure.github.io/unbounded-kube/reference/machina-crd/) · [GPU / NVIDIA](https://azure.github.io/unbounded-kube/reference/gpu/nvidia/) |
+
+## Repository Structure
+
+```
+api/          API definitions for custom resources
+bin/          Generated binary artifacts
+cmd/
+  agent/      unbounded-agent sources
+  inventory/  Inventory controller sources
+  kubectl-unbounded/  kubectl plugin sources
+  machina/    machina controller sources
+  metalman/   metalman controller sources
+deploy/       Kubernetes manifests for deployment
+docs/         Documentation site (Hugo)
+hack/         Development tools and scripts
+images/       OCI image definitions (Containerfiles)
+internal/     Shared internal packages
+```
+
+## Building from Source
+
+Requires Go 1.26+.
+
+```bash
+# Build the kubectl plugin
+make kubectl-unbounded
+
+# Build controllers (includes format, lint, test, and build)
+make machina
+make metalman
+
+# Build without lint/test (used in container images)
+make machina-build
+make metalman-build
+
+# Build container images
+make machina-oci
+make metalman-oci
+
+# Serve docs locally
+make docs-serve
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for full build instructions and coding standards.
 
 ## Contributing
 
 This project welcomes contributions and suggestions. See [CONTRIBUTING.md](CONTRIBUTING.md) for
-details.
+details on how to get started, including the CLA process, coding standards, and how to submit
+pull requests.
 
-## Third-Party Dependencies
+- [Code of Conduct](CODE_OF_CONDUCT.md)
+- [Support](SUPPORT.md)
+- [Issue Tracker](https://github.com/Azure/unbounded-kube/issues)
 
-This project uses third-party open source libraries. See the [NOTICE](NOTICE) file for
-attributions and license information.
+## License
+
+This project is licensed under the [MIT License](LICENSE).
+
+Third-party dependency attributions are listed in the [NOTICE](NOTICE) file.
 
 ## Trademarks
 

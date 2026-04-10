@@ -19,7 +19,7 @@ import (
 
 const (
 	azureDefaultCloud        = "AzurePublicCloud"
-	azureDefaultSubscription = "44654aed-2753-4b88-9142-af7132933b6b"
+	azureDefaultSubscription = ""
 	azureDefaultLocation     = "canadacentral"
 )
 

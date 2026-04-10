@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 name: Smoke Metalman
 
 on:
@@ -26,6 +29,9 @@ on:
       - go.sum
       - .github/workflows/smoke-metalman.yaml
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   smoke:
