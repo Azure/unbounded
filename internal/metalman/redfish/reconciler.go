@@ -167,7 +167,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		}
 	}
 
-	// No reboot pending — done.
+	// No reboot pending - done.
 	if machine.Spec.Operations.RebootCounter <= machine.Status.Operations.RebootCounter {
 		return ctrl.Result{}, nil
 	}
@@ -267,7 +267,7 @@ func (r *Reconciler) reconcilePowerOn(ctx context.Context, log *slog.Logger, mac
 	}
 
 	if state != PowerOff {
-		// Machine is on — complete the reboot cycle.
+		// Machine is on - complete the reboot cycle.
 		log.Info("machine confirmed powered on, completing reboot cycle")
 		meta.RemoveStatusCondition(&machine.Status.Conditions, condPoweredOff)
 

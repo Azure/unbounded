@@ -196,7 +196,7 @@ func unpackOCILayout(ctx context.Context, layoutDir, tag, destDir string) error 
 		return fmt.Errorf("tag %q not found in OCI layout", tag)
 	}
 
-	// Use the first descriptor — netboot images are single-platform.
+	// Use the first descriptor - netboot images are single-platform.
 	dp := descriptorPaths[0]
 
 	blob, err := engine.FromDescriptor(ctx, dp.Descriptor())
