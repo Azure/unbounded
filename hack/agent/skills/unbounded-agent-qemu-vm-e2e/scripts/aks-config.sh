@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 # aks-config.sh — Extract unbounded-agent configuration from an AKS kubeconfig
 # and write a JSON config file matching the AgentConfig schema.
 #

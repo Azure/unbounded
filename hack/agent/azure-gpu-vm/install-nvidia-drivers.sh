@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 #
 # install-nvidia-drivers.sh - Install NVIDIA GPU drivers on an Azure GPU VM.
 #

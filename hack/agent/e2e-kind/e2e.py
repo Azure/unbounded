@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 """Agent E2E Kind test.
 
 Creates a QEMU VM, joins it to a Kind cluster using the production
