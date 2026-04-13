@@ -154,7 +154,7 @@ func TestIsKubeletAllowedLabel(t *testing.T) {
 		{name: "failure-domain-zone", key: "failure-domain.beta.kubernetes.io/zone", allowed: true},
 
 		// Restricted kubernetes.io labels.
-		{name: "cloud-provider-exclude", key: ExcludeFromCloudProviderLabel, allowed: false},
+		{name: "cloud-provider-exclude", key: "node.cloudprovider.kubernetes.io/exclude-from-external-cloud-provider", allowed: false},
 		{name: "arbitrary-kubernetes-io", key: "foo.kubernetes.io/bar", allowed: false},
 		{name: "arbitrary-k8s-io", key: "foo.k8s.io/bar", allowed: false},
 	}
@@ -171,10 +171,10 @@ func TestPartitionNodeLabels(t *testing.T) {
 	t.Parallel()
 
 	input := map[string]string{
-		"my-custom-label":                "value1",
-		"kubernetes.azure.com/managed":   "false",
-		"kubernetes.io/hostname":         "my-node",
-		ExcludeFromCloudProviderLabel:    "true",
+		"my-custom-label":              "value1",
+		"kubernetes.azure.com/managed": "false",
+		"kubernetes.io/hostname":       "my-node",
+		"node.cloudprovider.kubernetes.io/exclude-from-external-cloud-provider": "true",
 		"node.kubernetes.io/custom":      "value2",
 		"restricted.kubernetes.io/label": "value3",
 	}
@@ -189,7 +189,7 @@ func TestPartitionNodeLabels(t *testing.T) {
 	require.Len(t, kubeletLabels, 4)
 
 	// Controller-managed labels.
-	require.Equal(t, "true", controllerLabels[ExcludeFromCloudProviderLabel])
+	require.Equal(t, "true", controllerLabels["node.cloudprovider.kubernetes.io/exclude-from-external-cloud-provider"])
 	require.Equal(t, "value3", controllerLabels["restricted.kubernetes.io/label"])
 	require.Len(t, controllerLabels, 2)
 }
@@ -220,8 +220,8 @@ func TestPartitionNodeLabels_AllRestricted(t *testing.T) {
 	t.Parallel()
 
 	input := map[string]string{
-		ExcludeFromCloudProviderLabel:    "true",
-		"restricted.kubernetes.io/other": "val",
+		"node.cloudprovider.kubernetes.io/exclude-from-external-cloud-provider": "true",
+		"restricted.kubernetes.io/other":                                        "val",
 	}
 
 	kubeletLabels, controllerLabels := PartitionNodeLabels(input)

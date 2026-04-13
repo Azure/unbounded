@@ -1319,6 +1319,63 @@ func TestReconcileNodeJoin_Ready_NodeStillExists(t *testing.T) {
 	require.Equal(t, RequeueAfterReady, result.RequeueAfter)
 }
 
+func TestReconcileNodeJoin_Ready_ReconcilesMissingLabels(t *testing.T) {
+	t.Parallel()
+
+	s := newTestScheme(t)
+
+	k8s := defaultKubernetes()
+	k8s.NodeRef = &unboundedv1alpha3.LocalObjectReference{Name: "worker-1"}
+	k8s.NodeLabels = map[string]string{
+		"custom.kubernetes.io/team": "platform", // Restricted - requires controller
+		"my-org.com/env":            "prod",     // Allowed - kubelet can self-apply
+	}
+
+	machine := newTestMachine("test-machine", "10.0.0.1:22", "testuser", k8s)
+	machine.Status = unboundedv1alpha3.MachineStatus{
+		Phase: unboundedv1alpha3.MachinePhaseReady,
+		Conditions: []metav1.Condition{
+			{Type: unboundedv1alpha3.MachineConditionProvisioned, Status: metav1.ConditionTrue, Reason: "Provisioned"},
+		},
+	}
+
+	// Node exists but is missing the restricted label.
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "worker-1",
+			Labels: map[string]string{
+				"my-org.com/env": "prod",
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(machine, node).
+		WithStatusSubresource(machine).
+		Build()
+
+	reconciler := &MachineReconciler{
+		Client:              fakeClient,
+		Scheme:              s,
+		ReachabilityChecker: &mockReachabilityChecker{},
+	}
+
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-machine"}}
+
+	result, err := reconciler.Reconcile(context.Background(), req)
+	require.NoError(t, err)
+	require.Equal(t, RequeueAfterReady, result.RequeueAfter)
+
+	// Verify the restricted label was applied to the Node while in Ready phase.
+	var updatedNode corev1.Node
+
+	err = fakeClient.Get(context.Background(), client.ObjectKey{Name: "worker-1"}, &updatedNode)
+	require.NoError(t, err)
+	require.Equal(t, "platform", updatedNode.Labels["custom.kubernetes.io/team"],
+		"restricted label should be reconciled while in Ready phase")
+}
+
 func TestReconcileNodeJoin_Ready_NodeDisappears(t *testing.T) {
 	t.Parallel()
 
@@ -1445,7 +1502,12 @@ func TestEnsureControllerLabels_AppliesRestrictedLabels(t *testing.T) {
 
 	s := newTestScheme(t)
 
-	machine := newTestMachine("test-machine", "10.0.0.1:22", "testuser", defaultKubernetes())
+	k8s := defaultKubernetes()
+	k8s.NodeLabels = map[string]string{
+		"custom.kubernetes.io/team": "platform", // Restricted - requires controller
+	}
+
+	machine := newTestMachine("test-machine", "10.0.0.1:22", "testuser", k8s)
 	node := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   "test-machine",
@@ -1473,8 +1535,8 @@ func TestEnsureControllerLabels_AppliesRestrictedLabels(t *testing.T) {
 	err = fakeClient.Get(context.Background(), client.ObjectKey{Name: "test-machine"}, &updatedNode)
 	require.NoError(t, err)
 
-	require.Equal(t, "true", updatedNode.Labels["node.cloudprovider.kubernetes.io/exclude-from-external-cloud-provider"],
-		"cloud provider exclusion label should be applied by controller")
+	require.Equal(t, "platform", updatedNode.Labels["custom.kubernetes.io/team"],
+		"restricted label should be applied by controller")
 	require.Equal(t, "value", updatedNode.Labels["existing-label"],
 		"existing labels should be preserved")
 }
@@ -1484,12 +1546,17 @@ func TestEnsureControllerLabels_SkipsWhenAlreadyPresent(t *testing.T) {
 
 	s := newTestScheme(t)
 
-	machine := newTestMachine("test-machine", "10.0.0.1:22", "testuser", defaultKubernetes())
+	k8s := defaultKubernetes()
+	k8s.NodeLabels = map[string]string{
+		"custom.kubernetes.io/team": "platform", // Restricted
+	}
+
+	machine := newTestMachine("test-machine", "10.0.0.1:22", "testuser", k8s)
 	node := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "test-machine",
 			Labels: map[string]string{
-				"node.cloudprovider.kubernetes.io/exclude-from-external-cloud-provider": "true",
+				"custom.kubernetes.io/team": "platform",
 			},
 		},
 	}
@@ -1513,7 +1580,7 @@ func TestEnsureControllerLabels_SkipsWhenAlreadyPresent(t *testing.T) {
 
 	err = fakeClient.Get(context.Background(), client.ObjectKey{Name: "test-machine"}, &updatedNode)
 	require.NoError(t, err)
-	require.Equal(t, "true", updatedNode.Labels["node.cloudprovider.kubernetes.io/exclude-from-external-cloud-provider"])
+	require.Equal(t, "platform", updatedNode.Labels["custom.kubernetes.io/team"])
 }
 
 func TestEnsureControllerLabels_WithProviderLabels(t *testing.T) {
@@ -1553,8 +1620,7 @@ func TestEnsureControllerLabels_WithProviderLabels(t *testing.T) {
 	err = fakeClient.Get(context.Background(), client.ObjectKey{Name: "test-machine"}, &updatedNode)
 	require.NoError(t, err)
 
-	// Both restricted labels should be applied.
-	require.Equal(t, "true", updatedNode.Labels["node.cloudprovider.kubernetes.io/exclude-from-external-cloud-provider"])
+	// Restricted label should be applied by the controller.
 	require.Equal(t, "platform", updatedNode.Labels["custom.kubernetes.io/team"])
 
 	// Allowed labels should NOT be in controller labels (they go through kubelet).

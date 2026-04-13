@@ -910,7 +910,18 @@ func (r *MachineReconciler) reconcileNodeJoin(ctx context.Context, machine *unbo
 
 	case unboundedv1alpha3.MachinePhaseReady:
 		if len(nodeList.Items) > 0 {
-			// Node still exists — stay Ready.
+			// Node still exists - ensure controller-managed labels are
+			// reconciled (e.g. when Machine.Spec labels change while
+			// already Ready). The internal allPresent check avoids
+			// repeated patches when labels are already correct.
+			node := &nodeList.Items[0]
+			if err := r.ensureControllerLabels(ctx, machine, node); err != nil {
+				logger.Error(err, "Failed to reconcile controller-managed labels on Node",
+					"machine", machine.Name, "node", node.Name)
+
+				return ctrl.Result{}, err
+			}
+
 			return ctrl.Result{RequeueAfter: RequeueAfterReady}, nil
 		}
 
