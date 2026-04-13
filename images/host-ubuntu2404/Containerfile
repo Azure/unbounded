@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 # ── Build the unbounded-agent binary ────────────────────────────────
 FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26@sha256:ec4debba7b371fb2eaa6169a72fc61ad93b9be6a9ae9da2a010cb81a760d36e7 AS gobuilder
 
@@ -16,12 +19,12 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build \
     -o /unbounded-agent ./cmd/agent
 
 # ── Assemble host image artifacts ───────────────────────────────────
-FROM docker.io/library/debian:bookworm-slim@sha256:4724b8cc51e33e398f0e2e15e18d5ec2851ff0c2280647e1310bc1642182655d AS build
+FROM docker.io/library/ubuntu:24.04 AS build
 
 ARG TARGETARCH
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        cpio curl ca-certificates qemu-utils libguestfs-tools linux-image-${TARGETARCH} \
+        cpio curl ca-certificates qemu-utils libguestfs-tools linux-image-generic \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Download netboot artifacts ──────────────────────────────────────
@@ -31,11 +34,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # File names follow UEFI convention: shimx64/grubx64 (amd64), shimaa64/grubaa64 (arm64).
 # metalman looks up the boot filename from metadata.yaml (dhcpBootImageName).
 RUN mkdir -p /artifacts && \
+    KVER=$(ls /lib/modules | head -1) && \
+    cp "/boot/vmlinuz-${KVER}" /artifacts/vmlinuz && \
     if [ "${TARGETARCH}" = "amd64" ]; then \
         NETBOOT_BASE="https://releases.ubuntu.com/24.04.2/netboot/amd64"; \
         curl -fSL -o /artifacts/shimx64.efi  "${NETBOOT_BASE}/bootx64.efi" && \
         curl -fSL -o /artifacts/grubx64.efi  "${NETBOOT_BASE}/grubx64.efi" && \
-        curl -fSL -o /artifacts/vmlinuz      "${NETBOOT_BASE}/linux"       && \
         curl -fSL -o /artifacts/initrd       "${NETBOOT_BASE}/initrd"; \
     elif [ "${TARGETARCH}" = "arm64" ]; then \
         NETBOOT_URL="https://cdimage.ubuntu.com/releases/noble/release/ubuntu-24.04.4-netboot-arm64.tar.gz"; \
@@ -43,7 +47,6 @@ RUN mkdir -p /artifacts && \
         tar -xzf /tmp/netboot.tar.gz -C /tmp && \
         cp /tmp/arm64/bootaa64.efi   /artifacts/shimaa64.efi && \
         cp /tmp/arm64/grubaa64.efi   /artifacts/grubaa64.efi && \
-        cp /tmp/arm64/linux           /artifacts/vmlinuz && \
         cp /tmp/arm64/initrd          /artifacts/initrd && \
         rm -rf /tmp/netboot.tar.gz /tmp/arm64; \
     else \
@@ -51,8 +54,47 @@ RUN mkdir -p /artifacts && \
     fi
 
 # ── Build init.cpio overlay ─────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends efibootmgr && \
+    rm -rf /var/lib/apt/lists/*
+
 COPY images/host-ubuntu2404/assets/init /tmp/initrd-root/init
 RUN chmod 755 /tmp/initrd-root/init && \
+    mkdir -p /tmp/initrd-root/usr/bin /tmp/initrd-root/usr/lib && \
+    cp /usr/bin/efibootmgr /tmp/initrd-root/usr/bin/ && \
+    for lib in $(ldd /usr/bin/efibootmgr | awk '/=>/{print $3}'); do \
+        mkdir -p "/tmp/initrd-root$(dirname "$lib")" && \
+        cp "$lib" "/tmp/initrd-root${lib}"; \
+    done && \
+    # Also copy the dynamic linker so efibootmgr can run in the initrd.
+    INTERP=$(ldd /usr/bin/efibootmgr | awk '/ld-linux/{print $1}') && \
+    mkdir -p "/tmp/initrd-root$(dirname "$INTERP")" && \
+    cp "$INTERP" "/tmp/initrd-root${INTERP}" && \
+    # Copy kernel modules into the overlay so modprobe can load network
+    # and storage drivers.  The Ubuntu netboot initrd is a minimal
+    # Debian-Installer image that does not ship ethernet driver modules;
+    # without them no NIC appears and the installer panics.
+    KVER=$(ls /lib/modules | head -1) && \
+    KMOD="/tmp/initrd-root/lib/modules/${KVER}" && \
+    mkdir -p "${KMOD}/kernel/drivers/net" \
+             "${KMOD}/kernel/drivers/scsi" \
+             "${KMOD}/kernel/drivers/ata" \
+             "${KMOD}/kernel/drivers/nvme" \
+             "${KMOD}/kernel/drivers/virtio" \
+             "${KMOD}/kernel/drivers/block" && \
+    cp -a "/lib/modules/${KVER}/kernel/drivers/net/." \
+           "${KMOD}/kernel/drivers/net/" && \
+    cp -a "/lib/modules/${KVER}/kernel/drivers/scsi/." \
+           "${KMOD}/kernel/drivers/scsi/" && \
+    cp -a "/lib/modules/${KVER}/kernel/drivers/ata/." \
+           "${KMOD}/kernel/drivers/ata/" && \
+    cp -a "/lib/modules/${KVER}/kernel/drivers/nvme/." \
+           "${KMOD}/kernel/drivers/nvme/" && \
+    cp -a "/lib/modules/${KVER}/kernel/drivers/virtio/." \
+           "${KMOD}/kernel/drivers/virtio/" && \
+    cp -a "/lib/modules/${KVER}/kernel/drivers/block/." \
+           "${KMOD}/kernel/drivers/block/" && \
+    # modules.dep and map files so modprobe can resolve dependencies.
+    depmod -b /tmp/initrd-root "${KVER}" && \
     cd /tmp/initrd-root && \
     find . -print0 | cpio --create --format=newc --quiet --null > /artifacts/init.cpio
 

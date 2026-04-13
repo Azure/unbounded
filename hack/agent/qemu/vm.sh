@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 #
 # vm.sh - Manage QEMU-based Ubuntu VMs with cloud-init support
 #
@@ -160,7 +163,7 @@ check_deps() {
 }
 
 # Build a cloud-init NoCloud seed ISO without requiring cloud-localds.
-# Uses mkisofs, genisoimage, or hdiutil (macOS) — whichever is available.
+# Uses mkisofs, genisoimage, or hdiutil (macOS) - whichever is available.
 create_seed_iso() {
     local iso_path="$1"
     local user_data="$2"
@@ -324,7 +327,7 @@ EOF
     MACHINE_ARGS=""
     QEMU_BIN=""
 
-    # Determine accelerator first — CPU model may depend on whether we have hardware virt.
+    # Determine accelerator first - CPU model may depend on whether we have hardware virt.
     case "$(uname -s)" in
         Darwin)
             if sysctl -n kern.hv_support 2>/dev/null | grep -q 1; then
@@ -431,7 +434,7 @@ EOF
 
     # shellcheck disable=SC2086
     if [[ "${NEEDS_SUDO}" == true ]]; then
-        info "vmnet-shared requires root — requesting sudo..."
+        info "vmnet-shared requires root - requesting sudo..."
         sudo "${QEMU_CMD[@]}"
         # QEMU ran as root so its outputs (pid, log) are root-owned.
         # Fix ownership so the rest of the script (and stop/logs commands)

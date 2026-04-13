@@ -74,7 +74,6 @@ Initialize a new unbounded-kube site. This command:
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--cluster-service-cidr` | `string` | *(auto-detected from kube-dns)* | Service CIDR of the cluster (e.g. `10.0.0.0/16`) |
 | `--cni-manifests` | `string` | unbounded-net v1.1.2 release URL | Path to a local file/directory or HTTPS URL for CNI manifests |
 | `--machina-manifests` | `string` | *(embedded manifests)* | Path to a local file/directory or HTTPS URL for machina manifests |
 | `--kubeconfig` | `string` | `$KUBECONFIG` or default | Path to kubeconfig file |
@@ -97,14 +96,13 @@ kubectl unbounded site init \
   --pod-cidr 10.101.0.0/24
 ```
 
-With explicit service CIDR and local manifests:
+With local manifests:
 
 ```bash
 kubectl unbounded site init \
   --name dc2 \
   --cluster-node-cidr 10.224.0.0/16 \
   --cluster-pod-cidr 10.244.0.0/16 \
-  --cluster-service-cidr 10.0.0.0/16 \
   --node-cidr 10.200.0.0/24 \
   --pod-cidr 10.201.0.0/24 \
   --cni-manifests ./my-cni-manifests/ \

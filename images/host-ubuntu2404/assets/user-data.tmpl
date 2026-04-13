@@ -17,25 +17,7 @@ write_files:
 - path: /etc/unbounded-agent/config.json
   permissions: '0600'
   content: |
-    {
-      "MachineName": "{{ .Machine.Name }}",
-      "Cluster": {
-        "CaCertBase64": "",
-        "ClusterDNS": "{{ .ClusterDNS }}",
-        "Version": "{{ .KubernetesVersion }}"
-      },
-      "Kubelet": {
-        "ApiServer": "{{ .ApiserverURL }}",
-        "Labels": {
-          "kubernetes.azure.com/managed": "false",
-          "kubernetes.azure.com/cluster": "unbounded-metal"
-        }
-      },{{ if .AgentImage }}
-      "OCIImage": "{{ .AgentImage }}",{{ end }}
-      "Attest": {
-        "URL": "{{ .ServeURL }}"
-      }
-    }
+    {{ .AgentConfigJSON }}
 - path: /etc/cloud/cloud-init.disabled
   defer: true
   content: ''

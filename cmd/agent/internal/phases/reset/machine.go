@@ -5,8 +5,10 @@ package reset
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"time"
 
 	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases"
@@ -27,6 +29,10 @@ func StopMachine(log *slog.Logger, machineName string) phases.Task {
 func (t *stopMachine) Name() string { return "stop-machine" }
 
 func (t *stopMachine) Do(ctx context.Context) error {
+	if err := utilexec.RunCmd(ctx, t.log, utilexec.Machinectl(), "disable", t.machineName); err != nil {
+		t.log.Warn("failed to disable machine (may not have been enabled)", "machine", t.machineName, "error", err)
+	}
+
 	if !machineExists(ctx, t.log, t.machineName) {
 		t.log.Info("machine not running, nothing to stop", "machine", t.machineName)
 		return nil
@@ -99,6 +105,12 @@ func (t *removeMachine) Name() string { return "remove-machine" }
 
 func (t *removeMachine) Do(ctx context.Context) error {
 	machineDir := fmt.Sprintf("/var/lib/machines/%s", t.machineName)
+
+	// Skip entirely if the machine directory doesn't exist — nothing to remove.
+	if _, err := os.Stat(machineDir); errors.Is(err, os.ErrNotExist) {
+		t.log.Info("machine rootfs not present, nothing to remove", "machine", t.machineName)
+		return nil
+	}
 
 	t.log.Info("removing machine rootfs", "machine", t.machineName, "dir", machineDir)
 

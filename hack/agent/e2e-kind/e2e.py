@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 """Agent E2E Kind test.
 
 Creates a QEMU VM, joins it to a Kind cluster using the production
@@ -45,6 +48,9 @@ VM_DIR = Path(os.environ.get("VM_DIR", str(REPO_ROOT / ".vm-e2e")))
 KIND_CLUSTER_NAME = os.environ.get("KIND_CLUSTER_NAME", "kind")
 AGENT_MACHINE_NAME = os.environ.get("AGENT_MACHINE_NAME", "agent-e2e")
 AGENT_DEBUG = os.environ.get("AGENT_DEBUG", "")
+
+# Fixed nspawn machine names used by unbounded-agent (decoupled from the kube node name).
+NSPAWN_MACHINE_NAMES = ["kube1", "kube2"]
 
 BRIDGE_NAME = "virbr-e2e"
 TAP_NAME = "tap-e2e"
@@ -452,7 +458,7 @@ def _run_agent_inner(agent_url: str) -> None:
         "Kubelet": {
             "ApiServer": api_server,
             "BootstrapToken": bootstrap_token,
-            "Labels": {"unbounded-kube.io/machine": AGENT_MACHINE_NAME},
+            "Labels": {},
             "RegisterWithTaints": [],
         },
     }
@@ -697,7 +703,7 @@ def reset_agent() -> None:
     if not SSH_KEY.exists():
         die(f"SSH key not found: {SSH_KEY}. Run create-vm first.")
 
-    log(f"Running 'unbounded-agent reset' on VM for machine '{AGENT_MACHINE_NAME}'...")
+    log("Running 'unbounded-agent reset' on VM...")
     run([
         "timeout", "300",
         "ssh", *SSH_OPTS, "-o", "ServerAliveInterval=30", SSH_TARGET,
@@ -729,16 +735,17 @@ def reset_agent() -> None:
     else:
         die(f"Timed out waiting for node '{AGENT_MACHINE_NAME}' to be removed after {node_timeout}s")
 
-    # Verify the nspawn machine is no longer running on the VM
-    log("Verifying nspawn machine is stopped on VM...")
-    result = subprocess.run(
-        ["ssh", *SSH_OPTS, SSH_TARGET,
-         f"sudo machinectl show {AGENT_MACHINE_NAME}"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    if result.returncode == 0:
-        die(f"nspawn machine '{AGENT_MACHINE_NAME}' is still running after reset")
-    log(f"nspawn machine '{AGENT_MACHINE_NAME}' is not running")
+    # Verify the nspawn machines are no longer running on the VM
+    log("Verifying nspawn machines are stopped on VM...")
+    for nspawn_name in NSPAWN_MACHINE_NAMES:
+        result = subprocess.run(
+            ["ssh", *SSH_OPTS, SSH_TARGET,
+             f"sudo machinectl show {nspawn_name}"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        if result.returncode == 0:
+            die(f"nspawn machine '{nspawn_name}' is still running after reset")
+        log(f"nspawn machine '{nspawn_name}' is not running")
 
     log("============================================")
     log("  Agent reset PASSED")

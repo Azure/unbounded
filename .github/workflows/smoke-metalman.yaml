@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 name: Smoke Metalman
 
 on:
@@ -5,8 +8,8 @@ on:
     paths:
       - cmd/metalman/**
       - internal/metalman/**
-      - deploy/metalman/**
-      - hack/smoke.py
+      - deploy/machina/**
+      - hack/smoke-metalman.py
       - images/host-ubuntu2404/**
       - go.mod
       - go.sum
@@ -17,10 +20,8 @@ on:
       - cmd/metalman/**
       - internal/metalman/**
       - api/v1alpha3/**
-      - deploy/metalman/**
-      - deploy/machina/crd/**
-      - deploy/machina/01-namespace.yaml
-      - hack/smoke.py
+      - deploy/machina/**
+      - hack/smoke-metalman.py
       - images/host-ubuntu2404/**
       - go.mod
       - go.sum
@@ -35,6 +36,18 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
+      - name: Free disk space
+        run: |
+          # GitHub-hosted runners have ~14 GB free; the smoke test needs
+          # much more because it builds two Docker images (one containing a
+          # full Ubuntu cloud image) and creates a 20 GB qcow2 VM disk that
+          # grows dynamically.  Remove pre-installed toolchains and images
+          # that this workflow does not use.
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet \
+                      /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af || true
+          df -h /
+
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Enable KVM
@@ -71,4 +84,4 @@ jobs:
         run: |
           sudo mkdir -p /root/.kube
           sudo cp "${KUBECONFIG:-$HOME/.kube/config}" /root/.kube/config
-          sudo -E env "PATH=$PATH" python3 hack/smoke.py
+          sudo -E env "PATH=$PATH" python3 hack/smoke-metalman.py

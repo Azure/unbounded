@@ -88,7 +88,7 @@ func (c *OCICache) Metadata(digest string) (*ImageMetadata, error) {
 	data, err := os.ReadFile(metaPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// Image has no metadata.yaml — return empty metadata.
+			// Image has no metadata.yaml - return empty metadata.
 			m := &ImageMetadata{}
 
 			c.mu.Lock()

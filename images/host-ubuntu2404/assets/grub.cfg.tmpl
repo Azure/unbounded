@@ -1,5 +1,11 @@
 {{ if le .Machine.Spec.Operations.ReimageCounter .Machine.Status.Operations.ReimageCounter }}
+# No pending reimage – chainload the locally installed bootloader.
+# When GRUB is PXE-booted $root is (tftp).  We need extra modules to
+# probe local disks and read their FAT-formatted ESPs.
 insmod part_gpt
+insmod fat
+insmod search_fs_file
+insmod chain
 search --no-floppy --set=root --file /EFI/ubuntu/shimx64.efi
 chainloader /EFI/ubuntu/shimx64.efi
 boot

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 # aks-quickstart.sh -- Create or configure an AKS cluster for unbounded-kube
 # with gateway node pools and all required networking infrastructure.
 #
@@ -113,7 +116,7 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "$1 not found. $2"
 }
 
-# is_valid_cidr <cidr> — basic validation of a CIDR notation string.
+# is_valid_cidr <cidr> - basic validation of a CIDR notation string.
 is_valid_cidr() {
   local cidr="$1"
   [[ "$cidr" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]] || return 1
@@ -122,7 +125,7 @@ is_valid_cidr() {
   return 0
 }
 
-# dns_ip_from_cidr <service-cidr> — derive the DNS service IP (.10) from a CIDR.
+# dns_ip_from_cidr <service-cidr> - derive the DNS service IP (.10) from a CIDR.
 # e.g. 10.0.0.0/16 -> 10.0.0.10
 dns_ip_from_cidr() {
   local cidr="$1"
@@ -131,7 +134,7 @@ dns_ip_from_cidr() {
   echo "${a}.${b}.${c}.10"
 }
 
-# ip4_to_int <a.b.c.d> — print the IPv4 address as a decimal integer.
+# ip4_to_int <a.b.c.d> - print the IPv4 address as a decimal integer.
 ip4_to_int() {
   local IFS=.
   read -r a b c d <<< "$1"
@@ -552,7 +555,7 @@ cmd_create() {
 
   resource_group="${resource_group:-$name}"
 
-  # Step 1: Create resource group (idempotent — az group create is a no-op if it exists).
+  # Step 1: Create resource group (idempotent - az group create is a no-op if it exists).
   log "Creating resource group '$resource_group' in '$location'..."
   az group create \
     --name "$resource_group" \
@@ -631,7 +634,7 @@ cmd_create() {
   NODE_RG="${name}-nodes"
   KUBECTL_CTX_ARGS=()
 
-  # Step 4: Add gateway node pool (idempotent — skips if gwmain already exists).
+  # Step 4: Add gateway node pool (idempotent - skips if gwmain already exists).
   add_gateway_pool "$resource_group" "$name" "$gateway_pool_sku" "$gateway_pool_count" "$public_ip_strategy"
 
   # Step 5: Wait for gateway nodes to be registered (they won't be Ready until CNI is installed).

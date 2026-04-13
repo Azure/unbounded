@@ -5,6 +5,7 @@ package commands
 
 import (
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -22,6 +23,7 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	v1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
+	"github.com/Azure/unbounded-kube/internal/cloudprovider"
 	"github.com/Azure/unbounded-kube/internal/metalman/attestation"
 	"github.com/Azure/unbounded-kube/internal/metalman/dhcp"
 	"github.com/Azure/unbounded-kube/internal/metalman/indexing"
@@ -41,7 +43,6 @@ func ServePXECmd() *cobra.Command {
 		dhcpInterface     string
 		dhcpAutoInterface bool
 		dhcpPort          int
-		apiserverURL      string
 		serveURL          string
 		leaseDuration     time.Duration
 		renewDeadline     time.Duration
@@ -112,6 +113,19 @@ func ServePXECmd() *cobra.Command {
 				return fmt.Errorf("creating clientset: %w", err)
 			}
 
+			// Detect cloud provider for default node labels. These are
+			// static and resolved once at startup.
+			var providerLabels map[string]string
+
+			provider, err := cloudprovider.DetectProvider(ctx, clientset)
+			if err != nil {
+				return fmt.Errorf("detect provider: %w", err)
+			}
+
+			if provider != nil {
+				providerLabels = provider.DefaultLabels()
+			}
+
 			sv, err := clientset.Discovery().ServerVersion()
 			if err != nil {
 				return fmt.Errorf("resolving cluster Kubernetes version: %w", err)
@@ -130,6 +144,19 @@ func ServePXECmd() *cobra.Command {
 				return fmt.Errorf("kube-dns Service has no ClusterIP")
 			}
 
+			// Watch the cluster-info ConfigMap in kube-public for API
+			// server URL and CA certificate. This is the only watched
+			// cluster-level resource; DNS and version are resolved once
+			// at startup above.
+			clusterInfoWatcher, err := NewClusterInfoWatcher(ctx, clientset, slog.Default())
+			if err != nil {
+				return fmt.Errorf("creating cluster-info watcher: %w", err)
+			}
+
+			if err := mgr.Add(clusterInfoWatcher); err != nil {
+				return fmt.Errorf("adding cluster-info watcher: %w", err)
+			}
+
 			clusterCA := attestation.ClusterCAFromConfig(cfg)
 
 			serverIP := net.ParseIP(bindAddress)
@@ -146,10 +173,6 @@ func ServePXECmd() *cobra.Command {
 				}
 
 				serveURL = fmt.Sprintf("http://%s:%d", ip, httpPort)
-			}
-
-			if apiserverURL == "" {
-				apiserverURL = cfg.Host
 			}
 
 			ociCache := netboot.NewOCICache(cacheDir)
@@ -175,10 +198,11 @@ func ServePXECmd() *cobra.Command {
 			resolver := netboot.FileResolver{
 				Cache:             ociCache,
 				Reader:            mgr.GetClient(),
-				ApiserverURL:      apiserverURL,
+				Cluster:           clusterInfoWatcher,
 				ServeURL:          serveURL,
 				KubernetesVersion: kubeVersion,
 				ClusterDNS:        clusterDNS,
+				ProviderLabels:    providerLabels,
 			}
 
 			if dhcpInterface != "" && dhcpAutoInterface {
@@ -281,7 +305,6 @@ func ServePXECmd() *cobra.Command {
 	cmd.Flags().StringVar(&dhcpInterface, "dhcp-interface", "", "Network interface for broadcast DHCP (omit for relay/unicast mode)")
 	cmd.Flags().BoolVar(&dhcpAutoInterface, "dhcp-auto-interface", false, "Auto-detect the DHCP interface from the server IP")
 	cmd.Flags().IntVar(&dhcpPort, "dhcp-port", 67, "UDP port for the DHCP server")
-	cmd.Flags().StringVar(&apiserverURL, "apiserver-url", "", "External URL of the Kubernetes API server (for templates)")
 	cmd.Flags().StringVar(&serveURL, "serve-url", "", "External URL of this serve instance")
 	cmd.Flags().DurationVar(&leaseDuration, "leader-elect-lease-duration", 15*time.Second, "Duration that non-leader candidates will wait before attempting to acquire leadership")
 	cmd.Flags().DurationVar(&renewDeadline, "leader-elect-renew-deadline", 10*time.Second, "Duration the acting leader will retry refreshing leadership before giving up")

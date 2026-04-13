@@ -148,7 +148,7 @@ func detectDiskType(name, base string) DiskType {
 		return DiskTypeSSD
 	}
 
-	// rotational=1 is unreliable — many SSDs and virtual disks report 1.
+	// rotational=1 is unreliable - many SSDs and virtual disks report 1.
 	// Cross-check with TRIM/discard support: if the device supports discard
 	// it is almost certainly flash-based (SSD), not a spinning disk.
 	if strings.TrimSpace(rotational) == "1" {
@@ -264,7 +264,7 @@ func readDiskDriver(ctx context.Context, name, base string) (string, string) {
 		driverName = filepath.Base(link)
 	}
 
-	// For SCSI devices the direct driver is "sd" — find the HBA driver instead.
+	// For SCSI devices the direct driver is "sd" - find the HBA driver instead.
 	if driverName == "sd" || driverName == "" {
 		if hostDriver := readScsiHostDriver(base); hostDriver != "" {
 			driverName = hostDriver

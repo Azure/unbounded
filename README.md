@@ -36,7 +36,7 @@ so that pods, services, and DNS work transparently across sites.
   <img src="docs/static/img/unbounded-overview.svg" alt="Unbounded Kubernetes overview: Control Plane connected to Bare Metal (PXE Boot), Public Cloud (cloud-init), and AI Infrastructure (SSH) sites via WireGuard and Direct L3 networking" width="800">
 </p>
 
-For a deeper dive, see the [Project Overview](https://legendary-sniffle-6qv7eqr.pages.github.io/concepts/overview/).
+For a deeper dive, see the [Project Overview](https://azure.github.io/unbounded-kube/concepts/overview/).
 
 ## Key Features
 
@@ -51,17 +51,17 @@ For a deeper dive, see the [Project Overview](https://legendary-sniffle-6qv7eqr.
 
 | Component | Description | Details |
 |-----------|-------------|---------|
-| **[unbounded-agent](https://legendary-sniffle-6qv7eqr.pages.github.io/guides/agent/)** | Single binary delivered to hosts to bootstrap them as Kubernetes worker nodes using `systemd-nspawn`. | [Agent Guide](https://legendary-sniffle-6qv7eqr.pages.github.io/guides/agent/) |
-| **[machina](https://legendary-sniffle-6qv7eqr.pages.github.io/guides/ssh/)** | Kubernetes controller that provisions remote Linux machines over SSH. | [SSH Guide](https://legendary-sniffle-6qv7eqr.pages.github.io/guides/ssh/), [CRD Reference](https://legendary-sniffle-6qv7eqr.pages.github.io/reference/machina-crd/) |
-| **[metalman](https://legendary-sniffle-6qv7eqr.pages.github.io/guides/pxe/)** | Controller for PXE-booting bare-metal servers with DHCP, TFTP, HTTP, Redfish BMC, and TPM 2.0. | [PXE Guide](https://legendary-sniffle-6qv7eqr.pages.github.io/guides/pxe/), [Bare Metal Concepts](https://legendary-sniffle-6qv7eqr.pages.github.io/concepts/bare-metal/) |
-| **[unbounded-net](https://github.com/Azure/unbounded-net)** | CNI plugin and multi-site networking system for cross-site pod connectivity. | [Networking Concepts](https://legendary-sniffle-6qv7eqr.pages.github.io/concepts/networking/) |
-| **kubectl-unbounded** | kubectl plugin for initializing sites, adding machines, and managing the cluster. | [CLI Reference](https://legendary-sniffle-6qv7eqr.pages.github.io/reference/cli/) |
+| **[unbounded-agent](https://azure.github.io/unbounded-kube/guides/agent/)** | Single binary delivered to hosts to bootstrap them as Kubernetes worker nodes using `systemd-nspawn`. | [Agent Guide](https://azure.github.io/unbounded-kube/guides/agent/) |
+| **[machina](https://azure.github.io/unbounded-kube/guides/ssh/)** | Kubernetes controller that provisions remote Linux machines over SSH. | [SSH Guide](https://azure.github.io/unbounded-kube/guides/ssh/), [CRD Reference](https://azure.github.io/unbounded-kube/reference/machina-crd/) |
+| **[metalman](https://azure.github.io/unbounded-kube/guides/pxe/)** | Controller for PXE-booting bare-metal servers with DHCP, TFTP, HTTP, Redfish BMC, and TPM 2.0. | [PXE Guide](https://azure.github.io/unbounded-kube/guides/pxe/), [Bare Metal Concepts](https://azure.github.io/unbounded-kube/concepts/bare-metal/) |
+| **[unbounded-net](https://github.com/Azure/unbounded-net)** | CNI plugin and multi-site networking system for cross-site pod connectivity. | [Networking Concepts](https://azure.github.io/unbounded-kube/concepts/networking/) |
+| **kubectl-unbounded** | kubectl plugin for initializing sites, adding machines, and managing the cluster. | [CLI Reference](https://azure.github.io/unbounded-kube/reference/cli/) |
 
 ## Quick Start
 
 Get a working multi-site cluster in under 10 minutes. This creates an AKS cluster
 and joins a remote node to it. Already have a cluster? See the
-[Bring Your Own Cluster](https://legendary-sniffle-6qv7eqr.pages.github.io/guides/existing-cluster/) guide.
+[Bring Your Own Cluster](https://azure.github.io/unbounded-kube/guides/existing-cluster/) guide.
 
 <p align="center">
   <img src="docs/static/img/quickstart-architecture.svg" alt="Quickstart architecture: AKS cluster with gateway nodes connected to a remote site over WireGuard" width="700">
@@ -119,17 +119,17 @@ kubectl get nodes -w
 After a few minutes your remote node appears with status **Ready**.
 
 For the full walkthrough including pod networking verification, see the
-[Getting Started Guide](https://legendary-sniffle-6qv7eqr.pages.github.io/guides/getting-started/).
+[Getting Started Guide](https://azure.github.io/unbounded-kube/guides/getting-started/).
 
 ## Documentation
 
-Full documentation is available at **[legendary-sniffle-6qv7eqr.pages.github.io](https://legendary-sniffle-6qv7eqr.pages.github.io/)**.
+Full documentation is available at **[azure.github.io/unbounded-kube](https://azure.github.io/unbounded-kube/)**.
 
 | | |
 |---|---|
-| **Concepts** | [Project Overview](https://legendary-sniffle-6qv7eqr.pages.github.io/concepts/overview/) · [Networking](https://legendary-sniffle-6qv7eqr.pages.github.io/concepts/networking/) · [Bare Metal](https://legendary-sniffle-6qv7eqr.pages.github.io/concepts/bare-metal/) |
-| **Guides** | [Getting Started](https://legendary-sniffle-6qv7eqr.pages.github.io/guides/getting-started/) · [Existing Cluster](https://legendary-sniffle-6qv7eqr.pages.github.io/guides/existing-cluster/) · [SSH Provisioning](https://legendary-sniffle-6qv7eqr.pages.github.io/guides/ssh/) · [Cloud API](https://legendary-sniffle-6qv7eqr.pages.github.io/guides/cloud-api/) · [PXE Boot](https://legendary-sniffle-6qv7eqr.pages.github.io/guides/pxe/) · [Agent](https://legendary-sniffle-6qv7eqr.pages.github.io/guides/agent/) |
-| **Reference** | [Architecture](https://legendary-sniffle-6qv7eqr.pages.github.io/reference/architecture/) · [CLI](https://legendary-sniffle-6qv7eqr.pages.github.io/reference/cli/) · [Machine CRD](https://legendary-sniffle-6qv7eqr.pages.github.io/reference/machina-crd/) · [GPU / NVIDIA](https://legendary-sniffle-6qv7eqr.pages.github.io/reference/gpu/nvidia/) |
+| **Concepts** | [Project Overview](https://azure.github.io/unbounded-kube/concepts/overview/) · [Networking](https://azure.github.io/unbounded-kube/concepts/networking/) · [Bare Metal](https://azure.github.io/unbounded-kube/concepts/bare-metal/) |
+| **Guides** | [Getting Started](https://azure.github.io/unbounded-kube/guides/getting-started/) · [Existing Cluster](https://azure.github.io/unbounded-kube/guides/existing-cluster/) · [SSH Provisioning](https://azure.github.io/unbounded-kube/guides/ssh/) · [Cloud API](https://azure.github.io/unbounded-kube/guides/cloud-api/) · [PXE Boot](https://azure.github.io/unbounded-kube/guides/pxe/) · [Agent](https://azure.github.io/unbounded-kube/guides/agent/) |
+| **Reference** | [Architecture](https://azure.github.io/unbounded-kube/reference/architecture/) · [CLI](https://azure.github.io/unbounded-kube/reference/cli/) · [Machine CRD](https://azure.github.io/unbounded-kube/reference/machina-crd/) · [GPU / NVIDIA](https://azure.github.io/unbounded-kube/reference/gpu/nvidia/) |
 
 ## Repository Structure
 

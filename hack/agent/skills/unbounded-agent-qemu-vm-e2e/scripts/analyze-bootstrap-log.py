@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""analyze-bootstrap-log.py — Parse unbounded-agent bootstrap logs and print a
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+"""analyze-bootstrap-log.py - Parse unbounded-agent bootstrap logs and print a
 phase duration breakdown.
 
 Usage:

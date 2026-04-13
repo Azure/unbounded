@@ -8,9 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"maps"
 	"net"
-	"strings"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -28,7 +26,6 @@ import (
 	stderrs "errors"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
-	"github.com/Azure/unbounded-kube/internal/cloudprovider"
 	"github.com/Azure/unbounded-kube/internal/provision"
 )
 
@@ -68,10 +65,6 @@ const (
 	// must reside. Machine is cluster-scoped, so we use a fixed namespace
 	// for secret lookup.
 	SecretNamespaceUnboundedKube = "unbounded-kube"
-
-	// MachineNodeLabel is the label key applied to Nodes that correspond
-	// to a Machine. The value is the Machine name.
-	MachineNodeLabel = "unbounded-kube.io/machine"
 )
 
 // ReachabilityChecker checks if a machine is reachable via TCP.
@@ -562,14 +555,6 @@ func (r *MachineReconciler) provisionMachine(
 		k8sVersion = r.ClusterInfo.KubeVersion
 	}
 
-	if machine.Spec.Kubernetes != nil && machine.Spec.Kubernetes.Version != "" {
-		k8sVersion = machine.Spec.Kubernetes.Version
-	}
-
-	if k8sVersion != "" && !strings.HasPrefix(k8sVersion, "v") {
-		k8sVersion = "v" + k8sVersion
-	}
-
 	apiServer := ""
 	caCertBase64 := ""
 	clusterDNS := ""
@@ -580,54 +565,22 @@ func (r *MachineReconciler) provisionMachine(
 		clusterDNS = r.ClusterInfo.ClusterDNS
 	}
 
-	// User-defined labels (lowest priority).
-	labels := map[string]string{}
-
-	if machine.Spec.Kubernetes != nil {
-		for k, v := range machine.Spec.Kubernetes.NodeLabels {
-			labels[k] = v
-		}
-	}
-
-	// Controller-injected labels override user labels.
-	labels[MachineNodeLabel] = machine.Name
-
-	// Provider-injected labels override everything.
+	var providerLabels map[string]string
 	if r.ClusterInfo != nil && r.ClusterInfo.Provider != nil {
-		for k, v := range r.ClusterInfo.Provider.DefaultLabels() {
-			labels[k] = v
-		}
+		providerLabels = r.ClusterInfo.Provider.DefaultLabels()
 	}
 
-	// Common labels are applied unconditionally to every node provisioned
-	// by unbounded, regardless of the detected cloud provider.
-	maps.Copy(labels, cloudprovider.CommonDefaultLabels())
-
-	var taints []string
-	if machine.Spec.Kubernetes != nil {
-		taints = machine.Spec.Kubernetes.RegisterWithTaints
-	}
-
-	var ociImage string
-	if machine.Spec.Agent != nil {
-		ociImage = machine.Spec.Agent.Image
-	}
-
-	agentConfig := provision.AgentConfig{
-		MachineName: machine.Name,
-		Cluster: provision.AgentClusterConfig{
-			CaCertBase64: caCertBase64,
+	agentConfig := provision.BuildAgentConfig(provision.BuildAgentConfigParams{
+		Machine: machine,
+		Cluster: provision.ClusterEndpoint{
+			APIServer:    apiServer,
+			CACertBase64: caCertBase64,
 			ClusterDNS:   clusterDNS,
-			Version:      k8sVersion,
+			KubeVersion:  k8sVersion,
 		},
-		Kubelet: provision.AgentKubeletConfig{
-			ApiServer:          apiServer,
-			BootstrapToken:     bootstrapToken,
-			Labels:             labels,
-			RegisterWithTaints: taints,
-		},
-		OCIImage: ociImage,
-	}
+		ProviderLabels: providerLabels,
+		BootstrapToken: bootstrapToken,
+	})
 
 	configJSON, err := json.Marshal(agentConfig)
 	if err != nil {
@@ -815,52 +768,48 @@ func (r *MachineReconciler) SetupWithManager(mgr ctrl.Manager) error {
 }
 
 // findMachineForNode maps a Node event to the Machine that owns it (if any)
-// by looking at the MachineNodeLabel label on the Node.
-func (r *MachineReconciler) findMachineForNode(_ context.Context, obj client.Object) []ctrl.Request {
+// by looking up a Machine whose name matches the Node name.
+func (r *MachineReconciler) findMachineForNode(ctx context.Context, obj client.Object) []ctrl.Request {
 	node, ok := obj.(*corev1.Node)
 	if !ok {
 		return nil
 	}
 
-	machineName, found := node.Labels[MachineNodeLabel]
-	if !found || machineName == "" {
+	var machine unboundedv1alpha3.Machine
+	if err := r.Get(ctx, client.ObjectKey{Name: node.Name}, &machine); err != nil {
 		return nil
 	}
 
 	return []ctrl.Request{
-		{NamespacedName: client.ObjectKey{Name: machineName}},
+		{NamespacedName: client.ObjectKey{Name: machine.Name}},
 	}
 }
 
 // reconcileNodeJoin handles the Node lifecycle for a provisioned Machine.
-// It looks for a Node with the matching label and transitions the Machine
-// between Joining and Ready phases.
+// It looks for a Node whose name matches the Machine (or the explicit NodeRef)
+// and transitions the Machine between Joining and Ready phases.
 func (r *MachineReconciler) reconcileNodeJoin(ctx context.Context, machine *unboundedv1alpha3.Machine) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
 	// Determine the node name to look for. If the machine has a nodeRef in
-	// its kubernetes spec, use that; otherwise look up by label.
+	// its kubernetes spec, use that; otherwise look up by machine name
+	// (machine name == node name by convention).
+	nodeName := machine.Name
+	if machine.Spec.Kubernetes != nil && machine.Spec.Kubernetes.NodeRef != nil {
+		nodeName = machine.Spec.Kubernetes.NodeRef.Name
+	}
+
 	var nodeList corev1.NodeList
 
-	if machine.Spec.Kubernetes != nil && machine.Spec.Kubernetes.NodeRef != nil {
-		// Look for the specific node by name.
-		var node corev1.Node
-		if err := r.Get(ctx, client.ObjectKey{Name: machine.Spec.Kubernetes.NodeRef.Name}, &node); err != nil {
-			if errors.IsNotFound(err) {
-				// Node doesn't exist yet; handled below.
-			} else {
-				logger.Error(err, "Failed to get Node for Machine", "machine", machine.Name)
-				return ctrl.Result{}, err
-			}
-		} else {
-			nodeList.Items = append(nodeList.Items, node)
-		}
-	} else {
-		// Look for a Node with the matching label.
-		if err := r.List(ctx, &nodeList, client.MatchingLabels{MachineNodeLabel: machine.Name}); err != nil {
-			logger.Error(err, "Failed to list Nodes for Machine", "machine", machine.Name)
+	var node corev1.Node
+	if err := r.Get(ctx, client.ObjectKey{Name: nodeName}, &node); err != nil {
+		if !errors.IsNotFound(err) {
+			logger.Error(err, "Failed to get Node for Machine", "machine", machine.Name)
 			return ctrl.Result{}, err
 		}
+		// Node doesn't exist yet; nodeList stays empty.
+	} else {
+		nodeList.Items = append(nodeList.Items, node)
 	}
 
 	switch machine.Status.Phase {

@@ -636,7 +636,6 @@ func TestProvisionMachine_EndToEnd(t *testing.T) {
 	require.Equal(t, "v1.34.0", agentConfig.Cluster.Version) // Machine spec overrides cluster version.
 	require.Equal(t, "api.example.com:443", agentConfig.Kubelet.ApiServer)
 	require.Equal(t, "abc123.secret", agentConfig.Kubelet.BootstrapToken)
-	require.Equal(t, "test-machine", agentConfig.Kubelet.Labels[MachineNodeLabel])
 
 	// Common labels are always applied.
 	require.Equal(t, "true", agentConfig.Kubelet.Labels[cloudprovider.ExcludeFromCloudProviderLabel])
@@ -765,7 +764,6 @@ func TestProvisionMachine_ConfigFile(t *testing.T) {
 	require.Equal(t, "v1.33.1", agentConfig.Cluster.Version)
 	require.Equal(t, "k8s.example.com:6443", agentConfig.Kubelet.ApiServer)
 	require.Equal(t, "tok123.secret456", agentConfig.Kubelet.BootstrapToken)
-	require.Equal(t, "my-special-machine", agentConfig.Kubelet.Labels[MachineNodeLabel])
 }
 
 func TestProvisionMachine_NilClusterInfo(t *testing.T) {
@@ -907,9 +905,8 @@ func TestProvisionMachine_LabelMerge(t *testing.T) {
 			Kubernetes: &unboundedv1alpha3.KubernetesSpec{
 				BootstrapTokenRef: unboundedv1alpha3.LocalObjectReference{Name: "bt"},
 				NodeLabels: map[string]string{
-					"env":            "production",
-					"team":           "platform",
-					MachineNodeLabel: "user-override", // Controller-injected label wins over this.
+					"env":  "production",
+					"team": "platform",
 				},
 			},
 		},
@@ -947,9 +944,6 @@ func TestProvisionMachine_LabelMerge(t *testing.T) {
 	// User-defined labels should be present.
 	require.Equal(t, "production", agentConfig.Kubelet.Labels["env"])
 	require.Equal(t, "platform", agentConfig.Kubelet.Labels["team"])
-
-	// Controller-injected label overrides user label on conflict.
-	require.Equal(t, "label-test-machine", agentConfig.Kubelet.Labels[MachineNodeLabel])
 
 	// Common labels are always applied.
 	require.Equal(t, "true", agentConfig.Kubelet.Labels[cloudprovider.ExcludeFromCloudProviderLabel])
@@ -1144,9 +1138,6 @@ func TestProvisionMachine_ProviderLabelsOverride(t *testing.T) {
 	require.Equal(t, "false", agentConfig.Kubelet.Labels["kubernetes.azure.com/managed"])
 
 	// kubernetes.azure.com/cluster label is no longer applied to unbounded-managed nodes.
-
-	// Controller-injected label is present.
-	require.Equal(t, "provider-label-machine", agentConfig.Kubelet.Labels[MachineNodeLabel])
 
 	// Common labels are always applied.
 	require.Equal(t, "true", agentConfig.Kubelet.Labels[cloudprovider.ExcludeFromCloudProviderLabel])

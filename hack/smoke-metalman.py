@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 from __future__ import annotations
 
 import atexit
+import base64
 import json
 import os
 import signal
@@ -30,6 +33,7 @@ NET_NAME = "unbounded-metal-smoke"
 SUBNET = "192.168.200"
 SERVER_IP = f"{SUBNET}.1"
 NODE_IP = f"{SUBNET}.10"
+KIND_SMOKE_IP = f"{SUBNET}.2"  # IP assigned to the kind container on virbr-smoke
 GATEWAY = SERVER_IP
 DNS_SERVER = "8.8.8.8"
 MAC_ADDRESS = "52:54:00:aa:bb:01"
@@ -50,6 +54,7 @@ AGENT_IMAGE_NAME_VM = f"{SERVER_IP}:{REGISTRY_PORT}/unbounded/agent-ubuntu2404:s
 BINARY = REPO_ROOT / "bin" / "metalman"
 KUBECTL_UNBOUNDED = REPO_ROOT / "bin" / "kubectl-unbounded"
 SERIAL_SOCK = TMPDIR / "console.sock"
+QGA_SOCK = TMPDIR / "qga.sock"
 
 KUBECTL = "kubectl"
 VIRSH = ["virsh", "--connect", "qemu:///system"]
@@ -66,6 +71,10 @@ def log(msg: str) -> None:
 
 def die(msg: str) -> None:
     print(f"FAIL: {msg}", file=sys.stderr)
+    try:
+        collect_debug_logs()
+    except Exception as e:
+        log(f"  (debug log collection failed: {e})")
     sys.exit(1)
 
 
@@ -88,7 +97,7 @@ def _forward_lines(stream: Any, log_file: Any) -> None:
 
 def spawn(args: list[str], log_path: Path | str) -> subprocess.Popen[Any]:
     """Start a background process, teeing its output to *log_path* and stderr."""
-    log_file = open(log_path, "w")  # noqa: SIM115 — intentionally long-lived
+    log_file = open(log_path, "w")  # noqa: SIM115 - intentionally long-lived
     proc = subprocess.Popen(
         args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         start_new_session=True,
@@ -138,8 +147,103 @@ def forward_console(sock_path: Path) -> None:
         finally:
             conn.close()
 
-        # Socket closed — VM probably rebooted.  Retry.
+        # Socket closed - VM probably rebooted.  Retry.
         time.sleep(1)
+
+
+def guest_exec(command: str, timeout: int = 30) -> tuple[int, str, str]:
+    """Execute a command inside the VM via the QEMU guest agent.
+
+    Returns (exit_code, stdout, stderr).  Requires the guest agent channel
+    to be configured on the VM and the qemu-guest-agent service running
+    inside the guest.
+    """
+    exec_req = json.dumps({
+        "execute": "guest-exec",
+        "arguments": {
+            "path": "/bin/bash",
+            "arg": ["-c", command],
+            "capture-output": True,
+        },
+    })
+    result = subprocess.run(
+        [*VIRSH, "qemu-agent-command", VM_NAME, exec_req],
+        capture_output=True, text=True, timeout=10,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"guest-exec failed: {result.stderr.strip()}")
+    pid = json.loads(result.stdout)["return"]["pid"]
+
+    # Poll guest-exec-status until the process exits.
+    deadline = time.monotonic() + timeout
+    while True:
+        status_req = json.dumps({
+            "execute": "guest-exec-status",
+            "arguments": {"pid": pid},
+        })
+        result = subprocess.run(
+            [*VIRSH, "qemu-agent-command", VM_NAME, status_req],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"guest-exec-status failed: {result.stderr.strip()}")
+        status = json.loads(result.stdout)["return"]
+        if status.get("exited"):
+            exit_code = status.get("exitcode", -1)
+            stdout = base64.b64decode(status.get("out-data", "")).decode("utf-8", errors="replace")
+            stderr = base64.b64decode(status.get("err-data", "")).decode("utf-8", errors="replace")
+            return exit_code, stdout, stderr
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"guest-exec pid {pid} did not exit within {timeout}s")
+        time.sleep(0.5)
+
+
+def collect_debug_logs() -> None:
+    """Use the QEMU guest agent to dump kubelet and agent debug information.
+
+    Best-effort: failures are logged but do not abort the test.
+    """
+    log("Collecting debug logs from VM via QEMU guest agent...")
+    commands = [
+        # Network diagnostics — must come first to diagnose download hangs.
+        ("resolv.conf", "cat /etc/resolv.conf"),
+        ("ip addr", "ip -4 addr show"),
+        ("ip route", "ip route show"),
+        ("dns test (dl.k8s.io)", "timeout 5 getent hosts dl.k8s.io || echo 'DNS FAILED'"),
+        ("curl test (dl.k8s.io)", "timeout 10 curl -sS -o /dev/null -w '%{http_code}' https://dl.k8s.io/ || echo 'CURL FAILED'"),
+        ("dns test (github.com)", "timeout 5 getent hosts github.com || echo 'DNS FAILED'"),
+        ("iptables nat", "iptables -t nat -L -n 2>/dev/null || nft list ruleset 2>/dev/null | head -60"),
+        # Agent and service logs.
+        ("systemctl status", "systemctl --no-pager status"),
+        ("unbounded-agent journal", "journalctl --no-pager -n 200 -u cloud-final.service"),
+        ("machinectl list", "machinectl list --no-pager"),
+        ("nspawn machine status", f"machinectl status {NODE_NAME} --no-pager"),
+        ("kubelet journal (nspawn)", (
+            f"systemd-run --pipe --wait --machine={NODE_NAME} "
+            "journalctl --no-pager -n 200 -u kubelet.service"
+        )),
+        ("containerd journal (nspawn)", (
+            f"systemd-run --pipe --wait --machine={NODE_NAME} "
+            "journalctl --no-pager -n 100 -u containerd.service"
+        )),
+        ("kubelet service status (nspawn)", (
+            f"systemd-run --pipe --wait --machine={NODE_NAME} "
+            "systemctl --no-pager status kubelet.service"
+        )),
+    ]
+    for label, cmd in commands:
+        log(f"  --- {label} ---")
+        try:
+            exit_code, stdout, stderr = guest_exec(cmd, timeout=30)
+            if stdout:
+                sys.stderr.write(stdout)
+                sys.stderr.flush()
+            if stderr:
+                sys.stderr.write(stderr)
+                sys.stderr.flush()
+        except (RuntimeError, TimeoutError, subprocess.TimeoutExpired, OSError) as e:
+            log(f"  (failed to collect {label}: {e})")
+    log("  --- end debug logs ---")
 
 
 def clean_libvirt() -> None:
@@ -152,10 +256,13 @@ def clean_libvirt() -> None:
         run_quiet(cmd)
     # Remove stale bridge left behind by a previous net-destroy.
     run_quiet(["sudo", "ip", "link", "delete", "virbr-smoke"])
+    # Remove veth pair used to connect kind container to virbr-smoke.
+    run_quiet(["sudo", "ip", "link", "delete", "veth-kind-smoke"])
     # Kill any leftover sushy-emulator from a previous run.
     run_quiet(["sudo", "pkill", "-f", "sushy-emulator"])
     # Kill any leftover metalman serve-pxe from a previous run.
-    run_quiet(["sudo", "pkill", "-f", "metalman"])
+    # Use the binary path to avoid matching this script (smoke-metalman.py).
+    run_quiet(["sudo", "pkill", "-f", "bin/metalman"])
     # Stop and remove leftover local registry container.
     run_quiet(["docker", "rm", "-f", REGISTRY_CONTAINER])
     # Delete stale leader-election leases so new processes acquire immediately.
@@ -239,6 +346,32 @@ def apiserver_url() -> str:
     return url
 
 
+def _probe_vm_network() -> None:
+    """Run quick network diagnostics inside the VM via guest agent."""
+    log("  Probing VM network (one-time diagnostic)...")
+    for label, cmd in [
+        ("resolv.conf", "cat /etc/resolv.conf"),
+        ("ip route", "ip route show"),
+        ("dns dl.k8s.io", "timeout 5 getent hosts dl.k8s.io 2>&1 || echo 'DNS FAILED'"),
+        ("curl dl.k8s.io", "timeout 10 curl -sSf -o /dev/null -w '%{http_code}' https://dl.k8s.io/ 2>&1 || echo 'CURL FAILED'"),
+    ]:
+        try:
+            _, stdout, stderr = guest_exec(cmd, timeout=15)
+            out = (stdout + stderr).strip()
+            log(f"    [{label}] {out}")
+        except Exception as e:
+            log(f"    [{label}] (failed: {e})")
+
+
+def _vm_is_running() -> bool:
+    """Return True if the VM domain is in 'running' state."""
+    result = subprocess.run(
+        [*VIRSH, "domstate", VM_NAME],
+        capture_output=True, text=True,
+    )
+    return result.returncode == 0 and "running" in result.stdout.strip()
+
+
 def machine_status() -> str | None:
     """Return a short summary of Machine conditions, or None."""
     result = subprocess.run(
@@ -254,6 +387,7 @@ def machine_status() -> str | None:
 def wait_k8s_node(name: str, timeout: int = 1800) -> None:
     log(f"  Waiting for Kubernetes Node '{name}' to appear...")
     last_status: str | None = None
+    net_diag_done = False
     for elapsed in range(timeout):
         check_procs()
         result = subprocess.run(
@@ -266,6 +400,21 @@ def wait_k8s_node(name: str, timeout: int = 1800) -> None:
                 if status != last_status:
                     last_status = status
                 log(f"    ({elapsed}s) Machine conditions: {status or 'none'}")
+
+                # Check if the VM is still alive; bail early if it crashed.
+                if not _vm_is_running():
+                    # Log host disk free space to help diagnose qcow2 growth.
+                    df = subprocess.run(
+                        ["df", "-h", str(TMPDIR)],
+                        capture_output=True, text=True,
+                    )
+                    log(f"    Host disk:\n{df.stdout}")
+                    die(f"VM '{VM_NAME}' is no longer running (crashed or shut down)")
+
+                # Run network diagnostics once after 180s if still stuck.
+                if elapsed >= 180 and not net_diag_done:
+                    net_diag_done = True
+                    _probe_vm_network()
             time.sleep(1)
             continue
         log(f"  Node '{name}' appeared in cluster")
@@ -322,21 +471,41 @@ def main() -> None:
     # can reach the kind API server.
     run(["sudo", "iptables", "-t", "raw", "-I", "PREROUTING",
          "-i", "virbr-smoke", "-j", "ACCEPT"])
-    # Add a route inside the kind container so it can reach the VM subnet.
-    # Without this, kindnet on the control-plane can't add routes for the
-    # smoke-node's pod CIDR and crash-loops.
-    log("Adding route inside kind container for VM subnet")
+
+    # Connect the kind container directly to virbr-smoke so that the VM
+    # subnet is *directly reachable* from inside the container.  Kindnet
+    # adds routes of the form "10.244.x.0/24 via <nodeIP>"; the kernel
+    # rejects these when the gateway is only reachable via an indirect
+    # route.  A direct L2 link avoids this.
+    log("Attaching kind container to virbr-smoke bridge")
+    kind_pid = run(
+        ["docker", "inspect", "kind-control-plane", "--format", "{{.State.Pid}}"],
+        capture_output=True, text=True,
+    ).stdout.strip()
     kind_ip = run(
         ["docker", "inspect", "kind-control-plane",
          "--format", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}"],
         capture_output=True, text=True,
     ).stdout.strip()
-    run(["docker", "exec", "kind-control-plane",
-         "ip", "route", "replace", f"{SUBNET}.0/24", "via", "172.18.0.1"])
+    # Clean up any leftover veth from a previous run.
+    run_quiet(["sudo", "ip", "link", "delete", "veth-kind-smoke"], check=False)
+    # Create a veth pair: host-side attaches to virbr-smoke, container-side
+    # gets an IP on the VM subnet.
+    run(["sudo", "ip", "link", "add", "veth-kind-smoke", "type", "veth",
+         "peer", "name", "eth-smoke"])
+    run(["sudo", "ip", "link", "set", "veth-kind-smoke", "master", "virbr-smoke"])
+    run(["sudo", "ip", "link", "set", "veth-kind-smoke", "up"])
+    # Move the peer into the kind container's network namespace.
+    run(["sudo", "ip", "link", "set", "eth-smoke", "netns", kind_pid])
+    run(["sudo", "nsenter", "-t", kind_pid, "-n",
+         "ip", "addr", "add", f"{KIND_SMOKE_IP}/24", "dev", "eth-smoke"])
+    run(["sudo", "nsenter", "-t", kind_pid, "-n",
+         "ip", "link", "set", "eth-smoke", "up"])
 
     # Kindnet's CONTROL_PLANE_ENDPOINT defaults to "kind-control-plane:6443"
     # which is unresolvable from the bare-metal VM (it's not in Docker's DNS).
-    # Patch it to use the kind container's actual IP.
+    # Patch it to use the kind container's Docker IP which the VM can reach
+    # through its default gateway.
     log("Patching kindnet DaemonSet for VM-reachable control plane endpoint")
     patch = json.dumps({
         "spec": {"template": {"spec": {"containers": [{
@@ -363,6 +532,7 @@ def main() -> None:
         "--boot", f"uefi,loader=/usr/share/OVMF/OVMF_CODE_4M.fd,nvram={ovmf_vars},hd,network",
         "--tpm", "backend.type=emulator,backend.version=2.0",
         "--serial", f"unix,path={SERIAL_SOCK},mode=bind",
+        "--channel", f"unix,path={QGA_SOCK},mode=bind,target.type=virtio,target.name=org.qemu.guest_agent.0",
         "--os-variant", "generic",
         "--noautoconsole", "--noreboot", "--import",
     ], check=True)
@@ -409,7 +579,7 @@ def main() -> None:
     log("Applying deploy manifests (CRDs, namespace, RBAC)")
     kubectl(["apply", "--server-side", "--force-conflicts", "-f", str(REPO_ROOT / "deploy" / "machina" / "01-namespace.yaml")])
     kubectl(["apply", "--server-side", "--force-conflicts", "-f", str(REPO_ROOT / "deploy" / "machina" / "crd")])
-    kubectl(["apply", "--server-side", "--force-conflicts", "-f", str(REPO_ROOT / "deploy" / "metalman" / "01-rbac.yaml")])
+    kubectl(["apply", "--server-side", "--force-conflicts", "-f", str(REPO_ROOT / "deploy" / "machina" / "06-metalman-rbac.yaml")])
 
     log("Creating Kubernetes resources")
     kubectl(["-n", NODE_NS, "create", "secret", "generic",
@@ -443,6 +613,14 @@ def main() -> None:
 
     log("Pushing agent-ubuntu2404 OCI image to local registry")
     run(["docker", "push", AGENT_IMAGE_NAME])
+
+    # Reclaim disk space consumed by Docker build cache.  The host-ubuntu2404
+    # build downloads a ~2 GB Ubuntu cloud image and converts it to raw; the
+    # intermediate layers are no longer needed once the images are pushed.
+    # Only prune the build cache (not running container images) to avoid
+    # disturbing the registry container.
+    log("Pruning Docker build cache to free disk space")
+    run_quiet(["docker", "builder", "prune", "-af"], check=False)
 
     server_url = apiserver_url()
     log(f"  API server URL: {server_url}")
@@ -481,8 +659,9 @@ def main() -> None:
 
     log("Starting metalman serve-pxe")
     proc = spawn([
-        "sudo", str(BINARY), "serve-pxe", f"--site={SITE}", f"--bind-address={SERVER_IP}",
-        f"--cache-dir={CACHE_DIR}", f"--apiserver-url={server_url}",
+        "sudo", "env", f"METALMAN_APISERVER_URL={server_url}",
+        str(BINARY), "serve-pxe", f"--site={SITE}", f"--bind-address={SERVER_IP}",
+        f"--cache-dir={CACHE_DIR}",
         f"--serve-url={SERVE_URL}", "--dhcp-interface=virbr-smoke",
         "--leader-elect-lease-duration=60s",
         "--leader-elect-renew-deadline=40s",
@@ -495,6 +674,10 @@ def main() -> None:
 
     log("Triggering reimage")
     run([str(KUBECTL_UNBOUNDED), "machine", "reimage", NODE_NAME])
+
+    # Log free space so we can correlate disk exhaustion with VM failures.
+    df = subprocess.run(["df", "-h", str(TMPDIR)], capture_output=True, text=True)
+    log(f"  Host disk after image builds:\n{df.stdout.strip()}")
 
     log("Waiting for kubelet to join the cluster...")
     wait_k8s_node(NODE_NAME, timeout=900)
