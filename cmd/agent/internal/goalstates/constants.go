@@ -11,6 +11,23 @@ const (
 	SystemdSystemDir = "/etc/systemd/system"
 )
 
+// NSpawn machine names used for blue/green style in-place upgrades.
+//
+//   - NSpawnMachineKube1 is the initial (default) machine name.
+//   - NSpawnMachineKube2 will be used for the next upgrade cycle.
+//
+// The pattern alternates between the two so an in-place upgrade can bring
+// up the new machine before tearing down the old one:
+//
+//	kube1  ← initial
+//	kube2  ← after operation 1
+//	kube1  ← after operation 2
+//	…
+const (
+	NSpawnMachineKube1 = "kube1"
+	NSpawnMachineKube2 = "kube2" //nolint:deadcode // reserved for future upgrade cycle
+)
+
 const (
 	ContainerdVersion = "2.0.4"
 	RunCVersion       = "1.1.12"

@@ -49,6 +49,12 @@ KIND_CLUSTER_NAME = os.environ.get("KIND_CLUSTER_NAME", "kind")
 AGENT_MACHINE_NAME = os.environ.get("AGENT_MACHINE_NAME", "agent-e2e")
 AGENT_DEBUG = os.environ.get("AGENT_DEBUG", "")
 
+# Site name used when generating the bootstrap script via kubectl-unbounded.
+E2E_SITE_NAME = "e2e"
+
+# Fixed nspawn machine names used by unbounded-agent (decoupled from the kube node name).
+NSPAWN_MACHINE_NAMES = ["kube1", "kube2"]
+
 BRIDGE_NAME = "virbr-e2e"
 TAP_NAME = "tap-e2e"
 SERVE_PORT = 8199
@@ -63,8 +69,8 @@ SSH_OPTS = [
 ]
 SSH_TARGET = f"ubuntu@{VM_IP}"
 
-INSTALL_SCRIPT = REPO_ROOT / "internal" / "provision" / "assets" / "unbounded-agent-install.sh"
 KUBECTL = "kubectl"
+KUBECTL_UNBOUNDED = str(REPO_ROOT / "bin" / "kubectl-unbounded")
 
 TEST_NS = "e2e-workload-test"
 
@@ -317,9 +323,7 @@ def run_agent() -> None:
 
     if not SSH_KEY.exists():
         die(f"SSH key not found: {SSH_KEY}. Run create-vm first.")
-    if not INSTALL_SCRIPT.exists():
-        die(f"Provision install script not found: {INSTALL_SCRIPT}")
-    for cmd in (KUBECTL, "jq"):
+    for cmd in (KUBECTL,):
         if shutil.which(cmd) is None:
             die(f"{cmd} is required but not found in PATH")
 
@@ -329,6 +333,12 @@ def run_agent() -> None:
     run(["go", "build", "-o", str(agent_bin), str(REPO_ROOT / "cmd" / "agent" / "main.go")],
         env={**os.environ, "GOOS": "linux", "GOARCH": "amd64"})
     log(f"Agent binary built: {agent_bin}")
+
+    log("Building kubectl-unbounded...")
+    kubectl_unbounded_bin = Path(KUBECTL_UNBOUNDED)
+    run(["go", "build", "-o", str(kubectl_unbounded_bin),
+         str(REPO_ROOT / "cmd" / "kubectl-unbounded" / "main.go")])
+    log(f"kubectl-unbounded binary built: {kubectl_unbounded_bin}")
 
     log("Packaging agent binary as tarball...")
     agent_tarball = VM_DIR / "unbounded-agent-linux-amd64.tar.gz"
@@ -367,8 +377,9 @@ def _make_handler(directory: str) -> type:
 def _run_agent_inner(agent_url: str) -> None:
     """Core logic for run-agent (after HTTP server is up)."""
 
-    # Extract cluster information from Kind
-    log(f"Extracting cluster info from Kind cluster '{KIND_CLUSTER_NAME}'...")
+    # Determine the Kind control-plane IP so connectivity checks have the
+    # correct address even when the local kubeconfig uses 127.0.0.1.
+    log(f"Resolving Kind control-plane IP for '{KIND_CLUSTER_NAME}'...")
     kind_container = f"{KIND_CLUSTER_NAME}-control-plane"
     kind_ip = capture([
         "docker", "inspect", kind_container,
@@ -376,38 +387,8 @@ def _run_agent_inner(agent_url: str) -> None:
     ])
     if not kind_ip:
         die("Could not determine Kind control-plane container IP")
-
     api_server = f"https://{kind_ip}:6443"
     log(f"API server: {api_server}")
-
-    ca_cert_b64 = kubectl_capture([
-        "config", "view", "--raw",
-        "-o", "jsonpath={.clusters[0].cluster.certificate-authority-data}",
-    ])
-    if not ca_cert_b64:
-        die("Could not extract CA certificate from kubeconfig")
-
-    version_json = capture([KUBECTL, "version", "-o", "json"])
-    kube_version = json.loads(version_json)["serverVersion"]["gitVersion"]
-    if not kube_version:
-        die("Could not determine Kubernetes version")
-    log(f"Kubernetes version: {kube_version}")
-
-    # Cluster DNS
-    cluster_dns = ""
-    for svc in ("kube-dns", "coredns"):
-        try:
-            cluster_dns = kubectl_capture([
-                "get", "svc", "-n", "kube-system", svc,
-                "-o", "jsonpath={.spec.clusterIP}",
-            ])
-            if cluster_dns:
-                break
-        except subprocess.CalledProcessError:
-            log(f"  DNS service '{svc}' not found, trying next...")
-    if not cluster_dns:
-        die("Could not determine cluster DNS IP")
-    log(f"Cluster DNS: {cluster_dns}")
 
     # Create bootstrap token.
     # Kind clusters use kubeadm, which creates ClusterRoleBindings for TLS
@@ -419,7 +400,6 @@ def _run_agent_inner(agent_url: str) -> None:
     log("Creating bootstrap token...")
     token_id = secrets.token_hex(3)
     token_secret = secrets.token_hex(8)
-    bootstrap_token = f"{token_id}.{token_secret}"
     bootstrap_group = "system:bootstrappers:kubeadm:default-node-token"
 
     token_manifest = json.dumps({
@@ -441,34 +421,43 @@ def _run_agent_inner(agent_url: str) -> None:
     kubectl(["apply", "-f", "-"], input=token_manifest.encode())
     log(f"Bootstrap token created: {token_id}.xxxxxxxxxxxxxxxx")
 
-    # Generate agent configuration
-    log("Generating agent configuration...")
-    agent_config_path = VM_DIR / "agent-config.json"
+    # Generate bootstrap script via kubectl-unbounded.
+    # manual-bootstrap auto-detects the API server, CA cert, Kubernetes
+    # version, and cluster DNS from the active kubeconfig, and picks up
+    # the bootstrap token we just created via the fallback path.
+    log("Generating bootstrap script with kubectl-unbounded machine manual-bootstrap...")
 
-    agent_config: dict[str, Any] = {
-        "MachineName": AGENT_MACHINE_NAME,
-        "Cluster": {
-            "CaCertBase64": ca_cert_b64,
-            "ClusterDNS": cluster_dns,
-            "Version": kube_version,
-        },
-        "Kubelet": {
-            "ApiServer": api_server,
-            "BootstrapToken": bootstrap_token,
-            "Labels": {},
-            "RegisterWithTaints": [],
-        },
-    }
+    # Capture the local API server URL from the kubeconfig (typically
+    # https://127.0.0.1:<port> for Kind) so we can replace it with the
+    # VM-reachable container IP after generating the script.
+    local_api_server = kubectl_capture([
+        "config", "view", "--raw",
+        "-o", "jsonpath={.clusters[0].cluster.server}",
+    ])
+    if not local_api_server:
+        die("Could not determine local API server URL from kubeconfig")
 
-    agent_config_path.write_text(json.dumps(agent_config, indent=2))
-    agent_config_path.chmod(0o600)  # restrict access; contains bootstrap token
-    log(f"Agent config written to {agent_config_path}")
+    bootstrap_script = capture([
+        KUBECTL_UNBOUNDED, "machine", "manual-bootstrap",
+        AGENT_MACHINE_NAME,
+        "--site", E2E_SITE_NAME,
+    ])
 
-    # Copy install script and config to VM
-    log("Copying provision install script and config to VM...")
-    scp_cmd(str(INSTALL_SCRIPT), f"{SSH_TARGET}:/tmp/unbounded-agent-install.sh")
-    scp_cmd(str(agent_config_path), f"{SSH_TARGET}:/tmp/agent-config.json")
-    ssh_cmd("chmod +x /tmp/unbounded-agent-install.sh")
+    # The kubeconfig uses a localhost address that is not reachable from the VM.
+    # Patch the generated script to use the Kind container IP instead.
+    if local_api_server in bootstrap_script:
+        log(f"Patching bootstrap script: replacing {local_api_server} -> {api_server}")
+        bootstrap_script = bootstrap_script.replace(local_api_server, api_server)
+    else:
+        log(f"[WARN] Local API server {local_api_server!r} not found in bootstrap script; "
+            f"VM may not be able to reach the API server")
+
+    bootstrap_script_path = VM_DIR / "bootstrap.sh"
+    bootstrap_script_path.write_text(bootstrap_script)
+    bootstrap_script_path.chmod(0o600)
+    log(f"Bootstrap script written to {bootstrap_script_path}")
+    log("Bootstrap script contents:")
+    print(bootstrap_script, flush=True)
 
     # Wait for cloud-init and verify connectivity
     log("Waiting for cloud-init to complete on VM...")
@@ -481,18 +470,18 @@ def _run_agent_inner(agent_url: str) -> None:
     log("Verifying VM can reach Kind API server...")
     ssh_cmd(f"curl -fsSk --connect-timeout 10 {api_server}/healthz")
 
-    # Run the provision install script on the VM
-    log("Running provision install script on VM...")
+    # Copy bootstrap script to VM and execute it.
+    log("Copying bootstrap script to VM...")
+    scp_cmd(str(bootstrap_script_path), f"{SSH_TARGET}:/tmp/bootstrap.sh")
+    ssh_cmd("chmod +x /tmp/bootstrap.sh")
+
+    log("Running bootstrap script on VM...")
     log("This will download the agent, bootstrap the node, and join it to the Kind cluster.")
-    env_prefix = (
-        f"UNBOUNDED_AGENT_CONFIG_FILE=/tmp/agent-config.json "
-        f"AGENT_URL={agent_url} "
-        f"AGENT_DEBUG={AGENT_DEBUG}"
-    )
+    env_prefix = f"AGENT_URL={agent_url} AGENT_DEBUG={AGENT_DEBUG}"
     run([
         "timeout", "1200",
         "ssh", *SSH_OPTS, "-o", "ServerAliveInterval=30", SSH_TARGET,
-        f"sudo {env_prefix} /tmp/unbounded-agent-install.sh",
+        f"sudo {env_prefix} /tmp/bootstrap.sh",
     ])
 
 
@@ -700,11 +689,11 @@ def reset_agent() -> None:
     if not SSH_KEY.exists():
         die(f"SSH key not found: {SSH_KEY}. Run create-vm first.")
 
-    log(f"Running 'unbounded-agent reset' on VM for machine '{AGENT_MACHINE_NAME}'...")
+    log("Running 'unbounded-agent reset' on VM...")
     run([
         "timeout", "300",
         "ssh", *SSH_OPTS, "-o", "ServerAliveInterval=30", SSH_TARGET,
-        f"sudo UNBOUNDED_AGENT_CONFIG_FILE=/tmp/agent-config.json unbounded-agent reset",
+        "sudo unbounded-agent reset",
     ])
     log("Agent reset completed on VM")
 
@@ -732,16 +721,17 @@ def reset_agent() -> None:
     else:
         die(f"Timed out waiting for node '{AGENT_MACHINE_NAME}' to be removed after {node_timeout}s")
 
-    # Verify the nspawn machine is no longer running on the VM
-    log("Verifying nspawn machine is stopped on VM...")
-    result = subprocess.run(
-        ["ssh", *SSH_OPTS, SSH_TARGET,
-         f"sudo machinectl show {AGENT_MACHINE_NAME}"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    if result.returncode == 0:
-        die(f"nspawn machine '{AGENT_MACHINE_NAME}' is still running after reset")
-    log(f"nspawn machine '{AGENT_MACHINE_NAME}' is not running")
+    # Verify the nspawn machines are no longer running on the VM
+    log("Verifying nspawn machines are stopped on VM...")
+    for nspawn_name in NSPAWN_MACHINE_NAMES:
+        result = subprocess.run(
+            ["ssh", *SSH_OPTS, SSH_TARGET,
+             f"sudo machinectl show {nspawn_name}"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        if result.returncode == 0:
+            die(f"nspawn machine '{nspawn_name}' is still running after reset")
+        log(f"nspawn machine '{nspawn_name}' is not running")
 
     log("============================================")
     log("  Agent reset PASSED")
