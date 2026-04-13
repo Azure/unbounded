@@ -459,7 +459,7 @@ func TestDHCPHandlerRelayOnlyRejectsDirectPacket(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// No GatewayIPAddr set — this is a direct client packet, not from a relay.
+	// No GatewayIPAddr set - this is a direct client packet, not from a relay.
 	conn := &fakePacketConn{}
 	peer := &net.UDPAddr{IP: net.ParseIP("10.0.1.10"), Port: 68}
 

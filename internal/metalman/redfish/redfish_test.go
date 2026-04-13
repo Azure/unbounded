@@ -192,7 +192,7 @@ func TestRedfishRebootCycle(t *testing.T) {
 		t.Fatalf("expected PoweredOff=False/PoweringOff, got %+v", poweredOffCond)
 	}
 
-	// Second reconcile: machine still not off — should NOT send ForceOff again,
+	// Second reconcile: machine still not off - should NOT send ForceOff again,
 	// just requeue.
 	powerState.Store("On")
 
@@ -251,7 +251,7 @@ func TestRedfishRebootCycle(t *testing.T) {
 		t.Fatalf("expected PoweredOff reason=PoweringOn, got %+v", poweredOffCond)
 	}
 
-	// Fifth reconcile: machine still Off but On was already sent — should not
+	// Fifth reconcile: machine still Off but On was already sent - should not
 	// send On again, just requeue.
 	powerState.Store("Off")
 
@@ -303,7 +303,7 @@ func TestRedfishRebootCycle(t *testing.T) {
 		t.Fatalf("expected Reimaged message 'image=ghcr.io/test/test-image:v1', got %q", reimagedCond.Message)
 	}
 
-	// Seventh reconcile: reboots match — no-op (timeout is handled by the
+	// Seventh reconcile: reboots match - no-op (timeout is handled by the
 	// lifecycle controller, not the redfish reconciler).
 	prevForceOff := forceOffCalls.Load()
 	prevOn := onCalls.Load()
@@ -373,7 +373,7 @@ func TestRedfishPowerOnTimeoutRetry(t *testing.T) {
 	}
 
 	// Machine is stuck in PoweringOn state with a stale LastTransitionTime
-	// that exceeds powerActionTimeout — this reproduces the deadlock from
+	// that exceeds powerActionTimeout - this reproduces the deadlock from
 	// bug.yaml where the On command was lost and never retried.
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-stuck", Namespace: "default"},
@@ -1486,7 +1486,7 @@ func TestBootOrderConfigUnsupportedDuringPOST(t *testing.T) {
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "node-boot-post", Namespace: "default"}}
 
 	// First reconcile: system is POSTing (PoweringOn), boot order PATCH
-	// returns 404. Should NOT set the unsupported condition — just requeue.
+	// returns 404. Should NOT set the unsupported condition - just requeue.
 	result, err := reconciler.Reconcile(ctx, req)
 	if err != nil {
 		t.Fatalf("reconcile 1: %v", err)
@@ -1506,7 +1506,7 @@ func TestBootOrderConfigUnsupportedDuringPOST(t *testing.T) {
 		t.Fatalf("expected BootOrderConfigSupported condition NOT to be set during POST, got %+v", bootCond)
 	}
 
-	// Simulate POST completing — system is now On.
+	// Simulate POST completing - system is now On.
 	powerState.Store("On")
 
 	// Second reconcile: system is On, boot order PATCH still returns 404.
@@ -1629,7 +1629,7 @@ func TestSessionExpiryRetry(t *testing.T) {
 	)
 
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Session creation — assigns a unique token per session.
+		// Session creation - assigns a unique token per session.
 		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/SessionService/Sessions") {
 			var body struct {
 				UserName string `json:"UserName"`

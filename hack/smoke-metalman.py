@@ -97,7 +97,7 @@ def _forward_lines(stream: Any, log_file: Any) -> None:
 
 def spawn(args: list[str], log_path: Path | str) -> subprocess.Popen[Any]:
     """Start a background process, teeing its output to *log_path* and stderr."""
-    log_file = open(log_path, "w")  # noqa: SIM115 — intentionally long-lived
+    log_file = open(log_path, "w")  # noqa: SIM115 - intentionally long-lived
     proc = subprocess.Popen(
         args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         start_new_session=True,
@@ -147,7 +147,7 @@ def forward_console(sock_path: Path) -> None:
         finally:
             conn.close()
 
-        # Socket closed — VM probably rebooted.  Retry.
+        # Socket closed - VM probably rebooted.  Retry.
         time.sleep(1)
 
 
