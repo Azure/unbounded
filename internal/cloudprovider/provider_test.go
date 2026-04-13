@@ -121,3 +121,110 @@ func TestCommonDefaultLabels(t *testing.T) {
 
 	require.Empty(t, labels)
 }
+
+func TestIsKubeletAllowedLabel(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		key     string
+		allowed bool
+	}{
+		// Labels without a domain are always allowed.
+		{name: "no-domain", key: "my-label", allowed: true},
+
+		// Labels with non-kubernetes.io domains are always allowed.
+		{name: "custom-domain", key: "example.com/label", allowed: true},
+		{name: "azure-domain", key: "kubernetes.azure.com/managed", allowed: true},
+
+		// Allowed kubernetes.io prefixes.
+		{name: "kubelet-prefix", key: "kubelet.kubernetes.io/os", allowed: true},
+		{name: "node-prefix", key: "node.kubernetes.io/instance-type", allowed: true},
+
+		// Allowed exact labels.
+		{name: "kubernetes-io-arch", key: "kubernetes.io/arch", allowed: true},
+		{name: "kubernetes-io-hostname", key: "kubernetes.io/hostname", allowed: true},
+		{name: "kubernetes-io-os", key: "kubernetes.io/os", allowed: true},
+		{name: "topology-region", key: "topology.kubernetes.io/region", allowed: true},
+		{name: "topology-zone", key: "topology.kubernetes.io/zone", allowed: true},
+		{name: "beta-arch", key: "beta.kubernetes.io/arch", allowed: true},
+		{name: "beta-os", key: "beta.kubernetes.io/os", allowed: true},
+		{name: "beta-instance-type", key: "beta.kubernetes.io/instance-type", allowed: true},
+		{name: "failure-domain-region", key: "failure-domain.beta.kubernetes.io/region", allowed: true},
+		{name: "failure-domain-zone", key: "failure-domain.beta.kubernetes.io/zone", allowed: true},
+
+		// Restricted kubernetes.io labels.
+		{name: "cloud-provider-exclude", key: ExcludeFromCloudProviderLabel, allowed: false},
+		{name: "arbitrary-kubernetes-io", key: "foo.kubernetes.io/bar", allowed: false},
+		{name: "arbitrary-k8s-io", key: "foo.k8s.io/bar", allowed: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			require.Equal(t, tt.allowed, IsKubeletAllowedLabel(tt.key))
+		})
+	}
+}
+
+func TestPartitionNodeLabels(t *testing.T) {
+	t.Parallel()
+
+	input := map[string]string{
+		"my-custom-label":                "value1",
+		"kubernetes.azure.com/managed":   "false",
+		"kubernetes.io/hostname":         "my-node",
+		ExcludeFromCloudProviderLabel:    "true",
+		"node.kubernetes.io/custom":      "value2",
+		"restricted.kubernetes.io/label": "value3",
+	}
+
+	kubeletLabels, controllerLabels := PartitionNodeLabels(input)
+
+	// Kubelet-allowed labels.
+	require.Equal(t, "value1", kubeletLabels["my-custom-label"])
+	require.Equal(t, "false", kubeletLabels["kubernetes.azure.com/managed"])
+	require.Equal(t, "my-node", kubeletLabels["kubernetes.io/hostname"])
+	require.Equal(t, "value2", kubeletLabels["node.kubernetes.io/custom"])
+	require.Len(t, kubeletLabels, 4)
+
+	// Controller-managed labels.
+	require.Equal(t, "true", controllerLabels[ExcludeFromCloudProviderLabel])
+	require.Equal(t, "value3", controllerLabels["restricted.kubernetes.io/label"])
+	require.Len(t, controllerLabels, 2)
+}
+
+func TestPartitionNodeLabels_Empty(t *testing.T) {
+	t.Parallel()
+
+	kubeletLabels, controllerLabels := PartitionNodeLabels(map[string]string{})
+	require.Empty(t, kubeletLabels)
+	require.Empty(t, controllerLabels)
+}
+
+func TestPartitionNodeLabels_AllAllowed(t *testing.T) {
+	t.Parallel()
+
+	input := map[string]string{
+		"custom-label":              "v1",
+		"kubernetes.io/hostname":    "node1",
+		"kubernetes.azure.com/mode": "user",
+	}
+
+	kubeletLabels, controllerLabels := PartitionNodeLabels(input)
+	require.Len(t, kubeletLabels, 3)
+	require.Empty(t, controllerLabels)
+}
+
+func TestPartitionNodeLabels_AllRestricted(t *testing.T) {
+	t.Parallel()
+
+	input := map[string]string{
+		ExcludeFromCloudProviderLabel:    "true",
+		"restricted.kubernetes.io/other": "val",
+	}
+
+	kubeletLabels, controllerLabels := PartitionNodeLabels(input)
+	require.Empty(t, kubeletLabels)
+	require.Len(t, controllerLabels, 2)
+}
