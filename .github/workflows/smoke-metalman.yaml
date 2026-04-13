@@ -12,6 +12,7 @@ on:
       - hack/smoke-metalman.py
       - hack/kind-smoke-config.yaml
       - images/host-ubuntu2404/**
+      - images/agent-ubuntu2404/**
       - go.mod
       - go.sum
       - .github/workflows/smoke-metalman.yaml
@@ -25,6 +26,7 @@ on:
       - hack/smoke-metalman.py
       - hack/kind-smoke-config.yaml
       - images/host-ubuntu2404/**
+      - images/agent-ubuntu2404/**
       - go.mod
       - go.sum
       - .github/workflows/smoke-metalman.yaml
@@ -43,11 +45,12 @@ jobs:
           # GitHub-hosted runners have ~14 GB free; the smoke test needs
           # much more because it builds two Docker images (one containing a
           # full Ubuntu cloud image) and creates a 20 GB qcow2 VM disk that
-          # grows dynamically.  Remove pre-installed toolchains and images
-          # that this workflow does not use.
+          # grows dynamically.  Remove the largest pre-installed toolchains
+          # in parallel and prune unused Docker images.
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet \
-                      /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL
-          sudo docker image prune -af || true
+                      /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL &
+          sudo docker image prune -af &
+          wait
           df -h /
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -77,6 +80,12 @@ jobs:
       - name: Install sushy-tools
         run: sudo pip3 install --break-system-packages --ignore-installed sushy-tools
 
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
+        with:
+          driver-opts: network=host
+
       - name: Create kind cluster
         uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
         with:
@@ -88,7 +97,18 @@ jobs:
           config: hack/kind-smoke-config.yaml
 
       - name: Run smoke test
+        env:
+          ACTIONS_CACHE_URL: ${{ env.ACTIONS_CACHE_URL }}
+          ACTIONS_RUNTIME_TOKEN: ${{ env.ACTIONS_RUNTIME_TOKEN }}
+          BUILDX_BUILDER: ${{ steps.buildx.outputs.name }}
         run: |
           sudo mkdir -p /root/.kube
           sudo cp "${KUBECONFIG:-$HOME/.kube/config}" /root/.kube/config
-          sudo -E env "PATH=$PATH" python3 hack/smoke-metalman.py
+          # Share the buildx builder and GHA cache credentials with the
+          # smoke test so it can use cached Docker layers.
+          sudo -E env "PATH=$PATH" \
+            "ACTIONS_CACHE_URL=${ACTIONS_CACHE_URL}" \
+            "ACTIONS_RUNTIME_TOKEN=${ACTIONS_RUNTIME_TOKEN}" \
+            "BUILDX_CONFIG=${HOME}/.docker/buildx" \
+            "BUILDX_BUILDER=${BUILDX_BUILDER}" \
+            python3 hack/smoke-metalman.py

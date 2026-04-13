@@ -623,14 +623,28 @@ def main() -> None:
         die("Local OCI registry did not become ready")
 
     log("Building host-ubuntu2404 OCI image")
-    run(["docker", "build", "-t", IMAGE_NAME,
+    docker_build_cmd = ["docker", "buildx", "build", "--load"]
+    # Use GitHub Actions cache when running in CI (env vars set by
+    # docker/setup-buildx-action in the workflow).
+    if os.environ.get("ACTIONS_CACHE_URL"):
+        docker_build_cmd += [
+            "--cache-from", "type=gha,scope=host-ubuntu2404",
+            "--cache-to", "type=gha,mode=max,scope=host-ubuntu2404",
+        ]
+    run([*docker_build_cmd, "-t", IMAGE_NAME,
          "-f", str(IMAGE_DIR / "Containerfile"), str(REPO_ROOT)])
 
     log("Pushing host-ubuntu2404 OCI image to local registry")
     run(["docker", "push", IMAGE_NAME])
 
     log("Building agent-ubuntu2404 OCI image")
-    run(["docker", "build", "-t", AGENT_IMAGE_NAME,
+    agent_build_cmd = ["docker", "buildx", "build", "--load"]
+    if os.environ.get("ACTIONS_CACHE_URL"):
+        agent_build_cmd += [
+            "--cache-from", "type=gha,scope=agent-ubuntu2404",
+            "--cache-to", "type=gha,mode=max,scope=agent-ubuntu2404",
+        ]
+    run([*agent_build_cmd, "-t", AGENT_IMAGE_NAME,
          "-f", str(AGENT_IMAGE_DIR / "Containerfile"), str(AGENT_IMAGE_DIR)])
 
     log("Pushing agent-ubuntu2404 OCI image to local registry")
