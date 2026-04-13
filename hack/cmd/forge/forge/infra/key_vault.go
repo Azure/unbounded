@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/keyvault/armkeyvault"
 
 	"github.com/Azure/unbounded-kube/hack/cmd/forge/forge/azsdk"
@@ -69,6 +70,20 @@ func (m *KeyVaultManager) CreateOrUpdate(ctx context.Context, rgName string, des
 		Properties: desired.Properties,
 	}
 
+	// Check if a soft-deleted vault with this name exists. If so, we need to
+	// recover it rather than create a new one, otherwise Azure returns a 409
+	// Conflict because it won't implicitly overwrite a soft-deleted vault.
+	deleted, err := m.GetDeleted(ctx, *desired.Name, *desired.Location)
+	if err != nil {
+		return nil, fmt.Errorf("KeyVaultManager.CreateOrUpdate: check for soft-deleted vault: %w", err)
+	}
+
+	if deleted != nil {
+		l.Info("Found soft-deleted key vault, recovering")
+
+		params.Properties.CreateMode = to.Ptr(armkeyvault.CreateModeRecover)
+	}
+
 	p, err := m.Client.BeginCreateOrUpdate(ctx, rgName, *desired.Name, params, nil)
 	if err != nil {
 		return nil, fmt.Errorf("KeyVaultManager.CreateOrUpdate: update key vault: %w", err)
@@ -89,6 +104,19 @@ func (m *KeyVaultManager) Get(ctx context.Context, rgName, name string) (*armkey
 	}
 
 	return &r.Vault, nil
+}
+
+func (m *KeyVaultManager) GetDeleted(ctx context.Context, name, location string) (*armkeyvault.DeletedVault, error) {
+	r, err := m.Client.GetDeleted(ctx, name, location, nil)
+	if err != nil {
+		if azsdk.IsNotFoundError(err) {
+			return nil, nil
+		}
+
+		return nil, fmt.Errorf("KeyVaultManager.GetDeleted: %w", err)
+	}
+
+	return &r.DeletedVault, nil
 }
 
 func (m *KeyVaultManager) Delete(ctx context.Context, rgName, name string) error {
