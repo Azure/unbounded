@@ -326,22 +326,16 @@ def apiserver_url() -> str:
     url = result.stdout.strip()
 
     # When running against a kind cluster the kubeconfig points at
-    # 127.0.0.1:<nodeport> which is unreachable from the VM.  Detect this
-    # and rewrite to the kind container's internal IP on port 6443.
+    # 127.0.0.1:<nodeport> which is unreachable from the VM.  Rewrite to
+    # KIND_SMOKE_IP which is the kind container's address on virbr-smoke,
+    # the same L2 network the VM is on.  The Docker bridge IP
+    # (172.18.0.x) is NOT routable from the VM because iptables isolation
+    # rules block forwarding between bridges.
     from urllib.parse import urlparse
     parsed = urlparse(url)
     if parsed.hostname in ("127.0.0.1", "localhost", "::1"):
-        try:
-            ip = run(
-                ["docker", "inspect", "kind-control-plane",
-                 "--format", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}"],
-                capture_output=True, text=True,
-            ).stdout.strip()
-            if ip:
-                url = f"{parsed.scheme}://{ip}:6443"
-                log(f"  Rewrote apiserver URL to {url} (kind container IP)")
-        except subprocess.CalledProcessError:
-            pass
+        url = f"{parsed.scheme}://{KIND_SMOKE_IP}:6443"
+        log(f"  Rewrote apiserver URL to {url} (kind container on virbr-smoke)")
 
     return url
 
@@ -504,14 +498,15 @@ def main() -> None:
 
     # Kindnet's CONTROL_PLANE_ENDPOINT defaults to "kind-control-plane:6443"
     # which is unresolvable from the bare-metal VM (it's not in Docker's DNS).
-    # Patch it to use the kind container's Docker IP which the VM can reach
-    # through its default gateway.
+    # Patch it to use KIND_SMOKE_IP. The API server's TLS cert SANs (set in
+    # kind-smoke-config.yaml) only cover this IP, 127.0.0.1, and localhost.
+    # Using the Docker bridge IP (kind_ip) would cause TLS verification failures.
     log("Patching kindnet DaemonSet for VM-reachable control plane endpoint")
     patch = json.dumps({
         "spec": {"template": {"spec": {"containers": [{
             "name": "kindnet-cni",
             "env": [
-                {"name": "CONTROL_PLANE_ENDPOINT", "value": f"{kind_ip}:6443"},
+                {"name": "CONTROL_PLANE_ENDPOINT", "value": f"{KIND_SMOKE_IP}:6443"},
             ],
         }]}}}
     })

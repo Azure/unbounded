@@ -10,6 +10,7 @@ on:
       - internal/metalman/**
       - deploy/machina/**
       - hack/smoke-metalman.py
+      - hack/kind-smoke-config.yaml
       - images/host-ubuntu2404/**
       - go.mod
       - go.sum
@@ -22,6 +23,7 @@ on:
       - api/v1alpha3/**
       - deploy/machina/**
       - hack/smoke-metalman.py
+      - hack/kind-smoke-config.yaml
       - images/host-ubuntu2404/**
       - go.mod
       - go.sum
@@ -79,6 +81,11 @@ jobs:
         uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
         with:
           cluster_name: kind
+          # The smoke test assigns 192.168.200.2 (KIND_SMOKE_IP) to the kind
+          # container on virbr-smoke and rewrites the apiserver URL to that IP.
+          # Include it as an extra SAN so the kubelet in the VM can verify the
+          # API server TLS certificate.
+          config: hack/kind-smoke-config.yaml
 
       - name: Run smoke test
         run: |
