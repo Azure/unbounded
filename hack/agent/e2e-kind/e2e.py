@@ -46,7 +46,7 @@ VM_GATEWAY = f"{VM_SUBNET}.1"
 VM_DIR = Path(os.environ.get("VM_DIR", str(REPO_ROOT / ".vm-e2e")))
 
 KIND_CLUSTER_NAME = os.environ.get("KIND_CLUSTER_NAME", "kind")
-AGENT_MACHINE_NAME = os.environ.get("AGENT_MACHINE_NAME", "kube1")
+AGENT_MACHINE_NAME = os.environ.get("AGENT_MACHINE_NAME", "agent-e2e")
 AGENT_DEBUG = os.environ.get("AGENT_DEBUG", "")
 
 BRIDGE_NAME = "virbr-e2e"

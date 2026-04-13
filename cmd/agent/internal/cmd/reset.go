@@ -4,10 +4,8 @@
 package cmd
 
 import (
-	"fmt"
 	"os"
 	"os/signal"
-	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -22,19 +20,14 @@ import (
 const defaultConfigPath = "/etc/unbounded-agent/config.json"
 
 func newCmdReset(cmdCtx *CommandContext) *cobra.Command {
-	var machineName string
-
 	cmd := &cobra.Command{
 		Use:   "reset",
 		Short: "Reset the host by removing the agent and all associated resources",
-		Long: `Fully reverse the bootstrap process: stop and remove the nspawn machine,
+		Long: `Fully reverse the bootstrap process: stop and remove the nspawn machines,
 clean up network interfaces, remove configuration files, and restore the host
 to its original state. This is the inverse of 'unbounded-agent start'.
 
-The machine name is resolved in this order:
-  1. --machine-name flag
-  2. Agent config file (UNBOUNDED_AGENT_CONFIG_FILE env var)
-  3. Default config path (/etc/unbounded-agent/config.json)`,
+Both possible nspawn machine names (kube1 and kube2) are stopped and removed.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx, cancel := signal.NotifyContext(cmd.Context(), os.Interrupt)
 			defer cancel()
@@ -46,17 +39,14 @@ The machine name is resolved in this order:
 				"commit", version.GitCommit,
 			)
 
-			name, err := resolveMachineName(machineName)
-			if err != nil {
-				return err
-			}
-
 			log := cmdCtx.Logger
-			log.Info("resetting host", "machine", name)
 
 			return phases.Serial(log,
-				// Step 1: Stop the nspawn machine.
-				reset.StopMachine(log, name),
+				// Step 1: Stop both nspawn machines.
+				phases.Parallel(log,
+					reset.StopMachine(log, goalstates.NSpawnMachineKube1),
+					reset.StopMachine(log, goalstates.NSpawnMachineKube2),
+				),
 
 				// Step 2-3: Remove network interfaces and WireGuard keys.
 				phases.Parallel(log,
@@ -64,11 +54,17 @@ The machine name is resolved in this order:
 					reset.RemoveWireGuardKeys(log),
 				),
 
-				// Step 4: Remove nspawn configuration files.
-				reset.RemoveNSpawnConfig(log, name),
+				// Step 4: Remove nspawn configuration files for both machines.
+				phases.Parallel(log,
+					reset.RemoveNSpawnConfig(log, goalstates.NSpawnMachineKube1),
+					reset.RemoveNSpawnConfig(log, goalstates.NSpawnMachineKube2),
+				),
 
-				// Step 5: Remove the machine rootfs.
-				reset.RemoveMachine(log, name),
+				// Step 5: Remove both machine rootfs directories.
+				phases.Parallel(log,
+					reset.RemoveMachine(log, goalstates.NSpawnMachineKube1),
+					reset.RemoveMachine(log, goalstates.NSpawnMachineKube2),
+				),
 
 				// Step 6: Clean up policy routing rules.
 				reset.CleanupRoutes(log),
@@ -82,36 +78,5 @@ The machine name is resolved in this order:
 		},
 	}
 
-	cmd.Flags().StringVar(&machineName, "machine-name", "", "Name of the machine to reset (overrides config file)")
-
 	return cmd
-}
-
-// resolveMachineName determines the machine name from the flag, the agent
-// config file, or a well-known default path. When no source provides a name,
-// it falls back to the default nspawn machine name (kube1).
-func resolveMachineName(flagValue string) (string, error) {
-	if flagValue != "" {
-		return flagValue, nil
-	}
-
-	// Try config file from environment variable.
-	if path := strings.TrimSpace(os.Getenv(configFileEnv)); path != "" {
-		cfg, err := loadConfigFromFile(path)
-		if err != nil {
-			return "", fmt.Errorf("reading config for machine name: %w", err)
-		}
-
-		if cfg.MachineName != "" {
-			return cfg.MachineName, nil
-		}
-	}
-
-	// Try well-known config path.
-	if cfg, err := loadConfigFromFile(defaultConfigPath); err == nil && cfg.MachineName != "" {
-		return cfg.MachineName, nil
-	}
-
-	// Fall back to the default nspawn machine name.
-	return goalstates.NSpawnMachineKube1, nil
 }
