@@ -1,0 +1,23 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+#
+# Kind cluster configuration for the smoke-metalman test.
+# The smoke test assigns 192.168.200.2 (KIND_SMOKE_IP) to the kind container
+# on virbr-smoke and rewrites the apiserver URL to that IP.  Include it as an
+# extra certSAN so the kubelet inside the VM can verify the API server TLS
+# certificate when connecting via that address.  127.0.0.1 and localhost must
+# also be listed because kubeadm's certSANs list replaces (not appends to)
+# the default SANs, and the host-side kubeconfig uses 127.0.0.1.
+
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+- role: control-plane
+  kubeadmConfigPatches:
+  - |
+    kind: ClusterConfiguration
+    apiServer:
+      certSANs:
+      - "192.168.200.2"
+      - "127.0.0.1"
+      - "localhost"

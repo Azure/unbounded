@@ -24,7 +24,7 @@ FROM docker.io/library/ubuntu:24.04 AS build
 ARG TARGETARCH
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        cpio curl ca-certificates qemu-utils libguestfs-tools linux-image-generic \
+        cpio curl ca-certificates qemu-utils libguestfs-tools linux-image-generic pigz \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Download netboot artifacts ──────────────────────────────────────
@@ -33,17 +33,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 #   arm64: tarball at cdimage.ubuntu.com (individual URLs are unavailable)
 # File names follow UEFI convention: shimx64/grubx64 (amd64), shimaa64/grubaa64 (arm64).
 # metalman looks up the boot filename from metadata.yaml (dhcpBootImageName).
+#
+# --connect-timeout and --retry flags prevent CI hangs when upstream mirrors
+# stall (observed 112s+ stalls on releases.ubuntu.com).
 RUN mkdir -p /artifacts && \
     KVER=$(ls /lib/modules | head -1) && \
     cp "/boot/vmlinuz-${KVER}" /artifacts/vmlinuz && \
     if [ "${TARGETARCH}" = "amd64" ]; then \
         NETBOOT_BASE="https://releases.ubuntu.com/24.04.2/netboot/amd64"; \
-        curl -fSL -o /artifacts/shimx64.efi  "${NETBOOT_BASE}/bootx64.efi" && \
-        curl -fSL -o /artifacts/grubx64.efi  "${NETBOOT_BASE}/grubx64.efi" && \
-        curl -fSL -o /artifacts/initrd       "${NETBOOT_BASE}/initrd"; \
+        curl -fSL --connect-timeout 10 --retry 3 --retry-delay 2 \
+            -o /artifacts/shimx64.efi  "${NETBOOT_BASE}/bootx64.efi" && \
+        curl -fSL --connect-timeout 10 --retry 3 --retry-delay 2 \
+            -o /artifacts/grubx64.efi  "${NETBOOT_BASE}/grubx64.efi" && \
+        curl -fSL --connect-timeout 10 --retry 3 --retry-delay 2 \
+            -o /artifacts/initrd       "${NETBOOT_BASE}/initrd"; \
     elif [ "${TARGETARCH}" = "arm64" ]; then \
         NETBOOT_URL="https://cdimage.ubuntu.com/releases/noble/release/ubuntu-24.04.4-netboot-arm64.tar.gz"; \
-        curl -fSL -o /tmp/netboot.tar.gz "${NETBOOT_URL}" && \
+        curl -fSL --connect-timeout 10 --retry 3 --retry-delay 2 \
+            -o /tmp/netboot.tar.gz "${NETBOOT_URL}" && \
         tar -xzf /tmp/netboot.tar.gz -C /tmp && \
         cp /tmp/arm64/bootaa64.efi   /artifacts/shimaa64.efi && \
         cp /tmp/arm64/grubaa64.efi   /artifacts/grubaa64.efi && \
@@ -136,14 +143,15 @@ ARG UBUNTU_CLOUDIMG_URL=https://cloud-images.ubuntu.com/releases/noble/release/u
 # (below) so metalman can serve it to other provisioning paths.
 COPY --from=gobuilder /unbounded-agent /tmp/unbounded-agent
 
-RUN curl -fSL -o /tmp/cloudimg.qcow2 "${UBUNTU_CLOUDIMG_URL}" && \
+RUN curl -fSL --connect-timeout 10 --retry 3 --retry-delay 2 \
+        -o /tmp/cloudimg.qcow2 "${UBUNTU_CLOUDIMG_URL}" && \
     qemu-img convert -f qcow2 -O raw /tmp/cloudimg.qcow2 /tmp/disk.img && \
     rm /tmp/cloudimg.qcow2 && \
     LIBGUESTFS_BACKEND=direct virt-customize -a /tmp/disk.img \
         --mkdir /usr/local/bin \
         --copy-in /tmp/unbounded-agent:/usr/local/bin \
         --chmod 0755:/usr/local/bin/unbounded-agent && \
-    gzip -1 /tmp/disk.img && \
+    pigz -1 /tmp/disk.img && \
     mv /tmp/disk.img.gz /disk/disk.img.gz
 
 # ── Agent binary built from source ──────────────────────────────────

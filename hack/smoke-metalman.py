@@ -55,6 +55,9 @@ BINARY = REPO_ROOT / "bin" / "metalman"
 KUBECTL_UNBOUNDED = REPO_ROOT / "bin" / "kubectl-unbounded"
 SERIAL_SOCK = TMPDIR / "console.sock"
 QGA_SOCK = TMPDIR / "qga.sock"
+# The nspawn machine name used by the agent (must match the constant in
+# cmd/agent/internal/goalstates/constants.go - NSpawnMachineKube1).
+NSPAWN_MACHINE = "kube1"
 
 KUBECTL = "kubectl"
 VIRSH = ["virsh", "--connect", "qemu:///system"]
@@ -217,17 +220,17 @@ def collect_debug_logs() -> None:
         ("systemctl status", "systemctl --no-pager status"),
         ("unbounded-agent journal", "journalctl --no-pager -n 200 -u cloud-final.service"),
         ("machinectl list", "machinectl list --no-pager"),
-        ("nspawn machine status", f"machinectl status {NODE_NAME} --no-pager"),
+        ("nspawn machine status", f"machinectl status {NSPAWN_MACHINE} --no-pager"),
         ("kubelet journal (nspawn)", (
-            f"systemd-run --pipe --wait --machine={NODE_NAME} "
+            f"systemd-run --pipe --wait --machine={NSPAWN_MACHINE} "
             "journalctl --no-pager -n 200 -u kubelet.service"
         )),
         ("containerd journal (nspawn)", (
-            f"systemd-run --pipe --wait --machine={NODE_NAME} "
+            f"systemd-run --pipe --wait --machine={NSPAWN_MACHINE} "
             "journalctl --no-pager -n 100 -u containerd.service"
         )),
         ("kubelet service status (nspawn)", (
-            f"systemd-run --pipe --wait --machine={NODE_NAME} "
+            f"systemd-run --pipe --wait --machine={NSPAWN_MACHINE} "
             "systemctl --no-pager status kubelet.service"
         )),
     ]
@@ -243,6 +246,30 @@ def collect_debug_logs() -> None:
                 sys.stderr.flush()
         except (RuntimeError, TimeoutError, subprocess.TimeoutExpired, OSError) as e:
             log(f"  (failed to collect {label}: {e})")
+
+    # Kubernetes-side diagnostics (run from the host via kubectl).
+    k8s_commands = [
+        ("kubectl describe node", [KUBECTL, "describe", "node", NODE_NAME]),
+        ("kubectl get pods -A", [KUBECTL, "get", "pods", "-A", "-o", "wide"]),
+        ("kubectl get events", [
+            KUBECTL, "get", "events", "-A", "--sort-by=.lastTimestamp",
+        ]),
+    ]
+    for label, cmd in k8s_commands:
+        log(f"  --- {label} ---")
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=15,
+            )
+            if result.stdout:
+                sys.stderr.write(result.stdout)
+                sys.stderr.flush()
+            if result.stderr:
+                sys.stderr.write(result.stderr)
+                sys.stderr.flush()
+        except Exception as e:
+            log(f"  (failed to collect {label}: {e})")
+
     log("  --- end debug logs ---")
 
 
@@ -326,22 +353,16 @@ def apiserver_url() -> str:
     url = result.stdout.strip()
 
     # When running against a kind cluster the kubeconfig points at
-    # 127.0.0.1:<nodeport> which is unreachable from the VM.  Detect this
-    # and rewrite to the kind container's internal IP on port 6443.
+    # 127.0.0.1:<nodeport> which is unreachable from the VM.  Rewrite to
+    # KIND_SMOKE_IP which is the kind container's address on virbr-smoke,
+    # the same L2 network the VM is on.  The Docker bridge IP
+    # (172.18.0.x) is NOT routable from the VM because iptables isolation
+    # rules block forwarding between bridges.
     from urllib.parse import urlparse
     parsed = urlparse(url)
     if parsed.hostname in ("127.0.0.1", "localhost", "::1"):
-        try:
-            ip = run(
-                ["docker", "inspect", "kind-control-plane",
-                 "--format", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}"],
-                capture_output=True, text=True,
-            ).stdout.strip()
-            if ip:
-                url = f"{parsed.scheme}://{ip}:6443"
-                log(f"  Rewrote apiserver URL to {url} (kind container IP)")
-        except subprocess.CalledProcessError:
-            pass
+        url = f"{parsed.scheme}://{KIND_SMOKE_IP}:6443"
+        log(f"  Rewrote apiserver URL to {url} (kind container on virbr-smoke)")
 
     return url
 
@@ -504,14 +525,15 @@ def main() -> None:
 
     # Kindnet's CONTROL_PLANE_ENDPOINT defaults to "kind-control-plane:6443"
     # which is unresolvable from the bare-metal VM (it's not in Docker's DNS).
-    # Patch it to use the kind container's Docker IP which the VM can reach
-    # through its default gateway.
+    # Patch it to use KIND_SMOKE_IP. The API server's TLS cert SANs (set in
+    # kind-smoke-config.yaml) only cover this IP, 127.0.0.1, and localhost.
+    # Using the Docker bridge IP (kind_ip) would cause TLS verification failures.
     log("Patching kindnet DaemonSet for VM-reachable control plane endpoint")
     patch = json.dumps({
         "spec": {"template": {"spec": {"containers": [{
             "name": "kindnet-cni",
             "env": [
-                {"name": "CONTROL_PLANE_ENDPOINT", "value": f"{kind_ip}:6443"},
+                {"name": "CONTROL_PLANE_ENDPOINT", "value": f"{KIND_SMOKE_IP}:6443"},
             ],
         }]}}}
     })
@@ -601,14 +623,28 @@ def main() -> None:
         die("Local OCI registry did not become ready")
 
     log("Building host-ubuntu2404 OCI image")
-    run(["docker", "build", "-t", IMAGE_NAME,
+    docker_build_cmd = ["docker", "buildx", "build", "--load"]
+    # Use GitHub Actions cache when running in CI (env vars set by
+    # docker/setup-buildx-action in the workflow).
+    if os.environ.get("ACTIONS_CACHE_URL"):
+        docker_build_cmd += [
+            "--cache-from", "type=gha,scope=host-ubuntu2404",
+            "--cache-to", "type=gha,mode=max,scope=host-ubuntu2404",
+        ]
+    run([*docker_build_cmd, "-t", IMAGE_NAME,
          "-f", str(IMAGE_DIR / "Containerfile"), str(REPO_ROOT)])
 
     log("Pushing host-ubuntu2404 OCI image to local registry")
     run(["docker", "push", IMAGE_NAME])
 
     log("Building agent-ubuntu2404 OCI image")
-    run(["docker", "build", "-t", AGENT_IMAGE_NAME,
+    agent_build_cmd = ["docker", "buildx", "build", "--load"]
+    if os.environ.get("ACTIONS_CACHE_URL"):
+        agent_build_cmd += [
+            "--cache-from", "type=gha,scope=agent-ubuntu2404",
+            "--cache-to", "type=gha,mode=max,scope=agent-ubuntu2404",
+        ]
+    run([*agent_build_cmd, "-t", AGENT_IMAGE_NAME,
          "-f", str(AGENT_IMAGE_DIR / "Containerfile"), str(AGENT_IMAGE_DIR)])
 
     log("Pushing agent-ubuntu2404 OCI image to local registry")
