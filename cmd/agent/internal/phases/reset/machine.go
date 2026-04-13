@@ -27,6 +27,10 @@ func StopMachine(log *slog.Logger, machineName string) phases.Task {
 func (t *stopMachine) Name() string { return "stop-machine" }
 
 func (t *stopMachine) Do(ctx context.Context) error {
+	if err := utilexec.RunCmd(ctx, t.log, utilexec.Machinectl(), "disable", t.machineName); err != nil {
+		t.log.Warn("failed to disable machine (may not have been enabled)", "machine", t.machineName, "error", err)
+	}
+
 	if !machineExists(ctx, t.log, t.machineName) {
 		t.log.Info("machine not running, nothing to stop", "machine", t.machineName)
 		return nil

@@ -51,7 +51,7 @@ set -euo pipefail
 #
 # Format: SKU_PATTERN:GPU_NAME:DRIVER_TYPE:DRIVER_VERSION:NEEDS_FABRIC_MANAGER
 #   DRIVER_TYPE is one of: proprietary | open
-#   NEEDS_FABRIC_MANAGER: yes | no — Fabric Manager is required for NVSwitch-
+#   NEEDS_FABRIC_MANAGER: yes | no - Fabric Manager is required for NVSwitch-
 #     based multi-GPU systems (H100, H200, multi-GPU A100 ND-series).
 #
 # IMPORTANT: More-specific patterns (newer GPUs) must come before generic
@@ -75,7 +75,7 @@ SKU_MAP=(
     # --- Older GPUs -> proprietary nvidia-dkms ---
     # NC v3  (V100)
     "Standard_NC.*_v3:V100:proprietary:580:no"
-    # ND v2  (V100 8-GPU, NVLink but no NVSwitch — fabric manager not required)
+    # ND v2  (V100 8-GPU, NVLink but no NVSwitch - fabric manager not required)
     "Standard_ND40rs_v2:V100:proprietary:580:no"
     # NC T4 v3  (T4)
     "Standard_NC.*T4_v3:T4:proprietary:580:no"
@@ -259,10 +259,10 @@ read -r GPU_NAME DRIVER_TYPE DRIVER_VERSION NEEDS_FABRIC <<< "$(resolve_sku "${V
 log "Detected GPU: ${GPU_NAME}, driver type: ${DRIVER_TYPE}, driver version: ${DRIVER_VERSION}, fabric manager: ${NEEDS_FABRIC}"
 
 if is_secure_boot; then
-    log "Secure Boot is enabled — using pre-signed kernel module packages."
+    log "Secure Boot is enabled - using pre-signed kernel module packages."
     install_prebuilt_azure "${GPU_NAME}" "${DRIVER_VERSION}" "${DRIVER_TYPE}"
 else
-    log "Secure Boot is not enabled — using DKMS packages."
+    log "Secure Boot is not enabled - using DKMS packages."
     case "${DRIVER_TYPE}" in
         proprietary) install_proprietary_dkms "${GPU_NAME}" "${DRIVER_VERSION}" ;;
         open)        install_open_dkms "${GPU_NAME}" "${DRIVER_VERSION}" ;;

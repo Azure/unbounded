@@ -2,7 +2,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""analyze-bootstrap-log.py — Parse unbounded-agent bootstrap logs and print a
+"""analyze-bootstrap-log.py - Parse unbounded-agent bootstrap logs and print a
 phase duration breakdown.
 
 Usage:

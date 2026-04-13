@@ -104,7 +104,6 @@ kubectl unbounded site init \
 | `--kubeconfig` | Path to kubeconfig file |
 | `--cni-manifests` | Path or URL to CNI manifests (defaults to a known release) |
 | `--machina-manifests` | Path or URL to machina manifests (uses embedded manifests if omitted) |
-| `--cluster-service-cidr` | Service CIDR (derived from kube-dns if omitted) |
 | `--manage-cni-plugin` | Set to `false` when the cluster already has a CNI (default: `true`) |
 
 </details>
