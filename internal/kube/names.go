@@ -9,7 +9,7 @@ import (
 )
 
 // nonK8sNameChars matches any character that is not a lowercase alphanumeric,
-// dash, or dot — i.e. characters not allowed in a Kubernetes object name.
+// dash, or dot - i.e. characters not allowed in a Kubernetes object name.
 var nonK8sNameChars = regexp.MustCompile(`[^a-z0-9\-.]`)
 
 // SanitizeK8sName converts a raw string into a valid Kubernetes object name.

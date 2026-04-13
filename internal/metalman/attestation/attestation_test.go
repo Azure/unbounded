@@ -588,7 +588,7 @@ func TestCreateCredentialWrongKey(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Try to decrypt the seed with the wrong key — RSA-OAEP decrypt should fail.
+	// Try to decrypt the seed with the wrong key - RSA-OAEP decrypt should fail.
 	label := []byte("IDENTITY\x00")
 
 	_, decryptErr := rsa.DecryptOAEP(sha256.New(), rand.Reader, priv2, encSecret, label)

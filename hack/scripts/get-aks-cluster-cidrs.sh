@@ -176,7 +176,7 @@ SERVICE_CIDR="${_cidrs[1]:-}"
 [[ -z "$POD_CIDR" ]]     && die "cluster has no pod CIDR in its network profile (possibly BYO CNI). Pass --cluster-pod-cidr explicitly to kubectl unbounded site init."
 [[ -z "$SERVICE_CIDR" ]] && die "could not determine service CIDR from AKS network profile. Pass --cluster-service-cidr explicitly to kubectl unbounded site init."
 
-# ip4_to_int <a.b.c.d> — print the IPv4 address as a decimal integer.
+# ip4_to_int <a.b.c.d> - print the IPv4 address as a decimal integer.
 ip4_to_int() {
   local IFS=.
   read -r a b c d <<< "$1"

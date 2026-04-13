@@ -36,6 +36,8 @@ unbounded-kube is organized into several directories:
 
 - Do not cross cmd/ package boundaries. For example, `cmd/agent` should not import from `cmd/machina`. If you need to
   share code between these packages, put it in `internal/`.
+- Do not use em-dashes (`—`) in comments, strings, or any source/config files. Use a plain ASCII hyphen (`-`)
+  or rephrase the sentence instead.
 
 ## Testing Standards
 
