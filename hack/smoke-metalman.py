@@ -55,6 +55,9 @@ BINARY = REPO_ROOT / "bin" / "metalman"
 KUBECTL_UNBOUNDED = REPO_ROOT / "bin" / "kubectl-unbounded"
 SERIAL_SOCK = TMPDIR / "console.sock"
 QGA_SOCK = TMPDIR / "qga.sock"
+# The nspawn machine name used by the agent (must match the constant in
+# cmd/agent/internal/goalstates/constants.go - NSpawnMachineKube1).
+NSPAWN_MACHINE = "kube1"
 
 KUBECTL = "kubectl"
 VIRSH = ["virsh", "--connect", "qemu:///system"]
@@ -217,17 +220,17 @@ def collect_debug_logs() -> None:
         ("systemctl status", "systemctl --no-pager status"),
         ("unbounded-agent journal", "journalctl --no-pager -n 200 -u cloud-final.service"),
         ("machinectl list", "machinectl list --no-pager"),
-        ("nspawn machine status", f"machinectl status {NODE_NAME} --no-pager"),
+        ("nspawn machine status", f"machinectl status {NSPAWN_MACHINE} --no-pager"),
         ("kubelet journal (nspawn)", (
-            f"systemd-run --pipe --wait --machine={NODE_NAME} "
+            f"systemd-run --pipe --wait --machine={NSPAWN_MACHINE} "
             "journalctl --no-pager -n 200 -u kubelet.service"
         )),
         ("containerd journal (nspawn)", (
-            f"systemd-run --pipe --wait --machine={NODE_NAME} "
+            f"systemd-run --pipe --wait --machine={NSPAWN_MACHINE} "
             "journalctl --no-pager -n 100 -u containerd.service"
         )),
         ("kubelet service status (nspawn)", (
-            f"systemd-run --pipe --wait --machine={NODE_NAME} "
+            f"systemd-run --pipe --wait --machine={NSPAWN_MACHINE} "
             "systemctl --no-pager status kubelet.service"
         )),
     ]
@@ -243,6 +246,30 @@ def collect_debug_logs() -> None:
                 sys.stderr.flush()
         except (RuntimeError, TimeoutError, subprocess.TimeoutExpired, OSError) as e:
             log(f"  (failed to collect {label}: {e})")
+
+    # Kubernetes-side diagnostics (run from the host via kubectl).
+    k8s_commands = [
+        ("kubectl describe node", [KUBECTL, "describe", "node", NODE_NAME]),
+        ("kubectl get pods -A", [KUBECTL, "get", "pods", "-A", "-o", "wide"]),
+        ("kubectl get events", [
+            KUBECTL, "get", "events", "-A", "--sort-by=.lastTimestamp",
+        ]),
+    ]
+    for label, cmd in k8s_commands:
+        log(f"  --- {label} ---")
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=15,
+            )
+            if result.stdout:
+                sys.stderr.write(result.stdout)
+                sys.stderr.flush()
+            if result.stderr:
+                sys.stderr.write(result.stderr)
+                sys.stderr.flush()
+        except Exception as e:
+            log(f"  (failed to collect {label}: {e})")
+
     log("  --- end debug logs ---")
 
 
