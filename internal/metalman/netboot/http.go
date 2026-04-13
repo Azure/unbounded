@@ -5,6 +5,7 @@ package netboot
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -19,6 +20,16 @@ import (
 
 	v1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
 )
+
+// cloudInitEvent represents a cloud-init webhook reporting event.
+type cloudInitEvent struct {
+	Name        string  `json:"name"`
+	Description string  `json:"description"`
+	EventType   string  `json:"event_type"`
+	Origin      string  `json:"origin"`
+	Timestamp   float64 `json:"timestamp"`
+	Result      string  `json:"result,omitempty"`
+}
 
 type HTTPServer struct {
 	BindAddr string
@@ -78,14 +89,14 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 
 	node, err := h.LookupNodeByIP(r.Context(), ip)
 	if err != nil {
-		log.Error("no node for source IP", "err", err)
+		log.Warn("no node for source IP", "err", err)
 		http.NotFound(w, r)
 
 		return
 	}
 
 	if node.Spec.PXE == nil {
-		log.Error("node has no PXE config", "node", node.Name)
+		log.Warn("node has no PXE config", "node", node.Name)
 		http.NotFound(w, r)
 
 		return
@@ -101,7 +112,7 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		log.Error("resolving file", "node", node.Name, "err", err)
+		log.Warn("resolving file", "node", node.Name, "err", err)
 		http.NotFound(w, r)
 
 		return
@@ -124,13 +135,31 @@ func (h *HTTPServer) handleCloudInitLog(w http.ResponseWriter, r *http.Request) 
 
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
-		slog.Error("reading cloudinit log body", "ip", ip, "err", err)
+		slog.Error("reading cloud-init log body", "ip", ip, "err", err)
 		http.Error(w, "bad request", http.StatusBadRequest)
 
 		return
 	}
 
-	slog.Info("cloudinit", "ip", ip, "event", string(body))
+	var ev cloudInitEvent
+	if err := json.Unmarshal(body, &ev); err != nil {
+		slog.Warn("cloud-init log: unparseable event", "ip", ip, "body", string(body))
+		w.WriteHeader(http.StatusOK)
+
+		return
+	}
+
+	log := slog.With("handler", "cloudinit-log", "ip", ip, "stage", ev.Name)
+
+	switch ev.EventType {
+	case "start":
+		log.Info("cloud-init stage started", "description", ev.Description)
+	case "finish":
+		log.Info("cloud-init stage finished", "description", ev.Description, "result", ev.Result)
+	default:
+		log.Info("cloud-init event", "type", ev.EventType, "description", ev.Description)
+	}
+
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -140,7 +169,7 @@ func (h *HTTPServer) handleDisablePXE(w http.ResponseWriter, r *http.Request) {
 
 	node, err := h.LookupNodeByIP(r.Context(), ip)
 	if err != nil {
-		log.Error("no node for source IP", "err", err)
+		log.Warn("no node for source IP", "err", err)
 		http.NotFound(w, r)
 
 		return

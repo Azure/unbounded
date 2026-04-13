@@ -12,10 +12,13 @@ import (
 	"path/filepath"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/selection"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
@@ -140,6 +143,67 @@ func InterfaceForIP(ip net.IP) (string, error) {
 	}
 
 	return "", fmt.Errorf("no interface found for IP %s", ip)
+}
+
+// ClusterInfo holds the API server URL and CA certificate discovered from
+// the standard cluster-info ConfigMap in kube-public.
+type ClusterInfo struct {
+	// ApiserverURL is the external API server URL (e.g. "https://10.0.0.1:6443").
+	ApiserverURL string
+	// CACertPEM is the PEM-encoded cluster CA certificate.
+	CACertPEM []byte
+}
+
+// ResolveClusterInfo reads the standard cluster-info ConfigMap from the
+// kube-public namespace and returns both the API server URL and the CA
+// certificate from the embedded kubeconfig. Every conformant cluster
+// publishes this ConfigMap, making it the canonical way to discover the
+// external API server endpoint and trust anchor.
+func ResolveClusterInfo(ctx context.Context, clientset kubernetes.Interface) (*ClusterInfo, error) {
+	cm, err := clientset.CoreV1().ConfigMaps(metav1.NamespacePublic).Get(ctx, "cluster-info", metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("get cluster-info ConfigMap from kube-public: %w", err)
+	}
+
+	kubeconfig, ok := cm.Data["kubeconfig"]
+	if !ok {
+		return nil, fmt.Errorf("kubeconfig key not found in cluster-info ConfigMap")
+	}
+
+	cfg, err := clientcmd.RESTConfigFromKubeConfig([]byte(kubeconfig))
+	if err != nil {
+		return nil, fmt.Errorf("parsing kubeconfig from cluster-info ConfigMap: %w", err)
+	}
+
+	if cfg.Host == "" {
+		return nil, fmt.Errorf("cluster-info kubeconfig has no server URL")
+	}
+
+	if len(cfg.CAData) == 0 {
+		return nil, fmt.Errorf("cluster-info kubeconfig has no CA certificate")
+	}
+
+	return &ClusterInfo{
+		ApiserverURL: cfg.Host,
+		CACertPEM:    cfg.CAData,
+	}, nil
+}
+
+// ResolveApiserverURL reads the standard cluster-info ConfigMap from the
+// kube-public namespace and returns the Kubernetes API server URL contained
+// in the embedded kubeconfig. Every conformant cluster publishes this
+// ConfigMap, making it the canonical way to discover the external API
+// server endpoint.
+//
+// Deprecated: Use ResolveClusterInfo instead, which also returns the CA
+// certificate from the same kubeconfig.
+func ResolveApiserverURL(ctx context.Context, clientset kubernetes.Interface) (string, error) {
+	info, err := ResolveClusterInfo(ctx, clientset)
+	if err != nil {
+		return "", err
+	}
+
+	return info.ApiserverURL, nil
 }
 
 func InterfaceIPv4(name string) (net.IP, error) {

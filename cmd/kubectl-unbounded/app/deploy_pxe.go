@@ -8,6 +8,7 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -51,6 +52,13 @@ func buildPXEDeployment(p deployPXEParams) *acappsv1.DeploymentApplyConfiguratio
 		WithLabels(labels).
 		WithSpec(acappsv1.DeploymentSpec().
 			WithReplicas(1).
+			WithStrategy(acappsv1.DeploymentStrategy().
+				WithType(appsv1.RollingUpdateDeploymentStrategyType).
+				WithRollingUpdate(acappsv1.RollingUpdateDeployment().
+					WithMaxSurge(intstr.FromInt32(1)).
+					WithMaxUnavailable(intstr.FromInt32(1)),
+				),
+			).
 			WithSelector(acmetav1.LabelSelector().
 				WithMatchLabels(labels),
 			).
@@ -81,7 +89,7 @@ func buildPXEDeployment(p deployPXEParams) *acappsv1.DeploymentApplyConfiguratio
 						WithName("metalman").
 						WithImage(p.Image).
 						WithImagePullPolicy(corev1.PullAlways).
-						WithArgs("serve-pxe", "--site="+p.Site).
+						WithArgs("serve-pxe", "--site="+p.Site, "--dhcp-auto-interface").
 						WithPorts(
 							accorev1.ContainerPort().
 								WithContainerPort(8880).

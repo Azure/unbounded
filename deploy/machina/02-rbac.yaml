@@ -61,7 +61,7 @@ rules:
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch", "delete"]
-  # ConfigMaps (kube-root-ca.crt in kube-public for CA cert resolution)
+  # ConfigMaps (kube-root-ca.crt in kube-public for CA cert resolution, cluster-info)
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["get"]

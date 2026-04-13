@@ -1139,27 +1139,28 @@ func TestMachineReconciler_UpdateStatus_PhaseDeterminesRequeue(t *testing.T) {
 func TestFindMachineForNode(t *testing.T) {
 	t.Parallel()
 
-	t.Run("returns request when Node has matching label", func(t *testing.T) {
+	t.Run("returns request when Machine exists with matching name", func(t *testing.T) {
 		t.Parallel()
 
 		s := newTestScheme(t)
 
-		fakeClient := fake.NewClientBuilder().WithScheme(s).Build()
+		machine := newTestMachine("worker-1", "10.0.0.1:22", "user", nil)
+
+		fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(machine).Build()
 		reconciler := &MachineReconciler{Client: fakeClient, Scheme: s}
 
 		node := &corev1.Node{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:   "worker-1",
-				Labels: map[string]string{MachineNodeLabel: "my-machine"},
+				Name: "worker-1",
 			},
 		}
 
 		requests := reconciler.findMachineForNode(context.Background(), node)
 		require.Len(t, requests, 1)
-		require.Equal(t, "my-machine", requests[0].Name)
+		require.Equal(t, "worker-1", requests[0].Name)
 	})
 
-	t.Run("returns nil when Node has no label", func(t *testing.T) {
+	t.Run("returns nil when no Machine matches Node name", func(t *testing.T) {
 		t.Parallel()
 
 		s := newTestScheme(t)
@@ -1245,10 +1246,10 @@ func TestReconcileNodeJoin_Joining_NodeFound(t *testing.T) {
 		Phase: unboundedv1alpha3.MachinePhaseJoining,
 	}
 
+	// Node name matches machine name (convention).
 	node := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:   "worker-1",
-			Labels: map[string]string{MachineNodeLabel: "test-machine"},
+			Name: "test-machine",
 		},
 	}
 
@@ -1295,8 +1296,7 @@ func TestReconcileNodeJoin_Ready_NodeStillExists(t *testing.T) {
 
 	node := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:   "worker-1",
-			Labels: map[string]string{MachineNodeLabel: "test-machine"},
+			Name: "worker-1",
 		},
 	}
 
@@ -1372,10 +1372,10 @@ func TestReconcileNodeJoin_Joining_NodeReappears(t *testing.T) {
 		Phase: unboundedv1alpha3.MachinePhaseJoining,
 	}
 
+	// Node name matches machine name (convention).
 	node := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:   "worker-1",
-			Labels: map[string]string{MachineNodeLabel: "test-machine"},
+			Name: "test-machine",
 		},
 	}
 
