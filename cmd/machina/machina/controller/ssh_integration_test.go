@@ -1137,7 +1137,8 @@ func TestProvisionMachine_ProviderLabelsOverride(t *testing.T) {
 	// Provider label overrides user-specified value.
 	require.Equal(t, "false", agentConfig.Kubelet.Labels["kubernetes.azure.com/managed"])
 
-	// kubernetes.azure.com/cluster label is no longer applied to unbounded-managed nodes.
+	// kubernetes.azure.com/cluster must be absent from unbounded-managed nodes.
+	require.NotContains(t, agentConfig.Kubelet.Labels, "kubernetes.azure.com/cluster")
 
 	// Common labels are always applied.
 	require.Equal(t, "true", agentConfig.Kubelet.Labels[cloudprovider.ExcludeFromCloudProviderLabel])
