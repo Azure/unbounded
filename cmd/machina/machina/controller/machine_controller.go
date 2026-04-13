@@ -8,7 +8,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"maps"
 	"net"
 	"time"
 
@@ -18,7 +17,6 @@ import (
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -28,7 +26,6 @@ import (
 	stderrs "errors"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
-	"github.com/Azure/unbounded-kube/internal/cloudprovider"
 	"github.com/Azure/unbounded-kube/internal/provision"
 )
 
@@ -222,7 +219,6 @@ type MachineReconciler struct {
 // +kubebuilder:rbac:groups=unbounded-kube.io,resources=machines/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=unbounded-kube.io,resources=machines/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;patch
 
 // Reconcile handles Machine reconciliation: reachability checks and provisioning.
 func (r *MachineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -789,62 +785,6 @@ func (r *MachineReconciler) findMachineForNode(ctx context.Context, obj client.O
 	}
 }
 
-// ensureControllerLabels patches a Node to add labels that the kubelet
-// cannot self-apply via --node-labels (e.g. restricted kubernetes.io labels).
-// It computes the full desired label set using the same priority as
-// BuildAgentConfig, partitions them into kubelet-allowed and
-// controller-managed, and merge-patches any missing controller-managed labels.
-func (r *MachineReconciler) ensureControllerLabels(ctx context.Context, machine *unboundedv1alpha3.Machine, node *corev1.Node) error {
-	// Build the full desired label set, same as BuildAgentConfig.
-	labels := map[string]string{}
-	if machine.Spec.Kubernetes != nil {
-		maps.Copy(labels, machine.Spec.Kubernetes.NodeLabels)
-	}
-
-	maps.Copy(labels, cloudprovider.CommonDefaultLabels())
-
-	if r.ClusterInfo != nil && r.ClusterInfo.Provider != nil {
-		maps.Copy(labels, r.ClusterInfo.Provider.DefaultLabels())
-	}
-
-	_, controllerLabels := cloudprovider.PartitionNodeLabels(labels)
-	if len(controllerLabels) == 0 {
-		return nil
-	}
-
-	// Check if all controller-managed labels are already present.
-	allPresent := true
-
-	for k, v := range controllerLabels {
-		if existing, ok := node.Labels[k]; !ok || existing != v {
-			allPresent = false
-			break
-		}
-	}
-
-	if allPresent {
-		return nil
-	}
-
-	// Merge-patch the Node to add the missing labels.
-	patch := map[string]any{
-		"metadata": map[string]any{
-			"labels": controllerLabels,
-		},
-	}
-
-	patchBytes, err := json.Marshal(patch)
-	if err != nil {
-		return fmt.Errorf("marshal label patch: %w", err)
-	}
-
-	logger := log.FromContext(ctx)
-	logger.Info("Patching Node with controller-managed labels",
-		"node", node.Name, "labels", controllerLabels)
-
-	return r.Patch(ctx, node, client.RawPatch(types.MergePatchType, patchBytes))
-}
-
 // reconcileNodeJoin handles the Node lifecycle for a provisioned Machine.
 // It looks for a Node whose name matches the Machine (or the explicit NodeRef)
 // and transitions the Machine between Joining and Ready phases.
@@ -885,16 +825,6 @@ func (r *MachineReconciler) reconcileNodeJoin(ctx context.Context, machine *unbo
 		logger.Info("Node found for Machine, transitioning to Ready",
 			"machine", machine.Name, "node", node.Name)
 
-		// Apply labels that the kubelet cannot self-apply (restricted
-		// kubernetes.io/k8s.io labels). These are built using the same
-		// label priority as BuildAgentConfig.
-		if err := r.ensureControllerLabels(ctx, machine, node); err != nil {
-			logger.Error(err, "Failed to apply controller-managed labels to Node",
-				"machine", machine.Name, "node", node.Name)
-
-			return ctrl.Result{}, err
-		}
-
 		// Update nodeRef in the kubernetes spec if not already set.
 		if machine.Spec.Kubernetes != nil && machine.Spec.Kubernetes.NodeRef == nil {
 			machine.Spec.Kubernetes.NodeRef = &unboundedv1alpha3.LocalObjectReference{Name: node.Name}
@@ -910,18 +840,7 @@ func (r *MachineReconciler) reconcileNodeJoin(ctx context.Context, machine *unbo
 
 	case unboundedv1alpha3.MachinePhaseReady:
 		if len(nodeList.Items) > 0 {
-			// Node still exists - ensure controller-managed labels are
-			// reconciled (e.g. when Machine.Spec labels change while
-			// already Ready). The internal allPresent check avoids
-			// repeated patches when labels are already correct.
-			node := &nodeList.Items[0]
-			if err := r.ensureControllerLabels(ctx, machine, node); err != nil {
-				logger.Error(err, "Failed to reconcile controller-managed labels on Node",
-					"machine", machine.Name, "node", node.Name)
-
-				return ctrl.Result{}, err
-			}
-
+			// Node still exists — stay Ready.
 			return ctrl.Result{RequeueAfter: RequeueAfterReady}, nil
 		}
 

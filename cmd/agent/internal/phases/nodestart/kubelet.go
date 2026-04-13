@@ -16,7 +16,6 @@ import (
 	"github.com/Azure/unbounded-kube/cmd/agent/internal/goalstates"
 	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases"
 	"github.com/Azure/unbounded-kube/cmd/agent/internal/utilio"
-	"github.com/Azure/unbounded-kube/internal/cloudprovider"
 )
 
 type configureKubelet struct {
@@ -119,15 +118,9 @@ func (c *configureKubelet) ensureKubeletServiceUnit() error {
 func (c *configureKubelet) ensureKubeletDropIns() error {
 	spec := c.goalState.Kubelet
 
-	// Filter out labels that the kubelet is not allowed to self-apply via
-	// --node-labels. These are labels in restricted kubernetes.io/k8s.io
-	// namespaces that are not in the kubelet's allowed set. Such labels
-	// must be applied by a controller after the node registers.
-	kubeletLabels, _ := cloudprovider.PartitionNodeLabels(spec.NodeLabels)
-
 	// Format node labels as a comma-separated "key=value" string, sorted for
 	// deterministic output.
-	nodeLabels := formatNodeLabels(kubeletLabels)
+	nodeLabels := formatNodeLabels(spec.NodeLabels)
 
 	// Format taints as a comma-separated "key=value:effect" string, sorted
 	// for deterministic output.

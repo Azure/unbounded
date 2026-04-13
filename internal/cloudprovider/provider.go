@@ -6,7 +6,6 @@ package cloudprovider
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -18,84 +17,6 @@ import (
 // provisioned by unbounded, regardless of the detected cloud provider.
 func CommonDefaultLabels() map[string]string {
 	return map[string]string{}
-}
-
-// kubeletAllowedPrefixes are the kubernetes.io sub-domains that the kubelet
-// is allowed to self-apply via --node-labels.
-var kubeletAllowedPrefixes = []string{
-	"kubelet.kubernetes.io/",
-	"node.kubernetes.io/",
-}
-
-// kubeletAllowedLabels is the exact set of kubernetes.io / k8s.io labels
-// that the kubelet may self-apply (legacy well-known labels).
-var kubeletAllowedLabels = map[string]bool{
-	"beta.kubernetes.io/arch":                  true,
-	"beta.kubernetes.io/instance-type":         true,
-	"beta.kubernetes.io/os":                    true,
-	"failure-domain.beta.kubernetes.io/region": true,
-	"failure-domain.beta.kubernetes.io/zone":   true,
-	"kubernetes.io/arch":                       true,
-	"kubernetes.io/hostname":                   true,
-	"kubernetes.io/os":                         true,
-	"node.kubernetes.io/instance-type":         true,
-	"topology.kubernetes.io/region":            true,
-	"topology.kubernetes.io/zone":              true,
-}
-
-// IsKubeletAllowedLabel reports whether the given label key may be passed to
-// the kubelet via --node-labels. Labels outside the kubernetes.io and k8s.io
-// namespaces are always allowed. Labels within those namespaces must be in
-// the kubelet's allowed prefix set or exact allowed set.
-func IsKubeletAllowedLabel(key string) bool {
-	// Split on "/" to find the domain part. Labels without a "/" have no
-	// domain and are always allowed.
-	slash := strings.IndexByte(key, '/')
-	if slash < 0 {
-		return true
-	}
-
-	domain := key[:slash]
-
-	// Labels outside the kubernetes.io/k8s.io namespaces are always allowed.
-	if !strings.HasSuffix(domain, ".kubernetes.io") &&
-		!strings.HasSuffix(domain, ".k8s.io") &&
-		domain != "kubernetes.io" &&
-		domain != "k8s.io" {
-		return true
-	}
-
-	// Check the exact allowed set.
-	if kubeletAllowedLabels[key] {
-		return true
-	}
-
-	// Check allowed prefixes.
-	for _, prefix := range kubeletAllowedPrefixes {
-		if strings.HasPrefix(key, prefix) {
-			return true
-		}
-	}
-
-	return false
-}
-
-// PartitionNodeLabels splits labels into two maps: those that kubelet may
-// self-apply via --node-labels, and those that require a controller to apply
-// after the node has registered.
-func PartitionNodeLabels(labels map[string]string) (kubeletLabels, controllerLabels map[string]string) {
-	kubeletLabels = make(map[string]string, len(labels))
-	controllerLabels = make(map[string]string)
-
-	for k, v := range labels {
-		if IsKubeletAllowedLabel(k) {
-			kubeletLabels[k] = v
-		} else {
-			controllerLabels[k] = v
-		}
-	}
-
-	return kubeletLabels, controllerLabels
 }
 
 // Provider represents a Kubernetes cluster provider and its default
