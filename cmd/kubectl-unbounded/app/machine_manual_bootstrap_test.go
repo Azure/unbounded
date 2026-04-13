@@ -16,7 +16,6 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/rest"
 
-	"github.com/Azure/unbounded-kube/internal/cloudprovider"
 	"github.com/Azure/unbounded-kube/internal/provision"
 )
 
@@ -189,7 +188,7 @@ func TestManualBootstrapHandler_BuildAgentConfig(t *testing.T) {
 	require.NotEmpty(t, cfg.Cluster.CaCertBase64)
 	require.NotEmpty(t, cfg.Cluster.Version) // fake client returns empty string but it's still set
 	require.Contains(t, cfg.Kubelet.BootstrapToken, "abc123.")
-	require.Equal(t, map[string]string{"env": "prod", cloudprovider.ExcludeFromCloudProviderLabel: "true"}, cfg.Kubelet.Labels)
+	require.Equal(t, map[string]string{"env": "prod"}, cfg.Kubelet.Labels)
 	require.Equal(t, []string{"dedicated=gpu:NoSchedule"}, cfg.Kubelet.RegisterWithTaints)
 	require.Equal(t, "ghcr.io/azure/rootfs:v1", cfg.OCIImage)
 }
