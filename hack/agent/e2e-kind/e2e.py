@@ -426,15 +426,38 @@ def _run_agent_inner(agent_url: str) -> None:
     # version, and cluster DNS from the active kubeconfig, and picks up
     # the bootstrap token we just created via the fallback path.
     log("Generating bootstrap script with kubectl-unbounded machine manual-bootstrap...")
+
+    # Capture the local API server URL from the kubeconfig (typically
+    # https://127.0.0.1:<port> for Kind) so we can replace it with the
+    # VM-reachable container IP after generating the script.
+    local_api_server = kubectl_capture([
+        "config", "view", "--raw",
+        "-o", "jsonpath={.clusters[0].cluster.server}",
+    ])
+    if not local_api_server:
+        die("Could not determine local API server URL from kubeconfig")
+
     bootstrap_script = capture([
         KUBECTL_UNBOUNDED, "machine", "manual-bootstrap",
         AGENT_MACHINE_NAME,
         "--site", E2E_SITE_NAME,
     ])
+
+    # The kubeconfig uses a localhost address that is not reachable from the VM.
+    # Patch the generated script to use the Kind container IP instead.
+    if local_api_server in bootstrap_script:
+        log(f"Patching bootstrap script: replacing {local_api_server} -> {api_server}")
+        bootstrap_script = bootstrap_script.replace(local_api_server, api_server)
+    else:
+        log(f"[WARN] Local API server {local_api_server!r} not found in bootstrap script; "
+            f"VM may not be able to reach the API server")
+
     bootstrap_script_path = VM_DIR / "bootstrap.sh"
     bootstrap_script_path.write_text(bootstrap_script)
     bootstrap_script_path.chmod(0o600)
     log(f"Bootstrap script written to {bootstrap_script_path}")
+    log("Bootstrap script contents:")
+    print(bootstrap_script, flush=True)
 
     # Wait for cloud-init and verify connectivity
     log("Waiting for cloud-init to complete on VM...")
