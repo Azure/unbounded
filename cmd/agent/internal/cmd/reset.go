@@ -11,6 +11,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/Azure/unbounded-kube/cmd/agent/internal/goalstates"
 	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases"
 	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases/reset"
 	"github.com/Azure/unbounded-kube/internal/version"
@@ -87,7 +88,8 @@ The machine name is resolved in this order:
 }
 
 // resolveMachineName determines the machine name from the flag, the agent
-// config file, or a well-known default path.
+// config file, or a well-known default path. When no source provides a name,
+// it falls back to the default nspawn machine name (kube1).
 func resolveMachineName(flagValue string) (string, error) {
 	if flagValue != "" {
 		return flagValue, nil
@@ -110,8 +112,6 @@ func resolveMachineName(flagValue string) (string, error) {
 		return cfg.MachineName, nil
 	}
 
-	return "", fmt.Errorf(
-		"machine name is required: use --machine-name flag or ensure agent config is available via %s or %s",
-		configFileEnv, defaultConfigPath,
-	)
+	// Fall back to the default nspawn machine name.
+	return goalstates.NSpawnMachineKube1, nil
 }

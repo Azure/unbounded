@@ -68,18 +68,17 @@ func TestResolveMachineName_ConfigFileEmptyMachineName(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, data, 0o644))
 	t.Setenv(configFileEnv, path)
 
-	_, err = resolveMachineName("")
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "machine name is required")
+	name, err := resolveMachineName("")
+	require.NoError(t, err)
+	assert.Equal(t, "kube1", name)
 }
 
 func TestResolveMachineName_NoFlagNoConfig(t *testing.T) {
 	t.Setenv(configFileEnv, "")
 
-	_, err := resolveMachineName("")
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "machine name is required")
-	assert.Contains(t, err.Error(), configFileEnv)
+	name, err := resolveMachineName("")
+	require.NoError(t, err)
+	assert.Equal(t, "kube1", name)
 }
 
 func TestNewCmdReset_IsRegistered(t *testing.T) {

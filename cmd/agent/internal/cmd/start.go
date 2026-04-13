@@ -99,12 +99,7 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 
 // ref: cmd/machina/machina/controller/machine_controller.go
 func resolveRootFSGoalState(log *slog.Logger, cfg *provision.AgentConfig) (*goalstates.RootFS, error) {
-	// TODO: investigate whether the rootfs name can be decoupled from the
-	// machine name. Using a fixed rootfs name (e.g. "node") would simplify
-	// tool invocations (machinectl, systemctl) and allow the nspawn unit to
-	// be templated once. For now we derive it from the machine name so the
-	// rootfs identity matches what the controller expects.
-	machineName := cfg.MachineName
+	machineName := goalstates.NSpawnMachineKube1
 	kubeVersion := cfg.Cluster.Version
 
 	kernel, err := hostKernel() //nolint:staticcheck // SA4023: non-Linux stub always errors; this is intentional.
@@ -150,7 +145,7 @@ func resolveRootFSGoalState(log *slog.Logger, cfg *provision.AgentConfig) (*goal
 
 // ref: cmd/machina/machina/controller/machine_controller.go
 func resolveNodeStartGoalState(cfg *provision.AgentConfig, nvidia goalstates.NvidiaHost) (*goalstates.NodeStart, error) {
-	machineName := cfg.MachineName
+	machineName := goalstates.NSpawnMachineKube1
 
 	kubelet, err := resolveKubeletGoalState(cfg)
 	if err != nil {
