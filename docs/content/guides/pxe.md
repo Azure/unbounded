@@ -96,6 +96,57 @@ spec:
 
 Store BMC passwords in a Secret referenced by `passwordRef`. See the [CRD Reference]({{< relref "/reference/machina-crd" >}}) for all fields.
 
+## Cloud-Init Customization
+
+Cloud-init on PXE-booted machines uses two data sources that are merged at boot:
+
+- **Vendor-data** (managed by unbounded-kube) -- Contains the agent configuration, bootstrap scripts, and system defaults required for the node to join the cluster. This is not user-editable.
+- **User-data** (managed by the cluster operator) -- Optional customization such as SSH keys, additional packages, or host-level configuration.
+
+When no user-data is configured, metalman serves a minimal `#cloud-config` document. To supply custom user-data, create a ConfigMap and reference it from the Machine spec:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: my-cloud-init
+  namespace: unbounded-kube
+data:
+  user-data: |
+    #cloud-config
+    ssh_authorized_keys:
+      - ssh-rsa AAAA...
+    packages:
+      - vim
+      - htop
+```
+
+Then reference the ConfigMap in the Machine:
+
+```yaml
+apiVersion: unbounded-kube.io/v1alpha3
+kind: Machine
+metadata:
+  name: server-01
+spec:
+  pxe:
+    image: ghcr.io/azure/images/host-ubuntu2404:v1
+    dhcpLeases:
+    - ipv4: "10.10.0.50"
+      mac: "aa:bb:cc:dd:ee:ff"
+      subnetMask: "255.255.255.0"
+      gateway: "10.10.0.1"
+      dns: ["8.8.8.8"]
+    cloudInit:
+      userDataConfigMapRef:
+        name: my-cloud-init
+        namespace: unbounded-kube
+```
+
+The `key` field defaults to `user-data` but can be overridden to select a different key from the ConfigMap. Both `data` and `binaryData` entries are supported.
+
+If the referenced ConfigMap does not exist, metalman falls back to the default minimal cloud-config. If the ConfigMap exists but the referenced key is not found, metalman returns an error and the machine will not receive user-data.
+
 ## Boot Flow
 
 1. **Machine CR created.** The Redfish reconciler sets the boot device to PXE and power-cycles the server (ForceOff → On).

@@ -117,6 +117,10 @@ rules:
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get"]
+  # ConfigMaps (cloud-init user-data)
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
   # Nodes (cloud provider detection)
   - apiGroups: [""]
     resources: ["nodes"]
