@@ -18,6 +18,7 @@ import (
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -841,7 +842,7 @@ func (r *MachineReconciler) ensureControllerLabels(ctx context.Context, machine 
 	logger.Info("Patching Node with controller-managed labels",
 		"node", node.Name, "labels", controllerLabels)
 
-	return r.Patch(ctx, node, client.RawPatch(client.MergeFrom(node).Type(), patchBytes))
+	return r.Patch(ctx, node, client.RawPatch(types.MergePatchType, patchBytes))
 }
 
 // reconcileNodeJoin handles the Node lifecycle for a provisioned Machine.
