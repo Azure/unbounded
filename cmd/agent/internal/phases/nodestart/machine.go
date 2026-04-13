@@ -71,12 +71,14 @@ func (r *registerMachine) Do(ctx context.Context) error {
 	if err := c.Get(ctx, client.ObjectKey{Name: machineName}, &existing); err == nil {
 		r.log.Info("Machine CR already exists, skipping registration",
 			slog.String("machine", machineName))
+
 		return nil
 	} else if apimeta.IsNoMatchError(err) {
 		// The Machine CRD is not installed; machina is not deployed in this
 		// cluster. Log a warning and continue without failing.
 		r.log.Warn("Machine API not available (machina not installed?), skipping Machine CR registration",
 			slog.String("machine", machineName))
+
 		return nil
 	} else if !apierrors.IsNotFound(err) {
 		return fmt.Errorf("get Machine CR %q: %w", machineName, err)
