@@ -488,9 +488,7 @@ func TestUserDataTemplate_WithAgentImage(t *testing.T) {
     },
     "Kubelet": {
       "ApiServer": "https://k8s.example.com",
-      "Labels": {
-        "node.cloudprovider.kubernetes.io/exclude-from-external-cloud-provider": "true"
-      },
+      "Labels": {},
       "RegisterWithTaints": null
     },
     "OCIImage": "ghcr.io/org/rootfs:v1",
@@ -538,9 +536,7 @@ func TestUserDataTemplate_WithoutAgentImage(t *testing.T) {
     },
     "Kubelet": {
       "ApiServer": "https://k8s.example.com",
-      "Labels": {
-        "node.cloudprovider.kubernetes.io/exclude-from-external-cloud-provider": "true"
-      },
+      "Labels": {},
       "RegisterWithTaints": null
     },
     "Attest": {

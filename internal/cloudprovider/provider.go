@@ -13,19 +13,10 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 )
 
-const (
-	// ExcludeFromCloudProviderLabel prevents the cloud controller manager
-	// from trying to manage a node that was not provisioned by the cloud
-	// provider. This label must be set on every node added by unbounded.
-	ExcludeFromCloudProviderLabel = "node.cloudprovider.kubernetes.io/exclude-from-external-cloud-provider"
-)
-
 // CommonDefaultLabels returns labels that must be applied to every node
 // provisioned by unbounded, regardless of the detected cloud provider.
 func CommonDefaultLabels() map[string]string {
-	return map[string]string{
-		ExcludeFromCloudProviderLabel: "true",
-	}
+	return map[string]string{}
 }
 
 // Provider represents a Kubernetes cluster provider and its default

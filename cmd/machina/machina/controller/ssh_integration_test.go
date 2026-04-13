@@ -637,9 +637,6 @@ func TestProvisionMachine_EndToEnd(t *testing.T) {
 	require.Equal(t, "api.example.com:443", agentConfig.Kubelet.ApiServer)
 	require.Equal(t, "abc123.secret", agentConfig.Kubelet.BootstrapToken)
 
-	// Common labels are always applied.
-	require.Equal(t, "true", agentConfig.Kubelet.Labels[cloudprovider.ExcludeFromCloudProviderLabel])
-
 	// Command: script execution with UNBOUNDED_AGENT_CONFIG_FILE.
 	require.NotNil(t, execCmd, "expected a script execution command")
 	require.Contains(t, execCmd.command, "UNBOUNDED_AGENT_CONFIG_FILE")
@@ -944,9 +941,6 @@ func TestProvisionMachine_LabelMerge(t *testing.T) {
 	// User-defined labels should be present.
 	require.Equal(t, "production", agentConfig.Kubelet.Labels["env"])
 	require.Equal(t, "platform", agentConfig.Kubelet.Labels["team"])
-
-	// Common labels are always applied.
-	require.Equal(t, "true", agentConfig.Kubelet.Labels[cloudprovider.ExcludeFromCloudProviderLabel])
 }
 
 func TestProvisionMachine_Taints(t *testing.T) {
@@ -1139,9 +1133,6 @@ func TestProvisionMachine_ProviderLabelsOverride(t *testing.T) {
 
 	// kubernetes.azure.com/cluster must be absent from unbounded-managed nodes.
 	require.NotContains(t, agentConfig.Kubelet.Labels, "kubernetes.azure.com/cluster")
-
-	// Common labels are always applied.
-	require.Equal(t, "true", agentConfig.Kubelet.Labels[cloudprovider.ExcludeFromCloudProviderLabel])
 }
 
 // ---------------------------------------------------------------------------

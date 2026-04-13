@@ -7,6 +7,7 @@ on:
   pull_request:
     paths:
       - cmd/agent/**
+      - cmd/kubectl-unbounded/**
       - internal/cloudprovider/**
       - internal/provision/**
       - internal/kube/**
@@ -18,6 +19,7 @@ on:
     branches: [main]
     paths:
       - cmd/agent/**
+      - cmd/kubectl-unbounded/**
       - internal/cloudprovider/**
       - internal/provision/**
       - internal/kube/**
