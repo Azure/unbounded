@@ -134,11 +134,11 @@ func (f *FileResolver) ResolveFileByPath(ctx context.Context, path string, node 
 			return &ResolvedFile{Data: data, ContentType: "text/plain"}, nil
 		}
 
-		// No node context — return template content verbatim
+		// No node context - return template content verbatim
 		return &ResolvedFile{Data: content, ContentType: "text/plain"}, nil
 	}
 
-	// Static file — serve from disk
+	// Static file - serve from disk
 	return &ResolvedFile{DiskPath: diskPath}, nil
 }
 
