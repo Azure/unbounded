@@ -129,11 +129,6 @@ RUN if [ "${TARGETARCH}" = "amd64" ]; then \
         echo "dhcpBootImageName: shimaa64.efi" > /disk/metadata.yaml; \
     fi
 
-# User-data is now a Go template rendered per-node by metalman.
-# The unbounded-agent handles kubelet/containerd/TPM attestation
-# internally, so no attest script injection or kubelet configs are needed.
-COPY images/host-ubuntu2404/assets/user-data.tmpl             /disk/cloud-init/user-data.tmpl
-
 # ── Download and convert Ubuntu cloud image to raw+gzip ─────────────
 # Cloud image URL is parameterized by architecture.
 ARG UBUNTU_CLOUDIMG_URL=https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-${TARGETARCH}.img

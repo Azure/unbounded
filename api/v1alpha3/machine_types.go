@@ -191,6 +191,38 @@ type PXESpec struct {
 	// Redfish configures optional Redfish BMC access.
 	// +optional
 	Redfish *RedfishSpec `json:"redfish,omitempty"`
+
+	// CloudInit contains optional cloud-init customization for PXE-booted
+	// machines.
+	// +optional
+	CloudInit *CloudInitSpec `json:"cloudInit,omitempty"`
+}
+
+// CloudInitSpec defines cloud-init customization for PXE-booted machines.
+// Cloud-init merges vendor-data (managed by unbounded-kube) with user-data
+// (managed by the cluster operator). This spec controls the user-data
+// portion, allowing operators to configure SSH keys, install packages,
+// and perform other host-level customization.
+type CloudInitSpec struct {
+	// UserDataConfigMapRef references a ConfigMap containing custom
+	// cloud-init user-data. The referenced key (default "user-data")
+	// must contain a valid cloud-init configuration (e.g. a
+	// #cloud-config YAML document).
+	// +optional
+	UserDataConfigMapRef *ConfigMapKeySelector `json:"userDataConfigMapRef,omitempty"`
+}
+
+// ConfigMapKeySelector selects a key from a ConfigMap.
+type ConfigMapKeySelector struct {
+	// Name of the ConfigMap.
+	Name string `json:"name"`
+
+	// Namespace of the ConfigMap.
+	Namespace string `json:"namespace"`
+
+	// Key within the ConfigMap.
+	// +kubebuilder:default=user-data
+	Key string `json:"key,omitempty"`
 }
 
 // KubernetesSpec defines Kubernetes-specific configuration for a Machine.

@@ -64,6 +64,11 @@ PXE boot configuration consumed by the metalman controller.
 | `pxe.redfish.username` | string | Yes | — | Redfish username. |
 | `pxe.redfish.deviceID` | string | No | `"1"` | Redfish system device ID. |
 | `pxe.redfish.passwordRef` | SecretKeySelector | Yes | — | Secret containing the Redfish password. |
+| `pxe.cloudInit` | CloudInitSpec | No | — | Optional cloud-init customization for PXE-booted machines. |
+| `pxe.cloudInit.userDataConfigMapRef` | ConfigMapKeySelector | No | — | Reference to a ConfigMap containing custom cloud-init user-data. |
+| `pxe.cloudInit.userDataConfigMapRef.name` | string | Yes | — | ConfigMap name. |
+| `pxe.cloudInit.userDataConfigMapRef.namespace` | string | Yes | — | ConfigMap namespace. |
+| `pxe.cloudInit.userDataConfigMapRef.key` | string | No | `"user-data"` | Key within the ConfigMap. |
 
 ### spec.kubernetes
 
@@ -211,6 +216,10 @@ spec:
       username: admin
       passwordRef:
         name: bmc-password
+        namespace: unbounded-kube
+    cloudInit:
+      userDataConfigMapRef:
+        name: my-cloud-init
         namespace: unbounded-kube
   kubernetes:
     version: v1.34.0

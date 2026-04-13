@@ -12,6 +12,8 @@ import (
 	"sync"
 	"text/template"
 
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
@@ -79,7 +81,23 @@ func (f *FileResolver) LookupNodeByIP(ctx context.Context, ip string) (*v1alpha3
 	return &nodes.Items[0], nil
 }
 
+const userDataPath = "cloud-init/user-data"
+
+// defaultUserData is the minimal cloud-config returned when no custom
+// user-data ConfigMap is configured on the Machine.
+const defaultUserData = "#cloud-config\n"
+
 func (f *FileResolver) ResolveFileByPath(ctx context.Context, path string, node *v1alpha3.Machine, imageRef string) (*ResolvedFile, error) {
+	if path == userDataPath && node != nil {
+		if data, ok, err := f.resolveUserDataFromConfigMap(ctx, node); err != nil {
+			return nil, fmt.Errorf("resolving user-data from ConfigMap: %w", err)
+		} else if ok {
+			return &ResolvedFile{Data: data, ContentType: "text/plain"}, nil
+		}
+
+		return &ResolvedFile{Data: []byte(defaultUserData), ContentType: "text/plain"}, nil
+	}
+
 	diskPath, isTemplate, err := f.Cache.ResolvePath(imageRef, path)
 	if err != nil {
 		// Check if the image just hasn't been pulled yet
@@ -114,7 +132,7 @@ func (f *FileResolver) ResolveFileByPath(ctx context.Context, path string, node 
 
 			// The MarshalIndent prefix "    " (4 spaces) must match the
 			// indentation level of the {{ .AgentConfigJSON }} placeholder
-			// inside user-data.tmpl so that all lines of the multi-line
+			// inside vendor-data.tmpl so that all lines of the multi-line
 			// JSON are properly indented within the YAML content: | block.
 			agentConfigJSON, err := json.MarshalIndent(agentConfig, "    ", "  ")
 			if err != nil {
@@ -140,6 +158,41 @@ func (f *FileResolver) ResolveFileByPath(ctx context.Context, path string, node 
 
 	// Static file - serve from disk
 	return &ResolvedFile{DiskPath: diskPath}, nil
+}
+
+func (f *FileResolver) resolveUserDataFromConfigMap(ctx context.Context, node *v1alpha3.Machine) ([]byte, bool, error) {
+	if node.Spec.PXE == nil || node.Spec.PXE.CloudInit == nil || node.Spec.PXE.CloudInit.UserDataConfigMapRef == nil {
+		return nil, false, nil
+	}
+
+	ref := node.Spec.PXE.CloudInit.UserDataConfigMapRef
+
+	var cm corev1.ConfigMap
+	if err := f.Reader.Get(ctx, client.ObjectKey{
+		Namespace: ref.Namespace,
+		Name:      ref.Name,
+	}, &cm); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, false, nil
+		}
+
+		return nil, false, fmt.Errorf("getting ConfigMap %s/%s: %w", ref.Namespace, ref.Name, err)
+	}
+
+	key := ref.Key
+	if key == "" {
+		key = "user-data"
+	}
+
+	if data, ok := cm.Data[key]; ok {
+		return []byte(data), true, nil
+	}
+
+	if data, ok := cm.BinaryData[key]; ok {
+		return data, true, nil
+	}
+
+	return nil, false, fmt.Errorf("key %q not found in ConfigMap %s/%s", key, ref.Namespace, ref.Name)
 }
 
 type templateData struct {

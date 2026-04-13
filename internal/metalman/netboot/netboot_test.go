@@ -17,10 +17,12 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	v1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
 	"github.com/Azure/unbounded-kube/internal/metalman/indexing"
@@ -31,6 +33,10 @@ func newScheme(t *testing.T) *runtime.Scheme {
 
 	s := runtime.NewScheme()
 	if err := v1alpha3.AddToScheme(s); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := corev1.AddToScheme(s); err != nil {
 		t.Fatal(err)
 	}
 
@@ -254,7 +260,7 @@ func TestHTTPServer_TemplateVerbatim(t *testing.T) {
 
 	// Static file (no .tmpl suffix) served verbatim from disk
 	cache := setupOCICache(t, "ghcr.io/test/image:v1", "verb123", map[string][]byte{
-		"cloud-init/user-data": []byte(staticConfig),
+		"cloud-init/network-config": []byte(staticConfig),
 	})
 
 	node := &v1alpha3.Machine{
@@ -288,7 +294,7 @@ func TestHTTPServer_TemplateVerbatim(t *testing.T) {
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 
-	req, _ := http.NewRequest("GET", ts.URL+"/cloud-init/user-data", nil)
+	req, _ := http.NewRequest("GET", ts.URL+"/cloud-init/network-config", nil)
 	req.Header.Set("X-Forwarded-For", "10.0.1.51")
 
 	resp, err := http.DefaultClient.Do(req)
@@ -312,7 +318,7 @@ func TestHTTPServer_StaticFile(t *testing.T) {
 	staticContent := "autoinstall:\n  version: 1\n  identity:\n    hostname: server\n"
 
 	cache := setupOCICache(t, "ghcr.io/test/image:v1", "static123", map[string][]byte{
-		"cloud-init/user-data": []byte(staticContent),
+		"cloud-init/network-config": []byte(staticContent),
 	})
 
 	node := &v1alpha3.Machine{
@@ -346,7 +352,7 @@ func TestHTTPServer_StaticFile(t *testing.T) {
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 
-	req, _ := http.NewRequest("GET", ts.URL+"/cloud-init/user-data", nil)
+	req, _ := http.NewRequest("GET", ts.URL+"/cloud-init/network-config", nil)
 	req.Header.Set("X-Forwarded-For", "10.0.1.52")
 
 	resp, err := http.DefaultClient.Do(req)
@@ -473,10 +479,10 @@ func TestTemplateRendering_AgentConfigJSONUnset(t *testing.T) {
 	}
 }
 
-func TestUserDataTemplate_WithAgentImage(t *testing.T) {
-	userDataTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "host-ubuntu2404", "assets", "user-data.tmpl"))
+func TestVendorDataTemplate_WithAgentImage(t *testing.T) {
+	vendorDataTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "host-ubuntu2404", "assets", "vendor-data.tmpl"))
 	if err != nil {
-		t.Fatalf("reading user-data.tmpl: %v", err)
+		t.Fatalf("reading vendor-data.tmpl: %v", err)
 	}
 
 	agentConfigJSON := `{
@@ -506,25 +512,33 @@ func TestUserDataTemplate_WithAgentImage(t *testing.T) {
 		AgentConfigJSON: agentConfigJSON,
 	}
 
-	result, err := renderTemplate(string(userDataTmpl), data)
+	result, err := renderTemplate(string(vendorDataTmpl), data)
 	if err != nil {
 		t.Fatalf("renderTemplate: %v", err)
 	}
 
 	body := string(result)
 	if !strings.Contains(body, `"OCIImage": "ghcr.io/org/rootfs:v1"`) {
-		t.Errorf("expected OCIImage in rendered user-data, got:\n%s", body)
+		t.Errorf("expected OCIImage in rendered vendor-data, got:\n%s", body)
 	}
 
 	if !strings.Contains(body, `"MachineName": "agent-img-node"`) {
-		t.Errorf("expected MachineName in rendered user-data, got:\n%s", body)
+		t.Errorf("expected MachineName in rendered vendor-data, got:\n%s", body)
+	}
+
+	if !strings.Contains(body, "unbounded-agent start") {
+		t.Errorf("expected unbounded-agent start in rendered vendor-data, got:\n%s", body)
+	}
+
+	if !strings.Contains(body, "/cloudinit/log") {
+		t.Errorf("expected webhook reporting endpoint in rendered vendor-data, got:\n%s", body)
 	}
 }
 
-func TestUserDataTemplate_WithoutAgentImage(t *testing.T) {
-	userDataTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "host-ubuntu2404", "assets", "user-data.tmpl"))
+func TestVendorDataTemplate_WithoutAgentImage(t *testing.T) {
+	vendorDataTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "host-ubuntu2404", "assets", "vendor-data.tmpl"))
 	if err != nil {
-		t.Fatalf("reading user-data.tmpl: %v", err)
+		t.Fatalf("reading vendor-data.tmpl: %v", err)
 	}
 
 	agentConfigJSON := `{
@@ -553,18 +567,533 @@ func TestUserDataTemplate_WithoutAgentImage(t *testing.T) {
 		AgentConfigJSON: agentConfigJSON,
 	}
 
-	result, err := renderTemplate(string(userDataTmpl), data)
+	result, err := renderTemplate(string(vendorDataTmpl), data)
 	if err != nil {
 		t.Fatalf("renderTemplate: %v", err)
 	}
 
 	body := string(result)
 	if strings.Contains(body, "OCIImage") {
-		t.Errorf("expected no OCIImage in rendered user-data when AgentImage is empty, got:\n%s", body)
+		t.Errorf("expected no OCIImage in rendered vendor-data when AgentImage is empty, got:\n%s", body)
 	}
 
 	if !strings.Contains(body, `"MachineName": "no-agent-node"`) {
-		t.Errorf("expected MachineName in rendered user-data, got:\n%s", body)
+		t.Errorf("expected MachineName in rendered vendor-data, got:\n%s", body)
+	}
+}
+
+func TestResolveFileByPath_UserDataFromConfigMap(t *testing.T) {
+	customUserData := "#cloud-config\nssh_authorized_keys:\n  - ssh-rsa AAAA...\npackages:\n  - vim\n"
+
+	cache := setupOCICache(t, "ghcr.io/test/image:v1", "cmud123", map[string][]byte{
+		"vmlinuz": []byte("kernel"),
+	})
+
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-userdata",
+			Namespace: "default",
+		},
+		Data: map[string]string{
+			"user-data": customUserData,
+		},
+	}
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-cm-ud"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:40", IPv4: "10.0.8.10", SubnetMask: "255.255.255.0"}},
+				CloudInit: &v1alpha3.CloudInitSpec{
+					UserDataConfigMapRef: &v1alpha3.ConfigMapKeySelector{
+						Name:      "my-userdata",
+						Namespace: "default",
+						Key:       "user-data",
+					},
+				},
+			},
+		},
+	}
+
+	scheme := newScheme(t)
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node, cm).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+
+	resolver := FileResolver{
+		Cache:  cache,
+		Reader: fc,
+		Cluster: &StaticClusterInfo{Info: ClusterInfo{
+			ApiserverURL: "https://k8s.example.com",
+		}},
+		ServeURL: "http://10.0.8.1:8080",
+	}
+
+	resolved, err := resolver.ResolveFileByPath(t.Context(), "cloud-init/user-data", node, "ghcr.io/test/image:v1")
+	if err != nil {
+		t.Fatalf("ResolveFileByPath: %v", err)
+	}
+
+	if string(resolved.Data) != customUserData {
+		t.Errorf("expected ConfigMap user-data, got %q", resolved.Data)
+	}
+}
+
+func TestResolveFileByPath_UserDataFallsBackToDefault(t *testing.T) {
+	cache := setupOCICache(t, "ghcr.io/test/image:v1", "fblud123", map[string][]byte{
+		"vmlinuz": []byte("kernel"),
+	})
+
+	// Node without cloudInit configured — should return the built-in default.
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-no-cm"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:41", IPv4: "10.0.8.11", SubnetMask: "255.255.255.0"}},
+			},
+		},
+	}
+
+	scheme := newScheme(t)
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+
+	resolver := FileResolver{
+		Cache:  cache,
+		Reader: fc,
+		Cluster: &StaticClusterInfo{Info: ClusterInfo{
+			ApiserverURL: "https://k8s.example.com",
+		}},
+		ServeURL: "http://10.0.8.1:8080",
+	}
+
+	resolved, err := resolver.ResolveFileByPath(t.Context(), "cloud-init/user-data", node, "ghcr.io/test/image:v1")
+	if err != nil {
+		t.Fatalf("ResolveFileByPath: %v", err)
+	}
+
+	if resolved.DiskPath != "" {
+		t.Errorf("expected no DiskPath for default user-data, got %q", resolved.DiskPath)
+	}
+
+	if string(resolved.Data) != defaultUserData {
+		t.Errorf("expected default user-data %q, got %q", defaultUserData, resolved.Data)
+	}
+}
+
+func TestResolveFileByPath_UserDataConfigMapCustomKey(t *testing.T) {
+	customUserData := "#cloud-config\npackages:\n  - htop\n"
+
+	cache := setupOCICache(t, "ghcr.io/test/image:v1", "cmkey123", map[string][]byte{
+		"vmlinuz": []byte("kernel"),
+	})
+
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "multi-key-cm",
+			Namespace: "infra",
+		},
+		Data: map[string]string{
+			"my-custom-key": customUserData,
+		},
+	}
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-custom-key"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:42", IPv4: "10.0.8.12", SubnetMask: "255.255.255.0"}},
+				CloudInit: &v1alpha3.CloudInitSpec{
+					UserDataConfigMapRef: &v1alpha3.ConfigMapKeySelector{
+						Name:      "multi-key-cm",
+						Namespace: "infra",
+						Key:       "my-custom-key",
+					},
+				},
+			},
+		},
+	}
+
+	scheme := newScheme(t)
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node, cm).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+
+	resolver := FileResolver{
+		Cache:  cache,
+		Reader: fc,
+		Cluster: &StaticClusterInfo{Info: ClusterInfo{
+			ApiserverURL: "https://k8s.example.com",
+		}},
+		ServeURL: "http://10.0.8.1:8080",
+	}
+
+	resolved, err := resolver.ResolveFileByPath(t.Context(), "cloud-init/user-data", node, "ghcr.io/test/image:v1")
+	if err != nil {
+		t.Fatalf("ResolveFileByPath: %v", err)
+	}
+
+	if string(resolved.Data) != customUserData {
+		t.Errorf("expected custom-key user-data, got %q", resolved.Data)
+	}
+}
+
+func TestResolveFileByPath_UserDataConfigMapMissing(t *testing.T) {
+	cache := setupOCICache(t, "ghcr.io/test/image:v1", "cmmiss123", map[string][]byte{
+		"vmlinuz": []byte("kernel"),
+	})
+
+	// ConfigMap doesn't exist — should fall back to default cloud-init.
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-cm-missing"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:43", IPv4: "10.0.8.13", SubnetMask: "255.255.255.0"}},
+				CloudInit: &v1alpha3.CloudInitSpec{
+					UserDataConfigMapRef: &v1alpha3.ConfigMapKeySelector{
+						Name:      "nonexistent",
+						Namespace: "default",
+					},
+				},
+			},
+		},
+	}
+
+	scheme := newScheme(t)
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+
+	resolver := FileResolver{
+		Cache:  cache,
+		Reader: fc,
+	}
+
+	resolved, err := resolver.ResolveFileByPath(t.Context(), "cloud-init/user-data", node, "ghcr.io/test/image:v1")
+	if err != nil {
+		t.Fatalf("expected fallback to default user-data, got error: %v", err)
+	}
+
+	if string(resolved.Data) != defaultUserData {
+		t.Errorf("expected default user-data %q, got %q", defaultUserData, resolved.Data)
+	}
+}
+
+func TestResolveFileByPath_UserDataConfigMapGetError(t *testing.T) {
+	cache := setupOCICache(t, "ghcr.io/test/image:v1", "cmerr123", map[string][]byte{
+		"vmlinuz": []byte("kernel"),
+	})
+
+	// Node references a ConfigMap, but the client returns a non-NotFound error.
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-cm-err"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:45", IPv4: "10.0.8.15", SubnetMask: "255.255.255.0"}},
+				CloudInit: &v1alpha3.CloudInitSpec{
+					UserDataConfigMapRef: &v1alpha3.ConfigMapKeySelector{
+						Name:      "some-cm",
+						Namespace: "default",
+					},
+				},
+			},
+		},
+	}
+
+	scheme := newScheme(t)
+	injectedErr := fmt.Errorf("simulated network timeout")
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if _, ok := obj.(*corev1.ConfigMap); ok {
+					return injectedErr
+				}
+
+				return c.Get(ctx, key, obj, opts...)
+			},
+		}).
+		Build()
+
+	resolver := FileResolver{
+		Cache:  cache,
+		Reader: fc,
+	}
+
+	_, err := resolver.ResolveFileByPath(t.Context(), "cloud-init/user-data", node, "ghcr.io/test/image:v1")
+	if err == nil {
+		t.Fatal("expected error for non-NotFound client failure, got nil")
+	}
+
+	if !strings.Contains(err.Error(), "simulated network timeout") {
+		t.Errorf("expected error to contain injected message, got: %v", err)
+	}
+}
+
+func TestResolveFileByPath_UserDataConfigMapMissingKey(t *testing.T) {
+	cache := setupOCICache(t, "ghcr.io/test/image:v1", "cmnokey123", map[string][]byte{
+		"vmlinuz": []byte("kernel"),
+	})
+
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "wrong-key-cm",
+			Namespace: "default",
+		},
+		Data: map[string]string{
+			"other-key": "some data",
+		},
+	}
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-cm-nokey"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:44", IPv4: "10.0.8.14", SubnetMask: "255.255.255.0"}},
+				CloudInit: &v1alpha3.CloudInitSpec{
+					UserDataConfigMapRef: &v1alpha3.ConfigMapKeySelector{
+						Name:      "wrong-key-cm",
+						Namespace: "default",
+						Key:       "user-data",
+					},
+				},
+			},
+		},
+	}
+
+	scheme := newScheme(t)
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node, cm).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+
+	resolver := FileResolver{
+		Cache:  cache,
+		Reader: fc,
+	}
+
+	_, err := resolver.ResolveFileByPath(t.Context(), "cloud-init/user-data", node, "ghcr.io/test/image:v1")
+	if err == nil {
+		t.Fatal("expected error when ConfigMap key is missing")
+	}
+
+	if !strings.Contains(err.Error(), "user-data") {
+		t.Errorf("expected error to mention missing key, got: %v", err)
+	}
+}
+
+func TestResolveFileByPath_UserDataFromBinaryData(t *testing.T) {
+	binaryUserData := []byte("#cloud-config\npackages:\n  - curl\n")
+
+	cache := setupOCICache(t, "ghcr.io/test/image:v1", "cmbin123", map[string][]byte{
+		"vmlinuz": []byte("kernel"),
+	})
+
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "binary-ud",
+			Namespace: "default",
+		},
+		BinaryData: map[string][]byte{
+			"user-data": binaryUserData,
+		},
+	}
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-bindata"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:60", IPv4: "10.0.10.10", SubnetMask: "255.255.255.0"}},
+				CloudInit: &v1alpha3.CloudInitSpec{
+					UserDataConfigMapRef: &v1alpha3.ConfigMapKeySelector{
+						Name:      "binary-ud",
+						Namespace: "default",
+					},
+				},
+			},
+		},
+	}
+
+	scheme := newScheme(t)
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node, cm).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+
+	resolver := FileResolver{
+		Cache:  cache,
+		Reader: fc,
+	}
+
+	resolved, err := resolver.ResolveFileByPath(t.Context(), "cloud-init/user-data", node, "ghcr.io/test/image:v1")
+	if err != nil {
+		t.Fatalf("ResolveFileByPath: %v", err)
+	}
+
+	if string(resolved.Data) != string(binaryUserData) {
+		t.Errorf("expected BinaryData user-data, got %q", resolved.Data)
+	}
+}
+
+func TestHTTPServer_UserDataConfigMapMissing(t *testing.T) {
+	cache := setupOCICache(t, "ghcr.io/test/image:v1", "httpcmmiss123", map[string][]byte{
+		"vmlinuz": []byte("kernel"),
+	})
+
+	// Node references a ConfigMap that doesn't exist — should fall back to default cloud-init.
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-http-cm-miss"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:51", IPv4: "10.0.9.11", SubnetMask: "255.255.255.0"}},
+				CloudInit: &v1alpha3.CloudInitSpec{
+					UserDataConfigMapRef: &v1alpha3.ConfigMapKeySelector{
+						Name:      "nonexistent",
+						Namespace: "default",
+					},
+				},
+			},
+			Operations: &v1alpha3.OperationsSpec{ReimageCounter: 1},
+		},
+	}
+
+	scheme := newScheme(t)
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+
+	srv := &HTTPServer{
+		FileResolver: FileResolver{
+			Cache:    cache,
+			Reader:   fc,
+			Cluster:  &StaticClusterInfo{Info: ClusterInfo{ApiserverURL: "https://k8s.example.com"}},
+			ServeURL: "http://10.0.9.1:8080",
+		},
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /", srv.handleFile)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	req, _ := http.NewRequest("GET", ts.URL+"/cloud-init/user-data", nil)
+	req.Header.Set("X-Forwarded-For", "10.0.9.11")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /cloud-init/user-data: %v", err)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 for missing ConfigMap (fallback to default), got %d", resp.StatusCode)
+	}
+
+	if string(body) != defaultUserData {
+		t.Errorf("expected default user-data %q, got %q", defaultUserData, body)
+	}
+}
+
+func TestHTTPServer_UserDataFromConfigMap(t *testing.T) {
+	customUserData := "#cloud-config\nssh_authorized_keys:\n  - ssh-rsa AAAA...\n"
+
+	cache := setupOCICache(t, "ghcr.io/test/image:v1", "httpud123", map[string][]byte{
+		"vmlinuz": []byte("kernel"),
+	})
+
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "ssh-keys",
+			Namespace: "default",
+		},
+		Data: map[string]string{
+			"user-data": customUserData,
+		},
+	}
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-http-ud"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:50", IPv4: "10.0.9.10", SubnetMask: "255.255.255.0"}},
+				CloudInit: &v1alpha3.CloudInitSpec{
+					UserDataConfigMapRef: &v1alpha3.ConfigMapKeySelector{
+						Name:      "ssh-keys",
+						Namespace: "default",
+						Key:       "user-data",
+					},
+				},
+			},
+			Operations: &v1alpha3.OperationsSpec{ReimageCounter: 1},
+		},
+	}
+
+	scheme := newScheme(t)
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node, cm).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+
+	srv := &HTTPServer{
+		FileResolver: FileResolver{
+			Cache:    cache,
+			Reader:   fc,
+			Cluster:  &StaticClusterInfo{Info: ClusterInfo{ApiserverURL: "https://k8s.example.com"}},
+			ServeURL: "http://10.0.9.1:8080",
+		},
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /", srv.handleFile)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	req, _ := http.NewRequest("GET", ts.URL+"/cloud-init/user-data", nil)
+	req.Header.Set("X-Forwarded-For", "10.0.9.10")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /cloud-init/user-data: %v", err)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("user-data status: got %d, want 200", resp.StatusCode)
+	}
+
+	if string(body) != customUserData {
+		t.Errorf("expected ConfigMap user-data, got %q", body)
 	}
 }
 
@@ -828,13 +1357,11 @@ menuentry "Install {{ .Machine.Name }}" {
   linux /vmlinuz
   initrd /initrd
 }`
-	staticConfig := "autoinstall: true"
 
 	cache := setupOCICache(t, "ghcr.io/test/e2e:v1", "e2e123", map[string][]byte{
-		"vmlinuz":              vmlinuzData,
-		"initrd":               initrdData,
-		"grub/grub.cfg.tmpl":   []byte(bootTemplate),
-		"cloud-init/user-data": []byte(staticConfig),
+		"vmlinuz":            vmlinuzData,
+		"initrd":             initrdData,
+		"grub/grub.cfg.tmpl": []byte(bootTemplate),
 	})
 
 	node := &v1alpha3.Machine{
@@ -896,15 +1423,15 @@ menuentry "Install {{ .Machine.Name }}" {
 		t.Errorf("grub.cfg should contain node name, got:\n%s", body)
 	}
 
-	// Test static file serving
+	// Test default user-data (no ConfigMap configured, so metalman returns built-in default)
 	req, _ = http.NewRequest("GET", httpTS.URL+"/cloud-init/user-data", nil)
 	req.Header.Set("X-Forwarded-For", "10.0.3.10")
 	resp, _ = http.DefaultClient.Do(req)
 	body, _ = io.ReadAll(resp.Body)
 	resp.Body.Close()
 
-	if string(body) != staticConfig {
-		t.Errorf("static config mismatch: got %q", body)
+	if string(body) != defaultUserData {
+		t.Errorf("default user-data mismatch: got %q, want %q", body, defaultUserData)
 	}
 
 	// Test 404 for file not in this image
