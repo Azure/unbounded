@@ -26,37 +26,22 @@ You may want to reset a node when:
 The `unbounded-agent reset` command fully reverses the bootstrap process. It is
 the inverse of `unbounded-agent start`.
 
-### If the agent config file is available
-
-When the agent config file is still on disk (e.g. `/etc/unbounded-agent/config.json`
-from a cloud-init bootstrap, or a temporary file from a script bootstrap), the
-reset command reads the machine name from it automatically:
-
 ```bash
-# Cloud-init bootstrapped nodes (config at /etc/unbounded-agent/config.json):
 sudo unbounded-agent reset
-
-# Script bootstrapped nodes (config in a temp file):
-sudo UNBOUNDED_AGENT_CONFIG_FILE=/tmp/unbounded-agent-config.XXXXXX.json unbounded-agent reset
 ```
 
-### Specifying the machine name explicitly
-
-If the config file is no longer available, provide the machine name directly:
-
-```bash
-sudo unbounded-agent reset --machine-name my-node
-```
+The command unconditionally cleans up both possible nspawn machine names (`kube1`
+and `kube2`) so it works regardless of which upgrade cycle the node is in.
 
 ## What Reset Does
 
 The reset command performs the following steps in order:
 
-1. **Stops the nspawn machine** -- gracefully stops, then force-terminates if needed
+1. **Stops the nspawn machines** -- gracefully stops `kube1` and `kube2`, then force-terminates if needed
 2. **Removes network interfaces** -- WireGuard (`wg*`), tunnel (`geneve0`, `vxlan0`, `ipip0`), and overlay (`unbounded0`, `cbr0`) interfaces
 3. **Removes WireGuard keys** -- cleans up `/etc/wireguard/server.priv` and `server.pub`
-4. **Removes nspawn configuration** -- deletes `.nspawn` config and systemd overrides
-5. **Removes the machine rootfs** -- deletes `/var/lib/machines/<name>`
+4. **Removes nspawn configuration** -- deletes `.nspawn` configs and systemd overrides for both machines
+5. **Removes the machine rootfs** -- deletes `/var/lib/machines/kube1` and `/var/lib/machines/kube2`
 6. **Cleans up routing** -- removes policy routing rules and flushes routing tables
 7. **Removes agent binaries** -- deletes the agent binary and config artifacts
 8. **Reloads systemd** -- picks up all configuration changes
