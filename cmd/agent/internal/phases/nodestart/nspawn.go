@@ -29,6 +29,10 @@ func StartNSpawnMachine(log *slog.Logger, goalState *goalstates.NodeStart) phase
 func (s *startNSpawnMachine) Name() string { return "start-nspawn-machine" }
 
 func (s *startNSpawnMachine) Do(ctx context.Context) error {
+	if err := utilexec.RunCmd(ctx, s.log, utilexec.Machinectl(), "enable", s.goalState.MachineName); err != nil {
+		return fmt.Errorf("machinectl enable %s: %w", s.goalState.MachineName, err)
+	}
+
 	if err := utilexec.RunCmd(ctx, s.log, utilexec.Machinectl(), "start", s.goalState.MachineName); err != nil {
 		return fmt.Errorf("machinectl start %s: %w", s.goalState.MachineName, err)
 	}
