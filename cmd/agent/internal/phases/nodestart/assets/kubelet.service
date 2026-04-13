@@ -2,10 +2,13 @@
 Description=Kubelet
 ConditionPathExists={{.KubeletBinPath}}
 Wants=network-online.target containerd.service
-After=network-online.target
+After=network-online.target containerd.service
 
 [Service]
 Restart=always
+RestartSec=1
+RestartMaxDelaySec=60
+RestartSteps=10
 SuccessExitStatus=143
 ExecStart={{.KubeletBinPath}} \
         --config="" \
