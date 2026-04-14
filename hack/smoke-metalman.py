@@ -58,6 +58,10 @@ QGA_SOCK = TMPDIR / "qga.sock"
 # The nspawn machine name used by the agent (must match the constant in
 # cmd/agent/internal/goalstates/constants.go - NSpawnMachineKube1).
 NSPAWN_MACHINE = "kube1"
+NET_API_GROUP = "net.unbounded-kube.io"
+NET_API_VERSION = f"{NET_API_GROUP}/v1alpha1"
+AUTOALLOC_NODE_NAME = "smoke-autoalloc"
+AUTOALLOC_MAC = "52:54:00:aa:bb:02"
 
 KUBECTL = "kubectl"
 VIRSH = ["virsh", "--connect", "qemu:///system"]
@@ -462,6 +466,154 @@ def assert_node_ready(name: str, timeout: int = 300) -> None:
     die(f"Timed out waiting for Node '{name}' to become Ready")
 
 
+def apply_site_crd() -> None:
+    """Apply a minimal Site CRD so the IP allocator can look up Site objects."""
+    crd = {
+        "apiVersion": "apiextensions.k8s.io/v1",
+        "kind": "CustomResourceDefinition",
+        "metadata": {"name": f"sites.{NET_API_GROUP}"},
+        "spec": {
+            "group": NET_API_GROUP,
+            "names": {
+                "kind": "Site",
+                "listKind": "SiteList",
+                "plural": "sites",
+                "singular": "site",
+                "shortNames": ["st"],
+            },
+            "scope": "Cluster",
+            "versions": [{
+                "name": "v1alpha1",
+                "served": True,
+                "storage": True,
+                "schema": {
+                    "openAPIV3Schema": {
+                        "type": "object",
+                        "properties": {
+                            "spec": {
+                                "type": "object",
+                                "properties": {
+                                    "nodeCidrs": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
+            }],
+        },
+    }
+    kubectl(["apply", "-f", "-"], input=json.dumps(crd).encode(), stdout=DEVNULL)
+
+
+def assert_ip_auto_allocation(timeout: int = 60) -> None:
+    """Create a MAC-only Machine and verify the IP allocator fills in the lease.
+
+    This validates the IP auto-allocation feature without needing a real VM.
+    The test creates a Site object matching the smoke network, then creates
+    a Machine with only a MAC address in its DHCP lease. The IP allocator
+    reconciler should pick a random address from the Site's nodeCidrs and
+    patch it onto the Machine spec.
+    """
+    log("Testing IP auto-allocation from Site")
+
+    log("  Applying Site CRD")
+    apply_site_crd()
+
+    site = {
+        "apiVersion": NET_API_VERSION,
+        "kind": "Site",
+        "metadata": {"name": SITE},
+        "spec": {
+            "nodeCidrs": [f"{SUBNET}.0/24"],
+        },
+    }
+    kubectl(["apply", "-f", "-"], input=json.dumps(site).encode(), stdout=DEVNULL)
+    log(f"  Created Site '{SITE}' with nodeCidrs [{SUBNET}.0/24]")
+
+    autoalloc_machine = {
+        "apiVersion": API_VERSION,
+        "kind": "Machine",
+        "metadata": {
+            "name": AUTOALLOC_NODE_NAME,
+            "labels": {f"{API_GROUP}/site": SITE},
+        },
+        "spec": {
+            "pxe": {
+                "image": IMAGE_NAME,
+                "dhcpLeases": [{
+                    "mac": AUTOALLOC_MAC,
+                    # IPv4, subnetMask, and gateway intentionally omitted.
+                }],
+            },
+            "agent": {
+                "image": AGENT_IMAGE_NAME_VM,
+            },
+        },
+    }
+    kubectl(["apply", "-f", "-"], input=json.dumps(autoalloc_machine).encode(),
+            stdout=DEVNULL)
+    log(f"  Created Machine '{AUTOALLOC_NODE_NAME}' with MAC-only lease")
+
+    log("  Waiting for IP allocator to fill in DHCP lease fields...")
+    import ipaddress
+    subnet = ipaddress.IPv4Network(f"{SUBNET}.0/24")
+
+    for elapsed in range(timeout):
+        check_procs()
+        result = subprocess.run(
+            [KUBECTL, "get", f"machines.{API_GROUP}", AUTOALLOC_NODE_NAME,
+             "-o", "json"],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            time.sleep(1)
+            continue
+
+        try:
+            machine_obj = json.loads(result.stdout)
+            leases = machine_obj.get("spec", {}).get("pxe", {}).get("dhcpLeases", [])
+            if leases:
+                lease = leases[0]
+                ipv4 = lease.get("ipv4", "")
+                subnet_mask = lease.get("subnetMask", "")
+                gateway = lease.get("gateway", "")
+
+                if ipv4 and subnet_mask and gateway:
+                    # Validate the allocated values.
+                    alloc_ip = ipaddress.IPv4Address(ipv4)
+                    if alloc_ip not in subnet:
+                        die(f"Allocated IP {ipv4} not in subnet {subnet}")
+                    if ipv4 == f"{SUBNET}.0":
+                        die(f"Allocated network address {ipv4}")
+                    if ipv4 == f"{SUBNET}.255":
+                        die(f"Allocated broadcast address {ipv4}")
+                    if ipv4 == f"{SUBNET}.1":
+                        die(f"Allocated gateway address {ipv4}")
+                    if subnet_mask != "255.255.255.0":
+                        die(f"Expected subnet mask 255.255.255.0, got {subnet_mask}")
+                    if gateway != f"{SUBNET}.1":
+                        die(f"Expected gateway {SUBNET}.1, got {gateway}")
+
+                    log(f"  IP auto-allocation succeeded: "
+                        f"ipv4={ipv4} subnetMask={subnet_mask} gateway={gateway}")
+
+                    # Clean up the test Machine.
+                    run_quiet([KUBECTL, "delete", f"machines.{API_GROUP}",
+                               AUTOALLOC_NODE_NAME])
+                    return
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            log(f"    Parse error: {e}")
+
+        if elapsed > 0 and elapsed % 10 == 0:
+            log(f"    ({elapsed}s) Still waiting for IP allocation...")
+        time.sleep(1)
+
+    die(f"Timed out waiting for IP auto-allocation on Machine '{AUTOALLOC_NODE_NAME}'")
+
+
 def assert_cloud_init_done(timeout: int = 900) -> None:
     """Assert the Machine's CloudInitDone condition reaches True/Succeeded.
 
@@ -636,6 +788,8 @@ def main() -> None:
     log("Cleaning up stale Kubernetes resources")
     run_quiet([KUBECTL, "-n", NODE_NS, "delete", "secret", "bmc-pass"])
     run_quiet([KUBECTL, "delete", f"machines.{API_GROUP}", NODE_NAME])
+    run_quiet([KUBECTL, "delete", f"machines.{API_GROUP}", AUTOALLOC_NODE_NAME])
+    run_quiet([KUBECTL, "delete", f"sites.{NET_API_GROUP}", SITE])
     run_quiet([KUBECTL, "delete", "node", NODE_NAME])
     # Remove stale CRDs so that a version change (e.g. storedVersions
     # referencing an old API version) does not block the fresh apply.
@@ -750,6 +904,9 @@ def main() -> None:
 
     time.sleep(2)
     check_procs()
+
+    log("Testing IP auto-allocation")
+    assert_ip_auto_allocation()
 
     log("Triggering reimage")
     run([str(KUBECTL_UNBOUNDED), "machine", "reimage", NODE_NAME])

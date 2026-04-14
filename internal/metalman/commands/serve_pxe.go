@@ -28,6 +28,7 @@ import (
 	"github.com/Azure/unbounded-kube/internal/metalman/cloudinit"
 	"github.com/Azure/unbounded-kube/internal/metalman/dhcp"
 	"github.com/Azure/unbounded-kube/internal/metalman/indexing"
+	"github.com/Azure/unbounded-kube/internal/metalman/ipallocator"
 	"github.com/Azure/unbounded-kube/internal/metalman/lifecycle"
 	"github.com/Azure/unbounded-kube/internal/metalman/netboot"
 	"github.com/Azure/unbounded-kube/internal/metalman/redfish"
@@ -198,6 +199,10 @@ func ServePXECmd() *cobra.Command {
 
 			if err := (&cloudinit.Reconciler{Client: mgr.GetClient()}).SetupWithManager(mgr); err != nil {
 				return fmt.Errorf("setting up CloudInit reconciler: %w", err)
+			}
+
+			if err := (&ipallocator.Reconciler{Client: mgr.GetClient()}).SetupWithManager(mgr); err != nil {
+				return fmt.Errorf("setting up IP allocator reconciler: %w", err)
 			}
 
 			resolver := netboot.FileResolver{

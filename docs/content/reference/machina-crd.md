@@ -54,10 +54,10 @@ PXE boot configuration consumed by the metalman controller.
 | `pxe` | PXESpec | No | — | PXE boot configuration. |
 | `pxe.image` | string | Yes | — | OCI image reference containing netboot artifacts (e.g. `"ghcr.io/azure/images/host-ubuntu2404:v1"`). |
 | `pxe.dhcpLeases` | []DHCPLease | No | — | Static DHCP leases served during PXE boot. |
-| `pxe.dhcpLeases[].ipv4` | string | Yes | — | Static IPv4 address to assign. |
+| `pxe.dhcpLeases[].ipv4` | string | No | Auto-allocated | Static IPv4 address to assign. When omitted, allocated automatically from the Site's `nodeCidrs`. |
 | `pxe.dhcpLeases[].mac` | string | Yes | — | NIC MAC address (matched case-insensitively). |
-| `pxe.dhcpLeases[].subnetMask` | string | Yes | — | Subnet mask. |
-| `pxe.dhcpLeases[].gateway` | string | Yes | — | Default gateway. |
+| `pxe.dhcpLeases[].subnetMask` | string | No | Auto-derived | Subnet mask. When omitted, derived from the Site's `nodeCidrs` prefix length. |
+| `pxe.dhcpLeases[].gateway` | string | No | Auto-derived | Default gateway. When omitted, defaults to the first usable address in the Site's `nodeCidrs` subnet. |
 | `pxe.dhcpLeases[].dns` | []string | No | — | DNS server addresses. |
 | `pxe.redfish` | RedfishSpec | No | — | BMC access via the Redfish API. |
 | `pxe.redfish.url` | string | Yes | — | Redfish endpoint URL. |
@@ -225,6 +225,32 @@ spec:
     version: v1.34.0
     bootstrapTokenRef:
       name: bootstrap-token-abc123
+```
+
+**PXE with automatic IP allocation:**
+
+When the Machine has the `unbounded-kube.io/site` label and an unbounded-net
+Site exists with matching `nodeCidrs`, omitting IP fields triggers automatic
+allocation:
+
+```yaml
+apiVersion: unbounded-kube.io/v1alpha3
+kind: Machine
+metadata:
+  name: baremetal-02
+  labels:
+    unbounded-kube.io/site: lab
+spec:
+  pxe:
+    image: ghcr.io/azure/images/host-ubuntu2404:v1
+    dhcpLeases:
+    - mac: "aa:bb:cc:dd:ee:02"
+    redfish:
+      url: "https://bmc-02.example.com"
+      username: admin
+      passwordRef:
+        name: bmc-password
+        namespace: unbounded-kube
 ```
 
 ---

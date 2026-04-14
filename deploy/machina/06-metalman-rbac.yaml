@@ -109,10 +109,14 @@ rules:
   # Machine controller
   - apiGroups: ["unbounded-kube.io"]
     resources: ["machines"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "update"]
   - apiGroups: ["unbounded-kube.io"]
     resources: ["machines/status"]
     verbs: ["update"]
+  # Site (unbounded-net) - read for IP auto-allocation
+  - apiGroups: ["net.unbounded-kube.io"]
+    resources: ["sites"]
+    verbs: ["get"]
   # Secrets (Redfish passwords)
   - apiGroups: [""]
     resources: ["secrets"]

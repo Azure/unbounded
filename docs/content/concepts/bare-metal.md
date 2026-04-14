@@ -85,13 +85,24 @@ For PXE-provisioned machines, the `Machine` resource includes:
 
 - **`spec.pxe.image`** -- OCI image reference containing netboot artifacts
   (e.g. `"ghcr.io/azure/images/host-ubuntu2404:v1"`).
-- **`spec.pxe.dhcpLeases`** -- NIC specifications: MAC address and IP
-  assignment for each interface.
+- **`spec.pxe.dhcpLeases`** -- NIC specifications: MAC address and optional IP
+  assignment for each interface. When `ipv4`, `subnetMask`, or `gateway` are
+  omitted, they are resolved automatically from the unbounded-net Site object
+  matching the Machine's `unbounded-kube.io/site` label (see below).
 - **`spec.pxe.redfish`** -- Optional BMC connection details (endpoint, username,
   password secret) for remote power management.
 - **`spec.pxe.cloudInit`** -- Optional cloud-init customization. References a
   ConfigMap containing user-data that is merged with the vendor-data managed by
   unbounded-kube.
+
+### Automatic IP Allocation
+
+When a DHCP lease specifies only a MAC address, the IP allocator reconciler
+reads the Site's `spec.nodeCidrs` to determine the subnet, derives the mask and
+gateway, and picks a random available address. This is useful for large
+deployments where manually assigning IPs is impractical. The allocated values
+are written back to the Machine spec so that the DHCP server and other
+components use them directly.
 
 ### Site Isolation
 

@@ -162,7 +162,14 @@ spec:
                   dhcpLeases:
                     description: DHCPLeases defines static DHCP leases for PXE booting.
                     items:
-                      description: DHCPLease defines a static DHCP lease for PXE booting.
+                      description: |-
+                        DHCPLease defines a static DHCP lease for PXE booting.
+
+                        Only MAC is required. When IPv4, SubnetMask, or Gateway are omitted,
+                        the IP allocator reconciler resolves them automatically from the
+                        unbounded-net Site object matching the Machine's site label. A random
+                        address from the Site's nodeCidrs is chosen and the lease fields are
+                        patched onto the Machine spec before the DHCP server uses them.
                       properties:
                         dns:
                           description: DNS is a list of DNS server addresses.
@@ -170,22 +177,25 @@ spec:
                             type: string
                           type: array
                         gateway:
-                          description: Gateway is the default gateway.
+                          description: |-
+                            Gateway is the default gateway. When omitted, it defaults to
+                            the first usable address in the Site's nodeCidrs subnet.
                           type: string
                         ipv4:
-                          description: IPv4 is the IP address to assign.
+                          description: |-
+                            IPv4 is the IP address to assign. When omitted, an address is
+                            allocated automatically from the Site's nodeCidrs.
                           type: string
                         mac:
                           description: MAC is the MAC address of the network interface.
                           type: string
                         subnetMask:
-                          description: SubnetMask is the subnet mask for the lease.
+                          description: |-
+                            SubnetMask is the subnet mask for the lease. When omitted, it
+                            is derived from the Site's nodeCidrs prefix length.
                           type: string
                       required:
-                      - gateway
-                      - ipv4
                       - mac
-                      - subnetMask
                       type: object
                     type: array
                   image:

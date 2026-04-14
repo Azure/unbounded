@@ -150,18 +150,30 @@ type BastionSSHSpec struct {
 }
 
 // DHCPLease defines a static DHCP lease for PXE booting.
+//
+// Only MAC is required. When IPv4, SubnetMask, or Gateway are omitted,
+// the IP allocator reconciler resolves them automatically from the
+// unbounded-net Site object matching the Machine's site label. A random
+// address from the Site's nodeCidrs is chosen and the lease fields are
+// patched onto the Machine spec before the DHCP server uses them.
 type DHCPLease struct {
-	// IPv4 is the IP address to assign.
-	IPv4 string `json:"ipv4"`
+	// IPv4 is the IP address to assign. When omitted, an address is
+	// allocated automatically from the Site's nodeCidrs.
+	// +optional
+	IPv4 string `json:"ipv4,omitempty"`
 
 	// MAC is the MAC address of the network interface.
 	MAC string `json:"mac"`
 
-	// SubnetMask is the subnet mask for the lease.
-	SubnetMask string `json:"subnetMask"`
+	// SubnetMask is the subnet mask for the lease. When omitted, it
+	// is derived from the Site's nodeCidrs prefix length.
+	// +optional
+	SubnetMask string `json:"subnetMask,omitempty"`
 
-	// Gateway is the default gateway.
-	Gateway string `json:"gateway"`
+	// Gateway is the default gateway. When omitted, it defaults to
+	// the first usable address in the Site's nodeCidrs subnet.
+	// +optional
+	Gateway string `json:"gateway,omitempty"`
 
 	// DNS is a list of DNS server addresses.
 	// +optional

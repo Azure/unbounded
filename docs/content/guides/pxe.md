@@ -96,6 +96,49 @@ spec:
 
 Store BMC passwords in a Secret referenced by `passwordRef`. See the [CRD Reference]({{< relref "/reference/machina-crd" >}}) for all fields.
 
+## Automatic IP Allocation
+
+When a DHCP lease entry specifies only a MAC address (omitting `ipv4`, `subnetMask`, and `gateway`), metalman automatically resolves the missing fields from the unbounded-net **Site** object matching the Machine's `unbounded-kube.io/site` label.
+
+The IP allocator:
+
+1. Reads `spec.nodeCidrs` from the Site to determine the subnet.
+2. Derives the subnet mask from the CIDR prefix length.
+3. Uses the first usable address in the subnet (network + 1) as the gateway.
+4. Picks a random address from the remaining usable range that is not already assigned to any other Machine's DHCP lease.
+5. Patches the resolved values onto the Machine spec.
+
+This means you can create a Machine with minimal configuration:
+
+```yaml
+apiVersion: unbounded-kube.io/v1alpha3
+kind: Machine
+metadata:
+  name: server-02
+  labels:
+    unbounded-kube.io/site: rack-a
+spec:
+  pxe:
+    image: ghcr.io/azure/images/host-ubuntu2404:v1
+    dhcpLeases:
+    - mac: "aa:bb:cc:dd:ee:02"
+    redfish:
+      url: "https://bmc-02.example.com"
+      username: admin
+      passwordRef:
+        name: bmc-passwords
+        namespace: unbounded-kube
+        key: bmc-02
+```
+
+{{< callout type="important" >}}
+Automatic IP allocation requires an unbounded-net Site object with at least one IPv4 `nodeCidrs` entry. The Machine must have the `unbounded-kube.io/site` label set to the Site's name.
+{{< /callout >}}
+
+The randomly chosen address avoids collisions with other Machines managed by metalman. If there are other IPs on the network managed outside of this system, the randomness combined with metalman's existing reconcile retry logic should eventually converge on an available address.
+
+You can also partially specify leases - for example, providing an `ipv4` but omitting `subnetMask` and `gateway` - and the allocator will fill in only the missing fields.
+
 ## Cloud-Init Customization
 
 Cloud-init on PXE-booted machines uses two data sources that are merged at boot:
