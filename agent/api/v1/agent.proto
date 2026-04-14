@@ -1,0 +1,100 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+syntax = "proto3";
+
+package unbounded.agent.v1;
+
+option go_package = "github.com/Azure/unbounded-kube/agent/api/v1;agentv1";
+
+import "google/protobuf/timestamp.proto";
+
+// AgentService defines the task-pulling interface used by the unbounded-agent
+// to receive work from its control plane.
+service AgentService {
+  // PullTasks is a server-streaming RPC. The agent opens a long-lived stream
+  // and the server pushes tasks as they become available.
+  rpc PullTasks(PullTasksRequest) returns (stream PullTasksResponse);
+
+  // ReportTaskStatus allows the agent to report the outcome of a previously
+  // pulled task back to the server.
+  rpc ReportTaskStatus(ReportTaskStatusRequest) returns (ReportTaskStatusResponse);
+}
+
+// PullTasksRequest is sent once by the agent when it opens a PullTasks stream.
+message PullTasksRequest {}
+
+// PullTasksResponse wraps a single task pushed to the agent over the stream.
+message PullTasksResponse {
+  // task contains the next task the agent should execute.
+  Task task = 1;
+}
+
+// Task represents a unit of work assigned to the agent.
+message Task {
+  // id is a server-assigned unique identifier for this task.
+  string id = 1;
+
+  // spec carries the task-type-specific payload. Exactly one field must be set.
+  oneof spec {
+    NodeUpdateSpec node_update = 2;
+  }
+
+  // created_at is the server timestamp when the task was created.
+  google.protobuf.Timestamp created_at = 3;
+}
+
+// NodeUpdateSpec is the payload for a node update task. Fields mirror the
+// agent configuration (see docs/content/reference/agent/configuration.md).
+// The agent uses these values to re-provision the node, which includes
+// pointing it at a different cluster at runtime.
+message NodeUpdateSpec {
+  // kubernetes_version is the target Kubernetes version (e.g. "1.33.1").
+  string kubernetes_version = 1;
+
+  // api_server is the address of the Kubernetes API server.
+  string api_server = 2;
+
+  // ca_cert_base64 is the base64-encoded cluster CA certificate.
+  string ca_cert_base64 = 3;
+
+  // cluster_dns is the ClusterIP of the kube-dns Service.
+  string cluster_dns = 4;
+
+  // bootstrap_token is the token used for TLS bootstrapping. Omit when
+  // using TPM attestation.
+  string bootstrap_token = 5;
+
+  // oci_image is the OCI image reference for the rootfs. When empty the agent
+  // falls back to debootstrap.
+  string oci_image = 6;
+
+  // node_labels are key-value labels applied to the Node on registration.
+  map<string, string> node_labels = 7;
+
+  // register_with_taints are taints applied to the Node on registration
+  // in "key=value:effect" format.
+  repeated string register_with_taints = 8;
+}
+
+// TaskState enumerates the possible terminal states for a task.
+enum TaskState {
+  TASK_STATE_UNSPECIFIED = 0;
+  TASK_STATE_SUCCEEDED  = 1;
+  TASK_STATE_FAILED     = 2;
+}
+
+// ReportTaskStatusRequest is sent by the agent to report task completion.
+message ReportTaskStatusRequest {
+  // task_id is the id of the completed task.
+  string task_id = 1;
+
+  // state indicates whether the task succeeded or failed.
+  TaskState state = 2;
+
+  // message is an optional human-readable status or error description.
+  string message = 3;
+}
+
+// ReportTaskStatusResponse is the server acknowledgement.
+message ReportTaskStatusResponse {}

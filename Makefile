@@ -41,7 +41,15 @@ KUBECTL_UNBOUNDED_LDFLAGS=$(VERSION_LDFLAGS) -X github.com/Azure/unbounded-kube/
 METALMAN_TAG ?= latest
 METALMAN_IMAGE=$(CONTAINER_REGISTRY)/metalman:$(METALMAN_TAG)
 
-.PHONY: all help fmt lint test check-deps kubectl-unbounded forge inventory inventory-amd64 inventory-arm64 unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve
+# Proto tools (downloaded into hack/bin/ by hack/scripts/proto-tools.sh)
+PROTO_TOOLS=hack/scripts/proto-tools.sh
+HACK_BIN=hack/bin
+PROTOC=$(HACK_BIN)/protoc
+PROTOC_GEN_GO=$(HACK_BIN)/protoc-gen-go
+PROTOC_GEN_GO_GRPC=$(HACK_BIN)/protoc-gen-go-grpc
+PROTO_INCLUDE=$(HACK_BIN)/include
+
+.PHONY: all help fmt lint test check-deps kubectl-unbounded forge inventory inventory-amd64 inventory-arm64 unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests metalman metalman-build metalman-oci metalman-oci-push gomod proto-tools proto docs-serve
 
 ##@ General
 
@@ -79,6 +87,19 @@ test: lint ## Run all tests (implies lint)
 
 gomod: ## Tidy go.mod and go.sum
 	GOPROXY=direct $(GOMOD) tidy
+
+proto-tools: ## Download pinned protoc, protoc-gen-go, protoc-gen-go-grpc into hack/bin/
+	@bash $(PROTO_TOOLS)
+
+proto: proto-tools ## Generate Go code from .proto definitions
+	$(PROTOC) \
+		--proto_path=agent/api/v1 \
+		--proto_path=$(PROTO_INCLUDE) \
+		--plugin=protoc-gen-go=$(PROTOC_GEN_GO) \
+		--plugin=protoc-gen-go-grpc=$(PROTOC_GEN_GO_GRPC) \
+		--go_out=agent/api/v1 --go_opt=paths=source_relative \
+		--go-grpc_out=agent/api/v1 --go-grpc_opt=paths=source_relative \
+		agent/api/v1/agent.proto
 
 ##@ Build
 
