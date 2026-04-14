@@ -95,21 +95,13 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 				nodestart.StartKubelet(log, nodeStartGoalState),
 			}
 
-			// Phase 4 (optional): enable the agent daemon when a task
-			// server endpoint is configured.
-			if cfg.TaskServer != nil && cfg.TaskServer.Endpoint != "" {
-				log.Info("task server configured, enabling daemon",
-					"endpoint", cfg.TaskServer.Endpoint,
-				)
-
-				tasks = append(tasks, host.EnableDaemon(log, cfg.TaskServer.Endpoint))
-			}
-
 			if err := phases.Serial(log, tasks...).Do(ctx); err != nil {
 				return err
 			}
 
 			// Persist the applied config so the daemon can detect drift.
+			// This MUST happen before the daemon starts, because the
+			// daemon reads the applied config on task arrival.
 			nspawnMachineName := goalstates.NSpawnMachineKube1
 			if err := persistAppliedConfig(cfg, nspawnMachineName); err != nil {
 				return err
@@ -117,6 +109,20 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 			log.Info("applied config persisted",
 				"path", goalstates.AppliedConfigPath(nspawnMachineName),
 			)
+
+			// Phase 4 (optional): enable the agent daemon when a task
+			// server endpoint is configured. Runs after applied config
+			// is persisted so the daemon can find it immediately.
+			if cfg.TaskServer != nil && cfg.TaskServer.Endpoint != "" {
+				log.Info("task server configured, enabling daemon",
+					"endpoint", cfg.TaskServer.Endpoint,
+				)
+
+				daemonTask := host.EnableDaemon(log, cfg.TaskServer.Endpoint)
+				if err := daemonTask.Do(ctx); err != nil {
+					return err
+				}
+			}
 
 			return nil
 		},
