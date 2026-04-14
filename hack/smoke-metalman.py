@@ -462,6 +462,49 @@ def assert_node_ready(name: str, timeout: int = 300) -> None:
     die(f"Timed out waiting for Node '{name}' to become Ready")
 
 
+def assert_cloud_init_done(timeout: int = 900) -> None:
+    """Assert the Machine's CloudInitDone condition reaches True/Succeeded.
+
+    Called before waiting for the Kubernetes Node to appear because
+    cloud-init must finish before the kubelet can join the cluster.
+    Fails fast if the condition transitions to Failed so that the
+    smoke test does not wait for the full node-join timeout.
+    """
+    log(f"  Waiting for Machine '{NODE_NAME}' CloudInitDone condition...")
+    for elapsed in range(timeout):
+        check_procs()
+        result = subprocess.run(
+            [KUBECTL, "get", f"machines.{API_GROUP}", NODE_NAME, "-o", "json"],
+            capture_output=True, text=True,
+        )
+        status = ""
+        reason = ""
+        message = ""
+        if result.returncode == 0:
+            try:
+                conditions = json.loads(result.stdout).get("status", {}).get("conditions", [])
+                for c in conditions:
+                    if c.get("type") == "CloudInitDone":
+                        status = c.get("status", "")
+                        reason = c.get("reason", "")
+                        message = c.get("message", "")
+                        break
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+        if status == "True":
+            if reason != "Succeeded":
+                die(f"CloudInitDone condition is True but reason is {reason!r}, expected 'Succeeded'")
+            log(f"  Machine '{NODE_NAME}' CloudInitDone condition is True/Succeeded")
+            return
+        if status == "False" and reason == "Failed":
+            die(f"Cloud-init failed: {message}")
+        if elapsed > 0 and elapsed % 30 == 0:
+            log(f"    ({elapsed}s) CloudInitDone status={status or 'not set'} reason={reason or 'not set'}")
+        time.sleep(1)
+    die(f"Timed out waiting for CloudInitDone condition on Machine '{NODE_NAME}'")
+
+
 def main() -> None:
     signal.signal(signal.SIGINT, _sigint_handler)
     atexit.register(cleanup)
@@ -714,6 +757,9 @@ def main() -> None:
     # Log free space so we can correlate disk exhaustion with VM failures.
     df = subprocess.run(["df", "-h", str(TMPDIR)], capture_output=True, text=True)
     log(f"  Host disk after image builds:\n{df.stdout.strip()}")
+
+    log("Waiting for cloud-init to complete...")
+    assert_cloud_init_done(timeout=900)
 
     log("Waiting for kubelet to join the cluster...")
     wait_k8s_node(NODE_NAME, timeout=900)
