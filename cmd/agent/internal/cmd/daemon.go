@@ -53,7 +53,7 @@ pulls tasks as they arrive, executes them, and reports the result back.`,
 			if err != nil {
 				return fmt.Errorf("dial task server %q: %w", endpoint, err)
 			}
-			defer func() { _ = conn.Close() }()
+			defer conn.Close() //nolint:errcheck // Best-effort close of gRPC connection.
 
 			client := agentv1.NewTaskServerClient(conn)
 
