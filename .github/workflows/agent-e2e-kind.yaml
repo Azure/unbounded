@@ -119,7 +119,7 @@ jobs:
           kubectl -n kube-system rollout status daemonset/kindnet --timeout=60s
 
       - name: Create QEMU VM
-        run: python3 ./hack/agent/e2e-kind/e2e.py create-vm
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose create-vm
 
       - name: Attach Kind container to VM bridge
         run: |
@@ -143,50 +143,50 @@ jobs:
           sudo nsenter -t "${KIND_PID}" -n ip link set eth-e2e up
 
       - name: Install Machine CRD
-        run: python3 ./hack/agent/e2e-kind/e2e.py install-machine-crd
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose install-machine-crd
 
       # Case 1: Machine CR already exists when agent runs.
       - name: Pre-create Machine CR
-        run: python3 ./hack/agent/e2e-kind/e2e.py create-machine-cr
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose create-machine-cr
 
       - name: Run agent to join VM to cluster
-        run: python3 ./hack/agent/e2e-kind/e2e.py run-agent
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose run-agent
 
       - name: Wait for node to become Ready
-        run: python3 ./hack/agent/e2e-kind/e2e.py wait-for-node
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose wait-for-node
 
       - name: Validate Machine CR (preexisting)
-        run: python3 ./hack/agent/e2e-kind/e2e.py validate-machine-cr-preexisting
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-machine-cr-preexisting
 
       - name: Validate workload on agent node
-        run: python3 ./hack/agent/e2e-kind/e2e.py validate-workload
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-workload
 
       - name: Reset agent on VM
-        run: python3 ./hack/agent/e2e-kind/e2e.py reset-agent
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose reset-agent
 
       - name: Delete Machine CR
-        run: python3 ./hack/agent/e2e-kind/e2e.py delete-machine-cr
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose delete-machine-cr
 
       # Case 2: Machine CR does not exist when agent runs.
       # Recreate the VM so Case 2 starts with a pristine OS (the first
       # agent run leaves nftables/kube-proxy state that can interfere).
       - name: Recreate VM for Case 2
-        run: python3 ./hack/agent/e2e-kind/e2e.py recreate-vm
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose recreate-vm
 
       - name: Ensure Kind bridge attachment for Case 2
-        run: python3 ./hack/agent/e2e-kind/e2e.py ensure-kind-bridge
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose ensure-kind-bridge
 
       - name: Rejoin agent to cluster
-        run: python3 ./hack/agent/e2e-kind/e2e.py run-agent
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose run-agent
 
       - name: Wait for node to become Ready (rejoin)
-        run: python3 ./hack/agent/e2e-kind/e2e.py wait-for-node
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose wait-for-node
 
       - name: Validate Machine CR (created)
-        run: python3 ./hack/agent/e2e-kind/e2e.py validate-machine-cr-created
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-machine-cr-created
 
       - name: Validate workload on rejoined agent node
-        run: python3 ./hack/agent/e2e-kind/e2e.py validate-workload
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-workload
 
       - name: Collect VM logs
         if: always()
@@ -252,4 +252,4 @@ jobs:
 
       - name: Cleanup
         if: always()
-        run: python3 ./hack/agent/e2e-kind/e2e.py cleanup
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose cleanup

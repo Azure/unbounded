@@ -20,11 +20,21 @@
 #
 # Usage:
 #   ./hack/agent/e2e-kind/run-local.sh
+#   ./hack/agent/e2e-kind/run-local.sh --verbose   # enable diagnostic output
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 E2E="${REPO_ROOT}/hack/agent/e2e-kind/e2e.py"
+
+# Forward --verbose to e2e.py when passed to this script.
+E2E_VERBOSE=""
+for arg in "$@"; do
+    case "$arg" in
+        --verbose) E2E_VERBOSE="--verbose" ;;
+        *) echo "[ERROR] Unknown argument: $arg" >&2; exit 1 ;;
+    esac
+done
 
 export KIND_CLUSTER_NAME="${KIND_CLUSTER_NAME:-kind}"
 export VM_NAME="${VM_NAME:-agent-e2e}"
@@ -109,7 +119,7 @@ cleanup_forwarding() {
 cleanup() {
     info "Running cleanup..."
     cleanup_forwarding "${BRIDGE}"
-    python3 "$E2E" cleanup 2>/dev/null || true
+    python3 "$E2E" $E2E_VERBOSE cleanup 2>/dev/null || true
     kind delete cluster --name "${KIND_CLUSTER_NAME}" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -179,7 +189,7 @@ kubectl -n kube-system rollout status daemonset/kindnet --timeout=60s
 # ---------------------------------------------------------------------------
 # QEMU VM
 # ---------------------------------------------------------------------------
-python3 "$E2E" create-vm
+python3 "$E2E" $E2E_VERBOSE create-vm
 
 # Attach Kind container to VM bridge via a veth pair so that the VM
 # subnet is directly reachable at L2.
@@ -193,10 +203,15 @@ sudo ip link set eth-e2e netns "${KIND_PID}"
 sudo nsenter -t "${KIND_PID}" -n ip addr add "${VM_SUBNET}.2/24" dev eth-e2e
 sudo nsenter -t "${KIND_PID}" -n ip link set eth-e2e up
 
+# Prevent NetworkManager from detaching the veth from the bridge.
+if command -v nmcli &>/dev/null; then
+    sudo nmcli device set veth-kind-e2e managed no 2>/dev/null || true
+fi
+
 # ---------------------------------------------------------------------------
 # Install Machine CRD
 # ---------------------------------------------------------------------------
-python3 "$E2E" install-machine-crd
+python3 "$E2E" $E2E_VERBOSE install-machine-crd
 
 # ---------------------------------------------------------------------------
 # Case 1: Machine CR already exists when agent runs
@@ -207,13 +222,14 @@ echo "  Case 1: Machine CR already exists"
 echo "============================================"
 echo ""
 
-python3 "$E2E" create-machine-cr
-python3 "$E2E" run-agent
-python3 "$E2E" wait-for-node
-python3 "$E2E" validate-machine-cr-preexisting
-python3 "$E2E" validate-workload
-python3 "$E2E" reset-agent
-python3 "$E2E" delete-machine-cr
+python3 "$E2E" $E2E_VERBOSE create-machine-cr
+python3 "$E2E" $E2E_VERBOSE run-agent
+python3 "$E2E" $E2E_VERBOSE wait-for-node
+python3 "$E2E" $E2E_VERBOSE validate-machine-cr-preexisting
+python3 "$E2E" $E2E_VERBOSE validate-workload
+
+python3 "$E2E" $E2E_VERBOSE reset-agent
+python3 "$E2E" $E2E_VERBOSE delete-machine-cr
 
 # ---------------------------------------------------------------------------
 # Case 2: Machine CR does not exist when agent runs
@@ -226,13 +242,14 @@ echo ""
 
 # Recreate the VM so Case 2 starts with a pristine OS (the first agent
 # run leaves nftables/kube-proxy state that can interfere).
-python3 "$E2E" recreate-vm
-python3 "$E2E" ensure-kind-bridge
+python3 "$E2E" $E2E_VERBOSE recreate-vm
 
-python3 "$E2E" run-agent
-python3 "$E2E" wait-for-node
-python3 "$E2E" validate-machine-cr-created
-python3 "$E2E" validate-workload
+python3 "$E2E" $E2E_VERBOSE ensure-kind-bridge
+
+python3 "$E2E" $E2E_VERBOSE run-agent
+python3 "$E2E" $E2E_VERBOSE wait-for-node
+python3 "$E2E" $E2E_VERBOSE validate-machine-cr-created
+python3 "$E2E" $E2E_VERBOSE validate-workload
 
 # ---------------------------------------------------------------------------
 # Done (cleanup runs via trap)
