@@ -66,14 +66,7 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 				host.ApplyAttestation(log, cfg.Attest, cfg.MachineName, nodeStartGoalState),
 
 				// Phase 2: rootfs
-				rootfs.EnsureNSpawnWorkspace(log, rootFSGoalState),
-				phases.Parallel(log,
-					rootfs.DownloadKubeBinaries(log, rootFSGoalState),
-					rootfs.DownloadCRIBinaries(log, rootFSGoalState),
-					rootfs.DownloadCNIBinaries(log, rootFSGoalState),
-					rootfs.ConfigureOS(rootFSGoalState),
-					rootfs.DisableResolved(rootFSGoalState),
-				),
+				rootfs.Provision(log, rootFSGoalState),
 
 				// Register a Machine CR for this node if one does not already
 				// exist. This supports dynamic environments (manual-bootstrap,
@@ -83,14 +76,7 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 				nodestart.RegisterMachine(log, nodeStartGoalState),
 
 				// Phase 3: node-start
-				phases.Parallel(log,
-					nodestart.ConfigureContainerd(nodeStartGoalState),
-					nodestart.ConfigureKubelet(nodeStartGoalState),
-				),
-				nodestart.StartNSpawnMachine(log, nodeStartGoalState),
-				nodestart.SetupNVIDIA(log, nodeStartGoalState),
-				nodestart.StartContainerd(log, nodeStartGoalState),
-				nodestart.StartKubelet(log, nodeStartGoalState),
+				nodestart.StartNode(log, nodeStartGoalState),
 			}
 
 			if err := phases.Serial(log, tasks...).Do(ctx); err != nil {

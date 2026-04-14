@@ -21,7 +21,7 @@ type startNSpawnMachine struct {
 
 // StartNSpawnMachine returns a task that starts the systemd-nspawn machine using machinectl and
 // waits until D-Bus is responsive inside the machine so that subsequent phases
-// can safely use machineRun().
+// can safely use utilexec.MachineRun().
 func StartNSpawnMachine(log *slog.Logger, goalState *goalstates.NodeStart) phases.Task {
 	return &startNSpawnMachine{log: log, goalState: goalState}
 }
@@ -46,7 +46,7 @@ func (s *startNSpawnMachine) Do(ctx context.Context) error {
 
 // waitForMachine polls the machine until it is responsive to systemd-run
 // commands. machinectl start returns before D-Bus is ready, so phases that use
-// machineRun() would fail without this gate.
+// utilexec.MachineRun() would fail without this gate.
 func waitForMachine(ctx context.Context, log *slog.Logger, machine string) error {
 	const (
 		pollInterval = 500 * time.Millisecond
@@ -57,7 +57,7 @@ func waitForMachine(ctx context.Context, log *slog.Logger, machine string) error
 	defer cancel()
 
 	for {
-		if _, err := machineRun(ctx, log, machine, "/bin/true"); err == nil {
+		if _, err := utilexec.MachineRun(ctx, log, machine, "/bin/true"); err == nil {
 			return nil
 		}
 
@@ -68,15 +68,4 @@ func waitForMachine(ctx context.Context, log *slog.Logger, machine string) error
 		case <-time.After(pollInterval):
 		}
 	}
-}
-
-// machineRun executes a command inside the named nspawn machine using
-// systemd-run --machine=<machine> --pipe --wait. It streams stdout at Debug
-// and stderr at Error, and returns the captured stdout.
-func machineRun(ctx context.Context, log *slog.Logger, machine string, args ...string) (string, error) {
-	runArgs := make([]string, 0, 3+len(args))
-	runArgs = append(runArgs, "--machine="+machine, "--pipe", "--wait")
-	runArgs = append(runArgs, args...)
-
-	return utilexec.OutputCmd(ctx, log, "systemd-run", runArgs...)
 }

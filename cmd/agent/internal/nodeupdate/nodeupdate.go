@@ -6,11 +6,10 @@
 // applied config, this package orchestrates:
 //
 //  1. Provisioning a new nspawn machine (the alternate of the current one)
-//  2. Gracefully stopping kubelet and containerd inside the old machine
-//  3. Stopping the old nspawn machine
-//  4. Starting the new machine and verifying kubelet is running
-//  5. Removing the old machine
-//  6. Persisting the new applied config
+//  2. Stopping the old machine
+//  3. Starting the new machine and verifying kubelet is running
+//  4. Removing the old machine
+//  5. Persisting the new applied config
 package nodeupdate
 
 import (
@@ -26,6 +25,7 @@ import (
 	"github.com/Azure/unbounded-kube/cmd/agent/internal/goalstates"
 	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases"
 	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases/nodestart"
+	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases/nodestop"
 	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases/reset"
 	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases/rootfs"
 	"github.com/Azure/unbounded-kube/cmd/agent/internal/utilexec"
@@ -185,12 +185,11 @@ func MergeSpec(base *provision.AgentConfig, spec *NodeUpdateSpec) *provision.Age
 
 // Execute performs the nspawn machine update:
 //  1. Provision a new rootfs on the alternate machine
-//  2. Configure containerd and kubelet (pre-boot)
-//  3. Gracefully stop kubelet and containerd inside the old machine
-//  4. Stop the old nspawn machine
-//  5. Start the new machine, verify kubelet is running
-//  6. Remove the old machine
-//  7. Persist the new applied config, remove the old one
+//  2. Stop the old machine (graceful service shutdown + nspawn teardown)
+//  3. Start the new machine (configure, boot nspawn, start services)
+//  4. Verify kubelet health
+//  5. Remove the old machine
+//  6. Persist the new applied config, remove the old one
 func Execute(ctx context.Context, log *slog.Logger, active *ActiveMachine, newCfg *provision.AgentConfig) error {
 	oldMachine := active.Name
 	newMachine := goalstates.AlternateMachine(oldMachine)
@@ -212,59 +211,23 @@ func Execute(ctx context.Context, log *slog.Logger, active *ActiveMachine, newCf
 
 	// Step 1: Provision the new machine rootfs.
 	log.Info("provisioning new machine rootfs", "machine", newMachine)
-	provisionTasks := phases.Serial(log,
-		rootfs.EnsureNSpawnWorkspace(log, rootFSGoalState),
-		phases.Parallel(log,
-			rootfs.DownloadKubeBinaries(log, rootFSGoalState),
-			rootfs.DownloadCRIBinaries(log, rootFSGoalState),
-			rootfs.DownloadCNIBinaries(log, rootFSGoalState),
-			rootfs.ConfigureOS(rootFSGoalState),
-			rootfs.DisableResolved(rootFSGoalState),
-		),
-	)
-	if err := provisionTasks.Do(ctx); err != nil {
+	if err := rootfs.Provision(log, rootFSGoalState).Do(ctx); err != nil {
 		return fmt.Errorf("provision new machine %s: %w", newMachine, err)
 	}
 
-	// Step 2: Configure containerd and kubelet (pre-boot).
-	log.Info("configuring services for new machine", "machine", newMachine)
-	configureTasks := phases.Parallel(log,
-		nodestart.ConfigureContainerd(nodeStartGoalState),
-		nodestart.ConfigureKubelet(nodeStartGoalState),
-	)
-	if err := configureTasks.Do(ctx); err != nil {
-		return fmt.Errorf("configure services for %s: %w", newMachine, err)
-	}
-
-	// Step 3: Stop the old machine.
-	// First gracefully stop kubelet and containerd inside the container so
-	// the nspawn stop does not have to force-kill them, which is faster.
-	log.Info("pre-stopping services in old machine", "machine", oldMachine)
-	if _, err := machineRun(ctx, log, oldMachine, "systemctl", "stop", goalstates.SystemdUnitKubelet); err != nil {
-		log.Warn("failed to pre-stop kubelet (proceeding anyway)", "machine", oldMachine, "error", err)
-	}
-	if _, err := machineRun(ctx, log, oldMachine, "systemctl", "stop", goalstates.SystemdUnitContainerd); err != nil {
-		log.Warn("failed to pre-stop containerd (proceeding anyway)", "machine", oldMachine, "error", err)
-	}
-
+	// Step 2: Stop the old machine.
 	log.Info("stopping old machine", "machine", oldMachine)
-	if err := reset.StopMachine(log, oldMachine).Do(ctx); err != nil {
+	if err := nodestop.StopNode(log, oldMachine).Do(ctx); err != nil {
 		return fmt.Errorf("stop old machine %s: %w", oldMachine, err)
 	}
 
-	// Step 4: Start the new machine and verify health.
+	// Step 3: Start the new machine and verify health.
 	log.Info("starting new machine", "machine", newMachine)
-	startTasks := phases.Serial(log,
-		nodestart.StartNSpawnMachine(log, nodeStartGoalState),
-		nodestart.SetupNVIDIA(log, nodeStartGoalState),
-		nodestart.StartContainerd(log, nodeStartGoalState),
-		nodestart.StartKubelet(log, nodeStartGoalState),
-	)
-	if err := startTasks.Do(ctx); err != nil {
+	if err := nodestart.StartNode(log, nodeStartGoalState).Do(ctx); err != nil {
 		return fmt.Errorf("start new machine %s: %w", newMachine, err)
 	}
 
-	// Health check: verify kubelet is active inside the new machine.
+	// Step 4: Verify kubelet health.
 	log.Info("verifying kubelet health", "machine", newMachine)
 	if err := waitForKubelet(ctx, log, newMachine); err != nil {
 		return fmt.Errorf("kubelet health check on %s: %w", newMachine, err)
@@ -316,16 +279,6 @@ func persistAppliedConfig(cfg *provision.AgentConfig, machineName string) error 
 	return nil
 }
 
-// machineRun executes a command inside the named nspawn machine using
-// systemd-run --machine=<machine> --pipe --wait.
-func machineRun(ctx context.Context, log *slog.Logger, machine string, args ...string) (string, error) {
-	runArgs := make([]string, 0, 3+len(args))
-	runArgs = append(runArgs, "--machine="+machine, "--pipe", "--wait")
-	runArgs = append(runArgs, args...)
-
-	return utilexec.OutputCmd(ctx, log, "systemd-run", runArgs...)
-}
-
 // waitForKubelet polls the kubelet systemd service inside the nspawn machine
 // until it reports as active. This confirms the kubelet started successfully
 // after a machine update.
@@ -339,7 +292,7 @@ func waitForKubelet(ctx context.Context, log *slog.Logger, machine string) error
 	defer cancel()
 
 	for {
-		out, err := machineRun(ctx, log, machine,
+		out, err := utilexec.MachineRun(ctx, log, machine,
 			"systemctl", "is-active", goalstates.SystemdUnitKubelet,
 		)
 		if err == nil && strings.TrimSpace(out) == "active" {

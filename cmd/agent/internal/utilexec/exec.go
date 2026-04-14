@@ -63,7 +63,7 @@ func RunCmd(ctx context.Context, logger *slog.Logger, newCmd func(context.Contex
 
 // OutputCmd runs the command specified by name and args, streams stdout at
 // Debug and stderr at Error, and returns the captured stdout as a string.
-// Unlike RunCmd it does not require a command factory — just a binary path.
+// Unlike RunCmd it does not require a command factory - just a binary path.
 func OutputCmd(ctx context.Context, logger *slog.Logger, name string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
 
@@ -106,6 +106,17 @@ func OutputCmd(ctx context.Context, logger *slog.Logger, name string, args ...st
 	}
 
 	return strings.TrimRight(buf.String(), "\n"), nil
+}
+
+// MachineRun executes a command inside the named nspawn machine using
+// systemd-run --machine=<machine> --pipe --wait. It streams stdout at Debug
+// and stderr at Error, and returns the captured stdout.
+func MachineRun(ctx context.Context, log *slog.Logger, machine string, args ...string) (string, error) {
+	runArgs := make([]string, 0, 3+len(args))
+	runArgs = append(runArgs, "--machine="+machine, "--pipe", "--wait")
+	runArgs = append(runArgs, args...)
+
+	return OutputCmd(ctx, log, "systemd-run", runArgs...)
 }
 
 // streamLogs reads lines from reader and logs each one at the given level.
