@@ -3,7 +3,7 @@
 
 //go:build linux
 
-package utilio
+package goalstates
 
 import (
 	"fmt"
@@ -11,8 +11,8 @@ import (
 	"syscall"
 )
 
-// HostKernel returns the running kernel version (equivalent to uname -r).
-func HostKernel() (string, error) {
+// hostKernel returns the running kernel version (equivalent to uname -r).
+func hostKernel() (string, error) {
 	var utsname syscall.Utsname
 	if err := syscall.Uname(&utsname); err != nil {
 		return "", fmt.Errorf("uname: %w", err)

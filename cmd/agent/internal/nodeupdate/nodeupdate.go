@@ -1,9 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-// Package nodeupdate implements blue-green nspawn machine updates for the
-// unbounded-agent daemon. When a NodeUpdateSpec task arrives with different
-// configuration from the currently applied config, this package orchestrates:
+// Package nodeupdate implements nspawn machine updates for the unbounded-agent
+// daemon. When a NodeUpdateSpec task arrives with different configuration from
+// the currently applied config, this package orchestrates:
 //
 //  1. Provisioning a new nspawn machine (the alternate of the current one)
 //  2. Gracefully stopping kubelet and containerd inside the old machine
@@ -15,14 +15,11 @@ package nodeupdate
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
-	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 
@@ -179,7 +176,7 @@ func MergeSpec(base *provision.AgentConfig, spec *agentv1.NodeUpdateSpec) *provi
 	return &merged
 }
 
-// Execute performs the blue-green nspawn machine update:
+// Execute performs the nspawn machine update:
 //  1. Provision a new rootfs on the alternate machine
 //  2. Configure containerd and kubelet (pre-boot)
 //  3. Gracefully stop kubelet and containerd inside the old machine
@@ -191,7 +188,7 @@ func Execute(ctx context.Context, log *slog.Logger, active *ActiveMachine, newCf
 	oldMachine := active.Name
 	newMachine := goalstates.AlternateMachine(oldMachine)
 
-	log.Info("starting blue-green node update",
+	log.Info("starting node update",
 		"old_machine", oldMachine,
 		"new_machine", newMachine,
 		"old_version", active.Config.Cluster.Version,
@@ -199,15 +196,12 @@ func Execute(ctx context.Context, log *slog.Logger, active *ActiveMachine, newCf
 	)
 
 	// Resolve goal states for the new machine.
-	rootFSGoalState, err := resolveRootFSGoalState(log, newCfg, newMachine)
+	gs, err := goalstates.ResolveMachine(log, newCfg, newMachine)
 	if err != nil {
-		return fmt.Errorf("resolve rootfs goal state: %w", err)
+		return fmt.Errorf("resolve machine goal state: %w", err)
 	}
-
-	nodeStartGoalState, err := resolveNodeStartGoalState(newCfg, newMachine, rootFSGoalState.Nvidia)
-	if err != nil {
-		return fmt.Errorf("resolve nodestart goal state: %w", err)
-	}
+	rootFSGoalState := gs.RootFS
+	nodeStartGoalState := gs.NodeStart
 
 	// Step 1: Provision the new machine rootfs.
 	log.Info("provisioning new machine rootfs", "machine", newMachine)
@@ -292,7 +286,7 @@ func Execute(ctx context.Context, log *slog.Logger, active *ActiveMachine, newCf
 			"path", oldConfigPath, "error", err)
 	}
 
-	log.Info("blue-green node update completed",
+	log.Info("node update completed",
 		"active_machine", newMachine,
 		"version", newCfg.Cluster.Version,
 	)
@@ -315,100 +309,6 @@ func persistAppliedConfig(cfg *provision.AgentConfig, machineName string) error 
 	return nil
 }
 
-// resolveRootFSGoalState builds the rootfs goal state for the given machine.
-func resolveRootFSGoalState(log *slog.Logger, cfg *provision.AgentConfig, machineName string) (*goalstates.RootFS, error) {
-	kubeVersion := cfg.Cluster.Version
-
-	kernel, err := utilio.HostKernel()
-	if err != nil {
-		return nil, err
-	}
-
-	hostname, err := os.Hostname()
-	if err != nil {
-		return nil, fmt.Errorf("get host hostname: %w", err)
-	}
-
-	nvidia, err := goalstates.ResolveNvidiaHost(runtime.GOARCH)
-	if err != nil {
-		return nil, err
-	}
-
-	ociImage := cfg.OCIImage
-	if ociImage == "" {
-		if len(nvidia.GPUDevicePaths) > 0 {
-			ociImage = goalstates.DefaultNvidiaOCImage
-		} else {
-			ociImage = goalstates.DefaultOCIImage
-		}
-		log.Info("no OCI image configured, using default", "image", ociImage)
-	}
-
-	return &goalstates.RootFS{
-		MachineDir: filepath.Join("/var/lib/machines", machineName),
-		NSpawnConfigFile: filepath.Join(
-			goalstates.SystemdNSpawnDir,
-			machineName+".nspawn",
-		),
-		ServiceOverrideFile: filepath.Join(
-			goalstates.SystemdSystemDir,
-			fmt.Sprintf("systemd-nspawn@%s.service.d", machineName),
-			"override.conf",
-		),
-		HostArch:          runtime.GOARCH,
-		HostKernel:        kernel,
-		Hostname:          hostname,
-		ContainerdVersion: goalstates.ContainerdVersion,
-		RunCVersion:       goalstates.RunCVersion,
-		CNIPluginVersion:  goalstates.CNIPluginVersion,
-		KubernetesVersion: kubeVersion,
-		OCIImage:          ociImage,
-		Nvidia:            nvidia,
-		HostDevicePaths:   goalstates.DiscoverHostDevicePaths(),
-	}, nil
-}
-
-// resolveNodeStartGoalState builds the nodestart goal state for the given machine.
-func resolveNodeStartGoalState(cfg *provision.AgentConfig, machineName string, nvidia goalstates.NvidiaHost) (*goalstates.NodeStart, error) {
-	kubelet, err := resolveKubeletGoalState(cfg)
-	if err != nil {
-		return nil, err
-	}
-
-	return &goalstates.NodeStart{
-		MachineName: machineName,
-		MachineDir:  filepath.Join("/var/lib/machines", machineName),
-		Containerd:  goalstates.ResolveContainerd(),
-		Kubelet:     kubelet,
-		Nvidia:      nvidia,
-	}, nil
-}
-
-// resolveKubeletGoalState builds the kubelet goal state from agent config.
-func resolveKubeletGoalState(cfg *provision.AgentConfig) (goalstates.Kubelet, error) {
-	var zero goalstates.Kubelet
-
-	caCert, err := base64.StdEncoding.DecodeString(cfg.Cluster.CaCertBase64)
-	if err != nil {
-		return zero, fmt.Errorf("decode CaCertBase64: %w", err)
-	}
-
-	labels := cfg.Kubelet.Labels
-	if labels == nil {
-		labels = make(map[string]string)
-	}
-
-	return goalstates.Kubelet{
-		KubeletBinPath:     filepath.Join("/"+goalstates.BinDir, "kubelet"),
-		BootstrapToken:     cfg.Kubelet.BootstrapToken,
-		APIServer:          cfg.Kubelet.ApiServer,
-		CACertData:         caCert,
-		ClusterDNS:         cfg.Cluster.ClusterDNS,
-		NodeLabels:         labels,
-		RegisterWithTaints: cfg.Kubelet.RegisterWithTaints,
-	}, nil
-}
-
 // machineRun executes a command inside the named nspawn machine using
 // systemd-run --machine=<machine> --pipe --wait.
 func machineRun(ctx context.Context, log *slog.Logger, machine string, args ...string) (string, error) {
@@ -421,7 +321,7 @@ func machineRun(ctx context.Context, log *slog.Logger, machine string, args ...s
 
 // waitForKubelet polls the kubelet systemd service inside the nspawn machine
 // until it reports as active. This confirms the kubelet started successfully
-// after a blue-green update.
+// after a machine update.
 func waitForKubelet(ctx context.Context, log *slog.Logger, machine string) error {
 	const (
 		pollInterval = 2 * time.Second

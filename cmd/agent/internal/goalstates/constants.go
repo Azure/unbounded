@@ -17,7 +17,7 @@ const (
 	SystemdSystemDir = "/etc/systemd/system"
 )
 
-// NSpawn machine names used for blue/green style in-place upgrades.
+// NSpawn machine names used for alternating in-place upgrades.
 //
 //   - NSpawnMachineKube1 is the initial (default) machine name.
 //   - NSpawnMachineKube2 will be used for the next upgrade cycle.
@@ -34,7 +34,7 @@ const (
 	NSpawnMachineKube2 = "kube2"
 )
 
-// AlternateMachine returns the other machine name in the blue-green pair.
+// AlternateMachine returns the other machine name in the pair.
 // kube1 -> kube2, kube2 -> kube1.
 func AlternateMachine(current string) string {
 	if current == NSpawnMachineKube1 {

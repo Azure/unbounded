@@ -236,7 +236,7 @@ func executeTask(ctx context.Context, log *slog.Logger, task *agentv1.Task) (age
 }
 
 // executeNodeUpdate handles a NodeUpdateSpec task by detecting drift against
-// the applied config and performing a blue-green nspawn machine update if
+// the applied config and performing an nspawn machine update if
 // needed.
 func executeNodeUpdate(ctx context.Context, log *slog.Logger, spec *agentv1.NodeUpdateSpec) (agentv1.TaskState, string) {
 	log.Info("executing node update task",
@@ -261,12 +261,12 @@ func executeNodeUpdate(ctx context.Context, log *slog.Logger, spec *agentv1.Node
 		return agentv1.TaskState_TASK_STATE_SUCCEEDED, "no drift detected"
 	}
 
-	log.Info("drift detected, starting blue-green update")
+	log.Info("drift detected, starting node update")
 
 	// Merge the spec into the current config.
 	newCfg := nodeupdate.MergeSpec(active.Config, spec)
 
-	// Execute the blue-green update.
+	// Execute the node update.
 	if err := nodeupdate.Execute(ctx, log, active, newCfg); err != nil {
 		log.Error("node update failed", "error", err)
 		return agentv1.TaskState_TASK_STATE_FAILED, fmt.Sprintf("node update: %v", err)
