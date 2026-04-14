@@ -19,12 +19,13 @@ import (
 )
 
 func newCmdDaemon(cmdCtx *CommandContext) *cobra.Command {
+	var endpoint string
+
 	cmd := &cobra.Command{
 		Use:   "daemon",
 		Short: "Run the agent daemon to pull and execute tasks",
-		Long: `Run a long-lived daemon that connects to the configured task server via
-gRPC, pulls tasks as they arrive, executes them, and reports the result
-back. The agent reads the TaskServer.Endpoint from its config file.`,
+		Long: `Run a long-lived daemon that connects to the task server via gRPC,
+pulls tasks as they arrive, executes them, and reports the result back.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx, cancel := signal.NotifyContext(cmd.Context(), os.Interrupt)
 			defer cancel()
@@ -32,22 +33,15 @@ back. The agent reads the TaskServer.Endpoint from its config file.`,
 			cmdCtx.Setup()
 			log := cmdCtx.Logger
 
+			if endpoint == "" {
+				return fmt.Errorf("--endpoint is required")
+			}
+
 			log.Info("starting daemon",
 				"version", version.Version,
 				"commit", version.GitCommit,
+				"endpoint", endpoint,
 			)
-
-			cfg, err := loadConfig()
-			if err != nil {
-				return err
-			}
-
-			if cfg.TaskServer == nil || cfg.TaskServer.Endpoint == "" {
-				return fmt.Errorf("TaskServer.Endpoint is not configured")
-			}
-
-			endpoint := cfg.TaskServer.Endpoint
-			log.Info("connecting to task server", "endpoint", endpoint)
 
 			conn, err := grpc.NewClient(
 				endpoint,
@@ -108,6 +102,8 @@ back. The agent reads the TaskServer.Endpoint from its config file.`,
 			}
 		},
 	}
+
+	cmd.Flags().StringVar(&endpoint, "endpoint", "", "gRPC endpoint of the task server (required)")
 
 	return cmd
 }

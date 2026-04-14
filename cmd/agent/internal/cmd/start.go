@@ -58,7 +58,8 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 
 			log := cmdCtx.Logger
 
-			return phases.Serial(log,
+			// Build the list of phases to execute.
+			tasks := []phases.Task{
 				// Phase 1: host
 				host.InstallPackages(log),
 				phases.Parallel(log,
@@ -90,7 +91,19 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 				nodestart.SetupNVIDIA(log, nodeStartGoalState),
 				nodestart.StartContainerd(log, nodeStartGoalState),
 				nodestart.StartKubelet(log, nodeStartGoalState),
-			).Do(ctx)
+			}
+
+			// Phase 4 (optional): enable the agent daemon when a task
+			// server endpoint is configured.
+			if cfg.TaskServer != nil && cfg.TaskServer.Endpoint != "" {
+				log.Info("task server configured, enabling daemon",
+					"endpoint", cfg.TaskServer.Endpoint,
+				)
+
+				tasks = append(tasks, host.EnableDaemon(log, cfg.TaskServer.Endpoint))
+			}
+
+			return phases.Serial(log, tasks...).Do(ctx)
 		},
 	}
 
