@@ -227,7 +227,6 @@ func TestBuildAgentConfig(t *testing.T) {
 				require.Equal(t, "prod", cfg.Kubelet.Labels["env"])
 				require.Equal(t, "infra", cfg.Kubelet.Labels["team"])
 				require.Equal(t, "provider-val", cfg.Kubelet.Labels["provider-key"])
-				require.Equal(t, "true", cfg.Kubelet.Labels["node.cloudprovider.kubernetes.io/exclude-from-external-cloud-provider"])
 
 				require.Equal(t, []string{"dedicated=gpu:NoSchedule"}, cfg.Kubelet.RegisterWithTaints)
 			},
@@ -247,9 +246,8 @@ func TestBuildAgentConfig(t *testing.T) {
 				require.Equal(t, "bare-machine", cfg.MachineName)
 				require.Equal(t, "v1.33.0", cfg.Cluster.Version)
 
-				// Common labels should be present.
-				require.Equal(t, "true", cfg.Kubelet.Labels["node.cloudprovider.kubernetes.io/exclude-from-external-cloud-provider"])
-				require.Len(t, cfg.Kubelet.Labels, 1)
+				// No labels are added for a bare machine.
+				require.Empty(t, cfg.Kubelet.Labels)
 				require.Nil(t, cfg.Kubelet.RegisterWithTaints)
 				require.Empty(t, cfg.OCIImage)
 			},
@@ -320,8 +318,7 @@ func TestBuildAgentConfig(t *testing.T) {
 			},
 			assert: func(t *testing.T, cfg AgentConfig) {
 				require.Equal(t, "value", cfg.Kubelet.Labels["key"])
-				require.Equal(t, "true", cfg.Kubelet.Labels["node.cloudprovider.kubernetes.io/exclude-from-external-cloud-provider"])
-				require.Len(t, cfg.Kubelet.Labels, 2)
+				require.Len(t, cfg.Kubelet.Labels, 1)
 			},
 		},
 		{

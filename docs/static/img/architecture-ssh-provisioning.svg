@@ -18,7 +18,7 @@
   <!-- Step 1: kubectl command                            -->
   <!-- ═══════════════════════════════════════════════════ -->
   <rect x="30" y="25" width="280" height="36" rx="6" fill="#18181b" stroke="#4d8eff" stroke-width="1.5" stroke-opacity="0.6"/>
-  <text x="170" y="48" text-anchor="middle" fill="#4d8eff" font-size="12" font-weight="600" font-family="'SF Mono', 'Fira Code', monospace">kubectl unbounded site add-machine</text>
+  <text x="170" y="48" text-anchor="middle" fill="#4d8eff" font-size="12" font-weight="600" font-family="'SF Mono', 'Fira Code', monospace">kubectl unbounded machine register</text>
 
   <!-- Arrow down -->
   <line x1="170" y1="61" x2="170" y2="85" stroke="#4d8eff" stroke-width="1.5" marker-end="url(#arrowDown)"/>

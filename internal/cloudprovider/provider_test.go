@@ -119,12 +119,5 @@ func TestCommonDefaultLabels(t *testing.T) {
 
 	labels := CommonDefaultLabels()
 
-	require.Contains(t, labels, ExcludeFromCloudProviderLabel)
-	require.Equal(t, "true", labels[ExcludeFromCloudProviderLabel])
-}
-
-func TestExcludeFromCloudProviderLabel_Constant(t *testing.T) {
-	t.Parallel()
-
-	require.Equal(t, "node.cloudprovider.kubernetes.io/exclude-from-external-cloud-provider", ExcludeFromCloudProviderLabel)
+	require.Empty(t, labels)
 }

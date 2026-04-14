@@ -7,6 +7,7 @@ on:
   pull_request:
     paths:
       - cmd/agent/**
+      - cmd/kubectl-unbounded/**
       - internal/provision/**
       - internal/kube/**
       - hack/agent/e2e-kind/**
@@ -19,6 +20,7 @@ on:
     branches: [main]
     paths:
       - cmd/agent/**
+      - cmd/kubectl-unbounded/**
       - internal/provision/**
       - internal/kube/**
       - hack/agent/e2e-kind/**
@@ -203,15 +205,16 @@ jobs:
           # Kubelet and containerd run inside the nspawn container, not on
           # the host.  Use 'journalctl -M <machine>' to read the container
           # journal, and fall back to machinectl shell if that doesn't work.
-          MACHINE="${AGENT_MACHINE_NAME}"
-          $SSH "sudo journalctl -M ${MACHINE} --no-pager -l" > logs/nspawn-journal.log 2>/dev/null || true
-          $SSH "sudo journalctl -M ${MACHINE} -u kubelet --no-pager -l" > logs/nspawn-kubelet.log 2>/dev/null || true
-          $SSH "sudo journalctl -M ${MACHINE} -u containerd --no-pager -l" > logs/nspawn-containerd.log 2>/dev/null || true
-          # Also list running machines and their status
+          # The nspawn machine name is fixed to kube1/kube2 (decoupled from
+          # the Kubernetes node name).
           $SSH "sudo machinectl list --no-pager" > logs/vm-machines.txt 2>/dev/null || true
-          $SSH "sudo machinectl status ${MACHINE} --no-pager" > logs/vm-machine-status.txt 2>/dev/null || true
-          # List systemd units inside the container
-          $SSH "sudo machinectl shell ${MACHINE} /usr/bin/systemctl list-units --no-pager" > logs/nspawn-units.txt 2>/dev/null || true
+          for MACHINE in kube1 kube2; do
+            $SSH "sudo journalctl -M ${MACHINE} --no-pager -l" > logs/nspawn-${MACHINE}-journal.log 2>/dev/null || true
+            $SSH "sudo journalctl -M ${MACHINE} -u kubelet --no-pager -l" > logs/nspawn-${MACHINE}-kubelet.log 2>/dev/null || true
+            $SSH "sudo journalctl -M ${MACHINE} -u containerd --no-pager -l" > logs/nspawn-${MACHINE}-containerd.log 2>/dev/null || true
+            $SSH "sudo machinectl status ${MACHINE} --no-pager" > logs/vm-machine-${MACHINE}-status.txt 2>/dev/null || true
+            $SSH "sudo machinectl shell ${MACHINE} /usr/bin/systemctl list-units --no-pager" > logs/nspawn-${MACHINE}-units.txt 2>/dev/null || true
+          done
 
       - name: Collect cluster state
         if: always()

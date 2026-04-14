@@ -5,8 +5,10 @@ package reset
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"time"
 
 	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases"
@@ -103,6 +105,12 @@ func (t *removeMachine) Name() string { return "remove-machine" }
 
 func (t *removeMachine) Do(ctx context.Context) error {
 	machineDir := fmt.Sprintf("/var/lib/machines/%s", t.machineName)
+
+	// Skip entirely if the machine directory doesn't exist — nothing to remove.
+	if _, err := os.Stat(machineDir); errors.Is(err, os.ErrNotExist) {
+		t.log.Info("machine rootfs not present, nothing to remove", "machine", t.machineName)
+		return nil
+	}
 
 	t.log.Info("removing machine rootfs", "machine", t.machineName, "dir", machineDir)
 

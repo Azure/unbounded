@@ -106,12 +106,7 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 
 // ref: cmd/machina/machina/controller/machine_controller.go
 func resolveRootFSGoalState(log *slog.Logger, cfg *provision.AgentConfig) (*goalstates.RootFS, error) {
-	// TODO: investigate whether the rootfs name can be decoupled from the
-	// machine name. Using a fixed rootfs name (e.g. "node") would simplify
-	// tool invocations (machinectl, systemctl) and allow the nspawn unit to
-	// be templated once. For now we derive it from the machine name so the
-	// rootfs identity matches what the controller expects.
-	machineName := cfg.MachineName
+	nspawnMachineName := goalstates.NSpawnMachineKube1
 	kubeVersion := cfg.Cluster.Version
 
 	kernel, err := hostKernel() //nolint:staticcheck // SA4023: non-Linux stub always errors; this is intentional.
@@ -132,14 +127,14 @@ func resolveRootFSGoalState(log *slog.Logger, cfg *provision.AgentConfig) (*goal
 	ociImage := resolveOCIImage(log, cfg.OCIImage, len(nvidia.GPUDevicePaths) > 0)
 
 	return &goalstates.RootFS{
-		MachineDir: filepath.Join("/var/lib/machines", machineName),
+		MachineDir: filepath.Join("/var/lib/machines", nspawnMachineName),
 		NSpawnConfigFile: filepath.Join(
 			goalstates.SystemdNSpawnDir,
-			machineName+".nspawn",
+			nspawnMachineName+".nspawn",
 		),
 		ServiceOverrideFile: filepath.Join(
 			goalstates.SystemdSystemDir,
-			fmt.Sprintf("systemd-nspawn@%s.service.d", machineName),
+			fmt.Sprintf("systemd-nspawn@%s.service.d", nspawnMachineName),
 			"override.conf",
 		),
 		HostArch:          runtime.GOARCH,
@@ -157,7 +152,7 @@ func resolveRootFSGoalState(log *slog.Logger, cfg *provision.AgentConfig) (*goal
 
 // ref: cmd/machina/machina/controller/machine_controller.go
 func resolveNodeStartGoalState(cfg *provision.AgentConfig, nvidia goalstates.NvidiaHost) (*goalstates.NodeStart, error) {
-	machineName := cfg.MachineName
+	nspawnMachineName := goalstates.NSpawnMachineKube1
 
 	kubelet, err := resolveKubeletGoalState(cfg)
 	if err != nil {
@@ -165,8 +160,8 @@ func resolveNodeStartGoalState(cfg *provision.AgentConfig, nvidia goalstates.Nvi
 	}
 
 	return &goalstates.NodeStart{
-		MachineName: machineName,
-		MachineDir:  filepath.Join("/var/lib/machines", machineName),
+		MachineName: nspawnMachineName,
+		MachineDir:  filepath.Join("/var/lib/machines", nspawnMachineName),
 		Containerd:  goalstates.ResolveContainerd(),
 		Kubelet:     kubelet,
 		Nvidia:      nvidia,

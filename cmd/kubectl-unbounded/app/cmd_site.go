@@ -17,7 +17,6 @@ func siteCommandGroup() *cobra.Command {
 
 	cmd.AddCommand(
 		siteInitCommand(),
-		siteAddMachineCommand(),
 		deployPXECommand(),
 		metalmancmd.ServePXECmd())
 
