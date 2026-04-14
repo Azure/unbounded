@@ -15,10 +15,6 @@ import (
 	"github.com/Azure/unbounded-kube/internal/version"
 )
 
-// defaultConfigPath is the well-known location for the agent config file
-// written by cloud-init based bootstrapping.
-const defaultConfigPath = "/etc/unbounded-agent/config.json"
-
 func newCmdReset(cmdCtx *CommandContext) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "reset",

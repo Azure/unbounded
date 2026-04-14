@@ -7,16 +7,28 @@
 Creates a QEMU VM, joins it to a Kind cluster using the production
 provision install script, and validates workloads run on the new node.
 
+Options:
+    --verbose                          Enable diagnostic output (network diags).
+
 Subcommands (called as individual workflow steps):
-    create-vm          Create bridge networking and launch a QEMU VM.
-    run-agent          Build agent, extract cluster info, run provision script.
-    wait-for-node      Wait for the node to appear and become Ready.
-    validate-workload  Deploy test pods on the agent node.
-    cleanup            Tear down VM, networking, and Kind cluster.
+    create-vm                          Create bridge networking and launch a QEMU VM.
+    recreate-vm                        Destroy and recreate VM with a fresh disk (keeps networking).
+    ensure-kind-bridge                 Verify/repair veth pair connecting Kind to VM bridge.
+    run-agent                          Build agent, generate bootstrap script, run on VM.
+    wait-for-node                      Wait for the node to appear and become Ready.
+    validate-workload                  Deploy test pods on the agent node.
+    install-machine-crd                Install Machine CRD and bootstrapper RBAC.
+    create-machine-cr                  Pre-create a Machine CR for the agent node.
+    delete-machine-cr                  Delete the Machine CR.
+    validate-machine-cr-preexisting    Verify agent preserved a pre-existing Machine CR.
+    validate-machine-cr-created        Verify agent self-registered a Machine CR.
+    reset-agent                        Run agent reset and verify cleanup.
+    cleanup                            Tear down VM, networking, and Kind cluster.
 """
 
 from __future__ import annotations
 
+import argparse
 import base64
 import json
 import os
@@ -46,6 +58,7 @@ VM_GATEWAY = f"{VM_SUBNET}.1"
 VM_DIR = Path(os.environ.get("VM_DIR", str(REPO_ROOT / ".vm-e2e")))
 
 KIND_CLUSTER_NAME = os.environ.get("KIND_CLUSTER_NAME", "kind")
+KIND_CONTAINER = f"{KIND_CLUSTER_NAME}-control-plane"
 AGENT_MACHINE_NAME = os.environ.get("AGENT_MACHINE_NAME", "agent-e2e")
 AGENT_DEBUG = os.environ.get("AGENT_DEBUG", "")
 
@@ -58,6 +71,9 @@ NSPAWN_MACHINE_NAMES = ["kube1", "kube2"]
 BRIDGE_NAME = "virbr-e2e"
 TAP_NAME = "tap-e2e"
 SERVE_PORT = 8199
+
+# Set to True by --verbose flag; gates diagnostic output.
+VERBOSE = False
 
 SSH_KEY_DIR = VM_DIR / "ssh"
 SSH_KEY = SSH_KEY_DIR / "id_ed25519"
@@ -85,6 +101,35 @@ def log(msg: str) -> None:
 def die(msg: str) -> None:
     print(f"[ERROR] {msg}", file=sys.stderr, flush=True)
     sys.exit(1)
+
+
+def diag(msg: str) -> None:
+    """Print a diagnostic message only when --verbose is active."""
+    if VERBOSE:
+        print(f"[DIAG]  {msg}", flush=True)
+
+
+def _nm_unmanage(iface: str) -> None:
+    """Tell NetworkManager to leave *iface* alone.
+
+    NetworkManager can silently detach interfaces from their bridge master.
+    Calling ``nmcli device set <iface> managed no`` prevents this.  The
+    setting is runtime-only (resets when NM restarts) so it does not touch
+    any persistent configuration files.
+
+    No-op if ``nmcli`` is not installed or if the command fails (NM may not
+    be running).
+    """
+    if shutil.which("nmcli") is None:
+        return
+    result = subprocess.run(
+        ["sudo", "nmcli", "device", "set", iface, "managed", "no"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+    )
+    if result.returncode == 0:
+        diag(f"Told NetworkManager to ignore {iface}")
+    else:
+        diag(f"nmcli device set {iface} managed no failed (rc={result.returncode}), continuing")
 
 
 def run(args: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
@@ -126,52 +171,41 @@ def _b64(val: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# create-vm
+# create-vm / recreate-vm helpers
 # ---------------------------------------------------------------------------
-def create_vm() -> None:
-    """Create bridge networking and launch a QEMU VM."""
+def _stop_qemu() -> None:
+    """Stop the QEMU VM process if it is running."""
+    pid_file = VM_DIR / f"{VM_NAME}.pid"
+    if not pid_file.exists():
+        return
 
-    # Pre-flight
-    for cmd in ("qemu-system-x86_64", "qemu-img", "genisoimage"):
-        if shutil.which(cmd) is None:
-            die(f"{cmd} is required but not found in PATH")
-    if not os.access("/dev/kvm", os.R_OK):
-        die("/dev/kvm is not accessible. Enable KVM for hardware acceleration.")
+    pid = int(pid_file.read_text().strip())
+    try:
+        os.kill(pid, 0)
+        log(f"Stopping VM '{VM_NAME}' (PID: {pid})...")
+        os.kill(pid, 15)
+        time.sleep(2)
+        try:
+            os.kill(pid, 0)
+            log("Force killing VM...")
+            os.kill(pid, 9)
+        except OSError:
+            pass  # already exited after SIGTERM
+    except OSError:
+        pass  # already gone
+    pid_file.unlink(missing_ok=True)
 
-    VM_DIR.mkdir(parents=True, exist_ok=True)
-    SSH_KEY_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Generate SSH key pair
-    if not SSH_KEY.exists():
-        log("Generating SSH key pair...")
-        run(["ssh-keygen", "-t", "ed25519", "-f", str(SSH_KEY), "-N", "", "-q"])
+def _launch_vm(ssh_pub_key: str) -> None:
+    """Create a fresh VM disk, cloud-init ISO, launch QEMU, and wait for SSH.
 
-    ssh_pub_key = SSH_KEY.with_suffix(".pub").read_text().strip()
+    Assumes VM_DIR, the base cloud image, and the SSH key pair already exist.
+    Networking (bridge, TAP, NAT) must already be configured.
+    """
 
-    # Create bridge network
-    log(f"Creating bridge network {BRIDGE_NAME}...")
-    run_quiet(["sudo", "ip", "link", "del", BRIDGE_NAME], check=False)
-    run(["sudo", "ip", "link", "add", BRIDGE_NAME, "type", "bridge"])
-    run(["sudo", "ip", "addr", "add", f"{VM_GATEWAY}/24", "dev", BRIDGE_NAME])
-    run(["sudo", "ip", "link", "set", BRIDGE_NAME, "up"])
-
-    # NAT for the VM subnet
-    run(["sudo", "iptables", "-t", "nat", "-A", "POSTROUTING",
-         "-s", f"{VM_SUBNET}.0/24", "!", "-d", f"{VM_SUBNET}.0/24", "-j", "MASQUERADE"])
-
-    # TAP device
-    run(["sudo", "ip", "tuntap", "add", "dev", TAP_NAME, "mode", "tap"])
-    run(["sudo", "ip", "link", "set", TAP_NAME, "master", BRIDGE_NAME])
-    run(["sudo", "ip", "link", "set", TAP_NAME, "up"])
-
-    # Download Ubuntu cloud image
-    image_url = "https://cloud-images.ubuntu.com/minimal/releases/noble/release/ubuntu-24.04-minimal-cloudimg-amd64.img"
     image_file = VM_DIR / "ubuntu-cloud-amd64.img"
     if not image_file.exists():
-        log("Downloading Ubuntu 24.04 cloud image...")
-        run(["curl", "-fsSL", "-o", str(image_file), image_url])
-    else:
-        log(f"Using existing image: {image_file}")
+        die(f"Base cloud image not found: {image_file}. Run create-vm first.")
 
     # Create VM disk
     vm_disk = VM_DIR / f"{VM_NAME}.qcow2"
@@ -232,8 +266,11 @@ def create_vm() -> None:
     """))
 
     meta_data = VM_DIR / "meta-data"
+    # Use a unique instance-id so cloud-init treats this as a new instance
+    # even when reusing the same VM_DIR.
+    instance_id = f"{VM_NAME}-{secrets.token_hex(4)}"
     meta_data.write_text(textwrap.dedent(f"""\
-        instance-id: {VM_NAME}
+        instance-id: {instance_id}
         local-hostname: {VM_NAME}
     """))
 
@@ -316,10 +353,174 @@ def create_vm() -> None:
 
 
 # ---------------------------------------------------------------------------
+# create-vm
+# ---------------------------------------------------------------------------
+def create_vm() -> None:
+    """Create bridge networking and launch a QEMU VM."""
+
+    # Pre-flight
+    for cmd in ("qemu-system-x86_64", "qemu-img", "genisoimage"):
+        if shutil.which(cmd) is None:
+            die(f"{cmd} is required but not found in PATH")
+    if not os.access("/dev/kvm", os.R_OK):
+        die("/dev/kvm is not accessible. Enable KVM for hardware acceleration.")
+
+    VM_DIR.mkdir(parents=True, exist_ok=True)
+    SSH_KEY_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Generate SSH key pair
+    if not SSH_KEY.exists():
+        log("Generating SSH key pair...")
+        run(["ssh-keygen", "-t", "ed25519", "-f", str(SSH_KEY), "-N", "", "-q"])
+
+    ssh_pub_key = SSH_KEY.with_suffix(".pub").read_text().strip()
+
+    # Create bridge network
+    log(f"Creating bridge network {BRIDGE_NAME}...")
+    run_quiet(["sudo", "ip", "link", "del", BRIDGE_NAME], check=False)
+    run(["sudo", "ip", "link", "add", BRIDGE_NAME, "type", "bridge"])
+    run(["sudo", "ip", "addr", "add", f"{VM_GATEWAY}/24", "dev", BRIDGE_NAME])
+    run(["sudo", "ip", "link", "set", BRIDGE_NAME, "up"])
+
+    # NAT for the VM subnet
+    run(["sudo", "iptables", "-t", "nat", "-A", "POSTROUTING",
+         "-s", f"{VM_SUBNET}.0/24", "!", "-d", f"{VM_SUBNET}.0/24", "-j", "MASQUERADE"])
+
+    # TAP device
+    run(["sudo", "ip", "tuntap", "add", "dev", TAP_NAME, "mode", "tap"])
+    run(["sudo", "ip", "link", "set", TAP_NAME, "master", BRIDGE_NAME])
+    run(["sudo", "ip", "link", "set", TAP_NAME, "up"])
+
+    # Prevent NetworkManager from detaching interfaces from the bridge.
+    _nm_unmanage(BRIDGE_NAME)
+    _nm_unmanage(TAP_NAME)
+
+    # Download Ubuntu cloud image
+    image_url = "https://cloud-images.ubuntu.com/minimal/releases/noble/release/ubuntu-24.04-minimal-cloudimg-amd64.img"
+    image_file = VM_DIR / "ubuntu-cloud-amd64.img"
+    if not image_file.exists():
+        log("Downloading Ubuntu 24.04 cloud image...")
+        run(["curl", "-fsSL", "-o", str(image_file), image_url])
+    else:
+        log(f"Using existing image: {image_file}")
+
+    _launch_vm(ssh_pub_key)
+
+
+# ---------------------------------------------------------------------------
+# recreate-vm
+# ---------------------------------------------------------------------------
+def recreate_vm() -> None:
+    """Destroy and recreate the QEMU VM with a fresh disk.
+
+    Bridge networking, the TAP device, and the Kind cluster veth pair are
+    left intact.  Only the QEMU process and VM disk are replaced, giving
+    Case 2 a pristine VM with no state left over from Case 1.
+    """
+
+    if not SSH_KEY.exists():
+        die(f"SSH key not found: {SSH_KEY}. Run create-vm first.")
+
+    ssh_pub_key = SSH_KEY.with_suffix(".pub").read_text().strip()
+
+    _stop_qemu()
+    _launch_vm(ssh_pub_key)
+
+
+# ---------------------------------------------------------------------------
+# ensure-kind-bridge
+# ---------------------------------------------------------------------------
+VETH_HOST = "veth-kind-e2e"
+VETH_KIND = "eth-e2e"
+
+
+def ensure_kind_bridge() -> None:
+    """Ensure the Kind container is connected to the VM bridge via a veth pair.
+
+    Checks whether veth-kind-e2e is attached to virbr-e2e on the host and
+    eth-e2e exists inside the Kind container with the correct IP.  If
+    anything is missing or broken the veth pair is (re)created.
+
+    This is safe to call repeatedly (idempotent) and is used between
+    Case 1 and Case 2 to guard against the veth pair being detached from
+    the bridge by external events (Docker, kernel, etc.).
+    """
+    log(f"Ensuring Kind container is attached to bridge {BRIDGE_NAME}...")
+
+    needs_repair = False
+
+    # 1. Check if veth-kind-e2e exists on the host and is a member of
+    #    the correct bridge.
+    result = subprocess.run(
+        ["ip", "-j", "link", "show", VETH_HOST],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        log(f"  {VETH_HOST} does not exist on host - will create")
+        needs_repair = True
+    else:
+        try:
+            link_info = json.loads(result.stdout)
+            master = link_info[0].get("master", "")
+            if master != BRIDGE_NAME:
+                log(f"  {VETH_HOST} exists but master='{master}' (expected '{BRIDGE_NAME}') - will recreate")
+                needs_repair = True
+            else:
+                log(f"  {VETH_HOST} is correctly attached to {BRIDGE_NAME}")
+        except (ValueError, IndexError, KeyError):
+            log(f"  Could not parse ip -j output for {VETH_HOST} - will recreate")
+            needs_repair = True
+
+    # 2. Check if eth-e2e exists inside the Kind container with the
+    #    expected IP address.
+    if not needs_repair:
+        result = subprocess.run(
+            ["docker", "exec", KIND_CONTAINER, "ip", "addr", "show", VETH_KIND],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            log(f"  {VETH_KIND} does not exist in Kind container - will recreate")
+            needs_repair = True
+        elif f"{VM_SUBNET}.2/24" not in result.stdout:
+            log(f"  {VETH_KIND} exists but missing {VM_SUBNET}.2/24 - will recreate")
+            needs_repair = True
+
+    if not needs_repair:
+        log("  Bridge attachment is healthy - no action needed")
+        return
+
+    # 3. Repair: delete any stale veth and recreate the pair.
+    log("  Repairing bridge attachment...")
+    kind_pid = capture([
+        "docker", "inspect", KIND_CONTAINER,
+        "--format", "{{.State.Pid}}",
+    ])
+
+    # Deleting either end destroys the whole pair, so this is safe even
+    # if only one end still exists.
+    run_quiet(["sudo", "ip", "link", "delete", VETH_HOST], check=False)
+
+    run(["sudo", "ip", "link", "add", VETH_HOST, "type", "veth",
+         "peer", "name", VETH_KIND])
+    run(["sudo", "ip", "link", "set", VETH_HOST, "master", BRIDGE_NAME])
+    run(["sudo", "ip", "link", "set", VETH_HOST, "up"])
+    run(["sudo", "ip", "link", "set", VETH_KIND, "netns", kind_pid])
+    run(["sudo", "nsenter", "-t", kind_pid, "-n",
+         "ip", "addr", "add", f"{VM_SUBNET}.2/24", "dev", VETH_KIND])
+    run(["sudo", "nsenter", "-t", kind_pid, "-n",
+         "ip", "link", "set", VETH_KIND, "up"])
+
+    # Prevent NetworkManager from detaching the veth from the bridge.
+    _nm_unmanage(VETH_HOST)
+
+    log(f"  Repaired: {VETH_HOST} -> {BRIDGE_NAME} -> {VETH_KIND} in Kind container")
+
+
+# ---------------------------------------------------------------------------
 # run-agent
 # ---------------------------------------------------------------------------
 def run_agent() -> None:
-    """Build agent, extract cluster info, run provision install script on VM."""
+    """Build agent, generate bootstrap script, and run it on the VM."""
 
     if not SSH_KEY.exists():
         die(f"SSH key not found: {SSH_KEY}. Run create-vm first.")
@@ -380,9 +581,8 @@ def _run_agent_inner(agent_url: str) -> None:
     # Determine the Kind control-plane IP so connectivity checks have the
     # correct address even when the local kubeconfig uses 127.0.0.1.
     log(f"Resolving Kind control-plane IP for '{KIND_CLUSTER_NAME}'...")
-    kind_container = f"{KIND_CLUSTER_NAME}-control-plane"
     kind_ip = capture([
-        "docker", "inspect", kind_container,
+        "docker", "inspect", KIND_CONTAINER,
         "--format", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
     ])
     if not kind_ip:
@@ -400,6 +600,7 @@ def _run_agent_inner(agent_url: str) -> None:
     log("Creating bootstrap token...")
     token_id = secrets.token_hex(3)
     token_secret = secrets.token_hex(8)
+    (VM_DIR / "token-id").write_text(token_id)
     bootstrap_group = "system:bootstrappers:kubeadm:default-node-token"
 
     token_manifest = json.dumps({
@@ -430,8 +631,10 @@ def _run_agent_inner(agent_url: str) -> None:
     # Capture the local API server URL from the kubeconfig (typically
     # https://127.0.0.1:<port> for Kind) so we can replace it with the
     # VM-reachable container IP after generating the script.
+    # Use --minify to scope to the current context only, avoiding picking up
+    # the wrong cluster when multiple contexts exist in the kubeconfig.
     local_api_server = kubectl_capture([
-        "config", "view", "--raw",
+        "config", "view", "--minify", "--raw",
         "-o", "jsonpath={.clusters[0].cluster.server}",
     ])
     if not local_api_server:
@@ -543,6 +746,81 @@ def wait_for_node() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Network diagnostics (non-fatal)
+# ---------------------------------------------------------------------------
+def _run_diag(label: str, args: list[str]) -> None:
+    """Run a single diagnostic command, printing its output under *label*.
+
+    Only produces output when ``--verbose`` is active.
+    """
+    if not VERBOSE:
+        return
+    diag(label)
+    result = subprocess.run(args, capture_output=True, text=True, check=False)
+    out = (result.stdout or "").rstrip()
+    err = (result.stderr or "").rstrip()
+    if out:
+        for line in out.splitlines():
+            print(f"  {line}", flush=True)
+    if err:
+        for line in err.splitlines():
+            print(f"  (stderr) {line}", flush=True)
+    if result.returncode != 0:
+        print(f"  (exit code {result.returncode})", flush=True)
+
+
+def _log_network_diagnostics() -> None:
+    """Emit non-fatal network diagnostics from the VM, Kind container, and host.
+
+    Only produces output when ``--verbose`` is active.  Called in
+    validate_workload() after the pod reaches Running but before we attempt
+    ``kubectl logs`` (which proxies through the kubelet and may fail with
+    "no route to host" if there is a networking issue between the Kind
+    container and the VM).
+    """
+    if not VERBOSE:
+        return
+    log("=== Network diagnostics (non-fatal) ===")
+
+    # -- From the VM (via SSH) --
+    _run_diag("VM: nft list ruleset",
+              ["ssh", *SSH_OPTS, SSH_TARGET, "sudo", "nft", "list", "ruleset"])
+    # Show ALL listening TCP sockets (unfiltered) so we can see what port
+    # the kubelet is actually on.  sudo is needed to see process names for
+    # sockets owned by nspawn processes.
+    _run_diag("VM: sudo ss -tlnp (all listening)",
+              ["ssh", *SSH_OPTS, SSH_TARGET, "sudo", "ss", "-tlnp"])
+    _run_diag("VM: ip addr show",
+              ["ssh", *SSH_OPTS, SSH_TARGET, "ip", "addr", "show"])
+
+    # -- From the Kind container --
+    _run_diag("Kind: ip addr show eth-e2e",
+              ["docker", "exec", KIND_CONTAINER, "ip", "addr", "show", "eth-e2e"])
+    _run_diag("Kind: ip route",
+              ["docker", "exec", KIND_CONTAINER, "ip", "route"])
+    _run_diag("Kind: ip neigh show",
+              ["docker", "exec", KIND_CONTAINER, "ip", "neigh", "show"])
+    _run_diag("Kind: ping VM",
+              ["docker", "exec", KIND_CONTAINER,
+               "ping", "-c", "2", "-W", "2", VM_IP])
+    _run_diag("Kind: curl kubelet /healthz",
+              ["docker", "exec", KIND_CONTAINER,
+               "curl", "-sk", "--connect-timeout", "5",
+               f"https://{VM_IP}:10250/healthz"])
+
+    # -- From the host --
+    # Show ALL interfaces so we can verify veth-kind-e2e exists and is UP.
+    _run_diag("Host: ip link show (all)",
+              ["ip", "link", "show"])
+    _run_diag("Host: ip -d link show type veth",
+              ["ip", "-d", "link", "show", "type", "veth"])
+    _run_diag("Host: bridge link show",
+              ["bridge", "link", "show"])
+
+    log("=== End network diagnostics ===")
+
+
+# ---------------------------------------------------------------------------
 # validate-workload
 # ---------------------------------------------------------------------------
 def validate_workload() -> None:
@@ -604,9 +882,34 @@ def validate_workload() -> None:
         subprocess.run([KUBECTL, "describe", "pod", "e2e-hello", "-n", TEST_NS], check=False)
         die(f"Timed out waiting for pod 'e2e-hello' to be Running after {timeout_secs}s")
 
-    # Check logs
+    # Emit network diagnostics before attempting kubectl logs.  The API
+    # server proxies log requests through the kubelet (port 10250) on the
+    # agent node.  If the Kind container cannot reach the VM this will fail
+    # with "no route to host".  The diagnostics help pinpoint the cause.
+    _log_network_diagnostics()
+
+    # Check logs (retry; kubectl logs can fail transiently right after a pod
+    # starts because the API server proxies to the kubelet which may not have
+    # the log stream ready yet).
     log("Checking pod logs...")
-    logs = capture([KUBECTL, "logs", "e2e-hello", "-n", TEST_NS])
+    logs = ""
+    log_attempts = 6
+    for attempt in range(1, log_attempts + 1):
+        result = subprocess.run(
+            [KUBECTL, "logs", "e2e-hello", "-n", TEST_NS],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            logs = result.stdout.strip()
+            break
+        if attempt < log_attempts:
+            log(f"  kubectl logs failed (attempt {attempt}/{log_attempts}): {result.stderr.strip()}")
+            time.sleep(5)
+        else:
+            log(f"  kubectl logs failed (attempt {attempt}/{log_attempts}): {result.stderr.strip()}")
+            subprocess.run([KUBECTL, "describe", "pod", "e2e-hello", "-n", TEST_NS], check=False)
+            die(f"kubectl logs failed after {log_attempts} attempts")
+
     print(logs, flush=True)
     if "Hello from unbounded agent node!" not in logs:
         die("Pod logs do not contain expected message")
@@ -695,6 +998,7 @@ def reset_agent() -> None:
         "ssh", *SSH_OPTS, "-o", "ServerAliveInterval=30", SSH_TARGET,
         "sudo unbounded-agent reset",
     ])
+
     log("Agent reset completed on VM")
 
     # Verify the node is removed from the cluster
@@ -739,38 +1043,163 @@ def reset_agent() -> None:
 
 
 # ---------------------------------------------------------------------------
+# install-machine-crd
+# ---------------------------------------------------------------------------
+def install_machine_crd() -> None:
+    """Install the Machine CRD and bootstrapper RBAC into the cluster."""
+
+    crd_path = REPO_ROOT / "deploy" / "machina" / "crd" / "unbounded-kube.io_machines.yaml"
+    rbac_path = REPO_ROOT / "deploy" / "machina" / "07-bootstrapper-rbac.yaml"
+
+    if not crd_path.exists():
+        die(f"Machine CRD not found: {crd_path}")
+    if not rbac_path.exists():
+        die(f"Bootstrapper RBAC not found: {rbac_path}")
+
+    log("Installing Machine CRD...")
+    kubectl(["apply", "-f", str(crd_path)])
+
+    log("Installing bootstrapper RBAC...")
+    kubectl(["apply", "-f", str(rbac_path)])
+
+    log("Machine CRD and bootstrapper RBAC installed")
+
+
+# ---------------------------------------------------------------------------
+# create-machine-cr
+# ---------------------------------------------------------------------------
+def create_machine_cr() -> None:
+    """Pre-create a Machine CR for the agent node.
+
+    The CR is annotated with ``e2e-test/precreated: "true"`` so that
+    validate-machine-cr-preexisting can verify the agent left it untouched.
+    """
+
+    log(f"Pre-creating Machine CR '{AGENT_MACHINE_NAME}'...")
+
+    manifest = json.dumps({
+        "apiVersion": "unbounded-kube.io/v1alpha3",
+        "kind": "Machine",
+        "metadata": {
+            "name": AGENT_MACHINE_NAME,
+            "annotations": {"e2e-test/precreated": "true"},
+        },
+        "spec": {},
+    })
+    kubectl(["apply", "-f", "-"], input=manifest.encode())
+
+    log(f"Machine CR '{AGENT_MACHINE_NAME}' pre-created")
+
+
+# ---------------------------------------------------------------------------
+# delete-machine-cr
+# ---------------------------------------------------------------------------
+def delete_machine_cr() -> None:
+    """Delete the Machine CR (idempotent)."""
+
+    log(f"Deleting Machine CR '{AGENT_MACHINE_NAME}'...")
+    run_quiet([KUBECTL, "delete", "machine", AGENT_MACHINE_NAME,
+               "--ignore-not-found"], check=False)
+    log(f"Machine CR '{AGENT_MACHINE_NAME}' deleted")
+
+
+# ---------------------------------------------------------------------------
+# validate-machine-cr-preexisting
+# ---------------------------------------------------------------------------
+def validate_machine_cr_preexisting() -> None:
+    """Validate the agent preserved a pre-existing Machine CR.
+
+    Asserts the Machine CR still exists and retains the
+    ``e2e-test/precreated`` annotation, proving the agent detected the
+    existing CR and skipped registration.
+    """
+
+    log(f"Validating pre-existing Machine CR '{AGENT_MACHINE_NAME}'...")
+
+    try:
+        machine_json = kubectl_capture([
+            "get", "machine", AGENT_MACHINE_NAME, "-o", "json",
+        ])
+    except subprocess.CalledProcessError:
+        die(f"Machine CR '{AGENT_MACHINE_NAME}' not found - expected pre-existing CR to still exist")
+
+    machine = json.loads(machine_json)
+    annotations = machine.get("metadata", {}).get("annotations", {})
+
+    if annotations.get("e2e-test/precreated") != "true":
+        die("e2e-test/precreated annotation missing - agent may have deleted and recreated the CR")
+
+    log("Machine CR still has e2e-test/precreated annotation")
+
+    log("============================================")
+    log("  Machine CR validation PASSED (preexisting)")
+    log("============================================")
+
+
+# ---------------------------------------------------------------------------
+# validate-machine-cr-created
+# ---------------------------------------------------------------------------
+def validate_machine_cr_created() -> None:
+    """Validate the agent self-registered a Machine CR during bootstrap.
+
+    Asserts the Machine CR exists, does NOT have the pre-created marker
+    annotation, and has the correct ``bootstrapTokenRef`` derived from
+    the bootstrap token created by run-agent.
+    """
+
+    token_id_file = VM_DIR / "token-id"
+    if not token_id_file.exists():
+        die(f"Token ID file not found: {token_id_file}. Run run-agent first.")
+    token_id = token_id_file.read_text().strip()
+
+    log(f"Validating agent-created Machine CR '{AGENT_MACHINE_NAME}'...")
+
+    try:
+        machine_json = kubectl_capture([
+            "get", "machine", AGENT_MACHINE_NAME, "-o", "json",
+        ])
+    except subprocess.CalledProcessError:
+        die(f"Machine CR '{AGENT_MACHINE_NAME}' not found - expected agent to create it")
+
+    machine = json.loads(machine_json)
+
+    # Must NOT have the pre-created marker.
+    annotations = machine.get("metadata", {}).get("annotations", {})
+    if "e2e-test/precreated" in annotations:
+        die("e2e-test/precreated annotation found - CR was not created by the agent")
+
+    # Verify bootstrapTokenRef.
+    k8s_spec = machine.get("spec", {}).get("kubernetes", {})
+    token_ref = k8s_spec.get("bootstrapTokenRef", {}).get("name", "")
+    expected_ref = f"bootstrap-token-{token_id}"
+    if token_ref != expected_ref:
+        die(f"bootstrapTokenRef mismatch: got '{token_ref}', expected '{expected_ref}'")
+
+    log(f"bootstrapTokenRef is correct: {token_ref}")
+
+    log("============================================")
+    log("  Machine CR validation PASSED (created)")
+    log("============================================")
+
+
+# ---------------------------------------------------------------------------
 # cleanup
 # ---------------------------------------------------------------------------
 def cleanup() -> None:
     """Tear down VM, networking, and Kind cluster."""
 
     # Stop QEMU VM
-    pid_file = VM_DIR / f"{VM_NAME}.pid"
-    if pid_file.exists():
-        pid = int(pid_file.read_text().strip())
-        try:
-            os.kill(pid, 0)
-            log(f"Stopping VM '{VM_NAME}' (PID: {pid})...")
-            os.kill(pid, 15)
-            time.sleep(2)
-            try:
-                os.kill(pid, 0)
-                log("Force killing VM...")
-                os.kill(pid, 9)
-            except OSError:
-                # Process already exited after SIGTERM; nothing to force kill.
-                pass
-        except OSError:
-            # Process already gone or cannot be signaled; safe to ignore during cleanup.
-            pass
-        pid_file.unlink(missing_ok=True)
+    _stop_qemu()
 
     # Remove networking
     log("Cleaning up networking...")
     run_quiet(["sudo", "ip", "link", "del", TAP_NAME], check=False)
     run_quiet(["sudo", "ip", "link", "del", BRIDGE_NAME], check=False)
 
-    # Remove iptables rules (best-effort)
+    # Remove iptables/nftables forwarding rules (best-effort).
+    # Rules may have been inserted via legacy iptables (into FORWARD) or
+    # via native nft (into the nftables DOCKER-USER chain). We attempt
+    # removal from both paths since we don't know which was used.
     for rule in [
         ["sudo", "iptables", "-D", "FORWARD", "-i", BRIDGE_NAME, "-j", "ACCEPT"],
         ["sudo", "iptables", "-D", "FORWARD", "-o", BRIDGE_NAME, "-j", "ACCEPT"],
@@ -779,6 +1208,24 @@ def cleanup() -> None:
          "-s", f"{VM_SUBNET}.0/24", "!", "-d", f"{VM_SUBNET}.0/24", "-j", "MASQUERADE"],
     ]:
         run_quiet(rule, check=False)
+
+    # On nftables-managed Docker (Fedora, Arch, etc.) rules were inserted
+    # directly via nft into ip filter DOCKER-USER. Remove them by handle.
+    if shutil.which("nft"):
+        try:
+            out = subprocess.run(
+                ["sudo", "nft", "-a", "list", "chain", "ip", "filter", "DOCKER-USER"],
+                capture_output=True, text=True,
+            )
+            if out.returncode == 0:
+                for line in out.stdout.splitlines():
+                    if BRIDGE_NAME in line and "handle" in line:
+                        handle = line.strip().split()[-1]
+                        run_quiet(["sudo", "nft", "delete", "rule", "ip",
+                                   "filter", "DOCKER-USER", "handle", handle],
+                                  check=False)
+        except Exception:
+            pass  # best-effort
 
     # Delete Kind cluster
     if shutil.which("kind"):
@@ -798,20 +1245,42 @@ def cleanup() -> None:
 # ---------------------------------------------------------------------------
 COMMANDS = {
     "create-vm": create_vm,
+    "recreate-vm": recreate_vm,
+    "ensure-kind-bridge": ensure_kind_bridge,
     "run-agent": run_agent,
     "wait-for-node": wait_for_node,
     "validate-workload": validate_workload,
+    "install-machine-crd": install_machine_crd,
+    "create-machine-cr": create_machine_cr,
+    "delete-machine-cr": delete_machine_cr,
+    "validate-machine-cr-preexisting": validate_machine_cr_preexisting,
+    "validate-machine-cr-created": validate_machine_cr_created,
     "reset-agent": reset_agent,
     "cleanup": cleanup,
 }
 
 
 def main() -> None:
-    if len(sys.argv) != 2 or sys.argv[1] not in COMMANDS:
-        cmds = ", ".join(COMMANDS)
-        die(f"Usage: {sys.argv[0]} <{cmds}>")
+    global VERBOSE  # noqa: PLW0603
 
-    COMMANDS[sys.argv[1]]()
+    parser = argparse.ArgumentParser(
+        description="Agent E2E Kind test harness",
+    )
+    parser.add_argument(
+        "command",
+        choices=sorted(COMMANDS),
+        help="Subcommand to run",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        default=False,
+        help="Enable verbose diagnostic output",
+    )
+    args = parser.parse_args()
+    VERBOSE = args.verbose
+
+    COMMANDS[args.command]()
 
 
 if __name__ == "__main__":
