@@ -2,12 +2,16 @@
 // Licensed under the MIT License.
 
 // e2e-task-server is a minimal gRPC server that implements the TaskServer
-// service for end-to-end testing. It queues a single NodeUpdateSpec task
-// and logs the status report from the agent.
+// service for end-to-end testing. It sends up to two NodeUpdateSpec tasks:
+//
+//  1. A "no-drift" task with the current cluster Kubernetes version.
+//  2. An optional "upgrade" task with a different version (triggers
+//     drift detection and a blue-green update attempt).
 //
 // Usage:
 //
 //	go run ./hack/agent/e2e-task-server --listen=:50051 --kubernetes-version=1.33.1
+//	go run ./hack/agent/e2e-task-server --listen=:50051 --kubernetes-version=1.33.1 --upgrade-kubernetes-version=1.33.2
 package main
 
 import (
@@ -29,7 +33,8 @@ import (
 
 func main() {
 	listen := flag.String("listen", ":50051", "gRPC listen address")
-	kubeVersion := flag.String("kubernetes-version", "", "Kubernetes version for the NodeUpdateSpec task")
+	kubeVersion := flag.String("kubernetes-version", "", "Kubernetes version for the no-drift task (required)")
+	upgradeVersion := flag.String("upgrade-kubernetes-version", "", "Kubernetes version for the upgrade task (optional)")
 	flag.Parse()
 
 	if *kubeVersion == "" {
@@ -44,8 +49,8 @@ func main() {
 		log.Fatalf("listen %s: %v", *listen, err)
 	}
 
-	srv := &server{
-		task: &agentv1.Task{
+	tasks := []*agentv1.Task{
+		{
 			Id: "e2e-update-001",
 			Spec: &agentv1.Task_NodeUpdate{
 				NodeUpdate: &agentv1.NodeUpdateSpec{
@@ -54,7 +59,24 @@ func main() {
 			},
 			CreatedAt: timestamppb.Now(),
 		},
-		done: make(chan struct{}),
+	}
+
+	if *upgradeVersion != "" {
+		tasks = append(tasks, &agentv1.Task{
+			Id: "e2e-upgrade-002",
+			Spec: &agentv1.Task_NodeUpdate{
+				NodeUpdate: &agentv1.NodeUpdateSpec{
+					KubernetesVersion: *upgradeVersion,
+				},
+			},
+			CreatedAt: timestamppb.Now(),
+		})
+		log.Printf("upgrade task configured: version %s -> %s", *kubeVersion, *upgradeVersion)
+	}
+
+	srv := &server{
+		tasks:   tasks,
+		reports: make(map[string]*reportEntry),
 	}
 
 	gs := grpc.NewServer()
@@ -66,39 +88,79 @@ func main() {
 		gs.GracefulStop()
 	}()
 
-	log.Printf("e2e-task-server listening on %s", lis.Addr())
+	log.Printf("e2e-task-server listening on %s (tasks: %d)", lis.Addr(), len(tasks))
 	if err := gs.Serve(lis); err != nil {
 		log.Fatalf("serve: %v", err)
 	}
+}
+
+// reportEntry holds the status report and a channel that is closed when
+// the report is received.
+type reportEntry struct {
+	req  *agentv1.ReportTaskStatusRequest
+	done chan struct{} // closed when the report arrives
 }
 
 // server implements agentv1.TaskServerServer for e2e testing.
 type server struct {
 	agentv1.UnimplementedTaskServerServer
 
-	task *agentv1.Task
+	tasks []*agentv1.Task
 
-	// mu protects reported.
-	mu       sync.Mutex
-	reported *agentv1.ReportTaskStatusRequest
-
-	// done is closed when a status report is received.
-	done chan struct{}
+	mu      sync.Mutex
+	reports map[string]*reportEntry // keyed by task ID
 }
 
-// PullTasks sends the pre-configured task to the agent and then keeps the
-// stream open until the client disconnects or the server shuts down.
-func (s *server) PullTasks(_ *agentv1.PullTasksRequest, stream grpc.ServerStreamingServer[agentv1.PullTasksResponse]) error {
-	log.Printf("PullTasks: agent connected, sending task %s", s.task.GetId())
+// getOrCreateEntry returns the report entry for the given task ID,
+// creating one if it does not exist. Must be called with s.mu held.
+func (s *server) getOrCreateEntry(taskID string) *reportEntry {
+	e, ok := s.reports[taskID]
+	if !ok {
+		e = &reportEntry{done: make(chan struct{})}
+		s.reports[taskID] = e
+	}
+	return e
+}
 
-	if err := stream.Send(&agentv1.PullTasksResponse{Task: s.task}); err != nil {
-		return fmt.Errorf("send task: %w", err)
+// waitForReport blocks until the report for taskID arrives or the context
+// is cancelled.
+func (s *server) waitForReport(ctx context.Context, taskID string) error {
+	s.mu.Lock()
+	e := s.getOrCreateEntry(taskID)
+	s.mu.Unlock()
+
+	select {
+	case <-e.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// PullTasks sends tasks to the agent one at a time. For each task after
+// the first, it waits for the previous task's status report before sending
+// the next one. The stream is held open after all tasks are sent.
+func (s *server) PullTasks(_ *agentv1.PullTasksRequest, stream grpc.ServerStreamingServer[agentv1.PullTasksResponse]) error {
+	for i, task := range s.tasks {
+		// Wait for the previous task to be reported before sending the next.
+		if i > 0 {
+			prevID := s.tasks[i-1].GetId()
+			log.Printf("PullTasks: waiting for report on task %s before sending next", prevID)
+			if err := s.waitForReport(stream.Context(), prevID); err != nil {
+				return fmt.Errorf("wait for task %s report: %w", prevID, err)
+			}
+		}
+
+		log.Printf("PullTasks: sending task %d/%d: %s", i+1, len(s.tasks), task.GetId())
+		if err := stream.Send(&agentv1.PullTasksResponse{Task: task}); err != nil {
+			return fmt.Errorf("send task %s: %w", task.GetId(), err)
+		}
 	}
 
-	log.Printf("PullTasks: task %s sent, holding stream open", s.task.GetId())
+	log.Printf("PullTasks: all %d tasks sent, holding stream open", len(s.tasks))
 
-	// Hold the stream open until the client disconnects or the context
-	// is cancelled (server shutdown).
+	// Hold the stream open until the client disconnects or the server
+	// shuts down.
 	<-stream.Context().Done()
 	return stream.Context().Err()
 }
@@ -109,27 +171,29 @@ func (s *server) ReportTaskStatus(_ context.Context, req *agentv1.ReportTaskStat
 		req.GetTaskId(), req.GetState(), req.GetMessage())
 
 	s.mu.Lock()
-	first := s.reported == nil
-	s.reported = req
-	s.mu.Unlock()
-
-	if first {
-		close(s.done)
+	e := s.getOrCreateEntry(req.GetTaskId())
+	if e.req == nil {
+		e.req = req
+		close(e.done)
 	}
+	s.mu.Unlock()
 
 	return &agentv1.ReportTaskStatusResponse{}, nil
 }
 
-// WaitForReport blocks until a status report is received or the timeout
-// expires. This is intended for programmatic callers (not used by gRPC
-// clients).
-func (s *server) WaitForReport(timeout time.Duration) (*agentv1.ReportTaskStatusRequest, error) {
+// WaitForReport blocks until a status report for the given task ID is
+// received or the timeout expires.
+func (s *server) WaitForReport(taskID string, timeout time.Duration) (*agentv1.ReportTaskStatusRequest, error) {
+	s.mu.Lock()
+	e := s.getOrCreateEntry(taskID)
+	s.mu.Unlock()
+
 	select {
-	case <-s.done:
+	case <-e.done:
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		return s.reported, nil
+		return e.req, nil
 	case <-time.After(timeout):
-		return nil, fmt.Errorf("timed out waiting for status report after %s", timeout)
+		return nil, fmt.Errorf("timed out waiting for status report on %s after %s", taskID, timeout)
 	}
 }
