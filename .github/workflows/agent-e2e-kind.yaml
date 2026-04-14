@@ -156,6 +156,9 @@ jobs:
       - name: Validate task-pull daemon
         run: python3 ./hack/agent/e2e-kind/e2e.py validate-task-pull
 
+      - name: Start upgrade task server
+        run: python3 ./hack/agent/e2e-kind/e2e.py start-upgrade-task
+
       - name: Validate node upgrade attempt
         run: python3 ./hack/agent/e2e-kind/e2e.py validate-node-upgrade
 

@@ -13,6 +13,7 @@ Subcommands (called as individual workflow steps):
     wait-for-node          Wait for the node to appear and become Ready.
     validate-workload      Deploy test pods on the agent node.
     validate-task-pull     Verify the daemon pulled a task and reported success.
+    start-upgrade-task     Restart task server with a bumped version to trigger upgrade.
     validate-node-upgrade  Verify the daemon attempted a node upgrade after drift.
     cleanup                Tear down VM, networking, and Kind cluster.
 """
@@ -139,6 +140,56 @@ def _bump_patch_version(version: str) -> str:
         raise ValueError(f"expected semver major.minor.patch, got {version!r}")
     parts[2] = str(int(parts[2]) + 1)
     return ".".join(parts)
+
+
+def _stop_task_server() -> None:
+    """Stop a running e2e-task-server if one exists."""
+    pid_file = VM_DIR / "e2e-task-server.pid"
+    if not pid_file.exists():
+        return
+    pid = int(pid_file.read_text().strip())
+    try:
+        os.kill(pid, 0)
+        log(f"Stopping e2e-task-server (PID: {pid})...")
+        os.kill(pid, 15)
+        time.sleep(1)
+    except OSError:
+        pass
+    pid_file.unlink(missing_ok=True)
+
+
+def _start_task_server(
+    kube_version: str,
+    task_id: str = "e2e-update-001",
+    log_mode: str = "w",
+) -> None:
+    """Start the e2e-task-server with the given version.
+
+    Args:
+        kube_version: Kubernetes version for the NodeUpdateSpec task.
+        task_id: Task ID for the single task.
+        log_mode: File open mode for the log file ("w" to truncate, "a" to append).
+    """
+    task_server_bin = REPO_ROOT / "bin" / "e2e-task-server"
+    task_server_addr = f"{VM_GATEWAY}:{TASK_SERVER_PORT}"
+    task_server_log = VM_DIR / "e2e-task-server.log"
+    task_server_pid_file = VM_DIR / "e2e-task-server.pid"
+
+    _stop_task_server()
+
+    log(f"Starting e2e-task-server on {task_server_addr} "
+        f"(task_id={task_id}, version={kube_version})...")
+
+    ts_log_fd = open(task_server_log, log_mode)
+    ts_proc = subprocess.Popen(
+        [str(task_server_bin),
+         f"--listen={task_server_addr}",
+         f"--kubernetes-version={kube_version}",
+         f"--task-id={task_id}"],
+        stdout=ts_log_fd, stderr=subprocess.STDOUT,
+    )
+    task_server_pid_file.write_text(str(ts_proc.pid))
+    log(f"e2e-task-server started (PID: {ts_proc.pid}, log: {task_server_log})")
 
 
 # ---------------------------------------------------------------------------
@@ -420,50 +471,17 @@ def _run_agent_inner(agent_url: str) -> None:
 
     # Start the e2e task server so the agent daemon can connect after
     # bootstrap completes. The server runs on the host bridge IP, reachable
-    # from the VM.
-    task_server_bin = REPO_ROOT / "bin" / "e2e-task-server"
-    task_server_addr = f"{VM_GATEWAY}:{TASK_SERVER_PORT}"
-    task_server_log = VM_DIR / "e2e-task-server.log"
-    task_server_pid_file = VM_DIR / "e2e-task-server.pid"
-
-    # Query the cluster Kubernetes version to send in the NodeUpdateSpec.
-    # The first task uses the same version (no drift). The second task
-    # bumps the patch version to trigger drift detection and a blue-green
-    # update attempt.
+    # from the VM. It sends a single task with the same Kubernetes version
+    # as the cluster (no drift). The upgrade task is started separately
+    # via the start-upgrade-task command.
     kube_version_json = kubectl_capture([
         "version", "-o", "json",
     ])
     kube_version = json.loads(kube_version_json)["serverVersion"]["gitVersion"]
     kube_version = kube_version.lstrip("v")
-    upgrade_version = _bump_patch_version(kube_version)
     log(f"Cluster Kubernetes version: {kube_version}")
-    log(f"Upgrade target version:     {upgrade_version}")
 
-    log(f"Starting e2e-task-server on {task_server_addr}...")
-
-    # If a previous task server is still running (e.g. from a prior
-    # run-agent invocation), stop it first to free the port.
-    if task_server_pid_file.exists():
-        old_pid = int(task_server_pid_file.read_text().strip())
-        try:
-            os.kill(old_pid, 0)
-            log(f"Stopping previous e2e-task-server (PID: {old_pid})...")
-            os.kill(old_pid, 15)
-            time.sleep(1)
-        except OSError:
-            pass
-        task_server_pid_file.unlink(missing_ok=True)
-
-    ts_log_fd = open(task_server_log, "w")
-    ts_proc = subprocess.Popen(
-        [str(task_server_bin),
-         f"--listen={task_server_addr}",
-         f"--kubernetes-version={kube_version}",
-         f"--upgrade-kubernetes-version={upgrade_version}"],
-        stdout=ts_log_fd, stderr=subprocess.STDOUT,
-    )
-    task_server_pid_file.write_text(str(ts_proc.pid))
-    log(f"e2e-task-server started (PID: {ts_proc.pid}, log: {task_server_log})")
+    _start_task_server(kube_version)
 
     # Determine the Kind control-plane IP so connectivity checks have the
     # correct address even when the local kubeconfig uses 127.0.0.1.
@@ -899,6 +917,39 @@ def validate_task_pull() -> None:
 
 
 # ---------------------------------------------------------------------------
+# start-upgrade-task
+# ---------------------------------------------------------------------------
+def start_upgrade_task() -> None:
+    """Restart the task server with a bumped Kubernetes version.
+
+    This kills the current task server (which was serving the no-drift task)
+    and starts a new instance that sends a NodeUpdateSpec with the patch
+    version incremented by one. The agent daemon will reconnect (systemd
+    Restart=always) and receive the upgrade task, triggering drift detection
+    and a blue-green update attempt.
+    """
+    kube_version_json = kubectl_capture([
+        "version", "-o", "json",
+    ])
+    kube_version = json.loads(kube_version_json)["serverVersion"]["gitVersion"]
+    kube_version = kube_version.lstrip("v")
+    upgrade_version = _bump_patch_version(kube_version)
+
+    log(f"Restarting task server with upgrade version {upgrade_version} "
+        f"(cluster is {kube_version})")
+
+    _start_task_server(
+        kube_version=upgrade_version,
+        task_id="e2e-upgrade-002",
+        log_mode="a",  # Append to preserve the no-drift task log.
+    )
+
+    log("============================================")
+    log("  Upgrade task server started")
+    log("============================================")
+
+
+# ---------------------------------------------------------------------------
 # validate-node-upgrade
 # ---------------------------------------------------------------------------
 def validate_node_upgrade() -> None:
@@ -1066,6 +1117,7 @@ COMMANDS = {
     "wait-for-node": wait_for_node,
     "validate-workload": validate_workload,
     "validate-task-pull": validate_task_pull,
+    "start-upgrade-task": start_upgrade_task,
     "validate-node-upgrade": validate_node_upgrade,
     "reset-agent": reset_agent,
     "cleanup": cleanup,
