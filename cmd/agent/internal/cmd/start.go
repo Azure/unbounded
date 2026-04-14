@@ -153,8 +153,8 @@ func resolveRootFSGoalState(log *slog.Logger, cfg *provision.AgentConfig) (*goal
 	nspawnMachineName := goalstates.NSpawnMachineKube1
 	kubeVersion := cfg.Cluster.Version
 
-	kernel, err := hostKernel() //nolint:staticcheck // SA4023: non-Linux stub always errors; this is intentional.
-	if err != nil {             //nolint:staticcheck // SA4023: see above.
+	kernel, err := utilio.HostKernel() //nolint:staticcheck // SA4023: non-Linux stub always errors; this is intentional.
+	if err != nil {                    //nolint:staticcheck // SA4023: see above.
 		return nil, err
 	}
 

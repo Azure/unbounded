@@ -307,7 +307,7 @@ func persistAppliedConfig(cfg *provision.AgentConfig, machineName string) error 
 func resolveRootFSGoalState(log *slog.Logger, cfg *provision.AgentConfig, machineName string) (*goalstates.RootFS, error) {
 	kubeVersion := cfg.Cluster.Version
 
-	kernel, err := hostKernel()
+	kernel, err := utilio.HostKernel()
 	if err != nil {
 		return nil, err
 	}
