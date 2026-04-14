@@ -53,7 +53,7 @@ pulls tasks as they arrive, executes them, and reports the result back.`,
 			if err != nil {
 				return fmt.Errorf("dial task server %q: %w", endpoint, err)
 			}
-			defer conn.Close()
+			defer func() { _ = conn.Close() }()
 
 			client := agentv1.NewTaskServerClient(conn)
 
