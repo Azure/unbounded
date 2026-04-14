@@ -36,6 +36,20 @@ func newFakeScheme() *runtime.Scheme {
 	return s
 }
 
+// fakeCACertPEM is a self-signed CA certificate used only in tests so that
+// the PEM validation in buildClient() passes.
+const fakeCACertPEM = `-----BEGIN CERTIFICATE-----
+MIIBhTCCASugAwIBAgIULnybQx3VI0BYI2yZi3GUr3Z3MzwwCgYIKoZIzj0EAwIw
+FzEVMBMGA1UEAwwMZmFrZS10ZXN0LWNhMCAXDTI2MDQxNDA1NTIxN1oYDzIxMjYw
+MzIxMDU1MjE3WjAXMRUwEwYDVQQDDAxmYWtlLXRlc3QtY2EwWTATBgcqhkjOPQIB
+BggqhkjOPQMBBwNCAATuDE0L4VmwupHcW3eM5HB2yDPq06/4mcbcSyhqOrwO03Dp
+7EWavVPbnpq3ftGkC3qHsC81CuN/6wAifxgDYYaJo1MwUTAdBgNVHQ4EFgQUWApU
+yOSviOcKPNZtj/oOUe5r3MgwHwYDVR0jBBgwFoAUWApUyOSviOcKPNZtj/oOUe5r
+3MgwDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNIADBFAiBS4nPJKt8QSZct
+hpnfsIFMdNXiOVD3et8iXxIvG6MM4QIhAJnTuif88s4vV5c0GeAwdulG0k3fdKyI
+h47WE0g7IMhA
+-----END CERTIFICATE-----`
+
 // goalStateFor builds a minimal NodeStart goal state for tests.
 func goalStateFor(machineName, bootstrapToken string, labels map[string]string, taints []string) *goalstates.NodeStart {
 	return &goalstates.NodeStart{
@@ -43,7 +57,7 @@ func goalStateFor(machineName, bootstrapToken string, labels map[string]string, 
 		Kubelet: goalstates.Kubelet{
 			BootstrapToken:     bootstrapToken,
 			APIServer:          "https://api.example.com:6443",
-			CACertData:         []byte("fake-ca"),
+			CACertData:         []byte(fakeCACertPEM),
 			NodeLabels:         labels,
 			RegisterWithTaints: taints,
 		},
@@ -245,6 +259,56 @@ func TestRegisterMachine_NoMatchError_Skips(t *testing.T) {
 
 	// Should succeed (log a warning) rather than returning an error.
 	require.NoError(t, task.Do(context.Background()))
+}
+
+func TestRegisterMachine_EmptyCACertData_ReturnsError(t *testing.T) {
+	t.Parallel()
+
+	gs := &goalstates.NodeStart{
+		MachineName: "my-node",
+		Kubelet: goalstates.Kubelet{
+			BootstrapToken: "tok.secret",
+			APIServer:      "https://api.example.com:6443",
+			CACertData:     []byte{},
+		},
+	}
+	task := &registerMachine{
+		log:       discardLogger(),
+		goalState: gs,
+		newClient: func(_ *rest.Config, _ client.Options) (client.Client, error) {
+			t.Fatal("newClient should not be called when CACertData is empty")
+			return nil, nil
+		},
+	}
+
+	err := task.Do(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "CA certificate data is empty")
+}
+
+func TestRegisterMachine_InvalidPEMCACertData_ReturnsError(t *testing.T) {
+	t.Parallel()
+
+	gs := &goalstates.NodeStart{
+		MachineName: "my-node",
+		Kubelet: goalstates.Kubelet{
+			BootstrapToken: "tok.secret",
+			APIServer:      "https://api.example.com:6443",
+			CACertData:     []byte("not-valid-pem-data"),
+		},
+	}
+	task := &registerMachine{
+		log:       discardLogger(),
+		goalState: gs,
+		newClient: func(_ *rest.Config, _ client.Options) (client.Client, error) {
+			t.Fatal("newClient should not be called when CACertData is invalid PEM")
+			return nil, nil
+		},
+	}
+
+	err := task.Do(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "does not contain a valid PEM block")
 }
 
 // ---------------------------------------------------------------------------

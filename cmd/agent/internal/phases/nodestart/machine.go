@@ -5,6 +5,8 @@ package nodestart
 
 import (
 	"context"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -100,11 +102,41 @@ func (r *registerMachine) Do(ctx context.Context) error {
 // buildClient creates a controller-runtime client that authenticates with
 // the bootstrap token and trusts the cluster CA certificate.
 func (r *registerMachine) buildClient() (client.Client, error) {
+	caData := r.goalState.Kubelet.CACertData
+	if len(caData) == 0 {
+		return nil, fmt.Errorf("CA certificate data is empty; cannot verify API server identity")
+	}
+
+	// Verify the data contains at least one valid PEM block so we get a
+	// clear error here instead of a cryptic x509 failure later.
+	block, _ := pem.Decode(caData)
+	if block == nil {
+		return nil, fmt.Errorf("CA certificate data (%d bytes) does not contain a valid PEM block", len(caData))
+	}
+
+	// Log CA certificate identity at Info level so CI output always shows
+	// what the agent trusts, even without --debug.
+	if cert, err := x509.ParseCertificate(block.Bytes); err != nil {
+		r.log.Warn("CA certificate PEM is valid but could not be parsed as X.509",
+			slog.String("parse_error", err.Error()),
+			slog.Int("ca_cert_bytes", len(caData)),
+		)
+	} else {
+		r.log.Info("CA certificate for Machine CR registration",
+			slog.String("subject", cert.Subject.String()),
+			slog.String("issuer", cert.Issuer.String()),
+			slog.String("not_before", cert.NotBefore.UTC().String()),
+			slog.String("not_after", cert.NotAfter.UTC().String()),
+			slog.Int("ca_cert_bytes", len(caData)),
+			slog.String("api_server", r.goalState.Kubelet.APIServer),
+		)
+	}
+
 	restCfg := &rest.Config{
 		Host:        r.goalState.Kubelet.APIServer,
 		BearerToken: r.goalState.Kubelet.BootstrapToken,
 		TLSClientConfig: rest.TLSClientConfig{
-			CAData: r.goalState.Kubelet.CACertData,
+			CAData: caData,
 		},
 	}
 
