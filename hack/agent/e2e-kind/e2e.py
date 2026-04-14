@@ -1013,6 +1013,25 @@ def validate_node_upgrade() -> None:
                 else:
                     die(f"Upgrade task status report found but state is unknown: {line}")
 
+                # Dump node status after the upgrade attempt for visibility.
+                log("Node status after upgrade attempt:")
+                subprocess.run(
+                    [KUBECTL, "get", "nodes", "-o", "wide"],
+                    check=False,
+                )
+                subprocess.run(
+                    [KUBECTL, "describe", "node", AGENT_MACHINE_NAME],
+                    check=False,
+                )
+
+                # Dump nspawn machine state from the VM.
+                log("nspawn machine state after upgrade attempt:")
+                subprocess.run(
+                    ["ssh", *SSH_OPTS, SSH_TARGET,
+                     "sudo machinectl list --no-pager"],
+                    check=False,
+                )
+
                 log("============================================")
                 log("  Node upgrade validation PASSED")
                 log("============================================")
