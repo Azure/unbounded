@@ -393,8 +393,8 @@ spec:
                     format: int64
                     type: integer
                   repaveCounter:
-                    description: RepaveCounter is the last repave counter value
-                      that was acted on.
+                    description: RepaveCounter is the last repave counter value that
+                      was acted on.
                     format: int64
                     type: integer
                 type: object

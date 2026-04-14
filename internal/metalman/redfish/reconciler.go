@@ -27,7 +27,7 @@ const (
 	// Condition types set by this controller.
 	condPoweredOff    = "PoweredOff"
 	condBootSupported = "BootOrderConfigSupported"
-	condRepaved      = "Repaved"
+	condRepaved       = "Repaved"
 
 	// Condition reasons.
 	reasonPoweringOff  = "PoweringOff"
