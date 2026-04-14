@@ -11,9 +11,11 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -239,7 +241,7 @@ func TestRegisterMachine_GetError_ReturnsError(t *testing.T) {
 	assert.Contains(t, err.Error(), "api server unavailable")
 }
 
-func TestRegisterMachine_NoMatchError_Skips(t *testing.T) {
+func TestRegisterMachine_NoMatchError_ReturnsError(t *testing.T) {
 	t.Parallel()
 
 	// Simulate the Machine CRD not being installed: Get returns a NoKindMatchError.
@@ -257,7 +259,31 @@ func TestRegisterMachine_NoMatchError_Skips(t *testing.T) {
 		newClient: newSharedClientFactory(errClient),
 	}
 
-	// Should succeed (log a warning) rather than returning an error.
+	err := task.Do(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "machine CRD is not installed")
+}
+
+func TestRegisterMachine_CreateAlreadyExists_Tolerates(t *testing.T) {
+	t.Parallel()
+
+	// Simulate a race: GET returns NotFound, but another client creates the
+	// Machine CR before our CREATE arrives, so CREATE returns AlreadyExists.
+	scheme := newFakeScheme()
+	base := fake.NewClientBuilder().WithScheme(scheme).Build()
+	errClient := &errorInjectingClient{
+		Client:    base,
+		createErr: apierrors.NewAlreadyExists(schema.GroupResource{Group: "unbounded-kube.io", Resource: "machines"}, "my-node"),
+	}
+
+	gs := goalStateFor("my-node", "tok.secret", nil, nil)
+	task := &registerMachine{
+		log:       discardLogger(),
+		goalState: gs,
+		newClient: newSharedClientFactory(errClient),
+	}
+
+	// Should succeed rather than returning an error.
 	require.NoError(t, task.Do(context.Background()))
 }
 
@@ -341,9 +367,18 @@ func TestBuildMachine_PopulatesFields(t *testing.T) {
 
 type errorInjectingClient struct {
 	client.Client
-	getErr error
+	getErr    error
+	createErr error
 }
 
 func (e *errorInjectingClient) Get(_ context.Context, _ client.ObjectKey, _ client.Object, _ ...client.GetOption) error {
 	return e.getErr
+}
+
+func (e *errorInjectingClient) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
+	if e.createErr != nil {
+		return e.createErr
+	}
+
+	return e.Client.Create(ctx, obj, opts...)
 }

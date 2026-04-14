@@ -69,19 +69,14 @@ func (r *registerMachine) Do(ctx context.Context) error {
 
 	machineName := r.goalState.MachineName
 
-	var existing v1alpha3.Machine
-	if err := c.Get(ctx, client.ObjectKey{Name: machineName}, &existing); err == nil {
+	var machine v1alpha3.Machine
+	if err := c.Get(ctx, client.ObjectKey{Name: machineName}, &machine); err == nil {
 		r.log.Info("Machine CR already exists, skipping registration",
-			slog.String("machine", machineName))
+			slog.String("machine", machineName), slog.String("machineID", string(machine.UID)))
 
 		return nil
 	} else if apimeta.IsNoMatchError(err) {
-		// The Machine CRD is not installed; machina is not deployed in this
-		// cluster. Log a warning and continue without failing.
-		r.log.Warn("Machine API not available (machina not installed?), skipping Machine CR registration",
-			slog.String("machine", machineName))
-
-		return nil
+		return fmt.Errorf("machine CRD is not installed (machina not deployed?): %w", err)
 	} else if !apierrors.IsNotFound(err) {
 		return fmt.Errorf("get Machine CR %q: %w", machineName, err)
 	}
@@ -89,12 +84,15 @@ func (r *registerMachine) Do(ctx context.Context) error {
 	// Machine CR does not exist; create a minimal one.
 	r.log.Info("Machine CR not found, creating", slog.String("machine", machineName))
 
-	machine := r.buildMachine(token)
-	if err := c.Create(ctx, &machine); err != nil {
+	machine = r.buildMachine(token)
+	if err := c.Create(ctx, &machine); apierrors.IsAlreadyExists(err) {
+		r.log.Info("Machine CR was created by another client", slog.String("machine", machineName))
+		return nil
+	} else if err != nil {
 		return fmt.Errorf("create Machine CR %q: %w", machineName, err)
 	}
 
-	r.log.Info("Machine CR created", slog.String("machine", machineName))
+	r.log.Info("Machine CR created", slog.String("machine", machineName), slog.String("machineID", string(machine.UID)))
 
 	return nil
 }
