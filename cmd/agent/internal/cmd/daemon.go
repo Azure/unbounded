@@ -8,17 +8,36 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"os/signal"
+	"time"
 
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
 
 	agentv1 "github.com/Azure/unbounded-kube/agent/api/v1"
 	"github.com/Azure/unbounded-kube/cmd/agent/internal/goalstates"
 	"github.com/Azure/unbounded-kube/cmd/agent/internal/nodeupdate"
 	"github.com/Azure/unbounded-kube/internal/version"
+)
+
+// Retry parameters for the daemon task-pull loop.
+const (
+	// initialBackoff is the delay before the first reconnect attempt.
+	initialBackoff = 1 * time.Second
+	// maxBackoff caps the exponential backoff between reconnect attempts.
+	maxBackoff = 60 * time.Second
+	// backoffMultiplier scales the delay after each consecutive failure.
+	backoffMultiplier = 2.0
+
+	// reportRetries is the number of times to retry ReportTaskStatus on
+	// transient errors before giving up.
+	reportRetries = 5
+	// reportRetryDelay is the base delay between ReportTaskStatus retries.
+	reportRetryDelay = 2 * time.Second
 )
 
 func newCmdDaemon(cmdCtx *CommandContext) *cobra.Command {
@@ -28,7 +47,10 @@ func newCmdDaemon(cmdCtx *CommandContext) *cobra.Command {
 		Use:   "daemon",
 		Short: "Run the agent daemon to pull and execute tasks",
 		Long: `Run a long-lived daemon that connects to the task server via gRPC,
-pulls tasks as they arrive, executes them, and reports the result back.`,
+pulls tasks as they arrive, executes them, and reports the result back.
+
+The daemon automatically reconnects with exponential backoff when the
+server disconnects or becomes temporarily unavailable.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx, cancel := signal.NotifyContext(cmd.Context(), os.Interrupt)
 			defer cancel()
@@ -49,62 +71,156 @@ pulls tasks as they arrive, executes them, and reports the result back.`,
 			conn, err := grpc.NewClient(
 				endpoint,
 				grpc.WithTransportCredentials(insecure.NewCredentials()),
+				grpc.WithKeepaliveParams(keepalive.ClientParameters{
+					// Send keepalive pings every 30s to detect dead connections.
+					Time: 30 * time.Second,
+					// Wait 10s for a ping ack before considering the connection dead.
+					Timeout: 10 * time.Second,
+					// Send pings even when there are no active RPCs, since the
+					// daemon is idle between tasks.
+					PermitWithoutStream: true,
+				}),
 			)
 			if err != nil {
-				return fmt.Errorf("dial task server %q: %w", endpoint, err)
+				return fmt.Errorf("create gRPC client for %q: %w", endpoint, err)
 			}
 			defer conn.Close() //nolint:errcheck // Best-effort close of gRPC connection.
 
 			client := agentv1.NewTaskServerClient(conn)
 
-			stream, err := client.PullTasks(ctx, &agentv1.PullTasksRequest{})
-			if err != nil {
-				return fmt.Errorf("open PullTasks stream: %w", err)
-			}
-
-			log.Info("task-pull stream opened, waiting for tasks")
-
-			for {
-				resp, err := stream.Recv()
-				if err == io.EOF {
-					log.Info("task-pull stream closed by server")
-					return nil
-				}
-
-				if err != nil {
-					return fmt.Errorf("receive task: %w", err)
-				}
-
-				task := resp.GetTask()
-				if task == nil {
-					log.Warn("received empty task, skipping")
-					continue
-				}
-
-				log.Info("received task", "task_id", task.GetId())
-
-				state, message := executeTask(ctx, log, task)
-
-				_, err = client.ReportTaskStatus(ctx, &agentv1.ReportTaskStatusRequest{
-					TaskId:  task.GetId(),
-					State:   state,
-					Message: message,
-				})
-				if err != nil {
-					return fmt.Errorf("report task status for %q: %w", task.GetId(), err)
-				}
-
-				log.Info("reported task status",
-					"task_id", task.GetId(),
-					"state", state,
-				)
-			}
+			return runPullLoop(ctx, log, client)
 		},
 	}
 
 	cmd.Flags().StringVar(&endpoint, "endpoint", "", "gRPC endpoint of the task server (required)")
 
 	return cmd
+}
+
+// runPullLoop opens a PullTasks stream and processes tasks. When the stream
+// breaks (server restart, network blip, EOF) it reconnects with exponential
+// backoff. It only returns when the context is cancelled.
+func runPullLoop(ctx context.Context, log *slog.Logger, client agentv1.TaskServerClient) error {
+	backoff := initialBackoff
+
+	for {
+		err := pullAndProcess(ctx, log, client)
+		if ctx.Err() != nil {
+			// Context cancelled (e.g. SIGINT) - exit cleanly.
+			log.Info("daemon stopping", "reason", ctx.Err())
+			return nil
+		}
+
+		log.Warn("task-pull stream disconnected, will reconnect",
+			"error", err,
+			"backoff", backoff,
+		)
+
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(backoff):
+		}
+
+		// Exponential backoff capped at maxBackoff.
+		backoff = time.Duration(math.Min(
+			float64(backoff)*backoffMultiplier,
+			float64(maxBackoff),
+		))
+	}
+}
+
+// pullAndProcess opens a single PullTasks stream and processes tasks until
+// the stream ends or an error occurs. On a successful stream open the backoff
+// is reset via the returned error (nil means clean EOF from server).
+func pullAndProcess(ctx context.Context, log *slog.Logger, client agentv1.TaskServerClient) error {
+	stream, err := client.PullTasks(ctx, &agentv1.PullTasksRequest{})
+	if err != nil {
+		return fmt.Errorf("open PullTasks stream: %w", err)
+	}
+
+	log.Info("task-pull stream opened, waiting for tasks")
+
+	for {
+		resp, err := stream.Recv()
+		if err == io.EOF {
+			log.Info("task-pull stream closed by server")
+			return fmt.Errorf("stream closed by server (EOF)")
+		}
+
+		if err != nil {
+			return fmt.Errorf("receive task: %w", err)
+		}
+
+		task := resp.GetTask()
+		if task == nil {
+			log.Warn("received empty task, skipping")
+			continue
+		}
+
+		log.Info("received task", "task_id", task.GetId())
+
+		state, message := executeTask(ctx, log, task)
+
+		if err := reportStatusWithRetry(ctx, log, client, task.GetId(), state, message); err != nil {
+			// Log the failure but keep the stream alive. The server
+			// can resend the task if it never received the report.
+			log.Error("failed to report task status after retries",
+				"task_id", task.GetId(),
+				"error", err,
+			)
+		}
+
+		log.Info("reported task status",
+			"task_id", task.GetId(),
+			"state", state,
+		)
+	}
+}
+
+// reportStatusWithRetry calls ReportTaskStatus with retries on transient
+// errors. It gives up after reportRetries attempts.
+func reportStatusWithRetry(
+	ctx context.Context,
+	log *slog.Logger,
+	client agentv1.TaskServerClient,
+	taskID string,
+	state agentv1.TaskState,
+	message string,
+) error {
+	var lastErr error
+
+	for attempt := range reportRetries {
+		_, err := client.ReportTaskStatus(ctx, &agentv1.ReportTaskStatusRequest{
+			TaskId:  taskID,
+			State:   state,
+			Message: message,
+		})
+		if err == nil {
+			return nil
+		}
+
+		lastErr = err
+		delay := reportRetryDelay * time.Duration(1<<attempt)
+		if delay > maxBackoff {
+			delay = maxBackoff
+		}
+
+		log.Warn("ReportTaskStatus failed, retrying",
+			"task_id", taskID,
+			"attempt", attempt+1,
+			"error", err,
+			"retry_in", delay,
+		)
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+	}
+
+	return fmt.Errorf("ReportTaskStatus failed after %d attempts: %w", reportRetries, lastErr)
 }
 
 // executeTask dispatches a task to the appropriate handler and returns the
