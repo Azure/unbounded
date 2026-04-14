@@ -66,7 +66,7 @@ metadata:
 subjects:
   - kind: ServiceAccount
     name: metalman-controller
-    namespace: machina-system
+    namespace: unbounded-kube
 roleRef:
   kind: Role
   name: metalman-controller
@@ -94,7 +94,7 @@ metadata:
 subjects:
   - kind: ServiceAccount
     name: metalman-controller
-    namespace: machina-system
+    namespace: unbounded-kube
 roleRef:
   kind: Role
   name: metalman-controller
