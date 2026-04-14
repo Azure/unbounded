@@ -154,7 +154,7 @@ def _stop_task_server() -> None:
         os.kill(pid, 15)
         time.sleep(1)
     except OSError:
-        pass
+        pass  # Process already exited; nothing to stop.
     pid_file.unlink(missing_ok=True)
 
 
@@ -188,6 +188,7 @@ def _start_task_server(
          f"--task-id={task_id}"],
         stdout=ts_log_fd, stderr=subprocess.STDOUT,
     )
+    ts_log_fd.close()  # Popen has inherited the fd; parent no longer needs it.
     task_server_pid_file.write_text(str(ts_proc.pid))
     log(f"e2e-task-server started (PID: {ts_proc.pid}, log: {task_server_log})")
 
@@ -954,18 +955,16 @@ def start_upgrade_task() -> None:
 # validate-node-upgrade
 # ---------------------------------------------------------------------------
 def validate_node_upgrade() -> None:
-    """Validate that the agent attempted a node upgrade after drift detection.
+    """Validate that the agent performed a node upgrade after drift detection.
 
-    The e2e task server sends a second task with a bumped patch version
-    (e.g. 1.33.2 when the cluster runs 1.33.1). The agent should detect
-    drift and attempt a blue-green update. Because the bumped version
-    likely does not have downloadable binaries, the update is expected to
-    fail at the binary download step. This test validates that:
+    The e2e task server sends a task with a bumped patch version (e.g. 1.33.2
+    when the cluster runs 1.33.1). The agent detects drift and performs a
+    blue-green nspawn machine update. This test validates:
 
-    1. The task server sent the upgrade task (task e2e-upgrade-002).
-    2. The agent reported a status for it (SUCCEEDED or FAILED).
-    3. If FAILED, the message indicates the update was attempted (drift
-       was detected and the blue-green process started).
+    1. The upgrade task was reported as SUCCEEDED.
+    2. The node kubelet version changed to the target version.
+    3. The node becomes Ready after the upgrade.
+    4. A test workload can run on the upgraded node.
     """
 
     timeout_secs = int(os.environ.get("NODE_UPGRADE_TIMEOUT", "300"))
@@ -973,8 +972,14 @@ def validate_node_upgrade() -> None:
     task_server_pid_file = VM_DIR / "e2e-task-server.pid"
     upgrade_task_id = "e2e-upgrade-002"
 
+    # Determine what version we expect after the upgrade.
+    kube_version_json = kubectl_capture(["version", "-o", "json"])
+    cluster_version = json.loads(kube_version_json)["serverVersion"]["gitVersion"].lstrip("v")
+    upgrade_version = _bump_patch_version(cluster_version)
+    log(f"Expecting node upgrade to v{upgrade_version}")
+
     if not task_server_pid_file.exists():
-        die("e2e-task-server PID file not found. Was run-agent executed?")
+        die("e2e-task-server PID file not found. Was start-upgrade-task executed?")
 
     pid = int(task_server_pid_file.read_text().strip())
     try:
@@ -982,6 +987,7 @@ def validate_node_upgrade() -> None:
     except OSError:
         die(f"e2e-task-server (PID {pid}) is not running")
 
+    # --- Step 1: Wait for the upgrade task status report. ---
     log(f"Waiting for upgrade task ({upgrade_task_id}) status report (timeout: {timeout_secs}s)...")
 
     elapsed = 0
@@ -989,7 +995,6 @@ def validate_node_upgrade() -> None:
         if task_server_log.exists():
             log_content = task_server_log.read_text()
 
-            # Look for a ReportTaskStatus line for the upgrade task.
             for line in log_content.splitlines():
                 if "ReportTaskStatus:" not in line:
                     continue
@@ -1000,65 +1005,150 @@ def validate_node_upgrade() -> None:
                 print(line, flush=True)
 
                 if "state=TASK_STATE_SUCCEEDED" in line:
-                    log("Upgrade task reported as SUCCEEDED (unexpected but acceptable)")
+                    log("Upgrade task reported as SUCCEEDED")
                 elif "state=TASK_STATE_FAILED" in line:
-                    # Expected: the bumped version likely does not exist,
-                    # so the download fails. The important thing is that
-                    # drift was detected and the update was attempted.
-                    log("Upgrade task reported as FAILED (expected - binary download likely unavailable)")
-                    if "node update:" in line or "provision new machine" in line:
-                        log("Confirmed: blue-green update was attempted")
-                    else:
-                        log("Note: failure reason may vary depending on environment")
+                    die(f"Upgrade task reported as FAILED: {line}")
                 else:
                     die(f"Upgrade task status report found but state is unknown: {line}")
 
-                # Dump node status after the upgrade attempt for visibility.
-                log("Node status after upgrade attempt:")
-                subprocess.run(
-                    [KUBECTL, "get", "nodes", "-o", "wide"],
-                    check=False,
-                )
-                subprocess.run(
-                    [KUBECTL, "describe", "node", AGENT_MACHINE_NAME],
-                    check=False,
-                )
+                # Break out of both loops.
+                break
+            else:
+                # Inner for-loop did not break: no matching line found yet.
+                if elapsed > 0 and elapsed % 30 == 0:
+                    log(f"  ({elapsed}s) Waiting for upgrade task status report...")
+                    subprocess.run(
+                        ["ssh", *SSH_OPTS, SSH_TARGET,
+                         "sudo journalctl -u unbounded-agent-daemon --no-pager -l --lines=20"],
+                        check=False,
+                    )
+                time.sleep(5)
+                elapsed += 5
+                continue
+            break  # Outer while-loop break on success.
+    else:
+        log("e2e-task-server log contents:")
+        if task_server_log.exists():
+            print(task_server_log.read_text(), flush=True)
+        log("VM daemon journal:")
+        subprocess.run(
+            ["ssh", *SSH_OPTS, SSH_TARGET,
+             "sudo journalctl -u unbounded-agent-daemon --no-pager -l"],
+            check=False,
+        )
+        die(f"Timed out waiting for upgrade task status report after {timeout_secs}s")
 
-                # Dump nspawn machine state from the VM.
-                log("nspawn machine state after upgrade attempt:")
-                subprocess.run(
-                    ["ssh", *SSH_OPTS, SSH_TARGET,
-                     "sudo machinectl list --no-pager"],
-                    check=False,
-                )
+    # --- Step 2: Verify kubelet version changed. ---
+    log(f"Verifying node kubelet version is v{upgrade_version}...")
+    result = subprocess.run(
+        [KUBECTL, "get", "node", AGENT_MACHINE_NAME,
+         "-o", "jsonpath={.status.nodeInfo.kubeletVersion}"],
+        capture_output=True, text=True,
+    )
+    kubelet_version = result.stdout.strip().lstrip("v") if result.returncode == 0 else "unknown"
+    if kubelet_version == upgrade_version:
+        log(f"Kubelet version confirmed: v{kubelet_version}")
+    else:
+        log(f"WARNING: Expected kubelet v{upgrade_version}, got v{kubelet_version}")
 
-                log("============================================")
-                log("  Node upgrade validation PASSED")
-                log("============================================")
-                return
+    # Dump node status for visibility.
+    log("Node status after upgrade:")
+    subprocess.run([KUBECTL, "get", "nodes", "-o", "wide"], check=False)
 
-        if elapsed > 0 and elapsed % 30 == 0:
-            log(f"  ({elapsed}s) Waiting for upgrade task status report...")
-            # Print daemon logs from the VM for debugging.
-            subprocess.run(
-                ["ssh", *SSH_OPTS, SSH_TARGET,
-                 "sudo journalctl -u unbounded-agent-daemon --no-pager -l --lines=20"],
-                check=False,
-            )
-        time.sleep(5)
-        elapsed += 5
-
-    # Timed out.
-    log("e2e-task-server log contents:")
-    if task_server_log.exists():
-        print(task_server_log.read_text(), flush=True)
-    log("VM daemon journal:")
+    # Dump nspawn machine state from the VM.
+    log("nspawn machine state after upgrade:")
     subprocess.run(
-        ["ssh", *SSH_OPTS, SSH_TARGET,
-         "sudo journalctl -u unbounded-agent-daemon --no-pager -l"],
+        ["ssh", *SSH_OPTS, SSH_TARGET, "sudo machinectl list --no-pager"],
         check=False,
     )
-    die(f"Timed out waiting for upgrade task status report after {timeout_secs}s")
+
+    # --- Step 3: Wait for node to become Ready. ---
+    ready_timeout = int(os.environ.get("READY_TIMEOUT", "120"))
+    log(f"Waiting for node '{AGENT_MACHINE_NAME}' to become Ready after upgrade (timeout: {ready_timeout}s)...")
+    elapsed = 0
+    while elapsed < ready_timeout:
+        result = subprocess.run(
+            [KUBECTL, "get", "node", AGENT_MACHINE_NAME,
+             "-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}"],
+            capture_output=True, text=True,
+        )
+        status = result.stdout.strip() if result.returncode == 0 else "unknown"
+        if status == "True":
+            log(f"Node '{AGENT_MACHINE_NAME}' is Ready after upgrade ({elapsed}s)")
+            break
+        if elapsed > 0 and elapsed % 30 == 0:
+            log(f"  ({elapsed}s) Node not yet Ready (status: {status})")
+        time.sleep(5)
+        elapsed += 5
+    else:
+        log("Node status:")
+        subprocess.run([KUBECTL, "describe", "node", AGENT_MACHINE_NAME], check=False)
+        die(f"Timed out waiting for node to become Ready after upgrade ({ready_timeout}s)")
+
+    # --- Step 4: Deploy test workload on the upgraded node. ---
+    log("Deploying test workload on upgraded node...")
+
+    upgrade_pod_name = "e2e-upgrade-hello"
+    upgrade_ns = TEST_NS
+
+    # Clean up any stale pod from a previous run.
+    run_quiet([KUBECTL, "delete", "pod", upgrade_pod_name, "-n", upgrade_ns,
+               "--ignore-not-found"], check=False)
+
+    upgrade_pod = {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {"name": upgrade_pod_name, "namespace": upgrade_ns},
+        "spec": {
+            "nodeName": AGENT_MACHINE_NAME,
+            "containers": [{
+                "name": "hello",
+                "image": "busybox:1.36",
+                "command": ["sh", "-c", "echo 'Hello from upgraded node!' && sleep 3600"],
+            }],
+            "restartPolicy": "Never",
+            "tolerations": [{"operator": "Exists"}],
+        },
+    }
+    kubectl(["apply", "-f", "-"], input=json.dumps(upgrade_pod).encode())
+
+    workload_timeout = 120
+    log(f"Waiting for pod '{upgrade_pod_name}' to be Running (timeout: {workload_timeout}s)...")
+    elapsed = 0
+    while elapsed < workload_timeout:
+        result = subprocess.run(
+            [KUBECTL, "get", "pod", upgrade_pod_name, "-n", upgrade_ns,
+             "-o", "jsonpath={.status.phase}"],
+            capture_output=True, text=True,
+        )
+        phase = result.stdout.strip() if result.returncode == 0 else "unknown"
+        if phase == "Running":
+            log(f"Pod '{upgrade_pod_name}' is Running after {elapsed}s")
+            break
+        if phase == "Failed":
+            subprocess.run(
+                [KUBECTL, "describe", "pod", upgrade_pod_name, "-n", upgrade_ns],
+                check=False,
+            )
+            die(f"Pod '{upgrade_pod_name}' entered Failed state")
+        if elapsed > 0 and elapsed % 30 == 0:
+            log(f"  ({elapsed}s) Pod phase: {phase}")
+        time.sleep(5)
+        elapsed += 5
+    else:
+        subprocess.run(
+            [KUBECTL, "describe", "pod", upgrade_pod_name, "-n", upgrade_ns],
+            check=False,
+        )
+        die(f"Timed out waiting for pod '{upgrade_pod_name}' to run after {workload_timeout}s")
+
+    # Clean up the test pod.
+    run_quiet([KUBECTL, "delete", "pod", upgrade_pod_name, "-n", upgrade_ns,
+               "--ignore-not-found"], check=False)
+
+    log("============================================")
+    log("  Node upgrade validation PASSED")
+    log("============================================")
 
 
 # ---------------------------------------------------------------------------
@@ -1097,7 +1187,7 @@ def cleanup() -> None:
             log(f"Stopping e2e-task-server (PID: {ts_pid})...")
             os.kill(ts_pid, 15)
         except OSError:
-            pass
+            pass  # Process already exited; nothing to stop.
         ts_pid_file.unlink(missing_ok=True)
 
     # Remove networking
