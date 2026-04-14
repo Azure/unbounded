@@ -10,6 +10,12 @@ import (
 	"time"
 )
 
+type ExecuteInventoryConfig struct {
+	Debug         bool
+	DbPath        string
+	CollectorAddr string
+}
+
 // CollectInventory gathers inventory data from the environment.
 // dbPath specifies where the output database file will be written.
 func CollectInventory(ctx context.Context, debug bool) (*Inventory, error) {
@@ -95,31 +101,35 @@ func CollectInventory(ctx context.Context, debug bool) (*Inventory, error) {
 	return &records, nil
 }
 
-func Execute(debug bool, dbPath string) error {
+func Execute(config ExecuteInventoryConfig) error {
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("error: inventory must be run as root")
 	}
 
-	if debug {
+	if config.Debug {
 		fmt.Println("Running in debug mode")
 	}
 
-	fmt.Printf("Output database: %s\n", dbPath)
+	fmt.Printf("Output database: %s\n", config.DbPath)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if err := ensureDB(dbPath); err != nil {
+	if err := ensureDB(config.DbPath); err != nil {
 		return fmt.Errorf("error initializing database: %w", err)
 	}
 
-	inventory, err := CollectInventory(ctx, debug)
+	inventory, err := CollectInventory(ctx, config.Debug)
 	if err != nil {
 		return err
 	}
 
-	if err := inventory.localDWriter(ctx, dbPath); err != nil {
+	if err := inventory.localDWriter(ctx, config.DbPath); err != nil {
 		return fmt.Errorf("error writing inventory to database: %w", err)
+	}
+
+	if err := inventory.RemoteWriter(ctx, config.CollectorAddr); err != nil {
+		return fmt.Errorf("error publishing inventory: %w", err)
 	}
 
 	return nil

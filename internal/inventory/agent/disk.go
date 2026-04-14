@@ -216,6 +216,21 @@ func readDiskSerial(name string) string {
 		}
 	}
 
+	// Fall back to udevadm which can read the serial from SCSI VPD pages
+	// and other sources not directly exposed via sysfs.
+	out, err := exec.Command("udevadm", "info", "--query=property", "--name="+name).Output()
+	if err == nil {
+		for _, line := range strings.Split(string(out), "\n") {
+			// Prefer ID_SERIAL_SHORT (the raw serial) over ID_SERIAL
+			// which often includes the vendor/model prefix.
+			if strings.HasPrefix(line, "ID_SERIAL_SHORT=") {
+				if v := strings.TrimPrefix(line, "ID_SERIAL_SHORT="); v != "" {
+					return strings.TrimSpace(v)
+				}
+			}
+		}
+	}
+
 	return ""
 }
 

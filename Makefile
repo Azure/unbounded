@@ -9,8 +9,23 @@ GOLINT=golangci-lint run -c .golangci.yaml
 FORGE_BIN=bin/forge
 FORGE_CMD=./hack/cmd/forge
 
-INVENTORY_BIN=bin/inventory
-INVENTORY_CMD=./cmd/inventory
+INVENTORY_AGENT_BIN=bin/inventory-agent
+INVENTORY_AGENT_CMD=./cmd/inventory/inventory-agent
+
+INVENTORY_COLLECTOR_BIN=bin/inventory-collector
+INVENTORY_COLLECTOR_CMD=./cmd/inventory/inventory-collector
+INVENTORY_COLLECTOR_TAG ?= latest
+INVENTORY_COLLECTOR_IMAGE=$(CONTAINER_REGISTRY)/inventory-collector:$(INVENTORY_COLLECTOR_TAG)
+
+INVENTORY_INSPECTOR_BIN=bin/inventory-inspector
+INVENTORY_INSPECTOR_CMD=./cmd/inventory/inventory-inspector
+INVENTORY_INSPECTOR_TAG ?= latest
+INVENTORY_INSPECTOR_IMAGE=$(CONTAINER_REGISTRY)/inventory-inspector:$(INVENTORY_INSPECTOR_TAG)
+
+INVENTORY_VIEWER_BIN=bin/inventory-viewer
+INVENTORY_VIEWER_CMD=./cmd/inventory/inventory-viewer
+INVENTORY_VIEWER_TAG ?= latest
+INVENTORY_VIEWER_IMAGE=$(CONTAINER_REGISTRY)/inventory-viewer:$(INVENTORY_VIEWER_TAG)
 
 AGENT_BIN=bin/unbounded-agent
 AGENT_CMD=./cmd/agent
@@ -90,9 +105,13 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 # Frontend build toggle (dev builds produce unminified output with sourcemaps).
 REACT_DEV ?= false
 
+<<<<<<< HEAD
 .PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge inventory inventory-amd64 inventory-arm64 unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute
 .PHONY: net-frontend net-frontend-clean net-build-ebpf net-manifests release-manifests
 .PHONY: image-machina-local image-metalman-local image-net-controller-local image-net-node-local images-local
+=======
+.PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute
+>>>>>>> 0287e20 (Save WIP on inventory work.)
 
 ##@ General
 
@@ -277,20 +296,38 @@ kubectl-unbounded: test kubectl-unbounded-build ## Build the kubectl-unbounded p
 forge: test ## Build the forge dev tool (implies test)
 	$(GOBUILD) -o $(FORGE_BIN) $(FORGE_CMD)/main.go
 
-inventory: inventory-amd64 inventory-arm64 ## Build inventory for amd64 and arm64, symlink to host arch
+.PHONY: inventory-all
+inventory-all: inventory-agent inventory-collector inventory-inspector inventory-viewer ## Build all inventory components
+
+.PHONY: inventory-agent
+inventory-agent: inventory-agent-amd64 inventory-agent-arm64 ## Build inventory for amd64 and arm64, symlink to host arch
 	@HOST_ARCH=$$(uname -m); \
 	case "$$HOST_ARCH" in \
 		x86_64)  ARCH=amd64 ;; \
 		aarch64) ARCH=arm64 ;; \
 		*)       echo "unsupported architecture: $$HOST_ARCH" >&2; exit 1 ;; \
 	esac; \
-	ln -sf inventory-$$ARCH $(INVENTORY_BIN)
+	ln -sf inventory-agent-$$ARCH $(INVENTORY_AGENT_BIN)
 
-inventory-amd64: test ## Build inventory for linux/amd64 (implies test)
-	GOOS=linux GOARCH=amd64 $(GOBUILD) -o $(INVENTORY_BIN)-amd64 $(INVENTORY_CMD)/main.go
+.PHONY: inventory-agent-amd64
+inventory-agent-amd64: test ## Build inventory for linux/amd64 (implies test)
+	GOOS=linux GOARCH=amd64 $(GOBUILD) -o $(INVENTORY_AGENT_BIN)-amd64 $(INVENTORY_AGENT_CMD)/main.go
 
-inventory-arm64: test ## Build inventory for linux/arm64 (implies test)
-	GOOS=linux GOARCH=arm64 $(GOBUILD) -o $(INVENTORY_BIN)-arm64 $(INVENTORY_CMD)/main.go
+.PHONY: inventory-agent-arm64
+inventory-agent-arm64: test ## Build inventory for linux/arm64 (implies test)
+	GOOS=linux GOARCH=arm64 $(GOBUILD) -o $(INVENTORY_AGENT_BIN)-arm64 $(INVENTORY_AGENT_CMD)/main.go
+
+.PHONY: inventory-collector
+inventory-collector: test ## Build the inventory-collector for linux (implies test)
+	$(GOBUILD) -o $(INVENTORY_COLLECTOR_BIN) $(INVENTORY_COLLECTOR_CMD)/main.go
+
+.PHONY: inventory-inspector
+inventory-inspector: test ## Build the inventory-inspector (implies test)
+	$(GOBUILD) -o $(INVENTORY_INSPECTOR_BIN) $(INVENTORY_INSPECTOR_CMD)/main.go
+
+.PHONY: inventory-viewer
+inventory-viewer: test ## Build the inventory-viewer web server (implies test)
+	$(GOBUILD) -o $(INVENTORY_VIEWER_BIN) $(INVENTORY_VIEWER_CMD)/main.go
 
 unbounded-agent: test ## Build the unbounded-agent for linux (implies test)
 	GOOS=linux $(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(AGENT_BIN) $(AGENT_CMD)/main.go
@@ -376,6 +413,30 @@ resources/cni-plugins-linux-%-$(CNI_PLUGINS_VERSION).tgz:
 	curl -fsSL \
 		"https://github.com/containernetworking/plugins/releases/download/$(CNI_PLUGINS_VERSION)/cni-plugins-linux-$*-$(CNI_PLUGINS_VERSION).tgz" \
 		-o $@
+
+.PHONY: inventory-collector-oci
+inventory-collector-oci: ## Build the inventory-collector container image
+	$(CONTAINER_ENGINE) build -t inventory-collector:$(INVENTORY_COLLECTOR_TAG) -t $(INVENTORY_COLLECTOR_IMAGE) -f ./cmd/inventory/inventory-collector/oci/Containerfile .
+
+.PHONY: inventory-collector-oci-push
+inventory-collector-oci-push: inventory-collector-oci ## Build and push the inventory-collector container image
+	$(CONTAINER_ENGINE) push $(INVENTORY_COLLECTOR_IMAGE)
+
+.PHONY: inventory-inspector-oci
+inventory-inspector-oci: ## Build the inventory-inspector container image
+	$(CONTAINER_ENGINE) build -t inventory-inspector:$(INVENTORY_INSPECTOR_TAG) -t $(INVENTORY_INSPECTOR_IMAGE) -f ./cmd/inventory/inventory-inspector/oci/Containerfile .
+
+.PHONY: inventory-inspector-oci-push
+inventory-inspector-oci-push: inventory-inspector-oci ## Build and push the inventory-inspector container image
+	$(CONTAINER_ENGINE) push $(INVENTORY_INSPECTOR_IMAGE)
+
+.PHONY: inventory-viewer-oci
+inventory-viewer-oci: ## Build the inventory-viewer container image
+	$(CONTAINER_ENGINE) build -t inventory-viewer:$(INVENTORY_VIEWER_TAG) -t $(INVENTORY_VIEWER_IMAGE) -f ./cmd/inventory/inventory-viewer/oci/Containerfile .
+
+.PHONY: inventory-viewer-oci-push
+inventory-viewer-oci-push: inventory-viewer-oci ## Build and push the inventory-viewer container image
+	$(CONTAINER_ENGINE) push $(INVENTORY_VIEWER_IMAGE)
 
 image-machina-local: ## Build the machina container image locally (single-arch)
 	$(CONTAINER_ENGINE) build \
