@@ -1,0 +1,22 @@
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: inventory-inspector
+  namespace: inventory
+  labels:
+    app: inventory-inspector
+spec:
+  schedule: "0 * * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: inventory-inspector
+              image: stargatetmedev.azurecr.io/inventory-inspector:latest
+              envFrom:
+                - configMapRef:
+                    name: inventory-database-config
+                - secretRef:
+                    name: pg-creds
