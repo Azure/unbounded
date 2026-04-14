@@ -116,11 +116,11 @@ kubectl unbounded site init \
 
 ## 4. Add Machines
 
-Register remote machines with `site add-machine`. Each machine must be
+Register remote machines with `machine register`. Each machine must be
 reachable via SSH:
 
 ```bash
-kubectl unbounded site add-machine \
+kubectl unbounded machine register \
     --site my-site \
     --host 10.0.0.5 \
     --ssh-username ubuntu \
