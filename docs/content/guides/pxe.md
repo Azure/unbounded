@@ -34,12 +34,14 @@ Key `serve-pxe` flags (set via the Deployment):
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--dhcp-interface` | *(none — relay mode)* | NIC for broadcast DHCP |
+| `--dhcp-interface` | *(none - relay mode)* | NIC for broadcast DHCP |
 | `--site` | *(none)* | Scope to machines with a specific site label |
 | `--http-port` | 8880 | HTTP server port |
 | `--cache-dir` | `~/.unbounded/metalman/cache` | Local cache for downloaded images |
 | `--health-port` | 8081 | Health/readiness probe port |
 | `--serve-url` | | External URL of this metalman instance |
+| `--bootstrap` | false | Automatically create Machine objects for unknown MAC addresses |
+| `--bootstrap-image` | | OCI image reference for bootstrapped Machines (required when `--bootstrap` is set) |
 
 When `--dhcp-interface` is set, metalman binds to the interface for broadcast DHCP, and the DHCP server requires leader election. Without it, metalman accepts relayed (unicast) DHCP packets and the DHCP server responds regardless of leader status. Leader election always runs at the manager level for the reconcilers.
 
@@ -139,56 +141,38 @@ The randomly chosen address avoids collisions with other Machines managed by met
 
 You can also partially specify leases - for example, providing an `ipv4` but omitting `subnetMask` and `gateway` - and the allocator will fill in only the missing fields.
 
-## Cloud-Init Customization
+## Bootstrap Mode
 
-Cloud-init on PXE-booted machines uses two data sources that are merged at boot:
+When `--bootstrap` is enabled, metalman automatically creates Machine objects for unknown MAC addresses that send DHCP requests. This eliminates the need to pre-register machines before they PXE boot - simply connect a new machine to the network and power it on.
 
-- **Vendor-data** (managed by unbounded-kube) -- Contains the agent configuration, bootstrap scripts, and system defaults required for the node to join the cluster. This is not user-editable.
-- **User-data** (managed by the cluster operator) -- Optional customization such as SSH keys, additional packages, or host-level configuration.
-
-When no user-data is configured, metalman serves a minimal `#cloud-config` document. To supply custom user-data, create a ConfigMap and reference it from the Machine spec:
-
-```yaml
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: my-cloud-init
-  namespace: unbounded-kube
-data:
-  user-data: |
-    #cloud-config
-    ssh_authorized_keys:
-      - ssh-rsa AAAA...
-    packages:
-      - vim
-      - htop
+```bash
+metalman serve-pxe --site=rack-a --dhcp-interface=eth1 \
+  --bootstrap --bootstrap-image=ghcr.io/azure/images/host-ubuntu2404:v1
 ```
 
-Then reference the ConfigMap in the Machine:
+When a DHCP Discover arrives from a MAC address that does not match any existing Machine:
 
-```yaml
-apiVersion: unbounded-kube.io/v1alpha3
-kind: Machine
-metadata:
-  name: server-01
-spec:
-  pxe:
-    image: ghcr.io/azure/images/host-ubuntu2404:v1
-    dhcpLeases:
-    - ipv4: "10.10.0.50"
-      mac: "aa:bb:cc:dd:ee:ff"
-      subnetMask: "255.255.255.0"
-      gateway: "10.10.0.1"
-      dns: ["8.8.8.8"]
-    cloudInit:
-      userDataConfigMapRef:
-        name: my-cloud-init
-        namespace: unbounded-kube
-```
+1. Metalman creates a Machine with `generateName: machine-` (producing names like `machine-xk9f2`).
+2. The Machine is created with a single DHCP lease entry containing only the MAC address.
+3. If `--site` is set, the Machine is labeled with `unbounded-kube.io/site=<value>`.
+4. The IP allocator fills in IPv4, subnet mask, and gateway from the Site's `nodeCidrs` (see Automatic IP Allocation above).
+5. On the next DHCP retry, the Machine has a complete lease and metalman responds normally.
 
-The `key` field defaults to `user-data` but can be overridden to select a different key from the ConfigMap. Both `data` and `binaryData` entries are supported.
+The `--bootstrap-image` flag is required when `--bootstrap` is enabled. It specifies the OCI netboot image to set on every auto-created Machine.
 
-If the referenced ConfigMap does not exist, metalman falls back to the default minimal cloud-config. If the ConfigMap exists but the referenced key is not found, metalman returns an error and the machine will not receive user-data.
+{{< callout type="important" >}}
+Bootstrap mode requires an unbounded-net Site object with `nodeCidrs` configured, since auto-created Machines have no IP address and rely on the IP allocator. The `--site` flag must be set to match the Site's name.
+{{< /callout >}}
+
+### Deduplication
+
+Metalman handles the case where multiple DHCP packets arrive for the same MAC address before the Machine is fully created:
+
+- An in-memory guard prevents concurrent creation attempts within the same metalman process.
+- Before creating, metalman re-checks the MAC index to detect Machines created by external actors or a previous handler.
+- If a create call fails because another process created the Machine first, the error is silently handled.
+
+If multiple Machines are somehow created for the same MAC address (e.g. by manual creation during bootstrap), only the first one found by the MAC index is used for DHCP responses. The operator should delete the duplicate.
 
 ## Boot Flow
 

@@ -146,6 +146,29 @@ multiple sites can coexist on one cluster with independent HA. A `site serve-pxe
 instance with no `--site` manages Machines that do not have the site label
 at all.
 
+#### Bootstrap Mode
+
+When `--bootstrap` is passed to `serve-pxe`, metalman automatically creates
+Machine objects for unknown MAC addresses that send DHCP requests. This
+eliminates the need to pre-register machines before they PXE boot.
+
+```bash
+metalman serve-pxe --site=rack-a --dhcp-interface=eth0 \
+  --bootstrap --bootstrap-image=ghcr.io/azure/images/host-ubuntu2404:v1
+```
+
+Each auto-created Machine:
+
+- Uses `generateName: machine-` for random naming (e.g. `machine-xk9f2`).
+- Contains a single DHCP lease entry with only the MAC address (the IP
+  allocator fills in IP, subnet, and gateway from the Site).
+- Is labeled with `unbounded-kube.io/site=<value>` when `--site` is set.
+
+The `--bootstrap-image` flag is required when `--bootstrap` is enabled.
+
+Deduplication guards prevent creating multiple Machines for the same MAC
+address, even under rapid DHCP retry storms.
+
 ### Images
 
 Netboot images are standard OCI container images built `FROM scratch` that

@@ -10,10 +10,13 @@ import (
 	"log/slog"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/insomniacslk/dhcp/dhcpv4"
 	"github.com/insomniacslk/dhcp/dhcpv4/server4"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
@@ -21,12 +24,39 @@ import (
 	"github.com/Azure/unbounded-kube/internal/metalman/netboot"
 )
 
+// BootstrapConfig holds settings for automatic Machine creation when a
+// DHCP request arrives from an unknown MAC address. When nil on the
+// Server, bootstrap mode is disabled and unknown MACs are silently
+// ignored (the existing behavior).
+type BootstrapConfig struct {
+	// Client is a read-write Kubernetes client used to create Machine
+	// objects. It must be non-nil.
+	Client client.Client
+
+	// Image is the OCI image reference to set on bootstrapped Machines
+	// (e.g. "ghcr.io/azure/images/host-ubuntu2404:v1").
+	Image string
+
+	// Site is the optional site label value. When non-empty, created
+	// Machines are labeled with unbounded-kube.io/site=<value>.
+	Site string
+}
+
 type Server struct {
 	Interface string
 	Port      int
 	Reader    client.Reader
 	ServerIP  net.IP
 	OCICache  *netboot.OCICache
+
+	// Bootstrap, when non-nil, enables automatic Machine creation for
+	// unknown MAC addresses. See BootstrapConfig for details.
+	Bootstrap *BootstrapConfig
+
+	// bootstrapInFlight tracks MAC addresses for which a bootstrap
+	// Machine creation is currently in progress, preventing duplicate
+	// concurrent API calls from rapid DHCP retries.
+	bootstrapInFlight sync.Map
 }
 
 func (s *Server) NeedLeaderElection() bool {
@@ -130,6 +160,10 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, m *dhcpv4.DHCPv4) {
 	}
 
 	if len(list.Items) == 0 {
+		if s.Bootstrap != nil && mac != "" {
+			s.bootstrapMachine(ctx, log, mac)
+		}
+
 		return
 	}
 
@@ -216,4 +250,71 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, m *dhcpv4.DHCPv4) {
 	if _, err := conn.WriteTo(resp.ToBytes(), dest); err != nil {
 		log.Error("sending DHCP response", "err", err)
 	}
+}
+
+const siteLabel = "unbounded-kube.io/site"
+
+// bootstrapMachine creates a Machine object for an unknown MAC address.
+// It uses generateName for random naming and guards against duplicate
+// creation with both an in-memory dedup map and a server-side MAC index
+// check. Concurrent calls for the same MAC are coalesced via
+// bootstrapInFlight.
+func (s *Server) bootstrapMachine(ctx context.Context, log *slog.Logger, mac string) {
+	// Fast-path: if another goroutine is already creating a Machine for
+	// this MAC, skip. LoadOrStore returns true if the key was already
+	// present.
+	if _, loaded := s.bootstrapInFlight.LoadOrStore(mac, struct{}{}); loaded {
+		return
+	}
+	defer s.bootstrapInFlight.Delete(mac)
+
+	// Double-check the MAC index in case a Machine was created between
+	// the caller's List and this point (e.g. by a concurrent handler
+	// that just finished, or an external actor).
+	var existing v1alpha3.MachineList
+	if err := s.Bootstrap.Client.List(ctx, &existing, client.MatchingFields{indexing.IndexNodeByMAC: mac}); err != nil {
+		log.Error("bootstrap: re-checking MAC index", "err", err)
+		return
+	}
+
+	if len(existing.Items) > 0 {
+		log.Info("bootstrap: Machine already exists for MAC", "machine", existing.Items[0].Name)
+		return
+	}
+
+	machine := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: "machine-",
+		},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image: s.Bootstrap.Image,
+				DHCPLeases: []v1alpha3.DHCPLease{{
+					MAC: mac,
+				}},
+			},
+		},
+	}
+
+	if s.Bootstrap.Site != "" {
+		machine.Labels = map[string]string{
+			siteLabel: s.Bootstrap.Site,
+		}
+	}
+
+	if err := s.Bootstrap.Client.Create(ctx, machine); err != nil {
+		// With generateName, AlreadyExists should not normally occur since
+		// names are generated server-side. This guard handles any unexpected
+		// API-level conflict gracefully.
+		if apierrors.IsAlreadyExists(err) {
+			log.Info("bootstrap: Machine creation conflict (already exists)")
+			return
+		}
+
+		log.Error("bootstrap: creating Machine", "err", err)
+
+		return
+	}
+
+	log.Info("bootstrap: created Machine for unknown MAC", "machine", machine.Name)
 }

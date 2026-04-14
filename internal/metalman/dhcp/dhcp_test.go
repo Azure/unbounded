@@ -541,6 +541,26 @@ func newFakeReader(t *testing.T, objs ...runtime.Object) client.Reader {
 		Build()
 }
 
+func newFakeClient(t *testing.T, objs ...runtime.Object) client.Client {
+	t.Helper()
+
+	scheme := runtime.NewScheme()
+	if err := v1alpha3.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+
+	clientObjs := make([]client.Object, len(objs))
+	for i, o := range objs {
+		clientObjs[i] = o.(client.Object)
+	}
+
+	return fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(clientObjs...).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByMAC, indexing.IndexNodeByMACFunc).
+		Build()
+}
+
 type fakePacketConn struct {
 	written []byte
 	dest    net.Addr
@@ -559,3 +579,245 @@ func (f *fakePacketConn) LocalAddr() net.Addr                { return &net.UDPAd
 func (f *fakePacketConn) SetDeadline(_ time.Time) error      { return nil }
 func (f *fakePacketConn) SetReadDeadline(_ time.Time) error  { return nil }
 func (f *fakePacketConn) SetWriteDeadline(_ time.Time) error { return nil }
+
+func TestDHCPHandlerBootstrapCreatesMachine(t *testing.T) {
+	mac, _ := net.ParseMAC("aa:bb:cc:dd:ee:99")
+	serverIP := net.ParseIP("10.0.1.254").To4()
+
+	fc := newFakeClient(t)
+	srv := &Server{
+		Interface: "eth0",
+		Reader:    fc,
+		ServerIP:  serverIP,
+		Bootstrap: &BootstrapConfig{
+			Client: fc,
+			Image:  "ghcr.io/test/bootstrap:v1",
+			Site:   "rack-a",
+		},
+	}
+
+	discover, err := dhcpv4.NewDiscovery(mac)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	conn := &fakePacketConn{}
+	peer := &net.UDPAddr{IP: net.ParseIP("10.0.1.99"), Port: 68}
+
+	srv.handler(conn, peer, discover)
+
+	// No DHCP response should be sent (no IP allocated yet).
+	if conn.written != nil {
+		t.Error("expected no DHCP response for bootstrapped MAC (IP not yet allocated)")
+	}
+
+	// Verify a Machine was created.
+	var list v1alpha3.MachineList
+	if err := fc.List(t.Context(), &list); err != nil {
+		t.Fatalf("listing Machines: %v", err)
+	}
+
+	if len(list.Items) != 1 {
+		t.Fatalf("expected 1 Machine, got %d", len(list.Items))
+	}
+
+	machine := list.Items[0]
+
+	// Verify generateName was used.
+	if machine.GenerateName != "machine-" {
+		t.Errorf("expected generateName 'machine-', got %q", machine.GenerateName)
+	}
+
+	// Verify PXE image.
+	if machine.Spec.PXE == nil || machine.Spec.PXE.Image != "ghcr.io/test/bootstrap:v1" {
+		t.Errorf("expected PXE image 'ghcr.io/test/bootstrap:v1', got %v", machine.Spec.PXE)
+	}
+
+	// Verify DHCP lease MAC.
+	if len(machine.Spec.PXE.DHCPLeases) != 1 || machine.Spec.PXE.DHCPLeases[0].MAC != "aa:bb:cc:dd:ee:99" {
+		t.Errorf("expected DHCP lease with MAC aa:bb:cc:dd:ee:99, got %v", machine.Spec.PXE.DHCPLeases)
+	}
+
+	// Verify site label.
+	if machine.Labels["unbounded-kube.io/site"] != "rack-a" {
+		t.Errorf("expected site label 'rack-a', got %q", machine.Labels["unbounded-kube.io/site"])
+	}
+
+	// Verify no IPv4 was set (IP allocator handles that).
+	if machine.Spec.PXE.DHCPLeases[0].IPv4 != "" {
+		t.Errorf("expected empty IPv4 (for IP allocator), got %q", machine.Spec.PXE.DHCPLeases[0].IPv4)
+	}
+}
+
+func TestDHCPHandlerBootstrapNoSiteLabel(t *testing.T) {
+	mac, _ := net.ParseMAC("aa:bb:cc:dd:ee:98")
+	serverIP := net.ParseIP("10.0.1.254").To4()
+
+	fc := newFakeClient(t)
+	srv := &Server{
+		Interface: "eth0",
+		Reader:    fc,
+		ServerIP:  serverIP,
+		Bootstrap: &BootstrapConfig{
+			Client: fc,
+			Image:  "ghcr.io/test/bootstrap:v1",
+			// Site intentionally left empty.
+		},
+	}
+
+	discover, err := dhcpv4.NewDiscovery(mac)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	conn := &fakePacketConn{}
+	peer := &net.UDPAddr{IP: net.ParseIP("10.0.1.99"), Port: 68}
+
+	srv.handler(conn, peer, discover)
+
+	var list v1alpha3.MachineList
+	if err := fc.List(t.Context(), &list); err != nil {
+		t.Fatalf("listing Machines: %v", err)
+	}
+
+	if len(list.Items) != 1 {
+		t.Fatalf("expected 1 Machine, got %d", len(list.Items))
+	}
+
+	// Verify no site label.
+	if _, ok := list.Items[0].Labels["unbounded-kube.io/site"]; ok {
+		t.Error("expected no site label when Site is empty")
+	}
+}
+
+func TestDHCPHandlerBootstrapSkipsExistingMAC(t *testing.T) {
+	mac, _ := net.ParseMAC("aa:bb:cc:dd:ee:f0")
+	serverIP := net.ParseIP("10.0.1.254").To4()
+
+	// Pre-existing Machine with this MAC.
+	existingNode := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "existing-node"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image: "ghcr.io/test/image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{
+					MAC:        "aa:bb:cc:dd:ee:f0",
+					IPv4:       "10.0.1.10",
+					SubnetMask: "255.255.255.0",
+				}},
+			},
+		},
+	}
+
+	fc := newFakeClient(t, existingNode)
+	srv := &Server{
+		Interface: "eth0",
+		Reader:    fc,
+		ServerIP:  serverIP,
+		Bootstrap: &BootstrapConfig{
+			Client: fc,
+			Image:  "ghcr.io/test/bootstrap:v1",
+		},
+	}
+
+	discover, err := dhcpv4.NewDiscovery(mac)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	conn := &fakePacketConn{}
+	peer := &net.UDPAddr{IP: net.ParseIP("10.0.1.10"), Port: 68}
+
+	srv.handler(conn, peer, discover)
+
+	// Should have responded normally (existing Machine has an IP).
+	if conn.written == nil {
+		t.Fatal("expected DHCP response for existing Machine")
+	}
+
+	// Verify no new Machine was created.
+	var list v1alpha3.MachineList
+	if err := fc.List(t.Context(), &list); err != nil {
+		t.Fatalf("listing Machines: %v", err)
+	}
+
+	if len(list.Items) != 1 {
+		t.Errorf("expected exactly 1 Machine (the existing one), got %d", len(list.Items))
+	}
+}
+
+func TestDHCPHandlerBootstrapDisabledIgnoresUnknownMAC(t *testing.T) {
+	mac, _ := net.ParseMAC("aa:bb:cc:dd:ee:97")
+	serverIP := net.ParseIP("10.0.1.254").To4()
+
+	fc := newFakeClient(t)
+	srv := &Server{
+		Interface: "eth0",
+		Reader:    fc,
+		ServerIP:  serverIP,
+		// Bootstrap intentionally nil (disabled).
+	}
+
+	discover, err := dhcpv4.NewDiscovery(mac)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	conn := &fakePacketConn{}
+	peer := &net.UDPAddr{IP: net.ParseIP("10.0.1.99"), Port: 68}
+
+	srv.handler(conn, peer, discover)
+
+	if conn.written != nil {
+		t.Error("expected no response for unknown MAC without bootstrap")
+	}
+
+	// Verify no Machine was created.
+	var list v1alpha3.MachineList
+	if err := fc.List(t.Context(), &list); err != nil {
+		t.Fatalf("listing Machines: %v", err)
+	}
+
+	if len(list.Items) != 0 {
+		t.Errorf("expected 0 Machines, got %d", len(list.Items))
+	}
+}
+
+func TestDHCPHandlerBootstrapDeduplicatesConcurrent(t *testing.T) {
+	mac, _ := net.ParseMAC("aa:bb:cc:dd:ee:96")
+	serverIP := net.ParseIP("10.0.1.254").To4()
+
+	fc := newFakeClient(t)
+	srv := &Server{
+		Interface: "eth0",
+		Reader:    fc,
+		ServerIP:  serverIP,
+		Bootstrap: &BootstrapConfig{
+			Client: fc,
+			Image:  "ghcr.io/test/bootstrap:v1",
+		},
+	}
+
+	// Send multiple DHCP discovers for the same MAC.
+	for i := 0; i < 5; i++ {
+		discover, err := dhcpv4.NewDiscovery(mac)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		conn := &fakePacketConn{}
+		peer := &net.UDPAddr{IP: net.ParseIP("10.0.1.99"), Port: 68}
+
+		srv.handler(conn, peer, discover)
+	}
+
+	// Only one Machine should have been created.
+	var list v1alpha3.MachineList
+	if err := fc.List(t.Context(), &list); err != nil {
+		t.Fatalf("listing Machines: %v", err)
+	}
+
+	if len(list.Items) != 1 {
+		t.Errorf("expected exactly 1 Machine after multiple requests, got %d", len(list.Items))
+	}
+}

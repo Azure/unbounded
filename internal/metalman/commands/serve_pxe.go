@@ -49,6 +49,8 @@ func ServePXECmd() *cobra.Command {
 		leaseDuration     time.Duration
 		renewDeadline     time.Duration
 		retryPeriod       time.Duration
+		bootstrap         bool
+		bootstrapImage    string
 	)
 
 	cmd := &cobra.Command{
@@ -57,6 +59,10 @@ func ServePXECmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx := ctrl.SetupSignalHandler()
 			cfg := ctrl.GetConfigOrDie()
+
+			if bootstrap && bootstrapImage == "" {
+				return fmt.Errorf("--bootstrap-image is required when --bootstrap is enabled")
+			}
 
 			selector, err := SiteSelector(site)
 			if err != nil {
@@ -246,6 +252,15 @@ func ServePXECmd() *cobra.Command {
 				ServerIP:  dhcpServerIP,
 				OCICache:  ociCache,
 			}
+
+			if bootstrap {
+				dhcpServer.Bootstrap = &dhcp.BootstrapConfig{
+					Client: mgr.GetClient(),
+					Image:  bootstrapImage,
+					Site:   site,
+				}
+			}
+
 			if err := mgr.Add(dhcpServer); err != nil {
 				return fmt.Errorf("adding DHCP server: %w", err)
 			}
@@ -290,6 +305,10 @@ func ServePXECmd() *cobra.Command {
 			PrintConfig("cache-dir", cacheDir)
 			PrintConfig("dhcp-interface", dhcpInterface)
 			PrintConfig("dhcp-port", fmt.Sprintf("%d", dhcpPort))
+			PrintConfig("bootstrap", fmt.Sprintf("%t", bootstrap))
+			if bootstrap {
+				PrintConfig("bootstrap-image", bootstrapImage)
+			}
 			fmt.Println()
 
 			if dhcpInterface != "" {
@@ -319,6 +338,8 @@ func ServePXECmd() *cobra.Command {
 	cmd.Flags().DurationVar(&leaseDuration, "leader-elect-lease-duration", 15*time.Second, "Duration that non-leader candidates will wait before attempting to acquire leadership")
 	cmd.Flags().DurationVar(&renewDeadline, "leader-elect-renew-deadline", 10*time.Second, "Duration the acting leader will retry refreshing leadership before giving up")
 	cmd.Flags().DurationVar(&retryPeriod, "leader-elect-retry-period", 2*time.Second, "Duration between leader election retries")
+	cmd.Flags().BoolVar(&bootstrap, "bootstrap", false, "Automatically create Machine objects for unknown MAC addresses during DHCP")
+	cmd.Flags().StringVar(&bootstrapImage, "bootstrap-image", "", "OCI image reference for bootstrapped Machines (required when --bootstrap is set)")
 
 	return cmd
 }
