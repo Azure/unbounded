@@ -55,7 +55,7 @@ h47WE0g7IMhA
 // goalStateFor builds a minimal NodeStart goal state for tests.
 func goalStateFor(machineName, bootstrapToken string, labels map[string]string, taints []string) *goalstates.NodeStart {
 	return &goalstates.NodeStart{
-		MachineName: machineName,
+		KubeMachineName: machineName,
 		Kubelet: goalstates.Kubelet{
 			BootstrapToken:     bootstrapToken,
 			APIServer:          "https://api.example.com:6443",
@@ -291,7 +291,7 @@ func TestRegisterMachine_EmptyCACertData_ReturnsError(t *testing.T) {
 	t.Parallel()
 
 	gs := &goalstates.NodeStart{
-		MachineName: "my-node",
+		KubeMachineName: "my-node",
 		Kubelet: goalstates.Kubelet{
 			BootstrapToken: "tok.secret",
 			APIServer:      "https://api.example.com:6443",
@@ -316,7 +316,7 @@ func TestRegisterMachine_InvalidPEMCACertData_ReturnsError(t *testing.T) {
 	t.Parallel()
 
 	gs := &goalstates.NodeStart{
-		MachineName: "my-node",
+		KubeMachineName: "my-node",
 		Kubelet: goalstates.Kubelet{
 			BootstrapToken: "tok.secret",
 			APIServer:      "https://api.example.com:6443",

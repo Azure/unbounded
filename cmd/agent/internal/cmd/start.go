@@ -160,11 +160,12 @@ func resolveNodeStartGoalState(cfg *provision.AgentConfig, nvidia goalstates.Nvi
 	}
 
 	return &goalstates.NodeStart{
-		MachineName: nspawnMachineName,
-		MachineDir:  filepath.Join("/var/lib/machines", nspawnMachineName),
-		Containerd:  goalstates.ResolveContainerd(),
-		Kubelet:     kubelet,
-		Nvidia:      nvidia,
+		MachineName:     nspawnMachineName,
+		KubeMachineName: cfg.MachineName,
+		MachineDir:      filepath.Join("/var/lib/machines", nspawnMachineName),
+		Containerd:      goalstates.ResolveContainerd(),
+		Kubelet:         kubelet,
+		Nvidia:          nvidia,
 	}, nil
 }
 

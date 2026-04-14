@@ -631,8 +631,10 @@ def _run_agent_inner(agent_url: str) -> None:
     # Capture the local API server URL from the kubeconfig (typically
     # https://127.0.0.1:<port> for Kind) so we can replace it with the
     # VM-reachable container IP after generating the script.
+    # Use --minify to scope to the current context only, avoiding picking up
+    # the wrong cluster when multiple contexts exist in the kubeconfig.
     local_api_server = kubectl_capture([
-        "config", "view", "--raw",
+        "config", "view", "--minify", "--raw",
         "-o", "jsonpath={.clusters[0].cluster.server}",
     ])
     if not local_api_server:

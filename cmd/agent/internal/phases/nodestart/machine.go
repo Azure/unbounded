@@ -67,7 +67,7 @@ func (r *registerMachine) Do(ctx context.Context) error {
 		return fmt.Errorf("build Kubernetes client: %w", err)
 	}
 
-	machineName := r.goalState.MachineName
+	machineName := r.goalState.KubeMachineName
 
 	var machine v1alpha3.Machine
 	if err := c.Get(ctx, client.ObjectKey{Name: machineName}, &machine); err == nil {
@@ -148,7 +148,7 @@ func (r *registerMachine) buildClient() (client.Client, error) {
 func (r *registerMachine) buildMachine(token string) v1alpha3.Machine {
 	return v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: r.goalState.MachineName,
+			Name: r.goalState.KubeMachineName,
 		},
 		Spec: v1alpha3.MachineSpec{
 			Kubernetes: &v1alpha3.KubernetesSpec{
