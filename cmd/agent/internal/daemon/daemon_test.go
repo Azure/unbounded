@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-package nodestart
+package daemon
 
 import (
 	"context"
@@ -22,7 +22,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	v1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
-	"github.com/Azure/unbounded-kube/cmd/agent/internal/goalstates"
 )
 
 // discardLogger returns a logger that silently drops all output.
@@ -52,27 +51,41 @@ hpnfsIFMdNXiOVD3et8iXxIvG6MM4QIhAJnTuif88s4vV5c0GeAwdulG0k3fdKyI
 h47WE0g7IMhA
 -----END CERTIFICATE-----`
 
-// goalStateFor builds a minimal NodeStart goal state for tests.
-func goalStateFor(machineName, bootstrapToken string, labels map[string]string, taints []string) *goalstates.NodeStart {
-	return &goalstates.NodeStart{
-		KubeMachineName: machineName,
-		Kubelet: goalstates.Kubelet{
-			BootstrapToken:     bootstrapToken,
-			APIServer:          "https://api.example.com:6443",
-			CACertData:         []byte(fakeCACertPEM),
-			NodeLabels:         labels,
-			RegisterWithTaints: taints,
-		},
+// configFor builds a daemon Config for tests.
+func configFor(machineName, bootstrapToken string, labels map[string]string, taints []string) *Config {
+	return &Config{
+		MachineName:        machineName,
+		APIServer:          "https://api.example.com:6443",
+		CACertData:         []byte(fakeCACertPEM),
+		BootstrapToken:     bootstrapToken,
+		NodeLabels:         labels,
+		RegisterWithTaints: taints,
 	}
 }
 
-// newSharedClientFactory returns a newClient factory that always returns the
-// provided client. Use this when you need to inspect the client state after
-// a task completes.
-func newSharedClientFactory(c client.Client) func(*rest.Config, client.Options) (client.Client, error) {
-	return func(_ *rest.Config, _ client.Options) (client.Client, error) {
+// withFakeClient overrides the package-level newClientFunc for the duration of
+// the test and restores it on cleanup.
+func withFakeClient(t *testing.T, c client.Client) {
+	t.Helper()
+
+	orig := newClientFunc
+	newClientFunc = func(_ *rest.Config, _ client.Options) (client.Client, error) {
 		return c, nil
 	}
+
+	t.Cleanup(func() { newClientFunc = orig })
+}
+
+// withFailingClientBuilder overrides newClientFunc to return the given error.
+func withFailingClientBuilder(t *testing.T, err error) {
+	t.Helper()
+
+	orig := newClientFunc
+	newClientFunc = func(_ *rest.Config, _ client.Options) (client.Client, error) {
+		return nil, err
+	}
+
+	t.Cleanup(func() { newClientFunc = orig })
 }
 
 // ---------------------------------------------------------------------------
@@ -104,7 +117,7 @@ func TestBootstrapTokenID(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// RegisterMachine phase tests
+// registerMachine tests
 // ---------------------------------------------------------------------------
 
 func TestRegisterMachine_EmptyBootstrapToken_Skips(t *testing.T) {
@@ -112,15 +125,10 @@ func TestRegisterMachine_EmptyBootstrapToken_Skips(t *testing.T) {
 
 	scheme := newFakeScheme()
 	c := fake.NewClientBuilder().WithScheme(scheme).Build()
+	withFakeClient(t, c)
 
-	gs := goalStateFor("my-node", "", nil, nil)
-	task := &registerMachine{
-		log:       discardLogger(),
-		goalState: gs,
-		newClient: newSharedClientFactory(c),
-	}
-
-	require.NoError(t, task.Do(context.Background()))
+	cfg := configFor("my-node", "", nil, nil)
+	require.NoError(t, registerMachine(context.Background(), discardLogger(), cfg))
 
 	// Confirm no Machine CR was created.
 	var list v1alpha3.MachineList
@@ -137,15 +145,10 @@ func TestRegisterMachine_MachineAlreadyExists_Skips(t *testing.T) {
 
 	scheme := newFakeScheme()
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(existing).Build()
+	withFakeClient(t, c)
 
-	gs := goalStateFor("my-node", "tokid.secret", nil, nil)
-	task := &registerMachine{
-		log:       discardLogger(),
-		goalState: gs,
-		newClient: newSharedClientFactory(c),
-	}
-
-	require.NoError(t, task.Do(context.Background()))
+	cfg := configFor("my-node", "tokid.secret", nil, nil)
+	require.NoError(t, registerMachine(context.Background(), discardLogger(), cfg))
 
 	// Confirm only one Machine CR exists (the original).
 	var list v1alpha3.MachineList
@@ -158,20 +161,15 @@ func TestRegisterMachine_MachineNotFound_Creates(t *testing.T) {
 
 	scheme := newFakeScheme()
 	c := fake.NewClientBuilder().WithScheme(scheme).Build()
+	withFakeClient(t, c)
 
-	gs := goalStateFor(
+	cfg := configFor(
 		"new-node",
 		"abc123.secretpart",
 		map[string]string{"env": "prod"},
 		[]string{"dedicated=gpu:NoSchedule"},
 	)
-	task := &registerMachine{
-		log:       discardLogger(),
-		goalState: gs,
-		newClient: newSharedClientFactory(c),
-	}
-
-	require.NoError(t, task.Do(context.Background()))
+	require.NoError(t, registerMachine(context.Background(), discardLogger(), cfg))
 
 	var machine v1alpha3.Machine
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "new-node"}, &machine))
@@ -186,16 +184,11 @@ func TestRegisterMachine_MachineNotFound_MinimalCreate(t *testing.T) {
 
 	scheme := newFakeScheme()
 	c := fake.NewClientBuilder().WithScheme(scheme).Build()
+	withFakeClient(t, c)
 
 	// No labels or taints.
-	gs := goalStateFor("bare-node", "tid001.secret", nil, nil)
-	task := &registerMachine{
-		log:       discardLogger(),
-		goalState: gs,
-		newClient: newSharedClientFactory(c),
-	}
-
-	require.NoError(t, task.Do(context.Background()))
+	cfg := configFor("bare-node", "tid001.secret", nil, nil)
+	require.NoError(t, registerMachine(context.Background(), discardLogger(), cfg))
 
 	var machine v1alpha3.Machine
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "bare-node"}, &machine))
@@ -209,16 +202,10 @@ func TestRegisterMachine_ClientBuildError_ReturnsError(t *testing.T) {
 	t.Parallel()
 
 	expectedErr := errors.New("injected client build error")
-	gs := goalStateFor("my-node", "tok.secret", nil, nil)
-	task := &registerMachine{
-		log:       discardLogger(),
-		goalState: gs,
-		newClient: func(_ *rest.Config, _ client.Options) (client.Client, error) {
-			return nil, expectedErr
-		},
-	}
+	withFailingClientBuilder(t, expectedErr)
 
-	err := task.Do(context.Background())
+	cfg := configFor("my-node", "tok.secret", nil, nil)
+	err := registerMachine(context.Background(), discardLogger(), cfg)
 	require.ErrorIs(t, err, expectedErr)
 }
 
@@ -228,15 +215,10 @@ func TestRegisterMachine_GetError_ReturnsError(t *testing.T) {
 	scheme := newFakeScheme()
 	base := fake.NewClientBuilder().WithScheme(scheme).Build()
 	errClient := &errorInjectingClient{Client: base, getErr: errors.New("api server unavailable")}
+	withFakeClient(t, errClient)
 
-	gs := goalStateFor("my-node", "tok.secret", nil, nil)
-	task := &registerMachine{
-		log:       discardLogger(),
-		goalState: gs,
-		newClient: newSharedClientFactory(errClient),
-	}
-
-	err := task.Do(context.Background())
+	cfg := configFor("my-node", "tok.secret", nil, nil)
+	err := registerMachine(context.Background(), discardLogger(), cfg)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "api server unavailable")
 }
@@ -251,15 +233,10 @@ func TestRegisterMachine_NoMatchError_ReturnsError(t *testing.T) {
 	scheme := newFakeScheme()
 	base := fake.NewClientBuilder().WithScheme(scheme).Build()
 	errClient := &errorInjectingClient{Client: base, getErr: noMatchErr}
+	withFakeClient(t, errClient)
 
-	gs := goalStateFor("my-node", "tok.secret", nil, nil)
-	task := &registerMachine{
-		log:       discardLogger(),
-		goalState: gs,
-		newClient: newSharedClientFactory(errClient),
-	}
-
-	err := task.Do(context.Background())
+	cfg := configFor("my-node", "tok.secret", nil, nil)
+	err := registerMachine(context.Background(), discardLogger(), cfg)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "machine CRD is not installed")
 }
@@ -275,39 +252,24 @@ func TestRegisterMachine_CreateAlreadyExists_Tolerates(t *testing.T) {
 		Client:    base,
 		createErr: apierrors.NewAlreadyExists(schema.GroupResource{Group: "unbounded-kube.io", Resource: "machines"}, "my-node"),
 	}
+	withFakeClient(t, errClient)
 
-	gs := goalStateFor("my-node", "tok.secret", nil, nil)
-	task := &registerMachine{
-		log:       discardLogger(),
-		goalState: gs,
-		newClient: newSharedClientFactory(errClient),
-	}
-
+	cfg := configFor("my-node", "tok.secret", nil, nil)
 	// Should succeed rather than returning an error.
-	require.NoError(t, task.Do(context.Background()))
+	require.NoError(t, registerMachine(context.Background(), discardLogger(), cfg))
 }
 
 func TestRegisterMachine_EmptyCACertData_ReturnsError(t *testing.T) {
 	t.Parallel()
 
-	gs := &goalstates.NodeStart{
-		KubeMachineName: "my-node",
-		Kubelet: goalstates.Kubelet{
-			BootstrapToken: "tok.secret",
-			APIServer:      "https://api.example.com:6443",
-			CACertData:     []byte{},
-		},
-	}
-	task := &registerMachine{
-		log:       discardLogger(),
-		goalState: gs,
-		newClient: func(_ *rest.Config, _ client.Options) (client.Client, error) {
-			t.Fatal("newClient should not be called when CACertData is empty")
-			return nil, nil
-		},
+	cfg := &Config{
+		MachineName:    "my-node",
+		APIServer:      "https://api.example.com:6443",
+		CACertData:     []byte{},
+		BootstrapToken: "tok.secret",
 	}
 
-	err := task.Do(context.Background())
+	err := registerMachine(context.Background(), discardLogger(), cfg)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "CA certificate data is empty")
 }
@@ -315,24 +277,14 @@ func TestRegisterMachine_EmptyCACertData_ReturnsError(t *testing.T) {
 func TestRegisterMachine_InvalidPEMCACertData_ReturnsError(t *testing.T) {
 	t.Parallel()
 
-	gs := &goalstates.NodeStart{
-		KubeMachineName: "my-node",
-		Kubelet: goalstates.Kubelet{
-			BootstrapToken: "tok.secret",
-			APIServer:      "https://api.example.com:6443",
-			CACertData:     []byte("not-valid-pem-data"),
-		},
-	}
-	task := &registerMachine{
-		log:       discardLogger(),
-		goalState: gs,
-		newClient: func(_ *rest.Config, _ client.Options) (client.Client, error) {
-			t.Fatal("newClient should not be called when CACertData is invalid PEM")
-			return nil, nil
-		},
+	cfg := &Config{
+		MachineName:    "my-node",
+		APIServer:      "https://api.example.com:6443",
+		CACertData:     []byte("not-valid-pem-data"),
+		BootstrapToken: "tok.secret",
 	}
 
-	err := task.Do(context.Background())
+	err := registerMachine(context.Background(), discardLogger(), cfg)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "does not contain a valid PEM block")
 }
@@ -344,15 +296,14 @@ func TestRegisterMachine_InvalidPEMCACertData_ReturnsError(t *testing.T) {
 func TestBuildMachine_PopulatesFields(t *testing.T) {
 	t.Parallel()
 
-	gs := goalStateFor(
+	cfg := configFor(
 		"my-node",
 		"tid.secretpart",
 		map[string]string{"zone": "east"},
 		[]string{"key=val:NoSchedule"},
 	)
 
-	task := &registerMachine{goalState: gs}
-	machine := task.buildMachine("tid.secretpart")
+	machine := buildMachine(cfg)
 
 	assert.Equal(t, "my-node", machine.Name)
 	require.NotNil(t, machine.Spec.Kubernetes)
@@ -362,7 +313,7 @@ func TestBuildMachine_PopulatesFields(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// errorInjectingClient wraps a client and injects an error on Get.
+// errorInjectingClient wraps a client and injects errors on Get and Create.
 // ---------------------------------------------------------------------------
 
 type errorInjectingClient struct {
