@@ -22,17 +22,17 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	AgentService_PullTasks_FullMethodName        = "/unbounded.agent.v1.AgentService/PullTasks"
-	AgentService_ReportTaskStatus_FullMethodName = "/unbounded.agent.v1.AgentService/ReportTaskStatus"
+	TaskServer_PullTasks_FullMethodName        = "/unbounded.agent.v1.TaskServer/PullTasks"
+	TaskServer_ReportTaskStatus_FullMethodName = "/unbounded.agent.v1.TaskServer/ReportTaskStatus"
 )
 
-// AgentServiceClient is the client API for AgentService service.
+// TaskServerClient is the client API for TaskServer service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
-// AgentService defines the task-pulling interface used by the unbounded-agent
+// TaskServer defines the task-pulling interface used by the unbounded-agent
 // to receive work from its control plane.
-type AgentServiceClient interface {
+type TaskServerClient interface {
 	// PullTasks is a server-streaming RPC. The agent opens a long-lived stream
 	// and the server pushes tasks as they become available.
 	PullTasks(ctx context.Context, in *PullTasksRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PullTasksResponse], error)
@@ -41,17 +41,17 @@ type AgentServiceClient interface {
 	ReportTaskStatus(ctx context.Context, in *ReportTaskStatusRequest, opts ...grpc.CallOption) (*ReportTaskStatusResponse, error)
 }
 
-type agentServiceClient struct {
+type taskServerClient struct {
 	cc grpc.ClientConnInterface
 }
 
-func NewAgentServiceClient(cc grpc.ClientConnInterface) AgentServiceClient {
-	return &agentServiceClient{cc}
+func NewTaskServerClient(cc grpc.ClientConnInterface) TaskServerClient {
+	return &taskServerClient{cc}
 }
 
-func (c *agentServiceClient) PullTasks(ctx context.Context, in *PullTasksRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PullTasksResponse], error) {
+func (c *taskServerClient) PullTasks(ctx context.Context, in *PullTasksRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PullTasksResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &AgentService_ServiceDesc.Streams[0], AgentService_PullTasks_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &TaskServer_ServiceDesc.Streams[0], TaskServer_PullTasks_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -66,113 +66,113 @@ func (c *agentServiceClient) PullTasks(ctx context.Context, in *PullTasksRequest
 }
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type AgentService_PullTasksClient = grpc.ServerStreamingClient[PullTasksResponse]
+type TaskServer_PullTasksClient = grpc.ServerStreamingClient[PullTasksResponse]
 
-func (c *agentServiceClient) ReportTaskStatus(ctx context.Context, in *ReportTaskStatusRequest, opts ...grpc.CallOption) (*ReportTaskStatusResponse, error) {
+func (c *taskServerClient) ReportTaskStatus(ctx context.Context, in *ReportTaskStatusRequest, opts ...grpc.CallOption) (*ReportTaskStatusResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ReportTaskStatusResponse)
-	err := c.cc.Invoke(ctx, AgentService_ReportTaskStatus_FullMethodName, in, out, cOpts...)
+	err := c.cc.Invoke(ctx, TaskServer_ReportTaskStatus_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-// AgentServiceServer is the server API for AgentService service.
-// All implementations must embed UnimplementedAgentServiceServer
+// TaskServerServer is the server API for TaskServer service.
+// All implementations must embed UnimplementedTaskServerServer
 // for forward compatibility.
 //
-// AgentService defines the task-pulling interface used by the unbounded-agent
+// TaskServer defines the task-pulling interface used by the unbounded-agent
 // to receive work from its control plane.
-type AgentServiceServer interface {
+type TaskServerServer interface {
 	// PullTasks is a server-streaming RPC. The agent opens a long-lived stream
 	// and the server pushes tasks as they become available.
 	PullTasks(*PullTasksRequest, grpc.ServerStreamingServer[PullTasksResponse]) error
 	// ReportTaskStatus allows the agent to report the outcome of a previously
 	// pulled task back to the server.
 	ReportTaskStatus(context.Context, *ReportTaskStatusRequest) (*ReportTaskStatusResponse, error)
-	mustEmbedUnimplementedAgentServiceServer()
+	mustEmbedUnimplementedTaskServerServer()
 }
 
-// UnimplementedAgentServiceServer must be embedded to have
+// UnimplementedTaskServerServer must be embedded to have
 // forward compatible implementations.
 //
 // NOTE: this should be embedded by value instead of pointer to avoid a nil
 // pointer dereference when methods are called.
-type UnimplementedAgentServiceServer struct{}
+type UnimplementedTaskServerServer struct{}
 
-func (UnimplementedAgentServiceServer) PullTasks(*PullTasksRequest, grpc.ServerStreamingServer[PullTasksResponse]) error {
+func (UnimplementedTaskServerServer) PullTasks(*PullTasksRequest, grpc.ServerStreamingServer[PullTasksResponse]) error {
 	return status.Errorf(codes.Unimplemented, "method PullTasks not implemented")
 }
-func (UnimplementedAgentServiceServer) ReportTaskStatus(context.Context, *ReportTaskStatusRequest) (*ReportTaskStatusResponse, error) {
+func (UnimplementedTaskServerServer) ReportTaskStatus(context.Context, *ReportTaskStatusRequest) (*ReportTaskStatusResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ReportTaskStatus not implemented")
 }
-func (UnimplementedAgentServiceServer) mustEmbedUnimplementedAgentServiceServer() {}
-func (UnimplementedAgentServiceServer) testEmbeddedByValue()                      {}
+func (UnimplementedTaskServerServer) mustEmbedUnimplementedTaskServerServer() {}
+func (UnimplementedTaskServerServer) testEmbeddedByValue()                    {}
 
-// UnsafeAgentServiceServer may be embedded to opt out of forward compatibility for this service.
-// Use of this interface is not recommended, as added methods to AgentServiceServer will
+// UnsafeTaskServerServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to TaskServerServer will
 // result in compilation errors.
-type UnsafeAgentServiceServer interface {
-	mustEmbedUnimplementedAgentServiceServer()
+type UnsafeTaskServerServer interface {
+	mustEmbedUnimplementedTaskServerServer()
 }
 
-func RegisterAgentServiceServer(s grpc.ServiceRegistrar, srv AgentServiceServer) {
-	// If the following call pancis, it indicates UnimplementedAgentServiceServer was
+func RegisterTaskServerServer(s grpc.ServiceRegistrar, srv TaskServerServer) {
+	// If the following call pancis, it indicates UnimplementedTaskServerServer was
 	// embedded by pointer and is nil.  This will cause panics if an
 	// unimplemented method is ever invoked, so we test this at initialization
 	// time to prevent it from happening at runtime later due to I/O.
 	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
 		t.testEmbeddedByValue()
 	}
-	s.RegisterService(&AgentService_ServiceDesc, srv)
+	s.RegisterService(&TaskServer_ServiceDesc, srv)
 }
 
-func _AgentService_PullTasks_Handler(srv interface{}, stream grpc.ServerStream) error {
+func _TaskServer_PullTasks_Handler(srv interface{}, stream grpc.ServerStream) error {
 	m := new(PullTasksRequest)
 	if err := stream.RecvMsg(m); err != nil {
 		return err
 	}
-	return srv.(AgentServiceServer).PullTasks(m, &grpc.GenericServerStream[PullTasksRequest, PullTasksResponse]{ServerStream: stream})
+	return srv.(TaskServerServer).PullTasks(m, &grpc.GenericServerStream[PullTasksRequest, PullTasksResponse]{ServerStream: stream})
 }
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type AgentService_PullTasksServer = grpc.ServerStreamingServer[PullTasksResponse]
+type TaskServer_PullTasksServer = grpc.ServerStreamingServer[PullTasksResponse]
 
-func _AgentService_ReportTaskStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _TaskServer_ReportTaskStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ReportTaskStatusRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(AgentServiceServer).ReportTaskStatus(ctx, in)
+		return srv.(TaskServerServer).ReportTaskStatus(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: AgentService_ReportTaskStatus_FullMethodName,
+		FullMethod: TaskServer_ReportTaskStatus_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(AgentServiceServer).ReportTaskStatus(ctx, req.(*ReportTaskStatusRequest))
+		return srv.(TaskServerServer).ReportTaskStatus(ctx, req.(*ReportTaskStatusRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
-// AgentService_ServiceDesc is the grpc.ServiceDesc for AgentService service.
+// TaskServer_ServiceDesc is the grpc.ServiceDesc for TaskServer service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
-var AgentService_ServiceDesc = grpc.ServiceDesc{
-	ServiceName: "unbounded.agent.v1.AgentService",
-	HandlerType: (*AgentServiceServer)(nil),
+var TaskServer_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "unbounded.agent.v1.TaskServer",
+	HandlerType: (*TaskServerServer)(nil),
 	Methods: []grpc.MethodDesc{
 		{
 			MethodName: "ReportTaskStatus",
-			Handler:    _AgentService_ReportTaskStatus_Handler,
+			Handler:    _TaskServer_ReportTaskStatus_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{
 		{
 			StreamName:    "PullTasks",
-			Handler:       _AgentService_PullTasks_Handler,
+			Handler:       _TaskServer_PullTasks_Handler,
 			ServerStreams: true,
 		},
 	},

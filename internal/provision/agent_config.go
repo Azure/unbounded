@@ -29,6 +29,12 @@ type AgentConfig struct {
 	// performs TPM attestation on the host instead of requiring a static
 	// BootstrapToken in Kubelet config.
 	Attest *AgentAttestConfig `json:"Attest,omitempty"`
+
+	// TaskServer configures the gRPC connection to the agent task server.
+	// When set, the agent opens a long-lived stream to pull tasks (e.g.
+	// node updates) at runtime. When nil the agent operates in its
+	// default fire-and-forget mode.
+	TaskServer *AgentTaskServerConfig `json:"TaskServer,omitempty"`
 }
 
 // AgentClusterConfig holds the cluster-level values the agent needs to
@@ -54,6 +60,15 @@ type AgentAttestConfig struct {
 	// "http://10.0.0.1:8880"). The agent appends "/attest" to this URL
 	// when performing TPM attestation.
 	URL string `json:"URL"`
+}
+
+// AgentTaskServerConfig holds configuration for connecting to the gRPC
+// agent task server (AgentService). When present the agent opens a
+// long-lived PullTasks stream to receive work such as node updates.
+type AgentTaskServerConfig struct {
+	// Endpoint is the gRPC target of the task server
+	// (e.g. "tasks.example.com:443").
+	Endpoint string `json:"Endpoint"`
 }
 
 // ClusterEndpoint holds the cluster-level connection parameters needed to

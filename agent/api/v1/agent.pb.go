@@ -499,8 +499,9 @@ const file_agent_proto_rawDesc = "" +
 	"\tTaskState\x12\x1a\n" +
 	"\x16TASK_STATE_UNSPECIFIED\x10\x00\x12\x18\n" +
 	"\x14TASK_STATE_SUCCEEDED\x10\x01\x12\x15\n" +
-	"\x11TASK_STATE_FAILED\x10\x022\xd9\x01\n" +
-	"\fAgentService\x12Z\n" +
+	"\x11TASK_STATE_FAILED\x10\x022\xd7\x01\n" +
+	"\n" +
+	"TaskServer\x12Z\n" +
 	"\tPullTasks\x12$.unbounded.agent.v1.PullTasksRequest\x1a%.unbounded.agent.v1.PullTasksResponse0\x01\x12m\n" +
 	"\x10ReportTaskStatus\x12+.unbounded.agent.v1.ReportTaskStatusRequest\x1a,.unbounded.agent.v1.ReportTaskStatusResponseB6Z4github.com/Azure/unbounded-kube/agent/api/v1;agentv1b\x06proto3"
 
@@ -535,10 +536,10 @@ var file_agent_proto_depIdxs = []int32{
 	8, // 2: unbounded.agent.v1.Task.created_at:type_name -> google.protobuf.Timestamp
 	7, // 3: unbounded.agent.v1.NodeUpdateSpec.node_labels:type_name -> unbounded.agent.v1.NodeUpdateSpec.NodeLabelsEntry
 	0, // 4: unbounded.agent.v1.ReportTaskStatusRequest.state:type_name -> unbounded.agent.v1.TaskState
-	1, // 5: unbounded.agent.v1.AgentService.PullTasks:input_type -> unbounded.agent.v1.PullTasksRequest
-	5, // 6: unbounded.agent.v1.AgentService.ReportTaskStatus:input_type -> unbounded.agent.v1.ReportTaskStatusRequest
-	2, // 7: unbounded.agent.v1.AgentService.PullTasks:output_type -> unbounded.agent.v1.PullTasksResponse
-	6, // 8: unbounded.agent.v1.AgentService.ReportTaskStatus:output_type -> unbounded.agent.v1.ReportTaskStatusResponse
+	1, // 5: unbounded.agent.v1.TaskServer.PullTasks:input_type -> unbounded.agent.v1.PullTasksRequest
+	5, // 6: unbounded.agent.v1.TaskServer.ReportTaskStatus:input_type -> unbounded.agent.v1.ReportTaskStatusRequest
+	2, // 7: unbounded.agent.v1.TaskServer.PullTasks:output_type -> unbounded.agent.v1.PullTasksResponse
+	6, // 8: unbounded.agent.v1.TaskServer.ReportTaskStatus:output_type -> unbounded.agent.v1.ReportTaskStatusResponse
 	7, // [7:9] is the sub-list for method output_type
 	5, // [5:7] is the sub-list for method input_type
 	5, // [5:5] is the sub-list for extension type_name

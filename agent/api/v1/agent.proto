@@ -9,9 +9,9 @@ option go_package = "github.com/Azure/unbounded-kube/agent/api/v1;agentv1";
 
 import "google/protobuf/timestamp.proto";
 
-// AgentService defines the task-pulling interface used by the unbounded-agent
+// TaskServer defines the task-pulling interface used by the unbounded-agent
 // to receive work from its control plane.
-service AgentService {
+service TaskServer {
   // PullTasks is a server-streaming RPC. The agent opens a long-lived stream
   // and the server pushes tasks as they become available.
   rpc PullTasks(PullTasksRequest) returns (stream PullTasksResponse);
