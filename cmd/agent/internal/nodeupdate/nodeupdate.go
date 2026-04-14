@@ -6,10 +6,11 @@
 // configuration from the currently applied config, this package orchestrates:
 //
 //  1. Provisioning a new nspawn machine (the alternate of the current one)
-//  2. Stopping the old machine
-//  3. Starting the new machine and verifying kubelet is running
-//  4. Removing the old machine
-//  5. Persisting the new applied config
+//  2. Gracefully stopping kubelet and containerd inside the old machine
+//  3. Stopping the old nspawn machine
+//  4. Starting the new machine and verifying kubelet is running
+//  5. Removing the old machine
+//  6. Persisting the new applied config
 package nodeupdate
 
 import (
@@ -181,10 +182,11 @@ func MergeSpec(base *provision.AgentConfig, spec *agentv1.NodeUpdateSpec) *provi
 // Execute performs the blue-green nspawn machine update:
 //  1. Provision a new rootfs on the alternate machine
 //  2. Configure containerd and kubelet (pre-boot)
-//  3. Stop the old machine
-//  4. Start the new machine, verify kubelet is running
-//  5. Stop and remove the old machine
-//  6. Persist the new applied config, remove the old one
+//  3. Gracefully stop kubelet and containerd inside the old machine
+//  4. Stop the old nspawn machine
+//  5. Start the new machine, verify kubelet is running
+//  6. Remove the old machine
+//  7. Persist the new applied config, remove the old one
 func Execute(ctx context.Context, log *slog.Logger, active *ActiveMachine, newCfg *provision.AgentConfig) error {
 	oldMachine := active.Name
 	newMachine := goalstates.AlternateMachine(oldMachine)
@@ -234,6 +236,16 @@ func Execute(ctx context.Context, log *slog.Logger, active *ActiveMachine, newCf
 	}
 
 	// Step 3: Stop the old machine.
+	// First gracefully stop kubelet and containerd inside the container so
+	// the nspawn stop does not have to force-kill them, which is faster.
+	log.Info("pre-stopping services in old machine", "machine", oldMachine)
+	if _, err := machineRun(ctx, log, oldMachine, "systemctl", "stop", goalstates.SystemdUnitKubelet); err != nil {
+		log.Warn("failed to pre-stop kubelet (proceeding anyway)", "machine", oldMachine, "error", err)
+	}
+	if _, err := machineRun(ctx, log, oldMachine, "systemctl", "stop", goalstates.SystemdUnitContainerd); err != nil {
+		log.Warn("failed to pre-stop containerd (proceeding anyway)", "machine", oldMachine, "error", err)
+	}
+
 	log.Info("stopping old machine", "machine", oldMachine)
 	if err := reset.StopMachine(log, oldMachine).Do(ctx); err != nil {
 		return fmt.Errorf("stop old machine %s: %w", oldMachine, err)
