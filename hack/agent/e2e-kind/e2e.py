@@ -21,7 +21,8 @@ Subcommands (called as individual workflow steps):
     create-machine-cr                  Pre-create a Machine CR for the agent node.
     delete-machine-cr                  Delete the Machine CR.
     validate-machine-cr-preexisting    Verify agent preserved a pre-existing Machine CR.
-    validate-machine-cr-created        Verify agent self-registered a Machine CR.
+    validate-machine-cr-created        Verify agent self-registered a Machine CR and save UID.
+    validate-machine-cr-persisted      Verify Machine CR UID matches the previously saved UID.
     reset-agent                        Run agent reset and verify cleanup.
     cleanup                            Tear down VM, networking, and Kind cluster.
 """
@@ -1145,6 +1146,9 @@ def validate_machine_cr_created() -> None:
     Asserts the Machine CR exists, does NOT have the pre-created marker
     annotation, and has the correct ``bootstrapTokenRef`` derived from
     the bootstrap token created by run-agent.
+
+    The Machine CR's UID is saved to ``VM_DIR/machine-uid`` so that
+    validate-machine-cr-persisted can verify it survives a rejoin.
     """
 
     token_id_file = VM_DIR / "token-id"
@@ -1177,8 +1181,56 @@ def validate_machine_cr_created() -> None:
 
     log(f"bootstrapTokenRef is correct: {token_ref}")
 
+    # Save the UID for later persistence validation.
+    uid = machine.get("metadata", {}).get("uid", "")
+    if not uid:
+        die("Machine CR has no UID")
+    uid_file = VM_DIR / "machine-uid"
+    uid_file.write_text(uid)
+    log(f"Machine CR UID saved: {uid}")
+
     log("============================================")
     log("  Machine CR validation PASSED (created)")
+    log("============================================")
+
+
+# ---------------------------------------------------------------------------
+# validate-machine-cr-persisted
+# ---------------------------------------------------------------------------
+def validate_machine_cr_persisted() -> None:
+    """Validate the Machine CR persists with the same UID after a rejoin.
+
+    After the agent is reset and rejoins the cluster, the daemon should
+    detect that the Machine CR already exists and skip re-creation. This
+    function asserts the CR's UID matches the value saved by
+    validate-machine-cr-created during the first join.
+    """
+
+    uid_file = VM_DIR / "machine-uid"
+    if not uid_file.exists():
+        die(f"Machine UID file not found: {uid_file}. Run validate-machine-cr-created first.")
+    expected_uid = uid_file.read_text().strip()
+
+    log(f"Validating Machine CR '{AGENT_MACHINE_NAME}' persisted with UID {expected_uid}...")
+
+    try:
+        machine_json = kubectl_capture([
+            "get", "machine", AGENT_MACHINE_NAME, "-o", "json",
+        ])
+    except subprocess.CalledProcessError:
+        die(f"Machine CR '{AGENT_MACHINE_NAME}' not found - expected it to persist across rejoin")
+
+    machine = json.loads(machine_json)
+    actual_uid = machine.get("metadata", {}).get("uid", "")
+
+    if actual_uid != expected_uid:
+        die(f"Machine CR UID changed: expected '{expected_uid}', got '{actual_uid}' - "
+            "daemon may have deleted and recreated the CR")
+
+    log(f"Machine CR UID is unchanged: {actual_uid}")
+
+    log("============================================")
+    log("  Machine CR validation PASSED (persisted)")
     log("============================================")
 
 
@@ -1255,6 +1307,7 @@ COMMANDS = {
     "delete-machine-cr": delete_machine_cr,
     "validate-machine-cr-preexisting": validate_machine_cr_preexisting,
     "validate-machine-cr-created": validate_machine_cr_created,
+    "validate-machine-cr-persisted": validate_machine_cr_persisted,
     "reset-agent": reset_agent,
     "cleanup": cleanup,
 }
