@@ -20,6 +20,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -58,6 +59,7 @@ NSPAWN_MACHINE_NAMES = ["kube1", "kube2"]
 BRIDGE_NAME = "virbr-e2e"
 TAP_NAME = "tap-e2e"
 SERVE_PORT = 8199
+TASK_SERVER_PORT = 50051
 
 SSH_KEY_DIR = VM_DIR / "ssh"
 SSH_KEY = SSH_KEY_DIR / "id_ed25519"
@@ -334,6 +336,12 @@ def run_agent() -> None:
         env={**os.environ, "GOOS": "linux", "GOARCH": "amd64"})
     log(f"Agent binary built: {agent_bin}")
 
+    log("Building e2e-task-server...")
+    task_server_bin = REPO_ROOT / "bin" / "e2e-task-server"
+    run(["go", "build", "-o", str(task_server_bin),
+         str(REPO_ROOT / "hack" / "agent" / "e2e-task-server" / "main.go")])
+    log(f"e2e-task-server binary built: {task_server_bin}")
+
     log("Building kubectl-unbounded...")
     kubectl_unbounded_bin = Path(KUBECTL_UNBOUNDED)
     run(["go", "build", "-o", str(kubectl_unbounded_bin),
@@ -374,8 +382,58 @@ def _make_handler(directory: str) -> type:
     return Handler
 
 
+def _patch_agent_config(script: str, extra: dict[str, Any]) -> str:
+    """Patch the agent config JSON embedded in the bootstrap script.
+
+    Finds the JSON block between the AGENT_CONFIG_EOF heredoc markers,
+    deserialises it, merges *extra* into the top-level dict, and replaces
+    the original JSON in the script.
+    """
+    pattern = r"(<<'AGENT_CONFIG_EOF'\n)(.*?)(\nAGENT_CONFIG_EOF)"
+    m = re.search(pattern, script, re.DOTALL)
+    if not m:
+        die("Could not find AGENT_CONFIG_EOF heredoc in bootstrap script")
+
+    cfg = json.loads(m.group(2))
+    cfg.update(extra)
+    patched_json = json.dumps(cfg, indent=2)
+
+    return script[:m.start(2)] + patched_json + script[m.end(2):]
+
+
 def _run_agent_inner(agent_url: str) -> None:
     """Core logic for run-agent (after HTTP server is up)."""
+
+    # Start the e2e task server so the agent daemon can connect after
+    # bootstrap completes. The server runs on the host bridge IP, reachable
+    # from the VM.
+    task_server_bin = REPO_ROOT / "bin" / "e2e-task-server"
+    task_server_addr = f"{VM_GATEWAY}:{TASK_SERVER_PORT}"
+    task_server_log = VM_DIR / "e2e-task-server.log"
+    task_server_pid_file = VM_DIR / "e2e-task-server.pid"
+
+    log(f"Starting e2e-task-server on {task_server_addr}...")
+
+    # If a previous task server is still running (e.g. from a prior
+    # run-agent invocation), stop it first to free the port.
+    if task_server_pid_file.exists():
+        old_pid = int(task_server_pid_file.read_text().strip())
+        try:
+            os.kill(old_pid, 0)
+            log(f"Stopping previous e2e-task-server (PID: {old_pid})...")
+            os.kill(old_pid, 15)
+            time.sleep(1)
+        except OSError:
+            pass
+        task_server_pid_file.unlink(missing_ok=True)
+
+    ts_log_fd = open(task_server_log, "w")
+    ts_proc = subprocess.Popen(
+        [str(task_server_bin), f"--listen={task_server_addr}"],
+        stdout=ts_log_fd, stderr=subprocess.STDOUT,
+    )
+    task_server_pid_file.write_text(str(ts_proc.pid))
+    log(f"e2e-task-server started (PID: {ts_proc.pid}, log: {task_server_log})")
 
     # Determine the Kind control-plane IP so connectivity checks have the
     # correct address even when the local kubeconfig uses 127.0.0.1.
@@ -451,6 +509,14 @@ def _run_agent_inner(agent_url: str) -> None:
     else:
         log(f"[WARN] Local API server {local_api_server!r} not found in bootstrap script; "
             f"VM may not be able to reach the API server")
+
+    # Inject TaskServer config into the agent config JSON embedded in the
+    # bootstrap script. The JSON lives between the AGENT_CONFIG_EOF heredoc
+    # markers.
+    bootstrap_script = _patch_agent_config(bootstrap_script, {
+        "TaskServer": {"Endpoint": task_server_addr},
+    })
+    log(f"Patched bootstrap script with TaskServer.Endpoint={task_server_addr}")
 
     bootstrap_script_path = VM_DIR / "bootstrap.sh"
     bootstrap_script_path.write_text(bootstrap_script)
@@ -739,6 +805,70 @@ def reset_agent() -> None:
 
 
 # ---------------------------------------------------------------------------
+# validate-task-pull
+# ---------------------------------------------------------------------------
+def validate_task_pull() -> None:
+    """Validate that the agent daemon pulled a task and reported status."""
+
+    timeout_secs = int(os.environ.get("TASK_PULL_TIMEOUT", "120"))
+    task_server_log = VM_DIR / "e2e-task-server.log"
+    task_server_pid_file = VM_DIR / "e2e-task-server.pid"
+
+    if not task_server_pid_file.exists():
+        die("e2e-task-server PID file not found. Was run-agent executed?")
+
+    pid = int(task_server_pid_file.read_text().strip())
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        die(f"e2e-task-server (PID {pid}) is not running")
+
+    log(f"Waiting for agent daemon to report task status (timeout: {timeout_secs}s)...")
+
+    elapsed = 0
+    while elapsed < timeout_secs:
+        if task_server_log.exists():
+            log_content = task_server_log.read_text()
+            if "ReportTaskStatus:" in log_content:
+                log(f"Task status report received after {elapsed}s")
+                print(log_content, flush=True)
+
+                if "state=TASK_STATE_SUCCEEDED" in log_content:
+                    log("Task reported as SUCCEEDED")
+                elif "state=TASK_STATE_FAILED" in log_content:
+                    die("Task reported as FAILED")
+                else:
+                    die("Task status report found but state is unknown")
+
+                break
+        if elapsed > 0 and elapsed % 30 == 0:
+            log(f"  ({elapsed}s) Waiting for task status report...")
+            # Print daemon logs from the VM for debugging.
+            subprocess.run(
+                ["ssh", *SSH_OPTS, SSH_TARGET,
+                 "sudo journalctl -u unbounded-agent-daemon --no-pager -l --lines=20"],
+                check=False,
+            )
+        time.sleep(5)
+        elapsed += 5
+    else:
+        log("e2e-task-server log contents:")
+        if task_server_log.exists():
+            print(task_server_log.read_text(), flush=True)
+        log("VM daemon journal:")
+        subprocess.run(
+            ["ssh", *SSH_OPTS, SSH_TARGET,
+             "sudo journalctl -u unbounded-agent-daemon --no-pager -l"],
+            check=False,
+        )
+        die(f"Timed out waiting for task status report after {timeout_secs}s")
+
+    log("============================================")
+    log("  Task-pull validation PASSED")
+    log("============================================")
+
+
+# ---------------------------------------------------------------------------
 # cleanup
 # ---------------------------------------------------------------------------
 def cleanup() -> None:
@@ -764,6 +894,18 @@ def cleanup() -> None:
             # Process already gone or cannot be signaled; safe to ignore during cleanup.
             pass
         pid_file.unlink(missing_ok=True)
+
+    # Stop e2e-task-server
+    ts_pid_file = VM_DIR / "e2e-task-server.pid"
+    if ts_pid_file.exists():
+        ts_pid = int(ts_pid_file.read_text().strip())
+        try:
+            os.kill(ts_pid, 0)
+            log(f"Stopping e2e-task-server (PID: {ts_pid})...")
+            os.kill(ts_pid, 15)
+        except OSError:
+            pass
+        ts_pid_file.unlink(missing_ok=True)
 
     # Remove networking
     log("Cleaning up networking...")
@@ -801,6 +943,7 @@ COMMANDS = {
     "run-agent": run_agent,
     "wait-for-node": wait_for_node,
     "validate-workload": validate_workload,
+    "validate-task-pull": validate_task_pull,
     "reset-agent": reset_agent,
     "cleanup": cleanup,
 }

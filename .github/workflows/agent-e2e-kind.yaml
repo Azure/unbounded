@@ -8,9 +8,11 @@ on:
     paths:
       - cmd/agent/**
       - cmd/kubectl-unbounded/**
+      - agent/api/**
       - internal/provision/**
       - internal/kube/**
       - hack/agent/e2e-kind/**
+      - hack/agent/e2e-task-server/**
       - go.mod
       - go.sum
       - .github/workflows/agent-e2e-kind.yaml
@@ -19,9 +21,11 @@ on:
     paths:
       - cmd/agent/**
       - cmd/kubectl-unbounded/**
+      - agent/api/**
       - internal/provision/**
       - internal/kube/**
       - hack/agent/e2e-kind/**
+      - hack/agent/e2e-task-server/**
       - go.mod
       - go.sum
       - .github/workflows/agent-e2e-kind.yaml
@@ -149,6 +153,9 @@ jobs:
       - name: Validate workload on agent node
         run: python3 ./hack/agent/e2e-kind/e2e.py validate-workload
 
+      - name: Validate task-pull daemon
+        run: python3 ./hack/agent/e2e-kind/e2e.py validate-task-pull
+
       - name: Reset agent on VM
         run: python3 ./hack/agent/e2e-kind/e2e.py reset-agent
 
@@ -173,6 +180,10 @@ jobs:
           $SSH "sudo journalctl --no-pager -l" > logs/vm-journal.log 2>/dev/null || true
           # Collect unbounded-agent logs from the VM host
           $SSH "sudo journalctl -u unbounded-agent --no-pager -l" > logs/vm-unbounded-agent.log 2>/dev/null || true
+          # Collect unbounded-agent-daemon logs from the VM host
+          $SSH "sudo journalctl -u unbounded-agent-daemon --no-pager -l" > logs/vm-unbounded-agent-daemon.log 2>/dev/null || true
+          # Collect e2e-task-server log from the host
+          cp "${VM_DIR}/e2e-task-server.log" logs/e2e-task-server.log 2>/dev/null || true
           # Kubelet and containerd run inside the nspawn container, not on
           # the host.  Use 'journalctl -M <machine>' to read the container
           # journal, and fall back to machinectl shell if that doesn't work.
