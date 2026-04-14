@@ -52,12 +52,12 @@ All five flags above are required. Optional flags:
 
 ## Creating Machines
 
-Use `kubectl unbounded site add-machine` to register a machine with the site.
+Use `kubectl unbounded machine register` to register a machine with the site.
 The command creates an SSH key Secret in `unbounded-kube` and applies a Machine
 CR to the cluster:
 
 ```bash
-kubectl unbounded site add-machine \
+kubectl unbounded machine register \
   --site mysite \
   --host 10.0.0.5 \
   --ssh-username ubuntu \
@@ -88,7 +88,7 @@ Bastion-related flags are covered in the [Bastion Hosts](#bastion-hosts) section
 
 ### Example Machine manifest
 
-The `add-machine` command produces and applies a manifest like this:
+The `machine register` command produces and applies a manifest like this:
 
 ```yaml
 apiVersion: unbounded-kube.io/v1alpha3
@@ -122,7 +122,7 @@ the bastion first, tunnels TCP to the target, then performs the SSH handshake
 over the tunnel.
 
 ```bash
-kubectl unbounded site add-machine \
+kubectl unbounded machine register \
   --site mysite \
   --host 10.0.1.50 \
   --ssh-username ubuntu \
@@ -221,7 +221,7 @@ HTTPS connectivity to the API server.
 - **[Networking Concepts]({{< relref "concepts/networking" >}})** -- How
   WireGuard tunnels and cross-site routing work.
 - **[CLI Reference]({{< relref "reference/cli" >}})** -- Full flag reference
-  for `site init` and `site add-machine`.
+  for `site init` and `machine register`.
 - **[CRD Reference]({{< relref "reference/machina-crd" >}})** -- Complete
   Machine and Image API specification.
 - **[Architecture]({{< relref "reference/architecture" >}})** -- Internal
