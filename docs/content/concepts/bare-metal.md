@@ -9,7 +9,7 @@ description: "How metalman PXE-boots bare-metal servers and joins them to your c
 Use metalman when you have physical servers that need to be:
 
 - **Netbooted** from bare metal (no pre-installed OS).
-- **Reimaged** on demand without physical access.
+- **Repaved** on demand without physical access.
 - **Power-managed** remotely via Redfish BMC APIs.
 - **Securely bootstrapped** using TPM 2.0 hardware attestation.
 
@@ -123,7 +123,7 @@ metalman supports two counter-based operations for day-2 management:
 
 - **Reboot** -- Increment `spec.operations.rebootCounter` to trigger a
   reboot via Redfish.
-- **Reimage** -- Increment `spec.operations.reimageCounter` to wipe and
+- **Repave** -- Increment `spec.operations.repaveCounter` to wipe and
   re-provision the machine from scratch.
 
 The controller compares the spec counter against the status counter and acts

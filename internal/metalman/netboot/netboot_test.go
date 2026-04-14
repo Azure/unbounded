@@ -93,7 +93,7 @@ func TestHTTPServer_ServeFiles(t *testing.T) {
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:01", IPv4: "10.0.1.50", SubnetMask: "255.255.255.0"}},
 			},
-			Operations: &v1alpha3.OperationsSpec{ReimageCounter: 1},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
 		},
 	}
 
@@ -203,7 +203,7 @@ menuentry "Install" {
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:f0", IPv4: "10.0.1.10", SubnetMask: "255.255.255.0"}},
 			},
-			Operations: &v1alpha3.OperationsSpec{ReimageCounter: 1},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
 		},
 	}
 
@@ -270,7 +270,7 @@ func TestHTTPServer_TemplateVerbatim(t *testing.T) {
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:02", IPv4: "10.0.1.51", SubnetMask: "255.255.255.0"}},
 			},
-			Operations: &v1alpha3.OperationsSpec{ReimageCounter: 1},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
 		},
 	}
 
@@ -328,7 +328,7 @@ func TestHTTPServer_StaticFile(t *testing.T) {
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:03", IPv4: "10.0.1.52", SubnetMask: "255.255.255.0"}},
 			},
-			Operations: &v1alpha3.OperationsSpec{ReimageCounter: 1},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
 		},
 	}
 
@@ -974,7 +974,7 @@ func TestHTTPServer_UserDataConfigMapMissing(t *testing.T) {
 					},
 				},
 			},
-			Operations: &v1alpha3.OperationsSpec{ReimageCounter: 1},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
 		},
 	}
 
@@ -1051,7 +1051,7 @@ func TestHTTPServer_UserDataFromConfigMap(t *testing.T) {
 					},
 				},
 			},
-			Operations: &v1alpha3.OperationsSpec{ReimageCounter: 1},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
 		},
 	}
 
@@ -1371,7 +1371,7 @@ menuentry "Install {{ .Machine.Name }}" {
 				Image:      "ghcr.io/test/e2e:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:00:11:22", IPv4: "10.0.3.10", SubnetMask: "255.255.255.0"}},
 			},
-			Operations: &v1alpha3.OperationsSpec{ReimageCounter: 1},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
 		},
 	}
 
@@ -1465,7 +1465,7 @@ func TestHTTPServer_CrossImageIsolation(t *testing.T) {
 				Image:      "ghcr.io/test/alpha:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:aa:aa:aa:aa:aa", IPv4: "10.0.10.1", SubnetMask: "255.255.255.0"}},
 			},
-			Operations: &v1alpha3.OperationsSpec{ReimageCounter: 1},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
 		},
 	}
 	betaNode := &v1alpha3.Machine{
@@ -1475,7 +1475,7 @@ func TestHTTPServer_CrossImageIsolation(t *testing.T) {
 				Image:      "ghcr.io/test/beta:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "bb:bb:bb:bb:bb:bb", IPv4: "10.0.10.2", SubnetMask: "255.255.255.0"}},
 			},
-			Operations: &v1alpha3.OperationsSpec{ReimageCounter: 1},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
 		},
 	}
 
@@ -1541,7 +1541,7 @@ func TestHTTPServer_503WhenFileNotDownloaded(t *testing.T) {
 				Image:      "ghcr.io/test/pending:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:10", IPv4: "10.0.5.10", SubnetMask: "255.255.255.0"}},
 			},
-			Operations: &v1alpha3.OperationsSpec{ReimageCounter: 1},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
 		},
 	}
 
@@ -1601,7 +1601,7 @@ func TestHTTPServer_DisablePXE(t *testing.T) {
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:20", IPv4: "10.0.6.10", SubnetMask: "255.255.255.0"}},
 			},
-			Operations: &v1alpha3.OperationsSpec{ReimageCounter: 1},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
 		},
 	}
 
@@ -1648,27 +1648,27 @@ func TestHTTPServer_DisablePXE(t *testing.T) {
 		t.Fatalf("getting updated node: %v", err)
 	}
 
-	var specReimage, statusReimage int64
+	var specRepave, statusRepave int64
 	if updated.Spec.Operations != nil {
-		specReimage = updated.Spec.Operations.ReimageCounter
+		specRepave = updated.Spec.Operations.RepaveCounter
 	}
 
 	if updated.Status.Operations != nil {
-		statusReimage = updated.Status.Operations.ReimageCounter
+		statusRepave = updated.Status.Operations.RepaveCounter
 	}
 
-	if statusReimage != specReimage {
-		t.Errorf("status.operations.reimageCounter (%d) should match spec.operations.reimageCounter (%d)",
-			statusReimage, specReimage)
+	if statusRepave != specRepave {
+		t.Errorf("status.operations.repaveCounter (%d) should match spec.operations.repaveCounter (%d)",
+			statusRepave, specRepave)
 	}
 
-	reimagedCond := findCondition(updated.Status.Conditions, v1alpha3.MachineConditionReimaged)
-	if reimagedCond == nil || reimagedCond.Status != metav1.ConditionTrue || reimagedCond.Reason != "Succeeded" {
-		t.Fatalf("expected Reimaged=True/Succeeded, got %+v", reimagedCond)
+	repavedCond := findCondition(updated.Status.Conditions, v1alpha3.MachineConditionRepaved)
+	if repavedCond == nil || repavedCond.Status != metav1.ConditionTrue || repavedCond.Reason != "Succeeded" {
+		t.Fatalf("expected Repaved=True/Succeeded, got %+v", repavedCond)
 	}
 
-	if reimagedCond.Message != "image=ghcr.io/test/image:v1" {
-		t.Fatalf("expected Reimaged message 'image=ghcr.io/test/image:v1', got %q", reimagedCond.Message)
+	if repavedCond.Message != "image=ghcr.io/test/image:v1" {
+		t.Fatalf("expected Repaved message 'image=ghcr.io/test/image:v1', got %q", repavedCond.Message)
 	}
 
 	// Second call should be idempotent (still 200)

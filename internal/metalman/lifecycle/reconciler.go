@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	reimageTimeout = 30 * time.Minute // TODO: Make this configurable
+	repaveTimeout = 30 * time.Minute // TODO: Make this configurable
 )
 
 type Reconciler struct {
@@ -43,23 +43,23 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, nil
 	}
 
-	pendingReimage := node.Spec.Operations.ReimageCounter > node.Status.Operations.ReimageCounter
-	if !pendingReimage {
+	pendingRepave := node.Spec.Operations.RepaveCounter > node.Status.Operations.RepaveCounter
+	if !pendingRepave {
 		return ctrl.Result{}, nil
 	}
 
-	reimagedCond := meta.FindStatusCondition(node.Status.Conditions, v1alpha3.MachineConditionReimaged)
-	if reimagedCond == nil || reimagedCond.Status != metav1.ConditionFalse {
+	repavedCond := meta.FindStatusCondition(node.Status.Conditions, v1alpha3.MachineConditionRepaved)
+	if repavedCond == nil || repavedCond.Status != metav1.ConditionFalse {
 		return ctrl.Result{}, nil
 	}
 
-	elapsed := time.Since(reimagedCond.LastTransitionTime.Time)
-	if elapsed < reimageTimeout {
-		return ctrl.Result{RequeueAfter: reimageTimeout - elapsed}, nil
+	elapsed := time.Since(repavedCond.LastTransitionTime.Time)
+	if elapsed < repaveTimeout {
+		return ctrl.Result{RequeueAfter: repaveTimeout - elapsed}, nil
 	}
 
-	log.Info("reimage timed out, triggering retry", "elapsed", elapsed)
-	meta.RemoveStatusCondition(&node.Status.Conditions, v1alpha3.MachineConditionReimaged)
+	log.Info("repave timed out, triggering retry", "elapsed", elapsed)
+	meta.RemoveStatusCondition(&node.Status.Conditions, v1alpha3.MachineConditionRepaved)
 
 	if node.Status.Operations.RebootCounter > 0 {
 		node.Status.Operations.RebootCounter--

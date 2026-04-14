@@ -708,8 +708,8 @@ def main() -> None:
     time.sleep(2)
     check_procs()
 
-    log("Triggering reimage")
-    run([str(KUBECTL_UNBOUNDED), "machine", "reimage", NODE_NAME])
+    log("Triggering repave")
+    run([str(KUBECTL_UNBOUNDED), "machine", "repave", NODE_NAME])
 
     # Log free space so we can correlate disk exhaustion with VM failures.
     df = subprocess.run(["df", "-h", str(TMPDIR)], capture_output=True, text=True)
