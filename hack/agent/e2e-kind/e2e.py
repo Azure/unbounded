@@ -561,10 +561,11 @@ def _run_agent_inner(agent_url: str) -> None:
     # Inject TaskServer config into the agent config JSON embedded in the
     # bootstrap script. The JSON lives between the AGENT_CONFIG_EOF heredoc
     # markers.
+    task_server_endpoint = f"{VM_GATEWAY}:{TASK_SERVER_PORT}"
     bootstrap_script = _patch_agent_config(bootstrap_script, {
-        "TaskServer": {"Endpoint": task_server_addr},
+        "TaskServer": {"Endpoint": task_server_endpoint},
     })
-    log(f"Patched bootstrap script with TaskServer.Endpoint={task_server_addr}")
+    log(f"Patched bootstrap script with TaskServer.Endpoint={task_server_endpoint}")
 
     bootstrap_script_path = VM_DIR / "bootstrap.sh"
     bootstrap_script_path.write_text(bootstrap_script)
