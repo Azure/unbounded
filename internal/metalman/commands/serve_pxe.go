@@ -25,6 +25,7 @@ import (
 	v1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
 	"github.com/Azure/unbounded-kube/internal/cloudprovider"
 	"github.com/Azure/unbounded-kube/internal/metalman/attestation"
+	"github.com/Azure/unbounded-kube/internal/metalman/cloudinit"
 	"github.com/Azure/unbounded-kube/internal/metalman/dhcp"
 	"github.com/Azure/unbounded-kube/internal/metalman/indexing"
 	"github.com/Azure/unbounded-kube/internal/metalman/lifecycle"
@@ -193,6 +194,10 @@ func ServePXECmd() *cobra.Command {
 
 			if err := (&lifecycle.Reconciler{Client: mgr.GetClient()}).SetupWithManager(mgr); err != nil {
 				return fmt.Errorf("setting up Lifecycle reconciler: %w", err)
+			}
+
+			if err := (&cloudinit.Reconciler{Client: mgr.GetClient()}).SetupWithManager(mgr); err != nil {
+				return fmt.Errorf("setting up CloudInit reconciler: %w", err)
 			}
 
 			resolver := netboot.FileResolver{

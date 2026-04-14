@@ -1925,6 +1925,591 @@ func TestHandleCloudInitLog(t *testing.T) {
 	}
 }
 
+func TestBuildCloudInitCondition(t *testing.T) {
+	generation := int64(3)
+
+	tests := []struct {
+		name       string
+		event      cloudInitEvent
+		wantNil    bool
+		wantStatus metav1.ConditionStatus
+		wantReason string
+		wantSubstr string // substring expected in message
+	}{
+		{
+			name: "start event sets Running",
+			event: cloudInitEvent{
+				Name:        "init-local",
+				Description: "starting init-local",
+				EventType:   "start",
+			},
+			wantStatus: metav1.ConditionFalse,
+			wantReason: "Running",
+			wantSubstr: `stage "init-local" started`,
+		},
+		{
+			name: "early stage finish SUCCESS sets Running",
+			event: cloudInitEvent{
+				Name:        "init-local",
+				Description: "init-local ran successfully",
+				EventType:   "finish",
+				Result:      "SUCCESS",
+			},
+			wantStatus: metav1.ConditionFalse,
+			wantReason: "Running",
+			wantSubstr: `stage "init-local" finished successfully`,
+		},
+		{
+			name: "modules-config finish SUCCESS sets Running",
+			event: cloudInitEvent{
+				Name:        "modules-config",
+				Description: "modules-config ran successfully",
+				EventType:   "finish",
+				Result:      "SUCCESS",
+			},
+			wantStatus: metav1.ConditionFalse,
+			wantReason: "Running",
+			wantSubstr: `stage "modules-config" finished successfully`,
+		},
+		{
+			name: "modules-final finish SUCCESS sets Succeeded",
+			event: cloudInitEvent{
+				Name:        "modules-final",
+				Description: "modules-final ran successfully and took 1.23 seconds",
+				EventType:   "finish",
+				Result:      "SUCCESS",
+			},
+			wantStatus: metav1.ConditionTrue,
+			wantReason: "Succeeded",
+			wantSubstr: "cloud-init completed successfully",
+		},
+		{
+			name: "finish with failure sets Failed",
+			event: cloudInitEvent{
+				Name:        "modules-config",
+				Description: "running modules-config",
+				EventType:   "finish",
+				Result:      "FAIL: command [apt-get install -y badpkg] failed with exit code 100",
+			},
+			wantStatus: metav1.ConditionFalse,
+			wantReason: "Failed",
+			wantSubstr: `stage "modules-config" failed`,
+		},
+		{
+			name: "finish with failure includes result in message",
+			event: cloudInitEvent{
+				Name:        "modules-final",
+				Description: "running modules-final",
+				EventType:   "finish",
+				Result:      "EXCEPTION: Traceback (most recent call last): runcmd failed",
+			},
+			wantStatus: metav1.ConditionFalse,
+			wantReason: "Failed",
+			wantSubstr: "EXCEPTION: Traceback",
+		},
+		{
+			name: "unknown event type returns nil",
+			event: cloudInitEvent{
+				Name:        "modules-config",
+				Description: "custom event",
+				EventType:   "custom",
+			},
+			wantNil: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cond := buildCloudInitCondition(&tt.event, generation)
+
+			if tt.wantNil {
+				if cond != nil {
+					t.Fatalf("expected nil condition, got %+v", cond)
+				}
+
+				return
+			}
+
+			if cond == nil {
+				t.Fatal("expected non-nil condition")
+			}
+
+			if cond.Type != v1alpha3.MachineConditionCloudInitDone {
+				t.Errorf("type: got %q, want %q", cond.Type, v1alpha3.MachineConditionCloudInitDone)
+			}
+
+			if cond.Status != tt.wantStatus {
+				t.Errorf("status: got %q, want %q", cond.Status, tt.wantStatus)
+			}
+
+			if cond.Reason != tt.wantReason {
+				t.Errorf("reason: got %q, want %q", cond.Reason, tt.wantReason)
+			}
+
+			if !strings.Contains(cond.Message, tt.wantSubstr) {
+				t.Errorf("message %q should contain %q", cond.Message, tt.wantSubstr)
+			}
+
+			if cond.ObservedGeneration != generation {
+				t.Errorf("observedGeneration: got %d, want %d", cond.ObservedGeneration, generation)
+			}
+		})
+	}
+}
+
+func TestBuildCloudInitCondition_MessageTruncation(t *testing.T) {
+	// Build a result string that will exceed maxConditionMessageLen when
+	// formatted into the failure message.
+	longResult := strings.Repeat("x", maxConditionMessageLen+500)
+
+	ev := cloudInitEvent{
+		Name:        "modules-config",
+		Description: "running modules-config",
+		EventType:   "finish",
+		Result:      longResult,
+	}
+
+	cond := buildCloudInitCondition(&ev, 1)
+	if cond == nil {
+		t.Fatal("expected non-nil condition")
+	}
+
+	if len(cond.Message) > maxConditionMessageLen {
+		t.Errorf("message length %d exceeds max %d", len(cond.Message), maxConditionMessageLen)
+	}
+
+	if !strings.HasSuffix(cond.Message, "...") {
+		t.Errorf("truncated message should end with '...', got %q", cond.Message[len(cond.Message)-10:])
+	}
+
+	// Verify that the message still starts with the stage info.
+	if !strings.Contains(cond.Message, "modules-config") {
+		t.Errorf("truncated message should contain stage name, got %q", cond.Message[:100])
+	}
+}
+
+func TestCloudInitCondition_StageStartSetsRunning(t *testing.T) {
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "ci-start-node"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:70", IPv4: "10.0.20.10", SubnetMask: "255.255.255.0"}},
+			},
+		},
+	}
+
+	cache := NewOCICache(t.TempDir())
+	scheme := newScheme(t)
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node).
+		WithStatusSubresource(&v1alpha3.Machine{}).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+
+	srv := &HTTPServer{
+		Client:       fc,
+		FileResolver: FileResolver{Cache: cache, Reader: fc},
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /cloudinit/log", srv.handleCloudInitLog)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	body := `{"name":"init-local","description":"starting init-local","event_type":"start","origin":"cloudinit","timestamp":1775657336.0}`
+	req, _ := http.NewRequest("POST", ts.URL+"/cloudinit/log", strings.NewReader(body))
+	req.Header.Set("X-Forwarded-For", "10.0.20.10")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /cloudinit/log: %v", err)
+	}
+
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	var updated v1alpha3.Machine
+	if err := fc.Get(t.Context(), client.ObjectKeyFromObject(node), &updated); err != nil {
+		t.Fatalf("getting updated node: %v", err)
+	}
+
+	cond := findCondition(updated.Status.Conditions, v1alpha3.MachineConditionCloudInitDone)
+	if cond == nil {
+		t.Fatal("expected CloudInitDone condition to be set")
+	}
+
+	if cond.Status != metav1.ConditionFalse {
+		t.Errorf("status: got %q, want %q", cond.Status, metav1.ConditionFalse)
+	}
+
+	if cond.Reason != "Running" {
+		t.Errorf("reason: got %q, want %q", cond.Reason, "Running")
+	}
+}
+
+func TestCloudInitCondition_FinalStageSuccessSetsTrue(t *testing.T) {
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "ci-done-node"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:71", IPv4: "10.0.20.11", SubnetMask: "255.255.255.0"}},
+			},
+		},
+	}
+
+	cache := NewOCICache(t.TempDir())
+	scheme := newScheme(t)
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node).
+		WithStatusSubresource(&v1alpha3.Machine{}).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+
+	srv := &HTTPServer{
+		Client:       fc,
+		FileResolver: FileResolver{Cache: cache, Reader: fc},
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /cloudinit/log", srv.handleCloudInitLog)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	body := `{"name":"modules-final","description":"modules-final ran successfully and took 1.23 seconds","event_type":"finish","origin":"cloudinit","timestamp":1775657336.0,"result":"SUCCESS"}`
+	req, _ := http.NewRequest("POST", ts.URL+"/cloudinit/log", strings.NewReader(body))
+	req.Header.Set("X-Forwarded-For", "10.0.20.11")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /cloudinit/log: %v", err)
+	}
+
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	var updated v1alpha3.Machine
+	if err := fc.Get(t.Context(), client.ObjectKeyFromObject(node), &updated); err != nil {
+		t.Fatalf("getting updated node: %v", err)
+	}
+
+	cond := findCondition(updated.Status.Conditions, v1alpha3.MachineConditionCloudInitDone)
+	if cond == nil {
+		t.Fatal("expected CloudInitDone condition to be set")
+	}
+
+	if cond.Status != metav1.ConditionTrue {
+		t.Errorf("status: got %q, want %q", cond.Status, metav1.ConditionTrue)
+	}
+
+	if cond.Reason != "Succeeded" {
+		t.Errorf("reason: got %q, want %q", cond.Reason, "Succeeded")
+	}
+
+	if !strings.Contains(cond.Message, "cloud-init completed successfully") {
+		t.Errorf("message %q should contain completion text", cond.Message)
+	}
+}
+
+func TestCloudInitCondition_StageFailureSetsFailedWithDetails(t *testing.T) {
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "ci-fail-node"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:72", IPv4: "10.0.20.12", SubnetMask: "255.255.255.0"}},
+			},
+		},
+	}
+
+	cache := NewOCICache(t.TempDir())
+	scheme := newScheme(t)
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node).
+		WithStatusSubresource(&v1alpha3.Machine{}).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+
+	srv := &HTTPServer{
+		Client:       fc,
+		FileResolver: FileResolver{Cache: cache, Reader: fc},
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /cloudinit/log", srv.handleCloudInitLog)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	body := `{"name":"modules-config","description":"running modules-config","event_type":"finish","origin":"cloudinit","timestamp":1775657336.0,"result":"FAIL: command [apt-get install -y badpkg] failed with exit code 100"}`
+	req, _ := http.NewRequest("POST", ts.URL+"/cloudinit/log", strings.NewReader(body))
+	req.Header.Set("X-Forwarded-For", "10.0.20.12")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /cloudinit/log: %v", err)
+	}
+
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	var updated v1alpha3.Machine
+	if err := fc.Get(t.Context(), client.ObjectKeyFromObject(node), &updated); err != nil {
+		t.Fatalf("getting updated node: %v", err)
+	}
+
+	cond := findCondition(updated.Status.Conditions, v1alpha3.MachineConditionCloudInitDone)
+	if cond == nil {
+		t.Fatal("expected CloudInitDone condition to be set")
+	}
+
+	if cond.Status != metav1.ConditionFalse {
+		t.Errorf("status: got %q, want %q", cond.Status, metav1.ConditionFalse)
+	}
+
+	if cond.Reason != "Failed" {
+		t.Errorf("reason: got %q, want %q", cond.Reason, "Failed")
+	}
+
+	if !strings.Contains(cond.Message, "modules-config") {
+		t.Errorf("message %q should contain stage name", cond.Message)
+	}
+
+	if !strings.Contains(cond.Message, "FAIL: command [apt-get install -y badpkg] failed with exit code 100") {
+		t.Errorf("message %q should contain the error result", cond.Message)
+	}
+}
+
+func TestCloudInitCondition_NoClientSkipsUpdate(t *testing.T) {
+	// When Client is nil, handleCloudInitLog should still return 200
+	// but not attempt any status update.
+	srv := &HTTPServer{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /cloudinit/log", srv.handleCloudInitLog)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	body := `{"name":"modules-final","description":"done","event_type":"finish","origin":"cloudinit","timestamp":1775657336.0,"result":"SUCCESS"}`
+	req, _ := http.NewRequest("POST", ts.URL+"/cloudinit/log", strings.NewReader(body))
+	req.Header.Set("X-Forwarded-For", "10.0.20.99")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /cloudinit/log: %v", err)
+	}
+
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200, got %d", resp.StatusCode)
+	}
+}
+
+func TestCloudInitCondition_UnknownIPSkipsUpdate(t *testing.T) {
+	// When the IP doesn't match any Machine, updateCloudInitCondition
+	// should log a warning but the handler should still return 200.
+	cache := NewOCICache(t.TempDir())
+	scheme := newScheme(t)
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&v1alpha3.Machine{}).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+
+	srv := &HTTPServer{
+		Client:       fc,
+		FileResolver: FileResolver{Cache: cache, Reader: fc},
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /cloudinit/log", srv.handleCloudInitLog)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	body := `{"name":"modules-final","description":"done","event_type":"finish","origin":"cloudinit","timestamp":1775657336.0,"result":"SUCCESS"}`
+	req, _ := http.NewRequest("POST", ts.URL+"/cloudinit/log", strings.NewReader(body))
+	req.Header.Set("X-Forwarded-For", "10.99.99.99")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /cloudinit/log: %v", err)
+	}
+
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200, got %d", resp.StatusCode)
+	}
+}
+
+func TestCloudInitCondition_StatusUpdateError(t *testing.T) {
+	// When the status update fails, the handler should still return 200
+	// because cloud-init does not retry on error responses.
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "ci-update-err-node"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:75", IPv4: "10.0.20.15", SubnetMask: "255.255.255.0"}},
+			},
+		},
+	}
+
+	cache := NewOCICache(t.TempDir())
+	scheme := newScheme(t)
+
+	injectedErr := fmt.Errorf("simulated conflict")
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node).
+		WithStatusSubresource(&v1alpha3.Machine{}).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		WithInterceptorFuncs(interceptor.Funcs{
+			SubResourceUpdate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+				return injectedErr
+			},
+		}).
+		Build()
+
+	srv := &HTTPServer{
+		Client:       fc,
+		FileResolver: FileResolver{Cache: cache, Reader: fc},
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /cloudinit/log", srv.handleCloudInitLog)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	body := `{"name":"modules-final","description":"done","event_type":"finish","origin":"cloudinit","timestamp":1775657336.0,"result":"SUCCESS"}`
+	req, _ := http.NewRequest("POST", ts.URL+"/cloudinit/log", strings.NewReader(body))
+	req.Header.Set("X-Forwarded-For", "10.0.20.15")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /cloudinit/log: %v", err)
+	}
+
+	resp.Body.Close()
+
+	// Handler must still return 200 even when status update fails.
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 despite status update failure, got %d", resp.StatusCode)
+	}
+}
+
+func TestCloudInitCondition_FullLifecycle(t *testing.T) {
+	// Simulate a full cloud-init lifecycle: start -> intermediate finish -> final finish.
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "ci-lifecycle-node"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:73", IPv4: "10.0.20.13", SubnetMask: "255.255.255.0"}},
+			},
+		},
+	}
+
+	cache := NewOCICache(t.TempDir())
+	scheme := newScheme(t)
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node).
+		WithStatusSubresource(&v1alpha3.Machine{}).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+
+	srv := &HTTPServer{
+		Client:       fc,
+		FileResolver: FileResolver{Cache: cache, Reader: fc},
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /cloudinit/log", srv.handleCloudInitLog)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	postEvent := func(body string) {
+		t.Helper()
+
+		req, _ := http.NewRequest("POST", ts.URL+"/cloudinit/log", strings.NewReader(body))
+		req.Header.Set("X-Forwarded-For", "10.0.20.13")
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("POST /cloudinit/log: %v", err)
+		}
+
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200, got %d", resp.StatusCode)
+		}
+	}
+
+	getCondition := func() *metav1.Condition {
+		t.Helper()
+
+		var updated v1alpha3.Machine
+		if err := fc.Get(t.Context(), client.ObjectKeyFromObject(node), &updated); err != nil {
+			t.Fatalf("getting updated node: %v", err)
+		}
+
+		return findCondition(updated.Status.Conditions, v1alpha3.MachineConditionCloudInitDone)
+	}
+
+	// Step 1: init-local starts
+	postEvent(`{"name":"init-local","description":"starting init-local","event_type":"start","origin":"cloudinit","timestamp":1.0}`)
+
+	cond := getCondition()
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "Running" {
+		t.Fatalf("after init-local start: expected False/Running, got %+v", cond)
+	}
+
+	// Step 2: init-local finishes successfully
+	postEvent(`{"name":"init-local","description":"init-local done","event_type":"finish","origin":"cloudinit","timestamp":2.0,"result":"SUCCESS"}`)
+
+	cond = getCondition()
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "Running" {
+		t.Fatalf("after init-local finish: expected False/Running, got %+v", cond)
+	}
+
+	// Step 3: modules-final starts
+	postEvent(`{"name":"modules-final","description":"starting modules-final","event_type":"start","origin":"cloudinit","timestamp":3.0}`)
+
+	cond = getCondition()
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "Running" {
+		t.Fatalf("after modules-final start: expected False/Running, got %+v", cond)
+	}
+
+	// Step 4: modules-final finishes successfully
+	postEvent(`{"name":"modules-final","description":"modules-final done","event_type":"finish","origin":"cloudinit","timestamp":4.0,"result":"SUCCESS"}`)
+
+	cond = getCondition()
+	if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != "Succeeded" {
+		t.Fatalf("after modules-final finish: expected True/Succeeded, got %+v", cond)
+	}
+}
+
 func freePort(t *testing.T) int {
 	t.Helper()
 

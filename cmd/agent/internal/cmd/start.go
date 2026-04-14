@@ -81,6 +81,13 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 					rootfs.DisableResolved(rootFSGoalState),
 				),
 
+				// Register a Machine CR for this node if one does not already
+				// exist. This supports dynamic environments (manual-bootstrap,
+				// cloud-init) where a Machine CR may not have been pre-created.
+				// Must run after ApplyAttestation so the bootstrap token is
+				// fully resolved, and before kubelet starts.
+				nodestart.RegisterMachine(log, nodeStartGoalState),
+
 				// Phase 3: node-start
 				phases.Parallel(log,
 					nodestart.ConfigureContainerd(nodeStartGoalState),
@@ -153,11 +160,12 @@ func resolveNodeStartGoalState(cfg *provision.AgentConfig, nvidia goalstates.Nvi
 	}
 
 	return &goalstates.NodeStart{
-		MachineName: nspawnMachineName,
-		MachineDir:  filepath.Join("/var/lib/machines", nspawnMachineName),
-		Containerd:  goalstates.ResolveContainerd(),
-		Kubelet:     kubelet,
-		Nvidia:      nvidia,
+		MachineName:     nspawnMachineName,
+		KubeMachineName: cfg.MachineName,
+		MachineDir:      filepath.Join("/var/lib/machines", nspawnMachineName),
+		Containerd:      goalstates.ResolveContainerd(),
+		Kubelet:         kubelet,
+		Nvidia:          nvidia,
 	}, nil
 }
 

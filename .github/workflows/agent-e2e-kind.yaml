@@ -11,6 +11,8 @@ on:
       - internal/provision/**
       - internal/kube/**
       - hack/agent/e2e-kind/**
+      - deploy/machina/crd/**
+      - deploy/machina/07-bootstrapper-rbac.yaml
       - go.mod
       - go.sum
       - .github/workflows/agent-e2e-kind.yaml
@@ -22,6 +24,8 @@ on:
       - internal/provision/**
       - internal/kube/**
       - hack/agent/e2e-kind/**
+      - deploy/machina/crd/**
+      - deploy/machina/07-bootstrapper-rbac.yaml
       - go.mod
       - go.sum
       - .github/workflows/agent-e2e-kind.yaml
@@ -117,7 +121,7 @@ jobs:
           kubectl -n kube-system rollout status daemonset/kindnet --timeout=60s
 
       - name: Create QEMU VM
-        run: python3 ./hack/agent/e2e-kind/e2e.py create-vm
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose create-vm
 
       - name: Attach Kind container to VM bridge
         run: |
@@ -140,26 +144,51 @@ jobs:
           sudo nsenter -t "${KIND_PID}" -n ip addr add "${VM_SUBNET}.2/24" dev eth-e2e
           sudo nsenter -t "${KIND_PID}" -n ip link set eth-e2e up
 
+      - name: Install Machine CRD
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose install-machine-crd
+
+      # Case 1: Machine CR already exists when agent runs.
+      - name: Pre-create Machine CR
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose create-machine-cr
+
       - name: Run agent to join VM to cluster
-        run: python3 ./hack/agent/e2e-kind/e2e.py run-agent
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose run-agent
 
       - name: Wait for node to become Ready
-        run: python3 ./hack/agent/e2e-kind/e2e.py wait-for-node
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose wait-for-node
+
+      - name: Validate Machine CR (preexisting)
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-machine-cr-preexisting
 
       - name: Validate workload on agent node
-        run: python3 ./hack/agent/e2e-kind/e2e.py validate-workload
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-workload
 
       - name: Reset agent on VM
-        run: python3 ./hack/agent/e2e-kind/e2e.py reset-agent
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose reset-agent
+
+      - name: Delete Machine CR
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose delete-machine-cr
+
+      # Case 2: Machine CR does not exist when agent runs.
+      # Recreate the VM so Case 2 starts with a pristine OS (the first
+      # agent run leaves nftables/kube-proxy state that can interfere).
+      - name: Recreate VM for Case 2
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose recreate-vm
+
+      - name: Ensure Kind bridge attachment for Case 2
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose ensure-kind-bridge
 
       - name: Rejoin agent to cluster
-        run: python3 ./hack/agent/e2e-kind/e2e.py run-agent
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose run-agent
 
       - name: Wait for node to become Ready (rejoin)
-        run: python3 ./hack/agent/e2e-kind/e2e.py wait-for-node
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose wait-for-node
+
+      - name: Validate Machine CR (created)
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-machine-cr-created
 
       - name: Validate workload on rejoined agent node
-        run: python3 ./hack/agent/e2e-kind/e2e.py validate-workload
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-workload
 
       - name: Collect VM logs
         if: always()
@@ -195,6 +224,9 @@ jobs:
           kubectl describe nodes > logs/nodes-describe.txt 2>&1 || true
           kubectl get pods -A -o wide > logs/pods.txt 2>&1 || true
           kubectl get events -A --sort-by='.lastTimestamp' > logs/events.txt 2>&1 || true
+          # Collect Machine CRs (if CRD is installed)
+          kubectl get machines -o wide > logs/machines.txt 2>&1 || true
+          kubectl get machines -o yaml > logs/machines-full.yaml 2>&1 || true
           # Collect kubelet logs from the Kind control-plane
           docker exec kind-control-plane journalctl -u kubelet --no-pager -l > logs/kind-kubelet.log 2>&1 || true
           # Collect kube-apiserver logs (critical for diagnosing TLS bootstrap / RBAC issues)
@@ -223,4 +255,4 @@ jobs:
 
       - name: Cleanup
         if: always()
-        run: python3 ./hack/agent/e2e-kind/e2e.py cleanup
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose cleanup
