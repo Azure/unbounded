@@ -7,6 +7,10 @@
 Creates a QEMU VM, joins it to a Kind cluster using the production
 provision install script, and validates workloads run on the new node.
 
+Options:
+    --verbose                          Enable diagnostic output (network diags,
+                                       CA cert checks).
+
 Subcommands (called as individual workflow steps):
     create-vm                          Create bridge networking and launch a QEMU VM.
     recreate-vm                        Destroy and recreate VM with a fresh disk (keeps networking).
@@ -25,6 +29,7 @@ Subcommands (called as individual workflow steps):
 
 from __future__ import annotations
 
+import argparse
 import base64
 import json
 import os
@@ -62,6 +67,9 @@ BRIDGE_NAME = "virbr-e2e"
 TAP_NAME = "tap-e2e"
 SERVE_PORT = 8199
 
+# Set to True by --verbose flag; gates diagnostic output.
+VERBOSE = False
+
 SSH_KEY_DIR = VM_DIR / "ssh"
 SSH_KEY = SSH_KEY_DIR / "id_ed25519"
 SSH_OPTS = [
@@ -88,6 +96,35 @@ def log(msg: str) -> None:
 def die(msg: str) -> None:
     print(f"[ERROR] {msg}", file=sys.stderr, flush=True)
     sys.exit(1)
+
+
+def diag(msg: str) -> None:
+    """Print a diagnostic message only when --verbose is active."""
+    if VERBOSE:
+        print(f"[DIAG]  {msg}", flush=True)
+
+
+def _nm_unmanage(iface: str) -> None:
+    """Tell NetworkManager to leave *iface* alone.
+
+    NetworkManager can silently detach interfaces from their bridge master.
+    Calling ``nmcli device set <iface> managed no`` prevents this.  The
+    setting is runtime-only (resets when NM restarts) so it does not touch
+    any persistent configuration files.
+
+    No-op if ``nmcli`` is not installed or if the command fails (NM may not
+    be running).
+    """
+    if shutil.which("nmcli") is None:
+        return
+    result = subprocess.run(
+        ["sudo", "nmcli", "device", "set", iface, "managed", "no"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+    )
+    if result.returncode == 0:
+        diag(f"Told NetworkManager to ignore {iface}")
+    else:
+        diag(f"nmcli device set {iface} managed no failed (rc={result.returncode}), continuing")
 
 
 def run(args: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
@@ -349,6 +386,10 @@ def create_vm() -> None:
     run(["sudo", "ip", "link", "set", TAP_NAME, "master", BRIDGE_NAME])
     run(["sudo", "ip", "link", "set", TAP_NAME, "up"])
 
+    # Prevent NetworkManager from detaching interfaces from the bridge.
+    _nm_unmanage(BRIDGE_NAME)
+    _nm_unmanage(TAP_NAME)
+
     # Download Ubuntu cloud image
     image_url = "https://cloud-images.ubuntu.com/minimal/releases/noble/release/ubuntu-24.04-minimal-cloudimg-amd64.img"
     image_file = VM_DIR / "ubuntu-cloud-amd64.img"
@@ -463,6 +504,9 @@ def ensure_kind_bridge() -> None:
          "ip", "addr", "add", f"{VM_SUBNET}.2/24", "dev", VETH_KIND])
     run(["sudo", "nsenter", "-t", kind_pid, "-n",
          "ip", "link", "set", VETH_KIND, "up"])
+
+    # Prevent NetworkManager from detaching the veth from the bridge.
+    _nm_unmanage(VETH_HOST)
 
     log(f"  Repaired: {VETH_HOST} -> {BRIDGE_NAME} -> {VETH_KIND} in Kind container")
 
@@ -627,12 +671,13 @@ def _run_agent_inner(agent_url: str) -> None:
     log(f"Agent config written to {agent_config_path}")
 
     # -- Diagnostic: verify the CA cert round-trips through base64 correctly --
-    try:
-        ca_pem = base64.b64decode(ca_cert_b64)
-        first_line = ca_pem.split(b"\n", 1)[0].decode(errors="replace")
-        log(f"[diag] CA cert decoded: {len(ca_pem)} bytes, first line: {first_line}")
-    except Exception as exc:
-        log(f"[diag] CA cert decode failed: {exc}")
+    if VERBOSE:
+        try:
+            ca_pem = base64.b64decode(ca_cert_b64)
+            first_line = ca_pem.split(b"\n", 1)[0].decode(errors="replace")
+            diag(f"CA cert decoded: {len(ca_pem)} bytes, first line: {first_line}")
+        except Exception as exc:
+            diag(f"CA cert decode failed: {exc}")
 
     # Copy install script and config to VM
     log("Copying provision install script and config to VM...")
@@ -652,23 +697,25 @@ def _run_agent_inner(agent_url: str) -> None:
     ssh_cmd(f"curl -fsSk --connect-timeout 10 {api_server}/healthz")
 
     # -- Diagnostic: show what TLS cert the API server presents --
-    log("[diag] Querying API server TLS certificate from VM...")
-    subprocess.run(
-        ["ssh", *SSH_OPTS, SSH_TARGET,
-         f"echo | openssl s_client -connect {kind_ip}:6443 2>&1"
-         " | openssl x509 -noout -subject -issuer -dates"],
-        check=False,
-    )
+    if VERBOSE:
+        diag("Querying API server TLS certificate from VM...")
+        subprocess.run(
+            ["ssh", *SSH_OPTS, SSH_TARGET,
+             f"echo | openssl s_client -connect {kind_ip}:6443 2>&1"
+             " | openssl x509 -noout -subject -issuer -dates"],
+            check=False,
+        )
 
     # -- Diagnostic: verify CA cert from config on the VM side --
-    log("[diag] Verifying CA cert from agent config on VM...")
-    subprocess.run(
-        ["ssh", *SSH_OPTS, SSH_TARGET,
-         "jq -r '.Cluster.CaCertBase64' /tmp/agent-config.json"
-         " | base64 -d"
-         " | openssl x509 -noout -subject -issuer -dates"],
-        check=False,
-    )
+    if VERBOSE:
+        diag("Verifying CA cert from agent config on VM...")
+        subprocess.run(
+            ["ssh", *SSH_OPTS, SSH_TARGET,
+             "jq -r '.Cluster.CaCertBase64' /tmp/agent-config.json"
+             " | base64 -d"
+             " | openssl x509 -noout -subject -issuer -dates"],
+            check=False,
+        )
 
     # Run the provision install script on the VM
     log("Running provision install script on VM...")
@@ -746,8 +793,13 @@ def wait_for_node() -> None:
 # Network diagnostics (non-fatal)
 # ---------------------------------------------------------------------------
 def _run_diag(label: str, args: list[str]) -> None:
-    """Run a single diagnostic command, printing its output under *label*."""
-    log(f"[DIAG] {label}")
+    """Run a single diagnostic command, printing its output under *label*.
+
+    Only produces output when ``--verbose`` is active.
+    """
+    if not VERBOSE:
+        return
+    diag(label)
     result = subprocess.run(args, capture_output=True, text=True, check=False)
     out = (result.stdout or "").rstrip()
     err = (result.stderr or "").rstrip()
@@ -764,11 +816,14 @@ def _run_diag(label: str, args: list[str]) -> None:
 def _log_network_diagnostics() -> None:
     """Emit non-fatal network diagnostics from the VM, Kind container, and host.
 
-    This is called in validate_workload() after the pod reaches Running but
-    before we attempt ``kubectl logs`` (which proxies through the kubelet and
-    may fail with "no route to host" if there is a networking issue between
-    the Kind container and the VM).
+    Only produces output when ``--verbose`` is active.  Called in
+    validate_workload() after the pod reaches Running but before we attempt
+    ``kubectl logs`` (which proxies through the kubelet and may fail with
+    "no route to host" if there is a networking issue between the Kind
+    container and the VM).
     """
+    if not VERBOSE:
+        return
     log("=== Network diagnostics (non-fatal) ===")
 
     # -- From the VM (via SSH) --
@@ -982,11 +1037,13 @@ def reset_agent() -> None:
         die(f"SSH key not found: {SSH_KEY}. Run create-vm first.")
 
     log(f"Running 'unbounded-agent reset' on VM for machine '{AGENT_MACHINE_NAME}'...")
+
     run([
         "timeout", "300",
         "ssh", *SSH_OPTS, "-o", "ServerAliveInterval=30", SSH_TARGET,
-        f"sudo UNBOUNDED_AGENT_CONFIG_FILE=/tmp/agent-config.json unbounded-agent reset",
+        "sudo UNBOUNDED_AGENT_CONFIG_FILE=/tmp/agent-config.json unbounded-agent reset",
     ])
+
     log("Agent reset completed on VM")
 
     # Verify the node is removed from the cluster
@@ -1248,11 +1305,26 @@ COMMANDS = {
 
 
 def main() -> None:
-    if len(sys.argv) != 2 or sys.argv[1] not in COMMANDS:
-        cmds = ", ".join(COMMANDS)
-        die(f"Usage: {sys.argv[0]} <{cmds}>")
+    global VERBOSE  # noqa: PLW0603
 
-    COMMANDS[sys.argv[1]]()
+    parser = argparse.ArgumentParser(
+        description="Agent E2E Kind test harness",
+    )
+    parser.add_argument(
+        "command",
+        choices=sorted(COMMANDS),
+        help="Subcommand to run",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        default=False,
+        help="Enable verbose diagnostic output",
+    )
+    args = parser.parse_args()
+    VERBOSE = args.verbose
+
+    COMMANDS[args.command]()
 
 
 if __name__ == "__main__":
