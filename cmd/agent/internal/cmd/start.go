@@ -4,15 +4,10 @@
 package cmd
 
 import (
-	"encoding/base64"
+	"encoding/json"
 	"fmt"
-	"log/slog"
 	"os"
 	"os/signal"
-	"path/filepath"
-	"runtime"
-	"strconv"
-	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -21,6 +16,7 @@ import (
 	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases/host"
 	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases/nodestart"
 	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases/rootfs"
+	"github.com/Azure/unbounded-kube/cmd/agent/internal/utilio"
 	"github.com/Azure/unbounded-kube/internal/provision"
 	"github.com/Azure/unbounded-kube/internal/version"
 )
@@ -46,19 +42,17 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 				return err
 			}
 
-			rootFSGoalState, err := resolveRootFSGoalState(cmdCtx.Logger, cfg)
-			if err != nil {
-				return err
-			}
-
-			nodeStartGoalState, err := resolveNodeStartGoalState(cfg, rootFSGoalState.Nvidia)
-			if err != nil {
-				return err
-			}
-
 			log := cmdCtx.Logger
 
-			return phases.Serial(log,
+			gs, err := goalstates.ResolveMachine(log, cfg, goalstates.NSpawnMachineKube1)
+			if err != nil {
+				return err
+			}
+			rootFSGoalState := gs.RootFS
+			nodeStartGoalState := gs.NodeStart
+
+			// Build the list of phases to execute.
+			tasks := []phases.Task{
 				// Phase 1: host
 				host.InstallPackages(log),
 				phases.Parallel(log,
@@ -97,133 +91,49 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 				nodestart.SetupNVIDIA(log, nodeStartGoalState),
 				nodestart.StartContainerd(log, nodeStartGoalState),
 				nodestart.StartKubelet(log, nodeStartGoalState),
-			).Do(ctx)
+			}
+
+			if err := phases.Serial(log, tasks...).Do(ctx); err != nil {
+				return err
+			}
+
+			// Persist the applied config for drift detection.
+			// This MUST happen before any future daemon starts, because
+			// it reads the applied config on task arrival.
+			nspawnMachineName := goalstates.NSpawnMachineKube1
+			if err := persistAppliedConfig(cfg, nspawnMachineName); err != nil {
+				return err
+			}
+			log.Info("applied config persisted",
+				"path", goalstates.AppliedConfigPath(nspawnMachineName),
+			)
+
+			// Phase 4: Enable and start the daemon that watches the Machine CR
+			// for ongoing drift detection and reconciliation.
+			if err := host.EnableDaemon(log).Do(ctx); err != nil {
+				return err
+			}
+
+			return nil
 		},
 	}
 
 	return cmd
 }
 
-// ref: cmd/machina/machina/controller/machine_controller.go
-func resolveRootFSGoalState(log *slog.Logger, cfg *provision.AgentConfig) (*goalstates.RootFS, error) {
-	nspawnMachineName := goalstates.NSpawnMachineKube1
-	kubeVersion := cfg.Cluster.Version
-
-	kernel, err := hostKernel() //nolint:staticcheck // SA4023: non-Linux stub always errors; this is intentional.
-	if err != nil {             //nolint:staticcheck // SA4023: see above.
-		return nil, err
-	}
-
-	hostname, err := os.Hostname()
+// persistAppliedConfig writes the agent config to the applied config file
+// for the given nspawn machine. This is used for drift detection by the
+// daemon when a NodeUpdateSpec task arrives.
+func persistAppliedConfig(cfg *provision.AgentConfig, machineName string) error {
+	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
-		return nil, fmt.Errorf("get host hostname: %w", err)
+		return fmt.Errorf("marshal applied config: %w", err)
 	}
 
-	nvidia, err := goalstates.ResolveNvidiaHost(runtime.GOARCH)
-	if err != nil {
-		return nil, err
+	path := goalstates.AppliedConfigPath(machineName)
+	if err := utilio.WriteFile(path, data, 0o600); err != nil {
+		return fmt.Errorf("write applied config to %s: %w", path, err)
 	}
 
-	ociImage := resolveOCIImage(log, cfg.OCIImage, len(nvidia.GPUDevicePaths) > 0)
-
-	return &goalstates.RootFS{
-		MachineDir: filepath.Join("/var/lib/machines", nspawnMachineName),
-		NSpawnConfigFile: filepath.Join(
-			goalstates.SystemdNSpawnDir,
-			nspawnMachineName+".nspawn",
-		),
-		ServiceOverrideFile: filepath.Join(
-			goalstates.SystemdSystemDir,
-			fmt.Sprintf("systemd-nspawn@%s.service.d", nspawnMachineName),
-			"override.conf",
-		),
-		HostArch:          runtime.GOARCH,
-		HostKernel:        kernel,
-		Hostname:          hostname,
-		ContainerdVersion: goalstates.ContainerdVersion, // FIXME: allow overriding
-		RunCVersion:       goalstates.RunCVersion,       // FIXME allow overriding
-		CNIPluginVersion:  goalstates.CNIPluginVersion,  // FIXME: allow overriding
-		KubernetesVersion: kubeVersion,
-		OCIImage:          ociImage,
-		Nvidia:            nvidia,
-		HostDevicePaths:   goalstates.DiscoverHostDevicePaths(),
-	}, nil
-}
-
-// ref: cmd/machina/machina/controller/machine_controller.go
-func resolveNodeStartGoalState(cfg *provision.AgentConfig, nvidia goalstates.NvidiaHost) (*goalstates.NodeStart, error) {
-	nspawnMachineName := goalstates.NSpawnMachineKube1
-
-	kubelet, err := resolveKubeletGoalState(cfg)
-	if err != nil {
-		return nil, err
-	}
-
-	return &goalstates.NodeStart{
-		MachineName:     nspawnMachineName,
-		KubeMachineName: cfg.MachineName,
-		MachineDir:      filepath.Join("/var/lib/machines", nspawnMachineName),
-		Containerd:      goalstates.ResolveContainerd(),
-		Kubelet:         kubelet,
-		Nvidia:          nvidia,
-	}, nil
-}
-
-func resolveKubeletGoalState(cfg *provision.AgentConfig) (goalstates.Kubelet, error) {
-	var zero goalstates.Kubelet
-
-	caCert, err := base64.StdEncoding.DecodeString(cfg.Cluster.CaCertBase64)
-	if err != nil {
-		return zero, fmt.Errorf("decode CaCertBase64: %w", err)
-	}
-
-	labels := cfg.Kubelet.Labels
-	if labels == nil {
-		labels = make(map[string]string)
-	}
-
-	return goalstates.Kubelet{
-		KubeletBinPath:     filepath.Join("/"+goalstates.BinDir, "kubelet"),
-		BootstrapToken:     cfg.Kubelet.BootstrapToken,
-		APIServer:          cfg.Kubelet.ApiServer,
-		CACertData:         caCert,
-		ClusterDNS:         cfg.Cluster.ClusterDNS,
-		NodeLabels:         labels,
-		RegisterWithTaints: cfg.Kubelet.RegisterWithTaints,
-	}, nil
-}
-
-// resolveOCIImage determines the OCI image to use for the nspawn rootfs.
-//
-// The priority is: configImage (from the agent config) >
-// AGENT_DISABLE_OCI_IMAGE env var > AGENT_OCI_IMAGE env var > built-in
-// default selected by GPU presence.
-//
-// When AGENT_DISABLE_OCI_IMAGE is set to a truthy value (e.g. "1", "true"),
-// OCI-based rootfs provisioning is disabled and the agent falls back to
-// debootstrap.
-func resolveOCIImage(log *slog.Logger, configImage string, nvidiaGPUAvailable bool) string {
-	if configImage != "" {
-		return configImage
-	}
-
-	if disabled, err := strconv.ParseBool(os.Getenv("AGENT_DISABLE_OCI_IMAGE")); err == nil && disabled {
-		log.Info("OCI image usage disabled via AGENT_DISABLE_OCI_IMAGE, falling back to debootstrap")
-		return ""
-	}
-
-	if v := strings.TrimSpace(os.Getenv("AGENT_OCI_IMAGE")); v != "" {
-		return v
-	}
-
-	var image string
-	if nvidiaGPUAvailable {
-		image = goalstates.DefaultNvidiaOCImage
-	} else {
-		image = goalstates.DefaultOCIImage
-	}
-
-	log.Info("no OCI image configured, using default", "image", image)
-
-	return image
+	return nil
 }

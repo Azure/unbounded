@@ -13,6 +13,7 @@ on:
       - hack/agent/e2e-kind/**
       - deploy/machina/crd/**
       - deploy/machina/07-bootstrapper-rbac.yaml
+      - deploy/agent/**
       - go.mod
       - go.sum
       - .github/workflows/agent-e2e-kind.yaml
@@ -26,6 +27,7 @@ on:
       - hack/agent/e2e-kind/**
       - deploy/machina/crd/**
       - deploy/machina/07-bootstrapper-rbac.yaml
+      - deploy/agent/**
       - go.mod
       - go.sum
       - .github/workflows/agent-e2e-kind.yaml
@@ -160,6 +162,20 @@ jobs:
       - name: Validate Machine CR (preexisting)
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-machine-cr-preexisting
 
+      - name: Validate daemon watching Machine CR
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-daemon
+
+      # Trigger a reimage via the Machine CR and validate the daemon performs
+      # the nspawn machine update (kube1 -> kube2).
+      - name: Trigger node upgrade via Machine CR
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose trigger-upgrade
+
+      - name: Validate node upgrade completed
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-upgrade
+
+      - name: Wait for node to become Ready (post-upgrade)
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose wait-for-node
+
       - name: Validate workload on agent node
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-workload
 
@@ -187,6 +203,13 @@ jobs:
       - name: Validate Machine CR (created)
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-machine-cr-created
 
+      # The daemon also needs to be watching after rejoin.
+      - name: Create Machine CR (rejoin)
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose create-machine-cr
+
+      - name: Validate daemon watching Machine CR (rejoin)
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-daemon
+
       - name: Validate workload on rejoined agent node
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-workload
 
@@ -202,6 +225,8 @@ jobs:
           $SSH "sudo journalctl --no-pager -l" > logs/vm-journal.log 2>/dev/null || true
           # Collect unbounded-agent logs from the VM host
           $SSH "sudo journalctl -u unbounded-agent --no-pager -l" > logs/vm-unbounded-agent.log 2>/dev/null || true
+          # Collect unbounded-agent-daemon logs
+          $SSH "sudo journalctl -u unbounded-agent-daemon --no-pager -l" > logs/vm-unbounded-agent-daemon.log 2>/dev/null || true
           # Kubelet and containerd run inside the nspawn container, not on
           # the host.  Use 'journalctl -M <machine>' to read the container
           # journal, and fall back to machinectl shell if that doesn't work.

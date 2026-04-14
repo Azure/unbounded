@@ -26,6 +26,7 @@ func Run() {
 
 	root.AddCommand(
 		newCmdStart(cmdCtx),
+		newCmdDaemon(cmdCtx),
 		newCmdReset(cmdCtx),
 		newCmdVersion(),
 	)

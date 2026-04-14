@@ -3,11 +3,11 @@
 
 //go:build !linux
 
-package cmd
+package goalstates
 
 import "fmt"
 
 // hostKernel is not supported on non-Linux platforms.
 func hostKernel() (string, error) {
-	return "", fmt.Errorf("hostKernel is not supported on this platform")
+	return "", fmt.Errorf("hostKernel is only supported on Linux")
 }
