@@ -3,9 +3,15 @@
 
 package goalstates
 
+import "fmt"
+
 const (
 	// ConfigDir is the host-level configuration directory for unbounded-kube.
 	ConfigDir = "/etc/unbounded-kube"
+
+	// AgentConfigDir is the host-level configuration directory for the
+	// unbounded-agent. Applied config files are persisted here.
+	AgentConfigDir = "/etc/unbounded-agent"
 
 	SystemdNSpawnDir = "/etc/systemd/nspawn"
 	SystemdSystemDir = "/etc/systemd/system"
@@ -25,8 +31,23 @@ const (
 //	…
 const (
 	NSpawnMachineKube1 = "kube1"
-	NSpawnMachineKube2 = "kube2" //nolint:deadcode // reserved for future upgrade cycle
+	NSpawnMachineKube2 = "kube2"
 )
+
+// AlternateMachine returns the other machine name in the blue-green pair.
+// kube1 -> kube2, kube2 -> kube1.
+func AlternateMachine(current string) string {
+	if current == NSpawnMachineKube1 {
+		return NSpawnMachineKube2
+	}
+	return NSpawnMachineKube1
+}
+
+// AppliedConfigPath returns the path to the applied config file for the
+// given nspawn machine name, e.g. /etc/unbounded-agent/kube1-applied-config.json.
+func AppliedConfigPath(machineName string) string {
+	return fmt.Sprintf("%s/%s-applied-config.json", AgentConfigDir, machineName)
+}
 
 const (
 	ContainerdVersion = "2.0.4"

@@ -3,11 +3,11 @@
 
 // e2e-task-server is a minimal gRPC server that implements the TaskServer
 // service for end-to-end testing. It queues a single NodeUpdateSpec task
-// (Kubernetes upgrade to 1.33.4) and logs the status report from the agent.
+// and logs the status report from the agent.
 //
 // Usage:
 //
-//	go run ./hack/agent/e2e-task-server --listen=:50051
+//	go run ./hack/agent/e2e-task-server --listen=:50051 --kubernetes-version=1.33.1
 package main
 
 import (
@@ -29,7 +29,12 @@ import (
 
 func main() {
 	listen := flag.String("listen", ":50051", "gRPC listen address")
+	kubeVersion := flag.String("kubernetes-version", "", "Kubernetes version for the NodeUpdateSpec task")
 	flag.Parse()
+
+	if *kubeVersion == "" {
+		log.Fatal("--kubernetes-version is required")
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
@@ -41,10 +46,10 @@ func main() {
 
 	srv := &server{
 		task: &agentv1.Task{
-			Id: "e2e-upgrade-001",
+			Id: "e2e-update-001",
 			Spec: &agentv1.Task_NodeUpdate{
 				NodeUpdate: &agentv1.NodeUpdateSpec{
-					KubernetesVersion: "1.33.4",
+					KubernetesVersion: *kubeVersion,
 				},
 			},
 			CreatedAt: timestamppb.Now(),

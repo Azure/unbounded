@@ -5,6 +5,7 @@ package cmd
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -21,6 +22,7 @@ import (
 	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases/host"
 	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases/nodestart"
 	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases/rootfs"
+	"github.com/Azure/unbounded-kube/cmd/agent/internal/utilio"
 	"github.com/Azure/unbounded-kube/internal/provision"
 	"github.com/Azure/unbounded-kube/internal/version"
 )
@@ -103,11 +105,41 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 				tasks = append(tasks, host.EnableDaemon(log, cfg.TaskServer.Endpoint))
 			}
 
-			return phases.Serial(log, tasks...).Do(ctx)
+			if err := phases.Serial(log, tasks...).Do(ctx); err != nil {
+				return err
+			}
+
+			// Persist the applied config so the daemon can detect drift.
+			nspawnMachineName := goalstates.NSpawnMachineKube1
+			if err := persistAppliedConfig(cfg, nspawnMachineName); err != nil {
+				return err
+			}
+			log.Info("applied config persisted",
+				"path", goalstates.AppliedConfigPath(nspawnMachineName),
+			)
+
+			return nil
 		},
 	}
 
 	return cmd
+}
+
+// persistAppliedConfig writes the agent config to the applied config file
+// for the given nspawn machine. This is used for drift detection by the
+// daemon when a NodeUpdateSpec task arrives.
+func persistAppliedConfig(cfg *provision.AgentConfig, machineName string) error {
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal applied config: %w", err)
+	}
+
+	path := goalstates.AppliedConfigPath(machineName)
+	if err := utilio.WriteFile(path, data, 0o600); err != nil {
+		return fmt.Errorf("write applied config to %s: %w", path, err)
+	}
+
+	return nil
 }
 
 // ref: cmd/machina/machina/controller/machine_controller.go

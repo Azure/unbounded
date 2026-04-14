@@ -1,0 +1,31 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+//go:build linux
+
+package nodeupdate
+
+import (
+	"fmt"
+	"strings"
+	"syscall"
+)
+
+// hostKernel returns the running kernel version (equivalent to uname -r).
+func hostKernel() (string, error) {
+	var utsname syscall.Utsname
+	if err := syscall.Uname(&utsname); err != nil {
+		return "", fmt.Errorf("uname: %w", err)
+	}
+
+	buf := make([]byte, 0, len(utsname.Release))
+	for _, b := range utsname.Release {
+		if b == 0 {
+			break
+		}
+
+		buf = append(buf, byte(b))
+	}
+
+	return strings.TrimSpace(string(buf)), nil
+}

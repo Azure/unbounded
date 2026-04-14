@@ -412,6 +412,16 @@ def _run_agent_inner(agent_url: str) -> None:
     task_server_log = VM_DIR / "e2e-task-server.log"
     task_server_pid_file = VM_DIR / "e2e-task-server.pid"
 
+    # Query the cluster Kubernetes version to send in the NodeUpdateSpec.
+    # Using the same version means no drift is detected, validating the
+    # task-pull pipeline without triggering a real blue-green update.
+    kube_version_json = kubectl_capture([
+        "version", "-o", "json",
+    ])
+    kube_version = json.loads(kube_version_json)["serverVersion"]["gitVersion"]
+    kube_version = kube_version.lstrip("v")
+    log(f"Cluster Kubernetes version: {kube_version}")
+
     log(f"Starting e2e-task-server on {task_server_addr}...")
 
     # If a previous task server is still running (e.g. from a prior
@@ -429,7 +439,9 @@ def _run_agent_inner(agent_url: str) -> None:
 
     ts_log_fd = open(task_server_log, "w")
     ts_proc = subprocess.Popen(
-        [str(task_server_bin), f"--listen={task_server_addr}"],
+        [str(task_server_bin),
+         f"--listen={task_server_addr}",
+         f"--kubernetes-version={kube_version}"],
         stdout=ts_log_fd, stderr=subprocess.STDOUT,
     )
     task_server_pid_file.write_text(str(ts_proc.pid))
