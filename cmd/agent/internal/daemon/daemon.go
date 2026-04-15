@@ -142,6 +142,11 @@ func buildKubeClient(cfg *provision.AgentConfig) (client.WithWatch, error) {
 		return nil, fmt.Errorf("applied config has no bootstrap token")
 	}
 
+	// TODO: Bootstrap tokens are short-lived and not intended for long-running
+	// daemons. We need to define a proper agent credential strategy - for
+	// example, signing dedicated client certificates for the agent so it remains
+	// authenticated even when the bootstrap token expires or the kubelet is
+	// unavailable.
 	restCfg := &rest.Config{
 		Host:        cfg.Kubelet.ApiServer,
 		BearerToken: cfg.Kubelet.BootstrapToken,
