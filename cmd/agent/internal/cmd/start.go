@@ -67,19 +67,13 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 
 				// Phase 3: node-start (includes persisting the applied config).
 				nodestart.StartNode(log, nodeStartGoalState, cfg),
+
+				// Phase 4: Enable and start the daemon that watches the
+				// Machine CR for drift detection and reconciliation.
+				host.EnableDaemon(log),
 			}
 
-			if err := phases.Serial(log, tasks...).Do(ctx); err != nil {
-				return err
-			}
-
-			// Phase 4: Enable and start the daemon that watches the Machine CR
-			// for ongoing drift detection and reconciliation.
-			if err := host.EnableDaemon(log).Do(ctx); err != nil {
-				return err
-			}
-
-			return nil
+			return phases.Serial(log, tasks...).Do(ctx)
 		},
 	}
 

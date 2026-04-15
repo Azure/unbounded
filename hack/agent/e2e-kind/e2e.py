@@ -1078,9 +1078,11 @@ def delete_machine_cr() -> None:
 def validate_machine_cr_created() -> None:
     """Validate the agent self-registered a Machine CR during bootstrap.
 
-    Asserts the Machine CR exists, does NOT have the pre-created marker
-    annotation, and has the correct ``bootstrapTokenRef`` derived from
-    the bootstrap token created by run-agent.
+    The daemon registers the Machine CR at startup, so this function polls
+    until the CR appears (with a timeout). Once found, it asserts the CR
+    does NOT have the pre-created marker annotation and has the correct
+    ``bootstrapTokenRef`` derived from the bootstrap token created by
+    run-agent.
     """
 
     token_id_file = VM_DIR / "token-id"
@@ -1090,12 +1092,27 @@ def validate_machine_cr_created() -> None:
 
     log(f"Validating agent-created Machine CR '{AGENT_MACHINE_NAME}'...")
 
-    try:
-        machine_json = kubectl_capture([
-            "get", "machine", AGENT_MACHINE_NAME, "-o", "json",
-        ])
-    except subprocess.CalledProcessError:
-        die(f"Machine CR '{AGENT_MACHINE_NAME}' not found - expected agent to create it")
+    # Poll for the Machine CR to appear (the daemon registers it
+    # asynchronously after startup).
+    timeout_secs = 120
+    elapsed = 0
+    machine_json = None
+    while elapsed < timeout_secs:
+        result = subprocess.run(
+            [KUBECTL, "get", "machine", AGENT_MACHINE_NAME, "-o", "json"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            machine_json = result.stdout
+            log(f"Machine CR '{AGENT_MACHINE_NAME}' found after {elapsed}s")
+            break
+        if elapsed > 0 and elapsed % 15 == 0:
+            log(f"  ({elapsed}s) Machine CR not yet created...")
+        time.sleep(5)
+        elapsed += 5
+    else:
+        die(f"Machine CR '{AGENT_MACHINE_NAME}' not found after {timeout_secs}s - "
+            f"expected daemon to create it")
 
     machine = json.loads(machine_json)
 

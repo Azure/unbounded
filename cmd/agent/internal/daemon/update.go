@@ -37,10 +37,10 @@ type ActiveMachine struct {
 	Config *provision.AgentConfig
 }
 
-// FindActiveMachine scans the agent config directory for an applied config
+// findActiveMachine scans the agent config directory for an applied config
 // file and returns the active machine name and config. Returns an error if
 // no applied config is found.
-func FindActiveMachine() (*ActiveMachine, error) {
+func findActiveMachine() (*ActiveMachine, error) {
 	for _, name := range []string{goalstates.NSpawnMachineKube1, goalstates.NSpawnMachineKube2} {
 		path := goalstates.AppliedConfigPath(name)
 

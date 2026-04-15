@@ -36,7 +36,7 @@ const (
 // Machine CR for changes.
 func Run(ctx context.Context, log *slog.Logger) error {
 	// Find the active machine and its applied config.
-	active, err := FindActiveMachine()
+	active, err := findActiveMachine()
 	if err != nil {
 		return fmt.Errorf("find active machine: %w", err)
 	}
@@ -261,7 +261,7 @@ func handleMachineEvent(ctx context.Context, log *slog.Logger, c client.WithWatc
 
 	// Re-read the active machine state on each event, because a previous
 	// reconciliation may have changed the active nspawn machine name.
-	active, err := FindActiveMachine()
+	active, err := findActiveMachine()
 	if err != nil {
 		return fmt.Errorf("find active machine: %w", err)
 	}

@@ -107,7 +107,7 @@ func Test_hasDrift_LabelsOnlyDoNotTrigger(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// FindActiveMachine
+// findActiveMachine
 // ---------------------------------------------------------------------------
 
 func TestFindActiveMachine_Kube1(t *testing.T) {
@@ -133,7 +133,7 @@ func TestFindActiveMachine_Kube1(t *testing.T) {
 	assert.Equal(t, cfg.MachineName, readCfg.MachineName)
 	assert.Equal(t, cfg.Cluster.Version, readCfg.Cluster.Version)
 
-	_ = origPath // Note: FindActiveMachine uses the const, so this test
+	_ = origPath // Note: findActiveMachine uses the const, so this test
 	// validates the serialization/deserialization roundtrip rather than
-	// the full FindActiveMachine flow (which requires root filesystem access).
+	// the full findActiveMachine flow (which requires root filesystem access).
 }
