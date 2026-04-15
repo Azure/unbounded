@@ -46,10 +46,10 @@ fields (API server URL, base64-encoded CA certificate, bootstrap token),
 avoiding any dependency on kubeconfig files inside the nspawn machine (which
 contain nspawn-internal paths that do not resolve on the host filesystem).
 
-The bootstrap token places the daemon in the `system:bootstrappers` group. A
-dedicated RBAC ClusterRole (`unbounded-agent-daemon`) grants the daemon
-create, read, and update access to Machine CRs. A ClusterRoleBinding binds
-this role to the `system:bootstrappers` group.
+The bootstrap token places the daemon in the `system:bootstrappers` group. The
+`unbounded-bootstrapper-machine` ClusterRole (deployed with machina) grants the
+daemon create, read, and update access to Machine CRs. A ClusterRoleBinding
+binds this role to the `system:bootstrappers` group.
 
 ## Machine CR Registration
 
@@ -143,13 +143,14 @@ starts after systemd-nspawn machines are available.
 
 ## RBAC
 
-The following cluster-scoped RBAC resources are required:
+The daemon's permissions are part of the bootstrapper RBAC deployed with
+machina (`deploy/machina/07-bootstrapper-rbac.yaml`):
 
 ```yaml
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: unbounded-agent-daemon
+  name: unbounded-bootstrapper-machine
 rules:
   - apiGroups: ["unbounded-kube.io"]
     resources: ["machines"]
@@ -162,11 +163,11 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: unbounded-agent-daemon
+  name: unbounded-bootstrapper-machine
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: unbounded-agent-daemon
+  name: unbounded-bootstrapper-machine
 subjects:
   - apiGroup: rbac.authorization.k8s.io
     kind: Group

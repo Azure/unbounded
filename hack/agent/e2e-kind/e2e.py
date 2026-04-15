@@ -1035,27 +1035,21 @@ def reset_agent() -> None:
 # install-machine-crd
 # ---------------------------------------------------------------------------
 def install_machine_crd() -> None:
-    """Install the Machine CRD, bootstrapper RBAC, and agent daemon RBAC."""
+    """Install the Machine CRD and bootstrapper RBAC."""
 
     crd_path = REPO_ROOT / "deploy" / "machina" / "crd" / "unbounded-kube.io_machines.yaml"
     rbac_path = REPO_ROOT / "deploy" / "machina" / "07-bootstrapper-rbac.yaml"
-    agent_rbac_path = REPO_ROOT / "deploy" / "agent" / "01-rbac.yaml"
 
     if not crd_path.exists():
         die(f"Machine CRD not found: {crd_path}")
     if not rbac_path.exists():
         die(f"Bootstrapper RBAC not found: {rbac_path}")
-    if not agent_rbac_path.exists():
-        die(f"Agent daemon RBAC not found: {agent_rbac_path}")
 
     log("Installing Machine CRD...")
     kubectl(["apply", "-f", str(crd_path)])
 
     log("Installing bootstrapper RBAC...")
     kubectl(["apply", "-f", str(rbac_path)])
-
-    log("Installing agent daemon RBAC...")
-    kubectl(["apply", "-f", str(agent_rbac_path)])
 
     log("Machine CRD and RBAC installed")
 
