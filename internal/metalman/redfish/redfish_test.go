@@ -152,7 +152,7 @@ func TestRedfishRebootCycle(t *testing.T) {
 			},
 			Operations: &v1alpha3.OperationsSpec{
 				RebootCounter:  1,
-				ReimageCounter: 1,
+				RepaveCounter: 1,
 			},
 		},
 		Status: v1alpha3.MachineStatus{
@@ -294,13 +294,13 @@ func TestRedfishRebootCycle(t *testing.T) {
 		t.Fatalf("expected operations.rebootCounter=1, got %d", got)
 	}
 
-	reimagedCond := meta.FindStatusCondition(updated.Status.Conditions, condReimaged)
-	if reimagedCond == nil || reimagedCond.Status != metav1.ConditionFalse || reimagedCond.Reason != "Pending" {
-		t.Fatalf("expected Reimaged=False/Pending, got %+v", reimagedCond)
+	repavedCond := meta.FindStatusCondition(updated.Status.Conditions, condRepaved)
+	if repavedCond == nil || repavedCond.Status != metav1.ConditionFalse || repavedCond.Reason != "Pending" {
+		t.Fatalf("expected Repaved=False/Pending, got %+v", repavedCond)
 	}
 
-	if reimagedCond.Message != "image=ghcr.io/test/test-image:v1" {
-		t.Fatalf("expected Reimaged message 'image=ghcr.io/test/test-image:v1', got %q", reimagedCond.Message)
+	if repavedCond.Message != "image=ghcr.io/test/test-image:v1" {
+		t.Fatalf("expected Repaved message 'image=ghcr.io/test/test-image:v1', got %q", repavedCond.Message)
 	}
 
 	// Seventh reconcile: reboots match - no-op (timeout is handled by the
@@ -390,12 +390,12 @@ func TestRedfishPowerOnTimeoutRetry(t *testing.T) {
 			},
 			Operations: &v1alpha3.OperationsSpec{
 				RebootCounter:  22,
-				ReimageCounter: 22,
+				RepaveCounter: 22,
 			},
 		},
 		Status: v1alpha3.MachineStatus{
 			Redfish:    &v1alpha3.RedfishStatus{CertFingerprint: fp},
-			Operations: &v1alpha3.OperationsStatus{RebootCounter: 21, ReimageCounter: 20},
+			Operations: &v1alpha3.OperationsStatus{RebootCounter: 21, RepaveCounter: 20},
 			Conditions: []metav1.Condition{
 				{
 					Type:               condPoweredOff,
@@ -629,7 +629,7 @@ func TestRedfishTOFUCertCapture(t *testing.T) {
 				},
 			},
 			Operations: &v1alpha3.OperationsSpec{
-				ReimageCounter: 1,
+				RepaveCounter: 1,
 			},
 		},
 	}
@@ -707,7 +707,7 @@ func TestRedfishExactlyOnceSemantics(t *testing.T) {
 			},
 			Operations: &v1alpha3.OperationsSpec{
 				RebootCounter:  3,
-				ReimageCounter: 1,
+				RepaveCounter: 1,
 			},
 		},
 		Status: v1alpha3.MachineStatus{
@@ -816,7 +816,7 @@ func TestBootOrderConfigPxeOn(t *testing.T) {
 				},
 			},
 			Operations: &v1alpha3.OperationsSpec{
-				ReimageCounter: 1,
+				RepaveCounter: 1,
 			},
 		},
 		Status: v1alpha3.MachineStatus{
@@ -1013,7 +1013,7 @@ func TestBootOrderConfigNoOp(t *testing.T) {
 				},
 			},
 			Operations: &v1alpha3.OperationsSpec{
-				ReimageCounter: 1,
+				RepaveCounter: 1,
 			},
 		},
 		Status: v1alpha3.MachineStatus{
@@ -1368,7 +1368,7 @@ func TestBootOrderConfigUnsupported(t *testing.T) {
 				},
 			},
 			Operations: &v1alpha3.OperationsSpec{
-				ReimageCounter: 1,
+				RepaveCounter: 1,
 			},
 		},
 		Status: v1alpha3.MachineStatus{
@@ -1467,7 +1467,7 @@ func TestBootOrderConfigUnsupportedDuringPOST(t *testing.T) {
 				},
 			},
 			Operations: &v1alpha3.OperationsSpec{
-				ReimageCounter: 1,
+				RepaveCounter: 1,
 			},
 		},
 		Status: v1alpha3.MachineStatus{
@@ -1588,7 +1588,7 @@ func TestBootOrderConfigTransientError(t *testing.T) {
 				},
 			},
 			Operations: &v1alpha3.OperationsSpec{
-				ReimageCounter: 1,
+				RepaveCounter: 1,
 			},
 		},
 		Status: v1alpha3.MachineStatus{

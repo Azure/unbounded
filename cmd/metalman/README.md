@@ -38,8 +38,8 @@ EOF
 # Store the BMC's Redfish password
 kubectl create secret generic bmc-node-01-pass --from-literal=password=example-password
 
-# Reimage the node via PXE
-kubectl unbounded machine reimage node-01
+# Repave the node via PXE
+kubectl unbounded machine repave node-01
 ```
 
 
@@ -222,12 +222,12 @@ On first connection, the controller captures the BMC's TLS certificate
 fingerprint and pins it in `status.redfish.certFingerprint` for subsequent
 requests.
 
-To reimage a node with BMC access:
+To repave a node with BMC access:
 
 ```bash
-kubectl unbounded machine reimage node-01
+kubectl unbounded machine repave node-01
 ```
 
-This increments `spec.operations.reimageCounter` and `spec.operations.rebootCounter`. The
+This increments `spec.operations.repaveCounter` and `spec.operations.rebootCounter`. The
 controller handles the rest — it configures the boot order to PXE, executes a
 ForceOff/On power cycle, and clears the condition once the node is back up.

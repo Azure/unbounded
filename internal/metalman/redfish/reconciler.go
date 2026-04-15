@@ -27,7 +27,7 @@ const (
 	// Condition types set by this controller.
 	condPoweredOff    = "PoweredOff"
 	condBootSupported = "BootOrderConfigSupported"
-	condReimaged      = "Reimaged"
+	condRepaved       = "Repaved"
 
 	// Condition reasons.
 	reasonPoweringOff  = "PoweringOff"
@@ -129,11 +129,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	// Boot order configuration (skip if known unsupported).
-	pendingReimage := machine.Spec.Operations.ReimageCounter > machine.Status.Operations.ReimageCounter
+	pendingRepave := machine.Spec.Operations.RepaveCounter > machine.Status.Operations.RepaveCounter
 
 	bootCond := meta.FindStatusCondition(machine.Status.Conditions, condBootSupported)
 	if bootCond == nil || bootCond.Status != metav1.ConditionFalse {
-		if err := r.reconcileBootOrder(ctx, log, &machine, c, pendingReimage); err != nil {
+		if err := r.reconcileBootOrder(ctx, log, &machine, c, pendingRepave); err != nil {
 			if errors.Is(err, ErrUnsupported) {
 				// BMCs commonly reject boot order changes during POST.
 				// Only conclude the feature is permanently unsupported
@@ -177,18 +177,18 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return r.reconcilePowerOff(ctx, log, &machine, c)
 	}
 
-	return r.reconcilePowerOn(ctx, log, &machine, c, pendingReimage)
+	return r.reconcilePowerOn(ctx, log, &machine, c, pendingRepave)
 }
 
 // reconcileBootOrder ensures the boot source override matches the desired state.
 // Returns ErrUnsupported if the BMC does not support boot order configuration.
-func (r *Reconciler) reconcileBootOrder(ctx context.Context, log *slog.Logger, machine *v1alpha3.Machine, c *Client, pendingReimage bool) error {
+func (r *Reconciler) reconcileBootOrder(ctx context.Context, log *slog.Logger, machine *v1alpha3.Machine, c *Client, pendingRepave bool) error {
 	config, err := c.GetBootConfig(ctx)
 	if err != nil {
 		return err
 	}
 
-	if pendingReimage {
+	if pendingRepave {
 		if config.Target == BootTargetPxe && config.Enabled == BootContinuous {
 			return nil // Already set to PXE boot.
 		}
@@ -260,7 +260,7 @@ func (r *Reconciler) reconcilePowerOff(ctx context.Context, log *slog.Logger, ma
 
 // reconcilePowerOn drives the machine from Off to On and completes the
 // reboot cycle.
-func (r *Reconciler) reconcilePowerOn(ctx context.Context, log *slog.Logger, machine *v1alpha3.Machine, c *Client, pendingReimage bool) (ctrl.Result, error) {
+func (r *Reconciler) reconcilePowerOn(ctx context.Context, log *slog.Logger, machine *v1alpha3.Machine, c *Client, pendingRepave bool) (ctrl.Result, error) {
 	state, err := c.PowerState(ctx)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("getting power state: %w", err)
@@ -271,9 +271,9 @@ func (r *Reconciler) reconcilePowerOn(ctx context.Context, log *slog.Logger, mac
 		log.Info("machine confirmed powered on, completing reboot cycle")
 		meta.RemoveStatusCondition(&machine.Status.Conditions, condPoweredOff)
 
-		if pendingReimage {
+		if pendingRepave {
 			meta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
-				Type:               condReimaged,
+				Type:               condRepaved,
 				Status:             metav1.ConditionFalse,
 				Reason:             reasonPending,
 				Message:            "image=" + machine.Spec.PXE.Image,

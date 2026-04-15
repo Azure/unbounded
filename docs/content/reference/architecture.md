@@ -54,7 +54,7 @@ Runs three reconcilers and four network servers:
 |-------------------------|-------------------------------------------------------------|
 | OCIReconciler           | Pulls and caches OCI netboot images from container registries. |
 | Redfish Reconciler      | BMC power control and boot order via Redfish REST. TOFU TLS cert pinning. |
-| Lifecycle Reconciler    | Detects 30-min reimage timeout and triggers automatic retry. |
+| Lifecycle Reconciler    | Detects 30-min repave timeout and triggers automatic retry. |
 | DHCP server (UDP/67)    | Static IP assignment by MAC address.                        |
 | TFTP server (UDP/69)    | Bootloader delivery.                                        |
 | HTTP server (TCP/8880)  | Kernel, initrd, Go-templated configs, `/attest` (TPM), `/pxe/disable`. |
@@ -93,11 +93,11 @@ Represents a host and drives its lifecycle.
 | `spec.ssh`            | SSH connectivity (host, port, user, privateKeyRef) and optional bastion config. |
 | `spec.pxe`            | PXE config: OCI image reference, dhcpLeases, redfish settings. |
 | `spec.kubernetes`     | Kubernetes version, bootstrapTokenRef, nodeRef, nodeLabels. |
-| `spec.operations`     | Reboot and reimage counters. |
+| `spec.operations`     | Reboot and repave counters. |
 
 Status includes phase, message, conditions, SSH fingerprint, Redfish cert
 fingerprint, TPM info, and operation results. The API defines four condition
-type constants: `Provisioned`, `SSHReachable`, `Provisioning`, and `Reimaged`.
+type constants: `Provisioned`, `SSHReachable`, `Provisioning`, and `Repaved`.
 Additional conditions such as `PoweredOff` and `BootOrderConfigSupported` may
 be set by the metalman controller but are not defined as constants in the
 Machine types.

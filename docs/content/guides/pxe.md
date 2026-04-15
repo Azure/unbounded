@@ -91,7 +91,7 @@ spec:
         key: bmc-01
   operations:
     rebootCounter: 0
-    reimageCounter: 0
+    repaveCounter: 0
 ```
 
 Store BMC passwords in a Secret referenced by `passwordRef`. See the [CRD Reference]({{< relref "/reference/machina-crd" >}}) for all fields.
@@ -151,7 +151,7 @@ If the referenced ConfigMap does not exist, metalman falls back to the default m
 
 1. **Machine CR created.** The Redfish reconciler sets the boot device to PXE and power-cycles the server (ForceOff → On).
 2. **PXE boot.** DHCP assigns the static IP by MAC. TFTP serves `shimx64.efi`, which chainloads GRUB over HTTP.
-3. **GRUB decision.** A rendered `grub.cfg` (from a `.tmpl` file in the OCI image) checks `reimageCounter` against status: if counter is ahead, boot the PXE installer; otherwise chainload the local OS.
+3. **GRUB decision.** A rendered `grub.cfg` (from a `.tmpl` file in the OCI image) checks `repaveCounter` against status: if counter is ahead, boot the PXE installer; otherwise chainload the local OS.
 4. **Installer (initrd overlay).** An init script in the initrd:
    - Loads storage and network drivers, configures the static IP from kernel cmdline.
    - Downloads the gzip-compressed raw disk image over HTTP (retries up to 120 times).
@@ -195,9 +195,9 @@ Metalman uses counter-based operations. Increment a spec counter above the corre
 
 **Reboot** a machine by incrementing the `rebootCounter`:
 
-**Reimage** a machine (PXE reinstall) by incrementing both counters.
+**Repave** a machine (PXE reinstall) by incrementing both counters.
 
-The lifecycle reconciler enforces a 30-minute timeout for reimaging and automatically retries on timeout.
+The lifecycle reconciler enforces a 30-minute timeout for repaving and automatically retries on timeout.
 
 Edit the Machine CR directly:
 
@@ -205,7 +205,7 @@ Edit the Machine CR directly:
 spec:
   operations:
     rebootCounter: 1   # increment above status to reboot
-    reimageCounter: 1   # increment above status to reimage
+    repaveCounter: 1   # increment above status to repave
 ```
 
 ## Troubleshooting
@@ -214,7 +214,7 @@ spec:
 Running metalman's DHCP server on a network segment that already has an active DHCP server will cause conflicts. Ensure metalman is the only DHCP server on the PXE segment, or use relay mode to isolate DHCP traffic.
 {{< /callout >}}
 
-**Machine stuck in reimaging.** Check metalman logs for HTTP download errors. Verify the target machine can reach metalman on TCP/8880. The lifecycle reconciler will auto-retry after the 30-minute timeout.
+**Machine stuck in repaving.** Check metalman logs for HTTP download errors. Verify the target machine can reach metalman on TCP/8880. The lifecycle reconciler will auto-retry after the 30-minute timeout.
 
 **DHCP not responding.** Confirm `--dhcp-interface` points to the correct NIC (broadcast mode) or that your relay agent forwards to metalman's DHCP port. Check that no other DHCP server is competing on the same segment.
 
@@ -227,7 +227,7 @@ Running metalman's DHCP server on a network segment that already has an active D
 ## Limitations
 
 {{< callout type="note" >}}
-Only Ubuntu 24.04 images are currently supported. The reimage timeout is fixed at 30 minutes.
+Only Ubuntu 24.04 images are currently supported. The repave timeout is fixed at 30 minutes.
 {{< /callout >}}
 
 ## See Also

@@ -266,17 +266,17 @@ func (h *HTTPServer) handleDisablePXE(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var specReimage, statusReimage int64
+	var specRepave, statusRepave int64
 	if node.Spec.Operations != nil {
-		specReimage = node.Spec.Operations.ReimageCounter
+		specRepave = node.Spec.Operations.RepaveCounter
 	}
 
 	if node.Status.Operations != nil {
-		statusReimage = node.Status.Operations.ReimageCounter
+		statusRepave = node.Status.Operations.RepaveCounter
 	}
 
-	if specReimage <= statusReimage {
-		log.Info("reimage already cleared", "node", node.Name)
+	if specRepave <= statusRepave {
+		log.Info("repave already cleared", "node", node.Name)
 		w.WriteHeader(http.StatusOK)
 
 		return
@@ -286,7 +286,7 @@ func (h *HTTPServer) handleDisablePXE(w http.ResponseWriter, r *http.Request) {
 		node.Status.Operations = &v1alpha3.OperationsStatus{}
 	}
 
-	node.Status.Operations.ReimageCounter = specReimage
+	node.Status.Operations.RepaveCounter = specRepave
 
 	imageName := ""
 	if node.Spec.PXE != nil {
@@ -294,7 +294,7 @@ func (h *HTTPServer) handleDisablePXE(w http.ResponseWriter, r *http.Request) {
 	}
 
 	meta.SetStatusCondition(&node.Status.Conditions, metav1.Condition{
-		Type:               v1alpha3.MachineConditionReimaged,
+		Type:               v1alpha3.MachineConditionRepaved,
 		Status:             metav1.ConditionTrue,
 		Reason:             "Succeeded",
 		Message:            "image=" + imageName,
@@ -308,7 +308,7 @@ func (h *HTTPServer) handleDisablePXE(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Info("reimage cleared", "node", node.Name)
+	log.Info("repave cleared", "node", node.Name)
 	w.WriteHeader(http.StatusOK)
 }
 

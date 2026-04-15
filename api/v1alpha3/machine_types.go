@@ -56,12 +56,12 @@ const (
 	// attempts (e.g. after a controller restart).
 	MachineConditionProvisioning = "Provisioning"
 
-	// MachineConditionReimaged indicates the state of a reimage operation.
-	// Status is set to False (with Reason "Pending") when a reimage begins,
-	// and True (with Reason "Succeeded") when the reimage completes.
-	// The lastTransitionTime records when the reimage started, which is
-	// used to detect stale reimage attempts.
-	MachineConditionReimaged = "Reimaged"
+	// MachineConditionRepaved indicates the state of a repave operation.
+	// Status is set to False (with Reason "Pending") when a repave begins,
+	// and True (with Reason "Succeeded") when the repave completes.
+	// The lastTransitionTime records when the repave started, which is
+	// used to detect stale repave attempts.
+	MachineConditionRepaved = "Repaved"
 
 	// MachineConditionCloudInitDone indicates whether cloud-init has
 	// finished on the machine. Status is True with Reason "Succeeded"
@@ -84,7 +84,7 @@ const (
 // Annotation keys.
 const (
 	// AnnotationProvider associates a Machine with a provider's
-	// controller for reboot/reimage operations.
+	// controller for reboot/repave operations.
 	AnnotationProvider = "unbounded-kube.io/provider"
 )
 
@@ -288,10 +288,10 @@ type OperationsSpec struct {
 	// +optional
 	RebootCounter int64 `json:"rebootCounter,omitempty"`
 
-	// ReimageCounter triggers a reimage when it exceeds the status
-	// reimage counter.
+	// RepaveCounter triggers a repave when it exceeds the status
+	// repave counter.
 	// +optional
-	ReimageCounter int64 `json:"reimageCounter,omitempty"`
+	RepaveCounter int64 `json:"repaveCounter,omitempty"`
 }
 
 // LocalObjectReference contains enough information to locate the referenced resource.
@@ -392,6 +392,6 @@ type OperationsStatus struct {
 	// RebootCounter is the last reboot counter value that was acted on.
 	RebootCounter int64 `json:"rebootCounter,omitempty"`
 
-	// ReimageCounter is the last reimage counter value that was acted on.
-	ReimageCounter int64 `json:"reimageCounter,omitempty"`
+	// RepaveCounter is the last repave counter value that was acted on.
+	RepaveCounter int64 `json:"repaveCounter,omitempty"`
 }
