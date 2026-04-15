@@ -1489,7 +1489,7 @@ def validate_upgrade() -> None:
     log("Phase 6: Verifying applied config version on disk...")
     result = subprocess.run(
         ["ssh", *SSH_OPTS, SSH_TARGET,
-         "sudo cat /etc/unbounded-agent/kube2-applied-config.json || "
+         "sudo cat /etc/unbounded-agent/kube2-applied-config.json || " +
          "sudo cat /etc/unbounded-agent/kube1-applied-config.json"],
         capture_output=True, text=True,
     )
