@@ -598,6 +598,9 @@ def _run_agent_inner(agent_url: str) -> None:
         "metadata": {
             "name": f"bootstrap-token-{token_id}",
             "namespace": "kube-system",
+            "labels": {
+                "unbounded-kube.io/site": E2E_SITE_NAME,
+            },
         },
         "type": "bootstrap.kubernetes.io/token",
         "data": {
@@ -613,8 +616,8 @@ def _run_agent_inner(agent_url: str) -> None:
 
     # Generate bootstrap script via kubectl-unbounded.
     # manual-bootstrap auto-detects the API server, CA cert, Kubernetes
-    # version, and cluster DNS from the active kubeconfig, and picks up
-    # the bootstrap token we just created via the fallback path.
+    # version, and cluster DNS from the active kubeconfig. The bootstrap
+    # token is resolved via the site label on the secret.
     log("Generating bootstrap script with kubectl-unbounded machine manual-bootstrap...")
 
     # Capture the local API server URL from the kubeconfig (typically
