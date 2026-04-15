@@ -4,8 +4,6 @@
 package cmd
 
 import (
-	"encoding/json"
-	"fmt"
 	"os"
 	"os/signal"
 
@@ -16,8 +14,6 @@ import (
 	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases/host"
 	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases/nodestart"
 	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases/rootfs"
-	"github.com/Azure/unbounded-kube/cmd/agent/internal/utilio"
-	"github.com/Azure/unbounded-kube/internal/provision"
 	"github.com/Azure/unbounded-kube/internal/version"
 )
 
@@ -48,6 +44,7 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 			if err != nil {
 				return err
 			}
+
 			rootFSGoalState := gs.RootFS
 			nodeStartGoalState := gs.NodeStart
 
@@ -75,24 +72,13 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 				// fully resolved, and before kubelet starts.
 				nodestart.RegisterMachine(log, nodeStartGoalState),
 
-				// Phase 3: node-start
-				nodestart.StartNode(log, nodeStartGoalState),
+				// Phase 3: node-start (includes persisting the applied config).
+				nodestart.StartNode(log, nodeStartGoalState, cfg),
 			}
 
 			if err := phases.Serial(log, tasks...).Do(ctx); err != nil {
 				return err
 			}
-
-			// Persist the applied config for drift detection.
-			// This MUST happen before any future daemon starts, because
-			// it reads the applied config on task arrival.
-			nspawnMachineName := goalstates.NSpawnMachineKube1
-			if err := persistAppliedConfig(cfg, nspawnMachineName); err != nil {
-				return err
-			}
-			log.Info("applied config persisted",
-				"path", goalstates.AppliedConfigPath(nspawnMachineName),
-			)
 
 			// Phase 4: Enable and start the daemon that watches the Machine CR
 			// for ongoing drift detection and reconciliation.
@@ -105,21 +91,4 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 	}
 
 	return cmd
-}
-
-// persistAppliedConfig writes the agent config to the applied config file
-// for the given nspawn machine. This is used for drift detection by the
-// daemon when a NodeUpdateSpec task arrives.
-func persistAppliedConfig(cfg *provision.AgentConfig, machineName string) error {
-	data, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal applied config: %w", err)
-	}
-
-	path := goalstates.AppliedConfigPath(machineName)
-	if err := utilio.WriteFile(path, data, 0o600); err != nil {
-		return fmt.Errorf("write applied config to %s: %w", path, err)
-	}
-
-	return nil
 }

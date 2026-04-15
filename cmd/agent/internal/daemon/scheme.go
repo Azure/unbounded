@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-package cmd
+package daemon
 
 import (
 	"k8s.io/apimachinery/pkg/runtime"

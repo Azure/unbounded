@@ -40,6 +40,7 @@ func AlternateMachine(current string) string {
 	if current == NSpawnMachineKube1 {
 		return NSpawnMachineKube2
 	}
+
 	return NSpawnMachineKube1
 }
 
