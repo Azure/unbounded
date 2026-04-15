@@ -23,19 +23,26 @@ import (
 	"github.com/Azure/unbounded-kube/internal/provision"
 )
 
-// NewKubeClient is the constructor for the Kubernetes watch client. It is
-// overridden in tests to inject a fake client.
-var NewKubeClient = defaultNewKubeClient
+// kubeClientFunc constructs a controller-runtime WithWatch client from a
+// rest.Config. The production implementation is client.NewWithWatch;
+// tests can supply a fake.
+type kubeClientFunc func(cfg *rest.Config, opts client.Options) (client.WithWatch, error)
 
 const (
 	// watchRetryInterval is the delay between watch re-establishment attempts.
 	watchRetryInterval = 10 * time.Second
 )
 
-// Run is the main daemon loop. It discovers the active nspawn machine,
-// builds a Kubernetes client from the applied config, and watches the
-// Machine CR for changes.
+// Run is the main daemon entry point. It discovers the active nspawn
+// machine, builds a Kubernetes client from the applied config, and
+// watches the Machine CR for changes.
 func Run(ctx context.Context, log *slog.Logger) error {
+	return run(ctx, log, client.NewWithWatch)
+}
+
+// run is the inner loop, accepting a client constructor so tests can
+// inject a fake.
+func run(ctx context.Context, log *slog.Logger, newClient kubeClientFunc) error {
 	// Find the active machine and its applied config.
 	active, err := findActiveMachine()
 	if err != nil {
@@ -50,7 +57,7 @@ func Run(ctx context.Context, log *slog.Logger) error {
 	)
 
 	// Build a controller-runtime WithWatch client from the applied config.
-	kubeClient, err := buildKubeClient(active.Config)
+	kubeClient, err := buildKubeClient(active.Config, newClient)
 	if err != nil {
 		return fmt.Errorf("build kube client: %w", err)
 	}
@@ -124,7 +131,7 @@ func runWorker(ctx context.Context, log *slog.Logger, c client.WithWatch, queue 
 //
 // This avoids reading kubeconfig files from inside the nspawn machine, which
 // contain nspawn-internal paths that do not resolve on the host filesystem.
-func buildKubeClient(cfg *provision.AgentConfig) (client.WithWatch, error) {
+func buildKubeClient(cfg *provision.AgentConfig, newClient kubeClientFunc) (client.WithWatch, error) {
 	if cfg.Kubelet.ApiServer == "" {
 		return nil, fmt.Errorf("applied config has no API server URL")
 	}
@@ -157,13 +164,7 @@ func buildKubeClient(cfg *provision.AgentConfig) (client.WithWatch, error) {
 
 	s := newScheme()
 
-	return NewKubeClient(restCfg, client.Options{Scheme: s})
-}
-
-// defaultNewKubeClient is the production constructor for the Kubernetes
-// WithWatch client.
-func defaultNewKubeClient(cfg *rest.Config, opts client.Options) (client.WithWatch, error) {
-	return client.NewWithWatch(cfg, opts)
+	return newClient(restCfg, client.Options{Scheme: s})
 }
 
 // registerMachine ensures a Machine CR exists for this node. If the CR
