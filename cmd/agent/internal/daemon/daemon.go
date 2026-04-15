@@ -65,9 +65,31 @@ func Run(ctx context.Context, log *slog.Logger) error {
 		return fmt.Errorf("register machine: %w", err)
 	}
 
+	// reconcileCh is a buffered channel (capacity 1) that signals the
+	// worker goroutine that reconciliation may be needed. The watch loop
+	// performs a non-blocking send on every relevant event; the buffer
+	// naturally coalesces bursts so the worker processes at most one
+	// reconciliation at a time. This keeps the watch loop free to drain
+	// events without backpressuring the API server's HTTP/2 stream.
+	reconcileCh := make(chan struct{}, 1)
+
+	// Worker goroutine: runs handleMachineEvent whenever signalled.
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-reconcileCh:
+				if err := handleMachineEvent(ctx, log, kubeClient, machineName); err != nil {
+					log.Error("reconciliation failed", "error", err)
+				}
+			}
+		}
+	}()
+
 	// Enter the watch loop.
 	for {
-		if err := watchMachine(ctx, log, kubeClient, machineName); err != nil {
+		if err := watchMachine(ctx, log, kubeClient, machineName, reconcileCh); err != nil {
 			if ctx.Err() != nil {
 				return nil // Graceful shutdown.
 			}
@@ -192,9 +214,11 @@ func buildMachineCR(cfg *provision.AgentConfig) v1alpha3.Machine {
 	}
 }
 
-// watchMachine establishes a watch on the named Machine CR and handles events
-// until the watch closes or the context is cancelled.
-func watchMachine(ctx context.Context, log *slog.Logger, wc client.WithWatch, machineName string) error {
+// watchMachine establishes a watch on the named Machine CR and signals the
+// reconcile channel on relevant events. It returns when the watch closes or
+// the context is cancelled. The actual reconciliation happens asynchronously
+// in the worker goroutine, keeping this loop free to drain the watch stream.
+func watchMachine(ctx context.Context, log *slog.Logger, wc client.WithWatch, machineName string, reconcileCh chan<- struct{}) error {
 	machineList := &v1alpha3.MachineList{}
 
 	watcher, err := wc.Watch(ctx, machineList, client.MatchingFields{"metadata.name": machineName})
@@ -234,30 +258,25 @@ func watchMachine(ctx context.Context, log *slog.Logger, wc client.WithWatch, ma
 				"version", machine.ResourceVersion,
 			)
 
-			if err := handleMachineEvent(ctx, log, wc, machine); err != nil {
-				log.Error("reconciliation failed", "error", err)
-				// Don't return - continue watching. The next event
-				// or a retry will attempt reconciliation again.
+			// Signal the worker goroutine. Non-blocking: if there
+			// is already a pending signal the buffer coalesces it.
+			select {
+			case reconcileCh <- struct{}{}:
+			default:
 			}
 		}
 	}
 }
 
-// handleMachineEvent processes a single Machine CR event, checking for drift
-// and performing reconciliation if needed.
-func handleMachineEvent(ctx context.Context, log *slog.Logger, c client.WithWatch, machine *v1alpha3.Machine) error {
-	// Re-read the Machine CR from the API server to get the latest status.
-	// The watch event object may be stale: during a reconciliation the
-	// daemon writes multiple status updates (Provisioning, then Joining
-	// with acknowledged counters), and earlier MODIFIED events may still
-	// be queued with pre-acknowledgement status. Using a fresh GET avoids
-	// spurious drift detection that would trigger a redundant update cycle.
-	fresh := &v1alpha3.Machine{}
-	if err := c.Get(ctx, client.ObjectKeyFromObject(machine), fresh); err != nil {
-		return fmt.Errorf("re-read Machine %q: %w", machine.Name, err)
+// handleMachineEvent processes a single reconciliation cycle. It reads the
+// current Machine CR from the API server, checks for drift, and performs
+// reconciliation if needed.
+func handleMachineEvent(ctx context.Context, log *slog.Logger, c client.WithWatch, machineName string) error {
+	// Read the Machine CR from the API server to get the latest state.
+	machine := &v1alpha3.Machine{}
+	if err := c.Get(ctx, client.ObjectKey{Name: machineName}, machine); err != nil {
+		return fmt.Errorf("get Machine %q: %w", machineName, err)
 	}
-
-	machine = fresh
 
 	// Re-read the active machine state on each event, because a previous
 	// reconciliation may have changed the active nspawn machine name.
