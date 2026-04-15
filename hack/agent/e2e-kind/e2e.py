@@ -7,20 +7,26 @@
 Creates a QEMU VM, joins it to a Kind cluster using the production
 provision install script, and validates workloads run on the new node.
 
+The test follows a single linear sequence:
+  1. Start node without a Machine CR (agent self-registers).
+  2. Wait for the node to become Ready.
+  3. Validate the Machine CR created by the agent.
+  4. Update the Machine CR version and reimage counter.
+  5. Wait for the node to be upgraded.
+  6. Reset the node.
+  7. Rejoin the node and validate again.
+
 Options:
     --verbose                          Enable diagnostic output (network diags).
 
 Subcommands (called as individual workflow steps):
     create-vm                          Create bridge networking and launch a QEMU VM.
-    recreate-vm                        Destroy and recreate VM with a fresh disk (keeps networking).
     ensure-kind-bridge                 Verify/repair veth pair connecting Kind to VM bridge.
     run-agent                          Build agent, generate bootstrap script, run on VM.
     wait-for-node                      Wait for the node to appear and become Ready.
     validate-workload                  Deploy test pods on the agent node.
     install-machine-crd                Install Machine CRD and bootstrapper RBAC.
-    create-machine-cr                  Pre-create a Machine CR for the agent node.
     delete-machine-cr                  Delete the Machine CR.
-    validate-machine-cr-preexisting    Verify agent preserved a pre-existing Machine CR.
     validate-machine-cr-created        Verify agent self-registered a Machine CR.
     validate-daemon                    Verify agent daemon is watching Machine CR and updates status.
     trigger-upgrade                    Patch Machine CR reimageCounter to trigger a node update.
@@ -407,26 +413,6 @@ def create_vm() -> None:
     else:
         log(f"Using existing image: {image_file}")
 
-    _launch_vm(ssh_pub_key)
-
-
-# ---------------------------------------------------------------------------
-# recreate-vm
-# ---------------------------------------------------------------------------
-def recreate_vm() -> None:
-    """Destroy and recreate the QEMU VM with a fresh disk.
-
-    Bridge networking, the TAP device, and the Kind cluster veth pair are
-    left intact.  Only the QEMU process and VM disk are replaced, giving
-    Case 2 a pristine VM with no state left over from Case 1.
-    """
-
-    if not SSH_KEY.exists():
-        die(f"SSH key not found: {SSH_KEY}. Run create-vm first.")
-
-    ssh_pub_key = SSH_KEY.with_suffix(".pub").read_text().strip()
-
-    _stop_qemu()
     _launch_vm(ssh_pub_key)
 
 
@@ -1075,32 +1061,6 @@ def install_machine_crd() -> None:
 
 
 # ---------------------------------------------------------------------------
-# create-machine-cr
-# ---------------------------------------------------------------------------
-def create_machine_cr() -> None:
-    """Pre-create a Machine CR for the agent node.
-
-    The CR is annotated with ``e2e-test/precreated: "true"`` so that
-    validate-machine-cr-preexisting can verify the agent left it untouched.
-    """
-
-    log(f"Pre-creating Machine CR '{AGENT_MACHINE_NAME}'...")
-
-    manifest = json.dumps({
-        "apiVersion": "unbounded-kube.io/v1alpha3",
-        "kind": "Machine",
-        "metadata": {
-            "name": AGENT_MACHINE_NAME,
-            "annotations": {"e2e-test/precreated": "true"},
-        },
-        "spec": {},
-    })
-    kubectl(["apply", "-f", "-"], input=manifest.encode())
-
-    log(f"Machine CR '{AGENT_MACHINE_NAME}' pre-created")
-
-
-# ---------------------------------------------------------------------------
 # delete-machine-cr
 # ---------------------------------------------------------------------------
 def delete_machine_cr() -> None:
@@ -1110,39 +1070,6 @@ def delete_machine_cr() -> None:
     run_quiet([KUBECTL, "delete", "machine", AGENT_MACHINE_NAME,
                "--ignore-not-found"], check=False)
     log(f"Machine CR '{AGENT_MACHINE_NAME}' deleted")
-
-
-# ---------------------------------------------------------------------------
-# validate-machine-cr-preexisting
-# ---------------------------------------------------------------------------
-def validate_machine_cr_preexisting() -> None:
-    """Validate the agent preserved a pre-existing Machine CR.
-
-    Asserts the Machine CR still exists and retains the
-    ``e2e-test/precreated`` annotation, proving the agent detected the
-    existing CR and skipped registration.
-    """
-
-    log(f"Validating pre-existing Machine CR '{AGENT_MACHINE_NAME}'...")
-
-    try:
-        machine_json = kubectl_capture([
-            "get", "machine", AGENT_MACHINE_NAME, "-o", "json",
-        ])
-    except subprocess.CalledProcessError:
-        die(f"Machine CR '{AGENT_MACHINE_NAME}' not found - expected pre-existing CR to still exist")
-
-    machine = json.loads(machine_json)
-    annotations = machine.get("metadata", {}).get("annotations", {})
-
-    if annotations.get("e2e-test/precreated") != "true":
-        die("e2e-test/precreated annotation missing - agent may have deleted and recreated the CR")
-
-    log("Machine CR still has e2e-test/precreated annotation")
-
-    log("============================================")
-    log("  Machine CR validation PASSED (preexisting)")
-    log("============================================")
 
 
 # ---------------------------------------------------------------------------
@@ -1637,15 +1564,12 @@ def cleanup() -> None:
 # ---------------------------------------------------------------------------
 COMMANDS = {
     "create-vm": create_vm,
-    "recreate-vm": recreate_vm,
     "ensure-kind-bridge": ensure_kind_bridge,
     "run-agent": run_agent,
     "wait-for-node": wait_for_node,
     "validate-workload": validate_workload,
     "install-machine-crd": install_machine_crd,
-    "create-machine-cr": create_machine_cr,
     "delete-machine-cr": delete_machine_cr,
-    "validate-machine-cr-preexisting": validate_machine_cr_preexisting,
     "validate-machine-cr-created": validate_machine_cr_created,
     "validate-daemon": validate_daemon,
     "trigger-upgrade": trigger_upgrade,
