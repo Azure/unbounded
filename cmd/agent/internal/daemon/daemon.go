@@ -146,7 +146,7 @@ func registerMachine(ctx context.Context, log *slog.Logger, c client.Client, cfg
 		)
 		return nil
 	} else if apimeta.IsNoMatchError(err) {
-		return fmt.Errorf("Machine CRD is not installed (machina not deployed?): %w", err)
+		return fmt.Errorf("machine CRD is not installed (machina not deployed?): %w", err)
 	} else if !apierrors.IsNotFound(err) {
 		return fmt.Errorf("get Machine CR %q: %w", machineName, err)
 	}
