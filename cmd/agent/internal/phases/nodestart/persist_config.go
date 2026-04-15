@@ -41,7 +41,17 @@ func (p *persistAppliedConfig) Do(_ context.Context) error {
 		return fmt.Errorf("write applied config to %s: %w", path, err)
 	}
 
-	p.log.Info("applied config persisted", "path", path)
+	// Write a SHA-256 sidecar file next to the config. Both files are
+	// written atomically via renameio so each is never half-written. A
+	// crash between the two writes leaves a missing sidecar, which the
+	// read path treats as a warning (not an error).
+	checksumPath := goalstates.AppliedConfigChecksumPath(p.machineName)
+	checksum := goalstates.ComputeChecksum(data)
+	if err := utilio.WriteFile(checksumPath, []byte(checksum+"\n"), 0o600); err != nil {
+		return fmt.Errorf("write checksum to %s: %w", checksumPath, err)
+	}
+
+	p.log.Info("applied config persisted", "path", path, "checksum_path", checksumPath)
 
 	return nil
 }

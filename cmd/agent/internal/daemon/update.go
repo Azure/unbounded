@@ -40,7 +40,11 @@ type ActiveMachine struct {
 // findActiveMachine scans the agent config directory for an applied config
 // file and returns the active machine name and config. Returns an error if
 // no applied config is found.
-func findActiveMachine() (*ActiveMachine, error) {
+//
+// After reading the config JSON, the function verifies the SHA-256 sidecar
+// checksum (if present). A missing sidecar is logged as a warning and not
+// treated as an error - see goalstates.VerifyChecksum for rationale.
+func findActiveMachine(log *slog.Logger) (*ActiveMachine, error) {
 	for _, name := range []string{goalstates.NSpawnMachineKube1, goalstates.NSpawnMachineKube2} {
 		path := goalstates.AppliedConfigPath(name)
 
@@ -51,6 +55,21 @@ func findActiveMachine() (*ActiveMachine, error) {
 
 		if err != nil {
 			return nil, fmt.Errorf("read applied config %s: %w", path, err)
+		}
+
+		// Verify the sidecar checksum before trusting the config data.
+		checksumPath := goalstates.AppliedConfigChecksumPath(name)
+		if err := goalstates.VerifyChecksum(data, checksumPath); err != nil {
+			return nil, fmt.Errorf("verify applied config checksum for %s: %w", name, err)
+		}
+
+		// If the sidecar file is missing, log a warning so operators
+		// know the integrity check was skipped.
+		if _, statErr := os.Stat(checksumPath); errors.Is(statErr, os.ErrNotExist) {
+			log.Warn("no checksum sidecar found, skipping integrity check",
+				"config_path", path,
+				"checksum_path", checksumPath,
+			)
 		}
 
 		var cfg provision.AgentConfig

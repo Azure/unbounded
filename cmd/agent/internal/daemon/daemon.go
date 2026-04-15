@@ -44,7 +44,7 @@ func Run(ctx context.Context, log *slog.Logger) error {
 // inject a fake.
 func run(ctx context.Context, log *slog.Logger, newClient kubeClientFunc) error {
 	// Find the active machine and its applied config.
-	active, err := findActiveMachine()
+	active, err := findActiveMachine(log)
 	if err != nil {
 		return fmt.Errorf("find active machine: %w", err)
 	}
@@ -297,7 +297,7 @@ func handleMachineEvent(ctx context.Context, log *slog.Logger, c client.WithWatc
 
 	// Re-read the active machine state on each event, because a previous
 	// reconciliation may have changed the active nspawn machine name.
-	active, err := findActiveMachine()
+	active, err := findActiveMachine(log)
 	if err != nil {
 		return fmt.Errorf("find active machine: %w", err)
 	}

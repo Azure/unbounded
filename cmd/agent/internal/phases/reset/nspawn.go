@@ -54,6 +54,9 @@ func (t *removeAppliedConfig) Do(_ context.Context) error {
 	path := goalstates.AppliedConfigPath(t.machineName)
 	removeFileIfExists(t.log, path)
 
+	checksumPath := goalstates.AppliedConfigChecksumPath(t.machineName)
+	removeFileIfExists(t.log, checksumPath)
+
 	return nil
 }
 
