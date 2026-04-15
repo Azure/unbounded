@@ -160,7 +160,7 @@ jobs:
       - name: Validate daemon watching Machine CR
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-daemon
 
-      # Trigger a reimage via the Machine CR and validate the daemon performs
+      # Trigger a repave via the Machine CR and validate the daemon performs
       # the nspawn machine update (kube1 -> kube2).
       - name: Trigger node upgrade via Machine CR
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose trigger-upgrade

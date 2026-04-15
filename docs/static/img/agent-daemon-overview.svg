@@ -29,12 +29,12 @@
   <text x="80" y="162" fill="#e4e4e7" font-size="11" font-weight="600">spec:</text>
   <text x="95" y="179" fill="#a0a0a8" font-size="10" font-family="'SF Mono', 'Fira Code', monospace">kubernetes.version</text>
   <text x="95" y="195" fill="#a0a0a8" font-size="10" font-family="'SF Mono', 'Fira Code', monospace">agent.image</text>
-  <text x="95" y="211" fill="#a0a0a8" font-size="10" font-family="'SF Mono', 'Fira Code', monospace">operations.reimageCounter: 1</text>
+  <text x="95" y="211" fill="#a0a0a8" font-size="10" font-family="'SF Mono', 'Fira Code', monospace">operations.repaveCounter: 1</text>
 
   <!-- status fields -->
   <text x="80" y="237" fill="#e4e4e7" font-size="11" font-weight="600">status:</text>
   <text x="95" y="254" fill="#a0a0a8" font-size="10" font-family="'SF Mono', 'Fira Code', monospace">phase: Ready</text>
-  <text x="95" y="270" fill="#a0a0a8" font-size="10" font-family="'SF Mono', 'Fira Code', monospace">operations.reimageCounter: 1</text>
+  <text x="95" y="270" fill="#a0a0a8" font-size="10" font-family="'SF Mono', 'Fira Code', monospace">operations.repaveCounter: 1</text>
   <text x="95" y="286" fill="#a0a0a8" font-size="10" font-family="'SF Mono', 'Fira Code', monospace">conditions: [NodeUpdated]</text>
 
   <!-- ═══════════════════════════════════════════════════ -->

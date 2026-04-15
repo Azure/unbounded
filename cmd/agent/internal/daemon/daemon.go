@@ -425,7 +425,7 @@ func hasOperationsDrift(machine *v1alpha3.Machine) bool {
 		return true
 	}
 
-	if specOps.ReimageCounter > statusOps.ReimageCounter {
+	if specOps.RepaveCounter > statusOps.RepaveCounter {
 		return true
 	}
 
@@ -442,7 +442,7 @@ func specVersion(machine *v1alpha3.Machine) string {
 	return ""
 }
 
-// acknowledgeOperations copies the spec reimage counter to status, marking
+// acknowledgeOperations copies the spec repave counter to status, marking
 // it as acted upon. The reboot counter is not acknowledged here because
 // reboots are handled separately.
 func acknowledgeOperations(machine *v1alpha3.Machine) {
@@ -454,7 +454,7 @@ func acknowledgeOperations(machine *v1alpha3.Machine) {
 		machine.Status.Operations = &v1alpha3.OperationsStatus{}
 	}
 
-	machine.Status.Operations.ReimageCounter = machine.Spec.Operations.ReimageCounter
+	machine.Status.Operations.RepaveCounter = machine.Spec.Operations.RepaveCounter
 }
 
 // updateMachinePhase sets the Machine phase, message, and a corresponding

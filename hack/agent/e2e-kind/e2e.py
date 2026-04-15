@@ -11,7 +11,7 @@ The test follows a single linear sequence:
   1. Start node without a Machine CR (agent self-registers).
   2. Wait for the node to become Ready.
   3. Validate the Machine CR created by the agent.
-  4. Update the Machine CR version and reimage counter.
+   4. Update the Machine CR version and repave counter.
   5. Wait for the node to be upgraded.
   6. Reset the node.
   7. Rejoin the node and validate again.
@@ -29,7 +29,7 @@ Subcommands (called as individual workflow steps):
     delete-machine-cr                  Delete the Machine CR.
     validate-machine-cr-created        Verify agent self-registered a Machine CR.
     validate-daemon                    Verify agent daemon is watching Machine CR and updates status.
-    trigger-upgrade                    Patch Machine CR reimageCounter to trigger a node update.
+    trigger-upgrade                    Patch Machine CR repaveCounter to trigger a node update.
     validate-upgrade                   Wait for node update to complete and verify status.
     reset-agent                        Run agent reset and verify cleanup.
     cleanup                            Tear down VM, networking, and Kind cluster.
@@ -1231,11 +1231,11 @@ def _bump_patch_version(version: str) -> str:
 
 
 def trigger_upgrade() -> None:
-    """Patch the Machine CR to trigger a version upgrade via reimageCounter.
+    """Patch the Machine CR to trigger a version upgrade via repaveCounter.
 
     Reads the current Kubernetes version from the node, bumps the patch
     component (e.g. v1.33.1 -> v1.33.2), and patches the Machine CR with
-    both spec.kubernetes.version and spec.operations.reimageCounter=1.
+    both spec.kubernetes.version and spec.operations.repaveCounter=1.
     The daemon detects both spec drift and operations drift and triggers
     nodeupdate.Execute().
     """
@@ -1263,7 +1263,7 @@ def trigger_upgrade() -> None:
     if result.returncode == 0:
         log(f"Applied config files before upgrade: {result.stdout.strip()}")
 
-    # Patch the Machine CR to set the new version and reimageCounter = 1.
+    # Patch the Machine CR to set the new version and repaveCounter = 1.
     # The CRD requires spec.kubernetes.bootstrapTokenRef when
     # spec.kubernetes is present, so we include a placeholder value.
     patch = json.dumps({
@@ -1275,7 +1275,7 @@ def trigger_upgrade() -> None:
                 },
             },
             "operations": {
-                "reimageCounter": 1,
+                "repaveCounter": 1,
             },
         },
     })
@@ -1283,7 +1283,7 @@ def trigger_upgrade() -> None:
              "--type=merge", "-p", patch])
 
     log(f"Machine CR patched: spec.kubernetes.version={upgrade_version}, "
-        f"spec.operations.reimageCounter=1")
+        f"spec.operations.repaveCounter=1")
 
     # Show the Machine CR state after patch.
     kubectl(["get", "machine", AGENT_MACHINE_NAME, "-o", "yaml"])
@@ -1297,7 +1297,7 @@ def validate_upgrade() -> None:
 
     Checks:
     1. The node goes through NotReady (update in progress) and comes back Ready.
-    2. Machine CR status.operations.reimageCounter == 1 (counter acknowledged).
+    2. Machine CR status.operations.repaveCounter == 1 (counter acknowledged).
     3. Machine CR status.phase == "Joining".
     4. Machine CR has NodeUpdated condition with status True.
     5. The active nspawn machine switched (kube1 -> kube2 or vice versa).
@@ -1396,9 +1396,9 @@ def validate_upgrade() -> None:
         machine = json.loads(machine_json.stdout)
         status = machine.get("status", {})
 
-        # Check reimageCounter acknowledgement.
+        # Check repaveCounter acknowledgement.
         ops_status = status.get("operations", {})
-        reimage_counter = ops_status.get("reimageCounter", 0)
+        repave_counter = ops_status.get("repaveCounter", 0)
 
         # Check phase.
         phase = status.get("phase", "")
@@ -1411,7 +1411,7 @@ def validate_upgrade() -> None:
                 node_updated = cond
                 break
 
-        if (reimage_counter == 1
+        if (repave_counter == 1
                 and phase in ("Joining", "Ready")
                 and node_updated is not None
                 and node_updated.get("status") == "True"
@@ -1420,7 +1420,7 @@ def validate_upgrade() -> None:
             break
 
         if elapsed > 0 and elapsed % 15 == 0:
-            log(f"  ({elapsed}s) phase={phase}, reimageCounter={reimage_counter}, "
+            log(f"  ({elapsed}s) phase={phase}, repaveCounter={repave_counter}, "
                 f"NodeUpdated={node_updated}")
         time.sleep(5)
         elapsed += 5
@@ -1432,7 +1432,7 @@ def validate_upgrade() -> None:
 
     log(f"Machine CR status validated:")
     log(f"  phase: {phase}")
-    log(f"  operations.reimageCounter: {reimage_counter}")
+    log(f"  operations.repaveCounter: {repave_counter}")
     log(f"  NodeUpdated: status={node_updated['status']}, reason={node_updated['reason']}")
 
     # Phase 4: Verify the active nspawn machine switched.

@@ -95,19 +95,19 @@ by config field changes alone:
 
 | Machine CR field | Condition | Trigger |
 |---|---|---|
-| `spec.operations.reimageCounter` | `> status.operations.reimageCounter` | Reimage requested |
+| `spec.operations.repaveCounter` | `> status.operations.repaveCounter` | Repave requested |
 
 Once triggered, the update flow compares the desired config against the
 applied config to decide whether a rootfs reprovision is actually needed.
 
-After successful reconciliation, only the reimage counter is acknowledged
+After successful reconciliation, only the repave counter is acknowledged
 (copied from spec to status). The reboot counter is not acknowledged by the
 daemon.
 
 Example steps for triggering a node update:
 
 1. Update `spec.kubernetes.version` to the desired Kubernetes version.
-2. Increment `spec.operations.reimageCounter`.
+2. Increment `spec.operations.repaveCounter`.
 3. Wait for `status.phase` to reach `Joining` (or `Ready` once the machina
    controller observes the Node).
 
@@ -160,7 +160,7 @@ When operation counter drift is detected:
 5. On success, the daemon updates Machine CR status:
    - Sets `status.phase` to `Joining` (the machina controller transitions
      to `Ready` once the Node object appears)
-   - Copies the reimage counter from spec to status (acknowledging the
+    - Copies the repave counter from spec to status (acknowledging the
      operation)
    - Sets a `NodeUpdated` condition to `True` / `Succeeded`
 6. On failure, the daemon sets `status.phase` to `Failed` with an error

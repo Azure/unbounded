@@ -234,7 +234,7 @@ python3 "$E2E" $E2E_VERBOSE validate-machine-cr-created
 python3 "$E2E" $E2E_VERBOSE validate-daemon
 
 # ---------------------------------------------------------------------------
-# Upgrade: trigger reimage via Machine CR
+# Upgrade: trigger repave via Machine CR
 # ---------------------------------------------------------------------------
 echo ""
 echo "============================================"
