@@ -58,16 +58,17 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
+          # Install sushy-tools via pip in the background while apt-get
+          # installs system packages.  pip3 is already available on the
+          # runner image so this does not depend on apt-get.
+          sudo pip3 install --break-system-packages --ignore-installed sushy-tools &
+          PIP_PID=$!
           sudo apt-get install -y --no-install-recommends \
             dnsmasq qemu-kvm libvirt-daemon-system libvirt-clients virtinst \
             ovmf qemu-utils swtpm swtpm-tools \
             python3-pip python3-yaml cpio iptables
-
-      - name: Start libvirt
-        run: sudo systemctl start libvirtd
-
-      - name: Install sushy-tools
-        run: sudo pip3 install --break-system-packages --ignore-installed sushy-tools
+          sudo systemctl start libvirtd
+          wait "$PIP_PID"
 
       - name: Set up Docker Buildx
         id: buildx
