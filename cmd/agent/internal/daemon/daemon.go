@@ -16,6 +16,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
@@ -65,31 +66,24 @@ func Run(ctx context.Context, log *slog.Logger) error {
 		return fmt.Errorf("register machine: %w", err)
 	}
 
-	// reconcileCh is a buffered channel (capacity 1) that signals the
-	// worker goroutine that reconciliation may be needed. The watch loop
-	// performs a non-blocking send on every relevant event; the buffer
-	// naturally coalesces bursts so the worker processes at most one
-	// reconciliation at a time. This keeps the watch loop free to drain
-	// events without backpressuring the API server's HTTP/2 stream.
-	reconcileCh := make(chan struct{}, 1)
+	// Use client-go's rate-limiting workqueue to decouple the watch loop
+	// from reconciliation. The watch loop adds the machine name on every
+	// relevant event; the queue deduplicates and rate-limits so the
+	// worker processes at most one reconciliation at a time. This keeps
+	// the watch loop free to drain events without backpressuring the API
+	// server's HTTP/2 stream.
+	queue := workqueue.NewTypedRateLimitingQueueWithConfig(
+		workqueue.DefaultTypedControllerRateLimiter[string](),
+		workqueue.TypedRateLimitingQueueConfig[string]{Name: "machine"},
+	)
+	defer queue.ShutDown()
 
-	// Worker goroutine: runs handleMachineEvent whenever signalled.
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-reconcileCh:
-				if err := handleMachineEvent(ctx, log, kubeClient, machineName); err != nil {
-					log.Error("reconciliation failed", "error", err)
-				}
-			}
-		}
-	}()
+	// Worker goroutine: processes items from the queue.
+	go runWorker(ctx, log, kubeClient, queue)
 
 	// Enter the watch loop.
 	for {
-		if err := watchMachine(ctx, log, kubeClient, machineName, reconcileCh); err != nil {
+		if err := watchMachine(ctx, log, kubeClient, machineName, queue); err != nil {
 			if ctx.Err() != nil {
 				return nil // Graceful shutdown.
 			}
@@ -102,6 +96,25 @@ func Run(ctx context.Context, log *slog.Logger) error {
 			case <-time.After(watchRetryInterval):
 			}
 		}
+	}
+}
+
+// runWorker drains the workqueue, processing one item at a time.
+func runWorker(ctx context.Context, log *slog.Logger, c client.WithWatch, queue workqueue.TypedRateLimitingInterface[string]) {
+	for {
+		key, shutdown := queue.Get()
+		if shutdown {
+			return
+		}
+
+		if err := handleMachineEvent(ctx, log, c, key); err != nil {
+			log.Error("reconciliation failed, requeuing", "error", err)
+			queue.AddRateLimited(key)
+		} else {
+			queue.Forget(key)
+		}
+
+		queue.Done(key)
 	}
 }
 
@@ -214,11 +227,11 @@ func buildMachineCR(cfg *provision.AgentConfig) v1alpha3.Machine {
 	}
 }
 
-// watchMachine establishes a watch on the named Machine CR and signals the
-// reconcile channel on relevant events. It returns when the watch closes or
-// the context is cancelled. The actual reconciliation happens asynchronously
-// in the worker goroutine, keeping this loop free to drain the watch stream.
-func watchMachine(ctx context.Context, log *slog.Logger, wc client.WithWatch, machineName string, reconcileCh chan<- struct{}) error {
+// watchMachine establishes a watch on the named Machine CR and enqueues the
+// machine name on relevant events. It returns when the watch closes or the
+// context is cancelled. The actual reconciliation happens asynchronously via
+// the workqueue, keeping this loop free to drain the watch stream.
+func watchMachine(ctx context.Context, log *slog.Logger, wc client.WithWatch, machineName string, queue workqueue.TypedRateLimitingInterface[string]) error {
 	machineList := &v1alpha3.MachineList{}
 
 	watcher, err := wc.Watch(ctx, machineList, client.MatchingFields{"metadata.name": machineName})
@@ -258,12 +271,10 @@ func watchMachine(ctx context.Context, log *slog.Logger, wc client.WithWatch, ma
 				"version", machine.ResourceVersion,
 			)
 
-			// Signal the worker goroutine. Non-blocking: if there
-			// is already a pending signal the buffer coalesces it.
-			select {
-			case reconcileCh <- struct{}{}:
-			default:
-			}
+			// Enqueue the machine name. The workqueue deduplicates:
+			// if the name is already queued or being processed, this
+			// is a no-op.
+			queue.Add(machineName)
 		}
 	}
 }
