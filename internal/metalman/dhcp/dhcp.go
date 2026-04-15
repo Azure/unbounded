@@ -33,6 +33,12 @@ type BootstrapConfig struct {
 	// objects. It must be non-nil.
 	Client client.Client
 
+	// APIReader is an uncached reader used for the MAC double-check
+	// before creating a Machine. Using a direct API read avoids the
+	// informer cache propagation delay that could miss recently
+	// created Machines.
+	APIReader client.Reader
+
 	// Image is the OCI image reference to set on bootstrapped Machines
 	// (e.g. "ghcr.io/azure/images/host-ubuntu2404:v1").
 	Image string
@@ -272,14 +278,21 @@ func (s *Server) bootstrapMachine(ctx context.Context, log *slog.Logger, mac str
 	// the caller's List and this point (e.g. by a concurrent handler
 	// that just finished, or an external actor).
 	var existing v1alpha3.MachineList
-	if err := s.Bootstrap.Client.List(ctx, &existing, client.MatchingFields{indexing.IndexNodeByMAC: mac}); err != nil {
-		log.Error("bootstrap: re-checking MAC index", "err", err)
+	if err := s.Bootstrap.APIReader.List(ctx, &existing); err != nil {
+		log.Error("bootstrap: re-checking MAC via API", "err", err)
 		return
 	}
 
-	if len(existing.Items) > 0 {
-		log.Info("bootstrap: Machine already exists for MAC", "machine", existing.Items[0].Name)
-		return
+	for i := range existing.Items {
+		if existing.Items[i].Spec.PXE == nil {
+			continue
+		}
+		for _, lease := range existing.Items[i].Spec.PXE.DHCPLeases {
+			if strings.EqualFold(lease.MAC, mac) {
+				log.Info("bootstrap: Machine already exists for MAC", "machine", existing.Items[i].Name)
+				return
+			}
+		}
 	}
 
 	machine := &v1alpha3.Machine{

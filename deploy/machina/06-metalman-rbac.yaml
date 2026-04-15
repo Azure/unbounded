@@ -113,10 +113,10 @@ rules:
   - apiGroups: ["unbounded-kube.io"]
     resources: ["machines/status"]
     verbs: ["update"]
-  # Site (unbounded-net) - read for IP auto-allocation
+  # Site (unbounded-net) - read and watch for IP auto-allocation
   - apiGroups: ["net.unbounded-kube.io"]
     resources: ["sites"]
-    verbs: ["get"]
+    verbs: ["get", "list", "watch"]
   # Secrets (Redfish passwords)
   - apiGroups: [""]
     resources: ["secrets"]

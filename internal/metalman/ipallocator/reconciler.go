@@ -28,9 +28,12 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
+	"github.com/Azure/unbounded-kube/internal/metalman/indexing"
 )
 
 const siteLabel = "unbounded-kube.io/site"
@@ -44,10 +47,19 @@ var siteGVR = schema.GroupVersionResource{
 // Reconciler watches Machine resources and fills in incomplete DHCP
 // leases from the matching unbounded-net Site object.
 type Reconciler struct {
-	Client client.Client
+	Client    client.Client
+	APIReader client.Reader
 }
 
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// Build an unstructured object to watch Site resources.
+	siteObj := &unstructured.Unstructured{}
+	siteObj.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   siteGVR.Group,
+		Version: siteGVR.Version,
+		Kind:    "Site",
+	})
+
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("ipallocator").
 		For(&v1alpha3.Machine{}).
@@ -65,7 +77,30 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 				return needsAllocation(e.Object)
 			},
 		}).
+		Watches(siteObj, handler.EnqueueRequestsFromMapFunc(r.machinesForSite)).
 		Complete(r)
+}
+
+// machinesForSite maps a Site event to all Machines that reference
+// that Site via the unbounded-kube.io/site label and have incomplete
+// DHCP leases.
+func (r *Reconciler) machinesForSite(ctx context.Context, obj client.Object) []reconcile.Request {
+	var machines v1alpha3.MachineList
+	if err := r.Client.List(ctx, &machines, client.MatchingLabels{siteLabel: obj.GetName()}); err != nil {
+		slog.Error("ipallocator: listing machines for site", "site", obj.GetName(), "err", err)
+		return nil
+	}
+
+	var requests []reconcile.Request
+	for _, m := range machines.Items {
+		if needsAllocation(&m) {
+			requests = append(requests, reconcile.Request{
+				NamespacedName: client.ObjectKeyFromObject(&m),
+			})
+		}
+	}
+
+	return requests
 }
 
 // needsAllocation returns true if the Machine has at least one DHCP
@@ -163,13 +198,35 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		}
 
 		if lease.IPv4 == "" {
-			ip, err := randomAvailableIP(subnet, allocated)
-			if err != nil {
-				return ctrl.Result{}, fmt.Errorf("allocating IP for MAC %s: %w", lease.MAC, err)
+			var chosen net.IP
+			for attempt := uint32(0); attempt < subnetSize(subnet); attempt++ {
+				candidate, err := randomAvailableIP(subnet, allocated)
+				if err != nil {
+					return ctrl.Result{}, fmt.Errorf("allocating IP for MAC %s: %w", lease.MAC, err)
+				}
+
+				// Verify against the live index to guard against races
+				// with other concurrent reconciles.
+				var existing v1alpha3.MachineList
+				if err := r.Client.List(ctx, &existing, client.MatchingFields{indexing.IndexNodeByIP: candidate.String()}); err != nil {
+					return ctrl.Result{}, fmt.Errorf("checking IP index for %s: %w", candidate, err)
+				}
+
+				if len(existing.Items) == 0 {
+					chosen = candidate
+					break
+				}
+
+				// IP is taken; mark it and try again.
+				allocated[candidate.String()] = true
 			}
 
-			lease.IPv4 = ip.String()
-			allocated[ip.String()] = true
+			if chosen == nil {
+				return ctrl.Result{}, fmt.Errorf("no available addresses in subnet %s for MAC %s", subnet, lease.MAC)
+			}
+
+			lease.IPv4 = chosen.String()
+			allocated[chosen.String()] = true
 			changed = true
 
 			log.Info("allocated IP for DHCP lease",
@@ -204,7 +261,7 @@ func (r *Reconciler) fetchSiteInfo(ctx context.Context, name string) (*siteInfo,
 		Kind:    "Site",
 	})
 
-	if err := r.Client.Get(ctx, client.ObjectKey{Name: name}, &site); err != nil {
+	if err := r.APIReader.Get(ctx, client.ObjectKey{Name: name}, &site); err != nil {
 		return nil, fmt.Errorf("getting Site %q: %w", name, err)
 	}
 

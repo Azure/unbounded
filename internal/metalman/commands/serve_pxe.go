@@ -207,7 +207,7 @@ func ServePXECmd() *cobra.Command {
 				return fmt.Errorf("setting up CloudInit reconciler: %w", err)
 			}
 
-			if err := (&ipallocator.Reconciler{Client: mgr.GetClient()}).SetupWithManager(mgr); err != nil {
+			if err := (&ipallocator.Reconciler{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader()}).SetupWithManager(mgr); err != nil {
 				return fmt.Errorf("setting up IP allocator reconciler: %w", err)
 			}
 
@@ -255,9 +255,10 @@ func ServePXECmd() *cobra.Command {
 
 			if bootstrap {
 				dhcpServer.Bootstrap = &dhcp.BootstrapConfig{
-					Client: mgr.GetClient(),
-					Image:  bootstrapImage,
-					Site:   site,
+					Client:    mgr.GetClient(),
+					APIReader: mgr.GetAPIReader(),
+					Image:     bootstrapImage,
+					Site:      site,
 				}
 			}
 

@@ -18,6 +18,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
+	"github.com/Azure/unbounded-kube/internal/metalman/indexing"
 )
 
 // --- helper functions for IP math ---
@@ -227,6 +228,7 @@ func newFakeClient(t *testing.T, objs ...client.Object) client.Client {
 		WithScheme(scheme).
 		WithObjects(objs...).
 		WithStatusSubresource(&v1alpha3.Machine{}).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
 		Build()
 }
 
@@ -279,9 +281,10 @@ func TestReconcileAllocatesIP(t *testing.T) {
 		WithScheme(scheme).
 		WithObjects(machine, site).
 		WithStatusSubresource(&v1alpha3.Machine{}).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
 		Build()
 
-	r := &Reconciler{Client: cl}
+	r := &Reconciler{Client: cl, APIReader: cl}
 
 	_, err := r.Reconcile(context.Background(), reconcile.Request{
 		NamespacedName: types.NamespacedName{Name: "node-01"},
@@ -345,7 +348,7 @@ func TestReconcileSkipsFullySpecifiedLease(t *testing.T) {
 
 	cl := newFakeClient(t, machine)
 
-	r := &Reconciler{Client: cl}
+	r := &Reconciler{Client: cl, APIReader: cl}
 
 	_, err := r.Reconcile(context.Background(), reconcile.Request{
 		NamespacedName: types.NamespacedName{Name: "node-01"},
@@ -412,9 +415,10 @@ func TestReconcileAvoidsExistingAllocations(t *testing.T) {
 		WithScheme(scheme).
 		WithObjects(existing, newMachine, site).
 		WithStatusSubresource(&v1alpha3.Machine{}).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
 		Build()
 
-	r := &Reconciler{Client: cl}
+	r := &Reconciler{Client: cl, APIReader: cl}
 
 	_, err := r.Reconcile(context.Background(), reconcile.Request{
 		NamespacedName: types.NamespacedName{Name: "new-node"},
@@ -442,7 +446,7 @@ func TestReconcileNoSiteLabel(t *testing.T) {
 
 	cl := newFakeClient(t, machine)
 
-	r := &Reconciler{Client: cl}
+	r := &Reconciler{Client: cl, APIReader: cl}
 
 	_, err := r.Reconcile(context.Background(), reconcile.Request{
 		NamespacedName: types.NamespacedName{Name: "node-no-site"},
@@ -471,7 +475,7 @@ func TestReconcileNoPXE(t *testing.T) {
 
 	cl := newFakeClient(t, machine)
 
-	r := &Reconciler{Client: cl}
+	r := &Reconciler{Client: cl, APIReader: cl}
 
 	_, err := r.Reconcile(context.Background(), reconcile.Request{
 		NamespacedName: types.NamespacedName{Name: "node-no-pxe"},
@@ -511,9 +515,10 @@ func TestReconcilePartialLease(t *testing.T) {
 		WithScheme(scheme).
 		WithObjects(machine, site).
 		WithStatusSubresource(&v1alpha3.Machine{}).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
 		Build()
 
-	r := &Reconciler{Client: cl}
+	r := &Reconciler{Client: cl, APIReader: cl}
 
 	_, err := r.Reconcile(context.Background(), reconcile.Request{
 		NamespacedName: types.NamespacedName{Name: "node-partial"},
@@ -571,9 +576,10 @@ func TestReconcileMultipleLeases(t *testing.T) {
 		WithScheme(scheme).
 		WithObjects(machine, site).
 		WithStatusSubresource(&v1alpha3.Machine{}).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
 		Build()
 
-	r := &Reconciler{Client: cl}
+	r := &Reconciler{Client: cl, APIReader: cl}
 
 	_, err := r.Reconcile(context.Background(), reconcile.Request{
 		NamespacedName: types.NamespacedName{Name: "node-multi"},
@@ -603,7 +609,7 @@ func TestReconcileDeletedMachine(t *testing.T) {
 	// Reconciling a deleted Machine should be a no-op.
 	cl := newFakeClient(t)
 
-	r := &Reconciler{Client: cl}
+	r := &Reconciler{Client: cl, APIReader: cl}
 
 	_, err := r.Reconcile(context.Background(), reconcile.Request{
 		NamespacedName: types.NamespacedName{Name: "deleted-node"},
@@ -641,9 +647,10 @@ func TestReconcileIdempotent(t *testing.T) {
 		WithScheme(scheme).
 		WithObjects(machine, site).
 		WithStatusSubresource(&v1alpha3.Machine{}).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
 		Build()
 
-	r := &Reconciler{Client: cl}
+	r := &Reconciler{Client: cl, APIReader: cl}
 
 	// First reconcile.
 	_, err := r.Reconcile(context.Background(), reconcile.Request{
@@ -707,9 +714,10 @@ func TestReconcileIPv6OnlyNodeCidrs(t *testing.T) {
 		WithScheme(scheme).
 		WithObjects(machine, site).
 		WithStatusSubresource(&v1alpha3.Machine{}).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
 		Build()
 
-	r := &Reconciler{Client: cl}
+	r := &Reconciler{Client: cl, APIReader: cl}
 
 	_, err := r.Reconcile(context.Background(), reconcile.Request{
 		NamespacedName: types.NamespacedName{Name: "node-ipv6"},

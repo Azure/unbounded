@@ -590,9 +590,10 @@ func TestDHCPHandlerBootstrapCreatesMachine(t *testing.T) {
 		Reader:    fc,
 		ServerIP:  serverIP,
 		Bootstrap: &BootstrapConfig{
-			Client: fc,
-			Image:  "ghcr.io/test/bootstrap:v1",
-			Site:   "rack-a",
+			Client:    fc,
+			APIReader: fc,
+			Image:     "ghcr.io/test/bootstrap:v1",
+			Site:      "rack-a",
 		},
 	}
 
@@ -659,8 +660,9 @@ func TestDHCPHandlerBootstrapNoSiteLabel(t *testing.T) {
 		Reader:    fc,
 		ServerIP:  serverIP,
 		Bootstrap: &BootstrapConfig{
-			Client: fc,
-			Image:  "ghcr.io/test/bootstrap:v1",
+			Client:    fc,
+			APIReader: fc,
+			Image:     "ghcr.io/test/bootstrap:v1",
 			// Site intentionally left empty.
 		},
 	}
@@ -715,8 +717,9 @@ func TestDHCPHandlerBootstrapSkipsExistingMAC(t *testing.T) {
 		Reader:    fc,
 		ServerIP:  serverIP,
 		Bootstrap: &BootstrapConfig{
-			Client: fc,
-			Image:  "ghcr.io/test/bootstrap:v1",
+			Client:    fc,
+			APIReader: fc,
+			Image:     "ghcr.io/test/bootstrap:v1",
 		},
 	}
 
@@ -793,8 +796,9 @@ func TestDHCPHandlerBootstrapDeduplicatesConcurrent(t *testing.T) {
 		Reader:    fc,
 		ServerIP:  serverIP,
 		Bootstrap: &BootstrapConfig{
-			Client: fc,
-			Image:  "ghcr.io/test/bootstrap:v1",
+			Client:    fc,
+			APIReader: fc,
+			Image:     "ghcr.io/test/bootstrap:v1",
 		},
 	}
 
