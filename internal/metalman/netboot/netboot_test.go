@@ -2392,9 +2392,10 @@ func TestCloudInitCondition_FailurePreservedOnSubsequentStart(t *testing.T) {
 		t.Errorf("reason after subsequent success: got %q, want %q (failure should be preserved)", cond.Reason, "Failed")
 	}
 
-	// Step 4: Overall modules-final finishes with FAIL - this is also a
-	// Failed condition, so it IS allowed to update (but the first failure
-	// message is already preserved since we keep the first Failed reason).
+	// Step 4: Overall modules-final finishes with FAIL - because we
+	// preserve the first failure for the current generation, even this
+	// Failed event is skipped; the original sub-module error message
+	// remains for easier debugging.
 	sendEvent(`{"name":"modules-final","description":"running modules for final","event_type":"finish","origin":"cloudinit","timestamp":4.0,"result":"FAIL"}`)
 
 	if err := fc.Get(t.Context(), client.ObjectKeyFromObject(node), &updated); err != nil {
@@ -2406,6 +2407,31 @@ func TestCloudInitCondition_FailurePreservedOnSubsequentStart(t *testing.T) {
 	}
 	if cond.Reason != "Failed" {
 		t.Errorf("reason after overall FAIL: got %q, want %q", cond.Reason, "Failed")
+	}
+	if !strings.Contains(cond.Message, "config-scripts_user") {
+		t.Errorf("message %q should still contain original sub-module failure, not the generic stage failure", cond.Message)
+	}
+
+	// Step 5: After a generation bump (simulating a reimage), the Failed
+	// condition from the old generation should no longer block updates.
+	if err := fc.Get(t.Context(), client.ObjectKeyFromObject(node), &updated); err != nil {
+		t.Fatalf("getting node before generation bump: %v", err)
+	}
+	updated.Generation = 2
+	if err := fc.Update(t.Context(), &updated); err != nil {
+		t.Fatalf("bumping generation: %v", err)
+	}
+	sendEvent(`{"name":"modules-config","description":"running modules for config","event_type":"start","origin":"cloudinit","timestamp":5.0}`)
+
+	if err := fc.Get(t.Context(), client.ObjectKeyFromObject(node), &updated); err != nil {
+		t.Fatalf("getting updated node after generation bump: %v", err)
+	}
+	cond = findCondition(updated.Status.Conditions, v1alpha3.MachineConditionCloudInitDone)
+	if cond == nil {
+		t.Fatal("expected CloudInitDone condition after generation bump")
+	}
+	if cond.Reason != "Running" {
+		t.Errorf("reason after generation bump: got %q, want %q (new generation should allow updates)", cond.Reason, "Running")
 	}
 }
 
