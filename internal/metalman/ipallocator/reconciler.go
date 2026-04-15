@@ -47,8 +47,7 @@ var siteGVR = schema.GroupVersionResource{
 // Reconciler watches Machine resources and fills in incomplete DHCP
 // leases from the matching unbounded-net Site object.
 type Reconciler struct {
-	Client    client.Client
-	APIReader client.Reader
+	Client client.Client
 }
 
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -261,7 +260,7 @@ func (r *Reconciler) fetchSiteInfo(ctx context.Context, name string) (*siteInfo,
 		Kind:    "Site",
 	})
 
-	if err := r.APIReader.Get(ctx, client.ObjectKey{Name: name}, &site); err != nil {
+	if err := r.Client.Get(ctx, client.ObjectKey{Name: name}, &site); err != nil {
 		return nil, fmt.Errorf("getting Site %q: %w", name, err)
 	}
 

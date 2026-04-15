@@ -207,7 +207,7 @@ func ServePXECmd() *cobra.Command {
 				return fmt.Errorf("setting up CloudInit reconciler: %w", err)
 			}
 
-			if err := (&ipallocator.Reconciler{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader()}).SetupWithManager(mgr); err != nil {
+			if err := (&ipallocator.Reconciler{Client: mgr.GetClient()}).SetupWithManager(mgr); err != nil {
 				return fmt.Errorf("setting up IP allocator reconciler: %w", err)
 			}
 
