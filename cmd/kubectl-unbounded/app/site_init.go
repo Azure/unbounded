@@ -29,7 +29,7 @@ import (
 var siteTemplates embed.FS
 
 const (
-	unboundedCNIRelease = "https://github.com/Azure/unbounded-net/releases/download/v1.1.2/unbounded-net-manifests-v1.1.2.tar.gz"
+	unboundedCNIRelease = "https://unboundednet.blob.core.windows.net/manifests/unbounded-net-manifests-v1.2.2.tar.gz"
 )
 
 // siteInitHandler is responsible for handling initial unbounded-kube bootstrap and also ensuring a site
