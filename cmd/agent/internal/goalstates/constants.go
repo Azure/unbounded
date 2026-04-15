@@ -7,11 +7,11 @@ import "fmt"
 
 const (
 	// ConfigDir is the host-level configuration directory for unbounded-kube.
-	ConfigDir = "/etc/unbounded-kube"
+	ConfigDir = "/etc/unbounded/kube"
 
 	// AgentConfigDir is the host-level configuration directory for the
 	// unbounded-agent. Applied config files are persisted here.
-	AgentConfigDir = "/etc/unbounded-agent"
+	AgentConfigDir = "/etc/unbounded/agent"
 
 	SystemdNSpawnDir = "/etc/systemd/nspawn"
 	SystemdSystemDir = "/etc/systemd/system"
@@ -45,7 +45,7 @@ func AlternateMachine(current string) string {
 }
 
 // AppliedConfigPath returns the path to the applied config file for the
-// given nspawn machine name, e.g. /etc/unbounded-agent/kube1-applied-config.json.
+// given nspawn machine name, e.g. /etc/unbounded/agent/kube1-applied-config.json.
 func AppliedConfigPath(machineName string) string {
 	return fmt.Sprintf("%s/%s-applied-config.json", AgentConfigDir, machineName)
 }

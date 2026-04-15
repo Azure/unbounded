@@ -27,8 +27,8 @@ func TestAppliedConfigPath(t *testing.T) {
 		machine  string
 		expected string
 	}{
-		{NSpawnMachineKube1, "/etc/unbounded-agent/kube1-applied-config.json"},
-		{NSpawnMachineKube2, "/etc/unbounded-agent/kube2-applied-config.json"},
+		{NSpawnMachineKube1, "/etc/unbounded/agent/kube1-applied-config.json"},
+		{NSpawnMachineKube2, "/etc/unbounded/agent/kube2-applied-config.json"},
 	}
 
 	for _, tt := range tests {

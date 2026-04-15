@@ -28,7 +28,7 @@ Control Plane                         Agent Host
 |     version     | +-----------+  +--+ bootstrap token   |
 |   agent:        | |           |     |                   |
 |     image       | | API Server|     | applied config    |
-|   operations:   | |           |     | /etc/unbounded-   |
+|   operations:   | |           |     | /etc/unbounded/   |
 |     reboot: 2   | +-----------+     |   agent/kube1-    |
 |     reimage: 1  |                   |   applied-config  |
 | status:         |                   |   .json           |

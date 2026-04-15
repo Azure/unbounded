@@ -1257,7 +1257,7 @@ def trigger_upgrade() -> None:
     # so validate-upgrade can confirm it switched.
     result = subprocess.run(
         ["ssh", *SSH_OPTS, SSH_TARGET,
-         "sudo ls /etc/unbounded-agent/"],
+         "sudo ls /etc/unbounded/agent/"],
         capture_output=True, text=True,
     )
     if result.returncode == 0:
@@ -1439,7 +1439,7 @@ def validate_upgrade() -> None:
     log("Phase 4: Verifying nspawn machine switched...")
     result = subprocess.run(
         ["ssh", *SSH_OPTS, SSH_TARGET,
-         "sudo ls /etc/unbounded-agent/"],
+         "sudo ls /etc/unbounded/agent/"],
         capture_output=True, text=True,
     )
     if result.returncode == 0:
@@ -1486,8 +1486,8 @@ def validate_upgrade() -> None:
     log("Phase 6: Verifying applied config version on disk...")
     result = subprocess.run(
         ["ssh", *SSH_OPTS, SSH_TARGET,
-         "sudo cat /etc/unbounded-agent/kube2-applied-config.json || " +
-         "sudo cat /etc/unbounded-agent/kube1-applied-config.json"],
+         "sudo cat /etc/unbounded/agent/kube2-applied-config.json || " +
+         "sudo cat /etc/unbounded/agent/kube1-applied-config.json"],
         capture_output=True, text=True,
     )
     if result.returncode == 0 and result.stdout.strip():
