@@ -170,3 +170,30 @@ roleRef:
   kind: ClusterRole
   name: system:certificates.k8s.io:certificatesigningrequests:nodeclient
   apiGroup: rbac.authorization.k8s.io
+
+---
+# Allow the metalman-bootstrap SA to get and create Machine CRs.
+# The agent's register-machine phase uses this SA token to check whether a
+# Machine CR already exists and, if not, to create one during bootstrap.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: metalman-bootstrap
+rules:
+  - apiGroups: ["unbounded-kube.io"]
+    resources: ["machines"]
+    verbs: ["get", "create"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: metalman:bootstrap-machine
+subjects:
+  - kind: ServiceAccount
+    name: metalman-bootstrap
+    namespace: unbounded-kube
+roleRef:
+  kind: ClusterRole
+  name: metalman-bootstrap
+  apiGroup: rbac.authorization.k8s.io
