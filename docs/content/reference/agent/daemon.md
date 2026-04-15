@@ -19,32 +19,20 @@ config). When an operation counter in the CR's spec diverges from the status,
 the daemon performs the necessary operations to bring the node into the
 desired state.
 
-```
-Control Plane                         Agent Host
-+-----------------+                   +-------------------+
-| Machine CR      |   watch/update    | unbounded-agent   |
-| spec:           | <-------------+   | daemon            |
-|   kubernetes:   |                |  |                   |
-|     version     | +-----------+  +--+ bootstrap token   |
-|   agent:        | |           |     |                   |
-|     image       | | API Server|     | applied config    |
-|   operations:   | |           |     | /etc/unbounded/   |
-|     reboot: 2   | +-----------+     |   agent/kube1-    |
-|     reimage: 1  |                   |   applied-config  |
-| status:         |                   |   .json           |
-|   operations:   |                   +-------------------+
-|     reboot: 2   |
-|     reimage: 1  |
-+-----------------+
-```
+![Agent daemon overview: Control Plane with Machine CR watched by the daemon on the Agent Host, which persists applied config with SHA-256 integrity sidecar](../../../img/agent-daemon-overview.svg)
 
 ## Authentication
 
 The daemon authenticates to the API server using the bootstrap token from the
-applied agent config. It builds a `rest.Config` directly from the config
-fields (API server URL, base64-encoded CA certificate, bootstrap token),
-avoiding any dependency on kubeconfig files inside the nspawn machine (which
-contain nspawn-internal paths that do not resolve on the host filesystem).
+applied agent config. This is a temporary arrangement - bootstrap tokens are
+short-lived and not intended for long-running daemons. A proper agent
+credential strategy (e.g. dedicated client certificates) needs to be defined
+so the daemon remains authenticated after the bootstrap token expires.
+
+The daemon builds a `rest.Config` directly from the config fields (API server
+URL, base64-encoded CA certificate, bootstrap token), avoiding any dependency
+on kubeconfig files inside the nspawn machine (which contain nspawn-internal
+paths that do not resolve on the host filesystem).
 
 The bootstrap token places the daemon in the `system:bootstrappers` group. The
 `unbounded-bootstrapper-machine` ClusterRole (deployed with machina) grants the
@@ -70,25 +58,87 @@ is left untouched. If the CRD is not installed, the daemon returns an error
 This self-registration happens before the watch loop begins, ensuring the
 daemon always has a Machine CR to watch.
 
-## Drift Detection
+## Applied Config and Drift Detection
 
-The daemon detects drift by comparing operation counters in the Machine CR:
+The daemon uses an `AgentConfig` as the local goal state for the node. This
+config is persisted to disk as the applied config file
+(`/etc/unbounded/agent/<machine>-applied-config.json`) after every successful
+provisioning or update. The daemon reads it on startup to know what the node
+is currently running.
+
+### AgentConfig fields
+
+The applied config contains the full set of parameters needed to provision an
+nspawn machine:
+
+| Field | Description |
+|---|---|
+| `MachineName` | Name of this node's Machine CR |
+| `Cluster.Version` | Kubernetes version (e.g. `v1.33.1`) |
+| `Cluster.CaCertBase64` | Base64-encoded cluster CA certificate |
+| `Cluster.ClusterDNS` | ClusterIP of the kube-dns Service |
+| `Kubelet.ApiServer` | API server endpoint URL |
+| `Kubelet.BootstrapToken` | Bootstrap token for kubelet TLS bootstrapping |
+| `Kubelet.Labels` | Node labels passed to kubelet registration |
+| `Kubelet.RegisterWithTaints` | Taints applied at registration |
+| `OCIImage` | OCI image reference for the nspawn rootfs |
+
+When a Machine CR watch event arrives, the daemon builds a desired
+`AgentConfig` by overlaying CR spec fields (version, image, labels, taints)
+onto the current applied config. Fields not present in the CR (API server, CA
+cert, cluster DNS, bootstrap token) are preserved from the applied config.
+
+### Operation counter triggers
+
+Reconciliation is triggered by operation counter drift in the Machine CR, not
+by config field changes alone:
 
 | Machine CR field | Condition | Trigger |
 |---|---|---|
 | `spec.operations.reimageCounter` | `> status.operations.reimageCounter` | Reimage requested |
-| `spec.operations.rebootCounter` | `> status.operations.rebootCounter` | Reboot requested |
 
-Only operation counter drift triggers reconciliation. Inside the update flow,
-`hasDrift` (unexported) additionally checks whether the desired config
-actually differs from the applied config before performing the expensive
-rootfs reprovision.
+Once triggered, the update flow compares the desired config against the
+applied config to decide whether a rootfs reprovision is actually needed.
 
 After successful reconciliation, only the reimage counter is acknowledged
 (copied from spec to status). The reboot counter is not acknowledged by the
 daemon.
 
+Example steps for triggering a node update:
+
+1. Update `spec.kubernetes.version` to the desired Kubernetes version.
+2. Increment `spec.operations.reimageCounter`.
+3. Wait for `status.phase` to reach `Joining` (or `Ready` once the machina
+   controller observes the Node).
+
+### Persistence and integrity
+
+The applied config is persisted to disk after every successful provisioning
+or update. A SHA-256 sidecar checksum file
+(`<machine>-applied-config.json.sha256`) is written alongside it to protect
+against bitflips.
+
+On the **write path**, `PersistAppliedConfig` writes the config JSON first,
+then computes the SHA-256 digest and writes the sidecar. A crash between the
+two writes leaves a missing sidecar, which the read path handles gracefully.
+
+On the **read path**, `findActiveMachine` verifies the sidecar checksum
+before trusting the config data:
+
+| Sidecar state | Behavior |
+|---|---|
+| Present, digest matches | Config is trusted, proceed normally |
+| Missing | Log a warning and proceed - the config may have been written by an older agent that did not produce checksums, or the agent may have crashed between the two writes |
+| Present, digest mismatch | Return `ErrChecksumMismatch` - indicates on-disk corruption; the daemon will not start |
+
+On **reset**, `RemoveAppliedConfig` removes both the config JSON and the
+`.sha256` sidecar file.
+
 ## Reconciliation Flow
+
+The daemon uses a rate-limited workqueue to handle watch events. The watch
+loop enqueues events and the queue deduplicates and rate-limits so at most
+one reconciliation runs at a time.
 
 When operation counter drift is detected:
 
@@ -118,58 +168,21 @@ When operation counter drift is detected:
 
 ## Systemd Unit
 
-The daemon runs as `unbounded-agent-daemon.service`:
+The daemon runs as `unbounded-agent-daemon.service`. It depends on
+`network-online.target` and `machines.target` so it starts after networking
+is up and systemd-nspawn machines are available.
 
-```ini
-[Unit]
-Description=Unbounded Agent Daemon
-After=network-online.target machines.target
-Wants=network-online.target machines.target
+The `start` command enables and starts this service after the initial node
+provisioning is complete and the applied config is persisted.
 
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/unbounded-agent daemon
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-```
-
-The `start` command enables and starts this service as part of the serial
-task list after the initial node provisioning is complete and the applied
-config is persisted. The `machines.target` dependency ensures the daemon
-starts after systemd-nspawn machines are available.
+During a `reset`, the daemon is stopped first (before any nspawn machines are
+torn down) by the `StopDaemon` task, which stops and disables the service and
+removes the unit file.
 
 ## RBAC
 
-The daemon's permissions are part of the bootstrapper RBAC deployed with
-machina (`deploy/machina/07-bootstrapper-rbac.yaml`):
-
-```yaml
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: unbounded-bootstrapper-machine
-rules:
-  - apiGroups: ["unbounded-kube.io"]
-    resources: ["machines"]
-    verbs: ["create", "get", "list", "watch"]
-  - apiGroups: ["unbounded-kube.io"]
-    resources: ["machines/status"]
-    verbs: ["get", "update", "patch"]
-
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: unbounded-bootstrapper-machine
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: unbounded-bootstrapper-machine
-subjects:
-  - apiGroup: rbac.authorization.k8s.io
-    kind: Group
-    name: system:bootstrappers
-```
+The daemon needs create, get, list, and watch access to Machine CRs, plus
+get, update, and patch access to Machine status subresources. These
+permissions are granted by the `unbounded-bootstrapper-machine` ClusterRole,
+deployed with machina, and bound to the `system:bootstrappers` group via a
+ClusterRoleBinding.
