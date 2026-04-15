@@ -5,17 +5,6 @@ name: Smoke Metalman
 
 on:
   pull_request:
-    paths:
-      - cmd/metalman/**
-      - internal/metalman/**
-      - deploy/machina/**
-      - hack/smoke-metalman.py
-      - hack/kind-smoke-config.yaml
-      - images/host-ubuntu2404/**
-      - images/agent-ubuntu2404/**
-      - go.mod
-      - go.sum
-      - .github/workflows/smoke-metalman.yaml
   push:
     branches: [main]
     paths:
