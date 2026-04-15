@@ -675,6 +675,8 @@ def main() -> None:
     # Start Go builds in the background so they overlap with Kubernetes
     # setup and Docker image builds.  Both targets share the Go build
     # cache, so concurrent compilation is safe and efficient.
+    # stdout/stderr are inherited so build output streams to the CI log
+    # in real-time.
     log("Building metalman and kubectl-unbounded (parallel)")
     go_builds: list[tuple[str, subprocess.Popen[Any]]] = [
         ("metalman", subprocess.Popen(
@@ -725,6 +727,9 @@ def main() -> None:
     # builds safely.  The agent image is much smaller (~18s) than the host
     # image (~5 min), so the agent build finishes well before the host
     # build and its wall-clock cost is completely hidden.
+    # stdout/stderr are inherited so build output streams to the CI log
+    # in real-time; on failure the error details are already visible above
+    # the die() message.
     log("Building OCI images (host-ubuntu2404 + agent-ubuntu2404 in parallel)")
     host_build_cmd = ["docker", "buildx", "build", "--load"]
     # Use GitHub Actions cache when running in CI (env vars set by
