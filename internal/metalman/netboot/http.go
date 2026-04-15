@@ -189,6 +189,20 @@ func (h *HTTPServer) updateCloudInitCondition(ctx context.Context, log *slog.Log
 			return nil
 		}
 
+		// Once a sub-module failure has been recorded (reason=Failed), preserve
+		// that condition so the specific error message is not overwritten by
+		// subsequent module start/success events. Cloud-init continues running
+		// other modules after a failure, so we would otherwise lose the first
+		// (and most informative) failure message.
+		existing := meta.FindStatusCondition(node.Status.Conditions, v1alpha3.MachineConditionCloudInitDone)
+		if existing != nil && existing.Reason == "Failed" && cond.Reason != "Failed" {
+			log.Info("cloud-init condition: preserving existing failure",
+				"existing_message", existing.Message,
+				"skipped_event", ev.Name,
+				"skipped_reason", cond.Reason)
+			return nil
+		}
+
 		// TODO(jordan): Rename all `node` references in this file to `machine`
 		meta.SetStatusCondition(&node.Status.Conditions, *cond)
 

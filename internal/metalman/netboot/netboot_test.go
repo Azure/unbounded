@@ -2295,6 +2295,120 @@ func TestCloudInitCondition_StageFailureSetsFailedWithDetails(t *testing.T) {
 	}
 }
 
+func TestCloudInitCondition_FailurePreservedOnSubsequentStart(t *testing.T) {
+	// When a sub-module fails (e.g. config-scripts_user), subsequent module
+	// start events must not overwrite the Failed condition. The first failure
+	// message is the most informative because it identifies the specific
+	// failing module.
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "ci-preserve-node"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:90", IPv4: "10.0.30.10", SubnetMask: "255.255.255.0"}},
+			},
+		},
+	}
+
+	cache := NewOCICache(t.TempDir())
+	scheme := newScheme(t)
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node).
+		WithStatusSubresource(&v1alpha3.Machine{}).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+
+	srv := &HTTPServer{
+		Client:       fc,
+		FileResolver: FileResolver{Cache: cache, Reader: fc},
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /cloudinit/log", srv.handleCloudInitLog)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	sendEvent := func(body string) {
+		t.Helper()
+		req, _ := http.NewRequest("POST", ts.URL+"/cloudinit/log", strings.NewReader(body))
+		req.Header.Set("X-Forwarded-For", "10.0.30.10")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("POST /cloudinit/log: %v", err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200, got %d", resp.StatusCode)
+		}
+	}
+
+	// Step 1: Sub-module fails.
+	sendEvent(`{"name":"modules-final/config-scripts_user","description":"running config-scripts_user","event_type":"finish","origin":"cloudinit","timestamp":1.0,"result":"FAIL"}`)
+
+	var updated v1alpha3.Machine
+	if err := fc.Get(t.Context(), client.ObjectKeyFromObject(node), &updated); err != nil {
+		t.Fatalf("getting updated node: %v", err)
+	}
+	cond := findCondition(updated.Status.Conditions, v1alpha3.MachineConditionCloudInitDone)
+	if cond == nil {
+		t.Fatal("expected CloudInitDone condition after failure")
+	}
+	if cond.Reason != "Failed" {
+		t.Fatalf("reason: got %q, want %q", cond.Reason, "Failed")
+	}
+	if !strings.Contains(cond.Message, "config-scripts_user") {
+		t.Fatalf("message %q should contain failing module name", cond.Message)
+	}
+
+	// Step 2: Next sub-module starts - should NOT overwrite the failure.
+	sendEvent(`{"name":"modules-final/config-ssh_authkey_fingerprints","description":"running config-ssh_authkey_fingerprints","event_type":"start","origin":"cloudinit","timestamp":2.0}`)
+
+	if err := fc.Get(t.Context(), client.ObjectKeyFromObject(node), &updated); err != nil {
+		t.Fatalf("getting updated node: %v", err)
+	}
+	cond = findCondition(updated.Status.Conditions, v1alpha3.MachineConditionCloudInitDone)
+	if cond == nil {
+		t.Fatal("expected CloudInitDone condition to still be set")
+	}
+	if cond.Reason != "Failed" {
+		t.Errorf("reason after subsequent start: got %q, want %q (failure should be preserved)", cond.Reason, "Failed")
+	}
+	if !strings.Contains(cond.Message, "config-scripts_user") {
+		t.Errorf("message %q should still contain original failing module name", cond.Message)
+	}
+
+	// Step 3: Next sub-module finishes successfully - should NOT overwrite.
+	sendEvent(`{"name":"modules-final/config-ssh_authkey_fingerprints","description":"config-ssh_authkey_fingerprints ran successfully","event_type":"finish","origin":"cloudinit","timestamp":3.0,"result":"SUCCESS"}`)
+
+	if err := fc.Get(t.Context(), client.ObjectKeyFromObject(node), &updated); err != nil {
+		t.Fatalf("getting updated node: %v", err)
+	}
+	cond = findCondition(updated.Status.Conditions, v1alpha3.MachineConditionCloudInitDone)
+	if cond == nil {
+		t.Fatal("expected CloudInitDone condition to still be set")
+	}
+	if cond.Reason != "Failed" {
+		t.Errorf("reason after subsequent success: got %q, want %q (failure should be preserved)", cond.Reason, "Failed")
+	}
+
+	// Step 4: Overall modules-final finishes with FAIL - this is also a
+	// Failed condition, so it IS allowed to update (but the first failure
+	// message is already preserved since we keep the first Failed reason).
+	sendEvent(`{"name":"modules-final","description":"running modules for final","event_type":"finish","origin":"cloudinit","timestamp":4.0,"result":"FAIL"}`)
+
+	if err := fc.Get(t.Context(), client.ObjectKeyFromObject(node), &updated); err != nil {
+		t.Fatalf("getting updated node: %v", err)
+	}
+	cond = findCondition(updated.Status.Conditions, v1alpha3.MachineConditionCloudInitDone)
+	if cond == nil {
+		t.Fatal("expected CloudInitDone condition to still be set")
+	}
+	if cond.Reason != "Failed" {
+		t.Errorf("reason after overall FAIL: got %q, want %q", cond.Reason, "Failed")
+	}
+}
+
 func TestCloudInitCondition_NoClientSkipsUpdate(t *testing.T) {
 	// When Client is nil, handleCloudInitLog should still return 200
 	// but not attempt any status update.
