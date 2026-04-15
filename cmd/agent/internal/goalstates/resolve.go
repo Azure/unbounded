@@ -30,7 +30,7 @@ type MachineGoalState struct {
 func ResolveMachine(log *slog.Logger, cfg *provision.AgentConfig, machineName string) (*MachineGoalState, error) {
 	kernel, err := hostKernel()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("get host kernel: %w", err)
 	}
 
 	hostname, err := os.Hostname()
@@ -40,14 +40,14 @@ func ResolveMachine(log *slog.Logger, cfg *provision.AgentConfig, machineName st
 
 	nvidia, err := ResolveNvidiaHost(runtime.GOARCH)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("resolve nvidia host: %w", err)
 	}
 
 	ociImage := ResolveOCIImage(log, cfg.OCIImage, len(nvidia.GPUDevicePaths) > 0)
 
 	kubelet, err := resolveKubelet(cfg)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("resolve kubelet config: %w", err)
 	}
 
 	rootFS := &RootFS{

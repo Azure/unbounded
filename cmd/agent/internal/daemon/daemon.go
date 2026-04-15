@@ -421,10 +421,21 @@ func acknowledgeOperations(machine *v1alpha3.Machine) {
 	machine.Status.Operations.ReimageCounter = machine.Spec.Operations.ReimageCounter
 }
 
-// updateMachinePhase sets the Machine phase and message via a status update.
+// updateMachinePhase sets the Machine phase, message, and a corresponding
+// NodeUpdated condition via a status update. The condition tracks the
+// in-progress state so that phase transitions are always backed by
+// observable conditions.
 func updateMachinePhase(ctx context.Context, c client.Client, machine *v1alpha3.Machine, phase v1alpha3.MachinePhase, message string) error {
 	machine.Status.Phase = phase
 	machine.Status.Message = message
+
+	apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
+		Type:               v1alpha3.MachineConditionNodeUpdated,
+		Status:             metav1.ConditionFalse,
+		Reason:             "InProgress",
+		Message:            message,
+		ObservedGeneration: machine.Generation,
+	})
 
 	return c.Status().Update(ctx, machine)
 }
@@ -450,33 +461,13 @@ func updateMachineStatus(
 		condReason = "Succeeded"
 	}
 
-	// Set the NodeUpdated condition.
-	now := metav1.Now()
-	found := false
-
-	for i := range machine.Status.Conditions {
-		if machine.Status.Conditions[i].Type == "NodeUpdated" {
-			machine.Status.Conditions[i].Status = condStatus
-			machine.Status.Conditions[i].Reason = condReason
-			machine.Status.Conditions[i].Message = message
-			machine.Status.Conditions[i].LastTransitionTime = now
-			machine.Status.Conditions[i].ObservedGeneration = machine.Generation
-			found = true
-
-			break
-		}
-	}
-
-	if !found {
-		machine.Status.Conditions = append(machine.Status.Conditions, metav1.Condition{
-			Type:               "NodeUpdated",
-			Status:             condStatus,
-			Reason:             condReason,
-			Message:            message,
-			LastTransitionTime: now,
-			ObservedGeneration: machine.Generation,
-		})
-	}
+	apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
+		Type:               v1alpha3.MachineConditionNodeUpdated,
+		Status:             condStatus,
+		Reason:             condReason,
+		Message:            message,
+		ObservedGeneration: machine.Generation,
+	})
 
 	return c.Status().Update(ctx, machine)
 }

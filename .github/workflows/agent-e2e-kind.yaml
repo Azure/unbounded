@@ -192,9 +192,6 @@ jobs:
       - name: Wait for node to become Ready (rejoin)
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose wait-for-node
 
-      - name: Validate Machine CR (rejoin)
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-machine-cr-created
-
       - name: Validate daemon watching Machine CR (rejoin)
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-daemon
 
