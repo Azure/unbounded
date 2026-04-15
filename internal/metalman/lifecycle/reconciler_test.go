@@ -25,20 +25,20 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-func TestReimageTimeout(t *testing.T) {
+func TestRepaveTimeout(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-timeout", Namespace: "default"},
 		Spec: v1alpha3.MachineSpec{
 			Operations: &v1alpha3.OperationsSpec{
 				RebootCounter:  1,
-				ReimageCounter: 1,
+				RepaveCounter: 1,
 			},
 		},
 		Status: v1alpha3.MachineStatus{
 			Operations: &v1alpha3.OperationsStatus{RebootCounter: 1},
 			Conditions: []metav1.Condition{
 				{
-					Type:               v1alpha3.MachineConditionReimaged,
+					Type:               v1alpha3.MachineConditionRepaved,
 					Status:             metav1.ConditionFalse,
 					Reason:             "Pending",
 					Message:            "image=test-image",
@@ -68,9 +68,9 @@ func TestReimageTimeout(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reimagedCond := meta.FindStatusCondition(updated.Status.Conditions, v1alpha3.MachineConditionReimaged)
-	if reimagedCond != nil {
-		t.Fatalf("expected Reimaged condition to be removed, got %+v", reimagedCond)
+	repavedCond := meta.FindStatusCondition(updated.Status.Conditions, v1alpha3.MachineConditionRepaved)
+	if repavedCond != nil {
+		t.Fatalf("expected Repaved condition to be removed, got %+v", repavedCond)
 	}
 
 	if updated.Status.Operations.RebootCounter != 0 {
@@ -78,20 +78,20 @@ func TestReimageTimeout(t *testing.T) {
 	}
 }
 
-func TestReimageTimeoutNotYetExpired(t *testing.T) {
+func TestRepaveTimeoutNotYetExpired(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-not-expired", Namespace: "default"},
 		Spec: v1alpha3.MachineSpec{
 			Operations: &v1alpha3.OperationsSpec{
 				RebootCounter:  1,
-				ReimageCounter: 1,
+				RepaveCounter: 1,
 			},
 		},
 		Status: v1alpha3.MachineStatus{
 			Operations: &v1alpha3.OperationsStatus{RebootCounter: 1},
 			Conditions: []metav1.Condition{
 				{
-					Type:               v1alpha3.MachineConditionReimaged,
+					Type:               v1alpha3.MachineConditionRepaved,
 					Status:             metav1.ConditionFalse,
 					Reason:             "Pending",
 					Message:            "image=test-image",
@@ -117,7 +117,7 @@ func TestReimageTimeoutNotYetExpired(t *testing.T) {
 	}
 
 	if result.RequeueAfter == 0 {
-		t.Fatal("expected RequeueAfter for not-yet-expired reimage timeout")
+		t.Fatal("expected RequeueAfter for not-yet-expired repave timeout")
 	}
 
 	if result.RequeueAfter > 11*time.Minute {
@@ -134,19 +134,19 @@ func TestReimageTimeoutNotYetExpired(t *testing.T) {
 	}
 }
 
-func TestNoOpWithoutPendingReimage(t *testing.T) {
+func TestNoOpWithoutPendingRepave(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-noop", Namespace: "default"},
 		Spec: v1alpha3.MachineSpec{
 			Operations: &v1alpha3.OperationsSpec{
 				RebootCounter:  1,
-				ReimageCounter: 1,
+				RepaveCounter: 1,
 			},
 		},
 		Status: v1alpha3.MachineStatus{
 			Operations: &v1alpha3.OperationsStatus{
 				RebootCounter:  1,
-				ReimageCounter: 1,
+				RepaveCounter: 1,
 			},
 		},
 	}
@@ -171,20 +171,20 @@ func TestNoOpWithoutPendingReimage(t *testing.T) {
 	}
 }
 
-func TestNoOpWhenReimageSucceeded(t *testing.T) {
+func TestNoOpWhenRepaveSucceeded(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-succeeded", Namespace: "default"},
 		Spec: v1alpha3.MachineSpec{
 			Operations: &v1alpha3.OperationsSpec{
 				RebootCounter:  1,
-				ReimageCounter: 1,
+				RepaveCounter: 1,
 			},
 		},
 		Status: v1alpha3.MachineStatus{
 			Operations: &v1alpha3.OperationsStatus{RebootCounter: 1},
 			Conditions: []metav1.Condition{
 				{
-					Type:               v1alpha3.MachineConditionReimaged,
+					Type:               v1alpha3.MachineConditionRepaved,
 					Status:             metav1.ConditionTrue,
 					Reason:             "Succeeded",
 					LastTransitionTime: metav1.NewTime(time.Now().Add(-20 * time.Minute)),
@@ -209,7 +209,7 @@ func TestNoOpWhenReimageSucceeded(t *testing.T) {
 	}
 
 	if result.RequeueAfter != 0 {
-		t.Fatalf("expected no requeue for Reimaged=True, got RequeueAfter=%v", result.RequeueAfter)
+		t.Fatalf("expected no requeue for Repaved=True, got RequeueAfter=%v", result.RequeueAfter)
 	}
 }
 

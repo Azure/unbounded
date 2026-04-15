@@ -122,10 +122,10 @@ spec:
                       reboot counter.
                     format: int64
                     type: integer
-                  reimageCounter:
+                  repaveCounter:
                     description: |-
-                      ReimageCounter triggers a reimage when it exceeds the status
-                      reimage counter.
+                      RepaveCounter triggers a repave when it exceeds the status
+                      repave counter.
                     format: int64
                     type: integer
                 type: object
@@ -392,9 +392,9 @@ spec:
                       was acted on.
                     format: int64
                     type: integer
-                  reimageCounter:
-                    description: ReimageCounter is the last reimage counter value
-                      that was acted on.
+                  repaveCounter:
+                    description: RepaveCounter is the last repave counter value that
+                      was acted on.
                     format: int64
                     type: integer
                 type: object

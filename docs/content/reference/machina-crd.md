@@ -87,7 +87,7 @@ Kubernetes join configuration.
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `operations.rebootCounter` | int64 | No | `0` | Triggers a reboot when the spec value exceeds the status value. |
-| `operations.reimageCounter` | int64 | No | `0` | Triggers a PXE reimage when the spec value exceeds the status value. |
+| `operations.repaveCounter` | int64 | No | `0` | Triggers a PXE repave when the spec value exceeds the status value. |
 
 ### status
 
@@ -99,7 +99,7 @@ Kubernetes join configuration.
 | `redfish.certFingerprint` | string | BMC TLS certificate SHA-256 fingerprint. Set by metalman using TOFU. |
 | `tpm.ekPublicKey` | string | TPM endorsement key in PEM format. Set by metalman attestation using TOFU. |
 | `operations.rebootCounter` | int64 | Last-acted reboot counter value. |
-| `operations.reimageCounter` | int64 | Last-acted reimage counter value. |
+| `operations.repaveCounter` | int64 | Last-acted repave counter value. |
 | `conditions` | []Condition | Standard Kubernetes conditions (see below). |
 
 ### Conditions
@@ -111,7 +111,7 @@ Kubernetes join configuration.
 | `Provisioned` | machina | `True` after successful SSH provisioning. `ObservedGeneration` tracks the spec generation. |
 | `PoweredOff` | metalman | Tracks BMC power state during a reboot cycle. Removed after power-on completes. Not defined as a CRD type constant; set directly by the metalman redfish reconciler. |
 | `BootOrderConfigSupported` | metalman | Set to `False` when the BMC does not support boot order configuration. Not defined as a CRD type constant; set directly by the metalman redfish reconciler. |
-| `Reimaged` | metalman | `False`/`Pending` during reimage; `True`/`Succeeded` after `/pxe/disable`. Stale `False` conditions are removed after a 30-minute timeout. |
+| `Repaved` | metalman | `False`/`Pending` during repave; `True`/`Succeeded` after `/pxe/disable`. Stale `False` conditions are removed after a 30-minute timeout. |
 
 ### Phase lifecycle
 

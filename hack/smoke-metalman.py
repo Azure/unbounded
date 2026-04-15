@@ -443,9 +443,45 @@ def wait_k8s_node(name: str, timeout: int = 1800) -> None:
     die(f"Timed out waiting for Node '{name}'")
 
 
+def _restart_crashing_pods(node_name: str, namespace: str, label: str) -> None:
+    """Delete pods matching *label* on *node_name* that are in CrashLoopBackOff.
+
+    This resets the exponential backoff timer so the pod gets a fresh start.
+    Useful when a DaemonSet pod crashes transiently during node initialization
+    (e.g. kindnet racing with network setup on a QEMU VM).
+    """
+    result = subprocess.run(
+        [KUBECTL, "get", "pods", "-n", namespace,
+         "-l", label, "--field-selector", f"spec.nodeName={node_name}",
+         "-o", "json"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return
+
+    pods = json.loads(result.stdout).get("items", [])
+    for pod in pods:
+        for cs in pod.get("status", {}).get("containerStatuses", []):
+            if cs.get("ready"):
+                continue
+            waiting = cs.get("state", {}).get("waiting", {})
+            restart_count = cs.get("restartCount", 0)
+            if restart_count >= 3 or waiting.get("reason") == "CrashLoopBackOff":
+                pod_name = pod["metadata"]["name"]
+                log(f"    Deleting crashing pod {pod_name} "
+                    f"(restarts={restart_count}) to reset backoff")
+                subprocess.run(
+                    [KUBECTL, "delete", "pod", "-n", namespace, pod_name,
+                     "--grace-period=0", "--force"],
+                    capture_output=True, text=True,
+                )
+
+
 def assert_node_ready(name: str, timeout: int = 300) -> None:
     """Assert the Node reaches Ready status within timeout seconds."""
     log(f"  Waiting for Node '{name}' to become Ready...")
+    pod_restart_interval = 60  # seconds between CrashLoopBackOff resets
+    last_restart_attempt = 0
     for elapsed in range(timeout):
         check_procs()
         result = subprocess.run(
@@ -458,6 +494,13 @@ def assert_node_ready(name: str, timeout: int = 300) -> None:
             return
         if elapsed > 0 and elapsed % 30 == 0:
             log(f"    ({elapsed}s) Node not yet Ready")
+        # Periodically reset CrashLoopBackOff on critical DaemonSet pods.
+        # Kindnet can fail transiently when the VM's network is still
+        # initializing; deleting the pod resets the backoff timer and
+        # lets the DaemonSet controller schedule a fresh attempt.
+        if elapsed >= 30 and elapsed - last_restart_attempt >= pod_restart_interval:
+            _restart_crashing_pods(name, "kube-system", "app=kindnet")
+            last_restart_attempt = elapsed
         time.sleep(1)
     die(f"Timed out waiting for Node '{name}' to become Ready")
 
@@ -751,8 +794,8 @@ def main() -> None:
     time.sleep(2)
     check_procs()
 
-    log("Triggering reimage")
-    run([str(KUBECTL_UNBOUNDED), "machine", "reimage", NODE_NAME])
+    log("Triggering repave")
+    run([str(KUBECTL_UNBOUNDED), "machine", "repave", NODE_NAME])
 
     # Log free space so we can correlate disk exhaustion with VM failures.
     df = subprocess.run(["df", "-h", str(TMPDIR)], capture_output=True, text=True)
