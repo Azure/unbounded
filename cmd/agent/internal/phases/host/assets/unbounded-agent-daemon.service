@@ -5,6 +5,7 @@ Wants=network-online.target machines.target
 
 [Service]
 Type=simple
+Environment=UNBOUNDED_AGENT_CONFIG_FILE=/etc/unbounded-agent/config.json
 ExecStart=/usr/local/bin/unbounded-agent daemon
 Restart=always
 RestartSec=10

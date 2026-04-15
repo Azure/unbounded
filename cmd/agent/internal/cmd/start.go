@@ -93,7 +93,7 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 
 				// Phase 4: Enable and start the daemon that runs on the host
 				// alongside the nspawn machine.
-				host.EnableDaemon(log),
+				host.EnableDaemon(log, cfg),
 			).Do(ctx)
 		},
 	}
