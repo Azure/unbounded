@@ -15,6 +15,9 @@ const (
 
 	SystemdNSpawnDir = "/etc/systemd/nspawn"
 	SystemdSystemDir = "/etc/systemd/system"
+
+	// DaemonUnit is the systemd unit name for the unbounded-agent daemon.
+	DaemonUnit = "unbounded-agent-daemon.service"
 )
 
 // NSpawn machine names used for alternating in-place upgrades.

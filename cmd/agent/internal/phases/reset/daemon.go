@@ -13,8 +13,6 @@ import (
 	"github.com/Azure/unbounded-kube/cmd/agent/internal/utilexec"
 )
 
-const daemonUnit = "unbounded-agent-daemon.service"
-
 type stopDaemon struct {
 	log *slog.Logger
 }
@@ -31,15 +29,15 @@ func (t *stopDaemon) Name() string { return "stop-daemon" }
 func (t *stopDaemon) Do(ctx context.Context) error {
 	systemctl := utilexec.Systemctl()
 
-	if err := utilexec.RunCmd(ctx, t.log, systemctl, "stop", daemonUnit); err != nil {
+	if err := utilexec.RunCmd(ctx, t.log, systemctl, "stop", goalstates.DaemonUnit); err != nil {
 		t.log.Warn("failed to stop daemon (may not be running)", "error", err)
 	}
 
-	if err := utilexec.RunCmd(ctx, t.log, systemctl, "disable", daemonUnit); err != nil {
+	if err := utilexec.RunCmd(ctx, t.log, systemctl, "disable", goalstates.DaemonUnit); err != nil {
 		t.log.Warn("failed to disable daemon (may not be enabled)", "error", err)
 	}
 
-	unitPath := filepath.Join(goalstates.SystemdSystemDir, daemonUnit)
+	unitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonUnit)
 	removeFileIfExists(t.log, unitPath)
 
 	return nil

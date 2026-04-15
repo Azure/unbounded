@@ -421,10 +421,6 @@ func hasOperationsDrift(machine *v1alpha3.Machine) bool {
 		statusOps = &v1alpha3.OperationsStatus{}
 	}
 
-	if specOps.RebootCounter > statusOps.RebootCounter {
-		return true
-	}
-
 	if specOps.RepaveCounter > statusOps.RepaveCounter {
 		return true
 	}

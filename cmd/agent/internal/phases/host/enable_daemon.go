@@ -16,8 +16,6 @@ import (
 	"github.com/Azure/unbounded-kube/cmd/agent/internal/utilio"
 )
 
-const daemonUnit = "unbounded-agent-daemon.service"
-
 //go:embed assets/unbounded-agent-daemon.service
 var daemonServiceContent []byte
 
@@ -36,7 +34,7 @@ func EnableDaemon(log *slog.Logger) phases.Task {
 func (d *enableDaemon) Name() string { return "enable-daemon" }
 
 func (d *enableDaemon) Do(ctx context.Context) error {
-	unitPath := filepath.Join(goalstates.SystemdSystemDir, daemonUnit)
+	unitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonUnit)
 
 	if err := utilio.WriteFile(unitPath, daemonServiceContent, 0o644); err != nil {
 		return fmt.Errorf("writing %s: %w", unitPath, err)
@@ -48,15 +46,15 @@ func (d *enableDaemon) Do(ctx context.Context) error {
 		return fmt.Errorf("systemctl daemon-reload: %w", err)
 	}
 
-	if err := utilexec.RunCmd(ctx, d.log, systemctl, "enable", daemonUnit); err != nil {
-		return fmt.Errorf("systemctl enable %s: %w", daemonUnit, err)
+	if err := utilexec.RunCmd(ctx, d.log, systemctl, "enable", goalstates.DaemonUnit); err != nil {
+		return fmt.Errorf("systemctl enable %s: %w", goalstates.DaemonUnit, err)
 	}
 
-	if err := utilexec.RunCmd(ctx, d.log, systemctl, "start", daemonUnit); err != nil {
-		return fmt.Errorf("systemctl start %s: %w", daemonUnit, err)
+	if err := utilexec.RunCmd(ctx, d.log, systemctl, "start", goalstates.DaemonUnit); err != nil {
+		return fmt.Errorf("systemctl start %s: %w", goalstates.DaemonUnit, err)
 	}
 
-	d.log.Info("daemon unit started", "unit", daemonUnit)
+	d.log.Info("daemon unit started", "unit", goalstates.DaemonUnit)
 
 	return nil
 }
