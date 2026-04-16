@@ -2,6 +2,10 @@
 
 The Unbounded controller will rely on two control methods - configuration CRs for machine configuration and status alongside an operational CR for operations like reboot, shutdown, and power on.
 
+![Excalidraw diagram of the below architecture](image.png)
+
+[Link](https://excalidraw.com/#json=FvIvkl5uWdPAwTrVdNNua,WTKPZlW8KllB1HMfHbj0rQ)
+
 ## Configuration CRs - Machine, MachineConfiguration
 
 ### Machine/Node
@@ -14,7 +18,7 @@ The configuration selected drives the VM agent (see Agents, below) to create the
 
 If the user wants to repave the `systemd-nspawn` container or make configuration changes on the VM effective, they should cordon/drain the node and then delete the Kubernetes `Node` object. The VM agent will detect that the `Machine` exists but no matching Kubernetes `Node` exists; this will then trigger the repave operation on the node, which should result in the node rejoining the cluster and becoming ready.
 
-**TODO**: Figure out a way to deal with changes that don't require a repave, if we want to allow that.
+**TODO**: Figure out a way to deal with changes that don't require a repave, if we want to allow that. Perhaps an `applyConfiguration` operation that can be used to indicate we want changes applied, which could take a parameter for disruptive or not, and handle the automation of cordon/drain/delete?
 
 ### MachineConfiguration/MachineConfigurationVersion
 
