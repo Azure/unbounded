@@ -466,7 +466,7 @@ def _restart_crashing_pods(node_name: str, namespace: str, label: str) -> None:
                 continue
             waiting = cs.get("state", {}).get("waiting", {})
             restart_count = cs.get("restartCount", 0)
-            if restart_count >= 3 or waiting.get("reason") == "CrashLoopBackOff":
+            if restart_count >= 2 or waiting.get("reason") == "CrashLoopBackOff":
                 pod_name = pod["metadata"]["name"]
                 log(f"    Deleting crashing pod {pod_name} "
                     f"(restarts={restart_count}) to reset backoff")
@@ -477,8 +477,16 @@ def _restart_crashing_pods(node_name: str, namespace: str, label: str) -> None:
                 )
 
 
-def assert_node_ready(name: str, timeout: int = 300) -> None:
-    """Assert the Node reaches Ready status within timeout seconds."""
+def assert_node_ready(name: str, timeout: int = 480) -> None:
+    """Assert the Node reaches Ready status within timeout seconds.
+
+    The timeout must be generous enough to survive multiple kindnet
+    CrashLoopBackOff cycles.  In CI each kindnet pod runs for ~2 min
+    before crashing; with a restart threshold of 2 and a 30s check
+    interval, each cycle (crash -> detect -> delete -> new pod start)
+    takes ~90-120s.  480s accommodates 3 full cycles plus ~60s for the
+    final pod to write the CNI config and the kubelet to detect it.
+    """
     log(f"  Waiting for Node '{name}' to become Ready...")
     pod_restart_interval = 30  # seconds between CrashLoopBackOff resets
     last_restart_attempt = 0
@@ -844,7 +852,7 @@ def main() -> None:
 
     log("Waiting for kubelet to join the cluster...")
     wait_k8s_node(NODE_NAME, timeout=900)
-    assert_node_ready(NODE_NAME, timeout=300)
+    assert_node_ready(NODE_NAME, timeout=480)
 
     log("")
     log("Smoke test PASSED")
