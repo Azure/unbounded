@@ -9,20 +9,36 @@ and at the edge, without being limited by the location of your control plane.
 unbounded-kube is organized into several directories:
 
 - `api/` - where API definitions for custom resources are located.
+  - `v1alpha3/` - Machine and Image CRD types.
+  - `net/v1alpha1/` - unbounded-net CRD types (Sites, GatewayPools, SitePeerings, etc.).
 - `bin/` - where generated binary artifacts should be placed.
+- `bpf/` - eBPF C source code for unbounded-net tunnel encapsulation.
 - `cmd/` - where the sources for each binary artifact are located. Each subdirectory corresponds to a binary artifact.
   - `agent` - sources for the unbounded-agent.
   - `inventory` - sources for the inventory controller.
-  - `kubectl-unbounded` - sources for the `kubectl unbounded` plugin.
+  - `kubectl-unbounded` - sources for the `kubectl unbounded` plugin (includes `net` subcommand group).
   - `machina` - sources for the machina controller.
   - `metalman` - sources for the metalman controller.
+  - `unbounded-net-controller` - sources for the unbounded-net control-plane controller.
+  - `unbounded-net-node` - sources for the unbounded-net node agent DaemonSet.
+  - `unbounded-net-routeplan-debug` - debug utility for route plan inspection.
+  - `unping` - network ping utility.
+  - `unroute` - route diagnostic utility.
 - `deploy/` - component manifests for deploying on a Kubernetes cluster.
+  - `machina/` - machina controller manifests.
+  - `net/` - unbounded-net deployment templates and CRDs.
 - `docs/` - documentation for the project.
+  - `net/` - unbounded-net specific documentation.
+- `frontend/` - frontend web applications.
+  - `net/` - React/TypeScript dashboard for unbounded-net.
 - `hack/` - where development tools and scripts are located.
   - `cmd/` - development tools that are built as Go binaries.
+  - `net/` - unbounded-net operational scripts.
   - `scratch/` - scratch space for quick go experiments.
 - `images/` - where OCI image definitions and related assets for building container images are located.
+  - `unbounded-net/` - Containerfile for unbounded-net-controller and unbounded-net-node images.
 - `internal/` - where shared but internal to this project packages are located.
+  - `net/` - unbounded-net internal packages (allocator, config, controller, ebpf, netlink, routeplan, etc.).
 - `tmp/` - project local temporary directory for intermediate stuff that will be cleaned up quickly.
 
 ## Building and Testing
@@ -31,6 +47,8 @@ unbounded-kube is organized into several directories:
 - To build `machina` without lint/test use `make machina-build` (used in Containerfiles).
 - To build `metalman` use `make metalman` which runs formatters, lint, tests, and builds the binary.
 - To build `metalman` without lint/test use `make metalman-build` (used in Containerfiles).
+- For unbounded-net targets, use `make net-<target>`, e.g. `make net-build`, `make net-test`, `make net-lint`.
+  These delegate to `net.Makefile`.
 
 ## Coding Standards
 

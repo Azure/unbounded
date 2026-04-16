@@ -8,6 +8,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	netcmd "github.com/Azure/unbounded-kube/cmd/kubectl-unbounded/app/net"
 	"github.com/Azure/unbounded-kube/internal/version"
 )
 
@@ -19,6 +20,7 @@ func Run() {
 
 	root.AddCommand(siteCommandGroup())
 	root.AddCommand(machineCommandGroup())
+	root.AddCommand(netcmd.NewNetCommand())
 	root.AddCommand(version.Command())
 
 	if err := root.Execute(); err != nil {

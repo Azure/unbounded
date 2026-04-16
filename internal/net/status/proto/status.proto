@@ -1,0 +1,200 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+syntax = "proto3";
+package unboundednet.status.v1;
+option go_package = "github.com/Azure/unbounded-kube/internal/net/status/proto";
+
+// NodeStatusMessage wraps all node-to-controller status messages.
+message NodeStatusMessage {
+  string type = 1;           // "node_status_full" or "node_status_delta"
+  string node_name = 2;
+  uint64 base_revision = 3;
+  NodeStatusFull status = 4; // set for full updates
+  NodeStatusDelta delta = 5; // set for delta updates
+}
+
+// NodeStatusAck is the acknowledgment returned by the controller for push updates.
+message NodeStatusAck {
+  string status = 1;   // "ok" or "resync_required"
+  uint64 revision = 2;
+  string reason = 3;
+}
+
+// NodeStatusFull mirrors the complete NodeStatusResponse payload.
+message NodeStatusFull {
+  int64 timestamp_unix_ns = 1;
+  NodeInfo node_info = 2;
+  repeated PeerStatus peers = 3;
+  RoutingTableInfo routing_table = 4;
+  HealthCheckStatus health_check = 5;
+  repeated NodeError node_errors = 6;
+  string fetch_error = 7;
+  int64 last_push_time_unix_ns = 8;  // 0 means unset
+  string status_source = 9;
+  NodePodInfo node_pod_info = 10;
+  repeated BpfEntry bpf_entries = 11;
+}
+
+// NodeStatusDelta carries field-level updates; only set fields are applied.
+message NodeStatusDelta {
+  NodeInfo node_info = 1;
+  repeated PeerStatus peers = 2;
+  RoutingTableInfo routing_table = 3;
+  HealthCheckStatus health_check = 4;
+  repeated NodeError node_errors = 5;
+  // Track which top-level fields are present in this delta.
+  repeated string updated_fields = 15;
+  repeated BpfEntry bpf_entries = 6;
+}
+
+// NodeInfo contains basic node identification and metadata.
+message NodeInfo {
+  string name = 1;
+  string site_name = 2;
+  bool is_gateway = 3;
+  repeated string pod_cidrs = 4;
+  repeated string internal_ips = 5;
+  repeated string external_ips = 6;
+  BuildInfo build_info = 7;
+  WireGuardStatusInfo wire_guard = 8;
+  string k8s_ready = 9;
+  string provider_id = 10;
+  string os_image = 11;
+  string kernel = 12;
+  string kubelet = 13;
+  string arch = 14;
+  string node_os = 15;
+  map<string, string> k8s_labels = 16;
+  int64 k8s_updated_at_unix_ns = 17;  // 0 means unset
+}
+
+// BuildInfo contains build-time version information for a binary.
+message BuildInfo {
+  string version = 1;
+  string commit = 2;
+  string build_time = 3;
+}
+
+// WireGuardStatusInfo contains WireGuard interface status.
+message WireGuardStatusInfo {
+  string interface = 1;
+  string public_key = 2;
+  int32 listen_port = 3;
+  int32 peer_count = 4;
+}
+
+// PeerStatus contains information about a tunnel peer.
+message PeerStatus {
+  string name = 1;
+  string peer_type = 2;
+  string site_name = 3;
+  repeated string pod_cidr_gateways = 4;
+  bool skip_pod_cidr_routes = 5;
+  map<string, int32> route_distances = 6;
+  PeerTunnelStatus tunnel = 7;
+  repeated string route_destinations = 8;
+  HealthCheckPeerStatus health_check = 9;
+}
+
+// PeerTunnelStatus contains per-link tunnel transport metrics.
+message PeerTunnelStatus {
+  string protocol = 1;
+  string interface = 2;
+  string public_key = 3;
+  string endpoint = 4;
+  repeated string allowed_ips = 5;
+  int64 rx_bytes = 6;
+  int64 tx_bytes = 7;
+  int64 last_handshake_unix_ns = 8;
+}
+
+// RoutingTableInfo contains routing table entries.
+message RoutingTableInfo {
+  repeated RouteEntry routes = 1;
+  int32 managed_route_count = 2;
+  int32 pending_route_count = 3;
+}
+
+// RouteEntry represents a deduplicated route.
+message RouteEntry {
+  string destination = 1;
+  string family = 2;  // "IPv4" or "IPv6"
+  int32 table = 3;
+  repeated NextHop next_hops = 4;
+}
+
+// NextHop represents a single next-hop in a route.
+message NextHop {
+  string gateway = 1;
+  string device = 2;
+  int32 distance = 3;
+  int32 weight = 4;
+  int32 mtu = 5;
+  repeated RouteType route_types = 6;
+  OptionalBool expected = 7;
+  OptionalBool present = 8;
+  repeated string peer_destinations = 9;
+  NextHopInfo info = 10;
+}
+
+// OptionalBool wraps a boolean value so we can distinguish unset from false.
+message OptionalBool {
+  bool value = 1;
+}
+
+// NextHopInfo contains metadata describing how a next-hop was derived.
+message NextHopInfo {
+  string object_name = 1;
+  string object_type = 2;
+  string route_type = 3;
+}
+
+// RouteType contains the protocol type and attributes for one contributor to a nexthop.
+message RouteType {
+  string type = 1;
+  repeated string attributes = 2;
+}
+
+// HealthCheckStatus contains aggregate health check service information.
+message HealthCheckStatus {
+  bool healthy = 1;
+  string summary = 2;
+  int32 peer_count = 3;
+  int64 checked_at_unix_ns = 4;
+}
+
+// HealthCheckPeerStatus contains health check session status for a peer.
+message HealthCheckPeerStatus {
+  bool enabled = 1;
+  string status = 2;
+  string uptime = 3;
+  string rtt = 4;
+}
+
+// NodeError describes a node-level error surfaced in status payloads.
+message NodeError {
+  string type = 1;
+  string message = 2;
+  int64 timestamp_ns = 3;  // Unix nanoseconds; 0 means unset
+}
+
+// NodePodInfo contains information about the unbounded-net-node pod on a node.
+message NodePodInfo {
+  string pod_name = 1;
+  int64 start_time_unix_ns = 2;
+  int32 restarts = 3;
+}
+
+// BpfEntry represents a single entry from the eBPF LPM trie tunnel maps.
+message BpfEntry {
+  string cidr = 1;
+  string remote = 2;
+  string node = 3;
+  string interface_name = 4;
+  string protocol = 5;
+  uint32 vni = 6;
+  int32 mtu = 7;
+  uint32 ifindex = 8;
+  bool healthy = 9;
+}

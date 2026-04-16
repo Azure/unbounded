@@ -151,3 +151,8 @@ docs-serve: ## Start a local Hugo dev server with live-reload
 		{ echo "error: hugo not found. Install it from:"; \
 		  echo "  https://gohugo.io/installation/"; exit 1; }
 	cd docs && hugo server
+
+# Proxy target for unbounded-net Makefile.
+# Usage: make net-<target>, e.g. make net-build, make net-test, make net-lint
+net-%:
+	$(MAKE) -f net.Makefile $*

@@ -54,3 +54,21 @@ docs/.hugo_build.lock
 
 # Python
 __pycache__/
+
+# unbounded-net
+/resources/
+/frontend/net/node_modules/
+/frontend/net/dist/
+/internal/net/html/dist/
+.vite/
+.npm/
+.playwright-cli/
+.playwright/
+coverage.out
+coverage.html
+*.kubeconfig
+.env
+.env.*
+.envrc
+__debug*
+*.tmp
