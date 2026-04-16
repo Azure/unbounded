@@ -1,9 +1,9 @@
 ---
-# Grant bootstrap token users (system:bootstrappers group) the permissions
-# required by the unbounded-agent daemon. The daemon self-registers a
-# Machine CR at startup (if one does not already exist), watches the
-# Machine CR that corresponds to its node, and updates the Machine status
-# after reconciliation.
+# Grant bootstrap token users (system:bootstrappers group) the minimum
+# permissions required for the unbounded-agent to self-register a Machine CR
+# when one does not already exist. This is required for dynamic boot
+# environments such as manual-bootstrap and cloud-init where a Machine CR is
+# not pre-created before the agent runs.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -11,10 +11,7 @@ metadata:
 rules:
   - apiGroups: ["unbounded-kube.io"]
     resources: ["machines"]
-    verbs: ["create", "get", "list", "watch"]
-  - apiGroups: ["unbounded-kube.io"]
-    resources: ["machines/status"]
-    verbs: ["get", "update", "patch"]
+    verbs: ["get", "create"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1

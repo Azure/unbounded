@@ -9,33 +9,27 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
-	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
 	"github.com/Azure/unbounded-kube/internal/provision"
 )
 
-// kubeClientFunc constructs a controller-runtime WithWatch client from a
-// rest.Config. The production implementation is client.NewWithWatch;
-// tests can supply a fake.
+// kubeClientFunc constructs a controller-runtime client from a rest.Config.
+// The production implementation is client.NewWithWatch; tests can supply a fake.
 type kubeClientFunc func(cfg *rest.Config, opts client.Options) (client.WithWatch, error)
 
-const (
-	// watchRetryInterval is the delay between watch re-establishment attempts.
-	watchRetryInterval = 10 * time.Second
-)
-
 // Run is the main daemon entry point. It discovers the active nspawn
-// machine, builds a Kubernetes client from the applied config, and
-// watches the Machine CR for changes.
+// machine, builds a Kubernetes client, registers the Machine CR if needed,
+// and blocks until the context is cancelled.
+//
+// TODO: Add a trigger mechanism (e.g. file watch, signal, API) to invoke
+// updateNode when the desired config changes.
 func Run(ctx context.Context, log *slog.Logger) error {
 	return run(ctx, log, client.NewWithWatch)
 }
@@ -49,14 +43,13 @@ func run(ctx context.Context, log *slog.Logger, newClient kubeClientFunc) error 
 		return fmt.Errorf("find active machine: %w", err)
 	}
 
-	machineName := active.Config.MachineName
 	log.Info("daemon starting",
-		"machine_cr", machineName,
+		"machine_cr", active.Config.MachineName,
 		"nspawn_machine", active.Name,
 		"applied_version", active.Config.Cluster.Version,
 	)
 
-	// Build a controller-runtime WithWatch client from the applied config.
+	// Build a controller-runtime client from the applied config.
 	kubeClient, err := buildKubeClient(active.Config, newClient)
 	if err != nil {
 		return fmt.Errorf("build kube client: %w", err)
@@ -66,63 +59,18 @@ func run(ctx context.Context, log *slog.Logger, newClient kubeClientFunc) error 
 		"api_server", active.Config.Kubelet.ApiServer,
 	)
 
-	// Ensure a Machine CR exists before entering the watch loop. In
-	// dynamic environments (manual-bootstrap, cloud-init) a Machine CR
-	// may not have been pre-created by machina.
+	// Ensure a Machine CR exists before blocking. In dynamic environments
+	// (manual-bootstrap, cloud-init) a Machine CR may not have been
+	// pre-created by machina.
 	if err := registerMachine(ctx, log, kubeClient, active.Config); err != nil {
 		return fmt.Errorf("register machine: %w", err)
 	}
 
-	// Use client-go's rate-limiting workqueue to decouple the watch loop
-	// from reconciliation. The watch loop adds the machine name on every
-	// relevant event; the queue deduplicates and rate-limits so the
-	// worker processes at most one reconciliation at a time. This keeps
-	// the watch loop free to drain events without backpressuring the API
-	// server's HTTP/2 stream.
-	queue := workqueue.NewTypedRateLimitingQueueWithConfig(
-		workqueue.DefaultTypedControllerRateLimiter[string](),
-		workqueue.TypedRateLimitingQueueConfig[string]{Name: "machine"},
-	)
-	defer queue.ShutDown()
+	// Block until shutdown.
+	<-ctx.Done()
+	log.Info("daemon shutting down")
 
-	// Worker goroutine: processes items from the queue.
-	go runWorker(ctx, log, kubeClient, queue)
-
-	// Enter the watch loop.
-	for {
-		if err := watchMachine(ctx, log, kubeClient, machineName, queue); err != nil {
-			if ctx.Err() != nil {
-				return nil // Graceful shutdown.
-			}
-
-			log.Error("watch failed, retrying", "error", err, "retry_in", watchRetryInterval)
-
-			select {
-			case <-ctx.Done():
-				return nil
-			case <-time.After(watchRetryInterval):
-			}
-		}
-	}
-}
-
-// runWorker drains the workqueue, processing one item at a time.
-func runWorker(ctx context.Context, log *slog.Logger, c client.WithWatch, queue workqueue.TypedRateLimitingInterface[string]) {
-	for {
-		key, shutdown := queue.Get()
-		if shutdown {
-			return
-		}
-
-		if err := handleMachineEvent(ctx, log, c, key); err != nil {
-			log.Error("reconciliation failed, requeuing", "error", err)
-			queue.AddRateLimited(key)
-		} else {
-			queue.Forget(key)
-		}
-
-		queue.Done(key)
-	}
+	return nil
 }
 
 // buildKubeClient creates a controller-runtime WithWatch client from the
@@ -231,275 +179,4 @@ func buildMachineCR(cfg *provision.AgentConfig) v1alpha3.Machine {
 			},
 		},
 	}
-}
-
-// watchMachine establishes a watch on the named Machine CR and enqueues the
-// machine name on relevant events. It returns when the watch closes or the
-// context is cancelled. The actual reconciliation happens asynchronously via
-// the workqueue, keeping this loop free to drain the watch stream.
-func watchMachine(ctx context.Context, log *slog.Logger, wc client.WithWatch, machineName string, queue workqueue.TypedRateLimitingInterface[string]) error {
-	machineList := &v1alpha3.MachineList{}
-
-	watcher, err := wc.Watch(ctx, machineList, client.MatchingFields{"metadata.name": machineName})
-	if err != nil {
-		return fmt.Errorf("start watch for Machine %q: %w", machineName, err)
-	}
-	defer watcher.Stop()
-
-	log.Info("watching Machine CR", "name", machineName)
-
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case event, ok := <-watcher.ResultChan():
-			if !ok {
-				return fmt.Errorf("watch channel closed")
-			}
-
-			if event.Type == watch.Error {
-				return fmt.Errorf("watch error event: %v", event.Object)
-			}
-
-			if event.Type != watch.Modified && event.Type != watch.Added {
-				continue
-			}
-
-			machine, ok := event.Object.(*v1alpha3.Machine)
-			if !ok {
-				log.Warn("unexpected object type in watch event")
-				continue
-			}
-
-			log.Debug("watch event",
-				"type", event.Type,
-				"generation", machine.Generation,
-				"version", machine.ResourceVersion,
-			)
-
-			// Enqueue the machine name. The workqueue deduplicates:
-			// if the name is already queued or being processed, this
-			// is a no-op.
-			queue.Add(machineName)
-		}
-	}
-}
-
-// handleMachineEvent processes a single reconciliation cycle. It reads the
-// current Machine CR from the API server, checks for drift, and performs
-// reconciliation if needed.
-func handleMachineEvent(ctx context.Context, log *slog.Logger, c client.WithWatch, machineName string) error {
-	// Read the Machine CR from the API server to get the latest state.
-	machine := &v1alpha3.Machine{}
-	if err := c.Get(ctx, client.ObjectKey{Name: machineName}, machine); err != nil {
-		return fmt.Errorf("get Machine %q: %w", machineName, err)
-	}
-
-	// Re-read the active machine state on each event, because a previous
-	// reconciliation may have changed the active nspawn machine name.
-	active, err := findActiveMachine(log)
-	if err != nil {
-		return fmt.Errorf("find active machine: %w", err)
-	}
-
-	// Build the desired config from the Machine CR overlaid on applied config.
-	desired := desiredConfigFromMachine(active.Config, machine)
-
-	// Check for operation counter drift. Counter bumps are the only
-	// trigger for reconciliation; actual config drift (version, image,
-	// etc.) is checked inside UpdateNode to decide whether the
-	// expensive rootfs reprovision is needed.
-	if !hasOperationsDrift(machine) {
-		log.Debug("no operation counter drift")
-		return nil
-	}
-
-	log.Info("operation counter drift detected",
-		"current_version", active.Config.Cluster.Version,
-		"desired_version", specVersion(machine),
-	)
-
-	// Set status to Provisioning before starting work.
-	if err := updateMachinePhase(ctx, c, machine, v1alpha3.MachinePhaseProvisioning, "agent daemon reconciling"); err != nil {
-		log.Warn("failed to update phase to Provisioning", "error", err)
-		// Continue with reconciliation even if status update fails.
-	}
-
-	// Execute the node update with the desired config.
-	if err := updateNode(ctx, log, active, desired); err != nil {
-		// Update status to Failed.
-		failMsg := fmt.Sprintf("node update failed: %v", err)
-		if updateErr := updateMachineStatus(ctx, c, machine, v1alpha3.MachinePhaseFailed, failMsg, false); updateErr != nil {
-			log.Warn("failed to update status after failure", "error", updateErr)
-		}
-
-		return fmt.Errorf("node update: %w", err)
-	}
-
-	// Acknowledge operation counters.
-	acknowledgeOperations(machine)
-
-	// Update status to Joining with success.
-	if err := updateMachineStatus(ctx, c, machine, v1alpha3.MachinePhaseJoining, "node update completed", true); err != nil {
-		log.Warn("failed to update status after success", "error", err)
-	}
-
-	log.Info("reconciliation completed",
-		"new_version", desired.Cluster.Version,
-	)
-
-	return nil
-}
-
-// desiredConfigFromMachine builds the desired AgentConfig by overlaying
-// fields from the Machine CR onto the applied config. Fields not present in
-// the CR (API server, CA cert, cluster DNS, bootstrap token, etc.) are
-// preserved from the applied config.
-func desiredConfigFromMachine(applied *provision.AgentConfig, machine *v1alpha3.Machine) *provision.AgentConfig {
-	// Deep copy the applied config as the base.
-	desired := *applied
-	desired.Cluster = applied.Cluster
-	desired.Kubelet = applied.Kubelet
-
-	// Copy labels map to avoid aliasing.
-	if applied.Kubelet.Labels != nil {
-		desired.Kubelet.Labels = make(map[string]string, len(applied.Kubelet.Labels))
-		for k, v := range applied.Kubelet.Labels {
-			desired.Kubelet.Labels[k] = v
-		}
-	}
-
-	// Copy taints slice.
-	if applied.Kubelet.RegisterWithTaints != nil {
-		desired.Kubelet.RegisterWithTaints = make([]string, len(applied.Kubelet.RegisterWithTaints))
-		copy(desired.Kubelet.RegisterWithTaints, applied.Kubelet.RegisterWithTaints)
-	}
-
-	// Preserve Attest pointer.
-	if applied.Attest != nil {
-		a := *applied.Attest
-		desired.Attest = &a
-	}
-
-	// Overlay Machine CR fields.
-	if machine.Spec.Kubernetes != nil {
-		if v := machine.Spec.Kubernetes.Version; v != "" {
-			desired.Cluster.Version = strings.TrimPrefix(v, "v")
-		}
-
-		if labels := machine.Spec.Kubernetes.NodeLabels; len(labels) > 0 {
-			desired.Kubelet.Labels = make(map[string]string, len(labels))
-			for k, v := range labels {
-				desired.Kubelet.Labels[k] = v
-			}
-		}
-
-		if taints := machine.Spec.Kubernetes.RegisterWithTaints; len(taints) > 0 {
-			desired.Kubelet.RegisterWithTaints = make([]string, len(taints))
-			copy(desired.Kubelet.RegisterWithTaints, taints)
-		}
-	}
-
-	if machine.Spec.Agent != nil && machine.Spec.Agent.Image != "" {
-		desired.OCIImage = machine.Spec.Agent.Image
-	}
-
-	return &desired
-}
-
-// hasOperationsDrift returns true if any operation counter in spec exceeds
-// the corresponding status counter.
-func hasOperationsDrift(machine *v1alpha3.Machine) bool {
-	if machine.Spec.Operations == nil {
-		return false
-	}
-
-	specOps := machine.Spec.Operations
-
-	statusOps := machine.Status.Operations
-	if statusOps == nil {
-		statusOps = &v1alpha3.OperationsStatus{}
-	}
-
-	if specOps.RepaveCounter > statusOps.RepaveCounter {
-		return true
-	}
-
-	return false
-}
-
-// specVersion extracts the kubernetes version from a Machine spec, or returns
-// empty string if not set.
-func specVersion(machine *v1alpha3.Machine) string {
-	if machine.Spec.Kubernetes != nil {
-		return machine.Spec.Kubernetes.Version
-	}
-
-	return ""
-}
-
-// acknowledgeOperations copies the spec repave counter to status, marking
-// it as acted upon. The reboot counter is not acknowledged here because
-// reboots are handled separately.
-func acknowledgeOperations(machine *v1alpha3.Machine) {
-	if machine.Spec.Operations == nil {
-		return
-	}
-
-	if machine.Status.Operations == nil {
-		machine.Status.Operations = &v1alpha3.OperationsStatus{}
-	}
-
-	machine.Status.Operations.RepaveCounter = machine.Spec.Operations.RepaveCounter
-}
-
-// updateMachinePhase sets the Machine phase, message, and a corresponding
-// NodeUpdated condition via a status update. The condition tracks the
-// in-progress state so that phase transitions are always backed by
-// observable conditions.
-func updateMachinePhase(ctx context.Context, c client.Client, machine *v1alpha3.Machine, phase v1alpha3.MachinePhase, message string) error {
-	machine.Status.Phase = phase
-	machine.Status.Message = message
-
-	apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
-		Type:               v1alpha3.MachineConditionNodeUpdated,
-		Status:             metav1.ConditionFalse,
-		Reason:             "InProgress",
-		Message:            message,
-		ObservedGeneration: machine.Generation,
-	})
-
-	return c.Status().Update(ctx, machine)
-}
-
-// updateMachineStatus sets the Machine phase, message, operation counters,
-// and the NodeUpdated condition via a status update.
-func updateMachineStatus(
-	ctx context.Context,
-	c client.Client,
-	machine *v1alpha3.Machine,
-	phase v1alpha3.MachinePhase,
-	message string,
-	success bool,
-) error {
-	machine.Status.Phase = phase
-	machine.Status.Message = message
-
-	condStatus := metav1.ConditionFalse
-	condReason := "Failed"
-
-	if success {
-		condStatus = metav1.ConditionTrue
-		condReason = "Succeeded"
-	}
-
-	apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
-		Type:               v1alpha3.MachineConditionNodeUpdated,
-		Status:             condStatus,
-		Reason:             condReason,
-		Message:            message,
-		ObservedGeneration: machine.Generation,
-	})
-
-	return c.Status().Update(ctx, machine)
 }

@@ -116,13 +116,13 @@ func hasDrift(applied, desired *provision.AgentConfig) bool {
 	return false
 }
 
-// updateNode performs the nspawn machine update:
+// UpdateNode performs the nspawn machine update:
 //  1. Provision a new rootfs on the alternate machine
 //  2. Stop the old machine (graceful service shutdown + nspawn teardown)
 //  3. Start the new machine (configure, boot nspawn, start services, persist config)
 //  4. Verify kubelet health
 //  5. Remove the old machine and its applied config
-func updateNode(ctx context.Context, log *slog.Logger, active *ActiveMachine, newCfg *provision.AgentConfig) error {
+func UpdateNode(ctx context.Context, log *slog.Logger, active *ActiveMachine, newCfg *provision.AgentConfig) error {
 	// Skip the update if the desired config matches the applied config.
 	if !hasDrift(active.Config, newCfg) {
 		log.Info("no config drift detected, skipping node update")
