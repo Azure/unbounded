@@ -1,0 +1,371 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v1.2.1)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+
+env:
+  REGISTRY: ghcr.io/${{ github.repository_owner }}
+  CNI_PLUGINS_VERSION: v1.9.0
+
+jobs:
+  # ---------- Validate tag and extract changelog ----------
+  version:
+    name: Validate Release
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.validate.outputs.tag }}
+      changelog: ${{ steps.changelog.outputs.body }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+
+      - name: Validate tag format
+        id: validate
+        run: |
+          TAG="${{ inputs.tag }}"
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Tag must be in vX.Y.Z format, got: ${TAG}"
+            exit 1
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Release tag: ${TAG}"
+
+      - name: Extract changelog for tag
+        id: changelog
+        run: |
+          TAG="${{ inputs.tag }}"
+          # Extract the section between "## vX.Y.Z" and the next "## v" heading.
+          BODY=$(awk "/^## ${TAG//./\\.}/{found=1; next} /^## v[0-9]/{if(found) exit} found" CHANGELOG.md)
+          if [[ -z "$BODY" ]]; then
+            echo "::warning::No CHANGELOG section found for ${TAG}, using auto-generated notes"
+            echo "body=" >> "$GITHUB_OUTPUT"
+          else
+            # Use a delimiter for multi-line output
+            {
+              echo "body<<CHANGELOG_EOF"
+              echo "$BODY"
+              echo "CHANGELOG_EOF"
+            } >> "$GITHUB_OUTPUT"
+            echo "Extracted changelog for ${TAG}"
+          fi
+
+  # ---------- Build frontend ----------
+  frontend:
+    name: Build Frontend
+    needs: [version]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend
+        run: npm ci --prefer-offline --no-audit && npm run build
+        working-directory: frontend
+
+      - name: Upload frontend dist
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+          retention-days: 1
+
+  # ---------- Build release images with proper version tag ----------
+  build:
+    name: Build (${{ matrix.arch }})
+    needs: [version, frontend]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            platform: linux/amd64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+
+      - name: Download frontend dist
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: frontend-dist
+          path: pkg/html/dist
+
+      - name: Cache CNI plugins
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
+        with:
+          path: resources
+          key: cni-plugins-${{ matrix.arch }}-${{ env.CNI_PLUGINS_VERSION }}
+
+      - name: Download CNI plugins
+        run: |
+          mkdir -p resources
+          file="resources/cni-plugins-linux-${{ matrix.arch }}-${CNI_PLUGINS_VERSION}.tgz"
+          if [ ! -s "$file" ]; then
+            curl -fsSL "https://github.com/containernetworking/plugins/releases/download/${CNI_PLUGINS_VERSION}/cni-plugins-linux-${{ matrix.arch }}-${CNI_PLUGINS_VERSION}.tgz" -o "$file"
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute Go version for Docker
+        id: goversion
+        run: echo "go_version=$(awk '/^go /{split($2,v,"."); print v[1]"."v[2]}' go.mod)" >> "$GITHUB_OUTPUT"
+
+      - name: Build controller image
+        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: controller
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            GO_VERSION=${{ steps.goversion.outputs.go_version }}
+            VERSION=${{ needs.version.outputs.tag }}
+            CNI_PLUGINS_VERSION=${{ env.CNI_PLUGINS_VERSION }}
+          tags: ${{ env.REGISTRY }}/unbounded-net-controller:${{ needs.version.outputs.tag }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=build-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=build-${{ matrix.arch }}
+          push: true
+          provenance: false
+
+      - name: Build node image
+        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: node
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            GO_VERSION=${{ steps.goversion.outputs.go_version }}
+            VERSION=${{ needs.version.outputs.tag }}
+            CNI_PLUGINS_VERSION=${{ env.CNI_PLUGINS_VERSION }}
+          tags: ${{ env.REGISTRY }}/unbounded-net-node:${{ needs.version.outputs.tag }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=build-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=build-${{ matrix.arch }}
+          push: true
+          provenance: false
+
+  # ---------- Create multi-arch manifests ----------
+  manifest:
+    name: Create Manifests
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch manifests
+        run: |
+          TAG="${{ needs.version.outputs.tag }}"
+          for image in controller node; do
+            SRC="${{ env.REGISTRY }}/unbounded-net-${image}"
+            for release_tag in "${TAG}" "latest"; do
+              echo "Creating manifest ${SRC}:${release_tag}..."
+              docker buildx imagetools create \
+                --tag "${SRC}:${release_tag}" \
+                "${SRC}:${TAG}-amd64" \
+                "${SRC}:${TAG}-arm64"
+            done
+          done
+
+  # ---------- Build release plugins (parallel matrix) ----------
+  plugin:
+    name: Plugin (${{ matrix.os }}/${{ matrix.arch }})
+    needs: [version]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            ext: ""
+          - os: linux
+            arch: arm64
+            ext: ""
+          - os: darwin
+            arch: amd64
+            ext: ""
+          - os: darwin
+            arch: arm64
+            ext: ""
+          - os: windows
+            arch: amd64
+            ext: ".exe"
+          - os: windows
+            arch: arm64
+            ext: ".exe"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version-file: go.mod
+          go-download-base-url: 'https://aka.ms/golang/release/latest'
+          cache: false
+
+      - name: Go build/mod cache
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/.cache/ms-go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('go.mod') }}-plugin-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: ${{ runner.os }}-go-${{ hashFiles('go.mod') }}-plugin-${{ matrix.os }}-${{ matrix.arch }}-
+
+      - name: Build kubectl plugin
+        env:
+          CGO_ENABLED: "0"
+          GOEXPERIMENT: nosystemcrypto
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+        run: |
+          LDFLAGS="-s -w -X main.Version=${{ needs.version.outputs.tag }}"
+          go build -ldflags "$LDFLAGS" \
+            -o "kubectl-unbounded-net-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }}" \
+            ./tools/kubectl-plugin/cmd/kubectl-unbounded-net
+
+      - name: Upload plugin binary
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: plugin-${{ matrix.os }}-${{ matrix.arch }}
+          path: kubectl-unbounded-net-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }}
+          retention-days: 7
+
+  # ---------- Create draft release ----------
+  release:
+    name: Create Release
+    needs: [version, manifest, plugin]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+
+      - name: Create and push git tag
+        run: |
+          TAG="${{ needs.version.outputs.tag }}"
+          if git rev-parse "${TAG}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists, skipping tag creation"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag "${TAG}"
+            git push origin "${TAG}"
+            echo "Created and pushed tag ${TAG}"
+          fi
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version-file: go.mod
+          go-download-base-url: 'https://aka.ms/golang/release/latest'
+          cache: false
+
+      - name: Go build/mod cache
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/.cache/ms-go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('go.mod') }}-release-${{ hashFiles('**/go.sum') }}
+          restore-keys: ${{ runner.os }}-go-${{ hashFiles('go.mod') }}-release-
+
+      - name: Render release manifests
+        run: |
+          TAG="${{ needs.version.outputs.tag }}"
+          go run ./tools/render-manifests \
+            --templates-dir deploy \
+            --output-dir build/manifests \
+            --namespace unbounded-net \
+            --controller-image "${{ env.REGISTRY }}/unbounded-net-controller:${TAG}" \
+            --node-image "${{ env.REGISTRY }}/unbounded-net-node:${TAG}"
+          mkdir -p build/manifests/crds
+          cp deploy/crds/*.yaml build/manifests/crds/
+          tar czf "build/unbounded-net-manifests-${TAG}.tar.gz" -C build/manifests .
+
+      - name: Download plugin artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: plugin-*
+          path: build/kubectl-plugin
+          merge-multiple: true
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v4
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: sbom.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Sign SBOM with cosign (keyless)
+        run: |
+          cosign sign-blob --yes \
+            --output-signature sbom.spdx.json.sig \
+            --output-certificate sbom.spdx.json.pem \
+            sbom.spdx.json
+
+      - name: Create draft release
+        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          draft: true
+          body: ${{ needs.version.outputs.changelog }}
+          generate_release_notes: ${{ needs.version.outputs.changelog == '' }}
+          files: |
+            build/unbounded-net-manifests-*.tar.gz
+            build/kubectl-plugin/kubectl-unbounded-net-linux-amd64
+            build/kubectl-plugin/kubectl-unbounded-net-linux-arm64
+            build/kubectl-plugin/kubectl-unbounded-net-darwin-amd64
+            build/kubectl-plugin/kubectl-unbounded-net-darwin-arm64
+            build/kubectl-plugin/kubectl-unbounded-net-windows-amd64.exe
+            build/kubectl-plugin/kubectl-unbounded-net-windows-arm64.exe
+            sbom.spdx.json
+            sbom.spdx.json.sig
+            sbom.spdx.json.pem

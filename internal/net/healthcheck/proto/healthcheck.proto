@@ -1,0 +1,19 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+syntax = "proto3";
+package healthcheck;
+option go_package = "github.com/Azure/unbounded-kube/internal/net/healthcheck/proto";
+
+enum PacketType {
+  REQUEST = 0;
+  REPLY = 1;
+}
+
+message HealthCheckPacket {
+  string source_hostname = 1;
+  string destination_hostname = 2;
+  uint64 sequence_number = 3;
+  int64 timestamp_ns = 4;
+  PacketType type = 5;
+}

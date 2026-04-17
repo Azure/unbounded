@@ -1,6 +1,7 @@
 # Build artifacts
 bin/
 dist/
+build/
 inventory.db
 *.exe
 *.exe~
@@ -8,15 +9,22 @@ inventory.db
 *.so
 *.dylib
 
+# Net binaries (ignore loose binaries, not cmd dirs)
+unbounded-net-*
+!unbounded-net-*/
+__debug*
+
 # Developer Stuff
 hack/scratch
 tmp/
 .vm/
 .vm-e2e/
 unbounded-agent-config-dev.json
+/resources/
 
 # Kubernetes
 .kube/
+*.kubeconfig
 
 # SSH
 *_rsa
@@ -27,6 +35,12 @@ unbounded-agent-config-dev.json
 *.test
 *.out
 coverage.txt
+coverage.out
+coverage.html
+
+# Go workspace
+go.work
+go.work.sum
 
 # Logs
 *.log
@@ -39,6 +53,7 @@ vendor/
 .idea/
 *.swp
 *.swo
+*~
 
 # OS generated
 .DS_Store
@@ -51,6 +66,28 @@ docs/.hugo_build.lock
 
 # AI Tools
 .opencode
+.claude/settings.local.json
 
 # Python
 __pycache__/
+
+# Environment files
+.env
+.env.*
+.envrc
+
+# Frontend
+/frontend/node_modules/
+/frontend/dist/
+.vite/
+.npm/
+
+# Playwright
+.playwright-cli/
+.playwright/
+
+# Rendered templates
+hack/scripts/templates/*.json
+
+# Temporary files
+*.tmp

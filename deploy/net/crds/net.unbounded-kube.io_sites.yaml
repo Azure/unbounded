@@ -1,0 +1,225 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.1
+  name: sites.net.unbounded-kube.io
+spec:
+  group: net.unbounded-kube.io
+  names:
+    kind: Site
+    listKind: SiteList
+    plural: sites
+    shortNames:
+    - st
+    singular: site
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.nodeCidrs
+      name: Node CIDRs
+      type: string
+    - jsonPath: .spec.podCidrAssignments
+      name: Pod CIDR Assignments
+      type: string
+    - jsonPath: .status.nodeCount
+      name: Nodes
+      type: integer
+    - jsonPath: .status.sliceCount
+      name: Slices
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Site defines a network location containing nodes
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: SiteSpec defines the desired state of Site
+            properties:
+              healthCheckSettings:
+                description: HealthCheckSettings controls health check settings for
+                  inter-site tunnel peers.
+                properties:
+                  detectMultiplier:
+                    description: |-
+                      DetectMultiplier is the multiplier used to determine session down detection.
+                      Valid range is 1-255.
+                    format: int32
+                    maximum: 255
+                    minimum: 1
+                    type: integer
+                  enabled:
+                    description: Enabled controls whether health check is enabled
+                      for this scope.
+                    type: boolean
+                  receiveInterval:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: |-
+                      ReceiveInterval is the minimum interval between received health check packets.
+                      Accepts either a duration string (e.g. "300ms") or an integer interpreted as milliseconds.
+                    x-kubernetes-int-or-string: true
+                  transmitInterval:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: |-
+                      TransmitInterval is the minimum interval between transmitted health check packets.
+                      Accepts either a duration string (e.g. "300ms") or an integer interpreted as milliseconds.
+                    x-kubernetes-int-or-string: true
+                type: object
+              localCidrs:
+                description: |-
+                  LocalCIDRs are CIDR blocks that are considered local to this site.
+                  Traffic to these CIDRs should never be routed via gateway pools.
+                items:
+                  type: string
+                type: array
+              manageCniPlugin:
+                description: |-
+                  ManageCniPlugin controls whether the node agent writes CNI configuration
+                  and creates tunnel endpoints for same-site nodes. When true (the default),
+                  CNI config is written and all same-site nodes are tunnel peers.
+                  When false, only tunnel links to gateway pools for other sites are created,
+                  allowing an external CNI plugin to manage intra-site networking.
+                  Pod CIDR assignment is also disabled when manageCniPlugin is false,
+                  regardless of the assignmentEnabled setting on individual podCidrAssignments
+                  rules. The podCidrAssignments are still required to define the CIDR ranges
+                  used for inter-site routing.
+                type: boolean
+              nodeCidrs:
+                description: NodeCidrs are the CIDRs that contain the internal IPs
+                  of nodes at this site
+                items:
+                  type: string
+                minItems: 1
+                type: array
+              nonMasqueradeCIDRs:
+                description: |-
+                  NonMasqueradeCIDRs are CIDR blocks that should NOT be masqueraded when
+                  traffic leaves the node via the default gateway. Traffic to these CIDRs
+                  will use the pod's actual IP address. This is useful for preserving source
+                  IPs when communicating with external networks (e.g., corporate networks, VPNs).
+                  If nodes are Azure VMs/VMSS instances, NIC ipForwarding must be enabled
+                  for this setting to work correctly.
+                items:
+                  type: string
+                type: array
+              podCidrAssignments:
+                description: PodCidrAssignments define how pod CIDRs are allocated
+                  to nodes in this site.
+                items:
+                  description: PodCidrAssignment defines a pod CIDR allocation rule
+                    for nodes in a site.
+                  properties:
+                    assignmentEnabled:
+                      description: AssignmentEnabled controls whether this assignment
+                        is active. Defaults to true.
+                      type: boolean
+                    cidrBlocks:
+                      description: CidrBlocks are the CIDR pools to allocate from.
+                      items:
+                        type: string
+                      minItems: 1
+                      type: array
+                    nodeBlockSizes:
+                      description: NodeBlockSizes define the per-node allocation sizes
+                        for IPv4 and IPv6.
+                      properties:
+                        ipv4:
+                          description: IPv4 is the IPv4 subnet mask size (e.g., 24
+                            for /24).
+                          maximum: 32
+                          minimum: 1
+                          type: integer
+                        ipv6:
+                          description: IPv6 is the IPv6 subnet mask size (e.g., 80
+                            for /80).
+                          maximum: 128
+                          minimum: 1
+                          type: integer
+                      type: object
+                    nodeRegex:
+                      description: NodeRegex is a list of regex patterns for matching
+                        node names. If empty, no regex filtering is applied.
+                      items:
+                        maxLength: 1024
+                        type: string
+                      type: array
+                      x-kubernetes-list-type: atomic
+                    priority:
+                      description: |-
+                        Priority controls which assignment wins when multiple match. Lower values win.
+                        Defaults to 100.
+                      format: int32
+                      type: integer
+                  required:
+                  - cidrBlocks
+                  type: object
+                minItems: 1
+                type: array
+              tunnelMTU:
+                description: TunnelMTU is the MTU to set on routes through tunnels
+                  for this scope.
+                format: int32
+                maximum: 9000
+                minimum: 576
+                type: integer
+              tunnelProtocol:
+                description: |-
+                  TunnelProtocol selects the tunnel protocol for this scope.
+                  Valid values are "WireGuard", "IPIP", "GENEVE", "VXLAN", "None", or "Auto".
+                  Defaults to "Auto" when unset. When "Auto", links using external IPs
+                  use WireGuard and links using only internal IPs use GENEVE.
+                enum:
+                - WireGuard
+                - IPIP
+                - GENEVE
+                - VXLAN
+                - None
+                - Auto
+                type: string
+            required:
+            - nodeCidrs
+            - podCidrAssignments
+            type: object
+          status:
+            description: SiteStatus defines the observed state of Site
+            properties:
+              nodeCount:
+                description: NodeCount is the number of nodes matched to this site
+                type: integer
+              sliceCount:
+                description: SliceCount is the number of SiteNodeSlice objects for
+                  this site
+                type: integer
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

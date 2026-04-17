@@ -1,0 +1,51 @@
+# Build artifacts
+bin/
+unbounded-net*
+!unbounded-net*/
+__debug*
+
+# Docker
+.dockerignore
+
+# Git
+.git/
+.gitignore
+
+# CI/CD
+.github/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Frontend (built separately and copied in)
+frontend/node_modules/
+frontend/dist/
+
+# Playwright local artifacts
+.playwright-cli/
+.playwright/
+
+# Test coverage
+coverage.out
+coverage.html
+
+# Documentation and deployment (not needed in build)
+docs/
+deploy/
+dev/
+build/
+scripts/
+CHANGELOG.md
+LICENSE
+README.md
+Makefile
+
+# Local env files
+.envrc
+
+# OS files
+.DS_Store
+Thumbs.db

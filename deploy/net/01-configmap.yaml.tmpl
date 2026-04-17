@@ -1,0 +1,68 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: unbounded-net-config
+  namespace: {{ .Namespace }}
+data:
+  LOG_LEVEL: "{{ default "2" .LogLevel }}"
+  config.yaml: |
+    common:
+      azureTenantId: "{{ default "" .AzureTenantID }}"
+      apiserverURL: "{{ default "" .ApiserverURL }}"
+      logLevel: {{ default "2" .LogLevel }}
+
+    controller:
+      healthPort: {{ default "9999" .ControllerHealthPort }}
+      nodeAgentHealthPort: {{ default "9998" .ControllerNodeAgentHealthPort }}
+      informerResyncPeriod: "{{ default "300s" .ControllerInformerResyncPeriod }}"
+      statusStaleThreshold: "{{ default "90s" .ControllerStatusStaleThreshold }}"
+      statusWebsocketKeepaliveInterval: "{{ default "30s" .ControllerStatusWebsocketKeepaliveInterval }}"
+      statusWsKeepaliveFailureCount: {{ default "3" .ControllerStatusWsKeepaliveFailureCount }}
+      registerAggregatedAPIServer: {{ default "true" .ControllerRegisterAggregatedAPIServer }}
+      kubeProxyHealthInterval: "{{ default "30s" .ControllerKubeProxyHealthInterval }}"
+      leaderElection:
+        enabled: {{ default "true" .ControllerLeaderElectionEnabled }}
+        leaseDuration: "{{ default "30s" .ControllerLeaderElectionLeaseDuration }}"
+        renewDeadline: "{{ default "15s" .ControllerLeaderElectionRenewDeadline }}"
+        retryPeriod: "{{ default "10s" .ControllerLeaderElectionRetryPeriod }}"
+        resourceNamespace: {{ .Namespace }}
+        resourceName: "{{ default "unbounded-net-controller" .ControllerLeaderElectionResourceName }}"
+
+    node:
+      cniConfDir: "{{ default "/host/etc/cni/net.d" .NodeCNIConfDir }}"
+      cniConfFile: "{{ default "10-unbounded.conflist" .NodeCNIConfFile }}"
+      bridgeName: "{{ default "cbr0" .NodeBridgeName }}"
+      wireGuardDir: "{{ default "/host/etc/wireguard" .NodeWireGuardDir }}"
+      wireGuardPort: {{ default "51820" .NodeWireGuardPort }}
+      enablePolicyRouting: {{ default "false" .NodeEnablePolicyRouting }}
+      mtu: {{ default "0" .NodeMTU }}
+      healthPort: {{ default "9998" .NodeHealthPort }}
+      informerResyncPeriod: "{{ default "3600s" .NodeInformerResyncPeriod }}"
+      statusWebsocketEnabled: {{ default "true" .NodeStatusWebsocketEnabled }}
+      statusWebsocketURL: "{{ default "" .NodeStatusWebsocketURL }}"
+      statusWebsocketApiserverMode: "{{ default "fallback" .NodeStatusWebsocketApiserverMode }}"
+      statusWebsocketApiserverURL: "{{ default "wss://$(KUBERNETES_SERVICE_HOST)/apis/status.net.unbounded-kube.io/v1alpha1/status/nodews" .NodeStatusWebsocketApiserverURL }}"
+      statusWebsocketApiserverStartupDelay: "{{ default "60s" .NodeStatusWebsocketApiserverStartupDelay }}"
+      statusWebsocketKeepaliveInterval: "{{ default "10s" .NodeStatusWebsocketKeepaliveInterval }}"
+      statusWsKeepaliveFailureCount: {{ default "2" .NodeStatusWsKeepaliveFailureCount }}
+      removeConfigurationOnShutdown: {{ default "false" .NodeRemoveConfigurationOnShutdown }}
+      shutdownRemoveWireGuardConfiguration: {{ default "false" .NodeShutdownRemoveWireGuardConfiguration }}
+      cleanupNetlinkOnShutdown: {{ default "false" .NodeShutdownRemoveIPRoutes }}
+      shutdownRemoveMasqueradeRules: {{ default "false" .NodeShutdownRemoveMasqueradeRules }}
+      criticalDeltaEvery: "{{ default "15s" .NodeCriticalDeltaEvery }}"
+      statsDeltaEvery: "{{ default "60s" .NodeStatsDeltaEvery }}"
+      statusPushEnabled: {{ default "true" .NodeStatusPushEnabled }}
+      statusPushURL: "{{ default "" .NodeStatusPushURL }}"
+      statusPushDelta: {{ default "true" .NodeStatusPushDelta }}
+      statusPushInterval: "{{ default "60s" .NodeStatusPushInterval }}"
+      statusPushApiserverInterval: "{{ default "60s" .NodeStatusPushApiserverInterval }}"
+      healthCheckPort: "{{ default "9997" .NodeHealthCheckPort }}"
+      healthFlapMaxBackoff: "{{ default "120s" .NodeHealthFlapMaxBackoff }}"
+      baseMetric: "{{ default "1" .NodeBaseMetric }}"
+      routeTableId: {{ default "252" .NodeRouteTableId }}
+      kubeProxyHealthInterval: "{{ default "30s" .NodeKubeProxyHealthInterval }}"
+      netlinkResyncPeriod: "{{ default "300s" .NodeNetlinkResyncPeriod }}"

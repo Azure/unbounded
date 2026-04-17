@@ -1,0 +1,146 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.1
+  name: sitepeerings.net.unbounded-kube.io
+spec:
+  group: net.unbounded-kube.io
+  names:
+    kind: SitePeering
+    listKind: SitePeeringList
+    plural: sitepeerings
+    shortNames:
+    - spr
+    singular: sitepeering
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.peeredSiteCount
+      name: Sites
+      type: integer
+    - jsonPath: .status.totalNodeCount
+      name: Nodes
+      type: integer
+    - jsonPath: .spec.meshNodes
+      name: Mesh Nodes
+      type: boolean
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: SitePeering defines direct peering between sites.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: SitePeeringSpec defines desired state of SitePeering.
+            properties:
+              enabled:
+                description: |-
+                  Enabled controls whether this peering is active.
+                  Defaults to true.
+                type: boolean
+              healthCheckSettings:
+                description: HealthCheckSettings controls health check settings for
+                  inter-site peering.
+                properties:
+                  detectMultiplier:
+                    description: |-
+                      DetectMultiplier is the multiplier used to determine session down detection.
+                      Valid range is 1-255.
+                    format: int32
+                    maximum: 255
+                    minimum: 1
+                    type: integer
+                  enabled:
+                    description: Enabled controls whether health check is enabled
+                      for this scope.
+                    type: boolean
+                  receiveInterval:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: |-
+                      ReceiveInterval is the minimum interval between received health check packets.
+                      Accepts either a duration string (e.g. "300ms") or an integer interpreted as milliseconds.
+                    x-kubernetes-int-or-string: true
+                  transmitInterval:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: |-
+                      TransmitInterval is the minimum interval between transmitted health check packets.
+                      Accepts either a duration string (e.g. "300ms") or an integer interpreted as milliseconds.
+                    x-kubernetes-int-or-string: true
+                type: object
+              meshNodes:
+                description: MeshNodes controls whether nodes in listed sites mesh
+                  directly.
+                type: boolean
+              sites:
+                description: Sites is the list of site names that should be directly
+                  peered.
+                items:
+                  type: string
+                minItems: 2
+                type: array
+              tunnelMTU:
+                description: TunnelMTU is the MTU to set on routes through tunnels
+                  for this scope.
+                format: int32
+                maximum: 9000
+                minimum: 576
+                type: integer
+              tunnelProtocol:
+                description: |-
+                  TunnelProtocol selects the tunnel protocol for this scope.
+                  Valid values are "WireGuard", "IPIP", "GENEVE", "VXLAN", "None", or "Auto".
+                  Defaults to "Auto" when unset. When "Auto", links using external IPs
+                  use WireGuard and links using only internal IPs use GENEVE.
+                enum:
+                - WireGuard
+                - IPIP
+                - GENEVE
+                - VXLAN
+                - None
+                - Auto
+                type: string
+            type: object
+          status:
+            description: SitePeeringStatus defines the observed state of SitePeering.
+            properties:
+              peeredSiteCount:
+                description: PeeredSiteCount is the number of sites in this peering
+                  that exist.
+                type: integer
+              totalNodeCount:
+                description: TotalNodeCount is the total number of nodes across all
+                  peered sites.
+                type: integer
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

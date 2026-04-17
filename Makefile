@@ -28,6 +28,22 @@ METALMAN_CMD=./cmd/metalman
 KUBECTL_UNBOUNDED_BIN=bin/kubectl-unbounded
 KUBECTL_UNBOUNDED_CMD=./cmd/kubectl-unbounded
 
+# Net binaries
+NET_CONTROLLER_BIN=bin/unbounded-net-controller
+NET_CONTROLLER_CMD=./cmd/unbounded-net-controller
+
+NET_NODE_BIN=bin/unbounded-net-node
+NET_NODE_CMD=./cmd/unbounded-net-node
+
+NET_ROUTEPLAN_DEBUG_BIN=bin/unbounded-net-routeplan-debug
+NET_ROUTEPLAN_DEBUG_CMD=./cmd/unbounded-net-routeplan-debug
+
+UNPING_BIN=bin/unping
+UNPING_CMD=./cmd/unping
+
+UNROUTE_BIN=bin/unroute
+UNROUTE_CMD=./cmd/unroute
+
 # Version is derived from the latest git tag. Override with: make VERSION=v1.0.0
 VERSION ?= $(shell git describe --tags --always 2>/dev/null || echo dev)
 GIT_COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
@@ -41,11 +57,11 @@ KUBECTL_UNBOUNDED_LDFLAGS=$(VERSION_LDFLAGS) -X github.com/Azure/unbounded-kube/
 METALMAN_TAG ?= latest
 METALMAN_IMAGE=$(CONTAINER_REGISTRY)/metalman:$(METALMAN_TAG)
 
-.PHONY: all help fmt lint test check-deps kubectl-unbounded forge inventory inventory-amd64 inventory-arm64 unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve
+.PHONY: all help fmt lint test check-deps kubectl-unbounded forge inventory inventory-amd64 inventory-arm64 unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute
 
 ##@ General
 
-all: kubectl-unbounded forge machina ## Build kubectl-unbounded, forge, and machina (default)
+all: kubectl-unbounded forge machina unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute ## Build all binaries (default)
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} \
@@ -120,6 +136,23 @@ metalman: check-deps ## Format, lint, test, and build metalman
 	$(GOLINT) $(METALMAN_CMD)/... ./internal/metalman/...
 	$(GOTEST) $(METALMAN_CMD)/... ./internal/metalman/...
 	$(GOBUILD) -ldflags '$(VERSION_LDFLAGS)' -o $(METALMAN_BIN) $(METALMAN_CMD)/main.go
+
+##@ Net Binaries
+
+unbounded-net-controller: test ## Build the unbounded-net-controller (implies test)
+	$(GOBUILD) -o $(NET_CONTROLLER_BIN) $(NET_CONTROLLER_CMD)
+
+unbounded-net-node: test ## Build the unbounded-net-node (implies test)
+	$(GOBUILD) -o $(NET_NODE_BIN) $(NET_NODE_CMD)
+
+unbounded-net-routeplan-debug: test ## Build the routeplan debug tool (implies test)
+	$(GOBUILD) -o $(NET_ROUTEPLAN_DEBUG_BIN) $(NET_ROUTEPLAN_DEBUG_CMD)
+
+unping: test ## Build the unping utility (implies test)
+	$(GOBUILD) -o $(UNPING_BIN) $(UNPING_CMD)
+
+unroute: test ## Build the unroute utility (implies test)
+	$(GOBUILD) -o $(UNROUTE_BIN) $(UNROUTE_CMD)
 
 ##@ Container Images
 

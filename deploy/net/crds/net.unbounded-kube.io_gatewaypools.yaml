@@ -1,0 +1,213 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.1
+  name: gatewaypools.net.unbounded-kube.io
+spec:
+  group: net.unbounded-kube.io
+  names:
+    kind: GatewayPool
+    listKind: GatewayPoolList
+    plural: gatewaypools
+    shortNames:
+    - gp
+    singular: gatewaypool
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.nodeSelector
+      name: Selector
+      type: string
+    - jsonPath: .status.nodeCount
+      name: Nodes
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: GatewayPool defines a pool of gateway nodes selected by labels
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: GatewayPoolSpec defines the desired state of GatewayPool
+            properties:
+              healthCheckSettings:
+                description: HealthCheckSettings controls health check settings for
+                  routes to peers in this gateway pool.
+                properties:
+                  detectMultiplier:
+                    description: |-
+                      DetectMultiplier is the multiplier used to determine session down detection.
+                      Valid range is 1-255.
+                    format: int32
+                    maximum: 255
+                    minimum: 1
+                    type: integer
+                  enabled:
+                    description: Enabled controls whether health check is enabled
+                      for this scope.
+                    type: boolean
+                  receiveInterval:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: |-
+                      ReceiveInterval is the minimum interval between received health check packets.
+                      Accepts either a duration string (e.g. "300ms") or an integer interpreted as milliseconds.
+                    x-kubernetes-int-or-string: true
+                  transmitInterval:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: |-
+                      TransmitInterval is the minimum interval between transmitted health check packets.
+                      Accepts either a duration string (e.g. "300ms") or an integer interpreted as milliseconds.
+                    x-kubernetes-int-or-string: true
+                type: object
+              nodeSelector:
+                additionalProperties:
+                  type: string
+                description: |-
+                  NodeSelector selects nodes to include in this gateway pool
+                  Only nodes with external IPs and WireGuard public keys will be included
+                minProperties: 1
+                type: object
+              routedCidrs:
+                description: RoutedCidrs are the CIDR blocks that should be routed
+                  through this gateway pool
+                items:
+                  type: string
+                type: array
+              tunnelMTU:
+                description: TunnelMTU is the MTU to set on routes through tunnels
+                  for this scope.
+                format: int32
+                maximum: 9000
+                minimum: 576
+                type: integer
+              tunnelProtocol:
+                description: |-
+                  TunnelProtocol selects the tunnel protocol for this scope.
+                  Valid values are "WireGuard", "IPIP", "GENEVE", "VXLAN", "None", or "Auto".
+                  Defaults to "Auto" when unset. When "Auto", links using external IPs
+                  use WireGuard and links using only internal IPs use GENEVE.
+                enum:
+                - WireGuard
+                - IPIP
+                - GENEVE
+                - VXLAN
+                - None
+                - Auto
+                type: string
+              type:
+                description: |-
+                  Type controls how gateway nodes are selected and connected.
+                  Allowed values are "External" or "Internal".
+                enum:
+                - External
+                - Internal
+                - ""
+                type: string
+            required:
+            - nodeSelector
+            type: object
+          status:
+            description: GatewayPoolStatus defines the observed state of GatewayPool
+            properties:
+              connectedSites:
+                description: ConnectedSites is the list of sites directly peered to
+                  this gateway pool.
+                items:
+                  type: string
+                type: array
+              nodeCount:
+                description: NodeCount is the number of nodes in this gateway pool
+                type: integer
+              nodes:
+                description: Nodes contains information about nodes in this gateway
+                  pool
+                items:
+                  description: GatewayNodeInfo contains information about a gateway
+                    node
+                  properties:
+                    externalIPs:
+                      description: ExternalIPs are the node's external IP addresses
+                        (for cross-site connections)
+                      items:
+                        type: string
+                      type: array
+                    gatewayWireguardPort:
+                      description: |-
+                        GatewayWireguardPort is the WireGuard listen port assigned to this
+                        gateway node for gateway-to-gateway peering. Ports are allocated by the
+                        controller starting at 51821 and are unique across all gateway pools.
+                      format: int32
+                      type: integer
+                    healthEndpoints:
+                      description: HealthEndpoints are health check IP addresses (e.g.,
+                        10.0.1.1 or fd00::1)
+                      items:
+                        type: string
+                      type: array
+                    internalIPs:
+                      description: InternalIPs are the node's internal IP addresses
+                        (for same-site connections)
+                      items:
+                        type: string
+                      type: array
+                    name:
+                      description: Name is the node name
+                      type: string
+                    podCIDRs:
+                      description: PodCIDRs are the pod CIDRs assigned to this gateway
+                        node
+                      items:
+                        type: string
+                      type: array
+                    siteName:
+                      description: SiteName is the name of the site this gateway node
+                        belongs to
+                      type: string
+                    wireGuardPublicKey:
+                      description: WireGuardPublicKey is the node's WireGuard public
+                        key
+                      type: string
+                  required:
+                  - name
+                  - wireGuardPublicKey
+                  type: object
+                type: array
+              reachableSites:
+                description: ReachableSites is the list of sites reachable via this
+                  gateway pool.
+                items:
+                  type: string
+                type: array
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

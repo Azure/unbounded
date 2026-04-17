@@ -1,0 +1,195 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: unbounded-net-controller
+  labels:
+    app.kubernetes.io/name: unbounded-net-controller
+    app.kubernetes.io/component: controller
+rules:
+  # Nodes: read, patch, and update for CIDR assignment and site labeling.
+  # Cannot be further scoped -- the controller must operate on any node in the cluster.
+  # Fields restricted by ValidatingAdmissionPolicy (09-vap.yaml.tmpl):
+  #   labels/annotations: only net.unbounded-kube.io/* prefix
+  #   spec: only podCIDR and podCIDRs (Kubernetes enforces immutability after initial set)
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  # Events: emit events about cluster-scoped objects (Nodes)
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  # Sites and GatewayPools: read access and finalizer management for controllers
+  - apiGroups: ["net.unbounded-kube.io"]
+    resources: ["sites", "gatewaypools"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  # Peering and assignment resources: read access for controllers and status aggregation
+  - apiGroups: ["net.unbounded-kube.io"]
+    resources: ["sitepeerings", "sitegatewaypoolassignments", "gatewaypoolpeerings"]
+    verbs: ["get", "list", "watch"]
+  # Status subresources: update observed state for sites, site peerings, gateway pools, and gateway pool nodes
+  - apiGroups: ["net.unbounded-kube.io"]
+    resources: ["sites/status", "sitepeerings/status", "gatewaypools/status", "gatewaypoolnodes/status"]
+    verbs: ["get", "patch", "update"]
+  # SiteNodeSlices: full access to manage node slices
+  - apiGroups: ["net.unbounded-kube.io"]
+    resources: ["sitenodeslices"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # GatewayPoolNodes: manage per-node route advertisements and heartbeat status
+  - apiGroups: ["net.unbounded-kube.io"]
+    resources: ["gatewaypoolnodes"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # TokenReviews: validate node agent bearer tokens when OIDC issuer is unavailable.
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+  # SubjectAccessReviews: check dashboard viewer authorization.
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["subjectaccessreviews"]
+    verbs: ["create"]
+  # ValidatingWebhookConfigurations: inject caBundle on startup.
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources: ["validatingwebhookconfigurations"]
+    resourceNames: ["unbounded-net-validating-webhook"]
+    verbs: ["get", "update"]
+  # MutatingWebhookConfigurations: inject caBundle on startup.
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources: ["mutatingwebhookconfigurations"]
+    resourceNames: ["unbounded-net-mutating-webhook"]
+    verbs: ["get", "update"]
+  # APIServices: inject caBundle on startup.
+  - apiGroups: ["apiregistration.k8s.io"]
+    resources: ["apiservices"]
+    resourceNames: ["v1alpha1.status.net.unbounded-kube.io"]
+    verbs: ["get", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: unbounded-net-controller
+  labels:
+    app.kubernetes.io/name: unbounded-net-controller
+    app.kubernetes.io/component: controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: unbounded-net-controller
+subjects:
+  - kind: ServiceAccount
+    name: unbounded-net-controller
+    namespace: {{ .Namespace }}
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: unbounded-net-controller
+  namespace: {{ .Namespace }}
+  labels:
+    app.kubernetes.io/name: unbounded-net-controller
+    app.kubernetes.io/component: controller
+rules:
+  # Leases: leader election lock in the controller namespace.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update", "patch", "delete"]
+  # Events: create namespaced events for audit/debugging
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  # EndpointSlices: leader manages service EndpointSlice for leader-only routing.
+  # Create cannot be constrained by resourceNames in RBAC, so split create from named-object ops.
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["create"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    resourceNames: ["unbounded-net-controller"]
+    verbs: ["get", "update", "delete"]
+  # Endpoints: delete stale v1/Endpoints left over from previous controller versions
+  - apiGroups: [""]
+    resources: ["endpoints"]
+    resourceNames: ["unbounded-net-controller"]
+    verbs: ["delete"]
+  # Secrets: store serving certificate TLS material.
+  # Create cannot be constrained by resourceNames in RBAC, so split create from named-object ops.
+  # The create verb below allows creating arbitrary secrets in the namespace; RBAC cannot scope
+  # create to specific resourceNames. Named-object ops are scoped separately below.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["unbounded-net-serving-cert"]
+    verbs: ["get", "update", "patch"]
+  # ConfigMaps: publish serving CA certificate for node agent TLS verification.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["unbounded-net-serving-ca"]
+    verbs: ["get", "update", "patch"]
+  # Services: read controller service ClusterIP for certificate IP SANs.
+  - apiGroups: [""]
+    resources: ["services"]
+    resourceNames: ["unbounded-net-controller"]
+    verbs: ["get"]
+  # Pods: read pods for node agent status in dashboard (controller namespace only)
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: unbounded-net-controller
+  namespace: {{ .Namespace }}
+  labels:
+    app.kubernetes.io/name: unbounded-net-controller
+    app.kubernetes.io/component: controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: unbounded-net-controller
+subjects:
+  - kind: ServiceAccount
+    name: unbounded-net-controller
+    namespace: {{ .Namespace }}
+
+---
+# Role in kube-system for reading extension-apiserver-authentication ConfigMap
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: unbounded-net-controller
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: unbounded-net-controller
+    app.kubernetes.io/component: controller
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["extension-apiserver-authentication"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: unbounded-net-controller
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: unbounded-net-controller
+    app.kubernetes.io/component: controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: unbounded-net-controller
+subjects:
+  - kind: ServiceAccount
+    name: unbounded-net-controller
+    namespace: {{ .Namespace }}

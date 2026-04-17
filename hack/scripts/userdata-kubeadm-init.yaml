@@ -1,0 +1,667 @@
+#cloud-config
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+#
+# userdata-kubeadm-init.yaml - Cloud-init userdata to bootstrap a kubeadm control plane node
+#
+# This cloud-init configuration installs the Kubernetes runtime stack and runs
+# kubeadm init (or kubeadm join --control-plane for subsequent nodes) to set up
+# a control plane node for a self-managed Kubernetes cluster.
+#
+# Usage:
+#   Before using this file, replace the following placeholders:
+#     __KUBERNETES_VERSION__      - Kubernetes version (e.g., v1.30.0)
+#     __API_SERVER_IP__           - API server load balancer public IP
+#     __API_SERVER_PORT__         - API server port (usually 6443)
+#     __BOOTSTRAP_TOKEN__         - Bootstrap token (format: [a-z0-9]{6}.[a-z0-9]{16})
+#     __CERTIFICATE_KEY__         - Certificate key for kubeadm upload-certs (64-char hex)
+#     __CLUSTER_DNS__             - Cluster DNS IP (e.g., 10.96.0.10)
+#     __POD_CIDR__                - Pod CIDR (e.g., 10.244.0.0/16)
+#     __SERVICE_CIDR__            - Service CIDR (e.g., 10.96.0.0/12)
+#     __CA_CERT_BASE64__          - Base64-encoded CA certificate
+#     __CA_KEY_BASE64__           - Base64-encoded CA private key
+#     __SA_KEY_BASE64__           - Base64-encoded service account signing key
+#     __SA_PUB_BASE64__           - Base64-encoded service account public key
+#     __TENANT_ID__               - Azure tenant ID
+#     __SUBSCRIPTION_ID__         - Azure subscription ID
+#     __CLUSTER_RG__              - Azure resource group name
+#     __SECURITY_GROUP_NAME__     - Azure network security group name
+#     __VNET_NAME__               - Azure virtual network name
+#     __VNET_RG__                 - Azure resource group for the virtual network
+#     __SUBNET_NAME__             - Azure subnet name
+#     __ROUTE_TABLE_NAME__        - Azure route table name
+#     __SCALE_SET_NAME__          - Azure VMSS name for this pool
+#     __KUBELET_CLIENT_ID__       - Client ID of the kubelet managed identity
+#     __EXTRA_NODE_LABELS__       - Extra node labels (e.g. "" or ",key=value")
+#     __CUSTOMDATA_GENERATED__    - Timestamp for customdata generation tracking
+#
+# usage-end
+
+# Ensure the system is up to date and has required packages
+package_update: true
+package_upgrade: true
+packages:
+  - curl
+  - ca-certificates
+  - apt-transport-https
+  - wireguard-tools
+  - tcpdump
+  - jq
+  - socat
+  - conntrack
+  - ethtool
+
+write_files:
+  # CA certificate for the Kubernetes cluster
+  - path: /etc/kubernetes/pki/ca.crt
+    permissions: '0644'
+    encoding: base64
+    content: __CA_CERT_BASE64__
+
+  - path: /etc/kubernetes/pki/ca.key
+    permissions: '0600'
+    encoding: base64
+    content: __CA_KEY_BASE64__
+
+  # Service account signing key pair
+  - path: /etc/kubernetes/pki/sa.key
+    permissions: '0600'
+    encoding: base64
+    content: __SA_KEY_BASE64__
+
+  - path: /etc/kubernetes/pki/sa.pub
+    permissions: '0644'
+    encoding: base64
+    content: __SA_PUB_BASE64__
+
+  # Also write CA cert to /tmp for the join bootstrap path
+  - path: /tmp/ca.crt
+    permissions: '0644'
+    encoding: base64
+    content: __CA_CERT_BASE64__
+
+  - path: /etc/dhcp/dhclient.conf
+    permissions: '0644'
+    content: |
+        timeout 10;
+
+  # AuthenticationConfiguration for fine-grained anonymous auth.
+  # Allows anonymous requests only to health check and OIDC discovery endpoints.
+  - path: /etc/kubernetes/auth-config.yaml
+    permissions: '0644'
+    content: |
+        apiVersion: apiserver.config.k8s.io/v1beta1
+        kind: AuthenticationConfiguration
+        anonymous:
+          enabled: true
+          conditions:
+            - path: /healthz
+            - path: /livez
+            - path: /readyz
+            - path: /.well-known/openid-configuration
+            - path: /openid/v1/jwks
+
+  - path: /etc/cloud/cloud.config.d/91-azure-network.cfg
+    permissions: '0600'
+    content: |
+        network:
+        version: 2
+        ethernets:
+            eth0:
+                dhcp4: true
+                dhcp6: true
+                dhcp4-overrides:
+                    route-metric: 100
+                dhcp6-overrides:
+                    route-metric: 100
+                match:
+                    driver: hv_netvsc
+                set-name: eth0
+
+  - path: /etc/kubernetes/azure.json
+    permissions: '0644'
+    content: |
+      {
+          "cloud": "AzurePublicCloud",
+          "tenantId": "__TENANT_ID__",
+          "subscriptionId": "__SUBSCRIPTION_ID__",
+          "aadClientId": "msi",
+          "aadClientSecret": "msi",
+          "resourceGroup": "__CLUSTER_RG__",
+          "location": "canadacentral",
+          "vmType": "vmss",
+          "subnetName": "__SUBNET_NAME__",
+          "securityGroupName": "__SECURITY_GROUP_NAME__",
+          "vnetName": "__VNET_NAME__",
+          "vnetResourceGroup": "__VNET_RG__",
+          "routeTableName": "__ROUTE_TABLE_NAME__",
+          "primaryAvailabilitySetName": "",
+          "primaryScaleSetName": "__SCALE_SET_NAME__",
+          "cloudProviderBackoffMode": "v2",
+          "cloudProviderBackoff": true,
+          "cloudProviderBackoffRetries": 6,
+          "cloudProviderBackoffDuration": 5,
+          "cloudProviderRateLimit": true,
+          "cloudProviderRateLimitQPS": 3,
+          "cloudProviderRateLimitBucket": 10,
+          "cloudProviderRateLimitQPSWrite": 1,
+          "cloudProviderRateLimitBucketWrite": 10,
+          "useManagedIdentityExtension": true,
+          "userAssignedIdentityID": "__KUBELET_CLIENT_ID__",
+          "useInstanceMetadata": true,
+          "loadBalancerSku": "standard",
+          "disableOutboundSNAT": false,
+          "excludeMasterFromStandardLB": true,
+          "providerVaultName": "",
+          "maximumLoadBalancerRuleCount": 250,
+          "providerKeyName": "k8s",
+          "providerKeyVersion": ""
+      }
+
+  - path: /opt/kubeadm-init.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      #
+      # kubeadm-init.sh - Initialize or join a kubeadm control plane node
+      #
+      # This script installs the Kubernetes runtime stack (containerd, kubelet,
+      # kubeadm, kubectl) and either runs kubeadm init (for the first control plane
+      # node) or kubeadm join --control-plane (for subsequent nodes).
+      #
+      # The first node to successfully create the kubeadm-init-lock ConfigMap in the
+      # "default" namespace wins the init race; all others join as control plane nodes.
+      #
+      set -euo pipefail
+
+      LOG_FILE="/var/log/kubeadm-init.log"
+      exec > >(tee -a "$LOG_FILE") 2>&1
+
+      # --- Configuration (injected by cloud-init placeholders) ---
+      KUBE_VERSION="__KUBERNETES_VERSION__"
+      API_SERVER_IP="__API_SERVER_IP__"
+      API_SERVER_PORT="__API_SERVER_PORT__"
+      BOOTSTRAP_TOKEN="__BOOTSTRAP_TOKEN__"
+      CERTIFICATE_KEY="__CERTIFICATE_KEY__"
+      CLUSTER_DNS="__CLUSTER_DNS__"
+      POD_CIDR="__POD_CIDR__"
+      SERVICE_CIDR="__SERVICE_CIDR__"
+      CLUSTER_RG="__CLUSTER_RG__"
+      SCALE_SET_NAME="__SCALE_SET_NAME__"
+      NODE_LABELS="kubernetes.azure.com/managed=false,node.kubernetes.io/exclude-from-external-load-balancers=true,net.unbounded-kube.io/provider=azure,net.unbounded-kube.io/customdata-generated=__CUSTOMDATA_GENERATED__,net.unbounded-kube.io/agentpool=__SCALE_SET_NAME____EXTRA_NODE_LABELS__"
+
+      CONTAINERD_VERSION="1.7.24"
+      RUNC_VERSION="1.2.4"
+      CRICTL_VERSION="1.32.0"
+
+      ARCH="$(dpkg --print-architecture)"
+      KUBELET_DIR="/etc/kubernetes"
+      DOWNLOAD_DIR="/var/cache/kubernetes-bootstrap"
+      mkdir -p "$DOWNLOAD_DIR"
+
+      log_info()  { echo "[INFO]  $(date '+%H:%M:%S') $*"; }
+      log_step()  { echo ""; echo "==> $*"; }
+      log_warn()  { echo "[WARN]  $(date '+%H:%M:%S') $*" >&2; }
+      log_error() { echo "[ERROR] $(date '+%H:%M:%S') $*" >&2; }
+
+      # Strip leading 'v' from version string
+      strip_v() { echo "${1#v}"; }
+
+      download_file() {
+          local url="$1" dest="$2" desc="$3"
+          local max_retries=5
+          local attempt=0
+          while (( attempt < max_retries )); do
+              if curl -fsSL --retry 3 --retry-delay 2 -o "$dest" "$url"; then
+                  return 0
+              fi
+              attempt=$((attempt + 1))
+              log_warn "Download attempt $attempt/$max_retries failed for $desc, retrying in 5s..."
+              sleep 5
+          done
+          log_error "Failed to download $desc from $url after $max_retries attempts"
+          return 1
+      }
+
+      # --- Detect node identity ---
+      detect_node_name() {
+          local name
+          name="$(hostname)"
+          if [[ -z "$name" || "$name" == "localhost" ]]; then
+              name="$(curl -sH Metadata:true 'http://169.254.169.254/metadata/instance/compute/name?api-version=2021-02-01&format=text' || hostname -f)"
+          fi
+          echo "$name"
+      }
+
+      detect_node_ips() {
+          local iface
+          iface="$(ip -4 route show default | awk '{print $5; exit}')"
+          NODE_IP_V4="$(ip -4 addr show dev "$iface" | awk '/inet / {split($2,a,"/"); print a[1]; exit}')"
+          NODE_IP_V6="$(ip -6 addr show dev "$iface" scope global | awk '/inet6/ {split($2,a,"/"); print a[1]; exit}')" || true
+          log_info "Detected node IPs: v4=$NODE_IP_V4 v6=${NODE_IP_V6:-none}"
+      }
+
+      # --- Kernel configuration ---
+      configure_kernel() {
+          log_step "Configuring kernel parameters..."
+
+          cat > /etc/modules-load.d/kubernetes.conf <<EOF
+      overlay
+      br_netfilter
+      EOF
+          modprobe overlay
+          modprobe br_netfilter
+
+          cat > /etc/sysctl.d/99-kubernetes.conf <<EOF
+      net.bridge.bridge-nf-call-iptables  = 1
+      net.bridge.bridge-nf-call-ip6tables = 1
+      net.ipv4.ip_forward                 = 1
+      net.ipv6.conf.all.forwarding        = 1
+      net.ipv4.conf.all.rp_filter         = 0
+      net.ipv4.conf.default.rp_filter     = 0
+      net.ipv4.conf.all.src_valid_mark    = 1
+      EOF
+          sysctl --system > /dev/null 2>&1
+      }
+
+      # --- Install container runtime ---
+      install_runc() {
+          log_step "Installing runc ${RUNC_VERSION}..."
+          local url="https://github.com/opencontainers/runc/releases/download/v${RUNC_VERSION}/runc.${ARCH}"
+          download_file "$url" "$DOWNLOAD_DIR/runc" "runc ${RUNC_VERSION}"
+          install -m 755 "$DOWNLOAD_DIR/runc" /usr/local/sbin/runc
+      }
+
+      install_containerd() {
+          log_step "Installing containerd ${CONTAINERD_VERSION}..."
+          local url="https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}/containerd-${CONTAINERD_VERSION}-linux-${ARCH}.tar.gz"
+          local tarball="$DOWNLOAD_DIR/containerd.tar.gz"
+          download_file "$url" "$tarball" "containerd ${CONTAINERD_VERSION}"
+          tar -xzf "$tarball" -C /usr/local
+
+          # Generate default config and enable SystemdCgroup
+          mkdir -p /etc/containerd
+          containerd config default > /etc/containerd/config.toml
+          sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+
+          # Install systemd service
+          local service_url="https://raw.githubusercontent.com/containerd/containerd/v${CONTAINERD_VERSION}/containerd.service"
+          download_file "$service_url" "/etc/systemd/system/containerd.service" "containerd systemd service"
+          systemctl daemon-reload
+          systemctl enable --now containerd
+      }
+
+      install_crictl() {
+          log_step "Installing crictl ${CRICTL_VERSION}..."
+          local url="https://github.com/kubernetes-sigs/cri-tools/releases/download/v${CRICTL_VERSION}/crictl-v${CRICTL_VERSION}-linux-${ARCH}.tar.gz"
+          local tarball="$DOWNLOAD_DIR/crictl.tar.gz"
+          download_file "$url" "$tarball" "crictl ${CRICTL_VERSION}"
+          tar -xzf "$tarball" -C /usr/local/bin
+
+          cat > /etc/crictl.yaml <<EOF
+      runtime-endpoint: unix:///run/containerd/containerd.sock
+      image-endpoint: unix:///run/containerd/containerd.sock
+      timeout: 10
+      EOF
+      }
+
+      # --- Install Kubernetes binaries ---
+      install_kubernetes_binaries() {
+          log_step "Installing Kubernetes binaries ${KUBE_VERSION}..."
+          local v
+          v="$(strip_v "$KUBE_VERSION")"
+
+          for bin in kubelet kubeadm kubectl; do
+              local url="https://dl.k8s.io/release/v${v}/bin/linux/${ARCH}/${bin}"
+              download_file "$url" "$DOWNLOAD_DIR/$bin" "$bin v${v}"
+              install -m 755 "$DOWNLOAD_DIR/$bin" /usr/bin/$bin
+          done
+          log_info "kubelet version: $(/usr/bin/kubelet --version)"
+          log_info "kubeadm version: $(/usr/bin/kubeadm version -o short)"
+      }
+
+      # --- Install credential provider ---
+      install_credential_provider() {
+          log_step "Installing Azure ACR credential provider..."
+          local kube_major_minor
+          kube_major_minor="$(echo "$KUBE_VERSION" | sed 's/^v//' | cut -d. -f1,2)"
+
+          local release_tag
+          release_tag="$(curl -fsSL 'https://api.github.com/repos/kubernetes-sigs/cloud-provider-azure/releases' | \
+              jq -r --arg mm "v${kube_major_minor}" \
+              '[.[] | select(.tag_name | startswith($mm)) | select(.prerelease == false)] | sort_by(.published_at) | last | .tag_name // empty')" || true
+
+          if [[ -z "$release_tag" ]]; then
+              log_warn "No cloud-provider-azure release found for v${kube_major_minor}.x, skipping credential provider"
+              return 0
+          fi
+
+          local binary_name="azure-acr-credential-provider-linux-${ARCH}"
+          local url="https://github.com/kubernetes-sigs/cloud-provider-azure/releases/download/${release_tag}/${binary_name}"
+          local dest_dir="/var/lib/kubelet/credential-provider"
+          mkdir -p "$dest_dir"
+          download_file "$url" "${dest_dir}/${binary_name}" "credential-provider ${release_tag}"
+          chmod 755 "${dest_dir}/${binary_name}"
+
+          cat > /var/lib/kubelet/credential-provider-config.yaml <<EOF
+      apiVersion: kubelet.config.k8s.io/v1
+      kind: CredentialProviderConfig
+      providers:
+        - name: ${binary_name}
+          matchImages:
+            - "*.azurecr.io"
+            - "*.azurecr.cn"
+            - "*.azurecr.de"
+            - "*.azurecr.us"
+          defaultCacheDuration: "10m"
+          apiVersion: credentialprovider.kubelet.k8s.io/v1
+      EOF
+      }
+
+      # --- Write kubelet systemd units ---
+      write_kubelet_service() {
+          log_step "Writing kubelet systemd service..."
+          # Use the standard kubeadm-compatible kubelet service layout.
+          # kubeadm init writes KUBELET_KUBEADM_ARGS to /var/lib/kubelet/kubeadm-flags.env
+          # and the kubelet config to /var/lib/kubelet/config.yaml, then restarts kubelet.
+          cat > /etc/systemd/system/kubelet.service <<'EOF'
+      [Unit]
+      Description=kubelet: The Kubernetes Node Agent
+      Documentation=https://kubernetes.io/docs/
+      Wants=containerd.service
+      After=containerd.service
+
+      [Service]
+      ExecStart=/usr/bin/kubelet
+      Restart=always
+      StartLimitInterval=0
+      RestartSec=10
+
+      [Install]
+      WantedBy=multi-user.target
+      EOF
+
+          mkdir -p /etc/systemd/system/kubelet.service.d
+          cat > /etc/systemd/system/kubelet.service.d/10-kubeadm.conf <<'EOF'
+      [Service]
+      Environment="KUBELET_CONFIG_ARGS=--config=/var/lib/kubelet/config.yaml --bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf"
+      Environment="KUBELET_KUBEADM_ARGS="
+      EnvironmentFile=-/var/lib/kubelet/kubeadm-flags.env
+      EnvironmentFile=-/etc/default/kubelet
+      ExecStart=
+      ExecStart=/usr/bin/kubelet $KUBELET_CONFIG_ARGS $KUBELET_KUBEADM_ARGS $KUBELET_EXTRA_ARGS
+      EOF
+
+          systemctl daemon-reload
+          systemctl enable kubelet
+      }
+
+      # --- kubeadm init or join ---
+      run_kubeadm() {
+          local node_name
+          node_name="$(detect_node_name)"
+          detect_node_ips
+
+          local node_ip_flag=""
+          if [[ -n "$NODE_IP_V4" ]] && [[ -n "${NODE_IP_V6:-}" ]]; then
+              node_ip_flag="${NODE_IP_V4},${NODE_IP_V6}"
+          elif [[ -n "$NODE_IP_V4" ]]; then
+              node_ip_flag="${NODE_IP_V4}"
+          fi
+
+          local control_plane_endpoint="${API_SERVER_IP}:${API_SERVER_PORT}"
+
+          # Determine this node's VMSS instance ID from the hostname.
+          # Hostnames follow the pattern {computerNamePrefix}{instanceId}
+          # where instanceId is a 6-digit zero-padded number (e.g., 000000).
+          local instance_id
+          instance_id="$(hostname | grep -oE '[0-9]{6}$' || echo "")"
+          log_info "VMSS instance ID: ${instance_id:-unknown}"
+
+          # Write kubeadm InitConfiguration + ClusterConfiguration
+          cat > /tmp/kubeadm-init-config.yaml <<EOF
+      apiVersion: kubeadm.k8s.io/v1beta4
+      kind: InitConfiguration
+      bootstrapTokens:
+        - token: "${BOOTSTRAP_TOKEN}"
+          ttl: "0"
+          usages:
+            - signing
+            - authentication
+      certificateKey: "${CERTIFICATE_KEY}"
+      localAPIEndpoint:
+        advertiseAddress: "${NODE_IP_V4}"
+        bindPort: ${API_SERVER_PORT}
+      nodeRegistration:
+        name: "${node_name}"
+        kubeletExtraArgs:
+          - name: hostname-override
+            value: "${node_name}"
+          - name: node-labels
+            value: "${NODE_LABELS}"
+          - name: image-credential-provider-bin-dir
+            value: /var/lib/kubelet/credential-provider
+          - name: image-credential-provider-config
+            value: /var/lib/kubelet/credential-provider-config.yaml
+      $(if [[ -n "$node_ip_flag" ]]; then
+      echo "    - name: node-ip"
+      echo "      value: \"${node_ip_flag}\""
+      fi)
+      ---
+      apiVersion: kubeadm.k8s.io/v1beta4
+      kind: ClusterConfiguration
+      kubernetesVersion: "${KUBE_VERSION}"
+      controlPlaneEndpoint: "${control_plane_endpoint}"
+      networking:
+        podSubnet: "${POD_CIDR}"
+        serviceSubnet: "${SERVICE_CIDR}"
+        dnsDomain: "cluster.local"
+      apiServer:
+        extraArgs:
+          - name: enable-bootstrap-token-auth
+            value: "true"
+          - name: service-account-issuer
+            value: "https://${API_SERVER_IP}:${API_SERVER_PORT}"
+          - name: service-account-jwks-uri
+            value: "https://${API_SERVER_IP}:${API_SERVER_PORT}/openid/v1/jwks"
+          - name: authentication-config
+            value: /etc/kubernetes/auth-config.yaml
+        extraVolumes:
+          - name: auth-config
+            hostPath: /etc/kubernetes/auth-config.yaml
+            mountPath: /etc/kubernetes/auth-config.yaml
+            readOnly: true
+        certSANs:
+          - "${API_SERVER_IP}"
+          - "${NODE_IP_V4}"
+          - "127.0.0.1"
+          - "localhost"
+      controllerManager:
+        extraArgs:
+          - name: allocate-node-cidrs
+            value: "false"
+          - name: configure-cloud-routes
+            value: "false"
+      EOF
+
+          # Write kubeadm JoinConfiguration (used by instances 1+)
+          cat > /tmp/kubeadm-join-config.yaml <<EOF
+      apiVersion: kubeadm.k8s.io/v1beta4
+      kind: JoinConfiguration
+      discovery:
+        bootstrapToken:
+          apiServerEndpoint: "${control_plane_endpoint}"
+          token: "${BOOTSTRAP_TOKEN}"
+          caCertHashes: []
+          unsafeSkipCAVerification: true
+      controlPlane:
+        localAPIEndpoint:
+          advertiseAddress: "${NODE_IP_V4}"
+          bindPort: ${API_SERVER_PORT}
+        certificateKey: "${CERTIFICATE_KEY}"
+      nodeRegistration:
+        name: "${node_name}"
+        kubeletExtraArgs:
+          - name: hostname-override
+            value: "${node_name}"
+          - name: node-labels
+            value: "${NODE_LABELS}"
+          - name: image-credential-provider-bin-dir
+            value: /var/lib/kubelet/credential-provider
+          - name: image-credential-provider-config
+            value: /var/lib/kubelet/credential-provider-config.yaml
+      $(if [[ -n "$node_ip_flag" ]]; then
+      echo "    - name: node-ip"
+      echo "      value: \"${node_ip_flag}\""
+      fi)
+      EOF
+
+          log_step "Determining init or join role..."
+
+          if [[ "$instance_id" == "000000" ]]; then
+              # Instance 0 is always the init node.
+              run_kubeadm_init "$control_plane_endpoint"
+          else
+              # Instances 1+ wait for the API server and join as control plane.
+              run_kubeadm_join "$control_plane_endpoint"
+          fi
+
+          touch /etc/kubernetes/init-complete
+          log_info "Control plane setup complete"
+      }
+
+      # run_kubeadm_init runs kubeadm init on the primary control plane node.
+      run_kubeadm_init() {
+          local control_plane_endpoint="$1"
+          log_info "Instance 000000 -- running kubeadm init"
+          kubeadm init --config /tmp/kubeadm-init-config.yaml \
+              --upload-certs \
+              --v=5 2>&1 | tee -a "$LOG_FILE"
+
+          # Copy admin kubeconfig for convenience
+          mkdir -p /root/.kube
+          cp /etc/kubernetes/admin.conf /root/.kube/config
+
+          # Configure kube-proxy to use nftables mode
+          log_step "Configuring kube-proxy for nftables mode..."
+          kubectl --kubeconfig=/etc/kubernetes/admin.conf get cm -n kube-system kube-proxy -o json \
+              | jq '.data["config.conf"] |= gsub("mode: \"\""; "mode: \"nftables\"")' \
+              | kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f - 2>/dev/null || true
+          # Restart kube-proxy pods to pick up the config change
+          kubectl --kubeconfig=/etc/kubernetes/admin.conf rollout restart ds/kube-proxy -n kube-system 2>/dev/null || true
+
+          # Grant anonymous access to OIDC discovery endpoints (AuthenticationConfiguration
+          # handles authentication; RBAC handles authorization for nonResourceURLs).
+          log_step "Creating RBAC for anonymous OIDC discovery..."
+          kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f - <<RBACEOF || true
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRole
+      metadata:
+        name: system:openid-discovery
+      rules:
+        - nonResourceURLs:
+            - /.well-known/openid-configuration
+            - /openid/v1/jwks
+          verbs:
+            - get
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+        name: system:openid-discovery
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: system:openid-discovery
+      subjects:
+        - apiGroup: rbac.authorization.k8s.io
+          kind: Group
+          name: system:unauthenticated
+      RBACEOF
+
+          # Enable auto-approval of kubelet CSRs for bootstrap
+          log_step "Configuring CSR auto-approval..."
+          kubectl --kubeconfig=/etc/kubernetes/admin.conf create clusterrolebinding \
+              kubeadm:node-autoapprove-bootstrap \
+              --clusterrole=system:certificates.k8s.io:certificatesigningrequests:nodeclient \
+              --group=system:bootstrappers:kubeadm:default-node-token \
+              2>/dev/null || true
+
+          kubectl --kubeconfig=/etc/kubernetes/admin.conf create clusterrolebinding \
+              kubeadm:node-autoapprove-certificate-rotation \
+              --clusterrole=system:certificates.k8s.io:certificatesigningrequests:selfnodeclient \
+              --group=system:nodes \
+              2>/dev/null || true
+
+          # Approve any pending CSRs from this node
+          kubectl --kubeconfig=/etc/kubernetes/admin.conf get csr -o name 2>/dev/null | while read -r csr; do
+              kubectl --kubeconfig=/etc/kubernetes/admin.conf certificate approve "$csr" 2>/dev/null || true
+          done
+      }
+
+      # run_kubeadm_join waits for the API server to be healthy and then joins
+      # as a control plane node. Since all control plane nodes have the CA key
+      # pair pre-distributed via cloud-init, kubeadm can generate the required
+      # certs locally without needing --certificate-key / upload-certs.
+      run_kubeadm_join() {
+          local control_plane_endpoint="$1"
+          log_info "Waiting for API server at ${control_plane_endpoint} before joining..."
+
+          local max_wait=900
+          local elapsed=0
+          while (( elapsed < max_wait )); do
+              if curl -sk --connect-timeout 5 "https://${control_plane_endpoint}/healthz" 2>/dev/null | grep -q "ok"; then
+                  log_info "API server is healthy (waited ${elapsed}s)"
+                  break
+              fi
+              if (( elapsed % 60 == 0 )); then
+                  log_info "  ${elapsed}s: waiting for API server..."
+              fi
+              sleep 15
+              elapsed=$((elapsed + 15))
+          done
+
+          if (( elapsed >= max_wait )); then
+              log_error "API server did not become healthy within ${max_wait}s"
+              return 1
+          fi
+
+          # Short additional delay to let the init node finish post-init setup
+          sleep 15
+
+          log_info "Joining as control plane node..."
+          kubeadm join --config /tmp/kubeadm-join-config.yaml \
+              --skip-phases=preflight \
+              --v=5 2>&1 | tee -a "$LOG_FILE"
+      }
+
+      # --- Main ---
+      main() {
+          log_step "Starting kubeadm control plane bootstrap at $(date)"
+          log_info "Kubernetes version: ${KUBE_VERSION}"
+          log_info "API server endpoint: ${API_SERVER_IP}:${API_SERVER_PORT}"
+
+          configure_kernel
+          install_runc
+          install_containerd
+          install_crictl
+          install_kubernetes_binaries
+          install_credential_provider
+          write_kubelet_service
+          run_kubeadm
+
+          log_step "Control plane bootstrap finished at $(date)"
+      }
+
+      main "$@"
+
+runcmd:
+  - |
+    echo "Starting control plane bootstrap at $(date)"
+    /opt/kubeadm-init.sh
+    echo "Control plane bootstrap completed at $(date)"
+
+final_message: |
+  Kubernetes control plane bootstrap complete!
+  Check /var/log/kubeadm-init.log for details.
