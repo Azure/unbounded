@@ -48,6 +48,7 @@ func VerifyChecksum(data []byte, checksumPath string) error {
 		// No sidecar on disk - nothing to verify.
 		return nil
 	}
+
 	if err != nil {
 		return fmt.Errorf("read checksum file %s: %w", checksumPath, err)
 	}
