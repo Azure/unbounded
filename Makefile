@@ -128,7 +128,7 @@ vulncheck: ## Run govulncheck for known vulnerabilities
 	$(GOCMD) tool govulncheck ./...
 
 gomod: ## Tidy go.mod and go.sum
-	GOPROXY=direct $(GOMOD) tidy
+	$(GOMOD) tidy
 
 ##@ Build
 

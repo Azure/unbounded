@@ -153,7 +153,7 @@ LABEL org.opencontainers.image.licenses="MIT"
 ENTRYPOINT ["/usr/local/bin/unbounded-net-node"]
 
 # Copy init script for installing CNI plugins
-COPY docker/node-agent-init.sh /usr/local/bin/node-agent-init.sh
+COPY images/net-controller/node-agent-init.sh /usr/local/bin/node-agent-init.sh
 RUN chmod 0755 /usr/local/bin/node-agent-init.sh
 
 # Copy CNI plugins first (rarely changes, cached)
