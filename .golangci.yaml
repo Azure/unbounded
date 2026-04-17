@@ -5,7 +5,7 @@ run:
     - int
     - integrationtest
   # With default 1m timeout CI sometimes fails.
-  timeout: 5m
+  timeout: 10m
 linters:
   enable:
     - goheader

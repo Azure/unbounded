@@ -72,6 +72,14 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
+      - name: Cache golangci-lint analysis
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.cache/golangci-lint
+          key: golangci-${{ runner.os }}-${{ hashFiles('go.sum', '.golangci.yaml') }}
+          restore-keys: |
+            golangci-${{ runner.os }}-
+
       - name: Install tools
         run: make install-tools
 
