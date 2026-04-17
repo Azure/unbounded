@@ -46,7 +46,6 @@ func (p *persistAppliedConfig) Do(_ context.Context) error {
 	// crash between the two writes leaves a missing sidecar, which the
 	// read path treats as a warning (not an error).
 	checksumPath := goalstates.AppliedConfigChecksumPath(p.machineName)
-
 	checksum := goalstates.ComputeChecksum(data)
 	if err := utilio.WriteFile(checksumPath, []byte(checksum+"\n"), 0o600); err != nil {
 		return fmt.Errorf("write checksum to %s: %w", checksumPath, err)

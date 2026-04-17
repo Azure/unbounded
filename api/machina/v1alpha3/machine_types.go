@@ -72,6 +72,13 @@ const (
 	// error result so that operators can diagnose the problem without
 	// logging into the machine.
 	MachineConditionCloudInitDone = "CloudInitDone"
+
+	// MachineConditionNodeUpdated indicates the result of a node
+	// update performed by the agent daemon. Status is True with
+	// Reason "Succeeded" after a successful update, and False with
+	// Reason "Failed" when the update fails. While the update is in
+	// progress the status is False with Reason "InProgress".
+	MachineConditionNodeUpdated = "NodeUpdated"
 )
 
 // Annotation keys.
