@@ -3,8 +3,8 @@
  * Licensed under the MIT License
  */
 
-// SPDX-License-Identifier: GPL-2.0
-// tunnel_encap.c -- TC egress classifier for eBPF tunnel dataplane.
+// SPDX-License-Identifier: MIT
+// unbounded_encap.c -- TC egress classifier for eBPF tunnel dataplane.
 //
 // Runs on unbounded0 egress. Intercepts packets destined to remote overlay
 // CIDRs, selects a nexthop using consistent hashing (HRW), and redirects
@@ -283,4 +283,4 @@ int unbounded_encap(struct __sk_buff *skb)
 	return TC_ACT_OK;
 }
 
-char _license[] SEC("license") = "GPL";
+char _license[] SEC("license") = "MIT";
