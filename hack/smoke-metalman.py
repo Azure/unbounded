@@ -466,7 +466,7 @@ def _restart_crashing_pods(node_name: str, namespace: str, label: str) -> None:
                 continue
             waiting = cs.get("state", {}).get("waiting", {})
             restart_count = cs.get("restartCount", 0)
-            if restart_count >= 3 or waiting.get("reason") == "CrashLoopBackOff":
+            if restart_count >= 2 or waiting.get("reason") == "CrashLoopBackOff":
                 pod_name = pod["metadata"]["name"]
                 log(f"    Deleting crashing pod {pod_name} "
                     f"(restarts={restart_count}) to reset backoff")
@@ -477,10 +477,18 @@ def _restart_crashing_pods(node_name: str, namespace: str, label: str) -> None:
                 )
 
 
-def assert_node_ready(name: str, timeout: int = 300) -> None:
-    """Assert the Node reaches Ready status within timeout seconds."""
+def assert_node_ready(name: str, timeout: int = 480) -> None:
+    """Assert the Node reaches Ready status within timeout seconds.
+
+    The timeout must be generous enough to survive multiple kindnet
+    CrashLoopBackOff cycles.  In CI each kindnet pod runs for ~2 min
+    before crashing; with a restart threshold of 2 and a 30s check
+    interval, each cycle (crash -> detect -> delete -> new pod start)
+    takes ~90-120s.  480s accommodates 3 full cycles plus ~60s for the
+    final pod to write the CNI config and the kubelet to detect it.
+    """
     log(f"  Waiting for Node '{name}' to become Ready...")
-    pod_restart_interval = 60  # seconds between CrashLoopBackOff resets
+    pod_restart_interval = 30  # seconds between CrashLoopBackOff resets
     last_restart_attempt = 0
     for elapsed in range(timeout):
         check_procs()
@@ -672,10 +680,24 @@ def main() -> None:
     time.sleep(2)
     check_procs()
 
-    log("Building metalman and kubectl-unbounded")
-    run(["go", "build", "-o", str(BINARY), "./cmd/metalman"], cwd=str(REPO_ROOT))
-    run(["go", "build", "-o", str(KUBECTL_UNBOUNDED), "./cmd/kubectl-unbounded"], cwd=str(REPO_ROOT))
+    # Start Go builds in the background so they overlap with Kubernetes
+    # setup and Docker image builds.  Both targets share the Go build
+    # cache, so concurrent compilation is safe and efficient.
+    # stdout/stderr are inherited so build output streams to the CI log
+    # in real-time.
+    log("Building metalman and kubectl-unbounded (parallel)")
+    go_builds: list[tuple[str, subprocess.Popen[Any]]] = [
+        ("metalman", subprocess.Popen(
+            ["go", "build", "-o", str(BINARY), "./cmd/metalman"],
+            cwd=str(REPO_ROOT),
+        )),
+        ("kubectl-unbounded", subprocess.Popen(
+            ["go", "build", "-o", str(KUBECTL_UNBOUNDED), "./cmd/kubectl-unbounded"],
+            cwd=str(REPO_ROOT),
+        )),
+    ]
 
+    # Kubernetes setup runs while Go builds are in progress.
     log("Cleaning up stale Kubernetes resources")
     run_quiet([KUBECTL, "-n", NODE_NS, "delete", "secret", "bmc-pass"])
     run_quiet([KUBECTL, "delete", f"machines.{API_GROUP}", NODE_NAME])
@@ -708,32 +730,56 @@ def main() -> None:
     else:
         die("Local OCI registry did not become ready")
 
-    log("Building host-ubuntu2404 OCI image")
-    docker_build_cmd = ["docker", "buildx", "build", "--load"]
+    # Build both Docker images in parallel.  They use separate GHA cache
+    # scopes so there is no contention, and buildkit handles concurrent
+    # builds safely.  The agent image is much smaller (~18s) than the host
+    # image (~5 min), so the agent build finishes well before the host
+    # build and its wall-clock cost is completely hidden.
+    # stdout/stderr are inherited so build output streams to the CI log
+    # in real-time; on failure the error details are already visible above
+    # the die() message.
+    log("Building OCI images (host-ubuntu2404 + agent-ubuntu2404 in parallel)")
+    host_build_cmd = ["docker", "buildx", "build", "--load"]
     # Use GitHub Actions cache when running in CI (env vars set by
     # docker/setup-buildx-action in the workflow).
     if os.environ.get("ACTIONS_CACHE_URL"):
-        docker_build_cmd += [
+        host_build_cmd += [
             "--cache-from", "type=gha,scope=host-ubuntu2404",
             "--cache-to", "type=gha,mode=max,scope=host-ubuntu2404",
         ]
-    run([*docker_build_cmd, "-t", IMAGE_NAME,
-         "-f", str(IMAGE_DIR / "Containerfile"), str(REPO_ROOT)])
+    host_build_cmd += ["-t", IMAGE_NAME,
+                       "-f", str(IMAGE_DIR / "Containerfile"), str(REPO_ROOT)]
 
-    log("Pushing host-ubuntu2404 OCI image to local registry")
-    run(["docker", "push", IMAGE_NAME])
-
-    log("Building agent-ubuntu2404 OCI image")
     agent_build_cmd = ["docker", "buildx", "build", "--load"]
     if os.environ.get("ACTIONS_CACHE_URL"):
         agent_build_cmd += [
             "--cache-from", "type=gha,scope=agent-ubuntu2404",
             "--cache-to", "type=gha,mode=max,scope=agent-ubuntu2404",
         ]
-    run([*agent_build_cmd, "-t", AGENT_IMAGE_NAME,
-         "-f", str(AGENT_IMAGE_DIR / "Containerfile"), str(AGENT_IMAGE_DIR)])
+    agent_build_cmd += ["-t", AGENT_IMAGE_NAME,
+                        "-f", str(AGENT_IMAGE_DIR / "Containerfile"),
+                        str(AGENT_IMAGE_DIR)]
 
-    log("Pushing agent-ubuntu2404 OCI image to local registry")
+    host_build_proc = subprocess.Popen(host_build_cmd)
+    agent_build_proc = subprocess.Popen(agent_build_cmd)
+
+    # Wait for Go builds (likely already finished during k8s setup).
+    for name, proc in go_builds:
+        rc = proc.wait()
+        if rc != 0:
+            die(f"go build {name} failed (exit code {rc})")
+    log("  Go builds finished")
+
+    # Wait for Docker image builds.
+    for name, proc in [("host-ubuntu2404", host_build_proc),
+                       ("agent-ubuntu2404", agent_build_proc)]:
+        rc = proc.wait()
+        if rc != 0:
+            die(f"Docker build of {name} failed (exit code {rc})")
+        log(f"  {name} build finished")
+
+    log("Pushing OCI images to local registry")
+    run(["docker", "push", IMAGE_NAME])
     run(["docker", "push", AGENT_IMAGE_NAME])
 
     # Reclaim disk space consumed by Docker build cache.  The host-ubuntu2404
@@ -806,7 +852,7 @@ def main() -> None:
 
     log("Waiting for kubelet to join the cluster...")
     wait_k8s_node(NODE_NAME, timeout=900)
-    assert_node_ready(NODE_NAME, timeout=300)
+    assert_node_ready(NODE_NAME, timeout=480)
 
     log("")
     log("Smoke test PASSED")
