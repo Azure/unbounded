@@ -462,7 +462,6 @@ do_site_init() {
     --name "$site_name" \
     --cluster-node-cidr "$cluster_node_cidr" \
     --cluster-pod-cidr "$cluster_pod_cidr" \
-    --cluster-service-cidr "$cluster_service_cidr" \
     --node-cidr "$remote_node_cidr" \
     --pod-cidr "$remote_pod_cidr"
 
