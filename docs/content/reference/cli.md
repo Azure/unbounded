@@ -74,7 +74,7 @@ Initialize a new unbounded-kube site. This command:
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--cni-manifests` | `string` | unbounded-net v1.1.2 release URL | Path to a local file/directory or HTTPS URL for CNI manifests |
+| `--cni-manifests` | `string` | unbounded-net release URL | Path to a local file/directory or HTTPS URL for CNI manifests |
 | `--machina-manifests` | `string` | *(embedded manifests)* | Path to a local file/directory or HTTPS URL for machina manifests |
 | `--kubeconfig` | `string` | `$KUBECONFIG` or default | Path to kubeconfig file |
 
