@@ -189,7 +189,7 @@ jobs:
 
       - name: Check for drift
         run: |
-          if [ -n "$(git diff --name-only)" ]; then
+          if ! git diff -I '//[[:space:]]*protoc[[:space:]]' --quiet; then
             echo "::error::Generated files are out of date. Run 'make generate' and commit the results."
             git diff
             exit 1
