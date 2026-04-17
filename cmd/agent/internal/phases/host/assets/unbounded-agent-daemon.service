@@ -8,10 +8,11 @@ Wants=network-online.target machines.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/unbounded-agent daemon
+ExecStart=/usr/local/bin/unbounded-agent-current daemon
 Restart=always
 RestartSec=10
 StartLimitIntervalSec=0
+OnFailure=unbounded-agent-daemon-recovery.service
 
 [Install]
 WantedBy=multi-user.target

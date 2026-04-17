@@ -97,7 +97,11 @@ rm -rf "/var/lib/machines/${MACHINE_NAME}"
 # -----------------------------------------------------------------
 echo "Removing nftables flush service..."
 systemctl disable --now nftables-flush.service 2>/dev/null || true
+systemctl disable --now unbounded-agent-daemon.service 2>/dev/null || true
+systemctl disable --now unbounded-agent-daemon-recovery.service 2>/dev/null || true
 rm -f /etc/systemd/system/nftables-flush.service
+rm -f /etc/systemd/system/unbounded-agent-daemon.service
+rm -f /etc/systemd/system/unbounded-agent-daemon-recovery.service
 rm -rf /etc/unbounded/kube
 
 # -----------------------------------------------------------------
@@ -152,6 +156,10 @@ done
 # -----------------------------------------------------------------
 echo "Removing agent binaries and configuration..."
 rm -f /usr/local/bin/unbounded-agent
+rm -f /usr/local/bin/unbounded-agent-blue
+rm -f /usr/local/bin/unbounded-agent-green
+rm -f /usr/local/bin/unbounded-agent-current
+rm -f /usr/local/bin/unbounded-agent-last-good
 rm -f /usr/local/bin/unbounded-agent-install.sh
 rm -f /usr/local/bin/unbounded-agent-uninstall.sh
 rm -rf /etc/unbounded/agent
