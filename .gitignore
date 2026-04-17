@@ -87,7 +87,7 @@ __pycache__/
 .playwright/
 
 # Rendered templates
-hack/scripts/templates/*.json
+hack/net/templates/*.json
 
 # Temporary files
 *.tmp
