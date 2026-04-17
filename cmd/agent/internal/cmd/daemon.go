@@ -15,9 +15,10 @@ import (
 func newCmdDaemon(cmdCtx *CommandContext) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "daemon",
-		Short: "Long-running daemon for node lifecycle management",
-		Long: "Long-running daemon that manages the nspawn machine lifecycle. " +
-			"Runs as a systemd unit after initial provisioning.",
+		Short: "Watch the Machine CR and reconcile the node to the desired state",
+		Long: "Long-running daemon that watches the Machine custom resource on the " +
+			"control plane and performs node updates when the desired state diverges " +
+			"from the locally applied configuration.",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx, cancel := signal.NotifyContext(cmd.Context(), os.Interrupt)
 			defer cancel()

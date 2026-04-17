@@ -127,7 +127,6 @@ func TestVerifyChecksum_ReadError(t *testing.T) {
 	}
 
 	data := []byte(`{"Version":"1.33.1"}`)
-
 	err := VerifyChecksum(data, checksumPath)
 	if err == nil {
 		t.Fatal("VerifyChecksum() expected error for unreadable path, got nil")
