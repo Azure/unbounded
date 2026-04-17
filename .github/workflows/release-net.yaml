@@ -206,77 +206,10 @@ jobs:
             done
           done
 
-  # ---------- Build release plugins (parallel matrix) ----------
-  plugin:
-    name: Plugin (${{ matrix.os }}/${{ matrix.arch }})
-    needs: [version]
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: true
-      matrix:
-        include:
-          - os: linux
-            arch: amd64
-            ext: ""
-          - os: linux
-            arch: arm64
-            ext: ""
-          - os: darwin
-            arch: amd64
-            ext: ""
-          - os: darwin
-            arch: arm64
-            ext: ""
-          - os: windows
-            arch: amd64
-            ext: ".exe"
-          - os: windows
-            arch: arm64
-            ext: ".exe"
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-        with:
-          fetch-depth: 0
-
-      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
-        with:
-          go-version-file: go.mod
-          go-download-base-url: 'https://aka.ms/golang/release/latest'
-          cache: false
-
-      - name: Go build/mod cache
-        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
-        with:
-          path: |
-            ~/.cache/go-build
-            ~/.cache/ms-go-build
-            ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('go.mod') }}-plugin-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('**/go.sum') }}
-          restore-keys: ${{ runner.os }}-go-${{ hashFiles('go.mod') }}-plugin-${{ matrix.os }}-${{ matrix.arch }}-
-
-      - name: Build kubectl plugin
-        env:
-          CGO_ENABLED: "0"
-          GOEXPERIMENT: nosystemcrypto
-          GOOS: ${{ matrix.os }}
-          GOARCH: ${{ matrix.arch }}
-        run: |
-          LDFLAGS="-s -w -X main.Version=${{ needs.version.outputs.tag }}"
-          go build -ldflags "$LDFLAGS" \
-            -o "kubectl-unbounded-net-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }}" \
-            ./tools/kubectl-plugin/cmd/kubectl-unbounded-net
-
-      - name: Upload plugin binary
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
-        with:
-          name: plugin-${{ matrix.os }}-${{ matrix.arch }}
-          path: kubectl-unbounded-net-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }}
-          retention-days: 7
-
   # ---------- Create draft release ----------
   release:
     name: Create Release
-    needs: [version, manifest, plugin]
+    needs: [version, manifest]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -360,12 +293,6 @@ jobs:
           generate_release_notes: ${{ needs.version.outputs.changelog == '' }}
           files: |
             build/unbounded-net-manifests-*.tar.gz
-            build/kubectl-plugin/kubectl-unbounded-net-linux-amd64
-            build/kubectl-plugin/kubectl-unbounded-net-linux-arm64
-            build/kubectl-plugin/kubectl-unbounded-net-darwin-amd64
-            build/kubectl-plugin/kubectl-unbounded-net-darwin-arm64
-            build/kubectl-plugin/kubectl-unbounded-net-windows-amd64.exe
-            build/kubectl-plugin/kubectl-unbounded-net-windows-arm64.exe
             sbom.spdx.json
             sbom.spdx.json.sig
             sbom.spdx.json.pem
