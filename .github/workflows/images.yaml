@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-name: Build Container Images
+name: unbounded container images
 
 on:
   push:

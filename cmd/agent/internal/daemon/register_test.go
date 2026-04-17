@@ -15,7 +15,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	v1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
+	v1alpha3 "github.com/Azure/unbounded-kube/api/machina/v1alpha3"
 	"github.com/Azure/unbounded-kube/internal/provision"
 )
 
@@ -26,6 +26,7 @@ func discardLogger() *slog.Logger {
 func fakeScheme() *runtime.Scheme {
 	s := runtime.NewScheme()
 	utilruntime.Must(v1alpha3.AddToScheme(s))
+
 	return s
 }
 
@@ -111,6 +112,7 @@ func Test_registerMachine_NotFound_Creates(t *testing.T) {
 
 	// Verify Machine CR was created.
 	var machine v1alpha3.Machine
+
 	err = c.Get(context.Background(), client.ObjectKey{Name: "test-machine"}, &machine)
 	require.NoError(t, err)
 	assert.Equal(t, "test-machine", machine.Name)
@@ -132,6 +134,7 @@ func Test_registerMachine_Labels_Preserved(t *testing.T) {
 	require.NoError(t, err)
 
 	var machine v1alpha3.Machine
+
 	err = c.Get(context.Background(), client.ObjectKey{Name: "labeled-machine"}, &machine)
 	require.NoError(t, err)
 	assert.Equal(t, map[string]string{"env": "prod", "zone": "us-west"}, machine.Spec.Kubernetes.NodeLabels)

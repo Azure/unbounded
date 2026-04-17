@@ -22,7 +22,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
-	unboundedv1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
+	unboundedv1alpha3 "github.com/Azure/unbounded-kube/api/machina/v1alpha3"
 	"github.com/Azure/unbounded-kube/internal/cloudprovider"
 	"github.com/Azure/unbounded-kube/internal/kube"
 	"github.com/Azure/unbounded-kube/internal/provision"

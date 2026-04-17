@@ -22,7 +22,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
-	v1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
+	v1alpha3 "github.com/Azure/unbounded-kube/api/machina/v1alpha3"
 	"github.com/Azure/unbounded-kube/internal/cloudprovider"
 	"github.com/Azure/unbounded-kube/internal/metalman/attestation"
 	"github.com/Azure/unbounded-kube/internal/metalman/cloudinit"

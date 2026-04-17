@@ -16,7 +16,7 @@ import (
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	v1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
+	v1alpha3 "github.com/Azure/unbounded-kube/api/machina/v1alpha3"
 	"github.com/Azure/unbounded-kube/internal/provision"
 )
 
@@ -121,6 +121,7 @@ func buildKubeClient(cfg *provision.AgentConfig, newClient kubeClientFunc) (clie
 // Machine CR may not have been pre-created by machina.
 func registerMachine(ctx context.Context, log *slog.Logger, c client.Client, cfg *provision.AgentConfig) error {
 	machineName := cfg.MachineName
+
 	token := cfg.Kubelet.BootstrapToken
 	if token == "" {
 		log.Info("bootstrap token not set, skipping Machine CR registration")
@@ -133,6 +134,7 @@ func registerMachine(ctx context.Context, log *slog.Logger, c client.Client, cfg
 			slog.String("machine", machineName),
 			slog.String("machineID", string(machine.UID)),
 		)
+
 		return nil
 	} else if apimeta.IsNoMatchError(err) {
 		return fmt.Errorf("machine CRD is not installed (machina not deployed?): %w", err)
@@ -155,6 +157,7 @@ func registerMachine(ctx context.Context, log *slog.Logger, c client.Client, cfg
 		slog.String("machine", machineName),
 		slog.String("machineID", string(machine.UID)),
 	)
+
 	return nil
 }
 

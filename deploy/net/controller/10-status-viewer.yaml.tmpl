@@ -1,0 +1,21 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: unbounded-net-status-viewer
+  labels:
+    app.kubernetes.io/name: unbounded-net-controller
+    app.kubernetes.io/component: controller
+    rbac.authorization.k8s.io/aggregate-to-view: "true"
+rules:
+  - apiGroups: ["status.net.unbounded-kube.io"]
+    resources: ["status"]
+    resourceNames: ["dashboard", "json"]
+    verbs: ["get"]
+  - apiGroups: ["status.net.unbounded-kube.io"]
+    resources: ["token"]
+    resourceNames: ["viewer"]
+    verbs: ["create"]

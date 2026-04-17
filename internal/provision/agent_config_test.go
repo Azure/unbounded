@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	v1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
+	v1alpha3 "github.com/Azure/unbounded-kube/api/machina/v1alpha3"
 )
 
 func TestAgentConfig_MarshalJSON(t *testing.T) {

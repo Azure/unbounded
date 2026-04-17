@@ -28,6 +28,22 @@ METALMAN_CMD=./cmd/metalman
 KUBECTL_UNBOUNDED_BIN=bin/kubectl-unbounded
 KUBECTL_UNBOUNDED_CMD=./cmd/kubectl-unbounded
 
+# Net binaries
+NET_CONTROLLER_BIN=bin/unbounded-net-controller
+NET_CONTROLLER_CMD=./cmd/unbounded-net-controller
+
+NET_NODE_BIN=bin/unbounded-net-node
+NET_NODE_CMD=./cmd/unbounded-net-node
+
+NET_ROUTEPLAN_DEBUG_BIN=bin/unbounded-net-routeplan-debug
+NET_ROUTEPLAN_DEBUG_CMD=./cmd/unbounded-net-routeplan-debug
+
+UNPING_BIN=bin/unping
+UNPING_CMD=./cmd/unping
+
+UNROUTE_BIN=bin/unroute
+UNROUTE_CMD=./cmd/unroute
+
 # Version is derived from the latest git tag. Override with: make VERSION=v1.0.0
 VERSION ?= $(shell git describe --tags --always 2>/dev/null || echo dev)
 GIT_COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
@@ -41,11 +57,11 @@ KUBECTL_UNBOUNDED_LDFLAGS=$(VERSION_LDFLAGS) -X github.com/Azure/unbounded-kube/
 METALMAN_TAG ?= latest
 METALMAN_IMAGE=$(CONTAINER_REGISTRY)/metalman:$(METALMAN_TAG)
 
-.PHONY: all help fmt lint test check-deps kubectl-unbounded kubectl-unbounded-build forge inventory inventory-amd64 inventory-arm64 unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve
+.PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge inventory inventory-amd64 inventory-arm64 unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute
 
 ##@ General
 
-all: kubectl-unbounded forge machina ## Build kubectl-unbounded, forge, and machina (default)
+all: kubectl-unbounded forge machina unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute ## Build all binaries (default)
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} \
@@ -53,6 +69,56 @@ help: ## Show this help
 	/^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) }' $(MAKEFILE_LIST)
 
 ##@ Development
+#
+# When CI is set (GitHub Actions sets CI=true automatically), targets run
+# without their usual dependency chains so each CI job stays independent.
+
+GOFUMPT_VERSION ?= v0.8.0
+GOLANGCI_LINT_VERSION ?= v2.11.4
+PROTOC_GEN_GO_VERSION ?= v1.36.11
+CONTROLLER_GEN_VERSION ?= v0.20.1
+
+# Pinned protoc for deterministic .pb.go output across environments.
+# Downloaded from the upstream protobuf GitHub releases.
+PROTOC_VERSION ?= 3.19.6
+PROTOC_DIR     ?= $(CURDIR)/bin/protoc
+PROTOC         := $(PROTOC_DIR)/bin/protoc
+
+# Auto-detect OS/arch for protoc release archive naming.
+# See https://github.com/protocolbuffers/protobuf/releases for valid combinations.
+PROTOC_UNAME_S := $(shell uname -s)
+PROTOC_UNAME_M := $(shell uname -m)
+ifeq ($(PROTOC_UNAME_S),Darwin)
+  PROTOC_OS ?= osx
+else
+  PROTOC_OS ?= linux
+endif
+ifeq ($(PROTOC_UNAME_M),x86_64)
+  PROTOC_ARCH ?= x86_64
+else ifeq ($(PROTOC_UNAME_M),aarch64)
+  PROTOC_ARCH ?= aarch_64
+else ifeq ($(PROTOC_UNAME_M),arm64)
+  PROTOC_ARCH ?= aarch_64
+else
+  PROTOC_ARCH ?= $(PROTOC_UNAME_M)
+endif
+
+install-tools: ## Install development tools (gofumpt, golangci-lint, protoc-gen-go)
+	go install mvdan.cc/gofumpt@$(GOFUMPT_VERSION)
+	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
+	go install google.golang.org/protobuf/cmd/protoc-gen-go@$(PROTOC_GEN_GO_VERSION)
+	go install sigs.k8s.io/controller-tools/cmd/controller-gen@$(CONTROLLER_GEN_VERSION)
+
+install-protoc: $(PROTOC) ## Download pinned protoc into bin/protoc/
+
+$(PROTOC):
+	@mkdir -p $(PROTOC_DIR)
+	@echo "Downloading protoc v$(PROTOC_VERSION) for $(PROTOC_OS)-$(PROTOC_ARCH)..."
+	@curl -fsSL -o $(PROTOC_DIR)/protoc.zip \
+	  https://github.com/protocolbuffers/protobuf/releases/download/v$(PROTOC_VERSION)/protoc-$(PROTOC_VERSION)-$(PROTOC_OS)-$(PROTOC_ARCH).zip
+	@unzip -q -o $(PROTOC_DIR)/protoc.zip -d $(PROTOC_DIR)
+	@rm $(PROTOC_DIR)/protoc.zip
+	@$(PROTOC) --version
 
 check-deps: ## Verify required tools (gofumpt, golangci-lint v2) are installed
 	@command -v $(GOFMT) >/dev/null 2>&1 || \
@@ -67,18 +133,41 @@ check-deps: ## Verify required tools (gofumpt, golangci-lint v2) are installed
 		  echo "  Install v2 with:"; \
 		  echo "  go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest"; exit 1; }
 
-fmt: check-deps ## Format all Go source files with gofumpt
+fmt: check-deps ## Format all Go source files (gofumpt + wsl_v5 whitespace)
 	$(GOFMT) -w .
+	$(GOLINT) --fix -E wsl_v5 ./...
+
+ifdef CI
+# In CI each job is independent; skip chained prerequisites.
+
+lint: ## Run golangci-lint
+	$(GOLINT) ./...
+
+test: ## Run all tests with race detector
+	$(GOTEST) -race ./...
+
+else
+# Locally, chain targets for convenience: test -> lint -> fmt -> check-deps.
 
 lint: fmt ## Run golangci-lint (implies fmt)
-	$(GOLINT) --fix -E wsl_v5 ./...
 	$(GOLINT) ./...
 
 test: lint ## Run all tests (implies lint)
 	$(GOTEST) ./...
 
+endif
+
+build: ## Build all Go packages
+	$(GOBUILD) ./...
+
+generate: install-protoc ## Run go generate for API types (deepcopy, CRDs) and protobuf
+	PATH="$(PROTOC_DIR)/bin:$$PATH" $(GOCMD) generate ./...
+
+vulncheck: ## Run govulncheck for known vulnerabilities
+	$(GOCMD) tool govulncheck ./...
+
 gomod: ## Tidy go.mod and go.sum
-	GOPROXY=direct $(GOMOD) tidy
+	$(GOMOD) tidy
 
 ##@ Build
 
@@ -116,12 +205,24 @@ machina: test machina-build ## Build the machina controller (implies test)
 metalman-build: ## Build the metalman binary (no lint/test)
 	$(GOBUILD) -ldflags '$(VERSION_LDFLAGS)' -o $(METALMAN_BIN) $(METALMAN_CMD)/main.go
 
-metalman: check-deps ## Format, lint, test, and build metalman
-	$(GOFMT) -w $(METALMAN_CMD) ./internal/metalman
-	$(GOLINT) --fix -E wsl_v5 $(METALMAN_CMD)/... ./internal/metalman/...
-	$(GOLINT) $(METALMAN_CMD)/... ./internal/metalman/...
-	$(GOTEST) $(METALMAN_CMD)/... ./internal/metalman/...
-	$(GOBUILD) -ldflags '$(VERSION_LDFLAGS)' -o $(METALMAN_BIN) $(METALMAN_CMD)/main.go
+metalman: test metalman-build ## Build the metalman controller (implies test)
+
+##@ Net Binaries
+
+unbounded-net-controller: test ## Build the unbounded-net-controller (implies test)
+	$(GOBUILD) -o $(NET_CONTROLLER_BIN) $(NET_CONTROLLER_CMD)
+
+unbounded-net-node: test ## Build the unbounded-net-node (implies test)
+	$(GOBUILD) -o $(NET_NODE_BIN) $(NET_NODE_CMD)
+
+unbounded-net-routeplan-debug: test ## Build the routeplan debug tool (implies test)
+	$(GOBUILD) -o $(NET_ROUTEPLAN_DEBUG_BIN) $(NET_ROUTEPLAN_DEBUG_CMD)
+
+unping: test ## Build the unping utility (implies test)
+	$(GOBUILD) -o $(UNPING_BIN) $(UNPING_CMD)
+
+unroute: test ## Build the unroute utility (implies test)
+	$(GOBUILD) -o $(UNROUTE_BIN) $(UNROUTE_CMD)
 
 ##@ Container Images
 

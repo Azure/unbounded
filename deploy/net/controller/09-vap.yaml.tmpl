@@ -1,0 +1,129 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+---
+# Restrict what resources the unbounded-net controller service account may create.
+# RBAC cannot scope the "create" verb by resourceNames, so this VAP ensures the
+# controller can only create resources with the expected names. This prevents the
+# SA from creating arbitrary Secrets, ConfigMaps, or EndpointSlices.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: unbounded-net-create-restriction
+  labels:
+    app.kubernetes.io/name: unbounded-net-controller
+    app.kubernetes.io/component: controller
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["secrets", "configmaps"]
+      - apiGroups: ["discovery.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["endpointslices"]
+  matchConditions:
+    - name: "is-unbounded-net-controller-sa"
+      expression: "request.userInfo.username == 'system:serviceaccount:{{ .Namespace }}:unbounded-net-controller'"
+  validations:
+    # Secrets: only unbounded-net-serving-cert
+    - expression: >-
+        request.resource.resource != 'secrets' ||
+        object.metadata.name == 'unbounded-net-serving-cert'
+      message: "unbounded-net controller may only create the unbounded-net-serving-cert secret"
+    # ConfigMaps: only unbounded-net-serving-ca
+    - expression: >-
+        request.resource.resource != 'configmaps' ||
+        object.metadata.name == 'unbounded-net-serving-ca'
+      message: "unbounded-net controller may only create the unbounded-net-serving-ca configmap"
+    # EndpointSlices: only unbounded-net-controller
+    - expression: >-
+        request.resource.resource != 'endpointslices' ||
+        object.metadata.name == 'unbounded-net-controller'
+      message: "unbounded-net controller may only create the unbounded-net-controller endpointslice"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: unbounded-net-create-restriction
+  labels:
+    app.kubernetes.io/name: unbounded-net-controller
+    app.kubernetes.io/component: controller
+spec:
+  policyName: unbounded-net-create-restriction
+  validationActions: ["Deny"]
+
+---
+# Restrict what fields unbounded-net service accounts may modify on Node objects.
+# The controller and node agent may ONLY modify:
+#   - metadata.labels with the net.unbounded-kube.io/ prefix
+#   - metadata.annotations with the net.unbounded-kube.io/ prefix
+#   - spec.podCIDR and spec.podCIDRs (Kubernetes enforces immutability after initial set)
+# All other node fields (spec.taints, spec.unschedulable, status, etc.) must remain unchanged.
+# The CEL expressions iterate over map keys dynamically rather than enumerating fields,
+# so new fields added to the Node spec in future Kubernetes versions are automatically protected.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: unbounded-net-node-field-restriction
+  labels:
+    app.kubernetes.io/name: unbounded-net-controller
+    app.kubernetes.io/component: controller
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["UPDATE"]
+        resources: ["nodes"]
+  matchConditions:
+    - name: "is-unbounded-net-sa"
+      expression: >-
+        request.userInfo.username == 'system:serviceaccount:{{ .Namespace }}:unbounded-net-controller' ||
+        request.userInfo.username == 'system:serviceaccount:{{ .Namespace }}:unbounded-net-node'
+  validations:
+    # Status must be unchanged.
+    - expression: "object.status == oldObject.status"
+      message: "unbounded-net may not modify node status"
+    # Spec: only podCIDR and podCIDRs may change. All other spec fields are protected.
+    - expression: >-
+        object.spec.all(k, k in ['podCIDR', 'podCIDRs'] || (k in oldObject.spec && object.spec[k] == oldObject.spec[k])) &&
+        oldObject.spec.all(k, k in ['podCIDR', 'podCIDRs'] || (k in object.spec && oldObject.spec[k] == object.spec[k]))
+      message: "unbounded-net may only modify spec.podCIDR and spec.podCIDRs on nodes"
+    # Labels: only net.unbounded-kube.io/ prefix labels may be added, changed, or removed.
+    - expression: >-
+        (!has(object.metadata.labels) && !has(oldObject.metadata.labels)) ||
+        (!has(oldObject.metadata.labels) && object.metadata.labels.all(k, k.startsWith('net.unbounded-kube.io/'))) ||
+        (!has(object.metadata.labels) && oldObject.metadata.labels.all(k, k.startsWith('net.unbounded-kube.io/'))) ||
+        (has(object.metadata.labels) && has(oldObject.metadata.labels) &&
+          object.metadata.labels.all(k, k.startsWith('net.unbounded-kube.io/') ||
+            (k in oldObject.metadata.labels && object.metadata.labels[k] == oldObject.metadata.labels[k])) &&
+          oldObject.metadata.labels.all(k, k.startsWith('net.unbounded-kube.io/') ||
+            (k in object.metadata.labels && oldObject.metadata.labels[k] == object.metadata.labels[k])))
+      message: "unbounded-net may only modify labels with net.unbounded-kube.io/ prefix"
+    # Annotations: only net.unbounded-kube.io/ prefix annotations may be added, changed, or removed.
+    - expression: >-
+        (!has(object.metadata.annotations) && !has(oldObject.metadata.annotations)) ||
+        (!has(oldObject.metadata.annotations) && object.metadata.annotations.all(k, k.startsWith('net.unbounded-kube.io/'))) ||
+        (!has(object.metadata.annotations) && oldObject.metadata.annotations.all(k, k.startsWith('net.unbounded-kube.io/'))) ||
+        (has(object.metadata.annotations) && has(oldObject.metadata.annotations) &&
+          object.metadata.annotations.all(k, k.startsWith('net.unbounded-kube.io/') ||
+            (k in oldObject.metadata.annotations && object.metadata.annotations[k] == oldObject.metadata.annotations[k])) &&
+          oldObject.metadata.annotations.all(k, k.startsWith('net.unbounded-kube.io/') ||
+            (k in object.metadata.annotations && oldObject.metadata.annotations[k] == object.metadata.annotations[k])))
+      message: "unbounded-net may only modify annotations with net.unbounded-kube.io/ prefix"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: unbounded-net-node-field-restriction
+  labels:
+    app.kubernetes.io/name: unbounded-net-controller
+    app.kubernetes.io/component: controller
+spec:
+  policyName: unbounded-net-node-field-restriction
+  validationActions: ["Deny"]

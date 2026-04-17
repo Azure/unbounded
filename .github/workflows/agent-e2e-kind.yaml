@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-name: Agent E2E Kind
+name: unbounded agent e2e
 
 on:
   pull_request:

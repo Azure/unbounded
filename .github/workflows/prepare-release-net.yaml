@@ -1,0 +1,64 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+name: unbounded-net prepare release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump level"
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        default: patch
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    name: Prepare Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+
+      - name: Compute next version
+        id: version
+        run: |
+          LATEST=$(git tag --list 'v*' --sort=-version:refname | head -n1)
+          if [[ -z "$LATEST" ]]; then
+            LATEST="v0.0.0"
+          fi
+          SEMVER="${LATEST#v}"
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$SEMVER"
+          case "${{ inputs.bump }}" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH + 1)) ;;
+          esac
+          TAG="v${MAJOR}.${MINOR}.${PATCH}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Next version: ${TAG} (bump: ${{ inputs.bump }}, from: ${LATEST})"
+
+      - name: Create release branch and update CHANGELOG
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          BRANCH="release/${TAG}"
+          DATE=$(date -u '+%Y-%m-%d')
+
+          git checkout -b "${BRANCH}"
+          sed -i "/^## Unreleased$/a\\\\n## ${TAG} (${DATE})" CHANGELOG.md
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add CHANGELOG.md
+          git commit -m "release: prepare ${TAG}"
+          git push origin "${BRANCH}"
+
+          echo "::notice::Release branch pushed. Create a PR at: https://github.com/${{ github.repository }}/compare/main...${BRANCH}?expand=1&title=release:+${TAG}"

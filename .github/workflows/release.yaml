@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-name: Release
+name: unbounded release
 
 on:
   # Automated release via GitHub Actions UI — computes next version from latest tag.

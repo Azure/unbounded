@@ -1,0 +1,21 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+---
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  name: v1alpha1.status.net.unbounded-kube.io
+  labels:
+    app.kubernetes.io/name: unbounded-net-controller
+    app.kubernetes.io/component: controller
+spec:
+  group: status.net.unbounded-kube.io
+  version: v1alpha1
+  groupPriorityMinimum: 1000
+  versionPriority: 100
+  insecureSkipTLSVerify: false
+  service:
+    name: unbounded-net-controller
+    namespace: {{ .Namespace }}
+    port: 9999

@@ -11,7 +11,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/yaml"
 
-	machinav1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
+	machinav1alpha3 "github.com/Azure/unbounded-kube/api/machina/v1alpha3"
 	"github.com/Azure/unbounded-kube/hack/cmd/forge/forge/site/azuredev"
 	"github.com/Azure/unbounded-kube/internal/kube"
 )
