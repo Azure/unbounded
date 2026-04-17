@@ -1,6 +1,6 @@
 # Build artifacts
 bin/
-dist/
+/dist/
 build/
 inventory.db
 *.exe
