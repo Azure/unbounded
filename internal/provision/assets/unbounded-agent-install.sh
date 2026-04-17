@@ -57,7 +57,17 @@ fi
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "${tmp_dir}"' EXIT
 
-curl -fsSL "${AGENT_URL}" | tar -xz -C "${tmp_dir}" unbounded-agent
+archive_path="${tmp_dir}/unbounded-agent.tar.gz"
+if ! curl -fsSL "${AGENT_URL}" -o "${archive_path}"; then
+    echo "failed to download unbounded-agent archive: ${AGENT_URL}" >&2
+    exit 1
+fi
+
+if ! tar -xzf "${archive_path}" -C "${tmp_dir}" unbounded-agent; then
+    echo "failed to extract unbounded-agent from archive: ${archive_path}" >&2
+    exit 1
+fi
+
 install -m 0755 "${tmp_dir}/unbounded-agent" "${NEXT_BIN}"
 
 if [ -x "${ACTIVE_BIN}" ]; then

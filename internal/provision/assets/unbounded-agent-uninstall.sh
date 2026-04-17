@@ -160,6 +160,7 @@ rm -f /usr/local/bin/unbounded-agent-blue
 rm -f /usr/local/bin/unbounded-agent-green
 rm -f /usr/local/bin/unbounded-agent-current
 rm -f /usr/local/bin/unbounded-agent-last-good
+rm -f /usr/local/bin/unbounded-agent-daemon-recovery.sh
 rm -f /usr/local/bin/unbounded-agent-install.sh
 rm -f /usr/local/bin/unbounded-agent-uninstall.sh
 rm -rf /etc/unbounded/agent

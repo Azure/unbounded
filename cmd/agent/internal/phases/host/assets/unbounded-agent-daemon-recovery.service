@@ -6,4 +6,4 @@ Description=Recover Unbounded Agent Daemon to last known good binary
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash -c 'set -euo pipefail; current="/usr/local/bin/unbounded-agent-current"; last_good="$(readlink -f /usr/local/bin/unbounded-agent-last-good || true)"; if [ -z "$last_good" ] || [ ! -x "$last_good" ]; then echo "no valid last-known-good agent binary found" >&2; exit 1; fi; ln -sfn "$last_good" "$current"; systemctl reset-failed unbounded-agent-daemon.service; systemctl restart unbounded-agent-daemon.service'
+ExecStart=/usr/local/bin/unbounded-agent-daemon-recovery.sh

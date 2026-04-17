@@ -22,6 +22,9 @@ var daemonServiceContent []byte
 //go:embed assets/unbounded-agent-daemon-recovery.service
 var daemonRecoveryServiceContent []byte
 
+//go:embed assets/unbounded-agent-daemon-recovery.sh
+var daemonRecoveryScriptContent []byte
+
 type enableDaemon struct {
 	log *slog.Logger
 }
@@ -46,6 +49,10 @@ func (d *enableDaemon) Do(ctx context.Context) error {
 
 	if err := utilio.WriteFile(recoveryUnitPath, daemonRecoveryServiceContent, 0o644); err != nil {
 		return fmt.Errorf("writing %s: %w", recoveryUnitPath, err)
+	}
+
+	if err := utilio.WriteFile(goalstates.DaemonRecoveryPath, daemonRecoveryScriptContent, 0o755); err != nil {
+		return fmt.Errorf("writing %s: %w", goalstates.DaemonRecoveryPath, err)
 	}
 
 	systemctl := utilexec.Systemctl()
