@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-name: Prepare Release
+name: unbounded-net prepare release
 
 on:
   workflow_dispatch:
