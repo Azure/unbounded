@@ -57,7 +57,7 @@ KUBECTL_UNBOUNDED_LDFLAGS=$(VERSION_LDFLAGS) -X github.com/Azure/unbounded-kube/
 METALMAN_TAG ?= latest
 METALMAN_IMAGE=$(CONTAINER_REGISTRY)/metalman:$(METALMAN_TAG)
 
-.PHONY: all help fmt lint test build vulncheck check-deps generate kubectl-unbounded forge inventory inventory-amd64 inventory-arm64 unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute
+.PHONY: all help fmt lint test build vulncheck check-deps install-tools generate kubectl-unbounded forge inventory inventory-amd64 inventory-arm64 unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute
 
 ##@ General
 
@@ -72,6 +72,13 @@ help: ## Show this help
 #
 # When CI is set (GitHub Actions sets CI=true automatically), targets run
 # without their usual dependency chains so each CI job stays independent.
+
+GOFUMPT_VERSION ?= v0.8.0
+GOLANGCI_LINT_VERSION ?= v2.11.4
+
+install-tools: ## Install development tools (gofumpt, golangci-lint)
+	go install mvdan.cc/gofumpt@$(GOFUMPT_VERSION)
+	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 
 check-deps: ## Verify required tools (gofumpt, golangci-lint v2) are installed
 	@command -v $(GOFMT) >/dev/null 2>&1 || \
