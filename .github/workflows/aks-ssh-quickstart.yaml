@@ -1,0 +1,271 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+name: AKS SSH Quickstart
+
+"on":
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: aks-ssh-quickstart-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  aks-ssh-quickstart:
+    runs-on:
+      - self-hosted
+      - pve
+    environment: azure-ci
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Verify runner dependencies
+        run: |
+          set -euo pipefail
+          for tool in az kubectl jq ssh-keygen curl; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              printf 'missing required runner dependency: %s\n' "$tool" >&2
+              exit 1
+            fi
+          done
+
+      - name: Azure login
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build kubectl-unbounded
+        run: |
+          set -euo pipefail
+          mkdir -p bin
+          go build -o bin/kubectl-unbounded ./cmd/kubectl-unbounded
+          echo "$PWD/bin" >> "$GITHUB_PATH"
+
+      - name: Generate ephemeral SSH keypair
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp/aks-ssh
+          ssh-keygen -q -t ed25519 -N '' -f .tmp/aks-ssh/id_ed25519
+          chmod 600 .tmp/aks-ssh/id_ed25519
+
+      - name: Derive run-scoped names
+        run: |
+          set -euo pipefail
+          suffix="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "AKS_NAME=ssh-quickstart-${suffix}" >> "$GITHUB_ENV"
+          echo "AKS_RG=ssh-quickstart-${suffix}" >> "$GITHUB_ENV"
+          echo "SITE_NAME=remote" >> "$GITHUB_ENV"
+          echo "VM1_NAME=ssh-node-${suffix}-1" >> "$GITHUB_ENV"
+          echo "VM1_RG=ssh-node-${suffix}-1" >> "$GITHUB_ENV"
+          echo "VM2_NAME=ssh-node-${suffix}-2" >> "$GITHUB_ENV"
+          echo "VM2_RG=ssh-node-${suffix}-2" >> "$GITHUB_ENV"
+          echo "REMOTE_NODE_CIDR=10.60.0.0/16" >> "$GITHUB_ENV"
+          echo "REMOTE_POD_CIDR=10.61.0.0/16" >> "$GITHUB_ENV"
+
+      - name: Validate remote CIDRs against AKS defaults
+        run: |
+          set -euo pipefail
+          aks_service_cidr="10.0.0.0/16"
+          aks_pod_cidr="10.244.0.0/16"
+
+          if [[ "$REMOTE_NODE_CIDR" == "$aks_service_cidr" || "$REMOTE_NODE_CIDR" == "$aks_pod_cidr" ]]; then
+            printf 'REMOTE_NODE_CIDR (%s) collides with AKS default CIDR (%s or %s)\n' "$REMOTE_NODE_CIDR" "$aks_service_cidr" "$aks_pod_cidr" >&2
+            exit 1
+          fi
+
+          if [[ "$REMOTE_POD_CIDR" == "$aks_service_cidr" || "$REMOTE_POD_CIDR" == "$aks_pod_cidr" ]]; then
+            printf 'REMOTE_POD_CIDR (%s) collides with AKS default CIDR (%s or %s)\n' "$REMOTE_POD_CIDR" "$aks_service_cidr" "$aks_pod_cidr" >&2
+            exit 1
+          fi
+
+      - name: Create AKS cluster via quickstart
+        run: |
+          set -euo pipefail
+          bash hack/scripts/aks-quickstart.sh create \
+            --name "$AKS_NAME" \
+            --resource-group "$AKS_RG" \
+            --location eastus2 \
+            --site-name "$SITE_NAME" \
+            --remote-node-cidr "$REMOTE_NODE_CIDR" \
+            --remote-pod-cidr "$REMOTE_POD_CIDR" \
+            --ssh-key .tmp/aks-ssh/id_ed25519.pub
+
+      - name: Create first SSH VM
+        run: |
+          set -euo pipefail
+          bash hack/scripts/aks-quickstart.sh create-azure-vm \
+            --name "$VM1_NAME" \
+            --resource-group "$VM1_RG" \
+            --location eastus2 \
+            --site-name "$SITE_NAME" \
+            --remote-node-cidr "$REMOTE_NODE_CIDR" \
+            --ssh-key .tmp/aks-ssh/id_ed25519.pub
+
+      - name: Create second SSH VM
+        run: |
+          set -euo pipefail
+          bash hack/scripts/aks-quickstart.sh create-azure-vm \
+            --name "$VM2_NAME" \
+            --resource-group "$VM2_RG" \
+            --location eastus2 \
+            --site-name "$SITE_NAME" \
+            --remote-node-cidr "$REMOTE_NODE_CIDR" \
+            --ssh-key .tmp/aks-ssh/id_ed25519.pub
+
+      - name: Discover VM SSH endpoints
+        run: |
+          set -euo pipefail
+          vm1_raw=$(az vm show -d --resource-group "$VM1_RG" --name "$VM1_NAME" --query publicIps -o tsv)
+          vm2_raw=$(az vm show -d --resource-group "$VM2_RG" --name "$VM2_NAME" --query publicIps -o tsv)
+
+          vm1_hosts=$(printf '%s\n' "$vm1_raw" | sed '/^[[:space:]]*$/d')
+          vm2_hosts=$(printf '%s\n' "$vm2_raw" | sed '/^[[:space:]]*$/d')
+
+          vm1_count=$(printf '%s\n' "$vm1_hosts" | wc -l)
+          vm2_count=$(printf '%s\n' "$vm2_hosts" | wc -l)
+
+          test "$vm1_count" -eq 1
+          test "$vm2_count" -eq 1
+
+          vm1_host=${vm1_hosts%%$'\n'*}
+          vm2_host=${vm2_hosts%%$'\n'*}
+          echo "VM1_HOST=$vm1_host" >> "$GITHUB_ENV"
+          echo "VM2_HOST=$vm2_host" >> "$GITHUB_ENV"
+
+      - name: Define SSH registration settings
+        run: |
+          set -euo pipefail
+          echo "WORKFLOW_KUBECONFIG=${KUBECONFIG:-$HOME/.kube/config}" >> "$GITHUB_ENV"
+          echo "SSH_USERNAME=azureuser" >> "$GITHUB_ENV"
+          echo "SSH_PRIVATE_KEY=.tmp/aks-ssh/id_ed25519" >> "$GITHUB_ENV"
+
+      - name: Verify SSH connectivity to both VMs
+        run: |
+          set -euo pipefail
+          for host in "$VM1_HOST" "$VM2_HOST"; do
+            for attempt in 1 2 3 4 5 6; do
+              if ssh -o StrictHostKeyChecking=no \
+                -o UserKnownHostsFile=/dev/null \
+                -o ConnectTimeout=10 \
+                -i "$SSH_PRIVATE_KEY" \
+                "$SSH_USERNAME"@"$host" 'echo ssh-ok'; then
+                break
+              fi
+
+              if [[ "$attempt" -eq 6 ]]; then
+                printf 'ssh did not become ready for %s after %s attempts\n' "$host" "$attempt" >&2
+                exit 1
+              fi
+
+              sleep 10
+            done
+          done
+
+      - name: Register first machine
+        run: |
+          set -euo pipefail
+          kubectl unbounded machine register \
+            --kubeconfig "$WORKFLOW_KUBECONFIG" \
+            --site "$SITE_NAME" \
+            --name worker-1 \
+            --host "$VM1_HOST" \
+            --ssh-username "$SSH_USERNAME" \
+            --ssh-private-key "$SSH_PRIVATE_KEY"
+
+      - name: Register second machine
+        run: |
+          set -euo pipefail
+          kubectl unbounded machine register \
+            --kubeconfig "$WORKFLOW_KUBECONFIG" \
+            --site "$SITE_NAME" \
+            --name worker-2 \
+            --host "$VM2_HOST" \
+            --ssh-username "$SSH_USERNAME" \
+            --ssh-private-key "$SSH_PRIVATE_KEY"
+
+      - name: Wait for both nodes to become Ready
+        run: |
+          set -euo pipefail
+          kubeconfig="${WORKFLOW_KUBECONFIG:-${KUBECONFIG:-$HOME/.kube/config}}"
+          for machine in "${SITE_NAME}-worker-1" "${SITE_NAME}-worker-2"; do
+            node=""
+            for attempt in $(seq 1 60); do
+              node=$(KUBECONFIG="$kubeconfig" kubectl get nodes -l "unbounded-kube.io/machine=$machine" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+              if [[ -n "$node" ]]; then
+                break
+              fi
+
+              if [[ "$attempt" -eq 60 ]]; then
+                printf 'node for machine %s did not appear after %s attempts\n' "$machine" "$attempt" >&2
+                exit 1
+              fi
+
+              sleep 10
+            done
+
+            KUBECONFIG="$kubeconfig" kubectl wait --for=condition=Ready "node/$node" --timeout=20m
+          done
+
+      - name: Collect cluster diagnostics
+        if: always()
+        run: |
+          set -euo pipefail
+          kubeconfig="${WORKFLOW_KUBECONFIG:-${KUBECONFIG:-$HOME/.kube/config}}"
+          mkdir -p logs
+          KUBECONFIG="$kubeconfig" kubectl get nodes -o wide > logs/nodes.txt 2>&1 || true
+          KUBECONFIG="$kubeconfig" kubectl get machines -o wide > logs/machines.txt 2>&1 || true
+          KUBECONFIG="$kubeconfig" kubectl get machines -o yaml > logs/machines.yaml 2>&1 || true
+          KUBECONFIG="$kubeconfig" kubectl describe machines > logs/machines-describe.txt 2>&1 || true
+          KUBECONFIG="$kubeconfig" kubectl -n unbounded-kube logs deploy/machina-controller > logs/machina.log 2>&1 || true
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: aks-ssh-quickstart-logs
+          path: logs/
+          retention-days: 14
+
+      - name: Cleanup Azure resources
+        if: always()
+        run: |
+          set -euo pipefail
+          aks_rg="${AKS_RG:-}"
+          vm1_rg="${VM1_RG:-}"
+          vm2_rg="${VM2_RG:-}"
+          cleanup_failed=0
+
+          delete_resource_group() {
+            local rg="$1"
+
+            if [[ -z "$rg" ]]; then
+              return 0
+            fi
+
+            if ! az group delete --yes --no-wait --name "$rg"; then
+              printf 'failed to start deletion for resource group %s\n' "$rg" >&2
+              cleanup_failed=1
+            fi
+          }
+
+          delete_resource_group "$aks_rg"
+          delete_resource_group "$vm1_rg"
+          delete_resource_group "$vm2_rg"
+
+          if [[ "$cleanup_failed" -ne 0 ]]; then
+            exit 1
+          fi
