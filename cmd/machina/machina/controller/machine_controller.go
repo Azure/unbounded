@@ -25,7 +25,7 @@ import (
 
 	stderrs "errors"
 
-	unboundedv1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
+	unboundedv1alpha3 "github.com/Azure/unbounded-kube/api/machina/v1alpha3"
 	"github.com/Azure/unbounded-kube/internal/provision"
 )
 

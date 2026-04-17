@@ -27,7 +27,7 @@ import (
 	"k8s.io/klog/v2"
 	apiregistrationclientset "k8s.io/kube-aggregator/pkg/client/clientset_generated/clientset"
 
-	unboundednetv1alpha1 "github.com/Azure/unbounded-kube/internal/net/apis/unboundednet/v1alpha1"
+	unboundednetv1alpha1 "github.com/Azure/unbounded-kube/api/net/v1alpha1"
 	"github.com/Azure/unbounded-kube/internal/net/authn"
 	"github.com/Azure/unbounded-kube/internal/net/buildinfo"
 	"github.com/Azure/unbounded-kube/internal/net/certmanager"

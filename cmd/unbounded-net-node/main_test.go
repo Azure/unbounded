@@ -11,7 +11,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
-	unboundednetv1alpha1 "github.com/Azure/unbounded-kube/internal/net/apis/unboundednet/v1alpha1"
+	unboundednetv1alpha1 "github.com/Azure/unbounded-kube/api/net/v1alpha1"
 )
 
 func gatewayNodeToUnstructured(t *testing.T, node *unboundednetv1alpha1.GatewayPoolNode) *unstructured.Unstructured {

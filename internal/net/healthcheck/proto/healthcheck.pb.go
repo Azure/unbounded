@@ -5,7 +5,7 @@
 // versions:
 // 	protoc-gen-go v1.36.11
 // 	protoc        v3.19.6
-// source: internal/net/healthcheck/proto/healthcheck.proto
+// source: healthcheck.proto
 
 package proto
 
@@ -54,11 +54,11 @@ func (x PacketType) String() string {
 }
 
 func (PacketType) Descriptor() protoreflect.EnumDescriptor {
-	return file_internal_net_healthcheck_proto_healthcheck_proto_enumTypes[0].Descriptor()
+	return file_healthcheck_proto_enumTypes[0].Descriptor()
 }
 
 func (PacketType) Type() protoreflect.EnumType {
-	return &file_internal_net_healthcheck_proto_healthcheck_proto_enumTypes[0]
+	return &file_healthcheck_proto_enumTypes[0]
 }
 
 func (x PacketType) Number() protoreflect.EnumNumber {
@@ -67,7 +67,7 @@ func (x PacketType) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use PacketType.Descriptor instead.
 func (PacketType) EnumDescriptor() ([]byte, []int) {
-	return file_internal_net_healthcheck_proto_healthcheck_proto_rawDescGZIP(), []int{0}
+	return file_healthcheck_proto_rawDescGZIP(), []int{0}
 }
 
 type HealthCheckPacket struct {
@@ -83,7 +83,7 @@ type HealthCheckPacket struct {
 
 func (x *HealthCheckPacket) Reset() {
 	*x = HealthCheckPacket{}
-	mi := &file_internal_net_healthcheck_proto_healthcheck_proto_msgTypes[0]
+	mi := &file_healthcheck_proto_msgTypes[0]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -95,7 +95,7 @@ func (x *HealthCheckPacket) String() string {
 func (*HealthCheckPacket) ProtoMessage() {}
 
 func (x *HealthCheckPacket) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_net_healthcheck_proto_healthcheck_proto_msgTypes[0]
+	mi := &file_healthcheck_proto_msgTypes[0]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -108,7 +108,7 @@ func (x *HealthCheckPacket) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HealthCheckPacket.ProtoReflect.Descriptor instead.
 func (*HealthCheckPacket) Descriptor() ([]byte, []int) {
-	return file_internal_net_healthcheck_proto_healthcheck_proto_rawDescGZIP(), []int{0}
+	return file_healthcheck_proto_rawDescGZIP(), []int{0}
 }
 
 func (x *HealthCheckPacket) GetSourceHostname() string {
@@ -146,11 +146,11 @@ func (x *HealthCheckPacket) GetType() PacketType {
 	return PacketType_REQUEST
 }
 
-var File_internal_net_healthcheck_proto_healthcheck_proto protoreflect.FileDescriptor
+var File_healthcheck_proto protoreflect.FileDescriptor
 
-const file_internal_net_healthcheck_proto_healthcheck_proto_rawDesc = "" +
+const file_healthcheck_proto_rawDesc = "" +
 	"\n" +
-	"0internal/net/healthcheck/proto/healthcheck.proto\x12\vhealthcheck\"\xe8\x01\n" +
+	"\x11healthcheck.proto\x12\vhealthcheck\"\xe8\x01\n" +
 	"\x11HealthCheckPacket\x12'\n" +
 	"\x0fsource_hostname\x18\x01 \x01(\tR\x0esourceHostname\x121\n" +
 	"\x14destination_hostname\x18\x02 \x01(\tR\x13destinationHostname\x12'\n" +
@@ -163,24 +163,24 @@ const file_internal_net_healthcheck_proto_healthcheck_proto_rawDesc = "" +
 	"\x05REPLY\x10\x01B@Z>github.com/Azure/unbounded-kube/internal/net/healthcheck/protob\x06proto3"
 
 var (
-	file_internal_net_healthcheck_proto_healthcheck_proto_rawDescOnce sync.Once
-	file_internal_net_healthcheck_proto_healthcheck_proto_rawDescData []byte
+	file_healthcheck_proto_rawDescOnce sync.Once
+	file_healthcheck_proto_rawDescData []byte
 )
 
-func file_internal_net_healthcheck_proto_healthcheck_proto_rawDescGZIP() []byte {
-	file_internal_net_healthcheck_proto_healthcheck_proto_rawDescOnce.Do(func() {
-		file_internal_net_healthcheck_proto_healthcheck_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_internal_net_healthcheck_proto_healthcheck_proto_rawDesc), len(file_internal_net_healthcheck_proto_healthcheck_proto_rawDesc)))
+func file_healthcheck_proto_rawDescGZIP() []byte {
+	file_healthcheck_proto_rawDescOnce.Do(func() {
+		file_healthcheck_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_healthcheck_proto_rawDesc), len(file_healthcheck_proto_rawDesc)))
 	})
-	return file_internal_net_healthcheck_proto_healthcheck_proto_rawDescData
+	return file_healthcheck_proto_rawDescData
 }
 
-var file_internal_net_healthcheck_proto_healthcheck_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_internal_net_healthcheck_proto_healthcheck_proto_msgTypes = make([]protoimpl.MessageInfo, 1)
-var file_internal_net_healthcheck_proto_healthcheck_proto_goTypes = []any{
+var file_healthcheck_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
+var file_healthcheck_proto_msgTypes = make([]protoimpl.MessageInfo, 1)
+var file_healthcheck_proto_goTypes = []any{
 	(PacketType)(0),           // 0: healthcheck.PacketType
 	(*HealthCheckPacket)(nil), // 1: healthcheck.HealthCheckPacket
 }
-var file_internal_net_healthcheck_proto_healthcheck_proto_depIdxs = []int32{
+var file_healthcheck_proto_depIdxs = []int32{
 	0, // 0: healthcheck.HealthCheckPacket.type:type_name -> healthcheck.PacketType
 	1, // [1:1] is the sub-list for method output_type
 	1, // [1:1] is the sub-list for method input_type
@@ -189,27 +189,27 @@ var file_internal_net_healthcheck_proto_healthcheck_proto_depIdxs = []int32{
 	0, // [0:1] is the sub-list for field type_name
 }
 
-func init() { file_internal_net_healthcheck_proto_healthcheck_proto_init() }
-func file_internal_net_healthcheck_proto_healthcheck_proto_init() {
-	if File_internal_net_healthcheck_proto_healthcheck_proto != nil {
+func init() { file_healthcheck_proto_init() }
+func file_healthcheck_proto_init() {
+	if File_healthcheck_proto != nil {
 		return
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
-			RawDescriptor: unsafe.Slice(unsafe.StringData(file_internal_net_healthcheck_proto_healthcheck_proto_rawDesc), len(file_internal_net_healthcheck_proto_healthcheck_proto_rawDesc)),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_healthcheck_proto_rawDesc), len(file_healthcheck_proto_rawDesc)),
 			NumEnums:      1,
 			NumMessages:   1,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
-		GoTypes:           file_internal_net_healthcheck_proto_healthcheck_proto_goTypes,
-		DependencyIndexes: file_internal_net_healthcheck_proto_healthcheck_proto_depIdxs,
-		EnumInfos:         file_internal_net_healthcheck_proto_healthcheck_proto_enumTypes,
-		MessageInfos:      file_internal_net_healthcheck_proto_healthcheck_proto_msgTypes,
+		GoTypes:           file_healthcheck_proto_goTypes,
+		DependencyIndexes: file_healthcheck_proto_depIdxs,
+		EnumInfos:         file_healthcheck_proto_enumTypes,
+		MessageInfos:      file_healthcheck_proto_msgTypes,
 	}.Build()
-	File_internal_net_healthcheck_proto_healthcheck_proto = out.File
-	file_internal_net_healthcheck_proto_healthcheck_proto_goTypes = nil
-	file_internal_net_healthcheck_proto_healthcheck_proto_depIdxs = nil
+	File_healthcheck_proto = out.File
+	file_healthcheck_proto_goTypes = nil
+	file_healthcheck_proto_depIdxs = nil
 }

@@ -9,6 +9,8 @@ and at the edge, without being limited by the location of your control plane.
 unbounded-kube is organized into several directories:
 
 - `api/` - where API definitions for custom resources are located.
+  - `machina/v1alpha3/` - Machine CRD types (unbounded-kube.io group).
+  - `net/v1alpha1/` - Net CRD types (net.unbounded-kube.io group): Site, GatewayPool, SitePeering, etc.
 - `bin/` - where generated binary artifacts should be placed.
 - `bpf/` - eBPF C programs for network encapsulation (compiled with clang).
 - `cmd/` - where the sources for each binary artifact are located. Each subdirectory corresponds to a binary artifact.
@@ -46,6 +48,7 @@ unbounded-kube is organized into several directories:
 - To build `metalman` without lint/test use `make metalman-build` (used in Containerfiles).
 - To build individual net binaries: `make unbounded-net-controller`, `make unbounded-net-node`, `make unbounded-net-routeplan-debug`, `make unping`, `make unroute`.
 - Net-specific build tasks (Docker images, frontend, eBPF, deploy) are in `net.Makefile`.
+- `make generate` runs `go generate ./api/...` to regenerate deepcopy functions and CRD manifests for both `api/machina/` and `api/net/`.
 
 ## Coding Standards
 

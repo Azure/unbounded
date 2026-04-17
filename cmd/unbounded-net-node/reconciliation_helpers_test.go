@@ -12,7 +12,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
-	unboundednetv1alpha1 "github.com/Azure/unbounded-kube/internal/net/apis/unboundednet/v1alpha1"
+	unboundednetv1alpha1 "github.com/Azure/unbounded-kube/api/net/v1alpha1"
 	"github.com/Azure/unbounded-kube/internal/net/healthcheck"
 )
 

@@ -4,7 +4,7 @@
 package main
 
 import (
-	unboundednetv1alpha1 "github.com/Azure/unbounded-kube/internal/net/apis/unboundednet/v1alpha1"
+	unboundednetv1alpha1 "github.com/Azure/unbounded-kube/api/net/v1alpha1"
 )
 
 // resolveSingleScope returns the tunnel protocol from a single governing CRD

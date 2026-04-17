@@ -13,7 +13,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/tools/cache"
 
-	unboundednetv1alpha1 "github.com/Azure/unbounded-kube/internal/net/apis/unboundednet/v1alpha1"
+	unboundednetv1alpha1 "github.com/Azure/unbounded-kube/api/net/v1alpha1"
 	unboundednetnetlink "github.com/Azure/unbounded-kube/internal/net/netlink"
 )
 

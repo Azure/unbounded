@@ -6,7 +6,7 @@ package main
 import (
 	"testing"
 
-	unboundednetv1alpha1 "github.com/Azure/unbounded-kube/internal/net/apis/unboundednet/v1alpha1"
+	unboundednetv1alpha1 "github.com/Azure/unbounded-kube/api/net/v1alpha1"
 )
 
 func ptrTunnelProto(t unboundednetv1alpha1.TunnelProtocol) *unboundednetv1alpha1.TunnelProtocol {

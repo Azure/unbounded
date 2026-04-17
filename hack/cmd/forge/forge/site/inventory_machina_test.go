@@ -10,7 +10,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	machinav1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
+	machinav1alpha3 "github.com/Azure/unbounded-kube/api/machina/v1alpha3"
 	"github.com/Azure/unbounded-kube/hack/cmd/forge/forge/site/azuredev"
 )
 

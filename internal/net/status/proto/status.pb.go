@@ -5,7 +5,7 @@
 // versions:
 // 	protoc-gen-go v1.36.11
 // 	protoc        v3.19.6
-// source: internal/net/status/proto/status.proto
+// source: status.proto
 
 package proto
 
@@ -38,7 +38,7 @@ type NodeStatusMessage struct {
 
 func (x *NodeStatusMessage) Reset() {
 	*x = NodeStatusMessage{}
-	mi := &file_internal_net_status_proto_status_proto_msgTypes[0]
+	mi := &file_status_proto_msgTypes[0]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -50,7 +50,7 @@ func (x *NodeStatusMessage) String() string {
 func (*NodeStatusMessage) ProtoMessage() {}
 
 func (x *NodeStatusMessage) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_net_status_proto_status_proto_msgTypes[0]
+	mi := &file_status_proto_msgTypes[0]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -63,7 +63,7 @@ func (x *NodeStatusMessage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeStatusMessage.ProtoReflect.Descriptor instead.
 func (*NodeStatusMessage) Descriptor() ([]byte, []int) {
-	return file_internal_net_status_proto_status_proto_rawDescGZIP(), []int{0}
+	return file_status_proto_rawDescGZIP(), []int{0}
 }
 
 func (x *NodeStatusMessage) GetType() string {
@@ -113,7 +113,7 @@ type NodeStatusAck struct {
 
 func (x *NodeStatusAck) Reset() {
 	*x = NodeStatusAck{}
-	mi := &file_internal_net_status_proto_status_proto_msgTypes[1]
+	mi := &file_status_proto_msgTypes[1]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -125,7 +125,7 @@ func (x *NodeStatusAck) String() string {
 func (*NodeStatusAck) ProtoMessage() {}
 
 func (x *NodeStatusAck) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_net_status_proto_status_proto_msgTypes[1]
+	mi := &file_status_proto_msgTypes[1]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -138,7 +138,7 @@ func (x *NodeStatusAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeStatusAck.ProtoReflect.Descriptor instead.
 func (*NodeStatusAck) Descriptor() ([]byte, []int) {
-	return file_internal_net_status_proto_status_proto_rawDescGZIP(), []int{1}
+	return file_status_proto_rawDescGZIP(), []int{1}
 }
 
 func (x *NodeStatusAck) GetStatus() string {
@@ -182,7 +182,7 @@ type NodeStatusFull struct {
 
 func (x *NodeStatusFull) Reset() {
 	*x = NodeStatusFull{}
-	mi := &file_internal_net_status_proto_status_proto_msgTypes[2]
+	mi := &file_status_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -194,7 +194,7 @@ func (x *NodeStatusFull) String() string {
 func (*NodeStatusFull) ProtoMessage() {}
 
 func (x *NodeStatusFull) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_net_status_proto_status_proto_msgTypes[2]
+	mi := &file_status_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -207,7 +207,7 @@ func (x *NodeStatusFull) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeStatusFull.ProtoReflect.Descriptor instead.
 func (*NodeStatusFull) Descriptor() ([]byte, []int) {
-	return file_internal_net_status_proto_status_proto_rawDescGZIP(), []int{2}
+	return file_status_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *NodeStatusFull) GetTimestampUnixNs() int64 {
@@ -304,7 +304,7 @@ type NodeStatusDelta struct {
 
 func (x *NodeStatusDelta) Reset() {
 	*x = NodeStatusDelta{}
-	mi := &file_internal_net_status_proto_status_proto_msgTypes[3]
+	mi := &file_status_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -316,7 +316,7 @@ func (x *NodeStatusDelta) String() string {
 func (*NodeStatusDelta) ProtoMessage() {}
 
 func (x *NodeStatusDelta) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_net_status_proto_status_proto_msgTypes[3]
+	mi := &file_status_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -329,7 +329,7 @@ func (x *NodeStatusDelta) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeStatusDelta.ProtoReflect.Descriptor instead.
 func (*NodeStatusDelta) Descriptor() ([]byte, []int) {
-	return file_internal_net_status_proto_status_proto_rawDescGZIP(), []int{3}
+	return file_status_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *NodeStatusDelta) GetNodeInfo() *NodeInfo {
@@ -407,7 +407,7 @@ type NodeInfo struct {
 
 func (x *NodeInfo) Reset() {
 	*x = NodeInfo{}
-	mi := &file_internal_net_status_proto_status_proto_msgTypes[4]
+	mi := &file_status_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -419,7 +419,7 @@ func (x *NodeInfo) String() string {
 func (*NodeInfo) ProtoMessage() {}
 
 func (x *NodeInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_net_status_proto_status_proto_msgTypes[4]
+	mi := &file_status_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -432,7 +432,7 @@ func (x *NodeInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeInfo.ProtoReflect.Descriptor instead.
 func (*NodeInfo) Descriptor() ([]byte, []int) {
-	return file_internal_net_status_proto_status_proto_rawDescGZIP(), []int{4}
+	return file_status_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *NodeInfo) GetName() string {
@@ -566,7 +566,7 @@ type BuildInfo struct {
 
 func (x *BuildInfo) Reset() {
 	*x = BuildInfo{}
-	mi := &file_internal_net_status_proto_status_proto_msgTypes[5]
+	mi := &file_status_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -578,7 +578,7 @@ func (x *BuildInfo) String() string {
 func (*BuildInfo) ProtoMessage() {}
 
 func (x *BuildInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_net_status_proto_status_proto_msgTypes[5]
+	mi := &file_status_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -591,7 +591,7 @@ func (x *BuildInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BuildInfo.ProtoReflect.Descriptor instead.
 func (*BuildInfo) Descriptor() ([]byte, []int) {
-	return file_internal_net_status_proto_status_proto_rawDescGZIP(), []int{5}
+	return file_status_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *BuildInfo) GetVersion() string {
@@ -628,7 +628,7 @@ type WireGuardStatusInfo struct {
 
 func (x *WireGuardStatusInfo) Reset() {
 	*x = WireGuardStatusInfo{}
-	mi := &file_internal_net_status_proto_status_proto_msgTypes[6]
+	mi := &file_status_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -640,7 +640,7 @@ func (x *WireGuardStatusInfo) String() string {
 func (*WireGuardStatusInfo) ProtoMessage() {}
 
 func (x *WireGuardStatusInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_net_status_proto_status_proto_msgTypes[6]
+	mi := &file_status_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -653,7 +653,7 @@ func (x *WireGuardStatusInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WireGuardStatusInfo.ProtoReflect.Descriptor instead.
 func (*WireGuardStatusInfo) Descriptor() ([]byte, []int) {
-	return file_internal_net_status_proto_status_proto_rawDescGZIP(), []int{6}
+	return file_status_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *WireGuardStatusInfo) GetInterface() string {
@@ -702,7 +702,7 @@ type PeerStatus struct {
 
 func (x *PeerStatus) Reset() {
 	*x = PeerStatus{}
-	mi := &file_internal_net_status_proto_status_proto_msgTypes[7]
+	mi := &file_status_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -714,7 +714,7 @@ func (x *PeerStatus) String() string {
 func (*PeerStatus) ProtoMessage() {}
 
 func (x *PeerStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_net_status_proto_status_proto_msgTypes[7]
+	mi := &file_status_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -727,7 +727,7 @@ func (x *PeerStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PeerStatus.ProtoReflect.Descriptor instead.
 func (*PeerStatus) Descriptor() ([]byte, []int) {
-	return file_internal_net_status_proto_status_proto_rawDescGZIP(), []int{7}
+	return file_status_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *PeerStatus) GetName() string {
@@ -810,7 +810,7 @@ type PeerTunnelStatus struct {
 
 func (x *PeerTunnelStatus) Reset() {
 	*x = PeerTunnelStatus{}
-	mi := &file_internal_net_status_proto_status_proto_msgTypes[8]
+	mi := &file_status_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -822,7 +822,7 @@ func (x *PeerTunnelStatus) String() string {
 func (*PeerTunnelStatus) ProtoMessage() {}
 
 func (x *PeerTunnelStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_net_status_proto_status_proto_msgTypes[8]
+	mi := &file_status_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -835,7 +835,7 @@ func (x *PeerTunnelStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PeerTunnelStatus.ProtoReflect.Descriptor instead.
 func (*PeerTunnelStatus) Descriptor() ([]byte, []int) {
-	return file_internal_net_status_proto_status_proto_rawDescGZIP(), []int{8}
+	return file_status_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *PeerTunnelStatus) GetProtocol() string {
@@ -906,7 +906,7 @@ type RoutingTableInfo struct {
 
 func (x *RoutingTableInfo) Reset() {
 	*x = RoutingTableInfo{}
-	mi := &file_internal_net_status_proto_status_proto_msgTypes[9]
+	mi := &file_status_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -918,7 +918,7 @@ func (x *RoutingTableInfo) String() string {
 func (*RoutingTableInfo) ProtoMessage() {}
 
 func (x *RoutingTableInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_net_status_proto_status_proto_msgTypes[9]
+	mi := &file_status_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -931,7 +931,7 @@ func (x *RoutingTableInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RoutingTableInfo.ProtoReflect.Descriptor instead.
 func (*RoutingTableInfo) Descriptor() ([]byte, []int) {
-	return file_internal_net_status_proto_status_proto_rawDescGZIP(), []int{9}
+	return file_status_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *RoutingTableInfo) GetRoutes() []*RouteEntry {
@@ -968,7 +968,7 @@ type RouteEntry struct {
 
 func (x *RouteEntry) Reset() {
 	*x = RouteEntry{}
-	mi := &file_internal_net_status_proto_status_proto_msgTypes[10]
+	mi := &file_status_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -980,7 +980,7 @@ func (x *RouteEntry) String() string {
 func (*RouteEntry) ProtoMessage() {}
 
 func (x *RouteEntry) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_net_status_proto_status_proto_msgTypes[10]
+	mi := &file_status_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -993,7 +993,7 @@ func (x *RouteEntry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RouteEntry.ProtoReflect.Descriptor instead.
 func (*RouteEntry) Descriptor() ([]byte, []int) {
-	return file_internal_net_status_proto_status_proto_rawDescGZIP(), []int{10}
+	return file_status_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *RouteEntry) GetDestination() string {
@@ -1043,7 +1043,7 @@ type NextHop struct {
 
 func (x *NextHop) Reset() {
 	*x = NextHop{}
-	mi := &file_internal_net_status_proto_status_proto_msgTypes[11]
+	mi := &file_status_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1055,7 +1055,7 @@ func (x *NextHop) String() string {
 func (*NextHop) ProtoMessage() {}
 
 func (x *NextHop) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_net_status_proto_status_proto_msgTypes[11]
+	mi := &file_status_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1068,7 +1068,7 @@ func (x *NextHop) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NextHop.ProtoReflect.Descriptor instead.
 func (*NextHop) Descriptor() ([]byte, []int) {
-	return file_internal_net_status_proto_status_proto_rawDescGZIP(), []int{11}
+	return file_status_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *NextHop) GetGateway() string {
@@ -1151,7 +1151,7 @@ type OptionalBool struct {
 
 func (x *OptionalBool) Reset() {
 	*x = OptionalBool{}
-	mi := &file_internal_net_status_proto_status_proto_msgTypes[12]
+	mi := &file_status_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1163,7 +1163,7 @@ func (x *OptionalBool) String() string {
 func (*OptionalBool) ProtoMessage() {}
 
 func (x *OptionalBool) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_net_status_proto_status_proto_msgTypes[12]
+	mi := &file_status_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1176,7 +1176,7 @@ func (x *OptionalBool) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use OptionalBool.ProtoReflect.Descriptor instead.
 func (*OptionalBool) Descriptor() ([]byte, []int) {
-	return file_internal_net_status_proto_status_proto_rawDescGZIP(), []int{12}
+	return file_status_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *OptionalBool) GetValue() bool {
@@ -1198,7 +1198,7 @@ type NextHopInfo struct {
 
 func (x *NextHopInfo) Reset() {
 	*x = NextHopInfo{}
-	mi := &file_internal_net_status_proto_status_proto_msgTypes[13]
+	mi := &file_status_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1210,7 +1210,7 @@ func (x *NextHopInfo) String() string {
 func (*NextHopInfo) ProtoMessage() {}
 
 func (x *NextHopInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_net_status_proto_status_proto_msgTypes[13]
+	mi := &file_status_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1223,7 +1223,7 @@ func (x *NextHopInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NextHopInfo.ProtoReflect.Descriptor instead.
 func (*NextHopInfo) Descriptor() ([]byte, []int) {
-	return file_internal_net_status_proto_status_proto_rawDescGZIP(), []int{13}
+	return file_status_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *NextHopInfo) GetObjectName() string {
@@ -1258,7 +1258,7 @@ type RouteType struct {
 
 func (x *RouteType) Reset() {
 	*x = RouteType{}
-	mi := &file_internal_net_status_proto_status_proto_msgTypes[14]
+	mi := &file_status_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1270,7 +1270,7 @@ func (x *RouteType) String() string {
 func (*RouteType) ProtoMessage() {}
 
 func (x *RouteType) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_net_status_proto_status_proto_msgTypes[14]
+	mi := &file_status_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1283,7 +1283,7 @@ func (x *RouteType) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RouteType.ProtoReflect.Descriptor instead.
 func (*RouteType) Descriptor() ([]byte, []int) {
-	return file_internal_net_status_proto_status_proto_rawDescGZIP(), []int{14}
+	return file_status_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *RouteType) GetType() string {
@@ -1313,7 +1313,7 @@ type HealthCheckStatus struct {
 
 func (x *HealthCheckStatus) Reset() {
 	*x = HealthCheckStatus{}
-	mi := &file_internal_net_status_proto_status_proto_msgTypes[15]
+	mi := &file_status_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1325,7 +1325,7 @@ func (x *HealthCheckStatus) String() string {
 func (*HealthCheckStatus) ProtoMessage() {}
 
 func (x *HealthCheckStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_net_status_proto_status_proto_msgTypes[15]
+	mi := &file_status_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1338,7 +1338,7 @@ func (x *HealthCheckStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HealthCheckStatus.ProtoReflect.Descriptor instead.
 func (*HealthCheckStatus) Descriptor() ([]byte, []int) {
-	return file_internal_net_status_proto_status_proto_rawDescGZIP(), []int{15}
+	return file_status_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *HealthCheckStatus) GetHealthy() bool {
@@ -1382,7 +1382,7 @@ type HealthCheckPeerStatus struct {
 
 func (x *HealthCheckPeerStatus) Reset() {
 	*x = HealthCheckPeerStatus{}
-	mi := &file_internal_net_status_proto_status_proto_msgTypes[16]
+	mi := &file_status_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1394,7 +1394,7 @@ func (x *HealthCheckPeerStatus) String() string {
 func (*HealthCheckPeerStatus) ProtoMessage() {}
 
 func (x *HealthCheckPeerStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_net_status_proto_status_proto_msgTypes[16]
+	mi := &file_status_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1407,7 +1407,7 @@ func (x *HealthCheckPeerStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HealthCheckPeerStatus.ProtoReflect.Descriptor instead.
 func (*HealthCheckPeerStatus) Descriptor() ([]byte, []int) {
-	return file_internal_net_status_proto_status_proto_rawDescGZIP(), []int{16}
+	return file_status_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *HealthCheckPeerStatus) GetEnabled() bool {
@@ -1450,7 +1450,7 @@ type NodeError struct {
 
 func (x *NodeError) Reset() {
 	*x = NodeError{}
-	mi := &file_internal_net_status_proto_status_proto_msgTypes[17]
+	mi := &file_status_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1462,7 +1462,7 @@ func (x *NodeError) String() string {
 func (*NodeError) ProtoMessage() {}
 
 func (x *NodeError) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_net_status_proto_status_proto_msgTypes[17]
+	mi := &file_status_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1475,7 +1475,7 @@ func (x *NodeError) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeError.ProtoReflect.Descriptor instead.
 func (*NodeError) Descriptor() ([]byte, []int) {
-	return file_internal_net_status_proto_status_proto_rawDescGZIP(), []int{17}
+	return file_status_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *NodeError) GetType() string {
@@ -1511,7 +1511,7 @@ type NodePodInfo struct {
 
 func (x *NodePodInfo) Reset() {
 	*x = NodePodInfo{}
-	mi := &file_internal_net_status_proto_status_proto_msgTypes[18]
+	mi := &file_status_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1523,7 +1523,7 @@ func (x *NodePodInfo) String() string {
 func (*NodePodInfo) ProtoMessage() {}
 
 func (x *NodePodInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_net_status_proto_status_proto_msgTypes[18]
+	mi := &file_status_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1536,7 +1536,7 @@ func (x *NodePodInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodePodInfo.ProtoReflect.Descriptor instead.
 func (*NodePodInfo) Descriptor() ([]byte, []int) {
-	return file_internal_net_status_proto_status_proto_rawDescGZIP(), []int{18}
+	return file_status_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *NodePodInfo) GetPodName() string {
@@ -1578,7 +1578,7 @@ type BpfEntry struct {
 
 func (x *BpfEntry) Reset() {
 	*x = BpfEntry{}
-	mi := &file_internal_net_status_proto_status_proto_msgTypes[19]
+	mi := &file_status_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1590,7 +1590,7 @@ func (x *BpfEntry) String() string {
 func (*BpfEntry) ProtoMessage() {}
 
 func (x *BpfEntry) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_net_status_proto_status_proto_msgTypes[19]
+	mi := &file_status_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1603,7 +1603,7 @@ func (x *BpfEntry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BpfEntry.ProtoReflect.Descriptor instead.
 func (*BpfEntry) Descriptor() ([]byte, []int) {
-	return file_internal_net_status_proto_status_proto_rawDescGZIP(), []int{19}
+	return file_status_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *BpfEntry) GetCidr() string {
@@ -1669,11 +1669,11 @@ func (x *BpfEntry) GetHealthy() bool {
 	return false
 }
 
-var File_internal_net_status_proto_status_proto protoreflect.FileDescriptor
+var File_status_proto protoreflect.FileDescriptor
 
-const file_internal_net_status_proto_status_proto_rawDesc = "" +
+const file_status_proto_rawDesc = "" +
 	"\n" +
-	"&internal/net/status/proto/status.proto\x12\x16unboundednet.status.v1\"\xe8\x01\n" +
+	"\fstatus.proto\x12\x16unboundednet.status.v1\"\xe8\x01\n" +
 	"\x11NodeStatusMessage\x12\x12\n" +
 	"\x04type\x18\x01 \x01(\tR\x04type\x12\x1b\n" +
 	"\tnode_name\x18\x02 \x01(\tR\bnodeName\x12#\n" +
@@ -1843,19 +1843,19 @@ const file_internal_net_status_proto_status_proto_rawDesc = "" +
 	"\ahealthy\x18\t \x01(\bR\ahealthyB;Z9github.com/Azure/unbounded-kube/internal/net/status/protob\x06proto3"
 
 var (
-	file_internal_net_status_proto_status_proto_rawDescOnce sync.Once
-	file_internal_net_status_proto_status_proto_rawDescData []byte
+	file_status_proto_rawDescOnce sync.Once
+	file_status_proto_rawDescData []byte
 )
 
-func file_internal_net_status_proto_status_proto_rawDescGZIP() []byte {
-	file_internal_net_status_proto_status_proto_rawDescOnce.Do(func() {
-		file_internal_net_status_proto_status_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_internal_net_status_proto_status_proto_rawDesc), len(file_internal_net_status_proto_status_proto_rawDesc)))
+func file_status_proto_rawDescGZIP() []byte {
+	file_status_proto_rawDescOnce.Do(func() {
+		file_status_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_status_proto_rawDesc), len(file_status_proto_rawDesc)))
 	})
-	return file_internal_net_status_proto_status_proto_rawDescData
+	return file_status_proto_rawDescData
 }
 
-var file_internal_net_status_proto_status_proto_msgTypes = make([]protoimpl.MessageInfo, 22)
-var file_internal_net_status_proto_status_proto_goTypes = []any{
+var file_status_proto_msgTypes = make([]protoimpl.MessageInfo, 22)
+var file_status_proto_goTypes = []any{
 	(*NodeStatusMessage)(nil),     // 0: unboundednet.status.v1.NodeStatusMessage
 	(*NodeStatusAck)(nil),         // 1: unboundednet.status.v1.NodeStatusAck
 	(*NodeStatusFull)(nil),        // 2: unboundednet.status.v1.NodeStatusFull
@@ -1879,7 +1879,7 @@ var file_internal_net_status_proto_status_proto_goTypes = []any{
 	nil,                           // 20: unboundednet.status.v1.NodeInfo.K8sLabelsEntry
 	nil,                           // 21: unboundednet.status.v1.PeerStatus.RouteDistancesEntry
 }
-var file_internal_net_status_proto_status_proto_depIdxs = []int32{
+var file_status_proto_depIdxs = []int32{
 	2,  // 0: unboundednet.status.v1.NodeStatusMessage.status:type_name -> unboundednet.status.v1.NodeStatusFull
 	3,  // 1: unboundednet.status.v1.NodeStatusMessage.delta:type_name -> unboundednet.status.v1.NodeStatusDelta
 	4,  // 2: unboundednet.status.v1.NodeStatusFull.node_info:type_name -> unboundednet.status.v1.NodeInfo
@@ -1914,26 +1914,26 @@ var file_internal_net_status_proto_status_proto_depIdxs = []int32{
 	0,  // [0:27] is the sub-list for field type_name
 }
 
-func init() { file_internal_net_status_proto_status_proto_init() }
-func file_internal_net_status_proto_status_proto_init() {
-	if File_internal_net_status_proto_status_proto != nil {
+func init() { file_status_proto_init() }
+func file_status_proto_init() {
+	if File_status_proto != nil {
 		return
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
-			RawDescriptor: unsafe.Slice(unsafe.StringData(file_internal_net_status_proto_status_proto_rawDesc), len(file_internal_net_status_proto_status_proto_rawDesc)),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_status_proto_rawDesc), len(file_status_proto_rawDesc)),
 			NumEnums:      0,
 			NumMessages:   22,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
-		GoTypes:           file_internal_net_status_proto_status_proto_goTypes,
-		DependencyIndexes: file_internal_net_status_proto_status_proto_depIdxs,
-		MessageInfos:      file_internal_net_status_proto_status_proto_msgTypes,
+		GoTypes:           file_status_proto_goTypes,
+		DependencyIndexes: file_status_proto_depIdxs,
+		MessageInfos:      file_status_proto_msgTypes,
 	}.Build()
-	File_internal_net_status_proto_status_proto = out.File
-	file_internal_net_status_proto_status_proto_goTypes = nil
-	file_internal_net_status_proto_status_proto_depIdxs = nil
+	File_status_proto = out.File
+	file_status_proto_goTypes = nil
+	file_status_proto_depIdxs = nil
 }
