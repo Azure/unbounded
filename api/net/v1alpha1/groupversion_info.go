@@ -6,4 +6,4 @@
 package v1alpha1
 
 //go:generate controller-gen object:headerFile=../../../hack/boilerplate.go.txt paths=.
-//go:generate controller-gen crd paths=. output:crd:dir=../../../deploy/net/crds
+//go:generate controller-gen crd:headerFile=../../../hack/boilerplate.yaml.txt paths=. output:crd:dir=../../../deploy/net/crds
