@@ -41,7 +41,7 @@ KUBECTL_UNBOUNDED_LDFLAGS=$(VERSION_LDFLAGS) -X github.com/Azure/unbounded-kube/
 METALMAN_TAG ?= latest
 METALMAN_IMAGE=$(CONTAINER_REGISTRY)/metalman:$(METALMAN_TAG)
 
-.PHONY: all help fmt lint test check-deps kubectl-unbounded forge inventory inventory-amd64 inventory-arm64 unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve
+.PHONY: all help fmt lint test check-deps kubectl-unbounded kubectl-unbounded-build forge inventory inventory-amd64 inventory-arm64 unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve
 
 ##@ General
 
@@ -82,8 +82,10 @@ gomod: ## Tidy go.mod and go.sum
 
 ##@ Build
 
-kubectl-unbounded: test machina-manifests ## Build the kubectl-unbounded plugin (implies test)
+kubectl-unbounded-build: machina-manifests ## Build the kubectl-unbounded binary (no lint/test)
 	$(GOBUILD) -ldflags '$(KUBECTL_UNBOUNDED_LDFLAGS)' -o $(KUBECTL_UNBOUNDED_BIN) $(KUBECTL_UNBOUNDED_CMD)/main.go
+
+kubectl-unbounded: test kubectl-unbounded-build ## Build the kubectl-unbounded plugin (implies test)
 
 forge: test ## Build the forge dev tool (implies test)
 	$(GOBUILD) -o $(FORGE_BIN) $(FORGE_CMD)/main.go

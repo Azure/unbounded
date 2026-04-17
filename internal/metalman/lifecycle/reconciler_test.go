@@ -30,7 +30,7 @@ func TestRepaveTimeout(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "node-timeout", Namespace: "default"},
 		Spec: v1alpha3.MachineSpec{
 			Operations: &v1alpha3.OperationsSpec{
-				RebootCounter:  1,
+				RebootCounter: 1,
 				RepaveCounter: 1,
 			},
 		},
@@ -83,7 +83,7 @@ func TestRepaveTimeoutNotYetExpired(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "node-not-expired", Namespace: "default"},
 		Spec: v1alpha3.MachineSpec{
 			Operations: &v1alpha3.OperationsSpec{
-				RebootCounter:  1,
+				RebootCounter: 1,
 				RepaveCounter: 1,
 			},
 		},
@@ -139,13 +139,13 @@ func TestNoOpWithoutPendingRepave(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "node-noop", Namespace: "default"},
 		Spec: v1alpha3.MachineSpec{
 			Operations: &v1alpha3.OperationsSpec{
-				RebootCounter:  1,
+				RebootCounter: 1,
 				RepaveCounter: 1,
 			},
 		},
 		Status: v1alpha3.MachineStatus{
 			Operations: &v1alpha3.OperationsStatus{
-				RebootCounter:  1,
+				RebootCounter: 1,
 				RepaveCounter: 1,
 			},
 		},
@@ -176,7 +176,7 @@ func TestNoOpWhenRepaveSucceeded(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "node-succeeded", Namespace: "default"},
 		Spec: v1alpha3.MachineSpec{
 			Operations: &v1alpha3.OperationsSpec{
-				RebootCounter:  1,
+				RebootCounter: 1,
 				RepaveCounter: 1,
 			},
 		},

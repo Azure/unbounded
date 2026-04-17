@@ -151,7 +151,7 @@ func TestRedfishRebootCycle(t *testing.T) {
 				},
 			},
 			Operations: &v1alpha3.OperationsSpec{
-				RebootCounter:  1,
+				RebootCounter: 1,
 				RepaveCounter: 1,
 			},
 		},
@@ -389,7 +389,7 @@ func TestRedfishPowerOnTimeoutRetry(t *testing.T) {
 				},
 			},
 			Operations: &v1alpha3.OperationsSpec{
-				RebootCounter:  22,
+				RebootCounter: 22,
 				RepaveCounter: 22,
 			},
 		},
@@ -706,7 +706,7 @@ func TestRedfishExactlyOnceSemantics(t *testing.T) {
 				},
 			},
 			Operations: &v1alpha3.OperationsSpec{
-				RebootCounter:  3,
+				RebootCounter: 3,
 				RepaveCounter: 1,
 			},
 		},
