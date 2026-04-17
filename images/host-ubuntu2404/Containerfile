@@ -23,9 +23,21 @@ FROM docker.io/library/ubuntu:24.04 AS build
 
 ARG TARGETARCH
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        cpio curl ca-certificates qemu-utils libguestfs-tools linux-image-generic pigz \
-    && rm -rf /var/lib/apt/lists/*
+# Retry loop: Ubuntu mirrors rate-limit large downloads (e.g. linux-firmware,
+# ~600 MB) with HTTP 429.  apt's built-in Acquire::Retries does not add a
+# delay between attempts, so a shell-level retry with sleep is needed.
+RUN apt-get update && \
+    ok=false && \
+    for attempt in 1 2 3 4 5; do \
+      if apt-get install -y --no-install-recommends \
+           cpio curl ca-certificates qemu-utils libguestfs-tools linux-image-generic pigz; then \
+        ok=true; break; \
+      fi; \
+      echo "apt-get install failed (attempt $attempt/5), retrying in 30s..."; \
+      sleep 30; \
+      apt-get update; \
+    done && $ok && \
+    rm -rf /var/lib/apt/lists/*
 
 # ── Download netboot artifacts ──────────────────────────────────────
 # Ubuntu netboot layout differs by architecture:

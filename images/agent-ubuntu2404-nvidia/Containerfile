@@ -4,21 +4,20 @@
 # TODO: switch to debootstrap-based base image once we have the container registry set up
 FROM docker.io/library/ubuntu:noble@sha256:84e77dee7d1bc93fb029a45e3c6cb9d8aa4831ccfcc7103d36e876938d28895b
 
-RUN apt-get update \
-    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    systemd \
-    systemd-sysv \
-    dbus \
-    curl \
-    ca-certificates \
-    iproute2 \
-    nftables \
-    kmod \
-    udev \
-    procps \
-    wireguard-tools \
-    gpg \
-    && rm -rf /var/lib/apt/lists/*
+# Retry loop: Ubuntu mirrors occasionally rate-limit with HTTP 429.
+RUN apt-get update && \
+    ok=false && \
+    for attempt in 1 2 3 4 5; do \
+      if DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+           systemd systemd-sysv dbus curl ca-certificates \
+           iproute2 nftables kmod udev procps wireguard-tools gpg; then \
+        ok=true; break; \
+      fi; \
+      echo "apt-get install failed (attempt $attempt/5), retrying in 30s..."; \
+      sleep 30; \
+      apt-get update; \
+    done && $ok && \
+    rm -rf /var/lib/apt/lists/*
 
 # Install NVIDIA Container Toolkit.
 # https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html
