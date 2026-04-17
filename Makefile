@@ -133,14 +133,14 @@ check-deps: ## Verify required tools (gofumpt, golangci-lint v2) are installed
 		  echo "  Install v2 with:"; \
 		  echo "  go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest"; exit 1; }
 
-fmt: check-deps ## Format all Go source files with gofumpt
+fmt: check-deps ## Format all Go source files (gofumpt + wsl_v5 whitespace)
 	$(GOFMT) -w .
+	$(GOLINT) --fix -E wsl_v5 ./...
 
 ifdef CI
 # In CI each job is independent; skip chained prerequisites.
 
 lint: ## Run golangci-lint
-	$(GOLINT) --fix -E wsl_v5 ./...
 	$(GOLINT) ./...
 
 test: ## Run all tests with race detector
@@ -150,7 +150,6 @@ else
 # Locally, chain targets for convenience: test -> lint -> fmt -> check-deps.
 
 lint: fmt ## Run golangci-lint (implies fmt)
-	$(GOLINT) --fix -E wsl_v5 ./...
 	$(GOLINT) ./...
 
 test: lint ## Run all tests (implies lint)
@@ -204,12 +203,7 @@ machina: test machina-build ## Build the machina controller (implies test)
 metalman-build: ## Build the metalman binary (no lint/test)
 	$(GOBUILD) -ldflags '$(VERSION_LDFLAGS)' -o $(METALMAN_BIN) $(METALMAN_CMD)/main.go
 
-metalman: check-deps ## Format, lint, test, and build metalman
-	$(GOFMT) -w $(METALMAN_CMD) ./internal/metalman
-	$(GOLINT) --fix -E wsl_v5 $(METALMAN_CMD)/... ./internal/metalman/...
-	$(GOLINT) $(METALMAN_CMD)/... ./internal/metalman/...
-	$(GOTEST) $(METALMAN_CMD)/... ./internal/metalman/...
-	$(GOBUILD) -ldflags '$(VERSION_LDFLAGS)' -o $(METALMAN_BIN) $(METALMAN_CMD)/main.go
+metalman: test metalman-build ## Build the metalman controller (implies test)
 
 ##@ Net Binaries
 
