@@ -1,0 +1,17 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[Unit]
+Description=Unbounded Agent Daemon
+After=network-online.target machines.target
+Wants=network-online.target machines.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/unbounded-agent daemon
+Restart=always
+RestartSec=10
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target

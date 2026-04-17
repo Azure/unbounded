@@ -37,7 +37,7 @@ func (t *removeAgentArtifacts) Do(_ context.Context) error {
 
 	// Remove directories.
 	for _, dir := range []string{
-		"/etc/unbounded-agent",
+		"/etc/unbounded/agent",
 		"/tmp/unbounded-agent",
 	} {
 		removeAllIfExists(t.log, dir)

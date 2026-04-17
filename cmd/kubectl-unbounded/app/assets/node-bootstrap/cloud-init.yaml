@@ -7,7 +7,7 @@
 # -----------------------------------------------------------------
 
 write_files:
-  - path: /etc/unbounded-agent/config.json
+  - path: /etc/unbounded/agent/config.json
     permissions: "0600"
     content: |
 {{ .AgentConfigJSON | indent 6 }}
@@ -18,5 +18,5 @@ write_files:
 {{ .InstallScript | indent 6 }}
 
 runcmd:
-  - export UNBOUNDED_AGENT_CONFIG_FILE=/etc/unbounded-agent/config.json
+  - export UNBOUNDED_AGENT_CONFIG_FILE=/etc/unbounded/agent/config.json
   - bash /usr/local/bin/unbounded-agent-install.sh

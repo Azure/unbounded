@@ -15,6 +15,7 @@ import (
 
 	"github.com/Azure/unbounded-kube/cmd/agent/internal/goalstates"
 	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases"
+	"github.com/Azure/unbounded-kube/cmd/agent/internal/utilexec"
 	"github.com/Azure/unbounded-kube/cmd/agent/internal/utilio"
 )
 
@@ -78,7 +79,7 @@ func StartKubelet(log *slog.Logger, goalState *goalstates.NodeStart) phases.Task
 func (s *startKubelet) Name() string { return "start-kubelet" }
 
 func (s *startKubelet) Do(ctx context.Context) error {
-	if _, err := machineRun(ctx, s.log, s.goalState.MachineName,
+	if _, err := utilexec.MachineRun(ctx, s.log, s.goalState.MachineName,
 		"systemctl", "enable", "--now", goalstates.SystemdUnitKubelet,
 	); err != nil {
 		return fmt.Errorf("systemctl enable --now %s in %s: %w",
