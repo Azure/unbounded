@@ -16,6 +16,7 @@ __debug*
 
 # Developer Stuff
 hack/scratch
+hack/bin/
 tmp/
 .vm/
 .vm-e2e/

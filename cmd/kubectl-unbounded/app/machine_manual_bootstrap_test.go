@@ -360,7 +360,7 @@ func TestManualBootstrapHandler_RenderCloudInit(t *testing.T) {
 		require.Contains(t, output, "test-node")
 
 		// Must write the agent config file.
-		require.Contains(t, output, "/etc/unbounded-agent/config.json")
+		require.Contains(t, output, "/etc/unbounded/agent/config.json")
 		require.Contains(t, output, `"MachineName": "test-node"`)
 		require.Contains(t, output, `"ApiServer": "https://api-server:6443"`)
 
@@ -369,7 +369,7 @@ func TestManualBootstrapHandler_RenderCloudInit(t *testing.T) {
 		require.Contains(t, output, "unbounded-agent")
 
 		// runcmd must set UNBOUNDED_AGENT_CONFIG_FILE and run the install script.
-		require.Contains(t, output, "UNBOUNDED_AGENT_CONFIG_FILE=/etc/unbounded-agent/config.json")
+		require.Contains(t, output, "UNBOUNDED_AGENT_CONFIG_FILE=/etc/unbounded/agent/config.json")
 		require.Contains(t, output, "bash /usr/local/bin/unbounded-agent-install.sh")
 
 		// AGENT_OCI_IMAGE env var should not be present (OCI image is in the JSON config).
@@ -469,6 +469,6 @@ func TestManualBootstrapHandler_Execute(t *testing.T) {
 		require.True(t, strings.HasPrefix(output, "#cloud-config\n"))
 		require.Contains(t, output, "my-node")
 		require.Contains(t, output, "abc123.")
-		require.Contains(t, output, "/etc/unbounded-agent/config.json")
+		require.Contains(t, output, "/etc/unbounded/agent/config.json")
 	})
 }
