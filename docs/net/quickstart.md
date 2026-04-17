@@ -48,7 +48,7 @@ resources step by step, follow the order below.
 #### 1. Install CRDs
 
 ```bash
-kubectl apply -f deploy/crds/
+kubectl apply -f deploy/net/crds/
 ```
 
 This installs the following CustomResourceDefinitions in the
@@ -75,7 +75,7 @@ kubectl create namespace unbounded-net
 #### 3. Deploy controller
 
 The controller manifests are in `deploy/controller/` (as `.yaml.tmpl` templates
-that must be rendered -- see `tools/render-manifests`). After rendering, apply
+that must be rendered -- see `hack/cmd/render-manifests`). After rendering, apply
 them in order:
 
 ```bash

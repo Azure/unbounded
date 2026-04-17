@@ -353,7 +353,7 @@ This is critical because:
   decapsulated frame (wrong destination MAC).
 
 Both the BPF program (`derive_mac_from_ipv4()` in `bpf/unbounded_encap.c`) and
-the Go control plane (`TunnelMACFromIP()` in `pkg/ebpf/tunnel_map.go`) must
+the Go control plane (`TunnelMACFromIP()` in `internal/net/ebpf/tunnel_map.go`) must
 produce identical values.
 
 For IPv6 underlay, the last 4 bytes of the IPv6 address are used:
@@ -388,7 +388,7 @@ This ensures that during the reconcile window, all tunnel destinations are
 consistent and no stale entries cause misdirected packets.
 
 See `cmd/unbounded-net-node/site_watch_reconcile.go` and
-`pkg/ebpf/tunnel_map.go:Reconcile()`.
+`internal/net/ebpf/tunnel_map.go:Reconcile()`.
 
 #### BPF ECMP: Multi-Nexthop with HRW Hashing
 
@@ -667,7 +667,7 @@ returns `WireGuard`.
 | Area                     | File                                                      |
 |--------------------------|-----------------------------------------------------------|
 | BPF program              | `bpf/unbounded_encap.c`                                   |
-| BPF map management       | `pkg/ebpf/tunnel_map.go`                                  |
+| BPF map management       | `internal/net/ebpf/tunnel_map.go`                                  |
 | eBPF tunnel setup        | `cmd/unbounded-net-node/ebpf_geneve_config.go`            |
 | Netlink GENEVE/IPIP      | `cmd/unbounded-net-node/geneve_config.go`                 |
 | Netlink VXLAN            | `cmd/unbounded-net-node/vxlan_config.go`                  |

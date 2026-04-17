@@ -112,7 +112,7 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: frontend-dist
-          path: pkg/html/dist
+          path: internal/net/html/dist
 
       - name: Cache CNI plugins
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
@@ -248,14 +248,14 @@ jobs:
       - name: Render release manifests
         run: |
           TAG="${{ needs.version.outputs.tag }}"
-          go run ./tools/render-manifests \
+          go run ./hack/cmd/render-manifests \
             --templates-dir deploy \
             --output-dir build/manifests \
             --namespace unbounded-net \
             --controller-image "${{ env.REGISTRY }}/unbounded-net-controller:${TAG}" \
             --node-image "${{ env.REGISTRY }}/unbounded-net-node:${TAG}"
           mkdir -p build/manifests/crds
-          cp deploy/crds/*.yaml build/manifests/crds/
+          cp deploy/net/crds/*.yaml build/manifests/crds/
           tar czf "build/unbounded-net-manifests-${TAG}.tar.gz" -C build/manifests .
 
       - name: Download plugin artifacts

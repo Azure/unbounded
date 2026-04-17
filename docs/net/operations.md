@@ -43,7 +43,7 @@ flowchart TD
 #### Step 1: Deploy CRDs
 
 ```bash
-kubectl apply -f deploy/crds/
+kubectl apply -f deploy/net/crds/
 ```
 
 Verify CRDs are installed:
@@ -1153,7 +1153,7 @@ kubectl -n kube-system rollout status daemonset/unbounded-net-node
 
 ```bash
 # 1. Restore CRDs (if cluster recreated)
-kubectl apply -f deploy/crds/
+kubectl apply -f deploy/net/crds/
 
 # 2. Restore Sites, GatewayPools, and peering resources
 kubectl apply -f sites-backup.yaml

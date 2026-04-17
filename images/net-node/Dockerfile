@@ -60,14 +60,14 @@ RUN git clone --depth 1 https://github.com/microsoft/ntttcp-for-linux.git /tmp/n
 COPY . .
 
 # Copy frontend dist files from the build output in the context
-COPY pkg/html/dist/ /src/pkg/html/dist/
+COPY internal/net/html/dist/ /src/internal/net/html/dist/
 
 # Compile eBPF programs (target bpf is architecture-independent)
 RUN clang -O2 -g -target bpf \
     -D__TARGET_ARCH_${TARGETARCH} \
     -I/usr/include \
     -c bpf/unbounded_encap.c \
-    -o pkg/ebpf/unbounded_encap_bpfel.o
+    -o internal/net/ebpf/unbounded_encap_bpfel.o
 
 # Build both binaries with CGO enabled (required for Microsoft Go FIPS crypto)
 # Cache mounts persist Go module cache and build cache across builds

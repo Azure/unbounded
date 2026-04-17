@@ -48,7 +48,11 @@ unbounded-kube is organized into several directories:
 - To build `metalman` without lint/test use `make metalman-build` (used in Containerfiles).
 - To build individual net binaries: `make unbounded-net-controller`, `make unbounded-net-node`, `make unbounded-net-routeplan-debug`, `make unping`, `make unroute`.
 - Net-specific build tasks (Docker images, frontend, eBPF, deploy) are in `net.Makefile`.
-- `make generate` runs `go generate ./api/...` to regenerate deepcopy functions and CRD manifests for both `api/machina/` and `api/net/`.
+- `make generate` runs `go generate ./...` to regenerate deepcopy, CRDs, and protobuf for all packages.
+- `make build` compiles all Go packages (`go build ./...`).
+- `make vulncheck` runs `govulncheck` for known vulnerabilities.
+- `make fmt` formats with gofumpt; `make lint` runs golangci-lint; `make test` runs all tests.
+- Locally these chain: `test` -> `lint` -> `fmt`. In CI (`CI=1`), each runs independently.
 
 ## Coding Standards
 

@@ -57,11 +57,11 @@ KUBECTL_UNBOUNDED_LDFLAGS=$(VERSION_LDFLAGS) -X github.com/Azure/unbounded-kube/
 METALMAN_TAG ?= latest
 METALMAN_IMAGE=$(CONTAINER_REGISTRY)/metalman:$(METALMAN_TAG)
 
-.PHONY: all help fmt lint test check-deps generate kubectl-unbounded forge inventory inventory-amd64 inventory-arm64 unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute
+.PHONY: all help fmt lint test build vulncheck check-deps generate kubectl-unbounded forge inventory inventory-amd64 inventory-arm64 unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute
 
 ##@ General
 
-all: generate kubectl-unbounded forge machina unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute ## Build all binaries (default)
+all: kubectl-unbounded forge machina unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute ## Build all binaries (default)
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} \
@@ -69,6 +69,9 @@ help: ## Show this help
 	/^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) }' $(MAKEFILE_LIST)
 
 ##@ Development
+#
+# When CI is set (GitHub Actions sets CI=true automatically), targets run
+# without their usual dependency chains so each CI job stays independent.
 
 check-deps: ## Verify required tools (gofumpt, golangci-lint v2) are installed
 	@command -v $(GOFMT) >/dev/null 2>&1 || \
@@ -86,6 +89,19 @@ check-deps: ## Verify required tools (gofumpt, golangci-lint v2) are installed
 fmt: check-deps ## Format all Go source files with gofumpt
 	$(GOFMT) -w .
 
+ifdef CI
+# In CI each job is independent; skip chained prerequisites.
+
+lint: ## Run golangci-lint
+	$(GOLINT) --fix -E wsl_v5 ./...
+	$(GOLINT) ./...
+
+test: ## Run all tests with race detector
+	$(GOTEST) -race ./...
+
+else
+# Locally, chain targets for convenience: test -> lint -> fmt -> check-deps.
+
 lint: fmt ## Run golangci-lint (implies fmt)
 	$(GOLINT) --fix -E wsl_v5 ./...
 	$(GOLINT) ./...
@@ -93,8 +109,16 @@ lint: fmt ## Run golangci-lint (implies fmt)
 test: lint ## Run all tests (implies lint)
 	$(GOTEST) ./...
 
+endif
+
+build: ## Build all Go packages
+	$(GOBUILD) ./...
+
 generate: ## Run go generate for API types (deepcopy, CRDs) and protobuf
 	$(GOCMD) generate ./...
+
+vulncheck: ## Run govulncheck for known vulnerabilities
+	$(GOCMD) tool govulncheck ./...
 
 gomod: ## Tidy go.mod and go.sum
 	GOPROXY=direct $(GOMOD) tidy

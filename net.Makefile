@@ -35,7 +35,7 @@ RESOURCES_DIR ?= $(REPO_ROOT)resources
 GOOS ?= linux
 GOARCH ?= amd64
 FRONTEND_DIR := frontend
-FRONTEND_DIST_DIR := pkg/html/dist
+FRONTEND_DIST_DIR := internal/net/html/dist
 FRONTEND_CACHE_FILE := $(FRONTEND_DIST_DIR)/.frontend-build-key
 MANIFEST_TEMPLATES_DIR := deploy
 GO_IN_REPO = cd $(REPO_ROOT) && $(GO)
@@ -121,7 +121,7 @@ build-ebpf:
 	@cd $(REPO_ROOT) && clang -O2 -g -target bpf \
 		-I/usr/include \
 		-c bpf/unbounded_encap.c \
-		-o pkg/ebpf/unbounded_encap_bpfel.o
+		-o internal/net/ebpf/unbounded_encap_bpfel.o
 	@echo "eBPF programs compiled."
 
 #
@@ -385,7 +385,7 @@ build-add-remote:
 render: validate-version generate
 	rm -rf $(REPO_ROOT)build/manifests
 	@mkdir -p $(REPO_ROOT)build/manifests/crds
-	cd $(REPO_ROOT) && $(GO) run ./tools/render-manifests \
+	cd $(REPO_ROOT) && $(GO) run ./hack/cmd/render-manifests \
 		--templates-dir "$(REPO_ROOT)$(MANIFEST_TEMPLATES_DIR)" \
 		--output-dir build/manifests \
 		--namespace "$(NAMESPACE)" \
@@ -393,7 +393,7 @@ render: validate-version generate
 		--node-image "$(UNBOUNDED_NET_NODE_IMAGE)" \
 		--force-not-leader "$(FORCE_NOT_LEADER)" \
 		--azure-tenant-id "$(AZURE_TENANT_ID)"
-	cp $(REPO_ROOT)deploy/crds/*.yaml $(REPO_ROOT)build/manifests/crds/
+	cp $(REPO_ROOT)deploy/net/crds/*.yaml $(REPO_ROOT)build/manifests/crds/
 	cd $(REPO_ROOT) && tar czf "build/unbounded-net-manifests-$(VERSION).tar.gz" -C build/manifests .
 	@echo "Rendered manifests written to $(REPO_ROOT)build/manifests"
 	@echo "Rendered manifests archive written to $(REPO_ROOT)build/unbounded-net-manifests-$(VERSION).tar.gz"
@@ -413,7 +413,7 @@ deploy-config: validate-version deploy-namespace
 	@set -e; \
 	MANIFEST_TMP_DIR=$$(mktemp -d); \
 	trap 'rm -rf "$$MANIFEST_TMP_DIR"' EXIT; \
-	cd $(REPO_ROOT) && $(GO) run ./tools/render-manifests \
+	cd $(REPO_ROOT) && $(GO) run ./hack/cmd/render-manifests \
 		--templates-dir "$(REPO_ROOT)$(MANIFEST_TEMPLATES_DIR)" \
 		--output-dir "$$MANIFEST_TMP_DIR" \
 		--namespace "$(NAMESPACE)" \
@@ -442,7 +442,7 @@ deploy-namespace:
 		set -e; \
 		MANIFEST_TMP_DIR=$$(mktemp -d); \
 		trap 'rm -rf "$$MANIFEST_TMP_DIR"' EXIT; \
-		cd $(REPO_ROOT) && $(GO) run ./tools/render-manifests \
+		cd $(REPO_ROOT) && $(GO) run ./hack/cmd/render-manifests \
 			--templates-dir "$(REPO_ROOT)$(MANIFEST_TEMPLATES_DIR)" \
 			--output-dir "$$MANIFEST_TMP_DIR" \
 			--namespace "$(NAMESPACE)" \
@@ -456,14 +456,14 @@ deploy-namespace:
 
 ## Deploy only the CRDs to Kubernetes
 deploy-crds: generate
-	kubectl apply -f "$(REPO_ROOT)deploy/crds/"
+	kubectl apply -f "$(REPO_ROOT)deploy/net/crds/"
 
 ## Deploy only the controller to Kubernetes (and restart if needed)
 deploy-controller: validate-version deploy-namespace deploy-crds deploy-config
 	@CTRL_GEN_BEFORE=$$(kubectl get deployment/unbounded-net-controller -n $(NAMESPACE) -o jsonpath='{.metadata.generation}' 2>/dev/null || echo "0"); \
 	MANIFEST_TMP_DIR=$$(mktemp -d); \
 	trap 'rm -rf "$$MANIFEST_TMP_DIR"' EXIT; \
-	cd $(REPO_ROOT) && $(GO) run ./tools/render-manifests \
+	cd $(REPO_ROOT) && $(GO) run ./hack/cmd/render-manifests \
 		--templates-dir "$(REPO_ROOT)$(MANIFEST_TEMPLATES_DIR)" \
 		--output-dir "$$MANIFEST_TMP_DIR" \
 		--namespace "$(NAMESPACE)" \
@@ -501,7 +501,7 @@ deploy-node: validate-version deploy-crds deploy-namespace deploy-config
 	@NODE_GEN_BEFORE=$$(kubectl get daemonset/unbounded-net-node -n $(NAMESPACE) -o jsonpath='{.metadata.generation}' 2>/dev/null || echo "0"); \
 	MANIFEST_TMP_DIR=$$(mktemp -d); \
 	trap 'rm -rf "$$MANIFEST_TMP_DIR"' EXIT; \
-	cd $(REPO_ROOT) && $(GO) run ./tools/render-manifests \
+	cd $(REPO_ROOT) && $(GO) run ./hack/cmd/render-manifests \
 		--templates-dir "$(REPO_ROOT)$(MANIFEST_TEMPLATES_DIR)" \
 		--output-dir "$$MANIFEST_TMP_DIR" \
 		--namespace "$(NAMESPACE)" \
@@ -526,7 +526,7 @@ undeploy: validate-version
 	@set -e; \
 	MANIFEST_TMP_DIR=$$(mktemp -d); \
 	trap 'rm -rf "$$MANIFEST_TMP_DIR"' EXIT; \
-	cd $(REPO_ROOT) && $(GO) run ./tools/render-manifests \
+	cd $(REPO_ROOT) && $(GO) run ./hack/cmd/render-manifests \
 		--templates-dir "$(REPO_ROOT)$(MANIFEST_TEMPLATES_DIR)" \
 		--output-dir "$$MANIFEST_TMP_DIR" \
 		--namespace "$(NAMESPACE)" \
@@ -547,7 +547,7 @@ undeploy: validate-version
 	kubectl delete -f "$$MANIFEST_TMP_DIR/controller/03-deployment.yaml" --ignore-not-found; \
 	kubectl delete -f "$$MANIFEST_TMP_DIR/controller/02-rbac.yaml" --ignore-not-found; \
 	kubectl delete -f "$$MANIFEST_TMP_DIR/controller/01-serviceaccount.yaml" --ignore-not-found; \
-	kubectl delete -f "$(REPO_ROOT)deploy/crds/" --ignore-not-found; \
+	kubectl delete -f "$(REPO_ROOT)deploy/net/crds/" --ignore-not-found; \
 	kubectl delete apiservice status.net.unbounded-kube.io --ignore-not-found; \
 	kubectl delete apiservice v1alpha1.status.net.unbounded-kube.io --ignore-not-found; \
 	if [ "$(NAMESPACE)" != "kube-system" ]; then \
