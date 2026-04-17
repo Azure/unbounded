@@ -57,7 +57,7 @@ KUBECTL_UNBOUNDED_LDFLAGS=$(VERSION_LDFLAGS) -X github.com/Azure/unbounded-kube/
 METALMAN_TAG ?= latest
 METALMAN_IMAGE=$(CONTAINER_REGISTRY)/metalman:$(METALMAN_TAG)
 
-.PHONY: all help fmt lint test build vulncheck check-deps install-tools generate kubectl-unbounded forge inventory inventory-amd64 inventory-arm64 unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute
+.PHONY: all help fmt lint test build vulncheck check-deps install-tools install-protoc generate kubectl-unbounded forge inventory inventory-amd64 inventory-arm64 unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute
 
 ##@ General
 
@@ -75,10 +75,50 @@ help: ## Show this help
 
 GOFUMPT_VERSION ?= v0.8.0
 GOLANGCI_LINT_VERSION ?= v2.11.4
+PROTOC_GEN_GO_VERSION ?= v1.36.11
+CONTROLLER_GEN_VERSION ?= v0.20.1
 
-install-tools: ## Install development tools (gofumpt, golangci-lint)
+# Pinned protoc for deterministic .pb.go output across environments.
+# Downloaded from the upstream protobuf GitHub releases.
+PROTOC_VERSION ?= 3.19.6
+PROTOC_DIR     ?= $(CURDIR)/bin/protoc
+PROTOC         := $(PROTOC_DIR)/bin/protoc
+
+# Auto-detect OS/arch for protoc release archive naming.
+# See https://github.com/protocolbuffers/protobuf/releases for valid combinations.
+PROTOC_UNAME_S := $(shell uname -s)
+PROTOC_UNAME_M := $(shell uname -m)
+ifeq ($(PROTOC_UNAME_S),Darwin)
+  PROTOC_OS ?= osx
+else
+  PROTOC_OS ?= linux
+endif
+ifeq ($(PROTOC_UNAME_M),x86_64)
+  PROTOC_ARCH ?= x86_64
+else ifeq ($(PROTOC_UNAME_M),aarch64)
+  PROTOC_ARCH ?= aarch_64
+else ifeq ($(PROTOC_UNAME_M),arm64)
+  PROTOC_ARCH ?= aarch_64
+else
+  PROTOC_ARCH ?= $(PROTOC_UNAME_M)
+endif
+
+install-tools: ## Install development tools (gofumpt, golangci-lint, protoc-gen-go)
 	go install mvdan.cc/gofumpt@$(GOFUMPT_VERSION)
 	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
+	go install google.golang.org/protobuf/cmd/protoc-gen-go@$(PROTOC_GEN_GO_VERSION)
+	go install sigs.k8s.io/controller-tools/cmd/controller-gen@$(CONTROLLER_GEN_VERSION)
+
+install-protoc: $(PROTOC) ## Download pinned protoc into bin/protoc/
+
+$(PROTOC):
+	@mkdir -p $(PROTOC_DIR)
+	@echo "Downloading protoc v$(PROTOC_VERSION) for $(PROTOC_OS)-$(PROTOC_ARCH)..."
+	@curl -fsSL -o $(PROTOC_DIR)/protoc.zip \
+	  https://github.com/protocolbuffers/protobuf/releases/download/v$(PROTOC_VERSION)/protoc-$(PROTOC_VERSION)-$(PROTOC_OS)-$(PROTOC_ARCH).zip
+	@unzip -q -o $(PROTOC_DIR)/protoc.zip -d $(PROTOC_DIR)
+	@rm $(PROTOC_DIR)/protoc.zip
+	@$(PROTOC) --version
 
 check-deps: ## Verify required tools (gofumpt, golangci-lint v2) are installed
 	@command -v $(GOFMT) >/dev/null 2>&1 || \
@@ -121,8 +161,8 @@ endif
 build: ## Build all Go packages
 	$(GOBUILD) ./...
 
-generate: ## Run go generate for API types (deepcopy, CRDs) and protobuf
-	$(GOCMD) generate ./...
+generate: install-protoc ## Run go generate for API types (deepcopy, CRDs) and protobuf
+	PATH="$(PROTOC_DIR)/bin:$$PATH" $(GOCMD) generate ./...
 
 vulncheck: ## Run govulncheck for known vulnerabilities
 	$(GOCMD) tool govulncheck ./...
