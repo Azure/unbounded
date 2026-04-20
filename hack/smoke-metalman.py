@@ -45,7 +45,6 @@ SERVE_URL = f"http://{SERVER_IP}:{HTTP_PORT}"
 REGISTRY_PORT = 5555
 REGISTRY_CONTAINER = "unbounded-smoke-registry"
 IMAGE_NAME = f"localhost:{REGISTRY_PORT}/unbounded/host-ubuntu2404:smoke"
-AGENT_IMAGE_DIR = REPO_ROOT / "images" / "agent-ubuntu2404"
 AGENT_IMAGE_NAME = f"localhost:{REGISTRY_PORT}/unbounded/agent-ubuntu2404:smoke"
 # The agent runs inside a VM on an isolated libvirt network. "localhost" inside
 # the VM resolves to the VM's own loopback, not the host.  Use the host's
@@ -62,8 +61,6 @@ NSPAWN_MACHINE = "kube1"
 KUBECTL = "kubectl"
 VIRSH = ["virsh", "--connect", "qemu:///system"]
 DEVNULL = subprocess.DEVNULL
-
-IMAGE_DIR = REPO_ROOT / "images" / "host-ubuntu2404"
 
 _procs: list[subprocess.Popen[Any]] = []
 
@@ -730,38 +727,21 @@ def main() -> None:
     else:
         die("Local OCI registry did not become ready")
 
-    # Build both Docker images in parallel.  They use separate GHA cache
-    # scopes so there is no contention, and buildkit handles concurrent
-    # builds safely.  The agent image is much smaller (~18s) than the host
-    # image (~5 min), so the agent build finishes well before the host
-    # build and its wall-clock cost is completely hidden.
-    # stdout/stderr are inherited so build output streams to the CI log
-    # in real-time; on failure the error details are already visible above
-    # the die() message.
-    log("Building OCI images (host-ubuntu2404 + agent-ubuntu2404 in parallel)")
-    host_build_cmd = ["docker", "buildx", "build", "--load"]
-    # Use GitHub Actions cache when running in CI (env vars set by
-    # docker/setup-buildx-action in the workflow).
-    if os.environ.get("ACTIONS_CACHE_URL"):
-        host_build_cmd += [
-            "--cache-from", "type=gha,scope=host-ubuntu2404",
-            "--cache-to", "type=gha,mode=max,scope=host-ubuntu2404",
-        ]
-    host_build_cmd += ["-t", IMAGE_NAME,
-                       "-f", str(IMAGE_DIR / "Containerfile"), str(REPO_ROOT)]
-
-    agent_build_cmd = ["docker", "buildx", "build", "--load"]
-    if os.environ.get("ACTIONS_CACHE_URL"):
-        agent_build_cmd += [
-            "--cache-from", "type=gha,scope=agent-ubuntu2404",
-            "--cache-to", "type=gha,mode=max,scope=agent-ubuntu2404",
-        ]
-    agent_build_cmd += ["-t", AGENT_IMAGE_NAME,
-                        "-f", str(AGENT_IMAGE_DIR / "Containerfile"),
-                        str(AGENT_IMAGE_DIR)]
-
-    host_build_proc = subprocess.Popen(host_build_cmd)
-    agent_build_proc = subprocess.Popen(agent_build_cmd)
+    # Both Docker images (host-ubuntu2404 and agent-ubuntu2404) are pre-built
+    # by the GitHub Actions workflow using docker/build-push-action with GHA
+    # layer caching.  They are already loaded into the local Docker daemon
+    # with the correct tags (IMAGE_NAME and AGENT_IMAGE_NAME).
+    log("Verifying pre-built OCI images are available")
+    for name, tag in [("host-ubuntu2404", IMAGE_NAME),
+                      ("agent-ubuntu2404", AGENT_IMAGE_NAME)]:
+        result = subprocess.run(
+            ["docker", "image", "inspect", tag],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            die(f"Pre-built image {tag} not found in local Docker daemon. "
+                "Ensure the workflow builds it before running this script.")
+        log(f"  {name} image found: {tag}")
 
     # Wait for Go builds (likely already finished during k8s setup).
     for name, proc in go_builds:
@@ -769,14 +749,6 @@ def main() -> None:
         if rc != 0:
             die(f"go build {name} failed (exit code {rc})")
     log("  Go builds finished")
-
-    # Wait for Docker image builds.
-    for name, proc in [("host-ubuntu2404", host_build_proc),
-                       ("agent-ubuntu2404", agent_build_proc)]:
-        rc = proc.wait()
-        if rc != 0:
-            die(f"Docker build of {name} failed (exit code {rc})")
-        log(f"  {name} build finished")
 
     log("Pushing OCI images to local registry")
     run(["docker", "push", IMAGE_NAME])
