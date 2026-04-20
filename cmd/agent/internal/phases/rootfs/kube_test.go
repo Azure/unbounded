@@ -30,9 +30,9 @@ func TestCrictlVersionForKubernetesVersion(t *testing.T) {
 			expected:          "1.32.0",
 		},
 		{
-			name:              "missing patch",
+			name:              "missing patch defaults to zero",
 			kubernetesVersion: "1.32",
-			wantErr:           true,
+			expected:          "1.32.0",
 		},
 		{
 			name:              "invalid version",

@@ -9,10 +9,10 @@ import (
 	"log/slog"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"time"
 
+	"github.com/Masterminds/semver/v3"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/Azure/unbounded-kube/cmd/agent/internal/goalstates"
@@ -80,22 +80,30 @@ func (d *downloadKubeBinaries) Do(ctx context.Context) error {
 	eg, ctx := errgroup.WithContext(ctx)
 
 	if needsKubeBinaries {
-		for _, binary := range requiredKubeBinaries {
-			binaryURL := fmt.Sprintf(kubernetesBinaryURLTemplate, version, arch, binary)
-			checksumURL := fmt.Sprintf(kubernetesChecksumURLTemplate, version, arch, binary)
-			targetFilePath := filepath.Join(destDir, binary)
-
-			eg.Go(d.downloadBinary(ctx, binary, binaryURL, checksumURL, targetFilePath))
-		}
+		d.enqueueKubernetesBinaryDownloads(ctx, eg, version, arch, destDir)
 	}
 
 	if needsCrictl {
-		downloadURL := crictlDownloadURL(crictlVersion, runtime.GOOS, arch)
-		targetFilePath := filepath.Join(destDir, "crictl")
-		eg.Go(d.downloadCrictlBinary(ctx, downloadURL, targetFilePath))
+		d.enqueueCrictlDownload(ctx, eg, crictlVersion, arch, destDir)
 	}
 
 	return eg.Wait()
+}
+
+func (d *downloadKubeBinaries) enqueueKubernetesBinaryDownloads(ctx context.Context, eg *errgroup.Group, kubernetesVersion, arch, destDir string) {
+	for _, binary := range requiredKubeBinaries {
+		binaryURL := fmt.Sprintf(kubernetesBinaryURLTemplate, kubernetesVersion, arch, binary)
+		checksumURL := fmt.Sprintf(kubernetesChecksumURLTemplate, kubernetesVersion, arch, binary)
+		targetFilePath := filepath.Join(destDir, binary)
+
+		eg.Go(d.downloadBinary(ctx, binary, binaryURL, checksumURL, targetFilePath))
+	}
+}
+
+func (d *downloadKubeBinaries) enqueueCrictlDownload(ctx context.Context, eg *errgroup.Group, crictlVersion, arch, destDir string) {
+	downloadURL := crictlDownloadURL(crictlVersion, runtime.GOOS, arch)
+	targetFilePath := filepath.Join(destDir, "crictl")
+	eg.Go(d.downloadCrictlBinary(ctx, downloadURL, targetFilePath))
 }
 
 // downloadBinary returns a function that downloads a single Kubernetes binary,
@@ -211,20 +219,12 @@ func crictlVersionMatch(ctx context.Context, log *slog.Logger, destDir, expected
 
 // crictlVersionForKubernetesVersion returns the cri-tools patch version that matches the kubelet version.
 func crictlVersionForKubernetesVersion(kubernetesVersion string) (string, error) {
-	version := strings.TrimPrefix(kubernetesVersion, "v")
-	version = strings.SplitN(version, "-", 2)[0]
-	parts := strings.Split(version, ".")
-	if len(parts) != 3 {
-		return "", fmt.Errorf("kubernetes version %q must be in major.minor.patch form", kubernetesVersion)
+	version, err := semver.NewVersion(strings.TrimSpace(kubernetesVersion))
+	if err != nil {
+		return "", fmt.Errorf("parse kubernetes version %q: %w", kubernetesVersion, err)
 	}
 
-	for _, part := range parts {
-		if _, err := strconv.Atoi(part); err != nil {
-			return "", fmt.Errorf("invalid kubernetes version %q: %w", kubernetesVersion, err)
-		}
-	}
-
-	return strings.Join(parts, "."), nil
+	return fmt.Sprintf("%d.%d.%d", version.Major(), version.Minor(), version.Patch()), nil
 }
 
 func crictlDownloadURL(version, hostOS, hostArch string) string {
