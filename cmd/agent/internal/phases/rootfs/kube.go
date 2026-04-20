@@ -68,7 +68,7 @@ func (d *downloadKubeBinaries) Do(ctx context.Context) error {
 		return fmt.Errorf("resolve crictl version: %w", err)
 	}
 
-	needsKubeBinaries := !(hasRequiredKubeBinaries(destDir) && kubeletVersionMatch(ctx, d.log, destDir, kubernetesVersion))
+	needsKubeBinaries := !hasRequiredKubeBinaries(destDir) || !kubeletVersionMatch(ctx, d.log, destDir, kubernetesVersion)
 	needsCrictl := !crictlVersionMatch(ctx, d.log, destDir, crictlVersion)
 	if !needsKubeBinaries && !needsCrictl {
 		return nil
@@ -217,14 +217,15 @@ func crictlVersionMatch(ctx context.Context, log *slog.Logger, destDir, expected
 	return strings.Contains(output, "v"+expectedVersion) || strings.Contains(output, expectedVersion)
 }
 
-// crictlVersionForKubernetesVersion returns the cri-tools patch version that matches the kubelet version.
+// crictlVersionForKubernetesVersion returns the cri-tools version for the Kubernetes major.minor release.
+// cri-tools releases are published as v<major>.<minor>.0.
 func crictlVersionForKubernetesVersion(kubernetesVersion string) (string, error) {
 	version, err := semver.NewVersion(strings.TrimSpace(kubernetesVersion))
 	if err != nil {
 		return "", fmt.Errorf("parse kubernetes version %q: %w", kubernetesVersion, err)
 	}
 
-	return fmt.Sprintf("%d.%d.%d", version.Major(), version.Minor(), version.Patch()), nil
+	return fmt.Sprintf("%d.%d.0", version.Major(), version.Minor()), nil
 }
 
 func crictlDownloadURL(version, hostOS, hostArch string) string {

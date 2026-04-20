@@ -15,19 +15,24 @@ func TestCrictlVersionForKubernetesVersion(t *testing.T) {
 		wantErr           bool
 	}{
 		{
-			name:              "exact semver",
+			name:              "exact semver maps to minor patch zero",
 			kubernetesVersion: "1.30.4",
-			expected:          "1.30.4",
+			expected:          "1.30.0",
 		},
 		{
-			name:              "leading v prefix",
+			name:              "leading v prefix maps to minor patch zero",
 			kubernetesVersion: "v1.31.2",
-			expected:          "1.31.2",
+			expected:          "1.31.0",
 		},
 		{
 			name:              "prerelease suffix",
 			kubernetesVersion: "1.32.0-rc.1",
 			expected:          "1.32.0",
+		},
+		{
+			name:              "non zero patch maps to zero",
+			kubernetesVersion: "1.33.1",
+			expected:          "1.33.0",
 		},
 		{
 			name:              "missing patch defaults to zero",
@@ -69,11 +74,11 @@ func TestCrictlDownloadURL(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name    string
-		version string
-		hostOS  string
+		name     string
+		version  string
+		hostOS   string
 		hostArch string
-		want    string
+		want     string
 	}{
 		{
 			name:     "linux amd64",
