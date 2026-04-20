@@ -3,7 +3,14 @@
 
 package rootfs
 
-import "testing"
+import (
+	"context"
+	"io"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func TestCrictlVersionForKubernetesVersion(t *testing.T) {
 	t.Parallel()
@@ -46,15 +53,12 @@ func TestCrictlVersionForKubernetesVersion(t *testing.T) {
 		},
 	}
 
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			version, err := crictlVersionForKubernetesVersion(tt.kubernetesVersion)
-			if tt.wantErr {
+	for i := range tests {
+		t.Run(tests[i].name, func(t *testing.T) {
+			version, err := crictlVersionForKubernetesVersion(tests[i].kubernetesVersion)
+			if tests[i].wantErr {
 				if err == nil {
-					t.Fatalf("expected an error for version %q", tt.kubernetesVersion)
+					t.Fatalf("expected an error for version %q", tests[i].kubernetesVersion)
 				}
 				return
 			}
@@ -63,8 +67,8 @@ func TestCrictlVersionForKubernetesVersion(t *testing.T) {
 				t.Fatalf("unexpected error: %v", err)
 			}
 
-			if version != tt.expected {
-				t.Fatalf("got version %q, want %q", version, tt.expected)
+			if version != tests[i].expected {
+				t.Fatalf("got version %q, want %q", version, tests[i].expected)
 			}
 		})
 	}
@@ -103,13 +107,70 @@ func TestCrictlDownloadURL(t *testing.T) {
 		},
 	}
 
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			got := crictlDownloadURL(tt.version, tt.hostOS, tt.hostArch)
-			if got != tt.want {
-				t.Fatalf("got URL %q, want %q", got, tt.want)
+	for i := range tests {
+		t.Run(tests[i].name, func(t *testing.T) {
+			got := crictlDownloadURL(tests[i].version, tests[i].hostOS, tests[i].hostArch)
+			if got != tests[i].want {
+				t.Fatalf("got URL %q, want %q", got, tests[i].want)
+			}
+		})
+	}
+}
+
+func TestCrictlVersionMatch(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name            string
+		crictlOutput    string
+		expectedVersion string
+		installBinary   bool
+		wantMatch       bool
+	}{
+		{
+			name:            "matching version",
+			crictlOutput:    "crictl version v1.35.0",
+			expectedVersion: "1.35.0",
+			installBinary:   true,
+			wantMatch:       true,
+		},
+		{
+			name:            "mismatched version",
+			crictlOutput:    "crictl version v1.35.1",
+			expectedVersion: "1.35.0",
+			installBinary:   true,
+			wantMatch:       false,
+		},
+		{
+			name:            "invalid output format",
+			crictlOutput:    "v1.35.0",
+			expectedVersion: "1.35.0",
+			installBinary:   true,
+			wantMatch:       false,
+		},
+		{
+			name:            "missing crictl binary",
+			expectedVersion: "1.35.0",
+			installBinary:   false,
+			wantMatch:       false,
+		},
+	}
+
+	for i := range tests {
+		t.Run(tests[i].name, func(t *testing.T) {
+			destDir := t.TempDir()
+
+			if tests[i].installBinary {
+				crictlScript := "#!/usr/bin/env sh\necho '" + tests[i].crictlOutput + "'\n"
+				if err := os.WriteFile(filepath.Join(destDir, "crictl"), []byte(crictlScript), 0o755); err != nil {
+					t.Fatalf("write test crictl binary: %v", err)
+				}
+			}
+
+			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+			got := crictlVersionMatch(context.Background(), logger, destDir, tests[i].expectedVersion)
+			if got != tests[i].wantMatch {
+				t.Fatalf("got match=%t, want %t", got, tests[i].wantMatch)
 			}
 		})
 	}

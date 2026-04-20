@@ -214,7 +214,12 @@ func crictlVersionMatch(ctx context.Context, log *slog.Logger, destDir, expected
 		return false
 	}
 
-	return strings.Contains(output, "v"+expectedVersion) || strings.Contains(output, expectedVersion)
+	parts := strings.Fields(output)
+	if len(parts) != 3 {
+		return false
+	}
+
+	return parts[2] == "v"+expectedVersion
 }
 
 // crictlVersionForKubernetesVersion returns the cri-tools version for the Kubernetes major.minor release.
