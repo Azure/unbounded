@@ -25,6 +25,7 @@ Subcommands (called as individual workflow steps):
     run-agent                          Build agent, generate bootstrap script, run on VM.
     wait-for-node                      Wait for the node to appear and become Ready.
     validate-workload                  Deploy test pods on the agent node.
+    validate-kube-proxy                Verify kube-proxy is Running on all nodes.
     install-machine-crd                Install Machine CRD and bootstrapper RBAC.
     delete-machine-cr                  Delete the Machine CR.
     validate-machine-cr-created        Verify agent self-registered a Machine CR.
@@ -810,6 +811,82 @@ def _log_network_diagnostics() -> None:
 
 
 # ---------------------------------------------------------------------------
+# validate-kube-proxy
+# ---------------------------------------------------------------------------
+def validate_kube_proxy() -> None:
+    """Validate that kube-proxy pods are Running on every node in the cluster.
+
+    kube-proxy requires /lib/modules from the host kernel to load kernel
+    modules via modprobe. This check catches regressions where the nspawn
+    container does not bind-mount /lib/modules.
+    """
+
+    timeout_secs = 180
+
+    # Get all node names.
+    node_names_raw = kubectl_capture(["get", "nodes", "-o", "jsonpath={.items[*].metadata.name}"])
+    all_nodes = set(node_names_raw.split())
+    if not all_nodes:
+        die("No nodes found in the cluster")
+    log(f"Cluster nodes: {sorted(all_nodes)}")
+
+    # Wait for kube-proxy pods to be Running on every node.
+    log(f"Waiting for kube-proxy pods to be Running on all {len(all_nodes)} node(s) "
+        f"(timeout: {timeout_secs}s)...")
+    elapsed = 0
+    while elapsed < timeout_secs:
+        result = subprocess.run(
+            [KUBECTL, "get", "pods", "-n", "kube-system",
+             "-l", "k8s-app=kube-proxy",
+             "-o", "json"],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            if elapsed > 0 and elapsed % 30 == 0:
+                log(f"  ({elapsed}s) Failed to list kube-proxy pods")
+            time.sleep(5)
+            elapsed += 5
+            continue
+
+        pods = json.loads(result.stdout).get("items", [])
+        running_nodes: set[str] = set()
+        for pod in pods:
+            phase = pod.get("status", {}).get("phase", "")
+            node = pod.get("spec", {}).get("nodeName", "")
+            if phase == "Running" and node:
+                running_nodes.add(node)
+
+        if running_nodes >= all_nodes:
+            log(f"kube-proxy Running on all nodes after {elapsed}s")
+            break
+
+        missing = sorted(all_nodes - running_nodes)
+        if elapsed > 0 and elapsed % 30 == 0:
+            log(f"  ({elapsed}s) kube-proxy not yet Running on: {missing}")
+        time.sleep(5)
+        elapsed += 5
+    else:
+        log("kube-proxy pod status:")
+        subprocess.run([KUBECTL, "get", "pods", "-n", "kube-system",
+                        "-l", "k8s-app=kube-proxy", "-o", "wide"], check=False)
+        # Show logs from non-Running pods for debugging.
+        for pod in pods:
+            phase = pod.get("status", {}).get("phase", "")
+            name = pod.get("metadata", {}).get("name", "")
+            if phase != "Running" and name:
+                log(f"Logs for {name}:")
+                subprocess.run([KUBECTL, "logs", name, "-n", "kube-system",
+                                "--tail=50"], check=False)
+        die(f"kube-proxy not Running on all nodes after {timeout_secs}s. "
+            f"Missing: {sorted(all_nodes - running_nodes)}")
+
+    log("============================================")
+    log("  kube-proxy validation PASSED")
+    log("============================================")
+    kubectl(["get", "pods", "-n", "kube-system", "-l", "k8s-app=kube-proxy", "-o", "wide"])
+
+
+# ---------------------------------------------------------------------------
 # validate-workload
 # ---------------------------------------------------------------------------
 def validate_workload() -> None:
@@ -1195,6 +1272,7 @@ COMMANDS = {
     "ensure-kind-bridge": ensure_kind_bridge,
     "run-agent": run_agent,
     "wait-for-node": wait_for_node,
+    "validate-kube-proxy": validate_kube_proxy,
     "validate-workload": validate_workload,
     "install-machine-crd": install_machine_crd,
     "delete-machine-cr": delete_machine_cr,
