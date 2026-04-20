@@ -68,9 +68,44 @@ func TestCrictlVersionForKubernetesVersion(t *testing.T) {
 func TestCrictlDownloadURL(t *testing.T) {
 	t.Parallel()
 
-	got := crictlDownloadURL("1.30.4", "linux", "amd64")
-	want := "https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.30.4/crictl-v1.30.4-linux-amd64.tar.gz"
-	if got != want {
-		t.Fatalf("got URL %q, want %q", got, want)
+	tests := []struct {
+		name    string
+		version string
+		hostOS  string
+		hostArch string
+		want    string
+	}{
+		{
+			name:     "linux amd64",
+			version:  "1.30.4",
+			hostOS:   "linux",
+			hostArch: "amd64",
+			want:     "https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.30.4/crictl-v1.30.4-linux-amd64.tar.gz",
+		},
+		{
+			name:     "darwin arm64",
+			version:  "1.30.4",
+			hostOS:   "darwin",
+			hostArch: "arm64",
+			want:     "https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.30.4/crictl-v1.30.4-darwin-arm64.tar.gz",
+		},
+		{
+			name:     "windows amd64",
+			version:  "1.30.4",
+			hostOS:   "windows",
+			hostArch: "amd64",
+			want:     "https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.30.4/crictl-v1.30.4-windows-amd64.tar.gz",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := crictlDownloadURL(tt.version, tt.hostOS, tt.hostArch)
+			if got != tt.want {
+				t.Fatalf("got URL %q, want %q", got, tt.want)
+			}
+		})
 	}
 }

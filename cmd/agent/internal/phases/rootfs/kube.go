@@ -33,7 +33,7 @@ const (
 	kubernetesChecksumURLTemplate = "https://dl.k8s.io/v%s/bin/linux/%s/%s.sha256"
 
 	// criToolsCrictlURLTemplate is the download URL template for the crictl tarball.
-	// Parameters: version, version, os, arch.
+	// Parameters: version tag, version filename segment, os, arch.
 	criToolsCrictlURLTemplate = "https://github.com/kubernetes-sigs/cri-tools/releases/download/v%s/crictl-v%s-%s-%s.tar.gz"
 )
 
