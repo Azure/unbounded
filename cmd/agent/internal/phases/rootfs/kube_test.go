@@ -54,11 +54,14 @@ func TestCrictlVersionForKubernetesVersion(t *testing.T) {
 	}
 
 	for i := range tests {
-		t.Run(tests[i].name, func(t *testing.T) {
-			version, err := crictlVersionForKubernetesVersion(tests[i].kubernetesVersion)
-			if tests[i].wantErr {
+		testCase := tests[i]
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			version, err := crictlVersionForKubernetesVersion(testCase.kubernetesVersion)
+			if testCase.wantErr {
 				if err == nil {
-					t.Fatalf("expected an error for version %q", tests[i].kubernetesVersion)
+					t.Fatalf("expected an error for version %q", testCase.kubernetesVersion)
 				}
 				return
 			}
@@ -67,8 +70,8 @@ func TestCrictlVersionForKubernetesVersion(t *testing.T) {
 				t.Fatalf("unexpected error: %v", err)
 			}
 
-			if version != tests[i].expected {
-				t.Fatalf("got version %q, want %q", version, tests[i].expected)
+			if version != testCase.expected {
+				t.Fatalf("got version %q, want %q", version, testCase.expected)
 			}
 		})
 	}
@@ -108,10 +111,13 @@ func TestCrictlDownloadURL(t *testing.T) {
 	}
 
 	for i := range tests {
-		t.Run(tests[i].name, func(t *testing.T) {
-			got := crictlDownloadURL(tests[i].version, tests[i].hostOS, tests[i].hostArch)
-			if got != tests[i].want {
-				t.Fatalf("got URL %q, want %q", got, tests[i].want)
+		testCase := tests[i]
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := crictlDownloadURL(testCase.version, testCase.hostOS, testCase.hostArch)
+			if got != testCase.want {
+				t.Fatalf("got URL %q, want %q", got, testCase.want)
 			}
 		})
 	}
