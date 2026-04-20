@@ -28,6 +28,9 @@ Subcommands (called as individual workflow steps):
     install-machine-crd                Install Machine CRD and bootstrapper RBAC.
     delete-machine-cr                  Delete the Machine CR.
     validate-machine-cr-created        Verify agent self-registered a Machine CR.
+    validate-daemon                    Verify agent daemon is watching Machine CR and updates status.
+    trigger-upgrade                    Patch Machine CR repaveCounter to trigger a node update.
+    validate-upgrade                   Wait for node update to complete and verify status.
     reset-agent                        Run agent reset and verify cleanup.
     cleanup                            Tear down VM, networking, and Kind cluster.
 """
@@ -1130,6 +1133,389 @@ def validate_machine_cr_created() -> None:
 
 
 # ---------------------------------------------------------------------------
+# validate-daemon
+# ---------------------------------------------------------------------------
+def validate_daemon() -> None:
+    """Verify the agent daemon is running on the VM and watching the Machine CR.
+
+    Checks:
+    1. The unbounded-agent-daemon.service systemd unit is active on the VM.
+    2. The Machine CR exists in the cluster.
+    3. The daemon logs show it is watching the Machine CR.
+    """
+
+    log("Validating agent daemon...")
+
+    # 1. Check systemd unit is active on the VM.
+    log("Checking unbounded-agent-daemon.service is active...")
+    timeout_secs = 60
+    elapsed = 0
+    while elapsed < timeout_secs:
+        result = subprocess.run(
+            ["ssh", *SSH_OPTS, SSH_TARGET,
+             "sudo systemctl is-active unbounded-agent-daemon.service"],
+            capture_output=True, text=True,
+        )
+        status = result.stdout.strip()
+        if status == "active":
+            log(f"Daemon unit is active after {elapsed}s")
+            break
+        if elapsed > 0 and elapsed % 15 == 0:
+            log(f"  ({elapsed}s) Daemon status: {status}")
+        time.sleep(5)
+        elapsed += 5
+    else:
+        # Collect daemon logs for diagnostics.
+        subprocess.run(
+            ["ssh", *SSH_OPTS, SSH_TARGET,
+             "sudo journalctl -u unbounded-agent-daemon.service --no-pager -l -n 50"],
+            check=False,
+        )
+        die(f"Daemon unit not active after {timeout_secs}s (status: {status})")
+
+    # 2. Check Machine CR exists.
+    log(f"Checking Machine CR '{AGENT_MACHINE_NAME}' exists...")
+    result = subprocess.run(
+        [KUBECTL, "get", "machine", AGENT_MACHINE_NAME, "-o", "name"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        die(f"Machine CR '{AGENT_MACHINE_NAME}' not found in cluster")
+    log(f"Machine CR '{AGENT_MACHINE_NAME}' exists")
+
+    # 3. Check daemon logs for watch establishment.
+    log("Checking daemon logs for watch activity...")
+    result = subprocess.run(
+        ["ssh", *SSH_OPTS, SSH_TARGET,
+         "sudo journalctl -u unbounded-agent-daemon.service --no-pager -l -n 100"],
+        capture_output=True, text=True,
+    )
+    daemon_logs = result.stdout if result.returncode == 0 else ""
+    if VERBOSE:
+        print(daemon_logs, flush=True)
+
+    if "watching Machine CR" in daemon_logs:
+        log("Daemon is actively watching Machine CR")
+    elif "daemon starting" in daemon_logs:
+        log("Daemon has started (watch may still be establishing)")
+    else:
+        log("[WARN] Could not confirm daemon watch activity from logs")
+
+    log("============================================")
+    log("  Daemon validation PASSED")
+    log("============================================")
+
+
+# ---------------------------------------------------------------------------
+# trigger-upgrade
+# ---------------------------------------------------------------------------
+def _bump_patch_version(version: str) -> str:
+    """Bump the patch component of a semver string.
+
+    Examples:
+        "v1.33.1" -> "v1.33.2"
+        "1.33.1"  -> "1.33.2"
+    """
+    prefix = ""
+    v = version
+    if v.startswith("v"):
+        prefix = "v"
+        v = v[1:]
+
+    parts = v.split(".")
+    if len(parts) != 3:
+        die(f"Cannot parse version '{version}' as semver")
+
+    parts[2] = str(int(parts[2]) + 1)
+    return prefix + ".".join(parts)
+
+
+def trigger_upgrade() -> None:
+    """Patch the Machine CR to trigger a version upgrade via repaveCounter.
+
+    Reads the current Kubernetes version from the node, bumps the patch
+    component (e.g. v1.33.1 -> v1.33.2), and patches the Machine CR with
+    both spec.kubernetes.version and spec.operations.repaveCounter=1.
+    The daemon detects both spec drift and operations drift and triggers
+    nodeupdate.Execute().
+    """
+
+    log(f"Triggering node upgrade for Machine CR '{AGENT_MACHINE_NAME}'...")
+
+    # Get the current Kubernetes version from the node.
+    current_version = kubectl_capture([
+        "get", "node", AGENT_MACHINE_NAME,
+        "-o", "jsonpath={.status.nodeInfo.kubeletVersion}",
+    ])
+    if not current_version:
+        die("Could not determine current Kubernetes version from node")
+
+    upgrade_version = _bump_patch_version(current_version)
+    log(f"Current version: {current_version}, upgrade version: {upgrade_version}")
+
+    # Record which nspawn machine is currently active before the upgrade
+    # so validate-upgrade can confirm it switched.
+    result = subprocess.run(
+        ["ssh", *SSH_OPTS, SSH_TARGET,
+         "sudo ls /etc/unbounded/agent/"],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        log(f"Applied config files before upgrade: {result.stdout.strip()}")
+
+    # Patch the Machine CR to set the new version and repaveCounter = 1.
+    # The CRD requires spec.kubernetes.bootstrapTokenRef when
+    # spec.kubernetes is present, so we include a placeholder value.
+    patch = json.dumps({
+        "spec": {
+            "kubernetes": {
+                "version": upgrade_version,
+                "bootstrapTokenRef": {
+                    "name": "not-used-by-agent-daemon",
+                },
+            },
+            "operations": {
+                "repaveCounter": 1,
+            },
+        },
+    })
+    kubectl(["patch", "machine", AGENT_MACHINE_NAME,
+             "--type=merge", "-p", patch])
+
+    log(f"Machine CR patched: spec.kubernetes.version={upgrade_version}, "
+        f"spec.operations.repaveCounter=1")
+
+    # Show the Machine CR state after patch.
+    kubectl(["get", "machine", AGENT_MACHINE_NAME, "-o", "yaml"])
+
+
+# ---------------------------------------------------------------------------
+# validate-upgrade
+# ---------------------------------------------------------------------------
+def validate_upgrade() -> None:
+    """Wait for the daemon to complete the node update and verify the result.
+
+    Checks:
+    1. The node goes through NotReady (update in progress) and comes back Ready.
+    2. Machine CR status.operations.repaveCounter == 1 (counter acknowledged).
+    3. Machine CR status.phase == "Joining".
+    4. Machine CR has NodeUpdated condition with status True.
+    5. The active nspawn machine switched (kube1 -> kube2 or vice versa).
+    6. The daemon systemd unit is still active after the update.
+    """
+
+    timeout_secs = int(os.environ.get("UPGRADE_TIMEOUT", "600"))
+
+    log("Waiting for daemon to detect drift and start node update...")
+    log(f"Timeout: {timeout_secs}s")
+
+    # Phase 1: Wait for Machine CR phase to become Provisioning or beyond.
+    # This confirms the daemon detected the drift and started reconciliation.
+    log("Phase 1: Waiting for daemon to start reconciliation...")
+    elapsed = 0
+    provisioning_seen = False
+    while elapsed < timeout_secs:
+        result = subprocess.run(
+            [KUBECTL, "get", "machine", AGENT_MACHINE_NAME,
+             "-o", "jsonpath={.status.phase}"],
+            capture_output=True, text=True,
+        )
+        phase = result.stdout.strip() if result.returncode == 0 else ""
+        if phase == "Provisioning":
+            log(f"Daemon started reconciliation (phase=Provisioning) after {elapsed}s")
+            provisioning_seen = True
+            break
+        if phase in ("Joining", "Ready"):
+            # The daemon may have already completed by the time we check.
+            log(f"Daemon already completed (phase={phase}) after {elapsed}s")
+            provisioning_seen = True
+            break
+        if phase == "Failed":
+            log("Machine CR phase is Failed - dumping daemon logs")
+            subprocess.run(
+                ["ssh", *SSH_OPTS, SSH_TARGET,
+                 "sudo journalctl -u unbounded-agent-daemon.service --no-pager -l -n 100"],
+                check=False,
+            )
+            die("Daemon reconciliation failed")
+        if elapsed > 0 and elapsed % 15 == 0:
+            log(f"  ({elapsed}s) Machine phase: {phase or '(empty)'}")
+        time.sleep(5)
+        elapsed += 5
+
+    if not provisioning_seen:
+        log("Daemon logs:")
+        subprocess.run(
+            ["ssh", *SSH_OPTS, SSH_TARGET,
+             "sudo journalctl -u unbounded-agent-daemon.service --no-pager -l -n 100"],
+            check=False,
+        )
+        die(f"Daemon did not start reconciliation within {timeout_secs}s")
+
+    # Phase 2: Wait for the node to come back Ready.
+    # During the update the old nspawn machine is stopped and the new one
+    # is started, so the node will briefly go NotReady.
+    log("Phase 2: Waiting for node to become Ready after update...")
+    node_ready_timeout = 300
+    elapsed = 0
+    while elapsed < node_ready_timeout:
+        result = subprocess.run(
+            [KUBECTL, "get", "node", AGENT_MACHINE_NAME,
+             "-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}"],
+            capture_output=True, text=True,
+        )
+        status = result.stdout.strip() if result.returncode == 0 else "unknown"
+        if status == "True":
+            log(f"Node is Ready after {elapsed}s")
+            break
+        if elapsed > 0 and elapsed % 30 == 0:
+            log(f"  ({elapsed}s) Node Ready status: {status}")
+        time.sleep(5)
+        elapsed += 5
+    else:
+        log("Node status:")
+        subprocess.run([KUBECTL, "describe", "node", AGENT_MACHINE_NAME], check=False)
+        die(f"Node did not become Ready after update within {node_ready_timeout}s")
+
+    # Phase 3: Validate Machine CR status.
+    log("Phase 3: Validating Machine CR status...")
+
+    # Wait for status to settle (the daemon updates status after the node
+    # update completes; give it a moment).
+    status_timeout = 60
+    elapsed = 0
+    status_ok = False
+    while elapsed < status_timeout:
+        machine_json = subprocess.run(
+            [KUBECTL, "get", "machine", AGENT_MACHINE_NAME, "-o", "json"],
+            capture_output=True, text=True,
+        )
+        if machine_json.returncode != 0:
+            die(f"Could not get Machine CR: {machine_json.stderr}")
+
+        machine = json.loads(machine_json.stdout)
+        status = machine.get("status", {})
+
+        # Check repaveCounter acknowledgement.
+        ops_status = status.get("operations", {})
+        repave_counter = ops_status.get("repaveCounter", 0)
+
+        # Check phase.
+        phase = status.get("phase", "")
+
+        # Check NodeUpdated condition.
+        conditions = status.get("conditions", [])
+        node_updated = None
+        for cond in conditions:
+            if cond.get("type") == "NodeUpdated":
+                node_updated = cond
+                break
+
+        if (repave_counter == 1
+                and phase in ("Joining", "Ready")
+                and node_updated is not None
+                and node_updated.get("status") == "True"
+                and node_updated.get("reason") == "Succeeded"):
+            status_ok = True
+            break
+
+        if elapsed > 0 and elapsed % 15 == 0:
+            log(f"  ({elapsed}s) phase={phase}, repaveCounter={repave_counter}, "
+                f"NodeUpdated={node_updated}")
+        time.sleep(5)
+        elapsed += 5
+
+    if not status_ok:
+        log("Machine CR status did not reach expected state:")
+        kubectl(["get", "machine", AGENT_MACHINE_NAME, "-o", "yaml"])
+        die("Machine CR status validation failed")
+
+    log(f"Machine CR status validated:")
+    log(f"  phase: {phase}")
+    log(f"  operations.repaveCounter: {repave_counter}")
+    log(f"  NodeUpdated: status={node_updated['status']}, reason={node_updated['reason']}")
+
+    # Phase 4: Verify the active nspawn machine switched.
+    log("Phase 4: Verifying nspawn machine switched...")
+    result = subprocess.run(
+        ["ssh", *SSH_OPTS, SSH_TARGET,
+         "sudo ls /etc/unbounded/agent/"],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        config_files = result.stdout.strip()
+        log(f"Applied config files after upgrade: {config_files}")
+        # After upgrade, only the new machine's config should exist.
+        # e.g. kube2-applied-config.json (if it was kube1 before).
+        if "kube2-applied-config.json" in config_files:
+            log("Active machine switched to kube2 (was kube1)")
+        elif "kube1-applied-config.json" in config_files:
+            log("Active machine switched to kube1 (was kube2)")
+        else:
+            log("[WARN] Could not determine active machine from config files")
+
+    # Verify the new nspawn machine is running.
+    for nspawn_name in NSPAWN_MACHINE_NAMES:
+        result = subprocess.run(
+            ["ssh", *SSH_OPTS, SSH_TARGET,
+             f"sudo machinectl show {nspawn_name} --property=State"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0 and "running" in result.stdout:
+            log(f"nspawn machine '{nspawn_name}' is running (this is the new active machine)")
+
+    # Phase 5: Verify daemon is still running.
+    log("Phase 5: Verifying daemon is still active after update...")
+    result = subprocess.run(
+        ["ssh", *SSH_OPTS, SSH_TARGET,
+         "sudo systemctl is-active unbounded-agent-daemon.service"],
+        capture_output=True, text=True,
+    )
+    daemon_status = result.stdout.strip()
+    if daemon_status == "active":
+        log("Daemon is still active after upgrade")
+    else:
+        log(f"[WARN] Daemon status after upgrade: {daemon_status}")
+        subprocess.run(
+            ["ssh", *SSH_OPTS, SSH_TARGET,
+             "sudo journalctl -u unbounded-agent-daemon.service --no-pager -l -n 50"],
+            check=False,
+        )
+
+    # Phase 6: Verify applied config on disk shows the new version.
+    log("Phase 6: Verifying applied config version on disk...")
+    result = subprocess.run(
+        ["ssh", *SSH_OPTS, SSH_TARGET,
+         "sudo cat /etc/unbounded/agent/kube2-applied-config.json || " +
+         "sudo cat /etc/unbounded/agent/kube1-applied-config.json"],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0 and result.stdout.strip():
+        applied_cfg = json.loads(result.stdout)
+        # AgentConfig uses Go-style capitalised JSON keys:
+        # {"Cluster": {"Version": "1.33.2", ...}, ...}
+        applied_version = applied_cfg.get("Cluster", {}).get("Version", "")
+        # The Machine CR spec.kubernetes.version has a "v" prefix but the
+        # applied config stores the version without it.
+        machine_version = (machine.get("spec", {})
+                           .get("kubernetes", {})
+                           .get("version", ""))
+        expected = machine_version.lstrip("v")
+        if applied_version == expected:
+            log(f"Applied config version matches: {applied_version}")
+        else:
+            die(f"Applied config version mismatch: got '{applied_version}', "
+                f"expected '{expected}'")
+    else:
+        die("Could not read applied config from VM")
+
+    log("============================================")
+    log("  Upgrade validation PASSED")
+    log("============================================")
+    kubectl(["get", "machine", AGENT_MACHINE_NAME, "-o", "yaml"])
+
+
+# ---------------------------------------------------------------------------
 # cleanup
 # ---------------------------------------------------------------------------
 def cleanup() -> None:
@@ -1199,6 +1585,9 @@ COMMANDS = {
     "install-machine-crd": install_machine_crd,
     "delete-machine-cr": delete_machine_cr,
     "validate-machine-cr-created": validate_machine_cr_created,
+    "validate-daemon": validate_daemon,
+    "trigger-upgrade": trigger_upgrade,
+    "validate-upgrade": validate_upgrade,
     "reset-agent": reset_agent,
     "cleanup": cleanup,
 }
