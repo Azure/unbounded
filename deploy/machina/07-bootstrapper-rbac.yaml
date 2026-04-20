@@ -15,6 +15,14 @@ rules:
   - apiGroups: ["unbounded-kube.io"]
     resources: ["machines/status"]
     verbs: ["get", "update", "patch"]
+  # POC: Temporary ConfigMap permissions for the agent operation controller.
+  # The agent watches ConfigMaps labeled unbounded.io/agent-op=<machine-name>
+  # in the unbounded-system namespace to receive operation requests (reboot,
+  # etc.). This will be replaced by a dedicated Operation CRD with proper
+  # RBAC when the operation CR is introduced.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "update", "patch"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
