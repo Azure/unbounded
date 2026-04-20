@@ -230,6 +230,7 @@ echo ""
 
 python3 "$E2E" $E2E_VERBOSE run-agent
 python3 "$E2E" $E2E_VERBOSE wait-for-node
+python3 "$E2E" $E2E_VERBOSE validate-kube-proxy
 python3 "$E2E" $E2E_VERBOSE validate-machine-cr-created
 python3 "$E2E" $E2E_VERBOSE validate-daemon
 
@@ -245,6 +246,7 @@ echo ""
 python3 "$E2E" $E2E_VERBOSE trigger-upgrade
 python3 "$E2E" $E2E_VERBOSE validate-upgrade
 python3 "$E2E" $E2E_VERBOSE wait-for-node
+python3 "$E2E" $E2E_VERBOSE validate-kube-proxy
 python3 "$E2E" $E2E_VERBOSE validate-workload
 
 # ---------------------------------------------------------------------------
@@ -262,6 +264,7 @@ python3 "$E2E" $E2E_VERBOSE delete-machine-cr
 python3 "$E2E" $E2E_VERBOSE ensure-kind-bridge
 python3 "$E2E" $E2E_VERBOSE run-agent
 python3 "$E2E" $E2E_VERBOSE wait-for-node
+python3 "$E2E" $E2E_VERBOSE validate-kube-proxy
 python3 "$E2E" $E2E_VERBOSE validate-machine-cr-created
 python3 "$E2E" $E2E_VERBOSE validate-daemon
 python3 "$E2E" $E2E_VERBOSE validate-workload

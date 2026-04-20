@@ -73,12 +73,6 @@ type nspawnTemplateData struct {
 	NvidiaLibDirMounts   []goalstates.NvidiaLibDirMount
 }
 
-// HasFilesSection reports whether the rendered nspawn config requires a
-// [Files] section. Templates call this to avoid emitting an empty section.
-func (d nspawnTemplateData) HasFilesSection() bool {
-	return len(d.HostDevicePaths) > 0 || len(d.NvidiaGPUDevicePaths) > 0
-}
-
 // writeNSpawnConfigs renders the nspawn and service-override templates with
 // device and GPU data (when present) and writes them to their configured paths.
 func (e *ensureNSpawnWorkspace) writeNSpawnConfigs() error {
