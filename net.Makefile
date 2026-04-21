@@ -37,7 +37,8 @@ GOARCH ?= amd64
 FRONTEND_DIR := frontend
 FRONTEND_DIST_DIR := internal/net/html/dist
 FRONTEND_CACHE_FILE := $(FRONTEND_DIST_DIR)/.frontend-build-key
-MANIFEST_TEMPLATES_DIR := deploy
+MANIFEST_TEMPLATES_DIR := deploy/net
+MANIFEST_RENDERED_DIR  := deploy/net/rendered
 GO_IN_REPO = cd $(REPO_ROOT) && $(GO)
 CONTROLLER_GEN_IN_REPO = cd $(REPO_ROOT) && $(GO) tool controller-gen
 
@@ -381,22 +382,27 @@ build-add-remote:
 	@echo "Bootstrapping remote builder (this may take a moment)..."
 	docker buildx inspect --bootstrap
 
-## Render deployment templates into build/manifests
-render: validate-version generate
-	rm -rf $(REPO_ROOT)build/manifests
-	@mkdir -p $(REPO_ROOT)build/manifests/crds
+## Render deployment templates into deploy/net/rendered
+render: validate-version generate render-manifests
+	cd $(REPO_ROOT) && tar czf "build/unbounded-net-manifests-$(VERSION).tar.gz" -C $(MANIFEST_RENDERED_DIR) .
+	@echo "Rendered manifests written to $(REPO_ROOT)$(MANIFEST_RENDERED_DIR)"
+	@echo "Rendered manifests archive written to $(REPO_ROOT)build/unbounded-net-manifests-$(VERSION).tar.gz"
+
+# Render net manifests into $(MANIFEST_RENDERED_DIR). All deploy-* targets depend
+# on this; the rendered tree is gitignored and safe to overwrite.
+render-manifests:
+	@rm -rf $(REPO_ROOT)$(MANIFEST_RENDERED_DIR)
+	@mkdir -p $(REPO_ROOT)$(MANIFEST_RENDERED_DIR)/crds
 	cd $(REPO_ROOT) && $(GO) run ./hack/cmd/render-manifests \
 		--templates-dir "$(REPO_ROOT)$(MANIFEST_TEMPLATES_DIR)" \
-		--output-dir build/manifests \
-		--namespace "$(NAMESPACE)" \
-		--controller-image "$(UNBOUNDED_NET_CONTROLLER_IMAGE)" \
-		--node-image "$(UNBOUNDED_NET_NODE_IMAGE)" \
-		--force-not-leader "$(FORCE_NOT_LEADER)" \
-		--azure-tenant-id "$(AZURE_TENANT_ID)"
-	cp $(REPO_ROOT)deploy/net/crds/*.yaml $(REPO_ROOT)build/manifests/crds/
-	cd $(REPO_ROOT) && tar czf "build/unbounded-net-manifests-$(VERSION).tar.gz" -C build/manifests .
-	@echo "Rendered manifests written to $(REPO_ROOT)build/manifests"
-	@echo "Rendered manifests archive written to $(REPO_ROOT)build/unbounded-net-manifests-$(VERSION).tar.gz"
+		--output-dir "$(REPO_ROOT)$(MANIFEST_RENDERED_DIR)" \
+		--set Namespace=$(NAMESPACE) \
+		--set ControllerImage=$(UNBOUNDED_NET_CONTROLLER_IMAGE) \
+		--set NodeImage=$(UNBOUNDED_NET_NODE_IMAGE) \
+		--set ForceNotLeader=$(FORCE_NOT_LEADER) \
+		--set AzureTenantID=$(AZURE_TENANT_ID) \
+		--set ApiserverURL=$(APISERVER_URL)
+	@cp $(REPO_ROOT)deploy/net/crds/*.yaml $(REPO_ROOT)$(MANIFEST_RENDERED_DIR)/crds/
 
 #
 # Kubernetes Targets
@@ -409,23 +415,12 @@ deploy: validate-version deploy-crds deploy-namespace deploy-config deploy-contr
 ## - Creates configmap when missing.
 ## - Does not overwrite existing values with empty/null values.
 ## - If LOG_LEVEL is provided on command line, patches LOG_LEVEL first.
-deploy-config: validate-version deploy-namespace
+deploy-config: validate-version deploy-namespace render-manifests
 	@set -e; \
-	MANIFEST_TMP_DIR=$$(mktemp -d); \
-	trap 'rm -rf "$$MANIFEST_TMP_DIR"' EXIT; \
-	cd $(REPO_ROOT) && $(GO) run ./hack/cmd/render-manifests \
-		--templates-dir "$(REPO_ROOT)$(MANIFEST_TEMPLATES_DIR)" \
-		--output-dir "$$MANIFEST_TMP_DIR" \
-		--namespace "$(NAMESPACE)" \
-		--controller-image "$(UNBOUNDED_NET_CONTROLLER_IMAGE)" \
-		--node-image "$(UNBOUNDED_NET_NODE_IMAGE)" \
-		--force-not-leader "$(FORCE_NOT_LEADER)" \
-		--azure-tenant-id "$(AZURE_TENANT_ID)" \
-		--apiserver-url "$(APISERVER_URL)"; \
 	CM_NAME="unbounded-net-config"; \
 	if ! kubectl get configmap $$CM_NAME -n $(NAMESPACE) >/dev/null 2>&1; then \
 		echo "Creating $$CM_NAME configmap in namespace $(NAMESPACE)"; \
-		kubectl apply -f "$$MANIFEST_TMP_DIR/01-configmap.yaml"; \
+		kubectl apply -f "$(REPO_ROOT)$(MANIFEST_RENDERED_DIR)/01-configmap.yaml"; \
 	fi; \
 	if [ "$(LOG_LEVEL_FROM_ARGS)" = "1" ] && [ -n "$(LOG_LEVEL)" ]; then \
 		echo "Patching $$CM_NAME LOG_LEVEL=$(LOG_LEVEL)"; \
@@ -437,21 +432,9 @@ deploy-config: validate-version deploy-namespace
 	fi
 
 ## Deploy only the namespace (skipped when NAMESPACE=kube-system)
-deploy-namespace:
+deploy-namespace: render-manifests
 	@if [ "$(NAMESPACE)" != "kube-system" ]; then \
-		set -e; \
-		MANIFEST_TMP_DIR=$$(mktemp -d); \
-		trap 'rm -rf "$$MANIFEST_TMP_DIR"' EXIT; \
-		cd $(REPO_ROOT) && $(GO) run ./hack/cmd/render-manifests \
-			--templates-dir "$(REPO_ROOT)$(MANIFEST_TEMPLATES_DIR)" \
-			--output-dir "$$MANIFEST_TMP_DIR" \
-			--namespace "$(NAMESPACE)" \
-			--controller-image "$(UNBOUNDED_NET_CONTROLLER_IMAGE)" \
-			--node-image "$(UNBOUNDED_NET_NODE_IMAGE)" \
-			--force-not-leader "$(FORCE_NOT_LEADER)" \
-			--azure-tenant-id "$(AZURE_TENANT_ID)" \
-			--apiserver-url "$(APISERVER_URL)"; \
-		kubectl apply -f "$$MANIFEST_TMP_DIR/00-namespace.yaml"; \
+		kubectl apply -f "$(REPO_ROOT)$(MANIFEST_RENDERED_DIR)/00-namespace.yaml"; \
 	fi
 
 ## Deploy only the CRDs to Kubernetes
@@ -459,22 +442,11 @@ deploy-crds: generate
 	kubectl apply -f "$(REPO_ROOT)deploy/net/crds/"
 
 ## Deploy only the controller to Kubernetes (and restart if needed)
-deploy-controller: validate-version deploy-namespace deploy-crds deploy-config
+deploy-controller: validate-version deploy-namespace deploy-crds deploy-config render-manifests
 	@CTRL_GEN_BEFORE=$$(kubectl get deployment/unbounded-net-controller -n $(NAMESPACE) -o jsonpath='{.metadata.generation}' 2>/dev/null || echo "0"); \
-	MANIFEST_TMP_DIR=$$(mktemp -d); \
-	trap 'rm -rf "$$MANIFEST_TMP_DIR"' EXIT; \
-	cd $(REPO_ROOT) && $(GO) run ./hack/cmd/render-manifests \
-		--templates-dir "$(REPO_ROOT)$(MANIFEST_TEMPLATES_DIR)" \
-		--output-dir "$$MANIFEST_TMP_DIR" \
-		--namespace "$(NAMESPACE)" \
-		--controller-image "$(UNBOUNDED_NET_CONTROLLER_IMAGE)" \
-		--node-image "$(UNBOUNDED_NET_NODE_IMAGE)" \
-		--force-not-leader "$(FORCE_NOT_LEADER)" \
-		--azure-tenant-id "$(AZURE_TENANT_ID)" \
-		--apiserver-url "$(APISERVER_URL)"; \
-	kubectl apply -f "$$MANIFEST_TMP_DIR/controller/01-serviceaccount.yaml"; \
-	kubectl apply -f "$$MANIFEST_TMP_DIR/controller/02-rbac.yaml"; \
-	kubectl apply -f "$$MANIFEST_TMP_DIR/controller/04-service.yaml"; \
+	kubectl apply -f "$(REPO_ROOT)$(MANIFEST_RENDERED_DIR)/controller/01-serviceaccount.yaml"; \
+	kubectl apply -f "$(REPO_ROOT)$(MANIFEST_RENDERED_DIR)/controller/02-rbac.yaml"; \
+	kubectl apply -f "$(REPO_ROOT)$(MANIFEST_RENDERED_DIR)/controller/04-service.yaml"; \
 	kubectl delete service unbounded-net-webhook -n $(NAMESPACE) --ignore-not-found; \
 	kubectl delete validatingadmissionpolicy unbounded-net-webhook-field-restriction --ignore-not-found; \
 	kubectl delete validatingadmissionpolicybinding unbounded-net-webhook-field-restriction --ignore-not-found; \
@@ -482,12 +454,12 @@ deploy-controller: validate-version deploy-namespace deploy-crds deploy-config
 	kubectl delete validatingadmissionpolicybinding unbounded-net-csr-restriction --ignore-not-found; \
 	kubectl delete validatingadmissionpolicy unbounded-net-csr-approval-restriction --ignore-not-found; \
 	kubectl delete validatingadmissionpolicybinding unbounded-net-csr-approval-restriction --ignore-not-found; \
-	kubectl apply -f "$$MANIFEST_TMP_DIR/controller/06-validatingwebhook.yaml"; \
-	kubectl apply -f "$$MANIFEST_TMP_DIR/controller/07-apiservice.yaml"; \
-	kubectl apply -f "$$MANIFEST_TMP_DIR/controller/08-mutatingwebhook.yaml"; \
-	kubectl apply -f "$$MANIFEST_TMP_DIR/controller/09-vap.yaml"; \
-	kubectl apply -f "$$MANIFEST_TMP_DIR/controller/10-status-viewer.yaml"; \
-	kubectl apply -f "$$MANIFEST_TMP_DIR/controller/03-deployment.yaml"; \
+	kubectl apply -f "$(REPO_ROOT)$(MANIFEST_RENDERED_DIR)/controller/06-validatingwebhook.yaml"; \
+	kubectl apply -f "$(REPO_ROOT)$(MANIFEST_RENDERED_DIR)/controller/07-apiservice.yaml"; \
+	kubectl apply -f "$(REPO_ROOT)$(MANIFEST_RENDERED_DIR)/controller/08-mutatingwebhook.yaml"; \
+	kubectl apply -f "$(REPO_ROOT)$(MANIFEST_RENDERED_DIR)/controller/09-vap.yaml"; \
+	kubectl apply -f "$(REPO_ROOT)$(MANIFEST_RENDERED_DIR)/controller/10-status-viewer.yaml"; \
+	kubectl apply -f "$(REPO_ROOT)$(MANIFEST_RENDERED_DIR)/controller/03-deployment.yaml"; \
 	CTRL_GEN_AFTER=$$(kubectl get deployment/unbounded-net-controller -n $(NAMESPACE) -o jsonpath='{.metadata.generation}'); \
 	if [ "$$CTRL_GEN_BEFORE" = "$$CTRL_GEN_AFTER" ]; then \
 		echo "Controller manifest unchanged, restarting to pick up new image..."; \
@@ -497,22 +469,11 @@ deploy-controller: validate-version deploy-namespace deploy-crds deploy-config
 	kubectl rollout status deployment/unbounded-net-controller -n $(NAMESPACE) --timeout=120s
 
 ## Deploy only the node DaemonSet to Kubernetes (and restart if needed)
-deploy-node: validate-version deploy-crds deploy-namespace deploy-config
+deploy-node: validate-version deploy-crds deploy-namespace deploy-config render-manifests
 	@NODE_GEN_BEFORE=$$(kubectl get daemonset/unbounded-net-node -n $(NAMESPACE) -o jsonpath='{.metadata.generation}' 2>/dev/null || echo "0"); \
-	MANIFEST_TMP_DIR=$$(mktemp -d); \
-	trap 'rm -rf "$$MANIFEST_TMP_DIR"' EXIT; \
-	cd $(REPO_ROOT) && $(GO) run ./hack/cmd/render-manifests \
-		--templates-dir "$(REPO_ROOT)$(MANIFEST_TEMPLATES_DIR)" \
-		--output-dir "$$MANIFEST_TMP_DIR" \
-		--namespace "$(NAMESPACE)" \
-		--controller-image "$(UNBOUNDED_NET_CONTROLLER_IMAGE)" \
-		--node-image "$(UNBOUNDED_NET_NODE_IMAGE)" \
-		--force-not-leader "$(FORCE_NOT_LEADER)" \
-		--azure-tenant-id "$(AZURE_TENANT_ID)" \
-		--apiserver-url "$(APISERVER_URL)"; \
-	kubectl apply -f "$$MANIFEST_TMP_DIR/node/01-serviceaccount.yaml"; \
-	kubectl apply -f "$$MANIFEST_TMP_DIR/node/02-rbac.yaml"; \
-	kubectl apply -f "$$MANIFEST_TMP_DIR/node/03-daemonset.yaml"; \
+	kubectl apply -f "$(REPO_ROOT)$(MANIFEST_RENDERED_DIR)/node/01-serviceaccount.yaml"; \
+	kubectl apply -f "$(REPO_ROOT)$(MANIFEST_RENDERED_DIR)/node/02-rbac.yaml"; \
+	kubectl apply -f "$(REPO_ROOT)$(MANIFEST_RENDERED_DIR)/node/03-daemonset.yaml"; \
 	NODE_GEN_AFTER=$$(kubectl get daemonset/unbounded-net-node -n $(NAMESPACE) -o jsonpath='{.metadata.generation}'); \
 	if [ "$$NODE_GEN_BEFORE" = "$$NODE_GEN_AFTER" ]; then \
 		echo "Node manifest unchanged, restarting to pick up new image..."; \
@@ -522,36 +483,24 @@ deploy-node: validate-version deploy-crds deploy-namespace deploy-config
 	kubectl rollout status daemonset/unbounded-net-node -n $(NAMESPACE) --timeout=120s
 
 ## Remove from Kubernetes
-undeploy: validate-version
+undeploy: validate-version render-manifests
 	@set -e; \
-	MANIFEST_TMP_DIR=$$(mktemp -d); \
-	trap 'rm -rf "$$MANIFEST_TMP_DIR"' EXIT; \
-	cd $(REPO_ROOT) && $(GO) run ./hack/cmd/render-manifests \
-		--templates-dir "$(REPO_ROOT)$(MANIFEST_TEMPLATES_DIR)" \
-		--output-dir "$$MANIFEST_TMP_DIR" \
-		--namespace "$(NAMESPACE)" \
-		--controller-image "$(UNBOUNDED_NET_CONTROLLER_IMAGE)" \
-		--node-image "$(UNBOUNDED_NET_NODE_IMAGE)" \
-		--force-not-leader "$(FORCE_NOT_LEADER)" \
-		--azure-tenant-id "$(AZURE_TENANT_ID)" \
-		--apiserver-url "$(APISERVER_URL)"; \
-	kubectl delete -f "$$MANIFEST_TMP_DIR/node/03-daemonset.yaml" --ignore-not-found; \
-	kubectl delete -f "$$MANIFEST_TMP_DIR/node/02-rbac.yaml" --ignore-not-found; \
-	kubectl delete -f "$$MANIFEST_TMP_DIR/node/01-serviceaccount.yaml" --ignore-not-found; \
-	kubectl delete -f "$$MANIFEST_TMP_DIR/controller/09-vap.yaml" --ignore-not-found; \
-	kubectl delete -f "$$MANIFEST_TMP_DIR/controller/08-mutatingwebhook.yaml" --ignore-not-found; \
-	kubectl delete -f "$$MANIFEST_TMP_DIR/controller/07-apiservice.yaml" --ignore-not-found; \
-	kubectl delete -f "$$MANIFEST_TMP_DIR/controller/06-validatingwebhook.yaml" --ignore-not-found; \
-	kubectl delete -f "$$MANIFEST_TMP_DIR/controller/05-webhook.yaml" --ignore-not-found; \
-	kubectl delete -f "$$MANIFEST_TMP_DIR/controller/04-service.yaml" --ignore-not-found; \
-	kubectl delete -f "$$MANIFEST_TMP_DIR/controller/03-deployment.yaml" --ignore-not-found; \
-	kubectl delete -f "$$MANIFEST_TMP_DIR/controller/02-rbac.yaml" --ignore-not-found; \
-	kubectl delete -f "$$MANIFEST_TMP_DIR/controller/01-serviceaccount.yaml" --ignore-not-found; \
+	kubectl delete -f "$(REPO_ROOT)$(MANIFEST_RENDERED_DIR)/node/03-daemonset.yaml" --ignore-not-found; \
+	kubectl delete -f "$(REPO_ROOT)$(MANIFEST_RENDERED_DIR)/node/02-rbac.yaml" --ignore-not-found; \
+	kubectl delete -f "$(REPO_ROOT)$(MANIFEST_RENDERED_DIR)/node/01-serviceaccount.yaml" --ignore-not-found; \
+	kubectl delete -f "$(REPO_ROOT)$(MANIFEST_RENDERED_DIR)/controller/09-vap.yaml" --ignore-not-found; \
+	kubectl delete -f "$(REPO_ROOT)$(MANIFEST_RENDERED_DIR)/controller/08-mutatingwebhook.yaml" --ignore-not-found; \
+	kubectl delete -f "$(REPO_ROOT)$(MANIFEST_RENDERED_DIR)/controller/07-apiservice.yaml" --ignore-not-found; \
+	kubectl delete -f "$(REPO_ROOT)$(MANIFEST_RENDERED_DIR)/controller/06-validatingwebhook.yaml" --ignore-not-found; \
+	kubectl delete -f "$(REPO_ROOT)$(MANIFEST_RENDERED_DIR)/controller/04-service.yaml" --ignore-not-found; \
+	kubectl delete -f "$(REPO_ROOT)$(MANIFEST_RENDERED_DIR)/controller/03-deployment.yaml" --ignore-not-found; \
+	kubectl delete -f "$(REPO_ROOT)$(MANIFEST_RENDERED_DIR)/controller/02-rbac.yaml" --ignore-not-found; \
+	kubectl delete -f "$(REPO_ROOT)$(MANIFEST_RENDERED_DIR)/controller/01-serviceaccount.yaml" --ignore-not-found; \
 	kubectl delete -f "$(REPO_ROOT)deploy/net/crds/" --ignore-not-found; \
 	kubectl delete apiservice status.net.unbounded-kube.io --ignore-not-found; \
 	kubectl delete apiservice v1alpha1.status.net.unbounded-kube.io --ignore-not-found; \
 	if [ "$(NAMESPACE)" != "kube-system" ]; then \
-		kubectl delete -f "$$MANIFEST_TMP_DIR/00-namespace.yaml" --ignore-not-found; \
+		kubectl delete -f "$(REPO_ROOT)$(MANIFEST_RENDERED_DIR)/00-namespace.yaml" --ignore-not-found; \
 	fi
 
 #

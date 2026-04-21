@@ -249,11 +249,11 @@ jobs:
         run: |
           TAG="${{ needs.version.outputs.tag }}"
           go run ./hack/cmd/render-manifests \
-            --templates-dir deploy \
+            --templates-dir deploy/net \
             --output-dir build/manifests \
-            --namespace unbounded-net \
-            --controller-image "${{ env.REGISTRY }}/unbounded-net-controller:${TAG}" \
-            --node-image "${{ env.REGISTRY }}/unbounded-net-node:${TAG}"
+            --set Namespace=unbounded-net \
+            --set ControllerImage="${{ env.REGISTRY }}/unbounded-net-controller:${TAG}" \
+            --set NodeImage="${{ env.REGISTRY }}/unbounded-net-node:${TAG}"
           mkdir -p build/manifests/crds
           cp deploy/net/crds/*.yaml build/manifests/crds/
           tar czf "build/unbounded-net-manifests-${TAG}.tar.gz" -C build/manifests .
