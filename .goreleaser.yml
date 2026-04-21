@@ -99,4 +99,8 @@ release:
   github:
     owner: Azure
     name: unbounded-kube
+  # Always create as draft. The release workflow attaches additional
+  # artifacts (manifests tarball, krew manifest, image signatures) before
+  # a human flips the release to published.
+  draft: true
   prerelease: auto
