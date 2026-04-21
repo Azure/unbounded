@@ -18,8 +18,10 @@ import (
 )
 
 // reconcileUpdateMachine processes a single Machine CR reconciliation cycle.
-// It reads the current Machine CR from the API server, checks for operation
-// counter drift, and performs a full blue/green node update if needed.
+// It reads the current Machine CR from the API server, resolves the
+// MachineConfigurationVersion referenced by spec.configurationRef, checks
+// for operation counter drift, and performs a full blue/green node update
+// if needed.
 func (r *reconciler) reconcileUpdateMachine(ctx context.Context, log *slog.Logger, machineName string) error {
 	// Read the Machine CR from the API server to get the latest state.
 	machine := &v1alpha3.Machine{}
@@ -27,15 +29,26 @@ func (r *reconciler) reconcileUpdateMachine(ctx context.Context, log *slog.Logge
 		return fmt.Errorf("get Machine %q: %w", machineName, err)
 	}
 
+	// Resolve the MachineConfigurationVersion from configurationRef.
+	mcv, err := r.resolveMCV(ctx, log, machine)
+	if err != nil {
+		return fmt.Errorf("resolve MachineConfigurationVersion: %w", err)
+	}
+
 	// Re-read the active machine state on each event, because a previous
 	// reconciliation may have changed the active nspawn machine name.
-	active, err := findActiveMachine(log)
+	findActive := findActiveMachine
+	if r.findActive != nil {
+		findActive = r.findActive
+	}
+
+	active, err := findActive(log)
 	if err != nil {
 		return fmt.Errorf("find active machine: %w", err)
 	}
 
-	// Build the desired config from the Machine CR overlaid on applied config.
-	desired := desiredConfigFromMachine(active.Config, machine)
+	// Build the desired config from the MCV template overlaid on applied config.
+	desired := desiredConfigFromMCV(active.Config, &mcv.Spec.Template)
 
 	// Check for operation counter drift. Counter bumps are the only
 	// trigger for reconciliation; actual config drift (version, image,
@@ -46,9 +59,15 @@ func (r *reconciler) reconcileUpdateMachine(ctx context.Context, log *slog.Logge
 		return nil
 	}
 
+	desiredVersion := ""
+	if mcv.Spec.Template.Kubernetes != nil {
+		desiredVersion = mcv.Spec.Template.Kubernetes.Version
+	}
+
 	log.Info("operation counter drift detected",
 		"current_version", active.Config.Cluster.Version,
-		"desired_version", specVersion(machine),
+		"desired_version", desiredVersion,
+		"mcv", mcv.Name,
 	)
 
 	// Set status to Provisioning before starting work.
@@ -61,7 +80,7 @@ func (r *reconciler) reconcileUpdateMachine(ctx context.Context, log *slog.Logge
 	if err := updateNode(ctx, log, active, desired); err != nil {
 		// Update status to Failed.
 		failMsg := fmt.Sprintf("node update failed: %v", err)
-		if updateErr := updateMachineStatus(ctx, r.client, machine, v1alpha3.MachinePhaseFailed, failMsg, false); updateErr != nil {
+		if updateErr := updateMachineStatus(ctx, r.client, machine, v1alpha3.MachinePhaseFailed, failMsg, nil, false); updateErr != nil {
 			log.Warn("failed to update status after failure", "error", updateErr)
 		}
 
@@ -71,23 +90,56 @@ func (r *reconciler) reconcileUpdateMachine(ctx context.Context, log *slog.Logge
 	// Acknowledge operation counters.
 	acknowledgeOperations(machine)
 
+	// Record the applied configuration version in Machine status.
+	configStatus := &v1alpha3.MachineConfigurationRefStatus{
+		Name:        machine.Spec.ConfigurationRef.Name,
+		Version:     mcv.Spec.Version,
+		VersionName: mcv.Name,
+	}
+
 	// Update status to Joining with success.
-	if err := updateMachineStatus(ctx, r.client, machine, v1alpha3.MachinePhaseJoining, "node update completed", true); err != nil {
+	if err := updateMachineStatus(ctx, r.client, machine, v1alpha3.MachinePhaseJoining, "node update completed", configStatus, true); err != nil {
 		log.Warn("failed to update status after success", "error", err)
 	}
 
 	log.Info("reconciliation completed",
 		"new_version", desired.Cluster.Version,
+		"mcv", mcv.Name,
 	)
 
 	return nil
 }
 
-// desiredConfigFromMachine builds the desired AgentConfig by overlaying
-// fields from the Machine CR onto the applied config. Fields not present in
-// the CR (API server, CA cert, cluster DNS, bootstrap token, etc.) are
-// preserved from the applied config.
-func desiredConfigFromMachine(applied *provision.AgentConfig, machine *v1alpha3.Machine) *provision.AgentConfig {
+// resolveMCV looks up the MachineConfigurationVersion referenced by the
+// Machine's spec.configurationRef. If configurationRef is nil or the MCV
+// cannot be found, an error is returned - the agent requires a valid
+// configuration reference to proceed.
+func (r *reconciler) resolveMCV(ctx context.Context, log *slog.Logger, machine *v1alpha3.Machine) (*v1alpha3.MachineConfigurationVersion, error) {
+	ref := machine.Spec.ConfigurationRef
+	if ref == nil {
+		return nil, fmt.Errorf("Machine %q has no spec.configurationRef", machine.Name)
+	}
+
+	if ref.Version == nil {
+		return nil, fmt.Errorf("Machine %q configurationRef has no version set", machine.Name)
+	}
+
+	mcvName := fmt.Sprintf("%s-v%d", ref.Name, *ref.Version)
+	log.Debug("resolving MachineConfigurationVersion", "mcv", mcvName)
+
+	mcv := &v1alpha3.MachineConfigurationVersion{}
+	if err := r.client.Get(ctx, client.ObjectKey{Name: mcvName}, mcv); err != nil {
+		return nil, fmt.Errorf("get MachineConfigurationVersion %q: %w", mcvName, err)
+	}
+
+	return mcv, nil
+}
+
+// desiredConfigFromMCV builds the desired AgentConfig by overlaying fields
+// from a MachineConfigurationVersion template onto the applied config.
+// Fields not present in the template (API server, CA cert, cluster DNS,
+// bootstrap token, etc.) are preserved from the applied config.
+func desiredConfigFromMCV(applied *provision.AgentConfig, tmpl *v1alpha3.MachineConfigurationTemplate) *provision.AgentConfig {
 	// Deep copy the applied config as the base.
 	desired := *applied
 	desired.Cluster = applied.Cluster
@@ -113,27 +165,27 @@ func desiredConfigFromMachine(applied *provision.AgentConfig, machine *v1alpha3.
 		desired.Attest = &a
 	}
 
-	// Overlay Machine CR fields.
-	if machine.Spec.Kubernetes != nil {
-		if v := machine.Spec.Kubernetes.Version; v != "" {
+	// Overlay MCV template fields.
+	if tmpl.Kubernetes != nil {
+		if v := tmpl.Kubernetes.Version; v != "" {
 			desired.Cluster.Version = strings.TrimPrefix(v, "v")
 		}
 
-		if labels := machine.Spec.Kubernetes.NodeLabels; len(labels) > 0 {
+		if labels := tmpl.Kubernetes.NodeLabels; len(labels) > 0 {
 			desired.Kubelet.Labels = make(map[string]string, len(labels))
 			for k, v := range labels {
 				desired.Kubelet.Labels[k] = v
 			}
 		}
 
-		if taints := machine.Spec.Kubernetes.RegisterWithTaints; len(taints) > 0 {
+		if taints := tmpl.Kubernetes.RegisterWithTaints; len(taints) > 0 {
 			desired.Kubelet.RegisterWithTaints = make([]string, len(taints))
 			copy(desired.Kubelet.RegisterWithTaints, taints)
 		}
 	}
 
-	if machine.Spec.Agent != nil && machine.Spec.Agent.Image != "" {
-		desired.OCIImage = machine.Spec.Agent.Image
+	if tmpl.Agent != nil && tmpl.Agent.Image != "" {
+		desired.OCIImage = tmpl.Agent.Image
 	}
 
 	return &desired
@@ -158,16 +210,6 @@ func hasOperationsDrift(machine *v1alpha3.Machine) bool {
 	}
 
 	return false
-}
-
-// specVersion extracts the kubernetes version from a Machine spec, or returns
-// empty string if not set.
-func specVersion(machine *v1alpha3.Machine) string {
-	if machine.Spec.Kubernetes != nil {
-		return machine.Spec.Kubernetes.Version
-	}
-
-	return ""
 }
 
 // acknowledgeOperations copies the spec repave counter to status, marking
@@ -205,17 +247,23 @@ func updateMachinePhase(ctx context.Context, c client.Client, machine *v1alpha3.
 }
 
 // updateMachineStatus sets the Machine phase, message, operation counters,
-// and the NodeUpdated condition via a status update.
+// configuration status, and the NodeUpdated condition via a status update.
+// configStatus may be nil if no configuration change was applied.
 func updateMachineStatus(
 	ctx context.Context,
 	c client.Client,
 	machine *v1alpha3.Machine,
 	phase v1alpha3.MachinePhase,
 	message string,
+	configStatus *v1alpha3.MachineConfigurationRefStatus,
 	success bool,
 ) error {
 	machine.Status.Phase = phase
 	machine.Status.Message = message
+
+	if configStatus != nil {
+		machine.Status.Configuration = configStatus
+	}
 
 	condStatus := metav1.ConditionFalse
 	condReason := "Failed"

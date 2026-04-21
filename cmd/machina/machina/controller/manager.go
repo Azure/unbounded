@@ -58,7 +58,7 @@ func RunManager(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("resolve cluster info: %w", err)
 	}
 
-	// Setup Machine controller — handles both reachability and provisioning.
+	// Setup Machine controller - handles both reachability and provisioning.
 	if err := (&MachineReconciler{
 		Client:                      mgr.GetClient(),
 		Scheme:                      mgr.GetScheme(),
@@ -67,6 +67,14 @@ func RunManager(ctx context.Context, cfg Config) error {
 		ProvisioningTimeoutDuration: cfg.ProvisioningTimeout,
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup Machine controller: %w", err)
+	}
+
+	// Setup MachineConfiguration controller - manages versioned config snapshots.
+	if err := (&MachineConfigurationReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("setup MachineConfiguration controller: %w", err)
 	}
 
 	// Add health checks

@@ -86,6 +86,11 @@ const (
 	// AnnotationProvider associates a Machine with a provider's
 	// controller for reboot/repave operations.
 	AnnotationProvider = "unbounded-kube.io/provider"
+
+	// AnnotationConfigurationVersion is set on the Kubernetes Node
+	// object to record which MachineConfigurationVersion was used to
+	// bootstrap the machine.
+	AnnotationConfigurationVersion = "unbounded-kube.io/machine-configuration-version"
 )
 
 // MachineSpec defines the desired state of a Machine.
@@ -110,6 +115,30 @@ type MachineSpec struct {
 	// Operations contains counter-based operation triggers.
 	// +optional
 	Operations *OperationsSpec `json:"operations,omitempty"`
+
+	// ConfigurationRef references a MachineConfiguration (and
+	// optionally a specific version) that defines the configuration
+	// profile for this machine. If a specific version is set, that
+	// version is used at provisioning time; otherwise the latest
+	// locked version is used and the version field is set by the
+	// controller.
+	// +optional
+	ConfigurationRef *MachineConfigurationRef `json:"configurationRef,omitempty"`
+}
+
+// MachineConfigurationRef references a MachineConfiguration and
+// optionally a specific MachineConfigurationVersion.
+type MachineConfigurationRef struct {
+	// Name is the name of the MachineConfiguration.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+
+	// Version is the specific MachineConfigurationVersion number to
+	// use. If omitted, the controller selects the latest locked
+	// (deployed) version and populates this field.
+	// +optional
+	Version *int32 `json:"version,omitempty"`
 }
 
 // SSHSpec defines SSH connection details. The same structure is reused
@@ -342,9 +371,28 @@ type MachineStatus struct {
 	// +optional
 	Operations *OperationsStatus `json:"operations,omitempty"`
 
+	// Configuration records the MachineConfigurationVersion that was
+	// applied to this machine during the most recent provisioning.
+	// +optional
+	Configuration *MachineConfigurationRefStatus `json:"configuration,omitempty"`
+
 	// Conditions represent the latest available observations of the
 	// machine's state.
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// MachineConfigurationRefStatus records which configuration version
+// was applied to a Machine.
+type MachineConfigurationRefStatus struct {
+	// Name is the MachineConfiguration name.
+	Name string `json:"name,omitempty"`
+
+	// Version is the MachineConfigurationVersion number that was applied.
+	Version int32 `json:"version,omitempty"`
+
+	// VersionName is the full MachineConfigurationVersion object name
+	// (e.g. "myconfig-v3").
+	VersionName string `json:"versionName,omitempty"`
 }
 
 // MachinePhase represents the current phase of a Machine.
