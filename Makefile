@@ -238,16 +238,16 @@ fmt: check-deps ## Format all Go source files (gofumpt + wsl_v5 whitespace)
 ifdef CI
 # In CI each job is independent; skip chained prerequisites.
 
-lint: ## Run golangci-lint
+lint: machina-manifests ## Run golangci-lint
 	$(GOLINT) ./...
 
-test: ## Run all tests with race detector
+test: machina-manifests ## Run all tests with race detector
 	$(GOTEST) -race ./...
 
 else
 # Locally, chain targets for convenience: test -> lint -> fmt -> check-deps.
 
-lint: fmt ## Run golangci-lint (implies fmt)
+lint: fmt machina-manifests ## Run golangci-lint (implies fmt)
 	$(GOLINT) ./...
 
 test: lint ## Run all tests (implies lint)
@@ -261,7 +261,7 @@ build: machina-manifests ## Build all Go packages
 generate: install-protoc ## Run go generate for API types (deepcopy, CRDs) and protobuf
 	PATH="$(PROTOC_DIR)/bin:$$PATH" $(GOCMD) generate ./...
 
-vulncheck: ## Run govulncheck for known vulnerabilities
+vulncheck: machina-manifests ## Run govulncheck for known vulnerabilities
 	$(GOCMD) tool govulncheck ./...
 
 gomod: ## Tidy go.mod and go.sum
