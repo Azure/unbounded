@@ -146,12 +146,13 @@ jobs:
         uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7
         with:
           context: .
-          file: docker/Dockerfile
+          file: images/net-controller/Dockerfile
           target: controller
           platforms: ${{ matrix.platform }}
           build-args: |
             GO_VERSION=${{ steps.goversion.outputs.go_version }}
             VERSION=${{ needs.version.outputs.tag }}
+            GIT_COMMIT=${{ github.sha }}
             CNI_PLUGINS_VERSION=${{ env.CNI_PLUGINS_VERSION }}
           tags: ${{ env.REGISTRY }}/unbounded-net-controller:${{ needs.version.outputs.tag }}-${{ matrix.arch }}
           cache-from: type=gha,scope=build-${{ matrix.arch }}
@@ -163,12 +164,13 @@ jobs:
         uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7
         with:
           context: .
-          file: docker/Dockerfile
+          file: images/net-node/Dockerfile
           target: node
           platforms: ${{ matrix.platform }}
           build-args: |
             GO_VERSION=${{ steps.goversion.outputs.go_version }}
             VERSION=${{ needs.version.outputs.tag }}
+            GIT_COMMIT=${{ github.sha }}
             CNI_PLUGINS_VERSION=${{ env.CNI_PLUGINS_VERSION }}
           tags: ${{ env.REGISTRY }}/unbounded-net-node:${{ needs.version.outputs.tag }}-${{ matrix.arch }}
           cache-from: type=gha,scope=build-${{ matrix.arch }}
@@ -257,13 +259,6 @@ jobs:
           mkdir -p build/manifests/crds
           cp deploy/net/crds/*.yaml build/manifests/crds/
           tar czf "build/unbounded-net-manifests-${TAG}.tar.gz" -C build/manifests .
-
-      - name: Download plugin artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          pattern: plugin-*
-          path: build/kubectl-plugin
-          merge-multiple: true
 
       - name: Install cosign
         uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v4
