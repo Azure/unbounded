@@ -15,6 +15,7 @@ builds:
     hooks:
       pre:
         - make machina-manifests VERSION={{ .Tag }}
+        - make net-render-manifests VERSION={{ .Tag }}
     goos:
       - linux
       - darwin

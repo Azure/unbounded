@@ -74,15 +74,16 @@ Initialize a new unbounded-kube site. This command:
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--cni-manifests` | `string` | unbounded-net release URL | Path to a local file/directory or HTTPS URL for CNI manifests |
+| `--cni-manifests` | `string` | *(embedded manifests)* | Path to a local file/directory or HTTPS URL for CNI manifests |
 | `--machina-manifests` | `string` | *(embedded manifests)* | Path to a local file/directory or HTTPS URL for machina manifests |
 | `--kubeconfig` | `string` | `$KUBECONFIG` or default | Path to kubeconfig file |
 
 #### Validation
 
 - All CIDR values must be valid IPv4 CIDR notation.
-- `--cni-manifests` must be either a valid HTTPS URL or an existing local
-  file/directory path.
+- `--cni-manifests`, when provided, must be either a valid HTTPS URL or an
+  existing local file/directory path. If omitted, the manifests embedded in
+  the kubectl plugin are used.
 - `kubectl` must be available on `PATH`.
 
 #### Example
