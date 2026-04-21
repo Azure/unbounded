@@ -83,7 +83,7 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 REACT_DEV ?= false
 
 .PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge inventory inventory-amd64 inventory-arm64 unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute
-.PHONY: net-frontend net-frontend-clean net-build-ebpf net-render-manifests net-render
+.PHONY: net-frontend net-frontend-clean net-build-ebpf net-render-manifests net-render release-manifests
 .PHONY: image-machina-local image-metalman-local image-net-controller-local image-net-node-local images-local
 .PHONY: net-deploy net-deploy-crds net-deploy-namespace net-deploy-config net-deploy-controller net-deploy-node net-undeploy
 
@@ -451,6 +451,22 @@ net-render: net-render-manifests ## Render net manifests and create a versioned 
 	@mkdir -p build
 	tar czf "build/unbounded-net-manifests-$(VERSION).tar.gz" -C $(NET_MANIFEST_RENDERED_DIR) .
 	@echo "Rendered manifests archive: build/unbounded-net-manifests-$(VERSION).tar.gz"
+
+##@ Release Manifests
+
+RELEASE_MANIFESTS_STAGE_DIR := build/release-manifests
+RELEASE_MANIFESTS_NAME      := unbounded-manifests-$(VERSION)
+
+release-manifests: machina-manifests net-render-manifests ## Build stamped combined machina+net manifest tarball under build/
+	@rm -rf $(RELEASE_MANIFESTS_STAGE_DIR)
+	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machina
+	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/net
+	@cp -R $(MACHINA_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machina/
+	@cp -R $(NET_MANIFEST_RENDERED_DIR)/.     $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/net/
+	@echo "$(VERSION)" > $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/VERSION
+	@mkdir -p build
+	tar czf "build/$(RELEASE_MANIFESTS_NAME).tar.gz" -C $(RELEASE_MANIFESTS_STAGE_DIR) $(RELEASE_MANIFESTS_NAME)
+	@echo "Release manifests archive: build/$(RELEASE_MANIFESTS_NAME).tar.gz"
 
 ##@ Net Kubernetes
 
