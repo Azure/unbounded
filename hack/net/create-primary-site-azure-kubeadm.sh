@@ -885,14 +885,14 @@ else
     kubectl rollout restart ds/kube-proxy -n kube-system 2>/dev/null || true
 fi
 
-echo "==> Running make net-deploy-crds..."
-(cd "$REPO_ROOT" && make net-deploy-crds)
+echo "==> Running make -C hack/net deploy-crds..."
+(cd "$REPO_ROOT" && make -C hack/net deploy-crds)
 
 echo "==> Deploying site resources..."
 ensure_site_gateway_resources "$SITE_NAME" "${GATEWAY_POOL_NAME}"
 
-echo "==> Running make build net-deploy..."
-(cd "$REPO_ROOT" && make build net-deploy)
+echo "==> Running make build && make -C hack/net deploy..."
+(cd "$REPO_ROOT" && make build && make -C hack/net deploy)
 
 echo ""
 echo "==> Kubeadm primary site '$SITE_NAME' deployment complete!"

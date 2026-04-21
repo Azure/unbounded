@@ -10,34 +10,34 @@ multi-site or AKS deployments.
 
 - **Kubernetes cluster** (v1.27+) with WireGuard kernel module support on nodes
 - **kubectl** configured for your cluster
-- **Go toolchain** (if building from source or using `make net-deploy`)
+- **Go toolchain** (if building from source or using `make -C hack/net deploy`)
 - For **AKS**: Azure CLI (`az`), a subscription with permissions to create
   clusters, node pools, and public IP prefixes
 
 ## Deploying unbounded-net
 
-You can deploy unbounded-net either with `make net-deploy` (recommended -- handles
+You can deploy unbounded-net either with `make -C hack/net deploy` (recommended -- handles
 template rendering and ordering) or by applying manifests manually.
 
 ### Option A: Deploy with Make (recommended)
 
 ```bash
 # Deploy everything: CRDs, namespace, config, controller, and node agent
-make net-deploy
+make -C hack/net deploy
 ```
 
 By default this deploys into the `unbounded-net` namespace. Override with:
 
 ```bash
-make net-deploy NET_NAMESPACE=kube-system
+make -C hack/net deploy NET_NAMESPACE=kube-system
 ```
 
 You can also deploy components individually:
 
 ```bash
-make net-deploy-crds          # CRDs only
-make net-deploy-controller    # Controller (includes CRDs, namespace, config)
-make net-deploy-node          # Node agent (includes CRDs, namespace, config)
+make -C hack/net deploy-crds          # CRDs only
+make -C hack/net deploy-controller    # Controller (includes CRDs, namespace, config)
+make -C hack/net deploy-node          # Node agent (includes CRDs, namespace, config)
 ```
 
 ### Option B: Manual deployment

@@ -68,7 +68,7 @@ NET_NAMESPACE           ?= unbounded-net
 NET_FORCE_NOT_LEADER    ?= false
 NET_AZURE_TENANT_ID     ?=
 NET_APISERVER_URL       ?= $(shell kubectl config view --flatten --minify --template '{{ (index .clusters 0).cluster.server }}' 2>/dev/null)
-# When set (e.g. NET_LOG_LEVEL=4), net-deploy-config patches the live configmap.
+# When set (e.g. NET_LOG_LEVEL=4), `make -C hack/net deploy-config` patches the live configmap.
 NET_LOG_LEVEL           ?=
 
 # Paths.
@@ -85,7 +85,6 @@ REACT_DEV ?= false
 .PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge inventory inventory-amd64 inventory-arm64 unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute
 .PHONY: net-frontend net-frontend-clean net-build-ebpf net-render-manifests net-render release-manifests
 .PHONY: image-machina-local image-metalman-local image-net-controller-local image-net-node-local images-local
-.PHONY: net-deploy net-deploy-crds net-deploy-namespace net-deploy-config net-deploy-controller net-deploy-node net-undeploy
 
 ##@ General
 
@@ -145,13 +144,7 @@ help: ## Show this help
 	@echo "  net-render                  Render net manifests and create a versioned tarball"
 	@echo ""
 	@echo "Net Kubernetes (apply to current kubectl context):"
-	@echo "  net-deploy                  Deploy CRDs, namespace, config, controller, node"
-	@echo "  net-deploy-crds             Apply CRDs only"
-	@echo "  net-deploy-namespace        Apply namespace only"
-	@echo "  net-deploy-config           Apply configmap (and patch when NET_LOG_LEVEL or NET_AZURE_TENANT_ID set)"
-	@echo "  net-deploy-controller       Apply controller manifests and roll the deployment"
-	@echo "  net-deploy-node             Apply node DaemonSet manifests and roll it"
-	@echo "  net-undeploy                Tear down all net resources"
+	@echo "  See \`make -C hack/net help\` for cluster deploy/undeploy targets."
 	@echo ""
 	@echo "Documentation:"
 	@echo "  docs-serve                  Start local Hugo dev server"
@@ -467,41 +460,6 @@ release-manifests: machina-manifests net-render-manifests ## Build stamped combi
 	@mkdir -p build
 	tar czf "build/$(RELEASE_MANIFESTS_NAME).tar.gz" -C $(RELEASE_MANIFESTS_STAGE_DIR) $(RELEASE_MANIFESTS_NAME)
 	@echo "Release manifests archive: build/$(RELEASE_MANIFESTS_NAME).tar.gz"
-
-##@ Net Kubernetes
-
-net-deploy: net-deploy-crds net-deploy-namespace net-deploy-config net-deploy-controller net-deploy-node ## Apply all net components and roll workloads
-
-net-deploy-crds: ## Apply the net CRDs
-	kubectl apply -f "$(NET_CRD_DIR)/"
-
-net-deploy-namespace: net-render-manifests ## Apply the net namespace (skipped when NET_NAMESPACE=kube-system)
-	@if [ "$(NET_NAMESPACE)" != "kube-system" ]; then \
-		kubectl apply -f "$(NET_MANIFEST_RENDERED_DIR)/00-namespace.yaml"; \
-	fi
-
-net-deploy-config: net-deploy-namespace net-render-manifests ## Apply the net configmap; patches LOG_LEVEL/AZURE_TENANT_ID when set
-	NAMESPACE="$(NET_NAMESPACE)" \
-	RENDERED_DIR="$(NET_MANIFEST_RENDERED_DIR)" \
-	LOG_LEVEL="$(NET_LOG_LEVEL)" \
-	AZURE_TENANT_ID="$(NET_AZURE_TENANT_ID)" \
-		hack/scripts/net-deploy-config.sh
-
-net-deploy-controller: net-deploy-namespace net-deploy-crds net-deploy-config net-render-manifests ## Apply controller manifests and roll the deployment
-	NAMESPACE="$(NET_NAMESPACE)" \
-	RENDERED_DIR="$(NET_MANIFEST_RENDERED_DIR)" \
-		hack/scripts/net-deploy-controller.sh
-
-net-deploy-node: net-deploy-namespace net-deploy-crds net-deploy-config net-render-manifests ## Apply node DaemonSet manifests and roll it
-	NAMESPACE="$(NET_NAMESPACE)" \
-	RENDERED_DIR="$(NET_MANIFEST_RENDERED_DIR)" \
-		hack/scripts/net-deploy-node.sh
-
-net-undeploy: net-render-manifests ## Tear down all net resources in dependency order
-	NAMESPACE="$(NET_NAMESPACE)" \
-	RENDERED_DIR="$(NET_MANIFEST_RENDERED_DIR)" \
-	CRD_DIR="$(NET_CRD_DIR)" \
-		hack/scripts/net-undeploy.sh
 
 ##@ Documentation
 
