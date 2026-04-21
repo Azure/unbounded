@@ -238,16 +238,16 @@ fmt: check-deps ## Format all Go source files (gofumpt + wsl_v5 whitespace)
 ifdef CI
 # In CI each job is independent; skip chained prerequisites.
 
-lint: machina-manifests ## Run golangci-lint
+lint: machina-manifests net-render-manifests ## Run golangci-lint
 	$(GOLINT) ./...
 
-test: machina-manifests ## Run all tests with race detector
+test: machina-manifests net-render-manifests ## Run all tests with race detector
 	$(GOTEST) -race ./...
 
 else
 # Locally, chain targets for convenience: test -> lint -> fmt -> check-deps.
 
-lint: fmt machina-manifests ## Run golangci-lint (implies fmt)
+lint: fmt machina-manifests net-render-manifests ## Run golangci-lint (implies fmt)
 	$(GOLINT) ./...
 
 test: lint ## Run all tests (implies lint)
@@ -255,13 +255,13 @@ test: lint ## Run all tests (implies lint)
 
 endif
 
-build: machina-manifests ## Build all Go packages
+build: machina-manifests net-render-manifests ## Build all Go packages
 	$(GOBUILD) ./...
 
 generate: install-protoc ## Run go generate for API types (deepcopy, CRDs) and protobuf
 	PATH="$(PROTOC_DIR)/bin:$$PATH" $(GOCMD) generate ./...
 
-vulncheck: machina-manifests ## Run govulncheck for known vulnerabilities
+vulncheck: machina-manifests net-render-manifests ## Run govulncheck for known vulnerabilities
 	$(GOCMD) tool govulncheck ./...
 
 gomod: ## Tidy go.mod and go.sum
@@ -269,7 +269,7 @@ gomod: ## Tidy go.mod and go.sum
 
 ##@ Build
 
-kubectl-unbounded-build: machina-manifests ## Build the kubectl-unbounded binary (no lint/test)
+kubectl-unbounded-build: machina-manifests net-render-manifests ## Build the kubectl-unbounded binary (no lint/test)
 	$(GOBUILD) -ldflags '$(KUBECTL_UNBOUNDED_LDFLAGS)' -o $(KUBECTL_UNBOUNDED_BIN) $(KUBECTL_UNBOUNDED_CMD)/main.go
 
 kubectl-unbounded: test kubectl-unbounded-build ## Build the kubectl-unbounded plugin (implies test)
