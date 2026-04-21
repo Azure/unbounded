@@ -682,8 +682,8 @@ def main() -> None:
     # cache, so concurrent compilation is safe and efficient.
     # stdout/stderr are inherited so build output streams to the CI log
     # in real-time.
-    log("Rendering machina manifests")
-    run(["make", "machina-manifests"], cwd=str(REPO_ROOT))
+    log("Rendering machina and net manifests")
+    run(["make", "machina-manifests", "net-render-manifests"], cwd=str(REPO_ROOT))
 
     log("Building metalman and kubectl-unbounded (parallel)")
     go_builds: list[tuple[str, subprocess.Popen[Any]]] = [

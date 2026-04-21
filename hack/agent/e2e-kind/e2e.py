@@ -522,6 +522,9 @@ def run_agent() -> None:
         env={**os.environ, "GOOS": "linux", "GOARCH": "amd64"})
     log(f"Agent binary built: {agent_bin}")
 
+    log("Rendering manifests for embedded fs...")
+    run(["make", "machina-manifests", "net-render-manifests"], cwd=str(REPO_ROOT))
+
     log("Building kubectl-unbounded...")
     kubectl_unbounded_bin = Path(KUBECTL_UNBOUNDED)
     run(["go", "build", "-o", str(kubectl_unbounded_bin),
