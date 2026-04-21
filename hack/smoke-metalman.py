@@ -682,6 +682,9 @@ def main() -> None:
     # cache, so concurrent compilation is safe and efficient.
     # stdout/stderr are inherited so build output streams to the CI log
     # in real-time.
+    log("Rendering machina manifests")
+    run(["make", "machina-manifests"], cwd=str(REPO_ROOT))
+
     log("Building metalman and kubectl-unbounded (parallel)")
     go_builds: list[tuple[str, subprocess.Popen[Any]]] = [
         ("metalman", subprocess.Popen(
@@ -704,9 +707,9 @@ def main() -> None:
     run_quiet([KUBECTL, "delete", "crd", f"machines.{API_GROUP}"])
 
     log("Applying deploy manifests (CRDs, namespace, RBAC)")
-    kubectl(["apply", "--server-side", "--force-conflicts", "-f", str(REPO_ROOT / "deploy" / "machina" / "01-namespace.yaml")])
+    kubectl(["apply", "--server-side", "--force-conflicts", "-f", str(REPO_ROOT / "deploy" / "machina" / "rendered" / "01-namespace.yaml")])
     kubectl(["apply", "--server-side", "--force-conflicts", "-f", str(REPO_ROOT / "deploy" / "machina" / "crd")])
-    kubectl(["apply", "--server-side", "--force-conflicts", "-f", str(REPO_ROOT / "deploy" / "machina" / "06-metalman-rbac.yaml")])
+    kubectl(["apply", "--server-side", "--force-conflicts", "-f", str(REPO_ROOT / "deploy" / "machina" / "rendered" / "06-metalman-rbac.yaml")])
 
     log("Creating Kubernetes resources")
     kubectl(["-n", NODE_NS, "create", "secret", "generic",
