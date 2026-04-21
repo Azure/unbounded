@@ -1,6 +1,6 @@
 module github.com/Azure/unbounded-kube
 
-go 1.26.2
+go 1.26.1
 
 tool (
 	golang.org/x/vuln/cmd/govulncheck
