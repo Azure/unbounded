@@ -37,9 +37,13 @@ RUN go mod download
 # Copy the rest of the source code
 COPY ../../ .
 
-# VERSION is passed from the release workflow to inject version metadata via ldflags.
+# VERSION/GIT_COMMIT/BUILD_TIME are passed in to inject version metadata via ldflags.
+# Empty defaults let the Makefile fall back to its own git/date detection when callers
+# don't supply explicit values; ${VAR:+...} forwards only when the caller set them.
 ARG VERSION=dev
-RUN make machina-build VERSION=${VERSION}
+ARG GIT_COMMIT=
+ARG BUILD_TIME=
+RUN make machina-build VERSION=${VERSION} ${GIT_COMMIT:+GIT_COMMIT=${GIT_COMMIT}} ${BUILD_TIME:+BUILD_TIME=${BUILD_TIME}}
 
 # Runtime stage
 FROM mcr.microsoft.com/azurelinux/base/core:3.0@sha256:35149ae8dd179684f969944f54a337c665a64e702486154eb44253fb39c2505b

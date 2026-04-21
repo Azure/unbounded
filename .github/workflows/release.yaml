@@ -211,7 +211,9 @@ jobs:
           file: ${{ matrix.component.file }}
           push: false
           load: true
-          build-args: VERSION=${{ needs.version.outputs.tag }}
+          build-args: |
+            VERSION=${{ needs.version.outputs.tag }}
+            GIT_COMMIT=${{ github.sha }}
           tags: scan/${{ matrix.component.name }}:${{ needs.version.outputs.tag }}
 
       - name: Scan with Trivy
@@ -232,7 +234,9 @@ jobs:
           file: ${{ matrix.component.file }}
           platforms: ${{ matrix.component.platforms }}
           push: ${{ inputs.dry_run != true }}
-          build-args: VERSION=${{ needs.version.outputs.tag }}
+          build-args: |
+            VERSION=${{ needs.version.outputs.tag }}
+            GIT_COMMIT=${{ github.sha }}
           tags: |
             ${{ env.CONTAINER_REGISTRY }}/${{ matrix.component.name }}:${{ needs.version.outputs.tag }}
             ${{ env.CONTAINER_REGISTRY }}/${{ matrix.component.name }}:latest
