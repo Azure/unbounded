@@ -15,23 +15,23 @@ const (
 	// CR watcher when operation counter drift is detected.
 	ActionUpdateMachine ActionType = "UpdateMachine"
 
-	// ActionSoftRestart stops and restarts the current nspawn machine in
-	// place (no rootfs change, no config change). Produced by the
-	// operation ConfigMap watcher.
-	ActionSoftRestart ActionType = "SoftRestart"
+	// ActionOperation processes an Operation CR (e.g. SoftReboot,
+	// HardReboot). Produced by the Operation CR watcher when a
+	// non-terminal Operation targeting this machine is observed.
+	ActionOperation ActionType = "Operation"
 )
 
 // Action is the unit of work processed by the daemon's single worker
-// goroutine. Both the Machine CR watcher and the operation ConfigMap
-// watcher produce Actions; sequential processing by one worker guarantees
-// that machine-mutating operations never overlap.
+// goroutine. Both the Machine CR watcher and the Operation CR watcher
+// produce Actions; sequential processing by one worker guarantees that
+// machine-mutating operations never overlap.
 type Action struct {
 	// Type identifies the action to perform.
 	Type ActionType
 
 	// Source identifies where this action originated. For Machine CR
-	// actions this is the machine name; for operation ConfigMap actions
-	// this is "namespace/configmap-name".
+	// actions this is the machine name; for Operation actions this is
+	// the Operation CR name.
 	Source string
 }
 

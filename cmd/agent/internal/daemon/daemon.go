@@ -35,7 +35,7 @@ const (
 
 // Run is the main daemon entry point. It discovers the active nspawn
 // machine, builds a Kubernetes client from the applied config, and
-// watches both the Machine CR and operation ConfigMaps for changes.
+// watches both the Machine CR and Operation CRs for changes.
 // A single worker goroutine processes all actions sequentially,
 // preventing overlapping machine-mutating operations.
 func Run(ctx context.Context, log *slog.Logger) error {
@@ -92,7 +92,7 @@ func run(ctx context.Context, log *slog.Logger, newClient kubeClientFunc) error 
 	// Single worker goroutine: processes actions one at a time.
 	go runWorker(ctx, log, r, queue)
 
-	// Operation ConfigMap watch loop (goroutine, retries internally).
+	// Operation CR watch loop (goroutine, retries internally).
 	go watchOperations(ctx, log, kubeClient, machineName, queue)
 
 	// Machine CR watch loop (blocking, retries in-place).

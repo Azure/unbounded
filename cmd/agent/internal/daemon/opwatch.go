@@ -9,24 +9,21 @@ import (
 	"log/slog"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	v1alpha3 "github.com/Azure/unbounded-kube/api/machina/v1alpha3"
 )
 
-// watchOperations watches ConfigMaps labeled unbounded.io/agent-op=<machineName>
-// in the unbounded-system namespace and enqueues ActionSoftRestart actions into
-// the shared queue. It retries on watch failure with the same interval as the
-// Machine CR watcher.
-//
-// This function and opshim.go are the ConfigMap-specific layer. When migrating
-// to a dedicated Operation CRD, replace these two files.
+// watchOperations watches Operation CRs targeting machineName and enqueues
+// ActionOperation actions into the shared queue. It retries on watch failure
+// with the same interval as the Machine CR watcher.
 func watchOperations(ctx context.Context, log *slog.Logger, wc client.WithWatch, machineName string, queue workqueue.TypedRateLimitingInterface[Action]) {
 	log = log.With("watcher", "operations")
 
 	for {
-		if err := watchConfigMaps(ctx, log, wc, machineName, queue); err != nil {
+		if err := watchOperationCRs(ctx, log, wc, machineName, queue); err != nil {
 			if ctx.Err() != nil {
 				return
 			}
@@ -42,32 +39,26 @@ func watchOperations(ctx context.Context, log *slog.Logger, wc client.WithWatch,
 	}
 }
 
-// watchConfigMaps establishes a single watch on ConfigMaps with the
-// operation label matching machineName. It enqueues an ActionSoftRestart
-// for each ConfigMap that has pending operations. Returns when the watch
-// closes or the context is cancelled.
-func watchConfigMaps(
+// watchOperationCRs establishes a single watch on Operation CRs. It filters
+// for Operations targeting machineName that are not yet in a terminal phase,
+// and enqueues an ActionOperation for each. Returns when the watch closes or
+// the context is cancelled.
+func watchOperationCRs(
 	ctx context.Context,
 	log *slog.Logger,
 	wc client.WithWatch,
 	machineName string,
 	queue workqueue.TypedRateLimitingInterface[Action],
 ) error {
-	cmList := &corev1.ConfigMapList{}
+	opList := &v1alpha3.OperationList{}
 
-	watcher, err := wc.Watch(ctx, cmList,
-		client.InNamespace(operationNamespace),
-		client.MatchingLabels{operationLabelKey: machineName},
-	)
+	watcher, err := wc.Watch(ctx, opList)
 	if err != nil {
-		return fmt.Errorf("start watch for operation ConfigMaps (machine=%s): %w", machineName, err)
+		return fmt.Errorf("start watch for Operation CRs (machine=%s): %w", machineName, err)
 	}
 	defer watcher.Stop()
 
-	log.Info("watching operation ConfigMaps",
-		"namespace", operationNamespace,
-		"label", operationLabelKey+"="+machineName,
-	)
+	log.Info("watching Operation CRs", "machineRef", machineName)
 
 	for {
 		select {
@@ -86,35 +77,30 @@ func watchConfigMaps(
 				continue
 			}
 
-			cm, ok := event.Object.(*corev1.ConfigMap)
+			op, ok := event.Object.(*v1alpha3.Operation)
 			if !ok {
 				log.Warn("unexpected object type in watch event")
 				continue
 			}
 
-			// Only enqueue if there are pending operations, to avoid
-			// unnecessary queue churn for already-completed ConfigMaps.
-			ops, err := parseOperations(cm)
-			if err != nil {
-				log.Warn("failed to parse operations from ConfigMap",
-					"configmap", cm.Namespace+"/"+cm.Name,
-					"error", err,
-				)
-
+			// Only process operations targeting this machine.
+			if op.Spec.MachineRef != machineName {
 				continue
 			}
 
-			if !hasPendingOperations(ops) {
+			// Skip operations that have already reached a terminal phase.
+			if op.Status.IsTerminal() {
 				continue
 			}
 
-			source := cm.Namespace + "/" + cm.Name
 			log.Debug("enqueuing operation",
-				"configmap", source,
+				"operation", op.Name,
+				"type", op.Spec.Type,
+				"phase", op.Status.Phase,
 				"event", event.Type,
 			)
 
-			queue.Add(Action{Type: ActionSoftRestart, Source: source})
+			queue.Add(Action{Type: ActionOperation, Source: op.Name})
 		}
 	}
 }

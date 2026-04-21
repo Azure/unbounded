@@ -7,93 +7,81 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"strings"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	v1alpha3 "github.com/Azure/unbounded-kube/api/machina/v1alpha3"
 	"github.com/Azure/unbounded-kube/cmd/agent/internal/goalstates"
 	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases/nodestart"
 	"github.com/Azure/unbounded-kube/cmd/agent/internal/utilexec"
 )
 
-// reconcileSoftRestart processes a single operation ConfigMap. It reads the
-// ConfigMap, finds the first pending or in_progress operation, executes it,
-// and updates the operation state. If more pending operations remain after
-// a successful execution, the action is re-enqueued for immediate processing
-// via the provided queue.
-//
-// Operations left in_progress by a crashed process are treated as retriable
-// to ensure restart safety.
-func (r *reconciler) reconcileSoftRestart(ctx context.Context, log *slog.Logger, source string) error {
-	// Parse namespace/name from the source key.
-	ns, name, err := parseConfigMapKey(source)
-	if err != nil {
-		return err
+// reconcileOperation processes a single Operation CR. It reads the Operation,
+// checks if it is in a retriable phase (Pending or InProgress), executes it,
+// and updates the status. Operations left InProgress by a crashed process are
+// treated as retriable to ensure restart safety.
+func (r *reconciler) reconcileOperation(ctx context.Context, log *slog.Logger, opName string) error {
+	var op v1alpha3.Operation
+	if err := r.client.Get(ctx, client.ObjectKey{Name: opName}, &op); err != nil {
+		return fmt.Errorf("get Operation %q: %w", opName, err)
 	}
 
-	// Read the ConfigMap.
-	var cm corev1.ConfigMap
-	if err := r.client.Get(ctx, client.ObjectKey{Namespace: ns, Name: name}, &cm); err != nil {
-		return fmt.Errorf("get ConfigMap %s: %w", source, err)
-	}
-
-	ops, err := parseOperations(&cm)
-	if err != nil {
-		return err
-	}
-
-	// Find the first retriable operation (pending or in_progress).
-	idx := -1
-	for i := range ops {
-		if ops[i].State == OpStatePending || ops[i].State == OpStateInProgress {
-			idx = i
-			break
-		}
-	}
-
-	if idx < 0 {
-		log.Debug("no pending operations in ConfigMap", "configmap", source)
+	// Skip terminal operations.
+	if op.Status.IsTerminal() {
+		log.Debug("operation already terminal", "operation", opName, "phase", op.Status.Phase)
 		return nil
 	}
 
-	op := &ops[idx]
-	log = log.With("op_type", op.Type, "op_index", idx)
+	log = log.With("op_type", op.Spec.Type, "op_phase", op.Status.Phase)
 
-	// Mark in_progress and persist before executing.
-	op.State = OpStateInProgress
-	op.Message = ""
+	// Mark InProgress and persist before executing.
+	now := metav1.Now()
+	op.Status.Phase = v1alpha3.OperationPhaseInProgress
+	op.Status.Message = ""
 
-	if err := r.updateConfigMapOps(ctx, &cm, ops); err != nil {
-		return fmt.Errorf("update operation to in_progress: %w", err)
+	if op.Status.StartedAt == nil {
+		op.Status.StartedAt = &now
+	}
+
+	if err := r.client.Status().Update(ctx, &op); err != nil {
+		return fmt.Errorf("update Operation to InProgress: %w", err)
 	}
 
 	// Execute the operation.
 	log.Info("executing operation")
 
-	execErr := r.executeOperation(ctx, log, op)
+	execErr := r.executeOperation(ctx, log, &op)
 
-	// Update state based on result.
+	// Update status based on result.
+	completedAt := metav1.Now()
+
 	if execErr != nil {
-		op.State = OpStateFailed
-		op.Message = execErr.Error()
+		op.Status.Phase = v1alpha3.OperationPhaseFailed
+		op.Status.Message = execErr.Error()
+		op.Status.CompletedAt = &completedAt
 		log.Error("operation failed", "error", execErr)
 	} else {
-		op.State = OpStateCompleted
-		op.Message = ""
+		op.Status.Phase = v1alpha3.OperationPhaseCompleted
+		op.Status.Message = ""
+		op.Status.CompletedAt = &completedAt
 		log.Info("operation completed")
 	}
 
-	if err := r.updateConfigMapOps(ctx, &cm, ops); err != nil {
-		log.Warn("failed to update operation state in ConfigMap", "error", err)
-		// Return the original execution error if there was one, otherwise
-		// return the update error so the action gets requeued.
+	if err := r.client.Status().Update(ctx, &op); err != nil {
+		log.Warn("failed to update Operation status", "error", err)
+
 		if execErr != nil {
 			return execErr
 		}
 
-		return fmt.Errorf("update operation state: %w", err)
+		return fmt.Errorf("update Operation status: %w", err)
+	}
+
+	// Handle TTL cleanup for terminal operations.
+	if op.Spec.TTLSecondsAfterFinished != nil {
+		go r.scheduleTTLCleanup(ctx, log, op.Name, *op.Spec.TTLSecondsAfterFinished)
 	}
 
 	if execErr != nil {
@@ -105,9 +93,9 @@ func (r *reconciler) reconcileSoftRestart(ctx context.Context, log *slog.Logger,
 
 // executeOperation dispatches to the appropriate executor method based on
 // the operation type.
-func (r *reconciler) executeOperation(ctx context.Context, log *slog.Logger, op *Operation) error {
-	switch op.Type {
-	case OpTypeReboot:
+func (r *reconciler) executeOperation(ctx context.Context, log *slog.Logger, op *v1alpha3.Operation) error {
+	switch op.Spec.Type {
+	case v1alpha3.OperationTypeSoftReboot:
 		// Discover the active nspawn machine at execution time. The name
 		// can change after an upgrade (kube1 <-> kube2), so we cannot
 		// cache it at daemon startup.
@@ -117,29 +105,41 @@ func (r *reconciler) executeOperation(ctx context.Context, log *slog.Logger, op 
 		}
 
 		return r.exec.softRestart(ctx, log, active.Name)
+	case v1alpha3.OperationTypeHardReboot:
+		return fmt.Errorf("HardReboot operations are handled by the machina controller, not the agent")
 	default:
-		return fmt.Errorf("unknown operation type: %q", op.Type)
+		return fmt.Errorf("unknown operation type: %q", op.Spec.Type)
 	}
 }
 
-// updateConfigMapOps serializes the operations list back into the ConfigMap
-// and persists the update.
-func (r *reconciler) updateConfigMapOps(ctx context.Context, cm *corev1.ConfigMap, ops []Operation) error {
-	if err := serializeOperations(cm, ops); err != nil {
-		return err
+// scheduleTTLCleanup waits for the TTL to expire and then deletes the
+// Operation CR. This runs in a goroutine and is best-effort.
+func (r *reconciler) scheduleTTLCleanup(ctx context.Context, log *slog.Logger, opName string, ttlSeconds int32) {
+	delay := time.Duration(ttlSeconds) * time.Second
+
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(delay):
 	}
 
-	return r.client.Update(ctx, cm)
-}
-
-// parseConfigMapKey splits a "namespace/name" key into its components.
-func parseConfigMapKey(key string) (string, string, error) {
-	parts := strings.SplitN(key, "/", 2)
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return "", "", fmt.Errorf("invalid ConfigMap key %q: expected namespace/name", key)
+	var op v1alpha3.Operation
+	if err := r.client.Get(ctx, client.ObjectKey{Name: opName}, &op); err != nil {
+		log.Debug("TTL cleanup: operation already gone", "operation", opName)
+		return
 	}
 
-	return parts[0], parts[1], nil
+	// Only delete if still terminal.
+	if !op.Status.IsTerminal() {
+		return
+	}
+
+	if err := r.client.Delete(ctx, &op); err != nil {
+		log.Warn("TTL cleanup: failed to delete operation", "operation", opName, "error", err)
+		return
+	}
+
+	log.Info("TTL cleanup: deleted operation", "operation", opName)
 }
 
 // defaultExecutor is the production implementation of the executor interface.

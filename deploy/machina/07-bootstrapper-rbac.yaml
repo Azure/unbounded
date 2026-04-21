@@ -2,8 +2,8 @@
 # Grant bootstrap token users (system:bootstrappers group) the permissions
 # required by the unbounded-agent daemon. The daemon self-registers a
 # Machine CR at startup (if one does not already exist), watches the
-# Machine CR that corresponds to its node, and updates the Machine status
-# after reconciliation.
+# Machine CR that corresponds to its node, watches Operation CRs
+# targeting its machine, and updates status after reconciliation.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -15,14 +15,12 @@ rules:
   - apiGroups: ["unbounded-kube.io"]
     resources: ["machines/status"]
     verbs: ["get", "update", "patch"]
-  # POC: Temporary ConfigMap permissions for the agent operation controller.
-  # The agent watches ConfigMaps labeled unbounded.io/agent-op=<machine-name>
-  # in the unbounded-system namespace to receive operation requests (reboot,
-  # etc.). This will be replaced by a dedicated Operation CRD with proper
-  # RBAC when the operation CR is introduced.
-  - apiGroups: [""]
-    resources: ["configmaps"]
-    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["unbounded-kube.io"]
+    resources: ["operations"]
+    verbs: ["get", "list", "watch", "delete"]
+  - apiGroups: ["unbounded-kube.io"]
+    resources: ["operations/status"]
+    verbs: ["get", "update", "patch"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1

@@ -1115,23 +1115,29 @@ def reset_agent() -> None:
 # install-machine-crd
 # ---------------------------------------------------------------------------
 def install_machine_crd() -> None:
-    """Install the Machine CRD and bootstrapper RBAC."""
+    """Install the Machine CRD, Operation CRD, and bootstrapper RBAC."""
 
-    crd_path = REPO_ROOT / "deploy" / "machina" / "crd" / "unbounded-kube.io_machines.yaml"
+    machine_crd_path = REPO_ROOT / "deploy" / "machina" / "crd" / "unbounded-kube.io_machines.yaml"
+    operation_crd_path = REPO_ROOT / "deploy" / "machina" / "crd" / "unbounded-kube.io_operations.yaml"
     rbac_path = REPO_ROOT / "deploy" / "machina" / "07-bootstrapper-rbac.yaml"
 
-    if not crd_path.exists():
-        die(f"Machine CRD not found: {crd_path}")
+    if not machine_crd_path.exists():
+        die(f"Machine CRD not found: {machine_crd_path}")
+    if not operation_crd_path.exists():
+        die(f"Operation CRD not found: {operation_crd_path}")
     if not rbac_path.exists():
         die(f"Bootstrapper RBAC not found: {rbac_path}")
 
     log("Installing Machine CRD...")
-    kubectl(["apply", "-f", str(crd_path)])
+    kubectl(["apply", "-f", str(machine_crd_path)])
+
+    log("Installing Operation CRD...")
+    kubectl(["apply", "-f", str(operation_crd_path)])
 
     log("Installing bootstrapper RBAC...")
     kubectl(["apply", "-f", str(rbac_path)])
 
-    log("Machine CRD and RBAC installed")
+    log("Machine CRD, Operation CRD, and RBAC installed")
 
 
 # ---------------------------------------------------------------------------

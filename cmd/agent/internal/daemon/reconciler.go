@@ -35,8 +35,8 @@ func (r *reconciler) reconcile(ctx context.Context, log *slog.Logger, action Act
 	switch action.Type {
 	case ActionUpdateMachine:
 		return r.reconcileUpdateMachine(ctx, log, action.Source)
-	case ActionSoftRestart:
-		return r.reconcileSoftRestart(ctx, log, action.Source)
+	case ActionOperation:
+		return r.reconcileOperation(ctx, log, action.Source)
 	default:
 		log.Warn("unknown action type, ignoring")
 		return nil
