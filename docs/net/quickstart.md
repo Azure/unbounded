@@ -48,7 +48,7 @@ resources step by step, follow the order below.
 #### 1. Install CRDs
 
 ```bash
-kubectl apply -f deploy/net/crds/
+kubectl apply -f deploy/net/crd/
 ```
 
 This installs the following CustomResourceDefinitions in the

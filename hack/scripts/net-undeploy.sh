@@ -5,13 +5,13 @@
 # Required env:
 #   NAMESPACE       Kubernetes namespace.
 #   RENDERED_DIR    Path to deploy/net/rendered.
-#   CRDS_DIR        Path to deploy/net/crds (raw CRD manifests).
+#   CRD_DIR         Path to deploy/net/crd (raw CRD manifests).
 
 set -euo pipefail
 
 : "${NAMESPACE:?NAMESPACE is required}"
 : "${RENDERED_DIR:?RENDERED_DIR is required}"
-: "${CRDS_DIR:?CRDS_DIR is required}"
+: "${CRD_DIR:?CRD_DIR is required}"
 
 CTRL_DIR="$RENDERED_DIR/controller"
 NODE_DIR="$RENDERED_DIR/node"
@@ -31,7 +31,7 @@ kubectl delete -f "$CTRL_DIR/03-deployment.yaml"         --ignore-not-found
 kubectl delete -f "$CTRL_DIR/02-rbac.yaml"               --ignore-not-found
 kubectl delete -f "$CTRL_DIR/01-serviceaccount.yaml"     --ignore-not-found
 
-kubectl delete -f "$CRDS_DIR/" --ignore-not-found
+kubectl delete -f "$CRD_DIR/" --ignore-not-found
 
 # Legacy APIService names retained for backwards compatibility cleanup.
 kubectl delete apiservice status.net.unbounded-kube.io          --ignore-not-found

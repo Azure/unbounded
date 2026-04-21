@@ -74,7 +74,7 @@ NET_LOG_LEVEL           ?=
 # Paths.
 NET_MANIFEST_TEMPLATES_DIR := deploy/net
 NET_MANIFEST_RENDERED_DIR  := deploy/net/rendered
-NET_CRDS_DIR               := deploy/net/crds
+NET_CRD_DIR                := deploy/net/crd
 NET_FRONTEND_DIR           := frontend
 NET_FRONTEND_DIST_DIR      := internal/net/html/dist
 NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
@@ -434,7 +434,7 @@ net-build-ebpf: ## Compile bpf/unbounded_encap.c to internal/net/ebpf/unbounded_
 
 net-render-manifests: ## Render net manifests into $(NET_MANIFEST_RENDERED_DIR)
 	@rm -rf $(NET_MANIFEST_RENDERED_DIR)
-	@mkdir -p $(NET_MANIFEST_RENDERED_DIR)/crds
+	@mkdir -p $(NET_MANIFEST_RENDERED_DIR)/crd
 	$(GOCMD) run ./hack/cmd/render-manifests \
 		--templates-dir "$(NET_MANIFEST_TEMPLATES_DIR)" \
 		--output-dir "$(NET_MANIFEST_RENDERED_DIR)" \
@@ -444,7 +444,7 @@ net-render-manifests: ## Render net manifests into $(NET_MANIFEST_RENDERED_DIR)
 		--set ForceNotLeader=$(NET_FORCE_NOT_LEADER) \
 		--set AzureTenantID=$(NET_AZURE_TENANT_ID) \
 		--set ApiserverURL=$(NET_APISERVER_URL)
-	@cp $(NET_CRDS_DIR)/*.yaml $(NET_MANIFEST_RENDERED_DIR)/crds/
+	@cp $(NET_CRD_DIR)/*.yaml $(NET_MANIFEST_RENDERED_DIR)/crd/
 	@echo "Rendered net manifests into $(NET_MANIFEST_RENDERED_DIR) (controller: $(NET_CONTROLLER_IMAGE), node: $(NET_NODE_IMAGE))"
 
 net-render: net-render-manifests ## Render net manifests and create a versioned tarball under build/
@@ -457,7 +457,7 @@ net-render: net-render-manifests ## Render net manifests and create a versioned 
 net-deploy: net-deploy-crds net-deploy-namespace net-deploy-config net-deploy-controller net-deploy-node ## Apply all net components and roll workloads
 
 net-deploy-crds: ## Apply the net CRDs
-	kubectl apply -f "$(NET_CRDS_DIR)/"
+	kubectl apply -f "$(NET_CRD_DIR)/"
 
 net-deploy-namespace: net-render-manifests ## Apply the net namespace (skipped when NET_NAMESPACE=kube-system)
 	@if [ "$(NET_NAMESPACE)" != "kube-system" ]; then \
@@ -484,7 +484,7 @@ net-deploy-node: net-deploy-namespace net-deploy-crds net-deploy-config net-rend
 net-undeploy: net-render-manifests ## Tear down all net resources in dependency order
 	NAMESPACE="$(NET_NAMESPACE)" \
 	RENDERED_DIR="$(NET_MANIFEST_RENDERED_DIR)" \
-	CRDS_DIR="$(NET_CRDS_DIR)" \
+	CRD_DIR="$(NET_CRD_DIR)" \
 		hack/scripts/net-undeploy.sh
 
 ##@ Documentation

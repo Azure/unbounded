@@ -256,8 +256,8 @@ jobs:
             --set Namespace=unbounded-net \
             --set ControllerImage="${{ env.REGISTRY }}/unbounded-net-controller:${TAG}" \
             --set NodeImage="${{ env.REGISTRY }}/unbounded-net-node:${TAG}"
-          mkdir -p build/manifests/crds
-          cp deploy/net/crds/*.yaml build/manifests/crds/
+          mkdir -p build/manifests/crd
+          cp deploy/net/crd/*.yaml build/manifests/crd/
           tar czf "build/unbounded-net-manifests-${TAG}.tar.gz" -C build/manifests .
 
       - name: Install cosign
