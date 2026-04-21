@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"time"
 
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -16,19 +17,19 @@ import (
 	v1alpha3 "github.com/Azure/unbounded-kube/api/machina/v1alpha3"
 )
 
-// watchOperations watches Operation CRs targeting machineName and enqueues
-// ActionOperation actions into the shared queue. It retries on watch failure
-// with the same interval as the Machine CR watcher.
+// watchOperations watches MachineOperation CRs targeting machineName using a
+// label selector and enqueues ActionOperation actions into the shared queue.
+// It retries on watch failure with the same interval as the Machine CR watcher.
 func watchOperations(ctx context.Context, log *slog.Logger, wc client.WithWatch, machineName string, queue workqueue.TypedRateLimitingInterface[Action]) {
-	log = log.With("watcher", "operations")
+	log = log.With("watcher", "machineoperations")
 
 	for {
-		if err := watchOperationCRs(ctx, log, wc, machineName, queue); err != nil {
+		if err := watchMachineOperationCRs(ctx, log, wc, machineName, queue); err != nil {
 			if ctx.Err() != nil {
 				return
 			}
 
-			log.Error("operation watch failed, retrying", "error", err, "retry_in", watchRetryInterval)
+			log.Error("machine operation watch failed, retrying", "error", err, "retry_in", watchRetryInterval)
 
 			select {
 			case <-ctx.Done():
@@ -39,26 +40,34 @@ func watchOperations(ctx context.Context, log *slog.Logger, wc client.WithWatch,
 	}
 }
 
-// watchOperationCRs establishes a single watch on Operation CRs. It filters
-// for Operations targeting machineName that are not yet in a terminal phase,
-// and enqueues an ActionOperation for each. Returns when the watch closes or
-// the context is cancelled.
-func watchOperationCRs(
+// watchMachineOperationCRs establishes a single watch on MachineOperation CRs
+// scoped by a label selector on the machine name. It filters for operations
+// that are not yet in a terminal phase and enqueues an ActionOperation for
+// each. Returns when the watch closes or the context is cancelled.
+func watchMachineOperationCRs(
 	ctx context.Context,
 	log *slog.Logger,
 	wc client.WithWatch,
 	machineName string,
 	queue workqueue.TypedRateLimitingInterface[Action],
 ) error {
-	opList := &v1alpha3.OperationList{}
+	opList := &v1alpha3.MachineOperationList{}
 
-	watcher, err := wc.Watch(ctx, opList)
+	// Use a label selector to scope the informer to only operations
+	// targeting this machine, as recommended by the design proposal.
+	labelSelector := labels.SelectorFromSet(labels.Set{
+		v1alpha3.MachineOperationMachineLabelKey: machineName,
+	})
+
+	watcher, err := wc.Watch(ctx, opList, &client.ListOptions{
+		LabelSelector: labelSelector,
+	})
 	if err != nil {
-		return fmt.Errorf("start watch for Operation CRs (machine=%s): %w", machineName, err)
+		return fmt.Errorf("start watch for MachineOperation CRs (machine=%s): %w", machineName, err)
 	}
 	defer watcher.Stop()
 
-	log.Info("watching Operation CRs", "machineRef", machineName)
+	log.Info("watching MachineOperation CRs", "machineRef", machineName, "labelSelector", labelSelector.String())
 
 	for {
 		select {
@@ -77,14 +86,9 @@ func watchOperationCRs(
 				continue
 			}
 
-			op, ok := event.Object.(*v1alpha3.Operation)
+			op, ok := event.Object.(*v1alpha3.MachineOperation)
 			if !ok {
 				log.Warn("unexpected object type in watch event")
-				continue
-			}
-
-			// Only process operations targeting this machine.
-			if op.Spec.MachineRef != machineName {
 				continue
 			}
 
@@ -93,9 +97,9 @@ func watchOperationCRs(
 				continue
 			}
 
-			log.Debug("enqueuing operation",
+			log.Debug("enqueuing machine operation",
 				"operation", op.Name,
-				"type", op.Spec.Type,
+				"operationName", op.Spec.OperationName,
 				"phase", op.Status.Phase,
 				"event", event.Type,
 			)

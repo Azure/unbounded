@@ -18,7 +18,7 @@ import (
 	v1alpha3 "github.com/Azure/unbounded-kube/api/machina/v1alpha3"
 )
 
-// defaultTTLSeconds is the default TTL for completed/failed Operation CRs.
+// defaultTTLSeconds is the default TTL for completed/failed MachineOperation CRs.
 const defaultTTLSeconds = 300 // 5 minutes
 
 func machineSoftRebootCommand() *cobra.Command {
@@ -32,9 +32,9 @@ reprovisioning the rootfs. The kubelet and containerd services are
 stopped, the nspawn container is restarted, and services are brought
 back up.
 
-This command creates an Operation CR that the agent daemon watches.
-The agent processes the operation and updates the Operation status
-to "Completed" or "Failed".`,
+This command creates a MachineOperation CR that the agent daemon watches.
+The agent processes the operation and updates the MachineOperation status
+to "Complete" or "Failed".`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := ctrl.SetupSignalHandler()
@@ -49,7 +49,7 @@ to "Completed" or "Failed".`,
 	}
 
 	cmd.Flags().Int32Var(&ttl, "ttl", defaultTTLSeconds,
-		"Seconds after completion before the Operation CR is automatically deleted (0 to disable)")
+		"Seconds after completion before the MachineOperation CR is automatically deleted (0 to disable)")
 
 	return cmd
 }
@@ -61,12 +61,15 @@ func runSoftReboot(ctx context.Context, c client.WithWatch, name string, ttlSeco
 		return err
 	}
 
-	// Build the Operation CR.
-	opName := fmt.Sprintf("%s-softreboot-%d", name, time.Now().Unix())
+	// Build the MachineOperation CR.
+	opName := fmt.Sprintf("%s-reboot-%d", name, time.Now().Unix())
 
-	op := &v1alpha3.Operation{
+	op := &v1alpha3.MachineOperation{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: opName,
+			Labels: map[string]string{
+				v1alpha3.MachineOperationMachineLabelKey: name,
+			},
 			OwnerReferences: []metav1.OwnerReference{
 				{
 					APIVersion: v1alpha3.GroupVersion.String(),
@@ -76,9 +79,9 @@ func runSoftReboot(ctx context.Context, c client.WithWatch, name string, ttlSeco
 				},
 			},
 		},
-		Spec: v1alpha3.OperationSpec{
-			MachineRef: name,
-			Type:       v1alpha3.OperationTypeSoftReboot,
+		Spec: v1alpha3.MachineOperationSpec{
+			MachineRef:    name,
+			OperationName: v1alpha3.OperationReboot,
 		},
 	}
 
@@ -87,24 +90,24 @@ func runSoftReboot(ctx context.Context, c client.WithWatch, name string, ttlSeco
 	}
 
 	if err := c.Create(ctx, op); err != nil {
-		return fmt.Errorf("creating Operation: %w", err)
+		return fmt.Errorf("creating MachineOperation: %w", err)
 	}
 
 	printStep(fmt.Sprintf("Soft-rebooting Machine %s...", name))
 	printConfig("operation", opName)
 	fmt.Println()
 
-	return watchOperation(ctx, c, opName)
+	return watchMachineOperation(ctx, c, opName)
 }
 
-// watchOperation watches an Operation CR until it reaches a terminal phase
-// (Completed or Failed).
-func watchOperation(ctx context.Context, c client.WithWatch, opName string) error {
-	watcher, err := c.Watch(ctx, &v1alpha3.OperationList{},
+// watchMachineOperation watches a MachineOperation CR until it reaches a
+// terminal phase (Complete or Failed).
+func watchMachineOperation(ctx context.Context, c client.WithWatch, opName string) error {
+	watcher, err := c.Watch(ctx, &v1alpha3.MachineOperationList{},
 		client.MatchingFields{"metadata.name": opName},
 	)
 	if err != nil {
-		return fmt.Errorf("watching Operation: %w", err)
+		return fmt.Errorf("watching MachineOperation: %w", err)
 	}
 	defer watcher.Stop()
 
@@ -119,7 +122,7 @@ func watchOperation(ctx context.Context, c client.WithWatch, opName string) erro
 			return fmt.Errorf("operation %s was deleted", opName)
 		}
 
-		op, ok := ev.Object.(*v1alpha3.Operation)
+		op, ok := ev.Object.(*v1alpha3.MachineOperation)
 		if !ok {
 			continue
 		}
@@ -128,11 +131,11 @@ func watchOperation(ctx context.Context, c client.WithWatch, opName string) erro
 		if phase != lastPhase {
 			switch phase {
 			case v1alpha3.OperationPhaseInProgress:
-				printStep(fmt.Sprintf("Operation %s: %s in progress...", op.Spec.Type, opName))
-			case v1alpha3.OperationPhaseCompleted:
-				printStep(fmt.Sprintf("Operation %s: %s completed", op.Spec.Type, opName))
+				printStep(fmt.Sprintf("Operation %s: %s in progress...", op.Spec.OperationName, opName))
+			case v1alpha3.OperationPhaseComplete:
+				printStep(fmt.Sprintf("Operation %s: %s completed", op.Spec.OperationName, opName))
 			case v1alpha3.OperationPhaseFailed:
-				printStep(fmt.Sprintf("Operation %s: %s failed: %s", op.Spec.Type, opName, op.Status.Message))
+				printStep(fmt.Sprintf("Operation %s: %s failed: %s", op.Spec.OperationName, opName, op.Status.Message))
 			}
 
 			lastPhase = phase

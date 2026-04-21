@@ -52,29 +52,32 @@ func operationClient(objs ...client.Object) client.WithWatch {
 	return fake.NewClientBuilder().
 		WithScheme(operationScheme()).
 		WithObjects(objs...).
-		WithStatusSubresource(&v1alpha3.Operation{}).
+		WithStatusSubresource(&v1alpha3.MachineOperation{}).
 		Build().(client.WithWatch)
 }
 
-func testOperation(name string, opType v1alpha3.OperationType, phase v1alpha3.OperationPhase) *v1alpha3.Operation {
-	return &v1alpha3.Operation{
+func testMachineOperation(name string, opName v1alpha3.OperationName, phase v1alpha3.OperationPhase) *v1alpha3.MachineOperation {
+	return &v1alpha3.MachineOperation{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: name,
+			Labels: map[string]string{
+				v1alpha3.MachineOperationMachineLabelKey: "test-machine",
+			},
 		},
-		Spec: v1alpha3.OperationSpec{
-			MachineRef: "test-machine",
-			Type:       opType,
+		Spec: v1alpha3.MachineOperationSpec{
+			MachineRef:    "test-machine",
+			OperationName: opName,
 		},
-		Status: v1alpha3.OperationStatus{
+		Status: v1alpha3.MachineOperationStatus{
 			Phase: phase,
 		},
 	}
 }
 
-func getOperation(t *testing.T, c client.Client, name string) *v1alpha3.Operation {
+func getMachineOperation(t *testing.T, c client.Client, name string) *v1alpha3.MachineOperation {
 	t.Helper()
 
-	var op v1alpha3.Operation
+	var op v1alpha3.MachineOperation
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: name}, &op))
 
 	return &op
@@ -89,8 +92,8 @@ func newTestReconciler(c client.WithWatch, exec *mockExecutor) *reconciler {
 	}
 }
 
-func Test_reconcileOperation_PendingSoftReboot(t *testing.T) {
-	op := testOperation("op-1", v1alpha3.OperationTypeSoftReboot, v1alpha3.OperationPhasePending)
+func Test_reconcileOperation_PendingReboot(t *testing.T) {
+	op := testMachineOperation("op-1", v1alpha3.OperationReboot, v1alpha3.OperationPhasePending)
 	c := operationClient(op)
 	exec := &mockExecutor{}
 	r := newTestReconciler(c, exec)
@@ -102,8 +105,8 @@ func Test_reconcileOperation_PendingSoftReboot(t *testing.T) {
 	assert.Equal(t, []string{"kube1"}, exec.softRestartCalls)
 
 	// Operation should be completed with timestamps.
-	result := getOperation(t, c, "op-1")
-	assert.Equal(t, v1alpha3.OperationPhaseCompleted, result.Status.Phase)
+	result := getMachineOperation(t, c, "op-1")
+	assert.Equal(t, v1alpha3.OperationPhaseComplete, result.Status.Phase)
 	assert.NotNil(t, result.Status.StartedAt)
 	assert.NotNil(t, result.Status.CompletedAt)
 	assert.Empty(t, result.Status.Message)
@@ -111,7 +114,7 @@ func Test_reconcileOperation_PendingSoftReboot(t *testing.T) {
 
 func Test_reconcileOperation_InProgressRecovery(t *testing.T) {
 	// Simulates crash recovery: operation left InProgress by a previous run.
-	op := testOperation("op-2", v1alpha3.OperationTypeSoftReboot, v1alpha3.OperationPhaseInProgress)
+	op := testMachineOperation("op-2", v1alpha3.OperationReboot, v1alpha3.OperationPhaseInProgress)
 	c := operationClient(op)
 	exec := &mockExecutor{}
 	r := newTestReconciler(c, exec)
@@ -121,12 +124,12 @@ func Test_reconcileOperation_InProgressRecovery(t *testing.T) {
 
 	assert.Len(t, exec.softRestartCalls, 1)
 
-	result := getOperation(t, c, "op-2")
-	assert.Equal(t, v1alpha3.OperationPhaseCompleted, result.Status.Phase)
+	result := getMachineOperation(t, c, "op-2")
+	assert.Equal(t, v1alpha3.OperationPhaseComplete, result.Status.Phase)
 }
 
 func Test_reconcileOperation_SkipsTerminal(t *testing.T) {
-	op := testOperation("op-3", v1alpha3.OperationTypeSoftReboot, v1alpha3.OperationPhaseCompleted)
+	op := testMachineOperation("op-3", v1alpha3.OperationReboot, v1alpha3.OperationPhaseComplete)
 	c := operationClient(op)
 	exec := &mockExecutor{}
 	r := newTestReconciler(c, exec)
@@ -139,7 +142,7 @@ func Test_reconcileOperation_SkipsTerminal(t *testing.T) {
 }
 
 func Test_reconcileOperation_ExecutorError(t *testing.T) {
-	op := testOperation("op-4", v1alpha3.OperationTypeSoftReboot, v1alpha3.OperationPhasePending)
+	op := testMachineOperation("op-4", v1alpha3.OperationReboot, v1alpha3.OperationPhasePending)
 	c := operationClient(op)
 	exec := &mockExecutor{softRestartErr: fmt.Errorf("nspawn exploded")}
 	r := newTestReconciler(c, exec)
@@ -149,22 +152,25 @@ func Test_reconcileOperation_ExecutorError(t *testing.T) {
 	assert.Contains(t, err.Error(), "nspawn exploded")
 
 	// Operation should be marked failed with the error message.
-	result := getOperation(t, c, "op-4")
+	result := getMachineOperation(t, c, "op-4")
 	assert.Equal(t, v1alpha3.OperationPhaseFailed, result.Status.Phase)
 	assert.Contains(t, result.Status.Message, "nspawn exploded")
 	assert.NotNil(t, result.Status.CompletedAt)
 }
 
-func Test_reconcileOperation_UnknownType(t *testing.T) {
-	op := &v1alpha3.Operation{
+func Test_reconcileOperation_UnknownOperationName(t *testing.T) {
+	op := &v1alpha3.MachineOperation{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "op-5",
+			Labels: map[string]string{
+				v1alpha3.MachineOperationMachineLabelKey: "test-machine",
+			},
 		},
-		Spec: v1alpha3.OperationSpec{
-			MachineRef: "test-machine",
-			Type:       "Explode",
+		Spec: v1alpha3.MachineOperationSpec{
+			MachineRef:    "test-machine",
+			OperationName: "Explode",
 		},
-		Status: v1alpha3.OperationStatus{
+		Status: v1alpha3.MachineOperationStatus{
 			Phase: v1alpha3.OperationPhasePending,
 		},
 	}
@@ -178,13 +184,13 @@ func Test_reconcileOperation_UnknownType(t *testing.T) {
 	// Executor should not have been called.
 	assert.Empty(t, exec.softRestartCalls)
 
-	result := getOperation(t, c, "op-5")
+	result := getMachineOperation(t, c, "op-5")
 	assert.Equal(t, v1alpha3.OperationPhaseFailed, result.Status.Phase)
-	assert.Contains(t, result.Status.Message, "unknown operation type")
+	assert.Contains(t, result.Status.Message, "unknown operation name")
 }
 
-func Test_reconcileOperation_HardRebootNotSupported(t *testing.T) {
-	op := testOperation("op-6", v1alpha3.OperationTypeHardReboot, v1alpha3.OperationPhasePending)
+func Test_reconcileOperation_PowerCycleNotSupported(t *testing.T) {
+	op := testMachineOperation("op-6", v1alpha3.OperationPowerCycle, v1alpha3.OperationPhasePending)
 	c := operationClient(op)
 	exec := &mockExecutor{}
 	r := newTestReconciler(c, exec)
@@ -194,13 +200,13 @@ func Test_reconcileOperation_HardRebootNotSupported(t *testing.T) {
 
 	assert.Empty(t, exec.softRestartCalls)
 
-	result := getOperation(t, c, "op-6")
+	result := getMachineOperation(t, c, "op-6")
 	assert.Equal(t, v1alpha3.OperationPhaseFailed, result.Status.Phase)
 	assert.Contains(t, result.Status.Message, "machina controller")
 }
 
 func Test_reconcileOperation_SkipsFailed(t *testing.T) {
-	op := testOperation("op-7", v1alpha3.OperationTypeSoftReboot, v1alpha3.OperationPhaseFailed)
+	op := testMachineOperation("op-7", v1alpha3.OperationReboot, v1alpha3.OperationPhaseFailed)
 	op.Status.Message = "previous failure"
 	c := operationClient(op)
 	exec := &mockExecutor{}

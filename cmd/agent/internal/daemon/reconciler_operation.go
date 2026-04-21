@@ -18,14 +18,15 @@ import (
 	"github.com/Azure/unbounded-kube/cmd/agent/internal/utilexec"
 )
 
-// reconcileOperation processes a single Operation CR. It reads the Operation,
-// checks if it is in a retriable phase (Pending or InProgress), executes it,
-// and updates the status. Operations left InProgress by a crashed process are
-// treated as retriable to ensure restart safety.
+// reconcileOperation processes a single MachineOperation CR. It reads the
+// MachineOperation, checks if it is in a retriable phase (Pending or
+// InProgress), executes it, and updates the status. Operations left
+// InProgress by a crashed process are treated as retriable to ensure
+// restart safety.
 func (r *reconciler) reconcileOperation(ctx context.Context, log *slog.Logger, opName string) error {
-	var op v1alpha3.Operation
+	var op v1alpha3.MachineOperation
 	if err := r.client.Get(ctx, client.ObjectKey{Name: opName}, &op); err != nil {
-		return fmt.Errorf("get Operation %q: %w", opName, err)
+		return fmt.Errorf("get MachineOperation %q: %w", opName, err)
 	}
 
 	// Skip terminal operations.
@@ -34,7 +35,7 @@ func (r *reconciler) reconcileOperation(ctx context.Context, log *slog.Logger, o
 		return nil
 	}
 
-	log = log.With("op_type", op.Spec.Type, "op_phase", op.Status.Phase)
+	log = log.With("op_name", op.Spec.OperationName, "op_phase", op.Status.Phase)
 
 	// Mark InProgress and persist before executing.
 	now := metav1.Now()
@@ -46,7 +47,7 @@ func (r *reconciler) reconcileOperation(ctx context.Context, log *slog.Logger, o
 	}
 
 	if err := r.client.Status().Update(ctx, &op); err != nil {
-		return fmt.Errorf("update Operation to InProgress: %w", err)
+		return fmt.Errorf("update MachineOperation to InProgress: %w", err)
 	}
 
 	// Execute the operation.
@@ -63,20 +64,20 @@ func (r *reconciler) reconcileOperation(ctx context.Context, log *slog.Logger, o
 		op.Status.CompletedAt = &completedAt
 		log.Error("operation failed", "error", execErr)
 	} else {
-		op.Status.Phase = v1alpha3.OperationPhaseCompleted
+		op.Status.Phase = v1alpha3.OperationPhaseComplete
 		op.Status.Message = ""
 		op.Status.CompletedAt = &completedAt
 		log.Info("operation completed")
 	}
 
 	if err := r.client.Status().Update(ctx, &op); err != nil {
-		log.Warn("failed to update Operation status", "error", err)
+		log.Warn("failed to update MachineOperation status", "error", err)
 
 		if execErr != nil {
 			return execErr
 		}
 
-		return fmt.Errorf("update Operation status: %w", err)
+		return fmt.Errorf("update MachineOperation status: %w", err)
 	}
 
 	// Handle TTL cleanup for terminal operations.
@@ -92,10 +93,10 @@ func (r *reconciler) reconcileOperation(ctx context.Context, log *slog.Logger, o
 }
 
 // executeOperation dispatches to the appropriate executor method based on
-// the operation type.
-func (r *reconciler) executeOperation(ctx context.Context, log *slog.Logger, op *v1alpha3.Operation) error {
-	switch op.Spec.Type {
-	case v1alpha3.OperationTypeSoftReboot:
+// the operation name.
+func (r *reconciler) executeOperation(ctx context.Context, log *slog.Logger, op *v1alpha3.MachineOperation) error {
+	switch op.Spec.OperationName {
+	case v1alpha3.OperationReboot:
 		// Discover the active nspawn machine at execution time. The name
 		// can change after an upgrade (kube1 <-> kube2), so we cannot
 		// cache it at daemon startup.
@@ -105,15 +106,23 @@ func (r *reconciler) executeOperation(ctx context.Context, log *slog.Logger, op 
 		}
 
 		return r.exec.softRestart(ctx, log, active.Name)
-	case v1alpha3.OperationTypeHardReboot:
-		return fmt.Errorf("HardReboot operations are handled by the machina controller, not the agent")
+	case v1alpha3.OperationPowerCycle:
+		return fmt.Errorf("PowerCycle operations are handled by the machina controller, not the agent")
+	case v1alpha3.OperationShutdown:
+		return fmt.Errorf("Shutdown operations are not yet implemented")
+	case v1alpha3.OperationPowerOff:
+		return fmt.Errorf("PowerOff operations are handled by the machina controller, not the agent")
+	case v1alpha3.OperationPowerOn:
+		return fmt.Errorf("PowerOn operations are handled by the machina controller, not the agent")
+	case v1alpha3.OperationRestartService:
+		return fmt.Errorf("RestartService operations are not yet implemented")
 	default:
-		return fmt.Errorf("unknown operation type: %q", op.Spec.Type)
+		return fmt.Errorf("unknown operation name: %q", op.Spec.OperationName)
 	}
 }
 
 // scheduleTTLCleanup waits for the TTL to expire and then deletes the
-// Operation CR. This runs in a goroutine and is best-effort.
+// MachineOperation CR. This runs in a goroutine and is best-effort.
 func (r *reconciler) scheduleTTLCleanup(ctx context.Context, log *slog.Logger, opName string, ttlSeconds int32) {
 	delay := time.Duration(ttlSeconds) * time.Second
 
@@ -123,7 +132,7 @@ func (r *reconciler) scheduleTTLCleanup(ctx context.Context, log *slog.Logger, o
 	case <-time.After(delay):
 	}
 
-	var op v1alpha3.Operation
+	var op v1alpha3.MachineOperation
 	if err := r.client.Get(ctx, client.ObjectKey{Name: opName}, &op); err != nil {
 		log.Debug("TTL cleanup: operation already gone", "operation", opName)
 		return

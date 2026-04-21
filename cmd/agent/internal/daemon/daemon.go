@@ -35,7 +35,7 @@ const (
 
 // Run is the main daemon entry point. It discovers the active nspawn
 // machine, builds a Kubernetes client from the applied config, and
-// watches both the Machine CR and Operation CRs for changes.
+// watches both the Machine CR and MachineOperation CRs for changes.
 // A single worker goroutine processes all actions sequentially,
 // preventing overlapping machine-mutating operations.
 func Run(ctx context.Context, log *slog.Logger) error {

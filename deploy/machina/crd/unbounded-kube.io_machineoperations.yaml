@@ -6,24 +6,24 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.20.1
-  name: operations.unbounded-kube.io
+  name: machineoperations.unbounded-kube.io
 spec:
   group: unbounded-kube.io
   names:
-    kind: Operation
-    listKind: OperationList
-    plural: operations
+    kind: MachineOperation
+    listKind: MachineOperationList
+    plural: machineoperations
     shortNames:
-    - op
-    singular: operation
+    - mop
+    singular: machineoperation
   scope: Cluster
   versions:
   - additionalPrinterColumns:
     - jsonPath: .spec.machineRef
       name: Machine
       type: string
-    - jsonPath: .spec.type
-      name: Type
+    - jsonPath: .spec.operationName
+      name: Operation
       type: string
     - jsonPath: .status.phase
       name: Phase
@@ -35,9 +35,11 @@ spec:
     schema:
       openAPIV3Schema:
         description: |-
-          Operation represents a discrete operation to be performed on a Machine.
-          Operations are created by CLI commands or controllers and processed by
-          the agent daemon running on the target machine.
+          MachineOperation represents a discrete operation to be performed on a
+          Machine. MachineOperations are created by CLI commands or controllers and
+          processed by the appropriate agent - the in-VM agent handles operations
+          like Reboot, while cloud or PXE controllers handle operations like
+          PowerCycle, PowerOff, and PowerOn.
         properties:
           apiVersion:
             description: |-
@@ -57,39 +59,52 @@ spec:
           metadata:
             type: object
           spec:
-            description: OperationSpec defines the desired state of an Operation.
+            description: MachineOperationSpec defines the desired state of a MachineOperation.
             properties:
               machineRef:
                 description: MachineRef is the name of the Machine CR this operation
                   targets.
                 minLength: 1
                 type: string
+              operationName:
+                description: OperationName is the operation to perform on the target
+                  machine.
+                enum:
+                - Reboot
+                - PowerCycle
+                - Shutdown
+                - PowerOff
+                - PowerOn
+                - RestartService
+                type: string
+              parameters:
+                additionalProperties:
+                  type: string
+                description: |-
+                  Parameters is an optional set of key-value pairs passed to the
+                  operation executor. For example, RestartService uses "service" to
+                  specify the systemd unit name.
+                type: object
               ttlSecondsAfterFinished:
                 description: |-
                   TTLSecondsAfterFinished limits the lifetime of a completed or failed
-                  Operation. If set, the agent deletes the Operation this many seconds
-                  after it reaches a terminal phase. If unset, the Operation is kept
-                  indefinitely.
+                  MachineOperation. If set, the agent deletes the MachineOperation
+                  this many seconds after it reaches a terminal phase. If unset, the
+                  MachineOperation is kept indefinitely.
                 format: int32
                 minimum: 0
                 type: integer
-              type:
-                description: Type is the operation to perform on the target machine.
-                enum:
-                - SoftReboot
-                - HardReboot
-                type: string
             required:
             - machineRef
-            - type
+            - operationName
             type: object
           status:
-            description: OperationStatus defines the observed state of an Operation.
+            description: MachineOperationStatus defines the observed state of a MachineOperation.
             properties:
               completedAt:
                 description: |-
                   CompletedAt is when the operation reached a terminal state
-                  (Completed or Failed).
+                  (Complete or Failed).
                 format: date-time
                 type: string
               conditions:
