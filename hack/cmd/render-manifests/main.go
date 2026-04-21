@@ -22,7 +22,7 @@ import (
 	"strings"
 	"text/template"
 
-	sprig "github.com/Masterminds/sprig/v3"
+	"github.com/Masterminds/sprig/v3"
 )
 
 // setFlags implements flag.Value for repeatable --set key=value arguments.
