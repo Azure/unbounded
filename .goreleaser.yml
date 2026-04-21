@@ -10,10 +10,11 @@ builds:
       - -s -w
       - -X github.com/Azure/unbounded-kube/internal/version.Version={{ .Version }}
       - -X github.com/Azure/unbounded-kube/internal/version.GitCommit={{ .ShortCommit }}
+      - -X github.com/Azure/unbounded-kube/internal/version.BuildTime={{ .Date }}
       - -X github.com/Azure/unbounded-kube/cmd/kubectl-unbounded/app.MetalmanImage=ghcr.io/azure/metalman:v{{ .Version }}
     hooks:
       pre:
-        - make machina-manifests MACHINA_TAG={{ .Tag }}
+        - make machina-manifests VERSION={{ .Tag }}
     goos:
       - linux
       - darwin
@@ -30,6 +31,7 @@ builds:
       - -s -w
       - -X github.com/Azure/unbounded-kube/internal/version.Version={{ .Version }}
       - -X github.com/Azure/unbounded-kube/internal/version.GitCommit={{ .ShortCommit }}
+      - -X github.com/Azure/unbounded-kube/internal/version.BuildTime={{ .Date }}
     goos:
       - linux
     goarch:

@@ -29,12 +29,12 @@ import (
 
 	unboundednetv1alpha1 "github.com/Azure/unbounded-kube/api/net/v1alpha1"
 	"github.com/Azure/unbounded-kube/internal/net/authn"
-	"github.com/Azure/unbounded-kube/internal/net/buildinfo"
 	"github.com/Azure/unbounded-kube/internal/net/certmanager"
 	"github.com/Azure/unbounded-kube/internal/net/config"
 	"github.com/Azure/unbounded-kube/internal/net/controller"
 	"github.com/Azure/unbounded-kube/internal/net/metrics"
 	"github.com/Azure/unbounded-kube/internal/net/webhook"
+	"github.com/Azure/unbounded-kube/internal/version"
 )
 
 var gatewayPoolGVR = schema.GroupVersionResource{
@@ -89,7 +89,7 @@ func main() {
 
 It watches for nodes and Site resources to label nodes, assign pod CIDRs based
 on site configuration, and maintain SiteNodeSlice and GatewayPool status.`,
-		Version: buildinfo.Version + " (commit: " + buildinfo.Commit + ")",
+		Version: version.Version + " (commit: " + version.GitCommit + ")",
 		PreRunE: func(cmd *cobra.Command, args []string) error {
 			cfg.ConfigFile = configFile
 			if err := applyControllerRuntimeConfig(cmd, cfg, configFile); err != nil {
@@ -337,7 +337,7 @@ Use "{{.CommandPath}} [command] --help" for more information about a command.{{e
 `
 
 func run(cfg *config.Config, forceNotLeader bool) error {
-	klog.Infof("unbounded-net-controller version=%s commit=%s built=%s", buildinfo.Version, buildinfo.Commit, buildinfo.BuildTime)
+	klog.Infof("unbounded-net-controller version=%s commit=%s built=%s", version.Version, version.GitCommit, version.BuildTime)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

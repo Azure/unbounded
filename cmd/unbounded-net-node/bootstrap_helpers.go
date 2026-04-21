@@ -24,7 +24,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 
-	"github.com/Azure/unbounded-kube/internal/net/buildinfo"
+	"github.com/Azure/unbounded-kube/internal/version"
 )
 
 // errCNIConfDirNotEmpty is returned when existing CNI configuration files are
@@ -452,8 +452,8 @@ func taintGatewayNode(ctx context.Context, clientset kubernetes.Interface, nodeN
 
 func nodeAgentBuildInfo() *BuildInfo {
 	return &BuildInfo{
-		Version:   buildinfo.Version,
-		Commit:    buildinfo.Commit,
-		BuildTime: buildinfo.BuildTime,
+		Version:   version.Version,
+		Commit:    version.GitCommit,
+		BuildTime: version.BuildTime,
 	}
 }

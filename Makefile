@@ -17,9 +17,8 @@ AGENT_CMD=./cmd/agent
 
 MACHINA_BIN=bin/machina
 MACHINA_CMD=./cmd/machina
-MACHINA_TAG ?= latest
 CONTAINER_REGISTRY ?= ghcr.io/azure
-MACHINA_IMAGE=$(CONTAINER_REGISTRY)/machina:$(MACHINA_TAG)
+MACHINA_IMAGE=$(CONTAINER_REGISTRY)/machina:$(VERSION)
 CONTAINER_ENGINE ?= podman
 
 METALMAN_BIN=bin/metalman
@@ -45,17 +44,19 @@ UNROUTE_BIN=bin/unroute
 UNROUTE_CMD=./cmd/unroute
 
 # Version is derived from the latest git tag. Override with: make VERSION=v1.0.0
-VERSION ?= $(shell git describe --tags --always 2>/dev/null || echo dev)
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 GIT_COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+BUILD_TIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
 # Shared ldflags for injecting version metadata into all binaries.
-VERSION_LDFLAGS=-X github.com/Azure/unbounded-kube/internal/version.Version=$(VERSION) -X github.com/Azure/unbounded-kube/internal/version.GitCommit=$(GIT_COMMIT)
+STAMP_LDFLAGS=-X github.com/Azure/unbounded-kube/internal/version.Version=$(VERSION) \
+              -X github.com/Azure/unbounded-kube/internal/version.GitCommit=$(GIT_COMMIT) \
+              -X github.com/Azure/unbounded-kube/internal/version.BuildTime=$(BUILD_TIME)
+
+METALMAN_IMAGE=$(CONTAINER_REGISTRY)/metalman:$(VERSION)
 
 # kubectl-unbounded also stamps the metalman image reference.
-KUBECTL_UNBOUNDED_LDFLAGS=$(VERSION_LDFLAGS) -X github.com/Azure/unbounded-kube/cmd/kubectl-unbounded/app.MetalmanImage=$(METALMAN_IMAGE)
-
-METALMAN_TAG ?= latest
-METALMAN_IMAGE=$(CONTAINER_REGISTRY)/metalman:$(METALMAN_TAG)
+KUBECTL_UNBOUNDED_LDFLAGS=$(STAMP_LDFLAGS) -X github.com/Azure/unbounded-kube/cmd/kubectl-unbounded/app.MetalmanImage=$(METALMAN_IMAGE)
 
 .PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge inventory inventory-amd64 inventory-arm64 unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute
 
@@ -195,39 +196,39 @@ inventory-arm64: test ## Build inventory for linux/arm64 (implies test)
 	GOOS=linux GOARCH=arm64 $(GOBUILD) -o $(INVENTORY_BIN)-arm64 $(INVENTORY_CMD)/main.go
 
 unbounded-agent: test ## Build the unbounded-agent for linux (implies test)
-	GOOS=linux $(GOBUILD) -ldflags '$(VERSION_LDFLAGS)' -o $(AGENT_BIN) $(AGENT_CMD)/main.go
+	GOOS=linux $(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(AGENT_BIN) $(AGENT_CMD)/main.go
 
 machina-build: machina-manifests ## Build the machina binary (no lint/test)
-	$(GOBUILD) -ldflags '$(VERSION_LDFLAGS)' -o $(MACHINA_BIN) $(MACHINA_CMD)/main.go
+	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(MACHINA_BIN) $(MACHINA_CMD)/main.go
 
 machina: test machina-build ## Build the machina controller (implies test)
 
 metalman-build: ## Build the metalman binary (no lint/test)
-	$(GOBUILD) -ldflags '$(VERSION_LDFLAGS)' -o $(METALMAN_BIN) $(METALMAN_CMD)/main.go
+	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(METALMAN_BIN) $(METALMAN_CMD)/main.go
 
 metalman: test metalman-build ## Build the metalman controller (implies test)
 
 ##@ Net Binaries
 
 unbounded-net-controller: test ## Build the unbounded-net-controller (implies test)
-	$(GOBUILD) -o $(NET_CONTROLLER_BIN) $(NET_CONTROLLER_CMD)
+	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(NET_CONTROLLER_BIN) $(NET_CONTROLLER_CMD)
 
 unbounded-net-node: test ## Build the unbounded-net-node (implies test)
-	$(GOBUILD) -o $(NET_NODE_BIN) $(NET_NODE_CMD)
+	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(NET_NODE_BIN) $(NET_NODE_CMD)
 
 unbounded-net-routeplan-debug: test ## Build the routeplan debug tool (implies test)
-	$(GOBUILD) -o $(NET_ROUTEPLAN_DEBUG_BIN) $(NET_ROUTEPLAN_DEBUG_CMD)
+	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(NET_ROUTEPLAN_DEBUG_BIN) $(NET_ROUTEPLAN_DEBUG_CMD)
 
 unping: test ## Build the unping utility (implies test)
-	$(GOBUILD) -o $(UNPING_BIN) $(UNPING_CMD)
+	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(UNPING_BIN) $(UNPING_CMD)
 
 unroute: test ## Build the unroute utility (implies test)
-	$(GOBUILD) -o $(UNROUTE_BIN) $(UNROUTE_CMD)
+	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(UNROUTE_BIN) $(UNROUTE_CMD)
 
 ##@ Container Images
 
 machina-oci: ## Build the machina container image
-	$(CONTAINER_ENGINE) build -t machina:$(MACHINA_TAG) -t $(MACHINA_IMAGE) -f ./images/machina/Containerfile .
+	$(CONTAINER_ENGINE) build -t machina:$(VERSION) -t $(MACHINA_IMAGE) -f ./images/machina/Containerfile .
 
 machina-oci-push: machina-oci ## Build and push the machina container image
 	$(CONTAINER_ENGINE) push $(MACHINA_IMAGE)
@@ -253,7 +254,7 @@ machina-run: machina ## Replace the in-cluster machina with a locally built bina
 	$(MACHINA_BIN) controller --config=hack/machina-config.yaml
 
 metalman-oci: ## Build the metalman container image
-	$(CONTAINER_ENGINE) build -t metalman:$(METALMAN_TAG) -t $(METALMAN_IMAGE) -f ./images/metalman/Containerfile .
+	$(CONTAINER_ENGINE) build -t metalman:$(VERSION) -t $(METALMAN_IMAGE) -f ./images/metalman/Containerfile .
 
 metalman-oci-push: metalman-oci ## Build and push the metalman container image
 	$(CONTAINER_ENGINE) push $(METALMAN_IMAGE)
