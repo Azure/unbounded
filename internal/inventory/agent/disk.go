@@ -197,36 +197,22 @@ func readLinkSpeed(name, base string) string {
 	return ""
 }
 
-// readDiskSerial reads the disk serial number from sysfs or udevadm.
+// readDiskSerial reads the disk serial number via udevadm. udevadm
+// invokes ata_id or scsi_id as needed (issuing ATA IDENTIFY DEVICE or
+// SCSI INQUIRY VPD page commands) and also reads sysfs attributes for
+// NVMe and virtio devices, so it covers all device types in one call.
 func readDiskSerial(name string) string {
-	// Try direct sysfs path first (works for many SCSI/SATA disks).
-	serial := readSysfsField(filepath.Join("/sys/block", name, "device", "serial"))
-	if serial != "" {
-		return serial
-	}
-
-	// NVMe exposes serial under the nvme controller.
-	if strings.HasPrefix(name, "nvme") {
-		// e.g., nvme0n1 → controller is nvme0.
-		ctrl := strings.TrimSuffix(strings.TrimRight(name, "0123456789"), "n")
-
-		serial = readSysfsField(filepath.Join("/sys/class/nvme", ctrl, "serial"))
-		if serial != "" {
-			return serial
-		}
-	}
-
-	// Fall back to udevadm which can read the serial from SCSI VPD pages
-	// and other sources not directly exposed via sysfs.
 	out, err := exec.Command("udevadm", "info", "--query=property", "--name="+name).Output()
-	if err == nil {
-		for _, line := range strings.Split(string(out), "\n") {
-			// Prefer ID_SERIAL_SHORT (the raw serial) over ID_SERIAL
-			// which often includes the vendor/model prefix.
-			if strings.HasPrefix(line, "ID_SERIAL_SHORT=") {
-				if v := strings.TrimPrefix(line, "ID_SERIAL_SHORT="); v != "" {
-					return strings.TrimSpace(v)
-				}
+	if err != nil {
+		return ""
+	}
+
+	for _, line := range strings.Split(string(out), "\n") {
+		// Prefer ID_SERIAL_SHORT (the raw serial) over ID_SERIAL
+		// which often includes the vendor/model prefix.
+		if strings.HasPrefix(line, "ID_SERIAL_SHORT=") {
+			if v := strings.TrimPrefix(line, "ID_SERIAL_SHORT="); v != "" {
+				return strings.TrimSpace(v)
 			}
 		}
 	}
