@@ -23,7 +23,7 @@ common:
   azureTenantId: ""
   # Override the Kubernetes API server URL used by both the controller and node
   # agent. When empty (the default), in-cluster discovery is used. Populated
-  # automatically by `make deploy` from the current kubeconfig context.
+  # automatically by `make net-deploy` from the current kubeconfig context.
   apiserverURL: ""
   # klog verbosity level (0-10). Watched for changes at runtime; editing the
   # ConfigMap updates the log level without a pod restart.
