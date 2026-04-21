@@ -157,7 +157,7 @@ test: lint ## Run all tests (implies lint)
 
 endif
 
-build: ## Build all Go packages
+build: machina-manifests ## Build all Go packages
 	$(GOBUILD) ./...
 
 generate: install-protoc ## Run go generate for API types (deepcopy, CRDs) and protobuf
@@ -232,9 +232,20 @@ machina-oci: ## Build the machina container image
 machina-oci-push: machina-oci ## Build and push the machina container image
 	$(CONTAINER_ENGINE) push $(MACHINA_IMAGE)
 
-machina-manifests: ## Stamp the machina deployment manifest with the container image
-	@sed -i 's|image: .*|image: $(MACHINA_IMAGE)|' deploy/machina/04-deployment.yaml
-	@echo "Updated deploy/machina/04-deployment.yaml → image: $(MACHINA_IMAGE)"
+MACHINA_NAMESPACE ?= unbounded-kube
+MACHINA_MANIFEST_TEMPLATES_DIR := deploy/machina
+MACHINA_MANIFEST_RENDERED_DIR  := deploy/machina/rendered
+
+machina-manifests: ## Render machina deployment manifests into deploy/machina/rendered
+	@rm -rf $(MACHINA_MANIFEST_RENDERED_DIR)
+	@mkdir -p $(MACHINA_MANIFEST_RENDERED_DIR)/crd
+	$(GOCMD) run ./hack/cmd/render-manifests \
+		--templates-dir $(MACHINA_MANIFEST_TEMPLATES_DIR) \
+		--output-dir $(MACHINA_MANIFEST_RENDERED_DIR) \
+		--set Namespace=$(MACHINA_NAMESPACE) \
+		--set ControllerImage=$(MACHINA_IMAGE)
+	@cp $(MACHINA_MANIFEST_TEMPLATES_DIR)/crd/*.yaml $(MACHINA_MANIFEST_RENDERED_DIR)/crd/
+	@echo "Rendered machina manifests into $(MACHINA_MANIFEST_RENDERED_DIR) (image: $(MACHINA_IMAGE))"
 
 machina-run: machina ## Replace the in-cluster machina with a locally built binary
 	kubectl scale deployment/machina-controller --replicas=0 -n unbounded-kube
