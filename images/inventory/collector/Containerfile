@@ -1,5 +1,8 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 # Build stage
-FROM mcr.microsoft.com/azurelinux/base/core:3.0 AS builder
+FROM mcr.microsoft.com/azurelinux/base/core:3.0@sha256:35149ae8dd179684f969944f54a337c665a64e702486154eb44253fb39c2505b AS builder
 
 # Install build dependencies
 RUN tdnf install -y \
@@ -15,6 +18,10 @@ RUN tdnf install -y \
 # Set up Go environment
 ENV CGO_ENABLED=1
 ENV GOPATH=/go
+ENV GOTOOLCHAIN=auto
+# Azure Linux 3.0's Go package restricts GOTOOLCHAIN to "local" by default.
+# Allow "auto" so that go install can download the required toolchain.
+ENV MS_GOTOOLCHAIN_ALLOW_NON_LOCAL=1
 ENV PATH=$PATH:/go/bin
 
 # Install gofumpt and golangci-lint for the build
@@ -29,12 +36,14 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 # Copy the rest of the source code
-COPY . .
+COPY ../../ .
 
-RUN make inventory-inspector
+# VERSION is passed from the release workflow to inject version metadata via ldflags.
+ARG VERSION=dev
+RUN make inventory-collector VERSION=${VERSION}
 
 # Runtime stage
-FROM mcr.microsoft.com/azurelinux/base/core:3.0
+FROM mcr.microsoft.com/azurelinux/base/core:3.0@sha256:35149ae8dd179684f969944f54a337c665a64e702486154eb44253fb39c2505b
 
 # Install runtime dependencies
 RUN tdnf install -y \
@@ -45,7 +54,7 @@ RUN tdnf install -y \
 RUN mkdir -p /unbounded/bin
 
 # Copy the built binaries from the builder stage
-COPY --from=builder /src/bin/inventory-inspector /unbounded/bin/inventory-inspector
+COPY --from=builder /src/bin/inventory-collector /unbounded/bin/inventory-collector
 
 # Add unbounded bin to PATH
 ENV PATH="/unbounded/bin:${PATH}"
@@ -54,4 +63,4 @@ ENV PATH="/unbounded/bin:${PATH}"
 WORKDIR /unbounded
 
 # Default entrypoint
-ENTRYPOINT ["/unbounded/bin/inventory-inspector"]
+ENTRYPOINT ["/unbounded/bin/inventory-collector"]

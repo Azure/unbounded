@@ -414,9 +414,12 @@ resources/cni-plugins-linux-%-$(CNI_PLUGINS_VERSION).tgz:
 		"https://github.com/containernetworking/plugins/releases/download/$(CNI_PLUGINS_VERSION)/cni-plugins-linux-$*-$(CNI_PLUGINS_VERSION).tgz" \
 		-o $@
 
+.PHONY: inventory-oci-all
+inventory-oci-all: inventory-collector-oci inventory-inspector-oci inventory-viewer-oci ## Build all inventory container images
+
 .PHONY: inventory-collector-oci
 inventory-collector-oci: ## Build the inventory-collector container image
-	$(CONTAINER_ENGINE) build -t inventory-collector:$(INVENTORY_COLLECTOR_TAG) -t $(INVENTORY_COLLECTOR_IMAGE) -f ./cmd/inventory/inventory-collector/oci/Containerfile .
+	$(CONTAINER_ENGINE) build -t inventory-collector:$(INVENTORY_COLLECTOR_TAG) -t $(INVENTORY_COLLECTOR_IMAGE) -f ./images/inventory/collector/Containerfile .
 
 .PHONY: inventory-collector-oci-push
 inventory-collector-oci-push: inventory-collector-oci ## Build and push the inventory-collector container image
@@ -424,7 +427,7 @@ inventory-collector-oci-push: inventory-collector-oci ## Build and push the inve
 
 .PHONY: inventory-inspector-oci
 inventory-inspector-oci: ## Build the inventory-inspector container image
-	$(CONTAINER_ENGINE) build -t inventory-inspector:$(INVENTORY_INSPECTOR_TAG) -t $(INVENTORY_INSPECTOR_IMAGE) -f ./cmd/inventory/inventory-inspector/oci/Containerfile .
+	$(CONTAINER_ENGINE) build -t inventory-inspector:$(INVENTORY_INSPECTOR_TAG) -t $(INVENTORY_INSPECTOR_IMAGE) -f ./images/inventory/inspector/Containerfile .
 
 .PHONY: inventory-inspector-oci-push
 inventory-inspector-oci-push: inventory-inspector-oci ## Build and push the inventory-inspector container image
@@ -432,7 +435,7 @@ inventory-inspector-oci-push: inventory-inspector-oci ## Build and push the inve
 
 .PHONY: inventory-viewer-oci
 inventory-viewer-oci: ## Build the inventory-viewer container image
-	$(CONTAINER_ENGINE) build -t inventory-viewer:$(INVENTORY_VIEWER_TAG) -t $(INVENTORY_VIEWER_IMAGE) -f ./cmd/inventory/inventory-viewer/oci/Containerfile .
+	$(CONTAINER_ENGINE) build -t inventory-viewer:$(INVENTORY_VIEWER_TAG) -t $(INVENTORY_VIEWER_IMAGE) -f ./images/inventory/viewer/Containerfile .
 
 .PHONY: inventory-viewer-oci-push
 inventory-viewer-oci-push: inventory-viewer-oci ## Build and push the inventory-viewer container image
