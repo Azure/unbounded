@@ -9,6 +9,7 @@ RUN tdnf install -y \
     gcc \
     git \
     ca-certificates \
+    openssl-devel \
     && tdnf clean all
 
 # Set up Go environment
