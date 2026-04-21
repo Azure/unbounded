@@ -20,9 +20,13 @@ import (
 // reconcileUpdateMachine processes a single Machine CR reconciliation cycle.
 // It reads the current Machine CR from the API server, resolves the
 // MachineConfigurationVersion referenced by spec.configurationRef, checks
-// for operation counter drift, and performs a full blue/green node update
-// if needed.
-func (r *reconciler) reconcileUpdateMachine(ctx context.Context, log *slog.Logger, machineName string) error {
+// for operation counter drift (unless forceRepave is true), and performs a
+// full blue/green node update if needed.
+//
+// When forceRepave is true the operation counter check is skipped - this is
+// used by the Node-deletion trigger where the operator has already cordoned,
+// drained, and deleted the Node to signal a repave.
+func (r *reconciler) reconcileUpdateMachine(ctx context.Context, log *slog.Logger, machineName string, forceRepave bool) error {
 	// Read the Machine CR from the API server to get the latest state.
 	machine := &v1alpha3.Machine{}
 	if err := r.client.Get(ctx, client.ObjectKey{Name: machineName}, machine); err != nil {
@@ -54,9 +58,16 @@ func (r *reconciler) reconcileUpdateMachine(ctx context.Context, log *slog.Logge
 	// trigger for reconciliation; actual config drift (version, image,
 	// etc.) is checked inside updateNode to decide whether the
 	// expensive rootfs reprovision is needed.
-	if !hasOperationsDrift(machine) {
+	// When forceRepave is true (Node deleted), skip the counter check
+	// and always proceed with the update.
+	if !forceRepave && !hasOperationsDrift(machine) {
 		log.Debug("no operation counter drift")
 		return nil
+	}
+
+	triggerReason := "operation counter drift detected"
+	if forceRepave {
+		triggerReason = "Node deleted, forcing repave"
 	}
 
 	desiredVersion := ""
@@ -64,7 +75,7 @@ func (r *reconciler) reconcileUpdateMachine(ctx context.Context, log *slog.Logge
 		desiredVersion = mcv.Spec.Template.Kubernetes.Version
 	}
 
-	log.Info("operation counter drift detected",
+	log.Info(triggerReason,
 		"current_version", active.Config.Cluster.Version,
 		"desired_version", desiredVersion,
 		"mcv", mcv.Name,

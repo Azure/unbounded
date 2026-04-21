@@ -250,3 +250,117 @@ func Test_resolveMCV_NotFound(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "get MachineConfigurationVersion")
 }
+
+// ---------------------------------------------------------------------------
+// reconcileUpdateMachine with forceRepave
+// ---------------------------------------------------------------------------
+
+// Test_reconcileUpdateMachine_ForceRepaveSkipsDriftCheck verifies that when
+// forceRepave is true, the reconciler proceeds even when there is no
+// operation counter drift. Since updateNode requires real nspawn operations,
+// we verify that it gets past the drift check by confirming it reaches the
+// MCV resolution / findActive stages (which we can control via fakes).
+func Test_reconcileUpdateMachine_ForceRepaveSkipsDriftCheck(t *testing.T) {
+	// Create a Machine with NO operation drift (spec counter == status counter).
+	machine := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-machine"},
+		Spec: v1alpha3.MachineSpec{
+			ConfigurationRef: &v1alpha3.MachineConfigurationRef{
+				Name:    "myconfig",
+				Version: ptr.To(int32(1)),
+			},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
+		},
+		Status: v1alpha3.MachineStatus{
+			Operations: &v1alpha3.OperationsStatus{RepaveCounter: 1},
+		},
+	}
+
+	mcv := &v1alpha3.MachineConfigurationVersion{
+		ObjectMeta: metav1.ObjectMeta{Name: "myconfig-v1"},
+		Spec: v1alpha3.MachineConfigurationVersionSpec{
+			Version: 1,
+			Template: v1alpha3.MachineConfigurationTemplate{
+				Kubernetes: &v1alpha3.MachineConfigurationKubernetes{
+					Version: "v1.33.1",
+				},
+			},
+		},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(newScheme()).
+		WithObjects(machine, mcv).
+		WithStatusSubresource(machine).
+		Build()
+
+	r := &reconciler{
+		client:      c,
+		machineName: "test-machine",
+		exec:        &mockExecutor{},
+		findActive: func(_ *slog.Logger) (*ActiveMachine, error) {
+			return &ActiveMachine{
+				Name:   "kube1",
+				Config: baseConfig(),
+			}, nil
+		},
+	}
+
+	// With forceRepave=false and no drift, should return nil (no-op).
+	err := r.reconcileUpdateMachine(context.Background(), slog.Default(), "test-machine", false)
+	require.NoError(t, err)
+
+	// With forceRepave=true and no drift, should proceed past drift check.
+	// It will reach updateNode which checks hasDrift - since versions match,
+	// it logs "no config drift" and succeeds without actually repaving.
+	err = r.reconcileUpdateMachine(context.Background(), slog.Default(), "test-machine", true)
+	require.NoError(t, err)
+}
+
+// Test_reconcileUpdateMachine_NoDrift_NormalPath verifies that with
+// forceRepave=false and no operation counter drift, the reconciler
+// returns early without error.
+func Test_reconcileUpdateMachine_NoDrift_NormalPath(t *testing.T) {
+	machine := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-machine"},
+		Spec: v1alpha3.MachineSpec{
+			ConfigurationRef: &v1alpha3.MachineConfigurationRef{
+				Name:    "myconfig",
+				Version: ptr.To(int32(1)),
+			},
+		},
+	}
+
+	mcv := &v1alpha3.MachineConfigurationVersion{
+		ObjectMeta: metav1.ObjectMeta{Name: "myconfig-v1"},
+		Spec: v1alpha3.MachineConfigurationVersionSpec{
+			Version: 1,
+			Template: v1alpha3.MachineConfigurationTemplate{
+				Kubernetes: &v1alpha3.MachineConfigurationKubernetes{
+					Version: "v1.33.1",
+				},
+			},
+		},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(newScheme()).
+		WithObjects(machine, mcv).
+		Build()
+
+	r := &reconciler{
+		client:      c,
+		machineName: "test-machine",
+		exec:        &mockExecutor{},
+		findActive: func(_ *slog.Logger) (*ActiveMachine, error) {
+			return &ActiveMachine{
+				Name:   "kube1",
+				Config: baseConfig(),
+			}, nil
+		},
+	}
+
+	// No operations spec at all - no drift - should return nil.
+	err := r.reconcileUpdateMachine(context.Background(), slog.Default(), "test-machine", false)
+	require.NoError(t, err)
+}

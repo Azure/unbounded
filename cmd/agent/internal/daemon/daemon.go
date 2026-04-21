@@ -95,6 +95,10 @@ func run(ctx context.Context, log *slog.Logger, newClient kubeClientFunc) error 
 	// Operation CR watch loop (goroutine, retries internally).
 	go watchOperations(ctx, log, kubeClient, machineName, queue)
 
+	// Node watch loop (goroutine, retries internally). Detects Node
+	// deletion as the primary signal for the OnDelete update strategy.
+	go watchNode(ctx, log, kubeClient, queue)
+
 	// Machine CR watch loop (blocking, retries in-place).
 	for {
 		if err := watchMachine(ctx, log, kubeClient, machineName, queue); err != nil {

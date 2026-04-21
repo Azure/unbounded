@@ -15,6 +15,13 @@ const (
 	// CR watcher when operation counter drift is detected.
 	ActionUpdateMachine ActionType = "UpdateMachine"
 
+	// ActionNodeDeleted triggers a repave because the Kubernetes Node
+	// object corresponding to this machine was deleted. This is the
+	// primary signal for the OnDelete update strategy: an operator
+	// cordons, drains, and deletes the Node to trigger a repave with
+	// the latest MachineConfigurationVersion.
+	ActionNodeDeleted ActionType = "NodeDeleted"
+
 	// ActionOperation processes an Operation CR (e.g. SoftReboot,
 	// HardReboot). Produced by the Operation CR watcher when a
 	// non-terminal Operation targeting this machine is observed.

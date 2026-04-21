@@ -34,7 +34,9 @@ func (r *reconciler) reconcile(ctx context.Context, log *slog.Logger, action Act
 
 	switch action.Type {
 	case ActionUpdateMachine:
-		return r.reconcileUpdateMachine(ctx, log, action.Source)
+		return r.reconcileUpdateMachine(ctx, log, action.Source, false)
+	case ActionNodeDeleted:
+		return r.reconcileUpdateMachine(ctx, log, r.machineName, true)
 	case ActionOperation:
 		return r.reconcileOperation(ctx, log, action.Source)
 	default:
