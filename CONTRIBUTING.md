@@ -43,3 +43,24 @@ detail as possible: steps to reproduce, expected behavior, actual behavior, and 
 - `make metalman` -- build the metalman controller (with format, lint, test)
 - `make machina-build` / `make metalman-build` -- build without lint/test (used in container builds)
 - `make kubectl-unbounded` -- build the kubectl plugin
+
+### Testing the Release Pipeline Locally
+
+Before pushing a tag, you can rehearse the GitHub Actions release workflow on
+your workstation with:
+
+```
+./hack/test-release-local.sh
+```
+
+This mirrors `.github/workflows/release.yaml`: it runs `goreleaser check`,
+builds the frontend, downloads CNI plugins, renders the combined manifest
+tarball, runs `goreleaser release --snapshot` (skipping publish, sign, sbom,
+docker), invokes `hack/test-goreleaser-hook.sh` to assert manifests and
+binaries are stamped with the test tag, and `docker buildx build`s the
+container images.
+
+Useful flags: `--multi-arch` (also build linux/arm64 via QEMU),
+`--include-host` (also build the large host-ubuntu2404 image), `--skip-net`
+(skip net image builds entirely), `--keep-dist` (preserve `dist/` and
+`build/` after the run). Override the snapshot tag with `TAG=...`.
