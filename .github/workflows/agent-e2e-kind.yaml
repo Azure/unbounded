@@ -12,7 +12,7 @@ on:
       - internal/kube/**
       - hack/agent/e2e-kind/**
       - deploy/machina/crd/**
-      - deploy/machina/07-bootstrapper-rbac.yaml
+      - deploy/machina/*.yaml.tmpl
       - go.mod
       - go.sum
       - .github/workflows/agent-e2e-kind.yaml
@@ -25,7 +25,7 @@ on:
       - internal/kube/**
       - hack/agent/e2e-kind/**
       - deploy/machina/crd/**
-      - deploy/machina/07-bootstrapper-rbac.yaml
+      - deploy/machina/*.yaml.tmpl
       - go.mod
       - go.sum
       - .github/workflows/agent-e2e-kind.yaml
