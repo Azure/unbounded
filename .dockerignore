@@ -32,16 +32,14 @@ frontend/dist/
 coverage.out
 coverage.html
 
-# Documentation and deployment (not needed in build)
+# Documentation and local-only directories (not needed in build)
 docs/
-deploy/
 dev/
 build/
 scripts/
 CHANGELOG.md
 LICENSE
 README.md
-Makefile
 
 # Local env files
 .envrc
