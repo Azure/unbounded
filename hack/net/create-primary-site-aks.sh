@@ -493,13 +493,13 @@ ensure_unmanaged_cloud_node_manager_daemonset
 if [[ "$SKIP_INSTALL" == true ]]; then
     echo "==> --skip-install: skipping unbounded-net installation."
     echo "==> Cluster is ready. Install unbounded-net manually with:"
-    echo "    make deploy"
+    echo "    make -C hack/net deploy"
     exit 0
 fi
 
-echo "==> Running make deploy-crds..."
-(cd "$REPO_ROOT" && make deploy-crds)
+echo "==> Running make -C hack/net deploy-crds..."
+(cd "$REPO_ROOT" && make -C hack/net deploy-crds)
 echo "==> Deploying site resources..."
 ensure_site_gateway_resources "$SITE_NAME" "${SITE_NAME}extgw1"
-echo "==> Running make build deploy..."
-(cd "$REPO_ROOT" && make build deploy)
+echo "==> Running make build && make -C hack/net deploy..."
+(cd "$REPO_ROOT" && make build && make -C hack/net deploy)

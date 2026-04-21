@@ -17,8 +17,8 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/klog/v2"
 
-	"github.com/Azure/unbounded-kube/internal/net/buildinfo"
 	"github.com/Azure/unbounded-kube/internal/net/controller"
+	"github.com/Azure/unbounded-kube/internal/version"
 )
 
 func formatDurationAgo(d time.Duration) string {
@@ -44,7 +44,7 @@ func fetchClusterStatus(ctx context.Context, health *healthState, pullEnabled bo
 		Problems:      []StatusProblem{},
 		PullEnabled:   pullEnabled,
 		AzureTenantID: health.azureTenantID,
-		BuildInfo:     &BuildInfo{Version: buildinfo.Version, Commit: buildinfo.Commit, BuildTime: buildinfo.BuildTime},
+		BuildInfo:     &BuildInfo{Version: version.Version, Commit: version.GitCommit, BuildTime: version.BuildTime},
 	}
 
 	if leaderInfo, err := health.getLeaderInfo(ctx); err == nil {

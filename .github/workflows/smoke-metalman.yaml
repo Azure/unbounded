@@ -12,6 +12,7 @@ on:
       - internal/metalman/**
       - api/v1alpha3/**
       - deploy/machina/**
+      - deploy/net/**
       - hack/smoke-metalman.py
       - hack/kind-smoke-config.yaml
       - images/host-ubuntu2404/**

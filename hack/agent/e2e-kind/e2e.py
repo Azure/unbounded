@@ -522,6 +522,9 @@ def run_agent() -> None:
         env={**os.environ, "GOOS": "linux", "GOARCH": "amd64"})
     log(f"Agent binary built: {agent_bin}")
 
+    log("Rendering manifests for embedded fs...")
+    run(["make", "machina-manifests", "net-render-manifests"], cwd=str(REPO_ROOT))
+
     log("Building kubectl-unbounded...")
     kubectl_unbounded_bin = Path(KUBECTL_UNBOUNDED)
     run(["go", "build", "-o", str(kubectl_unbounded_bin),
@@ -1115,12 +1118,16 @@ def install_machine_crd() -> None:
     """Install the Machine CRD and bootstrapper RBAC."""
 
     crd_path = REPO_ROOT / "deploy" / "machina" / "crd" / "unbounded-kube.io_machines.yaml"
-    rbac_path = REPO_ROOT / "deploy" / "machina" / "07-bootstrapper-rbac.yaml"
+    rbac_path = REPO_ROOT / "deploy" / "machina" / "rendered" / "07-bootstrapper-rbac.yaml"
 
     if not crd_path.exists():
         die(f"Machine CRD not found: {crd_path}")
+
+    log("Rendering machina manifests...")
+    run(["make", "machina-manifests"], cwd=str(REPO_ROOT))
+
     if not rbac_path.exists():
-        die(f"Bootstrapper RBAC not found: {rbac_path}")
+        die(f"Bootstrapper RBAC not found after render: {rbac_path}")
 
     log("Installing Machine CRD...")
     kubectl(["apply", "-f", str(crd_path)])

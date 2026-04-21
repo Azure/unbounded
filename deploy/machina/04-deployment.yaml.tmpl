@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: machina-controller
-  namespace: unbounded-kube
+  namespace: {{ default "unbounded-kube" .Namespace }}
   labels:
     app: machina-controller
 spec:
@@ -35,7 +35,7 @@ spec:
             name: machina-config
       containers:
         - name: machina-controller
-          image: ghcr.io/azure/machina:latest
+          image: {{ default "ghcr.io/azure/machina:latest" .ControllerImage }}
           imagePullPolicy: Always
           args:
             - controller

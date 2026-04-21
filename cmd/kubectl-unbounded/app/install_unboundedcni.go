@@ -10,6 +10,8 @@ import (
 
 	"k8s.io/client-go/kubernetes"
 
+	netdeploy "github.com/Azure/unbounded-kube/deploy/net"
+
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -25,18 +27,24 @@ type installUnboundedCNI struct {
 }
 
 func newInstallUnboundedCNI(fileOrURL string, httpClient *http.Client, logger *slog.Logger, kubeResourcesCli client.Client, kubeCli kubernetes.Interface) *installUnboundedCNI {
-	return &installUnboundedCNI{
-		kubeComponentInstaller: &kubeComponentInstaller{
-			fileOrURL:        fileOrURL,
-			httpClient:       httpClient,
-			logger:           logger,
-			kubeResourcesCli: kubeResourcesCli,
-			kubeCli:          kubeCli,
-			namespace:        unboundedCNINamespace,
-			controllerName:   unboundedCNIControllerName,
-			waitTimeout:      5 * time.Minute,
-			pollInterval:     5 * time.Second,
-			tempPrefix:       "unbounded-net",
-		},
+	inst := &kubeComponentInstaller{
+		fileOrURL:        fileOrURL,
+		httpClient:       httpClient,
+		logger:           logger,
+		kubeResourcesCli: kubeResourcesCli,
+		kubeCli:          kubeCli,
+		namespace:        unboundedCNINamespace,
+		controllerName:   unboundedCNIControllerName,
+		waitTimeout:      5 * time.Minute,
+		pollInterval:     5 * time.Second,
+		tempPrefix:       "unbounded-net",
 	}
+
+	// When no explicit manifests path/URL is provided, fall back to the
+	// manifests embedded in the binary from deploy/net/.
+	if fileOrURL == "" {
+		inst.embeddedFS = netdeploy.Manifests
+	}
+
+	return &installUnboundedCNI{kubeComponentInstaller: inst}
 }

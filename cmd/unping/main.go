@@ -17,8 +17,8 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
-	"github.com/Azure/unbounded-kube/internal/net/buildinfo"
 	pb "github.com/Azure/unbounded-kube/internal/net/healthcheck/proto"
+	"github.com/Azure/unbounded-kube/internal/version"
 
 	flag "github.com/spf13/pflag"
 )
@@ -55,7 +55,7 @@ func main() {
 	flag.Parse()
 
 	if showVersion {
-		fmt.Printf("unping %s (commit %s, built %s)\n", buildinfo.Version, buildinfo.Commit, buildinfo.BuildTime)
+		fmt.Printf("unping %s (commit %s, built %s)\n", version.Version, version.GitCommit, version.BuildTime)
 		os.Exit(0)
 	}
 

@@ -3,14 +3,14 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: machina-controller
-  namespace: unbounded-kube
+  namespace: {{ default "unbounded-kube" .Namespace }}
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: machina-controller
-  namespace: unbounded-kube
+  namespace: {{ default "unbounded-kube" .Namespace }}
 rules:
   - apiGroups: [""]
     resources: ["configmaps"]
@@ -27,11 +27,11 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: machina-controller
-  namespace: unbounded-kube
+  namespace: {{ default "unbounded-kube" .Namespace }}
 subjects:
   - kind: ServiceAccount
     name: machina-controller
-    namespace: unbounded-kube
+    namespace: {{ default "unbounded-kube" .Namespace }}
 roleRef:
   kind: Role
   name: machina-controller
@@ -84,7 +84,7 @@ metadata:
 subjects:
   - kind: ServiceAccount
     name: machina-controller
-    namespace: unbounded-kube
+    namespace: {{ default "unbounded-kube" .Namespace }}
 roleRef:
   kind: ClusterRole
   name: machina-controller

@@ -20,7 +20,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
-	"github.com/Azure/unbounded-kube/internal/net/buildinfo"
+	"github.com/Azure/unbounded-kube/internal/version"
 )
 
 // TestWaitForPodCIDRsAndConfigureImmediate tests WaitForPodCIDRsAndConfigureImmediate.
@@ -453,18 +453,18 @@ func TestAnnotateNodeWithPubKeyAndTaintGatewayNode(t *testing.T) {
 
 // TestNodeAgentBuildInfo tests NodeAgentBuildInfo.
 func TestNodeAgentBuildInfo(t *testing.T) {
-	oldVersion, oldCommit, oldBuildTime := buildinfo.Version, buildinfo.Commit, buildinfo.BuildTime
+	oldVersion, oldCommit, oldBuildTime := version.Version, version.GitCommit, version.BuildTime
 
 	defer func() {
-		buildinfo.Version, buildinfo.Commit, buildinfo.BuildTime = oldVersion, oldCommit, oldBuildTime
+		version.Version, version.GitCommit, version.BuildTime = oldVersion, oldCommit, oldBuildTime
 	}()
 
-	buildinfo.Version = "v-test"
-	buildinfo.Commit = "abc123"
-	buildinfo.BuildTime = "2026-02-20T00:00:00Z"
+	version.Version = "v-test"
+	version.GitCommit = "abc123"
+	version.BuildTime = "2026-02-20T00:00:00Z"
 
 	got := nodeAgentBuildInfo()
-	if got.Version != buildinfo.Version || got.Commit != buildinfo.Commit || got.BuildTime != buildinfo.BuildTime {
+	if got.Version != version.Version || got.Commit != version.GitCommit || got.BuildTime != version.BuildTime {
 		t.Fatalf("unexpected build info: %#v", got)
 	}
 }

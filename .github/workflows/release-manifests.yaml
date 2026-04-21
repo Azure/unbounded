@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-name: unbounded-net release
+name: unbounded manifests release
 
 on:
   workflow_dispatch:
@@ -146,12 +146,13 @@ jobs:
         uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7
         with:
           context: .
-          file: docker/Dockerfile
+          file: images/net-controller/Dockerfile
           target: controller
           platforms: ${{ matrix.platform }}
           build-args: |
             GO_VERSION=${{ steps.goversion.outputs.go_version }}
             VERSION=${{ needs.version.outputs.tag }}
+            GIT_COMMIT=${{ github.sha }}
             CNI_PLUGINS_VERSION=${{ env.CNI_PLUGINS_VERSION }}
           tags: ${{ env.REGISTRY }}/unbounded-net-controller:${{ needs.version.outputs.tag }}-${{ matrix.arch }}
           cache-from: type=gha,scope=build-${{ matrix.arch }}
@@ -163,12 +164,13 @@ jobs:
         uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7
         with:
           context: .
-          file: docker/Dockerfile
+          file: images/net-node/Dockerfile
           target: node
           platforms: ${{ matrix.platform }}
           build-args: |
             GO_VERSION=${{ steps.goversion.outputs.go_version }}
             VERSION=${{ needs.version.outputs.tag }}
+            GIT_COMMIT=${{ github.sha }}
             CNI_PLUGINS_VERSION=${{ env.CNI_PLUGINS_VERSION }}
           tags: ${{ env.REGISTRY }}/unbounded-net-node:${{ needs.version.outputs.tag }}-${{ matrix.arch }}
           cache-from: type=gha,scope=build-${{ matrix.arch }}
@@ -245,28 +247,23 @@ jobs:
           key: ${{ runner.os }}-go-${{ hashFiles('go.mod') }}-release-${{ hashFiles('**/go.sum') }}
           restore-keys: ${{ runner.os }}-go-${{ hashFiles('go.mod') }}-release-
 
-      - name: Render release manifests
+      - name: Build combined release manifests tarball
         run: |
           TAG="${{ needs.version.outputs.tag }}"
-          go run ./hack/cmd/render-manifests \
-            --templates-dir deploy \
-            --output-dir build/manifests \
-            --namespace unbounded-net \
-            --controller-image "${{ env.REGISTRY }}/unbounded-net-controller:${TAG}" \
-            --node-image "${{ env.REGISTRY }}/unbounded-net-node:${TAG}"
-          mkdir -p build/manifests/crds
-          cp deploy/net/crds/*.yaml build/manifests/crds/
-          tar czf "build/unbounded-net-manifests-${TAG}.tar.gz" -C build/manifests .
-
-      - name: Download plugin artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          pattern: plugin-*
-          path: build/kubectl-plugin
-          merge-multiple: true
+          make release-manifests \
+            VERSION="${TAG}" \
+            CONTAINER_REGISTRY="${{ env.REGISTRY }}"
 
       - name: Install cosign
         uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v4
+
+      - name: Sign release manifests tarball with cosign (keyless)
+        run: |
+          TAG="${{ needs.version.outputs.tag }}"
+          ARCHIVE="build/unbounded-manifests-${TAG}.tar.gz"
+          cosign sign-blob --yes \
+            --bundle="${ARCHIVE}.bundle.json" \
+            "${ARCHIVE}"
 
       - name: Generate SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
@@ -292,7 +289,8 @@ jobs:
           body: ${{ needs.version.outputs.changelog }}
           generate_release_notes: ${{ needs.version.outputs.changelog == '' }}
           files: |
-            build/unbounded-net-manifests-*.tar.gz
+            build/unbounded-manifests-*.tar.gz
+            build/unbounded-manifests-*.tar.gz.bundle.json
             sbom.spdx.json
             sbom.spdx.json.sig
             sbom.spdx.json.pem
