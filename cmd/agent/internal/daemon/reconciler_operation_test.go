@@ -158,7 +158,7 @@ func Test_reconcileOperation_ExecutorError(t *testing.T) {
 	assert.NotNil(t, result.Status.CompletedAt)
 }
 
-func Test_reconcileOperation_UnknownOperationName(t *testing.T) {
+func Test_reconcileOperation_UnknownOperationIgnored(t *testing.T) {
 	op := &v1alpha3.MachineOperation{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "op-5",
@@ -179,30 +179,30 @@ func Test_reconcileOperation_UnknownOperationName(t *testing.T) {
 	r := newTestReconciler(c, exec)
 
 	err := r.reconcileOperation(context.Background(), discardLogger(), "op-5")
-	require.Error(t, err)
+	require.NoError(t, err)
 
 	// Executor should not have been called.
 	assert.Empty(t, exec.softRebootCalls)
 
+	// Status should be unchanged - agent ignores operations it does not handle.
 	result := getMachineOperation(t, c, "op-5")
-	assert.Equal(t, v1alpha3.OperationPhaseFailed, result.Status.Phase)
-	assert.Contains(t, result.Status.Message, "unknown operation name")
+	assert.Equal(t, v1alpha3.OperationPhasePending, result.Status.Phase)
 }
 
-func Test_reconcileOperation_HardRebootNotSupported(t *testing.T) {
+func Test_reconcileOperation_HardRebootIgnored(t *testing.T) {
 	op := testMachineOperation("op-6", v1alpha3.OperationHardReboot, v1alpha3.OperationPhasePending)
 	c := operationClient(op)
 	exec := &mockExecutor{}
 	r := newTestReconciler(c, exec)
 
 	err := r.reconcileOperation(context.Background(), discardLogger(), "op-6")
-	require.Error(t, err)
+	require.NoError(t, err)
 
 	assert.Empty(t, exec.softRebootCalls)
 
+	// Status should be unchanged - left for the machina controller.
 	result := getMachineOperation(t, c, "op-6")
-	assert.Equal(t, v1alpha3.OperationPhaseFailed, result.Status.Phase)
-	assert.Contains(t, result.Status.Message, "machina controller")
+	assert.Equal(t, v1alpha3.OperationPhasePending, result.Status.Phase)
 }
 
 func Test_reconcileOperation_SkipsFailed(t *testing.T) {

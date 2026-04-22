@@ -5,6 +5,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -17,6 +18,11 @@ import (
 	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases/nodestart"
 	"github.com/Azure/unbounded-kube/cmd/agent/internal/utilexec"
 )
+
+// errIgnoreOperation is returned by executeOperation when the operation is not
+// handled by the in-VM agent. The reconciler silently skips such operations
+// without updating their status, leaving them for the machina controller.
+var errIgnoreOperation = errors.New("operation not handled by agent")
 
 // reconcileOperation processes a single MachineOperation CR. It reads the
 // MachineOperation, checks if it is in a retriable phase (Pending or
@@ -37,23 +43,18 @@ func (r *reconciler) reconcileOperation(ctx context.Context, log *slog.Logger, o
 
 	log = log.With("op_name", op.Spec.OperationName, "op_phase", op.Status.Phase)
 
-	// Mark InProgress and persist before executing.
+	// Check if the agent handles this operation before touching status.
+	execErr := r.executeOperation(ctx, log, &op)
+	if errors.Is(execErr, errIgnoreOperation) {
+		return nil
+	}
+
+	// Mark InProgress and persist before recording the result.
 	now := metav1.Now()
-	op.Status.Phase = v1alpha3.OperationPhaseInProgress
-	op.Status.Message = ""
 
 	if op.Status.StartedAt == nil {
 		op.Status.StartedAt = &now
 	}
-
-	if err := r.client.Status().Update(ctx, &op); err != nil {
-		return fmt.Errorf("update MachineOperation to InProgress: %w", err)
-	}
-
-	// Execute the operation.
-	log.Info("executing operation")
-
-	execErr := r.executeOperation(ctx, log, &op)
 
 	// Update status based on result.
 	completedAt := metav1.Now()
@@ -106,18 +107,13 @@ func (r *reconciler) executeOperation(ctx context.Context, log *slog.Logger, op 
 		}
 
 		return r.exec.softReboot(ctx, log, active.Name)
-	case v1alpha3.OperationHardReboot:
-		return fmt.Errorf("HardReboot operations are handled by the machina controller, not the agent")
-	case v1alpha3.OperationShutdown:
-		return fmt.Errorf("Shutdown operations are not yet implemented")
-	case v1alpha3.OperationPowerOff:
-		return fmt.Errorf("PowerOff operations are handled by the machina controller, not the agent")
-	case v1alpha3.OperationPowerOn:
-		return fmt.Errorf("PowerOn operations are handled by the machina controller, not the agent")
-	case v1alpha3.OperationRestartService:
-		return fmt.Errorf("RestartService operations are not yet implemented")
 	default:
-		return fmt.Errorf("unknown operation name: %q", op.Spec.OperationName)
+		// Operations not handled by the in-VM agent (e.g. HardReboot,
+		// PowerOff, PowerOn) are silently ignored. They stay in their
+		// current phase for the machina controller or cloud controller
+		// to process.
+		log.Debug("ignoring operation not handled by agent", "operation", op.Spec.OperationName)
+		return errIgnoreOperation
 	}
 }
 

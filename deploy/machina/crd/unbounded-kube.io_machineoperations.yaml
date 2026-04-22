@@ -72,10 +72,6 @@ spec:
                 enum:
                 - Reboot
                 - HardReboot
-                - Shutdown
-                - PowerOff
-                - PowerOn
-                - RestartService
                 type: string
               parameters:
                 additionalProperties:

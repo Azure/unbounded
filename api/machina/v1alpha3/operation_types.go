@@ -52,7 +52,7 @@ type MachineOperationList struct {
 // OperationName identifies the kind of operation to perform. Predefined
 // operations cover common lifecycle actions; custom operations may be
 // supported by individual cloud controllers.
-// +kubebuilder:validation:Enum=Reboot;HardReboot;Shutdown;PowerOff;PowerOn;RestartService
+// +kubebuilder:validation:Enum=Reboot;HardReboot
 type OperationName string
 
 const (
@@ -66,23 +66,6 @@ const (
 	// via BMC (e.g. Redfish). Handled by the machina controller or cloud
 	// controller.
 	OperationHardReboot OperationName = "HardReboot"
-
-	// OperationShutdown gracefully shuts down the nspawn machine. Handled
-	// by the in-VM agent.
-	OperationShutdown OperationName = "Shutdown"
-
-	// OperationPowerOff powers off the host via BMC. Handled by the
-	// machina controller or cloud controller.
-	OperationPowerOff OperationName = "PowerOff"
-
-	// OperationPowerOn powers on the host via BMC. Handled by the
-	// machina controller or cloud controller.
-	OperationPowerOn OperationName = "PowerOn"
-
-	// OperationRestartService restarts a named service inside the nspawn
-	// machine. The service name should be specified in Parameters.
-	// Handled by the in-VM agent.
-	OperationRestartService OperationName = "RestartService"
 )
 
 // OperationPhase represents the current phase of a MachineOperation.
