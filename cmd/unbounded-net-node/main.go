@@ -24,10 +24,10 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 
-	"github.com/Azure/unbounded-kube/internal/net/buildinfo"
 	configpkg "github.com/Azure/unbounded-kube/internal/net/config"
 	"github.com/Azure/unbounded-kube/internal/net/metrics"
 	unboundednetnetlink "github.com/Azure/unbounded-kube/internal/net/netlink"
+	"github.com/Azure/unbounded-kube/internal/version"
 )
 
 // CNIConfig represents the CNI configuration file structure
@@ -236,7 +236,7 @@ file that sets up pod networking using the bridge plugin with host-local IPAM.
 
 It also generates WireGuard keys for the node and stores them in /etc/wireguard,
 then annotates the node with the public key.`,
-		Version:      buildinfo.Version + " (commit: " + buildinfo.Commit + ")",
+		Version:      version.Version + " (commit: " + version.GitCommit + ")",
 		SilenceUsage: true,
 		PreRunE: func(cmd *cobra.Command, args []string) error {
 			return applyNodeRuntimeConfig(cmd, cfg)
@@ -585,7 +585,7 @@ func applyNodeRuntimeConfig(cmd *cobra.Command, cfg *config) error {
 }
 
 func run(cfg *config) error {
-	klog.Infof("unbounded-net-node version=%s commit=%s built=%s", buildinfo.Version, buildinfo.Commit, buildinfo.BuildTime)
+	klog.Infof("unbounded-net-node version=%s commit=%s built=%s", version.Version, version.GitCommit, version.BuildTime)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

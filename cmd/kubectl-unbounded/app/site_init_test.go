@@ -66,12 +66,12 @@ func TestEnsureUnboundedSite_DefaultTemplates(t *testing.T) {
 }
 
 // TestSiteInitCommand_DefaultCNIManifests verifies the default --cni-manifests
-// value points to the unbounded-net release when prototype mode is off.
+// value is empty so the embedded manifests are used.
 func TestSiteInitCommand_DefaultCNIManifests(t *testing.T) {
 	cmd := siteInitCommand()
 	f := cmd.Flags().Lookup("cni-manifests")
 	require.NotNil(t, f)
-	require.Equal(t, unboundedCNIRelease, f.DefValue)
+	require.Equal(t, "", f.DefValue)
 }
 
 func TestSiteInitCommand_ManageCniPluginFlag(t *testing.T) {

@@ -3,7 +3,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: machina-config
-  namespace: unbounded-kube
+  namespace: {{ default "unbounded-kube" .Namespace }}
 data:
   config.yaml: |
     # Machina Controller Configuration

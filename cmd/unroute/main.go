@@ -22,7 +22,7 @@ import (
 	"github.com/cilium/ebpf"
 	flag "github.com/spf13/pflag"
 
-	"github.com/Azure/unbounded-kube/internal/net/buildinfo"
+	"github.com/Azure/unbounded-kube/internal/version"
 )
 
 const (
@@ -111,7 +111,7 @@ func main() {
 	flag.Parse()
 
 	if showVersion {
-		fmt.Printf("unroute %s (commit %s, built %s)\n", buildinfo.Version, buildinfo.Commit, buildinfo.BuildTime)
+		fmt.Printf("unroute %s (commit %s, built %s)\n", version.Version, version.GitCommit, version.BuildTime)
 		os.Exit(0)
 	}
 

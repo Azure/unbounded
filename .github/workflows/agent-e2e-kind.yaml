@@ -12,7 +12,11 @@ on:
       - internal/kube/**
       - hack/agent/e2e-kind/**
       - deploy/machina/crd/**
-      - deploy/machina/07-bootstrapper-rbac.yaml
+      - deploy/machina/*.yaml.tmpl
+      - deploy/net/crd/**
+      - deploy/net/*.yaml.tmpl
+      - deploy/net/controller/*.yaml.tmpl
+      - deploy/net/node/*.yaml.tmpl
       - go.mod
       - go.sum
       - .github/workflows/agent-e2e-kind.yaml
@@ -25,7 +29,11 @@ on:
       - internal/kube/**
       - hack/agent/e2e-kind/**
       - deploy/machina/crd/**
-      - deploy/machina/07-bootstrapper-rbac.yaml
+      - deploy/machina/*.yaml.tmpl
+      - deploy/net/crd/**
+      - deploy/net/*.yaml.tmpl
+      - deploy/net/controller/*.yaml.tmpl
+      - deploy/net/node/*.yaml.tmpl
       - go.mod
       - go.sum
       - .github/workflows/agent-e2e-kind.yaml
@@ -154,6 +162,9 @@ jobs:
       - name: Wait for node to become Ready
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose wait-for-node
 
+      - name: Validate kube-proxy on all nodes
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-kube-proxy
+
       - name: Validate Machine CR (self-registered)
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-machine-cr-created
 
@@ -175,6 +186,9 @@ jobs:
 
       - name: Wait for node to become Ready (rejoin)
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose wait-for-node
+
+      - name: Validate kube-proxy on all nodes (rejoin)
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-kube-proxy
 
       - name: Validate Machine CR (rejoin)
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-machine-cr-created

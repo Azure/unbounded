@@ -3,8 +3,30 @@
 
 name: unbounded release
 
+# ---------------------------------------------------------------------------
+# Single, unified release pipeline.
+#
+# Triggers:
+#   workflow_dispatch  - bump latest tag by selected level (patch/minor/major)
+#                         and run the full pipeline against the new tag.
+#   push (tags v*)     - run the pipeline against the pushed tag.
+#
+# Job topology:
+#   version
+#     -> changelog
+#     -> frontend
+#     -> binaries          (GoReleaser; creates draft GitHub release)
+#     -> net-images        (matrix: amd64-native, arm64-native)
+#         -> net-images-manifest (multi-arch tag stitch + sign + SBOM attest)
+#     -> component-images  (matrix: machina, metalman, host-ubuntu2404)
+#     -> manifests-tarball (make release-manifests + cosign sign)
+#     -> finalize          (attach extras + krew manifest; optional publish)
+#
+# All artifacts land on a single GitHub release that defaults to draft.
+# Pass `publish: true` on workflow_dispatch to publish immediately.
+# ---------------------------------------------------------------------------
+
 on:
-  # Automated release via GitHub Actions UI — computes next version from latest tag.
   workflow_dispatch:
     inputs:
       bump:
@@ -21,13 +43,17 @@ on:
         required: false
         type: boolean
         default: false
+      publish:
+        description: "Publish the release immediately (otherwise leave as draft)"
+        required: false
+        type: boolean
+        default: false
       dry_run:
-        description: "Dry run (validate without publishing)"
+        description: "Dry run (build everything, push and sign nothing, no release)"
         required: false
         type: boolean
         default: false
 
-  # Manual release via tag push — skips version computation.
   push:
     tags:
       - "v*"
@@ -41,13 +67,22 @@ permissions:
   # Required for attaching SBOMs and provenance attestations.
   attestations: write
 
-# ---------------------------------------------------------------------------
-# Compute the release version.
-#
-#   workflow_dispatch  →  bump latest tag by selected level (patch/minor/major)
-#   tag push           →  use the pushed tag as-is
-# ---------------------------------------------------------------------------
+# Prevent two release runs on the same ref from racing each other.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io/${{ github.repository_owner }}
+  CNI_PLUGINS_VERSION: v1.9.1
+
 jobs:
+  # ---------------------------------------------------------------------------
+  # Compute the release tag.
+  #
+  #   workflow_dispatch -> bump latest semver tag by the selected level
+  #   tag push          -> use the pushed tag as-is
+  # ---------------------------------------------------------------------------
   version:
     runs-on: ubuntu-latest
     outputs:
@@ -62,16 +97,13 @@ jobs:
         id: version
         run: |
           if [[ "${{ github.event_name }}" == "push" ]]; then
-            # Tag push — use the tag directly.
             TAG="${{ github.ref_name }}"
           else
-            # workflow_dispatch — bump latest semver tag.
             LATEST=$(git tag --list 'v*' --sort=-version:refname | head -n1)
             if [[ -z "$LATEST" ]]; then
               LATEST="v0.0.0"
             fi
 
-            # Strip leading 'v' and split into components.
             SEMVER="${LATEST#v}"
             IFS='.' read -r MAJOR MINOR PATCH <<< "$SEMVER"
 
@@ -84,17 +116,87 @@ jobs:
             TAG="v${MAJOR}.${MINOR}.${PATCH}"
           fi
 
-          # VERSION is the tag without the leading 'v' (used by GoReleaser).
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Tag must be in vX.Y.Z[-suffix] format, got: ${TAG}"
+            exit 1
+          fi
+
           VERSION="${TAG#v}"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Release: ${TAG} (version: ${VERSION})"
 
+      - name: Normalize container registry to lowercase
+        run: echo "REGISTRY=${REGISTRY,,}" >> "$GITHUB_ENV"
+
   # ---------------------------------------------------------------------------
-  # Build binaries with GoReleaser, sign checksums, generate SBOMs,
-  # and upload deploy manifests + krew manifest to the GitHub Release.
+  # Extract the release notes section from CHANGELOG.md if present.
+  # Falls back to GitHub's auto-generated notes when no section is found.
   # ---------------------------------------------------------------------------
-  release:
+  changelog:
+    needs: version
+    runs-on: ubuntu-latest
+    outputs:
+      body: ${{ steps.extract.outputs.body }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Extract changelog for tag
+        id: extract
+        run: |
+          TAG="${{ needs.version.outputs.tag }}"
+          if [[ ! -f CHANGELOG.md ]]; then
+            echo "::notice::No CHANGELOG.md present; will use auto-generated notes."
+            echo "body=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          BODY=$(awk "/^## ${TAG//./\\.}/{found=1; next} /^## v[0-9]/{if(found) exit} found" CHANGELOG.md)
+          if [[ -z "$BODY" ]]; then
+            echo "::warning::No CHANGELOG section found for ${TAG}, using auto-generated notes"
+            echo "body=" >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "body<<CHANGELOG_EOF"
+              echo "$BODY"
+              echo "CHANGELOG_EOF"
+            } >> "$GITHUB_OUTPUT"
+            echo "Extracted changelog for ${TAG}"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Build the React frontend; downstream net-images jobs consume the artifact.
+  # ---------------------------------------------------------------------------
+  frontend:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.0.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend
+        run: npm ci --prefer-offline --no-audit && npm run build
+        working-directory: frontend
+
+      - name: Upload frontend dist
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Create the git tag (workflow_dispatch only) and run GoReleaser.
+  # GoReleaser produces kubectl-unbounded + unbounded-agent archives,
+  # signs the checksums file, generates SBOMs, and creates a DRAFT GitHub
+  # release. Subsequent jobs attach more artifacts to that draft.
+  # ---------------------------------------------------------------------------
+  binaries:
     needs: version
     runs-on: ubuntu-latest
     steps:
@@ -106,12 +208,19 @@ jobs:
         with:
           go-version-file: go.mod
 
-      # Create and push the tag if this is a workflow_dispatch (tag push already has it).
-      - name: Create tag
+      - name: Create tag (workflow_dispatch only)
         if: github.event_name == 'workflow_dispatch'
         run: |
-          git tag "${{ needs.version.outputs.tag }}"
-          git push origin "${{ needs.version.outputs.tag }}"
+          TAG="${{ needs.version.outputs.tag }}"
+          if git rev-parse "${TAG}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists, skipping creation"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag "${TAG}"
+            git push origin "${TAG}"
+            echo "Created and pushed tag ${TAG}"
+          fi
 
       - name: Install cosign
         uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
@@ -122,47 +231,276 @@ jobs:
       - uses: goreleaser/goreleaser-action@ec59f474b9834571250b370d4735c50f8e2d1e29 # v7.0.0
         with:
           version: "~> v2"
-          args: release --clean ${{ inputs.dry_run == true && '--skip=publish' || '' }}
+          args: release --clean ${{ inputs.dry_run == true && '--skip=publish,sign,sbom' || '' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GORELEASER_CURRENT_TAG: ${{ needs.version.outputs.tag }}
 
-      - name: Upload manifests
+      - name: Upload dist artifact for downstream jobs
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: goreleaser-dist
+          path: dist/
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Build, push, sign, and SBOM-attest unbounded-net-controller and
+  # unbounded-net-node images. Native runners per arch (CGO + heavy tdnf
+  # installs make QEMU prohibitively slow). Per-arch tags are stitched into
+  # multi-arch manifests by the net-images-manifest job below.
+  # ---------------------------------------------------------------------------
+  net-images:
+    needs: [version, frontend]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            platform: linux/amd64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Normalize container registry to lowercase
+        run: echo "REGISTRY=${REGISTRY,,}" >> "$GITHUB_ENV"
+
+      - name: Download frontend dist
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          name: frontend-dist
+          path: internal/net/html/dist
+
+      - name: Cache CNI plugins
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: resources
+          key: cni-plugins-${{ matrix.arch }}-${{ env.CNI_PLUGINS_VERSION }}
+
+      - name: Download CNI plugins
+        run: |
+          mkdir -p resources
+          file="resources/cni-plugins-linux-${{ matrix.arch }}-${CNI_PLUGINS_VERSION}.tgz"
+          if [ ! -s "$file" ]; then
+            curl -fsSL \
+              "https://github.com/containernetworking/plugins/releases/download/${CNI_PLUGINS_VERSION}/cni-plugins-linux-${{ matrix.arch }}-${CNI_PLUGINS_VERSION}.tgz" \
+              -o "$file"
+          fi
+
+      - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
+
+      - name: Log in to ghcr.io
+        if: inputs.dry_run != true
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute Go version for Docker
+        id: goversion
+        run: echo "go_version=$(awk '/^go /{split($2,v,"."); print v[1]"."v[2]}' go.mod)" >> "$GITHUB_OUTPUT"
+
+      # Trivy scan on a single-platform load build before pushing.
+      - name: Build controller for scanning
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: images/net-controller/Dockerfile
+          target: controller
+          platforms: ${{ matrix.platform }}
+          load: true
+          push: false
+          build-args: |
+            GO_VERSION=${{ steps.goversion.outputs.go_version }}
+            VERSION=${{ needs.version.outputs.tag }}
+            GIT_COMMIT=${{ github.sha }}
+            CNI_PLUGINS_VERSION=${{ env.CNI_PLUGINS_VERSION }}
+          tags: scan/unbounded-net-controller:${{ needs.version.outputs.tag }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=net-controller-${{ matrix.arch }}
+          cache-to: type=gha,scope=net-controller-${{ matrix.arch }},mode=max
+
+      - name: Scan controller with Trivy
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        with:
+          image-ref: scan/unbounded-net-controller:${{ needs.version.outputs.tag }}-${{ matrix.arch }}
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+
+      - name: Build node for scanning
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: images/net-node/Dockerfile
+          target: node
+          platforms: ${{ matrix.platform }}
+          load: true
+          push: false
+          build-args: |
+            GO_VERSION=${{ steps.goversion.outputs.go_version }}
+            VERSION=${{ needs.version.outputs.tag }}
+            GIT_COMMIT=${{ github.sha }}
+            CNI_PLUGINS_VERSION=${{ env.CNI_PLUGINS_VERSION }}
+          tags: scan/unbounded-net-node:${{ needs.version.outputs.tag }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=net-node-${{ matrix.arch }}
+          cache-to: type=gha,scope=net-node-${{ matrix.arch }},mode=max
+
+      - name: Scan node with Trivy (CRITICAL, gating)
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        with:
+          image-ref: scan/unbounded-net-node:${{ needs.version.outputs.tag }}-${{ matrix.arch }}
+          format: table
+          severity: CRITICAL
+          exit-code: "1"
+
+      # HIGH findings are reported but do not gate the release: net-node bundles
+      # the upstream containernetworking/plugins CNI binaries, whose Go stdlib
+      # CVEs we cannot fix without an upstream rebuild. Keep the scan visible so
+      # regressions surface in the workflow log; promote back to gating once
+      # upstream ships a clean toolchain.
+      - name: Scan node with Trivy (HIGH, report-only)
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        with:
+          image-ref: scan/unbounded-net-node:${{ needs.version.outputs.tag }}-${{ matrix.arch }}
+          format: table
+          severity: HIGH
+          exit-code: "0"
+
+      - name: Push controller image
+        id: push_controller
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: images/net-controller/Dockerfile
+          target: controller
+          platforms: ${{ matrix.platform }}
+          push: ${{ inputs.dry_run != true }}
+          provenance: false
+          build-args: |
+            GO_VERSION=${{ steps.goversion.outputs.go_version }}
+            VERSION=${{ needs.version.outputs.tag }}
+            GIT_COMMIT=${{ github.sha }}
+            CNI_PLUGINS_VERSION=${{ env.CNI_PLUGINS_VERSION }}
+          tags: ${{ env.REGISTRY }}/unbounded-net-controller:${{ needs.version.outputs.tag }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=net-controller-${{ matrix.arch }}
+          cache-to: type=gha,scope=net-controller-${{ matrix.arch }},mode=max
+
+      - name: Push node image
+        id: push_node
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: images/net-node/Dockerfile
+          target: node
+          platforms: ${{ matrix.platform }}
+          push: ${{ inputs.dry_run != true }}
+          provenance: false
+          build-args: |
+            GO_VERSION=${{ steps.goversion.outputs.go_version }}
+            VERSION=${{ needs.version.outputs.tag }}
+            GIT_COMMIT=${{ github.sha }}
+            CNI_PLUGINS_VERSION=${{ env.CNI_PLUGINS_VERSION }}
+          tags: ${{ env.REGISTRY }}/unbounded-net-node:${{ needs.version.outputs.tag }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=net-node-${{ matrix.arch }}
+          cache-to: type=gha,scope=net-node-${{ matrix.arch }},mode=max
+
+      - name: Sign per-arch net images
         if: inputs.dry_run != true
         run: |
+          cosign sign --yes "${{ env.REGISTRY }}/unbounded-net-controller@${{ steps.push_controller.outputs.digest }}"
+          cosign sign --yes "${{ env.REGISTRY }}/unbounded-net-node@${{ steps.push_node.outputs.digest }}"
+
+      - name: Generate and attest controller SBOM
+        if: inputs.dry_run != true
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ env.REGISTRY }}/unbounded-net-controller@${{ steps.push_controller.outputs.digest }}
+          registry-username: ${{ github.actor }}
+          registry-password: ${{ secrets.GITHUB_TOKEN }}
+          format: spdx-json
+          artifact-name: sbom-net-controller-${{ matrix.arch }}.spdx.json
+          output-file: sbom-net-controller-${{ matrix.arch }}.spdx.json
+
+      - name: Attest controller SBOM
+        if: inputs.dry_run != true
+        run: |
+          cosign attest --yes \
+            --predicate sbom-net-controller-${{ matrix.arch }}.spdx.json \
+            --type spdxjson \
+            "${{ env.REGISTRY }}/unbounded-net-controller@${{ steps.push_controller.outputs.digest }}"
+
+      - name: Generate and attest node SBOM
+        if: inputs.dry_run != true
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ env.REGISTRY }}/unbounded-net-node@${{ steps.push_node.outputs.digest }}
+          registry-username: ${{ github.actor }}
+          registry-password: ${{ secrets.GITHUB_TOKEN }}
+          format: spdx-json
+          artifact-name: sbom-net-node-${{ matrix.arch }}.spdx.json
+          output-file: sbom-net-node-${{ matrix.arch }}.spdx.json
+
+      - name: Attest node SBOM
+        if: inputs.dry_run != true
+        run: |
+          cosign attest --yes \
+            --predicate sbom-net-node-${{ matrix.arch }}.spdx.json \
+            --type spdxjson \
+            "${{ env.REGISTRY }}/unbounded-net-node@${{ steps.push_node.outputs.digest }}"
+
+  # ---------------------------------------------------------------------------
+  # Stitch per-arch net image tags into multi-arch manifests for :TAG and
+  # :latest.
+  # ---------------------------------------------------------------------------
+  net-images-manifest:
+    needs: [version, net-images]
+    if: ${{ inputs.dry_run != true }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Normalize container registry to lowercase
+        run: echo "REGISTRY=${REGISTRY,,}" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch manifests
+        run: |
           TAG="${{ needs.version.outputs.tag }}"
-
-          tar -czf dist/deploy.tar.gz deploy/
-          gh release upload "${TAG}" dist/deploy.tar.gz --clobber
-
-          export VERSION="${TAG}"
-          export REPO="Azure/unbounded-kube"
-          export SHA_LINUX_AMD64=$(sha256sum dist/kubectl-unbounded-linux-amd64.tar.gz | awk '{print $1}')
-          export SHA_LINUX_ARM64=$(sha256sum dist/kubectl-unbounded-linux-arm64.tar.gz | awk '{print $1}')
-          export SHA_DARWIN_AMD64=$(sha256sum dist/kubectl-unbounded-darwin-amd64.tar.gz | awk '{print $1}')
-          export SHA_DARWIN_ARM64=$(sha256sum dist/kubectl-unbounded-darwin-arm64.tar.gz | awk '{print $1}')
-          envsubst < hack/krew-manifest.yaml > dist/unbounded.yaml
-          gh release upload "${TAG}" dist/unbounded.yaml --clobber
-
-          # Mark as prerelease if requested.
-          if [[ "${{ inputs.prerelease }}" == "true" ]]; then
-            gh release edit "${TAG}" --prerelease
-          fi
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          for image in controller node; do
+            SRC="${{ env.REGISTRY }}/unbounded-net-${image}"
+            for release_tag in "${TAG}" "latest"; do
+              echo "Creating manifest ${SRC}:${release_tag}..."
+              docker buildx imagetools create \
+                --tag "${SRC}:${release_tag}" \
+                "${SRC}:${TAG}-amd64" \
+                "${SRC}:${TAG}-arm64"
+            done
+          done
 
   # ---------------------------------------------------------------------------
-  # Build, scan, sign, and push multi-arch container images.
-  #
-  # machina and metalman are Trivy-scanned (they contain OS packages).
-  # host-ubuntu2404 is a scratch image with only data files — skip Trivy.
-  # All images are signed with cosign and have SBOMs attested.
+  # Build, scan, push, sign, and SBOM-attest the component images.
+  # machina/metalman cross-compile natively for amd64 and arm64;
+  # host-ubuntu2404 is amd64-only because virt-customize cannot run
+  # under QEMU user-mode emulation.
   # ---------------------------------------------------------------------------
-  images:
+  component-images:
     needs: version
     runs-on: ubuntu-latest
-    env:
-      CONTAINER_REGISTRY: ghcr.io/${{ github.repository_owner }}
     strategy:
       matrix:
         component:
@@ -174,17 +512,15 @@ jobs:
             file: images/metalman/Containerfile
             platforms: linux/amd64,linux/arm64
             trivy: true
-          # host-ubuntu2404 is amd64-only because virt-customize (libguestfs)
-          # cannot run under QEMU user-mode emulation for cross-arch builds.
           - name: host-ubuntu2404
             file: images/host-ubuntu2404/Containerfile
             platforms: linux/amd64
             trivy: false
     steps:
-      - name: Normalize container registry
-        run: echo "CONTAINER_REGISTRY=${CONTAINER_REGISTRY,,}" >> "$GITHUB_ENV"
-
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Normalize container registry to lowercase
+        run: echo "REGISTRY=${REGISTRY,,}" >> "$GITHUB_ENV"
 
       - name: Install cosign
         uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
@@ -196,13 +532,13 @@ jobs:
       - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
 
       - name: Log in to ghcr.io
+        if: inputs.dry_run != true
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Trivy scan on a single-platform local build (only for images with OS packages).
       - name: Build image for scanning
         if: matrix.component.trivy
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
@@ -211,7 +547,9 @@ jobs:
           file: ${{ matrix.component.file }}
           push: false
           load: true
-          build-args: VERSION=${{ needs.version.outputs.tag }}
+          build-args: |
+            VERSION=${{ needs.version.outputs.tag }}
+            GIT_COMMIT=${{ github.sha }}
           tags: scan/${{ matrix.component.name }}:${{ needs.version.outputs.tag }}
 
       - name: Scan with Trivy
@@ -223,7 +561,6 @@ jobs:
           severity: CRITICAL,HIGH
           exit-code: "1"
 
-      # Multi-arch build and push.
       - name: Build and push image
         id: push
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
@@ -232,10 +569,12 @@ jobs:
           file: ${{ matrix.component.file }}
           platforms: ${{ matrix.component.platforms }}
           push: ${{ inputs.dry_run != true }}
-          build-args: VERSION=${{ needs.version.outputs.tag }}
+          build-args: |
+            VERSION=${{ needs.version.outputs.tag }}
+            GIT_COMMIT=${{ github.sha }}
           tags: |
-            ${{ env.CONTAINER_REGISTRY }}/${{ matrix.component.name }}:${{ needs.version.outputs.tag }}
-            ${{ env.CONTAINER_REGISTRY }}/${{ matrix.component.name }}:latest
+            ${{ env.REGISTRY }}/${{ matrix.component.name }}:${{ needs.version.outputs.tag }}
+            ${{ env.REGISTRY }}/${{ matrix.component.name }}:latest
           cache-from: type=gha,scope=${{ matrix.component.name }}
           cache-to: type=gha,scope=${{ matrix.component.name }},mode=max
 
@@ -243,13 +582,13 @@ jobs:
         if: inputs.dry_run != true
         run: |
           cosign sign --yes \
-            "${{ env.CONTAINER_REGISTRY }}/${{ matrix.component.name }}@${{ steps.push.outputs.digest }}"
+            "${{ env.REGISTRY }}/${{ matrix.component.name }}@${{ steps.push.outputs.digest }}"
 
       - name: Generate and attach SBOM
         if: inputs.dry_run != true
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
-          image: ${{ env.CONTAINER_REGISTRY }}/${{ matrix.component.name }}@${{ steps.push.outputs.digest }}
+          image: ${{ env.REGISTRY }}/${{ matrix.component.name }}@${{ steps.push.outputs.digest }}
           registry-username: ${{ github.actor }}
           registry-password: ${{ secrets.GITHUB_TOKEN }}
           format: spdx-json
@@ -262,4 +601,124 @@ jobs:
           cosign attest --yes \
             --predicate sbom-${{ matrix.component.name }}.spdx.json \
             --type spdxjson \
-            "${{ env.CONTAINER_REGISTRY }}/${{ matrix.component.name }}@${{ steps.push.outputs.digest }}"
+            "${{ env.REGISTRY }}/${{ matrix.component.name }}@${{ steps.push.outputs.digest }}"
+
+  # ---------------------------------------------------------------------------
+  # Build the stamped combined machina+net manifests tarball, sign with
+  # cosign, and upload as a workflow artifact for the finalize job.
+  # ---------------------------------------------------------------------------
+  manifests-tarball:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Normalize container registry to lowercase
+        run: echo "REGISTRY=${REGISTRY,,}" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
+
+      - name: Build combined release manifests tarball
+        run: |
+          TAG="${{ needs.version.outputs.tag }}"
+          make release-manifests \
+            VERSION="${TAG}" \
+            CONTAINER_REGISTRY="${{ env.REGISTRY }}"
+
+      - name: Sign manifests tarball with cosign (keyless)
+        if: inputs.dry_run != true
+        run: |
+          TAG="${{ needs.version.outputs.tag }}"
+          ARCHIVE="build/unbounded-manifests-${TAG}.tar.gz"
+          cosign sign-blob --yes \
+            --bundle="${ARCHIVE}.bundle.json" \
+            "${ARCHIVE}"
+
+      - name: Upload manifests artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: manifests-tarball
+          path: build/unbounded-manifests-*
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Attach the manifests tarball + krew manifest to the draft release that
+  # GoReleaser created, set release notes, and optionally flip from draft
+  # to published.
+  # ---------------------------------------------------------------------------
+  finalize:
+    needs:
+      - version
+      - changelog
+      - binaries
+      - net-images-manifest
+      - component-images
+      - manifests-tarball
+    if: ${{ inputs.dry_run != true }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Download goreleaser dist
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          name: goreleaser-dist
+          path: dist/
+
+      - name: Download manifests tarball
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          name: manifests-tarball
+          path: dist/
+
+      - name: Render krew manifest
+        run: |
+          export VERSION="${{ needs.version.outputs.tag }}"
+          export REPO="${{ github.repository }}"
+          export SHA_LINUX_AMD64=$(sha256sum dist/kubectl-unbounded-linux-amd64.tar.gz | awk '{print $1}')
+          export SHA_LINUX_ARM64=$(sha256sum dist/kubectl-unbounded-linux-arm64.tar.gz | awk '{print $1}')
+          export SHA_DARWIN_AMD64=$(sha256sum dist/kubectl-unbounded-darwin-amd64.tar.gz | awk '{print $1}')
+          export SHA_DARWIN_ARM64=$(sha256sum dist/kubectl-unbounded-darwin-arm64.tar.gz | awk '{print $1}')
+          envsubst < hack/krew-manifest.yaml > dist/unbounded.yaml
+
+      - name: Attach extras to release and set notes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.version.outputs.tag }}"
+          # Upload the additional artifacts to the draft release that
+          # GoReleaser created.
+          gh release upload "${TAG}" \
+            dist/unbounded.yaml \
+            dist/unbounded-manifests-*.tar.gz \
+            dist/unbounded-manifests-*.tar.gz.bundle.json \
+            --clobber
+
+          # Apply CHANGELOG-derived release notes if present.
+          NOTES=$(cat <<'EOF'
+          ${{ needs.changelog.outputs.body }}
+          EOF
+          )
+          if [[ -n "${NOTES// /}" ]]; then
+            gh release edit "${TAG}" --notes "${NOTES}"
+          fi
+
+          # Flag prerelease if requested.
+          if [[ "${{ inputs.prerelease }}" == "true" ]]; then
+            gh release edit "${TAG}" --prerelease
+          fi
+
+          # Flip from draft to published when explicitly requested.
+          if [[ "${{ inputs.publish }}" == "true" ]]; then
+            gh release edit "${TAG}" --draft=false
+            echo "Published release ${TAG}"
+          else
+            echo "Release ${TAG} left as draft. Publish via the GitHub UI or 'gh release edit ${TAG} --draft=false'."
+          fi

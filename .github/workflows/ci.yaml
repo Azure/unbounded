@@ -22,7 +22,7 @@ permissions:
 
 env:
   REGISTRY: ghcr.io/${{ github.repository_owner }}
-  CNI_PLUGINS_VERSION: v1.9.0
+  CNI_PLUGINS_VERSION: v1.9.1
 
 jobs:
   # ---------- Frontend ----------
@@ -257,6 +257,7 @@ jobs:
           build-args: |
             GO_VERSION=${{ steps.goversion.outputs.go_version }}
             CNI_PLUGINS_VERSION=${{ env.CNI_PLUGINS_VERSION }}
+            GIT_COMMIT=${{ github.sha }}
           tags: ${{ env.REGISTRY }}/unbounded-net-controller:ci-${{ matrix.arch }}
           cache-from: type=gha,scope=build-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=build-${{ matrix.arch }}
@@ -273,6 +274,7 @@ jobs:
           build-args: |
             GO_VERSION=${{ steps.goversion.outputs.go_version }}
             CNI_PLUGINS_VERSION=${{ env.CNI_PLUGINS_VERSION }}
+            GIT_COMMIT=${{ github.sha }}
           tags: ${{ env.REGISTRY }}/unbounded-net-node:ci-${{ matrix.arch }}
           cache-from: type=gha,scope=build-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=build-${{ matrix.arch }}

@@ -28,7 +28,7 @@ ARG TARGETOS
 ARG TARGETARCH
 
 # Software version args
-ARG CNI_PLUGINS_VERSION=v1.9.0
+ARG CNI_PLUGINS_VERSION=v1.9.1
 
 # Pre-downloaded build assets from repository resources/
 COPY resources/ /resources/
@@ -72,22 +72,29 @@ RUN clang -O2 -g -target bpf \
 # Build both binaries with CGO enabled (required for Microsoft Go FIPS crypto)
 # Cache mounts persist Go module cache and build cache across builds
 # Build cache is per-architecture to avoid conflicts
+ARG VERSION=dev
+ARG GIT_COMMIT=unknown
+ARG BUILD_TIME=unknown
+ENV STAMP_LDFLAGS="-s -w \
+    -X github.com/Azure/unbounded-kube/internal/version.Version=${VERSION} \
+    -X github.com/Azure/unbounded-kube/internal/version.GitCommit=${GIT_COMMIT} \
+    -X github.com/Azure/unbounded-kube/internal/version.BuildTime=${BUILD_TIME}"
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/ms-go-build,id=go-build-${TARGETARCH} \
     CGO_ENABLED=1 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
-    -ldflags="-s -w" \
+    -ldflags="${STAMP_LDFLAGS}" \
     -o /unbounded-net-controller \
     ./cmd/unbounded-net-controller && \
     CGO_ENABLED=1 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
-    -ldflags="-s -w" \
+    -ldflags="${STAMP_LDFLAGS}" \
     -o /unbounded-net-node \
     ./cmd/unbounded-net-node && \
     CGO_ENABLED=1 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
-    -ldflags="-s -w" \
+    -ldflags="${STAMP_LDFLAGS}" \
     -o /unping \
     ./cmd/unping && \
     CGO_ENABLED=1 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
-    -ldflags="-s -w" \
+    -ldflags="${STAMP_LDFLAGS}" \
     -o /unroute \
     ./cmd/unroute
 
@@ -128,10 +135,6 @@ LABEL org.opencontainers.image.licenses="MIT"
 # Create non-root user and set entrypoint (cached, runs under QEMU once)
 RUN groupadd -r controller && useradd -r -g controller controller
 
-# Write version metadata before switching to non-root user
-ARG VERSION=dev
-RUN mkdir -p /etc/unbounded-net && echo "${VERSION}" > /etc/unbounded-net/version
-
 USER controller
 ENTRYPOINT ["/usr/local/bin/unbounded-net-controller"]
 
@@ -166,7 +169,3 @@ COPY --from=builder /usr/local/bin/ntttcp /usr/local/bin/ntttcp
 COPY --from=builder /unbounded-net-node /usr/local/bin/unbounded-net-node
 COPY --from=builder /unping /usr/local/bin/unping
 COPY --from=builder /unroute /usr/local/bin/unroute
-
-# Write version metadata (last layer -- only this changes per release)
-ARG VERSION=dev
-RUN mkdir -p /etc/unbounded-net && echo "${VERSION}" > /etc/unbounded-net/version

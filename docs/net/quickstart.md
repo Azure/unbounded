@@ -10,34 +10,34 @@ multi-site or AKS deployments.
 
 - **Kubernetes cluster** (v1.27+) with WireGuard kernel module support on nodes
 - **kubectl** configured for your cluster
-- **Go toolchain** (if building from source or using `make deploy`)
+- **Go toolchain** (if building from source or using `make -C hack/net deploy`)
 - For **AKS**: Azure CLI (`az`), a subscription with permissions to create
   clusters, node pools, and public IP prefixes
 
 ## Deploying unbounded-net
 
-You can deploy unbounded-net either with `make deploy` (recommended -- handles
+You can deploy unbounded-net either with `make -C hack/net deploy` (recommended -- handles
 template rendering and ordering) or by applying manifests manually.
 
 ### Option A: Deploy with Make (recommended)
 
 ```bash
 # Deploy everything: CRDs, namespace, config, controller, and node agent
-make deploy
+make -C hack/net deploy
 ```
 
 By default this deploys into the `unbounded-net` namespace. Override with:
 
 ```bash
-make deploy NAMESPACE=kube-system
+make -C hack/net deploy NET_NAMESPACE=kube-system
 ```
 
 You can also deploy components individually:
 
 ```bash
-make deploy-crds          # CRDs only
-make deploy-controller    # Controller (includes CRDs, namespace, config)
-make deploy-node          # Node agent (includes CRDs, namespace, config)
+make -C hack/net deploy-crds          # CRDs only
+make -C hack/net deploy-controller    # Controller (includes CRDs, namespace, config)
+make -C hack/net deploy-node          # Node agent (includes CRDs, namespace, config)
 ```
 
 ### Option B: Manual deployment
@@ -48,7 +48,7 @@ resources step by step, follow the order below.
 #### 1. Install CRDs
 
 ```bash
-kubectl apply -f deploy/net/crds/
+kubectl apply -f deploy/net/crd/
 ```
 
 This installs the following CustomResourceDefinitions in the
@@ -74,17 +74,17 @@ kubectl create namespace unbounded-net
 
 #### 3. Deploy controller
 
-The controller manifests are in `deploy/controller/` (as `.yaml.tmpl` templates
-that must be rendered -- see `hack/cmd/render-manifests`). After rendering, apply
-them in order:
+The controller manifests are in `deploy/net/controller/` (as `.yaml.tmpl`
+templates that must be rendered -- see `hack/cmd/render-manifests`). After
+rendering, apply them in order:
 
 ```bash
 # Render templates first
-make render
+make net-manifests
 
 # Then apply rendered manifests
-kubectl apply -f build/manifests/01-configmap.yaml
-kubectl apply -f build/manifests/controller/
+kubectl apply -f deploy/net/rendered/01-configmap.yaml
+kubectl apply -f deploy/net/rendered/controller/
 ```
 
 The controller deployment includes:
@@ -107,10 +107,10 @@ The controller deployment includes:
 
 #### 4. Deploy node agent
 
-The node agent manifests are in `deploy/node/` (also `.yaml.tmpl` templates).
+The node agent manifests are in `deploy/net/node/` (also `.yaml.tmpl` templates).
 
 ```bash
-kubectl apply -f build/manifests/node/
+kubectl apply -f deploy/net/rendered/node/
 ```
 
 The node agent DaemonSet:
@@ -179,7 +179,7 @@ kubectl -n unbounded-net get pods -l app.kubernetes.io/name=unbounded-net-node -
 kubectl get nodes -L net.unbounded-kube.io/site
 ```
 
-If you have the kubectl plugin installed (`make build-plugin`):
+If you have the kubectl plugin installed (`make kubectl-unbounded`):
 
 ```bash
 kubectl unbounded net node list
