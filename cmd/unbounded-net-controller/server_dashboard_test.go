@@ -4,11 +4,25 @@
 package main
 
 import (
+	"errors"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/Azure/unbounded-kube/internal/net/html"
 )
+
+// skipIfFrontendUnbuilt skips the calling test when the embedded frontend
+// has no index.html (i.e. `make net-frontend` has not been run on this
+// tree). Mirrors the precedent in internal/net/html/pages_test.go.
+func skipIfFrontendUnbuilt(t *testing.T) {
+	t.Helper()
+	if _, err := html.ClusterStatusIndex(); errors.Is(err, fs.ErrNotExist) {
+		t.Skip("frontend not built; run `make net-frontend` to enable this test")
+	}
+}
 
 // TestRegisterDashboardHandlers tests RegisterDashboardHandlers.
 func TestRegisterDashboardHandlers(t *testing.T) {
@@ -21,6 +35,8 @@ func TestRegisterDashboardHandlers(t *testing.T) {
 	registerDashboardHandlers(mux, health, b, false, nil, nil, nil)
 
 	t.Run("status page served", func(t *testing.T) {
+		skipIfFrontendUnbuilt(t)
+
 		req := httptest.NewRequest(http.MethodGet, "/status", nil)
 		resp := httptest.NewRecorder()
 		mux.ServeHTTP(resp, req)
@@ -35,6 +51,8 @@ func TestRegisterDashboardHandlers(t *testing.T) {
 	})
 
 	t.Run("status page served with trailing slash", func(t *testing.T) {
+		skipIfFrontendUnbuilt(t)
+
 		req := httptest.NewRequest(http.MethodGet, "/status/", nil)
 		resp := httptest.NewRecorder()
 		mux.ServeHTTP(resp, req)
