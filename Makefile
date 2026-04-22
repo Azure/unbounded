@@ -405,13 +405,14 @@ net-frontend: ## Build the React frontend into $(NET_FRONTEND_DIST_DIR) (cached 
 			npm run build; \
 		fi \
 	); \
-	rm -rf "$(NET_FRONTEND_DIST_DIR)"; \
 	mkdir -p "$(NET_FRONTEND_DIST_DIR)"; \
+	find "$(NET_FRONTEND_DIST_DIR)" -mindepth 1 -not -name .gitignore -delete; \
 	cp -R "$(NET_FRONTEND_DIR)/dist/." "$(NET_FRONTEND_DIST_DIR)/"; \
 	printf '%s\n' "$$frontend_key" > "$(NET_FRONTEND_CACHE_FILE)"
 
 net-frontend-clean: ## Remove frontend node_modules and dist artifacts
-	rm -rf "$(NET_FRONTEND_DIR)/node_modules" "$(NET_FRONTEND_DIR)/dist" "$(NET_FRONTEND_DIST_DIR)"
+	rm -rf "$(NET_FRONTEND_DIR)/node_modules" "$(NET_FRONTEND_DIR)/dist"
+	@find "$(NET_FRONTEND_DIST_DIR)" -mindepth 1 -not -name .gitignore -delete 2>/dev/null || true
 
 ##@ Net eBPF
 
