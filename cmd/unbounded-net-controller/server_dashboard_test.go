@@ -19,6 +19,7 @@ import (
 // tree). Mirrors the precedent in internal/net/html/pages_test.go.
 func skipIfFrontendUnbuilt(t *testing.T) {
 	t.Helper()
+
 	if _, err := html.ClusterStatusIndex(); errors.Is(err, fs.ErrNotExist) {
 		t.Skip("frontend not built; run `make net-frontend` to enable this test")
 	}
