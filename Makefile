@@ -63,6 +63,14 @@ KUBECTL_UNBOUNDED_LDFLAGS=$(STAMP_LDFLAGS) -X github.com/Azure/unbounded-kube/cm
 NET_CONTROLLER_IMAGE ?= $(CONTAINER_REGISTRY)/unbounded-net-controller:$(VERSION)
 NET_NODE_IMAGE       ?= $(CONTAINER_REGISTRY)/unbounded-net-node:$(VERSION)
 
+# CNI plugins version baked into the net-node image. Keep in sync with the
+# defaults in images/net-{node,controller}/Dockerfile and the workflow envs.
+CNI_PLUGINS_VERSION  ?= v1.9.1
+
+# Host architecture for local image builds (amd64 / arm64). Used to pick the
+# right CNI plugins tarball for the current machine.
+HOST_GOARCH := $(shell $(GOCMD) env GOARCH)
+
 # Kubernetes deploy knobs.
 NET_NAMESPACE           ?= unbounded-net
 NET_FORCE_NOT_LEADER    ?= false
@@ -83,7 +91,7 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 REACT_DEV ?= false
 
 .PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge inventory inventory-amd64 inventory-arm64 unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute
-.PHONY: net-frontend net-frontend-clean net-build-ebpf net-render-manifests net-render release-manifests
+.PHONY: net-frontend net-frontend-clean net-build-ebpf net-manifests release-manifests
 .PHONY: image-machina-local image-metalman-local image-net-controller-local image-net-node-local images-local
 
 ##@ General
@@ -140,8 +148,7 @@ help: ## Show this help
 	@echo ""
 	@echo "Net Manifests:"
 	@echo "  machina-manifests           Render machina manifests into deploy/machina/rendered"
-	@echo "  net-render-manifests        Render net manifests into \$$(NET_MANIFEST_RENDERED_DIR)"
-	@echo "  net-render                  Render net manifests and create a versioned tarball"
+	@echo "  net-manifests               Render net manifests into \$$(NET_MANIFEST_RENDERED_DIR)"
 	@echo ""
 	@echo "Net Kubernetes (apply to current kubectl context):"
 	@echo "  See \`make -C hack/net help\` for cluster deploy/undeploy targets."
@@ -231,16 +238,16 @@ fmt: check-deps ## Format all Go source files (gofumpt + wsl_v5 whitespace)
 ifdef CI
 # In CI each job is independent; skip chained prerequisites.
 
-lint: machina-manifests net-render-manifests ## Run golangci-lint
+lint: machina-manifests net-manifests ## Run golangci-lint
 	$(GOLINT) ./...
 
-test: machina-manifests net-render-manifests ## Run all tests with race detector
+test: machina-manifests net-manifests ## Run all tests with race detector
 	$(GOTEST) -race ./...
 
 else
 # Locally, chain targets for convenience: test -> lint -> fmt -> check-deps.
 
-lint: fmt machina-manifests net-render-manifests ## Run golangci-lint (implies fmt)
+lint: fmt machina-manifests net-manifests ## Run golangci-lint (implies fmt)
 	$(GOLINT) ./...
 
 test: lint ## Run all tests (implies lint)
@@ -248,13 +255,13 @@ test: lint ## Run all tests (implies lint)
 
 endif
 
-build: machina-manifests net-render-manifests ## Build all Go packages
+build: machina-manifests net-manifests ## Build all Go packages
 	$(GOBUILD) ./...
 
 generate: install-protoc ## Run go generate for API types (deepcopy, CRDs) and protobuf
 	PATH="$(PROTOC_DIR)/bin:$$PATH" $(GOCMD) generate ./...
 
-vulncheck: machina-manifests net-render-manifests ## Run govulncheck for known vulnerabilities
+vulncheck: machina-manifests net-manifests ## Run govulncheck for known vulnerabilities
 	$(GOCMD) tool govulncheck ./...
 
 gomod: ## Tidy go.mod and go.sum
@@ -262,7 +269,7 @@ gomod: ## Tidy go.mod and go.sum
 
 ##@ Build
 
-kubectl-unbounded-build: machina-manifests net-render-manifests ## Build the kubectl-unbounded binary (no lint/test)
+kubectl-unbounded-build: machina-manifests net-manifests ## Build the kubectl-unbounded binary (no lint/test)
 	$(GOBUILD) -ldflags '$(KUBECTL_UNBOUNDED_LDFLAGS)' -o $(KUBECTL_UNBOUNDED_BIN) $(KUBECTL_UNBOUNDED_CMD)/main.go
 
 kubectl-unbounded: test kubectl-unbounded-build ## Build the kubectl-unbounded plugin (implies test)
@@ -316,6 +323,59 @@ unroute: test ## Build the unroute utility (implies test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(UNROUTE_BIN) $(UNROUTE_CMD)
 
 ##@ Container Images
+#
+# Trivy (image scanning)
+# ----------------------
+# Set TRIVY=1 (or any non-empty value) on the make command line to scan after
+# each image-*-local build, e.g.:
+#     TRIVY=1 make image-net-node-local
+#     TRIVY=1 make images-local
+#
+# Knobs (all overridable on the command line or environment):
+#   TRIVY            Enable scanning when non-empty. Default: unset (no scan).
+#   TRIVY_VERSION    Trivy CLI version. Default: 0.69.3 (matches CI).
+#   TRIVY_SEVERITY   Comma-separated severities. Default: CRITICAL,HIGH.
+#   TRIVY_EXIT_CODE  Exit code on findings. Default: 1 (fail). Set 0 to warn-only.
+#   TRIVY_IMAGE      Override the trivy container image entirely.
+#                    Default: aquasec/trivy:$(TRIVY_VERSION).
+#   TRIVY_CACHE_DIR  Host dir for the trivy DB cache.
+#                    Default: $$HOME/.cache/trivy.
+
+TRIVY            ?=
+TRIVY_VERSION    ?= 0.69.3
+TRIVY_SEVERITY   ?= CRITICAL,HIGH
+TRIVY_EXIT_CODE  ?= 1
+TRIVY_IMAGE      ?= aquasec/trivy:$(TRIVY_VERSION)
+TRIVY_CACHE_DIR  ?= $(HOME)/.cache/trivy
+
+# Single-line shell command; expands to nothing when TRIVY is empty.
+# Usage in a recipe:  $(call trivy-maybe,image:tag)
+#
+# We pipe the image to trivy via `image save` + `--input` so the same
+# recipe works with both docker and podman without needing a daemon
+# socket mounted into the trivy container.
+TRIVY_SCAN_CMD = mkdir -p $(TRIVY_CACHE_DIR) && \
+    tmp=$$(mktemp -t trivy-scan-XXXXXX.tar) && trap 'rm -f $$tmp' EXIT && \
+    $(CONTAINER_ENGINE) image save -o $$tmp $(1) && \
+    $(CONTAINER_ENGINE) run --rm \
+        -v $$tmp:/scan.tar:ro \
+        -v $(TRIVY_CACHE_DIR):/root/.cache/trivy \
+        $(TRIVY_IMAGE) image \
+            --severity $(TRIVY_SEVERITY) \
+            --exit-code $(TRIVY_EXIT_CODE) \
+            --format table \
+            --input /scan.tar
+
+trivy-maybe = $(if $(strip $(TRIVY)),$(TRIVY_SCAN_CMD))
+
+# Pre-fetch CNI plugins tarballs for local image builds.
+# The Dockerfile reads resources/cni-plugins-linux-<arch>-<version>.tgz; this
+# pattern rule fetches it on demand when the file is missing.
+resources/cni-plugins-linux-%-$(CNI_PLUGINS_VERSION).tgz:
+	@mkdir -p resources
+	curl -fsSL \
+		"https://github.com/containernetworking/plugins/releases/download/$(CNI_PLUGINS_VERSION)/cni-plugins-linux-$*-$(CNI_PLUGINS_VERSION).tgz" \
+		-o $@
 
 image-machina-local: ## Build the machina container image locally (single-arch)
 	$(CONTAINER_ENGINE) build \
@@ -324,6 +384,7 @@ image-machina-local: ## Build the machina container image locally (single-arch)
 		--build-arg BUILD_TIME=$(BUILD_TIME) \
 		-t machina:$(VERSION) -t $(MACHINA_IMAGE) \
 		-f ./images/machina/Containerfile .
+	$(call trivy-maybe,$(MACHINA_IMAGE))
 
 # Retained for backwards compatibility with external callers (release pipelines).
 machina-oci: image-machina-local ## Alias for image-machina-local
@@ -358,29 +419,34 @@ image-metalman-local: ## Build the metalman container image locally (single-arch
 		--build-arg BUILD_TIME=$(BUILD_TIME) \
 		-t metalman:$(VERSION) -t $(METALMAN_IMAGE) \
 		-f ./images/metalman/Containerfile .
+	$(call trivy-maybe,$(METALMAN_IMAGE))
 
 metalman-oci: image-metalman-local ## Alias for image-metalman-local
 
 metalman-oci-push: metalman-oci ## Build and push the metalman container image
 	$(CONTAINER_ENGINE) push $(METALMAN_IMAGE)
 
-image-net-controller-local: net-frontend ## Build the unbounded-net-controller image locally (single-arch)
+image-net-controller-local: net-frontend resources/cni-plugins-linux-$(HOST_GOARCH)-$(CNI_PLUGINS_VERSION).tgz ## Build the unbounded-net-controller image locally (single-arch)
 	$(CONTAINER_ENGINE) build \
 		--target controller \
 		--build-arg VERSION=$(VERSION) \
 		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
 		--build-arg BUILD_TIME=$(BUILD_TIME) \
+		--build-arg CNI_PLUGINS_VERSION=$(CNI_PLUGINS_VERSION) \
 		-t $(NET_CONTROLLER_IMAGE) \
 		-f ./images/net-controller/Dockerfile .
+	$(call trivy-maybe,$(NET_CONTROLLER_IMAGE))
 
-image-net-node-local: ## Build the unbounded-net-node image locally (single-arch)
+image-net-node-local: resources/cni-plugins-linux-$(HOST_GOARCH)-$(CNI_PLUGINS_VERSION).tgz ## Build the unbounded-net-node image locally (single-arch)
 	$(CONTAINER_ENGINE) build \
 		--target node \
 		--build-arg VERSION=$(VERSION) \
 		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
 		--build-arg BUILD_TIME=$(BUILD_TIME) \
+		--build-arg CNI_PLUGINS_VERSION=$(CNI_PLUGINS_VERSION) \
 		-t $(NET_NODE_IMAGE) \
 		-f ./images/net-node/Dockerfile .
+	$(call trivy-maybe,$(NET_NODE_IMAGE))
 
 images-local: image-machina-local image-metalman-local image-net-controller-local image-net-node-local ## Build all four container images locally
 
@@ -405,13 +471,14 @@ net-frontend: ## Build the React frontend into $(NET_FRONTEND_DIST_DIR) (cached 
 			npm run build; \
 		fi \
 	); \
-	rm -rf "$(NET_FRONTEND_DIST_DIR)"; \
 	mkdir -p "$(NET_FRONTEND_DIST_DIR)"; \
+	find "$(NET_FRONTEND_DIST_DIR)" -mindepth 1 -not -name .gitignore -delete; \
 	cp -R "$(NET_FRONTEND_DIR)/dist/." "$(NET_FRONTEND_DIST_DIR)/"; \
 	printf '%s\n' "$$frontend_key" > "$(NET_FRONTEND_CACHE_FILE)"
 
 net-frontend-clean: ## Remove frontend node_modules and dist artifacts
-	rm -rf "$(NET_FRONTEND_DIR)/node_modules" "$(NET_FRONTEND_DIR)/dist" "$(NET_FRONTEND_DIST_DIR)"
+	rm -rf "$(NET_FRONTEND_DIR)/node_modules" "$(NET_FRONTEND_DIR)/dist"
+	@find "$(NET_FRONTEND_DIST_DIR)" -mindepth 1 -not -name .gitignore -delete 2>/dev/null || true
 
 ##@ Net eBPF
 
@@ -425,7 +492,7 @@ net-build-ebpf: ## Compile bpf/unbounded_encap.c to internal/net/ebpf/unbounded_
 
 ##@ Net Manifests
 
-net-render-manifests: ## Render net manifests into $(NET_MANIFEST_RENDERED_DIR)
+net-manifests: ## Render net manifests into $(NET_MANIFEST_RENDERED_DIR)
 	@rm -rf $(NET_MANIFEST_RENDERED_DIR)
 	@mkdir -p $(NET_MANIFEST_RENDERED_DIR)/crd
 	$(GOCMD) run ./hack/cmd/render-manifests \
@@ -440,17 +507,12 @@ net-render-manifests: ## Render net manifests into $(NET_MANIFEST_RENDERED_DIR)
 	@cp $(NET_CRD_DIR)/*.yaml $(NET_MANIFEST_RENDERED_DIR)/crd/
 	@echo "Rendered net manifests into $(NET_MANIFEST_RENDERED_DIR) (controller: $(NET_CONTROLLER_IMAGE), node: $(NET_NODE_IMAGE))"
 
-net-render: net-render-manifests ## Render net manifests and create a versioned tarball under build/
-	@mkdir -p build
-	tar czf "build/unbounded-net-manifests-$(VERSION).tar.gz" -C $(NET_MANIFEST_RENDERED_DIR) .
-	@echo "Rendered manifests archive: build/unbounded-net-manifests-$(VERSION).tar.gz"
-
 ##@ Release Manifests
 
 RELEASE_MANIFESTS_STAGE_DIR := build/release-manifests
 RELEASE_MANIFESTS_NAME      := unbounded-manifests-$(VERSION)
 
-release-manifests: machina-manifests net-render-manifests ## Build stamped combined machina+net manifest tarball under build/
+release-manifests: machina-manifests net-manifests ## Build stamped combined machina+net manifest tarball under build/
 	@rm -rf $(RELEASE_MANIFESTS_STAGE_DIR)
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machina
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/net

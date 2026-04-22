@@ -1,5 +1,13 @@
 version: 2
 
+before:
+  hooks:
+    # Render manifests once before any builds. These targets are not safe
+    # to run in parallel (they rm -rf shared output directories), and
+    # goreleaser fans builds out across goos/goarch concurrently.
+    - make machina-manifests VERSION={{ .Tag }}
+    - make net-manifests VERSION={{ .Tag }}
+
 builds:
   - id: kubectl-unbounded
     main: ./cmd/kubectl-unbounded
@@ -12,10 +20,6 @@ builds:
       - -X github.com/Azure/unbounded-kube/internal/version.GitCommit={{ .ShortCommit }}
       - -X github.com/Azure/unbounded-kube/internal/version.BuildTime={{ .Date }}
       - -X github.com/Azure/unbounded-kube/cmd/kubectl-unbounded/app.MetalmanImage=ghcr.io/azure/metalman:v{{ .Version }}
-    hooks:
-      pre:
-        - make machina-manifests VERSION={{ .Tag }}
-        - make net-render-manifests VERSION={{ .Tag }}
     goos:
       - linux
       - darwin
@@ -58,7 +62,7 @@ checksum:
   name_template: "checksums.txt"
 
 # Sign the checksums file with cosign using keyless (Sigstore OIDC) signing.
-# This ties the signature to the GitHub Actions OIDC identity — no long-lived keys required.
+# This ties the signature to the GitHub Actions OIDC identity - no long-lived keys required.
 # Uses --bundle to produce a Sigstore bundle (.bundle.json) containing the signature,
 # certificate, and transparency log entry in one file.
 signs:
@@ -99,4 +103,8 @@ release:
   github:
     owner: Azure
     name: unbounded-kube
+  # Always create as draft. The release workflow attaches additional
+  # artifacts (manifests tarball, krew manifest, image signatures) before
+  # a human flips the release to published.
+  draft: true
   prerelease: auto

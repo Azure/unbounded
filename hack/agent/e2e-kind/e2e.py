@@ -523,7 +523,7 @@ def run_agent() -> None:
     log(f"Agent binary built: {agent_bin}")
 
     log("Rendering manifests for embedded fs...")
-    run(["make", "machina-manifests", "net-render-manifests"], cwd=str(REPO_ROOT))
+    run(["make", "machina-manifests", "net-manifests"], cwd=str(REPO_ROOT))
 
     log("Building kubectl-unbounded...")
     kubectl_unbounded_bin = Path(KUBECTL_UNBOUNDED)

@@ -26,7 +26,7 @@ unbounded-kube is organized into several directories:
   - `unroute` - eBPF route inspection utility.
 - `deploy/` - component manifests for deploying on a Kubernetes cluster.
   - `machina/` - machina controller manifest templates (*.yaml.tmpl) plus generated CRDs under `crd/`; rendered output lives under `machina/rendered/` (gitignored, produced by `make machina-manifests`).
-  - `net/` - unbounded-net controller and node manifest templates (*.yaml.tmpl); rendered output lives under `net/rendered/` (gitignored, produced by `make net-render-manifests`).
+  - `net/` - unbounded-net controller and node manifest templates (*.yaml.tmpl); rendered output lives under `net/rendered/` (gitignored, produced by `make net-manifests`).
 - `docs/` - documentation for the project.
   - `net/` - unbounded-net specific documentation.
 - `frontend/` - React/TypeScript web UI for network topology visualization (built with Vite).
@@ -47,7 +47,7 @@ unbounded-kube is organized into several directories:
 - To build `metalman` use `make metalman` which runs formatters, lint, tests, and builds the binary.
 - To build `metalman` without lint/test use `make metalman-build` (used in Containerfiles).
 - To build individual net binaries: `make unbounded-net-controller`, `make unbounded-net-node`, `make unbounded-net-routeplan-debug`, `make unping`, `make unroute`.
-- Net-specific build tasks (container images, frontend, eBPF, render) are exposed via `net-` prefixed targets in the main `Makefile` (e.g., `make net-frontend`, `make net-build-ebpf`, `make net-render-manifests`). Cluster deploy/undeploy targets live separately under `hack/net/` and are invoked via `make -C hack/net <target>` (e.g., `make -C hack/net deploy`). Run `make help` and `make -C hack/net help` for the full lists.
+- Net-specific build tasks (container images, frontend, eBPF, render) are exposed via `net-` prefixed targets in the main `Makefile` (e.g., `make net-frontend`, `make net-build-ebpf`, `make net-manifests`). Cluster deploy/undeploy targets live separately under `hack/net/` and are invoked via `make -C hack/net <target>` (e.g., `make -C hack/net deploy`). Run `make help` and `make -C hack/net help` for the full lists.
 - `make generate` runs `go generate ./...` to regenerate deepcopy, CRDs, and protobuf for all packages.
 - `make build` compiles all Go packages (`go build ./...`).
 - `make vulncheck` runs `govulncheck` for known vulnerabilities.

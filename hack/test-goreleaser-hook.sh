@@ -21,7 +21,7 @@ EXPECTED_NET_IMAGE="ghcr.io/azure/unbounded-net-controller:${TAG}"
 # Save the original manifest so we can restore it on exit.
 cleanup() {
     echo "Restoring manifests to default..."
-    make machina-manifests net-render-manifests
+    make machina-manifests net-manifests
     git tag -d "$TAG" 2>/dev/null || true
     echo "Done."
 }
@@ -31,7 +31,7 @@ echo "=== Creating local tag ${TAG} ==="
 git tag "$TAG"
 
 echo "=== Running goreleaser snapshot ==="
-goreleaser release --snapshot --clean
+goreleaser release --snapshot --clean --skip=sign --skip=sbom
 
 echo "=== Checking machina manifest ==="
 actual=$(grep 'image:' "$MANIFEST" | xargs)

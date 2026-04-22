@@ -22,7 +22,7 @@ permissions:
 
 env:
   REGISTRY: ghcr.io/${{ github.repository_owner }}
-  CNI_PLUGINS_VERSION: v1.9.0
+  CNI_PLUGINS_VERSION: v1.9.1
 
 jobs:
   # ---------- Frontend ----------

@@ -11,7 +11,11 @@ import (
 
 // ClusterStatusAssets contains the built frontend assets.
 //
-//go:embed dist/*
+// The all: prefix includes dotfiles so the tracked dist/.gitignore
+// satisfies the embed at compile time even before `make net-frontend`
+// has populated the directory with the real Vite build output.
+//
+//go:embed all:dist
 var ClusterStatusAssets embed.FS
 
 // ClusterStatusFS returns the embedded assets rooted at dist.

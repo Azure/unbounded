@@ -1,6 +1,5 @@
-# Ignore everything in this directory
+# Keep this directory present in the repo as the embed root.
+# `make net-frontend` writes the Vite build output here (index.html,
+# assets/, .frontend-build-key); none of that is tracked.
 *
-
-# Except this file
 !.gitignore
-!index.html

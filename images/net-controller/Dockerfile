@@ -28,7 +28,7 @@ ARG TARGETOS
 ARG TARGETARCH
 
 # Software version args
-ARG CNI_PLUGINS_VERSION=v1.9.0
+ARG CNI_PLUGINS_VERSION=v1.9.1
 
 # Pre-downloaded build assets from repository resources/
 COPY resources/ /resources/

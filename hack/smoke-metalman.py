@@ -683,7 +683,7 @@ def main() -> None:
     # stdout/stderr are inherited so build output streams to the CI log
     # in real-time.
     log("Rendering machina and net manifests")
-    run(["make", "machina-manifests", "net-render-manifests"], cwd=str(REPO_ROOT))
+    run(["make", "machina-manifests", "net-manifests"], cwd=str(REPO_ROOT))
 
     log("Building metalman and kubectl-unbounded (parallel)")
     go_builds: list[tuple[str, subprocess.Popen[Any]]] = [
