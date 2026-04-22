@@ -18,8 +18,8 @@ type stopDaemon struct {
 }
 
 // StopDaemon returns a task that stops, disables, and removes the
-// unbounded-agent-daemon systemd unit. Errors from stop and disable are
-// logged but do not fail the task since the unit may not be present.
+// unbounded-agent-daemon and recovery systemd units. Errors from stop and
+// disable are logged but do not fail the task since the units may not be present.
 func StopDaemon(log *slog.Logger) phases.Task {
 	return &stopDaemon{log: log}
 }
@@ -37,8 +37,13 @@ func (t *stopDaemon) Do(ctx context.Context) error {
 		t.log.Warn("failed to disable daemon (may not be enabled)", "error", err)
 	}
 
-	unitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonUnit)
-	removeFileIfExists(t.log, unitPath)
+	if err := utilexec.RunCmd(ctx, t.log, systemctl, "disable", goalstates.DaemonRecoveryUnit); err != nil {
+		t.log.Warn("failed to disable daemon recovery unit (may not be enabled)", "error", err)
+	}
+
+	for _, unit := range []string{goalstates.DaemonUnit, goalstates.DaemonRecoveryUnit} {
+		removeFileIfExists(t.log, filepath.Join(goalstates.SystemdSystemDir, unit))
+	}
 
 	return nil
 }

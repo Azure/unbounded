@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"path/filepath"
 
+	"github.com/Azure/unbounded-kube/cmd/agent/internal/goalstates"
 	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases"
 )
 
@@ -29,6 +30,11 @@ func (t *removeAgentArtifacts) Do(_ context.Context) error {
 	// Remove known file paths.
 	for _, path := range []string{
 		"/usr/local/bin/unbounded-agent",
+		"/usr/local/bin/unbounded-agent-blue",
+		"/usr/local/bin/unbounded-agent-green",
+		"/usr/local/bin/unbounded-agent-current",
+		"/usr/local/bin/unbounded-agent-last-good",
+		goalstates.DaemonRecoveryPath,
 		"/usr/local/bin/unbounded-agent-install.sh",
 		"/usr/local/bin/unbounded-agent-uninstall.sh",
 	} {

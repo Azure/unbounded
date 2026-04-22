@@ -19,6 +19,12 @@ import (
 //go:embed assets/unbounded-agent-daemon.service
 var daemonServiceContent []byte
 
+//go:embed assets/unbounded-agent-daemon-recovery.service
+var daemonRecoveryServiceContent []byte
+
+//go:embed assets/unbounded-agent-daemon-recovery.sh
+var daemonRecoveryScriptContent []byte
+
 type enableDaemon struct {
 	log *slog.Logger
 }
@@ -35,9 +41,18 @@ func (d *enableDaemon) Name() string { return "enable-daemon" }
 
 func (d *enableDaemon) Do(ctx context.Context) error {
 	unitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonUnit)
+	recoveryUnitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonRecoveryUnit)
 
 	if err := utilio.WriteFile(unitPath, daemonServiceContent, 0o644); err != nil {
 		return fmt.Errorf("writing %s: %w", unitPath, err)
+	}
+
+	if err := utilio.WriteFile(recoveryUnitPath, daemonRecoveryServiceContent, 0o644); err != nil {
+		return fmt.Errorf("writing %s: %w", recoveryUnitPath, err)
+	}
+
+	if err := utilio.WriteFile(goalstates.DaemonRecoveryPath, daemonRecoveryScriptContent, 0o755); err != nil {
+		return fmt.Errorf("writing %s: %w", goalstates.DaemonRecoveryPath, err)
 	}
 
 	systemctl := utilexec.Systemctl()

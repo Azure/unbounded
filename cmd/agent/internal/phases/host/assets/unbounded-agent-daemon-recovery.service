@@ -1,0 +1,9 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[Unit]
+Description=Recover Unbounded Agent Daemon to last known good binary
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/unbounded-agent-daemon-recovery.sh

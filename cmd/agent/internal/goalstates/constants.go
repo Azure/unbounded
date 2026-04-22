@@ -17,7 +17,9 @@ const (
 	SystemdSystemDir = "/etc/systemd/system"
 
 	// DaemonUnit is the systemd unit name for the unbounded-agent daemon.
-	DaemonUnit = "unbounded-agent-daemon.service"
+	DaemonUnit         = "unbounded-agent-daemon.service"
+	DaemonRecoveryUnit = "unbounded-agent-daemon-recovery.service"
+	DaemonRecoveryPath = "/usr/local/bin/unbounded-agent-daemon-recovery.sh"
 )
 
 // NSpawn machine names used for alternating in-place upgrades.

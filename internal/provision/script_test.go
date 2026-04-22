@@ -17,6 +17,11 @@ func TestUnboundedAgentInstallScript(t *testing.T) {
 	require.NotEmpty(t, script)
 	require.Contains(t, script, "#!/bin/bash")
 	require.Contains(t, script, "unbounded-agent")
+	require.Contains(t, script, "unbounded-agent-blue")
+	require.Contains(t, script, "unbounded-agent-green")
+	require.Contains(t, script, "unbounded-agent-current")
+	require.Contains(t, script, "unbounded-agent-last-good")
+	require.Contains(t, script, "ln -sfn")
 }
 
 func TestUnboundedAgentUninstallScript(t *testing.T) {
@@ -40,6 +45,8 @@ func TestUnboundedAgentUninstallScript(t *testing.T) {
 	require.Contains(t, script, "/etc/systemd/nspawn/${MACHINE_NAME}.nspawn")
 	require.Contains(t, script, "/var/lib/machines/${MACHINE_NAME}")
 	require.Contains(t, script, "nftables-flush.service")
+	require.Contains(t, script, "unbounded-agent-daemon-recovery.service")
+	require.Contains(t, script, "unbounded-agent-daemon-recovery.sh")
 	require.Contains(t, script, "99-kubernetes.conf")
 	require.Contains(t, script, "sysctl --system")
 	require.Contains(t, script, "docker.service")
