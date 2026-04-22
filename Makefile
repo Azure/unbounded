@@ -63,6 +63,14 @@ KUBECTL_UNBOUNDED_LDFLAGS=$(STAMP_LDFLAGS) -X github.com/Azure/unbounded-kube/cm
 NET_CONTROLLER_IMAGE ?= $(CONTAINER_REGISTRY)/unbounded-net-controller:$(VERSION)
 NET_NODE_IMAGE       ?= $(CONTAINER_REGISTRY)/unbounded-net-node:$(VERSION)
 
+# CNI plugins version baked into the net-node image. Keep in sync with the
+# defaults in images/net-{node,controller}/Dockerfile and the workflow envs.
+CNI_PLUGINS_VERSION  ?= v1.9.1
+
+# Host architecture for local image builds (amd64 / arm64). Used to pick the
+# right CNI plugins tarball for the current machine.
+HOST_GOARCH := $(shell $(GOCMD) env GOARCH)
+
 # Kubernetes deploy knobs.
 NET_NAMESPACE           ?= unbounded-net
 NET_FORCE_NOT_LEADER    ?= false
@@ -315,6 +323,51 @@ unroute: test ## Build the unroute utility (implies test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(UNROUTE_BIN) $(UNROUTE_CMD)
 
 ##@ Container Images
+#
+# Trivy (image scanning)
+# ----------------------
+# Set TRIVY=1 (or any non-empty value) on the make command line to scan after
+# each image-*-local build, e.g.:
+#     TRIVY=1 make image-net-node-local
+#     TRIVY=1 make images-local
+#
+# Knobs (all overridable on the command line or environment):
+#   TRIVY            Enable scanning when non-empty. Default: unset (no scan).
+#   TRIVY_VERSION    Trivy CLI version. Default: 0.69.3 (matches CI).
+#   TRIVY_SEVERITY   Comma-separated severities. Default: CRITICAL,HIGH.
+#   TRIVY_EXIT_CODE  Exit code on findings. Default: 1 (fail). Set 0 to warn-only.
+#   TRIVY_IMAGE      Override the trivy container image entirely.
+#                    Default: aquasec/trivy:$(TRIVY_VERSION).
+#   TRIVY_CACHE_DIR  Host dir for the trivy DB cache.
+#                    Default: $$HOME/.cache/trivy.
+
+TRIVY            ?=
+TRIVY_VERSION    ?= 0.69.3
+TRIVY_SEVERITY   ?= CRITICAL,HIGH
+TRIVY_EXIT_CODE  ?= 1
+TRIVY_IMAGE      ?= aquasec/trivy:$(TRIVY_VERSION)
+TRIVY_CACHE_DIR  ?= $(HOME)/.cache/trivy
+
+# Single-line shell command; expands to nothing when TRIVY is empty.
+# Usage in a recipe:  $(call trivy-maybe,image:tag)
+TRIVY_SCAN_CMD = mkdir -p $(TRIVY_CACHE_DIR) && $(CONTAINER_ENGINE) run --rm \
+    -v /var/run/docker.sock:/var/run/docker.sock \
+    -v $(TRIVY_CACHE_DIR):/root/.cache/trivy \
+    $(TRIVY_IMAGE) image \
+        --severity $(TRIVY_SEVERITY) \
+        --exit-code $(TRIVY_EXIT_CODE) \
+        --format table
+
+trivy-maybe = $(if $(strip $(TRIVY)),$(TRIVY_SCAN_CMD) $(1))
+
+# Pre-fetch CNI plugins tarballs for local image builds.
+# The Dockerfile reads resources/cni-plugins-linux-<arch>-<version>.tgz; this
+# pattern rule fetches it on demand when the file is missing.
+resources/cni-plugins-linux-%-$(CNI_PLUGINS_VERSION).tgz:
+	@mkdir -p resources
+	curl -fsSL \
+		"https://github.com/containernetworking/plugins/releases/download/$(CNI_PLUGINS_VERSION)/cni-plugins-linux-$*-$(CNI_PLUGINS_VERSION).tgz" \
+		-o $@
 
 image-machina-local: ## Build the machina container image locally (single-arch)
 	$(CONTAINER_ENGINE) build \
@@ -323,6 +376,7 @@ image-machina-local: ## Build the machina container image locally (single-arch)
 		--build-arg BUILD_TIME=$(BUILD_TIME) \
 		-t machina:$(VERSION) -t $(MACHINA_IMAGE) \
 		-f ./images/machina/Containerfile .
+	$(call trivy-maybe,$(MACHINA_IMAGE))
 
 # Retained for backwards compatibility with external callers (release pipelines).
 machina-oci: image-machina-local ## Alias for image-machina-local
@@ -357,29 +411,34 @@ image-metalman-local: ## Build the metalman container image locally (single-arch
 		--build-arg BUILD_TIME=$(BUILD_TIME) \
 		-t metalman:$(VERSION) -t $(METALMAN_IMAGE) \
 		-f ./images/metalman/Containerfile .
+	$(call trivy-maybe,$(METALMAN_IMAGE))
 
 metalman-oci: image-metalman-local ## Alias for image-metalman-local
 
 metalman-oci-push: metalman-oci ## Build and push the metalman container image
 	$(CONTAINER_ENGINE) push $(METALMAN_IMAGE)
 
-image-net-controller-local: net-frontend ## Build the unbounded-net-controller image locally (single-arch)
+image-net-controller-local: net-frontend resources/cni-plugins-linux-$(HOST_GOARCH)-$(CNI_PLUGINS_VERSION).tgz ## Build the unbounded-net-controller image locally (single-arch)
 	$(CONTAINER_ENGINE) build \
 		--target controller \
 		--build-arg VERSION=$(VERSION) \
 		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
 		--build-arg BUILD_TIME=$(BUILD_TIME) \
+		--build-arg CNI_PLUGINS_VERSION=$(CNI_PLUGINS_VERSION) \
 		-t $(NET_CONTROLLER_IMAGE) \
 		-f ./images/net-controller/Dockerfile .
+	$(call trivy-maybe,$(NET_CONTROLLER_IMAGE))
 
-image-net-node-local: ## Build the unbounded-net-node image locally (single-arch)
+image-net-node-local: resources/cni-plugins-linux-$(HOST_GOARCH)-$(CNI_PLUGINS_VERSION).tgz ## Build the unbounded-net-node image locally (single-arch)
 	$(CONTAINER_ENGINE) build \
 		--target node \
 		--build-arg VERSION=$(VERSION) \
 		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
 		--build-arg BUILD_TIME=$(BUILD_TIME) \
+		--build-arg CNI_PLUGINS_VERSION=$(CNI_PLUGINS_VERSION) \
 		-t $(NET_NODE_IMAGE) \
 		-f ./images/net-node/Dockerfile .
+	$(call trivy-maybe,$(NET_NODE_IMAGE))
 
 images-local: image-machina-local image-metalman-local image-net-controller-local image-net-node-local ## Build all four container images locally
 
