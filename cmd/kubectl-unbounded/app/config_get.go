@@ -58,12 +58,12 @@ func runConfigGetAll(ctx context.Context, c client.WithWatch) error {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "NAME\tLATEST VERSION\tSTRATEGY\tPRIORITY\tAGE")
+	_, _ = fmt.Fprintln(w, "NAME\tLATEST VERSION\tSTRATEGY\tPRIORITY\tAGE")
 
 	for i := range list.Items {
 		mc := &list.Items[i]
 		age := formatAge(mc.CreationTimestamp.Time)
-		fmt.Fprintf(w, "%s\t%d\t%s\t%d\t%s\n",
+		_, _ = fmt.Fprintf(w, "%s\t%d\t%s\t%d\t%s\n",
 			mc.Name,
 			mc.Status.LatestVersion,
 			mc.Spec.UpdateStrategy.Type,

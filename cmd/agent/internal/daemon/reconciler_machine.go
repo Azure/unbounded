@@ -128,11 +128,11 @@ func (r *reconciler) reconcileUpdateMachine(ctx context.Context, log *slog.Logge
 func (r *reconciler) resolveMCV(ctx context.Context, log *slog.Logger, machine *v1alpha3.Machine) (*v1alpha3.MachineConfigurationVersion, error) {
 	ref := machine.Spec.ConfigurationRef
 	if ref == nil {
-		return nil, fmt.Errorf("Machine %q has no spec.configurationRef", machine.Name)
+		return nil, fmt.Errorf("machine %q has no spec.configurationRef", machine.Name)
 	}
 
 	if ref.Version == nil {
-		return nil, fmt.Errorf("Machine %q configurationRef has no version set", machine.Name)
+		return nil, fmt.Errorf("machine %q configurationRef has no version set", machine.Name)
 	}
 
 	mcvName := fmt.Sprintf("%s-v%d", ref.Name, *ref.Version)

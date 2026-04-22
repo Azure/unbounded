@@ -53,7 +53,7 @@ func operationClient(objs ...client.Object) client.WithWatch {
 		WithScheme(operationScheme()).
 		WithObjects(objs...).
 		WithStatusSubresource(&v1alpha3.MachineOperation{}).
-		Build().(client.WithWatch)
+		Build()
 }
 
 func testMachineOperation(name string, opName v1alpha3.OperationName, phase v1alpha3.OperationPhase) *v1alpha3.MachineOperation {
