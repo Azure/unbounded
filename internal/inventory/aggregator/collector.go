@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-package inventorycollector
+package aggregator
 
 import (
 	"context"
@@ -45,7 +45,7 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 
 	grpcServer := grpc.NewServer()
-	inventoryv1.RegisterInventoryCollectorServer(grpcServer, NewServer(db))
+	inventoryv1.RegisterInventoryAggregatorServer(grpcServer, NewServer(db))
 
 	// Shut down gracefully when the context is cancelled.
 	go func() {

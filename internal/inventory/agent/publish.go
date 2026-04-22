@@ -22,7 +22,7 @@ func (inv *Inventory) RemoteWriter(ctx context.Context, addr string) error {
 	}
 	defer conn.Close() //nolint:errcheck
 
-	client := inventoryv1.NewInventoryCollectorClient(conn)
+	client := inventoryv1.NewInventoryAggregatorClient(conn)
 
 	req := &inventoryv1.SubmitInventoryRequest{
 		Devices:   toProtoDevices(inv.DeviceRecords),

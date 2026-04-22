@@ -12,15 +12,15 @@ import (
 	"github.com/lib/pq"
 	"github.com/spf13/cobra"
 
-	inventorycollector "github.com/Azure/unbounded-kube/internal/inventory/collector"
+	"github.com/Azure/unbounded-kube/internal/inventory/aggregator"
 )
 
 func main() {
-	config := inventorycollector.Config{}
+	config := aggregator.Config{}
 
 	rootCmd := &cobra.Command{
-		Use:   "inventory-collector",
-		Short: "Collect and store node inventory data",
+		Use:   "inventory-aggregator",
+		Short: "Aggregate and store node inventory data",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			level := slog.LevelInfo
 			if config.Debug {
@@ -42,7 +42,7 @@ func main() {
 				Database:        os.Getenv("POSTGRES_DB_NAME"),
 				User:            os.Getenv("POSTGRES_USER"),
 				Password:        os.Getenv("POSTGRES_PASSWORD"),
-				ApplicationName: "inventory-collector",
+				ApplicationName: "inventory-aggregator",
 				SSLMode:         sslMode,
 			}
 
@@ -55,7 +55,7 @@ func main() {
 				config.DbConn.Port = uint16(port)
 			}
 
-			return inventorycollector.Run(cmd.Context(), config)
+			return aggregator.Run(cmd.Context(), config)
 		},
 	}
 

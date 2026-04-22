@@ -12,10 +12,10 @@ FORGE_CMD=./hack/cmd/forge
 INVENTORY_AGENT_BIN=bin/inventory-agent
 INVENTORY_AGENT_CMD=./cmd/inventory/inventory-agent
 
-INVENTORY_COLLECTOR_BIN=bin/inventory-collector
-INVENTORY_COLLECTOR_CMD=./cmd/inventory/inventory-collector
-INVENTORY_COLLECTOR_TAG ?= latest
-INVENTORY_COLLECTOR_IMAGE=$(CONTAINER_REGISTRY)/inventory-collector:$(INVENTORY_COLLECTOR_TAG)
+INVENTORY_AGGREGATOR_BIN=bin/inventory-aggregator
+INVENTORY_AGGREGATOR_CMD=./cmd/inventory/inventory-aggregator
+INVENTORY_AGGREGATOR_TAG ?= latest
+INVENTORY_AGGREGATOR_IMAGE=$(CONTAINER_REGISTRY)/inventory-aggregator:$(INVENTORY_AGGREGATOR_TAG)
 
 INVENTORY_INSPECTOR_BIN=bin/inventory-inspector
 INVENTORY_INSPECTOR_CMD=./cmd/inventory/inventory-inspector
@@ -317,9 +317,9 @@ inventory-agent-amd64: test ## Build inventory for linux/amd64 (implies test)
 inventory-agent-arm64: test ## Build inventory for linux/arm64 (implies test)
 	GOOS=linux GOARCH=arm64 $(GOBUILD) -o $(INVENTORY_AGENT_BIN)-arm64 $(INVENTORY_AGENT_CMD)/main.go
 
-.PHONY: inventory-collector
-inventory-collector: test ## Build the inventory-collector for linux (implies test)
-	$(GOBUILD) -o $(INVENTORY_COLLECTOR_BIN) $(INVENTORY_COLLECTOR_CMD)/main.go
+.PHONY: inventory-aggregator
+inventory-aggregator: test ## Build the inventory-aggregator for linux (implies test)
+	$(GOBUILD) -o $(INVENTORY_AGGREGATOR_BIN) $(INVENTORY_AGGREGATOR_CMD)/main.go
 
 .PHONY: inventory-inspector
 inventory-inspector: test ## Build the inventory-inspector (implies test)
@@ -414,16 +414,13 @@ resources/cni-plugins-linux-%-$(CNI_PLUGINS_VERSION).tgz:
 		"https://github.com/containernetworking/plugins/releases/download/$(CNI_PLUGINS_VERSION)/cni-plugins-linux-$*-$(CNI_PLUGINS_VERSION).tgz" \
 		-o $@
 
-.PHONY: inventory-oci-all
-inventory-oci-all: inventory-collector-oci inventory-inspector-oci inventory-viewer-oci ## Build all inventory container images
+.PHONY: inventory-aggregator-oci
+inventory-aggregator-oci: ## Build the inventory-aggregator container image
+	$(CONTAINER_ENGINE) build -t inventory-aggregator:$(INVENTORY_AGGREGATOR_TAG) -t $(INVENTORY_AGGREGATOR_IMAGE) -f ./images/inventory/aggregator/Containerfile .
 
-.PHONY: inventory-collector-oci
-inventory-collector-oci: ## Build the inventory-collector container image
-	$(CONTAINER_ENGINE) build -t inventory-collector:$(INVENTORY_COLLECTOR_TAG) -t $(INVENTORY_COLLECTOR_IMAGE) -f ./images/inventory/collector/Containerfile .
-
-.PHONY: inventory-collector-oci-push
-inventory-collector-oci-push: inventory-collector-oci ## Build and push the inventory-collector container image
-	$(CONTAINER_ENGINE) push $(INVENTORY_COLLECTOR_IMAGE)
+.PHONY: inventory-aggregator-oci-push
+inventory-aggregator-oci-push: inventory-aggregator-oci ## Build and push the inventory-aggregator container image
+	$(CONTAINER_ENGINE) push $(INVENTORY_AGGREGATOR_IMAGE)
 
 .PHONY: inventory-inspector-oci
 inventory-inspector-oci: ## Build the inventory-inspector container image

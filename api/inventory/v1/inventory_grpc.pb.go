@@ -19,109 +19,109 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	InventoryCollector_SubmitInventory_FullMethodName = "/inventory.v1.InventoryCollector/SubmitInventory"
+	InventoryAggregator_SubmitInventory_FullMethodName = "/inventory.v1.InventoryAggregator/SubmitInventory"
 )
 
-// InventoryCollectorClient is the client API for InventoryCollector service.
+// InventoryAggregatorClient is the client API for InventoryAggregator service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
-// InventoryCollector accepts inventory data from nodes.
-type InventoryCollectorClient interface {
+// InventoryAggregator accepts inventory data from nodes.
+type InventoryAggregatorClient interface {
 	// SubmitInventory receives a batch of device and neighbor records and
 	// persists them to the database.
 	SubmitInventory(ctx context.Context, in *SubmitInventoryRequest, opts ...grpc.CallOption) (*SubmitInventoryResponse, error)
 }
 
-type inventoryCollectorClient struct {
+type inventoryAggregatorClient struct {
 	cc grpc.ClientConnInterface
 }
 
-func NewInventoryCollectorClient(cc grpc.ClientConnInterface) InventoryCollectorClient {
-	return &inventoryCollectorClient{cc}
+func NewInventoryAggregatorClient(cc grpc.ClientConnInterface) InventoryAggregatorClient {
+	return &inventoryAggregatorClient{cc}
 }
 
-func (c *inventoryCollectorClient) SubmitInventory(ctx context.Context, in *SubmitInventoryRequest, opts ...grpc.CallOption) (*SubmitInventoryResponse, error) {
+func (c *inventoryAggregatorClient) SubmitInventory(ctx context.Context, in *SubmitInventoryRequest, opts ...grpc.CallOption) (*SubmitInventoryResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(SubmitInventoryResponse)
-	err := c.cc.Invoke(ctx, InventoryCollector_SubmitInventory_FullMethodName, in, out, cOpts...)
+	err := c.cc.Invoke(ctx, InventoryAggregator_SubmitInventory_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-// InventoryCollectorServer is the server API for InventoryCollector service.
-// All implementations must embed UnimplementedInventoryCollectorServer
+// InventoryAggregatorServer is the server API for InventoryAggregator service.
+// All implementations must embed UnimplementedInventoryAggregatorServer
 // for forward compatibility.
 //
-// InventoryCollector accepts inventory data from nodes.
-type InventoryCollectorServer interface {
+// InventoryAggregator accepts inventory data from nodes.
+type InventoryAggregatorServer interface {
 	// SubmitInventory receives a batch of device and neighbor records and
 	// persists them to the database.
 	SubmitInventory(context.Context, *SubmitInventoryRequest) (*SubmitInventoryResponse, error)
-	mustEmbedUnimplementedInventoryCollectorServer()
+	mustEmbedUnimplementedInventoryAggregatorServer()
 }
 
-// UnimplementedInventoryCollectorServer must be embedded to have
+// UnimplementedInventoryAggregatorServer must be embedded to have
 // forward compatible implementations.
 //
 // NOTE: this should be embedded by value instead of pointer to avoid a nil
 // pointer dereference when methods are called.
-type UnimplementedInventoryCollectorServer struct{}
+type UnimplementedInventoryAggregatorServer struct{}
 
-func (UnimplementedInventoryCollectorServer) SubmitInventory(context.Context, *SubmitInventoryRequest) (*SubmitInventoryResponse, error) {
+func (UnimplementedInventoryAggregatorServer) SubmitInventory(context.Context, *SubmitInventoryRequest) (*SubmitInventoryResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SubmitInventory not implemented")
 }
-func (UnimplementedInventoryCollectorServer) mustEmbedUnimplementedInventoryCollectorServer() {}
-func (UnimplementedInventoryCollectorServer) testEmbeddedByValue()                            {}
+func (UnimplementedInventoryAggregatorServer) mustEmbedUnimplementedInventoryAggregatorServer() {}
+func (UnimplementedInventoryAggregatorServer) testEmbeddedByValue()                             {}
 
-// UnsafeInventoryCollectorServer may be embedded to opt out of forward compatibility for this service.
-// Use of this interface is not recommended, as added methods to InventoryCollectorServer will
+// UnsafeInventoryAggregatorServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to InventoryAggregatorServer will
 // result in compilation errors.
-type UnsafeInventoryCollectorServer interface {
-	mustEmbedUnimplementedInventoryCollectorServer()
+type UnsafeInventoryAggregatorServer interface {
+	mustEmbedUnimplementedInventoryAggregatorServer()
 }
 
-func RegisterInventoryCollectorServer(s grpc.ServiceRegistrar, srv InventoryCollectorServer) {
-	// If the following call panics, it indicates UnimplementedInventoryCollectorServer was
+func RegisterInventoryAggregatorServer(s grpc.ServiceRegistrar, srv InventoryAggregatorServer) {
+	// If the following call panics, it indicates UnimplementedInventoryAggregatorServer was
 	// embedded by pointer and is nil.  This will cause panics if an
 	// unimplemented method is ever invoked, so we test this at initialization
 	// time to prevent it from happening at runtime later due to I/O.
 	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
 		t.testEmbeddedByValue()
 	}
-	s.RegisterService(&InventoryCollector_ServiceDesc, srv)
+	s.RegisterService(&InventoryAggregator_ServiceDesc, srv)
 }
 
-func _InventoryCollector_SubmitInventory_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _InventoryAggregator_SubmitInventory_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(SubmitInventoryRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(InventoryCollectorServer).SubmitInventory(ctx, in)
+		return srv.(InventoryAggregatorServer).SubmitInventory(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: InventoryCollector_SubmitInventory_FullMethodName,
+		FullMethod: InventoryAggregator_SubmitInventory_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(InventoryCollectorServer).SubmitInventory(ctx, req.(*SubmitInventoryRequest))
+		return srv.(InventoryAggregatorServer).SubmitInventory(ctx, req.(*SubmitInventoryRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
-// InventoryCollector_ServiceDesc is the grpc.ServiceDesc for InventoryCollector service.
+// InventoryAggregator_ServiceDesc is the grpc.ServiceDesc for InventoryAggregator service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
-var InventoryCollector_ServiceDesc = grpc.ServiceDesc{
-	ServiceName: "inventory.v1.InventoryCollector",
-	HandlerType: (*InventoryCollectorServer)(nil),
+var InventoryAggregator_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "inventory.v1.InventoryAggregator",
+	HandlerType: (*InventoryAggregatorServer)(nil),
 	Methods: []grpc.MethodDesc{
 		{
 			MethodName: "SubmitInventory",
-			Handler:    _InventoryCollector_SubmitInventory_Handler,
+			Handler:    _InventoryAggregator_SubmitInventory_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

@@ -293,8 +293,8 @@ const file_api_inventory_v1_inventory_proto_rawDesc = "" +
 	"\tneighbors\x18\x02 \x03(\v2\x1c.inventory.v1.NeighborRecordR\tneighbors\"g\n" +
 	"\x17SubmitInventoryResponse\x12#\n" +
 	"\rdevices_saved\x18\x01 \x01(\x05R\fdevicesSaved\x12'\n" +
-	"\x0fneighbors_saved\x18\x02 \x01(\x05R\x0eneighborsSaved2t\n" +
-	"\x12InventoryCollector\x12^\n" +
+	"\x0fneighbors_saved\x18\x02 \x01(\x05R\x0eneighborsSaved2u\n" +
+	"\x13InventoryAggregator\x12^\n" +
 	"\x0fSubmitInventory\x12$.inventory.v1.SubmitInventoryRequest\x1a%.inventory.v1.SubmitInventoryResponseB>Z<github.com/Azure/unbounded-kube/api/inventory/v1;inventoryv1b\x06proto3"
 
 var (
@@ -319,8 +319,8 @@ var file_api_inventory_v1_inventory_proto_goTypes = []any{
 var file_api_inventory_v1_inventory_proto_depIdxs = []int32{
 	0, // 0: inventory.v1.SubmitInventoryRequest.devices:type_name -> inventory.v1.DeviceRecord
 	1, // 1: inventory.v1.SubmitInventoryRequest.neighbors:type_name -> inventory.v1.NeighborRecord
-	2, // 2: inventory.v1.InventoryCollector.SubmitInventory:input_type -> inventory.v1.SubmitInventoryRequest
-	3, // 3: inventory.v1.InventoryCollector.SubmitInventory:output_type -> inventory.v1.SubmitInventoryResponse
+	2, // 2: inventory.v1.InventoryAggregator.SubmitInventory:input_type -> inventory.v1.SubmitInventoryRequest
+	3, // 3: inventory.v1.InventoryAggregator.SubmitInventory:output_type -> inventory.v1.SubmitInventoryResponse
 	3, // [3:4] is the sub-list for method output_type
 	2, // [2:3] is the sub-list for method input_type
 	2, // [2:2] is the sub-list for extension type_name

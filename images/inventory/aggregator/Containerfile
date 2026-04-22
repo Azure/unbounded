@@ -40,7 +40,7 @@ COPY ../../ .
 
 # VERSION is passed from the release workflow to inject version metadata via ldflags.
 ARG VERSION=dev
-RUN make inventory-collector VERSION=${VERSION}
+RUN make inventory-aggregator VERSION=${VERSION}
 
 # Runtime stage
 FROM mcr.microsoft.com/azurelinux/base/core:3.0@sha256:35149ae8dd179684f969944f54a337c665a64e702486154eb44253fb39c2505b
@@ -54,7 +54,7 @@ RUN tdnf install -y \
 RUN mkdir -p /unbounded/bin
 
 # Copy the built binaries from the builder stage
-COPY --from=builder /src/bin/inventory-collector /unbounded/bin/inventory-collector
+COPY --from=builder /src/bin/inventory-aggregator /unbounded/bin/inventory-aggregator
 
 # Add unbounded bin to PATH
 ENV PATH="/unbounded/bin:${PATH}"
@@ -63,4 +63,4 @@ ENV PATH="/unbounded/bin:${PATH}"
 WORKDIR /unbounded
 
 # Default entrypoint
-ENTRYPOINT ["/unbounded/bin/inventory-collector"]
+ENTRYPOINT ["/unbounded/bin/inventory-aggregator"]

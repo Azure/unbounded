@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-package inventorycollector
+package aggregator
 
 import (
 	"context"
@@ -14,9 +14,9 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// Server implements the InventoryCollector gRPC service.
+// Server implements the InventoryAggregator gRPC service.
 type Server struct {
-	inventoryv1.UnimplementedInventoryCollectorServer
+	inventoryv1.UnimplementedInventoryAggregatorServer
 	db *sql.DB
 }
 

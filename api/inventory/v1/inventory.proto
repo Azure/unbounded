@@ -34,8 +34,8 @@ message SubmitInventoryResponse {
   int32 neighbors_saved = 2;
 }
 
-// InventoryCollector accepts inventory data from nodes.
-service InventoryCollector {
+// InventoryAggregator accepts inventory data from nodes.
+service InventoryAggregator {
   // SubmitInventory receives a batch of device and neighbor records and
   // persists them to the database.
   rpc SubmitInventory(SubmitInventoryRequest) returns (SubmitInventoryResponse);
