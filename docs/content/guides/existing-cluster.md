@@ -102,7 +102,7 @@ kubectl unbounded site init \
 | Flag | Description |
 |------|-------------|
 | `--kubeconfig` | Path to kubeconfig file |
-| `--cni-manifests` | Path or URL to CNI manifests (defaults to a known release) |
+| `--cni-manifests` | Path or URL to CNI manifests (uses embedded manifests if omitted) |
 | `--machina-manifests` | Path or URL to machina manifests (uses embedded manifests if omitted) |
 | `--manage-cni-plugin` | Set to `false` when the cluster already has a CNI (default: `true`) |
 

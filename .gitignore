@@ -89,6 +89,8 @@ __pycache__/
 
 # Rendered templates
 hack/net/templates/*.json
+deploy/net/rendered/
+deploy/machina/rendered/
 
 # Temporary files
 *.tmp

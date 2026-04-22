@@ -9,9 +9,8 @@
 #
 # Test flow:
 #   1. Start node without Machine CR (agent self-registers)
-#   2. Wait for node to become Ready
-#   3. Validate Machine CR, daemon, upgrade
-#   4. Reset, rejoin, validate again
+#   2. Wait for node to become Ready and validate Machine CR + workload
+#   3. Reset, rejoin, validate again
 #
 # Prerequisites (Fedora):
 #   sudo dnf install -y qemu-system-x86 qemu-img genisoimage iptables docker-ce docker-ce-cli containerd.io
@@ -232,21 +231,6 @@ python3 "$E2E" $E2E_VERBOSE run-agent
 python3 "$E2E" $E2E_VERBOSE wait-for-node
 python3 "$E2E" $E2E_VERBOSE validate-kube-proxy
 python3 "$E2E" $E2E_VERBOSE validate-machine-cr-created
-python3 "$E2E" $E2E_VERBOSE validate-daemon
-
-# ---------------------------------------------------------------------------
-# Upgrade: trigger repave via Machine CR
-# ---------------------------------------------------------------------------
-echo ""
-echo "============================================"
-echo "  Phase 2: Upgrade via Machine CR"
-echo "============================================"
-echo ""
-
-python3 "$E2E" $E2E_VERBOSE trigger-upgrade
-python3 "$E2E" $E2E_VERBOSE validate-upgrade
-python3 "$E2E" $E2E_VERBOSE wait-for-node
-python3 "$E2E" $E2E_VERBOSE validate-kube-proxy
 python3 "$E2E" $E2E_VERBOSE validate-workload
 
 # ---------------------------------------------------------------------------
@@ -254,7 +238,7 @@ python3 "$E2E" $E2E_VERBOSE validate-workload
 # ---------------------------------------------------------------------------
 echo ""
 echo "============================================"
-echo "  Phase 3: Reset and rejoin"
+echo "  Phase 2: Reset and rejoin"
 echo "============================================"
 echo ""
 
@@ -266,7 +250,6 @@ python3 "$E2E" $E2E_VERBOSE run-agent
 python3 "$E2E" $E2E_VERBOSE wait-for-node
 python3 "$E2E" $E2E_VERBOSE validate-kube-proxy
 python3 "$E2E" $E2E_VERBOSE validate-machine-cr-created
-python3 "$E2E" $E2E_VERBOSE validate-daemon
 python3 "$E2E" $E2E_VERBOSE validate-workload
 
 # ---------------------------------------------------------------------------

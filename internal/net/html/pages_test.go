@@ -4,6 +4,7 @@
 package html
 
 import (
+	"errors"
 	"io/fs"
 	"testing"
 )
@@ -16,6 +17,10 @@ func TestClusterStatusFS(t *testing.T) {
 	}
 
 	content, err := fs.ReadFile(assetsFS, "index.html")
+	if errors.Is(err, fs.ErrNotExist) {
+		t.Skip("frontend not built; run `make net-frontend` to enable this test")
+	}
+
 	if err != nil {
 		t.Fatalf("read index.html from embedded fs: %v", err)
 	}
@@ -28,6 +33,10 @@ func TestClusterStatusFS(t *testing.T) {
 // TestClusterStatusIndex tests cluster status index.
 func TestClusterStatusIndex(t *testing.T) {
 	content, err := ClusterStatusIndex()
+	if errors.Is(err, fs.ErrNotExist) {
+		t.Skip("frontend not built; run `make net-frontend` to enable this test")
+	}
+
 	if err != nil {
 		t.Fatalf("ClusterStatusIndex() error = %v", err)
 	}

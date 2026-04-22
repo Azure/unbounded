@@ -43,3 +43,55 @@ detail as possible: steps to reproduce, expected behavior, actual behavior, and 
 - `make metalman` -- build the metalman controller (with format, lint, test)
 - `make machina-build` / `make metalman-build` -- build without lint/test (used in container builds)
 - `make kubectl-unbounded` -- build the kubectl plugin
+
+### Testing the Release Pipeline Locally
+
+Before pushing a tag, you can rehearse the GitHub Actions release workflow on
+your workstation with:
+
+```
+./hack/test-release-local.sh
+```
+
+This mirrors `.github/workflows/release.yaml`: it runs `goreleaser check`,
+builds the frontend, downloads CNI plugins, renders the combined manifest
+tarball, runs `goreleaser release --snapshot` (skipping publish, sign, sbom,
+docker), invokes `hack/test-goreleaser-hook.sh` to assert manifests and
+binaries are stamped with the test tag, and `docker buildx build`s the
+container images.
+
+Useful flags: `--multi-arch` (also build linux/arm64 via QEMU),
+`--include-host` (also build the large host-ubuntu2404 image), `--skip-net`
+(skip net image builds entirely), `--keep-dist` (preserve `dist/` and
+`build/` after the run). Override the snapshot tag with `TAG=...`.
+
+### Scanning Container Images Locally with Trivy
+
+Each `make image-*-local` target accepts an opt-in Trivy scan controlled by the
+`TRIVY` variable. When set to any non-empty value, the recipe scans the image it
+just built using the same severity policy as CI (HIGH/CRITICAL, fail on
+findings).
+
+```
+TRIVY=1 make image-net-node-local
+TRIVY=1 make images-local
+```
+
+The scan runs inside a `aquasec/trivy` container, so no local CLI install is
+required. Works with either `docker` or `podman` as `CONTAINER_ENGINE`: the
+recipe pipes the image into trivy via `image save` + `--input`, so no daemon
+socket needs to be mounted into the scanner container. Knobs (all overridable on the command line or environment):
+
+- `TRIVY` - enable scanning when non-empty. Default: unset (no scan).
+- `TRIVY_VERSION` - Trivy CLI version. Default: `0.69.3` (matches CI).
+- `TRIVY_SEVERITY` - comma-separated severities. Default: `CRITICAL,HIGH`.
+- `TRIVY_EXIT_CODE` - exit code on findings. Default: `1`. Set `0` for
+  warn-only.
+- `TRIVY_IMAGE` - override the trivy container image entirely. Default:
+  `aquasec/trivy:$(TRIVY_VERSION)`.
+- `TRIVY_CACHE_DIR` - host dir for the trivy DB cache. Default:
+  `$HOME/.cache/trivy`.
+
+The net image targets also depend on a pattern rule that auto-fetches the
+pinned CNI plugins tarball into `resources/` if it is missing. Override the
+pinned version with `CNI_PLUGINS_VERSION=v1.9.x`.
