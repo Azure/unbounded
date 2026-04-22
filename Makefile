@@ -152,11 +152,11 @@ help: ## Show this help
 	@echo "  unroute                          Build unroute eBPF inspection utility"
 	@echo ""
 	@echo "Container Images (local, single-arch):"
-	@echo "  image-inventory-aggregator-build Build the inventory-aggregator container image"
+	@echo "  image-inventory-aggregator-local Build a local inventory-aggregator container image"
 	@echo "  image-inventory-aggregator-push  Build and push the inventory-aggregator container image"
-	@echo "  image-inventory-inspector-build  Build the inventory-inspector container image"
+	@echo "  image-inventory-inspector-local  Build a local inventory-inspector container image"
 	@echo "  image-inventory-inspector-push   Build and push the inventory-inspector container image"
-	@echo "  image-inventory-viewer-build     Build the inventory-viewer container image"
+	@echo "  image-inventory-viewer-local     Build a local inventory-viewer container image"
 	@echo "  image-inventory-viewer-push      Build and push the inventory-viewer container image"
 	@echo "  image-machina-local              Build machina image with \$$(CONTAINER_ENGINE)"
 	@echo "  image-metalman-local             Build metalman image"
@@ -423,27 +423,27 @@ resources/cni-plugins-linux-%-$(CNI_PLUGINS_VERSION).tgz:
 		-o $@
 
 .PHONY: image-inventory-aggregator-build
-image-inventory-aggregator-build: ## Build the inventory-aggregator container image
+image-inventory-aggregator-local: ## Build the inventory-aggregator container image
 	$(CONTAINER_ENGINE) build -t inventory-aggregator:$(INVENTORY_AGGREGATOR_TAG) -t $(INVENTORY_AGGREGATOR_IMAGE) -f ./images/inventory/aggregator/Containerfile .
 
 .PHONY: image-inventory-aggregator-push
-image-inventory-aggregator-push: image-inventory-aggregator-build ## Build and push the inventory-aggregator container image
+image-inventory-aggregator-push: image-inventory-aggregator-local ## Build and push the inventory-aggregator container image
 	$(CONTAINER_ENGINE) push $(INVENTORY_AGGREGATOR_IMAGE)
 
 .PHONY: image-inventory-inspector-build
-image-inventory-inspector-build: ## Build the inventory-inspector container image
+image-inventory-inspector-local: ## Build the inventory-inspector container image
 	$(CONTAINER_ENGINE) build -t inventory-inspector:$(INVENTORY_INSPECTOR_TAG) -t $(INVENTORY_INSPECTOR_IMAGE) -f ./images/inventory/inspector/Containerfile .
 
 .PHONY: image-inventory-inspector-push
-image-inventory-inspector-push: image-inventory-inspector-build ## Build and push the inventory-inspector container image
+image-inventory-inspector-push: image-inventory-inspector-local ## Build and push the inventory-inspector container image
 	$(CONTAINER_ENGINE) push $(INVENTORY_INSPECTOR_IMAGE)
 
 .PHONY: image-inventory-viewer-build
-image-inventory-viewer-build: ## Build the inventory-viewer container image
+image-inventory-viewer-local: ## Build the inventory-viewer container image
 	$(CONTAINER_ENGINE) build -t inventory-viewer:$(INVENTORY_VIEWER_TAG) -t $(INVENTORY_VIEWER_IMAGE) -f ./images/inventory/viewer/Containerfile .
 
 .PHONY: image-inventory-viewer-push
-image-inventory-viewer-push: image-inventory-viewer-build ## Build and push the inventory-viewer container image
+image-inventory-viewer-push: image-inventory-viewer-local ## Build and push the inventory-viewer container image
 	$(CONTAINER_ENGINE) push $(INVENTORY_VIEWER_IMAGE)
 
 image-machina-local: ## Build the machina container image locally (single-arch)
