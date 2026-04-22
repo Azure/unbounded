@@ -118,58 +118,70 @@ help: ## Show this help
 	@echo "Usage: make <target> [VAR=value ...]"
 	@echo ""
 	@echo "General:"
-	@echo "  all                         Build all Go binaries (default)"
-	@echo "  help                        Show this help"
-	@echo "  install-tools               Install gofumpt, golangci-lint, protoc-gen-go, controller-gen"
-	@echo "  install-protoc              Download pinned protoc into bin/protoc/"
+	@echo "  all                              Build all Go binaries (default)"
+	@echo "  help                             Show this help"
+	@echo "  install-tools                    Install gofumpt, golangci-lint, protoc-gen-go, controller-gen"
+	@echo "  install-protoc                   Download pinned protoc into bin/protoc/"
 	@echo ""
 	@echo "Development:"
-	@echo "  fmt                         Format Go source (gofumpt + wsl_v5)"
-	@echo "  lint                        Run golangci-lint"
-	@echo "  test                        Run all tests"
-	@echo "  build                       Compile all Go packages"
-	@echo "  generate                    Run go generate (deepcopy, CRDs, protobuf)"
-	@echo "  vulncheck                   Run govulncheck"
-	@echo "  gomod                       go mod tidy"
+	@echo "  fmt                              Format Go source (gofumpt + wsl_v5)"
+	@echo "  lint                             Run golangci-lint"
+	@echo "  test                             Run all tests"
+	@echo "  build                            Compile all Go packages"
+	@echo "  generate                         Run go generate (deepcopy, CRDs, protobuf)"
+	@echo "  vulncheck                        Run govulncheck"
+	@echo "  gomod                            go mod tidy"
 	@echo ""
 	@echo "Build:"
-	@echo "  kubectl-unbounded           Build kubectl-unbounded plugin"
-	@echo "  forge                       Build forge dev tool"
-	@echo "  inventory                   Build inventory for amd64 and arm64"
-	@echo "  unbounded-agent             Build unbounded-agent (linux)"
-	@echo "  machina | machina-build     Build machina controller (with/without lint/test)"
-	@echo "  metalman | metalman-build   Build metalman controller (with/without lint/test)"
-	@echo "  unbounded-net-controller    Build net controller"
-	@echo "  unbounded-net-node          Build net node agent"
-	@echo "  unbounded-net-routeplan-debug  Build net routeplan debug tool"
-	@echo "  unping                      Build unping health-check utility"
-	@echo "  unroute                     Build unroute eBPF inspection utility"
+	@echo "  kubectl-unbounded                Build kubectl-unbounded plugin"
+	@echo "  forge                            Build forge dev tool"
+	@echo "  inventory-all                    Build all inventory components"
+	@echo "  inventory-agent                  Build inventory-agent for amd64 and arm64"
+	@echo "  inventory-agent-amd64            Build inventory-agent for amd64"
+	@echo "  inventory-agent-arm64            Build inventory-agent for arm64"
+	@echo "  inventory-aggregator             Build inventory-aggregator"
+	@echo "  inventory-inspector              Build inventory-inspector"
+	@echo "  inventory-viewer                 Build inventory-viewer"
+	@echo "  unbounded-agent                  Build unbounded-agent (linux)"
+	@echo "  machina | machina-build          Build machina controller (with/without lint/test)"
+	@echo "  metalman | metalman-build        Build metalman controller (with/without lint/test)"
+	@echo "  unbounded-net-controller         Build net controller"
+	@echo "  unbounded-net-node               Build net node agent"
+	@echo "  unbounded-net-routeplan-debug    Build net routeplan debug tool"
+	@echo "  unping                           Build unping health-check utility"
+	@echo "  unroute                          Build unroute eBPF inspection utility"
 	@echo ""
 	@echo "Container Images (local, single-arch):"
-	@echo "  image-machina-local         Build machina image with \$$(CONTAINER_ENGINE)"
-	@echo "  image-metalman-local        Build metalman image"
-	@echo "  image-net-controller-local  Build unbounded-net-controller image"
-	@echo "  image-net-node-local        Build unbounded-net-node image"
-	@echo "  images-local                Build all four images"
-	@echo "  machina-oci-push            Build machina image and push"
-	@echo "  metalman-oci-push           Build metalman image and push"
+	@echo "  image-inventory-aggregator-build Build the inventory-aggregator container image"
+	@echo "  image-inventory-aggregator-push  Build and push the inventory-aggregator container image"
+	@echo "  image-inventory-inspector-build  Build the inventory-inspector container image"
+	@echo "  image-inventory-inspector-push   Build and push the inventory-inspector container image"
+	@echo "  image-inventory-viewer-build     Build the inventory-viewer container image"
+	@echo "  image-inventory-viewer-push      Build and push the inventory-viewer container image"
+	@echo "  image-machina-local              Build machina image with \$$(CONTAINER_ENGINE)"
+	@echo "  image-metalman-local             Build metalman image"
+	@echo "  image-net-controller-local       Build unbounded-net-controller image"
+	@echo "  image-net-node-local             Build unbounded-net-node image"
+	@echo "  images-local                     Build all four images"
+	@echo "  machina-oci-push                 Build machina image and push"
+	@echo "  metalman-oci-push                Build metalman image and push"
 	@echo ""
 	@echo "Net Frontend:"
-	@echo "  net-frontend                Build frontend into \$$(NET_FRONTEND_DIST_DIR) (cached)"
-	@echo "  net-frontend-clean          Remove node_modules and dist artifacts"
+	@echo "  net-frontend                     Build frontend into \$$(NET_FRONTEND_DIST_DIR) (cached)"
+	@echo "  net-frontend-clean               Remove node_modules and dist artifacts"
 	@echo ""
 	@echo "Net eBPF:"
-	@echo "  net-build-ebpf              Compile bpf/unbounded_encap.c (requires clang)"
+	@echo "  net-build-ebpf                   Compile bpf/unbounded_encap.c (requires clang)"
 	@echo ""
 	@echo "Net Manifests:"
-	@echo "  machina-manifests           Render machina manifests into deploy/machina/rendered"
-	@echo "  net-manifests               Render net manifests into \$$(NET_MANIFEST_RENDERED_DIR)"
+	@echo "  machina-manifests                Render machina manifests into deploy/machina/rendered"
+	@echo "  net-manifests                    Render net manifests into \$$(NET_MANIFEST_RENDERED_DIR)"
 	@echo ""
 	@echo "Net Kubernetes (apply to current kubectl context):"
 	@echo "  See \`make -C hack/net help\` for cluster deploy/undeploy targets."
 	@echo ""
 	@echo "Documentation:"
-	@echo "  docs-serve                  Start local Hugo dev server"
+	@echo "  docs-serve                       Start local Hugo dev server"
 	@echo ""
 	@echo "Common variables (override with VAR=value):"
 	@echo "  VERSION=$(VERSION)"
@@ -410,28 +422,28 @@ resources/cni-plugins-linux-%-$(CNI_PLUGINS_VERSION).tgz:
 		"https://github.com/containernetworking/plugins/releases/download/$(CNI_PLUGINS_VERSION)/cni-plugins-linux-$*-$(CNI_PLUGINS_VERSION).tgz" \
 		-o $@
 
-.PHONY: inventory-aggregator-oci
-inventory-aggregator-oci: ## Build the inventory-aggregator container image
+.PHONY: image-inventory-aggregator-build
+image-inventory-aggregator-build: ## Build the inventory-aggregator container image
 	$(CONTAINER_ENGINE) build -t inventory-aggregator:$(INVENTORY_AGGREGATOR_TAG) -t $(INVENTORY_AGGREGATOR_IMAGE) -f ./images/inventory/aggregator/Containerfile .
 
-.PHONY: inventory-aggregator-oci-push
-inventory-aggregator-oci-push: inventory-aggregator-oci ## Build and push the inventory-aggregator container image
+.PHONY: image-inventory-aggregator-push
+image-inventory-aggregator-push: image-inventory-aggregator-build ## Build and push the inventory-aggregator container image
 	$(CONTAINER_ENGINE) push $(INVENTORY_AGGREGATOR_IMAGE)
 
-.PHONY: inventory-inspector-oci
-inventory-inspector-oci: ## Build the inventory-inspector container image
+.PHONY: image-inventory-inspector-build
+image-inventory-inspector-build: ## Build the inventory-inspector container image
 	$(CONTAINER_ENGINE) build -t inventory-inspector:$(INVENTORY_INSPECTOR_TAG) -t $(INVENTORY_INSPECTOR_IMAGE) -f ./images/inventory/inspector/Containerfile .
 
-.PHONY: inventory-inspector-oci-push
-inventory-inspector-oci-push: inventory-inspector-oci ## Build and push the inventory-inspector container image
+.PHONY: image-inventory-inspector-push
+image-inventory-inspector-push: image-inventory-inspector-build ## Build and push the inventory-inspector container image
 	$(CONTAINER_ENGINE) push $(INVENTORY_INSPECTOR_IMAGE)
 
-.PHONY: inventory-viewer-oci
-inventory-viewer-oci: ## Build the inventory-viewer container image
+.PHONY: image-inventory-viewer-build
+image-inventory-viewer-build: ## Build the inventory-viewer container image
 	$(CONTAINER_ENGINE) build -t inventory-viewer:$(INVENTORY_VIEWER_TAG) -t $(INVENTORY_VIEWER_IMAGE) -f ./images/inventory/viewer/Containerfile .
 
-.PHONY: inventory-viewer-oci-push
-inventory-viewer-oci-push: inventory-viewer-oci ## Build and push the inventory-viewer container image
+.PHONY: image-inventory-viewer-push
+image-inventory-viewer-push: image-inventory-viewer-build ## Build and push the inventory-viewer container image
 	$(CONTAINER_ENGINE) push $(INVENTORY_VIEWER_IMAGE)
 
 image-machina-local: ## Build the machina container image locally (single-arch)
