@@ -78,7 +78,9 @@ TRIVY=1 make images-local
 ```
 
 The scan runs inside a `aquasec/trivy` container, so no local CLI install is
-required. Knobs (all overridable on the command line or environment):
+required. Works with either `docker` or `podman` as `CONTAINER_ENGINE`: the
+recipe pipes the image into trivy via `image save` + `--input`, so no daemon
+socket needs to be mounted into the scanner container. Knobs (all overridable on the command line or environment):
 
 - `TRIVY` - enable scanning when non-empty. Default: unset (no scan).
 - `TRIVY_VERSION` - Trivy CLI version. Default: `0.69.3` (matches CI).

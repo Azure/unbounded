@@ -350,15 +350,23 @@ TRIVY_CACHE_DIR  ?= $(HOME)/.cache/trivy
 
 # Single-line shell command; expands to nothing when TRIVY is empty.
 # Usage in a recipe:  $(call trivy-maybe,image:tag)
-TRIVY_SCAN_CMD = mkdir -p $(TRIVY_CACHE_DIR) && $(CONTAINER_ENGINE) run --rm \
-    -v /var/run/docker.sock:/var/run/docker.sock \
-    -v $(TRIVY_CACHE_DIR):/root/.cache/trivy \
-    $(TRIVY_IMAGE) image \
-        --severity $(TRIVY_SEVERITY) \
-        --exit-code $(TRIVY_EXIT_CODE) \
-        --format table
+#
+# We pipe the image to trivy via `image save` + `--input` so the same
+# recipe works with both docker and podman without needing a daemon
+# socket mounted into the trivy container.
+TRIVY_SCAN_CMD = mkdir -p $(TRIVY_CACHE_DIR) && \
+    tmp=$$(mktemp -t trivy-scan-XXXXXX.tar) && trap 'rm -f $$tmp' EXIT && \
+    $(CONTAINER_ENGINE) image save -o $$tmp $(1) && \
+    $(CONTAINER_ENGINE) run --rm \
+        -v $$tmp:/scan.tar:ro \
+        -v $(TRIVY_CACHE_DIR):/root/.cache/trivy \
+        $(TRIVY_IMAGE) image \
+            --severity $(TRIVY_SEVERITY) \
+            --exit-code $(TRIVY_EXIT_CODE) \
+            --format table \
+            --input /scan.tar
 
-trivy-maybe = $(if $(strip $(TRIVY)),$(TRIVY_SCAN_CMD) $(1))
+trivy-maybe = $(if $(strip $(TRIVY)),$(TRIVY_SCAN_CMD))
 
 # Pre-fetch CNI plugins tarballs for local image builds.
 # The Dockerfile reads resources/cni-plugins-linux-<arch>-<version>.tgz; this
