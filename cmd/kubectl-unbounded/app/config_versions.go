@@ -55,7 +55,10 @@ func runConfigVersions(ctx context.Context, c client.WithWatch, name string) err
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	_, _ = fmt.Fprintln(w, "NAME\tVERSION\tDEPLOYED\tMACHINES\tK8S VERSION\tAGENT IMAGE\tAGE")
+
+	if _, err := fmt.Fprintln(w, "NAME\tVERSION\tDEPLOYED\tMACHINES\tK8S VERSION\tAGENT IMAGE\tAGE"); err != nil {
+		return err
+	}
 
 	for i := range list.Items {
 		mcv := &list.Items[i]
@@ -72,7 +75,8 @@ func runConfigVersions(ctx context.Context, c client.WithWatch, name string) err
 		}
 
 		age := formatAge(mcv.CreationTimestamp.Time)
-		_, _ = fmt.Fprintf(w, "%s\t%d\t%v\t%d\t%s\t%s\t%s\n",
+
+		if _, err := fmt.Fprintf(w, "%s\t%d\t%v\t%d\t%s\t%s\t%s\n",
 			mcv.Name,
 			mcv.Spec.Version,
 			mcv.Status.Deployed,
@@ -80,7 +84,9 @@ func runConfigVersions(ctx context.Context, c client.WithWatch, name string) err
 			k8sVersion,
 			agentImage,
 			age,
-		)
+		); err != nil {
+			return err
+		}
 	}
 
 	return w.Flush()
