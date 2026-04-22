@@ -31,7 +31,7 @@ echo "=== Creating local tag ${TAG} ==="
 git tag "$TAG"
 
 echo "=== Running goreleaser snapshot ==="
-goreleaser release --snapshot --clean
+goreleaser release --snapshot --clean --skip=sign --skip=sbom
 
 echo "=== Checking machina manifest ==="
 actual=$(grep 'image:' "$MANIFEST" | xargs)
