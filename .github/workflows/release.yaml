@@ -354,13 +354,26 @@ jobs:
           cache-from: type=gha,scope=net-node-${{ matrix.arch }}
           cache-to: type=gha,scope=net-node-${{ matrix.arch }},mode=max
 
-      - name: Scan node with Trivy
+      - name: Scan node with Trivy (CRITICAL, gating)
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
         with:
           image-ref: scan/unbounded-net-node:${{ needs.version.outputs.tag }}-${{ matrix.arch }}
           format: table
-          severity: CRITICAL,HIGH
+          severity: CRITICAL
           exit-code: "1"
+
+      # HIGH findings are reported but do not gate the release: net-node bundles
+      # the upstream containernetworking/plugins CNI binaries, whose Go stdlib
+      # CVEs we cannot fix without an upstream rebuild. Keep the scan visible so
+      # regressions surface in the workflow log; promote back to gating once
+      # upstream ships a clean toolchain.
+      - name: Scan node with Trivy (HIGH, report-only)
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        with:
+          image-ref: scan/unbounded-net-node:${{ needs.version.outputs.tag }}-${{ matrix.arch }}
+          format: table
+          severity: HIGH
+          exit-code: "0"
 
       - name: Push controller image
         id: push_controller
