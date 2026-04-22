@@ -18,7 +18,7 @@ name: unbounded release
 #     -> binaries          (GoReleaser; creates draft GitHub release)
 #     -> net-images        (matrix: amd64-native, arm64-native)
 #         -> net-images-manifest (multi-arch tag stitch + sign + SBOM attest)
-#     -> other-images      (matrix: machina, metalman, host-ubuntu2404)
+#     -> component-images  (matrix: machina, metalman, host-ubuntu2404)
 #     -> manifests-tarball (make release-manifests + cosign sign)
 #     -> finalize          (attach extras + krew manifest; optional publish)
 #
@@ -493,11 +493,12 @@ jobs:
           done
 
   # ---------------------------------------------------------------------------
-  # Build, scan, push, sign, and SBOM-attest the remaining component images.
-  # machina/metalman use QEMU multi-arch; host-ubuntu2404 is amd64-only
-  # because virt-customize cannot run under QEMU user-mode emulation.
+  # Build, scan, push, sign, and SBOM-attest the component images.
+  # machina/metalman cross-compile natively for amd64 and arm64;
+  # host-ubuntu2404 is amd64-only because virt-customize cannot run
+  # under QEMU user-mode emulation.
   # ---------------------------------------------------------------------------
-  other-images:
+  component-images:
     needs: version
     runs-on: ubuntu-latest
     strategy:
@@ -658,7 +659,7 @@ jobs:
       - changelog
       - binaries
       - net-images-manifest
-      - other-images
+      - component-images
       - manifests-tarball
     if: ${{ inputs.dry_run != true }}
     runs-on: ubuntu-latest
