@@ -83,7 +83,7 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 REACT_DEV ?= false
 
 .PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge inventory inventory-amd64 inventory-arm64 unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute
-.PHONY: net-frontend net-frontend-clean net-build-ebpf net-render-manifests net-render release-manifests
+.PHONY: net-frontend net-frontend-clean net-build-ebpf net-manifests release-manifests
 .PHONY: image-machina-local image-metalman-local image-net-controller-local image-net-node-local images-local
 
 ##@ General
@@ -140,8 +140,7 @@ help: ## Show this help
 	@echo ""
 	@echo "Net Manifests:"
 	@echo "  machina-manifests           Render machina manifests into deploy/machina/rendered"
-	@echo "  net-render-manifests        Render net manifests into \$$(NET_MANIFEST_RENDERED_DIR)"
-	@echo "  net-render                  Render net manifests and create a versioned tarball"
+	@echo "  net-manifests               Render net manifests into \$$(NET_MANIFEST_RENDERED_DIR)"
 	@echo ""
 	@echo "Net Kubernetes (apply to current kubectl context):"
 	@echo "  See \`make -C hack/net help\` for cluster deploy/undeploy targets."
@@ -231,16 +230,16 @@ fmt: check-deps ## Format all Go source files (gofumpt + wsl_v5 whitespace)
 ifdef CI
 # In CI each job is independent; skip chained prerequisites.
 
-lint: machina-manifests net-render-manifests ## Run golangci-lint
+lint: machina-manifests net-manifests ## Run golangci-lint
 	$(GOLINT) ./...
 
-test: machina-manifests net-render-manifests ## Run all tests with race detector
+test: machina-manifests net-manifests ## Run all tests with race detector
 	$(GOTEST) -race ./...
 
 else
 # Locally, chain targets for convenience: test -> lint -> fmt -> check-deps.
 
-lint: fmt machina-manifests net-render-manifests ## Run golangci-lint (implies fmt)
+lint: fmt machina-manifests net-manifests ## Run golangci-lint (implies fmt)
 	$(GOLINT) ./...
 
 test: lint ## Run all tests (implies lint)
@@ -248,13 +247,13 @@ test: lint ## Run all tests (implies lint)
 
 endif
 
-build: machina-manifests net-render-manifests ## Build all Go packages
+build: machina-manifests net-manifests ## Build all Go packages
 	$(GOBUILD) ./...
 
 generate: install-protoc ## Run go generate for API types (deepcopy, CRDs) and protobuf
 	PATH="$(PROTOC_DIR)/bin:$$PATH" $(GOCMD) generate ./...
 
-vulncheck: machina-manifests net-render-manifests ## Run govulncheck for known vulnerabilities
+vulncheck: machina-manifests net-manifests ## Run govulncheck for known vulnerabilities
 	$(GOCMD) tool govulncheck ./...
 
 gomod: ## Tidy go.mod and go.sum
@@ -262,7 +261,7 @@ gomod: ## Tidy go.mod and go.sum
 
 ##@ Build
 
-kubectl-unbounded-build: machina-manifests net-render-manifests ## Build the kubectl-unbounded binary (no lint/test)
+kubectl-unbounded-build: machina-manifests net-manifests ## Build the kubectl-unbounded binary (no lint/test)
 	$(GOBUILD) -ldflags '$(KUBECTL_UNBOUNDED_LDFLAGS)' -o $(KUBECTL_UNBOUNDED_BIN) $(KUBECTL_UNBOUNDED_CMD)/main.go
 
 kubectl-unbounded: test kubectl-unbounded-build ## Build the kubectl-unbounded plugin (implies test)
@@ -426,7 +425,7 @@ net-build-ebpf: ## Compile bpf/unbounded_encap.c to internal/net/ebpf/unbounded_
 
 ##@ Net Manifests
 
-net-render-manifests: ## Render net manifests into $(NET_MANIFEST_RENDERED_DIR)
+net-manifests: ## Render net manifests into $(NET_MANIFEST_RENDERED_DIR)
 	@rm -rf $(NET_MANIFEST_RENDERED_DIR)
 	@mkdir -p $(NET_MANIFEST_RENDERED_DIR)/crd
 	$(GOCMD) run ./hack/cmd/render-manifests \
@@ -441,17 +440,12 @@ net-render-manifests: ## Render net manifests into $(NET_MANIFEST_RENDERED_DIR)
 	@cp $(NET_CRD_DIR)/*.yaml $(NET_MANIFEST_RENDERED_DIR)/crd/
 	@echo "Rendered net manifests into $(NET_MANIFEST_RENDERED_DIR) (controller: $(NET_CONTROLLER_IMAGE), node: $(NET_NODE_IMAGE))"
 
-net-render: net-render-manifests ## Render net manifests and create a versioned tarball under build/
-	@mkdir -p build
-	tar czf "build/unbounded-net-manifests-$(VERSION).tar.gz" -C $(NET_MANIFEST_RENDERED_DIR) .
-	@echo "Rendered manifests archive: build/unbounded-net-manifests-$(VERSION).tar.gz"
-
 ##@ Release Manifests
 
 RELEASE_MANIFESTS_STAGE_DIR := build/release-manifests
 RELEASE_MANIFESTS_NAME      := unbounded-manifests-$(VERSION)
 
-release-manifests: machina-manifests net-render-manifests ## Build stamped combined machina+net manifest tarball under build/
+release-manifests: machina-manifests net-manifests ## Build stamped combined machina+net manifest tarball under build/
 	@rm -rf $(RELEASE_MANIFESTS_STAGE_DIR)
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machina
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/net

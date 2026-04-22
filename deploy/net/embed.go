@@ -5,7 +5,7 @@
 // manifests so they can be bundled into binaries that need to apply them
 // (e.g. the kubectl plugin). The sources of truth are the *.yaml.tmpl files
 // in this directory and the controller-gen generated CRDs under crd/; the
-// rendered tree under rendered/ is produced by `make net-render-manifests`
+// rendered tree under rendered/ is produced by `make net-manifests`
 // and is gitignored.
 package net
 

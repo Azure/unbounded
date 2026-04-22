@@ -6,7 +6,7 @@ before:
     # to run in parallel (they rm -rf shared output directories), and
     # goreleaser fans builds out across goos/goarch concurrently.
     - make machina-manifests VERSION={{ .Tag }}
-    - make net-render-manifests VERSION={{ .Tag }}
+    - make net-manifests VERSION={{ .Tag }}
 
 builds:
   - id: kubectl-unbounded

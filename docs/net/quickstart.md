@@ -80,7 +80,7 @@ rendering, apply them in order:
 
 ```bash
 # Render templates first
-make net-render-manifests
+make net-manifests
 
 # Then apply rendered manifests
 kubectl apply -f deploy/net/rendered/01-configmap.yaml

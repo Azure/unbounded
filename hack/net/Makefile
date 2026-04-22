@@ -4,7 +4,7 @@
 #
 # These targets apply rendered manifests to whatever cluster the current
 # kubectl context points at. Rendering is auto-invoked from the root
-# Makefile via `make net-render-manifests`.
+# Makefile via `make net-manifests`.
 
 REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
 SCRIPTS_DIR := $(dir $(lastword $(MAKEFILE_LIST)))
@@ -40,7 +40,7 @@ help: ## Show this help
 	@echo "  NET_AZURE_TENANT_ID=$(NET_AZURE_TENANT_ID)"
 
 render:
-	$(MAKE) -C $(REPO_ROOT) net-render-manifests
+	$(MAKE) -C $(REPO_ROOT) net-manifests
 
 deploy: deploy-crds deploy-namespace deploy-config deploy-controller deploy-node ## Apply all net components and roll workloads
 
