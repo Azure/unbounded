@@ -34,13 +34,13 @@
 #
 # Env knobs:
 #   TAG                  Tag to use for snapshot. Default v0.0.0-localtest.
-#   CNI_PLUGINS_VERSION  CNI plugins version. Default v1.9.0.
+#   CNI_PLUGINS_VERSION  CNI plugins version. Default v1.9.1.
 #   GO_VERSION           Go version build-arg. Default parsed from go.mod.
 
 set -euo pipefail
 
 TAG="${TAG:-v0.0.0-localtest}"
-CNI_PLUGINS_VERSION="${CNI_PLUGINS_VERSION:-v1.9.0}"
+CNI_PLUGINS_VERSION="${CNI_PLUGINS_VERSION:-v1.9.1}"
 
 MULTI_ARCH=0
 INCLUDE_HOST=0
