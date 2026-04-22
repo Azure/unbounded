@@ -39,7 +39,7 @@ spec:
           Machine. MachineOperations are created by CLI commands or controllers and
           processed by the appropriate agent - the in-VM agent handles operations
           like Reboot, while cloud or PXE controllers handle operations like
-          PowerCycle, PowerOff, and PowerOn.
+          HardReboot, PowerOff, and PowerOn.
         properties:
           apiVersion:
             description: |-
@@ -71,7 +71,7 @@ spec:
                   machine.
                 enum:
                 - Reboot
-                - PowerCycle
+                - HardReboot
                 - Shutdown
                 - PowerOff
                 - PowerOn

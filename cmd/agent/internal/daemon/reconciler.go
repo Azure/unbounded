@@ -14,7 +14,7 @@ import (
 // system calls (nspawn, systemctl, machinectl) without actually affecting a
 // host.
 type executor interface {
-	softRestart(ctx context.Context, log *slog.Logger, machineName string) error
+	softReboot(ctx context.Context, log *slog.Logger, machineName string) error
 }
 
 // reconciler holds shared state for all action handlers. A single worker

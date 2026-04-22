@@ -105,9 +105,9 @@ func (r *reconciler) executeOperation(ctx context.Context, log *slog.Logger, op 
 			return fmt.Errorf("find active machine: %w", err)
 		}
 
-		return r.exec.softRestart(ctx, log, active.Name)
-	case v1alpha3.OperationPowerCycle:
-		return fmt.Errorf("PowerCycle operations are handled by the machina controller, not the agent")
+		return r.exec.softReboot(ctx, log, active.Name)
+	case v1alpha3.OperationHardReboot:
+		return fmt.Errorf("HardReboot operations are handled by the machina controller, not the agent")
 	case v1alpha3.OperationShutdown:
 		return fmt.Errorf("Shutdown operations are not yet implemented")
 	case v1alpha3.OperationPowerOff:
@@ -155,10 +155,10 @@ func (r *reconciler) scheduleTTLCleanup(ctx context.Context, log *slog.Logger, o
 // It interacts with systemd-nspawn, machinectl, and systemctl on the host.
 type defaultExecutor struct{}
 
-func (e *defaultExecutor) softRestart(ctx context.Context, log *slog.Logger, machineName string) error {
+func (e *defaultExecutor) softReboot(ctx context.Context, log *slog.Logger, machineName string) error {
 	serviceName := fmt.Sprintf("systemd-nspawn@%s.service", machineName)
 
-	log.Info("soft restart: pre-stopping services in machine", "machine", machineName)
+	log.Info("soft reboot: pre-stopping services in machine", "machine", machineName)
 
 	// Gracefully stop kubelet and containerd inside the container so the
 	// nspawn restart does not have to force-kill them.
@@ -174,7 +174,7 @@ func (e *defaultExecutor) softRestart(ctx context.Context, log *slog.Logger, mac
 		log.Warn("failed to pre-stop containerd (proceeding anyway)", "machine", machineName, "error", err)
 	}
 
-	log.Info("soft restart: restarting nspawn service", "service", serviceName)
+	log.Info("soft reboot: restarting nspawn service", "service", serviceName)
 
 	// Restart the nspawn service directly. This avoids the machinectl
 	// disable/enable cycle that StopNode uses, which tears down the
@@ -189,7 +189,7 @@ func (e *defaultExecutor) softRestart(ctx context.Context, log *slog.Logger, mac
 		return fmt.Errorf("wait for machine %s: %w", machineName, err)
 	}
 
-	log.Info("soft restart: starting services", "machine", machineName)
+	log.Info("soft reboot: starting services", "machine", machineName)
 
 	// Re-enable containerd and kubelet inside the machine.
 	// systemctl enable --now is idempotent on already-running services.
@@ -210,14 +210,14 @@ func (e *defaultExecutor) softRestart(ctx context.Context, log *slog.Logger, mac
 		return fmt.Errorf("wait for kubelet in %s: %w", machineName, err)
 	}
 
-	log.Info("soft restart: completed", "machine", machineName)
+	log.Info("soft reboot: completed", "machine", machineName)
 
 	return nil
 }
 
 // waitForMachineReady polls the nspawn machine until it is responsive to
 // systemd-run commands. This mirrors the wait logic in nodestart but is
-// kept here to avoid coupling the soft-restart path to goal-state types.
+// kept here to avoid coupling the soft-reboot path to goal-state types.
 func waitForMachineReady(ctx context.Context, log *slog.Logger, machine string) error {
 	const (
 		pollInterval = 500 * time.Millisecond

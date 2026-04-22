@@ -23,13 +23,13 @@ import (
 
 // mockExecutor records calls and returns a configurable error.
 type mockExecutor struct {
-	softRestartCalls []string
-	softRestartErr   error
+	softRebootCalls []string
+	softRebootErr   error
 }
 
-func (m *mockExecutor) softRestart(_ context.Context, _ *slog.Logger, machineName string) error {
-	m.softRestartCalls = append(m.softRestartCalls, machineName)
-	return m.softRestartErr
+func (m *mockExecutor) softReboot(_ context.Context, _ *slog.Logger, machineName string) error {
+	m.softRebootCalls = append(m.softRebootCalls, machineName)
+	return m.softRebootErr
 }
 
 // stubFindActive returns a findActive function that always returns the given
@@ -102,7 +102,7 @@ func Test_reconcileOperation_PendingReboot(t *testing.T) {
 	require.NoError(t, err)
 
 	// Executor should have been called once with the nspawn name.
-	assert.Equal(t, []string{"kube1"}, exec.softRestartCalls)
+	assert.Equal(t, []string{"kube1"}, exec.softRebootCalls)
 
 	// Operation should be completed with timestamps.
 	result := getMachineOperation(t, c, "op-1")
@@ -122,7 +122,7 @@ func Test_reconcileOperation_InProgressRecovery(t *testing.T) {
 	err := r.reconcileOperation(context.Background(), discardLogger(), "op-2")
 	require.NoError(t, err)
 
-	assert.Len(t, exec.softRestartCalls, 1)
+	assert.Len(t, exec.softRebootCalls, 1)
 
 	result := getMachineOperation(t, c, "op-2")
 	assert.Equal(t, v1alpha3.OperationPhaseComplete, result.Status.Phase)
@@ -138,13 +138,13 @@ func Test_reconcileOperation_SkipsTerminal(t *testing.T) {
 	require.NoError(t, err)
 
 	// Executor should not have been called.
-	assert.Empty(t, exec.softRestartCalls)
+	assert.Empty(t, exec.softRebootCalls)
 }
 
 func Test_reconcileOperation_ExecutorError(t *testing.T) {
 	op := testMachineOperation("op-4", v1alpha3.OperationReboot, v1alpha3.OperationPhasePending)
 	c := operationClient(op)
-	exec := &mockExecutor{softRestartErr: fmt.Errorf("nspawn exploded")}
+	exec := &mockExecutor{softRebootErr: fmt.Errorf("nspawn exploded")}
 	r := newTestReconciler(c, exec)
 
 	err := r.reconcileOperation(context.Background(), discardLogger(), "op-4")
@@ -182,15 +182,15 @@ func Test_reconcileOperation_UnknownOperationName(t *testing.T) {
 	require.Error(t, err)
 
 	// Executor should not have been called.
-	assert.Empty(t, exec.softRestartCalls)
+	assert.Empty(t, exec.softRebootCalls)
 
 	result := getMachineOperation(t, c, "op-5")
 	assert.Equal(t, v1alpha3.OperationPhaseFailed, result.Status.Phase)
 	assert.Contains(t, result.Status.Message, "unknown operation name")
 }
 
-func Test_reconcileOperation_PowerCycleNotSupported(t *testing.T) {
-	op := testMachineOperation("op-6", v1alpha3.OperationPowerCycle, v1alpha3.OperationPhasePending)
+func Test_reconcileOperation_HardRebootNotSupported(t *testing.T) {
+	op := testMachineOperation("op-6", v1alpha3.OperationHardReboot, v1alpha3.OperationPhasePending)
 	c := operationClient(op)
 	exec := &mockExecutor{}
 	r := newTestReconciler(c, exec)
@@ -198,7 +198,7 @@ func Test_reconcileOperation_PowerCycleNotSupported(t *testing.T) {
 	err := r.reconcileOperation(context.Background(), discardLogger(), "op-6")
 	require.Error(t, err)
 
-	assert.Empty(t, exec.softRestartCalls)
+	assert.Empty(t, exec.softRebootCalls)
 
 	result := getMachineOperation(t, c, "op-6")
 	assert.Equal(t, v1alpha3.OperationPhaseFailed, result.Status.Phase)
@@ -215,5 +215,5 @@ func Test_reconcileOperation_SkipsFailed(t *testing.T) {
 	err := r.reconcileOperation(context.Background(), discardLogger(), "op-7")
 	require.NoError(t, err)
 
-	assert.Empty(t, exec.softRestartCalls)
+	assert.Empty(t, exec.softRebootCalls)
 }

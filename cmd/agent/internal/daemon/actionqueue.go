@@ -22,7 +22,7 @@ const (
 	// the latest MachineConfigurationVersion.
 	ActionNodeDeleted ActionType = "NodeDeleted"
 
-	// ActionOperation processes an Operation CR (e.g. SoftReboot,
+	// ActionOperation processes an Operation CR (e.g. Reboot,
 	// HardReboot). Produced by the Operation CR watcher when a
 	// non-terminal Operation targeting this machine is observed.
 	ActionOperation ActionType = "Operation"
