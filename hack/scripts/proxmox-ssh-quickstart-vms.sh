@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# proxmox-ssh-quickstart-vms.sh - Create, query, and destroy Proxmox VMs for
+# the AKS SSH quickstart CI workflow. It provisions Ubuntu cloud-init VMs on a
+# self-hosted Proxmox runner so the aks-ssh-quickstart workflow can bootstrap
+# them as remote Kubernetes nodes and verify they join the cluster.
+
 # These host-specific defaults are intentionally explicit so this helper does
 # not depend on hidden runner state.
 readonly REQUIRED_VALUE="__REQUIRED__"

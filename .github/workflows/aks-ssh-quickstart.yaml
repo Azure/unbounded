@@ -60,7 +60,9 @@ jobs:
           set -euo pipefail
           mkdir -p workflow-artifacts/metadata
           suffix="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          acr_name="sshquickstart${GITHUB_RUN_ID}${GITHUB_RUN_ATTEMPT}"
+          # ACR names must be 5-50 alphanumeric chars; truncate to stay safe.
+          acr_name="sshqs${GITHUB_RUN_ID}${GITHUB_RUN_ATTEMPT}"
+          acr_name="${acr_name:0:50}"
           cat > workflow-artifacts/metadata/aks-metadata.env <<EOF
           AKS_NAME=ssh-quickstart-${suffix}
           AKS_RG=ssh-quickstart-${suffix}
@@ -73,6 +75,9 @@ jobs:
           REMOTE_NODE_CIDR=10.10.100.0/24
           REMOTE_POD_CIDR=10.245.0.0/16
           EOF
+          # Strip leading whitespace introduced by YAML indentation so that
+          # GITHUB_ENV sees clean NAME=value lines.
+          sed -i 's/^[[:space:]]*//' workflow-artifacts/metadata/aks-metadata.env
 
       - name: Load metadata into environment
         run: |
