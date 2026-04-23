@@ -1,4 +1,4 @@
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: inventory
+  name: {{ default "unbounded-kube" .Namespace }}
