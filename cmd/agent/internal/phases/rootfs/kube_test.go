@@ -63,6 +63,7 @@ func TestCrictlVersionForKubernetesVersion(t *testing.T) {
 				if err == nil {
 					t.Fatalf("expected an error for version %q", testCase.kubernetesVersion)
 				}
+
 				return
 			}
 
@@ -174,6 +175,7 @@ func TestCrictlVersionMatch(t *testing.T) {
 			}
 
 			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
 			got := crictlVersionMatch(context.Background(), logger, destDir, tests[i].expectedVersion)
 			if got != tests[i].wantMatch {
 				t.Fatalf("got match=%t, want %t", got, tests[i].wantMatch)

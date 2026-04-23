@@ -69,6 +69,7 @@ func (d *downloadKubeBinaries) Do(ctx context.Context) error {
 	}
 
 	needsKubeBinaries := !hasRequiredKubeBinaries(destDir) || !kubeletVersionMatch(ctx, d.log, destDir, kubernetesVersion)
+
 	needsCrictl := !crictlVersionMatch(ctx, d.log, destDir, crictlVersion)
 	if !needsKubeBinaries && !needsCrictl {
 		return nil
