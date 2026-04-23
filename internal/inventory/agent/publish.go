@@ -7,7 +7,7 @@ import (
 	"context"
 	"fmt"
 
-	inventoryv1 "github.com/Azure/unbounded-kube/api/inventory/v1"
+	inventoryv1 "github.com/Azure/unbounded/api/inventory/v1"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"

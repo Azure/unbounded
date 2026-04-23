@@ -9,7 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	inventory "github.com/Azure/unbounded-kube/internal/inventory/agent"
+	inventory "github.com/Azure/unbounded/internal/inventory/agent"
 )
 
 func main() {
