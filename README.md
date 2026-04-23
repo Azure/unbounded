@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="https://github.com/Azure/unbounded/releases/latest"><img src="https://img.shields.io/github/v/release/Azure/unbounded?style=flat-square" alt="Release"></a>
-  <a href="https://github.com/Azure/unbounded/actions/workflows/go-ci.yaml"><img src="https://img.shields.io/github/actions/workflow/status/Azure/unbounded/go-ci.yaml?branch=main&label=CI&style=flat-square" alt="Go CI"></a>
+  <a href="https://github.com/Azure/unbounded/actions/workflows/ci.yaml"><img src="https://img.shields.io/github/actions/workflow/status/Azure/unbounded/ci.yaml?branch=main&label=CI&style=flat-square" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/Azure/unbounded?style=flat-square" alt="License"></a>
 </p>
 
