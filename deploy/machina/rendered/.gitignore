@@ -1,0 +1,5 @@
+# Keep this directory present in the repo as the embed root for
+# deploy/machina/embed.go. `make machina-manifests` writes the rendered
+# manifests (and a crd/ subdirectory) here; none of that output is tracked.
+*
+!.gitignore

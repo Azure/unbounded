@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Inventory Viewer</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --surface: #161b22;
+      --border: #30363d;
+      --text: #e6edf3;
+      --text-muted: #8b949e;
+      --accent: #58a6ff;
+      --accent-hover: #79c0ff;
+      --green: #3fb950;
+      --red: #f85149;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+    }
+    header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 16px 24px;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+    header h1 { font-size: 20px; font-weight: 600; }
+    .tab-bar {
+      display: flex;
+      gap: 4px;
+      margin-left: auto;
+    }
+    .tab-bar button {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      padding: 6px 16px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 14px;
+      transition: all 0.15s;
+    }
+    .tab-bar button:hover { color: var(--text); border-color: var(--text-muted); }
+    .tab-bar button.active {
+      background: var(--accent);
+      color: #fff;
+      border-color: var(--accent);
+    }
+    main { max-width: 1400px; margin: 24px auto; padding: 0 24px; }
+    .toolbar {
+      display: flex;
+      gap: 12px;
+      margin-bottom: 16px;
+      align-items: center;
+    }
+    .toolbar input {
+      flex: 1;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 8px 12px;
+      border-radius: 6px;
+      font-size: 14px;
+      outline: none;
+    }
+    .toolbar input:focus { border-color: var(--accent); }
+    .badge {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      padding: 6px 12px;
+      border-radius: 6px;
+      font-size: 13px;
+      color: var(--text-muted);
+      white-space: nowrap;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      overflow: hidden;
+    }
+    th, td {
+      text-align: left;
+      padding: 10px 16px;
+      border-bottom: 1px solid var(--border);
+      font-size: 14px;
+    }
+    th {
+      background: var(--bg);
+      color: var(--text-muted);
+      font-weight: 600;
+      position: sticky;
+      top: 0;
+      cursor: pointer;
+      user-select: none;
+    }
+    th:hover { color: var(--text); }
+    th .sort-arrow { margin-left: 4px; font-size: 12px; }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: rgba(88,166,255,0.04); }
+    .attr-toggle {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--accent);
+      padding: 2px 8px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 12px;
+    }
+    .attr-toggle:hover { background: rgba(88,166,255,0.1); }
+    .attr-content {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 8px 12px;
+      margin-top: 6px;
+      font-family: 'SFMono-Regular', Consolas, monospace;
+      font-size: 12px;
+      white-space: pre-wrap;
+      word-break: break-all;
+      max-height: 300px;
+      overflow-y: auto;
+    }
+    .loading, .error-msg {
+      text-align: center;
+      padding: 48px;
+      font-size: 16px;
+    }
+    .error-msg { color: var(--red); }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect, useMemo } = React;
+
+    function App() {
+      const [tab, setTab] = useState("devices");
+      return (
+        <>
+          <header>
+            <h1>Inventory Viewer</h1>
+            <div className="tab-bar">
+              <button className={tab === "devices" ? "active" : ""} onClick={() => setTab("devices")}>Devices</button>
+              <button className={tab === "neighbors" ? "active" : ""} onClick={() => setTab("neighbors")}>Neighbors</button>
+            </div>
+          </header>
+          <main>
+            {tab === "devices" ? <DevicesTable /> : <NeighborsTable />}
+          </main>
+        </>
+      );
+    }
+
+    function useData(url) {
+      const [data, setData] = useState(null);
+      const [error, setError] = useState(null);
+      const [loading, setLoading] = useState(true);
+      useEffect(() => {
+        setLoading(true);
+        setError(null);
+        fetch(url)
+          .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+          .then(d => { setData(d); setLoading(false); })
+          .catch(e => { setError(e.message); setLoading(false); });
+      }, [url]);
+      return { data, error, loading };
+    }
+
+    function useSortable(data, defaultKey) {
+      const [sortKey, setSortKey] = useState(defaultKey);
+      const [sortAsc, setSortAsc] = useState(true);
+      const sorted = useMemo(() => {
+        if (!data) return [];
+        return [...data].sort((a, b) => {
+          const av = a[sortKey], bv = b[sortKey];
+          if (av < bv) return sortAsc ? -1 : 1;
+          if (av > bv) return sortAsc ? 1 : -1;
+          return 0;
+        });
+      }, [data, sortKey, sortAsc]);
+      const onSort = (key) => {
+        if (key === sortKey) { setSortAsc(!sortAsc); }
+        else { setSortKey(key); setSortAsc(true); }
+      };
+      return { sorted, sortKey, sortAsc, onSort };
+    }
+
+    function SortHeader({ label, field, sortKey, sortAsc, onSort }) {
+      const arrow = field === sortKey ? (sortAsc ? "▲" : "▼") : "";
+      return <th onClick={() => onSort(field)}>{label}<span className="sort-arrow">{arrow}</span></th>;
+    }
+
+    function AttrCell({ value }) {
+      const [open, setOpen] = useState(false);
+      let formatted = value;
+      try { formatted = JSON.stringify(JSON.parse(value), null, 2); } catch {}
+      return (
+        <td>
+          <button className="attr-toggle" onClick={() => setOpen(!open)}>{open ? "Hide" : "Show"}</button>
+          {open && <div className="attr-content">{formatted}</div>}
+        </td>
+      );
+    }
+
+    function DevicesTable() {
+      const { data, error, loading } = useData("/api/devices");
+      const [filter, setFilter] = useState("");
+      const filtered = useMemo(() => {
+        if (!data) return [];
+        if (!filter) return data;
+        const q = filter.toLowerCase();
+        return data.filter(d =>
+          d.device_type.toLowerCase().includes(q) ||
+          d.device_name.toLowerCase().includes(q) ||
+          d.host_identifier.toLowerCase().includes(q) ||
+          d.serial_number.toLowerCase().includes(q)
+        );
+      }, [data, filter]);
+      const { sorted, sortKey, sortAsc, onSort } = useSortable(filtered, "id");
+
+      if (loading) return <div className="loading">Loading devices…</div>;
+      if (error) return <div className="error-msg">Error: {error}</div>;
+
+      const cols = [
+        { label: "ID", field: "id" },
+        { label: "Type", field: "device_type" },
+        { label: "Name", field: "device_name" },
+        { label: "Host", field: "host_identifier" },
+        { label: "Serial Number", field: "serial_number" },
+      ];
+      return (
+        <>
+          <div className="toolbar">
+            <input placeholder="Filter devices…" value={filter} onChange={e => setFilter(e.target.value)} />
+            <span className="badge">{sorted.length} device{sorted.length !== 1 ? "s" : ""}</span>
+          </div>
+          <table>
+            <thead><tr>
+              {cols.map(c => <SortHeader key={c.field} {...c} sortKey={sortKey} sortAsc={sortAsc} onSort={onSort} />)}
+              <th>Attributes</th>
+            </tr></thead>
+            <tbody>
+              {sorted.map(d => (
+                <tr key={d.id}>
+                  <td>{d.id}</td>
+                  <td>{d.device_type}</td>
+                  <td>{d.device_name}</td>
+                  <td>{d.host_identifier}</td>
+                  <td>{d.serial_number}</td>
+                  <AttrCell value={d.attributes} />
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </>
+      );
+    }
+
+    function NeighborsTable() {
+      const { data, error, loading } = useData("/api/neighbors");
+      const [filter, setFilter] = useState("");
+      const filtered = useMemo(() => {
+        if (!data) return [];
+        if (!filter) return data;
+        const q = filter.toLowerCase();
+        return data.filter(n =>
+          n.host_identifier.toLowerCase().includes(q) ||
+          n.local_interface.toLowerCase().includes(q)
+        );
+      }, [data, filter]);
+      const { sorted, sortKey, sortAsc, onSort } = useSortable(filtered, "id");
+
+      if (loading) return <div className="loading">Loading neighbors…</div>;
+      if (error) return <div className="error-msg">Error: {error}</div>;
+
+      const cols = [
+        { label: "ID", field: "id" },
+        { label: "Host", field: "host_identifier" },
+        { label: "Interface", field: "local_interface" },
+      ];
+      return (
+        <>
+          <div className="toolbar">
+            <input placeholder="Filter neighbors…" value={filter} onChange={e => setFilter(e.target.value)} />
+            <span className="badge">{sorted.length} neighbor{sorted.length !== 1 ? "s" : ""}</span>
+          </div>
+          <table>
+            <thead><tr>
+              {cols.map(c => <SortHeader key={c.field} {...c} sortKey={sortKey} sortAsc={sortAsc} onSort={onSort} />)}
+              <th>Attributes</th>
+            </tr></thead>
+            <tbody>
+              {sorted.map(n => (
+                <tr key={n.id}>
+                  <td>{n.id}</td>
+                  <td>{n.host_identifier}</td>
+                  <td>{n.local_interface}</td>
+                  <AttrCell value={n.attributes} />
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
