@@ -9,10 +9,10 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/Azure/unbounded-kube/cmd/agent/internal/goalstates"
-	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases"
-	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases/reset"
-	"github.com/Azure/unbounded-kube/internal/version"
+	"github.com/Azure/unbounded/cmd/agent/internal/goalstates"
+	"github.com/Azure/unbounded/cmd/agent/internal/phases"
+	"github.com/Azure/unbounded/cmd/agent/internal/phases/reset"
+	"github.com/Azure/unbounded/internal/version"
 )
 
 func newCmdReset(cmdCtx *CommandContext) *cobra.Command {

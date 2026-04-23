@@ -13,7 +13,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/Azure/unbounded-kube/internal/provision"
+	"github.com/Azure/unbounded/internal/provision"
 )
 
 // MachineGoalState holds the fully resolved goal state for provisioning and

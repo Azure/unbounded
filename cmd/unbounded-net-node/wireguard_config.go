@@ -12,8 +12,8 @@ import (
 	"github.com/vishvananda/netlink"
 	"k8s.io/klog/v2"
 
-	unboundednetnetlink "github.com/Azure/unbounded-kube/internal/net/netlink"
-	"github.com/Azure/unbounded-kube/internal/net/routeplan"
+	unboundednetnetlink "github.com/Azure/unbounded/internal/net/netlink"
+	"github.com/Azure/unbounded/internal/net/routeplan"
 )
 
 // configureWireGuard sets up WireGuard interfaces and configures peers

@@ -12,9 +12,9 @@ import (
 	"github.com/vishvananda/netlink"
 	"k8s.io/klog/v2"
 
-	unboundednetv1alpha1 "github.com/Azure/unbounded-kube/api/net/v1alpha1"
-	unboundednetnetlink "github.com/Azure/unbounded-kube/internal/net/netlink"
-	"github.com/Azure/unbounded-kube/internal/net/routeplan"
+	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
+	unboundednetnetlink "github.com/Azure/unbounded/internal/net/netlink"
+	"github.com/Azure/unbounded/internal/net/routeplan"
 )
 
 // geneveIfaceName returns a deterministic interface name for a GENEVE peer

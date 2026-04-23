@@ -27,7 +27,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/remotecommand"
 
-	statusv1alpha1 "github.com/Azure/unbounded-kube/internal/net/status/v1alpha1"
+	statusv1alpha1 "github.com/Azure/unbounded/internal/net/status/v1alpha1"
 )
 
 // newNodeRootCommand builds node operation commands.

@@ -27,14 +27,14 @@ import (
 	"k8s.io/klog/v2"
 	apiregistrationclientset "k8s.io/kube-aggregator/pkg/client/clientset_generated/clientset"
 
-	unboundednetv1alpha1 "github.com/Azure/unbounded-kube/api/net/v1alpha1"
-	"github.com/Azure/unbounded-kube/internal/net/authn"
-	"github.com/Azure/unbounded-kube/internal/net/certmanager"
-	"github.com/Azure/unbounded-kube/internal/net/config"
-	"github.com/Azure/unbounded-kube/internal/net/controller"
-	"github.com/Azure/unbounded-kube/internal/net/metrics"
-	"github.com/Azure/unbounded-kube/internal/net/webhook"
-	"github.com/Azure/unbounded-kube/internal/version"
+	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
+	"github.com/Azure/unbounded/internal/net/authn"
+	"github.com/Azure/unbounded/internal/net/certmanager"
+	"github.com/Azure/unbounded/internal/net/config"
+	"github.com/Azure/unbounded/internal/net/controller"
+	"github.com/Azure/unbounded/internal/net/metrics"
+	"github.com/Azure/unbounded/internal/net/webhook"
+	"github.com/Azure/unbounded/internal/version"
 )
 
 var gatewayPoolGVR = schema.GroupVersionResource{

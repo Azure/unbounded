@@ -37,7 +37,7 @@ az login
 az aks install-cli
 
 # kubectl-unbounded (Linux amd64)
-curl -sL https://github.com/Azure/unbounded-kube/releases/latest/download/kubectl-unbounded-linux-amd64.tar.gz | tar xz
+curl -sL https://github.com/Azure/unbounded/releases/latest/download/kubectl-unbounded-linux-amd64.tar.gz | tar xz
 sudo mv kubectl-unbounded /usr/local/bin/
 ```
 
@@ -46,7 +46,7 @@ sudo mv kubectl-unbounded /usr/local/bin/
 
 ```bash
 # kubectl-unbounded (macOS arm64)
-curl -sL https://github.com/Azure/unbounded-kube/releases/latest/download/kubectl-unbounded-darwin-arm64.tar.gz | tar xz
+curl -sL https://github.com/Azure/unbounded/releases/latest/download/kubectl-unbounded-darwin-arm64.tar.gz | tar xz
 sudo mv kubectl-unbounded /usr/local/bin/
 ```
 
@@ -65,7 +65,7 @@ az version && kubectl version --client && kubectl unbounded --help
 Download and run the quickstart script:
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/Azure/unbounded-kube/main/hack/scripts/aks-quickstart.sh
+curl -fsSLO https://raw.githubusercontent.com/Azure/unbounded/main/hack/scripts/aks-quickstart.sh
 chmod +x aks-quickstart.sh
 
 ./aks-quickstart.sh create \

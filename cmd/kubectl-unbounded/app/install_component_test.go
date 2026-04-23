@@ -29,7 +29,7 @@ import (
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
-	machinadeploy "github.com/Azure/unbounded-kube/deploy/machina"
+	machinadeploy "github.com/Azure/unbounded/deploy/machina"
 )
 
 // discardLogger returns a logger that discards all output.

@@ -8,8 +8,8 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/Azure/unbounded-kube/cmd/agent/internal/goalstates"
-	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases"
+	"github.com/Azure/unbounded/cmd/agent/internal/goalstates"
+	"github.com/Azure/unbounded/cmd/agent/internal/phases"
 )
 
 type removeNSpawnConfig struct {

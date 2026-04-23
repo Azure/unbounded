@@ -6,7 +6,7 @@ package main
 import (
 	"net"
 
-	"github.com/Azure/unbounded-kube/internal/net/routeplan"
+	"github.com/Azure/unbounded/internal/net/routeplan"
 )
 
 // getGatewayIPFromCIDR returns the first usable IP in a CIDR (the gateway address on cbr0).

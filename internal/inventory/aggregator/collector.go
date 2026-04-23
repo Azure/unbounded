@@ -12,7 +12,7 @@ import (
 	"github.com/lib/pq"
 	"google.golang.org/grpc"
 
-	inventoryv1 "github.com/Azure/unbounded-kube/api/inventory/v1"
+	inventoryv1 "github.com/Azure/unbounded/api/inventory/v1"
 )
 
 // Config holds the configuration for the inventory collector service.

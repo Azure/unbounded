@@ -9,8 +9,8 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
-	statusproto "github.com/Azure/unbounded-kube/internal/net/status/proto"
-	statusv1alpha1 "github.com/Azure/unbounded-kube/internal/net/status/v1alpha1"
+	statusproto "github.com/Azure/unbounded/internal/net/status/proto"
+	statusv1alpha1 "github.com/Azure/unbounded/internal/net/status/v1alpha1"
 )
 
 // protoToNodeStatus converts a protobuf NodeStatusFull to the Go NodeStatusResponse type.

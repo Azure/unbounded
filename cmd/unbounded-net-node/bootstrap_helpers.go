@@ -24,7 +24,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 
-	"github.com/Azure/unbounded-kube/internal/version"
+	"github.com/Azure/unbounded/internal/version"
 )
 
 // errCNIConfDirNotEmpty is returned when existing CNI configuration files are

@@ -15,7 +15,7 @@ import (
 	"github.com/opencontainers/umoci/oci/casext"
 	"github.com/opencontainers/umoci/oci/layer"
 
-	"github.com/Azure/unbounded-kube/internal/ociutil"
+	"github.com/Azure/unbounded/internal/ociutil"
 )
 
 func init() {

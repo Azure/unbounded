@@ -6,9 +6,9 @@ package nodestart
 import (
 	"log/slog"
 
-	"github.com/Azure/unbounded-kube/cmd/agent/internal/goalstates"
-	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases"
-	"github.com/Azure/unbounded-kube/internal/provision"
+	"github.com/Azure/unbounded/cmd/agent/internal/goalstates"
+	"github.com/Azure/unbounded/cmd/agent/internal/phases"
+	"github.com/Azure/unbounded/internal/provision"
 )
 
 // StartNode returns a composite task that configures and starts an nspawn

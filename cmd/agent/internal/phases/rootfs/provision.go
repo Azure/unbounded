@@ -6,8 +6,8 @@ package rootfs
 import (
 	"log/slog"
 
-	"github.com/Azure/unbounded-kube/cmd/agent/internal/goalstates"
-	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases"
+	"github.com/Azure/unbounded/cmd/agent/internal/goalstates"
+	"github.com/Azure/unbounded/cmd/agent/internal/phases"
 )
 
 // Provision returns a composite task that provisions a complete nspawn machine

@@ -39,7 +39,7 @@ case "$arch" in
 esac
 
 if [ -z "${AGENT_URL}" ]; then
-    AGENT_URL="https://github.com/Azure/unbounded-kube/releases/download/${AGENT_VERSION}/unbounded-agent-linux-${arch}.tar.gz"
+    AGENT_URL="https://github.com/Azure/unbounded/releases/download/${AGENT_VERSION}/unbounded-agent-linux-${arch}.tar.gz"
 fi
 AGENT_BIN="/usr/local/bin/unbounded-agent"
 

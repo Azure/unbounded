@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Azure/unbounded-kube/internal/net/html"
+	"github.com/Azure/unbounded/internal/net/html"
 )
 
 // skipIfFrontendUnbuilt skips the calling test when the embedded frontend

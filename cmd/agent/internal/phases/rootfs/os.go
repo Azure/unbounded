@@ -9,9 +9,9 @@ import (
 	"fmt"
 	"path/filepath"
 
-	"github.com/Azure/unbounded-kube/cmd/agent/internal/goalstates"
-	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases"
-	"github.com/Azure/unbounded-kube/cmd/agent/internal/utilio"
+	"github.com/Azure/unbounded/cmd/agent/internal/goalstates"
+	"github.com/Azure/unbounded/cmd/agent/internal/phases"
+	"github.com/Azure/unbounded/cmd/agent/internal/utilio"
 )
 
 // /dev/kmsg workaround: kubelet expects /dev/kmsg for kernel log access, but

@@ -10,7 +10,7 @@ import (
 
 	"github.com/lib/pq"
 
-	inventoryv1 "github.com/Azure/unbounded-kube/api/inventory/v1"
+	inventoryv1 "github.com/Azure/unbounded/api/inventory/v1"
 )
 
 // createTableSQL maps each required table name to the DDL statement that

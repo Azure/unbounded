@@ -64,14 +64,14 @@ GIT_COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BUILD_TIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
 # Shared ldflags for injecting version metadata into all binaries.
-STAMP_LDFLAGS=-X github.com/Azure/unbounded-kube/internal/version.Version=$(VERSION) \
-              -X github.com/Azure/unbounded-kube/internal/version.GitCommit=$(GIT_COMMIT) \
-              -X github.com/Azure/unbounded-kube/internal/version.BuildTime=$(BUILD_TIME)
+STAMP_LDFLAGS=-X github.com/Azure/unbounded/internal/version.Version=$(VERSION) \
+              -X github.com/Azure/unbounded/internal/version.GitCommit=$(GIT_COMMIT) \
+              -X github.com/Azure/unbounded/internal/version.BuildTime=$(BUILD_TIME)
 
 METALMAN_IMAGE=$(CONTAINER_REGISTRY)/metalman:$(VERSION)
 
 # kubectl-unbounded also stamps the metalman image reference.
-KUBECTL_UNBOUNDED_LDFLAGS=$(STAMP_LDFLAGS) -X github.com/Azure/unbounded-kube/cmd/kubectl-unbounded/app.MetalmanImage=$(METALMAN_IMAGE)
+KUBECTL_UNBOUNDED_LDFLAGS=$(STAMP_LDFLAGS) -X github.com/Azure/unbounded/cmd/kubectl-unbounded/app.MetalmanImage=$(METALMAN_IMAGE)
 
 # --- Net (unbounded-net) configuration -------------------------------------
 # Container images for the net controller and node agent.

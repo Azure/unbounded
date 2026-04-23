@@ -44,7 +44,7 @@ Install the prerequisites if you haven't already:
 
 ```bash
 # kubectl-unbounded (Linux amd64)
-curl -sL https://github.com/Azure/unbounded-kube/releases/latest/download/kubectl-unbounded-linux-amd64.tar.gz | tar xz
+curl -sL https://github.com/Azure/unbounded/releases/latest/download/kubectl-unbounded-linux-amd64.tar.gz | tar xz
 sudo mv kubectl-unbounded /usr/local/bin/
 ```
 
@@ -52,7 +52,7 @@ sudo mv kubectl-unbounded /usr/local/bin/
 <summary>macOS (Apple Silicon)</summary>
 
 ```bash
-curl -sL https://github.com/Azure/unbounded-kube/releases/latest/download/kubectl-unbounded-darwin-arm64.tar.gz | tar xz
+curl -sL https://github.com/Azure/unbounded/releases/latest/download/kubectl-unbounded-darwin-arm64.tar.gz | tar xz
 sudo mv kubectl-unbounded /usr/local/bin/
 ```
 

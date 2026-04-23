@@ -14,9 +14,9 @@ import (
 
 	"k8s.io/klog/v2"
 
-	unboundednetv1alpha1 "github.com/Azure/unbounded-kube/api/net/v1alpha1"
-	ebpfpkg "github.com/Azure/unbounded-kube/internal/net/ebpf"
-	unboundednetnetlink "github.com/Azure/unbounded-kube/internal/net/netlink"
+	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
+	ebpfpkg "github.com/Azure/unbounded/internal/net/ebpf"
+	unboundednetnetlink "github.com/Azure/unbounded/internal/net/netlink"
 )
 
 // unbounded0DeviceName is the dedicated dummy interface for the eBPF tunnel

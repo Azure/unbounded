@@ -27,7 +27,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 
-	"github.com/Azure/unbounded-kube/internal/net/authn"
+	"github.com/Azure/unbounded/internal/net/authn"
 )
 
 const (

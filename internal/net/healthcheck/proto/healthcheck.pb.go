@@ -160,7 +160,7 @@ const file_healthcheck_proto_rawDesc = "" +
 	"\n" +
 	"PacketType\x12\v\n" +
 	"\aREQUEST\x10\x00\x12\t\n" +
-	"\x05REPLY\x10\x01B@Z>github.com/Azure/unbounded-kube/internal/net/healthcheck/protob\x06proto3"
+	"\x05REPLY\x10\x01B;Z9github.com/Azure/unbounded/internal/net/healthcheck/protob\x06proto3"
 
 var (
 	file_healthcheck_proto_rawDescOnce sync.Once

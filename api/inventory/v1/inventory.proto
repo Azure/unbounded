@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package inventory.v1;
 
-option go_package = "github.com/Azure/unbounded-kube/api/inventory/v1;inventoryv1";
+option go_package = "github.com/Azure/unbounded/api/inventory/v1;inventoryv1";
 
 // DeviceRecord represents a single hardware inventory item.
 message DeviceRecord {

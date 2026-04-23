@@ -11,7 +11,7 @@ import (
 	"log/slog"
 	"os/exec"
 
-	"github.com/Azure/unbounded-kube/internal/helpers"
+	"github.com/Azure/unbounded/internal/helpers"
 )
 
 func Kubectl(env []string, kubeconfig string) func(context.Context) *exec.Cmd {

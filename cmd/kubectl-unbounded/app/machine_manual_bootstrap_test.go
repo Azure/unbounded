@@ -16,7 +16,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/rest"
 
-	"github.com/Azure/unbounded-kube/internal/provision"
+	"github.com/Azure/unbounded/internal/provision"
 )
 
 // ---------------------------------------------------------------------------
@@ -361,8 +361,10 @@ func TestManualBootstrapHandler_RenderScript_WithAgentURL(t *testing.T) {
 
 	script, err := h.renderScript(cfg)
 	require.NoError(t, err)
+
 	agentURLExport := "export AGENT_URL='file:///tmp/unbounded-agent-linux-amd64.tar.gz'"
 	installScript := "bash <<'INSTALL_SCRIPT_EOF'"
+
 	require.Contains(t, script, agentURLExport)
 	require.Contains(t, script, installScript)
 	require.Less(t, strings.Index(script, agentURLExport), strings.Index(script, installScript))
@@ -393,6 +395,7 @@ func TestManualBootstrapHandler_RenderScript_WithUnsafeAgentURL(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, script, `export AGENT_URL='https://example.test/download?name="agent"&cmd=$(touch /tmp/pwned)'`)
 	require.NotContains(t, script, `export AGENT_URL="https://example.test/download?name="agent"&cmd=$(touch /tmp/pwned)"`)
+
 	installScript := "bash <<'INSTALL_SCRIPT_EOF'"
 	require.Less(t, strings.Index(script, "export AGENT_URL='https://example.test/download?name=\"agent\"&cmd=$(touch /tmp/pwned)'"), strings.Index(script, installScript))
 }
@@ -515,7 +518,9 @@ func TestManualBootstrapHandler_Execute_WithAgentURL(t *testing.T) {
 	t.Parallel()
 
 	kubeCli := newFakeCluster(t, "dc1")
+
 	var buf bytes.Buffer
+
 	kubeconfigPath := writeTempKubeconfig(t)
 
 	h := &manualBootstrapHandler{

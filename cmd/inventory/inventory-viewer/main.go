@@ -12,7 +12,7 @@ import (
 	"github.com/lib/pq"
 	"github.com/spf13/cobra"
 
-	inventoryviewer "github.com/Azure/unbounded-kube/internal/inventory/viewer"
+	inventoryviewer "github.com/Azure/unbounded/internal/inventory/viewer"
 )
 
 func main() {

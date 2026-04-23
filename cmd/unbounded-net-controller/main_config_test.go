@@ -11,7 +11,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/Azure/unbounded-kube/internal/net/config"
+	"github.com/Azure/unbounded/internal/net/config"
 )
 
 func newControllerConfigTestCommand(cfg *config.Config) *cobra.Command {

@@ -9,7 +9,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/Azure/unbounded-kube/internal/provision"
+	"github.com/Azure/unbounded/internal/provision"
 )
 
 const configFileEnv = "UNBOUNDED_AGENT_CONFIG_FILE"

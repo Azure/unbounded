@@ -2,7 +2,7 @@
 
 ## How to file issues and get help
 
-This project uses [GitHub Issues](https://github.com/Azure/unbounded-kube/issues) to
+This project uses [GitHub Issues](https://github.com/Azure/unbounded/issues) to
 track bugs and feature requests. Please search the existing issues before filing new issues to avoid
 duplicates. For new issues, file your bug or feature request as a new issue.
 

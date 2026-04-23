@@ -12,7 +12,7 @@ import (
 	"github.com/lib/pq"
 	"github.com/spf13/cobra"
 
-	"github.com/Azure/unbounded-kube/internal/inventory/aggregator"
+	"github.com/Azure/unbounded/internal/inventory/aggregator"
 )
 
 func main() {

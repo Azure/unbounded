@@ -3,7 +3,7 @@
 
 package main
 
-import "github.com/Azure/unbounded-kube/cmd/agent/internal/cmd"
+import "github.com/Azure/unbounded/cmd/agent/internal/cmd"
 
 func main() {
 	cmd.Run()

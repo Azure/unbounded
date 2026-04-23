@@ -17,8 +17,8 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/klog/v2"
 
-	"github.com/Azure/unbounded-kube/internal/net/controller"
-	"github.com/Azure/unbounded-kube/internal/version"
+	"github.com/Azure/unbounded/internal/net/controller"
+	"github.com/Azure/unbounded/internal/version"
 )
 
 func formatDurationAgo(d time.Duration) string {

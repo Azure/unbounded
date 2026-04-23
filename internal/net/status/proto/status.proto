@@ -3,7 +3,7 @@
 
 syntax = "proto3";
 package unboundednet.status.v1;
-option go_package = "github.com/Azure/unbounded-kube/internal/net/status/proto";
+option go_package = "github.com/Azure/unbounded/internal/net/status/proto";
 
 // NodeStatusMessage wraps all node-to-controller status messages.
 message NodeStatusMessage {
