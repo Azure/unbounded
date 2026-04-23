@@ -18,7 +18,7 @@ AGENT_CMD=./cmd/agent
 MACHINA_BIN=bin/machina
 MACHINA_CMD=./cmd/machina
 CONTAINER_REGISTRY ?= ghcr.io/azure
-MACHINA_IMAGE=$(CONTAINER_REGISTRY)/machina:$(VERSION)
+MACHINA_IMAGE ?= $(CONTAINER_REGISTRY)/machina:$(VERSION)
 CONTAINER_ENGINE ?= podman
 
 METALMAN_BIN=bin/metalman
