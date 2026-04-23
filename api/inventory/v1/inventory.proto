@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package inventory.v1;
+
+option go_package = "github.com/Azure/unbounded-kube/api/inventory/v1;inventoryv1";
+
+// DeviceRecord represents a single hardware inventory item.
+message DeviceRecord {
+  string device_type = 1;
+  string device_name = 2;
+  string host_identifier = 3;
+  string serial_number = 4;
+  // JSON-encoded device attributes.
+  bytes attributes = 5;
+}
+
+// NeighborRecord represents a discovered network neighbor.
+message NeighborRecord {
+  string host_identifier = 1;
+  string local_interface = 2;
+  // JSON-encoded neighbor attributes.
+  bytes attributes = 3;
+}
+
+// SubmitInventoryRequest carries a batch of inventory records from a node.
+message SubmitInventoryRequest {
+  repeated DeviceRecord devices = 1;
+  repeated NeighborRecord neighbors = 2;
+}
+
+// SubmitInventoryResponse is returned after records have been persisted.
+message SubmitInventoryResponse {
+  int32 devices_saved = 1;
+  int32 neighbors_saved = 2;
+}
+
+// InventoryAggregator accepts inventory data from nodes.
+service InventoryAggregator {
+  // SubmitInventory receives a batch of device and neighbor records and
+  // persists them to the database.
+  rpc SubmitInventory(SubmitInventoryRequest) returns (SubmitInventoryResponse);
+}

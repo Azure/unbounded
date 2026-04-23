@@ -1,0 +1,41 @@
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres-server
+  namespace: inventory
+  labels:
+    app: postgres-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres-server
+  template:
+    metadata:
+      labels:
+        app: postgres-server
+    spec:
+      containers:
+        - name: postgres-server
+          image: mcr.microsoft.com/azurelinux/base/postgres:16
+          ports:
+            - containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: pg-creds
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: inventory
+spec:
+  selector:
+    app: postgres-server
+  ports:
+    - port: 5432
+      targetPort: 5432
