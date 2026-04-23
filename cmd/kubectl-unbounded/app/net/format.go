@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	statusv1alpha1 "github.com/Azure/unbounded-kube/internal/net/status/v1alpha1"
+	statusv1alpha1 "github.com/Azure/unbounded/internal/net/status/v1alpha1"
 )
 
 // routeKind classifies route type in the same spirit as the UI.

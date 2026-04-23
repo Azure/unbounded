@@ -11,11 +11,11 @@ import (
 	"log/slog"
 	"text/template"
 
-	"github.com/Azure/unbounded-kube/cmd/agent/internal/goalstates"
-	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases"
-	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases/rootfs/debootstrap"
-	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases/rootfs/oci"
-	"github.com/Azure/unbounded-kube/cmd/agent/internal/utilio"
+	"github.com/Azure/unbounded/cmd/agent/internal/goalstates"
+	"github.com/Azure/unbounded/cmd/agent/internal/phases"
+	"github.com/Azure/unbounded/cmd/agent/internal/phases/rootfs/debootstrap"
+	"github.com/Azure/unbounded/cmd/agent/internal/phases/rootfs/oci"
+	"github.com/Azure/unbounded/cmd/agent/internal/utilio"
 )
 
 //go:embed assets/nspawn.conf assets/service-override.conf

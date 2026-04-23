@@ -11,7 +11,7 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
-	pb "github.com/Azure/unbounded-kube/internal/net/healthcheck/proto"
+	pb "github.com/Azure/unbounded/internal/net/healthcheck/proto"
 )
 
 func TestListenerRepliestoRequest(t *testing.T) {

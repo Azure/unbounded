@@ -9,8 +9,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/Azure/unbounded-kube/cmd/machina/machina/controller"
-	"github.com/Azure/unbounded-kube/internal/version"
+	"github.com/Azure/unbounded/cmd/machina/machina/controller"
+	"github.com/Azure/unbounded/internal/version"
 )
 
 func Run() {

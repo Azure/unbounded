@@ -6,8 +6,8 @@ package main
 import (
 	"testing"
 
-	"github.com/Azure/unbounded-kube/internal/net/routeplan"
-	statusv1alpha1 "github.com/Azure/unbounded-kube/internal/net/status/v1alpha1"
+	"github.com/Azure/unbounded/internal/net/routeplan"
+	statusv1alpha1 "github.com/Azure/unbounded/internal/net/status/v1alpha1"
 )
 
 // TestSortExpectedRoutesAndDestinationType tests SortExpectedRoutesAndDestinationType.

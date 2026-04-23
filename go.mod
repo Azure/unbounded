@@ -1,4 +1,4 @@
-module github.com/Azure/unbounded-kube
+module github.com/Azure/unbounded
 
 go 1.26.2
 

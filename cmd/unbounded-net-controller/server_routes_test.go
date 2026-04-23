@@ -23,8 +23,8 @@ import (
 	corev1listers "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 
-	"github.com/Azure/unbounded-kube/internal/net/authn"
-	"github.com/Azure/unbounded-kube/internal/net/webhook"
+	"github.com/Azure/unbounded/internal/net/authn"
+	"github.com/Azure/unbounded/internal/net/webhook"
 )
 
 // testTokenIssuer creates a TokenIssuer for use in tests.

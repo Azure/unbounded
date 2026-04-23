@@ -24,10 +24,10 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 
-	configpkg "github.com/Azure/unbounded-kube/internal/net/config"
-	"github.com/Azure/unbounded-kube/internal/net/metrics"
-	unboundednetnetlink "github.com/Azure/unbounded-kube/internal/net/netlink"
-	"github.com/Azure/unbounded-kube/internal/version"
+	configpkg "github.com/Azure/unbounded/internal/net/config"
+	"github.com/Azure/unbounded/internal/net/metrics"
+	unboundednetnetlink "github.com/Azure/unbounded/internal/net/netlink"
+	"github.com/Azure/unbounded/internal/version"
 )
 
 // CNIConfig represents the CNI configuration file structure

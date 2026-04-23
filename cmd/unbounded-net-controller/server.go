@@ -21,12 +21,12 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/klog/v2"
 
-	"github.com/Azure/unbounded-kube/internal/net/authn"
-	"github.com/Azure/unbounded-kube/internal/net/certmanager"
-	"github.com/Azure/unbounded-kube/internal/net/html"
-	"github.com/Azure/unbounded-kube/internal/net/metrics"
-	statusproto "github.com/Azure/unbounded-kube/internal/net/status/proto"
-	webhookpkg "github.com/Azure/unbounded-kube/internal/net/webhook"
+	"github.com/Azure/unbounded/internal/net/authn"
+	"github.com/Azure/unbounded/internal/net/certmanager"
+	"github.com/Azure/unbounded/internal/net/html"
+	"github.com/Azure/unbounded/internal/net/metrics"
+	statusproto "github.com/Azure/unbounded/internal/net/status/proto"
+	webhookpkg "github.com/Azure/unbounded/internal/net/webhook"
 )
 
 const (

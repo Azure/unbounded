@@ -22,10 +22,10 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
-	unboundedv1alpha3 "github.com/Azure/unbounded-kube/api/machina/v1alpha3"
-	"github.com/Azure/unbounded-kube/internal/cloudprovider"
-	"github.com/Azure/unbounded-kube/internal/kube"
-	"github.com/Azure/unbounded-kube/internal/provision"
+	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/cloudprovider"
+	"github.com/Azure/unbounded/internal/kube"
+	"github.com/Azure/unbounded/internal/provision"
 )
 
 //go:embed assets/node-bootstrap/script.sh

@@ -12,7 +12,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/Azure/unbounded-kube/internal/provision"
+	"github.com/Azure/unbounded/internal/provision"
 )
 
 func writeConfigFile(t *testing.T, cfg provision.AgentConfig) string {

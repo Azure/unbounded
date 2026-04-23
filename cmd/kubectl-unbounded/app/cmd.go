@@ -8,8 +8,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	netcmd "github.com/Azure/unbounded-kube/cmd/kubectl-unbounded/app/net"
-	"github.com/Azure/unbounded-kube/internal/version"
+	netcmd "github.com/Azure/unbounded/cmd/kubectl-unbounded/app/net"
+	"github.com/Azure/unbounded/internal/version"
 )
 
 func Run() {

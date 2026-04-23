@@ -9,12 +9,12 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/Azure/unbounded-kube/cmd/agent/internal/goalstates"
-	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases"
-	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases/host"
-	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases/nodestart"
-	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases/rootfs"
-	"github.com/Azure/unbounded-kube/internal/version"
+	"github.com/Azure/unbounded/cmd/agent/internal/goalstates"
+	"github.com/Azure/unbounded/cmd/agent/internal/phases"
+	"github.com/Azure/unbounded/cmd/agent/internal/phases/host"
+	"github.com/Azure/unbounded/cmd/agent/internal/phases/nodestart"
+	"github.com/Azure/unbounded/cmd/agent/internal/phases/rootfs"
+	"github.com/Azure/unbounded/internal/version"
 )
 
 func newCmdStart(cmdCtx *CommandContext) *cobra.Command {

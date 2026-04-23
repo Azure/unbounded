@@ -24,7 +24,7 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 
-	"github.com/Azure/unbounded-kube/internal/net/allocator"
+	"github.com/Azure/unbounded/internal/net/allocator"
 )
 
 const (

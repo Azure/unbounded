@@ -13,7 +13,7 @@ import (
 
 	"golang.org/x/term"
 
-	statusv1alpha1 "github.com/Azure/unbounded-kube/internal/net/status/v1alpha1"
+	statusv1alpha1 "github.com/Azure/unbounded/internal/net/status/v1alpha1"
 )
 
 // clusterStatusResponse is the controller /status/json response used by node list.

@@ -22,15 +22,15 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
-	v1alpha3 "github.com/Azure/unbounded-kube/api/machina/v1alpha3"
-	"github.com/Azure/unbounded-kube/internal/cloudprovider"
-	"github.com/Azure/unbounded-kube/internal/metalman/attestation"
-	"github.com/Azure/unbounded-kube/internal/metalman/cloudinit"
-	"github.com/Azure/unbounded-kube/internal/metalman/dhcp"
-	"github.com/Azure/unbounded-kube/internal/metalman/indexing"
-	"github.com/Azure/unbounded-kube/internal/metalman/lifecycle"
-	"github.com/Azure/unbounded-kube/internal/metalman/netboot"
-	"github.com/Azure/unbounded-kube/internal/metalman/redfish"
+	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/cloudprovider"
+	"github.com/Azure/unbounded/internal/metalman/attestation"
+	"github.com/Azure/unbounded/internal/metalman/cloudinit"
+	"github.com/Azure/unbounded/internal/metalman/dhcp"
+	"github.com/Azure/unbounded/internal/metalman/indexing"
+	"github.com/Azure/unbounded/internal/metalman/lifecycle"
+	"github.com/Azure/unbounded/internal/metalman/netboot"
+	"github.com/Azure/unbounded/internal/metalman/redfish"
 )
 
 // ServePXECmd returns a cobra.Command that runs PXE servers and the BMC control loop.

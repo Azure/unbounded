@@ -9,7 +9,7 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 
-	"github.com/Azure/unbounded-kube/hack/cmd/forge/forge/azsdk"
+	"github.com/Azure/unbounded/hack/cmd/forge/forge/azsdk"
 )
 
 func Test_ParseTokenClaims(t *testing.T) {

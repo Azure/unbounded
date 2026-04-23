@@ -21,8 +21,8 @@ import (
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"github.com/Azure/unbounded-kube/cmd/machina/machina/controller"
-	"github.com/Azure/unbounded-kube/internal/kube"
+	"github.com/Azure/unbounded/cmd/machina/machina/controller"
+	"github.com/Azure/unbounded/internal/kube"
 )
 
 //go:embed assets/unbounded-net-site/*.yaml

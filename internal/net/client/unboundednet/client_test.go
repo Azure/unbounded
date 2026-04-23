@@ -15,7 +15,7 @@ import (
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/rest"
 
-	unboundednetv1alpha1 "github.com/Azure/unbounded-kube/api/net/v1alpha1"
+	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 )
 
 func mustUnstructured(t *testing.T, obj interface{}, kind string) *unstructured.Unstructured {

@@ -20,7 +20,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
 
-	unboundednet "github.com/Azure/unbounded-kube/internal/net/client/unboundednet"
+	unboundednet "github.com/Azure/unbounded/internal/net/client/unboundednet"
 )
 
 const (

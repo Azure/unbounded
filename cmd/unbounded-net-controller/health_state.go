@@ -20,7 +20,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 
-	"github.com/Azure/unbounded-kube/internal/net/controller"
+	"github.com/Azure/unbounded/internal/net/controller"
 )
 
 // healthState tracks the health of the controller for health and status endpoints.

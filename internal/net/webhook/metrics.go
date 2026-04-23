@@ -7,7 +7,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 
-	"github.com/Azure/unbounded-kube/internal/net/metrics"
+	"github.com/Azure/unbounded/internal/net/metrics"
 )
 
 const controllerNamespace = "unbounded_cni_controller"

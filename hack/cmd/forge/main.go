@@ -3,7 +3,7 @@
 
 package main
 
-import "github.com/Azure/unbounded-kube/hack/cmd/forge/forge"
+import "github.com/Azure/unbounded/hack/cmd/forge/forge"
 
 func main() {
 	forge.Run()

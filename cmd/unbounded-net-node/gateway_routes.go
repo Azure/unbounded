@@ -19,8 +19,8 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 
-	unboundednetv1alpha1 "github.com/Azure/unbounded-kube/api/net/v1alpha1"
-	"github.com/Azure/unbounded-kube/internal/net/routeplan"
+	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
+	"github.com/Azure/unbounded/internal/net/routeplan"
 )
 
 // parseSite converts an unstructured object to a Site

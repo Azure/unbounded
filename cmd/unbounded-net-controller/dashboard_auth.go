@@ -15,8 +15,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 
-	"github.com/Azure/unbounded-kube/internal/net/authn"
-	webhookpkg "github.com/Azure/unbounded-kube/internal/net/webhook"
+	"github.com/Azure/unbounded/internal/net/authn"
+	webhookpkg "github.com/Azure/unbounded/internal/net/webhook"
 )
 
 const (

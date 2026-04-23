@@ -1840,7 +1840,7 @@ const file_status_proto_rawDesc = "" +
 	"\x03vni\x18\x06 \x01(\rR\x03vni\x12\x10\n" +
 	"\x03mtu\x18\a \x01(\x05R\x03mtu\x12\x18\n" +
 	"\aifindex\x18\b \x01(\rR\aifindex\x12\x18\n" +
-	"\ahealthy\x18\t \x01(\bR\ahealthyB;Z9github.com/Azure/unbounded-kube/internal/net/status/protob\x06proto3"
+	"\ahealthy\x18\t \x01(\bR\ahealthyB6Z4github.com/Azure/unbounded/internal/net/status/protob\x06proto3"
 
 var (
 	file_status_proto_rawDescOnce sync.Once

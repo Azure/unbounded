@@ -9,7 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/Azure/unbounded-kube/cmd/agent/internal/daemon"
+	"github.com/Azure/unbounded/cmd/agent/internal/daemon"
 )
 
 func newCmdDaemon(cmdCtx *CommandContext) *cobra.Command {

@@ -9,7 +9,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	unboundednetv1alpha1 "github.com/Azure/unbounded-kube/api/net/v1alpha1"
+	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 )
 
 // TestAssignmentPrimitiveHelpers tests assignment primitive helpers.

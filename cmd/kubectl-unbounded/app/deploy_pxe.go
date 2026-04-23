@@ -18,13 +18,13 @@ import (
 	acmetav1 "k8s.io/client-go/applyconfigurations/meta/v1"
 	"k8s.io/utils/ptr"
 
-	"github.com/Azure/unbounded-kube/internal/kube"
+	"github.com/Azure/unbounded/internal/kube"
 )
 
 // MetalmanImage is the default container image for the metalman controller
 // deployment. It is set at build time via -ldflags:
 //
-//	-X github.com/Azure/unbounded-kube/cmd/kubectl-unbounded/app.MetalmanImage=<image>
+//	-X github.com/Azure/unbounded/cmd/kubectl-unbounded/app.MetalmanImage=<image>
 //
 // When not set (e.g. during development), it falls back to "metalman:latest".
 var MetalmanImage = "metalman:latest"
