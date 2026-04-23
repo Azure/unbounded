@@ -64,6 +64,7 @@ FROM mcr.microsoft.com/azurelinux/base/core:3.0@sha256:35149ae8dd179684f969944f5
 # Install runtime dependencies
 RUN tdnf install -y \
     ca-certificates \
+    && tdnf makecache && tdnf upgrade -y \
     && tdnf clean all
 
 # Create unbounded directory
