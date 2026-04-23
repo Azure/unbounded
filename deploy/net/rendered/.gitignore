@@ -1,0 +1,6 @@
+# Keep this directory present in the repo as the embed root for
+# deploy/net/embed.go. `make net-manifests` writes the rendered manifests
+# (with controller/, node/ and crd/ subdirectories) here; none of that
+# output is tracked.
+*
+!.gitignore

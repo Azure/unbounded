@@ -238,7 +238,7 @@ fmt: check-deps ## Format all Go source files (gofumpt + wsl_v5 whitespace)
 ifdef CI
 # In CI each job is independent; skip chained prerequisites.
 
-lint: machina-manifests net-manifests ## Run golangci-lint
+lint: ## Run golangci-lint
 	$(GOLINT) ./...
 
 test: machina-manifests net-manifests ## Run all tests with race detector
@@ -247,10 +247,10 @@ test: machina-manifests net-manifests ## Run all tests with race detector
 else
 # Locally, chain targets for convenience: test -> lint -> fmt -> check-deps.
 
-lint: fmt machina-manifests net-manifests ## Run golangci-lint (implies fmt)
+lint: fmt ## Run golangci-lint (implies fmt)
 	$(GOLINT) ./...
 
-test: lint ## Run all tests (implies lint)
+test: lint machina-manifests net-manifests ## Run all tests (implies lint)
 	$(GOTEST) ./...
 
 endif
@@ -397,7 +397,8 @@ MACHINA_MANIFEST_TEMPLATES_DIR := deploy/machina
 MACHINA_MANIFEST_RENDERED_DIR  := deploy/machina/rendered
 
 machina-manifests: ## Render machina deployment manifests into deploy/machina/rendered
-	@rm -rf $(MACHINA_MANIFEST_RENDERED_DIR)
+	@mkdir -p $(MACHINA_MANIFEST_RENDERED_DIR)
+	@find $(MACHINA_MANIFEST_RENDERED_DIR) -mindepth 1 -not -name .gitignore -delete
 	@mkdir -p $(MACHINA_MANIFEST_RENDERED_DIR)/crd
 	$(GOCMD) run ./hack/cmd/render-manifests \
 		--templates-dir $(MACHINA_MANIFEST_TEMPLATES_DIR) \
@@ -493,7 +494,8 @@ net-build-ebpf: ## Compile bpf/unbounded_encap.c to internal/net/ebpf/unbounded_
 ##@ Net Manifests
 
 net-manifests: ## Render net manifests into $(NET_MANIFEST_RENDERED_DIR)
-	@rm -rf $(NET_MANIFEST_RENDERED_DIR)
+	@mkdir -p $(NET_MANIFEST_RENDERED_DIR)
+	@find $(NET_MANIFEST_RENDERED_DIR) -mindepth 1 -not -name .gitignore -delete
 	@mkdir -p $(NET_MANIFEST_RENDERED_DIR)/crd
 	$(GOCMD) run ./hack/cmd/render-manifests \
 		--templates-dir "$(NET_MANIFEST_TEMPLATES_DIR)" \
