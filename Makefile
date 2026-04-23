@@ -152,6 +152,8 @@ help: ## Show this help
 	@echo "  unroute                          Build unroute eBPF inspection utility"
 	@echo ""
 	@echo "Container Images (local, single-arch):"
+	@echo "  image-inventory-all-local        Build all local inventory container images"
+	@echo "  image-inventory-all-push         Build and push all inventory container images"
 	@echo "  image-inventory-aggregator-local Build a local inventory-aggregator container image"
 	@echo "  image-inventory-aggregator-push  Build and push the inventory-aggregator container image"
 	@echo "  image-inventory-inspector-local  Build a local inventory-inspector container image"
@@ -421,6 +423,12 @@ resources/cni-plugins-linux-%-$(CNI_PLUGINS_VERSION).tgz:
 	curl -fsSL \
 		"https://github.com/containernetworking/plugins/releases/download/$(CNI_PLUGINS_VERSION)/cni-plugins-linux-$*-$(CNI_PLUGINS_VERSION).tgz" \
 		-o $@
+
+.PHONY: image-inventory-all-local
+image-inventory-all-local: image-inventory-aggregator-local image-inventory-inspector-local image-inventory-viewer-local
+
+.PHONY: image-inventory-all-push
+image-inventory-all-push: image-inventory-aggregator-push image-inventory-inspector-push image-inventory-viewer-push
 
 .PHONY: image-inventory-aggregator-build
 image-inventory-aggregator-local: ## Build the inventory-aggregator container image

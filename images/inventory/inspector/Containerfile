@@ -2,26 +2,22 @@
 # Licensed under the MIT License.
 
 # Build stage
-FROM mcr.microsoft.com/azurelinux/base/core:3.0@sha256:35149ae8dd179684f969944f54a337c665a64e702486154eb44253fb39c2505b AS builder
+FROM docker.io/library/golang:1.26.2-trixie AS builder
 
 # Install build dependencies
-RUN tdnf install -y \
+RUN apt-get update && apt-get install -y \
     build-essential \
     golang \
     make \
     gcc \
     git \
     ca-certificates \
-    openssl-devel \
-    && tdnf clean all
+    && apt-get clean
 
 # Set up Go environment
-ENV CGO_ENABLED=1
+ENV CGO_ENABLED=0
 ENV GOPATH=/go
 ENV GOTOOLCHAIN=auto
-# Azure Linux 3.0's Go package restricts GOTOOLCHAIN to "local" by default.
-# Allow "auto" so that go install can download the required toolchain.
-ENV MS_GOTOOLCHAIN_ALLOW_NON_LOCAL=1
 ENV PATH=$PATH:/go/bin
 
 # Install gofumpt and golangci-lint for the build
@@ -43,12 +39,12 @@ ARG VERSION=dev
 RUN make inventory-inspector VERSION=${VERSION}
 
 # Runtime stage
-FROM mcr.microsoft.com/azurelinux/base/core:3.0@sha256:35149ae8dd179684f969944f54a337c665a64e702486154eb44253fb39c2505b
+FROM ubuntu:noble
 
 # Install runtime dependencies
-RUN tdnf install -y \
+RUN apt-get update && apt-get install -y \
     ca-certificates \
-    && tdnf clean all
+    && apt-get clean
 
 # Create unbounded directory
 RUN mkdir -p /unbounded/bin
