@@ -83,11 +83,23 @@ type manualBootstrapHandler struct {
 	// via the discovery client.
 	kubernetesVersion string
 
+	// agentVersion pins the unbounded-agent release tag to download on the
+	// target host. When empty (the default) the install script tracks the
+	// latest published release.
+	agentVersion string
+
+	// agentURL is a fully qualified override for the unbounded-agent download
+	// URL. When set it takes precedence over agentVersion and agentBaseURL.
+	agentURL string
+
+	// agentBaseURL overrides the base URL used to construct the download URL
+	// for the unbounded-agent. Useful for self-hosted release mirrors. Must
+	// follow the same layout as GitHub releases
+	// (<base>/latest/download/<asset> and <base>/download/<tag>/<asset>).
+	agentBaseURL string
+
 	// variant controls the output format. Defaults to "script".
 	variant string
-
-	// agentURL optionally overrides the embedded install script download URL.
-	agentURL string
 
 	// kubeconfigPath is the path to the kubeconfig used to contact the cluster.
 	kubeconfigPath string
@@ -171,10 +183,6 @@ func (h *manualBootstrapHandler) validate() error {
 
 	if _, err := parseBootstrapVariant(h.variant); err != nil {
 		return err
-	}
-
-	if h.agentURL != "" && bootstrapVariant(h.variant) != variantScript {
-		return errors.New("--agent-url is only supported with --variant script")
 	}
 
 	h.kubeconfigPath = getKubeconfigPath(h.kubeconfigPath)
@@ -293,13 +301,38 @@ type manualBootstrapTemplateData struct {
 	// heredoc that is piped to bash.
 	InstallScript string
 
-	// AgentURLLiteral optionally overrides the agent download location used by
-	// the embedded install script as a shell-safe literal.
-	AgentURLLiteral string
+	// InstallEnv is an optional list of "KEY=VALUE" strings that are exported
+	// in the generated script's shell (or cloud-init runcmd) immediately
+	// before the embedded install script runs. Used to forward agent
+	// download overrides like AGENT_VERSION, AGENT_URL, and AGENT_BASE_URL.
+	InstallEnv []string
 }
 
-func shellQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", `'"'"'`) + "'"
+// installEnv returns the KEY=VALUE pairs that should be exported before the
+// embedded install script runs. Only non-empty overrides are included.
+func (h *manualBootstrapHandler) installEnv() []string {
+	var env []string
+
+	if h.agentVersion != "" {
+		env = append(env, fmt.Sprintf("AGENT_VERSION=%s", shellSingleQuote(h.agentVersion)))
+	}
+
+	if h.agentBaseURL != "" {
+		env = append(env, fmt.Sprintf("AGENT_BASE_URL=%s", shellSingleQuote(h.agentBaseURL)))
+	}
+
+	if h.agentURL != "" {
+		env = append(env, fmt.Sprintf("AGENT_URL=%s", shellSingleQuote(h.agentURL)))
+	}
+
+	return env
+}
+
+// shellSingleQuote wraps v in POSIX-safe single quotes, escaping any embedded
+// single quotes. The result can be used verbatim on the right-hand side of
+// an `export KEY=...` statement in bash.
+func shellSingleQuote(v string) string {
+	return "'" + strings.ReplaceAll(v, "'", `'\''`) + "'"
 }
 
 // renderScript produces a self-contained bash script that writes the agent
@@ -315,10 +348,7 @@ func (h *manualBootstrapHandler) renderScript(cfg *provision.AgentConfig) (strin
 		MachineName:     cfg.MachineName,
 		AgentConfigJSON: string(configJSON),
 		InstallScript:   provision.UnboundedAgentInstallScript(),
-	}
-
-	if h.agentURL != "" {
-		data.AgentURLLiteral = shellQuote(h.agentURL)
+		InstallEnv:      h.installEnv(),
 	}
 
 	t, err := template.New("node-bootstrap").Parse(manualBootstrapTemplate)
@@ -346,6 +376,7 @@ func (h *manualBootstrapHandler) renderCloudInit(cfg *provision.AgentConfig) (st
 		MachineName:     cfg.MachineName,
 		AgentConfigJSON: string(configJSON),
 		InstallScript:   provision.UnboundedAgentInstallScript(),
+		InstallEnv:      h.installEnv(),
 	}
 
 	funcMap := template.FuncMap{
@@ -381,7 +412,7 @@ func newMachineManualBootstrapCommand(handler *manualBootstrapHandler) *cobra.Co
 		Use:   "manual-bootstrap NAME",
 		Short: "Generate a bootstrap script or cloud-init config for provisioning a machine",
 		Long: `Generate a self-contained bootstrap payload that provisions a bare-metal or VM
-host as an unbounded-kube worker node. The payload embeds the agent JSON
+host as an unbounded worker node. The payload embeds the agent JSON
 configuration inline and the install script for the target architecture.
 
 Use --variant to choose the output format:
@@ -398,7 +429,15 @@ Examples:
   kubectl unbounded machine manual-bootstrap my-node --site my-site | ssh user@host sudo bash
 
   # Generate cloud-init user-data for a cloud provider API:
-  kubectl unbounded machine manual-bootstrap my-node --site my-site --variant cloud-init > user-data.yaml`,
+  kubectl unbounded machine manual-bootstrap my-node --site my-site --variant cloud-init > user-data.yaml
+
+  # Pin the agent to a specific release instead of tracking "latest":
+  kubectl unbounded machine manual-bootstrap my-node --site my-site --agent-version v0.0.10
+
+  # Self-host / mirror the release assets (expects the same layout as
+  # GitHub releases under the base URL):
+  kubectl unbounded machine manual-bootstrap my-node --site my-site \
+    --agent-base-url https://releases.example.com/unbounded`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			handler.machineName = args[0]
@@ -413,7 +452,9 @@ Examples:
 	cmd.Flags().StringVar(&handler.ociImage, "oci-image", "", "OCI image reference for the agent rootfs")
 	cmd.Flags().StringVar(&handler.kubernetesVersion, "kubernetes-version", "", "Override the Kubernetes version (default: auto-detected from API server)")
 	cmd.Flags().StringVar(&handler.variant, "variant", "script", "Output format: script or cloud-init")
-	cmd.Flags().StringVar(&handler.agentURL, "agent-url", "", "Override URL used by the embedded agent install script")
+	cmd.Flags().StringVar(&handler.agentVersion, "agent-version", "", "Pin the unbounded-agent release tag to download on the host (default: latest GitHub release)")
+	cmd.Flags().StringVar(&handler.agentURL, "agent-url", "", "Fully qualified download URL for the unbounded-agent tarball (overrides --agent-version and --agent-base-url)")
+	cmd.Flags().StringVar(&handler.agentBaseURL, "agent-base-url", "", "Base URL for unbounded-agent release downloads (default: https://github.com/Azure/unbounded/releases). Use this to self-host or mirror release assets")
 
 	if err := cmd.MarkFlagRequired("site"); err != nil {
 		panic(err)

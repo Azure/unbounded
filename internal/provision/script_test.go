@@ -17,10 +17,27 @@ func TestUnboundedAgentInstallScript(t *testing.T) {
 	require.NotEmpty(t, script)
 	require.Contains(t, script, "#!/bin/bash")
 	require.Contains(t, script, "unbounded-agent")
-	require.Contains(t, script, `if [ -z "${AGENT_URL}" ]; then
-    AGENT_URL="https://github.com/Azure/unbounded/releases/download/${AGENT_VERSION}/unbounded-agent-linux-${arch}.tar.gz"
-fi`)
-	require.Contains(t, script, `curl -fsSL "${AGENT_URL}" | tar -xz -C /usr/local/bin unbounded-agent`)
+
+	// The install script must support the documented download-override
+	// environment variables.
+	require.Contains(t, script, "AGENT_VERSION")
+	require.Contains(t, script, "AGENT_BASE_URL")
+	require.Contains(t, script, "AGENT_URL")
+
+	// The default base URL must point at GitHub releases so that a fresh
+	// install works out of the box.
+	require.Contains(t, script, "https://github.com/Azure/unbounded/releases")
+
+	// The default (unpinned) download URL must use GitHub's /latest/download/
+	// redirect so a new release is picked up without editing this script.
+	require.Contains(t, script, "/latest/download/unbounded-agent-linux-")
+
+	// Pinned downloads must use the /download/<tag>/ layout.
+	require.Contains(t, script, "/download/${AGENT_VERSION}/unbounded-agent-linux-")
+
+	// The script must not hardcode a specific release tag as a fallback
+	// default, so that "latest" is used when AGENT_VERSION is unset.
+	require.NotContains(t, script, "AGENT_VERSION:-v0.0.10")
 }
 
 func TestUnboundedAgentUninstallScript(t *testing.T) {
