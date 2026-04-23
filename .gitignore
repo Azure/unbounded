@@ -89,8 +89,10 @@ __pycache__/
 
 # Rendered templates
 hack/net/templates/*.json
-deploy/net/rendered/
-deploy/machina/rendered/
+# Rendered manifest output is managed by per-directory .gitignore placeholders
+# under deploy/{machina,net}/rendered/ so the //go:embed all:rendered
+# directives in deploy/{machina,net}/embed.go remain satisfiable on a fresh
+# clone.
 
 # Temporary files
 *.tmp
