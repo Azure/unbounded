@@ -17,6 +17,10 @@ func TestUnboundedAgentInstallScript(t *testing.T) {
 	require.NotEmpty(t, script)
 	require.Contains(t, script, "#!/bin/bash")
 	require.Contains(t, script, "unbounded-agent")
+	require.Contains(t, script, `if [ -z "${AGENT_URL}" ]; then
+    AGENT_URL="https://github.com/Azure/unbounded-kube/releases/download/${AGENT_VERSION}/unbounded-agent-linux-${arch}.tar.gz"
+fi`)
+	require.Contains(t, script, `curl -fsSL "${AGENT_URL}" | tar -xz -C /usr/local/bin unbounded-agent`)
 }
 
 func TestUnboundedAgentUninstallScript(t *testing.T) {

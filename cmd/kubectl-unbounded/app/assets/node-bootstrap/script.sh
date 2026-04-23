@@ -28,6 +28,10 @@ AGENT_CONFIG_EOF
 # Embedded install script
 # -----------------------------------------------------------------
 
+{{- if .AgentURLLiteral }}
+export AGENT_URL={{ .AgentURLLiteral }}
+{{- end }}
+
 bash <<'INSTALL_SCRIPT_EOF'
 {{ .InstallScript }}
 INSTALL_SCRIPT_EOF
