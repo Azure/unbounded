@@ -7,6 +7,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 
@@ -103,17 +105,6 @@ func TestManualBootstrapHandler_Validate(t *testing.T) {
 				kubeconfigPath: kubeconfigPath,
 				variant:        "cloud-init",
 			},
-		},
-		{
-			name: "invalid: agent-url with cloud-init variant",
-			handler: manualBootstrapHandler{
-				siteName:       "dc1",
-				machineName:    "my-node",
-				kubeconfigPath: kubeconfigPath,
-				variant:        "cloud-init",
-				agentURL:       "file:///tmp/unbounded-agent-linux-amd64.tar.gz",
-			},
-			expectErr: "--agent-url is only supported with --variant script",
 		},
 		{
 			name: "valid: variant defaults to script when empty",
@@ -288,6 +279,13 @@ func TestManualBootstrapHandler_RenderScript(t *testing.T) {
 
 	script, err := h.renderScript(cfg)
 	require.NoError(t, err)
+
+	// No download overrides: no `export AGENT_*=` lines should appear in
+	// the outer script (the embedded install script references the vars
+	// in its own help text, but must not be pre-set by the wrapper).
+	require.NotContains(t, script, "export AGENT_VERSION=")
+	require.NotContains(t, script, "export AGENT_URL=")
+	require.NotContains(t, script, "export AGENT_BASE_URL=")
 
 	// Should start with a shebang.
 	require.Contains(t, script, "#!/bin/bash")
@@ -600,4 +598,164 @@ func TestManualBootstrapHandler_Execute(t *testing.T) {
 		require.Contains(t, output, "abc123.")
 		require.Contains(t, output, "/etc/unbounded/agent/config.json")
 	})
+}
+
+// ---------------------------------------------------------------------------
+// Agent download override tests
+// ---------------------------------------------------------------------------
+
+func TestManualBootstrapHandler_InstallEnv(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		handler manualBootstrapHandler
+		want    []string
+	}{
+		{
+			name:    "no overrides",
+			handler: manualBootstrapHandler{},
+			want:    nil,
+		},
+		{
+			name:    "pinned version",
+			handler: manualBootstrapHandler{agentVersion: "v0.0.10"},
+			want:    []string{"AGENT_VERSION='v0.0.10'"},
+		},
+		{
+			name:    "base URL override",
+			handler: manualBootstrapHandler{agentBaseURL: "https://mirror.example.com/releases"},
+			want:    []string{"AGENT_BASE_URL='https://mirror.example.com/releases'"},
+		},
+		{
+			name:    "full URL override",
+			handler: manualBootstrapHandler{agentURL: "https://mirror.example.com/agent.tar.gz"},
+			want:    []string{"AGENT_URL='https://mirror.example.com/agent.tar.gz'"},
+		},
+		{
+			name: "all three set",
+			handler: manualBootstrapHandler{
+				agentVersion: "v0.0.10",
+				agentBaseURL: "https://mirror.example.com/releases",
+				agentURL:     "https://mirror.example.com/agent.tar.gz",
+			},
+			want: []string{
+				"AGENT_VERSION='v0.0.10'",
+				"AGENT_BASE_URL='https://mirror.example.com/releases'",
+				"AGENT_URL='https://mirror.example.com/agent.tar.gz'",
+			},
+		},
+		{
+			name:    "value containing a single quote is escaped",
+			handler: manualBootstrapHandler{agentVersion: "v'1"},
+			want:    []string{`AGENT_VERSION='v'\''1'`},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := tt.handler.installEnv()
+			require.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestManualBootstrapHandler_RenderScript_DownloadOverrides(t *testing.T) {
+	t.Parallel()
+
+	cfg := &provision.AgentConfig{
+		MachineName: "test-node",
+		Cluster: provision.AgentClusterConfig{
+			CaCertBase64: "dGVzdA==",
+			ClusterDNS:   "10.0.0.10",
+			Version:      "v1.30.0",
+		},
+		Kubelet: provision.AgentKubeletConfig{
+			ApiServer:      "https://api-server:6443",
+			BootstrapToken: "abc123.0123456789abcdef",
+			Labels:         map[string]string{"env": "prod"},
+		},
+	}
+
+	h := &manualBootstrapHandler{
+		logger:       discardLogger(),
+		agentVersion: "v0.0.10",
+		agentBaseURL: "https://mirror.example.com/releases",
+	}
+
+	script, err := h.renderScript(cfg)
+	require.NoError(t, err)
+
+	// Overrides must be exported in the outer shell before the embedded
+	// install script heredoc.
+	require.Contains(t, script, "export AGENT_VERSION='v0.0.10'")
+	require.Contains(t, script, "export AGENT_BASE_URL='https://mirror.example.com/releases'")
+
+	// The exports must appear before the embedded install script heredoc.
+	exportIdx := strings.Index(script, "export AGENT_VERSION=")
+	heredocIdx := strings.Index(script, "INSTALL_SCRIPT_EOF")
+	require.Greater(t, exportIdx, 0)
+	require.Greater(t, heredocIdx, exportIdx)
+
+	// Script should still be valid bash syntax.
+	requireValidBashSyntax(t, script)
+}
+
+func TestManualBootstrapHandler_RenderCloudInit_DownloadOverrides(t *testing.T) {
+	t.Parallel()
+
+	cfg := &provision.AgentConfig{
+		MachineName: "test-node",
+		Cluster: provision.AgentClusterConfig{
+			CaCertBase64: "dGVzdA==",
+			ClusterDNS:   "10.0.0.10",
+			Version:      "v1.30.0",
+		},
+		Kubelet: provision.AgentKubeletConfig{
+			ApiServer:      "https://api-server:6443",
+			BootstrapToken: "abc123.0123456789abcdef",
+		},
+	}
+
+	h := &manualBootstrapHandler{
+		logger:   discardLogger(),
+		agentURL: "https://mirror.example.com/agent.tar.gz",
+	}
+
+	output, err := h.renderCloudInit(cfg)
+	require.NoError(t, err)
+
+	// The override must be exported in runcmd before invoking the install
+	// script.
+	require.Contains(t, output, "export AGENT_URL='https://mirror.example.com/agent.tar.gz'")
+
+	exportIdx := strings.Index(output, "export AGENT_URL=")
+	runIdx := strings.Index(output, "bash /usr/local/bin/unbounded-agent-install.sh")
+	require.Greater(t, exportIdx, 0)
+	require.Greater(t, runIdx, exportIdx)
+}
+
+// requireValidBashSyntax shells out to `bash -n` to syntax-check a script.
+// It skips the test if bash is not available in the test environment.
+func requireValidBashSyntax(t *testing.T, script string) {
+	t.Helper()
+
+	bashPath, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skipf("bash not found in PATH: %v", err)
+	}
+
+	f, err := os.CreateTemp(t.TempDir(), "bootstrap-*.sh")
+	require.NoError(t, err)
+
+	_, err = f.WriteString(script)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	cmd := exec.Command(bashPath, "-n", f.Name())
+
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, "bash -n failed: %s", string(out))
 }
