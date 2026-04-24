@@ -71,7 +71,7 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 				nodestart.StartNode(log, nodeStartGoalState),
 
 				// Phase 4: Persist the applied config for drift detection.
-				daemon.PersistAppliedConfig(log, cfg.MachineName, &cfg.AgentConfig),
+				daemon.PersistAppliedConfig(log, nodeStartGoalState.MachineName, &cfg.AgentConfig),
 
 				// Phase 5: Enable and start the daemon that watches the
 				// Machine CR for drift detection and reconciliation.
