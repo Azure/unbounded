@@ -1,6 +1,6 @@
-baseURL = "/"
+baseURL = "/unbounded/"
 languageCode = "en-us"
-title = "Unbounded Kube"
+title = "Unbounded"
 
 [markup]
   [markup.highlight]

@@ -1,10 +1,10 @@
 ---
 title: "Bring Your Own Cluster"
 weight: 2
-description: "Add Unbounded Kube to an existing Kubernetes cluster and join remote nodes."
+description: "Add Unbounded to an existing Kubernetes cluster and join remote nodes."
 ---
 
-This guide adds Unbounded Kube to a Kubernetes cluster you already have running.
+This guide adds Unbounded to a Kubernetes cluster you already have running.
 You'll label gateway nodes, initialize a site, and join remote machines.
 
 > Starting from scratch? See the

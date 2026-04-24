@@ -7,7 +7,7 @@ description: "Complete reference for the kubectl-unbounded plugin commands."
 ## Overview
 
 `kubectl-unbounded` is a kubectl plugin that extends `kubectl` with commands for
-managing Unbounded Kube sites. Once installed, commands are available as:
+managing Unbounded sites. Once installed, commands are available as:
 
 ```bash
 kubectl unbounded <command>
