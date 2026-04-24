@@ -20,9 +20,9 @@ const (
 	// cniBinDir is the standard CNI binary directory relative to the machine root.
 	cniBinDir = "opt/cni/bin"
 
-	// cniPluginsURLTemplate is the download URL template for CNI plugins.
-	// Parameters: version, arch, version.
-	cniPluginsURLTemplate = "https://github.com/containernetworking/plugins/releases/download/v%s/cni-plugins-linux-%s-v%s.tgz"
+	// cniPluginsDefaultBaseURL is the upstream base URL for CNI plugin
+	// releases. Mirrors must preserve the <base>/v<ver>/<asset> layout.
+	cniPluginsDefaultBaseURL = "https://github.com/containernetworking/plugins/releases/download"
 )
 
 // requiredCNIPlugins lists the CNI plugins that must be present for a valid installation.
@@ -47,9 +47,21 @@ func (d *downloadCNIBinaries) Name() string { return "download-cni-binaries" }
 
 func (d *downloadCNIBinaries) Do(ctx context.Context) error {
 	destDir := filepath.Join(d.goalState.MachineDir, cniBinDir)
-	downloadURL := fmt.Sprintf(cniPluginsURLTemplate, d.goalState.CNIPluginVersion, d.goalState.HostArch, d.goalState.CNIPluginVersion)
 
-	if hasRequiredCNIPlugins(destDir) && cniPluginsVersionMatch(ctx, d.log, destDir, d.goalState.CNIPluginVersion) {
+	version := d.goalState.CNIPluginVersion
+
+	var override *goalstates.DownloadSource
+	if d.goalState.Downloads != nil {
+		override = d.goalState.Downloads.CNI
+	}
+
+	if override != nil && override.Version != "" {
+		version = override.Version
+	}
+
+	downloadURL := cniDownloadURL(override, version, d.goalState.HostArch)
+
+	if hasRequiredCNIPlugins(destDir) && cniPluginsVersionMatch(ctx, d.log, destDir, version) {
 		return nil
 	}
 
@@ -66,6 +78,21 @@ func (d *downloadCNIBinaries) Do(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// cniDownloadURL resolves the CNI plugins tarball URL honoring the
+// optional override. Mirrors must publish under <base>/v<ver>/<asset>.
+func cniDownloadURL(override *goalstates.DownloadSource, version, arch string) string {
+	if override != nil && override.URL != "" {
+		return fmt.Sprintf(override.URL, version, arch, version)
+	}
+
+	base := cniPluginsDefaultBaseURL
+	if override != nil && override.BaseURL != "" {
+		base = strings.TrimRight(override.BaseURL, "/")
+	}
+
+	return fmt.Sprintf("%s/v%s/cni-plugins-linux-%s-v%s.tgz", base, version, arch, version)
 }
 
 // hasRequiredCNIPlugins checks if all required CNI plugins are installed and executable.

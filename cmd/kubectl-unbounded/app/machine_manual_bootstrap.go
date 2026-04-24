@@ -98,6 +98,15 @@ type manualBootstrapHandler struct {
 	// (<base>/latest/download/<asset> and <base>/download/<tag>/<asset>).
 	agentBaseURL string
 
+	// Download override flags for rootfs binaries installed by the agent.
+	// See `kubectl unbounded machine register --help` for the equivalent
+	// flags on the machina controller path.
+	kubernetesBaseURL, kubernetesURL, kubernetesBinaryVersion string
+	containerdBaseURL, containerdURL, containerdVersion       string
+	runcBaseURL, runcURL, runcVersion                         string
+	cniBaseURL, cniURL, cniVersion                            string
+	crictlBaseURL, crictlURL, crictlVersion                   string
+
 	// variant controls the output format. Defaults to "script".
 	variant string
 
@@ -273,6 +282,14 @@ func (h *manualBootstrapHandler) buildAgentConfig(ctx context.Context) (*provisi
 		machine.Spec.Agent = &unboundedv1alpha3.AgentSpec{Image: h.ociImage}
 	}
 
+	if downloads := h.buildDownloadsSpec(); downloads != nil {
+		if machine.Spec.Agent == nil {
+			machine.Spec.Agent = &unboundedv1alpha3.AgentSpec{}
+		}
+
+		machine.Spec.Agent.Downloads = downloads
+	}
+
 	cfg := provision.BuildAgentConfig(provision.BuildAgentConfigParams{
 		Machine: machine,
 		Cluster: provision.ClusterEndpoint{
@@ -308,31 +325,32 @@ type manualBootstrapTemplateData struct {
 	InstallEnv []string
 }
 
+// buildDownloadsSpec returns a non-nil AgentDownloadsSpec when any rootfs
+// download override flag has been set; otherwise nil.
+func (h *manualBootstrapHandler) buildDownloadsSpec() *unboundedv1alpha3.AgentDownloadsSpec {
+	out := &unboundedv1alpha3.AgentDownloadsSpec{
+		Kubernetes: downloadSourceFromFlags(h.kubernetesBaseURL, h.kubernetesURL, h.kubernetesBinaryVersion),
+		Containerd: downloadSourceFromFlags(h.containerdBaseURL, h.containerdURL, h.containerdVersion),
+		Runc:       downloadSourceFromFlags(h.runcBaseURL, h.runcURL, h.runcVersion),
+		CNI:        downloadSourceFromFlags(h.cniBaseURL, h.cniURL, h.cniVersion),
+		Crictl:     downloadSourceFromFlags(h.crictlBaseURL, h.crictlURL, h.crictlVersion),
+	}
+
+	if out.Kubernetes == nil && out.Containerd == nil && out.Runc == nil && out.CNI == nil && out.Crictl == nil {
+		return nil
+	}
+
+	return out
+}
+
 // installEnv returns the KEY=VALUE pairs that should be exported before the
 // embedded install script runs. Only non-empty overrides are included.
 func (h *manualBootstrapHandler) installEnv() []string {
-	var env []string
-
-	if h.agentVersion != "" {
-		env = append(env, fmt.Sprintf("AGENT_VERSION=%s", shellSingleQuote(h.agentVersion)))
-	}
-
-	if h.agentBaseURL != "" {
-		env = append(env, fmt.Sprintf("AGENT_BASE_URL=%s", shellSingleQuote(h.agentBaseURL)))
-	}
-
-	if h.agentURL != "" {
-		env = append(env, fmt.Sprintf("AGENT_URL=%s", shellSingleQuote(h.agentURL)))
-	}
-
-	return env
-}
-
-// shellSingleQuote wraps v in POSIX-safe single quotes, escaping any embedded
-// single quotes. The result can be used verbatim on the right-hand side of
-// an `export KEY=...` statement in bash.
-func shellSingleQuote(v string) string {
-	return "'" + strings.ReplaceAll(v, "'", `'\''`) + "'"
+	return provision.AgentInstallEnv(&unboundedv1alpha3.AgentSpec{
+		Version: h.agentVersion,
+		BaseURL: h.agentBaseURL,
+		URL:     h.agentURL,
+	})
 }
 
 // renderScript produces a self-contained bash script that writes the agent
@@ -455,6 +473,39 @@ Examples:
 	cmd.Flags().StringVar(&handler.agentVersion, "agent-version", "", "Pin the unbounded-agent release tag to download on the host (default: latest GitHub release)")
 	cmd.Flags().StringVar(&handler.agentURL, "agent-url", "", "Fully qualified download URL for the unbounded-agent tarball (overrides --agent-version and --agent-base-url)")
 	cmd.Flags().StringVar(&handler.agentBaseURL, "agent-base-url", "", "Base URL for unbounded-agent release downloads (default: https://github.com/Azure/unbounded/releases). Use this to self-host or mirror release assets")
+
+	// Rootfs binary download overrides. See `kubectl unbounded machine register --help`
+	// for the equivalent flags on the machina controller path.
+	cmd.Flags().StringVar(&handler.kubernetesBaseURL, "kubernetes-base-url", "",
+		"Base URL for kubelet/kubectl/kube-proxy downloads (default: https://dl.k8s.io). Mirrors must preserve the <base>/v<ver>/bin/linux/<arch>/ layout")
+	cmd.Flags().StringVar(&handler.kubernetesURL, "kubernetes-url", "",
+		"Full URL template for kubernetes binary downloads (fmt placeholders: version, arch, binary)")
+	cmd.Flags().StringVar(&handler.kubernetesBinaryVersion, "kubernetes-binary-version", "",
+		"Override the Kubernetes binary version installed in the rootfs (defaults to the cluster Kubernetes version)")
+	cmd.Flags().StringVar(&handler.containerdBaseURL, "containerd-base-url", "",
+		"Base URL for containerd release downloads (default: https://github.com/containerd/containerd/releases/download)")
+	cmd.Flags().StringVar(&handler.containerdURL, "containerd-url", "",
+		"Full URL template for containerd downloads (fmt placeholders: version, version, arch)")
+	cmd.Flags().StringVar(&handler.containerdVersion, "containerd-version", "",
+		"Override the containerd version installed in the rootfs (defaults to agent's built-in version)")
+	cmd.Flags().StringVar(&handler.runcBaseURL, "runc-base-url", "",
+		"Base URL for runc release downloads (default: https://github.com/opencontainers/runc/releases/download)")
+	cmd.Flags().StringVar(&handler.runcURL, "runc-url", "",
+		"Full URL template for runc downloads (fmt placeholders: version, arch)")
+	cmd.Flags().StringVar(&handler.runcVersion, "runc-version", "",
+		"Override the runc version installed in the rootfs (defaults to agent's built-in version)")
+	cmd.Flags().StringVar(&handler.cniBaseURL, "cni-base-url", "",
+		"Base URL for CNI plugins release downloads (default: https://github.com/containernetworking/plugins/releases/download)")
+	cmd.Flags().StringVar(&handler.cniURL, "cni-url", "",
+		"Full URL template for CNI plugins downloads (fmt placeholders: version, arch, version)")
+	cmd.Flags().StringVar(&handler.cniVersion, "cni-version", "",
+		"Override the CNI plugins version installed in the rootfs (defaults to agent's built-in version)")
+	cmd.Flags().StringVar(&handler.crictlBaseURL, "crictl-base-url", "",
+		"Base URL for cri-tools (crictl) release downloads (default: https://github.com/kubernetes-sigs/cri-tools/releases/download)")
+	cmd.Flags().StringVar(&handler.crictlURL, "crictl-url", "",
+		"Full URL template for crictl downloads (fmt placeholders: version, version, os, arch)")
+	cmd.Flags().StringVar(&handler.crictlVersion, "crictl-version", "",
+		"Override the cri-tools/crictl version installed in the rootfs (defaults to the cluster Kubernetes minor, patch 0)")
 
 	if err := cmd.MarkFlagRequired("site"); err != nil {
 		panic(err)

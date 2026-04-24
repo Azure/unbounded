@@ -122,9 +122,9 @@ func hasDrift(applied, desired *provision.AgentConfig) bool {
 //  3. Start the new machine (configure, boot nspawn, start services, persist config)
 //  4. Verify kubelet health
 //  5. Remove the old machine and its applied config
-func UpdateNode(ctx context.Context, log *slog.Logger, active *ActiveMachine, newCfg *provision.AgentConfig) error {
+func UpdateNode(ctx context.Context, log *slog.Logger, active *ActiveMachine, newCfg *provision.UnboundedAgentConfig) error {
 	// Skip the update if the desired config matches the applied config.
-	if !hasDrift(active.Config, newCfg) {
+	if !hasDrift(active.Config, &newCfg.AgentConfig) {
 		log.Info("no config drift detected, skipping node update")
 		return nil
 	}
@@ -140,7 +140,7 @@ func UpdateNode(ctx context.Context, log *slog.Logger, active *ActiveMachine, ne
 	)
 
 	// Resolve goal states for the new machine.
-	gs, err := goalstates.ResolveMachine(log, newCfg, newMachine)
+	gs, err := goalstates.ResolveMachine(log, &newCfg.AgentConfig, newMachine, provision.ResolveDownloadOverrides(newCfg.Downloads))
 	if err != nil {
 		return fmt.Errorf("resolve machine goal state: %w", err)
 	}
@@ -149,7 +149,7 @@ func UpdateNode(ctx context.Context, log *slog.Logger, active *ActiveMachine, ne
 		rootfs.Provision(log, gs.RootFS),
 		nodestop.StopNode(log, oldMachine),
 		nodestart.StartNode(log, gs.NodeStart),
-		PersistAppliedConfig(log, gs.NodeStart.MachineName, newCfg),
+		PersistAppliedConfig(log, gs.NodeStart.MachineName, &newCfg.AgentConfig),
 		nodestart.WaitForKubelet(log, newMachine),
 		reset.CleanupMachine(log, oldMachine),
 		RemoveAppliedConfig(log, oldMachine),

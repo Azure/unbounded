@@ -10,6 +10,7 @@ import (
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/cloudprovider"
 	"github.com/Azure/unbounded/pkg/agent/config"
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
 type (
@@ -34,6 +35,12 @@ type UnboundedAgentConfig struct {
 	// performs TPM attestation on the host instead of requiring a static
 	// BootstrapToken in the Kubelet.Auth config.
 	Attest *AgentAttestConfig `json:"Attest,omitempty"`
+
+	// Downloads optionally overrides the download sources for binaries
+	// the agent installs into the nspawn rootfs (kubelet, containerd,
+	// runc, CNI plugins, crictl). When unset the agent downloads each
+	// artifact from its upstream default host.
+	Downloads *AgentDownloads `json:"Downloads,omitempty"`
 }
 
 // AgentAttestConfig holds configuration for TPM-based attestation against
@@ -43,6 +50,29 @@ type AgentAttestConfig struct {
 	// "http://10.0.0.1:8880"). The agent appends "/attest" to this URL
 	// when performing TPM attestation.
 	URL string `json:"URL"`
+}
+
+// AgentDownloads optionally overrides the download sources for the
+// binaries the agent installs into the nspawn rootfs. Each entry is
+// optional; unset entries fall back to the upstream defaults compiled
+// into the agent.
+type AgentDownloads struct {
+	Kubernetes *AgentDownloadSource `json:"Kubernetes,omitempty"`
+	Containerd *AgentDownloadSource `json:"Containerd,omitempty"`
+	Runc       *AgentDownloadSource `json:"Runc,omitempty"`
+	CNI        *AgentDownloadSource `json:"CNI,omitempty"`
+	Crictl     *AgentDownloadSource `json:"Crictl,omitempty"`
+}
+
+// AgentDownloadSource configures an override for a single binary download
+// source. BaseURL replaces the upstream host + path prefix; URL replaces
+// the entire URL template. Version overrides the version that would
+// otherwise be derived from the cluster Kubernetes version or the agent's
+// compiled-in defaults.
+type AgentDownloadSource struct {
+	BaseURL string `json:"BaseURL,omitempty"`
+	URL     string `json:"URL,omitempty"`
+	Version string `json:"Version,omitempty"`
 }
 
 // ClusterEndpoint holds the cluster-level connection parameters needed to
@@ -137,6 +167,12 @@ func BuildAgentConfig(params BuildAgentConfigParams) UnboundedAgentConfig {
 		ociImage = machine.Spec.Agent.Image
 	}
 
+	// Resolve download overrides from the Machine spec.
+	var downloads *AgentDownloads
+	if machine.Spec.Agent != nil && machine.Spec.Agent.Downloads != nil {
+		downloads = agentDownloadsFromSpec(machine.Spec.Agent.Downloads)
+	}
+
 	cfg := UnboundedAgentConfig{
 		AgentConfig: config.AgentConfig{
 			MachineName: machine.Name,
@@ -155,6 +191,7 @@ func BuildAgentConfig(params BuildAgentConfigParams) UnboundedAgentConfig {
 			},
 			OCIImage: ociImage,
 		},
+		Downloads: downloads,
 	}
 
 	if params.AttestURL != "" {
@@ -162,4 +199,80 @@ func BuildAgentConfig(params BuildAgentConfigParams) UnboundedAgentConfig {
 	}
 
 	return cfg
+}
+
+// agentDownloadsFromSpec converts the Machine API AgentDownloadsSpec into
+// the agent-facing AgentDownloads config. Returns nil if every entry is
+// unset, so the resulting JSON config remains minimal.
+func agentDownloadsFromSpec(spec *v1alpha3.AgentDownloadsSpec) *AgentDownloads {
+	if spec == nil {
+		return nil
+	}
+
+	out := &AgentDownloads{
+		Kubernetes: downloadSourceFromSpec(spec.Kubernetes),
+		Containerd: downloadSourceFromSpec(spec.Containerd),
+		Runc:       downloadSourceFromSpec(spec.Runc),
+		CNI:        downloadSourceFromSpec(spec.CNI),
+		Crictl:     downloadSourceFromSpec(spec.Crictl),
+	}
+
+	if out.Kubernetes == nil && out.Containerd == nil && out.Runc == nil && out.CNI == nil && out.Crictl == nil {
+		return nil
+	}
+
+	return out
+}
+
+func downloadSourceFromSpec(s *v1alpha3.DownloadSource) *AgentDownloadSource {
+	if s == nil {
+		return nil
+	}
+
+	if s.BaseURL == "" && s.URL == "" && s.Version == "" {
+		return nil
+	}
+
+	return &AgentDownloadSource{
+		BaseURL: s.BaseURL,
+		URL:     s.URL,
+		Version: s.Version,
+	}
+}
+
+// ResolveDownloadOverrides converts the provision AgentDownloads (from the
+// agent config JSON) into the goalstates.DownloadOverrides shape that
+// rootfs phase tasks consume. Returns nil when no overrides are set.
+func ResolveDownloadOverrides(d *AgentDownloads) *goalstates.DownloadOverrides {
+	if d == nil {
+		return nil
+	}
+
+	convert := func(s *AgentDownloadSource) *goalstates.DownloadSource {
+		if s == nil {
+			return nil
+		}
+		if s.BaseURL == "" && s.URL == "" && s.Version == "" {
+			return nil
+		}
+		return &goalstates.DownloadSource{
+			BaseURL: s.BaseURL,
+			URL:     s.URL,
+			Version: s.Version,
+		}
+	}
+
+	out := &goalstates.DownloadOverrides{
+		Kubernetes: convert(d.Kubernetes),
+		Containerd: convert(d.Containerd),
+		Runc:       convert(d.Runc),
+		CNI:        convert(d.CNI),
+		Crictl:     convert(d.Crictl),
+	}
+
+	if out.Kubernetes == nil && out.Containerd == nil && out.Runc == nil && out.CNI == nil && out.Crictl == nil {
+		return nil
+	}
+
+	return out
 }

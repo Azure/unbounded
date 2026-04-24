@@ -828,3 +828,92 @@ func TestMachineRegisterHandler_Execute_WithNodeLabels(t *testing.T) {
 	require.Contains(t, string(appliedData), "kubernetes.azure.com/managed")
 	require.Contains(t, string(appliedData), "env: prod")
 }
+
+// TestMachineRegisterHandler_Execute_WithAgentOverrides verifies that the
+// --agent-version, --agent-base-url, --agent-url flags flow into
+// Machine.Spec.Agent on the applied resource.
+func TestMachineRegisterHandler_Execute_WithAgentOverrides(t *testing.T) {
+	t.Parallel()
+
+	sshKeyPath := writeTempSSHKey(t)
+
+	var appliedData []byte
+
+	kubeResourcesCli := fakeclient.NewClientBuilder().
+		WithInterceptorFuncs(interceptor.Funcs{
+			Apply: func(_ context.Context, _ client.WithWatch, obj runtime.ApplyConfiguration, _ ...client.ApplyOption) error {
+				appliedData, _ = yaml.Marshal(obj)
+				return nil
+			},
+		}).
+		Build()
+
+	kubeCli := fake.NewClientset(newBootstrapTokenSecret("dc1"))
+
+	h := &machineRegisterHandler{
+		siteName:          "dc1",
+		host:              "10.0.0.5",
+		hostSSHUsername:   "admin",
+		hostSSHPrivateKey: sshKeyPath,
+		agentVersion:      "v0.0.10",
+		agentBaseURL:      "https://mirror.example.com/unbounded",
+		kubeCli:           kubeCli,
+		kubeResourcesCli:  kubeResourcesCli,
+		logger:            discardLogger(),
+	}
+
+	h.setDefaults()
+
+	err := h.executeAfterValidation(context.Background())
+	require.NoError(t, err)
+
+	s := string(appliedData)
+	require.Contains(t, s, "agent:")
+	require.Contains(t, s, "version: v0.0.10")
+	require.Contains(t, s, "baseURL: https://mirror.example.com/unbounded")
+}
+
+// TestMachineRegisterHandler_Execute_WithDownloadOverrides verifies that the
+// rootfs download override flags flow into Machine.Spec.Agent.Downloads.
+func TestMachineRegisterHandler_Execute_WithDownloadOverrides(t *testing.T) {
+	t.Parallel()
+
+	sshKeyPath := writeTempSSHKey(t)
+
+	var appliedData []byte
+
+	kubeResourcesCli := fakeclient.NewClientBuilder().
+		WithInterceptorFuncs(interceptor.Funcs{
+			Apply: func(_ context.Context, _ client.WithWatch, obj runtime.ApplyConfiguration, _ ...client.ApplyOption) error {
+				appliedData, _ = yaml.Marshal(obj)
+				return nil
+			},
+		}).
+		Build()
+
+	kubeCli := fake.NewClientset(newBootstrapTokenSecret("dc1"))
+
+	h := &machineRegisterHandler{
+		siteName:          "dc1",
+		host:              "10.0.0.5",
+		hostSSHUsername:   "admin",
+		hostSSHPrivateKey: sshKeyPath,
+		kubernetesBaseURL: "https://mirror.example.com/k8s",
+		containerdVersion: "2.0.5",
+		crictlBaseURL:     "https://mirror.example.com/cri-tools/releases/download",
+		kubeCli:           kubeCli,
+		kubeResourcesCli:  kubeResourcesCli,
+		logger:            discardLogger(),
+	}
+
+	h.setDefaults()
+
+	err := h.executeAfterValidation(context.Background())
+	require.NoError(t, err)
+
+	s := string(appliedData)
+	require.Contains(t, s, "downloads:")
+	require.Contains(t, s, "baseURL: https://mirror.example.com/k8s")
+	require.Contains(t, s, "version: 2.0.5")
+	require.Contains(t, s, "baseURL: https://mirror.example.com/cri-tools/releases/download")
+}

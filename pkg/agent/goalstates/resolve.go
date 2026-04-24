@@ -27,7 +27,7 @@ type MachineGoalState struct {
 // ResolveMachine probes the host (kernel version, hostname, GPU hardware) and
 // resolves the complete goal state for the named nspawn machine from an agent
 // config.
-func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName string) (*MachineGoalState, error) {
+func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName string, downloads *DownloadOverrides) (*MachineGoalState, error) {
 	kernel, err := hostKernel()
 	if err != nil {
 		return nil, fmt.Errorf("get host kernel: %w", err)
@@ -81,6 +81,7 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 		RunCVersion:       runcVersion,
 		CNIPluginVersion:  cniVersion,
 		KubernetesVersion: cfg.Cluster.Version,
+		Downloads:         downloads,
 		OCIImage:          ociImage,
 		Nvidia:            nvidia,
 		HostDevicePaths:   DiscoverHostDevicePaths(),

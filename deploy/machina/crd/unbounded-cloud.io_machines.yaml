@@ -59,13 +59,164 @@ spec:
               agent:
                 description: Agent contains settings for the unbounded node agent.
                 properties:
+                  baseURL:
+                    description: |-
+                      BaseURL overrides the base URL used to construct the
+                      unbounded-agent download URL. Defaults to the upstream GitHub
+                      releases URL. The layout under BaseURL must match the GitHub
+                      releases layout (<base>/latest/download/<asset> and
+                      <base>/download/<tag>/<asset>).
+                    type: string
+                  downloads:
+                    description: |-
+                      Downloads overrides the download sources for the binaries the
+                      agent installs into the nspawn rootfs (kubelet, containerd, runc,
+                      CNI plugins, crictl). When unset the agent downloads each
+                      artifact from its upstream default host.
+                    properties:
+                      cni:
+                        description: |-
+                          CNI overrides the download source for CNI plugins
+                          (upstream default: https://github.com/containernetworking/plugins).
+                        properties:
+                          baseURL:
+                            description: |-
+                              BaseURL replaces the upstream host + path prefix used to
+                              construct the download URL. Version and arch substitution are
+                              preserved so mirrors need to publish assets under the same
+                              layout as the upstream project.
+                            type: string
+                          url:
+                            description: |-
+                              URL is a fully qualified download URL template. Version/arch
+                              substitution via fmt directives is preserved. When set it
+                              overrides BaseURL entirely.
+                            type: string
+                          version:
+                            description: |-
+                              Version overrides the version of the artifact that would
+                              otherwise be derived from the cluster Kubernetes version or the
+                              agent's compiled-in defaults.
+                            type: string
+                        type: object
+                      containerd:
+                        description: |-
+                          Containerd overrides the download source for containerd
+                          (upstream default: https://github.com/containerd/containerd).
+                        properties:
+                          baseURL:
+                            description: |-
+                              BaseURL replaces the upstream host + path prefix used to
+                              construct the download URL. Version and arch substitution are
+                              preserved so mirrors need to publish assets under the same
+                              layout as the upstream project.
+                            type: string
+                          url:
+                            description: |-
+                              URL is a fully qualified download URL template. Version/arch
+                              substitution via fmt directives is preserved. When set it
+                              overrides BaseURL entirely.
+                            type: string
+                          version:
+                            description: |-
+                              Version overrides the version of the artifact that would
+                              otherwise be derived from the cluster Kubernetes version or the
+                              agent's compiled-in defaults.
+                            type: string
+                        type: object
+                      crictl:
+                        description: |-
+                          Crictl overrides the download source for crictl
+                          (upstream default: https://github.com/kubernetes-sigs/cri-tools).
+                        properties:
+                          baseURL:
+                            description: |-
+                              BaseURL replaces the upstream host + path prefix used to
+                              construct the download URL. Version and arch substitution are
+                              preserved so mirrors need to publish assets under the same
+                              layout as the upstream project.
+                            type: string
+                          url:
+                            description: |-
+                              URL is a fully qualified download URL template. Version/arch
+                              substitution via fmt directives is preserved. When set it
+                              overrides BaseURL entirely.
+                            type: string
+                          version:
+                            description: |-
+                              Version overrides the version of the artifact that would
+                              otherwise be derived from the cluster Kubernetes version or the
+                              agent's compiled-in defaults.
+                            type: string
+                        type: object
+                      kubernetes:
+                        description: |-
+                          Kubernetes overrides the download source for kubelet/kubectl/kube-proxy
+                          (upstream default: https://dl.k8s.io).
+                        properties:
+                          baseURL:
+                            description: |-
+                              BaseURL replaces the upstream host + path prefix used to
+                              construct the download URL. Version and arch substitution are
+                              preserved so mirrors need to publish assets under the same
+                              layout as the upstream project.
+                            type: string
+                          url:
+                            description: |-
+                              URL is a fully qualified download URL template. Version/arch
+                              substitution via fmt directives is preserved. When set it
+                              overrides BaseURL entirely.
+                            type: string
+                          version:
+                            description: |-
+                              Version overrides the version of the artifact that would
+                              otherwise be derived from the cluster Kubernetes version or the
+                              agent's compiled-in defaults.
+                            type: string
+                        type: object
+                      runc:
+                        description: |-
+                          Runc overrides the download source for runc
+                          (upstream default: https://github.com/opencontainers/runc).
+                        properties:
+                          baseURL:
+                            description: |-
+                              BaseURL replaces the upstream host + path prefix used to
+                              construct the download URL. Version and arch substitution are
+                              preserved so mirrors need to publish assets under the same
+                              layout as the upstream project.
+                            type: string
+                          url:
+                            description: |-
+                              URL is a fully qualified download URL template. Version/arch
+                              substitution via fmt directives is preserved. When set it
+                              overrides BaseURL entirely.
+                            type: string
+                          version:
+                            description: |-
+                              Version overrides the version of the artifact that would
+                              otherwise be derived from the cluster Kubernetes version or the
+                              agent's compiled-in defaults.
+                            type: string
+                        type: object
+                    type: object
                   image:
                     description: |-
                       Image is the OCI image reference used for provisioning the
-                      nspawn machine (e.g. "ghcr.io/org/repo:tag").
+                      nspawn machine (e.g. "ghcr.io/org/repo:tag"). When empty the
+                      agent falls back to its built-in default image.
                     type: string
-                required:
-                - image
+                  url:
+                    description: |-
+                      URL is a fully qualified download URL for the unbounded-agent
+                      tarball. When set it overrides Version and BaseURL entirely.
+                    type: string
+                  version:
+                    description: |-
+                      Version pins the unbounded-agent release tag that is downloaded
+                      onto the host (e.g. "v0.0.10"). When empty the install script
+                      tracks the latest published release.
+                    type: string
                 type: object
               kubernetes:
                 description: Kubernetes contains Kubernetes-specific configuration.

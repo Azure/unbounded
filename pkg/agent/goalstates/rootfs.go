@@ -18,6 +18,11 @@ type RootFS struct {
 	CNIPluginVersion    string
 	KubernetesVersion   string
 
+	// Downloads optionally overrides the download sources for binaries
+	// the agent installs into the nspawn rootfs (kubelet, containerd,
+	// runc, CNI plugins, crictl). Nil means upstream defaults apply.
+	Downloads *DownloadOverrides
+
 	// OCIImage is the fully-qualified OCI image reference (e.g.
 	// "ghcr.io/org/repo:tag") used to bootstrap the machine rootfs.
 	// The image must use OCI media types and include a platform manifest
