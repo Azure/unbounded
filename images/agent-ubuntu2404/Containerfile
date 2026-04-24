@@ -10,7 +10,7 @@ RUN apt-get update && \
     for attempt in 1 2 3 4 5; do \
       if DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
            systemd systemd-sysv dbus curl ca-certificates \
-           iproute2 nftables kmod udev procps wireguard-tools; then \
+           iproute2 nftables iptables kmod udev procps wireguard-tools; then \
         ok=true; break; \
       fi; \
       echo "apt-get install failed (attempt $attempt/5), retrying in 30s..."; \
