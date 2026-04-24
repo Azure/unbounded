@@ -12,6 +12,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"math/big"
+	"net"
 	"testing"
 	"time"
 
@@ -74,6 +75,39 @@ func generateTestCert(t *testing.T, caCert *x509.Certificate, caKey *rsa.Private
 			CommonName: "test",
 		},
 		DNSNames:    dnsNames,
+		NotBefore:   notBefore,
+		NotAfter:    notAfter,
+		KeyUsage:    x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+
+	certDER, err := x509.CreateCertificate(rand.Reader, template, caCert, &key.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("failed to create certificate: %v", err)
+	}
+
+	certPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	keyPEM = pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+
+	return certPEM, keyPEM
+}
+
+// generateTestCertWithIPs creates a server certificate with IP SANs, signed by the given CA.
+func generateTestCertWithIPs(t *testing.T, caCert *x509.Certificate, caKey *rsa.PrivateKey, dnsNames []string, ips []net.IP, notBefore, notAfter time.Time) (certPEM, keyPEM []byte) {
+	t.Helper()
+
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("failed to generate key: %v", err)
+	}
+
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject: pkix.Name{
+			CommonName: "test",
+		},
+		DNSNames:    dnsNames,
+		IPAddresses: ips,
 		NotBefore:   notBefore,
 		NotAfter:    notAfter,
 		KeyUsage:    x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
@@ -173,18 +207,21 @@ func TestValidateCertificate(t *testing.T) {
 	expectedDNS := cm.dnsNames()
 
 	tests := []struct {
-		name      string
-		dns       []string
-		notBefore time.Time
-		notAfter  time.Time
-		valid     bool
+		name        string
+		dns         []string
+		ips         []net.IP
+		expectedIPs []net.IP
+		notBefore   time.Time
+		notAfter    time.Time
+		valid       bool
 	}{
 		{
-			name:      "valid certificate",
-			dns:       expectedDNS,
-			notBefore: time.Now().Add(-1 * time.Hour),
-			notAfter:  time.Now().Add(90 * 24 * time.Hour),
-			valid:     true,
+			name:        "valid certificate no IP check",
+			dns:         expectedDNS,
+			notBefore:   time.Now().Add(-1 * time.Hour),
+			notAfter:    time.Now().Add(90 * 24 * time.Hour),
+			expectedIPs: nil,
+			valid:       true,
 		},
 		{
 			name:      "expired certificate",
@@ -207,6 +244,69 @@ func TestValidateCertificate(t *testing.T) {
 			notAfter:  time.Now().Add(90 * 24 * time.Hour),
 			valid:     false,
 		},
+		{
+			name:        "valid certificate with matching IP SANs",
+			dns:         expectedDNS,
+			ips:         []net.IP{net.ParseIP("10.0.0.1")},
+			expectedIPs: []net.IP{net.ParseIP("10.0.0.1")},
+			notBefore:   time.Now().Add(-1 * time.Hour),
+			notAfter:    time.Now().Add(90 * 24 * time.Hour),
+			valid:       true,
+		},
+		{
+			name:        "IP changed - cert has old IP",
+			dns:         expectedDNS,
+			ips:         []net.IP{net.ParseIP("10.0.0.1")},
+			expectedIPs: []net.IP{net.ParseIP("10.0.0.2")},
+			notBefore:   time.Now().Add(-1 * time.Hour),
+			notAfter:    time.Now().Add(90 * 24 * time.Hour),
+			valid:       false,
+		},
+		{
+			name:        "cert has no IP SANs but service has ClusterIP",
+			dns:         expectedDNS,
+			ips:         nil,
+			expectedIPs: []net.IP{net.ParseIP("10.0.0.1")},
+			notBefore:   time.Now().Add(-1 * time.Hour),
+			notAfter:    time.Now().Add(90 * 24 * time.Hour),
+			valid:       false,
+		},
+		{
+			name:        "nil expectedIPs skips IP validation",
+			dns:         expectedDNS,
+			ips:         []net.IP{net.ParseIP("10.0.0.1")},
+			expectedIPs: nil,
+			notBefore:   time.Now().Add(-1 * time.Hour),
+			notAfter:    time.Now().Add(90 * 24 * time.Hour),
+			valid:       true,
+		},
+		{
+			name:        "dual-stack IPs all present",
+			dns:         expectedDNS,
+			ips:         []net.IP{net.ParseIP("10.0.0.1"), net.ParseIP("fd00::1")},
+			expectedIPs: []net.IP{net.ParseIP("10.0.0.1"), net.ParseIP("fd00::1")},
+			notBefore:   time.Now().Add(-1 * time.Hour),
+			notAfter:    time.Now().Add(90 * 24 * time.Hour),
+			valid:       true,
+		},
+		{
+			name:        "dual-stack missing one IP",
+			dns:         expectedDNS,
+			ips:         []net.IP{net.ParseIP("10.0.0.1")},
+			expectedIPs: []net.IP{net.ParseIP("10.0.0.1"), net.ParseIP("fd00::1")},
+			notBefore:   time.Now().Add(-1 * time.Hour),
+			notAfter:    time.Now().Add(90 * 24 * time.Hour),
+			valid:       false,
+		},
+		{
+			name:        "empty expectedIPs skips IP validation",
+			dns:         expectedDNS,
+			ips:         []net.IP{net.ParseIP("10.0.0.1")},
+			expectedIPs: []net.IP{},
+			notBefore:   time.Now().Add(-1 * time.Hour),
+			notAfter:    time.Now().Add(90 * 24 * time.Hour),
+			valid:       true,
+		},
 	}
 
 	for _, tc := range tests {
@@ -220,6 +320,7 @@ func TestValidateCertificate(t *testing.T) {
 				SerialNumber: big.NewInt(1),
 				Subject:      pkix.Name{CommonName: "test"},
 				DNSNames:     tc.dns,
+				IPAddresses:  tc.ips,
 				NotBefore:    tc.notBefore,
 				NotAfter:     tc.notAfter,
 			}
@@ -234,7 +335,7 @@ func TestValidateCertificate(t *testing.T) {
 				t.Fatalf("failed to parse certificate: %v", err)
 			}
 
-			result := cm.validateCertificate(cert)
+			result := cm.validateCertificate(cert, tc.expectedIPs)
 			if result != tc.valid {
 				t.Errorf("expected validateCertificate to return %v, got %v", tc.valid, result)
 			}
@@ -545,6 +646,119 @@ func TestEnsureCertificateRegeneratesExpiredCA(t *testing.T) {
 
 	if time.Now().After(newCACert.NotAfter) {
 		t.Error("new CA certificate is already expired")
+	}
+}
+
+func TestEnsureCertificateRotatesWhenClusterIPChanges(t *testing.T) {
+	oldIP := "10.96.0.100"
+	newIP := "10.96.0.200"
+
+	// Create a Service with the old ClusterIP.
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-svc",
+			Namespace: "kube-system",
+		},
+		Spec: corev1.ServiceSpec{
+			ClusterIP:  oldIP,
+			ClusterIPs: []string{oldIP},
+		},
+	}
+
+	cm := NewCertManager(Options{
+		Namespace:   "kube-system",
+		ServiceName: "test-svc",
+	})
+
+	dns := cm.dnsNames()
+	caCertPEM, caKeyPEM, caCert, caKey := generateTestCA(t,
+		time.Now().Add(-1*time.Hour),
+		time.Now().Add(10*365*24*time.Hour))
+
+	// Create a cert with the old IP as an IP SAN.
+	certPEM, keyPEM := generateTestCertWithIPs(t, caCert, caKey, dns,
+		[]net.IP{net.ParseIP(oldIP)},
+		time.Now().Add(-1*time.Hour),
+		time.Now().Add(90*24*time.Hour))
+
+	// Include a valid HMAC key so EnsureCertificate doesn't rotate for that reason.
+	hmacKey := make([]byte, 32)
+	for i := range hmacKey {
+		hmacKey[i] = byte(i)
+	}
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      defaultSecretName,
+			Namespace: "kube-system",
+		},
+		Type: corev1.SecretTypeTLS,
+		Data: map[string][]byte{
+			"tls.crt":  certPEM,
+			"tls.key":  keyPEM,
+			"ca.crt":   caCertPEM,
+			"ca.key":   caKeyPEM,
+			"hmac.key": hmacKey,
+		},
+	}
+
+	// Start with old IP - cert should load without rotation.
+	client := fake.NewClientset(secret, svc)
+	cm.clientset = client
+
+	ctx := context.Background()
+	if err := cm.EnsureCertificate(ctx); err != nil {
+		t.Fatalf("EnsureCertificate with matching IP: %v", err)
+	}
+
+	// Read back the secret - it should be unchanged (no rotation).
+	origSecret, err := client.CoreV1().Secrets("kube-system").Get(ctx, defaultSecretName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("failed to get secret: %v", err)
+	}
+
+	if string(origSecret.Data["tls.crt"]) != string(certPEM) {
+		t.Fatal("expected cert to be unchanged when IP matches, but it was rotated")
+	}
+
+	// Now change the Service's ClusterIP to simulate a service recreation.
+	svc.Spec.ClusterIP = newIP
+	svc.Spec.ClusterIPs = []string{newIP}
+	if _, err := client.CoreV1().Services("kube-system").Update(ctx, svc, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("failed to update service: %v", err)
+	}
+
+	// EnsureCertificate should detect the IP mismatch and rotate.
+	if err := cm.EnsureCertificate(ctx); err != nil {
+		t.Fatalf("EnsureCertificate after IP change: %v", err)
+	}
+
+	// The cert should have been rotated (different from original).
+	updatedSecret, err := client.CoreV1().Secrets("kube-system").Get(ctx, defaultSecretName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("failed to get updated secret: %v", err)
+	}
+
+	if string(updatedSecret.Data["tls.crt"]) == string(certPEM) {
+		t.Fatal("expected cert to be rotated after ClusterIP change, but it was unchanged")
+	}
+
+	// Verify the new cert has the new IP as an IP SAN.
+	newCert, err := parseCertPEM(updatedSecret.Data["tls.crt"])
+	if err != nil {
+		t.Fatalf("failed to parse new cert: %v", err)
+	}
+
+	foundNewIP := false
+	for _, ip := range newCert.IPAddresses {
+		if ip.String() == newIP {
+			foundNewIP = true
+			break
+		}
+	}
+
+	if !foundNewIP {
+		t.Errorf("expected new cert to contain IP SAN %s, got %v", newIP, newCert.IPAddresses)
 	}
 }
 
