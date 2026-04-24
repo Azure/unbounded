@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -619,7 +620,8 @@ func (r *MachineReconciler) provisionMachine(
 	execSession.Stderr = &stderr
 
 	cmd := fmt.Sprintf(
-		`UNBOUNDED_AGENT_CONFIG_FILE=%q sudo -E bash %s`,
+		`%sUNBOUNDED_AGENT_CONFIG_FILE=%q sudo -E bash %s`,
+		agentInstallEnvPrefix(machine),
 		remoteConfigPath,
 		remoteScriptPath,
 	)
@@ -862,4 +864,20 @@ func (r *MachineReconciler) reconcileNodeJoin(ctx context.Context, machine *unbo
 func wasProvisioned(machine *unboundedv1alpha3.Machine) bool {
 	cond := apimeta.FindStatusCondition(machine.Status.Conditions, unboundedv1alpha3.MachineConditionProvisioned)
 	return cond != nil && cond.Status == metav1.ConditionTrue
+}
+
+// agentInstallEnvPrefix returns a space-terminated list of POSIX-quoted
+// KEY=VALUE pairs that should be prepended to the agent install script
+// invocation. Empty string when no overrides are set.
+func agentInstallEnvPrefix(machine *unboundedv1alpha3.Machine) string {
+	if machine == nil {
+		return ""
+	}
+
+	env := provision.AgentInstallEnv(machine.Spec.Agent)
+	if len(env) == 0 {
+		return ""
+	}
+
+	return strings.Join(env, " ") + " "
 }

@@ -1473,3 +1473,63 @@ func TestSchemeRegistration(t *testing.T) {
 
 // Ensure fake client satisfies the client.Client interface.
 var _ client.Client = (fake.NewClientBuilder().Build())
+
+func TestAgentInstallEnvPrefix(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		machine *unboundedv1alpha3.Machine
+		want    string
+	}{
+		{
+			name: "nil machine",
+			want: "",
+		},
+		{
+			name:    "no agent spec",
+			machine: &unboundedv1alpha3.Machine{},
+			want:    "",
+		},
+		{
+			name: "agent spec without download overrides",
+			machine: &unboundedv1alpha3.Machine{
+				Spec: unboundedv1alpha3.MachineSpec{
+					Agent: &unboundedv1alpha3.AgentSpec{Image: "ghcr.io/example/rootfs:1"},
+				},
+			},
+			want: "",
+		},
+		{
+			name: "version override",
+			machine: &unboundedv1alpha3.Machine{
+				Spec: unboundedv1alpha3.MachineSpec{
+					Agent: &unboundedv1alpha3.AgentSpec{Version: "v0.0.10"},
+				},
+			},
+			want: "AGENT_VERSION='v0.0.10' ",
+		},
+		{
+			name: "base url and version",
+			machine: &unboundedv1alpha3.Machine{
+				Spec: unboundedv1alpha3.MachineSpec{
+					Agent: &unboundedv1alpha3.AgentSpec{
+						Version: "v0.0.10",
+						BaseURL: "https://mirror.example.com/unbounded",
+					},
+				},
+			},
+			want: "AGENT_VERSION='v0.0.10' AGENT_BASE_URL='https://mirror.example.com/unbounded' ",
+		},
+	}
+
+	for i := range tests {
+		tt := tests[i]
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := agentInstallEnvPrefix(tt.machine)
+			require.Equal(t, tt.want, got)
+		})
+	}
+}

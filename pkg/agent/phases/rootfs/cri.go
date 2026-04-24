@@ -17,16 +17,16 @@ import (
 )
 
 const (
-	// containerdURLTemplate is the download URL template for containerd releases.
-	// Parameters: version, version, arch.
-	containerdURLTemplate = "https://github.com/containerd/containerd/releases/download/v%s/containerd-%s-linux-%s.tar.gz"
+	// containerdDefaultBaseURL is the upstream base URL for containerd releases.
+	// Mirrors must preserve the <base>/v<ver>/<asset> layout.
+	containerdDefaultBaseURL = "https://github.com/containerd/containerd/releases/download"
 
 	// containerdTarPrefix is the path prefix for binaries within the containerd tar archive.
 	containerdTarPrefix = "bin/"
 
-	// runcURLTemplate is the download URL template for runc releases.
-	// Parameters: version, arch.
-	runcURLTemplate = "https://github.com/opencontainers/runc/releases/download/v%s/runc.%s"
+	// runcDefaultBaseURL is the upstream base URL for runc releases.
+	// Mirrors must preserve the <base>/v<ver>/<asset> layout.
+	runcDefaultBaseURL = "https://github.com/opencontainers/runc/releases/download"
 )
 
 // containerdBinaries lists all binaries included in containerd releases.
@@ -53,22 +53,75 @@ func (d *downloadCRIBinaries) Name() string { return "download-cri-binaries" }
 func (d *downloadCRIBinaries) Do(ctx context.Context) error {
 	destDir := filepath.Join(d.goalState.MachineDir, goalstates.BinDir)
 
-	containerdURL := fmt.Sprintf(containerdURLTemplate, d.goalState.ContainerdVersion, d.goalState.ContainerdVersion, d.goalState.HostArch)
-	runcURL := fmt.Sprintf(runcURLTemplate, d.goalState.RunCVersion, d.goalState.HostArch)
+	containerdVersion := d.goalState.ContainerdVersion
+	runcVersion := d.goalState.RunCVersion
 
-	if !containerdVersionMatch(ctx, d.log, destDir, d.goalState.ContainerdVersion) {
+	var (
+		containerdOverride *goalstates.DownloadSource
+		runcOverride       *goalstates.DownloadSource
+	)
+
+	if d.goalState.Downloads != nil {
+		containerdOverride = d.goalState.Downloads.Containerd
+		runcOverride = d.goalState.Downloads.Runc
+	}
+
+	if containerdOverride != nil && containerdOverride.Version != "" {
+		containerdVersion = containerdOverride.Version
+	}
+
+	if runcOverride != nil && runcOverride.Version != "" {
+		runcVersion = runcOverride.Version
+	}
+
+	containerdURL := containerdDownloadURL(containerdOverride, containerdVersion, d.goalState.HostArch)
+	runcURL := runcDownloadURL(runcOverride, runcVersion, d.goalState.HostArch)
+
+	if !containerdVersionMatch(ctx, d.log, destDir, containerdVersion) {
 		if err := downloadContainerd(ctx, containerdURL, destDir); err != nil {
 			return err
 		}
 	}
 
-	if !runcVersionMatch(ctx, d.log, destDir, d.goalState.RunCVersion) {
+	if !runcVersionMatch(ctx, d.log, destDir, runcVersion) {
 		if err := downloadRunc(ctx, runcURL, destDir); err != nil {
 			return err
 		}
 	}
 
 	return nil
+}
+
+// containerdDownloadURL resolves the containerd release tarball URL,
+// honoring BaseURL / URL overrides. The upstream path-and-filename layout
+// (containerd-<ver>-linux-<arch>.tar.gz) is preserved so mirrors must
+// publish under the same structure.
+func containerdDownloadURL(override *goalstates.DownloadSource, version, arch string) string {
+	if override != nil && override.URL != "" {
+		return fmt.Sprintf(override.URL, version, version, arch)
+	}
+
+	base := containerdDefaultBaseURL
+	if override != nil && override.BaseURL != "" {
+		base = strings.TrimRight(override.BaseURL, "/")
+	}
+
+	return fmt.Sprintf("%s/v%s/containerd-%s-linux-%s.tar.gz", base, version, version, arch)
+}
+
+// runcDownloadURL resolves the runc binary URL, honoring BaseURL / URL
+// overrides. The upstream filename (runc.<arch>) is preserved.
+func runcDownloadURL(override *goalstates.DownloadSource, version, arch string) string {
+	if override != nil && override.URL != "" {
+		return fmt.Sprintf(override.URL, version, arch)
+	}
+
+	base := runcDefaultBaseURL
+	if override != nil && override.BaseURL != "" {
+		base = strings.TrimRight(override.BaseURL, "/")
+	}
+
+	return fmt.Sprintf("%s/v%s/runc.%s", base, version, arch)
 }
 
 // downloadContainerd downloads and extracts containerd binaries from a tar.gz archive.

@@ -63,6 +63,28 @@ type machineRegisterHandler struct {
 	// Defaults to sshSecretName.
 	bastionSSHSecretName string
 
+	// agentVersion pins the unbounded-agent release tag to download on the
+	// host. When empty the install script tracks the latest published release.
+	agentVersion string
+
+	// agentBaseURL overrides the base URL used to construct the download
+	// URL for the unbounded-agent tarball. Useful for self-hosted mirrors.
+	agentBaseURL string
+
+	// agentURL overrides the fully-qualified download URL for the
+	// unbounded-agent tarball. Takes precedence over agentVersion and
+	// agentBaseURL.
+	agentURL string
+
+	// Download override flags for rootfs binaries installed by the agent.
+	// Each artifact exposes base-url / url / version triples mirroring
+	// the agent-* flags above. Empty means upstream defaults apply.
+	kubernetesBaseURL, kubernetesURL, kubernetesVersionOverride string
+	containerdBaseURL, containerdURL, containerdVersion         string
+	runcBaseURL, runcURL, runcVersion                           string
+	cniBaseURL, cniURL, cniVersion                              string
+	crictlBaseURL, crictlURL, crictlVersion                     string
+
 	// kubeCli is the kubernetes client interface.
 	kubeCli kubernetes.Interface
 
@@ -204,6 +226,7 @@ func (h *machineRegisterHandler) executeAfterValidation(ctx context.Context) err
 					Name: fmt.Sprintf("bootstrap-token-%s", bootstrapToken.ID),
 				},
 			},
+			Agent: h.buildAgentSpec(),
 		},
 	}
 
@@ -238,6 +261,59 @@ func (h *machineRegisterHandler) executeAfterValidation(ctx context.Context) err
 	h.logger.Info("machine applied", "name", h.name)
 
 	return nil
+}
+
+// buildAgentSpec returns an AgentSpec when any agent-related override has
+// been set on the handler, otherwise nil so Spec.Agent stays empty.
+func (h *machineRegisterHandler) buildAgentSpec() *v1alpha3.AgentSpec {
+	agent := &v1alpha3.AgentSpec{
+		Version: h.agentVersion,
+		BaseURL: h.agentBaseURL,
+		URL:     h.agentURL,
+	}
+
+	downloads := h.buildDownloadsSpec()
+	if downloads != nil {
+		agent.Downloads = downloads
+	}
+
+	if agent.Version == "" && agent.BaseURL == "" && agent.URL == "" && agent.Image == "" && agent.Downloads == nil {
+		return nil
+	}
+
+	return agent
+}
+
+// buildDownloadsSpec returns a non-nil AgentDownloadsSpec when any rootfs
+// download override flag has been set.
+func (h *machineRegisterHandler) buildDownloadsSpec() *v1alpha3.AgentDownloadsSpec {
+	out := &v1alpha3.AgentDownloadsSpec{
+		Kubernetes: downloadSourceFromFlags(h.kubernetesBaseURL, h.kubernetesURL, h.kubernetesVersionOverride),
+		Containerd: downloadSourceFromFlags(h.containerdBaseURL, h.containerdURL, h.containerdVersion),
+		Runc:       downloadSourceFromFlags(h.runcBaseURL, h.runcURL, h.runcVersion),
+		CNI:        downloadSourceFromFlags(h.cniBaseURL, h.cniURL, h.cniVersion),
+		Crictl:     downloadSourceFromFlags(h.crictlBaseURL, h.crictlURL, h.crictlVersion),
+	}
+
+	if out.Kubernetes == nil && out.Containerd == nil && out.Runc == nil && out.CNI == nil && out.Crictl == nil {
+		return nil
+	}
+
+	return out
+}
+
+// downloadSourceFromFlags builds a DownloadSource from the given flag
+// values. Returns nil when all values are empty.
+func downloadSourceFromFlags(baseURL, url, version string) *v1alpha3.DownloadSource {
+	if baseURL == "" && url == "" && version == "" {
+		return nil
+	}
+
+	return &v1alpha3.DownloadSource{
+		BaseURL: baseURL,
+		URL:     url,
+		Version: version,
+	}
 }
 
 func (h *machineRegisterHandler) setDefaults() {
@@ -370,6 +446,47 @@ func machineRegisterCommand() *cobra.Command {
 	cmd.Flags().StringVar(&handler.bastionSSHPrivateKey, "bastion-ssh-private-key", "", "Path to SSH private key file for the bastion (defaults to --ssh-private-key)")
 	cmd.Flags().StringVar(&handler.kubeconfigPath, "kubeconfig", "", "Path to kubeconfig file")
 	cmd.Flags().StringArrayVar(&handler.nodeLabels, "node-label", nil, "Label in key=value format to pass to kubelet (can be repeated)")
+
+	// Agent binary download overrides. See `kubectl unbounded machine manual-bootstrap --help`
+	// for the equivalent flags on the manual bootstrap path.
+	cmd.Flags().StringVar(&handler.agentVersion, "agent-version", "",
+		"Pin the unbounded-agent release tag to download on the host (default: latest GitHub release)")
+	cmd.Flags().StringVar(&handler.agentBaseURL, "agent-base-url", "",
+		"Base URL for unbounded-agent release downloads (default: https://github.com/Azure/unbounded/releases). Use this to self-host or mirror release assets")
+	cmd.Flags().StringVar(&handler.agentURL, "agent-url", "",
+		"Fully qualified download URL for the unbounded-agent tarball (overrides --agent-version and --agent-base-url)")
+
+	// Rootfs binary download overrides.
+	cmd.Flags().StringVar(&handler.kubernetesBaseURL, "kubernetes-base-url", "",
+		"Base URL for kubelet/kubectl/kube-proxy downloads (default: https://dl.k8s.io). Mirrors must preserve the <base>/v<ver>/bin/linux/<arch>/ layout")
+	cmd.Flags().StringVar(&handler.kubernetesURL, "kubernetes-url", "",
+		"Full URL template for kubernetes binary downloads (fmt placeholders: version, arch, binary)")
+	cmd.Flags().StringVar(&handler.kubernetesVersionOverride, "kubernetes-binary-version", "",
+		"Override the Kubernetes binary version installed in the rootfs (defaults to the cluster Kubernetes version)")
+	cmd.Flags().StringVar(&handler.containerdBaseURL, "containerd-base-url", "",
+		"Base URL for containerd release downloads (default: https://github.com/containerd/containerd/releases/download)")
+	cmd.Flags().StringVar(&handler.containerdURL, "containerd-url", "",
+		"Full URL template for containerd downloads (fmt placeholders: version, version, arch)")
+	cmd.Flags().StringVar(&handler.containerdVersion, "containerd-version", "",
+		"Override the containerd version installed in the rootfs (defaults to agent's built-in version)")
+	cmd.Flags().StringVar(&handler.runcBaseURL, "runc-base-url", "",
+		"Base URL for runc release downloads (default: https://github.com/opencontainers/runc/releases/download)")
+	cmd.Flags().StringVar(&handler.runcURL, "runc-url", "",
+		"Full URL template for runc downloads (fmt placeholders: version, arch)")
+	cmd.Flags().StringVar(&handler.runcVersion, "runc-version", "",
+		"Override the runc version installed in the rootfs (defaults to agent's built-in version)")
+	cmd.Flags().StringVar(&handler.cniBaseURL, "cni-base-url", "",
+		"Base URL for CNI plugins release downloads (default: https://github.com/containernetworking/plugins/releases/download)")
+	cmd.Flags().StringVar(&handler.cniURL, "cni-url", "",
+		"Full URL template for CNI plugins downloads (fmt placeholders: version, arch, version)")
+	cmd.Flags().StringVar(&handler.cniVersion, "cni-version", "",
+		"Override the CNI plugins version installed in the rootfs (defaults to agent's built-in version)")
+	cmd.Flags().StringVar(&handler.crictlBaseURL, "crictl-base-url", "",
+		"Base URL for cri-tools (crictl) release downloads (default: https://github.com/kubernetes-sigs/cri-tools/releases/download)")
+	cmd.Flags().StringVar(&handler.crictlURL, "crictl-url", "",
+		"Full URL template for crictl downloads (fmt placeholders: version, version, os, arch)")
+	cmd.Flags().StringVar(&handler.crictlVersion, "crictl-version", "",
+		"Override the cri-tools/crictl version installed in the rootfs (defaults to the cluster Kubernetes minor, patch 0)")
 
 	if err := cmd.MarkFlagRequired("site"); err != nil {
 		panic(err)

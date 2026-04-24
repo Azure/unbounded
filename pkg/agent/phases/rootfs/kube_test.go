@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
 func TestCrictlVersionForKubernetesVersion(t *testing.T) {
@@ -83,6 +85,7 @@ func TestCrictlDownloadURL(t *testing.T) {
 
 	tests := []struct {
 		name     string
+		override *goalstates.DownloadSource
 		version  string
 		hostOS   string
 		hostArch string
@@ -109,6 +112,30 @@ func TestCrictlDownloadURL(t *testing.T) {
 			hostArch: "amd64",
 			want:     "https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.30.4/crictl-v1.30.4-windows-amd64.tar.gz",
 		},
+		{
+			name:     "base url override",
+			override: &goalstates.DownloadSource{BaseURL: "https://mirror.example.com/cri-tools"},
+			version:  "1.30.4",
+			hostOS:   "linux",
+			hostArch: "amd64",
+			want:     "https://mirror.example.com/cri-tools/v1.30.4/crictl-v1.30.4-linux-amd64.tar.gz",
+		},
+		{
+			name:     "base url override strips trailing slash",
+			override: &goalstates.DownloadSource{BaseURL: "https://mirror.example.com/cri-tools/"},
+			version:  "1.30.4",
+			hostOS:   "linux",
+			hostArch: "amd64",
+			want:     "https://mirror.example.com/cri-tools/v1.30.4/crictl-v1.30.4-linux-amd64.tar.gz",
+		},
+		{
+			name:     "full url override",
+			override: &goalstates.DownloadSource{URL: "https://mirror.example.com/crictl/%s/crictl-v%s-%s-%s.tgz"},
+			version:  "1.30.4",
+			hostOS:   "linux",
+			hostArch: "amd64",
+			want:     "https://mirror.example.com/crictl/1.30.4/crictl-v1.30.4-linux-amd64.tgz",
+		},
 	}
 
 	for i := range tests {
@@ -116,7 +143,101 @@ func TestCrictlDownloadURL(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
 
-			got := crictlDownloadURL(testCase.version, testCase.hostOS, testCase.hostArch)
+			got := crictlDownloadURL(testCase.override, testCase.version, testCase.hostOS, testCase.hostArch)
+			if got != testCase.want {
+				t.Fatalf("got URL %q, want %q", got, testCase.want)
+			}
+		})
+	}
+}
+
+func TestResolveCrictlVersion(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name              string
+		override          *goalstates.DownloadSource
+		kubernetesVersion string
+		want              string
+	}{
+		{
+			name:              "no override aligns to kubernetes minor",
+			kubernetesVersion: "1.33.5",
+			want:              "1.33.0",
+		},
+		{
+			name:              "nil override version falls through",
+			override:          &goalstates.DownloadSource{BaseURL: "https://mirror.example.com"},
+			kubernetesVersion: "1.33.5",
+			want:              "1.33.0",
+		},
+		{
+			name:              "version override wins over minor alignment",
+			override:          &goalstates.DownloadSource{Version: "1.34.1"},
+			kubernetesVersion: "1.33.5",
+			want:              "1.34.1",
+		},
+	}
+
+	for i := range tests {
+		testCase := tests[i]
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := resolveCrictlVersion(testCase.override, testCase.kubernetesVersion)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if got != testCase.want {
+				t.Fatalf("got version %q, want %q", got, testCase.want)
+			}
+		})
+	}
+}
+
+func TestKubernetesBinaryURL(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		override *goalstates.DownloadSource
+		version  string
+		arch     string
+		binary   string
+		want     string
+	}{
+		{
+			name:    "default",
+			version: "1.33.5",
+			arch:    "amd64",
+			binary:  "kubelet",
+			want:    "https://dl.k8s.io/v1.33.5/bin/linux/amd64/kubelet",
+		},
+		{
+			name:     "base url override",
+			override: &goalstates.DownloadSource{BaseURL: "https://mirror.example.com/k8s/"},
+			version:  "1.33.5",
+			arch:     "amd64",
+			binary:   "kubelet",
+			want:     "https://mirror.example.com/k8s/v1.33.5/bin/linux/amd64/kubelet",
+		},
+		{
+			name:     "url override",
+			override: &goalstates.DownloadSource{URL: "https://mirror.example.com/%s/%s/%s"},
+			version:  "1.33.5",
+			arch:     "amd64",
+			binary:   "kubelet",
+			want:     "https://mirror.example.com/1.33.5/amd64/kubelet",
+		},
+	}
+
+	for i := range tests {
+		testCase := tests[i]
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := kubernetesBinaryURL(testCase.override, testCase.version, testCase.arch, testCase.binary)
 			if got != testCase.want {
 				t.Fatalf("got URL %q, want %q", got, testCase.want)
 			}
