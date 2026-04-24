@@ -67,6 +67,29 @@ spec:
                 required:
                 - image
                 type: object
+              configurationRef:
+                description: |-
+                  ConfigurationRef references a MachineConfiguration (and
+                  optionally a specific version) that defines the configuration
+                  profile for this machine. If a specific version is set, that
+                  version is used at provisioning time; otherwise the latest
+                  locked version is used and the version field is set by the
+                  controller.
+                properties:
+                  name:
+                    description: Name is the name of the MachineConfiguration.
+                    minLength: 1
+                    type: string
+                  version:
+                    description: |-
+                      Version is the specific MachineConfigurationVersion number to
+                      use. If omitted, the controller selects the latest locked
+                      (deployed) version and populates this field.
+                    format: int32
+                    type: integer
+                required:
+                - name
+                type: object
               kubernetes:
                 description: Kubernetes contains Kubernetes-specific configuration.
                 properties:
@@ -383,6 +406,25 @@ spec:
                   - type
                   type: object
                 type: array
+              configuration:
+                description: |-
+                  Configuration records the MachineConfigurationVersion that was
+                  applied to this machine during the most recent provisioning.
+                properties:
+                  name:
+                    description: Name is the MachineConfiguration name.
+                    type: string
+                  version:
+                    description: Version is the MachineConfigurationVersion number
+                      that was applied.
+                    format: int32
+                    type: integer
+                  versionName:
+                    description: |-
+                      VersionName is the full MachineConfigurationVersion object name
+                      (e.g. "myconfig-v3").
+                    type: string
+                type: object
               message:
                 description: Message provides additional status information.
                 type: string

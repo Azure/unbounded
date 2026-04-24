@@ -168,6 +168,20 @@ jobs:
       - name: Validate Machine CR (self-registered)
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-machine-cr-created
 
+      - name: Validate daemon watching Machine CR
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-daemon
+
+      # Trigger a repave via the Machine CR and validate the daemon performs
+      # the nspawn machine update (kube1 -> kube2).
+      - name: Trigger node upgrade via Machine CR
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose trigger-upgrade
+
+      - name: Validate node upgrade completed
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-upgrade
+
+      - name: Wait for node to become Ready (post-upgrade)
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose wait-for-node
+
       - name: Validate workload on agent node
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-workload
 
@@ -192,6 +206,9 @@ jobs:
 
       - name: Validate Machine CR (rejoin)
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-machine-cr-created
+
+      - name: Validate daemon watching Machine CR (rejoin)
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-daemon
 
       - name: Validate workload on rejoined agent node
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-workload

@@ -66,10 +66,6 @@ func getMachine(ctx context.Context, c client.WithWatch, name string) (*v1alpha3
 		return nil, fmt.Errorf("getting Machine: %w", err)
 	}
 
-	if machine.Spec.PXE == nil || machine.Spec.PXE.Redfish == nil {
-		return nil, fmt.Errorf("machine %s has no redfish configuration; reboots require BMC access", name)
-	}
-
 	if machine.Spec.Operations == nil {
 		machine.Spec.Operations = &v1alpha3.OperationsSpec{}
 	}

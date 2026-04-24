@@ -9,27 +9,35 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/provision"
 )
 
-// kubeClientFunc constructs a controller-runtime client from a rest.Config.
-// The production implementation is client.NewWithWatch; tests can supply a fake.
+// kubeClientFunc constructs a controller-runtime WithWatch client from a
+// rest.Config. The production implementation is client.NewWithWatch;
+// tests can supply a fake.
 type kubeClientFunc func(cfg *rest.Config, opts client.Options) (client.WithWatch, error)
 
+const (
+	// watchRetryInterval is the delay between watch re-establishment attempts.
+	watchRetryInterval = 10 * time.Second
+)
+
 // Run is the main daemon entry point. It discovers the active nspawn
-// machine, builds a Kubernetes client, registers the Machine CR if needed,
-// and blocks until the context is cancelled.
-//
-// TODO: Add a trigger mechanism (e.g. file watch, signal, API) to invoke
-// updateNode when the desired config changes.
+// machine, builds a Kubernetes client from the applied config, and
+// watches both the Machine CR and MachineOperation CRs for changes.
+// A single worker goroutine processes all actions sequentially,
+// preventing overlapping machine-mutating operations.
 func Run(ctx context.Context, log *slog.Logger) error {
 	return run(ctx, log, client.NewWithWatch)
 }
@@ -43,13 +51,14 @@ func run(ctx context.Context, log *slog.Logger, newClient kubeClientFunc) error 
 		return fmt.Errorf("find active machine: %w", err)
 	}
 
+	machineName := active.Config.MachineName
 	log.Info("daemon starting",
-		"machine_cr", active.Config.MachineName,
+		"machine_cr", machineName,
 		"nspawn_machine", active.Name,
 		"applied_version", active.Config.Cluster.Version,
 	)
 
-	// Build a controller-runtime client from the applied config.
+	// Build a controller-runtime WithWatch client from the applied config.
 	kubeClient, err := buildKubeClient(active.Config, newClient)
 	if err != nil {
 		return fmt.Errorf("build kube client: %w", err)
@@ -59,18 +68,80 @@ func run(ctx context.Context, log *slog.Logger, newClient kubeClientFunc) error 
 		"api_server", active.Config.Kubelet.ApiServer,
 	)
 
-	// Ensure a Machine CR exists before blocking. In dynamic environments
-	// (manual-bootstrap, cloud-init) a Machine CR may not have been
-	// pre-created by machina.
+	// Ensure a Machine CR exists before entering the watch loop. In
+	// dynamic environments (manual-bootstrap, cloud-init) a Machine CR
+	// may not have been pre-created by machina.
 	if err := registerMachine(ctx, log, kubeClient, active.Config); err != nil {
 		return fmt.Errorf("register machine: %w", err)
 	}
 
-	// Block until shutdown.
-	<-ctx.Done()
-	log.Info("daemon shutting down")
+	// Unified action queue. Both watch loops enqueue Actions here; a
+	// single worker goroutine drains the queue sequentially. This
+	// guarantees that machine-mutating operations (repave, soft restart)
+	// never overlap.
+	queue := newActionQueue()
+	defer queue.ShutDown()
 
-	return nil
+	r := &reconciler{
+		client:      kubeClient,
+		machineName: machineName,
+		exec:        &defaultExecutor{},
+		findActive:  findActiveMachine,
+	}
+
+	// Single worker goroutine: processes actions one at a time.
+	go runWorker(ctx, log, r, queue)
+
+	// Operation CR watch loop (goroutine, retries internally).
+	go watchOperations(ctx, log, kubeClient, machineName, queue)
+
+	// Node watch loop (goroutine, retries internally). Detects Node
+	// deletion as the primary signal for the OnDelete update strategy.
+	go watchNode(ctx, log, kubeClient, queue)
+
+	// Machine CR watch loop (blocking, retries in-place).
+	for {
+		if err := watchMachine(ctx, log, kubeClient, machineName, queue); err != nil {
+			if ctx.Err() != nil {
+				return nil // Graceful shutdown.
+			}
+
+			log.Error("watch failed, retrying", "error", err, "retry_in", watchRetryInterval)
+
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(watchRetryInterval):
+			}
+		}
+	}
+}
+
+// runWorker drains the action queue, processing one item at a time. This
+// is the single point of execution for all machine-mutating operations,
+// providing serialization without locks.
+func runWorker(ctx context.Context, log *slog.Logger, r *reconciler, queue workqueue.TypedRateLimitingInterface[Action]) {
+	for {
+		action, shutdown := queue.Get()
+		if shutdown {
+			return
+		}
+
+		err := r.reconcile(ctx, log, action)
+
+		if err != nil {
+			log.Error("action failed, requeuing",
+				"type", action.Type,
+				"source", action.Source,
+				"error", err,
+			)
+			queue.AddRateLimited(action)
+		} else {
+			queue.Forget(action)
+		}
+
+		queue.Done(action)
+	}
 }
 
 // buildKubeClient creates a controller-runtime WithWatch client from the
@@ -121,7 +192,6 @@ func buildKubeClient(cfg *provision.AgentConfig, newClient kubeClientFunc) (clie
 // Machine CR may not have been pre-created by machina.
 func registerMachine(ctx context.Context, log *slog.Logger, c client.Client, cfg *provision.AgentConfig) error {
 	machineName := cfg.MachineName
-
 	token := cfg.Kubelet.BootstrapToken
 	if token == "" {
 		log.Info("bootstrap token not set, skipping Machine CR registration")
@@ -134,7 +204,6 @@ func registerMachine(ctx context.Context, log *slog.Logger, c client.Client, cfg
 			slog.String("machine", machineName),
 			slog.String("machineID", string(machine.UID)),
 		)
-
 		return nil
 	} else if apimeta.IsNoMatchError(err) {
 		return fmt.Errorf("machine CRD is not installed (machina not deployed?): %w", err)
@@ -157,7 +226,6 @@ func registerMachine(ctx context.Context, log *slog.Logger, c client.Client, cfg
 		slog.String("machine", machineName),
 		slog.String("machineID", string(machine.UID)),
 	)
-
 	return nil
 }
 
@@ -181,5 +249,57 @@ func buildMachineCR(cfg *provision.AgentConfig) v1alpha3.Machine {
 				RegisterWithTaints: cfg.Kubelet.RegisterWithTaints,
 			},
 		},
+	}
+}
+
+// watchMachine establishes a watch on the named Machine CR and enqueues
+// ActionUpdateMachine actions on relevant events. It returns when the watch
+// closes or the context is cancelled. The actual reconciliation happens
+// asynchronously via the shared action queue.
+func watchMachine(ctx context.Context, log *slog.Logger, wc client.WithWatch, machineName string, queue workqueue.TypedRateLimitingInterface[Action]) error {
+	machineList := &v1alpha3.MachineList{}
+
+	watcher, err := wc.Watch(ctx, machineList, client.MatchingFields{"metadata.name": machineName})
+	if err != nil {
+		return fmt.Errorf("start watch for Machine %q: %w", machineName, err)
+	}
+	defer watcher.Stop()
+
+	log.Info("watching Machine CR", "name", machineName)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case event, ok := <-watcher.ResultChan():
+			if !ok {
+				return fmt.Errorf("watch channel closed")
+			}
+
+			if event.Type == watch.Error {
+				return fmt.Errorf("watch error event: %v", event.Object)
+			}
+
+			if event.Type != watch.Modified && event.Type != watch.Added {
+				continue
+			}
+
+			machine, ok := event.Object.(*v1alpha3.Machine)
+			if !ok {
+				log.Warn("unexpected object type in watch event")
+				continue
+			}
+
+			log.Debug("watch event",
+				"type", event.Type,
+				"generation", machine.Generation,
+				"version", machine.ResourceVersion,
+			)
+
+			// Enqueue the machine name. The workqueue deduplicates:
+			// if the action is already queued or being processed, this
+			// is a no-op.
+			queue.Add(Action{Type: ActionUpdateMachine, Source: machineName})
+		}
 	}
 }

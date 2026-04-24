@@ -12,7 +12,7 @@ import (
 )
 
 // newScheme returns a runtime.Scheme that includes the core Kubernetes types
-// and the unbounded-kube v1alpha3 types (Machine, MachineList).
+// and the unbounded-kube v1alpha3 types (Machine, MachineOperation, etc.).
 func newScheme() *runtime.Scheme {
 	s := runtime.NewScheme()
 	utilruntime.Must(clientgoscheme.AddToScheme(s))

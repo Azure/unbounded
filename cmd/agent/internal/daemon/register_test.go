@@ -26,7 +26,6 @@ func discardLogger() *slog.Logger {
 func fakeScheme() *runtime.Scheme {
 	s := runtime.NewScheme()
 	utilruntime.Must(v1alpha3.AddToScheme(s))
-
 	return s
 }
 
@@ -112,7 +111,6 @@ func Test_registerMachine_NotFound_Creates(t *testing.T) {
 
 	// Verify Machine CR was created.
 	var machine v1alpha3.Machine
-
 	err = c.Get(context.Background(), client.ObjectKey{Name: "test-machine"}, &machine)
 	require.NoError(t, err)
 	assert.Equal(t, "test-machine", machine.Name)
@@ -134,7 +132,6 @@ func Test_registerMachine_Labels_Preserved(t *testing.T) {
 	require.NoError(t, err)
 
 	var machine v1alpha3.Machine
-
 	err = c.Get(context.Background(), client.ObjectKey{Name: "labeled-machine"}, &machine)
 	require.NoError(t, err)
 	assert.Equal(t, map[string]string{"env": "prod", "zone": "us-west"}, machine.Spec.Kubernetes.NodeLabels)
