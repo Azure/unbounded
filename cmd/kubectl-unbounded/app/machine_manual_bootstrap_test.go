@@ -276,7 +276,7 @@ func TestManualBootstrapHandler_RenderScript(t *testing.T) {
 				Auth: provision.KubeletAuthInfo{
 					BootstrapToken: "abc123.0123456789abcdef",
 				},
-				Labels:         map[string]string{"env": "prod"},
+				Labels: map[string]string{"env": "prod"},
 			},
 		},
 	}
@@ -459,7 +459,7 @@ func TestManualBootstrapHandler_RenderCloudInit(t *testing.T) {
 				Auth: provision.KubeletAuthInfo{
 					BootstrapToken: "abc123.0123456789abcdef",
 				},
-				Labels:         map[string]string{"env": "prod"},
+				Labels: map[string]string{"env": "prod"},
 			},
 		},
 	}
@@ -513,7 +513,7 @@ func TestManualBootstrapHandler_RenderCloudInit(t *testing.T) {
 					Auth: provision.KubeletAuthInfo{
 						BootstrapToken: "abc123.0123456789abcdef",
 					},
-					Labels:         map[string]string{"env": "prod"},
+					Labels: map[string]string{"env": "prod"},
 				},
 				OCIImage: "ghcr.io/azure/agent:latest",
 			},
@@ -702,7 +702,7 @@ func TestManualBootstrapHandler_RenderScript_DownloadOverrides(t *testing.T) {
 				Auth: provision.KubeletAuthInfo{
 					BootstrapToken: "abc123.0123456789abcdef",
 				},
-				Labels:         map[string]string{"env": "prod"},
+				Labels: map[string]string{"env": "prod"},
 			},
 		},
 	}
