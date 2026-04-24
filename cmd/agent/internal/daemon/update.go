@@ -21,13 +21,13 @@ import (
 	"os"
 	"strings"
 
+	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 	"github.com/Azure/unbounded/pkg/agent/phases/nodestart"
 	"github.com/Azure/unbounded/pkg/agent/phases/nodestop"
 	"github.com/Azure/unbounded/pkg/agent/phases/reset"
 	"github.com/Azure/unbounded/pkg/agent/phases/rootfs"
-	"github.com/Azure/unbounded/internal/provision"
 )
 
 // ActiveMachine holds the currently active nspawn machine name and its

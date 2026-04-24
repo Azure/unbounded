@@ -7,9 +7,9 @@ import (
 	"maps"
 	"strings"
 
-	"github.com/Azure/unbounded/pkg/agent/config"
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/cloudprovider"
+	"github.com/Azure/unbounded/pkg/agent/config"
 )
 
 type (

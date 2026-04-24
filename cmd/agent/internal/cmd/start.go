@@ -9,14 +9,14 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/Azure/unbounded/cmd/agent/internal/attest"
+	"github.com/Azure/unbounded/cmd/agent/internal/daemon"
+	"github.com/Azure/unbounded/internal/version"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 	"github.com/Azure/unbounded/pkg/agent/phases/host"
 	"github.com/Azure/unbounded/pkg/agent/phases/nodestart"
 	"github.com/Azure/unbounded/pkg/agent/phases/rootfs"
-	"github.com/Azure/unbounded/cmd/agent/internal/attest"
-	"github.com/Azure/unbounded/cmd/agent/internal/daemon"
-	"github.com/Azure/unbounded/internal/version"
 )
 
 func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
