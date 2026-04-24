@@ -91,7 +91,7 @@ For PXE-provisioned machines, the `Machine` resource includes:
   password secret) for remote power management.
 - **`spec.pxe.cloudInit`** -- Optional cloud-init customization. References a
   ConfigMap containing user-data that is merged with the vendor-data managed by
-  unbounded-kube.
+Unbounded.
 
 ### Site Isolation
 

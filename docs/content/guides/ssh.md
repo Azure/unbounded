@@ -113,7 +113,7 @@ The `kubernetes.version` is resolved automatically from the cluster's API
 server version. The `bootstrapTokenRef` references the bootstrap token created
 by `site init` for the site; the controller reads it from `kube-system`.
 
-See the [CRD Reference]({{< relref "/reference" >}}) for the full list of fields.
+See the [CRD Reference]({{< relref "reference/machina-crd" >}}) for the full list of fields.
 
 ## Bastion Hosts
 

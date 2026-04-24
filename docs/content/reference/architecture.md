@@ -116,8 +116,8 @@ serve time. A `metadata.yaml` provides image-level configuration (e.g.
 
 ## Network Architecture
 
-Cross-site networking is provided by **unbounded-cni** (separate repository), a
-WireGuard-based CNI plugin.
+Cross-site networking is provided by **unbounded-net**, a WireGuard-based CNI
+plugin.
 
 - **Gateway nodes** are labeled `unbounded-kube.io/unbounded-net-gateway=true`
   and expose public IPs with UDP ports 51820-51899.

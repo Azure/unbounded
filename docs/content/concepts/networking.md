@@ -16,7 +16,7 @@ main cluster, and that path must handle:
 - Efficient routing to avoid bottlenecks
 - Automatic CIDR allocation so pod IPs don't collide
 
-**[unbounded-net](https://github.com/Azure/unbounded-net)** solves
+**unbounded-net** solves
 these problems. It is a Kubernetes networking system that provides CNI
 functionality and multi-site pod routing.
 
@@ -173,7 +173,7 @@ using standard kernel routing tables.
 unbounded-net is the **networking layer** for the broader Project Unbounded
 system:
 
-- **unbounded-kube** handles node provisioning -- getting remote machines
+- **Unbounded** handles node provisioning -- getting remote machines
   registered as Kubernetes nodes (via SSH or PXE).
 - **unbounded-net** handles networking -- making those nodes reachable for pod
   traffic.

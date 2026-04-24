@@ -6,8 +6,7 @@ description: "Connect an AKS cluster to a remote Ubiquiti network over Azure VPN
 
 This guide walks through connecting an existing AKS cluster to a remote site
 over an Azure VPN Gateway and a Ubiquiti router. Because the VPN provides
-private L3 connectivity between the two networks, you'll configure Unbounded
-Kube to route directly over that link -- no WireGuard overlay needed.
+private L3 connectivity between the two networks, you'll configure Unbounded to route directly over that link -- no WireGuard overlay needed.
 
 {{< callout type="info" >}}
 This guide uses Azure VPN Gateway and a Ubiquiti router as a concrete example, but the same approach works with **any L3 interconnect** -- Azure ExpressRoute, AWS Direct Connect, GCP Cloud Interconnect, a hardware VPN appliance, or even a simple routed link between two networks. The Unbounded configuration in [steps 5-9](#5-prepare-gateway-nodes) is identical regardless of how the L3 path is established.
@@ -442,7 +441,7 @@ via SSH from the AKS cluster (which they are, since the VPN provides L3
 connectivity):
 
 ```bash
-kubectl unbounded site add-machine \
+kubectl unbounded machine register \
     --site ubiquiti-site \
     --host 192.168.1.100 \
     --ssh-username ubuntu \

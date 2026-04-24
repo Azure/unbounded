@@ -44,7 +44,7 @@ wg --version
    `kubectl label node <name> net.unbounded-kube.io/gateway=true`
 8. **Verify Connectivity**: Test with pod-to-pod ping across sites.
 
-> **Note:** When using unbounded-kube, steps 1-7 are handled automatically by
+> **Note:** When using Unbounded, steps 1-7 are handled automatically by
 > `kubectl unbounded site init`. See the
 > [Getting Started guide]({{< relref "guides/getting-started" >}}).
 

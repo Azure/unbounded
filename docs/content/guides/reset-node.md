@@ -1,10 +1,10 @@
 ---
 title: "Resetting a Node"
 weight: 6
-description: "Remove the unbounded-kube agent and restore a host to its original state."
+description: "Remove the unbounded agent and restore a host to its original state."
 ---
 
-This guide explains how to reset a node that was bootstrapped with unbounded-kube,
+This guide explains how to reset a node that was bootstrapped with Unbounded,
 removing the agent, nspawn machine, network interfaces, and configuration files
 to restore the host to its pre-bootstrap state.
 
