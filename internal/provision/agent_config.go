@@ -16,6 +16,7 @@ type (
 	AgentConfig        = config.AgentConfig
 	AgentClusterConfig = config.AgentClusterConfig
 	AgentKubeletConfig = config.AgentKubeletConfig
+	KubeletAuthInfo    = config.KubeletAuthInfo
 )
 
 // UnboundedAgentConfig extends the shared AgentConfig with unbounded-specific
@@ -27,7 +28,7 @@ type UnboundedAgentConfig struct {
 	// Attest configures TPM-based attestation for obtaining a bootstrap
 	// token from a metalman serve-pxe instance. When set, the agent
 	// performs TPM attestation on the host instead of requiring a static
-	// BootstrapToken in Kubelet config.
+	// BootstrapToken in the Kubelet.Auth config.
 	Attest *AgentAttestConfig `json:"Attest,omitempty"`
 }
 
@@ -141,8 +142,10 @@ func BuildAgentConfig(params BuildAgentConfigParams) UnboundedAgentConfig {
 				Version:      k8sVersion,
 			},
 			Kubelet: AgentKubeletConfig{
-				ApiServer:          params.Cluster.APIServer,
-				BootstrapToken:     params.BootstrapToken,
+				ApiServer: params.Cluster.APIServer,
+				Auth: KubeletAuthInfo{
+					BootstrapToken: params.BootstrapToken,
+				},
 				Labels:             labels,
 				RegisterWithTaints: taints,
 			},

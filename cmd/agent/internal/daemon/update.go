@@ -109,7 +109,7 @@ func hasDrift(applied, desired *provision.AgentConfig) bool {
 		return true
 	}
 
-	if applied.Kubelet.BootstrapToken != desired.Kubelet.BootstrapToken {
+	if applied.Kubelet.Auth.BootstrapToken != desired.Kubelet.Auth.BootstrapToken {
 		return true
 	}
 

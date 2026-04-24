@@ -145,8 +145,10 @@ func loadConfigFromEnv() (*provision.UnboundedAgentConfig, error) {
 				Version:      kubeVersion,
 			},
 			Kubelet: provision.AgentKubeletConfig{
-				ApiServer:          apiServer,
-				BootstrapToken:     bootstrapToken,
+				ApiServer: apiServer,
+				Auth: provision.KubeletAuthInfo{
+					BootstrapToken: bootstrapToken,
+				},
 				Labels:             labels,
 				RegisterWithTaints: taints,
 			},

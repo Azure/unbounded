@@ -189,7 +189,7 @@ func TestManualBootstrapHandler_BuildAgentConfig(t *testing.T) {
 	require.Equal(t, "10.0.0.10", cfg.Cluster.ClusterDNS)
 	require.NotEmpty(t, cfg.Cluster.CaCertBase64)
 	require.NotEmpty(t, cfg.Cluster.Version) // fake client returns empty string but it's still set
-	require.Contains(t, cfg.Kubelet.BootstrapToken, "abc123.")
+	require.Contains(t, cfg.Kubelet.Auth.BootstrapToken, "abc123.")
 	require.Equal(t, map[string]string{"env": "prod"}, cfg.Kubelet.Labels)
 	require.Equal(t, []string{"dedicated=gpu:NoSchedule"}, cfg.Kubelet.RegisterWithTaints)
 	require.Equal(t, "ghcr.io/azure/rootfs:v1", cfg.OCIImage)
@@ -272,8 +272,10 @@ func TestManualBootstrapHandler_RenderScript(t *testing.T) {
 				Version:      "v1.30.0",
 			},
 			Kubelet: provision.AgentKubeletConfig{
-				ApiServer:      "https://api-server:6443",
-				BootstrapToken: "abc123.0123456789abcdef",
+				ApiServer: "https://api-server:6443",
+				Auth: provision.KubeletAuthInfo{
+					BootstrapToken: "abc123.0123456789abcdef",
+				},
 				Labels:         map[string]string{"env": "prod"},
 			},
 		},
@@ -353,8 +355,10 @@ func TestManualBootstrapHandler_RenderScript_WithAgentURL(t *testing.T) {
 				Version:      "v1.30.0",
 			},
 			Kubelet: provision.AgentKubeletConfig{
-				ApiServer:      "https://api-server:6443",
-				BootstrapToken: "abc123.0123456789abcdef",
+				ApiServer: "https://api-server:6443",
+				Auth: provision.KubeletAuthInfo{
+					BootstrapToken: "abc123.0123456789abcdef",
+				},
 			},
 		},
 	}
@@ -389,8 +393,10 @@ func TestManualBootstrapHandler_RenderScript_WithUnsafeAgentURL(t *testing.T) {
 				Version:      "v1.30.0",
 			},
 			Kubelet: provision.AgentKubeletConfig{
-				ApiServer:      "https://api-server:6443",
-				BootstrapToken: "abc123.0123456789abcdef",
+				ApiServer: "https://api-server:6443",
+				Auth: provision.KubeletAuthInfo{
+					BootstrapToken: "abc123.0123456789abcdef",
+				},
 			},
 		},
 	}
@@ -420,8 +426,10 @@ func TestManualBootstrapHandler_RenderScript_WithoutAgentURL(t *testing.T) {
 				Version:      "v1.30.0",
 			},
 			Kubelet: provision.AgentKubeletConfig{
-				ApiServer:      "https://api-server:6443",
-				BootstrapToken: "abc123.0123456789abcdef",
+				ApiServer: "https://api-server:6443",
+				Auth: provision.KubeletAuthInfo{
+					BootstrapToken: "abc123.0123456789abcdef",
+				},
 			},
 		},
 	}
@@ -447,8 +455,10 @@ func TestManualBootstrapHandler_RenderCloudInit(t *testing.T) {
 				Version:      "v1.30.0",
 			},
 			Kubelet: provision.AgentKubeletConfig{
-				ApiServer:      "https://api-server:6443",
-				BootstrapToken: "abc123.0123456789abcdef",
+				ApiServer: "https://api-server:6443",
+				Auth: provision.KubeletAuthInfo{
+					BootstrapToken: "abc123.0123456789abcdef",
+				},
 				Labels:         map[string]string{"env": "prod"},
 			},
 		},
@@ -499,8 +509,10 @@ func TestManualBootstrapHandler_RenderCloudInit(t *testing.T) {
 					Version:      "v1.30.0",
 				},
 				Kubelet: provision.AgentKubeletConfig{
-					ApiServer:      "https://api-server:6443",
-					BootstrapToken: "abc123.0123456789abcdef",
+					ApiServer: "https://api-server:6443",
+					Auth: provision.KubeletAuthInfo{
+						BootstrapToken: "abc123.0123456789abcdef",
+					},
 					Labels:         map[string]string{"env": "prod"},
 				},
 				OCIImage: "ghcr.io/azure/agent:latest",
@@ -686,8 +698,10 @@ func TestManualBootstrapHandler_RenderScript_DownloadOverrides(t *testing.T) {
 				Version:      "v1.30.0",
 			},
 			Kubelet: provision.AgentKubeletConfig{
-				ApiServer:      "https://api-server:6443",
-				BootstrapToken: "abc123.0123456789abcdef",
+				ApiServer: "https://api-server:6443",
+				Auth: provision.KubeletAuthInfo{
+					BootstrapToken: "abc123.0123456789abcdef",
+				},
 				Labels:         map[string]string{"env": "prod"},
 			},
 		},
@@ -729,8 +743,10 @@ func TestManualBootstrapHandler_RenderCloudInit_DownloadOverrides(t *testing.T) 
 				Version:      "v1.30.0",
 			},
 			Kubelet: provision.AgentKubeletConfig{
-				ApiServer:      "https://api-server:6443",
-				BootstrapToken: "abc123.0123456789abcdef",
+				ApiServer: "https://api-server:6443",
+				Auth: provision.KubeletAuthInfo{
+					BootstrapToken: "abc123.0123456789abcdef",
+				},
 			},
 		},
 	}
