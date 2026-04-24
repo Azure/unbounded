@@ -53,7 +53,7 @@ Initialize a new unbounded-kube site. This command:
 
 1. Validates inputs and checks that `kubectl` is on your PATH.
 2. Verifies that at least one node is labeled as a gateway
-   (`unbounded-kube.io/unbounded-net-gateway=true`).
+   (`unbounded-cloud.io/unbounded-net-gateway=true`).
 3. Installs the unbounded-net CNI plugin (downloads from the release URL or
    uses local manifests).
 4. Creates unbounded-net Site and GatewayPool resources.

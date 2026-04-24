@@ -6,9 +6,9 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.20.1
-  name: sitenodeslices.net.unbounded-kube.io
+  name: sitenodeslices.net.unbounded-cloud.io
 spec:
-  group: net.unbounded-kube.io
+  group: net.unbounded-cloud.io
   names:
     kind: SiteNodeSlice
     listKind: SiteNodeSliceList

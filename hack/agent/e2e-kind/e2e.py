@@ -600,7 +600,7 @@ def _run_agent_inner(agent_url: str) -> None:
             "name": f"bootstrap-token-{token_id}",
             "namespace": "kube-system",
             "labels": {
-                "unbounded-kube.io/site": E2E_SITE_NAME,
+                "unbounded-cloud.io/site": E2E_SITE_NAME,
             },
         },
         "type": "bootstrap.kubernetes.io/token",
@@ -1117,7 +1117,7 @@ def reset_agent() -> None:
 def install_machine_crd() -> None:
     """Install the Machine CRD and bootstrapper RBAC."""
 
-    crd_path = REPO_ROOT / "deploy" / "machina" / "crd" / "unbounded-kube.io_machines.yaml"
+    crd_path = REPO_ROOT / "deploy" / "machina" / "crd" / "unbounded-cloud.io_machines.yaml"
     rbac_path = REPO_ROOT / "deploy" / "machina" / "rendered" / "07-bootstrapper-rbac.yaml"
 
     if not crd_path.exists():

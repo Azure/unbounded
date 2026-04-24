@@ -166,12 +166,12 @@ ensure_site_gateway_resources() {
 
     echo "==> Ensuring Site '${site_name}' CRD..."
     {
-        echo "apiVersion: net.unbounded-kube.io/v1alpha1"
+        echo "apiVersion: net.unbounded-cloud.io/v1alpha1"
         echo "kind: Site"
         echo "metadata:"
         echo "  name: ${site_name}"
         echo "  annotations:"
-        echo "    net.unbounded-kube.io/nebius-route-table-id: \"${ROUTE_TABLE_ID}\""
+        echo "    net.unbounded-cloud.io/nebius-route-table-id: \"${ROUTE_TABLE_ID}\""
         echo "spec:"
         echo "  nodeCidrs:"
         for cidr in "${node_cidrs[@]}"; do
@@ -192,18 +192,18 @@ ensure_site_gateway_resources() {
             local pool_name="${GATEWAY_POOL_NAMES[$i]}"
             local pool_type="${GATEWAY_POOL_TYPES[$i]}"
             cat <<EOF | kubectl apply -f -
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: GatewayPool
 metadata:
   name: ${pool_name}
 spec:
   type: ${pool_type}
   nodeSelector:
-    net.unbounded-kube.io/agentpool: "${pool_name}"
+    net.unbounded-cloud.io/agentpool: "${pool_name}"
 EOF
 
             cat <<EOF | kubectl apply -f -
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: SiteGatewayPoolAssignment
 metadata:
   name: ${site_name}-${pool_name}
@@ -230,7 +230,7 @@ EOF
                 fi
                 local peering_name="${first_pool}-${second_pool}"
                 cat <<EOF | kubectl apply -f -
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: GatewayPoolPeering
 metadata:
   name: ${peering_name}
@@ -250,7 +250,7 @@ EOF
         if kubectl get gatewaypool "$primary_gw" >/dev/null 2>&1; then
             echo "==> No local gateway pools; assigning site to primary gateway pool '${primary_gw}'..."
             cat <<EOF | kubectl apply -f -
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: SiteGatewayPoolAssignment
 metadata:
   name: ${site_name}-${primary_gw}
@@ -611,7 +611,7 @@ generate_vm_userdata() {
     # Check for an existing bootstrap token secret for this pool
     local existing_secret
     existing_secret="$(kubectl get secrets -n kube-system \
-        -l net.unbounded-kube.io/pool-name="$pool_name" \
+        -l net.unbounded-cloud.io/pool-name="$pool_name" \
         --field-selector type=bootstrap.kubernetes.io/token \
         -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
 
@@ -637,7 +637,7 @@ generate_vm_userdata() {
             --from-literal=usage-bootstrap-signing="true" >&2
         kubectl label secret "bootstrap-token-${token_id}" \
             --namespace kube-system \
-            net.unbounded-kube.io/pool-name="$pool_name" >&2
+            net.unbounded-cloud.io/pool-name="$pool_name" >&2
     fi
 
     # Generate gzip+base64 encoded bootstrap script with non-Azure node labels
@@ -646,7 +646,7 @@ generate_vm_userdata() {
 
     local customdata_ts
     customdata_ts="$(date -u +%Y%m%d%H%M%SZ)"
-    local nonazure_labels="kubernetes.azure.com/managed=false,node.kubernetes.io/exclude-from-external-load-balancers=true,net.unbounded-kube.io/provider=nebius,net.unbounded-kube.io/customdata-generated=${customdata_ts},net.unbounded-kube.io/agentpool=${pool_name}${extra_labels}"
+    local nonazure_labels="kubernetes.azure.com/managed=false,node.kubernetes.io/exclude-from-external-load-balancers=true,net.unbounded-cloud.io/provider=nebius,net.unbounded-cloud.io/customdata-generated=${customdata_ts},net.unbounded-cloud.io/agentpool=${pool_name}${extra_labels}"
 
     # Patch node labels, add --cloud-provider=external, remove credential-provider flags, then gzip+base64
     local bootstrap_gz
@@ -815,7 +815,7 @@ for i in $(seq 1 "$EXT_GATEWAY_POOLS"); do
         vm_seq="$(printf '%06d' "$j")"
         vm_hostname="ext-${pool_name}-${vm_seq}"
         vm_name="${USERNAME}-${pool_name}-${vm_seq}"
-        userdata_file="$(generate_vm_userdata "$pool_name" "$vm_hostname" ",net.unbounded-kube.io/gateway=true")"
+        userdata_file="$(generate_vm_userdata "$pool_name" "$vm_hostname" ",net.unbounded-cloud.io/gateway=true")"
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$vm_name" "$vm_hostname" "$IMAGE_ID_COMPUTE" "$COMPUTE_PLATFORM" "$COMPUTE_PRESET" "$userdata_file" "true" \
             >> "$VM_MANIFEST"
@@ -830,7 +830,7 @@ for i in $(seq 1 "$INT_GATEWAY_POOLS"); do
         vm_seq="$(printf '%06d' "$j")"
         vm_hostname="ext-${pool_name}-${vm_seq}"
         vm_name="${USERNAME}-${pool_name}-${vm_seq}"
-        userdata_file="$(generate_vm_userdata "$pool_name" "$vm_hostname" ",net.unbounded-kube.io/gateway=true")"
+        userdata_file="$(generate_vm_userdata "$pool_name" "$vm_hostname" ",net.unbounded-cloud.io/gateway=true")"
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$vm_name" "$vm_hostname" "$IMAGE_ID_COMPUTE" "$COMPUTE_PLATFORM" "$COMPUTE_PRESET" "$userdata_file" "false" \
             >> "$VM_MANIFEST"

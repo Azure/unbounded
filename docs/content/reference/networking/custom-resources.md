@@ -5,7 +5,7 @@ description: "Specifications for all 7 unbounded-net CRDs."
 ---
 
 unbounded-net uses seven Custom Resource Definitions (CRDs) in the
-`net.unbounded-kube.io` API group. For a conceptual introduction to Sites and
+`net.unbounded-cloud.io` API group. For a conceptual introduction to Sites and
 GatewayPools, see [Networking Concepts]({{< relref "concepts/networking" >}}).
 
 ## Site
@@ -17,7 +17,7 @@ assigned to sites based on their internal IP addresses matching the site's
 ### Example
 
 ```yaml
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: Site
 metadata:
   name: site-east
@@ -103,12 +103,12 @@ to prevent exceeding Kubernetes object size limits.
 ### Example
 
 ```yaml
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: SiteNodeSlice
 metadata:
   name: site-east-0
   ownerReferences:
-    - apiVersion: net.unbounded-kube.io/v1alpha1
+    - apiVersion: net.unbounded-cloud.io/v1alpha1
       kind: Site
       name: site-east
 siteName: site-east
@@ -149,14 +149,14 @@ between sites.
 ### Example
 
 ```yaml
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: GatewayPool
 metadata:
   name: main-gateways
 spec:
   type: External
   nodeSelector:
-    net.unbounded-kube.io/gateway: "true"
+    net.unbounded-cloud.io/gateway: "true"
   routedCidrs:
     - "172.16.0.0/12"
   healthCheckSettings:
@@ -239,7 +239,7 @@ nodes in peered sites create direct WireGuard tunnels, bypassing gateways.
 ### Example
 
 ```yaml
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: SitePeering
 metadata:
   name: east-west-peering
@@ -314,7 +314,7 @@ Defines which gateway pools serve which sites.
 ### Example
 
 ```yaml
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: SiteGatewayPoolAssignment
 metadata:
   name: east-gateways
@@ -349,7 +349,7 @@ Defines peering between gateway pools, enabling cross-pool routing.
 ### Example
 
 ```yaml
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: GatewayPoolPeering
 metadata:
   name: east-west-pool-peering
@@ -404,19 +404,19 @@ deterministic name order and the first profile is kept.
 
 | Label | Applied To | Description |
 |-------|-----------|-------------|
-| `net.unbounded-kube.io/site` | Node | Site membership (set by controller). |
+| `net.unbounded-cloud.io/site` | Node | Site membership (set by controller). |
 
 ### Annotations
 
 | Annotation | Applied To | Description |
 |------------|-----------|-------------|
-| `net.unbounded-kube.io/wg-pubkey` | Node | WireGuard public key (set by node agent). |
+| `net.unbounded-cloud.io/wg-pubkey` | Node | WireGuard public key (set by node agent). |
 
 ### Taints
 
 | Taint | Effect | Description |
 |-------|--------|-------------|
-| `net.unbounded-kube.io/gateway-node=true` | NoSchedule | Prevents regular workloads on gateway nodes. |
+| `net.unbounded-cloud.io/gateway-node=true` | NoSchedule | Prevents regular workloads on gateway nodes. |
 
 ---
 

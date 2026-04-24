@@ -97,7 +97,7 @@ For PXE-provisioned machines, the `Machine` resource includes:
 
 In environments with multiple metalman instances (e.g., different racks or
 sites), the `--site` flag scopes each instance to machines labeled with
-`unbounded-kube.io/site=<name>`. This prevents one metalman from interfering
+`unbounded-cloud.io/site=<name>`. This prevents one metalman from interfering
 with another's machines.
 
 ### TPM 2.0 Attestation

@@ -47,7 +47,7 @@ hand. A minimal example:
     "ApiServer": "https://api.example.com:6443",
     "BootstrapToken": "abc123.0123456789abcdef",
     "Labels": {
-      "unbounded-kube.io/site": "mysite"
+      "unbounded-cloud.io/site": "mysite"
     },
     "RegisterWithTaints": []
   }

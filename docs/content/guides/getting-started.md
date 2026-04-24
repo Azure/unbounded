@@ -161,11 +161,11 @@ Deploy a test pod on the remote node and verify cross-site connectivity:
 ```bash
 # Run a pod on the remote node
 kubectl run test-remote --image=busybox --restart=Never \
-    --overrides='{"spec":{"nodeSelector":{"net.unbounded-kube.io/site":"remote"}}}' \
+    --overrides='{"spec":{"nodeSelector":{"net.unbounded-cloud.io/site":"remote"}}}' \
     -- sleep 3600
 
 # Get a cluster node's internal IP
-CLUSTER_NODE_IP=$(kubectl get nodes -l 'net.unbounded-kube.io/site=cluster' \
+CLUSTER_NODE_IP=$(kubectl get nodes -l 'net.unbounded-cloud.io/site=cluster' \
     -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
 
 # Ping a cluster node from the remote pod (cross-site, over WireGuard)
@@ -173,7 +173,7 @@ kubectl exec test-remote -- ping -c 3 "$CLUSTER_NODE_IP"
 
 # Run a pod on a cluster node and curl it from the remote pod
 kubectl run test-cluster --image=nginx --restart=Never \
-    --overrides='{"spec":{"nodeSelector":{"net.unbounded-kube.io/site":"cluster"}}}'
+    --overrides='{"spec":{"nodeSelector":{"net.unbounded-cloud.io/site":"cluster"}}}'
 kubectl wait --for=condition=ready pod/test-cluster --timeout=60s
 CLUSTER_POD_IP=$(kubectl get pod test-cluster -o jsonpath='{.status.podIP}')
 kubectl exec test-remote -- wget -qO- "http://$CLUSTER_POD_IP"
@@ -212,7 +212,7 @@ A dedicated `gwmain` pool separate from the system pool:
   automatically
 - **Tainted** `CriticalAddonsOnly=true:NoSchedule` -- only networking
   components run here
-- **Labeled** `unbounded-kube.io/unbounded-net-gateway=true` -- tells
+- **Labeled** `unbounded-cloud.io/unbounded-net-gateway=true` -- tells
   unbounded-net which nodes are gateways
 
 ### unbounded-net CNI

@@ -6,9 +6,9 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.20.1
-  name: gatewaypools.net.unbounded-kube.io
+  name: gatewaypools.net.unbounded-cloud.io
 spec:
-  group: net.unbounded-kube.io
+  group: net.unbounded-cloud.io
   names:
     kind: GatewayPool
     listKind: GatewayPoolList

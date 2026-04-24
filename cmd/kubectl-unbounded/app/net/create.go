@@ -382,7 +382,7 @@ CNI configuration.`,
 
 			obj := &unstructured.Unstructured{
 				Object: map[string]interface{}{
-					"apiVersion": "net.unbounded-kube.io/v1alpha1",
+					"apiVersion": "net.unbounded-cloud.io/v1alpha1",
 					"kind":       "Site",
 					"metadata": map[string]interface{}{
 						"name": args[0],
@@ -498,7 +498,7 @@ typed as External (for connections outside the cluster) or Internal
 
 			obj := &unstructured.Unstructured{
 				Object: map[string]interface{}{
-					"apiVersion": "net.unbounded-kube.io/v1alpha1",
+					"apiVersion": "net.unbounded-cloud.io/v1alpha1",
 					"kind":       "GatewayPool",
 					"metadata": map[string]interface{}{
 						"name": args[0],
@@ -594,7 +594,7 @@ meshNodes is enabled, all nodes in the peered sites form a full mesh.`,
 
 			obj := &unstructured.Unstructured{
 				Object: map[string]interface{}{
-					"apiVersion": "net.unbounded-kube.io/v1alpha1",
+					"apiVersion": "net.unbounded-cloud.io/v1alpha1",
 					"kind":       "SitePeering",
 					"metadata": map[string]interface{}{
 						"name": args[0],
@@ -679,7 +679,7 @@ sites that cannot peer directly.`,
 
 			obj := &unstructured.Unstructured{
 				Object: map[string]interface{}{
-					"apiVersion": "net.unbounded-kube.io/v1alpha1",
+					"apiVersion": "net.unbounded-cloud.io/v1alpha1",
 					"kind":       "SiteGatewayPoolAssignment",
 					"metadata": map[string]interface{}{
 						"name": args[0],
@@ -758,7 +758,7 @@ network segments.`,
 
 			obj := &unstructured.Unstructured{
 				Object: map[string]interface{}{
-					"apiVersion": "net.unbounded-kube.io/v1alpha1",
+					"apiVersion": "net.unbounded-cloud.io/v1alpha1",
 					"kind":       "GatewayPoolPeering",
 					"metadata": map[string]interface{}{
 						"name": args[0],

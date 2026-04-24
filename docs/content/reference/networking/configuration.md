@@ -128,7 +128,7 @@ For standard 1500-byte links: `1500 - 80 = 1420`.
 
 **Behavior:**
 - Each node agent detects its default-route interface MTU and annotates itself
-  with `net.unbounded-kube.io/tunnel-mtu`.
+  with `net.unbounded-cloud.io/tunnel-mtu`.
 - Effective MTU = `min(configured MTU, detected MTU)`.
 - If configured MTU exceeds detected, the node logs an error and surfaces an
   `mtuMismatch` status error.

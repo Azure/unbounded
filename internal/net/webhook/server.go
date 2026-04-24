@@ -29,8 +29,8 @@ const (
 	extensionAuthConfigMapName   = "extension-apiserver-authentication"
 	extensionAuthClientCAKey     = "requestheader-client-ca-file"
 	extensionAuthAllowedNamesKey = "requestheader-allowed-names"
-	aggregatedAPIGroupPath       = "/apis/status.net.unbounded-kube.io"
-	aggregatedAPIVersionPath     = "/apis/status.net.unbounded-kube.io/v1alpha1"
+	aggregatedAPIGroupPath       = "/apis/status.net.unbounded-cloud.io"
+	aggregatedAPIVersionPath     = "/apis/status.net.unbounded-cloud.io/v1alpha1"
 )
 
 // CIDRAllocator provides pod CIDR allocation for the mutating webhook.
@@ -148,7 +148,7 @@ func (s *Server) registerAggregatedDiscoveryHandlers() {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"kind":"APIGroup","apiVersion":"v1","name":"status.net.unbounded-kube.io","versions":[{"groupVersion":"status.net.unbounded-kube.io/v1alpha1","version":"v1alpha1"}],"preferredVersion":{"groupVersion":"status.net.unbounded-kube.io/v1alpha1","version":"v1alpha1"}}`)) //nolint:errcheck
+		_, _ = w.Write([]byte(`{"kind":"APIGroup","apiVersion":"v1","name":"status.net.unbounded-cloud.io","versions":[{"groupVersion":"status.net.unbounded-cloud.io/v1alpha1","version":"v1alpha1"}],"preferredVersion":{"groupVersion":"status.net.unbounded-cloud.io/v1alpha1","version":"v1alpha1"}}`)) //nolint:errcheck
 	})
 	s.mux.HandleFunc(aggregatedAPIVersionPath, func(w http.ResponseWriter, r *http.Request) {
 		if !s.isTrustedAggregatedRequest(r) {
@@ -157,7 +157,7 @@ func (s *Server) registerAggregatedDiscoveryHandlers() {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"kind":"APIResourceList","apiVersion":"v1","groupVersion":"status.net.unbounded-kube.io/v1alpha1","resources":[{"name":"status/push","singularName":"","namespaced":false,"kind":"NodeStatusPush","verbs":["create"]},{"name":"status/nodews","singularName":"","namespaced":false,"kind":"NodeStatusStream","verbs":["get"]},{"name":"status/json","singularName":"","namespaced":false,"kind":"ClusterStatus","verbs":["get"]},{"name":"token/node","singularName":"","namespaced":false,"kind":"TokenRequest","verbs":["create"]},{"name":"token/viewer","singularName":"","namespaced":false,"kind":"TokenRequest","verbs":["create"]}]}`)) //nolint:errcheck
+		_, _ = w.Write([]byte(`{"kind":"APIResourceList","apiVersion":"v1","groupVersion":"status.net.unbounded-cloud.io/v1alpha1","resources":[{"name":"status/push","singularName":"","namespaced":false,"kind":"NodeStatusPush","verbs":["create"]},{"name":"status/nodews","singularName":"","namespaced":false,"kind":"NodeStatusStream","verbs":["get"]},{"name":"status/json","singularName":"","namespaced":false,"kind":"ClusterStatus","verbs":["get"]},{"name":"token/node","singularName":"","namespaced":false,"kind":"TokenRequest","verbs":["create"]},{"name":"token/viewer","singularName":"","namespaced":false,"kind":"TokenRequest","verbs":["create"]}]}`)) //nolint:errcheck
 	})
 }
 
@@ -366,7 +366,7 @@ func buildNodeAdmissionPatch(podCIDR string, podCIDRs []string, siteName string)
 	}
 	if siteName != "" {
 		patches = append(patches,
-			map[string]interface{}{"op": "add", "path": "/metadata/labels/net.unbounded-kube.io~1site", "value": siteName},
+			map[string]interface{}{"op": "add", "path": "/metadata/labels/net.unbounded-cloud.io~1site", "value": siteName},
 		)
 	}
 

@@ -55,13 +55,13 @@ func TestEnsureUnboundedSite_DefaultTemplates(t *testing.T) {
 	err := h.ensureUnboundedSite(context.Background(), cfg)
 	require.NoError(t, err)
 
-	// Verify default mode uses net.unbounded-kube.io apiVersion by
+	// Verify default mode uses net.unbounded-cloud.io apiVersion by
 	// rendering the template directly.
 	content, err := siteTemplates.ReadFile("assets/unbounded-net-site/site.yaml")
 	require.NoError(t, err)
 
 	appliedYAML = content
-	require.Contains(t, string(appliedYAML), "net.unbounded-kube.io/v1alpha1")
+	require.Contains(t, string(appliedYAML), "net.unbounded-cloud.io/v1alpha1")
 	require.NotContains(t, string(appliedYAML), "unbounded.aks.azure.com/v1alpha1")
 }
 

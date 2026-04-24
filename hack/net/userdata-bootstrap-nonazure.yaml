@@ -18,7 +18,7 @@
 #     __CLUSTER_RG__              - Cluster resource group name
 #     __CA_CERT_BASE64__          - Base64-encoded CA certificate (no newlines)
 #     __SCALE_SET_NAME__          - Pool name for this group of VMs
-#     __EXTRA_NODE_LABELS__       - Extra node labels (e.g. ",net.unbounded-kube.io/gateway=true" or empty)
+#     __EXTRA_NODE_LABELS__       - Extra node labels (e.g. ",net.unbounded-cloud.io/gateway=true" or empty)
 #     __SSH_PUBLIC_KEY__          - SSH public key for the ubuntu user
 #     __ADMIN_PASSWORD__          - Password for the ubuntu user (optional, empty to skip)
 #

@@ -72,7 +72,7 @@ func TestWriteInventoryAsMachina(t *testing.T) {
 	require.Equal(t, 1, strings.Count(output, "---\n"))
 
 	// Spot-check apiVersion, kind, names, host.
-	require.Contains(t, output, "apiVersion: unbounded-kube.io/v1alpha3")
+	require.Contains(t, output, "apiVersion: unbounded-cloud.io/v1alpha3")
 	require.Contains(t, output, "kind: Machine")
 	require.Contains(t, output, "name: mysite-20.48.100.5-50001")
 	require.Contains(t, output, "name: mysite-20.48.100.5-50002")

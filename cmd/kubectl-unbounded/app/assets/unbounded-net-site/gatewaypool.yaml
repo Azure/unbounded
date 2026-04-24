@@ -1,9 +1,9 @@
 ---
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: GatewayPool
 metadata:
   name: gw-main
 spec:
   nodeSelector:
-    unbounded-kube.io/unbounded-net-gateway: "true"
+    unbounded-cloud.io/unbounded-net-gateway: "true"
   type: External

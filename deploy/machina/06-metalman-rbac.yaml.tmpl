@@ -107,10 +107,10 @@ metadata:
   name: metalman-controller
 rules:
   # Machine controller
-  - apiGroups: ["unbounded-kube.io"]
+  - apiGroups: ["unbounded-cloud.io"]
     resources: ["machines"]
     verbs: ["get", "list", "watch"]
-  - apiGroups: ["unbounded-kube.io"]
+  - apiGroups: ["unbounded-cloud.io"]
     resources: ["machines/status"]
     verbs: ["update"]
   # Secrets (Redfish passwords)
@@ -180,7 +180,7 @@ kind: ClusterRole
 metadata:
   name: metalman-bootstrap
 rules:
-  - apiGroups: ["unbounded-kube.io"]
+  - apiGroups: ["unbounded-cloud.io"]
     resources: ["machines"]
     verbs: ["get", "create"]
 
