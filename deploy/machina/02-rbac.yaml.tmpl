@@ -1,0 +1,91 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: machina-controller
+  namespace: {{ default "unbounded-kube" .Namespace }}
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: machina-controller
+  namespace: {{ default "unbounded-kube" .Namespace }}
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: machina-controller
+  namespace: {{ default "unbounded-kube" .Namespace }}
+subjects:
+  - kind: ServiceAccount
+    name: machina-controller
+    namespace: {{ default "unbounded-kube" .Namespace }}
+roleRef:
+  kind: Role
+  name: machina-controller
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: machina-controller
+rules:
+  # Machine controller
+  - apiGroups: ["unbounded-kube.io"]
+    resources: ["machines"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["unbounded-kube.io"]
+    resources: ["machines/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["unbounded-kube.io"]
+    resources: ["machines/finalizers"]
+    verbs: ["update"]
+  # Secrets (SSH keys, bootstrap tokens)
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
+  # Nodes
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "delete"]
+  # ConfigMaps (kube-root-ca.crt in kube-public for CA cert resolution, cluster-info)
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get"]
+  # Services (kube-dns in kube-system for cluster DNS resolution)
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get"]
+  - apiGroups: ["certificates.k8s.io"]
+    resources: ["certificatesigningrequests"]
+    verbs: ["get", "list", "update"]
+  - apiGroups: ["certificates.k8s.io"]
+    resources: ["certificatesigningrequests/approval"]
+    verbs: ["update"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: machina-controller
+subjects:
+  - kind: ServiceAccount
+    name: machina-controller
+    namespace: {{ default "unbounded-kube" .Namespace }}
+roleRef:
+  kind: ClusterRole
+  name: machina-controller
+  apiGroup: rbac.authorization.k8s.io

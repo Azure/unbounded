@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-name: Deploy Docs
+name: unbounded docs
 
 on:
   push:

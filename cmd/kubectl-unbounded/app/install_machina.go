@@ -10,7 +10,7 @@ import (
 
 	"k8s.io/client-go/kubernetes"
 
-	machinadeploy "github.com/Azure/unbounded-kube/deploy/machina"
+	machinadeploy "github.com/Azure/unbounded/deploy/machina"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )

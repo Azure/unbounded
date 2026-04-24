@@ -10,10 +10,10 @@ private L3 connectivity between the two networks, you'll configure Unbounded
 Kube to route directly over that link -- no WireGuard overlay needed.
 
 {{< callout type="info" >}}
-This guide uses Azure VPN Gateway and a Ubiquiti router as a concrete example, but the same approach works with **any L3 interconnect** -- Azure ExpressRoute, AWS Direct Connect, GCP Cloud Interconnect, a hardware VPN appliance, or even a simple routed link between two networks. The Unbounded Kube configuration in [steps 5-9](#5-prepare-gateway-nodes) is identical regardless of how the L3 path is established.
+This guide uses Azure VPN Gateway and a Ubiquiti router as a concrete example, but the same approach works with **any L3 interconnect** -- Azure ExpressRoute, AWS Direct Connect, GCP Cloud Interconnect, a hardware VPN appliance, or even a simple routed link between two networks. The Unbounded configuration in [steps 5-9](#5-prepare-gateway-nodes) is identical regardless of how the L3 path is established.
 {{< /callout >}}
 
-> New to Unbounded Kube? Start with the
+> New to Unbounded? Start with the
 > [Getting Started]({{< relref "guides/getting-started" >}}) guide to create an
 > AKS cluster from scratch, then come back here to add L3 connectivity.
 
@@ -44,7 +44,7 @@ Install the prerequisites if you haven't already:
 
 ```bash
 # kubectl-unbounded (Linux amd64)
-curl -sL https://github.com/Azure/unbounded-kube/releases/latest/download/kubectl-unbounded-linux-amd64.tar.gz | tar xz
+curl -sL https://github.com/Azure/unbounded/releases/latest/download/kubectl-unbounded-linux-amd64.tar.gz | tar xz
 sudo mv kubectl-unbounded /usr/local/bin/
 ```
 
@@ -52,7 +52,7 @@ sudo mv kubectl-unbounded /usr/local/bin/
 <summary>macOS (Apple Silicon)</summary>
 
 ```bash
-curl -sL https://github.com/Azure/unbounded-kube/releases/latest/download/kubectl-unbounded-darwin-arm64.tar.gz | tar xz
+curl -sL https://github.com/Azure/unbounded/releases/latest/download/kubectl-unbounded-darwin-arm64.tar.gz | tar xz
 sudo mv kubectl-unbounded /usr/local/bin/
 ```
 
@@ -523,7 +523,7 @@ interfaces for the ubiquiti-site peering.
 
 ## How It Works
 
-In a standard Unbounded Kube deployment, remote nodes establish encrypted
+In a standard Unbounded deployment, remote nodes establish encrypted
 WireGuard tunnels to gateway nodes over the public internet. This is secure and
 works anywhere, but adds encapsulation overhead and requires public IPs on
 gateway nodes.
@@ -570,7 +570,7 @@ az network public-ip delete \
     --name vpn-gateway-ip
 ```
 
-To remove the Unbounded Kube site resources:
+To remove the Unbounded site resources:
 
 ```bash
 kubectl delete sitepeering aks-to-ubiquiti-peering

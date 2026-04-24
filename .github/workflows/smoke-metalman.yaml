@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-name: Smoke Metalman
+name: unbounded metalman smoke test
 
 on:
   pull_request:
@@ -12,6 +12,7 @@ on:
       - internal/metalman/**
       - api/v1alpha3/**
       - deploy/machina/**
+      - deploy/net/**
       - hack/smoke-metalman.py
       - hack/kind-smoke-config.yaml
       - images/host-ubuntu2404/**
@@ -55,25 +56,54 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Cache apt packages
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: /var/cache/apt/archives
+          key: apt-smoke-noble-${{ hashFiles('.github/workflows/smoke-metalman.yaml') }}
+          restore-keys: apt-smoke-noble-
+
       - name: Install system dependencies
         run: |
           sudo apt-get update
+          # Install sushy-tools via pip in the background while apt-get
+          # installs system packages.  pip3 is already available on the
+          # runner image so this does not depend on apt-get.
+          sudo pip3 install --break-system-packages --ignore-installed sushy-tools &
+          PIP_PID=$!
           sudo apt-get install -y --no-install-recommends \
             dnsmasq qemu-kvm libvirt-daemon-system libvirt-clients virtinst \
             ovmf qemu-utils swtpm swtpm-tools \
             python3-pip python3-yaml cpio iptables
-
-      - name: Start libvirt
-        run: sudo systemctl start libvirtd
-
-      - name: Install sushy-tools
-        run: sudo pip3 install --break-system-packages --ignore-installed sushy-tools
+          sudo systemctl start libvirtd
+          wait "$PIP_PID"
 
       - name: Set up Docker Buildx
-        id: buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
         with:
           driver-opts: network=host
+
+      - name: Build host-ubuntu2404 image
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: images/host-ubuntu2404/Containerfile
+          load: true
+          tags: localhost:5555/unbounded/host-ubuntu2404:smoke
+          cache-from: type=gha,scope=host-ubuntu2404
+          cache-to: type=gha,mode=max,scope=host-ubuntu2404
+          provenance: false
+
+      - name: Build agent-ubuntu2404 image
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: images/agent-ubuntu2404
+          file: images/agent-ubuntu2404/Containerfile
+          load: true
+          tags: localhost:5555/unbounded/agent-ubuntu2404:smoke
+          cache-from: type=gha,scope=agent-ubuntu2404
+          cache-to: type=gha,mode=max,scope=agent-ubuntu2404
+          provenance: false
 
       - name: Create kind cluster
         uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
@@ -86,16 +116,8 @@ jobs:
           config: hack/kind-smoke-config.yaml
 
       - name: Run smoke test
-        env:
-          BUILDX_BUILDER: ${{ steps.buildx.outputs.name }}
         run: |
           sudo mkdir -p /root/.kube
           sudo cp "${KUBECONFIG:-$HOME/.kube/config}" /root/.kube/config
-          # Share the buildx builder and GHA cache credentials with the
-          # smoke test so it can use cached Docker layers.
           sudo -E env "PATH=$PATH" \
-            "ACTIONS_CACHE_URL=${ACTIONS_CACHE_URL}" \
-            "ACTIONS_RUNTIME_TOKEN=${ACTIONS_RUNTIME_TOKEN}" \
-            "BUILDX_CONFIG=${HOME}/.docker/buildx" \
-            "BUILDX_BUILDER=${BUILDX_BUILDER}" \
             python3 hack/smoke-metalman.py

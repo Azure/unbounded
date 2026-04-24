@@ -1,0 +1,69 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: unbounded-net-node
+  labels:
+    app.kubernetes.io/name: unbounded-net-node
+    app.kubernetes.io/component: node
+rules:
+  # Nodes: read access to watch for podCIDR assignments, patch to add WireGuard pubkey annotation
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "watch", "patch"]
+  # Sites: read to determine which site this node belongs to
+  - apiGroups: ["net.unbounded-kube.io"]
+    resources: ["sites"]
+    verbs: ["get", "list", "watch"]
+  # SiteNodeSlices: watch for peer information to configure WireGuard tunnels
+  - apiGroups: ["net.unbounded-kube.io"]
+    resources: ["sitenodeslices"]
+    verbs: ["get", "list", "watch"]
+  # GatewayPools: watch for gateway peer information for inter-site routing
+  - apiGroups: ["net.unbounded-kube.io"]
+    resources: ["gatewaypools"]
+    verbs: ["get", "list", "watch"]
+  # GatewayPoolNodes: watch route advertisements and update this node's own heartbeat/routes
+  - apiGroups: ["net.unbounded-kube.io"]
+    resources: ["gatewaypoolnodes"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: ["net.unbounded-kube.io"]
+    resources: ["gatewaypoolnodes/status"]
+    verbs: ["get", "patch", "update"]
+  # Explicit peering model: watch for site and gateway-pool peering configuration
+  - apiGroups: ["net.unbounded-kube.io"]
+    resources: ["sitepeerings", "sitegatewaypoolassignments", "gatewaypoolpeerings"]
+    verbs: ["get", "list", "watch"]
+  # Aggregated status API: allow node status push and websocket stream via API server path
+  - apiGroups: ["status.net.unbounded-kube.io"]
+    resources: ["status"]
+    resourceNames: ["push"]
+    verbs: ["create"]
+  - apiGroups: ["status.net.unbounded-kube.io"]
+    resources: ["status"]
+    resourceNames: ["nodews"]
+    verbs: ["get"]
+  # Token: request HMAC authentication tokens from the aggregated API.
+  - apiGroups: ["status.net.unbounded-kube.io"]
+    resources: ["token"]
+    resourceNames: ["node"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: unbounded-net-node
+  labels:
+    app.kubernetes.io/name: unbounded-net-node
+    app.kubernetes.io/component: node
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: unbounded-net-node
+subjects:
+  - kind: ServiceAccount
+    name: unbounded-net-node
+    namespace: {{ .Namespace }}

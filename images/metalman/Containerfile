@@ -2,7 +2,11 @@
 # Licensed under the MIT License.
 
 # Build stage
-FROM mcr.microsoft.com/azurelinux/base/core:3.0@sha256:35149ae8dd179684f969944f54a337c665a64e702486154eb44253fb39c2505b AS builder
+# Pin the builder to BUILDPLATFORM so the Go toolchain runs natively on the
+# host even when targeting a foreign TARGETPLATFORM. Without this, buildkit
+# would emulate the entire builder under QEMU when producing arm64 images on
+# an amd64 runner, which makes "go build" painfully slow.
+FROM --platform=$BUILDPLATFORM mcr.microsoft.com/azurelinux/base/core:3.0@sha256:35149ae8dd179684f969944f54a337c665a64e702486154eb44253fb39c2505b AS builder
 
 # Install build dependencies
 RUN tdnf install -y \
@@ -14,18 +18,20 @@ RUN tdnf install -y \
     ca-certificates \
     && tdnf clean all
 
-# Set up Go environment
-ENV CGO_ENABLED=1
+# Set up Go environment.
+# CGO is disabled because cmd/metalman has no cgo imports; this also keeps
+# cross-compilation simple (no cross C toolchain required).
+# Microsoft's Go fork (shipped by Azure Linux 3.0) enables the systemcrypto
+# experiment by default, which requires CGO. Opt out so we can build the
+# pure-Go crypto backend.
+ENV CGO_ENABLED=0
+ENV GOEXPERIMENT=nosystemcrypto
 ENV GOPATH=/go
 ENV GOTOOLCHAIN=auto
 # Azure Linux 3.0's Go package restricts GOTOOLCHAIN to "local" by default.
 # Allow "auto" so that go install can download the required toolchain.
 ENV MS_GOTOOLCHAIN_ALLOW_NON_LOCAL=1
 ENV PATH=$PATH:/go/bin
-
-# Install gofumpt and golangci-lint for the build
-RUN go install mvdan.cc/gofumpt@latest && \
-    go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
 
 # Set working directory
 WORKDIR /src
@@ -37,9 +43,20 @@ RUN go mod download
 # Copy the rest of the source code
 COPY ../../ .
 
-# VERSION is passed from the release workflow to inject version metadata via ldflags.
+# TARGETOS/TARGETARCH are populated by buildkit from the requested
+# --platform; threading them into go via GOOS/GOARCH lets the builder run
+# natively on the host while still producing target-arch binaries.
+ARG TARGETOS
+ARG TARGETARCH
+
+# VERSION/GIT_COMMIT/BUILD_TIME are passed in to inject version metadata via ldflags.
+# Empty defaults let the Makefile fall back to its own git/date detection when callers
+# don't supply explicit values; ${VAR:+...} forwards only when the caller set them.
 ARG VERSION=dev
-RUN make metalman-build VERSION=${VERSION}
+ARG GIT_COMMIT=
+ARG BUILD_TIME=
+RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    make metalman-build VERSION=${VERSION} ${GIT_COMMIT:+GIT_COMMIT=${GIT_COMMIT}} ${BUILD_TIME:+BUILD_TIME=${BUILD_TIME}}
 
 # Runtime stage
 FROM mcr.microsoft.com/azurelinux/base/core:3.0@sha256:35149ae8dd179684f969944f54a337c665a64e702486154eb44253fb39c2505b
@@ -47,6 +64,7 @@ FROM mcr.microsoft.com/azurelinux/base/core:3.0@sha256:35149ae8dd179684f969944f5
 # Install runtime dependencies
 RUN tdnf install -y \
     ca-certificates \
+    && tdnf makecache && tdnf upgrade -y \
     && tdnf clean all
 
 # Create unbounded directory

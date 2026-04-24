@@ -1,0 +1,29 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: unbounded-net-validating-webhook
+  labels:
+    app.kubernetes.io/name: unbounded-net-controller
+    app.kubernetes.io/component: controller
+webhooks:
+  - name: validate.net.unbounded-kube.io
+    admissionReviewVersions: ["v1"]
+    failurePolicy: Ignore
+    sideEffects: None
+    matchPolicy: Equivalent
+    timeoutSeconds: 5
+    clientConfig:
+      service:
+        name: unbounded-net-controller
+        namespace: {{ .Namespace }}
+        path: /validate
+        port: 9999
+    rules:
+      - operations: ["CREATE", "UPDATE"]
+        apiGroups: ["net.unbounded-kube.io"]
+        apiVersions: ["v1alpha1"]
+        resources: ["sites", "gatewaypools", "sitepeerings", "sitegatewaypoolassignments", "gatewaypoolpeerings"]

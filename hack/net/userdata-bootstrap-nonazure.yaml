@@ -1,0 +1,105 @@
+#cloud-config
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+#
+# userdata-bootstrap-nonazure.yaml - Cloud-init userdata to bootstrap a non-Azure
+# Kubernetes node (e.g. Nebius, bare-metal) into an existing cluster.
+#
+# This is a variant of userdata-bootstrap.yaml with Azure-specific components
+# removed: no azure.json, no ACR credential provider, no Hyper-V netplan config.
+#
+# Usage:
+#   Before using this file, replace the following placeholders:
+#     __KUBERNETES_VERSION__      - Kubernetes version (e.g., 1.30.0)
+#     __API_SERVER__              - API server hostname:port (e.g., api.example.com:6443)
+#     __BOOTSTRAP_TOKEN__         - Bootstrap token (format: [a-z0-9]{6}.[a-z0-9]{16})
+#     __CLUSTER_DNS__             - Cluster DNS IP (e.g., 100.127.0.10)
+#     __CLUSTER_RG__              - Cluster resource group name
+#     __CA_CERT_BASE64__          - Base64-encoded CA certificate (no newlines)
+#     __SCALE_SET_NAME__          - Pool name for this group of VMs
+#     __EXTRA_NODE_LABELS__       - Extra node labels (e.g. ",net.unbounded-kube.io/gateway=true" or empty)
+#     __SSH_PUBLIC_KEY__          - SSH public key for the ubuntu user
+#     __ADMIN_PASSWORD__          - Password for the ubuntu user (optional, empty to skip)
+#
+#   Example with sed:
+#     sed -e 's/__KUBERNETES_VERSION__/1.30.0/g' \
+#         -e 's/__API_SERVER__/api.example.com:6443/g' \
+#         -e 's/__BOOTSTRAP_TOKEN__/abcdef.0123456789abcdef/g' \
+#         -e 's/__CLUSTER_DNS__/100.127.0.10/g' \
+#         -e 's/__CLUSTER_RG__/my-resource-group/g' \
+#         -e 's/__SCALE_SET_NAME__/my-pool/g' \
+#         -e "s|__CA_CERT_BASE64__|$(base64 -w0 < ca.crt)|g" \
+#         -e "s|__SSH_PUBLIC_KEY__|$(cat ~/.ssh/id_rsa.pub)|g" \
+#         -e 's/__ADMIN_PASSWORD__/mypassword/g' \
+#         userdata-bootstrap-nonazure.yaml > userdata.yaml
+#
+
+# Set the hostname
+hostname: __HOSTNAME__
+manage_etc_hosts: true
+
+# Ensure the system is up to date and has required packages
+package_update: true
+package_upgrade: true
+packages:
+  - curl
+  - ca-certificates
+  - apt-transport-https
+  - wireguard-tools
+  - tcpdump
+
+# Configure user account
+users:
+  - name: ubuntu
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    lock_passwd: false
+    ssh_authorized_keys:
+      - __SSH_PUBLIC_KEY__
+
+chpasswd:
+  expire: false
+  users:
+    - name: ubuntu
+      password: __ADMIN_PASSWORD__
+      type: text
+
+# Write the CA certificate
+write_files:
+  - path: /tmp/ca.crt
+    permissions: '0644'
+    encoding: base64
+    content: __CA_CERT_BASE64__
+
+  - path: /etc/dhcp/dhclient.conf
+    permissions: '0644'
+    content: |
+        timeout 10;
+
+  - path: /opt/bootstrap-node.sh
+    permissions: '0755'
+    encoding: gzip
+    content: !!binary |
+      __BOOTSTRAP_SCRIPT_GZ__
+
+# Run the bootstrap script on first boot
+runcmd:
+  - |
+    echo "Starting node bootstrap at $(date)"
+
+    # Run the bootstrap script with the configured parameters
+    /opt/bootstrap-node.sh \
+      -k "__KUBERNETES_VERSION__" \
+      --api-server "__API_SERVER__" \
+      --token "__BOOTSTRAP_TOKEN__" \
+      --ca-cert "/tmp/ca.crt" \
+      --cluster-dns "__CLUSTER_DNS__"
+
+    echo "Node bootstrap completed at $(date)"
+
+# Final message
+final_message: |
+  Kubernetes node bootstrap complete!
+  Check /var/log/bootstrap-node.log for details.
+  The node should now be joining the cluster.

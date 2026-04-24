@@ -22,7 +22,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/Azure/unbounded-kube/internal/helpers"
+	"github.com/Azure/unbounded/internal/helpers"
 )
 
 // TestParseTPM2B tests the TPM2B wire-format parser.

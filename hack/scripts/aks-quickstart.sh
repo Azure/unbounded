@@ -228,7 +228,7 @@ preflight() {
 
   # kubectl-unbounded is required for site init and manual-bootstrap.
   kubectl unbounded --help >/dev/null 2>&1 \
-    || die "kubectl-unbounded not found. Install it from: https://github.com/Azure/unbounded-kube/releases/latest"
+    || die "kubectl-unbounded not found. Install it from: https://github.com/Azure/unbounded/releases/latest"
 
   az account show --output none 2>/dev/null \
     || die "not logged in to Azure. Run: az login"
@@ -462,7 +462,6 @@ do_site_init() {
     --name "$site_name" \
     --cluster-node-cidr "$cluster_node_cidr" \
     --cluster-pod-cidr "$cluster_pod_cidr" \
-    --cluster-service-cidr "$cluster_service_cidr" \
     --node-cidr "$remote_node_cidr" \
     --pod-cidr "$remote_pod_cidr"
 

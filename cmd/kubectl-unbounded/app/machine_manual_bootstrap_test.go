@@ -16,7 +16,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/rest"
 
-	"github.com/Azure/unbounded-kube/internal/provision"
+	"github.com/Azure/unbounded/internal/provision"
 )
 
 // ---------------------------------------------------------------------------
@@ -103,6 +103,17 @@ func TestManualBootstrapHandler_Validate(t *testing.T) {
 				kubeconfigPath: kubeconfigPath,
 				variant:        "cloud-init",
 			},
+		},
+		{
+			name: "invalid: agent-url with cloud-init variant",
+			handler: manualBootstrapHandler{
+				siteName:       "dc1",
+				machineName:    "my-node",
+				kubeconfigPath: kubeconfigPath,
+				variant:        "cloud-init",
+				agentURL:       "file:///tmp/unbounded-agent-linux-amd64.tar.gz",
+			},
+			expectErr: "--agent-url is only supported with --variant script",
 		},
 		{
 			name: "valid: variant defaults to script when empty",
@@ -326,6 +337,94 @@ func TestManualBootstrapHandler_RenderScript(t *testing.T) {
 	require.NotContains(t, script, "unbounded-agent-uninstall.sh")
 }
 
+func TestManualBootstrapHandler_RenderScript_WithAgentURL(t *testing.T) {
+	t.Parallel()
+
+	h := &manualBootstrapHandler{
+		logger: discardLogger(),
+	}
+
+	cfg := &provision.AgentConfig{
+		MachineName: "test-node",
+		Cluster: provision.AgentClusterConfig{
+			CaCertBase64: "dGVzdA==",
+			ClusterDNS:   "10.0.0.10",
+			Version:      "v1.30.0",
+		},
+		Kubelet: provision.AgentKubeletConfig{
+			ApiServer:      "https://api-server:6443",
+			BootstrapToken: "abc123.0123456789abcdef",
+		},
+	}
+
+	h.agentURL = "file:///tmp/unbounded-agent-linux-amd64.tar.gz"
+
+	script, err := h.renderScript(cfg)
+	require.NoError(t, err)
+
+	agentURLExport := "export AGENT_URL='file:///tmp/unbounded-agent-linux-amd64.tar.gz'"
+	installScript := "bash <<'INSTALL_SCRIPT_EOF'"
+
+	require.Contains(t, script, agentURLExport)
+	require.Contains(t, script, installScript)
+	require.Less(t, strings.Index(script, agentURLExport), strings.Index(script, installScript))
+}
+
+func TestManualBootstrapHandler_RenderScript_WithUnsafeAgentURL(t *testing.T) {
+	t.Parallel()
+
+	h := &manualBootstrapHandler{
+		logger:   discardLogger(),
+		agentURL: `https://example.test/download?name="agent"&cmd=$(touch /tmp/pwned)`,
+	}
+
+	cfg := &provision.AgentConfig{
+		MachineName: "test-node",
+		Cluster: provision.AgentClusterConfig{
+			CaCertBase64: "dGVzdA==",
+			ClusterDNS:   "10.0.0.10",
+			Version:      "v1.30.0",
+		},
+		Kubelet: provision.AgentKubeletConfig{
+			ApiServer:      "https://api-server:6443",
+			BootstrapToken: "abc123.0123456789abcdef",
+		},
+	}
+
+	script, err := h.renderScript(cfg)
+	require.NoError(t, err)
+	require.Contains(t, script, `export AGENT_URL='https://example.test/download?name="agent"&cmd=$(touch /tmp/pwned)'`)
+	require.NotContains(t, script, `export AGENT_URL="https://example.test/download?name="agent"&cmd=$(touch /tmp/pwned)"`)
+
+	installScript := "bash <<'INSTALL_SCRIPT_EOF'"
+	require.Less(t, strings.Index(script, "export AGENT_URL='https://example.test/download?name=\"agent\"&cmd=$(touch /tmp/pwned)'"), strings.Index(script, installScript))
+}
+
+func TestManualBootstrapHandler_RenderScript_WithoutAgentURL(t *testing.T) {
+	t.Parallel()
+
+	h := &manualBootstrapHandler{
+		logger: discardLogger(),
+	}
+
+	cfg := &provision.AgentConfig{
+		MachineName: "test-node",
+		Cluster: provision.AgentClusterConfig{
+			CaCertBase64: "dGVzdA==",
+			ClusterDNS:   "10.0.0.10",
+			Version:      "v1.30.0",
+		},
+		Kubelet: provision.AgentKubeletConfig{
+			ApiServer:      "https://api-server:6443",
+			BootstrapToken: "abc123.0123456789abcdef",
+		},
+	}
+
+	script, err := h.renderScript(cfg)
+	require.NoError(t, err)
+	require.NotContains(t, script, "export AGENT_URL=")
+}
+
 func TestManualBootstrapHandler_RenderCloudInit(t *testing.T) {
 	t.Parallel()
 
@@ -360,7 +459,7 @@ func TestManualBootstrapHandler_RenderCloudInit(t *testing.T) {
 		require.Contains(t, output, "test-node")
 
 		// Must write the agent config file.
-		require.Contains(t, output, "/etc/unbounded-agent/config.json")
+		require.Contains(t, output, "/etc/unbounded/agent/config.json")
 		require.Contains(t, output, `"MachineName": "test-node"`)
 		require.Contains(t, output, `"ApiServer": "https://api-server:6443"`)
 
@@ -369,7 +468,7 @@ func TestManualBootstrapHandler_RenderCloudInit(t *testing.T) {
 		require.Contains(t, output, "unbounded-agent")
 
 		// runcmd must set UNBOUNDED_AGENT_CONFIG_FILE and run the install script.
-		require.Contains(t, output, "UNBOUNDED_AGENT_CONFIG_FILE=/etc/unbounded-agent/config.json")
+		require.Contains(t, output, "UNBOUNDED_AGENT_CONFIG_FILE=/etc/unbounded/agent/config.json")
 		require.Contains(t, output, "bash /usr/local/bin/unbounded-agent-install.sh")
 
 		// AGENT_OCI_IMAGE env var should not be present (OCI image is in the JSON config).
@@ -414,6 +513,36 @@ func TestManualBootstrapHandler_RenderCloudInit(t *testing.T) {
 // ---------------------------------------------------------------------------
 // execute() integration test
 // ---------------------------------------------------------------------------
+
+func TestManualBootstrapHandler_Execute_WithAgentURL(t *testing.T) {
+	t.Parallel()
+
+	kubeCli := newFakeCluster(t, "dc1")
+
+	var buf bytes.Buffer
+
+	kubeconfigPath := writeTempKubeconfig(t)
+
+	h := &manualBootstrapHandler{
+		out:            &buf,
+		kubeCli:        kubeCli,
+		kubeConfig:     &rest.Config{Host: "https://my-api-server:6443"},
+		kubeconfigPath: kubeconfigPath,
+		logger:         discardLogger(),
+	}
+
+	cmd := newMachineManualBootstrapCommand(h)
+	cmd.SetArgs([]string{
+		"--site", "dc1",
+		"--kubeconfig", kubeconfigPath,
+		"--agent-url", "file:///tmp/unbounded-agent-linux-amd64.tar.gz",
+		"node-1",
+	})
+
+	err := cmd.ExecuteContext(context.Background())
+	require.NoError(t, err)
+	require.Contains(t, buf.String(), "export AGENT_URL='file:///tmp/unbounded-agent-linux-amd64.tar.gz'")
+}
 
 func TestManualBootstrapHandler_Execute(t *testing.T) {
 	t.Parallel()
@@ -469,6 +598,6 @@ func TestManualBootstrapHandler_Execute(t *testing.T) {
 		require.True(t, strings.HasPrefix(output, "#cloud-config\n"))
 		require.Contains(t, output, "my-node")
 		require.Contains(t, output, "abc123.")
-		require.Contains(t, output, "/etc/unbounded-agent/config.json")
+		require.Contains(t, output, "/etc/unbounded/agent/config.json")
 	})
 }

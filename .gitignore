@@ -1,6 +1,7 @@
 # Build artifacts
 bin/
-dist/
+/dist/
+build/
 inventory.db
 *.exe
 *.exe~
@@ -8,15 +9,23 @@ inventory.db
 *.so
 *.dylib
 
+# Net binaries (ignore loose binaries, not cmd dirs)
+unbounded-net-*
+!unbounded-net-*/
+__debug*
+
 # Developer Stuff
 hack/scratch
+hack/bin/
 tmp/
 .vm/
 .vm-e2e/
 unbounded-agent-config-dev.json
+/resources/
 
 # Kubernetes
 .kube/
+*.kubeconfig
 
 # SSH
 *_rsa
@@ -27,6 +36,12 @@ unbounded-agent-config-dev.json
 *.test
 *.out
 coverage.txt
+coverage.out
+coverage.html
+
+# Go workspace
+go.work
+go.work.sum
 
 # Logs
 *.log
@@ -39,6 +54,7 @@ vendor/
 .idea/
 *.swp
 *.swo
+*~
 
 # OS generated
 .DS_Store
@@ -51,6 +67,32 @@ docs/.hugo_build.lock
 
 # AI Tools
 .opencode
+.claude/settings.local.json
 
 # Python
 __pycache__/
+
+# Environment files
+.env
+.env.*
+.envrc
+
+# Frontend
+/frontend/node_modules/
+/frontend/dist/
+.vite/
+.npm/
+
+# Playwright
+.playwright-cli/
+.playwright/
+
+# Rendered templates
+hack/net/templates/*.json
+# Rendered manifest output is managed by per-directory .gitignore placeholders
+# under deploy/{machina,net}/rendered/ so the //go:embed all:rendered
+# directives in deploy/{machina,net}/embed.go remain satisfiable on a fresh
+# clone.
+
+# Temporary files
+*.tmp

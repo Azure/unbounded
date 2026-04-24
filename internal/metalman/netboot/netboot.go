@@ -16,9 +16,9 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	v1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
-	"github.com/Azure/unbounded-kube/internal/metalman/indexing"
-	"github.com/Azure/unbounded-kube/internal/provision"
+	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/metalman/indexing"
+	"github.com/Azure/unbounded/internal/provision"
 )
 
 // ErrNotYetDownloaded is returned when an OCI image has not yet been

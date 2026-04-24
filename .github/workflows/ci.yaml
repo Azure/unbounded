@@ -1,0 +1,282 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+# Cancel in-progress runs for the same branch/PR to avoid wasted runner time.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io/${{ github.repository_owner }}
+  CNI_PLUGINS_VERSION: v1.9.1
+
+jobs:
+  # ---------- Frontend ----------
+  frontend:
+    name: Build Frontend
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend
+        run: npm ci --prefer-offline --no-audit && npm run build
+        working-directory: frontend
+
+      - name: Upload frontend dist
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+          retention-days: 1
+
+  # ---------- Lint ----------
+  lint:
+    name: Lint
+    needs: [frontend]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Download frontend dist
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: frontend-dist
+          path: internal/net/html/dist
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Cache golangci-lint analysis
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.cache/golangci-lint
+          key: golangci-${{ runner.os }}-${{ hashFiles('go.sum', '.golangci.yaml') }}
+          restore-keys: |
+            golangci-${{ runner.os }}-
+
+      - name: Install tools
+        run: make install-tools
+
+      - name: Lint
+        run: make lint
+
+  # ---------- Test ----------
+  test:
+    name: Test
+    needs: [frontend]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Download frontend dist
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: frontend-dist
+          path: internal/net/html/dist
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Verify go.mod tidy
+        run: |
+          make gomod
+          if [ -n "$(git diff --name-only go.mod go.sum)" ]; then
+            echo "::error::go.mod or go.sum is not tidy. Run 'make gomod' and commit the changes."
+            git diff go.mod go.sum
+            exit 1
+          fi
+
+      - name: Test
+        run: make test
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage
+          path: coverage.out
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # ---------- Build ----------
+  build:
+    name: Build
+    needs: [frontend]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Download frontend dist
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: frontend-dist
+          path: internal/net/html/dist
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Build
+        run: make build
+
+  # ---------- Vulnerability Check ----------
+  govulncheck:
+    name: Vulnerability Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Vulnerability check
+        run: make vulncheck
+
+  # ---------- Verify Generated Files ----------
+  verify-generated:
+    name: Verify Generated Files
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Install tools
+        run: make install-tools
+
+      - name: Regenerate
+        run: make generate
+
+      - name: Check for drift
+        run: |
+          if ! git diff --exit-code; then
+            echo "::error::Generated files are out of date. Run 'make generate' and commit the results."
+            exit 1
+          fi
+
+  # ---------- Build Container Images ----------
+  build-images:
+    name: Build Images (${{ matrix.arch }})
+    needs: [frontend]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            platform: linux/amd64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    steps:
+      - name: Normalize container registry
+        run: echo "REGISTRY=${REGISTRY,,}" >> "$GITHUB_ENV"
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Download frontend dist
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: frontend-dist
+          path: internal/net/html/dist
+
+      - name: Cache CNI plugins
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
+        with:
+          path: resources
+          key: cni-plugins-${{ matrix.arch }}-${{ env.CNI_PLUGINS_VERSION }}
+
+      - name: Download CNI plugins
+        run: |
+          mkdir -p resources
+          file="resources/cni-plugins-linux-${{ matrix.arch }}-${CNI_PLUGINS_VERSION}.tgz"
+          if [ ! -s "$file" ]; then
+            curl -fsSL "https://github.com/containernetworking/plugins/releases/download/${CNI_PLUGINS_VERSION}/cni-plugins-linux-${{ matrix.arch }}-${CNI_PLUGINS_VERSION}.tgz" -o "$file"
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
+
+      - name: Compute Go version for Docker
+        id: goversion
+        run: echo "go_version=$(awk '/^go /{split($2,v,"."); print v[1]"."v[2]}' go.mod)" >> "$GITHUB_OUTPUT"
+
+      - name: Build controller image
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
+        with:
+          context: .
+          file: images/net-controller/Dockerfile
+          target: controller
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            GO_VERSION=${{ steps.goversion.outputs.go_version }}
+            CNI_PLUGINS_VERSION=${{ env.CNI_PLUGINS_VERSION }}
+            GIT_COMMIT=${{ github.sha }}
+          tags: ${{ env.REGISTRY }}/unbounded-net-controller:ci-${{ matrix.arch }}
+          cache-from: type=gha,scope=build-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=build-${{ matrix.arch }}
+          push: false
+          provenance: false
+
+      - name: Build node image
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
+        with:
+          context: .
+          file: images/net-node/Dockerfile
+          target: node
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            GO_VERSION=${{ steps.goversion.outputs.go_version }}
+            CNI_PLUGINS_VERSION=${{ env.CNI_PLUGINS_VERSION }}
+            GIT_COMMIT=${{ github.sha }}
+          tags: ${{ env.REGISTRY }}/unbounded-net-node:ci-${{ matrix.arch }}
+          cache-from: type=gha,scope=build-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=build-${{ matrix.arch }}
+          push: false
+          provenance: false

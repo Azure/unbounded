@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-name: Agent E2E Kind
+name: unbounded agent e2e
 
 on:
   pull_request:
@@ -12,7 +12,11 @@ on:
       - internal/kube/**
       - hack/agent/e2e-kind/**
       - deploy/machina/crd/**
-      - deploy/machina/07-bootstrapper-rbac.yaml
+      - deploy/machina/*.yaml.tmpl
+      - deploy/net/crd/**
+      - deploy/net/*.yaml.tmpl
+      - deploy/net/controller/*.yaml.tmpl
+      - deploy/net/node/*.yaml.tmpl
       - go.mod
       - go.sum
       - .github/workflows/agent-e2e-kind.yaml
@@ -25,7 +29,11 @@ on:
       - internal/kube/**
       - hack/agent/e2e-kind/**
       - deploy/machina/crd/**
-      - deploy/machina/07-bootstrapper-rbac.yaml
+      - deploy/machina/*.yaml.tmpl
+      - deploy/net/crd/**
+      - deploy/net/*.yaml.tmpl
+      - deploy/net/controller/*.yaml.tmpl
+      - deploy/net/node/*.yaml.tmpl
       - go.mod
       - go.sum
       - .github/workflows/agent-e2e-kind.yaml
@@ -147,18 +155,18 @@ jobs:
       - name: Install Machine CRD
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose install-machine-crd
 
-      # Case 1: Machine CR already exists when agent runs.
-      - name: Pre-create Machine CR
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose create-machine-cr
-
+      # No Machine CR pre-created; agent self-registers during bootstrap.
       - name: Run agent to join VM to cluster
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose run-agent
 
       - name: Wait for node to become Ready
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose wait-for-node
 
-      - name: Validate Machine CR (preexisting)
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-machine-cr-preexisting
+      - name: Validate kube-proxy on all nodes
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-kube-proxy
+
+      - name: Validate Machine CR (self-registered)
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-machine-cr-created
 
       - name: Validate workload on agent node
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-workload
@@ -169,13 +177,8 @@ jobs:
       - name: Delete Machine CR
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose delete-machine-cr
 
-      # Case 2: Machine CR does not exist when agent runs.
-      # Recreate the VM so Case 2 starts with a pristine OS (the first
-      # agent run leaves nftables/kube-proxy state that can interfere).
-      - name: Recreate VM for Case 2
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose recreate-vm
-
-      - name: Ensure Kind bridge attachment for Case 2
+      # Rejoin: run the agent again on the same VM after reset.
+      - name: Ensure Kind bridge attachment for rejoin
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose ensure-kind-bridge
 
       - name: Rejoin agent to cluster
@@ -184,7 +187,10 @@ jobs:
       - name: Wait for node to become Ready (rejoin)
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose wait-for-node
 
-      - name: Validate Machine CR (created)
+      - name: Validate kube-proxy on all nodes (rejoin)
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-kube-proxy
+
+      - name: Validate Machine CR (rejoin)
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-machine-cr-created
 
       - name: Validate workload on rejoined agent node
@@ -202,6 +208,8 @@ jobs:
           $SSH "sudo journalctl --no-pager -l" > logs/vm-journal.log 2>/dev/null || true
           # Collect unbounded-agent logs from the VM host
           $SSH "sudo journalctl -u unbounded-agent --no-pager -l" > logs/vm-unbounded-agent.log 2>/dev/null || true
+          # Collect unbounded-agent-daemon logs
+          $SSH "sudo journalctl -u unbounded-agent-daemon --no-pager -l" > logs/vm-unbounded-agent-daemon.log 2>/dev/null || true
           # Kubelet and containerd run inside the nspawn container, not on
           # the host.  Use 'journalctl -M <machine>' to read the container
           # journal, and fall back to machinectl shell if that doesn't work.

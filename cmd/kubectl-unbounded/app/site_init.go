@@ -21,16 +21,12 @@ import (
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"github.com/Azure/unbounded-kube/cmd/machina/machina/controller"
-	"github.com/Azure/unbounded-kube/internal/kube"
+	"github.com/Azure/unbounded/cmd/machina/machina/controller"
+	"github.com/Azure/unbounded/internal/kube"
 )
 
 //go:embed assets/unbounded-net-site/*.yaml
 var siteTemplates embed.FS
-
-const (
-	unboundedCNIRelease = "https://unboundednet.blob.core.windows.net/manifests/unbounded-net-manifests-v1.2.2.tar.gz"
-)
 
 // siteInitHandler is responsible for handling initial unbounded-kube bootstrap and also ensuring a site
 // is ready for machines to be added to it. The handler performs the following duties:
@@ -226,7 +222,7 @@ func (h *siteInitHandler) validate() error {
 		return errors.New("pod CIDR is invalid")
 	}
 
-	if !isHTTPSURL(h.cniManifests) && !isDirectoryOrFile(h.cniManifests) {
+	if h.cniManifests != "" && !isHTTPSURL(h.cniManifests) && !isDirectoryOrFile(h.cniManifests) {
 		return errors.New("CNI manifests path is invalid")
 	}
 
@@ -266,6 +262,10 @@ func (h *siteInitHandler) ensureUnboundedCNI(ctx context.Context) error {
 		return fmt.Errorf(
 			"no nodes with label unbounded-kube.io/unbounded-net-gateway=true found; please label at least one node with that label before initializing the site",
 		)
+	}
+
+	if h.cniManifests == "" {
+		h.logger.Info("Using embedded unbounded-net manifests")
 	}
 
 	if err := h.installUnboundedCNI.run(ctx); err != nil {
@@ -399,7 +399,7 @@ func siteInitCommand() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&handler.cniManifests, "cni-manifests", unboundedCNIRelease, "Path or https URL to CNI plugin manifests")
+	cmd.Flags().StringVar(&handler.cniManifests, "cni-manifests", "", "Path or https URL to CNI plugin manifests (uses embedded manifests if omitted)")
 	cmd.Flags().StringVar(&handler.machinaManifests, "machina-manifests", "", "Path or https URL to Machina manifests (uses embedded manifests if omitted)")
 	cmd.Flags().StringVar(&handler.kubeconfigPath, "kubeconfig", "", "Path to kubeconfig file")
 	cmd.Flags().StringVar(&handler.name, "name", "", "The name of the site")

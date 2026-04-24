@@ -1,10 +1,10 @@
 ---
 title: "Bring Your Own Cluster"
 weight: 2
-description: "Add Unbounded Kube to an existing Kubernetes cluster and join remote nodes."
+description: "Add Unbounded to an existing Kubernetes cluster and join remote nodes."
 ---
 
-This guide adds Unbounded Kube to a Kubernetes cluster you already have running.
+This guide adds Unbounded to a Kubernetes cluster you already have running.
 You'll label gateway nodes, initialize a site, and join remote machines.
 
 > Starting from scratch? See the
@@ -36,7 +36,7 @@ Install the kubectl-unbounded plugin:
 
 ```bash
 # Linux (amd64)
-curl -sL https://github.com/Azure/unbounded-kube/releases/latest/download/kubectl-unbounded-linux-amd64.tar.gz | tar xz
+curl -sL https://github.com/Azure/unbounded/releases/latest/download/kubectl-unbounded-linux-amd64.tar.gz | tar xz
 sudo mv kubectl-unbounded /usr/local/bin/
 ```
 
@@ -44,7 +44,7 @@ sudo mv kubectl-unbounded /usr/local/bin/
 <summary>macOS (Apple Silicon)</summary>
 
 ```bash
-curl -sL https://github.com/Azure/unbounded-kube/releases/latest/download/kubectl-unbounded-darwin-arm64.tar.gz | tar xz
+curl -sL https://github.com/Azure/unbounded/releases/latest/download/kubectl-unbounded-darwin-arm64.tar.gz | tar xz
 sudo mv kubectl-unbounded /usr/local/bin/
 ```
 
@@ -102,7 +102,7 @@ kubectl unbounded site init \
 | Flag | Description |
 |------|-------------|
 | `--kubeconfig` | Path to kubeconfig file |
-| `--cni-manifests` | Path or URL to CNI manifests (defaults to a known release) |
+| `--cni-manifests` | Path or URL to CNI manifests (uses embedded manifests if omitted) |
 | `--machina-manifests` | Path or URL to machina manifests (uses embedded manifests if omitted) |
 | `--manage-cni-plugin` | Set to `false` when the cluster already has a CNI (default: `true`) |
 

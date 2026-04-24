@@ -10,8 +10,9 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/Azure/unbounded-kube/cmd/agent/internal/goalstates"
-	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases"
+	"github.com/Azure/unbounded/cmd/agent/internal/goalstates"
+	"github.com/Azure/unbounded/cmd/agent/internal/phases"
+	"github.com/Azure/unbounded/cmd/agent/internal/utilexec"
 )
 
 type setupNVIDIA struct {
@@ -73,7 +74,7 @@ func (s *setupNVIDIA) setupLibraries(ctx context.Context) error {
 
 	// Clean stale symlinks from a previous session that may point into
 	// /run/host-nvidia/ paths that no longer exist.
-	if _, err := machineRun(ctx, s.log, machine,
+	if _, err := utilexec.MachineRun(ctx, s.log, machine,
 		"find", s.goalState.Nvidia.ContainerLibDir, "-maxdepth", "1",
 		"-lname", goalstates.NvidiaHostLibDir+"/*", "-delete",
 	); err != nil {
@@ -83,11 +84,10 @@ func (s *setupNVIDIA) setupLibraries(ctx context.Context) error {
 	// Create symlinks: <lib>.LinkPath -> <lib>.ContainerPath
 	for _, lib := range libs {
 		// Remove any existing file/symlink, then create the new symlink.
-		// Errors from rm -f are intentionally ignored — the file may not exist.
-		//nolint:errcheck // rm -f is best-effort; file may not exist.
-		machineRun(ctx, s.log, machine, "rm", "-f", lib.LinkPath)
+		// Errors from rm -f are intentionally ignored - the file may not exist.
+		utilexec.MachineRun(ctx, s.log, machine, "rm", "-f", lib.LinkPath) //nolint:errcheck // rm -f is best-effort.
 
-		if _, err := machineRun(ctx, s.log, machine,
+		if _, err := utilexec.MachineRun(ctx, s.log, machine,
 			"ln", "-s", lib.ContainerPath, lib.LinkPath,
 		); err != nil {
 			return fmt.Errorf("symlink %s -> %s: %w", lib.LinkPath, lib.ContainerPath, err)
@@ -95,7 +95,7 @@ func (s *setupNVIDIA) setupLibraries(ctx context.Context) error {
 	}
 
 	// Update the dynamic linker cache so the libraries are discoverable.
-	if _, err := machineRun(ctx, s.log, machine, "ldconfig"); err != nil {
+	if _, err := utilexec.MachineRun(ctx, s.log, machine, "ldconfig"); err != nil {
 		return fmt.Errorf("ldconfig failed: %w", err)
 	}
 
@@ -120,7 +120,7 @@ func (s *setupNVIDIA) generateCDISpec(ctx context.Context) error {
 		slog.String("output", goalstates.CDISpecFile),
 	)
 
-	if _, err := machineRun(ctx, s.log, machine,
+	if _, err := utilexec.MachineRun(ctx, s.log, machine,
 		goalstates.NvidiaCTKPath, "cdi", "generate",
 		"--output", goalstates.CDISpecFile,
 		"--disable-hook", "all",

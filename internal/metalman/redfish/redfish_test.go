@@ -25,7 +25,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	v1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
+	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
 
 func TestMain(m *testing.M) {
@@ -151,7 +151,7 @@ func TestRedfishRebootCycle(t *testing.T) {
 				},
 			},
 			Operations: &v1alpha3.OperationsSpec{
-				RebootCounter:  1,
+				RebootCounter: 1,
 				RepaveCounter: 1,
 			},
 		},
@@ -389,7 +389,7 @@ func TestRedfishPowerOnTimeoutRetry(t *testing.T) {
 				},
 			},
 			Operations: &v1alpha3.OperationsSpec{
-				RebootCounter:  22,
+				RebootCounter: 22,
 				RepaveCounter: 22,
 			},
 		},
@@ -706,7 +706,7 @@ func TestRedfishExactlyOnceSemantics(t *testing.T) {
 				},
 			},
 			Operations: &v1alpha3.OperationsSpec{
-				RebootCounter:  3,
+				RebootCounter: 3,
 				RepaveCounter: 1,
 			},
 		},

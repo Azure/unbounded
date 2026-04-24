@@ -1,0 +1,128 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.1
+  name: sitegatewaypoolassignments.net.unbounded-kube.io
+spec:
+  group: net.unbounded-kube.io
+  names:
+    kind: SiteGatewayPoolAssignment
+    listKind: SiteGatewayPoolAssignmentList
+    plural: sitegatewaypoolassignments
+    shortNames:
+    - sgpa
+    singular: sitegatewaypoolassignment
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: SiteGatewayPoolAssignment links sites to gateway pools.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: SiteGatewayPoolAssignmentSpec defines desired state for site
+              to gateway-pool assignments.
+            properties:
+              enabled:
+                description: |-
+                  Enabled controls whether this assignment is active.
+                  Defaults to true.
+                type: boolean
+              gatewayPools:
+                description: GatewayPools is the list of gateway pool names.
+                items:
+                  type: string
+                minItems: 1
+                type: array
+              healthCheckSettings:
+                description: HealthCheckSettings controls health check settings for
+                  this site-to-pool assignment.
+                properties:
+                  detectMultiplier:
+                    description: |-
+                      DetectMultiplier is the multiplier used to determine session down detection.
+                      Valid range is 1-255.
+                    format: int32
+                    maximum: 255
+                    minimum: 1
+                    type: integer
+                  enabled:
+                    description: Enabled controls whether health check is enabled
+                      for this scope.
+                    type: boolean
+                  receiveInterval:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: |-
+                      ReceiveInterval is the minimum interval between received health check packets.
+                      Accepts either a duration string (e.g. "300ms") or an integer interpreted as milliseconds.
+                    x-kubernetes-int-or-string: true
+                  transmitInterval:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: |-
+                      TransmitInterval is the minimum interval between transmitted health check packets.
+                      Accepts either a duration string (e.g. "300ms") or an integer interpreted as milliseconds.
+                    x-kubernetes-int-or-string: true
+                type: object
+              sites:
+                description: Sites is the list of site names.
+                items:
+                  type: string
+                minItems: 1
+                type: array
+              tunnelMTU:
+                description: TunnelMTU is the MTU to set on routes through tunnels
+                  for this scope.
+                format: int32
+                maximum: 9000
+                minimum: 576
+                type: integer
+              tunnelProtocol:
+                description: |-
+                  TunnelProtocol selects the tunnel protocol for this scope.
+                  Valid values are "WireGuard", "IPIP", "GENEVE", "VXLAN", "None", or "Auto".
+                  Defaults to "Auto" when unset. When "Auto", links using external IPs
+                  use WireGuard and links using only internal IPs use GENEVE.
+                enum:
+                - WireGuard
+                - IPIP
+                - GENEVE
+                - VXLAN
+                - None
+                - Auto
+                type: string
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources: {}

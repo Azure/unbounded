@@ -22,10 +22,10 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
-	unboundedv1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
-	"github.com/Azure/unbounded-kube/internal/cloudprovider"
-	"github.com/Azure/unbounded-kube/internal/kube"
-	"github.com/Azure/unbounded-kube/internal/provision"
+	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/cloudprovider"
+	"github.com/Azure/unbounded/internal/kube"
+	"github.com/Azure/unbounded/internal/provision"
 )
 
 //go:embed assets/node-bootstrap/script.sh
@@ -85,6 +85,9 @@ type manualBootstrapHandler struct {
 
 	// variant controls the output format. Defaults to "script".
 	variant string
+
+	// agentURL optionally overrides the embedded install script download URL.
+	agentURL string
 
 	// kubeconfigPath is the path to the kubeconfig used to contact the cluster.
 	kubeconfigPath string
@@ -168,6 +171,10 @@ func (h *manualBootstrapHandler) validate() error {
 
 	if _, err := parseBootstrapVariant(h.variant); err != nil {
 		return err
+	}
+
+	if h.agentURL != "" && bootstrapVariant(h.variant) != variantScript {
+		return errors.New("--agent-url is only supported with --variant script")
 	}
 
 	h.kubeconfigPath = getKubeconfigPath(h.kubeconfigPath)
@@ -285,6 +292,14 @@ type manualBootstrapTemplateData struct {
 	// InstallScript is the full install script embedded verbatim inside a
 	// heredoc that is piped to bash.
 	InstallScript string
+
+	// AgentURLLiteral optionally overrides the agent download location used by
+	// the embedded install script as a shell-safe literal.
+	AgentURLLiteral string
+}
+
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'"'"'`) + "'"
 }
 
 // renderScript produces a self-contained bash script that writes the agent
@@ -300,6 +315,10 @@ func (h *manualBootstrapHandler) renderScript(cfg *provision.AgentConfig) (strin
 		MachineName:     cfg.MachineName,
 		AgentConfigJSON: string(configJSON),
 		InstallScript:   provision.UnboundedAgentInstallScript(),
+	}
+
+	if h.agentURL != "" {
+		data.AgentURLLiteral = shellQuote(h.agentURL)
 	}
 
 	t, err := template.New("node-bootstrap").Parse(manualBootstrapTemplate)
@@ -357,9 +376,7 @@ func (h *manualBootstrapHandler) renderCloudInit(cfg *provision.AgentConfig) (st
 	return buf.String(), nil
 }
 
-func machineManualBootstrapCommand() *cobra.Command {
-	handler := manualBootstrapHandler{}
-
+func newMachineManualBootstrapCommand(handler *manualBootstrapHandler) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "manual-bootstrap NAME",
 		Short: "Generate a bootstrap script or cloud-init config for provisioning a machine",
@@ -396,12 +413,19 @@ Examples:
 	cmd.Flags().StringVar(&handler.ociImage, "oci-image", "", "OCI image reference for the agent rootfs")
 	cmd.Flags().StringVar(&handler.kubernetesVersion, "kubernetes-version", "", "Override the Kubernetes version (default: auto-detected from API server)")
 	cmd.Flags().StringVar(&handler.variant, "variant", "script", "Output format: script or cloud-init")
+	cmd.Flags().StringVar(&handler.agentURL, "agent-url", "", "Override URL used by the embedded agent install script")
 
 	if err := cmd.MarkFlagRequired("site"); err != nil {
 		panic(err)
 	}
 
 	return cmd
+}
+
+func machineManualBootstrapCommand() *cobra.Command {
+	handler := &manualBootstrapHandler{}
+
+	return newMachineManualBootstrapCommand(handler)
 }
 
 // resolveBootstrapToken tries to find a bootstrap token for the given site.

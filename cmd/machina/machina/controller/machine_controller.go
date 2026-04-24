@@ -25,8 +25,8 @@ import (
 
 	stderrs "errors"
 
-	unboundedv1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
-	"github.com/Azure/unbounded-kube/internal/provision"
+	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/provision"
 )
 
 const (

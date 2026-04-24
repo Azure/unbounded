@@ -1,12 +1,12 @@
 ---
 title: "Architecture"
 weight: 1
-description: "High-level architecture of Unbounded Kube."
+description: "High-level architecture of Unbounded."
 ---
 
 ## Overview
 
-Unbounded Kube extends a standard Kubernetes cluster so that worker Nodes can
+Unbounded extends a standard Kubernetes cluster so that worker Nodes can
 run in any environment -- cloud, on-premises, or edge -- and join back to a
 central control plane. It adds:
 
@@ -41,7 +41,7 @@ service host to a public FQDN.
 **Configuration:** ConfigMap mounted at `/etc/machina/config.yaml`
 (`metricsAddr`, `probeAddr`, `enableLeaderElection`, `maxConcurrentReconciles`,
 `provisioningTimeout`). The Go code defaults `maxConcurrentReconciles` to 10,
-but the shipped ConfigMap (`deploy/machina/03-config.yaml`) sets it to 50.
+but the shipped ConfigMap (rendered from `deploy/machina/03-config.yaml.tmpl`) sets it to 50.
 `provisioningTimeout` defaults to 5 minutes.
 
 ### metalman -- Bare Metal PXE Controller

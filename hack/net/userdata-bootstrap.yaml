@@ -1,0 +1,1248 @@
+#cloud-config
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+#
+# userdata-bootstrap.yaml - Cloud-init userdata to bootstrap a Kubernetes node
+#
+# This cloud-init configuration embeds bootstrap-node.sh and runs it on first boot
+# to join a node to a Kubernetes cluster.
+#
+# Usage:
+#   Before using this file, replace the following placeholders:
+#     __KUBERNETES_VERSION__      - Kubernetes version (e.g., 1.30.0)
+#     __API_SERVER__              - API server hostname:port (e.g., api.example.com:6443)
+#     __BOOTSTRAP_TOKEN__         - Bootstrap token (format: [a-z0-9]{6}.[a-z0-9]{16})
+#     __CLUSTER_DNS__             - Cluster DNS IP (e.g., 100.127.0.10)
+#     __CLUSTER_RG__              - Azure resource group name
+#     __CA_CERT_BASE64__          - Base64-encoded CA certificate (no newlines)
+#     __TENANT_ID__               - Azure tenant ID
+#     __SUBSCRIPTION_ID__         - Azure subscription ID
+#     __SECURITY_GROUP_NAME__     - Azure network security group name
+#     __VNET_NAME__               - Azure virtual network name
+#     __VNET_RG__                 - Azure resource group for the virtual network
+#     __SUBNET_NAME__             - Azure subnet name
+#     __ROUTE_TABLE_NAME__        - Azure route table name
+#     __SCALE_SET_NAME__           - Azure VMSS name for this pool
+#     __EXTRA_NODE_LABELS__        - Extra node labels (e.g. ",net.unbounded-kube.io/gateway=true" or empty)
+#     __KUBELET_CLIENT_ID__       - Client ID of the kubelet managed identity
+#
+#   Example with sed:
+#     sed -e 's/__KUBERNETES_VERSION__/1.30.0/g' \
+#         -e 's/__API_SERVER__/api.example.com:6443/g' \
+#         -e 's/__BOOTSTRAP_TOKEN__/abcdef.0123456789abcdef/g' \
+#         -e 's/__CLUSTER_DNS__/100.127.0.10/g' \
+#         -e 's/__CLUSTER_RG__/my-resource-group/g' \
+#         -e 's/__TENANT_ID__/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx/g' \
+#         -e 's/__SUBSCRIPTION_ID__/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx/g' \
+#         -e 's/__SECURITY_GROUP_NAME__/my-nsg/g' \
+#         -e 's/__VNET_NAME__/my-vnet/g' \
+#         -e 's/__VNET_RG__/my-vnet-rg/g' \
+#         -e 's/__SUBNET_NAME__/default/g' \
+#         -e 's/__ROUTE_TABLE_NAME__/my-route-table/g' \
+#         -e 's/__SCALE_SET_NAME__/my-vmss/g' \
+#         -e 's/__KUBELET_CLIENT_ID__/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx/g' \
+#         -e "s|__CA_CERT_BASE64__|$(base64 -w0 < ca.crt)|g" \
+#         userdata-bootstrap.yaml > userdata.yaml
+#
+
+# Ensure the system is up to date and has required packages
+package_update: true
+package_upgrade: true
+packages:
+  - curl
+  - ca-certificates
+  - apt-transport-https
+  - wireguard-tools
+  - tcpdump
+
+# Write the CA certificate
+write_files:
+  - path: /tmp/ca.crt
+    permissions: '0644'
+    encoding: base64
+    content: __CA_CERT_BASE64__
+
+  - path: /etc/dhcp/dhclient.conf
+    permissions: '0644'
+    content: |
+        timeout 10;
+
+  - path: /etc/cloud/cloud.config.d/91-azure-network.cfg
+    permissions: '0600'
+    content: |
+        network:
+        version: 2
+        ethernets:
+            eth0:
+                dhcp4: true
+                dhcp6: true
+                dhcp4-overrides:
+                    route-metric: 100
+                dhcp6-overrides:
+                    route-metric: 100
+                match:
+                    driver: hv_netvsc
+                set-name: eth0
+
+  - path: /etc/kubernetes/azure.json
+    permissions: '0644'
+    content: |
+      {
+          "cloud": "AzurePublicCloud",
+          "tenantId": "__TENANT_ID__",
+          "subscriptionId": "__SUBSCRIPTION_ID__",
+          "aadClientId": "msi",
+          "aadClientSecret": "msi",
+          "resourceGroup": "__CLUSTER_RG__",
+          "location": "canadacentral",
+          "vmType": "vmss",
+          "subnetName": "__SUBNET_NAME__",
+          "securityGroupName": "__SECURITY_GROUP_NAME__",
+          "vnetName": "__VNET_NAME__",
+          "vnetResourceGroup": "__VNET_RG__",
+          "routeTableName": "__ROUTE_TABLE_NAME__",
+          "primaryAvailabilitySetName": "",
+          "primaryScaleSetName": "__SCALE_SET_NAME__",
+          "cloudProviderBackoffMode": "v2",
+          "cloudProviderBackoff": true,
+          "cloudProviderBackoffRetries": 6,
+          "cloudProviderBackoffDuration": 5,
+          "cloudProviderRateLimit": true,
+          "cloudProviderRateLimitQPS": 3,
+          "cloudProviderRateLimitBucket": 10,
+          "cloudProviderRateLimitQPSWrite": 1,
+          "cloudProviderRateLimitBucketWrite": 10,
+          "useManagedIdentityExtension": true,
+          "userAssignedIdentityID": "__KUBELET_CLIENT_ID__",
+          "useInstanceMetadata": true,
+          "loadBalancerSku": "standard",
+          "disableOutboundSNAT": false,
+          "excludeMasterFromStandardLB": true,
+          "providerVaultName": "",
+          "maximumLoadBalancerRuleCount": 250,
+          "providerKeyName": "k8s",
+          "providerKeyVersion": ""
+      }
+
+  - path: /opt/bootstrap-node.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      #
+      # bootstrap-node.sh - Bootstrap a node to join a Kubernetes cluster
+      #
+      # This script downloads and installs the required Kubernetes components (containerd,
+      # runc, kubelet, kubectl), then configures the kubelet with TLS bootstrapping to
+      # join a cluster.
+      #
+      # Usage:
+      #   ./bootstrap-node.sh -k <version> --api-server <hostname:port> --token <token> --ca-cert <path> --cluster-dns <ip> --cluster-rg <name>
+      #
+      # Required arguments:
+      #   -k, --kubernetes-version  Kubernetes version to install (e.g., 1.30.0, v1.30.0)
+      #   --api-server              Kubernetes API server hostname:port (e.g., api.example.com:6443)
+      #   --token                   Bootstrap token in format [a-z0-9]{6}.[a-z0-9]{16}
+      #   --ca-cert                 Path to the cluster CA certificate file
+      #   --cluster-dns             Cluster DNS service IP address (e.g., 10.96.0.10)
+      #   --cluster-rg              Azure resource group name for the cluster
+      #   --vnet-rg                 Azure resource group name for the virtual network
+      #
+      # Optional arguments:
+      #   --containerd-version      Containerd version (default: 1.7.24)
+      #   --runc-version            Runc version (default: 1.2.4)
+      #   --crictl-version          Crictl version (default: 1.32.0)
+      #   --node-name               Override the node name (default: short hostname)
+      #   --kubelet-dir             Kubelet configuration directory (default: /etc/kubernetes)
+      #   --skip-install            Skip downloading/installing components (configure only)
+      #   --dry-run                 Print what would be done without making changes
+      #   --help                    Show this help message
+      #
+
+      set -euo pipefail
+
+      # Default values
+      KUBELET_DIR="/etc/kubernetes"
+      NODE_NAME=""
+      DRY_RUN=false
+      SKIP_INSTALL=false
+      API_SERVER=""
+      BOOTSTRAP_TOKEN=""
+      CA_CERT_PATH=""
+      KUBE_VERSION=""
+      CLUSTER_DNS=""
+      CLUSTER_RG=""
+      TENANT_ID=""
+      SUBSCRIPTION_ID=""
+      SECURITY_GROUP_NAME=""
+      VNET_NAME=""
+      ROUTE_TABLE_NAME=""
+      SCALE_SET_NAME=""
+      CONTAINERD_VERSION="1.7.24"
+      RUNC_VERSION="1.2.4"
+      CRICTL_VERSION="1.32.0"
+
+      # Detect architecture
+      ARCH=$(uname -m)
+      case $ARCH in
+          x86_64)
+              ARCH="amd64"
+              ;;
+          aarch64)
+              ARCH="arm64"
+              ;;
+          *)
+              echo "Unsupported architecture: $ARCH" >&2
+              exit 1
+              ;;
+      esac
+
+      # Detected node IPs (set during detect_node_ips)
+      NODE_IP_V4=""
+      NODE_IP_V6=""
+
+      # Temporary directory for downloads
+      DOWNLOAD_DIR=""
+
+      # Colors for output
+      RED='\033[0;31m'
+      GREEN='\033[0;32m'
+      YELLOW='\033[1;33m'
+      BLUE='\033[0;34m'
+      NC='\033[0m' # No Color
+
+      log_info() {
+          echo -e "${GREEN}[INFO]${NC} $1"
+      }
+
+      log_warn() {
+          echo -e "${YELLOW}[WARN]${NC} $1"
+      }
+
+      log_error() {
+          echo -e "${RED}[ERROR]${NC} $1" >&2
+      }
+
+      log_step() {
+          echo -e "${BLUE}[STEP]${NC} $1"
+      }
+
+      usage() {
+          head -29 "$0" | grep '^#' | sed 's/^# *//'
+          exit 0
+      }
+
+      die() {
+          log_error "$1"
+          exit 1
+      }
+
+      cleanup() {
+          if [[ -n "$DOWNLOAD_DIR" ]] && [[ -d "$DOWNLOAD_DIR" ]]; then
+              rm -rf "$DOWNLOAD_DIR"
+          fi
+      }
+
+      trap cleanup EXIT
+
+      # Parse command line arguments
+      parse_args() {
+          while [[ $# -gt 0 ]]; do
+              case $1 in
+                  -k|--kubernetes-version)
+                      KUBE_VERSION="$2"
+                      shift 2
+                      ;;
+                  --api-server)
+                      API_SERVER="$2"
+                      shift 2
+                      ;;
+                  --token)
+                      BOOTSTRAP_TOKEN="$2"
+                      shift 2
+                      ;;
+                  --ca-cert)
+                      CA_CERT_PATH="$2"
+                      shift 2
+                      ;;
+                  --containerd-version)
+                      CONTAINERD_VERSION="$2"
+                      shift 2
+                      ;;
+                  --runc-version)
+                      RUNC_VERSION="$2"
+                      shift 2
+                      ;;
+                  --crictl-version)
+                      CRICTL_VERSION="$2"
+                      shift 2
+                      ;;
+                  --cluster-dns)
+                      CLUSTER_DNS="$2"
+                      shift 2
+                      ;;
+                  --cluster-rg)
+                      CLUSTER_RG="$2"
+                      shift 2
+                      ;;
+                  --vnet-rg)
+                      VNET_RG="$2"
+                      shift 2
+                      ;;
+                  --tenant-id)
+                      TENANT_ID="$2"
+                      shift 2
+                      ;;
+                  --subscription-id)
+                      SUBSCRIPTION_ID="$2"
+                      shift 2
+                      ;;
+                  --security-group-name)
+                      SECURITY_GROUP_NAME="$2"
+                      shift 2
+                      ;;
+                  --vnet-name)
+                      VNET_NAME="$2"
+                      shift 2
+                      ;;
+                  --route-table-name)
+                      ROUTE_TABLE_NAME="$2"
+                      shift 2
+                      ;;
+                  --scale-set-name)
+                      SCALE_SET_NAME="$2"
+                      shift 2
+                      ;;
+                  --node-name)
+                      NODE_NAME="$2"
+                      shift 2
+                      ;;
+                  --kubelet-dir)
+                      KUBELET_DIR="$2"
+                      shift 2
+                      ;;
+                  --skip-install)
+                      SKIP_INSTALL=true
+                      shift
+                      ;;
+                  --dry-run)
+                      DRY_RUN=true
+                      shift
+                      ;;
+                  --help|-h)
+                      usage
+                      ;;
+                  *)
+                      die "Unknown option: $1"
+                      ;;
+              esac
+          done
+      }
+
+      # Normalize version string (ensure it has 'v' prefix for Kubernetes)
+      normalize_kube_version() {
+          local version="$1"
+          # Remove 'v' prefix if present for consistency, then add it back
+          version="${version#v}"
+          echo "v$version"
+      }
+
+      # Get version without 'v' prefix
+      strip_version_prefix() {
+          local version="$1"
+          echo "${version#v}"
+      }
+
+      # Validate required arguments
+      validate_args() {
+          local errors=0
+
+          if [[ -z "$KUBE_VERSION" ]]; then
+              log_error "Missing required argument: -k/--kubernetes-version"
+              errors=$((errors + 1))
+          else
+              KUBE_VERSION=$(normalize_kube_version "$KUBE_VERSION")
+              log_info "Kubernetes version: $KUBE_VERSION"
+          fi
+
+          if [[ -z "$API_SERVER" ]]; then
+              log_error "Missing required argument: --api-server"
+              errors=$((errors + 1))
+          fi
+
+          if [[ -z "$BOOTSTRAP_TOKEN" ]]; then
+              log_error "Missing required argument: --token"
+              errors=$((errors + 1))
+          elif ! [[ "$BOOTSTRAP_TOKEN" =~ ^[a-z0-9]{6}\.[a-z0-9]{16}$ ]]; then
+              log_error "Invalid bootstrap token format. Expected: [a-z0-9]{6}.[a-z0-9]{16}"
+              errors=$((errors + 1))
+          fi
+
+          if [[ -z "$CA_CERT_PATH" ]]; then
+              log_error "Missing required argument: --ca-cert"
+              errors=$((errors + 1))
+          elif [[ ! -f "$CA_CERT_PATH" ]]; then
+              log_error "CA certificate file not found: $CA_CERT_PATH"
+              errors=$((errors + 1))
+          fi
+
+          if [[ -z "$CLUSTER_DNS" ]]; then
+              log_error "Missing required argument: --cluster-dns"
+              errors=$((errors + 1))
+          fi
+
+          if [[ -z "$CLUSTER_RG" ]]; then
+              log_error "Missing required argument: --cluster-rg"
+              errors=$((errors + 1))
+          fi
+
+          if [[ -z "$VNET_RG" ]]; then
+              log_error "Missing required argument: --vnet-rg"
+              errors=$((errors + 1))
+          fi
+
+          if [[ -z "$TENANT_ID" ]]; then
+              log_error "Missing required argument: --tenant-id"
+              errors=$((errors + 1))
+          fi
+
+          if [[ -z "$SUBSCRIPTION_ID" ]]; then
+              log_error "Missing required argument: --subscription-id"
+              errors=$((errors + 1))
+          fi
+
+          if [[ -z "$SECURITY_GROUP_NAME" ]]; then
+              log_error "Missing required argument: --security-group-name"
+              errors=$((errors + 1))
+          fi
+
+          if [[ -z "$VNET_NAME" ]]; then
+              log_error "Missing required argument: --vnet-name"
+              errors=$((errors + 1))
+          fi
+
+          if [[ -z "$SCALE_SET_NAME" ]]; then
+              log_error "Missing required argument: --scale-set-name"
+              errors=$((errors + 1))
+          fi
+
+          if [[ $errors -gt 0 ]]; then
+              echo ""
+              usage
+          fi
+
+          # Set default node name if not specified (use short hostname)
+          if [[ -z "$NODE_NAME" ]]; then
+              NODE_NAME=$(hostname -s)
+              log_info "Using short hostname as node name: $NODE_NAME"
+          fi
+      }
+
+      # Check prerequisites
+      check_prerequisites() {
+          log_step "Checking prerequisites..."
+
+          # Check if running as root
+          if [[ $EUID -ne 0 ]] && [[ "$DRY_RUN" == "false" ]]; then
+              die "This script must be run as root (or use --dry-run)"
+          fi
+
+          # Check for required commands
+          local required_cmds=("base64" "openssl" "curl" "tar")
+          for cmd in "${required_cmds[@]}"; do
+              if ! command -v "$cmd" &> /dev/null; then
+                  die "Required command not found: $cmd"
+              fi
+          done
+
+          # Verify CA certificate is valid
+          if ! openssl x509 -in "$CA_CERT_PATH" -noout 2>/dev/null; then
+              die "Invalid CA certificate: $CA_CERT_PATH"
+          fi
+
+          log_info "Prerequisites check passed"
+          log_info "Architecture: $ARCH"
+      }
+
+      # Detect primary IPv4 and IPv6 addresses from the default gateway interface
+      # This ensures kubelet uses stable, explicitly configured IPs instead of autodetection
+      detect_node_ips() {
+          log_step "Detecting node IP addresses..."
+
+          # Find the interface used for the default IPv4 route
+          local default_iface_v4
+          default_iface_v4=$(ip -4 route show default 2>/dev/null | awk '{print $5}' | head -1)
+
+          if [[ -n "$default_iface_v4" ]]; then
+              # Get the primary IPv4 address on that interface (first non-secondary address)
+              NODE_IP_V4=$(ip -4 addr show dev "$default_iface_v4" 2>/dev/null | \
+                  grep -oP 'inet \K[0-9.]+' | head -1)
+              if [[ -n "$NODE_IP_V4" ]]; then
+                  log_info "Detected IPv4 address: $NODE_IP_V4 (interface: $default_iface_v4)"
+              else
+                  log_warn "Could not detect IPv4 address on interface $default_iface_v4"
+              fi
+          else
+              log_warn "Could not detect default IPv4 interface"
+          fi
+
+          # Find the interface used for the default IPv6 route
+          local default_iface_v6
+          default_iface_v6=$(ip -6 route show default 2>/dev/null | awk '{print $5}' | head -1)
+
+          if [[ -n "$default_iface_v6" ]]; then
+              # Get the primary global IPv6 address on that interface (prefer non-temporary, non-link-local)
+              # Look for addresses with scope global that are not temporary (no 'temporary' or 'dynamic' flag with short lifetime)
+              NODE_IP_V6=$(ip -6 addr show dev "$default_iface_v6" scope global 2>/dev/null | \
+                  grep -v 'temporary' | grep -oP 'inet6 \K[0-9a-f:]+' | head -1)
+              if [[ -n "$NODE_IP_V6" ]]; then
+                  log_info "Detected IPv6 address: $NODE_IP_V6 (interface: $default_iface_v6)"
+              else
+                  log_warn "Could not detect IPv6 address on interface $default_iface_v6"
+              fi
+          else
+              log_info "No default IPv6 route found (IPv6 may not be configured)"
+          fi
+
+          # At least one IP must be detected
+          if [[ -z "$NODE_IP_V4" ]] && [[ -z "$NODE_IP_V6" ]]; then
+              die "Could not detect any node IP addresses"
+          fi
+      }
+
+      # Create download directory
+      setup_download_dir() {
+          DOWNLOAD_DIR=$(mktemp -d)
+          log_info "Using temporary directory: $DOWNLOAD_DIR"
+      }
+
+      # Download a file with progress
+      download_file() {
+          local url="$1"
+          local dest="$2"
+          local desc="$3"
+
+          if [[ "$DRY_RUN" == "true" ]]; then
+              log_info "[DRY-RUN] Would download: $url"
+              return 0
+          fi
+
+          log_info "Downloading $desc..."
+          if ! curl -fsSL --progress-bar -o "$dest" "$url"; then
+              die "Failed to download $desc from $url"
+          fi
+      }
+
+      # Install runc
+      install_runc() {
+          log_step "Installing runc ${RUNC_VERSION}..."
+
+          local url="https://github.com/opencontainers/runc/releases/download/v${RUNC_VERSION}/runc.${ARCH}"
+          local dest="$DOWNLOAD_DIR/runc"
+
+          if [[ "$DRY_RUN" == "true" ]]; then
+              log_info "[DRY-RUN] Would download runc from: $url"
+              log_info "[DRY-RUN] Would install runc to: /usr/local/sbin/runc"
+              return 0
+          fi
+
+          download_file "$url" "$dest" "runc ${RUNC_VERSION}"
+
+          install -m 755 "$dest" /usr/local/sbin/runc
+          log_info "Installed runc to /usr/local/sbin/runc"
+
+          # Verify installation
+          if /usr/local/sbin/runc --version &>/dev/null; then
+              log_info "runc version: $(/usr/local/sbin/runc --version | head -1)"
+          fi
+      }
+
+      # Install containerd
+      install_containerd() {
+          log_step "Installing containerd ${CONTAINERD_VERSION}..."
+
+          local url="https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}/containerd-${CONTAINERD_VERSION}-linux-${ARCH}.tar.gz"
+          local tarball="$DOWNLOAD_DIR/containerd.tar.gz"
+
+          if [[ "$DRY_RUN" == "true" ]]; then
+              log_info "[DRY-RUN] Would download containerd from: $url"
+              log_info "[DRY-RUN] Would extract containerd to: /usr/local"
+              log_info "[DRY-RUN] Would create containerd configuration"
+              log_info "[DRY-RUN] Would install containerd systemd service"
+              return 0
+          fi
+
+          download_file "$url" "$tarball" "containerd ${CONTAINERD_VERSION}"
+
+          # Extract to /usr/local
+          tar -C /usr/local -xzf "$tarball"
+          log_info "Extracted containerd to /usr/local"
+
+          # Create containerd configuration directory
+          mkdir -p /etc/containerd
+
+          # Generate default configuration with systemd cgroup driver
+          /usr/local/bin/containerd config default > /etc/containerd/config.toml
+
+          # Enable systemd cgroup driver for containerd
+          sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+          log_info "Configured containerd with systemd cgroup driver"
+
+          # Install systemd service
+          local service_url="https://raw.githubusercontent.com/containerd/containerd/v${CONTAINERD_VERSION}/containerd.service"
+          download_file "$service_url" "/etc/systemd/system/containerd.service" "containerd systemd service"
+
+          # Reload systemd and enable/start containerd
+          systemctl daemon-reload
+          systemctl enable containerd
+          systemctl start containerd
+
+          # Wait for containerd to be ready
+          sleep 2
+          if systemctl is-active --quiet containerd; then
+              log_info "containerd is running"
+              log_info "containerd version: $(/usr/local/bin/containerd --version)"
+          else
+              log_warn "containerd may not have started correctly. Check: systemctl status containerd"
+          fi
+      }
+
+      # Install crictl
+      install_crictl() {
+          log_step "Installing crictl ${CRICTL_VERSION}..."
+
+          local url="https://github.com/kubernetes-sigs/cri-tools/releases/download/v${CRICTL_VERSION}/crictl-v${CRICTL_VERSION}-linux-${ARCH}.tar.gz"
+          local tarball="$DOWNLOAD_DIR/crictl.tar.gz"
+
+          if [[ "$DRY_RUN" == "true" ]]; then
+              log_info "[DRY-RUN] Would download crictl from: $url"
+              log_info "[DRY-RUN] Would install crictl to: /usr/local/bin/crictl"
+              return 0
+          fi
+
+          download_file "$url" "$tarball" "crictl ${CRICTL_VERSION}"
+
+          # Extract to /usr/local/bin
+          tar -C /usr/local/bin -xzf "$tarball"
+          chmod 755 /usr/local/bin/crictl
+          log_info "Installed crictl to /usr/local/bin/crictl"
+
+          # Create crictl configuration to use containerd
+          cat > /etc/crictl.yaml <<EOF
+      runtime-endpoint: unix:///run/containerd/containerd.sock
+      image-endpoint: unix:///run/containerd/containerd.sock
+      timeout: 10
+      debug: false
+      EOF
+          log_info "Created crictl configuration at /etc/crictl.yaml"
+
+          # Verify installation
+          if /usr/local/bin/crictl --version &>/dev/null; then
+              log_info "crictl version: $(/usr/local/bin/crictl --version)"
+          fi
+      }
+
+      # Install kubelet and kubectl
+      install_kubernetes_binaries() {
+          log_step "Installing Kubernetes binaries ${KUBE_VERSION}..."
+
+          local version_stripped
+          version_stripped=$(strip_version_prefix "$KUBE_VERSION")
+
+          local kubelet_url="https://dl.k8s.io/release/${KUBE_VERSION}/bin/linux/${ARCH}/kubelet"
+          local kubectl_url="https://dl.k8s.io/release/${KUBE_VERSION}/bin/linux/${ARCH}/kubectl"
+
+          if [[ "$DRY_RUN" == "true" ]]; then
+              log_info "[DRY-RUN] Would download kubelet from: $kubelet_url"
+              log_info "[DRY-RUN] Would download kubectl from: $kubectl_url"
+              log_info "[DRY-RUN] Would install kubelet to: /usr/bin/kubelet"
+              log_info "[DRY-RUN] Would install kubectl to: /usr/bin/kubectl"
+              return 0
+          fi
+
+          # Download kubelet
+          download_file "$kubelet_url" "$DOWNLOAD_DIR/kubelet" "kubelet ${KUBE_VERSION}"
+          install -m 755 "$DOWNLOAD_DIR/kubelet" /usr/bin/kubelet
+          log_info "Installed kubelet to /usr/bin/kubelet"
+
+          # Download kubectl
+          download_file "$kubectl_url" "$DOWNLOAD_DIR/kubectl" "kubectl ${KUBE_VERSION}"
+          install -m 755 "$DOWNLOAD_DIR/kubectl" /usr/bin/kubectl
+          log_info "Installed kubectl to /usr/bin/kubectl"
+
+          # Verify installations
+          log_info "kubelet version: $(/usr/bin/kubelet --version)"
+          log_info "kubectl version: $(/usr/bin/kubectl version --client --short 2>/dev/null || /usr/bin/kubectl version --client)"
+      }
+
+      # Install Azure ACR credential provider
+      install_credential_provider() {
+          log_step "Installing Azure ACR credential provider..."
+
+          # Extract major.minor from KUBE_VERSION (e.g., v1.34.2 -> 1.34)
+          local kube_major_minor
+          kube_major_minor=$(echo "$KUBE_VERSION" | sed 's/^v//' | cut -d. -f1,2)
+
+          # Find the latest patch release matching this major.minor from cloud-provider-azure
+          local release_tag
+          release_tag=$(curl -fsSL "https://api.github.com/repos/kubernetes-sigs/cloud-provider-azure/releases" | \
+              jq -r --arg mm "v${kube_major_minor}" \
+              '[.[] | select(.tag_name | startswith($mm)) | select(.prerelease == false)] | sort_by(.published_at) | last | .tag_name // empty')
+
+          if [[ -z "$release_tag" ]]; then
+              log_warn "No cloud-provider-azure release found for v${kube_major_minor}.x, skipping credential provider"
+              return 0
+          fi
+
+          local binary_name="azure-acr-credential-provider-linux-${ARCH}"
+          local url="https://github.com/kubernetes-sigs/cloud-provider-azure/releases/download/${release_tag}/${binary_name}"
+          local dest_dir="/var/lib/kubelet/credential-provider"
+          local dest="${dest_dir}/${binary_name}"
+
+          if [[ "$DRY_RUN" == "true" ]]; then
+              log_info "[DRY-RUN] Would download credential provider from: $url"
+              log_info "[DRY-RUN] Would install to: $dest"
+              return 0
+          fi
+
+          mkdir -p "$dest_dir"
+          download_file "$url" "$DOWNLOAD_DIR/${binary_name}" "ACR credential provider ${release_tag}"
+          install -m 755 "$DOWNLOAD_DIR/${binary_name}" "$dest"
+          log_info "Installed ACR credential provider ${release_tag} to $dest"
+      }
+
+      # Configure kernel modules and sysctl settings
+      configure_system() {
+          log_step "Configuring system settings..."
+
+          if [[ "$DRY_RUN" == "true" ]]; then
+              log_info "[DRY-RUN] Would configure kernel modules: overlay, br_netfilter"
+              log_info "[DRY-RUN] Would configure sysctl settings for Kubernetes"
+              log_info "[DRY-RUN] Would disable systemd-resolved and copy resolv.conf"
+              return 0
+          fi
+
+          # Load required kernel modules
+          cat > /etc/modules-load.d/kubernetes.conf <<EOF
+      overlay
+      br_netfilter
+      EOF
+
+          modprobe overlay
+          modprobe br_netfilter
+          log_info "Loaded kernel modules: overlay, br_netfilter"
+
+          # Configure sysctl settings
+          cat > /etc/sysctl.d/99-kubernetes.conf <<EOF
+      net.bridge.bridge-nf-call-iptables  = 1
+      net.bridge.bridge-nf-call-ip6tables = 1
+      net.ipv4.ip_forward                 = 1
+      net.ipv6.conf.default.forwarding    = 1
+      net.ipv6.conf.all.forwarding        = 1
+      kernel.panic                        = 10
+      kernel.panic_on_oops                = 1
+      vm.overcommit_memory                = 1
+      EOF
+
+          sysctl --system > /dev/null 2>&1
+          log_info "Applied sysctl settings for Kubernetes"
+
+          # Disable swap (if enabled)
+          if [[ -n "$(swapon --show 2>/dev/null)" ]]; then
+              swapoff -a
+              log_info "Disabled swap"
+              # Comment out swap entries in fstab
+              sed -i '/\sswap\s/s/^/#/' /etc/fstab
+              log_info "Commented out swap entries in /etc/fstab"
+          else
+              log_info "Swap is already disabled"
+          fi
+
+          # Disable systemd-resolved
+          # Copy the upstream resolv.conf before disabling the service so that
+          # DNS resolution continues to work without the stub listener.
+          if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+              if [[ -f /run/systemd/resolve/resolv.conf ]]; then
+                  # Remove any existing symlink so cp creates a regular file
+                  rm -f /etc/resolv.conf
+                  cp /run/systemd/resolve/resolv.conf /etc/resolv.conf
+                  log_info "Copied /run/systemd/resolve/resolv.conf to /etc/resolv.conf"
+              else
+                  log_error "/run/systemd/resolve/resolv.conf not found, cannot disable systemd-resolved without breaking DNS"
+                  return 1
+              fi
+              systemctl stop systemd-resolved
+              systemctl disable systemd-resolved
+              log_info "Disabled systemd-resolved"
+          else
+              log_info "systemd-resolved is already inactive"
+          fi
+      }
+
+      # Create directory structure
+      create_directories() {
+          local dirs=(
+              "$KUBELET_DIR"
+              "$KUBELET_DIR/pki"
+              "$KUBELET_DIR/certs"
+              "$KUBELET_DIR/manifests"
+              "/var/lib/kubelet"
+              "/var/lib/kubelet/credential-provider"
+              "/opt/cni/bin"
+              "/etc/cni/net.d"
+          )
+
+          for dir in "${dirs[@]}"; do
+              if [[ "$DRY_RUN" == "true" ]]; then
+                  log_info "[DRY-RUN] Would create directory: $dir"
+              else
+                  mkdir -p "$dir"
+              fi
+          done
+
+          if [[ "$DRY_RUN" == "false" ]]; then
+              log_info "Created Kubernetes directories"
+          fi
+      }
+
+      # Write CA certificate
+      write_ca_cert() {
+          local pki_dest="$KUBELET_DIR/pki/ca.crt"
+          local certs_dest="$KUBELET_DIR/certs/ca.crt"
+
+          if [[ "$DRY_RUN" == "true" ]]; then
+              log_info "[DRY-RUN] Would copy CA certificate to: $pki_dest and $certs_dest"
+          else
+              cp "$CA_CERT_PATH" "$pki_dest"
+              chmod 644 "$pki_dest"
+              cp "$CA_CERT_PATH" "$certs_dest"
+              chmod 644 "$certs_dest"
+              log_info "Wrote CA certificate to: $pki_dest and $certs_dest"
+          fi
+      }
+
+      # Generate bootstrap kubeconfig
+      write_bootstrap_kubeconfig() {
+          local kubeconfig_path="$KUBELET_DIR/bootstrap-kubelet.conf"
+          local ca_data
+          ca_data=$(base64 -w0 < "$CA_CERT_PATH")
+
+          local kubeconfig_content
+          kubeconfig_content=$(cat <<EOF
+      apiVersion: v1
+      kind: Config
+      clusters:
+      - cluster:
+          certificate-authority-data: ${ca_data}
+          server: https://${API_SERVER}
+        name: kubernetes
+      contexts:
+      - context:
+          cluster: kubernetes
+          user: kubelet-bootstrap
+        name: kubelet-bootstrap@kubernetes
+      current-context: kubelet-bootstrap@kubernetes
+      preferences: {}
+      users:
+      - name: kubelet-bootstrap
+        user:
+          token: ${BOOTSTRAP_TOKEN}
+      EOF
+      )
+
+          if [[ "$DRY_RUN" == "true" ]]; then
+              log_info "[DRY-RUN] Would write bootstrap kubeconfig to: $kubeconfig_path"
+              echo "--- Bootstrap kubeconfig content ---"
+              # Redact the token for security
+              echo "$kubeconfig_content" | sed "s/${BOOTSTRAP_TOKEN}/[REDACTED]/g"
+              echo "--- End bootstrap kubeconfig ---"
+          else
+              echo "$kubeconfig_content" > "$kubeconfig_path"
+              chmod 600 "$kubeconfig_path"
+              log_info "Wrote bootstrap kubeconfig to: $kubeconfig_path"
+          fi
+      }
+
+      # Write kubelet configuration
+      write_kubelet_config() {
+          local config_path="/var/lib/kubelet/config.yaml"
+
+          local kubelet_config
+          kubelet_config=$(cat <<EOF
+      apiVersion: kubelet.config.k8s.io/v1beta1
+      kind: KubeletConfiguration
+      address: "0.0.0.0"
+      authentication:
+        anonymous:
+          enabled: false
+        webhook:
+          cacheTTL: 0s
+          enabled: true
+        x509:
+          clientCAFile: ${KUBELET_DIR}/certs/ca.crt
+      authorization:
+        mode: Webhook
+        webhook:
+          cacheAuthorizedTTL: 0s
+          cacheUnauthorizedTTL: 0s
+      cgroupDriver: systemd
+      cgroupsPerQOS: true
+      clusterDNS:
+      - ${CLUSTER_DNS}
+      clusterDomain: cluster.local
+      containerLogMaxSize: "50M"
+      containerRuntimeEndpoint: unix:///run/containerd/containerd.sock
+      enforceNodeAllocatable:
+      - pods
+      eventRecordQPS: 0
+      evictionHard:
+        memory.available: "100Mi"
+        nodefs.available: "10%"
+        nodefs.inodesFree: "5%"
+        pid.available: "2000"
+      featureGates:
+        RotateKubeletServerCertificate: true
+      imageGCHighThresholdPercent: 85
+      imageGCLowThresholdPercent: 80
+      kubeReserved:
+        cpu: "100m"
+        memory: "2048Mi"
+        pid: "1000"
+      maxPods: 250
+      nodeStatusUpdateFrequency: 10s
+      protectKernelDefaults: true
+      readOnlyPort: 0
+      rotateCertificates: true
+      runtimeRequestTimeout: 0s
+      serializeImagePulls: false
+      serverTLSBootstrap: true
+      staticPodPath: ${KUBELET_DIR}/manifests
+      streamingConnectionIdleTimeout: 4h0m0s
+      tlsCipherSuites:
+      - TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+      - TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+      - TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305
+      - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+      - TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305
+      - TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+      - TLS_RSA_WITH_AES_256_GCM_SHA384
+      - TLS_RSA_WITH_AES_128_GCM_SHA256
+      EOF
+      )
+
+          if [[ "$DRY_RUN" == "true" ]]; then
+              log_info "[DRY-RUN] Would write kubelet config to: $config_path"
+              echo "--- Kubelet config content ---"
+              echo "$kubelet_config"
+              echo "--- End kubelet config ---"
+          else
+              echo "$kubelet_config" > "$config_path"
+              chmod 644 "$config_path"
+              log_info "Wrote kubelet config to: $config_path"
+          fi
+      }
+
+      # Write kubelet environment/flags file
+      write_kubelet_flags() {
+          local flags_path="/etc/default/kubelet"
+
+          # Node labels for Azure integration
+          # Note: kubernetes.azure.com/cluster and kubernetes.azure.com/resource-group are
+          # intentionally omitted because bootstrap scripts are only used for secondary-site
+          # nodes that don't belong to the primary cluster's Azure resource group.
+          local node_labels="kubernetes.azure.com/managed=false,node.kubernetes.io/exclude-from-external-load-balancers=true,net.unbounded-kube.io/provider=azure,net.unbounded-kube.io/customdata-generated=__CUSTOMDATA_GENERATED__,net.unbounded-kube.io/agentpool=__SCALE_SET_NAME____EXTRA_NODE_LABELS__"
+
+          # Build --node-ip flag with detected addresses
+          # This prevents kubelet from autodetecting IPs which can be unstable
+          local node_ip_flag=""
+          if [[ -n "$NODE_IP_V4" ]] && [[ -n "$NODE_IP_V6" ]]; then
+              # Dual-stack: comma-separated IPv4,IPv6
+              node_ip_flag="--node-ip=${NODE_IP_V4},${NODE_IP_V6}"
+          elif [[ -n "$NODE_IP_V4" ]]; then
+              # IPv4 only
+              node_ip_flag="--node-ip=${NODE_IP_V4}"
+          elif [[ -n "$NODE_IP_V6" ]]; then
+              # IPv6 only
+              node_ip_flag="--node-ip=${NODE_IP_V6}"
+          fi
+
+          local kubelet_flags
+          kubelet_flags=$(cat <<EOF
+      KUBELET_KUBEADM_ARGS="--bootstrap-kubeconfig=${KUBELET_DIR}/bootstrap-kubelet.conf --kubeconfig=/var/lib/kubelet/kubeconfig --cloud-provider=external --pod-infra-container-image=mcr.microsoft.com/oss/v2/kubernetes/pause:3.6 --hostname-override=${NODE_NAME} --node-labels=${node_labels} --image-credential-provider-bin-dir=/var/lib/kubelet/credential-provider --image-credential-provider-config=/var/lib/kubelet/credential-provider-config.yaml ${node_ip_flag}"
+      EOF
+      )
+
+          if [[ "$DRY_RUN" == "true" ]]; then
+              log_info "[DRY-RUN] Would write kubelet flags to: $flags_path"
+              echo "--- Kubelet flags content ---"
+              echo "$kubelet_flags"
+              echo "--- End kubelet flags ---"
+          else
+              echo "$kubelet_flags" > "$flags_path"
+              chmod 644 "$flags_path"
+              log_info "Wrote kubelet flags to: $flags_path"
+          fi
+      }
+
+      # Write credential provider configuration
+      write_credential_provider_config() {
+          local config_path="/var/lib/kubelet/credential-provider-config.yaml"
+
+          local config_content
+          config_content=$(cat <<EOF
+      apiVersion: kubelet.config.k8s.io/v1
+      kind: CredentialProviderConfig
+      providers:
+        - name: azure-acr-credential-provider-linux-${ARCH}
+          matchImages:
+            - "*.azurecr.io"
+            - "*.azurecr.cn"
+            - "*.azurecr.de"
+            - "*.azurecr.us"
+          defaultCacheDuration: "10m"
+          apiVersion: credentialprovider.kubelet.k8s.io/v1
+          args:
+            - /etc/kubernetes/azure.json
+      EOF
+      )
+
+          if [[ "$DRY_RUN" == "true" ]]; then
+              log_info "[DRY-RUN] Would write credential provider config to: $config_path"
+          else
+              echo "$config_content" > "$config_path"
+              chmod 644 "$config_path"
+              log_info "Wrote credential provider config to: $config_path"
+          fi
+      }
+
+      # Write systemd service file
+      write_systemd_service() {
+          local service_path="/etc/systemd/system/kubelet.service"
+
+          local service_content
+          service_content=$(cat <<'EOF'
+      [Unit]
+      Description=kubelet: The Kubernetes Node Agent
+      Documentation=https://kubernetes.io/docs/
+      Wants=network-online.target containerd.service
+      After=network-online.target containerd.service
+
+      [Service]
+      ExecStart=/usr/bin/kubelet
+      Restart=always
+      StartLimitInterval=0
+      RestartSec=10
+
+      [Install]
+      WantedBy=multi-user.target
+      EOF
+      )
+
+          if [[ "$DRY_RUN" == "true" ]]; then
+              log_info "[DRY-RUN] Would write kubelet service to: $service_path"
+          else
+              echo "$service_content" > "$service_path"
+              chmod 644 "$service_path"
+              log_info "Wrote kubelet service to: $service_path"
+          fi
+
+          # Write service drop-in for configuration
+          local dropin_dir="/etc/systemd/system/kubelet.service.d"
+          local dropin_path="$dropin_dir/10-kubeadm.conf"
+
+          local dropin_content
+          dropin_content=$(cat <<EOF
+      [Service]
+      Environment="KUBELET_CONFIG_ARGS=--config=/var/lib/kubelet/config.yaml"
+      EnvironmentFile=-/etc/default/kubelet
+      ExecStart=
+      ExecStart=/usr/bin/kubelet \$KUBELET_CONFIG_ARGS \$KUBELET_KUBEADM_ARGS
+      EOF
+      )
+
+          if [[ "$DRY_RUN" == "true" ]]; then
+              log_info "[DRY-RUN] Would create drop-in directory: $dropin_dir"
+              log_info "[DRY-RUN] Would write kubelet drop-in to: $dropin_path"
+              echo "--- Kubelet drop-in content ---"
+              echo "$dropin_content"
+              echo "--- End kubelet drop-in ---"
+          else
+              mkdir -p "$dropin_dir"
+              echo "$dropin_content" > "$dropin_path"
+              chmod 644 "$dropin_path"
+              log_info "Wrote kubelet drop-in to: $dropin_path"
+          fi
+      }
+
+      # Fill in azure.json tokens with actual values
+      configure_azure_json() {
+          local azure_json="/etc/kubernetes/azure.json"
+
+          if [[ ! -f "$azure_json" ]]; then
+              log_warn "$azure_json not found, skipping azure.json configuration"
+              return
+          fi
+
+          if [[ "$DRY_RUN" == "true" ]]; then
+              log_info "[DRY-RUN] Would fill in tokens in $azure_json"
+              return
+          fi
+
+          log_step "Configuring $azure_json..."
+
+          sed -i \
+              -e "s|__TENANT_ID__|${TENANT_ID}|g" \
+              -e "s|__SUBSCRIPTION_ID__|${SUBSCRIPTION_ID}|g" \
+              -e "s|__CLUSTER_RG__|${CLUSTER_RG}|g" \
+              -e "s|__SECURITY_GROUP_NAME__|${SECURITY_GROUP_NAME}|g" \
+              -e "s|__VNET_NAME__|${VNET_NAME}|g" \
+              -e "s|__VNET_RG__|${VNET_RG}|g" \
+              -e "s|__ROUTE_TABLE_NAME__|${ROUTE_TABLE_NAME}|g" \
+              -e "s|__SCALE_SET_NAME__|${SCALE_SET_NAME}|g" \
+              "$azure_json"
+
+          log_info "Configured $azure_json with cluster-specific values"
+      }
+
+      # Enable and start kubelet
+      start_kubelet() {
+          if [[ "$DRY_RUN" == "true" ]]; then
+              log_info "[DRY-RUN] Would reload systemd daemon"
+              log_info "[DRY-RUN] Would enable kubelet service"
+              log_info "[DRY-RUN] Would start kubelet service"
+          else
+              log_info "Reloading systemd daemon..."
+              systemctl daemon-reload
+
+              log_info "Enabling kubelet service..."
+              systemctl enable kubelet
+
+              log_info "Starting kubelet service..."
+              systemctl start kubelet
+
+              # Wait briefly and check status
+              sleep 2
+              if systemctl is-active --quiet kubelet; then
+                  log_info "Kubelet is running"
+              else
+                  log_warn "Kubelet may not have started correctly. Check: systemctl status kubelet"
+              fi
+          fi
+      }
+
+      # Print summary
+      print_summary() {
+          echo ""
+          log_info "=========================================="
+          log_info "Node Bootstrap Complete"
+          log_info "=========================================="
+          echo ""
+          echo "Installed components:"
+          echo "  - runc ${RUNC_VERSION}"
+          echo "  - containerd ${CONTAINERD_VERSION}"
+          echo "  - crictl ${CRICTL_VERSION}"
+          echo "  - kubelet ${KUBE_VERSION}"
+          echo "  - kubectl ${KUBE_VERSION}"
+          echo "  - azure-acr-credential-provider"
+          echo ""
+          echo "Configuration files created:"
+          echo "  - ${KUBELET_DIR}/pki/ca.crt"
+          echo "  - ${KUBELET_DIR}/bootstrap-kubelet.conf"
+          echo "  - /var/lib/kubelet/config.yaml"
+          echo "  - /etc/default/kubelet"
+          echo "  - /etc/systemd/system/kubelet.service"
+          echo "  - /etc/systemd/system/kubelet.service.d/10-kubeadm.conf"
+          echo "  - /etc/containerd/config.toml"
+          echo "  - /etc/crictl.yaml"
+          echo "  - /var/lib/kubelet/credential-provider-config.yaml"
+          echo ""
+          echo "Node name: $NODE_NAME"
+          echo "Node IPs: ${NODE_IP_V4:-none}${NODE_IP_V6:+, $NODE_IP_V6}"
+          echo "API server: $API_SERVER"
+          echo "Cluster DNS: $CLUSTER_DNS"
+          echo "Cluster RG: $CLUSTER_RG"
+          echo ""
+          if [[ "$DRY_RUN" == "false" ]]; then
+              echo "Next steps:"
+              echo "  1. The kubelet is now running and will attempt to bootstrap"
+              echo "  2. On the control plane, approve the CSR:"
+              echo "     kubectl get csr"
+              echo "     kubectl certificate approve <csr-name>"
+              echo "  3. Verify the node joined:"
+              echo "     kubectl get nodes"
+              echo ""
+              echo "Note: CNI plugins are NOT installed. Deploy your CNI solution"
+              echo "      (e.g., unbounded-net) to enable pod networking."
+          else
+              echo "[DRY-RUN] No changes were made"
+          fi
+          echo ""
+      }
+
+      # Main function
+      main() {
+          echo ""
+          log_info "Kubernetes Node Bootstrap Script"
+          log_info "================================="
+          echo ""
+
+          parse_args "$@"
+          validate_args
+          check_prerequisites
+          detect_node_ips
+
+          if [[ "$SKIP_INSTALL" == "false" ]]; then
+              setup_download_dir
+              configure_system
+              install_runc
+              install_containerd
+              install_crictl
+              install_kubernetes_binaries
+              install_credential_provider
+          else
+              log_info "Skipping component installation (--skip-install)"
+          fi
+
+          log_step "Configuring kubelet..."
+          create_directories
+          write_ca_cert
+          configure_azure_json
+          write_bootstrap_kubeconfig
+          write_kubelet_config
+          write_kubelet_flags
+          write_credential_provider_config
+          write_systemd_service
+          start_kubelet
+          print_summary
+      }
+
+      main "$@"
+
+# Run the bootstrap script on first boot
+runcmd:
+  - |
+    echo "Starting node bootstrap at $(date)"
+
+    # Run the bootstrap script with the configured parameters
+    /opt/bootstrap-node.sh \
+      -k "__KUBERNETES_VERSION__" \
+      --api-server "__API_SERVER__" \
+      --token "__BOOTSTRAP_TOKEN__" \
+      --ca-cert "/tmp/ca.crt" \
+      --cluster-dns "__CLUSTER_DNS__" \
+      --cluster-rg "__CLUSTER_RG__" \
+      --vnet-rg "__VNET_RG__" \
+      --tenant-id "__TENANT_ID__" \
+      --subscription-id "__SUBSCRIPTION_ID__" \
+      --security-group-name "__SECURITY_GROUP_NAME__" \
+      --vnet-name "__VNET_NAME__" \
+      --route-table-name "__ROUTE_TABLE_NAME__" \
+      --scale-set-name "__SCALE_SET_NAME__"
+
+    echo "Node bootstrap completed at $(date)"
+
+# Final message
+final_message: |
+  Kubernetes node bootstrap complete!
+  Check /var/log/bootstrap-node.log for details.
+  The node should now be joining the cluster.

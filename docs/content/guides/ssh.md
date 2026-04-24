@@ -46,7 +46,7 @@ All five flags above are required. Optional flags:
 
 | Flag | Description |
 |---|---|
-| `--cni-manifests` | Path or HTTPS URL to CNI plugin manifests (defaults to the bundled release) |
+| `--cni-manifests` | Path or HTTPS URL to CNI plugin manifests (uses embedded manifests if omitted) |
 | `--machina-manifests` | Path or HTTPS URL to machina manifests (uses embedded manifests if omitted) |
 | `--kubeconfig` | Path to kubeconfig file |
 

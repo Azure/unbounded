@@ -8,7 +8,7 @@ import (
 	"log/slog"
 	"path/filepath"
 
-	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases"
+	"github.com/Azure/unbounded/cmd/agent/internal/phases"
 )
 
 type removeAgentArtifacts struct {
@@ -37,7 +37,7 @@ func (t *removeAgentArtifacts) Do(_ context.Context) error {
 
 	// Remove directories.
 	for _, dir := range []string{
-		"/etc/unbounded-agent",
+		"/etc/unbounded/agent",
 		"/tmp/unbounded-agent",
 	} {
 		removeAllIfExists(t.log, dir)

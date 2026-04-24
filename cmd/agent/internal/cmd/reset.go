@@ -9,10 +9,10 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/Azure/unbounded-kube/cmd/agent/internal/goalstates"
-	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases"
-	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases/reset"
-	"github.com/Azure/unbounded-kube/internal/version"
+	"github.com/Azure/unbounded/cmd/agent/internal/goalstates"
+	"github.com/Azure/unbounded/cmd/agent/internal/phases"
+	"github.com/Azure/unbounded/cmd/agent/internal/phases/reset"
+	"github.com/Azure/unbounded/internal/version"
 )
 
 func newCmdReset(cmdCtx *CommandContext) *cobra.Command {
@@ -38,13 +38,16 @@ Both possible nspawn machine names (kube1 and kube2) are stopped and removed.`,
 			log := cmdCtx.Logger
 
 			return phases.Serial(log,
-				// Step 1: Stop both nspawn machines.
+				// Step 1: Stop the agent daemon before tearing down machines.
+				reset.StopDaemon(log),
+
+				// Step 2: Stop both nspawn machines.
 				phases.Parallel(log,
 					reset.StopMachine(log, goalstates.NSpawnMachineKube1),
 					reset.StopMachine(log, goalstates.NSpawnMachineKube2),
 				),
 
-				// Step 2-3: Remove network interfaces and WireGuard keys.
+				// Step 3: Remove network interfaces and WireGuard keys.
 				phases.Parallel(log,
 					reset.RemoveNetworkInterfaces(log),
 					reset.RemoveWireGuardKeys(log),

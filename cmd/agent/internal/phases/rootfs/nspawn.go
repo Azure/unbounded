@@ -11,11 +11,11 @@ import (
 	"log/slog"
 	"text/template"
 
-	"github.com/Azure/unbounded-kube/cmd/agent/internal/goalstates"
-	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases"
-	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases/rootfs/debootstrap"
-	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases/rootfs/oci"
-	"github.com/Azure/unbounded-kube/cmd/agent/internal/utilio"
+	"github.com/Azure/unbounded/cmd/agent/internal/goalstates"
+	"github.com/Azure/unbounded/cmd/agent/internal/phases"
+	"github.com/Azure/unbounded/cmd/agent/internal/phases/rootfs/debootstrap"
+	"github.com/Azure/unbounded/cmd/agent/internal/phases/rootfs/oci"
+	"github.com/Azure/unbounded/cmd/agent/internal/utilio"
 )
 
 //go:embed assets/nspawn.conf assets/service-override.conf
@@ -71,12 +71,6 @@ type nspawnTemplateData struct {
 	HostDevicePaths      []string
 	NvidiaGPUDevicePaths []string
 	NvidiaLibDirMounts   []goalstates.NvidiaLibDirMount
-}
-
-// HasFilesSection reports whether the rendered nspawn config requires a
-// [Files] section. Templates call this to avoid emitting an empty section.
-func (d nspawnTemplateData) HasFilesSection() bool {
-	return len(d.HostDevicePaths) > 0 || len(d.NvidiaGPUDevicePaths) > 0
 }
 
 // writeNSpawnConfigs renders the nspawn and service-override templates with

@@ -5,7 +5,12 @@
 # Local runner for the agent e2e Kind test.
 #
 # Handles all setup (Kind cluster, networking, VM, bridge attachment) and
-# runs both Machine CR test cases end-to-end. Cleans up on exit.
+# runs the full linear test sequence end-to-end. Cleans up on exit.
+#
+# Test flow:
+#   1. Start node without Machine CR (agent self-registers)
+#   2. Wait for node to become Ready and validate Machine CR + workload
+#   3. Reset, rejoin, validate again
 #
 # Prerequisites (Fedora):
 #   sudo dnf install -y qemu-system-x86 qemu-img genisoimage iptables docker-ce docker-ce-cli containerd.io
@@ -214,40 +219,36 @@ fi
 python3 "$E2E" $E2E_VERBOSE install-machine-crd
 
 # ---------------------------------------------------------------------------
-# Case 1: Machine CR already exists when agent runs
+# Initial join: agent self-registers Machine CR
 # ---------------------------------------------------------------------------
 echo ""
 echo "============================================"
-echo "  Case 1: Machine CR already exists"
+echo "  Phase 1: Initial join (no pre-existing CR)"
 echo "============================================"
 echo ""
 
-python3 "$E2E" $E2E_VERBOSE create-machine-cr
 python3 "$E2E" $E2E_VERBOSE run-agent
 python3 "$E2E" $E2E_VERBOSE wait-for-node
-python3 "$E2E" $E2E_VERBOSE validate-machine-cr-preexisting
+python3 "$E2E" $E2E_VERBOSE validate-kube-proxy
+python3 "$E2E" $E2E_VERBOSE validate-machine-cr-created
 python3 "$E2E" $E2E_VERBOSE validate-workload
+
+# ---------------------------------------------------------------------------
+# Reset and rejoin
+# ---------------------------------------------------------------------------
+echo ""
+echo "============================================"
+echo "  Phase 2: Reset and rejoin"
+echo "============================================"
+echo ""
 
 python3 "$E2E" $E2E_VERBOSE reset-agent
 python3 "$E2E" $E2E_VERBOSE delete-machine-cr
 
-# ---------------------------------------------------------------------------
-# Case 2: Machine CR does not exist when agent runs
-# ---------------------------------------------------------------------------
-echo ""
-echo "============================================"
-echo "  Case 2: Machine CR does not exist"
-echo "============================================"
-echo ""
-
-# Recreate the VM so Case 2 starts with a pristine OS (the first agent
-# run leaves nftables/kube-proxy state that can interfere).
-python3 "$E2E" $E2E_VERBOSE recreate-vm
-
 python3 "$E2E" $E2E_VERBOSE ensure-kind-bridge
-
 python3 "$E2E" $E2E_VERBOSE run-agent
 python3 "$E2E" $E2E_VERBOSE wait-for-node
+python3 "$E2E" $E2E_VERBOSE validate-kube-proxy
 python3 "$E2E" $E2E_VERBOSE validate-machine-cr-created
 python3 "$E2E" $E2E_VERBOSE validate-workload
 

@@ -1,0 +1,30 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: unbounded-net-mutating-webhook
+  labels:
+    app.kubernetes.io/name: unbounded-net-controller
+    app.kubernetes.io/component: controller
+webhooks:
+  - name: nodes.unbounded-kube.io
+    admissionReviewVersions: ["v1"]
+    failurePolicy: Ignore
+    sideEffects: None
+    matchPolicy: Equivalent
+    timeoutSeconds: 5
+    reinvocationPolicy: Never
+    clientConfig:
+      service:
+        name: unbounded-net-controller
+        namespace: {{ .Namespace }}
+        path: /mutate-nodes
+        port: 9999
+    rules:
+      - operations: ["CREATE"]
+        apiGroups: [""]
+        apiVersions: ["v1"]
+        resources: ["nodes"]

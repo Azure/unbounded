@@ -11,8 +11,8 @@ import (
 	"github.com/spf13/cobra"
 	ctrl "sigs.k8s.io/controller-runtime"
 
-	"github.com/Azure/unbounded-kube/internal/metalman/commands"
-	"github.com/Azure/unbounded-kube/internal/version"
+	"github.com/Azure/unbounded/internal/metalman/commands"
+	"github.com/Azure/unbounded/internal/version"
 )
 
 func main() {

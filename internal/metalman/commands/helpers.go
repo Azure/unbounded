@@ -21,7 +21,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	v1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
+	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
 
 const siteLabel = "unbounded-kube.io/site"

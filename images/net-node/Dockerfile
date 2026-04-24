@@ -1,0 +1,171 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# Combined Dockerfile for unbounded-net-controller and unbounded-net-node
+# Builds natively on each architecture (cross-compilation not supported for CGO on Azure Linux)
+
+# =============================================================================
+# Build stage - builds natively on each target architecture
+# Uses Microsoft Go image for FIPS-compliant crypto and timely patch releases.
+# GO_VERSION is parsed from go.mod (major.minor) in CI.
+# =============================================================================
+ARG GO_VERSION=1.26
+FROM mcr.microsoft.com/oss/go/microsoft/golang:${GO_VERSION}-azurelinux3.0 AS builder
+
+# Install build dependencies (Go is provided by the base image)
+RUN tdnf upgrade -y \
+    && tdnf install -y \
+    ca-certificates git make curl tar which \
+    binutils gcc glibc-devel kernel-headers \
+    pkgconfig libcap-devel openssl-devel \
+    clang lld libbpf-devel \
+    && tdnf clean all
+
+WORKDIR /src
+
+# Platform args (provided by buildx, stable values)
+ARG TARGETOS
+ARG TARGETARCH
+
+# Software version args
+ARG CNI_PLUGINS_VERSION=v1.9.1
+
+# Pre-downloaded build assets from repository resources/
+COPY resources/ /resources/
+
+# Download CNI plugins for target architecture (cached unless version changes)
+RUN mkdir -p /cni-plugins && \
+    file="/resources/cni-plugins-${TARGETOS}-${TARGETARCH}-${CNI_PLUGINS_VERSION}.tgz"; \
+    if [ ! -s "$file" ]; then \
+        echo "Missing CNI plugins archive: $file"; \
+        exit 1; \
+    fi; \
+    tar -xz -C /cni-plugins -f "$file"
+
+# Copy go mod files first for better caching
+COPY go.mod go.sum ./
+
+# Download dependencies (cached in /go/pkg/mod, shared across architectures)
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
+
+# Build ntttcp for network performance testing
+RUN git clone --depth 1 https://github.com/microsoft/ntttcp-for-linux.git /tmp/ntttcp-for-linux \
+    && cd /tmp/ntttcp-for-linux/src \
+    && make \
+    && cp ntttcp /usr/local/bin/ntttcp \
+    && rm -rf /tmp/ntttcp-for-linux
+
+# Copy source code (this layer changes frequently)
+COPY . .
+
+# Copy frontend dist files from the build output in the context
+COPY internal/net/html/dist/ /src/internal/net/html/dist/
+
+# Compile eBPF programs (target bpf is architecture-independent)
+RUN clang -O2 -g -target bpf \
+    -D__TARGET_ARCH_${TARGETARCH} \
+    -I/usr/include \
+    -c bpf/unbounded_encap.c \
+    -o internal/net/ebpf/unbounded_encap_bpfel.o
+
+# Build both binaries with CGO enabled (required for Microsoft Go FIPS crypto)
+# Cache mounts persist Go module cache and build cache across builds
+# Build cache is per-architecture to avoid conflicts
+ARG VERSION=dev
+ARG GIT_COMMIT=unknown
+ARG BUILD_TIME=unknown
+ENV STAMP_LDFLAGS="-s -w \
+    -X github.com/Azure/unbounded/internal/version.Version=${VERSION} \
+    -X github.com/Azure/unbounded/internal/version.GitCommit=${GIT_COMMIT} \
+    -X github.com/Azure/unbounded/internal/version.BuildTime=${BUILD_TIME}"
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/ms-go-build,id=go-build-${TARGETARCH} \
+    CGO_ENABLED=1 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
+    -ldflags="${STAMP_LDFLAGS}" \
+    -o /unbounded-net-controller \
+    ./cmd/unbounded-net-controller && \
+    CGO_ENABLED=1 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
+    -ldflags="${STAMP_LDFLAGS}" \
+    -o /unbounded-net-node \
+    ./cmd/unbounded-net-node && \
+    CGO_ENABLED=1 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
+    -ldflags="${STAMP_LDFLAGS}" \
+    -o /unping \
+    ./cmd/unping && \
+    CGO_ENABLED=1 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
+    -ldflags="${STAMP_LDFLAGS}" \
+    -o /unroute \
+    ./cmd/unroute
+
+# =============================================================================
+# Shared runtime base image - contains all packages needed by both images
+# This is the only stage that runs under QEMU for arm64
+# =============================================================================
+FROM mcr.microsoft.com/azurelinux/base/core:3.0 AS runtime-base
+
+# Install all packages needed by both controller and node in a single tdnf call
+# - ca-certificates: TLS support (both)
+# - shadow-utils: user management (both)
+# - wireguard-tools: WireGuard support (node)
+# - iproute: ip command (node)
+# - iptables: iptables/ip6tables for masquerade rules (node)
+# - util-linux: nsenter for host namespace sysctl setup (node init)
+# - hostname: provides the hostname binary in Azure Linux runtime images
+RUN tdnf install -y \
+    ca-certificates shadow-utils iproute iptables util-linux hostname which wget tcpdump iputils \
+    libatomic libcap openssl vim bpftool \
+    procps-ng less sqlite-libs tar gzip jq python3 bind-utils \
+    && tdnf install -y --setopt=tsflags=noscripts wireguard-tools \
+    && tdnf clean all
+
+# Ensure /sbin and /usr/sbin are in PATH for ip command
+ENV PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ENV PS1='[\u@\h \W]\$ '
+
+# =============================================================================
+# Controller runtime image
+# =============================================================================
+FROM runtime-base AS controller
+
+LABEL org.opencontainers.image.source="https://github.com/project-unbounded/unbounded-net"
+LABEL org.opencontainers.image.description="unbounded-net controller"
+LABEL org.opencontainers.image.licenses="MIT"
+
+# Create non-root user and set entrypoint (cached, runs under QEMU once)
+RUN groupadd -r controller && useradd -r -g controller controller
+
+USER controller
+ENTRYPOINT ["/usr/local/bin/unbounded-net-controller"]
+
+# Copy binary from builder last (changes frequently, but COPY is fast)
+COPY --from=builder /unbounded-net-controller /usr/local/bin/unbounded-net-controller
+COPY --from=builder /unping /usr/local/bin/unping
+COPY --from=builder /unroute /usr/local/bin/unroute
+
+# =============================================================================
+# Node runtime image
+# =============================================================================
+FROM runtime-base AS node
+
+LABEL org.opencontainers.image.source="https://github.com/project-unbounded/unbounded-net"
+LABEL org.opencontainers.image.description="unbounded-net node agent"
+LABEL org.opencontainers.image.licenses="MIT"
+
+# Set entrypoint
+ENTRYPOINT ["/usr/local/bin/unbounded-net-node"]
+
+# Copy init script for installing CNI plugins
+COPY images/net-node/node-agent-init.sh /usr/local/bin/node-agent-init.sh
+RUN chmod 0755 /usr/local/bin/node-agent-init.sh
+
+# Copy CNI plugins first (rarely changes, cached)
+COPY --from=builder /cni-plugins/ /opt/cni/bin/
+
+# Copy ntttcp for network performance testing
+COPY --from=builder /usr/local/bin/ntttcp /usr/local/bin/ntttcp
+
+# Copy binary from builder last (changes frequently)
+COPY --from=builder /unbounded-net-node /usr/local/bin/unbounded-net-node
+COPY --from=builder /unping /usr/local/bin/unping
+COPY --from=builder /unroute /usr/local/bin/unroute

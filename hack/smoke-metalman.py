@@ -45,7 +45,6 @@ SERVE_URL = f"http://{SERVER_IP}:{HTTP_PORT}"
 REGISTRY_PORT = 5555
 REGISTRY_CONTAINER = "unbounded-smoke-registry"
 IMAGE_NAME = f"localhost:{REGISTRY_PORT}/unbounded/host-ubuntu2404:smoke"
-AGENT_IMAGE_DIR = REPO_ROOT / "images" / "agent-ubuntu2404"
 AGENT_IMAGE_NAME = f"localhost:{REGISTRY_PORT}/unbounded/agent-ubuntu2404:smoke"
 # The agent runs inside a VM on an isolated libvirt network. "localhost" inside
 # the VM resolves to the VM's own loopback, not the host.  Use the host's
@@ -62,8 +61,6 @@ NSPAWN_MACHINE = "kube1"
 KUBECTL = "kubectl"
 VIRSH = ["virsh", "--connect", "qemu:///system"]
 DEVNULL = subprocess.DEVNULL
-
-IMAGE_DIR = REPO_ROOT / "images" / "host-ubuntu2404"
 
 _procs: list[subprocess.Popen[Any]] = []
 
@@ -466,7 +463,7 @@ def _restart_crashing_pods(node_name: str, namespace: str, label: str) -> None:
                 continue
             waiting = cs.get("state", {}).get("waiting", {})
             restart_count = cs.get("restartCount", 0)
-            if restart_count >= 3 or waiting.get("reason") == "CrashLoopBackOff":
+            if restart_count >= 2 or waiting.get("reason") == "CrashLoopBackOff":
                 pod_name = pod["metadata"]["name"]
                 log(f"    Deleting crashing pod {pod_name} "
                     f"(restarts={restart_count}) to reset backoff")
@@ -477,10 +474,18 @@ def _restart_crashing_pods(node_name: str, namespace: str, label: str) -> None:
                 )
 
 
-def assert_node_ready(name: str, timeout: int = 300) -> None:
-    """Assert the Node reaches Ready status within timeout seconds."""
+def assert_node_ready(name: str, timeout: int = 480) -> None:
+    """Assert the Node reaches Ready status within timeout seconds.
+
+    The timeout must be generous enough to survive multiple kindnet
+    CrashLoopBackOff cycles.  In CI each kindnet pod runs for ~2 min
+    before crashing; with a restart threshold of 2 and a 30s check
+    interval, each cycle (crash -> detect -> delete -> new pod start)
+    takes ~90-120s.  480s accommodates 3 full cycles plus ~60s for the
+    final pod to write the CNI config and the kubelet to detect it.
+    """
     log(f"  Waiting for Node '{name}' to become Ready...")
-    pod_restart_interval = 60  # seconds between CrashLoopBackOff resets
+    pod_restart_interval = 30  # seconds between CrashLoopBackOff resets
     last_restart_attempt = 0
     for elapsed in range(timeout):
         check_procs()
@@ -672,10 +677,27 @@ def main() -> None:
     time.sleep(2)
     check_procs()
 
-    log("Building metalman and kubectl-unbounded")
-    run(["go", "build", "-o", str(BINARY), "./cmd/metalman"], cwd=str(REPO_ROOT))
-    run(["go", "build", "-o", str(KUBECTL_UNBOUNDED), "./cmd/kubectl-unbounded"], cwd=str(REPO_ROOT))
+    # Start Go builds in the background so they overlap with Kubernetes
+    # setup and Docker image builds.  Both targets share the Go build
+    # cache, so concurrent compilation is safe and efficient.
+    # stdout/stderr are inherited so build output streams to the CI log
+    # in real-time.
+    log("Rendering machina and net manifests")
+    run(["make", "machina-manifests", "net-manifests"], cwd=str(REPO_ROOT))
 
+    log("Building metalman and kubectl-unbounded (parallel)")
+    go_builds: list[tuple[str, subprocess.Popen[Any]]] = [
+        ("metalman", subprocess.Popen(
+            ["go", "build", "-o", str(BINARY), "./cmd/metalman"],
+            cwd=str(REPO_ROOT),
+        )),
+        ("kubectl-unbounded", subprocess.Popen(
+            ["go", "build", "-o", str(KUBECTL_UNBOUNDED), "./cmd/kubectl-unbounded"],
+            cwd=str(REPO_ROOT),
+        )),
+    ]
+
+    # Kubernetes setup runs while Go builds are in progress.
     log("Cleaning up stale Kubernetes resources")
     run_quiet([KUBECTL, "-n", NODE_NS, "delete", "secret", "bmc-pass"])
     run_quiet([KUBECTL, "delete", f"machines.{API_GROUP}", NODE_NAME])
@@ -685,9 +707,9 @@ def main() -> None:
     run_quiet([KUBECTL, "delete", "crd", f"machines.{API_GROUP}"])
 
     log("Applying deploy manifests (CRDs, namespace, RBAC)")
-    kubectl(["apply", "--server-side", "--force-conflicts", "-f", str(REPO_ROOT / "deploy" / "machina" / "01-namespace.yaml")])
+    kubectl(["apply", "--server-side", "--force-conflicts", "-f", str(REPO_ROOT / "deploy" / "machina" / "rendered" / "01-namespace.yaml")])
     kubectl(["apply", "--server-side", "--force-conflicts", "-f", str(REPO_ROOT / "deploy" / "machina" / "crd")])
-    kubectl(["apply", "--server-side", "--force-conflicts", "-f", str(REPO_ROOT / "deploy" / "machina" / "06-metalman-rbac.yaml")])
+    kubectl(["apply", "--server-side", "--force-conflicts", "-f", str(REPO_ROOT / "deploy" / "machina" / "rendered" / "06-metalman-rbac.yaml")])
 
     log("Creating Kubernetes resources")
     kubectl(["-n", NODE_NS, "create", "secret", "generic",
@@ -708,32 +730,31 @@ def main() -> None:
     else:
         die("Local OCI registry did not become ready")
 
-    log("Building host-ubuntu2404 OCI image")
-    docker_build_cmd = ["docker", "buildx", "build", "--load"]
-    # Use GitHub Actions cache when running in CI (env vars set by
-    # docker/setup-buildx-action in the workflow).
-    if os.environ.get("ACTIONS_CACHE_URL"):
-        docker_build_cmd += [
-            "--cache-from", "type=gha,scope=host-ubuntu2404",
-            "--cache-to", "type=gha,mode=max,scope=host-ubuntu2404",
-        ]
-    run([*docker_build_cmd, "-t", IMAGE_NAME,
-         "-f", str(IMAGE_DIR / "Containerfile"), str(REPO_ROOT)])
+    # Both Docker images (host-ubuntu2404 and agent-ubuntu2404) are pre-built
+    # by the GitHub Actions workflow using docker/build-push-action with GHA
+    # layer caching.  They are already loaded into the local Docker daemon
+    # with the correct tags (IMAGE_NAME and AGENT_IMAGE_NAME).
+    log("Verifying pre-built OCI images are available")
+    for name, tag in [("host-ubuntu2404", IMAGE_NAME),
+                      ("agent-ubuntu2404", AGENT_IMAGE_NAME)]:
+        result = subprocess.run(
+            ["docker", "image", "inspect", tag],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            die(f"Pre-built image {tag} not found in local Docker daemon. "
+                "Ensure the workflow builds it before running this script.")
+        log(f"  {name} image found: {tag}")
 
-    log("Pushing host-ubuntu2404 OCI image to local registry")
+    # Wait for Go builds (likely already finished during k8s setup).
+    for name, proc in go_builds:
+        rc = proc.wait()
+        if rc != 0:
+            die(f"go build {name} failed (exit code {rc})")
+    log("  Go builds finished")
+
+    log("Pushing OCI images to local registry")
     run(["docker", "push", IMAGE_NAME])
-
-    log("Building agent-ubuntu2404 OCI image")
-    agent_build_cmd = ["docker", "buildx", "build", "--load"]
-    if os.environ.get("ACTIONS_CACHE_URL"):
-        agent_build_cmd += [
-            "--cache-from", "type=gha,scope=agent-ubuntu2404",
-            "--cache-to", "type=gha,mode=max,scope=agent-ubuntu2404",
-        ]
-    run([*agent_build_cmd, "-t", AGENT_IMAGE_NAME,
-         "-f", str(AGENT_IMAGE_DIR / "Containerfile"), str(AGENT_IMAGE_DIR)])
-
-    log("Pushing agent-ubuntu2404 OCI image to local registry")
     run(["docker", "push", AGENT_IMAGE_NAME])
 
     # Reclaim disk space consumed by Docker build cache.  The host-ubuntu2404
@@ -806,7 +827,7 @@ def main() -> None:
 
     log("Waiting for kubelet to join the cluster...")
     wait_k8s_node(NODE_NAME, timeout=900)
-    assert_node_ready(NODE_NAME, timeout=300)
+    assert_node_ready(NODE_NAME, timeout=480)
 
     log("")
     log("Smoke test PASSED")

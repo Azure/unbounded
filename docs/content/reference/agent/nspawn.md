@@ -63,15 +63,15 @@ detected on the host.
 
 | Image | Default repository | Description |
 |---|---|---|
-| [`agent-ubuntu2404`](https://github.com/Azure/unbounded-kube/pkgs/container/agent-ubuntu2404) | `ghcr.io/azure/agent-ubuntu2404` | Base image with systemd, dbus, curl, iproute2, nftables, kmod, and wireguard-tools. ([Containerfile](https://github.com/Azure/unbounded-kube/tree/main/images/agent-ubuntu2404/Containerfile)) |
-| [`agent-ubuntu2404-nvidia`](https://github.com/Azure/unbounded-kube/pkgs/container/agent-ubuntu2404-nvidia) | `ghcr.io/azure/agent-ubuntu2404-nvidia` | Extends the base image with the NVIDIA Container Toolkit (`nvidia-ctk`, `nvidia-container-runtime`). ([Containerfile](https://github.com/Azure/unbounded-kube/tree/main/images/agent-ubuntu2404-nvidia/Containerfile)) |
+| [`agent-ubuntu2404`](https://github.com/Azure/unbounded/pkgs/container/agent-ubuntu2404) | `ghcr.io/azure/agent-ubuntu2404` | Base image with systemd, dbus, curl, iproute2, nftables, kmod, and wireguard-tools. ([Containerfile](https://github.com/Azure/unbounded/tree/main/images/agent-ubuntu2404/Containerfile)) |
+| [`agent-ubuntu2404-nvidia`](https://github.com/Azure/unbounded/pkgs/container/agent-ubuntu2404-nvidia) | `ghcr.io/azure/agent-ubuntu2404-nvidia` | Extends the base image with the NVIDIA Container Toolkit (`nvidia-ctk`, `nvidia-container-runtime`). ([Containerfile](https://github.com/Azure/unbounded/tree/main/images/agent-ubuntu2404-nvidia/Containerfile)) |
 
 The agent pins a specific image tag by default at build time. The `OCIImage`
 field in the agent config can override the full image reference for custom or
 pinned builds.
 
 Image sources are maintained in the
-[images/](https://github.com/Azure/unbounded-kube/tree/main/images)
+[images/](https://github.com/Azure/unbounded/tree/main/images)
 directory of the repository.
 
 ## Machine Configuration

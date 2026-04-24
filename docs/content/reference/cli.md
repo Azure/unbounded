@@ -7,7 +7,7 @@ description: "Complete reference for the kubectl-unbounded plugin commands."
 ## Overview
 
 `kubectl-unbounded` is a kubectl plugin that extends `kubectl` with commands for
-managing Unbounded Kube sites. Once installed, commands are available as:
+managing Unbounded sites. Once installed, commands are available as:
 
 ```bash
 kubectl unbounded <command>
@@ -18,7 +18,7 @@ The plugin binary can also be invoked directly as `kubectl-unbounded`.
 ## Installation
 
 Download the plugin binary from the
-[GitHub releases](https://github.com/Azure/unbounded-kube/releases)
+[GitHub releases](https://github.com/Azure/unbounded/releases)
 page and place it on your `PATH`. kubectl automatically discovers plugins named
 `kubectl-<name>`.
 
@@ -74,15 +74,16 @@ Initialize a new unbounded-kube site. This command:
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--cni-manifests` | `string` | unbounded-net v1.1.2 release URL | Path to a local file/directory or HTTPS URL for CNI manifests |
+| `--cni-manifests` | `string` | *(embedded manifests)* | Path to a local file/directory or HTTPS URL for CNI manifests |
 | `--machina-manifests` | `string` | *(embedded manifests)* | Path to a local file/directory or HTTPS URL for machina manifests |
 | `--kubeconfig` | `string` | `$KUBECONFIG` or default | Path to kubeconfig file |
 
 #### Validation
 
 - All CIDR values must be valid IPv4 CIDR notation.
-- `--cni-manifests` must be either a valid HTTPS URL or an existing local
-  file/directory path.
+- `--cni-manifests`, when provided, must be either a valid HTTPS URL or an
+  existing local file/directory path. If omitted, the manifests embedded in
+  the kubectl plugin are used.
 - `kubectl` must be available on `PATH`.
 
 #### Example

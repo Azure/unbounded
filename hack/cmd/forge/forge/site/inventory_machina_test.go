@@ -10,8 +10,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	machinav1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
-	"github.com/Azure/unbounded-kube/hack/cmd/forge/forge/site/azuredev"
+	machinav1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/hack/cmd/forge/forge/site/azuredev"
 )
 
 func TestMachinaNameFromInventory(t *testing.T) {

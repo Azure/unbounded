@@ -7,20 +7,27 @@
 Creates a QEMU VM, joins it to a Kind cluster using the production
 provision install script, and validates workloads run on the new node.
 
+The test follows a single linear sequence:
+  1. Start node without a Machine CR (agent self-registers).
+  2. Wait for the node to become Ready.
+  3. Validate the Machine CR created by the agent.
+   4. Update the Machine CR version and repave counter.
+  5. Wait for the node to be upgraded.
+  6. Reset the node.
+  7. Rejoin the node and validate again.
+
 Options:
     --verbose                          Enable diagnostic output (network diags).
 
 Subcommands (called as individual workflow steps):
     create-vm                          Create bridge networking and launch a QEMU VM.
-    recreate-vm                        Destroy and recreate VM with a fresh disk (keeps networking).
     ensure-kind-bridge                 Verify/repair veth pair connecting Kind to VM bridge.
     run-agent                          Build agent, generate bootstrap script, run on VM.
     wait-for-node                      Wait for the node to appear and become Ready.
     validate-workload                  Deploy test pods on the agent node.
+    validate-kube-proxy                Verify kube-proxy is Running on all nodes.
     install-machine-crd                Install Machine CRD and bootstrapper RBAC.
-    create-machine-cr                  Pre-create a Machine CR for the agent node.
     delete-machine-cr                  Delete the Machine CR.
-    validate-machine-cr-preexisting    Verify agent preserved a pre-existing Machine CR.
     validate-machine-cr-created        Verify agent self-registered a Machine CR.
     reset-agent                        Run agent reset and verify cleanup.
     cleanup                            Tear down VM, networking, and Kind cluster.
@@ -408,26 +415,6 @@ def create_vm() -> None:
 
 
 # ---------------------------------------------------------------------------
-# recreate-vm
-# ---------------------------------------------------------------------------
-def recreate_vm() -> None:
-    """Destroy and recreate the QEMU VM with a fresh disk.
-
-    Bridge networking, the TAP device, and the Kind cluster veth pair are
-    left intact.  Only the QEMU process and VM disk are replaced, giving
-    Case 2 a pristine VM with no state left over from Case 1.
-    """
-
-    if not SSH_KEY.exists():
-        die(f"SSH key not found: {SSH_KEY}. Run create-vm first.")
-
-    ssh_pub_key = SSH_KEY.with_suffix(".pub").read_text().strip()
-
-    _stop_qemu()
-    _launch_vm(ssh_pub_key)
-
-
-# ---------------------------------------------------------------------------
 # ensure-kind-bridge
 # ---------------------------------------------------------------------------
 VETH_HOST = "veth-kind-e2e"
@@ -535,6 +522,9 @@ def run_agent() -> None:
         env={**os.environ, "GOOS": "linux", "GOARCH": "amd64"})
     log(f"Agent binary built: {agent_bin}")
 
+    log("Rendering manifests for embedded fs...")
+    run(["make", "machina-manifests", "net-manifests"], cwd=str(REPO_ROOT))
+
     log("Building kubectl-unbounded...")
     kubectl_unbounded_bin = Path(KUBECTL_UNBOUNDED)
     run(["go", "build", "-o", str(kubectl_unbounded_bin),
@@ -609,6 +599,9 @@ def _run_agent_inner(agent_url: str) -> None:
         "metadata": {
             "name": f"bootstrap-token-{token_id}",
             "namespace": "kube-system",
+            "labels": {
+                "unbounded-kube.io/site": E2E_SITE_NAME,
+            },
         },
         "type": "bootstrap.kubernetes.io/token",
         "data": {
@@ -624,8 +617,8 @@ def _run_agent_inner(agent_url: str) -> None:
 
     # Generate bootstrap script via kubectl-unbounded.
     # manual-bootstrap auto-detects the API server, CA cert, Kubernetes
-    # version, and cluster DNS from the active kubeconfig, and picks up
-    # the bootstrap token we just created via the fallback path.
+    # version, and cluster DNS from the active kubeconfig. The bootstrap
+    # token is resolved via the site label on the secret.
     log("Generating bootstrap script with kubectl-unbounded machine manual-bootstrap...")
 
     # Capture the local API server URL from the kubeconfig (typically
@@ -818,6 +811,82 @@ def _log_network_diagnostics() -> None:
               ["bridge", "link", "show"])
 
     log("=== End network diagnostics ===")
+
+
+# ---------------------------------------------------------------------------
+# validate-kube-proxy
+# ---------------------------------------------------------------------------
+def validate_kube_proxy() -> None:
+    """Validate that kube-proxy pods are Running on every node in the cluster.
+
+    kube-proxy requires /lib/modules from the host kernel to load kernel
+    modules via modprobe. This check catches regressions where the nspawn
+    container does not bind-mount /lib/modules.
+    """
+
+    timeout_secs = 180
+
+    # Get all node names.
+    node_names_raw = kubectl_capture(["get", "nodes", "-o", "jsonpath={.items[*].metadata.name}"])
+    all_nodes = set(node_names_raw.split())
+    if not all_nodes:
+        die("No nodes found in the cluster")
+    log(f"Cluster nodes: {sorted(all_nodes)}")
+
+    # Wait for kube-proxy pods to be Running on every node.
+    log(f"Waiting for kube-proxy pods to be Running on all {len(all_nodes)} node(s) "
+        f"(timeout: {timeout_secs}s)...")
+    elapsed = 0
+    while elapsed < timeout_secs:
+        result = subprocess.run(
+            [KUBECTL, "get", "pods", "-n", "kube-system",
+             "-l", "k8s-app=kube-proxy",
+             "-o", "json"],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            if elapsed > 0 and elapsed % 30 == 0:
+                log(f"  ({elapsed}s) Failed to list kube-proxy pods")
+            time.sleep(5)
+            elapsed += 5
+            continue
+
+        pods = json.loads(result.stdout).get("items", [])
+        running_nodes: set[str] = set()
+        for pod in pods:
+            phase = pod.get("status", {}).get("phase", "")
+            node = pod.get("spec", {}).get("nodeName", "")
+            if phase == "Running" and node:
+                running_nodes.add(node)
+
+        if running_nodes >= all_nodes:
+            log(f"kube-proxy Running on all nodes after {elapsed}s")
+            break
+
+        missing = sorted(all_nodes - running_nodes)
+        if elapsed > 0 and elapsed % 30 == 0:
+            log(f"  ({elapsed}s) kube-proxy not yet Running on: {missing}")
+        time.sleep(5)
+        elapsed += 5
+    else:
+        log("kube-proxy pod status:")
+        subprocess.run([KUBECTL, "get", "pods", "-n", "kube-system",
+                        "-l", "k8s-app=kube-proxy", "-o", "wide"], check=False)
+        # Show logs from non-Running pods for debugging.
+        for pod in pods:
+            phase = pod.get("status", {}).get("phase", "")
+            name = pod.get("metadata", {}).get("name", "")
+            if phase != "Running" and name:
+                log(f"Logs for {name}:")
+                subprocess.run([KUBECTL, "logs", name, "-n", "kube-system",
+                                "--tail=50"], check=False)
+        die(f"kube-proxy not Running on all nodes after {timeout_secs}s. "
+            f"Missing: {sorted(all_nodes - running_nodes)}")
+
+    log("============================================")
+    log("  kube-proxy validation PASSED")
+    log("============================================")
+    kubectl(["get", "pods", "-n", "kube-system", "-l", "k8s-app=kube-proxy", "-o", "wide"])
 
 
 # ---------------------------------------------------------------------------
@@ -1046,15 +1115,19 @@ def reset_agent() -> None:
 # install-machine-crd
 # ---------------------------------------------------------------------------
 def install_machine_crd() -> None:
-    """Install the Machine CRD and bootstrapper RBAC into the cluster."""
+    """Install the Machine CRD and bootstrapper RBAC."""
 
     crd_path = REPO_ROOT / "deploy" / "machina" / "crd" / "unbounded-kube.io_machines.yaml"
-    rbac_path = REPO_ROOT / "deploy" / "machina" / "07-bootstrapper-rbac.yaml"
+    rbac_path = REPO_ROOT / "deploy" / "machina" / "rendered" / "07-bootstrapper-rbac.yaml"
 
     if not crd_path.exists():
         die(f"Machine CRD not found: {crd_path}")
+
+    log("Rendering machina manifests...")
+    run(["make", "machina-manifests"], cwd=str(REPO_ROOT))
+
     if not rbac_path.exists():
-        die(f"Bootstrapper RBAC not found: {rbac_path}")
+        die(f"Bootstrapper RBAC not found after render: {rbac_path}")
 
     log("Installing Machine CRD...")
     kubectl(["apply", "-f", str(crd_path)])
@@ -1062,33 +1135,7 @@ def install_machine_crd() -> None:
     log("Installing bootstrapper RBAC...")
     kubectl(["apply", "-f", str(rbac_path)])
 
-    log("Machine CRD and bootstrapper RBAC installed")
-
-
-# ---------------------------------------------------------------------------
-# create-machine-cr
-# ---------------------------------------------------------------------------
-def create_machine_cr() -> None:
-    """Pre-create a Machine CR for the agent node.
-
-    The CR is annotated with ``e2e-test/precreated: "true"`` so that
-    validate-machine-cr-preexisting can verify the agent left it untouched.
-    """
-
-    log(f"Pre-creating Machine CR '{AGENT_MACHINE_NAME}'...")
-
-    manifest = json.dumps({
-        "apiVersion": "unbounded-kube.io/v1alpha3",
-        "kind": "Machine",
-        "metadata": {
-            "name": AGENT_MACHINE_NAME,
-            "annotations": {"e2e-test/precreated": "true"},
-        },
-        "spec": {},
-    })
-    kubectl(["apply", "-f", "-"], input=manifest.encode())
-
-    log(f"Machine CR '{AGENT_MACHINE_NAME}' pre-created")
+    log("Machine CRD and RBAC installed")
 
 
 # ---------------------------------------------------------------------------
@@ -1104,47 +1151,16 @@ def delete_machine_cr() -> None:
 
 
 # ---------------------------------------------------------------------------
-# validate-machine-cr-preexisting
-# ---------------------------------------------------------------------------
-def validate_machine_cr_preexisting() -> None:
-    """Validate the agent preserved a pre-existing Machine CR.
-
-    Asserts the Machine CR still exists and retains the
-    ``e2e-test/precreated`` annotation, proving the agent detected the
-    existing CR and skipped registration.
-    """
-
-    log(f"Validating pre-existing Machine CR '{AGENT_MACHINE_NAME}'...")
-
-    try:
-        machine_json = kubectl_capture([
-            "get", "machine", AGENT_MACHINE_NAME, "-o", "json",
-        ])
-    except subprocess.CalledProcessError:
-        die(f"Machine CR '{AGENT_MACHINE_NAME}' not found - expected pre-existing CR to still exist")
-
-    machine = json.loads(machine_json)
-    annotations = machine.get("metadata", {}).get("annotations", {})
-
-    if annotations.get("e2e-test/precreated") != "true":
-        die("e2e-test/precreated annotation missing - agent may have deleted and recreated the CR")
-
-    log("Machine CR still has e2e-test/precreated annotation")
-
-    log("============================================")
-    log("  Machine CR validation PASSED (preexisting)")
-    log("============================================")
-
-
-# ---------------------------------------------------------------------------
 # validate-machine-cr-created
 # ---------------------------------------------------------------------------
 def validate_machine_cr_created() -> None:
     """Validate the agent self-registered a Machine CR during bootstrap.
 
-    Asserts the Machine CR exists, does NOT have the pre-created marker
-    annotation, and has the correct ``bootstrapTokenRef`` derived from
-    the bootstrap token created by run-agent.
+    The daemon registers the Machine CR at startup, so this function polls
+    until the CR appears (with a timeout). Once found, it asserts the CR
+    does NOT have the pre-created marker annotation and has the correct
+    ``bootstrapTokenRef`` derived from the bootstrap token created by
+    run-agent.
     """
 
     token_id_file = VM_DIR / "token-id"
@@ -1154,12 +1170,27 @@ def validate_machine_cr_created() -> None:
 
     log(f"Validating agent-created Machine CR '{AGENT_MACHINE_NAME}'...")
 
-    try:
-        machine_json = kubectl_capture([
-            "get", "machine", AGENT_MACHINE_NAME, "-o", "json",
-        ])
-    except subprocess.CalledProcessError:
-        die(f"Machine CR '{AGENT_MACHINE_NAME}' not found - expected agent to create it")
+    # Poll for the Machine CR to appear (the daemon registers it
+    # asynchronously after startup).
+    timeout_secs = 120
+    elapsed = 0
+    machine_json = None
+    while elapsed < timeout_secs:
+        result = subprocess.run(
+            [KUBECTL, "get", "machine", AGENT_MACHINE_NAME, "-o", "json"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            machine_json = result.stdout
+            log(f"Machine CR '{AGENT_MACHINE_NAME}' found after {elapsed}s")
+            break
+        if elapsed > 0 and elapsed % 15 == 0:
+            log(f"  ({elapsed}s) Machine CR not yet created...")
+        time.sleep(5)
+        elapsed += 5
+    else:
+        die(f"Machine CR '{AGENT_MACHINE_NAME}' not found after {timeout_secs}s - "
+            f"expected daemon to create it")
 
     machine = json.loads(machine_json)
 
@@ -1245,15 +1276,13 @@ def cleanup() -> None:
 # ---------------------------------------------------------------------------
 COMMANDS = {
     "create-vm": create_vm,
-    "recreate-vm": recreate_vm,
     "ensure-kind-bridge": ensure_kind_bridge,
     "run-agent": run_agent,
     "wait-for-node": wait_for_node,
+    "validate-kube-proxy": validate_kube_proxy,
     "validate-workload": validate_workload,
     "install-machine-crd": install_machine_crd,
-    "create-machine-cr": create_machine_cr,
     "delete-machine-cr": delete_machine_cr,
-    "validate-machine-cr-preexisting": validate_machine_cr_preexisting,
     "validate-machine-cr-created": validate_machine_cr_created,
     "reset-agent": reset_agent,
     "cleanup": cleanup,
