@@ -12,6 +12,7 @@ import (
 	"github.com/Azure/unbounded/agent/goalstates"
 	"github.com/Azure/unbounded/agent/phases"
 	"github.com/Azure/unbounded/agent/phases/reset"
+	"github.com/Azure/unbounded/cmd/agent/internal/daemon"
 	"github.com/Azure/unbounded/internal/version"
 )
 
@@ -39,7 +40,7 @@ Both possible nspawn machine names (kube1 and kube2) are stopped and removed.`,
 
 			return phases.Serial(log,
 				// Step 1: Stop the agent daemon before tearing down machines.
-				reset.StopDaemon(log),
+				daemon.StopDaemon(log),
 
 				// Step 2: Stop both nspawn machines.
 				phases.Parallel(log,
@@ -69,7 +70,7 @@ Both possible nspawn machine names (kube1 and kube2) are stopped and removed.`,
 				reset.CleanupRoutes(log),
 
 				// Step 7: Remove agent binaries and config.
-				reset.RemoveAgentArtifacts(log),
+				daemon.RemoveAgentArtifacts(log),
 
 				// Step 8: Reload systemd.
 				reset.ReloadSystemd(log),

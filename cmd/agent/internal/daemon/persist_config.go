@@ -6,8 +6,10 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 
 	"github.com/Azure/unbounded/agent/config"
 	"github.com/Azure/unbounded/agent/goalstates"
@@ -55,4 +57,44 @@ func (p *persistAppliedConfig) Do(_ context.Context) error {
 	p.log.Info("applied config persisted", "path", path, "checksum_path", checksumPath)
 
 	return nil
+}
+
+type removeAppliedConfig struct {
+	log         *slog.Logger
+	machineName string
+}
+
+// RemoveAppliedConfig returns a task that removes the applied agent config
+// file and its checksum sidecar for the named machine. Errors are logged but
+// do not fail the task.
+func RemoveAppliedConfig(log *slog.Logger, machineName string) phases.Task {
+	return &removeAppliedConfig{log: log, machineName: machineName}
+}
+
+func (t *removeAppliedConfig) Name() string { return "remove-applied-config" }
+
+func (t *removeAppliedConfig) Do(_ context.Context) error {
+	path := goalstates.AppliedConfigPath(t.machineName)
+	removeFileIfExists(t.log, path)
+
+	checksumPath := goalstates.AppliedConfigChecksumPath(t.machineName)
+	removeFileIfExists(t.log, checksumPath)
+
+	return nil
+}
+
+// removeFileIfExists removes a file if it exists. Non-ENOENT errors are
+// logged at Warn so we have a trace but don't abort the flow.
+func removeFileIfExists(log *slog.Logger, path string) {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		log.Warn("failed to remove file", "path", path, "error", err)
+	}
+}
+
+// removeAllIfExists removes a path and all children if it exists. Errors are
+// logged at Warn so we have a trace but don't abort the flow.
+func removeAllIfExists(log *slog.Logger, path string) {
+	if err := os.RemoveAll(path); err != nil {
+		log.Warn("failed to remove directory", "path", path, "error", err)
+	}
 }

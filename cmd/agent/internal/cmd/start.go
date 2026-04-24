@@ -75,7 +75,7 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 
 				// Phase 5: Enable and start the daemon that watches the
 				// Machine CR for drift detection and reconciliation.
-				host.EnableDaemon(log),
+				daemon.EnableDaemon(log),
 			}
 
 			return phases.Serial(log, tasks...).Do(ctx)

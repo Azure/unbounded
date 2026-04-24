@@ -152,6 +152,7 @@ func UpdateNode(ctx context.Context, log *slog.Logger, active *ActiveMachine, ne
 		PersistAppliedConfig(log, gs.NodeStart.MachineName, newCfg),
 		nodestart.WaitForKubelet(log, newMachine),
 		reset.CleanupMachine(log, oldMachine),
+		RemoveAppliedConfig(log, oldMachine),
 	).Do(ctx)
 	if err != nil {
 		return err

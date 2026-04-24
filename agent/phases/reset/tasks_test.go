@@ -25,7 +25,6 @@ func TestTaskNames(t *testing.T) {
 		{"remove-wireguard-keys", RemoveWireGuardKeys(log)},
 		{"remove-nspawn-config", RemoveNSpawnConfig(log, "test")},
 		{"cleanup-routes", CleanupRoutes(log)},
-		{"remove-agent-artifacts", RemoveAgentArtifacts(log)},
 		{"reload-systemd", ReloadSystemd(log)},
 	}
 
