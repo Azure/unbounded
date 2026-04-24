@@ -88,6 +88,44 @@ kubectl unbounded machine manual-bootstrap my-node --site mysite > bootstrap.sh
 ```
 {{< /callout >}}
 
+### Customizing the agent download
+
+By default the bootstrap script downloads the latest published
+`unbounded-agent` release directly from GitHub. This means new releases are
+picked up automatically without editing scripts or docs. The download can be
+customized when generating the bootstrap payload or at runtime via
+environment variables:
+
+- `--agent-version` / `AGENT_VERSION`: pin to a specific release tag instead
+  of tracking latest. Example: `--agent-version v0.0.10`.
+- `--agent-base-url` / `AGENT_BASE_URL`: point at a self-hosted mirror of the
+  release assets. The layout under the base URL must match the GitHub
+  releases layout (`<base>/latest/download/<asset>` and
+  `<base>/download/<tag>/<asset>`). Useful for air-gapped environments.
+- `--agent-url` / `AGENT_URL`: fully qualified download URL for the agent
+  tarball. Overrides the version / base URL resolution entirely.
+
+Examples:
+
+```bash
+# Pin the agent to a specific release:
+kubectl unbounded machine manual-bootstrap my-node --site mysite \
+    --agent-version v0.0.10 | ssh user@host sudo bash
+
+# Self-host the release assets under an internal mirror:
+kubectl unbounded machine manual-bootstrap my-node --site mysite \
+    --agent-base-url https://releases.internal.example.com/unbounded \
+    | ssh user@host sudo bash
+```
+
+The same overrides can also be exported on the target host before running a
+previously generated bootstrap script:
+
+```bash
+export AGENT_BASE_URL=https://releases.internal.example.com/unbounded
+bash bootstrap.sh
+```
+
 A successful run looks like this (timestamps shortened for readability):
 
 ```

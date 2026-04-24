@@ -49,8 +49,14 @@ COPY go.mod go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod \
     go mod download
 
-# Build ntttcp for network performance testing
-RUN git clone --depth 1 https://github.com/microsoft/ntttcp-for-linux.git /tmp/ntttcp-for-linux \
+# Build ntttcp for network performance testing (retry up to 3 times for transient network errors)
+RUN for i in 1 2 3; do \
+        git clone --depth 1 https://github.com/microsoft/ntttcp-for-linux.git /tmp/ntttcp-for-linux && break; \
+        echo "git clone attempt $i failed, retrying in 10s..."; \
+        rm -rf /tmp/ntttcp-for-linux; \
+        [ "$i" = "3" ] && exit 1; \
+        sleep 10; \
+    done \
     && cd /tmp/ntttcp-for-linux/src \
     && make \
     && cp ntttcp /usr/local/bin/ntttcp \
