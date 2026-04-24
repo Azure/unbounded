@@ -100,7 +100,7 @@ Store BMC passwords in a Secret referenced by `passwordRef`. See the [CRD Refere
 
 Cloud-init on PXE-booted machines uses two data sources that are merged at boot:
 
-- **Vendor-data** (managed by unbounded-kube) -- Contains the agent configuration, bootstrap scripts, and system defaults required for the node to join the cluster. This is not user-editable.
+- **Vendor-data** (managed by Unbounded) -- Contains the agent configuration, bootstrap scripts, and system defaults required for the node to join the cluster. This is not user-editable.
 - **User-data** (managed by the cluster operator) -- Optional customization such as SSH keys, additional packages, or host-level configuration.
 
 When no user-data is configured, metalman serves a minimal `#cloud-config` document. To supply custom user-data, create a ConfigMap and reference it from the Machine spec:
