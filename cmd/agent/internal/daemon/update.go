@@ -21,12 +21,12 @@ import (
 	"os"
 	"strings"
 
-	"github.com/Azure/unbounded/cmd/agent/internal/goalstates"
-	"github.com/Azure/unbounded/cmd/agent/internal/phases"
-	"github.com/Azure/unbounded/cmd/agent/internal/phases/nodestart"
-	"github.com/Azure/unbounded/cmd/agent/internal/phases/nodestop"
-	"github.com/Azure/unbounded/cmd/agent/internal/phases/reset"
-	"github.com/Azure/unbounded/cmd/agent/internal/phases/rootfs"
+	"github.com/Azure/unbounded/agent/goalstates"
+	"github.com/Azure/unbounded/agent/phases"
+	"github.com/Azure/unbounded/agent/phases/nodestart"
+	"github.com/Azure/unbounded/agent/phases/nodestop"
+	"github.com/Azure/unbounded/agent/phases/reset"
+	"github.com/Azure/unbounded/agent/phases/rootfs"
 	"github.com/Azure/unbounded/internal/provision"
 )
 

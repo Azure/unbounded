@@ -27,9 +27,9 @@ func requiredEnv(n string) (string, error) {
 // UNBOUNDED_AGENT_CONFIG_FILE.  When that variable is unset the function falls
 // back to the legacy per-field environment variables so that existing
 // deployments keep working without changes.
-func loadConfig() (*provision.AgentConfig, error) {
+func loadConfig() (*provision.UnboundedAgentConfig, error) {
 	var (
-		cfg *provision.AgentConfig
+		cfg *provision.UnboundedAgentConfig
 		err error
 	)
 
@@ -49,7 +49,7 @@ func loadConfig() (*provision.AgentConfig, error) {
 }
 
 // normalizeConfig applies common fixups regardless of how the config was loaded.
-func normalizeConfig(cfg *provision.AgentConfig) {
+func normalizeConfig(cfg *provision.UnboundedAgentConfig) {
 	cfg.Cluster.Version = strings.TrimPrefix(cfg.Cluster.Version, "v")
 
 	// FIXME: should we set the scheme in machina side?
@@ -59,13 +59,13 @@ func normalizeConfig(cfg *provision.AgentConfig) {
 }
 
 // loadConfigFromFile reads and decodes the JSON config file at path.
-func loadConfigFromFile(path string) (*provision.AgentConfig, error) {
+func loadConfigFromFile(path string) (*provision.UnboundedAgentConfig, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read agent config file %q: %w", path, err)
 	}
 
-	var cfg provision.AgentConfig
+	var cfg provision.UnboundedAgentConfig
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("decode agent config file %q: %w", path, err)
 	}
@@ -76,7 +76,7 @@ func loadConfigFromFile(path string) (*provision.AgentConfig, error) {
 // loadConfigFromEnv builds an AgentConfig from the legacy ad-hoc environment
 // variables.  This preserves backward compatibility for callers that have not
 // yet switched to the JSON config file.
-func loadConfigFromEnv() (*provision.AgentConfig, error) {
+func loadConfigFromEnv() (*provision.UnboundedAgentConfig, error) {
 	machineName, err := requiredEnv("MACHINA_MACHINE_NAME")
 	if err != nil {
 		return nil, err
@@ -136,18 +136,20 @@ func loadConfigFromEnv() (*provision.AgentConfig, error) {
 		taints = strings.Split(raw, ",")
 	}
 
-	cfg := &provision.AgentConfig{
-		MachineName: machineName,
-		Cluster: provision.AgentClusterConfig{
-			CaCertBase64: caCertB64,
-			ClusterDNS:   clusterDNS,
-			Version:      kubeVersion,
-		},
-		Kubelet: provision.AgentKubeletConfig{
-			ApiServer:          apiServer,
-			BootstrapToken:     bootstrapToken,
-			Labels:             labels,
-			RegisterWithTaints: taints,
+	cfg := &provision.UnboundedAgentConfig{
+		AgentConfig: provision.AgentConfig{
+			MachineName: machineName,
+			Cluster: provision.AgentClusterConfig{
+				CaCertBase64: caCertB64,
+				ClusterDNS:   clusterDNS,
+				Version:      kubeVersion,
+			},
+			Kubelet: provision.AgentKubeletConfig{
+				ApiServer:          apiServer,
+				BootstrapToken:     bootstrapToken,
+				Labels:             labels,
+				RegisterWithTaints: taints,
+			},
 		},
 	}
 

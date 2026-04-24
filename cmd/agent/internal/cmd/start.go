@@ -9,11 +9,12 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/Azure/unbounded/cmd/agent/internal/goalstates"
-	"github.com/Azure/unbounded/cmd/agent/internal/phases"
-	"github.com/Azure/unbounded/cmd/agent/internal/phases/host"
-	"github.com/Azure/unbounded/cmd/agent/internal/phases/nodestart"
-	"github.com/Azure/unbounded/cmd/agent/internal/phases/rootfs"
+	"github.com/Azure/unbounded/agent/goalstates"
+	"github.com/Azure/unbounded/agent/phases"
+	"github.com/Azure/unbounded/agent/phases/host"
+	"github.com/Azure/unbounded/agent/phases/nodestart"
+	"github.com/Azure/unbounded/agent/phases/rootfs"
+	"github.com/Azure/unbounded/cmd/agent/internal/attest"
 	"github.com/Azure/unbounded/internal/version"
 )
 
@@ -40,7 +41,7 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 
 			log := cmdCtx.Logger
 
-			gs, err := goalstates.ResolveMachine(log, cfg, goalstates.NSpawnMachineKube1)
+			gs, err := goalstates.ResolveMachine(log, &cfg.AgentConfig, goalstates.NSpawnMachineKube1)
 			if err != nil {
 				return err
 			}
@@ -60,13 +61,13 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 				),
 
 				// TPM Attestation (no-op when not configured).
-				host.ApplyAttestation(log, cfg.Attest, cfg.MachineName, nodeStartGoalState),
+				attest.ApplyAttestation(log, cfg.Attest, cfg.MachineName, nodeStartGoalState),
 
 				// Phase 2: rootfs
 				rootfs.Provision(log, rootFSGoalState),
 
 				// Phase 3: node-start (includes persisting the applied config).
-				nodestart.StartNode(log, nodeStartGoalState, cfg),
+				nodestart.StartNode(log, nodeStartGoalState, &cfg.AgentConfig),
 
 				// Phase 4: Enable and start the daemon that watches the
 				// Machine CR for drift detection and reconciliation.

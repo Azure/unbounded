@@ -7,44 +7,28 @@ import (
 	"maps"
 	"strings"
 
+	"github.com/Azure/unbounded/agent/config"
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/cloudprovider"
 )
 
-// AgentConfig is the configuration document uploaded to the remote machine
-// before running the agent install script. The script reads it via the
-// UNBOUNDED_AGENT_CONFIG_FILE environment variable.
-type AgentConfig struct {
-	MachineName string             `json:"MachineName"`
-	Cluster     AgentClusterConfig `json:"Cluster"`
-	Kubelet     AgentKubeletConfig `json:"Kubelet"`
+type (
+	AgentConfig        = config.AgentConfig
+	AgentClusterConfig = config.AgentClusterConfig
+	AgentKubeletConfig = config.AgentKubeletConfig
+)
 
-	// OCIImage is the fully-qualified OCI image reference (e.g.
-	// "ghcr.io/org/repo:tag") used to bootstrap the machine rootfs.
-	// When empty the agent falls back to debootstrap.
-	OCIImage string `json:"OCIImage,omitempty"`
+// UnboundedAgentConfig extends the shared AgentConfig with unbounded-specific
+// fields that are not part of the public agent IR. Controllers and the
+// agent CLI use this type; the shared agent library uses only AgentConfig.
+type UnboundedAgentConfig struct {
+	config.AgentConfig
 
 	// Attest configures TPM-based attestation for obtaining a bootstrap
 	// token from a metalman serve-pxe instance. When set, the agent
 	// performs TPM attestation on the host instead of requiring a static
 	// BootstrapToken in Kubelet config.
 	Attest *AgentAttestConfig `json:"Attest,omitempty"`
-}
-
-// AgentClusterConfig holds the cluster-level values the agent needs to
-// join the Kubernetes control plane.
-type AgentClusterConfig struct {
-	CaCertBase64 string `json:"CaCertBase64"`
-	ClusterDNS   string `json:"ClusterDNS"`
-	Version      string `json:"Version"`
-}
-
-// AgentKubeletConfig holds kubelet-specific overrides.
-type AgentKubeletConfig struct {
-	ApiServer          string            `json:"ApiServer"`
-	BootstrapToken     string            `json:"BootstrapToken,omitempty"`
-	Labels             map[string]string `json:"Labels"`
-	RegisterWithTaints []string          `json:"RegisterWithTaints"`
 }
 
 // AgentAttestConfig holds configuration for TPM-based attestation against
@@ -110,7 +94,7 @@ type BuildAgentConfigParams struct {
 //  1. User-defined labels from Machine.Spec.Kubernetes.NodeLabels.
 //  2. Common labels applied unconditionally (e.g. cloud provider exclusion).
 //  3. Provider-injected labels from params.ProviderLabels.
-func BuildAgentConfig(params BuildAgentConfigParams) AgentConfig {
+func BuildAgentConfig(params BuildAgentConfigParams) UnboundedAgentConfig {
 	machine := params.Machine
 
 	// Resolve Kubernetes version: Machine spec overrides cluster default.
@@ -148,20 +132,22 @@ func BuildAgentConfig(params BuildAgentConfigParams) AgentConfig {
 		ociImage = machine.Spec.Agent.Image
 	}
 
-	cfg := AgentConfig{
-		MachineName: machine.Name,
-		Cluster: AgentClusterConfig{
-			CaCertBase64: params.Cluster.CACertBase64,
-			ClusterDNS:   params.Cluster.ClusterDNS,
-			Version:      k8sVersion,
+	cfg := UnboundedAgentConfig{
+		AgentConfig: config.AgentConfig{
+			MachineName: machine.Name,
+			Cluster: AgentClusterConfig{
+				CaCertBase64: params.Cluster.CACertBase64,
+				ClusterDNS:   params.Cluster.ClusterDNS,
+				Version:      k8sVersion,
+			},
+			Kubelet: AgentKubeletConfig{
+				ApiServer:          params.Cluster.APIServer,
+				BootstrapToken:     params.BootstrapToken,
+				Labels:             labels,
+				RegisterWithTaints: taints,
+			},
+			OCIImage: ociImage,
 		},
-		Kubelet: AgentKubeletConfig{
-			ApiServer:          params.Cluster.APIServer,
-			BootstrapToken:     params.BootstrapToken,
-			Labels:             labels,
-			RegisterWithTaints: taints,
-		},
-		OCIImage: ociImage,
 	}
 
 	if params.AttestURL != "" {

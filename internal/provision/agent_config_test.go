@@ -120,25 +120,24 @@ func TestAgentConfig_EmptyFields(t *testing.T) {
 	// OCIImage has omitempty so should be absent from zero-value config.
 	_, hasOCIImage := parsed["OCIImage"]
 	require.False(t, hasOCIImage, "OCIImage should be omitted when empty")
-
-	// Attest should be omitted when nil.
-	require.Nil(t, parsed["Attest"])
 }
 
-func TestAgentConfig_WithAttest(t *testing.T) {
+func TestUnboundedAgentConfig_WithAttest(t *testing.T) {
 	t.Parallel()
 
-	cfg := AgentConfig{
-		MachineName: "metal-node-1",
-		Cluster: AgentClusterConfig{
-			CaCertBase64: "dGVzdC1jYQ==",
-			ClusterDNS:   "10.0.0.10",
-			Version:      "v1.34.0",
-		},
-		Kubelet: AgentKubeletConfig{
-			ApiServer: "api.example.com:443",
-			Labels: map[string]string{
-				"kubernetes.azure.com/managed": "false",
+	cfg := UnboundedAgentConfig{
+		AgentConfig: AgentConfig{
+			MachineName: "metal-node-1",
+			Cluster: AgentClusterConfig{
+				CaCertBase64: "dGVzdC1jYQ==",
+				ClusterDNS:   "10.0.0.10",
+				Version:      "v1.34.0",
+			},
+			Kubelet: AgentKubeletConfig{
+				ApiServer: "api.example.com:443",
+				Labels: map[string]string{
+					"kubernetes.azure.com/managed": "false",
+				},
 			},
 		},
 		Attest: &AgentAttestConfig{
@@ -149,7 +148,7 @@ func TestAgentConfig_WithAttest(t *testing.T) {
 	data, err := json.Marshal(cfg)
 	require.NoError(t, err)
 
-	var decoded AgentConfig
+	var decoded UnboundedAgentConfig
 	require.NoError(t, json.Unmarshal(data, &decoded))
 
 	require.Equal(t, cfg.MachineName, decoded.MachineName)
@@ -160,13 +159,15 @@ func TestAgentConfig_WithAttest(t *testing.T) {
 	require.Empty(t, decoded.Kubelet.BootstrapToken)
 }
 
-func TestAgentConfig_AttestOmittedWhenNil(t *testing.T) {
+func TestUnboundedAgentConfig_AttestOmittedWhenNil(t *testing.T) {
 	t.Parallel()
 
-	cfg := AgentConfig{
-		MachineName: "ssh-node",
-		Kubelet: AgentKubeletConfig{
-			BootstrapToken: "abc123.secret456",
+	cfg := UnboundedAgentConfig{
+		AgentConfig: AgentConfig{
+			MachineName: "ssh-node",
+			Kubelet: AgentKubeletConfig{
+				BootstrapToken: "abc123.secret456",
+			},
 		},
 	}
 
@@ -176,7 +177,7 @@ func TestAgentConfig_AttestOmittedWhenNil(t *testing.T) {
 	// Attest should not appear in JSON output when nil.
 	require.NotContains(t, string(data), "Attest")
 
-	var decoded AgentConfig
+	var decoded UnboundedAgentConfig
 	require.NoError(t, json.Unmarshal(data, &decoded))
 	require.Nil(t, decoded.Attest)
 	require.Equal(t, "abc123.secret456", decoded.Kubelet.BootstrapToken)
@@ -188,7 +189,7 @@ func TestBuildAgentConfig(t *testing.T) {
 	tests := []struct {
 		name   string
 		params BuildAgentConfigParams
-		assert func(t *testing.T, cfg AgentConfig)
+		assert func(t *testing.T, cfg UnboundedAgentConfig)
 	}{
 		{
 			name: "fully populated",
@@ -213,7 +214,7 @@ func TestBuildAgentConfig(t *testing.T) {
 				ProviderLabels: map[string]string{"provider-key": "provider-val"},
 				BootstrapToken: "abc123.secret456",
 			},
-			assert: func(t *testing.T, cfg AgentConfig) {
+			assert: func(t *testing.T, cfg UnboundedAgentConfig) {
 				require.Equal(t, "my-machine", cfg.MachineName)
 				require.Equal(t, "dGVzdC1jYQ==", cfg.Cluster.CaCertBase64)
 				require.Equal(t, "10.0.0.10", cfg.Cluster.ClusterDNS)
@@ -242,7 +243,7 @@ func TestBuildAgentConfig(t *testing.T) {
 					KubeVersion: "v1.33.0",
 				},
 			},
-			assert: func(t *testing.T, cfg AgentConfig) {
+			assert: func(t *testing.T, cfg UnboundedAgentConfig) {
 				require.Equal(t, "bare-machine", cfg.MachineName)
 				require.Equal(t, "v1.33.0", cfg.Cluster.Version)
 
@@ -264,7 +265,7 @@ func TestBuildAgentConfig(t *testing.T) {
 					},
 				},
 			},
-			assert: func(t *testing.T, cfg AgentConfig) {
+			assert: func(t *testing.T, cfg UnboundedAgentConfig) {
 				require.Equal(t, "v1.34.0", cfg.Cluster.Version)
 			},
 		},
@@ -278,7 +279,7 @@ func TestBuildAgentConfig(t *testing.T) {
 					KubeVersion: "1.33.0", // no "v" prefix, should be normalized
 				},
 			},
-			assert: func(t *testing.T, cfg AgentConfig) {
+			assert: func(t *testing.T, cfg UnboundedAgentConfig) {
 				require.Equal(t, "v1.33.0", cfg.Cluster.Version)
 			},
 		},
@@ -298,7 +299,7 @@ func TestBuildAgentConfig(t *testing.T) {
 				},
 				ProviderLabels: map[string]string{"provider-key": "provider-wins"},
 			},
-			assert: func(t *testing.T, cfg AgentConfig) {
+			assert: func(t *testing.T, cfg UnboundedAgentConfig) {
 				require.Equal(t, "user-value", cfg.Kubelet.Labels["user-label"])
 				require.Equal(t, "provider-wins", cfg.Kubelet.Labels["provider-key"]) // provider wins over user
 			},
@@ -316,7 +317,7 @@ func TestBuildAgentConfig(t *testing.T) {
 				},
 				ProviderLabels: nil, // should be safe
 			},
-			assert: func(t *testing.T, cfg AgentConfig) {
+			assert: func(t *testing.T, cfg UnboundedAgentConfig) {
 				require.Equal(t, "value", cfg.Kubelet.Labels["key"])
 				require.Len(t, cfg.Kubelet.Labels, 1)
 			},
@@ -329,7 +330,7 @@ func TestBuildAgentConfig(t *testing.T) {
 				},
 				AttestURL: "http://10.0.0.1:8880",
 			},
-			assert: func(t *testing.T, cfg AgentConfig) {
+			assert: func(t *testing.T, cfg UnboundedAgentConfig) {
 				require.NotNil(t, cfg.Attest)
 				require.Equal(t, "http://10.0.0.1:8880", cfg.Attest.URL)
 				require.Empty(t, cfg.Kubelet.BootstrapToken)
@@ -343,7 +344,7 @@ func TestBuildAgentConfig(t *testing.T) {
 				},
 				BootstrapToken: "tok.sec",
 			},
-			assert: func(t *testing.T, cfg AgentConfig) {
+			assert: func(t *testing.T, cfg UnboundedAgentConfig) {
 				require.Nil(t, cfg.Attest)
 				require.Equal(t, "tok.sec", cfg.Kubelet.BootstrapToken)
 			},
