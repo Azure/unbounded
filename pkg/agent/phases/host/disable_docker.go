@@ -11,9 +11,9 @@ import (
 	"log/slog"
 	"os"
 
+	"github.com/Azure/unbounded/pkg/agent/internal/utilexec"
+	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 	"github.com/Azure/unbounded/pkg/agent/phases"
-	"github.com/Azure/unbounded/pkg/agent/utilexec"
-	"github.com/Azure/unbounded/pkg/agent/utilio"
 )
 
 const (

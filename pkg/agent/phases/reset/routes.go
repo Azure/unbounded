@@ -8,8 +8,8 @@ import (
 	"fmt"
 	"log/slog"
 
+	"github.com/Azure/unbounded/pkg/agent/internal/utilexec"
 	"github.com/Azure/unbounded/pkg/agent/phases"
-	"github.com/Azure/unbounded/pkg/agent/utilexec"
 )
 
 // wireguardTableStart and wireguardTableEnd define the range of routing table

@@ -14,7 +14,6 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/phases"
-	"github.com/Azure/unbounded/pkg/agent/utilio"
 )
 
 type persistAppliedConfig struct {
@@ -39,7 +38,7 @@ func (p *persistAppliedConfig) Do(_ context.Context) error {
 	}
 
 	path := goalstates.AppliedConfigPath(p.machineName)
-	if err := utilio.WriteFile(path, data, 0o600); err != nil {
+	if err := writeFile(path, data, 0o600); err != nil {
 		return fmt.Errorf("write applied config to %s: %w", path, err)
 	}
 
@@ -50,7 +49,7 @@ func (p *persistAppliedConfig) Do(_ context.Context) error {
 	checksumPath := goalstates.AppliedConfigChecksumPath(p.machineName)
 
 	checksum := goalstates.ComputeChecksum(data)
-	if err := utilio.WriteFile(checksumPath, []byte(checksum+"\n"), 0o600); err != nil {
+	if err := writeFile(checksumPath, []byte(checksum+"\n"), 0o600); err != nil {
 		return fmt.Errorf("write checksum to %s: %w", checksumPath, err)
 	}
 

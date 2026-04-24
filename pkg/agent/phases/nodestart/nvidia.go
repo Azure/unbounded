@@ -11,8 +11,8 @@ import (
 	"path/filepath"
 
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/internal/utilexec"
 	"github.com/Azure/unbounded/pkg/agent/phases"
-	"github.com/Azure/unbounded/pkg/agent/utilexec"
 )
 
 type setupNVIDIA struct {

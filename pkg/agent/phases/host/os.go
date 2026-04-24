@@ -10,9 +10,9 @@ import (
 	"log/slog"
 	"strings"
 
+	"github.com/Azure/unbounded/pkg/agent/internal/utilexec"
+	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 	"github.com/Azure/unbounded/pkg/agent/phases"
-	"github.com/Azure/unbounded/pkg/agent/utilexec"
-	"github.com/Azure/unbounded/pkg/agent/utilio"
 )
 
 // requiredPackages lists the OS packages that must be installed on the host.

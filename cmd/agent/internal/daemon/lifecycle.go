@@ -12,8 +12,6 @@ import (
 
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/phases"
-	"github.com/Azure/unbounded/pkg/agent/utilexec"
-	"github.com/Azure/unbounded/pkg/agent/utilio"
 )
 
 // ---------------------------------------------------------------------------
@@ -40,21 +38,21 @@ func (d *enableDaemon) Name() string { return "enable-daemon" }
 func (d *enableDaemon) Do(ctx context.Context) error {
 	unitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonUnit)
 
-	if err := utilio.WriteFile(unitPath, daemonServiceContent, 0o644); err != nil {
+	if err := writeFile(unitPath, daemonServiceContent, 0o644); err != nil {
 		return fmt.Errorf("writing %s: %w", unitPath, err)
 	}
 
-	systemctl := utilexec.Systemctl()
+	sc := systemctl()
 
-	if err := utilexec.RunCmd(ctx, d.log, systemctl, "daemon-reload"); err != nil {
+	if err := runCmd(ctx, d.log, sc, "daemon-reload"); err != nil {
 		return fmt.Errorf("systemctl daemon-reload: %w", err)
 	}
 
-	if err := utilexec.RunCmd(ctx, d.log, systemctl, "enable", goalstates.DaemonUnit); err != nil {
+	if err := runCmd(ctx, d.log, sc, "enable", goalstates.DaemonUnit); err != nil {
 		return fmt.Errorf("systemctl enable %s: %w", goalstates.DaemonUnit, err)
 	}
 
-	if err := utilexec.RunCmd(ctx, d.log, systemctl, "start", goalstates.DaemonUnit); err != nil {
+	if err := runCmd(ctx, d.log, sc, "start", goalstates.DaemonUnit); err != nil {
 		return fmt.Errorf("systemctl start %s: %w", goalstates.DaemonUnit, err)
 	}
 
@@ -81,13 +79,13 @@ func StopDaemon(log *slog.Logger) phases.Task {
 func (t *stopDaemon) Name() string { return "stop-daemon" }
 
 func (t *stopDaemon) Do(ctx context.Context) error {
-	systemctl := utilexec.Systemctl()
+	sc := systemctl()
 
-	if err := utilexec.RunCmd(ctx, t.log, systemctl, "stop", goalstates.DaemonUnit); err != nil {
+	if err := runCmd(ctx, t.log, sc, "stop", goalstates.DaemonUnit); err != nil {
 		t.log.Warn("failed to stop daemon (may not be running)", "error", err)
 	}
 
-	if err := utilexec.RunCmd(ctx, t.log, systemctl, "disable", goalstates.DaemonUnit); err != nil {
+	if err := runCmd(ctx, t.log, sc, "disable", goalstates.DaemonUnit); err != nil {
 		t.log.Warn("failed to disable daemon (may not be enabled)", "error", err)
 	}
 

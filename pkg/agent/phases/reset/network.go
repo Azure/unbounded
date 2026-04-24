@@ -12,8 +12,8 @@ import (
 	"os"
 	"strings"
 
+	"github.com/Azure/unbounded/pkg/agent/internal/utilexec"
 	"github.com/Azure/unbounded/pkg/agent/phases"
-	"github.com/Azure/unbounded/pkg/agent/utilexec"
 )
 
 // knownOverlayInterfaces lists the tunnel and overlay interfaces created by

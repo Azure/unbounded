@@ -15,8 +15,8 @@ import (
 	"oras.land/oras-go/v2/registry/remote"
 
 	"github.com/Azure/unbounded/internal/ociutil"
+	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 	"github.com/Azure/unbounded/pkg/agent/phases"
-	"github.com/Azure/unbounded/pkg/agent/utilio"
 )
 
 type downloadRootFS struct {

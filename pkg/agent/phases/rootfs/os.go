@@ -10,8 +10,8 @@ import (
 	"path/filepath"
 
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 	"github.com/Azure/unbounded/pkg/agent/phases"
-	"github.com/Azure/unbounded/pkg/agent/utilio"
 )
 
 // /dev/kmsg workaround: kubelet expects /dev/kmsg for kernel log access, but
