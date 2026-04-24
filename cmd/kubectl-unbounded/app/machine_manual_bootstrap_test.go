@@ -677,17 +677,19 @@ func TestManualBootstrapHandler_InstallEnv(t *testing.T) {
 func TestManualBootstrapHandler_RenderScript_DownloadOverrides(t *testing.T) {
 	t.Parallel()
 
-	cfg := &provision.AgentConfig{
-		MachineName: "test-node",
-		Cluster: provision.AgentClusterConfig{
-			CaCertBase64: "dGVzdA==",
-			ClusterDNS:   "10.0.0.10",
-			Version:      "v1.30.0",
-		},
-		Kubelet: provision.AgentKubeletConfig{
-			ApiServer:      "https://api-server:6443",
-			BootstrapToken: "abc123.0123456789abcdef",
-			Labels:         map[string]string{"env": "prod"},
+	cfg := &provision.UnboundedAgentConfig{
+		AgentConfig: provision.AgentConfig{
+			MachineName: "test-node",
+			Cluster: provision.AgentClusterConfig{
+				CaCertBase64: "dGVzdA==",
+				ClusterDNS:   "10.0.0.10",
+				Version:      "v1.30.0",
+			},
+			Kubelet: provision.AgentKubeletConfig{
+				ApiServer:      "https://api-server:6443",
+				BootstrapToken: "abc123.0123456789abcdef",
+				Labels:         map[string]string{"env": "prod"},
+			},
 		},
 	}
 
@@ -718,16 +720,18 @@ func TestManualBootstrapHandler_RenderScript_DownloadOverrides(t *testing.T) {
 func TestManualBootstrapHandler_RenderCloudInit_DownloadOverrides(t *testing.T) {
 	t.Parallel()
 
-	cfg := &provision.AgentConfig{
-		MachineName: "test-node",
-		Cluster: provision.AgentClusterConfig{
-			CaCertBase64: "dGVzdA==",
-			ClusterDNS:   "10.0.0.10",
-			Version:      "v1.30.0",
-		},
-		Kubelet: provision.AgentKubeletConfig{
-			ApiServer:      "https://api-server:6443",
-			BootstrapToken: "abc123.0123456789abcdef",
+	cfg := &provision.UnboundedAgentConfig{
+		AgentConfig: provision.AgentConfig{
+			MachineName: "test-node",
+			Cluster: provision.AgentClusterConfig{
+				CaCertBase64: "dGVzdA==",
+				ClusterDNS:   "10.0.0.10",
+				Version:      "v1.30.0",
+			},
+			Kubelet: provision.AgentKubeletConfig{
+				ApiServer:      "https://api-server:6443",
+				BootstrapToken: "abc123.0123456789abcdef",
+			},
 		},
 	}
 
