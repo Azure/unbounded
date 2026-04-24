@@ -9,10 +9,10 @@ import (
 	"fmt"
 	"log/slog"
 
+	"github.com/Azure/unbounded/agent/config"
 	"github.com/Azure/unbounded/agent/goalstates"
 	"github.com/Azure/unbounded/agent/phases"
 	"github.com/Azure/unbounded/agent/utilio"
-	"github.com/Azure/unbounded/agent/config"
 )
 
 type persistAppliedConfig struct {

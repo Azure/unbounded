@@ -6,9 +6,9 @@ package nodestart
 import (
 	"log/slog"
 
+	"github.com/Azure/unbounded/agent/config"
 	"github.com/Azure/unbounded/agent/goalstates"
 	"github.com/Azure/unbounded/agent/phases"
-	"github.com/Azure/unbounded/agent/config"
 )
 
 // StartNode returns a composite task that configures and starts an nspawn
