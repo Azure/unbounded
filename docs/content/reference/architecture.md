@@ -1,12 +1,12 @@
 ---
 title: "Architecture"
 weight: 1
-description: "High-level architecture of Unbounded Kube."
+description: "High-level architecture of Unbounded."
 ---
 
 ## Overview
 
-Unbounded Kube extends a standard Kubernetes cluster so that worker Nodes can
+Unbounded extends a standard Kubernetes cluster so that worker Nodes can
 run in any environment -- cloud, on-premises, or edge -- and join back to a
 central control plane. It adds:
 

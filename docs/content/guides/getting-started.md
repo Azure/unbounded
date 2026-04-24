@@ -1,10 +1,10 @@
 ---
 title: "Getting Started"
 weight: 1
-description: "Create an AKS cluster with Unbounded Kube and join your first remote node."
+description: "Create an AKS cluster with Unbounded and join your first remote node."
 ---
 
-This guide creates an AKS cluster configured for Unbounded Kube and joins a
+This guide creates an AKS cluster configured for Unbounded and joins a
 remote node to it. You'll have a working multi-site cluster in a few minutes.
 
 ![Quickstart architecture: AKS cluster with gateway nodes connected to a remote site over WireGuard](../../img/quickstart-architecture.svg)
