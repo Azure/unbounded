@@ -148,7 +148,8 @@ func UpdateNode(ctx context.Context, log *slog.Logger, active *ActiveMachine, ne
 	err = phases.Serial(log,
 		rootfs.Provision(log, gs.RootFS),
 		nodestop.StopNode(log, oldMachine),
-		nodestart.StartNode(log, gs.NodeStart, newCfg),
+		nodestart.StartNode(log, gs.NodeStart),
+		PersistAppliedConfig(log, gs.NodeStart.MachineName, newCfg),
 		nodestart.WaitForKubelet(log, newMachine),
 		reset.CleanupMachine(log, oldMachine),
 	).Do(ctx)

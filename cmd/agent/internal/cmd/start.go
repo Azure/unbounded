@@ -15,6 +15,7 @@ import (
 	"github.com/Azure/unbounded/agent/phases/nodestart"
 	"github.com/Azure/unbounded/agent/phases/rootfs"
 	"github.com/Azure/unbounded/cmd/agent/internal/attest"
+	"github.com/Azure/unbounded/cmd/agent/internal/daemon"
 	"github.com/Azure/unbounded/internal/version"
 )
 
@@ -66,10 +67,13 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 				// Phase 2: rootfs
 				rootfs.Provision(log, rootFSGoalState),
 
-				// Phase 3: node-start (includes persisting the applied config).
-				nodestart.StartNode(log, nodeStartGoalState, &cfg.AgentConfig),
+				// Phase 3: node-start.
+				nodestart.StartNode(log, nodeStartGoalState),
 
-				// Phase 4: Enable and start the daemon that watches the
+				// Phase 4: Persist the applied config for drift detection.
+				daemon.PersistAppliedConfig(log, cfg.MachineName, &cfg.AgentConfig),
+
+				// Phase 5: Enable and start the daemon that watches the
 				// Machine CR for drift detection and reconciliation.
 				host.EnableDaemon(log),
 			}
