@@ -44,7 +44,7 @@ type deployPXEParams struct {
 func buildPXEDeployment(p deployPXEParams) *acappsv1.DeploymentApplyConfiguration {
 	name := "metalman-controller-" + p.Site
 	labels := map[string]string{
-		"app":                    "unbounded-pxe",
+		"app":                     "unbounded-pxe",
 		"unbounded-cloud.io/site": p.Site,
 	}
 
