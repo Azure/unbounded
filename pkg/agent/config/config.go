@@ -28,6 +28,8 @@ type AgentConfig struct {
 	MachineName string             `json:"MachineName"`
 	Cluster     AgentClusterConfig `json:"Cluster"`
 	Kubelet     AgentKubeletConfig `json:"Kubelet"`
+	CRI         CRIConfig          `json:"CRI"`
+	CNI         CNIConfig          `json:"CNI"`
 
 	// OCIImage is the fully-qualified OCI image reference (e.g.
 	// "ghcr.io/org/repo:tag") used to bootstrap the machine rootfs.
@@ -77,4 +79,30 @@ func (a *KubeletAuthInfo) Validate() error {
 		return fmt.Errorf("ExecCredential.Command is required")
 	}
 	return nil
+}
+
+// CRIConfig holds container runtime version overrides. Zero values fall
+// back to the library defaults in goalstates/constants.go.
+type CRIConfig struct {
+	Containerd ContainerdConfig `json:"Containerd"`
+	Runc       RuncConfig       `json:"Runc"`
+}
+
+// ContainerdConfig holds containerd-specific overrides.
+type ContainerdConfig struct {
+	// Version overrides the default containerd version (e.g. "2.0.4").
+	Version string `json:"Version,omitempty"`
+}
+
+// RuncConfig holds runc-specific overrides.
+type RuncConfig struct {
+	// Version overrides the default runc version (e.g. "1.1.12").
+	Version string `json:"Version,omitempty"`
+}
+
+// CNIConfig holds CNI plugin version overrides. Zero values fall back to
+// the library defaults in goalstates/constants.go.
+type CNIConfig struct {
+	// PluginVersion overrides the default CNI plugin version (e.g. "1.5.1").
+	PluginVersion string `json:"PluginVersion,omitempty"`
 }

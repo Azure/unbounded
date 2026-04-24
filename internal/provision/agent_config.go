@@ -17,6 +17,10 @@ type (
 	AgentClusterConfig = config.AgentClusterConfig
 	AgentKubeletConfig = config.AgentKubeletConfig
 	KubeletAuthInfo    = config.KubeletAuthInfo
+	CRIConfig          = config.CRIConfig
+	ContainerdConfig   = config.ContainerdConfig
+	RuncConfig         = config.RuncConfig
+	CNIConfig          = config.CNIConfig
 )
 
 // UnboundedAgentConfig extends the shared AgentConfig with unbounded-specific

@@ -50,6 +50,19 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 		return nil, fmt.Errorf("resolve kubelet config: %w", err)
 	}
 
+	containerdVersion := cfg.CRI.Containerd.Version
+	if containerdVersion == "" {
+		containerdVersion = ContainerdVersion
+	}
+	runcVersion := cfg.CRI.Runc.Version
+	if runcVersion == "" {
+		runcVersion = RunCVersion
+	}
+	cniVersion := cfg.CNI.PluginVersion
+	if cniVersion == "" {
+		cniVersion = CNIPluginVersion
+	}
+
 	rootFS := &RootFS{
 		MachineDir: filepath.Join("/var/lib/machines", machineName),
 		NSpawnConfigFile: filepath.Join(
@@ -64,9 +77,9 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 		HostArch:          runtime.GOARCH,
 		HostKernel:        kernel,
 		Hostname:          hostname,
-		ContainerdVersion: ContainerdVersion,
-		RunCVersion:       RunCVersion,
-		CNIPluginVersion:  CNIPluginVersion,
+		ContainerdVersion: containerdVersion,
+		RunCVersion:       runcVersion,
+		CNIPluginVersion:  cniVersion,
 		KubernetesVersion: cfg.Cluster.Version,
 		OCIImage:          ociImage,
 		Nvidia:            nvidia,

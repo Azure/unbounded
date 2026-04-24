@@ -4,6 +4,7 @@
 package config
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -73,4 +74,49 @@ func TestKubeletAuthInfo_Validate(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCRIConfig_JSONRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	cfg := AgentConfig{
+		MachineName: "test",
+		CRI: CRIConfig{
+			Containerd: ContainerdConfig{Version: "2.1.0"},
+			Runc:       RuncConfig{Version: "1.2.0"},
+		},
+		CNI: CNIConfig{PluginVersion: "1.6.0"},
+	}
+
+	data, err := json.Marshal(cfg)
+	require.NoError(t, err)
+
+	var decoded AgentConfig
+	require.NoError(t, json.Unmarshal(data, &decoded))
+
+	assert.Equal(t, "2.1.0", decoded.CRI.Containerd.Version)
+	assert.Equal(t, "1.2.0", decoded.CRI.Runc.Version)
+	assert.Equal(t, "1.6.0", decoded.CNI.PluginVersion)
+}
+
+func TestCRIConfig_OmittedWhenEmpty(t *testing.T) {
+	t.Parallel()
+
+	cfg := AgentConfig{MachineName: "test"}
+
+	data, err := json.Marshal(cfg)
+	require.NoError(t, err)
+
+	var parsed map[string]interface{}
+	require.NoError(t, json.Unmarshal(data, &parsed))
+
+	// CRI sub-structs should have no version keys when empty (omitempty).
+	cri := parsed["CRI"].(map[string]interface{})
+	containerd := cri["Containerd"].(map[string]interface{})
+	assert.NotContains(t, containerd, "Version")
+	runc := cri["Runc"].(map[string]interface{})
+	assert.NotContains(t, runc, "Version")
+
+	cni := parsed["CNI"].(map[string]interface{})
+	assert.NotContains(t, cni, "PluginVersion")
 }
