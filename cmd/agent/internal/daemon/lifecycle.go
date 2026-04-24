@@ -10,10 +10,10 @@ import (
 	"log/slog"
 	"path/filepath"
 
-	"github.com/Azure/unbounded/agent/goalstates"
-	"github.com/Azure/unbounded/agent/phases"
-	"github.com/Azure/unbounded/agent/utilexec"
-	"github.com/Azure/unbounded/agent/utilio"
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/phases"
+	"github.com/Azure/unbounded/pkg/agent/utilexec"
+	"github.com/Azure/unbounded/pkg/agent/utilio"
 )
 
 // ---------------------------------------------------------------------------

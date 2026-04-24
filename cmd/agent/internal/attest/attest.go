@@ -21,8 +21,8 @@ import (
 	"github.com/google/go-tpm/tpm2/transport"
 	"github.com/google/go-tpm/tpm2/transport/linuxtpm"
 
-	"github.com/Azure/unbounded/agent/goalstates"
-	"github.com/Azure/unbounded/agent/phases"
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/phases"
 	"github.com/Azure/unbounded/internal/provision"
 )
 
