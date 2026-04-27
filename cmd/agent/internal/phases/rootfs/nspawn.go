@@ -9,6 +9,7 @@ import (
 	"embed"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"text/template"
 
 	"github.com/Azure/unbounded/cmd/agent/internal/goalstates"
@@ -68,6 +69,9 @@ func (e *ensureNSpawnWorkspace) bootstrapWorkspace(ctx context.Context) error {
 // service-override.conf templates. Using a struct (rather than map[string]any)
 // lets us attach helper methods that the templates can call directly.
 type nspawnTemplateData struct {
+	// MachineName is the nspawn machine name (e.g. "kube1"). Used by the
+	// service drop-in for the ExecStartPre `machinectl terminate` cleanup.
+	MachineName          string
 	HostDevicePaths      []string
 	NvidiaGPUDevicePaths []string
 	NvidiaLibDirMounts   []goalstates.NvidiaLibDirMount
@@ -77,6 +81,10 @@ type nspawnTemplateData struct {
 // device and GPU data (when present) and writes them to their configured paths.
 func (e *ensureNSpawnWorkspace) writeNSpawnConfigs() error {
 	templateData := nspawnTemplateData{
+		// MachineName is the basename of MachineDir (e.g. "kube1" from
+		// "/var/lib/machines/kube1"); nspawn always names the machine
+		// after that directory.
+		MachineName:          filepath.Base(e.goalState.MachineDir),
 		HostDevicePaths:      e.goalState.HostDevicePaths,
 		NvidiaGPUDevicePaths: e.goalState.Nvidia.GPUDevicePaths,
 		NvidiaLibDirMounts:   e.goalState.Nvidia.LibDirMounts,
