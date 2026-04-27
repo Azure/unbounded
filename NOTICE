@@ -246,6 +246,13 @@ notices:
         link: https://github.com/google/go-tpm-tools/blob/v0.4.8/LICENSE
       - name: BSD 2-Clause License
         link: https://github.com/google/go-tpm-tools/blob/v0.4.8/LICENSE
+  - dependency: github.com/google/licensecheck
+    ecosystem: go
+    copyright:
+      - Copyright (c) 2019 The Go Authors. All rights reserved.
+    license:
+      - name: BSD 3-Clause License
+        link: https://github.com/google/licensecheck/blob/v0.3.1/LICENSE
   - dependency: github.com/google/renameio/v2
     ecosystem: go
     copyright:
@@ -334,6 +341,13 @@ notices:
     license:
       - name: BSD 3-Clause License
         link: https://go.googlesource.com/crypto
+  - dependency: golang.org/x/mod
+    ecosystem: go
+    copyright:
+      - Copyright 2009 The Go Authors.
+    license:
+      - name: BSD 3-Clause License
+        link: https://go.googlesource.com/mod
   - dependency: golang.org/x/sync
     ecosystem: go
     copyright:
