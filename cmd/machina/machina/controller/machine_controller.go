@@ -215,9 +215,9 @@ type MachineReconciler struct {
 	ProvisioningTimeoutDuration time.Duration
 }
 
-// +kubebuilder:rbac:groups=unbounded-kube.io,resources=machines,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=unbounded-kube.io,resources=machines/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=unbounded-kube.io,resources=machines/finalizers,verbs=update
+// +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machines,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machines/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machines/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 
 // Reconcile handles Machine reconciliation: reachability checks and provisioning.

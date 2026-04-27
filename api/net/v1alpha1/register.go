@@ -10,7 +10,7 @@ import (
 )
 
 // GroupName is the group name used in this package
-const GroupName = "net.unbounded-kube.io"
+const GroupName = "net.unbounded-cloud.io"
 
 var (
 	// GroupVersion is group version used to register these objects.

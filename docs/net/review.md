@@ -109,10 +109,10 @@ request.userInfo.extra["authentication.kubernetes.io/node-name"][0] == object.me
 ### Object Creation Restrictions (RBAC items 32, 46 follow-up)
 Restrict the controller to only creating CRDs, secrets, webhooks, and API services
 with expected names (closing the RBAC gap where `create` cannot use `resourceNames`):
-- CRDs: `object.metadata.name.endsWith(".net.unbounded-kube.io")`
+- CRDs: `object.metadata.name.endsWith(".net.unbounded-cloud.io")`
 - Secrets: `object.metadata.name == "unbounded-net-serving-cert"`
 - ValidatingWebhookConfigurations: `object.metadata.name == "unbounded-net-validating-webhook"`
-- APIServices: `object.metadata.name == "v1alpha1.status.net.unbounded-kube.io"`
+- APIServices: `object.metadata.name == "v1alpha1.status.net.unbounded-cloud.io"`
 - EndpointSlices: `object.metadata.name == "unbounded-net-controller"`
 - GatewayPoolNodes: node agent can only create objects matching its own node name
 

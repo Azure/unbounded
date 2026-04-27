@@ -4,7 +4,7 @@ weight: 2
 description: "API reference for the Machine custom resource."
 ---
 
-API group: `unbounded-kube.io/v1alpha3`
+API group: `unbounded-cloud.io/v1alpha3`
 
 This document describes the custom resource definition shipped with the project: **Machine**.
 
@@ -132,22 +132,22 @@ The machina controller drives the following phases:
 
 | Label | Applied to | Description |
 |-------|-----------|-------------|
-| `unbounded-kube.io/machine` | Node | Maps the Node back to its Machine CR. Set during provisioning. |
-| `unbounded-kube.io/site` | Machine | Scopes a metalman instance to a subset of Machines. |
-| `unbounded-kube.io/default-bootstrap-token` | Secret | Marks a Secret as the default bootstrap token for auto-discovery. |
+| `unbounded-cloud.io/machine` | Node | Maps the Node back to its Machine CR. Set during provisioning. |
+| `unbounded-cloud.io/site` | Machine | Scopes a metalman instance to a subset of Machines. |
+| `unbounded-cloud.io/default-bootstrap-token` | Secret | Marks a Secret as the default bootstrap token for auto-discovery. |
 
 **Annotations:**
 
 | Annotation | Description |
 |-----------|-------------|
-| `unbounded-kube.io/provider` | Associates a Machine with a provider controller (extension point). |
+| `unbounded-cloud.io/provider` | Associates a Machine with a provider controller (extension point). |
 
 ### Examples
 
 **Minimal SSH-only Machine:**
 
 ```yaml
-apiVersion: unbounded-kube.io/v1alpha3
+apiVersion: unbounded-cloud.io/v1alpha3
 kind: Machine
 metadata:
   name: worker-01
@@ -166,7 +166,7 @@ spec:
 **SSH with bastion:**
 
 ```yaml
-apiVersion: unbounded-kube.io/v1alpha3
+apiVersion: unbounded-cloud.io/v1alpha3
 kind: Machine
 metadata:
   name: worker-02
@@ -190,12 +190,12 @@ spec:
 **PXE / bare-metal Machine:**
 
 ```yaml
-apiVersion: unbounded-kube.io/v1alpha3
+apiVersion: unbounded-cloud.io/v1alpha3
 kind: Machine
 metadata:
   name: baremetal-01
   labels:
-    unbounded-kube.io/site: lab
+    unbounded-cloud.io/site: lab
 spec:
   ssh:
     host: "10.0.0.60"

@@ -359,7 +359,7 @@ func openBrowser(rawURL string) {
 	_ = cmd.Start() //nolint:errcheck
 }
 
-const viewerTokenEndpointPath = "/apis/status.net.unbounded-kube.io/v1alpha1/token/viewer"
+const viewerTokenEndpointPath = "/apis/status.net.unbounded-cloud.io/v1alpha1/token/viewer"
 
 // viewerTokenResponse is the JSON response from the viewer token endpoint.
 type viewerTokenResponse struct {

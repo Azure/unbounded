@@ -45,7 +45,7 @@ data:
       statusWebsocketEnabled: {{ default "true" .NodeStatusWebsocketEnabled }}
       statusWebsocketURL: "{{ default "" .NodeStatusWebsocketURL }}"
       statusWebsocketApiserverMode: "{{ default "fallback" .NodeStatusWebsocketApiserverMode }}"
-      statusWebsocketApiserverURL: "{{ default "wss://$(KUBERNETES_SERVICE_HOST)/apis/status.net.unbounded-kube.io/v1alpha1/status/nodews" .NodeStatusWebsocketApiserverURL }}"
+      statusWebsocketApiserverURL: "{{ default "wss://$(KUBERNETES_SERVICE_HOST)/apis/status.net.unbounded-cloud.io/v1alpha1/status/nodews" .NodeStatusWebsocketApiserverURL }}"
       statusWebsocketApiserverStartupDelay: "{{ default "60s" .NodeStatusWebsocketApiserverStartupDelay }}"
       statusWebsocketKeepaliveInterval: "{{ default "10s" .NodeStatusWebsocketKeepaliveInterval }}"
       statusWsKeepaliveFailureCount: {{ default "2" .NodeStatusWsKeepaliveFailureCount }}

@@ -19,7 +19,7 @@ resulting Node.
 
 - A working kubeconfig for the cluster
 - The `kubectl-unbounded` plugin built and on your `PATH`
-- At least one cluster node labeled `unbounded-kube.io/unbounded-net-gateway=true` for WireGuard gateway traffic
+- At least one cluster node labeled `unbounded-cloud.io/unbounded-net-gateway=true` for WireGuard gateway traffic
 - UDP ports 51820-51899 open on gateway nodes for WireGuard
 
 ## Cluster Setup
@@ -27,10 +27,10 @@ resulting Node.
 Run `kubectl unbounded site init` to prepare the cluster and create a new site.
 This single command handles:
 
-- Validating that a gateway node exists (label `unbounded-kube.io/unbounded-net-gateway=true`)
+- Validating that a gateway node exists (label `unbounded-cloud.io/unbounded-net-gateway=true`)
 - Installing the unbounded-net CNI plugin
 - Creating site resources for both the cluster and the new site
-- Creating a **bootstrap token** Secret in `kube-system` (labeled `unbounded-kube.io/site=<name>`)
+- Creating a **bootstrap token** Secret in `kube-system` (labeled `unbounded-cloud.io/site=<name>`)
 - Installing the **machina controller** in the `unbounded-kube` namespace
 
 ```bash
@@ -91,7 +91,7 @@ Bastion-related flags are covered in the [Bastion Hosts](#bastion-hosts) section
 The `machine register` command produces and applies a manifest like this:
 
 ```yaml
-apiVersion: unbounded-kube.io/v1alpha3
+apiVersion: unbounded-cloud.io/v1alpha3
 kind: Machine
 metadata:
   name: mysite-worker-01
@@ -113,7 +113,7 @@ The `kubernetes.version` is resolved automatically from the cluster's API
 server version. The `bootstrapTokenRef` references the bootstrap token created
 by `site init` for the site; the controller reads it from `kube-system`.
 
-See the [CRD Reference]({{< relref "/reference" >}}) for the full list of fields.
+See the [CRD Reference]({{< relref "reference/machina-crd" >}}) for the full list of fields.
 
 ## Bastion Hosts
 
@@ -144,7 +144,7 @@ is only created when the bastion uses a different key file and a different secre
 name.
 
 ```yaml
-apiVersion: unbounded-kube.io/v1alpha3
+apiVersion: unbounded-cloud.io/v1alpha3
 kind: Machine
 metadata:
   name: mysite-worker-behind-bastion
@@ -176,7 +176,7 @@ Machines move through phases: **Pending** &rarr; **Provisioning** &rarr; **Joini
 |---|---|
 | **Pending** | SSH unreachable; retries every 30 s. |
 | **Provisioning** | SSH session active, install script running on target. |
-| **Joining** | Script succeeded; waiting for the Node to register with label `unbounded-kube.io/machine=<name>` (polls every 30 s). |
+| **Joining** | Script succeeded; waiting for the Node to register with label `unbounded-cloud.io/machine=<name>` (polls every 30 s). |
 | **Ready** | Node exists and is tracked (re-checked every 5 min; reverts to Joining if the Node disappears). |
 | **Failed** | SSH or script error; retries every 60 s with no limit. |
 | **Rebooting** | Machine is undergoing a reboot operation (used by the metalman bare-metal controller). |

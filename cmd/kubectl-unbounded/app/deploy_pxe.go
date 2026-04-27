@@ -44,8 +44,8 @@ type deployPXEParams struct {
 func buildPXEDeployment(p deployPXEParams) *acappsv1.DeploymentApplyConfiguration {
 	name := "metalman-controller-" + p.Site
 	labels := map[string]string{
-		"app":                    "unbounded-pxe",
-		"unbounded-kube.io/site": p.Site,
+		"app":                     "unbounded-pxe",
+		"unbounded-cloud.io/site": p.Site,
 	}
 
 	return acappsv1.Deployment(name, deployPXENamespace).
@@ -69,7 +69,7 @@ func buildPXEDeployment(p deployPXEParams) *acappsv1.DeploymentApplyConfiguratio
 					WithHostNetwork(true).
 					WithDNSPolicy(corev1.DNSClusterFirstWithHostNet).
 					WithNodeSelector(map[string]string{
-						"unbounded-kube.io/site": p.Site,
+						"unbounded-cloud.io/site": p.Site,
 					}).
 					WithTolerations(accorev1.Toleration().
 						WithKey("CriticalAddonsOnly").
@@ -201,7 +201,7 @@ unbounded-kube namespace.`,
 	}
 
 	cmd.Flags().StringVar(&handler.kubeconfigPath, "kubeconfig", "", "Path to kubeconfig file")
-	cmd.Flags().StringVar(&handler.site, "site", "", "Site name (required; scopes the PXE instance to machines labeled unbounded-kube.io/site=<site>)")
+	cmd.Flags().StringVar(&handler.site, "site", "", "Site name (required; scopes the PXE instance to machines labeled unbounded-cloud.io/site=<site>)")
 	cmd.Flags().StringVar(&handler.image, "image", MetalmanImage, "Container image for the PXE deployment")
 
 	if err := cmd.MarkFlagRequired("site"); err != nil {

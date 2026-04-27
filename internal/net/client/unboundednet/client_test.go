@@ -32,7 +32,7 @@ func mustUnstructured(t *testing.T, obj interface{}, kind string) *unstructured.
 	}
 
 	u := &unstructured.Unstructured{Object: m}
-	u.SetAPIVersion("net.unbounded-kube.io/v1alpha1")
+	u.SetAPIVersion("net.unbounded-cloud.io/v1alpha1")
 	u.SetKind(kind)
 
 	return u

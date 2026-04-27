@@ -79,7 +79,7 @@ func (da *dashboardAuthorizer) authorize(ctx context.Context, username string, g
 			Groups: groups,
 			ResourceAttributes: &authorizationv1.ResourceAttributes{
 				Verb:     "get",
-				Group:    "status.net.unbounded-kube.io",
+				Group:    "status.net.unbounded-cloud.io",
 				Resource: "status",
 				Name:     "dashboard",
 			},
@@ -149,7 +149,7 @@ func (da *dashboardAuthorizer) evictCacheLocked(now time.Time) {
 // dashboard endpoints. When requireDashboardAuth is false, all requests are
 // allowed. Otherwise, the bearer token is validated as an HMAC viewer token
 // and a SubjectAccessReview is performed to check for the
-// status.net.unbounded-kube.io/status "get" permission on the "dashboard" resource.
+// status.net.unbounded-cloud.io/status "get" permission on the "dashboard" resource.
 func authorizeDashboardRequest(requireDashboardAuth bool, tokenIssuer *authn.TokenIssuer, authorizer *dashboardAuthorizer, r *http.Request) bool {
 	if !requireDashboardAuth {
 		return true

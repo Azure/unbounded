@@ -850,7 +850,7 @@ func TestMaterializeEmbeddedFS(t *testing.T) {
 
 	// Verify CRD subdirectory files exist.
 	for _, name := range []string{
-		"crd/unbounded-kube.io_machines.yaml",
+		"crd/unbounded-cloud.io_machines.yaml",
 	} {
 		info, err := os.Stat(filepath.Join(dir, name))
 		require.NoError(t, err, "expected %s to exist", name)

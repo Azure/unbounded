@@ -34,7 +34,7 @@ func (t BootstrapToken) String() string {
 
 func GetBootstrapToken(ctx context.Context, kubeCli kubernetes.Interface) (*BootstrapToken, error) {
 	listOptions := metav1.ListOptions{
-		LabelSelector: "unbounded-kube.io/default-bootstrap-token=true",
+		LabelSelector: "unbounded-cloud.io/default-bootstrap-token=true",
 	}
 
 	secrets, err := kubeCli.CoreV1().Secrets(metav1.NamespaceSystem).List(ctx, listOptions)
@@ -89,7 +89,7 @@ metadata:
   name: bootstrap-token-%[1]s
   namespace: kube-system
   labels:
-    unbounded-kube.io/default-bootstrap-token: "true"
+    unbounded-cloud.io/default-bootstrap-token: "true"
 type: bootstrap.kubernetes.io/token
 stringData:
   token-id: "%[1]s"

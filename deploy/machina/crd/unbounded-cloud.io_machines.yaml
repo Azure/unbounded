@@ -6,9 +6,9 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.20.1
-  name: machines.unbounded-kube.io
+  name: machines.unbounded-cloud.io
 spec:
-  group: unbounded-kube.io
+  group: unbounded-cloud.io
   names:
     kind: Machine
     listKind: MachineList

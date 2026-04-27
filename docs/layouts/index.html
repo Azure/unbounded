@@ -1,109 +1,387 @@
 {{ define "main" }}
 <section class="hero">
-  <h1 class="hero-title">Kubernetes Without Boundaries</h1>
-  <p class="tagline">
-    Add any Linux machine to your Kubernetes cluster &mdash; cloud, on-prem,
-    bare metal, or edge &mdash; no matter where it lives or what network it's on.
-  </p>
-  <div class="hero-diagram">
-    <img src="{{ "img/unbounded-overview.svg" | relURL }}"
-         alt="Three sites — bare metal, public cloud, and AI infrastructure — connected to a central Kubernetes control plane through WireGuard tunnels and direct L3 links."
-         width="960" height="480" />
-  </div>
-  <div class="hero-links">
-    <a href="{{ "guides/getting-started/" | relURL }}" class="btn btn-primary">Get Started</a>
-    <a href="{{ "concepts/" | relURL }}" class="btn btn-secondary">Learn the Concepts</a>
+  <div class="hero-layout">
+    <div class="hero-content">
+      <h1 class="hero-title">Kubernetes Without Boundaries</h1>
+      <p class="tagline">
+        Add any Linux machine to your Kubernetes cluster - cloud, on-prem,
+        bare metal, or edge - no matter where it lives or what network it's on.
+      </p>
+      <div class="hero-links">
+        <a href="{{ "guides/getting-started/" | relURL }}" class="btn btn-primary">Get Started</a>
+        <a href="https://github.com/Azure/unbounded" target="_blank" rel="noopener" class="btn btn-secondary">GitHub</a>
+      </div>
+    </div>
+    <div class="hero-visual">
+      <img src="{{ "img/unbounded-overview.svg" | relURL }}"
+           alt="Three sites - bare metal, public cloud, and AI infrastructure - connected to a central Kubernetes control plane through WireGuard tunnels and direct L3 links."
+           width="960" height="480" />
+    </div>
   </div>
 </section>
 
-<section class="home-components">
-  <h2>How It Works</h2>
-  <p class="home-components-lead">Four provisioning paths, one control plane.</p>
-  <div class="grid grid-4">
-    <div class="card">
-      <h3>machina</h3>
-      <p>Provisions remote machines over SSH. Point it at a Linux host and it handles kubelet install, bootstrap, and node lifecycle.</p>
-      <a href="{{ "guides/ssh" | relURL }}">SSH Guide &rarr;</a>
+<section class="home-features">
+  <h2>Key Features</h2>
+  <div class="features-grid">
+    <div class="feature">
+      <svg class="feature-icon feature-icon-networking" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10A15.3 15.3 0 0 1 12 2z"/></svg>
+      <h3>Multi-Site Networking</h3>
+      <p>Transparent pod-to-pod connectivity across sites using WireGuard, GENEVE, VXLAN, IPIP, or direct routing with an eBPF dataplane.</p>
     </div>
-    <div class="card">
-      <h3>cloud&#8209;init</h3>
-      <p>Spin up GPU and compute instances on Nebius, CoreWeave, OCI, Azure, AWS, and more. Nodes join automatically on first boot via cloud&#8209;init user&#8209;data.</p>
-      <a href="{{ "guides/cloud-api" | relURL }}">Cloud API Guide &rarr;</a>
+    <div class="feature">
+      <svg class="feature-icon feature-icon-ssh" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+      <h3>SSH-Based Provisioning</h3>
+      <p>Join existing Linux machines to the cluster over SSH with a single command.</p>
     </div>
-    <div class="card">
-      <h3>metalman</h3>
-      <p>PXE-boots bare-metal servers with bundled DHCP, TFTP, and HTTP. Integrates Redfish BMC and TPM&nbsp;2.0 attestation.</p>
-      <a href="{{ "concepts/bare-metal" | relURL }}">Bare Metal &rarr;</a>
+    <div class="feature">
+      <svg class="feature-icon feature-icon-cloud" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/></svg>
+      <h3>Cloud API Provisioning</h3>
+      <p>Auto-provision instances from Nebius, CoreWeave, OCI, Azure, AWS, and others in response to unschedulable pods.</p>
     </div>
-    <div class="card">
-      <h3>unbounded-net</h3>
-      <p>CNI plugin providing pod-to-pod connectivity across sites via WireGuard, GENEVE, VXLAN, or IPIP tunnels.</p>
-      <a href="{{ "concepts/networking" | relURL }}">Networking &rarr;</a>
+    <div class="feature">
+      <svg class="feature-icon feature-icon-pxe" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><circle cx="6" cy="6" r="1" fill="currentColor"/><circle cx="6" cy="18" r="1" fill="currentColor"/></svg>
+      <h3>Bare-Metal PXE Boot</h3>
+      <p>PXE-boot servers with integrated DHCP, TFTP, HTTP, Redfish BMC power management, and TPM 2.0 attestation.</p>
+    </div>
+    <div class="feature">
+      <svg class="feature-icon feature-icon-k8s" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 3v3.6"/><path d="M12 17.4V21"/><path d="M3 12h3.6"/><path d="M17.4 12H21"/><path d="M5.6 5.6l2.6 2.6"/><path d="M15.8 15.8l2.6 2.6"/><path d="M18.4 5.6l-2.6 2.6"/><path d="M8.2 15.8l-2.6 2.6"/></svg>
+      <h3>Any Conformant Kubernetes</h3>
+      <p>AKS, EKS, GKE, kubeadm, k3s, and more. Bring your own cluster or use the quickstart script.</p>
+    </div>
+    <div class="feature">
+      <svg class="feature-icon feature-icon-gpu" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/><path d="M9 1v3"/><path d="M15 1v3"/><path d="M9 20v3"/><path d="M15 20v3"/><path d="M20 9h3"/><path d="M20 15h3"/><path d="M1 9h3"/><path d="M1 15h3"/></svg>
+      <h3>GPU Support</h3>
+      <p>Automatic detection and configuration of NVIDIA GPUs on provisioned nodes.</p>
     </div>
   </div>
+</section>
+
+<section class="capabilities">
+  <h2>What you can do with it</h2>
+  <div class="carousel">
+    <div class="carousel-tabs">
+      <button class="carousel-tab active" data-slide="0">Add any compute</button>
+      <button class="carousel-tab" data-slide="1">Connect sites</button>
+      <button class="carousel-tab" data-slide="2">Manage with Kubernetes</button>
+    </div>
+    <div class="carousel-slides">
+      <div class="carousel-slide active" data-index="0">
+        <div class="cap-text">
+          <p>Bring on-prem servers, bare-metal machines, cloud instances, and edge devices into your Kubernetes cluster. Provision over SSH, cloud API, or PXE boot.</p>
+        </div>
+        <div class="terminal-demo">
+          <div class="terminal-chrome">
+            <div class="terminal-dots"><span class="dot dot-red"></span><span class="dot dot-yellow"></span><span class="dot dot-green"></span></div>
+            <span class="terminal-title">unbounded</span>
+          </div>
+          <div class="terminal-body cap-term" id="cap-term-0"></div>
+        </div>
+      </div>
+      <div class="carousel-slide" data-index="1">
+        <div class="cap-text">
+          <p>Automatically enables the Kubernetes networking model across all your sites. Works with your existing L3 interconnects, or uses WireGuard, GENEVE, VXLAN, or IPIP tunnels with an eBPF dataplane.</p>
+        </div>
+        <div class="terminal-demo">
+          <div class="terminal-chrome">
+            <div class="terminal-dots"><span class="dot dot-red"></span><span class="dot dot-yellow"></span><span class="dot dot-green"></span></div>
+            <span class="terminal-title">unbounded</span>
+          </div>
+          <div class="terminal-body cap-term" id="cap-term-1"></div>
+        </div>
+      </div>
+      <div class="carousel-slide" data-index="2">
+        <div class="cap-text">
+          <p>Everything is a custom resource. Reboot nodes, track operations, and manage lifecycle declaratively using standard kubectl commands and CRDs.</p>
+        </div>
+        <div class="terminal-demo">
+          <div class="terminal-chrome">
+            <div class="terminal-dots"><span class="dot dot-red"></span><span class="dot dot-yellow"></span><span class="dot dot-green"></span></div>
+            <span class="terminal-title">unbounded</span>
+          </div>
+          <div class="terminal-body cap-term" id="cap-term-2"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <script>
+  (function() {
+    var CMD_CHAR_MS = 18;
+    var OUTPUT_LINE_MS = 60;
+    var PAUSE_AFTER_CMD = 400;
+    var PAUSE_AFTER_OUTPUT = 120;
+    var PAUSE_BEFORE_RESTART = 6000;
+
+    var sequences = [
+      // Slide 0: Add any compute
+      [
+        {type:'comment', text:'# Join a bare-metal server over SSH'},
+        {type:'cmd', text:'kubectl unbounded machine manual-bootstrap gpu-node-1 \\'},
+        {type:'cmd-cont', text:'    --site dc-east \\'},
+        {type:'cmd-cont', text:'    | ssh admin@10.0.50.12 sudo bash'},
+        {type:'blank'},
+        {type:'comment', text:'# Auto-provision cloud GPU instances'},
+        {type:'cmd', text:'kubectl apply -f gpu-nodepool.yaml'},
+        {type:'output', text:'nodepool/gpu-on-demand created'},
+        {type:'blank'},
+        {type:'cmd', text:'kubectl get machines'},
+        {type:'header', text:'NAME          HOST          PHASE   K8S VERSION   AGE'},
+        {type:'output', text:'gpu-node-1    10.0.50.12    Ready   v1.32.3       5m'},
+        {type:'output', text:'cw-a100-01    10.1.20.5     Ready   v1.32.3       2m'},
+        {type:'output', text:'nb-h100-01    10.2.10.8     Ready   v1.32.3       45s'}
+      ],
+      // Slide 1: Connect sites
+      [
+        {type:'comment', text:'# Sites discover each other and establish connectivity'},
+        {type:'cmd', text:'kubectl get sites'},
+        {type:'header', text:'NAME        NODE CIDRS        POD CIDR ASSIGNMENTS   NODES   AGE'},
+        {type:'output', text:'aks-east    [10.224.0.0/16]   [10.244.0.0/16]        3       24h'},
+        {type:'output', text:'dc-east     [10.0.50.0/24]    [10.245.0.0/16]        4       12h'},
+        {type:'output', text:'eu-north    [10.2.10.0/24]    [10.246.0.0/16]        2       6h'},
+        {type:'blank'},
+        {type:'comment', text:'# Pods communicate across sites like they\'re local'},
+        {type:'cmd', text:'kubectl exec -n app frontend-7b -- curl -s backend.app:8080'},
+        {type:'output', text:'{"status":"ok","from":"aks-east","to":"dc-east","latency":"2ms"}'}
+      ],
+      // Slide 2: Manage with Kubernetes
+      [
+        {type:'comment', text:'# Soft-reboot a machine'},
+        {type:'cmd', text:'kubectl unbounded machine soft-reboot gpu-node-1'},
+        {type:'output', text:'  --> Soft-rebooting Machine gpu-node-1...'},
+        {type:'output', text:'  operation         gpu-node-1-softreboot-1776734492'},
+        {type:'output', text:'  --> Operation SoftReboot: completed'},
+        {type:'output', text:'  ready'},
+        {type:'blank'},
+        {type:'comment', text:'# Upgrade Kubernetes by patching the Machine CR'},
+        {type:'cmd', text:'kubectl patch machine gpu-node-1 --type merge \\'},
+        {type:'cmd-cont', text:'    -p \'{"spec":{"kubernetesVersion":"v1.33.0"}}\''},
+        {type:'output', text:'machine.unbounded-cloud.io/gpu-node-1 patched'},
+        {type:'blank'},
+        {type:'cmd', text:'kubectl get machines'},
+        {type:'header', text:'NAME          HOST          PHASE      K8S VERSION   AGE'},
+        {type:'output', text:'gpu-node-1    10.0.50.12    Updating   v1.33.0       5h'},
+        {type:'output', text:'gpu-node-2    10.0.50.13    Ready      v1.32.3       4h'},
+        {type:'blank'},
+        {type:'comment', text:'# Agent detects drift and blue/green swaps the node'},
+        {type:'cmd', text:'kubectl get machines'},
+        {type:'header', text:'NAME          HOST          PHASE   K8S VERSION   AGE'},
+        {type:'output', text:'gpu-node-1    10.0.50.12    Ready   v1.33.0       5h'},
+        {type:'output', text:'gpu-node-2    10.0.50.13    Ready   v1.32.3       4h'}
+      ]
+    ];
+
+    function escHtml(s) {
+      return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+
+    // Animation engine - returns a stop function
+    function animate(el, seq) {
+      var cancelled = false;
+      function stop() { cancelled = true; }
+
+      function run() {
+        if (cancelled) return;
+        el.innerHTML = '';
+        var idx = 0;
+
+        function next() {
+          if (cancelled || idx >= seq.length) {
+            if (!cancelled) setTimeout(run, PAUSE_BEFORE_RESTART);
+            return;
+          }
+          var item = seq[idx++];
+
+          if (item.type === 'blank') {
+            el.innerHTML += '\n';
+            setTimeout(next, 50);
+          }
+          else if (item.type === 'comment') {
+            el.innerHTML += '<span class="c">' + escHtml(item.text) + '</span>\n';
+            setTimeout(next, 100);
+          }
+          else if (item.type === 'cmd') {
+            var line = document.createElement('span');
+            line.className = 'term-line';
+            line.innerHTML = '<span class="prompt">$ </span>';
+            el.appendChild(line);
+            typeCmd(el, line, item.text, 0, function() {
+              line.innerHTML += '\n';
+              setTimeout(next, PAUSE_AFTER_CMD);
+            });
+          }
+          else if (item.type === 'cmd-cont') {
+            var line = document.createElement('span');
+            line.className = 'term-line';
+            line.innerHTML = '  ';
+            el.appendChild(line);
+            typeCmd(el, line, item.text, 0, function() {
+              line.innerHTML += '\n';
+              setTimeout(next, PAUSE_AFTER_CMD);
+            });
+          }
+          else if (item.type === 'header') {
+            el.innerHTML += '<span class="h">' + escHtml(item.text) + '</span>\n';
+            setTimeout(next, OUTPUT_LINE_MS);
+          }
+          else if (item.type === 'output') {
+            el.innerHTML += escHtml(item.text) + '\n';
+            el.scrollTop = el.scrollHeight;
+            setTimeout(next, PAUSE_AFTER_OUTPUT);
+          }
+        }
+
+        function typeCmd(container, lineEl, text, i, cb) {
+          if (cancelled) return;
+          if (i >= text.length) { cb(); return; }
+          lineEl.innerHTML = lineEl.innerHTML + escHtml(text[i]);
+          container.scrollTop = container.scrollHeight;
+          setTimeout(function() { typeCmd(container, lineEl, text, i+1, cb); }, CMD_CHAR_MS);
+        }
+
+        next();
+      }
+
+      run();
+      return stop;
+    }
+
+    // Carousel logic
+    var tabs = document.querySelectorAll('.carousel-tab');
+    var slides = document.querySelectorAll('.carousel-slide');
+    var currentStop = null;
+    var autoTimer;
+    var AUTO_MS = 12000;
+
+    function showSlide(idx) {
+      // Stop current animation
+      if (currentStop) { currentStop(); currentStop = null; }
+
+      tabs.forEach(function(t) { t.classList.remove('active'); });
+      slides.forEach(function(s) { s.classList.remove('active'); });
+      tabs[idx].classList.add('active');
+      slides[idx].classList.add('active');
+
+      // Start animation for this slide
+      var termEl = document.getElementById('cap-term-' + idx);
+      if (termEl) {
+        currentStop = animate(termEl, sequences[idx]);
+      }
+    }
+
+    function startAuto() {
+      clearInterval(autoTimer);
+      autoTimer = setInterval(function() {
+        var cur = document.querySelector('.carousel-tab.active');
+        var next = (parseInt(cur.dataset.slide) + 1) % tabs.length;
+        showSlide(next);
+      }, AUTO_MS);
+    }
+
+    tabs.forEach(function(tab) {
+      tab.addEventListener('click', function() {
+        showSlide(parseInt(tab.dataset.slide));
+        startAuto();
+      });
+    });
+
+    // Start first slide animation when visible
+    if ('IntersectionObserver' in window) {
+      var started = false;
+      var section = document.querySelector('.capabilities');
+      var obs = new IntersectionObserver(function(entries) {
+        if (entries[0].isIntersecting && !started) {
+          started = true;
+          showSlide(0);
+          startAuto();
+        }
+      }, {threshold: 0.2});
+      obs.observe(section);
+    } else {
+      showSlide(0);
+      startAuto();
+    }
+  })();
+  </script>
 </section>
 
 <section class="home-steps">
   <div class="home-steps-inner">
-    <h2>Get Up and Running</h2>
+    <h2>Quick Start</h2>
+    <p class="home-steps-lead">Get a working multi-site cluster in under 10 minutes. Already have a cluster? See the <a href="{{ "guides/existing-cluster/" | relURL }}">Bring Your Own Cluster</a> guide.</p>
     <ol class="steps-list">
       <li>
         <span class="step-num">1</span>
         <div>
-          <strong><a href="{{ "guides/getting-started/#install-kubectl-unbounded" | relURL }}">Install the kubectl plugin</a></strong>
-          <code class="step-output">$ kubectl unbounded --help</code>
+          <strong>Install the kubectl plugin</strong>
+          <div class="step-code">
+            <button class="copy-btn" aria-label="Copy to clipboard"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>
+            <code>curl -sL https://github.com/Azure/unbounded/releases/latest/download/kubectl-unbounded-linux-amd64.tar.gz | tar xz
+sudo mv kubectl-unbounded /usr/local/bin/</code>
+          </div>
         </div>
       </li>
       <li>
         <span class="step-num">2</span>
         <div>
-          <strong><a href="{{ "guides/getting-started/#initialize-a-site" | relURL }}">Initialize a site</a></strong>
-          <span class="step-desc">&mdash; sets up networking and the machina controller</span>
-          <code class="step-output">$ kubectl unbounded site init --name mysite ...</code>
+          <strong>Create the cluster</strong>
+          <div class="step-code">
+            <button class="copy-btn" aria-label="Copy to clipboard"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>
+            <code>curl -fsSLO https://raw.githubusercontent.com/Azure/unbounded/main/hack/scripts/aks-quickstart.sh
+chmod +x aks-quickstart.sh
+./aks-quickstart.sh create \
+    --name my-unbounded \
+    --location eastus \
+    --remote-node-cidr 192.168.1.0/24 \
+    --remote-pod-cidr 10.245.0.0/16</code>
+          </div>
         </div>
       </li>
       <li>
         <span class="step-num">3</span>
         <div>
-          <strong><a href="{{ "guides/getting-started/#add-machines" | relURL }}">Add machines</a></strong>
-          <span class="step-desc">&mdash; via SSH, cloud-init, or PXE</span>
-          <code class="step-output">$ kubectl unbounded machine register --host 10.0.0.5 ...</code>
+          <strong>Add a remote node</strong>
+          <div class="step-code">
+            <button class="copy-btn" aria-label="Copy to clipboard"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>
+            <code>kubectl unbounded machine manual-bootstrap my-node --site remote \
+    | ssh user@remote-host sudo bash</code>
+          </div>
+          <span class="step-note">Replace <em>user@remote-host</em> with the SSH user and IP of your remote machine.</span>
         </div>
       </li>
       <li>
         <span class="step-num">4</span>
         <div>
-          <strong>Watch them join</strong>
-          <span class="step-desc">&mdash; Pending &rarr; Provisioning &rarr; Joining &rarr; Ready</span>
-          <code class="step-output">$ kubectl get machines -w</code>
+          <strong>Verify</strong>
+          <div class="step-code">
+            <button class="copy-btn" aria-label="Copy to clipboard"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>
+            <code>kubectl get nodes -w</code>
+          </div>
         </div>
       </li>
     </ol>
+    <script>
+      document.querySelectorAll('.copy-btn').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+          var code = btn.closest('.step-code').querySelector('code').textContent;
+          navigator.clipboard.writeText(code).then(function() {
+            btn.classList.add('copied');
+            setTimeout(function() { btn.classList.remove('copied'); }, 1500);
+          });
+        });
+      });
+    </script>
+    <p class="home-steps-footer">For the full walkthrough, see the <a href="{{ "guides/getting-started/" | relURL }}">Getting Started Guide</a>.</p>
   </div>
 </section>
 
 <section class="overview">
   <h2>Explore the Docs</h2>
   <p class="overview-lead">Jump to what you need.</p>
+
+  <h3 class="docs-category">Get Started</h3>
   <div class="grid grid-3">
-    <a href="{{ "guides/ssh" | relURL }}" class="card card-link">
-      <h3>Add a Remote Node via SSH</h3>
-      <p>Point machina at any reachable Linux host and watch it join your cluster.</p>
-      <span class="card-arrow">&rarr;</span>
-    </a>
-    <a href="{{ "guides/pxe" | relURL }}" class="card card-link">
-      <h3>PXE Boot Bare-Metal Servers</h3>
-      <p>Netboot machines with metalman's DHCP, TFTP, and HTTP stack.</p>
-      <span class="card-arrow">&rarr;</span>
-    </a>
-    <a href="{{ "guides/cloud-api" | relURL }}" class="card card-link">
-      <h3>Connect Cloud Instances</h3>
-      <p>Spin up GPU or compute instances and have them join via cloud-init.</p>
-      <span class="card-arrow">&rarr;</span>
-    </a>
-    <a href="{{ "reference/networking/" | relURL }}" class="card card-link">
-      <h3>Set Up Cross-Site Networking</h3>
-      <p>WireGuard tunnels, GENEVE overlays, and eBPF routing across sites.</p>
+    <a href="{{ "guides/getting-started" | relURL }}" class="card card-link">
+      <h3>Getting Started Guide</h3>
+      <p>End-to-end walkthrough - from zero to a running multi-site cluster.</p>
       <span class="card-arrow">&rarr;</span>
     </a>
     <a href="{{ "guides/existing-cluster" | relURL }}" class="card card-link">
@@ -111,9 +389,47 @@
       <p>Add Unbounded to a cluster you already have running.</p>
       <span class="card-arrow">&rarr;</span>
     </a>
+    <a href="{{ "guides/ssh" | relURL }}" class="card card-link">
+      <h3>Add a Remote Node via SSH</h3>
+      <p>Point machina at any reachable Linux host and watch it join your cluster.</p>
+      <span class="card-arrow">&rarr;</span>
+    </a>
+  </div>
+
+  <h3 class="docs-category">Connect &amp; Scale</h3>
+  <div class="grid grid-3">
+    <a href="{{ "reference/networking/" | relURL }}" class="card card-link">
+      <h3>Set Up Cross-Site Networking</h3>
+      <p>WireGuard tunnels, GENEVE overlays, and eBPF routing across sites.</p>
+      <span class="card-arrow">&rarr;</span>
+    </a>
+    <a href="{{ "guides/cloud-api" | relURL }}" class="card card-link">
+      <h3>Connect Cloud Instances</h3>
+      <p>Spin up GPU or compute instances and have them join via cloud-init.</p>
+      <span class="card-arrow">&rarr;</span>
+    </a>
+    <a href="{{ "guides/pxe" | relURL }}" class="card card-link">
+      <h3>PXE Boot Bare-Metal Servers</h3>
+      <p>Netboot machines with metalman's DHCP, TFTP, and HTTP stack.</p>
+      <span class="card-arrow">&rarr;</span>
+    </a>
+  </div>
+
+  <h3 class="docs-category">Operate &amp; Reference</h3>
+  <div class="grid grid-3">
+    <a href="{{ "reference/machina-crd" | relURL }}" class="card card-link">
+      <h3>Reboot &amp; Upgrade Nodes</h3>
+      <p>Patch Machine specs to upgrade Kubernetes versions or trigger reboots.</p>
+      <span class="card-arrow">&rarr;</span>
+    </a>
+    <a href="{{ "reference/gpu/" | relURL }}" class="card card-link">
+      <h3>GPU Workloads</h3>
+      <p>Run GPU-accelerated workloads on remote nodes with automatic driver setup.</p>
+      <span class="card-arrow">&rarr;</span>
+    </a>
     <a href="{{ "reference/architecture" | relURL }}" class="card card-link">
-      <h3>Understand the Architecture</h3>
-      <p>Controllers, CRDs, provisioning flows, and network topology.</p>
+      <h3>Architecture &amp; CLI Reference</h3>
+      <p>Controllers, CRDs, provisioning flows, and the kubectl plugin.</p>
       <span class="card-arrow">&rarr;</span>
     </a>
   </div>

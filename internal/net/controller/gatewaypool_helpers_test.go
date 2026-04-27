@@ -337,7 +337,7 @@ func TestEnqueueHelpersAndPoolsCacheUpdate(t *testing.T) {
 	informer := cache.NewSharedIndexInformer(&cache.ListWatch{}, &unstructured.Unstructured{}, 0, cache.Indexers{})
 	valid := toGatewayPoolUnstructured(t, &unboundednetv1alpha1.GatewayPool{ObjectMeta: metav1.ObjectMeta{Name: "pool-a"}})
 	invalid := &unstructured.Unstructured{Object: map[string]interface{}{
-		"apiVersion": "net.unbounded-kube.io/v1alpha1",
+		"apiVersion": "net.unbounded-cloud.io/v1alpha1",
 		"kind":       "GatewayPool",
 		"metadata":   map[string]interface{}{"name": "pool-bad"},
 		"spec":       map[string]interface{}{"nodeSelector": "invalid-type"},
@@ -388,7 +388,7 @@ func TestEnqueueHelpersAndPoolsCacheUpdate(t *testing.T) {
 func TestUpdateGatewayPoolStatusPatchPaths(t *testing.T) {
 	scheme := runtime.NewScheme()
 	client := fake.NewSimpleDynamicClient(scheme, &unstructured.Unstructured{Object: map[string]interface{}{
-		"apiVersion": "net.unbounded-kube.io/v1alpha1",
+		"apiVersion": "net.unbounded-cloud.io/v1alpha1",
 		"kind":       "GatewayPool",
 		"metadata":   map[string]interface{}{"name": "pool-a"},
 	}})
@@ -491,7 +491,7 @@ func TestEnsureGatewayPoolNodeCreateAndPatch(t *testing.T) {
 	}
 
 	existingObj := &unstructured.Unstructured{Object: map[string]interface{}{
-		"apiVersion": "net.unbounded-kube.io/v1alpha1",
+		"apiVersion": "net.unbounded-cloud.io/v1alpha1",
 		"kind":       "GatewayPoolNode",
 		"metadata": map[string]interface{}{
 			"name": "node-a",
@@ -543,7 +543,7 @@ func TestCleanupStaleGatewayPoolNodesDeleteAndPreserve(t *testing.T) {
 	client := fake.NewSimpleDynamicClientWithCustomListKinds(scheme, map[schema.GroupVersionResource]string{
 		gatewayNodeGVR: "GatewayPoolNodeList",
 	}, &unstructured.Unstructured{Object: map[string]interface{}{
-		"apiVersion": "net.unbounded-kube.io/v1alpha1",
+		"apiVersion": "net.unbounded-cloud.io/v1alpha1",
 		"kind":       "GatewayPoolNode",
 		"metadata": map[string]interface{}{
 			"name": "stale-delete",
@@ -552,7 +552,7 @@ func TestCleanupStaleGatewayPoolNodesDeleteAndPreserve(t *testing.T) {
 			"gatewayPool": "pool-a",
 		},
 	}}, &unstructured.Unstructured{Object: map[string]interface{}{
-		"apiVersion": "net.unbounded-kube.io/v1alpha1",
+		"apiVersion": "net.unbounded-cloud.io/v1alpha1",
 		"kind":       "GatewayPoolNode",
 		"metadata": map[string]interface{}{
 			"name": "stale-preserve",
@@ -573,13 +573,13 @@ func TestCleanupStaleGatewayPoolNodesDeleteAndPreserve(t *testing.T) {
 
 	gwNodeIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
 	staleDelete := &unstructured.Unstructured{Object: map[string]interface{}{
-		"apiVersion": "net.unbounded-kube.io/v1alpha1",
+		"apiVersion": "net.unbounded-cloud.io/v1alpha1",
 		"kind":       "GatewayPoolNode",
 		"metadata":   map[string]interface{}{"name": "stale-delete"},
 		"spec":       map[string]interface{}{"gatewayPool": "pool-a"},
 	}}
 	stalePreserve := &unstructured.Unstructured{Object: map[string]interface{}{
-		"apiVersion": "net.unbounded-kube.io/v1alpha1",
+		"apiVersion": "net.unbounded-cloud.io/v1alpha1",
 		"kind":       "GatewayPoolNode",
 		"metadata":   map[string]interface{}{"name": "stale-preserve"},
 		"spec":       map[string]interface{}{"gatewayPool": "pool-a"},

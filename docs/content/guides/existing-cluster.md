@@ -64,7 +64,7 @@ At least one cluster node must be labeled as a WireGuard gateway. Open
 **UDP 51820-51899** on the node's firewall, then label it:
 
 ```bash
-kubectl label node <node-name> "unbounded-kube.io/unbounded-net-gateway=true"
+kubectl label node <node-name> "unbounded-cloud.io/unbounded-net-gateway=true"
 ```
 
 {{< callout type="important" >}}

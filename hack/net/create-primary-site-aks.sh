@@ -182,7 +182,7 @@ ensure_unmanaged_cloud_node_manager_daemonset() {
                 "operator": "DoesNotExist"
               },
               {
-                "key": "net.unbounded-kube.io/provider",
+                "key": "net.unbounded-cloud.io/provider",
                 "operator": "In",
                 "values": ["azure"]
               }
@@ -219,7 +219,7 @@ ensure_site_gateway_resources() {
 
     echo "==> Ensuring Site '${site_name}' and GatewayPool '${gateway_pool_name}' CRDs..."
     {
-        echo "apiVersion: net.unbounded-kube.io/v1alpha1"
+        echo "apiVersion: net.unbounded-cloud.io/v1alpha1"
         echo "kind: Site"
         echo "metadata:"
         echo "  name: ${site_name}"
@@ -240,7 +240,7 @@ ensure_site_gateway_resources() {
     } | kubectl apply -f -
 
     cat <<EOF | kubectl apply -f -
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: GatewayPool
 metadata:
   name: ${gateway_pool_name}
@@ -257,7 +257,7 @@ fi)
 EOF
 
     cat <<EOF | kubectl apply -f -
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: SiteGatewayPoolAssignment
 metadata:
   name: ${site_name}-${gateway_pool_name}

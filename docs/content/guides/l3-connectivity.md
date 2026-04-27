@@ -6,8 +6,7 @@ description: "Connect an AKS cluster to a remote Ubiquiti network over Azure VPN
 
 This guide walks through connecting an existing AKS cluster to a remote site
 over an Azure VPN Gateway and a Ubiquiti router. Because the VPN provides
-private L3 connectivity between the two networks, you'll configure Unbounded
-Kube to route directly over that link -- no WireGuard overlay needed.
+private L3 connectivity between the two networks, you'll configure Unbounded to route directly over that link -- no WireGuard overlay needed.
 
 {{< callout type="info" >}}
 This guide uses Azure VPN Gateway and a Ubiquiti router as a concrete example, but the same approach works with **any L3 interconnect** -- Azure ExpressRoute, AWS Direct Connect, GCP Cloud Interconnect, a hardware VPN appliance, or even a simple routed link between two networks. The Unbounded configuration in [steps 5-9](#5-prepare-gateway-nodes) is identical regardless of how the L3 path is established.
@@ -323,14 +322,14 @@ this configuration uses the VPN for all cross-site traffic.
 
 ```bash
 # Pick a node (or use a dedicated node pool)
-kubectl label node <node-name> "unbounded-kube.io/unbounded-net-gateway=true"
+kubectl label node <node-name> "unbounded-cloud.io/unbounded-net-gateway=true"
 ```
 
 {{< callout type="tip" >}}
 If your AKS cluster was created with the quickstart script, gateway nodes are already labeled. Verify with:
 
 ```bash
-kubectl get nodes -l unbounded-kube.io/unbounded-net-gateway=true
+kubectl get nodes -l unbounded-cloud.io/unbounded-net-gateway=true
 ```
 {{< /callout >}}
 
@@ -390,7 +389,7 @@ VPN:
 
 ```bash
 kubectl apply -f - <<'EOF'
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: SitePeering
 metadata:
   name: aks-to-ubiquiti-peering
@@ -442,7 +441,7 @@ via SSH from the AKS cluster (which they are, since the VPN provides L3
 connectivity):
 
 ```bash
-kubectl unbounded site add-machine \
+kubectl unbounded machine register \
     --site ubiquiti-site \
     --host 192.168.1.100 \
     --ssh-username ubuntu \
@@ -483,11 +482,11 @@ kubectl get nodes -w
 ```bash
 # Run a pod on the remote node
 kubectl run test-remote --image=busybox --restart=Never \
-    --overrides='{"spec":{"nodeSelector":{"net.unbounded-kube.io/site":"ubiquiti-site"}}}' \
+    --overrides='{"spec":{"nodeSelector":{"net.unbounded-cloud.io/site":"ubiquiti-site"}}}' \
     -- sleep 3600
 
 # Get a cluster node's internal IP
-CLUSTER_NODE_IP=$(kubectl get nodes -l 'net.unbounded-kube.io/site=cluster' \
+CLUSTER_NODE_IP=$(kubectl get nodes -l 'net.unbounded-cloud.io/site=cluster' \
     -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
 
 # Ping a cluster node from the remote pod (over the VPN -- no WireGuard)
@@ -495,7 +494,7 @@ kubectl exec test-remote -- ping -c 3 "$CLUSTER_NODE_IP"
 
 # Run a pod on a cluster node and curl it from the remote pod
 kubectl run test-cluster --image=nginx --restart=Never \
-    --overrides='{"spec":{"nodeSelector":{"net.unbounded-kube.io/site":"cluster"}}}'
+    --overrides='{"spec":{"nodeSelector":{"net.unbounded-cloud.io/site":"cluster"}}}'
 kubectl wait --for=condition=ready pod/test-cluster --timeout=60s
 CLUSTER_POD_IP=$(kubectl get pod test-cluster -o jsonpath='{.status.podIP}')
 kubectl exec test-remote -- wget -qO- "http://$CLUSTER_POD_IP"
@@ -574,7 +573,7 @@ To remove the Unbounded site resources:
 
 ```bash
 kubectl delete sitepeering aks-to-ubiquiti-peering
-kubectl delete machines --selector unbounded-kube.io/site=ubiquiti-site
+kubectl delete machines --selector unbounded-cloud.io/site=ubiquiti-site
 ```
 
 ---

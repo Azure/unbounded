@@ -120,60 +120,60 @@ type config struct {
 }
 
 var siteGVR = schema.GroupVersionResource{
-	Group:    "net.unbounded-kube.io",
+	Group:    "net.unbounded-cloud.io",
 	Version:  "v1alpha1",
 	Resource: "sites",
 }
 
 var siteNodeSliceGVR = schema.GroupVersionResource{
-	Group:    "net.unbounded-kube.io",
+	Group:    "net.unbounded-cloud.io",
 	Version:  "v1alpha1",
 	Resource: "sitenodeslices",
 }
 
 var gatewayPoolGVR = schema.GroupVersionResource{
-	Group:    "net.unbounded-kube.io",
+	Group:    "net.unbounded-cloud.io",
 	Version:  "v1alpha1",
 	Resource: "gatewaypools",
 }
 
 var gatewayNodeGVR = schema.GroupVersionResource{
-	Group:    "net.unbounded-kube.io",
+	Group:    "net.unbounded-cloud.io",
 	Version:  "v1alpha1",
 	Resource: "gatewaypoolnodes",
 }
 
 var sitePeeringGVR = schema.GroupVersionResource{
-	Group:    "net.unbounded-kube.io",
+	Group:    "net.unbounded-cloud.io",
 	Version:  "v1alpha1",
 	Resource: "sitepeerings",
 }
 
 var siteGatewayPoolAssignmentGVR = schema.GroupVersionResource{
-	Group:    "net.unbounded-kube.io",
+	Group:    "net.unbounded-cloud.io",
 	Version:  "v1alpha1",
 	Resource: "sitegatewaypoolassignments",
 }
 
 var gatewayPoolPeeringGVR = schema.GroupVersionResource{
-	Group:    "net.unbounded-kube.io",
+	Group:    "net.unbounded-cloud.io",
 	Version:  "v1alpha1",
 	Resource: "gatewaypoolpeerings",
 }
 
 const (
 	// WireGuard public key annotation on the node
-	WireGuardPubKeyAnnotation = "net.unbounded-kube.io/wg-pubkey"
+	WireGuardPubKeyAnnotation = "net.unbounded-cloud.io/wg-pubkey"
 
 	// TunnelMTUAnnotation is the maximum tunnel MTU this node
 	// can support, based on its default-route interface MTU minus encapsulation
 	// overhead. The controller uses this to validate that the configured MTU
 	// does not exceed what any node in the cluster can handle.
-	TunnelMTUAnnotation = "net.unbounded-kube.io/tunnel-mtu"
+	TunnelMTUAnnotation = "net.unbounded-cloud.io/tunnel-mtu"
 
 	// Gateway node taint key - prevents regular workloads from running on gateway nodes
 	// since they don't have regular pod CIDR routing
-	GatewayNodeTaintKey = "net.unbounded-kube.io/gateway-node"
+	GatewayNodeTaintKey = "net.unbounded-cloud.io/gateway-node"
 
 	// gatewayNodeHeartbeatInterval controls how frequently the node agent refreshes
 	// GatewayNode.status.lastUpdated. Route staleness is derived from this cadence.
@@ -291,7 +291,7 @@ then annotates the node with the public key.`,
 	flags.BoolVar(&cfg.StatusWSEnabled, "status-ws-enabled", true, "Enable websocket status push to controller")
 	flags.StringVar(&cfg.StatusWSURL, "status-ws-url", "", "Controller websocket URL for status push (default: ws://service/status/nodews)")
 	flags.StringVar(&cfg.StatusWSAPIServerMode, "status-ws-apiserver-mode", statusWSAPIServerModeFallback, "API server websocket mode: never, fallback, preferred")
-	flags.StringVar(&cfg.StatusWSAPIServerURL, "status-ws-apiserver-url", "", "API server websocket URL for status push fallback (default: wss://$(KUBERNETES_SERVICE_HOST)/apis/status.net.unbounded-kube.io/v1alpha1/status/nodews)")
+	flags.StringVar(&cfg.StatusWSAPIServerURL, "status-ws-apiserver-url", "", "API server websocket URL for status push fallback (default: wss://$(KUBERNETES_SERVICE_HOST)/apis/status.net.unbounded-cloud.io/v1alpha1/status/nodews)")
 	flags.DurationVar(&cfg.StatusWSAPIServerStartupDelay, "status-ws-apiserver-startup-delay", 60*time.Second, "Delay before API server websocket/push fallback is allowed after startup (0 to disable delay)")
 	flags.DurationVar(&cfg.StatusWSKeepaliveInterval, "status-ws-keepalive-interval", 10*time.Second, "Interval between websocket keepalive pings (0 to disable)")
 	flags.IntVar(&cfg.StatusWSKeepaliveFailureCount, "status-ws-keepalive-failure-count", 2, "Sequential websocket keepalive ping failures before reconnect")
