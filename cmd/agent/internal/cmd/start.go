@@ -59,6 +59,7 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 					host.ConfigureNFTables(log),
 					host.DisableDocker(log),
 					host.DisableSwap(log),
+					host.HardenAPT(log),
 				),
 
 				// TPM Attestation (no-op when not configured).
