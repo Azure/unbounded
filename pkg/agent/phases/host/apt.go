@@ -9,8 +9,8 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/Azure/unbounded/cmd/agent/internal/phases"
-	"github.com/Azure/unbounded/cmd/agent/internal/utilio"
+	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
+	"github.com/Azure/unbounded/pkg/agent/phases"
 )
 
 // On Ubuntu hosts, unattended-upgrades and needrestart will happily restart

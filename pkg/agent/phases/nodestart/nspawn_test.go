@@ -12,7 +12,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/Azure/unbounded/cmd/agent/internal/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
 // silentLogger returns a logger that drops all output. Tests use it so the
