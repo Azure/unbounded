@@ -22,8 +22,8 @@ import (
 )
 
 const (
-	aggregatedTokenNodePath   = "/apis/status.net.unbounded-kube.io/v1alpha1/token/node"
-	aggregatedTokenViewerPath = "/apis/status.net.unbounded-kube.io/v1alpha1/token/viewer"
+	aggregatedTokenNodePath   = "/apis/status.net.unbounded-cloud.io/v1alpha1/token/node"
+	aggregatedTokenViewerPath = "/apis/status.net.unbounded-cloud.io/v1alpha1/token/viewer"
 )
 
 // tokenEndpointConfig holds configurable parameters for token endpoints.
@@ -229,7 +229,7 @@ func handleTokenViewer(w http.ResponseWriter, r *http.Request, health *healthSta
 
 // performSAR performs a SubjectAccessReview to check whether the given user
 // is authorized to perform the specified action on a token resource in the
-// status.net.unbounded-kube.io API group.
+// status.net.unbounded-cloud.io API group.
 func performSAR(ctx context.Context, clientset kubernetes.Interface, username string, groups []string, verb, resource, resourceName string) bool {
 	review := &authorizationv1.SubjectAccessReview{
 		Spec: authorizationv1.SubjectAccessReviewSpec{
@@ -237,7 +237,7 @@ func performSAR(ctx context.Context, clientset kubernetes.Interface, username st
 			Groups: groups,
 			ResourceAttributes: &authorizationv1.ResourceAttributes{
 				Verb:     verb,
-				Group:    "status.net.unbounded-kube.io",
+				Group:    "status.net.unbounded-cloud.io",
 				Resource: resource,
 				Name:     resourceName,
 			},

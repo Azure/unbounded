@@ -26,7 +26,7 @@ os.chmod(TMPDIR, 0o755)
 SITE = "smoke"
 NODE_NAME = "smoke-node"
 NODE_NS = "default"
-API_GROUP = "unbounded-kube.io"
+API_GROUP = "unbounded-cloud.io"
 API_VERSION = f"{API_GROUP}/v1alpha3"
 VM_NAME = "unbounded-metal-smoke"
 NET_NAME = "unbounded-metal-smoke"

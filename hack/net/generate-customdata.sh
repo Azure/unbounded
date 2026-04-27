@@ -12,7 +12,7 @@ fi
 # Optional: override the NSG name (e.g. site-nsg). If not provided, resolved from cluster.
 NSG_NAME_OVERRIDE="${2:-}"
 
-# Optional: extra node labels to append (e.g. ",net.unbounded-kube.io/gateway=true")
+# Optional: extra node labels to append (e.g. ",net.unbounded-cloud.io/gateway=true")
 EXTRA_NODE_LABELS="${3:-}"
 
 API_SERVER="$(kubectl config view --flatten --minify --template '{{ (index .clusters 0).cluster.server }}' | awk -F'[:/]+' '{print $2}')"
@@ -23,7 +23,7 @@ REPO="$(git rev-parse --show-toplevel)"
 
 # Check for an existing bootstrap token secret for this pool
 EXISTING_SECRET="$(kubectl get secrets -n kube-system \
-    -l net.unbounded-kube.io/pool-name="$VMSS_NAME" \
+    -l net.unbounded-cloud.io/pool-name="$VMSS_NAME" \
     --field-selector type=bootstrap.kubernetes.io/token \
     -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)"
 
@@ -44,7 +44,7 @@ else
     --from-literal=token-secret="$BOOTSTRAP_TOKEN_SECRET" \
     --from-literal=usage-bootstrap-authentication="true" \
     --from-literal=usage-bootstrap-signing="true" \
-    -l net.unbounded-kube.io/pool-name="$VMSS_NAME" >&2
+    -l net.unbounded-cloud.io/pool-name="$VMSS_NAME" >&2
 fi
 
 # Extract fields from the providerID of a system node:

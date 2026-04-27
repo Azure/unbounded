@@ -783,7 +783,7 @@ func fetchStatusViaServiceProxy(ctx context.Context, client *kubernetes.Clientse
 	return client.CoreV1().RESTClient().
 		Get().
 		AbsPath(
-			"/apis/status.net.unbounded-kube.io/v1alpha1/status/json",
+			"/apis/status.net.unbounded-cloud.io/v1alpha1/status/json",
 		).
 		DoRaw(ctx)
 }

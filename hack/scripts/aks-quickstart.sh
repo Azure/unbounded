@@ -69,7 +69,7 @@ set -euo pipefail
 
 # ── constants ────────────────────────────────────────────────────────────────
 
-GATEWAY_LABEL="unbounded-kube.io/unbounded-net-gateway=true"
+GATEWAY_LABEL="unbounded-cloud.io/unbounded-net-gateway=true"
 GATEWAY_TAINT="CriticalAddonsOnly=true:NoSchedule"
 WIREGUARD_PORTS="51820-51899/udp"
 

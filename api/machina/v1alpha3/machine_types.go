@@ -78,7 +78,7 @@ const (
 const (
 	// AnnotationProvider associates a Machine with a provider's
 	// controller for reboot/repave operations.
-	AnnotationProvider = "unbounded-kube.io/provider"
+	AnnotationProvider = "unbounded-cloud.io/provider"
 )
 
 // MachineSpec defines the desired state of a Machine.

@@ -189,7 +189,7 @@ write_files:
       SERVICE_CIDR="__SERVICE_CIDR__"
       CLUSTER_RG="__CLUSTER_RG__"
       SCALE_SET_NAME="__SCALE_SET_NAME__"
-      NODE_LABELS="kubernetes.azure.com/managed=false,node.kubernetes.io/exclude-from-external-load-balancers=true,net.unbounded-kube.io/provider=azure,net.unbounded-kube.io/customdata-generated=__CUSTOMDATA_GENERATED__,net.unbounded-kube.io/agentpool=__SCALE_SET_NAME____EXTRA_NODE_LABELS__"
+      NODE_LABELS="kubernetes.azure.com/managed=false,node.kubernetes.io/exclude-from-external-load-balancers=true,net.unbounded-cloud.io/provider=azure,net.unbounded-cloud.io/customdata-generated=__CUSTOMDATA_GENERATED__,net.unbounded-cloud.io/agentpool=__SCALE_SET_NAME____EXTRA_NODE_LABELS__"
 
       CONTAINERD_VERSION="1.7.24"
       RUNC_VERSION="1.2.4"

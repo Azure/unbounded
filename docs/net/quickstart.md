@@ -52,7 +52,7 @@ kubectl apply -f deploy/net/crd/
 ```
 
 This installs the following CustomResourceDefinitions in the
-`net.unbounded-kube.io` API group:
+`net.unbounded-cloud.io` API group:
 
 | CRD | Short Name | Description |
 |-----|-----------|-------------|
@@ -132,7 +132,7 @@ A Site defines a network location and its pod CIDR allocation. Create a Site
 resource to start managing nodes:
 
 ```yaml
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: Site
 metadata:
   name: primary
@@ -176,7 +176,7 @@ kubectl -n unbounded-net get pods -l app.kubernetes.io/name=unbounded-net-contro
 kubectl -n unbounded-net get pods -l app.kubernetes.io/name=unbounded-net-node -o wide
 
 # Nodes should be labeled with their site
-kubectl get nodes -L net.unbounded-kube.io/site
+kubectl get nodes -L net.unbounded-cloud.io/site
 ```
 
 If you have the kubectl plugin installed (`make kubectl-unbounded`):
@@ -219,7 +219,7 @@ az aks nodepool add \
   --node-count 2 \
   --enable-node-public-ip \
   --node-public-ip-prefix <prefix-id> \
-  --labels net.unbounded-kube.io/agentpool=extgw1
+  --labels net.unbounded-cloud.io/agentpool=extgw1
 ```
 
 ### Required NSG rules for gateway nodes
@@ -235,13 +235,13 @@ Allow inbound UDP traffic to gateway nodes on these ports:
 ### Creating the gateway pool
 
 ```yaml
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: GatewayPool
 metadata:
   name: extgw1
 spec:
   nodeSelector:
-    net.unbounded-kube.io/agentpool: extgw1
+    net.unbounded-cloud.io/agentpool: extgw1
   type: External
 ```
 
@@ -253,7 +253,7 @@ annotated example.
 Link the site to the gateway pool so nodes can route traffic through gateways:
 
 ```yaml
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: SiteGatewayPoolAssignment
 metadata:
   name: primary-extgw1
@@ -281,7 +281,7 @@ Use SitePeering when sites have direct network reachability (e.g., same cloud
 region or VPN-connected). All nodes across the listed sites form direct tunnels:
 
 ```yaml
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: SitePeering
 metadata:
   name: east-west
@@ -302,7 +302,7 @@ across the internet). Traffic flows through the gateway pools rather than
 directly between all nodes:
 
 ```yaml
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: GatewayPoolPeering
 metadata:
   name: gw-east-west

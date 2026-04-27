@@ -29,7 +29,7 @@ namespace. Built on controller-runtime.
 - Provisions remote hosts over SSH: TCP probe, SSH connect (direct or via
   bastion), copy and execute an install script.
 - Detects the corresponding Node by the label
-  `unbounded-kube.io/machine=<name>` and transitions the Machine phase to
+  `unbounded-cloud.io/machine=<name>` and transitions the Machine phase to
   Ready.
 
 **Startup resolution:** resolves API server address from
@@ -60,7 +60,7 @@ Runs three reconcilers and four network servers:
 | HTTP server (TCP/8880)  | Kernel, initrd, Go-templated configs, `/attest` (TPM), `/pxe/disable`. |
 | Health server (TCP/8081)| Liveness and readiness probes.                              |
 
-Site-based scoping: the `--site` flag and the `unbounded-kube.io/site` label
+Site-based scoping: the `--site` flag and the `unbounded-cloud.io/site` label
 restrict each instance to a subset of Machines. Leader election is per-site.
 
 ### kubectl-unbounded -- CLI Plugin
@@ -80,7 +80,7 @@ Results are stored in a local SQLite database.
 
 ## Custom Resources
 
-API group `unbounded-kube.io`, version `v1alpha3`. CRD manifests live in
+API group `unbounded-cloud.io`, version `v1alpha3`. CRD manifests live in
 `deploy/machina/crd/`. See the [CRD Reference]({{< ref "reference/machina-crd" >}}) for
 full field documentation.
 
@@ -119,7 +119,7 @@ serve time. A `metadata.yaml` provides image-level configuration (e.g.
 Cross-site networking is provided by **unbounded-net**, a WireGuard-based CNI
 plugin.
 
-- **Gateway nodes** are labeled `unbounded-kube.io/unbounded-net-gateway=true`
+- **Gateway nodes** are labeled `unbounded-cloud.io/unbounded-net-gateway=true`
   and expose public IPs with UDP ports 51820-51899.
 - Remote nodes establish WireGuard tunnels directly to gateway public IPs (no
   STUN/TURN).

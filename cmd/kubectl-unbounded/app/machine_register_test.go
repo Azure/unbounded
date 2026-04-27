@@ -369,7 +369,7 @@ func newBootstrapTokenSecret(siteName string) *corev1.Secret {
 			Name:      "bootstrap-token-abc123",
 			Namespace: metav1.NamespaceSystem,
 			Labels: map[string]string{
-				"unbounded-kube.io/site": siteName,
+				"unbounded-cloud.io/site": siteName,
 			},
 		},
 		Type: corev1.SecretTypeBootstrapToken,

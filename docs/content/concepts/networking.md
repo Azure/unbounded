@@ -56,7 +56,7 @@ edge deployment. Each site is defined by:
   controller hands out per-node slices from these pools.
 
 When a node joins the cluster, the controller matches its internal IP against
-all Site `nodeCidrs` and labels it with `net.unbounded-kube.io/site=<name>`.
+all Site `nodeCidrs` and labels it with `net.unbounded-cloud.io/site=<name>`.
 
 ### Gateway Pools
 
@@ -66,7 +66,7 @@ Gateway nodes forward traffic from one site's pods to another using tunnels.
 Key properties:
 
 - Gateway nodes are identified by a label selector (e.g.,
-  `unbounded-kube.io/unbounded-net-gateway=true`).
+  `unbounded-cloud.io/unbounded-net-gateway=true`).
 - Multiple gateways in a pool provide **ECMP load balancing** -- traffic is
   distributed across all healthy gateways.
 - Sites are bound to gateway pools via **SiteGatewayPoolAssignment** resources.
@@ -98,7 +98,7 @@ WireGuard overlay.
 Create a `SitePeering` with `meshNodes: false` and `tunnelProtocol: None`:
 
 ```yaml
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: SitePeering
 metadata:
   name: azure-expressroute-peering
@@ -178,7 +178,7 @@ system:
 - **unbounded-net** handles networking -- making those nodes reachable for pod
   traffic.
 
-They share the same API group prefix (`unbounded-kube.io` / `net.unbounded-kube.io`)
+They share the same API group prefix (`unbounded-cloud.io` / `net.unbounded-cloud.io`)
 and are designed to work together. When you run `kubectl unbounded site init`,
 it installs both the machina controller and the unbounded-net CNI plugin.
 

@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 
 // +kubebuilder:object:generate=true
-// +groupName=net.unbounded-kube.io
+// +groupName=net.unbounded-cloud.io
 package v1alpha1
 
 //go:generate controller-gen object:headerFile=../../../hack/boilerplate.go.txt paths=.

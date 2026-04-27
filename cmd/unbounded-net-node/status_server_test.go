@@ -144,7 +144,7 @@ func TestResolveStatusWebSocketURLs(t *testing.T) {
 			t.Fatalf("unexpected direct websocket URL: %q", urls[0])
 		}
 
-		if urls[1] != "wss://api.public.example/apis/status.net.unbounded-kube.io/v1alpha1/status/nodews" {
+		if urls[1] != "wss://api.public.example/apis/status.net.unbounded-cloud.io/v1alpha1/status/nodews" {
 			t.Fatalf("unexpected apiserver websocket URL: %q", urls[1])
 		}
 	})
@@ -182,7 +182,7 @@ func TestResolveStatusWebSocketURLs(t *testing.T) {
 	t.Run("legacy aggregated group URL is rewritten", func(t *testing.T) {
 		cfg := &config{
 			StatusWSAPIServerMode: statusWSAPIServerModePreferred,
-			StatusWSAPIServerURL:  "wss://kubernetes.default.svc/apis/net.unbounded-kube.io/v1alpha1/status/nodews",
+			StatusWSAPIServerURL:  "wss://kubernetes.default.svc/apis/net.unbounded-cloud.io/v1alpha1/status/nodews",
 		}
 
 		urls := resolveStatusWebSocketURLs(cfg, true)
@@ -190,7 +190,7 @@ func TestResolveStatusWebSocketURLs(t *testing.T) {
 			t.Fatalf("expected at least one websocket URL")
 		}
 
-		if urls[0] != "wss://kubernetes.default.svc/apis/status.net.unbounded-kube.io/v1alpha1/status/nodews" {
+		if urls[0] != "wss://kubernetes.default.svc/apis/status.net.unbounded-cloud.io/v1alpha1/status/nodews" {
 			t.Fatalf("expected rewritten aggregated websocket URL, got %q", urls[0])
 		}
 	})
@@ -275,10 +275,10 @@ func TestResolveStatusPushAPIServerURL(t *testing.T) {
 	})
 
 	t.Run("rewrites legacy aggregated group in push URL", func(t *testing.T) {
-		cfg := &config{StatusWSAPIServerURL: "wss://kubernetes.default.svc/apis/net.unbounded-kube.io/v1alpha1/status/nodews"}
+		cfg := &config{StatusWSAPIServerURL: "wss://kubernetes.default.svc/apis/net.unbounded-cloud.io/v1alpha1/status/nodews"}
 		got := resolveStatusPushAPIServerURL(cfg)
 
-		want := "https://kubernetes.default.svc/apis/status.net.unbounded-kube.io/v1alpha1/status/push"
+		want := "https://kubernetes.default.svc/apis/status.net.unbounded-cloud.io/v1alpha1/status/push"
 		if got != want {
 			t.Fatalf("unexpected push URL: got %q want %q", got, want)
 		}
@@ -377,7 +377,7 @@ func TestNextExponentialBackoff(t *testing.T) {
 func TestWebsocketHostScopeKey(t *testing.T) {
 	key := websocketHostScopeKey([]string{
 		"ws://controller.svc:80/status/nodews",
-		"wss://kubernetes.default.svc/apis/status.net.unbounded-kube.io/v1alpha1/status/nodews",
+		"wss://kubernetes.default.svc/apis/status.net.unbounded-cloud.io/v1alpha1/status/nodews",
 	})
 	if key != "controller.svc:80,kubernetes.default.svc" {
 		t.Fatalf("unexpected websocket host scope key: %q", key)

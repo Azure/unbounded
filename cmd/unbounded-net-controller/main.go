@@ -673,7 +673,7 @@ func injectCABundle(ctx context.Context, clientset kubernetes.Interface, restCon
 		return fmt.Errorf("failed to create apiregistration client: %w", err)
 	}
 
-	apiSvc, err := apiRegClient.ApiregistrationV1().APIServices().Get(ctx, "v1alpha1.status.net.unbounded-kube.io", metav1.GetOptions{})
+	apiSvc, err := apiRegClient.ApiregistrationV1().APIServices().Get(ctx, "v1alpha1.status.net.unbounded-cloud.io", metav1.GetOptions{})
 	if err != nil {
 		klog.Warningf("Failed to get APIService (may not be deployed yet): %v", err)
 	} else {

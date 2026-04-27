@@ -41,7 +41,7 @@ wg --version
 5. **Create GatewayPools**: Define pools with `nodeSelector`.
 6. **Assign Sites to Pools**: Create SiteGatewayPoolAssignment resources.
 7. **Label Gateway Nodes**:
-   `kubectl label node <name> net.unbounded-kube.io/gateway=true`
+   `kubectl label node <name> net.unbounded-cloud.io/gateway=true`
 8. **Verify Connectivity**: Test with pod-to-pod ping across sites.
 
 > **Note:** When using Unbounded, steps 1-7 are handled automatically by
@@ -178,7 +178,7 @@ ip route show dev wg51821
 
 **Check:**
 ```bash
-kubectl get node <name> -L net.unbounded-kube.io/site
+kubectl get node <name> -L net.unbounded-cloud.io/site
 kubectl get sites -o yaml
 kubectl -n kube-system logs -l app=unbounded-net-controller | grep -i alloc
 ```
@@ -261,7 +261,7 @@ kubectl -n kube-system get endpoints unbounded-net-controller 2>&1
 # Cluster overview
 kubectl get st                                    # Sites
 kubectl get gp                                    # Gateway pools
-kubectl get nodes -L net.unbounded-kube.io/site   # Node assignments
+kubectl get nodes -L net.unbounded-cloud.io/site   # Node assignments
 
 # Per-node (eBPF)
 tc filter show dev unbounded0 egress              # BPF program
@@ -300,7 +300,7 @@ args:
 2. Create SiteGatewayPoolAssignment to bind site to a gateway pool.
 3. Deploy nodes whose IPs fall within the site's `nodeCidrs`.
 4. Label a gateway node:
-   `kubectl label node <name> net.unbounded-kube.io/gateway=true`
+   `kubectl label node <name> net.unbounded-cloud.io/gateway=true`
 5. Verify: `kubectl get gp <pool> -o yaml`
 
 ### Removing a Site
@@ -394,7 +394,7 @@ kind: Policy
 rules:
   - level: Metadata
     resources:
-      - group: "net.unbounded-kube.io"
+      - group: "net.unbounded-cloud.io"
         resources: ["sites", "sitenodeslices", "gatewaypools",
                     "gatewaypoolnodes", "sitepeerings",
                     "sitegatewaypoolassignments", "gatewaypoolpeerings"]

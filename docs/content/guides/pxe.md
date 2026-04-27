@@ -8,7 +8,7 @@ description: "Netboot bare metal machines into your cluster."
 
 Metalman is a controller that PXE-boots bare-metal servers and joins them to your Kubernetes cluster. It bundles DHCP, TFTP, and HTTP servers into a single binary, integrates with Redfish BMCs for remote power management, and uses TPM 2.0 attestation for secure bootstrap token delivery.
 
-API group: `unbounded-kube.io/v1alpha3`. CRD: **Machine** (`mach`), cluster-scoped.
+API group: `unbounded-cloud.io/v1alpha3`. CRD: **Machine** (`mach`), cluster-scoped.
 
 ## Prerequisites
 
@@ -67,12 +67,12 @@ See the [CRD Reference]({{< relref "/reference/machina-crd" >}}) for the full Ma
 A Machine represents a single bare-metal host. The `spec.pxe` section ties together the OCI image, network config, and BMC credentials:
 
 ```yaml
-apiVersion: unbounded-kube.io/v1alpha3
+apiVersion: unbounded-cloud.io/v1alpha3
 kind: Machine
 metadata:
   name: server-01
   labels:
-    unbounded-kube.io/site: rack-a
+    unbounded-cloud.io/site: rack-a
 spec:
   pxe:
     image: ghcr.io/azure/images/host-ubuntu2404:v1
@@ -124,7 +124,7 @@ data:
 Then reference the ConfigMap in the Machine:
 
 ```yaml
-apiVersion: unbounded-kube.io/v1alpha3
+apiVersion: unbounded-cloud.io/v1alpha3
 kind: Machine
 metadata:
   name: server-01
@@ -177,7 +177,7 @@ The `metalman-bootstrap` ServiceAccount has RBAC for `system:node-bootstrapper` 
 
 ## Site Isolation
 
-Use the `--site` flag to scope a metalman instance to machines labeled `unbounded-kube.io/site=<value>`. Each site gets its own leader-election lease.
+Use the `--site` flag to scope a metalman instance to machines labeled `unbounded-cloud.io/site=<value>`. Each site gets its own leader-election lease.
 
 Run separate metalman instances for different racks or network segments:
 

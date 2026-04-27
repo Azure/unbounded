@@ -24,7 +24,7 @@ import (
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
 
-const siteLabel = "unbounded-kube.io/site"
+const siteLabel = "unbounded-cloud.io/site"
 
 // ANSI color/style codes for terminal output.
 const (

@@ -10,7 +10,7 @@ metadata:
     app.kubernetes.io/name: unbounded-net-controller
     app.kubernetes.io/component: controller
 webhooks:
-  - name: validate.net.unbounded-kube.io
+  - name: validate.net.unbounded-cloud.io
     admissionReviewVersions: ["v1"]
     failurePolicy: Ignore
     sideEffects: None
@@ -24,6 +24,6 @@ webhooks:
         port: 9999
     rules:
       - operations: ["CREATE", "UPDATE"]
-        apiGroups: ["net.unbounded-kube.io"]
+        apiGroups: ["net.unbounded-cloud.io"]
         apiVersions: ["v1alpha1"]
         resources: ["sites", "gatewaypools", "sitepeerings", "sitegatewaypoolassignments", "gatewaypoolpeerings"]
