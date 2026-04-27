@@ -54,7 +54,7 @@ func Test_buildMachineCR(t *testing.T) {
 
 func Test_buildMachineCR_TokenNoDot(t *testing.T) {
 	cfg := baseConfig()
-	cfg.Kubelet.BootstrapToken = "abc123"
+	cfg.Kubelet.Auth.BootstrapToken = "abc123"
 	machine := buildMachineCR(cfg)
 
 	assert.Equal(t, "bootstrap-token-abc123", machine.Spec.Kubernetes.BootstrapTokenRef.Name)
@@ -76,7 +76,7 @@ func Test_buildMachineCR_NilLabelsAndTaints(t *testing.T) {
 
 func Test_registerMachine_EmptyToken_Skips(t *testing.T) {
 	cfg := baseConfig()
-	cfg.Kubelet.BootstrapToken = ""
+	cfg.Kubelet.Auth.BootstrapToken = ""
 
 	c := fakeClient()
 	err := registerMachine(context.Background(), discardLogger(), c, cfg)
@@ -123,7 +123,9 @@ func Test_registerMachine_Labels_Preserved(t *testing.T) {
 	cfg := &provision.AgentConfig{
 		MachineName: "labeled-machine",
 		Kubelet: provision.AgentKubeletConfig{
-			BootstrapToken:     "tok123.secret",
+			Auth: provision.KubeletAuthInfo{
+				BootstrapToken: "tok123.secret",
+			},
 			Labels:             map[string]string{"env": "prod", "zone": "us-west"},
 			RegisterWithTaints: []string{"gpu=true:NoSchedule"},
 		},

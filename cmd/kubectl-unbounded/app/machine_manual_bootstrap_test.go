@@ -189,7 +189,7 @@ func TestManualBootstrapHandler_BuildAgentConfig(t *testing.T) {
 	require.Equal(t, "10.0.0.10", cfg.Cluster.ClusterDNS)
 	require.NotEmpty(t, cfg.Cluster.CaCertBase64)
 	require.NotEmpty(t, cfg.Cluster.Version) // fake client returns empty string but it's still set
-	require.Contains(t, cfg.Kubelet.BootstrapToken, "abc123.")
+	require.Contains(t, cfg.Kubelet.Auth.BootstrapToken, "abc123.")
 	require.Equal(t, map[string]string{"env": "prod"}, cfg.Kubelet.Labels)
 	require.Equal(t, []string{"dedicated=gpu:NoSchedule"}, cfg.Kubelet.RegisterWithTaints)
 	require.Equal(t, "ghcr.io/azure/rootfs:v1", cfg.OCIImage)
@@ -263,17 +263,21 @@ func TestManualBootstrapHandler_RenderScript(t *testing.T) {
 		logger: discardLogger(),
 	}
 
-	cfg := &provision.AgentConfig{
-		MachineName: "test-node",
-		Cluster: provision.AgentClusterConfig{
-			CaCertBase64: "dGVzdA==",
-			ClusterDNS:   "10.0.0.10",
-			Version:      "v1.30.0",
-		},
-		Kubelet: provision.AgentKubeletConfig{
-			ApiServer:      "https://api-server:6443",
-			BootstrapToken: "abc123.0123456789abcdef",
-			Labels:         map[string]string{"env": "prod"},
+	cfg := &provision.UnboundedAgentConfig{
+		AgentConfig: provision.AgentConfig{
+			MachineName: "test-node",
+			Cluster: provision.AgentClusterConfig{
+				CaCertBase64: "dGVzdA==",
+				ClusterDNS:   "10.0.0.10",
+				Version:      "v1.30.0",
+			},
+			Kubelet: provision.AgentKubeletConfig{
+				ApiServer: "https://api-server:6443",
+				Auth: provision.KubeletAuthInfo{
+					BootstrapToken: "abc123.0123456789abcdef",
+				},
+				Labels: map[string]string{"env": "prod"},
+			},
 		},
 	}
 
@@ -342,16 +346,20 @@ func TestManualBootstrapHandler_RenderScript_WithAgentURL(t *testing.T) {
 		logger: discardLogger(),
 	}
 
-	cfg := &provision.AgentConfig{
-		MachineName: "test-node",
-		Cluster: provision.AgentClusterConfig{
-			CaCertBase64: "dGVzdA==",
-			ClusterDNS:   "10.0.0.10",
-			Version:      "v1.30.0",
-		},
-		Kubelet: provision.AgentKubeletConfig{
-			ApiServer:      "https://api-server:6443",
-			BootstrapToken: "abc123.0123456789abcdef",
+	cfg := &provision.UnboundedAgentConfig{
+		AgentConfig: provision.AgentConfig{
+			MachineName: "test-node",
+			Cluster: provision.AgentClusterConfig{
+				CaCertBase64: "dGVzdA==",
+				ClusterDNS:   "10.0.0.10",
+				Version:      "v1.30.0",
+			},
+			Kubelet: provision.AgentKubeletConfig{
+				ApiServer: "https://api-server:6443",
+				Auth: provision.KubeletAuthInfo{
+					BootstrapToken: "abc123.0123456789abcdef",
+				},
+			},
 		},
 	}
 
@@ -376,16 +384,20 @@ func TestManualBootstrapHandler_RenderScript_WithUnsafeAgentURL(t *testing.T) {
 		agentURL: `https://example.test/download?name="agent"&cmd=$(touch /tmp/pwned)`,
 	}
 
-	cfg := &provision.AgentConfig{
-		MachineName: "test-node",
-		Cluster: provision.AgentClusterConfig{
-			CaCertBase64: "dGVzdA==",
-			ClusterDNS:   "10.0.0.10",
-			Version:      "v1.30.0",
-		},
-		Kubelet: provision.AgentKubeletConfig{
-			ApiServer:      "https://api-server:6443",
-			BootstrapToken: "abc123.0123456789abcdef",
+	cfg := &provision.UnboundedAgentConfig{
+		AgentConfig: provision.AgentConfig{
+			MachineName: "test-node",
+			Cluster: provision.AgentClusterConfig{
+				CaCertBase64: "dGVzdA==",
+				ClusterDNS:   "10.0.0.10",
+				Version:      "v1.30.0",
+			},
+			Kubelet: provision.AgentKubeletConfig{
+				ApiServer: "https://api-server:6443",
+				Auth: provision.KubeletAuthInfo{
+					BootstrapToken: "abc123.0123456789abcdef",
+				},
+			},
 		},
 	}
 
@@ -405,16 +417,20 @@ func TestManualBootstrapHandler_RenderScript_WithoutAgentURL(t *testing.T) {
 		logger: discardLogger(),
 	}
 
-	cfg := &provision.AgentConfig{
-		MachineName: "test-node",
-		Cluster: provision.AgentClusterConfig{
-			CaCertBase64: "dGVzdA==",
-			ClusterDNS:   "10.0.0.10",
-			Version:      "v1.30.0",
-		},
-		Kubelet: provision.AgentKubeletConfig{
-			ApiServer:      "https://api-server:6443",
-			BootstrapToken: "abc123.0123456789abcdef",
+	cfg := &provision.UnboundedAgentConfig{
+		AgentConfig: provision.AgentConfig{
+			MachineName: "test-node",
+			Cluster: provision.AgentClusterConfig{
+				CaCertBase64: "dGVzdA==",
+				ClusterDNS:   "10.0.0.10",
+				Version:      "v1.30.0",
+			},
+			Kubelet: provision.AgentKubeletConfig{
+				ApiServer: "https://api-server:6443",
+				Auth: provision.KubeletAuthInfo{
+					BootstrapToken: "abc123.0123456789abcdef",
+				},
+			},
 		},
 	}
 
@@ -430,17 +446,21 @@ func TestManualBootstrapHandler_RenderCloudInit(t *testing.T) {
 		logger: discardLogger(),
 	}
 
-	cfg := &provision.AgentConfig{
-		MachineName: "test-node",
-		Cluster: provision.AgentClusterConfig{
-			CaCertBase64: "dGVzdA==",
-			ClusterDNS:   "10.0.0.10",
-			Version:      "v1.30.0",
-		},
-		Kubelet: provision.AgentKubeletConfig{
-			ApiServer:      "https://api-server:6443",
-			BootstrapToken: "abc123.0123456789abcdef",
-			Labels:         map[string]string{"env": "prod"},
+	cfg := &provision.UnboundedAgentConfig{
+		AgentConfig: provision.AgentConfig{
+			MachineName: "test-node",
+			Cluster: provision.AgentClusterConfig{
+				CaCertBase64: "dGVzdA==",
+				ClusterDNS:   "10.0.0.10",
+				Version:      "v1.30.0",
+			},
+			Kubelet: provision.AgentKubeletConfig{
+				ApiServer: "https://api-server:6443",
+				Auth: provision.KubeletAuthInfo{
+					BootstrapToken: "abc123.0123456789abcdef",
+				},
+				Labels: map[string]string{"env": "prod"},
+			},
 		},
 	}
 
@@ -480,19 +500,23 @@ func TestManualBootstrapHandler_RenderCloudInit(t *testing.T) {
 	t.Run("with OCI image", func(t *testing.T) {
 		t.Parallel()
 
-		cfgWithOCI := &provision.AgentConfig{
-			MachineName: "test-node",
-			Cluster: provision.AgentClusterConfig{
-				CaCertBase64: "dGVzdA==",
-				ClusterDNS:   "10.0.0.10",
-				Version:      "v1.30.0",
+		cfgWithOCI := &provision.UnboundedAgentConfig{
+			AgentConfig: provision.AgentConfig{
+				MachineName: "test-node",
+				Cluster: provision.AgentClusterConfig{
+					CaCertBase64: "dGVzdA==",
+					ClusterDNS:   "10.0.0.10",
+					Version:      "v1.30.0",
+				},
+				Kubelet: provision.AgentKubeletConfig{
+					ApiServer: "https://api-server:6443",
+					Auth: provision.KubeletAuthInfo{
+						BootstrapToken: "abc123.0123456789abcdef",
+					},
+					Labels: map[string]string{"env": "prod"},
+				},
+				OCIImage: "ghcr.io/azure/agent:latest",
 			},
-			Kubelet: provision.AgentKubeletConfig{
-				ApiServer:      "https://api-server:6443",
-				BootstrapToken: "abc123.0123456789abcdef",
-				Labels:         map[string]string{"env": "prod"},
-			},
-			OCIImage: "ghcr.io/azure/agent:latest",
 		}
 
 		withOCI := &manualBootstrapHandler{
@@ -665,17 +689,21 @@ func TestManualBootstrapHandler_InstallEnv(t *testing.T) {
 func TestManualBootstrapHandler_RenderScript_DownloadOverrides(t *testing.T) {
 	t.Parallel()
 
-	cfg := &provision.AgentConfig{
-		MachineName: "test-node",
-		Cluster: provision.AgentClusterConfig{
-			CaCertBase64: "dGVzdA==",
-			ClusterDNS:   "10.0.0.10",
-			Version:      "v1.30.0",
-		},
-		Kubelet: provision.AgentKubeletConfig{
-			ApiServer:      "https://api-server:6443",
-			BootstrapToken: "abc123.0123456789abcdef",
-			Labels:         map[string]string{"env": "prod"},
+	cfg := &provision.UnboundedAgentConfig{
+		AgentConfig: provision.AgentConfig{
+			MachineName: "test-node",
+			Cluster: provision.AgentClusterConfig{
+				CaCertBase64: "dGVzdA==",
+				ClusterDNS:   "10.0.0.10",
+				Version:      "v1.30.0",
+			},
+			Kubelet: provision.AgentKubeletConfig{
+				ApiServer: "https://api-server:6443",
+				Auth: provision.KubeletAuthInfo{
+					BootstrapToken: "abc123.0123456789abcdef",
+				},
+				Labels: map[string]string{"env": "prod"},
+			},
 		},
 	}
 
@@ -707,16 +735,20 @@ func TestManualBootstrapHandler_RenderScript_DownloadOverrides(t *testing.T) {
 func TestManualBootstrapHandler_RenderCloudInit_DownloadOverrides(t *testing.T) {
 	t.Parallel()
 
-	cfg := &provision.AgentConfig{
-		MachineName: "test-node",
-		Cluster: provision.AgentClusterConfig{
-			CaCertBase64: "dGVzdA==",
-			ClusterDNS:   "10.0.0.10",
-			Version:      "v1.30.0",
-		},
-		Kubelet: provision.AgentKubeletConfig{
-			ApiServer:      "https://api-server:6443",
-			BootstrapToken: "abc123.0123456789abcdef",
+	cfg := &provision.UnboundedAgentConfig{
+		AgentConfig: provision.AgentConfig{
+			MachineName: "test-node",
+			Cluster: provision.AgentClusterConfig{
+				CaCertBase64: "dGVzdA==",
+				ClusterDNS:   "10.0.0.10",
+				Version:      "v1.30.0",
+			},
+			Kubelet: provision.AgentKubeletConfig{
+				ApiServer: "https://api-server:6443",
+				Auth: provision.KubeletAuthInfo{
+					BootstrapToken: "abc123.0123456789abcdef",
+				},
+			},
 		},
 	}
 

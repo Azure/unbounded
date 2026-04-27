@@ -12,8 +12,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/Azure/unbounded/cmd/agent/internal/goalstates"
 	"github.com/Azure/unbounded/internal/provision"
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
 func baseConfig() *provision.AgentConfig {
@@ -25,8 +25,10 @@ func baseConfig() *provision.AgentConfig {
 			Version:      "1.33.1",
 		},
 		Kubelet: provision.AgentKubeletConfig{
-			ApiServer:      "https://api.example.com:6443",
-			BootstrapToken: "abc123.xyz789",
+			ApiServer: "https://api.example.com:6443",
+			Auth: provision.KubeletAuthInfo{
+				BootstrapToken: "abc123.xyz789",
+			},
 			Labels: map[string]string{
 				"env": "test",
 			},
@@ -85,7 +87,7 @@ func Test_hasDrift_ClusterDNSChange(t *testing.T) {
 func Test_hasDrift_BootstrapTokenChange(t *testing.T) {
 	applied := baseConfig()
 	desired := baseConfig()
-	desired.Kubelet.BootstrapToken = "new123.newxyz"
+	desired.Kubelet.Auth.BootstrapToken = "new123.newxyz"
 	assert.True(t, hasDrift(applied, desired))
 }
 

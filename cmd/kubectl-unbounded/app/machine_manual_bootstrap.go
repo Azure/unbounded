@@ -196,7 +196,7 @@ func (h *manualBootstrapHandler) validate() error {
 
 // buildAgentConfig resolves cluster information and assembles the provision.AgentConfig
 // that the unbounded-agent expects.
-func (h *manualBootstrapHandler) buildAgentConfig(ctx context.Context) (*provision.AgentConfig, error) {
+func (h *manualBootstrapHandler) buildAgentConfig(ctx context.Context) (*provision.UnboundedAgentConfig, error) {
 	tok, err := resolveBootstrapToken(ctx, h.logger, h.kubeCli, h.siteName)
 	if err != nil {
 		return nil, err
@@ -338,7 +338,7 @@ func shellSingleQuote(v string) string {
 // renderScript produces a self-contained bash script that writes the agent
 // config JSON to a temporary file and then executes the standard install
 // script. It uses the embedded node-bootstrap/script.sh template.
-func (h *manualBootstrapHandler) renderScript(cfg *provision.AgentConfig) (string, error) {
+func (h *manualBootstrapHandler) renderScript(cfg *provision.UnboundedAgentConfig) (string, error) {
 	configJSON, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return "", fmt.Errorf("marshalling agent config: %w", err)
@@ -366,7 +366,7 @@ func (h *manualBootstrapHandler) renderScript(cfg *provision.AgentConfig) (strin
 
 // renderCloudInit produces a cloud-init user-data document that writes the
 // agent config JSON file and runs the install script on first boot via runcmd.
-func (h *manualBootstrapHandler) renderCloudInit(cfg *provision.AgentConfig) (string, error) {
+func (h *manualBootstrapHandler) renderCloudInit(cfg *provision.UnboundedAgentConfig) (string, error) {
 	configJSON, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return "", fmt.Errorf("marshalling agent config: %w", err)

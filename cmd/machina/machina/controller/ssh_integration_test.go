@@ -635,7 +635,7 @@ func TestProvisionMachine_EndToEnd(t *testing.T) {
 	require.Equal(t, "10.0.0.10", agentConfig.Cluster.ClusterDNS)
 	require.Equal(t, "v1.34.0", agentConfig.Cluster.Version) // Machine spec overrides cluster version.
 	require.Equal(t, "api.example.com:443", agentConfig.Kubelet.ApiServer)
-	require.Equal(t, "abc123.secret", agentConfig.Kubelet.BootstrapToken)
+	require.Equal(t, "abc123.secret", agentConfig.Kubelet.Auth.BootstrapToken)
 
 	// Command: script execution with UNBOUNDED_AGENT_CONFIG_FILE.
 	require.NotNil(t, execCmd, "expected a script execution command")
@@ -760,7 +760,7 @@ func TestProvisionMachine_ConfigFile(t *testing.T) {
 	require.Equal(t, "10.96.0.10", agentConfig.Cluster.ClusterDNS)
 	require.Equal(t, "v1.33.1", agentConfig.Cluster.Version)
 	require.Equal(t, "k8s.example.com:6443", agentConfig.Kubelet.ApiServer)
-	require.Equal(t, "tok123.secret456", agentConfig.Kubelet.BootstrapToken)
+	require.Equal(t, "tok123.secret456", agentConfig.Kubelet.Auth.BootstrapToken)
 }
 
 func TestProvisionMachine_NilClusterInfo(t *testing.T) {
@@ -819,7 +819,7 @@ func TestProvisionMachine_NilClusterInfo(t *testing.T) {
 	require.Equal(t, "", agentConfig.Cluster.ClusterDNS)
 	require.Equal(t, "", agentConfig.Cluster.Version)
 	require.Equal(t, "", agentConfig.Kubelet.ApiServer)
-	require.Equal(t, "", agentConfig.Kubelet.BootstrapToken)
+	require.Equal(t, "", agentConfig.Kubelet.Auth.BootstrapToken)
 }
 
 func TestProvisionMachine_KubeVersionPrefixing(t *testing.T) {

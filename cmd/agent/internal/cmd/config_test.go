@@ -15,7 +15,7 @@ import (
 	"github.com/Azure/unbounded/internal/provision"
 )
 
-func writeConfigFile(t *testing.T, cfg provision.AgentConfig) string {
+func writeConfigFile(t *testing.T, cfg provision.UnboundedAgentConfig) string {
 	t.Helper()
 
 	data, err := json.Marshal(cfg)
@@ -26,23 +26,27 @@ func writeConfigFile(t *testing.T, cfg provision.AgentConfig) string {
 	return path
 }
 
-func sampleConfig() provision.AgentConfig {
-	return provision.AgentConfig{
-		MachineName: "test-machine",
-		Cluster: provision.AgentClusterConfig{
-			CaCertBase64: "dGVzdC1jYQ==",
-			ClusterDNS:   "10.0.0.10",
-			Version:      "v1.34.0",
-		},
-		Kubelet: provision.AgentKubeletConfig{
-			ApiServer:      "api.example.com:443",
-			BootstrapToken: "abc123.secret456",
-			Labels: map[string]string{
-				"env": "test",
+func sampleConfig() provision.UnboundedAgentConfig {
+	return provision.UnboundedAgentConfig{
+		AgentConfig: provision.AgentConfig{
+			MachineName: "test-machine",
+			Cluster: provision.AgentClusterConfig{
+				CaCertBase64: "dGVzdC1jYQ==",
+				ClusterDNS:   "10.0.0.10",
+				Version:      "v1.34.0",
 			},
-			RegisterWithTaints: []string{
-				"dedicated=gpu:NoSchedule",
-				"workload=ml:PreferNoSchedule",
+			Kubelet: provision.AgentKubeletConfig{
+				ApiServer: "api.example.com:443",
+				Auth: provision.KubeletAuthInfo{
+					BootstrapToken: "abc123.secret456",
+				},
+				Labels: map[string]string{
+					"env": "test",
+				},
+				RegisterWithTaints: []string{
+					"dedicated=gpu:NoSchedule",
+					"workload=ml:PreferNoSchedule",
+				},
 			},
 		},
 	}
@@ -63,7 +67,7 @@ func TestLoadConfig_FromFile(t *testing.T) {
 	// Version should have the leading "v" stripped.
 	assert.Equal(t, "1.34.0", got.Cluster.Version)
 	assert.Equal(t, "https://api.example.com:443", got.Kubelet.ApiServer)
-	assert.Equal(t, "abc123.secret456", got.Kubelet.BootstrapToken)
+	assert.Equal(t, "abc123.secret456", got.Kubelet.Auth.BootstrapToken)
 	assert.Equal(t, map[string]string{"env": "test"}, got.Kubelet.Labels)
 	assert.Equal(t, []string{"dedicated=gpu:NoSchedule", "workload=ml:PreferNoSchedule"}, got.Kubelet.RegisterWithTaints)
 }
@@ -122,7 +126,7 @@ func TestLoadConfig_FromEnv(t *testing.T) {
 	assert.Equal(t, "10.96.0.10", got.Cluster.ClusterDNS)
 	assert.Equal(t, "1.33.0", got.Cluster.Version)
 	assert.Equal(t, "https://api.env.example.com:443", got.Kubelet.ApiServer)
-	assert.Equal(t, "envtok.envsec", got.Kubelet.BootstrapToken)
+	assert.Equal(t, "envtok.envsec", got.Kubelet.Auth.BootstrapToken)
 	assert.Equal(t, map[string]string{"env": "staging", "team": "infra"}, got.Kubelet.Labels)
 	assert.Equal(t, []string{"dedicated=gpu:NoSchedule", "workload=ml:PreferNoSchedule"}, got.Kubelet.RegisterWithTaints)
 	assert.Nil(t, got.Attest)
@@ -245,7 +249,7 @@ func TestLoadConfig_FromEnv_WithAttestURL(t *testing.T) {
 	assert.Equal(t, "metal-node", got.MachineName)
 	assert.NotNil(t, got.Attest)
 	assert.Equal(t, "http://10.0.0.1:8880", got.Attest.URL)
-	assert.Empty(t, got.Kubelet.BootstrapToken)
+	assert.Empty(t, got.Kubelet.Auth.BootstrapToken)
 }
 
 func TestLoadConfig_FromEnv_NoTokenAndNoAttest(t *testing.T) {
@@ -266,15 +270,17 @@ func TestLoadConfig_FromEnv_NoTokenAndNoAttest(t *testing.T) {
 }
 
 func TestLoadConfig_FromFile_WithAttest(t *testing.T) {
-	cfg := provision.AgentConfig{
-		MachineName: "metal-node-file",
-		Cluster: provision.AgentClusterConfig{
-			CaCertBase64: "dGVzdC1jYQ==",
-			ClusterDNS:   "10.0.0.10",
-			Version:      "v1.34.0",
-		},
-		Kubelet: provision.AgentKubeletConfig{
-			ApiServer: "api.example.com:443",
+	cfg := provision.UnboundedAgentConfig{
+		AgentConfig: provision.AgentConfig{
+			MachineName: "metal-node-file",
+			Cluster: provision.AgentClusterConfig{
+				CaCertBase64: "dGVzdC1jYQ==",
+				ClusterDNS:   "10.0.0.10",
+				Version:      "v1.34.0",
+			},
+			Kubelet: provision.AgentKubeletConfig{
+				ApiServer: "api.example.com:443",
+			},
 		},
 		Attest: &provision.AgentAttestConfig{
 			URL: "http://192.168.1.1:8880",
@@ -290,5 +296,5 @@ func TestLoadConfig_FromFile_WithAttest(t *testing.T) {
 	assert.Equal(t, "metal-node-file", got.MachineName)
 	assert.NotNil(t, got.Attest)
 	assert.Equal(t, "http://192.168.1.1:8880", got.Attest.URL)
-	assert.Empty(t, got.Kubelet.BootstrapToken)
+	assert.Empty(t, got.Kubelet.Auth.BootstrapToken)
 }
