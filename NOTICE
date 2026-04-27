@@ -1,191 +1,516 @@
-NOTICES
-
-This project incorporates material from the third-party open source projects
-listed below. The original copyright notices and the licenses under which
-Microsoft received such material are set forth below. Microsoft reserves all
-other rights not specifically granted herein, whether by implication, estoppel
-or otherwise.
-
---------------------------------------------------------------------------------
-
-github.com/Azure/azure-sdk-for-go
-Copyright (c) Microsoft Corporation.
-Licensed under the MIT License.
-https://github.com/Azure/azure-sdk-for-go/blob/main/LICENSE.txt
-
---------------------------------------------------------------------------------
-
-github.com/bougou/go-ipmi
-Copyright (c) bougou
-Licensed under the Apache License, Version 2.0.
-https://github.com/bougou/go-ipmi/blob/main/LICENSE
-
---------------------------------------------------------------------------------
-
-github.com/containerd/platforms
-Copyright The containerd Authors.
-Licensed under the Apache License, Version 2.0.
-https://github.com/containerd/platforms/blob/main/LICENSE
-
---------------------------------------------------------------------------------
-
-github.com/fatih/color
-Copyright (c) 2013 Fatih Arslan
-Licensed under the MIT License.
-https://github.com/fatih/color/blob/main/LICENSE.md
-
---------------------------------------------------------------------------------
-
-github.com/go-logr/logr
-Copyright 2019 The logr Authors.
-Licensed under the Apache License, Version 2.0.
-https://github.com/go-logr/logr/blob/master/LICENSE
-
---------------------------------------------------------------------------------
-
-github.com/golang-jwt/jwt
-Copyright (c) 2012 Dave Grijalva
-Copyright (c) 2021 golang-jwt maintainers
-Licensed under the MIT License.
-https://github.com/golang-jwt/jwt/blob/main/LICENSE
-
---------------------------------------------------------------------------------
-
-github.com/google/go-tpm
-Copyright (c) 2018 Google LLC
-Licensed under the Apache License, Version 2.0.
-https://github.com/google/go-tpm/blob/main/LICENSE
-
---------------------------------------------------------------------------------
-
-github.com/google/go-tpm-tools
-Copyright (c) 2019 Google LLC
-Licensed under the Apache License, Version 2.0.
-https://github.com/google/go-tpm-tools/blob/main/LICENSE
-
---------------------------------------------------------------------------------
-
-github.com/google/renameio
-Copyright (c) 2018 Google Inc.
-Licensed under the Apache License, Version 2.0.
-https://github.com/google/renameio/blob/main/LICENSE
-
---------------------------------------------------------------------------------
-
-github.com/insomniacslk/dhcp
-Copyright (c) 2018 Andrea Barberio
-Licensed under the BSD 3-Clause License.
-https://github.com/insomniacslk/dhcp/blob/main/LICENSE
-
---------------------------------------------------------------------------------
-
-github.com/opencontainers/image-spec
-Copyright (c) 2016 The Linux Foundation
-Licensed under the Apache License, Version 2.0.
-https://github.com/opencontainers/image-spec/blob/main/LICENSE
-
---------------------------------------------------------------------------------
-
-github.com/opencontainers/umoci
-Copyright (c) 2016 SUSE LLC
-Licensed under the Apache License, Version 2.0.
-https://github.com/opencontainers/umoci/blob/main/COPYING
-
---------------------------------------------------------------------------------
-
-github.com/pin/tftp
-Copyright (c) 2015 Dmitry Bogatov
-Licensed under the MIT License.
-https://github.com/pin/tftp/blob/master/LICENSE
-
---------------------------------------------------------------------------------
-
-github.com/spf13/cobra
-Copyright (c) 2013 Steve Francia
-Licensed under the Apache License, Version 2.0.
-https://github.com/spf13/cobra/blob/main/LICENSE.txt
-
---------------------------------------------------------------------------------
-
-github.com/stretchr/testify
-Copyright (c) 2012-2020 Mat Ryer, Tyler Bunnell and contributors
-Licensed under the MIT License.
-https://github.com/stretchr/testify/blob/master/LICENSE
-
---------------------------------------------------------------------------------
-
-golang.org/x/crypto
-Copyright (c) 2009 The Go Authors
-Licensed under the BSD 3-Clause License.
-https://cs.opensource.google/go/x/crypto/+/master:LICENSE
-
---------------------------------------------------------------------------------
-
-golang.org/x/sync
-Copyright (c) 2009 The Go Authors
-Licensed under the BSD 3-Clause License.
-https://cs.opensource.google/go/x/sync/+/master:LICENSE
-
---------------------------------------------------------------------------------
-
-gopkg.in/yaml.v3
-Copyright (c) 2011-2019 Canonical Ltd
-Licensed under the MIT License and Apache License, Version 2.0.
-https://github.com/go-yaml/yaml/blob/v3/LICENSE
-
---------------------------------------------------------------------------------
-
-k8s.io/api
-Copyright (c) 2014 The Kubernetes Authors
-Licensed under the Apache License, Version 2.0.
-https://github.com/kubernetes/api/blob/master/LICENSE
-
---------------------------------------------------------------------------------
-
-k8s.io/apimachinery
-Copyright (c) 2014 The Kubernetes Authors
-Licensed under the Apache License, Version 2.0.
-https://github.com/kubernetes/apimachinery/blob/master/LICENSE
-
---------------------------------------------------------------------------------
-
-k8s.io/client-go
-Copyright (c) 2014 The Kubernetes Authors
-Licensed under the Apache License, Version 2.0.
-https://github.com/kubernetes/client-go/blob/master/LICENSE
-
---------------------------------------------------------------------------------
-
-k8s.io/utils
-Copyright (c) 2016 The Kubernetes Authors
-Licensed under the Apache License, Version 2.0.
-https://github.com/kubernetes/utils/blob/master/LICENSE
-
---------------------------------------------------------------------------------
-
-modernc.org/sqlite
-Copyright (c) 2017 The Sqlite Authors
-Licensed under the BSD 3-Clause License.
-https://gitlab.com/cznic/sqlite/-/blob/master/LICENSE
-
---------------------------------------------------------------------------------
-
-oras.land/oras-go
-Copyright The ORAS Authors.
-Licensed under the Apache License, Version 2.0.
-https://github.com/oras-project/oras-go/blob/main/LICENSE
-
---------------------------------------------------------------------------------
-
-sigs.k8s.io/controller-runtime
-Copyright 2018 The Kubernetes Authors
-Licensed under the Apache License, Version 2.0.
-https://github.com/kubernetes-sigs/controller-runtime/blob/main/LICENSE
-
---------------------------------------------------------------------------------
-
-sigs.k8s.io/yaml
-Copyright (c) 2014 Sam Ghods
-Copyright (c) 2012 The Go Authors
-Licensed under the MIT License and BSD 3-Clause License.
-https://github.com/kubernetes-sigs/yaml/blob/master/LICENSE
+# Generated by hack/cmd/notice. DO NOT EDIT.
+# Run 'make notice' to regenerate. Source: go.mod + frontend/package.json.
+notices:
+  - dependency: '@emotion/react'
+    ecosystem: npm
+    copyright:
+      - Copyright (c) Emotion team and other contributors
+    license:
+      - name: MIT License
+        link: https://github.com/emotion-js/emotion/blob/HEAD/LICENSE
+  - dependency: '@emotion/styled'
+    ecosystem: npm
+    copyright:
+      - Copyright (c) Emotion team and other contributors
+    license:
+      - name: MIT License
+        link: https://github.com/emotion-js/emotion/blob/HEAD/LICENSE
+  - dependency: '@tanstack/react-table'
+    ecosystem: npm
+    copyright:
+      - Copyright (c) 2016 Tanner Linsley
+    license:
+      - name: MIT License
+        link: https://github.com/TanStack/table/blob/HEAD/LICENSE
+  - dependency: '@tanstack/table-core'
+    ecosystem: npm
+    copyright:
+      - Copyright (c) 2016 Tanner Linsley
+    license:
+      - name: MIT License
+        link: https://github.com/TanStack/table/blob/HEAD/LICENSE
+  - dependency: d3-scale
+    ecosystem: npm
+    copyright:
+      - Copyright 2010-2021 Mike Bostock
+    license:
+      - name: ISC License
+        link: https://github.com/d3/d3-scale/blob/HEAD/LICENSE
+  - dependency: github.com/Azure/azure-sdk-for-go/sdk/azcore
+    ecosystem: go
+    copyright:
+      - Copyright (c) Microsoft Corporation.
+    license:
+      - name: MIT License
+        link: https://github.com/Azure/azure-sdk-for-go/blob/sdk/azcore/v1.21.1/LICENSE.txt
+  - dependency: github.com/Azure/azure-sdk-for-go/sdk/azidentity
+    ecosystem: go
+    copyright:
+      - Copyright (c) Microsoft Corporation.
+    license:
+      - name: MIT License
+        link: https://github.com/Azure/azure-sdk-for-go/blob/sdk/azidentity/v1.13.1/LICENSE.txt
+  - dependency: github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/authorization/armauthorization/v2
+    ecosystem: go
+    copyright:
+      - Copyright (c) Microsoft Corporation. All rights reserved.
+    license:
+      - name: MIT License
+        link: https://github.com/Azure/azure-sdk-for-go/blob/sdk/resourcemanager/authorization/armauthorization/v2.2.0/LICENSE.txt
+  - dependency: github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v6
+    ecosystem: go
+    copyright:
+      - Copyright (c) Microsoft Corporation. All rights reserved.
+    license:
+      - name: MIT License
+        link: https://github.com/Azure/azure-sdk-for-go/blob/sdk/resourcemanager/compute/armcompute/v6.4.0/LICENSE.txt
+  - dependency: github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v4
+    ecosystem: go
+    copyright:
+      - Copyright (c) Microsoft Corporation. All rights reserved.
+    license:
+      - name: MIT License
+        link: https://github.com/Azure/azure-sdk-for-go/blob/sdk/resourcemanager/containerservice/armcontainerservice/v4.8.0/LICENSE.txt
+  - dependency: github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/dns/armdns
+    ecosystem: go
+    copyright:
+      - Copyright (c) Microsoft Corporation. All rights reserved.
+    license:
+      - name: MIT License
+        link: https://github.com/Azure/azure-sdk-for-go/blob/sdk/resourcemanager/dns/armdns/v1.2.0/LICENSE.txt
+  - dependency: github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/keyvault/armkeyvault
+    ecosystem: go
+    copyright:
+      - Copyright (c) Microsoft Corporation. All rights reserved.
+    license:
+      - name: MIT License
+        link: https://github.com/Azure/azure-sdk-for-go/blob/sdk/resourcemanager/keyvault/armkeyvault/v1.5.0/LICENSE.txt
+  - dependency: github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/msi/armmsi
+    ecosystem: go
+    copyright:
+      - Copyright (c) Microsoft Corporation. All rights reserved.
+    license:
+      - name: MIT License
+        link: https://github.com/Azure/azure-sdk-for-go/blob/sdk/resourcemanager/msi/armmsi/v1.3.0/LICENSE.txt
+  - dependency: github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v7
+    ecosystem: go
+    copyright:
+      - Copyright (c) Microsoft Corporation. All rights reserved.
+    license:
+      - name: MIT License
+        link: https://github.com/Azure/azure-sdk-for-go/blob/sdk/resourcemanager/network/armnetwork/v7.2.0/LICENSE.txt
+  - dependency: github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/privatedns/armprivatedns
+    ecosystem: go
+    copyright:
+      - Copyright (c) Microsoft Corporation. All rights reserved.
+    license:
+      - name: MIT License
+        link: https://github.com/Azure/azure-sdk-for-go/blob/sdk/resourcemanager/privatedns/armprivatedns/v1.3.0/LICENSE.txt
+  - dependency: github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armfeatures
+    ecosystem: go
+    copyright:
+      - Copyright (c) Microsoft Corporation. All rights reserved.
+    license:
+      - name: MIT License
+        link: https://github.com/Azure/azure-sdk-for-go/blob/sdk/resourcemanager/resources/armfeatures/v1.2.0/LICENSE.txt
+  - dependency: github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armlocks
+    ecosystem: go
+    copyright:
+      - Copyright (c) Microsoft Corporation. All rights reserved.
+    license:
+      - name: MIT License
+        link: https://github.com/Azure/azure-sdk-for-go/blob/sdk/resourcemanager/resources/armlocks/v1.2.0/LICENSE.txt
+  - dependency: github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources
+    ecosystem: go
+    copyright:
+      - Copyright (c) Microsoft Corporation. All rights reserved.
+    license:
+      - name: MIT License
+        link: https://github.com/Azure/azure-sdk-for-go/blob/sdk/resourcemanager/resources/armresources/v1.2.0/LICENSE.txt
+  - dependency: github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armsubscriptions
+    ecosystem: go
+    copyright:
+      - Copyright (c) Microsoft Corporation. All rights reserved.
+    license:
+      - name: MIT License
+        link: https://github.com/Azure/azure-sdk-for-go/blob/sdk/resourcemanager/resources/armsubscriptions/v1.3.0/LICENSE.txt
+  - dependency: github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/storage/armstorage
+    ecosystem: go
+    copyright:
+      - Copyright (c) Microsoft Corporation. All rights reserved.
+    license:
+      - name: MIT License
+        link: https://github.com/Azure/azure-sdk-for-go/blob/sdk/resourcemanager/storage/armstorage/v1.8.1/LICENSE.txt
+  - dependency: github.com/Azure/azure-sdk-for-go/sdk/storage/azblob
+    ecosystem: go
+    copyright:
+      - Copyright (c) Microsoft Corporation. All rights reserved.
+    license:
+      - name: MIT License
+        link: https://github.com/Azure/azure-sdk-for-go/blob/sdk/storage/azblob/v1.6.4/LICENSE.txt
+  - dependency: github.com/Masterminds/semver/v3
+    ecosystem: go
+    copyright:
+      - See LICENSE file
+    license:
+      - name: MIT License
+        link: https://github.com/Masterminds/semver/blob/v3.4.0/LICENSE.txt
+  - dependency: github.com/Masterminds/sprig/v3
+    ecosystem: go
+    copyright:
+      - See LICENSE file
+    license:
+      - name: MIT License
+        link: https://github.com/Masterminds/sprig/blob/v3.3.0/LICENSE.txt
+  - dependency: github.com/bougou/go-ipmi
+    ecosystem: go
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/bougou/go-ipmi/blob/v0.8.3/LICENSE
+  - dependency: github.com/cilium/ebpf
+    ecosystem: go
+    copyright:
+      - Copyright (c) 2017 Nathan Sweet
+      - Copyright (c) 2018, 2019 Cloudflare
+      - Copyright (c) 2019 Authors of Cilium
+    license:
+      - name: MIT License
+        link: https://github.com/cilium/ebpf/blob/v0.21.0/LICENSE
+  - dependency: github.com/coder/websocket
+    ecosystem: go
+    copyright:
+      - Copyright (c) 2025 Coder
+    license:
+      - name: ISC License
+        link: https://github.com/coder/websocket/blob/v1.8.14/LICENSE.txt
+  - dependency: github.com/containerd/platforms
+    ecosystem: go
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/containerd/platforms/blob/v0.2.1/LICENSE
+  - dependency: github.com/coreos/go-iptables
+    ecosystem: go
+    copyright:
+      - Copyright 2018 CoreOS, Inc
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/coreos/go-iptables/blob/v0.8.0/LICENSE
+  - dependency: github.com/fatih/color
+    ecosystem: go
+    copyright:
+      - Copyright (c) 2013 Fatih Arslan
+    license:
+      - name: MIT License
+        link: https://github.com/fatih/color/blob/v1.19.0/LICENSE.md
+  - dependency: github.com/fsnotify/fsnotify
+    ecosystem: go
+    copyright:
+      - Copyright © 2012 The Go Authors. All rights reserved.
+      - Copyright © fsnotify Authors. All rights reserved.
+    license:
+      - name: BSD 3-Clause License
+        link: https://github.com/fsnotify/fsnotify/blob/v1.9.0/LICENSE
+  - dependency: github.com/go-logr/logr
+    ecosystem: go
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/go-logr/logr/blob/v1.4.3/LICENSE
+  - dependency: github.com/golang-jwt/jwt/v5
+    ecosystem: go
+    copyright:
+      - Copyright (c) 2012 Dave Grijalva
+      - Copyright (c) 2021 golang-jwt maintainers
+    license:
+      - name: MIT License
+        link: https://github.com/golang-jwt/jwt/blob/v5.3.1/LICENSE
+  - dependency: github.com/google/go-tpm
+    ecosystem: go
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/google/go-tpm/blob/v0.9.8/LICENSE
+  - dependency: github.com/google/go-tpm-tools
+    ecosystem: go
+    copyright:
+      - Copyright (c) Microsoft Corporation
+      - Copyright (c) Intel Corporation
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/google/go-tpm-tools/blob/v0.4.8/LICENSE
+      - name: BSD 2-Clause License
+        link: https://github.com/google/go-tpm-tools/blob/v0.4.8/LICENSE
+  - dependency: github.com/google/licensecheck
+    ecosystem: go
+    copyright:
+      - Copyright (c) 2019 The Go Authors. All rights reserved.
+    license:
+      - name: BSD 3-Clause License
+        link: https://github.com/google/licensecheck/blob/v0.3.1/LICENSE
+  - dependency: github.com/google/renameio/v2
+    ecosystem: go
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/google/renameio/blob/v2.0.2/LICENSE
+  - dependency: github.com/insomniacslk/dhcp
+    ecosystem: go
+    copyright:
+      - Copyright (c) 2018, Andrea Barberio
+    license:
+      - name: BSD 3-Clause License
+        link: https://github.com/insomniacslk/dhcp/blob/5adc3eb26f91/LICENSE
+  - dependency: github.com/lib/pq
+    ecosystem: go
+    copyright:
+      - Copyright (c) 2011-2013, 'pq' Contributors. Portions Copyright (c) 2011 Blake Mizerany
+    license:
+      - name: MIT License
+        link: https://github.com/lib/pq/blob/v1.12.3/LICENSE
+  - dependency: github.com/opencontainers/image-spec
+    ecosystem: go
+    copyright:
+      - Copyright 2016 The Linux Foundation.
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/opencontainers/image-spec/blob/v1.1.1/LICENSE
+  - dependency: github.com/opencontainers/umoci
+    ecosystem: go
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/opencontainers/umoci/blob/v0.6.0/COPYING
+  - dependency: github.com/pin/tftp/v3
+    ecosystem: go
+    copyright:
+      - Copyright (c) 2016 Dmitri Popov
+    license:
+      - name: MIT License
+        link: https://github.com/pin/tftp/blob/v3.2.0/LICENSE
+  - dependency: github.com/prometheus/client_golang
+    ecosystem: go
+    copyright:
+      - Copyright 2012-2015 The Prometheus Authors
+      - Copyright 2013-2015 Blake Mizerany, Björn Rabenstein
+      - Copyright 2010 The Go Authors
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/prometheus/client_golang/blob/v1.23.2/LICENSE
+  - dependency: github.com/spf13/cobra
+    ecosystem: go
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/spf13/cobra/blob/v1.10.2/LICENSE.txt
+  - dependency: github.com/spf13/pflag
+    ecosystem: go
+    copyright:
+      - Copyright (c) 2012 Alex Ogier. All rights reserved.
+      - Copyright (c) 2012 The Go Authors. All rights reserved.
+    license:
+      - name: BSD 3-Clause License
+        link: https://github.com/spf13/pflag/blob/v1.0.10/LICENSE
+  - dependency: github.com/stretchr/testify
+    ecosystem: go
+    copyright:
+      - Copyright (c) 2012-2020 Mat Ryer, Tyler Bunnell and contributors.
+    license:
+      - name: MIT License
+        link: https://github.com/stretchr/testify/blob/v1.11.1/LICENSE
+  - dependency: github.com/vishvananda/netlink
+    ecosystem: go
+    copyright:
+      - Copyright 2014 Vishvananda Ishaya.
+      - Copyright 2014 Docker, Inc.
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/vishvananda/netlink/blob/v1.3.1/LICENSE
+  - dependency: golang.org/x/crypto
+    ecosystem: go
+    copyright:
+      - Copyright 2009 The Go Authors.
+    license:
+      - name: BSD 3-Clause License
+        link: https://go.googlesource.com/crypto
+  - dependency: golang.org/x/mod
+    ecosystem: go
+    copyright:
+      - Copyright 2009 The Go Authors.
+    license:
+      - name: BSD 3-Clause License
+        link: https://go.googlesource.com/mod
+  - dependency: golang.org/x/sync
+    ecosystem: go
+    copyright:
+      - Copyright 2009 The Go Authors.
+    license:
+      - name: BSD 3-Clause License
+        link: https://go.googlesource.com/sync
+  - dependency: golang.org/x/sys
+    ecosystem: go
+    copyright:
+      - Copyright 2009 The Go Authors.
+    license:
+      - name: BSD 3-Clause License
+        link: https://go.googlesource.com/sys
+  - dependency: golang.org/x/term
+    ecosystem: go
+    copyright:
+      - Copyright 2009 The Go Authors.
+    license:
+      - name: BSD 3-Clause License
+        link: https://go.googlesource.com/term
+  - dependency: golang.zx2c4.com/wireguard/wgctrl
+    ecosystem: go
+    copyright:
+      - See LICENSE file
+    license:
+      - name: MIT License
+        link: https://github.com/WireGuard/wgctrl-go/blob/a9ab2273dd10/LICENSE.md
+  - dependency: google.golang.org/grpc
+    ecosystem: go
+    copyright:
+      - Copyright 2014 gRPC authors.
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/grpc/grpc-go/blob/v1.80.0/LICENSE
+  - dependency: google.golang.org/protobuf
+    ecosystem: go
+    copyright:
+      - Copyright (c) 2018 The Go Authors. All rights reserved.
+    license:
+      - name: BSD 3-Clause License
+        link: https://go.googlesource.com/protobuf
+  - dependency: gopkg.in/yaml.v3
+    ecosystem: go
+    copyright:
+      - Copyright (c) 2006-2010 Kirill Simonov
+      - Copyright (c) 2006-2011 Kirill Simonov
+      - Copyright (c) 2011-2019 Canonical Ltd
+    license:
+      - name: MIT License
+        link: https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE
+      - name: Apache License, Version 2.0
+        link: https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE
+  - dependency: k8s.io/api
+    ecosystem: go
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/kubernetes/api/blob/v0.35.4/LICENSE
+  - dependency: k8s.io/apimachinery
+    ecosystem: go
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/kubernetes/apimachinery/blob/v0.35.4/LICENSE
+  - dependency: k8s.io/cli-runtime
+    ecosystem: go
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/kubernetes/cli-runtime/blob/v0.35.4/LICENSE
+  - dependency: k8s.io/client-go
+    ecosystem: go
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/kubernetes/client-go/blob/v0.35.4/LICENSE
+  - dependency: k8s.io/klog/v2
+    ecosystem: go
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/kubernetes/klog/blob/v2.130.1/LICENSE
+  - dependency: k8s.io/kube-aggregator
+    ecosystem: go
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/kubernetes/kube-aggregator/blob/v0.35.4/LICENSE
+  - dependency: k8s.io/utils
+    ecosystem: go
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/kubernetes/utils/blob/bc988d571ff4/LICENSE
+  - dependency: modernc.org/sqlite
+    ecosystem: go
+    copyright:
+      - Copyright (c) 2017 The Sqlite Authors. All rights reserved.
+    license:
+      - name: BSD 3-Clause License
+        link: https://gitlab.com/cznic/sqlite/-/blob/v1.49.1/LICENSE
+  - dependency: oras.land/oras-go/v2
+    ecosystem: go
+    copyright:
+      - Copyright 2021 ORAS Authors.
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/oras-project/oras-go/blob/v2.6.0/LICENSE
+  - dependency: react
+    ecosystem: npm
+    copyright:
+      - Copyright (c) Meta Platforms, Inc. and affiliates.
+    license:
+      - name: MIT License
+        link: https://github.com/facebook/react/blob/HEAD/LICENSE
+  - dependency: react-dom
+    ecosystem: npm
+    copyright:
+      - Copyright (c) Meta Platforms, Inc. and affiliates.
+    license:
+      - name: MIT License
+        link: https://github.com/facebook/react/blob/HEAD/LICENSE
+  - dependency: reagraph
+    ecosystem: npm
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/reaviz/reagraph/blob/HEAD/LICENSE
+  - dependency: sigs.k8s.io/controller-runtime
+    ecosystem: go
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/kubernetes-sigs/controller-runtime/blob/v0.23.3/LICENSE
+  - dependency: sigs.k8s.io/yaml
+    ecosystem: go
+    copyright:
+      - Copyright (c) 2014 Sam Ghods
+      - Copyright (c) 2012 The Go Authors. All rights reserved.
+      - Copyright (c) 2006-2010 Kirill Simonov
+      - Copyright (c) 2006-2011 Kirill Simonov
+      - Copyright (c) 2011-2019 Canonical Ltd
+    license:
+      - name: MIT License
+        link: https://github.com/kubernetes-sigs/yaml/blob/v1.6.0/LICENSE
+      - name: BSD 3-Clause License
+        link: https://github.com/kubernetes-sigs/yaml/blob/v1.6.0/LICENSE
+      - name: Apache License, Version 2.0
+        link: https://github.com/kubernetes-sigs/yaml/blob/v1.6.0/LICENSE
+  - dependency: three
+    ecosystem: npm
+    copyright:
+      - Copyright © 2010-2025 three.js authors
+    license:
+      - name: MIT License
+        link: https://github.com/mrdoob/three.js/blob/HEAD/LICENSE
