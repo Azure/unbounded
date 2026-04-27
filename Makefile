@@ -105,7 +105,7 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 # Frontend build toggle (dev builds produce unminified output with sourcemaps).
 REACT_DEV ?= false
 
-.PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute
+.PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute notice notice-check
 .PHONY: net-frontend net-frontend-clean net-build-ebpf net-manifests release-manifests
 .PHONY: image-machina-local image-metalman-local image-net-controller-local image-net-node-local images-local
 
@@ -131,6 +131,8 @@ help: ## Show this help
 	@echo "  generate                         Run go generate (deepcopy, CRDs, protobuf)"
 	@echo "  vulncheck                        Run govulncheck"
 	@echo "  gomod                            go mod tidy"
+	@echo "  notice                           Regenerate NOTICE from go.mod and frontend/package.json"
+	@echo "  notice-check                     Verify NOTICE is in sync with dependencies"
 	@echo ""
 	@echo "Build:"
 	@echo "  kubectl-unbounded                Build kubectl-unbounded plugin"
@@ -295,6 +297,22 @@ vulncheck: machina-manifests net-manifests ## Run govulncheck for known vulnerab
 
 gomod: ## Tidy go.mod and go.sum
 	$(GOMOD) tidy
+
+notice: ## Regenerate NOTICE from go.mod and frontend/package.json
+	@if [ ! -d "$(NET_FRONTEND_DIR)/node_modules" ]; then \
+		echo "ERROR: $(NET_FRONTEND_DIR)/node_modules not found." >&2; \
+		echo "Run: (cd $(NET_FRONTEND_DIR) && npm ci)" >&2; \
+		exit 1; \
+	fi
+	$(GOCMD) run ./hack/cmd/notice generate --output NOTICE
+
+notice-check: ## Verify NOTICE is in sync with go.mod and frontend/package.json
+	@if [ ! -d "$(NET_FRONTEND_DIR)/node_modules" ]; then \
+		echo "ERROR: $(NET_FRONTEND_DIR)/node_modules not found." >&2; \
+		echo "Run: (cd $(NET_FRONTEND_DIR) && npm ci)" >&2; \
+		exit 1; \
+	fi
+	$(GOCMD) run ./hack/cmd/notice check --notice NOTICE
 
 ##@ Build
 
