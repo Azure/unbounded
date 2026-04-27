@@ -120,7 +120,7 @@ help: ## Show this help
 	@echo "General:"
 	@echo "  all                              Build all Go binaries (default)"
 	@echo "  help                             Show this help"
-	@echo "  install-tools                    Install gofumpt, golangci-lint, protoc-gen-go, controller-gen"
+	@echo "  install-tools                    Install gofumpt, golangci-lint, protoc-gen-go, protoc-gen-go-grpc, controller-gen"
 	@echo "  install-protoc                   Download pinned protoc into bin/protoc/"
 	@echo ""
 	@echo "Development:"
@@ -203,6 +203,7 @@ help: ## Show this help
 GOFUMPT_VERSION ?= v0.8.0
 GOLANGCI_LINT_VERSION ?= v2.11.4
 PROTOC_GEN_GO_VERSION ?= v1.36.11
+PROTOC_GEN_GO_GRPC_VERSION ?= v1.6.1
 CONTROLLER_GEN_VERSION ?= v0.20.1
 
 # Pinned protoc for deterministic .pb.go output across environments.
@@ -230,10 +231,11 @@ else
   PROTOC_ARCH ?= $(PROTOC_UNAME_M)
 endif
 
-install-tools: ## Install development tools (gofumpt, golangci-lint, protoc-gen-go)
+install-tools: ## Install development tools (gofumpt, golangci-lint, protoc-gen-go, protoc-gen-go-grpc, controller-gen)
 	go install mvdan.cc/gofumpt@$(GOFUMPT_VERSION)
 	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 	go install google.golang.org/protobuf/cmd/protoc-gen-go@$(PROTOC_GEN_GO_VERSION)
+	go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@$(PROTOC_GEN_GO_GRPC_VERSION)
 	go install sigs.k8s.io/controller-tools/cmd/controller-gen@$(CONTROLLER_GEN_VERSION)
 
 install-protoc: $(PROTOC) ## Download pinned protoc into bin/protoc/

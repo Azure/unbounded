@@ -696,6 +696,7 @@ func TestManualBootstrapHandler_RenderScript_DownloadOverrides(t *testing.T) {
 	// The exports must appear before the embedded install script heredoc.
 	exportIdx := strings.Index(script, "export AGENT_VERSION=")
 	heredocIdx := strings.Index(script, "INSTALL_SCRIPT_EOF")
+
 	require.Greater(t, exportIdx, 0)
 	require.Greater(t, heredocIdx, exportIdx)
 
@@ -733,6 +734,7 @@ func TestManualBootstrapHandler_RenderCloudInit_DownloadOverrides(t *testing.T) 
 
 	exportIdx := strings.Index(output, "export AGENT_URL=")
 	runIdx := strings.Index(output, "bash /usr/local/bin/unbounded-agent-install.sh")
+
 	require.Greater(t, exportIdx, 0)
 	require.Greater(t, runIdx, exportIdx)
 }
