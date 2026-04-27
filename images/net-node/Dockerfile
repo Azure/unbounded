@@ -112,7 +112,8 @@ FROM mcr.microsoft.com/azurelinux/base/core:3.0 AS runtime-base
 # - iptables: iptables/ip6tables for masquerade rules (node)
 # - util-linux: nsenter for host namespace sysctl setup (node init)
 # - hostname: provides the hostname binary in Azure Linux runtime images
-RUN tdnf install -y \
+RUN tdnf upgrade -y \
+    && tdnf install -y \
     ca-certificates shadow-utils iproute iptables util-linux hostname which wget tcpdump iputils \
     libatomic libcap openssl vim bpftool \
     procps-ng less sqlite-libs tar gzip jq python3 bind-utils \
