@@ -3,7 +3,7 @@ apiVersion: batch/v1
 kind: CronJob
 metadata:
   name: inventory-inspector
-  namespace: inventory
+  namespace: {{ default "unbounded-kube" .Namespace }}
   labels:
     app: inventory-inspector
 spec:
