@@ -642,14 +642,15 @@ LAB_HOST ?=
 
 # Helper: if LAB_HOST is set, edit the named configMap host literal in the
 # given kustomize dir, run the wrapped command, then restore the file.
-# Args: $(1)=kustomize dir, $(2)=configmap name, $(3)=command to run
+# Uses sed (kustomize CLI is not a hard dependency).
+# Args: $(1)=kustomize dir, $(2)=configmap name (informational), $(3)=command to run
 define _lab_with_host
 	@set -eu; \
-	dir='$(1)'; cm='$(2)'; cmd='$(3)'; \
+	dir='$(1)'; cmd='$(3)'; \
 	if [ -n '$(LAB_HOST)' ]; then \
 		cp "$$dir/kustomization.yaml" "$$dir/kustomization.yaml.bak"; \
 		trap 'mv "$$dir/kustomization.yaml.bak" "$$dir/kustomization.yaml"' EXIT INT TERM; \
-		( cd "$$dir" && kustomize edit set configmap "$$cm" --from-literal=host='$(LAB_HOST)' ); \
+		sed -i -E "s|^([[:space:]]*-[[:space:]]*host=).*|\1$(LAB_HOST)|" "$$dir/kustomization.yaml"; \
 		eval "$$cmd"; \
 	else \
 		echo "WARNING: LAB_HOST is not set; using kustomization placeholder host. Public ingress will not work."; \
