@@ -54,10 +54,12 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 	if containerdVersion == "" {
 		containerdVersion = ContainerdVersion
 	}
+
 	runcVersion := cfg.CRI.Runc.Version
 	if runcVersion == "" {
 		runcVersion = RunCVersion
 	}
+
 	cniVersion := cfg.CNI.PluginVersion
 	if cniVersion == "" {
 		cniVersion = CNIPluginVersion
