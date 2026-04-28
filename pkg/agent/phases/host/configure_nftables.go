@@ -90,7 +90,7 @@ func (c *configureNFTables) ensureNFTablesFlushUnit(ctx context.Context) error {
 		return fmt.Errorf("systemctl daemon-reload: %w", err)
 	}
 
-	if err := utilexec.RunCmd(ctx, c.log, systemctl, "enable", nftablesFlushUnit); err != nil {
+	if err := utilexec.RunCmdAt(ctx, c.log, slog.LevelInfo, systemctl, "enable", nftablesFlushUnit); err != nil {
 		return fmt.Errorf("systemctl enable %s: %w", nftablesFlushUnit, err)
 	}
 

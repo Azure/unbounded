@@ -19,6 +19,14 @@ import (
 // RunCmd creates a command from the given factory, appends args, streams stdout
 // at Debug and stderr at Error, and waits for it to finish.
 func RunCmd(ctx context.Context, logger *slog.Logger, newCmd func(context.Context) *exec.Cmd, args ...string) error {
+	return RunCmdAt(ctx, logger, slog.LevelError, newCmd, args...)
+}
+
+// RunCmdAt is like RunCmd but streams stderr at stderrLevel instead of Error.
+// Use a lower level (e.g. Info or Debug) when stderr output is informational
+// (e.g. systemctl writing "Created symlink..." on enable/mask) or when a
+// failure is expected and already handled by the caller.
+func RunCmdAt(ctx context.Context, logger *slog.Logger, stderrLevel slog.Level, newCmd func(context.Context) *exec.Cmd, args ...string) error {
 	cmd := newCmd(ctx)
 	cmd.Args = append(cmd.Args, args...)
 
@@ -49,7 +57,7 @@ func RunCmd(ctx context.Context, logger *slog.Logger, newCmd func(context.Contex
 	go func() {
 		defer wg.Done()
 
-		streamLogs(ctx, logger, stderr, slog.LevelError)
+		streamLogs(ctx, logger, stderr, stderrLevel)
 	}()
 
 	wg.Wait()
