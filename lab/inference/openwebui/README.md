@@ -55,12 +55,16 @@ Spark-resident Ollama pod traverses unbounded-net.
 ## Deploy
 
 ```sh
-make lab-openwebui-up
+make LAB_HOST=mychat.example.com lab-w1.1-openwebui-up
 ```
 
-Idempotent. Generates `secret.local.yaml` on first run. Re-running does NOT
-rotate the session key; delete `secret.local.yaml` and re-run to rotate
-(invalidates all logged-in sessions).
+Idempotent. `LAB_HOST` overrides the `open-webui-host` configMap on the
+fly (the target backs up and restores `kustomization.yaml`, even on
+Ctrl-C); without it, the placeholder `chat.lab.example.com` is used and
+the public endpoint will not work. Generates `secret.local.yaml` on first
+run. Re-running does NOT rotate the session key; delete
+`secret.local.yaml` and re-run to rotate (invalidates all logged-in
+sessions).
 
 ## First use
 

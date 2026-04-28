@@ -63,3 +63,26 @@ lab.unbounded.cloud/hardware-class=dgx-spark-gb10
 ```
 
 Apply via [`foundation/label-region-a.sh`](foundation/label-region-a.sh).
+
+## Public hostname (`LAB_HOST`)
+
+W1.1 ingresses (Ollama, Open WebUI) read their public hostname from a tiny
+`configMapGenerator` in each `kustomization.yaml`. The committed defaults
+are placeholders (`ollama.lab.example.com`, `chat.lab.example.com`) so the
+repo carries no environment-specific names.
+
+Override on the command line, do not commit the literal:
+
+```sh
+make LAB_HOST=mychat.example.com lab-w1.1-up
+```
+
+The Make target backs up each `kustomization.yaml`, runs
+`kustomize edit set configmap <name> --from-literal=host=$LAB_HOST`,
+applies, and restores the file (even on Ctrl-C). Open WebUI and Ollama
+share a single hostname (path-based routing: `/` -> Open WebUI,
+`/ollama/` -> Ollama API), so one `LAB_HOST` covers both.
+
+If `LAB_HOST` is not set the targets print a warning and apply with the
+placeholder; this is fine for local-dry-run kustomize testing but will not
+produce a working public endpoint.

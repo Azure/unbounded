@@ -632,22 +632,47 @@ docs-serve: ## Start a local Hugo dev server with live-reload
 
 # ---- unbounded-lab (Wave 1) ----
 
+# Public hostname for W1.1 ingresses. Both Ollama and Open WebUI share this
+# host (path-based routing: / -> Open WebUI, /ollama/ -> Ollama API).
+# Override on the command line, do not commit:
+#     make LAB_HOST=mychat.example.com lab-w1.1-up
+# When unset, the placeholder defaults from each kustomization.yaml are used,
+# which will not produce a working public endpoint.
+LAB_HOST ?=
+
+# Helper: if LAB_HOST is set, edit the named configMap host literal in the
+# given kustomize dir, run the wrapped command, then restore the file.
+# Args: $(1)=kustomize dir, $(2)=configmap name, $(3)=command to run
+define _lab_with_host
+	@set -eu; \
+	dir='$(1)'; cm='$(2)'; cmd='$(3)'; \
+	if [ -n '$(LAB_HOST)' ]; then \
+		cp "$$dir/kustomization.yaml" "$$dir/kustomization.yaml.bak"; \
+		trap 'mv "$$dir/kustomization.yaml.bak" "$$dir/kustomization.yaml"' EXIT INT TERM; \
+		( cd "$$dir" && kustomize edit set configmap "$$cm" --from-literal=host='$(LAB_HOST)' ); \
+		eval "$$cmd"; \
+	else \
+		echo "WARNING: LAB_HOST is not set; using kustomization placeholder host. Public ingress will not work."; \
+		eval "$$cmd"; \
+	fi
+endef
+
 .PHONY: lab-w1.1-up lab-w1.1-down lab-w1.1-status \
         lab-w1.1-ollama-up lab-w1.1-ollama-down lab-w1.1-ollama-status \
         lab-w1.1-openwebui-up lab-w1.1-openwebui-down lab-w1.1-openwebui-status
 
 # Aggregate W1.1 = Ollama engine + Open WebUI customer chat UI.
-lab-w1.1-up: lab-w1.1-ollama-up lab-w1.1-openwebui-up ## W1.1 deploy/redeploy: Ollama (Qwen MoE on spark-3d37) + Open WebUI
+lab-w1.1-up: lab-w1.1-ollama-up lab-w1.1-openwebui-up ## W1.1 deploy/redeploy: Ollama (Qwen MoE on spark-3d37) + Open WebUI. Set LAB_HOST=<fqdn> to override the public hostname.
 
 lab-w1.1-down: lab-w1.1-openwebui-down lab-w1.1-ollama-down ## W1.1 tear down both (deletes namespaces + PVCs; weights re-pulled on next up)
 
 lab-w1.1-status: lab-w1.1-ollama-status lab-w1.1-openwebui-status ## W1.1 quick status (both)
 
 # Per-component targets, so each can be brought up independently when needed.
-lab-w1.1-ollama-up: ## W1.1 Ollama engine only
+lab-w1.1-ollama-up: ## W1.1 Ollama engine only. Set LAB_HOST=<fqdn> to override.
 	@test -f lab/inference/ollama-qwen-moe/secret.local.yaml || \
 		( cd lab/inference/ollama-qwen-moe && ./make-auth-secret.sh )
-	kubectl apply -k lab/inference/ollama-qwen-moe
+	$(call _lab_with_host,lab/inference/ollama-qwen-moe,ollama-host,kubectl apply -k lab/inference/ollama-qwen-moe)
 	kubectl -n lab-ollama-qwen-moe rollout status statefulset/ollama --timeout=10m
 
 lab-w1.1-ollama-down: ## W1.1 Ollama engine only - tear down
@@ -656,10 +681,10 @@ lab-w1.1-ollama-down: ## W1.1 Ollama engine only - tear down
 lab-w1.1-ollama-status: ## W1.1 Ollama engine only - status
 	kubectl -n lab-ollama-qwen-moe get statefulset,pod,svc,ingress,certificate,pvc -o wide
 
-lab-w1.1-openwebui-up: ## W1.1 Open WebUI customer chat UI only
+lab-w1.1-openwebui-up: ## W1.1 Open WebUI customer chat UI only. Set LAB_HOST=<fqdn> to override.
 	@test -f lab/inference/openwebui/secret.local.yaml || \
 		( cd lab/inference/openwebui && ./make-secrets.sh )
-	kubectl apply -k lab/inference/openwebui
+	$(call _lab_with_host,lab/inference/openwebui,open-webui-host,kubectl apply -k lab/inference/openwebui)
 	kubectl -n lab-openwebui rollout status deployment/open-webui --timeout=10m
 
 lab-w1.1-openwebui-down: ## W1.1 Open WebUI only - tear down (deletes namespace + chat history PVC)

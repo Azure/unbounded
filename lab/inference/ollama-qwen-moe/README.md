@@ -39,10 +39,20 @@ shared ingress + auth pattern across all Wave 1/2 engines.
 
 ## Hostname
 
-`ollama.lab.example.com` is a placeholder. Set your real public hostname in
-the `configMapGenerator` in `kustomization.yaml`; it must resolve to the
+`ollama.lab.example.com` is a placeholder. The Make targets accept
+`LAB_HOST=<fqdn>` to override on the fly without committing the literal:
+
+```sh
+make LAB_HOST=mychat.example.com lab-w1.1-ollama-up
+```
+
+The target backs up `kustomization.yaml`, runs `kustomize edit set
+configmap ollama-host --from-literal=host=$LAB_HOST`, applies, and
+restores the file even on Ctrl-C. The host must already resolve to the
 `ingress-nginx-controller` LoadBalancer IP before cert-manager can solve
-the ACME HTTP-01 challenge. To change:
+the ACME HTTP-01 challenge.
+
+For a permanent change (e.g. forking the lab) edit the literal directly:
 
 ```sh
 cd lab/inference/ollama-qwen-moe
