@@ -1,0 +1,38 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ollama
+  namespace: lab-ollama-qwen-moe
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    # W1.1 stand-in auth: nginx basic auth backed by ollama-basic-auth Secret.
+    # W1.4 will replace this with the consolidated auth proxy pattern shared
+    # across all engines (Ollama, vLLM, SGLang).
+    nginx.ingress.kubernetes.io/auth-type: basic
+    nginx.ingress.kubernetes.io/auth-secret: ollama-basic-auth
+    nginx.ingress.kubernetes.io/auth-realm: "lab-ollama-qwen-moe"
+    # Long generations need long timeouts; vLLM/Ollama streams can run minutes.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-body-size: "32m"
+    # Ollama API mounts under /ollama on the shared host so Open WebUI can
+    # own the root path. Strip the prefix before forwarding to the backend.
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - LAB_OLLAMA_HOST_PLACEHOLDER
+      secretName: ollama-tls
+  rules:
+    - host: LAB_OLLAMA_HOST_PLACEHOLDER
+      http:
+        paths:
+          - path: /ollama(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: ollama
+                port:
+                  number: 11434

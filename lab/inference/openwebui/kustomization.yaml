@@ -1,0 +1,32 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: lab-openwebui
+resources:
+  - namespace.yaml
+  - pvc.yaml
+  - service.yaml
+  - deployment.yaml
+  - ingress.yaml
+  - secret.local.yaml
+# Override the public hostname before applying:
+#   kustomize edit set configmap open-webui-host --from-literal=host=chat.example.com
+# (or edit configMapGenerator below). DNS must point at the ingress LB IP
+# before cert-manager will solve the ACME HTTP-01 challenge.
+replacements:
+  - source:
+      kind: ConfigMap
+      name: open-webui-host
+      fieldPath: data.host
+    targets:
+      - select:
+          kind: Ingress
+          name: open-webui
+        fieldPaths:
+          - spec.tls.0.hosts.0
+          - spec.rules.0.host
+configMapGenerator:
+  - name: open-webui-host
+    literals:
+      - host=chat.lab.example.com
+generatorOptions:
+  disableNameSuffixHash: true

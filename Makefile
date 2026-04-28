@@ -629,3 +629,41 @@ docs-serve: ## Start a local Hugo dev server with live-reload
 		{ echo "error: hugo not found. Install it from:"; \
 		  echo "  https://gohugo.io/installation/"; exit 1; }
 	cd docs && hugo server
+
+# ---- unbounded-lab (Wave 1) ----
+
+.PHONY: lab-w1.1-up lab-w1.1-down lab-w1.1-status \
+        lab-w1.1-ollama-up lab-w1.1-ollama-down lab-w1.1-ollama-status \
+        lab-w1.1-openwebui-up lab-w1.1-openwebui-down lab-w1.1-openwebui-status
+
+# Aggregate W1.1 = Ollama engine + Open WebUI customer chat UI.
+lab-w1.1-up: lab-w1.1-ollama-up lab-w1.1-openwebui-up ## W1.1 deploy/redeploy: Ollama (Qwen MoE on spark-3d37) + Open WebUI
+
+lab-w1.1-down: lab-w1.1-openwebui-down lab-w1.1-ollama-down ## W1.1 tear down both (deletes namespaces + PVCs; weights re-pulled on next up)
+
+lab-w1.1-status: lab-w1.1-ollama-status lab-w1.1-openwebui-status ## W1.1 quick status (both)
+
+# Per-component targets, so each can be brought up independently when needed.
+lab-w1.1-ollama-up: ## W1.1 Ollama engine only
+	@test -f lab/inference/ollama-qwen-moe/secret.local.yaml || \
+		( cd lab/inference/ollama-qwen-moe && ./make-auth-secret.sh )
+	kubectl apply -k lab/inference/ollama-qwen-moe
+	kubectl -n lab-ollama-qwen-moe rollout status statefulset/ollama --timeout=10m
+
+lab-w1.1-ollama-down: ## W1.1 Ollama engine only - tear down
+	kubectl delete -k lab/inference/ollama-qwen-moe --ignore-not-found
+
+lab-w1.1-ollama-status: ## W1.1 Ollama engine only - status
+	kubectl -n lab-ollama-qwen-moe get statefulset,pod,svc,ingress,certificate,pvc -o wide
+
+lab-w1.1-openwebui-up: ## W1.1 Open WebUI customer chat UI only
+	@test -f lab/inference/openwebui/secret.local.yaml || \
+		( cd lab/inference/openwebui && ./make-secrets.sh )
+	kubectl apply -k lab/inference/openwebui
+	kubectl -n lab-openwebui rollout status deployment/open-webui --timeout=10m
+
+lab-w1.1-openwebui-down: ## W1.1 Open WebUI only - tear down (deletes namespace + chat history PVC)
+	kubectl delete -k lab/inference/openwebui --ignore-not-found
+
+lab-w1.1-openwebui-status: ## W1.1 Open WebUI only - status
+	kubectl -n lab-openwebui get deployment,pod,svc,ingress,certificate,pvc -o wide

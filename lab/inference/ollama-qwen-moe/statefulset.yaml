@@ -1,0 +1,92 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ollama
+  namespace: lab-ollama-qwen-moe
+  labels:
+    app.kubernetes.io/name: ollama
+    app.kubernetes.io/instance: qwen-moe
+spec:
+  serviceName: ollama-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ollama
+      app.kubernetes.io/instance: qwen-moe
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ollama
+        app.kubernetes.io/instance: qwen-moe
+    spec:
+      runtimeClassName: nvidia
+      # Pin to the Region A Spark dedicated to Ollama (Wave 1 convention).
+      nodeSelector:
+        kubernetes.io/hostname: spark-3d37
+        lab.unbounded.cloud/hardware-class: dgx-spark-gb10
+      # The Spark joins the cluster via unbounded-net; tolerate any taints
+      # the node ships with by remaining stricter on the selector above.
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: ollama
+          image: ollama/ollama:0.22.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 11434
+              protocol: TCP
+          env:
+            # Engine parameters (Ollama reads env, not a config file). See plan W1.1.
+            - name: OLLAMA_HOST
+              value: "0.0.0.0:11434"
+            - name: OLLAMA_MODELS
+              value: /var/lib/ollama/models
+            - name: OLLAMA_NUM_PARALLEL
+              value: "2"
+            - name: OLLAMA_CONTEXT_LENGTH
+              value: "65536"
+            - name: OLLAMA_KEEP_ALIVE
+              value: "30m"
+            - name: OLLAMA_FLASH_ATTENTION
+              value: "1"
+            # Default model used by the W1.3 measurement runbook. Override in the
+            # StatefulSet patch if you swap targets without redeploying weights.
+            - name: LAB_DEFAULT_MODEL
+              value: "qwen3:30b-a3b"
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+              memory: 96Gi
+            requests:
+              nvidia.com/gpu: "1"
+              cpu: "2"
+              memory: 32Gi
+          volumeMounts:
+            - name: models
+              mountPath: /var/lib/ollama
+          readinessProbe:
+            httpGet:
+              path: /api/tags
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+  volumeClaimTemplates:
+    - metadata:
+        name: models
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: local-path
+        resources:
+          requests:
+            # Q4_K_M GGUF for Qwen MoE ~24 GB; leave headroom for a second
+            # variant or a small companion model.
+            storage: 60Gi

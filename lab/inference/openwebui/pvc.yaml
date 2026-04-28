@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: data
+  namespace: lab-openwebui
+  labels:
+    app.kubernetes.io/name: open-webui
+spec:
+  accessModes: ["ReadWriteOnce"]
+  # Default StorageClass is Azure Disk (managed-csi); the pod is pinned to the
+  # AKS system pool so the disk attaches successfully. PVC moves with the pod
+  # within Azure-managed nodes only.
+  storageClassName: default
+  resources:
+    requests:
+      storage: 10Gi

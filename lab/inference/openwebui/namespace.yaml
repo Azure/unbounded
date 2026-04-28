@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: lab-openwebui
+  labels:
+    lab.unbounded.cloud/wave: "1"
+    lab.unbounded.cloud/wave-item: "W1.1"
+    lab.unbounded.cloud/role: chat-ui

@@ -1,0 +1,29 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: open-webui
+  namespace: lab-openwebui
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    # Streaming chat completions; do not buffer.
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-body-size: "32m"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - LAB_OPENWEBUI_HOST_PLACEHOLDER
+      secretName: open-webui-tls
+  rules:
+    - host: LAB_OPENWEBUI_HOST_PLACEHOLDER
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: open-webui
+                port:
+                  number: 8080
