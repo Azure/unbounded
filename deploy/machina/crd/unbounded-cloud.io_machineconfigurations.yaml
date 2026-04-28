@@ -124,7 +124,8 @@ spec:
                   RevisionHistoryLimit is the number of old
                   MachineConfigurationVersions to retain for rollback. Versions
                   that are still referenced by a Machine are never deleted
-                  regardless of this limit.
+                  regardless of this limit, so the actual number of retained
+                  versions may exceed this value.
                 format: int32
                 minimum: 0
                 type: integer
@@ -160,10 +161,35 @@ spec:
                       registerWithTaints:
                         description: |-
                           RegisterWithTaints are taints passed to kubelet's
-                          --register-with-taints flag. Each entry uses the standard
-                          Kubernetes taint format: key=value:Effect.
+                          --register-with-taints flag.
                         items:
-                          type: string
+                          description: |-
+                            The node this Taint is attached to has the "effect" on
+                            any pod that does not tolerate the Taint.
+                          properties:
+                            effect:
+                              description: |-
+                                Required. The effect of the taint on pods
+                                that do not tolerate the taint.
+                                Valid effects are NoSchedule, PreferNoSchedule and NoExecute.
+                              type: string
+                            key:
+                              description: Required. The taint key to be applied to
+                                a node.
+                              type: string
+                            timeAdded:
+                              description: TimeAdded represents the time at which
+                                the taint was added.
+                              format: date-time
+                              type: string
+                            value:
+                              description: The taint value corresponding to the taint
+                                key.
+                              type: string
+                          required:
+                          - effect
+                          - key
+                          type: object
                         type: array
                       version:
                         description: Version is the Kubernetes version to install

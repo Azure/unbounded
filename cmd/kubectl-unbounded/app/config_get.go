@@ -107,7 +107,7 @@ func runConfigGetOne(ctx context.Context, c client.WithWatch, name string) error
 
 		if len(k.RegisterWithTaints) > 0 {
 			for _, t := range k.RegisterWithTaints {
-				printConfig("taint", t)
+				printConfig("taint", formatTaint(t))
 			}
 		}
 	}

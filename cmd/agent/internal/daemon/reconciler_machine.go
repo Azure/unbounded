@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"strings"
 
+	corev1 "k8s.io/api/core/v1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -185,7 +186,9 @@ func desiredConfigFromMCV(applied *provision.AgentConfig, tmpl *v1alpha3.Machine
 
 		if taints := tmpl.Kubernetes.RegisterWithTaints; len(taints) > 0 {
 			desired.Kubelet.RegisterWithTaints = make([]string, len(taints))
-			copy(desired.Kubelet.RegisterWithTaints, taints)
+			for i, t := range taints {
+				desired.Kubelet.RegisterWithTaints[i] = taintToString(t)
+			}
 		}
 	}
 
@@ -270,21 +273,14 @@ func updateMachineStatus(
 		machine.Status.Configuration = configStatus
 	}
 
-	condStatus := metav1.ConditionFalse
-	condReason := "Failed"
-
-	if success {
-		condStatus = metav1.ConditionTrue
-		condReason = "Succeeded"
-	}
-
-	apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
-		Type:               v1alpha3.MachineConditionNodeUpdated,
-		Status:             condStatus,
-		Reason:             condReason,
-		Message:            message,
-		ObservedGeneration: machine.Generation,
-	})
-
 	return c.Status().Update(ctx, machine)
+}
+
+// taintToString converts a corev1.Taint to the standard kubelet
+// --register-with-taints format: key=value:Effect.
+func taintToString(t corev1.Taint) string {
+	if t.Value == "" {
+		return fmt.Sprintf("%s:%s", t.Key, t.Effect)
+	}
+	return fmt.Sprintf("%s=%s:%s", t.Key, t.Value, t.Effect)
 }

@@ -99,7 +99,7 @@ func watchMachineOperationCRs(
 
 			log.Debug("enqueuing machine operation",
 				"operation", op.Name,
-				"operationName", op.Spec.OperationName,
+				"operationKind", op.Spec.OperationKind,
 				"phase", op.Status.Phase,
 				"event", event.Type,
 			)

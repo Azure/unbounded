@@ -41,7 +41,7 @@ func (r *reconciler) reconcileOperation(ctx context.Context, log *slog.Logger, o
 		return nil
 	}
 
-	log = log.With("op_name", op.Spec.OperationName, "op_phase", op.Status.Phase)
+	log = log.With("op_name", op.Spec.OperationKind, "op_phase", op.Status.Phase)
 
 	// Check if the agent handles this operation before touching status.
 	execErr := r.executeOperation(ctx, log, &op)
@@ -96,8 +96,8 @@ func (r *reconciler) reconcileOperation(ctx context.Context, log *slog.Logger, o
 // executeOperation dispatches to the appropriate executor method based on
 // the operation name.
 func (r *reconciler) executeOperation(ctx context.Context, log *slog.Logger, op *v1alpha3.MachineOperation) error {
-	switch op.Spec.OperationName {
-	case v1alpha3.OperationReboot:
+	switch op.Spec.OperationKind {
+	case v1alpha3.OperationSoftReboot:
 		// Discover the active nspawn machine at execution time. The name
 		// can change after an upgrade (kube1 <-> kube2), so we cannot
 		// cache it at daemon startup.
@@ -112,7 +112,7 @@ func (r *reconciler) executeOperation(ctx context.Context, log *slog.Logger, op 
 		// PowerOff, PowerOn) are silently ignored. They stay in their
 		// current phase for the machina controller or cloud controller
 		// to process.
-		log.Debug("ignoring operation not handled by agent", "operation", op.Spec.OperationName)
+		log.Debug("ignoring operation not handled by agent", "operation", op.Spec.OperationKind)
 		return errIgnoreOperation
 	}
 }

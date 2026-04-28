@@ -79,6 +79,13 @@ const (
 	// Reason "Failed" when the update fails. While the update is in
 	// progress the status is False with Reason "InProgress".
 	MachineConditionNodeUpdated = "NodeUpdated"
+
+	// MachineConditionConfigurationPending indicates that no
+	// MachineConfiguration has been assigned to this Machine, either
+	// directly via configurationRef or through a machineSelector
+	// match. The Machine remains in a waiting state until a
+	// configuration is assigned.
+	MachineConditionConfigurationPending = "ConfigurationPending"
 )
 
 // Annotation keys.

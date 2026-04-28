@@ -81,7 +81,7 @@ func runSoftReboot(ctx context.Context, c client.WithWatch, name string, ttlSeco
 		},
 		Spec: v1alpha3.MachineOperationSpec{
 			MachineRef:    name,
-			OperationName: v1alpha3.OperationReboot,
+			OperationKind: v1alpha3.OperationSoftReboot,
 		},
 	}
 
@@ -131,11 +131,11 @@ func watchMachineOperation(ctx context.Context, c client.WithWatch, opName strin
 		if phase != lastPhase {
 			switch phase {
 			case v1alpha3.OperationPhaseInProgress:
-				printStep(fmt.Sprintf("Operation %s: %s in progress...", op.Spec.OperationName, opName))
+				printStep(fmt.Sprintf("Operation %s: %s in progress...", op.Spec.OperationKind, opName))
 			case v1alpha3.OperationPhaseComplete:
-				printStep(fmt.Sprintf("Operation %s: %s completed", op.Spec.OperationName, opName))
+				printStep(fmt.Sprintf("Operation %s: %s completed", op.Spec.OperationKind, opName))
 			case v1alpha3.OperationPhaseFailed:
-				printStep(fmt.Sprintf("Operation %s: %s failed: %s", op.Spec.OperationName, opName, op.Status.Message))
+				printStep(fmt.Sprintf("Operation %s: %s failed: %s", op.Spec.OperationKind, opName, op.Status.Message))
 			}
 
 			lastPhase = phase

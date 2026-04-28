@@ -56,7 +56,7 @@ func operationClient(objs ...client.Object) client.WithWatch {
 		Build()
 }
 
-func testMachineOperation(name string, opName v1alpha3.OperationName, phase v1alpha3.OperationPhase) *v1alpha3.MachineOperation {
+func testMachineOperation(name string, opName v1alpha3.OperationKind, phase v1alpha3.OperationPhase) *v1alpha3.MachineOperation {
 	return &v1alpha3.MachineOperation{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: name,
@@ -66,7 +66,7 @@ func testMachineOperation(name string, opName v1alpha3.OperationName, phase v1al
 		},
 		Spec: v1alpha3.MachineOperationSpec{
 			MachineRef:    "test-machine",
-			OperationName: opName,
+			OperationKind: opName,
 		},
 		Status: v1alpha3.MachineOperationStatus{
 			Phase: phase,
@@ -93,7 +93,7 @@ func newTestReconciler(c client.WithWatch, exec *mockExecutor) *reconciler {
 }
 
 func Test_reconcileOperation_PendingReboot(t *testing.T) {
-	op := testMachineOperation("op-1", v1alpha3.OperationReboot, v1alpha3.OperationPhasePending)
+	op := testMachineOperation("op-1", v1alpha3.OperationSoftReboot, v1alpha3.OperationPhasePending)
 	c := operationClient(op)
 	exec := &mockExecutor{}
 	r := newTestReconciler(c, exec)
@@ -114,7 +114,7 @@ func Test_reconcileOperation_PendingReboot(t *testing.T) {
 
 func Test_reconcileOperation_InProgressRecovery(t *testing.T) {
 	// Simulates crash recovery: operation left InProgress by a previous run.
-	op := testMachineOperation("op-2", v1alpha3.OperationReboot, v1alpha3.OperationPhaseInProgress)
+	op := testMachineOperation("op-2", v1alpha3.OperationSoftReboot, v1alpha3.OperationPhaseInProgress)
 	c := operationClient(op)
 	exec := &mockExecutor{}
 	r := newTestReconciler(c, exec)
@@ -129,7 +129,7 @@ func Test_reconcileOperation_InProgressRecovery(t *testing.T) {
 }
 
 func Test_reconcileOperation_SkipsTerminal(t *testing.T) {
-	op := testMachineOperation("op-3", v1alpha3.OperationReboot, v1alpha3.OperationPhaseComplete)
+	op := testMachineOperation("op-3", v1alpha3.OperationSoftReboot, v1alpha3.OperationPhaseComplete)
 	c := operationClient(op)
 	exec := &mockExecutor{}
 	r := newTestReconciler(c, exec)
@@ -142,7 +142,7 @@ func Test_reconcileOperation_SkipsTerminal(t *testing.T) {
 }
 
 func Test_reconcileOperation_ExecutorError(t *testing.T) {
-	op := testMachineOperation("op-4", v1alpha3.OperationReboot, v1alpha3.OperationPhasePending)
+	op := testMachineOperation("op-4", v1alpha3.OperationSoftReboot, v1alpha3.OperationPhasePending)
 	c := operationClient(op)
 	exec := &mockExecutor{softRebootErr: fmt.Errorf("nspawn exploded")}
 	r := newTestReconciler(c, exec)
@@ -168,7 +168,7 @@ func Test_reconcileOperation_UnknownOperationIgnored(t *testing.T) {
 		},
 		Spec: v1alpha3.MachineOperationSpec{
 			MachineRef:    "test-machine",
-			OperationName: "Explode",
+			OperationKind: "Explode",
 		},
 		Status: v1alpha3.MachineOperationStatus{
 			Phase: v1alpha3.OperationPhasePending,
@@ -206,7 +206,7 @@ func Test_reconcileOperation_HardRebootIgnored(t *testing.T) {
 }
 
 func Test_reconcileOperation_SkipsFailed(t *testing.T) {
-	op := testMachineOperation("op-7", v1alpha3.OperationReboot, v1alpha3.OperationPhaseFailed)
+	op := testMachineOperation("op-7", v1alpha3.OperationSoftReboot, v1alpha3.OperationPhaseFailed)
 	op.Status.Message = "previous failure"
 	c := operationClient(op)
 	exec := &mockExecutor{}

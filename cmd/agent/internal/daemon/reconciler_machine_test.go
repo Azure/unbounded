@@ -10,6 +10,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -145,7 +146,7 @@ func Test_desiredConfigFromMCV_OverlaysTaints(t *testing.T) {
 	applied := baseConfig()
 	tmpl := &v1alpha3.MachineConfigurationTemplate{
 		Kubernetes: &v1alpha3.MachineConfigurationKubernetes{
-			RegisterWithTaints: []string{"key=val:NoSchedule"},
+			RegisterWithTaints: []corev1.Taint{{Key: "key", Value: "val", Effect: corev1.TaintEffectNoSchedule}},
 		},
 	}
 

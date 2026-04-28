@@ -23,7 +23,7 @@ func init() {
 // +kubebuilder:resource:scope=Cluster,shortName=mop
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Machine",type="string",JSONPath=".spec.machineRef"
-// +kubebuilder:printcolumn:name="Operation",type="string",JSONPath=".spec.operationName"
+// +kubebuilder:printcolumn:name="Operation",type="string",JSONPath=".spec.operationKind"
 // +kubebuilder:printcolumn:name="Phase",type="string",JSONPath=".status.phase"
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
@@ -49,23 +49,23 @@ type MachineOperationList struct {
 	Items           []MachineOperation `json:"items"`
 }
 
-// OperationName identifies the kind of operation to perform. Predefined
+// OperationKind identifies the kind of operation to perform. Predefined
 // operations cover common lifecycle actions; custom operations may be
 // supported by individual cloud controllers.
-// +kubebuilder:validation:Enum=Reboot;HardReboot
-type OperationName string
+// +kubebuilder:validation:Enum=SoftReboot;HardReboot
+type OperationKind string
 
 const (
-	// OperationReboot restarts the nspawn machine in place without
+	// OperationSoftReboot restarts the nspawn machine in place without
 	// reprovisioning the rootfs. Services are stopped, the nspawn container
 	// is restarted, and services are brought back up. Handled by the
 	// in-VM agent.
-	OperationReboot OperationName = "Reboot"
+	OperationSoftReboot OperationKind = "SoftReboot"
 
 	// OperationHardReboot triggers a full hardware power cycle of the host
 	// via BMC (e.g. Redfish). Handled by the machina controller or cloud
 	// controller.
-	OperationHardReboot OperationName = "HardReboot"
+	OperationHardReboot OperationKind = "HardReboot"
 )
 
 // OperationPhase represents the current phase of a MachineOperation.
@@ -81,17 +81,27 @@ const (
 // MachineOperationSpec defines the desired state of a MachineOperation.
 type MachineOperationSpec struct {
 	// MachineRef is the name of the Machine CR this operation targets.
-	// +kubebuilder:validation:Required
-	// +kubebuilder:validation:MinLength=1
-	MachineRef string `json:"machineRef"`
+	// Either machineRef or machineSelector must be set.
+	// +optional
+	MachineRef string `json:"machineRef,omitempty"`
 
-	// OperationName is the operation to perform on the target machine.
+	// MachineSelector selects machines by labels. When set, the
+	// controller creates individual MachineOperation children for
+	// each matched machine. Either machineRef or machineSelector
+	// must be set.
+	// +optional
+	MachineSelector *metav1.LabelSelector `json:"machineSelector,omitempty"`
+
+	// OperationKind is the operation to perform on the target machine.
 	// +kubebuilder:validation:Required
-	OperationName OperationName `json:"operationName"`
+	OperationKind OperationKind `json:"operationKind"`
 
 	// Parameters is an optional set of key-value pairs passed to the
 	// operation executor. For example, RestartService uses "service" to
 	// specify the systemd unit name.
+	// TODO: Revisit whether map[string]string is sufficient or if we
+	// need a richer type (e.g. runtime.RawExtension for arbitrary
+	// JSON, or a typed []OperationParameter struct).
 	// +optional
 	Parameters map[string]string `json:"parameters,omitempty"`
 
@@ -121,6 +131,13 @@ type MachineOperationStatus struct {
 	// (Complete or Failed).
 	// +optional
 	CompletedAt *metav1.Time `json:"completedAt,omitempty"`
+
+	// ObservedMachineGeneration is the Machine's metadata.generation
+	// at the time the agent began executing the operation. Clients
+	// can compare this to the current Machine generation to determine
+	// whether the operation acted on the expected machine state.
+	// +optional
+	ObservedMachineGeneration int64 `json:"observedMachineGeneration,omitempty"`
 
 	// Conditions represent the latest available observations of the
 	// operation's state.

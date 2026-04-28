@@ -4,6 +4,7 @@
 package v1alpha3
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -70,7 +71,8 @@ type MachineConfigurationSpec struct {
 	// RevisionHistoryLimit is the number of old
 	// MachineConfigurationVersions to retain for rollback. Versions
 	// that are still referenced by a Machine are never deleted
-	// regardless of this limit.
+	// regardless of this limit, so the actual number of retained
+	// versions may exceed this value.
 	// +optional
 	// +kubebuilder:default=10
 	// +kubebuilder:validation:Minimum=0
@@ -103,10 +105,9 @@ type MachineConfigurationKubernetes struct {
 	NodeLabels map[string]string `json:"nodeLabels,omitempty"`
 
 	// RegisterWithTaints are taints passed to kubelet's
-	// --register-with-taints flag. Each entry uses the standard
-	// Kubernetes taint format: key=value:Effect.
+	// --register-with-taints flag.
 	// +optional
-	RegisterWithTaints []string `json:"registerWithTaints,omitempty"`
+	RegisterWithTaints []corev1.Taint `json:"registerWithTaints,omitempty"`
 }
 
 // MachineConfigurationAgent holds agent-specific fields that are part

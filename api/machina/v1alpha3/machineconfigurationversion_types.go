@@ -24,7 +24,7 @@ const (
 // +kubebuilder:object:root=true
 // +kubebuilder:resource:scope=Cluster,shortName=mcv
 // +kubebuilder:subresource:status
-// +kubebuilder:printcolumn:name="Configuration",type="string",JSONPath=".metadata.labels.unbounded-kube\\.io/machine-configuration"
+// +kubebuilder:printcolumn:name="Configuration",type="string",JSONPath=".metadata.labels.unbounded-cloud\\.io/machine-configuration"
 // +kubebuilder:printcolumn:name="Version",type="integer",JSONPath=".spec.version"
 // +kubebuilder:printcolumn:name="Deployed",type="boolean",JSONPath=".status.deployed"
 // +kubebuilder:printcolumn:name="Machines",type="integer",JSONPath=".status.deployedMachines"

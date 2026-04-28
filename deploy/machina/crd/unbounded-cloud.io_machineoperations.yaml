@@ -22,7 +22,7 @@ spec:
     - jsonPath: .spec.machineRef
       name: Machine
       type: string
-    - jsonPath: .spec.operationName
+    - jsonPath: .spec.operationKind
       name: Operation
       type: string
     - jsonPath: .status.phase
@@ -62,15 +62,65 @@ spec:
             description: MachineOperationSpec defines the desired state of a MachineOperation.
             properties:
               machineRef:
-                description: MachineRef is the name of the Machine CR this operation
-                  targets.
-                minLength: 1
+                description: |-
+                  MachineRef is the name of the Machine CR this operation targets.
+                  Either machineRef or machineSelector must be set.
                 type: string
-              operationName:
-                description: OperationName is the operation to perform on the target
+              machineSelector:
+                description: |-
+                  MachineSelector selects machines by labels. When set, the
+                  controller creates individual MachineOperation children for
+                  each matched machine. Either machineRef or machineSelector
+                  must be set.
+                properties:
+                  matchExpressions:
+                    description: matchExpressions is a list of label selector requirements.
+                      The requirements are ANDed.
+                    items:
+                      description: |-
+                        A label selector requirement is a selector that contains values, a key, and an operator that
+                        relates the key and values.
+                      properties:
+                        key:
+                          description: key is the label key that the selector applies
+                            to.
+                          type: string
+                        operator:
+                          description: |-
+                            operator represents a key's relationship to a set of values.
+                            Valid operators are In, NotIn, Exists and DoesNotExist.
+                          type: string
+                        values:
+                          description: |-
+                            values is an array of string values. If the operator is In or NotIn,
+                            the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                            the values array must be empty. This array is replaced during a strategic
+                            merge patch.
+                          items:
+                            type: string
+                          type: array
+                          x-kubernetes-list-type: atomic
+                      required:
+                      - key
+                      - operator
+                      type: object
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  matchLabels:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                      map is equivalent to an element of matchExpressions, whose key field is "key", the
+                      operator is "In", and the values array contains only "value". The requirements are ANDed.
+                    type: object
+                type: object
+                x-kubernetes-map-type: atomic
+              operationKind:
+                description: OperationKind is the operation to perform on the target
                   machine.
                 enum:
-                - Reboot
+                - SoftReboot
                 - HardReboot
                 type: string
               parameters:
@@ -80,6 +130,8 @@ spec:
                   Parameters is an optional set of key-value pairs passed to the
                   operation executor. For example, RestartService uses "service" to
                   specify the systemd unit name.
+                  need a richer type (e.g. runtime.RawExtension for arbitrary
+                  JSON, or a typed []OperationParameter struct).
                 type: object
               ttlSecondsAfterFinished:
                 description: |-
@@ -91,8 +143,7 @@ spec:
                 minimum: 0
                 type: integer
             required:
-            - machineRef
-            - operationName
+            - operationKind
             type: object
           status:
             description: MachineOperationStatus defines the observed state of a MachineOperation.
@@ -166,6 +217,14 @@ spec:
                 description: Message is a human-readable description of the current
                   state.
                 type: string
+              observedMachineGeneration:
+                description: |-
+                  ObservedMachineGeneration is the Machine's metadata.generation
+                  at the time the agent began executing the operation. Clients
+                  can compare this to the current Machine generation to determine
+                  whether the operation acted on the expected machine state.
+                format: int64
+                type: integer
               phase:
                 description: Phase is the current phase of the operation.
                 type: string
