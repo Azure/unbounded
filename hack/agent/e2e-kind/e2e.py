@@ -1118,16 +1118,23 @@ def reset_agent() -> None:
 # install-machine-crd
 # ---------------------------------------------------------------------------
 def install_machine_crd() -> None:
-    """Install the Machine CRD, MachineOperation CRD, and bootstrapper RBAC."""
+    """Install Machine-related CRDs and bootstrapper RBAC."""
 
-    machine_crd_path = REPO_ROOT / "deploy" / "machina" / "crd" / "unbounded-cloud.io_machines.yaml"
-    machineoperation_crd_path = REPO_ROOT / "deploy" / "machina" / "crd" / "unbounded-cloud.io_machineoperations.yaml"
+    crd_dir = REPO_ROOT / "deploy" / "machina" / "crd"
+    machine_crd_path = crd_dir / "unbounded-cloud.io_machines.yaml"
+    machineoperation_crd_path = crd_dir / "unbounded-cloud.io_machineoperations.yaml"
+    mc_crd_path = crd_dir / "unbounded-cloud.io_machineconfigurations.yaml"
+    mcv_crd_path = crd_dir / "unbounded-cloud.io_machineconfigurationversions.yaml"
     rbac_path = REPO_ROOT / "deploy" / "machina" / "rendered" / "07-bootstrapper-rbac.yaml"
 
-    if not machine_crd_path.exists():
-        die(f"Machine CRD not found: {machine_crd_path}")
-    if not machineoperation_crd_path.exists():
-        die(f"MachineOperation CRD not found: {machineoperation_crd_path}")
+    for path, name in [
+        (machine_crd_path, "Machine CRD"),
+        (machineoperation_crd_path, "MachineOperation CRD"),
+        (mc_crd_path, "MachineConfiguration CRD"),
+        (mcv_crd_path, "MachineConfigurationVersion CRD"),
+    ]:
+        if not path.exists():
+            die(f"{name} not found: {path}")
 
     log("Rendering machina manifests...")
     run(["make", "machina-manifests"], cwd=str(REPO_ROOT))
@@ -1135,16 +1142,19 @@ def install_machine_crd() -> None:
     if not rbac_path.exists():
         die(f"Bootstrapper RBAC not found after render: {rbac_path}")
 
-    log("Installing Machine CRD...")
-    kubectl(["apply", "-f", str(machine_crd_path)])
-
-    log("Installing MachineOperation CRD...")
-    kubectl(["apply", "-f", str(machineoperation_crd_path)])
+    for path, name in [
+        (machine_crd_path, "Machine CRD"),
+        (machineoperation_crd_path, "MachineOperation CRD"),
+        (mc_crd_path, "MachineConfiguration CRD"),
+        (mcv_crd_path, "MachineConfigurationVersion CRD"),
+    ]:
+        log(f"Installing {name}...")
+        kubectl(["apply", "-f", str(path)])
 
     log("Installing bootstrapper RBAC...")
     kubectl(["apply", "-f", str(rbac_path)])
 
-    log("Machine CRD, MachineOperation CRD, and RBAC installed")
+    log("All CRDs and RBAC installed")
 
 
 # ---------------------------------------------------------------------------
@@ -1323,11 +1333,9 @@ def _bump_patch_version(version: str) -> str:
 def trigger_upgrade() -> None:
     """Patch the Machine CR to trigger a version upgrade via repaveCounter.
 
-    Reads the current Kubernetes version from the node, bumps the patch
-    component (e.g. v1.33.1 -> v1.33.2), and patches the Machine CR with
-    both spec.kubernetes.version and spec.operations.repaveCounter=1.
-    The daemon detects both spec drift and operations drift and triggers
-    nodeupdate.Execute().
+    Creates a MachineConfigurationVersion with the upgrade version, sets
+    spec.configurationRef on the Machine CR, and bumps the repaveCounter
+    so the daemon detects operations drift and triggers a node update.
     """
 
     log(f"Triggering node upgrade for Machine CR '{AGENT_MACHINE_NAME}'...")
@@ -1353,9 +1361,37 @@ def trigger_upgrade() -> None:
     if result.returncode == 0:
         log(f"Applied config files before upgrade: {result.stdout.strip()}")
 
-    # Patch the Machine CR to set the new version and repaveCounter = 1.
-    # The CRD requires spec.kubernetes.bootstrapTokenRef when
-    # spec.kubernetes is present, so we include a placeholder value.
+    # Create a MachineConfigurationVersion with the upgrade version.
+    # The reconciler resolves MCV from configurationRef name + version,
+    # expecting a CR named "<name>-v<version>".
+    mc_name = f"{AGENT_MACHINE_NAME}-config"
+    mcv_version = 1
+    mcv_name = f"{mc_name}-v{mcv_version}"
+
+    mcv_manifest = json.dumps({
+        "apiVersion": "unbounded-cloud.io/v1alpha3",
+        "kind": "MachineConfigurationVersion",
+        "metadata": {
+            "name": mcv_name,
+            "labels": {
+                "unbounded-cloud.io/machine-configuration": mc_name,
+                "unbounded-cloud.io/machine-configuration-version": str(mcv_version),
+            },
+        },
+        "spec": {
+            "version": mcv_version,
+            "template": {
+                "kubernetes": {
+                    "version": upgrade_version,
+                },
+            },
+        },
+    })
+
+    log(f"Creating MachineConfigurationVersion '{mcv_name}'...")
+    kubectl(["apply", "-f", "-"], input=mcv_manifest, text=True)
+
+    # Patch the Machine CR to set configurationRef and bump repaveCounter.
     patch = json.dumps({
         "spec": {
             "kubernetes": {
@@ -1367,13 +1403,18 @@ def trigger_upgrade() -> None:
             "operations": {
                 "repaveCounter": 1,
             },
+            "configurationRef": {
+                "name": mc_name,
+                "version": mcv_version,
+            },
         },
     })
     kubectl(["patch", "machine", AGENT_MACHINE_NAME,
              "--type=merge", "-p", patch])
 
     log(f"Machine CR patched: spec.kubernetes.version={upgrade_version}, "
-        f"spec.operations.repaveCounter=1")
+        f"spec.operations.repaveCounter=1, "
+        f"spec.configurationRef.name={mc_name}, version={mcv_version}")
 
     # Show the Machine CR state after patch.
     kubectl(["get", "machine", AGENT_MACHINE_NAME, "-o", "yaml"])
