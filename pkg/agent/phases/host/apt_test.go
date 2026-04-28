@@ -37,6 +37,7 @@ func TestHardenAPT_WritesBothDropIns(t *testing.T) {
 
 	apt := string(aptBytes)
 	require.Contains(t, apt, "Unattended-Upgrade::Package-Blacklist")
+
 	for _, pkg := range []string{
 		`"systemd";`,
 		`"systemd-container";`,

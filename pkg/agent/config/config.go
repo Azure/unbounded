@@ -68,6 +68,7 @@ type KubeletAuthInfo struct {
 // Validate checks that exactly one auth method is configured.
 func (a *KubeletAuthInfo) Validate() error {
 	hasToken := a.BootstrapToken != ""
+
 	hasExec := a.ExecCredential != nil
 	switch {
 	case hasToken && hasExec:
@@ -75,9 +76,11 @@ func (a *KubeletAuthInfo) Validate() error {
 	case !hasToken && !hasExec:
 		return fmt.Errorf("one of BootstrapToken or ExecCredential must be set")
 	}
+
 	if hasExec && a.ExecCredential.Command == "" {
 		return fmt.Errorf("ExecCredential.Command is required")
 	}
+
 	return nil
 }
 

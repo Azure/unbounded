@@ -192,6 +192,7 @@ func (c *configureKubelet) ensureKubeconfig() error {
 // cluster CA and server from the kubelet goal state.
 func (c *configureKubelet) buildKubeconfig(authInfo *clientcmdapi.AuthInfo) clientcmdapi.Config {
 	spec := c.goalState.Kubelet
+
 	return clientcmdapi.Config{
 		Clusters: map[string]*clientcmdapi.Cluster{
 			"cluster": {
@@ -218,11 +219,14 @@ func (c *configureKubelet) ensureBootstrapKubeconfig() error {
 	cfg := c.buildKubeconfig(&clientcmdapi.AuthInfo{
 		Token: c.goalState.Kubelet.BootstrapToken,
 	})
+
 	data, err := clientcmd.Write(cfg)
 	if err != nil {
 		return fmt.Errorf("serialize bootstrap kubeconfig: %w", err)
 	}
+
 	dest := filepath.Join(c.goalState.MachineDir, goalstates.KubeletBootstrapKubeconfigPath)
+
 	return utilio.WriteFile(dest, data, 0o600)
 }
 
@@ -232,6 +236,7 @@ func (c *configureKubelet) ensureExecKubeconfig() error {
 	cfg := c.buildKubeconfig(&clientcmdapi.AuthInfo{
 		Exec: c.goalState.Kubelet.ExecCredential,
 	})
+
 	data, err := clientcmd.Write(cfg)
 	if err != nil {
 		return fmt.Errorf("serialize exec kubeconfig: %w", err)
@@ -239,6 +244,7 @@ func (c *configureKubelet) ensureExecKubeconfig() error {
 	// Exec credential plugins provide renewable tokens, so write directly
 	// to the kubelet kubeconfig path (no TLS bootstrap needed).
 	dest := filepath.Join(c.goalState.MachineDir, goalstates.KubeletKubeconfigPath)
+
 	return utilio.WriteFile(dest, data, 0o600)
 }
 
