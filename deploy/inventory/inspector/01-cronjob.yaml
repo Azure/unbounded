@@ -20,3 +20,4 @@ spec:
                     name: inventory-database-config
                 - secretRef:
                     name: pg-creds
+          restartPolicy: OnFailure
