@@ -253,6 +253,29 @@ func Test_resolveMCV_NotFound(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// reconcileUpdateMachine - nil configurationRef
+// ---------------------------------------------------------------------------
+
+// Test_reconcileUpdateMachine_NilConfigRef verifies that reconciliation is
+// skipped gracefully when the Machine CR has no configurationRef set.
+func Test_reconcileUpdateMachine_NilConfigRef(t *testing.T) {
+	machine := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-machine"},
+		Spec:       v1alpha3.MachineSpec{},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(newScheme()).
+		WithObjects(machine).
+		Build()
+
+	r := &reconciler{client: c, machineName: "test-machine"}
+
+	err := r.reconcileUpdateMachine(context.Background(), slog.Default(), "test-machine", false)
+	require.NoError(t, err)
+}
+
+// ---------------------------------------------------------------------------
 // reconcileUpdateMachine with forceRepave
 // ---------------------------------------------------------------------------
 

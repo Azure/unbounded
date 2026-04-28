@@ -35,8 +35,14 @@ func (r *reconciler) reconcileUpdateMachine(ctx context.Context, log *slog.Logge
 	}
 
 	// Resolve the MachineConfigurationVersion from configurationRef.
+	// If no configurationRef is set, skip reconciliation - the machine
+	// has not been assigned a configuration yet.
 	mcv, err := r.resolveMCV(ctx, log, machine)
 	if err != nil {
+		if machine.Spec.ConfigurationRef == nil {
+			log.Debug("machine has no configurationRef, skipping reconciliation")
+			return nil
+		}
 		return fmt.Errorf("resolve MachineConfigurationVersion: %w", err)
 	}
 
@@ -90,6 +96,10 @@ func (r *reconciler) reconcileUpdateMachine(ctx context.Context, log *slog.Logge
 
 	// Execute the node update with the desired config.
 	if err := updateNode(ctx, log, active, desired); err != nil {
+		// Re-read the Machine CR to get the latest resourceVersion.
+		if getErr := r.client.Get(ctx, client.ObjectKey{Name: machineName}, machine); getErr != nil {
+			log.Warn("failed to re-read Machine CR for failure status update", "error", getErr)
+		}
 		// Update status to Failed.
 		failMsg := fmt.Sprintf("node update failed: %v", err)
 		if updateErr := updateMachineStatus(ctx, r.client, machine, v1alpha3.MachinePhaseFailed, failMsg, nil, false); updateErr != nil {
@@ -108,6 +118,15 @@ func (r *reconciler) reconcileUpdateMachine(ctx context.Context, log *slog.Logge
 		Version:     mcv.Spec.Version,
 		VersionName: mcv.Name,
 	}
+
+	// Re-read the Machine CR to get the latest resourceVersion before
+	// the final status update. The earlier Provisioning phase update
+	// may have been overwritten by a concurrent reconciliation triggered
+	// by the status change event.
+	if err := r.client.Get(ctx, client.ObjectKey{Name: machineName}, machine); err != nil {
+		log.Warn("failed to re-read Machine CR for final status update", "error", err)
+	}
+	acknowledgeOperations(machine)
 
 	// Update status to Joining with success.
 	if err := updateMachineStatus(ctx, r.client, machine, v1alpha3.MachinePhaseJoining, "node update completed", configStatus, true); err != nil {
