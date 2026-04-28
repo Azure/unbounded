@@ -292,6 +292,22 @@ func updateMachineStatus(
 		machine.Status.Configuration = configStatus
 	}
 
+	condStatus := metav1.ConditionFalse
+	condReason := "Failed"
+
+	if success {
+		condStatus = metav1.ConditionTrue
+		condReason = "Succeeded"
+	}
+
+	apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
+		Type:               v1alpha3.MachineConditionNodeUpdated,
+		Status:             condStatus,
+		Reason:             condReason,
+		Message:            message,
+		ObservedGeneration: machine.Generation,
+	})
+
 	return c.Status().Update(ctx, machine)
 }
 
