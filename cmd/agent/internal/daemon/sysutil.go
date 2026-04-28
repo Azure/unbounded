@@ -28,7 +28,7 @@ func writeFile(filename string, content []byte, perm os.FileMode) error {
 }
 
 // runCmd creates a command from the given factory, appends args, streams stdout
-// at Debug and stderr at Error, and waits for it to finish.
+// at Debug and stderr at Info, and waits for it to finish.
 func runCmd(ctx context.Context, logger *slog.Logger, newCmd func(context.Context) *exec.Cmd, args ...string) error {
 	cmd := newCmd(ctx)
 	cmd.Args = append(cmd.Args, args...)
@@ -60,7 +60,7 @@ func runCmd(ctx context.Context, logger *slog.Logger, newCmd func(context.Contex
 	go func() {
 		defer wg.Done()
 
-		streamLogs(ctx, logger, stderr, slog.LevelError)
+		streamLogs(ctx, logger, stderr, slog.LevelInfo)
 	}()
 
 	wg.Wait()
