@@ -96,3 +96,5 @@ hack/net/templates/*.json
 
 # Temporary files
 *.tmp
+agent
+kubectl-unbounded
