@@ -73,6 +73,13 @@ func RunCmdAt(ctx context.Context, logger *slog.Logger, stderrLevel slog.Level, 
 // Debug and stderr at Error, and returns the captured stdout as a string.
 // Unlike RunCmd it does not require a command factory - just a binary path.
 func OutputCmd(ctx context.Context, logger *slog.Logger, name string, args ...string) (string, error) {
+	return OutputCmdAt(ctx, logger, slog.LevelError, name, args...)
+}
+
+// OutputCmdAt is like OutputCmd but streams stderr at stderrLevel instead of
+// Error. Use a lower level (e.g. Debug) when stderr output is informational or
+// an error exit is expected and already handled by the caller.
+func OutputCmdAt(ctx context.Context, logger *slog.Logger, stderrLevel slog.Level, name string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
 
 	stdout, err := cmd.StdoutPipe()
@@ -104,7 +111,7 @@ func OutputCmd(ctx context.Context, logger *slog.Logger, name string, args ...st
 	go func() {
 		defer wg.Done()
 
-		streamLogs(ctx, logger, stderr, slog.LevelError)
+		streamLogs(ctx, logger, stderr, stderrLevel)
 	}()
 
 	wg.Wait()
