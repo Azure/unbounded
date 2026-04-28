@@ -114,6 +114,7 @@ func TestCRIConfig_OmittedWhenEmpty(t *testing.T) {
 	cri := parsed["CRI"].(map[string]interface{})
 	containerd := cri["Containerd"].(map[string]interface{})
 	assert.NotContains(t, containerd, "Version")
+
 	runc := cri["Runc"].(map[string]interface{})
 	assert.NotContains(t, runc, "Version")
 

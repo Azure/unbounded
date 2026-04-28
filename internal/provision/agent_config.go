@@ -252,9 +252,11 @@ func ResolveDownloadOverrides(d *AgentDownloads) *goalstates.DownloadOverrides {
 		if s == nil {
 			return nil
 		}
+
 		if s.BaseURL == "" && s.URL == "" && s.Version == "" {
 			return nil
 		}
+
 		return &goalstates.DownloadSource{
 			BaseURL: s.BaseURL,
 			URL:     s.URL,
