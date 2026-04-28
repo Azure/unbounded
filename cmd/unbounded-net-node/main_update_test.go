@@ -13,8 +13,8 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/tools/cache"
 
-	unboundednetv1alpha1 "github.com/Azure/unbounded-kube/api/net/v1alpha1"
-	unboundednetnetlink "github.com/Azure/unbounded-kube/internal/net/netlink"
+	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
+	unboundednetnetlink "github.com/Azure/unbounded/internal/net/netlink"
 )
 
 func newInformerWithObjects(objects ...*unstructured.Unstructured) cache.SharedIndexInformer {

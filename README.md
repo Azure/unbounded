@@ -9,16 +9,16 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Azure/unbounded-kube/releases/latest"><img src="https://img.shields.io/github/v/release/Azure/unbounded-kube?style=flat-square" alt="Release"></a>
-  <a href="https://github.com/Azure/unbounded-kube/actions/workflows/go-ci.yaml"><img src="https://img.shields.io/github/actions/workflow/status/Azure/unbounded-kube/go-ci.yaml?branch=main&label=CI&style=flat-square" alt="Go CI"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/Azure/unbounded-kube?style=flat-square" alt="License"></a>
+  <a href="https://github.com/Azure/unbounded/releases/latest"><img src="https://img.shields.io/github/v/release/Azure/unbounded?style=flat-square" alt="Release"></a>
+  <a href="https://github.com/Azure/unbounded/actions/workflows/ci.yaml"><img src="https://img.shields.io/github/actions/workflow/status/Azure/unbounded/ci.yaml?branch=main&label=CI&style=flat-square" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/Azure/unbounded?style=flat-square" alt="License"></a>
 </p>
 
 ---
 
 > **Early Development** — This project is under active development. It is suitable
 > for experimentation and prototyping, but expect rough edges and breaking changes.
-> Please report issues on the [Issue Tracker](https://github.com/Azure/unbounded-kube/issues).
+> Please report issues on the [Issue Tracker](https://github.com/Azure/unbounded/issues).
 
 ## What is Unbounded Kubernetes?
 
@@ -36,7 +36,7 @@ so that pods, services, and DNS work transparently across sites.
   <img src="docs/static/img/unbounded-overview.svg" alt="Unbounded Kubernetes overview: Control Plane connected to Bare Metal (PXE Boot), Public Cloud (cloud-init), and AI Infrastructure (SSH) sites via WireGuard and Direct L3 networking" width="800">
 </p>
 
-For a deeper dive, see the [Project Overview](https://azure.github.io/unbounded-kube/concepts/overview/).
+For a deeper dive, see the [Project Overview](https://azure.github.io/unbounded/concepts/overview/).
 
 ## Key Features
 
@@ -51,17 +51,17 @@ For a deeper dive, see the [Project Overview](https://azure.github.io/unbounded-
 
 | Component | Description | Details |
 |-----------|-------------|---------|
-| **[unbounded-agent](https://azure.github.io/unbounded-kube/guides/agent/)** | Single binary delivered to hosts to bootstrap them as Kubernetes worker nodes using `systemd-nspawn`. | [Agent Guide](https://azure.github.io/unbounded-kube/guides/agent/) |
-| **[machina](https://azure.github.io/unbounded-kube/guides/ssh/)** | Kubernetes controller that provisions remote Linux machines over SSH. | [SSH Guide](https://azure.github.io/unbounded-kube/guides/ssh/), [CRD Reference](https://azure.github.io/unbounded-kube/reference/machina-crd/) |
-| **[metalman](https://azure.github.io/unbounded-kube/guides/pxe/)** | Controller for PXE-booting bare-metal servers with DHCP, TFTP, HTTP, Redfish BMC, and TPM 2.0. | [PXE Guide](https://azure.github.io/unbounded-kube/guides/pxe/), [Bare Metal Concepts](https://azure.github.io/unbounded-kube/concepts/bare-metal/) |
-| **[unbounded-net](https://github.com/Azure/unbounded-net)** | CNI plugin and multi-site networking system for cross-site pod connectivity. | [Networking Concepts](https://azure.github.io/unbounded-kube/concepts/networking/) |
-| **kubectl-unbounded** | kubectl plugin for initializing sites, adding machines, and managing the cluster. | [CLI Reference](https://azure.github.io/unbounded-kube/reference/cli/) |
+| **[unbounded-agent](https://azure.github.io/unbounded/guides/agent/)** | Single binary delivered to hosts to bootstrap them as Kubernetes worker nodes using `systemd-nspawn`. | [Agent Guide](https://azure.github.io/unbounded/guides/agent/) |
+| **[machina](https://azure.github.io/unbounded/guides/ssh/)** | Kubernetes controller that provisions remote Linux machines over SSH. | [SSH Guide](https://azure.github.io/unbounded/guides/ssh/), [CRD Reference](https://azure.github.io/unbounded/reference/machina-crd/) |
+| **[metalman](https://azure.github.io/unbounded/guides/pxe/)** | Controller for PXE-booting bare-metal servers with DHCP, TFTP, HTTP, Redfish BMC, and TPM 2.0. | [PXE Guide](https://azure.github.io/unbounded/guides/pxe/), [Bare Metal Concepts](https://azure.github.io/unbounded/concepts/bare-metal/) |
+| **[unbounded-net](https://github.com/Azure/unbounded-net)** | CNI plugin and multi-site networking system for cross-site pod connectivity. | [Networking Concepts](https://azure.github.io/unbounded/concepts/networking/) |
+| **kubectl-unbounded** | kubectl plugin for initializing sites, adding machines, and managing the cluster. | [CLI Reference](https://azure.github.io/unbounded/reference/cli/) |
 
 ## Quick Start
 
 Get a working multi-site cluster in under 10 minutes. This creates an AKS cluster
 and joins a remote node to it. Already have a cluster? See the
-[Bring Your Own Cluster](https://azure.github.io/unbounded-kube/guides/existing-cluster/) guide.
+[Bring Your Own Cluster](https://azure.github.io/unbounded/guides/existing-cluster/) guide.
 
 <p align="center">
   <img src="docs/static/img/quickstart-architecture.svg" alt="Quickstart architecture: AKS cluster with gateway nodes connected to a remote site over WireGuard" width="700">
@@ -71,7 +71,7 @@ and joins a remote node to it. Already have a cluster? See the
 
 ```bash
 # Linux amd64
-curl -sL https://github.com/Azure/unbounded-kube/releases/latest/download/kubectl-unbounded-linux-amd64.tar.gz | tar xz
+curl -sL https://github.com/Azure/unbounded/releases/latest/download/kubectl-unbounded-linux-amd64.tar.gz | tar xz
 sudo mv kubectl-unbounded /usr/local/bin/
 ```
 
@@ -79,7 +79,7 @@ sudo mv kubectl-unbounded /usr/local/bin/
 <summary>macOS (Apple Silicon)</summary>
 
 ```bash
-curl -sL https://github.com/Azure/unbounded-kube/releases/latest/download/kubectl-unbounded-darwin-arm64.tar.gz | tar xz
+curl -sL https://github.com/Azure/unbounded/releases/latest/download/kubectl-unbounded-darwin-arm64.tar.gz | tar xz
 sudo mv kubectl-unbounded /usr/local/bin/
 ```
 
@@ -88,7 +88,7 @@ sudo mv kubectl-unbounded /usr/local/bin/
 ### 2. Create the cluster
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/Azure/unbounded-kube/main/hack/scripts/aks-quickstart.sh
+curl -fsSLO https://raw.githubusercontent.com/Azure/unbounded/main/hack/scripts/aks-quickstart.sh
 chmod +x aks-quickstart.sh
 
 ./aks-quickstart.sh create \
@@ -119,17 +119,17 @@ kubectl get nodes -w
 After a few minutes your remote node appears with status **Ready**.
 
 For the full walkthrough including pod networking verification, see the
-[Getting Started Guide](https://azure.github.io/unbounded-kube/guides/getting-started/).
+[Getting Started Guide](https://azure.github.io/unbounded/guides/getting-started/).
 
 ## Documentation
 
-Full documentation is available at **[azure.github.io/unbounded-kube](https://azure.github.io/unbounded-kube/)**.
+Full documentation is available at **[azure.github.io/unbounded](https://azure.github.io/unbounded/)**.
 
 | | |
 |---|---|
-| **Concepts** | [Project Overview](https://azure.github.io/unbounded-kube/concepts/overview/) · [Networking](https://azure.github.io/unbounded-kube/concepts/networking/) · [Bare Metal](https://azure.github.io/unbounded-kube/concepts/bare-metal/) |
-| **Guides** | [Getting Started](https://azure.github.io/unbounded-kube/guides/getting-started/) · [Existing Cluster](https://azure.github.io/unbounded-kube/guides/existing-cluster/) · [SSH Provisioning](https://azure.github.io/unbounded-kube/guides/ssh/) · [Cloud API](https://azure.github.io/unbounded-kube/guides/cloud-api/) · [PXE Boot](https://azure.github.io/unbounded-kube/guides/pxe/) · [Agent](https://azure.github.io/unbounded-kube/guides/agent/) |
-| **Reference** | [Architecture](https://azure.github.io/unbounded-kube/reference/architecture/) · [CLI](https://azure.github.io/unbounded-kube/reference/cli/) · [Machine CRD](https://azure.github.io/unbounded-kube/reference/machina-crd/) · [GPU / NVIDIA](https://azure.github.io/unbounded-kube/reference/gpu/nvidia/) |
+| **Concepts** | [Project Overview](https://azure.github.io/unbounded/concepts/overview/) · [Networking](https://azure.github.io/unbounded/concepts/networking/) · [Bare Metal](https://azure.github.io/unbounded/concepts/bare-metal/) |
+| **Guides** | [Getting Started](https://azure.github.io/unbounded/guides/getting-started/) · [Existing Cluster](https://azure.github.io/unbounded/guides/existing-cluster/) · [SSH Provisioning](https://azure.github.io/unbounded/guides/ssh/) · [Cloud API](https://azure.github.io/unbounded/guides/cloud-api/) · [PXE Boot](https://azure.github.io/unbounded/guides/pxe/) · [Agent](https://azure.github.io/unbounded/guides/agent/) |
+| **Reference** | [Architecture](https://azure.github.io/unbounded/reference/architecture/) · [CLI](https://azure.github.io/unbounded/reference/cli/) · [Machine CRD](https://azure.github.io/unbounded/reference/machina-crd/) · [GPU / NVIDIA](https://azure.github.io/unbounded/reference/gpu/nvidia/) |
 
 ## Repository Structure
 
@@ -183,7 +183,7 @@ pull requests.
 
 - [Code of Conduct](CODE_OF_CONDUCT.md)
 - [Support](SUPPORT.md)
-- [Issue Tracker](https://github.com/Azure/unbounded-kube/issues)
+- [Issue Tracker](https://github.com/Azure/unbounded/issues)
 
 ## License
 

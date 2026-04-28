@@ -10,9 +10,9 @@ import (
 
 	"k8s.io/klog/v2"
 
-	"github.com/Azure/unbounded-kube/internal/net/healthcheck"
-	unboundednetnetlink "github.com/Azure/unbounded-kube/internal/net/netlink"
-	"github.com/Azure/unbounded-kube/internal/net/routeplan"
+	"github.com/Azure/unbounded/internal/net/healthcheck"
+	unboundednetnetlink "github.com/Azure/unbounded/internal/net/netlink"
+	"github.com/Azure/unbounded/internal/net/routeplan"
 )
 
 // buildMeshPeerRoutes builds DesiredRoute entries for a single mesh peer.

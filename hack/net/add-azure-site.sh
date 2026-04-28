@@ -177,7 +177,7 @@ ensure_site_gateway_resources() {
 
     echo "==> Ensuring Site '${site_name}' CRD..."
     {
-        echo "apiVersion: net.unbounded-kube.io/v1alpha1"
+        echo "apiVersion: net.unbounded-cloud.io/v1alpha1"
         echo "kind: Site"
         echo "metadata:"
         echo "  name: ${site_name}"
@@ -205,18 +205,18 @@ ensure_site_gateway_resources() {
         local pool_name="${GATEWAY_POOL_NAMES[$i]}"
         local pool_type="${GATEWAY_POOL_TYPES[$i]}"
         cat <<EOF | kubectl apply -f -
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: GatewayPool
 metadata:
   name: ${pool_name}
 spec:
   type: ${pool_type}
   nodeSelector:
-    net.unbounded-kube.io/agentpool: "${pool_name}"
+    net.unbounded-cloud.io/agentpool: "${pool_name}"
 EOF
 
         cat <<EOF | kubectl apply -f -
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: SiteGatewayPoolAssignment
 metadata:
   name: ${site_name}-${pool_name}
@@ -249,7 +249,7 @@ ensure_site_peering_resource() {
     peering_name="${primary_site_name}-${site_name}"
     echo "==> Ensuring SitePeering '${peering_name}'..."
     cat <<EOF | kubectl apply -f -
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: SitePeering
 metadata:
   name: ${peering_name}
@@ -288,7 +288,7 @@ ensure_primary_gateway_connectivity() {
             fi
             peering_name="${first_pool}-${second_pool}"
             cat <<EOF | kubectl apply -f -
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: GatewayPoolPeering
 metadata:
   name: ${peering_name}
@@ -305,7 +305,7 @@ EOF
     if [[ "$PEER_PRIMARY_VNET" == true ]]; then
         echo "==> Ensuring SiteGatewayPoolAssignment to primary pool '${primary_gateway_pool_name}'..."
         cat <<EOF | kubectl apply -f -
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: SiteGatewayPoolAssignment
 metadata:
   name: ${site_name}-${primary_gateway_pool_name}
@@ -608,7 +608,7 @@ fi
 
 # generate_pool_customdata <pool_name> [extra_labels]
 # Outputs base64-encoded customdata to stdout. Status messages go to stderr.
-# extra_labels is substituted for __EXTRA_NODE_LABELS__ (e.g. ",net.unbounded-kube.io/gateway=true").
+# extra_labels is substituted for __EXTRA_NODE_LABELS__ (e.g. ",net.unbounded-cloud.io/gateway=true").
 generate_pool_customdata() {
     local pool_name="$1"
     local extra_labels="${2:-}"
@@ -616,7 +616,7 @@ generate_pool_customdata() {
     # Check for an existing bootstrap token secret for this pool
     local existing_secret
     existing_secret="$(kubectl get secrets -n kube-system \
-        -l net.unbounded-kube.io/pool-name="$pool_name" \
+        -l net.unbounded-cloud.io/pool-name="$pool_name" \
         --field-selector type=bootstrap.kubernetes.io/token \
         -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
 
@@ -642,7 +642,7 @@ generate_pool_customdata() {
             --from-literal=usage-bootstrap-signing="true" >&2
         kubectl label secret "bootstrap-token-${token_id}" \
             --namespace kube-system \
-            net.unbounded-kube.io/pool-name="$pool_name" >&2
+            net.unbounded-cloud.io/pool-name="$pool_name" >&2
     fi
 
     # Render the userdata template with all substitutions and base64-encode
@@ -712,7 +712,7 @@ for i in $(seq 1 "$EXT_GATEWAY_POOLS"); do
     hostname_prefix="$(get_hostname_prefix "$pool_name")"
     echo "  Pool: $pool_name (external gateway, sku=$GATEWAY_SKU, count=$GATEWAY_COUNT)"
     cd_file="${TEMP_DIR}/${pool_name}.cd"
-    generate_pool_customdata "$pool_name" ",net.unbounded-kube.io/gateway=true" > "$cd_file"
+    generate_pool_customdata "$pool_name" ",net.unbounded-cloud.io/gateway=true" > "$cd_file"
     add_pool "$pool_name" "$GATEWAY_SKU" "$GATEWAY_COUNT" "$hostname_prefix" "$cd_file" true "51820-51999/udp" "$NSG_RULE_PRIORITY"
     GATEWAY_POOL_NAMES+=("$pool_name")
     GATEWAY_POOL_TYPES+=("External")
@@ -725,7 +725,7 @@ for i in $(seq 1 "$INT_GATEWAY_POOLS"); do
     hostname_prefix="$(get_hostname_prefix "$pool_name")"
     echo "  Pool: $pool_name (internal gateway, sku=$GATEWAY_SKU, count=$GATEWAY_COUNT)"
     cd_file="${TEMP_DIR}/${pool_name}.cd"
-    generate_pool_customdata "$pool_name" ",net.unbounded-kube.io/gateway=true" > "$cd_file"
+    generate_pool_customdata "$pool_name" ",net.unbounded-cloud.io/gateway=true" > "$cd_file"
     add_pool "$pool_name" "$GATEWAY_SKU" "$GATEWAY_COUNT" "$hostname_prefix" "$cd_file" false
     GATEWAY_POOL_NAMES+=("$pool_name")
     GATEWAY_POOL_TYPES+=("Internal")

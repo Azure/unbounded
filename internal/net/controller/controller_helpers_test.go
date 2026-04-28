@@ -13,7 +13,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 
-	"github.com/Azure/unbounded-kube/internal/net/allocator"
+	"github.com/Azure/unbounded/internal/net/allocator"
 )
 
 // TestControllerInformerSynced tests controller informer synced.

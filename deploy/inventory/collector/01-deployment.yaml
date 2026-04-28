@@ -1,0 +1,41 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inventory-collector
+  namespace: inventory
+  labels:
+    app: inventory-collector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: inventory-collector
+  template:
+    metadata:
+      labels:
+        app: inventory-collector
+    spec:
+      initContainers:
+        - name: ensure-database
+          image: postgres:17
+          command: ["sh", "-c"]
+          args:
+            - |
+              psql "host=$POSTGRES_HOST port=$POSTGRES_PORT user=$POSTGRES_USER password=$POSTGRES_PASSWORD dbname=postgres sslmode=$POSTGRES_SSL_MODE" \
+                -tc "SELECT 1 FROM pg_database WHERE datname = '$POSTGRES_DB_NAME'" | grep -q 1 \
+                || psql "host=$POSTGRES_HOST port=$POSTGRES_PORT user=$POSTGRES_USER password=$POSTGRES_PASSWORD dbname=postgres sslmode=$POSTGRES_SSL_MODE" \
+                  -c "CREATE DATABASE \"$POSTGRES_DB_NAME\""
+          envFrom:
+            - configMapRef:
+                name: inventory-database-config
+            - secretRef:
+                name: pg-creds
+      containers:
+        - name: inventory-collector
+          image: stargatetmedev.azurecr.io/inventory-collector:latest
+          envFrom:
+            - configMapRef:
+                name: inventory-database-config
+            - secretRef:
+                name: pg-creds

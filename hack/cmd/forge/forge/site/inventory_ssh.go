@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/Azure/unbounded-kube/hack/cmd/forge/forge/site/azuredev"
+	"github.com/Azure/unbounded/hack/cmd/forge/forge/site/azuredev"
 )
 
 // WriteInventoryAsSSH writes an SSH config to w for all machines in the inventory.

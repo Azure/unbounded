@@ -1,4 +1,4 @@
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: Site
 metadata:
   name: site-nebius

@@ -11,9 +11,9 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/Azure/unbounded-kube/hack/cmd/forge/forge/cluster"
-	"github.com/Azure/unbounded-kube/hack/cmd/forge/forge/cmd"
-	"github.com/Azure/unbounded-kube/hack/cmd/forge/forge/site"
+	"github.com/Azure/unbounded/hack/cmd/forge/forge/cluster"
+	"github.com/Azure/unbounded/hack/cmd/forge/forge/cmd"
+	"github.com/Azure/unbounded/hack/cmd/forge/forge/site"
 )
 
 func Run() {
@@ -26,8 +26,8 @@ func Run() {
 
 	root := &cobra.Command{
 		Use:               "forge [command]",
-		Short:             "unbounded-kube development tool",
-		Long:              `unbounded-kube development tool`,
+		Short:             "unbounded development tool",
+		Long:              `unbounded development tool`,
 		SilenceUsage:      true,
 		PersistentPreRunE: setup(&rootCfg.DataDir),
 	}

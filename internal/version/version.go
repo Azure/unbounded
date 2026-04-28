@@ -6,9 +6,9 @@
 // The variables Version, GitCommit, and BuildTime are intended to be set at
 // compile time via -ldflags:
 //
-//	go build -ldflags "-X github.com/Azure/unbounded-kube/internal/version.Version=v1.0.0
-//	                    -X github.com/Azure/unbounded-kube/internal/version.GitCommit=abc1234
-//	                    -X github.com/Azure/unbounded-kube/internal/version.BuildTime=2026-04-21T00:00:00Z"
+//	go build -ldflags "-X github.com/Azure/unbounded/internal/version.Version=v1.0.0
+//	                    -X github.com/Azure/unbounded/internal/version.GitCommit=abc1234
+//	                    -X github.com/Azure/unbounded/internal/version.BuildTime=2026-04-21T00:00:00Z"
 package version
 
 import (

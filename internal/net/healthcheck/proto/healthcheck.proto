@@ -3,7 +3,7 @@
 
 syntax = "proto3";
 package healthcheck;
-option go_package = "github.com/Azure/unbounded-kube/internal/net/healthcheck/proto";
+option go_package = "github.com/Azure/unbounded/internal/net/healthcheck/proto";
 
 enum PacketType {
   REQUEST = 0;

@@ -10,8 +10,8 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
 
-	"github.com/Azure/unbounded-kube/hack/cmd/forge/forge/azsdk"
-	"github.com/Azure/unbounded-kube/hack/cmd/forge/forge/validate"
+	"github.com/Azure/unbounded/hack/cmd/forge/forge/azsdk"
+	"github.com/Azure/unbounded/hack/cmd/forge/forge/validate"
 )
 
 type ResourceGroupManager struct {

@@ -89,6 +89,6 @@
 
   <!-- Label -->
   <rect x="275" y="215" width="155" height="16" rx="3" fill="#1e1e22" stroke="#2a2a2e" stroke-width="0.8"/>
-  <text x="352" y="227" text-anchor="middle" fill="#34d399" font-size="8" font-family="'SF Mono', 'Fira Code', monospace">unbounded-kube.io/machine</text>
+  <text x="352" y="227" text-anchor="middle" fill="#34d399" font-size="8" font-family="'SF Mono', 'Fira Code', monospace">unbounded-cloud.io/machine</text>
   <text x="352" y="246" text-anchor="middle" fill="#a0a0a8" font-size="9">(bidirectional via label)</text>
 </svg>

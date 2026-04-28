@@ -12,7 +12,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v4"
 
-	"github.com/Azure/unbounded-kube/hack/cmd/forge/forge/infra"
+	"github.com/Azure/unbounded/hack/cmd/forge/forge/infra"
 )
 
 func newGatewayAgentPool(site, sku string, nodeCount int32) armcontainerservice.ManagedClusterAgentPoolProfile {
@@ -30,7 +30,7 @@ func newGatewayAgentPool(site, sku string, nodeCount int32) armcontainerservice.
 			Protocol:  to.Ptr(armcontainerservice.ProtocolUDP),
 		}).
 		WithNodeLabels(map[string]string{
-			"unbounded-kube.io/unbounded-net-gateway": "true",
+			"unbounded-cloud.io/unbounded-net-gateway": "true",
 		}).
 		WithNodeTaints([]string{
 			"CriticalAddonsOnly=true:NoSchedule",

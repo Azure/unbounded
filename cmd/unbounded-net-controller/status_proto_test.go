@@ -10,7 +10,7 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
-	statusproto "github.com/Azure/unbounded-kube/internal/net/status/proto"
+	statusproto "github.com/Azure/unbounded/internal/net/status/proto"
 )
 
 func TestProtoToNodeStatus(t *testing.T) {

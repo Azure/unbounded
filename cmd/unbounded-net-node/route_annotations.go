@@ -11,7 +11,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 
-	"github.com/Azure/unbounded-kube/internal/net/routeplan"
+	"github.com/Azure/unbounded/internal/net/routeplan"
 )
 
 // routeKey uniquely identifies an expected route by destination, gateway,

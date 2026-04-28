@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -25,8 +26,8 @@ import (
 
 	stderrs "errors"
 
-	unboundedv1alpha3 "github.com/Azure/unbounded-kube/api/machina/v1alpha3"
-	"github.com/Azure/unbounded-kube/internal/provision"
+	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/provision"
 )
 
 const (
@@ -215,9 +216,9 @@ type MachineReconciler struct {
 	ProvisioningTimeoutDuration time.Duration
 }
 
-// +kubebuilder:rbac:groups=unbounded-kube.io,resources=machines,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=unbounded-kube.io,resources=machines/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=unbounded-kube.io,resources=machines/finalizers,verbs=update
+// +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machines,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machines/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machines/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 
 // Reconcile handles Machine reconciliation: reachability checks and provisioning.
@@ -619,7 +620,8 @@ func (r *MachineReconciler) provisionMachine(
 	execSession.Stderr = &stderr
 
 	cmd := fmt.Sprintf(
-		`UNBOUNDED_AGENT_CONFIG_FILE=%q sudo -E bash %s`,
+		`%sUNBOUNDED_AGENT_CONFIG_FILE=%q sudo -E bash %s`,
+		agentInstallEnvPrefix(machine),
 		remoteConfigPath,
 		remoteScriptPath,
 	)
@@ -862,4 +864,20 @@ func (r *MachineReconciler) reconcileNodeJoin(ctx context.Context, machine *unbo
 func wasProvisioned(machine *unboundedv1alpha3.Machine) bool {
 	cond := apimeta.FindStatusCondition(machine.Status.Conditions, unboundedv1alpha3.MachineConditionProvisioned)
 	return cond != nil && cond.Status == metav1.ConditionTrue
+}
+
+// agentInstallEnvPrefix returns a space-terminated list of POSIX-quoted
+// KEY=VALUE pairs that should be prepended to the agent install script
+// invocation. Empty string when no overrides are set.
+func agentInstallEnvPrefix(machine *unboundedv1alpha3.Machine) string {
+	if machine == nil {
+		return ""
+	}
+
+	env := provision.AgentInstallEnv(machine.Spec.Agent)
+	if len(env) == 0 {
+		return ""
+	}
+
+	return strings.Join(env, " ") + " "
 }

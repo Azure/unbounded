@@ -13,7 +13,7 @@ import (
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	"k8s.io/klog/v2"
 
-	"github.com/Azure/unbounded-kube/internal/net/config"
+	"github.com/Azure/unbounded/internal/net/config"
 )
 
 func runLeaderElection(ctx context.Context, cfg *config.Config, clientset kubernetes.Interface, health *healthState, runFunc func(ctx context.Context)) {

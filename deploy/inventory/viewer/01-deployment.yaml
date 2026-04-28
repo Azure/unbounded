@@ -1,0 +1,26 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inventory-viewer
+  namespace: inventory
+  labels:
+    app: inventory-viewer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: inventory-viewer
+  template:
+    metadata:
+      labels:
+        app: inventory-viewer
+    spec:
+      containers:
+        - name: inventory-viewer
+          image: stargatetmedev.azurecr.io/inventory-viewer:latest
+          envFrom:
+            - configMapRef:
+                name: inventory-database-config
+            - secretRef:
+                name: pg-creds

@@ -22,7 +22,7 @@ import (
 	"github.com/cilium/ebpf"
 	flag "github.com/spf13/pflag"
 
-	"github.com/Azure/unbounded-kube/internal/version"
+	"github.com/Azure/unbounded/internal/version"
 )
 
 const (

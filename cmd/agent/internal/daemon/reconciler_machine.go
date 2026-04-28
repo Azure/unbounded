@@ -13,8 +13,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	v1alpha3 "github.com/Azure/unbounded-kube/api/machina/v1alpha3"
-	"github.com/Azure/unbounded-kube/internal/provision"
+	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/provision"
 )
 
 // reconcileUpdateMachine processes a single Machine CR reconciliation cycle.
@@ -168,12 +168,6 @@ func desiredConfigFromMCV(applied *provision.AgentConfig, tmpl *v1alpha3.Machine
 	if applied.Kubelet.RegisterWithTaints != nil {
 		desired.Kubelet.RegisterWithTaints = make([]string, len(applied.Kubelet.RegisterWithTaints))
 		copy(desired.Kubelet.RegisterWithTaints, applied.Kubelet.RegisterWithTaints)
-	}
-
-	// Preserve Attest pointer.
-	if applied.Attest != nil {
-		a := *applied.Attest
-		desired.Attest = &a
 	}
 
 	// Overlay MCV template fields.

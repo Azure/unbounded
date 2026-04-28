@@ -8,7 +8,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/Azure/unbounded-kube/internal/logger"
+	"github.com/Azure/unbounded/internal/logger"
 )
 
 // CommandContext holds cross-cutting configuration shared by all agent

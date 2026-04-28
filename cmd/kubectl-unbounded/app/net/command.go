@@ -18,8 +18,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
-	unboundedv1alpha1 "github.com/Azure/unbounded-kube/api/net/v1alpha1"
-	"github.com/Azure/unbounded-kube/internal/version"
+	unboundedv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
+	"github.com/Azure/unbounded/internal/version"
 )
 
 const (

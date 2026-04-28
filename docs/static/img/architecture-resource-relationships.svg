@@ -76,5 +76,5 @@
   <!-- Node ◄──► Machine (bidirectional, green) -->
   <line x1="250" y1="240" x2="452" y2="240" stroke="#34d399" stroke-width="1.5" marker-start="url(#arrowBiL)" marker-end="url(#arrowBiR)"/>
   <text x="460" y="237" fill="#e4e4e7" font-size="11" font-weight="600">Machine</text>
-  <text x="460" y="252" fill="#a0a0a8" font-size="10" font-family="'SF Mono', 'Fira Code', monospace">label: unbounded-kube.io/machine=&lt;name&gt;</text>
+  <text x="460" y="252" fill="#a0a0a8" font-size="10" font-family="'SF Mono', 'Fira Code', monospace">label: unbounded-cloud.io/machine=&lt;name&gt;</text>
 </svg>

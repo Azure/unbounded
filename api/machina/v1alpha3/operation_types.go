@@ -12,7 +12,7 @@ const (
 	// MachineOperation to identify the target Machine. Agents use a
 	// label selector on this key to scope their informer to only
 	// operations targeting their own machine.
-	MachineOperationMachineLabelKey = "unbounded-kube.io/machine"
+	MachineOperationMachineLabelKey = "unbounded-cloud.io/machine"
 )
 
 func init() {

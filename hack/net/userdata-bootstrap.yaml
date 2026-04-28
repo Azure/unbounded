@@ -24,7 +24,7 @@
 #     __SUBNET_NAME__             - Azure subnet name
 #     __ROUTE_TABLE_NAME__        - Azure route table name
 #     __SCALE_SET_NAME__           - Azure VMSS name for this pool
-#     __EXTRA_NODE_LABELS__        - Extra node labels (e.g. ",net.unbounded-kube.io/gateway=true" or empty)
+#     __EXTRA_NODE_LABELS__        - Extra node labels (e.g. ",net.unbounded-cloud.io/gateway=true" or empty)
 #     __KUBELET_CLIENT_ID__       - Client ID of the kubelet managed identity
 #
 #   Example with sed:
@@ -950,7 +950,7 @@ write_files:
           # Note: kubernetes.azure.com/cluster and kubernetes.azure.com/resource-group are
           # intentionally omitted because bootstrap scripts are only used for secondary-site
           # nodes that don't belong to the primary cluster's Azure resource group.
-          local node_labels="kubernetes.azure.com/managed=false,node.kubernetes.io/exclude-from-external-load-balancers=true,net.unbounded-kube.io/provider=azure,net.unbounded-kube.io/customdata-generated=__CUSTOMDATA_GENERATED__,net.unbounded-kube.io/agentpool=__SCALE_SET_NAME____EXTRA_NODE_LABELS__"
+          local node_labels="kubernetes.azure.com/managed=false,node.kubernetes.io/exclude-from-external-load-balancers=true,net.unbounded-cloud.io/provider=azure,net.unbounded-cloud.io/customdata-generated=__CUSTOMDATA_GENERATED__,net.unbounded-cloud.io/agentpool=__SCALE_SET_NAME____EXTRA_NODE_LABELS__"
 
           # Build --node-ip flag with detected addresses
           # This prevents kubelet from autodetecting IPs which can be unstable

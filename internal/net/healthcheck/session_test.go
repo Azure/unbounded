@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	pb "github.com/Azure/unbounded-kube/internal/net/healthcheck/proto"
+	pb "github.com/Azure/unbounded/internal/net/healthcheck/proto"
 )
 
 func TestSessionGoesUpOnReply(t *testing.T) {

@@ -1,10 +1,10 @@
 ---
 title: "Getting Started"
 weight: 1
-description: "Create an AKS cluster with Unbounded Kube and join your first remote node."
+description: "Create an AKS cluster with Unbounded and join your first remote node."
 ---
 
-This guide creates an AKS cluster configured for Unbounded Kube and joins a
+This guide creates an AKS cluster configured for Unbounded and joins a
 remote node to it. You'll have a working multi-site cluster in a few minutes.
 
 ![Quickstart architecture: AKS cluster with gateway nodes connected to a remote site over WireGuard](../../img/quickstart-architecture.svg)
@@ -37,7 +37,7 @@ az login
 az aks install-cli
 
 # kubectl-unbounded (Linux amd64)
-curl -sL https://github.com/Azure/unbounded-kube/releases/latest/download/kubectl-unbounded-linux-amd64.tar.gz | tar xz
+curl -sL https://github.com/Azure/unbounded/releases/latest/download/kubectl-unbounded-linux-amd64.tar.gz | tar xz
 sudo mv kubectl-unbounded /usr/local/bin/
 ```
 
@@ -46,7 +46,7 @@ sudo mv kubectl-unbounded /usr/local/bin/
 
 ```bash
 # kubectl-unbounded (macOS arm64)
-curl -sL https://github.com/Azure/unbounded-kube/releases/latest/download/kubectl-unbounded-darwin-arm64.tar.gz | tar xz
+curl -sL https://github.com/Azure/unbounded/releases/latest/download/kubectl-unbounded-darwin-arm64.tar.gz | tar xz
 sudo mv kubectl-unbounded /usr/local/bin/
 ```
 
@@ -65,7 +65,7 @@ az version && kubectl version --client && kubectl unbounded --help
 Download and run the quickstart script:
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/Azure/unbounded-kube/main/hack/scripts/aks-quickstart.sh
+curl -fsSLO https://raw.githubusercontent.com/Azure/unbounded/main/hack/scripts/aks-quickstart.sh
 chmod +x aks-quickstart.sh
 
 ./aks-quickstart.sh create \
@@ -161,11 +161,11 @@ Deploy a test pod on the remote node and verify cross-site connectivity:
 ```bash
 # Run a pod on the remote node
 kubectl run test-remote --image=busybox --restart=Never \
-    --overrides='{"spec":{"nodeSelector":{"net.unbounded-kube.io/site":"remote"}}}' \
+    --overrides='{"spec":{"nodeSelector":{"net.unbounded-cloud.io/site":"remote"}}}' \
     -- sleep 3600
 
 # Get a cluster node's internal IP
-CLUSTER_NODE_IP=$(kubectl get nodes -l 'net.unbounded-kube.io/site=cluster' \
+CLUSTER_NODE_IP=$(kubectl get nodes -l 'net.unbounded-cloud.io/site=cluster' \
     -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
 
 # Ping a cluster node from the remote pod (cross-site, over WireGuard)
@@ -173,7 +173,7 @@ kubectl exec test-remote -- ping -c 3 "$CLUSTER_NODE_IP"
 
 # Run a pod on a cluster node and curl it from the remote pod
 kubectl run test-cluster --image=nginx --restart=Never \
-    --overrides='{"spec":{"nodeSelector":{"net.unbounded-kube.io/site":"cluster"}}}'
+    --overrides='{"spec":{"nodeSelector":{"net.unbounded-cloud.io/site":"cluster"}}}'
 kubectl wait --for=condition=ready pod/test-cluster --timeout=60s
 CLUSTER_POD_IP=$(kubectl get pod test-cluster -o jsonpath='{.status.podIP}')
 kubectl exec test-remote -- wget -qO- "http://$CLUSTER_POD_IP"
@@ -212,7 +212,7 @@ A dedicated `gwmain` pool separate from the system pool:
   automatically
 - **Tainted** `CriticalAddonsOnly=true:NoSchedule` -- only networking
   components run here
-- **Labeled** `unbounded-kube.io/unbounded-net-gateway=true` -- tells
+- **Labeled** `unbounded-cloud.io/unbounded-net-gateway=true` -- tells
   unbounded-net which nodes are gateways
 
 ### unbounded-net CNI

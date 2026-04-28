@@ -9,8 +9,8 @@ and at the edge, without being limited by the location of your control plane.
 unbounded-kube is organized into several directories:
 
 - `api/` - where API definitions for custom resources are located.
-  - `machina/v1alpha3/` - Machine CRD types (unbounded-kube.io group).
-  - `net/v1alpha1/` - Net CRD types (net.unbounded-kube.io group): Site, GatewayPool, SitePeering, etc.
+  - `machina/v1alpha3/` - Machine CRD types (unbounded-cloud.io group).
+  - `net/v1alpha1/` - Net CRD types (net.unbounded-cloud.io group): Site, GatewayPool, SitePeering, etc.
 - `bin/` - where generated binary artifacts should be placed.
 - `bpf/` - eBPF C programs for network encapsulation (compiled with clang).
 - `cmd/` - where the sources for each binary artifact are located. Each subdirectory corresponds to a binary artifact.

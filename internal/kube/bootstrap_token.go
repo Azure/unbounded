@@ -82,7 +82,7 @@ func ApplyBootstrapToken(ctx context.Context, kubeCli kubernetes.Interface, fiel
 
 func GetBootstrapTokenForSite(ctx context.Context, kubeCli kubernetes.Interface, siteName string) (*BootstrapToken, error) {
 	l, err := kubeCli.CoreV1().Secrets(metav1.NamespaceSystem).List(ctx, metav1.ListOptions{
-		LabelSelector: fmt.Sprintf("unbounded-kube.io/site=%s", siteName),
+		LabelSelector: fmt.Sprintf("unbounded-cloud.io/site=%s", siteName),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("list secrets: %w", err)

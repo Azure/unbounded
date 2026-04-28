@@ -14,11 +14,11 @@ func init() {
 // Label keys set on MachineConfigurationVersion objects.
 const (
 	// MCVConfigurationLabelKey identifies the parent MachineConfiguration.
-	MCVConfigurationLabelKey = "unbounded-kube.io/machine-configuration"
+	MCVConfigurationLabelKey = "unbounded-cloud.io/machine-configuration"
 
 	// MCVVersionLabelKey stores the version number as a label for
 	// efficient selection.
-	MCVVersionLabelKey = "unbounded-kube.io/machine-configuration-version"
+	MCVVersionLabelKey = "unbounded-cloud.io/machine-configuration-version"
 )
 
 // +kubebuilder:object:root=true

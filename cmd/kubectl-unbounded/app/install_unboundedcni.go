@@ -10,7 +10,7 @@ import (
 
 	"k8s.io/client-go/kubernetes"
 
-	netdeploy "github.com/Azure/unbounded-kube/deploy/net"
+	netdeploy "github.com/Azure/unbounded/deploy/net"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )

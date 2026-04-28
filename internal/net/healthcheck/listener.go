@@ -13,7 +13,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"k8s.io/klog/v2"
 
-	pb "github.com/Azure/unbounded-kube/internal/net/healthcheck/proto"
+	pb "github.com/Azure/unbounded/internal/net/healthcheck/proto"
 )
 
 const maxPacketSize = 1500

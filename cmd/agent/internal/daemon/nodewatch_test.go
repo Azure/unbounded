@@ -18,7 +18,7 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	v1alpha3 "github.com/Azure/unbounded-kube/api/machina/v1alpha3"
+	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
 
 func nodeScheme() *runtime.Scheme {

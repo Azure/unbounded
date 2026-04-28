@@ -8,7 +8,7 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 
-	v1alpha3 "github.com/Azure/unbounded-kube/api/machina/v1alpha3"
+	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
 
 // newScheme returns a runtime.Scheme that includes the core Kubernetes types

@@ -18,7 +18,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	v1alpha3 "github.com/Azure/unbounded-kube/api/machina/v1alpha3"
+	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
 
 // MachineConfigurationReconciler reconciles MachineConfiguration objects.

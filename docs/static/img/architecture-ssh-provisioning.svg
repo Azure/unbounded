@@ -94,7 +94,7 @@
   <!-- ═══════════════════════════════════════════════════ -->
   <rect x="40" y="425" width="260" height="48" rx="8" fill="#18181b" stroke="#34d399" stroke-width="1.5" stroke-opacity="0.6"/>
   <text x="170" y="446" text-anchor="middle" fill="#e4e4e7" font-size="12" font-weight="600">Node appears with label</text>
-  <text x="170" y="464" text-anchor="middle" fill="#a0a0a8" font-size="10" font-family="'SF Mono', 'Fira Code', monospace">unbounded-kube.io/machine=&lt;name&gt;</text>
+  <text x="170" y="464" text-anchor="middle" fill="#a0a0a8" font-size="10" font-family="'SF Mono', 'Fira Code', monospace">unbounded-cloud.io/machine=&lt;name&gt;</text>
 
   <!-- Arrow down -->
   <line x1="170" y1="473" x2="170" y2="490" stroke="#34d399" stroke-width="1.5" marker-end="url(#arrowDown)"/>

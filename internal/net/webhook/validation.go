@@ -21,9 +21,9 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 
-	unboundednetv1alpha1 "github.com/Azure/unbounded-kube/api/net/v1alpha1"
-	"github.com/Azure/unbounded-kube/internal/net/allocator"
-	unboundednet "github.com/Azure/unbounded-kube/internal/net/client/unboundednet"
+	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
+	"github.com/Azure/unbounded/internal/net/allocator"
+	unboundednet "github.com/Azure/unbounded/internal/net/client/unboundednet"
 )
 
 // Validator validates admission requests for unbounded CNI custom resources.

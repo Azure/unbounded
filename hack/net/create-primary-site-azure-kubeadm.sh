@@ -122,7 +122,7 @@ ensure_site_gateway_resources() {
 
     echo "==> Ensuring Site '${site_name}' and GatewayPool '${gateway_pool_name}' CRDs..."
     {
-        echo "apiVersion: net.unbounded-kube.io/v1alpha1"
+        echo "apiVersion: net.unbounded-cloud.io/v1alpha1"
         echo "kind: Site"
         echo "metadata:"
         echo "  name: ${site_name}"
@@ -141,14 +141,14 @@ ensure_site_gateway_resources() {
     } | kubectl apply -f -
 
     cat <<EOF | kubectl apply -f -
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: GatewayPool
 metadata:
   name: ${gateway_pool_name}
 spec:
   type: External
   nodeSelector:
-    net.unbounded-kube.io/agentpool: "${gateway_pool_name}"
+    net.unbounded-cloud.io/agentpool: "${gateway_pool_name}"
 $(if [[ "${#service_cidrs[@]}" -gt 0 ]]; then
     echo "  routedCidrs:"
     for cidr in "${service_cidrs[@]}"; do
@@ -158,7 +158,7 @@ fi)
 EOF
 
     cat <<EOF | kubectl apply -f -
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: SiteGatewayPoolAssignment
 metadata:
   name: ${site_name}-${gateway_pool_name}
@@ -549,7 +549,7 @@ SEDEOF
 
     # Generate gateway customdata (uses standard bootstrap template)
     echo "  Pool: ${GATEWAY_POOL_NAME} (external gateway, sku=$GATEWAY_VM_SIZE, count=$GATEWAY_COUNT)"
-    write_common_sed_script "${TEMP_DIR}/gateway.sed" "${SITE_NAME}-${GATEWAY_POOL_NAME}" ",net.unbounded-kube.io/gateway=true"
+    write_common_sed_script "${TEMP_DIR}/gateway.sed" "${SITE_NAME}-${GATEWAY_POOL_NAME}" ",net.unbounded-cloud.io/gateway=true"
     cat >> "${TEMP_DIR}/gateway.sed" <<SEDEOF
 /^[[:space:]]*#/!s|__API_SERVER__|${API_SERVER_IP}:${API_SERVER_PORT}|g
 /^[[:space:]]*#/!s|__KUBELET_CLIENT_ID__|${IDENTITY_CLIENT_ID}|g

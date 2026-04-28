@@ -18,7 +18,7 @@ import (
 	ktesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 
-	unboundednetv1alpha1 "github.com/Azure/unbounded-kube/api/net/v1alpha1"
+	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 )
 
 // testInformer is a minimal cache.SharedIndexInformer for tests that only need GetStore().
@@ -219,7 +219,7 @@ func fakeGatewayDynamic(objects ...runtime.Object) *dynamicfake.FakeDynamicClien
 	for _, obj := range objects {
 		if u, ok := obj.(*unstructured.Unstructured); ok {
 			if u.GetAPIVersion() == "" {
-				u.SetAPIVersion("net.unbounded-kube.io/v1alpha1")
+				u.SetAPIVersion("net.unbounded-cloud.io/v1alpha1")
 			}
 
 			if u.GetKind() == "" {

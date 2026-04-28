@@ -11,7 +11,7 @@ A Site represents a network location containing nodes. Nodes are automatically a
 ### Specification
 
 ```yaml
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: Site
 metadata:
   name: site-east
@@ -101,7 +101,7 @@ When `manageCniPlugin` is `false`, pod CIDR assignment by the controller is disa
 
 **Example -- site with an existing CNI plugin:**
 ```yaml
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: Site
 metadata:
   name: existing-cni-site
@@ -135,7 +135,7 @@ flowchart TD
     N[Node with Internal IP<br/>10.0.5.25] --> C{Check Site nodeCidrs}
     C --> S1{Site A<br/>10.0.0.0/16}
     C --> S2{Site B<br/>10.1.0.0/16}
-    S1 -->|Match!| L[Label: net.unbounded-kube.io/site=site-a]
+    S1 -->|Match!| L[Label: net.unbounded-cloud.io/site=site-a]
     S2 -->|No Match| X[Skip]
 ```
 
@@ -143,7 +143,7 @@ flowchart TD
 
 **Basic Site:**
 ```yaml
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: Site
 metadata:
   name: datacenter-east
@@ -154,7 +154,7 @@ spec:
 
 **Multi-Region Site with Pod CIDR Assignments:**
 ```yaml
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: Site
 metadata:
   name: aws-us-east-1
@@ -184,12 +184,12 @@ SiteNodeSlice contains a slice of nodes belonging to a site. Each slice holds up
 ### Specification
 
 ```yaml
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: SiteNodeSlice
 metadata:
   name: site-east-0
   ownerReferences:
-    - apiVersion: net.unbounded-kube.io/v1alpha1
+    - apiVersion: net.unbounded-cloud.io/v1alpha1
       kind: Site
       name: site-east
       uid: <site-uid>
@@ -268,7 +268,7 @@ Deletion is blocked while a pool has active nodes that match its selector.
 ### Specification
 
 ```yaml
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: GatewayPool
 metadata:
   name: main-gateways
@@ -278,7 +278,7 @@ spec:
 
   # Required: Label selector for gateway nodes
   nodeSelector:
-    net.unbounded-kube.io/gateway: "true"
+    net.unbounded-cloud.io/gateway: "true"
     topology.kubernetes.io/zone: "us-east-1a"
 
   # Optional: Additional CIDRs to route through this pool
@@ -382,7 +382,7 @@ flowchart TD
 
 **Simple Gateway Pool:**
 ```yaml
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: GatewayPool
 metadata:
   name: all-gateways
@@ -393,25 +393,25 @@ spec:
 
 **Zone-Specific Gateway Pool:**
 ```yaml
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: GatewayPool
 metadata:
   name: zone-a-gateways
 spec:
   nodeSelector:
-    net.unbounded-kube.io/gateway: "true"
+    net.unbounded-cloud.io/gateway: "true"
     topology.kubernetes.io/zone: "zone-a"
 ```
 
 **Gateway Pool with Custom Routes:**
 ```yaml
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: GatewayPool
 metadata:
   name: edge-gateways
 spec:
   nodeSelector:
-    net.unbounded-kube.io/edge-gateway: "true"
+    net.unbounded-cloud.io/edge-gateway: "true"
   routedCidrs:
     - "192.168.0.0/16"  # On-premises network
     - "172.16.0.0/12"   # Legacy infrastructure
@@ -428,7 +428,7 @@ GatewayPoolNode represents an individual node's membership in a gateway pool. Th
 ### Specification
 
 ```yaml
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: GatewayPoolNode
 metadata:
   name: pool-a-node-1
@@ -478,7 +478,7 @@ SitePeering defines direct peering between sites. By default, nodes in peered si
 ### Specification
 
 ```yaml
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: SitePeering
 metadata:
   name: east-west-peering
@@ -588,7 +588,7 @@ flowchart TD
 
 **Basic Two-Site SitePeering:**
 ```yaml
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: SitePeering
 metadata:
   name: datacenter-peering
@@ -600,7 +600,7 @@ spec:
 
 **Network-Peered Sites without Node Mesh:**
 ```yaml
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: SitePeering
 metadata:
   name: large-sites-peering
@@ -613,7 +613,7 @@ spec:
 
 **Multi-Site Regional SitePeering:**
 ```yaml
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: SitePeering
 metadata:
   name: us-east-region
@@ -633,7 +633,7 @@ SiteGatewayPoolAssignment defines which gateway pools serve which sites. This co
 ### Specification
 
 ```yaml
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: SiteGatewayPoolAssignment
 metadata:
   name: east-gateways
@@ -687,7 +687,7 @@ GatewayPoolPeering defines peering between gateway pools, enabling cross-pool ro
 ### Specification
 
 ```yaml
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: GatewayPoolPeering
 metadata:
   name: east-west-pool-peering
@@ -729,20 +729,20 @@ spec:
 
 | Label | Applied To | Description |
 |-------|-----------|-------------|
-| `net.unbounded-kube.io/site` | Node | Site membership. Set by Site controller. |
+| `net.unbounded-cloud.io/site` | Node | Site membership. Set by Site controller. |
 | `app.kubernetes.io/name: unbounded-net` | CRDs | Identifies unbounded-net resources. |
 
 ### Annotations
 
 | Annotation | Applied To | Description |
 |------------|-----------|-------------|
-| `net.unbounded-kube.io/wg-pubkey` | Node | WireGuard public key. Set by node agent. |
+| `net.unbounded-cloud.io/wg-pubkey` | Node | WireGuard public key. Set by node agent. |
 
 ### Taints
 
 | Taint | Applied To | Effect | Description |
 |-------|-----------|--------|-------------|
-| `net.unbounded-kube.io/gateway-node=true` | Gateway Node | NoSchedule | Prevents regular workloads on gateway nodes. |
+| `net.unbounded-cloud.io/gateway-node=true` | Gateway Node | NoSchedule | Prevents regular workloads on gateway nodes. |
 
 ---
 
@@ -844,7 +844,7 @@ kubectl describe st site-east
 kubectl get gp -o wide
 
 # View site node slices
-kubectl get sns -l net.unbounded-kube.io/site=site-east
+kubectl get sns -l net.unbounded-cloud.io/site=site-east
 
 # Watch gateway pool status
 kubectl get gp main-gateways -o yaml -w

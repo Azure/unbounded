@@ -17,7 +17,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 
-	"github.com/Azure/unbounded-kube/internal/metalman/netboot"
+	"github.com/Azure/unbounded/internal/metalman/netboot"
 )
 
 const (

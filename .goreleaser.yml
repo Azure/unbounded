@@ -16,10 +16,10 @@ builds:
       - CGO_ENABLED=0
     ldflags:
       - -s -w
-      - -X github.com/Azure/unbounded-kube/internal/version.Version={{ .Version }}
-      - -X github.com/Azure/unbounded-kube/internal/version.GitCommit={{ .ShortCommit }}
-      - -X github.com/Azure/unbounded-kube/internal/version.BuildTime={{ .Date }}
-      - -X github.com/Azure/unbounded-kube/cmd/kubectl-unbounded/app.MetalmanImage=ghcr.io/azure/metalman:v{{ .Version }}
+      - -X github.com/Azure/unbounded/internal/version.Version={{ .Version }}
+      - -X github.com/Azure/unbounded/internal/version.GitCommit={{ .ShortCommit }}
+      - -X github.com/Azure/unbounded/internal/version.BuildTime={{ .Date }}
+      - -X github.com/Azure/unbounded/cmd/kubectl-unbounded/app.MetalmanImage=ghcr.io/azure/metalman:v{{ .Version }}
     goos:
       - linux
       - darwin
@@ -34,9 +34,9 @@ builds:
       - CGO_ENABLED=0
     ldflags:
       - -s -w
-      - -X github.com/Azure/unbounded-kube/internal/version.Version={{ .Version }}
-      - -X github.com/Azure/unbounded-kube/internal/version.GitCommit={{ .ShortCommit }}
-      - -X github.com/Azure/unbounded-kube/internal/version.BuildTime={{ .Date }}
+      - -X github.com/Azure/unbounded/internal/version.Version={{ .Version }}
+      - -X github.com/Azure/unbounded/internal/version.GitCommit={{ .ShortCommit }}
+      - -X github.com/Azure/unbounded/internal/version.BuildTime={{ .Date }}
     goos:
       - linux
     goarch:
@@ -102,7 +102,7 @@ changelog:
 release:
   github:
     owner: Azure
-    name: unbounded-kube
+    name: unbounded
   # Always create as draft. The release workflow attaches additional
   # artifacts (manifests tarball, krew manifest, image signatures) before
   # a human flips the release to published.

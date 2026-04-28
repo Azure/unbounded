@@ -24,7 +24,7 @@
 #   --nsg-id <id>          Full resource ID of NSG to attach to VMSS NICs
 #   --allowed-host-ports <range>  Port range to allow inbound UDP (e.g. 51820-52999),
 #                          creates an ASG and NSG rule (requires --nsg-id)
-#   --gateway              Mark this pool as a gateway (adds net.unbounded-kube.io/gateway=true label)
+#   --gateway              Mark this pool as a gateway (adds net.unbounded-cloud.io/gateway=true label)
 #   --reimage-existing      After deployment, update and reimage the VMSS if it already existed
 #   --password <pass>      Admin password (sets auth type to password or all)
 #   --ssh-key <key|@path>   SSH public key value, or @<path> to read from file
@@ -176,7 +176,7 @@ if [[ -n "$NSG_ID" ]]; then
 fi
 EXTRA_LABELS=""
 if [[ "$GATEWAY" == true ]]; then
-    EXTRA_LABELS=",net.unbounded-kube.io/gateway=true"
+    EXTRA_LABELS=",net.unbounded-cloud.io/gateway=true"
 fi
 "${SCRIPT_DIR}/generate-customdata.sh" "$VMSS_NAME" "$NSG_NAME_ARG" "$EXTRA_LABELS" > "$CUSTOMDATA_FILE"
 

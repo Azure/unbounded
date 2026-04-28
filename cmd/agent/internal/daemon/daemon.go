@@ -19,8 +19,8 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	v1alpha3 "github.com/Azure/unbounded-kube/api/machina/v1alpha3"
-	"github.com/Azure/unbounded-kube/internal/provision"
+	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/provision"
 )
 
 // kubeClientFunc constructs a controller-runtime WithWatch client from a
@@ -164,7 +164,7 @@ func buildKubeClient(cfg *provision.AgentConfig, newClient kubeClientFunc) (clie
 		return nil, fmt.Errorf("decode CA certificate: %w", err)
 	}
 
-	if cfg.Kubelet.BootstrapToken == "" {
+	if cfg.Kubelet.Auth.BootstrapToken == "" {
 		return nil, fmt.Errorf("applied config has no bootstrap token")
 	}
 
@@ -175,7 +175,7 @@ func buildKubeClient(cfg *provision.AgentConfig, newClient kubeClientFunc) (clie
 	// unavailable.
 	restCfg := &rest.Config{
 		Host:        cfg.Kubelet.ApiServer,
-		BearerToken: cfg.Kubelet.BootstrapToken,
+		BearerToken: cfg.Kubelet.Auth.BootstrapToken,
 		TLSClientConfig: rest.TLSClientConfig{
 			CAData: caData,
 		},
@@ -192,7 +192,7 @@ func buildKubeClient(cfg *provision.AgentConfig, newClient kubeClientFunc) (clie
 // Machine CR may not have been pre-created by machina.
 func registerMachine(ctx context.Context, log *slog.Logger, c client.Client, cfg *provision.AgentConfig) error {
 	machineName := cfg.MachineName
-	token := cfg.Kubelet.BootstrapToken
+	token := cfg.Kubelet.Auth.BootstrapToken
 	if token == "" {
 		log.Info("bootstrap token not set, skipping Machine CR registration")
 		return nil
@@ -231,7 +231,7 @@ func registerMachine(ctx context.Context, log *slog.Logger, c client.Client, cfg
 
 // buildMachineCR constructs a minimal Machine CR from the applied config.
 func buildMachineCR(cfg *provision.AgentConfig) v1alpha3.Machine {
-	tokenID := cfg.Kubelet.BootstrapToken
+	tokenID := cfg.Kubelet.Auth.BootstrapToken
 	if i := strings.IndexByte(tokenID, '.'); i >= 0 {
 		tokenID = tokenID[:i]
 	}

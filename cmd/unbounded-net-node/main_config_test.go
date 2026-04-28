@@ -97,7 +97,7 @@ func TestApplyNodeRuntimeConfig(t *testing.T) {
 		"  statusWebsocketEnabled: false\n" +
 		"  statusWebsocketURL: ws://controller/status/nodews\n" +
 		"  statusWebsocketApiserverMode: never\n" +
-		"  statusWebsocketApiserverURL: wss://kubernetes.default.svc/apis/status.net.unbounded-kube.io/v1alpha1/status/nodews\n" +
+		"  statusWebsocketApiserverURL: wss://kubernetes.default.svc/apis/status.net.unbounded-cloud.io/v1alpha1/status/nodews\n" +
 		"  statusWebsocketApiserverStartupDelay: 75s\n" +
 		"  statusWebsocketKeepaliveInterval: 0s\n" +
 		"  statusWsKeepaliveFailureCount: 3\n" +
@@ -147,7 +147,7 @@ func TestApplyNodeRuntimeConfig(t *testing.T) {
 		t.Fatalf("expected status websocket API server mode never from runtime config, got %q", cfg.StatusWSAPIServerMode)
 	}
 
-	if cfg.StatusWSAPIServerURL != "wss://kubernetes.default.svc/apis/status.net.unbounded-kube.io/v1alpha1/status/nodews" {
+	if cfg.StatusWSAPIServerURL != "wss://kubernetes.default.svc/apis/status.net.unbounded-cloud.io/v1alpha1/status/nodews" {
 		t.Fatalf("expected status websocket API server URL from runtime config, got %q", cfg.StatusWSAPIServerURL)
 	}
 

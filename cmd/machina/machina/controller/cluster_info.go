@@ -13,7 +13,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 
-	"github.com/Azure/unbounded-kube/internal/cloudprovider"
+	"github.com/Azure/unbounded/internal/cloudprovider"
 )
 
 // ClusterInfo holds cluster-level values resolved once at startup and passed

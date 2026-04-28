@@ -9,8 +9,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/Azure/unbounded-kube/hack/cmd/forge/forge/azsdk"
-	"github.com/Azure/unbounded-kube/internal/logger"
+	"github.com/Azure/unbounded/hack/cmd/forge/forge/azsdk"
+	"github.com/Azure/unbounded/internal/logger"
 )
 
 type CommandContext struct {

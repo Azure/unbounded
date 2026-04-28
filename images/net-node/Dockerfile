@@ -76,9 +76,9 @@ ARG VERSION=dev
 ARG GIT_COMMIT=unknown
 ARG BUILD_TIME=unknown
 ENV STAMP_LDFLAGS="-s -w \
-    -X github.com/Azure/unbounded-kube/internal/version.Version=${VERSION} \
-    -X github.com/Azure/unbounded-kube/internal/version.GitCommit=${GIT_COMMIT} \
-    -X github.com/Azure/unbounded-kube/internal/version.BuildTime=${BUILD_TIME}"
+    -X github.com/Azure/unbounded/internal/version.Version=${VERSION} \
+    -X github.com/Azure/unbounded/internal/version.GitCommit=${GIT_COMMIT} \
+    -X github.com/Azure/unbounded/internal/version.BuildTime=${BUILD_TIME}"
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/ms-go-build,id=go-build-${TARGETARCH} \
     CGO_ENABLED=1 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
@@ -112,7 +112,8 @@ FROM mcr.microsoft.com/azurelinux/base/core:3.0 AS runtime-base
 # - iptables: iptables/ip6tables for masquerade rules (node)
 # - util-linux: nsenter for host namespace sysctl setup (node init)
 # - hostname: provides the hostname binary in Azure Linux runtime images
-RUN tdnf install -y \
+RUN tdnf upgrade -y \
+    && tdnf install -y \
     ca-certificates shadow-utils iproute iptables util-linux hostname which wget tcpdump iputils \
     libatomic libcap openssl vim bpftool \
     procps-ng less sqlite-libs tar gzip jq python3 bind-utils \

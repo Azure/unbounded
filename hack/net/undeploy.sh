@@ -34,8 +34,8 @@ kubectl delete -f "$CTRL_DIR/01-serviceaccount.yaml"     --ignore-not-found
 kubectl delete -f "$CRD_DIR/" --ignore-not-found
 
 # Legacy APIService names retained for backwards compatibility cleanup.
-kubectl delete apiservice status.net.unbounded-kube.io          --ignore-not-found
-kubectl delete apiservice v1alpha1.status.net.unbounded-kube.io --ignore-not-found
+kubectl delete apiservice status.net.unbounded-cloud.io          --ignore-not-found
+kubectl delete apiservice v1alpha1.status.net.unbounded-cloud.io --ignore-not-found
 
 if [[ "$NAMESPACE" != "kube-system" ]]; then
     kubectl delete -f "$RENDERED_DIR/00-namespace.yaml" --ignore-not-found

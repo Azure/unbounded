@@ -17,8 +17,8 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
-	pb "github.com/Azure/unbounded-kube/internal/net/healthcheck/proto"
-	"github.com/Azure/unbounded-kube/internal/version"
+	pb "github.com/Azure/unbounded/internal/net/healthcheck/proto"
+	"github.com/Azure/unbounded/internal/version"
 
 	flag "github.com/spf13/pflag"
 )

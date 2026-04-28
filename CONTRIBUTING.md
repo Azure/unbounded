@@ -17,7 +17,7 @@ contact [opencode@microsoft.com](mailto:opencode@microsoft.com) with any additio
 ### Reporting Issues
 
 If you find a bug or have a feature request, please open an issue on the
-[GitHub Issue Tracker](https://github.com/Azure/unbounded-kube/issues). Include as much
+[GitHub Issue Tracker](https://github.com/Azure/unbounded/issues). Include as much
 detail as possible: steps to reproduce, expected behavior, actual behavior, and relevant logs.
 
 ### Submitting Pull Requests

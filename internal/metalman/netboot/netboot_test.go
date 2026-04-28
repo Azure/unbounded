@@ -24,8 +24,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
-	v1alpha3 "github.com/Azure/unbounded-kube/api/machina/v1alpha3"
-	"github.com/Azure/unbounded-kube/internal/metalman/indexing"
+	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/metalman/indexing"
 )
 
 func newScheme(t *testing.T) *runtime.Scheme {
@@ -532,6 +532,24 @@ func TestVendorDataTemplate_WithAgentImage(t *testing.T) {
 
 	if !strings.Contains(body, "/cloudinit/log") {
 		t.Errorf("expected webhook reporting endpoint in rendered vendor-data, got:\n%s", body)
+	}
+
+	// Hardening drop-ins: the vendor-data must lay down apt and needrestart
+	// drop-ins that prevent unattended-upgrades from restarting
+	// systemd-machined out from under the running nspawn container. See
+	// cmd/agent/internal/phases/host/apt.go for the matching agent-side
+	// task that also writes these files.
+	for _, want := range []string{
+		"/etc/apt/apt.conf.d/99-unbounded-no-restart-systemd",
+		"Unattended-Upgrade::Package-Blacklist",
+		`"libcap2";`,
+		`"systemd-container";`,
+		"/etc/needrestart/conf.d/99-unbounded.conf",
+		"$nrconf{restart} = 'l';",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("expected %q in rendered vendor-data, got:\n%s", want, body)
+		}
 	}
 }
 

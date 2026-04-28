@@ -53,13 +53,13 @@ kubectl get crd | grep unbounded
 
 Expected output:
 ```
-gatewaypoolnodes.net.unbounded-kube.io              2024-01-15T10:00:00Z
-gatewaypoolpeerings.net.unbounded-kube.io            2024-01-15T10:00:00Z
-gatewaypools.net.unbounded-kube.io                   2024-01-15T10:00:00Z
-sitegatewaypoolassignments.net.unbounded-kube.io     2024-01-15T10:00:00Z
-sitenodeslices.net.unbounded-kube.io                 2024-01-15T10:00:00Z
-sitepeerings.net.unbounded-kube.io                   2024-01-15T10:00:00Z
-sites.net.unbounded-kube.io                          2024-01-15T10:00:00Z
+gatewaypoolnodes.net.unbounded-cloud.io              2024-01-15T10:00:00Z
+gatewaypoolpeerings.net.unbounded-cloud.io            2024-01-15T10:00:00Z
+gatewaypools.net.unbounded-cloud.io                   2024-01-15T10:00:00Z
+sitegatewaypoolassignments.net.unbounded-cloud.io     2024-01-15T10:00:00Z
+sitenodeslices.net.unbounded-cloud.io                 2024-01-15T10:00:00Z
+sitepeerings.net.unbounded-cloud.io                   2024-01-15T10:00:00Z
+sites.net.unbounded-cloud.io                          2024-01-15T10:00:00Z
 ```
 
 #### Container Registry
@@ -81,11 +81,11 @@ at render time.
 kubectl apply -f deploy/controller/
 ```
 
-On startup, the controller registers aggregated status endpoints through `APIService` `v1alpha1.status.net.unbounded-kube.io`, served over HTTPS via `unbounded-net-controller:9999` with an explicit `caBundle`.
+On startup, the controller registers aggregated status endpoints through `APIService` `v1alpha1.status.net.unbounded-cloud.io`, served over HTTPS via `unbounded-net-controller:9999` with an explicit `caBundle`.
 
 Verify aggregated API registration:
 ```bash
-kubectl get apiservice v1alpha1.status.net.unbounded-kube.io
+kubectl get apiservice v1alpha1.status.net.unbounded-cloud.io
 ```
 
 The controller registers the validating admission webhook on startup and stores
@@ -94,7 +94,7 @@ The webhook Service is `unbounded-net-controller` (port 9999). The webhook uses
 `failurePolicy: Ignore` so that CRD operations are not blocked if the webhook
 is unavailable. Most validation constraints are enforced by CRD OpenAPI schema
 rules. A single webhook entry covers all CRD types for CREATE and UPDATE
-operations. DELETE protection uses the `net.unbounded-kube.io/protection`
+operations. DELETE protection uses the `net.unbounded-cloud.io/protection`
 finalizer on Sites and GatewayPools.
 
 Verify controller is running:
@@ -117,7 +117,7 @@ kubectl -n kube-system get pods -l app=unbounded-net-node -o wide
 
 ```bash
 kubectl apply -f - <<EOF
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: Site
 metadata:
   name: site-east
@@ -132,7 +132,7 @@ spec:
         ipv4: 24
       priority: 100
 ---
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: Site
 metadata:
   name: site-west
@@ -153,7 +153,7 @@ EOF
 
 ```bash
 kubectl apply -f - <<EOF
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: SiteGatewayPoolAssignment
 metadata:
   name: main-gateway-assignment
@@ -170,13 +170,13 @@ EOF
 
 ```bash
 kubectl apply -f - <<EOF
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: GatewayPool
 metadata:
   name: main-gateways
 spec:
   nodeSelector:
-    net.unbounded-kube.io/gateway: "true"
+    net.unbounded-cloud.io/gateway: "true"
 EOF
 ```
 
@@ -184,15 +184,15 @@ EOF
 
 ```bash
 # Label nodes that should be gateways
-kubectl label node gateway-east-1 net.unbounded-kube.io/gateway=true
-kubectl label node gateway-west-1 net.unbounded-kube.io/gateway=true
+kubectl label node gateway-east-1 net.unbounded-cloud.io/gateway=true
+kubectl label node gateway-west-1 net.unbounded-cloud.io/gateway=true
 ```
 
 #### Step 7: Verify Connectivity
 
 ```bash
 # Check site membership
-kubectl get nodes -L net.unbounded-kube.io/site
+kubectl get nodes -L net.unbounded-cloud.io/site
 
 # Check gateway pool status
 kubectl get gp main-gateways -o yaml
@@ -276,8 +276,8 @@ curl http://<controller-pod-ip>:9999/status/json
 curl http://<controller-pod-ip>:9999/status/node/<node-name>
 
 # Aggregated API status push endpoint (if enabled)
-# POST http://<apiserver>/apis/status.net.unbounded-kube.io/v1alpha1/status/push
-# WebSocket: wss://<apiserver>/apis/status.net.unbounded-kube.io/v1alpha1/status/nodews
+# POST http://<apiserver>/apis/status.net.unbounded-cloud.io/v1alpha1/status/push
+# WebSocket: wss://<apiserver>/apis/status.net.unbounded-cloud.io/v1alpha1/status/nodews
 ```
 
 #### Gateway Health
@@ -675,8 +675,8 @@ Node Agent --> Controller (direct push / WebSocket)
 2. **API Server relay (fallback)**: When direct connectivity is unavailable (e.g.,
    external nodes), status is pushed through the Kubernetes API server's aggregated
    API at:
-   - `POST /apis/status.net.unbounded-kube.io/v1alpha1/status/push`
-   - `WebSocket wss://.../apis/status.net.unbounded-kube.io/v1alpha1/status/nodews`
+   - `POST /apis/status.net.unbounded-cloud.io/v1alpha1/status/push`
+   - `WebSocket wss://.../apis/status.net.unbounded-cloud.io/v1alpha1/status/nodews`
 
 The relay mode is controlled by `--status-ws-apiserver-mode` on the node agent, which
 accepts `never`, `fallback` (default), or `preferred`.
@@ -749,7 +749,7 @@ kubectl -n kube-system logs -l app=unbounded-net-controller
 kubectl get sites -o yaml
 
 # Check node site label
-kubectl get node <node-name> -L net.unbounded-kube.io/site
+kubectl get node <node-name> -L net.unbounded-cloud.io/site
 
 # Check allocator status (in logs)
 kubectl -n kube-system logs -l app=unbounded-net-controller | grep -i alloc
@@ -806,7 +806,7 @@ modprobe wireguard
 iptables -L -n | grep 51820
 
 # Verify site label
-kubectl get node <node-name> -L net.unbounded-kube.io/site
+kubectl get node <node-name> -L net.unbounded-cloud.io/site
 ```
 
 #### 3. Cross-Site Traffic Failing
@@ -838,7 +838,7 @@ ip route | grep <remote-site-cidr>
 **Resolution:**
 ```bash
 # Verify gateways have external IPs
-kubectl get nodes -l net.unbounded-kube.io/gateway=true \
+kubectl get nodes -l net.unbounded-cloud.io/gateway=true \
   -o jsonpath='{range .items[*]}{.metadata.name}: {.status.addresses[?(@.type=="ExternalIP")].address}{"\n"}{end}'
 
 # Test gateway connectivity
@@ -928,7 +928,7 @@ kubectl get st
 kubectl get gp
 
 # Node site assignments
-kubectl get nodes -L net.unbounded-kube.io/site
+kubectl get nodes -L net.unbounded-cloud.io/site
 
 # === Per-Node Diagnostics (WireGuard) ===
 # WireGuard status
@@ -1033,7 +1033,7 @@ flowchart TD
 ```bash
 # 1. Create the site
 kubectl apply -f - <<EOF
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: Site
 metadata:
   name: site-new
@@ -1051,7 +1051,7 @@ EOF
 
 # 2. Assign the site to a gateway pool
 kubectl apply -f - <<EOF
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: SiteGatewayPoolAssignment
 metadata:
   name: new-site-assignment
@@ -1063,10 +1063,10 @@ spec:
 EOF
 
 # 3. Wait for nodes to be labeled
-watch kubectl get nodes -L net.unbounded-kube.io/site
+watch kubectl get nodes -L net.unbounded-cloud.io/site
 
 # 3. Label gateway node
-kubectl label node gateway-new net.unbounded-kube.io/gateway=true
+kubectl label node gateway-new net.unbounded-cloud.io/gateway=true
 
 # 4. Verify gateway in pool
 kubectl get gp main-gateways -o yaml
@@ -1079,7 +1079,7 @@ kubectl get gp main-gateways -o yaml
 kubectl drain <node> --ignore-daemonsets --delete-emptydir-data
 
 # 2. Remove gateway label (if applicable)
-kubectl label node <gateway-node> net.unbounded-kube.io/gateway-
+kubectl label node <gateway-node> net.unbounded-cloud.io/gateway-
 
 # 3. Delete the site
 kubectl delete site site-old
@@ -1091,7 +1091,7 @@ kubectl delete site site-old
 
 ```bash
 # 1. Add new gateway
-kubectl label node new-gateway net.unbounded-kube.io/gateway=true
+kubectl label node new-gateway net.unbounded-cloud.io/gateway=true
 
 # 2. Verify new gateway in pool
 kubectl get gp main-gateways -o yaml
@@ -1100,7 +1100,7 @@ kubectl get gp main-gateways -o yaml
 sleep 10
 
 # 4. Remove old gateway label
-kubectl label node old-gateway net.unbounded-kube.io/gateway-
+kubectl label node old-gateway net.unbounded-cloud.io/gateway-
 
 # 5. Gateway taint will remain; drain if needed
 kubectl drain old-gateway --ignore-daemonsets
@@ -1170,7 +1170,7 @@ kubectl apply -f controller-backup.yaml
 kubectl apply -f deploy/node/
 
 # 5. Re-apply gateway labels
-kubectl label node <gateway> net.unbounded-kube.io/gateway=true
+kubectl label node <gateway> net.unbounded-cloud.io/gateway=true
 ```
 
 ---
@@ -1210,7 +1210,7 @@ kubectl unbounded-net controller proxy
 Status JSON is available through the Kubernetes aggregated API:
 
 ```bash
-kubectl get --raw /apis/status.net.unbounded-kube.io/v1alpha1/status/json
+kubectl get --raw /apis/status.net.unbounded-cloud.io/v1alpha1/status/json
 ```
 
 #### RBAC
@@ -1303,6 +1303,6 @@ kind: Policy
 rules:
   - level: Metadata
     resources:
-      - group: "net.unbounded-kube.io"
+      - group: "net.unbounded-cloud.io"
         resources: ["sites", "sitenodeslices", "gatewaypools", "gatewaypoolnodes", "sitepeerings", "sitegatewaypoolassignments", "gatewaypoolpeerings"]
 ```

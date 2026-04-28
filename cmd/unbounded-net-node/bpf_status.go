@@ -12,7 +12,7 @@ import (
 	"github.com/cilium/ebpf"
 	"k8s.io/klog/v2"
 
-	statusv1alpha1 "github.com/Azure/unbounded-kube/internal/net/status/v1alpha1"
+	statusv1alpha1 "github.com/Azure/unbounded/internal/net/status/v1alpha1"
 )
 
 const (

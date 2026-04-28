@@ -12,9 +12,9 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/Azure/unbounded-kube/hack/cmd/forge/forge/cluster"
-	"github.com/Azure/unbounded-kube/hack/cmd/forge/forge/infra"
-	"github.com/Azure/unbounded-kube/hack/cmd/forge/forge/site/azuredev"
+	"github.com/Azure/unbounded/hack/cmd/forge/forge/cluster"
+	"github.com/Azure/unbounded/hack/cmd/forge/forge/infra"
+	"github.com/Azure/unbounded/hack/cmd/forge/forge/site/azuredev"
 )
 
 const (

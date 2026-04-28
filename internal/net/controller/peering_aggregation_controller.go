@@ -25,35 +25,35 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 
-	unboundednetv1alpha1 "github.com/Azure/unbounded-kube/api/net/v1alpha1"
+	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 )
 
 var sitePeeringGVR = schema.GroupVersionResource{
-	Group:    "net.unbounded-kube.io",
+	Group:    "net.unbounded-cloud.io",
 	Version:  "v1alpha1",
 	Resource: "sitepeerings",
 }
 
 var siteGatewayPoolAssignmentGVR = schema.GroupVersionResource{
-	Group:    "net.unbounded-kube.io",
+	Group:    "net.unbounded-cloud.io",
 	Version:  "v1alpha1",
 	Resource: "sitegatewaypoolassignments",
 }
 
 var gatewayPoolPeeringGVR = schema.GroupVersionResource{
-	Group:    "net.unbounded-kube.io",
+	Group:    "net.unbounded-cloud.io",
 	Version:  "v1alpha1",
 	Resource: "gatewaypoolpeerings",
 }
 
 var siteGVRPeering = schema.GroupVersionResource{
-	Group:    "net.unbounded-kube.io",
+	Group:    "net.unbounded-cloud.io",
 	Version:  "v1alpha1",
 	Resource: "sites",
 }
 
 var gatewayPoolGVRPeering = schema.GroupVersionResource{
-	Group:    "net.unbounded-kube.io",
+	Group:    "net.unbounded-cloud.io",
 	Version:  "v1alpha1",
 	Resource: "gatewaypools",
 }
