@@ -1,0 +1,273 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+name: release upgrade
+
+# ---------------------------------------------------------------------------
+# Auto-deploys a published Unbounded release to a target Kubernetes cluster.
+#
+# Triggers:
+#   release (released)  - fires on full releases (excludes pre-releases) and
+#                          deploys the released tag to the target cluster.
+#   workflow_dispatch    - manual run; required for the very first install
+#                          (set force_init=true) and for re-deploys.
+#
+# The target cluster is configured via the `unbounded-stable` GitHub
+# Environment, which provides:
+#   - secret KUBECONFIG          (raw kubeconfig file contents)
+#   - vars   SITE_NAME, CLUSTER_NODE_CIDR, CLUSTER_POD_CIDR,
+#            SITE_NODE_CIDR, SITE_POD_CIDR, MANAGE_CNI_PLUGIN
+#
+# See hack/scripts/setup-deploy-environment.sh.
+# ---------------------------------------------------------------------------
+
+on:
+  release:
+    types: [released]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to deploy (e.g. v1.2.3)"
+        required: true
+      force_init:
+        description: "Run 'site init' instead of upgrade-apply (use for first-ever bootstrap)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-stable-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Resolve the release tag we are deploying. For release events we use the
+  # event payload; for manual runs we use the user-supplied input.
+  # ---------------------------------------------------------------------------
+  resolve:
+    if: github.repository == 'Azure/unbounded'
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - name: Resolve tag
+        id: resolve
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            TAG="${{ github.event.release.tag_name }}"
+          else
+            TAG="${{ inputs.tag }}"
+          fi
+
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Tag must be in vX.Y.Z[-suffix] format, got: ${TAG}"
+            exit 1
+          fi
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Resolved deploy tag: ${TAG}"
+
+  # ---------------------------------------------------------------------------
+  # Deploy the release to the target cluster.
+  #
+  #   MODE=init     -> 'kubectl unbounded site init' using the embedded
+  #                    manifests bundled into the released plugin binary.
+  #                    Used for the very first bootstrap of a cluster.
+  #   MODE=upgrade  -> server-side 'kubectl apply' of the rendered manifests
+  #                    that were attached to the GitHub Release.
+  # ---------------------------------------------------------------------------
+  deploy:
+    needs: resolve
+    if: github.repository == 'Azure/unbounded'
+    runs-on: ubuntu-latest
+    environment: unbounded-stable
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+      SITE_NAME: ${{ vars.SITE_NAME }}
+      CLUSTER_NODE_CIDR: ${{ vars.CLUSTER_NODE_CIDR }}
+      CLUSTER_POD_CIDR: ${{ vars.CLUSTER_POD_CIDR }}
+      SITE_NODE_CIDR: ${{ vars.SITE_NODE_CIDR }}
+      SITE_POD_CIDR: ${{ vars.SITE_POD_CIDR }}
+      MANAGE_CNI_PLUGIN: ${{ vars.MANAGE_CNI_PLUGIN }}
+    steps:
+      - name: Validate environment configuration
+        run: |
+          set -euo pipefail
+          missing=()
+          for v in SITE_NAME CLUSTER_NODE_CIDR CLUSTER_POD_CIDR SITE_NODE_CIDR SITE_POD_CIDR MANAGE_CNI_PLUGIN; do
+            if [[ -z "${!v}" ]]; then
+              missing+=("$v")
+            fi
+          done
+          if (( ${#missing[@]} > 0 )); then
+            echo "::error::Missing required Environment variables: ${missing[*]}"
+            echo "::error::Configure with hack/scripts/setup-deploy-environment.sh"
+            exit 1
+          fi
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.resolve.outputs.tag }}
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@776406bce94f63e41d621b960d78ee25c8b76ede # v4.0.1
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
+
+      - name: Write kubeconfig
+        env:
+          KUBECONFIG_CONTENT: ${{ secrets.KUBECONFIG }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${KUBECONFIG_CONTENT}" ]]; then
+            echo "::error::Environment secret KUBECONFIG is empty"
+            exit 1
+          fi
+          umask 077
+          printf '%s' "$KUBECONFIG_CONTENT" > "$RUNNER_TEMP/kubeconfig"
+          echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
+
+      - name: Verify cluster connectivity
+        run: |
+          set -euo pipefail
+          kubectl version
+          kubectl cluster-info
+
+      - name: Download release artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh release download "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern 'unbounded-manifests-*.tar.gz' \
+            --pattern 'unbounded-manifests-*.tar.gz.bundle.json' \
+            --pattern 'kubectl-unbounded-linux-amd64.tar.gz' \
+            --dir dist/
+          ls -la dist/
+
+      - name: Verify cosign signature on manifests tarball
+        run: |
+          set -euo pipefail
+          ARCHIVE="dist/unbounded-manifests-${TAG}.tar.gz"
+          BUNDLE="${ARCHIVE}.bundle.json"
+          cosign verify-blob \
+            --bundle "${BUNDLE}" \
+            --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/\.github/workflows/release\.yaml@refs/tags/${TAG}$" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "${ARCHIVE}"
+
+      - name: Extract manifests
+        run: |
+          set -euo pipefail
+          mkdir -p dist/manifests
+          tar -xzf "dist/unbounded-manifests-${TAG}.tar.gz" -C dist/manifests
+          MANIFESTS_DIR="dist/manifests/unbounded-manifests-${TAG}"
+          if [[ ! -d "${MANIFESTS_DIR}/net" || ! -d "${MANIFESTS_DIR}/machina" ]]; then
+            echo "::error::Tarball is missing expected net/ or machina/ subdir"
+            ls -la "${MANIFESTS_DIR}" || true
+            exit 1
+          fi
+          echo "MANIFESTS_DIR=${MANIFESTS_DIR}" >> "$GITHUB_ENV"
+
+      - name: Install kubectl-unbounded plugin
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf dist/kubectl-unbounded-linux-amd64.tar.gz -C "$RUNNER_TEMP/bin"
+          chmod +x "$RUNNER_TEMP/bin/kubectl-unbounded"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/bin/kubectl-unbounded" --help >/dev/null
+
+      - name: Determine deploy mode
+        run: |
+          set -euo pipefail
+          MODE=upgrade
+          if [[ "${{ inputs.force_init }}" == "true" ]]; then
+            MODE=init
+            echo "force_init=true; selecting init mode"
+          elif ! kubectl get crd sites.net.unbounded-cloud.io >/dev/null 2>&1; then
+            MODE=init
+            echo "Site CRD not present; selecting init mode"
+          elif ! kubectl get site.net.unbounded-cloud.io "${SITE_NAME}" >/dev/null 2>&1; then
+            MODE=init
+            echo "Site '${SITE_NAME}' not present; selecting init mode"
+          else
+            echo "Site '${SITE_NAME}' exists; selecting upgrade mode"
+          fi
+          echo "MODE=${MODE}" >> "$GITHUB_ENV"
+
+      - name: Run site init (first install)
+        if: env.MODE == 'init'
+        run: |
+          set -euo pipefail
+          kubectl unbounded site init \
+            --name "${SITE_NAME}" \
+            --cluster-node-cidr "${CLUSTER_NODE_CIDR}" \
+            --cluster-pod-cidr  "${CLUSTER_POD_CIDR}" \
+            --node-cidr         "${SITE_NODE_CIDR}" \
+            --pod-cidr          "${SITE_POD_CIDR}" \
+            --manage-cni-plugin="${MANAGE_CNI_PLUGIN}"
+
+      - name: Apply CRDs (upgrade)
+        if: env.MODE == 'upgrade'
+        run: |
+          set -euo pipefail
+          kubectl apply --server-side --force-conflicts -f "${MANIFESTS_DIR}/net/crd/"
+          kubectl apply --server-side --force-conflicts -f "${MANIFESTS_DIR}/machina/crd/"
+          kubectl wait --for=condition=Established crd --all --timeout=120s
+
+      - name: Sanity check tarball contents (upgrade)
+        if: env.MODE == 'upgrade'
+        run: |
+          set -euo pipefail
+          # The release tarball must not contain Site/GatewayPool/SitePeering
+          # CRs; those are operator-owned and are created during 'site init'.
+          # CRD definitions live under crd/ subdirs and are allowed.
+          if find "${MANIFESTS_DIR}" -type f \( -name '*.yaml' -o -name '*.yml' \) \
+                ! -path '*/crd/*' \
+                -exec grep -lE '^kind:[[:space:]]*(Site|GatewayPool|SitePeering)[[:space:]]*$' {} + \
+                | grep -q .; then
+            echo "::error::Release tarball contains operator-owned CRs; refusing to upgrade-apply."
+            exit 1
+          fi
+
+      - name: Apply manifests (upgrade)
+        if: env.MODE == 'upgrade'
+        run: |
+          set -euo pipefail
+          kubectl apply --server-side --force-conflicts -R -f "${MANIFESTS_DIR}/net/"
+          kubectl apply --server-side --force-conflicts -R -f "${MANIFESTS_DIR}/machina/"
+
+      - name: Wait for rollouts
+        run: |
+          set -euo pipefail
+          kubectl -n unbounded-net  rollout status deploy/unbounded-net-controller --timeout=5m
+          kubectl -n unbounded-net  rollout status ds/unbounded-net-node           --timeout=5m
+          kubectl -n unbounded-kube rollout status deploy/machina-controller       --timeout=5m
+
+      - name: Summarize deploy
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo "## Release upgrade"
+            echo ""
+            echo "- Tag: \`${TAG}\`"
+            echo "- Mode: \`${MODE:-unknown}\`"
+            echo "- Environment: \`unbounded-stable\`"
+            echo "- Site: \`${SITE_NAME}\`"
+            echo ""
+            echo "### Workload images"
+            echo ""
+            echo '```'
+            kubectl -n unbounded-net  get deploy unbounded-net-controller -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
+            kubectl -n unbounded-net  get ds     unbounded-net-node       -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
+            kubectl -n unbounded-kube get deploy machina-controller       -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
