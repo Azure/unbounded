@@ -15,8 +15,8 @@ import (
 	"github.com/Masterminds/semver/v3"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
-	"github.com/Azure/unbounded/pkg/agent/internal/utilexec"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
@@ -194,7 +194,7 @@ func kubeletVersionMatch(ctx context.Context, log *slog.Logger, destDir, expecte
 		return false
 	}
 
-	output, err := utilexec.OutputCmd(ctx, log, kubeletPath, "--version")
+	output, err := executil.OutputCmd(ctx, log, kubeletPath, "--version")
 	if err != nil {
 		return false
 	}
@@ -217,7 +217,7 @@ func crictlVersionMatch(ctx context.Context, log *slog.Logger, destDir, expected
 		return false
 	}
 
-	output, err := utilexec.OutputCmd(ctx, log, crictlPath, "--version")
+	output, err := executil.OutputCmd(ctx, log, crictlPath, "--version")
 	if err != nil {
 		return false
 	}

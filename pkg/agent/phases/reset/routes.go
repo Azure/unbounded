@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/Azure/unbounded/pkg/agent/internal/utilexec"
+	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
 
@@ -39,13 +39,13 @@ func (t *cleanupRoutes) Do(ctx context.Context) error {
 
 		// Remove all ip rules pointing to this table.
 		for {
-			if err := utilexec.RunCmd(ctx, t.log, utilexec.Ip(), "rule", "del", "table", tableStr); err != nil {
+			if err := executil.RunCmd(ctx, t.log, executil.Ip(), "rule", "del", "table", tableStr); err != nil {
 				break // no more rules for this table
 			}
 		}
 
 		// Flush the routing table.
-		if err := utilexec.RunCmd(ctx, t.log, utilexec.Ip(), "route", "flush", "table", tableStr); err != nil {
+		if err := executil.RunCmd(ctx, t.log, executil.Ip(), "route", "flush", "table", tableStr); err != nil {
 			t.log.Warn("failed to flush routing table (may be empty)", "table", tableStr, "error", err)
 		}
 	}
