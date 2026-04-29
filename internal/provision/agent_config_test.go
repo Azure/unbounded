@@ -54,6 +54,7 @@ func TestAgentConfig_MarshalJSON(t *testing.T) {
 	require.Equal(t, "api.example.com:443", kubelet["ApiServer"])
 	auth := kubelet["Auth"].(map[string]interface{})
 	require.Equal(t, "abc123.secret456", auth["BootstrapToken"])
+
 	labels := kubelet["Labels"].(map[string]interface{})
 	require.Equal(t, "my-machine", labels["app"])
 	require.Equal(t, "prod", labels["env"])

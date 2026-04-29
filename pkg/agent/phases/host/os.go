@@ -72,7 +72,10 @@ func (ip *installPackages) Do(ctx context.Context) error {
 
 // isDebianPackageInstalled checks whether a package is fully installed using dpkg-query.
 func isDebianPackageInstalled(ctx context.Context, log *slog.Logger, pkg string) bool {
-	output, err := utilexec.OutputCmd(ctx, log, "dpkg-query", "--show", "--showformat=${db:Status-Status}", pkg)
+	// dpkg-query exits non-zero and writes to stderr when the package is not
+	// found; this is the expected case when the package needs to be installed.
+	// Use Debug level so the "no packages found" message is not shown as an error.
+	output, err := utilexec.OutputCmdAt(ctx, log, slog.LevelDebug, "dpkg-query", "--show", "--showformat=${db:Status-Status}", pkg)
 	if err != nil {
 		return false
 	}

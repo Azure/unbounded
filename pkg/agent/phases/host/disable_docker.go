@@ -53,13 +53,16 @@ func (d *disableDocker) ensureDockerDisabled(ctx context.Context) error {
 	systemctl := utilexec.Systemctl()
 
 	for _, unit := range []string{dockerSocketUnit, dockerServiceUnit} {
-		// Stop the unit if running (ignore errors if already stopped or not loaded).
-		if err := utilexec.RunCmd(ctx, d.log, systemctl, "stop", unit); err != nil {
-			d.log.DebugContext(ctx, "stopping unit (may already be stopped)", "unit", unit, "err", err)
+		// Stop the unit if running. Docker may not be installed, so log stop
+		// errors at Debug - a missing unit is expected and not a problem.
+		if err := utilexec.RunCmdAt(ctx, d.log, slog.LevelDebug, systemctl, "stop", unit); err != nil {
+			d.log.DebugContext(ctx, "stopping unit (may already be stopped or not installed)", "unit", unit, "err", err)
 		}
 
-		// Mask the unit to prevent future activation.
-		if err := utilexec.RunCmd(ctx, d.log, systemctl, "mask", unit); err != nil {
+		// Mask the unit to prevent future activation. systemctl writes
+		// informational messages (e.g. "Created symlink ...") to stderr on
+		// success, so use Info level to avoid misleading Error logs.
+		if err := utilexec.RunCmdAt(ctx, d.log, slog.LevelInfo, systemctl, "mask", unit); err != nil {
 			return fmt.Errorf("masking %s: %w", unit, err)
 		}
 	}

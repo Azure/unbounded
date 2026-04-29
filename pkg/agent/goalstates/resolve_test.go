@@ -8,6 +8,9 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+
+	"github.com/Azure/unbounded/pkg/agent/config"
 )
 
 // discardLogger returns a logger that silently drops all output.
@@ -120,4 +123,68 @@ func TestResolveOCIImage_Priority(t *testing.T) {
 
 	assert.Equal(t, DefaultNvidiaOCImage, ResolveOCIImage(log, "", true))
 	assert.Equal(t, DefaultOCIImage, ResolveOCIImage(log, "", false))
+}
+
+// TestResolveKubelet_EmptyAuthAllowed verifies that resolveKubelet does
+// not reject a config with an empty Kubelet.Auth. In the metalman
+// PXE/attestation flow the bootstrap token is fetched from the metalman
+// attest server by a later phase, so the agent must accept an empty Auth
+// at config-load/resolution time.
+func TestResolveKubelet_EmptyAuthAllowed(t *testing.T) {
+	cfg := &config.AgentConfig{
+		Cluster: config.AgentClusterConfig{
+			// base64("ca-bytes") so the decode step succeeds.
+			CaCertBase64: "Y2EtYnl0ZXM=",
+		},
+		Kubelet: config.AgentKubeletConfig{
+			ApiServer: "https://api.example.com",
+		},
+	}
+
+	k, err := resolveKubelet(cfg)
+	assert.NoError(t, err)
+	assert.Empty(t, k.BootstrapToken)
+	assert.Nil(t, k.ExecCredential)
+}
+
+// TestResolveKubelet_BootstrapTokenAccepted verifies that a populated
+// BootstrapToken passes resolution.
+func TestResolveKubelet_BootstrapTokenAccepted(t *testing.T) {
+	cfg := &config.AgentConfig{
+		Cluster: config.AgentClusterConfig{
+			CaCertBase64: "Y2EtYnl0ZXM=",
+		},
+		Kubelet: config.AgentKubeletConfig{
+			ApiServer: "https://api.example.com",
+			Auth: config.KubeletAuthInfo{
+				BootstrapToken: "abc123.secret456",
+			},
+		},
+	}
+
+	k, err := resolveKubelet(cfg)
+	assert.NoError(t, err)
+	assert.Equal(t, "abc123.secret456", k.BootstrapToken)
+}
+
+// TestResolveKubelet_BothAuthMethodsRejected verifies that genuine
+// misconfigurations (both auth methods set) are still caught.
+func TestResolveKubelet_BothAuthMethodsRejected(t *testing.T) {
+	cfg := &config.AgentConfig{
+		Cluster: config.AgentClusterConfig{
+			CaCertBase64: "Y2EtYnl0ZXM=",
+		},
+		Kubelet: config.AgentKubeletConfig{
+			ApiServer: "https://api.example.com",
+			Auth: config.KubeletAuthInfo{
+				BootstrapToken: "abc123.secret456",
+				ExecCredential: &clientcmdapi.ExecConfig{
+					Command: "/usr/local/bin/auth-plugin",
+				},
+			},
+		},
+	}
+
+	_, err := resolveKubelet(cfg)
+	assert.ErrorContains(t, err, "mutually exclusive")
 }

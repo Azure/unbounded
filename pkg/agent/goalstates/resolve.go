@@ -54,10 +54,12 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 	if containerdVersion == "" {
 		containerdVersion = ContainerdVersion
 	}
+
 	runcVersion := cfg.CRI.Runc.Version
 	if runcVersion == "" {
 		runcVersion = RunCVersion
 	}
+
 	cniVersion := cfg.CNI.PluginVersion
 	if cniVersion == "" {
 		cniVersion = CNIPluginVersion
@@ -116,8 +118,18 @@ func resolveKubelet(cfg *config.AgentConfig) (Kubelet, error) {
 		labels = make(map[string]string)
 	}
 
-	if err := cfg.Kubelet.Auth.Validate(); err != nil {
-		return zero, fmt.Errorf("kubelet auth: %w", err)
+	// Skip the "must have one" check when both fields are empty: in the
+	// metalman PXE/attestation flow the agent config intentionally ships
+	// with an empty Kubelet.Auth and the bootstrap token is filled in
+	// later by the apply-attestation phase. The downstream
+	// configure-kubelet step ("ensureKubeconfig") fails with
+	// "no kubelet auth method configured" if attestation is also absent.
+	// Genuine misconfigurations (both fields set, or ExecCredential
+	// without a Command) are still caught here.
+	if cfg.Kubelet.Auth.BootstrapToken != "" || cfg.Kubelet.Auth.ExecCredential != nil {
+		if err := cfg.Kubelet.Auth.Validate(); err != nil {
+			return zero, fmt.Errorf("kubelet auth: %w", err)
+		}
 	}
 
 	return Kubelet{
