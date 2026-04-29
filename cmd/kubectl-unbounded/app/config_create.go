@@ -106,7 +106,12 @@ func runConfigCreate(ctx context.Context, c client.WithWatch, name string, opts 
 		}
 
 		if len(opts.taints) > 0 {
-			k8s.RegisterWithTaints = parseTaints(opts.taints)
+			taints, err := parseTaints(opts.taints)
+			if err != nil {
+				return fmt.Errorf("parsing taints: %w", err)
+			}
+
+			k8s.RegisterWithTaints = taints
 		}
 
 		mc.Spec.Template.Kubernetes = k8s

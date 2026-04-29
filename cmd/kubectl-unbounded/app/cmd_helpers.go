@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 func getKubeconfigPath(p string) string {
@@ -29,32 +30,90 @@ func getKubeconfigPath(p string) string {
 	return ""
 }
 
-// parseTaints converts taint strings in key=value:Effect format to
-// corev1.Taint values.
-func parseTaints(ss []string) []corev1.Taint {
-	taints := make([]corev1.Taint, 0, len(ss))
-	for _, s := range ss {
-		t := parseTaint(s)
-		taints = append(taints, t)
+func parseTaints(spec []string) ([]corev1.Taint, error) {
+	taints := make([]corev1.Taint, 0, len(spec))
+	uniqueTaints := map[corev1.TaintEffect]map[string]struct{}{}
+
+	for _, taintSpec := range spec {
+		if strings.HasSuffix(taintSpec, "-") {
+			return nil, fmt.Errorf("invalid taint spec: %v, removing taints is not supported", taintSpec)
+		}
+
+		newTaint, err := parseTaint(taintSpec)
+		if err != nil {
+			return nil, err
+		}
+
+		if len(newTaint.Effect) == 0 {
+			return nil, fmt.Errorf("invalid taint spec: %v", taintSpec)
+		}
+
+		if uniqueTaints[newTaint.Effect] == nil {
+			uniqueTaints[newTaint.Effect] = map[string]struct{}{}
+		}
+
+		if _, ok := uniqueTaints[newTaint.Effect][newTaint.Key]; ok {
+			return nil, fmt.Errorf("duplicated taints with the same key and effect: %v", newTaint)
+		}
+
+		uniqueTaints[newTaint.Effect][newTaint.Key] = struct{}{}
+		taints = append(taints, newTaint)
 	}
-	return taints
+
+	return taints, nil
 }
 
-// parseTaint parses a single taint string. Accepted formats:
-//   - key=value:Effect
-//   - key:Effect
-func parseTaint(s string) corev1.Taint {
-	colonIdx := strings.LastIndex(s, ":")
-	if colonIdx < 0 {
-		return corev1.Taint{Key: s}
-	}
-	effect := corev1.TaintEffect(s[colonIdx+1:])
-	keyVal := s[:colonIdx]
+// parseTaint parses a taint from a string, whose form must be either
+// '<key>=<value>:<effect>', '<key>:<effect>', or '<key>'.
+func parseTaint(st string) (corev1.Taint, error) {
+	var taint corev1.Taint
 
-	if eqIdx := strings.Index(keyVal, "="); eqIdx >= 0 {
-		return corev1.Taint{Key: keyVal[:eqIdx], Value: keyVal[eqIdx+1:], Effect: effect}
+	var key string
+	var value string
+	var effect corev1.TaintEffect
+
+	parts := strings.Split(st, ":")
+	switch len(parts) {
+	case 1:
+		key = parts[0]
+	case 2:
+		effect = corev1.TaintEffect(parts[1])
+		if err := validateTaintEffect(effect); err != nil {
+			return taint, err
+		}
+
+		partsKV := strings.Split(parts[0], "=")
+		if len(partsKV) > 2 {
+			return taint, fmt.Errorf("invalid taint spec: %v", st)
+		}
+		key = partsKV[0]
+		if len(partsKV) == 2 {
+			value = partsKV[1]
+			if errs := validation.IsValidLabelValue(value); len(errs) > 0 {
+				return taint, fmt.Errorf("invalid taint spec: %v, %s", st, strings.Join(errs, "; "))
+			}
+		}
+	default:
+		return taint, fmt.Errorf("invalid taint spec: %v", st)
 	}
-	return corev1.Taint{Key: keyVal, Effect: effect}
+
+	if errs := validation.IsQualifiedName(key); len(errs) > 0 {
+		return taint, fmt.Errorf("invalid taint spec: %v, %s", st, strings.Join(errs, "; "))
+	}
+
+	taint.Key = key
+	taint.Value = value
+	taint.Effect = effect
+
+	return taint, nil
+}
+
+func validateTaintEffect(effect corev1.TaintEffect) error {
+	if effect != corev1.TaintEffectNoSchedule && effect != corev1.TaintEffectPreferNoSchedule && effect != corev1.TaintEffectNoExecute {
+		return fmt.Errorf("invalid taint effect: %v, unsupported taint effect", effect)
+	}
+
+	return nil
 }
 
 // formatTaint formats a corev1.Taint as key=value:Effect.

@@ -16,10 +16,13 @@ import (
 )
 
 func configAssignCommand() *cobra.Command {
-	var version int32
+	var (
+		configName string
+		version    int32
+	)
 
 	cmd := &cobra.Command{
-		Use:   "assign CONFIG_NAME MACHINE_NAME",
+		Use:   "assign MACHINE_NAME",
 		Short: "Assign a MachineConfiguration to a Machine",
 		Long: `Set the spec.configurationRef on a Machine to reference a
 MachineConfiguration. If --version is specified, that exact version is
@@ -27,9 +30,9 @@ pinned; otherwise only the configuration name is set and the controller
 will select the latest version.
 
 Example:
-  kubectl unbounded machine config assign my-config my-machine
-  kubectl unbounded machine config assign my-config my-machine --version=3`,
-		Args: cobra.ExactArgs(2),
+  kubectl unbounded machine config assign my-machine --config=my-config
+  kubectl unbounded machine config assign my-machine --config=my-config --version=3`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := ctrl.SetupSignalHandler()
 
@@ -43,11 +46,13 @@ Example:
 				versionPtr = ptr.To(version)
 			}
 
-			return runConfigAssign(ctx, c, args[0], args[1], versionPtr)
+			return runConfigAssign(ctx, c, configName, args[0], versionPtr)
 		},
 	}
 
+	cmd.Flags().StringVar(&configName, "config", "", "MachineConfiguration name to assign")
 	cmd.Flags().Int32Var(&version, "version", 0, "Pin a specific MachineConfigurationVersion number")
+	_ = cmd.MarkFlagRequired("config") //nolint:errcheck
 
 	return cmd
 }
