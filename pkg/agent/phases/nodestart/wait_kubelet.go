@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
-	"github.com/Azure/unbounded/pkg/agent/internal/utilexec"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
 
@@ -38,7 +38,7 @@ func (w *waitForKubelet) Do(ctx context.Context) error {
 	defer cancel()
 
 	for {
-		out, err := utilexec.MachineRun(ctx, w.log, w.machine,
+		out, err := executil.MachineRun(ctx, w.log, w.machine,
 			"systemctl", "is-active", goalstates.SystemdUnitKubelet,
 		)
 		if err == nil && strings.TrimSpace(out) == "active" {

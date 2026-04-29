@@ -12,7 +12,7 @@ import (
 	"os/exec"
 	"strings"
 
-	"github.com/Azure/unbounded/pkg/agent/internal/utilexec"
+	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
@@ -34,7 +34,7 @@ func DisableSwap(log *slog.Logger) phases.Task {
 func (d *disableSwap) Name() string { return "disable-swap" }
 
 func (d *disableSwap) Do(ctx context.Context) error {
-	if err := utilexec.RunCmd(ctx, d.log, swapoff(), "-a"); err != nil {
+	if err := executil.RunCmd(ctx, d.log, swapoff(), "-a"); err != nil {
 		return fmt.Errorf("swapoff -a: %w", err)
 	}
 

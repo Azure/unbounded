@@ -10,7 +10,7 @@ import (
 	"log/slog"
 	"strings"
 
-	"github.com/Azure/unbounded/pkg/agent/internal/utilexec"
+	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
@@ -41,7 +41,7 @@ func InstallPackages(log *slog.Logger) phases.Task {
 func (ip *installPackages) Name() string { return "install-packages" }
 
 func (ip *installPackages) Do(ctx context.Context) error {
-	aptGet := utilexec.AptGet()
+	aptGet := executil.AptGet()
 
 	var missing []string
 
@@ -56,14 +56,14 @@ func (ip *installPackages) Do(ctx context.Context) error {
 	}
 
 	// Refresh the package index before installing.
-	if err := utilexec.RunCmd(ctx, ip.log, aptGet, "update", "-y"); err != nil {
+	if err := executil.RunCmd(ctx, ip.log, aptGet, "update", "-y"); err != nil {
 		return fmt.Errorf("apt-get update: %w", err)
 	}
 
 	// Install all missing packages in a single invocation.
 	args := append([]string{"install", "-y", "--no-install-recommends"}, missing...)
 
-	if err := utilexec.RunCmd(ctx, ip.log, aptGet, args...); err != nil {
+	if err := executil.RunCmd(ctx, ip.log, aptGet, args...); err != nil {
 		return fmt.Errorf("apt-get install %s: %w", strings.Join(missing, " "), err)
 	}
 
@@ -75,7 +75,7 @@ func isDebianPackageInstalled(ctx context.Context, log *slog.Logger, pkg string)
 	// dpkg-query exits non-zero and writes to stderr when the package is not
 	// found; this is the expected case when the package needs to be installed.
 	// Use Debug level so the "no packages found" message is not shown as an error.
-	output, err := utilexec.OutputCmdAt(ctx, log, slog.LevelDebug, "dpkg-query", "--show", "--showformat=${db:Status-Status}", pkg)
+	output, err := executil.OutputCmdAt(ctx, log, slog.LevelDebug, "dpkg-query", "--show", "--showformat=${db:Status-Status}", pkg)
 	if err != nil {
 		return false
 	}
@@ -112,7 +112,7 @@ func (c *configureOS) Do(ctx context.Context) error {
 		return fmt.Errorf("write %s: %w", hostSysctlPath, err)
 	}
 
-	if err := utilexec.RunCmd(ctx, c.log, utilexec.Sysctl(), "--system"); err != nil {
+	if err := executil.RunCmd(ctx, c.log, executil.Sysctl(), "--system"); err != nil {
 		return fmt.Errorf("sysctl --system: %w", err)
 	}
 

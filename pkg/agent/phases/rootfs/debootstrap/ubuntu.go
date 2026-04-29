@@ -11,7 +11,7 @@ import (
 	"os/exec"
 	"strings"
 
-	"github.com/Azure/unbounded/pkg/agent/internal/utilexec"
+	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
@@ -68,7 +68,7 @@ func (b *ubuntu) Do(ctx context.Context) error {
 	// debootstrap writes informational progress lines (e.g. "I: Extracting
 	// fonts...", "I: Base system installed successfully.") to stderr during a
 	// normal install. Use Info level so these don't appear as errors.
-	if err := utilexec.RunCmdAt(ctx, b.log, slog.LevelInfo, debootstrapCmd,
+	if err := executil.RunCmdAt(ctx, b.log, slog.LevelInfo, debootstrapCmd,
 		"--include="+strings.Join(packages, ","),
 		"--cache-dir="+cacheDir,
 		"noble",

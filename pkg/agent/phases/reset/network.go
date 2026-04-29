@@ -12,7 +12,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/Azure/unbounded/pkg/agent/internal/utilexec"
+	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
 
@@ -90,7 +90,7 @@ func (t *removeWireGuardKeys) Do(_ context.Context) error {
 // listWireGuardInterfaces returns the names of all WireGuard interfaces (names
 // matching wg[0-9]*) visible on the host.
 func listWireGuardInterfaces(ctx context.Context, log *slog.Logger) ([]string, error) {
-	out, err := utilexec.OutputCmd(ctx, log, "ip", "-o", "link", "show")
+	out, err := executil.OutputCmd(ctx, log, "ip", "-o", "link", "show")
 	if err != nil {
 		return nil, fmt.Errorf("ip link show: %w", err)
 	}
@@ -157,7 +157,7 @@ func linkExists(log *slog.Logger, name string) bool {
 // deleteLink removes a network interface, logging a warning if the operation
 // fails (e.g. the interface was already removed).
 func deleteLink(ctx context.Context, log *slog.Logger, name string) {
-	if err := utilexec.RunCmd(ctx, log, utilexec.Ip(), "link", "delete", name); err != nil {
+	if err := executil.RunCmd(ctx, log, executil.Ip(), "link", "delete", name); err != nil {
 		log.Warn("failed to delete interface (may already be gone)", "interface", name, "error", err)
 	}
 }

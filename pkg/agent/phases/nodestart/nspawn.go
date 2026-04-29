@@ -10,15 +10,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
-	"github.com/Azure/unbounded/pkg/agent/internal/utilexec"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
 
 // machinectlRunner abstracts the small set of machinectl/systemctl operations
 // we need so tests can exercise the recovery path without invoking real
 // binaries. The default implementation, defaultMachinectlRunner, shells out
-// via utilexec.
+// via executil.
 type machinectlRunner interface {
 	Start(ctx context.Context, name string) error
 	Enable(ctx context.Context, name string) error
@@ -32,24 +32,24 @@ type defaultMachinectlRunner struct {
 }
 
 func (r defaultMachinectlRunner) Enable(ctx context.Context, name string) error {
-	return utilexec.RunCmd(ctx, r.log, utilexec.Machinectl(), "enable", name)
+	return executil.RunCmd(ctx, r.log, executil.Machinectl(), "enable", name)
 }
 
 func (r defaultMachinectlRunner) Start(ctx context.Context, name string) error {
-	return utilexec.RunCmd(ctx, r.log, utilexec.Machinectl(), "start", name)
+	return executil.RunCmd(ctx, r.log, executil.Machinectl(), "start", name)
 }
 
 func (r defaultMachinectlRunner) Terminate(ctx context.Context, name string) error {
-	return utilexec.RunCmd(ctx, r.log, utilexec.Machinectl(), "terminate", name)
+	return executil.RunCmd(ctx, r.log, executil.Machinectl(), "terminate", name)
 }
 
 func (r defaultMachinectlRunner) Exists(ctx context.Context, name string) bool {
-	return utilexec.RunCmd(ctx, r.log, utilexec.Machinectl(), "show", name) == nil
+	return executil.RunCmd(ctx, r.log, executil.Machinectl(), "show", name) == nil
 }
 
 func (r defaultMachinectlRunner) ResetFailed(ctx context.Context, name string) error {
 	service := fmt.Sprintf("systemd-nspawn@%s.service", name)
-	return utilexec.RunCmd(ctx, r.log, utilexec.Systemctl(), "reset-failed", service)
+	return executil.RunCmd(ctx, r.log, executil.Systemctl(), "reset-failed", service)
 }
 
 type startNSpawnMachine struct {
@@ -62,7 +62,7 @@ type startNSpawnMachine struct {
 
 // StartNSpawnMachine returns a task that starts the systemd-nspawn machine using machinectl and
 // waits until D-Bus is responsive inside the machine so that subsequent phases
-// can safely use utilexec.MachineRun().
+// can safely use executil.MachineRun().
 func StartNSpawnMachine(log *slog.Logger, goalState *goalstates.NodeStart) phases.Task {
 	return &startNSpawnMachine{
 		log:       log,
@@ -174,7 +174,7 @@ func isAlreadyExistsErr(err error) bool {
 
 // waitForMachine polls the machine until it is responsive to systemd-run
 // commands. machinectl start returns before D-Bus is ready, so phases that use
-// utilexec.MachineRun() would fail without this gate.
+// executil.MachineRun() would fail without this gate.
 func waitForMachine(ctx context.Context, log *slog.Logger, machine string) error {
 	const (
 		pollInterval = 500 * time.Millisecond
@@ -185,7 +185,7 @@ func waitForMachine(ctx context.Context, log *slog.Logger, machine string) error
 	defer cancel()
 
 	for {
-		if _, err := utilexec.MachineRun(ctx, log, machine, "/bin/true"); err == nil {
+		if _, err := executil.MachineRun(ctx, log, machine, "/bin/true"); err == nil {
 			return nil
 		}
 
