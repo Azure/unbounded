@@ -15,7 +15,7 @@ import (
 	"text/template"
 
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
-	"github.com/Azure/unbounded/pkg/agent/internal/utilexec"
+	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
@@ -128,7 +128,7 @@ func StartContainerd(log *slog.Logger, goalState *goalstates.NodeStart) phases.T
 func (s *startContainerd) Name() string { return "start-containerd" }
 
 func (s *startContainerd) Do(ctx context.Context) error {
-	if _, err := utilexec.MachineRun(ctx, s.log, s.goalState.MachineName,
+	if _, err := executil.MachineRun(ctx, s.log, s.goalState.MachineName,
 		"systemctl", "enable", "--now", goalstates.SystemdUnitContainerd,
 	); err != nil {
 		return fmt.Errorf("systemctl enable --now %s in %s: %w",

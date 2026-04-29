@@ -13,7 +13,7 @@ import (
 	"text/template"
 
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
-	"github.com/Azure/unbounded/pkg/agent/internal/utilexec"
+	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
@@ -84,17 +84,17 @@ func (c *configureNFTables) ensureNFTablesFlushUnit(ctx context.Context) error {
 		return fmt.Errorf("writing %s: %w", unitPath, err)
 	}
 
-	systemctl := utilexec.Systemctl()
+	systemctl := executil.Systemctl()
 
-	if err := utilexec.RunCmd(ctx, c.log, systemctl, "daemon-reload"); err != nil {
+	if err := executil.RunCmd(ctx, c.log, systemctl, "daemon-reload"); err != nil {
 		return fmt.Errorf("systemctl daemon-reload: %w", err)
 	}
 
-	if err := utilexec.RunCmdAt(ctx, c.log, slog.LevelInfo, systemctl, "enable", nftablesFlushUnit); err != nil {
+	if err := executil.RunCmdAt(ctx, c.log, slog.LevelInfo, systemctl, "enable", nftablesFlushUnit); err != nil {
 		return fmt.Errorf("systemctl enable %s: %w", nftablesFlushUnit, err)
 	}
 
-	if err := utilexec.RunCmd(ctx, c.log, systemctl, "start", nftablesFlushUnit); err != nil {
+	if err := executil.RunCmd(ctx, c.log, systemctl, "start", nftablesFlushUnit); err != nil {
 		return fmt.Errorf("systemctl start %s: %w", nftablesFlushUnit, err)
 	}
 

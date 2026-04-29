@@ -11,7 +11,7 @@ import (
 	"strings"
 
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
-	"github.com/Azure/unbounded/pkg/agent/internal/utilexec"
+	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
@@ -115,7 +115,7 @@ func cniPluginsVersionMatch(ctx context.Context, log *slog.Logger, cniBinPath, e
 		return false
 	}
 
-	output, err := utilexec.OutputCmd(ctx, log, loopbackPath, "--version")
+	output, err := executil.OutputCmd(ctx, log, loopbackPath, "--version")
 	if err != nil {
 		// Some CNI plugin versions don't support --version; treat as not matching.
 		return false

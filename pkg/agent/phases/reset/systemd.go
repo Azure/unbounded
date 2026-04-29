@@ -7,7 +7,7 @@ import (
 	"context"
 	"log/slog"
 
-	"github.com/Azure/unbounded/pkg/agent/internal/utilexec"
+	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
 
@@ -26,5 +26,5 @@ func (t *reloadSystemd) Name() string { return "reload-systemd" }
 func (t *reloadSystemd) Do(ctx context.Context) error {
 	t.log.Info("reloading systemd daemon")
 
-	return utilexec.RunCmd(ctx, t.log, utilexec.Systemctl(), "daemon-reload")
+	return executil.RunCmd(ctx, t.log, executil.Systemctl(), "daemon-reload")
 }

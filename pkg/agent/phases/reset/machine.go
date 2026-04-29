@@ -11,7 +11,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/Azure/unbounded/pkg/agent/internal/utilexec"
+	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
 
@@ -29,7 +29,7 @@ func StopMachine(log *slog.Logger, machineName string) phases.Task {
 func (t *stopMachine) Name() string { return "stop-machine" }
 
 func (t *stopMachine) Do(ctx context.Context) error {
-	if err := utilexec.RunCmd(ctx, t.log, utilexec.Machinectl(), "disable", t.machineName); err != nil {
+	if err := executil.RunCmd(ctx, t.log, executil.Machinectl(), "disable", t.machineName); err != nil {
 		t.log.Warn("failed to disable machine (may not have been enabled)", "machine", t.machineName, "error", err)
 	}
 
@@ -47,7 +47,7 @@ func (t *stopMachine) Do(ctx context.Context) error {
 
 	if !serviceIsActive(ctx, t.log, serviceName) {
 		t.log.Info("nspawn service already inactive, skipping stop", "service", serviceName)
-	} else if err := utilexec.RunCmd(ctx, t.log, utilexec.Systemctl(), "stop", serviceName); err != nil {
+	} else if err := executil.RunCmd(ctx, t.log, executil.Systemctl(), "stop", serviceName); err != nil {
 		t.log.Warn("failed to stop nspawn service", "service", serviceName, "error", err)
 	}
 
@@ -60,7 +60,7 @@ func (t *stopMachine) Do(ctx context.Context) error {
 	if machineExists(ctx, t.log, t.machineName) {
 		t.log.Warn("machine did not stop gracefully, terminating", "machine", t.machineName)
 
-		if err := utilexec.RunCmd(ctx, t.log, utilexec.Machinectl(), "terminate", t.machineName); err != nil {
+		if err := executil.RunCmd(ctx, t.log, executil.Machinectl(), "terminate", t.machineName); err != nil {
 			t.log.Warn("failed to terminate machine", "machine", t.machineName, "error", err)
 		}
 
@@ -124,7 +124,7 @@ func (t *removeMachine) Do(ctx context.Context) error {
 
 	deadline := time.Now().Add(retryTimeout)
 	for time.Now().Before(deadline) {
-		err := utilexec.RunCmd(ctx, t.log, utilexec.Machinectl(), "remove", t.machineName)
+		err := executil.RunCmd(ctx, t.log, executil.Machinectl(), "remove", t.machineName)
 		if err == nil {
 			return nil // machinectl removed both image metadata and directory
 		}
@@ -145,12 +145,12 @@ func (t *removeMachine) Do(ctx context.Context) error {
 
 // machineExists checks whether the named nspawn machine is known to machinectl.
 func machineExists(ctx context.Context, log *slog.Logger, name string) bool {
-	err := utilexec.RunCmd(ctx, log, utilexec.Machinectl(), "show", name)
+	err := executil.RunCmd(ctx, log, executil.Machinectl(), "show", name)
 	return err == nil
 }
 
 // serviceIsActive returns true if the named systemd service is currently active.
 func serviceIsActive(ctx context.Context, log *slog.Logger, service string) bool {
-	err := utilexec.RunCmd(ctx, log, utilexec.Systemctl(), "is-active", "--quiet", service)
+	err := executil.RunCmd(ctx, log, executil.Systemctl(), "is-active", "--quiet", service)
 	return err == nil
 }

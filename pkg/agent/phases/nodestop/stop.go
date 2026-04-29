@@ -9,7 +9,7 @@ import (
 	"log/slog"
 
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
-	"github.com/Azure/unbounded/pkg/agent/internal/utilexec"
+	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 	"github.com/Azure/unbounded/pkg/agent/phases/reset"
 )
@@ -34,11 +34,11 @@ func (s *stopNode) Do(ctx context.Context) error {
 	// the nspawn stop is fast and does not have to force-kill them.
 	s.log.Info("pre-stopping services in machine", "machine", s.machineName)
 
-	if _, err := utilexec.MachineRun(ctx, s.log, s.machineName, "systemctl", "stop", goalstates.SystemdUnitKubelet); err != nil {
+	if _, err := executil.MachineRun(ctx, s.log, s.machineName, "systemctl", "stop", goalstates.SystemdUnitKubelet); err != nil {
 		s.log.Warn("failed to pre-stop kubelet (proceeding anyway)", "machine", s.machineName, "error", err)
 	}
 
-	if _, err := utilexec.MachineRun(ctx, s.log, s.machineName, "systemctl", "stop", goalstates.SystemdUnitContainerd); err != nil {
+	if _, err := executil.MachineRun(ctx, s.log, s.machineName, "systemctl", "stop", goalstates.SystemdUnitContainerd); err != nil {
 		s.log.Warn("failed to pre-stop containerd (proceeding anyway)", "machine", s.machineName, "error", err)
 	}
 

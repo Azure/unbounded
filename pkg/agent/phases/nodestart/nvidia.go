@@ -11,7 +11,7 @@ import (
 	"path/filepath"
 
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
-	"github.com/Azure/unbounded/pkg/agent/internal/utilexec"
+	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
 
@@ -74,7 +74,7 @@ func (s *setupNVIDIA) setupLibraries(ctx context.Context) error {
 
 	// Clean stale symlinks from a previous session that may point into
 	// /run/host-nvidia/ paths that no longer exist.
-	if _, err := utilexec.MachineRun(ctx, s.log, machine,
+	if _, err := executil.MachineRun(ctx, s.log, machine,
 		"find", s.goalState.Nvidia.ContainerLibDir, "-maxdepth", "1",
 		"-lname", goalstates.NvidiaHostLibDir+"/*", "-delete",
 	); err != nil {
@@ -85,9 +85,9 @@ func (s *setupNVIDIA) setupLibraries(ctx context.Context) error {
 	for _, lib := range libs {
 		// Remove any existing file/symlink, then create the new symlink.
 		// Errors from rm -f are intentionally ignored - the file may not exist.
-		utilexec.MachineRun(ctx, s.log, machine, "rm", "-f", lib.LinkPath) //nolint:errcheck // rm -f is best-effort.
+		executil.MachineRun(ctx, s.log, machine, "rm", "-f", lib.LinkPath) //nolint:errcheck // rm -f is best-effort.
 
-		if _, err := utilexec.MachineRun(ctx, s.log, machine,
+		if _, err := executil.MachineRun(ctx, s.log, machine,
 			"ln", "-s", lib.ContainerPath, lib.LinkPath,
 		); err != nil {
 			return fmt.Errorf("symlink %s -> %s: %w", lib.LinkPath, lib.ContainerPath, err)
@@ -95,7 +95,7 @@ func (s *setupNVIDIA) setupLibraries(ctx context.Context) error {
 	}
 
 	// Update the dynamic linker cache so the libraries are discoverable.
-	if _, err := utilexec.MachineRun(ctx, s.log, machine, "ldconfig"); err != nil {
+	if _, err := executil.MachineRun(ctx, s.log, machine, "ldconfig"); err != nil {
 		return fmt.Errorf("ldconfig failed: %w", err)
 	}
 
@@ -120,7 +120,7 @@ func (s *setupNVIDIA) generateCDISpec(ctx context.Context) error {
 		slog.String("output", goalstates.CDISpecFile),
 	)
 
-	if _, err := utilexec.MachineRun(ctx, s.log, machine,
+	if _, err := executil.MachineRun(ctx, s.log, machine,
 		goalstates.NvidiaCTKPath, "cdi", "generate",
 		"--output", goalstates.CDISpecFile,
 		"--disable-hook", "all",
