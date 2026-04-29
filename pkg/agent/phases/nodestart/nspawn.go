@@ -12,7 +12,7 @@ import (
 
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/phases"
-	"github.com/Azure/unbounded/pkg/agent/utilexec"
+	"github.com/Azure/unbounded/pkg/agent/internal/utilexec"
 )
 
 // machinectlRunner abstracts the small set of machinectl/systemctl operations

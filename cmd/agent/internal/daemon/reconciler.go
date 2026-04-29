@@ -15,6 +15,11 @@ import (
 // host.
 type executor interface {
 	softReboot(ctx context.Context, log *slog.Logger, machineName string) error
+	// machineRun executes a command inside the named nspawn machine using
+	// systemd-run --machine=<machine> --pipe --wait and returns stdout.
+	machineRun(ctx context.Context, log *slog.Logger, machine string, args ...string) (string, error)
+	// systemctlRestart restarts the named systemd unit on the host.
+	systemctlRestart(ctx context.Context, log *slog.Logger, unit string) error
 }
 
 // reconciler holds shared state for all action handlers. A single worker

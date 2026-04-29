@@ -32,6 +32,14 @@ func (m *mockExecutor) softReboot(_ context.Context, _ *slog.Logger, machineName
 	return m.softRebootErr
 }
 
+func (m *mockExecutor) machineRun(_ context.Context, _ *slog.Logger, _ string, _ ...string) (string, error) {
+	return "", nil
+}
+
+func (m *mockExecutor) systemctlRestart(_ context.Context, _ *slog.Logger, _ string) error {
+	return nil
+}
+
 // stubFindActive returns a findActive function that always returns the given
 // nspawn machine name.
 func stubFindActive(nspawnName string) func(*slog.Logger) (*ActiveMachine, error) {

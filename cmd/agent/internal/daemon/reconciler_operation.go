@@ -16,7 +16,6 @@ import (
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/phases/nodestart"
-	"github.com/Azure/unbounded/pkg/agent/utilexec"
 )
 
 // errIgnoreOperation is returned by executeOperation when the operation is not
@@ -158,13 +157,13 @@ func (e *defaultExecutor) softReboot(ctx context.Context, log *slog.Logger, mach
 
 	// Gracefully stop kubelet and containerd inside the container so the
 	// nspawn restart does not have to force-kill them.
-	if _, err := utilexec.MachineRun(ctx, log, machineName,
+	if _, err := e.machineRun(ctx, log, machineName,
 		"systemctl", "stop", goalstates.SystemdUnitKubelet,
 	); err != nil {
 		log.Warn("failed to pre-stop kubelet (proceeding anyway)", "machine", machineName, "error", err)
 	}
 
-	if _, err := utilexec.MachineRun(ctx, log, machineName,
+	if _, err := e.machineRun(ctx, log, machineName,
 		"systemctl", "stop", goalstates.SystemdUnitContainerd,
 	); err != nil {
 		log.Warn("failed to pre-stop containerd (proceeding anyway)", "machine", machineName, "error", err)
@@ -175,13 +174,13 @@ func (e *defaultExecutor) softReboot(ctx context.Context, log *slog.Logger, mach
 	// Restart the nspawn service directly. This avoids the machinectl
 	// disable/enable cycle that StopNode uses, which tears down the
 	// service symlink and can fail to re-enable it.
-	if err := utilexec.RunCmd(ctx, log, utilexec.Systemctl(), "restart", serviceName); err != nil {
+	if err := e.systemctlRestart(ctx, log, serviceName); err != nil {
 		return fmt.Errorf("restart %s: %w", serviceName, err)
 	}
 
 	// Wait for the machine's D-Bus to become responsive so that
 	// subsequent systemd-run commands work.
-	if err := waitForMachineReady(ctx, log, machineName); err != nil {
+	if err := e.waitForMachineReady(ctx, log, machineName); err != nil {
 		return fmt.Errorf("wait for machine %s: %w", machineName, err)
 	}
 
@@ -189,13 +188,13 @@ func (e *defaultExecutor) softReboot(ctx context.Context, log *slog.Logger, mach
 
 	// Re-enable containerd and kubelet inside the machine.
 	// systemctl enable --now is idempotent on already-running services.
-	if _, err := utilexec.MachineRun(ctx, log, machineName,
+	if _, err := e.machineRun(ctx, log, machineName,
 		"systemctl", "enable", "--now", goalstates.SystemdUnitContainerd,
 	); err != nil {
 		return fmt.Errorf("start containerd in %s: %w", machineName, err)
 	}
 
-	if _, err := utilexec.MachineRun(ctx, log, machineName,
+	if _, err := e.machineRun(ctx, log, machineName,
 		"systemctl", "enable", "--now", goalstates.SystemdUnitKubelet,
 	); err != nil {
 		return fmt.Errorf("start kubelet in %s: %w", machineName, err)
@@ -212,9 +211,8 @@ func (e *defaultExecutor) softReboot(ctx context.Context, log *slog.Logger, mach
 }
 
 // waitForMachineReady polls the nspawn machine until it is responsive to
-// systemd-run commands. This mirrors the wait logic in nodestart but is
-// kept here to avoid coupling the soft-reboot path to goal-state types.
-func waitForMachineReady(ctx context.Context, log *slog.Logger, machine string) error {
+// systemd-run commands.
+func (e *defaultExecutor) waitForMachineReady(ctx context.Context, log *slog.Logger, machine string) error {
 	const (
 		pollInterval = 500 * time.Millisecond
 		timeout      = 30 * time.Second
@@ -224,7 +222,7 @@ func waitForMachineReady(ctx context.Context, log *slog.Logger, machine string) 
 	defer cancel()
 
 	for {
-		if _, err := utilexec.MachineRun(ctx, log, machine, "/bin/true"); err == nil {
+		if _, err := e.machineRun(ctx, log, machine, "/bin/true"); err == nil {
 			return nil
 		}
 

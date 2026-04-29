@@ -12,7 +12,7 @@ import (
 
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 	"github.com/Azure/unbounded/pkg/agent/phases"
-	"github.com/Azure/unbounded/pkg/agent/utilexec"
+	"github.com/Azure/unbounded/pkg/agent/internal/utilexec"
 )
 
 // requiredPackages lists the OS packages that must be installed on the host.
