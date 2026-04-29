@@ -30,6 +30,8 @@ func getKubeconfigPath(p string) string {
 	return ""
 }
 
+// parseTaints mirrors Kubernetes' pkg/util/taints parsing and validation logic,
+// scoped to additions because MachineConfiguration creation does not remove taints.
 func parseTaints(spec []string) ([]corev1.Taint, error) {
 	taints := make([]corev1.Taint, 0, len(spec))
 	uniqueTaints := map[corev1.TaintEffect]map[string]struct{}{}
