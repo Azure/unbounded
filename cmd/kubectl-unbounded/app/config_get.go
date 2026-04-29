@@ -7,11 +7,12 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"text/tabwriter"
 	"time"
 
 	"github.com/spf13/cobra"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/duration"
+	"k8s.io/cli-runtime/pkg/printers"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -59,28 +60,30 @@ func runConfigGetAll(ctx context.Context, c client.WithWatch) error {
 		return nil
 	}
 
-	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-
-	if _, err := fmt.Fprintln(w, "NAME\tLATEST VERSION\tSTRATEGY\tPRIORITY\tAGE"); err != nil {
-		return err
+	table := &metav1.Table{
+		ColumnDefinitions: []metav1.TableColumnDefinition{
+			{Name: "Name", Type: "string", Format: "name"},
+			{Name: "Latest Version", Type: "integer"},
+			{Name: "Strategy", Type: "string"},
+			{Name: "Priority", Type: "integer"},
+			{Name: "Age", Type: "string"},
+		},
 	}
 
 	for i := range list.Items {
 		mc := &list.Items[i]
 		age := duration.HumanDuration(time.Since(mc.CreationTimestamp.Time))
 
-		if _, err := fmt.Fprintf(w, "%s\t%d\t%s\t%d\t%s\n",
+		table.Rows = append(table.Rows, metav1.TableRow{Cells: []interface{}{
 			mc.Name,
 			mc.Status.LatestVersion,
 			mc.Spec.UpdateStrategy.Type,
 			mc.Spec.Priority,
 			age,
-		); err != nil {
-			return err
-		}
+		}})
 	}
 
-	return w.Flush()
+	return printers.NewTablePrinter(printers.PrintOptions{}).PrintObj(table, os.Stdout)
 }
 
 func runConfigGetOne(ctx context.Context, c client.WithWatch, name string) error {
