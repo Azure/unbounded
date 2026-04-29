@@ -12,9 +12,9 @@ import (
 	"os/exec"
 	"strings"
 
+	"github.com/Azure/unbounded/pkg/agent/internal/utilexec"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 	"github.com/Azure/unbounded/pkg/agent/phases"
-	"github.com/Azure/unbounded/pkg/agent/internal/utilexec"
 )
 
 const fstabPath = "/etc/fstab"
