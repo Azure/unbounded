@@ -20,6 +20,7 @@ func Run() {
 
 	root.AddCommand(siteCommandGroup())
 	root.AddCommand(machineCommandGroup())
+	root.AddCommand(configCommandGroup())
 	root.AddCommand(netcmd.Command())
 	root.AddCommand(version.Command())
 
