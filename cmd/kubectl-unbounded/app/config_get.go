@@ -27,8 +27,8 @@ func configGetCommand() *cobra.Command {
 that specific configuration.
 
 Example:
-  kubectl unbounded config get
-  kubectl unbounded config get my-config`,
+  kubectl unbounded machine config get
+  kubectl unbounded machine config get my-config`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := ctrl.SetupSignalHandler()

@@ -35,7 +35,7 @@ profile for a class of machines. The machina controller automatically
 creates a MachineConfigurationVersion (v1) from the provided settings.
 
 Example:
-  kubectl unbounded config create my-config \
+  kubectl unbounded machine config create my-config \
     --kubernetes-version=v1.34.0 \
     --agent-image=ghcr.io/azure/unbounded-agent:latest \
     --node-labels=env=prod,tier=worker \

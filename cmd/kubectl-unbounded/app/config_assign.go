@@ -27,8 +27,8 @@ pinned; otherwise only the configuration name is set and the controller
 will select the latest version.
 
 Example:
-  kubectl unbounded config assign my-config my-machine
-  kubectl unbounded config assign my-config my-machine --version=3`,
+  kubectl unbounded machine config assign my-config my-machine
+  kubectl unbounded machine config assign my-config my-machine --version=3`,
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := ctrl.SetupSignalHandler()

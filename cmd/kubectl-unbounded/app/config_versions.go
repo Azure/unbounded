@@ -27,7 +27,7 @@ func configVersionsCommand() *cobra.Command {
 MachineConfiguration, ordered by version number.
 
 Example:
-  kubectl unbounded config versions my-config`,
+  kubectl unbounded machine config versions my-config`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := ctrl.SetupSignalHandler()
