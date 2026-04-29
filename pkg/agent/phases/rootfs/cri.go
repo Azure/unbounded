@@ -10,8 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
-	"github.com/Azure/unbounded/pkg/agent/internal/utilexec"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
@@ -167,7 +167,7 @@ func containerdVersionMatch(ctx context.Context, log *slog.Logger, destDir, expe
 
 	containerdPath := filepath.Join(destDir, "containerd")
 
-	output, err := utilexec.OutputCmd(ctx, log, containerdPath, "--version")
+	output, err := executil.OutputCmd(ctx, log, containerdPath, "--version")
 	if err != nil {
 		return false
 	}
@@ -182,7 +182,7 @@ func runcVersionMatch(ctx context.Context, log *slog.Logger, destDir, expectedVe
 		return false
 	}
 
-	output, err := utilexec.OutputCmd(ctx, log, runcPath, "--version")
+	output, err := executil.OutputCmd(ctx, log, runcPath, "--version")
 	if err != nil {
 		return false
 	}

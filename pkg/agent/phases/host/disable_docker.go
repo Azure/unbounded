@@ -11,7 +11,7 @@ import (
 	"log/slog"
 	"os"
 
-	"github.com/Azure/unbounded/pkg/agent/internal/utilexec"
+	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
@@ -50,19 +50,19 @@ func (d *disableDocker) Do(ctx context.Context) error {
 // ensureDockerDisabled idempotently stops, disables, and masks the docker
 // service and socket units so docker cannot be started.
 func (d *disableDocker) ensureDockerDisabled(ctx context.Context) error {
-	systemctl := utilexec.Systemctl()
+	systemctl := executil.Systemctl()
 
 	for _, unit := range []string{dockerSocketUnit, dockerServiceUnit} {
 		// Stop the unit if running. Docker may not be installed, so log stop
 		// errors at Debug - a missing unit is expected and not a problem.
-		if err := utilexec.RunCmdAt(ctx, d.log, slog.LevelDebug, systemctl, "stop", unit); err != nil {
+		if err := executil.RunCmdAt(ctx, d.log, slog.LevelDebug, systemctl, "stop", unit); err != nil {
 			d.log.DebugContext(ctx, "stopping unit (may already be stopped or not installed)", "unit", unit, "err", err)
 		}
 
 		// Mask the unit to prevent future activation. systemctl writes
 		// informational messages (e.g. "Created symlink ...") to stderr on
 		// success, so use Info level to avoid misleading Error logs.
-		if err := utilexec.RunCmdAt(ctx, d.log, slog.LevelInfo, systemctl, "mask", unit); err != nil {
+		if err := executil.RunCmdAt(ctx, d.log, slog.LevelInfo, systemctl, "mask", unit); err != nil {
 			return fmt.Errorf("masking %s: %w", unit, err)
 		}
 	}
