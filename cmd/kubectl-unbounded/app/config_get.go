@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"os"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
+	"k8s.io/apimachinery/pkg/util/duration"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -65,7 +67,7 @@ func runConfigGetAll(ctx context.Context, c client.WithWatch) error {
 
 	for i := range list.Items {
 		mc := &list.Items[i]
-		age := formatAge(mc.CreationTimestamp.Time)
+		age := duration.HumanDuration(time.Since(mc.CreationTimestamp.Time))
 
 		if _, err := fmt.Fprintf(w, "%s\t%d\t%s\t%d\t%s\n",
 			mc.Name,

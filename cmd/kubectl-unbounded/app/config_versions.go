@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"os"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
+	"k8s.io/apimachinery/pkg/util/duration"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -74,7 +76,7 @@ func runConfigVersions(ctx context.Context, c client.WithWatch, name string) err
 			agentImage = mcv.Spec.Template.Agent.Image
 		}
 
-		age := formatAge(mcv.CreationTimestamp.Time)
+		age := duration.HumanDuration(time.Since(mcv.CreationTimestamp.Time))
 
 		if _, err := fmt.Fprintf(w, "%s\t%d\t%v\t%d\t%s\t%s\t%s\n",
 			mcv.Name,
