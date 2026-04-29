@@ -17,8 +17,15 @@ import (
 )
 
 // RunCmd creates a command from the given factory, appends args, streams stdout
-// at Debug and stderr at Error, and waits for it to finish.
+// at Debug and stderr at Info, and waits for it to finish.
 func RunCmd(ctx context.Context, logger *slog.Logger, newCmd func(context.Context) *exec.Cmd, args ...string) error {
+	return RunCmdAt(ctx, logger, slog.LevelInfo, newCmd, args...)
+}
+
+// RunCmdAt is like RunCmd but streams stderr at stderrLevel instead of Info.
+// Use a lower level (e.g. Debug) when stderr output is known to be benign or
+// when a failure is expected and already handled by the caller.
+func RunCmdAt(ctx context.Context, logger *slog.Logger, stderrLevel slog.Level, newCmd func(context.Context) *exec.Cmd, args ...string) error {
 	cmd := newCmd(ctx)
 	cmd.Args = append(cmd.Args, args...)
 
@@ -49,7 +56,7 @@ func RunCmd(ctx context.Context, logger *slog.Logger, newCmd func(context.Contex
 	go func() {
 		defer wg.Done()
 
-		streamLogs(ctx, logger, stderr, slog.LevelError)
+		streamLogs(ctx, logger, stderr, stderrLevel)
 	}()
 
 	wg.Wait()
@@ -62,9 +69,16 @@ func RunCmd(ctx context.Context, logger *slog.Logger, newCmd func(context.Contex
 }
 
 // OutputCmd runs the command specified by name and args, streams stdout at
-// Debug and stderr at Error, and returns the captured stdout as a string.
+// Debug and stderr at Info, and returns the captured stdout as a string.
 // Unlike RunCmd it does not require a command factory - just a binary path.
 func OutputCmd(ctx context.Context, logger *slog.Logger, name string, args ...string) (string, error) {
+	return OutputCmdAt(ctx, logger, slog.LevelInfo, name, args...)
+}
+
+// OutputCmdAt is like OutputCmd but streams stderr at stderrLevel instead of
+// Info. Use a lower level (e.g. Debug) when stderr output is known to be
+// benign or an error exit is expected and already handled by the caller.
+func OutputCmdAt(ctx context.Context, logger *slog.Logger, stderrLevel slog.Level, name string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
 
 	stdout, err := cmd.StdoutPipe()
@@ -96,7 +110,7 @@ func OutputCmd(ctx context.Context, logger *slog.Logger, name string, args ...st
 	go func() {
 		defer wg.Done()
 
-		streamLogs(ctx, logger, stderr, slog.LevelError)
+		streamLogs(ctx, logger, stderr, stderrLevel)
 	}()
 
 	wg.Wait()

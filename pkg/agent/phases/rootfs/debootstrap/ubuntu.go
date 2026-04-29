@@ -65,7 +65,10 @@ func (b *ubuntu) Do(ctx context.Context) error {
 		"wireguard-tools",
 	}
 
-	if err := utilexec.RunCmd(ctx, b.log, debootstrapCmd,
+	// debootstrap writes informational progress lines (e.g. "I: Extracting
+	// fonts...", "I: Base system installed successfully.") to stderr during a
+	// normal install. Use Info level so these don't appear as errors.
+	if err := utilexec.RunCmdAt(ctx, b.log, slog.LevelInfo, debootstrapCmd,
 		"--include="+strings.Join(packages, ","),
 		"--cache-dir="+cacheDir,
 		"noble",
