@@ -7,14 +7,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-const (
-	// MachineOperationMachineLabelKey is the label key set on every
-	// MachineOperation to identify the target Machine. Agents use a
-	// label selector on this key to scope their informer to only
-	// operations targeting their own machine.
-	MachineOperationMachineLabelKey = "unbounded-cloud.io/machine"
-)
-
 func init() {
 	SchemeBuilder.Register(&MachineOperation{}, &MachineOperationList{})
 }
@@ -29,8 +21,8 @@ func init() {
 
 // MachineOperation represents a discrete operation to be performed on a
 // Machine. MachineOperations are created by CLI commands or controllers and
-// processed by the appropriate agent - the in-VM agent handles operations
-// like Reboot, while cloud or PXE controllers handle operations like
+// processed by the appropriate agent. The in-VM agent handles operations
+// like SoftReboot, while cloud or PXE controllers handle operations like
 // HardReboot, PowerOff, and PowerOn.
 type MachineOperation struct {
 	metav1.TypeMeta   `json:",inline"`
@@ -52,7 +44,7 @@ type MachineOperationList struct {
 // OperationKind identifies the kind of operation to perform. Predefined
 // operations cover common lifecycle actions; custom operations may be
 // supported by individual cloud controllers.
-// +kubebuilder:validation:Enum=SoftReboot;HardReboot
+// +kubebuilder:validation:Enum=SoftReboot;HardReboot;PowerOff;PowerOn
 type OperationKind string
 
 const (
@@ -66,6 +58,12 @@ const (
 	// via BMC (e.g. Redfish). Handled by the machina controller or cloud
 	// controller.
 	OperationHardReboot OperationKind = "HardReboot"
+
+	// OperationPowerOff powers off the host through an out-of-band provider.
+	OperationPowerOff OperationKind = "PowerOff"
+
+	// OperationPowerOn powers on the host through an out-of-band provider.
+	OperationPowerOn OperationKind = "PowerOn"
 )
 
 // OperationPhase represents the current phase of a MachineOperation.

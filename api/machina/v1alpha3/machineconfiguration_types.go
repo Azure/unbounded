@@ -91,6 +91,27 @@ type MachineConfigurationTemplate struct {
 	// OCI image reference for the nspawn machine).
 	// +optional
 	Agent *MachineConfigurationAgent `json:"agent,omitempty"`
+
+	// External contains provider configuration used by controllers that operate
+	// on machines from outside the host OS.
+	// +optional
+	External *MachineConfigurationExternal `json:"external,omitempty"`
+}
+
+// External provider names.
+const (
+	ExternalProviderAzureVM     = "AzureVM"
+	ExternalProviderOCIInstance = "OCIInstance"
+)
+
+// MachineConfigurationExternal selects the external provider used for
+// out-of-band machine operations.
+type MachineConfigurationExternal struct {
+	// Provider identifies the external control provider for machines using this
+	// configuration.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Enum=AzureVM;OCIInstance
+	Provider string `json:"provider"`
 }
 
 // MachineConfigurationKubernetes holds the Kubernetes-specific fields

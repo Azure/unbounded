@@ -123,6 +123,12 @@ type MachineSpec struct {
 	// +optional
 	Operations *OperationsSpec `json:"operations,omitempty"`
 
+	// ProviderID identifies the underlying infrastructure resource for this
+	// machine, using a Kubernetes-style provider ID such as
+	// azure:///subscriptions/.../virtualMachines/name or oci://ocid1.instance...
+	// +optional
+	ProviderID string `json:"providerID,omitempty"`
+
 	// ConfigurationRef references a MachineConfiguration (and
 	// optionally a specific version) that defines the configuration
 	// profile for this machine. If a specific version is set, that

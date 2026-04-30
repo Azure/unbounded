@@ -37,8 +37,8 @@ spec:
         description: |-
           MachineOperation represents a discrete operation to be performed on a
           Machine. MachineOperations are created by CLI commands or controllers and
-          processed by the appropriate agent - the in-VM agent handles operations
-          like Reboot, while cloud or PXE controllers handle operations like
+          processed by the appropriate agent. The in-VM agent handles operations
+          like SoftReboot, while cloud or PXE controllers handle operations like
           HardReboot, PowerOff, and PowerOn.
         properties:
           apiVersion:
@@ -122,6 +122,8 @@ spec:
                 enum:
                 - SoftReboot
                 - HardReboot
+                - PowerOff
+                - PowerOn
                 type: string
               parameters:
                 additionalProperties:
