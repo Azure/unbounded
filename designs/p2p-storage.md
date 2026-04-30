@@ -25,21 +25,73 @@ Optimize for high-frequency reads of large values, like model weights or contain
 
 ## Dataplane Architecture
 
+```mermaid
+flowchart LR
+  subgraph Node["Cluster Node"]
+    Client[Client App]
+    Frontend["Frontend<br/>(S3 / FUSE / gRPC / GDS)"]
+    DP["Dataplane<br/>(Rust)"]
+    CP["Control Plane<br/>(Go sidecar)"]
+    BD[("Local block<br/>device")]
+  end
+
+  subgraph Peer["Peer Node"]
+    PBD[("Peer block<br/>device")]
+  end
+
+  Backend["Backend<br/>(rclone / regional cache)"]
+  K8s[("Kubernetes API")]
+
+  Client --> Frontend
+  Frontend -- "metadata / map (gRPC)" --> DP
+  Frontend -. "direct read (GDS)" .-> BD
+  DP --> BD
+  DP <-- "NVMe-oF" --> PBD
+  DP --> Backend
+  CP -- "watch pods" --> K8s
+  CP -- "config (gRPC)" --> DP
+  CP -- "attach / detach" --> BD
+```
+
 ### Block
 
 The foundation of the service is simple block devices.
-Each node must have at least one writable block device that _can also be read by a subset of the cluster_.
+Each node must have at least one writable block device that __can also be read by a fixed subset of other cluster nodes__.
 In most cases other nodes will attach the device using NVMe-oF, but operating at the block level means we're decoupled from the transport.
 
-Bare metal can use NVMe-oF RDMA with full hardware offload on ConnectX/BlueField NICs (with NVIDIA SNAP providing host-side NVMe device emulation where needed).
-Cloud instances can use shared block devices from the provider (e.g. Azure shared disks).
-Otherwise, it's always possible to fall back to the Linux NVMe-oF stack over RDMA or TCP.
+- Bare metal can use NVMe-oF RDMA with full hardware offload on ConnectX/BlueField NICs (with NVIDIA SNAP providing host-side NVMe device emulation where needed)
+- Cloud instances can use shared block devices from the provider (e.g. Azure shared disks)
+- It's always possible to fall back to the Linux NVMe-oF stack over RDMA or TCP
 
-### Copy
+### Pull-through
 
-The goal of the cache is simple: get cache values onto a block device controlled by the requesting node.
+The goal of the dataplane is simple: shuffle cache values onto a block device attached to the requesting node.
 Those values might originate from a neighboring cluster node, the regional cache, or remote storage.
 Missing values are downloaded from a separate `backend` service: initially just a thin wrapper around rclone, later a regional cache layer.
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant L as Local dataplane
+  participant P as Peer (chunk owner)
+  participant B as Backend
+
+  C->>L: GetBlob(name)
+  L->>L: Resolve name to blob id (cached, TTL)
+  loop for each chunk
+    L->>P: Begin transaction (chunk id)
+    alt cache hit on peer
+      P-->>L: [device, offset, len]
+    else miss
+      P->>B: Fetch chunk
+      B-->>P: bytes (written to peer device)
+      P-->>L: [device, offset, len]
+    end
+    L->>P: Read range over NVMe-oF
+    L->>P: End transaction
+  end
+  L-->>C: bytes (or chunk map for GDS)
+```
 
 ### Frontend
 
@@ -51,8 +103,8 @@ This is critical for very high-performance clients like GPUDirect Storage, which
 
 ### Metadata
 
-Blob names need to be resolved to their length and an immutable identifier like an etag.
-This metadata will be cached according to a configured cache policy, using the same caching strategy as values.
+Blob names need to be resolved to a "blob identifier": their length, and an immutable id (etag).
+Metadata should be cached according to a configurable TTL.
 These values can then be hashed by the client to discover the stripe placements (more on that later).
 
 Metadata will use gRPC to avoid building an RPC layer on top of block devices.
@@ -82,6 +134,30 @@ This guarantees `O(log₂(n))` hops worst-case from any node to any value hashed
 
 For example, a 10k node cluster needs ~14 connections per node and will reach any value in ~14 hops worst-case (~7 hops expected).
 
+```mermaid
+flowchart LR
+  N0(("N0")):::origin
+  N1(("N1"))
+  N2(("N2"))
+  N3(("N3"))
+  N4(("N4"))
+  N5(("N5"))
+  N6(("N6"))
+  N7(("N7"))
+
+  %% Ring successor pointers
+  N0 --> N1 --> N2 --> N3 --> N4 --> N5 --> N6 --> N7 --> N0
+
+  %% N0's log2(n) fingers: +1, +2, +4
+  N0 -. "+1" .-> N1
+  N0 == "+2" ==> N2
+  N0 == "+4" ==> N4
+
+  classDef origin fill:#fde68a,stroke:#b45309,stroke-width:2px;
+```
+
+Thin arrows are the ring's successor chain; thick arrows are `N0`'s fingers at offsets `2⁰, 2¹, 2²` (3 fingers for `n=8`, since `log₂(8) = 3`). Every other node maintains an analogous fan-out from its own position.
+
 #### Complications
 
 - Use virtual slots to address unbalanced topologies (like clusters with nodes of different sizes).
@@ -110,6 +186,22 @@ The size of each chunk should be configurable, but a sane default would be 1GB.
 Stripes should be hashed onto the topology ring using the value's identifier plus an offset computed to purposefully distribute stripes across the ring.
 
 Smaller chunks increase the cost of coordination (metadata); larger chunks cause hotspots.
+
+```mermaid
+flowchart LR
+  Blob["Blob X<br/>(id = etag)"]
+  Blob --> C0["chunk 0<br/>hash(X, 0)"]
+  Blob --> C1["chunk 1<br/>hash(X, 1)"]
+  Blob --> C2["chunk 2<br/>hash(X, 2)"]
+  Blob --> C3["chunk 3<br/>hash(X, 3)"]
+
+  C0 --> N3(("N3"))
+  C1 --> N7(("N7"))
+  C2 --> N1(("N1"))
+  C3 --> N5(("N5"))
+```
+
+Each chunk lands on a different ring position, so a client reading the whole blob pulls from multiple owners in parallel rather than hammering one neighbor.
 
 ### Eviction
 
