@@ -158,11 +158,6 @@ flowchart LR
 
 Thin arrows are the ring's successor chain; thick arrows are `N0`'s fingers at offsets `2⁰, 2¹, 2²` (3 fingers for `n=8`, since `log₂(8) = 3`). Every other node maintains an analogous fan-out from its own position.
 
-#### Complications
-
-- Use virtual slots to address unbalanced topologies (like clusters with nodes of different sizes).
-- A "node" on the topology might correspond to a PCIe complex and/or NUMA domain rather than a logical host.
-
 #### Fan Out
 
 Since values are always read by copying them to a disk controlled by the node,
@@ -177,6 +172,16 @@ Naturally, the value won't be available if the owner is unable to accept request
 We mitigate this by allowing clients to retry requests with the target's successor (the next node on the hash ring), which is the natural next owner of those keys under consistent hashing.
 The successor won't have the value cached and will have to fetch it like the original owner would; successor-retry preserves liveness, not latency.
 Routing from the successor takes up to `log₂(n)` additional hops, so the worst-case path length stays `O(log(n))` (the constant roughly doubles).
+
+#### Locality
+
+Neighbor selection is topology-aware: for a given finger, the dataplane can pick any peer within the arc spanning the node and the key, preferring nodes that are physically closer, share faster interconnects, etc.
+This preserves the `O(log₂(n))` hop guarantee per ["Proximity Neighbor Selection"](https://people.eecs.berkeley.edu/~sylvia/cs268-2019/papers/dht-geometries.pdf).
+
+#### Per-node Topology
+
+Nodes with more than one PCIe complex will hash each complex onto the ring, and pin their NIC/SSD IO accordingly.
+On GB200-class hardware this is critical since bandwidth between complexes is limited.
 
 ### Striping
 
