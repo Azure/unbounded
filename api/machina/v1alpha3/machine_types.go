@@ -6,11 +6,6 @@ package v1alpha3
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
-
-func init() {
-	SchemeBuilder.Register(&Machine{}, &MachineList{})
-}
-
 // +kubebuilder:object:root=true
 // +kubebuilder:resource:scope=Cluster,shortName=mach
 // +kubebuilder:subresource:status

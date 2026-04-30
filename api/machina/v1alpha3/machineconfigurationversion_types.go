@@ -6,11 +6,6 @@ package v1alpha3
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
-
-func init() {
-	SchemeBuilder.Register(&MachineConfigurationVersion{}, &MachineConfigurationVersionList{})
-}
-
 // Label keys set on MachineConfigurationVersion objects.
 const (
 	// MCVConfigurationLabelKey identifies the parent MachineConfiguration.

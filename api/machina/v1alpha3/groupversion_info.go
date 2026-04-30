@@ -9,8 +9,9 @@ package v1alpha3
 //go:generate controller-gen crd:headerFile=../../../hack/boilerplate.yaml.txt paths=. output:crd:dir=../../../deploy/machina/crd
 
 import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"sigs.k8s.io/controller-runtime/pkg/scheme"
 )
 
 var (
@@ -18,8 +19,19 @@ var (
 	GroupVersion = schema.GroupVersion{Group: "unbounded-cloud.io", Version: "v1alpha3"}
 
 	// SchemeBuilder is used to add go types to the GroupVersionKind scheme.
-	SchemeBuilder = &scheme.Builder{GroupVersion: GroupVersion}
+	SchemeBuilder = runtime.NewSchemeBuilder(addKnownTypes)
 
 	// AddToScheme adds the types in this group-version to the given scheme.
 	AddToScheme = SchemeBuilder.AddToScheme
 )
+
+func addKnownTypes(s *runtime.Scheme) error {
+	s.AddKnownTypes(GroupVersion,
+		&Machine{}, &MachineList{},
+		&MachineOperation{}, &MachineOperationList{},
+		&MachineConfiguration{}, &MachineConfigurationList{},
+		&MachineConfigurationVersion{}, &MachineConfigurationVersionList{},
+	)
+	metav1.AddToGroupVersion(s, GroupVersion)
+	return nil
+}

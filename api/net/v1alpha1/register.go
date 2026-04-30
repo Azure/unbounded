@@ -5,8 +5,9 @@
 package v1alpha1
 
 import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"sigs.k8s.io/controller-runtime/pkg/scheme"
 )
 
 // GroupName is the group name used in this package
@@ -20,7 +21,7 @@ var (
 	SchemeGroupVersion = GroupVersion
 
 	// SchemeBuilder is used to add go types to the GroupVersionKind scheme.
-	SchemeBuilder = &scheme.Builder{GroupVersion: GroupVersion}
+	SchemeBuilder = runtime.NewSchemeBuilder(addKnownTypes)
 
 	// AddToScheme adds the types in this group-version to the given scheme.
 	AddToScheme = SchemeBuilder.AddToScheme
@@ -31,8 +32,8 @@ func Resource(resource string) schema.GroupResource {
 	return GroupVersion.WithResource(resource).GroupResource()
 }
 
-func init() {
-	SchemeBuilder.Register(
+func addKnownTypes(s *runtime.Scheme) error {
+	s.AddKnownTypes(GroupVersion,
 		&Site{}, &SiteList{},
 		&SiteNodeSlice{}, &SiteNodeSliceList{},
 		&GatewayPool{}, &GatewayPoolList{},
@@ -41,4 +42,6 @@ func init() {
 		&SiteGatewayPoolAssignment{}, &SiteGatewayPoolAssignmentList{},
 		&GatewayPoolPeering{}, &GatewayPoolPeeringList{},
 	)
+	metav1.AddToGroupVersion(s, GroupVersion)
+	return nil
 }

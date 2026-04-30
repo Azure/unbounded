@@ -15,10 +15,6 @@ const (
 	MachineOperationMachineLabelKey = "unbounded-cloud.io/machine"
 )
 
-func init() {
-	SchemeBuilder.Register(&MachineOperation{}, &MachineOperationList{})
-}
-
 // +kubebuilder:object:root=true
 // +kubebuilder:resource:scope=Cluster,shortName=mop
 // +kubebuilder:subresource:status
