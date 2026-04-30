@@ -22,6 +22,7 @@ type azureVMClient interface {
 }
 
 type azureVMClientFactory func(subscriptionID string) (azureVMClient, error)
+
 type azureVMOperation func(context.Context, azureVMClient, azureVMResourceRef) error
 
 var azureVMOperations = map[unboundedv1alpha3.OperationKind]azureVMOperation{
@@ -87,12 +88,12 @@ func parseAzureVMProviderID(providerID string) (azureVMResourceRef, error) {
 	providerID = strings.Trim(providerID, "/")
 
 	if providerID == "" {
-		return azureVMResourceRef{}, fmt.Errorf("Azure VM providerID is required")
+		return azureVMResourceRef{}, fmt.Errorf("azure VM providerID is required")
 	}
 
 	parts := strings.Split(providerID, "/")
 	if len(parts) != 8 {
-		return azureVMResourceRef{}, fmt.Errorf("Azure VM providerID must be azure:///subscriptions/{subscription}/resourceGroups/{resourceGroup}/providers/Microsoft.Compute/virtualMachines/{name}")
+		return azureVMResourceRef{}, fmt.Errorf("azure VM providerID must be azure:///subscriptions/{subscription}/resourceGroups/{resourceGroup}/providers/Microsoft.Compute/virtualMachines/{name}")
 	}
 
 	if !strings.EqualFold(parts[0], "subscriptions") ||
@@ -100,7 +101,7 @@ func parseAzureVMProviderID(providerID string) (azureVMResourceRef, error) {
 		!strings.EqualFold(parts[4], "providers") ||
 		!strings.EqualFold(parts[5], "Microsoft.Compute") ||
 		!strings.EqualFold(parts[6], "virtualMachines") {
-		return azureVMResourceRef{}, fmt.Errorf("Azure VM providerID must identify a Microsoft.Compute/virtualMachines resource")
+		return azureVMResourceRef{}, fmt.Errorf("azure VM providerID must identify a Microsoft.Compute/virtualMachines resource")
 	}
 
 	ref := azureVMResourceRef{
@@ -110,7 +111,7 @@ func parseAzureVMProviderID(providerID string) (azureVMResourceRef, error) {
 	}
 
 	if ref.SubscriptionID == "" || ref.ResourceGroup == "" || ref.VMName == "" {
-		return azureVMResourceRef{}, fmt.Errorf("Azure VM providerID is missing subscription, resource group, or VM name")
+		return azureVMResourceRef{}, fmt.Errorf("azure VM providerID is missing subscription, resource group, or VM name")
 	}
 
 	return ref, nil

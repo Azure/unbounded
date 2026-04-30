@@ -68,7 +68,7 @@ func (p *Provider) Execute(ctx context.Context, request machineops.OperationRequ
 
 	instanceID := strings.TrimSpace(strings.TrimPrefix(request.ProviderID, "oci://"))
 	if instanceID == "" {
-		return fmt.Errorf("OCI providerID is required")
+		return fmt.Errorf("oci providerID is required")
 	}
 
 	newClient := p.NewClient
@@ -119,7 +119,7 @@ func (p *Provider) newDefaultComputeClient() (computeClient, error) {
 			provider = common.CustomProfileSessionTokenConfigProvider(p.ConfigFile, profile)
 		}
 	} else if auth != AuthAPIKey {
-		return nil, fmt.Errorf("OCI auth mode %q requires --oci-config-file", auth)
+		return nil, fmt.Errorf("oci auth mode %q requires --oci-config-file", auth)
 	}
 
 	client, err := core.NewComputeClientWithConfigurationProvider(provider)

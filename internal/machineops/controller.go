@@ -166,13 +166,13 @@ func (r *MachineOperationReconciler) providerFor(ctx context.Context, machine *u
 		return "", nil, false, nil
 	}
 	if machine.Spec.ConfigurationRef == nil || machine.Spec.ConfigurationRef.Name == "" {
-		return "", nil, false, fmt.Errorf("Machine %s has no configurationRef", machine.Name)
+		return "", nil, false, fmt.Errorf("machine %s has no configurationRef", machine.Name)
 	}
 
 	var configuration unboundedv1alpha3.MachineConfiguration
 	if err := r.Get(ctx, client.ObjectKey{Name: machine.Spec.ConfigurationRef.Name}, &configuration); err != nil {
 		if apierrors.IsNotFound(err) {
-			return "", nil, false, fmt.Errorf("MachineConfiguration %s not found", machine.Spec.ConfigurationRef.Name)
+			return "", nil, false, fmt.Errorf("machineConfiguration %s not found", machine.Spec.ConfigurationRef.Name)
 		}
 
 		return "", nil, false, fmt.Errorf("get MachineConfiguration %s: %w", machine.Spec.ConfigurationRef.Name, err)
