@@ -6,6 +6,7 @@ package v1alpha3
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
+
 // +kubebuilder:object:root=true
 // +kubebuilder:resource:scope=Cluster,shortName=mach
 // +kubebuilder:subresource:status
