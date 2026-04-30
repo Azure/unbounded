@@ -1,5 +1,3 @@
-# Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
 ---
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
@@ -38,8 +36,8 @@ spec:
           MachineOperation represents a discrete operation to be performed on a
           Machine. MachineOperations are created by CLI commands or controllers and
           processed by the appropriate agent. The in-VM agent handles operations
-          like SoftReboot, while cloud or PXE controllers handle operations like
-          HardReboot, PowerOff, and PowerOn.
+          like MachineReboot, while cloud or PXE controllers handle operations like
+          HostReboot, HostPowerOff, and HostPowerOn.
         properties:
           apiVersion:
             description: |-
@@ -120,10 +118,10 @@ spec:
                 description: OperationKind is the operation to perform on the target
                   machine.
                 enum:
-                - SoftReboot
-                - HardReboot
-                - PowerOff
-                - PowerOn
+                - MachineReboot
+                - HostReboot
+                - HostPowerOff
+                - HostPowerOn
                 type: string
               parameters:
                 additionalProperties:

@@ -22,8 +22,8 @@ func init() {
 // MachineOperation represents a discrete operation to be performed on a
 // Machine. MachineOperations are created by CLI commands or controllers and
 // processed by the appropriate agent. The in-VM agent handles operations
-// like SoftReboot, while cloud or PXE controllers handle operations like
-// HardReboot, PowerOff, and PowerOn.
+// like MachineReboot, while cloud or PXE controllers handle operations like
+// HostReboot, HostPowerOff, and HostPowerOn.
 type MachineOperation struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
@@ -44,26 +44,26 @@ type MachineOperationList struct {
 // OperationKind identifies the kind of operation to perform. Predefined
 // operations cover common lifecycle actions; custom operations may be
 // supported by individual cloud controllers.
-// +kubebuilder:validation:Enum=SoftReboot;HardReboot;PowerOff;PowerOn
+// +kubebuilder:validation:Enum=MachineReboot;HostReboot;HostPowerOff;HostPowerOn
 type OperationKind string
 
 const (
-	// OperationSoftReboot restarts the nspawn machine in place without
+	// OperationMachineReboot restarts the nspawn machine in place without
 	// reprovisioning the rootfs. Services are stopped, the nspawn container
 	// is restarted, and services are brought back up. Handled by the
 	// in-VM agent.
-	OperationSoftReboot OperationKind = "SoftReboot"
+	OperationMachineReboot OperationKind = "MachineReboot"
 
-	// OperationHardReboot triggers a full hardware power cycle of the host
+	// OperationHostReboot triggers a full hardware power cycle of the host
 	// via BMC (e.g. Redfish). Handled by the machina controller or cloud
 	// controller.
-	OperationHardReboot OperationKind = "HardReboot"
+	OperationHostReboot OperationKind = "HostReboot"
 
-	// OperationPowerOff powers off the host through an out-of-band provider.
-	OperationPowerOff OperationKind = "PowerOff"
+	// OperationHostPowerOff powers off the host through an out-of-band provider.
+	OperationHostPowerOff OperationKind = "HostPowerOff"
 
-	// OperationPowerOn powers on the host through an out-of-band provider.
-	OperationPowerOn OperationKind = "PowerOn"
+	// OperationHostPowerOn powers on the host through an out-of-band provider.
+	OperationHostPowerOn OperationKind = "HostPowerOn"
 )
 
 // OperationPhase represents the current phase of a MachineOperation.

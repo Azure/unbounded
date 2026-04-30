@@ -77,9 +77,9 @@ func TestProviderExecute(t *testing.T) {
 		operation unboundedv1alpha3.OperationKind
 		wantCall  string
 	}{
-		{name: "hard reboot", operation: unboundedv1alpha3.OperationHardReboot, wantCall: "restart:rg/vm1"},
-		{name: "power off", operation: unboundedv1alpha3.OperationPowerOff, wantCall: "powerOff:rg/vm1"},
-		{name: "power on", operation: unboundedv1alpha3.OperationPowerOn, wantCall: "start:rg/vm1"},
+		{name: "hard reboot", operation: unboundedv1alpha3.OperationHostReboot, wantCall: "restart:rg/vm1"},
+		{name: "power off", operation: unboundedv1alpha3.OperationHostPowerOff, wantCall: "powerOff:rg/vm1"},
+		{name: "power on", operation: unboundedv1alpha3.OperationHostPowerOn, wantCall: "start:rg/vm1"},
 	}
 
 	for _, tt := range tests {

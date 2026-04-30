@@ -116,13 +116,13 @@ OCI operations use an OCI SDK config file mounted into the `machine-ops-controll
 | Scope | Cluster |
 | Status subresource | Yes |
 
-`MachineOperation` is a job-like CR for discrete operations. The in-host agent handles OS-level operations such as `SoftReboot`; `machine-ops-controller` handles out-of-band VM operations such as Azure VM power actions. PXE/BMC operations remain owned by metalman for now.
+`MachineOperation` is a job-like CR for discrete operations. The in-host agent handles OS-level operations such as `MachineReboot`; `machine-ops-controller` handles out-of-band VM operations such as Azure VM power actions. PXE/BMC operations remain owned by metalman for now.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `spec.machineRef` | string | No | Target `Machine` name. Either `machineRef` or `machineSelector` must be set. |
 | `spec.machineSelector` | LabelSelector | No | Selects Machines by label. Controllers may fan this out into per-Machine operations. |
-| `spec.operationKind` | string | Yes | One of `SoftReboot`, `HardReboot`, `PowerOff`, `PowerOn`. |
+| `spec.operationKind` | string | Yes | One of `MachineReboot`, `HostReboot`, `HostPowerOff`, `HostPowerOn`. |
 | `spec.parameters` | map[string]string | No | Operation-specific parameters. |
 | `spec.ttlSecondsAfterFinished` | int32 | No | Delete completed or failed operations after this many seconds. |
 | `status.phase` | string | No | `Pending`, `InProgress`, `Complete`, or `Failed`. |
@@ -134,17 +134,17 @@ The Azure VM provider handles:
 
 | Operation | Azure action |
 |-----------|--------------|
-| `HardReboot` | `VirtualMachinesClient.BeginRestart` |
-| `PowerOff` | `VirtualMachinesClient.BeginPowerOff` |
-| `PowerOn` | `VirtualMachinesClient.BeginStart` |
+| `HostReboot` | `VirtualMachinesClient.BeginRestart` |
+| `HostPowerOff` | `VirtualMachinesClient.BeginPowerOff` |
+| `HostPowerOn` | `VirtualMachinesClient.BeginStart` |
 
 The OCI instance provider handles:
 
 | Operation | OCI action |
 |-----------|------------|
-| `HardReboot` | `RESET` |
-| `PowerOff` | `STOP` |
-| `PowerOn` | `START` |
+| `HostReboot` | `RESET` |
+| `HostPowerOff` | `STOP` |
+| `HostPowerOn` | `START` |
 
 ### status
 
@@ -275,7 +275,7 @@ metadata:
   name: azure-worker-01-hardreboot
 spec:
   machineRef: azure-worker-01
-  operationKind: HardReboot
+  operationKind: HostReboot
   ttlSecondsAfterFinished: 300
 ```
 
@@ -310,7 +310,7 @@ metadata:
   name: oci-worker-01-poweroff
 spec:
   machineRef: oci-worker-01
-  operationKind: PowerOff
+  operationKind: HostPowerOff
   ttlSecondsAfterFinished: 300
 ```
 

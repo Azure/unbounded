@@ -28,8 +28,8 @@ func TestMachineOperationReconciler_CompletesSupportedOperation(t *testing.T) {
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
 	machine.Generation = 3
 	configuration := newMachineConfiguration("config-1", unboundedv1alpha3.ExternalProviderAzureVM)
-	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHardReboot)
-	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHardReboot: true}}
+	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReboot)
+	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReboot: true}}
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, configuration, op).WithStatusSubresource(op).Build()
 	reconciler := &MachineOperationReconciler{Client: c, Providers: []Provider{provider}, Now: fixedOperationNow}
@@ -44,7 +44,7 @@ func TestMachineOperationReconciler_CompletesSupportedOperation(t *testing.T) {
 	require.NotNil(t, updated.Status.StartedAt)
 	require.NotNil(t, updated.Status.CompletedAt)
 	require.Equal(t, machine.Generation, updated.Status.ObservedMachineGeneration)
-	require.Equal(t, []string{"HardReboot:machine-1:azure:///subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/machine-1"}, provider.calls)
+	require.Equal(t, []string{"HostReboot:machine-1:azure:///subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/machine-1"}, provider.calls)
 
 	cond := apimeta.FindStatusCondition(updated.Status.Conditions, OperationConditionCompleted)
 	require.NotNil(t, cond)
@@ -57,10 +57,10 @@ func TestMachineOperationReconciler_DoesNotReexecuteInProgressOperation(t *testi
 	s := newOperationTestScheme(t)
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
 	configuration := newMachineConfiguration("config-1", unboundedv1alpha3.ExternalProviderAzureVM)
-	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHardReboot)
+	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReboot)
 	op.Status.Phase = unboundedv1alpha3.OperationPhaseInProgress
 	op.Status.StartedAt = ptrTo(fixedOperationNow())
-	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHardReboot: true}}
+	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReboot: true}}
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, configuration, op).WithStatusSubresource(op).Build()
 	reconciler := &MachineOperationReconciler{Client: c, Providers: []Provider{provider}, Now: fixedOperationNow}
@@ -82,8 +82,8 @@ func TestMachineOperationReconciler_UnsupportedOperationIsIgnored(t *testing.T) 
 	s := newOperationTestScheme(t)
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
 	configuration := newMachineConfiguration("config-1", unboundedv1alpha3.ExternalProviderAzureVM)
-	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationSoftReboot)
-	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHardReboot: true}}
+	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationMachineReboot)
+	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReboot: true}}
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, configuration, op).WithStatusSubresource(op).Build()
 	reconciler := &MachineOperationReconciler{Client: c, Providers: []Provider{provider}, Now: fixedOperationNow}
@@ -102,9 +102,9 @@ func TestMachineOperationReconciler_SelectorOperationIsIgnored(t *testing.T) {
 	t.Parallel()
 
 	s := newOperationTestScheme(t)
-	op := newMachineOperation("op-1", "", unboundedv1alpha3.OperationHardReboot)
+	op := newMachineOperation("op-1", "", unboundedv1alpha3.OperationHostReboot)
 	op.Spec.MachineSelector = &metav1.LabelSelector{MatchLabels: map[string]string{"rack": "a"}}
-	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHardReboot: true}}
+	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReboot: true}}
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(op).WithStatusSubresource(op).Build()
 	reconciler := &MachineOperationReconciler{Client: c, Providers: []Provider{provider}, Now: fixedOperationNow}
@@ -123,7 +123,7 @@ func TestMachineOperationReconciler_FailsMissingMachine(t *testing.T) {
 	t.Parallel()
 
 	s := newOperationTestScheme(t)
-	op := newMachineOperation("op-1", "missing", unboundedv1alpha3.OperationHardReboot)
+	op := newMachineOperation("op-1", "missing", unboundedv1alpha3.OperationHostReboot)
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(op).WithStatusSubresource(op).Build()
 	reconciler := &MachineOperationReconciler{Client: c, Providers: []Provider{&recordingProvider{}}, Now: fixedOperationNow}
 
@@ -144,7 +144,7 @@ func TestMachineOperationReconciler_DeletesExpiredTerminalOperation(t *testing.T
 	s := newOperationTestScheme(t)
 	completedAt := metav1.NewTime(time.Date(2026, 4, 28, 10, 0, 0, 0, time.UTC))
 	ttl := int32(30)
-	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHardReboot)
+	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReboot)
 	op.Spec.TTLSecondsAfterFinished = &ttl
 	op.Status.Phase = unboundedv1alpha3.OperationPhaseComplete
 	op.Status.CompletedAt = &completedAt
@@ -176,7 +176,7 @@ func TestShouldReconcileOperation(t *testing.T) {
 	}{
 		{
 			name: "non terminal",
-			op:   newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHardReboot),
+			op:   newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReboot),
 			want: true,
 		},
 		{

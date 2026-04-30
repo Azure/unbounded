@@ -22,9 +22,9 @@ func TestProviderExecute(t *testing.T) {
 		operation unboundedv1alpha3.OperationKind
 		wantCall  string
 	}{
-		{name: "hard reboot", operation: unboundedv1alpha3.OperationHardReboot, wantCall: "RESET:ocid1.instance.oc1.test"},
-		{name: "power off", operation: unboundedv1alpha3.OperationPowerOff, wantCall: "STOP:ocid1.instance.oc1.test"},
-		{name: "power on", operation: unboundedv1alpha3.OperationPowerOn, wantCall: "START:ocid1.instance.oc1.test"},
+		{name: "hard reboot", operation: unboundedv1alpha3.OperationHostReboot, wantCall: "RESET:ocid1.instance.oc1.test"},
+		{name: "power off", operation: unboundedv1alpha3.OperationHostPowerOff, wantCall: "STOP:ocid1.instance.oc1.test"},
+		{name: "power on", operation: unboundedv1alpha3.OperationHostPowerOn, wantCall: "START:ocid1.instance.oc1.test"},
 	}
 
 	for _, tt := range tests {
@@ -53,7 +53,7 @@ func TestProviderExecuteRequiresProviderID(t *testing.T) {
 		return &recordingComputeClient{}, nil
 	}}
 
-	err := provider.Execute(context.Background(), machineops.OperationRequest{Operation: unboundedv1alpha3.OperationPowerOn})
+	err := provider.Execute(context.Background(), machineops.OperationRequest{Operation: unboundedv1alpha3.OperationHostPowerOn})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "providerID is required")
 }
@@ -65,7 +65,7 @@ func TestProviderExecuteRequiresNonEmptyProviderID(t *testing.T) {
 		return &recordingComputeClient{}, nil
 	}}
 
-	err := provider.Execute(context.Background(), machineops.OperationRequest{ProviderID: "oci:// ", Operation: unboundedv1alpha3.OperationPowerOn})
+	err := provider.Execute(context.Background(), machineops.OperationRequest{ProviderID: "oci:// ", Operation: unboundedv1alpha3.OperationHostPowerOn})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "providerID is required")
 }
@@ -77,7 +77,7 @@ func TestProviderExecuteReturnsClientError(t *testing.T) {
 		return nil, fmt.Errorf("boom")
 	}}
 
-	err := provider.Execute(context.Background(), machineops.OperationRequest{ProviderID: "oci://ocid1.instance.oc1.test", Operation: unboundedv1alpha3.OperationPowerOn})
+	err := provider.Execute(context.Background(), machineops.OperationRequest{ProviderID: "oci://ocid1.instance.oc1.test", Operation: unboundedv1alpha3.OperationHostPowerOn})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "create OCI compute client")
 }
@@ -110,7 +110,7 @@ func TestNewDefaultComputeClientValidatesAuth(t *testing.T) {
 func TestActionForOperation(t *testing.T) {
 	t.Parallel()
 
-	_, err := actionForOperation(unboundedv1alpha3.OperationSoftReboot)
+	_, err := actionForOperation(unboundedv1alpha3.OperationMachineReboot)
 	require.Error(t, err)
 }
 

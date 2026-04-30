@@ -26,13 +26,13 @@ type azureVMClientFactory func(subscriptionID string) (azureVMClient, error)
 type azureVMOperation func(context.Context, azureVMClient, azureVMResourceRef) error
 
 var azureVMOperations = map[unboundedv1alpha3.OperationKind]azureVMOperation{
-	unboundedv1alpha3.OperationHardReboot: func(ctx context.Context, client azureVMClient, ref azureVMResourceRef) error {
+	unboundedv1alpha3.OperationHostReboot: func(ctx context.Context, client azureVMClient, ref azureVMResourceRef) error {
 		return client.Restart(ctx, ref.ResourceGroup, ref.VMName)
 	},
-	unboundedv1alpha3.OperationPowerOff: func(ctx context.Context, client azureVMClient, ref azureVMResourceRef) error {
+	unboundedv1alpha3.OperationHostPowerOff: func(ctx context.Context, client azureVMClient, ref azureVMResourceRef) error {
 		return client.PowerOff(ctx, ref.ResourceGroup, ref.VMName)
 	},
-	unboundedv1alpha3.OperationPowerOn: func(ctx context.Context, client azureVMClient, ref azureVMResourceRef) error {
+	unboundedv1alpha3.OperationHostPowerOn: func(ctx context.Context, client azureVMClient, ref azureVMResourceRef) error {
 		return client.Start(ctx, ref.ResourceGroup, ref.VMName)
 	},
 }

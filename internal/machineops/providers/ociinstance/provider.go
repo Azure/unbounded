@@ -51,9 +51,9 @@ func (p *Provider) Name() string {
 
 func (p *Provider) Supports(operation unboundedv1alpha3.OperationKind) bool {
 	switch operation {
-	case unboundedv1alpha3.OperationHardReboot,
-		unboundedv1alpha3.OperationPowerOff,
-		unboundedv1alpha3.OperationPowerOn:
+	case unboundedv1alpha3.OperationHostReboot,
+		unboundedv1alpha3.OperationHostPowerOff,
+		unboundedv1alpha3.OperationHostPowerOn:
 		return true
 	default:
 		return false
@@ -86,11 +86,11 @@ func (p *Provider) Execute(ctx context.Context, request machineops.OperationRequ
 
 func actionForOperation(operation unboundedv1alpha3.OperationKind) (string, error) {
 	switch operation {
-	case unboundedv1alpha3.OperationHardReboot:
+	case unboundedv1alpha3.OperationHostReboot:
 		return instanceActionReset, nil
-	case unboundedv1alpha3.OperationPowerOff:
+	case unboundedv1alpha3.OperationHostPowerOff:
 		return instanceActionStop, nil
-	case unboundedv1alpha3.OperationPowerOn:
+	case unboundedv1alpha3.OperationHostPowerOn:
 		return instanceActionStart, nil
 	default:
 		return "", fmt.Errorf("unsupported OCI instance operation %q", operation)
