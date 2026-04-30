@@ -407,49 +407,49 @@ notices:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/kubernetes/api/blob/v0.35.4/LICENSE
+        link: https://github.com/kubernetes/api/blob/v0.36.0/LICENSE
   - dependency: k8s.io/apimachinery
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/kubernetes/apimachinery/blob/v0.35.4/LICENSE
+        link: https://github.com/kubernetes/apimachinery/blob/v0.36.0/LICENSE
   - dependency: k8s.io/cli-runtime
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/kubernetes/cli-runtime/blob/v0.35.4/LICENSE
+        link: https://github.com/kubernetes/cli-runtime/blob/v0.36.0/LICENSE
   - dependency: k8s.io/client-go
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/kubernetes/client-go/blob/v0.35.4/LICENSE
+        link: https://github.com/kubernetes/client-go/blob/v0.36.0/LICENSE
   - dependency: k8s.io/klog/v2
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/kubernetes/klog/blob/v2.130.1/LICENSE
+        link: https://github.com/kubernetes/klog/blob/main/LICENSE
   - dependency: k8s.io/kube-aggregator
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/kubernetes/kube-aggregator/blob/v0.35.4/LICENSE
+        link: https://github.com/kubernetes/kube-aggregator/blob/v0.36.0/LICENSE
   - dependency: k8s.io/utils
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/kubernetes/utils/blob/bc988d571ff4/LICENSE
+        link: https://github.com/kubernetes/utils/blob/b8788abfbbc2/LICENSE
   - dependency: modernc.org/sqlite
     ecosystem: go
     copyright:
@@ -491,7 +491,7 @@ notices:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/kubernetes-sigs/controller-runtime/blob/v0.23.3/LICENSE
+        link: https://github.com/kubernetes-sigs/controller-runtime/blob/v0.24.0/LICENSE
   - dependency: sigs.k8s.io/yaml
     ecosystem: go
     copyright:
