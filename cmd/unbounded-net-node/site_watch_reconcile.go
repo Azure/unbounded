@@ -2110,6 +2110,22 @@ func syncMasqueradeRules(state *wireGuardState, nonMasqCIDRs []string) {
 	} else {
 		klog.V(4).Infof("Synced masquerade rules for default gateway (v4: %s, v6: %s)", defaultIfaceV4, defaultIfaceV6)
 	}
+
+	// Opportunistically flush stale L2-transit UDP conntrack entries. This
+	// guards against the bridge-nf-call-iptables / route-flap class of bug
+	// where a downstream host's pre-route-change L2 frames left untranslated
+	// conntrack entries on this node, causing post-route-change packets to
+	// skip MASQUERADE. See FlushStaleTransitUDPConntrack for details.
+	if defaultIfaceV4 != "" {
+		localIPs, err := unboundednetnetlink.LocalIPv4Addresses()
+		if err != nil {
+			klog.V(3).Infof("Failed to enumerate local IPs for conntrack flush: %v", err)
+		} else if n, err := unboundednetnetlink.FlushStaleTransitUDPConntrack(localIPs); err != nil {
+			klog.V(3).Infof("Failed to flush stale transit conntrack: %v", err)
+		} else if n > 0 {
+			klog.V(2).Infof("Flushed %d stale L2-transit UDP conntrack entries", n)
+		}
+	}
 }
 
 // logMeshPeerChanges logs which mesh peers were added or removed
