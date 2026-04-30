@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"k8s.io/klog/v2"
@@ -329,7 +330,10 @@ func configureEBPFTunnelPeers(
 		addPeerBPFEntries(bpfEntries, peer.PodCIDRs, underlayIP, uint32(cfg.GeneveVNI), peerIfIdx, peerFlags, peerProto, peer.Name)
 	}
 
-	for _, gwPeer := range gatewayPeers {
+	sortedGatewayPeers := append([]gatewayPeerInfo(nil), gatewayPeers...)
+	sort.Slice(sortedGatewayPeers, func(i, j int) bool { return sortedGatewayPeers[i].Name < sortedGatewayPeers[j].Name })
+
+	for _, gwPeer := range sortedGatewayPeers {
 		if len(gwPeer.InternalIPs) == 0 || len(gwPeer.PodCIDRs) == 0 {
 			continue
 		}
@@ -341,7 +345,9 @@ func configureEBPFTunnelPeers(
 
 		peerIfIdx, peerFlags, peerProto := resolveEBPFPeerTarget(gwPeer.TunnelProtocol, geneveIfIndex, ipipIfIndex, defaultIfIdx, cfg)
 		addPeerBPFEntries(bpfEntries, gwPeer.PodCIDRs, underlayIP, uint32(cfg.GeneveVNI), peerIfIdx, peerFlags, peerProto, gwPeer.Name)
-		addPeerBPFEntries(bpfEntries, gwPeer.RoutedCidrs, underlayIP, uint32(cfg.GeneveVNI), peerIfIdx, peerFlags, peerProto, gwPeer.Name)
+		// Supernet RoutedCidrs are pinned to a single nexthop (first peer wins)
+		// to avoid asymmetric ECMP across non-equivalent gateways.
+		addPeerBPFEntriesSingleNexthop(bpfEntries, gwPeer.RoutedCidrs, underlayIP, uint32(cfg.GeneveVNI), peerIfIdx, peerFlags, peerProto, gwPeer.Name)
 	}
 
 	// Store entries for deferred reconcile (after VXLAN and WG entries are added).
@@ -499,7 +505,10 @@ func configureEBPFVXLANPeers(
 		addPeerBPFEntries(bpfEntries, peer.PodCIDRs, underlayIP, vni, tunnelIfIndex, ebpfpkg.TunnelFlagSetKey, ebpfpkg.TunnelProtoVXLAN, peer.Name)
 	}
 
-	for _, gwPeer := range gatewayPeers {
+	sortedGatewayPeers := append([]gatewayPeerInfo(nil), gatewayPeers...)
+	sort.Slice(sortedGatewayPeers, func(i, j int) bool { return sortedGatewayPeers[i].Name < sortedGatewayPeers[j].Name })
+
+	for _, gwPeer := range sortedGatewayPeers {
 		if len(gwPeer.InternalIPs) == 0 || len(gwPeer.PodCIDRs) == 0 {
 			continue
 		}
@@ -510,7 +519,9 @@ func configureEBPFVXLANPeers(
 		}
 
 		addPeerBPFEntries(bpfEntries, gwPeer.PodCIDRs, underlayIP, vni, tunnelIfIndex, ebpfpkg.TunnelFlagSetKey, ebpfpkg.TunnelProtoVXLAN, gwPeer.Name)
-		addPeerBPFEntries(bpfEntries, gwPeer.RoutedCidrs, underlayIP, vni, tunnelIfIndex, ebpfpkg.TunnelFlagSetKey, ebpfpkg.TunnelProtoVXLAN, gwPeer.Name)
+		// Supernet RoutedCidrs are pinned to a single nexthop (first peer wins)
+		// to avoid asymmetric ECMP across non-equivalent gateways.
+		addPeerBPFEntriesSingleNexthop(bpfEntries, gwPeer.RoutedCidrs, underlayIP, vni, tunnelIfIndex, ebpfpkg.TunnelFlagSetKey, ebpfpkg.TunnelProtoVXLAN, gwPeer.Name)
 	}
 
 	// Store entries for deferred reconcile.
@@ -585,6 +596,43 @@ func addPeerBPFEntries(entries map[string]ebpfpkg.TunnelEndpoint, cidrs []string
 			PeerName: peerName,
 		})
 		entries[key] = ep
+	}
+}
+
+// addPeerBPFEntriesSingleNexthop is like addPeerBPFEntries but skips a CIDR if
+// it already has any nexthop programmed. Used for cross-site supernets
+// (gateway RoutedCidrs) that are typically advertised by multiple gateway
+// peers but where ECMP-fanning a TCP flow across non-equivalent gateways
+// causes asymmetric paths (the BPF flow_hash is direction-asymmetric, so a
+// SYN and its SYN-ACK can pick different gateways). Pinning the supernet
+// fallback to a single nexthop -- the first deterministically-ordered peer
+// to advertise it -- keeps a flow on one gateway end-to-end. Per-peer
+// PodCIDRs (more-specific LPM entries) continue to use multi-nexthop ECMP.
+//
+// Callers must order peers deterministically (e.g. sorted by peer name) so
+// the winning nexthop is reproducible across reconciles.
+func addPeerBPFEntriesSingleNexthop(entries map[string]ebpfpkg.TunnelEndpoint, cidrs []string, underlayIP net.IP, vni, ifindex, flags, protocol uint32, peerName string) {
+	for _, cidrStr := range cidrs {
+		_, cidr, err := net.ParseCIDR(cidrStr)
+		if err != nil {
+			continue
+		}
+
+		key := cidr.String()
+		if ep, exists := entries[key]; exists && len(ep.Nexthops) > 0 {
+			continue
+		}
+
+		entries[key] = ebpfpkg.TunnelEndpoint{
+			Nexthops: []ebpfpkg.TunnelNexthop{{
+				RemoteIP: underlayIP,
+				VNI:      vni,
+				IfIndex:  ifindex,
+				Flags:    flags | ebpfpkg.TunnelFlagHealthy,
+				Protocol: protocol,
+				PeerName: peerName,
+			}},
+		}
 	}
 }
 
@@ -736,8 +784,12 @@ func addWireGuardPeersToBPFMap(cfg *config, state *wireGuardState, wgMeshPeers [
 		addPeerBPFEntries(state.pendingBPFEntries, peer.PodCIDRs, underlayIP, 0, wgIfIndex, 0, ebpfpkg.TunnelProtoWireGuard, peer.Name)
 	}
 
-	// Add gateway WG peers.
-	for _, gwPeer := range wgGatewayPeers {
+	// Add gateway WG peers. Order by Name so RoutedCidr single-nexthop
+	// programming (first-peer-wins) is deterministic across reconciles.
+	sortedWgGatewayPeers := append([]gatewayPeerInfo(nil), wgGatewayPeers...)
+	sort.Slice(sortedWgGatewayPeers, func(i, j int) bool { return sortedWgGatewayPeers[i].Name < sortedWgGatewayPeers[j].Name })
+
+	for _, gwPeer := range sortedWgGatewayPeers {
 		if len(gwPeer.InternalIPs) == 0 {
 			continue
 		}
@@ -760,8 +812,14 @@ func addWireGuardPeersToBPFMap(cfg *config, state *wireGuardState, wgMeshPeers [
 
 		gwIfIdx := uint32(gwIface.Index)
 
-		allCIDRs := append(gwPeer.PodCIDRs, gwPeer.RoutedCidrs...)
-		addPeerBPFEntries(state.pendingBPFEntries, allCIDRs, underlayIP, 0, gwIfIdx, 0, ebpfpkg.TunnelProtoWireGuard, gwPeer.Name)
+		addPeerBPFEntries(state.pendingBPFEntries, gwPeer.PodCIDRs, underlayIP, 0, gwIfIdx, 0, ebpfpkg.TunnelProtoWireGuard, gwPeer.Name)
+		// Supernet RoutedCidrs are pinned to a single nexthop (first peer wins)
+		// to avoid asymmetric ECMP across non-equivalent gateways. WG gateway
+		// peers commonly all advertise the same cross-site supernet (e.g. an
+		// AKS pod /16) -- without this dedupe, HRW spreads SYN and SYN-ACK
+		// across different gateway nodes and stateful NAT/conntrack on the
+		// far side drops the asymmetric reply.
+		addPeerBPFEntriesSingleNexthop(state.pendingBPFEntries, gwPeer.RoutedCidrs, underlayIP, 0, gwIfIdx, 0, ebpfpkg.TunnelProtoWireGuard, gwPeer.Name)
 	}
 	state.mu.Unlock()
 
