@@ -44,6 +44,117 @@ Adaptive replication over a structured ring for unbounded-storage-p2p.
   serving until SIEVE drains them; the new owner cold-fetches on first
   miss.
 
+## Motivation
+
+### Per-node connection budget
+
+Modern NICs do not scale linearly in concurrent peers.
+
+- **RDMA HCAs** cache queue-pair state in on-chip ICM. ConnectX-class
+  parts hit a cache cliff in the low thousands of resident RC QPs (the
+  exact number depends on generation, MTU, and traffic mix). Past the
+  cliff, QP context fetches go to host memory and per-op latency loses
+  a multiple. eRPC, FaSST, and the broader RDMA-systems literature
+  exist largely to dodge this. DCT relaxes the cap on InfiniBand but
+  adds setup cost and is not universally deployable.
+
+A node must therefore talk to a small bounded peer set, not `O(n)`.
+This kills two alternatives outright:
+
+- **Full-mesh swarms** (BitTorrent-style) expose each peer to many
+  others per swarm, multiplied across concurrent swarms.
+- **Centralized cache tiers** push the cost onto the cache: every
+  consumer holds a flow to the cache fleet, so the cache NICs are the
+  ones that hit the cliff.
+
+The ring caps a node's open peer set at `O(log n)` neighbors. At n=10k
+that is around 14 peers, comfortably inside any current HCA's resident
+QP budget.
+
+### Amplification economics
+
+Distribution systems lose to amplification along four axes.
+
+- **Cold-read amplification.** Metadata-first schemes pay a round trip
+  before any byte flows. For small blobs the metadata trip dominates
+  wall-clock latency. Manifest-free placement (`width(L)` plus
+  `hash(blob_id, idx)`) is zero round trips.
+- **Origin egress under synchronized pulls.** 1000 nodes pulling the
+  same 10 GB image without peer fan-out egresses 10 TB from the
+  backing store. A fixed cache tier just relocates the bottleneck to
+  the cache NIC. The emergent multicast tree at average fan-out 2
+  keeps per-replica egress bounded as n grows.
+- **Replication storage amplification.** Blanket N-way replication
+  spends disk on cold data. Demand-shaped replication only spends
+  bytes where reads actually happen, and SIEVE drains the spend when
+  demand drops.
+- **Cold-fetch amplification.** M independent cache nodes mean up to M
+  cold fetches per unique chunk per epoch. The single-owner rule means
+  exactly one.
+
+### Datacenter topology
+
+Bandwidth and fault tolerance are both hierarchical, and the design has
+to respect both at once.
+
+- **Bandwidth tiers.** Intra-rack via ToR is typically near
+  non-blocking at 100-400 Gbps. Pod aggregation is oversubscribed,
+  often 2:1 to 8:1. Spine is the scarcest layer. Cross-rack traffic
+  competes for the smallest pipe, so locality preference is not a
+  nice-to-have.
+- **Nested fault domains.** PCIe complex within a host, host within a
+  ToR/PSU/rack, rack within a pod, pod within a region. Replicas all
+  in one fault domain are not really replicated.
+- **AI/HPC rail alignment.** GPU NICs are organized into rails;
+  cross-rail traffic costs spine hops and contends with collective
+  ops. The same locality argument applies, just with different units.
+
+PNS biases each hop toward the nearest peer in its arc, so most replica
+acquisition stays intra-rack or intra-rail. The chunk-id-keyed
+fault-domain tiebreak in promotion ensures the multi-scale spread that
+the ring guarantees in id-space also manifests in physical-fault-space.
+
+### Membership and control-plane churn
+
+Kubernetes nodes are not stable.
+
+- Node pools autoscale on demand.
+- Rolling upgrades drain and replace nodes continuously.
+- Spot/preemptible nodes vanish without warning.
+- Cordon/uncordon, NotReady transitions, and taints reshape membership
+  on minute timescales.
+
+Any scheme that migrates state on every membership change becomes a
+noisy neighbor in this environment. The ring's "no migration, lazy
+reconvergence" behavior is a precondition, not an optimization:
+existing replicas keep serving until SIEVE drains them, and the new
+owner cold-fetches only on first miss.
+
+Reusing Kubernetes membership as the agreement substrate also avoids
+standing up a second HA control plane. The API server is already a
+trusted, monitored, recoverable dependency. A bespoke tracker or
+metadata service would need the same operational rigor for strictly
+less benefit.
+
+### Workload shape
+
+The motivating workloads (container image pulls, model and dataset
+distribution for AI inference and training) share three properties.
+
+- **Synchronized.** A Deployment rollout or Job launch starts hundreds
+  to thousands of pods at once, all pulling the same blobs. This is
+  exactly where multicast trees pay off and where any pre-provisioned
+  cache tier hits its NIC ceiling.
+- **Bimodal.** A small hot working set (popular base images, current
+  model versions, active dataset shards) dominates request volume,
+  while the long cold tail dominates total stored bytes. Demand-shaped
+  replication matches both halves: bytes flow toward demand, and
+  unloved chunks fall out of SIEVE for free.
+- **Read-heavy.** Images are built once and pulled many times; models
+  are trained occasionally and served constantly. Optimizing for read
+  fan-out while accepting one cold-fetch per chunk per epoch is the
+  right tradeoff.
+
 ## Ring and Neighbors
 
 Nodes hash onto a ring of size `2^m`. Each node `q` has `m` neighbor slots
