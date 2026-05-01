@@ -11,11 +11,11 @@ metadata:
     app.kubernetes.io/component: controller
     rbac.authorization.k8s.io/aggregate-to-view: "true"
 rules:
-  - apiGroups: ["status.net.unbounded-kube.io"]
+  - apiGroups: ["status.net.unbounded-cloud.io"]
     resources: ["status"]
     resourceNames: ["dashboard", "json"]
     verbs: ["get"]
-  - apiGroups: ["status.net.unbounded-kube.io"]
+  - apiGroups: ["status.net.unbounded-cloud.io"]
     resources: ["token"]
     resourceNames: ["viewer"]
     verbs: ["create"]

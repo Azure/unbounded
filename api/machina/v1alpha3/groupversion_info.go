@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 
 // +kubebuilder:object:generate=true
-// +groupName=unbounded-kube.io
+// +groupName=unbounded-cloud.io
 package v1alpha3
 
 //go:generate controller-gen object:headerFile=../../../hack/boilerplate.go.txt paths=.
@@ -15,7 +15,7 @@ import (
 
 var (
 	// GroupVersion is group version used to register these objects.
-	GroupVersion = schema.GroupVersion{Group: "unbounded-kube.io", Version: "v1alpha3"}
+	GroupVersion = schema.GroupVersion{Group: "unbounded-cloud.io", Version: "v1alpha3"}
 
 	// SchemeBuilder is used to add go types to the GroupVersionKind scheme.
 	SchemeBuilder = &scheme.Builder{GroupVersion: GroupVersion}

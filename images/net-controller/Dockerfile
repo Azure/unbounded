@@ -49,8 +49,14 @@ COPY go.mod go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod \
     go mod download
 
-# Build ntttcp for network performance testing
-RUN git clone --depth 1 https://github.com/microsoft/ntttcp-for-linux.git /tmp/ntttcp-for-linux \
+# Build ntttcp for network performance testing (retry up to 3 times for transient network errors)
+RUN for i in 1 2 3; do \
+        git clone --depth 1 https://github.com/microsoft/ntttcp-for-linux.git /tmp/ntttcp-for-linux && break; \
+        echo "git clone attempt $i failed, retrying in 10s..."; \
+        rm -rf /tmp/ntttcp-for-linux; \
+        [ "$i" = "3" ] && exit 1; \
+        sleep 10; \
+    done \
     && cd /tmp/ntttcp-for-linux/src \
     && make \
     && cp ntttcp /usr/local/bin/ntttcp \
@@ -112,7 +118,8 @@ FROM mcr.microsoft.com/azurelinux/base/core:3.0 AS runtime-base
 # - iptables: iptables/ip6tables for masquerade rules (node)
 # - util-linux: nsenter for host namespace sysctl setup (node init)
 # - hostname: provides the hostname binary in Azure Linux runtime images
-RUN tdnf install -y \
+RUN tdnf upgrade -y \
+    && tdnf install -y \
     ca-certificates shadow-utils iproute iptables util-linux hostname which wget tcpdump iputils \
     libatomic libcap openssl vim bpftool \
     procps-ng less sqlite-libs tar gzip jq python3 bind-utils \

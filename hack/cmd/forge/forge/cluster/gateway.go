@@ -30,7 +30,7 @@ func newGatewayAgentPool(site, sku string, nodeCount int32) armcontainerservice.
 			Protocol:  to.Ptr(armcontainerservice.ProtocolUDP),
 		}).
 		WithNodeLabels(map[string]string{
-			"unbounded-kube.io/unbounded-net-gateway": "true",
+			"unbounded-cloud.io/unbounded-net-gateway": "true",
 		}).
 		WithNodeTaints([]string{
 			"CriticalAddonsOnly=true:NoSchedule",

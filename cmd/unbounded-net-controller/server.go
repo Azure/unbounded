@@ -30,9 +30,9 @@ import (
 )
 
 const (
-	aggregatedNodeStatusWebSocketPath = "/apis/status.net.unbounded-kube.io/v1alpha1/status/nodews"
-	aggregatedNodeStatusPushPath      = "/apis/status.net.unbounded-kube.io/v1alpha1/status/push"
-	aggregatedStatusJSONPath          = "/apis/status.net.unbounded-kube.io/v1alpha1/status/json"
+	aggregatedNodeStatusWebSocketPath = "/apis/status.net.unbounded-cloud.io/v1alpha1/status/nodews"
+	aggregatedNodeStatusPushPath      = "/apis/status.net.unbounded-cloud.io/v1alpha1/status/push"
+	aggregatedStatusJSONPath          = "/apis/status.net.unbounded-cloud.io/v1alpha1/status/json"
 )
 
 // maxConcurrentNodeWS limits the number of simultaneous node WebSocket connections.

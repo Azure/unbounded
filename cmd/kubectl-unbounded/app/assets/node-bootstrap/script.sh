@@ -25,12 +25,15 @@ cat > "${UNBOUNDED_AGENT_CONFIG_FILE}" <<'AGENT_CONFIG_EOF'
 AGENT_CONFIG_EOF
 
 # -----------------------------------------------------------------
+# Agent download overrides (injected by manual-bootstrap flags)
+# -----------------------------------------------------------------
+{{- range .InstallEnv }}
+export {{ . }}
+{{- end }}
+
+# -----------------------------------------------------------------
 # Embedded install script
 # -----------------------------------------------------------------
-
-{{- if .AgentURLLiteral }}
-export AGENT_URL={{ .AgentURLLiteral }}
-{{- end }}
 
 bash <<'INSTALL_SCRIPT_EOF'
 {{ .InstallScript }}

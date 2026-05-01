@@ -49,7 +49,7 @@ over SSH. Given a `Machine` custom resource with SSH connection details, it:
 
 1. Probes the target host over TCP to confirm reachability.
 2. Connects via SSH (directly or through a bastion host).
-3. Copies and executes an install script that installs the unbounded-kube agent
+3. Copies and executes an install script that installs the unbounded agent
    and joins the node to the cluster using a bootstrap token.
 4. Watches for the corresponding `Node` object and transitions the Machine
    through its lifecycle phases.
@@ -97,7 +97,7 @@ hands-on walkthrough.
 
 ### unbounded-net -- Multi-Site Networking
 
-**[unbounded-net](https://github.com/Azure/unbounded-net)** is a
+**unbounded-net** is a
 CNI plugin and multi-site networking system. It provides transparent pod-to-pod
 connectivity across sites by:
 
@@ -118,10 +118,10 @@ The system is driven by Kubernetes custom resources:
 
 | CRD | API Group | Scope | Purpose |
 |-----|-----------|-------|---------|
-| **Machine** | `unbounded-kube.io` | Cluster | Represents a remote host to be provisioned (SSH, cloud API, or PXE) |
-| **Site** | `net.unbounded-kube.io` | Cluster | Groups nodes by internal IP range; allocates pod CIDRs |
-| **GatewayPool** | `net.unbounded-kube.io` | Cluster | Defines a set of gateway nodes for inter-site routing |
-| **SitePeering** | `net.unbounded-kube.io` | Cluster | Enables direct node-to-node tunnels between sites |
+| **Machine** | `unbounded-cloud.io` | Cluster | Represents a remote host to be provisioned (SSH, cloud API, or PXE) |
+| **Site** | `net.unbounded-cloud.io` | Cluster | Groups nodes by internal IP range; allocates pod CIDRs |
+| **GatewayPool** | `net.unbounded-cloud.io` | Cluster | Defines a set of gateway nodes for inter-site routing |
+| **SitePeering** | `net.unbounded-cloud.io` | Cluster | Enables direct node-to-node tunnels between sites |
 
 For full API specifications, see the
 [CRD Reference]({{< relref "reference/machina-crd" >}}) (Machine) and
@@ -147,18 +147,18 @@ The flow varies by provisioning path, but all paths share the same final steps:
 1. An unschedulable pod is detected by the Karpenter controller.
 2. A `Machine` CR is created for the target cloud provider.
 3. The Machine controller calls the provider API and launches an instance with
-   cloud-init user-data that installs the unbounded-kube agent.
+   cloud-init user-data that installs the unbounded agent.
 
 **PXE path:**
 
 1. A `Machine` CR with PXE configuration is created.
 2. metalman responds to the server's DHCP/TFTP/HTTP boot requests and serves
    the OS image.
-3. The installed OS runs the unbounded-kube agent on first boot.
+3. The installed OS runs the unbounded agent on first boot.
 
 **All paths converge here:**
 
-4. **The unbounded-kube agent** on the node uses a bootstrap token to join the
+4. **The unbounded agent** on the node uses a bootstrap token to join the
    cluster and gets assigned a pod CIDR by unbounded-net.
 5. **unbounded-net** establishes tunnels (or routes over an existing private
    link) between the new node's site and the gateway nodes.

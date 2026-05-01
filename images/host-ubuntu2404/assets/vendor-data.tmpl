@@ -25,6 +25,30 @@ write_files:
 - path: /etc/cloud/cloud-init.disabled
   defer: true
   content: ''
+# Block unattended-upgrades from upgrading packages whose post-install
+# triggers (via needrestart) restart systemd-machined and tear down the
+# running systemd-nspawn@kube1 container. The agent re-asserts this file
+# during `unbounded-agent start`; it is also written here so the protection
+# is in place from first boot, before the agent runs.
+- path: /etc/apt/apt.conf.d/99-unbounded-no-restart-systemd
+  permissions: '0644'
+  content: |
+    Unattended-Upgrade::Package-Blacklist {
+        "systemd";
+        "systemd-container";
+        "systemd-sysv";
+        "libsystemd0";
+        "libcap2";
+        "libcap2-bin";
+        "libpam-cap";
+    };
+# Disable needrestart auto-restart of services after package upgrades; only
+# list the ones that would otherwise be restarted. Belt-and-braces with the
+# apt blacklist above for any path that bypasses unattended-upgrades.
+- path: /etc/needrestart/conf.d/99-unbounded.conf
+  permissions: '0644'
+  content: |
+    $nrconf{restart} = 'l';
 runcmd:
 - - /bin/bash
   - -c

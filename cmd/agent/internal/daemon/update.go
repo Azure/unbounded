@@ -21,13 +21,13 @@ import (
 	"os"
 	"strings"
 
-	"github.com/Azure/unbounded/cmd/agent/internal/goalstates"
-	"github.com/Azure/unbounded/cmd/agent/internal/phases"
-	"github.com/Azure/unbounded/cmd/agent/internal/phases/nodestart"
-	"github.com/Azure/unbounded/cmd/agent/internal/phases/nodestop"
-	"github.com/Azure/unbounded/cmd/agent/internal/phases/reset"
-	"github.com/Azure/unbounded/cmd/agent/internal/phases/rootfs"
 	"github.com/Azure/unbounded/internal/provision"
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/phases"
+	"github.com/Azure/unbounded/pkg/agent/phases/nodestart"
+	"github.com/Azure/unbounded/pkg/agent/phases/nodestop"
+	"github.com/Azure/unbounded/pkg/agent/phases/reset"
+	"github.com/Azure/unbounded/pkg/agent/phases/rootfs"
 )
 
 // ActiveMachine holds the currently active nspawn machine name and its
@@ -109,7 +109,7 @@ func hasDrift(applied, desired *provision.AgentConfig) bool {
 		return true
 	}
 
-	if applied.Kubelet.BootstrapToken != desired.Kubelet.BootstrapToken {
+	if applied.Kubelet.Auth.BootstrapToken != desired.Kubelet.Auth.BootstrapToken {
 		return true
 	}
 
@@ -122,9 +122,9 @@ func hasDrift(applied, desired *provision.AgentConfig) bool {
 //  3. Start the new machine (configure, boot nspawn, start services, persist config)
 //  4. Verify kubelet health
 //  5. Remove the old machine and its applied config
-func UpdateNode(ctx context.Context, log *slog.Logger, active *ActiveMachine, newCfg *provision.AgentConfig) error {
+func UpdateNode(ctx context.Context, log *slog.Logger, active *ActiveMachine, newCfg *provision.UnboundedAgentConfig) error {
 	// Skip the update if the desired config matches the applied config.
-	if !hasDrift(active.Config, newCfg) {
+	if !hasDrift(active.Config, &newCfg.AgentConfig) {
 		log.Info("no config drift detected, skipping node update")
 		return nil
 	}
@@ -140,7 +140,7 @@ func UpdateNode(ctx context.Context, log *slog.Logger, active *ActiveMachine, ne
 	)
 
 	// Resolve goal states for the new machine.
-	gs, err := goalstates.ResolveMachine(log, newCfg, newMachine)
+	gs, err := goalstates.ResolveMachine(log, &newCfg.AgentConfig, newMachine, provision.ResolveDownloadOverrides(newCfg.Downloads))
 	if err != nil {
 		return fmt.Errorf("resolve machine goal state: %w", err)
 	}
@@ -148,9 +148,11 @@ func UpdateNode(ctx context.Context, log *slog.Logger, active *ActiveMachine, ne
 	err = phases.Serial(log,
 		rootfs.Provision(log, gs.RootFS),
 		nodestop.StopNode(log, oldMachine),
-		nodestart.StartNode(log, gs.NodeStart, newCfg),
+		nodestart.StartNode(log, gs.NodeStart),
+		PersistAppliedConfig(log, gs.NodeStart.MachineName, &newCfg.AgentConfig),
 		nodestart.WaitForKubelet(log, newMachine),
 		reset.CleanupMachine(log, oldMachine),
+		RemoveAppliedConfig(log, oldMachine),
 	).Do(ctx)
 	if err != nil {
 		return err

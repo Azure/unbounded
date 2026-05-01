@@ -36,13 +36,13 @@ import (
 )
 
 var gatewayPoolGVR = schema.GroupVersionResource{
-	Group:    "net.unbounded-kube.io",
+	Group:    "net.unbounded-cloud.io",
 	Version:  "v1alpha1",
 	Resource: "gatewaypools",
 }
 
 var gatewayNodeGVR = schema.GroupVersionResource{
-	Group:    "net.unbounded-kube.io",
+	Group:    "net.unbounded-cloud.io",
 	Version:  "v1alpha1",
 	Resource: "gatewaypoolnodes",
 }
@@ -863,15 +863,15 @@ func (gc *GatewayPoolController) ensureGatewayPoolNode(ctx context.Context, pool
 	}
 
 	labelsMap := map[string]interface{}{
-		"net.unbounded-kube.io/gateway-pool": pool.Name,
-		"net.unbounded-kube.io/node":         node.Name,
+		"net.unbounded-cloud.io/gateway-pool": pool.Name,
+		"net.unbounded-cloud.io/node":         node.Name,
 	}
 	if siteName != "" {
-		labelsMap["net.unbounded-kube.io/site"] = siteName
+		labelsMap["net.unbounded-cloud.io/site"] = siteName
 	}
 
 	obj := &unstructured.Unstructured{Object: map[string]interface{}{
-		"apiVersion": "net.unbounded-kube.io/v1alpha1",
+		"apiVersion": "net.unbounded-cloud.io/v1alpha1",
 		"kind":       "GatewayPoolNode",
 		"metadata": map[string]interface{}{
 			"name":   node.Name,
@@ -886,7 +886,7 @@ func (gc *GatewayPoolController) ensureGatewayPoolNode(ctx context.Context, pool
 					"blockOwnerDeletion": false,
 				},
 				map[string]interface{}{
-					"apiVersion":         "net.unbounded-kube.io/v1alpha1",
+					"apiVersion":         "net.unbounded-cloud.io/v1alpha1",
 					"kind":               "GatewayPool",
 					"name":               pool.Name,
 					"uid":                string(pool.UID),

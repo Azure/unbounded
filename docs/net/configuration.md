@@ -58,7 +58,7 @@ node:
   statusWebsocketEnabled: true
   statusWebsocketURL: ""
   statusWebsocketApiserverMode: fallback
-  statusWebsocketApiserverURL: wss://$(KUBERNETES_SERVICE_HOST)/apis/status.net.unbounded-kube.io/v1alpha1/status/nodews
+  statusWebsocketApiserverURL: wss://$(KUBERNETES_SERVICE_HOST)/apis/status.net.unbounded-cloud.io/v1alpha1/status/nodews
   statusWebsocketApiserverStartupDelay: 60s
   statusWebsocketKeepaliveInterval: 10s
   statusWsKeepaliveFailureCount: 2
@@ -115,7 +115,7 @@ Pod CIDR allocation is configured per Site using `spec.podCidrAssignments`.
 | `--status-stale-threshold` | duration | `40s` | Duration after which a node's pushed status is considered stale (~4x the default 10s push interval). |
 | `--status-ws-keepalive-interval` | duration | `10s` | Interval between controller websocket keepalive pings for node status streams (`0s` disables pings). |
 | `--status-ws-keepalive-failure-count` | int | `2` | Sequential websocket keepalive ping failures before the controller closes a node status websocket. |
-| `--register-aggregated-apiserver` | bool | `true` | Enable aggregated API server status endpoints (`/apis/status.net.unbounded-kube.io/v1alpha1/status/*`). |
+| `--register-aggregated-apiserver` | bool | `true` | Enable aggregated API server status endpoints (`/apis/status.net.unbounded-cloud.io/v1alpha1/status/*`). |
 | `--informer-resync-period` | duration | `300s` | How often informers resync with the API server. |
 | `--kube-proxy-health-interval` | duration | `30s` | Interval between kube-proxy health checks. 0s disables. |
 
@@ -129,7 +129,7 @@ Pod CIDR allocation is configured per Site using `spec.podCidrAssignments`.
 ### Example Configuration
 
 ```yaml
-apiVersion: net.unbounded-kube.io/v1alpha1
+apiVersion: net.unbounded-cloud.io/v1alpha1
 kind: Site
 metadata:
   name: site-east
@@ -215,7 +215,7 @@ the configured MTU must be based on the smallest value: `1500 - 80 = 1420`.
 **Behavior:**
 - Each node agent detects its default-route interface MTU at startup and on
   every reconciliation, then annotates itself with
-  `net.unbounded-kube.io/tunnel-mtu` (the detected max tunnel MTU).
+  `net.unbounded-cloud.io/tunnel-mtu` (the detected max tunnel MTU).
 - The effective MTU applied to each tunnel interface is
   `min(configured MTU, detected MTU)`, so a node with a smaller physical link
   will automatically clamp down even if the configured value is higher.
@@ -353,7 +353,7 @@ HTTP push also supports delta mode (`node.statusPushDelta`). If the controller c
 | `--status-ws-enabled` | bool | `true` | Enable websocket status push transport. |
 | `--status-ws-url` | string | - | Explicit websocket URL to controller. If set, this overrides automatic endpoint selection. |
 | `--status-ws-apiserver-mode` | string | `fallback` | API server mode for websocket/push endpoint selection: `never`, `fallback`, `preferred`. |
-| `--status-ws-apiserver-url` | string | `wss://$(KUBERNETES_SERVICE_HOST)/apis/status.net.unbounded-kube.io/v1alpha1/status/nodews` | Aggregated API websocket URL (also used to derive aggregated push URL). |
+| `--status-ws-apiserver-url` | string | `wss://$(KUBERNETES_SERVICE_HOST)/apis/status.net.unbounded-cloud.io/v1alpha1/status/nodews` | Aggregated API websocket URL (also used to derive aggregated push URL). |
 | `--status-ws-apiserver-startup-delay` | duration | `60s` | Delay after startup before API server websocket/push fallback is allowed (`0s` disables delay). |
 | `--status-ws-keepalive-interval` | duration | `10s` | Interval between node websocket keepalive pings (`0s` disables pings). |
 | `--status-ws-keepalive-failure-count` | int | `2` | Sequential websocket keepalive ping failures before the node reconnects. |
@@ -548,7 +548,7 @@ The controller registers a single validating admission webhook (`unbounded-net-v
 **Key configuration details:**
 
 - **failurePolicy: Ignore** -- if the webhook is unavailable (controller down, certificate issue), CRD operations are allowed to proceed. Most validation constraints are enforced by CRD OpenAPI schema rules (minItems, minProperties, enum, min/max, maxLength).
-- **DELETE protection** -- uses the `net.unbounded-kube.io/protection` finalizer on Sites and GatewayPools instead of webhook-based delete guards. SiteNodeSlices are protected by ownerReferences.
+- **DELETE protection** -- uses the `net.unbounded-cloud.io/protection` finalizer on Sites and GatewayPools instead of webhook-based delete guards. SiteNodeSlices are protected by ownerReferences.
 - **Single entry** -- previous versions used 6 separate webhook entries. These have been consolidated into 1.
 
 ---

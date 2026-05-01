@@ -30,7 +30,7 @@ jobs:
           cache-dependency-path: go.sum
 
       - name: Azure login
-        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2
+        uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 # v3.0.0
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -85,7 +85,7 @@ jobs:
           cat workflow-artifacts/metadata/aks-metadata.env >> "$GITHUB_ENV"
 
       - name: Upload metadata artifact
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: aks-quickstart-metadata
           path: workflow-artifacts/metadata/aks-metadata.env
@@ -255,21 +255,21 @@ jobs:
           cp .tmp/aks-ssh/id_ed25519.pub workflow-artifacts/ssh/id_ed25519.pub
 
       - name: Upload kubeconfig artifact
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: aks-kubeconfig
           path: workflow-artifacts/kubeconfig/aks-quickstart.kubeconfig
           retention-days: 1
 
       - name: Upload SSH material artifact
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: aks-ssh-material
           path: workflow-artifacts/ssh/
           retention-days: 1
 
       - name: Upload agent artifact
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: aks-unbounded-agent
           path: workflow-artifacts/agent/unbounded-agent-linux-amd64.tar.gz
@@ -538,7 +538,7 @@ jobs:
 
       - name: Upload diagnostics
         if: failure()
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: aks-ssh-quickstart-logs
           path: logs/
@@ -570,7 +570,7 @@ jobs:
 
       - name: Azure login
         if: ${{ env.AKS_RG != '' }}
-        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2
+        uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 # v3.0.0
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}

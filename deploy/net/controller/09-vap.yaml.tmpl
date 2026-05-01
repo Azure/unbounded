@@ -59,8 +59,8 @@ spec:
 ---
 # Restrict what fields unbounded-net service accounts may modify on Node objects.
 # The controller and node agent may ONLY modify:
-#   - metadata.labels with the net.unbounded-kube.io/ prefix
-#   - metadata.annotations with the net.unbounded-kube.io/ prefix
+#   - metadata.labels with the net.unbounded-cloud.io/ prefix
+#   - metadata.annotations with the net.unbounded-cloud.io/ prefix
 #   - spec.podCIDR and spec.podCIDRs (Kubernetes enforces immutability after initial set)
 # All other node fields (spec.taints, spec.unschedulable, status, etc.) must remain unchanged.
 # The CEL expressions iterate over map keys dynamically rather than enumerating fields,
@@ -94,28 +94,28 @@ spec:
         object.spec.all(k, k in ['podCIDR', 'podCIDRs'] || (k in oldObject.spec && object.spec[k] == oldObject.spec[k])) &&
         oldObject.spec.all(k, k in ['podCIDR', 'podCIDRs'] || (k in object.spec && oldObject.spec[k] == object.spec[k]))
       message: "unbounded-net may only modify spec.podCIDR and spec.podCIDRs on nodes"
-    # Labels: only net.unbounded-kube.io/ prefix labels may be added, changed, or removed.
+    # Labels: only net.unbounded-cloud.io/ prefix labels may be added, changed, or removed.
     - expression: >-
         (!has(object.metadata.labels) && !has(oldObject.metadata.labels)) ||
-        (!has(oldObject.metadata.labels) && object.metadata.labels.all(k, k.startsWith('net.unbounded-kube.io/'))) ||
-        (!has(object.metadata.labels) && oldObject.metadata.labels.all(k, k.startsWith('net.unbounded-kube.io/'))) ||
+        (!has(oldObject.metadata.labels) && object.metadata.labels.all(k, k.startsWith('net.unbounded-cloud.io/'))) ||
+        (!has(object.metadata.labels) && oldObject.metadata.labels.all(k, k.startsWith('net.unbounded-cloud.io/'))) ||
         (has(object.metadata.labels) && has(oldObject.metadata.labels) &&
-          object.metadata.labels.all(k, k.startsWith('net.unbounded-kube.io/') ||
+          object.metadata.labels.all(k, k.startsWith('net.unbounded-cloud.io/') ||
             (k in oldObject.metadata.labels && object.metadata.labels[k] == oldObject.metadata.labels[k])) &&
-          oldObject.metadata.labels.all(k, k.startsWith('net.unbounded-kube.io/') ||
+          oldObject.metadata.labels.all(k, k.startsWith('net.unbounded-cloud.io/') ||
             (k in object.metadata.labels && oldObject.metadata.labels[k] == object.metadata.labels[k])))
-      message: "unbounded-net may only modify labels with net.unbounded-kube.io/ prefix"
-    # Annotations: only net.unbounded-kube.io/ prefix annotations may be added, changed, or removed.
+      message: "unbounded-net may only modify labels with net.unbounded-cloud.io/ prefix"
+    # Annotations: only net.unbounded-cloud.io/ prefix annotations may be added, changed, or removed.
     - expression: >-
         (!has(object.metadata.annotations) && !has(oldObject.metadata.annotations)) ||
-        (!has(oldObject.metadata.annotations) && object.metadata.annotations.all(k, k.startsWith('net.unbounded-kube.io/'))) ||
-        (!has(object.metadata.annotations) && oldObject.metadata.annotations.all(k, k.startsWith('net.unbounded-kube.io/'))) ||
+        (!has(oldObject.metadata.annotations) && object.metadata.annotations.all(k, k.startsWith('net.unbounded-cloud.io/'))) ||
+        (!has(object.metadata.annotations) && oldObject.metadata.annotations.all(k, k.startsWith('net.unbounded-cloud.io/'))) ||
         (has(object.metadata.annotations) && has(oldObject.metadata.annotations) &&
-          object.metadata.annotations.all(k, k.startsWith('net.unbounded-kube.io/') ||
+          object.metadata.annotations.all(k, k.startsWith('net.unbounded-cloud.io/') ||
             (k in oldObject.metadata.annotations && object.metadata.annotations[k] == oldObject.metadata.annotations[k])) &&
-          oldObject.metadata.annotations.all(k, k.startsWith('net.unbounded-kube.io/') ||
+          oldObject.metadata.annotations.all(k, k.startsWith('net.unbounded-cloud.io/') ||
             (k in object.metadata.annotations && oldObject.metadata.annotations[k] == object.metadata.annotations[k])))
-      message: "unbounded-net may only modify annotations with net.unbounded-kube.io/ prefix"
+      message: "unbounded-net may only modify annotations with net.unbounded-cloud.io/ prefix"
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding

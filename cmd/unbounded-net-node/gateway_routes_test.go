@@ -219,7 +219,7 @@ func fakeGatewayDynamic(objects ...runtime.Object) *dynamicfake.FakeDynamicClien
 	for _, obj := range objects {
 		if u, ok := obj.(*unstructured.Unstructured); ok {
 			if u.GetAPIVersion() == "" {
-				u.SetAPIVersion("net.unbounded-kube.io/v1alpha1")
+				u.SetAPIVersion("net.unbounded-cloud.io/v1alpha1")
 			}
 
 			if u.GetKind() == "" {

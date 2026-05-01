@@ -13,7 +13,7 @@ rules:
   # Nodes: read, patch, and update for CIDR assignment and site labeling.
   # Cannot be further scoped -- the controller must operate on any node in the cluster.
   # Fields restricted by ValidatingAdmissionPolicy (09-vap.yaml.tmpl):
-  #   labels/annotations: only net.unbounded-kube.io/* prefix
+  #   labels/annotations: only net.unbounded-cloud.io/* prefix
   #   spec: only podCIDR and podCIDRs (Kubernetes enforces immutability after initial set)
   - apiGroups: [""]
     resources: ["nodes"]
@@ -23,23 +23,23 @@ rules:
     resources: ["events"]
     verbs: ["create", "patch"]
   # Sites and GatewayPools: read access and finalizer management for controllers
-  - apiGroups: ["net.unbounded-kube.io"]
+  - apiGroups: ["net.unbounded-cloud.io"]
     resources: ["sites", "gatewaypools"]
     verbs: ["get", "list", "watch", "update", "patch"]
   # Peering and assignment resources: read access for controllers and status aggregation
-  - apiGroups: ["net.unbounded-kube.io"]
+  - apiGroups: ["net.unbounded-cloud.io"]
     resources: ["sitepeerings", "sitegatewaypoolassignments", "gatewaypoolpeerings"]
     verbs: ["get", "list", "watch"]
   # Status subresources: update observed state for sites, site peerings, gateway pools, and gateway pool nodes
-  - apiGroups: ["net.unbounded-kube.io"]
+  - apiGroups: ["net.unbounded-cloud.io"]
     resources: ["sites/status", "sitepeerings/status", "gatewaypools/status", "gatewaypoolnodes/status"]
     verbs: ["get", "patch", "update"]
   # SiteNodeSlices: full access to manage node slices
-  - apiGroups: ["net.unbounded-kube.io"]
+  - apiGroups: ["net.unbounded-cloud.io"]
     resources: ["sitenodeslices"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   # GatewayPoolNodes: manage per-node route advertisements and heartbeat status
-  - apiGroups: ["net.unbounded-kube.io"]
+  - apiGroups: ["net.unbounded-cloud.io"]
     resources: ["gatewaypoolnodes"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   # TokenReviews: validate node agent bearer tokens when OIDC issuer is unavailable.
@@ -63,7 +63,7 @@ rules:
   # APIServices: inject caBundle on startup.
   - apiGroups: ["apiregistration.k8s.io"]
     resources: ["apiservices"]
-    resourceNames: ["v1alpha1.status.net.unbounded-kube.io"]
+    resourceNames: ["v1alpha1.status.net.unbounded-cloud.io"]
     verbs: ["get", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

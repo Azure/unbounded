@@ -72,13 +72,32 @@ const (
 	// error result so that operators can diagnose the problem without
 	// logging into the machine.
 	MachineConditionCloudInitDone = "CloudInitDone"
+
+	// MachineConditionNodeUpdated indicates the result of a node
+	// update performed by the agent daemon. Status is True with
+	// Reason "Succeeded" after a successful update, and False with
+	// Reason "Failed" when the update fails. While the update is in
+	// progress the status is False with Reason "InProgress".
+	MachineConditionNodeUpdated = "NodeUpdated"
+
+	// MachineConditionConfigurationPending indicates that no
+	// MachineConfiguration has been assigned to this Machine, either
+	// directly via configurationRef or through a machineSelector
+	// match. The Machine remains in a waiting state until a
+	// configuration is assigned.
+	MachineConditionConfigurationPending = "ConfigurationPending"
 )
 
 // Annotation keys.
 const (
 	// AnnotationProvider associates a Machine with a provider's
 	// controller for reboot/repave operations.
-	AnnotationProvider = "unbounded-kube.io/provider"
+	AnnotationProvider = "unbounded-cloud.io/provider"
+
+	// AnnotationConfigurationVersion is set on the Kubernetes Node
+	// object to record which MachineConfigurationVersion was used to
+	// bootstrap the machine.
+	AnnotationConfigurationVersion = "unbounded-cloud.io/machine-configuration-version"
 )
 
 // MachineSpec defines the desired state of a Machine.
@@ -103,6 +122,30 @@ type MachineSpec struct {
 	// Operations contains counter-based operation triggers.
 	// +optional
 	Operations *OperationsSpec `json:"operations,omitempty"`
+
+	// ConfigurationRef references a MachineConfiguration (and
+	// optionally a specific version) that defines the configuration
+	// profile for this machine. If a specific version is set, that
+	// version is used at provisioning time; otherwise the latest
+	// locked version is used and the version field is set by the
+	// controller.
+	// +optional
+	ConfigurationRef *MachineConfigurationRef `json:"configurationRef,omitempty"`
+}
+
+// MachineConfigurationRef references a MachineConfiguration and
+// optionally a specific MachineConfigurationVersion.
+type MachineConfigurationRef struct {
+	// Name is the name of the MachineConfiguration.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+
+	// Version is the specific MachineConfigurationVersion number to
+	// use. If omitted, the controller selects the latest locked
+	// (deployed) version and populates this field.
+	// +optional
+	Version *int32 `json:"version,omitempty"`
 }
 
 // SSHSpec defines SSH connection details. The same structure is reused
@@ -267,9 +310,91 @@ type KubernetesSpec struct {
 // AgentSpec defines settings for the unbounded node agent.
 type AgentSpec struct {
 	// Image is the OCI image reference used for provisioning the
-	// nspawn machine (e.g. "ghcr.io/org/repo:tag").
-	// +kubebuilder:validation:Required
-	Image string `json:"image"`
+	// nspawn machine (e.g. "ghcr.io/org/repo:tag"). When empty the
+	// agent falls back to its built-in default image.
+	// +optional
+	Image string `json:"image,omitempty"`
+
+	// Version pins the unbounded-agent release tag that is downloaded
+	// onto the host (e.g. "v0.0.10"). When empty the install script
+	// tracks the latest published release.
+	// +optional
+	Version string `json:"version,omitempty"`
+
+	// BaseURL overrides the base URL used to construct the
+	// unbounded-agent download URL. Defaults to the upstream GitHub
+	// releases URL. The layout under BaseURL must match the GitHub
+	// releases layout (<base>/latest/download/<asset> and
+	// <base>/download/<tag>/<asset>).
+	// +optional
+	BaseURL string `json:"baseURL,omitempty"`
+
+	// URL is a fully qualified download URL for the unbounded-agent
+	// tarball. When set it overrides Version and BaseURL entirely.
+	// +optional
+	URL string `json:"url,omitempty"`
+
+	// Downloads overrides the download sources for the binaries the
+	// agent installs into the nspawn rootfs (kubelet, containerd, runc,
+	// CNI plugins, crictl). When unset the agent downloads each
+	// artifact from its upstream default host.
+	// +optional
+	Downloads *AgentDownloadsSpec `json:"downloads,omitempty"`
+}
+
+// AgentDownloadsSpec overrides the download sources for the artifacts the
+// agent installs into the nspawn rootfs. Each entry is optional; unset
+// entries fall back to the upstream defaults.
+type AgentDownloadsSpec struct {
+	// Kubernetes overrides the download source for kubelet/kubectl/kube-proxy
+	// (upstream default: https://dl.k8s.io).
+	// +optional
+	Kubernetes *DownloadSource `json:"kubernetes,omitempty"`
+
+	// Containerd overrides the download source for containerd
+	// (upstream default: https://github.com/containerd/containerd).
+	// +optional
+	Containerd *DownloadSource `json:"containerd,omitempty"`
+
+	// Runc overrides the download source for runc
+	// (upstream default: https://github.com/opencontainers/runc).
+	// +optional
+	Runc *DownloadSource `json:"runc,omitempty"`
+
+	// CNI overrides the download source for CNI plugins
+	// (upstream default: https://github.com/containernetworking/plugins).
+	// +optional
+	CNI *DownloadSource `json:"cni,omitempty"`
+
+	// Crictl overrides the download source for crictl
+	// (upstream default: https://github.com/kubernetes-sigs/cri-tools).
+	// +optional
+	Crictl *DownloadSource `json:"crictl,omitempty"`
+}
+
+// DownloadSource configures an override for a binary download source.
+// Exactly one of URL or BaseURL should typically be set; when both are
+// set URL wins. Version overrides the version that would otherwise be
+// derived from the cluster Kubernetes version or agent defaults.
+type DownloadSource struct {
+	// BaseURL replaces the upstream host + path prefix used to
+	// construct the download URL. Version and arch substitution are
+	// preserved so mirrors need to publish assets under the same
+	// layout as the upstream project.
+	// +optional
+	BaseURL string `json:"baseURL,omitempty"`
+
+	// URL is a fully qualified download URL template. Version/arch
+	// substitution via fmt directives is preserved. When set it
+	// overrides BaseURL entirely.
+	// +optional
+	URL string `json:"url,omitempty"`
+
+	// Version overrides the version of the artifact that would
+	// otherwise be derived from the cluster Kubernetes version or the
+	// agent's compiled-in defaults.
+	// +optional
+	Version string `json:"version,omitempty"`
 }
 
 // OperationsSpec defines counter-based operation triggers.
@@ -335,9 +460,28 @@ type MachineStatus struct {
 	// +optional
 	Operations *OperationsStatus `json:"operations,omitempty"`
 
+	// Configuration records the MachineConfigurationVersion that was
+	// applied to this machine during the most recent provisioning.
+	// +optional
+	Configuration *MachineConfigurationRefStatus `json:"configuration,omitempty"`
+
 	// Conditions represent the latest available observations of the
 	// machine's state.
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// MachineConfigurationRefStatus records which configuration version
+// was applied to a Machine.
+type MachineConfigurationRefStatus struct {
+	// Name is the MachineConfiguration name.
+	Name string `json:"name,omitempty"`
+
+	// Version is the MachineConfigurationVersion number that was applied.
+	Version int32 `json:"version,omitempty"`
+
+	// VersionName is the full MachineConfigurationVersion object name
+	// (e.g. "myconfig-v3").
+	VersionName string `json:"versionName,omitempty"`
 }
 
 // MachinePhase represents the current phase of a Machine.

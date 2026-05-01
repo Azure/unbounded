@@ -579,7 +579,7 @@ func TestValidateRequestAndHandleValidate(t *testing.T) {
 
 // TestValidateSiteCreateAndDelete tests validate site create and delete.
 func TestValidateSiteCreateAndDelete(t *testing.T) {
-	client := kubefake.NewClientset(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a", Labels: map[string]string{"net.unbounded-kube.io/site": "site-a"}}})
+	client := kubefake.NewClientset(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a", Labels: map[string]string{"net.unbounded-cloud.io/site": "site-a"}}})
 	validator := &Validator{
 		clientset: client,
 		siteClient: &fakeSiteClient{items: []unboundednetv1alpha1.Site{

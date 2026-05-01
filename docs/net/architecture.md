@@ -660,7 +660,7 @@ graph TD
 
 ```mermaid
 graph TD
-    GN[Gateway Node] -->|Taint| T1["net.unbounded-kube.io/gateway-node=true:NoSchedule"]
+    GN[Gateway Node] -->|Taint| T1["net.unbounded-cloud.io/gateway-node=true:NoSchedule"]
     T1 -->|Effect| E1[No regular workloads scheduled]
     E1 -->|Reason| R1[Gateway lacks pod CIDR routes<br/>to other sites]
 

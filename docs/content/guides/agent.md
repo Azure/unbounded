@@ -47,7 +47,7 @@ hand. A minimal example:
     "ApiServer": "https://api.example.com:6443",
     "BootstrapToken": "abc123.0123456789abcdef",
     "Labels": {
-      "unbounded-kube.io/site": "mysite"
+      "unbounded-cloud.io/site": "mysite"
     },
     "RegisterWithTaints": []
   }
@@ -87,6 +87,158 @@ To inspect the script before running it, save it to a file first:
 kubectl unbounded machine manual-bootstrap my-node --site mysite > bootstrap.sh
 ```
 {{< /callout >}}
+
+### Customizing the agent download
+
+By default the bootstrap script downloads the latest published
+`unbounded-agent` release directly from GitHub. This means new releases are
+picked up automatically without editing scripts or docs. The download can be
+customized when generating the bootstrap payload or at runtime via
+environment variables:
+
+- `--agent-version` / `AGENT_VERSION`: pin to a specific release tag instead
+  of tracking latest. Example: `--agent-version v0.0.10`.
+- `--agent-base-url` / `AGENT_BASE_URL`: point at a self-hosted mirror of the
+  release assets. The layout under the base URL must match the GitHub
+  releases layout (`<base>/latest/download/<asset>` and
+  `<base>/download/<tag>/<asset>`). Useful for air-gapped environments.
+- `--agent-url` / `AGENT_URL`: fully qualified download URL for the agent
+  tarball. Overrides the version / base URL resolution entirely.
+
+Examples:
+
+```bash
+# Pin the agent to a specific release:
+kubectl unbounded machine manual-bootstrap my-node --site mysite \
+    --agent-version v0.0.10 | ssh user@host sudo bash
+
+# Self-host the release assets under an internal mirror:
+kubectl unbounded machine manual-bootstrap my-node --site mysite \
+    --agent-base-url https://releases.internal.example.com/unbounded \
+    | ssh user@host sudo bash
+```
+
+The same overrides can also be exported on the target host before running a
+previously generated bootstrap script:
+
+```bash
+export AGENT_BASE_URL=https://releases.internal.example.com/unbounded
+bash bootstrap.sh
+```
+
+The same agent-download flags are also accepted by `kubectl unbounded
+machine register`, which creates a `Machine` CRD. The machina controller
+then SSH's into the host and exports the same `AGENT_*` environment
+variables when running the install script, so pinning an agent version or
+pointing at a mirror works uniformly across all three provisioning paths
+(`manual-bootstrap`, `register`, and the machina reconciler):
+
+```bash
+kubectl unbounded machine register \
+    --site mysite \
+    --host 10.0.0.5 \
+    --ssh-username azureuser \
+    --ssh-private-key ~/.ssh/id_ed25519 \
+    --agent-version v0.0.10 \
+    --agent-base-url https://releases.internal.example.com/unbounded
+```
+
+These values are persisted on the `Machine` object under
+`spec.agent.{version,baseURL,url}` so the controller reproduces the same
+override on every reconcile:
+
+```yaml
+apiVersion: unbounded-kube.io/v1alpha3
+kind: Machine
+metadata:
+  name: mysite-worker-01
+spec:
+  agent:
+    version: v0.0.10
+    baseURL: https://releases.internal.example.com/unbounded
+  ssh:
+    host: 10.0.0.5
+    # ...
+```
+
+### Mirroring the rootfs downloads (air-gapped deployments)
+
+After installing the `unbounded-agent`, the agent downloads five additional
+binaries into the nspawn machine rootfs:
+
+| Artifact | Upstream default |
+|---|---|
+| kubelet / kubectl / kube-proxy | `https://dl.k8s.io` |
+| containerd | `https://github.com/containerd/containerd/releases/download` |
+| runc | `https://github.com/opencontainers/runc/releases/download` |
+| CNI plugins | `https://github.com/containernetworking/plugins/releases/download` |
+| crictl (cri-tools) | `https://github.com/kubernetes-sigs/cri-tools/releases/download` |
+
+Each default can be overridden at registration time. Every artifact
+exposes three flags, mirroring the `--agent-*` flags above:
+
+- `--<artifact>-base-url`: replaces the upstream host + path prefix.
+  Mirrors must preserve the same file layout as the upstream project
+  (e.g. `<base>/v<version>/<asset>`).
+- `--<artifact>-url`: full URL template; `%s` fmt placeholders are
+  substituted with version / arch fields in the same order as the
+  upstream default.
+- `--<artifact>-version` (or `--kubernetes-binary-version`): pin the
+  artifact to a specific version independently of the cluster
+  Kubernetes version. The default crictl minor-alignment behavior
+  (Kubernetes vX.Y.Z -> cri-tools vX.Y.0) is preserved when no crictl
+  version is set.
+
+The flags are available on both `manual-bootstrap` and `register`, and
+the machina controller forwards them through the agent JSON config
+(`Downloads` block) so an air-gapped operator can register a node
+against an internal mirror without touching source:
+
+```bash
+kubectl unbounded machine register \
+    --site mysite \
+    --host 10.0.0.5 \
+    --ssh-username azureuser \
+    --ssh-private-key ~/.ssh/id_ed25519 \
+    --agent-base-url      https://mirror.internal/unbounded \
+    --kubernetes-base-url https://mirror.internal/k8s \
+    --containerd-base-url https://mirror.internal/containerd/releases/download \
+    --runc-base-url       https://mirror.internal/runc/releases/download \
+    --cni-base-url        https://mirror.internal/plugins/releases/download \
+    --crictl-base-url     https://mirror.internal/cri-tools/releases/download
+```
+
+The resulting `Machine` persists the overrides under
+`spec.agent.downloads` so the controller reproduces them on every
+reconcile:
+
+```yaml
+apiVersion: unbounded-kube.io/v1alpha3
+kind: Machine
+metadata:
+  name: mysite-worker-01
+spec:
+  agent:
+    baseURL: https://mirror.internal/unbounded
+    downloads:
+      kubernetes:
+        baseURL: https://mirror.internal/k8s
+      containerd:
+        baseURL: https://mirror.internal/containerd/releases/download
+      runc:
+        baseURL: https://mirror.internal/runc/releases/download
+      cni:
+        baseURL: https://mirror.internal/plugins/releases/download
+      crictl:
+        baseURL: https://mirror.internal/cri-tools/releases/download
+  ssh:
+    host: 10.0.0.5
+    # ...
+```
+
+Leaving any artifact unset preserves the upstream default, so you can
+mirror a subset of the artifacts and let the rest fall back to the
+public CDN.
 
 A successful run looks like this (timestamps shortened for readability):
 

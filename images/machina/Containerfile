@@ -6,31 +6,24 @@
 # host even when targeting a foreign TARGETPLATFORM. Without this, buildkit
 # would emulate the entire builder under QEMU when producing arm64 images on
 # an amd64 runner, which makes "go build" painfully slow.
-FROM --platform=$BUILDPLATFORM mcr.microsoft.com/azurelinux/base/core:3.0@sha256:35149ae8dd179684f969944f54a337c665a64e702486154eb44253fb39c2505b AS builder
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26.2-trixie AS builder
 
-# Install build dependencies
-RUN tdnf install -y \
+# Install build dependencies. The base image already provides the Go
+# toolchain at /usr/local/go/bin, so we don't install the apt golang package.
+RUN apt-get update && apt-get install -y \
     build-essential \
-    golang \
     make \
     gcc \
     git \
     ca-certificates \
-    && tdnf clean all
+    && apt-get clean
 
 # Set up Go environment.
 # CGO is disabled because cmd/machina has no cgo imports; this also keeps
 # cross-compilation simple (no cross C toolchain required).
-# Microsoft's Go fork (shipped by Azure Linux 3.0) enables the systemcrypto
-# experiment by default, which requires CGO. Opt out so we can build the
-# pure-Go crypto backend.
 ENV CGO_ENABLED=0
-ENV GOEXPERIMENT=nosystemcrypto
 ENV GOPATH=/go
 ENV GOTOOLCHAIN=auto
-# Azure Linux 3.0's Go package restricts GOTOOLCHAIN to "local" by default.
-# Allow "auto" so that go install can download the required toolchain.
-ENV MS_GOTOOLCHAIN_ALLOW_NON_LOCAL=1
 ENV PATH=$PATH:/go/bin
 
 # Set working directory
@@ -59,13 +52,12 @@ RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     make machina-build VERSION=${VERSION} ${GIT_COMMIT:+GIT_COMMIT=${GIT_COMMIT}} ${BUILD_TIME:+BUILD_TIME=${BUILD_TIME}}
 
 # Runtime stage
-FROM mcr.microsoft.com/azurelinux/base/core:3.0@sha256:35149ae8dd179684f969944f54a337c665a64e702486154eb44253fb39c2505b
+FROM ubuntu:noble
 
 # Install runtime dependencies
-RUN tdnf install -y \
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     ca-certificates \
-    && tdnf makecache && tdnf upgrade -y \
-    && tdnf clean all
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Create unbounded directory
 RUN mkdir -p /unbounded/bin

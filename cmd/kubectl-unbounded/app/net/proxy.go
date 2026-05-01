@@ -357,7 +357,7 @@ func openBrowser(rawURL string) {
 	_ = cmd.Start() //nolint:errcheck
 }
 
-const viewerTokenEndpointPath = "/apis/status.net.unbounded-kube.io/v1alpha1/token/viewer"
+const viewerTokenEndpointPath = "/apis/status.net.unbounded-cloud.io/v1alpha1/token/viewer"
 
 // authRetryTransport injects a viewer token into outgoing requests and,
 // on a 401 response from the upstream, invalidates the cached token,

@@ -40,7 +40,7 @@ neither is set, the default kubeconfig location (`~/.kube/config`) is used.
 
 ### `kubectl unbounded site`
 
-Manage unbounded-kube sites.
+Manage Unbounded sites.
 
 This is a command group with no action of its own. Use one of the subcommands
 below.
@@ -49,11 +49,11 @@ below.
 
 ### `kubectl unbounded site init`
 
-Initialize a new unbounded-kube site. This command:
+Initialize a new Unbounded site. This command:
 
 1. Validates inputs and checks that `kubectl` is on your PATH.
 2. Verifies that at least one node is labeled as a gateway
-   (`unbounded-kube.io/unbounded-net-gateway=true`).
+   (`unbounded-cloud.io/unbounded-net-gateway=true`).
 3. Installs the unbounded-net CNI plugin (downloads from the release URL or
    uses local manifests).
 4. Creates unbounded-net Site and GatewayPool resources.
@@ -114,7 +114,7 @@ kubectl unbounded site init \
 
 ### `kubectl unbounded machine`
 
-Manage unbounded-kube machines.
+Manage Unbounded machines.
 
 This is a command group with no action of its own. Use one of the subcommands
 below.

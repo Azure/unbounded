@@ -64,7 +64,7 @@ func (h *nodeHealthState) getStatusServer() *nodeStatusServer {
 
 const (
 	serviceAccountTokenPath = "/var/run/secrets/kubernetes.io/serviceaccount/token"
-	hmacTokenEndpointPath   = "/apis/status.net.unbounded-kube.io/v1alpha1/token/node"
+	hmacTokenEndpointPath   = "/apis/status.net.unbounded-cloud.io/v1alpha1/token/node"
 )
 
 // hmacTokenManager manages the HMAC authentication token for the node agent.
@@ -328,12 +328,12 @@ const (
 	statusWSAPIServerModeNever         = "never"
 	statusWSAPIServerModeFallback      = "fallback"
 	statusWSAPIServerModePreferred     = "preferred"
-	defaultAggregatedNodeStatusWSURL   = "wss://$(KUBERNETES_SERVICE_HOST)/apis/status.net.unbounded-kube.io/v1alpha1/status/nodews"
-	defaultAggregatedNodeStatusPushURL = "https://$(KUBERNETES_SERVICE_HOST)/apis/status.net.unbounded-kube.io/v1alpha1/status/push"
+	defaultAggregatedNodeStatusWSURL   = "wss://$(KUBERNETES_SERVICE_HOST)/apis/status.net.unbounded-cloud.io/v1alpha1/status/nodews"
+	defaultAggregatedNodeStatusPushURL = "https://$(KUBERNETES_SERVICE_HOST)/apis/status.net.unbounded-cloud.io/v1alpha1/status/push"
 	directRecoveryProbeMultiplier      = 3
 	serviceAccountCACertPath           = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
-	legacyAggregatedStatusAPIPath      = "/apis/net.unbounded-kube.io/v1alpha1/status/"
-	currentAggregatedStatusAPIPath     = "/apis/status.net.unbounded-kube.io/v1alpha1/status/"
+	legacyAggregatedStatusAPIPath      = "/apis/net.unbounded-cloud.io/v1alpha1/status/"
+	currentAggregatedStatusAPIPath     = "/apis/status.net.unbounded-cloud.io/v1alpha1/status/"
 	statusWSModeNone                   = int32(0)
 	statusWSModeDirect                 = int32(1)
 	statusWSModeFallback               = int32(2)

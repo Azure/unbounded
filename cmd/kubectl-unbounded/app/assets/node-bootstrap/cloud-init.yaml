@@ -19,4 +19,7 @@ write_files:
 
 runcmd:
   - export UNBOUNDED_AGENT_CONFIG_FILE=/etc/unbounded/agent/config.json
+{{- range .InstallEnv }}
+  - export {{ . }}
+{{- end }}
   - bash /usr/local/bin/unbounded-agent-install.sh

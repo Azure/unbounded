@@ -27,7 +27,7 @@ var manifestsRaw embed.FS
 
 // Manifests exposes the rendered manifests as a filesystem rooted at the
 // rendered/ directory, so consumers see the familiar flat layout
-// (e.g. "01-namespace.yaml", "crd/unbounded-kube.io_machines.yaml").
+// (e.g. "01-namespace.yaml", "crd/unbounded-cloud.io_machines.yaml").
 var Manifests = mustSub(manifestsRaw, "rendered")
 
 func mustSub(fsys fs.FS, dir string) fs.FS {

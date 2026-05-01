@@ -44,13 +44,13 @@ metadata:
   name: machina-controller
 rules:
   # Machine controller
-  - apiGroups: ["unbounded-kube.io"]
+  - apiGroups: ["unbounded-cloud.io"]
     resources: ["machines"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  - apiGroups: ["unbounded-kube.io"]
+  - apiGroups: ["unbounded-cloud.io"]
     resources: ["machines/status"]
     verbs: ["get", "update", "patch"]
-  - apiGroups: ["unbounded-kube.io"]
+  - apiGroups: ["unbounded-cloud.io"]
     resources: ["machines/finalizers"]
     verbs: ["update"]
   # Secrets (SSH keys, bootstrap tokens)

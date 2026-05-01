@@ -8,6 +8,7 @@ on:
     paths:
       - cmd/agent/**
       - cmd/kubectl-unbounded/**
+      - pkg/agent/**
       - internal/provision/**
       - internal/kube/**
       - hack/agent/e2e-kind/**
@@ -25,6 +26,7 @@ on:
     paths:
       - cmd/agent/**
       - cmd/kubectl-unbounded/**
+      - pkg/agent/**
       - internal/provision/**
       - internal/kube/**
       - hack/agent/e2e-kind/**

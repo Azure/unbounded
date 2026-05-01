@@ -43,41 +43,41 @@ import (
 
 const (
 	// SiteLabelKey is the label key used to identify which site a node belongs to
-	SiteLabelKey = "net.unbounded-kube.io/site"
+	SiteLabelKey = "net.unbounded-cloud.io/site"
 
 	// WireGuardPubKeyAnnotation is the annotation key for a node's WireGuard public key
-	WireGuardPubKeyAnnotation = "net.unbounded-kube.io/wg-pubkey"
+	WireGuardPubKeyAnnotation = "net.unbounded-cloud.io/wg-pubkey"
 
 	// WireGuardPortAnnotation is the annotation key for a gateway node's
 	// assigned WireGuard port (used for gateway-to-gateway peering).
-	WireGuardPortAnnotation = "net.unbounded-kube.io/wireguard-port"
+	WireGuardPortAnnotation = "net.unbounded-cloud.io/wireguard-port"
 
 	// TunnelMTUAnnotation is the annotation key for a node's detected
 	// maximum tunnel MTU (default-route MTU minus encapsulation
 	// overhead). The controller compares this against the configured node MTU
 	// to surface warnings when the configured value is too high.
-	TunnelMTUAnnotation = "net.unbounded-kube.io/tunnel-mtu"
+	TunnelMTUAnnotation = "net.unbounded-cloud.io/tunnel-mtu"
 
 	// ProtectionFinalizer prevents deletion of Sites and GatewayPools that
 	// still have active nodes assigned. The controller adds this finalizer
 	// when nodes are present and removes it when the last node is unassigned.
-	ProtectionFinalizer = "net.unbounded-kube.io/protection"
+	ProtectionFinalizer = "net.unbounded-cloud.io/protection"
 )
 
 var siteGVR = schema.GroupVersionResource{
-	Group:    "net.unbounded-kube.io",
+	Group:    "net.unbounded-cloud.io",
 	Version:  "v1alpha1",
 	Resource: "sites",
 }
 
 var siteNodeSliceGVR = schema.GroupVersionResource{
-	Group:    "net.unbounded-kube.io",
+	Group:    "net.unbounded-cloud.io",
 	Version:  "v1alpha1",
 	Resource: "sitenodeslices",
 }
 
 var gatewayPoolGVRSite = schema.GroupVersionResource{
-	Group:    "net.unbounded-kube.io",
+	Group:    "net.unbounded-cloud.io",
 	Version:  "v1alpha1",
 	Resource: "gatewaypools",
 }
@@ -1196,13 +1196,13 @@ func (sc *SiteController) createOrUpdateSlice(ctx context.Context, site unbounde
 func (sc *SiteController) buildSliceObject(site unboundednetv1alpha1.Site, sliceName string, sliceIndex int, nodesData []interface{}) *unstructured.Unstructured {
 	return &unstructured.Unstructured{
 		Object: map[string]interface{}{
-			"apiVersion": "net.unbounded-kube.io/v1alpha1",
+			"apiVersion": "net.unbounded-cloud.io/v1alpha1",
 			"kind":       "SiteNodeSlice",
 			"metadata": map[string]interface{}{
 				"name": sliceName,
 				"ownerReferences": []interface{}{
 					map[string]interface{}{
-						"apiVersion":         "net.unbounded-kube.io/v1alpha1",
+						"apiVersion":         "net.unbounded-cloud.io/v1alpha1",
 						"kind":               "Site",
 						"name":               site.Name,
 						"uid":                string(site.UID),
