@@ -192,3 +192,108 @@ children, with bandwidth tracking local fan-out.
 - **In-flight transactions.** A hop failure surfaces as a transport
   error. The client retries; partial bytes are discarded by the
   reader's content-hash check.
+
+## Alternatives Considered
+
+The shape of this design is driven by three invariants: placement is a
+pure function of `(blob_id, chunk_index)` and current membership, bytes
+flow along the lookup path so caching is a routing side-effect, and
+replication geometry emerges from demand. Each alternative below
+sacrifices at least one of those.
+
+### Centralized dedicated cache tier
+
+A separate fleet of cache nodes sits between consumers and the backing
+store. Examples: registry pull-through mirrors (Harbor, distribution),
+Dragonfly's supernode/seed-peer tier used without peer-to-peer fan-out,
+classical CDN edge nodes.
+
+- **Provisioning is decoupled from demand.** The cache tier is sized
+  ahead of time. Idle outside bursts; saturated during synchronized
+  pulls. Our design uses the same nodes that *are* the demand as the
+  fabric, so capacity scales with the workload by construction.
+- **Locality is coarse.** Cache nodes are not on the consumer's data
+  path. Best case is one cache per rack, hand-placed. PNS gives us
+  rack/PCIe-aware replicas as a side-effect of demand, no placement
+  policy to maintain.
+- **Hot-spot under fan-out.** 1000 nodes pulling the same image
+  saturate the cache tier's NICs in proportion to fleet size. The
+  multicast tree in section "Recursive Structure" bounds *average*
+  per-replica bandwidth as the cluster grows; a centralized tier does
+  not.
+- **Extra control plane.** Another component to deploy, monitor,
+  upgrade, and recover. The ring derives from the existing Kubernetes
+  membership Unbounded already trusts.
+- **Concentrated fault domain.** Cache tier failure degrades every
+  consumer simultaneously. Our scheme degrades gradually as replicas
+  drain.
+
+### Centralized metadata, distributed blocks
+
+A metadata service tracks which nodes hold which blocks; data lives
+distributed. Examples: HDFS NameNode, Ceph MDS, BitTorrent tracker,
+IPFS provider records on a DHT, S3-style indirection.
+
+- **Manifest-free placement is lost.** The whole point of `width(L)`
+  + `hash(blob_id, idx)` is that any client computes chunk boundaries
+  and owners locally. A metadata layer reintroduces a per-read lookup
+  before any byte moves.
+- **Critical-path dependency.** Metadata service must be HA, must
+  scale to read RPS, and must be reachable before any data flows. The
+  ring + Kubernetes membership has none of those failure modes.
+- **Membership churn rewrites metadata.** Adding or removing a node
+  triggers placement-record updates proportional to held blocks. Our
+  scheme migrates nothing on membership change; existing replicas keep
+  serving and the new owner cold-fetches on first miss.
+- **Coordination cost on writes.** Every chunk landing somewhere has
+  to register that fact. Our promotion is purely local.
+- **Read amplification at small scale.** For a small blob the metadata
+  round-trip can dominate the actual transfer.
+
+### Typical BitTorrent
+
+Tracker or Mainline-DHT peer discovery, rarest-first piece selection,
+choke/unchoke tit-for-tat, unstructured swarm. Designed for adversarial
+public swarms with churning, selfish peers.
+
+- **Wrong replication objective.** Rarest-first deliberately spreads
+  rare pieces to keep the swarm healthy. We want the *opposite*: hot
+  pieces gain replicas near hot readers. SIEVE + arc-eligibility
+  encodes that directly.
+- **No structured routing.** Peer discovery is announce/gossip or DHT
+  lookup. Lookup cost is not `O(log n)` over the *cluster*; it is a
+  function of swarm size and DHT health. We get `O(log n)` cold and
+  `O(1)` hot from ring geometry.
+- **Transit nodes see nothing.** A BT peer only sees the pieces it
+  explicitly requests. Recursive byte-level routing means every transit
+  node already observes the chunks crossing it; SIEVE just decides
+  which ones to retain. That is the cheap caching property; BT cannot
+  reproduce it.
+- **No locality awareness.** Peer selection is random or
+  upload-rate-driven. PNS biases hops to the nearest peer in each arc
+  for free.
+- **Coordination overhead.** Bitfield exchange, HAVE messages, choke
+  algorithms, optimistic unchoke. All necessary in an adversarial
+  setting, all wasted overhead in a cooperative cluster.
+- **Tracker or DHT is itself a centralization point** with the same
+  problems as "centralized metadata" above, just less honestly named.
+
+### Adjacent real-world systems
+
+For grounding, points on the design space currently in production:
+
+- **Spegel.** libp2p + mDNS/DHT for in-cluster registry mirroring.
+  Closest to "typical BitTorrent" with cluster-local discovery; loses
+  structured routing and demand-shaped replication.
+- **Dragonfly.** Supernode-coordinated P2P. Hybrid of "centralized
+  metadata" (supernode tracks pieces) and swarm transfer between
+  agents. Supernode is the bottleneck and SPOF the design above
+  removes.
+- **Uber Kraken.** Origin cluster + tracker + agents, BitTorrent-style
+  transfer between agents. Same tracker dependency; locality is
+  rack-aware but not free, requires explicit configuration.
+
+None of these provide the "placement is a pure function, caching is a
+routing side-effect, replication shape emerges from demand" combination
+that motivates this design.
+
