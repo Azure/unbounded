@@ -305,6 +305,19 @@ spec:
                     format: int64
                     type: integer
                 type: object
+              provider:
+                description: Provider identifies the external control provider for
+                  this machine.
+                enum:
+                - AzureVM
+                - OCIInstance
+                type: string
+              providerID:
+                description: |-
+                  ProviderID identifies the underlying infrastructure resource for this
+                  machine, using a Kubernetes-style provider ID such as
+                  azure:///subscriptions/.../virtualMachines/name or oci://ocid1.instance...
+                type: string
               pxe:
                 description: PXE contains PXE boot configuration for the machine.
                 properties:
