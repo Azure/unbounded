@@ -723,6 +723,7 @@ func TestEnsureCertificateRotatesWhenClusterIPChanges(t *testing.T) {
 
 	// Now change the Service's ClusterIP to simulate a service recreation.
 	svc.Spec.ClusterIP = newIP
+
 	svc.Spec.ClusterIPs = []string{newIP}
 	if _, err := client.CoreV1().Services("kube-system").Update(ctx, svc, metav1.UpdateOptions{}); err != nil {
 		t.Fatalf("failed to update service: %v", err)
@@ -750,6 +751,7 @@ func TestEnsureCertificateRotatesWhenClusterIPChanges(t *testing.T) {
 	}
 
 	foundNewIP := false
+
 	for _, ip := range newCert.IPAddresses {
 		if ip.String() == newIP {
 			foundNewIP = true
