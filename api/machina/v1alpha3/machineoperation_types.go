@@ -7,6 +7,14 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+const (
+	// MachineOperationMachineLabelKey is the label key set on every
+	// MachineOperation to identify the target Machine. Agents use a
+	// label selector on this key to scope their informer to only
+	// operations targeting their own machine.
+	MachineOperationMachineLabelKey = "unbounded-cloud.io/machine"
+)
+
 func init() {
 	SchemeBuilder.Register(&MachineOperation{}, &MachineOperationList{})
 }
@@ -21,9 +29,9 @@ func init() {
 
 // MachineOperation represents a discrete operation to be performed on a
 // Machine. MachineOperations are created by CLI commands or controllers and
-// processed by the appropriate agent. The in-VM agent handles operations
-// like NodeReboot, while cloud or PXE controllers handle operations like
-// HostReboot, HostPowerOff, and HostPowerOn.
+// processed by the appropriate agent - the in-VM agent handles operations
+// like Reboot, while cloud or PXE controllers handle operations like
+// HardReboot, PowerOff, and PowerOn.
 type MachineOperation struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
@@ -44,26 +52,20 @@ type MachineOperationList struct {
 // OperationKind identifies the kind of operation to perform. Predefined
 // operations cover common lifecycle actions; custom operations may be
 // supported by individual cloud controllers.
-// +kubebuilder:validation:Enum=NodeReboot;HostReboot;HostPowerOff;HostPowerOn
+// +kubebuilder:validation:Enum=SoftReboot;HardReboot
 type OperationKind string
 
 const (
-	// OperationNodeReboot restarts the nspawn-backed node in place without
+	// OperationSoftReboot restarts the nspawn machine in place without
 	// reprovisioning the rootfs. Services are stopped, the nspawn container
 	// is restarted, and services are brought back up. Handled by the
 	// in-VM agent.
-	OperationNodeReboot OperationKind = "NodeReboot"
+	OperationSoftReboot OperationKind = "SoftReboot"
 
-	// OperationHostReboot triggers a full hardware power cycle of the host
+	// OperationHardReboot triggers a full hardware power cycle of the host
 	// via BMC (e.g. Redfish). Handled by the machina controller or cloud
 	// controller.
-	OperationHostReboot OperationKind = "HostReboot"
-
-	// OperationHostPowerOff powers off the host through an out-of-band provider.
-	OperationHostPowerOff OperationKind = "HostPowerOff"
-
-	// OperationHostPowerOn powers on the host through an out-of-band provider.
-	OperationHostPowerOn OperationKind = "HostPowerOn"
+	OperationHardReboot OperationKind = "HardReboot"
 )
 
 // OperationPhase represents the current phase of a MachineOperation.

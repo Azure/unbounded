@@ -1,5 +1,0 @@
-# Keep this directory present in the repo as the render output root for
-# machine-ops-controller manifests. `make machine-ops-manifests` writes the
-# rendered manifests here; none of that output is tracked.
-*
-!.gitignore

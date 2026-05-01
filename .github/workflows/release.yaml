@@ -18,7 +18,7 @@ name: unbounded release
 #     -> binaries          (GoReleaser; creates draft GitHub release)
 #     -> net-images        (matrix: amd64-native, arm64-native)
 #         -> net-images-manifest (multi-arch tag stitch + sign + SBOM attest)
-#     -> component-images  (matrix: machina, machine-ops-controller, metalman, host-ubuntu2404)
+#     -> component-images  (matrix: machina, metalman, host-ubuntu2404)
 #     -> manifests-tarball (make release-manifests + cosign sign)
 #     -> finalize          (attach extras + krew manifest; optional publish)
 #
@@ -506,10 +506,6 @@ jobs:
         component:
           - name: machina
             file: images/machina/Containerfile
-            platforms: linux/amd64,linux/arm64
-            trivy: true
-          - name: machine-ops-controller
-            file: images/machine-ops-controller/Containerfile
             platforms: linux/amd64,linux/arm64
             trivy: true
           - name: metalman

@@ -68,7 +68,6 @@ docs/.hugo_build.lock
 # AI Tools
 .opencode
 .claude/settings.local.json
-.worktrees/
 
 # Python
 __pycache__/

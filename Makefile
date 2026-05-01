@@ -36,10 +36,6 @@ CONTAINER_REGISTRY ?= ghcr.io/azure
 MACHINA_IMAGE ?= $(CONTAINER_REGISTRY)/machina:$(VERSION)
 CONTAINER_ENGINE ?= podman
 
-MACHINE_OPS_CONTROLLER_BIN=bin/machine-ops-controller
-MACHINE_OPS_CONTROLLER_CMD=./cmd/machine-ops-controller
-MACHINE_OPS_CONTROLLER_IMAGE ?= $(CONTAINER_REGISTRY)/machine-ops-controller:$(VERSION)
-
 METALMAN_BIN=bin/metalman
 METALMAN_CMD=./cmd/metalman
 
@@ -109,13 +105,13 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 # Frontend build toggle (dev builds produce unminified output with sourcemaps).
 REACT_DEV ?= false
 
-.PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute notice notice-check
+.PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute notice notice-check
 .PHONY: net-frontend net-frontend-clean net-build-ebpf net-manifests release-manifests
-.PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-net-controller-local image-net-node-local images-local
+.PHONY: image-machina-local image-metalman-local image-net-controller-local image-net-node-local images-local
 
 ##@ General
 
-all: kubectl-unbounded forge machina machine-ops-controller unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute ## Build all binaries (default)
+all: kubectl-unbounded forge machina unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute ## Build all binaries (default)
 
 help: ## Show this help
 	@echo ""
@@ -150,7 +146,6 @@ help: ## Show this help
 	@echo "  inventory-viewer                 Build inventory-viewer"
 	@echo "  unbounded-agent                  Build unbounded-agent (linux)"
 	@echo "  machina | machina-build          Build machina controller (with/without lint/test)"
-	@echo "  machine-ops-controller           Build machine-ops-controller"
 	@echo "  metalman | metalman-build        Build metalman controller (with/without lint/test)"
 	@echo "  unbounded-net-controller         Build net controller"
 	@echo "  unbounded-net-node               Build net node agent"
@@ -168,13 +163,11 @@ help: ## Show this help
 	@echo "  image-inventory-viewer-local     Build a local inventory-viewer container image"
 	@echo "  image-inventory-viewer-push      Build and push the inventory-viewer container image"
 	@echo "  image-machina-local              Build machina image with \$$(CONTAINER_ENGINE)"
-	@echo "  image-machine-ops-controller-local Build machine-ops-controller image"
 	@echo "  image-metalman-local             Build metalman image"
 	@echo "  image-net-controller-local       Build unbounded-net-controller image"
 	@echo "  image-net-node-local             Build unbounded-net-node image"
-	@echo "  images-local                     Build all local images"
+	@echo "  images-local                     Build all four images"
 	@echo "  machina-oci-push                 Build machina image and push"
-	@echo "  machine-ops-controller-oci-push  Build machine-ops-controller image and push"
 	@echo "  metalman-oci-push                Build metalman image and push"
 	@echo ""
 	@echo "Net Frontend:"
@@ -186,7 +179,6 @@ help: ## Show this help
 	@echo ""
 	@echo "Net Manifests:"
 	@echo "  machina-manifests                Render machina manifests into deploy/machina/rendered"
-	@echo "  machine-ops-manifests            Render machine-ops manifests into deploy/machine-ops/rendered"
 	@echo "  net-manifests                    Render net manifests into \$$(NET_MANIFEST_RENDERED_DIR)"
 	@echo ""
 	@echo "Net Kubernetes (apply to current kubectl context):"
@@ -375,11 +367,6 @@ machina-build: machina-manifests ## Build the machina binary (no lint/test)
 
 machina: test machina-build ## Build the machina controller (implies test)
 
-machine-ops-controller-build: machine-ops-manifests ## Build the machine-ops-controller binary (no lint/test)
-	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(MACHINE_OPS_CONTROLLER_BIN) $(MACHINE_OPS_CONTROLLER_CMD)
-
-machine-ops-controller: test machine-ops-controller-build ## Build the machine-ops-controller (implies test)
-
 metalman-build: ## Build the metalman binary (no lint/test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(METALMAN_BIN) $(METALMAN_CMD)/main.go
 
@@ -502,29 +489,9 @@ machina-oci: image-machina-local ## Alias for image-machina-local
 machina-oci-push: machina-oci ## Build and push the machina container image
 	$(CONTAINER_ENGINE) push $(MACHINA_IMAGE)
 
-image-machine-ops-controller-local: ## Build the machine-ops-controller container image locally (single-arch)
-	$(CONTAINER_ENGINE) build \
-		--build-arg VERSION=$(VERSION) \
-		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
-		--build-arg BUILD_TIME=$(BUILD_TIME) \
-		-t machine-ops-controller:$(VERSION) -t $(MACHINE_OPS_CONTROLLER_IMAGE) \
-		-f ./images/machine-ops-controller/Containerfile .
-	$(call trivy-maybe,$(MACHINE_OPS_CONTROLLER_IMAGE))
-
-machine-ops-controller-oci: image-machine-ops-controller-local ## Alias for image-machine-ops-controller-local
-
-machine-ops-controller-oci-push: machine-ops-controller-oci ## Build and push the machine-ops-controller image
-	$(CONTAINER_ENGINE) push $(MACHINE_OPS_CONTROLLER_IMAGE)
-
 MACHINA_NAMESPACE ?= unbounded-kube
 MACHINA_MANIFEST_TEMPLATES_DIR := deploy/machina
 MACHINA_MANIFEST_RENDERED_DIR  := deploy/machina/rendered
-MACHINE_OPS_NAMESPACE ?= unbounded-kube
-MACHINE_OPS_OCI_CONFIG_SECRET ?=
-MACHINE_OPS_OCI_CONFIG_PROFILE ?= DEFAULT
-MACHINE_OPS_OCI_AUTH ?= api_key
-MACHINE_OPS_MANIFEST_TEMPLATES_DIR := deploy/machine-ops
-MACHINE_OPS_MANIFEST_RENDERED_DIR  := deploy/machine-ops/rendered
 
 machina-manifests: ## Render machina deployment manifests into deploy/machina/rendered
 	@mkdir -p $(MACHINA_MANIFEST_RENDERED_DIR)
@@ -537,19 +504,6 @@ machina-manifests: ## Render machina deployment manifests into deploy/machina/re
 		--set ControllerImage=$(MACHINA_IMAGE)
 	@cp $(MACHINA_MANIFEST_TEMPLATES_DIR)/crd/*.yaml $(MACHINA_MANIFEST_RENDERED_DIR)/crd/
 	@echo "Rendered machina manifests into $(MACHINA_MANIFEST_RENDERED_DIR) (image: $(MACHINA_IMAGE))"
-
-machine-ops-manifests: ## Render machine-ops-controller manifests into deploy/machine-ops/rendered
-	@mkdir -p $(MACHINE_OPS_MANIFEST_RENDERED_DIR)
-	@find $(MACHINE_OPS_MANIFEST_RENDERED_DIR) -mindepth 1 -not -name .gitignore -delete
-	$(GOCMD) run ./hack/cmd/render-manifests \
-		--templates-dir $(MACHINE_OPS_MANIFEST_TEMPLATES_DIR) \
-		--output-dir $(MACHINE_OPS_MANIFEST_RENDERED_DIR) \
-		--set Namespace=$(MACHINE_OPS_NAMESPACE) \
-		--set ControllerImage=$(MACHINE_OPS_CONTROLLER_IMAGE) \
-		--set OCIConfigSecretName=$(MACHINE_OPS_OCI_CONFIG_SECRET) \
-		--set OCIConfigProfile=$(MACHINE_OPS_OCI_CONFIG_PROFILE) \
-		--set OCIAuth=$(MACHINE_OPS_OCI_AUTH)
-	@echo "Rendered machine-ops manifests into $(MACHINE_OPS_MANIFEST_RENDERED_DIR) (image: $(MACHINE_OPS_CONTROLLER_IMAGE))"
 
 machina-run: machina ## Replace the in-cluster machina with a locally built binary
 	kubectl scale deployment/machina-controller --replicas=0 -n unbounded-kube
@@ -592,7 +546,7 @@ image-net-node-local: resources/cni-plugins-linux-$(HOST_GOARCH)-$(CNI_PLUGINS_V
 		-f ./images/net-node/Dockerfile .
 	$(call trivy-maybe,$(NET_NODE_IMAGE))
 
-images-local: image-machina-local image-machine-ops-controller-local image-metalman-local image-net-controller-local image-net-node-local ## Build all container images locally
+images-local: image-machina-local image-metalman-local image-net-controller-local image-net-node-local ## Build all four container images locally
 
 ##@ Net Frontend
 
@@ -657,13 +611,11 @@ net-manifests: ## Render net manifests into $(NET_MANIFEST_RENDERED_DIR)
 RELEASE_MANIFESTS_STAGE_DIR := build/release-manifests
 RELEASE_MANIFESTS_NAME      := unbounded-manifests-$(VERSION)
 
-release-manifests: machina-manifests machine-ops-manifests net-manifests ## Build stamped combined manifest tarball under build/
+release-manifests: machina-manifests net-manifests ## Build stamped combined machina+net manifest tarball under build/
 	@rm -rf $(RELEASE_MANIFESTS_STAGE_DIR)
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machina
-	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machine-ops
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/net
 	@cp -R $(MACHINA_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machina/
-	@cp -R $(MACHINE_OPS_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machine-ops/
 	@cp -R $(NET_MANIFEST_RENDERED_DIR)/.     $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/net/
 	@echo "$(VERSION)" > $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/VERSION
 	@mkdir -p build

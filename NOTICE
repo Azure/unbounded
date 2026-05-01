@@ -288,17 +288,6 @@ notices:
     license:
       - name: Apache License, Version 2.0
         link: https://github.com/opencontainers/umoci/blob/v0.6.0/COPYING
-  - dependency: github.com/oracle/oci-go-sdk/v65
-    ecosystem: go
-    copyright:
-      - Copyright (c) 2016, 2026, Oracle and/or its affiliates.  All rights reserved.
-      - Copyright (c) 2016, 2026 Oracle and/or its affiliates.
-      - Copyright (c) 2016, 2016, Oracle and/or its affiliates. All rights reserved.
-    license:
-      - name: UPL-1.0
-        link: https://github.com/oracle/oci-go-sdk/blob/v65.114.0/LICENSE.txt
-      - name: Apache License, Version 2.0
-        link: https://github.com/oracle/oci-go-sdk/blob/v65.114.0/LICENSE.txt
   - dependency: github.com/pin/tftp/v3
     ecosystem: go
     copyright:
