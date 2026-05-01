@@ -68,19 +68,28 @@ crossing it. Cold-read latency is `O(log n)` hops; popular chunks shed hops
 as replicas grow.
 
 ```mermaid
-flowchart LR
-    C[client] -->|lookup c| Q1[q1]
-    Q1 -->|finger hop| Q2[q2]
-    Q2 -->|finger hop| Q3[q3]
-    Q3 -->|finger hop| P["p = owner(c)"]
-    P -. bytes .-> Q3
-    Q3 -. bytes .-> Q2
-    Q2 -. bytes .-> Q1
-    Q1 -. bytes .-> C
+sequenceDiagram
+    participant C as client
+    participant Q1 as q1
+    participant Q2 as q2
+    participant Q3 as q3
+    participant P as p (owner)
+    C->>Q1: lookup(c)
+    Q1->>Q2: forward (finger hop)
+    Q2->>Q3: forward (finger hop)
+    Q3->>P: forward (finger hop)
+    Note over P: cold-fetch from backend
+    P-->>Q3: bytes(c)
+    Q3-->>Q2: bytes(c)
+    Q2-->>Q1: bytes(c)
+    Q1-->>C: bytes(c)
+    Note over Q1,Q3: each transit hop feeds SIEVE
 ```
 
-Solid arrows are the lookup; dashed arrows are the chunk bytes returning along
-the same path. Every transit node observes `c` and feeds it into its SIEVE.
+Time runs top-to-bottom. The lookup descends the finger path with hops that
+halve the remaining ring distance, so depth is `O(log n)`. Bytes retrace the
+path on the way back; each transit node observes `c` exactly once and updates
+its SIEVE.
 
 ## Eligibility
 
@@ -133,15 +142,23 @@ to chunk-width distribution.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Transit: first seen in flow
-    Transit --> Transit: re-reference sets visited bit
-    Transit --> Replica: eligible AND s_hit ≥ τ_promote AND wins tiebreak
-    Replica --> Transit: s_miss ≥ τ_evict (demote, delete)
-    Transit --> [*]: s_miss ≥ τ_evict (drop from queue)
+    direction LR
+    [*] --> Observed: first seen in transit
+    Observed --> Replica: promote
+    Replica --> Observed: demote
+    Observed --> [*]: forget
 ```
 
-Per-chunk lifecycle on a single node. Most chunks live and die in `Transit`;
-only sustained hits on an eligible node cross into `Replica`.
+Per-chunk lifecycle on a single node.
+
+- **promote:** `s_hit ≥ τ_promote` ∧ node is eligible ∧ wins fault-domain tiebreak.
+- **demote:** `s_miss ≥ τ_evict` while serving; chunk stays in the SIEVE queue but is no longer served.
+- **forget:** `s_miss ≥ τ_evict` while merely observed; chunk drops out of the queue.
+
+The SIEVE visited-bit churn (set on re-reference, cleared by the hand) is
+queue bookkeeping, not a state transition; it is what drives `s_hit` and
+`s_miss`. Most chunks live and die in `Observed`; only sustained hits on an
+eligible node cross into `Replica`.
 
 ## Recursive Structure
 
@@ -153,30 +170,33 @@ saturation.
 
 ```mermaid
 flowchart TD
-    P["owner p<br/>(level 0)"]
-    R1["replica<br/>(level 1)"]
-    R2["replica<br/>(level 1)"]
-    R1a["replica<br/>(level 2)"]
-    R1b["replica<br/>(level 2)"]
-    R2a["replica<br/>(level 2)"]
-    R2b["replica<br/>(level 2)"]
-    P --> R1
-    P --> R2
-    R1 --> R1a
-    R1 --> R1b
-    R2 --> R2a
-    R2 --> R2b
-    L1[leaf reader]:::leaf --> R1a
-    L2[leaf reader]:::leaf --> R1b
-    L3[leaf reader]:::leaf --> R2a
-    L4[leaf reader]:::leaf --> R2b
-    classDef leaf fill:#eef,stroke:#88a;
+    P["p (owner)<br/>level 0"]
+    A["replica<br/>level 1"]
+    B["replica<br/>level 1"]
+    AA["replica<br/>level 2"]
+    AB["replica<br/>level 2"]
+    BA["replica<br/>level 2"]
+    BB["replica<br/>level 2"]
+    P --- A
+    P --- B
+    A --- AA
+    A --- AB
+    B --- BA
+    B --- BB
+
+    Cold["cold reader"]:::r -. "log₂ n hops" .-> P
+    Warm["warmer reader"]:::r -. "log₂ n - 1" .-> B
+    Hot["hottest reader"]:::r -. "log₂ n - 2" .-> AA
+
+    classDef r fill:#eef,stroke:#88a;
 ```
 
-As more predecessor levels promote, the replica set forms a tree rooted at
-the owner. Cold-read clients hit a level-`r` replica in `log₂ n - r` hops;
-synchronised reads (e.g. image pull at job start) traverse the same tree as
-a multicast with average fan-out 2.
+Edges are undirected: the tree records the replica hierarchy, not data flow.
+A reader's lookup terminates at the first replica it crosses, so attaching
+at level `r` saves `r` hops. Read this same picture in the other direction
+for synchronised reads (e.g. an image pull at job start): bytes propagate
+out from `p` along the tree as a multicast, with average fan-out 2 across
+`log₂ n` levels.
 
 ## Physical Clustering and Multicast
 
