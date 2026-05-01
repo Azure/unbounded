@@ -22,7 +22,7 @@ func init() {
 // MachineOperation represents a discrete operation to be performed on a
 // Machine. MachineOperations are created by CLI commands or controllers and
 // processed by the appropriate agent. The in-VM agent handles operations
-// like MachineReboot, while cloud or PXE controllers handle operations like
+// like NodeReboot, while cloud or PXE controllers handle operations like
 // HostReboot, HostPowerOff, and HostPowerOn.
 type MachineOperation struct {
 	metav1.TypeMeta   `json:",inline"`
@@ -44,15 +44,15 @@ type MachineOperationList struct {
 // OperationKind identifies the kind of operation to perform. Predefined
 // operations cover common lifecycle actions; custom operations may be
 // supported by individual cloud controllers.
-// +kubebuilder:validation:Enum=MachineReboot;HostReboot;HostPowerOff;HostPowerOn
+// +kubebuilder:validation:Enum=NodeReboot;HostReboot;HostPowerOff;HostPowerOn
 type OperationKind string
 
 const (
-	// OperationMachineReboot restarts the nspawn machine in place without
+	// OperationNodeReboot restarts the nspawn-backed node in place without
 	// reprovisioning the rootfs. Services are stopped, the nspawn container
 	// is restarted, and services are brought back up. Handled by the
 	// in-VM agent.
-	OperationMachineReboot OperationKind = "MachineReboot"
+	OperationNodeReboot OperationKind = "NodeReboot"
 
 	// OperationHostReboot triggers a full hardware power cycle of the host
 	// via BMC (e.g. Redfish). Handled by the machina controller or cloud

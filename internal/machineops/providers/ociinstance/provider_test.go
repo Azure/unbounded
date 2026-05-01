@@ -110,7 +110,7 @@ func TestNewDefaultComputeClientValidatesAuth(t *testing.T) {
 func TestActionForOperation(t *testing.T) {
 	t.Parallel()
 
-	_, err := actionForOperation(unboundedv1alpha3.OperationMachineReboot)
+	_, err := actionForOperation(unboundedv1alpha3.OperationNodeReboot)
 	require.Error(t, err)
 }
 

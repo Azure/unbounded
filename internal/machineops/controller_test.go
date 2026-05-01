@@ -79,7 +79,7 @@ func TestMachineOperationReconciler_UnsupportedOperationIsIgnored(t *testing.T) 
 
 	s := newOperationTestScheme(t)
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
-	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationMachineReboot)
+	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationNodeReboot)
 	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReboot: true}}
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op).WithStatusSubresource(op).Build()

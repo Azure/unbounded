@@ -38,7 +38,7 @@ spec:
           MachineOperation represents a discrete operation to be performed on a
           Machine. MachineOperations are created by CLI commands or controllers and
           processed by the appropriate agent. The in-VM agent handles operations
-          like MachineReboot, while cloud or PXE controllers handle operations like
+          like NodeReboot, while cloud or PXE controllers handle operations like
           HostReboot, HostPowerOff, and HostPowerOn.
         properties:
           apiVersion:
@@ -120,7 +120,7 @@ spec:
                 description: OperationKind is the operation to perform on the target
                   machine.
                 enum:
-                - MachineReboot
+                - NodeReboot
                 - HostReboot
                 - HostPowerOff
                 - HostPowerOn
