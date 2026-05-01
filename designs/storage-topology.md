@@ -4,35 +4,56 @@ Beehive variant on a Chord-style ring for unbounded-storage-p2p.
 
 ## TL;DR
 
-Nodes are arranged on a Chord-style hash ring. Membership comes from
-Kubernetes, so every node independently computes the same ring with no
-gossip or coordinator. Blobs are split into fixed-width chunks where the
-width is a pure function of the blob's length, so any client can address
-any chunk without a manifest. Each chunk has exactly one **owner** (the
-next node clockwise from its hash) and only the owner is allowed to fetch
-it from the backing store; everyone else either has a replica or forwards
-the request along the ring.
+**Membership**
 
-Reads route across `O(log n)` hops, but routing is recursive *at the byte
-level*: NVMe-oF bytes physically flow through each hop, so every transit
-node sees the chunks crossing it. Each node runs a SIEVE queue over all
-chunks it observes in transit, and when a chunk stays hot for several
-sweeps the node promotes itself to a replica (gated by node-id arithmetic
-that determines who is "eligible" at each ring level, plus a fault-domain
-tiebreak so exactly one node per domain promotes). Demotion is the
-symmetric rule on consecutive misses.
+- Nodes hash onto a ring. Each node links to peers at exponentially
+  spaced offsets ahead of itself, so any address is reachable in
+  `O(log n)` hops. Membership comes from Kubernetes, so every node
+  computes the same ring; no gossip, no coordinator.
+- Blobs are split into fixed-width chunks. Width is a pure function of
+  blob length, so any client can compute chunk boundaries without a
+  per-blob manifest.
+- Each chunk has exactly one **owner**: the next node clockwise from
+  `hash(blob_id, chunk_index)`. Only the owner may cold-fetch from the
+  backing store.
 
-The result is Beehive-style adaptive replication that emerges from local
-decisions: hot chunks accumulate replicas closer and closer to their
-readers, collapsing lookups from `O(log n)` toward `O(1)`, and synchronised
-reads (e.g. 1000 nodes pulling the same image) self-organise into a
-multicast tree with average fan-out 2. Failures need no migration -
-existing replicas keep serving until SIEVE drains them, and the new owner
-cold-fetches on the first miss.
+**Read path**
 
-## Ring and Fingers
+```
+client --> neighbor hop --> neighbor hop --> ... --> owner --> backend
+              |              |                     |
+            SIEVE          SIEVE                 SIEVE      (every transit
+                                                             node observes c)
+```
 
-Nodes hash onto a ring of size `2^m`. Each node `q` has `m` finger slots at
+- Lookup descends the neighbor table in `O(log n)` hops.
+- NVMe-oF bytes physically flow back along the same path; each transit
+  node sees every chunk crossing it and feeds its local cache.
+
+**Adaptive replication**
+
+- Each transit node tracks the chunks it observes in a SIEVE queue.
+- A chunk hot for a configurable number of sweeps causes the node to cache the value if the node is arc-eligible.
+- **Arc-eligibility** hedges between locality and spread: the owner's
+  `O(log n)` predecessor bands at exponentially increasing distances let
+  replicas cluster along hot read paths while guaranteeing copies at
+  multiple scales around the ring. Each band promotes only when its
+  readers are active, so demand picks where copies appear while the
+  geometry handles the spacing without coordination.
+- After a tunable number of cold sweeps the node evicts the chunk and eventually forgets it.
+
+**Emergent properties**
+
+- Hot chunks accumulate replicas closer to their readers; lookups collapse
+  from `O(log n)` toward `O(1)` as replica levels grow.
+- Synchronised reads (e.g. 1000 nodes pulling the same image) self-organise
+  into a multicast tree with average fan-out 2 over `log2 n` levels.
+- No migration on membership change: surviving replicas keep serving until
+  SIEVE drains them; the new owner cold-fetches only on the first miss.
+
+## Ring and Neighbors
+
+Nodes hash onto a ring of size `2^m`. Each node `q` has `m` neighbor slots at
 offsets `2^0..2^(m-1)`; with `n` nodes only the top `~log₂ n` slots resolve
 to distinct peers, giving out-degree `O(log n)`. Membership comes from
 Kubernetes, so every node computes the same ring.
@@ -67,38 +88,19 @@ path, each hop forwarding to the next, so every transit node sees the chunks
 crossing it. Cold-read latency is `O(log n)` hops; popular chunks shed hops
 as replicas grow.
 
-```mermaid
-sequenceDiagram
-    participant C as client
-    participant Q1 as q1
-    participant Q2 as q2
-    participant Q3 as q3
-    participant P as p (owner)
-    C->>Q1: lookup(c)
-    Q1->>Q2: forward (finger hop)
-    Q2->>Q3: forward (finger hop)
-    Q3->>P: forward (finger hop)
-    Note over P: cold-fetch from backend
-    P-->>Q3: bytes(c)
-    Q3-->>Q2: bytes(c)
-    Q2-->>Q1: bytes(c)
-    Q1-->>C: bytes(c)
-    Note over Q1,Q3: each transit hop feeds SIEVE
-```
-
-Time runs top-to-bottom. The lookup descends the finger path with hops that
+Time runs top-to-bottom. The lookup descends the neighbor path with hops that
 halve the remaining ring distance, so depth is `O(log n)`. Bytes retrace the
 path on the way back; each transit node observes `c` exactly once and updates
 its SIEVE.
 
 ## Eligibility
 
-The `i`-th **predecessor-finger arc** of `p` is `(p - 2^(i+1), p - 2^i]`.
+The `i`-th **predecessor-neighbor arc** of `p` is `(p - 2^(i+1), p - 2^i]`.
 Node `q` is eligible at level `i` iff `q` lies in that arc, equivalently iff
 `p` lies in `q`'s forward arc `[q + 2^i, q + 2^(i+1))`; this is a pure
 function of the two ids.
 
-Eligibility is a superset of "p is q's actual finger entry" (`successor(q +
+Eligibility is a superset of "p is q's actual neighbor entry" (`successor(q +
 2^i)` under strict Chord, q's topology pick under PNS); they coincide only
 when the arc holds at most one node (`2^i ≲ 2^m / n`). The slack is
 harmless: SIEVE gating below ensures arc-eligible nodes off every lookup
@@ -140,15 +142,6 @@ with `sweep_rate` in bytes/sec, so `τ` is interpretable directly as
 "hot/cold across this many full working-set traversals" without reference
 to chunk-width distribution.
 
-```mermaid
-stateDiagram-v2
-    direction LR
-    [*] --> Observed: first seen in transit
-    Observed --> Replica: promote
-    Replica --> Observed: demote
-    Observed --> [*]: forget
-```
-
 Per-chunk lifecycle on a single node.
 
 - **promote:** `s_hit ≥ τ_promote` ∧ node is eligible ∧ wins fault-domain tiebreak.
@@ -163,33 +156,10 @@ eligible node cross into `Replica`.
 ## Recursive Structure
 
 Once `q` serves `c`, lookups that previously terminated at `p` now
-terminate at `q`, and `q`'s own predecessor-fingers see transit for `c` and
+terminate at `q`, and `q`'s own predecessor-neighbors see transit for `c` and
 may promote in turn. Levels emerge with no explicit tracking. With `r`
 levels, expected lookup length is `log₂ n - r`, reaching `O(1)` at
 saturation.
-
-```mermaid
-flowchart TD
-    P["p (owner)<br/>level 0"]
-    A["replica<br/>level 1"]
-    B["replica<br/>level 1"]
-    AA["replica<br/>level 2"]
-    AB["replica<br/>level 2"]
-    BA["replica<br/>level 2"]
-    BB["replica<br/>level 2"]
-    P --- A
-    P --- B
-    A --- AA
-    A --- AB
-    B --- BA
-    B --- BB
-
-    Cold["cold reader"]:::r -. "log₂ n hops" .-> P
-    Warm["warmer reader"]:::r -. "log₂ n - 1" .-> B
-    Hot["hottest reader"]:::r -. "log₂ n - 2" .-> AA
-
-    classDef r fill:#eef,stroke:#88a;
-```
 
 Edges are undirected: the tree records the replica hierarchy, not data flow.
 A reader's lookup terminates at the first replica it crosses, so attaching
@@ -213,7 +183,7 @@ levels has *average* fan-out `n^(1/log₂ n) = 2`, bounding per-replica
 bandwidth as the cluster scales.
 
 This is an average, not a per-node bound: a replica has up to `log₂ n`
-predecessor-finger arcs and under skewed demand may fan out to more
+predecessor-neighbor arcs and under skewed demand may fan out to more
 children, with bandwidth tracking local fan-out.
 
 ## Failure and Liveness
