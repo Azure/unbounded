@@ -27,11 +27,10 @@ func TestMachineOperationReconciler_CompletesSupportedOperation(t *testing.T) {
 	s := newOperationTestScheme(t)
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
 	machine.Generation = 3
-	configuration := newMachineConfiguration("config-1", unboundedv1alpha3.ExternalProviderAzureVM)
 	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReboot)
 	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReboot: true}}
 
-	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, configuration, op).WithStatusSubresource(op).Build()
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op).WithStatusSubresource(op).Build()
 	reconciler := &MachineOperationReconciler{Client: c, Providers: []Provider{provider}, Now: fixedOperationNow}
 
 	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ignored", Name: "op-1"}})
@@ -56,13 +55,12 @@ func TestMachineOperationReconciler_DoesNotReexecuteInProgressOperation(t *testi
 
 	s := newOperationTestScheme(t)
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
-	configuration := newMachineConfiguration("config-1", unboundedv1alpha3.ExternalProviderAzureVM)
 	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReboot)
 	op.Status.Phase = unboundedv1alpha3.OperationPhaseInProgress
 	op.Status.StartedAt = ptrTo(fixedOperationNow())
 	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReboot: true}}
 
-	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, configuration, op).WithStatusSubresource(op).Build()
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op).WithStatusSubresource(op).Build()
 	reconciler := &MachineOperationReconciler{Client: c, Providers: []Provider{provider}, Now: fixedOperationNow}
 
 	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "op-1"}})
@@ -81,11 +79,10 @@ func TestMachineOperationReconciler_UnsupportedOperationIsIgnored(t *testing.T) 
 
 	s := newOperationTestScheme(t)
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
-	configuration := newMachineConfiguration("config-1", unboundedv1alpha3.ExternalProviderAzureVM)
 	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationMachineReboot)
 	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReboot: true}}
 
-	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, configuration, op).WithStatusSubresource(op).Build()
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op).WithStatusSubresource(op).Build()
 	reconciler := &MachineOperationReconciler{Client: c, Providers: []Provider{provider}, Now: fixedOperationNow}
 
 	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "op-1"}})
@@ -259,21 +256,8 @@ func newExternalMachine(name, provider string) *unboundedv1alpha3.Machine {
 	return &unboundedv1alpha3.Machine{
 		ObjectMeta: metav1ObjectMeta(name),
 		Spec: unboundedv1alpha3.MachineSpec{
+			Provider:   provider,
 			ProviderID: "azure:///subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/" + name,
-			ConfigurationRef: &unboundedv1alpha3.MachineConfigurationRef{
-				Name: "config-1",
-			},
-		},
-	}
-}
-
-func newMachineConfiguration(name, provider string) *unboundedv1alpha3.MachineConfiguration {
-	return &unboundedv1alpha3.MachineConfiguration{
-		ObjectMeta: metav1ObjectMeta(name),
-		Spec: unboundedv1alpha3.MachineConfigurationSpec{
-			Template: unboundedv1alpha3.MachineConfigurationTemplate{
-				External: &unboundedv1alpha3.MachineConfigurationExternal{Provider: provider},
-			},
 		},
 	}
 }

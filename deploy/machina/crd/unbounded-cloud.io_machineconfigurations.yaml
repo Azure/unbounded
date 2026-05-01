@@ -147,22 +147,6 @@ spec:
                     required:
                     - image
                     type: object
-                  external:
-                    description: |-
-                      External contains provider configuration used by controllers that operate
-                      on machines from outside the host OS.
-                    properties:
-                      provider:
-                        description: |-
-                          Provider identifies the external control provider for machines using this
-                          configuration.
-                        enum:
-                        - AzureVM
-                        - OCIInstance
-                        type: string
-                    required:
-                    - provider
-                    type: object
                   kubernetes:
                     description: |-
                       Kubernetes contains Kubernetes-specific configuration such as

@@ -89,19 +89,14 @@ Kubernetes join configuration.
 | `operations.rebootCounter` | int64 | No | `0` | Triggers a reboot when the spec value exceeds the status value. |
 | `operations.repaveCounter` | int64 | No | `0` | Triggers a PXE repave when the spec value exceeds the status value. |
 
-### spec.providerID
+### spec.provider and spec.providerID
 
-`providerID` identifies the underlying infrastructure resource for out-of-band operations. The value follows the Kubernetes Node provider ID convention.
+`provider` selects the external control provider for out-of-band operations. `providerID` identifies the underlying infrastructure resource and follows the Kubernetes Node provider ID convention.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
+| `provider` | string | For external operations | -- | External control provider. Supported values: `AzureVM`, `OCIInstance`. |
 | `providerID` | string | For external operations | -- | Provider-specific resource ID such as `azure:///subscriptions/.../virtualMachines/name` or `oci://ocid1.instance...`. |
-
-The MachineConfiguration referenced by `spec.configurationRef` selects which external provider handles this ID:
-
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| `template.external.provider` | string | For external operations | -- | External control provider. Supported values: `AzureVM`, `OCIInstance`. |
 
 Azure VM operations use `DefaultAzureCredential`, so the `machine-ops-controller` deployment can authenticate with workload identity, managed identity, or environment-based Azure credentials.
 OCI operations use an OCI SDK config file mounted into the `machine-ops-controller` deployment.
@@ -252,20 +247,10 @@ kind: Machine
 metadata:
   name: azure-worker-01
 spec:
+  provider: AzureVM
   providerID: azure:///subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-workers/providers/Microsoft.Compute/virtualMachines/azure-worker-01
   configurationRef:
     name: azure-workers
-```
-
-```yaml
-apiVersion: unbounded-cloud.io/v1alpha3
-kind: MachineConfiguration
-metadata:
-  name: azure-workers
-spec:
-  template:
-    external:
-      provider: AzureVM
 ```
 
 ```yaml
@@ -287,20 +272,10 @@ kind: Machine
 metadata:
   name: oci-worker-01
 spec:
+  provider: OCIInstance
   providerID: oci://ocid1.instance.oc1...
   configurationRef:
     name: oci-workers
-```
-
-```yaml
-apiVersion: unbounded-cloud.io/v1alpha3
-kind: MachineConfiguration
-metadata:
-  name: oci-workers
-spec:
-  template:
-    external:
-      provider: OCIInstance
 ```
 
 ```yaml

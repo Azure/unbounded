@@ -54,7 +54,6 @@ type MachineOperationReconciler struct {
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machineoperations/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machineoperations/finalizers,verbs=update
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machines,verbs=get;list;watch
-// +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machineconfigurations,verbs=get;list;watch
 
 func (r *MachineOperationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -87,10 +86,7 @@ func (r *MachineOperationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, fmt.Errorf("get Machine %s: %w", op.Spec.MachineRef, err)
 	}
 
-	providerID, provider, ok, err := r.providerFor(ctx, &machine, op.Spec.OperationKind)
-	if err != nil {
-		return r.failOperation(ctx, &op, "ConfigurationInvalid", err.Error())
-	}
+	providerID, provider, ok := r.providerFor(&machine, op.Spec.OperationKind)
 	if !ok {
 		logger.V(1).Info("operation not handled by external power controller",
 			"operation", op.Name,
@@ -161,34 +157,18 @@ func shouldReconcileOperation(op *unboundedv1alpha3.MachineOperation) bool {
 	return op.Spec.TTLSecondsAfterFinished != nil && op.Status.CompletedAt != nil
 }
 
-func (r *MachineOperationReconciler) providerFor(ctx context.Context, machine *unboundedv1alpha3.Machine, operation unboundedv1alpha3.OperationKind) (string, Provider, bool, error) {
-	if machine.Spec.ProviderID == "" {
-		return "", nil, false, nil
-	}
-	if machine.Spec.ConfigurationRef == nil || machine.Spec.ConfigurationRef.Name == "" {
-		return "", nil, false, fmt.Errorf("machine %s has no configurationRef", machine.Name)
-	}
-
-	var configuration unboundedv1alpha3.MachineConfiguration
-	if err := r.Get(ctx, client.ObjectKey{Name: machine.Spec.ConfigurationRef.Name}, &configuration); err != nil {
-		if apierrors.IsNotFound(err) {
-			return "", nil, false, fmt.Errorf("machineConfiguration %s not found", machine.Spec.ConfigurationRef.Name)
-		}
-
-		return "", nil, false, fmt.Errorf("get MachineConfiguration %s: %w", machine.Spec.ConfigurationRef.Name, err)
-	}
-
-	if configuration.Spec.Template.External == nil || configuration.Spec.Template.External.Provider == "" {
-		return "", nil, false, nil
+func (r *MachineOperationReconciler) providerFor(machine *unboundedv1alpha3.Machine, operation unboundedv1alpha3.OperationKind) (string, Provider, bool) {
+	if machine.Spec.Provider == "" || machine.Spec.ProviderID == "" {
+		return "", nil, false
 	}
 
 	for _, provider := range r.Providers {
-		if provider.Name() == configuration.Spec.Template.External.Provider && provider.Supports(operation) {
-			return machine.Spec.ProviderID, provider, true, nil
+		if provider.Name() == machine.Spec.Provider && provider.Supports(operation) {
+			return machine.Spec.ProviderID, provider, true
 		}
 	}
 
-	return "", nil, false, nil
+	return "", nil, false
 }
 
 func (r *MachineOperationReconciler) reconcileTerminal(ctx context.Context, op *unboundedv1alpha3.MachineOperation) (ctrl.Result, error) {

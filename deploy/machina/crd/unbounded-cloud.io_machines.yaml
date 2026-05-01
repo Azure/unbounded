@@ -305,6 +305,13 @@ spec:
                     format: int64
                     type: integer
                 type: object
+              provider:
+                description: Provider identifies the external control provider for
+                  this machine.
+                enum:
+                - AzureVM
+                - OCIInstance
+                type: string
               providerID:
                 description: |-
                   ProviderID identifies the underlying infrastructure resource for this
