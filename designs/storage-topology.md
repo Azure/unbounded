@@ -1,6 +1,6 @@
 # P2P Storage Protocol
 
-Beehive variant on a Chord-style ring for unbounded-storage-p2p.
+Adaptive replication over a structured ring for unbounded-storage-p2p.
 
 ## TL;DR
 
@@ -19,15 +19,8 @@ Beehive variant on a Chord-style ring for unbounded-storage-p2p.
 
 **Read path**
 
-```
-client --> neighbor hop --> neighbor hop --> ... --> owner --> backend
-              |              |                     |
-            SIEVE          SIEVE                 SIEVE      (every transit
-                                                             node observes c)
-```
-
 - Lookup descends the neighbor table in `O(log n)` hops.
-- NVMe-oF bytes physically flow back along the same path; each transit
+- Bytes physically flow back along the same path; each transit
   node sees every chunk crossing it and feeds its local cache.
 
 **Adaptive replication**
@@ -60,7 +53,7 @@ Kubernetes, so every node computes the same ring.
 
 **Proximity Neighbor Selection (PNS):** for slot `i`, `q` picks any peer in
 the arc `[q + 2^i, q + 2^(i+1))`, preferring topologically near peers (rack,
-PCIe complex, interconnect). The arc preserves Chord's distance-halving
+PCIe complex, interconnect). The arc preserves the distance-halving
 invariant, so `O(log n)` hops still hold.
 
 ## Chunk Placement
@@ -83,7 +76,7 @@ bucketing absorbs minor length-reporting jitter.
 
 ## Transport
 
-Routing is recursive at the byte level: NVMe-oF bytes flow along the lookup
+Routing is recursive at the byte level: bytes flow along the lookup
 path, each hop forwarding to the next, so every transit node sees the chunks
 crossing it. Cold-read latency is `O(log n)` hops; popular chunks shed hops
 as replicas grow.
@@ -101,7 +94,7 @@ Node `q` is eligible at level `i` iff `q` lies in that arc, equivalently iff
 function of the two ids.
 
 Eligibility is a superset of "p is q's actual neighbor entry" (`successor(q +
-2^i)` under strict Chord, q's topology pick under PNS); they coincide only
+2^i)` under strict successor selection, q's topology pick under PNS); they coincide only
 when the arc holds at most one node (`2^i ≲ 2^m / n`). The slack is
 harmless: SIEVE gating below ensures arc-eligible nodes off every lookup
 path never accumulate hits and never promote.
@@ -196,6 +189,6 @@ children, with bandwidth tracking local fan-out.
 - **Membership change.** Chunks are not migrated. Existing replicas serve
   until SIEVE drains them; the new owner cold-fetches only on a miss. Hot
   chunks regrow the tree under the new geometry.
-- **In-flight transactions.** A hop failure surfaces as an NVMe-oF
-  transport error. The client retries; partial bytes are discarded by the
+- **In-flight transactions.** A hop failure surfaces as a transport
+  error. The client retries; partial bytes are discarded by the
   reader's content-hash check.
