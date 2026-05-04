@@ -144,6 +144,13 @@ The lookup descends the neighbor path with hops that halve the remaining
 ring distance, so depth is `O(log n)`. Bytes retrace the path back; each
 transit node observes chunk `c` exactly once and updates its SIEVE.
 
+A cold read therefore puts the chunk's bytes on `O(log n)` fabric links
+instead of one. This is intentional: origin egress is the scarce, slow
+resource the design protects (one cold fetch per chunk regardless of
+reader count), and internal fabric is provisioned for the fan-out.
+Repeated reads of hot chunks amortize the amplification away as the
+replica tree forms; cold unique blobs pay the amplification once.
+
 ```mermaid
 sequenceDiagram
     autonumber
@@ -209,7 +216,11 @@ encountered serves the bytes.
 Each node maintains a SIEVE queue over **all transit chunks**, not just
 owned or cached ones. The queue is byte-weighted: a chunk of width `w`
 contributes `w` bytes, the hand advances at a configured bytes/sec rate,
-and a sweep is one full pass over `bytes(queue)`. Each chunk is examined
+and a sweep is one full pass over `bytes(queue)`. The forget rule below
+(`s_miss ≥ τ_evict` for unserved chunks) bounds the queue to the working
+set referenced within a `τ_evict`-sweep window; `sweep_rate` is
+provisioned against expected transit rate so this stays inside a fixed
+per-node metadata budget independent of cluster size. Each chunk is examined
 once per sweep regardless of width, so visit cadence is uniform across
 chunk sizes. Two derived counters drive transitions:
 
@@ -336,15 +347,30 @@ fault-domain tiebreak, and `μ` are unchanged. The hint shortens the
 runway to `τ_promote_local`, nothing else.
 
 **Composition along the path.** A forwarding node may rewrite the
-header with its own observed rate before passing it on. Once early
-replicas exist, downstream receivers see heat from the nearest
-authoritative point on their path, which is the relevant signal for
-the next wave of readers attaching to that subtree.
+header with its own observed rate before passing it on, substituting
+its value rather than adding to the upstream one. Once early replicas
+exist, downstream receivers see heat from the nearest authoritative
+point on their path, which is the relevant signal for the next wave of
+readers attaching to that subtree.
+
+**Wave-one dynamics.** Under a synchronized burst the owner's EWMA
+spikes from queued requests before it serves any of them, so the very
+first response already carries a high stamp. Under nominal pressure
+(`μ = 1`) that single stamp can carry up to `τ_promote` of credit,
+enough to promote an eligible level-1 predecessor on its first observed
+response. That predecessor then intercepts the rest of the wave and
+stamps its own rate onto further responses, recursively promoting
+deeper predecessors. Tree formation is therefore bounded by hop RTT,
+not by accumulating `τ_promote` sweeps of organic transit. Under
+admission pressure (`μ > 1`) more responses are required per level,
+which is the intended back-pressure.
 
 **Bounds.** Per-response credit is capped at `τ_promote`, so no single
 hint can promote on its own; the chunk still needs to be eligible and
-to win the tiebreak. `τ_evict` is untouched, so a chunk admitted on a
-hint that turns out to be cold drains on the normal schedule. The
+to win the tiebreak. The cap applies per stamp, not cumulatively:
+`s_hit` is a threshold counter, so additional credit past
+`τ_promote_local` is inert. `τ_evict` is untouched, so a chunk admitted
+on a hint that turns out to be cold drains on the normal schedule. The
 asymmetry is intentional: cheap to admit, slow to evict.
 
 **Why not just lower `τ_promote`.** That would admit the warm long
