@@ -85,19 +85,6 @@ in the arc `[q + 2^i, q + 2^(i+1))`, preferring topologically near peers
 (rack, PCIe complex, interconnect). The arc keeps the distance-halving
 property, so `O(log n)` hops still hold.
 
-```mermaid
-flowchart LR
-    q(("node q"))
-    q -->|"slot 0"| n0(("peer in<br/>[q+1, q+2)"))
-    q -->|"slot 1"| n1(("peer in<br/>[q+2, q+4)"))
-    q -->|"slot 2"| n2(("peer in<br/>[q+4, q+8)"))
-    q -->|"slot i"| ni(("peer in<br/>[q+2^i, q+2^(i+1))"))
-    q -->|"slot m-1"| nm(("peer in<br/>[q+2^(m-1), q)"))
-
-    classDef arc fill:#eef,stroke:#446
-    class n0,n1,n2,ni,nm arc
-```
-
 Each slot's arc doubles in width. PNS picks the topologically nearest
 peer inside the arc; the arc width guarantees the next hop still halves
 the remaining ring distance.
@@ -118,19 +105,6 @@ clockwise from that hash; only the owner may cold-fetch from the backend.
 mutable config breaks the no-coordination property. Power-of-two
 bucketing absorbs minor length-reporting jitter.
 
-```mermaid
-flowchart LR
-    Blob["blob<br/>length L"] --> W["width(L) =<br/>clamp(round_pow2(L/TARGET_CHUNKS),<br/>MIN_WIDTH, MAX_WIDTH)"]
-    W --> Stripe["chunk_0 | chunk_1 | ... | chunk_k"]
-    Stripe --> H["chunk_id =<br/>hash(blob_id, i)"]
-    H --> Ring(("ring position"))
-    Ring --> Owner(("owner =<br/>next node clockwise"))
-    Owner --> Cold[("cold fetch from<br/>backing store")]
-
-    classDef pure fill:#efe,stroke:#363
-    class W,H pure
-```
-
 The green nodes are pure functions of public inputs: any client computes
 them without coordination. Only the owner is allowed to cold-fetch.
 
@@ -150,24 +124,6 @@ resource the design protects (one cold fetch per chunk regardless of
 reader count), and internal fabric is provisioned for the fan-out.
 Repeated reads of hot chunks amortize the amplification away as the
 replica tree forms; cold unique blobs pay the amplification once.
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant C as client q0
-    participant T1 as transit q1
-    participant T2 as transit q2
-    participant P as owner p
-    C->>T1: lookup(c), distance d
-    T1->>T2: forward, distance d/2
-    T2->>P: forward, distance d/4
-    P-->>T2: bytes(c) + heat hint
-    Note over T2: SIEVE: observe c
-    T2-->>T1: bytes(c)
-    Note over T1: SIEVE: observe c
-    T1-->>C: bytes(c)
-    Note over C: SIEVE: observe c
-```
 
 Caching is a side-effect of routing: every transit node sees `c` once
 per pass, so any of them can later short-circuit the lookup if it
@@ -192,20 +148,6 @@ every lookup path never accumulate hits, so they never promote.
 **Shortcut property:** any lookup terminating at `p` crosses
 arc-eligible nodes in order on its way. The first one holding a replica
 answers, short-circuiting the lookup.
-
-```mermaid
-flowchart LR
-    A3["arc i=3<br/>(p-16, p-8]"] --> A2["arc i=2<br/>(p-8, p-4]"]
-    A2 --> A1["arc i=1<br/>(p-4, p-2]"]
-    A1 --> A0["arc i=0<br/>(p-2, p-1]"]
-    A0 --> P(("owner p"))
-
-    R["reader far<br/>from p"] -.->|"lookup<br/>halves distance"| A3
-    A2 -.->|"replica here<br/>terminates lookup"| Hit{{"short-circuit"}}
-
-    classDef arc fill:#fee,stroke:#633
-    class A0,A1,A2,A3 arc
-```
 
 Eligible nodes form a nested sequence of arcs behind `p`. A lookup
 crosses them from outer (high `i`) to inner (low `i`); the first replica
@@ -263,17 +205,6 @@ queue bookkeeping that drives `s_hit` and `s_miss`, not a state
 transition. Most chunks live and die in `Observed`; only sustained hits
 on an eligible node cross into `Replica`.
 
-```mermaid
-stateDiagram-v2
-    [*] --> Observed: first transit
-    Observed --> Observed: visited bit churn<br/>(s_hit, s_miss update)
-    Observed --> Replica: s_hit ≥ τ_promote<br/>∧ eligible<br/>∧ wins fault-domain tiebreak
-    Replica --> Demoted: s_miss ≥ τ_evict
-    Demoted --> Observed: re-reference
-    Observed --> [*]: forget<br/>(s_miss ≥ τ_evict)
-    Demoted --> [*]: forget
-```
-
 Promotion needs all three gates; demotion and forgetting are decided by
 `s_miss` alone. Thresholds count sweeps, so they read as "hot/cold
 across this many full working-set traversals" regardless of chunk width.
@@ -300,22 +231,6 @@ until it goes cold on its own.
 Computation is local. No coordination, no shared state, no integrator
 to wind up across membership changes. Under steady demand `μ = 1` and
 the rule reduces to the original `τ_promote`.
-
-```mermaid
-flowchart LR
-    Evict["bytes evicted /<br/>unit time"] --> Norm["normalise by<br/>cache size"]
-    Norm --> Churn["cache-byte-churn"]
-    Churn --> Map{{"piecewise linear<br/>map with deadband"}}
-    Map --> Mu["μ ∈ [1, μ_max]"]
-    Mu --> Local["τ_promote_local =<br/>τ_promote · μ"]
-    Local --> Gate{{"admission gate"}}
-    Evict_thr["τ_evict<br/>(unchanged)"] --> Gate
-
-    classDef quiet fill:#efe,stroke:#363
-    classDef hot fill:#fee,stroke:#633
-    class Mu hot
-    class Evict_thr quiet
-```
 
 `μ` only gates admission. Eviction stays on its original schedule, so
 pressure spikes can not flush a working set that is still being served.
@@ -381,21 +296,6 @@ Under steady demand heat values are near zero and this section reduces
 to plain SIEVE. It only matters during bursts, which is when fan-out
 matters.
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant P as owner p<br/>(EWMA serves)
-    participant T1 as transit q1
-    participant T2 as transit q2
-    participant R as reader
-    P-->>T1: bytes(c) + heat=H
-    Note over T1: s_hit(c) += H<br/>(capped at τ_promote)
-    Note over T1: optionally rewrite<br/>heat with own EWMA
-    T1-->>T2: bytes(c) + heat=H'
-    Note over T2: s_hit(c) += H'
-    T2-->>R: bytes(c) + heat
-```
-
 Each server stamps its own EWMA on outgoing bytes. Transit nodes fold
 that into `s_hit` to shorten the runway to `τ_promote_local`.
 Eligibility, the tiebreak, and `μ` are unchanged, so a hint can not
@@ -415,26 +315,6 @@ attaching at level `r` saves `r` hops. The same picture read in reverse
 describes synchronised reads (e.g. an image pull at job start): bytes
 propagate from `p` along the tree as a multicast, with average fan-out
 2 across `log2 n` levels.
-
-```mermaid
-flowchart TD
-    P((owner p))
-    P --- L1a((replica<br/>level 1))
-    P --- L1b((replica<br/>level 1))
-    L1a --- L2a((replica<br/>level 2))
-    L1a --- L2b((replica<br/>level 2))
-    L1b --- L2c((replica<br/>level 2))
-    L1b --- L2d((replica<br/>level 2))
-    L2a --- R1[reader<br/>saves 2 hops]
-    L2b --- R2[reader]
-    L2c --- R3[reader]
-    L2d --- R4[reader]
-
-    classDef owner fill:#fec,stroke:#963
-    classDef rep fill:#cef,stroke:#369
-    class P owner
-    class L1a,L1b,L2a,L2b,L2c,L2d rep
-```
 
 Levels emerge with no explicit tracking. Expected lookup length is
 `log2 n - r` with `r` levels of replicas, reaching `O(1)` at saturation.
@@ -457,26 +337,6 @@ This is an average, not a per-node bound. A replica has up to `log2 n`
 predecessor-neighbor arcs, and under skewed demand may fan out to more
 children, with bandwidth tracking local fan-out.
 
-```mermaid
-flowchart TD
-    P((owner p))
-    P -->|wave 1| A((q_a))
-    P -->|wave 1| B((q_b))
-    A -->|wave 2| A1((q_a1))
-    A -->|wave 2| A2((q_a2))
-    B -->|wave 2| B1((q_b1))
-    B -->|wave 2| B2((q_b2))
-    A1 -->|wave 3| L1[leaves]
-    A2 -->|wave 3| L2[leaves]
-    B1 -->|wave 3| L3[leaves]
-    B2 -->|wave 3| L4[leaves]
-
-    classDef rack1 fill:#dfe,stroke:#363
-    classDef rack2 fill:#def,stroke:#336
-    class A,A1,A2,L1,L2 rack1
-    class B,B1,B2,L3,L4 rack2
-```
-
 PNS biases each hop to the topologically nearest peer in its arc, so
 sub-trees collapse into local clusters (rack, PCIe complex). The same
 geometry that serves cached reads handles synchronised reads as a
@@ -495,27 +355,6 @@ multicast tree with average fan-out 2 across `log2 n` waves.
 - **In-flight transactions.** A hop failure surfaces as a transport
   error. The client retries; partial bytes are discarded by the
   reader's content-hash check.
-
-```mermaid
-flowchart LR
-    subgraph Before["before failure"]
-      direction TB
-      H1((high-i<br/>predecessor)) --> P((owner p))
-      L1((low-i<br/>predecessor)) --> P
-    end
-    subgraph After["after p fails"]
-      direction TB
-      H2((high-i<br/>predecessor<br/>still on path)) ==> P2((new owner p'))
-      L2((low-i<br/>predecessor<br/>off-path)) -.->|stale, drains<br/>via SIEVE| P2
-      P2 --> Cold[("cold fetch<br/>on miss")]
-    end
-    Before --> After
-
-    classDef stale fill:#fee,stroke:#633,stroke-dasharray: 4 2
-    classDef live fill:#efe,stroke:#363
-    class L2 stale
-    class H2 live
-```
 
 High-index predecessors of `p` are also predecessors of `p'`, so the
 top of the replica tree keeps serving without migration. Low-index
