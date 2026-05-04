@@ -257,6 +257,29 @@ queue bookkeeping that drives `s_hit` and `s_miss`, not a state
 transition. Most chunks live and die in `Observed`; only sustained hits
 on an eligible node cross into `Replica`.
 
+## Adaptive Admission
+
+A fixed `τ_promote` ignores cache pressure. A node already churning
+through its cache should be slower to admit new replicas. Each node
+multiplies `τ_promote` by a local factor `μ ≥ 1`:
+
+    τ_promote_local = τ_promote · μ
+
+`μ` rises with **cache-byte-churn**: bytes evicted per unit time,
+normalised by cache size. Low churn means the cache is comfortable and
+`μ = 1`. High churn means promotions are pushing out chunks faster than
+they age out naturally, and `μ` climbs toward a configured `μ_max`.
+Between the two it varies linearly. The deadband at the low end keeps
+the multiplier quiet under normal load.
+
+Only admission is gated. `τ_evict` is unchanged, so a pressure spike
+will not flush chunks that are still serving. The hot set stays put
+until it goes cold on its own.
+
+Computation is local. No coordination, no shared state, no integrator
+to wind up across membership changes. Under steady demand `μ = 1` and
+the rule reduces to the original `τ_promote`.
+
 ## Recursive Structure
 
 Once `q` serves `c`, lookups that previously terminated at `p` now
