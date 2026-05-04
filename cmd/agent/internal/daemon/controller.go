@@ -10,10 +10,7 @@ import (
 	"os"
 
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -44,21 +41,23 @@ type daemonRequest struct {
 
 type daemonReconciler struct {
 	client.Client
-	log         *slog.Logger
-	machineName string
-	nodeName    string
+	log               *slog.Logger
+	machineName       string
+	nodeName          string
+	restartActiveNode func(context.Context, *slog.Logger) error
 }
 
-func runController(ctx context.Context, log *slog.Logger, restCfg *rest.Config, _ client.WithWatch, active *ActiveMachine) error {
-	nodeName, err := resolveNodeName(active.Config.MachineName)
+func runController(ctx context.Context, log *slog.Logger, restCfg *rest.Config, machineName string) error {
+	nodeName, err := resolveNodeName(machineName)
 	if err != nil {
 		return err
 	}
 
 	reconciler := &daemonReconciler{
-		log:         log,
-		machineName: active.Config.MachineName,
-		nodeName:    nodeName,
+		log:               log,
+		machineName:       machineName,
+		nodeName:          nodeName,
+		restartActiveNode: restartActiveNode,
 	}
 
 	mgr, err := ctrl.NewManager(restCfg, manager.Options{
@@ -76,7 +75,7 @@ func runController(ctx context.Context, log *slog.Logger, restCfg *rest.Config, 
 					Field: fields.OneTermEqualSelector("metadata.name", nodeName),
 				},
 				&v1alpha3.Machine{}: {
-					Field: fields.OneTermEqualSelector("metadata.name", active.Config.MachineName),
+					Field: fields.OneTermEqualSelector("metadata.name", machineName),
 				},
 			},
 		},
@@ -143,8 +142,7 @@ func (r *daemonReconciler) SetupWithManager(mgr ctrl.Manager) error {
 func (r *daemonReconciler) Reconcile(ctx context.Context, req daemonRequest) (reconcile.Result, error) {
 	switch req.Kind {
 	case queueItemMachineOperation:
-		r.log.Info("machine operation queued", "operation", req.Name)
-		return reconcile.Result{}, nil
+		return r.reconcileMachineOperation(ctx, req.Name)
 	case queueItemRepave:
 		r.log.Info("repave queued", "node", req.Name)
 		return reconcile.Result{}, nil
@@ -153,79 +151,12 @@ func (r *daemonReconciler) Reconcile(ctx context.Context, req daemonRequest) (re
 	}
 }
 
-func (r *daemonReconciler) mapMachineOperation(ctx context.Context, obj client.Object) []daemonRequest {
-	op, ok := obj.(*v1alpha3.MachineOperation)
-	if !ok || !r.shouldEnqueueOperation(ctx, op) {
-		return nil
-	}
-
-	return []daemonRequest{{Kind: queueItemMachineOperation, Name: op.Name}}
-}
-
 func (r *daemonReconciler) mapNode(_ context.Context, obj client.Object) []daemonRequest {
 	if obj.GetName() != r.nodeName {
 		return nil
 	}
 
 	return []daemonRequest{{Kind: queueItemRepave, Name: obj.GetName()}}
-}
-
-func (r *daemonReconciler) shouldEnqueueOperation(ctx context.Context, op *v1alpha3.MachineOperation) bool {
-	if op.Status.Phase != "" && op.Status.Phase != v1alpha3.OperationPhasePending {
-		return false
-	}
-
-	switch op.Spec.OperationKind {
-	case v1alpha3.OperationNodeReboot, v1alpha3.OperationAgentUpgrade:
-		// handled below
-	default:
-		return false
-	}
-
-	matches, err := r.matchesMachine(ctx, op)
-	if err != nil {
-		r.log.Warn("invalid MachineOperation target selector", "operation", op.Name, "error", err)
-		return false
-	}
-
-	return matches
-}
-
-func (r *daemonReconciler) matchesMachine(ctx context.Context, op *v1alpha3.MachineOperation) (bool, error) {
-	if op.Spec.MachineRef != "" {
-		return op.Spec.MachineRef == r.machineName, nil
-	}
-
-	if op.Spec.MachineSelector == nil {
-		return false, nil
-	}
-
-	var node corev1.Node
-	if err := r.Get(ctx, client.ObjectKey{Name: r.nodeName}, &node); err == nil {
-		return selectorMatches(op.Spec.MachineSelector, node.Labels)
-	} else if !apierrors.IsNotFound(err) {
-		return false, fmt.Errorf("get Node %s for selector match: %w", r.nodeName, err)
-	}
-
-	var machine v1alpha3.Machine
-	if err := r.Get(ctx, client.ObjectKey{Name: r.machineName}, &machine); err != nil {
-		if apierrors.IsNotFound(err) {
-			return false, nil
-		}
-
-		return false, fmt.Errorf("get Machine %s for selector match: %w", r.machineName, err)
-	}
-
-	return selectorMatches(op.Spec.MachineSelector, machine.Labels)
-}
-
-func selectorMatches(selector *metav1.LabelSelector, targetLabels map[string]string) (bool, error) {
-	compiled, err := metav1.LabelSelectorAsSelector(selector)
-	if err != nil {
-		return false, err
-	}
-
-	return compiled.Matches(labels.Set(targetLabels)), nil
 }
 
 var _ reconcile.TypedReconciler[daemonRequest] = (*daemonReconciler)(nil)

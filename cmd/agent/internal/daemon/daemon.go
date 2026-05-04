@@ -71,7 +71,7 @@ func run(ctx context.Context, log *slog.Logger, newClient kubeClientFunc) error 
 		return fmt.Errorf("register machine: %w", err)
 	}
 
-	return runController(ctx, log, restCfg, kubeClient, active)
+	return runController(ctx, log, restCfg, active.Config.MachineName)
 }
 
 // buildRESTConfig builds a Kubernetes REST config from the applied agent
