@@ -18,7 +18,7 @@ name: unbounded release
 #     -> binaries          (GoReleaser; creates draft GitHub release)
 #     -> net-images        (matrix: amd64-native, arm64-native)
 #         -> net-images-manifest (multi-arch tag stitch + sign + SBOM attest)
-#     -> component-images  (matrix: machina, metalman, host-ubuntu2404)
+#     -> component-images  (matrix: machina, machine-ops-controller, metalman, host-ubuntu2404)
 #     -> manifests-tarball (make release-manifests + cosign sign)
 #     -> finalize          (attach extras + krew manifest; optional publish)
 #
@@ -228,7 +228,7 @@ jobs:
       - name: Install syft (for SBOM generation)
         uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
 
-      - uses: goreleaser/goreleaser-action@e24998b8b67b290c2fa8b7c14fcfa7de2c5c9b8c # v7.1.0
+      - uses: goreleaser/goreleaser-action@1a80836c5c9d9e5755a25cb59ec6f45a3b5f41a8 # v7.2.1
         with:
           version: "~> v2"
           args: release --clean ${{ inputs.dry_run == true && '--skip=publish,sign,sbom' || '' }}
@@ -506,6 +506,10 @@ jobs:
         component:
           - name: machina
             file: images/machina/Containerfile
+            platforms: linux/amd64,linux/arm64
+            trivy: true
+          - name: machine-ops-controller
+            file: images/machine-ops-controller/Containerfile
             platforms: linux/amd64,linux/arm64
             trivy: true
           - name: metalman
