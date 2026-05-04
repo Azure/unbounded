@@ -112,6 +112,7 @@ REACT_DEV ?= false
 .PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute notice notice-check
 .PHONY: net-frontend net-frontend-clean net-build-ebpf net-manifests release-manifests
 .PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-net-controller-local image-net-node-local images-local
+.PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
 
 ##@ General
 
@@ -171,7 +172,11 @@ help: ## Show this help
 	@echo "  image-machine-ops-controller-local Build machine-ops-controller image"
 	@echo "  image-metalman-local             Build metalman image"
 	@echo "  image-net-controller-local       Build unbounded-net-controller image"
+	@echo "  image-net-controller-push        Build and push unbounded-net-controller image"
 	@echo "  image-net-node-local             Build unbounded-net-node image"
+	@echo "  image-net-node-push              Build and push unbounded-net-node image"
+	@echo "  images-net-all                   Build all unbounded-net images"
+	@echo "  images-net-all-push              Build and push all unbounded-net images"
 	@echo "  images-local                     Build all local images"
 	@echo "  machina-oci-push                 Build machina image and push"
 	@echo "  machine-ops-controller-oci-push  Build machine-ops-controller image and push"
@@ -591,6 +596,16 @@ image-net-node-local: resources/cni-plugins-linux-$(HOST_GOARCH)-$(CNI_PLUGINS_V
 		-t $(NET_NODE_IMAGE) \
 		-f ./images/net-node/Dockerfile .
 	$(call trivy-maybe,$(NET_NODE_IMAGE))
+
+image-net-controller-push: image-net-controller-local ## Build and push the unbounded-net-controller image
+	$(CONTAINER_ENGINE) push $(NET_CONTROLLER_IMAGE)
+
+image-net-node-push: image-net-node-local ## Build and push the unbounded-net-node image
+	$(CONTAINER_ENGINE) push $(NET_NODE_IMAGE)
+
+images-net-all: image-net-controller-local image-net-node-local ## Build all unbounded-net container images locally
+
+images-net-all-push: image-net-controller-push image-net-node-push ## Build and push all unbounded-net container images
 
 images-local: image-machina-local image-machine-ops-controller-local image-metalman-local image-net-controller-local image-net-node-local ## Build all container images locally
 
