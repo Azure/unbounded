@@ -57,7 +57,7 @@ to "Complete" or "Failed".`,
 func runSoftReboot(ctx context.Context, c client.WithWatch, name string, ttlSeconds int32) error {
 	opName := fmt.Sprintf("%s-reboot-%d", name, time.Now().Unix())
 
-	if err := createMachineOperation(ctx, c, name, opName, v1alpha3.OperationSoftReboot, ttlSeconds); err != nil {
+	if err := createMachineOperation(ctx, c, name, opName, v1alpha3.OperationNodeReboot, ttlSeconds); err != nil {
 		return err
 	}
 
@@ -78,9 +78,6 @@ func createMachineOperation(ctx context.Context, c client.WithWatch, name, opNam
 	op := &v1alpha3.MachineOperation{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: opName,
-			Labels: map[string]string{
-				v1alpha3.MachineOperationMachineLabelKey: name,
-			},
 			OwnerReferences: []metav1.OwnerReference{
 				{
 					APIVersion: v1alpha3.GroupVersion.String(),

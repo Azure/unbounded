@@ -46,7 +46,7 @@ operation and updates MachineOperation status to "Complete" or "Failed".`,
 func runHardReboot(ctx context.Context, c client.WithWatch, name string, ttlSeconds int32) error {
 	opName := fmt.Sprintf("%s-hard-reboot-%d", name, time.Now().Unix())
 
-	if err := createMachineOperation(ctx, c, name, opName, v1alpha3.OperationHardReboot, ttlSeconds); err != nil {
+	if err := createMachineOperation(ctx, c, name, opName, v1alpha3.OperationHostReboot, ttlSeconds); err != nil {
 		return err
 	}
 
