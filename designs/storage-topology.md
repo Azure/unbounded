@@ -280,6 +280,52 @@ Computation is local. No coordination, no shared state, no integrator
 to wind up across membership changes. Under steady demand `μ = 1` and
 the rule reduces to the original `τ_promote`.
 
+## Promotion Hints
+
+SIEVE on a single transit node only sees the slice of traffic that
+crosses it. For a chunk that has just turned hot - a freshly published
+image tag, a model rollout, the start of a synchronised pull - no
+transit has accumulated `τ_promote` sweeps yet, so no replicas exist,
+and the first wave of readers all pays the full `O(log n)` path. SIEVE
+is doing the right thing in general; it just lags the workloads we
+care about most.
+
+The owner does not have this blind spot. Every cold miss funnels
+through it, so it sees demand climb several ring levels before any
+single transit catches up. Owner-adjacent branch nodes see a partial
+version of the same picture.
+
+**The hint.** Each server (owner or replica) tracks an EWMA of recent
+serves per chunk. When it writes a response, it stamps that rate, as a
+small integer, into a header on the byte stream. Cold chunks carry
+zero.
+
+**How transit nodes use it.** As bytes flow back, each transit reads
+the header and adds its value to `s_hit(c)`, as if the chunk had been
+visited at the head of that many extra sweeps. Eligibility, the
+fault-domain tiebreak, and `μ` are unchanged. The hint shortens the
+runway to `τ_promote_local`, nothing else.
+
+**Composition along the path.** A forwarding node may rewrite the
+header with its own observed rate before passing it on. Once early
+replicas exist, downstream receivers see heat from the nearest
+authoritative point on their path, which is the relevant signal for
+the next wave of readers attaching to that subtree.
+
+**Bounds.** Per-response credit is capped at `τ_promote`, so no single
+hint can promote on its own; the chunk still needs to be eligible and
+to win the tiebreak. `τ_evict` is untouched, so a chunk admitted on a
+hint that turns out to be cold drains on the normal schedule. The
+asymmetry is intentional: cheap to admit, slow to evict.
+
+**Why not just lower `τ_promote`.** That would admit the warm long
+tail too. The hint is per-chunk and demand-derived, so only genuinely
+hot chunks accelerate. Cold chunks earn promotion the slow way.
+
+Under steady demand heat values are near zero and this section reduces
+to plain SIEVE. It only matters during bursts, which is when fan-out
+matters.
+
 ## Recursive Structure
 
 Once `q` serves `c`, lookups that previously terminated at `p` now
