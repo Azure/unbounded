@@ -83,7 +83,7 @@ func NewNotrackManager() (*NotrackManager, error) {
 // to create and immediately delete a test rule.
 func detectCTSupport(ipt *iptables.IPTables, family string) bool {
 	// Ensure the chain exists for the probe.
-	_ = ipt.NewChain("raw", notrackChain)
+	_ = ipt.NewChain("raw", notrackChain) //nolint:errcheck // best-effort; may already exist
 
 	testRule := []string{"-d", "192.0.2.0/32", "-j", "CT", "--notrack"}
 	if family == "IPv6" {
@@ -94,14 +94,14 @@ func detectCTSupport(ipt *iptables.IPTables, family string) bool {
 		klog.V(4).Infof("NotrackManager: CT target probe failed for %s: %v", family, err)
 
 		// Clean up probe chain if we created it.
-		_ = ipt.ClearChain("raw", notrackChain)
-		_ = ipt.DeleteChain("raw", notrackChain)
+		_ = ipt.ClearChain("raw", notrackChain)  //nolint:errcheck // best-effort cleanup
+		_ = ipt.DeleteChain("raw", notrackChain) //nolint:errcheck // best-effort cleanup
 
 		return false
 	}
 
 	// Clean up test rule.
-	_ = ipt.Delete("raw", notrackChain, testRule...)
+	_ = ipt.Delete("raw", notrackChain, testRule...) //nolint:errcheck // best-effort cleanup
 	// Don't delete the chain - we'll use it.
 
 	return true
