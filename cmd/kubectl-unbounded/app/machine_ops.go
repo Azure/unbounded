@@ -57,17 +57,13 @@ func newMachineClient() (client.WithWatch, error) {
 	return c, nil
 }
 
-// getMachine fetches a Machine by name and validates that it has Redfish configuration.
+// getMachine fetches a Machine by name.
 func getMachine(ctx context.Context, c client.WithWatch, name string) (*v1alpha3.Machine, error) {
 	key := client.ObjectKey{Name: name}
 
 	var machine v1alpha3.Machine
 	if err := c.Get(ctx, key, &machine); err != nil {
 		return nil, fmt.Errorf("getting Machine: %w", err)
-	}
-
-	if machine.Spec.PXE == nil || machine.Spec.PXE.Redfish == nil {
-		return nil, fmt.Errorf("machine %s has no redfish configuration; reboots require BMC access", name)
 	}
 
 	if machine.Spec.Operations == nil {
