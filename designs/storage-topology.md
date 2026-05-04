@@ -8,8 +8,8 @@ Adaptive replication over a structured ring for unbounded-storage-p2p.
 
 - Nodes hash onto a ring. Each node links to peers at offsets `2^0, 2^1,
   ...` ahead of itself, so any address is reachable in `O(log n)` hops.
-  Membership comes from Kubernetes, so every node computes the same ring.
-  No gossip, no coordinator.
+  Membership comes from Kubernetes, so every node computes the same ring
+  without coordination.
 - Blobs split into fixed-width chunks. Width is computed from blob length
   alone, so clients find chunk boundaries without a manifest.
 - Each chunk has one **owner**: the next node clockwise from
@@ -18,31 +18,32 @@ Adaptive replication over a structured ring for unbounded-storage-p2p.
 
 **Read path**
 
-- Lookup descends the neighbor table in `O(log n)` hops.
-- Bytes flow back along the same path. Each transit node sees every
-  chunk crossing it and may cache it.
+- Lookup descends the neighbor table in `O(log n)` hops to the owner.
+- Bytes flow back along the same path, so caching is a side-effect of
+  routing: any node on the path can keep a copy, and once it does,
+  later lookups whose paths cross that node terminate there instead
+  of continuing on to the owner.
 
 **Adaptive replication**
 
-- Each transit node tracks observed chunks in a SIEVE queue.
-- A chunk that stays hot for `τ_promote` sweeps gets cached, if the node
-  is arc-eligible (see below).
-- Arc-eligibility uses the owner's `O(log n)` predecessor bands at
-  doubling distances. Replicas cluster near hot readers but are also
-  spread at multiple scales around the ring. Demand decides which bands
-  fill in; the geometry handles spacing without coordination.
-- After `τ_evict` cold sweeps the node evicts and eventually forgets the
-  chunk.
+- Each node tracks the chunks it sees in transit. Chunks that stay hot
+  get cached; chunks that go cold are dropped. Decisions are local; no
+  coordination.
+- Because caches form on the paths leading to the owner, popular chunks
+  end up replicated along the geometry that future readers will
+  traverse anyway. The set of paths to a hot owner thickens into a tree
+  of replicas rooted near the hot region, and each level of the tree
+  halves the distance the next reader has to travel.
+- Owners and existing replicas stamp a small heat hint onto served bytes.
+  Downstream transit nodes fold that hint into their local SIEVE counters,
+  shortening the runway to promotion for chunks that just turned hot.
 
 **Emergent properties**
 
-- Hot chunks gain replicas near their readers. Lookups shrink from
+- Hot chunks gain replicas near their readers. Lookups rapidly shrink from
   `O(log n)` toward `O(1)` as replica levels grow.
 - Synchronised reads (e.g. 1000 nodes pulling the same image) form a
   multicast tree with average fan-out 2 over `log2 n` levels.
-- Membership changes do not trigger migration. Existing replicas keep
-  serving until SIEVE drains them; the new owner cold-fetches on first
-  miss.
 
 ## Motivation
 
