@@ -81,7 +81,7 @@ func runSoftReboot(ctx context.Context, c client.WithWatch, name string, ttlSeco
 		},
 		Spec: v1alpha3.MachineOperationSpec{
 			MachineRef:    name,
-			OperationKind: v1alpha3.OperationSoftReboot,
+			OperationKind: v1alpha3.OperationNodeReboot,
 		},
 	}
 

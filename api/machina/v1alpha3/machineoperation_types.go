@@ -11,6 +11,12 @@ func init() {
 	SchemeBuilder.Register(&MachineOperation{}, &MachineOperationList{})
 }
 
+const (
+	// MachineOperationMachineLabelKey labels MachineOperation objects with the
+	// target Machine name so agents can efficiently watch their own operations.
+	MachineOperationMachineLabelKey = "unbounded-cloud.io/machine"
+)
+
 // +kubebuilder:object:root=true
 // +kubebuilder:resource:scope=Cluster,shortName=mop
 // +kubebuilder:subresource:status

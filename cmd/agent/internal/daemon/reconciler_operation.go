@@ -96,7 +96,7 @@ func (r *reconciler) reconcileOperation(ctx context.Context, log *slog.Logger, o
 // the operation name.
 func (r *reconciler) executeOperation(ctx context.Context, log *slog.Logger, op *v1alpha3.MachineOperation) error {
 	switch op.Spec.OperationKind {
-	case v1alpha3.OperationSoftReboot:
+	case v1alpha3.OperationNodeReboot:
 		// Discover the active nspawn machine at execution time. The name
 		// can change after an upgrade (kube1 <-> kube2), so we cannot
 		// cache it at daemon startup.
