@@ -73,6 +73,35 @@ Adaptive replication over a structured ring for unbounded-storage-p2p.
   already HA and trusted. A bespoke tracker or metadata service would
   need the same rigor for less benefit.
 
+## Alternatives Considered
+
+The design rests on three invariants: placement is a pure function of
+`(blob_id, chunk_index)` and current membership, bytes flow along the
+lookup path so caching is a routing side-effect, and replication
+geometry emerges from demand. Each alternative below sacrifices at
+least one.
+
+- **Centralized cache tier** (Harbor mirrors, Dragonfly supernodes,
+  CDN edges). Sized ahead of demand, not on the consumer's data path,
+  NIC-bound under synchronized pulls, extra control plane to operate,
+  concentrated fault domain.
+- **Centralized metadata, distributed blocks** (HDFS NameNode, Ceph
+  MDS, BitTorrent tracker, IPFS provider records). Reintroduces a
+  per-read lookup, must be HA and on the critical path, rewrites
+  placement records on membership churn, adds write-time coordination.
+- **Typical BitTorrent.** Rarest-first is the wrong objective (we want
+  hot pieces replicated, not rare ones), peer discovery is not
+  `O(log n)` over the cluster, transit peers do not see chunks they
+  did not request, no locality awareness, and the tracker/DHT is
+  itself a centralization point.
+- **Production peers.** Spegel (libp2p + DHT, no structured routing or
+  demand shaping), Dragonfly (supernode is bottleneck and SPOF),
+  Uber Kraken (tracker dependency, locality requires explicit config).
+  None combine pure-function placement, routing-as-caching, and
+  emergent replication geometry.
+
+---
+
 ## Ring and Neighbors
 
 Nodes hash onto a ring of size `2^m`. Each node `q` has `m` neighbor slots
@@ -319,29 +348,6 @@ propagate from `p` along the tree as a multicast, with average fan-out
 Levels emerge with no explicit tracking. Expected lookup length is
 `log2 n - r` with `r` levels of replicas, reaching `O(1)` at saturation.
 
-## Physical Clustering and Multicast
-
-PNS biases each hop toward the nearest peer in its arc. Hot chunks
-acquire a dense replica cluster near their dominant readers and a
-thinner reach into colder regions, with no explicit topology placement.
-
-For synchronised large-blob reads (e.g. 1000 nodes pulling the same
-image), the same mechanism builds a self-organising multicast tree.
-After `~log n` waves the chunk reaches every node. Fan-out analysis is
-per-blob and relies on within-blob chunk uniformity, which the width
-function preserves. A balanced tree of `n` leaves over `log2 n` levels
-has *average* fan-out `n^(1/log2 n) = 2`, bounding per-replica bandwidth
-as the cluster scales.
-
-This is an average, not a per-node bound. A replica has up to `log2 n`
-predecessor-neighbor arcs, and under skewed demand may fan out to more
-children, with bandwidth tracking local fan-out.
-
-PNS biases each hop to the topologically nearest peer in its arc, so
-sub-trees collapse into local clusters (rack, PCIe complex). The same
-geometry that serves cached reads handles synchronised reads as a
-multicast tree with average fan-out 2 across `log2 n` waves.
-
 ## Failure and Liveness
 
 - **Owner failure.** Replicas remain on disk, but only those on the
@@ -355,36 +361,4 @@ multicast tree with average fan-out 2 across `log2 n` waves.
 - **In-flight transactions.** A hop failure surfaces as a transport
   error. The client retries; partial bytes are discarded by the
   reader's content-hash check.
-
-High-index predecessors of `p` are also predecessors of `p'`, so the
-top of the replica tree keeps serving without migration. Low-index
-replicas fall off-path and drain via SIEVE while `p'` cold-fetches
-misses. No chunks move on membership change.
-
-## Alternatives Considered
-
-The design rests on three invariants: placement is a pure function of
-`(blob_id, chunk_index)` and current membership, bytes flow along the
-lookup path so caching is a routing side-effect, and replication
-geometry emerges from demand. Each alternative below sacrifices at
-least one.
-
-- **Centralized cache tier** (Harbor mirrors, Dragonfly supernodes,
-  CDN edges). Sized ahead of demand, not on the consumer's data path,
-  NIC-bound under synchronized pulls, extra control plane to operate,
-  concentrated fault domain.
-- **Centralized metadata, distributed blocks** (HDFS NameNode, Ceph
-  MDS, BitTorrent tracker, IPFS provider records). Reintroduces a
-  per-read lookup, must be HA and on the critical path, rewrites
-  placement records on membership churn, adds write-time coordination.
-- **Typical BitTorrent.** Rarest-first is the wrong objective (we want
-  hot pieces replicated, not rare ones), peer discovery is not
-  `O(log n)` over the cluster, transit peers do not see chunks they
-  did not request, no locality awareness, and the tracker/DHT is
-  itself a centralization point.
-- **Production peers.** Spegel (libp2p + DHT, no structured routing or
-  demand shaping), Dragonfly (supernode is bottleneck and SPOF),
-  Uber Kraken (tracker dependency, locality requires explicit config).
-  None combine pure-function placement, routing-as-caching, and
-  emergent replication geometry.
 
