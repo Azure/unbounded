@@ -47,114 +47,31 @@ Adaptive replication over a structured ring for unbounded-storage-p2p.
 
 ## Motivation
 
-### Per-node connection budget
-
-Modern NICs do not scale linearly in concurrent peers.
-
-- **RDMA HCAs** cache queue-pair state in on-chip ICM. ConnectX-class
-  parts hit a cache cliff in the low thousands of resident RC QPs (the
-  exact number depends on generation, MTU, and traffic mix). Past the
-  cliff, QP context fetches go to host memory and per-op latency loses
-  a multiple. eRPC, FaSST, and the broader RDMA-systems literature
-  exist largely to dodge this. DCT relaxes the cap on InfiniBand but
-  adds setup cost and is not universally deployable.
-
-A node must therefore talk to a small bounded peer set, not `O(n)`.
-This kills two alternatives outright:
-
-- **Full-mesh swarms** (BitTorrent-style) expose each peer to many
-  others per swarm, multiplied across concurrent swarms.
-- **Centralized cache tiers** push the cost onto the cache: every
-  consumer holds a flow to the cache fleet, so the cache NICs are the
-  ones that hit the cliff.
-
-The ring caps a node's open peer set at `O(log n)` neighbors. At n=10k
-that is around 14 peers, comfortably inside any current HCA's resident
-QP budget.
-
-### Amplification economics
-
-Distribution systems lose to amplification along four axes.
-
-- **Cold-read amplification.** Metadata-first schemes pay a round trip
-  before any byte flows. For small blobs the metadata trip dominates
-  wall-clock latency. Manifest-free placement (`width(L)` plus
-  `hash(blob_id, idx)`) is zero round trips.
-- **Origin egress under synchronized pulls.** 1000 nodes pulling the
-  same 10 GB image without peer fan-out egresses 10 TB from the
-  backing store. A fixed cache tier just relocates the bottleneck to
-  the cache NIC. The emergent multicast tree at average fan-out 2
-  keeps per-replica egress bounded as n grows.
-- **Replication storage amplification.** Blanket N-way replication
-  spends disk on cold data. Demand-shaped replication only spends
-  bytes where reads actually happen, and SIEVE drains the spend when
-  demand drops.
-- **Cold-fetch amplification.** M independent cache nodes mean up to M
-  cold fetches per unique chunk per epoch. The single-owner rule means
-  exactly one.
-
-### Datacenter topology
-
-Bandwidth and fault tolerance are both hierarchical, and the design has
-to respect both at once.
-
-- **Bandwidth tiers.** Intra-rack via ToR is typically near
-  non-blocking at 100-400 Gbps. Pod aggregation is oversubscribed,
-  often 2:1 to 8:1. Spine is the scarcest layer. Cross-rack traffic
-  competes for the smallest pipe, so locality preference is not a
-  nice-to-have.
-- **Nested fault domains.** PCIe complex within a host, host within a
-  ToR/PSU/rack, rack within a pod, pod within a region. Replicas all
-  in one fault domain are not really replicated.
-- **AI/HPC rail alignment.** GPU NICs are organized into rails;
-  cross-rail traffic costs spine hops and contends with collective
-  ops. The same locality argument applies, just with different units.
-
-PNS biases each hop toward the nearest peer in its arc, so most replica
-acquisition stays intra-rack or intra-rail. The chunk-id-keyed
-fault-domain tiebreak in promotion ensures the multi-scale spread that
-the ring guarantees in id-space also manifests in physical-fault-space.
-
-### Membership and control-plane churn
-
-Kubernetes nodes are not stable.
-
-- Node pools autoscale on demand.
-- Rolling upgrades drain and replace nodes continuously.
-- Spot/preemptible nodes vanish without warning.
-- Cordon/uncordon, NotReady transitions, and taints reshape membership
-  on minute timescales.
-
-Any scheme that migrates state on every membership change becomes a
-noisy neighbor in this environment. The ring's "no migration, lazy
-reconvergence" behavior is a precondition, not an optimization:
-existing replicas keep serving until SIEVE drains them, and the new
-owner cold-fetches only on first miss.
-
-Reusing Kubernetes membership as the agreement substrate also avoids
-standing up a second HA control plane. The API server is already a
-trusted, monitored, recoverable dependency. A bespoke tracker or
-metadata service would need the same operational rigor for strictly
-less benefit.
-
-### Workload shape
-
-The motivating workloads (container image pulls, model and dataset
-distribution for AI inference and training) share three properties.
-
-- **Synchronized.** A Deployment rollout or Job launch starts hundreds
-  to thousands of pods at once, all pulling the same blobs. This is
-  exactly where multicast trees pay off and where any pre-provisioned
-  cache tier hits its NIC ceiling.
-- **Bimodal.** A small hot working set (popular base images, current
-  model versions, active dataset shards) dominates request volume,
-  while the long cold tail dominates total stored bytes. Demand-shaped
-  replication matches both halves: bytes flow toward demand, and
-  unloved chunks fall out of SIEVE for free.
-- **Read-heavy.** Images are built once and pulled many times; models
-  are trained occasionally and served constantly. Optimizing for read
-  fan-out while accepting one cold-fetch per chunk per epoch is the
-  right tradeoff.
+- **Bounded peer set per node.** NICs (especially RDMA HCAs) fall off a
+  cliff past a few thousand concurrent peers. A node must talk to
+  `O(log n)` neighbors, not `O(n)`. Full-mesh swarms and centralized
+  cache tiers both violate this.
+- **No metadata round-trip.** Placement must be a pure function of the
+  blob id so any client finds chunks without a lookup service.
+- **One cold fetch per chunk.** A single owner per chunk avoids M cache
+  nodes each pulling the same bytes from the backing store.
+- **Bounded origin egress under synchronized pulls.** Thousands of pods
+  starting at once must not all hit the backing store or one cache
+  fleet. Peer fan-out is the only way to keep per-node egress flat as
+  the cluster grows.
+- **Demand-shaped replication.** Workloads are read-heavy and bimodal:
+  a small hot set dominates traffic, a long cold tail dominates bytes.
+  Bytes should land where readers are, and drain when demand fades.
+- **Topology awareness for free.** Datacenters are hierarchical in
+  bandwidth and fault domains (rack, PCIe, rail). Replicas should
+  cluster near readers without explicit placement policy.
+- **Tolerate Kubernetes churn.** Autoscaling, rolling upgrades, and
+  spot evictions reshape membership constantly. State must not migrate
+  on every change; existing replicas keep serving while the new owner
+  cold-fetches lazily.
+- **Reuse the existing control plane.** The Kubernetes API server is
+  already HA and trusted. A bespoke tracker or metadata service would
+  need the same rigor for less benefit.
 
 ## Ring and Neighbors
 
@@ -195,6 +112,10 @@ ring distance, so depth is `O(log n)`. Bytes retrace the path back; each
 transit node observes chunk `c` exactly once and updates its SIEVE.
 
 ## Eligibility
+
+Eligibility restricts promotion to ring positions that lie on high-probability
+lookup paths to the owner, so cache bytes spent here are guaranteed to shorten
+subsequent lookups.
 
 The `i`-th **predecessor-neighbor arc** of owner `p` is
 `(p - 2^(i+1), p - 2^i]`. Node `q` is eligible at level `i` iff `q` lies
@@ -376,105 +297,28 @@ children, with bandwidth tracking local fan-out.
 
 ## Alternatives Considered
 
-The shape of this design is driven by three invariants: placement is a
-pure function of `(blob_id, chunk_index)` and current membership, bytes
-flow along the lookup path so caching is a routing side-effect, and
-replication geometry emerges from demand. Each alternative below
-sacrifices at least one of those.
+The design rests on three invariants: placement is a pure function of
+`(blob_id, chunk_index)` and current membership, bytes flow along the
+lookup path so caching is a routing side-effect, and replication
+geometry emerges from demand. Each alternative below sacrifices at
+least one.
 
-### Centralized dedicated cache tier
-
-A separate fleet of cache nodes sits between consumers and the backing
-store. Examples: registry pull-through mirrors (Harbor, distribution),
-Dragonfly's supernode/seed-peer tier used without peer-to-peer fan-out,
-classical CDN edge nodes.
-
-- **Provisioning is decoupled from demand.** The cache tier is sized
-  ahead of time. Idle outside bursts; saturated during synchronized
-  pulls. Our design uses the same nodes that *are* the demand as the
-  fabric, so capacity scales with the workload by construction.
-- **Locality is coarse.** Cache nodes are not on the consumer's data
-  path. Best case is one cache per rack, hand-placed. PNS gives us
-  rack/PCIe-aware replicas as a side-effect of demand, no placement
-  policy to maintain.
-- **Hot-spot under fan-out.** 1000 nodes pulling the same image
-  saturate the cache tier's NICs in proportion to fleet size. The
-  multicast tree in section "Recursive Structure" bounds *average*
-  per-replica bandwidth as the cluster grows; a centralized tier does
-  not.
-- **Extra control plane.** Another component to deploy, monitor,
-  upgrade, and recover. The ring derives from the existing Kubernetes
-  membership Unbounded already trusts.
-- **Concentrated fault domain.** Cache tier failure degrades every
-  consumer simultaneously. Our scheme degrades gradually as replicas
-  drain.
-
-### Centralized metadata, distributed blocks
-
-A metadata service tracks which nodes hold which blocks; data lives
-distributed. Examples: HDFS NameNode, Ceph MDS, BitTorrent tracker,
-IPFS provider records on a DHT, S3-style indirection.
-
-- **Manifest-free placement is lost.** The whole point of `width(L)`
-  + `hash(blob_id, idx)` is that any client computes chunk boundaries
-  and owners locally. A metadata layer reintroduces a per-read lookup
-  before any byte moves.
-- **Critical-path dependency.** Metadata service must be HA, must
-  scale to read RPS, and must be reachable before any data flows. The
-  ring + Kubernetes membership has none of those failure modes.
-- **Membership churn rewrites metadata.** Adding or removing a node
-  triggers placement-record updates proportional to held blocks. Our
-  scheme migrates nothing on membership change; existing replicas keep
-  serving and the new owner cold-fetches on first miss.
-- **Coordination cost on writes.** Every chunk landing somewhere has
-  to register that fact. Our promotion is purely local.
-- **Read amplification at small scale.** For a small blob the metadata
-  round-trip can dominate the actual transfer.
-
-### Typical BitTorrent
-
-Tracker or Mainline-DHT peer discovery, rarest-first piece selection,
-choke/unchoke tit-for-tat, unstructured swarm. Designed for adversarial
-public swarms with churning, selfish peers.
-
-- **Wrong replication objective.** Rarest-first deliberately spreads
-  rare pieces to keep the swarm healthy. We want the *opposite*: hot
-  pieces gain replicas near hot readers. SIEVE + arc-eligibility
-  encodes that directly.
-- **No structured routing.** Peer discovery is announce/gossip or DHT
-  lookup. Lookup cost is not `O(log n)` over the *cluster*; it is a
-  function of swarm size and DHT health. We get `O(log n)` cold and
-  `O(1)` hot from ring geometry.
-- **Transit nodes see nothing.** A BT peer only sees the pieces it
-  explicitly requests. Recursive byte-level routing means every transit
-  node already observes the chunks crossing it; SIEVE just decides
-  which ones to retain. That is the cheap caching property; BT cannot
-  reproduce it.
-- **No locality awareness.** Peer selection is random or
-  upload-rate-driven. PNS biases hops to the nearest peer in each arc
-  for free.
-- **Coordination overhead.** Bitfield exchange, HAVE messages, choke
-  algorithms, optimistic unchoke. All necessary in an adversarial
-  setting, all wasted overhead in a cooperative cluster.
-- **Tracker or DHT is itself a centralization point** with the same
-  problems as "centralized metadata" above, just less honestly named.
-
-### Adjacent real-world systems
-
-For grounding, points on the design space currently in production:
-
-- **Spegel.** libp2p + mDNS/DHT for in-cluster registry mirroring.
-  Closest to "typical BitTorrent" with cluster-local discovery; loses
-  structured routing and demand-shaped replication.
-- **Dragonfly.** Supernode-coordinated P2P. Hybrid of "centralized
-  metadata" (supernode tracks pieces) and swarm transfer between
-  agents. Supernode is the bottleneck and SPOF the design above
-  removes.
-- **Uber Kraken.** Origin cluster + tracker + agents, BitTorrent-style
-  transfer between agents. Same tracker dependency; locality is
-  rack-aware but not free, requires explicit configuration.
-
-None of these provide the "placement is a pure function, caching is a
-routing side-effect, replication shape emerges from demand" combination
-that motivates this design.
+- **Centralized cache tier** (Harbor mirrors, Dragonfly supernodes,
+  CDN edges). Sized ahead of demand, not on the consumer's data path,
+  NIC-bound under synchronized pulls, extra control plane to operate,
+  concentrated fault domain.
+- **Centralized metadata, distributed blocks** (HDFS NameNode, Ceph
+  MDS, BitTorrent tracker, IPFS provider records). Reintroduces a
+  per-read lookup, must be HA and on the critical path, rewrites
+  placement records on membership churn, adds write-time coordination.
+- **Typical BitTorrent.** Rarest-first is the wrong objective (we want
+  hot pieces replicated, not rare ones), peer discovery is not
+  `O(log n)` over the cluster, transit peers do not see chunks they
+  did not request, no locality awareness, and the tracker/DHT is
+  itself a centralization point.
+- **Production peers.** Spegel (libp2p + DHT, no structured routing or
+  demand shaping), Dragonfly (supernode is bottleneck and SPOF),
+  Uber Kraken (tracker dependency, locality requires explicit config).
+  None combine pure-function placement, routing-as-caching, and
+  emergent replication geometry.
 
