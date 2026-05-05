@@ -45,6 +45,7 @@ type daemonReconciler struct {
 	machineName       string
 	nodeName          string
 	restartActiveNode func(context.Context, *slog.Logger) error
+	resetAgent        func(context.Context, *slog.Logger) error
 }
 
 func runController(ctx context.Context, log *slog.Logger, restCfg *rest.Config, machineName string) error {
@@ -58,6 +59,7 @@ func runController(ctx context.Context, log *slog.Logger, restCfg *rest.Config, 
 		machineName:       machineName,
 		nodeName:          nodeName,
 		restartActiveNode: restartActiveNode,
+		resetAgent:        resetAgent,
 	}
 
 	mgr, err := ctrl.NewManager(restCfg, manager.Options{
@@ -116,7 +118,7 @@ func (r *daemonReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return builder.TypedControllerManagedBy[daemonRequest](mgr).
 		Named("unbounded-agent-daemon").
 		// MachineOperation events drive explicit daemon operations. The mapper
-		// filters to local-machine NodeReboot/AgentUpgrade operations and emits
+		// filters to local-machine agent operations and emits
 		// typed daemon requests rather than Kubernetes object keys.
 		Watches(
 			&v1alpha3.MachineOperation{},

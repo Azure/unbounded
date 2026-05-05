@@ -89,3 +89,80 @@ func TestReconcileNodeReboot_Failed(t *testing.T) {
 	require.NotNil(t, updated.Status.StartedAt)
 	require.NotNil(t, updated.Status.CompletedAt)
 }
+
+func TestReconcileAgentReset_Complete(t *testing.T) {
+	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Generation: 7}}
+	op := &v1alpha3.MachineOperation{
+		ObjectMeta: metav1.ObjectMeta{Name: "op-1"},
+		Spec: v1alpha3.MachineOperationSpec{
+			MachineRef:    "test-machine",
+			OperationKind: v1alpha3.OperationAgentReset,
+		},
+	}
+
+	called := false
+	reconciler := &daemonReconciler{
+		Client:      fakeStatusClient(machine, op),
+		log:         discardLogger(),
+		machineName: "test-machine",
+		resetAgent: func(context.Context, *slog.Logger) error {
+			called = true
+			return nil
+		},
+	}
+
+	_, err := reconciler.reconcileMachineOperation(context.Background(), "op-1")
+	require.NoError(t, err)
+	assert.True(t, called)
+
+	var updated v1alpha3.MachineOperation
+	require.NoError(t, reconciler.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
+	assert.Equal(t, v1alpha3.OperationPhaseComplete, updated.Status.Phase)
+	assert.Equal(t, "AgentReset completed", updated.Status.Message)
+	assert.Equal(t, int64(7), updated.Status.ObservedMachineGeneration)
+	require.NotNil(t, updated.Status.StartedAt)
+	require.NotNil(t, updated.Status.CompletedAt)
+}
+
+func TestReconcileAgentReset_Failed(t *testing.T) {
+	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Generation: 7}}
+	op := &v1alpha3.MachineOperation{
+		ObjectMeta: metav1.ObjectMeta{Name: "op-1"},
+		Spec: v1alpha3.MachineOperationSpec{
+			MachineRef:    "test-machine",
+			OperationKind: v1alpha3.OperationAgentReset,
+		},
+	}
+
+	reconciler := &daemonReconciler{
+		Client:      fakeStatusClient(machine, op),
+		log:         discardLogger(),
+		machineName: "test-machine",
+		resetAgent: func(context.Context, *slog.Logger) error {
+			return errors.New("reset failed")
+		},
+	}
+
+	_, err := reconciler.reconcileMachineOperation(context.Background(), "op-1")
+	require.NoError(t, err)
+
+	var updated v1alpha3.MachineOperation
+	require.NoError(t, reconciler.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
+	assert.Equal(t, v1alpha3.OperationPhaseFailed, updated.Status.Phase)
+	assert.Equal(t, "reset failed", updated.Status.Message)
+	require.NotNil(t, updated.Status.StartedAt)
+	require.NotNil(t, updated.Status.CompletedAt)
+}
+
+func TestShouldEnqueueMachineOperation_AgentReset(t *testing.T) {
+	op := &v1alpha3.MachineOperation{
+		ObjectMeta: metav1.ObjectMeta{Name: "op-1"},
+		Spec: v1alpha3.MachineOperationSpec{
+			MachineRef:    "test-machine",
+			OperationKind: v1alpha3.OperationAgentReset,
+		},
+	}
+
+	matches := shouldEnqueueMachineOperation(context.Background(), fakeStatusClient(op), discardLogger(), "test-machine", "test-node", op)
+	assert.True(t, matches)
+}
