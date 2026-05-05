@@ -6,7 +6,6 @@ package daemon
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"strings"
 	"time"
 
@@ -21,60 +20,37 @@ import (
 	"github.com/Azure/unbounded/internal/provision"
 )
 
-type activeMachineFunc func(*slog.Logger) (*ActiveMachine, error)
-
-type repaveNodeFunc func(
-	context.Context,
-	*slog.Logger,
-	*ActiveMachine,
-	*provision.UnboundedAgentConfig,
-) error
-
-type repaveFunc func(context.Context, *slog.Logger, client.Client, string) (reconcile.Result, error)
-
-func reconcileRepave(
-	ctx context.Context,
-	log *slog.Logger,
-	c client.Client,
-	machineName string,
-) (reconcile.Result, error) {
-	return reconcileRepaveWithDeps(ctx, log, c, machineName, findActiveMachine, repaveNode)
-}
-
-func reconcileRepaveWithDeps(
-	ctx context.Context,
-	log *slog.Logger,
-	c client.Client,
-	machineName string,
-	findActive activeMachineFunc,
-	repaveNode repaveNodeFunc,
-) (reconcile.Result, error) {
-	active, err := findActive(log)
+func (r *daemonReconciler) reconcileRepave(ctx context.Context) (reconcile.Result, error) {
+	active, err := r.nodeOperator.FindActiveMachine(r.log)
 	if err != nil {
 		return reconcile.Result{}, fmt.Errorf("find active machine: %w", err)
 	}
 
-	desiredConfig, appliedRef, err := resolveDesiredRepaveConfig(ctx, c, machineName, active.Config)
+	desiredConfig, appliedRef, err := resolveDesiredRepaveConfig(ctx, r.Client, r.machineName, active.Config)
 	if err != nil {
 		if apierrors.IsNotFound(err) || apimeta.IsNoMatchError(err) {
-			log.Info("repave skipped until desired configuration is available", "error", err)
+			r.log.Info("repave skipped until desired configuration is available", "error", err)
 
 			return reconcile.Result{RequeueAfter: 30 * time.Second}, nil
 		}
 
 		return reconcile.Result{}, err
 	}
-	if appliedRef == nil && !hasDrift(active.Config, &desiredConfig.AgentConfig) {
-		log.Info("repave skipped because no desired configuration drift exists")
+	if !hasDrift(active.Config, &desiredConfig.AgentConfig) {
+		r.log.Info("repave skipped because no desired configuration drift exists")
+
+		if err := markAppliedConfiguration(ctx, r.Client, r.machineName, appliedRef); err != nil {
+			return reconcile.Result{}, fmt.Errorf("mark applied configuration: %w", err)
+		}
 
 		return reconcile.Result{}, nil
 	}
 
-	if err := repaveNode(ctx, log, active, desiredConfig); err != nil {
+	if err := r.nodeOperator.RepaveNode(ctx, r.log, active, desiredConfig); err != nil {
 		return reconcile.Result{}, fmt.Errorf("update node for repave: %w", err)
 	}
 
-	if err := markAppliedConfiguration(ctx, c, machineName, appliedRef); err != nil {
+	if err := markAppliedConfiguration(ctx, r.Client, r.machineName, appliedRef); err != nil {
 		return reconcile.Result{}, fmt.Errorf("mark applied configuration: %w", err)
 	}
 

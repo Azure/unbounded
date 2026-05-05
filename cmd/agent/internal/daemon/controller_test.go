@@ -17,11 +17,50 @@ import (
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/provision"
 )
+
+type fakeNodeOperator struct {
+	active  *ActiveMachine
+	findErr error
+
+	restartCalled bool
+	restartActive *ActiveMachine
+	restartErr    error
+
+	repaveActive *ActiveMachine
+	repaveConfig *provision.UnboundedAgentConfig
+	repaveErr    error
+}
+
+func (op *fakeNodeOperator) FindActiveMachine(*slog.Logger) (*ActiveMachine, error) {
+	if op.findErr != nil {
+		return nil, op.findErr
+	}
+
+	return op.active, nil
+}
+
+func (op *fakeNodeOperator) RestartNode(_ context.Context, _ *slog.Logger, active *ActiveMachine) error {
+	op.restartCalled = true
+	op.restartActive = active
+
+	return op.restartErr
+}
+
+func (op *fakeNodeOperator) RepaveNode(
+	_ context.Context,
+	_ *slog.Logger,
+	active *ActiveMachine,
+	cfg *provision.UnboundedAgentConfig,
+) error {
+	op.repaveActive = active
+	op.repaveConfig = cfg
+
+	return op.repaveErr
+}
 
 func fakeStatusClient(objs ...client.Object) client.Client {
 	return fake.NewClientBuilder().
@@ -34,7 +73,7 @@ func fakeStatusClient(objs ...client.Object) client.Client {
 
 func TestReconcileNodeReboot_Complete(t *testing.T) {
 	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Generation: 7}}
-	op := &v1alpha3.MachineOperation{
+	machineOp := &v1alpha3.MachineOperation{
 		ObjectMeta: metav1.ObjectMeta{Name: "op-1"},
 		Spec: v1alpha3.MachineOperationSpec{
 			MachineRef:    "test-machine",
@@ -42,20 +81,19 @@ func TestReconcileNodeReboot_Complete(t *testing.T) {
 		},
 	}
 
-	called := false
+	active := &ActiveMachine{Name: "kube1", Config: baseConfig()}
+	op := &fakeNodeOperator{active: active}
 	reconciler := &daemonReconciler{
-		Client:      fakeStatusClient(machine, op),
-		log:         discardLogger(),
-		machineName: "test-machine",
-		restartActiveNode: func(context.Context, *slog.Logger) error {
-			called = true
-			return nil
-		},
+		Client:       fakeStatusClient(machine, machineOp),
+		log:          discardLogger(),
+		machineName:  "test-machine",
+		nodeOperator: op,
 	}
 
 	_, err := reconciler.reconcileMachineOperation(context.Background(), "op-1")
 	require.NoError(t, err)
-	assert.True(t, called)
+	assert.True(t, op.restartCalled)
+	assert.Same(t, active, op.restartActive)
 
 	var updated v1alpha3.MachineOperation
 	require.NoError(t, reconciler.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
@@ -68,7 +106,7 @@ func TestReconcileNodeReboot_Complete(t *testing.T) {
 
 func TestReconcileNodeReboot_Failed(t *testing.T) {
 	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Generation: 7}}
-	op := &v1alpha3.MachineOperation{
+	machineOp := &v1alpha3.MachineOperation{
 		ObjectMeta: metav1.ObjectMeta{Name: "op-1"},
 		Spec: v1alpha3.MachineOperationSpec{
 			MachineRef:    "test-machine",
@@ -76,13 +114,12 @@ func TestReconcileNodeReboot_Failed(t *testing.T) {
 		},
 	}
 
+	op := &fakeNodeOperator{restartErr: errors.New("restart failed")}
 	reconciler := &daemonReconciler{
-		Client:      fakeStatusClient(machine, op),
-		log:         discardLogger(),
-		machineName: "test-machine",
-		restartActiveNode: func(context.Context, *slog.Logger) error {
-			return errors.New("restart failed")
-		},
+		Client:       fakeStatusClient(machine, machineOp),
+		log:          discardLogger(),
+		machineName:  "test-machine",
+		nodeOperator: op,
 	}
 
 	_, err := reconciler.reconcileMachineOperation(context.Background(), "op-1")
@@ -92,6 +129,36 @@ func TestReconcileNodeReboot_Failed(t *testing.T) {
 	require.NoError(t, reconciler.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
 	assert.Equal(t, v1alpha3.OperationPhaseFailed, updated.Status.Phase)
 	assert.Equal(t, "restart failed", updated.Status.Message)
+	require.NotNil(t, updated.Status.StartedAt)
+	require.NotNil(t, updated.Status.CompletedAt)
+}
+
+func TestReconcileNodeReboot_FindActiveMachineFailed(t *testing.T) {
+	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Generation: 7}}
+	machineOp := &v1alpha3.MachineOperation{
+		ObjectMeta: metav1.ObjectMeta{Name: "op-1"},
+		Spec: v1alpha3.MachineOperationSpec{
+			MachineRef:    "test-machine",
+			OperationKind: v1alpha3.OperationNodeReboot,
+		},
+	}
+
+	op := &fakeNodeOperator{findErr: errors.New("no active machine")}
+	reconciler := &daemonReconciler{
+		Client:       fakeStatusClient(machine, machineOp),
+		log:          discardLogger(),
+		machineName:  "test-machine",
+		nodeOperator: op,
+	}
+
+	_, err := reconciler.reconcileMachineOperation(context.Background(), "op-1")
+	require.NoError(t, err)
+	assert.False(t, op.restartCalled)
+
+	var updated v1alpha3.MachineOperation
+	require.NoError(t, reconciler.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
+	assert.Equal(t, v1alpha3.OperationPhaseFailed, updated.Status.Phase)
+	assert.Equal(t, "no active machine", updated.Status.Message)
 	require.NotNil(t, updated.Status.StartedAt)
 	require.NotNil(t, updated.Status.CompletedAt)
 }
@@ -123,50 +190,74 @@ func TestReconcileRepave_UsesDesiredMachineConfigurationVersion(t *testing.T) {
 	})
 
 	active := &ActiveMachine{Name: "kube1", Config: baseConfig()}
-	var got *provision.UnboundedAgentConfig
+	op := &fakeNodeOperator{active: active}
 	reconciler := &daemonReconciler{
-		Client:      fakeStatusClient(machine, mcv),
-		log:         discardLogger(),
-		machineName: "test-machine",
-		nodeName:    "test-node",
-	}
-	reconciler.reconcileRepave = func(
-		ctx context.Context,
-		log *slog.Logger,
-		c client.Client,
-		machineName string,
-	) (reconcile.Result, error) {
-		return reconcileRepaveWithDeps(
-			ctx,
-			log,
-			c,
-			machineName,
-			func(*slog.Logger) (*ActiveMachine, error) {
-				return active, nil
-			},
-			func(
-				_ context.Context,
-				_ *slog.Logger,
-				actualActive *ActiveMachine,
-				cfg *provision.UnboundedAgentConfig,
-			) error {
-				require.Same(t, active, actualActive)
-				got = cfg
-
-				return nil
-			},
-		)
+		Client:       fakeStatusClient(machine, mcv),
+		log:          discardLogger(),
+		machineName:  "test-machine",
+		nodeName:     "test-node",
+		nodeOperator: op,
 	}
 
 	_, err := reconciler.Reconcile(context.Background(), daemonRequest{Kind: queueItemRepave, Name: "test-node"})
 	require.NoError(t, err)
-	require.NotNil(t, got)
-	assert.Equal(t, "1.34.1", got.Cluster.Version)
-	assert.Equal(t, "ghcr.io/test/image:v2", got.OCIImage)
-	assert.Equal(t, map[string]string{"env": "prod"}, got.Kubelet.Labels)
-	assert.Equal(t, []string{"dedicated=prod:NoSchedule"}, got.Kubelet.RegisterWithTaints)
-	assert.Equal(t, active.Config.Kubelet.ApiServer, got.Kubelet.ApiServer)
-	assert.Equal(t, active.Config.Kubelet.Auth.BootstrapToken, got.Kubelet.Auth.BootstrapToken)
+	require.Same(t, active, op.repaveActive)
+	require.NotNil(t, op.repaveConfig)
+	assert.Equal(t, "1.34.1", op.repaveConfig.Cluster.Version)
+	assert.Equal(t, "ghcr.io/test/image:v2", op.repaveConfig.OCIImage)
+	assert.Equal(t, map[string]string{"env": "prod"}, op.repaveConfig.Kubelet.Labels)
+	assert.Equal(t, []string{"dedicated=prod:NoSchedule"}, op.repaveConfig.Kubelet.RegisterWithTaints)
+	assert.Equal(t, active.Config.Kubelet.ApiServer, op.repaveConfig.Kubelet.ApiServer)
+	assert.Equal(t, active.Config.Kubelet.Auth.BootstrapToken, op.repaveConfig.Kubelet.Auth.BootstrapToken)
+
+	var updated v1alpha3.Machine
+	require.NoError(t, reconciler.Get(context.Background(), client.ObjectKey{Name: "test-machine"}, &updated))
+	require.NotNil(t, updated.Status.Configuration)
+	assert.Equal(t, "config-a", updated.Status.Configuration.Name)
+	assert.Equal(t, int32(2), updated.Status.Configuration.Version)
+	assert.Equal(t, "config-a-v2", updated.Status.Configuration.VersionName)
+
+	condition := apimeta.FindStatusCondition(
+		updated.Status.Conditions,
+		v1alpha3.MachineConditionRepavePending,
+	)
+	require.NotNil(t, condition)
+	assert.Equal(t, metav1.ConditionFalse, condition.Status)
+	assert.Equal(t, "Applied", condition.Reason)
+}
+
+func TestReconcileRepave_NoDriftMarksDesiredConfigurationApplied(t *testing.T) {
+	version := int32(2)
+	machine := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Generation: 8},
+		Spec: v1alpha3.MachineSpec{
+			ConfigurationRef: &v1alpha3.MachineConfigurationRef{
+				Name:    "config-a",
+				Version: ptr.To(version),
+			},
+		},
+	}
+	base := baseConfig()
+	mcv := machineConfigurationVersion("config-a", version, v1alpha3.MachineConfigurationTemplate{
+		Kubernetes: &v1alpha3.MachineConfigurationKubernetes{
+			Version: base.Cluster.Version,
+		},
+		Agent: &v1alpha3.MachineConfigurationAgent{Image: base.OCIImage},
+	})
+
+	op := &fakeNodeOperator{active: &ActiveMachine{Name: "kube1", Config: base}}
+	reconciler := &daemonReconciler{
+		Client:       fakeStatusClient(machine, mcv),
+		log:          discardLogger(),
+		machineName:  "test-machine",
+		nodeName:     "test-node",
+		nodeOperator: op,
+	}
+
+	_, err := reconciler.Reconcile(context.Background(), daemonRequest{Kind: queueItemRepave, Name: "test-node"})
+	require.NoError(t, err)
+	assert.Nil(t, op.repaveActive)
+	assert.Nil(t, op.repaveConfig)
 
 	var updated v1alpha3.Machine
 	require.NoError(t, reconciler.Get(context.Background(), client.ObjectKey{Name: "test-machine"}, &updated))

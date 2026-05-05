@@ -113,7 +113,7 @@ func Test_hasDrift_TaintsChange(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// findActiveMachine
+// Active machine config serialization
 // ---------------------------------------------------------------------------
 
 func TestFindActiveMachine_Kube1(t *testing.T) {
@@ -139,7 +139,7 @@ func TestFindActiveMachine_Kube1(t *testing.T) {
 	assert.Equal(t, cfg.MachineName, readCfg.MachineName)
 	assert.Equal(t, cfg.Cluster.Version, readCfg.Cluster.Version)
 
-	_ = origPath // Note: findActiveMachine uses the const, so this test
+	_ = origPath // Note: nspawnNodeOperator uses the const, so this test
 	// validates the serialization/deserialization roundtrip rather than
-	// the full findActiveMachine flow (which requires root filesystem access).
+	// the full active-machine discovery flow (which requires root filesystem access).
 }

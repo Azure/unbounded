@@ -1,15 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-// Package daemon implements nspawn-backed node lifecycle actions for the
-// unbounded-agent. During repave, when a desired AgentConfig differs from the
-// currently applied config, this package orchestrates:
-//
-//  1. Provisioning a new nspawn machine (the alternate of the current one)
-//  2. Stopping the old machine
-//  3. Starting the new machine and verifying kubelet is running
-//  4. Removing the old machine
-//  5. Persisting the new applied config
 package daemon
 
 import (
@@ -38,14 +29,29 @@ type ActiveMachine struct {
 	Config *provision.AgentConfig
 }
 
-// findActiveMachine scans the agent config directory for an applied config
-// file and returns the active machine name and config. Returns an error if
-// no applied config is found.
-//
-// After reading the config JSON, the function verifies the SHA-256 sidecar
-// checksum (if present). A missing sidecar is logged as a warning and not
-// treated as an error - see goalstates.VerifyChecksum for rationale.
-func findActiveMachine(log *slog.Logger) (*ActiveMachine, error) {
+// nodeOperator performs host-local nspawn node operations for the daemon.
+// Reconcile code depends on this interface so tests can substitute the
+// host-mutating implementation with a fake.
+type nodeOperator interface {
+	// FindActiveMachine returns the currently active nspawn machine and its
+	// applied agent configuration.
+	FindActiveMachine(*slog.Logger) (*ActiveMachine, error)
+	// RestartNode restarts the provided active nspawn-backed node in place.
+	RestartNode(context.Context, *slog.Logger, *ActiveMachine) error
+	// RepaveNode performs the nspawn machine update:
+	//  1. Provision a new rootfs on the alternate machine
+	//  2. Stop the old machine (graceful service shutdown + nspawn teardown)
+	//  3. Start the new machine (configure, boot nspawn, start services, persist config)
+	//  4. Verify kubelet health
+	//  5. Remove the old machine and its applied config
+	RepaveNode(context.Context, *slog.Logger, *ActiveMachine, *provision.UnboundedAgentConfig) error
+}
+
+type nspawnNodeOperator struct{}
+
+func (nspawnNodeOperator) FindActiveMachine(log *slog.Logger) (*ActiveMachine, error) {
+	// Verify the SHA-256 sidecar before trusting the applied config. A missing
+	// sidecar is logged as a warning and not treated as an error.
 	for _, name := range []string{goalstates.NSpawnMachineKube1, goalstates.NSpawnMachineKube2} {
 		path := goalstates.AppliedConfigPath(name)
 
@@ -123,8 +129,7 @@ func hasDrift(applied, desired *provision.AgentConfig) bool {
 	return false
 }
 
-// restartNode restarts the currently active nspawn-backed node in place.
-func restartNode(ctx context.Context, log *slog.Logger, active *ActiveMachine) error {
+func (nspawnNodeOperator) RestartNode(ctx context.Context, log *slog.Logger, active *ActiveMachine) error {
 	gs, err := goalstates.ResolveMachine(log, active.Config, active.Name, nil)
 	if err != nil {
 		return fmt.Errorf("resolve machine goal state: %w", err)
@@ -141,37 +146,21 @@ func restartNode(ctx context.Context, log *slog.Logger, active *ActiveMachine) e
 		return err
 	}
 
-	log.Info("active node restarted", "machine", active.Name)
+	log.Info("node restarted", "machine", active.Name)
 
 	return nil
 }
 
-func restartActiveNode(ctx context.Context, log *slog.Logger) error {
-	active, err := findActiveMachine(log)
-	if err != nil {
-		return fmt.Errorf("find active machine: %w", err)
-	}
-
-	return restartNode(ctx, log, active)
-}
-
-// repaveNode performs the nspawn machine update:
-//  1. Provision a new rootfs on the alternate machine
-//  2. Stop the old machine (graceful service shutdown + nspawn teardown)
-//  3. Start the new machine (configure, boot nspawn, start services, persist config)
-//  4. Verify kubelet health
-//  5. Remove the old machine and its applied config
-func repaveNode(ctx context.Context, log *slog.Logger, active *ActiveMachine, newCfg *provision.UnboundedAgentConfig) error {
-	// Skip the update if the desired config matches the applied config.
-	if !hasDrift(active.Config, &newCfg.AgentConfig) {
-		log.Info("no config drift detected, skipping node update")
-		return nil
-	}
-
+func (nspawnNodeOperator) RepaveNode(
+	ctx context.Context,
+	log *slog.Logger,
+	active *ActiveMachine,
+	newCfg *provision.UnboundedAgentConfig,
+) error {
 	oldMachine := active.Name
 	newMachine := goalstates.AlternateMachine(oldMachine)
 
-	log.Info("starting node update",
+	log.Info("starting node repave",
 		"old_machine", oldMachine,
 		"new_machine", newMachine,
 		"old_version", active.Config.Cluster.Version,
@@ -197,7 +186,7 @@ func repaveNode(ctx context.Context, log *slog.Logger, active *ActiveMachine, ne
 		return err
 	}
 
-	log.Info("node update completed",
+	log.Info("node repave completed",
 		"active_machine", newMachine,
 		"version", newCfg.Cluster.Version,
 	)

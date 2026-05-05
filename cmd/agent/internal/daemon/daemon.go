@@ -27,18 +27,15 @@ type kubeClientFunc func(cfg *rest.Config, opts client.Options) (client.WithWatc
 // Run is the main daemon entry point. It discovers the active nspawn
 // machine, builds a Kubernetes client, registers the Machine CR if needed,
 // and blocks until the context is cancelled.
-//
-// TODO: Add a trigger mechanism (e.g. file watch, signal, API) to invoke
-// repaveNode when the desired config changes.
 func Run(ctx context.Context, log *slog.Logger) error {
-	return run(ctx, log, client.NewWithWatch)
+	return run(ctx, log, client.NewWithWatch, nspawnNodeOperator{})
 }
 
 // run is the inner loop, accepting a client constructor so tests can
 // inject a fake.
-func run(ctx context.Context, log *slog.Logger, newClient kubeClientFunc) error {
+func run(ctx context.Context, log *slog.Logger, newClient kubeClientFunc, nodeOperator nodeOperator) error {
 	// Find the active machine and its applied config.
-	active, err := findActiveMachine(log)
+	active, err := nodeOperator.FindActiveMachine(log)
 	if err != nil {
 		return fmt.Errorf("find active machine: %w", err)
 	}
@@ -71,7 +68,7 @@ func run(ctx context.Context, log *slog.Logger, newClient kubeClientFunc) error 
 		return fmt.Errorf("register machine: %w", err)
 	}
 
-	return runController(ctx, log, restCfg, active.Config.MachineName)
+	return runController(ctx, log, restCfg, active.Config.MachineName, nodeOperator)
 }
 
 // buildRESTConfig builds a Kubernetes REST config from the applied agent
