@@ -114,7 +114,7 @@ func (t *removeDaemonUnit) Name() string { return "remove-daemon-unit" }
 
 func (t *removeDaemonUnit) Do(ctx context.Context) error {
 	if err := executil.RunCmd(ctx, t.log, executil.Systemctl(), "disable", goalstates.DaemonUnit); err != nil {
-		t.log.Warn("failed to disable daemon (may not be enabled)", "error", err)
+		t.log.Warn("failed to disable daemon (may already be absent or systemd unavailable)", "error", err)
 	}
 
 	unitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonUnit)

@@ -1261,6 +1261,9 @@ def validate_workload() -> None:
 def reset_agent() -> None:
     """Trigger AgentReset and verify the node is removed."""
 
+    if not SSH_KEY.exists():
+        die(f"SSH key not found: {SSH_KEY}. Run create-vm first.")
+
     operation_name = f"e2e-agent-reset-{int(time.time())}"
 
     run_quiet([KUBECTL, "delete", _machine_operation_resource(), operation_name,
@@ -1298,9 +1301,6 @@ def reset_agent() -> None:
         elapsed += 5
     else:
         die(f"Timed out waiting for node '{AGENT_MACHINE_NAME}' to be removed after {node_timeout}s")
-
-    if not SSH_KEY.exists():
-        die(f"SSH key not found: {SSH_KEY}. Run create-vm first.")
 
     # Verify the nspawn machines are no longer running on the VM
     log("Verifying nspawn machines are stopped on VM...")
