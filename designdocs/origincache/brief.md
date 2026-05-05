@@ -24,19 +24,23 @@ within and across replicas, and presents the same `GetObject` /
 ## 2. Goals and non-goals
 
 Goals (v1):
-- Read-only S3-compatible API at the edge, including byte-range GETs.
+- Read-only S3-compatible API at the edge: `GetObject` (with byte-range
+  `Range`), `HeadObject`, `ListObjectsV2`.
 - Multi-PB working set; thousands of concurrent clients.
 - Multi-DC deployment; each DC independent (no cross-DC peering).
 - Negligible origin stampede under correlated cold-access bursts.
 - Low **TTFB** (time to first byte) on both warm and cold paths.
 - Atomic, durable commit of fetched chunks; safe under concurrent
   fills.
+- Bounded staleness on operator-contract violation: at most one
+  `metadata_ttl` window (default 5m); zero otherwise.
 
 Non-goals (v1):
 - Write path, multipart upload, object versioning.
 - Cross-DC peering.
 - SigV4 verification at the edge (bearer / mTLS only).
 - Multi-tenant quotas or per-tenant credentials.
+- Per-client / per-IP edge rate limiting.
 - Mutable-blob invalidation beyond ETag identity.
 - Encryption at rest beyond what the backing store provides.
 
@@ -91,9 +95,13 @@ graph TB
 
 ## 4. Components
 
-Named building blocks. See
-[design.md s7](./design.md#7-internal-interfaces) for the full
-interface definitions.
+Named building blocks. The first five (Origin, CacheStore, ChunkCatalog,
+Cluster, Spool) are formal Go interfaces in
+[design.md s7](./design.md#7-internal-interfaces); the request-edge
+components (Server, fetch.Coordinator, Singleflight, Auth) are
+process-internal and are described in
+[design.md s4](./design.md#4-architecture) and
+[s8](./design.md#8-stampede-protection).
 
 - **Server** - the S3-compatible HTTP edge for clients, plus a
   separate internal listener for per-chunk fill RPCs between
@@ -118,7 +126,7 @@ interface definitions.
   choice invisible above the cachestore boundary.
 - **Cluster** - peer discovery from the headless Service plus
   rendezvous hashing on pod IP to pick the coordinator per
-  `ChunkKey`. Refreshes membership every 5 s by default.
+  `ChunkKey`. Refreshes membership every 5s by default.
 - **Auth** - bearer / mTLS on the client edge and mTLS plus
   peer-IP authorization on the internal listener. Separate trust
   roots.
@@ -186,7 +194,7 @@ a new key. Because the
 cache key includes ETag (s5.1), as long as the contract holds the
 cache cannot serve stale bytes. If the contract is violated by an
 in-place overwrite, the cache may serve old bytes for at most one
-`metadata_ttl` window (default 5 m), bounded by the metadata cache
+`metadata_ttl` window (default 5m), bounded by the metadata cache
 TTL. This is the load-bearing semantic for correctness and MUST
 appear in the consumer-API documentation. Defense in depth: every
 `Origin.GetRange` carries `If-Match: <etag>`, so a mid-flight
@@ -256,7 +264,7 @@ sequenceDiagram
 
 1. **Immutable-origin contract** - Correctness rests on operators
    publishing new keys instead of overwriting. Bounded violation
-   window is `metadata_ttl` (5 m default). Must be visible in
+   window is `metadata_ttl` (5m default). Must be visible in
    consumer-API documentation. See
    [design.md s11](./design.md#11-bounded-staleness-contract).
 2. **Commit-after-serve failure** - Cold-path TTFB is gated on local
@@ -289,8 +297,8 @@ sequenceDiagram
 `design.md` (full mechanism + flow):
 - [s2 Decisions](./design.md#2-decisions) - locked design choices.
 - [s3 Terminology](./design.md#3-terminology) - full glossary.
-- [s4-s8](./design.md#4-architecture) - architecture, request flow,
-  internal interfaces, stampede protection.
+- [s4 Architecture and onward](./design.md#4-architecture) -
+  architecture, request flow, internal interfaces, stampede protection.
 - [s10.1 Atomic commit per driver](./design.md#101-atomic-commit-per-cachestore-driver)
 - [s11 Bounded staleness](./design.md#11-bounded-staleness-contract)
 - 11 inline mermaid diagrams covering hits, misses, cross-replica

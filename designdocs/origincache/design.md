@@ -44,6 +44,7 @@ layout, phasing, configuration, observability, and operational concerns.
 | Local spool | Every fill writes origin bytes through a local spool (`internal/origincache/fetch/spool`) so slow joiners always have a local fallback regardless of CacheStore driver (s8.2). |
 | Atomic commit | `localfs` and `posixfs` stage inside `<root>/.staging/<uuid>` with parent-dir fsync, then `link()` no-clobber (returns `EEXIST` to the loser); `s3` uses direct `PutObject` with `If-None-Match: *`. Each driver runs `SelfTestAtomicCommit` at boot: `s3` proves the backend honors `If-None-Match: *`; `posixfs` proves the backend honors `link()` / `EEXIST` and that directory fsync is durable, and additionally enforces `nfs.minimum_version` (default `4.1`, with opt-in `nfs.allow_v3`) and refuses to start on Alluxio FUSE backends. Cold-path TTFB is gated on local Spool fsync, not on CacheStore commit; commit-after-serve failure becomes `commit_after_serve_total{result="failed"}` rather than a client error (s8.6). |
 | Tenancy | Single tenant, single origin credential set in v1. |
+| Edge rate limiting | Out of scope for v1. No per-client / per-IP / per-credential rate limiting at the S3 edge. Hot-client mitigation in v1 is implicit: the per-replica origin semaphore (s8.4) caps cold-fill concurrency regardless of caller, and the singleflight (s8.1) coalesces concurrent identical fills. Edge rate limiting is Phase 4 and only if measured. |
 | Repo home | This repo. Layout mirrors `machina`. |
 
 ## 3. Terminology
@@ -60,7 +61,10 @@ section that defines or implements the full mechanism.
   [s7](#7-internal-interfaces).
 - **CacheStore** - the in-DC durable store that holds cached chunk bytes
   and is shared by all replicas. Pluggable: `localfs` for dev, `s3` (e.g.
-  VAST) for prod. Treated as the source of truth for chunk presence.
+  VAST or any S3-compatible in-DC object store) and `posixfs` (shared
+  POSIX FS - NFSv4.1+, Weka native, CephFS, Lustre, GPFS) for prod;
+  driver choice is a deployment-time decision and is invisible above the
+  cachestore boundary. Treated as the source of truth for chunk presence.
   Interface in [s7](#7-internal-interfaces); commit semantics in
   [s10](#10-concurrency-durability-correctness).
 - **Chunk** - a fixed-size byte range of an origin object (default 8 MiB);
@@ -182,7 +186,7 @@ graph TB
         end
         Headless["Headless Service<br/>peer discovery"]
         Internal["Internal listener :8444<br/>per-chunk fill RPC<br/>(mTLS, peer-IP authz)"]
-        CS[("CacheStore<br/>in-DC S3 / localfs")]
+        CS[("CacheStore<br/>in-DC S3 / posixfs / localfs")]
     end
     subgraph Cloud["Cloud origins"]
         S3[("AWS S3")]
@@ -244,6 +248,24 @@ path    = "<origin_id>/<hex(hashKey)>/<chunk_index>"
 into the hash, not the path) so operators can run per-origin lifecycle
 policies and target a specific deployment with `aws s3 rm --recursive
 <bucket>/<origin_id>/`.
+
+The `cachestore/posixfs` driver inserts a 2-character hex fan-out
+between `<origin_id>` and `<hex(hashKey)>` to keep directory sizes
+manageable on multi-PB working sets; that variant and its
+`cachestore.posixfs.fanout_chars` knob are specified in
+[s10.1.2](#1012-cachestoreposixfs). The `s3` and `localfs` drivers use
+the unmodified path above.
+
+**Operational note: changing `chunk_size`.** Because `chunk_size` is a
+field of `ChunkKey` and is folded into the path hash, changing it in
+deployment config never corrupts or shadows existing chunks; old-sized
+chunks remain valid byte ranges of the old logical layout but are no
+longer addressable. Operators should plan for transient storage
+doubling and a cold-period origin-cost spike when changing
+`chunk_size` on a hot working set: the working set is rebuilt at the
+new size on demand while the old set ages out via the CacheStore
+lifecycle policy (or, on `posixfs`, the operator's external sweep -
+see [s12](#12-eviction-and-capacity)).
 
 Whether a chunk is present is answered by `CacheStore.Stat(key)`. An
 in-memory `ChunkCatalog` LRU memoizes recent positive lookups so the hot
@@ -403,6 +425,95 @@ sequenceDiagram
     SF->>Sp: release after joiners drain
 ```
 
+### 6.1 HEAD request flow
+
+`HEAD /{bucket}/{key}` is served entirely from object metadata; no
+chunk lookup is performed.
+
+1. Auth as for GET.
+2. `fetch.Coordinator` looks up `ObjectInfo` in the metadata cache.
+   On miss, the metadata-layer singleflight (s8.7) issues at most one
+   `Origin.Head` per object per replica per `metadata_ttl` window.
+3. On success, return `200 OK` with `Content-Length:
+   ObjectInfo.Size`, `ETag: "ObjectInfo.ETag"`, `Content-Type:
+   ObjectInfo.ContentType`, `Accept-Ranges: bytes`. No
+   `CacheStore.Stat` and no `CacheStore.GetChunk` calls.
+4. Negative cases reuse the GET error mapping (s6.3): `404` is
+   negatively cached for `metadata_ttl`; an unsupported azureblob
+   blob type (s9) returns `502 OriginUnsupported` with the
+   `x-origincache-reject-reason` header.
+
+HEAD does NOT validate `If-Match` / `If-None-Match` / `If-Modified-Since`
+preconditions against the cache state in v1; conditional HEAD is a
+read-only client-side concern that operates on the returned `ETag`.
+
+### 6.2 LIST request flow
+
+`GET /{bucket}/?list-type=2&prefix=...` (S3 ListObjectsV2). v1 LIST is
+a thin pass-through with per-replica metadata-layer singleflight; no
+LIST result is cached on disk.
+
+1. Auth as for GET.
+2. The request parameters `(prefix, continuation-token / start-after,
+   max-keys, delimiter)` are forwarded verbatim to `Origin.List`. The
+   continuation token returned to the client is the origin's token
+   passed through unchanged. There is no token rewriting.
+3. **Per-replica LIST singleflight** keyed on
+   `(origin_id, bucket, prefix, marker, max)` collapses concurrent
+   identical LIST calls on the same replica. There is no cluster-wide
+   LIST singleflight in v1 - cluster-wide cold fan-out can produce up
+   to `N` `Origin.List` calls per identical query, where `N` is the
+   peer-set size. Acceptable in v1 (LIST is rare on the intended
+   workload); a cluster-wide LIST singleflight is Phase 4 only if
+   measured.
+4. **azureblob origin**: when `cachestore.azureblob.list_mode = filter`
+   (the default), non-BlockBlob entries are stripped while
+   continuation tokens are preserved (s9). `passthrough` mode disables
+   filtering and returns the entire listing including unsupported
+   blob types.
+5. LIST does NOT populate the metadata cache for individual entries.
+   A subsequent GET / HEAD on a listed key still triggers an
+   `Origin.Head` (subject to its own singleflight and TTL). Rationale:
+   eager metadata population on large listings would balloon the
+   metadata cache, and the intended GET workload addresses keys that
+   are already known.
+6. Origin failures during LIST surface as `502 Bad Gateway`
+   (`ErrTransient` upstream) or the corresponding S3 error code; LIST
+   does NOT trip the CacheStore circuit breaker because it never
+   touches the CacheStore.
+
+LIST is intentionally a thin pass-through in v1. The intended workload
+(large immutable artifacts under known keys) makes correctness the
+only concern; if heavy-LIST workloads emerge, a Phase 4 LIST cache
+with prefix-keyed cluster-wide singleflight is the natural follow-up.
+
+### 6.3 HTTP error-code mapping
+
+The complete catalog of HTTP statuses the cache layer can return on
+the **client edge**. Internal-listener (`:8444`, s8.8) statuses are
+listed inline in s8.3 and are not reproduced here.
+
+| Status | S3-style code | Reason | Triggered by | Client retry? |
+|---|---|---|---|---|
+| `200 OK` / `206 Partial Content` | (none) | normal hit or successful fill | hit + range OK; cold-path fill past spool-fsync gate | n/a |
+| `400 RequestSizeExceedsLimit` | `RequestSizeExceedsLimit` | response would exceed `server.max_response_bytes` | range math at request entry; `x-origincache-cap-exceeded: true` | no (different range) |
+| `416 Requested Range Not Satisfiable` | `InvalidRange` | range vs. `ObjectInfo.Size` violation | range math at request entry | no (different range) |
+| `502 Bad Gateway` | `OriginUnreachable` | origin error pre-spool-fsync gate | `Origin.GetRange` 5xx; origin DNS failure; semaphore exhausted past wait | yes, small backoff |
+| `502 Bad Gateway` | `OriginETagChanged` | `OriginETagChangedError` from `Origin.GetRange` (s8.6) | mid-flight overwrite caught by `If-Match` | yes (next request re-Heads) |
+| `502 Bad Gateway` | `OriginUnsupported` | non-BlockBlob azureblob (s9) | `Origin.Head` returns unsupported blob type | no |
+| `502 Bad Gateway` | `BackendUnavailable` | CacheStore `ErrAuth` | CacheStore credentials rejected | no (operator) |
+| `503 Slow Down` | `SlowDown` | CacheStore `ErrTransient` | CacheStore 5xx / timeout / throttle | yes |
+| `503 Slow Down` | `SlowDown` | spool full | `spool.max_inflight` exhausted past wait | yes |
+| `503 Slow Down` | `SlowDown` | breaker open | per-process CacheStore breaker open (s10.2) | yes |
+| `503 Service Unavailable` | (probe) | replica NotReady | `/readyz` failing predicates (s10.5) | n/a (LB drain) |
+| (mid-stream abort) | n/a | post-first-byte failure | CacheStore or origin failure after Spool-fsync gate | client SDK detects via `Content-Length` mismatch and retries |
+
+`Retry-After: 1s` is set on every `503 Slow Down`. Pre-first-byte
+errors carry an S3-style XML body (`<Error><Code>...<Message>...`).
+Mid-stream aborts terminate the response (`HTTP/2 RST_STREAM(INTERNAL_ERROR)`
+or `HTTP/1.1 Connection: close`) and increment
+`origincache_responses_aborted_total{phase="mid_stream",reason}`.
+
 ## 7. Internal interfaces
 
 The mechanism's named seams. Implementations live under
@@ -458,6 +569,15 @@ var (
 // present in the CacheStore. Purely a hot-path optimization; the
 // CacheStore is the source of truth. A Lookup miss falls through to
 // CacheStore.Stat; the result is Recorded for subsequent requests.
+//
+// Forget is invoked when an entry is known to be invalid:
+//   - on OriginETagChangedError, the assembler Forgets the now-stale
+//     ChunkKey (its etag has been superseded);
+//   - on a CacheStore.GetChunk returning ErrNotFound for a key that
+//     was previously Recorded (lifecycle eviction caught the entry).
+// In v1 there are no other callers; in particular, lifecycle
+// eviction does not push notifications back into the catalog and
+// stale entries are repaired lazily via the ErrNotFound path above.
 type ChunkCatalog interface {
     Lookup(k ChunkKey) (ChunkInfo, bool)
     Record(k ChunkKey, info ChunkInfo)
@@ -492,6 +612,61 @@ type SpoolWriter interface {
     io.Writer
     Commit() error // fsync + close
     Abort() error  // discard
+}
+
+// ---------------------------------------------------------------------
+// Supporting types referenced by the interfaces above.
+// ---------------------------------------------------------------------
+
+// ObjectInfo: result of a successful Origin.Head and the metadata-cache
+// entry shape. LastValidated and LastStatus are advisory and used for
+// negative-cache TTL accounting (s8.6).
+type ObjectInfo struct {
+    Size          int64
+    ETag          string
+    ContentType   string
+    LastValidated time.Time
+    LastStatus    int // last HTTP status seen from the origin
+}
+
+// ChunkInfo: result of a successful CacheStore.Stat or
+// ChunkCatalog.Lookup. Size is the on-store byte length, which equals
+// chunk_size for all chunks except the last chunk of an object (which
+// is partial; see s10.3).
+type ChunkInfo struct {
+    Size      int64
+    Committed time.Time
+}
+
+// ListResult: paginated result from Origin.List.
+type ListResult struct {
+    Entries     []ObjectEntry
+    NextMarker  string
+    IsTruncated bool
+}
+
+// ObjectEntry: one item in a ListResult. BlobType is azureblob-specific
+// and lets the cache filter non-BlockBlob entries while preserving
+// continuation tokens (s9).
+type ObjectEntry struct {
+    Key      string
+    Size     int64
+    ETag     string
+    BlobType string // "" for s3 origin; "BlockBlob" / "PageBlob" / "AppendBlob" for azureblob
+}
+
+// Peer: a single replica in the current peer-set snapshot returned by
+// Cluster.Peers / Cluster.Coordinator / Cluster.Self.
+type Peer struct {
+    IP   string // pod IP from the headless Service A-record
+    Self bool   // true iff this is the current process
+}
+
+// InternalClient: HTTP/2 over mTLS client to a peer's internal listener.
+// Returned by Cluster.InternalDial. v1 exposes a single RPC; the
+// surface can grow as additional internal RPCs are introduced.
+type InternalClient interface {
+    Fill(ctx context.Context, k ChunkKey) (io.ReadCloser, error)
 }
 ```
 
@@ -671,7 +846,7 @@ for that chunk (one duplicate fill possible during flux; observable via
 the duplicate-fills metric below). Receivers MUST NOT chain forward
 internal RPCs.
 
-Combined with 7.1, exactly one origin GET per cold chunk per cluster in
+Combined with s8.1, exactly one origin GET per cold chunk per cluster in
 steady state. During membership change we accept up to one duplicate fill
 per chunk (loser drops on commit collision; observable via
 `origincache_origin_duplicate_fills_total{result="commit_lost"}` - see
@@ -919,6 +1094,12 @@ loser, and share their helpers via
 `internal/origincache/cachestore/internal/posixcommon/`. `s3` uses
 `PutObject + If-None-Match: *` returning `412` to the loser. All three
 drivers run `SelfTestAtomicCommit` at boot.
+
+Commit outcomes are recorded as label values on the metric
+`origincache_origin_duplicate_fills_total{result="commit_won|commit_lost"}`
+(s8.3). Throughout this section "increment commit_won" / "increment
+commit_lost" is shorthand for "increment that counter with the
+matching label value".
 
 #### 10.1.1 cachestore/localfs
 
@@ -1174,6 +1355,60 @@ The check is in `internal/origincache/fetch/spool/` and runs from
 It runs before any CacheStore self-test so a misconfigured spool fails
 fast even on backends that would otherwise pass their own self-test.
 
+### 10.5 Readiness probe (`/readyz`)
+
+The HTTP `/readyz` endpoint reports whether the replica should
+receive client traffic. It is checked by the Kubernetes readiness
+probe and by front-of-cluster load balancers. Distinct from
+`/livez`, which is a process-liveness check only.
+
+**Response shape.**
+
+- `200 OK`, body `{"ready": true}`, when **all** of the following
+  predicates hold:
+  1. boot self-tests have passed (`SelfTestAtomicCommit` for the
+     configured CacheStore driver; spool locality check, s10.4);
+  2. the per-process CacheStore circuit breaker (s10.2) is `closed`
+     or `half_open`;
+  3. consecutive `ErrAuth` count from the CacheStore is below
+     `readyz.errauth_consecutive_threshold` (default 3);
+  4. peer discovery (s13) has completed at least one successful DNS
+     refresh since boot (the empty-peer fallback in s13 keeps the
+     replica functional, but `/readyz` still requires one
+     successful refresh so a totally broken DNS path does not stay
+     silently masked);
+  5. the local Spool has free capacity below `spool.max_bytes`.
+
+- `503 Service Unavailable`, body
+  `{"ready": false, "reasons": ["..."]}`, when any predicate above
+  fails. The `reasons` array names the failing predicates by stable
+  string keys (`selftest_pending`, `selftest_failed`,
+  `breaker_open`, `errauth_threshold`, `peer_discovery_pending`,
+  `spool_full`) so operators can triage from a probe response
+  alone.
+
+**NotReady -> Ready transitions.** The endpoint is stateless apart
+from reading the underlying components. Predicates clear themselves
+as the system recovers:
+
+- breaker `open` -> `closed` after `half_open_probes` successful
+  probes (s10.2);
+- `ErrAuth` consecutive counter resets on any non-`ErrAuth` success;
+- spool fullness clears as in-flight fills drain;
+- peer discovery flips to "completed" on the first successful
+  refresh and stays sticky for the lifetime of the process.
+
+**`/livez`.** A liveness-only check that returns `200 OK` if the
+process is running and the HTTP listener is bound; it does NOT
+consider any of the predicates above and is intentionally trivial.
+This separation lets the readiness probe drain a misconfigured
+replica without restarting it (so operators can inspect logs).
+
+`/readyz` and `/livez` are bound to the same client listener as the
+S3 API; they are NOT served on the internal listener (`:8444`,
+s8.8) because the internal listener's authorization scope is
+restricted to `/internal/fill`.
+
 ## 11. Bounded staleness contract
 
 OriginCache trusts an **operator contract** for correctness, and bounds
@@ -1238,6 +1473,20 @@ by the CacheStore. Because the on-store path is namespaced by
 `origin_id` (s5), per-origin lifecycle policies can be configured
 independently on the same CacheStore bucket.
 
+**`cachestore/posixfs` deployments**. Shared POSIX filesystems
+(NFSv4.1+, Weka native, CephFS, Lustre, GPFS) do not provide native
+object-lifecycle policies. The cache layer ships no automatic
+posixfs eviction in v1; operators MUST schedule an external cleanup
+mechanism. The recommended baseline is an age-based sweep against
+`<root>/<origin_id>/` from cron or a Kubernetes `CronJob` (e.g.
+`find <root>/<origin_id> -type f -atime +<n> -delete`). The sweep
+runs out-of-band; the cache layer does not need to be aware of it,
+because a `CacheStore.GetChunk` on a swept entry returns
+`ErrNotFound` and re-enters the miss-fill path. Operators SHOULD
+NOT sweep the staging subdirectory `<root>/.staging/` - that is
+managed by the driver's own background sweep
+(`cachestore.posixfs.staging_max_age`, default 1h, s10.1.2).
+
 The cache layer itself does not evict CacheStore objects in v1. The
 in-memory `ChunkCatalog` uses a fixed-size LRU; entries falling out of it
 are not evicted from the CacheStore, only from the metadata cache - a
@@ -1246,6 +1495,13 @@ subsequent request will rediscover the chunk via `CacheStore.Stat`.
 The local **spool** (s8.2) is bounded by `spool.max_bytes`; full-spool
 conditions block new fills briefly, then return `503 Slow Down` to
 clients. Spool entries are released as soon as in-flight readers drain.
+
+**Capacity impact of `chunk_size` config changes.** See the
+operational note in [s5](#5-chunk-model): changing `chunk_size`
+orphans the existing chunk set under the old size; storage
+transiently doubles and the working set is rebuilt at the new size
+on demand. The CacheStore lifecycle policy (or, on `posixfs`, the
+operator's external sweep above) ages the orphaned chunks out.
 
 Future work (Phase 4): if hot-chunk re-fetch from origin caused by
 lifecycle eviction proves material, add an in-cache access-tracking layer
@@ -1277,6 +1533,26 @@ rolling restarts when a pod's IP changes); the duplicate-fill metric (see
 Replication factor = 1 in v1 (cache loss is recoverable from origin).
 Optional R=2 for hot chunks deferred to Phase 4. Every replica sees the
 entire CacheStore. No replica owns bytes; replica loss never strands data.
+
+**Empty / unavailable peer set.** If `Cluster.Peers()` returns an
+empty set (the headless Service has no Ready endpoints, the DNS
+record returns NXDOMAIN, or the kube-dns / CoreDNS path is broken),
+the replica treats itself as the only peer: rendezvous hashing
+returns self for every `ChunkKey` and all fills run locally. The
+replica does NOT refuse to serve; cluster-wide deduplication
+(s8.3) degrades to per-replica deduplication for the duration. A
+subsequent successful DNS refresh re-introduces peers without
+process restart.
+
+DNS-refresh outcomes are exposed as
+`origincache_cluster_dns_refresh_total{result="ok|fail|empty"}` and
+the current peer-set size as `origincache_cluster_peers` (gauge).
+Boot-time failure is logged at WARN; sustained empty-peer state is
+trivially observable from the gauge. The `/readyz` predicate
+(s10.5) requires that **at least one** DNS refresh has succeeded
+since boot; a totally broken DNS path therefore keeps the replica
+NotReady and load balancers drain it, even though the empty-peer
+local-fill fallback would otherwise let it serve.
 
 ### Diagram 10: Membership & rendezvous hash
 
