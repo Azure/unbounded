@@ -5,7 +5,6 @@ package controller
 
 import (
 	"context"
-	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -247,7 +246,7 @@ func machineConfigurationVersion(
 ) *unboundedv1alpha3.MachineConfigurationVersion {
 	return &unboundedv1alpha3.MachineConfigurationVersion{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: fmt.Sprintf("%s-v%d", configurationName, version),
+			Name: unboundedv1alpha3.MachineConfigurationVersionName(configurationName, version),
 			Labels: map[string]string{
 				unboundedv1alpha3.MCVConfigurationLabelKey: configurationName,
 			},

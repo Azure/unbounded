@@ -86,6 +86,12 @@ const (
 	// match. The Machine remains in a waiting state until a
 	// configuration is assigned.
 	MachineConditionConfigurationPending = "ConfigurationPending"
+
+	// MachineConditionRepavePending indicates that the Machine's desired
+	// configuration version has not yet been applied to the running Node.
+	// For OnDelete updates this remains True until the operator deletes
+	// the Node and the agent repaves with the desired version.
+	MachineConditionRepavePending = "RepavePending"
 )
 
 // Annotation keys.

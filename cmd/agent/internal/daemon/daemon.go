@@ -29,7 +29,7 @@ type kubeClientFunc func(cfg *rest.Config, opts client.Options) (client.WithWatc
 // and blocks until the context is cancelled.
 //
 // TODO: Add a trigger mechanism (e.g. file watch, signal, API) to invoke
-// updateNode when the desired config changes.
+// repaveNode when the desired config changes.
 func Run(ctx context.Context, log *slog.Logger) error {
 	return run(ctx, log, client.NewWithWatch)
 }

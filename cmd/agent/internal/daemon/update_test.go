@@ -98,14 +98,18 @@ func Test_hasDrift_OciImageChange(t *testing.T) {
 	assert.True(t, hasDrift(applied, desired))
 }
 
-func Test_hasDrift_LabelsOnlyDoNotTrigger(t *testing.T) {
-	// Labels are not compared by hasDrift - only fields that require
-	// a machine update are checked. Label changes are handled by the
-	// kubelet registration, not a full rootfs reprovision.
+func Test_hasDrift_LabelsChange(t *testing.T) {
 	applied := baseConfig()
 	desired := baseConfig()
 	desired.Kubelet.Labels = map[string]string{"env": "prod"}
-	assert.False(t, hasDrift(applied, desired))
+	assert.True(t, hasDrift(applied, desired))
+}
+
+func Test_hasDrift_TaintsChange(t *testing.T) {
+	applied := baseConfig()
+	desired := baseConfig()
+	desired.Kubelet.RegisterWithTaints = []string{"dedicated=prod:NoSchedule"}
+	assert.True(t, hasDrift(applied, desired))
 }
 
 // ---------------------------------------------------------------------------

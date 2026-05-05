@@ -1,9 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-// Package daemon implements nspawn machine updates for the unbounded-agent.
-// When a desired AgentConfig differs from the currently applied config, this
-// package orchestrates:
+// Package daemon implements nspawn-backed node lifecycle actions for the
+// unbounded-agent. During repave, when a desired AgentConfig differs from the
+// currently applied config, this package orchestrates:
 //
 //  1. Provisioning a new nspawn machine (the alternate of the current one)
 //  2. Stopping the old machine
@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"reflect"
 	"strings"
 
 	"github.com/Azure/unbounded/internal/provision"
@@ -112,6 +113,12 @@ func hasDrift(applied, desired *provision.AgentConfig) bool {
 	if applied.Kubelet.Auth.BootstrapToken != desired.Kubelet.Auth.BootstrapToken {
 		return true
 	}
+	if !reflect.DeepEqual(applied.Kubelet.Labels, desired.Kubelet.Labels) {
+		return true
+	}
+	if !reflect.DeepEqual(applied.Kubelet.RegisterWithTaints, desired.Kubelet.RegisterWithTaints) {
+		return true
+	}
 
 	return false
 }
@@ -148,13 +155,13 @@ func restartActiveNode(ctx context.Context, log *slog.Logger) error {
 	return restartNode(ctx, log, active)
 }
 
-// UpdateNode performs the nspawn machine update:
+// repaveNode performs the nspawn machine update:
 //  1. Provision a new rootfs on the alternate machine
 //  2. Stop the old machine (graceful service shutdown + nspawn teardown)
 //  3. Start the new machine (configure, boot nspawn, start services, persist config)
 //  4. Verify kubelet health
 //  5. Remove the old machine and its applied config
-func UpdateNode(ctx context.Context, log *slog.Logger, active *ActiveMachine, newCfg *provision.UnboundedAgentConfig) error {
+func repaveNode(ctx context.Context, log *slog.Logger, active *ActiveMachine, newCfg *provision.UnboundedAgentConfig) error {
 	// Skip the update if the desired config matches the applied config.
 	if !hasDrift(active.Config, &newCfg.AgentConfig) {
 		log.Info("no config drift detected, skipping node update")

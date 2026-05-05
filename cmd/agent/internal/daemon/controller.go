@@ -45,6 +45,7 @@ type daemonReconciler struct {
 	machineName       string
 	nodeName          string
 	restartActiveNode func(context.Context, *slog.Logger) error
+	reconcileRepave   repaveFunc
 }
 
 func runController(ctx context.Context, log *slog.Logger, restCfg *rest.Config, machineName string) error {
@@ -58,6 +59,7 @@ func runController(ctx context.Context, log *slog.Logger, restCfg *rest.Config, 
 		machineName:       machineName,
 		nodeName:          nodeName,
 		restartActiveNode: restartActiveNode,
+		reconcileRepave:   reconcileRepave,
 	}
 
 	mgr, err := ctrl.NewManager(restCfg, manager.Options{
@@ -77,6 +79,7 @@ func runController(ctx context.Context, log *slog.Logger, restCfg *rest.Config, 
 				&v1alpha3.Machine{}: {
 					Field: fields.OneTermEqualSelector("metadata.name", machineName),
 				},
+				&v1alpha3.MachineConfigurationVersion{}: {},
 			},
 		},
 	})
@@ -144,8 +147,7 @@ func (r *daemonReconciler) Reconcile(ctx context.Context, req daemonRequest) (re
 	case queueItemMachineOperation:
 		return r.reconcileMachineOperation(ctx, req.Name)
 	case queueItemRepave:
-		r.log.Info("repave queued", "node", req.Name)
-		return reconcile.Result{}, nil
+		return r.reconcileRepave(ctx, r.log, r.Client, r.machineName)
 	default:
 		return reconcile.Result{}, nil
 	}

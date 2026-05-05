@@ -134,7 +134,7 @@ func (r *MachineConfigurationBindingReconciler) resolveExplicitConfiguration(
 	ref *unboundedv1alpha3.MachineConfigurationRef,
 ) (*configurationSelection, error) {
 	if ref.Version != nil {
-		name := fmt.Sprintf("%s-v%d", ref.Name, *ref.Version)
+		name := unboundedv1alpha3.MachineConfigurationVersionName(ref.Name, *ref.Version)
 		var mcv unboundedv1alpha3.MachineConfigurationVersion
 		if err := r.Get(ctx, client.ObjectKey{Name: name}, &mcv); err != nil {
 			return nil, fmt.Errorf("get MachineConfigurationVersion %s: %w", name, err)

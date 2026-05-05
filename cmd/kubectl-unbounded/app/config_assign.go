@@ -66,7 +66,7 @@ func runConfigAssign(ctx context.Context, c client.WithWatch, configName, machin
 
 	// If a version is specified, verify the MCV exists.
 	if version != nil {
-		mcvName := fmt.Sprintf("%s-v%d", configName, *version)
+		mcvName := v1alpha3.MachineConfigurationVersionName(configName, *version)
 		mcv := &v1alpha3.MachineConfigurationVersion{}
 
 		if err := c.Get(ctx, client.ObjectKey{Name: mcvName}, mcv); err != nil {

@@ -126,7 +126,7 @@ func (r *MachineConfigurationReconciler) createVersion(
 ) error {
 	mcv := &unboundedv1alpha3.MachineConfigurationVersion{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: fmt.Sprintf("%s-v%d", mc.Name, version),
+			Name: unboundedv1alpha3.MachineConfigurationVersionName(mc.Name, version),
 			Labels: map[string]string{
 				unboundedv1alpha3.MCVConfigurationLabelKey: mc.Name,
 				unboundedv1alpha3.MCVVersionLabelKey:       strconv.Itoa(int(version)),
