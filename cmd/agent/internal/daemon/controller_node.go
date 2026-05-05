@@ -17,6 +17,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/machineconfigs"
 	"github.com/Azure/unbounded/internal/provision"
 )
 
@@ -63,15 +64,15 @@ func resolveDesiredRepaveConfig(
 	machineName string,
 	applied *provision.AgentConfig,
 ) (*provision.UnboundedAgentConfig, *v1alpha3.MachineConfigurationRefStatus, error) {
-	var machine v1alpha3.Machine
-	if err := c.Get(ctx, client.ObjectKey{Name: machineName}, &machine); err != nil {
-		return nil, nil, fmt.Errorf("get Machine %s: %w", machineName, err)
+	machine, err := getLocalMachine(ctx, c, machineName)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	desired := configFromApplied(applied)
 	var appliedRef *v1alpha3.MachineConfigurationRefStatus
 	if machine.Spec.ConfigurationRef != nil {
-		mcv, err := resolveMachineConfigurationVersion(ctx, c, machine.Spec.ConfigurationRef)
+		mcv, err := machineconfigs.ResolveVersionFromRef(ctx, c, machine.Spec.ConfigurationRef)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -85,45 +86,6 @@ func resolveDesiredRepaveConfig(
 	}
 
 	return &desired, appliedRef, nil
-}
-
-func resolveMachineConfigurationVersion(
-	ctx context.Context,
-	c client.Client,
-	ref *v1alpha3.MachineConfigurationRef,
-) (*v1alpha3.MachineConfigurationVersion, error) {
-	if ref.Version != nil {
-		var mcv v1alpha3.MachineConfigurationVersion
-		name := v1alpha3.MachineConfigurationVersionName(ref.Name, *ref.Version)
-		if err := c.Get(ctx, client.ObjectKey{Name: name}, &mcv); err != nil {
-			return nil, fmt.Errorf("get MachineConfigurationVersion %s: %w", name, err)
-		}
-
-		return &mcv, nil
-	}
-
-	var list v1alpha3.MachineConfigurationVersionList
-	if err := c.List(ctx, &list, client.MatchingLabels{
-		v1alpha3.MCVConfigurationLabelKey: ref.Name,
-	}); err != nil {
-		return nil, fmt.Errorf("list MachineConfigurationVersions for %s: %w", ref.Name, err)
-	}
-
-	if len(list.Items) == 0 {
-		return nil, apierrors.NewNotFound(
-			v1alpha3.GroupVersion.WithResource("machineconfigurationversions").GroupResource(),
-			ref.Name,
-		)
-	}
-
-	latest := list.Items[0]
-	for i := 1; i < len(list.Items); i++ {
-		if list.Items[i].Spec.Version > latest.Spec.Version {
-			latest = list.Items[i]
-		}
-	}
-
-	return &latest, nil
 }
 
 func markAppliedConfiguration(

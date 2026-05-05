@@ -20,6 +20,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/machineconfigs"
 )
 
 // MachineConfigurationBindingReconciler resolves Machine configurationRef
@@ -133,21 +134,12 @@ func (r *MachineConfigurationBindingReconciler) resolveExplicitConfiguration(
 	ctx context.Context,
 	ref *unboundedv1alpha3.MachineConfigurationRef,
 ) (*configurationSelection, error) {
-	if ref.Version != nil {
-		name := unboundedv1alpha3.MachineConfigurationVersionName(ref.Name, *ref.Version)
-		var mcv unboundedv1alpha3.MachineConfigurationVersion
-		if err := r.Get(ctx, client.ObjectKey{Name: name}, &mcv); err != nil {
-			return nil, fmt.Errorf("get MachineConfigurationVersion %s: %w", name, err)
-		}
-
-		return &configurationSelection{
-			configurationName: ref.Name,
-			version:           mcv.Spec.Version,
-			versionName:       mcv.Name,
-		}, nil
+	mcv, err := machineconfigs.ResolveVersionFromRef(ctx, r.Client, ref)
+	if err != nil {
+		return nil, err
 	}
 
-	return r.resolveLatestVersion(ctx, ref.Name)
+	return selectionFromVersion(ref.Name, mcv), nil
 }
 
 func (r *MachineConfigurationBindingReconciler) selectConfiguration(
@@ -195,29 +187,23 @@ func (r *MachineConfigurationBindingReconciler) resolveLatestVersion(
 	ctx context.Context,
 	configurationName string,
 ) (*configurationSelection, error) {
-	var list unboundedv1alpha3.MachineConfigurationVersionList
-	if err := r.List(ctx, &list, client.MatchingLabels{
-		unboundedv1alpha3.MCVConfigurationLabelKey: configurationName,
-	}); err != nil {
-		return nil, fmt.Errorf("list MachineConfigurationVersions for %s: %w", configurationName, err)
+	mcv, err := machineconfigs.ResolveLatestVersion(ctx, r.Client, configurationName)
+	if err != nil {
+		return nil, err
 	}
 
-	if len(list.Items) == 0 {
-		return nil, fmt.Errorf("MachineConfiguration %s has no versions", configurationName)
-	}
+	return selectionFromVersion(configurationName, mcv), nil
+}
 
-	latest := list.Items[0]
-	for i := 1; i < len(list.Items); i++ {
-		if list.Items[i].Spec.Version > latest.Spec.Version {
-			latest = list.Items[i]
-		}
-	}
-
+func selectionFromVersion(
+	configurationName string,
+	mcv *unboundedv1alpha3.MachineConfigurationVersion,
+) *configurationSelection {
 	return &configurationSelection{
 		configurationName: configurationName,
-		version:           latest.Spec.Version,
-		versionName:       latest.Name,
-	}, nil
+		version:           mcv.Spec.Version,
+		versionName:       mcv.Name,
+	}
 }
 
 func (r *MachineConfigurationBindingReconciler) setConfigurationPending(
