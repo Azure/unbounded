@@ -29,6 +29,7 @@ Subcommands (called as individual workflow steps):
     install-machine-crd                Install Machine CRD and bootstrapper RBAC.
     delete-machine-cr                  Delete the Machine CR.
     validate-machine-cr-created        Verify agent self-registered a Machine CR.
+    validate-node-reboot-operation     Verify NodeReboot MachineOperation restarts the node.
     reset-agent                        Run agent reset and verify cleanup.
     cleanup                            Tear down VM, networking, and Kind cluster.
 """
@@ -175,6 +176,159 @@ def kubectl_capture(args: list[str]) -> str:
 def _b64(val: str) -> str:
     """Base64-encode a string (no newlines)."""
     return base64.b64encode(val.encode()).decode()
+
+
+def _machine_operation_resource() -> str:
+    """Return the fully-qualified MachineOperation resource name."""
+    return "machineoperations.v1alpha3.unbounded-cloud.io"
+
+
+def create_machine_operation(
+    name: str,
+    machine_name: str,
+    operation_kind: str,
+    ttl_seconds: int | None = None,
+) -> None:
+    """Create a MachineOperation CR targeting *machine_name*."""
+
+    spec: dict[str, Any] = {
+        "machineRef": machine_name,
+        "operationKind": operation_kind,
+    }
+    if ttl_seconds is not None:
+        spec["ttlSecondsAfterFinished"] = ttl_seconds
+
+    operation = {
+        "apiVersion": "unbounded-cloud.io/v1alpha3",
+        "kind": "MachineOperation",
+        "metadata": {"name": name},
+        "spec": spec,
+    }
+
+    log(f"Creating MachineOperation '{name}' ({operation_kind}) for '{machine_name}'...")
+    kubectl(["apply", "-f", "-"], input=json.dumps(operation).encode())
+
+
+def wait_for_machine_operation_complete(name: str, timeout_secs: int = 180) -> dict[str, Any]:
+    """Wait for a MachineOperation to complete and return its JSON object."""
+
+    log(f"Waiting for MachineOperation '{name}' to complete (timeout: {timeout_secs}s)...")
+    elapsed = 0
+    resource = _machine_operation_resource()
+    last_phase = ""
+    last_message = ""
+
+    while elapsed < timeout_secs:
+        result = subprocess.run(
+            [KUBECTL, "get", resource, name, "-o", "json"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            operation = json.loads(result.stdout)
+            status = operation.get("status", {})
+            phase = status.get("phase", "")
+            message = status.get("message", "")
+            if phase != last_phase or message != last_message:
+                log(f"  MachineOperation phase={phase or '<empty>'} message={message or '<empty>'}")
+                last_phase = phase
+                last_message = message
+            if phase == "Complete":
+                log(f"MachineOperation '{name}' completed after {elapsed}s")
+                return operation
+            if phase == "Failed":
+                die(f"MachineOperation '{name}' failed: {message}")
+
+        if elapsed > 0 and elapsed % 30 == 0:
+            log(f"  ({elapsed}s) MachineOperation not complete yet")
+        time.sleep(5)
+        elapsed += 5
+
+    subprocess.run([KUBECTL, "get", resource, name, "-o", "yaml"], check=False)
+    die(f"Timed out waiting for MachineOperation '{name}' to complete after {timeout_secs}s")
+
+
+def node_boot_id(node_name: str) -> str:
+    """Return the node boot ID reported by kubelet."""
+
+    return kubectl_capture([
+        "get", "node", node_name,
+        "-o", "jsonpath={.status.nodeInfo.bootID}",
+    ]).strip()
+
+
+def wait_for_node_ready(node_name: str, timeout_secs: int = 120) -> None:
+    """Wait until *node_name* reports Ready=True."""
+
+    log(f"Waiting for node '{node_name}' to be Ready (timeout: {timeout_secs}s)...")
+    elapsed = 0
+    while elapsed < timeout_secs:
+        result = subprocess.run(
+            [KUBECTL, "get", "node", node_name,
+             "-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}"],
+            capture_output=True, text=True,
+        )
+        status = result.stdout.strip() if result.returncode == 0 else "unknown"
+        if status == "True":
+            log(f"Node '{node_name}' is Ready after {elapsed}s")
+            return
+        if elapsed > 0 and elapsed % 30 == 0:
+            log(f"  ({elapsed}s) Node not yet Ready (status: {status})")
+        time.sleep(5)
+        elapsed += 5
+
+    kubectl(["describe", "node", node_name])
+    die(f"Timed out waiting for node '{node_name}' to become Ready after {timeout_secs}s")
+
+
+def wait_for_node_boot_id_change(node_name: str, previous_boot_id: str, timeout_secs: int = 120) -> str:
+    """Wait for kubelet to report a different node boot ID."""
+
+    log(f"Waiting for node '{node_name}' boot ID to change (timeout: {timeout_secs}s)...")
+    elapsed = 0
+    while elapsed < timeout_secs:
+        current_boot_id = node_boot_id(node_name)
+        if current_boot_id and current_boot_id != previous_boot_id:
+            log(f"Node boot ID changed: {previous_boot_id} -> {current_boot_id}")
+            return current_boot_id
+        if elapsed > 0 and elapsed % 30 == 0:
+            log(f"  ({elapsed}s) Node boot ID unchanged: {current_boot_id or '<empty>'}")
+        time.sleep(5)
+        elapsed += 5
+
+    kubectl(["describe", "node", node_name])
+    die(f"Timed out waiting for node '{node_name}' boot ID to change after {timeout_secs}s")
+
+
+def wait_for_node_reboot_event(node_name: str, boot_id: str, timeout_secs: int = 120) -> None:
+    """Wait for the Kubernetes Node Rebooted event for *boot_id*."""
+
+    log(f"Waiting for Node Rebooted event for boot ID '{boot_id}'...")
+    elapsed = 0
+    while elapsed < timeout_secs:
+        result = subprocess.run(
+            [
+                KUBECTL, "get", "events",
+                "--field-selector", f"involvedObject.kind=Node,involvedObject.name={node_name},reason=Rebooted",
+                "-o", "json",
+            ],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            events = json.loads(result.stdout).get("items", [])
+            for event in events:
+                message = event.get("message", "")
+                if boot_id in message:
+                    log(f"Observed Node Rebooted event: {message}")
+                    return
+
+        if elapsed > 0 and elapsed % 30 == 0:
+            log(f"  ({elapsed}s) Rebooted event not observed yet")
+        time.sleep(5)
+        elapsed += 5
+
+    kubectl(["get", "events", "--field-selector", f"involvedObject.kind=Node,involvedObject.name={node_name}",
+             "--sort-by=.lastTimestamp"])
+    die(f"Timed out waiting for Node Rebooted event for '{node_name}' boot ID '{boot_id}'")
 
 
 # ---------------------------------------------------------------------------
@@ -710,27 +864,7 @@ def wait_for_node() -> None:
         subprocess.run([KUBECTL, "get", "nodes", "-o", "wide"], check=False)
         die(f"Timed out waiting for node '{AGENT_MACHINE_NAME}' after {node_timeout}s")
 
-    # Wait for Ready
-    log(f"Waiting for node '{AGENT_MACHINE_NAME}' to become Ready (timeout: {ready_timeout}s)...")
-    elapsed = 0
-    while elapsed < ready_timeout:
-        result = subprocess.run(
-            [KUBECTL, "get", "node", AGENT_MACHINE_NAME,
-             "-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}"],
-            capture_output=True, text=True,
-        )
-        status = result.stdout.strip() if result.returncode == 0 else "unknown"
-        if status == "True":
-            log(f"Node '{AGENT_MACHINE_NAME}' is Ready after {elapsed}s")
-            break
-        if elapsed > 0 and elapsed % 30 == 0:
-            log(f"  ({elapsed}s) Node not yet Ready (status: {status})")
-        time.sleep(5)
-        elapsed += 5
-    else:
-        log("Node status:")
-        subprocess.run([KUBECTL, "describe", "node", AGENT_MACHINE_NAME], check=False)
-        die(f"Timed out waiting for node '{AGENT_MACHINE_NAME}' to become Ready after {ready_timeout}s")
+    wait_for_node_ready(AGENT_MACHINE_NAME, ready_timeout)
 
     log("============================================")
     log("  Node join PASSED")
@@ -1115,13 +1249,17 @@ def reset_agent() -> None:
 # install-machine-crd
 # ---------------------------------------------------------------------------
 def install_machine_crd() -> None:
-    """Install the Machine CRD and bootstrapper RBAC."""
+    """Install the Machine and MachineOperation CRDs plus bootstrapper RBAC."""
 
-    crd_path = REPO_ROOT / "deploy" / "machina" / "crd" / "unbounded-cloud.io_machines.yaml"
+    crd_paths = [
+        REPO_ROOT / "deploy" / "machina" / "crd" / "unbounded-cloud.io_machines.yaml",
+        REPO_ROOT / "deploy" / "machina" / "crd" / "unbounded-cloud.io_machineoperations.yaml",
+    ]
     rbac_path = REPO_ROOT / "deploy" / "machina" / "rendered" / "07-bootstrapper-rbac.yaml"
 
-    if not crd_path.exists():
-        die(f"Machine CRD not found: {crd_path}")
+    for crd_path in crd_paths:
+        if not crd_path.exists():
+            die(f"Machina CRD not found: {crd_path}")
 
     log("Rendering machina manifests...")
     run(["make", "machina-manifests"], cwd=str(REPO_ROOT))
@@ -1129,13 +1267,14 @@ def install_machine_crd() -> None:
     if not rbac_path.exists():
         die(f"Bootstrapper RBAC not found after render: {rbac_path}")
 
-    log("Installing Machine CRD...")
-    kubectl(["apply", "-f", str(crd_path)])
+    log("Installing Machine and MachineOperation CRDs...")
+    for crd_path in crd_paths:
+        kubectl(["apply", "-f", str(crd_path)])
 
     log("Installing bootstrapper RBAC...")
     kubectl(["apply", "-f", str(rbac_path)])
 
-    log("Machine CRD and RBAC installed")
+    log("Machine CRDs and RBAC installed")
 
 
 # ---------------------------------------------------------------------------
@@ -1214,6 +1353,49 @@ def validate_machine_cr_created() -> None:
 
 
 # ---------------------------------------------------------------------------
+# validate-node-reboot-operation
+# ---------------------------------------------------------------------------
+def validate_node_reboot_operation() -> None:
+    """Validate that a NodeReboot MachineOperation restarts the agent node."""
+
+    operation_name = f"e2e-node-reboot-{int(time.time())}"
+
+    log(f"Validating NodeReboot operation for '{AGENT_MACHINE_NAME}'...")
+    previous_boot_id = node_boot_id(AGENT_MACHINE_NAME)
+    if not previous_boot_id:
+        die(f"Node '{AGENT_MACHINE_NAME}' did not report a boot ID")
+    log(f"Current node boot ID: {previous_boot_id}")
+
+    run_quiet([KUBECTL, "delete", _machine_operation_resource(), operation_name,
+               "--ignore-not-found"], check=False)
+
+    create_machine_operation(operation_name, AGENT_MACHINE_NAME, "NodeReboot")
+
+    operation = wait_for_machine_operation_complete(operation_name)
+    status = operation.get("status", {})
+    if status.get("message") != "NodeReboot completed":
+        die(f"unexpected MachineOperation message: {status.get('message')!r}")
+
+    conditions = status.get("conditions", [])
+    completed_conditions = [
+        c for c in conditions
+        if c.get("type") == "Completed" and c.get("status") == "True" and c.get("reason") == "Succeeded"
+    ]
+    if not completed_conditions:
+        die(f"MachineOperation missing Completed=True/Succeeded condition: {conditions}")
+
+    new_boot_id = wait_for_node_boot_id_change(AGENT_MACHINE_NAME, previous_boot_id)
+    wait_for_node_reboot_event(AGENT_MACHINE_NAME, new_boot_id)
+    wait_for_node_ready(AGENT_MACHINE_NAME)
+
+    log("============================================")
+    log("  NodeReboot operation validation PASSED")
+    log("============================================")
+    kubectl(["get", _machine_operation_resource(), operation_name, "-o", "wide"])
+    kubectl(["get", "node", AGENT_MACHINE_NAME, "-o", "wide"])
+
+
+# ---------------------------------------------------------------------------
 # cleanup
 # ---------------------------------------------------------------------------
 def cleanup() -> None:
@@ -1284,6 +1466,7 @@ COMMANDS = {
     "install-machine-crd": install_machine_crd,
     "delete-machine-cr": delete_machine_cr,
     "validate-machine-cr-created": validate_machine_cr_created,
+    "validate-node-reboot-operation": validate_node_reboot_operation,
     "reset-agent": reset_agent,
     "cleanup": cleanup,
 }
