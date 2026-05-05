@@ -170,6 +170,9 @@ jobs:
       - name: Validate Machine CR (self-registered)
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-machine-cr-created
 
+      - name: Validate node restart operation
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-node-reboot-operation
+
       - name: Validate workload on agent node
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-workload
 
@@ -194,6 +197,9 @@ jobs:
 
       - name: Validate Machine CR (rejoin)
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-machine-cr-created
+
+      - name: Validate node restart operation (rejoin)
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-node-reboot-operation
 
       - name: Validate workload on rejoined agent node
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-workload
@@ -237,6 +243,8 @@ jobs:
           # Collect Machine CRs (if CRD is installed)
           kubectl get machines -o wide > logs/machines.txt 2>&1 || true
           kubectl get machines -o yaml > logs/machines-full.yaml 2>&1 || true
+          kubectl get machineoperations -o wide > logs/machineoperations.txt 2>&1 || true
+          kubectl get machineoperations -o yaml > logs/machineoperations-full.yaml 2>&1 || true
           # Collect kubelet logs from the Kind control-plane
           docker exec kind-control-plane journalctl -u kubelet --no-pager -l > logs/kind-kubelet.log 2>&1 || true
           # Collect kube-apiserver logs (critical for diagnosing TLS bootstrap / RBAC issues)
