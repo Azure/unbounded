@@ -37,6 +37,18 @@ type ActiveMachine struct {
 	Config *provision.AgentConfig
 }
 
+// nodeOperator performs host-local nspawn node operations for the daemon.
+// Reconcile code depends on this interface so tests can substitute the
+// host-mutating implementation with a fake.
+type nodeOperator interface {
+	FindActiveMachine(*slog.Logger) (*ActiveMachine, error)
+	RestartNode(context.Context, *slog.Logger, *ActiveMachine) error
+	ResetAgent(context.Context, *slog.Logger) error
+	StopDaemon(context.Context, *slog.Logger) error
+}
+
+type nspawnNodeOperator struct{}
+
 // findActiveMachine scans the agent config directory for an applied config
 // file and returns the active machine name and config. Returns an error if
 // no applied config is found.
@@ -81,6 +93,10 @@ func findActiveMachine(log *slog.Logger) (*ActiveMachine, error) {
 	}
 
 	return nil, fmt.Errorf("no applied config found in %s", goalstates.AgentConfigDir)
+}
+
+func (nspawnNodeOperator) FindActiveMachine(log *slog.Logger) (*ActiveMachine, error) {
+	return findActiveMachine(log)
 }
 
 // hasDrift reports whether the desired AgentConfig differs from the applied
@@ -139,13 +155,16 @@ func restartNode(ctx context.Context, log *slog.Logger, active *ActiveMachine) e
 	return nil
 }
 
-func restartActiveNode(ctx context.Context, log *slog.Logger) error {
-	active, err := findActiveMachine(log)
-	if err != nil {
-		return fmt.Errorf("find active machine: %w", err)
-	}
-
+func (nspawnNodeOperator) RestartNode(ctx context.Context, log *slog.Logger, active *ActiveMachine) error {
 	return restartNode(ctx, log, active)
+}
+
+func (nspawnNodeOperator) ResetAgent(ctx context.Context, log *slog.Logger) error {
+	return ResetAgentResources(log).Do(ctx)
+}
+
+func (nspawnNodeOperator) StopDaemon(ctx context.Context, log *slog.Logger) error {
+	return StopDaemon(log).Do(ctx)
 }
 
 // UpdateNode performs the nspawn machine update:

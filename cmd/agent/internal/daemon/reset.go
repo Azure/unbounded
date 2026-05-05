@@ -4,7 +4,6 @@
 package daemon
 
 import (
-	"context"
 	"log/slog"
 
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
@@ -46,8 +45,4 @@ func ResetAgentResources(log *slog.Logger) phases.Task {
 		RemoveAgentArtifacts(log),
 		reset.ReloadSystemd(log),
 	)
-}
-
-func resetAgentResources(ctx context.Context, log *slog.Logger) error {
-	return ResetAgentResources(log).Do(ctx)
 }

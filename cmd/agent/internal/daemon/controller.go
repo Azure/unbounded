@@ -41,25 +41,29 @@ type daemonRequest struct {
 
 type daemonReconciler struct {
 	client.Client
-	log               *slog.Logger
-	machineName       string
-	nodeName          string
-	restartActiveNode func(context.Context, *slog.Logger) error
-	resetAgent        func(context.Context, *slog.Logger) error
+	log          *slog.Logger
+	machineName  string
+	nodeName     string
+	nodeOperator nodeOperator
 }
 
-func runController(ctx context.Context, log *slog.Logger, restCfg *rest.Config, machineName string) error {
+func runController(
+	ctx context.Context,
+	log *slog.Logger,
+	restCfg *rest.Config,
+	machineName string,
+	nodeOperator nodeOperator,
+) error {
 	nodeName, err := resolveNodeName(machineName)
 	if err != nil {
 		return err
 	}
 
 	reconciler := &daemonReconciler{
-		log:               log,
-		machineName:       machineName,
-		nodeName:          nodeName,
-		restartActiveNode: restartActiveNode,
-		resetAgent:        resetAgentResources,
+		log:          log,
+		machineName:  machineName,
+		nodeName:     nodeName,
+		nodeOperator: nodeOperator,
 	}
 
 	mgr, err := ctrl.NewManager(restCfg, manager.Options{

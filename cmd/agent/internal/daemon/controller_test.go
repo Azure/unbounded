@@ -18,6 +18,48 @@ import (
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
 
+type fakeNodeOperator struct {
+	active  *ActiveMachine
+	findErr error
+
+	restartCalled bool
+	restartActive *ActiveMachine
+	restartErr    error
+
+	resetCalled bool
+	resetErr    error
+
+	stopCalled bool
+	stopErr    error
+}
+
+func (op *fakeNodeOperator) FindActiveMachine(*slog.Logger) (*ActiveMachine, error) {
+	if op.findErr != nil {
+		return nil, op.findErr
+	}
+
+	return op.active, nil
+}
+
+func (op *fakeNodeOperator) RestartNode(_ context.Context, _ *slog.Logger, active *ActiveMachine) error {
+	op.restartCalled = true
+	op.restartActive = active
+
+	return op.restartErr
+}
+
+func (op *fakeNodeOperator) ResetAgent(context.Context, *slog.Logger) error {
+	op.resetCalled = true
+
+	return op.resetErr
+}
+
+func (op *fakeNodeOperator) StopDaemon(context.Context, *slog.Logger) error {
+	op.stopCalled = true
+
+	return op.stopErr
+}
+
 func fakeStatusClient(objs ...client.Object) client.Client {
 	return fake.NewClientBuilder().
 		WithScheme(fakeScheme()).
@@ -36,20 +78,19 @@ func TestReconcileNodeReboot_Complete(t *testing.T) {
 		},
 	}
 
-	called := false
+	active := &ActiveMachine{Name: "kube1"}
+	opImpl := &fakeNodeOperator{active: active}
 	reconciler := &daemonReconciler{
-		Client:      fakeStatusClient(machine, op),
-		log:         discardLogger(),
-		machineName: "test-machine",
-		restartActiveNode: func(context.Context, *slog.Logger) error {
-			called = true
-			return nil
-		},
+		Client:       fakeStatusClient(machine, op),
+		log:          discardLogger(),
+		machineName:  "test-machine",
+		nodeOperator: opImpl,
 	}
 
 	_, err := reconciler.reconcileMachineOperation(context.Background(), "op-1")
 	require.NoError(t, err)
-	assert.True(t, called)
+	assert.True(t, opImpl.restartCalled)
+	assert.Same(t, active, opImpl.restartActive)
 
 	var updated v1alpha3.MachineOperation
 	require.NoError(t, reconciler.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
@@ -70,13 +111,12 @@ func TestReconcileNodeReboot_Failed(t *testing.T) {
 		},
 	}
 
+	opImpl := &fakeNodeOperator{restartErr: errors.New("restart failed")}
 	reconciler := &daemonReconciler{
-		Client:      fakeStatusClient(machine, op),
-		log:         discardLogger(),
-		machineName: "test-machine",
-		restartActiveNode: func(context.Context, *slog.Logger) error {
-			return errors.New("restart failed")
-		},
+		Client:       fakeStatusClient(machine, op),
+		log:          discardLogger(),
+		machineName:  "test-machine",
+		nodeOperator: opImpl,
 	}
 
 	_, err := reconciler.reconcileMachineOperation(context.Background(), "op-1")
@@ -100,20 +140,18 @@ func TestReconcileAgentReset_Complete(t *testing.T) {
 		},
 	}
 
-	called := false
+	opImpl := &fakeNodeOperator{}
 	reconciler := &daemonReconciler{
-		Client:      fakeStatusClient(machine, op),
-		log:         discardLogger(),
-		machineName: "test-machine",
-		resetAgent: func(context.Context, *slog.Logger) error {
-			called = true
-			return nil
-		},
+		Client:       fakeStatusClient(machine, op),
+		log:          discardLogger(),
+		machineName:  "test-machine",
+		nodeOperator: opImpl,
 	}
 
 	_, err := reconciler.reconcileMachineOperation(context.Background(), "op-1")
 	require.NoError(t, err)
-	assert.True(t, called)
+	assert.True(t, opImpl.resetCalled)
+	assert.True(t, opImpl.stopCalled)
 
 	var updated v1alpha3.MachineOperation
 	require.NoError(t, reconciler.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
@@ -134,13 +172,12 @@ func TestReconcileAgentReset_Failed(t *testing.T) {
 		},
 	}
 
+	opImpl := &fakeNodeOperator{resetErr: errors.New("reset failed")}
 	reconciler := &daemonReconciler{
-		Client:      fakeStatusClient(machine, op),
-		log:         discardLogger(),
-		machineName: "test-machine",
-		resetAgent: func(context.Context, *slog.Logger) error {
-			return errors.New("reset failed")
-		},
+		Client:       fakeStatusClient(machine, op),
+		log:          discardLogger(),
+		machineName:  "test-machine",
+		nodeOperator: opImpl,
 	}
 
 	_, err := reconciler.reconcileMachineOperation(context.Background(), "op-1")

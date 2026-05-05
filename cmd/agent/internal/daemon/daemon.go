@@ -37,8 +37,10 @@ func Run(ctx context.Context, log *slog.Logger) error {
 // run is the inner loop, accepting a client constructor so tests can
 // inject a fake.
 func run(ctx context.Context, log *slog.Logger, newClient kubeClientFunc) error {
+	nodeOperator := nspawnNodeOperator{}
+
 	// Find the active machine and its applied config.
-	active, err := findActiveMachine(log)
+	active, err := nodeOperator.FindActiveMachine(log)
 	if err != nil {
 		return fmt.Errorf("find active machine: %w", err)
 	}
@@ -71,7 +73,7 @@ func run(ctx context.Context, log *slog.Logger, newClient kubeClientFunc) error 
 		return fmt.Errorf("register machine: %w", err)
 	}
 
-	return runController(ctx, log, restCfg, active.Config.MachineName)
+	return runController(ctx, log, restCfg, active.Config.MachineName, nodeOperator)
 }
 
 // buildRESTConfig builds a Kubernetes REST config from the applied agent

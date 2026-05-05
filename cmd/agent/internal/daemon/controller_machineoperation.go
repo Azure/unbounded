@@ -53,7 +53,13 @@ func (r *daemonReconciler) reconcileNodeReboot(ctx context.Context, op *v1alpha3
 		return reconcile.Result{}, err
 	}
 
-	if err := r.restartActiveNode(ctx, r.log); err != nil {
+	active, err := r.nodeOperator.FindActiveMachine(r.log)
+	if err != nil {
+		_, finishErr := finishOperation(ctx, r.Client, op.Name, v1alpha3.OperationPhaseFailed, "ExecutionFailed", err.Error(), 0)
+		return reconcile.Result{}, finishErr
+	}
+
+	if err := r.nodeOperator.RestartNode(ctx, r.log, active); err != nil {
 		_, finishErr := finishOperation(ctx, r.Client, op.Name, v1alpha3.OperationPhaseFailed, "ExecutionFailed", err.Error(), 0)
 		return reconcile.Result{}, finishErr
 	}
@@ -71,7 +77,7 @@ func (r *daemonReconciler) reconcileAgentReset(ctx context.Context, op *v1alpha3
 		return reconcile.Result{}, err
 	}
 
-	if err := r.resetAgent(ctx, r.log); err != nil {
+	if err := r.nodeOperator.ResetAgent(ctx, r.log); err != nil {
 		_, finishErr := finishOperation(ctx, r.Client, op.Name, v1alpha3.OperationPhaseFailed, "ExecutionFailed", err.Error(), 0)
 		return reconcile.Result{}, finishErr
 	}
@@ -81,7 +87,7 @@ func (r *daemonReconciler) reconcileAgentReset(ctx context.Context, op *v1alpha3
 		return result, err
 	}
 
-	return result, StopDaemon(r.log).Do(ctx)
+	return result, r.nodeOperator.StopDaemon(ctx, r.log)
 }
 
 func (r *daemonReconciler) mapMachineOperation(ctx context.Context, obj client.Object) []daemonRequest {
