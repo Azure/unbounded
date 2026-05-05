@@ -55,13 +55,11 @@ func (r *daemonReconciler) reconcileNodeReboot(ctx context.Context, op *v1alpha3
 
 	active, err := r.nodeOperator.FindActiveMachine(r.log)
 	if err != nil {
-		_, finishErr := finishOperation(ctx, r.Client, op.Name, v1alpha3.OperationPhaseFailed, "ExecutionFailed", err.Error(), 0)
-		return reconcile.Result{}, finishErr
+		return finishFailedOperation(ctx, r.Client, op.Name, err)
 	}
 
 	if err := r.nodeOperator.RestartNode(ctx, r.log, active); err != nil {
-		_, finishErr := finishOperation(ctx, r.Client, op.Name, v1alpha3.OperationPhaseFailed, "ExecutionFailed", err.Error(), 0)
-		return reconcile.Result{}, finishErr
+		return finishFailedOperation(ctx, r.Client, op.Name, err)
 	}
 
 	return finishOperation(ctx, r.Client, op.Name, v1alpha3.OperationPhaseComplete, "Succeeded", "NodeReboot completed", machine.Generation)
@@ -78,8 +76,7 @@ func (r *daemonReconciler) reconcileAgentReset(ctx context.Context, op *v1alpha3
 	}
 
 	if err := r.nodeOperator.ResetAgent(ctx, r.log); err != nil {
-		_, finishErr := finishOperation(ctx, r.Client, op.Name, v1alpha3.OperationPhaseFailed, "ExecutionFailed", err.Error(), 0)
-		return reconcile.Result{}, finishErr
+		return finishFailedOperation(ctx, r.Client, op.Name, err)
 	}
 
 	result, err := finishOperation(ctx, r.Client, op.Name, v1alpha3.OperationPhaseComplete, "Succeeded", "AgentReset completed", machine.Generation)
@@ -229,6 +226,15 @@ func finishOperation(
 
 		return c.Status().Update(ctx, &latest)
 	})
+}
+
+func finishFailedOperation(ctx context.Context, c client.Client, name string, executionErr error) (reconcile.Result, error) {
+	result, finishErr := finishOperation(ctx, c, name, v1alpha3.OperationPhaseFailed, "ExecutionFailed", executionErr.Error(), 0)
+	if finishErr != nil {
+		return result, fmt.Errorf("mark MachineOperation %s failed after execution error %v: %w", name, executionErr, finishErr)
+	}
+
+	return result, nil
 }
 
 func selectorMatches(selector *metav1.LabelSelector, targetLabels map[string]string) (bool, error) {
