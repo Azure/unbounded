@@ -11,9 +11,6 @@ import (
 
 	"github.com/Azure/unbounded/cmd/agent/internal/daemon"
 	"github.com/Azure/unbounded/internal/version"
-	"github.com/Azure/unbounded/pkg/agent/goalstates"
-	"github.com/Azure/unbounded/pkg/agent/phases"
-	"github.com/Azure/unbounded/pkg/agent/phases/reset"
 )
 
 func newCmdReset(cmdCtx *CommandContext) *cobra.Command {
@@ -36,45 +33,7 @@ Both possible nspawn machine names (kube1 and kube2) are stopped and removed.`,
 				"commit", version.GitCommit,
 			)
 
-			log := cmdCtx.Logger
-
-			return phases.Serial(log,
-				// Step 1: Stop the agent daemon before tearing down machines.
-				daemon.StopDaemon(log),
-
-				// Step 2: Stop both nspawn machines.
-				phases.Parallel(log,
-					reset.StopMachine(log, goalstates.NSpawnMachineKube1),
-					reset.StopMachine(log, goalstates.NSpawnMachineKube2),
-				),
-
-				// Step 3: Remove network interfaces and WireGuard keys.
-				phases.Parallel(log,
-					reset.RemoveNetworkInterfaces(log),
-					reset.RemoveWireGuardKeys(log),
-				),
-
-				// Step 4: Remove nspawn configuration files for both machines.
-				phases.Parallel(log,
-					reset.RemoveNSpawnConfig(log, goalstates.NSpawnMachineKube1),
-					reset.RemoveNSpawnConfig(log, goalstates.NSpawnMachineKube2),
-				),
-
-				// Step 5: Remove both machine rootfs directories.
-				phases.Parallel(log,
-					reset.RemoveMachine(log, goalstates.NSpawnMachineKube1),
-					reset.RemoveMachine(log, goalstates.NSpawnMachineKube2),
-				),
-
-				// Step 6: Clean up policy routing rules.
-				reset.CleanupRoutes(log),
-
-				// Step 7: Remove agent binaries and config.
-				daemon.RemoveAgentArtifacts(log),
-
-				// Step 8: Reload systemd.
-				reset.ReloadSystemd(log),
-			).Do(ctx)
+			return daemon.ResetAgent(cmdCtx.Logger).Do(ctx)
 		},
 	}
 

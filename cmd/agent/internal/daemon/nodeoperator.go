@@ -38,6 +38,11 @@ type nodeOperator interface {
 	FindActiveMachine(*slog.Logger) (*ActiveMachine, error)
 	// RestartNode restarts the provided active nspawn-backed node in place.
 	RestartNode(context.Context, *slog.Logger, *ActiveMachine) error
+	// ResetAgentResources removes the unbounded-agent and associated resources
+	// without stopping the currently running daemon process.
+	ResetAgentResources(context.Context, *slog.Logger) error
+	// StopDaemon stops, disables, and removes the unbounded-agent-daemon unit.
+	StopDaemon(context.Context, *slog.Logger) error
 	// RepaveNode performs the nspawn machine update:
 	//  1. Provision a new rootfs on the alternate machine
 	//  2. Stop the old machine (graceful service shutdown + nspawn teardown)
@@ -149,6 +154,14 @@ func (nspawnNodeOperator) RestartNode(ctx context.Context, log *slog.Logger, act
 	log.Info("node restarted", "machine", active.Name)
 
 	return nil
+}
+
+func (nspawnNodeOperator) ResetAgentResources(ctx context.Context, log *slog.Logger) error {
+	return ResetAgentResources(log).Do(ctx)
+}
+
+func (nspawnNodeOperator) StopDaemon(ctx context.Context, log *slog.Logger) error {
+	return StopDaemon(log).Do(ctx)
 }
 
 func (nspawnNodeOperator) RepaveNode(
