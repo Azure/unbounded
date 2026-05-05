@@ -31,8 +31,9 @@ layout, phasing, configuration, observability, and operational concerns.
 | Auth (v1) | Network-perimeter trust + bearer / mTLS. No SigV4 verification yet. |
 | Origins | S3 + Azure Blob behind a pluggable `Origin` interface. |
 | Azure constraint | Block Blobs only. Append/Page Blobs rejected at `Head`. |
-| Backing store | Pluggable `CacheStore`; `localfs` for dev, `s3` (VAST) for prod. The CacheStore is the source of truth for chunk presence. |
-| In-DC S3 vs. cloud S3 | The in-DC S3-compatible store is treated identically to cloud S3 at the protocol level. The only difference is "much faster, in-DC". Both `Origin` and `CacheStore` are thin S3-client adapters with no special-casing. |
+| Backing store | Pluggable `CacheStore`; `localfs` for dev, `s3` (VAST or any S3-compatible in-DC object store) **or** `posixfs` (NFSv4.1+, Weka native, CephFS, Lustre, GPFS, or any shared POSIX FS that honors `link()` / `EEXIST` and directory `fsync`) for prod. The CacheStore is the source of truth for chunk presence. Driver choice is a deployment-time decision per replica set; `s3` and `posixfs` are interchangeable from the cache layer's perspective. |
+| In-DC S3 vs. cloud S3 | The in-DC S3-compatible store is treated identically to cloud S3 at the protocol level. The only difference is "much faster, in-DC". Both `Origin` and the `cachestore/s3` driver are thin S3-client adapters with no special-casing. The `cachestore/posixfs` driver replaces the S3 protocol with shared-POSIX primitives but presents the same `CacheStore` interface, so nothing above s7 changes. |
+| CacheStore atomic-commit primitive | Two equivalent primitives, picked per driver: object-store `PutObject + If-None-Match: *` (used by `cachestore/s3`) and POSIX `link()` / `renameat2(RENAME_NOREPLACE)` returning `EEXIST` (used by `cachestore/localfs` and `cachestore/posixfs`). Both are atomic, no-clobber, and have a "you lost the race" failure mode that maps cleanly onto `commit_lost`. Each driver runs `SelfTestAtomicCommit` at boot and refuses to start on backends that don't honor its primitive. |
 | Chunking | Fixed 8 MiB default (configurable 4-16 MiB). `chunk_size` baked into `ChunkKey`. |
 | Consistency | **Origin objects are immutable per operator contract**: an `(origin_id, bucket, key)` never has its bytes modified once published; replacement must be a new key. `ETag` is identity, not freshness. `If-Match: <etag>` on every `Origin.GetRange` is defense-in-depth that traps in-flight overwrites only. Bounded staleness on contract violation = `metadata_ttl` (default 5m); see [s11](#11-bounded-staleness-contract). |
 | Catalog | In-memory `ChunkCatalog` fronting `CacheStore.Stat`. No persistent local index. |
@@ -41,7 +42,7 @@ layout, phasing, configuration, observability, and operational concerns.
 | Cluster | Kubernetes Deployment + headless Service for peer discovery + ClusterIP/LB for client traffic. Rendezvous hashing on pod IP selects the coordinator per `ChunkKey` for miss-fills only; receiving replica is the **assembler** that fans out per-chunk fill RPCs to coordinators (s8.3). All replicas can read all chunks directly from the CacheStore on hits. |
 | Inter-replica auth | Separate internal mTLS listener (default `:8444`) chained to an internal CA distinct from the client mTLS CA; authorization = "presenter source IP is in current peer-IP set" (s8.8). |
 | Local spool | Every fill writes origin bytes through a local spool (`internal/origincache/fetch/spool`) so slow joiners always have a local fallback regardless of CacheStore driver (s8.2). |
-| Atomic commit | `localfs` stages inside `<root>/.staging/<uuid>` with parent-dir fsync, then `link()` no-clobber; `s3` uses direct `PutObject` with `If-None-Match: *` and a startup self-test that refuses to start if the backend doesn't honor the precondition (s10). Cold-path TTFB is gated on local Spool fsync, not on CacheStore commit; commit-after-serve failure becomes `commit_after_serve_total{result="failed"}` rather than a client error (s8.6). |
+| Atomic commit | `localfs` and `posixfs` stage inside `<root>/.staging/<uuid>` with parent-dir fsync, then `link()` no-clobber (returns `EEXIST` to the loser); `s3` uses direct `PutObject` with `If-None-Match: *`. Each driver runs `SelfTestAtomicCommit` at boot: `s3` proves the backend honors `If-None-Match: *`; `posixfs` proves the backend honors `link()` / `EEXIST` and that directory fsync is durable, and additionally enforces `nfs.minimum_version` (default `4.1`, with opt-in `nfs.allow_v3`) and refuses to start on Alluxio FUSE backends. Cold-path TTFB is gated on local Spool fsync, not on CacheStore commit; commit-after-serve failure becomes `commit_after_serve_total{result="failed"}` rather than a client error (s8.6). |
 | Tenancy | Single tenant, single origin credential set in v1. |
 | Repo home | This repo. Layout mirrors `machina`. |
 
@@ -124,6 +125,33 @@ section that defines or implements the full mechanism.
   breaker opens, short-circuits writes, and surfaces via metrics and
   `/readyz`. Defaults: 10 errors / 30s window, 30s open, 3 half-open
   probes. Detail in [s10.2](#102-catalog-correctness-typed-errors-circuit-breaker).
+- **Shared-POSIX CacheStore** - the `cachestore/posixfs` driver: a
+  `CacheStore` backed by a shared POSIX-style filesystem mounted on every
+  replica at the same path. Concrete supported backends are NFSv4.1+ (the
+  baseline), Weka native (`-t wekafs`), CephFS (`-t ceph`), Lustre
+  (`-t lustre`), and IBM Spectrum Scale / GPFS (`-t gpfs`). Disqualified
+  on purpose: Alluxio FUSE (no `link(2)`, no atomic no-overwrite rename,
+  no NFS gateway). The driver depends on
+  `internal/origincache/cachestore/internal/posixcommon/` (link-based
+  commit, dir-fsync, staging-dir helpers, fan-out path layout) which is
+  also depended on by `cachestore/localfs`. Detail in
+  [s10.1.2](#1012-cachestoreposixfs).
+- **Atomic-commit primitive** - the no-clobber publish step that ends a
+  fill. Two equivalent shapes: object-store
+  `PutObject + If-None-Match: *` (used by `cachestore/s3`) and POSIX
+  `link()` / `renameat2(RENAME_NOREPLACE)` returning `EEXIST` to the
+  loser (used by `cachestore/localfs` and `cachestore/posixfs`). Both are
+  atomic, return a "you lost the race" signal that becomes
+  `commit_lost`, and are validated at boot by `SelfTestAtomicCommit`.
+  Detail in [s10.1](#101-atomic-commit-per-cachestore-driver).
+- **Spool locality contract** - the local Spool (`spool.dir`) MUST live
+  on a local block device. The cache layer enforces this at boot via
+  `statfs(2)` against a denylist of network filesystems
+  (NFS / SMB / Ceph / Lustre / GPFS / FUSE) and refuses to start on
+  violation. Governed by `spool.require_local_fs` (default `true`). The
+  rationale and the boot check are in
+  [s10.4](#104-spool-locality-contract); the spool's role in the
+  cold-path TTFB barrier is in [s8.2](#82-ttfb-tee--spool).
 
 ## 4. Architecture
 
@@ -286,8 +314,12 @@ flowchart LR
    `Content-Range`, `ETag`, `Accept-Ranges: bytes`) are deferred until
    the **first chunk** of the range is durably fsynced into the local
    **Spool** (s8.2). The CacheStore commit happens asynchronously after
-   that. Commit-after-serve failure does NOT affect the in-flight client
-   response; it increments
+   that, using whichever atomic primitive the configured driver
+   advertises (`PutObject + If-None-Match: *` for `s3`; `link()` /
+   `EEXIST` for `localfs` and `posixfs`). The assembler is driver-
+   agnostic: it calls `CacheStore.PutChunk` and treats the typed error
+   the same way regardless of backing store. Commit-after-serve failure
+   does NOT affect the in-flight client response; it increments
    `origincache_commit_after_serve_total{result="failed"}` and the chunk
    is **not** recorded in the `ChunkCatalog` (the next request will
    refill). Pre-spool-fsync failures - origin unreachable,
@@ -468,8 +500,16 @@ Implementations:
 - `Origin`: `origin/s3`, `origin/azureblob` (Block Blob only). Both pass
   the caller's `etag` as `If-Match` on the underlying GET; both translate
   the backend's "precondition failed" status into `OriginETagChangedError`.
-- `CacheStore`: `cachestore/localfs` (dev), `cachestore/s3` (VAST etc.).
-  See s10 for atomic-commit specifics per driver.
+- `CacheStore`: `cachestore/localfs` (dev), `cachestore/s3` (in-DC
+  S3-compatible object store, e.g. VAST), `cachestore/posixfs` (shared
+  POSIX FS: NFSv4.1+ baseline, plus Weka native, CephFS, Lustre, GPFS).
+  See [s10.1](#101-atomic-commit-per-cachestore-driver) for atomic-commit
+  specifics per driver. The two POSIX-shaped drivers (`localfs` and
+  `posixfs`) share their commit primitives (`link()` no-clobber, dir
+  fsync, staging-dir layout, optional fan-out) via
+  `internal/origincache/cachestore/internal/posixcommon/`; this is an
+  internal-to-cachestore package and is not visible to the rest of the
+  cache layer.
 - `ChunkCatalog`: a single in-memory LRU implementation.
 - `Cluster`: a single implementation that polls the headless Service
   (default 5s), computes rendezvous hashes against pod IPs, and exposes
@@ -510,8 +550,21 @@ then re-read from disk. Instead the leader splits origin bytes two ways:
    spool exists because the production `cachestore/s3` driver streams
    directly into `PutObject` and does not produce a readable on-disk tmp
    file - without the spool, slow joiners on the s3 path would have no
-   local fallback. The spool unifies behavior across `localfs` and `s3`
-   drivers.
+   local fallback. The spool unifies behavior across `localfs`, `s3`,
+   and `posixfs` drivers.
+
+**Spool locality is mandatory.** The Spool MUST live on a local block
+device. At boot, the cache layer runs `statfs(2)` against `spool.dir`
+and refuses to start (exit non-zero) if the filesystem magic matches a
+network FS denylist (NFS, SMB / CIFS, CephFS, Lustre, GPFS, FUSE
+including Alluxio FUSE), incrementing
+`origincache_spool_locality_check_total{result="refused"}`. Override is
+intentionally not provided. Rationale: the spool-fsync gate (below) is
+the cold-path TTFB barrier, and a remote-FS fsync would convert
+microsecond-class local-NVMe latency into tens-of-milliseconds-class
+network-round-trip latency, defeating the gate's purpose. Governed by
+`spool.require_local_fs` (default `true`); see
+[s10.4](#104-spool-locality-contract) for the full check.
 
 **Spool-fsync gate (cold path)**: the cold-path TTFB barrier is the
 local Spool fsync, NOT the cluster-wide CacheStore commit. Sequence:
@@ -859,50 +912,125 @@ in-flight client response; it only increments
 `origincache_commit_after_serve_total{result="failed"}` and skips
 `ChunkCatalog.Record` (next request refills).
 
-- **`cachestore/localfs`**:
-  1. Leader stages the chunk inside `<root>/.staging/<uuid>` (a fixed
-     subdirectory of the CacheStore root, NOT `/tmp` and NOT the spool
-     directory). Staging inside the root keeps the file on the same
-     filesystem as the destination, which is required for `link()` to
-     succeed; the spool MAY be on a different filesystem and so cannot
-     also serve as the staging area.
-  2. After write, `fsync(<staging file>)` then `fsync(<staging dir>)`.
-  3. Commit: `link(<root>/.staging/<uuid>, <final>)`. POSIX `link()` is
-     atomic and returns `EEXIST` if the destination exists. On `EEXIST`,
-     the leader treats the existing `<final>` as the source of truth,
-     `unlink(<root>/.staging/<uuid>)`, `fsync(<root>/.staging/)`, and
-     increments commit_lost. On success, `unlink(<root>/.staging/<uuid>)`,
-     `fsync(<root>/.staging/)`, `fsync(<final parent dir>)`, and
-     increment commit_won.
-  4. On Linux, `renameat2(RENAME_NOREPLACE)` is preferred when available
-     (single syscall) with the same parent-dir fsync sequencing; the
-     `link` + `unlink` form is the portable fallback (also works on
-     macOS dev environments). Plain `rename()` is **never** used because
-     it overwrites the destination on POSIX.
-  5. Crash recovery: a periodic background sweep (default every 1 hour)
-     unlinks `<root>/.staging/<uuid>` entries older than
-     `cachestore.localfs.staging_max_age` (default 1h), with a
-     `fsync(<root>/.staging/)` after the batch. Nothing breaks if a
-     staging file lingers briefly. Each sweep increments
-     `origincache_localfs_dir_fsync_total{result}`.
+Three drivers ship in v1, mapped onto two equivalent atomic-commit
+primitives. `localfs` and `posixfs` both use POSIX `link()` (or
+`renameat2(RENAME_NOREPLACE)` on Linux) returning `EEXIST` to the
+loser, and share their helpers via
+`internal/origincache/cachestore/internal/posixcommon/`. `s3` uses
+`PutObject + If-None-Match: *` returning `412` to the loser. All three
+drivers run `SelfTestAtomicCommit` at boot.
 
-- **`cachestore/s3`**:
-  1. Leader streams origin bytes (via the Spool, s8.2) into a single
-     `PutObject(final_key, body, If-None-Match: "*")`. There is no tmp
-     key and no copy hop.
-  2. `200 OK` -> commit_won. `412 Precondition Failed` -> commit_lost
-     (treat the existing object as the source of truth; no cleanup
-     needed because no tmp object was created).
-  3. **Startup self-test** (`SelfTestAtomicCommit`): on driver init the
-     `cachestore/s3` driver writes a probe key, then attempts a second
-     `PutObject(probe_key, ..., If-None-Match: "*")` and asserts a
-     `412` response. If the backend returns `200` instead (silently
-     overwrites), the driver fails to start with `cachestore/s3:
-     backend does not honor If-None-Match: *; refusing to start`. This
-     prevents silent double-writes on backends that don't implement the
-     precondition. Verified backends as of v1: AWS S3 (since 2024-08),
-     MinIO. VAST: confirmation required during Phase 2 (see
-     [plan.md#10-open-questions--risks](./plan.md#10-open-questions--risks)).
+#### 10.1.1 cachestore/localfs
+
+1. Leader stages the chunk inside `<root>/.staging/<uuid>` (a fixed
+   subdirectory of the CacheStore root, NOT `/tmp` and NOT the spool
+   directory). Staging inside the root keeps the file on the same
+   filesystem as the destination, which is required for `link()` to
+   succeed; the spool MAY be on a different filesystem and so cannot
+   also serve as the staging area.
+2. After write, `fsync(<staging file>)` then `fsync(<staging dir>)`.
+3. Commit: `link(<root>/.staging/<uuid>, <final>)`. POSIX `link()` is
+   atomic and returns `EEXIST` if the destination exists. On `EEXIST`,
+   the leader treats the existing `<final>` as the source of truth,
+   `unlink(<root>/.staging/<uuid>)`, `fsync(<root>/.staging/)`, and
+   increments commit_lost. On success, `unlink(<root>/.staging/<uuid>)`,
+   `fsync(<root>/.staging/)`, `fsync(<final parent dir>)`, and
+   increment commit_won.
+4. On Linux, `renameat2(RENAME_NOREPLACE)` is preferred when available
+   (single syscall) with the same parent-dir fsync sequencing; the
+   `link` + `unlink` form is the portable fallback (also works on
+   macOS dev environments). Plain `rename()` is **never** used because
+   it overwrites the destination on POSIX.
+5. Crash recovery: a periodic background sweep (default every 1 hour)
+   unlinks `<root>/.staging/<uuid>` entries older than
+   `cachestore.localfs.staging_max_age` (default 1h), with a
+   `fsync(<root>/.staging/)` after the batch. Nothing breaks if a
+   staging file lingers briefly. Each sweep increments
+   `origincache_localfs_dir_fsync_total{result}`.
+
+#### 10.1.2 cachestore/posixfs
+
+`posixfs` runs the same `link()` no-clobber primitive as `localfs`, but
+against a shared POSIX-style filesystem mounted on every replica at the
+same mount point and the same `<root>`. All replicas race the same
+`link()` syscall against the same destination inode; the kernel (NFS
+server, Weka, CephFS MDS, Lustre MDS, GPFS, etc.) is the arbiter, and
+exactly one wins.
+
+1. Backend selection and detection. At boot the driver inspects the
+   filesystem under `<root>` via `statfs(2)` (`f_type`) and
+   `/proc/mounts` and emits an info gauge
+   `origincache_posixfs_backend{type,version,major,minor}` (e.g.
+   `type="nfs",version="4.1"`, `type="wekafs"`, `type="ceph"`,
+   `type="lustre"`, `type="gpfs"`). Operators MAY override the detected
+   `type` via `cachestore.posixfs.backend_type` for backends with
+   ambiguous magic numbers; the override is logged loudly. Detected
+   `type="fuse"` triggers an extra check: if `/proc/mounts` source
+   matches `alluxio` (case-insensitive), the driver increments
+   `origincache_posixfs_alluxio_refusal_total` and exits non-zero with
+   `cachestore/posixfs: Alluxio FUSE is unsupported (no link(2), no
+   atomic no-overwrite rename, no NFS gateway); use cachestore.driver:
+   s3 against the Alluxio S3 gateway instead`.
+2. NFS minimum version. If `type="nfs"`, the driver reads the
+   negotiated NFS version from `/proc/mounts` (the `vers=` option). If
+   the version is below `cachestore.posixfs.nfs.minimum_version`
+   (default `4.1`), the driver refuses to start. NFSv3 is opt-in only
+   via `cachestore.posixfs.nfs.allow_v3: true`, which logs a loud
+   warning and increments
+   `origincache_posixfs_nfs_v3_optin_total`. Rationale: NFSv3 has weak
+   retransmit semantics; NFSv4.0 has atomic CREATE EXCLUSIVE but no
+   session idempotency; NFSv4.1+ provides session-based idempotency
+   that makes `link()` / `EEXIST` safe under client retries.
+3. Path layout adds a 2-character hex fan-out to keep directory sizes
+   manageable on multi-PB working sets:
+   `<root>/<origin_id>/<hash[0:2]>/<hash>/<chunk_index>` where `hash`
+   is the existing s5 hex hash. Fan-out width is governed by
+   `cachestore.posixfs.fanout_chars` (default `2`, 0 disables). The
+   `localfs` driver does NOT add fan-out by default (small dev working
+   sets), but the `posixcommon` helper supports it on both drivers.
+4. Stage + commit + recovery: identical to `localfs` (steps 1-5 above)
+   with the fan-out parent dirs created lazily and `fsync`ed on first
+   use, and `cachestore.posixfs.staging_max_age` (default 1h) governing
+   the sweep.
+5. **Startup self-test** (`SelfTestAtomicCommit`): on driver init the
+   `posixfs` driver creates a staging file, links it to a probe final,
+   then attempts a second `link()` to the same probe final and asserts
+   `EEXIST`. It then writes a known-size payload to the linked file via
+   a separate handle and asserts the size is observable to a re-`stat`
+   after `fsync(<final parent dir>)`. If `EEXIST` is not returned (the
+   second `link()` succeeds, or returns a different error), or if the
+   size verification fails, the driver exits non-zero with
+   `cachestore/posixfs: backend does not honor link()/EEXIST or
+   directory fsync; refusing to start`. Governed by
+   `cachestore.posixfs.require_atomic_link_self_test` (default `true`;
+   never disabled in production). On success, the driver records
+   `origincache_posixfs_selftest_last_success_timestamp`.
+6. NFS export hardening. `posixfs` documents (and the operator runbook
+   enforces) that NFS exports MUST use `sync` (not `async`); an `async`
+   export weakens the dir-fsync guarantee that the commit primitive
+   depends on. The driver cannot detect server-side `async` directly;
+   the runbook is the contract, and the boot self-test catches the most
+   common misconfigurations by re-`stat`ing through the negotiated
+   client cache.
+
+#### 10.1.3 cachestore/s3
+
+1. Leader streams origin bytes (via the Spool, s8.2) into a single
+   `PutObject(final_key, body, If-None-Match: "*")`. There is no tmp
+   key and no copy hop.
+2. `200 OK` -> commit_won. `412 Precondition Failed` -> commit_lost
+   (treat the existing object as the source of truth; no cleanup
+   needed because no tmp object was created).
+3. **Startup self-test** (`SelfTestAtomicCommit`): on driver init the
+   `cachestore/s3` driver writes a probe key, then attempts a second
+   `PutObject(probe_key, ..., If-None-Match: "*")` and asserts a
+   `412` response. If the backend returns `200` instead (silently
+   overwrites), the driver fails to start with `cachestore/s3:
+   backend does not honor If-None-Match: *; refusing to start`. This
+   prevents silent double-writes on backends that don't implement the
+   precondition. Verified backends as of v1: AWS S3 (since 2024-08),
+   MinIO. VAST: confirmation required during Phase 2 (see
+   [plan.md#10-open-questions--risks](./plan.md#10-open-questions--risks)).
 
 ### 10.2 Catalog correctness, typed errors, circuit breaker
 
@@ -967,7 +1095,7 @@ current state as `origincache_cachestore_breaker_state` (0=closed,
   any CacheStore commit failure is invisible to the client and recorded
   as `commit_after_serve_total{result="failed"}` (s8.6).
 
-### Diagram 9: Atomic commit (localfs vs s3 CacheStore)
+### Diagram 9: Atomic commit (localfs vs posixfs vs s3 CacheStore)
 
 ```mermaid
 flowchart TB
@@ -976,18 +1104,75 @@ flowchart TB
     L1 --> L2["link(staging, final)<br/>or renameat2(RENAME_NOREPLACE)"]
     L2 -- "EEXIST" --> Llost["unlink staging<br/>fsync(staging dir)<br/>commit_lost++<br/>treat existing final as truth"]
     L2 -- "ok" --> Lwon["unlink staging<br/>fsync(staging dir) + fsync(final parent dir)<br/>commit_won++"]
+    Driver -- "posixfs" --> P1["stage in &lt;root&gt;/.staging/&lt;uuid&gt;<br/>fsync(file) + fsync(staging dir)<br/>(shared FS - same primitive as localfs)"]
+    P1 --> P2["link(staging, final)<br/>across NFSv4.1+ / Weka / CephFS / Lustre / GPFS"]
+    P2 -- "EEXIST" --> Plost["unlink staging<br/>fsync(staging dir)<br/>commit_lost++<br/>treat existing final as truth"]
+    P2 -- "ok" --> Pwon["unlink staging<br/>fsync(staging dir) + fsync(final parent dir)<br/>commit_won++"]
     Driver -- "s3" --> S1["PutObject(final, body,<br/>If-None-Match: *)"]
     S1 -- "200" --> Swon["commit_won++"]
     S1 -- "412" --> Slost["commit_lost++<br/>treat existing object as truth"]
     Lwon --> Pub["ChunkCatalog.Record(k, info)"]
     Llost --> Pub
+    Pwon --> Pub
+    Plost --> Pub
     Swon --> Pub
     Slost --> Pub
     Pub --> Done["chunk visible to all replicas"]
     Sweep["periodic sweep cleans<br/>stale &lt;root&gt;/.staging/&lt;uuid&gt;<br/>older than staging_max_age"] -.-> L1
-    SelfTest["startup: SelfTestAtomicCommit;<br/>refuse to start if<br/>If-None-Match not honored"] -.-> S1
+    Sweep -.-> P1
+    SelfTestS3["startup SelfTestAtomicCommit (s3)<br/>refuse to start if<br/>If-None-Match not honored"] -.-> S1
+    SelfTestPosix["startup SelfTestAtomicCommit (posixfs)<br/>link EEXIST + dir-fsync + size verify<br/>refuse on Alluxio FUSE<br/>refuse if NFS &lt; minimum_version<br/>(opt-in via nfs.allow_v3)"] -.-> P1
     Failed["any commit failure<br/>after spool-fsync gate"] -.-> CASF["commit_after_serve_total{failed}++<br/>skip Catalog.Record"]
 ```
+
+### 10.4 Spool locality contract
+
+The local Spool (s8.2) is the cold-path TTFB barrier: the first body
+byte to the client is gated on `SpoolWriter.Commit()`'s blocking
+`fsync` + close. That gate budgets microsecond-class to low-millisecond
+latency on a local NVMe. A network filesystem `fsync` instead pays a
+network round-trip per commit, which is tens of milliseconds at best
+and seconds during congestion. Putting the spool on a network FS
+silently destroys the cache layer's TTFB guarantee.
+
+To prevent that, the cache layer enforces a **boot-time locality
+check** before any client traffic is accepted:
+
+1. Resolve `spool.dir` to an absolute path; resolve symlinks.
+2. Call `statfs(2)` on the resolved path. Read `f_type`.
+3. Compare `f_type` against a denylist (these magic numbers indicate a
+   network or virtual FS that violates the locality contract):
+   - `NFS_SUPER_MAGIC` (`0x6969`) - any NFS version, including
+     NFSv4.1+.
+   - `SMB2_MAGIC_NUMBER` (`0xfe534d42`), `CIFS_MAGIC_NUMBER`
+     (`0xff534d42`) - SMB / CIFS.
+   - `CEPH_SUPER_MAGIC` (`0x00c36400`) - CephFS kernel client.
+   - `LUSTRE_SUPER_MAGIC` (`0x0bd00bd0`) - Lustre.
+   - `GPFS_SUPER_MAGIC` (`0x47504653`) - IBM Spectrum Scale.
+   - `FUSE_SUPER_MAGIC` (`0x65735546`) - any FUSE mount, including
+     Alluxio FUSE.
+4. On match: increment
+   `origincache_spool_locality_check_total{result="refused",fs_type="<name>"}`,
+   log `spool: <spool.dir> is on a network filesystem (<name>); the
+   spool MUST be on a local block device. Refusing to start. Set
+   spool.dir to a local-NVMe-backed path or, for testing only, set
+   spool.require_local_fs=false`, and exit non-zero.
+5. On no match: increment
+   `origincache_spool_locality_check_total{result="ok",fs_type="<name>"}`
+   and proceed.
+
+Override is `spool.require_local_fs: false` (default `true`). The
+override exists for unit tests on developer laptops where the work
+directory may be on an unusual FS; it is **not** intended for
+production and MUST NOT be set in any deployed manifest. The metric
+label `result="bypassed"` distinguishes overridden runs from clean
+ones, and the boot log carries a loud `WARN spool.require_local_fs is
+disabled; spool durability gate is best-effort` line.
+
+The check is in `internal/origincache/fetch/spool/` and runs from
+`cmd/origincache/origincache/main.go` before the HTTP listener binds.
+It runs before any CacheStore self-test so a misconfigured spool fails
+fast even on backends that would otherwise pass their own self-test.
 
 ## 11. Bounded staleness contract
 
