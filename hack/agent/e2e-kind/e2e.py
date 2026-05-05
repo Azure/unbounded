@@ -27,6 +27,8 @@ Subcommands (called as individual workflow steps):
     validate-workload                  Deploy test pods on the agent node.
     validate-kube-proxy                Verify kube-proxy is Running on all nodes.
     install-machine-crd                Install Machine CRD and bootstrapper RBAC.
+    start-machina-controller           Run the machina controller against Kind.
+    validate-machina-controller        Verify machina creates an MCV.
     delete-machine-cr                  Delete the Machine CR.
     validate-machine-cr-created        Verify agent self-registered a Machine CR.
     validate-node-reboot-operation     Verify NodeReboot MachineOperation restarts the node.
@@ -95,8 +97,12 @@ SSH_TARGET = f"ubuntu@{VM_IP}"
 
 KUBECTL = "kubectl"
 KUBECTL_UNBOUNDED = str(REPO_ROOT / "bin" / "kubectl-unbounded")
+MACHINA = str(REPO_ROOT / "bin" / "machina")
 
 TEST_NS = "e2e-workload-test"
+MACHINA_PID_FILE = VM_DIR / "machina-controller.pid"
+MACHINA_LOG_FILE = VM_DIR / "machina-controller.log"
+MACHINA_CONFIG_FILE = VM_DIR / "machina-config.yaml"
 
 
 # ---------------------------------------------------------------------------
@@ -1249,11 +1255,13 @@ def reset_agent() -> None:
 # install-machine-crd
 # ---------------------------------------------------------------------------
 def install_machine_crd() -> None:
-    """Install the Machine and MachineOperation CRDs plus bootstrapper RBAC."""
+    """Install Machine-related CRDs and bootstrapper RBAC."""
 
     crd_paths = [
         REPO_ROOT / "deploy" / "machina" / "crd" / "unbounded-cloud.io_machines.yaml",
         REPO_ROOT / "deploy" / "machina" / "crd" / "unbounded-cloud.io_machineoperations.yaml",
+        REPO_ROOT / "deploy" / "machina" / "crd" / "unbounded-cloud.io_machineconfigurations.yaml",
+        REPO_ROOT / "deploy" / "machina" / "crd" / "unbounded-cloud.io_machineconfigurationversions.yaml",
     ]
     rbac_path = REPO_ROOT / "deploy" / "machina" / "rendered" / "07-bootstrapper-rbac.yaml"
 
@@ -1267,7 +1275,7 @@ def install_machine_crd() -> None:
     if not rbac_path.exists():
         die(f"Bootstrapper RBAC not found after render: {rbac_path}")
 
-    log("Installing Machine and MachineOperation CRDs...")
+    log("Installing Machine-related CRDs...")
     for crd_path in crd_paths:
         kubectl(["apply", "-f", str(crd_path)])
 
@@ -1275,6 +1283,117 @@ def install_machine_crd() -> None:
     kubectl(["apply", "-f", str(rbac_path)])
 
     log("Machine CRDs and RBAC installed")
+
+
+# ---------------------------------------------------------------------------
+# start-machina-controller
+# ---------------------------------------------------------------------------
+def start_machina_controller() -> None:
+    """Build and run the machina controller locally against the Kind cluster."""
+
+    log("Building machina controller...")
+    run(["make", "machina-build"], cwd=str(REPO_ROOT))
+
+    api_server = kubectl_capture([
+        "config", "view", "--minify", "--raw",
+        "-o", "jsonpath={.clusters[0].cluster.server}",
+    ])
+    if not api_server:
+        die("Could not determine API server URL from kubeconfig")
+
+    MACHINA_CONFIG_FILE.write_text(textwrap.dedent(f"""\
+        apiServerEndpoint: {api_server}
+        metricsAddr: "0"
+        probeAddr: "0"
+        enableLeaderElection: false
+        maxConcurrentReconciles: 10
+    """))
+
+    if MACHINA_PID_FILE.exists():
+        old_pid = MACHINA_PID_FILE.read_text().strip()
+        if old_pid:
+            run_quiet(["kill", old_pid], check=False)
+
+    log("Starting machina controller in background...")
+    log(f"Machina logs: {MACHINA_LOG_FILE}")
+    log_file = MACHINA_LOG_FILE.open("w")
+    env = os.environ.copy()
+    # GitHub Actions uses RUNNER_TRACKING_ID to clean up processes it started.
+    # Clear it so the controller survives across later workflow steps.
+    env["RUNNER_TRACKING_ID"] = ""
+    proc = subprocess.Popen(
+        [MACHINA, "controller", f"--config={MACHINA_CONFIG_FILE}"],
+        cwd=str(REPO_ROOT),
+        env=env,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        text=True,
+    )
+    log_file.close()
+    MACHINA_PID_FILE.write_text(str(proc.pid))
+
+    time.sleep(3)
+    if proc.poll() is not None:
+        if MACHINA_LOG_FILE.exists():
+            print(MACHINA_LOG_FILE.read_text(), flush=True)
+        die(f"machina controller exited early with code {proc.returncode}")
+
+    log(f"Machina controller started (pid={proc.pid})")
+
+
+# ---------------------------------------------------------------------------
+# validate-machina-controller
+# ---------------------------------------------------------------------------
+def validate_machina_controller() -> None:
+    """Verify the machina controller reconciles MachineConfiguration objects."""
+
+    name = f"{AGENT_MACHINE_NAME}-config"
+    log(f"Validating machina controller with MachineConfiguration '{name}'...")
+
+    manifest = {
+        "apiVersion": "unbounded-cloud.io/v1alpha3",
+        "kind": "MachineConfiguration",
+        "metadata": {
+            "name": name,
+            "labels": {"e2e.unbounded-cloud.io/test": "agent-kind"},
+        },
+        "spec": {
+            "template": {
+                "kubernetes": {
+                    "version": kubectl_capture(["version", "-o", "jsonpath={.serverVersion.gitVersion}"]),
+                },
+            },
+        },
+    }
+    kubectl(["apply", "-f", "-"], input=json.dumps(manifest).encode())
+
+    mcv_name = f"{name}-v1"
+    timeout_secs = 60
+    elapsed = 0
+    while elapsed < timeout_secs:
+        result = subprocess.run(
+            [KUBECTL, "get", "machineconfigurationversion", mcv_name, "-o", "json"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            mcv = json.loads(result.stdout)
+            version = mcv.get("spec", {}).get("version")
+            config = mcv.get("metadata", {}).get("labels", {}).get(
+                "unbounded-cloud.io/machine-configuration",
+            )
+            if version == 1 and config == name:
+                log(f"MachineConfigurationVersion '{mcv_name}' created")
+                return
+
+        if elapsed > 0 and elapsed % 15 == 0:
+            log(f"  ({elapsed}s) waiting for MachineConfigurationVersion '{mcv_name}'...")
+        time.sleep(5)
+        elapsed += 5
+
+    if MACHINA_LOG_FILE.exists():
+        print(MACHINA_LOG_FILE.read_text(), flush=True)
+    die(f"MachineConfigurationVersion '{mcv_name}' was not created after {timeout_secs}s")
 
 
 # ---------------------------------------------------------------------------
@@ -1401,6 +1520,15 @@ def validate_node_reboot_operation() -> None:
 def cleanup() -> None:
     """Tear down VM, networking, and Kind cluster."""
 
+    # Stop locally running machina controller if this e2e started one.
+    if MACHINA_PID_FILE.exists():
+        pid = MACHINA_PID_FILE.read_text().strip()
+        if pid:
+            log(f"Stopping machina controller pid {pid}...")
+            run_quiet(["kill", "-TERM", f"-{pid}"], check=False)
+            run_quiet(["kill", pid], check=False)
+        MACHINA_PID_FILE.unlink(missing_ok=True)
+
     # Stop QEMU VM
     _stop_qemu()
 
@@ -1464,6 +1592,8 @@ COMMANDS = {
     "validate-kube-proxy": validate_kube_proxy,
     "validate-workload": validate_workload,
     "install-machine-crd": install_machine_crd,
+    "start-machina-controller": start_machina_controller,
+    "validate-machina-controller": validate_machina_controller,
     "delete-machine-cr": delete_machine_cr,
     "validate-machine-cr-created": validate_machine_cr_created,
     "validate-node-reboot-operation": validate_node_reboot_operation,
