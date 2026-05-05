@@ -1350,6 +1350,10 @@ def validate_machina_controller() -> None:
 
     name = f"{AGENT_MACHINE_NAME}-config"
     log(f"Validating machina controller with MachineConfiguration '{name}'...")
+    version_json = json.loads(kubectl_capture(["version", "-o", "json"]))
+    server_version = version_json.get("serverVersion", {}).get("gitVersion")
+    if not server_version:
+        die(f"Could not resolve server version from kubectl version: {version_json}")
 
     manifest = {
         "apiVersion": "unbounded-cloud.io/v1alpha3",
@@ -1361,7 +1365,7 @@ def validate_machina_controller() -> None:
         "spec": {
             "template": {
                 "kubernetes": {
-                    "version": kubectl_capture(["version", "-o", "jsonpath={.serverVersion.gitVersion}"]),
+                    "version": server_version,
                 },
             },
         },
@@ -1525,7 +1529,6 @@ def cleanup() -> None:
         pid = MACHINA_PID_FILE.read_text().strip()
         if pid:
             log(f"Stopping machina controller pid {pid}...")
-            run_quiet(["kill", "-TERM", f"-{pid}"], check=False)
             run_quiet(["kill", pid], check=False)
         MACHINA_PID_FILE.unlink(missing_ok=True)
 
