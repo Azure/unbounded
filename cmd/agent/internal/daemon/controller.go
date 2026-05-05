@@ -59,7 +59,7 @@ func runController(ctx context.Context, log *slog.Logger, restCfg *rest.Config, 
 		machineName:       machineName,
 		nodeName:          nodeName,
 		restartActiveNode: restartActiveNode,
-		resetAgent:        resetAgent,
+		resetAgent:        resetAgentResources,
 	}
 
 	mgr, err := ctrl.NewManager(restCfg, manager.Options{

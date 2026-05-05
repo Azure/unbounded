@@ -76,7 +76,12 @@ func (r *daemonReconciler) reconcileAgentReset(ctx context.Context, op *v1alpha3
 		return reconcile.Result{}, finishErr
 	}
 
-	return finishOperation(ctx, r.Client, op.Name, v1alpha3.OperationPhaseComplete, "Succeeded", "AgentReset completed", machine.Generation)
+	result, err := finishOperation(ctx, r.Client, op.Name, v1alpha3.OperationPhaseComplete, "Succeeded", "AgentReset completed", machine.Generation)
+	if err != nil {
+		return result, err
+	}
+
+	return result, StopDaemon(r.log).Do(ctx)
 }
 
 func (r *daemonReconciler) mapMachineOperation(ctx context.Context, obj client.Object) []daemonRequest {

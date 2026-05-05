@@ -12,9 +12,20 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/phases/reset"
 )
 
-func resetAgent(ctx context.Context, log *slog.Logger) error {
+// ResetAgent returns a task that resets the host by stopping the daemon and
+// removing the unbounded-agent and all associated resources.
+func ResetAgent(log *slog.Logger) phases.Task {
 	return phases.Serial(log,
 		StopDaemon(log),
+		ResetAgentResources(log),
+	)
+}
+
+// ResetAgentResources returns a task that removes the unbounded-agent and all
+// associated resources without stopping the daemon process.
+func ResetAgentResources(log *slog.Logger) phases.Task {
+	return phases.Serial(log,
+		RemoveDaemonUnit(log),
 		phases.Parallel(log,
 			reset.StopMachine(log, goalstates.NSpawnMachineKube1),
 			reset.StopMachine(log, goalstates.NSpawnMachineKube2),
@@ -34,5 +45,9 @@ func resetAgent(ctx context.Context, log *slog.Logger) error {
 		reset.CleanupRoutes(log),
 		RemoveAgentArtifacts(log),
 		reset.ReloadSystemd(log),
-	).Do(ctx)
+	)
+}
+
+func resetAgentResources(ctx context.Context, log *slog.Logger) error {
+	return ResetAgentResources(log).Do(ctx)
 }
