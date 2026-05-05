@@ -34,30 +34,111 @@ layout, phasing, configuration, observability, and operational concerns.
 | Backing store | Pluggable `CacheStore`; `localfs` for dev, `s3` (VAST) for prod. The CacheStore is the source of truth for chunk presence. |
 | In-DC S3 vs. cloud S3 | The in-DC S3-compatible store is treated identically to cloud S3 at the protocol level. The only difference is "much faster, in-DC". Both `Origin` and `CacheStore` are thin S3-client adapters with no special-casing. |
 | Chunking | Fixed 8 MiB default (configurable 4-16 MiB). `chunk_size` baked into `ChunkKey`. |
-| Consistency | Immutable blobs. ETag is the version identity. **Origin reads use `If-Match: <etag>`**; mid-flight overwrite triggers `OriginETagChangedError`, metadata invalidation, and refusal of the in-flight fill (no opt-out: design protects itself rather than relying on operational immutability). |
+| Consistency | **Origin objects are immutable per operator contract**: an `(origin_id, bucket, key)` never has its bytes modified once published; replacement must be a new key. `ETag` is identity, not freshness. `If-Match: <etag>` on every `Origin.GetRange` is defense-in-depth that traps in-flight overwrites only. Bounded staleness on contract violation = `metadata_ttl` (default 5m); see [s11](#11-bounded-staleness-contract). |
 | Catalog | In-memory `ChunkCatalog` fronting `CacheStore.Stat`. No persistent local index. |
 | Eviction | Deferred to CacheStore lifecycle policy. Cache layer ships no eviction code in v1. |
 | Prefetch | Sequential read-ahead by default. Configurable depth, capped concurrency. |
-| Cluster | Kubernetes Deployment + headless Service for peer discovery + ClusterIP/LB for client traffic. Rendezvous hashing on pod IP selects the coordinator per `ChunkKey` for miss-fills only; receiving replica is the **assembler** that fans out per-chunk fill RPCs to coordinators (s7.3). All replicas can read all chunks directly from the CacheStore on hits. |
-| Inter-replica auth | Separate internal mTLS listener (default `:8444`) chained to an internal CA distinct from the client mTLS CA; authorization = "presenter source IP is in current peer-IP set" (s7.8). |
-| Local spool | Every fill writes origin bytes through a local spool (`internal/origincache/fetch/spool`) so slow joiners always have a local fallback regardless of CacheStore driver (s7.2). |
-| Atomic commit | `localfs` uses `link()` for atomic no-clobber; `s3` uses direct `PutObject` with `If-None-Match: *` and a startup self-test that refuses to start if the backend doesn't honor the precondition (s9). |
+| Cluster | Kubernetes Deployment + headless Service for peer discovery + ClusterIP/LB for client traffic. Rendezvous hashing on pod IP selects the coordinator per `ChunkKey` for miss-fills only; receiving replica is the **assembler** that fans out per-chunk fill RPCs to coordinators (s8.3). All replicas can read all chunks directly from the CacheStore on hits. |
+| Inter-replica auth | Separate internal mTLS listener (default `:8444`) chained to an internal CA distinct from the client mTLS CA; authorization = "presenter source IP is in current peer-IP set" (s8.8). |
+| Local spool | Every fill writes origin bytes through a local spool (`internal/origincache/fetch/spool`) so slow joiners always have a local fallback regardless of CacheStore driver (s8.2). |
+| Atomic commit | `localfs` stages inside `<root>/.staging/<uuid>` with parent-dir fsync, then `link()` no-clobber; `s3` uses direct `PutObject` with `If-None-Match: *` and a startup self-test that refuses to start if the backend doesn't honor the precondition (s10). Cold-path TTFB is gated on local Spool fsync, not on CacheStore commit; commit-after-serve failure becomes `commit_after_serve_total{result="failed"}` rather than a client error (s8.6). |
 | Tenancy | Single tenant, single origin credential set in v1. |
 | Repo home | This repo. Layout mirrors `machina`. |
 
-## 3. Architecture
+## 3. Terminology
 
-A single binary, `origincache`, deployed as a Kubernetes Deployment. All
-replicas share a single in-DC CacheStore. A headless Service publishes the
-set of Ready pod IPs; each replica polls it (default every 5s) to refresh
-its peer set. Rendezvous hashing on `ChunkKey` against the current pod-IP
-set selects a coordinator replica **per chunk**. The replica that receives
-a client request is the **assembler**: for each chunk in the requested
-range, it serves directly from the CacheStore on hit, runs a local
-singleflight + tee fill if it is the coordinator for that chunk, or issues
-an internal per-chunk fill RPC to the coordinator otherwise. The
-coordinator owns the singleflight + tee + atomic CacheStore commit for its
-chunks. Single tenant. One origin credential set per deployment.
+Terms used throughout this document. Forward-references point at the
+section that defines or implements the full mechanism.
+
+- **Replica** - one running pod of the `origincache` Deployment. All
+  replicas are interchangeable; there is no per-pod state.
+- **Client** - external caller using an S3-compatible HTTP API (e.g.
+  `aws-sdk`, `boto3`).
+- **Origin** - upstream cloud blob store (AWS S3 or Azure Blob); read-only
+  from our perspective. Interface defined in
+  [s7](#7-internal-interfaces).
+- **CacheStore** - the in-DC durable store that holds cached chunk bytes
+  and is shared by all replicas. Pluggable: `localfs` for dev, `s3` (e.g.
+  VAST) for prod. Treated as the source of truth for chunk presence.
+  Interface in [s7](#7-internal-interfaces); commit semantics in
+  [s10](#10-concurrency-durability-correctness).
+- **Chunk** - a fixed-size byte range of an origin object (default 8 MiB);
+  the unit of caching and fill.
+- **ChunkKey** - the immutable identifier for a chunk:
+  `{origin_id, bucket, object_key, etag, chunk_size, chunk_index}`. Full
+  definition in [s5](#5-chunk-model).
+- **Headless Service** - Kubernetes `Service` with `clusterIP: None`; its
+  DNS A-record resolves to the IPs of all Ready pods. We poll it (default
+  every 5s) to discover the current peer set.
+- **Rendezvous hashing** (a.k.a. Highest Random Weight, HRW) - for a given
+  key, score each peer with `hash(peer_ip || key)` and pick the argmax.
+  Stable under membership changes that don't add or remove the winning
+  peer. We use it to pick exactly one coordinator per chunk from the
+  current peer set.
+- **Coordinator** - the replica that rendezvous hashing selects to perform
+  the miss-fill for a particular chunk. Ownership is **per chunk**, not
+  per request and not per object: a single client request spanning N
+  chunks may have N different coordinators.
+- **Assembler** - the replica that received the client request. It is
+  responsible for stitching the client response. For each chunk in the
+  requested range, the assembler either (a) reads from CacheStore on a
+  hit, (b) runs a local miss-fill if it is the coordinator for that
+  chunk, or (c) issues an internal fill RPC to the coordinator otherwise.
+  See [s8.3](#83-cluster-wide-deduplication-via-per-chunk-fill-rpc).
+- **Singleflight** - a per-key in-process deduplication primitive.
+  Concurrent requests for the same `ChunkKey` share a single in-flight
+  fill: the first arrival is the **leader** (issues the origin GET);
+  subsequent arrivals are **joiners** (wait on the leader's stream). Full
+  mechanism in [s8.1](#81-per-chunkkey-singleflight).
+- **Tee** - the leader's origin byte stream is split two ways: into a
+  small in-memory ring buffer for low-TTFB joiners, and into the Spool
+  (below) for slow joiners that fall behind the ring head. Joiners
+  therefore stream through the leader rather than waiting for the full
+  disk write. Full mechanism in [s8.2](#82-ttfb-tee--spool).
+- **Spool** - bounded local-disk staging area for in-flight fills
+  (`internal/origincache/fetch/spool`). Ensures slow joiners always have a
+  local fallback regardless of CacheStore driver. Detail in
+  [s8.2](#82-ttfb-tee--spool).
+- **Atomic CacheStore commit** - the leader publishes the completed chunk
+  in a single no-clobber operation: `link()` /
+  `renameat2(RENAME_NOREPLACE)` for `localfs`; `PutObject` +
+  `If-None-Match: *` for `s3`. Concurrent commits cannot overwrite each
+  other; the loser is recorded as `commit_lost`. See
+  [s10](#10-concurrency-durability-correctness).
+- **Per-chunk internal fill RPC** - `GET /internal/fill?key=<encoded
+  ChunkKey>` over mTLS on the internal listener (default `:8444`). The
+  assembler calls the coordinator when a chunk is missed and the
+  coordinator is not self. See [s8.8](#88-internal-rpc-listener).
+- **Immutable origin contract** - operator promise that an
+  `(origin_id, bucket, key)` never has its bytes modified once published;
+  replacement is always a new key. The cache trusts this contract; on
+  violation, the bounded staleness window is `metadata_ttl` (default 5m).
+  Full statement in [s11](#11-bounded-staleness-contract).
+- **Spool-fsync gate** - the cold-path TTFB barrier: the first body byte
+  is released to the client only after the chunk is durably fsynced into
+  the local Spool. The CacheStore commit happens asynchronously after
+  that; commit failure does not affect the in-flight client response.
+  Detail in [s8.2](#82-ttfb-tee--spool) and [s8.6](#86-failure-handling-without-re-stampede).
+- **CacheStore circuit breaker** - per-process error-rate breaker around
+  `CacheStore` calls. On sustained `ErrTransient` / `ErrAuth`, the
+  breaker opens, short-circuits writes, and surfaces via metrics and
+  `/readyz`. Defaults: 10 errors / 30s window, 30s open, 3 half-open
+  probes. Detail in [s10.2](#102-catalog-correctness-typed-errors-circuit-breaker).
+
+## 4. Architecture
+
+A single binary, `origincache`, deployed as a Kubernetes Deployment.
+Replicas discover each other through a headless Service and refresh the
+peer set on a configurable interval (default 5s). A request from a client
+lands on one replica - the **assembler** - which iterates the requested
+range chunk-by-chunk. For each `ChunkKey`, the assembler reads directly
+from the shared CacheStore on a hit; on a miss it routes to the chunk's
+**coordinator** (selected by rendezvous hashing on the current peer-IP
+set) for a singleflight + tee + spool + atomic-commit fill. The
+coordinator may be the assembler itself, in which case the fill runs
+locally; otherwise the assembler issues a per-chunk internal fill RPC.
+All terms are defined in [s3](#3-terminology). Single tenant. One origin
+credential set per deployment.
 
 ### Diagram 1: System overview
 
@@ -97,7 +178,7 @@ graph TB
     R3 -- "miss-fill<br/>If-Match: etag" --> Azure
 ```
 
-## 4. Chunk model
+## 5. Chunk model
 
 - `ChunkKey = {origin_id, bucket, object_key, etag, chunk_size, chunk_index}`.
   - `origin_id` is a deployment-scoped identifier from config (e.g.
@@ -172,34 +253,51 @@ flowchart LR
     Path --> CS[("CacheStore<br/>address")]
 ```
 
-## 5. Request flow
+## 6. Request flow
 
 1. `GET /{bucket}/{key}` arrives with optional `Range`.
 2. Auth middleware (bearer / mTLS) validates the caller.
 3. `fetch.Coordinator` looks up object metadata in the metadata cache. On
-   miss, exactly one `HEAD` is issued to origin (singleflight at the
-   metadata layer). `404` and unsupported-blob-type errors are negatively
-   cached. The cached entry includes the current `ETag`.
+   miss, **per-replica** singleflight at the metadata layer issues at most
+   one `HEAD` per object per replica per `metadata_ttl` window. Cluster-wide
+   bound is therefore N HEADs per object per window worst case where N is
+   the current peer-set size; this is acceptable in v1 (a cluster-wide HEAD
+   singleflight is Phase 4). `404` and unsupported-blob-type errors are
+   negatively cached. The cached entry includes the current `ETag` and is
+   reused for up to `metadata_ttl` (default 5m), which also bounds the
+   staleness window if the immutable-origin contract (s11) is violated.
 4. If the request has `Range`, validate against `ObjectInfo.Size`; serve
    `416` if unsatisfiable. Compute `firstChunk` and `lastChunk`. If
    `server.max_response_bytes > 0` and the computed response size exceeds
-   it, return `416` with `x-origincache-cap-exceeded: true`.
+   it, return `400 RequestSizeExceedsLimit` (S3-style XML error body)
+   with `x-origincache-cap-exceeded: true`. `416` is reserved for true
+   Range-vs-object-size violations.
 5. Iterate the chunk range as a streaming iterator. For each `ChunkKey`:
-   - **ChunkCatalog hit:** open reader from `CacheStore`.
+   - **ChunkCatalog hit:** open reader from `CacheStore`. Typed
+     `CacheStore` errors (s7) are honored: only `ErrNotFound` triggers a
+     refill; `ErrTransient` surfaces as `503 Slow Down` with `Retry-After`,
+     `ErrAuth` surfaces as `502 Bad Gateway` and counts toward the
+     `/readyz` `ErrAuth` threshold (default 3 consecutive -> NotReady).
    - **ChunkCatalog miss:** call `CacheStore.Stat(key)`. If present,
      record in the catalog and serve from the CacheStore. If absent, take
-     the miss-fill path (s7), which routes to the coordinator for that
+     the miss-fill path (s8), which routes to the coordinator for that
      specific chunk via local singleflight or per-chunk internal RPC.
-6. **Deferred response headers**: response headers (`Content-Length`,
-   `Content-Range`, `ETag`, `Accept-Ranges: bytes`) are not sent until
-   the **first chunk** of the range is in hand (committed to CacheStore
-   for the cold path; available from CacheStore for the warm path).
-   Until then, any failure - origin unreachable, `OriginETagChangedError`,
-   semaphore timeout, internal RPC failure - returns a clean HTTP error
-   (typically `502 Bad Gateway` or `503 Slow Down`). `Content-Length` and
-   `Content-Range` are computable from `ObjectInfo.Size` and the chunk
-   math, so deferring headers does not lose information; it only adds
-   roughly one chunk-fill latency to TTFB on the cold path.
+6. **Spool-fsync gate (cold path)**: response headers (`Content-Length`,
+   `Content-Range`, `ETag`, `Accept-Ranges: bytes`) are deferred until
+   the **first chunk** of the range is durably fsynced into the local
+   **Spool** (s8.2). The CacheStore commit happens asynchronously after
+   that. Commit-after-serve failure does NOT affect the in-flight client
+   response; it increments
+   `origincache_commit_after_serve_total{result="failed"}` and the chunk
+   is **not** recorded in the `ChunkCatalog` (the next request will
+   refill). Pre-spool-fsync failures - origin unreachable,
+   `OriginETagChangedError`, semaphore timeout, internal RPC failure -
+   return a clean HTTP error (typically `502 Bad Gateway` or
+   `503 Slow Down`). Warm-path TTFB is unchanged: the gate is the
+   `CacheStore.GetChunk` first byte. `Content-Length` and `Content-Range`
+   are computable from `ObjectInfo.Size` and the chunk math, so deferring
+   headers does not lose information; it adds roughly one Spool-fsync
+   latency to TTFB on the cold path.
 7. **Mid-stream failure**: once any body byte has been written, no HTTP
    error status is possible. Mid-stream failures abort the response
    (HTTP/2 `RST_STREAM` with `INTERNAL_ERROR`; HTTP/1.1 `Connection:
@@ -233,6 +331,7 @@ sequenceDiagram
         end
         R-->>C: stream slice
     end
+    Note over R,CS: All replicas read directly from shared CacheStore on hit<br/>and no peer is involved on the hit path
 ```
 
 ### Diagram 4: Cache miss, single replica (this replica is the coordinator)
@@ -251,25 +350,28 @@ sequenceDiagram
     R->>Cat: Lookup(k)
     Cat-->>R: miss
     R->>CS: Stat(k)
-    CS-->>R: absent
+    CS-->>R: ErrNotFound
     R->>SF: Acquire(k) [leader]
     SF->>O: GetRange(bucket, key, etag, off, n)<br/>If-Match: etag
     O-->>SF: byte stream
-    par tee
-        SF->>Sp: spool bytes
-        SF-->>R: ring buffer
-        Note over R: defer headers until first chunk committed
-        R-->>C: 200/206 + headers + stream slice
-    and commit
-        SF->>CS: PutObject(final, body, If-None-Match: *)
-        CS-->>SF: 200 (commit_won)
+    SF->>Sp: write bytes
+    SF->>Sp: Commit (fsync + close)
+    Note over SF,Sp: spool-fsync gate - chunk durable on local disk<br/>headers and first byte released to client now
+    SF-->>R: gate open
+    R-->>C: 200/206 + headers + stream slice
+    SF-)CS: PutObject(final, body, If-None-Match: *) [async]
+    CS--)SF: 200 (commit_won) or failure
+    alt commit ok
+        SF->>Cat: Record(k, info)
+        Note over SF: commit_after_serve_total{result=ok}++
+    else commit failed
+        Note over SF: commit_after_serve_total{result=failed}++<br/>chunk NOT recorded - next request refills
     end
-    SF->>Cat: Record(k, info)
     SF->>SF: Release(k)
     SF->>Sp: release after joiners drain
 ```
 
-## 6. Internal interfaces
+## 7. Internal interfaces
 
 The mechanism's named seams. Implementations live under
 `internal/origincache/`; see [plan.md#3-repo-layout](./plan.md#3-repo-layout-mirrors-machina).
@@ -297,13 +399,28 @@ type OriginETagChangedError struct {
 // source of truth for chunk presence; backed by an in-DC S3-like service
 // in production and a local directory in dev. PutChunk is atomic and
 // no-clobber; the second concurrent PutChunk for the same key returns a
-// CommitLost error.
+// CommitLost error. Read/Stat methods return typed errors:
+//   - ErrNotFound:  chunk is absent. ONLY this error triggers a refill.
+//   - ErrTransient: backend hiccup (5xx, timeout, throttle). Surfaced as
+//                   503 Slow Down + Retry-After. Counts toward the
+//                   per-process circuit breaker (see s10.2).
+//   - ErrAuth:      backend rejected credentials (401/403). Surfaced as
+//                   502 BadGateway. Counts toward the breaker AND toward
+//                   the /readyz consecutive-ErrAuth threshold (default 3
+//                   -> NotReady).
 type CacheStore interface {
     GetChunk(ctx context.Context, k ChunkKey, off, n int64) (io.ReadCloser, error)
     PutChunk(ctx context.Context, k ChunkKey, size int64, r io.Reader) error // atomic, no-clobber
     Stat(ctx context.Context, k ChunkKey) (ChunkInfo, error)
     SelfTestAtomicCommit(ctx context.Context) error // startup probe
 }
+
+// CacheStore typed errors. Wrap with %w so callers use errors.Is.
+var (
+    ErrNotFound  = errors.New("cachestore: not found")
+    ErrTransient = errors.New("cachestore: transient")
+    ErrAuth      = errors.New("cachestore: auth")
+)
 
 // ChunkCatalog: in-memory, best-effort record of chunks known to be
 // present in the CacheStore. Purely a hot-path optimization; the
@@ -318,12 +435,16 @@ type ChunkCatalog interface {
 // Cluster: peer discovery + rendezvous hashing. Returns the coordinator
 // peer for a given ChunkKey. self == coordinator means handle locally.
 // InternalDial returns a transport (HTTP/2 over mTLS) for issuing
-// /internal/fill RPCs to a non-self peer.
+// /internal/fill RPCs to a non-self peer. ServerName returns the stable
+// SAN (default "origincache.<ns>.svc") used for TLS verification across
+// rolling restarts and pod-IP churn; per-replica internal-listener certs
+// MUST include this SAN.
 type Cluster interface {
     Coordinator(k ChunkKey) Peer  // returns self or remote Peer
     Self() Peer
     Peers() []Peer                // current membership snapshot
     InternalDial(ctx context.Context, p Peer) (InternalClient, error)
+    ServerName() string           // e.g. "origincache.<ns>.svc"
 }
 
 // Spool: bounded local-disk staging area for in-flight fills. Every fill
@@ -348,7 +469,7 @@ Implementations:
   the caller's `etag` as `If-Match` on the underlying GET; both translate
   the backend's "precondition failed" status into `OriginETagChangedError`.
 - `CacheStore`: `cachestore/localfs` (dev), `cachestore/s3` (VAST etc.).
-  See s9 for atomic-commit specifics per driver.
+  See s10 for atomic-commit specifics per driver.
 - `ChunkCatalog`: a single in-memory LRU implementation.
 - `Cluster`: a single implementation that polls the headless Service
   (default 5s), computes rendezvous hashes against pod IPs, and exposes
@@ -357,15 +478,15 @@ Implementations:
   (`spool.dir`) with a capacity cap (`spool.max_bytes`) and an in-flight
   cap (`spool.max_inflight`).
 
-## 7. Stampede protection
+## 8. Stampede protection
 
 The single most important hot-path correctness issue. Layered defense.
 
-### 7.1 Per-`ChunkKey` singleflight
+### 8.1 Per-`ChunkKey` singleflight
 
 Process-local map `inflight: map[ChunkKey]*Fill`, guarded by a mutex. Each
 `*Fill` has a `done` channel, an error slot, the resulting `ChunkInfo`, a
-bounded ring buffer, a `Spool` handle (s7.2), and a refcount. Acquire
+bounded ring buffer, a `Spool` handle (s8.2), and a refcount. Acquire
 path: under the lock, either return the existing entry as a joiner or
 insert a new entry and become the leader. Release path: leader removes
 the entry from the map after signalling, so any thread arriving while the
@@ -373,7 +494,7 @@ entry is mapped joins; any thread arriving after removal records the
 chunk in the `ChunkCatalog` (which the leader populated before releasing)
 and serves a normal hit.
 
-### 7.2 TTFB tee + spool
+### 8.2 TTFB tee + spool
 
 Naive singleflight makes joiners wait for the leader's full disk write,
 then re-read from disk. Instead the leader splits origin bytes two ways:
@@ -392,6 +513,30 @@ then re-read from disk. Instead the leader splits origin bytes two ways:
    local fallback. The spool unifies behavior across `localfs` and `s3`
    drivers.
 
+**Spool-fsync gate (cold path)**: the cold-path TTFB barrier is the
+local Spool fsync, NOT the cluster-wide CacheStore commit. Sequence:
+
+1. Leader streams origin bytes into the Spool (and the ring buffer in
+   parallel).
+2. Once the chunk is fully written and `SpoolWriter.Commit()` has done a
+   blocking `fsync` + close, the chunk is durable on this replica's
+   local disk.
+3. The first body byte to the client (and the deferred response headers)
+   is released at this point.
+4. The leader then performs the CacheStore commit asynchronously
+   (`PutObject` + `If-None-Match: *` for `s3`; `link()` for `localfs`).
+   Success increments `commit_after_serve_total{result="ok"}`; failure
+   increments `commit_after_serve_total{result="failed"}` AND skips
+   `ChunkCatalog.Record` so the next request refills. The client
+   response is unaffected either way.
+
+This separation is deliberate: it bounds cold-path TTFB by local disk
+fsync (microseconds to low milliseconds on NVMe) rather than by the
+in-DC CacheStore round-trip plus durability barrier (typically tens of
+milliseconds on a healthy in-DC S3-like store, much higher under load).
+The chunk is still durable on at least one replica's disk before the
+client sees a byte; the only thing deferred is shared visibility.
+
 Capacity: `spool.max_bytes` caps total spool footprint (default 8 GiB);
 `spool.max_inflight` caps concurrent fills using the spool. When the
 spool is full, new fills wait briefly on `spool.max_inflight` semaphore;
@@ -399,7 +544,9 @@ on timeout they return `503 Slow Down` to the client.
 
 After the leader's CacheStore commit succeeds, the spool entry is retained
 briefly so any in-flight joiner can finish reading; once joiner refcount
-hits zero the spool entry is released.
+hits zero the spool entry is released. On commit-after-serve failure the
+spool entry is released the same way; the cache layer simply does not
+record the chunk and the next request refills.
 
 ### Diagram 5: Same-replica joiner via singleflight + tee + spool
 
@@ -424,21 +571,26 @@ sequenceDiagram
     and spool
         SF->>Sp: bytes
     end
+    SF->>Sp: Commit (fsync + close)
+    Note over SF,Sp: spool-fsync gate: first byte released to A now
     SF-->>A: stream from Ring
     B->>R: GET k (concurrent)
     R->>SF: Acquire(k) [joiner = B]
     SF-->>B: stream from Ring
     Note over B: B falls behind ring head
     SF-->>B: switch to Spool.Reader
-    SF->>Sp: Commit (fsync + close)
-    SF->>CS: PutObject(final, body, If-None-Match: *)
-    CS-->>SF: 200 (commit_won)
-    SF->>Cat: Record(k, info)
+    SF-)CS: PutObject(final, body, If-None-Match: *) [async]
+    CS--)SF: 200 (commit_won) or failure
+    alt commit ok
+        SF->>Cat: Record(k, info)
+    else commit failed
+        Note over SF: commit_after_serve_total{result=failed}++<br/>chunk NOT recorded
+    end
     SF->>SF: Release(k)
     SF->>Sp: Release after joiners drain
 ```
 
-### 7.3 Cluster-wide deduplication via per-chunk fill RPC
+### 8.3 Cluster-wide deduplication via per-chunk fill RPC
 
 Rendezvous hashing on `ChunkKey` against the current pod-IP set selects
 **one coordinator per chunk**. A range request can span N chunks; those
@@ -449,10 +601,10 @@ whole HTTP request. For each `ChunkKey k` in the requested range:
 - **Hit** (Catalog or `Stat` says present): assembler reads from
   `CacheStore` directly. No internal RPC.
 - **Miss + `Coordinator(k) == self`**: assembler runs the local
-  singleflight + tee + spool + commit path (s7.1, s7.2, s9).
+  singleflight + tee + spool + commit path (s8.1, s8.2, s10).
 - **Miss + `Coordinator(k) != self`**: assembler issues
   `GET /internal/fill?key=<encoded ChunkKey>` to the coordinator on the
-  coordinator's internal listener (s7.8). The coordinator runs the
+  coordinator's internal listener (s8.8). The coordinator runs the
   singleflight + tee + spool + commit path locally and streams the chunk
   bytes back. The assembler stitches the returned bytes into the client
   response, slicing the first and last chunk to match the client's `Range`.
@@ -496,15 +648,14 @@ sequenceDiagram
     B->>SF: Acquire(k) [leader]
     SF->>O: GetRange(..., If-Match: etag)
     O-->>SF: byte stream
-    par tee back to A
-        SF->>Sp: spool bytes
-        SF-->>B: stream
-        B-->>A: chunk bytes
-        A-->>C: stream slice
-    and commit
-        SF->>CS: PutObject(final, body, If-None-Match: *)
-        CS-->>SF: 200
-    end
+    SF->>Sp: write bytes
+    SF->>Sp: Commit (fsync + close)
+    Note over SF,Sp: spool-fsync gate at B
+    SF-->>B: gate open
+    B-->>A: chunk bytes (stream)
+    A-->>C: stream slice
+    SF-)CS: PutObject(final, body, If-None-Match: *) [async]
+    CS--)SF: 200 (commit_won) or failure
     Note over A,B: On membership disagreement at B<br/>B returns 409 and A falls back to local fill
     Note over A,B: On hit (chunk in CacheStore)<br/>A reads CacheStore directly with no internal RPC
 ```
@@ -536,22 +687,40 @@ sequenceDiagram
     A-->>C: stream slice
 ```
 
-### 7.4 Origin backpressure
+### 8.4 Origin backpressure
 
-A separate per-origin **semaphore** caps concurrent `Origin.GetRange`
-calls (default 64-128, configurable). Optional token bucket on origin
-bytes/sec. Joiners do not consume tokens. If saturated, leaders queue
-with bounded wait; on timeout the request returns `503 Slow Down` so
-clients back off.
+Each replica enforces a **per-replica** semaphore that caps concurrent
+`Origin.GetRange` calls. The configured value is a per-replica cap, not a
+cluster-wide one; given a desired global concurrency `target_global`, set
+the per-replica cap as:
 
-### 7.5 Cancellation safety
+```
+target_per_replica = floor(target_global / N_replicas)
+```
+
+with `N_replicas = len(Cluster.Peers())`. Defaults: 64-128 per replica,
+which gives 192-384 global at the typical 3-replica deployment. A real
+cluster-wide distributed limiter is deferred to Phase 4. The approximation
+can transiently exceed `target_global` by up to
+`(N_replicas - 1) * floor(target_global / N_replicas)` worst case during
+membership flux; in practice this is bounded by the cluster size and is
+acceptable for v1.
+
+The current saturation is exposed as
+`origincache_origin_inflight{origin}` (gauge, per-replica) so operators
+can observe approach to the cap. Optional token bucket on origin
+bytes/sec layered on top. Joiners do not consume tokens. If the
+semaphore is saturated, leaders queue with bounded wait; on timeout the
+request returns `503 Slow Down` so clients back off.
+
+### 8.5 Cancellation safety
 
 `Fill.run()` uses an internal long-lived context, not any single client's
 context. The fill outlives any single requester. If every joiner cancels
 we still finish the fill (cheap insurance; configurable to abort). A
 joiner cancelling unblocks only itself.
 
-### 7.6 Failure handling without re-stampede
+### 8.6 Failure handling without re-stampede
 
 - **Retryable error**: short-lived negative entry in the singleflight map
   (cooldown 100 ms - 1 s) so concurrent joiners share the failure rather
@@ -570,16 +739,35 @@ joiner cancelling unblocks only itself.
   which is non-retryable (the object identity changed; refilling under
   the old ETag is the bug we are preventing). Joiners sit through retries
   on the same `Fill`.
+- **`CommitFailedAfterServe` (post spool-fsync gate)**: after the client
+  has already received the first byte (i.e. the Spool fsync succeeded),
+  a CacheStore commit failure is NOT visible to the client. The leader
+  increments `origincache_commit_after_serve_total{result="failed"}` and
+  does NOT call `ChunkCatalog.Record`. Joiners on the same fill that are
+  still draining the Spool finish normally; the next request for the
+  same `ChunkKey` re-runs the fill (one extra origin GET worst case).
+  Sustained non-zero `failed` rate is a CacheStore-health alert, not a
+  per-request error path.
+- **Typed `CacheStore` errors during read**: `ErrNotFound` triggers the
+  miss-fill path; `ErrTransient` surfaces as `503 Slow Down` with
+  `Retry-After: 1s`; `ErrAuth` surfaces as `502 Bad Gateway`. Sustained
+  `ErrTransient` / `ErrAuth` trips the per-process **CacheStore circuit
+  breaker** (s10.2). Sustained `ErrAuth` (default 3 consecutive) flips
+  `/readyz` to NotReady so load balancers drain the replica.
 
-### 7.7 Metadata-layer singleflight
+### 8.7 Metadata-layer singleflight
 
 Same pattern at the metadata cache:
 `metaInflight: map[ObjectKey]*MetaFill`. Without this, a flood of
 distinct cold keys shifts the storm from chunk GETs to chunk HEADs.
 Stale-while-revalidate behavior: serve stale within a small margin while
-one background refresh runs.
+one background refresh runs. The singleflight is **per-replica**: a
+cluster-wide cold-fan-out can cause up to N HEADs per object per
+`metadata_ttl` window where N is the current peer-set size. This is
+acceptable in v1; a cluster-wide HEAD singleflight is Phase 4 only if
+measured.
 
-### 7.8 Internal RPC listener
+### 8.8 Internal RPC listener
 
 Per-chunk fill RPCs (`GET /internal/fill?key=<encoded ChunkKey>`) are
 served on a separate listener bound to a distinct port (default `:8444`,
@@ -590,11 +778,18 @@ from the client edge.
 - **Server cert**: per-replica cert (e.g. cert-manager-issued) chained to
   a configured **internal CA** (`cluster.internal_tls.ca_file`). The
   internal CA is **distinct** from the client mTLS CA so a leaked client
-  cert cannot be used to dial the internal listener.
+  cert cannot be used to dial the internal listener. The cert MUST
+  include the stable SAN `cluster.internal_tls.server_name` (default
+  `origincache.<ns>.svc`); pod-IP SANs are NOT used because pod IPs
+  change on rolling restart.
 - **Client auth**: peer presents a client cert chained to the internal CA
   AND the peer's source IP must be in the current peer-IP set
   (`Cluster.Peers()`). The IP-set check guards against a leaked internal
   cert being usable from outside the Deployment.
+- **TLS verification**: the dialer pins `tls.Config.ServerName` to the
+  value returned by `Cluster.ServerName()` (the same stable SAN above)
+  rather than to the destination pod IP. This keeps verification
+  consistent across rolling restarts and pod-IP churn.
 - **Authorization scope**: the internal listener serves `GET
   /internal/fill?key=<...>` only. No client identity is propagated from
   the assembler because chunk content is identity-independent: any
@@ -609,7 +804,7 @@ Metrics: `origincache_cluster_internal_fill_requests_total{direction=
 "sent|received|conflict"}`,
 `origincache_cluster_internal_fill_duration_seconds`.
 
-## 8. Azure adapter: Block Blob only
+## 9. Azure adapter: Block Blob only
 
 Hardened constraint.
 
@@ -632,7 +827,7 @@ Hardened constraint.
   false is rejected at startup.
 - `Origin.GetRange` on the azureblob adapter uses `If-Match: <etag>` on
   the underlying Get Blob; `412 Precondition Failed` is translated to
-  `OriginETagChangedError` (s7.6).
+  `OriginETagChangedError` (s8.6).
 - Prometheus counter:
   `origincache_origin_rejected_total{origin="azureblob",reason="non_block_blob",blob_type=...}`.
 
@@ -652,31 +847,47 @@ flowchart TD
     LR["ListObjectsV2<br/>(list_mode=filter)"] --> Filter["skip non-BlockBlob entries,<br/>preserve continuation tokens"]
 ```
 
-## 9. Concurrency, durability, correctness
+## 10. Concurrency, durability, correctness
 
-### 9.1 Atomic commit (per CacheStore driver)
+### 10.1 Atomic commit (per CacheStore driver)
 
 The leader publishes a chunk to the CacheStore atomically and
 no-clobber: the second concurrent commit for the same key MUST lose
-without overwriting the winner.
+without overwriting the winner. Cold-path commit happens **after** the
+spool-fsync gate (s8.2), so a commit failure here does NOT affect the
+in-flight client response; it only increments
+`origincache_commit_after_serve_total{result="failed"}` and skips
+`ChunkCatalog.Record` (next request refills).
 
 - **`cachestore/localfs`**:
-  1. Leader writes origin bytes to `<final>.tmp.<uuid>` and `fsync()`s.
-  2. Commit: `link(<final>.tmp.<uuid>, <final>)`. POSIX `link()` is atomic
-     and returns `EEXIST` if the destination exists. On `EEXIST`, the
-     leader treats the existing `<final>` as the source of truth, calls
-     `unlink(<final>.tmp.<uuid>)`, and increments commit_lost. On success,
-     `unlink(<final>.tmp.<uuid>)` and increment commit_won.
-  3. On Linux, `renameat2(RENAME_NOREPLACE)` is preferred when available
-     (single syscall); the `link` + `unlink` form is the portable
-     fallback (also works on macOS dev environments). Plain `rename()` is
-     **never** used because it overwrites the destination on POSIX.
-  4. Crash recovery: a periodic background sweep (default every 1 hour)
-     unlinks stale `*.tmp.*` files older than `spool.tmp_max_age`
-     (default 1 hour). Nothing breaks if a tmp file lingers briefly.
+  1. Leader stages the chunk inside `<root>/.staging/<uuid>` (a fixed
+     subdirectory of the CacheStore root, NOT `/tmp` and NOT the spool
+     directory). Staging inside the root keeps the file on the same
+     filesystem as the destination, which is required for `link()` to
+     succeed; the spool MAY be on a different filesystem and so cannot
+     also serve as the staging area.
+  2. After write, `fsync(<staging file>)` then `fsync(<staging dir>)`.
+  3. Commit: `link(<root>/.staging/<uuid>, <final>)`. POSIX `link()` is
+     atomic and returns `EEXIST` if the destination exists. On `EEXIST`,
+     the leader treats the existing `<final>` as the source of truth,
+     `unlink(<root>/.staging/<uuid>)`, `fsync(<root>/.staging/)`, and
+     increments commit_lost. On success, `unlink(<root>/.staging/<uuid>)`,
+     `fsync(<root>/.staging/)`, `fsync(<final parent dir>)`, and
+     increment commit_won.
+  4. On Linux, `renameat2(RENAME_NOREPLACE)` is preferred when available
+     (single syscall) with the same parent-dir fsync sequencing; the
+     `link` + `unlink` form is the portable fallback (also works on
+     macOS dev environments). Plain `rename()` is **never** used because
+     it overwrites the destination on POSIX.
+  5. Crash recovery: a periodic background sweep (default every 1 hour)
+     unlinks `<root>/.staging/<uuid>` entries older than
+     `cachestore.localfs.staging_max_age` (default 1h), with a
+     `fsync(<root>/.staging/)` after the batch. Nothing breaks if a
+     staging file lingers briefly. Each sweep increments
+     `origincache_localfs_dir_fsync_total{result}`.
 
 - **`cachestore/s3`**:
-  1. Leader streams origin bytes (via the Spool, s7.2) into a single
+  1. Leader streams origin bytes (via the Spool, s8.2) into a single
      `PutObject(final_key, body, If-None-Match: "*")`. There is no tmp
      key and no copy hop.
   2. `200 OK` -> commit_won. `412 Precondition Failed` -> commit_lost
@@ -693,36 +904,78 @@ without overwriting the winner.
      MinIO. VAST: confirmation required during Phase 2 (see
      [plan.md#10-open-questions--risks](./plan.md#10-open-questions--risks)).
 
-### 9.2 Catalog correctness
+### 10.2 Catalog correctness, typed errors, circuit breaker
 
 The CacheStore is the source of truth. The `ChunkCatalog` is purely an
 optimization and may be dropped at any time without affecting correctness;
 a `Lookup` miss falls through to `CacheStore.Stat` and refills the
 catalog. Catalog entries that point at a now-absent chunk (e.g. evicted
-by lifecycle) result in a `CacheStore.GetChunk` error that is treated as
-a miss and refilled.
+by lifecycle) result in a `CacheStore.GetChunk` returning `ErrNotFound`,
+which is the only error treated as a miss and refilled.
 
-### 9.3 Range, sizes, and edge cases
+`CacheStore` returns three typed error classes (s7); the cache layer
+honors them distinctly:
+
+- **`ErrNotFound`** (chunk absent): triggers the miss-fill path. Normal
+  cold-path behavior; not an error from the operator's perspective.
+- **`ErrTransient`** (5xx, timeout, throttle): surfaced to the client as
+  `503 Slow Down` with `Retry-After: 1s`. Counts toward the breaker.
+  Does NOT trigger refill (would amplify load against an already-degraded
+  backend).
+- **`ErrAuth`** (401/403): surfaced as `502 Bad Gateway`. Counts toward
+  the breaker. Counts toward the `/readyz` consecutive-`ErrAuth`
+  threshold (default 3); on threshold the replica reports NotReady and
+  load balancers drain it. A single non-`ErrAuth` success resets the
+  counter.
+
+To prevent amplifying degradation under sustained backend failure, a
+**per-process CacheStore circuit breaker** wraps every `CacheStore`
+call. Defaults (configurable, see plan.md s5):
+
+- `error_window: 30s`
+- `error_threshold: 10` (`ErrTransient` + `ErrAuth` count; `ErrNotFound`
+  does not)
+- `open_duration: 30s`
+- `half_open_probes: 3`
+
+State machine: **closed** (normal pass-through) -> **open** (immediately
+short-circuits CacheStore writes with `ErrTransient`; reads still attempt
+once per `open_duration / 10` for liveness probing) -> **half-open**
+(allows up to `half_open_probes` test calls; on all-success returns to
+closed; on any failure returns to open). Transitions are exposed as
+`origincache_cachestore_breaker_transitions_total{from,to}` and the
+current state as `origincache_cachestore_breaker_state` (0=closed,
+1=open, 2=half_open).
+
+### 10.3 Range, sizes, and edge cases
 
 - Partial last chunk of a blob stored at its actual size; `ChunkInfo.Size`
   records it; range math respects it.
 - `416 Requested Range Not Satisfiable` is returned by the server before
-  any cache lookup, using object metadata, and also when
-  `server.max_response_bytes` would be exceeded (s5).
-- Origin failure during fill never commits the tmp file or makes a final
-  PutObject. Pre-first-byte: surfaces as `502 Bad Gateway` to the client
-  and as a transient negative singleflight entry. Post-first-byte:
-  response is aborted (s5 step 7).
+  any cache lookup, using object metadata, **only** for true Range vs.
+  object-size violations.
+- `server.max_response_bytes` overflow returns
+  `400 RequestSizeExceedsLimit` (S3-style XML error body) with
+  `x-origincache-cap-exceeded: true` (s6). It is reported as `400` and
+  not `416` because the cap is a server policy, not a property of the
+  object: clients cannot fix it by re-requesting a different Range past
+  EOF.
+- Origin failure during fill never commits the staging file or makes a
+  final PutObject. Pre-spool-fsync-gate: surfaces as `502 Bad Gateway`
+  to the client and as a transient negative singleflight entry.
+  Post-spool-fsync-gate: response body completes from the local Spool;
+  any CacheStore commit failure is invisible to the client and recorded
+  as `commit_after_serve_total{result="failed"}` (s8.6).
 
 ### Diagram 9: Atomic commit (localfs vs s3 CacheStore)
 
 ```mermaid
 flowchart TB
-    Leader["Singleflight leader<br/>finishes origin read<br/>(via Spool)"] --> Driver{"CacheStore<br/>driver"}
-    Driver -- "localfs" --> L1["write to .tmp.uuid<br/>fsync"]
-    L1 --> L2["link(tmp, final)<br/>or renameat2(RENAME_NOREPLACE)"]
-    L2 -- "EEXIST" --> Llost["unlink tmp<br/>commit_lost++<br/>treat existing final as truth"]
-    L2 -- "ok" --> Lwon["unlink tmp<br/>commit_won++"]
+    Leader["Singleflight leader<br/>finishes origin read<br/>(via Spool, post spool-fsync gate)"] --> Driver{"CacheStore<br/>driver"}
+    Driver -- "localfs" --> L1["stage in &lt;root&gt;/.staging/&lt;uuid&gt;<br/>fsync(file) + fsync(staging dir)"]
+    L1 --> L2["link(staging, final)<br/>or renameat2(RENAME_NOREPLACE)"]
+    L2 -- "EEXIST" --> Llost["unlink staging<br/>fsync(staging dir)<br/>commit_lost++<br/>treat existing final as truth"]
+    L2 -- "ok" --> Lwon["unlink staging<br/>fsync(staging dir) + fsync(final parent dir)<br/>commit_won++"]
     Driver -- "s3" --> S1["PutObject(final, body,<br/>If-None-Match: *)"]
     S1 -- "200" --> Swon["commit_won++"]
     S1 -- "412" --> Slost["commit_lost++<br/>treat existing object as truth"]
@@ -731,11 +984,65 @@ flowchart TB
     Swon --> Pub
     Slost --> Pub
     Pub --> Done["chunk visible to all replicas"]
-    Sweep["periodic sweep cleans<br/>stale .tmp.* on crash"] -.-> L1
+    Sweep["periodic sweep cleans<br/>stale &lt;root&gt;/.staging/&lt;uuid&gt;<br/>older than staging_max_age"] -.-> L1
     SelfTest["startup: SelfTestAtomicCommit;<br/>refuse to start if<br/>If-None-Match not honored"] -.-> S1
+    Failed["any commit failure<br/>after spool-fsync gate"] -.-> CASF["commit_after_serve_total{failed}++<br/>skip Catalog.Record"]
 ```
 
-## 10. Eviction and capacity
+## 11. Bounded staleness contract
+
+OriginCache trusts an **operator contract** for correctness, and bounds
+the consequences of contract violation by configuration.
+
+**The contract.** For a given `(origin_id, bucket, object_key)`, the
+underlying bytes are immutable for the life of the key. If the data
+changes, operators MUST publish it under a new key. Replacement in place
+is a contract violation.
+
+**Why we trust it.** Cache key derivation includes the origin `ETag`
+(s5), and a new ETag deterministically yields a new `ChunkKey` and a
+fresh chunk path on the CacheStore. As long as the contract holds, the
+cache cannot serve stale bytes: every change of identity is a change of
+key.
+
+**What happens if the contract is violated.** The cache may serve the
+old bytes for up to one **`metadata_ttl`** window (default 5m,
+configurable). Mechanism:
+
+- Object metadata (`size`, `etag`, `content_type`) is cached for
+  `metadata_ttl` to avoid re-`HEAD`ing on every request.
+- During that window, requests resolve to the old `etag`, derive the
+  same `ChunkKey`, and serve from cached chunks.
+- After the window expires, the next request triggers a fresh `Head`,
+  observes the new ETag, derives a new `ChunkKey`, and refills.
+
+**Why this is acceptable for v1.** The intended workload is large
+immutable artifacts (job inputs, model weights, training shards). The
+contract matches how those are produced. The 5m window is a tunable
+upper bound, not a typical case: a flood of distinct cold keys reads the
+correct ETag on first contact with the cache.
+
+**Defense in depth.** `If-Match: <etag>` is sent on every
+`Origin.GetRange` (s8.6). If an in-flight fill races with an in-place
+overwrite, the origin returns `412 Precondition Failed` and the leader
+fails the fill, invalidates the metadata cache entry for
+`{origin_id, bucket, key}`, and increments
+`origincache_origin_etag_changed_total`. This catches the narrow window
+where a violation happens between the cache's `Head` and its `GetRange`.
+It does NOT catch a violation that happens between two complete
+request lifecycles within the same `metadata_ttl` window; the
+`metadata_ttl` cap is what bounds that case.
+
+**No background re-validation in v1.** A bounded-freshness mode (periodic
+background `Head` to refresh `etag` ahead of `metadata_ttl`) is Phase 4
+material, only if measured to be needed. The default posture is "trust
+the contract, cap the window".
+
+Cross-references: [s2 Decisions / Consistency](#2-decisions),
+[s8.6 Failure handling](#86-failure-handling-without-re-stampede),
+[s10.2 Catalog correctness](#102-catalog-correctness-typed-errors-circuit-breaker).
+
+## 12. Eviction and capacity
 
 Eviction is delegated to the CacheStore's storage system (e.g. VAST or S3
 lifecycle policies). Recommended baseline is age-based expiration on the
@@ -743,7 +1050,7 @@ chunk prefix with a TTL chosen to fit the deployment's working set in the
 available capacity. Operators tune the TTL based on
 `origincache_origin_bytes_total` and capacity utilization metrics exposed
 by the CacheStore. Because the on-store path is namespaced by
-`origin_id` (s4), per-origin lifecycle policies can be configured
+`origin_id` (s5), per-origin lifecycle policies can be configured
 independently on the same CacheStore bucket.
 
 The cache layer itself does not evict CacheStore objects in v1. The
@@ -751,7 +1058,7 @@ in-memory `ChunkCatalog` uses a fixed-size LRU; entries falling out of it
 are not evicted from the CacheStore, only from the metadata cache - a
 subsequent request will rediscover the chunk via `CacheStore.Stat`.
 
-The local **spool** (s7.2) is bounded by `spool.max_bytes`; full-spool
+The local **spool** (s8.2) is bounded by `spool.max_bytes`; full-spool
 conditions block new fills briefly, then return `503 Slow Down` to
 clients. Spool entries are released as soon as in-flight readers drain.
 
@@ -760,18 +1067,18 @@ lifecycle eviction proves material, add an in-cache access-tracking layer
 inside the `chunkcatalog` package and an opt-in active-eviction loop. This
 does not affect any other interface in the system.
 
-## 11. Horizontal scale
+## 13. Horizontal scale
 
 Cluster membership comes from the headless Service: an A-record lookup
 returns the IPs of all Ready pods backing the Service. Cluster code
 consumes that list, refreshes it on a configurable interval (default 5s),
 and rendezvous-hashes `ChunkKey` against pod IPs to select a coordinator
 **per chunk**. The replica that received the client request acts as the
-**assembler** (s7.3): for each chunk in the requested range, it serves
+**assembler** (s8.3): for each chunk in the requested range, it serves
 from CacheStore on hit, performs a local singleflight + tee + spool +
 commit if it is the coordinator, or issues a per-chunk
 `GET /internal/fill?key=<k>` to the coordinator on the coordinator's
-internal mTLS listener (s7.8). The assembler stitches returned bytes into
+internal mTLS listener (s8.8). The assembler stitches returned bytes into
 the client response, slicing the first and last chunk to match the
 client `Range`.
 
