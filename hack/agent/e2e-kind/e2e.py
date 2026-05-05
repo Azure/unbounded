@@ -1349,6 +1349,44 @@ def validate_machina_controller() -> None:
     """Verify the machina controller reconciles MachineConfiguration objects."""
 
     name = f"{AGENT_MACHINE_NAME}-config"
+
+    def wait_for_mcv(
+        mcv_name: str,
+        expected_version: int,
+        expected_node_labels: dict[str, str] | None,
+    ) -> dict[str, Any]:
+        timeout_secs = 60
+        elapsed = 0
+        while elapsed < timeout_secs:
+            result = subprocess.run(
+                [KUBECTL, "get", "machineconfigurationversion", mcv_name, "-o", "json"],
+                capture_output=True, text=True,
+            )
+            if result.returncode == 0:
+                mcv = json.loads(result.stdout)
+                version = mcv.get("spec", {}).get("version")
+                config = mcv.get("metadata", {}).get("labels", {}).get(
+                    "unbounded-cloud.io/machine-configuration",
+                )
+                node_labels = mcv.get("spec", {}).get("template", {}).get(
+                    "kubernetes", {},
+                ).get("nodeLabels")
+                if (
+                    version == expected_version
+                    and config == name
+                    and node_labels == expected_node_labels
+                ):
+                    return mcv
+
+            if elapsed > 0 and elapsed % 15 == 0:
+                log(f"  ({elapsed}s) waiting for MachineConfigurationVersion '{mcv_name}'...")
+            time.sleep(5)
+            elapsed += 5
+
+        if MACHINA_LOG_FILE.exists():
+            print(MACHINA_LOG_FILE.read_text(), flush=True)
+        die(f"MachineConfigurationVersion '{mcv_name}' was not ready after {timeout_secs}s")
+
     log(f"Validating machina controller with MachineConfiguration '{name}'...")
     version_json = json.loads(kubectl_capture(["version", "-o", "json"]))
     server_version = version_json.get("serverVersion", {}).get("gitVersion")
@@ -1372,32 +1410,37 @@ def validate_machina_controller() -> None:
     }
     kubectl(["apply", "-f", "-"], input=json.dumps(manifest).encode())
 
-    mcv_name = f"{name}-v1"
-    timeout_secs = 60
-    elapsed = 0
-    while elapsed < timeout_secs:
-        result = subprocess.run(
-            [KUBECTL, "get", "machineconfigurationversion", mcv_name, "-o", "json"],
-            capture_output=True, text=True,
-        )
-        if result.returncode == 0:
-            mcv = json.loads(result.stdout)
-            version = mcv.get("spec", {}).get("version")
-            config = mcv.get("metadata", {}).get("labels", {}).get(
-                "unbounded-cloud.io/machine-configuration",
-            )
-            if version == 1 and config == name:
-                log(f"MachineConfigurationVersion '{mcv_name}' created")
-                return
+    v1_name = f"{name}-v1"
+    v1 = wait_for_mcv(v1_name, 1, None)
+    log(f"MachineConfigurationVersion '{v1_name}' created")
 
-        if elapsed > 0 and elapsed % 15 == 0:
-            log(f"  ({elapsed}s) waiting for MachineConfigurationVersion '{mcv_name}'...")
-        time.sleep(5)
-        elapsed += 5
+    kubectl([
+        "patch", "machineconfigurationversion", v1_name,
+        "--subresource=status", "--type=merge",
+        "-p", json.dumps({
+            "status": {
+                "deployed": True,
+                "deployedMachines": 1,
+            },
+        }),
+    ])
 
-    if MACHINA_LOG_FILE.exists():
-        print(MACHINA_LOG_FILE.read_text(), flush=True)
-    die(f"MachineConfigurationVersion '{mcv_name}' was not created after {timeout_secs}s")
+    updated_node_labels = {"e2e.unbounded-cloud.io/config-version": "v2"}
+    manifest["spec"]["template"]["kubernetes"]["nodeLabels"] = updated_node_labels
+    kubectl(["apply", "-f", "-"], input=json.dumps(manifest).encode())
+
+    v2_name = f"{name}-v2"
+    wait_for_mcv(v2_name, 2, updated_node_labels)
+    log(f"MachineConfigurationVersion '{v2_name}' created after config change")
+
+    v1 = json.loads(kubectl_capture([
+        "get", "machineconfigurationversion", v1_name, "-o", "json",
+    ]))
+    v1_node_labels = v1.get("spec", {}).get("template", {}).get(
+        "kubernetes", {},
+    ).get("nodeLabels")
+    if v1_node_labels is not None:
+        die(f"MachineConfigurationVersion '{v1_name}' changed unexpectedly: {v1_node_labels}")
 
 
 # ---------------------------------------------------------------------------
