@@ -1649,8 +1649,6 @@ def validate_node_repave_upgrade() -> None:
     """Validate OnDelete repave applies a new MCV Kubernetes version."""
 
     config_name = MACHINE_CONFIG_NAME
-    target_version_number = 3
-    target_mcv = mcv_name(config_name, target_version_number)
 
     current_kubelet_version = node_kubelet_version(AGENT_MACHINE_NAME)
     if not current_kubelet_version:
@@ -1675,27 +1673,38 @@ def validate_node_repave_upgrade() -> None:
 
     timeout_secs = 120
     elapsed = 0
+    target_version_number = 0
+    target_mcv = ""
     while elapsed < timeout_secs:
         result = subprocess.run(
-            [KUBECTL, "get", "machineconfigurationversion", target_mcv, "-o", "json"],
+            [KUBECTL, "get", "machineconfigurationversion",
+             "-l", f"unbounded-cloud.io/machine-configuration={config_name}", "-o", "json"],
             capture_output=True, text=True,
         )
         if result.returncode == 0:
-            mcv = json.loads(result.stdout)
-            observed_version = mcv.get("spec", {}).get("template", {}).get(
-                "kubernetes", {},
-            ).get("version")
-            if observed_version == target_kubelet_version:
+            mcvs = json.loads(result.stdout).get("items", [])
+            matching_mcvs = [
+                mcv for mcv in mcvs
+                if mcv.get("spec", {}).get("template", {}).get("kubernetes", {}).get("version")
+                == target_kubelet_version
+            ]
+            if matching_mcvs:
+                latest = max(matching_mcvs, key=lambda mcv: mcv.get("spec", {}).get("version", 0))
+                target_version_number = latest.get("spec", {}).get("version", 0)
+                target_mcv = latest.get("metadata", {}).get("name", "")
                 log(f"MachineConfigurationVersion '{target_mcv}' is ready")
                 break
         if elapsed > 0 and elapsed % 30 == 0:
-            log(f"  ({elapsed}s) waiting for MachineConfigurationVersion '{target_mcv}'...")
+            log(f"  ({elapsed}s) waiting for MCV with Kubernetes {target_kubelet_version}...")
         time.sleep(5)
         elapsed += 5
     else:
         if MACHINA_LOG_FILE.exists():
             print(MACHINA_LOG_FILE.read_text(), flush=True)
-        die(f"MachineConfigurationVersion '{target_mcv}' was not ready after {timeout_secs}s")
+        die(f"No MachineConfigurationVersion reached Kubernetes {target_kubelet_version} after {timeout_secs}s")
+
+    if target_version_number == 0 or not target_mcv:
+        die("Resolved target MachineConfigurationVersion was empty")
 
     log(f"Assigning Machine '{AGENT_MACHINE_NAME}' to {target_mcv}...")
     run([KUBECTL_UNBOUNDED, "machine", "config", "assign", AGENT_MACHINE_NAME,
