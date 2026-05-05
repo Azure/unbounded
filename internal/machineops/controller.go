@@ -92,6 +92,7 @@ func (r *MachineOperationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 			"operation", op.Name,
 			"operationKind", op.Spec.OperationKind,
 			"machine", machine.Name)
+
 		return ctrl.Result{}, nil
 	}
 
@@ -111,6 +112,7 @@ func (r *MachineOperationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 			"operation", op.Name,
 			"operationKind", op.Spec.OperationKind,
 			"machine", machine.Name)
+
 		return ctrl.Result{}, nil
 	}
 
@@ -177,6 +179,7 @@ func (r *MachineOperationReconciler) reconcileTerminal(ctx context.Context, op *
 	}
 
 	deadline := op.Status.CompletedAt.Add(time.Duration(*op.Spec.TTLSecondsAfterFinished) * time.Second)
+
 	now := r.now().Time
 	if now.Before(deadline) {
 		return ctrl.Result{RequeueAfter: deadline.Sub(now)}, nil
@@ -198,6 +201,7 @@ func (r *MachineOperationReconciler) markInProgress(ctx context.Context, op *unb
 
 		now := r.now()
 		latest.Status.Phase = unboundedv1alpha3.OperationPhaseInProgress
+
 		latest.Status.Message = message
 		if latest.Status.StartedAt == nil {
 			latest.Status.StartedAt = &now
@@ -237,6 +241,7 @@ func (r *MachineOperationReconciler) finishOperation(
 	execErr error,
 ) (ctrl.Result, error) {
 	var updated unboundedv1alpha3.MachineOperation
+
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		if err := r.Get(ctx, client.ObjectKeyFromObject(op), &updated); err != nil {
 			return err
@@ -249,6 +254,7 @@ func (r *MachineOperationReconciler) finishOperation(
 
 		updated.Status.Phase = phase
 		updated.Status.Message = message
+
 		updated.Status.CompletedAt = &now
 		if observedMachineGeneration > 0 {
 			updated.Status.ObservedMachineGeneration = observedMachineGeneration

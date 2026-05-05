@@ -102,15 +102,18 @@ func (p *Provider) newDefaultComputeClient() (computeClient, error) {
 	if profile == "" {
 		profile = defaultConfigProfile
 	}
+
 	auth := strings.TrimSpace(p.Auth)
 	if auth == "" {
 		auth = AuthAPIKey
 	}
+
 	if auth != AuthAPIKey && auth != AuthSecurityToken {
 		return nil, fmt.Errorf("unsupported OCI auth mode %q", p.Auth)
 	}
 
 	provider := common.DefaultConfigProvider()
+
 	if strings.TrimSpace(p.ConfigFile) != "" {
 		switch auth {
 		case AuthAPIKey:

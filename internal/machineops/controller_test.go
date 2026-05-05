@@ -156,6 +156,7 @@ func TestMachineOperationReconciler_DeletesExpiredTerminalOperation(t *testing.T
 	require.Equal(t, ctrl.Result{}, result)
 
 	var updated unboundedv1alpha3.MachineOperation
+
 	err = c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated)
 	require.Error(t, err)
 }
