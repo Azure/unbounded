@@ -49,6 +49,27 @@ type proxyBackend struct {
 	backendPort int
 	stopCh      chan struct{}
 	transport   *http.Transport
+
+	// tokenMu guards token and tokenInflight.
+	tokenMu        sync.Mutex
+	token          string
+	tokenInflight  bool
+	tokenRefreshed chan struct{}
+
+	// shutdownCh is closed when a fatal error (e.g. unrecoverable token
+	// refresh failure) requires the proxy to terminate.
+	shutdownOnce sync.Once
+	shutdownCh   chan struct{}
+	shutdownErr  error
+}
+
+// shutdown signals the proxy to terminate. The first call records err and
+// closes shutdownCh; subsequent calls are no-ops.
+func (pb *proxyBackend) shutdown(err error) {
+	pb.shutdownOnce.Do(func() {
+		pb.shutdownErr = err
+		close(pb.shutdownCh)
+	})
 }
 
 // startPortForward establishes a new port-forward to a controller pod.
@@ -149,7 +170,67 @@ func (pb *proxyBackend) ensureConnected(ctx context.Context) error {
 	return pb.startPortForward(ctx)
 }
 
-// RoundTrip implements http.RoundTripper with auto-reconnect on failure.
+// currentToken returns the current viewer token (may be empty).
+func (pb *proxyBackend) currentToken() string {
+	pb.tokenMu.Lock()
+	defer pb.tokenMu.Unlock()
+
+	return pb.token
+}
+
+// setToken stores the given token.
+func (pb *proxyBackend) setToken(t string) {
+	pb.tokenMu.Lock()
+	pb.token = t
+	pb.tokenMu.Unlock()
+}
+
+// refreshToken requests a new viewer token. If a refresh is already in flight,
+// it waits for that one to finish and returns the resulting token. The stale
+// token passed in is used to detect lost races: if pb.token already differs
+// from stale by the time we try to refresh, another caller already updated it
+// and we return that newer token without making another request.
+func (pb *proxyBackend) refreshToken(stale string) (string, error) {
+	pb.tokenMu.Lock()
+	if pb.token != stale && pb.token != "" {
+		t := pb.token
+		pb.tokenMu.Unlock()
+
+		return t, nil
+	}
+
+	if pb.tokenInflight {
+		ch := pb.tokenRefreshed
+		pb.tokenMu.Unlock()
+		<-ch
+
+		return pb.currentToken(), nil
+	}
+
+	pb.tokenInflight = true
+	ch := make(chan struct{})
+	pb.tokenRefreshed = ch
+	pb.tokenMu.Unlock()
+
+	t, err := requestViewerToken(pb.cfg)
+
+	pb.tokenMu.Lock()
+
+	pb.tokenInflight = false
+	if err == nil {
+		pb.token = t
+	}
+
+	close(ch)
+	pb.tokenMu.Unlock()
+
+	return t, err
+}
+
+// RoundTrip implements http.RoundTripper with auto-reconnect on transport
+// failure and viewer-token refresh on a 401 response. It also injects the
+// Authorization header from the cached viewer token when the request does
+// not already carry one.
 func (pb *proxyBackend) RoundTrip(req *http.Request) (*http.Response, error) {
 	pb.mu.Lock()
 	t := pb.transport
@@ -169,6 +250,15 @@ func (pb *proxyBackend) RoundTrip(req *http.Request) (*http.Response, error) {
 
 	req.URL.Host = fmt.Sprintf("127.0.0.1:%d", port)
 
+	usedToken := ""
+
+	if req.Header.Get("Authorization") == "" {
+		if tok := pb.currentToken(); tok != "" {
+			req.Header.Set("Authorization", "Bearer "+tok)
+			usedToken = tok
+		}
+	}
+
 	resp, err := t.RoundTrip(req)
 	if err != nil {
 		if reconnErr := pb.ensureConnected(req.Context()); reconnErr != nil {
@@ -181,6 +271,27 @@ func (pb *proxyBackend) RoundTrip(req *http.Request) (*http.Response, error) {
 		pb.mu.Unlock()
 
 		req.URL.Host = fmt.Sprintf("127.0.0.1:%d", port)
+
+		resp, err = t.RoundTrip(req)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// On 401 with our injected token, refresh and retry once. Handles
+	// token expiry as well as controller HMAC key rotation (e.g. controller
+	// pod restart) which invalidates all previously issued tokens.
+	if resp.StatusCode == http.StatusUnauthorized && usedToken != "" {
+		_, _ = io.Copy(io.Discard, resp.Body) //nolint:errcheck
+		_ = resp.Body.Close()                 //nolint:errcheck
+
+		newTok, refreshErr := pb.refreshToken(usedToken)
+		if refreshErr != nil {
+			pb.shutdown(fmt.Errorf("viewer token refresh failed: %w", refreshErr))
+			return nil, fmt.Errorf("viewer token refresh failed: %w", refreshErr)
+		}
+
+		req.Header.Set("Authorization", "Bearer "+newTok)
 
 		return t.RoundTrip(req)
 	}
@@ -254,6 +365,7 @@ API from a browser or curl on localhost.`,
 					RootCAs:    caPool,
 					ServerName: fmt.Sprintf("%s.%s.svc", deployName, ns),
 				},
+				shutdownCh: make(chan struct{}),
 			}
 
 			// Establish initial port-forward.
@@ -261,31 +373,24 @@ API from a browser or curl on localhost.`,
 				return err
 			}
 
-			// Request an HMAC viewer token from the controller.
-			viewerToken, tokenErr := requestViewerToken(cfg)
-			if tokenErr != nil {
+			// Request an initial HMAC viewer token from the controller. The
+			// token is stored on backend; backend.RoundTrip refreshes it
+			// automatically on 401.
+			if viewerToken, tokenErr := requestViewerToken(cfg); tokenErr != nil {
 				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Warning: failed to request viewer token: %v\n", tokenErr) //nolint:errcheck
+			} else {
+				backend.setToken(viewerToken)
 			}
 
-			var tokenMu sync.Mutex
-
-			currentToken := viewerToken
-
 			// Build a reverse proxy using the auto-reconnecting backend.
+			// Authorization injection and 401-driven refresh happen inside
+			// backend.RoundTrip so that retries on 401 see the new token.
 			backendURL, _ := url.Parse(fmt.Sprintf("https://127.0.0.1:%d", backend.backendPort)) //nolint:errcheck
 			proxy := &httputil.ReverseProxy{
 				Transport: backend,
 				Rewrite: func(pr *httputil.ProxyRequest) {
 					pr.SetURL(backendURL)
 					pr.Out.URL.Host = fmt.Sprintf("127.0.0.1:%d", backend.backendPort)
-
-					tokenMu.Lock()
-					t := currentToken
-					tokenMu.Unlock()
-
-					if pr.Out.Header.Get("Authorization") == "" && t != "" {
-						pr.Out.Header.Set("Authorization", "Bearer "+t)
-					}
 				},
 			}
 
@@ -305,12 +410,19 @@ API from a browser or curl on localhost.`,
 				Handler: proxy,
 			}
 
-			// Graceful shutdown on signal.
+			// Graceful shutdown on signal or fatal backend error.
 			sigCh := make(chan os.Signal, 1)
 			signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
 			go func() {
-				<-sigCh
+				select {
+				case <-sigCh:
+				case <-backend.shutdownCh:
+					if backend.shutdownErr != nil {
+						_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Fatal: %v\n", backend.shutdownErr) //nolint:errcheck
+					}
+				}
+
 				backend.mu.Lock()
 				if backend.stopCh != nil {
 					close(backend.stopCh)
@@ -322,6 +434,10 @@ API from a browser or curl on localhost.`,
 
 			if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				return fmt.Errorf("proxy server error: %w", err)
+			}
+
+			if backend.shutdownErr != nil {
+				return backend.shutdownErr
 			}
 
 			return nil
