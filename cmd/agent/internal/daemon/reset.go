@@ -24,6 +24,7 @@ func ResetAgent(log *slog.Logger) phases.Task {
 // associated resources without stopping the daemon process.
 func ResetAgentResources(log *slog.Logger) phases.Task {
 	return phases.Serial(log,
+		RemoveDaemonUnit(log),
 		phases.Parallel(log,
 			reset.StopMachine(log, goalstates.NSpawnMachineKube1),
 			reset.StopMachine(log, goalstates.NSpawnMachineKube2),

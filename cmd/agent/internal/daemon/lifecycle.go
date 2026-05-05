@@ -97,6 +97,33 @@ func (t *stopDaemon) Do(ctx context.Context) error {
 }
 
 // ---------------------------------------------------------------------------
+// RemoveDaemonUnit
+// ---------------------------------------------------------------------------
+
+type removeDaemonUnit struct {
+	log *slog.Logger
+}
+
+// RemoveDaemonUnit returns a task that disables and removes the
+// unbounded-agent-daemon systemd unit without stopping the running service.
+func RemoveDaemonUnit(log *slog.Logger) phases.Task {
+	return &removeDaemonUnit{log: log}
+}
+
+func (t *removeDaemonUnit) Name() string { return "remove-daemon-unit" }
+
+func (t *removeDaemonUnit) Do(ctx context.Context) error {
+	if err := executil.RunCmd(ctx, t.log, executil.Systemctl(), "disable", goalstates.DaemonUnit); err != nil {
+		t.log.Warn("failed to disable daemon (may not be enabled)", "error", err)
+	}
+
+	unitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonUnit)
+	removeFileIfExists(t.log, unitPath)
+
+	return nil
+}
+
+// ---------------------------------------------------------------------------
 // RemoveAgentArtifacts
 // ---------------------------------------------------------------------------
 
