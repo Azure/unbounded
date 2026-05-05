@@ -161,7 +161,7 @@ func TestReconcileRepave_UsesDesiredMachineConfigurationVersion(t *testing.T) {
 	_, err := reconciler.Reconcile(context.Background(), daemonRequest{Kind: queueItemRepave, Name: "test-node"})
 	require.NoError(t, err)
 	require.NotNil(t, got)
-	assert.Equal(t, "v1.34.1", got.Cluster.Version)
+	assert.Equal(t, "1.34.1", got.Cluster.Version)
 	assert.Equal(t, "ghcr.io/test/image:v2", got.OCIImage)
 	assert.Equal(t, map[string]string{"env": "prod"}, got.Kubelet.Labels)
 	assert.Equal(t, []string{"dedicated=prod:NoSchedule"}, got.Kubelet.RegisterWithTaints)
@@ -210,7 +210,7 @@ func TestResolveDesiredRepaveConfig_UsesLatestWhenVersionOmitted(t *testing.T) {
 		baseConfig(),
 	)
 	require.NoError(t, err)
-	assert.Equal(t, "v1.35.0", desired.Cluster.Version)
+	assert.Equal(t, "1.35.0", desired.Cluster.Version)
 	require.NotNil(t, appliedRef)
 	assert.Equal(t, int32(3), appliedRef.Version)
 	assert.Equal(t, "config-a-v3", appliedRef.VersionName)

@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -182,7 +183,7 @@ func applyMachineConfigurationTemplate(
 ) {
 	if template.Kubernetes != nil {
 		if template.Kubernetes.Version != "" {
-			cfg.Cluster.Version = template.Kubernetes.Version
+			cfg.Cluster.Version = strings.TrimPrefix(template.Kubernetes.Version, "v")
 		}
 		if template.Kubernetes.NodeLabels != nil {
 			cfg.Kubelet.Labels = template.Kubernetes.NodeLabels
