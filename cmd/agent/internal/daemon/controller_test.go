@@ -197,15 +197,11 @@ func TestResolveDesiredRepaveConfig_UsesLatestWhenVersionOmitted(t *testing.T) {
 	mcv3 := machineConfigurationVersion("config-a", 3, v1alpha3.MachineConfigurationTemplate{
 		Kubernetes: &v1alpha3.MachineConfigurationKubernetes{Version: "v1.35.0"},
 	})
-	reconciler := &daemonReconciler{
-		Client:      fakeStatusClient(machine, mcv1, mcv3),
-		log:         discardLogger(),
-		machineName: "test-machine",
-	}
+	c := fakeStatusClient(machine, mcv1, mcv3)
 
 	desired, appliedRef, err := resolveDesiredRepaveConfig(
 		context.Background(),
-		reconciler.Client,
+		c,
 		"test-machine",
 		baseConfig(),
 	)
