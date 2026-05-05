@@ -121,6 +121,7 @@ spec:
                   machine.
                 enum:
                 - NodeReboot
+                - AgentUpgrade
                 - HostReboot
                 - HostPowerOff
                 - HostPowerOn
