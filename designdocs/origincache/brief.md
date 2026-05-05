@@ -32,8 +32,9 @@ Goals (v1):
 - Low **TTFB** (time to first byte) on both warm and cold paths.
 - Atomic, durable commit of fetched chunks; safe under concurrent
   fills.
-- Bounded staleness on operator-contract violation: at most one
-  `metadata_ttl` window (default 5m); zero otherwise.
+- Bounded staleness: `metadata_ttl` (default 5m) on contract violation,
+  `negative_metadata_ttl` (default 60s) on create-after-404; zero
+  otherwise.
 
 Non-goals (v1):
 - Write path, multipart upload, object versioning.
@@ -200,7 +201,12 @@ appear in the consumer-API documentation. Defense in depth: every
 `Origin.GetRange` carries `If-Match: <etag>`, so a mid-flight
 overwrite is caught at fill time and increments
 `origin_etag_changed_total`. See
-[design.md s11](./design.md#11-bounded-staleness-contract).
+[design.md s11](./design.md#11-bounded-staleness-contract). A
+symmetric bound applies to **create-after-404** (a key uploaded after
+a client already saw a 404 on it): at most one `negative_metadata_ttl`
+window per replica that observed the original 404 (default 60s)
+before the cache reflects the upload. See
+[design.md s12](./design.md#12-create-after-404-and-negative-cache-lifecycle).
 
 ## 6. Backing-store options
 
@@ -291,6 +297,15 @@ sequenceDiagram
    (`cachestore.driver: s3` against the Alluxio S3 gateway). See
    [design.md s10.1.2](./design.md#1012-cachestoreposixfs) and
    [plan.md s10](./plan.md#10-open-questions--risks).
+6. **Create-after-404 staleness** - A key uploaded after clients
+   already observed it as `404` will return stale `404` for up to
+   `negative_metadata_ttl` (default 60s) per replica that observed
+   the original miss. Round-robin LB can produce alternating `404`
+   / `200` during the drain. No event-driven invalidation in v1;
+   admin-invalidation RPC is Phase 4. Mitigation: short default
+   TTL, `metadata_negative_*` metrics, runbook instructs operators
+   to wait the TTL after uploading a previously-missing key. See
+   [design.md s12](./design.md#12-create-after-404-and-negative-cache-lifecycle).
 
 ## 9. Where to go next
 
@@ -301,8 +316,9 @@ sequenceDiagram
   architecture, request flow, internal interfaces, stampede protection.
 - [s10.1 Atomic commit per driver](./design.md#101-atomic-commit-per-cachestore-driver)
 - [s11 Bounded staleness](./design.md#11-bounded-staleness-contract)
-- 11 inline mermaid diagrams covering hits, misses, cross-replica
-  fills, atomic commit, and membership flux.
+- [s12 Create-after-404 and negative-cache lifecycle](./design.md#12-create-after-404-and-negative-cache-lifecycle)
+- 12 inline mermaid diagrams covering hits, misses, cross-replica
+  fills, atomic commit, create-after-404 timeline, and membership flux.
 
 `plan.md` (build + ops):
 - [s3 Repo layout](./plan.md#3-repo-layout-mirrors-machina)

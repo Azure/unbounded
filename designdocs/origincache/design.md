@@ -8,6 +8,61 @@ Owner: TBD
 
 ---
 
+## Table of contents
+
+### Sections
+
+1. [Overview](#1-overview)
+2. [Decisions](#2-decisions)
+3. [Terminology](#3-terminology)
+4. [Architecture](#4-architecture)
+5. [Chunk model](#5-chunk-model)
+6. [Request flow](#6-request-flow)
+   - [6.1 HEAD request flow](#61-head-request-flow)
+   - [6.2 LIST request flow](#62-list-request-flow)
+   - [6.3 HTTP error-code mapping](#63-http-error-code-mapping)
+7. [Internal interfaces](#7-internal-interfaces)
+8. [Stampede protection](#8-stampede-protection)
+   - [8.1 Per-`ChunkKey` singleflight](#81-per-chunkkey-singleflight)
+   - [8.2 TTFB tee + spool](#82-ttfb-tee--spool)
+   - [8.3 Cluster-wide deduplication via per-chunk fill RPC](#83-cluster-wide-deduplication-via-per-chunk-fill-rpc)
+   - [8.4 Origin backpressure](#84-origin-backpressure)
+   - [8.5 Cancellation safety](#85-cancellation-safety)
+   - [8.6 Failure handling without re-stampede](#86-failure-handling-without-re-stampede)
+   - [8.7 Metadata-layer singleflight](#87-metadata-layer-singleflight)
+   - [8.8 Internal RPC listener](#88-internal-rpc-listener)
+9. [Azure adapter: Block Blob only](#9-azure-adapter-block-blob-only)
+10. [Concurrency, durability, correctness](#10-concurrency-durability-correctness)
+    - [10.1 Atomic commit (per CacheStore driver)](#101-atomic-commit-per-cachestore-driver)
+    - [10.2 Catalog correctness, typed errors, circuit breaker](#102-catalog-correctness-typed-errors-circuit-breaker)
+    - [10.3 Range, sizes, and edge cases](#103-range-sizes-and-edge-cases)
+    - [10.4 Spool locality contract](#104-spool-locality-contract)
+    - [10.5 Readiness probe (`/readyz`)](#105-readiness-probe-readyz)
+11. [Bounded staleness contract](#11-bounded-staleness-contract)
+12. [Create-after-404 and negative-cache lifecycle](#12-create-after-404-and-negative-cache-lifecycle)
+13. [Eviction and capacity](#13-eviction-and-capacity)
+14. [Horizontal scale](#14-horizontal-scale)
+
+### Request scenarios
+
+Concrete request-flow narratives. Each scenario has a stable letter
+identifier reused in the diagram heading.
+
+- **Scenario A** - warm read (cache hit): [Diagram 3](#diagram-3-scenario-a---warm-read-cache-hit)
+- **Scenario B** - cold miss, local coordinator: [Diagram 4](#diagram-4-scenario-b---cold-miss-local-coordinator)
+- **Scenario C** - concurrent miss, same-replica joiner: [Diagram 5](#diagram-5-scenario-c---concurrent-miss-same-replica-joiner)
+- **Scenario D** - cold miss, remote coordinator (cross-replica fill): [Diagram 6](#diagram-6-scenario-d---cold-miss-remote-coordinator)
+- **Scenario E** - range spanning multiple coordinators: [Diagram 7](#diagram-7-scenario-e---range-spanning-multiple-coordinators)
+- **Scenario F** - Azure non-BlockBlob rejection: [Diagram 8](#diagram-8-scenario-f---azure-non-blockblob-rejection)
+- **Scenario G** - create-after-404 (operator upload after client miss): [Diagram 10](#diagram-10-scenario-g---create-after-404-timeline)
+- **Scenario H** - rolling restart membership flux: [Diagram 12](#diagram-12-scenario-h---rolling-restart-membership-flux)
+
+Other diagrams (D1, D2, D9, D11) depict architecture, math, or
+mechanism rather than request scenarios and are reachable from the
+Sections list above.
+
+---
+
 ## 1. Overview
 
 Edge devices inside an on-prem datacenter need read access to large files
@@ -35,7 +90,7 @@ layout, phasing, configuration, observability, and operational concerns.
 | In-DC S3 vs. cloud S3 | The in-DC S3-compatible store is treated identically to cloud S3 at the protocol level. The only difference is "much faster, in-DC". Both `Origin` and the `cachestore/s3` driver are thin S3-client adapters with no special-casing. The `cachestore/posixfs` driver replaces the S3 protocol with shared-POSIX primitives but presents the same `CacheStore` interface, so nothing above s7 changes. |
 | CacheStore atomic-commit primitive | Two equivalent primitives, picked per driver: object-store `PutObject + If-None-Match: *` (used by `cachestore/s3`) and POSIX `link()` / `renameat2(RENAME_NOREPLACE)` returning `EEXIST` (used by `cachestore/localfs` and `cachestore/posixfs`). Both are atomic, no-clobber, and have a "you lost the race" failure mode that maps cleanly onto `commit_lost`. Each driver runs `SelfTestAtomicCommit` at boot and refuses to start on backends that don't honor its primitive. |
 | Chunking | Fixed 8 MiB default (configurable 4-16 MiB). `chunk_size` baked into `ChunkKey`. |
-| Consistency | **Origin objects are immutable per operator contract**: an `(origin_id, bucket, key)` never has its bytes modified once published; replacement must be a new key. `ETag` is identity, not freshness. `If-Match: <etag>` on every `Origin.GetRange` is defense-in-depth that traps in-flight overwrites only. Bounded staleness on contract violation = `metadata_ttl` (default 5m); see [s11](#11-bounded-staleness-contract). |
+| Consistency | **Origin objects are immutable per operator contract**: an `(origin_id, bucket, key)` never has its bytes modified once published; replacement must be a new key. `ETag` is identity, not freshness. `If-Match: <etag>` on every `Origin.GetRange` is defense-in-depth that traps in-flight overwrites only. Bounded staleness uses two TTLs: `metadata_ttl` (default 5m) on positive entries (caps in-place-overwrite contract violations; see [s11](#11-bounded-staleness-contract)) and `negative_metadata_ttl` (default 60s) on negative entries (caps the create-after-404 unavailability window after an operator uploads a previously-missing key; see [s12](#12-create-after-404-and-negative-cache-lifecycle)). |
 | Catalog | In-memory `ChunkCatalog` fronting `CacheStore.Stat`. No persistent local index. |
 | Eviction | Deferred to CacheStore lifecycle policy. Cache layer ships no eviction code in v1. |
 | Prefetch | Sequential read-ahead by default. Configurable depth, capped concurrency. |
@@ -129,6 +184,11 @@ section that defines or implements the full mechanism.
   breaker opens, short-circuits writes, and surfaces via metrics and
   `/readyz`. Defaults: 10 errors / 30s window, 30s open, 3 half-open
   probes. Detail in [s10.2](#102-catalog-correctness-typed-errors-circuit-breaker).
+- **Negative-cache entry** - a metadata-cache entry recording an
+  authoritative `404` (or unsupported-blob-type rejection) from
+  origin. Reused for `negative_metadata_ttl` (default 60s) before
+  re-Heading. Bounds the create-after-404 unavailability window;
+  see [s12](#12-create-after-404-and-negative-cache-lifecycle).
 - **Shared-POSIX CacheStore** - the `cachestore/posixfs` driver: a
   `CacheStore` backed by a shared POSIX-style filesystem mounted on every
   replica at the same path. Concrete supported backends are NFSv4.1+ (the
@@ -265,7 +325,7 @@ doubling and a cold-period origin-cost spike when changing
 `chunk_size` on a hot working set: the working set is rebuilt at the
 new size on demand while the old set ages out via the CacheStore
 lifecycle policy (or, on `posixfs`, the operator's external sweep -
-see [s12](#12-eviction-and-capacity)).
+see [s13](#13-eviction-and-capacity)).
 
 Whether a chunk is present is answered by `CacheStore.Stat(key)`. An
 in-memory `ChunkCatalog` LRU memoizes recent positive lookups so the hot
@@ -309,13 +369,16 @@ flowchart LR
 2. Auth middleware (bearer / mTLS) validates the caller.
 3. `fetch.Coordinator` looks up object metadata in the metadata cache. On
    miss, **per-replica** singleflight at the metadata layer issues at most
-   one `HEAD` per object per replica per `metadata_ttl` window. Cluster-wide
+   one `HEAD` per object per replica per metadata-cache window. Cluster-wide
    bound is therefore N HEADs per object per window worst case where N is
    the current peer-set size; this is acceptable in v1 (a cluster-wide HEAD
-   singleflight is Phase 4). `404` and unsupported-blob-type errors are
-   negatively cached. The cached entry includes the current `ETag` and is
-   reused for up to `metadata_ttl` (default 5m), which also bounds the
-   staleness window if the immutable-origin contract (s11) is violated.
+   singleflight is Phase 4). Two TTLs apply, asymmetric by design (s12):
+   **positive entries** (`200` + ETag) are reused for `metadata_ttl`
+   (default 5m), which also bounds the staleness window if the
+   immutable-origin contract (s11) is violated. **Negative entries**
+   (`404`, unsupported-blob-type) are reused for `negative_metadata_ttl`
+   (default 60s), which bounds the create-after-404 unavailability window
+   after an operator uploads a previously-missing key.
 4. If the request has `Range`, validate against `ObjectInfo.Size`; serve
    `416` if unsatisfiable. Compute `firstChunk` and `lastChunk`. If
    `server.max_response_bytes > 0` and the computed response size exceeds
@@ -363,7 +426,7 @@ flowchart LR
    fills for the next N chunks (capped per blob and globally) one chunk
    ahead of the cursor.
 
-### Diagram 3: Cache hit
+### Diagram 3: Scenario A - warm read (cache hit)
 
 ```mermaid
 sequenceDiagram
@@ -388,7 +451,7 @@ sequenceDiagram
     Note over R,CS: All replicas read directly from shared CacheStore on hit<br/>and no peer is involved on the hit path
 ```
 
-### Diagram 4: Cache miss, single replica (this replica is the coordinator)
+### Diagram 4: Scenario B - cold miss, local coordinator
 
 ```mermaid
 sequenceDiagram
@@ -439,7 +502,7 @@ chunk lookup is performed.
    ObjectInfo.ContentType`, `Accept-Ranges: bytes`. No
    `CacheStore.Stat` and no `CacheStore.GetChunk` calls.
 4. Negative cases reuse the GET error mapping (s6.3): `404` is
-   negatively cached for `metadata_ttl`; an unsupported azureblob
+   negatively cached for `negative_metadata_ttl` (s12); an unsupported azureblob
    blob type (s9) returns `502 OriginUnsupported` with the
    `x-origincache-reject-reason` header.
 
@@ -776,7 +839,7 @@ hits zero the spool entry is released. On commit-after-serve failure the
 spool entry is released the same way; the cache layer simply does not
 record the chunk and the next request refills.
 
-### Diagram 5: Same-replica joiner via singleflight + tee + spool
+### Diagram 5: Scenario C - concurrent miss, same-replica joiner
 
 ```mermaid
 sequenceDiagram
@@ -855,7 +918,7 @@ metric is the leading indicator that this routing is working: a sustained
 non-zero `commit_lost` rate signals chronic membership flux or a bug in
 the hash distribution.
 
-### Diagram 6: Cross-replica per-chunk fill RPC (one chunk)
+### Diagram 6: Scenario D - cold miss, remote coordinator
 
 ```mermaid
 sequenceDiagram
@@ -888,7 +951,7 @@ sequenceDiagram
     Note over A,B: On hit (chunk in CacheStore)<br/>A reads CacheStore directly with no internal RPC
 ```
 
-### Diagram 7: Multi-chunk assembler fan-out across coordinators
+### Diagram 7: Scenario E - range spanning multiple coordinators
 
 ```mermaid
 sequenceDiagram
@@ -960,8 +1023,13 @@ joiner cancelling unblocks only itself.
   fresh `Head` and a new `ChunkKey` with the new ETag. Old chunks under
   the old ETag age out via the CacheStore lifecycle. Increments
   `origincache_origin_etag_changed_total`.
-- **Hard 404 / unsupported blob type**: cached in the metadata cache for
-  a longer TTL (default 5 min) so floods do not flood origin with `HEAD`s.
+- **Hard 404 / unsupported blob type**: cached in the metadata cache as
+  a negative entry for `negative_metadata_ttl` (default 60s,
+  configurable). Per-replica HEAD singleflight (s8.7) caps origin HEAD
+  load at one HEAD per object per replica per window. The full
+  negative-cache lifecycle and the create-after-404 case (an operator
+  uploads `K` after a client has already observed `404` on `K`) are in
+  [s12](#12-create-after-404-and-negative-cache-lifecycle).
 - **Retry inside the leader**: bounded exponential backoff (default 3
   attempts) before declaring failure, EXCEPT for `OriginETagChangedError`
   which is non-retryable (the object identity changed; refilling under
@@ -1046,7 +1114,9 @@ Hardened constraint.
 - Surfaced to clients as HTTP `502 Bad Gateway` with S3 error code
   `OriginUnsupported`, body containing reason, plus
   `x-origincache-reject-reason: azure-blob-type=<type>` header.
-- Negatively cached in the metadata cache (default 5 min TTL) and
+- Negatively cached in the metadata cache for `negative_metadata_ttl`
+  (default 60s; see [s12](#12-create-after-404-and-negative-cache-lifecycle))
+  and
   singleflighted at the metadata layer to prevent re-probing.
 - `ListObjectsV2` defaults to `filter` mode: non-Block Blob entries are
   skipped while preserving continuation tokens. `passthrough` mode is
@@ -1059,7 +1129,7 @@ Hardened constraint.
 - Prometheus counter:
   `origincache_origin_rejected_total{origin="azureblob",reason="non_block_blob",blob_type=...}`.
 
-### Diagram 8: Block Blob enforcement
+### Diagram 8: Scenario F - Azure non-BlockBlob rejection
 
 ```mermaid
 flowchart TD
@@ -1372,8 +1442,8 @@ probe and by front-of-cluster load balancers. Distinct from
      or `half_open`;
   3. consecutive `ErrAuth` count from the CacheStore is below
      `readyz.errauth_consecutive_threshold` (default 3);
-  4. peer discovery (s13) has completed at least one successful DNS
-     refresh since boot (the empty-peer fallback in s13 keeps the
+  4. peer discovery (s14) has completed at least one successful DNS
+     refresh since boot (the empty-peer fallback in s14 keeps the
      replica functional, but `/readyz` still requires one
      successful refresh so a totally broken DNS path does not stay
      silently masked);
@@ -1460,9 +1530,132 @@ the contract, cap the window".
 
 Cross-references: [s2 Decisions / Consistency](#2-decisions),
 [s8.6 Failure handling](#86-failure-handling-without-re-stampede),
-[s10.2 Catalog correctness](#102-catalog-correctness-typed-errors-circuit-breaker).
+[s10.2 Catalog correctness](#102-catalog-correctness-typed-errors-circuit-breaker),
+[s12 Create-after-404 and negative-cache lifecycle](#12-create-after-404-and-negative-cache-lifecycle).
 
-## 12. Eviction and capacity
+## 12. Create-after-404 and negative-cache lifecycle
+
+### 12.1 The scenario
+
+A client GETs a key `K` before the operator has uploaded it to
+origin. The cache observes `404` from `Origin.Head(K)`, records a
+negative metadata-cache entry, and returns `404` to the client. The
+operator then uploads `K`. Subsequent client requests still see
+`404` until the negative entry expires - the "we forgot to upload
+that" case.
+
+This is operationally indistinguishable from a contract violation
+(s11): from the client's perspective, the bytes for `K` changed
+without the cache being told. There is no event-driven invalidation
+in v1 (deferred to Phase 4); the cache can only bound how long it
+serves the stale `404`.
+
+### 12.2 Two TTLs (positive vs negative)
+
+The metadata cache uses two TTLs:
+
+| TTL | Default | Bounds | Rationale |
+|---|---|---|---|
+| `metadata_ttl` | 5m | positive entry (`200` + ETag) reuse without re-Head | immutable-origin contract (s11); long TTL keeps HEAD load low |
+| `negative_metadata_ttl` | 60s | negative entry (`404` / unsupported blob type) reuse without re-Head | operator "oops upload" recovery should be fast |
+
+Asymmetric defaults reflect asymmetric operational reality:
+positive-entry staleness only matters on contract violation;
+negative-entry staleness matters every time an operator uploads a
+previously-missing key, which is a normal operational event.
+
+Per-replica HEAD singleflight (s8.7) caps the HEAD load that a short
+negative TTL would otherwise create: a flood of distinct missing
+keys generates at most one HEAD per object per replica per
+`negative_metadata_ttl` window. At default settings (60s, 3
+replicas) origin sees at most 3 HEADs per missing key per minute,
+well under any S3 / Azure HEAD rate limit.
+
+### 12.3 Worst-case unavailability window
+
+After an operator uploads a previously-missing key:
+
+- A replica that observed the original `404` keeps serving `404`
+  for up to `negative_metadata_ttl` from its OWN observation time,
+  regardless of when the upload happened. The TTL is
+  observation-anchored, not upload-anchored, because the cache
+  cannot know about the upload.
+- A replica that did NOT observe the `404` will Head fresh on the
+  first request after the upload and serve `200` immediately.
+- Worst case across replicas: `negative_metadata_ttl` after the
+  LATEST replica's observation of the old `404`. Under round-robin
+  load balancing, clients can see alternating `404` / `200`
+  responses during the drain window (Diagram 10).
+
+There is no active invalidation in v1. Operator workaround: wait
+`negative_metadata_ttl` after upload before announcing the key. An
+admin-invalidation RPC is a Phase 4 deliverable
+([plan.md s7](./plan.md#7-phased-delivery)).
+
+### 12.4 Defense-in-depth and observability
+
+`If-Match: <etag>` (s8.6) does NOT defend against this case: there
+is no in-flight fill for a `404`'d key, so no precondition exists
+to trip on. The TTL is the only bound.
+
+Negative-cache metrics let operators observe drain progress after
+an upload:
+
+- `origincache_metadata_negative_entries` (gauge) - current count
+  of negative entries.
+- `origincache_metadata_negative_hit_total{origin_id}` (counter) -
+  returns served from a negative entry. A spike after a known
+  upload signals ongoing drain.
+- `origincache_metadata_negative_age_seconds{origin_id}`
+  (histogram) - age of negative entries at hit time. Use
+  upper-bound percentiles to size `negative_metadata_ttl`.
+
+Cross-references: [s2 Decisions / Consistency](#2-decisions),
+[s6 Request flow](#6-request-flow),
+[s8.6 Failure handling](#86-failure-handling-without-re-stampede),
+[s8.7 Metadata-layer singleflight](#87-metadata-layer-singleflight),
+[s11 Bounded staleness contract](#11-bounded-staleness-contract).
+
+### Diagram 10: Scenario G - create-after-404 timeline
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Op as Operator
+    participant C as Client
+    participant A as Replica A
+    participant B as Replica B
+    participant O as Origin
+    Note over A,B: t=0  K not yet uploaded
+    C->>A: GET /bucket/K
+    A->>O: Head(K)
+    O-->>A: 404
+    Note over A: cache K -> 404<br/>TTL = negative_metadata_ttl (60s)
+    A-->>C: 404
+    Note over Op,O: t=30s  operator uploads K
+    Op->>O: PUT /bucket/K
+    Note over A,B: t=45s  drain period
+    C->>B: GET /bucket/K (LB routes to B)
+    B->>O: Head(K)
+    O-->>B: 200 + ETag
+    B->>O: GetRange (fill path)
+    O-->>B: bytes
+    B-->>C: 200 + bytes
+    Note over A,B: inconsistent results across replicas during drain
+    C->>A: GET /bucket/K (LB routes to A again)
+    Note over A: negative entry still valid<br/>age 45s less than 60s
+    A-->>C: 404 STALE
+    Note over A: t=60s+  negative entry expires
+    C->>A: GET /bucket/K (t=70s)
+    A->>O: Head(K)
+    O-->>A: 200 + ETag
+    A->>O: GetRange (fill path)
+    O-->>A: bytes
+    A-->>C: 200 + bytes
+    Note over A,B: drain complete - all replicas consistent
+```
+
+## 13. Eviction and capacity
 
 Eviction is delegated to the CacheStore's storage system (e.g. VAST or S3
 lifecycle policies). Recommended baseline is age-based expiration on the
@@ -1508,7 +1701,7 @@ lifecycle eviction proves material, add an in-cache access-tracking layer
 inside the `chunkcatalog` package and an opt-in active-eviction loop. This
 does not affect any other interface in the system.
 
-## 13. Horizontal scale
+## 14. Horizontal scale
 
 Cluster membership comes from the headless Service: an A-record lookup
 returns the IPs of all Ready pods backing the Service. Cluster code
@@ -1554,7 +1747,7 @@ since boot; a totally broken DNS path therefore keeps the replica
 NotReady and load balancers drain it, even though the empty-peer
 local-fill fallback would otherwise let it serve.
 
-### Diagram 10: Membership & rendezvous hash
+### Diagram 11: Membership & rendezvous hash
 
 ```mermaid
 flowchart LR
@@ -1567,7 +1760,7 @@ flowchart LR
     Decide -- "no" --> Forward["GET /internal/fill?key=k<br/>(mTLS, internal listener)"]
 ```
 
-### Diagram 11: Rolling restart membership flux
+### Diagram 12: Scenario H - rolling restart membership flux
 
 ```mermaid
 sequenceDiagram
