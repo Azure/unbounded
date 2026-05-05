@@ -3,9 +3,6 @@
 Status: draft for review (round 2 incorporating reviewer feedback)
 Owner: TBD
 
-> Implementation phases, repo layout, configuration, ops, and approval
-> checklist: see [plan.md](./plan.md).
-
 ---
 
 ## Table of contents
@@ -39,9 +36,21 @@ Owner: TBD
     - [10.4 Spool locality contract](#104-spool-locality-contract)
     - [10.5 Readiness probe (`/readyz`)](#105-readiness-probe-readyz)
 11. [Bounded staleness contract](#11-bounded-staleness-contract)
+    - [11.1 The contract and the staleness window](#111-the-contract-and-the-staleness-window)
+    - [11.2 Bounded-freshness mode (optional)](#112-bounded-freshness-mode-optional)
 12. [Create-after-404 and negative-cache lifecycle](#12-create-after-404-and-negative-cache-lifecycle)
 13. [Eviction and capacity](#13-eviction-and-capacity)
+    - [13.1 Passive eviction (lifecycle)](#131-passive-eviction-lifecycle)
+    - [13.2 Active eviction (opt-in, access-frequency)](#132-active-eviction-opt-in-access-frequency)
+    - [13.3 ChunkCatalog size awareness](#133-chunkcatalog-size-awareness-load-bearing-operational-note)
+    - [13.4 Spool capacity](#134-spool-capacity)
+    - [13.5 `chunk_size` config-change capacity impact](#135-chunk_size-config-change-capacity-impact)
+    - [13.6 Eviction interactions](#136-eviction-interactions)
 14. [Horizontal scale](#14-horizontal-scale)
+15. [Deferred optimizations](#15-deferred-optimizations)
+    - [15.1 Edge rate limiting](#151-edge-rate-limiting)
+    - [15.2 Cluster-wide HEAD singleflight](#152-cluster-wide-head-singleflight)
+    - [15.3 Cluster-wide LIST coordinator](#153-cluster-wide-list-coordinator)
 
 ### Request scenarios
 
@@ -57,9 +66,10 @@ identifier reused in the diagram heading.
 - **Scenario G** - create-after-404 (operator upload after client miss): [Diagram 10](#diagram-10-scenario-g---create-after-404-timeline)
 - **Scenario H** - rolling restart membership flux: [Diagram 12](#diagram-12-scenario-h---rolling-restart-membership-flux)
 
-Other diagrams (D1, D2, D9, D11) depict architecture, math, or
+Other diagrams (D1, D2, D9, D11, D13) depict architecture, math, or
 mechanism rather than request scenarios and are reachable from the
-Sections list above.
+Sections list above. Diagram 13 covers the limiter authority and
+slot acquisition mechanism (s8.4).
 
 ---
 
@@ -74,9 +84,7 @@ OriginCache serves from a shared in-DC store when present, otherwise
 fetches from the cloud origin, stores the chunk, and returns it.
 
 This document describes the mechanism: decisions, components, request flow,
-stampede protection, atomic commit, and horizontal-scale coordination. It
-is paired with [plan.md](./plan.md), which covers deliverable scope, repo
-layout, phasing, configuration, observability, and operational concerns.
+stampede protection, atomic commit, and horizontal-scale coordination.
 
 ## 2. Decisions
 
@@ -91,16 +99,23 @@ layout, phasing, configuration, observability, and operational concerns.
 | CacheStore atomic-commit primitive | Two equivalent primitives, picked per driver: object-store `PutObject + If-None-Match: *` (used by `cachestore/s3`) and POSIX `link()` / `renameat2(RENAME_NOREPLACE)` returning `EEXIST` (used by `cachestore/localfs` and `cachestore/posixfs`). Both are atomic, no-clobber, and have a "you lost the race" failure mode that maps cleanly onto `commit_lost`. Each driver runs `SelfTestAtomicCommit` at boot and refuses to start on backends that don't honor its primitive. |
 | Chunking | Fixed 8 MiB default (configurable 4-16 MiB). `chunk_size` baked into `ChunkKey`. |
 | Consistency | **Origin objects are immutable per operator contract**: an `(origin_id, bucket, key)` never has its bytes modified once published; replacement must be a new key. `ETag` is identity, not freshness. `If-Match: <etag>` on every `Origin.GetRange` is defense-in-depth that traps in-flight overwrites only. Bounded staleness uses two TTLs: `metadata_ttl` (default 5m) on positive entries (caps in-place-overwrite contract violations; see [s11](#11-bounded-staleness-contract)) and `negative_metadata_ttl` (default 60s) on negative entries (caps the create-after-404 unavailability window after an operator uploads a previously-missing key; see [s12](#12-create-after-404-and-negative-cache-lifecycle)). |
-| Catalog | In-memory `ChunkCatalog` fronting `CacheStore.Stat`. No persistent local index. |
-| Eviction | Deferred to CacheStore lifecycle policy. Cache layer ships no eviction code in v1. |
+| Catalog | In-memory `ChunkCatalog` fronting `CacheStore.Stat`. No persistent local index. Per-entry access-frequency tracking (s10.2) feeds the optional active-eviction loop (s13.2). Bounded by `chunk_catalog.max_entries`; size to estimated working-set chunks (s13.3). |
+| Eviction | Two-tier. Passive: bounded LRU on the in-memory ChunkCatalog (always on); CacheStore lifecycle (S3 lifecycle / posixfs operator sweep) for storage-side cleanup. Active: opt-in access-frequency-driven eviction loop (`chunk_catalog.active_eviction.enabled`, default `false`) that deletes cold chunks from the CacheStore via `CacheStore.Delete`. Operators using `cachestore/posixfs` typically enable active eviction since posixfs has no native lifecycle. See [s13](#13-eviction-and-capacity). |
 | Prefetch | Sequential read-ahead by default. Configurable depth, capped concurrency. |
-| Cluster | Kubernetes Deployment + headless Service for peer discovery + ClusterIP/LB for client traffic. Rendezvous hashing on pod IP selects the coordinator per `ChunkKey` for miss-fills only; receiving replica is the **assembler** that fans out per-chunk fill RPCs to coordinators (s8.3). All replicas can read all chunks directly from the CacheStore on hits. |
+| Cluster | Kubernetes Deployment + headless Service for peer discovery + ClusterIP/LB for client traffic. Rendezvous hashing on pod IP selects the coordinator per `ChunkKey` for miss-fills only; receiving replica is the **assembler** that fans out per-chunk fill RPCs to coordinators (s8.3). All replicas can read all chunks directly from the CacheStore on hits. A separate **limiter authority** is elected via a Kubernetes `coordination.k8s.io/v1.Lease` to enforce a cluster-wide cap on concurrent `Origin.GetRange` calls (s8.4). |
+| Kubernetes coordination | Two K8s-native dependencies: (1) headless Service for peer discovery (s14); (2) one `coordination.k8s.io/v1.Lease` resource per deployment for limiter-authority election (s8.4). RBAC: `get / list / watch / create / update / patch` on the named Lease resource, scoped to the deployment's namespace. |
 | Inter-replica auth | Separate internal mTLS listener (default `:8444`) chained to an internal CA distinct from the client mTLS CA; authorization = "presenter source IP is in current peer-IP set" (s8.8). |
 | Local spool | Every fill writes origin bytes through a local spool (`internal/origincache/fetch/spool`) so slow joiners always have a local fallback regardless of CacheStore driver (s8.2). |
 | Atomic commit | `localfs` and `posixfs` stage inside `<root>/.staging/<uuid>` with parent-dir fsync, then `link()` no-clobber (returns `EEXIST` to the loser); `s3` uses direct `PutObject` with `If-None-Match: *`. Each driver runs `SelfTestAtomicCommit` at boot: `s3` proves the backend honors `If-None-Match: *`; `posixfs` proves the backend honors `link()` / `EEXIST` and that directory fsync is durable, and additionally enforces `nfs.minimum_version` (default `4.1`, with opt-in `nfs.allow_v3`) and refuses to start on Alluxio FUSE backends. Cold-path TTFB is gated on local Spool fsync, not on CacheStore commit; commit-after-serve failure becomes `commit_after_serve_total{result="failed"}` rather than a client error (s8.6). |
+| Versioned buckets on cachestore/s3 | Not supported. The `cachestore/s3` driver requires the bucket to have versioning **disabled**. AWS S3 honors `If-None-Match: *` on both versioned and unversioned buckets, but VAST Cluster (and likely other S3-compatible backends) only honors it on unversioned buckets ([VAST KB][vast-kb-conditional-writes]). The driver enforces this at boot via an explicit `GetBucketVersioning` versioning gate (s10.1.3); refusing to start on enabled or suspended versioning avoids a class of silent atomic-commit failures. |
+| LIST caching | Per-replica TTL'd LIST cache (s6.2 / FW3) in front of `Origin.List`, sized for the FUSE-`ls` workload pattern. Default `list_cache.ttl=60s`, configurable. Cluster-wide LIST coordination is a deferred optimization ([s15.3](#153-cluster-wide-list-coordinator)). |
+| Origin concurrency cap | Cluster-wide via Kubernetes-Lease-elected limiter authority (s8.4 / FW4). Default `cluster.limiter.target_global=192`. Per-replica static cap (`floor(target_global / N)`) is the documented graceful-fallback when the authority is unreachable; also the v1 escape hatch via `cluster.limiter.enabled=false`. |
+| Bounded-freshness mode | Optional, opt-in via `metadata_refresh.enabled` (default `false`). When enabled, a per-replica background loop proactively re-Heads hot keys (`AccessCount >= access_threshold`) ahead of `metadata_ttl` to shrink the effective bounded-staleness window for popular content. See [s11.2](#112-bounded-freshness-mode-optional). |
 | Tenancy | Single tenant, single origin credential set in v1. |
-| Edge rate limiting | Out of scope for v1. No per-client / per-IP / per-credential rate limiting at the S3 edge. Hot-client mitigation in v1 is implicit: the per-replica origin semaphore (s8.4) caps cold-fill concurrency regardless of caller, and the singleflight (s8.1) coalesces concurrent identical fills. Edge rate limiting is Phase 4 and only if measured. |
+| Edge rate limiting | Documented v1 gap; see [s15.1](#151-edge-rate-limiting). v1 has implicit hot-client mitigation via the per-replica origin limiter (s8.4) and singleflight (s8.1); per-client / per-IP / per-credential edge rate limiting is deferred future work. |
 | Repo home | This repo. Layout mirrors `machina`. |
+
+[vast-kb-conditional-writes]: https://kb.vastdata.com/documentation/docs/s3-conditional-writes
 
 ## 3. Terminology
 
@@ -216,6 +231,54 @@ section that defines or implements the full mechanism.
   rationale and the boot check are in
   [s10.4](#104-spool-locality-contract); the spool's role in the
   cold-path TTFB barrier is in [s8.2](#82-ttfb-tee--spool).
+- **LIST cache** - per-replica TTL'd cache of `Origin.List` responses
+  keyed on the full query tuple `(origin_id, bucket, prefix,
+  continuation_token, start_after, delimiter, max_keys)`. Default
+  `list_cache.ttl=60s`, configurable. Sized for the FUSE-`ls`
+  workload pattern (s6.2). Cluster-wide LIST coordination is a
+  deferred optimization ([s15.3](#153-cluster-wide-list-coordinator)).
+- **Active eviction** - optional, opt-in background loop in the
+  cache layer (`chunk_catalog.active_eviction.enabled`, default
+  `false`) that uses access-frequency tracking on the
+  `ChunkCatalog` to delete cold chunks from the CacheStore via
+  `CacheStore.Delete`. Recommended for `cachestore/posixfs`
+  deployments without external sweep tooling. Detail in
+  [s13.2](#132-active-eviction-opt-in-access-frequency).
+- **Bounded-freshness mode** - optional, opt-in
+  (`metadata_refresh.enabled`, default `false`) per-replica
+  background loop that proactively re-Heads hot keys ahead of
+  `metadata_ttl`. Shrinks the effective bounded-staleness window
+  for popular content from `metadata_ttl` to
+  `refresh_ahead_ratio * metadata_ttl` (default 3.5m). Hot-key
+  detection uses access-frequency counters on the metadata cache
+  (parallel to the ChunkCatalog tracking from FW8). Detail in
+  [s11.2](#112-bounded-freshness-mode-optional).
+- **Limiter authority** - the replica elected (via a Kubernetes
+  `coordination.k8s.io/v1.Lease`) to hold the cluster-wide
+  `Origin.GetRange` semaphore and serve slot-lease tokens to peers
+  over the internal listener. One per deployment. Election is
+  separate from the rendezvous-hashed chunk and HEAD coordinators.
+  Detail in [s8.4](#84-origin-backpressure).
+- **Slot lease token** - opaque token issued by the limiter
+  authority to a peer on `Acquire`. Carries N batched slots
+  (default 8) with wall-clock TTL (default 30s). Auto-extended
+  while in use; auto-released by the authority's sweep on
+  expiration without release. Detail in
+  [s8.4](#84-origin-backpressure).
+- **Limiter fallback mode** - graceful degradation when a peer
+  cannot reach the limiter authority (RPC timeout, dial failure,
+  K8s API outage, or `cluster.limiter.enabled=false`). The peer
+  falls back to a per-replica static cap of
+  `floor(target_global / N_replicas)`. Reconnects automatically.
+  Not a `/readyz` predicate. Detail in
+  [s8.4](#84-origin-backpressure).
+- **S3 versioning gate** - boot-time `GetBucketVersioning` check
+  by `cachestore/s3` that refuses to start if the bucket has
+  versioning enabled or suspended. Required because
+  `If-None-Match: *` is not honored on versioned buckets across
+  all S3-compatible backends; without this gate the atomic-commit
+  primitive silently degrades. Detail in
+  [s10.1.3](#1013-cachestores3).
 
 ## 4. Architecture
 
@@ -372,7 +435,8 @@ flowchart LR
    one `HEAD` per object per replica per metadata-cache window. Cluster-wide
    bound is therefore N HEADs per object per window worst case where N is
    the current peer-set size; this is acceptable in v1 (a cluster-wide HEAD
-   singleflight is Phase 4). Two TTLs apply, asymmetric by design (s12):
+   singleflight is a deferred optimization; see [s15.2](#152-cluster-wide-head-singleflight)).
+   Two TTLs apply, asymmetric by design (s12):
    **positive entries** (`200` + ETag) are reused for `metadata_ttl`
    (default 5m), which also bounds the staleness window if the
    immutable-origin contract (s11) is violated. **Negative entries**
@@ -512,43 +576,103 @@ read-only client-side concern that operates on the returned `ETag`.
 
 ### 6.2 LIST request flow
 
-`GET /{bucket}/?list-type=2&prefix=...` (S3 ListObjectsV2). v1 LIST is
-a thin pass-through with per-replica metadata-layer singleflight; no
-LIST result is cached on disk.
+`GET /{bucket}/?list-type=2&prefix=...` (S3 ListObjectsV2). v1 LIST
+serves from a per-replica **LIST cache** (s6.2 introduces it; FW3)
+in front of the existing per-replica LIST singleflight. The cache
+is sized and tuned for the FUSE-`ls` workload pattern: thousands of
+edge clients implementing FUSE filesystems perform interactive
+`ls` and directory navigation against the S3 API, generating
+prefix-clustered LIST traffic where the same query is repeated
+many times within a short window. Per-replica caching is naturally
+effective for FUSE clients because they typically pin to one
+replica via HTTP/2 keepalive.
+
+**Cache key**: the full LIST query tuple
+`(origin_id, bucket, prefix, continuation_token, start_after,
+delimiter, max_keys)`. Pagination tokens are part of the key, so
+sequential page-through caches each page independently and does
+not collide.
+
+**TTL**: governed by `list_cache.ttl` (default 60s, configurable
+typical range 5s - 30m). The 60s default trades freshness vs.
+origin load: a freshly-uploaded key is invisible to LIST clients
+for up to 60s. Acceptable for the immutable-artifact workload;
+operators with write-and-immediately-list patterns should tune
+shorter.
+
+**Eviction**: bounded LRU on `list_cache.max_entries` (default
+1024). Memory math: 1024 entries times ~10 KB typical (1000-key
+listing) = ~10 MB worst case.
+
+**Response-size cap**: very large LIST responses
+(>`list_cache.max_response_bytes`, default 1 MiB) bypass the cache
+entirely; the response is served to the client but not stored.
+
+**Steps**:
+
+0. **Cache lookup**. Compute the cache key from the request
+   parameters. On hit, serve the cached `ListResult` directly with
+   header `x-origincache-list-cache-age: <seconds>`. No origin
+   call. No singleflight acquisition. `list_cache_hit_total{origin_id,
+   result="hit"}++`.
 
 1. Auth as for GET.
-2. The request parameters `(prefix, continuation-token / start-after,
-   max-keys, delimiter)` are forwarded verbatim to `Origin.List`. The
-   continuation token returned to the client is the origin's token
-   passed through unchanged. There is no token rewriting.
-3. **Per-replica LIST singleflight** keyed on
-   `(origin_id, bucket, prefix, marker, max)` collapses concurrent
-   identical LIST calls on the same replica. There is no cluster-wide
-   LIST singleflight in v1 - cluster-wide cold fan-out can produce up
-   to `N` `Origin.List` calls per identical query, where `N` is the
-   peer-set size. Acceptable in v1 (LIST is rare on the intended
-   workload); a cluster-wide LIST singleflight is Phase 4 only if
-   measured.
+
+2. On cache miss, the request parameters `(prefix, continuation-token
+   / start-after, max-keys, delimiter)` are forwarded verbatim to
+   `Origin.List`. The continuation token returned to the client is
+   the origin's token passed through unchanged. There is no token
+   rewriting.
+
+3. **Per-replica LIST singleflight** keyed on the same cache-key
+   tuple collapses concurrent identical LIST calls on the same
+   replica during the cache miss. There is no cluster-wide LIST
+   singleflight in v1; cluster-wide bound is up to `N` `Origin.List`
+   calls per identical query per `list_cache.ttl` window where `N`
+   is peer-set size. Acceptable at v1 scale; a cluster-wide LIST
+   coordinator is a deferred optimization
+   ([s15.3](#153-cluster-wide-list-coordinator)).
+
 4. **azureblob origin**: when `cachestore.azureblob.list_mode = filter`
    (the default), non-BlockBlob entries are stripped while
-   continuation tokens are preserved (s9). `passthrough` mode disables
-   filtering and returns the entire listing including unsupported
-   blob types.
-5. LIST does NOT populate the metadata cache for individual entries.
-   A subsequent GET / HEAD on a listed key still triggers an
-   `Origin.Head` (subject to its own singleflight and TTL). Rationale:
-   eager metadata population on large listings would balloon the
-   metadata cache, and the intended GET workload addresses keys that
-   are already known.
-6. Origin failures during LIST surface as `502 Bad Gateway`
-   (`ErrTransient` upstream) or the corresponding S3 error code; LIST
-   does NOT trip the CacheStore circuit breaker because it never
-   touches the CacheStore.
+   continuation tokens are preserved (s9). `passthrough` mode
+   disables filtering and returns the entire listing including
+   unsupported blob types.
 
-LIST is intentionally a thin pass-through in v1. The intended workload
-(large immutable artifacts under known keys) makes correctness the
-only concern; if heavy-LIST workloads emerge, a Phase 4 LIST cache
-with prefix-keyed cluster-wide singleflight is the natural follow-up.
+5. **Cache populate** on successful `Origin.List`. If the serialized
+   `ListResult` exceeds `list_cache.max_response_bytes`, skip the
+   populate (serve the response normally) and increment
+   `list_cache_evict_total{reason="response_too_large"}`. Otherwise
+   store with TTL = `list_cache.ttl`. Negative responses (errors)
+   are NOT cached; errors fall through every time. Empty-result
+   listings ARE cached (an authoritative "this prefix has no keys"
+   for the TTL window).
+
+6. LIST does NOT populate the metadata cache for individual entries.
+   A subsequent GET / HEAD on a listed key still triggers an
+   `Origin.Head` (subject to its own singleflight and TTL).
+   Rationale: eager metadata population on large listings would
+   balloon the metadata cache, and the FUSE workload typically
+   reads only a fraction of listed entries.
+
+7. Origin failures during LIST surface as `502 Bad Gateway`
+   (`ErrTransient` upstream) or the corresponding S3 error code;
+   LIST does NOT trip the CacheStore circuit breaker because it
+   never touches the CacheStore.
+
+**Stale-while-revalidate** is opt-in via
+`list_cache.swr_enabled: false` default. When enabled with
+`list_cache.swr_threshold_ratio: 0.5` (default), an entry whose
+age exceeds half of `list_cache.ttl` is served immediately AND
+triggers a background `Origin.List` to refresh; the user-observed
+latency stays at cache-hit speed even at TTL boundaries. Adds
+small extra origin load (one refresh per entry per TTL window).
+Useful for heavy interactive FUSE deployments where `ls` latency
+spikes at TTL expiry are user-visible.
+
+**Toggle**: `list_cache.enabled: true` default. Set `false` to
+disable the cache layer for diagnostics; LIST falls through to the
+existing pass-through behavior with per-replica singleflight only.
 
 ### 6.3 HTTP error-code mapping
 
@@ -580,7 +704,7 @@ or `HTTP/1.1 Connection: close`) and increment
 ## 7. Internal interfaces
 
 The mechanism's named seams. Implementations live under
-`internal/origincache/`; see [plan.md#3-repo-layout](./plan.md#3-repo-layout-mirrors-machina).
+`internal/origincache/`.
 
 ```go
 // Origin: read-only view of upstream blob store. GetRange takes the etag
@@ -614,10 +738,15 @@ type OriginETagChangedError struct {
 //                   502 BadGateway. Counts toward the breaker AND toward
 //                   the /readyz consecutive-ErrAuth threshold (default 3
 //                   -> NotReady).
+//
+// Delete removes a chunk; used by active eviction (s13.2). Idempotent;
+// ErrNotFound on a missing chunk is treated as success by the eviction
+// loop. Delete errors count toward the same circuit breaker as Get / Put.
 type CacheStore interface {
     GetChunk(ctx context.Context, k ChunkKey, off, n int64) (io.ReadCloser, error)
     PutChunk(ctx context.Context, k ChunkKey, size int64, r io.Reader) error // atomic, no-clobber
     Stat(ctx context.Context, k ChunkKey) (ChunkInfo, error)
+    Delete(ctx context.Context, k ChunkKey) error // s13.2 active eviction
     SelfTestAtomicCommit(ctx context.Context) error // startup probe
 }
 
@@ -630,17 +759,24 @@ var (
 
 // ChunkCatalog: in-memory, best-effort record of chunks known to be
 // present in the CacheStore. Purely a hot-path optimization; the
+// ChunkCatalog: in-memory, best-effort record of chunks known to be
+// present in the CacheStore. Purely a hot-path optimization; the
 // CacheStore is the source of truth. A Lookup miss falls through to
 // CacheStore.Stat; the result is Recorded for subsequent requests.
+//
+// Lookup has a side effect: it increments the matched entry's
+// AccessCount and updates LastAccessed (s10.2). These access counters
+// are consumed by the optional active eviction loop (s13.2). Side
+// effects are atomic; Lookup remains safe for concurrent callers.
 //
 // Forget is invoked when an entry is known to be invalid:
 //   - on OriginETagChangedError, the assembler Forgets the now-stale
 //     ChunkKey (its etag has been superseded);
 //   - on a CacheStore.GetChunk returning ErrNotFound for a key that
-//     was previously Recorded (lifecycle eviction caught the entry).
-// In v1 there are no other callers; in particular, lifecycle
-// eviction does not push notifications back into the catalog and
-// stale entries are repaired lazily via the ErrNotFound path above.
+//     was previously Recorded (lifecycle eviction caught the entry);
+//   - by the active eviction loop (s13.2) after a successful
+//     CacheStore.Delete.
+// In v1 there are no other callers.
 type ChunkCatalog interface {
     Lookup(k ChunkKey) (ChunkInfo, bool)
     Record(k ChunkKey, info ChunkInfo)
@@ -650,8 +786,8 @@ type ChunkCatalog interface {
 // Cluster: peer discovery + rendezvous hashing. Returns the coordinator
 // peer for a given ChunkKey. self == coordinator means handle locally.
 // InternalDial returns a transport (HTTP/2 over mTLS) for issuing
-// /internal/fill RPCs to a non-self peer. ServerName returns the stable
-// SAN (default "origincache.<ns>.svc") used for TLS verification across
+// internal RPCs to a non-self peer. ServerName returns the stable SAN
+// (default "origincache.<ns>.svc") used for TLS verification across
 // rolling restarts and pod-IP churn; per-replica internal-listener certs
 // MUST include this SAN.
 type Cluster interface {
@@ -661,6 +797,30 @@ type Cluster interface {
     InternalDial(ctx context.Context, p Peer) (InternalClient, error)
     ServerName() string           // e.g. "origincache.<ns>.svc"
 }
+
+// Limiter: cluster-wide cap on concurrent Origin.GetRange calls (s8.4).
+// Acquire blocks until a slot is available or ctx expires. The returned
+// Slot's Release MUST be called when the GetRange completes (regardless
+// of success). Implementations: limiter/k8slease (authority mode +
+// fallback) and limiter/static (per-replica static cap, used when
+// cluster.limiter.enabled=false).
+type Limiter interface {
+    Acquire(ctx context.Context) (Slot, error)
+    State() LimiterState  // for /readyz and metrics; "authority|peer|fallback"
+}
+
+type Slot interface {
+    Release()
+}
+
+type LimiterState int
+
+const (
+    LimiterStateUnknown LimiterState = iota
+    LimiterStateAuthority   // this replica is the elected authority
+    LimiterStatePeer        // normal peer; using authority-issued lease tokens
+    LimiterStateFallback    // authority unreachable; using per-replica static cap
+)
 
 // Spool: bounded local-disk staging area for in-flight fills. Every fill
 // writes through the spool so slow joiners can fall back from the leader's
@@ -696,9 +856,17 @@ type ObjectInfo struct {
 // ChunkCatalog.Lookup. Size is the on-store byte length, which equals
 // chunk_size for all chunks except the last chunk of an object (which
 // is partial; see s10.3).
+//
+// AccessCount, LastAccessed, and LastEntered are set by the
+// ChunkCatalog as access-frequency tracking for the optional active
+// eviction loop (s13.2). They are zero-valued on freshly-Recorded
+// entries and are atomically updated by Lookup.
 type ChunkInfo struct {
-    Size      int64
-    Committed time.Time
+    Size         int64
+    Committed    time.Time
+    AccessCount  uint32    // s13.2; saturates at MaxUint32
+    LastAccessed time.Time // s13.2; updated on Lookup hit
+    LastEntered  time.Time // s13.2; set on Record; never updated
 }
 
 // ListResult: paginated result from Origin.List.
@@ -726,10 +894,36 @@ type Peer struct {
 }
 
 // InternalClient: HTTP/2 over mTLS client to a peer's internal listener.
-// Returned by Cluster.InternalDial. v1 exposes a single RPC; the
-// surface can grow as additional internal RPCs are introduced.
+// Returned by Cluster.InternalDial. v1 exposes the chunk-fill RPC plus
+// the distributed limiter RPCs (s8.4 / FW4).
 type InternalClient interface {
     Fill(ctx context.Context, k ChunkKey) (io.ReadCloser, error)
+
+    // Limiter RPCs (s8.4). The caller is responsible for retrying on
+    // a fresh authority after authority changeover; an `ErrNotAuthority`
+    // result means the receiving peer is not the elected authority and
+    // the caller should re-resolve.
+    LimiterAcquire(ctx context.Context, batch int) (LimiterToken, error)
+    LimiterExtend(ctx context.Context, t LimiterToken) (time.Duration, error)
+    LimiterRelease(ctx context.Context, t LimiterToken) error
+}
+
+// LimiterToken: opaque handle issued by the limiter authority on
+// Acquire. Carries the slot count granted and the expiry time.
+type LimiterToken struct {
+    ID        string
+    Slots     int
+    ExpiresAt time.Time
+}
+
+// MetadataCacheEntry: per-entry shape of the metadata cache (s8.7,
+// s11.2). Access tracking is set unconditionally on Lookup hit but
+// only consumed by the optional bounded-freshness mode (s11.2).
+type MetadataCacheEntry struct {
+    ObjectInfo
+    AccessCount  uint32    // s11.2; saturates at MaxUint32
+    LastAccessed time.Time // s11.2; updated on Lookup hit
+    LastEntered  time.Time // s11.2; set on Record; never updated
 }
 ```
 
@@ -748,10 +942,18 @@ Implementations:
   `internal/origincache/cachestore/internal/posixcommon/`; this is an
   internal-to-cachestore package and is not visible to the rest of the
   cache layer.
-- `ChunkCatalog`: a single in-memory LRU implementation.
+- `ChunkCatalog`: a single in-memory LRU implementation with
+  optional access-frequency tracking driving the active eviction
+  loop (s13.2). Bounded by `chunk_catalog.max_entries`.
 - `Cluster`: a single implementation that polls the headless Service
   (default 5s), computes rendezvous hashes against pod IPs, and exposes
   an mTLS HTTP/2 client for the internal listener.
+- `Limiter`: two implementations. `limiter/k8slease` runs election
+  via `client-go/tools/leaderelection` against a `Lease` resource
+  (s8.4) and contains the authority-mode semaphore + peer-mode
+  bucket logic + fallback. `limiter/static` is the disabled-mode
+  per-replica static cap (`floor(target_global / N_replicas)`) used
+  when `cluster.limiter.enabled=false`.
 - `Spool`: a single implementation backed by a configured local directory
   (`spool.dir`) with a capacity cap (`spool.max_bytes`) and an in-flight
   cap (`spool.max_inflight`).
@@ -912,11 +1114,10 @@ internal RPCs.
 Combined with s8.1, exactly one origin GET per cold chunk per cluster in
 steady state. During membership change we accept up to one duplicate fill
 per chunk (loser drops on commit collision; observable via
-`origincache_origin_duplicate_fills_total{result="commit_lost"}` - see
-[plan.md#6-observability](./plan.md#6-observability)). The duplicate-fill
-metric is the leading indicator that this routing is working: a sustained
-non-zero `commit_lost` rate signals chronic membership flux or a bug in
-the hash distribution.
+`origincache_origin_duplicate_fills_total{result="commit_lost"}`). The
+duplicate-fill metric is the leading indicator that this routing is
+working: a sustained non-zero `commit_lost` rate signals chronic
+membership flux or a bug in the hash distribution.
 
 ### Diagram 6: Scenario D - cold miss, remote coordinator
 
@@ -980,29 +1181,169 @@ sequenceDiagram
 
 ### 8.4 Origin backpressure
 
-Each replica enforces a **per-replica** semaphore that caps concurrent
-`Origin.GetRange` calls. The configured value is a per-replica cap, not a
-cluster-wide one; given a desired global concurrency `target_global`, set
-the per-replica cap as:
+Concurrent `Origin.GetRange` calls are capped at a configured
+**cluster-wide** target via a distributed limiter. The limiter has
+two modes: **authority mode** (the normal path; one elected
+authority issues slot leases over an internal RPC) and **fallback
+mode** (a degraded but always-correct per-replica static cap that
+activates when the authority is unreachable).
 
+#### Authority election via Kubernetes Lease
+
+One replica is elected as the **limiter authority** via a
+`coordination.k8s.io/v1.Lease` object (default name
+`origincache-limiter` in the deployment's namespace). Election uses
+the standard `client-go/tools/leaderelection` machinery used by
+controller-runtime, kube-scheduler, etc. K8s API load is
+intentionally minimal: the elected leader writes the Lease at
+`retry_period` (default 2s); non-leaders do not write. Steady-state
+load is ~6-30 API writes/min/deployment. Required RBAC: `get / list
+/ watch / create / update / patch` on the single named `Lease`
+resource, scoped to the deployment's namespace.
+
+The elected authority holds an in-memory counting semaphore of
+`cluster.limiter.target_global` slots (default 192). It serves three
+RPCs over the existing internal listener (s8.8):
+
+- `POST /internal/limiter/acquire` -> issues a lease token holding
+  N slots (batched; see below). Token has wall-clock TTL
+  (`token.ttl`, default 30s).
+- `POST /internal/limiter/extend` -> bumps an existing token's
+  expiry. Returns `unknown_token` or `expired` if the authority's
+  view of the token has been reclaimed.
+- `POST /internal/limiter/release` -> returns slots immediately;
+  idempotent.
+
+A background sweep on the authority reclaims expired tokens every
+5s. Tokens that expire ungracefully (peer crashed without
+releasing) increment `origincache_limiter_lease_expired_total`.
+
+#### Slot batching
+
+Each non-authority replica holds a small **local bucket** of slots
+acquired in batches. Default batch size is `cluster.limiter.batch.size = 8`;
+refill triggers when remaining slots fall to or below
+`cluster.limiter.batch.refill_threshold` (default 2). This bounds RPC
+overhead to roughly one Acquire per N origin GetRange calls (where
+N is batch_size). The trade-off: replicas may hold up to
+`batch_size - 1` extra slots that could otherwise be used by other
+peers; small noise relative to `target_global`.
+
+Tokens auto-extend when their age exceeds
+`cluster.limiter.token.extend_at_ratio * token.ttl` (default
+0.5 * 30s = 15s). When the local bucket empties, the replica
+Releases the old token and Acquires a fresh one.
+
+#### Authority changeover
+
+When the K8s Lease holder changes (current authority crash, network
+partition, K8s API blip):
+
+1. K8s lease expires after `cluster.limiter.lease.duration` (default
+   15s).
+2. New election runs; one survivor becomes new authority. Empty
+   slot table; `available = target_global`.
+3. **Transient overshoot**: outstanding lease tokens at peers point
+   at the dead authority. Peers continue using slots locally until
+   their token expires (`token.ttl`, 30s) or they detect the
+   authority change via Extend/Release returning `unknown_token`.
+4. Maximum cluster-wide inflight overshoot during changeover: up to
+   `target_global` extra slots (one full set of tokens still in use
+   against the dead authority while the new authority issues fresh
+   ones).
+5. Drains within `lease.duration + token.ttl` = **45s worst case**
+   with defaults.
+
+This is acceptable because the limiter is a soft cap. Correctness
+is unaffected; the steady-state cluster-wide bound returns once the
+old tokens drain.
+
+#### Fallback mode
+
+When a non-authority cannot reach the authority (RPC timeout, dial
+failure, K8s API down so no authority is elected, or
+`cluster.limiter.enabled: false`):
+
+1. Replica activates **fallback semaphore** with cap
+   `floor(target_global / N_replicas)` (the v1-equivalent
+   per-replica static cap).
+2. Each `Origin.GetRange` checks the fallback semaphore instead of
+   authority-issued tokens.
+3. Replica periodically retries authority connection
+   (`cluster.limiter.fallback.check_interval`, default 5s).
+4. On reconnect, replica re-Acquires from authority; fallback
+   semaphore deactivates.
+
+`origincache_limiter_fallback_active=1` (per-replica gauge) makes
+operators aware. Sustained fallback indicates K8s API or network
+issues. The fallback path is intentionally NOT a `/readyz`
+predicate (s10.5): replicas in fallback are still serving
+correctly, just with less optimal slot allocation.
+
+#### Disabling the distributed limiter
+
+`cluster.limiter.enabled: false` falls back to the per-replica
+`floor(target_global / N_replicas)` cap permanently. No K8s API
+access; no Lease object created. This is the v1 escape hatch for
+deployments that cannot grant the required RBAC, or for isolating
+debugging of the limiter path.
+
+#### Saturation
+
+Whether in authority mode, fallback mode, or disabled mode,
+saturation surfaces the same way: leaders that cannot acquire a
+slot queue with bounded wait; on timeout the request returns
+`503 Slow Down` so clients back off. Joiners on existing fills do
+not consume slots.
+
+The current saturation is exposed via:
+- `origincache_origin_inflight{origin}` - per-replica gauge of
+  in-flight `Origin.GetRange` calls.
+- `origincache_limiter_slots_local` - per-replica gauge of slots
+  held in the local bucket.
+- `origincache_limiter_slots_available` and `_slots_granted` -
+  authority-only gauges showing global semaphore state.
+
+Optional token bucket on origin bytes/sec layered on top of the
+slot-based concurrency cap.
+
+### Diagram 13: Limiter authority lifecycle and slot acquisition
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant K as K8s API (coordination.k8s.io Lease)
+    participant A as Replica A (limiter authority)
+    participant P as Replica P (peer)
+    participant O as Origin
+    Note over A,P: boot - all replicas race for the Lease
+    A->>K: create Lease holderIdentity=A
+    K-->>A: 200 OK A is leader
+    P->>K: get Lease
+    K-->>P: holder=A
+    Note over A: authority starts in-memory semaphore<br/>available = target_global (192)
+    Note over P: P needs slots for cold fills
+    P->>A: POST /internal/limiter/acquire batch=8
+    A->>A: available -= 8 (184)<br/>store token T1 expires_at=now+30s
+    A-->>P: { token: T1, ttl: 30s, slots: 8 }
+    Note over P: local bucket = 8
+    P->>O: GetRange (consumes 1 local slot)
+    O-->>P: bytes
+    Note over P: local bucket = 7<br/>(slot returns to bucket on completion)
+    Note over A,P: t=15s  P approaches token half-life
+    P->>A: POST /internal/limiter/extend token=T1
+    A->>A: T1.expires_at = now + 30s
+    A-->>P: { ttl: 30s }
+    Note over A,P: P bucket runs low (slots <= refill_threshold)
+    P->>A: POST /internal/limiter/release token=T1
+    A->>A: available += 8
+    A-->>P: ok
+    P->>A: POST /internal/limiter/acquire batch=8
+    A-->>P: { token: T2, ttl: 30s, slots: 8 }
+    Note over A,K: A renews K8s Lease at retry_period (2s)
+    A->>K: update Lease renewTime=now
+    K-->>A: 200 OK
 ```
-target_per_replica = floor(target_global / N_replicas)
-```
-
-with `N_replicas = len(Cluster.Peers())`. Defaults: 64-128 per replica,
-which gives 192-384 global at the typical 3-replica deployment. A real
-cluster-wide distributed limiter is deferred to Phase 4. The approximation
-can transiently exceed `target_global` by up to
-`(N_replicas - 1) * floor(target_global / N_replicas)` worst case during
-membership flux; in practice this is bounded by the cluster size and is
-acceptable for v1.
-
-The current saturation is exposed as
-`origincache_origin_inflight{origin}` (gauge, per-replica) so operators
-can observe approach to the cap. Optional token bucket on origin
-bytes/sec layered on top. Joiners do not consume tokens. If the
-semaphore is saturated, leaders queue with bounded wait; on timeout the
-request returns `503 Slow Down` so clients back off.
 
 ### 8.5 Cancellation safety
 
@@ -1060,8 +1401,25 @@ Stale-while-revalidate behavior: serve stale within a small margin while
 one background refresh runs. The singleflight is **per-replica**: a
 cluster-wide cold-fan-out can cause up to N HEADs per object per
 `metadata_ttl` window where N is the current peer-set size. This is
-acceptable in v1; a cluster-wide HEAD singleflight is Phase 4 only if
-measured.
+acceptable in v1; a cluster-wide HEAD singleflight is a deferred
+optimization (see [s15.2](#152-cluster-wide-head-singleflight)).
+
+**LIST cache singleflight (FW3, s6.2).** A parallel per-replica
+singleflight collapses concurrent identical `Origin.List` calls
+keyed on the full LIST query tuple. Sits in front of the LIST
+cache; reused on cache miss. Cluster-wide bound is up to N origin
+LIST per identical query per `list_cache.ttl`; a cluster-wide LIST
+coordinator is a deferred optimization (s15.3).
+
+**Bounded-freshness mode interaction (FW5, s11.2).** When
+`metadata_refresh.enabled: true`, background refresh workers are
+gated by the same per-replica HEAD singleflight: if both an
+on-demand miss-fill and a background refresh fire for the same
+object key concurrently, they share one `Origin.Head` and both
+consumers receive the result. New entries Recorded on a miss-fill
+start with `AccessCount=0` and `LastEntered=now`; the cold-start
+protection (`min_age`) prevents these from being immediately
+eligible for refresh.
 
 ### 8.8 Internal RPC listener
 
@@ -1086,19 +1444,37 @@ from the client edge.
   value returned by `Cluster.ServerName()` (the same stable SAN above)
   rather than to the destination pod IP. This keeps verification
   consistent across rolling restarts and pod-IP churn.
-- **Authorization scope**: the internal listener serves `GET
-  /internal/fill?key=<...>` only. No client identity is propagated from
-  the assembler because chunk content is identity-independent: any
-  authorized client at the assembler is entitled to the chunk bytes, and
-  the coordinator is doing the same fill it would do for a local request.
+- **Authorization scope**: the internal listener serves the
+  following endpoints, all over the same mTLS + peer-IP authz:
+  - `GET /internal/fill?key=<encoded ChunkKey>` - per-chunk fill
+    RPC (s8.3).
+  - `POST /internal/limiter/acquire` - distributed origin-limiter
+    slot acquisition (s8.4 / FW4).
+  - `POST /internal/limiter/extend` - extend an outstanding slot
+    lease token.
+  - `POST /internal/limiter/release` - release slots back to the
+    authority.
+
+  No client identity is propagated from the assembler because
+  chunk content is identity-independent: any authorized client at
+  the assembler is entitled to the chunk bytes, and the
+  coordinator is doing the same fill it would do for a local
+  request. The limiter RPCs carry no client identity; they are
+  inter-replica coordination only.
 - **NetworkPolicy**: ingress on `:8444` allowed only from pods with
   label `app=origincache` in the same namespace.
 - **Loop prevention**: receiver enforces `X-Origincache-Internal: 1` ->
-  self must be coordinator for the requested ChunkKey, else `409 Conflict`.
+  for `/internal/fill`, self must be coordinator for the requested
+  `ChunkKey`, else `409 Conflict`. The limiter RPCs do not loop-prevent
+  by header (election is via K8s Lease, not rendezvous-hash); a
+  receiver that is not the elected authority returns `409 Conflict`
+  with body `{"reason":"not_authority"}` and the caller falls back
+  to per-replica cap.
 
 Metrics: `origincache_cluster_internal_fill_requests_total{direction=
 "sent|received|conflict"}`,
-`origincache_cluster_internal_fill_duration_seconds`.
+`origincache_cluster_internal_fill_duration_seconds`. Limiter RPCs
+have their own metrics (s8.4).
 
 ## 9. Azure adapter: Block Blob only
 
@@ -1280,8 +1656,26 @@ exactly one wins.
    backend does not honor If-None-Match: *; refusing to start`. This
    prevents silent double-writes on backends that don't implement the
    precondition. Verified backends as of v1: AWS S3 (since 2024-08),
-   MinIO. VAST: confirmation required during Phase 2 (see
-   [plan.md#10-open-questions--risks](./plan.md#10-open-questions--risks)).
+   MinIO, VAST Cluster (**non-versioned buckets only**). VAST
+   documents that `If-None-Match: *` is honored on `PutObject` and
+   `CompleteMultipartUpload` against unversioned buckets but is NOT
+   supported on versioned buckets ([VAST KB: S3 Conditional
+   Writes][vast-kb-conditional-writes], 2026-01-26).
+4. **Startup versioning gate**: to prevent silent atomic-commit
+   failures the driver also issues `GetBucketVersioning(bucket)` at
+   boot. If the response indicates `Status: Enabled` OR
+   `Status: Suspended` (suspended also disables `If-None-Match`-
+   based atomic writes on AWS S3), the driver exits non-zero with
+   `cachestore/s3: bucket <name> has versioning enabled or
+   suspended; If-None-Match: * is not honored on versioned buckets
+   and the atomic-commit primitive cannot guarantee no-clobber.
+   Disable bucket versioning to use cachestore/s3.` Governed by
+   `cachestore.s3.require_unversioned_bucket` (default `true`;
+   never disabled in production). The gate emits
+   `origincache_s3_versioning_check_total{result="ok|refused"}` once
+   per boot.
+
+[vast-kb-conditional-writes]: https://kb.vastdata.com/documentation/docs/s3-conditional-writes
 
 ### 10.2 Catalog correctness, typed errors, circuit breaker
 
@@ -1309,7 +1703,7 @@ honors them distinctly:
 
 To prevent amplifying degradation under sustained backend failure, a
 **per-process CacheStore circuit breaker** wraps every `CacheStore`
-call. Defaults (configurable, see plan.md s5):
+call. Defaults (configurable):
 
 - `error_window: 30s`
 - `error_threshold: 10` (`ErrTransient` + `ErrAuth` count; `ErrNotFound`
@@ -1325,6 +1719,26 @@ closed; on any failure returns to open). Transitions are exposed as
 `origincache_cachestore_breaker_transitions_total{from,to}` and the
 current state as `origincache_cachestore_breaker_state` (0=closed,
 1=open, 2=half_open).
+
+**Access-frequency tracking on `Lookup`.** Per FW8 (s13.2), each
+`ChunkCatalog.Lookup` hit has a side effect: it increments the
+matched entry's `AccessCount` and updates `LastAccessed`. This data
+is consumed by the optional active-eviction loop (s13.2). The side
+effect is correctness-irrelevant: catalog `Lookup` continues to be
+safe to call from any goroutine; access counters are stored
+atomically. New entries Recorded by `ChunkCatalog.Record` start with
+`AccessCount=0` and `LastEntered=now`.
+
+**`CacheStore.Delete` breaker integration.** Active eviction
+(s13.2) calls `CacheStore.Delete` in the background. `Delete`
+errors count toward the same breaker as `Get` / `Put` errors:
+sustained `ErrTransient` or `ErrAuth` from `Delete` opens the
+breaker, which short-circuits subsequent writes (including the
+eviction loop's deletes). The eviction loop checks breaker state
+at run start and skips entirely if the breaker is open
+(`active_eviction_runs_total{result="breaker_open"}++`). This
+prevents the eviction loop from amplifying load against a
+degraded backend.
 
 ### 10.3 Range, sizes, and edge cases
 
@@ -1477,12 +1891,25 @@ replica without restarting it (so operators can inspect logs).
 `/readyz` and `/livez` are bound to the same client listener as the
 S3 API; they are NOT served on the internal listener (`:8444`,
 s8.8) because the internal listener's authorization scope is
-restricted to `/internal/fill`.
+restricted to internal RPCs (`/internal/fill`,
+`/internal/limiter/*`).
+
+**What is intentionally NOT a `/readyz` predicate.** The origin
+limiter authority's reachability (s8.4 / FW4) is intentionally NOT
+a readiness gate. A replica that has fallen back from authority-
+issued slot leases to the per-replica fallback cap is still
+serving correctly (origin concurrency is bounded, just less
+optimally). Marking such a replica NotReady would amplify a K8s
+API outage into a service outage. Sustained fallback is
+observable via `origincache_limiter_fallback_active=1` (per replica)
+and operators can alert on that gauge directly.
 
 ## 11. Bounded staleness contract
 
 OriginCache trusts an **operator contract** for correctness, and bounds
 the consequences of contract violation by configuration.
+
+### 11.1 The contract and the staleness window
 
 **The contract.** For a given `(origin_id, bucket, object_key)`, the
 underlying bytes are immutable for the life of the key. If the data
@@ -1523,15 +1950,132 @@ It does NOT catch a violation that happens between two complete
 request lifecycles within the same `metadata_ttl` window; the
 `metadata_ttl` cap is what bounds that case.
 
-**No background re-validation in v1.** A bounded-freshness mode (periodic
-background `Head` to refresh `etag` ahead of `metadata_ttl`) is Phase 4
-material, only if measured to be needed. The default posture is "trust
-the contract, cap the window".
+### 11.2 Bounded-freshness mode (optional)
+
+The default v1 posture is "trust the contract, cap the window". Some
+workloads benefit from shorter effective staleness windows on hot keys
+(typically: deployments where contract violations are operationally
+possible, or where TTL-boundary cold-miss latency on popular content
+is unacceptable). For those workloads, FW5 adds an opt-in
+**bounded-freshness mode** that proactively re-Heads hot keys ahead
+of `metadata_ttl`.
+
+**Opt-in via config**: `metadata_refresh.enabled: false` (default).
+When `false`, no background activity; the cache behaves exactly as
+described in s11.1.
+
+**Hot-key tracking**. Bounded-freshness mode requires per-entry access
+tracking on the metadata cache, parallel to the chunk-catalog access
+tracking from FW8 (s13.2). Each `MetadataCacheEntry` gains:
+- `AccessCount` (uint32, increments on Lookup hit)
+- `LastAccessed` (updated on Lookup hit)
+- `LastEntered` (set on Record; never updated)
+
+This tracking is independent of the chunk-catalog tracking; metadata
+hotness can diverge from chunk hotness (e.g., random-range reads
+access many chunks of one object).
+
+**Eligibility**. An entry is eligible for proactive refresh when ALL
+of:
+- `AccessCount >= access_threshold` (default 5; "hot" key)
+- `now - LastEntered >= refresh_ahead_ratio * metadata_ttl` (default
+  0.7 * 5m = 3.5m; approaching TTL)
+- `now - LastEntered < metadata_ttl` (still valid)
+- `now - LastEntered >= min_age` (default `metadata_ttl/4` = 75s;
+  cold-start protection)
+- no in-flight refresh for this key (per-replica HEAD singleflight,
+  s8.7, gates this)
+
+**Negative entries** (404, unsupported blob type) are NOT refreshed.
+Refreshing them would generate HEAD load to confirm a known-missing
+key; `negative_metadata_ttl` (default 60s, s12) handles the
+create-after-404 recovery instead.
+
+**Refresh loop**:
+
+```
+every metadata_refresh.interval:                          # default 1m
+  candidates = []
+  scan metadata cache:
+    for each entry e:
+      if eligible(e):
+        candidates.append(e)
+  sort candidates:
+    primary: highest AccessCount first
+    secondary: oldest LastEntered first
+  refresh_count = min(len(candidates), max_refreshes_per_run)  # 100
+  spawn refresh workers (concurrency: refresh_concurrency, default 8)
+  for first refresh_count entries:
+    result = Origin.Head(e.bucket, e.key)
+    case result of:
+      ok with same ETag:
+        metadata_cache.RefreshTTL(e.key)              # extend TTL
+        metric: metadata_refresh_total{result="ok"}++
+      ok with new ETag:
+        metadata_cache.Update(e.key, result)
+        metric: metadata_refresh_total{result="etag_changed"}++
+        metric: origin_etag_changed_total++           # existing metric
+        # old chunks orphaned; lifecycle / active eviction (s13)
+        # cleans up
+      err:
+        # don't extend TTL; entry expires naturally
+        metric: metadata_refresh_total{result="error"}++
+```
+
+**Origin HEAD load bound**. Per-replica per cycle: at most
+`max_refreshes_per_run` HEADs (default 100). Per minute (default
+interval): 100 HEADs. At 3 replicas: 300 HEADs/min. Negligible
+against documented S3 / Azure HEAD rate limits.
+
+The refresh workers compete for the existing **origin limiter**
+(s8.4) so they cannot starve on-demand fills. If the limiter is
+saturated, refresh requests queue with bounded wait and skip past
+timeout (`metric: metadata_refresh_total{result="skipped_limiter_busy"}`).
+
+**Effective staleness window** with bounded-freshness enabled:
+`refresh_ahead_ratio * metadata_ttl` for hot keys (default 3.5m).
+Cold keys still bounded by full `metadata_ttl` (default 5m). Negative
+entries bounded by `negative_metadata_ttl` (default 60s).
+
+**Cluster-wide HEAD bound** with bounded-freshness enabled: each
+replica refreshes its own metadata cache independently. With N
+replicas and H hot keys, refresh load is up to N*H HEADs per refresh
+cycle. The cluster-wide HEAD coordinator (deferred future work, see
+s15.2) would naturally absorb this load if N grows large enough to
+matter.
+
+**Failure modes**:
+- `Origin.Head` error during refresh: don't extend TTL; entry expires
+  naturally at `metadata_ttl`; on-demand miss re-Heads. Log + metric.
+- Origin limiter saturated: refresh worker times out; entry expires
+  naturally.
+- Loop hangs / crashes: metadata cache continues to age; entries
+  expire at `metadata_ttl`. Detected via
+  `metadata_refresh_runs_total` not advancing.
+- Refresh detects ETag change: metadata updated; old chunks orphaned;
+  active eviction (FW8 / s13.2) or CacheStore lifecycle handles
+  cleanup.
+
+**When to enable**:
+- Workload has identifiable hot keys with sub-`metadata_ttl`
+  staleness sensitivity.
+- Operators want shorter effective windows on popular content.
+- Origin can absorb the additional HEAD load (typically small for
+  bounded hot-key sets).
+
+**When to leave disabled (default)**:
+- Strict immutable-contract workload where `metadata_ttl` staleness
+  is acceptable.
+- Origin HEAD rate is constrained.
+- Hot-key set is unbounded (every key appears hot - refresh load
+  matches request load, defeating the purpose).
 
 Cross-references: [s2 Decisions / Consistency](#2-decisions),
 [s8.6 Failure handling](#86-failure-handling-without-re-stampede),
+[s8.7 Metadata-layer singleflight](#87-metadata-layer-singleflight),
 [s10.2 Catalog correctness](#102-catalog-correctness-typed-errors-circuit-breaker),
-[s12 Create-after-404 and negative-cache lifecycle](#12-create-after-404-and-negative-cache-lifecycle).
+[s12 Create-after-404 and negative-cache lifecycle](#12-create-after-404-and-negative-cache-lifecycle),
+[s13.2 Active eviction](#132-active-eviction-opt-in-access-frequency).
 
 ## 12. Create-after-404 and negative-cache lifecycle
 
@@ -1546,9 +2090,10 @@ that" case.
 
 This is operationally indistinguishable from a contract violation
 (s11): from the client's perspective, the bytes for `K` changed
-without the cache being told. There is no event-driven invalidation
-in v1 (deferred to Phase 4); the cache can only bound how long it
-serves the stale `404`.
+without the cache being told. Event-driven origin invalidation is
+intentionally not in v1 scope (the immutable-origin contract makes
+it unnecessary for the documented workload); the cache can only
+bound how long it serves the stale `404`.
 
 ### 12.2 Two TTLs (positive vs negative)
 
@@ -1587,10 +2132,10 @@ After an operator uploads a previously-missing key:
   load balancing, clients can see alternating `404` / `200`
   responses during the drain window (Diagram 10).
 
-There is no active invalidation in v1. Operator workaround: wait
-`negative_metadata_ttl` after upload before announcing the key. An
-admin-invalidation RPC is a Phase 4 deliverable
-([plan.md s7](./plan.md#7-phased-delivery)).
+There is no active invalidation in v1: neither event-driven
+invalidation (origin-pushed) nor an admin-invalidation RPC is in
+v1 scope. Operator workaround: wait `negative_metadata_ttl` after
+upload before announcing the key.
 
 ### 12.4 Defense-in-depth and observability
 
@@ -1657,49 +2202,187 @@ sequenceDiagram
 
 ## 13. Eviction and capacity
 
-Eviction is delegated to the CacheStore's storage system (e.g. VAST or S3
-lifecycle policies). Recommended baseline is age-based expiration on the
-chunk prefix with a TTL chosen to fit the deployment's working set in the
-available capacity. Operators tune the TTL based on
-`origincache_origin_bytes_total` and capacity utilization metrics exposed
-by the CacheStore. Because the on-store path is namespaced by
-`origin_id` (s5), per-origin lifecycle policies can be configured
-independently on the same CacheStore bucket.
+Two complementary mechanisms govern CacheStore footprint in v1:
+**passive lifecycle eviction** (always on, driver-dependent) and
+**optional active eviction** by the cache layer itself (opt-in,
+access-frequency-driven). Operators choose one, the other, or both
+depending on CacheStore driver and workload.
 
-**`cachestore/posixfs` deployments**. Shared POSIX filesystems
-(NFSv4.1+, Weka native, CephFS, Lustre, GPFS) do not provide native
-object-lifecycle policies. The cache layer ships no automatic
-posixfs eviction in v1; operators MUST schedule an external cleanup
-mechanism. The recommended baseline is an age-based sweep against
-`<root>/<origin_id>/` from cron or a Kubernetes `CronJob` (e.g.
-`find <root>/<origin_id> -type f -atime +<n> -delete`). The sweep
-runs out-of-band; the cache layer does not need to be aware of it,
-because a `CacheStore.GetChunk` on a swept entry returns
-`ErrNotFound` and re-enters the miss-fill path. Operators SHOULD
-NOT sweep the staging subdirectory `<root>/.staging/` - that is
-managed by the driver's own background sweep
-(`cachestore.posixfs.staging_max_age`, default 1h, s10.1.2).
+### 13.1 Passive eviction (lifecycle)
 
-The cache layer itself does not evict CacheStore objects in v1. The
-in-memory `ChunkCatalog` uses a fixed-size LRU; entries falling out of it
-are not evicted from the CacheStore, only from the metadata cache - a
-subsequent request will rediscover the chunk via `CacheStore.Stat`.
+Eviction is delegated to the CacheStore's storage system in the
+default v1 configuration. Recommended baseline is age-based
+expiration on the chunk prefix with a TTL chosen to fit the
+deployment's working set in the available capacity. Operators tune
+the TTL based on `origincache_origin_bytes_total` and capacity
+utilization metrics exposed by the CacheStore. Because the
+on-store path is namespaced by `origin_id` (s5), per-origin
+lifecycle policies can be configured independently on the same
+CacheStore bucket.
 
-The local **spool** (s8.2) is bounded by `spool.max_bytes`; full-spool
-conditions block new fills briefly, then return `503 Slow Down` to
-clients. Spool entries are released as soon as in-flight readers drain.
+**`cachestore/s3` deployments**: AWS S3, MinIO, and VAST all
+support bucket lifecycle policies for age-based expiration.
+Configure the lifecycle directly on the bucket (or delegate to the
+in-DC object store's tooling).
 
-**Capacity impact of `chunk_size` config changes.** See the
-operational note in [s5](#5-chunk-model): changing `chunk_size`
-orphans the existing chunk set under the old size; storage
-transiently doubles and the working set is rebuilt at the new size
-on demand. The CacheStore lifecycle policy (or, on `posixfs`, the
-operator's external sweep above) ages the orphaned chunks out.
+**`cachestore/posixfs` deployments**: shared POSIX filesystems
+(NFSv4.1+, Weka native, CephFS, Lustre, GPFS) do not provide
+native object-lifecycle policies. Two options for posixfs:
+- **External sweep**: schedule an age-based sweep against
+  `<root>/<origin_id>/` from cron or a Kubernetes `CronJob` (e.g.
+  `find <root>/<origin_id> -type f -atime +<n> -delete`). The
+  sweep runs out-of-band; `CacheStore.GetChunk` on a swept entry
+  returns `ErrNotFound` and re-enters the miss-fill path.
+  Operators SHOULD NOT sweep the staging subdirectory
+  `<root>/.staging/` - that is managed by the driver's own
+  background sweep (`cachestore.posixfs.staging_max_age`, default
+  1h, s10.1.2).
+- **Active eviction** (s13.2): enable the cache layer's
+  access-frequency-driven eviction loop. This is the recommended
+  posixfs path when external sweep tooling is impractical.
 
-Future work (Phase 4): if hot-chunk re-fetch from origin caused by
-lifecycle eviction proves material, add an in-cache access-tracking layer
-inside the `chunkcatalog` package and an opt-in active-eviction loop. This
-does not affect any other interface in the system.
+### 13.2 Active eviction (opt-in, access-frequency)
+
+When `chunk_catalog.active_eviction.enabled: true` (default
+`false`), each replica runs a background eviction loop that
+deletes cold chunks from BOTH the in-memory `ChunkCatalog` AND
+the CacheStore. The decision uses **access-frequency tracking**
+recorded in the catalog on every `Lookup` hit.
+
+**Per-entry tracking** added by FW8 to each `ChunkCatalogEntry`:
+
+```go
+type ChunkCatalogEntry struct {
+    ChunkInfo
+    AccessCount  uint32     // increments on each Lookup hit;
+                            // saturates at MaxUint32 (practically
+                            // unreachable)
+    LastAccessed time.Time  // updated on each Lookup hit
+    LastEntered  time.Time  // set on Record; never updated
+}
+```
+
+**Eviction policy**: a chunk is eligible for active eviction when
+ALL of:
+- `now - LastAccessed > inactive_threshold` (default 24h)
+- `AccessCount < access_threshold` (default 5)
+- `now - LastEntered >= min_age` (default 5m, cold-start protection
+  preventing newly-recorded entries from being evicted before they
+  accumulate hits)
+
+**Score** for ordering candidates (lowest first = most evictable):
+- primary: `AccessCount`
+- tiebreak: oldest `LastAccessed`
+
+**Loop**: every `eviction_interval` (default 10m), scan the
+catalog, identify eligible candidates, sort by score, evict up to
+`max_evictions_per_run` (default 1000) per cycle. For each
+evicted entry: call `CacheStore.Delete(k)`, then
+`ChunkCatalog.Forget(k)` on success. Bounded per-run cost
+prevents pathological delete-storms on a large catalog; the next
+cycle catches the remainder.
+
+**Failure handling**:
+- `Delete` returns `ErrNotFound` (already gone) - treat as success
+  and Forget.
+- `Delete` returns `ErrTransient` - do NOT Forget; retry next
+  cycle. Counter feeds the existing per-process circuit breaker
+  (s10.2).
+- `Delete` returns `ErrAuth` - stop the entire run; do NOT
+  Forget; metric increments. Circuit breaker integrates as usual.
+- Circuit breaker open - skip the eviction run entirely
+  (`active_eviction_runs_total{result="breaker_open"}++`) to
+  avoid amplifying load against a degraded backend.
+
+**Counter saturation, no decay in v1**: AccessCount is `uint32`
+and saturates at ~4 billion (practically unreachable). New entries
+start at 0 and must compete with old popular entries once past
+`min_age`. The cold-start protection covers this; for steady-state
+workloads the relative ordering remains correct.
+
+### 13.3 ChunkCatalog size awareness (load-bearing operational note)
+
+The ChunkCatalog is the active-eviction policy's window into
+chunk activity. Its size relative to the CacheStore working set
+determines eviction quality:
+
+- **catalog == working set**: full visibility; eviction policy
+  considers every chunk; quality is optimal.
+- **catalog < working set**: many chunks live in the CacheStore
+  but are NOT tracked by the catalog. They cannot be considered
+  for active eviction; they live indefinitely until external
+  lifecycle (if any) cleans them up. Active eviction has
+  incomplete visibility; effective behavior is "evict from the
+  visible subset only".
+- **catalog > working set**: wasted RAM but no correctness or
+  eviction-quality cost.
+
+**Sizing guidance for operators**:
+
+```
+target_catalog_entries = 1.2 * estimated_active_working_set_chunks
+                       (where chunk = chunk_size, default 8 MiB)
+
+memory_estimate = target_catalog_entries * ~120 bytes/entry
+```
+
+| Active working set | Chunks at 8 MiB | Catalog entries | RAM (~120 B/entry) |
+|---|---|---|---|
+| 100 GiB | ~13K | 16K | ~2 MB |
+| 1 TiB | ~130K | 160K | ~20 MB |
+| 10 TiB | ~1.3M | 1.6M | ~190 MB |
+| 100 TiB | ~13M | 16M | ~1.9 GB |
+
+For very large working sets (>1 PiB at 8 MiB chunks), operators
+should consider one of:
+- larger `chunk_size` (e.g., 16 MiB) to reduce catalog entry count
+  by half (note: changing `chunk_size` orphans the existing chunk
+  set, see s5);
+- disabling active eviction and relying on CacheStore lifecycle
+  exclusively (the default v1 posture);
+- a future external/persistent catalog (deferred future work,
+  not in v1).
+
+**Metrics for detecting undersizing**:
+- `origincache_chunk_catalog_hit_rate` (derived from `_hit_total`):
+  sustained < 0.7 suggests undersizing.
+- `origincache_chunk_catalog_evict_total{reason="size"}`: high
+  rate means LRU eviction is fighting the access-frequency policy;
+  catalog is too small.
+- `origincache_chunk_catalog_entries`: pinned at `max_entries`
+  may indicate undersizing.
+
+### 13.4 Spool capacity
+
+The local **spool** (s8.2) is bounded by `spool.max_bytes`;
+full-spool conditions block new fills briefly, then return `503
+Slow Down` to clients. Spool entries are released as soon as
+in-flight readers drain. Spool capacity is independent of the
+ChunkCatalog and CacheStore footprint.
+
+### 13.5 `chunk_size` config-change capacity impact
+
+See the operational note in [s5](#5-chunk-model): changing
+`chunk_size` orphans the existing chunk set under the old size;
+storage transiently doubles and the working set is rebuilt at the
+new size on demand. The CacheStore lifecycle policy (or, on
+posixfs with active eviction enabled, the access-frequency loop
+detecting the orphans as cold) ages the orphaned chunks out.
+
+### 13.6 Eviction interactions
+
+Operators using BOTH passive lifecycle AND active eviction need
+to understand the interaction:
+- Lifecycle deletes a chunk -> active eviction sees `ErrNotFound`
+  on `Delete`; treats as success. No conflict.
+- Active eviction deletes a chunk -> lifecycle sees it gone. No
+  conflict.
+- Both aggressive on the same chunk -> "double eviction" with no
+  correctness impact, but the chunk is gone slightly faster than
+  either policy alone would have removed it. Operators should
+  pick one as the primary mechanism and configure the other as
+  defense-in-depth (e.g., long lifecycle TTL + short active
+  eviction `inactive_threshold`).
 
 ## 14. Horizontal scale
 
@@ -1720,12 +2403,25 @@ Pod names are not stable under a Deployment; we never address peers by
 name, only by the IPs the headless Service publishes.
 
 We accept up to one duplicate fill per chunk during membership flux (e.g.
-rolling restarts when a pod's IP changes); the duplicate-fill metric (see
-[plan.md#6-observability](./plan.md#6-observability)) makes that visible.
+rolling restarts when a pod's IP changes); the duplicate-fill metric
+makes that visible.
 
 Replication factor = 1 in v1 (cache loss is recoverable from origin).
-Optional R=2 for hot chunks deferred to Phase 4. Every replica sees the
-entire CacheStore. No replica owns bytes; replica loss never strands data.
+Every replica sees the entire CacheStore. No replica owns bytes;
+replica loss never strands data.
+
+**Limiter authority changeover.** A separate coordinator role - the
+**limiter authority** (s8.4) - is elected via a Kubernetes Lease,
+distinct from the rendezvous-hashed chunk and (deferred) HEAD
+coordinators. When the elected authority dies or its `Lease`
+expires (default `lease.duration=15s`), a new authority is elected
+and starts with an empty slot table. Outstanding lease tokens
+issued by the old authority drain naturally as their TTL expires
+(default `token.ttl=30s`); during this window cluster-wide
+concurrent `Origin.GetRange` may transiently exceed `target_global`
+by up to one full set of tokens. Worst-case overshoot duration:
+`lease.duration + token.ttl` = 45s with defaults. Acceptable
+because the limiter is a soft cap; correctness is unaffected.
 
 **Empty / unavailable peer set.** If `Cluster.Peers()` returns an
 empty set (the headless Service has no Ready endpoints, the DNS
@@ -1787,3 +2483,119 @@ sequenceDiagram
     Note over A,Bp: duplicate_fills_total{commit_lost} += 1
     Note over A,DNS: t=10s  A refreshes DNS<br/>peers converge to {A, B'}<br/>steady state restored
 ```
+
+## 15. Deferred optimizations
+
+This section catalogs concerns that are intentionally NOT in v1. Each
+entry names what is deferred, why v1 ships without it, what operational
+evidence would justify building it, and a sketch of how it would fit
+into the existing surface area. None of these items require breaking
+changes to v1 interfaces.
+
+### 15.1 Edge rate limiting
+
+**What**: Per-client / per-IP / per-credential token-bucket rate
+limiting at the S3 edge; '429 Too Many Requests' on exhaustion;
+identity from auth subject (mTLS cert subject or bearer-token claim)
+with source-IP fallback when no auth identity is established.
+
+**Why deferred**: v1 has implicit hot-client mitigation - the per-
+replica origin semaphore (s8.4 / FW4) and singleflight (s8.1)
+coalesce concurrent identical work and cap cold-fill concurrency
+regardless of caller. No measured noisy-neighbor evidence at v1
+scale; cost of building edge rate limiting (token-bucket per
+identity, identity extraction, new HTTP error path, new metric)
+outweighs the speculative benefit.
+
+**Trigger**: Operator reports a single client / credential is
+measurably monopolizing TTFB or driving disproportionate origin
+load past internal mechanisms.
+
+**Sketch (if built)**: Token bucket per identity in
+`internal/origincache/server/edgelimit/`; refill rate per identity
+configurable; per-replica enforcement (no cluster-wide
+coordination); returns `429 Too Many Requests` with
+`Retry-After: 1s`. New metric
+`origincache_edge_ratelimit_total{identity,result}`.
+
+**Known v1 limitation**: documented gap. Multi-tenant deployments
+worried about single-client monopolization should layer rate
+limiting at an upstream proxy or LB until this lands.
+
+### 15.2 Cluster-wide HEAD singleflight
+
+**What**: A second coordinator role parallel to the chunk fill
+coordinator (s8.3): rendezvous-hash on `(origin_id, bucket, key)`
+to pick exactly one HEAD coordinator per object per cluster. New
+`/internal/head` RPC. After: exactly one `Origin.Head` per object
+per `metadata_ttl` window cluster-wide.
+
+**Why deferred**: Per-replica HEAD singleflight (s8.7) caps
+cluster-wide HEAD load at `N * (objects / metadata_ttl)`. At
+documented v1 scale (3-5 replicas, 5m TTL), this is well under
+documented S3 / Azure HEAD rate limits. Savings only become
+material at much larger scale.
+
+**Trigger**: any of:
+- peer-set size exceeds ~10 replicas, AND keys cluster under
+  shared prefixes approaching per-prefix rate limits (5500/sec on
+  AWS S3);
+- `metadata_ttl` configured short enough that HEAD storms repeat
+  frequently;
+- operator measures HEAD throttling on origin.
+
+**Sketch (if built)**: New `ObjectKey = {origin_id, bucket,
+object_key}` type. New `Cluster.HeadCoordinator(ObjectKey) Peer`
+parallel to `Coordinator(ChunkKey) Peer`. New
+`InternalClient.Head(ctx, ObjectKey) (ObjectInfo, error)`. New
+endpoint `GET /internal/head?origin_id=...&bucket=...&key=...` on
+existing internal listener (s8.8); reuses mTLS + peer-IP authz.
+Same `409 Conflict` membership-flux fallback as chunk fill.
+Coordinator-unreachable degrades to local `Origin.Head`. New
+`cluster_internal_head_*` metrics. The bounded-freshness mode
+(s11.2) would naturally route its background HEADs through this
+same coordinator pattern.
+
+**Known v1 bound**: at N replicas and `metadata_ttl=5m`, cold
+popular-key fan-out generates **N HEADs per object per 5 minutes
+cluster-wide**. Documented and acceptable at v1 scale.
+
+### 15.3 Cluster-wide LIST coordinator
+
+**What**: Extend FW2's coordinator pattern to LIST: rendezvous-
+hash on the full LIST query tuple `(origin_id, bucket, prefix,
+continuation_token, start_after, delimiter, max_keys)` to pick
+one coordinator per query per cluster. New `/internal/list` RPC.
+Coordinator's per-replica LIST cache (s6.2) becomes the de facto
+cluster cache. After: exactly one `Origin.List` per identical
+query per `list_cache.ttl` cluster-wide.
+
+**Why deferred**: v1 ships with per-replica LIST cache (s6.2,
+default 60s TTL). For the documented FUSE-`ls` workload, FUSE
+clients are typically pinned to one replica via HTTP/2 keepalive,
+making per-replica caching naturally effective for any single
+client. Across many clients sharing prefixes, per-replica caching
+holds origin LIST load to N per popular prefix per
+`list_cache.ttl` window - well under any documented rate limit
+at v1 scale.
+
+**Trigger**: any of:
+- peer-set size exceeds ~10 replicas, AND
+- highly-shared FUSE prefixes, AND
+- tight `ls` latency budgets (so the additional 5-20ms internal-
+  RPC hop is acceptable in trade for reduced origin load);
+- OR operator measures sustained LIST throttling on origin.
+
+**Sketch (if built)**: Symmetric to s15.2. New
+`Cluster.ListCoordinator(ListKey) Peer`. New
+`InternalClient.List` RPC. Coordinator runs the LIST cache and
+the existing per-replica LIST singleflight; non-coordinators
+route to it on cache miss. Same `409 Conflict` membership-flux
+fallback. Coordinator-unreachable degrades to local
+`Origin.List`. The internal-RPC latency overhead matters more
+for FUSE-`ls` than chunk fills, so caching at the coordinator
+must be aggressive (TTL >= 60s).
+
+**Known v1 bound**: cluster-wide LIST load is up to N origin LIST
+calls per identical query per `list_cache.ttl` window where N is
+peer count. Acceptable at v1 scale.

@@ -3,7 +3,7 @@
 A short brief intended for technical leads who need to understand the
 shape of the system, the load-bearing decisions, and what is in v1
 without wading through the full design. Drill-down references point at
-[design.md](./design.md) and [plan.md](./plan.md).
+[design.md](./design.md).
 
 ## 1. Problem and approach
 
@@ -11,8 +11,10 @@ Cloud blob origins (AWS S3, Azure Blob) are slow and expensive when
 read from on-prem at scale. The intended workload is large immutable
 artifacts (job inputs, model weights, training shards) read by
 thousands of clients with strongly correlated cold starts (job
-launches, distributed-training kickoffs). Naive direct access
-stampedes origin egress and cost.
+launches, distributed-training kickoffs), including FUSE-mounted
+filesystems where edge clients perform interactive `ls` and
+directory navigation. Naive direct access stampedes origin egress
+and cost.
 
 OriginCache is a read-only S3-compatible HTTP cache deployed inside
 the on-prem datacenter as a multi-replica Kubernetes Deployment
@@ -207,6 +209,13 @@ a client already saw a 404 on it): at most one `negative_metadata_ttl`
 window per replica that observed the original 404 (default 60s)
 before the cache reflects the upload. See
 [design.md s12](./design.md#12-create-after-404-and-negative-cache-lifecycle).
+Operators with workloads requiring shorter effective windows on hot
+keys can opt into a **bounded-freshness mode** (default off): a
+per-replica background loop proactively re-Heads frequently-
+accessed keys ahead of `metadata_ttl`, shrinking the effective
+window for those keys to `refresh_ahead_ratio * metadata_ttl`
+(default 3.5m). See
+[design.md s11.2](./design.md#112-bounded-freshness-mode-optional).
 
 ## 6. Backing-store options
 
@@ -285,26 +294,31 @@ sequenceDiagram
    a network FS silently destroys the TTFB guarantee; the override
    is intentionally test-only. See
    [design.md s10.4](./design.md#104-spool-locality-contract).
-4. **Per-replica origin semaphore is approximate** - Each replica
-   enforces `floor(target_global / N_replicas)`. Realized
-   cluster-wide concurrency can transiently exceed `target_global`
-   during membership flux. A real distributed limiter is Phase 4.
-   See [plan.md s10](./plan.md#10-open-questions--risks).
+4. **Limiter authority changeover overshoot** - Origin concurrency
+   is capped cluster-wide via a Kubernetes-Lease-elected limiter
+   authority. When the elected authority dies, the new authority
+   starts with an empty slot table while old slot-lease tokens at
+   peers continue draining; cluster-wide inflight may transiently
+   exceed `target_global` for up to one
+   `lease.duration + token.ttl` window (default 45s). When the
+   authority is unreachable, peers gracefully fall back to a
+   per-replica static cap. See
+   [design.md s8.4](./design.md#84-origin-backpressure).
 5. **POSIX backend hardening** - NFS exports MUST be `sync` (not
    `async`); Weka NFS `link()`/`EEXIST` is not docs-confirmed and
    is gated by `SelfTestAtomicCommit` at boot; Alluxio FUSE is
    hard-refused with a documented workaround
    (`cachestore.driver: s3` against the Alluxio S3 gateway). See
-   [design.md s10.1.2](./design.md#1012-cachestoreposixfs) and
-   [plan.md s10](./plan.md#10-open-questions--risks).
+   [design.md s10.1.2](./design.md#1012-cachestoreposixfs).
 6. **Create-after-404 staleness** - A key uploaded after clients
    already observed it as `404` will return stale `404` for up to
    `negative_metadata_ttl` (default 60s) per replica that observed
    the original miss. Round-robin LB can produce alternating `404`
-   / `200` during the drain. No event-driven invalidation in v1;
-   admin-invalidation RPC is Phase 4. Mitigation: short default
-   TTL, `metadata_negative_*` metrics, runbook instructs operators
-   to wait the TTL after uploading a previously-missing key. See
+   / `200` during the drain. No event-driven invalidation or admin-
+   invalidation in v1 (the immutable-origin contract makes them
+   unnecessary for the documented workload); operators must wait
+   the TTL after uploading a previously-missing key. Mitigation:
+   short default TTL, `metadata_negative_*` metrics. See
    [design.md s12](./design.md#12-create-after-404-and-negative-cache-lifecycle).
 
 ## 9. Where to go next
@@ -314,18 +328,18 @@ sequenceDiagram
 - [s3 Terminology](./design.md#3-terminology) - full glossary.
 - [s4 Architecture and onward](./design.md#4-architecture) -
   architecture, request flow, internal interfaces, stampede protection.
+- [s8.4 Origin backpressure](./design.md#84-origin-backpressure) -
+  K8s-Lease-elected limiter authority and graceful fallback.
 - [s10.1 Atomic commit per driver](./design.md#101-atomic-commit-per-cachestore-driver)
 - [s11 Bounded staleness](./design.md#11-bounded-staleness-contract)
+  - [s11.2 Bounded-freshness mode (optional)](./design.md#112-bounded-freshness-mode-optional)
 - [s12 Create-after-404 and negative-cache lifecycle](./design.md#12-create-after-404-and-negative-cache-lifecycle)
-- 12 inline mermaid diagrams covering hits, misses, cross-replica
-  fills, atomic commit, create-after-404 timeline, and membership flux.
-
-`plan.md` (build + ops):
-- [s3 Repo layout](./plan.md#3-repo-layout-mirrors-machina)
-- [s5 Configuration](./plan.md#5-configuration-shape) - full config keys.
-- [s6 Observability](./plan.md#6-observability) - full metric set.
-- [s7 Phased delivery](./plan.md#7-phased-delivery) - per-phase DoD.
-- [s8 Test strategy](./plan.md#8-test-strategy)
-- [s10 Risks](./plan.md#10-open-questions--risks) - full risk register.
-- [s11 Approval checklist](./plan.md#11-approval-checklist) - the
-  sign-off list before Phase 0 starts.
+- [s13 Eviction and capacity](./design.md#13-eviction-and-capacity) -
+  passive lifecycle and optional active eviction; ChunkCatalog
+  size-awareness operational guidance.
+- [s15 Deferred optimizations](./design.md#15-deferred-optimizations) -
+  v1 scope-discipline catalog (edge rate limiting, cluster-wide HEAD
+  singleflight, cluster-wide LIST coordinator).
+- 13 inline mermaid diagrams covering hits, misses, cross-replica
+  fills, atomic commit, create-after-404 timeline, membership flux,
+  and limiter authority lifecycle.
