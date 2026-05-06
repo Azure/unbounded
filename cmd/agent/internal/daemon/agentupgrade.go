@@ -18,7 +18,6 @@ import (
 
 const (
 	agentUpgradeDownloadURLParameter = "downloadURL"
-	agentBinaryArchiveName           = "unbounded-agent"
 )
 
 func agentUpgradeDownloadURL(parameters map[string]string) (string, error) {
@@ -31,35 +30,43 @@ func agentUpgradeDownloadURL(parameters map[string]string) (string, error) {
 }
 
 func upgradeDaemonBinary(ctx context.Context, log *slog.Logger, downloadURL string) error {
-	currentTarget, err := resolveSymlink(daemonBinaryCurrentPath())
+	paths := daemonAgentUpgradePaths()
+	currentTarget, err := resolveSymlink(paths.CurrentPath)
 	if err != nil {
 		return fmt.Errorf("resolve current daemon binary symlink: %w", err)
 	}
+	upgrade := paths.ResolveAgentUpgrade(downloadURL, currentTarget)
 
-	inactivePath := daemonBinaryBluePath()
-	if currentTarget == daemonBinaryBluePath() {
-		inactivePath = daemonBinaryGreenPath()
+	if err := agentbinary.InstallFromTarGz(ctx, upgrade.DownloadURL, upgrade.TargetBinaryPath, upgrade.BinaryName, upgrade.BinaryMode); err != nil {
+		return fmt.Errorf("install upgraded daemon binary to %s: %w", upgrade.TargetBinaryPath, err)
 	}
 
-	if err := agentbinary.InstallFromTarGz(ctx, downloadURL, inactivePath, agentBinaryArchiveName, 0o755); err != nil {
-		return fmt.Errorf("install upgraded daemon binary to %s: %w", inactivePath, err)
-	}
-
-	if err := updateSymlink(daemonBinaryLastGoodPath(), currentTarget); err != nil {
+	if err := updateSymlink(upgrade.LastGoodLinkPath, upgrade.PreviousBinaryPath); err != nil {
 		return fmt.Errorf("update last-good daemon symlink: %w", err)
 	}
 
-	if err := updateSymlink(daemonBinaryCurrentPath(), inactivePath); err != nil {
+	if err := updateSymlink(upgrade.CurrentLinkPath, upgrade.TargetBinaryPath); err != nil {
 		return fmt.Errorf("update current daemon symlink: %w", err)
 	}
 
 	log.Info("staged upgraded daemon binary",
-		"url", downloadURL,
-		"previous", currentTarget,
-		"current", inactivePath,
+		"url", upgrade.DownloadURL,
+		"previous", upgrade.PreviousBinaryPath,
+		"current", upgrade.TargetBinaryPath,
 	)
 
 	return nil
+}
+
+func daemonAgentUpgradePaths() goalstates.AgentUpgradePaths {
+	paths := goalstates.DefaultAgentUpgradePaths()
+	paths.BinaryPath = daemonBinaryPath()
+	paths.BluePath = daemonBinaryBluePath()
+	paths.GreenPath = daemonBinaryGreenPath()
+	paths.CurrentPath = daemonBinaryCurrentPath()
+	paths.LastGoodPath = daemonBinaryLastGoodPath()
+
+	return paths
 }
 
 func resolveSymlink(path string) (string, error) {

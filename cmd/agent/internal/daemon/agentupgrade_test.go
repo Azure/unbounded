@@ -180,7 +180,7 @@ func TestUpgradeDaemonBinary_SequentialFailureThenSuccess(t *testing.T) {
 func TestDownloadAgentBinaryFromTarGz_RejectsUnsupportedScheme(t *testing.T) {
 	t.Parallel()
 
-	err := agentbinary.InstallFromTarGz(context.Background(), "file:///tmp/unbounded-agent.tar.gz", filepath.Join(t.TempDir(), "agent"), agentBinaryArchiveName, 0o755)
+	err := agentbinary.InstallFromTarGz(context.Background(), "file:///tmp/unbounded-agent.tar.gz", filepath.Join(t.TempDir(), "agent"), goalstates.AgentUpgradeBinaryName, 0o755)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unsupported agent download URL scheme")
 }
