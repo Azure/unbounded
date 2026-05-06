@@ -557,31 +557,39 @@ def _build_agent_upgrade_tarball(tarball: Path) -> None:
 def _build_failing_agent_tarball(tarball: Path) -> None:
     """Package a deliberately failing executable as an agent upgrade tarball."""
 
-    build_dir = tarball.parent / "agent-upgrade-bad"
-    shutil.rmtree(build_dir, ignore_errors=True)
-    build_dir.mkdir(parents=True)
-    agent_path = build_dir / "unbounded-agent"
-    agent_path.write_text("#!/bin/sh\necho failing upgraded agent >&2\nexit 42\n")
-    agent_path.chmod(0o755)
-    run(["tar", "-czf", str(tarball), "-C", str(build_dir), "unbounded-agent"])
+    _build_script_agent_tarball(
+        tarball,
+        "agent-upgrade-bad",
+        "#!/bin/sh\n"
+        "echo failing upgraded agent >&2\n"
+        "exit 42\n",
+    )
 
 
 def _build_daemon_failing_agent_tarball(tarball: Path) -> None:
     """Package an executable that passes preflight but fails as the daemon."""
 
-    build_dir = tarball.parent / "agent-upgrade-daemon-bad"
-    shutil.rmtree(build_dir, ignore_errors=True)
-    build_dir.mkdir(parents=True)
-    agent_path = build_dir / "unbounded-agent"
-    agent_path.write_text(
+    _build_script_agent_tarball(
+        tarball,
+        "agent-upgrade-daemon-bad",
         "#!/bin/sh\n"
         "if [ \"${1:-}\" = \"version\" ]; then\n"
         "    echo unbounded-agent e2e-daemon-failing\n"
         "    exit 0\n"
         "fi\n"
         "echo failing upgraded agent daemon >&2\n"
-        "exit 42\n"
+        "exit 42\n",
     )
+
+
+def _build_script_agent_tarball(tarball: Path, build_name: str, script: str) -> None:
+    """Package script content as the agent binary in an upgrade tarball."""
+
+    build_dir = tarball.parent / build_name
+    shutil.rmtree(build_dir, ignore_errors=True)
+    build_dir.mkdir(parents=True)
+    agent_path = build_dir / "unbounded-agent"
+    agent_path.write_text(script)
     agent_path.chmod(0o755)
     run(["tar", "-czf", str(tarball), "-C", str(build_dir), "unbounded-agent"])
 

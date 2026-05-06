@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -375,5 +376,9 @@ func writeAgentArchive(w io.Writer, binary []byte) error {
 }
 
 func agentArchiveScript(version string, exitCode int) []byte {
-	return []byte(fmt.Sprintf("#!/bin/sh\necho %s\nexit %d\n", version, exitCode))
+	return []byte(fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' %s\nexit %d\n", shellQuote(version), exitCode))
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
