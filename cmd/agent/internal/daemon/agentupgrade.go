@@ -59,14 +59,13 @@ func upgradeDaemonBinary(ctx context.Context, log *slog.Logger, downloadURL stri
 }
 
 func daemonAgentUpgradePaths() goalstates.AgentUpgradePaths {
-	paths := goalstates.DefaultAgentUpgradePaths()
-	paths.BinaryPath = daemonBinaryPath()
-	paths.BluePath = daemonBinaryBluePath()
-	paths.GreenPath = daemonBinaryGreenPath()
-	paths.CurrentPath = daemonBinaryCurrentPath()
-	paths.LastGoodPath = daemonBinaryLastGoodPath()
-
-	return paths
+	return goalstates.AgentUpgradePaths{
+		BinaryPath:   daemonBinaryPath(),
+		BluePath:     daemonBinaryBluePath(),
+		GreenPath:    daemonBinaryGreenPath(),
+		CurrentPath:  daemonBinaryCurrentPath(),
+		LastGoodPath: daemonBinaryLastGoodPath(),
+	}
 }
 
 func resolveSymlink(path string) (string, error) {
