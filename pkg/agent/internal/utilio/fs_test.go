@@ -133,3 +133,27 @@ func TestUpdateSymlink(t *testing.T) {
 		t.Fatalf("second target = %q, want %q", target, secondTarget)
 	}
 }
+
+func TestGetEnvOrDefault(t *testing.T) {
+	t.Run("default when unset", func(t *testing.T) {
+		if got := GetEnvOrDefault("UNBOUNDED_TEST_UNSET", "default"); got != "default" {
+			t.Fatalf("GetEnvOrDefault() = %q, want %q", got, "default")
+		}
+	})
+
+	t.Run("trimmed value when set", func(t *testing.T) {
+		t.Setenv("UNBOUNDED_TEST_SET", " value ")
+
+		if got := GetEnvOrDefault("UNBOUNDED_TEST_SET", "default"); got != "value" {
+			t.Fatalf("GetEnvOrDefault() = %q, want %q", got, "value")
+		}
+	})
+
+	t.Run("default when blank", func(t *testing.T) {
+		t.Setenv("UNBOUNDED_TEST_BLANK", " ")
+
+		if got := GetEnvOrDefault("UNBOUNDED_TEST_BLANK", "default"); got != "default" {
+			t.Fatalf("GetEnvOrDefault() = %q, want %q", got, "default")
+		}
+	})
+}

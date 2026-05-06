@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // IsDirEmpty reports whether dir is empty or does not exist.
@@ -78,7 +79,7 @@ func UpdateSymlink(linkPath, targetPath string) error {
 	}
 
 	base := filepath.Base(linkPath)
-	tmpDir, err := os.MkdirTemp(dir, ".tmp.*")
+	tmpDir, err := os.MkdirTemp(dir, ".symlink-tmp.*")
 	if err != nil {
 		return err
 	}
@@ -90,4 +91,14 @@ func UpdateSymlink(linkPath, targetPath string) error {
 	}
 
 	return os.Rename(tmpPath, linkPath)
+}
+
+// GetEnvOrDefault returns a trimmed environment variable value, or defaultValue
+// when the variable is unset or blank.
+func GetEnvOrDefault(name, defaultValue string) string {
+	if value := strings.TrimSpace(os.Getenv(name)); value != "" {
+		return value
+	}
+
+	return defaultValue
 }

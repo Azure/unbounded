@@ -35,8 +35,7 @@ func agentUpgradeDownloadURL(parameters map[string]string) (string, error) {
 
 func upgradeDaemonBinary(ctx context.Context, log *slog.Logger, downloadURL string) error {
 	paths := goalstates.ResolvedAgentUpgradePaths()
-	currentFallbackPath := paths.BinaryPath
-	currentTarget, err := resolveSymlink(paths.CurrentPath, currentFallbackPath)
+	currentTarget, err := resolveSymlink(paths.CurrentPath, paths.BinaryPath)
 	if err != nil {
 		return fmt.Errorf("resolve current daemon binary symlink: %w", err)
 	}
