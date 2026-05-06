@@ -45,6 +45,10 @@ func EnableDaemon(log *slog.Logger) phases.Task {
 func (d *enableDaemon) Name() string { return "enable-daemon" }
 
 func (d *enableDaemon) Do(ctx context.Context) error {
+	if err := ensureDaemonBinaryLinks(d.log); err != nil {
+		return err
+	}
+
 	unitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonUnit)
 	daemonService, err := renderDaemonAsset("daemon-service", daemonServiceContent)
 	if err != nil {

@@ -18,6 +18,7 @@ import (
 
 const (
 	agentUpgradeDownloadURLParameter = "downloadURL"
+	agentUpgradeBinaryMode           = 0o755
 )
 
 func agentUpgradeDownloadURL(parameters map[string]string) (string, error) {
@@ -37,7 +38,7 @@ func upgradeDaemonBinary(ctx context.Context, log *slog.Logger, downloadURL stri
 	}
 	upgrade := paths.ResolveAgentUpgrade(downloadURL, currentTarget)
 
-	if err := agentbinary.InstallFromTarGz(ctx, upgrade.DownloadURL, upgrade.TargetBinaryPath, upgrade.BinaryName, upgrade.BinaryMode); err != nil {
+	if err := agentbinary.InstallFromTarGz(ctx, upgrade.DownloadURL, upgrade.TargetBinaryPath, upgrade.BinaryName, agentUpgradeBinaryMode); err != nil {
 		return fmt.Errorf("install upgraded daemon binary to %s: %w", upgrade.TargetBinaryPath, err)
 	}
 
@@ -66,6 +67,69 @@ func daemonAgentUpgradePaths() goalstates.AgentUpgradePaths {
 		CurrentPath:  daemonBinaryCurrentPath(),
 		LastGoodPath: daemonBinaryLastGoodPath(),
 	}
+}
+
+func ensureDaemonBinaryLinks(log *slog.Logger) error {
+	paths := daemonAgentUpgradePaths()
+
+	if _, err := filepath.EvalSymlinks(paths.CurrentPath); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("resolve current daemon binary symlink: %w", err)
+		}
+		target, targetErr := initialDaemonBinaryTarget(paths)
+		if targetErr != nil {
+			return targetErr
+		}
+		if err := updateSymlink(paths.CurrentPath, target); err != nil {
+			return fmt.Errorf("initialize current daemon symlink: %w", err)
+		}
+	}
+
+	currentTarget, err := filepath.EvalSymlinks(paths.CurrentPath)
+	if err != nil {
+		return fmt.Errorf("resolve current daemon binary symlink: %w", err)
+	}
+
+	if _, err := filepath.EvalSymlinks(paths.LastGoodPath); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("resolve last-good daemon binary symlink: %w", err)
+		}
+		if err := updateSymlink(paths.LastGoodPath, currentTarget); err != nil {
+			return fmt.Errorf("initialize last-good daemon symlink: %w", err)
+		}
+	}
+
+	if currentTarget != paths.BinaryPath {
+		if err := updateSymlink(paths.BinaryPath, paths.CurrentPath); err != nil {
+			return fmt.Errorf("initialize daemon compatibility symlink: %w", err)
+		}
+	}
+
+	log.Info("daemon binary links initialized",
+		"current", paths.CurrentPath,
+		"last_good", paths.LastGoodPath,
+	)
+
+	return nil
+}
+
+func initialDaemonBinaryTarget(paths goalstates.AgentUpgradePaths) (string, error) {
+	for _, path := range []string{paths.BluePath, paths.GreenPath, paths.BinaryPath} {
+		if isExecutableFile(path) {
+			return path, nil
+		}
+	}
+
+	return "", fmt.Errorf("no executable agent binary found for daemon link initialization")
+}
+
+func isExecutableFile(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+
+	return info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0
 }
 
 func resolveSymlink(path string) (string, error) {

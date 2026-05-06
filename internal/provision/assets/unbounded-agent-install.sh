@@ -66,19 +66,13 @@ if [ -z "${AGENT_URL}" ]; then
 else
     _version_desc="${AGENT_VERSION:-custom}"
 fi
-AGENT_BIN="/usr/local/bin/unbounded-agent"
 AGENT_BIN_BLUE="/usr/local/bin/unbounded-agent-blue"
-AGENT_BIN_CURRENT="/usr/local/bin/unbounded-agent-current"
-AGENT_BIN_LAST_GOOD="/usr/local/bin/unbounded-agent-last-good"
 
 echo "Downloading unbounded-agent ${_version_desc} for ${arch} from ${AGENT_URL}..."
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "${tmp_dir}"' EXIT
 curl -fsSL "${AGENT_URL}" | tar -xz -C "${tmp_dir}" unbounded-agent
 install -m 0755 "${tmp_dir}/unbounded-agent" "${AGENT_BIN_BLUE}"
-ln -sfn "${AGENT_BIN_BLUE}" "${AGENT_BIN_CURRENT}"
-ln -sfn "${AGENT_BIN_BLUE}" "${AGENT_BIN_LAST_GOOD}"
-ln -sfn "${AGENT_BIN_CURRENT}" "${AGENT_BIN}"
 
 _START_ARGS=""
 case "${AGENT_DEBUG}" in
@@ -86,4 +80,4 @@ case "${AGENT_DEBUG}" in
 esac
 
 echo "Running unbounded-agent start..."
-"${AGENT_BIN_CURRENT}" start ${_START_ARGS}
+"${AGENT_BIN_BLUE}" start ${_START_ARGS}

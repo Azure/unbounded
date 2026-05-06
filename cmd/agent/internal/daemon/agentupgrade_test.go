@@ -185,6 +185,31 @@ func TestDownloadAgentBinaryFromTarGz_RejectsUnsupportedScheme(t *testing.T) {
 	assert.Contains(t, err.Error(), "unsupported agent download URL scheme")
 }
 
+func TestEnsureDaemonBinaryLinks_InitializesFromBlue(t *testing.T) {
+	paths := setupDaemonBinaryTestWithoutLinks(t)
+	require.NoError(t, os.WriteFile(paths.blue, []byte("blue"), 0o755))
+
+	require.NoError(t, ensureDaemonBinaryLinks(slog.Default()))
+
+	assertSymlinkTarget(t, paths.current, paths.blue)
+	assertSymlinkTarget(t, paths.lastGood, paths.blue)
+	assertSymlinkTarget(t, paths.legacy, paths.blue)
+}
+
+func TestEnsureDaemonBinaryLinks_PreservesExistingLinks(t *testing.T) {
+	paths := setupDaemonBinaryTestWithoutLinks(t)
+	require.NoError(t, os.WriteFile(paths.blue, []byte("blue"), 0o755))
+	require.NoError(t, os.WriteFile(paths.green, []byte("green"), 0o755))
+	require.NoError(t, os.Symlink(paths.green, paths.current))
+	require.NoError(t, os.Symlink(paths.blue, paths.lastGood))
+
+	require.NoError(t, ensureDaemonBinaryLinks(slog.Default()))
+
+	assertSymlinkTarget(t, paths.current, paths.green)
+	assertSymlinkTarget(t, paths.lastGood, paths.blue)
+	assertSymlinkTarget(t, paths.legacy, paths.green)
+}
+
 type daemonBinaryTestPaths struct {
 	legacy   string
 	current  string
@@ -196,6 +221,16 @@ type daemonBinaryTestPaths struct {
 func setupDaemonBinaryTest(t *testing.T) daemonBinaryTestPaths {
 	t.Helper()
 
+	paths := setupDaemonBinaryTestWithoutLinks(t)
+	require.NoError(t, os.WriteFile(paths.legacy, []byte("legacy"), 0o755))
+	require.NoError(t, os.Symlink(paths.legacy, paths.current))
+
+	return paths
+}
+
+func setupDaemonBinaryTestWithoutLinks(t *testing.T) daemonBinaryTestPaths {
+	t.Helper()
+
 	dir := t.TempDir()
 	paths := daemonBinaryTestPaths{
 		legacy:   filepath.Join(dir, "unbounded-agent"),
@@ -205,8 +240,6 @@ func setupDaemonBinaryTest(t *testing.T) daemonBinaryTestPaths {
 		green:    filepath.Join(dir, "unbounded-agent-green"),
 	}
 
-	require.NoError(t, os.WriteFile(paths.legacy, []byte("legacy"), 0o755))
-	require.NoError(t, os.Symlink(paths.legacy, paths.current))
 	t.Setenv(goalstates.EnvDaemonBinary, paths.legacy)
 	t.Setenv(goalstates.EnvDaemonBinaryCurrent, paths.current)
 	t.Setenv(goalstates.EnvDaemonBinaryLastGood, paths.lastGood)

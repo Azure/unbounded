@@ -3,8 +3,6 @@
 
 package goalstates
 
-import "io/fs"
-
 const AgentUpgradeBinaryName = "unbounded-agent"
 
 // AgentUpgradePaths describes the host-side blue-green agent binary layout.
@@ -31,7 +29,6 @@ func DefaultAgentUpgradePaths() AgentUpgradePaths {
 type AgentUpgrade struct {
 	DownloadURL        string
 	BinaryName         string
-	BinaryMode         fs.FileMode
 	PreviousBinaryPath string
 	TargetBinaryPath   string
 	CurrentLinkPath    string
@@ -48,7 +45,6 @@ func (p AgentUpgradePaths) ResolveAgentUpgrade(downloadURL, previousBinaryPath s
 	return AgentUpgrade{
 		DownloadURL:        downloadURL,
 		BinaryName:         AgentUpgradeBinaryName,
-		BinaryMode:         0o755,
 		PreviousBinaryPath: previousBinaryPath,
 		TargetBinaryPath:   targetPath,
 		CurrentLinkPath:    p.CurrentPath,

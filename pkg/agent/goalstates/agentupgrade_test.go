@@ -27,7 +27,6 @@ func TestResolveAgentUpgrade_UsesBlueWhenCurrentIsNotBlue(t *testing.T) {
 	assert.Equal(t, "/agent-blue", upgrade.TargetBinaryPath)
 	assert.Equal(t, "/agent-current", upgrade.CurrentLinkPath)
 	assert.Equal(t, "/agent-last-good", upgrade.LastGoodLinkPath)
-	assert.Equal(t, 0o755, int(upgrade.BinaryMode))
 }
 
 func TestResolveAgentUpgrade_UsesGreenWhenCurrentIsBlue(t *testing.T) {
