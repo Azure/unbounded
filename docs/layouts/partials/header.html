@@ -1,6 +1,11 @@
 <header class="site-header">
   <nav>
-    <a href="{{ "" | relURL }}" class="site-title"><img src="{{ "img/icon.svg" | relURL }}" alt="" class="site-logo" aria-hidden="true">{{ .Site.Title }}</a>
+    <div class="nav-left">
+      <button class="left-nav-hamburger" id="left-nav-toggle" type="button" aria-label="Toggle navigation" aria-expanded="false">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M3 12h18M3 6h18M3 18h18"/></svg>
+      </button>
+      <a href="{{ "" | relURL }}" class="site-title"><img src="{{ "img/icon.svg" | relURL }}" alt="" class="site-logo" aria-hidden="true">{{ .Site.Title }}</a>
+    </div>
     <div class="nav-right">
       <button class="search-trigger" id="search-trigger" type="button" aria-label="Search documentation">
         <svg class="search-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="8.5" cy="8.5" r="5.5"/><path d="m13 13 4 4"/></svg>
