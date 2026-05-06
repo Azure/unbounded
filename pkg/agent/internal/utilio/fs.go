@@ -78,7 +78,7 @@ func UpdateSymlink(linkPath, targetPath string) error {
 	}
 
 	base := filepath.Base(linkPath)
-	tmpDir, err := os.MkdirTemp(dir, "."+base+".*.tmp")
+	tmpDir, err := os.MkdirTemp(dir, ".tmp.*")
 	if err != nil {
 		return err
 	}
