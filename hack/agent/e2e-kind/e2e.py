@@ -32,6 +32,8 @@ Subcommands (called as individual workflow steps):
     delete-machine-cr                  Delete the Machine CR.
     validate-machine-cr-created        Verify agent self-registered a Machine CR.
     validate-node-reboot-operation     Verify NodeReboot MachineOperation restarts the node.
+    validate-agent-upgrade-operation   Verify AgentUpgrade switches the host daemon binary.
+    validate-agent-upgrade-rollback    Verify AgentUpgrade rollback restores last-known-good.
     validate-node-repave-upgrade       Verify OnDelete repave applies a new MCV Kubernetes version.
     reset-agent                        Run agent reset and verify cleanup.
     cleanup                            Tear down VM, networking, and Kind cluster.
@@ -105,6 +107,8 @@ MACHINA_PID_FILE = VM_DIR / "machina-controller.pid"
 MACHINA_LOG_FILE = VM_DIR / "machina-controller.log"
 MACHINA_CONFIG_FILE = VM_DIR / "machina-config.yaml"
 MACHINE_CONFIG_NAME = f"{AGENT_MACHINE_NAME}-config"
+DAEMON_BINARY_CURRENT = "/usr/local/bin/unbounded-agent-current"
+DAEMON_BINARY_LAST_GOOD = "/usr/local/bin/unbounded-agent-last-good"
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +173,10 @@ def ssh_cmd(*remote_args: str) -> subprocess.CompletedProcess[str]:
     return run(["ssh", *SSH_OPTS, SSH_TARGET, *remote_args])
 
 
+def ssh_capture(command: str) -> str:
+    return capture(["ssh", *SSH_OPTS, SSH_TARGET, command])
+
+
 def scp_cmd(src: str, dst: str) -> subprocess.CompletedProcess[str]:
     return run(["scp", *SSH_OPTS, src, dst])
 
@@ -195,6 +203,7 @@ def create_machine_operation(
     name: str,
     machine_name: str,
     operation_kind: str,
+    parameters: dict[str, str] | None = None,
     ttl_seconds: int | None = None,
 ) -> None:
     """Create a MachineOperation CR targeting *machine_name*."""
@@ -205,6 +214,8 @@ def create_machine_operation(
     }
     if ttl_seconds is not None:
         spec["ttlSecondsAfterFinished"] = ttl_seconds
+    if parameters is not None:
+        spec["parameters"] = parameters
 
     operation = {
         "apiVersion": "unbounded-cloud.io/v1alpha3",
@@ -398,6 +409,122 @@ def wait_for_node_reboot_event(node_name: str, boot_id: str, timeout_secs: int =
     kubectl(["get", "events", "--field-selector", f"involvedObject.kind=Node,involvedObject.name={node_name}",
              "--sort-by=.lastTimestamp"])
     die(f"Timed out waiting for Node Rebooted event for '{node_name}' boot ID '{boot_id}'")
+
+
+def read_daemon_current_target() -> str:
+    """Return the target path of the host daemon current binary symlink."""
+
+    return ssh_capture(f"sudo readlink -f {DAEMON_BINARY_CURRENT}").strip()
+
+
+def read_daemon_last_good_target() -> str:
+    """Return the target path of the host daemon last-good binary symlink."""
+
+    return ssh_capture(f"sudo readlink -f {DAEMON_BINARY_LAST_GOOD}").strip()
+
+
+def wait_for_daemon_current_target(expected_target: str, timeout_secs: int = 180) -> None:
+    """Wait for the daemon current symlink to point to *expected_target*."""
+
+    log(f"Waiting for daemon current symlink to point to {expected_target}...")
+    elapsed = 0
+    last_target = ""
+    while elapsed < timeout_secs:
+        result = subprocess.run(
+            ["ssh", *SSH_OPTS, SSH_TARGET,
+             f"sudo readlink -f {DAEMON_BINARY_CURRENT}"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            last_target = result.stdout.strip()
+            if last_target == expected_target:
+                log(f"Daemon current symlink restored after {elapsed}s")
+                return
+        if elapsed > 0 and elapsed % 30 == 0:
+            log(f"  ({elapsed}s) daemon current target={last_target or '<unavailable>'}")
+        time.sleep(5)
+        elapsed += 5
+
+    die(f"Timed out waiting for daemon current target {expected_target}; last={last_target!r}")
+
+
+def wait_for_daemon_active(timeout_secs: int = 180) -> None:
+    """Wait for unbounded-agent-daemon.service to be active on the VM."""
+
+    log("Waiting for unbounded-agent-daemon.service to be active...")
+    elapsed = 0
+    last_status = ""
+    while elapsed < timeout_secs:
+        result = subprocess.run(
+            ["ssh", *SSH_OPTS, SSH_TARGET,
+             "sudo systemctl is-active unbounded-agent-daemon.service"],
+            capture_output=True, text=True,
+        )
+        last_status = result.stdout.strip() or result.stderr.strip()
+        if result.returncode == 0 and last_status == "active":
+            log(f"unbounded-agent-daemon.service is active after {elapsed}s")
+            return
+        if elapsed > 0 and elapsed % 30 == 0:
+            log(f"  ({elapsed}s) daemon status={last_status or '<empty>'}")
+        time.sleep(5)
+        elapsed += 5
+
+    subprocess.run(["ssh", *SSH_OPTS, SSH_TARGET,
+                    "sudo systemctl status unbounded-agent-daemon.service --no-pager"], check=False)
+    die(f"Timed out waiting for daemon to become active; last status={last_status!r}")
+
+
+def _serve_tarball_for_operation(tarball: Path, operation_name: str, expect_complete: bool = True) -> dict[str, Any]:
+    """Serve *tarball* to the VM, create AgentUpgrade, and wait for it."""
+
+    runner_ip = VM_GATEWAY
+    agent_url = f"http://{runner_ip}:{SERVE_PORT}/{tarball.name}"
+    log(f"Starting HTTP file server on {runner_ip}:{SERVE_PORT} for {tarball.name}...")
+    handler = _make_handler(str(tarball.parent))
+    httpd = HTTPServer((runner_ip, SERVE_PORT), handler)
+    server_thread = Thread(target=httpd.serve_forever, daemon=True)
+    server_thread.start()
+    try:
+        log(f"Verifying VM can reach agent upgrade URL: {agent_url}")
+        ssh_cmd(f"curl -fsSL --connect-timeout 10 -o /dev/null {agent_url}")
+        run_quiet([KUBECTL, "delete", _machine_operation_resource(), operation_name,
+                   "--ignore-not-found"], check=False)
+        create_machine_operation(
+            operation_name,
+            AGENT_MACHINE_NAME,
+            "AgentUpgrade",
+            parameters={"downloadURL": agent_url},
+        )
+        if expect_complete:
+            return wait_for_machine_operation_complete(operation_name)
+    finally:
+        httpd.shutdown()
+
+    return {}
+
+
+def _build_agent_upgrade_tarball(tarball: Path) -> None:
+    """Build the current repo agent binary and package it as an upgrade tarball."""
+
+    build_dir = tarball.parent / "agent-upgrade-good"
+    shutil.rmtree(build_dir, ignore_errors=True)
+    build_dir.mkdir(parents=True)
+    run(["go", "build", "-o", str(build_dir / "unbounded-agent"),
+         str(REPO_ROOT / "cmd" / "agent" / "main.go")],
+        env={**os.environ, "GOOS": "linux", "GOARCH": "amd64"})
+    run(["tar", "-czf", str(tarball), "-C", str(build_dir), "unbounded-agent"])
+
+
+def _build_failing_agent_tarball(tarball: Path) -> None:
+    """Package a deliberately failing executable as an agent upgrade tarball."""
+
+    build_dir = tarball.parent / "agent-upgrade-bad"
+    shutil.rmtree(build_dir, ignore_errors=True)
+    build_dir.mkdir(parents=True)
+    agent_path = build_dir / "unbounded-agent"
+    agent_path.write_text("#!/bin/sh\necho failing upgraded agent >&2\nexit 42\n")
+    agent_path.chmod(0o755)
+    run(["tar", "-czf", str(tarball), "-C", str(build_dir), "unbounded-agent"])
 
 
 # ---------------------------------------------------------------------------
@@ -1631,6 +1758,72 @@ def validate_node_reboot_operation() -> None:
 
 
 # ---------------------------------------------------------------------------
+# validate-agent-upgrade-operation
+# ---------------------------------------------------------------------------
+def validate_agent_upgrade_operation() -> None:
+    """Validate AgentUpgrade stages a new daemon binary and updates symlinks."""
+
+    operation_name = f"e2e-agent-upgrade-{int(time.time())}"
+    before_current = read_daemon_current_target()
+    if not before_current:
+        die("daemon current binary symlink target was empty")
+    log(f"Current daemon binary before upgrade: {before_current}")
+
+    tarball = VM_DIR / "unbounded-agent-upgrade-good.tar.gz"
+    _build_agent_upgrade_tarball(tarball)
+    operation = _serve_tarball_for_operation(tarball, operation_name)
+
+    status = operation.get("status", {})
+    if status.get("message") != "AgentUpgrade completed":
+        die(f"unexpected MachineOperation message: {status.get('message')!r}")
+
+    wait_for_daemon_active()
+    after_current = read_daemon_current_target()
+    last_good = read_daemon_last_good_target()
+    log(f"Current daemon binary after upgrade: {after_current}")
+    log(f"Last-good daemon binary after upgrade: {last_good}")
+
+    if after_current == before_current:
+        die("AgentUpgrade did not switch the daemon current symlink")
+    if last_good != before_current:
+        die(f"last-good symlink mismatch: got {last_good!r}, expected {before_current!r}")
+
+    log("============================================")
+    log("  AgentUpgrade operation validation PASSED")
+    log("============================================")
+    kubectl(["get", _machine_operation_resource(), operation_name, "-o", "wide"])
+
+
+# ---------------------------------------------------------------------------
+# validate-agent-upgrade-rollback
+# ---------------------------------------------------------------------------
+def validate_agent_upgrade_rollback() -> None:
+    """Validate systemd recovery rolls back from a failing upgraded daemon."""
+
+    operation_name = f"e2e-agent-upgrade-rollback-{int(time.time())}"
+    previous_good = read_daemon_current_target()
+    if not previous_good:
+        die("daemon current binary symlink target was empty")
+    log(f"Current daemon binary before failing upgrade: {previous_good}")
+
+    tarball = VM_DIR / "unbounded-agent-upgrade-bad.tar.gz"
+    _build_failing_agent_tarball(tarball)
+    operation = _serve_tarball_for_operation(tarball, operation_name)
+
+    status = operation.get("status", {})
+    if status.get("message") != "AgentUpgrade completed":
+        die(f"unexpected MachineOperation message: {status.get('message')!r}")
+
+    wait_for_daemon_current_target(previous_good)
+    wait_for_daemon_active()
+
+    log("============================================")
+    log("  AgentUpgrade rollback validation PASSED")
+    log("============================================")
+    kubectl(["get", _machine_operation_resource(), operation_name, "-o", "wide"])
+
+
+# ---------------------------------------------------------------------------
 # validate-node-repave-upgrade
 # ---------------------------------------------------------------------------
 def _next_patch_version(version: str) -> str:
@@ -1818,6 +2011,8 @@ COMMANDS = {
     "delete-machine-cr": delete_machine_cr,
     "validate-machine-cr-created": validate_machine_cr_created,
     "validate-node-reboot-operation": validate_node_reboot_operation,
+    "validate-agent-upgrade-operation": validate_agent_upgrade_operation,
+    "validate-agent-upgrade-rollback": validate_agent_upgrade_rollback,
     "validate-node-repave-upgrade": validate_node_repave_upgrade,
     "reset-agent": reset_agent,
     "cleanup": cleanup,

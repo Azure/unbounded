@@ -18,6 +18,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/Azure/unbounded/pkg/agent/agentbinary"
 )
 
 func TestAgentUpgradeDownloadURL(t *testing.T) {
@@ -45,11 +47,11 @@ func TestUpgradeDaemonBinary(t *testing.T) {
 	require.NoError(t, os.WriteFile(legacyPath, []byte("legacy"), 0o755))
 	require.NoError(t, os.Symlink(legacyPath, currentPath))
 
-	t.Setenv("UNBOUNDED_AGENT_DAEMON_BINARY", legacyPath)
-	t.Setenv("UNBOUNDED_AGENT_DAEMON_BINARY_CURRENT", currentPath)
-	t.Setenv("UNBOUNDED_AGENT_DAEMON_BINARY_LAST_GOOD", lastGoodPath)
-	t.Setenv("UNBOUNDED_AGENT_DAEMON_BINARY_BLUE", bluePath)
-	t.Setenv("UNBOUNDED_AGENT_DAEMON_BINARY_GREEN", greenPath)
+	t.Setenv(envDaemonBinary, legacyPath)
+	t.Setenv(envDaemonBinaryCurrent, currentPath)
+	t.Setenv(envDaemonBinaryLastGood, lastGoodPath)
+	t.Setenv(envDaemonBinaryBlue, bluePath)
+	t.Setenv(envDaemonBinaryGreen, greenPath)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/gzip")
@@ -83,10 +85,10 @@ func TestUpgradeDaemonBinary_AlternatesFromBlueToGreen(t *testing.T) {
 	require.NoError(t, os.WriteFile(bluePath, []byte("blue"), 0o755))
 	require.NoError(t, os.Symlink(bluePath, currentPath))
 
-	t.Setenv("UNBOUNDED_AGENT_DAEMON_BINARY_CURRENT", currentPath)
-	t.Setenv("UNBOUNDED_AGENT_DAEMON_BINARY_LAST_GOOD", lastGoodPath)
-	t.Setenv("UNBOUNDED_AGENT_DAEMON_BINARY_BLUE", bluePath)
-	t.Setenv("UNBOUNDED_AGENT_DAEMON_BINARY_GREEN", greenPath)
+	t.Setenv(envDaemonBinaryCurrent, currentPath)
+	t.Setenv(envDaemonBinaryLastGood, lastGoodPath)
+	t.Setenv(envDaemonBinaryBlue, bluePath)
+	t.Setenv(envDaemonBinaryGreen, greenPath)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		require.NoError(t, writeAgentArchive(w, []byte("green")))
@@ -107,7 +109,7 @@ func TestUpgradeDaemonBinary_AlternatesFromBlueToGreen(t *testing.T) {
 func TestDownloadAgentBinaryFromTarGz_RejectsUnsupportedScheme(t *testing.T) {
 	t.Parallel()
 
-	err := downloadAgentBinaryFromTarGz(context.Background(), "file:///tmp/unbounded-agent.tar.gz", filepath.Join(t.TempDir(), "agent"))
+	err := agentbinary.InstallFromTarGz(context.Background(), "file:///tmp/unbounded-agent.tar.gz", filepath.Join(t.TempDir(), "agent"), agentBinaryArchiveName, 0o755)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unsupported agent download URL scheme")
 }
