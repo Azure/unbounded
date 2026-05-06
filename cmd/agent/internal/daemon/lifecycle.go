@@ -6,8 +6,10 @@ package daemon
 import (
 	"context"
 	_ "embed"
+	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 
 	"github.com/Azure/unbounded/internal/executil"
@@ -21,6 +23,12 @@ import (
 
 //go:embed assets/unbounded-agent-daemon.service
 var daemonServiceContent []byte
+
+//go:embed assets/unbounded-agent-daemon-recovery.service
+var daemonRecoveryServiceContent []byte
+
+//go:embed assets/unbounded-agent-daemon-recovery.sh
+var daemonRecoveryScriptContent []byte
 
 type enableDaemon struct {
 	log *slog.Logger
@@ -38,9 +46,22 @@ func (d *enableDaemon) Name() string { return "enable-daemon" }
 
 func (d *enableDaemon) Do(ctx context.Context) error {
 	unitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonUnit)
+	recoveryUnitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonRecoveryUnit)
 
 	if err := writeFile(unitPath, daemonServiceContent, 0o644); err != nil {
 		return fmt.Errorf("writing %s: %w", unitPath, err)
+	}
+
+	if err := writeFile(recoveryUnitPath, daemonRecoveryServiceContent, 0o644); err != nil {
+		return fmt.Errorf("writing %s: %w", recoveryUnitPath, err)
+	}
+
+	if err := writeFile(goalstates.DaemonRecoveryScriptPath, daemonRecoveryScriptContent, 0o755); err != nil {
+		return fmt.Errorf("writing %s: %w", goalstates.DaemonRecoveryScriptPath, err)
+	}
+
+	if err := ensureDaemonSymlinkTargets(); err != nil {
+		return err
 	}
 
 	sc := executil.Systemctl()
@@ -90,8 +111,12 @@ func (t *stopDaemon) Do(ctx context.Context) error {
 		t.log.Warn("failed to disable daemon (may not be enabled)", "error", err)
 	}
 
-	unitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonUnit)
-	removeFileIfExists(t.log, unitPath)
+	if err := executil.RunCmd(ctx, t.log, sc, "disable", goalstates.DaemonRecoveryUnit); err != nil {
+		t.log.Warn("failed to disable daemon recovery unit (may not be enabled)", "error", err)
+	}
+
+	removeFileIfExists(t.log, filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonUnit))
+	removeFileIfExists(t.log, filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonRecoveryUnit))
 
 	return nil
 }
@@ -117,7 +142,12 @@ func (t *removeAgentArtifacts) Do(_ context.Context) error {
 
 	// Remove known file paths.
 	for _, path := range []string{
-		"/usr/local/bin/unbounded-agent",
+		goalstates.DaemonBinaryPath,
+		goalstates.DaemonBinaryBluePath,
+		goalstates.DaemonBinaryGreenPath,
+		goalstates.DaemonBinaryCurrentPath,
+		goalstates.DaemonBinaryLastGoodPath,
+		goalstates.DaemonRecoveryScriptPath,
 		"/usr/local/bin/unbounded-agent-install.sh",
 		"/usr/local/bin/unbounded-agent-uninstall.sh",
 	} {
@@ -136,6 +166,31 @@ func (t *removeAgentArtifacts) Do(_ context.Context) error {
 	matches, _ := filepath.Glob("/tmp/unbounded-agent-config.*.json") //nolint:errcheck // Pattern is valid; only errors on malformed globs.
 	for _, m := range matches {
 		removeFileIfExists(t.log, m)
+	}
+
+	return nil
+}
+
+func ensureDaemonSymlinkTargets() error {
+	if _, err := os.Lstat(goalstates.DaemonBinaryCurrentPath); errors.Is(err, os.ErrNotExist) {
+		if err := os.Symlink(goalstates.DaemonBinaryPath, goalstates.DaemonBinaryCurrentPath); err != nil {
+			return fmt.Errorf("create current daemon binary symlink: %w", err)
+		}
+	} else if err != nil {
+		return fmt.Errorf("stat current daemon binary symlink: %w", err)
+	}
+
+	currentTarget, err := resolveSymlink(goalstates.DaemonBinaryCurrentPath)
+	if err != nil {
+		return fmt.Errorf("resolve current daemon binary symlink: %w", err)
+	}
+
+	if _, err := os.Lstat(goalstates.DaemonBinaryLastGoodPath); errors.Is(err, os.ErrNotExist) {
+		if err := os.Symlink(currentTarget, goalstates.DaemonBinaryLastGoodPath); err != nil {
+			return fmt.Errorf("create last-good daemon binary symlink: %w", err)
+		}
+	} else if err != nil {
+		return fmt.Errorf("stat last-good daemon binary symlink: %w", err)
 	}
 
 	return nil

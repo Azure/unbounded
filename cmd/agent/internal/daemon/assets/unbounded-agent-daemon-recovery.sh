@@ -1,0 +1,17 @@
+#!/bin/bash
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+set -euo pipefail
+
+current="/usr/local/bin/unbounded-agent-current"
+last_good="$(readlink -f /usr/local/bin/unbounded-agent-last-good || true)"
+
+if [ -z "${last_good}" ] || [ ! -x "${last_good}" ]; then
+    echo "no valid last-known-good agent binary found" >&2
+    exit 1
+fi
+
+ln -sfn "${last_good}" "${current}"
+systemctl reset-failed unbounded-agent-daemon.service
+systemctl restart unbounded-agent-daemon.service

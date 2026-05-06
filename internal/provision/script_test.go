@@ -61,6 +61,8 @@ func TestUnboundedAgentUninstallScript(t *testing.T) {
 	require.Contains(t, script, "/etc/systemd/nspawn/${MACHINE_NAME}.nspawn")
 	require.Contains(t, script, "/var/lib/machines/${MACHINE_NAME}")
 	require.Contains(t, script, "nftables-flush.service")
+	require.Contains(t, script, "unbounded-agent-daemon-recovery.service")
+	require.Contains(t, script, "unbounded-agent-daemon-recovery.sh")
 	require.Contains(t, script, "99-kubernetes.conf")
 	require.Contains(t, script, "sysctl --system")
 	require.Contains(t, script, "docker.service")

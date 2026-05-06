@@ -45,6 +45,9 @@ type nodeOperator interface {
 	//  4. Verify kubelet health
 	//  5. Remove the old machine and its applied config
 	RepaveNode(context.Context, *slog.Logger, *ActiveMachine, *provision.UnboundedAgentConfig) error
+	// UpgradeAgent downloads and stages a new host daemon binary pointed to by
+	// the URL from a MachineOperation parameter.
+	UpgradeAgent(context.Context, *slog.Logger, string) error
 }
 
 type nspawnNodeOperator struct{}
@@ -192,4 +195,8 @@ func (nspawnNodeOperator) RepaveNode(
 	)
 
 	return nil
+}
+
+func (nspawnNodeOperator) UpgradeAgent(ctx context.Context, log *slog.Logger, downloadURL string) error {
+	return upgradeDaemonBinary(ctx, log, downloadURL)
 }

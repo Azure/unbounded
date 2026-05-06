@@ -118,7 +118,7 @@ OCI operations use an OCI SDK config file mounted into the `machine-ops-controll
 | `spec.machineRef` | string | No | Target `Machine` name. Either `machineRef` or `machineSelector` must be set. |
 | `spec.machineSelector` | LabelSelector | No | Selects Machines by label. Controllers may fan this out into per-Machine operations. |
 | `spec.operationKind` | string | Yes | One of `NodeReboot`, `AgentUpgrade`, `HostReboot`, `HostPowerOff`, `HostPowerOn`, `HostReplace`. |
-| `spec.parameters` | map[string]string | No | Operation-specific parameters. |
+| `spec.parameters` | map[string]string | No | Operation-specific parameters. For `AgentUpgrade`, set `downloadURL` to the agent tarball URL. |
 | `spec.ttlSecondsAfterFinished` | int32 | No | Delete completed or failed operations after this many seconds. |
 | `status.phase` | string | No | `Pending`, `InProgress`, `Complete`, or `Failed`. |
 | `status.message` | string | No | Human-readable status message. |
