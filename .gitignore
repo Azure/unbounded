@@ -97,3 +97,6 @@ hack/net/templates/*.json
 
 # Temporary files
 *.tmp
+
+public/
+.hugo_build.lock
