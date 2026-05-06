@@ -144,21 +144,43 @@ func StopDaemon(log *slog.Logger) phases.Task {
 func (t *stopDaemon) Name() string { return "stop-daemon" }
 
 func (t *stopDaemon) Do(ctx context.Context) error {
-	sc := executil.Systemctl()
-
-	if err := executil.RunCmd(ctx, t.log, sc, "stop", goalstates.DaemonUnit); err != nil {
+	if err := executil.RunCmd(ctx, t.log, executil.Systemctl(), "stop", goalstates.DaemonUnit); err != nil {
 		t.log.Warn("failed to stop daemon (may not be running)", "error", err)
 	}
 
-	if err := executil.RunCmd(ctx, t.log, sc, "disable", goalstates.DaemonUnit); err != nil {
-		t.log.Warn("failed to disable daemon (may not be enabled)", "error", err)
+	return disableAndRemoveDaemonUnit(ctx, t.log)
+}
+
+// ---------------------------------------------------------------------------
+// RemoveDaemonUnit
+// ---------------------------------------------------------------------------
+
+type removeDaemonUnit struct {
+	log *slog.Logger
+}
+
+// RemoveDaemonUnit returns a task that disables and removes the
+// unbounded-agent-daemon systemd unit without stopping the running service.
+func RemoveDaemonUnit(log *slog.Logger) phases.Task {
+	return &removeDaemonUnit{log: log}
+}
+
+func (t *removeDaemonUnit) Name() string { return "remove-daemon-unit" }
+
+func (t *removeDaemonUnit) Do(ctx context.Context) error {
+	return disableAndRemoveDaemonUnit(ctx, t.log)
+}
+
+func disableAndRemoveDaemonUnit(ctx context.Context, log *slog.Logger) error {
+	if err := executil.RunCmd(ctx, log, executil.Systemctl(), "disable", goalstates.DaemonUnit); err != nil {
+		log.Warn("failed to disable daemon (may already be absent or systemd unavailable)", "error", err)
 	}
 
 	unitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonUnit)
-	removeFileIfExists(t.log, unitPath)
+	removeFileIfExists(log, unitPath)
 	recoveryUnitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonRecoveryUnit)
-	removeFileIfExists(t.log, recoveryUnitPath)
-	removeFileIfExists(t.log, goalstates.DaemonRecoveryScriptPath)
+	removeFileIfExists(log, recoveryUnitPath)
+	removeFileIfExists(log, goalstates.DaemonRecoveryScriptPath)
 
 	return nil
 }
