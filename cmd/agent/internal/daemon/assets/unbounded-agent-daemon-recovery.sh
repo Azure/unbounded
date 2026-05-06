@@ -21,7 +21,6 @@ if [ -f "${pending_upgrade}" ]; then
         --failure-path "${failure_signal}" \
         --message "${message}"; then
         echo "failed to record AgentUpgrade recovery signal" >&2
-        rm -f "${pending_upgrade}"
     fi
 fi
 
