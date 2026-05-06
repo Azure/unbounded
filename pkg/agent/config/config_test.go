@@ -121,3 +121,34 @@ func TestCRIConfig_OmittedWhenEmpty(t *testing.T) {
 	cni := parsed["CNI"].(map[string]interface{})
 	assert.NotContains(t, cni, "PluginVersion")
 }
+
+func TestAgentConfig_DeepCopy(t *testing.T) {
+	t.Parallel()
+
+	original := &AgentConfig{
+		MachineName: "machine-a",
+		Kubelet: AgentKubeletConfig{
+			Labels: map[string]string{
+				"env": "test",
+			},
+			RegisterWithTaints: []string{"dedicated=test:NoSchedule"},
+		},
+	}
+
+	copy := original.DeepCopy()
+	require.NotSame(t, original, copy)
+	require.Equal(t, original, copy)
+
+	copy.Kubelet.Labels["env"] = "prod"
+	copy.Kubelet.RegisterWithTaints[0] = "dedicated=prod:NoSchedule"
+
+	require.Equal(t, "test", original.Kubelet.Labels["env"])
+	require.Equal(t, "dedicated=test:NoSchedule", original.Kubelet.RegisterWithTaints[0])
+}
+
+func TestAgentConfig_DeepCopyNil(t *testing.T) {
+	t.Parallel()
+
+	var original *AgentConfig
+	require.Nil(t, original.DeepCopy())
+}
