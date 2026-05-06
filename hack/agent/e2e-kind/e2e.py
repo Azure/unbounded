@@ -84,6 +84,7 @@ NSPAWN_MACHINE_NAMES = ["kube1", "kube2"]
 BRIDGE_NAME = "virbr-e2e"
 TAP_NAME = "tap-e2e"
 SERVE_PORT = 8199
+AGENT_UPGRADE_ROLLBACK_MESSAGE_FRAGMENT = "rolled back"
 
 # Set to True by --verbose flag; gates diagnostic output.
 VERBOSE = False
@@ -1901,7 +1902,7 @@ def validate_agent_upgrade_rollback() -> None:
     failed_operation = wait_for_machine_operation_failed(
         operation_name, allow_complete_before_failure=True)
     failed_status = failed_operation.get("status", {})
-    if "rolled back" not in failed_status.get("message", ""):
+    if AGENT_UPGRADE_ROLLBACK_MESSAGE_FRAGMENT not in failed_status.get("message", ""):
         die(f"unexpected rollback AgentUpgrade failure message: {failed_status.get('message')!r}")
 
     log("============================================")

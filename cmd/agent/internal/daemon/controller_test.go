@@ -98,12 +98,12 @@ func setAgentUpgradeSignalPaths(t *testing.T) (string, string) {
 	t.Helper()
 
 	dir := t.TempDir()
-	operationPath := filepath.Join(dir, "agent-upgrade-operation")
-	failurePath := filepath.Join(dir, "agent-upgrade-failure")
-	t.Setenv(goalstates.EnvDaemonAgentUpgradeOperationPath, operationPath)
-	t.Setenv(goalstates.EnvDaemonAgentUpgradeFailurePath, failurePath)
+	agentUpgradeOperationPath := filepath.Join(dir, "agent-upgrade-operation")
+	agentUpgradeFailurePath := filepath.Join(dir, "agent-upgrade-failure")
+	t.Setenv(goalstates.EnvDaemonAgentUpgradeOperationPath, agentUpgradeOperationPath)
+	t.Setenv(goalstates.EnvDaemonAgentUpgradeFailurePath, agentUpgradeFailurePath)
 
-	return operationPath, failurePath
+	return agentUpgradeOperationPath, agentUpgradeFailurePath
 }
 
 func TestReconcileNodeReboot_Complete(t *testing.T) {
@@ -334,6 +334,7 @@ func TestReconcileAgentUpgrade_RestartFailureLeavesOperationComplete(t *testing.
 
 func TestPublishAgentUpgradeFailureSignal(t *testing.T) {
 	_, failurePath := setAgentUpgradeSignalPaths(t)
+	const rollbackMessage = "rolled back to last good"
 	machineOp := &v1alpha3.MachineOperation{
 		ObjectMeta: metav1.ObjectMeta{Name: "op-1"},
 		Spec: v1alpha3.MachineOperationSpec{
@@ -346,14 +347,14 @@ func TestPublishAgentUpgradeFailureSignal(t *testing.T) {
 		},
 	}
 	c := fakeStatusClient(machineOp)
-	require.NoError(t, os.WriteFile(failurePath, []byte("op-1\nrolled back to last good\n"), 0o600))
+	require.NoError(t, os.WriteFile(failurePath, []byte("op-1\n"+rollbackMessage+"\n"), 0o600))
 
 	require.NoError(t, publishAgentUpgradeFailureSignal(context.Background(), discardLogger(), c))
 
 	var updated v1alpha3.MachineOperation
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
 	assert.Equal(t, v1alpha3.OperationPhaseFailed, updated.Status.Phase)
-	assert.Equal(t, "rolled back to last good", updated.Status.Message)
+	assert.Equal(t, rollbackMessage, updated.Status.Message)
 	condition := apimeta.FindStatusCondition(updated.Status.Conditions, "Completed")
 	require.NotNil(t, condition)
 	assert.Equal(t, metav1.ConditionFalse, condition.Status)
