@@ -295,9 +295,40 @@ spool:
   require_local_fs: true                          # boot statfs(2) check; refuse
                                                   # to start if spool.dir is on
                                                   # NFS/SMB/CephFS/Lustre/GPFS/
-                                                  # FUSE; intentionally has no
-                                                  # production override.
+                                                  # FUSE. Defense-in-depth: the
+                                                  # spool is no longer on the
+                                                  # client TTFB path in v1, but
+                                                  # joiner-fallback latency
+                                                  # benefits materially from
+                                                  # local block storage.
+                                                  # Operators with unusual
+                                                  # placements MAY relax to
+                                                  # false; production deploys
+                                                  # are expected to keep the
+                                                  # default.
                                                   # See design.md#104-spool-locality-contract.
+
+origin:                                           # leader-side pre-header
+                                                  # retry budget; transient
+                                                  # origin failures retry
+                                                  # invisibly to the client
+                                                  # before HTTP response
+                                                  # headers are committed
+                                                  # (design.md s8.6 / Option D)
+  retry:
+    attempts: 3                                   # max attempts before giving
+                                                  # up and returning 502
+                                                  # OriginRetryExhausted
+    backoff_initial: 100ms                        # initial backoff
+    backoff_max: 2s                               # capped backoff per attempt
+    max_total_duration: 5s                        # absolute wall-clock cap;
+                                                  # 502 if exhausted regardless
+                                                  # of attempt count. Bounded
+                                                  # well below typical S3 SDK
+                                                  # read timeouts (aws-sdk-go
+                                                  # 30s; boto3 60s) so retries
+                                                  # complete before clients
+                                                  # time out.
 
 cachestore:
   driver: localfs                                 # localfs | posixfs | s3
@@ -476,6 +507,30 @@ underlying storage system and is not a cache-layer concern. See
   - `origincache_origin_etag_changed_total{origin}` -- count of `412
     Precondition Failed` responses to `If-Match: <etag>` GETs;
     leading indicator of mid-flight overwrite or stale metadata cache
+  - `origincache_origin_retry_total{result="success|exhausted_attempts|exhausted_duration|etag_changed"}`
+    -- one increment per request that entered the pre-header retry
+    loop ([design.md s8.6](./design.md#86-failure-handling-without-re-stampede)).
+    `success` = origin returned a first byte after some attempts;
+    `exhausted_attempts` = ran out of attempts within the time
+    budget -> 502 OriginRetryExhausted;
+    `exhausted_duration` = exceeded `origin.retry.max_total_duration`
+    -> 502 OriginRetryExhausted;
+    `etag_changed` = OriginETagChangedError (non-retryable) -> 502
+    OriginETagChanged. Sustained non-zero `exhausted_*` rates
+    indicate origin health issues.
+  - `origincache_origin_retry_attempts` -- histogram of attempt
+    count per request that entered the retry loop. p50 should be
+    1 (first attempt succeeds); a long tail toward
+    `origin.retry.attempts` indicates degraded origin.
+  - `origincache_responses_aborted_total{phase="pre_commit|mid_stream",reason}`
+    -- response abort counters. `pre_commit` covers errors before
+    response headers are sent (mostly diagnostic; the request
+    typically returns a clean HTTP error). `mid_stream` covers
+    aborts after the commit boundary (origin disconnect after
+    first byte) and is the metric to watch for the cost paid by
+    the v1 streaming design. Sustained non-zero `mid_stream` rate
+    is the trigger for considering mid-stream origin resume
+    ([design.md s15.4](./design.md#154-mid-stream-origin-resume)).
   - `origincache_origin_duplicate_fills_total{result="commit_won|commit_lost"}`
     - increments at every CacheStore commit attempt. The `commit_lost` rate
       quantifies cross-replica fill duplication that escaped coordinator
@@ -618,7 +673,8 @@ underlying storage system and is not a cache-layer concern. See
     `refused` indicates the bucket has versioning enabled or
     suspended; the process exits non-zero immediately after.
   - `origincache_commit_after_serve_total{result="ok|failed"}` --
-    spool-fsync-gated async CacheStore commits; `failed` means the
+    asynchronous CacheStore commits that run after the client
+    response is complete; `failed` means the
     client response succeeded but the chunk was NOT recorded in the
     `ChunkCatalog` (next request refills); see
     [design.md#86-failure-handling-without-re-stampede](./design.md#86-failure-handling-without-re-stampede)
@@ -674,7 +730,7 @@ underlying storage system and is not a cache-layer concern. See
 | Phase | Scope | Definition of done |
 |---|---|---|
 | **0 - skeleton** | `cmd/origincache` boilerplate; `Origin` and `CacheStore` interfaces; `origin/s3`; `cachestore/localfs`; in-memory `chunkcatalog`; single-process Range GET; streaming chunk iterator; `make` integration; basic unit tests | One process serves a Range GET against a real S3 bucket and re-serves it from `localfs` |
-| **1 - prod basics** | `fetch.Coordinator` with chunk + meta singleflight + tee; `chunkcatalog` LRU + Stat-on-miss path with **per-entry access-frequency tracking** (FW8) and bounded by `chunk_catalog.max_entries` with size-awareness operational guidance ([design.md s13.3](./design.md#133-chunkcatalog-size-awareness-load-bearing-operational-note)); atomic CacheStore writes (`localfs` `link`/`renameat2(RENAME_NOREPLACE)` with **staging inside `<root>/.staging/<uuid>` + parent-dir fsync**); metadata cache with `metadata_ttl=5m` and **`negative_metadata_ttl=60s`** (asymmetric defaults; bounds the create-after-404 unavailability window per [design.md s12](./design.md#12-create-after-404-and-negative-cache-lifecycle)) including `metadata_negative_entries` / `metadata_negative_hit_total` / `metadata_negative_age_seconds` metrics; **per-replica LIST cache** (FW3) with default `list_cache.ttl=60s`, `max_entries=1024`, sized for FUSE-`ls` workload ([design.md s6.2](./design.md#62-list-request-flow)); **active eviction** (FW8) opt-in via `chunk_catalog.active_eviction.enabled` (default off; recommended on for posixfs deployments without external sweep) including `CacheStore.Delete` interface method; **bounded-freshness mode** (FW5) opt-in via `metadata_refresh.enabled` (default off) with hot-key detection via metadata-cache access counters ([design.md s11.2](./design.md#112-bounded-freshness-mode-optional)); **distributed origin limiter** (FW4) via Kubernetes `coordination.k8s.io/v1.Lease` for authority election plus in-memory semaphore at the elected leader plus internal RPC for slot acquisition; graceful fallback to per-replica `floor(target_global/N)` cap when authority unreachable ([design.md s8.4](./design.md#84-origin-backpressure)); RBAC manifests for the Lease resource; **bounded staleness contract documented**; **strict `If-Match: <etag>` on every `Origin.GetRange` plus `OriginETagChangedError` handling**; **typed `CacheStore` errors (`ErrNotFound|ErrTransient|ErrAuth`)** with only `ErrNotFound` triggering refill; **per-replica HEAD singleflight wording** in metadata layer; **spool-fsync gate** as cold-path TTFB barrier (response headers deferred until first chunk fsynced into local Spool; CacheStore commit async); **mid-stream abort** on post-first-byte failure (`RST_STREAM` / `Connection: close`); **`server.max_response_bytes` cap returns `400 RequestSizeExceedsLimit`** (S3-style XML; 416 reserved for Range vs. EOF); `HeadObject`; `ListObjectsV2`; `origin/azureblob` (Block Blob only); **`cachestore/s3` versioning gate** ([design.md s10.1.3](./design.md#1013-cachestores3)) refusing to start on versioned buckets; Prometheus; structured logging; health / readiness | One replica deployed in a dev K8s cluster serving traffic against both S3 and Azure (multi-replica clustering lands in Phase 3) |
+| **1 - prod basics** | `fetch.Coordinator` with chunk + meta singleflight + tee; `chunkcatalog` LRU + Stat-on-miss path with **per-entry access-frequency tracking** (FW8) and bounded by `chunk_catalog.max_entries` with size-awareness operational guidance ([design.md s13.3](./design.md#133-chunkcatalog-size-awareness-load-bearing-operational-note)); atomic CacheStore writes (`localfs` `link`/`renameat2(RENAME_NOREPLACE)` with **staging inside `<root>/.staging/<uuid>` + parent-dir fsync**); metadata cache with `metadata_ttl=5m` and **`negative_metadata_ttl=60s`** (asymmetric defaults; bounds the create-after-404 unavailability window per [design.md s12](./design.md#12-create-after-404-and-negative-cache-lifecycle)) including `metadata_negative_entries` / `metadata_negative_hit_total` / `metadata_negative_age_seconds` metrics; **per-replica LIST cache** (FW3) with default `list_cache.ttl=60s`, `max_entries=1024`, sized for FUSE-`ls` workload ([design.md s6.2](./design.md#62-list-request-flow)); **active eviction** (FW8) opt-in via `chunk_catalog.active_eviction.enabled` (default off; recommended on for posixfs deployments without external sweep) including `CacheStore.Delete` interface method; **bounded-freshness mode** (FW5) opt-in via `metadata_refresh.enabled` (default off) with hot-key detection via metadata-cache access counters ([design.md s11.2](./design.md#112-bounded-freshness-mode-optional)); **distributed origin limiter** (FW4) via Kubernetes `coordination.k8s.io/v1.Lease` for authority election plus in-memory semaphore at the elected leader plus internal RPC for slot acquisition; graceful fallback to per-replica `floor(target_global/N)` cap when authority unreachable ([design.md s8.4](./design.md#84-origin-backpressure)); RBAC manifests for the Lease resource; **bounded staleness contract documented**; **strict `If-Match: <etag>` on every `Origin.GetRange` plus `OriginETagChangedError` handling**; **typed `CacheStore` errors (`ErrNotFound|ErrTransient|ErrAuth`)** with only `ErrNotFound` triggering refill; **per-replica HEAD singleflight wording** in metadata layer; **pre-header origin retry** (`origin.retry.attempts=3`, `origin.retry.max_total_duration=5s` defaults) as the cold-path commit boundary - cold-path bytes stream origin -> client directly with bounded leader-side retry handling transient origin failures invisibly before HTTP response headers are committed; spool tees in parallel for joiner support and as the asynchronous CacheStore-commit source ([design.md s8.6](./design.md#86-failure-handling-without-re-stampede)); **mid-stream abort** on post-first-byte failure (`RST_STREAM` / `Connection: close`); **`server.max_response_bytes` cap returns `400 RequestSizeExceedsLimit`** (S3-style XML; 416 reserved for Range vs. EOF); `HeadObject`; `ListObjectsV2`; `origin/azureblob` (Block Blob only); **`cachestore/s3` versioning gate** ([design.md s10.1.3](./design.md#1013-cachestores3)) refusing to start on versioned buckets; Prometheus; structured logging; health / readiness | One replica deployed in a dev K8s cluster serving traffic against both S3 and Azure (multi-replica clustering lands in Phase 3) |
 | **2 - prod backend & ops** | `cachestore/s3` for VAST with `PutObject` + `If-None-Match: *` and **`SelfTestAtomicCommit` at startup** (refuse to start if backend silently overwrites); **`cachestore/posixfs` for shared POSIX FS deployments** (NFSv4.1+ baseline, plus Weka native, CephFS, Lustre, GPFS) sharing `link()`/`EEXIST` + dir-fsync helpers with `cachestore/localfs` via `internal/origincache/cachestore/internal/posixcommon/`, with **`SelfTestAtomicCommit` at startup** (refuse to start on Alluxio FUSE, on NFS below `nfs.minimum_version=4.1` unless `nfs.allow_v3` is set, or on any backend that fails the link-EEXIST + dir-fsync + size-verify self-test) and 2-char hex fan-out under `<origin_id>/`; **`internal/origincache/fetch/spool` layer** (slow-joiner fallback regardless of CacheStore driver) **with mandatory boot `statfs(2)` locality check** that refuses to start when `spool.dir` is on a network FS (NFS / SMB / CephFS / Lustre / GPFS / FUSE); **`commit_after_serve_total{ok|failed}` async-commit metric path**; **per-process CacheStore circuit breaker** (`enabled,error_window=30s,error_threshold=10,open_duration=30s,half_open_probes=3`); **per-replica origin semaphore documented** with formula `floor(target_global / N_replicas)` + `origin_inflight` gauge; **`localfs` `staging_max_age=1h` orphaned-staging sweeper** (and equivalent `posixfs.staging_max_age=1h`); **`/readyz` ErrAuth threshold (default 3 consecutive -> NotReady)**; sequential read-ahead; bearer / mTLS auth on the client edge; `deploy/origincache/` manifests (incl. `07-networkpolicy.yaml.tmpl`); `images/origincache/` Containerfile; `docs/origincache/` published with CacheStore lifecycle policy guidance and POSIX-backend support matrix | Production-shaped service running against VAST in a real DC with the self-test green, AND a parallel green run against at least one shared-POSIX backend (NFSv4.1+ baseline) |
 | **3 - cluster** | `cluster/` peer discovery from headless Service DNS; rendezvous hashing on pod IP; **per-chunk internal fill RPC** (assembler fan-out); **internal mTLS listener on `:8444`** with internal CA + peer-IP authz + **stable `ServerName=origincache.<ns>.svc`** pinned by dialers (per-replica certs MUST include this SAN) + `X-Origincache-Internal` loop prevention + `409 Conflict` on coordinator disagreement; NetworkPolicy applied; `kubectl unbounded origincache` inspection subcommand | Multi-replica Deployment sustaining target throughput; `commit_lost` rate near zero in steady state |
 | **4 - optional** | NVMe / HDD tiering; S3 SigV4 verification; adaptive prefetch; deferred optimizations catalogued in [design.md s15](./design.md#15-deferred-optimizations) (edge rate limiting, cluster-wide HEAD singleflight, cluster-wide LIST coordinator) if measured to be needed | As needed |
@@ -922,16 +978,54 @@ Estimated calendar: Phase 0 + 1 ~= 3-4 focused weeks. Phase 2 + 3 another
   `GetBucketVersioning` returns `Status: Disabled`; gate passes;
   metric `s3_versioning_check_total{result="ok"}=1`; driver proceeds
   to `SelfTestAtomicCommit`.
-- **T-2b spool-fsync gate (TTFB)** (`fetch` + `spool`): mock CacheStore
-  `PutObject` blocks for 5s; mock origin replies in 10ms; assert client
-  TTFB is < `(spool fsync + 50ms)`, NOT 5s. Asserts the gate is local
-  Spool fsync, not CacheStore commit ack.
-- **T-2b commit-after-serve failure** (`fetch` + `spool` + `cachestore`):
-  inject CacheStore commit error after the spool-fsync gate; assert the
-  client response completes successfully byte-for-byte; assert
-  `origincache_commit_after_serve_total{result="failed"}` == 1; assert
-  `ChunkCatalog.Lookup(k)` is still a miss; assert a follow-up request
-  triggers exactly one new origin GET.
+- **T-pre-header-retry-success** (`fetch.Coordinator` + mock origin):
+  origin returns transient 503 on attempt 1, 200 + bytes on attempt 2;
+  assert client sees clean 200 response with no observable abort;
+  assert `origin_retry_total{result="success"}=1`; assert
+  `origin_retry_attempts` records 2 attempts.
+- **T-pre-header-retry-exhausted-attempts**: origin returns 503 on
+  every attempt within the duration budget; assert client receives
+  clean `502 Bad Gateway` with code `OriginRetryExhausted` after
+  `origin.retry.attempts` exhaust; assert
+  `origin_retry_total{result="exhausted_attempts"}=1`.
+- **T-pre-header-retry-exhausted-duration**: origin slow-503 with
+  hangs that push total wall-clock past
+  `origin.retry.max_total_duration`; assert client receives `502`
+  before all attempts complete; assert
+  `origin_retry_total{result="exhausted_duration"}=1`.
+- **T-pre-header-retry-etag-changed-non-retryable**: origin returns
+  `OriginETagChangedError` on attempt 1; assert NO retry happens;
+  assert `502` with code `OriginETagChanged`; assert
+  `origin_retry_total{result="etag_changed"}=1`; assert metadata
+  cache invalidated.
+- **T-pre-header-retry-cold-path-ttfb** (`fetch` + mock origin):
+  with origin returning bytes after 10ms first-byte latency,
+  assert client TTFB < 50ms (sum of origin first-byte + small
+  pre-header retry overhead); assert NO chunk-download wait on
+  the TTFB path. Validates Option D's TTFB claim
+  ([design.md s8.6](./design.md#86-failure-handling-without-re-stampede)).
+- **T-mid-stream-abort-first-chunk-after-commit** (`fetch` +
+  `spool` + mock origin): origin succeeds for first byte; cache
+  commits headers + first byte; origin disconnects at 50% of
+  chunk; assert client connection aborts (HTTP/2 RST_STREAM or
+  HTTP/1.1 Connection: close); assert
+  `responses_aborted_total{phase="mid_stream"}=1`; client SDK
+  retries (validated separately via real aws-sdk-go integration
+  test).
+- **T-spool-tee-joiner-during-streaming** (`fetch` + `spool`):
+  leader streams 8 MiB chunk to client A; joiner B arrives at
+  50% point through the singleflight; B reads from ring buffer
+  while on-pace; B falls behind; B switches to spool reader; both
+  finish with full chunk byte-for-byte. Confirms the spool tee
+  works in parallel with client streaming and joiner-fallback is
+  unaffected by the drop of the spool-fsync gate.
+- **T-commit-after-serve failure** (`fetch` + `spool` + `cachestore`):
+  inject CacheStore commit error after the client response is
+  complete; assert the client response completes successfully
+  byte-for-byte; assert
+  `origincache_commit_after_serve_total{result="failed"}` == 1;
+  assert `ChunkCatalog.Lookup(k)` is still a miss; assert a
+  follow-up request triggers exactly one new origin GET.
 - **T-3 typed CacheStore errors** (`cachestore` + `fetch`): inject each
   of `ErrNotFound|ErrTransient|ErrAuth` from `CacheStore.GetChunk`:
   - `ErrNotFound` -> miss-fill path runs, eventual 200/206 to client;
@@ -1059,9 +1153,11 @@ Re-stated to prevent drift:
   overwrites only. Operators MUST surface this contract in the consumer
   API documentation. See
   [design.md#11-bounded-staleness-contract](./design.md#11-bounded-staleness-contract).
-- **Commit-after-serve failure** (decision 2b): the cold-path TTFB gate
-  is local Spool fsync; the CacheStore commit is async and a failure
-  there leaves the client successful but the chunk uncached. Repeated
+- **Commit-after-serve failure** (decision 2b): with v1 Option D
+  the cold-path bytes stream origin -> client directly; the
+  CacheStore commit is async and happens after the client response
+  is complete. A failure there leaves the client successful but
+  the chunk uncached. Repeated
   failures are visible only via
   `origincache_commit_after_serve_total{result="failed"}` and the
   CacheStore circuit breaker; operators MUST alert on a sustained
@@ -1125,16 +1221,19 @@ Re-stated to prevent drift:
   Alluxio S3 gateway, which is a normal in-DC S3 backend from the
   cache layer's perspective. Operators MUST be steered to this in the
   runbook to prevent Phase-2 deployments from getting stuck.
-- **Spool on a network filesystem silently destroys TTFB**: the
-  spool-fsync gate assumes microsecond-class local-NVMe `fsync`. A
-  spool placed on NFS / SMB / CephFS / Lustre / GPFS / FUSE pays a
-  network round-trip per commit, defeating the gate's purpose and
-  inflating cold-path TTFB by 1-3 orders of magnitude. The cache layer
-  enforces this at boot via `statfs(2)` and refuses to start
-  (`spool.require_local_fs=true` default; see
+- **Spool on a network filesystem degrades joiner-fallback latency**:
+  with the v1 streaming design (Option D) the spool is no longer on
+  the client TTFB path, but joiner-fallback reads still benefit
+  materially from local block storage. A spool placed on NFS /
+  SMB / CephFS / Lustre / GPFS / FUSE pays a network round-trip
+  per joiner-fallback read, converting microsecond-class
+  switchover into milliseconds-class. The cache layer enforces
+  local placement at boot via `statfs(2)` and refuses to start by
+  default (`spool.require_local_fs=true`; see
   [design.md#104-spool-locality-contract](./design.md#104-spool-locality-contract)).
-  The override exists for unit tests on developer laptops only and MUST
-  NOT appear in any deployed manifest. Operators should also pin
+  Operators with unusual placements (e.g., RAM-disk) MAY relax to
+  `spool.require_local_fs=false`; production deployments are
+  expected to keep the default. Operators should also pin
   `spool.dir` to a hostPath / local-PV pointing at NVMe and avoid
   generic-default-storage-class PVCs that may bind to network volumes.
 - **Spool exhaustion under sustained burst**: `spool.max_bytes` (default
@@ -1194,6 +1293,20 @@ Re-stated to prevent drift:
   operators with write-and-immediately-list patterns should tune
   `list_cache.ttl` shorter or disable the cache via
   `list_cache.enabled: false`.
+- **Mid-stream client aborts on post-commit origin failure**:
+  the v1 streaming design (Option D) sends response headers and
+  begins streaming as soon as origin returns a first byte. If the
+  origin connection breaks mid-chunk after the cache has committed,
+  the response aborts (HTTP/2 `RST_STREAM` or HTTP/1.1
+  `Connection: close`). S3 SDKs handle this via `Content-Length`
+  mismatch retry; the operational impact is small for the
+  documented workload but visible in
+  `responses_aborted_total{phase="mid_stream"}`. Sustained non-
+  zero rates indicate origin tail-latency issues; the trigger for
+  considering mid-stream origin resume
+  ([design.md s15.4](./design.md#154-mid-stream-origin-resume))
+  is sustained mid-stream abort rate measurably impacting
+  end-to-end client latency.
 - **Cold-start Stat storm**: a freshly started replica receiving a wide
   fan-out of distinct cold keys does one `CacheStore.Stat` per `ChunkKey`.
   At in-DC latencies this is cheap but not free. If a deployment routinely
@@ -1267,11 +1380,26 @@ Before starting Phase 0 implementation, please confirm:
 - [ ] **Bounded staleness contract published in design.md s11 with
       `metadata_ttl=5m` default; operators are expected to honor the
       immutable-origin contract.**
-- [ ] **Spool-fsync gate is the cold-path TTFB barrier (not CacheStore
-      commit ack); CacheStore commit runs asynchronously after first
-      byte; commit-after-serve failures are reported as
-      `commit_after_serve_total{result="failed"}` and do NOT affect
-      client responses.**
+- [ ] **Pre-header origin retry (Option D) ships in Phase 1: the
+      leader retries `Origin.GetRange` up to
+      `origin.retry.attempts` (default 3) with exponential backoff
+      capped by `origin.retry.max_total_duration` (default 5s)
+      BEFORE response headers are sent to the client; transparent
+      to the client. The commit boundary is the first byte arrival
+      from origin: post-commit, bytes stream origin -> client
+      directly; spool tees in parallel for joiner support and as
+      the asynchronous CacheStore-commit source. Pre-commit
+      failures (retry budget exhausted, `OriginETagChangedError`)
+      return clean HTTP errors; post-commit failures become
+      mid-stream client aborts (handled by SDK retry).
+      `origin_retry_total` and `origin_retry_attempts` metrics
+      exposed; T-pre-header-retry-* test group in Phase 1.
+      Mid-stream origin resume is deferred future work
+      ([design.md s15.4](./design.md#154-mid-stream-origin-resume)).
+      CacheStore commit runs asynchronously after the client
+      response completes; commit-after-serve failures are reported
+      as `commit_after_serve_total{result="failed"}` and do NOT
+      affect client responses.**
 - [ ] **`CacheStore` returns typed errors `ErrNotFound|ErrTransient|ErrAuth`;
       only `ErrNotFound` triggers refill; `ErrTransient` -> `503 Slow Down`
       with `Retry-After`; `ErrAuth` -> `502 Bad Gateway`.**
@@ -1339,8 +1467,12 @@ Before starting Phase 0 implementation, please confirm:
 - [ ] **Spool locality is enforced at boot: `spool.require_local_fs:
       true` (default) runs `statfs(2)` on `spool.dir` and refuses to
       start when the FS magic matches NFS / SMB / CephFS / Lustre /
-      GPFS / FUSE. Override is intentionally test-only and MUST NOT
-      appear in any deployed manifest. See
+      GPFS / FUSE. With Option D the spool is no longer on the
+      client TTFB path, so the contract is defense-in-depth for
+      joiner-fallback latency; operators with unusual placements
+      (e.g., RAM-disk) MAY relax via `spool.require_local_fs: false`
+      with the documented operational warning. Production deploys
+      are expected to keep the default. See
       [design.md#104-spool-locality-contract](./design.md#104-spool-locality-contract).**
 - [ ] **Negative-cache TTL is independent: `negative_metadata_ttl: 60s`
       (default) is distinct from `metadata_ttl: 5m`; bounds the

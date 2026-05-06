@@ -51,6 +51,7 @@ Owner: TBD
     - [15.1 Edge rate limiting](#151-edge-rate-limiting)
     - [15.2 Cluster-wide HEAD singleflight](#152-cluster-wide-head-singleflight)
     - [15.3 Cluster-wide LIST coordinator](#153-cluster-wide-list-coordinator)
+    - [15.4 Mid-stream origin resume](#154-mid-stream-origin-resume)
 
 ### Request scenarios
 
@@ -105,8 +106,8 @@ stampede protection, atomic commit, and horizontal-scale coordination.
 | Cluster | Kubernetes Deployment + headless Service for peer discovery + ClusterIP/LB for client traffic. Rendezvous hashing on pod IP selects the coordinator per `ChunkKey` for miss-fills only; receiving replica is the **assembler** that fans out per-chunk fill RPCs to coordinators (s8.3). All replicas can read all chunks directly from the CacheStore on hits. A separate **limiter authority** is elected via a Kubernetes `coordination.k8s.io/v1.Lease` to enforce a cluster-wide cap on concurrent `Origin.GetRange` calls (s8.4). |
 | Kubernetes coordination | Two K8s-native dependencies: (1) headless Service for peer discovery (s14); (2) one `coordination.k8s.io/v1.Lease` resource per deployment for limiter-authority election (s8.4). RBAC: `get / list / watch / create / update / patch` on the named Lease resource, scoped to the deployment's namespace. |
 | Inter-replica auth | Separate internal mTLS listener (default `:8444`) chained to an internal CA distinct from the client mTLS CA; authorization = "presenter source IP is in current peer-IP set" (s8.8). |
-| Local spool | Every fill writes origin bytes through a local spool (`internal/origincache/fetch/spool`) so slow joiners always have a local fallback regardless of CacheStore driver (s8.2). |
-| Atomic commit | `localfs` and `posixfs` stage inside `<root>/.staging/<uuid>` with parent-dir fsync, then `link()` no-clobber (returns `EEXIST` to the loser); `s3` uses direct `PutObject` with `If-None-Match: *`. Each driver runs `SelfTestAtomicCommit` at boot: `s3` proves the backend honors `If-None-Match: *`; `posixfs` proves the backend honors `link()` / `EEXIST` and that directory fsync is durable, and additionally enforces `nfs.minimum_version` (default `4.1`, with opt-in `nfs.allow_v3`) and refuses to start on Alluxio FUSE backends. Cold-path TTFB is gated on local Spool fsync, not on CacheStore commit; commit-after-serve failure becomes `commit_after_serve_total{result="failed"}` rather than a client error (s8.6). |
+| Local spool | Every fill writes origin bytes through a local spool (`internal/origincache/fetch/spool`) in parallel with streaming to the client; serves as a slow-joiner fallback and as the source for the asynchronous CacheStore commit. The spool is NOT on the client-TTFB path in v1; client bytes flow origin -> client directly (s8.2 / s8.6). |
+| Atomic commit | `localfs` and `posixfs` stage inside `<root>/.staging/<uuid>` with parent-dir fsync, then `link()` no-clobber (returns `EEXIST` to the loser); `s3` uses direct `PutObject` with `If-None-Match: *`. Each driver runs `SelfTestAtomicCommit` at boot: `s3` proves the backend honors `If-None-Match: *`; `posixfs` proves the backend honors `link()` / `EEXIST` and that directory fsync is durable, and additionally enforces `nfs.minimum_version` (default `4.1`, with opt-in `nfs.allow_v3`) and refuses to start on Alluxio FUSE backends. Cold-path bytes stream directly from origin to client; bounded leader-side **pre-header origin retry** (s8.6) handles transient origin failures invisibly before response headers are committed. The spool tees in parallel for joiners (s8.2) and as the CacheStore-commit source. CacheStore commit happens asynchronously after the response completes; commit-after-serve failure becomes `commit_after_serve_total{result="failed"}` rather than a client error (s8.6). |
 | Versioned buckets on cachestore/s3 | Not supported. The `cachestore/s3` driver requires the bucket to have versioning **disabled**. AWS S3 honors `If-None-Match: *` on both versioned and unversioned buckets, but VAST Cluster (and likely other S3-compatible backends) only honors it on unversioned buckets ([VAST KB][vast-kb-conditional-writes]). The driver enforces this at boot via an explicit `GetBucketVersioning` versioning gate (s10.1.3); refusing to start on enabled or suspended versioning avoids a class of silent atomic-commit failures. |
 | LIST caching | Per-replica TTL'd LIST cache (s6.2 / FW3) in front of `Origin.List`, sized for the FUSE-`ls` workload pattern. Default `list_cache.ttl=60s`, configurable. Cluster-wide LIST coordination is a deferred optimization ([s15.3](#153-cluster-wide-list-coordinator)). |
 | Origin concurrency cap | Cluster-wide via Kubernetes-Lease-elected limiter authority (s8.4 / FW4). Default `cluster.limiter.target_global=192`. Per-replica static cap (`floor(target_global / N)`) is the documented graceful-fallback when the authority is unreachable; also the v1 escape hatch via `cluster.limiter.enabled=false`. |
@@ -189,11 +190,19 @@ section that defines or implements the full mechanism.
   replacement is always a new key. The cache trusts this contract; on
   violation, the bounded staleness window is `metadata_ttl` (default 5m).
   Full statement in [s11](#11-bounded-staleness-contract).
-- **Spool-fsync gate** - the cold-path TTFB barrier: the first body byte
-  is released to the client only after the chunk is durably fsynced into
-  the local Spool. The CacheStore commit happens asynchronously after
-  that; commit failure does not affect the in-flight client response.
-  Detail in [s8.2](#82-ttfb-tee--spool) and [s8.6](#86-failure-handling-without-re-stampede).
+- **Pre-header retry** - the leader retries `Origin.GetRange` on
+  transient errors **before** sending HTTP response headers to the
+  client, making transient origin failures invisible to the client.
+  Bounded by `origin.retry.attempts` (default 3) and
+  `origin.retry.max_total_duration` (default 5s). The "commit
+  boundary" is the first byte arrival from origin: once received,
+  the cache sends headers and starts streaming; subsequent origin
+  failures become mid-stream client aborts (handled by S3 SDK
+  retry via `Content-Length` mismatch). `OriginETagChangedError`
+  is non-retryable. Detail in
+  [s8.6](#86-failure-handling-without-re-stampede). Mid-stream
+  origin resume is deferred future work
+  ([s15.4](#154-mid-stream-origin-resume)).
 - **CacheStore circuit breaker** - per-process error-rate breaker around
   `CacheStore` calls. On sustained `ErrTransient` / `ErrAuth`, the
   breaker opens, short-circuits writes, and surfaces via metrics and
@@ -459,33 +468,49 @@ flowchart LR
      record in the catalog and serve from the CacheStore. If absent, take
      the miss-fill path (s8), which routes to the coordinator for that
      specific chunk via local singleflight or per-chunk internal RPC.
-6. **Spool-fsync gate (cold path)**: response headers (`Content-Length`,
-   `Content-Range`, `ETag`, `Accept-Ranges: bytes`) are deferred until
-   the **first chunk** of the range is durably fsynced into the local
-   **Spool** (s8.2). The CacheStore commit happens asynchronously after
-   that, using whichever atomic primitive the configured driver
-   advertises (`PutObject + If-None-Match: *` for `s3`; `link()` /
-   `EEXIST` for `localfs` and `posixfs`). The assembler is driver-
-   agnostic: it calls `CacheStore.PutChunk` and treats the typed error
-   the same way regardless of backing store. Commit-after-serve failure
-   does NOT affect the in-flight client response; it increments
-   `origincache_commit_after_serve_total{result="failed"}` and the chunk
-   is **not** recorded in the `ChunkCatalog` (the next request will
-   refill). Pre-spool-fsync failures - origin unreachable,
-   `OriginETagChangedError`, semaphore timeout, internal RPC failure -
-   return a clean HTTP error (typically `502 Bad Gateway` or
-   `503 Slow Down`). Warm-path TTFB is unchanged: the gate is the
-   `CacheStore.GetChunk` first byte. `Content-Length` and `Content-Range`
-   are computable from `ObjectInfo.Size` and the chunk math, so deferring
-   headers does not lose information; it adds roughly one Spool-fsync
-   latency to TTFB on the cold path.
-7. **Mid-stream failure**: once any body byte has been written, no HTTP
-   error status is possible. Mid-stream failures abort the response
-   (HTTP/2 `RST_STREAM` with `INTERNAL_ERROR`; HTTP/1.1 `Connection:
-   close` after the partial write) and increment
-   `origincache_responses_aborted_total{phase="mid_stream",reason}`. S3
-   clients (aws-sdk, boto3, etc.) detect this via `Content-Length`
-   mismatch and retry.
+6. **Cold path: stream directly with pre-header retry**. On a chunk
+   miss, the leader issues `Origin.GetRange` with bounded retry
+   (s8.6) **before** any HTTP response header is sent to the client.
+   Transient origin failures (5xx, network errors) on retryable
+   attempts are invisible to the client: the leader retries up to
+   `origin.retry.attempts` (default 3) with exponential backoff
+   capped by `origin.retry.max_total_duration` (default 5s). The
+   commit boundary is the **first byte arrival from origin**: once
+   the leader has received any byte, response headers
+   (`Content-Length`, `Content-Range`, `ETag`,
+   `Accept-Ranges: bytes`) are sent immediately and the leader
+   begins streaming bytes to the client as they arrive from origin.
+   The leader simultaneously tees bytes into the local Spool (s8.2)
+   for joiner support and for the asynchronous CacheStore commit.
+   `Content-Length` and `Content-Range` are computable from
+   `ObjectInfo.Size` and the chunk math, so headers can be sent
+   before the body completes. Pre-commit failures
+   (`OriginETagChangedError`, retry budget exhausted, internal RPC
+   failure, semaphore timeout) return a clean HTTP error before
+   any byte is sent (typically `502 Bad Gateway` or `503 Slow
+   Down`). The CacheStore commit happens asynchronously after the
+   client response completes, using whichever atomic primitive the
+   configured driver advertises (`PutObject + If-None-Match: *` for
+   `s3`; `link()` / `EEXIST` for `localfs` and `posixfs`). The
+   assembler is driver-agnostic: it calls `CacheStore.PutChunk` and
+   treats the typed error the same way regardless of backing store.
+   Commit-after-serve failure does NOT affect the in-flight client
+   response; it increments
+   `origincache_commit_after_serve_total{result="failed"}` and the
+   chunk is **not** recorded in the `ChunkCatalog` (the next
+   request will refill).
+7. **Mid-stream failure**: once any body byte has been written
+   (i.e., after the commit boundary), no HTTP error status is
+   possible. Mid-stream failures (origin disconnect after first
+   byte, or any post-commit error) abort the response (HTTP/2
+   `RST_STREAM` with `INTERNAL_ERROR`; HTTP/1.1 `Connection: close`
+   after the partial write) and increment
+   `origincache_responses_aborted_total{phase="mid_stream",reason}`.
+   S3 clients (aws-sdk, boto3, etc.) detect this via
+   `Content-Length` mismatch and retry. Mid-stream origin resume
+   (re-issue origin GET with `Range: bytes=<offset>-` and continue
+   feeding the client transparently) is deferred future work
+   ([s15.4](#154-mid-stream-origin-resume)).
 8. If sequential prefetch is enabled, the iterator schedules asynchronous
    fills for the next N chunks (capped per blob and globally) one chunk
    ahead of the cursor.
@@ -533,13 +558,17 @@ sequenceDiagram
     R->>CS: Stat(k)
     CS-->>R: ErrNotFound
     R->>SF: Acquire(k) [leader]
-    SF->>O: GetRange(bucket, key, etag, off, n)<br/>If-Match: etag
-    O-->>SF: byte stream
-    SF->>Sp: write bytes
-    SF->>Sp: Commit (fsync + close)
-    Note over SF,Sp: spool-fsync gate - chunk durable on local disk<br/>headers and first byte released to client now
-    SF-->>R: gate open
-    R-->>C: 200/206 + headers + stream slice
+    SF->>O: GetRange(bucket, key, etag, off, n)<br/>If-Match: etag<br/>(pre-header retry s8.6)
+    O-->>SF: first byte
+    Note over SF: commit boundary - origin healthy
+    par stream to client
+        SF-->>R: stream bytes as they arrive from origin
+        R-->>C: 200/206 + headers + body
+    and tee to spool
+        SF->>Sp: write bytes (in parallel)
+    end
+    O-->>SF: remaining bytes
+    SF->>Sp: Commit (fsync + close) [after stream complete]
     SF-)CS: PutObject(final, body, If-None-Match: *) [async]
     CS--)SF: 200 (commit_won) or failure
     alt commit ok
@@ -682,18 +711,19 @@ listed inline in s8.3 and are not reproduced here.
 
 | Status | S3-style code | Reason | Triggered by | Client retry? |
 |---|---|---|---|---|
-| `200 OK` / `206 Partial Content` | (none) | normal hit or successful fill | hit + range OK; cold-path fill past spool-fsync gate | n/a |
+| `200 OK` / `206 Partial Content` | (none) | normal hit or successful fill | hit + range OK; cold-path fill after pre-header-retry commit (s8.6) | n/a |
 | `400 RequestSizeExceedsLimit` | `RequestSizeExceedsLimit` | response would exceed `server.max_response_bytes` | range math at request entry; `x-origincache-cap-exceeded: true` | no (different range) |
 | `416 Requested Range Not Satisfiable` | `InvalidRange` | range vs. `ObjectInfo.Size` violation | range math at request entry | no (different range) |
-| `502 Bad Gateway` | `OriginUnreachable` | origin error pre-spool-fsync gate | `Origin.GetRange` 5xx; origin DNS failure; semaphore exhausted past wait | yes, small backoff |
-| `502 Bad Gateway` | `OriginETagChanged` | `OriginETagChangedError` from `Origin.GetRange` (s8.6) | mid-flight overwrite caught by `If-Match` | yes (next request re-Heads) |
+| `502 Bad Gateway` | `OriginUnreachable` | origin error before commit boundary | `Origin.GetRange` 5xx; origin DNS failure; semaphore exhausted past wait | yes, small backoff |
+| `502 Bad Gateway` | `OriginRetryExhausted` | leader retry budget exhausted (`origin.retry.attempts` or `origin.retry.max_total_duration`) before any byte from origin (s8.6) | sustained transient origin failures during pre-header retry | yes (origin may recover) |
+| `502 Bad Gateway` | `OriginETagChanged` | `OriginETagChangedError` from `Origin.GetRange` (s8.6) | mid-flight overwrite caught by `If-Match`; non-retryable | yes (next request re-Heads) |
 | `502 Bad Gateway` | `OriginUnsupported` | non-BlockBlob azureblob (s9) | `Origin.Head` returns unsupported blob type | no |
 | `502 Bad Gateway` | `BackendUnavailable` | CacheStore `ErrAuth` | CacheStore credentials rejected | no (operator) |
 | `503 Slow Down` | `SlowDown` | CacheStore `ErrTransient` | CacheStore 5xx / timeout / throttle | yes |
 | `503 Slow Down` | `SlowDown` | spool full | `spool.max_inflight` exhausted past wait | yes |
 | `503 Slow Down` | `SlowDown` | breaker open | per-process CacheStore breaker open (s10.2) | yes |
 | `503 Service Unavailable` | (probe) | replica NotReady | `/readyz` failing predicates (s10.5) | n/a (LB drain) |
-| (mid-stream abort) | n/a | post-first-byte failure | CacheStore or origin failure after Spool-fsync gate | client SDK detects via `Content-Length` mismatch and retries |
+| (mid-stream abort) | n/a | post-commit-boundary failure | origin disconnect after first byte sent to client; CacheStore commit failure does NOT cause this (commit is post-response) | client SDK detects via `Content-Length` mismatch and retries; mid-stream resume deferred (s15.4) |
 
 `Retry-After: 1s` is set on every `503 Slow Down`. Pre-first-byte
 errors carry an S3-style XML body (`<Error><Code>...<Message>...`).
@@ -976,70 +1006,76 @@ and serves a normal hit.
 
 ### 8.2 TTFB tee + spool
 
-Naive singleflight makes joiners wait for the leader's full disk write,
-then re-read from disk. Instead the leader splits origin bytes two ways:
+In v1 the leader streams origin bytes directly to the requesting
+client (after pre-header retry confirms a healthy origin
+connection, s8.6) AND simultaneously tees the bytes into two
+side channels for joiner support and the asynchronous CacheStore
+commit:
 
 1. **Ring buffer** (in-memory, bounded 1-2 MiB by default). Joiners
-   obtain a `Reader` over this buffer that replays buffered bytes and
-   blocks on a condition variable for more. This delivers low TTFB for
-   on-pace joiners.
-2. **Spool** (local disk file via the `Spool` interface). The leader
-   writes every byte to a local spool file before (or in parallel with)
-   uploading to the CacheStore. A slow joiner that falls behind the ring
-   buffer head transparently switches to a `Spool.Reader(k, off)`. The
-   spool exists because the production `cachestore/s3` driver streams
-   directly into `PutObject` and does not produce a readable on-disk tmp
-   file - without the spool, slow joiners on the s3 path would have no
-   local fallback. The spool unifies behavior across `localfs`, `s3`,
-   and `posixfs` drivers.
+   obtain a `Reader` over this buffer that replays buffered bytes
+   and blocks on a condition variable for more. Delivers low TTFB
+   for on-pace joiners.
+2. **Spool** (local disk file via the `Spool` interface). The
+   leader writes every byte to a local spool file in parallel
+   with the client write and the CacheStore upload. A slow joiner
+   that falls behind the ring buffer head transparently switches
+   to a `Spool.Reader(k, off)`. The spool exists because the
+   production `cachestore/s3` driver streams directly into
+   `PutObject` and does not produce a readable on-disk tmp file -
+   without the spool, slow joiners on the s3 path would have no
+   local fallback. The spool unifies joiner-fallback behavior
+   across `localfs`, `s3`, and `posixfs` drivers.
 
-**Spool locality is mandatory.** The Spool MUST live on a local block
-device. At boot, the cache layer runs `statfs(2)` against `spool.dir`
-and refuses to start (exit non-zero) if the filesystem magic matches a
-network FS denylist (NFS, SMB / CIFS, CephFS, Lustre, GPFS, FUSE
-including Alluxio FUSE), incrementing
-`origincache_spool_locality_check_total{result="refused"}`. Override is
-intentionally not provided. Rationale: the spool-fsync gate (below) is
-the cold-path TTFB barrier, and a remote-FS fsync would convert
-microsecond-class local-NVMe latency into tens-of-milliseconds-class
-network-round-trip latency, defeating the gate's purpose. Governed by
-`spool.require_local_fs` (default `true`); see
+**The spool is NOT on the client TTFB path in v1.** Cold-path
+client TTFB is bounded by origin first-byte latency plus a small
+amount of pre-header retry overhead (s8.6). The leader does NOT
+wait for the chunk to be fully written or fsynced into the spool
+before sending bytes to the client. The spool is a parallel
+side-channel for joiner support and CacheStore commit; the client
+write is independent of and in parallel with the spool write.
+
+**Spool locality is required (with a documented override).** The
+Spool MUST live on a local block device by default. At boot, the
+cache layer runs `statfs(2)` against `spool.dir` and refuses to
+start (exit non-zero) if the filesystem magic matches a network FS
+denylist (NFS, SMB / CIFS, CephFS, Lustre, GPFS, FUSE including
+Alluxio FUSE), incrementing
+`origincache_spool_locality_check_total{result="refused"}`.
+Governed by `spool.require_local_fs` (default `true`). The
+rationale is now defense-in-depth: with the v1 streaming design
+the spool no longer gates client TTFB, but joiner-fallback latency
+still benefits materially from local NVMe (a remote-FS spool would
+convert microsecond-class read-from-spool to milliseconds-class
+network-round-trip on every joiner switchover). Operators with
+unusual placements (e.g., large RAM-disk) MAY relax the contract
+via `spool.require_local_fs: false`; production deployments are
+expected to keep the default. See
 [s10.4](#104-spool-locality-contract) for the full check.
 
-**Spool-fsync gate (cold path)**: the cold-path TTFB barrier is the
-local Spool fsync, NOT the cluster-wide CacheStore commit. Sequence:
+**CacheStore commit timing.** After the leader has streamed the
+full chunk to the client (and the spool has finished receiving),
+the leader performs the CacheStore commit asynchronously
+(`PutObject + If-None-Match: *` for `s3`; `link()` for `localfs`
+and `posixfs`). Success increments
+`commit_after_serve_total{result="ok"}`; failure increments
+`commit_after_serve_total{result="failed"}` AND skips
+`ChunkCatalog.Record` so the next request refills. The client
+response is unaffected either way - by this point the client has
+already received the full chunk.
 
-1. Leader streams origin bytes into the Spool (and the ring buffer in
-   parallel).
-2. Once the chunk is fully written and `SpoolWriter.Commit()` has done a
-   blocking `fsync` + close, the chunk is durable on this replica's
-   local disk.
-3. The first body byte to the client (and the deferred response headers)
-   is released at this point.
-4. The leader then performs the CacheStore commit asynchronously
-   (`PutObject` + `If-None-Match: *` for `s3`; `link()` for `localfs`).
-   Success increments `commit_after_serve_total{result="ok"}`; failure
-   increments `commit_after_serve_total{result="failed"}` AND skips
-   `ChunkCatalog.Record` so the next request refills. The client
-   response is unaffected either way.
+Capacity: `spool.max_bytes` caps total spool footprint (default 8
+GiB); `spool.max_inflight` caps concurrent fills using the spool.
+When the spool is full, new fills wait briefly on the
+`spool.max_inflight` semaphore; on timeout they return `503 Slow
+Down` to the client.
 
-This separation is deliberate: it bounds cold-path TTFB by local disk
-fsync (microseconds to low milliseconds on NVMe) rather than by the
-in-DC CacheStore round-trip plus durability barrier (typically tens of
-milliseconds on a healthy in-DC S3-like store, much higher under load).
-The chunk is still durable on at least one replica's disk before the
-client sees a byte; the only thing deferred is shared visibility.
-
-Capacity: `spool.max_bytes` caps total spool footprint (default 8 GiB);
-`spool.max_inflight` caps concurrent fills using the spool. When the
-spool is full, new fills wait briefly on `spool.max_inflight` semaphore;
-on timeout they return `503 Slow Down` to the client.
-
-After the leader's CacheStore commit succeeds, the spool entry is retained
-briefly so any in-flight joiner can finish reading; once joiner refcount
-hits zero the spool entry is released. On commit-after-serve failure the
-spool entry is released the same way; the cache layer simply does not
-record the chunk and the next request refills.
+After the leader's CacheStore commit succeeds, the spool entry is
+retained briefly so any in-flight joiner can finish reading; once
+joiner refcount hits zero the spool entry is released. On commit-
+after-serve failure the spool entry is released the same way; the
+cache layer simply does not record the chunk and the next request
+refills.
 
 ### Diagram 5: Scenario C - concurrent miss, same-replica joiner
 
@@ -1057,21 +1093,23 @@ sequenceDiagram
     participant Cat as ChunkCatalog
     A->>R: GET k
     R->>SF: Acquire(k) [leader = A]
-    SF->>O: GetRange(..., If-Match: etag)
-    O-->>SF: byte stream
-    par tee
+    SF->>O: GetRange(..., If-Match: etag)<br/>(pre-header retry s8.6)
+    O-->>SF: first byte
+    Note over SF: commit boundary - origin healthy
+    par tee to ring
         SF->>Ring: bytes
-    and spool
+    and tee to spool
         SF->>Sp: bytes
+    and stream to A
+        SF-->>A: stream bytes as they arrive
     end
-    SF->>Sp: Commit (fsync + close)
-    Note over SF,Sp: spool-fsync gate: first byte released to A now
-    SF-->>A: stream from Ring
+    O-->>SF: remaining bytes
     B->>R: GET k (concurrent)
     R->>SF: Acquire(k) [joiner = B]
     SF-->>B: stream from Ring
     Note over B: B falls behind ring head
     SF-->>B: switch to Spool.Reader
+    SF->>Sp: Commit (fsync + close) [after stream complete]
     SF-)CS: PutObject(final, body, If-None-Match: *) [async]
     CS--)SF: 200 (commit_won) or failure
     alt commit ok
@@ -1138,14 +1176,18 @@ sequenceDiagram
     B->>B: self-check: Coordinator(k) == self?
     Note over B: yes, proceed
     B->>SF: Acquire(k) [leader]
-    SF->>O: GetRange(..., If-Match: etag)
-    O-->>SF: byte stream
-    SF->>Sp: write bytes
-    SF->>Sp: Commit (fsync + close)
-    Note over SF,Sp: spool-fsync gate at B
-    SF-->>B: gate open
-    B-->>A: chunk bytes (stream)
-    A-->>C: stream slice
+    SF->>O: GetRange(..., If-Match: etag)<br/>(pre-header retry s8.6)
+    O-->>SF: first byte
+    Note over SF: commit boundary - origin healthy
+    par stream to A
+        SF-->>B: stream bytes as they arrive
+        B-->>A: chunk bytes (stream)
+        A-->>C: stream slice
+    and tee to spool @ B
+        SF->>Sp: write bytes (in parallel)
+    end
+    O-->>SF: remaining bytes
+    SF->>Sp: Commit (fsync + close) [after stream complete]
     SF-)CS: PutObject(final, body, If-None-Match: *) [async]
     CS--)SF: 200 (commit_won) or failure
     Note over A,B: On membership disagreement at B<br/>B returns 409 and A falls back to local fill
@@ -1360,7 +1402,7 @@ joiner cancelling unblocks only itself.
 - **`OriginETagChangedError`**: leader (a) invalidates the metadata cache
   entry for `{origin_id, bucket, key}`, (b) fails the in-flight fill, (c)
   joiners receive the same error and abort their responses (or, if
-  pre-first-byte, get a `502 Bad Gateway`). The next request triggers a
+  pre-commit, get a `502 Bad Gateway`). The next request triggers a
   fresh `Head` and a new `ChunkKey` with the new ETag. Old chunks under
   the old ETag age out via the CacheStore lifecycle. Increments
   `origincache_origin_etag_changed_total`.
@@ -1371,20 +1413,46 @@ joiner cancelling unblocks only itself.
   negative-cache lifecycle and the create-after-404 case (an operator
   uploads `K` after a client has already observed `404` on `K`) are in
   [s12](#12-create-after-404-and-negative-cache-lifecycle).
-- **Retry inside the leader**: bounded exponential backoff (default 3
-  attempts) before declaring failure, EXCEPT for `OriginETagChangedError`
-  which is non-retryable (the object identity changed; refilling under
-  the old ETag is the bug we are preventing). Joiners sit through retries
-  on the same `Fill`.
-- **`CommitFailedAfterServe` (post spool-fsync gate)**: after the client
-  has already received the first byte (i.e. the Spool fsync succeeded),
-  a CacheStore commit failure is NOT visible to the client. The leader
-  increments `origincache_commit_after_serve_total{result="failed"}` and
-  does NOT call `ChunkCatalog.Record`. Joiners on the same fill that are
-  still draining the Spool finish normally; the next request for the
-  same `ChunkKey` re-runs the fill (one extra origin GET worst case).
-  Sustained non-zero `failed` rate is a CacheStore-health alert, not a
-  per-request error path.
+- **Pre-header origin retry (the v1 cold-path retry mechanism)**:
+  the leader retries `Origin.GetRange` on transient errors **before**
+  any HTTP response header is sent to the client, making transient
+  origin failures invisible to the client. The retry budget is
+  bounded by both attempt count and total wall-clock duration:
+  - `origin.retry.attempts` (default 3): max attempts.
+  - `origin.retry.backoff_initial` (default 100ms),
+    `origin.retry.backoff_max` (default 2s): exponential backoff
+    cap per attempt.
+  - `origin.retry.max_total_duration` (default 5s): absolute
+    wall-clock cap; if exceeded the leader returns `502 Bad Gateway`
+    even before all attempts complete.
+
+  The **commit boundary** is the first byte arrival from origin:
+  once received, the leader sends headers + first byte, then
+  streams. Pre-commit failures return clean HTTP errors (`502
+  Bad Gateway` with code `OriginUnreachable` or
+  `OriginRetryExhausted`); post-commit failures become mid-stream
+  client aborts (s6 step 7). `OriginETagChangedError` is
+  non-retryable (the object identity changed; refilling under the
+  old ETag is the bug we are preventing); the leader returns
+  `502 OriginETagChanged` immediately. Joiners sit through retries
+  on the same `Fill`. Outcomes are exposed as
+  `origincache_origin_retry_total{result="success|exhausted_attempts|exhausted_duration|etag_changed"}`
+  (one increment per request that entered the retry loop) and
+  `origincache_origin_retry_attempts` (histogram of attempt count
+  per request).
+
+  The retry budget defaults are intentionally smaller than typical
+  S3 SDK read timeouts (aws-sdk-go: 30s; boto3: 60s) so retries
+  complete before clients time out.
+- **`CommitFailedAfterServe`**: the CacheStore commit happens
+  asynchronously after the client response is complete (s8.2). A
+  failure here is NOT visible to the client. The leader increments
+  `origincache_commit_after_serve_total{result="failed"}` and
+  does NOT call `ChunkCatalog.Record`. Joiners on the same fill
+  that are still draining the Spool finish normally; the next
+  request for the same `ChunkKey` re-runs the fill (one extra
+  origin GET worst case). Sustained non-zero `failed` rate is a
+  CacheStore-health alert, not a per-request error path.
 - **Typed `CacheStore` errors during read**: `ErrNotFound` triggers the
   miss-fill path; `ErrTransient` surfaces as `503 Slow Down` with
   `Retry-After: 1s`; `ErrAuth` surfaces as `502 Bad Gateway`. Sustained
@@ -1527,8 +1595,9 @@ flowchart TD
 
 The leader publishes a chunk to the CacheStore atomically and
 no-clobber: the second concurrent commit for the same key MUST lose
-without overwriting the winner. Cold-path commit happens **after** the
-spool-fsync gate (s8.2), so a commit failure here does NOT affect the
+without overwriting the winner. Cold-path commit happens
+asynchronously **after** the client response is complete (s8.2 / s6
+step 6), so a commit failure here does NOT affect the
 in-flight client response; it only increments
 `origincache_commit_after_serve_total{result="failed"}` and skips
 `ChunkCatalog.Record` (next request refills).
@@ -1754,17 +1823,21 @@ degraded backend.
   object: clients cannot fix it by re-requesting a different Range past
   EOF.
 - Origin failure during fill never commits the staging file or makes a
-  final PutObject. Pre-spool-fsync-gate: surfaces as `502 Bad Gateway`
-  to the client and as a transient negative singleflight entry.
-  Post-spool-fsync-gate: response body completes from the local Spool;
-  any CacheStore commit failure is invisible to the client and recorded
-  as `commit_after_serve_total{result="failed"}` (s8.6).
+  final PutObject. Pre-commit (before first byte from origin): the
+  pre-header retry loop (s8.6) handles transient cases; if the retry
+  budget exhausts, the leader returns `502 Bad Gateway` to the client
+  and records a transient negative singleflight entry. Post-commit
+  (after first byte sent to client): the response aborts mid-stream
+  (s6 step 7); any CacheStore commit failure is invisible to the
+  client and recorded as `commit_after_serve_total{result="failed"}`
+  (s8.6). Mid-stream origin resume is deferred future work
+  (s15.4).
 
 ### Diagram 9: Atomic commit (localfs vs posixfs vs s3 CacheStore)
 
 ```mermaid
 flowchart TB
-    Leader["Singleflight leader<br/>finishes origin read<br/>(via Spool, post spool-fsync gate)"] --> Driver{"CacheStore<br/>driver"}
+    Leader["Singleflight leader<br/>finishes origin read<br/>(via Spool tee; client response<br/>already complete)"] --> Driver{"CacheStore<br/>driver"}
     Driver -- "localfs" --> L1["stage in &lt;root&gt;/.staging/&lt;uuid&gt;<br/>fsync(file) + fsync(staging dir)"]
     L1 --> L2["link(staging, final)<br/>or renameat2(RENAME_NOREPLACE)"]
     L2 -- "EEXIST" --> Llost["unlink staging<br/>fsync(staging dir)<br/>commit_lost++<br/>treat existing final as truth"]
@@ -1787,21 +1860,31 @@ flowchart TB
     Sweep -.-> P1
     SelfTestS3["startup SelfTestAtomicCommit (s3)<br/>refuse to start if<br/>If-None-Match not honored"] -.-> S1
     SelfTestPosix["startup SelfTestAtomicCommit (posixfs)<br/>link EEXIST + dir-fsync + size verify<br/>refuse on Alluxio FUSE<br/>refuse if NFS &lt; minimum_version<br/>(opt-in via nfs.allow_v3)"] -.-> P1
-    Failed["any commit failure<br/>after spool-fsync gate"] -.-> CASF["commit_after_serve_total{failed}++<br/>skip Catalog.Record"]
+    Failed["any commit failure<br/>after client response complete"] -.-> CASF["commit_after_serve_total{failed}++<br/>skip Catalog.Record"]
 ```
 
 ### 10.4 Spool locality contract
 
-The local Spool (s8.2) is the cold-path TTFB barrier: the first body
-byte to the client is gated on `SpoolWriter.Commit()`'s blocking
-`fsync` + close. That gate budgets microsecond-class to low-millisecond
-latency on a local NVMe. A network filesystem `fsync` instead pays a
-network round-trip per commit, which is tens of milliseconds at best
-and seconds during congestion. Putting the spool on a network FS
-silently destroys the cache layer's TTFB guarantee.
+The local Spool (s8.2) is no longer on the cold-path client-TTFB
+path in v1: bytes stream origin -> client directly (s6 step 6 /
+s8.6 pre-header retry). The spool is a parallel side-channel that
+serves joiner-fallback reads and feeds the asynchronous CacheStore
+commit.
 
-To prevent that, the cache layer enforces a **boot-time locality
-check** before any client traffic is accepted:
+Even so, the spool benefits materially from a local block device.
+A joiner that falls behind the in-memory ring buffer head
+transparently switches to a `Spool.Reader(k, off)`. Local NVMe
+serves these reads in microsecond-class latency; a network
+filesystem (NFS, CephFS, Lustre, GPFS, FUSE) instead pays a
+network round-trip on every read, which is tens of milliseconds
+at best and seconds during congestion. That converts smooth
+joiner-fallback into multi-second TTFB stalls for slow joiners.
+Network-FS spools also weaken the durability semantics that the
+asynchronous CacheStore commit relies on.
+
+To prevent foot-gun deployments, the cache layer enforces a
+**boot-time locality check** before any client traffic is
+accepted, governed by `spool.require_local_fs` (default `true`):
 
 1. Resolve `spool.dir` to an absolute path; resolve symlinks.
 2. Call `statfs(2)` on the resolved path. Read `f_type`.
@@ -1818,26 +1901,31 @@ check** before any client traffic is accepted:
      Alluxio FUSE.
 4. On match: increment
    `origincache_spool_locality_check_total{result="refused",fs_type="<name>"}`,
-   log `spool: <spool.dir> is on a network filesystem (<name>); the
-   spool MUST be on a local block device. Refusing to start. Set
-   spool.dir to a local-NVMe-backed path or, for testing only, set
-   spool.require_local_fs=false`, and exit non-zero.
+   log `spool: <spool.dir> is on a network filesystem (<name>);
+   joiner-fallback latency would be unbounded. Refusing to start.
+   Set spool.dir to a local-NVMe-backed path or, for unusual
+   placements (e.g., RAM-disk), set spool.require_local_fs=false`,
+   and exit non-zero.
 5. On no match: increment
    `origincache_spool_locality_check_total{result="ok",fs_type="<name>"}`
    and proceed.
 
-Override is `spool.require_local_fs: false` (default `true`). The
-override exists for unit tests on developer laptops where the work
-directory may be on an unusual FS; it is **not** intended for
-production and MUST NOT be set in any deployed manifest. The metric
-label `result="bypassed"` distinguishes overridden runs from clean
-ones, and the boot log carries a loud `WARN spool.require_local_fs is
-disabled; spool durability gate is best-effort` line.
+**Relaxation**. `spool.require_local_fs: false` allows operators
+with unusual placements (RAM-disk, tmpfs, exotic local FS not on
+the denylist) to bypass the check. The override is supported but
+not recommended for production: with the v1 streaming design the
+spool no longer gates client TTFB, but joiner-fallback latency
+still benefits materially from local block storage. The metric
+label `result="bypassed"` distinguishes overridden runs from
+clean ones, and the boot log carries a loud `WARN
+spool.require_local_fs is disabled; joiner-fallback latency is
+best-effort` line.
 
 The check is in `internal/origincache/fetch/spool/` and runs from
 `cmd/origincache/origincache/main.go` before the HTTP listener binds.
-It runs before any CacheStore self-test so a misconfigured spool fails
-fast even on backends that would otherwise pass their own self-test.
+It runs before any CacheStore self-test so a misconfigured spool
+fails fast even on backends that would otherwise pass their own
+self-test.
 
 ### 10.5 Readiness probe (`/readyz`)
 
@@ -2599,3 +2687,49 @@ must be aggressive (TTL >= 60s).
 **Known v1 bound**: cluster-wide LIST load is up to N origin LIST
 calls per identical query per `list_cache.ttl` window where N is
 peer count. Acceptable at v1 scale.
+
+### 15.4 Mid-stream origin resume
+
+**What**: After the commit boundary (s8.6 / s6 step 6) the v1 cache
+streams origin bytes directly to the client. If the origin
+connection breaks mid-chunk, the response aborts (HTTP/2
+`RST_STREAM` or HTTP/1.1 `Connection: close`); the S3 SDK detects
+the `Content-Length` mismatch and retries. Mid-stream origin
+resume would replace the abort with a transparent re-issue: the
+leader tracks bytes sent to client; on origin disconnect, it
+re-issues `Origin.GetRange` with `Range: bytes=<offset>-` (and
+the same `If-Match: <etag>`) and continues feeding the client
+without ever showing an error.
+
+**Why deferred**: v1 relies on the SDK retry behavior (every
+mainstream S3 client handles this case correctly) which is
+acceptable for the documented workload. Mid-stream resume
+requires non-trivial state tracking (bytes-sent counter, retry
+budget for the resume itself, interaction with the singleflight
+joiner state), and the abort case is handled by the SDK so the
+operational impact is small.
+
+**Trigger**: any of:
+- mid-stream client aborts measurably impact tail TTFB on the
+  documented workload (visible via
+  `responses_aborted_total{phase="mid_stream"}` rate);
+- workload uses non-S3-compatible clients without robust retry
+  (uncommon);
+- post-commit origin failures are systematically more frequent
+  than pre-commit (e.g., long-tail origin connections that
+  succeed initially then drop).
+
+**Sketch (if built)**: extend `fetch.Coordinator` to track
+`bytesSent` per fill. On `Origin.GetRange` error after the commit
+boundary, retry origin with `Range: bytes=<bytesSent>-` (within
+the requested chunk's range; bounded by a separate
+`origin.resume.attempts` budget, e.g. 1-2 attempts). Joiners reading
+through the leader's tee transparently see the gap closed. The
+spool tee continues unaffected; the resumed bytes flow through
+the same ring buffer + spool. New metric:
+`origincache_origin_resume_total{result="success|exhausted|error"}`.
+
+**Known v1 bound**: post-commit origin failures abort the client
+response; client SDK retries from scratch
+(`responses_aborted_total{phase="mid_stream"}` increments).
+Acceptable for the documented workload at v1 scale.

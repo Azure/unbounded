@@ -116,8 +116,10 @@ process-internal and are described in
   cold misses for the same chunk collapse into one origin GET.
   Prevents process-local thundering herds.
 - **Spool** - bounded local-disk staging for in-flight fills.
-  Backs the spool-fsync gate (s5.2) and gives slow joiners a
-  uniform fallback across all CacheStore drivers.
+  Tees bytes in parallel with the client write (s5.2), giving
+  slow joiners a uniform fallback across all CacheStore drivers
+  and serving as the source for the asynchronous CacheStore
+  commit.
 - **ChunkCatalog** - in-memory LRU recording which chunks the
   CacheStore holds. Pure hot-path optimization; CacheStore is
   source of truth.
@@ -150,16 +152,21 @@ See [design.md s5](./design.md#5-chunk-model).
 ### 5.2 Singleflight + tee + spool
 
 Per-`ChunkKey` singleflight on the coordinator collapses concurrent
-misses to a single origin GET. The leader's origin byte stream is
-tee'd two ways: into a small in-memory ring buffer (low-TTFB joiners)
-and into a bounded local-disk **Spool** (slow joiners that fall
-behind the ring head, plus uniform behavior across all CacheStore
-drivers). The cold-path TTFB barrier is the local **spool-fsync
-gate**: the first body byte is released to the client only after the
-chunk is durably fsynced into the spool. The cluster-wide CacheStore
-commit happens asynchronously after that. See
-[design.md s8.1](./design.md#81-per-chunkkey-singleflight) and
-[s8.2](./design.md#82-ttfb-tee--spool).
+misses to a single origin GET. Cold-path bytes stream **directly
+from origin to client**: bounded **pre-header origin retry**
+(default 3 attempts, 5s total budget) handles transient origin
+failures invisibly before any HTTP response header is sent; the
+commit boundary is the first byte arrival from origin. Once
+committed, the leader streams bytes to the client as they arrive.
+In parallel, the leader tees bytes into a small in-memory ring
+buffer (low-TTFB joiners) and a bounded local-disk **Spool**
+(slow joiners that fall behind the ring head, plus uniform
+behavior across all CacheStore drivers). The CacheStore commit
+happens asynchronously after the response completes. The spool
+is NOT on the client TTFB path in v1. See
+[design.md s8.1](./design.md#81-per-chunkkey-singleflight),
+[s8.2](./design.md#82-ttfb-tee--spool), and
+[s8.6](./design.md#86-failure-handling-without-re-stampede).
 
 ### 5.3 Per-chunk coordinator (rendezvous hashing)
 
@@ -240,9 +247,11 @@ for atomic-commit specifics per driver.
 The diagram below traces a cold miss on replica A where the chunk's
 coordinator is replica B. The hot path (cache hit on A) skips
 straight from the catalog lookup to a direct CacheStore read; the
-local-coordinator path (B == A) skips the internal RPC. The
-spool-fsync gate is the cold-path TTFB barrier; the CacheStore
-commit happens asynchronously after the client has bytes.
+local-coordinator path (B == A) skips the internal RPC. Cold-path
+bytes stream from origin -> coordinator -> assembler -> client
+in parallel with the spool tee on B. Pre-header retry on B handles
+transient origin failures invisibly; the CacheStore commit happens
+asynchronously after the client has the full chunk.
 
 ### Diagram B: Cold miss, cross-replica coordinator
 
@@ -261,16 +270,18 @@ sequenceDiagram
     CS-->>A: ErrNotFound
     A->>B: /internal/fill?key=k (mTLS)
     B->>SF: Acquire(k) [leader]
-    SF->>O: GetRange(..., If-Match: etag)
-    O-->>SF: byte stream
-    par tee
-        SF->>Sp: bytes (ring + spool)
+    SF->>O: GetRange(..., If-Match: etag)<br/>(pre-header retry s8.6)
+    O-->>SF: first byte
+    Note over SF: commit boundary - origin healthy
+    par stream
+        SF-->>B: bytes as they arrive
+        B-->>A: stream
+        A-->>C: 200/206 + headers + body
+    and tee to spool
+        SF->>Sp: bytes (in parallel)
     end
-    SF->>Sp: Commit (fsync + close)
-    Note over SF,Sp: spool-fsync gate - first byte released now
-    SF-->>B: gate open
-    B-->>A: stream from Spool
-    A-->>C: 200/206 + headers + body
+    O-->>SF: remaining bytes
+    SF->>Sp: Commit (fsync + close) [after stream]
     SF-)CS: PutObject (or link()) commit [async]
     CS--)SF: 200 (commit_won) or failure
 ```
@@ -282,17 +293,22 @@ sequenceDiagram
    window is `metadata_ttl` (5m default). Must be visible in
    consumer-API documentation. See
    [design.md s11](./design.md#11-bounded-staleness-contract).
-2. **Commit-after-serve failure** - Cold-path TTFB is gated on local
-   fsync, not on CacheStore commit. If the async commit fails after
-   the client received bytes, the chunk is silently uncached and the
-   next request refills. Sustained failure is visible only via
+2. **Commit-after-serve failure** - The CacheStore commit happens
+   asynchronously after the client response is complete (cold-path
+   bytes stream origin -> client directly with pre-header retry on
+   the cache side). If the async commit fails after the client has
+   the full chunk, the chunk is silently uncached and the next
+   request refills. Sustained failure is visible only via
    `commit_after_serve_total{result="failed"}`; alerting is required.
    See [design.md s8.6](./design.md#86-failure-handling-without-re-stampede).
-3. **Spool locality** - The Spool MUST live on a local block device.
-   A boot-time `statfs(2)` check refuses to start when `spool.dir`
-   resides on NFS / SMB / CephFS / Lustre / GPFS / FUSE. A spool on
-   a network FS silently destroys the TTFB guarantee; the override
-   is intentionally test-only. See
+3. **Spool locality** - The Spool MUST live on a local block device
+   by default (boot-time `statfs(2)` check refuses to start on
+   NFS / SMB / CephFS / Lustre / GPFS / FUSE). With the v1 streaming
+   design the spool is no longer on the client TTFB path, so this
+   contract is defense-in-depth: a network-FS spool would only
+   degrade joiner-fallback latency, not first byte. Operators with
+   unusual placements MAY relax via `spool.require_local_fs: false`;
+   production deployments are expected to keep the default. See
    [design.md s10.4](./design.md#104-spool-locality-contract).
 4. **Limiter authority changeover overshoot** - Origin concurrency
    is capped cluster-wide via a Kubernetes-Lease-elected limiter
