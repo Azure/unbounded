@@ -122,6 +122,7 @@ spec:
                 enum:
                 - NodeReboot
                 - AgentUpgrade
+                - AgentReset
                 - HostReboot
                 - HostPowerOff
                 - HostPowerOn

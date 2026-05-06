@@ -33,7 +33,7 @@ Subcommands (called as individual workflow steps):
     validate-machine-cr-created        Verify agent self-registered a Machine CR.
     validate-node-reboot-operation     Verify NodeReboot MachineOperation restarts the node.
     validate-node-repave-upgrade       Verify OnDelete repave applies a new MCV Kubernetes version.
-    reset-agent                        Run agent reset and verify cleanup.
+    reset-agent                        Trigger AgentReset and verify cleanup.
     cleanup                            Tear down VM, networking, and Kind cluster.
 """
 
@@ -1259,19 +1259,24 @@ def validate_workload() -> None:
 # reset-agent
 # ---------------------------------------------------------------------------
 def reset_agent() -> None:
-    """Run unbounded-agent reset on the VM and verify the node is removed."""
+    """Trigger AgentReset and verify the node is removed."""
 
     if not SSH_KEY.exists():
         die(f"SSH key not found: {SSH_KEY}. Run create-vm first.")
 
-    log("Running 'unbounded-agent reset' on VM...")
-    run([
-        "timeout", "300",
-        "ssh", *SSH_OPTS, "-o", "ServerAliveInterval=30", SSH_TARGET,
-        "sudo unbounded-agent reset",
-    ])
+    operation_name = f"e2e-agent-reset-{int(time.time())}"
 
-    log("Agent reset completed on VM")
+    run_quiet([KUBECTL, "delete", _machine_operation_resource(), operation_name,
+               "--ignore-not-found"], check=False)
+
+    create_machine_operation(operation_name, AGENT_MACHINE_NAME, "AgentReset")
+
+    operation = wait_for_machine_operation_complete(operation_name, timeout_secs=300)
+    status = operation.get("status", {})
+    if status.get("message") != "AgentReset completed":
+        die(f"unexpected MachineOperation message: {status.get('message')!r}")
+
+    log("AgentReset MachineOperation completed")
 
     # Verify the node is removed from the cluster
     node_timeout = int(os.environ.get("NODE_TIMEOUT", "120"))
