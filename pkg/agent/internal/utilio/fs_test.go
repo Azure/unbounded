@@ -112,6 +112,13 @@ func TestUpdateSymlink(t *testing.T) {
 	if err := UpdateSymlink(linkPath, firstTarget); err != nil {
 		t.Fatalf("update symlink to first target: %v", err)
 	}
+	info, err := os.Stat(filepath.Dir(linkPath))
+	if err != nil {
+		t.Fatalf("stat created link directory: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o750 {
+		t.Fatalf("link directory mode = %o, want %o", got, 0o750)
+	}
 
 	target, err := filepath.EvalSymlinks(linkPath)
 	if err != nil {
