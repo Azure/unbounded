@@ -19,12 +19,6 @@ import (
 const (
 	agentUpgradeDownloadURLParameter = "downloadURL"
 	agentBinaryArchiveName           = "unbounded-agent"
-
-	envDaemonBinary         = "UNBOUNDED_AGENT_DAEMON_BINARY"
-	envDaemonBinaryBlue     = "UNBOUNDED_AGENT_DAEMON_BINARY_BLUE"
-	envDaemonBinaryGreen    = "UNBOUNDED_AGENT_DAEMON_BINARY_GREEN"
-	envDaemonBinaryCurrent  = "UNBOUNDED_AGENT_DAEMON_BINARY_CURRENT"
-	envDaemonBinaryLastGood = "UNBOUNDED_AGENT_DAEMON_BINARY_LAST_GOOD"
 )
 
 func agentUpgradeDownloadURL(parameters map[string]string) (string, error) {
@@ -82,7 +76,7 @@ func resolveSymlink(path string) (string, error) {
 }
 
 func daemonBinaryPath() string {
-	if path := strings.TrimSpace(os.Getenv(envDaemonBinary)); path != "" {
+	if path := strings.TrimSpace(os.Getenv(goalstates.EnvDaemonBinary)); path != "" {
 		return path
 	}
 
@@ -90,7 +84,7 @@ func daemonBinaryPath() string {
 }
 
 func daemonBinaryBluePath() string {
-	if path := strings.TrimSpace(os.Getenv(envDaemonBinaryBlue)); path != "" {
+	if path := strings.TrimSpace(os.Getenv(goalstates.EnvDaemonBinaryBlue)); path != "" {
 		return path
 	}
 
@@ -98,7 +92,7 @@ func daemonBinaryBluePath() string {
 }
 
 func daemonBinaryGreenPath() string {
-	if path := strings.TrimSpace(os.Getenv(envDaemonBinaryGreen)); path != "" {
+	if path := strings.TrimSpace(os.Getenv(goalstates.EnvDaemonBinaryGreen)); path != "" {
 		return path
 	}
 
@@ -106,7 +100,7 @@ func daemonBinaryGreenPath() string {
 }
 
 func daemonBinaryCurrentPath() string {
-	if path := strings.TrimSpace(os.Getenv(envDaemonBinaryCurrent)); path != "" {
+	if path := strings.TrimSpace(os.Getenv(goalstates.EnvDaemonBinaryCurrent)); path != "" {
 		return path
 	}
 
@@ -114,7 +108,7 @@ func daemonBinaryCurrentPath() string {
 }
 
 func daemonBinaryLastGoodPath() string {
-	if path := strings.TrimSpace(os.Getenv(envDaemonBinaryLastGood)); path != "" {
+	if path := strings.TrimSpace(os.Getenv(goalstates.EnvDaemonBinaryLastGood)); path != "" {
 		return path
 	}
 

@@ -20,6 +20,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/Azure/unbounded/pkg/agent/agentbinary"
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
 func TestAgentUpgradeDownloadURL(t *testing.T) {
@@ -47,11 +48,11 @@ func TestUpgradeDaemonBinary(t *testing.T) {
 	require.NoError(t, os.WriteFile(legacyPath, []byte("legacy"), 0o755))
 	require.NoError(t, os.Symlink(legacyPath, currentPath))
 
-	t.Setenv(envDaemonBinary, legacyPath)
-	t.Setenv(envDaemonBinaryCurrent, currentPath)
-	t.Setenv(envDaemonBinaryLastGood, lastGoodPath)
-	t.Setenv(envDaemonBinaryBlue, bluePath)
-	t.Setenv(envDaemonBinaryGreen, greenPath)
+	t.Setenv(goalstates.EnvDaemonBinary, legacyPath)
+	t.Setenv(goalstates.EnvDaemonBinaryCurrent, currentPath)
+	t.Setenv(goalstates.EnvDaemonBinaryLastGood, lastGoodPath)
+	t.Setenv(goalstates.EnvDaemonBinaryBlue, bluePath)
+	t.Setenv(goalstates.EnvDaemonBinaryGreen, greenPath)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/gzip")
@@ -85,10 +86,10 @@ func TestUpgradeDaemonBinary_AlternatesFromBlueToGreen(t *testing.T) {
 	require.NoError(t, os.WriteFile(bluePath, []byte("blue"), 0o755))
 	require.NoError(t, os.Symlink(bluePath, currentPath))
 
-	t.Setenv(envDaemonBinaryCurrent, currentPath)
-	t.Setenv(envDaemonBinaryLastGood, lastGoodPath)
-	t.Setenv(envDaemonBinaryBlue, bluePath)
-	t.Setenv(envDaemonBinaryGreen, greenPath)
+	t.Setenv(goalstates.EnvDaemonBinaryCurrent, currentPath)
+	t.Setenv(goalstates.EnvDaemonBinaryLastGood, lastGoodPath)
+	t.Setenv(goalstates.EnvDaemonBinaryBlue, bluePath)
+	t.Setenv(goalstates.EnvDaemonBinaryGreen, greenPath)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		require.NoError(t, writeAgentArchive(w, []byte("green")))
@@ -106,12 +107,152 @@ func TestUpgradeDaemonBinary_AlternatesFromBlueToGreen(t *testing.T) {
 	assert.Equal(t, bluePath, lastGoodTarget)
 }
 
+func TestUpgradeDaemonBinary_SequentialSuccesses(t *testing.T) {
+	paths := setupDaemonBinaryTest(t)
+	server := newAgentArchiveSequenceServer(t, []archiveResponse{
+		{binary: []byte("agent-a")},
+		{binary: []byte("agent-b")},
+	})
+	t.Cleanup(server.Close)
+
+	require.NoError(t, upgradeDaemonBinary(context.Background(), slog.Default(), server.URL))
+	assertSymlinkTarget(t, paths.current, paths.blue)
+	assertSymlinkTarget(t, paths.lastGood, paths.legacy)
+
+	require.NoError(t, upgradeDaemonBinary(context.Background(), slog.Default(), server.URL))
+	assertSymlinkTarget(t, paths.current, paths.green)
+	assertSymlinkTarget(t, paths.lastGood, paths.blue)
+	assertFileContent(t, paths.blue, "agent-a")
+	assertFileContent(t, paths.green, "agent-b")
+}
+
+func TestUpgradeDaemonBinary_SequentialSuccessThenFailure(t *testing.T) {
+	paths := setupDaemonBinaryTest(t)
+	server := newAgentArchiveSequenceServer(t, []archiveResponse{
+		{binary: []byte("agent-a")},
+		{status: http.StatusInternalServerError},
+	})
+	t.Cleanup(server.Close)
+
+	require.NoError(t, upgradeDaemonBinary(context.Background(), slog.Default(), server.URL))
+	require.Error(t, upgradeDaemonBinary(context.Background(), slog.Default(), server.URL))
+
+	assertSymlinkTarget(t, paths.current, paths.blue)
+	assertSymlinkTarget(t, paths.lastGood, paths.legacy)
+	assertFileContent(t, paths.blue, "agent-a")
+	assert.NoFileExists(t, paths.green)
+}
+
+func TestUpgradeDaemonBinary_SequentialFailureThenFailure(t *testing.T) {
+	paths := setupDaemonBinaryTest(t)
+	server := newAgentArchiveSequenceServer(t, []archiveResponse{
+		{status: http.StatusInternalServerError},
+		{status: http.StatusInternalServerError},
+	})
+	t.Cleanup(server.Close)
+
+	require.Error(t, upgradeDaemonBinary(context.Background(), slog.Default(), server.URL))
+	require.Error(t, upgradeDaemonBinary(context.Background(), slog.Default(), server.URL))
+
+	assertSymlinkTarget(t, paths.current, paths.legacy)
+	assert.NoFileExists(t, paths.lastGood)
+	assert.NoFileExists(t, paths.blue)
+	assert.NoFileExists(t, paths.green)
+}
+
+func TestUpgradeDaemonBinary_SequentialFailureThenSuccess(t *testing.T) {
+	paths := setupDaemonBinaryTest(t)
+	server := newAgentArchiveSequenceServer(t, []archiveResponse{
+		{status: http.StatusInternalServerError},
+		{binary: []byte("agent-b")},
+	})
+	t.Cleanup(server.Close)
+
+	require.Error(t, upgradeDaemonBinary(context.Background(), slog.Default(), server.URL))
+	require.NoError(t, upgradeDaemonBinary(context.Background(), slog.Default(), server.URL))
+
+	assertSymlinkTarget(t, paths.current, paths.blue)
+	assertSymlinkTarget(t, paths.lastGood, paths.legacy)
+	assertFileContent(t, paths.blue, "agent-b")
+	assert.NoFileExists(t, paths.green)
+}
+
 func TestDownloadAgentBinaryFromTarGz_RejectsUnsupportedScheme(t *testing.T) {
 	t.Parallel()
 
 	err := agentbinary.InstallFromTarGz(context.Background(), "file:///tmp/unbounded-agent.tar.gz", filepath.Join(t.TempDir(), "agent"), agentBinaryArchiveName, 0o755)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unsupported agent download URL scheme")
+}
+
+type daemonBinaryTestPaths struct {
+	legacy   string
+	current  string
+	lastGood string
+	blue     string
+	green    string
+}
+
+func setupDaemonBinaryTest(t *testing.T) daemonBinaryTestPaths {
+	t.Helper()
+
+	dir := t.TempDir()
+	paths := daemonBinaryTestPaths{
+		legacy:   filepath.Join(dir, "unbounded-agent"),
+		current:  filepath.Join(dir, "unbounded-agent-current"),
+		lastGood: filepath.Join(dir, "unbounded-agent-last-good"),
+		blue:     filepath.Join(dir, "unbounded-agent-blue"),
+		green:    filepath.Join(dir, "unbounded-agent-green"),
+	}
+
+	require.NoError(t, os.WriteFile(paths.legacy, []byte("legacy"), 0o755))
+	require.NoError(t, os.Symlink(paths.legacy, paths.current))
+	t.Setenv(goalstates.EnvDaemonBinary, paths.legacy)
+	t.Setenv(goalstates.EnvDaemonBinaryCurrent, paths.current)
+	t.Setenv(goalstates.EnvDaemonBinaryLastGood, paths.lastGood)
+	t.Setenv(goalstates.EnvDaemonBinaryBlue, paths.blue)
+	t.Setenv(goalstates.EnvDaemonBinaryGreen, paths.green)
+
+	return paths
+}
+
+type archiveResponse struct {
+	binary []byte
+	status int
+}
+
+func newAgentArchiveSequenceServer(t *testing.T, responses []archiveResponse) *httptest.Server {
+	t.Helper()
+
+	next := 0
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		require.Less(t, next, len(responses))
+		response := responses[next]
+		next++
+		if response.status != 0 {
+			http.Error(w, "failed", response.status)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/gzip")
+		require.NoError(t, writeAgentArchive(w, response.binary))
+	}))
+}
+
+func assertSymlinkTarget(t *testing.T, linkPath, expectedTarget string) {
+	t.Helper()
+
+	target, err := filepath.EvalSymlinks(linkPath)
+	require.NoError(t, err)
+	assert.Equal(t, expectedTarget, target)
+}
+
+func assertFileContent(t *testing.T, path, expected string) {
+	t.Helper()
+
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, expected, string(data))
 }
 
 func writeAgentArchive(w io.Writer, binary []byte) error {

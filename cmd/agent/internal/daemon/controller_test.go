@@ -34,9 +34,12 @@ type fakeNodeOperator struct {
 	repaveConfig *provision.UnboundedAgentConfig
 	repaveErr    error
 
-	upgradeCalled bool
-	upgradeURL    string
-	upgradeErr    error
+	stageUpgradeCalled bool
+	stageUpgradeURL    string
+	stageUpgradeErr    error
+
+	restartAgentCalled bool
+	restartAgentErr    error
 }
 
 func (op *fakeNodeOperator) FindActiveMachine(*slog.Logger) (*ActiveMachine, error) {
@@ -66,11 +69,17 @@ func (op *fakeNodeOperator) RepaveNode(
 	return op.repaveErr
 }
 
-func (op *fakeNodeOperator) UpgradeAgent(_ context.Context, _ *slog.Logger, downloadURL string) error {
-	op.upgradeCalled = true
-	op.upgradeURL = downloadURL
+func (op *fakeNodeOperator) StageAgentUpgrade(_ context.Context, _ *slog.Logger, downloadURL string) error {
+	op.stageUpgradeCalled = true
+	op.stageUpgradeURL = downloadURL
 
-	return op.upgradeErr
+	return op.stageUpgradeErr
+}
+
+func (op *fakeNodeOperator) RestartAgentDaemon(_ context.Context, _ *slog.Logger) error {
+	op.restartAgentCalled = true
+
+	return op.restartAgentErr
 }
 
 func fakeStatusClient(objs ...client.Object) client.Client {
@@ -197,8 +206,9 @@ func TestReconcileAgentUpgrade_Complete(t *testing.T) {
 
 	_, err := reconciler.reconcileMachineOperation(context.Background(), "op-1")
 	require.NoError(t, err)
-	assert.True(t, op.upgradeCalled)
-	assert.Equal(t, "https://example.com/unbounded-agent.tar.gz", op.upgradeURL)
+	assert.True(t, op.stageUpgradeCalled)
+	assert.Equal(t, "https://example.com/unbounded-agent.tar.gz", op.stageUpgradeURL)
+	assert.True(t, op.restartAgentCalled)
 
 	var updated v1alpha3.MachineOperation
 	require.NoError(t, reconciler.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
@@ -229,7 +239,8 @@ func TestReconcileAgentUpgrade_MissingDownloadURL(t *testing.T) {
 
 	_, err := reconciler.reconcileMachineOperation(context.Background(), "op-1")
 	require.NoError(t, err)
-	assert.False(t, op.upgradeCalled)
+	assert.False(t, op.stageUpgradeCalled)
+	assert.False(t, op.restartAgentCalled)
 
 	var updated v1alpha3.MachineOperation
 	require.NoError(t, reconciler.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
@@ -250,7 +261,7 @@ func TestReconcileAgentUpgrade_Failed(t *testing.T) {
 		},
 	}
 
-	op := &fakeNodeOperator{upgradeErr: errors.New("upgrade failed")}
+	op := &fakeNodeOperator{stageUpgradeErr: errors.New("upgrade failed")}
 	reconciler := &daemonReconciler{
 		Client:       fakeStatusClient(machine, machineOp),
 		log:          discardLogger(),
@@ -265,6 +276,7 @@ func TestReconcileAgentUpgrade_Failed(t *testing.T) {
 	require.NoError(t, reconciler.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
 	assert.Equal(t, v1alpha3.OperationPhaseFailed, updated.Status.Phase)
 	assert.Equal(t, "upgrade failed", updated.Status.Message)
+	assert.False(t, op.restartAgentCalled)
 }
 
 func TestReconcileRepave_UsesDesiredMachineConfigurationVersion(t *testing.T) {

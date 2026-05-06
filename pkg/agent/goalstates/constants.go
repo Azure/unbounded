@@ -28,6 +28,12 @@ const (
 	DaemonBinaryCurrentPath  = "/usr/local/bin/unbounded-agent-current"
 	DaemonBinaryLastGoodPath = "/usr/local/bin/unbounded-agent-last-good"
 	DaemonRecoveryScriptPath = "/usr/local/bin/unbounded-agent-daemon-recovery.sh"
+
+	EnvDaemonBinary         = "UNBOUNDED_AGENT_DAEMON_BINARY"
+	EnvDaemonBinaryBlue     = "UNBOUNDED_AGENT_DAEMON_BINARY_BLUE"
+	EnvDaemonBinaryGreen    = "UNBOUNDED_AGENT_DAEMON_BINARY_GREEN"
+	EnvDaemonBinaryCurrent  = "UNBOUNDED_AGENT_DAEMON_BINARY_CURRENT"
+	EnvDaemonBinaryLastGood = "UNBOUNDED_AGENT_DAEMON_BINARY_LAST_GOOD"
 )
 
 // NSpawn machine names used for alternating in-place upgrades.

@@ -80,12 +80,22 @@ func (r *daemonReconciler) reconcileAgentUpgrade(ctx context.Context, op *v1alph
 		return reconcile.Result{}, finishErr
 	}
 
-	if err := r.nodeOperator.UpgradeAgent(ctx, r.log, downloadURL); err != nil {
+	if err := r.nodeOperator.StageAgentUpgrade(ctx, r.log, downloadURL); err != nil {
 		_, finishErr := finishOperation(ctx, r.Client, op.Name, v1alpha3.OperationPhaseFailed, "ExecutionFailed", err.Error(), 0)
 		return reconcile.Result{}, finishErr
 	}
 
-	return finishOperation(ctx, r.Client, op.Name, v1alpha3.OperationPhaseComplete, "Succeeded", "AgentUpgrade completed", machine.Generation)
+	result, err := finishOperation(ctx, r.Client, op.Name, v1alpha3.OperationPhaseComplete, "Succeeded", "AgentUpgrade completed", machine.Generation)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+
+	if err := r.nodeOperator.RestartAgentDaemon(ctx, r.log); err != nil {
+		_, finishErr := finishOperation(ctx, r.Client, op.Name, v1alpha3.OperationPhaseFailed, "ExecutionFailed", err.Error(), 0)
+		return reconcile.Result{}, finishErr
+	}
+
+	return result, nil
 }
 
 func (r *daemonReconciler) mapMachineOperation(ctx context.Context, obj client.Object) []daemonRequest {

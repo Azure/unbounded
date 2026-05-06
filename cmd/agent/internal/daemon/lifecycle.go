@@ -4,12 +4,13 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	_ "embed"
 	"fmt"
 	"log/slog"
 	"path/filepath"
-	"strings"
+	"text/template"
 
 	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
@@ -45,16 +46,28 @@ func (d *enableDaemon) Name() string { return "enable-daemon" }
 
 func (d *enableDaemon) Do(ctx context.Context) error {
 	unitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonUnit)
-	if err := writeFile(unitPath, renderDaemonAsset(daemonServiceContent), 0o644); err != nil {
+	daemonService, err := renderDaemonAsset("daemon-service", daemonServiceContent)
+	if err != nil {
+		return fmt.Errorf("rendering %s: %w", unitPath, err)
+	}
+	if err := writeFile(unitPath, daemonService, 0o644); err != nil {
 		return fmt.Errorf("writing %s: %w", unitPath, err)
 	}
 
 	recoveryUnitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonRecoveryUnit)
-	if err := writeFile(recoveryUnitPath, renderDaemonAsset(daemonRecoveryServiceContent), 0o644); err != nil {
+	recoveryService, err := renderDaemonAsset("daemon-recovery-service", daemonRecoveryServiceContent)
+	if err != nil {
+		return fmt.Errorf("rendering %s: %w", recoveryUnitPath, err)
+	}
+	if err := writeFile(recoveryUnitPath, recoveryService, 0o644); err != nil {
 		return fmt.Errorf("writing %s: %w", recoveryUnitPath, err)
 	}
 
-	if err := writeFile(goalstates.DaemonRecoveryScriptPath, renderDaemonAsset(daemonRecoveryScriptContent), 0o755); err != nil {
+	recoveryScript, err := renderDaemonAsset("daemon-recovery-script", daemonRecoveryScriptContent)
+	if err != nil {
+		return fmt.Errorf("rendering %s: %w", goalstates.DaemonRecoveryScriptPath, err)
+	}
+	if err := writeFile(goalstates.DaemonRecoveryScriptPath, recoveryScript, 0o755); err != nil {
 		return fmt.Errorf("writing %s: %w", goalstates.DaemonRecoveryScriptPath, err)
 	}
 
@@ -77,16 +90,32 @@ func (d *enableDaemon) Do(ctx context.Context) error {
 	return nil
 }
 
-func renderDaemonAsset(content []byte) []byte {
-	replacer := strings.NewReplacer(
-		"{{ .DaemonUnit }}", goalstates.DaemonUnit,
-		"{{ .DaemonRecoveryUnit }}", goalstates.DaemonRecoveryUnit,
-		"{{ .DaemonBinaryCurrentPath }}", goalstates.DaemonBinaryCurrentPath,
-		"{{ .DaemonBinaryLastGoodPath }}", goalstates.DaemonBinaryLastGoodPath,
-		"{{ .DaemonRecoveryScriptPath }}", goalstates.DaemonRecoveryScriptPath,
-	)
+func renderDaemonAsset(name string, content []byte) ([]byte, error) {
+	data := struct {
+		DaemonUnit               string
+		DaemonRecoveryUnit       string
+		DaemonBinaryCurrentPath  string
+		DaemonBinaryLastGoodPath string
+		DaemonRecoveryScriptPath string
+	}{
+		DaemonUnit:               goalstates.DaemonUnit,
+		DaemonRecoveryUnit:       goalstates.DaemonRecoveryUnit,
+		DaemonBinaryCurrentPath:  goalstates.DaemonBinaryCurrentPath,
+		DaemonBinaryLastGoodPath: goalstates.DaemonBinaryLastGoodPath,
+		DaemonRecoveryScriptPath: goalstates.DaemonRecoveryScriptPath,
+	}
 
-	return []byte(replacer.Replace(string(content)))
+	tmpl, err := template.New(name).Parse(string(content))
+	if err != nil {
+		return nil, err
+	}
+
+	var rendered bytes.Buffer
+	if err := tmpl.Execute(&rendered, data); err != nil {
+		return nil, err
+	}
+
+	return rendered.Bytes(), nil
 }
 
 // ---------------------------------------------------------------------------

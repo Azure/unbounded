@@ -7,7 +7,6 @@ package agentbinary
 import (
 	"context"
 	"fmt"
-	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -34,28 +33,12 @@ func InstallFromTarGz(ctx context.Context, downloadURL, targetPath, binaryName s
 			continue
 		}
 
-		countingReader := &countingReader{r: tarFile.Body}
-		if err := utilio.InstallFile(targetPath, countingReader, perm); err != nil {
+		if err := utilio.InstallFile(targetPath, tarFile.Body, perm); err != nil {
 			return fmt.Errorf("install %s from %q: %w", binaryName, downloadURL, err)
-		}
-		if countingReader.n == 0 {
-			return fmt.Errorf("agent binary %q in archive %q is empty", binaryName, downloadURL)
 		}
 
 		return nil
 	}
 
 	return fmt.Errorf("agent binary %q not found in archive %q", binaryName, downloadURL)
-}
-
-type countingReader struct {
-	r io.Reader
-	n int64
-}
-
-func (r *countingReader) Read(p []byte) (int, error) {
-	n, err := r.r.Read(p)
-	r.n += int64(n)
-
-	return n, err
 }
