@@ -84,7 +84,7 @@ func (t *stopDaemon) Do(ctx context.Context) error {
 		t.log.Warn("failed to stop daemon (may not be running)", "error", err)
 	}
 
-	return RemoveDaemonUnit(t.log).Do(ctx)
+	return disableAndRemoveDaemonUnit(ctx, t.log)
 }
 
 // ---------------------------------------------------------------------------
@@ -104,12 +104,16 @@ func RemoveDaemonUnit(log *slog.Logger) phases.Task {
 func (t *removeDaemonUnit) Name() string { return "remove-daemon-unit" }
 
 func (t *removeDaemonUnit) Do(ctx context.Context) error {
-	if err := executil.RunCmd(ctx, t.log, executil.Systemctl(), "disable", goalstates.DaemonUnit); err != nil {
-		t.log.Warn("failed to disable daemon (may already be absent or systemd unavailable)", "error", err)
+	return disableAndRemoveDaemonUnit(ctx, t.log)
+}
+
+func disableAndRemoveDaemonUnit(ctx context.Context, log *slog.Logger) error {
+	if err := executil.RunCmd(ctx, log, executil.Systemctl(), "disable", goalstates.DaemonUnit); err != nil {
+		log.Warn("failed to disable daemon (may already be absent or systemd unavailable)", "error", err)
 	}
 
 	unitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonUnit)
-	removeFileIfExists(t.log, unitPath)
+	removeFileIfExists(log, unitPath)
 
 	return nil
 }
