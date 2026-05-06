@@ -49,8 +49,13 @@ func run(ctx context.Context, log *slog.Logger, newClient kubeClientFunc) error 
 		"applied_version", active.Config.Cluster.Version,
 	)
 
-	// Build a controller-runtime client from the applied config.
-	kubeClient, err := buildKubeClient(active.Config, newClient)
+	// Build Kubernetes clients from the applied config.
+	restCfg, err := buildRESTConfig(active.Config)
+	if err != nil {
+		return fmt.Errorf("build rest config: %w", err)
+	}
+
+	kubeClient, err := newClient(restCfg, client.Options{Scheme: newScheme()})
 	if err != nil {
 		return fmt.Errorf("build kube client: %w", err)
 	}
@@ -66,20 +71,16 @@ func run(ctx context.Context, log *slog.Logger, newClient kubeClientFunc) error 
 		return fmt.Errorf("register machine: %w", err)
 	}
 
-	// Block until shutdown.
-	<-ctx.Done()
-	log.Info("daemon shutting down")
-
-	return nil
+	return runController(ctx, log, restCfg, active.Config.MachineName)
 }
 
-// buildKubeClient creates a controller-runtime WithWatch client from the
-// applied agent config. It authenticates with the bootstrap token and trusts
-// the cluster CA certificate embedded in the config.
+// buildRESTConfig builds a Kubernetes REST config from the applied agent
+// config. It authenticates with the bootstrap token and trusts the cluster CA
+// certificate embedded in the config.
 //
 // This avoids reading kubeconfig files from inside the nspawn machine, which
 // contain nspawn-internal paths that do not resolve on the host filesystem.
-func buildKubeClient(cfg *provision.AgentConfig, newClient kubeClientFunc) (client.WithWatch, error) {
+func buildRESTConfig(cfg *provision.AgentConfig) (*rest.Config, error) {
 	if cfg.Kubelet.ApiServer == "" {
 		return nil, fmt.Errorf("applied config has no API server URL")
 	}
@@ -110,9 +111,7 @@ func buildKubeClient(cfg *provision.AgentConfig, newClient kubeClientFunc) (clie
 		},
 	}
 
-	s := newScheme()
-
-	return newClient(restCfg, client.Options{Scheme: s})
+	return restCfg, nil
 }
 
 // registerMachine ensures a Machine CR exists for this node. If the CR

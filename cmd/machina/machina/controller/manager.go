@@ -69,6 +69,23 @@ func RunManager(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("setup Machine controller: %w", err)
 	}
 
+	// Setup MachineConfiguration controller - manages versioned config snapshots.
+	if err := (&MachineConfigurationReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("setup MachineConfiguration controller: %w", err)
+	}
+
+	// Setup Machine configuration binding controller - resolves configurationRef
+	// from explicit refs or MachineConfiguration selectors.
+	if err := (&MachineConfigurationBindingReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("setup Machine configuration binding controller: %w", err)
+	}
+
 	// Add health checks
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		return fmt.Errorf("add healthz check: %w", err)

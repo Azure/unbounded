@@ -116,6 +116,38 @@ func hasDrift(applied, desired *provision.AgentConfig) bool {
 	return false
 }
 
+// restartNode restarts the currently active nspawn-backed node in place.
+func restartNode(ctx context.Context, log *slog.Logger, active *ActiveMachine) error {
+	gs, err := goalstates.ResolveMachine(log, active.Config, active.Name, nil)
+	if err != nil {
+		return fmt.Errorf("resolve machine goal state: %w", err)
+	}
+
+	log.Info("restarting active node", "machine", active.Name)
+
+	err = phases.Serial(log,
+		nodestop.StopNode(log, active.Name),
+		nodestart.StartNode(log, gs.NodeStart),
+		nodestart.WaitForKubelet(log, active.Name),
+	).Do(ctx)
+	if err != nil {
+		return err
+	}
+
+	log.Info("active node restarted", "machine", active.Name)
+
+	return nil
+}
+
+func restartActiveNode(ctx context.Context, log *slog.Logger) error {
+	active, err := findActiveMachine(log)
+	if err != nil {
+		return fmt.Errorf("find active machine: %w", err)
+	}
+
+	return restartNode(ctx, log, active)
+}
+
 // UpdateNode performs the nspawn machine update:
 //  1. Provision a new rootfs on the alternate machine
 //  2. Stop the old machine (graceful service shutdown + nspawn teardown)
