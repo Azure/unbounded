@@ -210,6 +210,56 @@ func TestEnsureDaemonBinaryLinks_PreservesExistingLinks(t *testing.T) {
 	assertSymlinkTarget(t, paths.legacy, paths.green)
 }
 
+func TestInitialDaemonBinaryTarget(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	paths := goalstates.AgentUpgradePaths{
+		BinaryPath: filepath.Join(dir, "unbounded-agent"),
+		BluePath:   filepath.Join(dir, "unbounded-agent-blue"),
+		GreenPath:  filepath.Join(dir, "unbounded-agent-green"),
+	}
+	require.NoError(t, os.WriteFile(paths.BinaryPath, []byte("legacy"), 0o755))
+	require.NoError(t, os.WriteFile(paths.BluePath, []byte("blue"), 0o755))
+	require.NoError(t, os.WriteFile(paths.GreenPath, []byte("green"), 0o755))
+
+	target, err := initialDaemonBinaryTarget(paths)
+	require.NoError(t, err)
+	assert.Equal(t, paths.BluePath, target)
+
+	require.NoError(t, os.Chmod(paths.BluePath, 0o644))
+	target, err = initialDaemonBinaryTarget(paths)
+	require.NoError(t, err)
+	assert.Equal(t, paths.GreenPath, target)
+
+	require.NoError(t, os.Chmod(paths.GreenPath, 0o644))
+	target, err = initialDaemonBinaryTarget(paths)
+	require.NoError(t, err)
+	assert.Equal(t, paths.BinaryPath, target)
+
+	require.NoError(t, os.Chmod(paths.BinaryPath, 0o644))
+	_, err = initialDaemonBinaryTarget(paths)
+	require.Error(t, err)
+}
+
+func TestIsExecutableFile(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	executablePath := filepath.Join(dir, "executable")
+	nonExecutablePath := filepath.Join(dir, "not-executable")
+	directoryPath := filepath.Join(dir, "directory")
+
+	require.NoError(t, os.WriteFile(executablePath, []byte("binary"), 0o755))
+	require.NoError(t, os.WriteFile(nonExecutablePath, []byte("binary"), 0o644))
+	require.NoError(t, os.Mkdir(directoryPath, 0o755))
+
+	assert.True(t, isExecutableFile(executablePath))
+	assert.False(t, isExecutableFile(nonExecutablePath))
+	assert.False(t, isExecutableFile(filepath.Join(dir, "missing")))
+	assert.False(t, isExecutableFile(directoryPath))
+}
+
 type daemonBinaryTestPaths struct {
 	legacy   string
 	current  string

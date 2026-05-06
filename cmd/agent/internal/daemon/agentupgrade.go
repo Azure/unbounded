@@ -100,6 +100,9 @@ func ensureDaemonBinaryLinks(log *slog.Logger) error {
 	}
 
 	if currentTarget != paths.BinaryPath {
+		// Do not replace the compatibility path when the current symlink
+		// already resolves to that path. That preserves legacy installs and
+		// avoids creating a BinaryPath -> CurrentPath -> BinaryPath loop.
 		if err := updateSymlink(paths.BinaryPath, paths.CurrentPath); err != nil {
 			return fmt.Errorf("initialize daemon compatibility symlink: %w", err)
 		}
