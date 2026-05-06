@@ -27,8 +27,8 @@ unbounded-kube is organized into several directories:
 - `deploy/` - component manifests for deploying on a Kubernetes cluster.
   - `machina/` - machina controller manifest templates (*.yaml.tmpl) plus generated CRDs under `crd/`; rendered output lives under `machina/rendered/` (gitignored, produced by `make machina-manifests`).
   - `net/` - unbounded-net controller and node manifest templates (*.yaml.tmpl); rendered output lives under `net/rendered/` (gitignored, produced by `make net-manifests`).
-- `docs/` - documentation for the project.
-  - `net/` - unbounded-net specific documentation.
+- `designs/` - design documents, proposals, and internal planning documentation for the project.
+- `docs/` - public web site documentation only. Do not place design documents, plans, or ad-hoc internal docs here.
 - `frontend/` - React/TypeScript web UI for network topology visualization (built with Vite).
 - `hack/` - where development tools and scripts are located.
   - `cmd/` - development tools that are built as Go binaries (forge, render-manifests). `render-manifests` is a generic Go template renderer driven by repeatable `--set key=value` flags; templates rely on sprig's `default` for fallbacks.
