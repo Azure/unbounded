@@ -183,7 +183,6 @@ func shouldEnqueueMachineOperation(ctx context.Context, c client.Client, log *sl
 
 	switch op.Spec.OperationKind {
 	case v1alpha3.OperationNodeReboot, v1alpha3.OperationAgentUpgrade, v1alpha3.OperationAgentReset:
-	// handled below
 	default:
 		return false
 	}
