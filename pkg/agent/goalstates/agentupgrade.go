@@ -34,15 +34,15 @@ func DefaultAgentUpgradePaths() AgentUpgradePaths {
 // applying environment overrides.
 func ResolvedAgentUpgradePaths() AgentUpgradePaths {
 	return AgentUpgradePaths{
-		BinaryPath:   envOrDefault(EnvDaemonBinary, DaemonBinaryPath),
-		BluePath:     envOrDefault(EnvDaemonBinaryBlue, DaemonBinaryBluePath),
-		GreenPath:    envOrDefault(EnvDaemonBinaryGreen, DaemonBinaryGreenPath),
-		CurrentPath:  envOrDefault(EnvDaemonBinaryCurrent, DaemonBinaryCurrentPath),
-		LastGoodPath: envOrDefault(EnvDaemonBinaryLastGood, DaemonBinaryLastGoodPath),
+		BinaryPath:   getEnvOrDefault(EnvDaemonBinary, DaemonBinaryPath),
+		BluePath:     getEnvOrDefault(EnvDaemonBinaryBlue, DaemonBinaryBluePath),
+		GreenPath:    getEnvOrDefault(EnvDaemonBinaryGreen, DaemonBinaryGreenPath),
+		CurrentPath:  getEnvOrDefault(EnvDaemonBinaryCurrent, DaemonBinaryCurrentPath),
+		LastGoodPath: getEnvOrDefault(EnvDaemonBinaryLastGood, DaemonBinaryLastGoodPath),
 	}
 }
 
-func envOrDefault(name, defaultValue string) string {
+func getEnvOrDefault(name, defaultValue string) string {
 	if value := strings.TrimSpace(os.Getenv(name)); value != "" {
 		return value
 	}

@@ -72,14 +72,25 @@ func CleanDir(path string) (retErr error) {
 
 // UpdateSymlink atomically updates linkPath to point at targetPath.
 func UpdateSymlink(linkPath, targetPath string) error {
-	if err := os.MkdirAll(filepath.Dir(linkPath), 0o750); err != nil {
+	dir := filepath.Dir(linkPath)
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return err
 	}
 
-	tmpPath := fmt.Sprintf("%s.tmp", linkPath)
-	if err := os.Remove(tmpPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+	tmpFile, err := os.CreateTemp(dir, "."+filepath.Base(linkPath)+".*.tmp")
+	if err != nil {
 		return err
 	}
+	tmpPath := tmpFile.Name()
+	if err := tmpFile.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Remove(tmpPath); err != nil {
+		return err
+	}
+	defer func() { _ = os.Remove(tmpPath) }()
+
 	if err := os.Symlink(targetPath, tmpPath); err != nil {
 		return err
 	}
