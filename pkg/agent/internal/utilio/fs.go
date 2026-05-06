@@ -77,20 +77,14 @@ func UpdateSymlink(linkPath, targetPath string) error {
 		return err
 	}
 
-	tmpFile, err := os.CreateTemp(dir, "."+filepath.Base(linkPath)+".*.tmp")
+	base := filepath.Base(linkPath)
+	tmpDir, err := os.MkdirTemp(dir, "."+base+".*.tmp")
 	if err != nil {
 		return err
 	}
-	tmpPath := tmpFile.Name()
-	if err := tmpFile.Close(); err != nil {
-		_ = os.Remove(tmpPath)
-		return err
-	}
-	if err := os.Remove(tmpPath); err != nil {
-		return err
-	}
-	defer func() { _ = os.Remove(tmpPath) }()
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
+	tmpPath := filepath.Join(tmpDir, base)
 	if err := os.Symlink(targetPath, tmpPath); err != nil {
 		return err
 	}

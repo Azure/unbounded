@@ -174,8 +174,8 @@ func isExecutableFile(path string) bool {
 	return info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0
 }
 
-func resolveSymlink(path, fallbackPath string) (string, error) {
-	targetPath, err := filepath.EvalSymlinks(path)
+func resolveSymlink(symlinkPath, fallbackPath string) (string, error) {
+	targetPath, err := filepath.EvalSymlinks(symlinkPath)
 	if err == nil {
 		return targetPath, nil
 	}
