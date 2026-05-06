@@ -3,7 +3,10 @@
 
 package goalstates
 
-import "github.com/Azure/unbounded/pkg/agent/internal/utilio"
+import (
+	"os"
+	"strings"
+)
 
 const AgentUpgradeBinaryName = "unbounded-agent"
 
@@ -31,12 +34,20 @@ func DefaultAgentUpgradePaths() AgentUpgradePaths {
 // applying environment overrides.
 func ResolvedAgentUpgradePaths() AgentUpgradePaths {
 	return AgentUpgradePaths{
-		BinaryPath:   utilio.GetEnvOrDefault(EnvDaemonBinary, DaemonBinaryPath),
-		BluePath:     utilio.GetEnvOrDefault(EnvDaemonBinaryBlue, DaemonBinaryBluePath),
-		GreenPath:    utilio.GetEnvOrDefault(EnvDaemonBinaryGreen, DaemonBinaryGreenPath),
-		CurrentPath:  utilio.GetEnvOrDefault(EnvDaemonBinaryCurrent, DaemonBinaryCurrentPath),
-		LastGoodPath: utilio.GetEnvOrDefault(EnvDaemonBinaryLastGood, DaemonBinaryLastGoodPath),
+		BinaryPath:   resolveDaemonBinaryPath(EnvDaemonBinary, DaemonBinaryPath),
+		BluePath:     resolveDaemonBinaryPath(EnvDaemonBinaryBlue, DaemonBinaryBluePath),
+		GreenPath:    resolveDaemonBinaryPath(EnvDaemonBinaryGreen, DaemonBinaryGreenPath),
+		CurrentPath:  resolveDaemonBinaryPath(EnvDaemonBinaryCurrent, DaemonBinaryCurrentPath),
+		LastGoodPath: resolveDaemonBinaryPath(EnvDaemonBinaryLastGood, DaemonBinaryLastGoodPath),
 	}
+}
+
+func resolveDaemonBinaryPath(envName, defaultPath string) string {
+	if path := strings.TrimSpace(os.Getenv(envName)); path != "" {
+		return path
+	}
+
+	return defaultPath
 }
 
 // AgentUpgrade captures the desired host-side binary state for one upgrade.

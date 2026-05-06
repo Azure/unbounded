@@ -53,6 +53,16 @@ func TestResolvedAgentUpgradePaths(t *testing.T) {
 	assert.Equal(t, lastGoodPath, paths.LastGoodPath)
 }
 
+func TestResolvedAgentUpgradePaths_UsesDefaultsForBlankOverrides(t *testing.T) {
+	t.Setenv(EnvDaemonBinary, "")
+	t.Setenv(EnvDaemonBinaryBlue, " ")
+
+	paths := ResolvedAgentUpgradePaths()
+
+	assert.Equal(t, DaemonBinaryPath, paths.BinaryPath)
+	assert.Equal(t, DaemonBinaryBluePath, paths.BluePath)
+}
+
 func TestResolveAgentUpgrade_UsesGreenWhenCurrentIsBlue(t *testing.T) {
 	t.Parallel()
 
