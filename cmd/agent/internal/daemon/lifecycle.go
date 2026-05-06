@@ -22,6 +22,12 @@ import (
 //go:embed assets/unbounded-agent-daemon.service
 var daemonServiceContent []byte
 
+//go:embed assets/unbounded-agent-daemon-recovery.service
+var daemonRecoveryServiceContent []byte
+
+//go:embed assets/unbounded-agent-daemon-recovery.sh
+var daemonRecoveryScriptContent []byte
+
 type enableDaemon struct {
 	log *slog.Logger
 }
@@ -38,9 +44,17 @@ func (d *enableDaemon) Name() string { return "enable-daemon" }
 
 func (d *enableDaemon) Do(ctx context.Context) error {
 	unitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonUnit)
-
 	if err := writeFile(unitPath, daemonServiceContent, 0o644); err != nil {
 		return fmt.Errorf("writing %s: %w", unitPath, err)
+	}
+
+	recoveryUnitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonRecoveryUnit)
+	if err := writeFile(recoveryUnitPath, daemonRecoveryServiceContent, 0o644); err != nil {
+		return fmt.Errorf("writing %s: %w", recoveryUnitPath, err)
+	}
+
+	if err := writeFile(goalstates.DaemonRecoveryScriptPath, daemonRecoveryScriptContent, 0o755); err != nil {
+		return fmt.Errorf("writing %s: %w", goalstates.DaemonRecoveryScriptPath, err)
 	}
 
 	sc := executil.Systemctl()
@@ -92,6 +106,9 @@ func (t *stopDaemon) Do(ctx context.Context) error {
 
 	unitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonUnit)
 	removeFileIfExists(t.log, unitPath)
+	recoveryUnitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonRecoveryUnit)
+	removeFileIfExists(t.log, recoveryUnitPath)
+	removeFileIfExists(t.log, goalstates.DaemonRecoveryScriptPath)
 
 	return nil
 }
@@ -117,7 +134,12 @@ func (t *removeAgentArtifacts) Do(_ context.Context) error {
 
 	// Remove known file paths.
 	for _, path := range []string{
-		"/usr/local/bin/unbounded-agent",
+		goalstates.DaemonBinaryPath,
+		goalstates.DaemonBinaryBluePath,
+		goalstates.DaemonBinaryGreenPath,
+		goalstates.DaemonBinaryCurrentPath,
+		goalstates.DaemonBinaryLastGoodPath,
+		goalstates.DaemonRecoveryScriptPath,
 		"/usr/local/bin/unbounded-agent-install.sh",
 		"/usr/local/bin/unbounded-agent-uninstall.sh",
 	} {

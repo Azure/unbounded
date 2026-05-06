@@ -18,6 +18,16 @@ const (
 
 	// DaemonUnit is the systemd unit name for the unbounded-agent daemon.
 	DaemonUnit = "unbounded-agent-daemon.service"
+
+	// DaemonRecoveryUnit is the systemd recovery unit for the agent daemon.
+	DaemonRecoveryUnit = "unbounded-agent-daemon-recovery.service"
+
+	DaemonBinaryPath         = "/usr/local/bin/unbounded-agent"
+	DaemonBinaryBluePath     = "/usr/local/bin/unbounded-agent-blue"
+	DaemonBinaryGreenPath    = "/usr/local/bin/unbounded-agent-green"
+	DaemonBinaryCurrentPath  = "/usr/local/bin/unbounded-agent-current"
+	DaemonBinaryLastGoodPath = "/usr/local/bin/unbounded-agent-last-good"
+	DaemonRecoveryScriptPath = "/usr/local/bin/unbounded-agent-daemon-recovery.sh"
 )
 
 // NSpawn machine names used for alternating in-place upgrades.

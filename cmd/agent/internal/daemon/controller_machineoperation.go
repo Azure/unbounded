@@ -34,8 +34,7 @@ func (r *daemonReconciler) reconcileMachineOperation(ctx context.Context, name s
 	case v1alpha3.OperationNodeReboot:
 		return r.reconcileNodeReboot(ctx, &op)
 	case v1alpha3.OperationAgentUpgrade:
-		r.log.Info("AgentUpgrade operation queued", "operation", op.Name)
-		return reconcile.Result{}, nil
+		return r.reconcileAgentUpgrade(ctx, &op)
 	default:
 		return reconcile.Result{}, nil
 	}
@@ -63,6 +62,30 @@ func (r *daemonReconciler) reconcileNodeReboot(ctx context.Context, op *v1alpha3
 	}
 
 	return finishOperation(ctx, r.Client, op.Name, v1alpha3.OperationPhaseComplete, "Succeeded", "NodeReboot completed", machine.Generation)
+}
+
+func (r *daemonReconciler) reconcileAgentUpgrade(ctx context.Context, op *v1alpha3.MachineOperation) (reconcile.Result, error) {
+	machine, err := getLocalMachine(ctx, r.Client, r.machineName)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+
+	if err := markOperationInProgress(ctx, r.Client, op, "staging upgraded host agent binary"); err != nil {
+		return reconcile.Result{}, err
+	}
+
+	downloadURL, err := agentUpgradeDownloadURL(op.Spec.Parameters)
+	if err != nil {
+		_, finishErr := finishOperation(ctx, r.Client, op.Name, v1alpha3.OperationPhaseFailed, "InvalidParameters", err.Error(), 0)
+		return reconcile.Result{}, finishErr
+	}
+
+	if err := r.nodeOperator.UpgradeAgent(ctx, r.log, downloadURL); err != nil {
+		_, finishErr := finishOperation(ctx, r.Client, op.Name, v1alpha3.OperationPhaseFailed, "ExecutionFailed", err.Error(), 0)
+		return reconcile.Result{}, finishErr
+	}
+
+	return finishOperation(ctx, r.Client, op.Name, v1alpha3.OperationPhaseComplete, "Succeeded", "AgentUpgrade completed", machine.Generation)
 }
 
 func (r *daemonReconciler) mapMachineOperation(ctx context.Context, obj client.Object) []daemonRequest {
