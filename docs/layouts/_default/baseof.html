@@ -5,9 +5,12 @@
 </head>
 <body>
   {{- partial "header.html" . -}}
-  <main>
-    {{- block "main" . }}{{- end }}
-  </main>
+  <div class="docs-layout">
+    {{- partial "left-nav.html" . -}}
+    <main>
+      {{- block "main" . }}{{- end }}
+    </main>
+  </div>
   {{- partial "footer.html" . -}}
   <script>
   document.addEventListener("DOMContentLoaded", function () {
@@ -135,6 +138,37 @@
             });
           });
         }, 200);
+      });
+    }
+  });
+  </script>
+  <script>
+  document.addEventListener("DOMContentLoaded", function () {
+    // Left nav expand/collapse
+    document.querySelectorAll(".left-nav-section-toggle, .left-nav-subsection-toggle").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        var parent = btn.parentElement;
+        var expanded = parent.classList.toggle("is-expanded");
+        btn.setAttribute("aria-expanded", expanded);
+      });
+    });
+
+    // Mobile hamburger toggle
+    var hamburger = document.getElementById("left-nav-toggle");
+    var leftNav = document.getElementById("left-nav");
+    if (hamburger && leftNav) {
+      hamburger.addEventListener("click", function () {
+        var open = leftNav.classList.toggle("is-open");
+        hamburger.setAttribute("aria-expanded", open);
+      });
+      // Close nav when clicking a link on mobile
+      leftNav.querySelectorAll("a").forEach(function (link) {
+        link.addEventListener("click", function () {
+          if (window.innerWidth < 1024) {
+            leftNav.classList.remove("is-open");
+            hamburger.setAttribute("aria-expanded", "false");
+          }
+        });
       });
     }
   });

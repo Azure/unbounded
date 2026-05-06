@@ -1,0 +1,41 @@
+<nav class="left-nav" id="left-nav" aria-label="Documentation navigation">
+  <div class="left-nav-inner">
+    {{- range .Site.Menus.main }}
+    {{- if .HasChildren }}{{ continue }}{{ end }}
+    {{- if strings.HasPrefix .URL "http" }}{{ continue }}{{ end }}
+    {{- $sectionPage := $.Site.GetPage .PageRef }}
+    {{- if not $sectionPage }}{{ continue }}{{ end }}
+    {{- $isInSection := $.IsDescendant $sectionPage }}
+    <div class="left-nav-section{{ if $isInSection }} is-expanded{{ end }}">
+      <button class="left-nav-section-toggle" aria-expanded="{{ if $isInSection }}true{{ else }}false{{ end }}">
+        <span>{{ .Name }}</span>
+        <svg class="left-nav-chevron" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M6.22 3.22a.75.75 0 0 1 1.06 0l4.25 4.25a.75.75 0 0 1 0 1.06l-4.25 4.25a.75.75 0 0 1-1.06-1.06L9.94 8 6.22 4.28a.75.75 0 0 1 0-1.06Z"/></svg>
+      </button>
+      <ul class="left-nav-pages">
+        {{- range $sectionPage.Pages }}
+        {{- if .IsSection }}
+        {{- $subIsIn := $.IsDescendant . }}
+        <li class="left-nav-subsection{{ if $subIsIn }} is-expanded{{ end }}">
+          <button class="left-nav-subsection-toggle" aria-expanded="{{ if $subIsIn }}true{{ else }}false{{ end }}">
+            <span>{{ .Title }}</span>
+            <svg class="left-nav-chevron" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M6.22 3.22a.75.75 0 0 1 1.06 0l4.25 4.25a.75.75 0 0 1 0 1.06l-4.25 4.25a.75.75 0 0 1-1.06-1.06L9.94 8 6.22 4.28a.75.75 0 0 1 0-1.06Z"/></svg>
+          </button>
+          <ul class="left-nav-subpages">
+            {{- range .Pages }}
+            <li{{ if eq $.RelPermalink .RelPermalink }} class="is-active"{{ end }}>
+              <a href="{{ .RelPermalink }}">{{ .Title }}</a>
+            </li>
+            {{- end }}
+          </ul>
+        </li>
+        {{- else }}
+        <li{{ if eq $.RelPermalink .RelPermalink }} class="is-active"{{ end }}>
+          <a href="{{ .RelPermalink }}">{{ .Title }}</a>
+        </li>
+        {{- end }}
+        {{- end }}
+      </ul>
+    </div>
+    {{- end }}
+  </div>
+</nav>
