@@ -7,12 +7,28 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"gopkg.in/yaml.v3"
 )
 
 const (
 	replaceAgentConfigPath = "/tmp/unbounded-agent.json"
 	replaceInstallPath     = "/tmp/machina-agent-install.sh"
 )
+
+// cloudInitConfig is the top-level cloud-init user-data structure.
+type cloudInitConfig struct {
+	WriteFiles []cloudInitWriteFile `yaml:"write_files"`
+	Runcmd     [][]string           `yaml:"runcmd"`
+}
+
+// cloudInitWriteFile represents a single entry under write_files.
+type cloudInitWriteFile struct {
+	Path        string `yaml:"path"`
+	Permissions string `yaml:"permissions"`
+	Owner       string `yaml:"owner"`
+	Content     string `yaml:"content"`
+}
 
 // ReplaceCloudInit renders cloud-init user data that reinstalls the
 // unbounded-agent after a host VM replacement.
@@ -29,31 +45,36 @@ func ReplaceCloudInit(agentConfig UnboundedAgentConfig, installEnv []string) (st
 		replaceInstallPath,
 	)
 
-	return fmt.Sprintf(
-		`#cloud-config
-write_files:
-  - path: %s
-    permissions: '0600'
-    owner: root:root
-    content: |
-%s
-  - path: %s
-    permissions: '0755'
-    owner: root:root
-    content: |
-%s
-runcmd:
-  - [ bash, -lc, %q ]
-  - [ rm, -f, %s, %s ]
-`,
-		replaceAgentConfigPath,
-		indentBlock(string(configJSON), 6),
-		replaceInstallPath,
-		indentBlock(UnboundedAgentInstallScript(), 6),
-		installCommand,
-		replaceAgentConfigPath,
-		replaceInstallPath,
-	), nil
+	cfg := cloudInitConfig{
+		WriteFiles: []cloudInitWriteFile{
+			{
+				Path:        replaceAgentConfigPath,
+				Permissions: "0600",
+				Owner:       "root:root",
+				// json.MarshalIndent does not add a trailing newline; add one
+				// so the YAML literal block scalar is well-formed.
+				Content: string(configJSON) + "\n",
+			},
+			{
+				Path:        replaceInstallPath,
+				Permissions: "0755",
+				Owner:       "root:root",
+				// The embedded script already ends with a newline.
+				Content: UnboundedAgentInstallScript(),
+			},
+		},
+		Runcmd: [][]string{
+			{"bash", "-lc", installCommand},
+			{"rm", "-f", replaceAgentConfigPath, replaceInstallPath},
+		},
+	}
+
+	out, err := yaml.Marshal(cfg)
+	if err != nil {
+		return "", fmt.Errorf("marshal cloud-init: %w", err)
+	}
+
+	return "#cloud-config\n" + string(out), nil
 }
 
 func installEnvPrefix(env []string) string {
@@ -62,15 +83,4 @@ func installEnvPrefix(env []string) string {
 	}
 
 	return strings.Join(env, " ") + " "
-}
-
-func indentBlock(s string, spaces int) string {
-	padding := strings.Repeat(" ", spaces)
-
-	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
-	for i, line := range lines {
-		lines[i] = padding + line
-	}
-
-	return strings.Join(lines, "\n")
 }
