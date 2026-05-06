@@ -125,6 +125,7 @@ spec:
                 - HostReboot
                 - HostPowerOff
                 - HostPowerOn
+                - HostReimage
                 type: string
               parameters:
                 additionalProperties:

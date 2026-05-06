@@ -18,6 +18,11 @@ rules:
   - apiGroups: ["unbounded-cloud.io"]
     resources: ["machineoperations/finalizers"]
     verbs: ["update"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["list"]
+  - nonResourceURLs: ["/version"]
+    verbs: ["get"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -31,6 +36,71 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: machine-ops-controller
+subjects:
+  - kind: ServiceAccount
+    name: machine-ops-controller
+    namespace: {{ default "unbounded-kube" .Namespace }}
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: machine-ops-controller-bootstrap
+  namespace: kube-public
+  labels:
+    app.kubernetes.io/name: machine-ops-controller
+    app.kubernetes.io/component: controller
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["kube-root-ca.crt"]
+    verbs: ["get"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: machine-ops-controller-bootstrap
+  namespace: kube-public
+  labels:
+    app.kubernetes.io/name: machine-ops-controller
+    app.kubernetes.io/component: controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: machine-ops-controller-bootstrap
+subjects:
+  - kind: ServiceAccount
+    name: machine-ops-controller
+    namespace: {{ default "unbounded-kube" .Namespace }}
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: machine-ops-controller-bootstrap
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: machine-ops-controller
+    app.kubernetes.io/component: controller
+rules:
+  - apiGroups: [""]
+    resources: ["services", "secrets"]
+    verbs: ["get"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: machine-ops-controller-bootstrap
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: machine-ops-controller
+    app.kubernetes.io/component: controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: machine-ops-controller-bootstrap
 subjects:
   - kind: ServiceAccount
     name: machine-ops-controller

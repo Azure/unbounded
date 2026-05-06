@@ -58,6 +58,17 @@ func TestProviderExecuteRequiresProviderID(t *testing.T) {
 	require.Contains(t, err.Error(), "providerID is required")
 }
 
+func TestProviderExecuteHostReimageUnsupported(t *testing.T) {
+	t.Parallel()
+
+	provider := &Provider{}
+
+	require.False(t, provider.Supports(unboundedv1alpha3.OperationHostReimage))
+	err := provider.Execute(context.Background(), machineops.OperationRequest{ProviderID: "oci://ocid1.instance.oc1.test", Operation: unboundedv1alpha3.OperationHostReimage})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "unsupported OCI instance operation")
+}
+
 func TestProviderExecuteRequiresNonEmptyProviderID(t *testing.T) {
 	t.Parallel()
 

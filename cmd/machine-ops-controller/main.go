@@ -13,6 +13,7 @@ import (
 	"github.com/spf13/cobra"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
@@ -46,6 +47,7 @@ func main() {
 	cmd.Flags().BoolVar(&cfg.leaderElection, "leader-elect", true, "Enable leader election")
 	cmd.Flags().StringVar(&cfg.leaderElectionNamespace, "leader-elect-namespace", "unbounded-kube", "Namespace for the leader election lease")
 	cmd.Flags().IntVar(&cfg.maxConcurrentReconciles, "max-concurrent-reconciles", 10, "Maximum concurrent MachineOperation reconciles")
+	cmd.Flags().StringVar(&cfg.apiServerEndpoint, "api-server-endpoint", "", "Kubernetes API server endpoint used in reimage bootstrap config")
 	cmd.Flags().StringVar(&cfg.ociConfigFile, "oci-config-file", "", "Path to OCI config file for OCIInstance operations")
 	cmd.Flags().StringVar(&cfg.ociConfigProfile, "oci-config-profile", "DEFAULT", "OCI config profile for OCIInstance operations")
 	cmd.Flags().StringVar(&cfg.ociAuth, "oci-auth", "api_key", "OCI auth mode for OCIInstance operations: api_key or security_token")
@@ -65,6 +67,7 @@ type config struct {
 	leaderElection          bool
 	leaderElectionNamespace string
 	maxConcurrentReconciles int
+	apiServerEndpoint       string
 	ociConfigFile           string
 	ociConfigProfile        string
 	ociAuth                 string
@@ -73,8 +76,9 @@ type config struct {
 func run(ctx context.Context, cfg config) error {
 	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
 
+	restConfig := ctrl.GetConfigOrDie()
 	scheme := runtimeScheme()
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
 		Scheme:                        scheme,
 		Metrics:                       metricsserver.Options{BindAddress: cfg.metricsAddr},
 		HealthProbeBindAddress:        cfg.probeAddr,
@@ -87,6 +91,11 @@ func run(ctx context.Context, cfg config) error {
 		return fmt.Errorf("create manager: %w", err)
 	}
 
+	kubeClient, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		return fmt.Errorf("create kubernetes client: %w", err)
+	}
+
 	if err := (&machineops.MachineOperationReconciler{
 		Client: mgr.GetClient(),
 		Providers: []machineops.Provider{
@@ -94,6 +103,8 @@ func run(ctx context.Context, cfg config) error {
 			&ociinstance.Provider{ConfigFile: cfg.ociConfigFile, ConfigProfile: cfg.ociConfigProfile, Auth: cfg.ociAuth},
 		},
 		MaxConcurrentReconciles: cfg.maxConcurrentReconciles,
+		KubeClient:              kubeClient,
+		APIServerEndpoint:       cfg.apiServerEndpoint,
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup MachineOperation controller: %w", err)
 	}

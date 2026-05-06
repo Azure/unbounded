@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -50,6 +51,43 @@ func TestMachineOperationReconciler_CompletesSupportedOperation(t *testing.T) {
 	require.Equal(t, metav1.ConditionTrue, cond.Status)
 }
 
+func TestMachineOperationReconciler_BuildsReimageUserData(t *testing.T) {
+	t.Parallel()
+
+	s := newOperationTestScheme(t)
+	require.NoError(t, corev1.AddToScheme(s))
+	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
+	machine.Spec.Kubernetes = &unboundedv1alpha3.KubernetesSpec{BootstrapTokenRef: unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-test"}}
+	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReimage)
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: metav1.NamespaceSystem, Name: "bootstrap-token-test"},
+		Data: map[string][]byte{
+			"token-id":     []byte("abc123"),
+			"token-secret": []byte("secret456"),
+		},
+	}
+	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReimage: true}}
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, secret).WithStatusSubresource(op).Build()
+	reconciler := &MachineOperationReconciler{
+		Client:      c,
+		Providers:   []Provider{provider},
+		Now:         fixedOperationNow,
+		ClusterInfo: testClusterInfo(),
+	}
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "op-1"}})
+	require.NoError(t, err)
+	require.Equal(t, ctrl.Result{}, result)
+	require.Len(t, provider.reimageUserData, 1)
+	require.Contains(t, provider.reimageUserData[0], "#cloud-config")
+	require.Contains(t, provider.reimageUserData[0], "abc123.secret456")
+
+	var updated unboundedv1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
+	require.Equal(t, unboundedv1alpha3.OperationPhaseComplete, updated.Status.Phase)
+}
+
 func TestMachineOperationReconciler_DoesNotReexecuteInProgressOperation(t *testing.T) {
 	t.Parallel()
 
@@ -74,6 +112,38 @@ func TestMachineOperationReconciler_DoesNotReexecuteInProgressOperation(t *testi
 	require.Nil(t, updated.Status.CompletedAt)
 }
 
+func TestMachineOperationReconciler_ReexecutesInProgressHostReimage(t *testing.T) {
+	t.Parallel()
+
+	s := newOperationTestScheme(t)
+	require.NoError(t, corev1.AddToScheme(s))
+	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
+	machine.Spec.Kubernetes = &unboundedv1alpha3.KubernetesSpec{BootstrapTokenRef: unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-test"}}
+	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReimage)
+	op.Status.Phase = unboundedv1alpha3.OperationPhaseInProgress
+	op.Status.StartedAt = ptrTo(fixedOperationNow())
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: metav1.NamespaceSystem, Name: "bootstrap-token-test"},
+		Data: map[string][]byte{
+			"token-id":     []byte("abc123"),
+			"token-secret": []byte("secret456"),
+		},
+	}
+	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReimage: true}}
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, secret).WithStatusSubresource(op).Build()
+	reconciler := &MachineOperationReconciler{Client: c, Providers: []Provider{provider}, Now: fixedOperationNow, ClusterInfo: testClusterInfo()}
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "op-1"}})
+	require.NoError(t, err)
+	require.Equal(t, ctrl.Result{}, result)
+	require.Len(t, provider.calls, 1)
+
+	var updated unboundedv1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
+	require.Equal(t, unboundedv1alpha3.OperationPhaseComplete, updated.Status.Phase)
+}
+
 func TestMachineOperationReconciler_UnsupportedOperationIsIgnored(t *testing.T) {
 	t.Parallel()
 
@@ -93,6 +163,28 @@ func TestMachineOperationReconciler_UnsupportedOperationIsIgnored(t *testing.T) 
 	var updated unboundedv1alpha3.MachineOperation
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
 	require.Empty(t, updated.Status.Phase)
+}
+
+func TestMachineOperationReconciler_FailsUnsupportedExternalOperation(t *testing.T) {
+	t.Parallel()
+
+	s := newOperationTestScheme(t)
+	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderOCIInstance)
+	machine.Spec.ProviderID = "oci://ocid1.instance.oc1.test"
+	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReimage)
+	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderOCIInstance, supported: map[unboundedv1alpha3.OperationKind]bool{}}
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op).WithStatusSubresource(op).Build()
+	reconciler := &MachineOperationReconciler{Client: c, Providers: []Provider{provider}, Now: fixedOperationNow}
+
+	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "op-1"}})
+	require.NoError(t, err)
+	require.Empty(t, provider.calls)
+
+	var updated unboundedv1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
+	require.Equal(t, unboundedv1alpha3.OperationPhaseFailed, updated.Status.Phase)
+	require.Contains(t, updated.Status.Message, "HostReimage is not supported for OCIInstance")
 }
 
 func TestMachineOperationReconciler_SelectorOperationIsIgnored(t *testing.T) {
@@ -214,10 +306,11 @@ func TestShouldReconcileOperation(t *testing.T) {
 }
 
 type recordingProvider struct {
-	provider  string
-	supported map[unboundedv1alpha3.OperationKind]bool
-	calls     []string
-	err       error
+	provider        string
+	supported       map[unboundedv1alpha3.OperationKind]bool
+	calls           []string
+	reimageUserData []string
+	err             error
 }
 
 func (p *recordingProvider) Name() string {
@@ -230,6 +323,9 @@ func (p *recordingProvider) Supports(operation unboundedv1alpha3.OperationKind) 
 
 func (p *recordingProvider) Execute(_ context.Context, request OperationRequest) error {
 	p.calls = append(p.calls, fmt.Sprintf("%s:%s:%s", request.Operation, request.Machine.Name, request.ProviderID))
+	if request.ReimageUserData != "" {
+		p.reimageUserData = append(p.reimageUserData, request.ReimageUserData)
+	}
 	return p.err
 }
 
@@ -268,6 +364,15 @@ func fixedOperationNow() metav1.Time {
 
 func ptrTo[T any](value T) *T {
 	return &value
+}
+
+func testClusterInfo() *ClusterInfo {
+	return &ClusterInfo{
+		APIServer:    "api.example.com:443",
+		CACertBase64: "Y2E=",
+		ClusterDNS:   "10.0.0.10",
+		KubeVersion:  "v1.34.0",
+	}
 }
 
 func metav1ObjectMeta(name string) metav1.ObjectMeta {
