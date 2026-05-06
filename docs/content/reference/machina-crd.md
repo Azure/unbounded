@@ -117,7 +117,7 @@ OCI operations use an OCI SDK config file mounted into the `machine-ops-controll
 |-------|------|----------|-------------|
 | `spec.machineRef` | string | No | Target `Machine` name. Either `machineRef` or `machineSelector` must be set. |
 | `spec.machineSelector` | LabelSelector | No | Selects Machines by label. Controllers may fan this out into per-Machine operations. |
-| `spec.operationKind` | string | Yes | One of `NodeReboot`, `HostReboot`, `HostPowerOff`, `HostPowerOn`. |
+| `spec.operationKind` | string | Yes | One of `NodeReboot`, `AgentUpgrade`, `HostReboot`, `HostPowerOff`, `HostPowerOn`, `HostReplace`. |
 | `spec.parameters` | map[string]string | No | Operation-specific parameters. |
 | `spec.ttlSecondsAfterFinished` | int32 | No | Delete completed or failed operations after this many seconds. |
 | `status.phase` | string | No | `Pending`, `InProgress`, `Complete`, or `Failed`. |
@@ -132,6 +132,11 @@ The Azure VM provider handles:
 | `HostReboot` | `VirtualMachinesClient.BeginRestart` |
 | `HostPowerOff` | `VirtualMachinesClient.BeginPowerOff` |
 | `HostPowerOn` | `VirtualMachinesClient.BeginStart` |
+| `HostReplace` | `VirtualMachinesClient.Get`, `BeginDelete`, then `BeginCreateOrUpdate` |
+
+`HostReplace` for `AzureVM` destructively replaces the VM: it reads the existing VM model, detaches NICs and data disks, deletes the VM resource, and recreates the same VM name with fresh cloud-init custom data that installs `unbounded-agent`. The old OS disk is not reused. Operation completion means the replacement VM create operation completed; it does not mean the Kubernetes `Node` is Ready. The `Machine` controller continues tracking whether the Kubernetes `Node` disappears and rejoins. Configure `machine-ops-controller --api-server-endpoint` with an API server address reachable from replaced hosts; the generated agent bootstrap config uses that value.
+
+This replacement flow avoids Azure standalone VM `customData` immutability during native reimage. It intentionally destroys host-local state on the old OS disk.
 
 The OCI instance provider handles:
 
@@ -140,6 +145,8 @@ The OCI instance provider handles:
 | `HostReboot` | `RESET` |
 | `HostPowerOff` | `STOP` |
 | `HostPowerOn` | `START` |
+
+`HostReplace` is not currently supported for `OCIInstance` because an identity-preserving OCI replacement flow with fresh `user_data` injection has not been verified.
 
 ### status
 
