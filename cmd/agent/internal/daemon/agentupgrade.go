@@ -82,24 +82,31 @@ func recordPendingAgentUpgradeOperation(operationName string, observedMachineGen
 	return writeFile(agentUpgradeOperationSignalPath(), append(data, '\n'), 0o600)
 }
 
-func readPendingAgentUpgradeOperation() (agentUpgradeOperationSignal, bool, error) {
+func readPendingAgentUpgradeOperation() (*agentUpgradeOperationSignal, error) {
 	data, err := os.ReadFile(agentUpgradeOperationSignalPath())
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return agentUpgradeOperationSignal{}, false, nil
+			return nil, nil
 		}
 
-		return agentUpgradeOperationSignal{}, false, err
+		return nil, err
 	}
 
 	var signal agentUpgradeOperationSignal
 	if err := json.Unmarshal(data, &signal); err == nil {
 		signal.OperationName = strings.TrimSpace(signal.OperationName)
-		return signal, signal.OperationName != "", nil
+		if signal.OperationName == "" {
+			return nil, nil
+		}
+		return &signal, nil
 	}
 
 	operationName := strings.TrimSpace(string(data))
-	return agentUpgradeOperationSignal{OperationName: operationName}, operationName != "", nil
+	if operationName == "" {
+		return nil, nil
+	}
+
+	return &agentUpgradeOperationSignal{OperationName: operationName}, nil
 }
 
 func removeAgentUpgradeOperationSignal() error {

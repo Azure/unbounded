@@ -183,11 +183,11 @@ func publishAndClearAgentUpgradeSignals(ctx context.Context, log *slog.Logger, c
 		return nil
 	}
 
-	pending, ok, err := readPendingAgentUpgradeOperation()
+	pending, err := readPendingAgentUpgradeOperation()
 	if err != nil {
 		return fmt.Errorf("read pending AgentUpgrade operation signal: %w", err)
 	}
-	if ok {
+	if pending != nil {
 		if _, err := finishOperation(
 			ctx,
 			c,

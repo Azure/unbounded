@@ -81,9 +81,9 @@ func writeTestAgentArchive(w io.Writer, binary []byte) error {
 }
 
 func testAgentScript(version string, exitCode int) []byte {
-	return []byte(fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' %s\nexit %d\n", shellQuote(version), exitCode))
+	return []byte(fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' %s\nexit %d\n", posixShellQuote(version), exitCode))
 }
 
-func shellQuote(value string) string {
+func posixShellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }

@@ -6,12 +6,14 @@ package agentbinary
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
@@ -60,16 +62,27 @@ func Verify(ctx context.Context, path string) error {
 	verifyCtx, cancel := context.WithTimeout(ctx, verifyTimeout)
 	defer cancel()
 
-	output, err := exec.CommandContext(verifyCtx, path, "version").CombinedOutput()
-	if err != nil {
+	for {
+		output, err := exec.CommandContext(verifyCtx, path, "version").CombinedOutput()
+		if err == nil {
+			return nil
+		}
+
+		if errors.Is(err, syscall.ETXTBSY) {
+			select {
+			case <-verifyCtx.Done():
+				return fmt.Errorf("verify agent binary %s: %w", path, err)
+			case <-time.After(100 * time.Millisecond):
+				continue
+			}
+		}
+
 		details := strings.TrimSpace(string(output))
 		if details != "" {
 			return fmt.Errorf("verify agent binary %s: %w: %s", path, err, details)
 		}
 		return fmt.Errorf("verify agent binary %s: %w", path, err)
 	}
-
-	return nil
 }
 
 // UpdateSymlink atomically updates linkPath to point at targetPath.
