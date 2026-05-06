@@ -773,6 +773,18 @@ a:hover {
   min-width: 0;
 }
 
+/* When inside docs-layout, inner containers should not re-center */
+.docs-layout .content-single,
+.docs-layout .content-list {
+  margin: 0;
+}
+
+.docs-layout .page-with-toc {
+  max-width: none;
+  margin: 0;
+  padding: 0;
+}
+
 /* ── Left navigation sidebar ─────────────────────────────── */
 .left-nav {
   width: 16rem;
