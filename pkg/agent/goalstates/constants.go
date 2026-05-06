@@ -22,18 +22,22 @@ const (
 	// DaemonRecoveryUnit is the systemd recovery unit for the agent daemon.
 	DaemonRecoveryUnit = "unbounded-agent-daemon-recovery.service"
 
-	DaemonBinaryPath         = "/usr/local/bin/unbounded-agent"
-	DaemonBinaryBluePath     = "/usr/local/bin/unbounded-agent-blue"
-	DaemonBinaryGreenPath    = "/usr/local/bin/unbounded-agent-green"
-	DaemonBinaryCurrentPath  = "/usr/local/bin/unbounded-agent-current"
-	DaemonBinaryLastGoodPath = "/usr/local/bin/unbounded-agent-last-good"
-	DaemonRecoveryScriptPath = "/usr/local/bin/unbounded-agent-daemon-recovery.sh"
+	DaemonBinaryPath                = "/usr/local/bin/unbounded-agent"
+	DaemonBinaryBluePath            = "/usr/local/bin/unbounded-agent-blue"
+	DaemonBinaryGreenPath           = "/usr/local/bin/unbounded-agent-green"
+	DaemonBinaryCurrentPath         = "/usr/local/bin/unbounded-agent-current"
+	DaemonBinaryLastGoodPath        = "/usr/local/bin/unbounded-agent-last-good"
+	DaemonRecoveryScriptPath        = "/usr/local/bin/unbounded-agent-daemon-recovery.sh"
+	DaemonAgentUpgradeOperationPath = AgentConfigDir + "/agent-upgrade-operation"
+	DaemonAgentUpgradeFailurePath   = AgentConfigDir + "/agent-upgrade-failure"
 
-	EnvDaemonBinary         = "UNBOUNDED_AGENT_DAEMON_BINARY"
-	EnvDaemonBinaryBlue     = "UNBOUNDED_AGENT_DAEMON_BINARY_BLUE"
-	EnvDaemonBinaryGreen    = "UNBOUNDED_AGENT_DAEMON_BINARY_GREEN"
-	EnvDaemonBinaryCurrent  = "UNBOUNDED_AGENT_DAEMON_BINARY_CURRENT"
-	EnvDaemonBinaryLastGood = "UNBOUNDED_AGENT_DAEMON_BINARY_LAST_GOOD"
+	EnvDaemonBinary                    = "UNBOUNDED_AGENT_DAEMON_BINARY"
+	EnvDaemonBinaryBlue                = "UNBOUNDED_AGENT_DAEMON_BINARY_BLUE"
+	EnvDaemonBinaryGreen               = "UNBOUNDED_AGENT_DAEMON_BINARY_GREEN"
+	EnvDaemonBinaryCurrent             = "UNBOUNDED_AGENT_DAEMON_BINARY_CURRENT"
+	EnvDaemonBinaryLastGood            = "UNBOUNDED_AGENT_DAEMON_BINARY_LAST_GOOD"
+	EnvDaemonAgentUpgradeOperationPath = "UNBOUNDED_AGENT_DAEMON_AGENT_UPGRADE_OPERATION_PATH"
+	EnvDaemonAgentUpgradeFailurePath   = "UNBOUNDED_AGENT_DAEMON_AGENT_UPGRADE_FAILURE_PATH"
 )
 
 // NSpawn machine names used for alternating in-place upgrades.

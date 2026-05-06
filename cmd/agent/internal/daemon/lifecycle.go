@@ -96,17 +96,21 @@ func (d *enableDaemon) Do(ctx context.Context) error {
 
 func renderDaemonAsset(name string, content []byte) ([]byte, error) {
 	data := struct {
-		DaemonUnit               string
-		DaemonRecoveryUnit       string
-		DaemonBinaryCurrentPath  string
-		DaemonBinaryLastGoodPath string
-		DaemonRecoveryScriptPath string
+		DaemonUnit                      string
+		DaemonRecoveryUnit              string
+		DaemonBinaryCurrentPath         string
+		DaemonBinaryLastGoodPath        string
+		DaemonRecoveryScriptPath        string
+		DaemonAgentUpgradeOperationPath string
+		DaemonAgentUpgradeFailurePath   string
 	}{
-		DaemonUnit:               goalstates.DaemonUnit,
-		DaemonRecoveryUnit:       goalstates.DaemonRecoveryUnit,
-		DaemonBinaryCurrentPath:  goalstates.DaemonBinaryCurrentPath,
-		DaemonBinaryLastGoodPath: goalstates.DaemonBinaryLastGoodPath,
-		DaemonRecoveryScriptPath: goalstates.DaemonRecoveryScriptPath,
+		DaemonUnit:                      goalstates.DaemonUnit,
+		DaemonRecoveryUnit:              goalstates.DaemonRecoveryUnit,
+		DaemonBinaryCurrentPath:         goalstates.DaemonBinaryCurrentPath,
+		DaemonBinaryLastGoodPath:        goalstates.DaemonBinaryLastGoodPath,
+		DaemonRecoveryScriptPath:        goalstates.DaemonRecoveryScriptPath,
+		DaemonAgentUpgradeOperationPath: goalstates.DaemonAgentUpgradeOperationPath,
+		DaemonAgentUpgradeFailurePath:   goalstates.DaemonAgentUpgradeFailurePath,
 	}
 
 	tmpl, err := template.New(name).Parse(string(content))

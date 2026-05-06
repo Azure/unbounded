@@ -82,6 +82,32 @@ func verifyAgentUpgradeBinary(ctx context.Context, path string) error {
 	return nil
 }
 
+func recordPendingAgentUpgradeOperation(operationName string) error {
+	return writeFile(agentUpgradeOperationSignalPath(), []byte(operationName+"\n"), 0o600)
+}
+
+func clearPendingAgentUpgradeOperation(log *slog.Logger) {
+	if err := os.Remove(agentUpgradeOperationSignalPath()); err != nil && !errors.Is(err, os.ErrNotExist) {
+		log.Warn("failed to clear pending AgentUpgrade operation signal", "error", err)
+	}
+}
+
+func agentUpgradeOperationSignalPath() string {
+	if path := strings.TrimSpace(os.Getenv(goalstates.EnvDaemonAgentUpgradeOperationPath)); path != "" {
+		return path
+	}
+
+	return goalstates.DaemonAgentUpgradeOperationPath
+}
+
+func agentUpgradeFailureSignalPath() string {
+	if path := strings.TrimSpace(os.Getenv(goalstates.EnvDaemonAgentUpgradeFailurePath)); path != "" {
+		return path
+	}
+
+	return goalstates.DaemonAgentUpgradeFailurePath
+}
+
 func daemonAgentUpgradePaths() goalstates.AgentUpgradePaths {
 	return goalstates.AgentUpgradePaths{
 		BinaryPath:   daemonBinaryPath(),

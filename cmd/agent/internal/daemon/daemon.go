@@ -68,6 +68,11 @@ func run(ctx context.Context, log *slog.Logger, newClient kubeClientFunc, nodeOp
 		return fmt.Errorf("register machine: %w", err)
 	}
 
+	if err := publishAgentUpgradeFailureSignal(ctx, log, kubeClient); err != nil {
+		log.Warn("failed to publish AgentUpgrade daemon failure signal", "error", err)
+	}
+	clearPendingAgentUpgradeOperation(log)
+
 	return runController(ctx, log, restCfg, active.Config.MachineName, nodeOperator)
 }
 

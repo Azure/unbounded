@@ -5,8 +5,11 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -80,7 +83,13 @@ func (r *daemonReconciler) reconcileAgentUpgrade(ctx context.Context, op *v1alph
 		return reconcile.Result{}, finishErr
 	}
 
+	if err := recordPendingAgentUpgradeOperation(op.Name); err != nil {
+		_, finishErr := finishOperation(ctx, r.Client, op.Name, v1alpha3.OperationPhaseFailed, "ExecutionFailed", err.Error(), 0)
+		return reconcile.Result{}, finishErr
+	}
+
 	if err := r.nodeOperator.StageAgentUpgrade(ctx, r.log, downloadURL); err != nil {
+		clearPendingAgentUpgradeOperation(r.log)
 		_, finishErr := finishOperation(ctx, r.Client, op.Name, v1alpha3.OperationPhaseFailed, "ExecutionFailed", err.Error(), 0)
 		return reconcile.Result{}, finishErr
 	}
@@ -95,6 +104,43 @@ func (r *daemonReconciler) reconcileAgentUpgrade(ctx context.Context, op *v1alph
 	}
 
 	return result, nil
+}
+
+func publishAgentUpgradeFailureSignal(ctx context.Context, log *slog.Logger, c client.Client) error {
+	data, err := os.ReadFile(agentUpgradeFailureSignalPath())
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+
+		return fmt.Errorf("read AgentUpgrade failure signal: %w", err)
+	}
+
+	lines := strings.SplitN(strings.TrimSpace(string(data)), "\n", 2)
+	operationName := strings.TrimSpace(lines[0])
+	if operationName == "" {
+		if err := os.Remove(agentUpgradeFailureSignalPath()); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove empty AgentUpgrade failure signal: %w", err)
+		}
+		return nil
+	}
+
+	message := "AgentUpgrade daemon failed after switching binary"
+	if len(lines) > 1 && strings.TrimSpace(lines[1]) != "" {
+		message = strings.TrimSpace(lines[1])
+	}
+
+	if _, err := finishOperation(ctx, c, operationName, v1alpha3.OperationPhaseFailed, "DaemonFailed", message, 0); err != nil {
+		return err
+	}
+
+	if err := os.Remove(agentUpgradeFailureSignalPath()); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove AgentUpgrade failure signal: %w", err)
+	}
+
+	log.Info("published AgentUpgrade daemon failure signal", "operation", operationName)
+
+	return nil
 }
 
 func (r *daemonReconciler) mapMachineOperation(ctx context.Context, obj client.Object) []daemonRequest {

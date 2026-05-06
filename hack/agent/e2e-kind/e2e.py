@@ -266,7 +266,11 @@ def wait_for_machine_operation_complete(name: str, timeout_secs: int = 180) -> d
     die(f"Timed out waiting for MachineOperation '{name}' to complete after {timeout_secs}s")
 
 
-def wait_for_machine_operation_failed(name: str, timeout_secs: int = 180) -> dict[str, Any]:
+def wait_for_machine_operation_failed(
+    name: str,
+    timeout_secs: int = 180,
+    allow_complete_before_failure: bool = False,
+) -> dict[str, Any]:
     """Wait for a MachineOperation to fail and return its JSON object."""
 
     log(f"Waiting for MachineOperation '{name}' to fail (timeout: {timeout_secs}s)...")
@@ -292,7 +296,7 @@ def wait_for_machine_operation_failed(name: str, timeout_secs: int = 180) -> dic
             if phase == "Failed":
                 log(f"MachineOperation '{name}' failed after {elapsed}s")
                 return operation
-            if phase == "Complete":
+            if phase == "Complete" and not allow_complete_before_failure:
                 die(f"MachineOperation '{name}' unexpectedly completed: {message}")
 
         if elapsed > 0 and elapsed % 30 == 0:
@@ -1894,6 +1898,11 @@ def validate_agent_upgrade_rollback() -> None:
 
     wait_for_daemon_current_target(previous_good)
     wait_for_daemon_active()
+    failed_operation = wait_for_machine_operation_failed(
+        operation_name, allow_complete_before_failure=True)
+    failed_status = failed_operation.get("status", {})
+    if "rolled back" not in failed_status.get("message", ""):
+        die(f"unexpected rollback AgentUpgrade failure message: {failed_status.get('message')!r}")
 
     log("============================================")
     log("  AgentUpgrade rollback validation PASSED")

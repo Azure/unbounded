@@ -7,6 +7,8 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -20,6 +22,7 @@ import (
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/provision"
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
 type fakeNodeOperator struct {
@@ -89,6 +92,18 @@ func fakeStatusClient(objs ...client.Object) client.Client {
 		WithStatusSubresource(&v1alpha3.MachineOperation{}).
 		WithObjects(objs...).
 		Build()
+}
+
+func setAgentUpgradeSignalPaths(t *testing.T) (string, string) {
+	t.Helper()
+
+	dir := t.TempDir()
+	operationPath := filepath.Join(dir, "agent-upgrade-operation")
+	failurePath := filepath.Join(dir, "agent-upgrade-failure")
+	t.Setenv(goalstates.EnvDaemonAgentUpgradeOperationPath, operationPath)
+	t.Setenv(goalstates.EnvDaemonAgentUpgradeFailurePath, failurePath)
+
+	return operationPath, failurePath
 }
 
 func TestReconcileNodeReboot_Complete(t *testing.T) {
@@ -184,6 +199,7 @@ func TestReconcileNodeReboot_FindActiveMachineFailed(t *testing.T) {
 }
 
 func TestReconcileAgentUpgrade_Complete(t *testing.T) {
+	operationPath, _ := setAgentUpgradeSignalPaths(t)
 	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Generation: 9}}
 	machineOp := &v1alpha3.MachineOperation{
 		ObjectMeta: metav1.ObjectMeta{Name: "op-1"},
@@ -217,6 +233,7 @@ func TestReconcileAgentUpgrade_Complete(t *testing.T) {
 	assert.Equal(t, int64(9), updated.Status.ObservedMachineGeneration)
 	require.NotNil(t, updated.Status.StartedAt)
 	require.NotNil(t, updated.Status.CompletedAt)
+	assertFileContent(t, operationPath, "op-1\n")
 }
 
 func TestReconcileAgentUpgrade_MissingDownloadURL(t *testing.T) {
@@ -249,6 +266,7 @@ func TestReconcileAgentUpgrade_MissingDownloadURL(t *testing.T) {
 }
 
 func TestReconcileAgentUpgrade_Failed(t *testing.T) {
+	operationPath, _ := setAgentUpgradeSignalPaths(t)
 	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Generation: 9}}
 	machineOp := &v1alpha3.MachineOperation{
 		ObjectMeta: metav1.ObjectMeta{Name: "op-1"},
@@ -277,9 +295,11 @@ func TestReconcileAgentUpgrade_Failed(t *testing.T) {
 	assert.Equal(t, v1alpha3.OperationPhaseFailed, updated.Status.Phase)
 	assert.Equal(t, "upgrade failed", updated.Status.Message)
 	assert.False(t, op.restartAgentCalled)
+	assert.NoFileExists(t, operationPath)
 }
 
 func TestReconcileAgentUpgrade_RestartFailureLeavesOperationComplete(t *testing.T) {
+	operationPath, _ := setAgentUpgradeSignalPaths(t)
 	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Generation: 9}}
 	machineOp := &v1alpha3.MachineOperation{
 		ObjectMeta: metav1.ObjectMeta{Name: "op-1"},
@@ -309,6 +329,36 @@ func TestReconcileAgentUpgrade_RestartFailureLeavesOperationComplete(t *testing.
 	require.NoError(t, reconciler.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
 	assert.Equal(t, v1alpha3.OperationPhaseComplete, updated.Status.Phase)
 	assert.Equal(t, "AgentUpgrade completed", updated.Status.Message)
+	assertFileContent(t, operationPath, "op-1\n")
+}
+
+func TestPublishAgentUpgradeFailureSignal(t *testing.T) {
+	_, failurePath := setAgentUpgradeSignalPaths(t)
+	machineOp := &v1alpha3.MachineOperation{
+		ObjectMeta: metav1.ObjectMeta{Name: "op-1"},
+		Spec: v1alpha3.MachineOperationSpec{
+			MachineRef:    "test-machine",
+			OperationKind: v1alpha3.OperationAgentUpgrade,
+		},
+		Status: v1alpha3.MachineOperationStatus{
+			Phase:   v1alpha3.OperationPhaseComplete,
+			Message: "AgentUpgrade completed",
+		},
+	}
+	c := fakeStatusClient(machineOp)
+	require.NoError(t, os.WriteFile(failurePath, []byte("op-1\nrolled back to last good\n"), 0o600))
+
+	require.NoError(t, publishAgentUpgradeFailureSignal(context.Background(), discardLogger(), c))
+
+	var updated v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
+	assert.Equal(t, v1alpha3.OperationPhaseFailed, updated.Status.Phase)
+	assert.Equal(t, "rolled back to last good", updated.Status.Message)
+	condition := apimeta.FindStatusCondition(updated.Status.Conditions, "Completed")
+	require.NotNil(t, condition)
+	assert.Equal(t, metav1.ConditionFalse, condition.Status)
+	assert.Equal(t, "DaemonFailed", condition.Reason)
+	assert.NoFileExists(t, failurePath)
 }
 
 func TestReconcileRepave_UsesDesiredMachineConfigurationVersion(t *testing.T) {
