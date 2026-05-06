@@ -34,11 +34,11 @@ func InstallFromTarGz(ctx context.Context, downloadURL, targetPath, binaryName s
 			continue
 		}
 
-		reader := &countingReader{r: tarFile.Body}
-		if err := utilio.InstallFile(targetPath, reader, perm); err != nil {
+		countingReader := &countingReader{r: tarFile.Body}
+		if err := utilio.InstallFile(targetPath, countingReader, perm); err != nil {
 			return fmt.Errorf("install %s from %q: %w", binaryName, downloadURL, err)
 		}
-		if reader.n == 0 {
+		if countingReader.n == 0 {
 			return fmt.Errorf("agent binary %q in archive %q is empty", binaryName, downloadURL)
 		}
 

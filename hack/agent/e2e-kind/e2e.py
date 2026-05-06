@@ -474,7 +474,7 @@ def wait_for_daemon_active(timeout_secs: int = 180) -> None:
     die(f"Timed out waiting for daemon to become active; last status={last_status!r}")
 
 
-def _serve_tarball_for_operation(tarball: Path, operation_name: str, expect_complete: bool = True) -> dict[str, Any]:
+def _serve_agent_upgrade_tarball(tarball: Path, operation_name: str, expect_complete: bool = True) -> dict[str, Any]:
     """Serve *tarball* to the VM, create AgentUpgrade, and wait for it."""
 
     runner_ip = VM_GATEWAY
@@ -504,7 +504,7 @@ def _serve_tarball_for_operation(tarball: Path, operation_name: str, expect_comp
 
 
 def _build_agent_upgrade_tarball(tarball: Path) -> None:
-    """Build the current repo agent binary and package it as an upgrade tarball."""
+    """Build the current repo agent binary and package it as a working upgrade tarball."""
 
     build_dir = tarball.parent / "agent-upgrade-good"
     shutil.rmtree(build_dir, ignore_errors=True)
@@ -1771,7 +1771,7 @@ def validate_agent_upgrade_operation() -> None:
 
     tarball = VM_DIR / "unbounded-agent-upgrade-good.tar.gz"
     _build_agent_upgrade_tarball(tarball)
-    operation = _serve_tarball_for_operation(tarball, operation_name)
+    operation = _serve_agent_upgrade_tarball(tarball, operation_name)
 
     status = operation.get("status", {})
     if status.get("message") != "AgentUpgrade completed":
@@ -1784,7 +1784,7 @@ def validate_agent_upgrade_operation() -> None:
     log(f"Last-good daemon binary after upgrade: {last_good}")
 
     if after_current == before_current:
-        die("AgentUpgrade did not switch the daemon current symlink")
+        die(f"AgentUpgrade did not switch the daemon current symlink (still points to {after_current})")
     if last_good != before_current:
         die(f"last-good symlink mismatch: got {last_good!r}, expected {before_current!r}")
 
@@ -1808,7 +1808,7 @@ def validate_agent_upgrade_rollback() -> None:
 
     tarball = VM_DIR / "unbounded-agent-upgrade-bad.tar.gz"
     _build_failing_agent_tarball(tarball)
-    operation = _serve_tarball_for_operation(tarball, operation_name)
+    operation = _serve_agent_upgrade_tarball(tarball, operation_name)
 
     status = operation.get("status", {})
     if status.get("message") != "AgentUpgrade completed":
