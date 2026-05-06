@@ -187,5 +187,5 @@ The container operates in the host's network namespace (`VirtualEthernet=no`):
   How GPU devices and libraries are forwarded into the nspawn container.
 - **[Agent Guide]({{< relref "guides/agent" >}})**:
   End-to-end walkthrough of the three-phase bootstrap.
-- **[Reset Node]({{< relref "guides/reset-node" >}})**:
-  How to tear down the nspawn machine and clean up.
+- **[Agent Operations]({{< relref "guides/operations/agent-operations" >}})**:
+  Upgrading the agent and resetting hosts.

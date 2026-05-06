@@ -24,7 +24,8 @@
   --color-code-bg: #1e1e22;
   --color-hero-bg: #141416;
 
-  --max-width: 72rem;
+  --max-width: 80rem;
+  --layout-width: 96rem;
   --nav-height: 3.5rem;
 }
 
@@ -69,7 +70,7 @@ a:hover {
 }
 
 .site-header nav {
-  max-width: 84rem;
+  max-width: var(--layout-width);
   margin: 0 auto;
   padding: 0 1.5rem;
   height: var(--nav-height);
@@ -709,41 +710,51 @@ a:hover {
   border-bottom: 1px solid var(--color-border);
 }
 
-.content-single h2 {
+.content-single h2,
+.content-list h2 {
   font-size: 1.35rem;
   font-weight: 700;
   margin-top: 2.5rem;
   margin-bottom: 0.75rem;
 }
 
-.content-single h3 {
+.content-single h3,
+.content-list h3 {
   font-size: 1.1rem;
   font-weight: 700;
   margin-top: 2rem;
   margin-bottom: 0.5rem;
 }
 
-.content-single h4 {
+.content-single h4,
+.content-list h4 {
   font-size: 1rem;
   font-weight: 600;
   margin-top: 1.5rem;
   margin-bottom: 0.5rem;
 }
 
-.content-single p {
+.content-single p,
+.content-list p {
   margin-bottom: 1rem;
+  line-height: 1.75;
 }
 
 .content-single ul,
-.content-single ol {
+.content-single ol,
+.content-list ul,
+.content-list ol {
   margin: 0 0 1rem 1.5rem;
+  line-height: 1.75;
 }
 
-.content-single li {
+.content-single li,
+.content-list li {
   margin-bottom: 0.25rem;
 }
 
-.content-single blockquote {
+.content-single blockquote,
+.content-list blockquote {
   border-left: 3px solid var(--color-accent);
   margin: 1.5rem 0;
   padding: 0.5rem 1rem;
@@ -764,7 +775,7 @@ a:hover {
 .docs-layout {
   display: flex;
   width: 100%;
-  max-width: 84rem;
+  max-width: var(--layout-width);
   margin: 0 auto;
   padding: 0 1.5rem;
   min-height: calc(100vh - var(--nav-height));
@@ -773,7 +784,8 @@ a:hover {
 .docs-layout > main {
   flex: 1;
   min-width: 0;
-  padding-left: 1.5rem;
+  padding-left: 6rem;
+  padding-right: 6rem;
 }
 
 /* Strip centering/padding from inner containers inside docs-layout */
@@ -824,57 +836,25 @@ a:hover {
   margin-bottom: 0.25rem;
 }
 
-.left-nav-section-toggle,
-.left-nav-subsection-toggle {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  width: 100%;
+.left-nav-section-title {
   padding: 0.5rem 1rem 0.5rem 0;
-  border: none;
-  background: none;
   color: var(--color-text);
   font-size: 0.8rem;
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.05em;
-  cursor: pointer;
-  text-align: left;
 }
 
-.left-nav-section-toggle:hover,
-.left-nav-subsection-toggle:hover {
-  color: var(--color-accent);
-}
-
-.left-nav-subsection-toggle {
-  text-transform: none;
+.left-nav-subsection-title {
   font-size: 0.85rem;
   font-weight: 600;
   padding: 0.375rem 1rem 0.375rem 0.5rem;
-}
-
-.left-nav-chevron {
-  width: 0.875rem;
-  height: 0.875rem;
-  flex-shrink: 0;
-  transition: transform 0.15s ease;
-  color: var(--color-text-secondary);
-}
-
-.left-nav-section.is-expanded > .left-nav-section-toggle .left-nav-chevron,
-.left-nav-subsection.is-expanded > .left-nav-subsection-toggle .left-nav-chevron {
-  transform: rotate(90deg);
+  color: var(--color-text);
 }
 
 .left-nav-pages,
 .left-nav-subpages {
   list-style: none;
-  display: none;
-}
-
-.left-nav-section.is-expanded > .left-nav-pages,
-.left-nav-subsection.is-expanded > .left-nav-subpages {
   display: block;
 }
 
@@ -957,7 +937,7 @@ a:hover {
 /* ── Table of Contents sidebar ───────────────────────────── */
 .page-with-toc {
   display: flex;
-  max-width: 84rem;
+  max-width: var(--layout-width);
   margin: 0 auto;
   padding: 0 1.5rem;
 }
@@ -1299,9 +1279,10 @@ details[open] summary {
 }
 
 .breadcrumbs li:not(:last-child)::after {
-  content: "/";
+  content: "\203A";
   margin: 0 0.5rem;
-  color: var(--color-border);
+  color: var(--color-text-secondary);
+  font-size: 1.1em;
 }
 
 .breadcrumbs li:last-child {
@@ -1586,7 +1567,7 @@ details[open] summary {
   display: flex;
   justify-content: center;
   gap: 4rem;
-  max-width: 84rem;
+  max-width: var(--layout-width);
   margin: 0 auto;
   padding: 0 1.5rem 1.5rem;
 }

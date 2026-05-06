@@ -150,15 +150,6 @@
   </script>
   <script>
   document.addEventListener("DOMContentLoaded", function () {
-    // Left nav expand/collapse
-    document.querySelectorAll(".left-nav-section-toggle, .left-nav-subsection-toggle").forEach(function (btn) {
-      btn.addEventListener("click", function () {
-        var parent = btn.parentElement;
-        var expanded = parent.classList.toggle("is-expanded");
-        btn.setAttribute("aria-expanded", expanded);
-      });
-    });
-
     // Mobile hamburger toggle
     var hamburger = document.getElementById("left-nav-toggle");
     var leftNav = document.getElementById("left-nav");
