@@ -32,6 +32,9 @@ func InstallFromTarGz(ctx context.Context, downloadURL, targetPath, binaryName s
 		if filepath.Base(tarFile.Name) != binaryName {
 			continue
 		}
+		if tarFile.Size == 0 {
+			return fmt.Errorf("agent binary %q in archive %q is empty", binaryName, downloadURL)
+		}
 
 		if err := utilio.InstallFile(targetPath, tarFile.Body, perm); err != nil {
 			return fmt.Errorf("install %s from %q: %w", binaryName, downloadURL, err)

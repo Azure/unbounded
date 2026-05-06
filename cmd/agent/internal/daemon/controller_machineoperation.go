@@ -91,8 +91,7 @@ func (r *daemonReconciler) reconcileAgentUpgrade(ctx context.Context, op *v1alph
 	}
 
 	if err := r.nodeOperator.RestartAgentDaemon(ctx, r.log); err != nil {
-		_, finishErr := finishOperation(ctx, r.Client, op.Name, v1alpha3.OperationPhaseFailed, "ExecutionFailed", err.Error(), 0)
-		return reconcile.Result{}, finishErr
+		r.log.Warn("failed to restart daemon after AgentUpgrade status update", "operation", op.Name, "error", err)
 	}
 
 	return result, nil
