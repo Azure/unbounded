@@ -34,8 +34,8 @@ func agentUpgradeDownloadURL(parameters map[string]string) (string, error) {
 }
 
 func upgradeDaemonBinary(ctx context.Context, log *slog.Logger, downloadURL string) error {
-	paths := daemonAgentUpgradePaths()
-	currentTarget, err := resolveSymlink(paths.CurrentPath)
+	paths := goalstates.ResolvedAgentUpgradePaths()
+	currentTarget, err := resolveSymlink(paths.CurrentPath, paths.BinaryPath)
 	if err != nil {
 		return fmt.Errorf("resolve current daemon binary symlink: %w", err)
 	}
@@ -49,11 +49,11 @@ func upgradeDaemonBinary(ctx context.Context, log *slog.Logger, downloadURL stri
 		return err
 	}
 
-	if err := updateSymlink(upgrade.LastGoodLinkPath, upgrade.PreviousBinaryPath); err != nil {
+	if err := agentbinary.UpdateSymlink(upgrade.LastGoodLinkPath, upgrade.PreviousBinaryPath); err != nil {
 		return fmt.Errorf("update last-good daemon symlink: %w", err)
 	}
 
-	if err := updateSymlink(upgrade.CurrentLinkPath, upgrade.TargetBinaryPath); err != nil {
+	if err := agentbinary.UpdateSymlink(upgrade.CurrentLinkPath, upgrade.TargetBinaryPath); err != nil {
 		return fmt.Errorf("update current daemon symlink: %w", err)
 	}
 
@@ -108,18 +108,8 @@ func agentUpgradeFailureSignalPath() string {
 	return goalstates.DaemonAgentUpgradeFailurePath
 }
 
-func daemonAgentUpgradePaths() goalstates.AgentUpgradePaths {
-	return goalstates.AgentUpgradePaths{
-		BinaryPath:   daemonBinaryPath(),
-		BluePath:     daemonBinaryBluePath(),
-		GreenPath:    daemonBinaryGreenPath(),
-		CurrentPath:  daemonBinaryCurrentPath(),
-		LastGoodPath: daemonBinaryLastGoodPath(),
-	}
-}
-
 func ensureDaemonBinaryLinks(log *slog.Logger) error {
-	paths := daemonAgentUpgradePaths()
+	paths := goalstates.ResolvedAgentUpgradePaths()
 
 	if _, err := filepath.EvalSymlinks(paths.CurrentPath); err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
@@ -129,7 +119,7 @@ func ensureDaemonBinaryLinks(log *slog.Logger) error {
 		if targetErr != nil {
 			return targetErr
 		}
-		if err := updateSymlink(paths.CurrentPath, target); err != nil {
+		if err := agentbinary.UpdateSymlink(paths.CurrentPath, target); err != nil {
 			return fmt.Errorf("initialize current daemon symlink: %w", err)
 		}
 	}
@@ -143,7 +133,7 @@ func ensureDaemonBinaryLinks(log *slog.Logger) error {
 		if !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("resolve last-good daemon binary symlink: %w", err)
 		}
-		if err := updateSymlink(paths.LastGoodPath, currentTarget); err != nil {
+		if err := agentbinary.UpdateSymlink(paths.LastGoodPath, currentTarget); err != nil {
 			return fmt.Errorf("initialize last-good daemon symlink: %w", err)
 		}
 	}
@@ -152,7 +142,7 @@ func ensureDaemonBinaryLinks(log *slog.Logger) error {
 		// Do not replace the compatibility path when the current symlink
 		// already resolves to that path. That preserves legacy installs and
 		// avoids creating a BinaryPath -> CurrentPath -> BinaryPath loop.
-		if err := updateSymlink(paths.BinaryPath, paths.CurrentPath); err != nil {
+		if err := agentbinary.UpdateSymlink(paths.BinaryPath, paths.CurrentPath); err != nil {
 			return fmt.Errorf("initialize daemon compatibility symlink: %w", err)
 		}
 	}
@@ -184,71 +174,15 @@ func isExecutableFile(path string) bool {
 	return info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0
 }
 
-func resolveSymlink(path string) (string, error) {
+func resolveSymlink(path, fallback string) (string, error) {
 	targetPath, err := filepath.EvalSymlinks(path)
 	if err == nil {
 		return targetPath, nil
 	}
 
 	if os.IsNotExist(err) {
-		return daemonBinaryPath(), nil
+		return fallback, nil
 	}
 
 	return "", err
-}
-
-func daemonBinaryPath() string {
-	if path := strings.TrimSpace(os.Getenv(goalstates.EnvDaemonBinary)); path != "" {
-		return path
-	}
-
-	return goalstates.DaemonBinaryPath
-}
-
-func daemonBinaryBluePath() string {
-	if path := strings.TrimSpace(os.Getenv(goalstates.EnvDaemonBinaryBlue)); path != "" {
-		return path
-	}
-
-	return goalstates.DaemonBinaryBluePath
-}
-
-func daemonBinaryGreenPath() string {
-	if path := strings.TrimSpace(os.Getenv(goalstates.EnvDaemonBinaryGreen)); path != "" {
-		return path
-	}
-
-	return goalstates.DaemonBinaryGreenPath
-}
-
-func daemonBinaryCurrentPath() string {
-	if path := strings.TrimSpace(os.Getenv(goalstates.EnvDaemonBinaryCurrent)); path != "" {
-		return path
-	}
-
-	return goalstates.DaemonBinaryCurrentPath
-}
-
-func daemonBinaryLastGoodPath() string {
-	if path := strings.TrimSpace(os.Getenv(goalstates.EnvDaemonBinaryLastGood)); path != "" {
-		return path
-	}
-
-	return goalstates.DaemonBinaryLastGoodPath
-}
-
-func updateSymlink(linkPath, targetPath string) error {
-	if err := os.MkdirAll(filepath.Dir(linkPath), 0o750); err != nil {
-		return err
-	}
-
-	tmpPath := fmt.Sprintf("%s.tmp", linkPath)
-	if err := os.Remove(tmpPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	if err := os.Symlink(targetPath, tmpPath); err != nil {
-		return err
-	}
-
-	return os.Rename(tmpPath, linkPath)
 }

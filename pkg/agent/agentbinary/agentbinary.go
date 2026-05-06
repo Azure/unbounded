@@ -45,3 +45,8 @@ func InstallFromTarGz(ctx context.Context, downloadURL, targetPath, binaryName s
 
 	return fmt.Errorf("agent binary %q not found in archive %q", binaryName, downloadURL)
 }
+
+// UpdateSymlink atomically updates linkPath to point at targetPath.
+func UpdateSymlink(linkPath, targetPath string) error {
+	return utilio.UpdateSymlink(linkPath, targetPath)
+}

@@ -3,6 +3,11 @@
 
 package goalstates
 
+import (
+	"os"
+	"strings"
+)
+
 const AgentUpgradeBinaryName = "unbounded-agent"
 
 // AgentUpgradePaths describes the host-side blue-green agent binary layout.
@@ -23,6 +28,26 @@ func DefaultAgentUpgradePaths() AgentUpgradePaths {
 		CurrentPath:  DaemonBinaryCurrentPath,
 		LastGoodPath: DaemonBinaryLastGoodPath,
 	}
+}
+
+// ResolvedAgentUpgradePaths returns the host-side agent binary paths after
+// applying environment overrides.
+func ResolvedAgentUpgradePaths() AgentUpgradePaths {
+	return AgentUpgradePaths{
+		BinaryPath:   envOrDefault(EnvDaemonBinary, DaemonBinaryPath),
+		BluePath:     envOrDefault(EnvDaemonBinaryBlue, DaemonBinaryBluePath),
+		GreenPath:    envOrDefault(EnvDaemonBinaryGreen, DaemonBinaryGreenPath),
+		CurrentPath:  envOrDefault(EnvDaemonBinaryCurrent, DaemonBinaryCurrentPath),
+		LastGoodPath: envOrDefault(EnvDaemonBinaryLastGood, DaemonBinaryLastGoodPath),
+	}
+}
+
+func envOrDefault(name, defaultValue string) string {
+	if value := strings.TrimSpace(os.Getenv(name)); value != "" {
+		return value
+	}
+
+	return defaultValue
 }
 
 // AgentUpgrade captures the desired host-side binary state for one upgrade.
