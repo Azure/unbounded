@@ -2,7 +2,7 @@
 
 The Unbounded controller will rely on two control methods - configuration CRs for machine configuration and status alongside an operational CR for operations like reboot, shutdown, and power on.
 
-![Excalidraw diagram of the below architecture](image.png)
+![Excalidraw diagram of the below architecture](machina-crds.png)
 
 [Link](https://excalidraw.com/#json=FvIvkl5uWdPAwTrVdNNua,WTKPZlW8KllB1HMfHbj0rQ)
 
