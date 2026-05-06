@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"strings"
 
 	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
@@ -44,16 +45,16 @@ func (d *enableDaemon) Name() string { return "enable-daemon" }
 
 func (d *enableDaemon) Do(ctx context.Context) error {
 	unitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonUnit)
-	if err := writeFile(unitPath, daemonServiceContent, 0o644); err != nil {
+	if err := writeFile(unitPath, renderDaemonAsset(daemonServiceContent), 0o644); err != nil {
 		return fmt.Errorf("writing %s: %w", unitPath, err)
 	}
 
 	recoveryUnitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonRecoveryUnit)
-	if err := writeFile(recoveryUnitPath, daemonRecoveryServiceContent, 0o644); err != nil {
+	if err := writeFile(recoveryUnitPath, renderDaemonAsset(daemonRecoveryServiceContent), 0o644); err != nil {
 		return fmt.Errorf("writing %s: %w", recoveryUnitPath, err)
 	}
 
-	if err := writeFile(goalstates.DaemonRecoveryScriptPath, daemonRecoveryScriptContent, 0o755); err != nil {
+	if err := writeFile(goalstates.DaemonRecoveryScriptPath, renderDaemonAsset(daemonRecoveryScriptContent), 0o755); err != nil {
 		return fmt.Errorf("writing %s: %w", goalstates.DaemonRecoveryScriptPath, err)
 	}
 
@@ -74,6 +75,18 @@ func (d *enableDaemon) Do(ctx context.Context) error {
 	d.log.Info("daemon unit started", "unit", goalstates.DaemonUnit)
 
 	return nil
+}
+
+func renderDaemonAsset(content []byte) []byte {
+	replacer := strings.NewReplacer(
+		"{{ .DaemonUnit }}", goalstates.DaemonUnit,
+		"{{ .DaemonRecoveryUnit }}", goalstates.DaemonRecoveryUnit,
+		"{{ .DaemonBinaryCurrentPath }}", goalstates.DaemonBinaryCurrentPath,
+		"{{ .DaemonBinaryLastGoodPath }}", goalstates.DaemonBinaryLastGoodPath,
+		"{{ .DaemonRecoveryScriptPath }}", goalstates.DaemonRecoveryScriptPath,
+	)
+
+	return []byte(replacer.Replace(string(content)))
 }
 
 // ---------------------------------------------------------------------------

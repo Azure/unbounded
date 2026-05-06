@@ -4,8 +4,8 @@
 
 set -euo pipefail
 
-current="/usr/local/bin/unbounded-agent-current"
-last_good="$(readlink -f /usr/local/bin/unbounded-agent-last-good || true)"
+current="{{ .DaemonBinaryCurrentPath }}"
+last_good="$(readlink -f {{ .DaemonBinaryLastGoodPath }} || true)"
 
 if [ -z "${last_good}" ] || [ ! -x "${last_good}" ]; then
     echo "no valid last-known-good agent binary found" >&2
@@ -13,5 +13,5 @@ if [ -z "${last_good}" ] || [ ! -x "${last_good}" ]; then
 fi
 
 ln -sfn "${last_good}" "${current}"
-systemctl reset-failed unbounded-agent-daemon.service
-systemctl restart unbounded-agent-daemon.service
+systemctl reset-failed {{ .DaemonUnit }}
+systemctl restart {{ .DaemonUnit }}

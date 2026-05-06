@@ -5,13 +5,13 @@
 Description=Unbounded Agent Daemon
 After=network-online.target machines.target
 Wants=network-online.target machines.target
-OnFailure=unbounded-agent-daemon-recovery.service
+OnFailure={{ .DaemonRecoveryUnit }}
 StartLimitIntervalSec=60
 StartLimitBurst=3
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/unbounded-agent-current daemon
+ExecStart={{ .DaemonBinaryCurrentPath }} daemon
 Restart=always
 RestartSec=10
 
