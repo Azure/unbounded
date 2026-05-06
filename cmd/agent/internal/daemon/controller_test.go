@@ -246,12 +246,21 @@ func TestReconcileAgentUpgrade_Complete(t *testing.T) {
 
 	var updated v1alpha3.MachineOperation
 	require.NoError(t, reconciler.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
+	assert.Equal(t, v1alpha3.OperationPhaseInProgress, updated.Status.Phase)
+	require.NotNil(t, updated.Status.StartedAt)
+	assert.Nil(t, updated.Status.CompletedAt)
+	data, err := os.ReadFile(operationPath)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"operationName":"op-1","observedMachineGeneration":9}`, string(data))
+
+	require.NoError(t, publishAndClearAgentUpgradeSignals(context.Background(), discardLogger(), reconciler.Client))
+	require.NoError(t, reconciler.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
 	assert.Equal(t, v1alpha3.OperationPhaseComplete, updated.Status.Phase)
 	assert.Equal(t, "AgentUpgrade completed", updated.Status.Message)
 	assert.Equal(t, int64(9), updated.Status.ObservedMachineGeneration)
 	require.NotNil(t, updated.Status.StartedAt)
 	require.NotNil(t, updated.Status.CompletedAt)
-	assertFileContent(t, operationPath, "op-1\n")
+	assert.NoFileExists(t, operationPath)
 }
 
 func TestReconcileAgentUpgrade_MissingDownloadURL(t *testing.T) {
@@ -316,7 +325,7 @@ func TestReconcileAgentUpgrade_Failed(t *testing.T) {
 	assert.NoFileExists(t, operationPath)
 }
 
-func TestReconcileAgentUpgrade_RestartFailureLeavesOperationComplete(t *testing.T) {
+func TestReconcileAgentUpgrade_RestartFailureFailsOperation(t *testing.T) {
 	operationPath, _ := setAgentUpgradeSignalPaths(t)
 	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Generation: 9}}
 	machineOp := &v1alpha3.MachineOperation{
@@ -345,13 +354,13 @@ func TestReconcileAgentUpgrade_RestartFailureLeavesOperationComplete(t *testing.
 
 	var updated v1alpha3.MachineOperation
 	require.NoError(t, reconciler.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
-	assert.Equal(t, v1alpha3.OperationPhaseComplete, updated.Status.Phase)
-	assert.Equal(t, "AgentUpgrade completed", updated.Status.Message)
-	assertFileContent(t, operationPath, "op-1\n")
+	assert.Equal(t, v1alpha3.OperationPhaseFailed, updated.Status.Phase)
+	assert.Equal(t, "restart failed", updated.Status.Message)
+	assert.NoFileExists(t, operationPath)
 }
 
-func TestPublishAgentUpgradeFailureSignal(t *testing.T) {
-	_, failurePath := setAgentUpgradeSignalPaths(t)
+func TestPublishAndClearAgentUpgradeSignals_Failure(t *testing.T) {
+	operationPath, failurePath := setAgentUpgradeSignalPaths(t)
 	const rollbackMessage = "rolled back to last good"
 	machineOp := &v1alpha3.MachineOperation{
 		ObjectMeta: metav1.ObjectMeta{Name: "op-1"},
@@ -365,9 +374,10 @@ func TestPublishAgentUpgradeFailureSignal(t *testing.T) {
 		},
 	}
 	c := fakeStatusClient(machineOp)
-	require.NoError(t, os.WriteFile(failurePath, []byte("op-1\n"+rollbackMessage+"\n"), 0o600))
+	require.NoError(t, recordPendingAgentUpgradeOperation("op-1", 7))
+	require.NoError(t, os.WriteFile(failurePath, []byte(`{"operationName":"op-1","message":"`+rollbackMessage+`"}`+"\n"), 0o600))
 
-	require.NoError(t, publishAgentUpgradeFailureSignal(context.Background(), discardLogger(), c))
+	require.NoError(t, publishAndClearAgentUpgradeSignals(context.Background(), discardLogger(), c))
 
 	var updated v1alpha3.MachineOperation
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
@@ -378,6 +388,7 @@ func TestPublishAgentUpgradeFailureSignal(t *testing.T) {
 	assert.Equal(t, metav1.ConditionFalse, condition.Status)
 	assert.Equal(t, "DaemonFailed", condition.Reason)
 	assert.NoFileExists(t, failurePath)
+	assert.NoFileExists(t, operationPath)
 }
 
 func TestReconcileAgentReset_Complete(t *testing.T) {

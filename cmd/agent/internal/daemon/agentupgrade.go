@@ -5,14 +5,13 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/Azure/unbounded/pkg/agent/agentbinary"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
@@ -21,8 +20,17 @@ import (
 const (
 	agentUpgradeDownloadURLParameter = "downloadURL"
 	agentUpgradeBinaryMode           = 0o755
-	agentUpgradeVerifyTimeout        = 30 * time.Second
 )
+
+type agentUpgradeOperationSignal struct {
+	OperationName             string `json:"operationName"`
+	ObservedMachineGeneration int64  `json:"observedMachineGeneration,omitempty"`
+}
+
+type agentUpgradeFailureSignal struct {
+	OperationName string `json:"operationName"`
+	Message       string `json:"message"`
+}
 
 func agentUpgradeDownloadURL(parameters map[string]string) (string, error) {
 	downloadURL := strings.TrimSpace(parameters[agentUpgradeDownloadURLParameter])
@@ -45,10 +53,6 @@ func upgradeDaemonBinary(ctx context.Context, log *slog.Logger, downloadURL stri
 		return fmt.Errorf("install upgraded daemon binary to %s: %w", upgrade.TargetBinaryPath, err)
 	}
 
-	if err := verifyAgentUpgradeBinary(ctx, upgrade.TargetBinaryPath); err != nil {
-		return err
-	}
-
 	if err := agentbinary.UpdateSymlink(upgrade.LastGoodLinkPath, upgrade.PreviousBinaryPath); err != nil {
 		return fmt.Errorf("update last-good daemon symlink: %w", err)
 	}
@@ -66,29 +70,60 @@ func upgradeDaemonBinary(ctx context.Context, log *slog.Logger, downloadURL stri
 	return nil
 }
 
-func verifyAgentUpgradeBinary(ctx context.Context, path string) error {
-	verifyCtx, cancel := context.WithTimeout(ctx, agentUpgradeVerifyTimeout)
-	defer cancel()
-
-	output, err := exec.CommandContext(verifyCtx, path, "version").CombinedOutput()
+func recordPendingAgentUpgradeOperation(operationName string, observedMachineGeneration int64) error {
+	data, err := json.Marshal(agentUpgradeOperationSignal{
+		OperationName:             operationName,
+		ObservedMachineGeneration: observedMachineGeneration,
+	})
 	if err != nil {
-		details := strings.TrimSpace(string(output))
-		if details != "" {
-			return fmt.Errorf("verify upgraded daemon binary %s: %w: %s", path, err, details)
+		return err
+	}
+
+	return writeFile(agentUpgradeOperationSignalPath(), append(data, '\n'), 0o600)
+}
+
+func readPendingAgentUpgradeOperation() (agentUpgradeOperationSignal, bool, error) {
+	data, err := os.ReadFile(agentUpgradeOperationSignalPath())
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return agentUpgradeOperationSignal{}, false, nil
 		}
-		return fmt.Errorf("verify upgraded daemon binary %s: %w", path, err)
+
+		return agentUpgradeOperationSignal{}, false, err
+	}
+
+	var signal agentUpgradeOperationSignal
+	if err := json.Unmarshal(data, &signal); err == nil {
+		signal.OperationName = strings.TrimSpace(signal.OperationName)
+		return signal, signal.OperationName != "", nil
+	}
+
+	operationName := strings.TrimSpace(string(data))
+	return agentUpgradeOperationSignal{OperationName: operationName}, operationName != "", nil
+}
+
+func removeAgentUpgradeOperationSignal() error {
+	if err := os.Remove(agentUpgradeOperationSignalPath()); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
 	}
 
 	return nil
 }
 
-func recordPendingAgentUpgradeOperation(operationName string) error {
-	return writeFile(agentUpgradeOperationSignalPath(), []byte(operationName+"\n"), 0o600)
+func removeAgentUpgradeFailureSignal() error {
+	if err := os.Remove(agentUpgradeFailureSignalPath()); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	return nil
 }
 
-func clearPendingAgentUpgradeOperation(log *slog.Logger) {
-	if err := os.Remove(agentUpgradeOperationSignalPath()); err != nil && !errors.Is(err, os.ErrNotExist) {
+func clearAgentUpgradeSignals(log *slog.Logger) {
+	if err := removeAgentUpgradeOperationSignal(); err != nil {
 		log.Warn("failed to clear pending AgentUpgrade operation signal", "error", err)
+	}
+	if err := removeAgentUpgradeFailureSignal(); err != nil {
+		log.Warn("failed to clear AgentUpgrade failure signal", "error", err)
 	}
 }
 

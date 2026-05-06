@@ -9,10 +9,15 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 )
+
+const verifyTimeout = 30 * time.Second
 
 // InstallFromTarGz downloads a remote .tar.gz archive and installs binaryName
 // from it to targetPath.
@@ -40,10 +45,31 @@ func InstallFromTarGz(ctx context.Context, downloadURL, targetPath, binaryName s
 			return fmt.Errorf("install %s from %q: %w", binaryName, downloadURL, err)
 		}
 
+		if err := Verify(ctx, targetPath); err != nil {
+			return err
+		}
+
 		return nil
 	}
 
 	return fmt.Errorf("agent binary %q not found in archive %q", binaryName, downloadURL)
+}
+
+// Verify runs the installed agent binary's version command.
+func Verify(ctx context.Context, path string) error {
+	verifyCtx, cancel := context.WithTimeout(ctx, verifyTimeout)
+	defer cancel()
+
+	output, err := exec.CommandContext(verifyCtx, path, "version").CombinedOutput()
+	if err != nil {
+		details := strings.TrimSpace(string(output))
+		if details != "" {
+			return fmt.Errorf("verify agent binary %s: %w: %s", path, err, details)
+		}
+		return fmt.Errorf("verify agent binary %s: %w", path, err)
+	}
+
+	return nil
 }
 
 // UpdateSymlink atomically updates linkPath to point at targetPath.

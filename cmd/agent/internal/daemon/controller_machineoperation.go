@@ -5,6 +5,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -83,27 +84,22 @@ func (r *daemonReconciler) reconcileAgentUpgrade(ctx context.Context, op *v1alph
 		return reconcile.Result{}, finishErr
 	}
 
-	if err := recordPendingAgentUpgradeOperation(op.Name); err != nil {
-		_, finishErr := finishOperation(ctx, r.Client, op.Name, v1alpha3.OperationPhaseFailed, "ExecutionFailed", err.Error(), 0)
-		return reconcile.Result{}, finishErr
-	}
-
 	if err := r.nodeOperator.StageAgentUpgrade(ctx, r.log, downloadURL); err != nil {
-		clearPendingAgentUpgradeOperation(r.log)
 		_, finishErr := finishOperation(ctx, r.Client, op.Name, v1alpha3.OperationPhaseFailed, "ExecutionFailed", err.Error(), 0)
 		return reconcile.Result{}, finishErr
 	}
 
-	result, err := finishOperation(ctx, r.Client, op.Name, v1alpha3.OperationPhaseComplete, "Succeeded", "AgentUpgrade completed", machine.Generation)
-	if err != nil {
-		return reconcile.Result{}, err
+	if err := recordPendingAgentUpgradeOperation(op.Name, machine.Generation); err != nil {
+		_, finishErr := finishOperation(ctx, r.Client, op.Name, v1alpha3.OperationPhaseFailed, "ExecutionFailed", err.Error(), 0)
+		return reconcile.Result{}, finishErr
 	}
 
 	if err := r.nodeOperator.RestartAgentDaemon(ctx, r.log); err != nil {
-		r.log.Warn("failed to restart daemon after AgentUpgrade status update", "operation", op.Name, "error", err)
+		clearAgentUpgradeSignals(r.log)
+		return finishFailedOperation(ctx, r.Client, op.Name, err)
 	}
 
-	return result, nil
+	return reconcile.Result{}, nil
 }
 
 func (r *daemonReconciler) reconcileAgentReset(ctx context.Context, op *v1alpha3.MachineOperation) (reconcile.Result, error) {
@@ -130,39 +126,83 @@ func (r *daemonReconciler) reconcileAgentReset(ctx context.Context, op *v1alpha3
 	return result, r.nodeOperator.StopDaemon(ctx, r.log)
 }
 
-func publishAgentUpgradeFailureSignal(ctx context.Context, log *slog.Logger, c client.Client) error {
+func publishAgentUpgradeFailureSignal(ctx context.Context, log *slog.Logger, c client.Client) (bool, error) {
 	data, err := os.ReadFile(agentUpgradeFailureSignalPath())
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil
+			return false, nil
 		}
 
-		return fmt.Errorf("read AgentUpgrade failure signal: %w", err)
+		return false, fmt.Errorf("read AgentUpgrade failure signal: %w", err)
 	}
 
-	lines := strings.SplitN(strings.TrimSpace(string(data)), "\n", 2)
-	operationName := strings.TrimSpace(lines[0])
+	var signal agentUpgradeFailureSignal
+	if err := json.Unmarshal(data, &signal); err != nil {
+		lines := strings.SplitN(strings.TrimSpace(string(data)), "\n", 2)
+		signal.OperationName = strings.TrimSpace(lines[0])
+		if len(lines) > 1 {
+			signal.Message = strings.TrimSpace(lines[1])
+		}
+	}
+
+	operationName := strings.TrimSpace(signal.OperationName)
 	if operationName == "" {
-		if err := os.Remove(agentUpgradeFailureSignalPath()); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("remove empty AgentUpgrade failure signal: %w", err)
+		if err := removeAgentUpgradeFailureSignal(); err != nil {
+			return false, fmt.Errorf("remove empty AgentUpgrade failure signal: %w", err)
+		}
+		return false, nil
+	}
+
+	message := "AgentUpgrade daemon failed after switching binary"
+	if strings.TrimSpace(signal.Message) != "" {
+		message = strings.TrimSpace(signal.Message)
+	}
+
+	if _, err := finishOperation(ctx, c, operationName, v1alpha3.OperationPhaseFailed, "DaemonFailed", message, 0); err != nil {
+		return false, err
+	}
+
+	if err := removeAgentUpgradeFailureSignal(); err != nil {
+		return false, fmt.Errorf("remove AgentUpgrade failure signal: %w", err)
+	}
+
+	log.Info("published AgentUpgrade daemon failure signal", "operation", operationName)
+
+	return true, nil
+}
+
+func publishAndClearAgentUpgradeSignals(ctx context.Context, log *slog.Logger, c client.Client) error {
+	failurePublished, err := publishAgentUpgradeFailureSignal(ctx, log, c)
+	if err != nil {
+		return err
+	}
+	if failurePublished {
+		if err := removeAgentUpgradeOperationSignal(); err != nil {
+			return fmt.Errorf("remove pending AgentUpgrade operation signal after failure: %w", err)
 		}
 		return nil
 	}
 
-	message := "AgentUpgrade daemon failed after switching binary"
-	if len(lines) > 1 && strings.TrimSpace(lines[1]) != "" {
-		message = strings.TrimSpace(lines[1])
+	pending, ok, err := readPendingAgentUpgradeOperation()
+	if err != nil {
+		return fmt.Errorf("read pending AgentUpgrade operation signal: %w", err)
+	}
+	if ok {
+		if _, err := finishOperation(
+			ctx,
+			c,
+			pending.OperationName,
+			v1alpha3.OperationPhaseComplete,
+			"Succeeded",
+			"AgentUpgrade completed",
+			pending.ObservedMachineGeneration,
+		); err != nil {
+			return err
+		}
+		log.Info("published AgentUpgrade success signal", "operation", pending.OperationName)
 	}
 
-	if _, err := finishOperation(ctx, c, operationName, v1alpha3.OperationPhaseFailed, "DaemonFailed", message, 0); err != nil {
-		return err
-	}
-
-	if err := os.Remove(agentUpgradeFailureSignalPath()); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("remove AgentUpgrade failure signal: %w", err)
-	}
-
-	log.Info("published AgentUpgrade daemon failure signal", "operation", operationName)
+	clearAgentUpgradeSignals(log)
 
 	return nil
 }
