@@ -1888,7 +1888,7 @@ def validate_agent_upgrade_rollback() -> None:
     broken_operation = _serve_agent_upgrade_tarball(
         broken_tarball, broken_operation_name, expect_complete=False)
     broken_status = broken_operation.get("status", {})
-    if "verify upgraded daemon binary" not in broken_status.get("message", ""):
+    if "verify agent binary" not in broken_status.get("message", ""):
         die(f"unexpected broken AgentUpgrade failure message: {broken_status.get('message')!r}")
     if read_daemon_current_target() != previous_good:
         die("broken AgentUpgrade changed current daemon binary symlink")
@@ -1896,16 +1896,9 @@ def validate_agent_upgrade_rollback() -> None:
     operation_name = f"e2e-agent-upgrade-rollback-{int(time.time())}"
     tarball = VM_DIR / "unbounded-agent-upgrade-daemon-bad.tar.gz"
     _build_daemon_failing_agent_tarball(tarball)
-    operation = _serve_agent_upgrade_tarball(tarball, operation_name)
-
-    status = operation.get("status", {})
-    if status.get("message") != "AgentUpgrade completed":
-        die(f"unexpected MachineOperation message: {status.get('message')!r}")
-
+    failed_operation = _serve_agent_upgrade_tarball(tarball, operation_name, expect_complete=False)
     wait_for_daemon_current_target(previous_good)
     wait_for_daemon_active()
-    failed_operation = wait_for_machine_operation_failed(
-        operation_name, allow_complete_before_failure=True)
     failed_status = failed_operation.get("status", {})
     if AGENT_UPGRADE_ROLLBACK_MESSAGE_FRAGMENT not in failed_status.get("message", ""):
         die(f"unexpected rollback AgentUpgrade failure message: {failed_status.get('message')!r}")

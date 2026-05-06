@@ -14,43 +14,15 @@ if [ -z "${last_good}" ] || [ ! -x "${last_good}" ]; then
     exit 1
 fi
 
-operation="$(
-    python3 - "${pending_upgrade}" 2>/dev/null <<'PY' || true
-import json
-import sys
-
-try:
-    with open(sys.argv[1], encoding="utf-8") as f:
-        data = f.read()
-except FileNotFoundError:
-    sys.exit(0)
-
-try:
-    print(json.loads(data).get("operationName", ""))
-except json.JSONDecodeError:
-    print(data.splitlines()[0] if data.splitlines() else "")
-PY
-)"
-if [ -z "${operation}" ] && ! command -v python3 >/dev/null 2>&1; then
-    operation="$(head -n 1 "${pending_upgrade}" 2>/dev/null || true)"
-fi
-if [ -n "${operation}" ]; then
-    mkdir -p "$(dirname "${failure_signal}")"
+if [ -f "${pending_upgrade}" ]; then
     message="AgentUpgrade daemon failed after switching binary; rolled back to ${last_good}"
-    if command -v python3 >/dev/null 2>&1; then
-        python3 - "${failure_signal}" "${operation}" "${message}" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], "w", encoding="utf-8") as f:
-    json.dump({"operationName": sys.argv[2], "message": sys.argv[3]}, f)
-    f.write("\n")
-PY
-    else
-        safe_operation="$(printf '%s' "${operation}" | tr -cd '[:alnum:]._-')"
-        printf '{"operationName":"%s","message":"AgentUpgrade daemon failed after switching binary"}\n' "${safe_operation}" > "${failure_signal}"
+    if ! "${last_good}" record-agent-upgrade-failure-signal \
+        --operation-path "${pending_upgrade}" \
+        --failure-path "${failure_signal}" \
+        --message "${message}"; then
+        echo "failed to record AgentUpgrade recovery signal" >&2
+        rm -f "${pending_upgrade}"
     fi
-    rm -f "${pending_upgrade}"
 fi
 
 ln -sfn "${last_good}" "${current}"

@@ -83,7 +83,11 @@ func recordPendingAgentUpgradeOperation(operationName string, observedMachineGen
 }
 
 func readPendingAgentUpgradeOperation() (*agentUpgradeOperationSignal, error) {
-	data, err := os.ReadFile(agentUpgradeOperationSignalPath())
+	return readAgentUpgradeOperationSignal(agentUpgradeOperationSignalPath())
+}
+
+func readAgentUpgradeOperationSignal(path string) (*agentUpgradeOperationSignal, error) {
+	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil
@@ -107,6 +111,41 @@ func readPendingAgentUpgradeOperation() (*agentUpgradeOperationSignal, error) {
 	}
 
 	return &agentUpgradeOperationSignal{OperationName: operationName}, nil
+}
+
+// RecordAgentUpgradeFailureSignal records that the daemon failed after an
+// AgentUpgrade and removes the pending operation signal.
+func RecordAgentUpgradeFailureSignal(operationPath, failurePath, message string) error {
+	pending, err := readAgentUpgradeOperationSignal(operationPath)
+	if err != nil {
+		return fmt.Errorf("read pending AgentUpgrade operation signal: %w", err)
+	}
+	if pending == nil {
+		return nil
+	}
+
+	message = strings.TrimSpace(message)
+	if message == "" {
+		message = "AgentUpgrade daemon failed after switching binary"
+	}
+
+	data, err := json.Marshal(agentUpgradeFailureSignal{
+		OperationName: pending.OperationName,
+		Message:       message,
+	})
+	if err != nil {
+		return err
+	}
+
+	if err := writeFile(failurePath, append(data, '\n'), 0o600); err != nil {
+		return err
+	}
+
+	if err := os.Remove(operationPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	return nil
 }
 
 func removeAgentUpgradeOperationSignal() error {

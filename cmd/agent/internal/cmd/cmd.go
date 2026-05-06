@@ -29,6 +29,7 @@ func Run() {
 		newCmdDaemon(cmdCtx),
 		newCmdReset(cmdCtx),
 		newCmdVersion(),
+		newCmdRecordAgentUpgradeFailureSignal(),
 	)
 
 	if err := root.Execute(); err != nil {
