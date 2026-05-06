@@ -80,20 +80,11 @@ func StopDaemon(log *slog.Logger) phases.Task {
 func (t *stopDaemon) Name() string { return "stop-daemon" }
 
 func (t *stopDaemon) Do(ctx context.Context) error {
-	sc := executil.Systemctl()
-
-	if err := executil.RunCmd(ctx, t.log, sc, "stop", goalstates.DaemonUnit); err != nil {
+	if err := executil.RunCmd(ctx, t.log, executil.Systemctl(), "stop", goalstates.DaemonUnit); err != nil {
 		t.log.Warn("failed to stop daemon (may not be running)", "error", err)
 	}
 
-	if err := executil.RunCmd(ctx, t.log, sc, "disable", goalstates.DaemonUnit); err != nil {
-		t.log.Warn("failed to disable daemon (may not be enabled)", "error", err)
-	}
-
-	unitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonUnit)
-	removeFileIfExists(t.log, unitPath)
-
-	return nil
+	return RemoveDaemonUnit(t.log).Do(ctx)
 }
 
 // ---------------------------------------------------------------------------

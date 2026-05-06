@@ -15,6 +15,10 @@ import (
 // removing the unbounded-agent and all associated resources.
 func ResetAgent(log *slog.Logger) phases.Task {
 	return phases.Serial(log,
+		// CLI reset runs outside the daemon, so it can stop the daemon first to
+		// keep it from reconciling while files are removed. The daemon operation
+		// path stops the daemon last because stopping the unit terminates the
+		// reconciler before it can mark the MachineOperation complete.
 		StopDaemon(log),
 		ResetAgentResources(log),
 	)

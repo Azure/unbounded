@@ -84,6 +84,8 @@ func (r *daemonReconciler) reconcileAgentReset(ctx context.Context, op *v1alpha3
 		return result, err
 	}
 
+	// Stop the daemon last because systemctl stop terminates this running
+	// process.
 	return result, r.nodeOperator.StopDaemon(ctx, r.log)
 }
 
