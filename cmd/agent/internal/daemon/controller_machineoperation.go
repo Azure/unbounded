@@ -51,7 +51,13 @@ func (r *daemonReconciler) reconcileNodeReboot(ctx context.Context, op *v1alpha3
 		return reconcile.Result{}, err
 	}
 
-	if err := r.restartActiveNode(ctx, r.log); err != nil {
+	active, err := r.nodeOperator.FindActiveMachine(r.log)
+	if err != nil {
+		_, finishErr := finishOperation(ctx, r.Client, op.Name, v1alpha3.OperationPhaseFailed, "ExecutionFailed", err.Error(), 0)
+		return reconcile.Result{}, finishErr
+	}
+
+	if err := r.nodeOperator.RestartNode(ctx, r.log, active); err != nil {
 		_, finishErr := finishOperation(ctx, r.Client, op.Name, v1alpha3.OperationPhaseFailed, "ExecutionFailed", err.Error(), 0)
 		return reconcile.Result{}, finishErr
 	}

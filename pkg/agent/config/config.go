@@ -16,6 +16,8 @@ package config
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 )
@@ -35,6 +37,22 @@ type AgentConfig struct {
 	// "ghcr.io/org/repo:tag") used to bootstrap the machine rootfs.
 	// When empty the agent falls back to debootstrap.
 	OCIImage string `json:"OCIImage,omitempty"`
+}
+
+// DeepCopy returns a copy of AgentConfig with mutable nested values cloned.
+func (a *AgentConfig) DeepCopy() *AgentConfig {
+	if a == nil {
+		return nil
+	}
+
+	out := *a
+	if a.Kubelet.Labels != nil {
+		out.Kubelet.Labels = make(map[string]string, len(a.Kubelet.Labels))
+		maps.Copy(out.Kubelet.Labels, a.Kubelet.Labels)
+	}
+	out.Kubelet.RegisterWithTaints = slices.Clone(a.Kubelet.RegisterWithTaints)
+
+	return &out
 }
 
 // AgentClusterConfig holds the cluster-level values the agent needs to

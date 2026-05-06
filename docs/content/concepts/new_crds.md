@@ -41,7 +41,7 @@ The initial `OnDelete` update flow should be explicit and operator-driven. After
 For example, updating a machine from version 1 to version 2 would look like:
 
 ```shell
-kubectl unbounded machine config set my-machine --configuration my-config --version 2
+kubectl unbounded machine config assign my-machine --config my-config --version 2
 kubectl drain my-node --ignore-daemonsets --delete-emptydir-data
 kubectl delete node my-node
 kubectl wait machine my-machine --for=condition=Ready

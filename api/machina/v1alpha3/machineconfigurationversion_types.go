@@ -4,6 +4,8 @@
 package v1alpha3
 
 import (
+	"fmt"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -20,6 +22,12 @@ const (
 	// efficient selection.
 	MCVVersionLabelKey = "unbounded-cloud.io/machine-configuration-version"
 )
+
+// MachineConfigurationVersionName returns the canonical name for a
+// MachineConfigurationVersion child object.
+func MachineConfigurationVersionName(configurationName string, version int32) string {
+	return fmt.Sprintf("%s-v%d", configurationName, version)
+}
 
 // +kubebuilder:object:root=true
 // +kubebuilder:resource:scope=Cluster,shortName=mcv
