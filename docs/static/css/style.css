@@ -32,6 +32,7 @@
 html {
   font-size: 16px;
   -webkit-font-smoothing: antialiased;
+  overflow-y: scroll;
 }
 
 body {
@@ -762,6 +763,7 @@ a:hover {
 /* ── Docs layout (left nav + main) ────────────────────────── */
 .docs-layout {
   display: flex;
+  width: 100%;
   max-width: 84rem;
   margin: 0 auto;
   padding: 0 1.5rem;
@@ -771,18 +773,27 @@ a:hover {
 .docs-layout > main {
   flex: 1;
   min-width: 0;
+  padding-left: 1.5rem;
 }
 
-/* When inside docs-layout, inner containers should not re-center */
+/* Strip centering/padding from inner containers inside docs-layout */
 .docs-layout .content-single,
 .docs-layout .content-list {
+  max-width: none;
   margin: 0;
+  padding-left: 0;
+  padding-right: 0;
 }
 
 .docs-layout .page-with-toc {
   max-width: none;
   margin: 0;
   padding: 0;
+}
+
+.docs-layout .page-with-toc .content-single {
+  padding-left: 0;
+  padding-right: 0;
 }
 
 /* ── Left navigation sidebar ─────────────────────────────── */
@@ -960,10 +971,11 @@ a:hover {
 }
 
 .toc-sidebar {
+  order: 2;
   width: 18rem;
   flex-shrink: 0;
   padding-top: 2.5rem;
-  margin-right: 2.5rem;
+  margin-left: 2.5rem;
 }
 
 .toc-inner {
