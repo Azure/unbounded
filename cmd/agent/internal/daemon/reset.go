@@ -11,19 +11,6 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/phases/reset"
 )
 
-// ResetAgent returns a task that resets the host by stopping the daemon and
-// removing the unbounded-agent and all associated resources.
-func ResetAgent(log *slog.Logger) phases.Task {
-	return phases.Serial(log,
-		// CLI reset runs outside the daemon, so it can stop the daemon first to
-		// keep it from reconciling while files are removed. The daemon operation
-		// path stops the daemon last because stopping the unit terminates the
-		// reconciler before it can mark the MachineOperation complete.
-		StopDaemon(log),
-		ResetAgentResources(log),
-	)
-}
-
 // ResetAgentResources returns a task that removes the unbounded-agent and all
 // associated resources without stopping the daemon process.
 func ResetAgentResources(log *slog.Logger) phases.Task {
