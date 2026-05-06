@@ -27,9 +27,12 @@ Subcommands (called as individual workflow steps):
     validate-workload                  Deploy test pods on the agent node.
     validate-kube-proxy                Verify kube-proxy is Running on all nodes.
     install-machine-crd                Install Machine CRD and bootstrapper RBAC.
+    start-machina-controller           Run the machina controller against Kind.
+    validate-machina-controller        Verify machina creates an MCV.
     delete-machine-cr                  Delete the Machine CR.
     validate-machine-cr-created        Verify agent self-registered a Machine CR.
     validate-node-reboot-operation     Verify NodeReboot MachineOperation restarts the node.
+    validate-node-repave-upgrade       Verify OnDelete repave applies a new MCV Kubernetes version.
     reset-agent                        Run agent reset and verify cleanup.
     cleanup                            Tear down VM, networking, and Kind cluster.
 """
@@ -95,8 +98,13 @@ SSH_TARGET = f"ubuntu@{VM_IP}"
 
 KUBECTL = "kubectl"
 KUBECTL_UNBOUNDED = str(REPO_ROOT / "bin" / "kubectl-unbounded")
+MACHINA = str(REPO_ROOT / "bin" / "machina")
 
 TEST_NS = "e2e-workload-test"
+MACHINA_PID_FILE = VM_DIR / "machina-controller.pid"
+MACHINA_LOG_FILE = VM_DIR / "machina-controller.log"
+MACHINA_CONFIG_FILE = VM_DIR / "machina-config.yaml"
+MACHINE_CONFIG_NAME = f"{AGENT_MACHINE_NAME}-config"
 
 
 # ---------------------------------------------------------------------------
@@ -256,6 +264,15 @@ def node_boot_id(node_name: str) -> str:
     ]).strip()
 
 
+def node_kubelet_version(node_name: str) -> str:
+    """Return the kubelet version reported by the Node object."""
+
+    return kubectl_capture([
+        "get", "node", node_name,
+        "-o", "jsonpath={.status.nodeInfo.kubeletVersion}",
+    ]).strip()
+
+
 def wait_for_node_ready(node_name: str, timeout_secs: int = 120) -> None:
     """Wait until *node_name* reports Ready=True."""
 
@@ -278,6 +295,58 @@ def wait_for_node_ready(node_name: str, timeout_secs: int = 120) -> None:
 
     kubectl(["describe", "node", node_name])
     die(f"Timed out waiting for node '{node_name}' to become Ready after {timeout_secs}s")
+
+
+def wait_for_node_absent(node_name: str, timeout_secs: int = 120) -> None:
+    """Wait until *node_name* no longer exists."""
+
+    log(f"Waiting for node '{node_name}' to be deleted (timeout: {timeout_secs}s)...")
+    elapsed = 0
+    while elapsed < timeout_secs:
+        ret = subprocess.run(
+            [KUBECTL, "get", "node", node_name, "-o", "name"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        if ret.returncode != 0:
+            log(f"Node '{node_name}' deleted after {elapsed}s")
+            return
+        if elapsed > 0 and elapsed % 30 == 0:
+            log(f"  ({elapsed}s) Node still present...")
+        time.sleep(5)
+        elapsed += 5
+
+    kubectl(["get", "node", node_name, "-o", "wide"])
+    die(f"Timed out waiting for node '{node_name}' to be deleted after {timeout_secs}s")
+
+
+def wait_for_node_kubelet_version(
+    node_name: str,
+    expected_version: str,
+    timeout_secs: int = 300,
+) -> None:
+    """Wait until *node_name* reports *expected_version* as kubeletVersion."""
+
+    log(f"Waiting for node '{node_name}' kubeletVersion={expected_version}...")
+    elapsed = 0
+    last_version = ""
+    while elapsed < timeout_secs:
+        result = subprocess.run(
+            [KUBECTL, "get", "node", node_name,
+             "-o", "jsonpath={.status.nodeInfo.kubeletVersion}"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            last_version = result.stdout.strip()
+            if last_version == expected_version:
+                log(f"Node kubeletVersion reached {expected_version} after {elapsed}s")
+                return
+        if elapsed > 0 and elapsed % 30 == 0:
+            log(f"  ({elapsed}s) kubeletVersion={last_version or '<unavailable>'}")
+        time.sleep(5)
+        elapsed += 5
+
+    kubectl(["describe", "node", node_name])
+    die(f"Timed out waiting for kubeletVersion={expected_version}; last={last_version!r}")
 
 
 def wait_for_node_boot_id_change(node_name: str, previous_boot_id: str, timeout_secs: int = 120) -> str:
@@ -1249,11 +1318,13 @@ def reset_agent() -> None:
 # install-machine-crd
 # ---------------------------------------------------------------------------
 def install_machine_crd() -> None:
-    """Install the Machine and MachineOperation CRDs plus bootstrapper RBAC."""
+    """Install Machine-related CRDs and bootstrapper RBAC."""
 
     crd_paths = [
         REPO_ROOT / "deploy" / "machina" / "crd" / "unbounded-cloud.io_machines.yaml",
         REPO_ROOT / "deploy" / "machina" / "crd" / "unbounded-cloud.io_machineoperations.yaml",
+        REPO_ROOT / "deploy" / "machina" / "crd" / "unbounded-cloud.io_machineconfigurations.yaml",
+        REPO_ROOT / "deploy" / "machina" / "crd" / "unbounded-cloud.io_machineconfigurationversions.yaml",
     ]
     rbac_path = REPO_ROOT / "deploy" / "machina" / "rendered" / "07-bootstrapper-rbac.yaml"
 
@@ -1267,7 +1338,7 @@ def install_machine_crd() -> None:
     if not rbac_path.exists():
         die(f"Bootstrapper RBAC not found after render: {rbac_path}")
 
-    log("Installing Machine and MachineOperation CRDs...")
+    log("Installing Machine-related CRDs...")
     for crd_path in crd_paths:
         kubectl(["apply", "-f", str(crd_path)])
 
@@ -1275,6 +1346,170 @@ def install_machine_crd() -> None:
     kubectl(["apply", "-f", str(rbac_path)])
 
     log("Machine CRDs and RBAC installed")
+
+
+# ---------------------------------------------------------------------------
+# start-machina-controller
+# ---------------------------------------------------------------------------
+def start_machina_controller() -> None:
+    """Build and run the machina controller locally against the Kind cluster."""
+
+    log("Building machina controller...")
+    run(["make", "machina-build"], cwd=str(REPO_ROOT))
+
+    api_server = kubectl_capture([
+        "config", "view", "--minify", "--raw",
+        "-o", "jsonpath={.clusters[0].cluster.server}",
+    ])
+    if not api_server:
+        die("Could not determine API server URL from kubeconfig")
+
+    MACHINA_CONFIG_FILE.write_text(textwrap.dedent(f"""\
+        apiServerEndpoint: {api_server}
+        metricsAddr: "0"
+        probeAddr: "0"
+        enableLeaderElection: false
+        maxConcurrentReconciles: 10
+    """))
+
+    if MACHINA_PID_FILE.exists():
+        old_pid = MACHINA_PID_FILE.read_text().strip()
+        if old_pid:
+            run_quiet(["kill", old_pid], check=False)
+
+    log("Starting machina controller in background...")
+    log(f"Machina logs: {MACHINA_LOG_FILE}")
+    log_file = MACHINA_LOG_FILE.open("w")
+    env = os.environ.copy()
+    # GitHub Actions uses RUNNER_TRACKING_ID to clean up processes it started.
+    # Clear it so the controller survives across later workflow steps.
+    env["RUNNER_TRACKING_ID"] = ""
+    proc = subprocess.Popen(
+        [MACHINA, "controller", f"--config={MACHINA_CONFIG_FILE}"],
+        cwd=str(REPO_ROOT),
+        env=env,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        text=True,
+    )
+    log_file.close()
+    MACHINA_PID_FILE.write_text(str(proc.pid))
+
+    time.sleep(3)
+    if proc.poll() is not None:
+        if MACHINA_LOG_FILE.exists():
+            print(MACHINA_LOG_FILE.read_text(), flush=True)
+        die(f"machina controller exited early with code {proc.returncode}")
+
+    log(f"Machina controller started (pid={proc.pid})")
+
+
+# ---------------------------------------------------------------------------
+# validate-machina-controller
+# ---------------------------------------------------------------------------
+def mcv_name(config_name: str, version: int) -> str:
+    """Return the canonical MachineConfigurationVersion name."""
+
+    return f"{config_name}-v{version}"
+
+
+def validate_machina_controller() -> None:
+    """Verify the machina controller reconciles MachineConfiguration objects."""
+
+    name = MACHINE_CONFIG_NAME
+
+    def wait_for_mcv(
+        mcv_name: str,
+        expected_version: int,
+        expected_node_labels: dict[str, str] | None,
+    ) -> dict[str, Any]:
+        timeout_secs = 60
+        elapsed = 0
+        while elapsed < timeout_secs:
+            result = subprocess.run(
+                [KUBECTL, "get", "machineconfigurationversion", mcv_name, "-o", "json"],
+                capture_output=True, text=True,
+            )
+            if result.returncode == 0:
+                mcv = json.loads(result.stdout)
+                version = mcv.get("spec", {}).get("version")
+                config = mcv.get("metadata", {}).get("labels", {}).get(
+                    "unbounded-cloud.io/machine-configuration",
+                )
+                node_labels = mcv.get("spec", {}).get("template", {}).get(
+                    "kubernetes", {},
+                ).get("nodeLabels")
+                if (
+                    version == expected_version
+                    and config == name
+                    and node_labels == expected_node_labels
+                ):
+                    return mcv
+
+            if elapsed > 0 and elapsed % 15 == 0:
+                log(f"  ({elapsed}s) waiting for MachineConfigurationVersion '{mcv_name}'...")
+            time.sleep(5)
+            elapsed += 5
+
+        if MACHINA_LOG_FILE.exists():
+            print(MACHINA_LOG_FILE.read_text(), flush=True)
+        die(f"MachineConfigurationVersion '{mcv_name}' was not ready after {timeout_secs}s")
+
+    log(f"Validating machina controller with MachineConfiguration '{name}'...")
+    version_json = json.loads(kubectl_capture(["version", "-o", "json"]))
+    server_version = version_json.get("serverVersion", {}).get("gitVersion")
+    if not server_version:
+        die(f"Could not resolve server version from kubectl version: {version_json}")
+
+    manifest = {
+        "apiVersion": "unbounded-cloud.io/v1alpha3",
+        "kind": "MachineConfiguration",
+        "metadata": {
+            "name": name,
+            "labels": {"e2e.unbounded-cloud.io/test": "agent-kind"},
+        },
+        "spec": {
+            "template": {
+                "kubernetes": {
+                    "version": server_version,
+                },
+            },
+        },
+    }
+    kubectl(["apply", "-f", "-"], input=json.dumps(manifest).encode())
+
+    v1_name = mcv_name(name, 1)
+    v1 = wait_for_mcv(v1_name, 1, None)
+    log(f"MachineConfigurationVersion '{v1_name}' created")
+
+    kubectl([
+        "patch", "machineconfigurationversion", v1_name,
+        "--subresource=status", "--type=merge",
+        "-p", json.dumps({
+            "status": {
+                "deployed": True,
+                "deployedMachines": 1,
+            },
+        }),
+    ])
+
+    updated_node_labels = {"e2e.unbounded-cloud.io/config-version": "v2"}
+    manifest["spec"]["template"]["kubernetes"]["nodeLabels"] = updated_node_labels
+    kubectl(["apply", "-f", "-"], input=json.dumps(manifest).encode())
+
+    v2_name = mcv_name(name, 2)
+    wait_for_mcv(v2_name, 2, updated_node_labels)
+    log(f"MachineConfigurationVersion '{v2_name}' created after config change")
+
+    v1 = json.loads(kubectl_capture([
+        "get", "machineconfigurationversion", v1_name, "-o", "json",
+    ]))
+    v1_node_labels = v1.get("spec", {}).get("template", {}).get(
+        "kubernetes", {},
+    ).get("nodeLabels")
+    if v1_node_labels is not None:
+        die(f"MachineConfigurationVersion '{v1_name}' changed unexpectedly: {v1_node_labels}")
 
 
 # ---------------------------------------------------------------------------
@@ -1396,10 +1631,124 @@ def validate_node_reboot_operation() -> None:
 
 
 # ---------------------------------------------------------------------------
+# validate-node-repave-upgrade
+# ---------------------------------------------------------------------------
+def _next_patch_version(version: str) -> str:
+    """Return the next Kubernetes patch version for a vMAJOR.MINOR.PATCH string."""
+
+    base = version.strip().lstrip("v")
+    parts = base.split(".")
+    if len(parts) != 3 or not all(part.isdigit() for part in parts):
+        die(f"Cannot derive patch upgrade from Kubernetes version {version!r}")
+
+    parts[2] = str(int(parts[2]) + 1)
+    return "v" + ".".join(parts)
+
+
+def validate_node_repave_upgrade() -> None:
+    """Validate OnDelete repave applies a new MCV Kubernetes version."""
+
+    config_name = MACHINE_CONFIG_NAME
+
+    current_kubelet_version = node_kubelet_version(AGENT_MACHINE_NAME)
+    if not current_kubelet_version:
+        die(f"Node '{AGENT_MACHINE_NAME}' did not report a kubelet version")
+    target_kubelet_version = _next_patch_version(current_kubelet_version)
+
+    log("Validating OnDelete repave upgrade...")
+    log(f"Current kubelet version: {current_kubelet_version}")
+    log(f"Target kubelet version: {target_kubelet_version}")
+
+    manifest = json.loads(kubectl_capture(["get", "machineconfiguration", config_name, "-o", "json"]))
+    metadata = manifest.setdefault("metadata", {})
+    for key in ["creationTimestamp", "generation", "resourceVersion", "uid", "managedFields"]:
+        metadata.pop(key, None)
+    manifest.pop("status", None)
+    kubernetes_template = manifest.setdefault("spec", {}).setdefault(
+        "template", {},
+    ).setdefault("kubernetes", {})
+    kubernetes_template["version"] = target_kubelet_version
+    kubernetes_template["nodeLabels"] = {"e2e.unbounded-cloud.io/config-version": "v3"}
+    kubectl(["apply", "-f", "-"], input=json.dumps(manifest).encode())
+
+    timeout_secs = 120
+    elapsed = 0
+    target_version_number = 0
+    target_mcv = ""
+    while elapsed < timeout_secs:
+        result = subprocess.run(
+            [KUBECTL, "get", "machineconfigurationversion",
+             "-l", f"unbounded-cloud.io/machine-configuration={config_name}", "-o", "json"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            mcvs = json.loads(result.stdout).get("items", [])
+            matching_mcvs = [
+                mcv for mcv in mcvs
+                if mcv.get("spec", {}).get("template", {}).get("kubernetes", {}).get("version")
+                == target_kubelet_version
+            ]
+            if matching_mcvs:
+                latest = max(matching_mcvs, key=lambda mcv: mcv.get("spec", {}).get("version", 0))
+                target_version_number = latest.get("spec", {}).get("version", 0)
+                target_mcv = latest.get("metadata", {}).get("name", "")
+                log(f"MachineConfigurationVersion '{target_mcv}' is ready")
+                break
+        if elapsed > 0 and elapsed % 30 == 0:
+            log(f"  ({elapsed}s) waiting for MCV with Kubernetes {target_kubelet_version}...")
+        time.sleep(5)
+        elapsed += 5
+    else:
+        if MACHINA_LOG_FILE.exists():
+            print(MACHINA_LOG_FILE.read_text(), flush=True)
+        die(f"No MachineConfigurationVersion reached Kubernetes {target_kubelet_version} after {timeout_secs}s")
+
+    if target_version_number == 0 or not target_mcv:
+        die("Resolved target MachineConfigurationVersion was empty")
+
+    log(f"Assigning Machine '{AGENT_MACHINE_NAME}' to {target_mcv}...")
+    run([KUBECTL_UNBOUNDED, "machine", "config", "assign", AGENT_MACHINE_NAME,
+         "--config", config_name, "--version", str(target_version_number)])
+
+    log(f"Deleting Node '{AGENT_MACHINE_NAME}' to trigger OnDelete repave...")
+    kubectl(["delete", "node", AGENT_MACHINE_NAME])
+    wait_for_node_absent(AGENT_MACHINE_NAME)
+    wait_for_node()
+    wait_for_node_kubelet_version(AGENT_MACHINE_NAME, target_kubelet_version)
+
+    machine = json.loads(kubectl_capture(["get", "machine", AGENT_MACHINE_NAME, "-o", "json"]))
+    status_config = machine.get("status", {}).get("configuration", {})
+    if status_config.get("version") != target_version_number or status_config.get("versionName") != target_mcv:
+        die(f"Machine status.configuration did not record {target_mcv}: {status_config}")
+
+    conditions = machine.get("status", {}).get("conditions", [])
+    repave_applied = [
+        c for c in conditions
+        if c.get("type") == "RepavePending" and c.get("status") == "False" and c.get("reason") == "Applied"
+    ]
+    if not repave_applied:
+        die(f"Machine missing RepavePending=False/Applied condition: {conditions}")
+
+    log("============================================")
+    log("  OnDelete repave upgrade validation PASSED")
+    log("============================================")
+    kubectl(["get", "machine", AGENT_MACHINE_NAME, "-o", "wide"])
+    kubectl(["get", "node", AGENT_MACHINE_NAME, "-o", "wide"])
+
+
+# ---------------------------------------------------------------------------
 # cleanup
 # ---------------------------------------------------------------------------
 def cleanup() -> None:
     """Tear down VM, networking, and Kind cluster."""
+
+    # Stop locally running machina controller if this e2e started one.
+    if MACHINA_PID_FILE.exists():
+        pid = MACHINA_PID_FILE.read_text().strip()
+        if pid:
+            log(f"Stopping machina controller pid {pid}...")
+            run_quiet(["kill", pid], check=False)
+        MACHINA_PID_FILE.unlink(missing_ok=True)
 
     # Stop QEMU VM
     _stop_qemu()
@@ -1464,9 +1813,12 @@ COMMANDS = {
     "validate-kube-proxy": validate_kube_proxy,
     "validate-workload": validate_workload,
     "install-machine-crd": install_machine_crd,
+    "start-machina-controller": start_machina_controller,
+    "validate-machina-controller": validate_machina_controller,
     "delete-machine-cr": delete_machine_cr,
     "validate-machine-cr-created": validate_machine_cr_created,
     "validate-node-reboot-operation": validate_node_reboot_operation,
+    "validate-node-repave-upgrade": validate_node_repave_upgrade,
     "reset-agent": reset_agent,
     "cleanup": cleanup,
 }

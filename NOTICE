@@ -148,6 +148,13 @@ notices:
     license:
       - name: MIT License
         link: https://github.com/Azure/azure-sdk-for-go/blob/sdk/storage/azblob/v1.6.4/LICENSE.txt
+  - dependency: github.com/DATA-DOG/go-sqlmock
+    ecosystem: go
+    copyright:
+      - Copyright (c) 2013-2019, DATA-DOG team
+    license:
+      - name: BSD 3-Clause License
+        link: https://github.com/DATA-DOG/go-sqlmock/blob/v1.5.2/LICENSE
   - dependency: github.com/Masterminds/semver/v3
     ecosystem: go
     copyright:

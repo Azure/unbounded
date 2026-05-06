@@ -2,19 +2,19 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: inventory-collector
-  namespace: inventory
+  name: inventory-aggregator
+  namespace: {{ default "unbounded-kube" .Namespace }}
   labels:
-    app: inventory-collector
+    app: inventory-aggregator
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: inventory-collector
+      app: inventory-aggregator
   template:
     metadata:
       labels:
-        app: inventory-collector
+        app: inventory-aggregator
     spec:
       initContainers:
         - name: ensure-database
@@ -32,7 +32,7 @@ spec:
             - secretRef:
                 name: pg-creds
       containers:
-        - name: inventory-collector
+        - name: inventory-aggregator
           image: stargatetmedev.azurecr.io/inventory-collector:latest
           envFrom:
             - configMapRef:

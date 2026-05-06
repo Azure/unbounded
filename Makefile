@@ -6,6 +6,9 @@ GOTEST=$(GOCMD) test
 GOMOD=$(GOCMD) mod
 GOLINT=golangci-lint run -c .golangci.yaml
 
+CONTAINER_ENGINE ?= podman
+CONTAINER_REGISTRY ?= ghcr.io/azure
+
 FORGE_BIN=bin/forge
 FORGE_CMD=./hack/cmd/forge
 
@@ -32,9 +35,7 @@ AGENT_CMD=./cmd/agent
 
 MACHINA_BIN=bin/machina
 MACHINA_CMD=./cmd/machina
-CONTAINER_REGISTRY ?= ghcr.io/azure
 MACHINA_IMAGE ?= $(CONTAINER_REGISTRY)/machina:$(VERSION)
-CONTAINER_ENGINE ?= podman
 
 MACHINE_OPS_CONTROLLER_BIN=bin/machine-ops-controller
 MACHINE_OPS_CONTROLLER_CMD=./cmd/machine-ops-controller
@@ -335,7 +336,7 @@ forge: test ## Build the forge dev tool (implies test)
 	$(GOBUILD) -o $(FORGE_BIN) $(FORGE_CMD)/main.go
 
 .PHONY: inventory-all
-inventory-all: inventory-agent inventory-collector inventory-inspector inventory-viewer ## Build all inventory components
+inventory-all: inventory-agent inventory-aggregator inventory-inspector inventory-viewer ## Build all inventory components
 
 .PHONY: inventory-agent
 inventory-agent: inventory-agent-amd64 inventory-agent-arm64 ## Build inventory for amd64 and arm64, symlink to host arch
