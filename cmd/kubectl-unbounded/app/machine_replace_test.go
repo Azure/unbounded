@@ -16,30 +16,31 @@ import (
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
 
-func TestRunReimageRequiresForceInNonInteractiveMode(t *testing.T) {
+func TestRunReplaceRequiresForceInNonInteractiveMode(t *testing.T) {
 	t.Parallel()
 
 	s := runtime.NewScheme()
 	require.NoError(t, v1alpha3.AddToScheme(s))
+
 	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "machine-1"}}
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine).Build()
 
-	err := runReimage(context.Background(), c, "machine-1", 0, false)
+	err := runReplace(context.Background(), c, "machine-1", 0, false)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "--force")
 }
 
-func TestConfirmReimage(t *testing.T) {
+func TestConfirmReplace(t *testing.T) {
 	t.Parallel()
 
-	err := confirmReimageWithTerminal("machine-1", strings.NewReader("machine-1\n"), ioDiscard{}, true)
+	err := confirmReplaceWithTerminal("machine-1", strings.NewReader("machine-1\n"), ioDiscard{}, true)
 	require.NoError(t, err)
 }
 
-func TestConfirmReimageRejectsMismatch(t *testing.T) {
+func TestConfirmReplaceRejectsMismatch(t *testing.T) {
 	t.Parallel()
 
-	err := confirmReimageWithTerminal("machine-1", strings.NewReader("wrong\n"), ioDiscard{}, true)
+	err := confirmReplaceWithTerminal("machine-1", strings.NewReader("wrong\n"), ioDiscard{}, true)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "confirmation did not match")
 }

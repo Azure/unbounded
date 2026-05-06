@@ -47,7 +47,7 @@ func main() {
 	cmd.Flags().BoolVar(&cfg.leaderElection, "leader-elect", true, "Enable leader election")
 	cmd.Flags().StringVar(&cfg.leaderElectionNamespace, "leader-elect-namespace", "unbounded-kube", "Namespace for the leader election lease")
 	cmd.Flags().IntVar(&cfg.maxConcurrentReconciles, "max-concurrent-reconciles", 10, "Maximum concurrent MachineOperation reconciles")
-	cmd.Flags().StringVar(&cfg.apiServerEndpoint, "api-server-endpoint", "", "Kubernetes API server endpoint used in reimage bootstrap config")
+	cmd.Flags().StringVar(&cfg.apiServerEndpoint, "api-server-endpoint", "", "Kubernetes API server endpoint used in host replacement bootstrap config")
 	cmd.Flags().StringVar(&cfg.ociConfigFile, "oci-config-file", "", "Path to OCI config file for OCIInstance operations")
 	cmd.Flags().StringVar(&cfg.ociConfigProfile, "oci-config-profile", "DEFAULT", "OCI config profile for OCIInstance operations")
 	cmd.Flags().StringVar(&cfg.ociAuth, "oci-auth", "api_key", "OCI auth mode for OCIInstance operations: api_key or security_token")
@@ -78,6 +78,7 @@ func run(ctx context.Context, cfg config) error {
 
 	restConfig := ctrl.GetConfigOrDie()
 	scheme := runtimeScheme()
+
 	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
 		Scheme:                        scheme,
 		Metrics:                       metricsserver.Options{BindAddress: cfg.metricsAddr},

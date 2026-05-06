@@ -63,6 +63,7 @@ func TestParseAzureVMProviderID(t *testing.T) {
 			if tt.wantErr != "" {
 				require.Error(t, err)
 				require.Contains(t, err.Error(), tt.wantErr)
+
 				return
 			}
 
@@ -83,7 +84,7 @@ func TestProviderExecute(t *testing.T) {
 		{name: "hard reboot", operation: unboundedv1alpha3.OperationHostReboot, wantCalls: []string{"restart:rg/vm1"}},
 		{name: "power off", operation: unboundedv1alpha3.OperationHostPowerOff, wantCalls: []string{"powerOff:rg/vm1"}},
 		{name: "power on", operation: unboundedv1alpha3.OperationHostPowerOn, wantCalls: []string{"start:rg/vm1"}},
-		{name: "reimage", operation: unboundedv1alpha3.OperationHostReimage, wantCalls: []string{"replace:rg/vm1:cloud-init"}},
+		{name: "replace", operation: unboundedv1alpha3.OperationHostReplace, wantCalls: []string{"replace:rg/vm1:cloud-init"}},
 	}
 
 	for _, tt := range tests {
@@ -98,7 +99,7 @@ func TestProviderExecute(t *testing.T) {
 				},
 			}
 
-			err := provider.Execute(context.Background(), machineops.OperationRequest{ProviderID: "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm1", Operation: tt.operation, ReimageUserData: "cloud-init"})
+			err := provider.Execute(context.Background(), machineops.OperationRequest{ProviderID: "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm1", Operation: tt.operation, ReplaceUserData: "cloud-init"})
 
 			require.NoError(t, err)
 			require.Equal(t, tt.wantCalls, client.calls)
@@ -106,7 +107,7 @@ func TestProviderExecute(t *testing.T) {
 	}
 }
 
-func TestProviderExecuteHostReimageRequiresUserData(t *testing.T) {
+func TestProviderExecuteHostReplaceRequiresUserData(t *testing.T) {
 	t.Parallel()
 
 	provider := &Provider{NewClient: func(subscriptionID string) (azureVMClient, error) {
@@ -114,10 +115,10 @@ func TestProviderExecuteHostReimageRequiresUserData(t *testing.T) {
 		return &recordingAzureVMClient{}, nil
 	}}
 
-	require.True(t, provider.Supports(unboundedv1alpha3.OperationHostReimage))
-	err := provider.Execute(context.Background(), machineops.OperationRequest{ProviderID: "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm1", Operation: unboundedv1alpha3.OperationHostReimage})
+	require.True(t, provider.Supports(unboundedv1alpha3.OperationHostReplace))
+	err := provider.Execute(context.Background(), machineops.OperationRequest{ProviderID: "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm1", Operation: unboundedv1alpha3.OperationHostReplace})
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "reimage user data is required")
+	require.Contains(t, err.Error(), "replacement user data is required")
 }
 
 func TestPrepareReplacementVM(t *testing.T) {
@@ -145,6 +146,7 @@ func TestPrepareReplacementVM(t *testing.T) {
 	require.Nil(t, replacement.Name)
 	require.Equal(t, &armcompute.UserAssignedIdentitiesValue{}, replacement.Identity.UserAssignedIdentities["/subscriptions/sub/resourceGroups/rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id1"])
 	require.Nil(t, replacement.Properties.ProvisioningState)
+
 	wantCustomData := base64.StdEncoding.EncodeToString([]byte("#cloud-config\n"))
 	require.Equal(t, wantCustomData, *replacement.Properties.UserData)
 	require.Equal(t, wantCustomData, *replacement.Properties.OSProfile.CustomData)
@@ -202,7 +204,7 @@ func (c *recordingAzureVMClient) Start(_ context.Context, resourceGroupName, vmN
 	return c.err
 }
 
-func (c *recordingAzureVMClient) Replace(_ context.Context, resourceGroupName, vmName string, userData string) error {
+func (c *recordingAzureVMClient) Replace(_ context.Context, resourceGroupName, vmName, userData string) error {
 	c.calls = append(c.calls, fmt.Sprintf("replace:%s/%s:%s", resourceGroupName, vmName, userData))
 	return c.err
 }

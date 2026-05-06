@@ -34,7 +34,7 @@ type OperationRequest struct {
 	ProviderID      string
 	Operation       unboundedv1alpha3.OperationKind
 	Parameters      map[string]string
-	ReimageUserData string
+	ReplaceUserData string
 }
 
 // Provider executes MachineOperation requests for a specific external provider.
@@ -105,6 +105,7 @@ func (r *MachineOperationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 			"operation", op.Name,
 			"operationKind", op.Spec.OperationKind,
 			"machine", machine.Name)
+
 		return ctrl.Result{}, nil
 	}
 
@@ -126,17 +127,18 @@ func (r *MachineOperationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 			"operation", op.Name,
 			"operationKind", op.Spec.OperationKind,
 			"machine", machine.Name)
+
 		return ctrl.Result{}, nil
 	}
 
 	operationRequest := OperationRequest{Machine: &machine, ProviderID: providerMatch.providerID, Operation: op.Spec.OperationKind, Parameters: op.Spec.Parameters}
-	if op.Spec.OperationKind == unboundedv1alpha3.OperationHostReimage {
-		userData, err := r.buildReimageUserData(ctx, &machine)
+	if op.Spec.OperationKind == unboundedv1alpha3.OperationHostReplace {
+		userData, err := r.buildReplaceUserData(ctx, &machine)
 		if err != nil {
 			return r.failOperation(ctx, &op, "BootstrapDataFailed", err.Error())
 		}
 
-		operationRequest.ReimageUserData = userData
+		operationRequest.ReplaceUserData = userData
 	}
 
 	if err := providerMatch.provider.Execute(ctx, operationRequest); err != nil {
@@ -151,7 +153,7 @@ func shouldExecuteOperation(op *unboundedv1alpha3.MachineOperation) bool {
 		return true
 	}
 
-	return op.Spec.OperationKind == unboundedv1alpha3.OperationHostReimage && op.Status.Phase == unboundedv1alpha3.OperationPhaseInProgress
+	return op.Spec.OperationKind == unboundedv1alpha3.OperationHostReplace && op.Status.Phase == unboundedv1alpha3.OperationPhaseInProgress
 }
 
 func isHostOperation(operation unboundedv1alpha3.OperationKind) bool {
@@ -206,6 +208,7 @@ func (r *MachineOperationReconciler) providerFor(machine *unboundedv1alpha3.Mach
 	}
 
 	var matched providerMatch
+
 	for _, provider := range r.Providers {
 		if provider.Name() != machine.Spec.Provider {
 			continue
@@ -215,6 +218,7 @@ func (r *MachineOperationReconciler) providerFor(machine *unboundedv1alpha3.Mach
 		if provider.Supports(operation) {
 			matched.provider = provider
 			matched.providerID = machine.Spec.ProviderID
+
 			return matched
 		}
 	}
@@ -228,6 +232,7 @@ func (r *MachineOperationReconciler) reconcileTerminal(ctx context.Context, op *
 	}
 
 	deadline := op.Status.CompletedAt.Add(time.Duration(*op.Spec.TTLSecondsAfterFinished) * time.Second)
+
 	now := r.now().Time
 	if now.Before(deadline) {
 		return ctrl.Result{RequeueAfter: deadline.Sub(now)}, nil
@@ -249,6 +254,7 @@ func (r *MachineOperationReconciler) markInProgress(ctx context.Context, op *unb
 
 		now := r.now()
 		latest.Status.Phase = unboundedv1alpha3.OperationPhaseInProgress
+
 		latest.Status.Message = message
 		if latest.Status.StartedAt == nil {
 			latest.Status.StartedAt = &now
@@ -288,6 +294,7 @@ func (r *MachineOperationReconciler) finishOperation(
 	execErr error,
 ) (ctrl.Result, error) {
 	var updated unboundedv1alpha3.MachineOperation
+
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		if err := r.Get(ctx, client.ObjectKeyFromObject(op), &updated); err != nil {
 			return err
@@ -300,6 +307,7 @@ func (r *MachineOperationReconciler) finishOperation(
 
 		updated.Status.Phase = phase
 		updated.Status.Message = message
+
 		updated.Status.CompletedAt = &now
 		if observedMachineGeneration > 0 {
 			updated.Status.ObservedMachineGeneration = observedMachineGeneration

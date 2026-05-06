@@ -51,14 +51,15 @@ func TestMachineOperationReconciler_CompletesSupportedOperation(t *testing.T) {
 	require.Equal(t, metav1.ConditionTrue, cond.Status)
 }
 
-func TestMachineOperationReconciler_BuildsReimageUserData(t *testing.T) {
+func TestMachineOperationReconciler_BuildsReplaceUserData(t *testing.T) {
 	t.Parallel()
 
 	s := newOperationTestScheme(t)
 	require.NoError(t, corev1.AddToScheme(s))
+
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
 	machine.Spec.Kubernetes = &unboundedv1alpha3.KubernetesSpec{BootstrapTokenRef: unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-test"}}
-	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReimage)
+	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReplace)
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Namespace: metav1.NamespaceSystem, Name: "bootstrap-token-test"},
 		Data: map[string][]byte{
@@ -66,7 +67,7 @@ func TestMachineOperationReconciler_BuildsReimageUserData(t *testing.T) {
 			"token-secret": []byte("secret456"),
 		},
 	}
-	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReimage: true}}
+	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReplace: true}}
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, secret).WithStatusSubresource(op).Build()
 	reconciler := &MachineOperationReconciler{
@@ -79,9 +80,9 @@ func TestMachineOperationReconciler_BuildsReimageUserData(t *testing.T) {
 	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "op-1"}})
 	require.NoError(t, err)
 	require.Equal(t, ctrl.Result{}, result)
-	require.Len(t, provider.reimageUserData, 1)
-	require.Contains(t, provider.reimageUserData[0], "#cloud-config")
-	require.Contains(t, provider.reimageUserData[0], "abc123.secret456")
+	require.Len(t, provider.replaceUserData, 1)
+	require.Contains(t, provider.replaceUserData[0], "#cloud-config")
+	require.Contains(t, provider.replaceUserData[0], "abc123.secret456")
 
 	var updated unboundedv1alpha3.MachineOperation
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
@@ -112,14 +113,15 @@ func TestMachineOperationReconciler_DoesNotReexecuteInProgressOperation(t *testi
 	require.Nil(t, updated.Status.CompletedAt)
 }
 
-func TestMachineOperationReconciler_ReexecutesInProgressHostReimage(t *testing.T) {
+func TestMachineOperationReconciler_ReexecutesInProgressHostReplace(t *testing.T) {
 	t.Parallel()
 
 	s := newOperationTestScheme(t)
 	require.NoError(t, corev1.AddToScheme(s))
+
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
 	machine.Spec.Kubernetes = &unboundedv1alpha3.KubernetesSpec{BootstrapTokenRef: unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-test"}}
-	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReimage)
+	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReplace)
 	op.Status.Phase = unboundedv1alpha3.OperationPhaseInProgress
 	op.Status.StartedAt = ptrTo(fixedOperationNow())
 	secret := &corev1.Secret{
@@ -129,7 +131,7 @@ func TestMachineOperationReconciler_ReexecutesInProgressHostReimage(t *testing.T
 			"token-secret": []byte("secret456"),
 		},
 	}
-	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReimage: true}}
+	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReplace: true}}
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, secret).WithStatusSubresource(op).Build()
 	reconciler := &MachineOperationReconciler{Client: c, Providers: []Provider{provider}, Now: fixedOperationNow, ClusterInfo: testClusterInfo()}
@@ -171,7 +173,7 @@ func TestMachineOperationReconciler_FailsUnsupportedExternalOperation(t *testing
 	s := newOperationTestScheme(t)
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderOCIInstance)
 	machine.Spec.ProviderID = "oci://ocid1.instance.oc1.test"
-	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReimage)
+	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReplace)
 	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderOCIInstance, supported: map[unboundedv1alpha3.OperationKind]bool{}}
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op).WithStatusSubresource(op).Build()
@@ -184,7 +186,7 @@ func TestMachineOperationReconciler_FailsUnsupportedExternalOperation(t *testing
 	var updated unboundedv1alpha3.MachineOperation
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
 	require.Equal(t, unboundedv1alpha3.OperationPhaseFailed, updated.Status.Phase)
-	require.Contains(t, updated.Status.Message, "HostReimage is not supported for OCIInstance")
+	require.Contains(t, updated.Status.Message, "HostReplace is not supported for OCIInstance")
 }
 
 func TestMachineOperationReconciler_SelectorOperationIsIgnored(t *testing.T) {
@@ -248,6 +250,7 @@ func TestMachineOperationReconciler_DeletesExpiredTerminalOperation(t *testing.T
 	require.Equal(t, ctrl.Result{}, result)
 
 	var updated unboundedv1alpha3.MachineOperation
+
 	err = c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated)
 	require.Error(t, err)
 }
@@ -309,7 +312,7 @@ type recordingProvider struct {
 	provider        string
 	supported       map[unboundedv1alpha3.OperationKind]bool
 	calls           []string
-	reimageUserData []string
+	replaceUserData []string
 	err             error
 }
 
@@ -323,9 +326,10 @@ func (p *recordingProvider) Supports(operation unboundedv1alpha3.OperationKind) 
 
 func (p *recordingProvider) Execute(_ context.Context, request OperationRequest) error {
 	p.calls = append(p.calls, fmt.Sprintf("%s:%s:%s", request.Operation, request.Machine.Name, request.ProviderID))
-	if request.ReimageUserData != "" {
-		p.reimageUserData = append(p.reimageUserData, request.ReimageUserData)
+	if request.ReplaceUserData != "" {
+		p.replaceUserData = append(p.replaceUserData, request.ReplaceUserData)
 	}
+
 	return p.err
 }
 

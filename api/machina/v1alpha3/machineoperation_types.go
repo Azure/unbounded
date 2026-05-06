@@ -44,7 +44,7 @@ type MachineOperationList struct {
 // OperationKind identifies the kind of operation to perform. Predefined
 // operations cover common lifecycle actions; custom operations may be
 // supported by individual cloud controllers.
-// +kubebuilder:validation:Enum=NodeReboot;AgentUpgrade;HostReboot;HostPowerOff;HostPowerOn;HostReimage
+// +kubebuilder:validation:Enum=NodeReboot;AgentUpgrade;HostReboot;HostPowerOff;HostPowerOn;HostReplace
 type OperationKind string
 
 const (
@@ -69,10 +69,9 @@ const (
 	// OperationHostPowerOn powers on the host through an out-of-band provider.
 	OperationHostPowerOn OperationKind = "HostPowerOn"
 
-	// OperationHostReimage reimages the host VM through an out-of-band
-	// provider and reinstalls the unbounded-agent so the node can rejoin
-	// the cluster.
-	OperationHostReimage OperationKind = "HostReimage"
+	// OperationHostReplace replaces the host VM through an out-of-band provider
+	// and reinstalls the unbounded-agent so the node can rejoin the cluster.
+	OperationHostReplace OperationKind = "HostReplace"
 )
 
 // OperationPhase represents the current phase of a MachineOperation.

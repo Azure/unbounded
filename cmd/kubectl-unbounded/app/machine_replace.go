@@ -19,14 +19,16 @@ import (
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
 
-func machineReimageCommand() *cobra.Command {
-	var ttl int32
-	var force bool
+func machineReplaceCommand() *cobra.Command {
+	var (
+		ttl   int32
+		force bool
+	)
 
 	cmd := &cobra.Command{
-		Use:   "reimage NAME",
+		Use:   "replace NAME",
 		Short: "Destructively replace a machine through MachineOperation",
-		Long: `Reimage creates a MachineOperation CR requesting a host VM reimage.
+		Long: `Replace creates a MachineOperation CR requesting a host VM replacement.
 The machine-ops-controller processes the operation through the external
 provider by deleting and recreating the host VM with fresh bootstrap data.
 Host-local OS disk state is destroyed.`,
@@ -39,7 +41,7 @@ Host-local OS disk state is destroyed.`,
 				return err
 			}
 
-			return runReimage(ctx, c, args[0], ttl, force)
+			return runReplace(ctx, c, args[0], ttl, force)
 		},
 	}
 
@@ -50,40 +52,44 @@ Host-local OS disk state is destroyed.`,
 	return cmd
 }
 
-func runReimage(ctx context.Context, c client.WithWatch, name string, ttlSeconds int32, force bool) error {
+func runReplace(ctx context.Context, c client.WithWatch, name string, ttlSeconds int32, force bool) error {
 	if !force {
-		if err := confirmReimage(name, os.Stdin, os.Stderr); err != nil {
+		if err := confirmReplace(name, os.Stdin, os.Stderr); err != nil {
 			return err
 		}
 	}
 
-	opName := fmt.Sprintf("%s-reimage-%d", name, time.Now().Unix())
+	opName := fmt.Sprintf("%s-replace-%d", name, time.Now().Unix())
 
-	if err := createMachineOperation(ctx, c, name, opName, v1alpha3.OperationHostReimage, ttlSeconds); err != nil {
+	if err := createMachineOperation(ctx, c, name, opName, v1alpha3.OperationHostReplace, ttlSeconds); err != nil {
 		return err
 	}
 
-	printStep(fmt.Sprintf("Reimaging Machine %s...", name))
+	printStep(fmt.Sprintf("Replacing Machine %s...", name))
 	printConfig("operation", opName)
 	fmt.Println()
 
 	return watchMachineOperation(ctx, c, opName)
 }
 
-func confirmReimage(name string, in *os.File, out io.Writer) error {
-	return confirmReimageWithTerminal(name, in, out, isTerminal(in))
+func confirmReplace(name string, in *os.File, out io.Writer) error {
+	return confirmReplaceWithTerminal(name, in, out, isTerminal(in))
 }
 
-func confirmReimageWithTerminal(name string, in io.Reader, out io.Writer, terminal bool) error {
+func confirmReplaceWithTerminal(name string, in io.Reader, out io.Writer, terminal bool) error {
 	if !terminal {
-		return fmt.Errorf("reimage deletes and recreates the host VM; rerun with --force to confirm")
+		return fmt.Errorf("replace deletes and recreates the host VM; rerun with --force to confirm")
 	}
 
-	fmt.Fprintf(out, "This will delete and recreate host VM %q, destroying OS disk state. Type the machine name to continue: ", name)
+	if _, err := fmt.Fprintf(out, "This will delete and recreate host VM %q, destroying OS disk state. Type the machine name to continue: ", name); err != nil {
+		return fmt.Errorf("write confirmation prompt: %w", err)
+	}
+
 	line, err := bufio.NewReader(in).ReadString('\n')
 	if err != nil {
 		return fmt.Errorf("read confirmation: %w; rerun with --force to confirm", err)
 	}
+
 	if strings.TrimSpace(line) != name {
 		return fmt.Errorf("confirmation did not match machine name %q", name)
 	}

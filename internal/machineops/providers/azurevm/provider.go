@@ -27,7 +27,7 @@ type azureVMClient interface {
 	Start(ctx context.Context, resourceGroupName, vmName string) error
 	PowerOff(ctx context.Context, resourceGroupName, vmName string) error
 	Restart(ctx context.Context, resourceGroupName, vmName string) error
-	Replace(ctx context.Context, resourceGroupName, vmName string, userData string) error
+	Replace(ctx context.Context, resourceGroupName, vmName, userData string) error
 }
 
 type azureVMClientFactory func(subscriptionID string) (azureVMClient, error)
@@ -44,12 +44,12 @@ var azureVMOperations = map[unboundedv1alpha3.OperationKind]azureVMOperation{
 	unboundedv1alpha3.OperationHostPowerOn: func(ctx context.Context, client azureVMClient, ref azureVMResourceRef) error {
 		return client.Start(ctx, ref.ResourceGroup, ref.VMName)
 	},
-	unboundedv1alpha3.OperationHostReimage: func(ctx context.Context, client azureVMClient, ref azureVMResourceRef) error {
-		if ref.ReimageUserData == "" {
-			return fmt.Errorf("reimage user data is required for Azure VM HostReimage")
+	unboundedv1alpha3.OperationHostReplace: func(ctx context.Context, client azureVMClient, ref azureVMResourceRef) error {
+		if ref.ReplaceUserData == "" {
+			return fmt.Errorf("replacement user data is required for Azure VM HostReplace")
 		}
 
-		return client.Replace(ctx, ref.ResourceGroup, ref.VMName, ref.ReimageUserData)
+		return client.Replace(ctx, ref.ResourceGroup, ref.VMName, ref.ReplaceUserData)
 	},
 }
 
@@ -77,7 +77,8 @@ func (p *Provider) Execute(ctx context.Context, request machineops.OperationRequ
 	if err != nil {
 		return err
 	}
-	ref.ReimageUserData = request.ReimageUserData
+
+	ref.ReplaceUserData = request.ReplaceUserData
 
 	newClient := p.NewClient
 	if newClient == nil {
@@ -96,7 +97,7 @@ type azureVMResourceRef struct {
 	SubscriptionID  string
 	ResourceGroup   string
 	VMName          string
-	ReimageUserData string
+	ReplaceUserData string
 }
 
 func parseAzureVMProviderID(providerID string) (azureVMResourceRef, error) {
@@ -192,7 +193,7 @@ func (c *armAzureVMClient) Restart(ctx context.Context, resourceGroupName, vmNam
 	return nil
 }
 
-func (c *armAzureVMClient) Replace(ctx context.Context, resourceGroupName, vmName string, userData string) error {
+func (c *armAzureVMClient) Replace(ctx context.Context, resourceGroupName, vmName, userData string) error {
 	if err := validateAzureCustomData(userData); err != nil {
 		return err
 	}
@@ -201,24 +202,29 @@ func (c *armAzureVMClient) Replace(ctx context.Context, resourceGroupName, vmNam
 	if err != nil && !isAzureNotFound(err) {
 		return fmt.Errorf("get VM %s/%s: %w", resourceGroupName, vmName, err)
 	}
+
 	if isAzureNotFound(err) {
 		return fmt.Errorf("get VM %s/%s: not found; replacement cannot recover without the original VM model", resourceGroupName, vmName)
 	}
 
 	existing := prepareVMForReplacementDelete(vm.VirtualMachine)
+
 	updatePoller, err := c.client.BeginCreateOrUpdate(ctx, resourceGroupName, vmName, existing, nil)
 	if err != nil {
 		return fmt.Errorf("update VM %s/%s delete options before replacement: %w", resourceGroupName, vmName, err)
 	}
+
 	if _, err := updatePoller.PollUntilDone(ctx, nil); err != nil {
 		return fmt.Errorf("wait for VM %s/%s delete option update before replacement: %w", resourceGroupName, vmName, err)
 	}
 
 	replacement := prepareReplacementVM(existing, userData, time.Now().Unix())
+
 	deletePoller, err := c.client.BeginDelete(ctx, resourceGroupName, vmName, &armcompute.VirtualMachinesClientBeginDeleteOptions{ForceDeletion: to.Ptr(false)})
 	if err != nil {
 		return fmt.Errorf("delete VM %s/%s before replacement: %w", resourceGroupName, vmName, err)
 	}
+
 	if _, err := deletePoller.PollUntilDone(ctx, nil); err != nil {
 		return fmt.Errorf("wait for VM %s/%s delete before replacement: %w", resourceGroupName, vmName, err)
 	}
@@ -227,6 +233,7 @@ func (c *armAzureVMClient) Replace(ctx context.Context, resourceGroupName, vmNam
 	if err != nil {
 		return fmt.Errorf("create replacement VM %s/%s: %w", resourceGroupName, vmName, err)
 	}
+
 	if _, err := createPoller.PollUntilDone(ctx, nil); err != nil {
 		return fmt.Errorf("wait for replacement VM %s/%s create: %w", resourceGroupName, vmName, err)
 	}
@@ -254,13 +261,16 @@ func prepareVMForReplacementDelete(vm armcompute.VirtualMachine) armcompute.Virt
 			if nic.Properties == nil {
 				nic.Properties = &armcompute.NetworkInterfaceReferenceProperties{}
 			}
+
 			nic.Properties.DeleteOption = to.Ptr(armcompute.DeleteOptionsDetach)
 		}
 	}
+
 	if vm.Properties.StorageProfile != nil {
 		if vm.Properties.StorageProfile.OSDisk != nil {
 			vm.Properties.StorageProfile.OSDisk.DeleteOption = to.Ptr(armcompute.DiskDeleteOptionTypesDelete)
 		}
+
 		for _, disk := range vm.Properties.StorageProfile.DataDisks {
 			disk.DeleteOption = to.Ptr(armcompute.DiskDeleteOptionTypesDetach)
 		}
@@ -278,6 +288,7 @@ func prepareReplacementVM(vm armcompute.VirtualMachine, userData string, diskNam
 	vm.Type = nil
 	vm.Etag = nil
 	vm.ManagedBy = nil
+
 	vm.Resources = nil
 	if vm.Identity != nil {
 		for id := range vm.Identity.UserAssignedIdentities {
@@ -291,14 +302,17 @@ func prepareReplacementVM(vm armcompute.VirtualMachine, userData string, diskNam
 		vm.Properties.VMID = nil
 		vm.Properties.InstanceView = nil
 		encodedUserData := base64.StdEncoding.EncodeToString([]byte(userData))
+
 		vm.Properties.UserData = &encodedUserData
 		if vm.Properties.OSProfile != nil {
 			vm.Properties.OSProfile.CustomData = &encodedUserData
 			vm.Properties.OSProfile.RequireGuestProvisionSignal = nil
 		}
+
 		if vm.Properties.StorageProfile != nil && vm.Properties.StorageProfile.OSDisk != nil {
 			vm.Properties.StorageProfile.OSDisk.CreateOption = to.Ptr(armcompute.DiskCreateOptionTypesFromImage)
 			vm.Properties.StorageProfile.OSDisk.Vhd = nil
+
 			vm.Properties.StorageProfile.OSDisk.Name = to.Ptr(fmt.Sprintf("%s-osdisk-%d", vmName, diskNameSuffix))
 			for _, disk := range vm.Properties.StorageProfile.DataDisks {
 				disk.DiskIOPSReadWrite = nil
@@ -313,7 +327,7 @@ func prepareReplacementVM(vm armcompute.VirtualMachine, userData string, diskNam
 
 func validateAzureCustomData(userData string) error {
 	if len([]byte(userData)) > azureCustomDataMaxBytes {
-		return fmt.Errorf("reimage cloud-init is %d bytes, exceeding Azure customData limit of %d bytes", len([]byte(userData)), azureCustomDataMaxBytes)
+		return fmt.Errorf("replacement cloud-init is %d bytes, exceeding Azure customData limit of %d bytes", len([]byte(userData)), azureCustomDataMaxBytes)
 	}
 
 	return nil

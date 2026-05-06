@@ -19,7 +19,7 @@ import (
 	"github.com/Azure/unbounded/internal/provision"
 )
 
-// ClusterInfo holds the cluster-level data needed to build reimage cloud-init.
+// ClusterInfo holds the cluster-level data needed to build host replacement cloud-init.
 type ClusterInfo struct {
 	APIServer      string
 	CACertBase64   string
@@ -28,7 +28,7 @@ type ClusterInfo struct {
 	ProviderLabels map[string]string
 }
 
-// ResolveClusterInfo resolves cluster bootstrap details for HostReimage.
+// ResolveClusterInfo resolves cluster bootstrap details for HostReplace.
 func ResolveClusterInfo(ctx context.Context, apiServerEndpoint string, k kubernetes.Interface) (*ClusterInfo, error) {
 	if strings.TrimSpace(apiServerEndpoint) == "" {
 		return nil, fmt.Errorf("API server endpoint is required")
@@ -78,13 +78,13 @@ func ResolveClusterInfo(ctx context.Context, apiServerEndpoint string, k kuberne
 	return info, nil
 }
 
-func (r *MachineOperationReconciler) buildReimageUserData(ctx context.Context, machine *unboundedv1alpha3.Machine) (string, error) {
-	agentConfig, err := r.buildReimageAgentConfig(ctx, machine)
+func (r *MachineOperationReconciler) buildReplaceUserData(ctx context.Context, machine *unboundedv1alpha3.Machine) (string, error) {
+	agentConfig, err := r.buildReplaceAgentConfig(ctx, machine)
 	if err != nil {
 		return "", err
 	}
 
-	userData, err := provision.ReimageCloudInit(agentConfig, provision.AgentInstallEnv(machine.Spec.Agent))
+	userData, err := provision.ReplaceCloudInit(agentConfig, provision.AgentInstallEnv(machine.Spec.Agent))
 	if err != nil {
 		return "", err
 	}
@@ -92,9 +92,9 @@ func (r *MachineOperationReconciler) buildReimageUserData(ctx context.Context, m
 	return userData, nil
 }
 
-func (r *MachineOperationReconciler) buildReimageAgentConfig(ctx context.Context, machine *unboundedv1alpha3.Machine) (provision.UnboundedAgentConfig, error) {
+func (r *MachineOperationReconciler) buildReplaceAgentConfig(ctx context.Context, machine *unboundedv1alpha3.Machine) (provision.UnboundedAgentConfig, error) {
 	if machine.Spec.Kubernetes == nil {
-		return provision.UnboundedAgentConfig{}, fmt.Errorf("machine spec.kubernetes is required for HostReimage")
+		return provision.UnboundedAgentConfig{}, fmt.Errorf("machine spec.kubernetes is required for HostReplace")
 	}
 
 	clusterInfo, err := r.clusterInfo(ctx)
@@ -126,7 +126,7 @@ func (r *MachineOperationReconciler) clusterInfo(ctx context.Context) (*ClusterI
 	}
 
 	if r.KubeClient == nil {
-		return nil, fmt.Errorf("kubernetes client is required for HostReimage")
+		return nil, fmt.Errorf("kubernetes client is required for HostReplace")
 	}
 
 	clusterInfo, err := ResolveClusterInfo(ctx, r.APIServerEndpoint, r.KubeClient)
