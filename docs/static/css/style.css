@@ -762,6 +762,9 @@ a:hover {
 /* ── Docs layout (left nav + main) ────────────────────────── */
 .docs-layout {
   display: flex;
+  max-width: 84rem;
+  margin: 0 auto;
+  padding: 0 1.5rem;
   min-height: calc(100vh - var(--nav-height));
 }
 
@@ -775,25 +778,23 @@ a:hover {
   width: 16rem;
   flex-shrink: 0;
   border-right: 1px solid var(--color-border);
-  background: var(--color-surface);
+}
+
+.left-nav-inner {
   position: sticky;
   top: var(--nav-height);
   height: calc(100vh - var(--nav-height));
   overflow-y: auto;
-  z-index: 5;
+  padding: 1.25rem 0;
 }
 
-.left-nav::-webkit-scrollbar {
+.left-nav-inner::-webkit-scrollbar {
   width: 3px;
 }
 
-.left-nav::-webkit-scrollbar-thumb {
+.left-nav-inner::-webkit-scrollbar-thumb {
   background: var(--color-border);
   border-radius: 3px;
-}
-
-.left-nav-inner {
-  padding: 1.25rem 0;
 }
 
 .left-nav-section {
@@ -914,8 +915,10 @@ a:hover {
     position: fixed;
     top: var(--nav-height);
     left: 0;
+    width: 16rem;
     height: calc(100vh - var(--nav-height));
     z-index: 20;
+    background: var(--color-surface);
     box-shadow: 4px 0 12px rgba(0, 0, 0, 0.3);
   }
 

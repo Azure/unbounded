@@ -5,12 +5,18 @@
 </head>
 <body>
   {{- partial "header.html" . -}}
+  {{- if .IsHome }}
+  <main>
+    {{- block "main" . }}{{- end }}
+  </main>
+  {{- else }}
   <div class="docs-layout">
     {{- partial "left-nav.html" . -}}
     <main>
       {{- block "main" . }}{{- end }}
     </main>
   </div>
+  {{- end }}
   {{- partial "footer.html" . -}}
   <script>
   document.addEventListener("DOMContentLoaded", function () {
