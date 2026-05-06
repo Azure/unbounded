@@ -266,6 +266,44 @@ def wait_for_machine_operation_complete(name: str, timeout_secs: int = 180) -> d
     die(f"Timed out waiting for MachineOperation '{name}' to complete after {timeout_secs}s")
 
 
+def wait_for_machine_operation_failed(name: str, timeout_secs: int = 180) -> dict[str, Any]:
+    """Wait for a MachineOperation to fail and return its JSON object."""
+
+    log(f"Waiting for MachineOperation '{name}' to fail (timeout: {timeout_secs}s)...")
+    elapsed = 0
+    resource = _machine_operation_resource()
+    last_phase = ""
+    last_message = ""
+
+    while elapsed < timeout_secs:
+        result = subprocess.run(
+            [KUBECTL, "get", resource, name, "-o", "json"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            operation = json.loads(result.stdout)
+            status = operation.get("status", {})
+            phase = status.get("phase", "")
+            message = status.get("message", "")
+            if phase != last_phase or message != last_message:
+                log(f"  MachineOperation phase={phase or '<empty>'} message={message or '<empty>'}")
+                last_phase = phase
+                last_message = message
+            if phase == "Failed":
+                log(f"MachineOperation '{name}' failed after {elapsed}s")
+                return operation
+            if phase == "Complete":
+                die(f"MachineOperation '{name}' unexpectedly completed: {message}")
+
+        if elapsed > 0 and elapsed % 30 == 0:
+            log(f"  ({elapsed}s) MachineOperation not failed yet")
+        time.sleep(5)
+        elapsed += 5
+
+    subprocess.run([KUBECTL, "get", resource, name, "-o", "yaml"], check=False)
+    die(f"Timed out waiting for MachineOperation '{name}' to fail after {timeout_secs}s")
+
+
 def node_boot_id(node_name: str) -> str:
     """Return the node boot ID reported by kubelet."""
 
@@ -497,6 +535,7 @@ def _serve_agent_upgrade_tarball(tarball: Path, operation_name: str, expect_comp
         )
         if expect_complete:
             return wait_for_machine_operation_complete(operation_name)
+        return wait_for_machine_operation_failed(operation_name)
     finally:
         httpd.shutdown()
 
@@ -523,6 +562,26 @@ def _build_failing_agent_tarball(tarball: Path) -> None:
     build_dir.mkdir(parents=True)
     agent_path = build_dir / "unbounded-agent"
     agent_path.write_text("#!/bin/sh\necho failing upgraded agent >&2\nexit 42\n")
+    agent_path.chmod(0o755)
+    run(["tar", "-czf", str(tarball), "-C", str(build_dir), "unbounded-agent"])
+
+
+def _build_daemon_failing_agent_tarball(tarball: Path) -> None:
+    """Package an executable that passes preflight but fails as the daemon."""
+
+    build_dir = tarball.parent / "agent-upgrade-daemon-bad"
+    shutil.rmtree(build_dir, ignore_errors=True)
+    build_dir.mkdir(parents=True)
+    agent_path = build_dir / "unbounded-agent"
+    agent_path.write_text(
+        "#!/bin/sh\n"
+        "if [ \"${1:-}\" = \"version\" ]; then\n"
+        "    echo unbounded-agent e2e-daemon-failing\n"
+        "    exit 0\n"
+        "fi\n"
+        "echo failing upgraded agent daemon >&2\n"
+        "exit 42\n"
+    )
     agent_path.chmod(0o755)
     run(["tar", "-czf", str(tarball), "-C", str(build_dir), "unbounded-agent"])
 
@@ -1800,14 +1859,25 @@ def validate_agent_upgrade_operation() -> None:
 def validate_agent_upgrade_rollback() -> None:
     """Validate systemd recovery rolls back from a failing upgraded daemon."""
 
-    operation_name = f"e2e-agent-upgrade-rollback-{int(time.time())}"
     previous_good = read_daemon_current_target()
     if not previous_good:
         die("daemon current binary symlink target was empty")
     log(f"Current daemon binary before failing upgrade: {previous_good}")
 
-    tarball = VM_DIR / "unbounded-agent-upgrade-bad.tar.gz"
-    _build_failing_agent_tarball(tarball)
+    broken_operation_name = f"e2e-agent-upgrade-broken-{int(time.time())}"
+    broken_tarball = VM_DIR / "unbounded-agent-upgrade-broken.tar.gz"
+    _build_failing_agent_tarball(broken_tarball)
+    broken_operation = _serve_agent_upgrade_tarball(
+        broken_tarball, broken_operation_name, expect_complete=False)
+    broken_status = broken_operation.get("status", {})
+    if "verify upgraded daemon binary" not in broken_status.get("message", ""):
+        die(f"unexpected broken AgentUpgrade failure message: {broken_status.get('message')!r}")
+    if read_daemon_current_target() != previous_good:
+        die("broken AgentUpgrade changed current daemon binary symlink")
+
+    operation_name = f"e2e-agent-upgrade-rollback-{int(time.time())}"
+    tarball = VM_DIR / "unbounded-agent-upgrade-daemon-bad.tar.gz"
+    _build_daemon_failing_agent_tarball(tarball)
     operation = _serve_agent_upgrade_tarball(tarball, operation_name)
 
     status = operation.get("status", {})

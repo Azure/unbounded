@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -57,7 +58,7 @@ func TestUpgradeDaemonBinary(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/gzip")
 		w.WriteHeader(http.StatusOK)
-		require.NoError(t, writeAgentArchive(w, []byte("new-agent-binary")))
+		require.NoError(t, writeAgentArchive(w, agentArchiveScript("new-agent-binary", 0)))
 	}))
 	t.Cleanup(server.Close)
 
@@ -73,7 +74,7 @@ func TestUpgradeDaemonBinary(t *testing.T) {
 
 	newData, err := os.ReadFile(bluePath)
 	require.NoError(t, err)
-	assert.Equal(t, []byte("new-agent-binary"), newData)
+	assert.Equal(t, agentArchiveScript("new-agent-binary", 0), newData)
 }
 
 func TestUpgradeDaemonBinary_AlternatesFromBlueToGreen(t *testing.T) {
@@ -92,7 +93,7 @@ func TestUpgradeDaemonBinary_AlternatesFromBlueToGreen(t *testing.T) {
 	t.Setenv(goalstates.EnvDaemonBinaryGreen, greenPath)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		require.NoError(t, writeAgentArchive(w, []byte("green")))
+		require.NoError(t, writeAgentArchive(w, agentArchiveScript("green", 0)))
 	}))
 	t.Cleanup(server.Close)
 
@@ -110,8 +111,8 @@ func TestUpgradeDaemonBinary_AlternatesFromBlueToGreen(t *testing.T) {
 func TestUpgradeDaemonBinary_SequentialSuccesses(t *testing.T) {
 	paths := setupDaemonBinaryTest(t)
 	server := newAgentArchiveSequenceServer(t, []archiveResponse{
-		{binary: []byte("agent-a")},
-		{binary: []byte("agent-b")},
+		{binary: agentArchiveScript("agent-a", 0)},
+		{binary: agentArchiveScript("agent-b", 0)},
 	})
 	t.Cleanup(server.Close)
 
@@ -122,14 +123,14 @@ func TestUpgradeDaemonBinary_SequentialSuccesses(t *testing.T) {
 	require.NoError(t, upgradeDaemonBinary(context.Background(), slog.Default(), server.URL))
 	assertSymlinkTarget(t, paths.current, paths.green)
 	assertSymlinkTarget(t, paths.lastGood, paths.blue)
-	assertFileContent(t, paths.blue, "agent-a")
-	assertFileContent(t, paths.green, "agent-b")
+	assertFileContent(t, paths.blue, string(agentArchiveScript("agent-a", 0)))
+	assertFileContent(t, paths.green, string(agentArchiveScript("agent-b", 0)))
 }
 
 func TestUpgradeDaemonBinary_SequentialSuccessThenFailure(t *testing.T) {
 	paths := setupDaemonBinaryTest(t)
 	server := newAgentArchiveSequenceServer(t, []archiveResponse{
-		{binary: []byte("agent-a")},
+		{binary: agentArchiveScript("agent-a", 0)},
 		{status: http.StatusInternalServerError},
 	})
 	t.Cleanup(server.Close)
@@ -139,7 +140,7 @@ func TestUpgradeDaemonBinary_SequentialSuccessThenFailure(t *testing.T) {
 
 	assertSymlinkTarget(t, paths.current, paths.blue)
 	assertSymlinkTarget(t, paths.lastGood, paths.legacy)
-	assertFileContent(t, paths.blue, "agent-a")
+	assertFileContent(t, paths.blue, string(agentArchiveScript("agent-a", 0)))
 	assert.NoFileExists(t, paths.green)
 }
 
@@ -164,7 +165,7 @@ func TestUpgradeDaemonBinary_SequentialFailureThenSuccess(t *testing.T) {
 	paths := setupDaemonBinaryTest(t)
 	server := newAgentArchiveSequenceServer(t, []archiveResponse{
 		{status: http.StatusInternalServerError},
-		{binary: []byte("agent-b")},
+		{binary: agentArchiveScript("agent-b", 0)},
 	})
 	t.Cleanup(server.Close)
 
@@ -173,7 +174,22 @@ func TestUpgradeDaemonBinary_SequentialFailureThenSuccess(t *testing.T) {
 
 	assertSymlinkTarget(t, paths.current, paths.blue)
 	assertSymlinkTarget(t, paths.lastGood, paths.legacy)
-	assertFileContent(t, paths.blue, "agent-b")
+	assertFileContent(t, paths.blue, string(agentArchiveScript("agent-b", 0)))
+	assert.NoFileExists(t, paths.green)
+}
+
+func TestUpgradeDaemonBinary_RejectsBrokenBinary(t *testing.T) {
+	paths := setupDaemonBinaryTest(t)
+	server := newAgentArchiveSequenceServer(t, []archiveResponse{
+		{binary: agentArchiveScript("agent-a", 42)},
+	})
+	t.Cleanup(server.Close)
+
+	require.Error(t, upgradeDaemonBinary(context.Background(), slog.Default(), server.URL))
+
+	assertSymlinkTarget(t, paths.current, paths.legacy)
+	assert.NoFileExists(t, paths.lastGood)
+	assertFileContent(t, paths.blue, string(agentArchiveScript("agent-a", 42)))
 	assert.NoFileExists(t, paths.green)
 }
 
@@ -356,4 +372,8 @@ func writeAgentArchive(w io.Writer, binary []byte) error {
 
 	_, err := io.Copy(tw, bytes.NewReader(binary))
 	return err
+}
+
+func agentArchiveScript(version string, exitCode int) []byte {
+	return []byte(fmt.Sprintf("#!/bin/sh\necho %s\nexit %d\n", version, exitCode))
 }

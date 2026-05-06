@@ -9,8 +9,10 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/Azure/unbounded/pkg/agent/agentbinary"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
@@ -19,6 +21,7 @@ import (
 const (
 	agentUpgradeDownloadURLParameter = "downloadURL"
 	agentUpgradeBinaryMode           = 0o755
+	agentUpgradeVerifyTimeout        = 30 * time.Second
 )
 
 func agentUpgradeDownloadURL(parameters map[string]string) (string, error) {
@@ -42,6 +45,10 @@ func upgradeDaemonBinary(ctx context.Context, log *slog.Logger, downloadURL stri
 		return fmt.Errorf("install upgraded daemon binary to %s: %w", upgrade.TargetBinaryPath, err)
 	}
 
+	if err := verifyAgentUpgradeBinary(ctx, upgrade.TargetBinaryPath); err != nil {
+		return err
+	}
+
 	if err := updateSymlink(upgrade.LastGoodLinkPath, upgrade.PreviousBinaryPath); err != nil {
 		return fmt.Errorf("update last-good daemon symlink: %w", err)
 	}
@@ -55,6 +62,22 @@ func upgradeDaemonBinary(ctx context.Context, log *slog.Logger, downloadURL stri
 		"previous", upgrade.PreviousBinaryPath,
 		"current", upgrade.TargetBinaryPath,
 	)
+
+	return nil
+}
+
+func verifyAgentUpgradeBinary(ctx context.Context, path string) error {
+	verifyCtx, cancel := context.WithTimeout(ctx, agentUpgradeVerifyTimeout)
+	defer cancel()
+
+	output, err := exec.CommandContext(verifyCtx, path, "version").CombinedOutput()
+	if err != nil {
+		details := strings.TrimSpace(string(output))
+		if details != "" {
+			return fmt.Errorf("verify upgraded daemon binary %s: %w: %s", path, err, details)
+		}
+		return fmt.Errorf("verify upgraded daemon binary %s: %w", path, err)
+	}
 
 	return nil
 }
