@@ -163,4 +163,12 @@ func TestGetEnvOrDefault(t *testing.T) {
 			t.Fatalf("GetEnvOrDefault() = %q, want %q", got, "default")
 		}
 	})
+
+	t.Run("default when empty", func(t *testing.T) {
+		t.Setenv("UNBOUNDED_TEST_EMPTY", "")
+
+		if got := GetEnvOrDefault("UNBOUNDED_TEST_EMPTY", "default"); got != "default" {
+			t.Fatalf("GetEnvOrDefault() = %q, want %q", got, "default")
+		}
+	})
 }
