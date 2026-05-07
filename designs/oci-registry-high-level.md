@@ -49,7 +49,7 @@ The P2P cache runs on every node and shares hot chunks with peers over RDMA (wit
 
 ### Containerd Integration
 
-The proxy runs as a local registry mirror on each node:
+Containerd supports [registry host configuration](https://github.com/containerd/containerd/blob/main/docs/hosts.md) through per-registry directories under a `certs.d` path. We use the `_default` directory, which acts as a fallback for all registries that don't have an explicit host configuration. This means all image pulls - regardless of origin registry - route through the proxy without needing per-registry configuration.
 
 ```toml
 # /etc/containerd/certs.d/_default/hosts.toml
@@ -59,6 +59,8 @@ The proxy runs as a local registry mirror on each node:
 ```
 
 From containerd's perspective, the proxy behaves as a standard OCI registry endpoint.
+
+This configuration is applied automatically by the unbounded-agent when it provisions the nspawn machine for a node. No manual containerd setup is required.
 
 ### Pull Flow
 
@@ -95,6 +97,10 @@ Possible directions:
 - **Manifest registration at pull time** - when the proxy first resolves a manifest, it registers the full layer-to-origin mapping (including a credential reference) with the regional cache, so future misses can be resolved without the original requester.
 
 This is unresolved and affects the boundary between the OCI-aware proxy layer and the registry-agnostic P2P/regional cache.
+
+### P2P Cache Lacks a Put API
+
+The P2P cache currently operates as a pull-through cache only - there is no Put API for explicitly writing data into it. The registry proxy needs a way to push newly fetched chunks into the cache so they become available to peers. This requires either adding a write path to the P2P cache or rethinking how origin-fetched data enters the cache layer.
 
 ## Related Work
 
