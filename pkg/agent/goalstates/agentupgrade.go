@@ -89,6 +89,7 @@ func (p AgentUpgradePaths) InitialDaemonBinaryTarget() (string, error) {
 	return "", os.ErrNotExist
 }
 
+// isExecutableFile reports whether path is a regular executable file.
 func isExecutableFile(path string) bool {
 	info, err := os.Stat(path)
 	if err != nil {

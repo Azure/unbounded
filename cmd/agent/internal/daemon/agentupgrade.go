@@ -22,12 +22,14 @@ const (
 	agentUpgradeBinaryMode           = 0o755
 )
 
+// agentUpgradeSignal is the JSON payload for pending and failure signals.
 type agentUpgradeSignal struct {
 	OperationName             string `json:"operationName"`
 	ObservedMachineGeneration int64  `json:"observedMachineGeneration,omitempty"`
 	Message                   string `json:"message,omitempty"`
 }
 
+// agentUpgradeSignalOperator manages persistent AgentUpgrade signal files.
 type agentUpgradeSignalOperator interface {
 	RecordPending(operationName string, observedMachineGeneration int64) error
 	RecordFailure(message string) error
@@ -38,6 +40,7 @@ type agentUpgradeSignalOperator interface {
 	Clear() error
 }
 
+// fileAgentUpgradeSignalOperator stores AgentUpgrade signals on disk.
 type fileAgentUpgradeSignalOperator struct {
 	paths goalstates.AgentUpgradeSignalPaths
 }
