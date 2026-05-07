@@ -7,6 +7,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 
@@ -16,7 +18,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/rest"
 
-	"github.com/Azure/unbounded-kube/internal/provision"
+	"github.com/Azure/unbounded/internal/provision"
 )
 
 // ---------------------------------------------------------------------------
@@ -187,7 +189,7 @@ func TestManualBootstrapHandler_BuildAgentConfig(t *testing.T) {
 	require.Equal(t, "10.0.0.10", cfg.Cluster.ClusterDNS)
 	require.NotEmpty(t, cfg.Cluster.CaCertBase64)
 	require.NotEmpty(t, cfg.Cluster.Version) // fake client returns empty string but it's still set
-	require.Contains(t, cfg.Kubelet.BootstrapToken, "abc123.")
+	require.Contains(t, cfg.Kubelet.Auth.BootstrapToken, "abc123.")
 	require.Equal(t, map[string]string{"env": "prod"}, cfg.Kubelet.Labels)
 	require.Equal(t, []string{"dedicated=gpu:NoSchedule"}, cfg.Kubelet.RegisterWithTaints)
 	require.Equal(t, "ghcr.io/azure/rootfs:v1", cfg.OCIImage)
@@ -261,22 +263,33 @@ func TestManualBootstrapHandler_RenderScript(t *testing.T) {
 		logger: discardLogger(),
 	}
 
-	cfg := &provision.AgentConfig{
-		MachineName: "test-node",
-		Cluster: provision.AgentClusterConfig{
-			CaCertBase64: "dGVzdA==",
-			ClusterDNS:   "10.0.0.10",
-			Version:      "v1.30.0",
-		},
-		Kubelet: provision.AgentKubeletConfig{
-			ApiServer:      "https://api-server:6443",
-			BootstrapToken: "abc123.0123456789abcdef",
-			Labels:         map[string]string{"env": "prod"},
+	cfg := &provision.UnboundedAgentConfig{
+		AgentConfig: provision.AgentConfig{
+			MachineName: "test-node",
+			Cluster: provision.AgentClusterConfig{
+				CaCertBase64: "dGVzdA==",
+				ClusterDNS:   "10.0.0.10",
+				Version:      "v1.30.0",
+			},
+			Kubelet: provision.AgentKubeletConfig{
+				ApiServer: "https://api-server:6443",
+				Auth: provision.KubeletAuthInfo{
+					BootstrapToken: "abc123.0123456789abcdef",
+				},
+				Labels: map[string]string{"env": "prod"},
+			},
 		},
 	}
 
 	script, err := h.renderScript(cfg)
 	require.NoError(t, err)
+
+	// No download overrides: no `export AGENT_*=` lines should appear in
+	// the outer script (the embedded install script references the vars
+	// in its own help text, but must not be pre-set by the wrapper).
+	require.NotContains(t, script, "export AGENT_VERSION=")
+	require.NotContains(t, script, "export AGENT_URL=")
+	require.NotContains(t, script, "export AGENT_BASE_URL=")
 
 	// Should start with a shebang.
 	require.Contains(t, script, "#!/bin/bash")
@@ -326,6 +339,106 @@ func TestManualBootstrapHandler_RenderScript(t *testing.T) {
 	require.NotContains(t, script, "unbounded-agent-uninstall.sh")
 }
 
+func TestManualBootstrapHandler_RenderScript_WithAgentURL(t *testing.T) {
+	t.Parallel()
+
+	h := &manualBootstrapHandler{
+		logger: discardLogger(),
+	}
+
+	cfg := &provision.UnboundedAgentConfig{
+		AgentConfig: provision.AgentConfig{
+			MachineName: "test-node",
+			Cluster: provision.AgentClusterConfig{
+				CaCertBase64: "dGVzdA==",
+				ClusterDNS:   "10.0.0.10",
+				Version:      "v1.30.0",
+			},
+			Kubelet: provision.AgentKubeletConfig{
+				ApiServer: "https://api-server:6443",
+				Auth: provision.KubeletAuthInfo{
+					BootstrapToken: "abc123.0123456789abcdef",
+				},
+			},
+		},
+	}
+
+	h.agentURL = "file:///tmp/unbounded-agent-linux-amd64.tar.gz"
+
+	script, err := h.renderScript(cfg)
+	require.NoError(t, err)
+
+	agentURLExport := "export AGENT_URL='file:///tmp/unbounded-agent-linux-amd64.tar.gz'"
+	installScript := "bash <<'INSTALL_SCRIPT_EOF'"
+
+	require.Contains(t, script, agentURLExport)
+	require.Contains(t, script, installScript)
+	require.Less(t, strings.Index(script, agentURLExport), strings.Index(script, installScript))
+}
+
+func TestManualBootstrapHandler_RenderScript_WithUnsafeAgentURL(t *testing.T) {
+	t.Parallel()
+
+	h := &manualBootstrapHandler{
+		logger:   discardLogger(),
+		agentURL: `https://example.test/download?name="agent"&cmd=$(touch /tmp/pwned)`,
+	}
+
+	cfg := &provision.UnboundedAgentConfig{
+		AgentConfig: provision.AgentConfig{
+			MachineName: "test-node",
+			Cluster: provision.AgentClusterConfig{
+				CaCertBase64: "dGVzdA==",
+				ClusterDNS:   "10.0.0.10",
+				Version:      "v1.30.0",
+			},
+			Kubelet: provision.AgentKubeletConfig{
+				ApiServer: "https://api-server:6443",
+				Auth: provision.KubeletAuthInfo{
+					BootstrapToken: "abc123.0123456789abcdef",
+				},
+			},
+		},
+	}
+
+	script, err := h.renderScript(cfg)
+	require.NoError(t, err)
+	require.Contains(t, script, `export AGENT_URL='https://example.test/download?name="agent"&cmd=$(touch /tmp/pwned)'`)
+	require.NotContains(t, script, `export AGENT_URL="https://example.test/download?name="agent"&cmd=$(touch /tmp/pwned)"`)
+
+	installScript := "bash <<'INSTALL_SCRIPT_EOF'"
+	require.Less(t, strings.Index(script, "export AGENT_URL='https://example.test/download?name=\"agent\"&cmd=$(touch /tmp/pwned)'"), strings.Index(script, installScript))
+}
+
+func TestManualBootstrapHandler_RenderScript_WithoutAgentURL(t *testing.T) {
+	t.Parallel()
+
+	h := &manualBootstrapHandler{
+		logger: discardLogger(),
+	}
+
+	cfg := &provision.UnboundedAgentConfig{
+		AgentConfig: provision.AgentConfig{
+			MachineName: "test-node",
+			Cluster: provision.AgentClusterConfig{
+				CaCertBase64: "dGVzdA==",
+				ClusterDNS:   "10.0.0.10",
+				Version:      "v1.30.0",
+			},
+			Kubelet: provision.AgentKubeletConfig{
+				ApiServer: "https://api-server:6443",
+				Auth: provision.KubeletAuthInfo{
+					BootstrapToken: "abc123.0123456789abcdef",
+				},
+			},
+		},
+	}
+
+	script, err := h.renderScript(cfg)
+	require.NoError(t, err)
+	require.NotContains(t, script, "export AGENT_URL=")
+}
+
 func TestManualBootstrapHandler_RenderCloudInit(t *testing.T) {
 	t.Parallel()
 
@@ -333,17 +446,21 @@ func TestManualBootstrapHandler_RenderCloudInit(t *testing.T) {
 		logger: discardLogger(),
 	}
 
-	cfg := &provision.AgentConfig{
-		MachineName: "test-node",
-		Cluster: provision.AgentClusterConfig{
-			CaCertBase64: "dGVzdA==",
-			ClusterDNS:   "10.0.0.10",
-			Version:      "v1.30.0",
-		},
-		Kubelet: provision.AgentKubeletConfig{
-			ApiServer:      "https://api-server:6443",
-			BootstrapToken: "abc123.0123456789abcdef",
-			Labels:         map[string]string{"env": "prod"},
+	cfg := &provision.UnboundedAgentConfig{
+		AgentConfig: provision.AgentConfig{
+			MachineName: "test-node",
+			Cluster: provision.AgentClusterConfig{
+				CaCertBase64: "dGVzdA==",
+				ClusterDNS:   "10.0.0.10",
+				Version:      "v1.30.0",
+			},
+			Kubelet: provision.AgentKubeletConfig{
+				ApiServer: "https://api-server:6443",
+				Auth: provision.KubeletAuthInfo{
+					BootstrapToken: "abc123.0123456789abcdef",
+				},
+				Labels: map[string]string{"env": "prod"},
+			},
 		},
 	}
 
@@ -360,7 +477,7 @@ func TestManualBootstrapHandler_RenderCloudInit(t *testing.T) {
 		require.Contains(t, output, "test-node")
 
 		// Must write the agent config file.
-		require.Contains(t, output, "/etc/unbounded-agent/config.json")
+		require.Contains(t, output, "/etc/unbounded/agent/config.json")
 		require.Contains(t, output, `"MachineName": "test-node"`)
 		require.Contains(t, output, `"ApiServer": "https://api-server:6443"`)
 
@@ -369,7 +486,7 @@ func TestManualBootstrapHandler_RenderCloudInit(t *testing.T) {
 		require.Contains(t, output, "unbounded-agent")
 
 		// runcmd must set UNBOUNDED_AGENT_CONFIG_FILE and run the install script.
-		require.Contains(t, output, "UNBOUNDED_AGENT_CONFIG_FILE=/etc/unbounded-agent/config.json")
+		require.Contains(t, output, "UNBOUNDED_AGENT_CONFIG_FILE=/etc/unbounded/agent/config.json")
 		require.Contains(t, output, "bash /usr/local/bin/unbounded-agent-install.sh")
 
 		// AGENT_OCI_IMAGE env var should not be present (OCI image is in the JSON config).
@@ -383,19 +500,23 @@ func TestManualBootstrapHandler_RenderCloudInit(t *testing.T) {
 	t.Run("with OCI image", func(t *testing.T) {
 		t.Parallel()
 
-		cfgWithOCI := &provision.AgentConfig{
-			MachineName: "test-node",
-			Cluster: provision.AgentClusterConfig{
-				CaCertBase64: "dGVzdA==",
-				ClusterDNS:   "10.0.0.10",
-				Version:      "v1.30.0",
+		cfgWithOCI := &provision.UnboundedAgentConfig{
+			AgentConfig: provision.AgentConfig{
+				MachineName: "test-node",
+				Cluster: provision.AgentClusterConfig{
+					CaCertBase64: "dGVzdA==",
+					ClusterDNS:   "10.0.0.10",
+					Version:      "v1.30.0",
+				},
+				Kubelet: provision.AgentKubeletConfig{
+					ApiServer: "https://api-server:6443",
+					Auth: provision.KubeletAuthInfo{
+						BootstrapToken: "abc123.0123456789abcdef",
+					},
+					Labels: map[string]string{"env": "prod"},
+				},
+				OCIImage: "ghcr.io/azure/agent:latest",
 			},
-			Kubelet: provision.AgentKubeletConfig{
-				ApiServer:      "https://api-server:6443",
-				BootstrapToken: "abc123.0123456789abcdef",
-				Labels:         map[string]string{"env": "prod"},
-			},
-			OCIImage: "ghcr.io/azure/agent:latest",
 		}
 
 		withOCI := &manualBootstrapHandler{
@@ -414,6 +535,36 @@ func TestManualBootstrapHandler_RenderCloudInit(t *testing.T) {
 // ---------------------------------------------------------------------------
 // execute() integration test
 // ---------------------------------------------------------------------------
+
+func TestManualBootstrapHandler_Execute_WithAgentURL(t *testing.T) {
+	t.Parallel()
+
+	kubeCli := newFakeCluster(t, "dc1")
+
+	var buf bytes.Buffer
+
+	kubeconfigPath := writeTempKubeconfig(t)
+
+	h := &manualBootstrapHandler{
+		out:            &buf,
+		kubeCli:        kubeCli,
+		kubeConfig:     &rest.Config{Host: "https://my-api-server:6443"},
+		kubeconfigPath: kubeconfigPath,
+		logger:         discardLogger(),
+	}
+
+	cmd := newMachineManualBootstrapCommand(h)
+	cmd.SetArgs([]string{
+		"--site", "dc1",
+		"--kubeconfig", kubeconfigPath,
+		"--agent-url", "file:///tmp/unbounded-agent-linux-amd64.tar.gz",
+		"node-1",
+	})
+
+	err := cmd.ExecuteContext(context.Background())
+	require.NoError(t, err)
+	require.Contains(t, buf.String(), "export AGENT_URL='file:///tmp/unbounded-agent-linux-amd64.tar.gz'")
+}
 
 func TestManualBootstrapHandler_Execute(t *testing.T) {
 	t.Parallel()
@@ -469,6 +620,176 @@ func TestManualBootstrapHandler_Execute(t *testing.T) {
 		require.True(t, strings.HasPrefix(output, "#cloud-config\n"))
 		require.Contains(t, output, "my-node")
 		require.Contains(t, output, "abc123.")
-		require.Contains(t, output, "/etc/unbounded-agent/config.json")
+		require.Contains(t, output, "/etc/unbounded/agent/config.json")
 	})
+}
+
+// ---------------------------------------------------------------------------
+// Agent download override tests
+// ---------------------------------------------------------------------------
+
+func TestManualBootstrapHandler_InstallEnv(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		handler manualBootstrapHandler
+		want    []string
+	}{
+		{
+			name:    "no overrides",
+			handler: manualBootstrapHandler{},
+			want:    nil,
+		},
+		{
+			name:    "pinned version",
+			handler: manualBootstrapHandler{agentVersion: "v0.0.10"},
+			want:    []string{"AGENT_VERSION='v0.0.10'"},
+		},
+		{
+			name:    "base URL override",
+			handler: manualBootstrapHandler{agentBaseURL: "https://mirror.example.com/releases"},
+			want:    []string{"AGENT_BASE_URL='https://mirror.example.com/releases'"},
+		},
+		{
+			name:    "full URL override",
+			handler: manualBootstrapHandler{agentURL: "https://mirror.example.com/agent.tar.gz"},
+			want:    []string{"AGENT_URL='https://mirror.example.com/agent.tar.gz'"},
+		},
+		{
+			name: "all three set",
+			handler: manualBootstrapHandler{
+				agentVersion: "v0.0.10",
+				agentBaseURL: "https://mirror.example.com/releases",
+				agentURL:     "https://mirror.example.com/agent.tar.gz",
+			},
+			want: []string{
+				"AGENT_VERSION='v0.0.10'",
+				"AGENT_BASE_URL='https://mirror.example.com/releases'",
+				"AGENT_URL='https://mirror.example.com/agent.tar.gz'",
+			},
+		},
+		{
+			name:    "value containing a single quote is escaped",
+			handler: manualBootstrapHandler{agentVersion: "v'1"},
+			want:    []string{`AGENT_VERSION='v'\''1'`},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := tt.handler.installEnv()
+			require.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestManualBootstrapHandler_RenderScript_DownloadOverrides(t *testing.T) {
+	t.Parallel()
+
+	cfg := &provision.UnboundedAgentConfig{
+		AgentConfig: provision.AgentConfig{
+			MachineName: "test-node",
+			Cluster: provision.AgentClusterConfig{
+				CaCertBase64: "dGVzdA==",
+				ClusterDNS:   "10.0.0.10",
+				Version:      "v1.30.0",
+			},
+			Kubelet: provision.AgentKubeletConfig{
+				ApiServer: "https://api-server:6443",
+				Auth: provision.KubeletAuthInfo{
+					BootstrapToken: "abc123.0123456789abcdef",
+				},
+				Labels: map[string]string{"env": "prod"},
+			},
+		},
+	}
+
+	h := &manualBootstrapHandler{
+		logger:       discardLogger(),
+		agentVersion: "v0.0.10",
+		agentBaseURL: "https://mirror.example.com/releases",
+	}
+
+	script, err := h.renderScript(cfg)
+	require.NoError(t, err)
+
+	// Overrides must be exported in the outer shell before the embedded
+	// install script heredoc.
+	require.Contains(t, script, "export AGENT_VERSION='v0.0.10'")
+	require.Contains(t, script, "export AGENT_BASE_URL='https://mirror.example.com/releases'")
+
+	// The exports must appear before the embedded install script heredoc.
+	exportIdx := strings.Index(script, "export AGENT_VERSION=")
+	heredocIdx := strings.Index(script, "INSTALL_SCRIPT_EOF")
+
+	require.Greater(t, exportIdx, 0)
+	require.Greater(t, heredocIdx, exportIdx)
+
+	// Script should still be valid bash syntax.
+	requireValidBashSyntax(t, script)
+}
+
+func TestManualBootstrapHandler_RenderCloudInit_DownloadOverrides(t *testing.T) {
+	t.Parallel()
+
+	cfg := &provision.UnboundedAgentConfig{
+		AgentConfig: provision.AgentConfig{
+			MachineName: "test-node",
+			Cluster: provision.AgentClusterConfig{
+				CaCertBase64: "dGVzdA==",
+				ClusterDNS:   "10.0.0.10",
+				Version:      "v1.30.0",
+			},
+			Kubelet: provision.AgentKubeletConfig{
+				ApiServer: "https://api-server:6443",
+				Auth: provision.KubeletAuthInfo{
+					BootstrapToken: "abc123.0123456789abcdef",
+				},
+			},
+		},
+	}
+
+	h := &manualBootstrapHandler{
+		logger:   discardLogger(),
+		agentURL: "https://mirror.example.com/agent.tar.gz",
+	}
+
+	output, err := h.renderCloudInit(cfg)
+	require.NoError(t, err)
+
+	// The override must be exported in runcmd before invoking the install
+	// script.
+	require.Contains(t, output, "export AGENT_URL='https://mirror.example.com/agent.tar.gz'")
+
+	exportIdx := strings.Index(output, "export AGENT_URL=")
+	runIdx := strings.Index(output, "bash /usr/local/bin/unbounded-agent-install.sh")
+
+	require.Greater(t, exportIdx, 0)
+	require.Greater(t, runIdx, exportIdx)
+}
+
+// requireValidBashSyntax shells out to `bash -n` to syntax-check a script.
+// It skips the test if bash is not available in the test environment.
+func requireValidBashSyntax(t *testing.T, script string) {
+	t.Helper()
+
+	bashPath, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skipf("bash not found in PATH: %v", err)
+	}
+
+	f, err := os.CreateTemp(t.TempDir(), "bootstrap-*.sh")
+	require.NoError(t, err)
+
+	_, err = f.WriteString(script)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	cmd := exec.Command(bashPath, "-n", f.Name())
+
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, "bash -n failed: %s", string(out))
 }

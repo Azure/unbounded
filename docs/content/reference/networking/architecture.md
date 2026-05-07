@@ -52,7 +52,7 @@ rules:
 Manages site membership and SiteNodeSlice objects:
 
 - Matches node internal IPs against Site `nodeCidrs`.
-- Labels matching nodes with `net.unbounded-kube.io/site=<name>`.
+- Labels matching nodes with `net.unbounded-cloud.io/site=<name>`.
 - Splits site nodes into **SiteNodeSlice** objects (max 500 nodes per slice to
   avoid etcd object size limits).
 - Slices are named `{site-name}-{index}` with OwnerReferences for automatic
@@ -235,7 +235,7 @@ GatewayPools/SitePeerings/SiteGatewayPoolAssignments/GatewayPoolPeerings
 ### Gateway Node Isolation
 
 Gateway nodes are tainted with
-`net.unbounded-kube.io/gateway-node=true:NoSchedule` to prevent regular
+`net.unbounded-cloud.io/gateway-node=true:NoSchedule` to prevent regular
 workloads from being scheduled on them, since gateways lack pod CIDR routes to
 other sites.
 

@@ -1,0 +1,62 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# Build stage
+FROM docker.io/library/golang:1.26.2-trixie AS builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    golang \
+    make \
+    gcc \
+    git \
+    ca-certificates \
+    && apt-get clean
+
+# Set up Go environment
+ENV CGO_ENABLED=0
+ENV GOPATH=/go
+ENV GOTOOLCHAIN=auto
+ENV PATH=$PATH:/go/bin
+
+# Install gofumpt and golangci-lint for the build
+RUN go install mvdan.cc/gofumpt@latest && \
+    go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
+
+# Set working directory
+WORKDIR /src
+
+# Copy go mod files first for better caching
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy the rest of the source code
+COPY ../../ .
+
+# VERSION is passed from the release workflow to inject version metadata via ldflags.
+ARG VERSION=dev
+RUN make inventory-inspector VERSION=${VERSION}
+
+# Runtime stage
+FROM ubuntu:noble
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    && apt-get clean
+
+# Create unbounded directory
+RUN mkdir -p /unbounded/bin
+
+# Copy the built binaries from the builder stage
+COPY --from=builder /src/bin/inventory-inspector /unbounded/bin/inventory-inspector
+
+# Add unbounded bin to PATH
+ENV PATH="/unbounded/bin:${PATH}"
+
+# Set working directory
+WORKDIR /unbounded
+
+# Default entrypoint
+ENTRYPOINT ["/unbounded/bin/inventory-inspector"]

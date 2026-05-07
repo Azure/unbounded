@@ -21,16 +21,12 @@ import (
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"github.com/Azure/unbounded-kube/cmd/machina/machina/controller"
-	"github.com/Azure/unbounded-kube/internal/kube"
+	"github.com/Azure/unbounded/cmd/machina/machina/controller"
+	"github.com/Azure/unbounded/internal/kube"
 )
 
 //go:embed assets/unbounded-net-site/*.yaml
 var siteTemplates embed.FS
-
-const (
-	unboundedCNIRelease = "https://github.com/Azure/unbounded-net/releases/download/v1.1.2/unbounded-net-manifests-v1.1.2.tar.gz"
-)
 
 // siteInitHandler is responsible for handling initial unbounded-kube bootstrap and also ensuring a site
 // is ready for machines to be added to it. The handler performs the following duties:
@@ -38,7 +34,7 @@ const (
 //  1. Validate inputs and runtime environment.
 //     - Check if parameters themselves are valid (e.g. CIDRs, site name, etc.).
 //     - Check if kubectl is available and can connect to the cluster.
-//     - Check if the cluster has at least one node with a label unbounded-kube.io/unbounded-net-gateway=true. If not,
+//     - Check if the cluster has at least one node with a label unbounded-cloud.io/unbounded-net-gateway=true. If not,
 //     the handler will exit and prompt the user to label at least one node with that label.
 //
 //  2. Install the unbounded-net plugin.
@@ -226,7 +222,7 @@ func (h *siteInitHandler) validate() error {
 		return errors.New("pod CIDR is invalid")
 	}
 
-	if !isHTTPSURL(h.cniManifests) && !isDirectoryOrFile(h.cniManifests) {
+	if h.cniManifests != "" && !isHTTPSURL(h.cniManifests) && !isDirectoryOrFile(h.cniManifests) {
 		return errors.New("CNI manifests path is invalid")
 	}
 
@@ -245,7 +241,7 @@ func (h *siteInitHandler) validate() error {
 
 func (h *siteInitHandler) checkUnboundedCNIGatewayNode(ctx context.Context) (bool, error) {
 	opts := metav1.ListOptions{
-		LabelSelector: "unbounded-kube.io/unbounded-net-gateway=true",
+		LabelSelector: "unbounded-cloud.io/unbounded-net-gateway=true",
 	}
 
 	nodes, err := h.kubeCli.CoreV1().Nodes().List(ctx, opts)
@@ -264,8 +260,12 @@ func (h *siteInitHandler) ensureUnboundedCNI(ctx context.Context) error {
 
 	if !hasGatewayAssignableNode {
 		return fmt.Errorf(
-			"no nodes with label unbounded-kube.io/unbounded-net-gateway=true found; please label at least one node with that label before initializing the site",
+			"no nodes with label unbounded-cloud.io/unbounded-net-gateway=true found; please label at least one node with that label before initializing the site",
 		)
+	}
+
+	if h.cniManifests == "" {
+		h.logger.Info("Using embedded unbounded-net manifests")
 	}
 
 	if err := h.installUnboundedCNI.run(ctx); err != nil {
@@ -378,7 +378,7 @@ func (h *siteInitHandler) ensureBootstrapToken(ctx context.Context) error {
 			return fmt.Errorf("generating bootstrap token for %s: %w", h.name, err)
 		}
 
-		tok.WithLabel("unbounded-kube.io/site", h.name)
+		tok.WithLabel("unbounded-cloud.io/site", h.name)
 
 		if err := kube.ApplyBootstrapToken(ctx, h.kubeCli, fieldManagerID, tok); err != nil {
 			return fmt.Errorf("applying bootstrap token for %s: %w", h.name, err)
@@ -399,7 +399,7 @@ func siteInitCommand() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&handler.cniManifests, "cni-manifests", unboundedCNIRelease, "Path or https URL to CNI plugin manifests")
+	cmd.Flags().StringVar(&handler.cniManifests, "cni-manifests", "", "Path or https URL to CNI plugin manifests (uses embedded manifests if omitted)")
 	cmd.Flags().StringVar(&handler.machinaManifests, "machina-manifests", "", "Path or https URL to Machina manifests (uses embedded manifests if omitted)")
 	cmd.Flags().StringVar(&handler.kubeconfigPath, "kubeconfig", "", "Path to kubeconfig file")
 	cmd.Flags().StringVar(&handler.name, "name", "", "The name of the site")

@@ -9,7 +9,7 @@ description: "How metalman PXE-boots bare-metal servers and joins them to your c
 Use metalman when you have physical servers that need to be:
 
 - **Netbooted** from bare metal (no pre-installed OS).
-- **Reimaged** on demand without physical access.
+- **Repaved** on demand without physical access.
 - **Power-managed** remotely via Redfish BMC APIs.
 - **Securely bootstrapped** using TPM 2.0 hardware attestation.
 
@@ -89,12 +89,15 @@ For PXE-provisioned machines, the `Machine` resource includes:
   assignment for each interface.
 - **`spec.pxe.redfish`** -- Optional BMC connection details (endpoint, username,
   password secret) for remote power management.
+- **`spec.pxe.cloudInit`** -- Optional cloud-init customization. References a
+  ConfigMap containing user-data that is merged with the vendor-data managed by
+Unbounded.
 
-### Pool Isolation
+### Site Isolation
 
 In environments with multiple metalman instances (e.g., different racks or
-sites), the `--pool` flag scopes each instance to machines labeled with
-`unbounded-kube.io/pool=<name>`. This prevents one metalman from interfering
+sites), the `--site` flag scopes each instance to machines labeled with
+`unbounded-cloud.io/site=<name>`. This prevents one metalman from interfering
 with another's machines.
 
 ### TPM 2.0 Attestation
@@ -120,7 +123,7 @@ metalman supports two counter-based operations for day-2 management:
 
 - **Reboot** -- Increment `spec.operations.rebootCounter` to trigger a
   reboot via Redfish.
-- **Reimage** -- Increment `spec.operations.reimageCounter` to wipe and
+- **Repave** -- Increment `spec.operations.repaveCounter` to wipe and
   re-provision the machine from scratch.
 
 The controller compares the spec counter against the status counter and acts

@@ -8,8 +8,8 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/Azure/unbounded-kube/hack/cmd/forge/forge/azsdk"
-	"github.com/Azure/unbounded-kube/hack/cmd/forge/forge/infra"
+	"github.com/Azure/unbounded/hack/cmd/forge/forge/azsdk"
+	"github.com/Azure/unbounded/hack/cmd/forge/forge/infra"
 )
 
 type DeleteCluster struct {

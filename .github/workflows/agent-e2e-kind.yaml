@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-name: Agent E2E Kind
+name: unbounded agent e2e
 
 on:
   pull_request:
@@ -9,9 +9,16 @@ on:
       - cmd/agent/**
       - cmd/kubectl-unbounded/**
       - internal/cloudprovider/**
+      - pkg/agent/**
       - internal/provision/**
       - internal/kube/**
       - hack/agent/e2e-kind/**
+      - deploy/machina/crd/**
+      - deploy/machina/*.yaml.tmpl
+      - deploy/net/crd/**
+      - deploy/net/*.yaml.tmpl
+      - deploy/net/controller/*.yaml.tmpl
+      - deploy/net/node/*.yaml.tmpl
       - go.mod
       - go.sum
       - .github/workflows/agent-e2e-kind.yaml
@@ -21,9 +28,16 @@ on:
       - cmd/agent/**
       - cmd/kubectl-unbounded/**
       - internal/cloudprovider/**
+      - pkg/agent/**
       - internal/provision/**
       - internal/kube/**
       - hack/agent/e2e-kind/**
+      - deploy/machina/crd/**
+      - deploy/machina/*.yaml.tmpl
+      - deploy/net/crd/**
+      - deploy/net/*.yaml.tmpl
+      - deploy/net/controller/*.yaml.tmpl
+      - deploy/net/node/*.yaml.tmpl
       - go.mod
       - go.sum
       - .github/workflows/agent-e2e-kind.yaml
@@ -119,7 +133,7 @@ jobs:
           kubectl -n kube-system rollout status daemonset/kindnet --timeout=60s
 
       - name: Create QEMU VM
-        run: python3 ./hack/agent/e2e-kind/e2e.py create-vm
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose create-vm
 
       - name: Attach Kind container to VM bridge
         run: |
@@ -142,26 +156,64 @@ jobs:
           sudo nsenter -t "${KIND_PID}" -n ip addr add "${VM_SUBNET}.2/24" dev eth-e2e
           sudo nsenter -t "${KIND_PID}" -n ip link set eth-e2e up
 
+      - name: Install Machine CRD
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose install-machine-crd
+
+      - name: Start machina controller
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose start-machina-controller
+
+      - name: Validate machina controller
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-machina-controller
+
+      # No Machine CR pre-created; agent self-registers during bootstrap.
       - name: Run agent to join VM to cluster
-        run: python3 ./hack/agent/e2e-kind/e2e.py run-agent
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose run-agent
 
       - name: Wait for node to become Ready
-        run: python3 ./hack/agent/e2e-kind/e2e.py wait-for-node
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose wait-for-node
+
+      - name: Validate kube-proxy on all nodes
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-kube-proxy
+
+      - name: Validate Machine CR (self-registered)
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-machine-cr-created
+
+      - name: Validate node restart operation
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-node-reboot-operation
 
       - name: Validate workload on agent node
-        run: python3 ./hack/agent/e2e-kind/e2e.py validate-workload
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-workload
 
       - name: Reset agent on VM
-        run: python3 ./hack/agent/e2e-kind/e2e.py reset-agent
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose reset-agent
+
+      - name: Delete Machine CR
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose delete-machine-cr
+
+      # Rejoin: run the agent again on the same VM after reset.
+      - name: Ensure Kind bridge attachment for rejoin
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose ensure-kind-bridge
 
       - name: Rejoin agent to cluster
-        run: python3 ./hack/agent/e2e-kind/e2e.py run-agent
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose run-agent
 
       - name: Wait for node to become Ready (rejoin)
-        run: python3 ./hack/agent/e2e-kind/e2e.py wait-for-node
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose wait-for-node
+
+      - name: Validate kube-proxy on all nodes (rejoin)
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-kube-proxy
+
+      - name: Validate Machine CR (rejoin)
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-machine-cr-created
+
+      - name: Validate node restart operation (rejoin)
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-node-reboot-operation
 
       - name: Validate workload on rejoined agent node
-        run: python3 ./hack/agent/e2e-kind/e2e.py validate-workload
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-workload
+
+      - name: Validate node repave upgrade
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-node-repave-upgrade
 
       - name: Collect VM logs
         if: always()
@@ -175,6 +227,9 @@ jobs:
           $SSH "sudo journalctl --no-pager -l" > logs/vm-journal.log 2>/dev/null || true
           # Collect unbounded-agent logs from the VM host
           $SSH "sudo journalctl -u unbounded-agent --no-pager -l" > logs/vm-unbounded-agent.log 2>/dev/null || true
+          # Collect unbounded-agent-daemon logs
+          $SSH "sudo journalctl -u unbounded-agent-daemon --no-pager -l" > logs/vm-unbounded-agent-daemon.log 2>/dev/null || true
+          cp ".vm-e2e/machina-controller.log" logs/machina-controller.log 2>/dev/null || true
           # Kubelet and containerd run inside the nspawn container, not on
           # the host.  Use 'journalctl -M <machine>' to read the container
           # journal, and fall back to machinectl shell if that doesn't work.
@@ -197,6 +252,15 @@ jobs:
           kubectl describe nodes > logs/nodes-describe.txt 2>&1 || true
           kubectl get pods -A -o wide > logs/pods.txt 2>&1 || true
           kubectl get events -A --sort-by='.lastTimestamp' > logs/events.txt 2>&1 || true
+          # Collect Machine CRs (if CRD is installed)
+          kubectl get machines -o wide > logs/machines.txt 2>&1 || true
+          kubectl get machines -o yaml > logs/machines-full.yaml 2>&1 || true
+          kubectl get machineconfigurations -o wide > logs/machineconfigurations.txt 2>&1 || true
+          kubectl get machineconfigurations -o yaml > logs/machineconfigurations-full.yaml 2>&1 || true
+          kubectl get machineconfigurationversions -o wide > logs/machineconfigurationversions.txt 2>&1 || true
+          kubectl get machineconfigurationversions -o yaml > logs/machineconfigurationversions-full.yaml 2>&1 || true
+          kubectl get machineoperations -o wide > logs/machineoperations.txt 2>&1 || true
+          kubectl get machineoperations -o yaml > logs/machineoperations-full.yaml 2>&1 || true
           # Collect kubelet logs from the Kind control-plane
           docker exec kind-control-plane journalctl -u kubelet --no-pager -l > logs/kind-kubelet.log 2>&1 || true
           # Collect kube-apiserver logs (critical for diagnosing TLS bootstrap / RBAC issues)
@@ -216,7 +280,7 @@ jobs:
           kubectl logs -n e2e-workload-test --all-containers --prefix e2e-dns-test > logs/workload-dns.log 2>&1 || true
 
       - name: Upload logs
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: agent-e2e-kind-logs
@@ -225,4 +289,4 @@ jobs:
 
       - name: Cleanup
         if: always()
-        run: python3 ./hack/agent/e2e-kind/e2e.py cleanup
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose cleanup

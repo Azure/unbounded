@@ -3,7 +3,7 @@
 
 package main
 
-import "github.com/Azure/unbounded-kube/cmd/machina/machina"
+import "github.com/Azure/unbounded/cmd/machina/machina"
 
 func main() {
 	machina.Run()

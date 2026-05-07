@@ -22,10 +22,10 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
-	unboundedv1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
-	"github.com/Azure/unbounded-kube/internal/cloudprovider"
-	"github.com/Azure/unbounded-kube/internal/kube"
-	"github.com/Azure/unbounded-kube/internal/provision"
+	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/cloudprovider"
+	"github.com/Azure/unbounded/internal/kube"
+	"github.com/Azure/unbounded/internal/provision"
 )
 
 //go:embed assets/node-bootstrap/script.sh
@@ -82,6 +82,30 @@ type manualBootstrapHandler struct {
 	// be auto-detected from the API server. When empty the version is resolved
 	// via the discovery client.
 	kubernetesVersion string
+
+	// agentVersion pins the unbounded-agent release tag to download on the
+	// target host. When empty (the default) the install script tracks the
+	// latest published release.
+	agentVersion string
+
+	// agentURL is a fully qualified override for the unbounded-agent download
+	// URL. When set it takes precedence over agentVersion and agentBaseURL.
+	agentURL string
+
+	// agentBaseURL overrides the base URL used to construct the download URL
+	// for the unbounded-agent. Useful for self-hosted release mirrors. Must
+	// follow the same layout as GitHub releases
+	// (<base>/latest/download/<asset> and <base>/download/<tag>/<asset>).
+	agentBaseURL string
+
+	// Download override flags for rootfs binaries installed by the agent.
+	// See `kubectl unbounded machine register --help` for the equivalent
+	// flags on the machina controller path.
+	kubernetesBaseURL, kubernetesURL, kubernetesBinaryVersion string
+	containerdBaseURL, containerdURL, containerdVersion       string
+	runcBaseURL, runcURL, runcVersion                         string
+	cniBaseURL, cniURL, cniVersion                            string
+	crictlBaseURL, crictlURL, crictlVersion                   string
 
 	// variant controls the output format. Defaults to "script".
 	variant string
@@ -181,7 +205,7 @@ func (h *manualBootstrapHandler) validate() error {
 
 // buildAgentConfig resolves cluster information and assembles the provision.AgentConfig
 // that the unbounded-agent expects.
-func (h *manualBootstrapHandler) buildAgentConfig(ctx context.Context) (*provision.AgentConfig, error) {
+func (h *manualBootstrapHandler) buildAgentConfig(ctx context.Context) (*provision.UnboundedAgentConfig, error) {
 	tok, err := resolveBootstrapToken(ctx, h.logger, h.kubeCli, h.siteName)
 	if err != nil {
 		return nil, err
@@ -258,6 +282,14 @@ func (h *manualBootstrapHandler) buildAgentConfig(ctx context.Context) (*provisi
 		machine.Spec.Agent = &unboundedv1alpha3.AgentSpec{Image: h.ociImage}
 	}
 
+	if downloads := h.buildDownloadsSpec(); downloads != nil {
+		if machine.Spec.Agent == nil {
+			machine.Spec.Agent = &unboundedv1alpha3.AgentSpec{}
+		}
+
+		machine.Spec.Agent.Downloads = downloads
+	}
+
 	cfg := provision.BuildAgentConfig(provision.BuildAgentConfigParams{
 		Machine: machine,
 		Cluster: provision.ClusterEndpoint{
@@ -285,12 +317,46 @@ type manualBootstrapTemplateData struct {
 	// InstallScript is the full install script embedded verbatim inside a
 	// heredoc that is piped to bash.
 	InstallScript string
+
+	// InstallEnv is an optional list of "KEY=VALUE" strings that are exported
+	// in the generated script's shell (or cloud-init runcmd) immediately
+	// before the embedded install script runs. Used to forward agent
+	// download overrides like AGENT_VERSION, AGENT_URL, and AGENT_BASE_URL.
+	InstallEnv []string
+}
+
+// buildDownloadsSpec returns a non-nil AgentDownloadsSpec when any rootfs
+// download override flag has been set; otherwise nil.
+func (h *manualBootstrapHandler) buildDownloadsSpec() *unboundedv1alpha3.AgentDownloadsSpec {
+	out := &unboundedv1alpha3.AgentDownloadsSpec{
+		Kubernetes: downloadSourceFromFlags(h.kubernetesBaseURL, h.kubernetesURL, h.kubernetesBinaryVersion),
+		Containerd: downloadSourceFromFlags(h.containerdBaseURL, h.containerdURL, h.containerdVersion),
+		Runc:       downloadSourceFromFlags(h.runcBaseURL, h.runcURL, h.runcVersion),
+		CNI:        downloadSourceFromFlags(h.cniBaseURL, h.cniURL, h.cniVersion),
+		Crictl:     downloadSourceFromFlags(h.crictlBaseURL, h.crictlURL, h.crictlVersion),
+	}
+
+	if out.Kubernetes == nil && out.Containerd == nil && out.Runc == nil && out.CNI == nil && out.Crictl == nil {
+		return nil
+	}
+
+	return out
+}
+
+// installEnv returns the KEY=VALUE pairs that should be exported before the
+// embedded install script runs. Only non-empty overrides are included.
+func (h *manualBootstrapHandler) installEnv() []string {
+	return provision.AgentInstallEnv(&unboundedv1alpha3.AgentSpec{
+		Version: h.agentVersion,
+		BaseURL: h.agentBaseURL,
+		URL:     h.agentURL,
+	})
 }
 
 // renderScript produces a self-contained bash script that writes the agent
 // config JSON to a temporary file and then executes the standard install
 // script. It uses the embedded node-bootstrap/script.sh template.
-func (h *manualBootstrapHandler) renderScript(cfg *provision.AgentConfig) (string, error) {
+func (h *manualBootstrapHandler) renderScript(cfg *provision.UnboundedAgentConfig) (string, error) {
 	configJSON, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return "", fmt.Errorf("marshalling agent config: %w", err)
@@ -300,6 +366,7 @@ func (h *manualBootstrapHandler) renderScript(cfg *provision.AgentConfig) (strin
 		MachineName:     cfg.MachineName,
 		AgentConfigJSON: string(configJSON),
 		InstallScript:   provision.UnboundedAgentInstallScript(),
+		InstallEnv:      h.installEnv(),
 	}
 
 	t, err := template.New("node-bootstrap").Parse(manualBootstrapTemplate)
@@ -317,7 +384,7 @@ func (h *manualBootstrapHandler) renderScript(cfg *provision.AgentConfig) (strin
 
 // renderCloudInit produces a cloud-init user-data document that writes the
 // agent config JSON file and runs the install script on first boot via runcmd.
-func (h *manualBootstrapHandler) renderCloudInit(cfg *provision.AgentConfig) (string, error) {
+func (h *manualBootstrapHandler) renderCloudInit(cfg *provision.UnboundedAgentConfig) (string, error) {
 	configJSON, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return "", fmt.Errorf("marshalling agent config: %w", err)
@@ -327,6 +394,7 @@ func (h *manualBootstrapHandler) renderCloudInit(cfg *provision.AgentConfig) (st
 		MachineName:     cfg.MachineName,
 		AgentConfigJSON: string(configJSON),
 		InstallScript:   provision.UnboundedAgentInstallScript(),
+		InstallEnv:      h.installEnv(),
 	}
 
 	funcMap := template.FuncMap{
@@ -357,14 +425,12 @@ func (h *manualBootstrapHandler) renderCloudInit(cfg *provision.AgentConfig) (st
 	return buf.String(), nil
 }
 
-func machineManualBootstrapCommand() *cobra.Command {
-	handler := manualBootstrapHandler{}
-
+func newMachineManualBootstrapCommand(handler *manualBootstrapHandler) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "manual-bootstrap NAME",
 		Short: "Generate a bootstrap script or cloud-init config for provisioning a machine",
 		Long: `Generate a self-contained bootstrap payload that provisions a bare-metal or VM
-host as an unbounded-kube worker node. The payload embeds the agent JSON
+host as an unbounded worker node. The payload embeds the agent JSON
 configuration inline and the install script for the target architecture.
 
 Use --variant to choose the output format:
@@ -381,7 +447,15 @@ Examples:
   kubectl unbounded machine manual-bootstrap my-node --site my-site | ssh user@host sudo bash
 
   # Generate cloud-init user-data for a cloud provider API:
-  kubectl unbounded machine manual-bootstrap my-node --site my-site --variant cloud-init > user-data.yaml`,
+  kubectl unbounded machine manual-bootstrap my-node --site my-site --variant cloud-init > user-data.yaml
+
+  # Pin the agent to a specific release instead of tracking "latest":
+  kubectl unbounded machine manual-bootstrap my-node --site my-site --agent-version v0.0.10
+
+  # Self-host / mirror the release assets (expects the same layout as
+  # GitHub releases under the base URL):
+  kubectl unbounded machine manual-bootstrap my-node --site my-site \
+    --agent-base-url https://releases.example.com/unbounded`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			handler.machineName = args[0]
@@ -396,12 +470,54 @@ Examples:
 	cmd.Flags().StringVar(&handler.ociImage, "oci-image", "", "OCI image reference for the agent rootfs")
 	cmd.Flags().StringVar(&handler.kubernetesVersion, "kubernetes-version", "", "Override the Kubernetes version (default: auto-detected from API server)")
 	cmd.Flags().StringVar(&handler.variant, "variant", "script", "Output format: script or cloud-init")
+	cmd.Flags().StringVar(&handler.agentVersion, "agent-version", "", "Pin the unbounded-agent release tag to download on the host (default: latest GitHub release)")
+	cmd.Flags().StringVar(&handler.agentURL, "agent-url", "", "Fully qualified download URL for the unbounded-agent tarball (overrides --agent-version and --agent-base-url)")
+	cmd.Flags().StringVar(&handler.agentBaseURL, "agent-base-url", "", "Base URL for unbounded-agent release downloads (default: https://github.com/Azure/unbounded/releases). Use this to self-host or mirror release assets")
+
+	// Rootfs binary download overrides. See `kubectl unbounded machine register --help`
+	// for the equivalent flags on the machina controller path.
+	cmd.Flags().StringVar(&handler.kubernetesBaseURL, "kubernetes-base-url", "",
+		"Base URL for kubelet/kubectl/kube-proxy downloads (default: https://dl.k8s.io). Mirrors must preserve the <base>/v<ver>/bin/linux/<arch>/ layout")
+	cmd.Flags().StringVar(&handler.kubernetesURL, "kubernetes-url", "",
+		"Full URL template for kubernetes binary downloads (fmt placeholders: version, arch, binary)")
+	cmd.Flags().StringVar(&handler.kubernetesBinaryVersion, "kubernetes-binary-version", "",
+		"Override the Kubernetes binary version installed in the rootfs (defaults to the cluster Kubernetes version)")
+	cmd.Flags().StringVar(&handler.containerdBaseURL, "containerd-base-url", "",
+		"Base URL for containerd release downloads (default: https://github.com/containerd/containerd/releases/download)")
+	cmd.Flags().StringVar(&handler.containerdURL, "containerd-url", "",
+		"Full URL template for containerd downloads (fmt placeholders: version, version, arch)")
+	cmd.Flags().StringVar(&handler.containerdVersion, "containerd-version", "",
+		"Override the containerd version installed in the rootfs (defaults to agent's built-in version)")
+	cmd.Flags().StringVar(&handler.runcBaseURL, "runc-base-url", "",
+		"Base URL for runc release downloads (default: https://github.com/opencontainers/runc/releases/download)")
+	cmd.Flags().StringVar(&handler.runcURL, "runc-url", "",
+		"Full URL template for runc downloads (fmt placeholders: version, arch)")
+	cmd.Flags().StringVar(&handler.runcVersion, "runc-version", "",
+		"Override the runc version installed in the rootfs (defaults to agent's built-in version)")
+	cmd.Flags().StringVar(&handler.cniBaseURL, "cni-base-url", "",
+		"Base URL for CNI plugins release downloads (default: https://github.com/containernetworking/plugins/releases/download)")
+	cmd.Flags().StringVar(&handler.cniURL, "cni-url", "",
+		"Full URL template for CNI plugins downloads (fmt placeholders: version, arch, version)")
+	cmd.Flags().StringVar(&handler.cniVersion, "cni-version", "",
+		"Override the CNI plugins version installed in the rootfs (defaults to agent's built-in version)")
+	cmd.Flags().StringVar(&handler.crictlBaseURL, "crictl-base-url", "",
+		"Base URL for cri-tools (crictl) release downloads (default: https://github.com/kubernetes-sigs/cri-tools/releases/download)")
+	cmd.Flags().StringVar(&handler.crictlURL, "crictl-url", "",
+		"Full URL template for crictl downloads (fmt placeholders: version, version, os, arch)")
+	cmd.Flags().StringVar(&handler.crictlVersion, "crictl-version", "",
+		"Override the cri-tools/crictl version installed in the rootfs (defaults to the cluster Kubernetes minor, patch 0)")
 
 	if err := cmd.MarkFlagRequired("site"); err != nil {
 		panic(err)
 	}
 
 	return cmd
+}
+
+func machineManualBootstrapCommand() *cobra.Command {
+	handler := &manualBootstrapHandler{}
+
+	return newMachineManualBootstrapCommand(handler)
 }
 
 // resolveBootstrapToken tries to find a bootstrap token for the given site.

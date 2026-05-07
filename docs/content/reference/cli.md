@@ -7,7 +7,7 @@ description: "Complete reference for the kubectl-unbounded plugin commands."
 ## Overview
 
 `kubectl-unbounded` is a kubectl plugin that extends `kubectl` with commands for
-managing Unbounded Kube sites. Once installed, commands are available as:
+managing Unbounded sites. Once installed, commands are available as:
 
 ```bash
 kubectl unbounded <command>
@@ -18,7 +18,7 @@ The plugin binary can also be invoked directly as `kubectl-unbounded`.
 ## Installation
 
 Download the plugin binary from the
-[GitHub releases](https://github.com/Azure/unbounded-kube/releases)
+[GitHub releases](https://github.com/Azure/unbounded/releases)
 page and place it on your `PATH`. kubectl automatically discovers plugins named
 `kubectl-<name>`.
 
@@ -40,7 +40,7 @@ neither is set, the default kubeconfig location (`~/.kube/config`) is used.
 
 ### `kubectl unbounded site`
 
-Manage unbounded-kube sites.
+Manage Unbounded sites.
 
 This is a command group with no action of its own. Use one of the subcommands
 below.
@@ -49,11 +49,11 @@ below.
 
 ### `kubectl unbounded site init`
 
-Initialize a new unbounded-kube site. This command:
+Initialize a new Unbounded site. This command:
 
 1. Validates inputs and checks that `kubectl` is on your PATH.
 2. Verifies that at least one node is labeled as a gateway
-   (`unbounded-kube.io/unbounded-net-gateway=true`).
+   (`unbounded-cloud.io/unbounded-net-gateway=true`).
 3. Installs the unbounded-net CNI plugin (downloads from the release URL or
    uses local manifests).
 4. Creates unbounded-net Site and GatewayPool resources.
@@ -74,15 +74,16 @@ Initialize a new unbounded-kube site. This command:
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--cni-manifests` | `string` | unbounded-net v1.1.2 release URL | Path to a local file/directory or HTTPS URL for CNI manifests |
+| `--cni-manifests` | `string` | *(embedded manifests)* | Path to a local file/directory or HTTPS URL for CNI manifests |
 | `--machina-manifests` | `string` | *(embedded manifests)* | Path to a local file/directory or HTTPS URL for machina manifests |
 | `--kubeconfig` | `string` | `$KUBECONFIG` or default | Path to kubeconfig file |
 
 #### Validation
 
 - All CIDR values must be valid IPv4 CIDR notation.
-- `--cni-manifests` must be either a valid HTTPS URL or an existing local
-  file/directory path.
+- `--cni-manifests`, when provided, must be either a valid HTTPS URL or an
+  existing local file/directory path. If omitted, the manifests embedded in
+  the kubectl plugin are used.
 - `kubectl` must be available on `PATH`.
 
 #### Example
@@ -111,7 +112,16 @@ kubectl unbounded site init \
 
 ---
 
-### `kubectl unbounded site add-machine`
+### `kubectl unbounded machine`
+
+Manage Unbounded machines.
+
+This is a command group with no action of its own. Use one of the subcommands
+below.
+
+---
+
+### `kubectl unbounded machine register`
 
 Register a machine to an existing site. This command:
 
@@ -163,7 +173,7 @@ Register a machine to an existing site. This command:
 **Direct SSH:**
 
 ```bash
-kubectl unbounded site add-machine \
+kubectl unbounded machine register \
   --site dc1 \
   --host 10.0.0.5 \
   --ssh-username admin \
@@ -173,7 +183,7 @@ kubectl unbounded site add-machine \
 **With explicit machine name:**
 
 ```bash
-kubectl unbounded site add-machine \
+kubectl unbounded machine register \
   --site dc1 \
   --name worker-1 \
   --host 10.0.0.5 \
@@ -184,7 +194,7 @@ kubectl unbounded site add-machine \
 **With bastion (shared credentials):**
 
 ```bash
-kubectl unbounded site add-machine \
+kubectl unbounded machine register \
   --site dc1 \
   --host 10.0.0.5:2222 \
   --ssh-username admin \
@@ -195,7 +205,7 @@ kubectl unbounded site add-machine \
 **With bastion (separate credentials):**
 
 ```bash
-kubectl unbounded site add-machine \
+kubectl unbounded machine register \
   --site dc1 \
   --host 10.0.0.5 \
   --ssh-username admin \
@@ -217,7 +227,7 @@ kubectl unbounded site add-machine \
 ## See Also
 
 - **[Getting Started]({{< relref "guides/getting-started" >}})** -- Walks
-  through `site init` and `add-machine` step by step.
+  through `site init` and `machine register` step by step.
 - **[SSH Guide]({{< relref "guides/ssh" >}})** -- Detailed SSH provisioning
   walkthrough with examples.
 - **[CRD Reference]({{< relref "reference/machina-crd" >}})** -- Full Machine

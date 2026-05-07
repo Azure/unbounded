@@ -1,0 +1,32 @@
+{
+  "name": "unbounded-net-frontend",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@emotion/react": "^11.14.0",
+    "@emotion/styled": "^11.14.1",
+    "@tanstack/table-core": "^8.21.3",
+    "@tanstack/react-table": "^8.21.3",
+    "d3-scale": "^4.0.2",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "reagraph": "4.30.8",
+    "three": "0.182.0"
+  },
+  "overrides": {
+    "three": "0.182.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.1.4",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.2"
+  }
+}

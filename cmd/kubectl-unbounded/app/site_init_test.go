@@ -55,23 +55,23 @@ func TestEnsureUnboundedSite_DefaultTemplates(t *testing.T) {
 	err := h.ensureUnboundedSite(context.Background(), cfg)
 	require.NoError(t, err)
 
-	// Verify default mode uses net.unbounded-kube.io apiVersion by
+	// Verify default mode uses net.unbounded-cloud.io apiVersion by
 	// rendering the template directly.
 	content, err := siteTemplates.ReadFile("assets/unbounded-net-site/site.yaml")
 	require.NoError(t, err)
 
 	appliedYAML = content
-	require.Contains(t, string(appliedYAML), "net.unbounded-kube.io/v1alpha1")
+	require.Contains(t, string(appliedYAML), "net.unbounded-cloud.io/v1alpha1")
 	require.NotContains(t, string(appliedYAML), "unbounded.aks.azure.com/v1alpha1")
 }
 
 // TestSiteInitCommand_DefaultCNIManifests verifies the default --cni-manifests
-// value points to the unbounded-net release when prototype mode is off.
+// value is empty so the embedded manifests are used.
 func TestSiteInitCommand_DefaultCNIManifests(t *testing.T) {
 	cmd := siteInitCommand()
 	f := cmd.Flags().Lookup("cni-manifests")
 	require.NotNil(t, f)
-	require.Equal(t, unboundedCNIRelease, f.DefValue)
+	require.Equal(t, "", f.DefValue)
 }
 
 func TestSiteInitCommand_ManageCniPluginFlag(t *testing.T) {

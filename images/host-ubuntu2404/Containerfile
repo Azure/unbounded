@@ -14,8 +14,8 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build \
     -ldflags "-s -w \
-      -X github.com/Azure/unbounded-kube/internal/version.Version=${VERSION} \
-      -X github.com/Azure/unbounded-kube/internal/version.GitCommit=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" \
+      -X github.com/Azure/unbounded/internal/version.Version=${VERSION} \
+      -X github.com/Azure/unbounded/internal/version.GitCommit=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" \
     -o /unbounded-agent ./cmd/agent
 
 # ── Assemble host image artifacts ───────────────────────────────────
@@ -23,9 +23,21 @@ FROM docker.io/library/ubuntu:24.04 AS build
 
 ARG TARGETARCH
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        cpio curl ca-certificates qemu-utils libguestfs-tools linux-image-generic \
-    && rm -rf /var/lib/apt/lists/*
+# Retry loop: Ubuntu mirrors rate-limit large downloads (e.g. linux-firmware,
+# ~600 MB) with HTTP 429.  apt's built-in Acquire::Retries does not add a
+# delay between attempts, so a shell-level retry with sleep is needed.
+RUN apt-get update && \
+    ok=false && \
+    for attempt in 1 2 3 4 5; do \
+      if apt-get install -y --no-install-recommends \
+           cpio curl ca-certificates qemu-utils libguestfs-tools linux-image-generic pigz; then \
+        ok=true; break; \
+      fi; \
+      echo "apt-get install failed (attempt $attempt/5), retrying in 30s..."; \
+      sleep 30; \
+      apt-get update; \
+    done && $ok && \
+    rm -rf /var/lib/apt/lists/*
 
 # ── Download netboot artifacts ──────────────────────────────────────
 # Ubuntu netboot layout differs by architecture:
@@ -33,17 +45,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 #   arm64: tarball at cdimage.ubuntu.com (individual URLs are unavailable)
 # File names follow UEFI convention: shimx64/grubx64 (amd64), shimaa64/grubaa64 (arm64).
 # metalman looks up the boot filename from metadata.yaml (dhcpBootImageName).
+#
+# --connect-timeout and --retry flags prevent CI hangs when upstream mirrors
+# stall (observed 112s+ stalls on releases.ubuntu.com).
 RUN mkdir -p /artifacts && \
     KVER=$(ls /lib/modules | head -1) && \
     cp "/boot/vmlinuz-${KVER}" /artifacts/vmlinuz && \
     if [ "${TARGETARCH}" = "amd64" ]; then \
         NETBOOT_BASE="https://releases.ubuntu.com/24.04.2/netboot/amd64"; \
-        curl -fSL -o /artifacts/shimx64.efi  "${NETBOOT_BASE}/bootx64.efi" && \
-        curl -fSL -o /artifacts/grubx64.efi  "${NETBOOT_BASE}/grubx64.efi" && \
-        curl -fSL -o /artifacts/initrd       "${NETBOOT_BASE}/initrd"; \
+        curl -fSL --connect-timeout 10 --retry 3 --retry-delay 2 \
+            -o /artifacts/shimx64.efi  "${NETBOOT_BASE}/bootx64.efi" && \
+        curl -fSL --connect-timeout 10 --retry 3 --retry-delay 2 \
+            -o /artifacts/grubx64.efi  "${NETBOOT_BASE}/grubx64.efi" && \
+        curl -fSL --connect-timeout 10 --retry 3 --retry-delay 2 \
+            -o /artifacts/initrd       "${NETBOOT_BASE}/initrd"; \
     elif [ "${TARGETARCH}" = "arm64" ]; then \
         NETBOOT_URL="https://cdimage.ubuntu.com/releases/noble/release/ubuntu-24.04.4-netboot-arm64.tar.gz"; \
-        curl -fSL -o /tmp/netboot.tar.gz "${NETBOOT_URL}" && \
+        curl -fSL --connect-timeout 10 --retry 3 --retry-delay 2 \
+            -o /tmp/netboot.tar.gz "${NETBOOT_URL}" && \
         tar -xzf /tmp/netboot.tar.gz -C /tmp && \
         cp /tmp/arm64/bootaa64.efi   /artifacts/shimaa64.efi && \
         cp /tmp/arm64/grubaa64.efi   /artifacts/grubaa64.efi && \
@@ -122,11 +141,6 @@ RUN if [ "${TARGETARCH}" = "amd64" ]; then \
         echo "dhcpBootImageName: shimaa64.efi" > /disk/metadata.yaml; \
     fi
 
-# User-data is now a Go template rendered per-node by metalman.
-# The unbounded-agent handles kubelet/containerd/TPM attestation
-# internally, so no attest script injection or kubelet configs are needed.
-COPY images/host-ubuntu2404/assets/user-data.tmpl             /disk/cloud-init/user-data.tmpl
-
 # ── Download and convert Ubuntu cloud image to raw+gzip ─────────────
 # Cloud image URL is parameterized by architecture.
 ARG UBUNTU_CLOUDIMG_URL=https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-${TARGETARCH}.img
@@ -136,14 +150,15 @@ ARG UBUNTU_CLOUDIMG_URL=https://cloud-images.ubuntu.com/releases/noble/release/u
 # (below) so metalman can serve it to other provisioning paths.
 COPY --from=gobuilder /unbounded-agent /tmp/unbounded-agent
 
-RUN curl -fSL -o /tmp/cloudimg.qcow2 "${UBUNTU_CLOUDIMG_URL}" && \
+RUN curl -fSL --connect-timeout 10 --retry 3 --retry-delay 2 \
+        -o /tmp/cloudimg.qcow2 "${UBUNTU_CLOUDIMG_URL}" && \
     qemu-img convert -f qcow2 -O raw /tmp/cloudimg.qcow2 /tmp/disk.img && \
     rm /tmp/cloudimg.qcow2 && \
     LIBGUESTFS_BACKEND=direct virt-customize -a /tmp/disk.img \
         --mkdir /usr/local/bin \
         --copy-in /tmp/unbounded-agent:/usr/local/bin \
         --chmod 0755:/usr/local/bin/unbounded-agent && \
-    gzip -1 /tmp/disk.img && \
+    pigz -1 /tmp/disk.img && \
     mv /tmp/disk.img.gz /disk/disk.img.gz
 
 # ── Agent binary built from source ──────────────────────────────────

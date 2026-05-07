@@ -1,0 +1,23 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: machina-config
+  namespace: {{ default "unbounded-kube" .Namespace }}
+data:
+  config.yaml: |
+    # Machina Controller Configuration
+
+    # Address to bind metrics endpoint
+    metricsAddr: ":8080"
+
+    # Address to bind health probe endpoint
+    probeAddr: ":8081"
+
+    # Enable leader election for high availability
+    enableLeaderElection: false
+
+    # Maximum number of machines to reconcile in parallel. Each worker handles
+    # both reachability probes and SSH provisioning, so when workers are busy
+    # provisioning, reachability probes for other machines are delayed.
+    maxConcurrentReconciles: 50

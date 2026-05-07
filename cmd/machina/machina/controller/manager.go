@@ -16,7 +16,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
-	unboundedv1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
+	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
 
 var scheme = runtime.NewScheme()
@@ -67,6 +67,23 @@ func RunManager(ctx context.Context, cfg Config) error {
 		ProvisioningTimeoutDuration: cfg.ProvisioningTimeout,
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup Machine controller: %w", err)
+	}
+
+	// Setup MachineConfiguration controller - manages versioned config snapshots.
+	if err := (&MachineConfigurationReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("setup MachineConfiguration controller: %w", err)
+	}
+
+	// Setup Machine configuration binding controller - resolves configurationRef
+	// from explicit refs or MachineConfiguration selectors.
+	if err := (&MachineConfigurationBindingReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("setup Machine configuration binding controller: %w", err)
 	}
 
 	// Add health checks

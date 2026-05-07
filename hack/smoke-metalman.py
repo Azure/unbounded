@@ -26,7 +26,7 @@ os.chmod(TMPDIR, 0o755)
 SITE = "smoke"
 NODE_NAME = "smoke-node"
 NODE_NS = "default"
-API_GROUP = "unbounded-kube.io"
+API_GROUP = "unbounded-cloud.io"
 API_VERSION = f"{API_GROUP}/v1alpha3"
 VM_NAME = "unbounded-metal-smoke"
 NET_NAME = "unbounded-metal-smoke"
@@ -45,7 +45,6 @@ SERVE_URL = f"http://{SERVER_IP}:{HTTP_PORT}"
 REGISTRY_PORT = 5555
 REGISTRY_CONTAINER = "unbounded-smoke-registry"
 IMAGE_NAME = f"localhost:{REGISTRY_PORT}/unbounded/host-ubuntu2404:smoke"
-AGENT_IMAGE_DIR = REPO_ROOT / "images" / "agent-ubuntu2404"
 AGENT_IMAGE_NAME = f"localhost:{REGISTRY_PORT}/unbounded/agent-ubuntu2404:smoke"
 # The agent runs inside a VM on an isolated libvirt network. "localhost" inside
 # the VM resolves to the VM's own loopback, not the host.  Use the host's
@@ -55,12 +54,13 @@ BINARY = REPO_ROOT / "bin" / "metalman"
 KUBECTL_UNBOUNDED = REPO_ROOT / "bin" / "kubectl-unbounded"
 SERIAL_SOCK = TMPDIR / "console.sock"
 QGA_SOCK = TMPDIR / "qga.sock"
+# The nspawn machine name used by the agent (must match the constant in
+# cmd/agent/internal/goalstates/constants.go - NSpawnMachineKube1).
+NSPAWN_MACHINE = "kube1"
 
 KUBECTL = "kubectl"
 VIRSH = ["virsh", "--connect", "qemu:///system"]
 DEVNULL = subprocess.DEVNULL
-
-IMAGE_DIR = REPO_ROOT / "images" / "host-ubuntu2404"
 
 _procs: list[subprocess.Popen[Any]] = []
 
@@ -217,17 +217,17 @@ def collect_debug_logs() -> None:
         ("systemctl status", "systemctl --no-pager status"),
         ("unbounded-agent journal", "journalctl --no-pager -n 200 -u cloud-final.service"),
         ("machinectl list", "machinectl list --no-pager"),
-        ("nspawn machine status", f"machinectl status {NODE_NAME} --no-pager"),
+        ("nspawn machine status", f"machinectl status {NSPAWN_MACHINE} --no-pager"),
         ("kubelet journal (nspawn)", (
-            f"systemd-run --pipe --wait --machine={NODE_NAME} "
+            f"systemd-run --pipe --wait --machine={NSPAWN_MACHINE} "
             "journalctl --no-pager -n 200 -u kubelet.service"
         )),
         ("containerd journal (nspawn)", (
-            f"systemd-run --pipe --wait --machine={NODE_NAME} "
+            f"systemd-run --pipe --wait --machine={NSPAWN_MACHINE} "
             "journalctl --no-pager -n 100 -u containerd.service"
         )),
         ("kubelet service status (nspawn)", (
-            f"systemd-run --pipe --wait --machine={NODE_NAME} "
+            f"systemd-run --pipe --wait --machine={NSPAWN_MACHINE} "
             "systemctl --no-pager status kubelet.service"
         )),
     ]
@@ -243,6 +243,30 @@ def collect_debug_logs() -> None:
                 sys.stderr.flush()
         except (RuntimeError, TimeoutError, subprocess.TimeoutExpired, OSError) as e:
             log(f"  (failed to collect {label}: {e})")
+
+    # Kubernetes-side diagnostics (run from the host via kubectl).
+    k8s_commands = [
+        ("kubectl describe node", [KUBECTL, "describe", "node", NODE_NAME]),
+        ("kubectl get pods -A", [KUBECTL, "get", "pods", "-A", "-o", "wide"]),
+        ("kubectl get events", [
+            KUBECTL, "get", "events", "-A", "--sort-by=.lastTimestamp",
+        ]),
+    ]
+    for label, cmd in k8s_commands:
+        log(f"  --- {label} ---")
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=15,
+            )
+            if result.stdout:
+                sys.stderr.write(result.stdout)
+                sys.stderr.flush()
+            if result.stderr:
+                sys.stderr.write(result.stderr)
+                sys.stderr.flush()
+        except Exception as e:
+            log(f"  (failed to collect {label}: {e})")
+
     log("  --- end debug logs ---")
 
 
@@ -326,22 +350,16 @@ def apiserver_url() -> str:
     url = result.stdout.strip()
 
     # When running against a kind cluster the kubeconfig points at
-    # 127.0.0.1:<nodeport> which is unreachable from the VM.  Detect this
-    # and rewrite to the kind container's internal IP on port 6443.
+    # 127.0.0.1:<nodeport> which is unreachable from the VM.  Rewrite to
+    # KIND_SMOKE_IP which is the kind container's address on virbr-smoke,
+    # the same L2 network the VM is on.  The Docker bridge IP
+    # (172.18.0.x) is NOT routable from the VM because iptables isolation
+    # rules block forwarding between bridges.
     from urllib.parse import urlparse
     parsed = urlparse(url)
     if parsed.hostname in ("127.0.0.1", "localhost", "::1"):
-        try:
-            ip = run(
-                ["docker", "inspect", "kind-control-plane",
-                 "--format", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}"],
-                capture_output=True, text=True,
-            ).stdout.strip()
-            if ip:
-                url = f"{parsed.scheme}://{ip}:6443"
-                log(f"  Rewrote apiserver URL to {url} (kind container IP)")
-        except subprocess.CalledProcessError:
-            pass
+        url = f"{parsed.scheme}://{KIND_SMOKE_IP}:6443"
+        log(f"  Rewrote apiserver URL to {url} (kind container on virbr-smoke)")
 
     return url
 
@@ -422,9 +440,53 @@ def wait_k8s_node(name: str, timeout: int = 1800) -> None:
     die(f"Timed out waiting for Node '{name}'")
 
 
-def assert_node_ready(name: str, timeout: int = 300) -> None:
-    """Assert the Node reaches Ready status within timeout seconds."""
+def _restart_crashing_pods(node_name: str, namespace: str, label: str) -> None:
+    """Delete pods matching *label* on *node_name* that are in CrashLoopBackOff.
+
+    This resets the exponential backoff timer so the pod gets a fresh start.
+    Useful when a DaemonSet pod crashes transiently during node initialization
+    (e.g. kindnet racing with network setup on a QEMU VM).
+    """
+    result = subprocess.run(
+        [KUBECTL, "get", "pods", "-n", namespace,
+         "-l", label, "--field-selector", f"spec.nodeName={node_name}",
+         "-o", "json"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return
+
+    pods = json.loads(result.stdout).get("items", [])
+    for pod in pods:
+        for cs in pod.get("status", {}).get("containerStatuses", []):
+            if cs.get("ready"):
+                continue
+            waiting = cs.get("state", {}).get("waiting", {})
+            restart_count = cs.get("restartCount", 0)
+            if restart_count >= 2 or waiting.get("reason") == "CrashLoopBackOff":
+                pod_name = pod["metadata"]["name"]
+                log(f"    Deleting crashing pod {pod_name} "
+                    f"(restarts={restart_count}) to reset backoff")
+                subprocess.run(
+                    [KUBECTL, "delete", "pod", "-n", namespace, pod_name,
+                     "--grace-period=0", "--force"],
+                    capture_output=True, text=True,
+                )
+
+
+def assert_node_ready(name: str, timeout: int = 480) -> None:
+    """Assert the Node reaches Ready status within timeout seconds.
+
+    The timeout must be generous enough to survive multiple kindnet
+    CrashLoopBackOff cycles.  In CI each kindnet pod runs for ~2 min
+    before crashing; with a restart threshold of 2 and a 30s check
+    interval, each cycle (crash -> detect -> delete -> new pod start)
+    takes ~90-120s.  480s accommodates 3 full cycles plus ~60s for the
+    final pod to write the CNI config and the kubelet to detect it.
+    """
     log(f"  Waiting for Node '{name}' to become Ready...")
+    pod_restart_interval = 30  # seconds between CrashLoopBackOff resets
+    last_restart_attempt = 0
     for elapsed in range(timeout):
         check_procs()
         result = subprocess.run(
@@ -437,8 +499,58 @@ def assert_node_ready(name: str, timeout: int = 300) -> None:
             return
         if elapsed > 0 and elapsed % 30 == 0:
             log(f"    ({elapsed}s) Node not yet Ready")
+        # Periodically reset CrashLoopBackOff on critical DaemonSet pods.
+        # Kindnet can fail transiently when the VM's network is still
+        # initializing; deleting the pod resets the backoff timer and
+        # lets the DaemonSet controller schedule a fresh attempt.
+        if elapsed >= 30 and elapsed - last_restart_attempt >= pod_restart_interval:
+            _restart_crashing_pods(name, "kube-system", "app=kindnet")
+            last_restart_attempt = elapsed
         time.sleep(1)
     die(f"Timed out waiting for Node '{name}' to become Ready")
+
+
+def assert_cloud_init_done(timeout: int = 900) -> None:
+    """Assert the Machine's CloudInitDone condition reaches True/Succeeded.
+
+    Called before waiting for the Kubernetes Node to appear because
+    cloud-init must finish before the kubelet can join the cluster.
+    Fails fast if the condition transitions to Failed so that the
+    smoke test does not wait for the full node-join timeout.
+    """
+    log(f"  Waiting for Machine '{NODE_NAME}' CloudInitDone condition...")
+    for elapsed in range(timeout):
+        check_procs()
+        result = subprocess.run(
+            [KUBECTL, "get", f"machines.{API_GROUP}", NODE_NAME, "-o", "json"],
+            capture_output=True, text=True,
+        )
+        status = ""
+        reason = ""
+        message = ""
+        if result.returncode == 0:
+            try:
+                conditions = json.loads(result.stdout).get("status", {}).get("conditions", [])
+                for c in conditions:
+                    if c.get("type") == "CloudInitDone":
+                        status = c.get("status", "")
+                        reason = c.get("reason", "")
+                        message = c.get("message", "")
+                        break
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+        if status == "True":
+            if reason != "Succeeded":
+                die(f"CloudInitDone condition is True but reason is {reason!r}, expected 'Succeeded'")
+            log(f"  Machine '{NODE_NAME}' CloudInitDone condition is True/Succeeded")
+            return
+        if status == "False" and reason == "Failed":
+            die(f"Cloud-init failed: {message}")
+        if elapsed > 0 and elapsed % 30 == 0:
+            log(f"    ({elapsed}s) CloudInitDone status={status or 'not set'} reason={reason or 'not set'}")
+        time.sleep(1)
+    die(f"Timed out waiting for CloudInitDone condition on Machine '{NODE_NAME}'")
 
 
 def main() -> None:
@@ -504,14 +616,15 @@ def main() -> None:
 
     # Kindnet's CONTROL_PLANE_ENDPOINT defaults to "kind-control-plane:6443"
     # which is unresolvable from the bare-metal VM (it's not in Docker's DNS).
-    # Patch it to use the kind container's Docker IP which the VM can reach
-    # through its default gateway.
+    # Patch it to use KIND_SMOKE_IP. The API server's TLS cert SANs (set in
+    # kind-smoke-config.yaml) only cover this IP, 127.0.0.1, and localhost.
+    # Using the Docker bridge IP (kind_ip) would cause TLS verification failures.
     log("Patching kindnet DaemonSet for VM-reachable control plane endpoint")
     patch = json.dumps({
         "spec": {"template": {"spec": {"containers": [{
             "name": "kindnet-cni",
             "env": [
-                {"name": "CONTROL_PLANE_ENDPOINT", "value": f"{kind_ip}:6443"},
+                {"name": "CONTROL_PLANE_ENDPOINT", "value": f"{KIND_SMOKE_IP}:6443"},
             ],
         }]}}}
     })
@@ -564,10 +677,27 @@ def main() -> None:
     time.sleep(2)
     check_procs()
 
-    log("Building metalman and kubectl-unbounded")
-    run(["go", "build", "-o", str(BINARY), "./cmd/metalman"], cwd=str(REPO_ROOT))
-    run(["go", "build", "-o", str(KUBECTL_UNBOUNDED), "./cmd/kubectl-unbounded"], cwd=str(REPO_ROOT))
+    # Start Go builds in the background so they overlap with Kubernetes
+    # setup and Docker image builds.  Both targets share the Go build
+    # cache, so concurrent compilation is safe and efficient.
+    # stdout/stderr are inherited so build output streams to the CI log
+    # in real-time.
+    log("Rendering machina and net manifests")
+    run(["make", "machina-manifests", "net-manifests"], cwd=str(REPO_ROOT))
 
+    log("Building metalman and kubectl-unbounded (parallel)")
+    go_builds: list[tuple[str, subprocess.Popen[Any]]] = [
+        ("metalman", subprocess.Popen(
+            ["go", "build", "-o", str(BINARY), "./cmd/metalman"],
+            cwd=str(REPO_ROOT),
+        )),
+        ("kubectl-unbounded", subprocess.Popen(
+            ["go", "build", "-o", str(KUBECTL_UNBOUNDED), "./cmd/kubectl-unbounded"],
+            cwd=str(REPO_ROOT),
+        )),
+    ]
+
+    # Kubernetes setup runs while Go builds are in progress.
     log("Cleaning up stale Kubernetes resources")
     run_quiet([KUBECTL, "-n", NODE_NS, "delete", "secret", "bmc-pass"])
     run_quiet([KUBECTL, "delete", f"machines.{API_GROUP}", NODE_NAME])
@@ -577,9 +707,9 @@ def main() -> None:
     run_quiet([KUBECTL, "delete", "crd", f"machines.{API_GROUP}"])
 
     log("Applying deploy manifests (CRDs, namespace, RBAC)")
-    kubectl(["apply", "--server-side", "--force-conflicts", "-f", str(REPO_ROOT / "deploy" / "machina" / "01-namespace.yaml")])
+    kubectl(["apply", "--server-side", "--force-conflicts", "-f", str(REPO_ROOT / "deploy" / "machina" / "rendered" / "01-namespace.yaml")])
     kubectl(["apply", "--server-side", "--force-conflicts", "-f", str(REPO_ROOT / "deploy" / "machina" / "crd")])
-    kubectl(["apply", "--server-side", "--force-conflicts", "-f", str(REPO_ROOT / "deploy" / "machina" / "06-metalman-rbac.yaml")])
+    kubectl(["apply", "--server-side", "--force-conflicts", "-f", str(REPO_ROOT / "deploy" / "machina" / "rendered" / "06-metalman-rbac.yaml")])
 
     log("Creating Kubernetes resources")
     kubectl(["-n", NODE_NS, "create", "secret", "generic",
@@ -600,18 +730,31 @@ def main() -> None:
     else:
         die("Local OCI registry did not become ready")
 
-    log("Building host-ubuntu2404 OCI image")
-    run(["docker", "build", "-t", IMAGE_NAME,
-         "-f", str(IMAGE_DIR / "Containerfile"), str(REPO_ROOT)])
+    # Both Docker images (host-ubuntu2404 and agent-ubuntu2404) are pre-built
+    # by the GitHub Actions workflow using docker/build-push-action with GHA
+    # layer caching.  They are already loaded into the local Docker daemon
+    # with the correct tags (IMAGE_NAME and AGENT_IMAGE_NAME).
+    log("Verifying pre-built OCI images are available")
+    for name, tag in [("host-ubuntu2404", IMAGE_NAME),
+                      ("agent-ubuntu2404", AGENT_IMAGE_NAME)]:
+        result = subprocess.run(
+            ["docker", "image", "inspect", tag],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            die(f"Pre-built image {tag} not found in local Docker daemon. "
+                "Ensure the workflow builds it before running this script.")
+        log(f"  {name} image found: {tag}")
 
-    log("Pushing host-ubuntu2404 OCI image to local registry")
+    # Wait for Go builds (likely already finished during k8s setup).
+    for name, proc in go_builds:
+        rc = proc.wait()
+        if rc != 0:
+            die(f"go build {name} failed (exit code {rc})")
+    log("  Go builds finished")
+
+    log("Pushing OCI images to local registry")
     run(["docker", "push", IMAGE_NAME])
-
-    log("Building agent-ubuntu2404 OCI image")
-    run(["docker", "build", "-t", AGENT_IMAGE_NAME,
-         "-f", str(AGENT_IMAGE_DIR / "Containerfile"), str(AGENT_IMAGE_DIR)])
-
-    log("Pushing agent-ubuntu2404 OCI image to local registry")
     run(["docker", "push", AGENT_IMAGE_NAME])
 
     # Reclaim disk space consumed by Docker build cache.  The host-ubuntu2404
@@ -672,16 +815,19 @@ def main() -> None:
     time.sleep(2)
     check_procs()
 
-    log("Triggering reimage")
-    run([str(KUBECTL_UNBOUNDED), "machine", "reimage", NODE_NAME])
+    log("Triggering repave")
+    run([str(KUBECTL_UNBOUNDED), "machine", "repave", NODE_NAME])
 
     # Log free space so we can correlate disk exhaustion with VM failures.
     df = subprocess.run(["df", "-h", str(TMPDIR)], capture_output=True, text=True)
     log(f"  Host disk after image builds:\n{df.stdout.strip()}")
 
+    log("Waiting for cloud-init to complete...")
+    assert_cloud_init_done(timeout=900)
+
     log("Waiting for kubelet to join the cluster...")
     wait_k8s_node(NODE_NAME, timeout=900)
-    assert_node_ready(NODE_NAME, timeout=300)
+    assert_node_ready(NODE_NAME, timeout=480)
 
     log("")
     log("Smoke test PASSED")

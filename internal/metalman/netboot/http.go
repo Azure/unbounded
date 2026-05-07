@@ -16,9 +16,10 @@ import (
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	v1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
+	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
 
 // cloudInitEvent represents a cloud-init webhook reporting event.
@@ -160,7 +161,97 @@ func (h *HTTPServer) handleCloudInitLog(w http.ResponseWriter, r *http.Request) 
 		log.Info("cloud-init event", "type", ev.EventType, "description", ev.Description)
 	}
 
+	h.updateCloudInitCondition(r.Context(), log, ip, &ev)
+
 	w.WriteHeader(http.StatusOK)
+}
+
+// cloudInitLastStage is the final cloud-init stage. When this stage
+// finishes successfully the CloudInitDone condition transitions to True.
+const cloudInitLastStage = "modules-final"
+
+// updateCloudInitCondition sets the CloudInitDone condition on the Machine
+// that matches the request source IP. The condition reflects the
+// cloud-init lifecycle reported through webhook events:
+func (h *HTTPServer) updateCloudInitCondition(ctx context.Context, log *slog.Logger, ip string, ev *cloudInitEvent) {
+	if h.Client == nil {
+		return
+	}
+
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		node, err := h.LookupNodeByIP(ctx, ip)
+		if err != nil {
+			return err
+		}
+
+		cond := buildCloudInitCondition(ev, node.Generation)
+		if cond == nil {
+			return nil
+		}
+
+		// TODO(jordan): Rename all `node` references in this file to `machine`
+		meta.SetStatusCondition(&node.Status.Conditions, *cond)
+
+		return h.Client.Status().Update(ctx, node)
+	})
+	if err != nil {
+		log.Error("cloud-init condition: updating Machine status", "ip", ip, "err", err)
+	}
+}
+
+const maxConditionMessageLen = 1024
+
+// buildCloudInitCondition returns the metav1.Condition to set for a
+// cloud-init webhook event, or nil if no update is needed.
+func buildCloudInitCondition(ev *cloudInitEvent, generation int64) *metav1.Condition {
+	switch ev.EventType {
+	case "start":
+		return &metav1.Condition{
+			Type:               v1alpha3.MachineConditionCloudInitDone,
+			Status:             metav1.ConditionFalse,
+			Reason:             "Running",
+			Message:            fmt.Sprintf("stage %q started: %s", ev.Name, ev.Description),
+			ObservedGeneration: generation,
+		}
+
+	case "finish":
+		if !strings.EqualFold(ev.Result, "SUCCESS") {
+			msg := fmt.Sprintf("stage %q failed with result %q: %s", ev.Name, ev.Result, ev.Description)
+			if len(msg) > maxConditionMessageLen {
+				msg = msg[:maxConditionMessageLen-3] + "..."
+			}
+
+			return &metav1.Condition{
+				Type:               v1alpha3.MachineConditionCloudInitDone,
+				Status:             metav1.ConditionFalse,
+				Reason:             "Failed",
+				Message:            msg,
+				ObservedGeneration: generation,
+			}
+		}
+
+		if ev.Name == cloudInitLastStage {
+			return &metav1.Condition{
+				Type:               v1alpha3.MachineConditionCloudInitDone,
+				Status:             metav1.ConditionTrue,
+				Reason:             "Succeeded",
+				Message:            "cloud-init completed successfully",
+				ObservedGeneration: generation,
+			}
+		}
+
+		// An earlier stage succeeded - cloud-init is still running.
+		return &metav1.Condition{
+			Type:               v1alpha3.MachineConditionCloudInitDone,
+			Status:             metav1.ConditionFalse,
+			Reason:             "Running",
+			Message:            fmt.Sprintf("stage %q finished successfully, waiting for remaining stages", ev.Name),
+			ObservedGeneration: generation,
+		}
+
+	default:
+		return nil
+	}
 }
 
 func (h *HTTPServer) handleDisablePXE(w http.ResponseWriter, r *http.Request) {
@@ -175,17 +266,17 @@ func (h *HTTPServer) handleDisablePXE(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var specReimage, statusReimage int64
+	var specRepave, statusRepave int64
 	if node.Spec.Operations != nil {
-		specReimage = node.Spec.Operations.ReimageCounter
+		specRepave = node.Spec.Operations.RepaveCounter
 	}
 
 	if node.Status.Operations != nil {
-		statusReimage = node.Status.Operations.ReimageCounter
+		statusRepave = node.Status.Operations.RepaveCounter
 	}
 
-	if specReimage <= statusReimage {
-		log.Info("reimage already cleared", "node", node.Name)
+	if specRepave <= statusRepave {
+		log.Info("repave already cleared", "node", node.Name)
 		w.WriteHeader(http.StatusOK)
 
 		return
@@ -195,7 +286,7 @@ func (h *HTTPServer) handleDisablePXE(w http.ResponseWriter, r *http.Request) {
 		node.Status.Operations = &v1alpha3.OperationsStatus{}
 	}
 
-	node.Status.Operations.ReimageCounter = specReimage
+	node.Status.Operations.RepaveCounter = specRepave
 
 	imageName := ""
 	if node.Spec.PXE != nil {
@@ -203,7 +294,7 @@ func (h *HTTPServer) handleDisablePXE(w http.ResponseWriter, r *http.Request) {
 	}
 
 	meta.SetStatusCondition(&node.Status.Conditions, metav1.Condition{
-		Type:               v1alpha3.MachineConditionReimaged,
+		Type:               v1alpha3.MachineConditionRepaved,
 		Status:             metav1.ConditionTrue,
 		Reason:             "Succeeded",
 		Message:            "image=" + imageName,
@@ -217,7 +308,7 @@ func (h *HTTPServer) handleDisablePXE(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Info("reimage cleared", "node", node.Name)
+	log.Info("repave cleared", "node", node.Name)
 	w.WriteHeader(http.StatusOK)
 }
 

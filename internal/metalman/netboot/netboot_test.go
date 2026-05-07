@@ -17,13 +17,15 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
-	v1alpha3 "github.com/Azure/unbounded-kube/api/v1alpha3"
-	"github.com/Azure/unbounded-kube/internal/metalman/indexing"
+	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/metalman/indexing"
 )
 
 func newScheme(t *testing.T) *runtime.Scheme {
@@ -31,6 +33,10 @@ func newScheme(t *testing.T) *runtime.Scheme {
 
 	s := runtime.NewScheme()
 	if err := v1alpha3.AddToScheme(s); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := corev1.AddToScheme(s); err != nil {
 		t.Fatal(err)
 	}
 
@@ -87,7 +93,7 @@ func TestHTTPServer_ServeFiles(t *testing.T) {
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:01", IPv4: "10.0.1.50", SubnetMask: "255.255.255.0"}},
 			},
-			Operations: &v1alpha3.OperationsSpec{ReimageCounter: 1},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
 		},
 	}
 
@@ -197,7 +203,7 @@ menuentry "Install" {
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:f0", IPv4: "10.0.1.10", SubnetMask: "255.255.255.0"}},
 			},
-			Operations: &v1alpha3.OperationsSpec{ReimageCounter: 1},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
 		},
 	}
 
@@ -254,7 +260,7 @@ func TestHTTPServer_TemplateVerbatim(t *testing.T) {
 
 	// Static file (no .tmpl suffix) served verbatim from disk
 	cache := setupOCICache(t, "ghcr.io/test/image:v1", "verb123", map[string][]byte{
-		"cloud-init/user-data": []byte(staticConfig),
+		"cloud-init/network-config": []byte(staticConfig),
 	})
 
 	node := &v1alpha3.Machine{
@@ -264,7 +270,7 @@ func TestHTTPServer_TemplateVerbatim(t *testing.T) {
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:02", IPv4: "10.0.1.51", SubnetMask: "255.255.255.0"}},
 			},
-			Operations: &v1alpha3.OperationsSpec{ReimageCounter: 1},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
 		},
 	}
 
@@ -288,7 +294,7 @@ func TestHTTPServer_TemplateVerbatim(t *testing.T) {
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 
-	req, _ := http.NewRequest("GET", ts.URL+"/cloud-init/user-data", nil)
+	req, _ := http.NewRequest("GET", ts.URL+"/cloud-init/network-config", nil)
 	req.Header.Set("X-Forwarded-For", "10.0.1.51")
 
 	resp, err := http.DefaultClient.Do(req)
@@ -312,7 +318,7 @@ func TestHTTPServer_StaticFile(t *testing.T) {
 	staticContent := "autoinstall:\n  version: 1\n  identity:\n    hostname: server\n"
 
 	cache := setupOCICache(t, "ghcr.io/test/image:v1", "static123", map[string][]byte{
-		"cloud-init/user-data": []byte(staticContent),
+		"cloud-init/network-config": []byte(staticContent),
 	})
 
 	node := &v1alpha3.Machine{
@@ -322,7 +328,7 @@ func TestHTTPServer_StaticFile(t *testing.T) {
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:03", IPv4: "10.0.1.52", SubnetMask: "255.255.255.0"}},
 			},
-			Operations: &v1alpha3.OperationsSpec{ReimageCounter: 1},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
 		},
 	}
 
@@ -346,7 +352,7 @@ func TestHTTPServer_StaticFile(t *testing.T) {
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 
-	req, _ := http.NewRequest("GET", ts.URL+"/cloud-init/user-data", nil)
+	req, _ := http.NewRequest("GET", ts.URL+"/cloud-init/network-config", nil)
 	req.Header.Set("X-Forwarded-For", "10.0.1.52")
 
 	resp, err := http.DefaultClient.Do(req)
@@ -473,10 +479,10 @@ func TestTemplateRendering_AgentConfigJSONUnset(t *testing.T) {
 	}
 }
 
-func TestUserDataTemplate_WithAgentImage(t *testing.T) {
-	userDataTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "host-ubuntu2404", "assets", "user-data.tmpl"))
+func TestVendorDataTemplate_WithAgentImage(t *testing.T) {
+	vendorDataTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "host-ubuntu2404", "assets", "vendor-data.tmpl"))
 	if err != nil {
-		t.Fatalf("reading user-data.tmpl: %v", err)
+		t.Fatalf("reading vendor-data.tmpl: %v", err)
 	}
 
 	agentConfigJSON := `{
@@ -506,25 +512,51 @@ func TestUserDataTemplate_WithAgentImage(t *testing.T) {
 		AgentConfigJSON: agentConfigJSON,
 	}
 
-	result, err := renderTemplate(string(userDataTmpl), data)
+	result, err := renderTemplate(string(vendorDataTmpl), data)
 	if err != nil {
 		t.Fatalf("renderTemplate: %v", err)
 	}
 
 	body := string(result)
 	if !strings.Contains(body, `"OCIImage": "ghcr.io/org/rootfs:v1"`) {
-		t.Errorf("expected OCIImage in rendered user-data, got:\n%s", body)
+		t.Errorf("expected OCIImage in rendered vendor-data, got:\n%s", body)
 	}
 
 	if !strings.Contains(body, `"MachineName": "agent-img-node"`) {
-		t.Errorf("expected MachineName in rendered user-data, got:\n%s", body)
+		t.Errorf("expected MachineName in rendered vendor-data, got:\n%s", body)
+	}
+
+	if !strings.Contains(body, "unbounded-agent start") {
+		t.Errorf("expected unbounded-agent start in rendered vendor-data, got:\n%s", body)
+	}
+
+	if !strings.Contains(body, "/cloudinit/log") {
+		t.Errorf("expected webhook reporting endpoint in rendered vendor-data, got:\n%s", body)
+	}
+
+	// Hardening drop-ins: the vendor-data must lay down apt and needrestart
+	// drop-ins that prevent unattended-upgrades from restarting
+	// systemd-machined out from under the running nspawn container. See
+	// cmd/agent/internal/phases/host/apt.go for the matching agent-side
+	// task that also writes these files.
+	for _, want := range []string{
+		"/etc/apt/apt.conf.d/99-unbounded-no-restart-systemd",
+		"Unattended-Upgrade::Package-Blacklist",
+		`"libcap2";`,
+		`"systemd-container";`,
+		"/etc/needrestart/conf.d/99-unbounded.conf",
+		"$nrconf{restart} = 'l';",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("expected %q in rendered vendor-data, got:\n%s", want, body)
+		}
 	}
 }
 
-func TestUserDataTemplate_WithoutAgentImage(t *testing.T) {
-	userDataTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "host-ubuntu2404", "assets", "user-data.tmpl"))
+func TestVendorDataTemplate_WithoutAgentImage(t *testing.T) {
+	vendorDataTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "host-ubuntu2404", "assets", "vendor-data.tmpl"))
 	if err != nil {
-		t.Fatalf("reading user-data.tmpl: %v", err)
+		t.Fatalf("reading vendor-data.tmpl: %v", err)
 	}
 
 	agentConfigJSON := `{
@@ -553,18 +585,533 @@ func TestUserDataTemplate_WithoutAgentImage(t *testing.T) {
 		AgentConfigJSON: agentConfigJSON,
 	}
 
-	result, err := renderTemplate(string(userDataTmpl), data)
+	result, err := renderTemplate(string(vendorDataTmpl), data)
 	if err != nil {
 		t.Fatalf("renderTemplate: %v", err)
 	}
 
 	body := string(result)
 	if strings.Contains(body, "OCIImage") {
-		t.Errorf("expected no OCIImage in rendered user-data when AgentImage is empty, got:\n%s", body)
+		t.Errorf("expected no OCIImage in rendered vendor-data when AgentImage is empty, got:\n%s", body)
 	}
 
 	if !strings.Contains(body, `"MachineName": "no-agent-node"`) {
-		t.Errorf("expected MachineName in rendered user-data, got:\n%s", body)
+		t.Errorf("expected MachineName in rendered vendor-data, got:\n%s", body)
+	}
+}
+
+func TestResolveFileByPath_UserDataFromConfigMap(t *testing.T) {
+	customUserData := "#cloud-config\nssh_authorized_keys:\n  - ssh-rsa AAAA...\npackages:\n  - vim\n"
+
+	cache := setupOCICache(t, "ghcr.io/test/image:v1", "cmud123", map[string][]byte{
+		"vmlinuz": []byte("kernel"),
+	})
+
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-userdata",
+			Namespace: "default",
+		},
+		Data: map[string]string{
+			"user-data": customUserData,
+		},
+	}
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-cm-ud"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:40", IPv4: "10.0.8.10", SubnetMask: "255.255.255.0"}},
+				CloudInit: &v1alpha3.CloudInitSpec{
+					UserDataConfigMapRef: &v1alpha3.ConfigMapKeySelector{
+						Name:      "my-userdata",
+						Namespace: "default",
+						Key:       "user-data",
+					},
+				},
+			},
+		},
+	}
+
+	scheme := newScheme(t)
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node, cm).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+
+	resolver := FileResolver{
+		Cache:  cache,
+		Reader: fc,
+		Cluster: &StaticClusterInfo{Info: ClusterInfo{
+			ApiserverURL: "https://k8s.example.com",
+		}},
+		ServeURL: "http://10.0.8.1:8080",
+	}
+
+	resolved, err := resolver.ResolveFileByPath(t.Context(), "cloud-init/user-data", node, "ghcr.io/test/image:v1")
+	if err != nil {
+		t.Fatalf("ResolveFileByPath: %v", err)
+	}
+
+	if string(resolved.Data) != customUserData {
+		t.Errorf("expected ConfigMap user-data, got %q", resolved.Data)
+	}
+}
+
+func TestResolveFileByPath_UserDataFallsBackToDefault(t *testing.T) {
+	cache := setupOCICache(t, "ghcr.io/test/image:v1", "fblud123", map[string][]byte{
+		"vmlinuz": []byte("kernel"),
+	})
+
+	// Node without cloudInit configured — should return the built-in default.
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-no-cm"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:41", IPv4: "10.0.8.11", SubnetMask: "255.255.255.0"}},
+			},
+		},
+	}
+
+	scheme := newScheme(t)
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+
+	resolver := FileResolver{
+		Cache:  cache,
+		Reader: fc,
+		Cluster: &StaticClusterInfo{Info: ClusterInfo{
+			ApiserverURL: "https://k8s.example.com",
+		}},
+		ServeURL: "http://10.0.8.1:8080",
+	}
+
+	resolved, err := resolver.ResolveFileByPath(t.Context(), "cloud-init/user-data", node, "ghcr.io/test/image:v1")
+	if err != nil {
+		t.Fatalf("ResolveFileByPath: %v", err)
+	}
+
+	if resolved.DiskPath != "" {
+		t.Errorf("expected no DiskPath for default user-data, got %q", resolved.DiskPath)
+	}
+
+	if string(resolved.Data) != defaultUserData {
+		t.Errorf("expected default user-data %q, got %q", defaultUserData, resolved.Data)
+	}
+}
+
+func TestResolveFileByPath_UserDataConfigMapCustomKey(t *testing.T) {
+	customUserData := "#cloud-config\npackages:\n  - htop\n"
+
+	cache := setupOCICache(t, "ghcr.io/test/image:v1", "cmkey123", map[string][]byte{
+		"vmlinuz": []byte("kernel"),
+	})
+
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "multi-key-cm",
+			Namespace: "infra",
+		},
+		Data: map[string]string{
+			"my-custom-key": customUserData,
+		},
+	}
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-custom-key"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:42", IPv4: "10.0.8.12", SubnetMask: "255.255.255.0"}},
+				CloudInit: &v1alpha3.CloudInitSpec{
+					UserDataConfigMapRef: &v1alpha3.ConfigMapKeySelector{
+						Name:      "multi-key-cm",
+						Namespace: "infra",
+						Key:       "my-custom-key",
+					},
+				},
+			},
+		},
+	}
+
+	scheme := newScheme(t)
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node, cm).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+
+	resolver := FileResolver{
+		Cache:  cache,
+		Reader: fc,
+		Cluster: &StaticClusterInfo{Info: ClusterInfo{
+			ApiserverURL: "https://k8s.example.com",
+		}},
+		ServeURL: "http://10.0.8.1:8080",
+	}
+
+	resolved, err := resolver.ResolveFileByPath(t.Context(), "cloud-init/user-data", node, "ghcr.io/test/image:v1")
+	if err != nil {
+		t.Fatalf("ResolveFileByPath: %v", err)
+	}
+
+	if string(resolved.Data) != customUserData {
+		t.Errorf("expected custom-key user-data, got %q", resolved.Data)
+	}
+}
+
+func TestResolveFileByPath_UserDataConfigMapMissing(t *testing.T) {
+	cache := setupOCICache(t, "ghcr.io/test/image:v1", "cmmiss123", map[string][]byte{
+		"vmlinuz": []byte("kernel"),
+	})
+
+	// ConfigMap doesn't exist — should fall back to default cloud-init.
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-cm-missing"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:43", IPv4: "10.0.8.13", SubnetMask: "255.255.255.0"}},
+				CloudInit: &v1alpha3.CloudInitSpec{
+					UserDataConfigMapRef: &v1alpha3.ConfigMapKeySelector{
+						Name:      "nonexistent",
+						Namespace: "default",
+					},
+				},
+			},
+		},
+	}
+
+	scheme := newScheme(t)
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+
+	resolver := FileResolver{
+		Cache:  cache,
+		Reader: fc,
+	}
+
+	resolved, err := resolver.ResolveFileByPath(t.Context(), "cloud-init/user-data", node, "ghcr.io/test/image:v1")
+	if err != nil {
+		t.Fatalf("expected fallback to default user-data, got error: %v", err)
+	}
+
+	if string(resolved.Data) != defaultUserData {
+		t.Errorf("expected default user-data %q, got %q", defaultUserData, resolved.Data)
+	}
+}
+
+func TestResolveFileByPath_UserDataConfigMapGetError(t *testing.T) {
+	cache := setupOCICache(t, "ghcr.io/test/image:v1", "cmerr123", map[string][]byte{
+		"vmlinuz": []byte("kernel"),
+	})
+
+	// Node references a ConfigMap, but the client returns a non-NotFound error.
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-cm-err"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:45", IPv4: "10.0.8.15", SubnetMask: "255.255.255.0"}},
+				CloudInit: &v1alpha3.CloudInitSpec{
+					UserDataConfigMapRef: &v1alpha3.ConfigMapKeySelector{
+						Name:      "some-cm",
+						Namespace: "default",
+					},
+				},
+			},
+		},
+	}
+
+	scheme := newScheme(t)
+	injectedErr := fmt.Errorf("simulated network timeout")
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if _, ok := obj.(*corev1.ConfigMap); ok {
+					return injectedErr
+				}
+
+				return c.Get(ctx, key, obj, opts...)
+			},
+		}).
+		Build()
+
+	resolver := FileResolver{
+		Cache:  cache,
+		Reader: fc,
+	}
+
+	_, err := resolver.ResolveFileByPath(t.Context(), "cloud-init/user-data", node, "ghcr.io/test/image:v1")
+	if err == nil {
+		t.Fatal("expected error for non-NotFound client failure, got nil")
+	}
+
+	if !strings.Contains(err.Error(), "simulated network timeout") {
+		t.Errorf("expected error to contain injected message, got: %v", err)
+	}
+}
+
+func TestResolveFileByPath_UserDataConfigMapMissingKey(t *testing.T) {
+	cache := setupOCICache(t, "ghcr.io/test/image:v1", "cmnokey123", map[string][]byte{
+		"vmlinuz": []byte("kernel"),
+	})
+
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "wrong-key-cm",
+			Namespace: "default",
+		},
+		Data: map[string]string{
+			"other-key": "some data",
+		},
+	}
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-cm-nokey"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:44", IPv4: "10.0.8.14", SubnetMask: "255.255.255.0"}},
+				CloudInit: &v1alpha3.CloudInitSpec{
+					UserDataConfigMapRef: &v1alpha3.ConfigMapKeySelector{
+						Name:      "wrong-key-cm",
+						Namespace: "default",
+						Key:       "user-data",
+					},
+				},
+			},
+		},
+	}
+
+	scheme := newScheme(t)
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node, cm).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+
+	resolver := FileResolver{
+		Cache:  cache,
+		Reader: fc,
+	}
+
+	_, err := resolver.ResolveFileByPath(t.Context(), "cloud-init/user-data", node, "ghcr.io/test/image:v1")
+	if err == nil {
+		t.Fatal("expected error when ConfigMap key is missing")
+	}
+
+	if !strings.Contains(err.Error(), "user-data") {
+		t.Errorf("expected error to mention missing key, got: %v", err)
+	}
+}
+
+func TestResolveFileByPath_UserDataFromBinaryData(t *testing.T) {
+	binaryUserData := []byte("#cloud-config\npackages:\n  - curl\n")
+
+	cache := setupOCICache(t, "ghcr.io/test/image:v1", "cmbin123", map[string][]byte{
+		"vmlinuz": []byte("kernel"),
+	})
+
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "binary-ud",
+			Namespace: "default",
+		},
+		BinaryData: map[string][]byte{
+			"user-data": binaryUserData,
+		},
+	}
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-bindata"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:60", IPv4: "10.0.10.10", SubnetMask: "255.255.255.0"}},
+				CloudInit: &v1alpha3.CloudInitSpec{
+					UserDataConfigMapRef: &v1alpha3.ConfigMapKeySelector{
+						Name:      "binary-ud",
+						Namespace: "default",
+					},
+				},
+			},
+		},
+	}
+
+	scheme := newScheme(t)
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node, cm).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+
+	resolver := FileResolver{
+		Cache:  cache,
+		Reader: fc,
+	}
+
+	resolved, err := resolver.ResolveFileByPath(t.Context(), "cloud-init/user-data", node, "ghcr.io/test/image:v1")
+	if err != nil {
+		t.Fatalf("ResolveFileByPath: %v", err)
+	}
+
+	if string(resolved.Data) != string(binaryUserData) {
+		t.Errorf("expected BinaryData user-data, got %q", resolved.Data)
+	}
+}
+
+func TestHTTPServer_UserDataConfigMapMissing(t *testing.T) {
+	cache := setupOCICache(t, "ghcr.io/test/image:v1", "httpcmmiss123", map[string][]byte{
+		"vmlinuz": []byte("kernel"),
+	})
+
+	// Node references a ConfigMap that doesn't exist — should fall back to default cloud-init.
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-http-cm-miss"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:51", IPv4: "10.0.9.11", SubnetMask: "255.255.255.0"}},
+				CloudInit: &v1alpha3.CloudInitSpec{
+					UserDataConfigMapRef: &v1alpha3.ConfigMapKeySelector{
+						Name:      "nonexistent",
+						Namespace: "default",
+					},
+				},
+			},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
+		},
+	}
+
+	scheme := newScheme(t)
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+
+	srv := &HTTPServer{
+		FileResolver: FileResolver{
+			Cache:    cache,
+			Reader:   fc,
+			Cluster:  &StaticClusterInfo{Info: ClusterInfo{ApiserverURL: "https://k8s.example.com"}},
+			ServeURL: "http://10.0.9.1:8080",
+		},
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /", srv.handleFile)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	req, _ := http.NewRequest("GET", ts.URL+"/cloud-init/user-data", nil)
+	req.Header.Set("X-Forwarded-For", "10.0.9.11")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /cloud-init/user-data: %v", err)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 for missing ConfigMap (fallback to default), got %d", resp.StatusCode)
+	}
+
+	if string(body) != defaultUserData {
+		t.Errorf("expected default user-data %q, got %q", defaultUserData, body)
+	}
+}
+
+func TestHTTPServer_UserDataFromConfigMap(t *testing.T) {
+	customUserData := "#cloud-config\nssh_authorized_keys:\n  - ssh-rsa AAAA...\n"
+
+	cache := setupOCICache(t, "ghcr.io/test/image:v1", "httpud123", map[string][]byte{
+		"vmlinuz": []byte("kernel"),
+	})
+
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "ssh-keys",
+			Namespace: "default",
+		},
+		Data: map[string]string{
+			"user-data": customUserData,
+		},
+	}
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-http-ud"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:50", IPv4: "10.0.9.10", SubnetMask: "255.255.255.0"}},
+				CloudInit: &v1alpha3.CloudInitSpec{
+					UserDataConfigMapRef: &v1alpha3.ConfigMapKeySelector{
+						Name:      "ssh-keys",
+						Namespace: "default",
+						Key:       "user-data",
+					},
+				},
+			},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
+		},
+	}
+
+	scheme := newScheme(t)
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node, cm).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+
+	srv := &HTTPServer{
+		FileResolver: FileResolver{
+			Cache:    cache,
+			Reader:   fc,
+			Cluster:  &StaticClusterInfo{Info: ClusterInfo{ApiserverURL: "https://k8s.example.com"}},
+			ServeURL: "http://10.0.9.1:8080",
+		},
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /", srv.handleFile)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	req, _ := http.NewRequest("GET", ts.URL+"/cloud-init/user-data", nil)
+	req.Header.Set("X-Forwarded-For", "10.0.9.10")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /cloud-init/user-data: %v", err)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("user-data status: got %d, want 200", resp.StatusCode)
+	}
+
+	if string(body) != customUserData {
+		t.Errorf("expected ConfigMap user-data, got %q", body)
 	}
 }
 
@@ -828,13 +1375,11 @@ menuentry "Install {{ .Machine.Name }}" {
   linux /vmlinuz
   initrd /initrd
 }`
-	staticConfig := "autoinstall: true"
 
 	cache := setupOCICache(t, "ghcr.io/test/e2e:v1", "e2e123", map[string][]byte{
-		"vmlinuz":              vmlinuzData,
-		"initrd":               initrdData,
-		"grub/grub.cfg.tmpl":   []byte(bootTemplate),
-		"cloud-init/user-data": []byte(staticConfig),
+		"vmlinuz":            vmlinuzData,
+		"initrd":             initrdData,
+		"grub/grub.cfg.tmpl": []byte(bootTemplate),
 	})
 
 	node := &v1alpha3.Machine{
@@ -844,7 +1389,7 @@ menuentry "Install {{ .Machine.Name }}" {
 				Image:      "ghcr.io/test/e2e:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:00:11:22", IPv4: "10.0.3.10", SubnetMask: "255.255.255.0"}},
 			},
-			Operations: &v1alpha3.OperationsSpec{ReimageCounter: 1},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
 		},
 	}
 
@@ -896,15 +1441,15 @@ menuentry "Install {{ .Machine.Name }}" {
 		t.Errorf("grub.cfg should contain node name, got:\n%s", body)
 	}
 
-	// Test static file serving
+	// Test default user-data (no ConfigMap configured, so metalman returns built-in default)
 	req, _ = http.NewRequest("GET", httpTS.URL+"/cloud-init/user-data", nil)
 	req.Header.Set("X-Forwarded-For", "10.0.3.10")
 	resp, _ = http.DefaultClient.Do(req)
 	body, _ = io.ReadAll(resp.Body)
 	resp.Body.Close()
 
-	if string(body) != staticConfig {
-		t.Errorf("static config mismatch: got %q", body)
+	if string(body) != defaultUserData {
+		t.Errorf("default user-data mismatch: got %q, want %q", body, defaultUserData)
 	}
 
 	// Test 404 for file not in this image
@@ -938,7 +1483,7 @@ func TestHTTPServer_CrossImageIsolation(t *testing.T) {
 				Image:      "ghcr.io/test/alpha:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:aa:aa:aa:aa:aa", IPv4: "10.0.10.1", SubnetMask: "255.255.255.0"}},
 			},
-			Operations: &v1alpha3.OperationsSpec{ReimageCounter: 1},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
 		},
 	}
 	betaNode := &v1alpha3.Machine{
@@ -948,7 +1493,7 @@ func TestHTTPServer_CrossImageIsolation(t *testing.T) {
 				Image:      "ghcr.io/test/beta:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "bb:bb:bb:bb:bb:bb", IPv4: "10.0.10.2", SubnetMask: "255.255.255.0"}},
 			},
-			Operations: &v1alpha3.OperationsSpec{ReimageCounter: 1},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
 		},
 	}
 
@@ -1014,7 +1559,7 @@ func TestHTTPServer_503WhenFileNotDownloaded(t *testing.T) {
 				Image:      "ghcr.io/test/pending:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:10", IPv4: "10.0.5.10", SubnetMask: "255.255.255.0"}},
 			},
-			Operations: &v1alpha3.OperationsSpec{ReimageCounter: 1},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
 		},
 	}
 
@@ -1074,7 +1619,7 @@ func TestHTTPServer_DisablePXE(t *testing.T) {
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:20", IPv4: "10.0.6.10", SubnetMask: "255.255.255.0"}},
 			},
-			Operations: &v1alpha3.OperationsSpec{ReimageCounter: 1},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
 		},
 	}
 
@@ -1121,27 +1666,27 @@ func TestHTTPServer_DisablePXE(t *testing.T) {
 		t.Fatalf("getting updated node: %v", err)
 	}
 
-	var specReimage, statusReimage int64
+	var specRepave, statusRepave int64
 	if updated.Spec.Operations != nil {
-		specReimage = updated.Spec.Operations.ReimageCounter
+		specRepave = updated.Spec.Operations.RepaveCounter
 	}
 
 	if updated.Status.Operations != nil {
-		statusReimage = updated.Status.Operations.ReimageCounter
+		statusRepave = updated.Status.Operations.RepaveCounter
 	}
 
-	if statusReimage != specReimage {
-		t.Errorf("status.operations.reimageCounter (%d) should match spec.operations.reimageCounter (%d)",
-			statusReimage, specReimage)
+	if statusRepave != specRepave {
+		t.Errorf("status.operations.repaveCounter (%d) should match spec.operations.repaveCounter (%d)",
+			statusRepave, specRepave)
 	}
 
-	reimagedCond := findCondition(updated.Status.Conditions, v1alpha3.MachineConditionReimaged)
-	if reimagedCond == nil || reimagedCond.Status != metav1.ConditionTrue || reimagedCond.Reason != "Succeeded" {
-		t.Fatalf("expected Reimaged=True/Succeeded, got %+v", reimagedCond)
+	repavedCond := findCondition(updated.Status.Conditions, v1alpha3.MachineConditionRepaved)
+	if repavedCond == nil || repavedCond.Status != metav1.ConditionTrue || repavedCond.Reason != "Succeeded" {
+		t.Fatalf("expected Repaved=True/Succeeded, got %+v", repavedCond)
 	}
 
-	if reimagedCond.Message != "image=ghcr.io/test/image:v1" {
-		t.Fatalf("expected Reimaged message 'image=ghcr.io/test/image:v1', got %q", reimagedCond.Message)
+	if repavedCond.Message != "image=ghcr.io/test/image:v1" {
+		t.Fatalf("expected Repaved message 'image=ghcr.io/test/image:v1', got %q", repavedCond.Message)
 	}
 
 	// Second call should be idempotent (still 200)
@@ -1395,6 +1940,591 @@ func TestHandleCloudInitLog(t *testing.T) {
 				t.Errorf("expected 200, got %d", resp.StatusCode)
 			}
 		})
+	}
+}
+
+func TestBuildCloudInitCondition(t *testing.T) {
+	generation := int64(3)
+
+	tests := []struct {
+		name       string
+		event      cloudInitEvent
+		wantNil    bool
+		wantStatus metav1.ConditionStatus
+		wantReason string
+		wantSubstr string // substring expected in message
+	}{
+		{
+			name: "start event sets Running",
+			event: cloudInitEvent{
+				Name:        "init-local",
+				Description: "starting init-local",
+				EventType:   "start",
+			},
+			wantStatus: metav1.ConditionFalse,
+			wantReason: "Running",
+			wantSubstr: `stage "init-local" started`,
+		},
+		{
+			name: "early stage finish SUCCESS sets Running",
+			event: cloudInitEvent{
+				Name:        "init-local",
+				Description: "init-local ran successfully",
+				EventType:   "finish",
+				Result:      "SUCCESS",
+			},
+			wantStatus: metav1.ConditionFalse,
+			wantReason: "Running",
+			wantSubstr: `stage "init-local" finished successfully`,
+		},
+		{
+			name: "modules-config finish SUCCESS sets Running",
+			event: cloudInitEvent{
+				Name:        "modules-config",
+				Description: "modules-config ran successfully",
+				EventType:   "finish",
+				Result:      "SUCCESS",
+			},
+			wantStatus: metav1.ConditionFalse,
+			wantReason: "Running",
+			wantSubstr: `stage "modules-config" finished successfully`,
+		},
+		{
+			name: "modules-final finish SUCCESS sets Succeeded",
+			event: cloudInitEvent{
+				Name:        "modules-final",
+				Description: "modules-final ran successfully and took 1.23 seconds",
+				EventType:   "finish",
+				Result:      "SUCCESS",
+			},
+			wantStatus: metav1.ConditionTrue,
+			wantReason: "Succeeded",
+			wantSubstr: "cloud-init completed successfully",
+		},
+		{
+			name: "finish with failure sets Failed",
+			event: cloudInitEvent{
+				Name:        "modules-config",
+				Description: "running modules-config",
+				EventType:   "finish",
+				Result:      "FAIL: command [apt-get install -y badpkg] failed with exit code 100",
+			},
+			wantStatus: metav1.ConditionFalse,
+			wantReason: "Failed",
+			wantSubstr: `stage "modules-config" failed`,
+		},
+		{
+			name: "finish with failure includes result in message",
+			event: cloudInitEvent{
+				Name:        "modules-final",
+				Description: "running modules-final",
+				EventType:   "finish",
+				Result:      "EXCEPTION: Traceback (most recent call last): runcmd failed",
+			},
+			wantStatus: metav1.ConditionFalse,
+			wantReason: "Failed",
+			wantSubstr: "EXCEPTION: Traceback",
+		},
+		{
+			name: "unknown event type returns nil",
+			event: cloudInitEvent{
+				Name:        "modules-config",
+				Description: "custom event",
+				EventType:   "custom",
+			},
+			wantNil: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cond := buildCloudInitCondition(&tt.event, generation)
+
+			if tt.wantNil {
+				if cond != nil {
+					t.Fatalf("expected nil condition, got %+v", cond)
+				}
+
+				return
+			}
+
+			if cond == nil {
+				t.Fatal("expected non-nil condition")
+			}
+
+			if cond.Type != v1alpha3.MachineConditionCloudInitDone {
+				t.Errorf("type: got %q, want %q", cond.Type, v1alpha3.MachineConditionCloudInitDone)
+			}
+
+			if cond.Status != tt.wantStatus {
+				t.Errorf("status: got %q, want %q", cond.Status, tt.wantStatus)
+			}
+
+			if cond.Reason != tt.wantReason {
+				t.Errorf("reason: got %q, want %q", cond.Reason, tt.wantReason)
+			}
+
+			if !strings.Contains(cond.Message, tt.wantSubstr) {
+				t.Errorf("message %q should contain %q", cond.Message, tt.wantSubstr)
+			}
+
+			if cond.ObservedGeneration != generation {
+				t.Errorf("observedGeneration: got %d, want %d", cond.ObservedGeneration, generation)
+			}
+		})
+	}
+}
+
+func TestBuildCloudInitCondition_MessageTruncation(t *testing.T) {
+	// Build a result string that will exceed maxConditionMessageLen when
+	// formatted into the failure message.
+	longResult := strings.Repeat("x", maxConditionMessageLen+500)
+
+	ev := cloudInitEvent{
+		Name:        "modules-config",
+		Description: "running modules-config",
+		EventType:   "finish",
+		Result:      longResult,
+	}
+
+	cond := buildCloudInitCondition(&ev, 1)
+	if cond == nil {
+		t.Fatal("expected non-nil condition")
+	}
+
+	if len(cond.Message) > maxConditionMessageLen {
+		t.Errorf("message length %d exceeds max %d", len(cond.Message), maxConditionMessageLen)
+	}
+
+	if !strings.HasSuffix(cond.Message, "...") {
+		t.Errorf("truncated message should end with '...', got %q", cond.Message[len(cond.Message)-10:])
+	}
+
+	// Verify that the message still starts with the stage info.
+	if !strings.Contains(cond.Message, "modules-config") {
+		t.Errorf("truncated message should contain stage name, got %q", cond.Message[:100])
+	}
+}
+
+func TestCloudInitCondition_StageStartSetsRunning(t *testing.T) {
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "ci-start-node"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:70", IPv4: "10.0.20.10", SubnetMask: "255.255.255.0"}},
+			},
+		},
+	}
+
+	cache := NewOCICache(t.TempDir())
+	scheme := newScheme(t)
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node).
+		WithStatusSubresource(&v1alpha3.Machine{}).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+
+	srv := &HTTPServer{
+		Client:       fc,
+		FileResolver: FileResolver{Cache: cache, Reader: fc},
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /cloudinit/log", srv.handleCloudInitLog)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	body := `{"name":"init-local","description":"starting init-local","event_type":"start","origin":"cloudinit","timestamp":1775657336.0}`
+	req, _ := http.NewRequest("POST", ts.URL+"/cloudinit/log", strings.NewReader(body))
+	req.Header.Set("X-Forwarded-For", "10.0.20.10")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /cloudinit/log: %v", err)
+	}
+
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	var updated v1alpha3.Machine
+	if err := fc.Get(t.Context(), client.ObjectKeyFromObject(node), &updated); err != nil {
+		t.Fatalf("getting updated node: %v", err)
+	}
+
+	cond := findCondition(updated.Status.Conditions, v1alpha3.MachineConditionCloudInitDone)
+	if cond == nil {
+		t.Fatal("expected CloudInitDone condition to be set")
+	}
+
+	if cond.Status != metav1.ConditionFalse {
+		t.Errorf("status: got %q, want %q", cond.Status, metav1.ConditionFalse)
+	}
+
+	if cond.Reason != "Running" {
+		t.Errorf("reason: got %q, want %q", cond.Reason, "Running")
+	}
+}
+
+func TestCloudInitCondition_FinalStageSuccessSetsTrue(t *testing.T) {
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "ci-done-node"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:71", IPv4: "10.0.20.11", SubnetMask: "255.255.255.0"}},
+			},
+		},
+	}
+
+	cache := NewOCICache(t.TempDir())
+	scheme := newScheme(t)
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node).
+		WithStatusSubresource(&v1alpha3.Machine{}).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+
+	srv := &HTTPServer{
+		Client:       fc,
+		FileResolver: FileResolver{Cache: cache, Reader: fc},
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /cloudinit/log", srv.handleCloudInitLog)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	body := `{"name":"modules-final","description":"modules-final ran successfully and took 1.23 seconds","event_type":"finish","origin":"cloudinit","timestamp":1775657336.0,"result":"SUCCESS"}`
+	req, _ := http.NewRequest("POST", ts.URL+"/cloudinit/log", strings.NewReader(body))
+	req.Header.Set("X-Forwarded-For", "10.0.20.11")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /cloudinit/log: %v", err)
+	}
+
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	var updated v1alpha3.Machine
+	if err := fc.Get(t.Context(), client.ObjectKeyFromObject(node), &updated); err != nil {
+		t.Fatalf("getting updated node: %v", err)
+	}
+
+	cond := findCondition(updated.Status.Conditions, v1alpha3.MachineConditionCloudInitDone)
+	if cond == nil {
+		t.Fatal("expected CloudInitDone condition to be set")
+	}
+
+	if cond.Status != metav1.ConditionTrue {
+		t.Errorf("status: got %q, want %q", cond.Status, metav1.ConditionTrue)
+	}
+
+	if cond.Reason != "Succeeded" {
+		t.Errorf("reason: got %q, want %q", cond.Reason, "Succeeded")
+	}
+
+	if !strings.Contains(cond.Message, "cloud-init completed successfully") {
+		t.Errorf("message %q should contain completion text", cond.Message)
+	}
+}
+
+func TestCloudInitCondition_StageFailureSetsFailedWithDetails(t *testing.T) {
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "ci-fail-node"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:72", IPv4: "10.0.20.12", SubnetMask: "255.255.255.0"}},
+			},
+		},
+	}
+
+	cache := NewOCICache(t.TempDir())
+	scheme := newScheme(t)
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node).
+		WithStatusSubresource(&v1alpha3.Machine{}).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+
+	srv := &HTTPServer{
+		Client:       fc,
+		FileResolver: FileResolver{Cache: cache, Reader: fc},
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /cloudinit/log", srv.handleCloudInitLog)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	body := `{"name":"modules-config","description":"running modules-config","event_type":"finish","origin":"cloudinit","timestamp":1775657336.0,"result":"FAIL: command [apt-get install -y badpkg] failed with exit code 100"}`
+	req, _ := http.NewRequest("POST", ts.URL+"/cloudinit/log", strings.NewReader(body))
+	req.Header.Set("X-Forwarded-For", "10.0.20.12")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /cloudinit/log: %v", err)
+	}
+
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	var updated v1alpha3.Machine
+	if err := fc.Get(t.Context(), client.ObjectKeyFromObject(node), &updated); err != nil {
+		t.Fatalf("getting updated node: %v", err)
+	}
+
+	cond := findCondition(updated.Status.Conditions, v1alpha3.MachineConditionCloudInitDone)
+	if cond == nil {
+		t.Fatal("expected CloudInitDone condition to be set")
+	}
+
+	if cond.Status != metav1.ConditionFalse {
+		t.Errorf("status: got %q, want %q", cond.Status, metav1.ConditionFalse)
+	}
+
+	if cond.Reason != "Failed" {
+		t.Errorf("reason: got %q, want %q", cond.Reason, "Failed")
+	}
+
+	if !strings.Contains(cond.Message, "modules-config") {
+		t.Errorf("message %q should contain stage name", cond.Message)
+	}
+
+	if !strings.Contains(cond.Message, "FAIL: command [apt-get install -y badpkg] failed with exit code 100") {
+		t.Errorf("message %q should contain the error result", cond.Message)
+	}
+}
+
+func TestCloudInitCondition_NoClientSkipsUpdate(t *testing.T) {
+	// When Client is nil, handleCloudInitLog should still return 200
+	// but not attempt any status update.
+	srv := &HTTPServer{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /cloudinit/log", srv.handleCloudInitLog)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	body := `{"name":"modules-final","description":"done","event_type":"finish","origin":"cloudinit","timestamp":1775657336.0,"result":"SUCCESS"}`
+	req, _ := http.NewRequest("POST", ts.URL+"/cloudinit/log", strings.NewReader(body))
+	req.Header.Set("X-Forwarded-For", "10.0.20.99")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /cloudinit/log: %v", err)
+	}
+
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200, got %d", resp.StatusCode)
+	}
+}
+
+func TestCloudInitCondition_UnknownIPSkipsUpdate(t *testing.T) {
+	// When the IP doesn't match any Machine, updateCloudInitCondition
+	// should log a warning but the handler should still return 200.
+	cache := NewOCICache(t.TempDir())
+	scheme := newScheme(t)
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&v1alpha3.Machine{}).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+
+	srv := &HTTPServer{
+		Client:       fc,
+		FileResolver: FileResolver{Cache: cache, Reader: fc},
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /cloudinit/log", srv.handleCloudInitLog)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	body := `{"name":"modules-final","description":"done","event_type":"finish","origin":"cloudinit","timestamp":1775657336.0,"result":"SUCCESS"}`
+	req, _ := http.NewRequest("POST", ts.URL+"/cloudinit/log", strings.NewReader(body))
+	req.Header.Set("X-Forwarded-For", "10.99.99.99")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /cloudinit/log: %v", err)
+	}
+
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200, got %d", resp.StatusCode)
+	}
+}
+
+func TestCloudInitCondition_StatusUpdateError(t *testing.T) {
+	// When the status update fails, the handler should still return 200
+	// because cloud-init does not retry on error responses.
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "ci-update-err-node"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:75", IPv4: "10.0.20.15", SubnetMask: "255.255.255.0"}},
+			},
+		},
+	}
+
+	cache := NewOCICache(t.TempDir())
+	scheme := newScheme(t)
+
+	injectedErr := fmt.Errorf("simulated conflict")
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node).
+		WithStatusSubresource(&v1alpha3.Machine{}).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		WithInterceptorFuncs(interceptor.Funcs{
+			SubResourceUpdate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+				return injectedErr
+			},
+		}).
+		Build()
+
+	srv := &HTTPServer{
+		Client:       fc,
+		FileResolver: FileResolver{Cache: cache, Reader: fc},
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /cloudinit/log", srv.handleCloudInitLog)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	body := `{"name":"modules-final","description":"done","event_type":"finish","origin":"cloudinit","timestamp":1775657336.0,"result":"SUCCESS"}`
+	req, _ := http.NewRequest("POST", ts.URL+"/cloudinit/log", strings.NewReader(body))
+	req.Header.Set("X-Forwarded-For", "10.0.20.15")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /cloudinit/log: %v", err)
+	}
+
+	resp.Body.Close()
+
+	// Handler must still return 200 even when status update fails.
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 despite status update failure, got %d", resp.StatusCode)
+	}
+}
+
+func TestCloudInitCondition_FullLifecycle(t *testing.T) {
+	// Simulate a full cloud-init lifecycle: start -> intermediate finish -> final finish.
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "ci-lifecycle-node"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:73", IPv4: "10.0.20.13", SubnetMask: "255.255.255.0"}},
+			},
+		},
+	}
+
+	cache := NewOCICache(t.TempDir())
+	scheme := newScheme(t)
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node).
+		WithStatusSubresource(&v1alpha3.Machine{}).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+
+	srv := &HTTPServer{
+		Client:       fc,
+		FileResolver: FileResolver{Cache: cache, Reader: fc},
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /cloudinit/log", srv.handleCloudInitLog)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	postEvent := func(body string) {
+		t.Helper()
+
+		req, _ := http.NewRequest("POST", ts.URL+"/cloudinit/log", strings.NewReader(body))
+		req.Header.Set("X-Forwarded-For", "10.0.20.13")
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("POST /cloudinit/log: %v", err)
+		}
+
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200, got %d", resp.StatusCode)
+		}
+	}
+
+	getCondition := func() *metav1.Condition {
+		t.Helper()
+
+		var updated v1alpha3.Machine
+		if err := fc.Get(t.Context(), client.ObjectKeyFromObject(node), &updated); err != nil {
+			t.Fatalf("getting updated node: %v", err)
+		}
+
+		return findCondition(updated.Status.Conditions, v1alpha3.MachineConditionCloudInitDone)
+	}
+
+	// Step 1: init-local starts
+	postEvent(`{"name":"init-local","description":"starting init-local","event_type":"start","origin":"cloudinit","timestamp":1.0}`)
+
+	cond := getCondition()
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "Running" {
+		t.Fatalf("after init-local start: expected False/Running, got %+v", cond)
+	}
+
+	// Step 2: init-local finishes successfully
+	postEvent(`{"name":"init-local","description":"init-local done","event_type":"finish","origin":"cloudinit","timestamp":2.0,"result":"SUCCESS"}`)
+
+	cond = getCondition()
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "Running" {
+		t.Fatalf("after init-local finish: expected False/Running, got %+v", cond)
+	}
+
+	// Step 3: modules-final starts
+	postEvent(`{"name":"modules-final","description":"starting modules-final","event_type":"start","origin":"cloudinit","timestamp":3.0}`)
+
+	cond = getCondition()
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "Running" {
+		t.Fatalf("after modules-final start: expected False/Running, got %+v", cond)
+	}
+
+	// Step 4: modules-final finishes successfully
+	postEvent(`{"name":"modules-final","description":"modules-final done","event_type":"finish","origin":"cloudinit","timestamp":4.0,"result":"SUCCESS"}`)
+
+	cond = getCondition()
+	if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != "Succeeded" {
+		t.Fatalf("after modules-final finish: expected True/Succeeded, got %+v", cond)
 	}
 }
 

@@ -1,0 +1,15 @@
+#!/bin/sh
+# Pre-commit hook: verify formatting on staged Go files.
+# Install: ln -sf ../../dev/pre-commit .git/hooks/pre-commit
+
+staged=$(git diff --cached --name-only --diff-filter=ACM -- '*.go')
+if [ -z "$staged" ]; then
+  exit 0
+fi
+
+unformatted=$(echo "$staged" | xargs gofmt -l 2>/dev/null)
+if [ -n "$unformatted" ]; then
+  echo "Go files not formatted (run 'make fmt'):"
+  echo "$unformatted"
+  exit 1
+fi

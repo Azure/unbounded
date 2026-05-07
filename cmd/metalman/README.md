@@ -13,7 +13,7 @@ Run `metalman version` to print the binary version.
 ```bash
 # Create a Machine
 kubectl apply -f - <<EOF
-apiVersion: unbounded-kube.io/v1alpha3
+apiVersion: unbounded-cloud.io/v1alpha3
 kind: Machine
 metadata:
   name: node-01
@@ -38,8 +38,8 @@ EOF
 # Store the BMC's Redfish password
 kubectl create secret generic bmc-node-01-pass --from-literal=password=example-password
 
-# Reimage the node via PXE
-kubectl unbounded machine reimage node-01
+# Repave the node via PXE
+kubectl unbounded machine repave node-01
 ```
 
 
@@ -86,14 +86,14 @@ It exposes ports 8880/tcp (HTTP), 8081/tcp (health), 67/udp (DHCP), and 69/udp (
 `site deploy-pxe` flags:
 
 - `--site` — Site name (required; scopes the PXE instance to machines
-  labeled `unbounded-kube.io/site=<site>`).
+  labeled `unbounded-cloud.io/site=<site>`).
 - `--image` — Container image for the PXE deployment (default: build-time
   value or `metalman:latest`).
 - `--kubeconfig` — Path to kubeconfig file.
 
 The generated Deployment uses host networking, a `CriticalAddonsOnly`
 toleration, DNS policy `ClusterFirstWithHostNet`, and a node selector
-`unbounded-kube.io/site=<site>`. Resource requests are 100m CPU / 128Mi
+`unbounded-cloud.io/site=<site>`. Resource requests are 100m CPU / 128Mi
 memory with limits of 500m CPU / 256Mi memory.
 
 #### DHCP Modes
@@ -130,7 +130,7 @@ So it's possible to prove that the bootstrap token was delivered only to trusted
 #### Sites
 
 The `--site` flag scopes a `site serve-pxe` instance to a subset of Machines. The
-value is matched against the `unbounded-kube.io/site` label on Machine
+value is matched against the `unbounded-cloud.io/site` label on Machine
 resources:
 
 ```bash
@@ -172,7 +172,7 @@ A Machine is a cluster-scoped custom resource representing a single bare metal
 host. At minimum it needs a NIC (MAC + static IP) and a PXE image reference:
 
 ```yaml
-apiVersion: unbounded-kube.io/v1alpha3
+apiVersion: unbounded-cloud.io/v1alpha3
 kind: Machine
 metadata:
   name: node-01
@@ -196,7 +196,7 @@ Adding a `redfish` block enables remote power management. The controller will
 manage boot order and execute reboot cycles without physical access:
 
 ```yaml
-apiVersion: unbounded-kube.io/v1alpha3
+apiVersion: unbounded-cloud.io/v1alpha3
 kind: Machine
 metadata:
   name: node-01
@@ -222,12 +222,12 @@ On first connection, the controller captures the BMC's TLS certificate
 fingerprint and pins it in `status.redfish.certFingerprint` for subsequent
 requests.
 
-To reimage a node with BMC access:
+To repave a node with BMC access:
 
 ```bash
-kubectl unbounded machine reimage node-01
+kubectl unbounded machine repave node-01
 ```
 
-This increments `spec.operations.reimageCounter` and `spec.operations.rebootCounter`. The
+This increments `spec.operations.repaveCounter` and `spec.operations.rebootCounter`. The
 controller handles the rest — it configures the boot order to PXE, executes a
 ForceOff/On power cycle, and clears the condition once the node is back up.

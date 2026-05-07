@@ -4,20 +4,16 @@
 package cmd
 
 import (
+	"log/slog"
 	"os"
 	"os/signal"
 
 	"github.com/spf13/cobra"
 
-	"github.com/Azure/unbounded-kube/cmd/agent/internal/goalstates"
-	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases"
-	"github.com/Azure/unbounded-kube/cmd/agent/internal/phases/reset"
-	"github.com/Azure/unbounded-kube/internal/version"
+	"github.com/Azure/unbounded/cmd/agent/internal/daemon"
+	"github.com/Azure/unbounded/internal/version"
+	"github.com/Azure/unbounded/pkg/agent/phases"
 )
-
-// defaultConfigPath is the well-known location for the agent config file
-// written by cloud-init based bootstrapping.
-const defaultConfigPath = "/etc/unbounded-agent/config.json"
 
 func newCmdReset(cmdCtx *CommandContext) *cobra.Command {
 	cmd := &cobra.Command{
@@ -39,44 +35,22 @@ Both possible nspawn machine names (kube1 and kube2) are stopped and removed.`,
 				"commit", version.GitCommit,
 			)
 
-			log := cmdCtx.Logger
-
-			return phases.Serial(log,
-				// Step 1: Stop both nspawn machines.
-				phases.Parallel(log,
-					reset.StopMachine(log, goalstates.NSpawnMachineKube1),
-					reset.StopMachine(log, goalstates.NSpawnMachineKube2),
-				),
-
-				// Step 2-3: Remove network interfaces and WireGuard keys.
-				phases.Parallel(log,
-					reset.RemoveNetworkInterfaces(log),
-					reset.RemoveWireGuardKeys(log),
-				),
-
-				// Step 4: Remove nspawn configuration files for both machines.
-				phases.Parallel(log,
-					reset.RemoveNSpawnConfig(log, goalstates.NSpawnMachineKube1),
-					reset.RemoveNSpawnConfig(log, goalstates.NSpawnMachineKube2),
-				),
-
-				// Step 5: Remove both machine rootfs directories.
-				phases.Parallel(log,
-					reset.RemoveMachine(log, goalstates.NSpawnMachineKube1),
-					reset.RemoveMachine(log, goalstates.NSpawnMachineKube2),
-				),
-
-				// Step 6: Clean up policy routing rules.
-				reset.CleanupRoutes(log),
-
-				// Step 7: Remove agent binaries and config.
-				reset.RemoveAgentArtifacts(log),
-
-				// Step 8: Reload systemd.
-				reset.ReloadSystemd(log),
-			).Do(ctx)
+			return resetAgent(cmdCtx.Logger).Do(ctx)
 		},
 	}
 
 	return cmd
+}
+
+// resetAgent returns a task that resets the host by stopping the daemon and
+// removing the unbounded-agent and all associated resources.
+func resetAgent(log *slog.Logger) phases.Task {
+	return phases.Serial(log,
+		// CLI reset runs outside the daemon, so it can stop the daemon first to
+		// keep it from reconciling while files are removed. The daemon operation
+		// path stops the daemon last because stopping the unit terminates the
+		// reconciler before it can mark the MachineOperation complete.
+		daemon.StopDaemon(log),
+		daemon.ResetAgentResources(log),
+	)
 }

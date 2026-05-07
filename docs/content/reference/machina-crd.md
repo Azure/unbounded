@@ -4,9 +4,9 @@ weight: 2
 description: "API reference for the Machine custom resource."
 ---
 
-API group: `unbounded-kube.io/v1alpha3`
+API group: `unbounded-cloud.io/v1alpha3`
 
-This document describes the custom resource definition shipped with the project: **Machine**.
+This document describes the custom resource definitions shipped with machina: **Machine** and **MachineOperation**.
 
 ## Machine
 
@@ -64,6 +64,11 @@ PXE boot configuration consumed by the metalman controller.
 | `pxe.redfish.username` | string | Yes | — | Redfish username. |
 | `pxe.redfish.deviceID` | string | No | `"1"` | Redfish system device ID. |
 | `pxe.redfish.passwordRef` | SecretKeySelector | Yes | — | Secret containing the Redfish password. |
+| `pxe.cloudInit` | CloudInitSpec | No | — | Optional cloud-init customization for PXE-booted machines. |
+| `pxe.cloudInit.userDataConfigMapRef` | ConfigMapKeySelector | No | — | Reference to a ConfigMap containing custom cloud-init user-data. |
+| `pxe.cloudInit.userDataConfigMapRef.name` | string | Yes | — | ConfigMap name. |
+| `pxe.cloudInit.userDataConfigMapRef.namespace` | string | Yes | — | ConfigMap namespace. |
+| `pxe.cloudInit.userDataConfigMapRef.key` | string | No | `"user-data"` | Key within the ConfigMap. |
 
 ### spec.kubernetes
 
@@ -82,7 +87,66 @@ Kubernetes join configuration.
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `operations.rebootCounter` | int64 | No | `0` | Triggers a reboot when the spec value exceeds the status value. |
-| `operations.reimageCounter` | int64 | No | `0` | Triggers a PXE reimage when the spec value exceeds the status value. |
+| `operations.repaveCounter` | int64 | No | `0` | Triggers a PXE repave when the spec value exceeds the status value. |
+
+### spec.provider and spec.providerID
+
+`provider` selects the external control provider for out-of-band operations. `providerID` identifies the underlying infrastructure resource and follows the Kubernetes Node provider ID convention.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `provider` | string | For external operations | -- | External control provider. Supported values: `AzureVM`, `OCIInstance`. |
+| `providerID` | string | For external operations | -- | Provider-specific resource ID such as `azure:///subscriptions/.../virtualMachines/name` or `oci://ocid1.instance...`. |
+
+Azure VM operations use `DefaultAzureCredential`, so the `machine-ops-controller` deployment can authenticate with workload identity, managed identity, or environment-based Azure credentials.
+OCI operations use an OCI SDK config file mounted into the `machine-ops-controller` deployment.
+
+## MachineOperation
+
+| Property | Value |
+|----------|-------|
+| Kind | `MachineOperation` |
+| Plural | `machineoperations` |
+| Short name | `mop` |
+| Scope | Cluster |
+| Status subresource | Yes |
+
+`MachineOperation` is a job-like CR for discrete operations. The in-host agent handles Kubernetes node operations such as `NodeReboot` and agent operations such as `AgentReset`; `machine-ops-controller` handles out-of-band VM operations such as Azure VM power actions. PXE/BMC operations remain owned by metalman for now.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `spec.machineRef` | string | No | Target `Machine` name. Either `machineRef` or `machineSelector` must be set. |
+| `spec.machineSelector` | LabelSelector | No | Selects Machines by label. Controllers may fan this out into per-Machine operations. |
+| `spec.operationKind` | string | Yes | One of `NodeReboot`, `AgentUpgrade`, `AgentReset`, `HostReboot`, `HostPowerOff`, `HostPowerOn`, `HostReplace`. |
+| `spec.parameters` | map[string]string | No | Operation-specific parameters. |
+| `spec.ttlSecondsAfterFinished` | int32 | No | Delete completed or failed operations after this many seconds. |
+| `status.phase` | string | No | `Pending`, `InProgress`, `Complete`, or `Failed`. |
+| `status.message` | string | No | Human-readable status message. |
+| `status.startedAt` | time | No | Operation start timestamp. |
+| `status.completedAt` | time | No | Terminal phase timestamp. |
+
+The Azure VM provider handles:
+
+| Operation | Azure action |
+|-----------|--------------|
+| `HostReboot` | `VirtualMachinesClient.BeginRestart` |
+| `HostPowerOff` | `VirtualMachinesClient.BeginPowerOff` |
+| `HostPowerOn` | `VirtualMachinesClient.BeginStart` |
+| `HostReplace` | `VirtualMachinesClient.Get`, `BeginDelete`, then `BeginCreateOrUpdate` |
+
+`HostReplace` for `AzureVM` destructively replaces the VM: it reads the existing VM model, detaches NICs and data disks, deletes the VM resource, and recreates the same VM name with fresh cloud-init custom data that installs `unbounded-agent`. The old OS disk is not reused. Operation completion means the replacement VM create operation completed; it does not mean the Kubernetes `Node` is Ready. The `Machine` controller continues tracking whether the Kubernetes `Node` disappears and rejoins. Configure `machine-ops-controller --api-server-endpoint` with an API server address reachable from replaced hosts; the generated agent bootstrap config uses that value.
+
+This replacement flow avoids Azure standalone VM `customData` immutability during native reimage. It intentionally destroys host-local state on the old OS disk.
+
+The OCI instance provider handles:
+
+| Operation | OCI action |
+|-----------|------------|
+| `HostReboot` | `RESET` |
+| `HostPowerOff` | `STOP` |
+| `HostPowerOn` | `START` |
+
+`HostReplace` is not currently supported for `OCIInstance` because an identity-preserving OCI replacement flow with fresh `user_data` injection has not been verified.
 
 ### status
 
@@ -94,7 +158,7 @@ Kubernetes join configuration.
 | `redfish.certFingerprint` | string | BMC TLS certificate SHA-256 fingerprint. Set by metalman using TOFU. |
 | `tpm.ekPublicKey` | string | TPM endorsement key in PEM format. Set by metalman attestation using TOFU. |
 | `operations.rebootCounter` | int64 | Last-acted reboot counter value. |
-| `operations.reimageCounter` | int64 | Last-acted reimage counter value. |
+| `operations.repaveCounter` | int64 | Last-acted repave counter value. |
 | `conditions` | []Condition | Standard Kubernetes conditions (see below). |
 
 ### Conditions
@@ -106,7 +170,7 @@ Kubernetes join configuration.
 | `Provisioned` | machina | `True` after successful SSH provisioning. `ObservedGeneration` tracks the spec generation. |
 | `PoweredOff` | metalman | Tracks BMC power state during a reboot cycle. Removed after power-on completes. Not defined as a CRD type constant; set directly by the metalman redfish reconciler. |
 | `BootOrderConfigSupported` | metalman | Set to `False` when the BMC does not support boot order configuration. Not defined as a CRD type constant; set directly by the metalman redfish reconciler. |
-| `Reimaged` | metalman | `False`/`Pending` during reimage; `True`/`Succeeded` after `/pxe/disable`. Stale `False` conditions are removed after a 30-minute timeout. |
+| `Repaved` | metalman | `False`/`Pending` during repave; `True`/`Succeeded` after `/pxe/disable`. Stale `False` conditions are removed after a 30-minute timeout. |
 
 ### Phase lifecycle
 
@@ -127,22 +191,22 @@ The machina controller drives the following phases:
 
 | Label | Applied to | Description |
 |-------|-----------|-------------|
-| `unbounded-kube.io/machine` | Node | Maps the Node back to its Machine CR. Set during provisioning. |
-| `unbounded-kube.io/site` | Machine | Scopes a metalman instance to a subset of Machines. |
-| `unbounded-kube.io/default-bootstrap-token` | Secret | Marks a Secret as the default bootstrap token for auto-discovery. |
+| `unbounded-cloud.io/machine` | Node | Maps the Node back to its Machine CR. Set during provisioning. |
+| `unbounded-cloud.io/site` | Machine | Scopes a metalman instance to a subset of Machines. |
+| `unbounded-cloud.io/default-bootstrap-token` | Secret | Marks a Secret as the default bootstrap token for auto-discovery. |
 
 **Annotations:**
 
 | Annotation | Description |
 |-----------|-------------|
-| `unbounded-kube.io/provider` | Associates a Machine with a provider controller (extension point). |
+| `unbounded-cloud.io/provider` | Associates a Machine with a provider controller (extension point). |
 
 ### Examples
 
 **Minimal SSH-only Machine:**
 
 ```yaml
-apiVersion: unbounded-kube.io/v1alpha3
+apiVersion: unbounded-cloud.io/v1alpha3
 kind: Machine
 metadata:
   name: worker-01
@@ -161,7 +225,7 @@ spec:
 **SSH with bastion:**
 
 ```yaml
-apiVersion: unbounded-kube.io/v1alpha3
+apiVersion: unbounded-cloud.io/v1alpha3
 kind: Machine
 metadata:
   name: worker-02
@@ -182,15 +246,65 @@ spec:
       name: bootstrap-token-abc123
 ```
 
+**Azure VM with external power operations:**
+
+```yaml
+apiVersion: unbounded-cloud.io/v1alpha3
+kind: Machine
+metadata:
+  name: azure-worker-01
+spec:
+  provider: AzureVM
+  providerID: azure:///subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-workers/providers/Microsoft.Compute/virtualMachines/azure-worker-01
+  configurationRef:
+    name: azure-workers
+```
+
+```yaml
+apiVersion: unbounded-cloud.io/v1alpha3
+kind: MachineOperation
+metadata:
+  name: azure-worker-01-hardreboot
+spec:
+  machineRef: azure-worker-01
+  operationKind: HostReboot
+  ttlSecondsAfterFinished: 300
+```
+
+**OCI instance with external power operations:**
+
+```yaml
+apiVersion: unbounded-cloud.io/v1alpha3
+kind: Machine
+metadata:
+  name: oci-worker-01
+spec:
+  provider: OCIInstance
+  providerID: oci://ocid1.instance.oc1...
+  configurationRef:
+    name: oci-workers
+```
+
+```yaml
+apiVersion: unbounded-cloud.io/v1alpha3
+kind: MachineOperation
+metadata:
+  name: oci-worker-01-poweroff
+spec:
+  machineRef: oci-worker-01
+  operationKind: HostPowerOff
+  ttlSecondsAfterFinished: 300
+```
+
 **PXE / bare-metal Machine:**
 
 ```yaml
-apiVersion: unbounded-kube.io/v1alpha3
+apiVersion: unbounded-cloud.io/v1alpha3
 kind: Machine
 metadata:
   name: baremetal-01
   labels:
-    unbounded-kube.io/site: lab
+    unbounded-cloud.io/site: lab
 spec:
   ssh:
     host: "10.0.0.60"
@@ -211,6 +325,10 @@ spec:
       username: admin
       passwordRef:
         name: bmc-password
+        namespace: unbounded-kube
+    cloudInit:
+      userDataConfigMapRef:
+        name: my-cloud-init
         namespace: unbounded-kube
   kubernetes:
     version: v1.34.0

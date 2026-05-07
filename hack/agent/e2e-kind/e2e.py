@@ -7,16 +7,39 @@
 Creates a QEMU VM, joins it to a Kind cluster using the production
 provision install script, and validates workloads run on the new node.
 
+The test follows a single linear sequence:
+  1. Start node without a Machine CR (agent self-registers).
+  2. Wait for the node to become Ready.
+  3. Validate the Machine CR created by the agent.
+   4. Update the Machine CR version and repave counter.
+  5. Wait for the node to be upgraded.
+  6. Reset the node.
+  7. Rejoin the node and validate again.
+
+Options:
+    --verbose                          Enable diagnostic output (network diags).
+
 Subcommands (called as individual workflow steps):
-    create-vm          Create bridge networking and launch a QEMU VM.
-    run-agent          Build agent, extract cluster info, run provision script.
-    wait-for-node      Wait for the node to appear and become Ready.
-    validate-workload  Deploy test pods on the agent node.
-    cleanup            Tear down VM, networking, and Kind cluster.
+    create-vm                          Create bridge networking and launch a QEMU VM.
+    ensure-kind-bridge                 Verify/repair veth pair connecting Kind to VM bridge.
+    run-agent                          Build agent, generate bootstrap script, run on VM.
+    wait-for-node                      Wait for the node to appear and become Ready.
+    validate-workload                  Deploy test pods on the agent node.
+    validate-kube-proxy                Verify kube-proxy is Running on all nodes.
+    install-machine-crd                Install Machine CRD and bootstrapper RBAC.
+    start-machina-controller           Run the machina controller against Kind.
+    validate-machina-controller        Verify machina creates an MCV.
+    delete-machine-cr                  Delete the Machine CR.
+    validate-machine-cr-created        Verify agent self-registered a Machine CR.
+    validate-node-reboot-operation     Verify NodeReboot MachineOperation restarts the node.
+    validate-node-repave-upgrade       Verify OnDelete repave applies a new MCV Kubernetes version.
+    reset-agent                        Trigger AgentReset and verify cleanup.
+    cleanup                            Tear down VM, networking, and Kind cluster.
 """
 
 from __future__ import annotations
 
+import argparse
 import base64
 import json
 import os
@@ -46,6 +69,7 @@ VM_GATEWAY = f"{VM_SUBNET}.1"
 VM_DIR = Path(os.environ.get("VM_DIR", str(REPO_ROOT / ".vm-e2e")))
 
 KIND_CLUSTER_NAME = os.environ.get("KIND_CLUSTER_NAME", "kind")
+KIND_CONTAINER = f"{KIND_CLUSTER_NAME}-control-plane"
 AGENT_MACHINE_NAME = os.environ.get("AGENT_MACHINE_NAME", "agent-e2e")
 AGENT_DEBUG = os.environ.get("AGENT_DEBUG", "")
 
@@ -59,6 +83,9 @@ BRIDGE_NAME = "virbr-e2e"
 TAP_NAME = "tap-e2e"
 SERVE_PORT = 8199
 
+# Set to True by --verbose flag; gates diagnostic output.
+VERBOSE = False
+
 SSH_KEY_DIR = VM_DIR / "ssh"
 SSH_KEY = SSH_KEY_DIR / "id_ed25519"
 SSH_OPTS = [
@@ -71,8 +98,13 @@ SSH_TARGET = f"ubuntu@{VM_IP}"
 
 KUBECTL = "kubectl"
 KUBECTL_UNBOUNDED = str(REPO_ROOT / "bin" / "kubectl-unbounded")
+MACHINA = str(REPO_ROOT / "bin" / "machina")
 
 TEST_NS = "e2e-workload-test"
+MACHINA_PID_FILE = VM_DIR / "machina-controller.pid"
+MACHINA_LOG_FILE = VM_DIR / "machina-controller.log"
+MACHINA_CONFIG_FILE = VM_DIR / "machina-config.yaml"
+MACHINE_CONFIG_NAME = f"{AGENT_MACHINE_NAME}-config"
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +117,35 @@ def log(msg: str) -> None:
 def die(msg: str) -> None:
     print(f"[ERROR] {msg}", file=sys.stderr, flush=True)
     sys.exit(1)
+
+
+def diag(msg: str) -> None:
+    """Print a diagnostic message only when --verbose is active."""
+    if VERBOSE:
+        print(f"[DIAG]  {msg}", flush=True)
+
+
+def _nm_unmanage(iface: str) -> None:
+    """Tell NetworkManager to leave *iface* alone.
+
+    NetworkManager can silently detach interfaces from their bridge master.
+    Calling ``nmcli device set <iface> managed no`` prevents this.  The
+    setting is runtime-only (resets when NM restarts) so it does not touch
+    any persistent configuration files.
+
+    No-op if ``nmcli`` is not installed or if the command fails (NM may not
+    be running).
+    """
+    if shutil.which("nmcli") is None:
+        return
+    result = subprocess.run(
+        ["sudo", "nmcli", "device", "set", iface, "managed", "no"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+    )
+    if result.returncode == 0:
+        diag(f"Told NetworkManager to ignore {iface}")
+    else:
+        diag(f"nmcli device set {iface} managed no failed (rc={result.returncode}), continuing")
 
 
 def run(args: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
@@ -125,53 +186,256 @@ def _b64(val: str) -> str:
     return base64.b64encode(val.encode()).decode()
 
 
+def _machine_operation_resource() -> str:
+    """Return the fully-qualified MachineOperation resource name."""
+    return "machineoperations.v1alpha3.unbounded-cloud.io"
+
+
+def create_machine_operation(
+    name: str,
+    machine_name: str,
+    operation_kind: str,
+    ttl_seconds: int | None = None,
+) -> None:
+    """Create a MachineOperation CR targeting *machine_name*."""
+
+    spec: dict[str, Any] = {
+        "machineRef": machine_name,
+        "operationKind": operation_kind,
+    }
+    if ttl_seconds is not None:
+        spec["ttlSecondsAfterFinished"] = ttl_seconds
+
+    operation = {
+        "apiVersion": "unbounded-cloud.io/v1alpha3",
+        "kind": "MachineOperation",
+        "metadata": {"name": name},
+        "spec": spec,
+    }
+
+    log(f"Creating MachineOperation '{name}' ({operation_kind}) for '{machine_name}'...")
+    kubectl(["apply", "-f", "-"], input=json.dumps(operation).encode())
+
+
+def wait_for_machine_operation_complete(name: str, timeout_secs: int = 180) -> dict[str, Any]:
+    """Wait for a MachineOperation to complete and return its JSON object."""
+
+    log(f"Waiting for MachineOperation '{name}' to complete (timeout: {timeout_secs}s)...")
+    elapsed = 0
+    resource = _machine_operation_resource()
+    last_phase = ""
+    last_message = ""
+
+    while elapsed < timeout_secs:
+        result = subprocess.run(
+            [KUBECTL, "get", resource, name, "-o", "json"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            operation = json.loads(result.stdout)
+            status = operation.get("status", {})
+            phase = status.get("phase", "")
+            message = status.get("message", "")
+            if phase != last_phase or message != last_message:
+                log(f"  MachineOperation phase={phase or '<empty>'} message={message or '<empty>'}")
+                last_phase = phase
+                last_message = message
+            if phase == "Complete":
+                log(f"MachineOperation '{name}' completed after {elapsed}s")
+                return operation
+            if phase == "Failed":
+                die(f"MachineOperation '{name}' failed: {message}")
+
+        if elapsed > 0 and elapsed % 30 == 0:
+            log(f"  ({elapsed}s) MachineOperation not complete yet")
+        time.sleep(5)
+        elapsed += 5
+
+    subprocess.run([KUBECTL, "get", resource, name, "-o", "yaml"], check=False)
+    die(f"Timed out waiting for MachineOperation '{name}' to complete after {timeout_secs}s")
+
+
+def node_boot_id(node_name: str) -> str:
+    """Return the node boot ID reported by kubelet."""
+
+    return kubectl_capture([
+        "get", "node", node_name,
+        "-o", "jsonpath={.status.nodeInfo.bootID}",
+    ]).strip()
+
+
+def node_kubelet_version(node_name: str) -> str:
+    """Return the kubelet version reported by the Node object."""
+
+    return kubectl_capture([
+        "get", "node", node_name,
+        "-o", "jsonpath={.status.nodeInfo.kubeletVersion}",
+    ]).strip()
+
+
+def wait_for_node_ready(node_name: str, timeout_secs: int = 120) -> None:
+    """Wait until *node_name* reports Ready=True."""
+
+    log(f"Waiting for node '{node_name}' to be Ready (timeout: {timeout_secs}s)...")
+    elapsed = 0
+    while elapsed < timeout_secs:
+        result = subprocess.run(
+            [KUBECTL, "get", "node", node_name,
+             "-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}"],
+            capture_output=True, text=True,
+        )
+        status = result.stdout.strip() if result.returncode == 0 else "unknown"
+        if status == "True":
+            log(f"Node '{node_name}' is Ready after {elapsed}s")
+            return
+        if elapsed > 0 and elapsed % 30 == 0:
+            log(f"  ({elapsed}s) Node not yet Ready (status: {status})")
+        time.sleep(5)
+        elapsed += 5
+
+    kubectl(["describe", "node", node_name])
+    die(f"Timed out waiting for node '{node_name}' to become Ready after {timeout_secs}s")
+
+
+def wait_for_node_absent(node_name: str, timeout_secs: int = 120) -> None:
+    """Wait until *node_name* no longer exists."""
+
+    log(f"Waiting for node '{node_name}' to be deleted (timeout: {timeout_secs}s)...")
+    elapsed = 0
+    while elapsed < timeout_secs:
+        ret = subprocess.run(
+            [KUBECTL, "get", "node", node_name, "-o", "name"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        if ret.returncode != 0:
+            log(f"Node '{node_name}' deleted after {elapsed}s")
+            return
+        if elapsed > 0 and elapsed % 30 == 0:
+            log(f"  ({elapsed}s) Node still present...")
+        time.sleep(5)
+        elapsed += 5
+
+    kubectl(["get", "node", node_name, "-o", "wide"])
+    die(f"Timed out waiting for node '{node_name}' to be deleted after {timeout_secs}s")
+
+
+def wait_for_node_kubelet_version(
+    node_name: str,
+    expected_version: str,
+    timeout_secs: int = 300,
+) -> None:
+    """Wait until *node_name* reports *expected_version* as kubeletVersion."""
+
+    log(f"Waiting for node '{node_name}' kubeletVersion={expected_version}...")
+    elapsed = 0
+    last_version = ""
+    while elapsed < timeout_secs:
+        result = subprocess.run(
+            [KUBECTL, "get", "node", node_name,
+             "-o", "jsonpath={.status.nodeInfo.kubeletVersion}"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            last_version = result.stdout.strip()
+            if last_version == expected_version:
+                log(f"Node kubeletVersion reached {expected_version} after {elapsed}s")
+                return
+        if elapsed > 0 and elapsed % 30 == 0:
+            log(f"  ({elapsed}s) kubeletVersion={last_version or '<unavailable>'}")
+        time.sleep(5)
+        elapsed += 5
+
+    kubectl(["describe", "node", node_name])
+    die(f"Timed out waiting for kubeletVersion={expected_version}; last={last_version!r}")
+
+
+def wait_for_node_boot_id_change(node_name: str, previous_boot_id: str, timeout_secs: int = 120) -> str:
+    """Wait for kubelet to report a different node boot ID."""
+
+    log(f"Waiting for node '{node_name}' boot ID to change (timeout: {timeout_secs}s)...")
+    elapsed = 0
+    while elapsed < timeout_secs:
+        current_boot_id = node_boot_id(node_name)
+        if current_boot_id and current_boot_id != previous_boot_id:
+            log(f"Node boot ID changed: {previous_boot_id} -> {current_boot_id}")
+            return current_boot_id
+        if elapsed > 0 and elapsed % 30 == 0:
+            log(f"  ({elapsed}s) Node boot ID unchanged: {current_boot_id or '<empty>'}")
+        time.sleep(5)
+        elapsed += 5
+
+    kubectl(["describe", "node", node_name])
+    die(f"Timed out waiting for node '{node_name}' boot ID to change after {timeout_secs}s")
+
+
+def wait_for_node_reboot_event(node_name: str, boot_id: str, timeout_secs: int = 120) -> None:
+    """Wait for the Kubernetes Node Rebooted event for *boot_id*."""
+
+    log(f"Waiting for Node Rebooted event for boot ID '{boot_id}'...")
+    elapsed = 0
+    while elapsed < timeout_secs:
+        result = subprocess.run(
+            [
+                KUBECTL, "get", "events",
+                "--field-selector", f"involvedObject.kind=Node,involvedObject.name={node_name},reason=Rebooted",
+                "-o", "json",
+            ],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            events = json.loads(result.stdout).get("items", [])
+            for event in events:
+                message = event.get("message", "")
+                if boot_id in message:
+                    log(f"Observed Node Rebooted event: {message}")
+                    return
+
+        if elapsed > 0 and elapsed % 30 == 0:
+            log(f"  ({elapsed}s) Rebooted event not observed yet")
+        time.sleep(5)
+        elapsed += 5
+
+    kubectl(["get", "events", "--field-selector", f"involvedObject.kind=Node,involvedObject.name={node_name}",
+             "--sort-by=.lastTimestamp"])
+    die(f"Timed out waiting for Node Rebooted event for '{node_name}' boot ID '{boot_id}'")
+
+
 # ---------------------------------------------------------------------------
-# create-vm
+# create-vm / recreate-vm helpers
 # ---------------------------------------------------------------------------
-def create_vm() -> None:
-    """Create bridge networking and launch a QEMU VM."""
+def _stop_qemu() -> None:
+    """Stop the QEMU VM process if it is running."""
+    pid_file = VM_DIR / f"{VM_NAME}.pid"
+    if not pid_file.exists():
+        return
 
-    # Pre-flight
-    for cmd in ("qemu-system-x86_64", "qemu-img", "genisoimage"):
-        if shutil.which(cmd) is None:
-            die(f"{cmd} is required but not found in PATH")
-    if not os.access("/dev/kvm", os.R_OK):
-        die("/dev/kvm is not accessible. Enable KVM for hardware acceleration.")
+    pid = int(pid_file.read_text().strip())
+    try:
+        os.kill(pid, 0)
+        log(f"Stopping VM '{VM_NAME}' (PID: {pid})...")
+        os.kill(pid, 15)
+        time.sleep(2)
+        try:
+            os.kill(pid, 0)
+            log("Force killing VM...")
+            os.kill(pid, 9)
+        except OSError:
+            pass  # already exited after SIGTERM
+    except OSError:
+        pass  # already gone
+    pid_file.unlink(missing_ok=True)
 
-    VM_DIR.mkdir(parents=True, exist_ok=True)
-    SSH_KEY_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Generate SSH key pair
-    if not SSH_KEY.exists():
-        log("Generating SSH key pair...")
-        run(["ssh-keygen", "-t", "ed25519", "-f", str(SSH_KEY), "-N", "", "-q"])
+def _launch_vm(ssh_pub_key: str) -> None:
+    """Create a fresh VM disk, cloud-init ISO, launch QEMU, and wait for SSH.
 
-    ssh_pub_key = SSH_KEY.with_suffix(".pub").read_text().strip()
+    Assumes VM_DIR, the base cloud image, and the SSH key pair already exist.
+    Networking (bridge, TAP, NAT) must already be configured.
+    """
 
-    # Create bridge network
-    log(f"Creating bridge network {BRIDGE_NAME}...")
-    run_quiet(["sudo", "ip", "link", "del", BRIDGE_NAME], check=False)
-    run(["sudo", "ip", "link", "add", BRIDGE_NAME, "type", "bridge"])
-    run(["sudo", "ip", "addr", "add", f"{VM_GATEWAY}/24", "dev", BRIDGE_NAME])
-    run(["sudo", "ip", "link", "set", BRIDGE_NAME, "up"])
-
-    # NAT for the VM subnet
-    run(["sudo", "iptables", "-t", "nat", "-A", "POSTROUTING",
-         "-s", f"{VM_SUBNET}.0/24", "!", "-d", f"{VM_SUBNET}.0/24", "-j", "MASQUERADE"])
-
-    # TAP device
-    run(["sudo", "ip", "tuntap", "add", "dev", TAP_NAME, "mode", "tap"])
-    run(["sudo", "ip", "link", "set", TAP_NAME, "master", BRIDGE_NAME])
-    run(["sudo", "ip", "link", "set", TAP_NAME, "up"])
-
-    # Download Ubuntu cloud image
-    image_url = "https://cloud-images.ubuntu.com/minimal/releases/noble/release/ubuntu-24.04-minimal-cloudimg-amd64.img"
     image_file = VM_DIR / "ubuntu-cloud-amd64.img"
     if not image_file.exists():
-        log("Downloading Ubuntu 24.04 cloud image...")
-        run(["curl", "-fsSL", "-o", str(image_file), image_url])
-    else:
-        log(f"Using existing image: {image_file}")
+        die(f"Base cloud image not found: {image_file}. Run create-vm first.")
 
     # Create VM disk
     vm_disk = VM_DIR / f"{VM_NAME}.qcow2"
@@ -232,8 +496,11 @@ def create_vm() -> None:
     """))
 
     meta_data = VM_DIR / "meta-data"
+    # Use a unique instance-id so cloud-init treats this as a new instance
+    # even when reusing the same VM_DIR.
+    instance_id = f"{VM_NAME}-{secrets.token_hex(4)}"
     meta_data.write_text(textwrap.dedent(f"""\
-        instance-id: {VM_NAME}
+        instance-id: {instance_id}
         local-hostname: {VM_NAME}
     """))
 
@@ -316,10 +583,154 @@ def create_vm() -> None:
 
 
 # ---------------------------------------------------------------------------
+# create-vm
+# ---------------------------------------------------------------------------
+def create_vm() -> None:
+    """Create bridge networking and launch a QEMU VM."""
+
+    # Pre-flight
+    for cmd in ("qemu-system-x86_64", "qemu-img", "genisoimage"):
+        if shutil.which(cmd) is None:
+            die(f"{cmd} is required but not found in PATH")
+    if not os.access("/dev/kvm", os.R_OK):
+        die("/dev/kvm is not accessible. Enable KVM for hardware acceleration.")
+
+    VM_DIR.mkdir(parents=True, exist_ok=True)
+    SSH_KEY_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Generate SSH key pair
+    if not SSH_KEY.exists():
+        log("Generating SSH key pair...")
+        run(["ssh-keygen", "-t", "ed25519", "-f", str(SSH_KEY), "-N", "", "-q"])
+
+    ssh_pub_key = SSH_KEY.with_suffix(".pub").read_text().strip()
+
+    # Create bridge network
+    log(f"Creating bridge network {BRIDGE_NAME}...")
+    run_quiet(["sudo", "ip", "link", "del", BRIDGE_NAME], check=False)
+    run(["sudo", "ip", "link", "add", BRIDGE_NAME, "type", "bridge"])
+    run(["sudo", "ip", "addr", "add", f"{VM_GATEWAY}/24", "dev", BRIDGE_NAME])
+    run(["sudo", "ip", "link", "set", BRIDGE_NAME, "up"])
+
+    # NAT for the VM subnet
+    run(["sudo", "iptables", "-t", "nat", "-A", "POSTROUTING",
+         "-s", f"{VM_SUBNET}.0/24", "!", "-d", f"{VM_SUBNET}.0/24", "-j", "MASQUERADE"])
+
+    # TAP device
+    run(["sudo", "ip", "tuntap", "add", "dev", TAP_NAME, "mode", "tap"])
+    run(["sudo", "ip", "link", "set", TAP_NAME, "master", BRIDGE_NAME])
+    run(["sudo", "ip", "link", "set", TAP_NAME, "up"])
+
+    # Prevent NetworkManager from detaching interfaces from the bridge.
+    _nm_unmanage(BRIDGE_NAME)
+    _nm_unmanage(TAP_NAME)
+
+    # Download Ubuntu cloud image
+    image_url = "https://cloud-images.ubuntu.com/minimal/releases/noble/release/ubuntu-24.04-minimal-cloudimg-amd64.img"
+    image_file = VM_DIR / "ubuntu-cloud-amd64.img"
+    if not image_file.exists():
+        log("Downloading Ubuntu 24.04 cloud image...")
+        run(["curl", "-fsSL", "-o", str(image_file), image_url])
+    else:
+        log(f"Using existing image: {image_file}")
+
+    _launch_vm(ssh_pub_key)
+
+
+# ---------------------------------------------------------------------------
+# ensure-kind-bridge
+# ---------------------------------------------------------------------------
+VETH_HOST = "veth-kind-e2e"
+VETH_KIND = "eth-e2e"
+
+
+def ensure_kind_bridge() -> None:
+    """Ensure the Kind container is connected to the VM bridge via a veth pair.
+
+    Checks whether veth-kind-e2e is attached to virbr-e2e on the host and
+    eth-e2e exists inside the Kind container with the correct IP.  If
+    anything is missing or broken the veth pair is (re)created.
+
+    This is safe to call repeatedly (idempotent) and is used between
+    Case 1 and Case 2 to guard against the veth pair being detached from
+    the bridge by external events (Docker, kernel, etc.).
+    """
+    log(f"Ensuring Kind container is attached to bridge {BRIDGE_NAME}...")
+
+    needs_repair = False
+
+    # 1. Check if veth-kind-e2e exists on the host and is a member of
+    #    the correct bridge.
+    result = subprocess.run(
+        ["ip", "-j", "link", "show", VETH_HOST],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        log(f"  {VETH_HOST} does not exist on host - will create")
+        needs_repair = True
+    else:
+        try:
+            link_info = json.loads(result.stdout)
+            master = link_info[0].get("master", "")
+            if master != BRIDGE_NAME:
+                log(f"  {VETH_HOST} exists but master='{master}' (expected '{BRIDGE_NAME}') - will recreate")
+                needs_repair = True
+            else:
+                log(f"  {VETH_HOST} is correctly attached to {BRIDGE_NAME}")
+        except (ValueError, IndexError, KeyError):
+            log(f"  Could not parse ip -j output for {VETH_HOST} - will recreate")
+            needs_repair = True
+
+    # 2. Check if eth-e2e exists inside the Kind container with the
+    #    expected IP address.
+    if not needs_repair:
+        result = subprocess.run(
+            ["docker", "exec", KIND_CONTAINER, "ip", "addr", "show", VETH_KIND],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            log(f"  {VETH_KIND} does not exist in Kind container - will recreate")
+            needs_repair = True
+        elif f"{VM_SUBNET}.2/24" not in result.stdout:
+            log(f"  {VETH_KIND} exists but missing {VM_SUBNET}.2/24 - will recreate")
+            needs_repair = True
+
+    if not needs_repair:
+        log("  Bridge attachment is healthy - no action needed")
+        return
+
+    # 3. Repair: delete any stale veth and recreate the pair.
+    log("  Repairing bridge attachment...")
+    kind_pid = capture([
+        "docker", "inspect", KIND_CONTAINER,
+        "--format", "{{.State.Pid}}",
+    ])
+
+    # Deleting either end destroys the whole pair, so this is safe even
+    # if only one end still exists.
+    run_quiet(["sudo", "ip", "link", "delete", VETH_HOST], check=False)
+
+    run(["sudo", "ip", "link", "add", VETH_HOST, "type", "veth",
+         "peer", "name", VETH_KIND])
+    run(["sudo", "ip", "link", "set", VETH_HOST, "master", BRIDGE_NAME])
+    run(["sudo", "ip", "link", "set", VETH_HOST, "up"])
+    run(["sudo", "ip", "link", "set", VETH_KIND, "netns", kind_pid])
+    run(["sudo", "nsenter", "-t", kind_pid, "-n",
+         "ip", "addr", "add", f"{VM_SUBNET}.2/24", "dev", VETH_KIND])
+    run(["sudo", "nsenter", "-t", kind_pid, "-n",
+         "ip", "link", "set", VETH_KIND, "up"])
+
+    # Prevent NetworkManager from detaching the veth from the bridge.
+    _nm_unmanage(VETH_HOST)
+
+    log(f"  Repaired: {VETH_HOST} -> {BRIDGE_NAME} -> {VETH_KIND} in Kind container")
+
+
+# ---------------------------------------------------------------------------
 # run-agent
 # ---------------------------------------------------------------------------
 def run_agent() -> None:
-    """Build agent, extract cluster info, run provision install script on VM."""
+    """Build agent, generate bootstrap script, and run it on the VM."""
 
     if not SSH_KEY.exists():
         die(f"SSH key not found: {SSH_KEY}. Run create-vm first.")
@@ -333,6 +744,9 @@ def run_agent() -> None:
     run(["go", "build", "-o", str(agent_bin), str(REPO_ROOT / "cmd" / "agent" / "main.go")],
         env={**os.environ, "GOOS": "linux", "GOARCH": "amd64"})
     log(f"Agent binary built: {agent_bin}")
+
+    log("Rendering manifests for embedded fs...")
+    run(["make", "machina-manifests", "net-manifests"], cwd=str(REPO_ROOT))
 
     log("Building kubectl-unbounded...")
     kubectl_unbounded_bin = Path(KUBECTL_UNBOUNDED)
@@ -380,9 +794,8 @@ def _run_agent_inner(agent_url: str) -> None:
     # Determine the Kind control-plane IP so connectivity checks have the
     # correct address even when the local kubeconfig uses 127.0.0.1.
     log(f"Resolving Kind control-plane IP for '{KIND_CLUSTER_NAME}'...")
-    kind_container = f"{KIND_CLUSTER_NAME}-control-plane"
     kind_ip = capture([
-        "docker", "inspect", kind_container,
+        "docker", "inspect", KIND_CONTAINER,
         "--format", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
     ])
     if not kind_ip:
@@ -400,6 +813,7 @@ def _run_agent_inner(agent_url: str) -> None:
     log("Creating bootstrap token...")
     token_id = secrets.token_hex(3)
     token_secret = secrets.token_hex(8)
+    (VM_DIR / "token-id").write_text(token_id)
     bootstrap_group = "system:bootstrappers:kubeadm:default-node-token"
 
     token_manifest = json.dumps({
@@ -408,6 +822,9 @@ def _run_agent_inner(agent_url: str) -> None:
         "metadata": {
             "name": f"bootstrap-token-{token_id}",
             "namespace": "kube-system",
+            "labels": {
+                "unbounded-cloud.io/site": E2E_SITE_NAME,
+            },
         },
         "type": "bootstrap.kubernetes.io/token",
         "data": {
@@ -423,15 +840,17 @@ def _run_agent_inner(agent_url: str) -> None:
 
     # Generate bootstrap script via kubectl-unbounded.
     # manual-bootstrap auto-detects the API server, CA cert, Kubernetes
-    # version, and cluster DNS from the active kubeconfig, and picks up
-    # the bootstrap token we just created via the fallback path.
+    # version, and cluster DNS from the active kubeconfig. The bootstrap
+    # token is resolved via the site label on the secret.
     log("Generating bootstrap script with kubectl-unbounded machine manual-bootstrap...")
 
     # Capture the local API server URL from the kubeconfig (typically
     # https://127.0.0.1:<port> for Kind) so we can replace it with the
     # VM-reachable container IP after generating the script.
+    # Use --minify to scope to the current context only, avoiding picking up
+    # the wrong cluster when multiple contexts exist in the kubeconfig.
     local_api_server = kubectl_capture([
-        "config", "view", "--raw",
+        "config", "view", "--minify", "--raw",
         "-o", "jsonpath={.clusters[0].cluster.server}",
     ])
     if not local_api_server:
@@ -514,32 +933,163 @@ def wait_for_node() -> None:
         subprocess.run([KUBECTL, "get", "nodes", "-o", "wide"], check=False)
         die(f"Timed out waiting for node '{AGENT_MACHINE_NAME}' after {node_timeout}s")
 
-    # Wait for Ready
-    log(f"Waiting for node '{AGENT_MACHINE_NAME}' to become Ready (timeout: {ready_timeout}s)...")
-    elapsed = 0
-    while elapsed < ready_timeout:
-        result = subprocess.run(
-            [KUBECTL, "get", "node", AGENT_MACHINE_NAME,
-             "-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}"],
-            capture_output=True, text=True,
-        )
-        status = result.stdout.strip() if result.returncode == 0 else "unknown"
-        if status == "True":
-            log(f"Node '{AGENT_MACHINE_NAME}' is Ready after {elapsed}s")
-            break
-        if elapsed > 0 and elapsed % 30 == 0:
-            log(f"  ({elapsed}s) Node not yet Ready (status: {status})")
-        time.sleep(5)
-        elapsed += 5
-    else:
-        log("Node status:")
-        subprocess.run([KUBECTL, "describe", "node", AGENT_MACHINE_NAME], check=False)
-        die(f"Timed out waiting for node '{AGENT_MACHINE_NAME}' to become Ready after {ready_timeout}s")
+    wait_for_node_ready(AGENT_MACHINE_NAME, ready_timeout)
 
     log("============================================")
     log("  Node join PASSED")
     log("============================================")
     kubectl(["get", "nodes", "-o", "wide"])
+
+
+# ---------------------------------------------------------------------------
+# Network diagnostics (non-fatal)
+# ---------------------------------------------------------------------------
+def _run_diag(label: str, args: list[str]) -> None:
+    """Run a single diagnostic command, printing its output under *label*.
+
+    Only produces output when ``--verbose`` is active.
+    """
+    if not VERBOSE:
+        return
+    diag(label)
+    result = subprocess.run(args, capture_output=True, text=True, check=False)
+    out = (result.stdout or "").rstrip()
+    err = (result.stderr or "").rstrip()
+    if out:
+        for line in out.splitlines():
+            print(f"  {line}", flush=True)
+    if err:
+        for line in err.splitlines():
+            print(f"  (stderr) {line}", flush=True)
+    if result.returncode != 0:
+        print(f"  (exit code {result.returncode})", flush=True)
+
+
+def _log_network_diagnostics() -> None:
+    """Emit non-fatal network diagnostics from the VM, Kind container, and host.
+
+    Only produces output when ``--verbose`` is active.  Called in
+    validate_workload() after the pod reaches Running but before we attempt
+    ``kubectl logs`` (which proxies through the kubelet and may fail with
+    "no route to host" if there is a networking issue between the Kind
+    container and the VM).
+    """
+    if not VERBOSE:
+        return
+    log("=== Network diagnostics (non-fatal) ===")
+
+    # -- From the VM (via SSH) --
+    _run_diag("VM: nft list ruleset",
+              ["ssh", *SSH_OPTS, SSH_TARGET, "sudo", "nft", "list", "ruleset"])
+    # Show ALL listening TCP sockets (unfiltered) so we can see what port
+    # the kubelet is actually on.  sudo is needed to see process names for
+    # sockets owned by nspawn processes.
+    _run_diag("VM: sudo ss -tlnp (all listening)",
+              ["ssh", *SSH_OPTS, SSH_TARGET, "sudo", "ss", "-tlnp"])
+    _run_diag("VM: ip addr show",
+              ["ssh", *SSH_OPTS, SSH_TARGET, "ip", "addr", "show"])
+
+    # -- From the Kind container --
+    _run_diag("Kind: ip addr show eth-e2e",
+              ["docker", "exec", KIND_CONTAINER, "ip", "addr", "show", "eth-e2e"])
+    _run_diag("Kind: ip route",
+              ["docker", "exec", KIND_CONTAINER, "ip", "route"])
+    _run_diag("Kind: ip neigh show",
+              ["docker", "exec", KIND_CONTAINER, "ip", "neigh", "show"])
+    _run_diag("Kind: ping VM",
+              ["docker", "exec", KIND_CONTAINER,
+               "ping", "-c", "2", "-W", "2", VM_IP])
+    _run_diag("Kind: curl kubelet /healthz",
+              ["docker", "exec", KIND_CONTAINER,
+               "curl", "-sk", "--connect-timeout", "5",
+               f"https://{VM_IP}:10250/healthz"])
+
+    # -- From the host --
+    # Show ALL interfaces so we can verify veth-kind-e2e exists and is UP.
+    _run_diag("Host: ip link show (all)",
+              ["ip", "link", "show"])
+    _run_diag("Host: ip -d link show type veth",
+              ["ip", "-d", "link", "show", "type", "veth"])
+    _run_diag("Host: bridge link show",
+              ["bridge", "link", "show"])
+
+    log("=== End network diagnostics ===")
+
+
+# ---------------------------------------------------------------------------
+# validate-kube-proxy
+# ---------------------------------------------------------------------------
+def validate_kube_proxy() -> None:
+    """Validate that kube-proxy pods are Running on every node in the cluster.
+
+    kube-proxy requires /lib/modules from the host kernel to load kernel
+    modules via modprobe. This check catches regressions where the nspawn
+    container does not bind-mount /lib/modules.
+    """
+
+    timeout_secs = 180
+
+    # Get all node names.
+    node_names_raw = kubectl_capture(["get", "nodes", "-o", "jsonpath={.items[*].metadata.name}"])
+    all_nodes = set(node_names_raw.split())
+    if not all_nodes:
+        die("No nodes found in the cluster")
+    log(f"Cluster nodes: {sorted(all_nodes)}")
+
+    # Wait for kube-proxy pods to be Running on every node.
+    log(f"Waiting for kube-proxy pods to be Running on all {len(all_nodes)} node(s) "
+        f"(timeout: {timeout_secs}s)...")
+    elapsed = 0
+    while elapsed < timeout_secs:
+        result = subprocess.run(
+            [KUBECTL, "get", "pods", "-n", "kube-system",
+             "-l", "k8s-app=kube-proxy",
+             "-o", "json"],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            if elapsed > 0 and elapsed % 30 == 0:
+                log(f"  ({elapsed}s) Failed to list kube-proxy pods")
+            time.sleep(5)
+            elapsed += 5
+            continue
+
+        pods = json.loads(result.stdout).get("items", [])
+        running_nodes: set[str] = set()
+        for pod in pods:
+            phase = pod.get("status", {}).get("phase", "")
+            node = pod.get("spec", {}).get("nodeName", "")
+            if phase == "Running" and node:
+                running_nodes.add(node)
+
+        if running_nodes >= all_nodes:
+            log(f"kube-proxy Running on all nodes after {elapsed}s")
+            break
+
+        missing = sorted(all_nodes - running_nodes)
+        if elapsed > 0 and elapsed % 30 == 0:
+            log(f"  ({elapsed}s) kube-proxy not yet Running on: {missing}")
+        time.sleep(5)
+        elapsed += 5
+    else:
+        log("kube-proxy pod status:")
+        subprocess.run([KUBECTL, "get", "pods", "-n", "kube-system",
+                        "-l", "k8s-app=kube-proxy", "-o", "wide"], check=False)
+        # Show logs from non-Running pods for debugging.
+        for pod in pods:
+            phase = pod.get("status", {}).get("phase", "")
+            name = pod.get("metadata", {}).get("name", "")
+            if phase != "Running" and name:
+                log(f"Logs for {name}:")
+                subprocess.run([KUBECTL, "logs", name, "-n", "kube-system",
+                                "--tail=50"], check=False)
+        die(f"kube-proxy not Running on all nodes after {timeout_secs}s. "
+            f"Missing: {sorted(all_nodes - running_nodes)}")
+
+    log("============================================")
+    log("  kube-proxy validation PASSED")
+    log("============================================")
+    kubectl(["get", "pods", "-n", "kube-system", "-l", "k8s-app=kube-proxy", "-o", "wide"])
 
 
 # ---------------------------------------------------------------------------
@@ -604,9 +1154,34 @@ def validate_workload() -> None:
         subprocess.run([KUBECTL, "describe", "pod", "e2e-hello", "-n", TEST_NS], check=False)
         die(f"Timed out waiting for pod 'e2e-hello' to be Running after {timeout_secs}s")
 
-    # Check logs
+    # Emit network diagnostics before attempting kubectl logs.  The API
+    # server proxies log requests through the kubelet (port 10250) on the
+    # agent node.  If the Kind container cannot reach the VM this will fail
+    # with "no route to host".  The diagnostics help pinpoint the cause.
+    _log_network_diagnostics()
+
+    # Check logs (retry; kubectl logs can fail transiently right after a pod
+    # starts because the API server proxies to the kubelet which may not have
+    # the log stream ready yet).
     log("Checking pod logs...")
-    logs = capture([KUBECTL, "logs", "e2e-hello", "-n", TEST_NS])
+    logs = ""
+    log_attempts = 6
+    for attempt in range(1, log_attempts + 1):
+        result = subprocess.run(
+            [KUBECTL, "logs", "e2e-hello", "-n", TEST_NS],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            logs = result.stdout.strip()
+            break
+        if attempt < log_attempts:
+            log(f"  kubectl logs failed (attempt {attempt}/{log_attempts}): {result.stderr.strip()}")
+            time.sleep(5)
+        else:
+            log(f"  kubectl logs failed (attempt {attempt}/{log_attempts}): {result.stderr.strip()}")
+            subprocess.run([KUBECTL, "describe", "pod", "e2e-hello", "-n", TEST_NS], check=False)
+            die(f"kubectl logs failed after {log_attempts} attempts")
+
     print(logs, flush=True)
     if "Hello from unbounded agent node!" not in logs:
         die("Pod logs do not contain expected message")
@@ -684,18 +1259,24 @@ def validate_workload() -> None:
 # reset-agent
 # ---------------------------------------------------------------------------
 def reset_agent() -> None:
-    """Run unbounded-agent reset on the VM and verify the node is removed."""
+    """Trigger AgentReset and verify the node is removed."""
 
     if not SSH_KEY.exists():
         die(f"SSH key not found: {SSH_KEY}. Run create-vm first.")
 
-    log("Running 'unbounded-agent reset' on VM...")
-    run([
-        "timeout", "300",
-        "ssh", *SSH_OPTS, "-o", "ServerAliveInterval=30", SSH_TARGET,
-        "sudo unbounded-agent reset",
-    ])
-    log("Agent reset completed on VM")
+    operation_name = f"e2e-agent-reset-{int(time.time())}"
+
+    run_quiet([KUBECTL, "delete", _machine_operation_resource(), operation_name,
+               "--ignore-not-found"], check=False)
+
+    create_machine_operation(operation_name, AGENT_MACHINE_NAME, "AgentReset")
+
+    operation = wait_for_machine_operation_complete(operation_name, timeout_secs=300)
+    status = operation.get("status", {})
+    if status.get("message") != "AgentReset completed":
+        die(f"unexpected MachineOperation message: {status.get('message')!r}")
+
+    log("AgentReset MachineOperation completed")
 
     # Verify the node is removed from the cluster
     node_timeout = int(os.environ.get("NODE_TIMEOUT", "120"))
@@ -739,38 +1320,453 @@ def reset_agent() -> None:
 
 
 # ---------------------------------------------------------------------------
+# install-machine-crd
+# ---------------------------------------------------------------------------
+def install_machine_crd() -> None:
+    """Install Machine-related CRDs and bootstrapper RBAC."""
+
+    crd_paths = [
+        REPO_ROOT / "deploy" / "machina" / "crd" / "unbounded-cloud.io_machines.yaml",
+        REPO_ROOT / "deploy" / "machina" / "crd" / "unbounded-cloud.io_machineoperations.yaml",
+        REPO_ROOT / "deploy" / "machina" / "crd" / "unbounded-cloud.io_machineconfigurations.yaml",
+        REPO_ROOT / "deploy" / "machina" / "crd" / "unbounded-cloud.io_machineconfigurationversions.yaml",
+    ]
+    rbac_path = REPO_ROOT / "deploy" / "machina" / "rendered" / "07-bootstrapper-rbac.yaml"
+
+    for crd_path in crd_paths:
+        if not crd_path.exists():
+            die(f"Machina CRD not found: {crd_path}")
+
+    log("Rendering machina manifests...")
+    run(["make", "machina-manifests"], cwd=str(REPO_ROOT))
+
+    if not rbac_path.exists():
+        die(f"Bootstrapper RBAC not found after render: {rbac_path}")
+
+    log("Installing Machine-related CRDs...")
+    for crd_path in crd_paths:
+        kubectl(["apply", "-f", str(crd_path)])
+
+    log("Installing bootstrapper RBAC...")
+    kubectl(["apply", "-f", str(rbac_path)])
+
+    log("Machine CRDs and RBAC installed")
+
+
+# ---------------------------------------------------------------------------
+# start-machina-controller
+# ---------------------------------------------------------------------------
+def start_machina_controller() -> None:
+    """Build and run the machina controller locally against the Kind cluster."""
+
+    log("Building machina controller...")
+    run(["make", "machina-build"], cwd=str(REPO_ROOT))
+
+    api_server = kubectl_capture([
+        "config", "view", "--minify", "--raw",
+        "-o", "jsonpath={.clusters[0].cluster.server}",
+    ])
+    if not api_server:
+        die("Could not determine API server URL from kubeconfig")
+
+    MACHINA_CONFIG_FILE.write_text(textwrap.dedent(f"""\
+        apiServerEndpoint: {api_server}
+        metricsAddr: "0"
+        probeAddr: "0"
+        enableLeaderElection: false
+        maxConcurrentReconciles: 10
+    """))
+
+    if MACHINA_PID_FILE.exists():
+        old_pid = MACHINA_PID_FILE.read_text().strip()
+        if old_pid:
+            run_quiet(["kill", old_pid], check=False)
+
+    log("Starting machina controller in background...")
+    log(f"Machina logs: {MACHINA_LOG_FILE}")
+    log_file = MACHINA_LOG_FILE.open("w")
+    env = os.environ.copy()
+    # GitHub Actions uses RUNNER_TRACKING_ID to clean up processes it started.
+    # Clear it so the controller survives across later workflow steps.
+    env["RUNNER_TRACKING_ID"] = ""
+    proc = subprocess.Popen(
+        [MACHINA, "controller", f"--config={MACHINA_CONFIG_FILE}"],
+        cwd=str(REPO_ROOT),
+        env=env,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        text=True,
+    )
+    log_file.close()
+    MACHINA_PID_FILE.write_text(str(proc.pid))
+
+    time.sleep(3)
+    if proc.poll() is not None:
+        if MACHINA_LOG_FILE.exists():
+            print(MACHINA_LOG_FILE.read_text(), flush=True)
+        die(f"machina controller exited early with code {proc.returncode}")
+
+    log(f"Machina controller started (pid={proc.pid})")
+
+
+# ---------------------------------------------------------------------------
+# validate-machina-controller
+# ---------------------------------------------------------------------------
+def mcv_name(config_name: str, version: int) -> str:
+    """Return the canonical MachineConfigurationVersion name."""
+
+    return f"{config_name}-v{version}"
+
+
+def validate_machina_controller() -> None:
+    """Verify the machina controller reconciles MachineConfiguration objects."""
+
+    name = MACHINE_CONFIG_NAME
+
+    def wait_for_mcv(
+        mcv_name: str,
+        expected_version: int,
+        expected_node_labels: dict[str, str] | None,
+    ) -> dict[str, Any]:
+        timeout_secs = 60
+        elapsed = 0
+        while elapsed < timeout_secs:
+            result = subprocess.run(
+                [KUBECTL, "get", "machineconfigurationversion", mcv_name, "-o", "json"],
+                capture_output=True, text=True,
+            )
+            if result.returncode == 0:
+                mcv = json.loads(result.stdout)
+                version = mcv.get("spec", {}).get("version")
+                config = mcv.get("metadata", {}).get("labels", {}).get(
+                    "unbounded-cloud.io/machine-configuration",
+                )
+                node_labels = mcv.get("spec", {}).get("template", {}).get(
+                    "kubernetes", {},
+                ).get("nodeLabels")
+                if (
+                    version == expected_version
+                    and config == name
+                    and node_labels == expected_node_labels
+                ):
+                    return mcv
+
+            if elapsed > 0 and elapsed % 15 == 0:
+                log(f"  ({elapsed}s) waiting for MachineConfigurationVersion '{mcv_name}'...")
+            time.sleep(5)
+            elapsed += 5
+
+        if MACHINA_LOG_FILE.exists():
+            print(MACHINA_LOG_FILE.read_text(), flush=True)
+        die(f"MachineConfigurationVersion '{mcv_name}' was not ready after {timeout_secs}s")
+
+    log(f"Validating machina controller with MachineConfiguration '{name}'...")
+    version_json = json.loads(kubectl_capture(["version", "-o", "json"]))
+    server_version = version_json.get("serverVersion", {}).get("gitVersion")
+    if not server_version:
+        die(f"Could not resolve server version from kubectl version: {version_json}")
+
+    manifest = {
+        "apiVersion": "unbounded-cloud.io/v1alpha3",
+        "kind": "MachineConfiguration",
+        "metadata": {
+            "name": name,
+            "labels": {"e2e.unbounded-cloud.io/test": "agent-kind"},
+        },
+        "spec": {
+            "template": {
+                "kubernetes": {
+                    "version": server_version,
+                },
+            },
+        },
+    }
+    kubectl(["apply", "-f", "-"], input=json.dumps(manifest).encode())
+
+    v1_name = mcv_name(name, 1)
+    v1 = wait_for_mcv(v1_name, 1, None)
+    log(f"MachineConfigurationVersion '{v1_name}' created")
+
+    kubectl([
+        "patch", "machineconfigurationversion", v1_name,
+        "--subresource=status", "--type=merge",
+        "-p", json.dumps({
+            "status": {
+                "deployed": True,
+                "deployedMachines": 1,
+            },
+        }),
+    ])
+
+    updated_node_labels = {"e2e.unbounded-cloud.io/config-version": "v2"}
+    manifest["spec"]["template"]["kubernetes"]["nodeLabels"] = updated_node_labels
+    kubectl(["apply", "-f", "-"], input=json.dumps(manifest).encode())
+
+    v2_name = mcv_name(name, 2)
+    wait_for_mcv(v2_name, 2, updated_node_labels)
+    log(f"MachineConfigurationVersion '{v2_name}' created after config change")
+
+    v1 = json.loads(kubectl_capture([
+        "get", "machineconfigurationversion", v1_name, "-o", "json",
+    ]))
+    v1_node_labels = v1.get("spec", {}).get("template", {}).get(
+        "kubernetes", {},
+    ).get("nodeLabels")
+    if v1_node_labels is not None:
+        die(f"MachineConfigurationVersion '{v1_name}' changed unexpectedly: {v1_node_labels}")
+
+
+# ---------------------------------------------------------------------------
+# delete-machine-cr
+# ---------------------------------------------------------------------------
+def delete_machine_cr() -> None:
+    """Delete the Machine CR (idempotent)."""
+
+    log(f"Deleting Machine CR '{AGENT_MACHINE_NAME}'...")
+    run_quiet([KUBECTL, "delete", "machine", AGENT_MACHINE_NAME,
+               "--ignore-not-found"], check=False)
+    log(f"Machine CR '{AGENT_MACHINE_NAME}' deleted")
+
+
+# ---------------------------------------------------------------------------
+# validate-machine-cr-created
+# ---------------------------------------------------------------------------
+def validate_machine_cr_created() -> None:
+    """Validate the agent self-registered a Machine CR during bootstrap.
+
+    The daemon registers the Machine CR at startup, so this function polls
+    until the CR appears (with a timeout). Once found, it asserts the CR
+    does NOT have the pre-created marker annotation and has the correct
+    ``bootstrapTokenRef`` derived from the bootstrap token created by
+    run-agent.
+    """
+
+    token_id_file = VM_DIR / "token-id"
+    if not token_id_file.exists():
+        die(f"Token ID file not found: {token_id_file}. Run run-agent first.")
+    token_id = token_id_file.read_text().strip()
+
+    log(f"Validating agent-created Machine CR '{AGENT_MACHINE_NAME}'...")
+
+    # Poll for the Machine CR to appear (the daemon registers it
+    # asynchronously after startup).
+    timeout_secs = 120
+    elapsed = 0
+    machine_json = None
+    while elapsed < timeout_secs:
+        result = subprocess.run(
+            [KUBECTL, "get", "machine", AGENT_MACHINE_NAME, "-o", "json"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            machine_json = result.stdout
+            log(f"Machine CR '{AGENT_MACHINE_NAME}' found after {elapsed}s")
+            break
+        if elapsed > 0 and elapsed % 15 == 0:
+            log(f"  ({elapsed}s) Machine CR not yet created...")
+        time.sleep(5)
+        elapsed += 5
+    else:
+        die(f"Machine CR '{AGENT_MACHINE_NAME}' not found after {timeout_secs}s - "
+            f"expected daemon to create it")
+
+    machine = json.loads(machine_json)
+
+    # Must NOT have the pre-created marker.
+    annotations = machine.get("metadata", {}).get("annotations", {})
+    if "e2e-test/precreated" in annotations:
+        die("e2e-test/precreated annotation found - CR was not created by the agent")
+
+    # Verify bootstrapTokenRef.
+    k8s_spec = machine.get("spec", {}).get("kubernetes", {})
+    token_ref = k8s_spec.get("bootstrapTokenRef", {}).get("name", "")
+    expected_ref = f"bootstrap-token-{token_id}"
+    if token_ref != expected_ref:
+        die(f"bootstrapTokenRef mismatch: got '{token_ref}', expected '{expected_ref}'")
+
+    log(f"bootstrapTokenRef is correct: {token_ref}")
+
+    log("============================================")
+    log("  Machine CR validation PASSED (created)")
+    log("============================================")
+
+
+# ---------------------------------------------------------------------------
+# validate-node-reboot-operation
+# ---------------------------------------------------------------------------
+def validate_node_reboot_operation() -> None:
+    """Validate that a NodeReboot MachineOperation restarts the agent node."""
+
+    operation_name = f"e2e-node-reboot-{int(time.time())}"
+
+    log(f"Validating NodeReboot operation for '{AGENT_MACHINE_NAME}'...")
+    previous_boot_id = node_boot_id(AGENT_MACHINE_NAME)
+    if not previous_boot_id:
+        die(f"Node '{AGENT_MACHINE_NAME}' did not report a boot ID")
+    log(f"Current node boot ID: {previous_boot_id}")
+
+    run_quiet([KUBECTL, "delete", _machine_operation_resource(), operation_name,
+               "--ignore-not-found"], check=False)
+
+    create_machine_operation(operation_name, AGENT_MACHINE_NAME, "NodeReboot")
+
+    operation = wait_for_machine_operation_complete(operation_name)
+    status = operation.get("status", {})
+    if status.get("message") != "NodeReboot completed":
+        die(f"unexpected MachineOperation message: {status.get('message')!r}")
+
+    conditions = status.get("conditions", [])
+    completed_conditions = [
+        c for c in conditions
+        if c.get("type") == "Completed" and c.get("status") == "True" and c.get("reason") == "Succeeded"
+    ]
+    if not completed_conditions:
+        die(f"MachineOperation missing Completed=True/Succeeded condition: {conditions}")
+
+    new_boot_id = wait_for_node_boot_id_change(AGENT_MACHINE_NAME, previous_boot_id)
+    wait_for_node_reboot_event(AGENT_MACHINE_NAME, new_boot_id)
+    wait_for_node_ready(AGENT_MACHINE_NAME)
+
+    log("============================================")
+    log("  NodeReboot operation validation PASSED")
+    log("============================================")
+    kubectl(["get", _machine_operation_resource(), operation_name, "-o", "wide"])
+    kubectl(["get", "node", AGENT_MACHINE_NAME, "-o", "wide"])
+
+
+# ---------------------------------------------------------------------------
+# validate-node-repave-upgrade
+# ---------------------------------------------------------------------------
+def _next_patch_version(version: str) -> str:
+    """Return the next Kubernetes patch version for a vMAJOR.MINOR.PATCH string."""
+
+    base = version.strip().lstrip("v")
+    parts = base.split(".")
+    if len(parts) != 3 or not all(part.isdigit() for part in parts):
+        die(f"Cannot derive patch upgrade from Kubernetes version {version!r}")
+
+    parts[2] = str(int(parts[2]) + 1)
+    return "v" + ".".join(parts)
+
+
+def validate_node_repave_upgrade() -> None:
+    """Validate OnDelete repave applies a new MCV Kubernetes version."""
+
+    config_name = MACHINE_CONFIG_NAME
+
+    current_kubelet_version = node_kubelet_version(AGENT_MACHINE_NAME)
+    if not current_kubelet_version:
+        die(f"Node '{AGENT_MACHINE_NAME}' did not report a kubelet version")
+    target_kubelet_version = _next_patch_version(current_kubelet_version)
+
+    log("Validating OnDelete repave upgrade...")
+    log(f"Current kubelet version: {current_kubelet_version}")
+    log(f"Target kubelet version: {target_kubelet_version}")
+
+    manifest = json.loads(kubectl_capture(["get", "machineconfiguration", config_name, "-o", "json"]))
+    metadata = manifest.setdefault("metadata", {})
+    for key in ["creationTimestamp", "generation", "resourceVersion", "uid", "managedFields"]:
+        metadata.pop(key, None)
+    manifest.pop("status", None)
+    kubernetes_template = manifest.setdefault("spec", {}).setdefault(
+        "template", {},
+    ).setdefault("kubernetes", {})
+    kubernetes_template["version"] = target_kubelet_version
+    kubernetes_template["nodeLabels"] = {"e2e.unbounded-cloud.io/config-version": "v3"}
+    kubectl(["apply", "-f", "-"], input=json.dumps(manifest).encode())
+
+    timeout_secs = 120
+    elapsed = 0
+    target_version_number = 0
+    target_mcv = ""
+    while elapsed < timeout_secs:
+        result = subprocess.run(
+            [KUBECTL, "get", "machineconfigurationversion",
+             "-l", f"unbounded-cloud.io/machine-configuration={config_name}", "-o", "json"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            mcvs = json.loads(result.stdout).get("items", [])
+            matching_mcvs = [
+                mcv for mcv in mcvs
+                if mcv.get("spec", {}).get("template", {}).get("kubernetes", {}).get("version")
+                == target_kubelet_version
+            ]
+            if matching_mcvs:
+                latest = max(matching_mcvs, key=lambda mcv: mcv.get("spec", {}).get("version", 0))
+                target_version_number = latest.get("spec", {}).get("version", 0)
+                target_mcv = latest.get("metadata", {}).get("name", "")
+                log(f"MachineConfigurationVersion '{target_mcv}' is ready")
+                break
+        if elapsed > 0 and elapsed % 30 == 0:
+            log(f"  ({elapsed}s) waiting for MCV with Kubernetes {target_kubelet_version}...")
+        time.sleep(5)
+        elapsed += 5
+    else:
+        if MACHINA_LOG_FILE.exists():
+            print(MACHINA_LOG_FILE.read_text(), flush=True)
+        die(f"No MachineConfigurationVersion reached Kubernetes {target_kubelet_version} after {timeout_secs}s")
+
+    if target_version_number == 0 or not target_mcv:
+        die("Resolved target MachineConfigurationVersion was empty")
+
+    log(f"Assigning Machine '{AGENT_MACHINE_NAME}' to {target_mcv}...")
+    run([KUBECTL_UNBOUNDED, "machine", "config", "assign", AGENT_MACHINE_NAME,
+         "--config", config_name, "--version", str(target_version_number)])
+
+    log(f"Deleting Node '{AGENT_MACHINE_NAME}' to trigger OnDelete repave...")
+    kubectl(["delete", "node", AGENT_MACHINE_NAME])
+    wait_for_node_absent(AGENT_MACHINE_NAME)
+    wait_for_node()
+    wait_for_node_kubelet_version(AGENT_MACHINE_NAME, target_kubelet_version)
+
+    machine = json.loads(kubectl_capture(["get", "machine", AGENT_MACHINE_NAME, "-o", "json"]))
+    status_config = machine.get("status", {}).get("configuration", {})
+    if status_config.get("version") != target_version_number or status_config.get("versionName") != target_mcv:
+        die(f"Machine status.configuration did not record {target_mcv}: {status_config}")
+
+    conditions = machine.get("status", {}).get("conditions", [])
+    repave_applied = [
+        c for c in conditions
+        if c.get("type") == "RepavePending" and c.get("status") == "False" and c.get("reason") == "Applied"
+    ]
+    if not repave_applied:
+        die(f"Machine missing RepavePending=False/Applied condition: {conditions}")
+
+    log("============================================")
+    log("  OnDelete repave upgrade validation PASSED")
+    log("============================================")
+    kubectl(["get", "machine", AGENT_MACHINE_NAME, "-o", "wide"])
+    kubectl(["get", "node", AGENT_MACHINE_NAME, "-o", "wide"])
+
+
+# ---------------------------------------------------------------------------
 # cleanup
 # ---------------------------------------------------------------------------
 def cleanup() -> None:
     """Tear down VM, networking, and Kind cluster."""
 
+    # Stop locally running machina controller if this e2e started one.
+    if MACHINA_PID_FILE.exists():
+        pid = MACHINA_PID_FILE.read_text().strip()
+        if pid:
+            log(f"Stopping machina controller pid {pid}...")
+            run_quiet(["kill", pid], check=False)
+        MACHINA_PID_FILE.unlink(missing_ok=True)
+
     # Stop QEMU VM
-    pid_file = VM_DIR / f"{VM_NAME}.pid"
-    if pid_file.exists():
-        pid = int(pid_file.read_text().strip())
-        try:
-            os.kill(pid, 0)
-            log(f"Stopping VM '{VM_NAME}' (PID: {pid})...")
-            os.kill(pid, 15)
-            time.sleep(2)
-            try:
-                os.kill(pid, 0)
-                log("Force killing VM...")
-                os.kill(pid, 9)
-            except OSError:
-                # Process already exited after SIGTERM; nothing to force kill.
-                pass
-        except OSError:
-            # Process already gone or cannot be signaled; safe to ignore during cleanup.
-            pass
-        pid_file.unlink(missing_ok=True)
+    _stop_qemu()
 
     # Remove networking
     log("Cleaning up networking...")
     run_quiet(["sudo", "ip", "link", "del", TAP_NAME], check=False)
     run_quiet(["sudo", "ip", "link", "del", BRIDGE_NAME], check=False)
 
-    # Remove iptables rules (best-effort)
+    # Remove iptables/nftables forwarding rules (best-effort).
+    # Rules may have been inserted via legacy iptables (into FORWARD) or
+    # via native nft (into the nftables DOCKER-USER chain). We attempt
+    # removal from both paths since we don't know which was used.
     for rule in [
         ["sudo", "iptables", "-D", "FORWARD", "-i", BRIDGE_NAME, "-j", "ACCEPT"],
         ["sudo", "iptables", "-D", "FORWARD", "-o", BRIDGE_NAME, "-j", "ACCEPT"],
@@ -779,6 +1775,24 @@ def cleanup() -> None:
          "-s", f"{VM_SUBNET}.0/24", "!", "-d", f"{VM_SUBNET}.0/24", "-j", "MASQUERADE"],
     ]:
         run_quiet(rule, check=False)
+
+    # On nftables-managed Docker (Fedora, Arch, etc.) rules were inserted
+    # directly via nft into ip filter DOCKER-USER. Remove them by handle.
+    if shutil.which("nft"):
+        try:
+            out = subprocess.run(
+                ["sudo", "nft", "-a", "list", "chain", "ip", "filter", "DOCKER-USER"],
+                capture_output=True, text=True,
+            )
+            if out.returncode == 0:
+                for line in out.stdout.splitlines():
+                    if BRIDGE_NAME in line and "handle" in line:
+                        handle = line.strip().split()[-1]
+                        run_quiet(["sudo", "nft", "delete", "rule", "ip",
+                                   "filter", "DOCKER-USER", "handle", handle],
+                                  check=False)
+        except Exception:
+            pass  # best-effort
 
     # Delete Kind cluster
     if shutil.which("kind"):
@@ -798,20 +1812,44 @@ def cleanup() -> None:
 # ---------------------------------------------------------------------------
 COMMANDS = {
     "create-vm": create_vm,
+    "ensure-kind-bridge": ensure_kind_bridge,
     "run-agent": run_agent,
     "wait-for-node": wait_for_node,
+    "validate-kube-proxy": validate_kube_proxy,
     "validate-workload": validate_workload,
+    "install-machine-crd": install_machine_crd,
+    "start-machina-controller": start_machina_controller,
+    "validate-machina-controller": validate_machina_controller,
+    "delete-machine-cr": delete_machine_cr,
+    "validate-machine-cr-created": validate_machine_cr_created,
+    "validate-node-reboot-operation": validate_node_reboot_operation,
+    "validate-node-repave-upgrade": validate_node_repave_upgrade,
     "reset-agent": reset_agent,
     "cleanup": cleanup,
 }
 
 
 def main() -> None:
-    if len(sys.argv) != 2 or sys.argv[1] not in COMMANDS:
-        cmds = ", ".join(COMMANDS)
-        die(f"Usage: {sys.argv[0]} <{cmds}>")
+    global VERBOSE  # noqa: PLW0603
 
-    COMMANDS[sys.argv[1]]()
+    parser = argparse.ArgumentParser(
+        description="Agent E2E Kind test harness",
+    )
+    parser.add_argument(
+        "command",
+        choices=sorted(COMMANDS),
+        help="Subcommand to run",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        default=False,
+        help="Enable verbose diagnostic output",
+    )
+    args = parser.parse_args()
+    VERBOSE = args.verbose
+
+    COMMANDS[args.command]()
 
 
 if __name__ == "__main__":

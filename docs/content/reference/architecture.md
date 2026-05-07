@@ -1,12 +1,12 @@
 ---
 title: "Architecture"
 weight: 1
-description: "High-level architecture of Unbounded Kube."
+description: "High-level architecture of Unbounded."
 ---
 
 ## Overview
 
-Unbounded Kube extends a standard Kubernetes cluster so that worker Nodes can
+Unbounded extends a standard Kubernetes cluster so that worker Nodes can
 run in any environment -- cloud, on-premises, or edge -- and join back to a
 central control plane. It adds:
 
@@ -29,7 +29,7 @@ namespace. Built on controller-runtime.
 - Provisions remote hosts over SSH: TCP probe, SSH connect (direct or via
   bastion), copy and execute an install script.
 - Detects the corresponding Node by the label
-  `unbounded-kube.io/machine=<name>` and transitions the Machine phase to
+  `unbounded-cloud.io/machine=<name>` and transitions the Machine phase to
   Ready.
 
 **Startup resolution:** resolves API server address from
@@ -41,7 +41,7 @@ service host to a public FQDN.
 **Configuration:** ConfigMap mounted at `/etc/machina/config.yaml`
 (`metricsAddr`, `probeAddr`, `enableLeaderElection`, `maxConcurrentReconciles`,
 `provisioningTimeout`). The Go code defaults `maxConcurrentReconciles` to 10,
-but the shipped ConfigMap (`deploy/machina/03-config.yaml`) sets it to 50.
+but the shipped ConfigMap (rendered from `deploy/machina/03-config.yaml.tmpl`) sets it to 50.
 `provisioningTimeout` defaults to 5 minutes.
 
 ### metalman -- Bare Metal PXE Controller
@@ -54,23 +54,23 @@ Runs three reconcilers and four network servers:
 |-------------------------|-------------------------------------------------------------|
 | OCIReconciler           | Pulls and caches OCI netboot images from container registries. |
 | Redfish Reconciler      | BMC power control and boot order via Redfish REST. TOFU TLS cert pinning. |
-| Lifecycle Reconciler    | Detects 30-min reimage timeout and triggers automatic retry. |
+| Lifecycle Reconciler    | Detects 30-min repave timeout and triggers automatic retry. |
 | DHCP server (UDP/67)    | Static IP assignment by MAC address.                        |
 | TFTP server (UDP/69)    | Bootloader delivery.                                        |
 | HTTP server (TCP/8880)  | Kernel, initrd, Go-templated configs, `/attest` (TPM), `/pxe/disable`. |
 | Health server (TCP/8081)| Liveness and readiness probes.                              |
 
-Site-based scoping: the `--site` flag and the `unbounded-kube.io/site` label
+Site-based scoping: the `--site` flag and the `unbounded-cloud.io/site` label
 restrict each instance to a subset of Machines. Leader election is per-site.
 
 ### kubectl-unbounded -- CLI Plugin
 
-Binary `cmd/kubectl-unbounded`. Provides the `kubectl unbounded site` subcommands:
+Binary `cmd/kubectl-unbounded`. Provides subcommands:
 
 | Subcommand         | Purpose |
 |--------------------|---------|
 | `site init`        | Initializes a new site: installs CNI, machina, creates RBAC, bootstrap token, and site resources. |
-| `site add-machine` | Registers a machine to a site, creating a `Machine` CR with auto-discovery of SSH secrets and bootstrap tokens. |
+| `machine register`   | Registers a machine to a site, creating a `Machine` CR with auto-discovery of SSH secrets and bootstrap tokens. |
 
 ### inventory -- Hardware Collector
 
@@ -80,7 +80,7 @@ Results are stored in a local SQLite database.
 
 ## Custom Resources
 
-API group `unbounded-kube.io`, version `v1alpha3`. CRD manifests live in
+API group `unbounded-cloud.io`, version `v1alpha3`. CRD manifests live in
 `deploy/machina/crd/`. See the [CRD Reference]({{< ref "reference/machina-crd" >}}) for
 full field documentation.
 
@@ -93,11 +93,11 @@ Represents a host and drives its lifecycle.
 | `spec.ssh`            | SSH connectivity (host, port, user, privateKeyRef) and optional bastion config. |
 | `spec.pxe`            | PXE config: OCI image reference, dhcpLeases, redfish settings. |
 | `spec.kubernetes`     | Kubernetes version, bootstrapTokenRef, nodeRef, nodeLabels. |
-| `spec.operations`     | Reboot and reimage counters. |
+| `spec.operations`     | Reboot and repave counters. |
 
 Status includes phase, message, conditions, SSH fingerprint, Redfish cert
 fingerprint, TPM info, and operation results. The API defines four condition
-type constants: `Provisioned`, `SSHReachable`, `Provisioning`, and `Reimaged`.
+type constants: `Provisioned`, `SSHReachable`, `Provisioning`, and `Repaved`.
 Additional conditions such as `PoweredOff` and `BootOrderConfigSupported` may
 be set by the metalman controller but are not defined as constants in the
 Machine types.
@@ -116,10 +116,10 @@ serve time. A `metadata.yaml` provides image-level configuration (e.g.
 
 ## Network Architecture
 
-Cross-site networking is provided by **unbounded-cni** (separate repository), a
-WireGuard-based CNI plugin.
+Cross-site networking is provided by **unbounded-net**, a WireGuard-based CNI
+plugin.
 
-- **Gateway nodes** are labeled `unbounded-kube.io/unbounded-net-gateway=true`
+- **Gateway nodes** are labeled `unbounded-cloud.io/unbounded-net-gateway=true`
   and expose public IPs with UDP ports 51820-51899.
 - Remote nodes establish WireGuard tunnels directly to gateway public IPs (no
   STUN/TURN).
@@ -136,7 +136,7 @@ WireGuard-based CNI plugin.
 
 ### SSH Path (machina)
 
-![SSH provisioning pipeline: kubectl add-machine creates Machine CR, machina reconciles with TCP probe, SSH connect, script execution, kubelet joins, Node appears, Machine becomes Ready](../../img/architecture-ssh-provisioning.svg)
+![SSH provisioning pipeline: kubectl machine register creates Machine CR, machina reconciles with TCP probe, SSH connect, script execution, kubelet joins, Node appears, Machine becomes Ready](../../img/architecture-ssh-provisioning.svg)
 
 Requeue intervals: Pending 30s, Failed 60s, Joining 30s, Ready 5m.
 

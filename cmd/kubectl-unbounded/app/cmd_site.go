@@ -6,7 +6,7 @@ package app
 import (
 	"github.com/spf13/cobra"
 
-	metalmancmd "github.com/Azure/unbounded-kube/internal/metalman/commands"
+	metalmancmd "github.com/Azure/unbounded/internal/metalman/commands"
 )
 
 func siteCommandGroup() *cobra.Command {
@@ -17,7 +17,6 @@ func siteCommandGroup() *cobra.Command {
 
 	cmd.AddCommand(
 		siteInitCommand(),
-		siteAddMachineCommand(),
 		deployPXECommand(),
 		metalmancmd.ServePXECmd())
 

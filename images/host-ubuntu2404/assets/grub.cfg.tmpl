@@ -1,5 +1,5 @@
-{{ if le .Machine.Spec.Operations.ReimageCounter .Machine.Status.Operations.ReimageCounter }}
-# No pending reimage – chainload the locally installed bootloader.
+{{ if le .Machine.Spec.Operations.RepaveCounter .Machine.Status.Operations.RepaveCounter }}
+# No pending repave – chainload the locally installed bootloader.
 # When GRUB is PXE-booted $root is (tftp).  We need extra modules to
 # probe local disks and read their FAT-formatted ESPs.
 insmod part_gpt

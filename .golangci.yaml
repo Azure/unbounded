@@ -5,7 +5,7 @@ run:
     - int
     - integrationtest
   # With default 1m timeout CI sometimes fails.
-  timeout: 5m
+  timeout: 10m
 linters:
   enable:
     - goheader
@@ -98,13 +98,13 @@ formatters:
       sections:
         - standard
         - default
-        - prefix(github.com/Azure/unbounded-kube)
+        - prefix(github.com/Azure/unbounded)
     gofumpt:
       # Enables only grouping of the arguments with the same type, the more consistency we can get, the better.
       extra-rules: true
     goimports:
       local-prefixes:
-        - github.com/Azure/unbounded-kube
+        - github.com/Azure/unbounded
   exclusions:
     generated: lax
     paths:
