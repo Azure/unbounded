@@ -544,8 +544,6 @@ def _serve_agent_upgrade_tarball(tarball: Path, operation_name: str, expect_comp
     finally:
         httpd.shutdown()
 
-    return {}
-
 
 def _build_agent_upgrade_tarball(tarball: Path) -> None:
     """Build the current repo agent binary and package it as a working upgrade tarball."""
