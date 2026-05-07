@@ -55,8 +55,8 @@ func resolveDaemonBinaryPath(envName, defaultPath string) string {
 	return defaultPath
 }
 
-// ResolveCurrent returns paths with CurrentTargetPath populated.
-func (p AgentUpgradePaths) ResolveCurrent() (AgentUpgradePaths, error) {
+// WithResolvedCurrentTarget returns paths with CurrentTargetPath populated.
+func (p AgentUpgradePaths) WithResolvedCurrentTarget() (AgentUpgradePaths, error) {
 	targetPath, err := filepath.EvalSymlinks(p.CurrentPath)
 	if err != nil {
 		if os.IsNotExist(err) {

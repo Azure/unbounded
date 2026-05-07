@@ -132,6 +132,8 @@ func publishAgentUpgradeFailureSignal(ctx context.Context, log *slog.Logger, c c
 		return false, fmt.Errorf("read AgentUpgrade failure signal: %w", err)
 	}
 	if signal == nil || signal.Message == "" {
+		// The shared signal file also carries pending success state, which has
+		// no failure message.
 		return false, nil
 	}
 

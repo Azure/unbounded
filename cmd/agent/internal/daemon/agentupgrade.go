@@ -52,12 +52,12 @@ func agentUpgradeDownloadURL(parameters map[string]string) (string, error) {
 }
 
 func upgradeDaemonBinary(ctx context.Context, log *slog.Logger, downloadURL string) error {
-	paths, err := goalstates.ResolvedAgentUpgradePaths().ResolveCurrent()
+	paths, err := goalstates.ResolvedAgentUpgradePaths().WithResolvedCurrentTarget()
 	if err != nil {
 		return fmt.Errorf("resolve current daemon binary symlink: %w", err)
 	}
 	targetPath := paths.NextTargetPath()
-	if err := agentbinary.InstallUpgradeFromTarGz(ctx, downloadURL, paths, agentUpgradeBinaryMode); err != nil {
+	if err := agentbinary.InstallAndSwitchFromTarGz(ctx, downloadURL, paths, agentUpgradeBinaryMode); err != nil {
 		return err
 	}
 

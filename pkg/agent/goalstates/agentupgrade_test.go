@@ -73,7 +73,7 @@ func TestAgentUpgradePathsNextTargetPathUsesGreenWhenCurrentIsBlue(t *testing.T)
 	assert.Equal(t, "/agent-green", paths.NextTargetPath())
 }
 
-func TestAgentUpgradePathsResolveCurrent(t *testing.T) {
+func TestAgentUpgradePathsWithResolvedCurrentTarget(t *testing.T) {
 	dir := t.TempDir()
 	currentTargetPath := filepath.Join(dir, "agent-blue")
 	currentPath := filepath.Join(dir, "agent-current")
@@ -83,19 +83,19 @@ func TestAgentUpgradePathsResolveCurrent(t *testing.T) {
 	paths, err := (AgentUpgradePaths{
 		BinaryPath:  filepath.Join(dir, "agent"),
 		CurrentPath: currentPath,
-	}).ResolveCurrent()
+	}).WithResolvedCurrentTarget()
 
 	require.NoError(t, err)
 	assert.Equal(t, currentTargetPath, paths.CurrentTargetPath)
 }
 
-func TestAgentUpgradePathsResolveCurrentFallsBackToBinaryPath(t *testing.T) {
+func TestAgentUpgradePathsWithResolvedCurrentTargetFallsBackToBinaryPath(t *testing.T) {
 	t.Parallel()
 
 	paths, err := (AgentUpgradePaths{
 		BinaryPath:  "/agent",
 		CurrentPath: filepath.Join(t.TempDir(), "missing-current"),
-	}).ResolveCurrent()
+	}).WithResolvedCurrentTarget()
 
 	require.NoError(t, err)
 	assert.Equal(t, "/agent", paths.CurrentTargetPath)

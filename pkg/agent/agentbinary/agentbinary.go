@@ -58,8 +58,8 @@ func InstallFromTarGz(ctx context.Context, downloadURL, targetPath, binaryName s
 	return fmt.Errorf("agent binary %q not found in archive %q", binaryName, downloadURL)
 }
 
-// InstallUpgradeFromTarGz installs the next agent binary and switches daemon links.
-func InstallUpgradeFromTarGz(ctx context.Context, downloadURL string, paths goalstates.AgentUpgradePaths, perm os.FileMode) error {
+// InstallAndSwitchFromTarGz installs the next agent binary and switches daemon links.
+func InstallAndSwitchFromTarGz(ctx context.Context, downloadURL string, paths goalstates.AgentUpgradePaths, perm os.FileMode) error {
 	targetPath := paths.NextTargetPath()
 	if err := InstallFromTarGz(ctx, downloadURL, targetPath, goalstates.AgentUpgradeBinaryName, perm); err != nil {
 		return fmt.Errorf("install upgraded daemon binary to %s: %w", targetPath, err)
