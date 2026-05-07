@@ -130,64 +130,43 @@ func (r *daemonReconciler) reconcileAgentReset(ctx context.Context, op *v1alpha3
 	return result, r.nodeOperator.StopDaemon(ctx, r.log)
 }
 
-func publishAgentUpgradeFailureSignal(ctx context.Context, log *slog.Logger, c client.Client, signals agentUpgradeSignalOperator) (bool, error) {
-	signal, err := signals.Read()
-	if err != nil {
-		return false, fmt.Errorf("read AgentUpgrade failure signal: %w", err)
-	}
-	if signal == nil || signal.FailureMessage == "" {
-		// The shared signal file also carries pending success state, which has
-		// no failure message.
-		return false, nil
-	}
-
-	if _, err := finishOperation(ctx, c, signal.OperationName, v1alpha3.OperationPhaseFailed, "DaemonFailed", signal.FailureMessage, 0); err != nil {
-		return false, err
-	}
-
-	if err := signals.Clear(); err != nil {
-		return false, fmt.Errorf("remove AgentUpgrade failure signal: %w", err)
-	}
-
-	log.Info("published AgentUpgrade daemon failure signal", "operation", signal.OperationName)
-
-	return true, nil
-}
-
 func publishAndClearAgentUpgradeSignals(ctx context.Context, log *slog.Logger, c client.Client) error {
 	signals, err := newAgentUpgradeSignalOperator()
 	if err != nil {
 		return err
 	}
-	failurePublished, err := publishAgentUpgradeFailureSignal(ctx, log, c, signals)
-	if err != nil {
-		return err
-	}
-	if failurePublished {
-		return nil
-	}
 
-	pending, err := signals.Read()
+	signal, err := signals.Read()
 	if err != nil {
-		return fmt.Errorf("read pending AgentUpgrade operation signal: %w", err)
+		return fmt.Errorf("read AgentUpgrade signal: %w", err)
 	}
-	if pending != nil {
+	switch {
+	case signal == nil:
+		return nil
+	case signal.FailureMessage != "":
+		if _, err := finishOperation(ctx, c, signal.OperationName, v1alpha3.OperationPhaseFailed, "DaemonFailed", signal.FailureMessage, 0); err != nil {
+			return err
+		}
+		if err := signals.Clear(); err != nil {
+			return fmt.Errorf("remove AgentUpgrade failure signal: %w", err)
+		}
+		log.Info("published AgentUpgrade daemon failure signal", "operation", signal.OperationName)
+	default:
 		if _, err := finishOperation(
 			ctx,
 			c,
-			pending.OperationName,
+			signal.OperationName,
 			v1alpha3.OperationPhaseComplete,
 			"Succeeded",
 			"AgentUpgrade completed",
-			pending.ObservedMachineGeneration,
+			signal.ObservedMachineGeneration,
 		); err != nil {
 			return err
 		}
-		log.Info("published AgentUpgrade success signal", "operation", pending.OperationName)
-	}
-
-	if err := signals.Clear(); err != nil {
-		log.Warn("failed to clear AgentUpgrade signal", "error", err)
+		if err := signals.Clear(); err != nil {
+			log.Warn("failed to clear AgentUpgrade signal", "error", err)
+		}
+		log.Info("published AgentUpgrade success signal", "operation", signal.OperationName)
 	}
 
 	return nil

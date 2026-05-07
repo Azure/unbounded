@@ -87,11 +87,11 @@ func InstallAndSwitchFromTarGz(ctx context.Context, downloadURL string, paths go
 		return fmt.Errorf("install upgraded daemon binary to %s: %w", targetPath, err)
 	}
 
-	if err := UpdateSymlink(paths.LastGoodPath, paths.CurrentTargetPath); err != nil {
+	if err := utilio.UpdateSymlink(paths.LastGoodPath, paths.CurrentTargetPath); err != nil {
 		return fmt.Errorf("update last-good daemon symlink: %w", err)
 	}
 
-	if err := UpdateSymlink(paths.CurrentPath, targetPath); err != nil {
+	if err := utilio.UpdateSymlink(paths.CurrentPath, targetPath); err != nil {
 		return fmt.Errorf("update current daemon symlink: %w", err)
 	}
 
@@ -114,7 +114,7 @@ func EnsureDaemonBinaryLinks(ctx context.Context, log *slog.Logger, paths goalst
 		if targetErr != nil {
 			return fmt.Errorf("no executable agent binary found for daemon link initialization: %w", targetErr)
 		}
-		if err := UpdateSymlink(paths.CurrentPath, target); err != nil {
+		if err := utilio.UpdateSymlink(paths.CurrentPath, target); err != nil {
 			return fmt.Errorf("initialize current daemon symlink: %w", err)
 		}
 		currentTarget = target
@@ -124,7 +124,7 @@ func EnsureDaemonBinaryLinks(ctx context.Context, log *slog.Logger, paths goalst
 		if !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("resolve last-good daemon binary symlink: %w", err)
 		}
-		if err := UpdateSymlink(paths.LastGoodPath, currentTarget); err != nil {
+		if err := utilio.UpdateSymlink(paths.LastGoodPath, currentTarget); err != nil {
 			return fmt.Errorf("initialize last-good daemon symlink: %w", err)
 		}
 	}
@@ -133,7 +133,7 @@ func EnsureDaemonBinaryLinks(ctx context.Context, log *slog.Logger, paths goalst
 		// Do not replace the compatibility path when the current symlink
 		// already resolves to that path. That preserves legacy installs and
 		// avoids creating a BinaryPath -> CurrentPath -> BinaryPath loop.
-		if err := UpdateSymlink(paths.BinaryPath, paths.CurrentPath); err != nil {
+		if err := utilio.UpdateSymlink(paths.BinaryPath, paths.CurrentPath); err != nil {
 			return fmt.Errorf("initialize daemon compatibility symlink: %w", err)
 		}
 	}
@@ -187,9 +187,4 @@ func Verify(ctx context.Context, path string) error {
 		}
 		return fmt.Errorf("verify agent binary %s: %w", path, err)
 	}
-}
-
-// UpdateSymlink atomically updates linkPath to point at targetPath.
-func UpdateSymlink(linkPath, targetPath string) error {
-	return utilio.UpdateSymlink(linkPath, targetPath)
 }

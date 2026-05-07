@@ -357,6 +357,13 @@ func TestReconcileAgentUpgrade_RestartFailureFailsOperation(t *testing.T) {
 	assert.NoFileExists(t, signalPath)
 }
 
+func TestPublishAndClearAgentUpgradeSignals_NoSignal(t *testing.T) {
+	signalPath := setAgentUpgradeSignalPath(t)
+
+	require.NoError(t, publishAndClearAgentUpgradeSignals(context.Background(), discardLogger(), fakeStatusClient()))
+	assert.NoFileExists(t, signalPath)
+}
+
 func TestPublishAndClearAgentUpgradeSignals_Failure(t *testing.T) {
 	signalPath := setAgentUpgradeSignalPath(t)
 	const rollbackMessage = "rolled back to last good"
