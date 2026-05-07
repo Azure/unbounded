@@ -14,7 +14,10 @@ FROM mcr.microsoft.com/oss/go/microsoft/golang:${GO_VERSION}-azurelinux3.0 AS bu
 
 # Override GOTOOLCHAIN=local set by the MCR base image so go can switch to
 # the toolchain version required by go.mod when the image patch lags behind.
-ENV GOTOOLCHAIN=auto
+# MS_GOTOOLCHAIN_ALLOW_NON_LOCAL=1 is required by the Microsoft Go wrapper to
+# permit GOTOOLCHAIN values other than "local".
+ENV GOTOOLCHAIN=auto \
+    MS_GOTOOLCHAIN_ALLOW_NON_LOCAL=1
 
 # Install build dependencies (Go is provided by the base image)
 RUN tdnf upgrade -y \
