@@ -76,3 +76,48 @@ func (p AgentUpgradePaths) ResolveAgentUpgrade(downloadURL, previousBinaryPath s
 		LastGoodLinkPath:   p.LastGoodPath,
 	}
 }
+
+// InitialDaemonBinaryTarget returns the first executable binary that can seed
+// the current daemon binary link.
+func (p AgentUpgradePaths) InitialDaemonBinaryTarget() (string, error) {
+	for _, path := range []string{p.BluePath, p.GreenPath, p.BinaryPath} {
+		if isExecutableFile(path) {
+			return path, nil
+		}
+	}
+
+	return "", os.ErrNotExist
+}
+
+func isExecutableFile(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+
+	return info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0
+}
+
+// AgentUpgradeSignalPaths describes host-side AgentUpgrade signal file paths.
+type AgentUpgradeSignalPaths struct {
+	OperationPath string
+	FailurePath   string
+}
+
+// DefaultAgentUpgradeSignalPaths returns the production host-side AgentUpgrade
+// signal file paths.
+func DefaultAgentUpgradeSignalPaths() AgentUpgradeSignalPaths {
+	return AgentUpgradeSignalPaths{
+		OperationPath: DaemonAgentUpgradeOperationPath,
+		FailurePath:   DaemonAgentUpgradeFailurePath,
+	}
+}
+
+// ResolvedAgentUpgradeSignalPaths returns the host-side AgentUpgrade signal
+// file paths after applying environment overrides.
+func ResolvedAgentUpgradeSignalPaths() AgentUpgradeSignalPaths {
+	return AgentUpgradeSignalPaths{
+		OperationPath: resolveDaemonBinaryPath(EnvDaemonAgentUpgradeOperationPath, DaemonAgentUpgradeOperationPath),
+		FailurePath:   resolveDaemonBinaryPath(EnvDaemonAgentUpgradeFailurePath, DaemonAgentUpgradeFailurePath),
+	}
+}

@@ -374,7 +374,11 @@ func TestPublishAndClearAgentUpgradeSignals_Failure(t *testing.T) {
 		},
 	}
 	c := fakeStatusClient(machineOp)
-	require.NoError(t, recordPendingAgentUpgradeOperation("op-1", 7))
+	signals := newAgentUpgradeSignalOperatorForPaths(goalstates.AgentUpgradeSignalPaths{
+		OperationPath: operationPath,
+		FailurePath:   failurePath,
+	})
+	require.NoError(t, signals.RecordPending("op-1", 7))
 	require.NoError(t, RecordAgentUpgradeFailureSignal(operationPath, failurePath, rollbackMessage))
 
 	require.NoError(t, publishAndClearAgentUpgradeSignals(context.Background(), discardLogger(), c))

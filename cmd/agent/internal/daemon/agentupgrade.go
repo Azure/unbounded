@@ -22,14 +22,24 @@ const (
 	agentUpgradeBinaryMode           = 0o755
 )
 
-type agentUpgradeOperationSignal struct {
+type agentUpgradeSignal struct {
 	OperationName             string `json:"operationName"`
 	ObservedMachineGeneration int64  `json:"observedMachineGeneration,omitempty"`
+	Message                   string `json:"message,omitempty"`
 }
 
-type agentUpgradeFailureSignal struct {
-	OperationName string `json:"operationName"`
-	Message       string `json:"message"`
+type agentUpgradeSignalOperator interface {
+	RecordPending(operationName string, observedMachineGeneration int64) error
+	RecordFailure(message string) error
+	ReadPending() (*agentUpgradeSignal, error)
+	ReadFailure() (*agentUpgradeSignal, error)
+	RemovePending() error
+	RemoveFailure() error
+	Clear() error
+}
+
+type fileAgentUpgradeSignalOperator struct {
+	paths goalstates.AgentUpgradeSignalPaths
 }
 
 func agentUpgradeDownloadURL(parameters map[string]string) (string, error) {
@@ -70,53 +80,25 @@ func upgradeDaemonBinary(ctx context.Context, log *slog.Logger, downloadURL stri
 	return nil
 }
 
-func recordPendingAgentUpgradeOperation(operationName string, observedMachineGeneration int64) error {
-	data, err := json.Marshal(agentUpgradeOperationSignal{
+func newAgentUpgradeSignalOperator() agentUpgradeSignalOperator {
+	return fileAgentUpgradeSignalOperator{
+		paths: goalstates.ResolvedAgentUpgradeSignalPaths(),
+	}
+}
+
+func newAgentUpgradeSignalOperatorForPaths(paths goalstates.AgentUpgradeSignalPaths) agentUpgradeSignalOperator {
+	return fileAgentUpgradeSignalOperator{paths: paths}
+}
+
+func (o fileAgentUpgradeSignalOperator) RecordPending(operationName string, observedMachineGeneration int64) error {
+	return o.write(o.paths.OperationPath, agentUpgradeSignal{
 		OperationName:             operationName,
 		ObservedMachineGeneration: observedMachineGeneration,
 	})
-	if err != nil {
-		return err
-	}
-
-	return writeFile(agentUpgradeOperationSignalPath(), append(data, '\n'), 0o600)
 }
 
-func readPendingAgentUpgradeOperation() (*agentUpgradeOperationSignal, error) {
-	return readAgentUpgradeOperationSignal(agentUpgradeOperationSignalPath())
-}
-
-func readAgentUpgradeOperationSignal(path string) (*agentUpgradeOperationSignal, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil
-		}
-
-		return nil, err
-	}
-
-	var signal agentUpgradeOperationSignal
-	if err := json.Unmarshal(data, &signal); err == nil {
-		signal.OperationName = strings.TrimSpace(signal.OperationName)
-		if signal.OperationName == "" {
-			return nil, nil
-		}
-		return &signal, nil
-	}
-
-	operationName := strings.TrimSpace(string(data))
-	if operationName == "" {
-		return nil, nil
-	}
-
-	return &agentUpgradeOperationSignal{OperationName: operationName}, nil
-}
-
-// RecordAgentUpgradeFailureSignal records that the daemon failed after an
-// AgentUpgrade and removes the pending operation signal.
-func RecordAgentUpgradeFailureSignal(operationPath, failurePath, message string) error {
-	pending, err := readAgentUpgradeOperationSignal(operationPath)
+func (o fileAgentUpgradeSignalOperator) RecordFailure(message string) error {
+	pending, err := o.ReadPending()
 	if err != nil {
 		return fmt.Errorf("read pending AgentUpgrade operation signal: %w", err)
 	}
@@ -129,64 +111,93 @@ func RecordAgentUpgradeFailureSignal(operationPath, failurePath, message string)
 		message = "AgentUpgrade daemon failed after switching binary"
 	}
 
-	data, err := json.Marshal(agentUpgradeFailureSignal{
+	if err := o.write(o.paths.FailurePath, agentUpgradeSignal{
 		OperationName: pending.OperationName,
 		Message:       message,
-	})
+	}); err != nil {
+		return err
+	}
+
+	return o.RemovePending()
+}
+
+func (o fileAgentUpgradeSignalOperator) ReadPending() (*agentUpgradeSignal, error) {
+	return o.read(o.paths.OperationPath)
+}
+
+func (o fileAgentUpgradeSignalOperator) ReadFailure() (*agentUpgradeSignal, error) {
+	return o.read(o.paths.FailurePath)
+}
+
+func (o fileAgentUpgradeSignalOperator) RemovePending() error {
+	return removeAgentUpgradeSignal(o.paths.OperationPath)
+}
+
+func (o fileAgentUpgradeSignalOperator) RemoveFailure() error {
+	return removeAgentUpgradeSignal(o.paths.FailurePath)
+}
+
+func (o fileAgentUpgradeSignalOperator) Clear() error {
+	if err := o.RemovePending(); err != nil {
+		return err
+	}
+	return o.RemoveFailure()
+}
+
+func (o fileAgentUpgradeSignalOperator) write(path string, signal agentUpgradeSignal) error {
+	data, err := json.Marshal(signal)
 	if err != nil {
 		return err
 	}
 
-	if err := writeFile(failurePath, append(data, '\n'), 0o600); err != nil {
-		return err
+	return writeFile(path, append(data, '\n'), 0o600)
+}
+
+func (o fileAgentUpgradeSignalOperator) read(path string) (*agentUpgradeSignal, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+
+		return nil, err
 	}
 
-	if err := os.Remove(operationPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+	var signal agentUpgradeSignal
+	if err := json.Unmarshal(data, &signal); err != nil {
+		return nil, fmt.Errorf("decode AgentUpgrade signal %s: %w", path, err)
+	}
+	signal.OperationName = strings.TrimSpace(signal.OperationName)
+	signal.Message = strings.TrimSpace(signal.Message)
+	if signal.OperationName == "" {
+		return nil, nil
+	}
+
+	return &signal, nil
+}
+
+// RecordAgentUpgradeFailureSignal records that the daemon failed after an
+// AgentUpgrade and removes the pending operation signal.
+func RecordAgentUpgradeFailureSignal(operationPath, failurePath, message string) error {
+	operator := newAgentUpgradeSignalOperatorForPaths(goalstates.AgentUpgradeSignalPaths{
+		OperationPath: operationPath,
+		FailurePath:   failurePath,
+	})
+	return operator.RecordFailure(message)
+}
+
+func removeAgentUpgradeSignal(path string) error {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 
 	return nil
 }
 
-func removeAgentUpgradeOperationSignal() error {
-	if err := os.Remove(agentUpgradeOperationSignalPath()); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
+func clearAgentUpgradeSignals(log *slog.Logger, operator agentUpgradeSignalOperator) {
+	if err := operator.Clear(); err != nil {
+		log.Warn("failed to clear AgentUpgrade signals", "error", err)
 	}
-
-	return nil
-}
-
-func removeAgentUpgradeFailureSignal() error {
-	if err := os.Remove(agentUpgradeFailureSignalPath()); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-
-	return nil
-}
-
-func clearAgentUpgradeSignals(log *slog.Logger) {
-	if err := removeAgentUpgradeOperationSignal(); err != nil {
-		log.Warn("failed to clear pending AgentUpgrade operation signal", "error", err)
-	}
-	if err := removeAgentUpgradeFailureSignal(); err != nil {
-		log.Warn("failed to clear AgentUpgrade failure signal", "error", err)
-	}
-}
-
-func agentUpgradeOperationSignalPath() string {
-	if path := strings.TrimSpace(os.Getenv(goalstates.EnvDaemonAgentUpgradeOperationPath)); path != "" {
-		return path
-	}
-
-	return goalstates.DaemonAgentUpgradeOperationPath
-}
-
-func agentUpgradeFailureSignalPath() string {
-	if path := strings.TrimSpace(os.Getenv(goalstates.EnvDaemonAgentUpgradeFailurePath)); path != "" {
-		return path
-	}
-
-	return goalstates.DaemonAgentUpgradeFailurePath
 }
 
 func ensureDaemonBinaryLinks(log *slog.Logger) error {
@@ -196,9 +207,9 @@ func ensureDaemonBinaryLinks(log *slog.Logger) error {
 		if !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("resolve current daemon binary symlink: %w", err)
 		}
-		target, targetErr := initialDaemonBinaryTarget(paths)
+		target, targetErr := paths.InitialDaemonBinaryTarget()
 		if targetErr != nil {
-			return targetErr
+			return fmt.Errorf("no executable agent binary found for daemon link initialization: %w", targetErr)
 		}
 		if err := agentbinary.UpdateSymlink(paths.CurrentPath, target); err != nil {
 			return fmt.Errorf("initialize current daemon symlink: %w", err)
@@ -234,25 +245,6 @@ func ensureDaemonBinaryLinks(log *slog.Logger) error {
 	)
 
 	return nil
-}
-
-func initialDaemonBinaryTarget(paths goalstates.AgentUpgradePaths) (string, error) {
-	for _, path := range []string{paths.BluePath, paths.GreenPath, paths.BinaryPath} {
-		if isExecutableFile(path) {
-			return path, nil
-		}
-	}
-
-	return "", fmt.Errorf("no executable agent binary found for daemon link initialization")
-}
-
-func isExecutableFile(path string) bool {
-	info, err := os.Stat(path)
-	if err != nil {
-		return false
-	}
-
-	return info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0
 }
 
 func resolveSymlink(path, fallbackPath string) (string, error) {

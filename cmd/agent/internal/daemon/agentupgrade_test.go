@@ -39,6 +39,42 @@ func TestAgentUpgradeDownloadURL(t *testing.T) {
 	assert.Contains(t, err.Error(), agentUpgradeDownloadURLParameter)
 }
 
+func TestAgentUpgradeSignalOperator_RecordFailure(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	operationPath := filepath.Join(dir, "agent-upgrade-operation")
+	failurePath := filepath.Join(dir, "agent-upgrade-failure")
+	signals := newAgentUpgradeSignalOperatorForPaths(goalstates.AgentUpgradeSignalPaths{
+		OperationPath: operationPath,
+		FailurePath:   failurePath,
+	})
+
+	require.NoError(t, signals.RecordPending("op-1", 7))
+	require.NoError(t, signals.RecordFailure("rolled back"))
+
+	assert.NoFileExists(t, operationPath)
+	data, err := os.ReadFile(failurePath)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"operationName":"op-1","message":"rolled back"}`, string(data))
+}
+
+func TestAgentUpgradeSignalOperator_ReadRejectsNonJSON(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	operationPath := filepath.Join(dir, "agent-upgrade-operation")
+	signals := newAgentUpgradeSignalOperatorForPaths(goalstates.AgentUpgradeSignalPaths{
+		OperationPath: operationPath,
+		FailurePath:   filepath.Join(dir, "agent-upgrade-failure"),
+	})
+	require.NoError(t, os.WriteFile(operationPath, []byte("op-1\n"), 0o600))
+
+	_, err := signals.ReadPending()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "decode AgentUpgrade signal")
+}
+
 func TestUpgradeDaemonBinary(t *testing.T) {
 	dir := t.TempDir()
 	legacyPath := filepath.Join(dir, "unbounded-agent")
@@ -227,7 +263,7 @@ func TestEnsureDaemonBinaryLinks_PreservesExistingLinks(t *testing.T) {
 	assertSymlinkTarget(t, paths.legacy, paths.green)
 }
 
-func TestInitialDaemonBinaryTarget(t *testing.T) {
+func TestAgentUpgradePathsInitialDaemonBinaryTarget(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
@@ -240,41 +276,23 @@ func TestInitialDaemonBinaryTarget(t *testing.T) {
 	require.NoError(t, os.WriteFile(paths.BluePath, []byte("blue"), 0o755))
 	require.NoError(t, os.WriteFile(paths.GreenPath, []byte("green"), 0o755))
 
-	target, err := initialDaemonBinaryTarget(paths)
+	target, err := paths.InitialDaemonBinaryTarget()
 	require.NoError(t, err)
 	assert.Equal(t, paths.BluePath, target)
 
 	require.NoError(t, os.Chmod(paths.BluePath, 0o644))
-	target, err = initialDaemonBinaryTarget(paths)
+	target, err = paths.InitialDaemonBinaryTarget()
 	require.NoError(t, err)
 	assert.Equal(t, paths.GreenPath, target)
 
 	require.NoError(t, os.Chmod(paths.GreenPath, 0o644))
-	target, err = initialDaemonBinaryTarget(paths)
+	target, err = paths.InitialDaemonBinaryTarget()
 	require.NoError(t, err)
 	assert.Equal(t, paths.BinaryPath, target)
 
 	require.NoError(t, os.Chmod(paths.BinaryPath, 0o644))
-	_, err = initialDaemonBinaryTarget(paths)
+	_, err = paths.InitialDaemonBinaryTarget()
 	require.Error(t, err)
-}
-
-func TestIsExecutableFile(t *testing.T) {
-	t.Parallel()
-
-	dir := t.TempDir()
-	executablePath := filepath.Join(dir, "executable")
-	nonExecutablePath := filepath.Join(dir, "not-executable")
-	directoryPath := filepath.Join(dir, "directory")
-
-	require.NoError(t, os.WriteFile(executablePath, []byte("binary"), 0o755))
-	require.NoError(t, os.WriteFile(nonExecutablePath, []byte("binary"), 0o644))
-	require.NoError(t, os.Mkdir(directoryPath, 0o755))
-
-	assert.True(t, isExecutableFile(executablePath))
-	assert.False(t, isExecutableFile(nonExecutablePath))
-	assert.False(t, isExecutableFile(filepath.Join(dir, "missing")))
-	assert.False(t, isExecutableFile(directoryPath))
 }
 
 type daemonBinaryTestPaths struct {

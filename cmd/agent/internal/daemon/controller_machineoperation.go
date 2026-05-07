@@ -5,12 +5,8 @@ package daemon
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
-	"os"
-	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -83,19 +79,21 @@ func (r *daemonReconciler) reconcileAgentUpgrade(ctx context.Context, op *v1alph
 		_, finishErr := finishOperation(ctx, r.Client, op.Name, v1alpha3.OperationPhaseFailed, "InvalidParameters", err.Error(), 0)
 		return reconcile.Result{}, finishErr
 	}
+	r.log.Info("staging AgentUpgrade binary", "operation", op.Name, "url", downloadURL)
 
 	if err := r.nodeOperator.StageAgentUpgrade(ctx, r.log, downloadURL); err != nil {
 		_, finishErr := finishOperation(ctx, r.Client, op.Name, v1alpha3.OperationPhaseFailed, "ExecutionFailed", err.Error(), 0)
 		return reconcile.Result{}, finishErr
 	}
 
-	if err := recordPendingAgentUpgradeOperation(op.Name, machine.Generation); err != nil {
+	signals := newAgentUpgradeSignalOperator()
+	if err := signals.RecordPending(op.Name, machine.Generation); err != nil {
 		_, finishErr := finishOperation(ctx, r.Client, op.Name, v1alpha3.OperationPhaseFailed, "ExecutionFailed", err.Error(), 0)
 		return reconcile.Result{}, finishErr
 	}
 
 	if err := r.nodeOperator.RestartAgentDaemon(ctx, r.log); err != nil {
-		clearAgentUpgradeSignals(r.log)
+		clearAgentUpgradeSignals(r.log, signals)
 		return finishFailedOperation(ctx, r.Client, op.Name, err)
 	}
 
@@ -126,64 +124,44 @@ func (r *daemonReconciler) reconcileAgentReset(ctx context.Context, op *v1alpha3
 	return result, r.nodeOperator.StopDaemon(ctx, r.log)
 }
 
-func publishAgentUpgradeFailureSignal(ctx context.Context, log *slog.Logger, c client.Client) (bool, error) {
-	data, err := os.ReadFile(agentUpgradeFailureSignalPath())
+func publishAgentUpgradeFailureSignal(ctx context.Context, log *slog.Logger, c client.Client, signals agentUpgradeSignalOperator) (bool, error) {
+	signal, err := signals.ReadFailure()
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return false, nil
-		}
-
 		return false, fmt.Errorf("read AgentUpgrade failure signal: %w", err)
 	}
-
-	var signal agentUpgradeFailureSignal
-	if err := json.Unmarshal(data, &signal); err != nil {
-		lines := strings.SplitN(strings.TrimSpace(string(data)), "\n", 2)
-		signal.OperationName = strings.TrimSpace(lines[0])
-		if len(lines) > 1 {
-			signal.Message = strings.TrimSpace(lines[1])
-		}
-	}
-
-	operationName := strings.TrimSpace(signal.OperationName)
-	if operationName == "" {
-		if err := removeAgentUpgradeFailureSignal(); err != nil {
-			return false, fmt.Errorf("remove empty AgentUpgrade failure signal: %w", err)
-		}
+	if signal == nil {
 		return false, nil
 	}
 
 	message := "AgentUpgrade daemon failed after switching binary"
-	if strings.TrimSpace(signal.Message) != "" {
-		message = strings.TrimSpace(signal.Message)
+	if signal.Message != "" {
+		message = signal.Message
 	}
 
-	if _, err := finishOperation(ctx, c, operationName, v1alpha3.OperationPhaseFailed, "DaemonFailed", message, 0); err != nil {
+	if _, err := finishOperation(ctx, c, signal.OperationName, v1alpha3.OperationPhaseFailed, "DaemonFailed", message, 0); err != nil {
 		return false, err
 	}
 
-	if err := removeAgentUpgradeFailureSignal(); err != nil {
+	if err := signals.RemoveFailure(); err != nil {
 		return false, fmt.Errorf("remove AgentUpgrade failure signal: %w", err)
 	}
 
-	log.Info("published AgentUpgrade daemon failure signal", "operation", operationName)
+	log.Info("published AgentUpgrade daemon failure signal", "operation", signal.OperationName)
 
 	return true, nil
 }
 
 func publishAndClearAgentUpgradeSignals(ctx context.Context, log *slog.Logger, c client.Client) error {
-	failurePublished, err := publishAgentUpgradeFailureSignal(ctx, log, c)
+	signals := newAgentUpgradeSignalOperator()
+	failurePublished, err := publishAgentUpgradeFailureSignal(ctx, log, c, signals)
 	if err != nil {
 		return err
 	}
 	if failurePublished {
-		if err := removeAgentUpgradeOperationSignal(); err != nil {
-			return fmt.Errorf("remove pending AgentUpgrade operation signal after failure: %w", err)
-		}
 		return nil
 	}
 
-	pending, err := readPendingAgentUpgradeOperation()
+	pending, err := signals.ReadPending()
 	if err != nil {
 		return fmt.Errorf("read pending AgentUpgrade operation signal: %w", err)
 	}
@@ -202,7 +180,7 @@ func publishAndClearAgentUpgradeSignals(ctx context.Context, log *slog.Logger, c
 		log.Info("published AgentUpgrade success signal", "operation", pending.OperationName)
 	}
 
-	clearAgentUpgradeSignals(log)
+	clearAgentUpgradeSignals(log, signals)
 
 	return nil
 }
