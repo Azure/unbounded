@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/Azure/unbounded/pkg/agent/agentbinary"
@@ -162,66 +161,4 @@ func RecordAgentUpgradeFailureSignal(message string) error {
 	}
 
 	return signals.RecordFailure(message)
-}
-
-func ensureDaemonBinaryLinks(log *slog.Logger) error {
-	paths, err := goalstates.ResolvedAgentUpgradePaths()
-	if err != nil {
-		return fmt.Errorf("resolve current daemon binary symlink: %w", err)
-	}
-
-	currentTarget := paths.CurrentTargetPath
-	if _, err := os.Lstat(paths.CurrentPath); err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("stat current daemon binary symlink: %w", err)
-		}
-		target, targetErr := initialDaemonBinaryTarget(paths)
-		if targetErr != nil {
-			return fmt.Errorf("no executable agent binary found for daemon link initialization: %w", targetErr)
-		}
-		if err := agentbinary.UpdateSymlink(paths.CurrentPath, target); err != nil {
-			return fmt.Errorf("initialize current daemon symlink: %w", err)
-		}
-		currentTarget = target
-	}
-
-	if _, err := filepath.EvalSymlinks(paths.LastGoodPath); err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("resolve last-good daemon binary symlink: %w", err)
-		}
-		if err := agentbinary.UpdateSymlink(paths.LastGoodPath, currentTarget); err != nil {
-			return fmt.Errorf("initialize last-good daemon symlink: %w", err)
-		}
-	}
-
-	if currentTarget != paths.BinaryPath {
-		// Do not replace the compatibility path when the current symlink
-		// already resolves to that path. That preserves legacy installs and
-		// avoids creating a BinaryPath -> CurrentPath -> BinaryPath loop.
-		if err := agentbinary.UpdateSymlink(paths.BinaryPath, paths.CurrentPath); err != nil {
-			return fmt.Errorf("initialize daemon compatibility symlink: %w", err)
-		}
-	}
-
-	log.Info("daemon binary links initialized",
-		"current", paths.CurrentPath,
-		"last_good", paths.LastGoodPath,
-	)
-
-	return nil
-}
-
-func initialDaemonBinaryTarget(paths goalstates.AgentUpgradePaths) (string, error) {
-	target, err := paths.InitialDaemonBinaryTarget()
-	if err != nil {
-		return "", err
-	}
-	if target != paths.BinaryPath {
-		return target, nil
-	}
-	if err := agentbinary.InstallFromFile(paths.BinaryPath, paths.BluePath, agentUpgradeBinaryMode); err != nil {
-		return "", err
-	}
-
-	return paths.BluePath, nil
 }

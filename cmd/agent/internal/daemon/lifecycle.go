@@ -13,6 +13,7 @@ import (
 	"text/template"
 
 	"github.com/Azure/unbounded/internal/executil"
+	"github.com/Azure/unbounded/pkg/agent/agentbinary"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
@@ -45,7 +46,11 @@ func EnableDaemon(log *slog.Logger) phases.Task {
 func (d *enableDaemon) Name() string { return "enable-daemon" }
 
 func (d *enableDaemon) Do(ctx context.Context) error {
-	if err := ensureDaemonBinaryLinks(d.log); err != nil {
+	paths, err := goalstates.ResolvedAgentUpgradePaths()
+	if err != nil {
+		return fmt.Errorf("resolve current daemon binary symlink: %w", err)
+	}
+	if err := agentbinary.EnsureDaemonBinaryLinks(ctx, d.log, paths); err != nil {
 		return err
 	}
 

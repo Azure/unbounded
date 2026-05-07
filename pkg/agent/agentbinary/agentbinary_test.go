@@ -10,14 +10,18 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
 func TestInstallFromTarGzVerifiesInstalledBinary(t *testing.T) {
@@ -60,6 +64,44 @@ func TestInstallFromTarGzRejectsUnsupportedScheme(t *testing.T) {
 	assert.Contains(t, err.Error(), "unsupported agent download URL scheme")
 }
 
+func TestEnsureDaemonBinaryLinks_InitializesFromBlue(t *testing.T) {
+	paths := setupDaemonBinaryTestPaths(t)
+	require.NoError(t, os.WriteFile(paths.BluePath, []byte("blue"), 0o755))
+
+	require.NoError(t, EnsureDaemonBinaryLinks(context.Background(), slog.Default(), paths))
+
+	assertSymlinkTarget(t, paths.CurrentPath, paths.BluePath)
+	assertSymlinkTarget(t, paths.LastGoodPath, paths.BluePath)
+	assertSymlinkTarget(t, paths.BinaryPath, paths.BluePath)
+}
+
+func TestEnsureDaemonBinaryLinks_SeedsBlueFromLegacyBinary(t *testing.T) {
+	paths := setupDaemonBinaryTestPaths(t)
+	require.NoError(t, os.WriteFile(paths.BinaryPath, []byte("legacy"), 0o755))
+
+	require.NoError(t, EnsureDaemonBinaryLinks(context.Background(), slog.Default(), paths))
+
+	assertFileContent(t, paths.BluePath, "legacy")
+	assertSymlinkTarget(t, paths.CurrentPath, paths.BluePath)
+	assertSymlinkTarget(t, paths.LastGoodPath, paths.BluePath)
+	assertSymlinkTarget(t, paths.BinaryPath, paths.BluePath)
+}
+
+func TestEnsureDaemonBinaryLinks_PreservesExistingLinks(t *testing.T) {
+	paths := setupDaemonBinaryTestPaths(t)
+	paths.CurrentTargetPath = paths.GreenPath
+	require.NoError(t, os.WriteFile(paths.BluePath, []byte("blue"), 0o755))
+	require.NoError(t, os.WriteFile(paths.GreenPath, []byte("green"), 0o755))
+	require.NoError(t, os.Symlink(paths.GreenPath, paths.CurrentPath))
+	require.NoError(t, os.Symlink(paths.BluePath, paths.LastGoodPath))
+
+	require.NoError(t, EnsureDaemonBinaryLinks(context.Background(), slog.Default(), paths))
+
+	assertSymlinkTarget(t, paths.CurrentPath, paths.GreenPath)
+	assertSymlinkTarget(t, paths.LastGoodPath, paths.BluePath)
+	assertSymlinkTarget(t, paths.BinaryPath, paths.GreenPath)
+}
+
 func writeTestAgentArchive(w io.Writer, binary []byte) error {
 	gz := gzip.NewWriter(w)
 	defer gz.Close()
@@ -86,4 +128,36 @@ func testAgentScript(version string, exitCode int) []byte {
 
 func posixShellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+}
+
+func setupDaemonBinaryTestPaths(t *testing.T) goalstates.AgentUpgradePaths {
+	t.Helper()
+
+	dir := t.TempDir()
+	paths := goalstates.AgentUpgradePaths{
+		BinaryPath:        filepath.Join(dir, "unbounded-agent"),
+		CurrentPath:       filepath.Join(dir, "unbounded-agent-current"),
+		LastGoodPath:      filepath.Join(dir, "unbounded-agent-last-good"),
+		BluePath:          filepath.Join(dir, "unbounded-agent-blue"),
+		GreenPath:         filepath.Join(dir, "unbounded-agent-green"),
+		CurrentTargetPath: filepath.Join(dir, "unbounded-agent"),
+	}
+
+	return paths
+}
+
+func assertSymlinkTarget(t *testing.T, linkPath, expectedTarget string) {
+	t.Helper()
+
+	target, err := filepath.EvalSymlinks(linkPath)
+	require.NoError(t, err)
+	assert.Equal(t, expectedTarget, target)
+}
+
+func assertFileContent(t *testing.T, path, expected string) {
+	t.Helper()
+
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, expected, string(data))
 }

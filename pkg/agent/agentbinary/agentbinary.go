@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"os"
 	"os/exec"
@@ -21,6 +22,8 @@ import (
 )
 
 const verifyTimeout = 30 * time.Second
+
+const daemonBinaryMode os.FileMode = 0o755
 
 // InstallFromTarGz downloads a remote .tar.gz archive and installs binaryName
 // from it to targetPath.
@@ -93,6 +96,69 @@ func InstallAndSwitchFromTarGz(ctx context.Context, downloadURL string, paths go
 	}
 
 	return nil
+}
+
+// EnsureDaemonBinaryLinks initializes daemon current, last-good, and
+// compatibility binary links.
+func EnsureDaemonBinaryLinks(ctx context.Context, log *slog.Logger, paths goalstates.AgentUpgradePaths) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	currentTarget := paths.CurrentTargetPath
+	if _, err := os.Lstat(paths.CurrentPath); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("stat current daemon binary symlink: %w", err)
+		}
+		target, targetErr := initialDaemonBinaryTarget(paths)
+		if targetErr != nil {
+			return fmt.Errorf("no executable agent binary found for daemon link initialization: %w", targetErr)
+		}
+		if err := UpdateSymlink(paths.CurrentPath, target); err != nil {
+			return fmt.Errorf("initialize current daemon symlink: %w", err)
+		}
+		currentTarget = target
+	}
+
+	if _, err := filepath.EvalSymlinks(paths.LastGoodPath); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("resolve last-good daemon binary symlink: %w", err)
+		}
+		if err := UpdateSymlink(paths.LastGoodPath, currentTarget); err != nil {
+			return fmt.Errorf("initialize last-good daemon symlink: %w", err)
+		}
+	}
+
+	if currentTarget != paths.BinaryPath {
+		// Do not replace the compatibility path when the current symlink
+		// already resolves to that path. That preserves legacy installs and
+		// avoids creating a BinaryPath -> CurrentPath -> BinaryPath loop.
+		if err := UpdateSymlink(paths.BinaryPath, paths.CurrentPath); err != nil {
+			return fmt.Errorf("initialize daemon compatibility symlink: %w", err)
+		}
+	}
+
+	log.Info("daemon binary links initialized",
+		"current", paths.CurrentPath,
+		"last_good", paths.LastGoodPath,
+	)
+
+	return nil
+}
+
+func initialDaemonBinaryTarget(paths goalstates.AgentUpgradePaths) (string, error) {
+	target, err := paths.InitialDaemonBinaryTarget()
+	if err != nil {
+		return "", err
+	}
+	if target != paths.BinaryPath {
+		return target, nil
+	}
+	if err := InstallFromFile(paths.BinaryPath, paths.BluePath, daemonBinaryMode); err != nil {
+		return "", err
+	}
+
+	return paths.BluePath, nil
 }
 
 // Verify runs the installed agent binary's version command.

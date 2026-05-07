@@ -230,43 +230,6 @@ func TestDownloadAgentBinaryFromTarGz_RejectsUnsupportedScheme(t *testing.T) {
 	assert.Contains(t, err.Error(), "unsupported agent download URL scheme")
 }
 
-func TestEnsureDaemonBinaryLinks_InitializesFromBlue(t *testing.T) {
-	paths := setupDaemonBinaryTestWithoutLinks(t)
-	require.NoError(t, os.WriteFile(paths.blue, []byte("blue"), 0o755))
-
-	require.NoError(t, ensureDaemonBinaryLinks(slog.Default()))
-
-	assertSymlinkTarget(t, paths.current, paths.blue)
-	assertSymlinkTarget(t, paths.lastGood, paths.blue)
-	assertSymlinkTarget(t, paths.legacy, paths.blue)
-}
-
-func TestEnsureDaemonBinaryLinks_SeedsBlueFromLegacyBinary(t *testing.T) {
-	paths := setupDaemonBinaryTestWithoutLinks(t)
-	require.NoError(t, os.WriteFile(paths.legacy, []byte("legacy"), 0o755))
-
-	require.NoError(t, ensureDaemonBinaryLinks(slog.Default()))
-
-	assertFileContent(t, paths.blue, "legacy")
-	assertSymlinkTarget(t, paths.current, paths.blue)
-	assertSymlinkTarget(t, paths.lastGood, paths.blue)
-	assertSymlinkTarget(t, paths.legacy, paths.blue)
-}
-
-func TestEnsureDaemonBinaryLinks_PreservesExistingLinks(t *testing.T) {
-	paths := setupDaemonBinaryTestWithoutLinks(t)
-	require.NoError(t, os.WriteFile(paths.blue, []byte("blue"), 0o755))
-	require.NoError(t, os.WriteFile(paths.green, []byte("green"), 0o755))
-	require.NoError(t, os.Symlink(paths.green, paths.current))
-	require.NoError(t, os.Symlink(paths.blue, paths.lastGood))
-
-	require.NoError(t, ensureDaemonBinaryLinks(slog.Default()))
-
-	assertSymlinkTarget(t, paths.current, paths.green)
-	assertSymlinkTarget(t, paths.lastGood, paths.blue)
-	assertSymlinkTarget(t, paths.legacy, paths.green)
-}
-
 func TestAgentUpgradePathsInitialDaemonBinaryTarget(t *testing.T) {
 	t.Parallel()
 
