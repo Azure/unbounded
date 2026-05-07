@@ -414,12 +414,30 @@ origin:
                                                   # on-store path so two
                                                   # deployments can safely share
                                                   # one CacheStore bucket
+  target_global: 192                              # desired cluster-wide cap
+                                                  # on concurrent
+                                                  # Origin.GetRange (design.md
+                                                  # s8.4). Per-replica cap is
+                                                  # floor(target_global /
+                                                  # cluster.target_replicas).
+                                                  # Realized cluster-wide cap
+                                                  # tracks target_global only
+                                                  # when actual replica count
+                                                  # equals
+                                                  # cluster.target_replicas.
+                                                  # Coordinated cluster-wide
+                                                  # limiter is deferred future
+                                                  # work (design.md s15.5).
+  queue_timeout: 5s                               # bounded wait when the
+                                                  # per-replica bucket is
+                                                  # saturated; on timeout the
+                                                  # request returns 503 Slow
+                                                  # Down so clients back off
   driver: s3                                      # s3 | azureblob
   s3:
     region: us-east-1
     bucket: example-data
     credentials: env                              # env | irsa | file
-    semaphore: 128
   azureblob:
     account: exampleacct
     container: data
@@ -429,7 +447,6 @@ origin:
     list_mode: filter                             # filter | passthrough
     metadata_ttl: 5m
     rejection_ttl: 5m
-    semaphore: 128
 
 cluster:
   enabled: true
@@ -450,37 +467,19 @@ cluster:
                                                       # internal-RPC dialers
                                                       # (NOT pod IPs); per-replica
                                                       # certs MUST include this SAN
-  limiter:                                            # cluster-wide cap on
-                                                      # concurrent Origin.GetRange
-                                                      # via K8s-Lease-elected
-                                                      # authority
-                                                      # (design.md s8.4 / FW4)
-    enabled: true                                     # default true; off falls
-                                                      # back to v1 per-replica
-                                                      # static cap (no K8s API
-                                                      # access; no Lease object)
-    target_global: 192                                # cluster-wide concurrency
-                                                      # cap; replaces prior
-                                                      # per-replica cap config
-    lease:                                            # K8s Lease (election)
-      name: origincache-limiter                       # Lease object name
-      namespace: ""                                   # default: pod's namespace
-      duration: 15s                                   # client-go leaseDuration
-      renew_deadline: 10s
-      retry_period: 2s
-    token:                                            # slot-lease tokens
-      ttl: 30s                                        # auto-release if not
-                                                      # extended
-      extend_at_ratio: 0.5                            # peer auto-extends when
-                                                      # token age > ratio * ttl
-    batch:
-      size: 8                                         # slots per Acquire RPC
-      refill_threshold: 2                             # refill local bucket
-                                                      # when remaining slots
-                                                      # <= threshold
-    fallback:
-      check_interval: 5s                              # how often a fallback
-                                                      # peer retries authority
+  target_replicas: 3                                  # expected replica count;
+                                                      # used to compute the
+                                                      # per-replica origin
+                                                      # concurrency cap
+                                                      # (target_per_replica =
+                                                      # floor(origin.target_global /
+                                                      # cluster.target_replicas))
+                                                      # (design.md s8.4).
+                                                      # MUST be updated after
+                                                      # any sustained scale
+                                                      # change. Dynamic recompute
+                                                      # is deferred future work
+                                                      # (design.md s15.6).
 ```
 
 CacheStore eviction (TTL / lifecycle) is configured separately on the
@@ -638,35 +637,6 @@ underlying storage system and is not a cache-layer concern. See
   - `origincache_metadata_refresh_lag_seconds` -- histogram of
     `(now - LastEntered)` at refresh time; should cluster around
     `metadata_refresh.refresh_ahead_ratio * metadata_ttl`.
-  - `origincache_limiter_state{role="authority|peer|fallback"}` --
-    per-replica gauge of the current limiter role
-    ([design.md s8.4](./design.md#84-origin-backpressure)).
-  - `origincache_limiter_target_global` -- gauge of configured
-    `cluster.limiter.target_global`.
-  - `origincache_limiter_slots_available` -- gauge (authority only)
-    of unallocated slots at the authority.
-  - `origincache_limiter_slots_granted` -- gauge (authority only)
-    of currently-held slots across all peers.
-  - `origincache_limiter_slots_local` -- per-peer gauge of slots in
-    the local bucket.
-  - `origincache_limiter_acquire_total{result="ok|denied|fallback|error"}`
-    -- Acquire RPC outcomes. `fallback` increments when the peer
-    activates fallback mode due to authority unreachability.
-  - `origincache_limiter_acquire_duration_seconds` -- histogram of
-    Acquire RPC latency.
-  - `origincache_limiter_extend_total{result="ok|expired|error"}`
-    -- token Extend outcomes. `expired` means the authority
-    reclaimed the token before extension arrived.
-  - `origincache_limiter_release_total` -- counter of Release
-    operations.
-  - `origincache_limiter_election_total{result="acquired|lost|renewed|failed"}`
-    -- K8s Lease election events.
-  - `origincache_limiter_lease_expired_total` -- counter of tokens
-    that expired without an explicit Release (peer crashed or
-    network partition). Authority sweep reclaimed the slots.
-  - `origincache_limiter_fallback_active` -- per-peer gauge; 1 if
-    fallback mode is currently active. Sustained = 1 indicates
-    K8s API or network issues; alert directly on this gauge.
   - `origincache_s3_versioning_check_total{result="ok|refused"}` --
     once-per-boot emission from the `cachestore/s3` versioning
     gate ([design.md s10.1.3](./design.md#1013-cachestores3)).
@@ -730,7 +700,7 @@ underlying storage system and is not a cache-layer concern. See
 | Phase | Scope | Definition of done |
 |---|---|---|
 | **0 - skeleton** | `cmd/origincache` boilerplate; `Origin` and `CacheStore` interfaces; `origin/s3`; `cachestore/localfs`; in-memory `chunkcatalog`; single-process Range GET; streaming chunk iterator; `make` integration; basic unit tests | One process serves a Range GET against a real S3 bucket and re-serves it from `localfs` |
-| **1 - prod basics** | `fetch.Coordinator` with chunk + meta singleflight + tee; `chunkcatalog` LRU + Stat-on-miss path with **per-entry access-frequency tracking** (FW8) and bounded by `chunk_catalog.max_entries` with size-awareness operational guidance ([design.md s13.3](./design.md#133-chunkcatalog-size-awareness-load-bearing-operational-note)); atomic CacheStore writes (`localfs` `link`/`renameat2(RENAME_NOREPLACE)` with **staging inside `<root>/.staging/<uuid>` + parent-dir fsync**); metadata cache with `metadata_ttl=5m` and **`negative_metadata_ttl=60s`** (asymmetric defaults; bounds the create-after-404 unavailability window per [design.md s12](./design.md#12-create-after-404-and-negative-cache-lifecycle)) including `metadata_negative_entries` / `metadata_negative_hit_total` / `metadata_negative_age_seconds` metrics; **per-replica LIST cache** (FW3) with default `list_cache.ttl=60s`, `max_entries=1024`, sized for FUSE-`ls` workload ([design.md s6.2](./design.md#62-list-request-flow)); **active eviction** (FW8) opt-in via `chunk_catalog.active_eviction.enabled` (default off; recommended on for posixfs deployments without external sweep) including `CacheStore.Delete` interface method; **bounded-freshness mode** (FW5) opt-in via `metadata_refresh.enabled` (default off) with hot-key detection via metadata-cache access counters ([design.md s11.2](./design.md#112-bounded-freshness-mode-optional)); **distributed origin limiter** (FW4) via Kubernetes `coordination.k8s.io/v1.Lease` for authority election plus in-memory semaphore at the elected leader plus internal RPC for slot acquisition; graceful fallback to per-replica `floor(target_global/N)` cap when authority unreachable ([design.md s8.4](./design.md#84-origin-backpressure)); RBAC manifests for the Lease resource; **bounded staleness contract documented**; **strict `If-Match: <etag>` on every `Origin.GetRange` plus `OriginETagChangedError` handling**; **typed `CacheStore` errors (`ErrNotFound|ErrTransient|ErrAuth`)** with only `ErrNotFound` triggering refill; **per-replica HEAD singleflight wording** in metadata layer; **pre-header origin retry** (`origin.retry.attempts=3`, `origin.retry.max_total_duration=5s` defaults) as the cold-path commit boundary - cold-path bytes stream origin -> client directly with bounded leader-side retry handling transient origin failures invisibly before HTTP response headers are committed; spool tees in parallel for joiner support and as the asynchronous CacheStore-commit source ([design.md s8.6](./design.md#86-failure-handling-without-re-stampede)); **mid-stream abort** on post-first-byte failure (`RST_STREAM` / `Connection: close`); **`server.max_response_bytes` cap returns `400 RequestSizeExceedsLimit`** (S3-style XML; 416 reserved for Range vs. EOF); `HeadObject`; `ListObjectsV2`; `origin/azureblob` (Block Blob only); **`cachestore/s3` versioning gate** ([design.md s10.1.3](./design.md#1013-cachestores3)) refusing to start on versioned buckets; Prometheus; structured logging; health / readiness | One replica deployed in a dev K8s cluster serving traffic against both S3 and Azure (multi-replica clustering lands in Phase 3) |
+| **1 - prod basics** | `fetch.Coordinator` with chunk + meta singleflight + tee; `chunkcatalog` LRU + Stat-on-miss path with **per-entry access-frequency tracking** (FW8) and bounded by `chunk_catalog.max_entries` with size-awareness operational guidance ([design.md s13.3](./design.md#133-chunkcatalog-size-awareness-load-bearing-operational-note)); atomic CacheStore writes (`localfs` `link`/`renameat2(RENAME_NOREPLACE)` with **staging inside `<root>/.staging/<uuid>` + parent-dir fsync**); metadata cache with `metadata_ttl=5m` and **`negative_metadata_ttl=60s`** (asymmetric defaults; bounds the create-after-404 unavailability window per [design.md s12](./design.md#12-create-after-404-and-negative-cache-lifecycle)) including `metadata_negative_entries` / `metadata_negative_hit_total` / `metadata_negative_age_seconds` metrics; **per-replica LIST cache** (FW3) with default `list_cache.ttl=60s`, `max_entries=1024`, sized for FUSE-`ls` workload ([design.md s6.2](./design.md#62-list-request-flow)); **active eviction** (FW8) opt-in via `chunk_catalog.active_eviction.enabled` (default off; recommended on for posixfs deployments without external sweep) including `CacheStore.Delete` interface method; **bounded-freshness mode** (FW5) opt-in via `metadata_refresh.enabled` (default off) with hot-key detection via metadata-cache access counters ([design.md s11.2](./design.md#112-bounded-freshness-mode-optional)); **distributed origin limiter** is deferred future work (see [design.md s15.5](./design.md#155-coordinated-cluster-wide-origin-limiter)); v1 ships with a per-replica token bucket sized `floor(origin.target_global / cluster.target_replicas)` (default 64 slots/replica at `target_global=192`, `target_replicas=3`), with origin throttling responses handled by the leader's pre-header retry loop ([design.md s8.4](./design.md#84-origin-backpressure)); **bounded staleness contract documented**; **strict `If-Match: <etag>` on every `Origin.GetRange` plus `OriginETagChangedError` handling**; **typed `CacheStore` errors (`ErrNotFound|ErrTransient|ErrAuth`)** with only `ErrNotFound` triggering refill; **per-replica HEAD singleflight wording** in metadata layer; **pre-header origin retry** (`origin.retry.attempts=3`, `origin.retry.max_total_duration=5s` defaults) as the cold-path commit boundary - cold-path bytes stream origin -> client directly with bounded leader-side retry handling transient origin failures invisibly before HTTP response headers are committed; spool tees in parallel for joiner support and as the asynchronous CacheStore-commit source ([design.md s8.6](./design.md#86-failure-handling-without-re-stampede)); **mid-stream abort** on post-first-byte failure (`RST_STREAM` / `Connection: close`); **`server.max_response_bytes` cap returns `400 RequestSizeExceedsLimit`** (S3-style XML; 416 reserved for Range vs. EOF); `HeadObject`; `ListObjectsV2`; `origin/azureblob` (Block Blob only); **`cachestore/s3` versioning gate** ([design.md s10.1.3](./design.md#1013-cachestores3)) refusing to start on versioned buckets; Prometheus; structured logging; health / readiness | One replica deployed in a dev K8s cluster serving traffic against both S3 and Azure (multi-replica clustering lands in Phase 3) |
 | **2 - prod backend & ops** | `cachestore/s3` for VAST with `PutObject` + `If-None-Match: *` and **`SelfTestAtomicCommit` at startup** (refuse to start if backend silently overwrites); **`cachestore/posixfs` for shared POSIX FS deployments** (NFSv4.1+ baseline, plus Weka native, CephFS, Lustre, GPFS) sharing `link()`/`EEXIST` + dir-fsync helpers with `cachestore/localfs` via `internal/origincache/cachestore/internal/posixcommon/`, with **`SelfTestAtomicCommit` at startup** (refuse to start on Alluxio FUSE, on NFS below `nfs.minimum_version=4.1` unless `nfs.allow_v3` is set, or on any backend that fails the link-EEXIST + dir-fsync + size-verify self-test) and 2-char hex fan-out under `<origin_id>/`; **`internal/origincache/fetch/spool` layer** (slow-joiner fallback regardless of CacheStore driver) **with mandatory boot `statfs(2)` locality check** that refuses to start when `spool.dir` is on a network FS (NFS / SMB / CephFS / Lustre / GPFS / FUSE); **`commit_after_serve_total{ok|failed}` async-commit metric path**; **per-process CacheStore circuit breaker** (`enabled,error_window=30s,error_threshold=10,open_duration=30s,half_open_probes=3`); **per-replica origin semaphore documented** with formula `floor(target_global / N_replicas)` + `origin_inflight` gauge; **`localfs` `staging_max_age=1h` orphaned-staging sweeper** (and equivalent `posixfs.staging_max_age=1h`); **`/readyz` ErrAuth threshold (default 3 consecutive -> NotReady)**; sequential read-ahead; bearer / mTLS auth on the client edge; `deploy/origincache/` manifests (incl. `07-networkpolicy.yaml.tmpl`); `images/origincache/` Containerfile; `docs/origincache/` published with CacheStore lifecycle policy guidance and POSIX-backend support matrix | Production-shaped service running against VAST in a real DC with the self-test green, AND a parallel green run against at least one shared-POSIX backend (NFSv4.1+ baseline) |
 | **3 - cluster** | `cluster/` peer discovery from headless Service DNS; rendezvous hashing on pod IP; **per-chunk internal fill RPC** (assembler fan-out); **internal mTLS listener on `:8444`** with internal CA + peer-IP authz + **stable `ServerName=origincache.<ns>.svc`** pinned by dialers (per-replica certs MUST include this SAN) + `X-Origincache-Internal` loop prevention + `409 Conflict` on coordinator disagreement; NetworkPolicy applied; `kubectl unbounded origincache` inspection subcommand | Multi-replica Deployment sustaining target throughput; `commit_lost` rate near zero in steady state |
 | **4 - optional** | NVMe / HDD tiering; S3 SigV4 verification; adaptive prefetch; deferred optimizations catalogued in [design.md s15](./design.md#15-deferred-optimizations) (edge rate limiting, cluster-wide HEAD singleflight, cluster-wide LIST coordinator) if measured to be needed | As needed |
@@ -933,42 +903,21 @@ Estimated calendar: Phase 0 + 1 ~= 3-4 focused weeks. Phase 2 + 3 another
 - **T-metadata-refresh-negative-entries-not-refreshed**: negative
   entry (404) under `negative_metadata_ttl` is NOT refreshed;
   expires naturally.
-- **T-limiter-acquire-basic** (`cluster/limiter`): peer Acquires 8
-  slots, consumes 1, releases. Assert local bucket = 7 after
-  consume, = 8 after release.
-- **T-limiter-batch-refill**: local bucket drops to
-  `refill_threshold` (2) -> auto-refill RPC fires; new batch of 8
-  acquired.
-- **T-limiter-extend-long-fill**: GetRange exceeds `token.ttl` ->
-  background extend fires before TTL; no expiration; metric
-  `limiter_extend_total{result="ok"}` increments.
-- **T-limiter-token-expiry**: peer crashes without release ->
-  authority sweep reclaims after `token.ttl`; metric
-  `limiter_lease_expired_total` increments.
-- **T-limiter-authority-changeover**: kill the elected authority
-  pod -> 15s lease expiry -> new election -> new authority. Verify
-  cluster-wide inflight overshoot bounded by `target_global` and
-  drains within 45s; metric `limiter_election_total{result="acquired"}`
-  on new authority.
-- **T-limiter-fallback-on-unreachable**: simulate authority RPC
-  timeout -> peer activates fallback (`floor(target_global/N)`).
-  Assert `limiter_fallback_active=1`. Reconnect -> fallback
-  deactivates; gauge returns to 0.
-- **T-limiter-k8s-api-down-at-boot**: K8s API unavailable at
-  startup -> no election; all replicas in fallback. API recovers ->
-  election runs; one replica becomes authority; others become peers.
-- **T-limiter-cap-respected-steady-state** (multi-replica
-  integration): 10 concurrent client requests across 3 replicas ->
-  cluster-wide concurrent `Origin.GetRange` never exceeds
-  `target_global` in steady state (modulo the 45s changeover
-  overshoot window).
-- **T-limiter-disabled**: `cluster.limiter.enabled=false` -> v1
-  per-replica static cap; no K8s API access; no Lease object
-  created; metric `limiter_state{role="fallback"}=1`.
-- **T-limiter-rbac-missing**: insufficient RBAC for the Lease
-  resource -> election fails with logged error; replica falls
-  back; no crash; metric
-  `limiter_election_total{result="failed"}` increments.
+- **T-origin-per-replica-cap** (`origin` + mock origin): with
+  `cluster.target_replicas=3` and `origin.target_global=192`
+  (giving per-replica cap = 64), launch 100 concurrent
+  `Origin.GetRange` calls on a single replica. Assert at most 64
+  hit origin concurrently; the remainder queue up to
+  `origin.queue_timeout` (5s) before returning `503 Slow Down` to
+  the client. Validates the simple per-replica token bucket
+  (design.md s8.4).
+- **T-origin-throttle-handled-by-retry** (`origin` +
+  `fetch.Coordinator` + mock origin): origin returns `503 SlowDown`
+  on the first attempt and `200` on the second. Assert client sees
+  a clean 200 response; assert
+  `origin_retry_total{result="success"}=1`. Validates that origin
+  throttling does NOT require a coordinated cluster-wide cap;
+  pre-header retry handles it.
 - **T-s3-versioned-bucket-refusal** (`cachestore/s3`): configure
   `cachestore/s3` against a bucket with versioning enabled; assert
   process exits non-zero with the documented error message and
@@ -1163,25 +1112,22 @@ Re-stated to prevent drift:
   CacheStore circuit breaker; operators MUST alert on a sustained
   non-zero rate (it indicates CacheStore degradation, not request
   errors).
-- **Limiter authority changeover overshoot**: the K8s-Lease-elected
-  limiter authority (`cluster.limiter` / FW4) starts each election
-  with an empty in-memory slot table while old slot-lease tokens at
-  peers continue draining naturally. Cluster-wide concurrent
-  `Origin.GetRange` may transiently exceed `target_global` by up to
-  one full set of tokens during a changeover, draining within
-  `lease.duration + token.ttl` (default 15s + 30s = 45s).
-  Acceptable because the limiter is a soft cap; correctness is
-  unaffected. Sustained overshoot would indicate a bug in the
-  election or token-sweep logic.
-- **Limiter fallback on K8s API outage**: when no peer can reach the
-  authority (or no authority is elected because K8s API is down),
-  every replica falls back to the per-replica static cap
-  `floor(target_global / N_replicas)`. Same approximation as the
-  pre-FW4 design; cluster-wide cap may be slightly under or over
-  `target_global` during the outage. `limiter_fallback_active=1`
-  per-replica gauge makes this visible; operators alert on the
-  gauge directly. Not a `/readyz` predicate since the cluster
-  continues serving correctly in fallback.
+- **Per-replica origin semaphore is approximate**: each replica
+  enforces `floor(origin.target_global / cluster.target_replicas)`
+  (default 64 slots/replica at `target_global=192`,
+  `target_replicas=3`). Realized cluster-wide concurrency tracks
+  `target_global` only when `N_actual == cluster.target_replicas`;
+  scale-out without updating the knob over-allocates against
+  origin (cluster-wide cap exceeds `target_global` by
+  `(N_actual - target_replicas) * target_per_replica`); scale-in
+  under-allocates. Mitigations: operators MUST update
+  `cluster.target_replicas` after sustained scale changes; a
+  coordinated cluster-wide limiter (s15.5) and dynamic recompute
+  from `len(Cluster.Peers())` (s15.6) are deferred future work.
+  Origin throttling responses (`503 SlowDown` / `429`) are handled
+  by the leader's pre-header retry loop (s8.6) with exponential
+  backoff regardless; origin self-protects against the static-cap
+  overshoot.
 - **VAST `If-None-Match: *` requires unversioned bucket**: the
   `cachestore/s3` driver relies on the backend honoring
   `If-None-Match: *` to enforce no-clobber atomic commit. AWS S3
@@ -1406,18 +1352,20 @@ Before starting Phase 0 implementation, please confirm:
 - [ ] **Per-process CacheStore circuit breaker with defaults
       `error_window=30s, error_threshold=10, open_duration=30s,
       half_open_probes=3`; state and transitions exported as metrics.**
-- [ ] **Distributed origin limiter (FW4) ships in Phase 1: K8s
-      `coordination.k8s.io/v1.Lease` for authority election;
-      in-memory semaphore at the elected leader; internal RPC for
-      slot acquisition with batching (default `batch.size=8`,
-      configurable); slot-lease tokens with TTL (default 30s);
-      graceful fallback to per-replica `floor(target_global / N)`
-      cap on authority unreachability;
-      `cluster.limiter.enabled=false` toggle preserves v1 escape
-      hatch with no K8s API access. RBAC manifest (`Role` +
-      `RoleBinding` for the named Lease resource) lands with the
-      deploy manifests. Limiter authority unreachability is NOT a
-      `/readyz` predicate ([design.md s8.4](./design.md#84-origin-backpressure)).**
+- [ ] **Origin backpressure is per-replica static cap:
+      `target_per_replica = floor(origin.target_global /
+      cluster.target_replicas)` (default 64 slots/replica at
+      `target_global=192`, `target_replicas=3`); origin throttling
+      responses (`503 SlowDown` / `429`) are handled by the
+      pre-header retry loop (`origin.retry.*`); `origin_inflight`
+      gauge exposes per-replica saturation. Coordinated
+      cluster-wide limiter and dynamic per-replica recompute are
+      deferred future work, see
+      [design.md s15.5](./design.md#155-coordinated-cluster-wide-origin-limiter)
+      and
+      [design.md s15.6](./design.md#156-dynamic-per-replica-origin-cap).
+      Operators MUST update `cluster.target_replicas` after any
+      sustained scale change.**
 - [ ] **`cachestore/localfs` stages inside `<root>/.staging/<uuid>` (NOT
       `/tmp` and NOT spool dir); parent-dir fsync after every link/unlink;
       `staging_max_age=1h` orphaned-staging sweeper.**

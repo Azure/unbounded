@@ -52,6 +52,8 @@ Owner: TBD
     - [15.2 Cluster-wide HEAD singleflight](#152-cluster-wide-head-singleflight)
     - [15.3 Cluster-wide LIST coordinator](#153-cluster-wide-list-coordinator)
     - [15.4 Mid-stream origin resume](#154-mid-stream-origin-resume)
+    - [15.5 Coordinated cluster-wide origin limiter](#155-coordinated-cluster-wide-origin-limiter)
+    - [15.6 Dynamic per-replica origin cap](#156-dynamic-per-replica-origin-cap)
 
 ### Request scenarios
 
@@ -67,10 +69,9 @@ identifier reused in the diagram heading.
 - **Scenario G** - create-after-404 (operator upload after client miss): [Diagram 10](#diagram-10-scenario-g---create-after-404-timeline)
 - **Scenario H** - rolling restart membership flux: [Diagram 12](#diagram-12-scenario-h---rolling-restart-membership-flux)
 
-Other diagrams (D1, D2, D9, D11, D13) depict architecture, math, or
+Other diagrams (D1, D2, D9, D11) depict architecture, math, or
 mechanism rather than request scenarios and are reachable from the
-Sections list above. Diagram 13 covers the limiter authority and
-slot acquisition mechanism (s8.4).
+Sections list above.
 
 ---
 
@@ -103,14 +104,13 @@ stampede protection, atomic commit, and horizontal-scale coordination.
 | Catalog | In-memory `ChunkCatalog` fronting `CacheStore.Stat`. No persistent local index. Per-entry access-frequency tracking (s10.2) feeds the optional active-eviction loop (s13.2). Bounded by `chunk_catalog.max_entries`; size to estimated working-set chunks (s13.3). |
 | Eviction | Two-tier. Passive: bounded LRU on the in-memory ChunkCatalog (always on); CacheStore lifecycle (S3 lifecycle / posixfs operator sweep) for storage-side cleanup. Active: opt-in access-frequency-driven eviction loop (`chunk_catalog.active_eviction.enabled`, default `false`) that deletes cold chunks from the CacheStore via `CacheStore.Delete`. Operators using `cachestore/posixfs` typically enable active eviction since posixfs has no native lifecycle. See [s13](#13-eviction-and-capacity). |
 | Prefetch | Sequential read-ahead by default. Configurable depth, capped concurrency. |
-| Cluster | Kubernetes Deployment + headless Service for peer discovery + ClusterIP/LB for client traffic. Rendezvous hashing on pod IP selects the coordinator per `ChunkKey` for miss-fills only; receiving replica is the **assembler** that fans out per-chunk fill RPCs to coordinators (s8.3). All replicas can read all chunks directly from the CacheStore on hits. A separate **limiter authority** is elected via a Kubernetes `coordination.k8s.io/v1.Lease` to enforce a cluster-wide cap on concurrent `Origin.GetRange` calls (s8.4). |
-| Kubernetes coordination | Two K8s-native dependencies: (1) headless Service for peer discovery (s14); (2) one `coordination.k8s.io/v1.Lease` resource per deployment for limiter-authority election (s8.4). RBAC: `get / list / watch / create / update / patch` on the named Lease resource, scoped to the deployment's namespace. |
+| Cluster | Kubernetes Deployment + headless Service for peer discovery + ClusterIP/LB for client traffic. Rendezvous hashing on pod IP selects the coordinator per `ChunkKey` for miss-fills only; receiving replica is the **assembler** that fans out per-chunk fill RPCs to coordinators (s8.3). All replicas can read all chunks directly from the CacheStore on hits. |
 | Inter-replica auth | Separate internal mTLS listener (default `:8444`) chained to an internal CA distinct from the client mTLS CA; authorization = "presenter source IP is in current peer-IP set" (s8.8). |
 | Local spool | Every fill writes origin bytes through a local spool (`internal/origincache/fetch/spool`) in parallel with streaming to the client; serves as a slow-joiner fallback and as the source for the asynchronous CacheStore commit. The spool is NOT on the client-TTFB path in v1; client bytes flow origin -> client directly (s8.2 / s8.6). |
 | Atomic commit | `localfs` and `posixfs` stage inside `<root>/.staging/<uuid>` with parent-dir fsync, then `link()` no-clobber (returns `EEXIST` to the loser); `s3` uses direct `PutObject` with `If-None-Match: *`. Each driver runs `SelfTestAtomicCommit` at boot: `s3` proves the backend honors `If-None-Match: *`; `posixfs` proves the backend honors `link()` / `EEXIST` and that directory fsync is durable, and additionally enforces `nfs.minimum_version` (default `4.1`, with opt-in `nfs.allow_v3`) and refuses to start on Alluxio FUSE backends. Cold-path bytes stream directly from origin to client; bounded leader-side **pre-header origin retry** (s8.6) handles transient origin failures invisibly before response headers are committed. The spool tees in parallel for joiners (s8.2) and as the CacheStore-commit source. CacheStore commit happens asynchronously after the response completes; commit-after-serve failure becomes `commit_after_serve_total{result="failed"}` rather than a client error (s8.6). |
 | Versioned buckets on cachestore/s3 | Not supported. The `cachestore/s3` driver requires the bucket to have versioning **disabled**. AWS S3 honors `If-None-Match: *` on both versioned and unversioned buckets, but VAST Cluster (and likely other S3-compatible backends) only honors it on unversioned buckets ([VAST KB][vast-kb-conditional-writes]). The driver enforces this at boot via an explicit `GetBucketVersioning` versioning gate (s10.1.3); refusing to start on enabled or suspended versioning avoids a class of silent atomic-commit failures. |
 | LIST caching | Per-replica TTL'd LIST cache (s6.2 / FW3) in front of `Origin.List`, sized for the FUSE-`ls` workload pattern. Default `list_cache.ttl=60s`, configurable. Cluster-wide LIST coordination is a deferred optimization ([s15.3](#153-cluster-wide-list-coordinator)). |
-| Origin concurrency cap | Cluster-wide via Kubernetes-Lease-elected limiter authority (s8.4 / FW4). Default `cluster.limiter.target_global=192`. Per-replica static cap (`floor(target_global / N)`) is the documented graceful-fallback when the authority is unreachable; also the v1 escape hatch via `cluster.limiter.enabled=false`. |
+| Origin concurrency cap | Per-replica token bucket sized `floor(target_global / cluster.target_replicas)`. Default `target_global=192` and `cluster.target_replicas=3`, giving 64 slots per replica. Origin throttling responses (503 / 429) are handled by the leader's pre-header retry loop (s8.6) with exponential backoff. A coordinated cluster-wide limiter and dynamic recompute from `len(Cluster.Peers())` are deferred optimizations; see [s15.5](#155-coordinated-cluster-wide-origin-limiter) and [s15.6](#156-dynamic-per-replica-origin-cap). |
 | Bounded-freshness mode | Optional, opt-in via `metadata_refresh.enabled` (default `false`). When enabled, a per-replica background loop proactively re-Heads hot keys (`AccessCount >= access_threshold`) ahead of `metadata_ttl` to shrink the effective bounded-staleness window for popular content. See [s11.2](#112-bounded-freshness-mode-optional). |
 | Tenancy | Single tenant, single origin credential set in v1. |
 | Edge rate limiting | Documented v1 gap; see [s15.1](#151-edge-rate-limiting). v1 has implicit hot-client mitigation via the per-replica origin limiter (s8.4) and singleflight (s8.1); per-client / per-IP / per-credential edge rate limiting is deferred future work. |
@@ -262,25 +262,6 @@ section that defines or implements the full mechanism.
   detection uses access-frequency counters on the metadata cache
   (parallel to the ChunkCatalog tracking from FW8). Detail in
   [s11.2](#112-bounded-freshness-mode-optional).
-- **Limiter authority** - the replica elected (via a Kubernetes
-  `coordination.k8s.io/v1.Lease`) to hold the cluster-wide
-  `Origin.GetRange` semaphore and serve slot-lease tokens to peers
-  over the internal listener. One per deployment. Election is
-  separate from the rendezvous-hashed chunk and HEAD coordinators.
-  Detail in [s8.4](#84-origin-backpressure).
-- **Slot lease token** - opaque token issued by the limiter
-  authority to a peer on `Acquire`. Carries N batched slots
-  (default 8) with wall-clock TTL (default 30s). Auto-extended
-  while in use; auto-released by the authority's sweep on
-  expiration without release. Detail in
-  [s8.4](#84-origin-backpressure).
-- **Limiter fallback mode** - graceful degradation when a peer
-  cannot reach the limiter authority (RPC timeout, dial failure,
-  K8s API outage, or `cluster.limiter.enabled=false`). The peer
-  falls back to a per-replica static cap of
-  `floor(target_global / N_replicas)`. Reconnects automatically.
-  Not a `/readyz` predicate. Detail in
-  [s8.4](#84-origin-backpressure).
 - **S3 versioning gate** - boot-time `GetBucketVersioning` check
   by `cachestore/s3` that refuses to start if the bucket has
   versioning enabled or suspended. Required because
@@ -828,30 +809,6 @@ type Cluster interface {
     ServerName() string           // e.g. "origincache.<ns>.svc"
 }
 
-// Limiter: cluster-wide cap on concurrent Origin.GetRange calls (s8.4).
-// Acquire blocks until a slot is available or ctx expires. The returned
-// Slot's Release MUST be called when the GetRange completes (regardless
-// of success). Implementations: limiter/k8slease (authority mode +
-// fallback) and limiter/static (per-replica static cap, used when
-// cluster.limiter.enabled=false).
-type Limiter interface {
-    Acquire(ctx context.Context) (Slot, error)
-    State() LimiterState  // for /readyz and metrics; "authority|peer|fallback"
-}
-
-type Slot interface {
-    Release()
-}
-
-type LimiterState int
-
-const (
-    LimiterStateUnknown LimiterState = iota
-    LimiterStateAuthority   // this replica is the elected authority
-    LimiterStatePeer        // normal peer; using authority-issued lease tokens
-    LimiterStateFallback    // authority unreachable; using per-replica static cap
-)
-
 // Spool: bounded local-disk staging area for in-flight fills. Every fill
 // writes through the spool so slow joiners can fall back from the leader's
 // ring buffer to a local disk reader regardless of CacheStore driver.
@@ -924,26 +881,10 @@ type Peer struct {
 }
 
 // InternalClient: HTTP/2 over mTLS client to a peer's internal listener.
-// Returned by Cluster.InternalDial. v1 exposes the chunk-fill RPC plus
-// the distributed limiter RPCs (s8.4 / FW4).
+// Returned by Cluster.InternalDial. v1 exposes the per-chunk fill RPC
+// only.
 type InternalClient interface {
     Fill(ctx context.Context, k ChunkKey) (io.ReadCloser, error)
-
-    // Limiter RPCs (s8.4). The caller is responsible for retrying on
-    // a fresh authority after authority changeover; an `ErrNotAuthority`
-    // result means the receiving peer is not the elected authority and
-    // the caller should re-resolve.
-    LimiterAcquire(ctx context.Context, batch int) (LimiterToken, error)
-    LimiterExtend(ctx context.Context, t LimiterToken) (time.Duration, error)
-    LimiterRelease(ctx context.Context, t LimiterToken) error
-}
-
-// LimiterToken: opaque handle issued by the limiter authority on
-// Acquire. Carries the slot count granted and the expiry time.
-type LimiterToken struct {
-    ID        string
-    Slots     int
-    ExpiresAt time.Time
 }
 
 // MetadataCacheEntry: per-entry shape of the metadata cache (s8.7,
@@ -978,12 +919,6 @@ Implementations:
 - `Cluster`: a single implementation that polls the headless Service
   (default 5s), computes rendezvous hashes against pod IPs, and exposes
   an mTLS HTTP/2 client for the internal listener.
-- `Limiter`: two implementations. `limiter/k8slease` runs election
-  via `client-go/tools/leaderelection` against a `Lease` resource
-  (s8.4) and contains the authority-mode semaphore + peer-mode
-  bucket logic + fallback. `limiter/static` is the disabled-mode
-  per-replica static cap (`floor(target_global / N_replicas)`) used
-  when `cluster.limiter.enabled=false`.
 - `Spool`: a single implementation backed by a configured local directory
   (`spool.dir`) with a capacity cap (`spool.max_bytes`) and an in-flight
   cap (`spool.max_inflight`).
@@ -1223,169 +1158,63 @@ sequenceDiagram
 
 ### 8.4 Origin backpressure
 
-Concurrent `Origin.GetRange` calls are capped at a configured
-**cluster-wide** target via a distributed limiter. The limiter has
-two modes: **authority mode** (the normal path; one elected
-authority issues slot leases over an internal RPC) and **fallback
-mode** (a degraded but always-correct per-replica static cap that
-activates when the authority is unreachable).
+Each replica enforces a **per-replica token bucket** that caps
+concurrent `Origin.GetRange` calls. The bucket is sized to a
+conservative per-replica fraction of the desired cluster-wide
+concurrency:
 
-#### Authority election via Kubernetes Lease
+```
+target_per_replica = floor(target_global / N_typical)
+```
 
-One replica is elected as the **limiter authority** via a
-`coordination.k8s.io/v1.Lease` object (default name
-`origincache-limiter` in the deployment's namespace). Election uses
-the standard `client-go/tools/leaderelection` machinery used by
-controller-runtime, kube-scheduler, etc. K8s API load is
-intentionally minimal: the elected leader writes the Lease at
-`retry_period` (default 2s); non-leaders do not write. Steady-state
-load is ~6-30 API writes/min/deployment. Required RBAC: `get / list
-/ watch / create / update / patch` on the single named `Lease`
-resource, scoped to the deployment's namespace.
+where `N_typical` is the expected replica count in steady state
+(`cluster.target_replicas`, default 3). Defaults: `target_global=192`,
+giving `target_per_replica=64`.
 
-The elected authority holds an in-memory counting semaphore of
-`cluster.limiter.target_global` slots (default 192). It serves three
-RPCs over the existing internal listener (s8.8):
+This is approximate. Realized cluster-wide concurrency depends on
+the actual replica count `N_actual`:
 
-- `POST /internal/limiter/acquire` -> issues a lease token holding
-  N slots (batched; see below). Token has wall-clock TTL
-  (`token.ttl`, default 30s).
-- `POST /internal/limiter/extend` -> bumps an existing token's
-  expiry. Returns `unknown_token` or `expired` if the authority's
-  view of the token has been reclaimed.
-- `POST /internal/limiter/release` -> returns slots immediately;
-  idempotent.
+- `N_actual == N_typical`: realized cap is `target_global` exactly.
+- `N_actual > N_typical` (scaled out without updating
+  `cluster.target_replicas`): realized cap exceeds `target_global`
+  by up to `(N_actual - N_typical) * target_per_replica`.
+- `N_actual < N_typical` (scaled in): realized cap falls below
+  `target_global` by `(N_typical - N_actual) * target_per_replica`.
 
-A background sweep on the authority reclaims expired tokens every
-5s. Tokens that expire ungracefully (peer crashed without
-releasing) increment `origincache_limiter_lease_expired_total`.
+Operators MUST update `cluster.target_replicas` after any sustained
+scale change. Dynamic recompute of the cap from `len(Cluster.Peers())`
+is a deferred optimization; see
+[s15.6](#156-dynamic-per-replica-origin-cap).
 
-#### Slot batching
+Origin throttling responses (HTTP 503 SlowDown, 429, retryable
+5xx) are handled by the leader's pre-header retry loop (s8.6 /
+Option D), which provides exponential backoff transparent to the
+client. If the retry budget exhausts, the leader returns
+`502 OriginRetryExhausted`. The system self-regulates without
+cluster-wide coordination: an over-loaded origin slows individual
+fills via backoff; the per-replica cap bounds inflight per pod;
+the singleflight (s8.1) collapses concurrent identical fills.
 
-Each non-authority replica holds a small **local bucket** of slots
-acquired in batches. Default batch size is `cluster.limiter.batch.size = 8`;
-refill triggers when remaining slots fall to or below
-`cluster.limiter.batch.refill_threshold` (default 2). This bounds RPC
-overhead to roughly one Acquire per N origin GetRange calls (where
-N is batch_size). The trade-off: replicas may hold up to
-`batch_size - 1` extra slots that could otherwise be used by other
-peers; small noise relative to `target_global`.
+When the bucket is saturated, leaders queue with bounded wait
+(`origin.queue_timeout`, default 5s); on timeout, the request
+returns `503 Slow Down` to the client so clients back off.
+Joiners on existing fills do not consume slots.
 
-Tokens auto-extend when their age exceeds
-`cluster.limiter.token.extend_at_ratio * token.ttl` (default
-0.5 * 30s = 15s). When the local bucket empties, the replica
-Releases the old token and Acquires a fresh one.
+The current saturation is exposed as
+`origincache_origin_inflight{origin}` (per-replica gauge).
+Operators can sum across replicas in their monitoring stack to
+observe approach to `target_global`.
 
-#### Authority changeover
-
-When the K8s Lease holder changes (current authority crash, network
-partition, K8s API blip):
-
-1. K8s lease expires after `cluster.limiter.lease.duration` (default
-   15s).
-2. New election runs; one survivor becomes new authority. Empty
-   slot table; `available = target_global`.
-3. **Transient overshoot**: outstanding lease tokens at peers point
-   at the dead authority. Peers continue using slots locally until
-   their token expires (`token.ttl`, 30s) or they detect the
-   authority change via Extend/Release returning `unknown_token`.
-4. Maximum cluster-wide inflight overshoot during changeover: up to
-   `target_global` extra slots (one full set of tokens still in use
-   against the dead authority while the new authority issues fresh
-   ones).
-5. Drains within `lease.duration + token.ttl` = **45s worst case**
-   with defaults.
-
-This is acceptable because the limiter is a soft cap. Correctness
-is unaffected; the steady-state cluster-wide bound returns once the
-old tokens drain.
-
-#### Fallback mode
-
-When a non-authority cannot reach the authority (RPC timeout, dial
-failure, K8s API down so no authority is elected, or
-`cluster.limiter.enabled: false`):
-
-1. Replica activates **fallback semaphore** with cap
-   `floor(target_global / N_replicas)` (the v1-equivalent
-   per-replica static cap).
-2. Each `Origin.GetRange` checks the fallback semaphore instead of
-   authority-issued tokens.
-3. Replica periodically retries authority connection
-   (`cluster.limiter.fallback.check_interval`, default 5s).
-4. On reconnect, replica re-Acquires from authority; fallback
-   semaphore deactivates.
-
-`origincache_limiter_fallback_active=1` (per-replica gauge) makes
-operators aware. Sustained fallback indicates K8s API or network
-issues. The fallback path is intentionally NOT a `/readyz`
-predicate (s10.5): replicas in fallback are still serving
-correctly, just with less optimal slot allocation.
-
-#### Disabling the distributed limiter
-
-`cluster.limiter.enabled: false` falls back to the per-replica
-`floor(target_global / N_replicas)` cap permanently. No K8s API
-access; no Lease object created. This is the v1 escape hatch for
-deployments that cannot grant the required RBAC, or for isolating
-debugging of the limiter path.
-
-#### Saturation
-
-Whether in authority mode, fallback mode, or disabled mode,
-saturation surfaces the same way: leaders that cannot acquire a
-slot queue with bounded wait; on timeout the request returns
-`503 Slow Down` so clients back off. Joiners on existing fills do
-not consume slots.
-
-The current saturation is exposed via:
-- `origincache_origin_inflight{origin}` - per-replica gauge of
-  in-flight `Origin.GetRange` calls.
-- `origincache_limiter_slots_local` - per-replica gauge of slots
-  held in the local bucket.
-- `origincache_limiter_slots_available` and `_slots_granted` -
-  authority-only gauges showing global semaphore state.
+A real coordinated cluster-wide limiter (Kubernetes-Lease-elected
+authority + slot-lease tokens + RPC-based slot acquisition +
+graceful fallback) is a deferred optimization; see
+[s15.5](#155-coordinated-cluster-wide-origin-limiter) for the
+full design, trigger conditions, and v1 bound. Build only when
+measured deployment scale (>10 replicas with steady-state slot
+under-utilization) justifies the additional surface area.
 
 Optional token bucket on origin bytes/sec layered on top of the
 slot-based concurrency cap.
-
-### Diagram 13: Limiter authority lifecycle and slot acquisition
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant K as K8s API (coordination.k8s.io Lease)
-    participant A as Replica A (limiter authority)
-    participant P as Replica P (peer)
-    participant O as Origin
-    Note over A,P: boot - all replicas race for the Lease
-    A->>K: create Lease holderIdentity=A
-    K-->>A: 200 OK A is leader
-    P->>K: get Lease
-    K-->>P: holder=A
-    Note over A: authority starts in-memory semaphore<br/>available = target_global (192)
-    Note over P: P needs slots for cold fills
-    P->>A: POST /internal/limiter/acquire batch=8
-    A->>A: available -= 8 (184)<br/>store token T1 expires_at=now+30s
-    A-->>P: { token: T1, ttl: 30s, slots: 8 }
-    Note over P: local bucket = 8
-    P->>O: GetRange (consumes 1 local slot)
-    O-->>P: bytes
-    Note over P: local bucket = 7<br/>(slot returns to bucket on completion)
-    Note over A,P: t=15s  P approaches token half-life
-    P->>A: POST /internal/limiter/extend token=T1
-    A->>A: T1.expires_at = now + 30s
-    A-->>P: { ttl: 30s }
-    Note over A,P: P bucket runs low (slots <= refill_threshold)
-    P->>A: POST /internal/limiter/release token=T1
-    A->>A: available += 8
-    A-->>P: ok
-    P->>A: POST /internal/limiter/acquire batch=8
-    A-->>P: { token: T2, ttl: 30s, slots: 8 }
-    Note over A,K: A renews K8s Lease at retry_period (2s)
-    A->>K: update Lease renewTime=now
-    K-->>A: 200 OK
-```
 
 ### 8.5 Cancellation safety
 
@@ -1512,37 +1341,22 @@ from the client edge.
   value returned by `Cluster.ServerName()` (the same stable SAN above)
   rather than to the destination pod IP. This keeps verification
   consistent across rolling restarts and pod-IP churn.
-- **Authorization scope**: the internal listener serves the
-  following endpoints, all over the same mTLS + peer-IP authz:
-  - `GET /internal/fill?key=<encoded ChunkKey>` - per-chunk fill
-    RPC (s8.3).
-  - `POST /internal/limiter/acquire` - distributed origin-limiter
-    slot acquisition (s8.4 / FW4).
-  - `POST /internal/limiter/extend` - extend an outstanding slot
-    lease token.
-  - `POST /internal/limiter/release` - release slots back to the
-    authority.
-
-  No client identity is propagated from the assembler because
-  chunk content is identity-independent: any authorized client at
-  the assembler is entitled to the chunk bytes, and the
-  coordinator is doing the same fill it would do for a local
-  request. The limiter RPCs carry no client identity; they are
-  inter-replica coordination only.
+- **Authorization scope**: the internal listener serves `GET
+  /internal/fill?key=<encoded ChunkKey>` only - the per-chunk
+  fill RPC (s8.3). No client identity is propagated from the
+  assembler because chunk content is identity-independent: any
+  authorized client at the assembler is entitled to the chunk
+  bytes, and the coordinator is doing the same fill it would do
+  for a local request.
 - **NetworkPolicy**: ingress on `:8444` allowed only from pods with
   label `app=origincache` in the same namespace.
 - **Loop prevention**: receiver enforces `X-Origincache-Internal: 1` ->
-  for `/internal/fill`, self must be coordinator for the requested
-  `ChunkKey`, else `409 Conflict`. The limiter RPCs do not loop-prevent
-  by header (election is via K8s Lease, not rendezvous-hash); a
-  receiver that is not the elected authority returns `409 Conflict`
-  with body `{"reason":"not_authority"}` and the caller falls back
-  to per-replica cap.
+  self must be coordinator for the requested `ChunkKey`, else
+  `409 Conflict`.
 
 Metrics: `origincache_cluster_internal_fill_requests_total{direction=
 "sent|received|conflict"}`,
-`origincache_cluster_internal_fill_duration_seconds`. Limiter RPCs
-have their own metrics (s8.4).
+`origincache_cluster_internal_fill_duration_seconds`.
 
 ## 9. Azure adapter: Block Blob only
 
@@ -1979,18 +1793,7 @@ replica without restarting it (so operators can inspect logs).
 `/readyz` and `/livez` are bound to the same client listener as the
 S3 API; they are NOT served on the internal listener (`:8444`,
 s8.8) because the internal listener's authorization scope is
-restricted to internal RPCs (`/internal/fill`,
-`/internal/limiter/*`).
-
-**What is intentionally NOT a `/readyz` predicate.** The origin
-limiter authority's reachability (s8.4 / FW4) is intentionally NOT
-a readiness gate. A replica that has fallen back from authority-
-issued slot leases to the per-replica fallback cap is still
-serving correctly (origin concurrency is bounded, just less
-optimally). Marking such a replica NotReady would amplify a K8s
-API outage into a service outage. Sustained fallback is
-observable via `origincache_limiter_fallback_active=1` (per replica)
-and operators can alert on that gauge directly.
+restricted to the `/internal/fill` per-chunk fill RPC.
 
 ## 11. Bounded staleness contract
 
@@ -2498,19 +2301,6 @@ Replication factor = 1 in v1 (cache loss is recoverable from origin).
 Every replica sees the entire CacheStore. No replica owns bytes;
 replica loss never strands data.
 
-**Limiter authority changeover.** A separate coordinator role - the
-**limiter authority** (s8.4) - is elected via a Kubernetes Lease,
-distinct from the rendezvous-hashed chunk and (deferred) HEAD
-coordinators. When the elected authority dies or its `Lease`
-expires (default `lease.duration=15s`), a new authority is elected
-and starts with an empty slot table. Outstanding lease tokens
-issued by the old authority drain naturally as their TTL expires
-(default `token.ttl=30s`); during this window cluster-wide
-concurrent `Origin.GetRange` may transiently exceed `target_global`
-by up to one full set of tokens. Worst-case overshoot duration:
-`lease.duration + token.ttl` = 45s with defaults. Acceptable
-because the limiter is a soft cap; correctness is unaffected.
-
 **Empty / unavailable peer set.** If `Cluster.Peers()` returns an
 empty set (the headless Service has no Ready endpoints, the DNS
 record returns NXDOMAIN, or the kube-dns / CoreDNS path is broken),
@@ -2588,7 +2378,7 @@ identity from auth subject (mTLS cert subject or bearer-token claim)
 with source-IP fallback when no auth identity is established.
 
 **Why deferred**: v1 has implicit hot-client mitigation - the per-
-replica origin semaphore (s8.4 / FW4) and singleflight (s8.1)
+replica origin semaphore (s8.4) and singleflight (s8.1)
 coalesce concurrent identical work and cap cold-fill concurrency
 regardless of caller. No measured noisy-neighbor evidence at v1
 scale; cost of building edge rate limiting (token-bucket per
@@ -2733,3 +2523,189 @@ the same ring buffer + spool. New metric:
 response; client SDK retries from scratch
 (`responses_aborted_total{phase="mid_stream"}` increments).
 Acceptable for the documented workload at v1 scale.
+
+### 15.5 Coordinated cluster-wide origin limiter
+
+**What**: Replace the per-replica static cap (s8.4) with a true
+cluster-wide cap on concurrent `Origin.GetRange` calls. Mechanism:
+Kubernetes-Lease-elected **limiter authority** + in-memory
+counting semaphore at the elected leader + slot-lease tokens
+(batched) issued over an internal RPC + per-peer local bucket
+that auto-refills + graceful fallback to the v1 per-replica
+static cap when the authority is unreachable.
+
+**Why deferred**: at documented v1 scale (3-5 replicas), the
+per-replica static cap (s8.4) is approximate but acceptable;
+cluster-wide concurrency tracks `target_global` within a small
+margin during steady state, and the pre-header retry loop (s8.6)
+handles origin throttling responses (`503 SlowDown` / `429`)
+self-correctingly. The K8s Lease design adds substantial surface
+area (election machinery, slot-lease tokens, batching, fallback
+mode, RBAC, ~12 metrics, ~10 tests, an additional `Limiter`
+interface plus `LimiterToken` type, three new internal RPC
+endpoints) that is not justified at v1 scale. Reviewer feedback
+flagged the cumulative complexity as not earning its keep.
+
+**Trigger**: any of:
+- peer-set size grows past ~10 replicas, AND measured steady-
+  state slot under-utilization (one replica saturated while
+  others are idle for the same hot work) is causing
+  `503 Slow Down` to clients;
+- operator requires a hard cluster-wide cap (e.g., dedicated
+  origin pipe sized for X concurrent connections; cost-sensitive
+  deployment cannot tolerate the static cap's worst-case
+  overshoot);
+- origin imposes an account-wide rate limit (rather than
+  per-prefix) that the static cap would routinely exceed.
+
+**Sketch (if built)**:
+
+- **Election**: standard `client-go/tools/leaderelection` against
+  a single `coordination.k8s.io/v1.Lease` resource named e.g.
+  `origincache-limiter` in the deployment's namespace. RBAC:
+  `get / list / watch / create / update / patch` on the named
+  Lease, scoped to the deployment's namespace. Steady-state K8s
+  API load: ~6-30 writes/min/deployment (the elected leader
+  renews; non-leaders do not write).
+
+- **Authority**: holds an in-memory counting semaphore of
+  `cluster.limiter.target_global` slots (default 192). Serves
+  three RPCs over the existing internal listener (s8.8):
+  `POST /internal/limiter/acquire` (issues a lease token holding
+  N batched slots; default `batch.size=8`, configurable;
+  `token.ttl=30s` wall-clock expiry); `POST /internal/limiter/extend`
+  (bumps an existing token's expiry; returns `unknown_token` or
+  `expired` if reclaimed); `POST /internal/limiter/release`
+  (returns slots; idempotent). Background sweep every 5s reclaims
+  expired tokens.
+
+- **Peer**: each non-authority replica holds a small local bucket
+  of slots acquired in batches; auto-refill triggers when remaining
+  slots fall to or below `cluster.limiter.batch.refill_threshold`
+  (default 2). Tokens auto-extend when their age exceeds
+  `cluster.limiter.token.extend_at_ratio * token.ttl` (default
+  0.5 * 30s = 15s). When the local bucket empties, the replica
+  releases the old token and acquires a fresh one.
+
+- **Authority changeover**: when the K8s Lease holder changes,
+  the new authority starts with an empty slot table while old
+  lease tokens at peers continue draining. Cluster-wide inflight
+  may transiently exceed `target_global` by up to one full set
+  of tokens; drains within `lease.duration + token.ttl` =
+  45s worst case with defaults. Acceptable because the limiter
+  is a soft cap; correctness is unaffected.
+
+- **Fallback mode**: peer cannot reach authority -> activates the
+  v1 per-replica static cap (the same `floor(target_global / N)`
+  semaphore from s8.4). Transparent to the client. Reconnects
+  automatically on `cluster.limiter.fallback.check_interval`
+  (default 5s). Limiter authority unreachability is intentionally
+  NOT a `/readyz` predicate: replicas in fallback are still
+  serving correctly.
+
+- **Disable toggle**: `cluster.limiter.enabled: false` returns
+  the v1 per-replica static cap permanently. No K8s API access;
+  no Lease object created. Useful for deployments without RBAC
+  for the Lease resource, or for isolated debugging.
+
+- **New metrics**: `origincache_limiter_state{role="authority|peer|fallback"}`,
+  `origincache_limiter_target_global`,
+  `origincache_limiter_slots_available` (authority-only),
+  `origincache_limiter_slots_granted` (authority-only),
+  `origincache_limiter_slots_local` (per-peer),
+  `origincache_limiter_acquire_total{result}`,
+  `origincache_limiter_acquire_duration_seconds`,
+  `origincache_limiter_extend_total{result}`,
+  `origincache_limiter_release_total`,
+  `origincache_limiter_election_total{result}`,
+  `origincache_limiter_lease_expired_total`,
+  `origincache_limiter_fallback_active`.
+
+- **New interfaces in s7**: `Limiter` (`Acquire(ctx) (Slot, error)`,
+  `State() LimiterState`); `Slot` (`Release()`); `LimiterToken`
+  struct (`ID`, `Slots`, `ExpiresAt`); `InternalClient` gains
+  `LimiterAcquire`, `LimiterExtend`, `LimiterRelease`.
+
+- **Composition with [s15.6](#156-dynamic-per-replica-origin-cap)**:
+  the coordinated authority (this entry) and dynamic per-replica
+  recompute (s15.6) are orthogonal mechanisms. If both ever
+  ship, dynamic per-replica is the uncoordinated baseline that
+  coordination tightens further.
+
+**Known v1 limitation**: per-replica static cap; cluster-wide
+concurrency tracks `target_global` only when `N_actual ==
+cluster.target_replicas`. Documented and acceptable at v1
+documented scale.
+
+### 15.6 Dynamic per-replica origin cap
+
+**What**: Derive `target_per_replica` at runtime from
+`len(Cluster.Peers())` rather than from the static
+`cluster.target_replicas` config knob. The per-replica origin
+semaphore is resized on each membership-refresh, keeping
+realized cluster-wide concurrency close to `target_global`
+regardless of actual replica count.
+
+**Why deferred**: v1 ships with `cluster.target_replicas` as a
+static config knob (s8.4). Static is simpler, deterministic,
+and matches the operator's mental model when the deployment has
+a stable replica count (the documented v1 target of 3-5
+replicas without HPA). Dynamic adds:
+
+- a resizable-semaphore primitive (the Go standard library and
+  `golang.org/x/sync/semaphore` both fix capacity at
+  construction; a custom wrapper is required, ~30-40 lines);
+- a peer-change notification channel on the `Cluster` interface
+  (`PeersChanges() <-chan []Peer` or equivalent);
+- a watcher goroutine that recomputes the cap on each membership
+  change;
+- edge-case handling (empty peer set, current inflight exceeding
+  the new cap, rapid peer-set churn).
+
+Roughly 60-80 lines of code plus ~5 new tests. Modest in
+isolation but composes with the broader complaint that the v1
+design has too many moving parts.
+
+**Trigger**: any of:
+
+- HPA-driven autoscaling produces frequent replica-count
+  changes;
+- operators routinely scale the deployment without updating
+  `cluster.target_replicas`, leaving the realized cap
+  mis-sized;
+- operator measures sustained over- or under-allocation against
+  `target_global` (sum of per-replica `origin_inflight` gauges
+  diverging persistently from `target_global`).
+
+**Sketch (if built)**:
+
+- `internal/origincache/origin/semaphore.go`: resizable semaphore
+  wrapper with `Acquire(ctx)`, `Release()`, `SetCapacity(n)`.
+- `Cluster` interface gains a peer-change notification surface
+  (channel or callback).
+- Watcher goroutine recomputes on each membership change:
+  `target_per_replica = floor(target_global / max(1, len(peers)))`.
+  The `max(1, ...)` matches the empty-peer fallback (s14): a
+  lone replica gets `target_global` slots, which is correct for
+  the last-replica-standing case.
+- Edge cases: current inflight exceeds new cap (existing holders
+  complete naturally; new acquires queue against the new cap);
+  rapid peer-set churn (optional debouncing or rate-limiting on
+  `SetCapacity` calls).
+- Composes naturally with [s15.5](#155-coordinated-cluster-wide-origin-limiter):
+  the coordinated authority (s15.5) and per-replica dynamic cap
+  (this entry) are orthogonal mechanisms; if both ever ship,
+  dynamic is the uncoordinated baseline that coordination
+  tightens further.
+
+**Known v1 limitation**: the static cap is approximate. Realized
+cluster-wide concurrency depends on `N_actual`:
+
+- `N_actual > N_typical`: realized cap exceeds `target_global` by
+  up to `(N_actual - N_typical) * target_per_replica`.
+- `N_actual < N_typical`: realized cap falls below `target_global`
+  by `(N_typical - N_actual) * target_per_replica`.
+
+Over-allocation may stress origin; under-allocation wastes
+capacity. Operators MUST update `cluster.target_replicas` after
+any sustained scale change.

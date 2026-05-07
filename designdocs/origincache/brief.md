@@ -310,16 +310,21 @@ sequenceDiagram
    unusual placements MAY relax via `spool.require_local_fs: false`;
    production deployments are expected to keep the default. See
    [design.md s10.4](./design.md#104-spool-locality-contract).
-4. **Limiter authority changeover overshoot** - Origin concurrency
-   is capped cluster-wide via a Kubernetes-Lease-elected limiter
-   authority. When the elected authority dies, the new authority
-   starts with an empty slot table while old slot-lease tokens at
-   peers continue draining; cluster-wide inflight may transiently
-   exceed `target_global` for up to one
-   `lease.duration + token.ttl` window (default 45s). When the
-   authority is unreachable, peers gracefully fall back to a
-   per-replica static cap. See
-   [design.md s8.4](./design.md#84-origin-backpressure).
+4. **Per-replica origin semaphore is approximate** - Origin
+   concurrency is capped per-replica at
+   `floor(target_global / cluster.target_replicas)` (default 64
+   slots/replica at `target_global=192`,
+   `cluster.target_replicas=3`). Realized cluster-wide concurrency
+   tracks `target_global` only when actual replica count matches
+   `cluster.target_replicas`; scale-out without updating the knob
+   over-allocates against origin, scale-in under-allocates.
+   Origin throttling is handled by the leader's pre-header retry
+   loop (exponential backoff) rather than by a hard coordinated
+   cap. A coordinated cluster-wide limiter and dynamic recompute
+   are deferred future work; see
+   [design.md s15.5](./design.md#155-coordinated-cluster-wide-origin-limiter)
+   and
+   [design.md s15.6](./design.md#156-dynamic-per-replica-origin-cap).
 5. **POSIX backend hardening** - NFS exports MUST be `sync` (not
    `async`); Weka NFS `link()`/`EEXIST` is not docs-confirmed and
    is gated by `SelfTestAtomicCommit` at boot; Alluxio FUSE is
@@ -345,7 +350,7 @@ sequenceDiagram
 - [s4 Architecture and onward](./design.md#4-architecture) -
   architecture, request flow, internal interfaces, stampede protection.
 - [s8.4 Origin backpressure](./design.md#84-origin-backpressure) -
-  K8s-Lease-elected limiter authority and graceful fallback.
+  per-replica static cap and pre-header retry for throttle handling.
 - [s10.1 Atomic commit per driver](./design.md#101-atomic-commit-per-cachestore-driver)
 - [s11 Bounded staleness](./design.md#11-bounded-staleness-contract)
   - [s11.2 Bounded-freshness mode (optional)](./design.md#112-bounded-freshness-mode-optional)
@@ -355,7 +360,9 @@ sequenceDiagram
   size-awareness operational guidance.
 - [s15 Deferred optimizations](./design.md#15-deferred-optimizations) -
   v1 scope-discipline catalog (edge rate limiting, cluster-wide HEAD
-  singleflight, cluster-wide LIST coordinator).
-- 13 inline mermaid diagrams covering hits, misses, cross-replica
-  fills, atomic commit, create-after-404 timeline, membership flux,
-  and limiter authority lifecycle.
+  singleflight, cluster-wide LIST coordinator, mid-stream origin
+  resume, coordinated cluster-wide origin limiter, dynamic per-
+  replica origin cap).
+- 12 inline mermaid diagrams covering hits, misses, cross-replica
+  fills, atomic commit, create-after-404 timeline, and membership
+  flux.
