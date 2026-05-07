@@ -147,21 +147,6 @@ The controller service account also needs cluster-wide DaemonSet permissions so
 it can detect provider kube-proxy DaemonSets and create/update/delete the
 unbounded-owned per-site DaemonSets.
 
-## Validation
-
-The behavior was validated on an AKS-backed cluster with an externally joined
-node in the `test` Site:
-
-- The provider `kube-system/kube-proxy` DaemonSet scheduled only on AKS nodes.
-- The external node had no `KUBE-SERVICES` NAT chains and could not reach
-  `unbounded-net-controller` through its ClusterIP `10.0.203.248:9999`.
-- Running the updated controller created `unbounded-net-kube-proxy-test`.
-- The controller labeled the node with:
-  `net.unbounded-cloud.io/kube-proxy=managed`.
-- The DaemonSet scheduled one kube-proxy pod on the node.
-- kube-proxy programmed ClusterIP DNAT rules, and
-  `10.0.203.248:9999` became reachable from the node.
-
 ## Operational Notes
 
 - Deleting a Site deletes or stops updating its managed kube-proxy DaemonSet.
