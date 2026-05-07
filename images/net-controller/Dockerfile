@@ -12,6 +12,10 @@
 ARG GO_VERSION=1.26
 FROM mcr.microsoft.com/oss/go/microsoft/golang:${GO_VERSION}-azurelinux3.0 AS builder
 
+# Override GOTOOLCHAIN=local set by the MCR base image so go can switch to
+# the toolchain version required by go.mod when the image patch lags behind.
+ENV GOTOOLCHAIN=auto
+
 # Install build dependencies (Go is provided by the base image)
 RUN tdnf upgrade -y \
     && tdnf install -y \
