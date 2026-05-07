@@ -59,12 +59,16 @@ func InstallFromTarGz(ctx context.Context, downloadURL, targetPath, binaryName s
 }
 
 // InstallFromFile installs a local agent binary to targetPath.
-func InstallFromFile(sourcePath, targetPath string, perm os.FileMode) error {
+func InstallFromFile(sourcePath, targetPath string, perm os.FileMode) (err error) {
 	source, err := os.Open(sourcePath)
 	if err != nil {
 		return fmt.Errorf("open %s: %w", sourcePath, err)
 	}
-	defer source.Close()
+	defer func() {
+		if closeErr := source.Close(); closeErr != nil && err == nil {
+			err = fmt.Errorf("close %s: %w", sourcePath, closeErr)
+		}
+	}()
 
 	if err := utilio.InstallFile(targetPath, source, perm); err != nil {
 		return fmt.Errorf("install %s to %s: %w", sourcePath, targetPath, err)

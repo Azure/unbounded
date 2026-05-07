@@ -97,6 +97,7 @@ func (o fileAgentUpgradeSignalOperator) RecordFailure(message string) error {
 		return fmt.Errorf("read pending AgentUpgrade operation signal: %w", err)
 	}
 	if pending == nil {
+		slog.Warn("no pending AgentUpgrade operation signal found; skipping failure signal", "path", o.path)
 		return nil
 	}
 
@@ -145,6 +146,7 @@ func (o fileAgentUpgradeSignalOperator) Read() (*agentUpgradeSignal, error) {
 	signal.OperationName = strings.TrimSpace(signal.OperationName)
 	signal.FailureMessage = strings.TrimSpace(signal.FailureMessage)
 	if signal.OperationName == "" {
+		slog.Warn("AgentUpgrade signal missing operation name; ignoring signal", "path", o.path)
 		return nil, nil
 	}
 
