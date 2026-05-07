@@ -98,13 +98,16 @@ func NewManagedKubeProxyController(
 		dsSynced:     dsInformer.Informer().HasSynced,
 		siteInformer: siteInformer,
 		siteSynced:   siteInformer.HasSynced,
-		workqueue:    workqueue.NewTypedRateLimitingQueueWithConfig(workqueue.DefaultTypedControllerRateLimiter[string](), workqueue.TypedRateLimitingQueueConfig[string]{Name: "ManagedKubeProxy"}),
+		workqueue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.DefaultTypedControllerRateLimiter[string](),
+			workqueue.TypedRateLimitingQueueConfig[string]{Name: "ManagedKubeProxy"},
+		),
 	}
 
 	handler := cache.ResourceEventHandlerFuncs{
-		AddFunc:    func(interface{}) { c.enqueueAll() },
-		UpdateFunc: func(interface{}, interface{}) { c.enqueueAll() },
-		DeleteFunc: func(interface{}) { c.enqueueAll() },
+		AddFunc:    func(any) { c.enqueueAll() },
+		UpdateFunc: func(any, any) { c.enqueueAll() },
+		DeleteFunc: func(any) { c.enqueueAll() },
 	}
 
 	if _, err := nodeInformer.Informer().AddEventHandler(handler); err != nil {
@@ -141,7 +144,7 @@ func (c *ManagedKubeProxyController) Run(ctx context.Context, workers int) error
 	return nil
 }
 
-func fromUnstructured(u *unstructured.Unstructured, out interface{}) error {
+func fromUnstructured(u *unstructured.Unstructured, out any) error {
 	return runtime.DefaultUnstructuredConverter.FromUnstructured(u.Object, out)
 }
 
