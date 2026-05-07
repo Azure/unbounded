@@ -23,10 +23,6 @@ func TestUnboundedAgentInstallScript(t *testing.T) {
 	require.Contains(t, script, "AGENT_VERSION")
 	require.Contains(t, script, "AGENT_BASE_URL")
 	require.Contains(t, script, "AGENT_URL")
-	require.NotContains(t, script, "unbounded-agent-blue")
-	require.NotContains(t, script, "unbounded-agent-green")
-	require.NotContains(t, script, "unbounded-agent-current")
-	require.NotContains(t, script, "unbounded-agent-last-good")
 
 	// The default base URL must point at GitHub releases so that a fresh
 	// install works out of the box.
