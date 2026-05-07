@@ -1,0 +1,33 @@
+<nav class="left-nav" id="left-nav" aria-label="Documentation navigation">
+  <div class="left-nav-inner">
+    {{- range .Site.Menus.main }}
+    {{- if .HasChildren }}{{ continue }}{{ end }}
+    {{- if strings.HasPrefix .URL "http" }}{{ continue }}{{ end }}
+    {{- $sectionPage := $.Site.GetPage .PageRef }}
+    {{- if not $sectionPage }}{{ continue }}{{ end }}
+    <div class="left-nav-section">
+      <div class="left-nav-section-title">{{ .Name }}</div>
+      <ul class="left-nav-pages">
+        {{- range $sectionPage.Pages }}
+        {{- if .IsSection }}
+        <li class="left-nav-subsection">
+          <div class="left-nav-subsection-title">{{ .Title }}</div>
+          <ul class="left-nav-subpages">
+            {{- range .Pages }}
+            <li{{ if eq $.RelPermalink .RelPermalink }} class="is-active"{{ end }}>
+              <a href="{{ .RelPermalink }}">{{ .Title }}</a>
+            </li>
+            {{- end }}
+          </ul>
+        </li>
+        {{- else }}
+        <li{{ if eq $.RelPermalink .RelPermalink }} class="is-active"{{ end }}>
+          <a href="{{ .RelPermalink }}">{{ .Title }}</a>
+        </li>
+        {{- end }}
+        {{- end }}
+      </ul>
+    </div>
+    {{- end }}
+  </div>
+</nav>
