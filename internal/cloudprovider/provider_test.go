@@ -67,7 +67,6 @@ func TestDetectProvider_AKS_NoSystemNodes(t *testing.T) {
 	require.Equal(t, "microsoft-aks", provider.ID())
 }
 
-
 func TestAKSProvider_DefaultLabels(t *testing.T) {
 	t.Parallel()
 
