@@ -135,13 +135,13 @@ func setupDaemonBinaryTestPaths(t *testing.T) goalstates.AgentUpgradePaths {
 
 	dir := t.TempDir()
 	paths := goalstates.AgentUpgradePaths{
-		BinaryPath:        filepath.Join(dir, "unbounded-agent"),
-		CurrentPath:       filepath.Join(dir, "unbounded-agent-current"),
-		LastGoodPath:      filepath.Join(dir, "unbounded-agent-last-good"),
-		BluePath:          filepath.Join(dir, "unbounded-agent-blue"),
-		GreenPath:         filepath.Join(dir, "unbounded-agent-green"),
-		CurrentTargetPath: filepath.Join(dir, "unbounded-agent"),
+		BinaryPath:   filepath.Join(dir, "unbounded-agent"),
+		CurrentPath:  filepath.Join(dir, "unbounded-agent-current"),
+		LastGoodPath: filepath.Join(dir, "unbounded-agent-last-good"),
+		BluePath:     filepath.Join(dir, "unbounded-agent-blue"),
+		GreenPath:    filepath.Join(dir, "unbounded-agent-green"),
 	}
+	paths.CurrentTargetPath = paths.BinaryPath
 
 	return paths
 }
