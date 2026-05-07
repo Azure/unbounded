@@ -58,6 +58,21 @@ func InstallFromTarGz(ctx context.Context, downloadURL, targetPath, binaryName s
 	return fmt.Errorf("agent binary %q not found in archive %q", binaryName, downloadURL)
 }
 
+// InstallFromFile installs a local agent binary to targetPath.
+func InstallFromFile(sourcePath, targetPath string, perm os.FileMode) error {
+	source, err := os.Open(sourcePath)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", sourcePath, err)
+	}
+	defer source.Close()
+
+	if err := utilio.InstallFile(targetPath, source, perm); err != nil {
+		return fmt.Errorf("install %s to %s: %w", sourcePath, targetPath, err)
+	}
+
+	return nil
+}
+
 // InstallAndSwitchFromTarGz installs the next agent binary and switches daemon links.
 func InstallAndSwitchFromTarGz(ctx context.Context, downloadURL string, paths goalstates.AgentUpgradePaths, perm os.FileMode) error {
 	targetPath := paths.NextTargetPath()

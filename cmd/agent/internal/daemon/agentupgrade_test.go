@@ -51,7 +51,7 @@ func TestAgentUpgradeSignalOperator_RecordFailure(t *testing.T) {
 
 	data, err := os.ReadFile(signalPath)
 	require.NoError(t, err)
-	assert.JSONEq(t, `{"operationName":"op-1","message":"rolled back"}`, string(data))
+	assert.JSONEq(t, `{"operationName":"op-1","failureMessage":"rolled back"}`, string(data))
 }
 
 func TestAgentUpgradeSignalOperator_ReadRejectsNonJSON(t *testing.T) {
@@ -236,6 +236,18 @@ func TestEnsureDaemonBinaryLinks_InitializesFromBlue(t *testing.T) {
 
 	require.NoError(t, ensureDaemonBinaryLinks(slog.Default()))
 
+	assertSymlinkTarget(t, paths.current, paths.blue)
+	assertSymlinkTarget(t, paths.lastGood, paths.blue)
+	assertSymlinkTarget(t, paths.legacy, paths.blue)
+}
+
+func TestEnsureDaemonBinaryLinks_SeedsBlueFromLegacyBinary(t *testing.T) {
+	paths := setupDaemonBinaryTestWithoutLinks(t)
+	require.NoError(t, os.WriteFile(paths.legacy, []byte("legacy"), 0o755))
+
+	require.NoError(t, ensureDaemonBinaryLinks(slog.Default()))
+
+	assertFileContent(t, paths.blue, "legacy")
 	assertSymlinkTarget(t, paths.current, paths.blue)
 	assertSymlinkTarget(t, paths.lastGood, paths.blue)
 	assertSymlinkTarget(t, paths.legacy, paths.blue)

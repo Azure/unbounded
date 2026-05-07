@@ -86,7 +86,11 @@ func (r *daemonReconciler) reconcileAgentUpgrade(ctx context.Context, op *v1alph
 		return reconcile.Result{}, finishErr
 	}
 
-	signals := newAgentUpgradeSignalOperator()
+	signals, err := newAgentUpgradeSignalOperator()
+	if err != nil {
+		_, finishErr := finishOperation(ctx, r.Client, op.Name, v1alpha3.OperationPhaseFailed, "ExecutionFailed", err.Error(), 0)
+		return reconcile.Result{}, finishErr
+	}
 	if err := signals.RecordPending(op.Name, machine.Generation); err != nil {
 		_, finishErr := finishOperation(ctx, r.Client, op.Name, v1alpha3.OperationPhaseFailed, "ExecutionFailed", err.Error(), 0)
 		return reconcile.Result{}, finishErr
@@ -131,13 +135,13 @@ func publishAgentUpgradeFailureSignal(ctx context.Context, log *slog.Logger, c c
 	if err != nil {
 		return false, fmt.Errorf("read AgentUpgrade failure signal: %w", err)
 	}
-	if signal == nil || signal.Message == "" {
+	if signal == nil || signal.FailureMessage == "" {
 		// The shared signal file also carries pending success state, which has
 		// no failure message.
 		return false, nil
 	}
 
-	if _, err := finishOperation(ctx, c, signal.OperationName, v1alpha3.OperationPhaseFailed, "DaemonFailed", signal.Message, 0); err != nil {
+	if _, err := finishOperation(ctx, c, signal.OperationName, v1alpha3.OperationPhaseFailed, "DaemonFailed", signal.FailureMessage, 0); err != nil {
 		return false, err
 	}
 
@@ -151,7 +155,10 @@ func publishAgentUpgradeFailureSignal(ctx context.Context, log *slog.Logger, c c
 }
 
 func publishAndClearAgentUpgradeSignals(ctx context.Context, log *slog.Logger, c client.Client) error {
-	signals := newAgentUpgradeSignalOperator()
+	signals, err := newAgentUpgradeSignalOperator()
+	if err != nil {
+		return err
+	}
 	failurePublished, err := publishAgentUpgradeFailureSignal(ctx, log, c, signals)
 	if err != nil {
 		return err

@@ -28,10 +28,10 @@ The path set is represented by `goalstates.AgentUpgradePaths`.
 | `SignalPath` | Single JSON signal file for pending and failure state. |
 | `CurrentTargetPath` | Resolved current binary target for one operation. |
 
-`AgentUpgradePaths.WithResolvedCurrentTarget()` resolves `CurrentPath` and
-stores the result in `CurrentTargetPath`. If `CurrentPath` does not exist, the
-compatibility `BinaryPath` is used as the current target. `NextTargetPath()`
-then chooses the inactive slot:
+`goalstates.ResolvedAgentUpgradePaths()` resolves environment overrides and
+stores the resolved `CurrentPath` target in `CurrentTargetPath`. If
+`CurrentPath` does not exist, the compatibility `BinaryPath` is used as the
+current target. `NextTargetPath()` then chooses the inactive slot:
 
 ```text
 current target == BluePath  -> next target = GreenPath
@@ -45,7 +45,8 @@ the systemd unit:
 
 1. Resolve `CurrentPath`.
 2. If it does not exist, seed it from the first executable of `BluePath`,
-   `GreenPath`, then `BinaryPath`.
+   `GreenPath`, then `BinaryPath`. When only `BinaryPath` exists, copy it into
+   `BluePath` first and seed the links from the blue slot.
 3. If `LastGoodPath` does not exist, point it to the resolved current target.
 4. Point `BinaryPath` to `CurrentPath` unless the current target already is
    `BinaryPath`.
@@ -120,14 +121,14 @@ managed through `agentUpgradeSignalOperator` and has the following shape:
 {
   "operationName": "upgrade-agent-on-worker-1",
   "observedMachineGeneration": 42,
-  "message": "AgentUpgrade daemon failed after switching binary"
+  "failureMessage": "AgentUpgrade daemon failed after switching binary"
 }
 ```
 
 Pending success state sets `operationName` and
-`observedMachineGeneration`. Failure state sets `operationName` and `message`.
-The shared file is intentionally JSON-only. Invalid JSON is treated as an
-error, not as a legacy fallback format.
+`observedMachineGeneration`. Failure state sets `operationName` and
+`failureMessage`. The shared file is intentionally JSON-only. Invalid JSON is
+treated as an error, not as a legacy fallback format.
 
 ## Successful startup
 

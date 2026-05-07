@@ -1886,6 +1886,7 @@ def validate_agent_upgrade_rollback() -> None:
     broken_operation = _serve_agent_upgrade_tarball(
         broken_tarball, broken_operation_name, expect_complete=False)
     broken_status = broken_operation.get("status", {})
+    log(f"Broken AgentUpgrade failure reason: {broken_status.get('reason')!r}")
     if "verify agent binary" not in broken_status.get("message", ""):
         die(f"unexpected broken AgentUpgrade failure message: {broken_status.get('message')!r}")
     if read_daemon_current_target() != previous_good:
@@ -1898,13 +1899,14 @@ def validate_agent_upgrade_rollback() -> None:
     wait_for_daemon_current_target(previous_good)
     wait_for_daemon_active()
     failed_status = failed_operation.get("status", {})
+    log(f"Rollback AgentUpgrade failure reason: {failed_status.get('reason')!r}")
     if AGENT_UPGRADE_ROLLBACK_MESSAGE_FRAGMENT not in failed_status.get("message", ""):
         die(f"unexpected rollback AgentUpgrade failure message: {failed_status.get('message')!r}")
 
     log("============================================")
     log("  AgentUpgrade rollback validation PASSED")
     log("============================================")
-    kubectl(["get", _machine_operation_resource(), operation_name, "-o", "wide"])
+    kubectl(["get", _machine_operation_resource(), operation_name, "-o", "jsonpath={.status.reason}{'\\n'}{.status.message}{'\\n'}"])
 
 
 # ---------------------------------------------------------------------------

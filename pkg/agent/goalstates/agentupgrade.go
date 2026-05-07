@@ -22,22 +22,10 @@ type AgentUpgradePaths struct {
 	CurrentTargetPath string
 }
 
-// DefaultAgentUpgradePaths returns the production host-side agent binary paths.
-func DefaultAgentUpgradePaths() AgentUpgradePaths {
-	return AgentUpgradePaths{
-		BinaryPath:   DaemonBinaryPath,
-		BluePath:     DaemonBinaryBluePath,
-		GreenPath:    DaemonBinaryGreenPath,
-		CurrentPath:  DaemonBinaryCurrentPath,
-		LastGoodPath: DaemonBinaryLastGoodPath,
-		SignalPath:   DaemonAgentUpgradeSignalPath,
-	}
-}
-
 // ResolvedAgentUpgradePaths returns the host-side agent binary paths after
 // applying environment overrides.
-func ResolvedAgentUpgradePaths() AgentUpgradePaths {
-	return AgentUpgradePaths{
+func ResolvedAgentUpgradePaths() (AgentUpgradePaths, error) {
+	paths := AgentUpgradePaths{
 		BinaryPath:   resolveDaemonBinaryPath(EnvDaemonBinary, DaemonBinaryPath),
 		BluePath:     resolveDaemonBinaryPath(EnvDaemonBinaryBlue, DaemonBinaryBluePath),
 		GreenPath:    resolveDaemonBinaryPath(EnvDaemonBinaryGreen, DaemonBinaryGreenPath),
@@ -45,6 +33,19 @@ func ResolvedAgentUpgradePaths() AgentUpgradePaths {
 		LastGoodPath: resolveDaemonBinaryPath(EnvDaemonBinaryLastGood, DaemonBinaryLastGoodPath),
 		SignalPath:   resolveDaemonBinaryPath(EnvDaemonAgentUpgradeSignalPath, DaemonAgentUpgradeSignalPath),
 	}
+	targetPath, err := filepath.EvalSymlinks(paths.CurrentPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			paths.CurrentTargetPath = paths.BinaryPath
+			return paths, nil
+		}
+
+		return paths, err
+	}
+
+	paths.CurrentTargetPath = targetPath
+
+	return paths, nil
 }
 
 func resolveDaemonBinaryPath(envName, defaultPath string) string {
@@ -53,23 +54,6 @@ func resolveDaemonBinaryPath(envName, defaultPath string) string {
 	}
 
 	return defaultPath
-}
-
-// WithResolvedCurrentTarget returns paths with CurrentTargetPath populated.
-func (p AgentUpgradePaths) WithResolvedCurrentTarget() (AgentUpgradePaths, error) {
-	targetPath, err := filepath.EvalSymlinks(p.CurrentPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			p.CurrentTargetPath = p.BinaryPath
-			return p, nil
-		}
-
-		return p, err
-	}
-
-	p.CurrentTargetPath = targetPath
-
-	return p, nil
 }
 
 // NextTargetPath returns the inactive blue-green binary path.

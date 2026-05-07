@@ -26,7 +26,8 @@ const (
 type agentUpgradeSignal struct {
 	OperationName             string `json:"operationName"`
 	ObservedMachineGeneration int64  `json:"observedMachineGeneration,omitempty"`
-	Message                   string `json:"message,omitempty"`
+	// FailureMessage is set only after recovery reports a failed upgraded daemon.
+	FailureMessage string `json:"failureMessage,omitempty"`
 }
 
 // agentUpgradeSignalOperator manages persistent AgentUpgrade signal files.
@@ -52,7 +53,7 @@ func agentUpgradeDownloadURL(parameters map[string]string) (string, error) {
 }
 
 func upgradeDaemonBinary(ctx context.Context, log *slog.Logger, downloadURL string) error {
-	paths, err := goalstates.ResolvedAgentUpgradePaths().WithResolvedCurrentTarget()
+	paths, err := goalstates.ResolvedAgentUpgradePaths()
 	if err != nil {
 		return fmt.Errorf("resolve current daemon binary symlink: %w", err)
 	}
@@ -70,10 +71,13 @@ func upgradeDaemonBinary(ctx context.Context, log *slog.Logger, downloadURL stri
 	return nil
 }
 
-func newAgentUpgradeSignalOperator() agentUpgradeSignalOperator {
-	return fileAgentUpgradeSignalOperator{
-		path: goalstates.ResolvedAgentUpgradePaths().SignalPath,
+func newAgentUpgradeSignalOperator() (agentUpgradeSignalOperator, error) {
+	paths, err := goalstates.ResolvedAgentUpgradePaths()
+	if err != nil {
+		return nil, fmt.Errorf("resolve AgentUpgrade signal path: %w", err)
 	}
+
+	return newAgentUpgradeSignalOperatorForPath(paths.SignalPath), nil
 }
 
 func newAgentUpgradeSignalOperatorForPath(path string) agentUpgradeSignalOperator {
@@ -102,8 +106,8 @@ func (o fileAgentUpgradeSignalOperator) RecordFailure(message string) error {
 	}
 
 	return o.write(agentUpgradeSignal{
-		OperationName: pending.OperationName,
-		Message:       message,
+		OperationName:  pending.OperationName,
+		FailureMessage: message,
 	})
 }
 
@@ -139,7 +143,7 @@ func (o fileAgentUpgradeSignalOperator) Read() (*agentUpgradeSignal, error) {
 		return nil, fmt.Errorf("decode AgentUpgrade signal %s: %w", o.path, err)
 	}
 	signal.OperationName = strings.TrimSpace(signal.OperationName)
-	signal.Message = strings.TrimSpace(signal.Message)
+	signal.FailureMessage = strings.TrimSpace(signal.FailureMessage)
 	if signal.OperationName == "" {
 		return nil, nil
 	}
@@ -150,18 +154,26 @@ func (o fileAgentUpgradeSignalOperator) Read() (*agentUpgradeSignal, error) {
 // RecordAgentUpgradeFailureSignal records that the daemon failed after an
 // AgentUpgrade.
 func RecordAgentUpgradeFailureSignal(message string) error {
-	return newAgentUpgradeSignalOperator().RecordFailure(message)
+	signals, err := newAgentUpgradeSignalOperator()
+	if err != nil {
+		return err
+	}
+
+	return signals.RecordFailure(message)
 }
 
 func ensureDaemonBinaryLinks(log *slog.Logger) error {
-	paths := goalstates.ResolvedAgentUpgradePaths()
-
-	currentTarget, err := filepath.EvalSymlinks(paths.CurrentPath)
+	paths, err := goalstates.ResolvedAgentUpgradePaths()
 	if err != nil {
+		return fmt.Errorf("resolve current daemon binary symlink: %w", err)
+	}
+
+	currentTarget := paths.CurrentTargetPath
+	if _, err := os.Lstat(paths.CurrentPath); err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("resolve current daemon binary symlink: %w", err)
+			return fmt.Errorf("stat current daemon binary symlink: %w", err)
 		}
-		target, targetErr := paths.InitialDaemonBinaryTarget()
+		target, targetErr := initialDaemonBinaryTarget(paths)
 		if targetErr != nil {
 			return fmt.Errorf("no executable agent binary found for daemon link initialization: %w", targetErr)
 		}
@@ -195,4 +207,19 @@ func ensureDaemonBinaryLinks(log *slog.Logger) error {
 	)
 
 	return nil
+}
+
+func initialDaemonBinaryTarget(paths goalstates.AgentUpgradePaths) (string, error) {
+	target, err := paths.InitialDaemonBinaryTarget()
+	if err != nil {
+		return "", err
+	}
+	if target != paths.BinaryPath {
+		return target, nil
+	}
+	if err := agentbinary.InstallFromFile(paths.BinaryPath, paths.BluePath, agentUpgradeBinaryMode); err != nil {
+		return "", err
+	}
+
+	return paths.BluePath, nil
 }

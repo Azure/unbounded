@@ -40,7 +40,8 @@ func TestResolvedAgentUpgradePaths(t *testing.T) {
 	t.Setenv(EnvDaemonBinaryLastGood, lastGoodPath)
 	t.Setenv(EnvDaemonAgentUpgradeSignalPath, signalPath)
 
-	paths := ResolvedAgentUpgradePaths()
+	paths, err := ResolvedAgentUpgradePaths()
+	require.NoError(t, err)
 
 	assert.Equal(t, binaryPath, paths.BinaryPath)
 	assert.Equal(t, bluePath, paths.BluePath)
@@ -48,13 +49,15 @@ func TestResolvedAgentUpgradePaths(t *testing.T) {
 	assert.Equal(t, currentPath, paths.CurrentPath)
 	assert.Equal(t, lastGoodPath, paths.LastGoodPath)
 	assert.Equal(t, signalPath, paths.SignalPath)
+	assert.Equal(t, binaryPath, paths.CurrentTargetPath)
 }
 
 func TestResolvedAgentUpgradePaths_UsesDefaultsForBlankOverrides(t *testing.T) {
 	t.Setenv(EnvDaemonBinary, "")
 	t.Setenv(EnvDaemonBinaryBlue, " ")
 
-	paths := ResolvedAgentUpgradePaths()
+	paths, err := ResolvedAgentUpgradePaths()
+	require.NoError(t, err)
 
 	assert.Equal(t, DaemonBinaryPath, paths.BinaryPath)
 	assert.Equal(t, DaemonBinaryBluePath, paths.BluePath)
@@ -73,29 +76,27 @@ func TestAgentUpgradePathsNextTargetPathUsesGreenWhenCurrentIsBlue(t *testing.T)
 	assert.Equal(t, "/agent-green", paths.NextTargetPath())
 }
 
-func TestAgentUpgradePathsWithResolvedCurrentTarget(t *testing.T) {
+func TestResolvedAgentUpgradePaths_ResolvesCurrentTarget(t *testing.T) {
 	dir := t.TempDir()
+	binaryPath := filepath.Join(dir, "agent")
 	currentTargetPath := filepath.Join(dir, "agent-blue")
 	currentPath := filepath.Join(dir, "agent-current")
 	require.NoError(t, os.WriteFile(currentTargetPath, []byte("agent"), 0o755))
 	require.NoError(t, os.Symlink(currentTargetPath, currentPath))
+	t.Setenv(EnvDaemonBinary, binaryPath)
+	t.Setenv(EnvDaemonBinaryCurrent, currentPath)
 
-	paths, err := (AgentUpgradePaths{
-		BinaryPath:  filepath.Join(dir, "agent"),
-		CurrentPath: currentPath,
-	}).WithResolvedCurrentTarget()
+	paths, err := ResolvedAgentUpgradePaths()
 
 	require.NoError(t, err)
 	assert.Equal(t, currentTargetPath, paths.CurrentTargetPath)
 }
 
-func TestAgentUpgradePathsWithResolvedCurrentTargetFallsBackToBinaryPath(t *testing.T) {
-	t.Parallel()
+func TestResolvedAgentUpgradePaths_CurrentTargetFallsBackToBinaryPath(t *testing.T) {
+	t.Setenv(EnvDaemonBinary, "/agent")
+	t.Setenv(EnvDaemonBinaryCurrent, filepath.Join(t.TempDir(), "missing-current"))
 
-	paths, err := (AgentUpgradePaths{
-		BinaryPath:  "/agent",
-		CurrentPath: filepath.Join(t.TempDir(), "missing-current"),
-	}).WithResolvedCurrentTarget()
+	paths, err := ResolvedAgentUpgradePaths()
 
 	require.NoError(t, err)
 	assert.Equal(t, "/agent", paths.CurrentTargetPath)

@@ -28,5 +28,5 @@ func TestRecordAgentUpgradeFailureSignalCommand(t *testing.T) {
 
 	data, err := os.ReadFile(signalPath)
 	require.NoError(t, err)
-	assert.JSONEq(t, `{"operationName":"op-1","message":"rolled back to last good"}`, string(data))
+	assert.JSONEq(t, `{"operationName":"op-1","failureMessage":"rolled back to last good"}`, string(data))
 }
