@@ -36,6 +36,8 @@ func (r *daemonReconciler) reconcileMachineOperation(ctx context.Context, name s
 	case v1alpha3.OperationAgentUpgrade:
 		r.log.Info("AgentUpgrade operation queued", "operation", op.Name)
 		return reconcile.Result{}, nil
+	case v1alpha3.OperationAgentReset:
+		return r.reconcileAgentReset(ctx, &op)
 	default:
 		return reconcile.Result{}, nil
 	}
@@ -53,16 +55,38 @@ func (r *daemonReconciler) reconcileNodeReboot(ctx context.Context, op *v1alpha3
 
 	active, err := r.nodeOperator.FindActiveMachine(r.log)
 	if err != nil {
-		_, finishErr := finishOperation(ctx, r.Client, op.Name, v1alpha3.OperationPhaseFailed, "ExecutionFailed", err.Error(), 0)
-		return reconcile.Result{}, finishErr
+		return finishFailedOperation(ctx, r.Client, op.Name, err)
 	}
 
 	if err := r.nodeOperator.RestartNode(ctx, r.log, active); err != nil {
-		_, finishErr := finishOperation(ctx, r.Client, op.Name, v1alpha3.OperationPhaseFailed, "ExecutionFailed", err.Error(), 0)
-		return reconcile.Result{}, finishErr
+		return finishFailedOperation(ctx, r.Client, op.Name, err)
 	}
 
 	return finishOperation(ctx, r.Client, op.Name, v1alpha3.OperationPhaseComplete, "Succeeded", "NodeReboot completed", machine.Generation)
+}
+
+func (r *daemonReconciler) reconcileAgentReset(ctx context.Context, op *v1alpha3.MachineOperation) (reconcile.Result, error) {
+	machine, err := getLocalMachine(ctx, r.Client, r.machineName)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+
+	if err := markOperationInProgress(ctx, r.Client, op, "resetting unbounded agent"); err != nil {
+		return reconcile.Result{}, err
+	}
+
+	if err := r.nodeOperator.ResetAgentResources(ctx, r.log); err != nil {
+		return finishFailedOperation(ctx, r.Client, op.Name, err)
+	}
+
+	result, err := finishOperation(ctx, r.Client, op.Name, v1alpha3.OperationPhaseComplete, "Succeeded", "AgentReset completed", machine.Generation)
+	if err != nil {
+		return result, err
+	}
+
+	// Stop the daemon last because systemctl stop terminates this running
+	// process.
+	return result, r.nodeOperator.StopDaemon(ctx, r.log)
 }
 
 func (r *daemonReconciler) mapMachineOperation(ctx context.Context, obj client.Object) []daemonRequest {
@@ -80,7 +104,7 @@ func shouldEnqueueMachineOperation(ctx context.Context, c client.Client, log *sl
 	}
 
 	switch op.Spec.OperationKind {
-	case v1alpha3.OperationNodeReboot, v1alpha3.OperationAgentUpgrade:
+	case v1alpha3.OperationNodeReboot, v1alpha3.OperationAgentUpgrade, v1alpha3.OperationAgentReset:
 		// handled below
 	default:
 		return false
@@ -204,6 +228,15 @@ func finishOperation(
 
 		return c.Status().Update(ctx, &latest)
 	})
+}
+
+func finishFailedOperation(ctx context.Context, c client.Client, name string, executionErr error) (reconcile.Result, error) {
+	result, finishErr := finishOperation(ctx, c, name, v1alpha3.OperationPhaseFailed, "ExecutionFailed", executionErr.Error(), 0)
+	if finishErr != nil {
+		return result, fmt.Errorf("mark MachineOperation %s failed after execution error %v: %w", name, executionErr, finishErr)
+	}
+
+	return result, nil
 }
 
 func selectorMatches(selector *metav1.LabelSelector, targetLabels map[string]string) (bool, error) {

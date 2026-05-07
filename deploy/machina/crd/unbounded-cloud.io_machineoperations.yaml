@@ -122,9 +122,11 @@ spec:
                 enum:
                 - NodeReboot
                 - AgentUpgrade
+                - AgentReset
                 - HostReboot
                 - HostPowerOff
                 - HostPowerOn
+                - HostReplace
                 type: string
               parameters:
                 additionalProperties:
