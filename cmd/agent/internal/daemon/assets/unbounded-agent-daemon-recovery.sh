@@ -6,20 +6,16 @@ set -euo pipefail
 
 current="{{ .DaemonBinaryCurrentPath }}"
 last_good="$(readlink -f {{ .DaemonBinaryLastGoodPath }} || true)"
-pending_upgrade="{{ .DaemonAgentUpgradeOperationPath }}"
-failure_signal="{{ .DaemonAgentUpgradeFailurePath }}"
+upgrade_signal="{{ .DaemonAgentUpgradeSignalPath }}"
 
 if [ -z "${last_good}" ] || [ ! -x "${last_good}" ]; then
     echo "no valid last-known-good agent binary found" >&2
     exit 1
 fi
 
-if [ -f "${pending_upgrade}" ]; then
+if [ -f "${upgrade_signal}" ]; then
     message="AgentUpgrade daemon failed after switching binary; rolled back to ${last_good}"
-    if ! "${last_good}" record-agent-upgrade-failure-signal \
-        --operation-path "${pending_upgrade}" \
-        --failure-path "${failure_signal}" \
-        --message "${message}"; then
+    if ! "${last_good}" record-agent-upgrade-failure-signal --message "${message}"; then
         echo "failed to record AgentUpgrade recovery signal" >&2
     fi
 fi

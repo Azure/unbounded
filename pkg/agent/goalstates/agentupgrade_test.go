@@ -4,30 +4,24 @@
 package goalstates
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-func TestResolveAgentUpgrade_UsesBlueWhenCurrentIsNotBlue(t *testing.T) {
+func TestAgentUpgradePathsNextTargetPathUsesBlueWhenCurrentIsNotBlue(t *testing.T) {
 	t.Parallel()
 
 	paths := AgentUpgradePaths{
-		BluePath:     "/agent-blue",
-		GreenPath:    "/agent-green",
-		CurrentPath:  "/agent-current",
-		LastGoodPath: "/agent-last-good",
+		BluePath:          "/agent-blue",
+		GreenPath:         "/agent-green",
+		CurrentTargetPath: "/agent",
 	}
 
-	upgrade := paths.ResolveAgentUpgrade("https://example.com/agent.tar.gz", "/agent")
-
-	assert.Equal(t, "https://example.com/agent.tar.gz", upgrade.DownloadURL)
-	assert.Equal(t, AgentUpgradeBinaryName, upgrade.BinaryName)
-	assert.Equal(t, "/agent", upgrade.PreviousBinaryPath)
-	assert.Equal(t, "/agent-blue", upgrade.TargetBinaryPath)
-	assert.Equal(t, "/agent-current", upgrade.CurrentLinkPath)
-	assert.Equal(t, "/agent-last-good", upgrade.LastGoodLinkPath)
+	assert.Equal(t, "/agent-blue", paths.NextTargetPath())
 }
 
 func TestResolvedAgentUpgradePaths(t *testing.T) {
@@ -37,12 +31,14 @@ func TestResolvedAgentUpgradePaths(t *testing.T) {
 	greenPath := filepath.Join(dir, "agent-green")
 	currentPath := filepath.Join(dir, "agent-current")
 	lastGoodPath := filepath.Join(dir, "agent-last-good")
+	signalPath := filepath.Join(dir, "agent-upgrade-signal")
 
 	t.Setenv(EnvDaemonBinary, binaryPath)
 	t.Setenv(EnvDaemonBinaryBlue, bluePath)
 	t.Setenv(EnvDaemonBinaryGreen, greenPath)
 	t.Setenv(EnvDaemonBinaryCurrent, currentPath)
 	t.Setenv(EnvDaemonBinaryLastGood, lastGoodPath)
+	t.Setenv(EnvDaemonAgentUpgradeSignalPath, signalPath)
 
 	paths := ResolvedAgentUpgradePaths()
 
@@ -51,6 +47,7 @@ func TestResolvedAgentUpgradePaths(t *testing.T) {
 	assert.Equal(t, greenPath, paths.GreenPath)
 	assert.Equal(t, currentPath, paths.CurrentPath)
 	assert.Equal(t, lastGoodPath, paths.LastGoodPath)
+	assert.Equal(t, signalPath, paths.SignalPath)
 }
 
 func TestResolvedAgentUpgradePaths_UsesDefaultsForBlankOverrides(t *testing.T) {
@@ -61,20 +58,45 @@ func TestResolvedAgentUpgradePaths_UsesDefaultsForBlankOverrides(t *testing.T) {
 
 	assert.Equal(t, DaemonBinaryPath, paths.BinaryPath)
 	assert.Equal(t, DaemonBinaryBluePath, paths.BluePath)
+	assert.Equal(t, DaemonAgentUpgradeSignalPath, paths.SignalPath)
 }
 
-func TestResolveAgentUpgrade_UsesGreenWhenCurrentIsBlue(t *testing.T) {
+func TestAgentUpgradePathsNextTargetPathUsesGreenWhenCurrentIsBlue(t *testing.T) {
 	t.Parallel()
 
 	paths := AgentUpgradePaths{
-		BluePath:     "/agent-blue",
-		GreenPath:    "/agent-green",
-		CurrentPath:  "/agent-current",
-		LastGoodPath: "/agent-last-good",
+		BluePath:          "/agent-blue",
+		GreenPath:         "/agent-green",
+		CurrentTargetPath: "/agent-blue",
 	}
 
-	upgrade := paths.ResolveAgentUpgrade("https://example.com/agent.tar.gz", "/agent-blue")
+	assert.Equal(t, "/agent-green", paths.NextTargetPath())
+}
 
-	assert.Equal(t, "/agent-green", upgrade.TargetBinaryPath)
-	assert.Equal(t, "/agent-blue", upgrade.PreviousBinaryPath)
+func TestAgentUpgradePathsResolveCurrent(t *testing.T) {
+	dir := t.TempDir()
+	currentTargetPath := filepath.Join(dir, "agent-blue")
+	currentPath := filepath.Join(dir, "agent-current")
+	require.NoError(t, os.WriteFile(currentTargetPath, []byte("agent"), 0o755))
+	require.NoError(t, os.Symlink(currentTargetPath, currentPath))
+
+	paths, err := (AgentUpgradePaths{
+		BinaryPath:  filepath.Join(dir, "agent"),
+		CurrentPath: currentPath,
+	}).ResolveCurrent()
+
+	require.NoError(t, err)
+	assert.Equal(t, currentTargetPath, paths.CurrentTargetPath)
+}
+
+func TestAgentUpgradePathsResolveCurrentFallsBackToBinaryPath(t *testing.T) {
+	t.Parallel()
+
+	paths, err := (AgentUpgradePaths{
+		BinaryPath:  "/agent",
+		CurrentPath: filepath.Join(t.TempDir(), "missing-current"),
+	}).ResolveCurrent()
+
+	require.NoError(t, err)
+	assert.Equal(t, "/agent", paths.CurrentTargetPath)
 }

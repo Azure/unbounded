@@ -93,7 +93,9 @@ func (r *daemonReconciler) reconcileAgentUpgrade(ctx context.Context, op *v1alph
 	}
 
 	if err := r.nodeOperator.RestartAgentDaemon(ctx, r.log); err != nil {
-		clearAgentUpgradeSignals(r.log, signals)
+		if clearErr := signals.Clear(); clearErr != nil {
+			r.log.Warn("failed to clear AgentUpgrade signal", "error", clearErr)
+		}
 		return finishFailedOperation(ctx, r.Client, op.Name, err)
 	}
 
@@ -125,24 +127,19 @@ func (r *daemonReconciler) reconcileAgentReset(ctx context.Context, op *v1alpha3
 }
 
 func publishAgentUpgradeFailureSignal(ctx context.Context, log *slog.Logger, c client.Client, signals agentUpgradeSignalOperator) (bool, error) {
-	signal, err := signals.ReadFailure()
+	signal, err := signals.Read()
 	if err != nil {
 		return false, fmt.Errorf("read AgentUpgrade failure signal: %w", err)
 	}
-	if signal == nil {
+	if signal == nil || signal.Message == "" {
 		return false, nil
 	}
 
-	message := "AgentUpgrade daemon failed after switching binary"
-	if signal.Message != "" {
-		message = signal.Message
-	}
-
-	if _, err := finishOperation(ctx, c, signal.OperationName, v1alpha3.OperationPhaseFailed, "DaemonFailed", message, 0); err != nil {
+	if _, err := finishOperation(ctx, c, signal.OperationName, v1alpha3.OperationPhaseFailed, "DaemonFailed", signal.Message, 0); err != nil {
 		return false, err
 	}
 
-	if err := signals.RemoveFailure(); err != nil {
+	if err := signals.Clear(); err != nil {
 		return false, fmt.Errorf("remove AgentUpgrade failure signal: %w", err)
 	}
 
@@ -161,7 +158,7 @@ func publishAndClearAgentUpgradeSignals(ctx context.Context, log *slog.Logger, c
 		return nil
 	}
 
-	pending, err := signals.ReadPending()
+	pending, err := signals.Read()
 	if err != nil {
 		return fmt.Errorf("read pending AgentUpgrade operation signal: %w", err)
 	}
@@ -180,7 +177,9 @@ func publishAndClearAgentUpgradeSignals(ctx context.Context, log *slog.Logger, c
 		log.Info("published AgentUpgrade success signal", "operation", pending.OperationName)
 	}
 
-	clearAgentUpgradeSignals(log, signals)
+	if err := signals.Clear(); err != nil {
+		log.Warn("failed to clear AgentUpgrade signal", "error", err)
+	}
 
 	return nil
 }

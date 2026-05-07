@@ -5,6 +5,7 @@ package goalstates
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -12,11 +13,13 @@ const AgentUpgradeBinaryName = "unbounded-agent"
 
 // AgentUpgradePaths describes the host-side blue-green agent binary layout.
 type AgentUpgradePaths struct {
-	BinaryPath   string
-	BluePath     string
-	GreenPath    string
-	CurrentPath  string
-	LastGoodPath string
+	BinaryPath        string
+	BluePath          string
+	GreenPath         string
+	CurrentPath       string
+	LastGoodPath      string
+	SignalPath        string
+	CurrentTargetPath string
 }
 
 // DefaultAgentUpgradePaths returns the production host-side agent binary paths.
@@ -27,6 +30,7 @@ func DefaultAgentUpgradePaths() AgentUpgradePaths {
 		GreenPath:    DaemonBinaryGreenPath,
 		CurrentPath:  DaemonBinaryCurrentPath,
 		LastGoodPath: DaemonBinaryLastGoodPath,
+		SignalPath:   DaemonAgentUpgradeSignalPath,
 	}
 }
 
@@ -39,6 +43,7 @@ func ResolvedAgentUpgradePaths() AgentUpgradePaths {
 		GreenPath:    resolveDaemonBinaryPath(EnvDaemonBinaryGreen, DaemonBinaryGreenPath),
 		CurrentPath:  resolveDaemonBinaryPath(EnvDaemonBinaryCurrent, DaemonBinaryCurrentPath),
 		LastGoodPath: resolveDaemonBinaryPath(EnvDaemonBinaryLastGood, DaemonBinaryLastGoodPath),
+		SignalPath:   resolveDaemonBinaryPath(EnvDaemonAgentUpgradeSignalPath, DaemonAgentUpgradeSignalPath),
 	}
 }
 
@@ -50,31 +55,30 @@ func resolveDaemonBinaryPath(envName, defaultPath string) string {
 	return defaultPath
 }
 
-// AgentUpgrade captures the desired host-side binary state for one upgrade.
-type AgentUpgrade struct {
-	DownloadURL        string
-	BinaryName         string
-	PreviousBinaryPath string
-	TargetBinaryPath   string
-	CurrentLinkPath    string
-	LastGoodLinkPath   string
+// ResolveCurrent returns paths with CurrentTargetPath populated.
+func (p AgentUpgradePaths) ResolveCurrent() (AgentUpgradePaths, error) {
+	targetPath, err := filepath.EvalSymlinks(p.CurrentPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			p.CurrentTargetPath = p.BinaryPath
+			return p, nil
+		}
+
+		return p, err
+	}
+
+	p.CurrentTargetPath = targetPath
+
+	return p, nil
 }
 
-// ResolveAgentUpgrade returns the target blue-green binary state for an upgrade.
-func (p AgentUpgradePaths) ResolveAgentUpgrade(downloadURL, previousBinaryPath string) AgentUpgrade {
-	targetPath := p.BluePath
-	if previousBinaryPath == p.BluePath {
-		targetPath = p.GreenPath
+// NextTargetPath returns the inactive blue-green binary path.
+func (p AgentUpgradePaths) NextTargetPath() string {
+	if p.CurrentTargetPath == p.BluePath {
+		return p.GreenPath
 	}
 
-	return AgentUpgrade{
-		DownloadURL:        downloadURL,
-		BinaryName:         AgentUpgradeBinaryName,
-		PreviousBinaryPath: previousBinaryPath,
-		TargetBinaryPath:   targetPath,
-		CurrentLinkPath:    p.CurrentPath,
-		LastGoodLinkPath:   p.LastGoodPath,
-	}
+	return p.BluePath
 }
 
 // InitialDaemonBinaryTarget returns the first executable binary that can seed
@@ -97,28 +101,4 @@ func isExecutableFile(path string) bool {
 	}
 
 	return info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0
-}
-
-// AgentUpgradeSignalPaths describes host-side AgentUpgrade signal file paths.
-type AgentUpgradeSignalPaths struct {
-	OperationPath string
-	FailurePath   string
-}
-
-// DefaultAgentUpgradeSignalPaths returns the production host-side AgentUpgrade
-// signal file paths.
-func DefaultAgentUpgradeSignalPaths() AgentUpgradeSignalPaths {
-	return AgentUpgradeSignalPaths{
-		OperationPath: DaemonAgentUpgradeOperationPath,
-		FailurePath:   DaemonAgentUpgradeFailurePath,
-	}
-}
-
-// ResolvedAgentUpgradeSignalPaths returns the host-side AgentUpgrade signal
-// file paths after applying environment overrides.
-func ResolvedAgentUpgradeSignalPaths() AgentUpgradeSignalPaths {
-	return AgentUpgradeSignalPaths{
-		OperationPath: resolveDaemonBinaryPath(EnvDaemonAgentUpgradeOperationPath, DaemonAgentUpgradeOperationPath),
-		FailurePath:   resolveDaemonBinaryPath(EnvDaemonAgentUpgradeFailurePath, DaemonAgentUpgradeFailurePath),
-	}
 }

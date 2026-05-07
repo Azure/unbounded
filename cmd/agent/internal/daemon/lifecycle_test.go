@@ -29,7 +29,6 @@ func TestRenderDaemonAsset(t *testing.T) {
 	require.NotContains(t, renderedRecovery, "{{")
 	assert.Contains(t, renderedRecovery, goalstates.DaemonBinaryLastGoodPath)
 	assert.Contains(t, renderedRecovery, goalstates.DaemonUnit)
-	assert.Contains(t, renderedRecovery, goalstates.DaemonAgentUpgradeOperationPath)
-	assert.Contains(t, renderedRecovery, goalstates.DaemonAgentUpgradeFailurePath)
+	assert.Contains(t, renderedRecovery, goalstates.DaemonAgentUpgradeSignalPath)
 	assert.Contains(t, renderedRecovery, "record-agent-upgrade-failure-signal")
 }

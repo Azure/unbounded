@@ -43,18 +43,13 @@ func TestAgentUpgradeSignalOperator_RecordFailure(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	operationPath := filepath.Join(dir, "agent-upgrade-operation")
-	failurePath := filepath.Join(dir, "agent-upgrade-failure")
-	signals := newAgentUpgradeSignalOperatorForPaths(goalstates.AgentUpgradeSignalPaths{
-		OperationPath: operationPath,
-		FailurePath:   failurePath,
-	})
+	signalPath := filepath.Join(dir, "agent-upgrade-signal")
+	signals := newAgentUpgradeSignalOperatorForPath(signalPath)
 
 	require.NoError(t, signals.RecordPending("op-1", 7))
 	require.NoError(t, signals.RecordFailure("rolled back"))
 
-	assert.NoFileExists(t, operationPath)
-	data, err := os.ReadFile(failurePath)
+	data, err := os.ReadFile(signalPath)
 	require.NoError(t, err)
 	assert.JSONEq(t, `{"operationName":"op-1","message":"rolled back"}`, string(data))
 }
@@ -63,14 +58,11 @@ func TestAgentUpgradeSignalOperator_ReadRejectsNonJSON(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	operationPath := filepath.Join(dir, "agent-upgrade-operation")
-	signals := newAgentUpgradeSignalOperatorForPaths(goalstates.AgentUpgradeSignalPaths{
-		OperationPath: operationPath,
-		FailurePath:   filepath.Join(dir, "agent-upgrade-failure"),
-	})
-	require.NoError(t, os.WriteFile(operationPath, []byte("op-1\n"), 0o600))
+	signalPath := filepath.Join(dir, "agent-upgrade-signal")
+	signals := newAgentUpgradeSignalOperatorForPath(signalPath)
+	require.NoError(t, os.WriteFile(signalPath, []byte("op-1\n"), 0o600))
 
-	_, err := signals.ReadPending()
+	_, err := signals.Read()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "decode AgentUpgrade signal")
 }
