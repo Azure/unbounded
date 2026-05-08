@@ -181,6 +181,12 @@ jobs:
       - name: Validate node restart operation
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-node-reboot-operation
 
+      - name: Validate agent upgrade operation
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-agent-upgrade-operation
+
+      - name: Validate agent upgrade rollback
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-agent-upgrade-rollback
+
       - name: Validate workload on agent node
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-workload
 

@@ -9,6 +9,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+
+	"github.com/google/renameio/v2"
 )
 
 // IsDirEmpty reports whether dir is empty or does not exist.
@@ -68,4 +70,14 @@ func CleanDir(path string) (retErr error) {
 	}
 
 	return nil
+}
+
+// UpdateSymlink atomically updates linkPath to point at targetPath.
+func UpdateSymlink(linkPath, targetPath string) error {
+	dir := filepath.Dir(linkPath)
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return err
+	}
+
+	return renameio.Symlink(targetPath, linkPath)
 }
