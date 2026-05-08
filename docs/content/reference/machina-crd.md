@@ -116,7 +116,7 @@ OCI operations use an OCI SDK config file mounted into the `machine-ops-controll
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `spec.machineRef` | string | No | Target `Machine` name. Either `machineRef` or `machineSelector` must be set. |
-| `spec.machineSelector` | LabelSelector | No | Selects Machines by label. Controllers may fan this out into per-Machine operations. |
+| `spec.machineSelector` | LabelSelector | No | Selects Machines by label. Supported for agent-handled operations (`NodeReboot`, `AgentUpgrade`, `AgentReset`). Each matching agent independently picks up the operation. Not supported for host operations. |
 | `spec.operationKind` | string | Yes | One of `NodeReboot`, `AgentUpgrade`, `AgentReset`, `HostReboot`, `HostPowerOff`, `HostPowerOn`, `HostReplace`. |
 | `spec.parameters` | map[string]string | No | Operation-specific parameters. |
 | `spec.ttlSecondsAfterFinished` | int32 | No | Delete completed or failed operations after this many seconds. |
@@ -124,6 +124,8 @@ OCI operations use an OCI SDK config file mounted into the `machine-ops-controll
 | `status.message` | string | No | Human-readable status message. |
 | `status.startedAt` | time | No | Operation start timestamp. |
 | `status.completedAt` | time | No | Terminal phase timestamp. |
+
+`AgentUpgrade` is handled by the in-host agent and requires `spec.parameters.downloadURL`. The URL must point to an `unbounded-agent` release tarball; the agent stages it as the inactive blue/green daemon binary, records the previous binary as last known good, and restarts `unbounded-agent-daemon.service`. If systemd cannot keep the upgraded daemon running, `unbounded-agent-daemon-recovery.service` switches the daemon back to the last known good binary.
 
 The Azure VM provider handles:
 

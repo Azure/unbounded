@@ -45,6 +45,7 @@ func downloadFromRemote(ctx context.Context, url string) (io.ReadCloser, error) 
 
 type TarFile struct {
 	Name string
+	Size int64
 	Body io.Reader
 }
 
@@ -88,7 +89,7 @@ func DecompressTarGzFromRemote(ctx context.Context, url string) iter.Seq2[*TarFi
 				return
 			}
 
-			if !yield(&TarFile{Name: cleanedName, Body: tarReader}, nil) {
+			if !yield(&TarFile{Name: cleanedName, Size: header.Size, Body: tarReader}, nil) {
 				return
 			}
 		}

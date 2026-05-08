@@ -34,8 +34,7 @@ func (r *daemonReconciler) reconcileMachineOperation(ctx context.Context, name s
 	case v1alpha3.OperationNodeReboot:
 		return r.reconcileNodeReboot(ctx, &op)
 	case v1alpha3.OperationAgentUpgrade:
-		r.log.Info("AgentUpgrade operation queued", "operation", op.Name)
-		return reconcile.Result{}, nil
+		return r.reconcileAgentUpgrade(ctx, &op)
 	case v1alpha3.OperationAgentReset:
 		return r.reconcileAgentReset(ctx, &op)
 	default:
@@ -65,6 +64,48 @@ func (r *daemonReconciler) reconcileNodeReboot(ctx context.Context, op *v1alpha3
 	return finishOperation(ctx, r.Client, op.Name, v1alpha3.OperationPhaseComplete, "Succeeded", "NodeReboot completed", machine.Generation)
 }
 
+func (r *daemonReconciler) reconcileAgentUpgrade(ctx context.Context, op *v1alpha3.MachineOperation) (reconcile.Result, error) {
+	machine, err := getLocalMachine(ctx, r.Client, r.machineName)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+
+	if err := markOperationInProgress(ctx, r.Client, op, "staging upgraded host agent binary"); err != nil {
+		return reconcile.Result{}, err
+	}
+
+	downloadURL, err := agentUpgradeDownloadURL(op.Spec.Parameters)
+	if err != nil {
+		_, finishErr := finishOperation(ctx, r.Client, op.Name, v1alpha3.OperationPhaseFailed, "InvalidParameters", err.Error(), 0)
+		return reconcile.Result{}, finishErr
+	}
+	r.log.Info("staging AgentUpgrade binary", "operation", op.Name, "url", downloadURL)
+
+	if err := r.nodeOperator.StageAgentUpgrade(ctx, r.log, downloadURL); err != nil {
+		_, finishErr := finishOperation(ctx, r.Client, op.Name, v1alpha3.OperationPhaseFailed, "ExecutionFailed", err.Error(), 0)
+		return reconcile.Result{}, finishErr
+	}
+
+	signals, err := newAgentUpgradeSignalOperator()
+	if err != nil {
+		_, finishErr := finishOperation(ctx, r.Client, op.Name, v1alpha3.OperationPhaseFailed, "ExecutionFailed", err.Error(), 0)
+		return reconcile.Result{}, finishErr
+	}
+	if err := signals.RecordPending(op.Name, machine.Generation); err != nil {
+		_, finishErr := finishOperation(ctx, r.Client, op.Name, v1alpha3.OperationPhaseFailed, "ExecutionFailed", err.Error(), 0)
+		return reconcile.Result{}, finishErr
+	}
+
+	if err := r.nodeOperator.RestartAgentDaemon(ctx, r.log); err != nil {
+		if clearErr := signals.Clear(); clearErr != nil {
+			r.log.Warn("failed to clear AgentUpgrade signal", "error", clearErr)
+		}
+		return finishFailedOperation(ctx, r.Client, op.Name, err)
+	}
+
+	return reconcile.Result{}, nil
+}
+
 func (r *daemonReconciler) reconcileAgentReset(ctx context.Context, op *v1alpha3.MachineOperation) (reconcile.Result, error) {
 	machine, err := getLocalMachine(ctx, r.Client, r.machineName)
 	if err != nil {
@@ -89,6 +130,48 @@ func (r *daemonReconciler) reconcileAgentReset(ctx context.Context, op *v1alpha3
 	return result, r.nodeOperator.StopDaemon(ctx, r.log)
 }
 
+func publishAndClearAgentUpgradeSignals(ctx context.Context, log *slog.Logger, c client.Client) error {
+	signals, err := newAgentUpgradeSignalOperator()
+	if err != nil {
+		return err
+	}
+
+	signal, err := signals.Read()
+	if err != nil {
+		return fmt.Errorf("read AgentUpgrade signal: %w", err)
+	}
+	switch {
+	case signal == nil:
+		return nil
+	case signal.FailureMessage != "":
+		if _, err := finishOperation(ctx, c, signal.OperationName, v1alpha3.OperationPhaseFailed, "DaemonFailed", signal.FailureMessage, 0); err != nil {
+			return err
+		}
+		if err := signals.Clear(); err != nil {
+			return fmt.Errorf("remove AgentUpgrade failure signal: %w", err)
+		}
+		log.Info("published AgentUpgrade daemon failure signal", "operation", signal.OperationName)
+	default:
+		if _, err := finishOperation(
+			ctx,
+			c,
+			signal.OperationName,
+			v1alpha3.OperationPhaseComplete,
+			"Succeeded",
+			"AgentUpgrade completed",
+			signal.ObservedMachineGeneration,
+		); err != nil {
+			return err
+		}
+		if err := signals.Clear(); err != nil {
+			log.Warn("failed to clear AgentUpgrade signal", "error", err)
+		}
+		log.Info("published AgentUpgrade success signal", "operation", signal.OperationName)
+	}
+
+	return nil
+}
+
 func (r *daemonReconciler) mapMachineOperation(ctx context.Context, obj client.Object) []daemonRequest {
 	op, ok := obj.(*v1alpha3.MachineOperation)
 	if !ok || !shouldEnqueueMachineOperation(ctx, r.Client, r.log, r.machineName, r.nodeName, op) {
@@ -105,7 +188,6 @@ func shouldEnqueueMachineOperation(ctx context.Context, c client.Client, log *sl
 
 	switch op.Spec.OperationKind {
 	case v1alpha3.OperationNodeReboot, v1alpha3.OperationAgentUpgrade, v1alpha3.OperationAgentReset:
-		// handled below
 	default:
 		return false
 	}
