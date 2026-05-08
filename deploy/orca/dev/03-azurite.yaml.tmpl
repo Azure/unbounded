@@ -1,0 +1,108 @@
+---
+# Azurite is Microsoft's official Azure Storage emulator. We use it as
+# an alternative origin in the dev harness so reviewers can exercise
+# the azureblob origin driver path without a real Azure account.
+#
+# Well-known dev account/key (documented at
+# https://learn.microsoft.com/azure/storage/common/storage-use-azurite):
+#   AccountName: devstoreaccount1
+#   AccountKey:  Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==
+#   BlobURL:     http://azurite.<ns>.svc.cluster.local:10000/devstoreaccount1
+apiVersion: v1
+kind: Service
+metadata:
+  name: azurite
+  namespace: {{ default "unbounded-kube" .Namespace }}
+  labels:
+    app.kubernetes.io/name: azurite
+    app.kubernetes.io/part-of: orca-dev
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: azurite
+  ports:
+    - name: blob
+      port: 10000
+      targetPort: 10000
+      protocol: TCP
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: azurite
+  namespace: {{ default "unbounded-kube" .Namespace }}
+  labels:
+    app.kubernetes.io/name: azurite
+    app.kubernetes.io/part-of: orca-dev
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: azurite
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: azurite
+        app.kubernetes.io/part-of: orca-dev
+    spec:
+      containers:
+        - name: azurite
+          image: {{ default "mcr.microsoft.com/azure-storage/azurite:3.33.0" .AzuriteImage | quote }}
+          imagePullPolicy: IfNotPresent
+          # Bind to 0.0.0.0 so the Service can reach it; default is
+          # 127.0.0.1.
+          # --skipApiVersionCheck allows newer Azure SDK clients
+          # (which advertise API versions Azurite hasn't yet caught up
+          # with) to talk to it.
+          # --loose disables strict validation of newer SDK headers.
+          # --disableProductStyleUrl forces path-style URL parsing.
+          # Without it, Azurite parses the first DNS label of the Host
+          # header as the account name (so requests to azurite.<ns>...
+          # would be misinterpreted as account="azurite" rather than
+          # account="devstoreaccount1").
+          # --debug routes Azurite's internal request log to a file;
+          # tail it via `kubectl exec ... -- cat /tmp/azurite-debug.log`
+          # when triaging 4xx responses.
+          args:
+            - azurite-blob
+            - --blobHost
+            - 0.0.0.0
+            - --blobPort
+            - "10000"
+            - --skipApiVersionCheck
+            - --loose
+            - --disableProductStyleUrl
+            - --debug
+            - /tmp/azurite-debug.log
+            - --location
+            - /data
+          ports:
+            - containerPort: 10000
+              name: blob
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            tcpSocket:
+              port: 10000
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            tcpSocket:
+              port: 10000
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          emptyDir: {}

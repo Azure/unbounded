@@ -10,19 +10,19 @@
 // evaluate to empty strings (text/template's missingkey=zero behaviour for map
 // data), which lets templates rely on sprig's `default` function to supply
 // documented fallbacks.
+//
+// The actual rendering logic lives in the render sub-package so it can be
+// invoked programmatically from tests.
 package main
 
 import (
-	"bytes"
 	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
-	"text/template"
 
-	"github.com/Masterminds/sprig/v3"
+	"github.com/Azure/unbounded/hack/cmd/render-manifests/render"
 )
 
 // setFlags implements flag.Value for repeatable --set key=value arguments.
@@ -75,58 +75,9 @@ func main() {
 		exitWithError("--output-dir is required")
 	}
 
-	if err := renderTemplates(templatesDir, outputDir, data); err != nil {
+	if err := render.Render(templatesDir, outputDir, data); err != nil {
 		exitWithError(err.Error())
 	}
-}
-
-func renderTemplates(templatesDir, outputDir string, data setFlags) error {
-	return filepath.WalkDir(templatesDir, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-
-		if d.IsDir() {
-			return nil
-		}
-
-		if !strings.HasSuffix(path, ".yaml.tmpl") {
-			return nil
-		}
-
-		relPath, err := filepath.Rel(templatesDir, path)
-		if err != nil {
-			return err
-		}
-
-		outputRelPath := strings.TrimSuffix(relPath, ".tmpl")
-		outputPath := filepath.Join(outputDir, outputRelPath)
-
-		templateBytes, err := os.ReadFile(path)
-		if err != nil {
-			return fmt.Errorf("read template %q: %w", path, err)
-		}
-
-		tmpl, err := template.New(relPath).Funcs(sprig.TxtFuncMap()).Option("missingkey=zero").Parse(string(templateBytes))
-		if err != nil {
-			return fmt.Errorf("parse template %q: %w", path, err)
-		}
-
-		if err := os.MkdirAll(filepath.Dir(outputPath), 0o755); err != nil {
-			return fmt.Errorf("create output dir for %q: %w", outputPath, err)
-		}
-
-		var rendered bytes.Buffer
-		if err := tmpl.Execute(&rendered, map[string]string(data)); err != nil {
-			return fmt.Errorf("execute template %q: %w", path, err)
-		}
-
-		if err := os.WriteFile(outputPath, rendered.Bytes(), 0o644); err != nil {
-			return fmt.Errorf("write rendered manifest %q: %w", outputPath, err)
-		}
-
-		return nil
-	})
 }
 
 func exitWithError(message string) {

@@ -1,0 +1,71 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: orca-config
+  namespace: {{ default "unbounded-kube" .Namespace }}
+  labels:
+    app.kubernetes.io/name: orca
+data:
+  config.yaml: |
+    # Orca origin cache configuration.
+    # Secret values (account keys, S3 access/secret) are sourced from
+    # environment variables ORCA_AZUREBLOB_ACCOUNT_KEY,
+    # ORCA_CACHESTORE_S3_ACCESS_KEY, ORCA_CACHESTORE_S3_SECRET_KEY,
+    # populated by the orca-credentials Secret via envFrom.
+
+    server:
+      listen: "0.0.0.0:8443"
+      auth:
+        # Dev: disabled. Production: enable bearer or mtls.
+        enabled: {{ default "false" .ServerAuthEnabled }}
+
+    origin:
+      id: {{ default "azureblob-default" .OriginID | quote }}
+      driver: {{ default "azureblob" .OriginDriver }}
+      target_global: {{ default "192" .TargetGlobal }}
+      queue_timeout: 5s
+      retry:
+        attempts: 3
+        backoff_initial: 100ms
+        backoff_max: 2s
+        max_total_duration: 5s
+      azureblob:
+        account: {{ default "" .AzureAccount | quote }}
+        container: {{ default "" .AzureContainer | quote }}
+        endpoint: {{ default "" .AzureEndpoint | quote }}
+        enforce_block_blob_only: true
+      awss3:
+        endpoint: {{ default "" .OriginAWSS3Endpoint | quote }}
+        region: {{ default "us-east-1" .OriginAWSS3Region | quote }}
+        bucket: {{ default "" .OriginAWSS3Bucket | quote }}
+        use_path_style: {{ default "false" .OriginAWSS3UsePathStyle }}
+
+    cachestore:
+      driver: s3
+      s3:
+        endpoint: {{ default "http://localstack.unbounded-kube.svc.cluster.local:4566" .CachestoreEndpoint | quote }}
+        bucket: {{ default "orca-cache" .CachestoreBucket | quote }}
+        region: {{ default "us-east-1" .CachestoreRegion | quote }}
+        use_path_style: true
+        require_unversioned_bucket: true
+
+    cluster:
+      service: {{ default "orca-peers.unbounded-kube.svc.cluster.local" .ClusterService | quote }}
+      membership_refresh: 5s
+      internal_listen: "0.0.0.0:8444"
+      target_replicas: {{ default "3" .TargetReplicas }}
+      internal_tls:
+        # Dev: disabled (plain HTTP/2 between peers). Production: true.
+        enabled: {{ default "false" .InternalTLSEnabled }}
+
+    chunk_catalog:
+      max_entries: 100000
+
+    metadata:
+      ttl: 5m
+      negative_ttl: 60s
+      max_entries: 10000
+
+    chunking:
+      size: 8388608

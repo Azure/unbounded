@@ -1,4 +1,4 @@
-# OriginCache - Implementation & Operations Plan
+# Orca - Origin Cache - Implementation & Operations Plan
 
 Status: draft for review (round 2 incorporating reviewer feedback)
 Owner: TBD
@@ -11,9 +11,9 @@ Targets: Phase 0 walking skeleton in this repo, growing to multi-PB multi-replic
 
 ## 1. Goal
 
-Ship a read-only S3-compatible blob caching layer ("OriginCache") inside an
+Ship a read-only S3-compatible blob caching layer ("Orca") inside an
 on-prem datacenter, fronting cloud blob storage (AWS S3 + Azure Blob).
-Clients issue range reads against OriginCache; OriginCache serves from a
+Clients issue range reads against Orca; Orca serves from a
 shared in-DC store when present, otherwise fetches from the cloud origin,
 stores the chunk, and returns it. There is no client-initiated write path.
 
@@ -60,14 +60,14 @@ Out of scope (v1):
 ## 3. Repo layout (mirrors `machina`)
 
 ```
-cmd/origincache/
-    main.go                         # thin wrapper -> origincache.Run()
-    origincache/
-        origincache.go              # cobra root, config load, wiring
+cmd/orca/
+    main.go                         # thin wrapper -> orca.Run()
+    orca/
+        orca.go              # cobra root, config load, wiring
         server/                     # S3-compatible HTTP handlers (client edge)
             internal/               # internal listener handlers
                                     #   GET /internal/fill?key=<encoded ChunkKey>
-internal/origincache/
+internal/orca/
     types.go                        # ChunkKey, ObjectInfo, ChunkInfo, Config
     chunker/                        # range <-> chunk math (streaming iterator)
     fetch/                          # Coordinator: meta + chunk SF, semaphore,
@@ -109,7 +109,7 @@ internal/origincache/
     auth/                           # bearer / mTLS verification (client edge);
                                     # internal-listener mTLS + peer-IP authz
     metrics/                        # Prometheus collectors
-deploy/origincache/
+deploy/orca/
     01-namespace.yaml.tmpl
     02-rbac.yaml.tmpl
     03-config.yaml.tmpl
@@ -118,28 +118,65 @@ deploy/origincache/
     05-service.yaml.tmpl            # headless service for membership
     06-service-clientvip.yaml.tmpl  # ClusterIP for client traffic
     07-networkpolicy.yaml.tmpl      # restricts ingress on :8444 to pods
-                                    # labelled app=origincache in-namespace
+                                    # labelled app=orca in-namespace;
+                                    # rendered only when
+                                    # networkpolicy.enabled=true (omit in dev)
     # 08-storage-pvc.yaml.tmpl      - RESERVED for Phase 2 cachestore/posixfs
     #                               deployments that wire the shared FS in via
     #                               a PVC + CSI driver rather than a kubelet
     #                               mount or hostPath; content deferred
+    dev/                            # dev-only manifests overlay
+        01-localstack-deployment.yaml   # LocalStack pod (ephemeral; no PVC);
+                                        # pinned to localstack/localstack:3.8
+                                        # (community)
+        02-localstack-service.yaml      # ClusterIP exposing :4566
+        03-localstack-init-job.yaml     # Job that creates the chunks bucket
+                                        # via awslocal at bring-up
     embed.go
     rendered/                       # gitignored, produced by render-manifests
-images/origincache/
+images/orca/
     Containerfile
-designdocs/origincache/
+design/orca/
     plan.md                         # this file
     design.md                       # mechanism + flow diagrams
-docs/origincache/                   # post-build, distilled from plan + design
-    architecture.md
-    operations.md
-hack/origincache/
-    Makefile                        # deploy / undeploy targets
-    scripts/
+    brief.md                        # stakeholder-facing brief
+hack/orca/
+    Makefile                        # dev-cluster targets: up, down, reset,
+                                    # render, port-forward, status, logs,
+                                    # seed-azure (real Azure only).
+                                    # Top-level Makefile may add `orca-`
+                                    # prefixed proxies that invoke
+                                    # `make -C hack/orca <target>`
+                                    # (matches the hack/net/ convention).
+    dev-harness.md                  # how to use the dev harness in Kind
+                                    # (LocalStack as cachestore/s3, real Azure
+                                    # as origin)
+    inttest.md                      # integration test guide for
+                                    # internal/orca/inttest/
+    up.sh                           # kind create + image build + load + render
+                                    # manifests + apply + wait-for-ready
+    down.sh                         # kind delete cluster
+    reset.sh                        # rebuild image + kind load + rollout
+                                    # restart
+    clear-cache.sh                  # delete LocalStack pod (recreated; cache
+                                    # state wiped without rebuilding the
+                                    # cluster)
+    seed-azure.sh                   # generate small/medium/large blobs and
+                                    # upload to the configured Azure account
+    port-forward.sh                 # kubectl port-forward orca client
+                                    # service to localhost
+    sample-get.sh, sample-list.sh   # example S3 client invocations
+    logs.sh                         # tail logs across replicas
+    .env.example                    # AZURE_STORAGE_ACCOUNT, AZURE_STORAGE_KEY,
+                                    # AZURE_CONTAINER, ORCA_REPLICAS,
+                                    # ORCA_IMAGE_TAG
+    kind-config.yaml                # 1 control + 3 worker nodes (one Orca
+                                    # replica per worker via required
+                                    # anti-affinity)
 ```
 
-`Makefile` additions: `origincache`, `origincache-build`, `origincache-image`,
-`origincache-manifests`. `make` continues to build everything.
+`Makefile` additions: `orca`, `orca-build`, `orca-image`,
+`orca-manifests`. `make` continues to build everything.
 
 ## 4. Auth (v1)
 
@@ -169,12 +206,12 @@ between replicas. Implementation follows
   the peer's source IP must be in the current peer-IP set
   (`Cluster.Peers()`).
 - NetworkPolicy (`07-networkpolicy.yaml.tmpl`) restricts ingress on `:8444`
-  to pods with label `app=origincache` in the same namespace.
+  to pods with label `app=orca` in the same namespace.
 - Loop prevention: receiver enforces `X-Origincache-Internal: 1` and
   self-checks `Cluster.Coordinator(k) == Self()`; on disagreement returns
   `409 Conflict` and the assembler falls back to local fill (one duplicate
   fill possible during membership flux, observable via
-  `origincache_origin_duplicate_fills_total{result="commit_lost"}`).
+  `orca_origin_duplicate_fills_total{result="commit_lost"}`).
 
 ## 5. Configuration shape
 
@@ -184,17 +221,25 @@ server:
   max_response_bytes: 0                           # 0 = no cap; >0 returns
                                                   # 400 RequestSizeExceedsLimit
                                                   # (S3-style XML) with header
-                                                  # x-origincache-cap-exceeded: true
+                                                  # x-orca-cap-exceeded: true
                                                   # before any cache lookup.
                                                   # 416 is reserved for true
                                                   # Range vs. object-size violations.
   tls:
-    cert_file: /etc/origincache/tls/tls.crt
-    key_file:  /etc/origincache/tls/tls.key
-    client_ca_file: /etc/origincache/tls/client-ca.crt   # optional, enables mTLS
+    cert_file: /etc/orca/tls/tls.crt
+    key_file:  /etc/orca/tls/tls.key
+    client_ca_file: /etc/orca/tls/client-ca.crt   # optional, enables mTLS
   auth:
+    enabled: true                                 # production: true. Dev:
+                                                  # set false to disable client
+                                                  # auth entirely (no token /
+                                                  # cert required). NOT a
+                                                  # dev_mode flag - just an
+                                                  # auth-on/off knob.
     mode: bearer                                  # bearer | mtls | both
-    bearer_secret_file: /etc/origincache/secret/token
+                                                  # (only meaningful when
+                                                  # enabled=true)
+    bearer_secret_file: /etc/orca/secret/token
 
 readyz:
   errauth_consecutive_threshold: 3                # mark NotReady after this many
@@ -288,7 +333,7 @@ metadata_refresh:                                 # opt-in bounded-freshness
   refresh_concurrency: 8                          # parallel refresh workers
 
 spool:
-  dir: /var/lib/origincache/spool                 # bounded local-disk staging
+  dir: /var/lib/orca/spool                 # bounded local-disk staging
   max_bytes: 8GiB                                 # full-spool -> 503 Slow Down
   max_inflight: 64                                # concurrent fills using spool
   tmp_max_age: 1h                                 # crash-recovery sweep age
@@ -333,7 +378,7 @@ origin:                                           # leader-side pre-header
 cachestore:
   driver: localfs                                 # localfs | posixfs | s3
   localfs:
-    root: /var/lib/origincache/chunks
+    root: /var/lib/orca/chunks
     staging_max_age: 1h                           # sweep <root>/.staging/<uuid>
                                                   # entries older than this; staging
                                                   # MUST live inside <root> to keep
@@ -343,7 +388,7 @@ cachestore:
                                                   # link()/EEXIST primitive as
                                                   # localfs but mounted on every
                                                   # replica at the same path
-    root: /mnt/origincache/chunks                 # mount point + base dir; MUST
+    root: /mnt/orca/chunks                 # mount point + base dir; MUST
                                                   # be the same on every replica
     staging_max_age: 1h                           # sweep <root>/.staging/<uuid>
                                                   # entries older than this
@@ -377,9 +422,9 @@ cachestore:
                                                   # production.
   s3:
     endpoint: https://vast.dc.example.internal
-    bucket: origincache-chunks
+    bucket: orca-chunks
     region: us-east-1
-    credentials_file: /etc/origincache/cachestore-creds
+    credentials_file: /etc/orca/cachestore-creds
     atomic_commit_self_test: true                 # SelfTestAtomicCommit at
                                                   # startup; refuse to start if
                                                   # backend silently overwrites
@@ -450,7 +495,7 @@ origin:
 
 cluster:
   enabled: true
-  service: origincache.origincache.svc.cluster.local
+  service: orca.orca.svc.cluster.local
   port: 8443                                      # client edge port on peers
                                                   # (used only as a discovery
                                                   # convention; internal RPCs
@@ -458,11 +503,17 @@ cluster:
   membership_refresh: 5s                          # headless Service DNS poll
   internal_listen: 0.0.0.0:8444                   # per-chunk fill RPC listener
   internal_tls:
-    cert_file: /etc/origincache/internal-tls/tls.crt
-    key_file:  /etc/origincache/internal-tls/tls.key
-    ca_file:   /etc/origincache/internal-tls/ca.crt   # internal CA, distinct
+    enabled: true                                   # production: true (mTLS).
+                                                    # Dev: set false to listen
+                                                    # plain HTTP/2; binary logs
+                                                    # WARN at startup. NOT a
+                                                    # dev_mode flag - just a
+                                                    # security knob.
+    cert_file: /etc/orca/internal-tls/tls.crt
+    key_file:  /etc/orca/internal-tls/tls.key
+    ca_file:   /etc/orca/internal-tls/ca.crt   # internal CA, distinct
                                                       # from client CA
-    server_name: origincache.<ns>.svc                 # stable SAN; pinned as
+    server_name: orca.<ns>.svc                 # stable SAN; pinned as
                                                       # tls.Config.ServerName by
                                                       # internal-RPC dialers
                                                       # (NOT pod IPs); per-replica
@@ -489,24 +540,24 @@ underlying storage system and is not a cache-layer concern. See
 ## 6. Observability
 
 - Prometheus collectors:
-  - `origincache_requests_total{op,status}`
-  - `origincache_request_duration_seconds{op}` (histogram)
-  - `origincache_responses_aborted_total{phase,reason}` -- mid-stream
+  - `orca_requests_total{op,status}`
+  - `orca_request_duration_seconds{op}` (histogram)
+  - `orca_responses_aborted_total{phase,reason}` -- mid-stream
     aborts after first byte sent (HTTP/2 `RST_STREAM` or HTTP/1.1
     `Connection: close`); `phase` in `pre_first_byte|mid_stream`
-  - `origincache_chunk_hits_total`, `origincache_chunk_misses_total`
-  - `origincache_chunkcatalog_hits_total`, `origincache_chunkcatalog_misses_total`
-  - `origincache_chunkcatalog_entries`
-  - `origincache_cachestore_stat_total{result="present|absent|error"}`
-  - `origincache_cachestore_stat_duration_seconds` (histogram)
-  - `origincache_origin_requests_total{origin,op,status}`
-  - `origincache_origin_bytes_total{origin}`
-  - `origincache_origin_request_duration_seconds{origin,op}` (histogram)
-  - `origincache_origin_rejected_total{origin,reason,blob_type}`
-  - `origincache_origin_etag_changed_total{origin}` -- count of `412
+  - `orca_chunk_hits_total`, `orca_chunk_misses_total`
+  - `orca_chunkcatalog_hits_total`, `orca_chunkcatalog_misses_total`
+  - `orca_chunkcatalog_entries`
+  - `orca_cachestore_stat_total{result="present|absent|error"}`
+  - `orca_cachestore_stat_duration_seconds` (histogram)
+  - `orca_origin_requests_total{origin,op,status}`
+  - `orca_origin_bytes_total{origin}`
+  - `orca_origin_request_duration_seconds{origin,op}` (histogram)
+  - `orca_origin_rejected_total{origin,reason,blob_type}`
+  - `orca_origin_etag_changed_total{origin}` -- count of `412
     Precondition Failed` responses to `If-Match: <etag>` GETs;
     leading indicator of mid-flight overwrite or stale metadata cache
-  - `origincache_origin_retry_total{result="success|exhausted_attempts|exhausted_duration|etag_changed"}`
+  - `orca_origin_retry_total{result="success|exhausted_attempts|exhausted_duration|etag_changed"}`
     -- one increment per request that entered the pre-header retry
     loop ([design.md s8.6](./design.md#86-failure-handling-without-re-stampede)).
     `success` = origin returned a first byte after some attempts;
@@ -517,11 +568,11 @@ underlying storage system and is not a cache-layer concern. See
     `etag_changed` = OriginETagChangedError (non-retryable) -> 502
     OriginETagChanged. Sustained non-zero `exhausted_*` rates
     indicate origin health issues.
-  - `origincache_origin_retry_attempts` -- histogram of attempt
+  - `orca_origin_retry_attempts` -- histogram of attempt
     count per request that entered the retry loop. p50 should be
     1 (first attempt succeeds); a long tail toward
     `origin.retry.attempts` indicates degraded origin.
-  - `origincache_responses_aborted_total{phase="pre_commit|mid_stream",reason}`
+  - `orca_responses_aborted_total{phase="pre_commit|mid_stream",reason}`
     -- response abort counters. `pre_commit` covers errors before
     response headers are sent (mostly diagnostic; the request
     typically returns a clean HTTP error). `mid_stream` covers
@@ -530,159 +581,159 @@ underlying storage system and is not a cache-layer concern. See
     the v1 streaming design. Sustained non-zero `mid_stream` rate
     is the trigger for considering mid-stream origin resume
     ([design.md s15.4](./design.md#154-mid-stream-origin-resume)).
-  - `origincache_origin_duplicate_fills_total{result="commit_won|commit_lost"}`
+  - `orca_origin_duplicate_fills_total{result="commit_won|commit_lost"}`
     - increments at every CacheStore commit attempt. The `commit_lost` rate
       quantifies cross-replica fill duplication that escaped coordinator
       routing (e.g. during membership flux during rolling restart). See
       [design.md#8-stampede-protection](./design.md#8-stampede-protection)
       and [design.md#14-horizontal-scale](./design.md#14-horizontal-scale).
-  - `origincache_inflight_fills`
-  - `origincache_singleflight_joiners_total`
-  - `origincache_spool_bytes` -- current spool footprint
-  - `origincache_spool_evictions_total{reason="committed|aborted|full"}`
-  - `origincache_cluster_internal_fill_requests_total{direction="sent|received|conflict"}`
+  - `orca_inflight_fills`
+  - `orca_singleflight_joiners_total`
+  - `orca_spool_bytes` -- current spool footprint
+  - `orca_spool_evictions_total{reason="committed|aborted|full"}`
+  - `orca_cluster_internal_fill_requests_total{direction="sent|received|conflict"}`
     -- `conflict` increments whenever the receiver returns `409 Conflict`
     because of a coordinator-membership disagreement
-  - `origincache_cluster_internal_fill_duration_seconds` (histogram)
-  - `origincache_cluster_membership_size`
-  - `origincache_cluster_membership_refresh_duration_seconds` (histogram)
-  - `origincache_cachestore_self_test_total{result="ok|failed"}` --
+  - `orca_cluster_internal_fill_duration_seconds` (histogram)
+  - `orca_cluster_membership_size`
+  - `orca_cluster_membership_refresh_duration_seconds` (histogram)
+  - `orca_cachestore_self_test_total{result="ok|failed"}` --
     incremented once per process start by `SelfTestAtomicCommit`
-  - `origincache_cachestore_errors_total{kind="not_found|transient|auth"}`
+  - `orca_cachestore_errors_total{kind="not_found|transient|auth"}`
     -- typed CacheStore error counts (see
     [design.md#102-catalog-correctness-typed-errors-circuit-breaker](./design.md#102-catalog-correctness-typed-errors-circuit-breaker));
     `not_found` is normal cold-path traffic, `transient` and `auth`
     feed the breaker and (for `auth`) the `/readyz` threshold
-  - `origincache_cachestore_breaker_state` -- 0=closed, 1=open,
+  - `orca_cachestore_breaker_state` -- 0=closed, 1=open,
     2=half_open
-  - `origincache_cachestore_breaker_transitions_total{from,to}` --
+  - `orca_cachestore_breaker_transitions_total{from,to}` --
     breaker state-transition counter
-  - `origincache_origin_inflight{origin}` -- per-replica gauge of
+  - `orca_origin_inflight{origin}` -- per-replica gauge of
     in-flight `Origin.GetRange` calls; cap is
     `floor(target_global / N_replicas)` per
     [design.md#84-origin-backpressure](./design.md#84-origin-backpressure)
-  - `origincache_metadata_origin_heads_total{origin,result}` --
+  - `orca_metadata_origin_heads_total{origin,result}` --
     per-replica HEAD calls that actually reached the origin (not
     served from the metadata cache); cluster-wide bound is N per
     object per `metadata_ttl` window in v1
-  - `origincache_metadata_negative_entries` -- gauge of negative
+  - `orca_metadata_negative_entries` -- gauge of negative
     metadata-cache entries (404 / unsupported-blob-type) currently
     held by this replica. Drains as entries expire after
     `negative_metadata_ttl`. See
     [design.md#12-create-after-404-and-negative-cache-lifecycle](./design.md#12-create-after-404-and-negative-cache-lifecycle).
-  - `origincache_metadata_negative_hit_total{origin_id}` -- counter
+  - `orca_metadata_negative_hit_total{origin_id}` -- counter
     of requests served from a negative entry. A spike following a
     known operator upload signals create-after-404 drain in
     progress.
-  - `origincache_metadata_negative_age_seconds{origin_id}` --
+  - `orca_metadata_negative_age_seconds{origin_id}` --
     histogram of negative-entry age at hit time. Upper-bound
     percentiles inform `negative_metadata_ttl` tuning.
-  - `origincache_list_cache_entries` -- gauge of LIST cache size
+  - `orca_list_cache_entries` -- gauge of LIST cache size
     (current LRU population). Approaches `list_cache.max_entries`
     indicate undersizing for the workload. See
     [design.md s6.2](./design.md#62-list-request-flow).
-  - `origincache_list_cache_hit_total{origin_id,result="hit|miss"}`
+  - `orca_list_cache_hit_total{origin_id,result="hit|miss"}`
     -- LIST cache hit rate; `result="hit"` increments on cache
     serve, `result="miss"` on origin pass-through. Hit rate is the
     primary indicator of LIST cache effectiveness for the FUSE
     workload.
-  - `origincache_list_cache_evict_total{reason="size|ttl|response_too_large"}`
+  - `orca_list_cache_evict_total{reason="size|ttl|response_too_large"}`
     -- LIST cache evictions by trigger. `size` = LRU bound;
     `ttl` = lazy expiration on lookup; `response_too_large` =
     response exceeded `list_cache.max_response_bytes` and bypassed
     cache.
-  - `origincache_list_cache_origin_calls_total{origin_id,result}`
+  - `orca_list_cache_origin_calls_total{origin_id,result}`
     -- LIST calls that actually reached origin (cache miss +
     singleflight collapse). With per-replica caching, cluster-wide
     bound is N origin LIST per identical query per
     `list_cache.ttl`.
-  - `origincache_list_cache_swr_refresh_total{origin_id,result}`
+  - `orca_list_cache_swr_refresh_total{origin_id,result}`
     -- background stale-while-revalidate refreshes. Only emitted
     when `list_cache.swr_enabled=true`.
-  - `origincache_chunk_catalog_entries` -- gauge of in-memory
+  - `orca_chunk_catalog_entries` -- gauge of in-memory
     ChunkCatalog size. Pinned at `chunk_catalog.max_entries`
     suggests undersizing relative to the working set
     ([design.md s13.3](./design.md#133-chunkcatalog-size-awareness-load-bearing-operational-note)).
-  - `origincache_chunk_catalog_hit_total{result="hit|miss"}` --
+  - `orca_chunk_catalog_hit_total{result="hit|miss"}` --
     catalog Lookup outcomes. Sustained hit_rate < 0.7 suggests
     undersizing.
-  - `origincache_chunk_catalog_evict_total{reason="size|active|forget"}`
+  - `orca_chunk_catalog_evict_total{reason="size|active|forget"}`
     -- catalog evictions by trigger. `size` = LRU bound (passive);
     `active` = active eviction loop deleted from CacheStore;
     `forget` = explicit Forget (ETag changed, GetChunk ErrNotFound).
-  - `origincache_chunk_catalog_active_eviction_runs_total{result="ok|breaker_open|aborted"}`
+  - `orca_chunk_catalog_active_eviction_runs_total{result="ok|breaker_open|aborted"}`
     -- active eviction loop completions. `breaker_open` means the
     loop skipped this cycle because the CacheStore breaker is
     open. Only emitted when
     `chunk_catalog.active_eviction.enabled=true`.
-  - `origincache_chunk_catalog_active_eviction_candidates` --
+  - `orca_chunk_catalog_active_eviction_candidates` --
     histogram of per-run candidate count. Visibility into
     eligible-but-not-yet-evicted entries.
-  - `origincache_cachestore_delete_total{result="ok|not_found|transient|auth"}`
+  - `orca_cachestore_delete_total{result="ok|not_found|transient|auth"}`
     -- `CacheStore.Delete` outcomes (called by active eviction).
     `not_found` is treated as success by the eviction loop
     (idempotent). `transient` and `auth` count toward the
     CacheStore circuit breaker.
-  - `origincache_metadata_refresh_runs_total{result="ok|aborted|breaker_open"}`
+  - `orca_metadata_refresh_runs_total{result="ok|aborted|breaker_open"}`
     -- bounded-freshness mode (FW5) per-loop completions. Only
     emitted when `metadata_refresh.enabled=true`. See
     [design.md s11.2](./design.md#112-bounded-freshness-mode-optional).
-  - `origincache_metadata_refresh_total{result="ok|etag_changed|error|skipped_limiter_busy"}`
+  - `orca_metadata_refresh_total{result="ok|etag_changed|error|skipped_limiter_busy"}`
     -- per-key refresh outcomes. `etag_changed` indicates an
     immutable-contract violation detected proactively (the metric
-    `origincache_origin_etag_changed_total` also increments).
-  - `origincache_metadata_refresh_candidates` -- histogram of
+    `orca_origin_etag_changed_total` also increments).
+  - `orca_metadata_refresh_candidates` -- histogram of
     eligible candidates per refresh-loop run. Visibility into the
     hot-key set size.
-  - `origincache_metadata_refresh_lag_seconds` -- histogram of
+  - `orca_metadata_refresh_lag_seconds` -- histogram of
     `(now - LastEntered)` at refresh time; should cluster around
     `metadata_refresh.refresh_ahead_ratio * metadata_ttl`.
-  - `origincache_s3_versioning_check_total{result="ok|refused"}` --
+  - `orca_s3_versioning_check_total{result="ok|refused"}` --
     once-per-boot emission from the `cachestore/s3` versioning
     gate ([design.md s10.1.3](./design.md#1013-cachestores3)).
     `refused` indicates the bucket has versioning enabled or
     suspended; the process exits non-zero immediately after.
-  - `origincache_commit_after_serve_total{result="ok|failed"}` --
+  - `orca_commit_after_serve_total{result="ok|failed"}` --
     asynchronous CacheStore commits that run after the client
     response is complete; `failed` means the
     client response succeeded but the chunk was NOT recorded in the
     `ChunkCatalog` (next request refills); see
     [design.md#86-failure-handling-without-re-stampede](./design.md#86-failure-handling-without-re-stampede)
-  - `origincache_localfs_dir_fsync_total{result="ok|failed"}` --
+  - `orca_localfs_dir_fsync_total{result="ok|failed"}` --
     `fsync()` of the `<root>/.staging/` and final-parent directories
     on every commit, sweep, and orphaned-staging cleanup
-  - `origincache_posixfs_link_total{result="commit_won|commit_lost|error"}` --
+  - `orca_posixfs_link_total{result="commit_won|commit_lost|error"}` --
     every `link()` no-clobber commit attempt by `cachestore/posixfs`;
     the loser of a race is `commit_lost` (returned `EEXIST`); other
     failures are `error` and feed the breaker. See
     [design.md#1012-cachestoreposixfs](./design.md#1012-cachestoreposixfs).
-  - `origincache_posixfs_dir_fsync_total{result="ok|failed"}` --
+  - `orca_posixfs_dir_fsync_total{result="ok|failed"}` --
     `fsync()` of `<root>/.staging/` and `<final parent>` directories
     by `cachestore/posixfs`; rate matters because a network FS may
     silently degrade dir-fsync semantics under an `async` export.
-  - `origincache_posixfs_backend{type,version,major,minor}` -- info
+  - `orca_posixfs_backend{type,version,major,minor}` -- info
     gauge (value=1) labelled with the auto-detected (or
     operator-overridden) backend at boot, e.g.
     `type="nfs",version="4.1"`; `type="wekafs"`; `type="ceph"`;
     `type="lustre"`; `type="gpfs"`. Used to tag every other posixfs
     metric in dashboards via `group_left`.
-  - `origincache_posixfs_selftest_last_success_timestamp` -- unix
+  - `orca_posixfs_selftest_last_success_timestamp` -- unix
     seconds of the last successful `SelfTestAtomicCommit`; absent if
     the driver never reached a green self-test.
-  - `origincache_posixfs_nfs_v3_optin_total` -- count of boot-time
+  - `orca_posixfs_nfs_v3_optin_total` -- count of boot-time
     NFSv3 opt-in events (operator set
     `cachestore.posixfs.nfs.allow_v3: true`); should be `0` in
     production.
-  - `origincache_posixfs_alluxio_refusal_total` -- count of boot
+  - `orca_posixfs_alluxio_refusal_total` -- count of boot
     refusals because the detected backend was Alluxio FUSE; should be
     `0`. Operators MUST switch to `cachestore.driver: s3` against the
     Alluxio S3 gateway.
-  - `origincache_spool_locality_check_total{result="ok|refused|bypassed",fs_type}` --
+  - `orca_spool_locality_check_total{result="ok|refused|bypassed",fs_type}` --
     boot `statfs(2)` outcome for `spool.dir`; `refused` means the FS
     is on the network-FS denylist and the process exited non-zero;
     `bypassed` means `spool.require_local_fs=false` (test-only).
     See [design.md#104-spool-locality-contract](./design.md#104-spool-locality-contract).
-  - `origincache_readyz_errauth_consecutive` -- current count of
+  - `orca_readyz_errauth_consecutive` -- current count of
     consecutive `ErrAuth` responses from CacheStore; flips `/readyz`
     to NotReady at `readyz.errauth_consecutive_threshold` (default 3)
 - Structured logs with request IDs propagated to origin SDKs.
@@ -693,16 +744,16 @@ underlying storage system and is not a cache-layer concern. See
 - Admin endpoints (gated by separate listener / auth):
   dump cluster topology, lookup chunk, force-`Forget` a catalog entry,
   dump current spool inventory.
-- `kubectl unbounded origincache` subcommand for inspection (later phase).
+- `kubectl unbounded orca` subcommand for inspection (later phase).
 
 ## 7. Phased delivery
 
 | Phase | Scope | Definition of done |
 |---|---|---|
-| **0 - skeleton** | `cmd/origincache` boilerplate; `Origin` and `CacheStore` interfaces; `origin/s3`; `cachestore/localfs`; in-memory `chunkcatalog`; single-process Range GET; streaming chunk iterator; `make` integration; basic unit tests | One process serves a Range GET against a real S3 bucket and re-serves it from `localfs` |
+| **0 - skeleton** | `cmd/orca` boilerplate; `Origin` and `CacheStore` interfaces; `origin/s3`; `cachestore/localfs`; in-memory `chunkcatalog`; single-process Range GET; streaming chunk iterator; `make` integration; basic unit tests | One process serves a Range GET against a real S3 bucket and re-serves it from `localfs` |
 | **1 - prod basics** | `fetch.Coordinator` with chunk + meta singleflight + tee; `chunkcatalog` LRU + Stat-on-miss path with **per-entry access-frequency tracking** (FW8) and bounded by `chunk_catalog.max_entries` with size-awareness operational guidance ([design.md s13.3](./design.md#133-chunkcatalog-size-awareness-load-bearing-operational-note)); atomic CacheStore writes (`localfs` `link`/`renameat2(RENAME_NOREPLACE)` with **staging inside `<root>/.staging/<uuid>` + parent-dir fsync**); metadata cache with `metadata_ttl=5m` and **`negative_metadata_ttl=60s`** (asymmetric defaults; bounds the create-after-404 unavailability window per [design.md s12](./design.md#12-create-after-404-and-negative-cache-lifecycle)) including `metadata_negative_entries` / `metadata_negative_hit_total` / `metadata_negative_age_seconds` metrics; **per-replica LIST cache** (FW3) with default `list_cache.ttl=60s`, `max_entries=1024`, sized for FUSE-`ls` workload ([design.md s6.2](./design.md#62-list-request-flow)); **active eviction** (FW8) opt-in via `chunk_catalog.active_eviction.enabled` (default off; recommended on for posixfs deployments without external sweep) including `CacheStore.Delete` interface method; **bounded-freshness mode** (FW5) opt-in via `metadata_refresh.enabled` (default off) with hot-key detection via metadata-cache access counters ([design.md s11.2](./design.md#112-bounded-freshness-mode-optional)); **distributed origin limiter** is deferred future work (see [design.md s15.5](./design.md#155-coordinated-cluster-wide-origin-limiter)); v1 ships with a per-replica token bucket sized `floor(origin.target_global / cluster.target_replicas)` (default 64 slots/replica at `target_global=192`, `target_replicas=3`), with origin throttling responses handled by the leader's pre-header retry loop ([design.md s8.4](./design.md#84-origin-backpressure)); **bounded staleness contract documented**; **strict `If-Match: <etag>` on every `Origin.GetRange` plus `OriginETagChangedError` handling**; **typed `CacheStore` errors (`ErrNotFound|ErrTransient|ErrAuth`)** with only `ErrNotFound` triggering refill; **per-replica HEAD singleflight wording** in metadata layer; **pre-header origin retry** (`origin.retry.attempts=3`, `origin.retry.max_total_duration=5s` defaults) as the cold-path commit boundary - cold-path bytes stream origin -> client directly with bounded leader-side retry handling transient origin failures invisibly before HTTP response headers are committed; spool tees in parallel for joiner support and as the asynchronous CacheStore-commit source ([design.md s8.6](./design.md#86-failure-handling-without-re-stampede)); **mid-stream abort** on post-first-byte failure (`RST_STREAM` / `Connection: close`); **`server.max_response_bytes` cap returns `400 RequestSizeExceedsLimit`** (S3-style XML; 416 reserved for Range vs. EOF); `HeadObject`; `ListObjectsV2`; `origin/azureblob` (Block Blob only); **`cachestore/s3` versioning gate** ([design.md s10.1.3](./design.md#1013-cachestores3)) refusing to start on versioned buckets; Prometheus; structured logging; health / readiness | One replica deployed in a dev K8s cluster serving traffic against both S3 and Azure (multi-replica clustering lands in Phase 3) |
-| **2 - prod backend & ops** | `cachestore/s3` for VAST with `PutObject` + `If-None-Match: *` and **`SelfTestAtomicCommit` at startup** (refuse to start if backend silently overwrites); **`cachestore/posixfs` for shared POSIX FS deployments** (NFSv4.1+ baseline, plus Weka native, CephFS, Lustre, GPFS) sharing `link()`/`EEXIST` + dir-fsync helpers with `cachestore/localfs` via `internal/origincache/cachestore/internal/posixcommon/`, with **`SelfTestAtomicCommit` at startup** (refuse to start on Alluxio FUSE, on NFS below `nfs.minimum_version=4.1` unless `nfs.allow_v3` is set, or on any backend that fails the link-EEXIST + dir-fsync + size-verify self-test) and 2-char hex fan-out under `<origin_id>/`; **`internal/origincache/fetch/spool` layer** (slow-joiner fallback regardless of CacheStore driver) **with mandatory boot `statfs(2)` locality check** that refuses to start when `spool.dir` is on a network FS (NFS / SMB / CephFS / Lustre / GPFS / FUSE); **`commit_after_serve_total{ok|failed}` async-commit metric path**; **per-process CacheStore circuit breaker** (`enabled,error_window=30s,error_threshold=10,open_duration=30s,half_open_probes=3`); **per-replica origin semaphore documented** with formula `floor(target_global / N_replicas)` + `origin_inflight` gauge; **`localfs` `staging_max_age=1h` orphaned-staging sweeper** (and equivalent `posixfs.staging_max_age=1h`); **`/readyz` ErrAuth threshold (default 3 consecutive -> NotReady)**; sequential read-ahead; bearer / mTLS auth on the client edge; `deploy/origincache/` manifests (incl. `07-networkpolicy.yaml.tmpl`); `images/origincache/` Containerfile; `docs/origincache/` published with CacheStore lifecycle policy guidance and POSIX-backend support matrix | Production-shaped service running against VAST in a real DC with the self-test green, AND a parallel green run against at least one shared-POSIX backend (NFSv4.1+ baseline) |
-| **3 - cluster** | `cluster/` peer discovery from headless Service DNS; rendezvous hashing on pod IP; **per-chunk internal fill RPC** (assembler fan-out); **internal mTLS listener on `:8444`** with internal CA + peer-IP authz + **stable `ServerName=origincache.<ns>.svc`** pinned by dialers (per-replica certs MUST include this SAN) + `X-Origincache-Internal` loop prevention + `409 Conflict` on coordinator disagreement; NetworkPolicy applied; `kubectl unbounded origincache` inspection subcommand | Multi-replica Deployment sustaining target throughput; `commit_lost` rate near zero in steady state |
+| **2 - prod backend & ops** | `cachestore/s3` for VAST with `PutObject` + `If-None-Match: *` and **`SelfTestAtomicCommit` at startup** (refuse to start if backend silently overwrites); **`cachestore/posixfs` for shared POSIX FS deployments** (NFSv4.1+ baseline, plus Weka native, CephFS, Lustre, GPFS) sharing `link()`/`EEXIST` + dir-fsync helpers with `cachestore/localfs` via `internal/orca/cachestore/internal/posixcommon/`, with **`SelfTestAtomicCommit` at startup** (refuse to start on Alluxio FUSE, on NFS below `nfs.minimum_version=4.1` unless `nfs.allow_v3` is set, or on any backend that fails the link-EEXIST + dir-fsync + size-verify self-test) and 2-char hex fan-out under `<origin_id>/`; **`internal/orca/fetch/spool` layer** (slow-joiner fallback regardless of CacheStore driver) **with mandatory boot `statfs(2)` locality check** that refuses to start when `spool.dir` is on a network FS (NFS / SMB / CephFS / Lustre / GPFS / FUSE); **`commit_after_serve_total{ok|failed}` async-commit metric path**; **per-process CacheStore circuit breaker** (`enabled,error_window=30s,error_threshold=10,open_duration=30s,half_open_probes=3`); **per-replica origin semaphore documented** with formula `floor(target_global / N_replicas)` + `origin_inflight` gauge; **`localfs` `staging_max_age=1h` orphaned-staging sweeper** (and equivalent `posixfs.staging_max_age=1h`); **`/readyz` ErrAuth threshold (default 3 consecutive -> NotReady)**; sequential read-ahead; bearer / mTLS auth on the client edge; `deploy/orca/` manifests (incl. `07-networkpolicy.yaml.tmpl`); `images/orca/` Containerfile; `hack/orca/` published with CacheStore lifecycle policy guidance and POSIX-backend support matrix | Production-shaped service running against VAST in a real DC with the self-test green, AND a parallel green run against at least one shared-POSIX backend (NFSv4.1+ baseline) |
+| **3 - cluster** | `cluster/` peer discovery from headless Service DNS; rendezvous hashing on pod IP; **per-chunk internal fill RPC** (assembler fan-out); **internal mTLS listener on `:8444`** with internal CA + peer-IP authz + **stable `ServerName=orca.<ns>.svc`** pinned by dialers (per-replica certs MUST include this SAN) + `X-Origincache-Internal` loop prevention + `409 Conflict` on coordinator disagreement; NetworkPolicy applied; `kubectl unbounded orca` inspection subcommand | Multi-replica Deployment sustaining target throughput; `commit_lost` rate near zero in steady state |
 | **4 - optional** | NVMe / HDD tiering; S3 SigV4 verification; adaptive prefetch; deferred optimizations catalogued in [design.md s15](./design.md#15-deferred-optimizations) (edge rate limiting, cluster-wide HEAD singleflight, cluster-wide LIST coordinator) if measured to be needed | As needed |
 
 Estimated calendar: Phase 0 + 1 ~= 3-4 focused weeks. Phase 2 + 3 another
@@ -743,7 +794,7 @@ Estimated calendar: Phase 0 + 1 ~= 3-4 focused weeks. Phase 2 + 3 another
 - `origin/azureblob`: contract tests against `azurite` in CI, including:
   - One Block Blob, one Page Blob, one Append Blob.
   - GETs against Page / Append return `502 OriginUnsupported` and
-    increment `origincache_origin_rejected_total`.
+    increment `orca_origin_rejected_total`.
   - `ListObjectsV2` in `filter` mode returns only the Block Blob and
     preserves continuation tokens across pages.
   - 1000 concurrent requests for the same Page Blob produce exactly one
@@ -760,7 +811,7 @@ Estimated calendar: Phase 0 + 1 ~= 3-4 focused weeks. Phase 2 + 3 another
   - **Mid-fill `OriginETagChangedError`**: after N bytes, mock origin
     returns 412 on `If-Match`; assert (a) leader fails the fill with
     `OriginETagChangedError`, (b) metadata cache entry invalidated, (c)
-    `origincache_origin_etag_changed_total` increments, (d) pre-first-byte
+    `orca_origin_etag_changed_total` increments, (d) pre-first-byte
     joiners receive `502`, mid-stream joiners are aborted, (e) the next
     request issues a fresh `Head`, gets a new etag, derives a new
     `ChunkKey`, and successfully fills.
@@ -779,7 +830,7 @@ Estimated calendar: Phase 0 + 1 ~= 3-4 focused weeks. Phase 2 + 3 another
 - Cluster:
   - in-process 3-replica test for assembler fan-out and per-chunk
     coordinator routing against a shared CacheStore; assert
-    `origincache_origin_duplicate_fills_total{result="commit_lost"}` = 0
+    `orca_origin_duplicate_fills_total{result="commit_lost"}` = 0
     under steady-state membership;
   - **internal-listener authz**: peer with valid internal cert but source
     IP outside `Cluster.Peers()` is rejected; client cert chained only to
@@ -793,7 +844,7 @@ Estimated calendar: Phase 0 + 1 ~= 3-4 focused weeks. Phase 2 + 3 another
     body is byte-identical to a direct origin read, and total origin
     GETs equal exactly 1000.
 - End-to-end: docker-compose with `minio` (origin) + a second `minio`
-  (CacheStore) + a single `origincache` process; scripted range-read
+  (CacheStore) + a single `orca` process; scripted range-read
   scenarios incl. mid-test object overwrite to exercise the `If-Match`
   path end-to-end.
 - Load test: `vegeta` / `k6` against a process backed by a mock origin with
@@ -972,7 +1023,7 @@ Estimated calendar: Phase 0 + 1 ~= 3-4 focused weeks. Phase 2 + 3 another
   inject CacheStore commit error after the client response is
   complete; assert the client response completes successfully
   byte-for-byte; assert
-  `origincache_commit_after_serve_total{result="failed"}` == 1;
+  `orca_commit_after_serve_total{result="failed"}` == 1;
   assert `ChunkCatalog.Lookup(k)` is still a miss; assert a
   follow-up request triggers exactly one new origin GET.
 - **T-3 typed CacheStore errors** (`cachestore` + `fetch`): inject each
@@ -993,7 +1044,7 @@ Estimated calendar: Phase 0 + 1 ~= 3-4 focused weeks. Phase 2 + 3 another
 - **T-4a per-replica origin semaphore** (`fetch`): set semaphore to 4;
   drive 16 concurrent cold misses across 16 distinct chunks; assert
   in-flight `Origin.GetRange` never exceeds 4; assert
-  `origincache_origin_inflight{origin}` saturates at 4; remaining 12
+  `orca_origin_inflight{origin}` saturates at 4; remaining 12
   fills queue and complete in 4-wide batches.
 - **T-6a localfs staging-inside-root** (`cachestore/localfs`): assert
   every commit writes to `<root>/.staging/<uuid>` (NOT `/tmp` and NOT
@@ -1050,19 +1101,19 @@ Estimated calendar: Phase 0 + 1 ~= 3-4 focused weeks. Phase 2 + 3 another
   (`fanout_chars: 0` for localfs) produces the flat layout. Verify
   the same `posixcommon` package powers both code paths via a unit
   test on the helper.
-- **T-spool-locality refusal** (`spool` + `cmd/origincache`): boot
+- **T-spool-locality refusal** (`spool` + `cmd/orca`): boot
   with `spool.dir` on a tmpfs-backed loopback NFS mount (CI helper);
   assert the process exits non-zero with the `spool: ... is on a
   network filesystem (nfs); ... Refusing to start` message and
-  `origincache_spool_locality_check_total{result="refused",fs_type="nfs"}`
+  `orca_spool_locality_check_total{result="refused",fs_type="nfs"}`
   == 1. Repeat with `spool.require_local_fs: false`; assert the
   process starts, `result="bypassed"` is emitted, and the boot log
   carries the `WARN spool.require_local_fs is disabled` line.
   Separately assert a clean local-FS run emits `result="ok"`.
 - **T-D3 internal mTLS ServerName** (`cluster`): boot 3 replicas with
-  per-replica certs whose only SAN is `origincache.<ns>.svc`;
+  per-replica certs whose only SAN is `orca.<ns>.svc`;
   rolling-restart one pod so its IP changes; assert the dialer pins
-  `tls.Config.ServerName = origincache.<ns>.svc` and the handshake
+  `tls.Config.ServerName = orca.<ns>.svc` and the handshake
   succeeds against the new pod IP without cert reissuance.
 - **T-D4 readyz on ErrAuth** (`cachestore` + `server`): inject 1
   `ErrAuth` -> `/readyz` still 200; inject 3 consecutive `ErrAuth` ->
@@ -1075,7 +1126,7 @@ Estimated calendar: Phase 0 + 1 ~= 3-4 focused weeks. Phase 2 + 3 another
 - **T-edge cap-exceeded 400** (`server`): set `max_response_bytes=1MiB`;
   request `Range: bytes=0-2097151` (2 MiB); assert response is
   `400 RequestSizeExceedsLimit` (S3-style XML body) with
-  `x-origincache-cap-exceeded: true`; separately, request a Range past
+  `x-orca-cap-exceeded: true`; separately, request a Range past
   EOF and assert response is `416 Requested Range Not Satisfiable`
   (cap-exceeded MUST NOT be reported as 416).
 
@@ -1094,7 +1145,7 @@ Re-stated to prevent drift:
 
 ## 10. Open questions / risks
 
-- **Origin immutability is an operator contract**: OriginCache trusts
+- **Origin immutability is an operator contract**: Orca trusts
   that an `(origin_id, bucket, object_key)` is immutable for the life
   of the key (replacement must use a new key); the bounded violation
   window is `metadata_ttl` (default 5m). `If-Match: <etag>` on every
@@ -1108,7 +1159,7 @@ Re-stated to prevent drift:
   is complete. A failure there leaves the client successful but
   the chunk uncached. Repeated
   failures are visible only via
-  `origincache_commit_after_serve_total{result="failed"}` and the
+  `orca_commit_after_serve_total{result="failed"}` and the
   CacheStore circuit breaker; operators MUST alert on a sustained
   non-zero rate (it indicates CacheStore degradation, not request
   errors).
@@ -1138,6 +1189,17 @@ Re-stated to prevent drift:
   citation is in design.md. The `SelfTestAtomicCommit` probe is the
   defense-in-depth backstop if any future S3-compatible backend
   reports versioning correctly but silently overwrites anyway.
+- **LocalStack community community-tier image must be pinned**: the
+  dev harness uses LocalStack as the `cachestore/s3` backend
+  (`hack/orca/dev-harness.md`). The `localstack/localstack:latest`
+  tag now requires a Pro auth token and exits with code 55 on the
+  free tier. Dev manifests pin to `localstack/localstack:3.8`, the
+  last known-stable community-tier release whose S3 implementation
+  honors `PutObject + If-None-Match: *` (verified locally; both the
+  `SelfTestAtomicCommit` and the `GetBucketVersioning` versioning
+  gate pass). Future LocalStack releases may diverge; if the dev
+  harness fails to start, first action is verify `If-None-Match: *`
+  + `GetBucketVersioning` against the pinned image.
 - **NFS export `async` weakens dir-fsync**: `cachestore/posixfs`
   depends on directory `fsync()` being durable on the server, which
   requires the NFS export to be `sync` (not `async`). The driver
@@ -1186,8 +1248,8 @@ Re-stated to prevent drift:
   8 GiB) and `spool.max_inflight` (default 64) bound the local staging
   area. A correlated cold-access burst that exceeds these returns `503
   Slow Down` to clients, which is the intended backpressure but visible
-  as user-facing errors. Operators should monitor `origincache_spool_bytes`
-  and `origincache_spool_evictions_total{reason="full"}` and tune the caps
+  as user-facing errors. Operators should monitor `orca_spool_bytes`
+  and `orca_spool_evictions_total{reason="full"}` and tune the caps
   per node disk capacity.
 - **Internal cert rotation**: the internal listener uses per-replica certs
   chained to an internal CA. Rotation is delegated to the issuing system
@@ -1202,7 +1264,7 @@ Re-stated to prevent drift:
   new member for up to one refresh interval (default 5s), shifting
   ownership for ~1/N keys until the next DNS refresh. Back-to-back
   restarts can cause repeated duplicate fills. The
-  `origincache_origin_duplicate_fills_total{result="commit_lost"}` metric
+  `orca_origin_duplicate_fills_total{result="commit_lost"}` metric
   makes this visible. We accept this in v1 and revisit if it proves
   material. See
   [design.md#14-horizontal-scale](./design.md#14-horizontal-scale).
@@ -1261,13 +1323,13 @@ Re-stated to prevent drift:
   measured.
 - **CacheStore lifecycle eviction of hot chunks**: age-based expiration may
   evict a chunk that is still hot, forcing a re-fetch from origin.
-  Operators should tune TTL against `origincache_origin_bytes_total`. Phase
+  Operators should tune TTL against `orca_origin_bytes_total`. Phase
   4 may add an in-`chunkcatalog` access-tracking layer if this proves
   material.
 - **Origin egress cost spikes**: cold-start fan-out can be expensive even
   with singleflight if many distinct keys are touched simultaneously.
   Origin semaphore + 503 backpressure protects us, but operators should
-  monitor `origincache_origin_bytes_total` and set DC-side egress budgets.
+  monitor `orca_origin_bytes_total` and set DC-side egress budgets.
 - **Prefetch-induced waste**: sequential read-ahead can fetch chunks the
   client never reads. Default depth (4) is conservative; we expose the knob
   and the metric.
@@ -1280,18 +1342,18 @@ Re-stated to prevent drift:
 
 Before starting Phase 0 implementation, please confirm:
 
-- [ ] Repo layout under `cmd/origincache/`, `internal/origincache/`,
-      `deploy/origincache/`, `images/origincache/`,
-      `designdocs/origincache/`, `hack/origincache/` is acceptable,
-      including `internal/origincache/fetch/spool/`,
-      `cmd/origincache/origincache/server/internal/`, and
-      `deploy/origincache/07-networkpolicy.yaml.tmpl`.
+- [ ] Repo layout under `cmd/orca/`, `internal/orca/`,
+      `deploy/orca/`, `images/orca/`,
+      `design/orca/`, `hack/orca/` is acceptable,
+      including `internal/orca/fetch/spool/`,
+      `cmd/orca/orca/server/internal/`, and
+      `deploy/orca/07-networkpolicy.yaml.tmpl`.
 - [ ] Default chunk size of 8 MiB is acceptable.
 - [ ] Bearer / mTLS auth on the client edge in v1 is acceptable; SigV4
       is deferred future work.
 - [ ] **Separate internal mTLS listener (`:8444`) with an internal CA
       distinct from the client mTLS CA, peer-IP-set authorization,
-      and a NetworkPolicy restricting ingress to `app=origincache` pods,
+      and a NetworkPolicy restricting ingress to `app=orca` pods,
       is acceptable.**
 - [ ] Azure constraint to Block Blobs only, surfaced as
       `502 OriginUnsupported`, is acceptable.
@@ -1321,7 +1383,7 @@ Before starting Phase 0 implementation, please confirm:
 - [ ] Phase 0 deliverable definition (one process serving a Range GET
       against real S3 and re-serving from `localfs`) is the right starting
       milestone.
-- [ ] No cross-cmd imports; shared code lives under `internal/origincache/`
+- [ ] No cross-cmd imports; shared code lives under `internal/orca/`
       per the project's coding standards.
 - [ ] **Bounded staleness contract published in design.md s11 with
       `metadata_ttl=5m` default; operators are expected to honor the
@@ -1370,7 +1432,7 @@ Before starting Phase 0 implementation, please confirm:
       `/tmp` and NOT spool dir); parent-dir fsync after every link/unlink;
       `staging_max_age=1h` orphaned-staging sweeper.**
 - [ ] **Internal mTLS dialer pins `tls.Config.ServerName` to the stable
-      SAN `origincache.<ns>.svc`; per-replica certs MUST include this
+      SAN `orca.<ns>.svc`; per-replica certs MUST include this
       SAN; pod-IP SANs are NOT used.**
 - [ ] **`/readyz` flips to NotReady after `readyz.errauth_consecutive_threshold=3`
       consecutive `ErrAuth` from CacheStore; one non-`ErrAuth` success
@@ -1381,7 +1443,7 @@ Before starting Phase 0 implementation, please confirm:
 - [ ] **`cachestore/posixfs` ships in Phase 2 alongside `cachestore/s3`,
       sharing `link()`/`EEXIST` + dir-fsync helpers with
       `cachestore/localfs` via
-      `internal/origincache/cachestore/internal/posixcommon/`. Supported
+      `internal/orca/cachestore/internal/posixcommon/`. Supported
       backends: NFSv4.1+ (baseline), Weka native (`-t wekafs`), CephFS,
       Lustre, GPFS / IBM Spectrum Scale.**
 - [ ] **`cachestore/posixfs` runs `SelfTestAtomicCommit` at startup
@@ -1480,3 +1542,13 @@ Before starting Phase 0 implementation, please confirm:
       tenant deployments worried about single-client monopolization
       should layer rate limiting at an upstream proxy or LB until
       this lands as a future deliverable.**
+- [ ] **Dev harness brings up cleanly with `make -C hack/orca up`
+      against LocalStack (cachestore/s3) and a real Azure storage
+      account (origin) inside a Kind cluster. End-to-end flow
+      verified: cold miss -> Azure -> LocalStack -> client; warm
+      hit served from LocalStack without origin call; 50 parallel
+      GETs across 3 replicas dedupe to 1 origin GET (cluster-wide
+      via `/internal/fill`). LocalStack pinned to a community-tier
+      image; dev disables `cluster.internal_tls.enabled` and
+      `server.auth.enabled`. NetworkPolicy not applied in dev. See
+      [hack/orca/dev-harness.md](../../hack/orca/dev-harness.md).**

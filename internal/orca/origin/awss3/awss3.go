@@ -1,0 +1,291 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+// Package awss3 is the AWS S3 (and S3-compatible) origin driver. It
+// targets either real AWS S3 or a local S3-compatible endpoint such as
+// LocalStack. Useful as a credential-free origin for the dev harness:
+// LocalStack acts as both origin and cachestore (different buckets).
+//
+// This driver is read-only from Orca's perspective (Head, GetRange,
+// List). The seed step that uploads test objects to the origin bucket
+// happens out-of-band via aws-cli or similar.
+package awss3
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
+
+	"github.com/Azure/unbounded/internal/orca/origin"
+)
+
+// Adapter implements origin.Origin against an S3-compatible endpoint.
+type Adapter struct {
+	cfg    Config
+	client *s3.Client
+}
+
+// Config is the awss3-driver configuration. Mirrors config.AWSS3 but
+// kept package-local so the driver can be unit-tested without
+// importing the whole config package.
+type Config struct {
+	// Endpoint, when set, overrides the regional default and routes
+	// requests at a custom URL (LocalStack uses
+	// http://localstack:4566). Leave empty for real AWS S3.
+	Endpoint string
+
+	// Region is the AWS region. LocalStack ignores this; the SDK
+	// requires a value.
+	Region string
+
+	// Bucket is the source bucket holding origin objects.
+	Bucket string
+
+	// AccessKey / SecretKey are static credentials. For LocalStack
+	// these are "test"/"test"; for real AWS, supply real creds.
+	AccessKey string
+	SecretKey string
+
+	// UsePathStyle: true for LocalStack (host-based addressing
+	// requires DNS wildcards LocalStack does not provide).
+	UsePathStyle bool
+}
+
+// New constructs an Adapter.
+func New(ctx context.Context, cfg Config) (*Adapter, error) {
+	if cfg.Bucket == "" {
+		return nil, fmt.Errorf("origin/awss3: bucket required")
+	}
+
+	if cfg.Region == "" {
+		cfg.Region = "us-east-1"
+	}
+
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx,
+		awsconfig.WithRegion(cfg.Region),
+		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
+			cfg.AccessKey, cfg.SecretKey, "",
+		)),
+		// Opt out of CRC64NVME default introduced in aws-sdk-go-v2
+		// 1.32. LocalStack 3.8 returns InvalidRequest for unknown
+		// algorithms; real AWS S3 still works either way.
+		awsconfig.WithRequestChecksumCalculation(aws.RequestChecksumCalculationWhenRequired),
+		awsconfig.WithResponseChecksumValidation(aws.ResponseChecksumValidationWhenRequired),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("origin/awss3: aws config: %w", err)
+	}
+
+	client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
+		if cfg.Endpoint != "" {
+			o.BaseEndpoint = aws.String(cfg.Endpoint)
+		}
+
+		o.UsePathStyle = cfg.UsePathStyle
+	})
+
+	return &Adapter{cfg: cfg, client: client}, nil
+}
+
+// Head returns ObjectInfo for the named object. The bucket arg lets
+// callers override the configured bucket; if empty, the configured
+// bucket is used.
+func (a *Adapter) Head(ctx context.Context, bucket, key string) (origin.ObjectInfo, error) {
+	b := bucket
+	if b == "" {
+		b = a.cfg.Bucket
+	}
+
+	out, err := a.client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(b),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		if isNotFound(err) {
+			return origin.ObjectInfo{LastStatus: http.StatusNotFound}, origin.ErrNotFound
+		}
+
+		if isAuth(err) {
+			return origin.ObjectInfo{}, origin.ErrAuth
+		}
+
+		return origin.ObjectInfo{}, fmt.Errorf("awss3 head: %w", err)
+	}
+
+	info := origin.ObjectInfo{LastStatus: http.StatusOK}
+	if out.ContentLength != nil {
+		info.Size = *out.ContentLength
+	}
+
+	if out.ETag != nil {
+		info.ETag = strings.Trim(*out.ETag, "\"")
+	}
+
+	if out.ContentType != nil {
+		info.ContentType = *out.ContentType
+	}
+
+	if out.LastModified != nil {
+		info.LastValidated = *out.LastModified
+	}
+
+	return info, nil
+}
+
+// GetRange fetches [off, off+n) of the object, sending If-Match: <etag>.
+func (a *Adapter) GetRange(ctx context.Context, bucket, key, etag string, off, n int64) (io.ReadCloser, error) {
+	b := bucket
+	if b == "" {
+		b = a.cfg.Bucket
+	}
+
+	rng := fmt.Sprintf("bytes=%d-%d", off, off+n-1)
+
+	in := &s3.GetObjectInput{
+		Bucket: aws.String(b),
+		Key:    aws.String(key),
+		Range:  aws.String(rng),
+	}
+	if etag != "" {
+		// S3 expects the etag wrapped in double quotes.
+		in.IfMatch = aws.String("\"" + etag + "\"")
+	}
+
+	out, err := a.client.GetObject(ctx, in)
+	if err != nil {
+		if isPreconditionFailed(err) {
+			return nil, &origin.OriginETagChangedError{
+				Bucket: b, Key: key, Want: etag,
+			}
+		}
+
+		if isNotFound(err) {
+			return nil, origin.ErrNotFound
+		}
+
+		if isAuth(err) {
+			return nil, origin.ErrAuth
+		}
+
+		return nil, fmt.Errorf("awss3 get-range: %w", err)
+	}
+
+	return out.Body, nil
+}
+
+// List enumerates objects under prefix.
+func (a *Adapter) List(ctx context.Context, bucket, prefix, marker string, maxResults int) (origin.ListResult, error) {
+	b := bucket
+	if b == "" {
+		b = a.cfg.Bucket
+	}
+
+	in := &s3.ListObjectsV2Input{
+		Bucket:  aws.String(b),
+		Prefix:  aws.String(prefix),
+		MaxKeys: aws.Int32(int32(maxResults)),
+	}
+	if marker != "" {
+		in.ContinuationToken = aws.String(marker)
+	}
+
+	out, err := a.client.ListObjectsV2(ctx, in)
+	if err != nil {
+		if isAuth(err) {
+			return origin.ListResult{}, origin.ErrAuth
+		}
+
+		return origin.ListResult{}, fmt.Errorf("awss3 list: %w", err)
+	}
+
+	res := origin.ListResult{}
+
+	for _, item := range out.Contents {
+		entry := origin.ObjectEntry{}
+		if item.Key != nil {
+			entry.Key = *item.Key
+		}
+
+		if item.Size != nil {
+			entry.Size = *item.Size
+		}
+
+		if item.ETag != nil {
+			entry.ETag = strings.Trim(*item.ETag, "\"")
+		}
+
+		res.Entries = append(res.Entries, entry)
+	}
+
+	if out.IsTruncated != nil {
+		res.IsTruncated = *out.IsTruncated
+	}
+
+	if out.NextContinuationToken != nil {
+		res.NextMarker = *out.NextContinuationToken
+	}
+
+	return res, nil
+}
+
+func isNotFound(err error) bool {
+	var nsk *s3types.NoSuchKey
+	if errors.As(err, &nsk) {
+		return true
+	}
+
+	var nsb *s3types.NoSuchBucket
+	if errors.As(err, &nsb) {
+		return true
+	}
+
+	var notFound *s3types.NotFound
+	if errors.As(err, &notFound) {
+		return true
+	}
+
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.ErrorCode() {
+		case "NoSuchKey", "NotFound", "404":
+			return true
+		}
+	}
+
+	return false
+}
+
+func isAuth(err error) bool {
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.ErrorCode() {
+		case "AccessDenied", "Unauthorized", "Forbidden", "InvalidAccessKeyId", "SignatureDoesNotMatch":
+			return true
+		}
+	}
+
+	return false
+}
+
+func isPreconditionFailed(err error) bool {
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.ErrorCode() {
+		case "PreconditionFailed", "ConditionalRequestConflict":
+			return true
+		}
+	}
+
+	return strings.Contains(err.Error(), "PreconditionFailed") ||
+		strings.Contains(err.Error(), "412")
+}

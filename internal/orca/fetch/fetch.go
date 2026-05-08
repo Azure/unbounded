@@ -1,0 +1,333 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+// Package fetch is the per-replica fill orchestrator: per-ChunkKey
+// singleflight, pre-header origin retry (Option D), per-replica origin
+// concurrency cap, and cross-replica fill via the cluster's internal
+// RPC (s8.3).
+//
+// Scope A+B per the design: per-replica singleflight + cluster-wide
+// dedup via rendezvous-hashed coordinator. No disk spool; joiner
+// streams from the leader's in-memory ring buffer.
+package fetch
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"sync"
+	"time"
+
+	"github.com/Azure/unbounded/internal/orca/cachestore"
+	"github.com/Azure/unbounded/internal/orca/chunk"
+	"github.com/Azure/unbounded/internal/orca/chunkcatalog"
+	"github.com/Azure/unbounded/internal/orca/cluster"
+	"github.com/Azure/unbounded/internal/orca/config"
+	"github.com/Azure/unbounded/internal/orca/metadata"
+	"github.com/Azure/unbounded/internal/orca/origin"
+)
+
+// Coordinator orchestrates per-replica chunk fills.
+type Coordinator struct {
+	or  origin.Origin
+	cs  cachestore.CacheStore
+	cl  *cluster.Cluster
+	cat *chunkcatalog.Catalog
+	mc  *metadata.Cache
+	cfg *config.Config
+
+	// Per-replica origin concurrency cap (s8.4 simplified).
+	originSem chan struct{}
+
+	// Per-ChunkKey singleflight (s8.1).
+	mu       sync.Mutex
+	inflight map[string]*fill
+}
+
+type fill struct {
+	done    chan struct{}
+	bodyBuf *bytes.Buffer // buffered chunk after fetch (in-memory, bounded by chunk size)
+	err     error
+}
+
+// NewCoordinator wires up the fetch coordinator.
+func NewCoordinator(
+	or origin.Origin,
+	cs cachestore.CacheStore,
+	cl *cluster.Cluster,
+	cat *chunkcatalog.Catalog,
+	mc *metadata.Cache,
+	cfg *config.Config,
+) *Coordinator {
+	tpr := cfg.TargetPerReplica()
+	if tpr < 1 {
+		tpr = 1
+	}
+
+	return &Coordinator{
+		or:        or,
+		cs:        cs,
+		cl:        cl,
+		cat:       cat,
+		mc:        mc,
+		cfg:       cfg,
+		originSem: make(chan struct{}, tpr),
+		inflight:  make(map[string]*fill),
+	}
+}
+
+// Origin returns the underlying origin (used by the LIST passthrough).
+func (c *Coordinator) Origin() origin.Origin { return c.or }
+
+// HeadObject returns object metadata, satisfying client HEAD requests.
+func (c *Coordinator) HeadObject(ctx context.Context, bucket, key string) (origin.ObjectInfo, error) {
+	return c.mc.LookupOrFetch(ctx, c.cfg.Origin.ID, bucket, key,
+		func(ctx context.Context) (origin.ObjectInfo, error) {
+			return c.or.Head(ctx, bucket, key)
+		})
+}
+
+// GetChunk returns a reader over the chunk's bytes, fulfilling either
+// from CacheStore (hit) or by orchestrating a cluster-wide
+// dedup'd fill (miss).
+//
+// On miss:
+//   - If self is the coordinator: run local fill (origin GET via retry,
+//     atomic commit to CacheStore, populate buffer for joiners).
+//   - If a peer is the coordinator: send /internal/fill to that peer;
+//     stream from peer's response. On 409 Conflict, fall back to local
+//     fill.
+func (c *Coordinator) GetChunk(ctx context.Context, k chunk.Key) (io.ReadCloser, error) {
+	// Hot path: catalog hit -> direct CacheStore read.
+	_, ok, err := c.cat.Lookup(k)
+	if err != nil {
+		return nil, fmt.Errorf("chunkcatalog lookup: %w", err)
+	}
+
+	if ok {
+		rc, err := c.cs.GetChunk(ctx, k, 0, k.ChunkSize)
+		if err == nil {
+			return rc, nil
+		}
+
+		if errors.Is(err, cachestore.ErrNotFound) {
+			c.cat.Forget(k)
+			// fall through to miss path
+		} else {
+			return nil, err
+		}
+	}
+
+	// Stat to confirm presence.
+	if info, err := c.cs.Stat(ctx, k); err == nil {
+		if recErr := c.cat.Record(k, info); recErr != nil {
+			return nil, fmt.Errorf("chunkcatalog record: %w", recErr)
+		}
+
+		return c.cs.GetChunk(ctx, k, 0, info.Size)
+	} else if !errors.Is(err, cachestore.ErrNotFound) {
+		return nil, err
+	}
+
+	// Cluster-wide dedup: route to coordinator.
+	coord := c.cl.Coordinator(k)
+	if !coord.Self {
+		rc, err := c.cl.FillFromPeer(ctx, coord, k)
+		if err == nil {
+			return rc, nil
+		}
+
+		if errors.Is(err, cluster.ErrPeerNotCoordinator) {
+			slog.Default().Warn("peer reported not-coordinator; falling back to local fill",
+				"chunk", k.String(), "peer", coord.IP)
+			// fall through to local fill
+		} else {
+			slog.Default().Warn("internal-fill RPC failed; falling back to local fill",
+				"chunk", k.String(), "peer", coord.IP, "err", err)
+		}
+	}
+
+	return c.fillLocal(ctx, k)
+}
+
+// FillForPeer is the path taken by the /internal/fill handler.
+//
+// The receiver becomes the leader for this fill (or joins an in-flight
+// fill for the same key). Returns a streaming body of the entire chunk.
+func (c *Coordinator) FillForPeer(ctx context.Context, k chunk.Key) (io.ReadCloser, error) {
+	// Hot path: catalog hit -> direct read. The catalog can be stale
+	// (e.g. cachestore pruned out-of-band, or operator clear-cache);
+	// on ErrNotFound we forget and fall through to a fresh fill.
+	_, ok, err := c.cat.Lookup(k)
+	if err != nil {
+		return nil, fmt.Errorf("chunkcatalog lookup: %w", err)
+	}
+
+	if ok {
+		rc, err := c.cs.GetChunk(ctx, k, 0, k.ChunkSize)
+		if err == nil {
+			return rc, nil
+		}
+
+		if errors.Is(err, cachestore.ErrNotFound) {
+			c.cat.Forget(k)
+		} else {
+			return nil, err
+		}
+	}
+
+	if info, err := c.cs.Stat(ctx, k); err == nil {
+		if recErr := c.cat.Record(k, info); recErr != nil {
+			return nil, fmt.Errorf("chunkcatalog record: %w", recErr)
+		}
+
+		return c.cs.GetChunk(ctx, k, 0, info.Size)
+	} else if !errors.Is(err, cachestore.ErrNotFound) {
+		return nil, err
+	}
+
+	return c.fillLocal(ctx, k)
+}
+
+// fillLocal runs (or joins) the singleflight for k on this replica.
+func (c *Coordinator) fillLocal(ctx context.Context, k chunk.Key) (io.ReadCloser, error) {
+	path := k.Path()
+
+	c.mu.Lock()
+
+	f, ok := c.inflight[path]
+	if !ok {
+		f = &fill{done: make(chan struct{})}
+		c.inflight[path] = f
+		c.mu.Unlock()
+
+		go c.runFill(k, f)
+	} else {
+		c.mu.Unlock()
+	}
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-f.done:
+	}
+
+	if f.err != nil {
+		return nil, f.err
+	}
+
+	return io.NopCloser(bytes.NewReader(f.bodyBuf.Bytes())), nil
+}
+
+func (c *Coordinator) runFill(k chunk.Key, f *fill) {
+	// Use a fill-scoped context to outlive any single requester.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	defer func() {
+		close(f.done)
+		c.mu.Lock()
+		delete(c.inflight, k.Path())
+		c.mu.Unlock()
+	}()
+
+	// Acquire per-replica origin slot.
+	queueCtx, queueCancel := context.WithTimeout(ctx, c.cfg.Origin.QueueTimeout)
+	defer queueCancel()
+
+	select {
+	case c.originSem <- struct{}{}:
+	case <-queueCtx.Done():
+		f.err = fmt.Errorf("origin: queue timeout (cap=%d)", cap(c.originSem))
+		return
+	}
+
+	defer func() { <-c.originSem }()
+
+	// Pre-header retry loop.
+	off, length := k.Range()
+
+	body, err := c.fetchWithRetry(ctx, k, off, length)
+	if err != nil {
+		f.err = err
+		return
+	}
+	defer body.Close() //nolint:errcheck // origin body close best-effort
+
+	buf := &bytes.Buffer{}
+	if _, err := io.Copy(buf, body); err != nil {
+		f.err = fmt.Errorf("fill copy: %w", err)
+		return
+	}
+
+	f.bodyBuf = buf
+
+	// Atomic commit to CacheStore.
+	commitErr := c.cs.PutChunk(ctx, k, int64(buf.Len()), bytes.NewReader(buf.Bytes()))
+	if commitErr == nil {
+		if recErr := c.cat.Record(k, cachestore.Info{Size: int64(buf.Len()), Committed: time.Now()}); recErr != nil {
+			slog.Default().Warn("chunkcatalog record failed",
+				"chunk", k.String(), "err", recErr)
+		}
+	} else if errors.Is(commitErr, cachestore.ErrCommitLost) {
+		// Another replica won; treat existing CacheStore entry as truth.
+		if info, err := c.cs.Stat(ctx, k); err == nil {
+			if recErr := c.cat.Record(k, info); recErr != nil {
+				slog.Default().Warn("chunkcatalog record failed",
+					"chunk", k.String(), "err", recErr)
+			}
+		}
+	} else {
+		slog.Default().Warn("commit-after-serve failed",
+			"chunk", k.String(), "err", commitErr)
+		// Don't record in catalog; next request refills.
+	}
+}
+
+func (c *Coordinator) fetchWithRetry(ctx context.Context, k chunk.Key, off, length int64) (io.ReadCloser, error) {
+	deadline := time.Now().Add(c.cfg.Origin.Retry.MaxTotalDuration)
+	backoff := c.cfg.Origin.Retry.BackoffInitial
+
+	var lastErr error
+
+	for attempt := 1; attempt <= c.cfg.Origin.Retry.Attempts; attempt++ {
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("origin retry exhausted (duration); last err: %w", lastErr)
+		}
+
+		body, err := c.or.GetRange(ctx, k.Bucket, k.ObjectKey, k.ETag, off, length)
+		if err == nil {
+			return body, nil
+		}
+
+		lastErr = err
+		// Non-retryable: ETag changed.
+		var etagChanged *origin.OriginETagChangedError
+		if errors.As(err, &etagChanged) {
+			c.mc.Invalidate(c.cfg.Origin.ID, k.Bucket, k.ObjectKey)
+			return nil, err
+		}
+		// Non-retryable: not found.
+		if errors.Is(err, origin.ErrNotFound) {
+			return nil, err
+		}
+		// Backoff.
+		if attempt < c.cfg.Origin.Retry.Attempts {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(backoff):
+			}
+
+			backoff *= 2
+			if backoff > c.cfg.Origin.Retry.BackoffMax {
+				backoff = c.cfg.Origin.Retry.BackoffMax
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("origin retry exhausted (attempts); last err: %w", lastErr)
+}

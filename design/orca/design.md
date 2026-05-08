@@ -1,4 +1,4 @@
-# OriginCache - Design (mechanism & flow)
+# Orca - Origin Cache - Design (mechanism & flow)
 
 Status: draft for review (round 2 incorporating reviewer feedback)
 Owner: TBD
@@ -79,10 +79,10 @@ Sections list above.
 
 Edge devices inside an on-prem datacenter need read access to large files
 held in cloud blob storage (S3, Azure Blob). Direct egress per device is
-unacceptable (cost, latency, throughput, security boundary). OriginCache is
+unacceptable (cost, latency, throughput, security boundary). Orca is
 a read-only caching layer, deployed inside each datacenter, that fronts
 cloud blob storage with an S3-compatible API. Clients issue range reads;
-OriginCache serves from a shared in-DC store when present, otherwise
+Orca serves from a shared in-DC store when present, otherwise
 fetches from the cloud origin, stores the chunk, and returns it.
 
 This document describes the mechanism: decisions, components, request flow,
@@ -106,7 +106,7 @@ stampede protection, atomic commit, and horizontal-scale coordination.
 | Prefetch | Sequential read-ahead by default. Configurable depth, capped concurrency. |
 | Cluster | Kubernetes Deployment + headless Service for peer discovery + ClusterIP/LB for client traffic. Rendezvous hashing on pod IP selects the coordinator per `ChunkKey` for miss-fills only; receiving replica is the **assembler** that fans out per-chunk fill RPCs to coordinators (s8.3). All replicas can read all chunks directly from the CacheStore on hits. |
 | Inter-replica auth | Separate internal mTLS listener (default `:8444`) chained to an internal CA distinct from the client mTLS CA; authorization = "presenter source IP is in current peer-IP set" (s8.8). |
-| Local spool | Every fill writes origin bytes through a local spool (`internal/origincache/fetch/spool`) in parallel with streaming to the client; serves as a slow-joiner fallback and as the source for the asynchronous CacheStore commit. The spool is NOT on the client-TTFB path in v1; client bytes flow origin -> client directly (s8.2 / s8.6). |
+| Local spool | Every fill writes origin bytes through a local spool (`internal/orca/fetch/spool`) in parallel with streaming to the client; serves as a slow-joiner fallback and as the source for the asynchronous CacheStore commit. The spool is NOT on the client-TTFB path in v1; client bytes flow origin -> client directly (s8.2 / s8.6). |
 | Atomic commit | `localfs` and `posixfs` stage inside `<root>/.staging/<uuid>` with parent-dir fsync, then `link()` no-clobber (returns `EEXIST` to the loser); `s3` uses direct `PutObject` with `If-None-Match: *`. Each driver runs `SelfTestAtomicCommit` at boot: `s3` proves the backend honors `If-None-Match: *`; `posixfs` proves the backend honors `link()` / `EEXIST` and that directory fsync is durable, and additionally enforces `nfs.minimum_version` (default `4.1`, with opt-in `nfs.allow_v3`) and refuses to start on Alluxio FUSE backends. Cold-path bytes stream directly from origin to client; bounded leader-side **pre-header origin retry** (s8.6) handles transient origin failures invisibly before response headers are committed. The spool tees in parallel for joiners (s8.2) and as the CacheStore-commit source. CacheStore commit happens asynchronously after the response completes; commit-after-serve failure becomes `commit_after_serve_total{result="failed"}` rather than a client error (s8.6). |
 | Versioned buckets on cachestore/s3 | Not supported. The `cachestore/s3` driver requires the bucket to have versioning **disabled**. AWS S3 honors `If-None-Match: *` on both versioned and unversioned buckets, but VAST Cluster (and likely other S3-compatible backends) only honors it on unversioned buckets ([VAST KB][vast-kb-conditional-writes]). The driver enforces this at boot via an explicit `GetBucketVersioning` versioning gate (s10.1.3); refusing to start on enabled or suspended versioning avoids a class of silent atomic-commit failures. |
 | LIST caching | Per-replica TTL'd LIST cache (s6.2 / FW3) in front of `Origin.List`, sized for the FUSE-`ls` workload pattern. Default `list_cache.ttl=60s`, configurable. Cluster-wide LIST coordination is a deferred optimization ([s15.3](#153-cluster-wide-list-coordinator)). |
@@ -123,7 +123,7 @@ stampede protection, atomic commit, and horizontal-scale coordination.
 Terms used throughout this document. Forward-references point at the
 section that defines or implements the full mechanism.
 
-- **Replica** - one running pod of the `origincache` Deployment. All
+- **Replica** - one running pod of the `orca` Deployment. All
   replicas are interchangeable; there is no per-pod state.
 - **Client** - external caller using an S3-compatible HTTP API (e.g.
   `aws-sdk`, `boto3`).
@@ -172,7 +172,7 @@ section that defines or implements the full mechanism.
   therefore stream through the leader rather than waiting for the full
   disk write. Full mechanism in [s8.2](#82-ttfb-tee--spool).
 - **Spool** - bounded local-disk staging area for in-flight fills
-  (`internal/origincache/fetch/spool`). Ensures slow joiners always have a
+  (`internal/orca/fetch/spool`). Ensures slow joiners always have a
   local fallback regardless of CacheStore driver. Detail in
   [s8.2](#82-ttfb-tee--spool).
 - **Atomic CacheStore commit** - the leader publishes the completed chunk
@@ -220,7 +220,7 @@ section that defines or implements the full mechanism.
   (`-t lustre`), and IBM Spectrum Scale / GPFS (`-t gpfs`). Disqualified
   on purpose: Alluxio FUSE (no `link(2)`, no atomic no-overwrite rename,
   no NFS gateway). The driver depends on
-  `internal/origincache/cachestore/internal/posixcommon/` (link-based
+  `internal/orca/cachestore/internal/posixcommon/` (link-based
   commit, dir-fsync, staging-dir helpers, fan-out path layout) which is
   also depended on by `cachestore/localfs`. Detail in
   [s10.1.2](#1012-cachestoreposixfs).
@@ -272,7 +272,7 @@ section that defines or implements the full mechanism.
 
 ## 4. Architecture
 
-A single binary, `origincache`, deployed as a Kubernetes Deployment.
+A single binary, `orca`, deployed as a Kubernetes Deployment.
 Replicas discover each other through a headless Service and refresh the
 peer set on a configurable interval (default 5s). A request from a client
 lands on one replica - the **assembler** - which iterates the requested
@@ -292,7 +292,7 @@ graph TB
     subgraph DC["On-prem datacenter"]
         Clients["Edge clients"]
         Service["Service (ClusterIP / LB)<br/>client traffic"]
-        subgraph Replicas["origincache Deployment"]
+        subgraph Replicas["orca Deployment"]
             R1["Replica 1"]
             R2["Replica 2"]
             R3["Replica N"]
@@ -402,7 +402,7 @@ The chunk loop is a **streaming iterator**: at no point is the full
 a sliding window of `min(prefetch_depth, lastChunk - cid)` ahead of the
 current cursor. A configurable `server.max_response_bytes` cap returns
 `416 Requested Range Not Satisfiable` (with header
-`x-origincache-cap-exceeded: true`) before any cache lookup if the
+`x-orca-cap-exceeded: true`) before any cache lookup if the
 computed response size exceeds the cap.
 
 ### Diagram 2: Range request -> chunk index mapping
@@ -437,7 +437,7 @@ flowchart LR
    `416` if unsatisfiable. Compute `firstChunk` and `lastChunk`. If
    `server.max_response_bytes > 0` and the computed response size exceeds
    it, return `400 RequestSizeExceedsLimit` (S3-style XML error body)
-   with `x-origincache-cap-exceeded: true`. `416` is reserved for true
+   with `x-orca-cap-exceeded: true`. `416` is reserved for true
    Range-vs-object-size violations.
 5. Iterate the chunk range as a streaming iterator. For each `ChunkKey`:
    - **ChunkCatalog hit:** open reader from `CacheStore`. Typed
@@ -477,7 +477,7 @@ flowchart LR
    treats the typed error the same way regardless of backing store.
    Commit-after-serve failure does NOT affect the in-flight client
    response; it increments
-   `origincache_commit_after_serve_total{result="failed"}` and the
+   `orca_commit_after_serve_total{result="failed"}` and the
    chunk is **not** recorded in the `ChunkCatalog` (the next
    request will refill).
 7. **Mid-stream failure**: once any body byte has been written
@@ -486,7 +486,7 @@ flowchart LR
    byte, or any post-commit error) abort the response (HTTP/2
    `RST_STREAM` with `INTERNAL_ERROR`; HTTP/1.1 `Connection: close`
    after the partial write) and increment
-   `origincache_responses_aborted_total{phase="mid_stream",reason}`.
+   `orca_responses_aborted_total{phase="mid_stream",reason}`.
    S3 clients (aws-sdk, boto3, etc.) detect this via
    `Content-Length` mismatch and retry. Mid-stream origin resume
    (re-issue origin GET with `Range: bytes=<offset>-` and continue
@@ -578,7 +578,7 @@ chunk lookup is performed.
 4. Negative cases reuse the GET error mapping (s6.3): `404` is
    negatively cached for `negative_metadata_ttl` (s12); an unsupported azureblob
    blob type (s9) returns `502 OriginUnsupported` with the
-   `x-origincache-reject-reason` header.
+   `x-orca-reject-reason` header.
 
 HEAD does NOT validate `If-Match` / `If-None-Match` / `If-Modified-Since`
 preconditions against the cache state in v1; conditional HEAD is a
@@ -622,7 +622,7 @@ entirely; the response is served to the client but not stored.
 
 0. **Cache lookup**. Compute the cache key from the request
    parameters. On hit, serve the cached `ListResult` directly with
-   header `x-origincache-list-cache-age: <seconds>`. No origin
+   header `x-orca-list-cache-age: <seconds>`. No origin
    call. No singleflight acquisition. `list_cache_hit_total{origin_id,
    result="hit"}++`.
 
@@ -693,7 +693,7 @@ listed inline in s8.3 and are not reproduced here.
 | Status | S3-style code | Reason | Triggered by | Client retry? |
 |---|---|---|---|---|
 | `200 OK` / `206 Partial Content` | (none) | normal hit or successful fill | hit + range OK; cold-path fill after pre-header-retry commit (s8.6) | n/a |
-| `400 RequestSizeExceedsLimit` | `RequestSizeExceedsLimit` | response would exceed `server.max_response_bytes` | range math at request entry; `x-origincache-cap-exceeded: true` | no (different range) |
+| `400 RequestSizeExceedsLimit` | `RequestSizeExceedsLimit` | response would exceed `server.max_response_bytes` | range math at request entry; `x-orca-cap-exceeded: true` | no (different range) |
 | `416 Requested Range Not Satisfiable` | `InvalidRange` | range vs. `ObjectInfo.Size` violation | range math at request entry | no (different range) |
 | `502 Bad Gateway` | `OriginUnreachable` | origin error before commit boundary | `Origin.GetRange` 5xx; origin DNS failure; semaphore exhausted past wait | yes, small backoff |
 | `502 Bad Gateway` | `OriginRetryExhausted` | leader retry budget exhausted (`origin.retry.attempts` or `origin.retry.max_total_duration`) before any byte from origin (s8.6) | sustained transient origin failures during pre-header retry | yes (origin may recover) |
@@ -710,12 +710,12 @@ listed inline in s8.3 and are not reproduced here.
 errors carry an S3-style XML body (`<Error><Code>...<Message>...`).
 Mid-stream aborts terminate the response (`HTTP/2 RST_STREAM(INTERNAL_ERROR)`
 or `HTTP/1.1 Connection: close`) and increment
-`origincache_responses_aborted_total{phase="mid_stream",reason}`.
+`orca_responses_aborted_total{phase="mid_stream",reason}`.
 
 ## 7. Internal interfaces
 
 The mechanism's named seams. Implementations live under
-`internal/origincache/`.
+`internal/orca/`.
 
 ```go
 // Origin: read-only view of upstream blob store. GetRange takes the etag
@@ -798,7 +798,7 @@ type ChunkCatalog interface {
 // peer for a given ChunkKey. self == coordinator means handle locally.
 // InternalDial returns a transport (HTTP/2 over mTLS) for issuing
 // internal RPCs to a non-self peer. ServerName returns the stable SAN
-// (default "origincache.<ns>.svc") used for TLS verification across
+// (default "orca.<ns>.svc") used for TLS verification across
 // rolling restarts and pod-IP churn; per-replica internal-listener certs
 // MUST include this SAN.
 type Cluster interface {
@@ -806,7 +806,7 @@ type Cluster interface {
     Self() Peer
     Peers() []Peer                // current membership snapshot
     InternalDial(ctx context.Context, p Peer) (InternalClient, error)
-    ServerName() string           // e.g. "origincache.<ns>.svc"
+    ServerName() string           // e.g. "orca.<ns>.svc"
 }
 
 // Spool: bounded local-disk staging area for in-flight fills. Every fill
@@ -910,7 +910,7 @@ Implementations:
   specifics per driver. The two POSIX-shaped drivers (`localfs` and
   `posixfs`) share their commit primitives (`link()` no-clobber, dir
   fsync, staging-dir layout, optional fan-out) via
-  `internal/origincache/cachestore/internal/posixcommon/`; this is an
+  `internal/orca/cachestore/internal/posixcommon/`; this is an
   internal-to-cachestore package and is not visible to the rest of the
   cache layer.
 - `ChunkCatalog`: a single in-memory LRU implementation with
@@ -976,7 +976,7 @@ cache layer runs `statfs(2)` against `spool.dir` and refuses to
 start (exit non-zero) if the filesystem magic matches a network FS
 denylist (NFS, SMB / CIFS, CephFS, Lustre, GPFS, FUSE including
 Alluxio FUSE), incrementing
-`origincache_spool_locality_check_total{result="refused"}`.
+`orca_spool_locality_check_total{result="refused"}`.
 Governed by `spool.require_local_fs` (default `true`). The
 rationale is now defense-in-depth: with the v1 streaming design
 the spool no longer gates client TTFB, but joiner-fallback latency
@@ -1087,7 +1087,7 @@ internal RPCs.
 Combined with s8.1, exactly one origin GET per cold chunk per cluster in
 steady state. During membership change we accept up to one duplicate fill
 per chunk (loser drops on commit collision; observable via
-`origincache_origin_duplicate_fills_total{result="commit_lost"}`). The
+`orca_origin_duplicate_fills_total{result="commit_lost"}`). The
 duplicate-fill metric is the leading indicator that this routing is
 working: a sustained non-zero `commit_lost` rate signals chronic
 membership flux or a bug in the hash distribution.
@@ -1201,7 +1201,7 @@ returns `503 Slow Down` to the client so clients back off.
 Joiners on existing fills do not consume slots.
 
 The current saturation is exposed as
-`origincache_origin_inflight{origin}` (per-replica gauge).
+`orca_origin_inflight{origin}` (per-replica gauge).
 Operators can sum across replicas in their monitoring stack to
 observe approach to `target_global`.
 
@@ -1234,7 +1234,7 @@ joiner cancelling unblocks only itself.
   pre-commit, get a `502 Bad Gateway`). The next request triggers a
   fresh `Head` and a new `ChunkKey` with the new ETag. Old chunks under
   the old ETag age out via the CacheStore lifecycle. Increments
-  `origincache_origin_etag_changed_total`.
+  `orca_origin_etag_changed_total`.
 - **Hard 404 / unsupported blob type**: cached in the metadata cache as
   a negative entry for `negative_metadata_ttl` (default 60s,
   configurable). Per-replica HEAD singleflight (s8.7) caps origin HEAD
@@ -1265,9 +1265,9 @@ joiner cancelling unblocks only itself.
   old ETag is the bug we are preventing); the leader returns
   `502 OriginETagChanged` immediately. Joiners sit through retries
   on the same `Fill`. Outcomes are exposed as
-  `origincache_origin_retry_total{result="success|exhausted_attempts|exhausted_duration|etag_changed"}`
+  `orca_origin_retry_total{result="success|exhausted_attempts|exhausted_duration|etag_changed"}`
   (one increment per request that entered the retry loop) and
-  `origincache_origin_retry_attempts` (histogram of attempt count
+  `orca_origin_retry_attempts` (histogram of attempt count
   per request).
 
   The retry budget defaults are intentionally smaller than typical
@@ -1276,7 +1276,7 @@ joiner cancelling unblocks only itself.
 - **`CommitFailedAfterServe`**: the CacheStore commit happens
   asynchronously after the client response is complete (s8.2). A
   failure here is NOT visible to the client. The leader increments
-  `origincache_commit_after_serve_total{result="failed"}` and
+  `orca_commit_after_serve_total{result="failed"}` and
   does NOT call `ChunkCatalog.Record`. Joiners on the same fill
   that are still draining the Spool finish normally; the next
   request for the same `ChunkKey` re-runs the fill (one extra
@@ -1331,7 +1331,7 @@ from the client edge.
   internal CA is **distinct** from the client mTLS CA so a leaked client
   cert cannot be used to dial the internal listener. The cert MUST
   include the stable SAN `cluster.internal_tls.server_name` (default
-  `origincache.<ns>.svc`); pod-IP SANs are NOT used because pod IPs
+  `orca.<ns>.svc`); pod-IP SANs are NOT used because pod IPs
   change on rolling restart.
 - **Client auth**: peer presents a client cert chained to the internal CA
   AND the peer's source IP must be in the current peer-IP set
@@ -1349,29 +1349,29 @@ from the client edge.
   bytes, and the coordinator is doing the same fill it would do
   for a local request.
 - **NetworkPolicy**: ingress on `:8444` allowed only from pods with
-  label `app=origincache` in the same namespace.
+  label `app=orca` in the same namespace.
 - **Loop prevention**: receiver enforces `X-Origincache-Internal: 1` ->
   self must be coordinator for the requested `ChunkKey`, else
   `409 Conflict`.
 
-Metrics: `origincache_cluster_internal_fill_requests_total{direction=
+Metrics: `orca_cluster_internal_fill_requests_total{direction=
 "sent|received|conflict"}`,
-`origincache_cluster_internal_fill_duration_seconds`.
+`orca_cluster_internal_fill_duration_seconds`.
 
 ## 9. Azure adapter: Block Blob only
 
 Hardened constraint.
 
-- Enforced in `internal/origincache/origin/azureblob.Head`. Block type is
+- Enforced in `internal/orca/origin/azureblob.Head`. Block type is
   immutable on an existing blob (you have to delete and recreate to change
   it, which produces a new ETag), so checking once per `(container, blob,
   etag)` is sufficient.
 - Detection via `Get Blob Properties` -> `BlobType` field. Reject anything
   other than `BlockBlob` with a typed error `UnsupportedBlobTypeError`
-  exported from `internal/origincache/origin`.
+  exported from `internal/orca/origin`.
 - Surfaced to clients as HTTP `502 Bad Gateway` with S3 error code
   `OriginUnsupported`, body containing reason, plus
-  `x-origincache-reject-reason: azure-blob-type=<type>` header.
+  `x-orca-reject-reason: azure-blob-type=<type>` header.
 - Negatively cached in the metadata cache for `negative_metadata_ttl`
   (default 60s; see [s12](#12-create-after-404-and-negative-cache-lifecycle))
   and
@@ -1385,7 +1385,7 @@ Hardened constraint.
   the underlying Get Blob; `412 Precondition Failed` is translated to
   `OriginETagChangedError` (s8.6).
 - Prometheus counter:
-  `origincache_origin_rejected_total{origin="azureblob",reason="non_block_blob",blob_type=...}`.
+  `orca_origin_rejected_total{origin="azureblob",reason="non_block_blob",blob_type=...}`.
 
 ### Diagram 8: Scenario F - Azure non-BlockBlob rejection
 
@@ -1399,7 +1399,7 @@ flowchart TD
     Type -- "BlockBlob" --> CacheOk["metadata cache:<br/>BlockBlob<br/>(default TTL)"]
     Type -- "PageBlob | AppendBlob" --> CacheReject["metadata cache:<br/>UnsupportedBlobTypeError<br/>(rejection_ttl)<br/>+ rejected_total++"]
     CacheOk --> OkPath
-    CacheReject --> Reject2["502 OriginUnsupported<br/>x-origincache-reject-reason:<br/>azure-blob-type=type"]
+    CacheReject --> Reject2["502 OriginUnsupported<br/>x-orca-reject-reason:<br/>azure-blob-type=type"]
     LR["ListObjectsV2<br/>(list_mode=filter)"] --> Filter["skip non-BlockBlob entries,<br/>preserve continuation tokens"]
 ```
 
@@ -1413,19 +1413,19 @@ without overwriting the winner. Cold-path commit happens
 asynchronously **after** the client response is complete (s8.2 / s6
 step 6), so a commit failure here does NOT affect the
 in-flight client response; it only increments
-`origincache_commit_after_serve_total{result="failed"}` and skips
+`orca_commit_after_serve_total{result="failed"}` and skips
 `ChunkCatalog.Record` (next request refills).
 
 Three drivers ship in v1, mapped onto two equivalent atomic-commit
 primitives. `localfs` and `posixfs` both use POSIX `link()` (or
 `renameat2(RENAME_NOREPLACE)` on Linux) returning `EEXIST` to the
 loser, and share their helpers via
-`internal/origincache/cachestore/internal/posixcommon/`. `s3` uses
+`internal/orca/cachestore/internal/posixcommon/`. `s3` uses
 `PutObject + If-None-Match: *` returning `412` to the loser. All three
 drivers run `SelfTestAtomicCommit` at boot.
 
 Commit outcomes are recorded as label values on the metric
-`origincache_origin_duplicate_fills_total{result="commit_won|commit_lost"}`
+`orca_origin_duplicate_fills_total{result="commit_won|commit_lost"}`
 (s8.3). Throughout this section "increment commit_won" / "increment
 commit_lost" is shorthand for "increment that counter with the
 matching label value".
@@ -1456,7 +1456,7 @@ matching label value".
    `cachestore.localfs.staging_max_age` (default 1h), with a
    `fsync(<root>/.staging/)` after the batch. Nothing breaks if a
    staging file lingers briefly. Each sweep increments
-   `origincache_localfs_dir_fsync_total{result}`.
+   `orca_localfs_dir_fsync_total{result}`.
 
 #### 10.1.2 cachestore/posixfs
 
@@ -1470,14 +1470,14 @@ exactly one wins.
 1. Backend selection and detection. At boot the driver inspects the
    filesystem under `<root>` via `statfs(2)` (`f_type`) and
    `/proc/mounts` and emits an info gauge
-   `origincache_posixfs_backend{type,version,major,minor}` (e.g.
+   `orca_posixfs_backend{type,version,major,minor}` (e.g.
    `type="nfs",version="4.1"`, `type="wekafs"`, `type="ceph"`,
    `type="lustre"`, `type="gpfs"`). Operators MAY override the detected
    `type` via `cachestore.posixfs.backend_type` for backends with
    ambiguous magic numbers; the override is logged loudly. Detected
    `type="fuse"` triggers an extra check: if `/proc/mounts` source
    matches `alluxio` (case-insensitive), the driver increments
-   `origincache_posixfs_alluxio_refusal_total` and exits non-zero with
+   `orca_posixfs_alluxio_refusal_total` and exits non-zero with
    `cachestore/posixfs: Alluxio FUSE is unsupported (no link(2), no
    atomic no-overwrite rename, no NFS gateway); use cachestore.driver:
    s3 against the Alluxio S3 gateway instead`.
@@ -1487,7 +1487,7 @@ exactly one wins.
    (default `4.1`), the driver refuses to start. NFSv3 is opt-in only
    via `cachestore.posixfs.nfs.allow_v3: true`, which logs a loud
    warning and increments
-   `origincache_posixfs_nfs_v3_optin_total`. Rationale: NFSv3 has weak
+   `orca_posixfs_nfs_v3_optin_total`. Rationale: NFSv3 has weak
    retransmit semantics; NFSv4.0 has atomic CREATE EXCLUSIVE but no
    session idempotency; NFSv4.1+ provides session-based idempotency
    that makes `link()` / `EEXIST` safe under client retries.
@@ -1514,7 +1514,7 @@ exactly one wins.
    directory fsync; refusing to start`. Governed by
    `cachestore.posixfs.require_atomic_link_self_test` (default `true`;
    never disabled in production). On success, the driver records
-   `origincache_posixfs_selftest_last_success_timestamp`.
+   `orca_posixfs_selftest_last_success_timestamp`.
 6. NFS export hardening. `posixfs` documents (and the operator runbook
    enforces) that NFS exports MUST use `sync` (not `async`); an `async`
    export weakens the dir-fsync guarantee that the commit primitive
@@ -1555,7 +1555,7 @@ exactly one wins.
    Disable bucket versioning to use cachestore/s3.` Governed by
    `cachestore.s3.require_unversioned_bucket` (default `true`;
    never disabled in production). The gate emits
-   `origincache_s3_versioning_check_total{result="ok|refused"}` once
+   `orca_s3_versioning_check_total{result="ok|refused"}` once
    per boot.
 
 [vast-kb-conditional-writes]: https://kb.vastdata.com/documentation/docs/s3-conditional-writes
@@ -1599,8 +1599,8 @@ short-circuits CacheStore writes with `ErrTransient`; reads still attempt
 once per `open_duration / 10` for liveness probing) -> **half-open**
 (allows up to `half_open_probes` test calls; on all-success returns to
 closed; on any failure returns to open). Transitions are exposed as
-`origincache_cachestore_breaker_transitions_total{from,to}` and the
-current state as `origincache_cachestore_breaker_state` (0=closed,
+`orca_cachestore_breaker_transitions_total{from,to}` and the
+current state as `orca_cachestore_breaker_state` (0=closed,
 1=open, 2=half_open).
 
 **Access-frequency tracking on `Lookup`.** Per FW8 (s13.2), each
@@ -1632,7 +1632,7 @@ degraded backend.
   object-size violations.
 - `server.max_response_bytes` overflow returns
   `400 RequestSizeExceedsLimit` (S3-style XML error body) with
-  `x-origincache-cap-exceeded: true` (s6). It is reported as `400` and
+  `x-orca-cap-exceeded: true` (s6). It is reported as `400` and
   not `416` because the cap is a server policy, not a property of the
   object: clients cannot fix it by re-requesting a different Range past
   EOF.
@@ -1714,14 +1714,14 @@ accepted, governed by `spool.require_local_fs` (default `true`):
    - `FUSE_SUPER_MAGIC` (`0x65735546`) - any FUSE mount, including
      Alluxio FUSE.
 4. On match: increment
-   `origincache_spool_locality_check_total{result="refused",fs_type="<name>"}`,
+   `orca_spool_locality_check_total{result="refused",fs_type="<name>"}`,
    log `spool: <spool.dir> is on a network filesystem (<name>);
    joiner-fallback latency would be unbounded. Refusing to start.
    Set spool.dir to a local-NVMe-backed path or, for unusual
    placements (e.g., RAM-disk), set spool.require_local_fs=false`,
    and exit non-zero.
 5. On no match: increment
-   `origincache_spool_locality_check_total{result="ok",fs_type="<name>"}`
+   `orca_spool_locality_check_total{result="ok",fs_type="<name>"}`
    and proceed.
 
 **Relaxation**. `spool.require_local_fs: false` allows operators
@@ -1735,8 +1735,8 @@ clean ones, and the boot log carries a loud `WARN
 spool.require_local_fs is disabled; joiner-fallback latency is
 best-effort` line.
 
-The check is in `internal/origincache/fetch/spool/` and runs from
-`cmd/origincache/origincache/main.go` before the HTTP listener binds.
+The check is in `internal/orca/fetch/spool/` and runs from
+`cmd/orca/orca/main.go` before the HTTP listener binds.
 It runs before any CacheStore self-test so a misconfigured spool
 fails fast even on backends that would otherwise pass their own
 self-test.
@@ -1797,7 +1797,7 @@ restricted to the `/internal/fill` per-chunk fill RPC.
 
 ## 11. Bounded staleness contract
 
-OriginCache trusts an **operator contract** for correctness, and bounds
+Orca trusts an **operator contract** for correctness, and bounds
 the consequences of contract violation by configuration.
 
 ### 11.1 The contract and the staleness window
@@ -1835,7 +1835,7 @@ correct ETag on first contact with the cache.
 overwrite, the origin returns `412 Precondition Failed` and the leader
 fails the fill, invalidates the metadata cache entry for
 `{origin_id, bucket, key}`, and increments
-`origincache_origin_etag_changed_total`. This catches the narrow window
+`orca_origin_etag_changed_total`. This catches the narrow window
 where a violation happens between the cache's `Head` and its `GetRange`.
 It does NOT catch a violation that happens between two complete
 request lifecycles within the same `metadata_ttl` window; the
@@ -2037,12 +2037,12 @@ to trip on. The TTL is the only bound.
 Negative-cache metrics let operators observe drain progress after
 an upload:
 
-- `origincache_metadata_negative_entries` (gauge) - current count
+- `orca_metadata_negative_entries` (gauge) - current count
   of negative entries.
-- `origincache_metadata_negative_hit_total{origin_id}` (counter) -
+- `orca_metadata_negative_hit_total{origin_id}` (counter) -
   returns served from a negative entry. A spike after a known
   upload signals ongoing drain.
-- `origincache_metadata_negative_age_seconds{origin_id}`
+- `orca_metadata_negative_age_seconds{origin_id}`
   (histogram) - age of negative entries at hit time. Use
   upper-bound percentiles to size `negative_metadata_ttl`.
 
@@ -2105,7 +2105,7 @@ Eviction is delegated to the CacheStore's storage system in the
 default v1 configuration. Recommended baseline is age-based
 expiration on the chunk prefix with a TTL chosen to fit the
 deployment's working set in the available capacity. Operators tune
-the TTL based on `origincache_origin_bytes_total` and capacity
+the TTL based on `orca_origin_bytes_total` and capacity
 utilization metrics exposed by the CacheStore. Because the
 on-store path is namespaced by `origin_id` (s5), per-origin
 lifecycle policies can be configured independently on the same
@@ -2235,12 +2235,12 @@ should consider one of:
   not in v1).
 
 **Metrics for detecting undersizing**:
-- `origincache_chunk_catalog_hit_rate` (derived from `_hit_total`):
+- `orca_chunk_catalog_hit_rate` (derived from `_hit_total`):
   sustained < 0.7 suggests undersizing.
-- `origincache_chunk_catalog_evict_total{reason="size"}`: high
+- `orca_chunk_catalog_evict_total{reason="size"}`: high
   rate means LRU eviction is fighting the access-frequency policy;
   catalog is too small.
-- `origincache_chunk_catalog_entries`: pinned at `max_entries`
+- `orca_chunk_catalog_entries`: pinned at `max_entries`
   may indicate undersizing.
 
 ### 13.4 Spool capacity
@@ -2312,8 +2312,8 @@ subsequent successful DNS refresh re-introduces peers without
 process restart.
 
 DNS-refresh outcomes are exposed as
-`origincache_cluster_dns_refresh_total{result="ok|fail|empty"}` and
-the current peer-set size as `origincache_cluster_peers` (gauge).
+`orca_cluster_dns_refresh_total{result="ok|fail|empty"}` and
+the current peer-set size as `orca_cluster_peers` (gauge).
 Boot-time failure is logged at WARN; sustained empty-peer state is
 trivially observable from the gauge. The `/readyz` predicate
 (s10.5) requires that **at least one** DNS refresh has succeeded
@@ -2390,11 +2390,11 @@ measurably monopolizing TTFB or driving disproportionate origin
 load past internal mechanisms.
 
 **Sketch (if built)**: Token bucket per identity in
-`internal/origincache/server/edgelimit/`; refill rate per identity
+`internal/orca/server/edgelimit/`; refill rate per identity
 configurable; per-replica enforcement (no cluster-wide
 coordination); returns `429 Too Many Requests` with
 `Retry-After: 1s`. New metric
-`origincache_edge_ratelimit_total{identity,result}`.
+`orca_edge_ratelimit_total{identity,result}`.
 
 **Known v1 limitation**: documented gap. Multi-tenant deployments
 worried about single-client monopolization should layer rate
@@ -2517,7 +2517,7 @@ the requested chunk's range; bounded by a separate
 through the leader's tee transparently see the gap closed. The
 spool tee continues unaffected; the resumed bytes flow through
 the same ring buffer + spool. New metric:
-`origincache_origin_resume_total{result="success|exhausted|error"}`.
+`orca_origin_resume_total{result="success|exhausted|error"}`.
 
 **Known v1 bound**: post-commit origin failures abort the client
 response; client SDK retries from scratch
@@ -2562,7 +2562,7 @@ flagged the cumulative complexity as not earning its keep.
 
 - **Election**: standard `client-go/tools/leaderelection` against
   a single `coordination.k8s.io/v1.Lease` resource named e.g.
-  `origincache-limiter` in the deployment's namespace. RBAC:
+  `orca-limiter` in the deployment's namespace. RBAC:
   `get / list / watch / create / update / patch` on the named
   Lease, scoped to the deployment's namespace. Steady-state K8s
   API load: ~6-30 writes/min/deployment (the elected leader
@@ -2608,18 +2608,18 @@ flagged the cumulative complexity as not earning its keep.
   no Lease object created. Useful for deployments without RBAC
   for the Lease resource, or for isolated debugging.
 
-- **New metrics**: `origincache_limiter_state{role="authority|peer|fallback"}`,
-  `origincache_limiter_target_global`,
-  `origincache_limiter_slots_available` (authority-only),
-  `origincache_limiter_slots_granted` (authority-only),
-  `origincache_limiter_slots_local` (per-peer),
-  `origincache_limiter_acquire_total{result}`,
-  `origincache_limiter_acquire_duration_seconds`,
-  `origincache_limiter_extend_total{result}`,
-  `origincache_limiter_release_total`,
-  `origincache_limiter_election_total{result}`,
-  `origincache_limiter_lease_expired_total`,
-  `origincache_limiter_fallback_active`.
+- **New metrics**: `orca_limiter_state{role="authority|peer|fallback"}`,
+  `orca_limiter_target_global`,
+  `orca_limiter_slots_available` (authority-only),
+  `orca_limiter_slots_granted` (authority-only),
+  `orca_limiter_slots_local` (per-peer),
+  `orca_limiter_acquire_total{result}`,
+  `orca_limiter_acquire_duration_seconds`,
+  `orca_limiter_extend_total{result}`,
+  `orca_limiter_release_total`,
+  `orca_limiter_election_total{result}`,
+  `orca_limiter_lease_expired_total`,
+  `orca_limiter_fallback_active`.
 
 - **New interfaces in s7**: `Limiter` (`Acquire(ctx) (Slot, error)`,
   `State() LimiterState`); `Slot` (`Release()`); `LimiterToken`
@@ -2679,7 +2679,7 @@ design has too many moving parts.
 
 **Sketch (if built)**:
 
-- `internal/origincache/origin/semaphore.go`: resizable semaphore
+- `internal/orca/origin/semaphore.go`: resizable semaphore
   wrapper with `Acquire(ctx)`, `Release()`, `SetCapacity(n)`.
 - `Cluster` interface gains a peer-change notification surface
   (channel or callback).

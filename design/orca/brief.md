@@ -1,4 +1,4 @@
-# OriginCache - Architecture Brief
+# Orca - Origin Cache - Architecture Brief
 
 A short brief intended for technical leads who need to understand the
 shape of the system, the load-bearing decisions, and what is in v1
@@ -16,7 +16,7 @@ filesystems where edge clients perform interactive `ls` and
 directory navigation. Naive direct access stampedes origin egress
 and cost.
 
-OriginCache is a read-only S3-compatible HTTP cache deployed inside
+Orca is a read-only S3-compatible HTTP cache deployed inside
 the on-prem datacenter as a multi-replica Kubernetes Deployment
 fronting AWS S3 and Azure Blob. It serves chunked, ETag-keyed bytes
 out of a shared in-DC backing store, dedupes concurrent fills both
@@ -65,7 +65,7 @@ graph TB
     subgraph DC["On-prem datacenter"]
         Clients["Edge clients"]
         Service["Service (ClusterIP / LB)<br/>client traffic"]
-        subgraph Replicas["origincache Deployment"]
+        subgraph Replicas["orca Deployment"]
             R1["Replica 1"]
             R2["Replica 2"]
             R3["Replica N"]

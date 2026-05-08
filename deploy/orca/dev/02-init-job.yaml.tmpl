@@ -1,0 +1,80 @@
+---
+# Init Job: creates the cachestore + origin S3 buckets in LocalStack so
+# that Orca can pass the versioningGate boot check and so that reviewers
+# have an origin bucket to seed sample objects into. Idempotent:
+# CreateBucket returns BucketAlreadyOwnedByYou on rerun, swallowed by
+# the script.
+#
+# Cachestore bucket: versioning left unset (which is what
+# require_unversioned_bucket=true expects).
+# Origin bucket: no versioning constraint; sample objects live here.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: orca-buckets-init
+  namespace: {{ default "unbounded-kube" .Namespace }}
+  labels:
+    app.kubernetes.io/name: orca
+    app.kubernetes.io/part-of: orca-dev
+spec:
+  backoffLimit: 6
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: orca
+        app.kubernetes.io/part-of: orca-dev
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: aws-cli
+          image: {{ default "amazon/aws-cli:latest" .AwsCliImage | quote }}
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              value: test
+            - name: AWS_SECRET_ACCESS_KEY
+              value: test
+            - name: AWS_DEFAULT_REGION
+              value: us-east-1
+            - name: CACHESTORE_BUCKET
+              value: {{ default "orca-cache" .CachestoreBucket | quote }}
+            - name: ORIGIN_BUCKET
+              value: {{ default "orca-origin" .OriginBucket | quote }}
+            - name: ENDPOINT
+              value: http://localstack.{{ default "unbounded-kube" .Namespace }}.svc.cluster.local:4566
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              echo "Waiting for LocalStack at $ENDPOINT ..."
+              for i in $(seq 1 60); do
+                if aws --endpoint-url "$ENDPOINT" s3api list-buckets >/dev/null 2>&1; then
+                  echo "LocalStack ready."
+                  break
+                fi
+                sleep 2
+              done
+
+              ensure_bucket() {
+                bucket="$1"
+                echo "Ensuring bucket $bucket (idempotent) ..."
+                if aws --endpoint-url "$ENDPOINT" s3api head-bucket --bucket "$bucket" >/dev/null 2>&1; then
+                  echo "Bucket $bucket already exists."
+                else
+                  aws --endpoint-url "$ENDPOINT" s3api create-bucket --bucket "$bucket"
+                  echo "Bucket $bucket created."
+                fi
+              }
+
+              ensure_bucket "$CACHESTORE_BUCKET"
+              ensure_bucket "$ORIGIN_BUCKET"
+
+              # Verify cachestore bucket versioning is unset (Orca's
+              # versioningGate rejects Enabled or Suspended).
+              status=$(aws --endpoint-url "$ENDPOINT" s3api get-bucket-versioning --bucket "$CACHESTORE_BUCKET" --query Status --output text 2>/dev/null || echo "None")
+              echo "Cachestore bucket versioning: $status (None means unset, which is required)."
+              if [ "$status" = "Enabled" ] || [ "$status" = "Suspended" ]; then
+                echo "ERROR: cachestore bucket versioning is $status; Orca requires unset/None."
+                exit 1
+              fi
+              echo "Init complete."
