@@ -8,6 +8,7 @@ on:
     paths:
       - cmd/agent/**
       - cmd/kubectl-unbounded/**
+      - internal/cloudprovider/**
       - pkg/agent/**
       - internal/provision/**
       - internal/kube/**
@@ -26,6 +27,7 @@ on:
     paths:
       - cmd/agent/**
       - cmd/kubectl-unbounded/**
+      - internal/cloudprovider/**
       - pkg/agent/**
       - internal/provision/**
       - internal/kube/**

@@ -22,6 +22,9 @@ common:
 controller:
   informerResyncPeriod: 30s
   healthPort: 9080
+  managedKubeProxy:
+    enabled: false
+    image: registry.example/kube-proxy:v1
 node:
   nodeName: node-a
   wireGuardPort: 51820
@@ -42,6 +45,14 @@ node:
 
 	if cfg.Controller.HealthPort == nil || *cfg.Controller.HealthPort != 9080 {
 		t.Fatalf("unexpected controller.healthPort: %#v", cfg.Controller.HealthPort)
+	}
+
+	if cfg.Controller.ManagedKubeProxy.Enabled == nil || *cfg.Controller.ManagedKubeProxy.Enabled {
+		t.Fatalf("unexpected controller.managedKubeProxy.enabled: %#v", cfg.Controller.ManagedKubeProxy.Enabled)
+	}
+
+	if cfg.Controller.ManagedKubeProxy.Image != "registry.example/kube-proxy:v1" {
+		t.Fatalf("unexpected controller.managedKubeProxy.image: %q", cfg.Controller.ManagedKubeProxy.Image)
 	}
 
 	if cfg.Node.NodeName != "node-a" {

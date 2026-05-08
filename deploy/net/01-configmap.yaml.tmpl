@@ -24,6 +24,9 @@ data:
       statusWsKeepaliveFailureCount: {{ default "3" .ControllerStatusWsKeepaliveFailureCount }}
       registerAggregatedAPIServer: {{ default "true" .ControllerRegisterAggregatedAPIServer }}
       kubeProxyHealthInterval: "{{ default "30s" .ControllerKubeProxyHealthInterval }}"
+      managedKubeProxy:
+        enabled: {{ default "true" .ControllerManagedKubeProxyEnabled }}
+        image: "{{ default "" .ControllerManagedKubeProxyImage }}"
       leaderElection:
         enabled: {{ default "true" .ControllerLeaderElectionEnabled }}
         leaseDuration: "{{ default "30s" .ControllerLeaderElectionLeaseDuration }}"
