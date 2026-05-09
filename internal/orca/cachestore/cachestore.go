@@ -4,8 +4,10 @@
 // Package cachestore defines the in-DC chunk store interface and shared
 // types. Concrete drivers live under cachestore/<driver>/.
 //
-// See design/orca/design.md s7 for the full interface and s10.1 for the
-// atomic-commit contract.
+// All drivers must implement atomic commit (CAS-style PutChunk that
+// rejects overwrites) so concurrent fills across replicas converge
+// without clobbering each other; SelfTestAtomicCommit is run at boot
+// to verify the backend honors the precondition.
 package cachestore
 
 import (
@@ -19,7 +21,7 @@ import (
 
 // CacheStore is where chunk bytes physically live. Source of truth for
 // chunk presence; backed by an in-DC S3-like store in production and
-// LocalStack in dev (Scope A+B).
+// LocalStack in dev.
 type CacheStore interface {
 	GetChunk(ctx context.Context, k chunk.Key, off, n int64) (io.ReadCloser, error)
 	PutChunk(ctx context.Context, k chunk.Key, size int64, r io.Reader) error

@@ -12,7 +12,7 @@ import (
 // produce the same path and that meaningful input differences
 // (OriginID, Bucket, ObjectKey, ETag, ChunkSize, Index) produce
 // distinct paths. The path encoding is part of orca's design
-// contract (design.md s5).
+// contract: any change here invalidates previously cached chunks.
 func TestKey_Path_Deterministic(t *testing.T) {
 	t.Parallel()
 

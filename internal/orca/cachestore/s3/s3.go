@@ -10,8 +10,6 @@
 // backend honors the precondition; the boot versioning gate verifies
 // the bucket is not versioned (since If-None-Match is not honored on
 // versioned buckets).
-//
-// See design/orca/design.md s10.1.3.
 package s3
 
 import (
@@ -108,7 +106,9 @@ func New(ctx context.Context, cfg Config) (*Driver, error) {
 }
 
 // versioningGate refuses to start if the bucket has versioning enabled
-// or suspended. design.md s10.1.3.
+// or suspended. If-None-Match: * is not honored against versioned
+// buckets, which would silently break atomic commit's no-clobber
+// guarantee.
 func (d *Driver) versioningGate(ctx context.Context) error {
 	out, err := d.client.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{
 		Bucket: aws.String(d.bucket),

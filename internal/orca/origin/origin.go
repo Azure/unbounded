@@ -3,8 +3,6 @@
 
 // Package origin defines the upstream-blob-store interface and shared
 // types. Concrete adapters live under origin/<driver>/.
-//
-// See design/orca/design.md s7 for the full interface.
 package origin
 
 import (
@@ -77,7 +75,7 @@ func (e *OriginETagChangedError) Error() string {
 }
 
 // UnsupportedBlobTypeError is returned by azureblob.Head when the
-// target is a Page or Append blob (design.md s9).
+// target is a Page or Append blob. Orca only serves Block Blobs.
 type UnsupportedBlobTypeError struct {
 	Bucket   string
 	Key      string

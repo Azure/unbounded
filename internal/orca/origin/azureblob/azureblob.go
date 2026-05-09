@@ -2,7 +2,8 @@
 // Licensed under the MIT License.
 
 // Package azureblob is the Azure Blob Storage adapter for the Origin
-// interface. Block Blobs only (design.md s9).
+// interface. Block Blobs only; PageBlob and AppendBlob are rejected
+// at Head() with UnsupportedBlobTypeError.
 package azureblob
 
 import (

@@ -3,9 +3,6 @@
 
 // Package chunk implements the chunk model: ChunkKey, deterministic
 // path encoding, and the range -> chunk-index iterator.
-//
-// See design/orca/design.md s5 for the full chunk model spec. This
-// implementation is a faithful subset.
 package chunk
 
 import (
@@ -18,7 +15,7 @@ import (
 
 // Key is the immutable identifier for a chunk.
 //
-// Path encoding (design.md s5):
+// Path encoding:
 //
 //	LP(s)   = LE64(uint64(len(s))) || s
 //	hashKey = sha256(

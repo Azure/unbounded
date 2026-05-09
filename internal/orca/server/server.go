@@ -140,8 +140,9 @@ func (h *EdgeHandler) handleGet(w http.ResponseWriter, r *http.Request, bucket, 
 	chunkSize := h.cfg.Chunking.Size
 	firstChunk, lastChunk := chunk.IndexRange(rangeStart, rangeEnd, chunkSize, info.Size)
 
-	// Set headers eagerly (Option D commit boundary == first byte from
-	// origin; for cache hit, immediate).
+	// Set headers eagerly. The response headers are committed when the
+	// first byte from the origin arrives (or immediately, for a cache
+	// hit); thereafter any failure becomes a mid-stream abort.
 	setObjectHeaders(w, info)
 	w.Header().Set("Content-Length", strconv.FormatInt(rangeEnd-rangeStart+1, 10))
 

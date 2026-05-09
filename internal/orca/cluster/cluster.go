@@ -10,8 +10,7 @@
 // peer set.
 //
 // Coordinator selection: rendezvous hashing on (peer_ip, ChunkKey)
-// picks one coordinator per chunk across the cluster. See
-// design.md s8.3.
+// picks one coordinator per chunk across the cluster.
 //
 // Internal RPC: each replica runs an HTTP/2 client to dial peers'
 // internal listeners (mTLS in production, plain in dev). The

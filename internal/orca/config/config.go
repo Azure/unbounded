@@ -4,10 +4,9 @@
 // Package config defines Orca's YAML configuration shape and loading
 // helpers.
 //
-// Only the subset of design.md s5 needed for the prototype (Scope A+B)
-// is represented here. The schema is intentionally a subset: extending
-// it later is a matter of adding fields and keeping zero-values
-// backward-compatible.
+// The schema is an intentional subset of the full Orca configuration
+// surface; extending it later is a matter of adding fields and keeping
+// zero-values backward-compatible.
 package config
 
 import (
@@ -208,7 +207,9 @@ func (c *Config) applyDefaults() {
 	}
 
 	if !c.Origin.Azureblob.EnforceBlockBlobOnly {
-		// design.md s9 states this is locked-true.
+		// EnforceBlockBlobOnly is locked true: orca only serves Block
+		// Blobs because PageBlob/AppendBlob semantics don't fit the
+		// chunked, immutable cache model.
 		c.Origin.Azureblob.EnforceBlockBlobOnly = true
 	}
 	// Cachestore.
@@ -352,9 +353,10 @@ func (c *Config) validate() error {
 	return nil
 }
 
-// TargetPerReplica returns the per-replica origin concurrency cap derived
-// from origin.target_global and cluster.target_replicas
-// (design.md s8.4).
+// TargetPerReplica returns the per-replica origin concurrency cap
+// derived from origin.target_global divided by cluster.target_replicas.
+// This bounds the number of concurrent in-flight origin requests this
+// replica will issue.
 func (c *Config) TargetPerReplica() int {
 	if c.Cluster.TargetReplicas <= 0 {
 		return c.Origin.TargetGlobal

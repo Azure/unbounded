@@ -2,13 +2,18 @@
 // Licensed under the MIT License.
 
 // Package fetch is the per-replica fill orchestrator: per-ChunkKey
-// singleflight, pre-header origin retry (Option D), per-replica origin
+// singleflight, pre-header origin retry, per-replica origin
 // concurrency cap, and cross-replica fill via the cluster's internal
-// RPC (s8.3).
+// RPC.
 //
-// Scope A+B per the design: per-replica singleflight + cluster-wide
-// dedup via rendezvous-hashed coordinator. No disk spool; joiner
-// streams from the leader's in-memory ring buffer.
+// The dedup model is per-replica singleflight + cluster-wide dedup
+// via a rendezvous-hashed coordinator. No disk spool; joiners stream
+// from the leader's in-memory ring buffer.
+//
+// Pre-header retry: the coordinator may retry origin GETs up to the
+// budget in cfg.Origin.Retry until the first byte is committed to
+// the client response. Once headers are sent retries are not safe and
+// failures become mid-stream aborts.
 package fetch
 
 import (
@@ -39,10 +44,12 @@ type Coordinator struct {
 	mc  *metadata.Cache
 	cfg *config.Config
 
-	// Per-replica origin concurrency cap (s8.4 simplified).
+	// Per-replica origin concurrency cap. Bounds in-flight
+	// Origin.GetRange calls to floor(target_global / target_replicas).
 	originSem chan struct{}
 
-	// Per-ChunkKey singleflight (s8.1).
+	// Per-ChunkKey singleflight. Concurrent local fills for the same
+	// chunk collapse to one origin GetRange.
 	mu       sync.Mutex
 	inflight map[string]*fill
 }

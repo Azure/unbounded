@@ -7,9 +7,9 @@
 //   - bounded TTL'd cache of ObjectInfo keyed on (origin_id, bucket,
 //     key)
 //   - separate negative-TTL handling for 404 / unsupported-blob-type
-//     entries (design.md s12)
-//   - per-replica HEAD singleflight (s8.7) so concurrent misses
-//     collapse to one Origin.Head
+//     entries
+//   - per-replica HEAD singleflight so concurrent misses collapse to
+//     one Origin.Head
 package metadata
 
 import (

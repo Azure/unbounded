@@ -8,9 +8,10 @@ package inttest
 // Pinned container image tags. Bump centrally when upgrading.
 const (
 	// localstackImage is the LocalStack image used for both the origin
-	// (awss3) and cachestore (s3) backends. 3.8 matches the version
-	// referenced in design.md and the dev harness's awareness of the
-	// CRC64NVME checksum quirk.
+	// (awss3) and cachestore (s3) backends. Pinned to 3.8 because
+	// later LocalStack tags require the AWS SDK CRC64NVME checksum
+	// opt-out (which the cachestore/s3 driver and this harness's S3
+	// client builder both apply).
 	localstackImage = "localstack/localstack:3.8"
 
 	// azuriteImage is the Azurite (Azure Blob emulator) image. We pin
