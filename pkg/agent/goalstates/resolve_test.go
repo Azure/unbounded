@@ -5,6 +5,7 @@ package goalstates
 
 import (
 	"log/slog"
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -204,8 +205,11 @@ func TestResolveMachine_BackfillsConfigNodeName(t *testing.T) {
 
 	got, err := ResolveMachine(discardLogger(), cfg, "kube1", nil)
 	require.NoError(t, err)
+	hostname, err := os.Hostname()
+	require.NoError(t, err)
 
 	assert.Equal(t, "configured-node", cfg.NodeName)
+	assert.Equal(t, hostname, got.RootFS.Hostname)
 	assert.Equal(t, "configured-node", got.NodeStart.NodeName)
 	assert.Equal(t, "kube1", got.NodeStart.MachineName)
 	assert.Equal(t, "machine-1", got.NodeStart.KubeMachineName)
