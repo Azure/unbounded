@@ -560,5 +560,96 @@ golangci-lint, go test) plus `make orca-inttest`. For T2.1
 verification gate that LocalStack 3.8 returns HTTP 412 on
 If-None-Match conflict (rather than the legacy `InvalidArgument`
 code we previously matched).
+
+---
+
+## Observability: structured debug logging
+
+Before this pass orca had roughly 20 log call sites across the
+codebase, all at Warn or Info level, and 5 of 8 packages had no
+logger at all. Debug-level tracing was effectively impossible: the
+boot-time level was hardcoded to LevelInfo, and there were no Debug
+emissions to enable even if it weren't.
+
+### What landed
+
+- **`cfg.Logging.Level`** (commit "Add cfg.Logging.Level + ORCA_LOG_LEVEL
+  override + AddSource"): YAML knob (`logging.level`) with values
+  `debug` / `info` / `warn` / `error`. Default `info`. The
+  `ORCA_LOG_LEVEL` environment variable overrides the YAML setting
+  at process start; unknown values from either source surface as a
+  parse error at config validation time. Uses `slog.LevelVar` so a
+  future runtime-tunable path (signal- or endpoint-driven) can plug
+  in without touching the handler.
+- **`HandlerOptions.AddSource: true`** on the production JSON
+  handler so every emission carries `source: {file, line, function}`.
+  Replaces per-package `log.With("package", ...)` tagging; operators
+  filter by source location instead.
+- **`*slog.Logger` injection** into every previously logger-less
+  package: `metadata`, `chunkcatalog`, `cluster` (via a `WithLogger`
+  functional option), `cachestore/s3`, `origin/awss3`,
+  `origin/azureblob`. All accept nil and fall back to
+  `slog.Default()`.
+- **Debug-level emissions** at every chunk-resolution decision point
+  in `fetch.Coordinator`, every catalog operation in `chunkcatalog`,
+  every cache-hit path in `metadata`, every backend operation in
+  `cachestore/s3`, every origin call in `awss3` and `azureblob`,
+  request entry/exit in `server` (both Edge and Internal), and
+  per-cycle / per-transition emissions in `cluster.refresh`,
+  `Coordinator`, and `FillFromPeer`.
+- **`slog.LogAttrs` everywhere** (not the convenience form) so
+  attribute evaluation is zero-cost when the configured level
+  filters the emission out. Critical for the chunkcatalog.Lookup
+  hot path where a single client request can trigger dozens of
+  lookups.
+- **Cross-package attribute taxonomy**: every chunk-related emission
+  uses a `slog.Group("chunk", ...)` carrying `origin_id`, `bucket`,
+  `key`, `index`. Operators can filter on `chunk.bucket=foo` across
+  fetch, chunkcatalog, cachestore, and the server handlers with a
+  single grep.
+- **Existing Warn / Info callsites migrated to LogAttrs** alongside
+  the new emissions so the codebase shares one consistent shape.
+- **Sensitive-data audit**: account keys, access keys, signed URLs,
+  and full ETags never appear in logs. The new `origin.ETagShort`
+  helper truncates entity-tags to the first 8 characters at every
+  call site where they are emitted. Object keys and bucket names
+  are logged in full because they are part of the operator's
+  diagnostic context.
+
+### Operator workflow
+
+```yaml
+# configmap
+logging:
+  level: debug
+```
+
+or, without re-rendering the configmap:
+
+```sh
+kubectl set env deployment/orca ORCA_LOG_LEVEL=debug
+kubectl rollout restart deployment/orca
+```
+
+Then filter the structured JSON output via, for example:
+
+```sh
+kubectl logs -l app=orca --tail=-1 | jq 'select(.chunk.bucket=="my-bucket")'
+kubectl logs -l app=orca --tail=-1 | jq 'select(.source.file | endswith("fetch.go"))'
+```
+
+### Deferred (future work)
+
+- **Per-request correlation IDs**: deliberately deferred. Threading
+  a request-scoped logger through every fetch coordinator method
+  requires ctx propagation work and touches many call sites. The
+  shared `chunk` attribute group plus AddSource provides workable
+  cross-request correlation in the meantime.
+- **Prometheus metrics**: still deferred from the prior pass; debug
+  tracing is the operator's diagnostic surface, metrics will arrive
+  separately.
+- **Runtime log-level switching**: the `slog.LevelVar` foundation is
+  in place; a SIGUSR1 handler or `/loglevel` admin endpoint can
+  plug in without touching the handler.
 </content>
 </invoke>
