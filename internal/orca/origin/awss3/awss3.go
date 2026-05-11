@@ -20,6 +20,7 @@ import (
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -254,12 +255,10 @@ func isNotFound(err error) bool {
 		return true
 	}
 
-	var apiErr smithy.APIError
-	if errors.As(err, &apiErr) {
-		switch apiErr.ErrorCode() {
-		case "NoSuchKey", "NotFound", "404":
-			return true
-		}
+	var respErr *awshttp.ResponseError
+	if errors.As(err, &respErr) && respErr.Response != nil &&
+		respErr.Response.StatusCode == http.StatusNotFound {
+		return true
 	}
 
 	return false
@@ -274,18 +273,29 @@ func isAuth(err error) bool {
 		}
 	}
 
-	return false
-}
-
-func isPreconditionFailed(err error) bool {
-	var apiErr smithy.APIError
-	if errors.As(err, &apiErr) {
-		switch apiErr.ErrorCode() {
-		case "PreconditionFailed", "ConditionalRequestConflict":
+	var respErr *awshttp.ResponseError
+	if errors.As(err, &respErr) && respErr.Response != nil {
+		status := respErr.Response.StatusCode
+		if status == http.StatusUnauthorized || status == http.StatusForbidden {
 			return true
 		}
 	}
 
-	return strings.Contains(err.Error(), "PreconditionFailed") ||
-		strings.Contains(err.Error(), "412")
+	return false
+}
+
+// isPreconditionFailed reports whether err carries an HTTP 412
+// Precondition Failed response. Used to translate
+// If-Match-rejected GetRange calls into the orca-internal
+// OriginETagChangedError. We rely on the HTTP status code on the
+// underlying *awshttp.ResponseError rather than service error
+// codes; the status code is part of the stable wire contract
+// across SDK and backend versions.
+func isPreconditionFailed(err error) bool {
+	var respErr *awshttp.ResponseError
+	if errors.As(err, &respErr) && respErr.Response != nil {
+		return respErr.Response.StatusCode == http.StatusPreconditionFailed
+	}
+
+	return false
 }
