@@ -20,9 +20,9 @@ import (
 // starting an nspawn machine. Callers use RootFS for the rootfs provisioning
 // phases and NodeStart for the service configuration and boot phases.
 type MachineGoalState struct {
-	NodeName  string
-	RootFS    *RootFS
-	NodeStart *NodeStart
+	NodeIdentity *NodeIdentity
+	RootFS       *RootFS
+	NodeStart    *NodeStart
 }
 
 // ResolveMachine probes the host (kernel version, hostname, GPU hardware) and
@@ -34,9 +34,9 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 		return nil, fmt.Errorf("get host kernel: %w", err)
 	}
 
-	nodeName, err := ResolveHostNodeName(cfg.MachineName)
+	nodeIdentity, err := ResolveNodeIdentity(cfg, machineName)
 	if err != nil {
-		return nil, fmt.Errorf("resolve node name: %w", err)
+		return nil, fmt.Errorf("resolve node identity: %w", err)
 	}
 
 	nvidia, err := ResolveNvidiaHost(runtime.GOARCH)
@@ -79,7 +79,7 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 		),
 		HostArch:          runtime.GOARCH,
 		HostKernel:        kernel,
-		NodeName:          nodeName,
+		NodeName:          nodeIdentity.NodeName,
 		ContainerdVersion: containerdVersion,
 		RunCVersion:       runcVersion,
 		CNIPluginVersion:  cniVersion,
@@ -91,9 +91,9 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 	}
 
 	nodeStart := &NodeStart{
-		MachineName:     machineName,
-		KubeMachineName: cfg.MachineName,
-		NodeName:        nodeName,
+		MachineName:     nodeIdentity.MachineName,
+		KubeMachineName: nodeIdentity.KubeMachineName,
+		NodeName:        nodeIdentity.NodeName,
 		MachineDir:      filepath.Join("/var/lib/machines", machineName),
 		Containerd:      ResolveContainerd(),
 		Kubelet:         kubelet,
@@ -101,9 +101,9 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 	}
 
 	return &MachineGoalState{
-		NodeName:  nodeName,
-		RootFS:    rootFS,
-		NodeStart: nodeStart,
+		NodeIdentity: nodeIdentity,
+		RootFS:       rootFS,
+		NodeStart:    nodeStart,
 	}, nil
 }
 

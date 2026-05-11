@@ -47,9 +47,9 @@ func run(ctx context.Context, log *slog.Logger, newClient kubeClientFunc, nodeOp
 		"applied_version", active.Config.Cluster.Version,
 	)
 
-	gs, err := goalstates.ResolveMachine(log, active.Config, active.Name, nil)
+	nodeIdentity, err := goalstates.ResolveNodeIdentity(active.Config, active.Name)
 	if err != nil {
-		return fmt.Errorf("resolve active machine goal state: %w", err)
+		return fmt.Errorf("resolve active machine node identity: %w", err)
 	}
 
 	// Build Kubernetes clients from the applied config.
@@ -78,7 +78,7 @@ func run(ctx context.Context, log *slog.Logger, newClient kubeClientFunc, nodeOp
 		log.Warn("failed to publish and clear AgentUpgrade daemon signals", "error", err)
 	}
 
-	return runController(ctx, log, restCfg, active.Config.MachineName, gs.NodeName, nodeOperator)
+	return runController(ctx, log, restCfg, active.Config.MachineName, nodeIdentity.NodeName, nodeOperator)
 }
 
 // buildRESTConfig builds a Kubernetes REST config from the applied agent
