@@ -62,10 +62,12 @@ type fill struct {
 }
 
 // NewCoordinator wires up the fetch coordinator. The log is used for
-// peer-fallback warnings and commit-after-serve failure traces; the
-// caller (usually app.Start) injects the app-wide slog.Logger so
-// fetch-path logs are unified with the rest of the runtime's output.
-// Passing nil falls back to slog.Default().
+// peer-fallback warnings and commit-after-serve failure traces, plus
+// debug-level tracing through every chunk-resolution decision point
+// when the operator enables logging.level: debug. The caller (usually
+// app.Start) injects the app-wide slog.Logger so fetch-path logs are
+// unified with the rest of the runtime's output. Passing nil falls
+// back to slog.Default().
 func NewCoordinator(
 	or origin.Origin,
 	cs cachestore.CacheStore,
@@ -102,6 +104,12 @@ func (c *Coordinator) Origin() origin.Origin { return c.or }
 
 // HeadObject returns object metadata, satisfying client HEAD requests.
 func (c *Coordinator) HeadObject(ctx context.Context, bucket, key string) (origin.ObjectInfo, error) {
+	c.log.LogAttrs(ctx, slog.LevelDebug, "head_object",
+		slog.String("origin_id", c.cfg.Origin.ID),
+		slog.String("bucket", bucket),
+		slog.String("key", key),
+	)
+
 	return c.mc.LookupOrFetch(ctx, c.cfg.Origin.ID, bucket, key,
 		func(ctx context.Context) (origin.ObjectInfo, error) {
 			return c.or.Head(ctx, bucket, key)
@@ -123,6 +131,12 @@ func (c *Coordinator) HeadObject(ctx context.Context, bucket, key string) (origi
 //     stream from peer's response. On 409 Conflict, fall back to local
 //     fill.
 func (c *Coordinator) GetChunk(ctx context.Context, k chunk.Key, objectSize int64) (io.ReadCloser, error) {
+	c.log.LogAttrs(ctx, slog.LevelDebug, "get_chunk",
+		chunkAttrs(k),
+		slog.Int64("object_size", objectSize),
+		slog.Int64("expected_len", k.ExpectedLen(objectSize)),
+	)
+
 	if rc, hit, err := c.lookupOrStat(ctx, k, objectSize); err != nil {
 		return nil, err
 	} else if hit {
@@ -131,19 +145,41 @@ func (c *Coordinator) GetChunk(ctx context.Context, k chunk.Key, objectSize int6
 
 	// Cluster-wide dedup: route to coordinator.
 	coord := c.cl.Coordinator(k)
+
+	c.log.LogAttrs(ctx, slog.LevelDebug, "coordinator_selected",
+		chunkAttrs(k),
+		slog.String("coord_ip", coord.IP),
+		slog.Bool("is_self", coord.Self),
+	)
+
 	if !coord.Self {
+		c.log.LogAttrs(ctx, slog.LevelDebug, "peer_fill_attempt",
+			chunkAttrs(k),
+			slog.String("peer_ip", coord.IP),
+		)
+
 		rc, err := c.cl.FillFromPeer(ctx, coord, k, objectSize)
 		if err == nil {
+			c.log.LogAttrs(ctx, slog.LevelDebug, "peer_fill_success",
+				chunkAttrs(k),
+				slog.String("peer_ip", coord.IP),
+			)
+
 			return rc, nil
 		}
 
 		if errors.Is(err, cluster.ErrPeerNotCoordinator) {
-			c.log.Warn("peer reported not-coordinator; falling back to local fill",
-				"chunk", k.String(), "peer", coord.IP)
+			c.log.LogAttrs(ctx, slog.LevelWarn, "peer reported not-coordinator; falling back to local fill",
+				chunkAttrs(k),
+				slog.String("peer_ip", coord.IP),
+			)
 			// fall through to local fill
 		} else {
-			c.log.Warn("internal-fill RPC failed; falling back to local fill",
-				"chunk", k.String(), "peer", coord.IP, "err", err)
+			c.log.LogAttrs(ctx, slog.LevelWarn, "internal-fill RPC failed; falling back to local fill",
+				chunkAttrs(k),
+				slog.String("peer_ip", coord.IP),
+				slog.Any("err", err),
+			)
 		}
 	}
 
@@ -155,6 +191,11 @@ func (c *Coordinator) GetChunk(ctx context.Context, k chunk.Key, objectSize int6
 // The receiver becomes the leader for this fill (or joins an in-flight
 // fill for the same key). Returns a streaming body of the entire chunk.
 func (c *Coordinator) FillForPeer(ctx context.Context, k chunk.Key, objectSize int64) (io.ReadCloser, error) {
+	c.log.LogAttrs(ctx, slog.LevelDebug, "fill_for_peer",
+		chunkAttrs(k),
+		slog.Int64("object_size", objectSize),
+	)
+
 	if rc, hit, err := c.lookupOrStat(ctx, k, objectSize); err != nil {
 		return nil, err
 	} else if hit {
@@ -177,12 +218,19 @@ func (c *Coordinator) lookupOrStat(ctx context.Context, k chunk.Key, objectSize 
 	expected := k.ExpectedLen(objectSize)
 
 	if _, ok := c.cat.Lookup(k); ok {
+		c.log.LogAttrs(ctx, slog.LevelDebug, "catalog_hit",
+			chunkAttrs(k),
+		)
+
 		rc, err := c.cs.GetChunk(ctx, k, 0, expected)
 		if err == nil {
 			return rc, true, nil
 		}
 
 		if errors.Is(err, cachestore.ErrNotFound) {
+			c.log.LogAttrs(ctx, slog.LevelDebug, "catalog_stale_forgotten",
+				chunkAttrs(k),
+			)
 			c.cat.Forget(k)
 			// fall through to stat
 		} else {
@@ -193,11 +241,20 @@ func (c *Coordinator) lookupOrStat(ctx context.Context, k chunk.Key, objectSize 
 	info, err := c.cs.Stat(ctx, k)
 	if err != nil {
 		if errors.Is(err, cachestore.ErrNotFound) {
+			c.log.LogAttrs(ctx, slog.LevelDebug, "cachestore_stat_miss",
+				chunkAttrs(k),
+			)
+
 			return nil, false, nil
 		}
 
 		return nil, false, err
 	}
+
+	c.log.LogAttrs(ctx, slog.LevelDebug, "cachestore_stat_hit",
+		chunkAttrs(k),
+		slog.Int64("size", info.Size),
+	)
 
 	c.cat.Record(k, info)
 
@@ -230,9 +287,16 @@ func (c *Coordinator) fillLocal(ctx context.Context, k chunk.Key, objectSize int
 		c.inflight[path] = f
 		c.mu.Unlock()
 
+		c.log.LogAttrs(ctx, slog.LevelDebug, "fill_local_lead",
+			chunkAttrs(k),
+		)
+
 		go c.runFill(k, objectSize, f)
 	} else {
 		c.mu.Unlock()
+		c.log.LogAttrs(ctx, slog.LevelDebug, "fill_local_join",
+			chunkAttrs(k),
+		)
 	}
 
 	select {
@@ -281,6 +345,11 @@ func (c *Coordinator) runFill(k chunk.Key, objectSize int64, f *fill) {
 
 	defer func() { <-c.originSem }()
 
+	c.log.LogAttrs(ctx, slog.LevelDebug, "origin_slot_acquired",
+		chunkAttrs(k),
+		slog.Int("slot_cap", cap(c.originSem)),
+	)
+
 	// expectedLen is the authoritative number of bytes we should
 	// receive from origin: ChunkSize for non-tail chunks, the
 	// remainder for the tail. We request at most expectedLen and
@@ -310,6 +379,12 @@ func (c *Coordinator) runFill(k chunk.Key, objectSize int64, f *fill) {
 		return
 	}
 
+	c.log.LogAttrs(ctx, slog.LevelDebug, "origin_body_received",
+		chunkAttrs(k),
+		slog.Int("bytes", buf.Len()),
+		slog.Int64("expected_len", expectedLen),
+	)
+
 	if expectedLen > 0 && int64(buf.Len()) != expectedLen {
 		f.err = fmt.Errorf("origin returned %d bytes, expected %d (chunk=%s)",
 			buf.Len(), expectedLen, k.String())
@@ -321,16 +396,28 @@ func (c *Coordinator) runFill(k chunk.Key, objectSize int64, f *fill) {
 
 	// Atomic commit to CacheStore.
 	commitErr := c.cs.PutChunk(ctx, k, int64(buf.Len()), bytes.NewReader(buf.Bytes()))
-	if commitErr == nil {
+
+	switch {
+	case commitErr == nil:
 		c.cat.Record(k, cachestore.Info{Size: int64(buf.Len()), Committed: time.Now()})
-	} else if errors.Is(commitErr, cachestore.ErrCommitLost) {
+		c.log.LogAttrs(ctx, slog.LevelDebug, "commit_success",
+			chunkAttrs(k),
+			slog.Int("bytes", buf.Len()),
+		)
+	case errors.Is(commitErr, cachestore.ErrCommitLost):
 		// Another replica won; treat existing CacheStore entry as truth.
+		c.log.LogAttrs(ctx, slog.LevelDebug, "commit_lost",
+			chunkAttrs(k),
+		)
+
 		if info, err := c.cs.Stat(ctx, k); err == nil {
 			c.cat.Record(k, info)
 		}
-	} else {
-		c.log.Warn("commit-after-serve failed",
-			"chunk", k.String(), "err", commitErr)
+	default:
+		c.log.LogAttrs(ctx, slog.LevelWarn, "commit-after-serve failed",
+			chunkAttrs(k),
+			slog.Any("err", commitErr),
+		)
 		// Don't record in catalog; next request refills.
 	}
 }
@@ -350,8 +437,20 @@ func (c *Coordinator) fetchWithRetry(ctx context.Context, k chunk.Key, off, leng
 			return nil, fmt.Errorf("origin retry exhausted (duration); last err: %w", lastErr)
 		}
 
+		c.log.LogAttrs(ctx, slog.LevelDebug, "origin_get_range_attempt",
+			chunkAttrs(k),
+			slog.Int("attempt", attempt),
+			slog.Int64("off", off),
+			slog.Int64("length", length),
+		)
+
 		body, err := c.or.GetRange(ctx, k.Bucket, k.ObjectKey, k.ETag, off, length)
 		if err == nil {
+			c.log.LogAttrs(ctx, slog.LevelDebug, "origin_get_range_ok",
+				chunkAttrs(k),
+				slog.Int("attempt", attempt),
+			)
+
 			return body, nil
 		}
 
@@ -359,13 +458,30 @@ func (c *Coordinator) fetchWithRetry(ctx context.Context, k chunk.Key, off, leng
 		// Non-retryable: ETag changed.
 		var etagChanged *origin.OriginETagChangedError
 		if errors.As(err, &etagChanged) {
+			c.log.LogAttrs(ctx, slog.LevelDebug, "origin_etag_changed",
+				chunkAttrs(k),
+				slog.Int("attempt", attempt),
+			)
 			c.mc.Invalidate(c.cfg.Origin.ID, k.Bucket, k.ObjectKey)
+
 			return nil, err
 		}
 		// Non-retryable: not found.
 		if errors.Is(err, origin.ErrNotFound) {
+			c.log.LogAttrs(ctx, slog.LevelDebug, "origin_not_found",
+				chunkAttrs(k),
+				slog.Int("attempt", attempt),
+			)
+
 			return nil, err
 		}
+
+		c.log.LogAttrs(ctx, slog.LevelDebug, "origin_retryable_error",
+			chunkAttrs(k),
+			slog.Int("attempt", attempt),
+			slog.Any("err", err),
+			slog.Duration("next_backoff", backoff),
+		)
 		// Backoff.
 		if attempt < c.cfg.Origin.Retry.Attempts {
 			select {
@@ -382,4 +498,18 @@ func (c *Coordinator) fetchWithRetry(ctx context.Context, k chunk.Key, off, leng
 	}
 
 	return nil, fmt.Errorf("origin retry exhausted (attempts); last err: %w", lastErr)
+}
+
+// chunkAttrs returns a slog.Attr group identifying the chunk by its
+// (origin, bucket, key, index) tuple. Used at every fetch-path log
+// callsite for consistent grep / filter syntax across emissions.
+// ETag is intentionally not surfaced here - log it via slog.String
+// where needed using the chunk.Key's truncated String() form.
+func chunkAttrs(k chunk.Key) slog.Attr {
+	return slog.Group("chunk",
+		slog.String("origin_id", k.OriginID),
+		slog.String("bucket", k.Bucket),
+		slog.String("key", k.ObjectKey),
+		slog.Int64("index", k.Index),
+	)
 }
