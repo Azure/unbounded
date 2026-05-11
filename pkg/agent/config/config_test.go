@@ -5,7 +5,11 @@ package config
 
 import (
 	"encoding/json"
+	"os"
+	"strings"
 	"testing"
+
+	"k8s.io/apimachinery/pkg/util/validation"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -159,7 +163,6 @@ func TestAgentConfig_BackfillNodeName(t *testing.T) {
 	tests := []struct {
 		name        string
 		nodeName    string
-		hostname    string
 		machineName string
 		want        string
 		wantErr     string
@@ -167,53 +170,20 @@ func TestAgentConfig_BackfillNodeName(t *testing.T) {
 		{
 			name:        "config override",
 			nodeName:    "configured-node",
-			hostname:    "worker-1",
 			machineName: "machine-1",
 			want:        "configured-node",
 		},
 		{
 			name:        "trimmed config override",
 			nodeName:    " configured-node ",
-			hostname:    "worker-1",
 			machineName: "machine-1",
 			want:        "configured-node",
 		},
 		{
 			name:        "invalid config override errors",
 			nodeName:    "Configured_Node",
-			hostname:    "worker-1",
 			machineName: "machine-1",
 			wantErr:     "node name override",
-		},
-		{
-			name:        "hostname",
-			hostname:    "worker-1",
-			machineName: "machine-1",
-			want:        "worker-1",
-		},
-		{
-			name:        "trimmed hostname",
-			hostname:    " worker-1 ",
-			machineName: "machine-1",
-			want:        "worker-1",
-		},
-		{
-			name:        "empty hostname falls back",
-			hostname:    "",
-			machineName: "machine-1",
-			want:        "machine-1",
-		},
-		{
-			name:        "invalid hostname falls back",
-			hostname:    "WORKER_1",
-			machineName: "machine-1",
-			want:        "machine-1",
-		},
-		{
-			name:        "invalid fallback errors",
-			hostname:    "WORKER_1",
-			machineName: "Machine_1",
-			wantErr:     "not a valid Kubernetes node name",
 		},
 	}
 
@@ -226,7 +196,7 @@ func TestAgentConfig_BackfillNodeName(t *testing.T) {
 				NodeName:    tt.nodeName,
 			}
 
-			err := cfg.BackfillNodeName(tt.hostname)
+			err := cfg.BackfillNodeName()
 			if tt.wantErr != "" {
 				require.ErrorContains(t, err, tt.wantErr)
 				return
@@ -236,4 +206,22 @@ func TestAgentConfig_BackfillNodeName(t *testing.T) {
 			assert.Equal(t, tt.want, cfg.NodeName)
 		})
 	}
+}
+
+func TestAgentConfig_BackfillNodeName_UsesHostHostname(t *testing.T) {
+	t.Parallel()
+
+	cfg := &AgentConfig{MachineName: "machine-1"}
+
+	err := cfg.BackfillNodeName()
+	require.NoError(t, err)
+
+	hostname, err := os.Hostname()
+	require.NoError(t, err)
+
+	want := "machine-1"
+	if nodeName := strings.TrimSpace(hostname); len(validation.IsDNS1123Subdomain(nodeName)) == 0 {
+		want = nodeName
+	}
+	assert.Equal(t, want, cfg.NodeName)
 }

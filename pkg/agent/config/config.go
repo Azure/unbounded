@@ -17,6 +17,7 @@ package config
 import (
 	"fmt"
 	"maps"
+	"os"
 	"slices"
 	"strings"
 
@@ -50,9 +51,9 @@ type AgentConfig struct {
 // BackfillNodeName resolves and stores the Kubernetes Node name once. An
 // explicit NodeName wins when set. Otherwise, a valid host hostname wins, then
 // MachineName is used as the final fallback.
-func (a *AgentConfig) BackfillNodeName(hostname string) error {
+func (a *AgentConfig) BackfillNodeName() error {
 	if nodeName := strings.TrimSpace(a.NodeName); nodeName != "" {
-		if len(validation.IsDNS1123Subdomain(nodeName)) == 0 {
+		if isValidNodeName(nodeName) {
 			a.NodeName = nodeName
 			return nil
 		}
@@ -60,18 +61,46 @@ func (a *AgentConfig) BackfillNodeName(hostname string) error {
 		return fmt.Errorf("node name override %q is not a valid Kubernetes node name", nodeName)
 	}
 
-	if nodeName := strings.TrimSpace(hostname); len(validation.IsDNS1123Subdomain(nodeName)) == 0 {
-		a.NodeName = nodeName
-		return nil
+	hostname, hostnameErr := os.Hostname()
+	if hostnameErr == nil {
+		if nodeName := strings.TrimSpace(hostname); isValidNodeName(nodeName) {
+			a.NodeName = nodeName
+			return nil
+		}
 	}
 
 	nodeName := strings.TrimSpace(a.MachineName)
-	if len(validation.IsDNS1123Subdomain(nodeName)) == 0 {
+	if isValidNodeName(nodeName) {
 		a.NodeName = nodeName
 		return nil
 	}
 
-	return fmt.Errorf("machine name %q is not a valid Kubernetes node name", a.MachineName)
+	machineValidationErr := strings.Join(validation.IsDNS1123Subdomain(nodeName), "; ")
+	if hostnameErr != nil {
+		return fmt.Errorf(
+			"machine name %q is not a valid Kubernetes node name (%s) after host hostname lookup also failed: %w",
+			a.MachineName,
+			machineValidationErr,
+			hostnameErr,
+		)
+	}
+
+	hostname = strings.TrimSpace(hostname)
+	return fmt.Errorf(
+		"machine name %q is not a valid Kubernetes node name (%s) after host hostname %q also failed validation: %s",
+		a.MachineName,
+		machineValidationErr,
+		hostname,
+		strings.Join(validation.IsDNS1123Subdomain(hostname), "; "),
+	)
+}
+
+func isValidNodeName(name string) bool {
+	if name == "" {
+		return false
+	}
+
+	return len(validation.IsDNS1123Subdomain(name)) == 0
 }
 
 // DeepCopy returns a copy of AgentConfig with mutable nested values cloned.
