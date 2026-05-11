@@ -135,6 +135,18 @@ func (c *Cache) LookupOrFetch(
 	fetch func(ctx context.Context) (origin.ObjectInfo, error),
 ) (origin.ObjectInfo, error) {
 	if info, ok, err := c.lookup(originID, bucket, key); ok {
+		hitKind := "positive"
+		if err != nil {
+			hitKind = "negative"
+		}
+
+		c.log.LogAttrs(ctx, slog.LevelDebug, "metadata_hit",
+			slog.String("origin_id", originID),
+			slog.String("bucket", bucket),
+			slog.String("key", key),
+			slog.String("kind", hitKind),
+		)
+
 		return info, err
 	}
 
@@ -151,6 +163,11 @@ func (c *Cache) LookupOrFetch(
 	})
 
 	if first {
+		c.log.LogAttrs(ctx, slog.LevelDebug, "metadata_singleflight_leader",
+			slog.String("origin_id", originID),
+			slog.String("bucket", bucket),
+			slog.String("key", key),
+		)
 		// Delete the singleflight entry before closing done so a new
 		// caller arriving after Delete creates a fresh entry instead
 		// of silently replaying our (possibly transient-error) result.
@@ -168,10 +185,16 @@ func (c *Cache) LookupOrFetch(
 		sfe.info = info
 		sfe.err = err
 
-		c.recordResult(originID, bucket, key, info, err)
+		c.recordResult(ctx, originID, bucket, key, info, err)
 
 		return info, err
 	}
+
+	c.log.LogAttrs(ctx, slog.LevelDebug, "metadata_singleflight_join",
+		slog.String("origin_id", originID),
+		slog.String("bucket", bucket),
+		slog.String("key", key),
+	)
 	// Joiner: wait for the leader.
 	select {
 	case <-ctx.Done():
@@ -192,10 +215,15 @@ func (c *Cache) Invalidate(originID, bucket, key string) {
 	if el, ok := c.idx[k]; ok {
 		c.ll.Remove(el)
 		delete(c.idx, k)
+		c.log.LogAttrs(context.Background(), slog.LevelDebug, "metadata_invalidate",
+			slog.String("origin_id", originID),
+			slog.String("bucket", bucket),
+			slog.String("key", key),
+		)
 	}
 }
 
-func (c *Cache) recordResult(originID, bucket, key string, info origin.ObjectInfo, err error) {
+func (c *Cache) recordResult(ctx context.Context, originID, bucket, key string, info origin.ObjectInfo, err error) {
 	k := mkKey(originID, bucket, key)
 
 	c.mu.Lock()
@@ -203,18 +231,34 @@ func (c *Cache) recordResult(originID, bucket, key string, info origin.ObjectInf
 
 	now := time.Now()
 
-	var e *cacheEntry
+	var (
+		e        *cacheEntry
+		recorded string
+		ttl      time.Duration
+	)
 
 	switch {
 	case err == nil:
 		e = &cacheEntry{key: k, info: info, expiresAt: now.Add(c.cfg.TTL)}
+		recorded = "positive"
+		ttl = c.cfg.TTL
 	case errors.Is(err, origin.ErrNotFound):
 		e = &cacheEntry{key: k, negative: true, negErr: err, expiresAt: now.Add(c.cfg.NegativeTTL)}
+		recorded = "not_found"
+		ttl = c.cfg.NegativeTTL
 	default:
 		var ube *origin.UnsupportedBlobTypeError
 		if errors.As(err, &ube) {
 			e = &cacheEntry{key: k, negative: true, negErr: err, expiresAt: now.Add(c.cfg.NegativeTTL)}
+			recorded = "unsupported_blob_type"
+			ttl = c.cfg.NegativeTTL
 		} else {
+			c.log.LogAttrs(ctx, slog.LevelDebug, "metadata_record_skip_transient",
+				slog.String("origin_id", originID),
+				slog.String("bucket", bucket),
+				slog.String("key", key),
+				slog.Any("err", err),
+			)
 			// Other transient errors not cached.
 			return
 		}
@@ -239,6 +283,14 @@ func (c *Cache) recordResult(originID, bucket, key string, info origin.ObjectInf
 		oldEntry := oldest.Value.(*cacheEntry) //nolint:errcheck // type invariant: list elements are *cacheEntry
 		delete(c.idx, oldEntry.key)
 	}
+
+	c.log.LogAttrs(ctx, slog.LevelDebug, "metadata_record",
+		slog.String("origin_id", originID),
+		slog.String("bucket", bucket),
+		slog.String("key", key),
+		slog.String("kind", recorded),
+		slog.Duration("ttl", ttl),
+	)
 }
 
 // mkKey builds an in-memory cache key from (originID, bucket, key).

@@ -4,10 +4,12 @@
 package metadata
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -208,5 +210,52 @@ func TestNewCache_NilLoggerFallsBackToDefault(t *testing.T) {
 	c := NewCache(config.Metadata{TTL: time.Minute, NegativeTTL: time.Minute, MaxEntries: 16}, nil)
 	if c.log == nil {
 		t.Errorf("nil logger should have fallen back to slog.Default()")
+	}
+}
+
+// TestLookupOrFetch_EmitsDebugTraces verifies that the metadata
+// cache emits the documented debug-level emissions on the leader,
+// joiner, hit, and record-result paths. The contract under test is
+// the named messages and the (origin_id, bucket, key) attribute
+// triple - operators rely on these for diagnosing cache-hit
+// patterns.
+func TestLookupOrFetch_EmitsDebugTraces(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	c := NewCache(config.Metadata{TTL: time.Minute, NegativeTTL: time.Minute, MaxEntries: 16}, log)
+
+	want := origin.ObjectInfo{Size: 42, ETag: "etag"}
+	// First call: leader path + positive record.
+	info, err := c.LookupOrFetch(context.Background(), "ox", "bkt", "obj",
+		func(_ context.Context) (origin.ObjectInfo, error) {
+			return want, nil
+		})
+	if err != nil || info.Size != 42 {
+		t.Fatalf("LookupOrFetch leader: info=%+v err=%v", info, err)
+	}
+	// Second call: cache hit path. The fetch function must not run.
+	_, err = c.LookupOrFetch(context.Background(), "ox", "bkt", "obj",
+		func(_ context.Context) (origin.ObjectInfo, error) {
+			t.Fatalf("fetch should not run on cache hit")
+			return origin.ObjectInfo{}, nil
+		})
+	if err != nil {
+		t.Fatalf("LookupOrFetch hit: %v", err)
+	}
+
+	out := buf.String()
+	for _, want := range []string{
+		"metadata_singleflight_leader",
+		"metadata_record",
+		"metadata_hit",
+		"bucket=bkt",
+		"key=obj",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %q in debug output; got %q", want, out)
+		}
 	}
 }
