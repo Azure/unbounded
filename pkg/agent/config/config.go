@@ -18,7 +18,9 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 
+	"k8s.io/apimachinery/pkg/util/validation"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 )
 
@@ -31,8 +33,8 @@ type AgentConfig struct {
 	// NodeName is the Kubernetes Node name used by kubelet and host-side
 	// daemon watches. During goal-state resolution this field is backfilled
 	// once. Resolution prefers an explicitly configured value, then a valid
-	// host hostname, then MachineName. The resolved value must be a valid
-	// Kubernetes DNS subdomain.
+	// host hostname, then MachineName. Explicit and resolved values must be
+	// valid Kubernetes DNS subdomains.
 	NodeName string             `json:"NodeName,omitempty"`
 	Cluster  AgentClusterConfig `json:"Cluster"`
 	Kubelet  AgentKubeletConfig `json:"Kubelet"`
@@ -43,6 +45,33 @@ type AgentConfig struct {
 	// "ghcr.io/org/repo:tag") used to bootstrap the machine rootfs.
 	// When empty the agent falls back to debootstrap.
 	OCIImage string `json:"OCIImage,omitempty"`
+}
+
+// BackfillNodeName resolves and stores the Kubernetes Node name once. An
+// explicit NodeName wins when set. Otherwise, a valid host hostname wins, then
+// MachineName is used as the final fallback.
+func (a *AgentConfig) BackfillNodeName(hostname string) error {
+	if nodeName := strings.TrimSpace(a.NodeName); nodeName != "" {
+		if len(validation.IsDNS1123Subdomain(nodeName)) == 0 {
+			a.NodeName = nodeName
+			return nil
+		}
+
+		return fmt.Errorf("node name override %q is not a valid Kubernetes node name", nodeName)
+	}
+
+	if nodeName := strings.TrimSpace(hostname); len(validation.IsDNS1123Subdomain(nodeName)) == 0 {
+		a.NodeName = nodeName
+		return nil
+	}
+
+	nodeName := strings.TrimSpace(a.MachineName)
+	if len(validation.IsDNS1123Subdomain(nodeName)) == 0 {
+		a.NodeName = nodeName
+		return nil
+	}
+
+	return fmt.Errorf("machine name %q is not a valid Kubernetes node name", a.MachineName)
 }
 
 // DeepCopy returns a copy of AgentConfig with mutable nested values cloned.

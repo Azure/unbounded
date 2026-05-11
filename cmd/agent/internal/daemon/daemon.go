@@ -46,11 +46,6 @@ func run(ctx context.Context, log *slog.Logger, newClient kubeClientFunc, nodeOp
 		"applied_version", active.Config.Cluster.Version,
 	)
 
-	nodeName := strings.TrimSpace(active.Config.NodeName)
-	if nodeName == "" {
-		return fmt.Errorf("applied config has no node name")
-	}
-
 	// Build Kubernetes clients from the applied config.
 	restCfg, err := buildRESTConfig(active.Config)
 	if err != nil {
@@ -77,7 +72,7 @@ func run(ctx context.Context, log *slog.Logger, newClient kubeClientFunc, nodeOp
 		log.Warn("failed to publish and clear AgentUpgrade daemon signals", "error", err)
 	}
 
-	return runController(ctx, log, restCfg, active.Config.MachineName, nodeName, nodeOperator)
+	return runController(ctx, log, restCfg, active.Config.MachineName, active.Config.NodeName, nodeOperator)
 }
 
 // buildRESTConfig builds a Kubernetes REST config from the applied agent

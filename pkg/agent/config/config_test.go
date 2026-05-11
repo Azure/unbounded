@@ -152,3 +152,88 @@ func TestAgentConfig_DeepCopyNil(t *testing.T) {
 	var original *AgentConfig
 	require.Nil(t, original.DeepCopy())
 }
+
+func TestAgentConfig_BackfillNodeName(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		nodeName    string
+		hostname    string
+		machineName string
+		want        string
+		wantErr     string
+	}{
+		{
+			name:        "config override",
+			nodeName:    "configured-node",
+			hostname:    "worker-1",
+			machineName: "machine-1",
+			want:        "configured-node",
+		},
+		{
+			name:        "trimmed config override",
+			nodeName:    " configured-node ",
+			hostname:    "worker-1",
+			machineName: "machine-1",
+			want:        "configured-node",
+		},
+		{
+			name:        "invalid config override errors",
+			nodeName:    "Configured_Node",
+			hostname:    "worker-1",
+			machineName: "machine-1",
+			wantErr:     "node name override",
+		},
+		{
+			name:        "hostname",
+			hostname:    "worker-1",
+			machineName: "machine-1",
+			want:        "worker-1",
+		},
+		{
+			name:        "trimmed hostname",
+			hostname:    " worker-1 ",
+			machineName: "machine-1",
+			want:        "worker-1",
+		},
+		{
+			name:        "empty hostname falls back",
+			hostname:    "",
+			machineName: "machine-1",
+			want:        "machine-1",
+		},
+		{
+			name:        "invalid hostname falls back",
+			hostname:    "WORKER_1",
+			machineName: "machine-1",
+			want:        "machine-1",
+		},
+		{
+			name:        "invalid fallback errors",
+			hostname:    "WORKER_1",
+			machineName: "Machine_1",
+			wantErr:     "not a valid Kubernetes node name",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := &AgentConfig{
+				MachineName: tt.machineName,
+				NodeName:    tt.nodeName,
+			}
+
+			err := cfg.BackfillNodeName(tt.hostname)
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				return
+			}
+
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, cfg.NodeName)
+		})
+	}
+}

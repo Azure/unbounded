@@ -33,8 +33,17 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 		return nil, fmt.Errorf("get host kernel: %w", err)
 	}
 
-	if err := resolveConfigNodeName(cfg); err != nil {
-		return nil, err
+	hostname, err := os.Hostname()
+	if err != nil {
+		hostname = ""
+	}
+
+	if err := cfg.BackfillNodeName(hostname); err != nil {
+		return nil, fmt.Errorf("resolve node name: %w", err)
+	}
+
+	if hostname == "" {
+		hostname = cfg.NodeName
 	}
 
 	nvidia, err := ResolveNvidiaHost(runtime.GOARCH)
@@ -77,7 +86,7 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 		),
 		HostArch:          runtime.GOARCH,
 		HostKernel:        kernel,
-		HostName:          cfg.NodeName,
+		Hostname:          hostname,
 		ContainerdVersion: containerdVersion,
 		RunCVersion:       runcVersion,
 		CNIPluginVersion:  cniVersion,
