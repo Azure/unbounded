@@ -163,3 +163,23 @@ func TestLookupOrFetch_ConcurrentJoinersCollapse(t *testing.T) {
 		}
 	}
 }
+
+// TestMkKey_PipeCollisionResolved verifies that length-prefixed
+// encoding distinguishes (origin, bucket, key) triples that
+// previously aliased on the pipe-delimited concatenation.
+//
+// Under the old 'origin|bucket|key' shape, S3 object keys legally
+// containing '|' could produce key collisions across distinct
+// triples: ("a|b","c","d") and ("a","b|c","d") rendered to the
+// same string. The length-prefix encoding guarantees uniqueness.
+func TestMkKey_PipeCollisionResolved(t *testing.T) {
+	t.Parallel()
+
+	a := mkKey("a|b", "c", "d")
+	b := mkKey("a", "b|c", "d")
+
+	if a == b {
+		t.Errorf("pipe-delimited collision: mkKey(%q,%q,%q) == mkKey(%q,%q,%q) = %q",
+			"a|b", "c", "d", "a", "b|c", "d", a)
+	}
+}

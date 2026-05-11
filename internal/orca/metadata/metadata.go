@@ -15,7 +15,9 @@ package metadata
 import (
 	"container/list"
 	"context"
+	"encoding/binary"
 	"errors"
+	"strings"
 	"sync"
 	"time"
 
@@ -222,6 +224,30 @@ func (c *Cache) recordResult(originID, bucket, key string, info origin.ObjectInf
 	}
 }
 
+// mkKey builds an in-memory cache key from (originID, bucket, key).
+// The encoding is length-prefixed: each field is written as an
+// 8-byte little-endian length followed by the field bytes. This
+// guarantees that two distinct triples cannot collide on the
+// rendered key. A naive 'origin|bucket|key' concatenation would
+// alias e.g. (origin="a|b", bucket="c", key="d") and
+// (origin="a", bucket="b|c", key="d") because S3 object keys may
+// legally contain '|'. The cache is purely in-memory so this
+// encoding has no on-disk compatibility implications.
 func mkKey(originID, bucket, key string) string {
-	return originID + "|" + bucket + "|" + key
+	var b strings.Builder
+
+	b.Grow(24 + len(originID) + len(bucket) + len(key))
+	writeLP(&b, originID)
+	writeLP(&b, bucket)
+	writeLP(&b, key)
+
+	return b.String()
+}
+
+func writeLP(b *strings.Builder, s string) {
+	var lenBuf [8]byte
+
+	binary.LittleEndian.PutUint64(lenBuf[:], uint64(len(s)))
+	b.Write(lenBuf[:])
+	b.WriteString(s)
 }
