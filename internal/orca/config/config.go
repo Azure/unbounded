@@ -11,7 +11,9 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -26,6 +28,21 @@ type Config struct {
 	ChunkCatalog ChunkCatalog `yaml:"chunk_catalog"`
 	Metadata     Metadata     `yaml:"metadata"`
 	Chunking     Chunking     `yaml:"chunking"`
+	Logging      Logging      `yaml:"logging"`
+}
+
+// Logging governs structured-log output. The level controls slog
+// emission filtering; debug surfaces per-request and per-chunk
+// tracing through the fetch coordinator, metadata cache, chunk
+// catalog, cluster, cachestore, and origin drivers.
+//
+// The ORCA_LOG_LEVEL environment variable, if set and non-empty,
+// overrides the YAML-configured Level at process startup. Useful
+// for one-shot debug sessions without re-rendering the configmap.
+type Logging struct {
+	// Level is one of "debug", "info", "warn", "error". Empty
+	// defaults to "info".
+	Level string `yaml:"level"`
 }
 
 // Server holds the client-edge listener configuration plus the
@@ -298,6 +315,10 @@ func (c *Config) applyDefaults() {
 	if c.Chunking.Size == 0 {
 		c.Chunking.Size = 8 * 1024 * 1024
 	}
+	// Logging.
+	if c.Logging.Level == "" {
+		c.Logging.Level = "info"
+	}
 }
 
 func (c *Config) validate() error {
@@ -358,7 +379,31 @@ func (c *Config) validate() error {
 		return fmt.Errorf("chunking.size %d too small; minimum 1 MiB", c.Chunking.Size)
 	}
 
+	if _, err := ParseLogLevel(c.Logging.Level); err != nil {
+		return err
+	}
+
 	return nil
+}
+
+// ParseLogLevel maps an orca log-level string to slog.Level. Returns
+// an error for unknown values. Empty string is treated as the
+// configured default ("info"). Used both by config.validate at YAML
+// parse time and by the cmd/orca entrypoint to honour the
+// ORCA_LOG_LEVEL environment override.
+func ParseLogLevel(s string) (slog.Level, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "info":
+		return slog.LevelInfo, nil
+	case "debug":
+		return slog.LevelDebug, nil
+	case "warn", "warning":
+		return slog.LevelWarn, nil
+	case "error":
+		return slog.LevelError, nil
+	default:
+		return 0, fmt.Errorf("logging.level %q invalid; expected one of debug, info, warn, error", s)
+	}
 }
 
 // TargetPerReplica returns the per-replica origin concurrency cap

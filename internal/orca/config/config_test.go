@@ -4,6 +4,7 @@
 package config
 
 import (
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -145,6 +146,7 @@ func TestApplyDefaults_FieldDefaults(t *testing.T) {
 		{"metadata.max_entries", c.Metadata.MaxEntries, 10_000},
 		{"chunking.size", c.Chunking.Size, int64(8 * 1024 * 1024)},
 		{"origin.awss3.region", c.Origin.AWSS3.Region, "us-east-1"},
+		{"logging.level", c.Logging.Level, "info"},
 	}
 
 	for _, ch := range checks {
@@ -291,6 +293,77 @@ func TestLoad_Validate(t *testing.T) {
 				t.Errorf("error %q does not contain %q", err.Error(), tt.wantErr)
 			}
 		})
+	}
+}
+
+// TestParseLogLevel covers the orca log-level string -> slog.Level
+// mapping. Both empty and "info" map to LevelInfo so the YAML default
+// path matches the explicit-info path; "warn" and "warning" are
+// accepted equivalently. Unknown values return a descriptive error
+// so misconfiguration is surfaced rather than silently downgrading.
+func TestParseLogLevel(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		in      string
+		want    slog.Level
+		wantErr bool
+	}{
+		{"", slog.LevelInfo, false},
+		{"info", slog.LevelInfo, false},
+		{"INFO", slog.LevelInfo, false},
+		{"debug", slog.LevelDebug, false},
+		{" Debug ", slog.LevelDebug, false},
+		{"warn", slog.LevelWarn, false},
+		{"warning", slog.LevelWarn, false},
+		{"error", slog.LevelError, false},
+		{"trace", 0, true},
+		{"verbose", 0, true},
+		{"5", 0, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			got, err := ParseLogLevel(tt.in)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("ParseLogLevel(%q) = %v, want error", tt.in, got)
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Errorf("ParseLogLevel(%q) unexpected err: %v", tt.in, err)
+				return
+			}
+
+			if got != tt.want {
+				t.Errorf("ParseLogLevel(%q) = %v, want %v", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestValidate_RejectsInvalidLogLevel verifies that an unrecognised
+// logging.level value is caught at config.Load time rather than at
+// process startup.
+func TestValidate_RejectsInvalidLogLevel(t *testing.T) {
+	t.Parallel()
+
+	yaml := validAwss3YAML + `
+logging:
+  level: trace
+`
+	path := writeTempYAML(t, yaml)
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatalf("Load accepted invalid logging.level: trace")
+	}
+
+	if !strings.Contains(err.Error(), "logging.level") {
+		t.Errorf("error does not mention logging.level: %v", err)
 	}
 }
 

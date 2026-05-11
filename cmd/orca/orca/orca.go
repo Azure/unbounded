@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -53,17 +54,29 @@ func newServeCmd() *cobra.Command {
 }
 
 func serve(parent context.Context, configPath string) error {
-	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	}))
-	slog.SetDefault(log)
-
-	log.Info("orca starting", "config_path", configPath)
-
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+
+	level, err := resolveLogLevel(cfg.Logging.Level)
+	if err != nil {
+		return err
+	}
+
+	levelVar := new(slog.LevelVar)
+	levelVar.Set(level)
+
+	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level:     levelVar,
+		AddSource: true,
+	}))
+	slog.SetDefault(log)
+
+	log.Info("orca starting",
+		"config_path", configPath,
+		"log_level", level.String(),
+	)
 
 	log.Info("config loaded",
 		"origin_id", cfg.Origin.ID,
@@ -96,4 +109,22 @@ func serve(parent context.Context, configPath string) error {
 	log.Info("orca stopped")
 
 	return nil
+}
+
+// resolveLogLevel determines the effective slog.Level by consulting
+// the ORCA_LOG_LEVEL environment variable first; if unset or empty,
+// falls back to the YAML-configured value. An unrecognised value
+// (from either source) returns a parse error so misconfiguration is
+// surfaced at startup rather than silently degrading to info.
+func resolveLogLevel(yamlLevel string) (slog.Level, error) {
+	if env := strings.TrimSpace(os.Getenv("ORCA_LOG_LEVEL")); env != "" {
+		level, err := config.ParseLogLevel(env)
+		if err != nil {
+			return 0, fmt.Errorf("ORCA_LOG_LEVEL: %w", err)
+		}
+
+		return level, nil
+	}
+
+	return config.ParseLogLevel(yamlLevel)
 }

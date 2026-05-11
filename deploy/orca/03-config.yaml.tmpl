@@ -67,3 +67,8 @@ data:
 
     chunking:
       size: 8388608
+
+    logging:
+      # One of debug, info, warn, error. Overridden at runtime by the
+      # ORCA_LOG_LEVEL environment variable when set.
+      level: {{ default "info" .LogLevel | quote }}
