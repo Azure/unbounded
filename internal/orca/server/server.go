@@ -12,6 +12,7 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"encoding/xml"
 	"errors"
@@ -139,9 +140,42 @@ func (h *EdgeHandler) handleGet(w http.ResponseWriter, r *http.Request, bucket, 
 	chunkSize := h.cfg.Chunking.Size
 	firstChunk, lastChunk := chunk.IndexRange(rangeStart, rangeEnd, chunkSize, info.Size)
 
-	// Set headers eagerly. The response headers are committed when the
-	// first byte from the origin arrives (or immediately, for a cache
-	// hit); thereafter any failure becomes a mid-stream abort.
+	// Fetch the first chunk before committing any response headers
+	// so that origin errors (404, auth, timeout, mid-stream blob
+	// fault) surface as a clean S3-style error response instead of
+	// a half-written 200 followed by a dropped connection. Once the
+	// first byte is in hand we know the rest of the stream is
+	// "tentatively" healthy; subsequent chunk failures remain
+	// mid-stream aborts.
+	firstKey := chunk.Key{
+		OriginID:  h.cfg.Origin.ID,
+		Bucket:    bucket,
+		ObjectKey: key,
+		ETag:      info.ETag,
+		ChunkSize: chunkSize,
+		Index:     firstChunk,
+	}
+
+	firstBody, err := h.fc.GetChunk(r.Context(), firstKey, info.Size)
+	if err != nil {
+		h.writeOriginError(w, err)
+		return
+	}
+	// Peek a single byte to drain any first-read errors from the
+	// underlying body (e.g. cachestore-backed bodies can fail on the
+	// first network read). io.EOF on peek is acceptable for the
+	// degenerate empty-chunk case.
+	firstReader := bufio.NewReader(firstBody)
+	if _, err := firstReader.Peek(1); err != nil && !errors.Is(err, io.EOF) {
+		firstBody.Close() //nolint:errcheck // closing on error path
+		h.writeOriginError(w, err)
+
+		return
+	}
+
+	// Set headers eagerly. The response headers are committed below
+	// once the first chunk has been confirmed readable; thereafter
+	// any failure becomes a mid-stream abort.
 	setObjectHeaders(w, info)
 	w.Header().Set("Content-Length", strconv.FormatInt(rangeEnd-rangeStart+1, 10))
 
@@ -149,11 +183,27 @@ func (h *EdgeHandler) handleGet(w http.ResponseWriter, r *http.Request, bucket, 
 		w.Header().Set("Content-Range",
 			fmt.Sprintf("bytes %d-%d/%d", rangeStart, rangeEnd, info.Size))
 	}
-
 	// Write status now; subsequent failures become mid-stream aborts.
 	w.WriteHeader(statusCode)
 
-	for ci := firstChunk; ci <= lastChunk; ci++ {
+	// Stream the first chunk's slice. Any failure here is now a
+	// mid-stream abort (headers are committed).
+	off, length := chunk.ChunkSlice(firstChunk, chunkSize, rangeStart, rangeEnd, info.Size)
+	if err := streamSlice(w, firstReader, off, length); err != nil {
+		firstBody.Close() //nolint:errcheck // body close best-effort, response already streaming
+		h.log.Warn("mid-stream copy failed",
+			"bucket", bucket, "key", key, "chunk", firstChunk, "err", err)
+
+		return
+	}
+
+	firstBody.Close() //nolint:errcheck // body close best-effort, response already streaming
+
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+
+	for ci := firstChunk + 1; ci <= lastChunk; ci++ {
 		ckey := chunk.Key{
 			OriginID:  h.cfg.Origin.ID,
 			Bucket:    bucket,

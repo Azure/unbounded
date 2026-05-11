@@ -464,7 +464,100 @@ func TestSetObjectHeaders(t *testing.T) {
 	}
 }
 
-// fakeInternalFetchAPI satisfies internalFetchAPI with a canned body.
+// errReader is an io.ReadCloser whose first Read returns errFirst.
+// Used to simulate cachestore-backed bodies that fail on their first
+// network read (e.g. azureblob returning a 503 mid-stream after the
+// header transaction succeeded).
+type errReader struct {
+	errFirst error
+	closed   bool
+}
+
+func (r *errReader) Read(_ []byte) (int, error) { return 0, r.errFirst }
+func (r *errReader) Close() error               { r.closed = true; return nil }
+
+// TestHandleGet_FirstChunkErrorReturnsCleanError verifies that when
+// the very first chunk fetch fails the edge handler responds with an
+// S3-style error response (proper status + error body) rather than
+// committing a 200 status and then aborting the connection
+// mid-stream.
+//
+// Regression test for B4.
+func TestHandleGet_FirstChunkErrorReturnsCleanError(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		fetchErr   error
+		peekErr    error // non-nil means GetChunk succeeds but first Read fails
+		wantStatus int
+		wantBody   string // substring assertion on the error body
+	}{
+		{
+			name:       "GetChunk returns NotFound",
+			fetchErr:   origin.ErrNotFound,
+			wantStatus: http.StatusNotFound,
+			wantBody:   "NoSuchKey",
+		},
+		{
+			name:       "GetChunk returns generic origin error",
+			fetchErr:   errors.New("origin: connect: timeout"),
+			wantStatus: http.StatusBadGateway,
+			wantBody:   "OriginUnreachable",
+		},
+		{
+			name:       "GetChunk succeeds but first Read fails",
+			peekErr:    errors.New("cachestore: blob fetch 503"),
+			wantStatus: http.StatusBadGateway,
+			wantBody:   "OriginUnreachable",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			info := origin.ObjectInfo{
+				Size:        1024,
+				ETag:        "etag1",
+				ContentType: "application/octet-stream",
+			}
+
+			fc := &fakeEdgeAPI{
+				HeadObjectFunc: func(_ context.Context, _, _ string) (origin.ObjectInfo, error) {
+					return info, nil
+				},
+				GetChunkFunc: func(_ context.Context, _ chunk.Key, _ int64) (io.ReadCloser, error) {
+					if tt.fetchErr != nil {
+						return nil, tt.fetchErr
+					}
+
+					return &errReader{errFirst: tt.peekErr}, nil
+				},
+			}
+
+			cfg := &config.Config{Chunking: config.Chunking{Size: 1024}}
+			h := NewEdgeHandler(fc, cfg, discardLogger())
+
+			req := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
+			rr := httptest.NewRecorder()
+			h.handleGet(rr, req, "bucket", "key")
+
+			if rr.Code != tt.wantStatus {
+				t.Errorf("status=%d want %d; body=%q", rr.Code, tt.wantStatus, rr.Body.String())
+			}
+
+			if !strings.Contains(rr.Body.String(), tt.wantBody) {
+				t.Errorf("body=%q want substring %q", rr.Body.String(), tt.wantBody)
+			}
+			// A bug here would 200 first, then write nothing or
+			// partial bytes; verify the response did not commit a
+			// success status that contradicts the error.
+			if rr.Code == http.StatusOK {
+				t.Errorf("handler committed 200 before failure became known")
+			}
+		})
+	}
+}
+
 type fakeInternalFetchAPI struct {
 	body []byte
 }
