@@ -5,17 +5,15 @@ package daemon
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"reflect"
 	"strings"
 
 	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/nspawn"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 	"github.com/Azure/unbounded/pkg/agent/phases/nodestart"
 	"github.com/Azure/unbounded/pkg/agent/phases/nodestop"
@@ -25,10 +23,7 @@ import (
 
 // ActiveMachine holds the currently active nspawn machine name and its
 // applied agent configuration.
-type ActiveMachine struct {
-	Name   string
-	Config *provision.AgentConfig
-}
+type ActiveMachine = nspawn.ActiveMachine
 
 // nodeOperator performs host-local nspawn node operations for the daemon.
 // Reconcile code depends on this interface so tests can substitute the
@@ -61,44 +56,7 @@ type nodeOperator interface {
 type nspawnNodeOperator struct{}
 
 func (nspawnNodeOperator) FindActiveMachine(log *slog.Logger) (*ActiveMachine, error) {
-	// Verify the SHA-256 sidecar before trusting the applied config. A missing
-	// sidecar is logged as a warning and not treated as an error.
-	for _, name := range []string{goalstates.NSpawnMachineKube1, goalstates.NSpawnMachineKube2} {
-		path := goalstates.AppliedConfigPath(name)
-
-		data, err := os.ReadFile(path)
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		}
-
-		if err != nil {
-			return nil, fmt.Errorf("read applied config %s: %w", path, err)
-		}
-
-		// Verify the sidecar checksum before trusting the config data.
-		checksumPath := goalstates.AppliedConfigChecksumPath(name)
-		if err := goalstates.VerifyChecksum(data, checksumPath); err != nil {
-			return nil, fmt.Errorf("verify applied config checksum for %s: %w", name, err)
-		}
-
-		// If the sidecar file is missing, log a warning so operators
-		// know the integrity check was skipped.
-		if _, statErr := os.Stat(checksumPath); errors.Is(statErr, os.ErrNotExist) {
-			log.Warn("no checksum sidecar found, skipping integrity check",
-				"config_path", path,
-				"checksum_path", checksumPath,
-			)
-		}
-
-		var cfg provision.AgentConfig
-		if err := json.Unmarshal(data, &cfg); err != nil {
-			return nil, fmt.Errorf("decode applied config %s: %w", path, err)
-		}
-
-		return &ActiveMachine{Name: name, Config: &cfg}, nil
-	}
-
-	return nil, fmt.Errorf("no applied config found in %s", goalstates.AgentConfigDir)
+	return nspawn.FindActiveMachine(context.Background(), log)
 }
 
 // hasDrift reports whether the desired AgentConfig differs from the applied
