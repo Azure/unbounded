@@ -21,10 +21,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -294,17 +294,22 @@ func randHex(n int) string {
 	return hex.EncodeToString(b)
 }
 
+// isPreconditionFailed reports whether err represents a 412
+// Precondition Failed response from S3. The atomic-commit primitive
+// (PutObject + If-None-Match: *) returns 412 when the key already
+// exists; the SelfTest path also expects 412 on the duplicate put.
+// We use the HTTP status code carried on *awshttp.ResponseError
+// rather than matching service error codes by string, since the
+// code surface is version-dependent across SDK and backend
+// implementations whereas the HTTP status code is part of the
+// stable wire contract.
 func isPreconditionFailed(err error) bool {
-	var apiErr smithy.APIError
-	if errors.As(err, &apiErr) {
-		code := apiErr.ErrorCode()
-		if code == "PreconditionFailed" || code == "InvalidArgument" || code == "ConditionalRequestConflict" {
-			return true
-		}
+	var respErr *awshttp.ResponseError
+	if errors.As(err, &respErr) && respErr.Response != nil {
+		return respErr.Response.StatusCode == http.StatusPreconditionFailed
 	}
 
-	return strings.Contains(err.Error(), "PreconditionFailed") ||
-		strings.Contains(err.Error(), "412")
+	return false
 }
 
 func isNotFound(err error) bool {
@@ -323,17 +328,20 @@ func isNotFound(err error) bool {
 		return true
 	}
 
-	var apiErr smithy.APIError
-	if errors.As(err, &apiErr) {
-		switch apiErr.ErrorCode() {
-		case "NoSuchKey", "NotFound", "404":
-			return true
-		}
+	var respErr *awshttp.ResponseError
+	if errors.As(err, &respErr) && respErr.Response != nil &&
+		respErr.Response.StatusCode == http.StatusNotFound {
+		return true
 	}
 
 	return false
 }
 
+// mapErr normalises driver errors to the cachestore sentinel
+// taxonomy. AccessDenied / Forbidden / Unauthorized are surfaced by
+// the SDK with stable smithy.APIError codes so we keep that match
+// path; everything else routes through HTTP status code on the
+// underlying *awshttp.ResponseError.
 func mapErr(err error) error {
 	if isNotFound(err) {
 		return cachestore.ErrNotFound
@@ -346,12 +354,18 @@ func mapErr(err error) error {
 			return cachestore.ErrAuth
 		}
 	}
-	// Treat HTTP 5xx as transient.
-	if strings.Contains(err.Error(), "StatusCode: 5") {
-		return cachestore.ErrTransient
-	}
 
-	_ = http.StatusOK // keep net/http import if not needed otherwise
+	var respErr *awshttp.ResponseError
+	if errors.As(err, &respErr) && respErr.Response != nil {
+		status := respErr.Response.StatusCode
+		if status == http.StatusUnauthorized || status == http.StatusForbidden {
+			return cachestore.ErrAuth
+		}
+
+		if status >= 500 && status < 600 {
+			return cachestore.ErrTransient
+		}
+	}
 
 	return err
 }
