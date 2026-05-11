@@ -1149,11 +1149,11 @@ def dump_persisted_agent_config() -> None:
     ssh_cmd(r"""
 set -euo pipefail
 sudo python3 - <<'PY'
-import glob
 import json
 import pathlib
 
 CONFIG_DIR = pathlib.Path("/etc/unbounded/agent")
+# Sensitive key names are compared in lowercase.
 SENSITIVE_KEYS = {"bootstraptoken"}
 
 
@@ -1169,7 +1169,7 @@ def redact(value):
 
 
 paths = [CONFIG_DIR / "config.json"]
-paths.extend(pathlib.Path(path) for path in sorted(glob.glob(str(CONFIG_DIR / "*-applied-config.json"))))
+paths.extend(sorted(CONFIG_DIR.glob("*-applied-config.json")))
 
 seen = set()
 for path in paths:
