@@ -19,10 +19,9 @@
 // # Test seams
 //
 // Production constructs a DNS-backed PeerSource implicitly from
-// cfg.Cluster.Service + net.DefaultResolver. Tests can substitute the
+// cfg.Cluster.Service + net.DefaultResolver. Tests substitute the
 // entire mechanism with WithPeerSource (typically a mutable
-// StaticPeerSource per replica) or just swap the underlying DNS
-// resolver with WithResolver.
+// StaticPeerSource per replica).
 package cluster
 
 import (
@@ -35,7 +34,6 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -72,9 +70,9 @@ type Cluster struct {
 }
 
 // Resolver looks up the host names that back the headless Service.
-// Production uses net.DefaultResolver; tests can swap it with
-// WithResolver to substitute only the DNS layer while keeping the
-// rest of the DNS-based PeerSource behavior.
+// Production uses net.DefaultResolver. The interface is exposed so
+// the DNS-backed peer source can be tested in isolation; production
+// code does not customize it.
 type Resolver interface {
 	LookupHost(ctx context.Context, host string) ([]string, error)
 }
@@ -100,24 +98,6 @@ type Option func(*Cluster)
 // DNS-backed source implicitly from cfg.Cluster.Service.
 func WithPeerSource(s PeerSource) Option {
 	return func(c *Cluster) { c.source = s }
-}
-
-// WithResolver replaces only the DNS resolver inside the default
-// DNS-backed PeerSource. Has no effect when WithPeerSource is also
-// provided. Useful if production wants a custom resolver (e.g. a
-// proxy resolver) without otherwise changing discovery semantics.
-func WithResolver(r Resolver) Option {
-	return func(c *Cluster) {
-		c.source = newDNSPeerSource(c.cfg.Service, c.cfg.SelfPodIP, r)
-	}
-}
-
-// NewDNSPeerSource is the production peer source: it polls the
-// headless Service via the given resolver. If resolver is nil, it
-// uses net.DefaultResolver. Returned peers have Port=0; FillFromPeer
-// falls back to cfg.Cluster.InternalListen's port when dialing.
-func NewDNSPeerSource(service, selfIP string, resolver Resolver) PeerSource {
-	return newDNSPeerSource(service, selfIP, resolver)
 }
 
 func newDNSPeerSource(service, selfIP string, resolver Resolver) PeerSource {
@@ -201,19 +181,19 @@ func (c *Cluster) Peers() []Peer {
 	return *p
 }
 
-// Self returns the Peer for this replica.
-func (c *Cluster) Self() Peer {
+// self returns the Peer for this replica.
+func (c *Cluster) self() Peer {
 	return Peer{IP: c.cfg.SelfPodIP, Self: true}
 }
 
 // Coordinator selects the rendezvous-hashed coordinator for a chunk.
 //
 // Returns the Peer with the highest hash(peer || chunk_path) score.
-// On empty peer set returns Self (last-replica-standing fallback).
+// On empty peer set returns self (last-replica-standing fallback).
 func (c *Cluster) Coordinator(k chunk.Key) Peer {
 	peers := c.Peers()
 	if len(peers) == 0 {
-		return c.Self()
+		return c.self()
 	}
 
 	path := []byte(k.Path())
@@ -443,6 +423,3 @@ func DecodeChunkKey(values url.Values) (chunk.Key, error) {
 		Index:     idx,
 	}, nil
 }
-
-// Mu guards external mutation in tests.
-var Mu sync.Mutex

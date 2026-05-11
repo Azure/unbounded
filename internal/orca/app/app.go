@@ -79,15 +79,6 @@ func WithLogger(log *slog.Logger) Option {
 	return func(o *options) { o.log = log }
 }
 
-// WithResolver overrides only the DNS resolver inside the default
-// peer source. Convenient for tests that want to keep the production
-// DNS-discovery shape but substitute the resolver itself.
-func WithResolver(r cluster.Resolver) Option {
-	return func(o *options) {
-		o.clusterOpts = append(o.clusterOpts, cluster.WithResolver(r))
-	}
-}
-
 // WithPeerSource replaces the cluster's entire peer-discovery
 // mechanism. Intended for integration tests that need full control
 // (e.g. per-replica peer sets with explicit ports).

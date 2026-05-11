@@ -95,7 +95,7 @@ func TestWriteOriginError(t *testing.T) {
 		{
 			name: "etag changed",
 			err: &origin.OriginETagChangedError{
-				Bucket: "b", Key: "k", Want: "old", Got: "new",
+				Bucket: "b", Key: "k", Want: "old",
 			},
 			wantStatus: http.StatusBadGateway,
 			wantBody:   "OriginETagChanged",

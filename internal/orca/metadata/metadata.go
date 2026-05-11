@@ -71,13 +71,13 @@ func NewCache(cfg config.Metadata) *Cache {
 	}
 }
 
-// Lookup returns the cached ObjectInfo if present and unexpired.
+// lookup returns the cached ObjectInfo if present and unexpired.
 //
 // Returns:
 //   - info, true,  nil  -> positive cache hit
 //   - {}, true,    err  -> negative cache hit (err is the cached error)
 //   - {}, false,   nil  -> miss; caller should LookupOrFetch
-func (c *Cache) Lookup(originID, bucket, key string) (origin.ObjectInfo, bool, error) {
+func (c *Cache) lookup(originID, bucket, key string) (origin.ObjectInfo, bool, error) {
 	k := mkKey(originID, bucket, key)
 
 	c.mu.Lock()
@@ -117,7 +117,7 @@ func (c *Cache) LookupOrFetch(
 	originID, bucket, key string,
 	fetch func(ctx context.Context) (origin.ObjectInfo, error),
 ) (origin.ObjectInfo, error) {
-	if info, ok, err := c.Lookup(originID, bucket, key); ok {
+	if info, ok, err := c.lookup(originID, bucket, key); ok {
 		return info, err
 	}
 

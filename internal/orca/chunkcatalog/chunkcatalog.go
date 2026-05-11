@@ -120,11 +120,3 @@ func (c *Catalog) Forget(k chunk.Key) {
 		delete(c.idx, path)
 	}
 }
-
-// Len returns the current entry count (test helper).
-func (c *Catalog) Len() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	return c.ll.Len()
-}

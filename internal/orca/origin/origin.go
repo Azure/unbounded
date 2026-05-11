@@ -57,7 +57,6 @@ type ObjectEntry struct {
 var (
 	ErrNotFound = errors.New("origin: not found")
 	ErrAuth     = errors.New("origin: auth")
-	ErrThrottle = errors.New("origin: throttle")
 )
 
 // OriginETagChangedError is returned by GetRange when the origin
@@ -66,12 +65,11 @@ type OriginETagChangedError struct {
 	Bucket string
 	Key    string
 	Want   string
-	Got    string
 }
 
 func (e *OriginETagChangedError) Error() string {
-	return fmt.Sprintf("origin etag changed for %s/%s: want=%q got=%q",
-		e.Bucket, e.Key, e.Want, e.Got)
+	return fmt.Sprintf("origin etag changed for %s/%s: want=%q",
+		e.Bucket, e.Key, e.Want)
 }
 
 // UnsupportedBlobTypeError is returned by azureblob.Head when the
