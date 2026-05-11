@@ -191,10 +191,10 @@ func TestResolveKubelet_BothAuthMethodsRejected(t *testing.T) {
 	assert.ErrorContains(t, err, "mutually exclusive")
 }
 
-func TestResolveMachine_BackfillsConfigNodeName(t *testing.T) {
+func TestResolveMachine_UsesConfigNodeName(t *testing.T) {
 	cfg := &config.AgentConfig{
 		MachineName: "machine-1",
-		NodeName:    " configured-node ",
+		NodeName:    "configured-node",
 		Cluster: config.AgentClusterConfig{
 			CaCertBase64: "Y2EtYnl0ZXM=",
 		},
