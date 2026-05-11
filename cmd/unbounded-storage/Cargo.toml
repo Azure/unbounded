@@ -1,0 +1,11 @@
+[package]
+name = "unbounded-storage"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "unbounded-storage"
+path = "src/main.rs"
+
+[dependencies]

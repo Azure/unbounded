@@ -63,6 +63,11 @@ UNPING_CMD=./cmd/unping
 UNROUTE_BIN=bin/unroute
 UNROUTE_CMD=./cmd/unroute
 
+# Rust binaries
+UNBOUNDED_STORAGE_BIN=bin/unbounded-storage
+UNBOUNDED_STORAGE_CRATE=./cmd/unbounded-storage
+CARGO ?= cargo
+
 # Version is derived from the latest git tag. Override with: make VERSION=v1.0.0
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 GIT_COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
@@ -113,6 +118,7 @@ REACT_DEV ?= false
 .PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute notice notice-check
 .PHONY: net-frontend net-frontend-clean net-build-ebpf net-manifests release-manifests
 .PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-net-controller-local image-net-node-local images-local
+.PHONY: unbounded-storage unbounded-storage-build unbounded-storage-test
 
 ##@ General
 
@@ -158,6 +164,10 @@ help: ## Show this help
 	@echo "  unbounded-net-routeplan-debug    Build net routeplan debug tool"
 	@echo "  unping                           Build unping health-check utility"
 	@echo "  unroute                          Build unroute eBPF inspection utility"
+	@echo ""
+	@echo "Rust Binaries:"
+	@echo "  unbounded-storage | unbounded-storage-build  Build unbounded-storage (with/without test)"
+	@echo "  unbounded-storage-test           Run cargo tests for unbounded-storage"
 	@echo ""
 	@echo "Container Images (local, single-arch):"
 	@echo "  image-inventory-all-local        Build all local inventory container images"
@@ -402,6 +412,18 @@ unping: test ## Build the unping utility (implies test)
 
 unroute: test ## Build the unroute utility (implies test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(UNROUTE_BIN) $(UNROUTE_CMD)
+
+##@ Rust Binaries
+
+unbounded-storage-test: ## Run cargo tests for unbounded-storage
+	$(CARGO) test --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --locked --all-targets
+
+unbounded-storage-build: ## Build the unbounded-storage binary (no test)
+	$(CARGO) build --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --release --locked
+	@mkdir -p $(dir $(UNBOUNDED_STORAGE_BIN))
+	cp $(UNBOUNDED_STORAGE_CRATE)/target/release/unbounded-storage $(UNBOUNDED_STORAGE_BIN)
+
+unbounded-storage: unbounded-storage-test unbounded-storage-build ## Build the unbounded-storage binary (implies test)
 
 ##@ Container Images
 #
