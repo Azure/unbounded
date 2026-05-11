@@ -116,16 +116,31 @@ func (a *Adapter) Head(ctx context.Context, bucket, key string) (origin.ObjectIn
 		b = a.cfg.Bucket
 	}
 
+	a.log.LogAttrs(ctx, slog.LevelDebug, "awss3_head_request",
+		slog.String("bucket", b),
+		slog.String("key", key),
+	)
+
 	out, err := a.client.HeadObject(ctx, &s3.HeadObjectInput{
 		Bucket: aws.String(b),
 		Key:    aws.String(key),
 	})
 	if err != nil {
 		if isNotFound(err) {
+			a.log.LogAttrs(ctx, slog.LevelDebug, "awss3_head_not_found",
+				slog.String("bucket", b),
+				slog.String("key", key),
+			)
+
 			return origin.ObjectInfo{LastStatus: http.StatusNotFound}, origin.ErrNotFound
 		}
 
 		if isAuth(err) {
+			a.log.LogAttrs(ctx, slog.LevelDebug, "awss3_head_auth",
+				slog.String("bucket", b),
+				slog.String("key", key),
+			)
+
 			return origin.ObjectInfo{}, origin.ErrAuth
 		}
 
@@ -149,6 +164,13 @@ func (a *Adapter) Head(ctx context.Context, bucket, key string) (origin.ObjectIn
 		info.LastValidated = *out.LastModified
 	}
 
+	a.log.LogAttrs(ctx, slog.LevelDebug, "awss3_head_response",
+		slog.String("bucket", b),
+		slog.String("key", key),
+		slog.Int64("size", info.Size),
+		slog.String("etag", origin.ETagShort(info.ETag)),
+	)
+
 	return info, nil
 }
 
@@ -171,24 +193,53 @@ func (a *Adapter) GetRange(ctx context.Context, bucket, key, etag string, off, n
 		in.IfMatch = aws.String("\"" + etag + "\"")
 	}
 
+	a.log.LogAttrs(ctx, slog.LevelDebug, "awss3_get_range_request",
+		slog.String("bucket", b),
+		slog.String("key", key),
+		slog.String("etag", origin.ETagShort(etag)),
+		slog.Int64("off", off),
+		slog.Int64("n", n),
+	)
+
 	out, err := a.client.GetObject(ctx, in)
 	if err != nil {
 		if isPreconditionFailed(err) {
+			a.log.LogAttrs(ctx, slog.LevelDebug, "awss3_get_range_etag_changed",
+				slog.String("bucket", b),
+				slog.String("key", key),
+				slog.String("want_etag", origin.ETagShort(etag)),
+			)
+
 			return nil, &origin.OriginETagChangedError{
 				Bucket: b, Key: key, Want: etag,
 			}
 		}
 
 		if isNotFound(err) {
+			a.log.LogAttrs(ctx, slog.LevelDebug, "awss3_get_range_not_found",
+				slog.String("bucket", b),
+				slog.String("key", key),
+			)
+
 			return nil, origin.ErrNotFound
 		}
 
 		if isAuth(err) {
+			a.log.LogAttrs(ctx, slog.LevelDebug, "awss3_get_range_auth",
+				slog.String("bucket", b),
+				slog.String("key", key),
+			)
+
 			return nil, origin.ErrAuth
 		}
 
 		return nil, fmt.Errorf("awss3 get-range: %w", err)
 	}
+
+	a.log.LogAttrs(ctx, slog.LevelDebug, "awss3_get_range_response",
+		slog.String("bucket", b),
+		slog.String("key", key),
+	)
 
 	return out.Body, nil
 }
@@ -199,6 +250,13 @@ func (a *Adapter) List(ctx context.Context, bucket, prefix, marker string, maxRe
 	if b == "" {
 		b = a.cfg.Bucket
 	}
+
+	a.log.LogAttrs(ctx, slog.LevelDebug, "awss3_list_request",
+		slog.String("bucket", b),
+		slog.String("prefix", prefix),
+		slog.String("marker", marker),
+		slog.Int("max", maxResults),
+	)
 
 	in := &s3.ListObjectsV2Input{
 		Bucket:  aws.String(b),
@@ -212,6 +270,10 @@ func (a *Adapter) List(ctx context.Context, bucket, prefix, marker string, maxRe
 	out, err := a.client.ListObjectsV2(ctx, in)
 	if err != nil {
 		if isAuth(err) {
+			a.log.LogAttrs(ctx, slog.LevelDebug, "awss3_list_auth",
+				slog.String("bucket", b),
+			)
+
 			return origin.ListResult{}, origin.ErrAuth
 		}
 
@@ -244,6 +306,12 @@ func (a *Adapter) List(ctx context.Context, bucket, prefix, marker string, maxRe
 	if out.NextContinuationToken != nil {
 		res.NextMarker = *out.NextContinuationToken
 	}
+
+	a.log.LogAttrs(ctx, slog.LevelDebug, "awss3_list_response",
+		slog.String("bucket", b),
+		slog.Int("count", len(res.Entries)),
+		slog.Bool("truncated", res.IsTruncated),
+	)
 
 	return res, nil
 }

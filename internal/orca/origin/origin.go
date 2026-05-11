@@ -97,3 +97,17 @@ func (e *UnsupportedBlobTypeError) Error() string {
 	return fmt.Sprintf("origin unsupported blob type %s for %s/%s",
 		e.BlobType, e.Bucket, e.Key)
 }
+
+// ETagShort returns the first 8 characters of an unquoted ETag for
+// log/debug emissions. ETags are not secrets but they're long enough
+// to make log lines hard to read; the prefix is sufficient for
+// matching one fill against another. Returns the input unchanged
+// when shorter than 8 chars.
+func ETagShort(etag string) string {
+	const n = 8
+	if len(etag) <= n {
+		return etag
+	}
+
+	return etag[:n]
+}

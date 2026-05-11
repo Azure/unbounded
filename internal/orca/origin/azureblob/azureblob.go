@@ -80,14 +80,29 @@ func (a *Adapter) Head(ctx context.Context, bucket, key string) (origin.ObjectIn
 		cName = a.cfg.Container
 	}
 
+	a.log.LogAttrs(ctx, slog.LevelDebug, "azureblob_head_request",
+		slog.String("container", cName),
+		slog.String("key", key),
+	)
+
 	props, err := a.client.ServiceClient().NewContainerClient(cName).
 		NewBlobClient(key).GetProperties(ctx, nil)
 	if err != nil {
 		if isNotFound(err) {
+			a.log.LogAttrs(ctx, slog.LevelDebug, "azureblob_head_not_found",
+				slog.String("container", cName),
+				slog.String("key", key),
+			)
+
 			return origin.ObjectInfo{LastStatus: http.StatusNotFound}, origin.ErrNotFound
 		}
 
 		if isAuth(err) {
+			a.log.LogAttrs(ctx, slog.LevelDebug, "azureblob_head_auth",
+				slog.String("container", cName),
+				slog.String("key", key),
+			)
+
 			return origin.ObjectInfo{}, origin.ErrAuth
 		}
 
@@ -95,6 +110,11 @@ func (a *Adapter) Head(ctx context.Context, bucket, key string) (origin.ObjectIn
 	}
 
 	if err := validateBlobType(cName, key, props.BlobType); err != nil {
+		a.log.LogAttrs(ctx, slog.LevelDebug, "azureblob_head_unsupported_blob_type",
+			slog.String("container", cName),
+			slog.String("key", key),
+		)
+
 		return origin.ObjectInfo{}, err
 	}
 
@@ -114,6 +134,13 @@ func (a *Adapter) Head(ctx context.Context, bucket, key string) (origin.ObjectIn
 	if props.LastModified != nil {
 		info.LastValidated = *props.LastModified
 	}
+
+	a.log.LogAttrs(ctx, slog.LevelDebug, "azureblob_head_response",
+		slog.String("container", cName),
+		slog.String("key", key),
+		slog.Int64("size", info.Size),
+		slog.String("etag", origin.ETagShort(info.ETag)),
+	)
 
 	return info, nil
 }
@@ -144,24 +171,53 @@ func (a *Adapter) GetRange(ctx context.Context, bucket, key, etag string, off, n
 		}
 	}
 
+	a.log.LogAttrs(ctx, slog.LevelDebug, "azureblob_get_range_request",
+		slog.String("container", cName),
+		slog.String("key", key),
+		slog.String("etag", origin.ETagShort(etag)),
+		slog.Int64("off", off),
+		slog.Int64("n", n),
+	)
+
 	resp, err := bc.DownloadStream(ctx, opts)
 	if err != nil {
 		if isPreconditionFailed(err) {
+			a.log.LogAttrs(ctx, slog.LevelDebug, "azureblob_get_range_etag_changed",
+				slog.String("container", cName),
+				slog.String("key", key),
+				slog.String("want_etag", origin.ETagShort(etag)),
+			)
+
 			return nil, &origin.OriginETagChangedError{
 				Bucket: cName, Key: key, Want: etag,
 			}
 		}
 
 		if isNotFound(err) {
+			a.log.LogAttrs(ctx, slog.LevelDebug, "azureblob_get_range_not_found",
+				slog.String("container", cName),
+				slog.String("key", key),
+			)
+
 			return nil, origin.ErrNotFound
 		}
 
 		if isAuth(err) {
+			a.log.LogAttrs(ctx, slog.LevelDebug, "azureblob_get_range_auth",
+				slog.String("container", cName),
+				slog.String("key", key),
+			)
+
 			return nil, origin.ErrAuth
 		}
 
 		return nil, fmt.Errorf("azureblob get-range: %w", err)
 	}
+
+	a.log.LogAttrs(ctx, slog.LevelDebug, "azureblob_get_range_response",
+		slog.String("container", cName),
+		slog.String("key", key),
+	)
 
 	return resp.Body, nil
 }
@@ -172,6 +228,13 @@ func (a *Adapter) List(ctx context.Context, bucket, prefix, marker string, maxRe
 	if cName == "" {
 		cName = a.cfg.Container
 	}
+
+	a.log.LogAttrs(ctx, slog.LevelDebug, "azureblob_list_request",
+		slog.String("container", cName),
+		slog.String("prefix", prefix),
+		slog.String("marker", marker),
+		slog.Int("max", maxResults),
+	)
 
 	cc := a.client.ServiceClient().NewContainerClient(cName)
 	max := int32(maxResults)
@@ -186,6 +249,10 @@ func (a *Adapter) List(ctx context.Context, bucket, prefix, marker string, maxRe
 		page, err := pager.NextPage(ctx)
 		if err != nil {
 			if isAuth(err) {
+				a.log.LogAttrs(ctx, slog.LevelDebug, "azureblob_list_auth",
+					slog.String("container", cName),
+				)
+
 				return origin.ListResult{}, origin.ErrAuth
 			}
 
@@ -220,6 +287,12 @@ func (a *Adapter) List(ctx context.Context, bucket, prefix, marker string, maxRe
 			out.IsTruncated = *page.NextMarker != ""
 		}
 	}
+
+	a.log.LogAttrs(ctx, slog.LevelDebug, "azureblob_list_response",
+		slog.String("container", cName),
+		slog.Int("count", len(out.Entries)),
+		slog.Bool("truncated", out.IsTruncated),
+	)
 
 	return out, nil
 }
