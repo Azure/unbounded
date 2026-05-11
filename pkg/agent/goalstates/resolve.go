@@ -20,6 +20,7 @@ import (
 // starting an nspawn machine. Callers use RootFS for the rootfs provisioning
 // phases and NodeStart for the service configuration and boot phases.
 type MachineGoalState struct {
+	NodeName  string
 	RootFS    *RootFS
 	NodeStart *NodeStart
 }
@@ -100,6 +101,7 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 	}
 
 	return &MachineGoalState{
+		NodeName:  nodeName,
 		RootFS:    rootFS,
 		NodeStart: nodeStart,
 	}, nil

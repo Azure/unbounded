@@ -24,7 +24,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
 type queueItemKind string
@@ -52,13 +51,9 @@ func runController(
 	log *slog.Logger,
 	restCfg *rest.Config,
 	machineName string,
+	nodeName string,
 	nodeOperator nodeOperator,
 ) error {
-	nodeName, err := resolveNodeName(machineName)
-	if err != nil {
-		return err
-	}
-
 	reconciler := &daemonReconciler{
 		log:          log,
 		machineName:  machineName,
@@ -101,15 +96,6 @@ func runController(
 	log.Info("daemon shutting down")
 
 	return err
-}
-
-func resolveNodeName(machineName string) (string, error) {
-	nodeName, err := goalstates.ResolveHostNodeName(machineName)
-	if err != nil {
-		return "", fmt.Errorf("resolve Node name for Machine %s: %w", machineName, err)
-	}
-
-	return nodeName, nil
 }
 
 func (r *daemonReconciler) SetupWithManager(mgr ctrl.Manager) error {

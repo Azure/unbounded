@@ -18,6 +18,7 @@ import (
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/provision"
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
 // kubeClientFunc constructs a controller-runtime client from a rest.Config.
@@ -46,6 +47,11 @@ func run(ctx context.Context, log *slog.Logger, newClient kubeClientFunc, nodeOp
 		"applied_version", active.Config.Cluster.Version,
 	)
 
+	gs, err := goalstates.ResolveMachine(log, active.Config, active.Name, nil)
+	if err != nil {
+		return fmt.Errorf("resolve active machine goal state: %w", err)
+	}
+
 	// Build Kubernetes clients from the applied config.
 	restCfg, err := buildRESTConfig(active.Config)
 	if err != nil {
@@ -72,7 +78,7 @@ func run(ctx context.Context, log *slog.Logger, newClient kubeClientFunc, nodeOp
 		log.Warn("failed to publish and clear AgentUpgrade daemon signals", "error", err)
 	}
 
-	return runController(ctx, log, restCfg, active.Config.MachineName, nodeOperator)
+	return runController(ctx, log, restCfg, active.Config.MachineName, gs.NodeName, nodeOperator)
 }
 
 // buildRESTConfig builds a Kubernetes REST config from the applied agent
