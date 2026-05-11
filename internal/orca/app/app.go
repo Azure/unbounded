@@ -208,7 +208,7 @@ func Start(ctx context.Context, cfg *config.Config, opts ...Option) (*App, error
 		cachestoreReady = true
 	}
 
-	var clusterOpts []cluster.Option
+	clusterOpts := []cluster.Option{cluster.WithLogger(log)}
 	if o.clusterOpt != nil {
 		clusterOpts = append(clusterOpts, o.clusterOpt)
 	}
@@ -218,8 +218,8 @@ func Start(ctx context.Context, cfg *config.Config, opts ...Option) (*App, error
 		return nil, fmt.Errorf("init cluster: %w", err)
 	}
 
-	cat := chunkcatalog.New(cfg.ChunkCatalog.MaxEntries)
-	mc := metadata.NewCache(cfg.Metadata)
+	cat := chunkcatalog.New(cfg.ChunkCatalog.MaxEntries, log)
+	mc := metadata.NewCache(cfg.Metadata, log)
 	fc := fetch.NewCoordinator(or, cs, cl, cat, mc, cfg, log)
 
 	edgeHandler := server.NewEdgeHandler(fc, cfg, log)

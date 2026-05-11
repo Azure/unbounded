@@ -6,6 +6,8 @@ package metadata
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -26,7 +28,7 @@ import (
 func TestLookupOrFetch_TransientErrorNotReplayed(t *testing.T) {
 	t.Parallel()
 
-	c := NewCache(config.Metadata{TTL: time.Minute, NegativeTTL: time.Minute, MaxEntries: 16})
+	c := NewCache(config.Metadata{TTL: time.Minute, NegativeTTL: time.Minute, MaxEntries: 16}, nil)
 
 	var calls atomic.Int64
 
@@ -55,7 +57,7 @@ func TestLookupOrFetch_TransientErrorNotReplayed(t *testing.T) {
 func TestLookupOrFetch_PositiveResultCached(t *testing.T) {
 	t.Parallel()
 
-	c := NewCache(config.Metadata{TTL: time.Minute, NegativeTTL: time.Minute, MaxEntries: 16})
+	c := NewCache(config.Metadata{TTL: time.Minute, NegativeTTL: time.Minute, MaxEntries: 16}, nil)
 
 	var calls atomic.Int64
 
@@ -87,7 +89,7 @@ func TestLookupOrFetch_PositiveResultCached(t *testing.T) {
 func TestLookupOrFetch_NotFoundCached(t *testing.T) {
 	t.Parallel()
 
-	c := NewCache(config.Metadata{TTL: time.Minute, NegativeTTL: time.Minute, MaxEntries: 16})
+	c := NewCache(config.Metadata{TTL: time.Minute, NegativeTTL: time.Minute, MaxEntries: 16}, nil)
 
 	var calls atomic.Int64
 
@@ -113,7 +115,7 @@ func TestLookupOrFetch_NotFoundCached(t *testing.T) {
 func TestLookupOrFetch_ConcurrentJoinersCollapse(t *testing.T) {
 	t.Parallel()
 
-	c := NewCache(config.Metadata{TTL: time.Minute, NegativeTTL: time.Minute, MaxEntries: 16})
+	c := NewCache(config.Metadata{TTL: time.Minute, NegativeTTL: time.Minute, MaxEntries: 16}, nil)
 
 	var calls atomic.Int64
 
@@ -181,5 +183,30 @@ func TestMkKey_PipeCollisionResolved(t *testing.T) {
 	if a == b {
 		t.Errorf("pipe-delimited collision: mkKey(%q,%q,%q) == mkKey(%q,%q,%q) = %q",
 			"a|b", "c", "d", "a", "b|c", "d", a)
+	}
+}
+
+// TestNewCache_UsesInjectedLogger locks the contract that the
+// metadata cache uses the caller's logger rather than slog.Default.
+func TestNewCache_UsesInjectedLogger(t *testing.T) {
+	t.Parallel()
+
+	injected := slog.New(slog.NewTextHandler(io.Discard, nil))
+	c := NewCache(config.Metadata{TTL: time.Minute, NegativeTTL: time.Minute, MaxEntries: 16}, injected)
+
+	if c.log != injected {
+		t.Errorf("metadata.Cache.log not the injected logger")
+	}
+}
+
+// TestNewCache_NilLoggerFallsBackToDefault verifies the nil-logger
+// fallback so a misconfigured caller does not panic on the first
+// trace emission.
+func TestNewCache_NilLoggerFallsBackToDefault(t *testing.T) {
+	t.Parallel()
+
+	c := NewCache(config.Metadata{TTL: time.Minute, NegativeTTL: time.Minute, MaxEntries: 16}, nil)
+	if c.log == nil {
+		t.Errorf("nil logger should have fallen back to slog.Default()")
 	}
 }

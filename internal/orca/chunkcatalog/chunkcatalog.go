@@ -8,6 +8,7 @@ package chunkcatalog
 
 import (
 	"container/list"
+	"log/slog"
 	"sync"
 
 	"github.com/Azure/unbounded/internal/orca/cachestore"
@@ -20,6 +21,7 @@ type Catalog struct {
 	maxEntries int
 	ll         *list.List
 	idx        map[string]*list.Element
+	log        *slog.Logger
 }
 
 type entry struct {
@@ -27,16 +29,23 @@ type entry struct {
 	info cachestore.Info
 }
 
-// New constructs a Catalog.
-func New(maxEntries int) *Catalog {
+// New constructs a Catalog. The log is used at debug level for
+// per-call hit / miss / record / forget / evict trace lines.
+// Passing nil falls back to slog.Default().
+func New(maxEntries int, log *slog.Logger) *Catalog {
 	if maxEntries <= 0 {
 		maxEntries = 100_000
+	}
+
+	if log == nil {
+		log = slog.Default()
 	}
 
 	return &Catalog{
 		maxEntries: maxEntries,
 		ll:         list.New(),
 		idx:        make(map[string]*list.Element, maxEntries),
+		log:        log,
 	}
 }
 

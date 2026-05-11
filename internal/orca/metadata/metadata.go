@@ -17,6 +17,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +29,7 @@ import (
 // Cache is the per-replica metadata cache.
 type Cache struct {
 	cfg config.Metadata
+	log *slog.Logger
 
 	mu  sync.Mutex
 	ll  *list.List
@@ -51,8 +53,11 @@ type sfEntry struct {
 	err  error
 }
 
-// NewCache builds a Cache from config.
-func NewCache(cfg config.Metadata) *Cache {
+// NewCache builds a Cache from config. The log is used at debug
+// level for cache hit / miss / record / invalidate trace lines and
+// at warn level for unexpected backend errors caught during result
+// recording. Passing nil falls back to slog.Default().
+func NewCache(cfg config.Metadata, log *slog.Logger) *Cache {
 	if cfg.MaxEntries <= 0 {
 		cfg.MaxEntries = 10_000
 	}
@@ -65,8 +70,13 @@ func NewCache(cfg config.Metadata) *Cache {
 		cfg.NegativeTTL = 60 * time.Second
 	}
 
+	if log == nil {
+		log = slog.Default()
+	}
+
 	return &Cache{
 		cfg: cfg,
+		log: log,
 		ll:  list.New(),
 		idx: make(map[string]*list.Element, cfg.MaxEntries),
 	}

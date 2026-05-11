@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"strconv"
@@ -440,6 +441,37 @@ func TestWithHTTPClient_Overrides(t *testing.T) {
 
 	if c.httpClient != custom {
 		t.Errorf("httpClient not overridden by WithHTTPClient")
+	}
+}
+
+// TestWithLogger_OverridesDefault verifies the cluster honours the
+// injected slog.Logger so cluster.refresh's warn-level
+// retain-snapshot message and the debug-level emissions route to
+// the caller's configured handler rather than slog.Default.
+func TestWithLogger_OverridesDefault(t *testing.T) {
+	t.Parallel()
+
+	injected := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	c, err := New(t.Context(),
+		config.Cluster{
+			Service:           "test",
+			SelfPodIP:         "10.0.0.1",
+			MembershipRefresh: time.Hour,
+		},
+		WithPeerSource(&fakePeerSource{mu: func() ([]Peer, error) {
+			return []Peer{{IP: "10.0.0.1", Self: true}}, nil
+		}}),
+		WithLogger(injected),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	t.Cleanup(func() { _ = c.Close(context.Background()) })
+
+	if c.log != injected {
+		t.Errorf("Cluster.log not the injected logger")
 	}
 }
 

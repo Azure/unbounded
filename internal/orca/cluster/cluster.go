@@ -61,6 +61,7 @@ type Peer struct {
 // internal-RPC client.
 type Cluster struct {
 	cfg config.Cluster
+	log *slog.Logger
 
 	peers atomic.Pointer[[]Peer]
 
@@ -122,6 +123,14 @@ func WithHTTPClient(c *http.Client) Option {
 	return func(cl *Cluster) { cl.httpClient = c }
 }
 
+// WithLogger overrides the cluster's structured logger. The default
+// is slog.Default(). The logger receives debug-level emissions for
+// every refresh cycle, coordinator selection, and FillFromPeer call,
+// plus warn-level emissions for retained-previous-snapshot fallback.
+func WithLogger(log *slog.Logger) Option {
+	return func(cl *Cluster) { cl.log = log }
+}
+
 func newDNSPeerSource(service, selfIP string, r resolver) PeerSource {
 	if r == nil {
 		r = net.DefaultResolver
@@ -170,6 +179,7 @@ func New(parent context.Context, cfg config.Cluster, opts ...Option) (*Cluster, 
 	ctx, cancel := context.WithCancel(parent)
 	c := &Cluster{
 		cfg:        cfg,
+		log:        slog.Default(),
 		httpClient: newHTTPClient(cfg),
 		source:     newDNSPeerSource(cfg.Service, cfg.SelfPodIP, nil),
 		cancelFn:   cancel,
@@ -178,6 +188,10 @@ func New(parent context.Context, cfg config.Cluster, opts ...Option) (*Cluster, 
 
 	for _, opt := range opts {
 		opt(c)
+	}
+
+	if c.log == nil {
+		c.log = slog.Default()
 	}
 	// Initial refresh; failure is non-fatal (empty peer-set fallback).
 	c.refresh(ctx)
@@ -402,7 +416,7 @@ func (c *Cluster) refresh(ctx context.Context) {
 		streak := c.consecutiveRefreshErrors.Add(1)
 
 		if c.peers.Load() != nil && streak <= maxStalePeerRefreshes {
-			slog.Default().Warn("cluster: peer discovery failed; retaining previous snapshot",
+			c.log.Warn("cluster: peer discovery failed; retaining previous snapshot",
 				"err", err, "consecutive_errors", streak)
 
 			return
