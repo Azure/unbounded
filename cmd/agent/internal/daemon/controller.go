@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"os"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -25,6 +24,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
 type queueItemKind string
@@ -104,16 +104,9 @@ func runController(
 }
 
 func resolveNodeName(machineName string) (string, error) {
-	// TODO: The daemon currently assumes the Kubernetes Node name matches the
-	// host hostname. We should decide the node name in the daemon and pass it
-	// into kubelet config later so node naming and Machine references are
-	// deterministic.
-	nodeName, err := os.Hostname()
+	nodeName, err := goalstates.ResolveHostNodeName(machineName)
 	if err != nil {
-		return "", fmt.Errorf("get hostname for Machine %s Node source: %w", machineName, err)
-	}
-	if nodeName == "" {
-		return "", fmt.Errorf("get hostname for Machine %s Node source: hostname is empty", machineName)
+		return "", fmt.Errorf("resolve Node name for Machine %s: %w", machineName, err)
 	}
 
 	return nodeName, nil

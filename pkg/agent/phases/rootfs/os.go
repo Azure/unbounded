@@ -76,9 +76,9 @@ func (c *configureOS) Do(_ context.Context) error {
 		{path: "etc/tmpfiles.d/kmsg.conf", content: kmsgConfig},
 		{path: "etc/modules-load.d/kubernetes.conf", content: kubernetesModulesConfig},
 		{path: "etc/apt/sources.list", content: sources},
-		// Inherit the hostname from the host so that the nspawn container
-		// identifies itself with the same name as the underlying machine.
-		{path: "etc/hostname", content: []byte(c.goalState.Hostname + "\n")},
+		// Use the resolved Kubernetes Node name so the nspawn container and
+		// kubelet identify the node consistently.
+		{path: "etc/hostname", content: []byte(c.goalState.NodeName + "\n")},
 	}
 
 	for _, f := range configs {

@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/Azure/unbounded/pkg/agent/config"
@@ -187,4 +188,58 @@ func TestResolveKubelet_BothAuthMethodsRejected(t *testing.T) {
 
 	_, err := resolveKubelet(cfg)
 	assert.ErrorContains(t, err, "mutually exclusive")
+}
+
+func TestResolveNodeName(t *testing.T) {
+	tests := []struct {
+		name        string
+		hostname    string
+		machineName string
+		want        string
+		wantErr     string
+	}{
+		{
+			name:        "hostname",
+			hostname:    "worker-1",
+			machineName: "machine-1",
+			want:        "worker-1",
+		},
+		{
+			name:        "trimmed hostname",
+			hostname:    " worker-1 ",
+			machineName: "machine-1",
+			want:        "worker-1",
+		},
+		{
+			name:        "empty hostname falls back",
+			hostname:    "",
+			machineName: "machine-1",
+			want:        "machine-1",
+		},
+		{
+			name:        "invalid hostname falls back",
+			hostname:    "WORKER_1",
+			machineName: "machine-1",
+			want:        "machine-1",
+		},
+		{
+			name:        "invalid fallback errors",
+			hostname:    "WORKER_1",
+			machineName: "Machine_1",
+			wantErr:     "not a valid Kubernetes node name",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ResolveNodeName(tt.hostname, tt.machineName)
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				return
+			}
+
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
 }

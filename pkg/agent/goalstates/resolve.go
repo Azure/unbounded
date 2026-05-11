@@ -33,9 +33,9 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 		return nil, fmt.Errorf("get host kernel: %w", err)
 	}
 
-	hostname, err := os.Hostname()
+	nodeName, err := ResolveHostNodeName(cfg.MachineName)
 	if err != nil {
-		return nil, fmt.Errorf("get host hostname: %w", err)
+		return nil, fmt.Errorf("resolve node name: %w", err)
 	}
 
 	nvidia, err := ResolveNvidiaHost(runtime.GOARCH)
@@ -78,7 +78,7 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 		),
 		HostArch:          runtime.GOARCH,
 		HostKernel:        kernel,
-		Hostname:          hostname,
+		NodeName:          nodeName,
 		ContainerdVersion: containerdVersion,
 		RunCVersion:       runcVersion,
 		CNIPluginVersion:  cniVersion,
@@ -92,6 +92,7 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 	nodeStart := &NodeStart{
 		MachineName:     machineName,
 		KubeMachineName: cfg.MachineName,
+		NodeName:        nodeName,
 		MachineDir:      filepath.Join("/var/lib/machines", machineName),
 		Containerd:      ResolveContainerd(),
 		Kubelet:         kubelet,

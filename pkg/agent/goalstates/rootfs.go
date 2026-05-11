@@ -12,7 +12,7 @@ type RootFS struct {
 	ServiceOverrideFile string // e.g. /etc/systemd/system/systemd-nspawn@node.service.d/override.conf
 	HostArch            string
 	HostKernel          string // running kernel version from uname -r, e.g. "6.8.0-45-generic"
-	Hostname            string // host hostname, written into the rootfs so the nspawn container inherits it
+	NodeName            string // Kubernetes Node name written into the rootfs hostname
 	ContainerdVersion   string
 	RunCVersion         string
 	CNIPluginVersion    string
