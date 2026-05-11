@@ -8,6 +8,39 @@ import (
 	"testing"
 )
 
+// TestKey_ExpectedLen covers the per-chunk expected length given an
+// object size: full chunks for non-tail, remainder for the tail, 0 for
+// past-end, k.ChunkSize when objectSize is unknown (<= 0).
+func TestKey_ExpectedLen(t *testing.T) {
+	t.Parallel()
+
+	const cs = int64(1024)
+
+	tests := []struct {
+		name       string
+		k          Key
+		objectSize int64
+		want       int64
+	}{
+		{"full chunk 0", Key{ChunkSize: cs, Index: 0}, 4096, cs},
+		{"full chunk 2", Key{ChunkSize: cs, Index: 2}, 4096, cs},
+		{"tail chunk partial", Key{ChunkSize: cs, Index: 3}, 3500, 3500 - 3072},
+		{"chunk exactly fills object", Key{ChunkSize: cs, Index: 3}, 4096, cs},
+		{"chunk past end returns 0", Key{ChunkSize: cs, Index: 5}, 3500, 0},
+		{"objectSize 0 -> ChunkSize (unknown)", Key{ChunkSize: cs, Index: 0}, 0, cs},
+		{"objectSize negative -> ChunkSize", Key{ChunkSize: cs, Index: 7}, -1, cs},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.k.ExpectedLen(tc.objectSize)
+			if got != tc.want {
+				t.Errorf("ExpectedLen=%d want %d", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestKey_Path_Deterministic verifies that the same inputs always
 // produce the same path and that meaningful input differences
 // (OriginID, Bucket, ObjectKey, ETag, ChunkSize, Index) produce

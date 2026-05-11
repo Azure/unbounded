@@ -60,6 +60,29 @@ func (k Key) Range() (off, length int64) {
 	return off, length
 }
 
+// ExpectedLen returns the authoritative number of bytes this chunk
+// should contain given the object's total size. For non-tail chunks
+// this is k.ChunkSize; for the tail chunk it is the remainder. If
+// objectSize is zero or negative (unknown), returns k.ChunkSize. If
+// the chunk is entirely past the end of the object, returns 0.
+func (k Key) ExpectedLen(objectSize int64) int64 {
+	if objectSize <= 0 {
+		return k.ChunkSize
+	}
+
+	off := k.Index * k.ChunkSize
+	if off >= objectSize {
+		return 0
+	}
+
+	remaining := objectSize - off
+	if remaining < k.ChunkSize {
+		return remaining
+	}
+
+	return k.ChunkSize
+}
+
 // String renders the key compactly for logging.
 func (k Key) String() string {
 	if len(k.ETag) > 8 {

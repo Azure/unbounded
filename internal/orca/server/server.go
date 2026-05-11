@@ -417,6 +417,16 @@ func (h *InternalHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer body.Close() //nolint:errcheck // internal-fill body close best-effort
 
+	// Set Content-Length so the requesting peer can validate the
+	// streamed body length and detect mid-stream truncation. If the
+	// expected length is zero (unknown objectSize or empty chunk) we
+	// omit Content-Length; the requester then falls back to
+	// connection-close framing without length validation.
+	expectedLen := k.ExpectedLen(objectSize)
+	if expectedLen > 0 {
+		w.Header().Set("Content-Length", strconv.FormatInt(expectedLen, 10))
+	}
+
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.WriteHeader(http.StatusOK)
 

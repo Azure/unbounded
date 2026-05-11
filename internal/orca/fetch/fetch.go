@@ -112,7 +112,7 @@ func (c *Coordinator) HeadObject(ctx context.Context, bucket, key string) (origi
 //     stream from peer's response. On 409 Conflict, fall back to local
 //     fill.
 func (c *Coordinator) GetChunk(ctx context.Context, k chunk.Key, objectSize int64) (io.ReadCloser, error) {
-	expected := expectedChunkLen(k, objectSize)
+	expected := k.ExpectedLen(objectSize)
 
 	// Hot path: catalog hit -> direct CacheStore read.
 	if _, ok := c.cat.Lookup(k); ok {
@@ -173,7 +173,7 @@ func (c *Coordinator) GetChunk(ctx context.Context, k chunk.Key, objectSize int6
 // The receiver becomes the leader for this fill (or joins an in-flight
 // fill for the same key). Returns a streaming body of the entire chunk.
 func (c *Coordinator) FillForPeer(ctx context.Context, k chunk.Key, objectSize int64) (io.ReadCloser, error) {
-	expected := expectedChunkLen(k, objectSize)
+	expected := k.ExpectedLen(objectSize)
 
 	// Hot path: catalog hit -> direct read. The catalog can be stale
 	// (e.g. cachestore pruned out-of-band, or operator clear-cache);
@@ -205,28 +205,6 @@ func (c *Coordinator) FillForPeer(ctx context.Context, k chunk.Key, objectSize i
 	}
 
 	return c.fillLocal(ctx, k, objectSize)
-}
-
-// expectedChunkLen returns the authoritative byte length of chunk k
-// given the object's total size. For non-tail chunks this is just
-// k.ChunkSize; for the tail chunk it is the remainder. If objectSize
-// is zero or negative (unknown), returns k.ChunkSize.
-func expectedChunkLen(k chunk.Key, objectSize int64) int64 {
-	if objectSize <= 0 {
-		return k.ChunkSize
-	}
-
-	off := k.Index * k.ChunkSize
-	if off >= objectSize {
-		return 0
-	}
-
-	remaining := objectSize - off
-	if remaining < k.ChunkSize {
-		return remaining
-	}
-
-	return k.ChunkSize
 }
 
 // fillLocal runs (or joins) the singleflight for k on this replica.
@@ -288,7 +266,7 @@ func (c *Coordinator) runFill(k chunk.Key, objectSize int64, f *fill) {
 	// receive from origin: ChunkSize for non-tail chunks, the
 	// remainder for the tail. We request at most expectedLen and
 	// reject responses that don't match.
-	expectedLen := expectedChunkLen(k, objectSize)
+	expectedLen := k.ExpectedLen(objectSize)
 	off := k.Index * k.ChunkSize
 
 	requestLen := expectedLen

@@ -28,6 +28,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -305,8 +306,46 @@ func (c *Cluster) FillFromPeer(ctx context.Context, p Peer, k chunk.Key, objectS
 			resp.StatusCode, string(body))
 	}
 
+	// Wrap the response body in a defense-in-depth validator that
+	// ensures the peer delivered exactly Content-Length bytes.
+	// net/http already raises io.ErrUnexpectedEOF when the body
+	// closes short of an explicit Content-Length, but the wrapper
+	// makes that contract explicit at the call site (so readers of
+	// FillFromPeer do not need to reason about transport internals)
+	// and guards against future changes to net/http's behavior.
+	if resp.ContentLength > 0 {
+		return &validatingReader{
+			rc:       resp.Body,
+			expected: resp.ContentLength,
+		}, nil
+	}
+
 	return resp.Body, nil
 }
+
+// validatingReader wraps an io.ReadCloser and returns
+// io.ErrUnexpectedEOF if the underlying stream closes after fewer
+// than expected bytes. Used by FillFromPeer to detect truncated
+// cross-replica internal-fill responses.
+type validatingReader struct {
+	rc       io.ReadCloser
+	expected int64
+	got      int64
+}
+
+func (r *validatingReader) Read(p []byte) (int, error) {
+	n, err := r.rc.Read(p)
+	r.got += int64(n)
+
+	if errors.Is(err, io.EOF) && r.got != r.expected {
+		return n, fmt.Errorf("cluster: internal-fill truncated: got %d bytes, expected %d: %w",
+			r.got, r.expected, io.ErrUnexpectedEOF)
+	}
+
+	return n, err
+}
+
+func (r *validatingReader) Close() error { return r.rc.Close() }
 
 // ErrPeerNotCoordinator is returned by FillFromPeer when the peer
 // reports it is not the coordinator (membership disagreement).

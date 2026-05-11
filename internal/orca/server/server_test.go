@@ -11,10 +11,13 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Azure/unbounded/internal/orca/chunk"
+	"github.com/Azure/unbounded/internal/orca/cluster"
 	"github.com/Azure/unbounded/internal/orca/config"
 	"github.com/Azure/unbounded/internal/orca/origin"
 )
@@ -459,6 +462,124 @@ func TestSetObjectHeaders(t *testing.T) {
 			}
 		})
 	}
+}
+
+// fakeInternalFetchAPI satisfies internalFetchAPI with a canned body.
+type fakeInternalFetchAPI struct {
+	body []byte
+}
+
+func (f *fakeInternalFetchAPI) FillForPeer(_ context.Context, _ chunk.Key, _ int64) (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader(string(f.body))), nil
+}
+
+// singleSelfPeerSource produces a peer-set containing only self.
+// IsCoordinator therefore returns true for every key, letting the
+// internal-fill handler proceed past its coordinator check without
+// requiring the test to know the rendezvous-hash outcome.
+type singleSelfPeerSource struct{}
+
+func (singleSelfPeerSource) Peers(_ context.Context) ([]cluster.Peer, error) {
+	return []cluster.Peer{{IP: "10.0.0.1", Self: true}}, nil
+}
+
+// TestInternalHandler_SetsContentLength verifies the internal-fill
+// handler sets Content-Length to chunk.Key.ExpectedLen(objectSize)
+// on the response. Setting the header allows the requesting peer to
+// detect mid-stream truncation via net/http's standard io.ErrUnexpectedEOF
+// surfacing; without it, a truncated peer response would be
+// indistinguishable from a clean EOF.
+//
+// Regression test for B7.
+func TestInternalHandler_SetsContentLength(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		chunkSize  int64
+		index      int64
+		objectSize int64
+		wantLen    string
+	}{
+		{
+			name:       "full chunk",
+			chunkSize:  1024,
+			index:      0,
+			objectSize: 4096,
+			wantLen:    "1024",
+		},
+		{
+			// The fake body returns chunkSize=1024 bytes but the
+			// tail-chunk ExpectedLen is 428 (3500 - 3*1024). The
+			// resulting Content-Length: 428 can only come from the
+			// handler computing ExpectedLen explicitly, proving the
+			// header is not auto-derived from the body length.
+			name:       "tail chunk partial",
+			chunkSize:  1024,
+			index:      3,
+			objectSize: 3500,
+			wantLen:    "428",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, err := cluster.New(t.Context(),
+				config.Cluster{
+					Service:           "test",
+					SelfPodIP:         "10.0.0.1",
+					MembershipRefresh: time.Hour,
+					InternalListen:    "0.0.0.0:8444",
+				},
+				cluster.WithPeerSource(singleSelfPeerSource{}),
+			)
+			if err != nil {
+				t.Fatalf("cluster.New: %v", err)
+			}
+
+			t.Cleanup(func() { _ = c.Close(context.Background()) })
+
+			h := NewInternalHandler(&fakeInternalFetchAPI{body: make([]byte, tt.chunkSize)}, c, discardLogger())
+
+			req := httptest.NewRequest(http.MethodGet, "/internal/fill?"+(func() string {
+				k := chunk.Key{
+					OriginID:  "origin",
+					Bucket:    "bucket",
+					ObjectKey: "key",
+					ETag:      "etag",
+					ChunkSize: tt.chunkSize,
+					Index:     tt.index,
+				}
+
+				return encodeQuery(k, tt.objectSize)
+			})(), nil)
+			req.Header.Set("X-Orca-Internal", "1")
+
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, req)
+
+			if rr.Code != http.StatusOK {
+				t.Fatalf("status = %d want 200; body=%q", rr.Code, rr.Body.String())
+			}
+
+			got := rr.Header().Get("Content-Length")
+			if got != tt.wantLen {
+				t.Errorf("Content-Length = %q want %q", got, tt.wantLen)
+			}
+		})
+	}
+}
+
+// encodeQuery duplicates cluster.encodeChunkKey for test purposes
+// (it is unexported in the cluster package).
+func encodeQuery(k chunk.Key, objectSize int64) string {
+	return "origin_id=" + k.OriginID +
+		"&bucket=" + k.Bucket +
+		"&key=" + k.ObjectKey +
+		"&etag=" + k.ETag +
+		"&chunk_size=" + strconv.FormatInt(k.ChunkSize, 10) +
+		"&index=" + strconv.FormatInt(k.Index, 10) +
+		"&object_size=" + strconv.FormatInt(objectSize, 10)
 }
 
 // helpers

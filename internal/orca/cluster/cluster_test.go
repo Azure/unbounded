@@ -6,10 +6,14 @@ package cluster
 import (
 	"context"
 	"errors"
+	"io"
+	"net"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/Azure/unbounded/internal/orca/chunk"
 	"github.com/Azure/unbounded/internal/orca/config"
 )
 
@@ -166,5 +170,112 @@ func TestRefresh_EmptyResultFallsBackToSelf(t *testing.T) {
 
 	if got := c.consecutiveRefreshErrors.Load(); got != 0 {
 		t.Errorf("empty (non-error) result should not bump error counter; got %d", got)
+	}
+}
+
+// TestFillFromPeer_DetectsTruncation verifies that the validating
+// reader returned by FillFromPeer surfaces io.ErrUnexpectedEOF when
+// the peer advertises a Content-Length but the connection closes
+// before that many bytes have been delivered. Without the validator
+// the requester would observe a clean io.EOF and silently pass
+// short bytes through to the client.
+//
+// Regression test for B7.
+func TestFillFromPeer_DetectsTruncation(t *testing.T) {
+	t.Parallel()
+
+	const advertised = 100
+
+	const delivered = 50
+
+	// Use a raw TCP listener so we have full control over the wire
+	// format: write Content-Length: 100, then write 50 body bytes,
+	// then close the connection mid-stream.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	t.Cleanup(func() { _ = ln.Close() }) //nolint:errcheck // test cleanup
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+
+		defer conn.Close() //nolint:errcheck // test cleanup
+		// Consume request headers up through the blank line.
+		buf := make([]byte, 4096)
+
+		if _, err := conn.Read(buf); err != nil {
+			return
+		}
+
+		resp := "HTTP/1.1 200 OK\r\n" +
+			"Content-Length: " + strconv.Itoa(advertised) + "\r\n" +
+			"Content-Type: application/octet-stream\r\n" +
+			"\r\n"
+		if _, err := conn.Write([]byte(resp)); err != nil {
+			return
+		}
+
+		if _, err := conn.Write(make([]byte, delivered)); err != nil {
+			return
+		}
+		// Close mid-body without writing the remaining bytes.
+	}()
+
+	host, portStr, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		t.Fatalf("split host port: %v", err)
+	}
+
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("parse port: %v", err)
+	}
+
+	c, err := New(t.Context(),
+		config.Cluster{
+			Service:           "test",
+			SelfPodIP:         "10.0.0.1",
+			MembershipRefresh: time.Hour,
+			InternalListen:    "0.0.0.0:8444",
+		},
+		WithPeerSource(&fakePeerSource{mu: func() ([]Peer, error) {
+			return []Peer{{IP: "10.0.0.1", Self: true}}, nil
+		}}),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	t.Cleanup(func() { _ = c.Close(context.Background()) })
+
+	peer := Peer{IP: host, Port: port}
+	key := chunk.Key{
+		OriginID:  "test-origin",
+		Bucket:    "test-bucket",
+		ObjectKey: "test-object",
+		ETag:      "test-etag",
+		ChunkSize: advertised,
+		Index:     0,
+	}
+
+	body, err := c.FillFromPeer(t.Context(), peer, key, advertised)
+	if err != nil {
+		t.Fatalf("FillFromPeer: %v", err)
+	}
+
+	defer body.Close() //nolint:errcheck // test cleanup
+
+	got, err := io.ReadAll(body)
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Errorf("expected io.ErrUnexpectedEOF, got err=%v (read %d bytes)", err, len(got))
+	}
+
+	if len(got) != delivered {
+		t.Errorf("got %d bytes, expected %d (the delivered prefix)", len(got), delivered)
 	}
 }
