@@ -442,3 +442,65 @@ func TestWithHTTPClient_Overrides(t *testing.T) {
 		t.Errorf("httpClient not overridden by WithHTTPClient")
 	}
 }
+
+// TestRefresh_CtxCanceledDoesNotBumpErrorCounter verifies that a
+// refresh call whose ctx has been cancelled (the normal shutdown
+// path) does not bump consecutiveRefreshErrors or churn the stored
+// peer-set into the self-only fallback. Without this guard the
+// final refresh during graceful shutdown produces a 'discovery
+// failed' warning and pushes the membership into the self-only
+// path even though nothing has actually gone wrong.
+func TestRefresh_CtxCanceledDoesNotBumpErrorCounter(t *testing.T) {
+	t.Parallel()
+
+	good := []Peer{
+		{IP: "10.0.0.1", Self: false},
+		{IP: "10.0.0.2", Self: true},
+	}
+
+	var failWithCancel atomic.Bool
+
+	src := &fakePeerSource{
+		mu: func() ([]Peer, error) {
+			if failWithCancel.Load() {
+				return nil, context.Canceled
+			}
+
+			out := make([]Peer, len(good))
+			copy(out, good)
+
+			return out, nil
+		},
+	}
+
+	c, err := New(t.Context(),
+		config.Cluster{
+			Service:           "test",
+			SelfPodIP:         "10.0.0.2",
+			MembershipRefresh: time.Hour, // disable auto-refresh; drive manually.
+		},
+		WithPeerSource(src),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	t.Cleanup(func() { _ = c.Close(context.Background()) })
+
+	if got := c.consecutiveRefreshErrors.Load(); got != 0 {
+		t.Fatalf("pre-test error counter = %d, want 0", got)
+	}
+
+	initialPeers := len(c.Peers())
+
+	failWithCancel.Store(true)
+	c.refresh(t.Context())
+
+	if got := c.consecutiveRefreshErrors.Load(); got != 0 {
+		t.Errorf("counter bumped on ctx.Canceled; got %d want 0", got)
+	}
+
+	if got := len(c.Peers()); got != initialPeers {
+		t.Errorf("peer-set churned on ctx.Canceled; got %d want %d", got, initialPeers)
+	}
+}

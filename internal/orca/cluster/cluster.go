@@ -388,6 +388,15 @@ func (c *Cluster) refreshLoop(ctx context.Context) {
 func (c *Cluster) refresh(ctx context.Context) {
 	peers, err := c.source.Peers(ctx)
 	if err != nil {
+		// A cancelled parent ctx (process shutdown) is not a
+		// discovery failure: it means the refresh loop is exiting.
+		// Bumping the streak counter on the way out would push the
+		// final snapshot into the self-only fallback path and emit
+		// a noisy 'discovery failed' warning during normal
+		// shutdown.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return
+		}
 		// Discovery failed. Retain the previous snapshot if we have
 		// one and we have not exceeded the staleness ceiling; the
 		// internal-fill RPC fallback (cluster.ErrPeerNotCoordinator
