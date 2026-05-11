@@ -40,24 +40,24 @@ import (
 type Driver struct {
 	client *s3.Client
 	bucket string
-
-	requireUnversionedBucket bool
 }
 
 // Config is the s3-driver configuration. Mirrors config.CachestoreS3
 // but kept package-local so the driver can be unit-tested without
 // importing the whole config package.
 type Config struct {
-	Endpoint                 string
-	Bucket                   string
-	Region                   string
-	AccessKey                string
-	SecretKey                string
-	UsePathStyle             bool
-	RequireUnversionedBucket bool
+	Endpoint     string
+	Bucket       string
+	Region       string
+	AccessKey    string
+	SecretKey    string
+	UsePathStyle bool
 }
 
-// New constructs a Driver. The boot versioning gate is run here.
+// New constructs a Driver. The bucket-versioning gate is run here
+// unconditionally: a versioned bucket silently breaks the no-clobber
+// atomic-commit primitive (PutObject + If-None-Match: *) so the
+// driver refuses to start against one.
 //
 // SelfTestAtomicCommit is a separate step (called by main after New)
 // to keep the constructor side-effect-light.
@@ -91,15 +91,12 @@ func New(ctx context.Context, cfg Config) (*Driver, error) {
 	})
 
 	d := &Driver{
-		client:                   client,
-		bucket:                   cfg.Bucket,
-		requireUnversionedBucket: cfg.RequireUnversionedBucket,
+		client: client,
+		bucket: cfg.Bucket,
 	}
 
-	if d.requireUnversionedBucket {
-		if err := d.versioningGate(ctx); err != nil {
-			return nil, err
-		}
+	if err := d.versioningGate(ctx); err != nil {
+		return nil, err
 	}
 
 	return d, nil

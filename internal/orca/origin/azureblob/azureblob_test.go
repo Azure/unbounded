@@ -12,10 +12,9 @@ import (
 	"github.com/Azure/unbounded/internal/orca/origin"
 )
 
-// TestValidateBlobType covers every branch of the EnforceBlockBlobOnly
-// gate. The integration suite previously only exercised the
-// PageBlob-refused case; this unit test fills in disabled, nil,
-// BlockBlob, and AppendBlob.
+// TestValidateBlobType covers every branch of the unconditional
+// block-blob-only enforcement. PageBlob and AppendBlob are always
+// rejected; BlockBlob and the nil/unknown response shape pass.
 func TestValidateBlobType(t *testing.T) {
 	pageBlob := blob.BlobTypePageBlob
 	appendBlob := blob.BlobTypeAppendBlob
@@ -23,15 +22,13 @@ func TestValidateBlobType(t *testing.T) {
 
 	tests := []struct {
 		name            string
-		enforce         bool
 		blobType        *blob.BlobType
 		wantUnsupported bool
 	}{
-		{"enforce off accepts any type", false, &pageBlob, false},
-		{"nil blob type passes when enforced (no info)", true, nil, false},
-		{"block blob accepted", true, &blockBlob, false},
-		{"page blob refused", true, &pageBlob, true},
-		{"append blob refused", true, &appendBlob, true},
+		{"nil blob type passes (no info to validate)", nil, false},
+		{"block blob accepted", &blockBlob, false},
+		{"page blob refused", &pageBlob, true},
+		{"append blob refused", &appendBlob, true},
 	}
 
 	const (
@@ -41,7 +38,7 @@ func TestValidateBlobType(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := validateBlobType(tt.enforce, container, key, tt.blobType)
+			err := validateBlobType(container, key, tt.blobType)
 
 			if (err != nil) != tt.wantUnsupported {
 				t.Fatalf("err=%v, wantUnsupported=%v", err, tt.wantUnsupported)
@@ -68,5 +65,22 @@ func TestValidateBlobType(t *testing.T) {
 				t.Errorf("BlobType=%q want %q", ube.BlobType, string(*tt.blobType))
 			}
 		})
+	}
+}
+
+// TestValidateBlobType_NonBlockBlob_AlwaysRejected is the regression
+// test for the fix that removed the user-overridable
+// EnforceBlockBlobOnly flag. There is no longer any code path that
+// accepts a Page or Append blob.
+func TestValidateBlobType_NonBlockBlob_AlwaysRejected(t *testing.T) {
+	pageBlob := blob.BlobTypePageBlob
+
+	if err := validateBlobType("ctr", "key", &pageBlob); err == nil {
+		t.Fatalf("page blob accepted; want UnsupportedBlobTypeError")
+	}
+
+	appendBlob := blob.BlobTypeAppendBlob
+	if err := validateBlobType("ctr", "key", &appendBlob); err == nil {
+		t.Fatalf("append blob accepted; want UnsupportedBlobTypeError")
 	}
 }

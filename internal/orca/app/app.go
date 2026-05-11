@@ -374,13 +374,12 @@ func buildCacheStore(ctx context.Context, cfg *config.Config, override cachestor
 	switch cfg.Cachestore.Driver {
 	case "s3":
 		cs, err := cachestores3.New(ctx, cachestores3.Config{
-			Endpoint:                 cfg.Cachestore.S3.Endpoint,
-			Bucket:                   cfg.Cachestore.S3.Bucket,
-			Region:                   cfg.Cachestore.S3.Region,
-			AccessKey:                cfg.Cachestore.S3.AccessKey,
-			SecretKey:                cfg.Cachestore.S3.SecretKey,
-			UsePathStyle:             cfg.Cachestore.S3.UsePathStyle,
-			RequireUnversionedBucket: cfg.Cachestore.S3.RequireUnversionedBucket,
+			Endpoint:     cfg.Cachestore.S3.Endpoint,
+			Bucket:       cfg.Cachestore.S3.Bucket,
+			Region:       cfg.Cachestore.S3.Region,
+			AccessKey:    cfg.Cachestore.S3.AccessKey,
+			SecretKey:    cfg.Cachestore.S3.SecretKey,
+			UsePathStyle: cfg.Cachestore.S3.UsePathStyle,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("init cachestore/s3: %w", err)

@@ -5,8 +5,9 @@
 # CreateBucket returns BucketAlreadyOwnedByYou on rerun, swallowed by
 # the script.
 #
-# Cachestore bucket: versioning left unset (which is what
-# require_unversioned_bucket=true expects).
+# Cachestore bucket: versioning left unset (the driver unconditionally
+# refuses to start against a versioned bucket since If-None-Match: *
+# is not honored on versioned buckets).
 # Origin bucket: no versioning constraint; sample objects live here.
 apiVersion: batch/v1
 kind: Job

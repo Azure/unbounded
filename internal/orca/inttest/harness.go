@@ -278,13 +278,12 @@ func buildConfig(opts ClusterOptions, cacheBucket string) *config.Config {
 		Cachestore: config.Cachestore{
 			Driver: "s3",
 			S3: config.CachestoreS3{
-				Endpoint:                 opts.LocalStack.Endpoint(),
-				Bucket:                   cacheBucket,
-				Region:                   opts.LocalStack.Region(),
-				AccessKey:                opts.LocalStack.AccessKey(),
-				SecretKey:                opts.LocalStack.SecretKey(),
-				UsePathStyle:             true,
-				RequireUnversionedBucket: true,
+				Endpoint:     opts.LocalStack.Endpoint(),
+				Bucket:       cacheBucket,
+				Region:       opts.LocalStack.Region(),
+				AccessKey:    opts.LocalStack.AccessKey(),
+				SecretKey:    opts.LocalStack.SecretKey(),
+				UsePathStyle: true,
 			},
 		},
 		Cluster: config.Cluster{
@@ -316,11 +315,10 @@ func buildConfig(opts ClusterOptions, cacheBucket string) *config.Config {
 		}
 	case "azureblob":
 		cfg.Origin.Azureblob = config.Azureblob{
-			Account:              opts.Azurite.AccountName(),
-			AccountKey:           opts.Azurite.AccountKey(),
-			Container:            opts.AzureContainer,
-			EnforceBlockBlobOnly: true,
-			Endpoint:             opts.Azurite.Endpoint(),
+			Account:    opts.Azurite.AccountName(),
+			AccountKey: opts.Azurite.AccountKey(),
+			Container:  opts.AzureContainer,
+			Endpoint:   opts.Azurite.Endpoint(),
 		}
 	}
 

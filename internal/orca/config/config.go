@@ -66,11 +66,15 @@ type OriginRetry struct {
 }
 
 // Azureblob is the azureblob origin adapter configuration.
+//
+// Page and Append blobs are unconditionally rejected at Head: their
+// random-access mutation model is incompatible with the chunked,
+// immutable cache contract orca relies on. There is no configuration
+// switch for this behaviour.
 type Azureblob struct {
-	Account              string `yaml:"account"`
-	AccountKey           string `yaml:"account_key"`
-	Container            string `yaml:"container"`
-	EnforceBlockBlobOnly bool   `yaml:"enforce_block_blob_only"`
+	Account    string `yaml:"account"`
+	AccountKey string `yaml:"account_key"`
+	Container  string `yaml:"container"`
 
 	// Endpoint, when set, overrides the default Azure Blob service URL
 	// (https://<account>.blob.core.windows.net/). Used in dev to point
@@ -101,14 +105,18 @@ type Cachestore struct {
 // CachestoreS3 is the s3 driver configuration. In dev this points at
 // LocalStack; in production at VAST or another in-DC S3-compatible
 // store.
+//
+// Bucket versioning is unconditionally validated at startup: a
+// versioned bucket silently breaks the no-clobber atomic-commit
+// primitive (PutObject + If-None-Match: *) the driver depends on.
+// There is no configuration switch for this gate.
 type CachestoreS3 struct {
-	Endpoint                 string `yaml:"endpoint"`
-	Bucket                   string `yaml:"bucket"`
-	Region                   string `yaml:"region"`
-	AccessKey                string `yaml:"access_key"`
-	SecretKey                string `yaml:"secret_key"`
-	UsePathStyle             bool   `yaml:"use_path_style"` // true for LocalStack
-	RequireUnversionedBucket bool   `yaml:"require_unversioned_bucket"`
+	Endpoint     string `yaml:"endpoint"`
+	Bucket       string `yaml:"bucket"`
+	Region       string `yaml:"region"`
+	AccessKey    string `yaml:"access_key"`
+	SecretKey    string `yaml:"secret_key"`
+	UsePathStyle bool   `yaml:"use_path_style"` // true for LocalStack
 }
 
 // Cluster captures peer discovery + internal-listener configuration.
@@ -205,13 +213,6 @@ func (c *Config) applyDefaults() {
 	if c.Origin.Retry.MaxTotalDuration == 0 {
 		c.Origin.Retry.MaxTotalDuration = 5 * time.Second
 	}
-
-	if !c.Origin.Azureblob.EnforceBlockBlobOnly {
-		// EnforceBlockBlobOnly is locked true: orca only serves Block
-		// Blobs because PageBlob/AppendBlob semantics don't fit the
-		// chunked, immutable cache model.
-		c.Origin.Azureblob.EnforceBlockBlobOnly = true
-	}
 	// Cachestore.
 	if c.Cachestore.Driver == "" {
 		c.Cachestore.Driver = "s3"
@@ -219,10 +220,6 @@ func (c *Config) applyDefaults() {
 
 	if c.Cachestore.S3.Region == "" {
 		c.Cachestore.S3.Region = "us-east-1"
-	}
-
-	if !c.Cachestore.S3.RequireUnversionedBucket {
-		c.Cachestore.S3.RequireUnversionedBucket = true
 	}
 	// Cluster.
 	if c.Cluster.MembershipRefresh == 0 {

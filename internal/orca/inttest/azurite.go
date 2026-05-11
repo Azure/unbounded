@@ -131,7 +131,8 @@ func (az *Azurite) UploadBlockBlob(ctx context.Context, t *testing.T, ctr, name 
 }
 
 // UploadPageBlob uploads bytes as a page blob (used to exercise the
-// EnforceBlockBlobOnly negative path). Size must be a multiple of 512.
+// unsupported-blob-type rejection path in the azureblob driver). Size
+// must be a multiple of 512.
 func (az *Azurite) UploadPageBlob(ctx context.Context, t *testing.T, ctr, name string, size int64) {
 	t.Helper()
 
@@ -153,7 +154,8 @@ func (az *Azurite) UploadPageBlob(ctx context.Context, t *testing.T, ctr, name s
 		t.Fatalf("create page blob: %v", err)
 	}
 	// Page blobs created here are zero-filled; tests don't read content
-	// because EnforceBlockBlobOnly should reject the GET first.
+	// because the azureblob driver rejects non-Block-Blob types before
+	// the GET stage.
 }
 
 // uniqueName returns a short random-suffixed name suitable for

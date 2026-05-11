@@ -84,7 +84,7 @@ func (a *Adapter) Head(ctx context.Context, bucket, key string) (origin.ObjectIn
 		return origin.ObjectInfo{}, fmt.Errorf("azureblob head: %w", err)
 	}
 
-	if err := validateBlobType(a.cfg.EnforceBlockBlobOnly, cName, key, props.BlobType); err != nil {
+	if err := validateBlobType(cName, key, props.BlobType); err != nil {
 		return origin.ObjectInfo{}, err
 	}
 
@@ -244,13 +244,14 @@ func isPreconditionFailed(err error) bool {
 	return bloberror.HasCode(err, bloberror.ConditionNotMet)
 }
 
-// validateBlobType returns an UnsupportedBlobTypeError when
-// enforceBlockBlobOnly is set and the blob is a non-Block-Blob type
-// (Page or Append). Returns nil for Block Blobs and when the gate is
-// disabled. Extracted as a pure function so unit tests can cover all
+// validateBlobType returns an UnsupportedBlobTypeError for any
+// non-Block-Blob type (Page or Append). PageBlob and AppendBlob's
+// random-access-mutation model is incompatible with orca's chunked
+// immutable cache contract, so they are unconditionally rejected
+// here. Extracted as a pure function so unit tests can cover the
 // branches without an Azurite round-trip.
-func validateBlobType(enforceBlockBlobOnly bool, container, key string, blobType *blob.BlobType) error {
-	if !enforceBlockBlobOnly || blobType == nil {
+func validateBlobType(container, key string, blobType *blob.BlobType) error {
+	if blobType == nil {
 		return nil
 	}
 

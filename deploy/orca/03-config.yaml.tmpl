@@ -34,7 +34,6 @@ data:
         account: {{ default "" .AzureAccount | quote }}
         container: {{ default "" .AzureContainer | quote }}
         endpoint: {{ default "" .AzureEndpoint | quote }}
-        enforce_block_blob_only: true
       awss3:
         endpoint: {{ default "" .OriginAWSS3Endpoint | quote }}
         region: {{ default "us-east-1" .OriginAWSS3Region | quote }}
@@ -48,7 +47,6 @@ data:
         bucket: {{ default "orca-cache" .CachestoreBucket | quote }}
         region: {{ default "us-east-1" .CachestoreRegion | quote }}
         use_path_style: true
-        require_unversioned_bucket: true
 
     cluster:
       service: {{ default "orca-peers.unbounded-kube.svc.cluster.local" .ClusterService | quote }}
