@@ -62,9 +62,11 @@ func (a *AgentConfig) BackfillNodeName() error {
 	}
 
 	hostname, hostnameErr := os.Hostname()
+	hostNodeName := ""
 	if hostnameErr == nil {
-		if nodeName := strings.TrimSpace(hostname); isValidNodeName(nodeName) {
-			a.NodeName = nodeName
+		hostNodeName = strings.TrimSpace(hostname)
+		if isValidNodeName(hostNodeName) {
+			a.NodeName = hostNodeName
 			return nil
 		}
 	}
@@ -85,13 +87,12 @@ func (a *AgentConfig) BackfillNodeName() error {
 		)
 	}
 
-	hostname = strings.TrimSpace(hostname)
 	return fmt.Errorf(
 		"machine name %q is not a valid Kubernetes node name (%s) after host hostname %q also failed validation: %s",
 		a.MachineName,
 		machineValidationErr,
-		hostname,
-		strings.Join(validation.IsDNS1123Subdomain(hostname), "; "),
+		hostNodeName,
+		strings.Join(validation.IsDNS1123Subdomain(hostNodeName), "; "),
 	)
 }
 

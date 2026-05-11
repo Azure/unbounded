@@ -39,7 +39,7 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 	}
 
 	if err := cfg.BackfillNodeName(); err != nil {
-		return nil, fmt.Errorf("resolve node name: %w", err)
+		return nil, fmt.Errorf("backfill node name: %w", err)
 	}
 
 	nvidia, err := ResolveNvidiaHost(runtime.GOARCH)
