@@ -94,7 +94,7 @@ func (a *Adapter) Head(ctx context.Context, bucket, key string) (origin.ObjectIn
 	}
 
 	if props.ETag != nil {
-		info.ETag = strings.Trim(string(*props.ETag), "\"")
+		info.ETag = unwrapAzcoreETag(props.ETag)
 	}
 
 	if props.ContentType != nil {
@@ -194,7 +194,7 @@ func (a *Adapter) List(ctx context.Context, bucket, prefix, marker string, maxRe
 				}
 
 				if item.Properties.ETag != nil {
-					entry.ETag = strings.Trim(string(*item.Properties.ETag), "\"")
+					entry.ETag = unwrapAzcoreETag(item.Properties.ETag)
 				}
 
 				if item.Properties.BlobType != nil {
@@ -269,4 +269,18 @@ func validateBlobType(container, key string, blobType *blob.BlobType) error {
 		Key:      key,
 		BlobType: string(*blobType),
 	}
+}
+
+// unwrapAzcoreETag normalises an *azcore.ETag from the Azure SDK
+// to the unquoted form orca uses internally. The Azure REST API
+// returns entity tags as quoted-strings per RFC 7232; the SDK
+// preserves the quotes, and orca strips them at the boundary so
+// later If-Match egress (which re-wraps via the awss3 / azureblob
+// drivers) doesn't double-quote.
+func unwrapAzcoreETag(e *azcore.ETag) string {
+	if e == nil {
+		return ""
+	}
+
+	return strings.Trim(string(*e), "\"")
 }

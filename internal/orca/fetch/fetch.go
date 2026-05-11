@@ -123,39 +123,10 @@ func (c *Coordinator) HeadObject(ctx context.Context, bucket, key string) (origi
 //     stream from peer's response. On 409 Conflict, fall back to local
 //     fill.
 func (c *Coordinator) GetChunk(ctx context.Context, k chunk.Key, objectSize int64) (io.ReadCloser, error) {
-	expected := k.ExpectedLen(objectSize)
-
-	// Hot path: catalog hit -> direct CacheStore read.
-	if _, ok := c.cat.Lookup(k); ok {
-		rc, err := c.cs.GetChunk(ctx, k, 0, expected)
-		if err == nil {
-			return rc, nil
-		}
-
-		if errors.Is(err, cachestore.ErrNotFound) {
-			c.cat.Forget(k)
-			// fall through to miss path
-		} else {
-			return nil, err
-		}
-	}
-
-	// Stat to confirm presence.
-	if info, err := c.cs.Stat(ctx, k); err == nil {
-		c.cat.Record(k, info)
-
-		// Trust the stat's reported size if it disagrees with our
-		// expectation (e.g. older committed entry from before a chunk
-		// size change), but clamp to the expected length so a
-		// corrupt larger stat does not leak bytes past the object end.
-		readLen := info.Size
-		if expected > 0 && readLen > expected {
-			readLen = expected
-		}
-
-		return c.cs.GetChunk(ctx, k, 0, readLen)
-	} else if !errors.Is(err, cachestore.ErrNotFound) {
+	if rc, hit, err := c.lookupOrStat(ctx, k, objectSize); err != nil {
 		return nil, err
+	} else if hit {
+		return rc, nil
 	}
 
 	// Cluster-wide dedup: route to coordinator.
@@ -184,38 +155,67 @@ func (c *Coordinator) GetChunk(ctx context.Context, k chunk.Key, objectSize int6
 // The receiver becomes the leader for this fill (or joins an in-flight
 // fill for the same key). Returns a streaming body of the entire chunk.
 func (c *Coordinator) FillForPeer(ctx context.Context, k chunk.Key, objectSize int64) (io.ReadCloser, error) {
+	if rc, hit, err := c.lookupOrStat(ctx, k, objectSize); err != nil {
+		return nil, err
+	} else if hit {
+		return rc, nil
+	}
+
+	return c.fillLocal(ctx, k, objectSize)
+}
+
+// lookupOrStat is the shared catalog-hit / cachestore-stat probe used
+// by both GetChunk and FillForPeer. Returns (body, true, nil) when a
+// pre-existing chunk is found, (nil, false, nil) on a clean miss
+// (caller should run the appropriate fill path), or (nil, false, err)
+// for non-recoverable cachestore errors.
+//
+// On a catalog hit that turns out to be stale (cachestore returns
+// ErrNotFound), the catalog entry is forgotten so the next call
+// re-stats fresh.
+func (c *Coordinator) lookupOrStat(ctx context.Context, k chunk.Key, objectSize int64) (io.ReadCloser, bool, error) {
 	expected := k.ExpectedLen(objectSize)
 
-	// Hot path: catalog hit -> direct read. The catalog can be stale
-	// (e.g. cachestore pruned out-of-band, or operator clear-cache);
-	// on ErrNotFound we forget and fall through to a fresh fill.
 	if _, ok := c.cat.Lookup(k); ok {
 		rc, err := c.cs.GetChunk(ctx, k, 0, expected)
 		if err == nil {
-			return rc, nil
+			return rc, true, nil
 		}
 
 		if errors.Is(err, cachestore.ErrNotFound) {
 			c.cat.Forget(k)
+			// fall through to stat
 		} else {
-			return nil, err
+			return nil, false, err
 		}
 	}
 
-	if info, err := c.cs.Stat(ctx, k); err == nil {
-		c.cat.Record(k, info)
-
-		readLen := info.Size
-		if expected > 0 && readLen > expected {
-			readLen = expected
+	info, err := c.cs.Stat(ctx, k)
+	if err != nil {
+		if errors.Is(err, cachestore.ErrNotFound) {
+			return nil, false, nil
 		}
 
-		return c.cs.GetChunk(ctx, k, 0, readLen)
-	} else if !errors.Is(err, cachestore.ErrNotFound) {
-		return nil, err
+		return nil, false, err
 	}
 
-	return c.fillLocal(ctx, k, objectSize)
+	c.cat.Record(k, info)
+
+	// Trust the stat's reported size if it disagrees with our
+	// expectation (e.g. older committed entry from before a chunk
+	// size change), but clamp to the expected length so a corrupt
+	// larger stat does not leak bytes past the object end.
+	readLen := info.Size
+	if expected > 0 && readLen > expected {
+		readLen = expected
+	}
+
+	rc, err := c.cs.GetChunk(ctx, k, 0, readLen)
+	if err != nil {
+		return nil, false, err
+	}
+
+	return rc, true, nil
 }
 
 // fillLocal runs (or joins) the singleflight for k on this replica.
@@ -249,7 +249,15 @@ func (c *Coordinator) fillLocal(ctx context.Context, k chunk.Key, objectSize int
 }
 
 func (c *Coordinator) runFill(k chunk.Key, objectSize int64, f *fill) {
-	// Use a fill-scoped context to outlive any single requester.
+	// runFill runs on a fill-scoped detached context (not the
+	// caller's) so it can complete the cachestore commit-after-serve
+	// step even if the originating client disconnects mid-stream.
+	// The 5-minute ceiling bounds the cost: a fill no joiner ever
+	// reads still releases its origin-semaphore slot and clears its
+	// inflight entry within the budget. Peak per-fill heap is one
+	// ChunkSize bytes.Buffer (8 MiB default). Without metrics this
+	// cost is invisible; revisit if production telemetry shows
+	// cancelled-by-client storms.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 

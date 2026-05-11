@@ -220,7 +220,12 @@ func (d *Driver) PutChunk(ctx context.Context, k chunk.Key, size int64, r io.Rea
 			return fmt.Errorf("cachestore/s3 put: read body: %w", err)
 		}
 
-		if int64(len(buf)) != size && size > 0 {
+		// Validate the actual byte count against the caller's
+		// claimed size. The previous '&& size > 0' carve-out
+		// silently disabled the check when callers passed size=0,
+		// which could upload arbitrary bytes with ContentLength=0
+		// and trigger backend errors that were harder to diagnose.
+		if int64(len(buf)) != size {
 			return fmt.Errorf("cachestore/s3 put: short body (got %d want %d)", len(buf), size)
 		}
 

@@ -9,7 +9,6 @@ package chunkcatalog
 import (
 	"container/list"
 	"sync"
-	"time"
 
 	"github.com/Azure/unbounded/internal/orca/cachestore"
 	"github.com/Azure/unbounded/internal/orca/chunk"
@@ -26,7 +25,6 @@ type Catalog struct {
 type entry struct {
 	path string
 	info cachestore.Info
-	at   time.Time
 }
 
 // New constructs a Catalog.
@@ -73,12 +71,11 @@ func (c *Catalog) Record(k chunk.Key, info cachestore.Info) {
 
 		e := el.Value.(*entry) //nolint:errcheck // type invariant: list elements are *entry
 		e.info = info
-		e.at = time.Now()
 
 		return
 	}
 
-	el := c.ll.PushFront(&entry{path: path, info: info, at: time.Now()})
+	el := c.ll.PushFront(&entry{path: path, info: info})
 
 	c.idx[path] = el
 	for c.ll.Len() > c.maxEntries {

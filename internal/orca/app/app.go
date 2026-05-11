@@ -70,7 +70,7 @@ type App struct {
 
 type options struct {
 	log                 *slog.Logger
-	clusterOpts         []cluster.Option
+	clusterOpt          cluster.Option
 	origin              origin.Origin
 	cacheStore          cachestore.CacheStore
 	skipCacheSelfTest   bool
@@ -91,10 +91,11 @@ func WithLogger(log *slog.Logger) Option {
 
 // WithPeerSource replaces the cluster's entire peer-discovery
 // mechanism. Intended for integration tests that need full control
-// (e.g. per-replica peer sets with explicit ports).
+// (e.g. per-replica peer sets with explicit ports). Only one such
+// override is meaningful per App; subsequent calls overwrite.
 func WithPeerSource(s cluster.PeerSource) Option {
 	return func(o *options) {
-		o.clusterOpts = append(o.clusterOpts, cluster.WithPeerSource(s))
+		o.clusterOpt = cluster.WithPeerSource(s)
 	}
 }
 
@@ -157,11 +158,18 @@ func WithOpsListener(ln net.Listener) Option {
 }
 
 // Start wires every dependency and begins serving on the configured
-// listeners. It returns once both listeners are accepting connections
+// listeners. It returns once all listeners are accepting connections
 // (or returns the error that prevented startup).
 //
 // The returned App must be Shutdown by the caller; Start does not own
 // the parent context's lifetime.
+//
+// Ordering note: cluster.New is called before any listener is bound.
+// Peers can therefore attempt internal-fill RPCs against this replica
+// before its listener is accepting; those connects fail and the
+// requester falls back to local fill via fetch.Coordinator.GetChunk's
+// peer-fallback path. This is transient (sub-second between cluster
+// construction and listener bind) and harmless.
 func Start(ctx context.Context, cfg *config.Config, opts ...Option) (*App, error) {
 	o := options{}
 	for _, opt := range opts {
@@ -200,7 +208,12 @@ func Start(ctx context.Context, cfg *config.Config, opts ...Option) (*App, error
 		cachestoreReady = true
 	}
 
-	cl, err := cluster.New(ctx, cfg.Cluster, o.clusterOpts...)
+	var clusterOpts []cluster.Option
+	if o.clusterOpt != nil {
+		clusterOpts = append(clusterOpts, o.clusterOpt)
+	}
+
+	cl, err := cluster.New(ctx, cfg.Cluster, clusterOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("init cluster: %w", err)
 	}
@@ -384,22 +397,25 @@ func (a *App) isReady() bool {
 }
 
 // Wait blocks until either the parent context is canceled or one of
-// the listeners exits unexpectedly. It returns the listener error (if
-// any) or nil if ctx was canceled. Wait is intended for the production
-// "serve until SIGTERM" path; tests typically call Shutdown directly.
+// the listeners exits unexpectedly. It returns the first listener
+// error (if any) or nil if ctx was canceled. Wait is intended for
+// the production "serve until SIGTERM" path; tests typically call
+// Shutdown directly.
+//
+// On ctx cancellation, any listener errors that have already landed
+// in errCh are drained and logged so they aren't silently discarded
+// when shutdown overlaps with a listener failure.
 func (a *App) Wait(ctx context.Context) error {
 	select {
 	case <-ctx.Done():
-		// Drain any listener error that happened to arrive at the
-		// same time as the shutdown signal so it shows up in logs
-		// rather than being silently discarded.
-		select {
-		case err := <-a.errCh:
-			a.log.Warn("listener error received during shutdown", "err", err)
-		default:
+		for {
+			select {
+			case err := <-a.errCh:
+				a.log.Warn("listener error received during shutdown", "err", err)
+			default:
+				return nil
+			}
 		}
-
-		return nil
 	case err := <-a.errCh:
 		return err
 	}

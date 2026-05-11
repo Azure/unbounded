@@ -79,29 +79,16 @@ func TestOpsHandler_Readyz_ReadyReturns200(t *testing.T) {
 	}
 }
 
-// TestApp_IsReady covers the AND logic over the two readiness
-// preconditions: cachestore-ready AND cluster-has-initial-snapshot.
-// Both must be true for isReady to return true.
-//
-// We can't construct *cluster.Cluster directly here (peers is a
-// private atomic.Pointer), so this test goes through isReady's
-// observable behaviour by checking the cachestoreReady gate.
-// The HasInitialSnapshot path is covered indirectly by the
-// integration suite which exercises full bootstrap.
+// TestApp_IsReady_RequiresCachestoreReady locks the AND-gating
+// behaviour of isReady. When cachestoreReady is false, isReady must
+// short-circuit and return false without touching the Cluster
+// pointer. Without that short-circuit a self-test failure that
+// leaves Cluster nil would panic the /readyz handler.
 func TestApp_IsReady_RequiresCachestoreReady(t *testing.T) {
 	t.Parallel()
-	// Building a real *cluster.Cluster here would tie this test to
-	// cluster.New's package-internal behaviour. Instead we exercise
-	// the gate at the App.isReady level via the underlying boolean
-	// composition: when cachestoreReady is false, isReady must be
-	// false irrespective of the cluster state.
-	//
-	// The cluster.HasInitialSnapshot() side is exercised by the
-	// orca-inttest suite which drives the full bootstrap path.
+
 	a := &App{cachestoreReady: false}
-	// Cluster left nil; calling isReady on it would panic if the
-	// gate were not short-circuiting on cachestoreReady. Failure
-	// to short-circuit is the regression we want to catch.
+
 	defer func() {
 		if r := recover(); r != nil {
 			t.Fatalf("isReady panicked instead of short-circuiting on cachestoreReady=false: %v", r)

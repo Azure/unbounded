@@ -105,10 +105,18 @@ func writeLP(h hash.Hash, s string) {
 // objectSize.
 //
 // Caller is responsible for clamping start / end against objectSize
-// before invoking; if end >= objectSize, end is clamped here.
+// before invoking; if end >= objectSize, end is clamped here. If
+// end is negative (e.g. an empty-object [0, -1] degenerate range),
+// last is clamped to 0 so the integer-division floor does not
+// silently produce a negative chunk index that could leak into
+// downstream loop bounds.
 func IndexRange(start, end, chunkSize, objectSize int64) (first, last int64) {
 	if end >= objectSize {
 		end = objectSize - 1
+	}
+
+	if end < 0 {
+		end = 0
 	}
 
 	first = start / chunkSize

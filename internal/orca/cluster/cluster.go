@@ -83,11 +83,11 @@ type Cluster struct {
 // dead peers if peer discovery is permanently broken.
 const maxStalePeerRefreshes = 5
 
-// Resolver looks up the host names that back the headless Service.
-// Production uses net.DefaultResolver. The interface is exposed so
-// the DNS-backed peer source can be tested in isolation; production
-// code does not customize it.
-type Resolver interface {
+// resolver looks up the host names that back the headless Service.
+// Production uses net.DefaultResolver. The interface is
+// package-internal: production code does not customize it, and the
+// DNS-backed peer source is the only implementation.
+type resolver interface {
 	LookupHost(ctx context.Context, host string) ([]string, error)
 }
 
@@ -122,22 +122,22 @@ func WithHTTPClient(c *http.Client) Option {
 	return func(cl *Cluster) { cl.httpClient = c }
 }
 
-func newDNSPeerSource(service, selfIP string, resolver Resolver) PeerSource {
-	if resolver == nil {
-		resolver = net.DefaultResolver
+func newDNSPeerSource(service, selfIP string, r resolver) PeerSource {
+	if r == nil {
+		r = net.DefaultResolver
 	}
 
 	return &dnsPeerSource{
 		service:  service,
 		selfIP:   selfIP,
-		resolver: resolver,
+		resolver: r,
 	}
 }
 
 type dnsPeerSource struct {
 	service  string
 	selfIP   string
-	resolver Resolver
+	resolver resolver
 }
 
 func (s *dnsPeerSource) Peers(ctx context.Context) ([]Peer, error) {
@@ -224,20 +224,15 @@ func (c *Cluster) HasInitialSnapshot() bool {
 	return c.peers.Load() != nil
 }
 
-// self returns the Peer for this replica.
-func (c *Cluster) self() Peer {
-	return Peer{IP: c.cfg.SelfPodIP, Self: true}
-}
-
 // Coordinator selects the rendezvous-hashed coordinator for a chunk.
 //
 // Returns the Peer with the highest hash(peer || chunk_path) score.
-// On empty peer set returns self (last-replica-standing fallback).
+// Peers() always returns at least one entry (self, via the bootstrap
+// fallback in Peers and the never-empty post-condition of every
+// branch in refresh), so this function does not need to handle an
+// empty input.
 func (c *Cluster) Coordinator(k chunk.Key) Peer {
 	peers := c.Peers()
-	if len(peers) == 0 {
-		return c.self()
-	}
 
 	path := []byte(k.Path())
 

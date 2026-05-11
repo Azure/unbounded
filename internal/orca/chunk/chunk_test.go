@@ -173,6 +173,11 @@ func TestIndexRange(t *testing.T) {
 		{"end clamped to objectSize", 0, 9999, 2048, 0, 1},
 		{"single byte", 5, 5, 1024, 0, 0},
 		{"last partial chunk", 1024, 1500, 1500, 1, 1},
+		// Empty-object guard: end = -1 (objectSize == 0). Without
+		// the negative-end clamp Go's integer division floors to 0
+		// but a subsequent negative-end could leak through other
+		// branches; defensive clamp here keeps last >= 0.
+		{"empty object end=-1 clamped to 0", 0, -1, 0, 0, 0},
 	}
 
 	for _, tt := range tests {
