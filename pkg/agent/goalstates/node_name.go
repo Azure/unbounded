@@ -56,7 +56,7 @@ func resolveNodeName(configNodeName, hostname, machineName string) (string, erro
 			return nodeName, nil
 		}
 
-		return "", fmt.Errorf("node name override %q is not a valid Kubernetes node name", configNodeName)
+		return "", fmt.Errorf("node name override %q is not a valid Kubernetes node name", nodeName)
 	}
 
 	if nodeName := strings.TrimSpace(hostname); isValidKubernetesNodeName(nodeName) {
