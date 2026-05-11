@@ -79,14 +79,14 @@ func (a *AgentConfig) BackfillNodeName() error {
 
 	if hostnameErr != nil {
 		return fmt.Errorf(
-			"machine name %q validation failed after host hostname lookup also failed: %w",
+			"machine name %q Kubernetes node name validation failed after host hostname lookup also failed: %w",
 			a.MachineName,
 			hostnameErr,
 		)
 	}
 
 	return fmt.Errorf(
-		"machine name %q validation failed after host hostname %q also failed validation",
+		"machine name %q Kubernetes node name validation failed after host hostname %q also failed validation",
 		a.MachineName,
 		hostNodeName,
 	)
