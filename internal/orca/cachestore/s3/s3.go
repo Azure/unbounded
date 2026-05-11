@@ -119,12 +119,21 @@ func New(ctx context.Context, cfg Config, log *slog.Logger) (*Driver, error) {
 // buckets, which would silently break atomic commit's no-clobber
 // guarantee.
 func (d *Driver) versioningGate(ctx context.Context) error {
+	d.log.LogAttrs(ctx, slog.LevelDebug, "versioning_gate_probe",
+		slog.String("bucket", d.bucket),
+	)
+
 	out, err := d.client.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{
 		Bucket: aws.String(d.bucket),
 	})
 	if err != nil {
 		return fmt.Errorf("cachestore/s3: GetBucketVersioning failed: %w", err)
 	}
+
+	d.log.LogAttrs(ctx, slog.LevelDebug, "versioning_gate_status",
+		slog.String("bucket", d.bucket),
+		slog.String("status", string(out.Status)),
+	)
 
 	return validateBucketVersioning(d.bucket, out.Status)
 }
@@ -153,6 +162,11 @@ func (d *Driver) SelfTestAtomicCommit(ctx context.Context) error {
 	probeKey := fmt.Sprintf("_orca-selftest/%s", randHex(16))
 	body := []byte("orca-selftest")
 
+	d.log.LogAttrs(ctx, slog.LevelDebug, "selftest_first_put",
+		slog.String("bucket", d.bucket),
+		slog.String("probe_key", probeKey),
+	)
+
 	// First put: must succeed.
 	_, err := d.client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:      aws.String(d.bucket),
@@ -163,6 +177,11 @@ func (d *Driver) SelfTestAtomicCommit(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("cachestore/s3 self-test: first put failed: %w", err)
 	}
+
+	d.log.LogAttrs(ctx, slog.LevelDebug, "selftest_second_put_expecting_412",
+		slog.String("bucket", d.bucket),
+		slog.String("probe_key", probeKey),
+	)
 
 	// Second put: must fail with 412.
 	_, err = d.client.PutObject(ctx, &s3.PutObjectInput{
@@ -193,6 +212,11 @@ func (d *Driver) SelfTestAtomicCommit(ctx context.Context) error {
 			"(want 412 PreconditionFailed): %w", err)
 	}
 
+	d.log.LogAttrs(ctx, slog.LevelDebug, "selftest_second_put_rejected_412",
+		slog.String("bucket", d.bucket),
+		slog.String("probe_key", probeKey),
+	)
+
 	// Cleanup probe key.
 	_, _ = d.client.DeleteObject(ctx, &s3.DeleteObjectInput{ //nolint:errcheck // best-effort selftest cleanup
 		Bucket: aws.String(d.bucket),
@@ -206,13 +230,25 @@ func (d *Driver) SelfTestAtomicCommit(ctx context.Context) error {
 func (d *Driver) GetChunk(ctx context.Context, k chunk.Key, off, n int64) (io.ReadCloser, error) {
 	rng := fmt.Sprintf("bytes=%d-%d", off, off+n-1)
 
+	d.log.LogAttrs(ctx, slog.LevelDebug, "cachestore_get_chunk",
+		csChunkAttrs(k),
+		slog.Int64("off", off),
+		slog.Int64("n", n),
+	)
+
 	out, err := d.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(d.bucket),
 		Key:    aws.String(k.Path()),
 		Range:  aws.String(rng),
 	})
 	if err != nil {
-		return nil, mapErr(err)
+		mapped := mapErr(err)
+		d.log.LogAttrs(ctx, slog.LevelDebug, "cachestore_get_chunk_err",
+			csChunkAttrs(k),
+			slog.Any("err", mapped),
+		)
+
+		return nil, mapped
 	}
 
 	return out.Body, nil
@@ -244,6 +280,11 @@ func (d *Driver) PutChunk(ctx context.Context, k chunk.Key, size int64, r io.Rea
 		body = bytes.NewReader(buf)
 	}
 
+	d.log.LogAttrs(ctx, slog.LevelDebug, "cachestore_put_chunk",
+		csChunkAttrs(k),
+		slog.Int64("size", size),
+	)
+
 	_, err := d.client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:        aws.String(d.bucket),
 		Key:           aws.String(k.Path()),
@@ -253,11 +294,26 @@ func (d *Driver) PutChunk(ctx context.Context, k chunk.Key, size int64, r io.Rea
 	})
 	if err != nil {
 		if isPreconditionFailed(err) {
+			d.log.LogAttrs(ctx, slog.LevelDebug, "cachestore_put_commit_lost",
+				csChunkAttrs(k),
+			)
+
 			return cachestore.ErrCommitLost
 		}
 
-		return mapErr(err)
+		mapped := mapErr(err)
+		d.log.LogAttrs(ctx, slog.LevelDebug, "cachestore_put_err",
+			csChunkAttrs(k),
+			slog.Any("err", mapped),
+		)
+
+		return mapped
 	}
+
+	d.log.LogAttrs(ctx, slog.LevelDebug, "cachestore_put_success",
+		csChunkAttrs(k),
+		slog.Int64("size", size),
+	)
 
 	return nil
 }
@@ -269,7 +325,17 @@ func (d *Driver) Stat(ctx context.Context, k chunk.Key) (cachestore.Info, error)
 		Key:    aws.String(k.Path()),
 	})
 	if err != nil {
-		return cachestore.Info{}, mapErr(err)
+		mapped := mapErr(err)
+		// ErrNotFound is the expected 'miss' result for Stat; logged
+		// at the same debug level as the hit path so cache-hit-rate
+		// diagnostics can count both.
+		d.log.LogAttrs(ctx, slog.LevelDebug, "cachestore_stat_result",
+			csChunkAttrs(k),
+			slog.Bool("present", false),
+			slog.Any("err", mapped),
+		)
+
+		return cachestore.Info{}, mapped
 	}
 
 	info := cachestore.Info{}
@@ -281,11 +347,21 @@ func (d *Driver) Stat(ctx context.Context, k chunk.Key) (cachestore.Info, error)
 		info.Committed = *out.LastModified
 	}
 
+	d.log.LogAttrs(ctx, slog.LevelDebug, "cachestore_stat_result",
+		csChunkAttrs(k),
+		slog.Bool("present", true),
+		slog.Int64("size", info.Size),
+	)
+
 	return info, nil
 }
 
 // Delete removes the chunk; idempotent.
 func (d *Driver) Delete(ctx context.Context, k chunk.Key) error {
+	d.log.LogAttrs(ctx, slog.LevelDebug, "cachestore_delete",
+		csChunkAttrs(k),
+	)
+
 	_, err := d.client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(d.bucket),
 		Key:    aws.String(k.Path()),
@@ -299,6 +375,19 @@ func (d *Driver) Delete(ctx context.Context, k chunk.Key) error {
 	}
 
 	return nil
+}
+
+// csChunkAttrs renders the chunk's identifying tuple as a slog
+// group attribute matching the cross-package 'chunk' taxonomy used
+// by fetch.Coordinator and chunkcatalog. Operator queries can grep
+// on a single attribute path across the request lifecycle.
+func csChunkAttrs(k chunk.Key) slog.Attr {
+	return slog.Group("chunk",
+		slog.String("origin_id", k.OriginID),
+		slog.String("bucket", k.Bucket),
+		slog.String("key", k.ObjectKey),
+		slog.Int64("index", k.Index),
+	)
 }
 
 func randHex(n int) string {
