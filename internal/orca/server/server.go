@@ -40,7 +40,7 @@ type EdgeHandler struct {
 // deterministic unit-level coverage.
 type edgeFetchAPI interface {
 	HeadObject(ctx context.Context, bucket, key string) (origin.ObjectInfo, error)
-	GetChunk(ctx context.Context, k chunk.Key) (io.ReadCloser, error)
+	GetChunk(ctx context.Context, k chunk.Key, objectSize int64) (io.ReadCloser, error)
 	Origin() origin.Origin
 }
 
@@ -163,7 +163,7 @@ func (h *EdgeHandler) handleGet(w http.ResponseWriter, r *http.Request, bucket, 
 			Index:     ci,
 		}
 
-		body, err := h.fc.GetChunk(r.Context(), ckey)
+		body, err := h.fc.GetChunk(r.Context(), ckey, info.Size)
 		if err != nil {
 			// We've already sent headers; abort the response.
 			h.log.Warn("mid-stream chunk fetch failed",
@@ -372,7 +372,7 @@ type InternalHandler struct {
 // internalFetchAPI is the surface area InternalHandler depends on. The
 // real *fetch.Coordinator satisfies it; tests substitute small fakes.
 type internalFetchAPI interface {
-	FillForPeer(ctx context.Context, k chunk.Key) (io.ReadCloser, error)
+	FillForPeer(ctx context.Context, k chunk.Key, objectSize int64) (io.ReadCloser, error)
 }
 
 // NewInternalHandler wires the internal handler.
@@ -397,7 +397,7 @@ func (h *InternalHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	k, err := cluster.DecodeChunkKey(r.URL.Query())
+	k, objectSize, err := cluster.DecodeChunkKey(r.URL.Query())
 	if err != nil {
 		http.Error(w, "invalid chunk key: "+err.Error(), http.StatusBadRequest)
 		return
@@ -408,7 +408,7 @@ func (h *InternalHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := h.fc.FillForPeer(r.Context(), k)
+	body, err := h.fc.FillForPeer(r.Context(), k, objectSize)
 	if err != nil {
 		h.log.Warn("internal fill failed", "chunk", k.String(), "err", err)
 		http.Error(w, "fill failed", http.StatusBadGateway)

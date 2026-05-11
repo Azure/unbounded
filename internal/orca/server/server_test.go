@@ -25,7 +25,7 @@ import (
 // method.
 type fakeEdgeAPI struct {
 	HeadObjectFunc func(ctx context.Context, bucket, key string) (origin.ObjectInfo, error)
-	GetChunkFunc   func(ctx context.Context, k chunk.Key) (io.ReadCloser, error)
+	GetChunkFunc   func(ctx context.Context, k chunk.Key, objectSize int64) (io.ReadCloser, error)
 	OriginVal      origin.Origin
 }
 
@@ -33,8 +33,8 @@ func (f *fakeEdgeAPI) HeadObject(ctx context.Context, bucket, key string) (origi
 	return f.HeadObjectFunc(ctx, bucket, key)
 }
 
-func (f *fakeEdgeAPI) GetChunk(ctx context.Context, k chunk.Key) (io.ReadCloser, error) {
-	return f.GetChunkFunc(ctx, k)
+func (f *fakeEdgeAPI) GetChunk(ctx context.Context, k chunk.Key, objectSize int64) (io.ReadCloser, error) {
+	return f.GetChunkFunc(ctx, k, objectSize)
 }
 
 func (f *fakeEdgeAPI) Origin() origin.Origin { return f.OriginVal }

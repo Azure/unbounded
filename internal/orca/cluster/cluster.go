@@ -248,8 +248,12 @@ func (c *Cluster) IsCoordinator(k chunk.Key) bool {
 }
 
 // FillFromPeer issues GET /internal/fill against the named peer and
-// returns the streaming chunk body. Caller closes the returned reader.
-func (c *Cluster) FillFromPeer(ctx context.Context, p Peer, k chunk.Key) (io.ReadCloser, error) {
+// returns the streaming chunk body. Caller closes the returned
+// reader. objectSize is the authoritative size of the object the
+// chunk belongs to; it is forwarded to the peer so the leader can
+// compute the correct per-chunk length (especially for the tail
+// chunk) and set Content-Length on its response.
+func (c *Cluster) FillFromPeer(ctx context.Context, p Peer, k chunk.Key, objectSize int64) (io.ReadCloser, error) {
 	if p.Self {
 		return nil, fmt.Errorf("cluster: refusing to FillFromPeer for self")
 	}
@@ -273,7 +277,7 @@ func (c *Cluster) FillFromPeer(ctx context.Context, p Peer, k chunk.Key) (io.Rea
 		Scheme:   scheme,
 		Host:     net.JoinHostPort(p.IP, port),
 		Path:     "/internal/fill",
-		RawQuery: encodeChunkKey(k),
+		RawQuery: encodeChunkKey(k, objectSize),
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
@@ -427,7 +431,7 @@ func rendezvousScore(p Peer, key []byte) uint64 {
 	return binary.BigEndian.Uint64(sum[:8])
 }
 
-func encodeChunkKey(k chunk.Key) string {
+func encodeChunkKey(k chunk.Key, objectSize int64) string {
 	v := url.Values{}
 	v.Set("origin_id", k.OriginID)
 	v.Set("bucket", k.Bucket)
@@ -435,29 +439,39 @@ func encodeChunkKey(k chunk.Key) string {
 	v.Set("etag", k.ETag)
 	v.Set("chunk_size", strconv.FormatInt(k.ChunkSize, 10))
 	v.Set("index", strconv.FormatInt(k.Index, 10))
+	v.Set("object_size", strconv.FormatInt(objectSize, 10))
 
 	return v.Encode()
 }
 
-// DecodeChunkKey parses query params into a Key. Used by the internal
-// listener (server/internal/fill).
-func DecodeChunkKey(values url.Values) (chunk.Key, error) {
+// DecodeChunkKey parses query params into a Key plus the authoritative
+// object size. Used by the internal listener (server/internal/fill).
+func DecodeChunkKey(values url.Values) (chunk.Key, int64, error) {
 	chunkSize, err := strconv.ParseInt(values.Get("chunk_size"), 10, 64)
 	if err != nil {
-		return chunk.Key{}, fmt.Errorf("invalid chunk_size: %w", err)
+		return chunk.Key{}, 0, fmt.Errorf("invalid chunk_size: %w", err)
 	}
 
 	if chunkSize <= 0 {
-		return chunk.Key{}, fmt.Errorf("invalid chunk_size: must be > 0, got %d", chunkSize)
+		return chunk.Key{}, 0, fmt.Errorf("invalid chunk_size: must be > 0, got %d", chunkSize)
 	}
 
 	idx, err := strconv.ParseInt(values.Get("index"), 10, 64)
 	if err != nil {
-		return chunk.Key{}, fmt.Errorf("invalid index: %w", err)
+		return chunk.Key{}, 0, fmt.Errorf("invalid index: %w", err)
 	}
 
 	if idx < 0 {
-		return chunk.Key{}, fmt.Errorf("invalid index: must be >= 0, got %d", idx)
+		return chunk.Key{}, 0, fmt.Errorf("invalid index: must be >= 0, got %d", idx)
+	}
+
+	objectSize, err := strconv.ParseInt(values.Get("object_size"), 10, 64)
+	if err != nil {
+		return chunk.Key{}, 0, fmt.Errorf("invalid object_size: %w", err)
+	}
+
+	if objectSize < 0 {
+		return chunk.Key{}, 0, fmt.Errorf("invalid object_size: must be >= 0, got %d", objectSize)
 	}
 
 	originID := values.Get("origin_id")
@@ -466,7 +480,7 @@ func DecodeChunkKey(values url.Values) (chunk.Key, error) {
 	etag := values.Get("etag")
 
 	if originID == "" || key == "" {
-		return chunk.Key{}, fmt.Errorf("missing required key fields")
+		return chunk.Key{}, 0, fmt.Errorf("missing required key fields")
 	}
 
 	return chunk.Key{
@@ -476,5 +490,5 @@ func DecodeChunkKey(values url.Values) (chunk.Key, error) {
 		ETag:      etag,
 		ChunkSize: chunkSize,
 		Index:     idx,
-	}, nil
+	}, objectSize, nil
 }

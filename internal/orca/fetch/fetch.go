@@ -101,16 +101,22 @@ func (c *Coordinator) HeadObject(ctx context.Context, bucket, key string) (origi
 // from CacheStore (hit) or by orchestrating a cluster-wide
 // dedup'd fill (miss).
 //
+// objectSize is the authoritative size of the object the chunk
+// belongs to (from origin Head). It is used to clamp the cachestore
+// read length and to size the tail chunk correctly on a miss.
+//
 // On miss:
 //   - If self is the coordinator: run local fill (origin GET via retry,
 //     atomic commit to CacheStore, populate buffer for joiners).
 //   - If a peer is the coordinator: send /internal/fill to that peer;
 //     stream from peer's response. On 409 Conflict, fall back to local
 //     fill.
-func (c *Coordinator) GetChunk(ctx context.Context, k chunk.Key) (io.ReadCloser, error) {
+func (c *Coordinator) GetChunk(ctx context.Context, k chunk.Key, objectSize int64) (io.ReadCloser, error) {
+	expected := expectedChunkLen(k, objectSize)
+
 	// Hot path: catalog hit -> direct CacheStore read.
 	if _, ok := c.cat.Lookup(k); ok {
-		rc, err := c.cs.GetChunk(ctx, k, 0, k.ChunkSize)
+		rc, err := c.cs.GetChunk(ctx, k, 0, expected)
 		if err == nil {
 			return rc, nil
 		}
@@ -127,7 +133,16 @@ func (c *Coordinator) GetChunk(ctx context.Context, k chunk.Key) (io.ReadCloser,
 	if info, err := c.cs.Stat(ctx, k); err == nil {
 		c.cat.Record(k, info)
 
-		return c.cs.GetChunk(ctx, k, 0, info.Size)
+		// Trust the stat's reported size if it disagrees with our
+		// expectation (e.g. older committed entry from before a chunk
+		// size change), but clamp to the expected length so a
+		// corrupt larger stat does not leak bytes past the object end.
+		readLen := info.Size
+		if expected > 0 && readLen > expected {
+			readLen = expected
+		}
+
+		return c.cs.GetChunk(ctx, k, 0, readLen)
 	} else if !errors.Is(err, cachestore.ErrNotFound) {
 		return nil, err
 	}
@@ -135,7 +150,7 @@ func (c *Coordinator) GetChunk(ctx context.Context, k chunk.Key) (io.ReadCloser,
 	// Cluster-wide dedup: route to coordinator.
 	coord := c.cl.Coordinator(k)
 	if !coord.Self {
-		rc, err := c.cl.FillFromPeer(ctx, coord, k)
+		rc, err := c.cl.FillFromPeer(ctx, coord, k, objectSize)
 		if err == nil {
 			return rc, nil
 		}
@@ -150,19 +165,21 @@ func (c *Coordinator) GetChunk(ctx context.Context, k chunk.Key) (io.ReadCloser,
 		}
 	}
 
-	return c.fillLocal(ctx, k)
+	return c.fillLocal(ctx, k, objectSize)
 }
 
 // FillForPeer is the path taken by the /internal/fill handler.
 //
 // The receiver becomes the leader for this fill (or joins an in-flight
 // fill for the same key). Returns a streaming body of the entire chunk.
-func (c *Coordinator) FillForPeer(ctx context.Context, k chunk.Key) (io.ReadCloser, error) {
+func (c *Coordinator) FillForPeer(ctx context.Context, k chunk.Key, objectSize int64) (io.ReadCloser, error) {
+	expected := expectedChunkLen(k, objectSize)
+
 	// Hot path: catalog hit -> direct read. The catalog can be stale
 	// (e.g. cachestore pruned out-of-band, or operator clear-cache);
 	// on ErrNotFound we forget and fall through to a fresh fill.
 	if _, ok := c.cat.Lookup(k); ok {
-		rc, err := c.cs.GetChunk(ctx, k, 0, k.ChunkSize)
+		rc, err := c.cs.GetChunk(ctx, k, 0, expected)
 		if err == nil {
 			return rc, nil
 		}
@@ -177,16 +194,43 @@ func (c *Coordinator) FillForPeer(ctx context.Context, k chunk.Key) (io.ReadClos
 	if info, err := c.cs.Stat(ctx, k); err == nil {
 		c.cat.Record(k, info)
 
-		return c.cs.GetChunk(ctx, k, 0, info.Size)
+		readLen := info.Size
+		if expected > 0 && readLen > expected {
+			readLen = expected
+		}
+
+		return c.cs.GetChunk(ctx, k, 0, readLen)
 	} else if !errors.Is(err, cachestore.ErrNotFound) {
 		return nil, err
 	}
 
-	return c.fillLocal(ctx, k)
+	return c.fillLocal(ctx, k, objectSize)
+}
+
+// expectedChunkLen returns the authoritative byte length of chunk k
+// given the object's total size. For non-tail chunks this is just
+// k.ChunkSize; for the tail chunk it is the remainder. If objectSize
+// is zero or negative (unknown), returns k.ChunkSize.
+func expectedChunkLen(k chunk.Key, objectSize int64) int64 {
+	if objectSize <= 0 {
+		return k.ChunkSize
+	}
+
+	off := k.Index * k.ChunkSize
+	if off >= objectSize {
+		return 0
+	}
+
+	remaining := objectSize - off
+	if remaining < k.ChunkSize {
+		return remaining
+	}
+
+	return k.ChunkSize
 }
 
 // fillLocal runs (or joins) the singleflight for k on this replica.
-func (c *Coordinator) fillLocal(ctx context.Context, k chunk.Key) (io.ReadCloser, error) {
+func (c *Coordinator) fillLocal(ctx context.Context, k chunk.Key, objectSize int64) (io.ReadCloser, error) {
 	path := k.Path()
 
 	c.mu.Lock()
@@ -197,7 +241,7 @@ func (c *Coordinator) fillLocal(ctx context.Context, k chunk.Key) (io.ReadCloser
 		c.inflight[path] = f
 		c.mu.Unlock()
 
-		go c.runFill(k, f)
+		go c.runFill(k, objectSize, f)
 	} else {
 		c.mu.Unlock()
 	}
@@ -215,7 +259,7 @@ func (c *Coordinator) fillLocal(ctx context.Context, k chunk.Key) (io.ReadCloser
 	return io.NopCloser(bytes.NewReader(f.bodyBuf.Bytes())), nil
 }
 
-func (c *Coordinator) runFill(k chunk.Key, f *fill) {
+func (c *Coordinator) runFill(k chunk.Key, objectSize int64, f *fill) {
 	// Use a fill-scoped context to outlive any single requester.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -240,10 +284,23 @@ func (c *Coordinator) runFill(k chunk.Key, f *fill) {
 
 	defer func() { <-c.originSem }()
 
-	// Pre-header retry loop.
-	off, length := k.Range()
+	// expectedLen is the authoritative number of bytes we should
+	// receive from origin: ChunkSize for non-tail chunks, the
+	// remainder for the tail. We request at most expectedLen and
+	// reject responses that don't match.
+	expectedLen := expectedChunkLen(k, objectSize)
+	off := k.Index * k.ChunkSize
 
-	body, err := c.fetchWithRetry(ctx, k, off, length)
+	requestLen := expectedLen
+	if requestLen == 0 {
+		// Fallback when objectSize is unknown: request the full chunk
+		// size; the validation below cannot distinguish a legitimate
+		// short tail from a flaky-origin short read, so the caller is
+		// trusting the origin in this mode.
+		requestLen = k.ChunkSize
+	}
+
+	body, err := c.fetchWithRetry(ctx, k, off, requestLen)
 	if err != nil {
 		f.err = err
 		return
@@ -253,6 +310,13 @@ func (c *Coordinator) runFill(k chunk.Key, f *fill) {
 	buf := &bytes.Buffer{}
 	if _, err := io.Copy(buf, body); err != nil {
 		f.err = fmt.Errorf("fill copy: %w", err)
+		return
+	}
+
+	if expectedLen > 0 && int64(buf.Len()) != expectedLen {
+		f.err = fmt.Errorf("origin returned %d bytes, expected %d (chunk=%s)",
+			buf.Len(), expectedLen, k.String())
+
 		return
 	}
 
