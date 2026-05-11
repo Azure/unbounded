@@ -113,6 +113,25 @@ func (h *EdgeHandler) handleGet(w http.ResponseWriter, r *http.Request, bucket, 
 		return
 	}
 
+	// Zero-byte objects short-circuit to 200 + empty body. The normal
+	// flow below would compute rangeEnd = info.Size - 1 = -1 and fall
+	// into the rangeStart > rangeEnd guard, returning a spurious 416
+	// for what should be a successful empty-body fetch. Any Range
+	// request against a zero-byte object is genuinely unsatisfiable
+	// and remains a 416 (RFC 7233).
+	if info.Size == 0 {
+		if r.Header.Get("Range") != "" {
+			http.Error(w, "range not satisfiable", http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+
+		setObjectHeaders(w, info)
+		w.Header().Set("Content-Length", "0")
+		w.WriteHeader(http.StatusOK)
+
+		return
+	}
+
 	// Determine byte range.
 	var (
 		rangeStart int64

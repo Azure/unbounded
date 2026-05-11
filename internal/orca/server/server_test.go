@@ -476,6 +476,73 @@ type errReader struct {
 func (r *errReader) Read(_ []byte) (int, error) { return 0, r.errFirst }
 func (r *errReader) Close() error               { r.closed = true; return nil }
 
+// TestHandleGet_EmptyObject_NoRange_Returns200 verifies that a GET
+// against a zero-byte object responds with 200 + Content-Length: 0
+// and an empty body. Previously the handler computed rangeEnd = -1
+// and fell into the unsatisfiable-range branch, returning a spurious
+// 416 for what should be a successful empty-body fetch.
+func TestHandleGet_EmptyObject_NoRange_Returns200(t *testing.T) {
+	t.Parallel()
+
+	info := origin.ObjectInfo{Size: 0, ETag: "etag-empty", ContentType: "application/octet-stream"}
+
+	fc := &fakeEdgeAPI{
+		HeadObjectFunc: func(_ context.Context, _, _ string) (origin.ObjectInfo, error) {
+			return info, nil
+		},
+		// GetChunkFunc deliberately unset; the short-circuit must
+		// not call into the fetch coordinator for zero-byte objects.
+	}
+
+	cfg := &config.Config{Chunking: config.Chunking{Size: 1024}}
+	h := NewEdgeHandler(fc, cfg, discardLogger())
+
+	req := httptest.NewRequest(http.MethodGet, "/bucket/empty", nil)
+	rr := httptest.NewRecorder()
+	h.handleGet(rr, req, "bucket", "empty")
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("status=%d want %d", rr.Code, http.StatusOK)
+	}
+
+	if rr.Body.Len() != 0 {
+		t.Errorf("body=%d bytes, want 0", rr.Body.Len())
+	}
+
+	if got := rr.Header().Get("Content-Length"); got != "0" {
+		t.Errorf("Content-Length=%q want %q", got, "0")
+	}
+}
+
+// TestHandleGet_EmptyObject_WithRange_Returns416 verifies that a
+// Range request against a zero-byte object remains a 416. RFC 7233
+// classifies any range over a zero-byte representation as
+// unsatisfiable.
+func TestHandleGet_EmptyObject_WithRange_Returns416(t *testing.T) {
+	t.Parallel()
+
+	info := origin.ObjectInfo{Size: 0, ETag: "etag-empty"}
+
+	fc := &fakeEdgeAPI{
+		HeadObjectFunc: func(_ context.Context, _, _ string) (origin.ObjectInfo, error) {
+			return info, nil
+		},
+	}
+
+	cfg := &config.Config{Chunking: config.Chunking{Size: 1024}}
+	h := NewEdgeHandler(fc, cfg, discardLogger())
+
+	req := httptest.NewRequest(http.MethodGet, "/bucket/empty", nil)
+	req.Header.Set("Range", "bytes=0-0")
+
+	rr := httptest.NewRecorder()
+	h.handleGet(rr, req, "bucket", "empty")
+
+	if rr.Code != http.StatusRequestedRangeNotSatisfiable {
+		t.Errorf("status=%d want %d", rr.Code, http.StatusRequestedRangeNotSatisfiable)
+	}
+}
+
 // TestHandleGet_FirstChunkErrorReturnsCleanError verifies that when
 // the very first chunk fetch fails the edge handler responds with an
 // S3-style error response (proper status + error body) rather than
