@@ -121,7 +121,12 @@ func (a *Adapter) GetRange(ctx context.Context, bucket, key, etag string, off, n
 	}
 
 	if etag != "" {
-		etagVal := azcore.ETag(etag)
+		// Azure (like S3) expects the entity-tag value in If-Match
+		// to be a quoted-string per RFC 7232. We strip the quotes
+		// on Head (a.cfg internal representation is unquoted) so
+		// re-wrap here at the point of egress, mirroring the
+		// awss3 driver.
+		etagVal := azcore.ETag("\"" + etag + "\"")
 		opts.AccessConditions = &blob.AccessConditions{
 			ModifiedAccessConditions: &blob.ModifiedAccessConditions{
 				IfMatch: to.Ptr(etagVal),
