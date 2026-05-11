@@ -405,5 +405,160 @@ corrections:
 - **Q1**'s "dead branch" claim verified by the reviewer.
 
 Adversarial-review verdict: "ship with corrections."
+
+---
+
+## Second-pass findings and remediation
+
+A second review pass over the orca packages turned up additional
+issues and led to 12 follow-up commits.
+
+### Landed findings
+
+The following findings were identified and fixed in the second pass.
+The naming convention re-starts (B-1 through B-11, etc.) since the
+first pass already used B1-B8 with different meanings; readers should
+disambiguate by surrounding text.
+
+- **B-1 (block-blob and versioning gates locked unconditionally).**
+  `config.applyDefaults` used `if !X { X = true }` for two booleans
+  (`EnforceBlockBlobOnly`, `RequireUnversionedBucket`). The shape
+  implied operators could opt out, but the code actually overrode
+  user-set `false` back to `true`. Removed both fields from
+  config; drivers always enforce. YAML now ignores both keys (clean
+  break: operators who set them will fail to parse).
+- **B-2 (zero-byte object served 416).** Edge handler computed
+  `rangeEnd = info.Size - 1 = -1`, then fell into the
+  `rangeStart > rangeEnd` guard, returning 416 for a normal GET on
+  an empty file. Added an explicit size==0 short-circuit; Range
+  requests against zero-byte objects remain 416 per RFC 7233.
+- **B-7 (Azure If-Match unquoted).** `azureblob.GetRange` passed the
+  internal unquoted ETag straight to `azcore.ETag` for `If-Match`.
+  Now re-wraps the value in quotes at egress, mirroring the awss3
+  driver. RFC 7232 requires quoted-strings; Azure tolerated unquoted
+  values in practice but the contract was inconsistent across
+  drivers.
+- **B-9 (60s wall timeout on cross-replica HTTP client).**
+  `cluster.newHTTPClient` carried `Client.Timeout: 60s` which
+  aborted any internal-fill body stream exceeding the budget
+  (plausible for 8 MiB chunks on degraded links). Removed the wall
+  clock; caller ctx (edge request ctx or `fetch.runFill`'s detached
+  fill ctx) is the sole deadline.
+- **B-3 / B-4 / B-6 (cachestore/s3 error mapping).** Three related
+  bugs: `isPreconditionFailed` matched `"InvalidArgument"` and
+  `"ConditionalRequestConflict"` plus `strings.Contains(err.Error(),
+  "412")`; `mapErr` 5xx detection was `strings.Contains(err.Error(),
+  "StatusCode: 5")`; a vestigial `_ = http.StatusOK` kept the
+  `net/http` import alive. All three replaced by
+  `*awshttp.ResponseError`-based HTTP status code inspection.
+- **Q-10 (awss3 mirror of the above).** Same string-matching
+  fragility in the origin driver. Same fix.
+- **O-4 (slog.Default in fetch.Coordinator).** Coordinator hardcoded
+  `slog.Default()` for peer-fallback warnings and
+  commit-after-serve traces, preventing operators from routing
+  fetch-path logs alongside the rest of the runtime. Injected
+  `*slog.Logger` through `NewCoordinator`.
+- **O-2 (no kubelet probe endpoints).** Added a third HTTP listener
+  bound to `cfg.Server.OpsListen` (default `0.0.0.0:8442`, plain
+  HTTP, no auth). Routes: `/healthz` always 200, `/readyz` returns
+  200 once cachestore self-test passed AND cluster has loaded its
+  initial peer-set snapshot. Deployment template gains livenessProbe
+  and readinessProbe entries.
+- **C-3 (pipe-delimited metadata cache keys).** `metadata.mkKey`
+  built `originID + "|" + bucket + "|" + key`. S3 object keys may
+  legally contain `|`. Switched to length-prefixed encoding;
+  in-memory only, no on-disk compatibility implication.
+- **B-11 (refresh streak bumped on ctx-canceled).**
+  `cluster.refresh` treated the `context.Canceled` from PeerSource
+  during graceful shutdown as a discovery failure, bumping the
+  streak counter and emitting a 'discovery failed' warning. Now
+  short-circuits on ctx-canceled / ctx-deadline-exceeded.
+
+### Smaller cleanups landed alongside
+
+- **B-5**: `cachestore/s3.PutChunk` dropped the `&& size > 0`
+  carve-out on the size validation.
+- **B-8**: removed unreachable `len(peers)==0` branch in
+  `cluster.Coordinator` (Peers() always returns >= 1 element).
+- **B-10**: defensively clamp `end >= 0` in `chunk.IndexRange`.
+- **Q-1**: extracted `fetch.lookupOrStat` helper shared by `GetChunk`
+  and `FillForPeer` (was duplicated catalog/stat hot path).
+- **Q-5**: removed unread `entry.at` field from `chunkcatalog`.
+- **Q-7**: extracted `cleanupOnStartFailure` helper from `app.Start`
+  (was duplicated three times for edge / internal / ops bind
+  failures).
+- **Q-8**: `app.Wait` loop-drains `errCh` on ctx-cancel rather than
+  draining only one error.
+- **Q-9**: introduced `unwrapAzcoreETag` helper in azureblob
+  driver, replacing two open-coded `strings.Trim` sites.
+- **S-1**: unexported `cluster.Resolver` -> `resolver` (no external
+  consumer).
+- **S-2**: `app.options.clusterOpts []cluster.Option` ->
+  `clusterOpt cluster.Option` (was always 0 or 1 element).
+- Doc comments added for the detached `runFill` context, the
+  singleflight ctx-propagation tradeoff in
+  `metadata.LookupOrFetch`, and the cluster-before-listener startup
+  ordering.
+
+### Deferred items (with rationale)
+
+These findings were identified in the second pass but explicitly
+deferred. Each has a reason documented here so they aren't silently
+dropped from future remediation work.
+
+- **Q-2 (8 MiB-per-fill peak heap, streaming validator).** Without
+  the `fills_inflight` metric we chose to skip in this pass, we
+  cannot measure actual incidence under load. Current behaviour is
+  correct; the streaming-validator refactor touches the critical
+  `runFill` path and risks subtle bugs in commit-after-serve.
+  Revisit when metrics land and we observe real fill concurrency.
+
+- **Q-3 (SHA-256 -> xxhash for rendezvous score).** Pure performance
+  optimization. Today's load (small N peers, ~16 chunks/sec at
+  1 Gbps, 5 peers = 80 hash/sec) makes SHA-256 a non-issue.
+  Premature.
+
+- **Q-4 (endianness consistency between chunk.Path LittleEndian and
+  cluster.rendezvousScore BigEndian).** Cosmetic. Touching
+  `chunk.Path` invalidates the on-store key (silent cache reset on
+  first deploy after upgrade). Park alongside the next storage-key
+  change.
+
+- **Q-11 (multi-range request support).** Explicit MVP scope
+  decision; documented in the edge handler. Multi-range returns 416
+  today, technically RFC-non-compliant but the simplest
+  reviewer-acceptable shape.
+
+- **Q-12 (planRange helper for handleGet).** Worthwhile readability
+  refactor but the handler has just-stabilised B-4 logic and is
+  well-tested. Refactor risk > readability win.
+
+- **S-3 (CoordinatorChecker interface for InternalHandler).** Tests
+  currently construct a real Cluster with a single-self peer source
+  and that suffices. Adding the interface expands surface area
+  without immediate test pain.
+
+- **S-4 (split SelfTestAtomicCommit into a separate interface).**
+  Aesthetic only; current shape doesn't cause friction.
+
+- **S-5 (split List out of origin.Origin).** Aesthetic. Would matter
+  if we added a list-less driver, which isn't planned.
+
+- **S-6 (TEST-ONLY listener-override options in a separate
+  package).** Inline doc comments already mark them TEST-ONLY; no
+  current cost.
+
+- **O-1 (Prometheus metrics surface).** Explicitly deferred to a
+  separate effort; the operator-observability tier wants more
+  thought than the cleanup-pass shape supports.
+
+### Verification
+
+Every second-pass commit ran the full `make` chain (gofumpt,
+golangci-lint, go test) plus `make orca-inttest`. For T2.1
+(cachestore/s3 error mapping), inttest also served as the
+verification gate that LocalStack 3.8 returns HTTP 412 on
+If-None-Match conflict (rather than the legacy `InvalidArgument`
+code we previously matched).
 </content>
 </invoke>
