@@ -30,6 +30,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -65,9 +66,21 @@ type Cluster struct {
 	httpClient *http.Client
 	source     PeerSource
 
+	// consecutiveRefreshErrors counts adjacent failed refresh attempts.
+	// Reset on any successful refresh. When the count exceeds
+	// maxStalePeerRefreshes the retained-previous fallback gives up
+	// and reverts to a self-only peer set.
+	consecutiveRefreshErrors atomic.Int64
+
 	cancelFn context.CancelFunc
 	done     chan struct{}
 }
+
+// maxStalePeerRefreshes is the number of consecutive refresh failures
+// after which Cluster.refresh stops retaining the previous peer-set
+// snapshot and falls back to [Self]. Bounds how long we route to
+// dead peers if peer discovery is permanently broken.
+const maxStalePeerRefreshes = 5
 
 // Resolver looks up the host names that back the headless Service.
 // Production uses net.DefaultResolver. The interface is exposed so
@@ -306,8 +319,35 @@ func (c *Cluster) refreshLoop(ctx context.Context) {
 
 func (c *Cluster) refresh(ctx context.Context) {
 	peers, err := c.source.Peers(ctx)
-	if err != nil || len(peers) == 0 {
-		// Empty-peer-set fallback: treat self as only peer.
+	if err != nil {
+		// Discovery failed. Retain the previous snapshot if we have
+		// one and we have not exceeded the staleness ceiling; the
+		// internal-fill RPC fallback (cluster.ErrPeerNotCoordinator
+		// -> local fill in fetch.Coordinator.GetChunk) absorbs
+		// pointing at briefly-stale peers. On bootstrap (no previous
+		// snapshot) or after too many consecutive errors, fall back
+		// to a self-only peer set so we keep making forward progress.
+		streak := c.consecutiveRefreshErrors.Add(1)
+
+		if c.peers.Load() != nil && streak <= maxStalePeerRefreshes {
+			slog.Default().Warn("cluster: peer discovery failed; retaining previous snapshot",
+				"err", err, "consecutive_errors", streak)
+
+			return
+		}
+
+		self := []Peer{{IP: c.cfg.SelfPodIP, Self: true}}
+		c.peers.Store(&self)
+
+		return
+	}
+
+	c.consecutiveRefreshErrors.Store(0)
+
+	if len(peers) == 0 {
+		// DNS legitimately reports no peers (e.g. headless Service
+		// has no Ready pods other than maybe self). Apply self-only
+		// fallback.
 		self := []Peer{{IP: c.cfg.SelfPodIP, Self: true}}
 		c.peers.Store(&self)
 
