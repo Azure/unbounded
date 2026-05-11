@@ -203,7 +203,7 @@ func Start(ctx context.Context, cfg *config.Config, opts ...Option) (*App, error
 			return nil, fmt.Errorf("cachestore self-test failed: %w", err)
 		}
 
-		log.Info("cachestore self-test passed")
+		log.LogAttrs(ctx, slog.LevelInfo, "cachestore self-test passed")
 
 		cachestoreReady = true
 	}
@@ -293,7 +293,9 @@ func Start(ctx context.Context, cfg *config.Config, opts ...Option) (*App, error
 	go func() {
 		defer a.wg.Done()
 
-		log.Info("edge listener", "addr", a.EdgeAddr)
+		log.LogAttrs(ctx, slog.LevelInfo, "edge listener",
+			slog.String("addr", a.EdgeAddr),
+		)
 
 		if err := a.edgeSrv.Serve(edgeLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			a.errCh <- fmt.Errorf("edge listener: %w", err)
@@ -305,9 +307,9 @@ func Start(ctx context.Context, cfg *config.Config, opts ...Option) (*App, error
 	go func() {
 		defer a.wg.Done()
 
-		log.Info("internal listener",
-			"addr", a.InternalAddr,
-			"tls_enabled", cfg.Cluster.InternalTLS.Enabled,
+		log.LogAttrs(ctx, slog.LevelInfo, "internal listener",
+			slog.String("addr", a.InternalAddr),
+			slog.Bool("tls_enabled", cfg.Cluster.InternalTLS.Enabled),
 		)
 
 		var lerr error
@@ -317,8 +319,9 @@ func Start(ctx context.Context, cfg *config.Config, opts ...Option) (*App, error
 				cfg.Cluster.InternalTLS.KeyFile,
 			)
 		} else {
-			log.Warn("internal listener TLS DISABLED - unsafe for production",
-				"addr", a.InternalAddr)
+			log.LogAttrs(ctx, slog.LevelWarn, "internal listener TLS DISABLED - unsafe for production",
+				slog.String("addr", a.InternalAddr),
+			)
 
 			lerr = a.internalSrv.Serve(internalLn)
 		}
@@ -333,7 +336,9 @@ func Start(ctx context.Context, cfg *config.Config, opts ...Option) (*App, error
 	go func() {
 		defer a.wg.Done()
 
-		log.Info("ops listener", "addr", a.OpsAddr)
+		log.LogAttrs(ctx, slog.LevelInfo, "ops listener",
+			slog.String("addr", a.OpsAddr),
+		)
 
 		if err := a.opsSrv.Serve(opsLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			a.errCh <- fmt.Errorf("ops listener: %w", err)
@@ -411,7 +416,9 @@ func (a *App) Wait(ctx context.Context) error {
 		for {
 			select {
 			case err := <-a.errCh:
-				a.log.Warn("listener error received during shutdown", "err", err)
+				a.log.LogAttrs(ctx, slog.LevelWarn, "listener error received during shutdown",
+					slog.Any("err", err),
+				)
 			default:
 				return nil
 			}
@@ -427,13 +434,17 @@ func (a *App) Shutdown(ctx context.Context) error {
 	var firstErr error
 
 	if err := a.edgeSrv.Shutdown(ctx); err != nil {
-		a.log.Warn("edge listener shutdown failed", "err", err)
+		a.log.LogAttrs(ctx, slog.LevelWarn, "edge listener shutdown failed",
+			slog.Any("err", err),
+		)
 
 		firstErr = err
 	}
 
 	if err := a.internalSrv.Shutdown(ctx); err != nil {
-		a.log.Warn("internal listener shutdown failed", "err", err)
+		a.log.LogAttrs(ctx, slog.LevelWarn, "internal listener shutdown failed",
+			slog.Any("err", err),
+		)
 
 		if firstErr == nil {
 			firstErr = err
@@ -442,7 +453,9 @@ func (a *App) Shutdown(ctx context.Context) error {
 
 	if a.opsSrv != nil {
 		if err := a.opsSrv.Shutdown(ctx); err != nil {
-			a.log.Warn("ops listener shutdown failed", "err", err)
+			a.log.LogAttrs(ctx, slog.LevelWarn, "ops listener shutdown failed",
+				slog.Any("err", err),
+			)
 
 			if firstErr == nil {
 				firstErr = err
@@ -451,7 +464,9 @@ func (a *App) Shutdown(ctx context.Context) error {
 	}
 
 	if err := a.Cluster.Close(ctx); err != nil {
-		a.log.Warn("cluster close did not finish before ctx deadline", "err", err)
+		a.log.LogAttrs(ctx, slog.LevelWarn, "cluster close did not finish before ctx deadline",
+			slog.Any("err", err),
+		)
 
 		if firstErr == nil {
 			firstErr = err

@@ -4,6 +4,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/xml"
 	"errors"
@@ -744,8 +745,48 @@ func encodeQuery(k chunk.Key, objectSize int64) string {
 
 // helpers
 
+// TestEdgeHandler_DebugEmissions verifies that the edge handler
+// emits a debug-level 'edge_request' trace at entry and at least
+// one of the response-shape emissions for HEAD/GET. Operators rely
+// on these to trace a single request across the structured-log
+// output.
+func TestEdgeHandler_DebugEmissions(t *testing.T) {
+	t.Parallel()
+
+	info := origin.ObjectInfo{Size: 5, ETag: "etag-xyz", ContentType: "application/octet-stream"}
+
+	fc := &fakeEdgeAPI{
+		HeadObjectFunc: func(_ context.Context, _, _ string) (origin.ObjectInfo, error) {
+			return info, nil
+		},
+	}
+
+	var buf bytes.Buffer
+
+	cfg := &config.Config{Chunking: config.Chunking{Size: 1024}}
+	h := NewEdgeHandler(fc, cfg, debugLoggerTo(&buf))
+
+	req := httptest.NewRequest(http.MethodHead, "/bkt/obj", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	out := buf.String()
+	for _, want := range []string{"edge_request", "edge_head_response", "bucket=bkt", "key=obj"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %q in debug output; got %q", want, out)
+		}
+	}
+}
+
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// debugLoggerTo returns a slog.Logger that writes Debug-and-above
+// emissions to buf. Used by tests asserting debug-trace emission
+// at known call sites.
+func debugLoggerTo(buf *bytes.Buffer) *slog.Logger {
+	return slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 }
 
 func equalStrings(a, b []string) bool {

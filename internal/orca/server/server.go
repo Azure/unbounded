@@ -73,6 +73,15 @@ func (h *EdgeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	bucket, key := splitPath(r.URL.Path)
 
+	h.log.LogAttrs(r.Context(), slog.LevelDebug, "edge_request",
+		slog.String("method", r.Method),
+		slog.String("path", r.URL.Path),
+		slog.String("bucket", bucket),
+		slog.String("key", key),
+		slog.String("range", r.Header.Get("Range")),
+		slog.String("remote", r.RemoteAddr),
+	)
+
 	switch r.Method {
 	case http.MethodHead:
 		if key == "" {
@@ -99,6 +108,13 @@ func (h *EdgeHandler) handleHead(w http.ResponseWriter, r *http.Request, bucket,
 		h.writeOriginError(w, err)
 		return
 	}
+
+	h.log.LogAttrs(r.Context(), slog.LevelDebug, "edge_head_response",
+		slog.String("bucket", bucket),
+		slog.String("key", key),
+		slog.Int64("size", info.Size),
+		slog.String("etag", origin.ETagShort(info.ETag)),
+	)
 
 	setObjectHeaders(w, info)
 	// HEAD must report the Content-Length the GET response would carry.
@@ -129,6 +145,11 @@ func (h *EdgeHandler) handleGet(w http.ResponseWriter, r *http.Request, bucket, 
 		w.Header().Set("Content-Length", "0")
 		w.WriteHeader(http.StatusOK)
 
+		h.log.LogAttrs(r.Context(), slog.LevelDebug, "edge_get_empty_object",
+			slog.String("bucket", bucket),
+			slog.String("key", key),
+		)
+
 		return
 	}
 
@@ -158,6 +179,16 @@ func (h *EdgeHandler) handleGet(w http.ResponseWriter, r *http.Request, bucket, 
 
 	chunkSize := h.cfg.Chunking.Size
 	firstChunk, lastChunk := chunk.IndexRange(rangeStart, rangeEnd, chunkSize, info.Size)
+
+	h.log.LogAttrs(r.Context(), slog.LevelDebug, "edge_get_plan",
+		slog.String("bucket", bucket),
+		slog.String("key", key),
+		slog.Int64("range_start", rangeStart),
+		slog.Int64("range_end", rangeEnd),
+		slog.Int64("first_chunk", firstChunk),
+		slog.Int64("last_chunk", lastChunk),
+		slog.Bool("has_range", hasRange),
+	)
 
 	// Fetch the first chunk before committing any response headers
 	// so that origin errors (404, auth, timeout, mid-stream blob
@@ -210,8 +241,12 @@ func (h *EdgeHandler) handleGet(w http.ResponseWriter, r *http.Request, bucket, 
 	off, length := chunk.ChunkSlice(firstChunk, chunkSize, rangeStart, rangeEnd, info.Size)
 	if err := streamSlice(w, firstReader, off, length); err != nil {
 		firstBody.Close() //nolint:errcheck // body close best-effort, response already streaming
-		h.log.Warn("mid-stream copy failed",
-			"bucket", bucket, "key", key, "chunk", firstChunk, "err", err)
+		h.log.LogAttrs(r.Context(), slog.LevelWarn, "mid-stream copy failed",
+			slog.String("bucket", bucket),
+			slog.String("key", key),
+			slog.Int64("chunk", firstChunk),
+			slog.Any("err", err),
+		)
 
 		return
 	}
@@ -232,11 +267,21 @@ func (h *EdgeHandler) handleGet(w http.ResponseWriter, r *http.Request, bucket, 
 			Index:     ci,
 		}
 
+		h.log.LogAttrs(r.Context(), slog.LevelDebug, "edge_get_chunk_next",
+			slog.String("bucket", bucket),
+			slog.String("key", key),
+			slog.Int64("chunk", ci),
+		)
+
 		body, err := h.fc.GetChunk(r.Context(), ckey, info.Size)
 		if err != nil {
 			// We've already sent headers; abort the response.
-			h.log.Warn("mid-stream chunk fetch failed",
-				"bucket", bucket, "key", key, "chunk", ci, "err", err)
+			h.log.LogAttrs(r.Context(), slog.LevelWarn, "mid-stream chunk fetch failed",
+				slog.String("bucket", bucket),
+				slog.String("key", key),
+				slog.Int64("chunk", ci),
+				slog.Any("err", err),
+			)
 
 			return
 		}
@@ -244,8 +289,12 @@ func (h *EdgeHandler) handleGet(w http.ResponseWriter, r *http.Request, bucket, 
 		off, length := chunk.ChunkSlice(ci, chunkSize, rangeStart, rangeEnd, info.Size)
 		if err := streamSlice(w, body, off, length); err != nil {
 			body.Close() //nolint:errcheck // chunk body close best-effort, response already streaming
-			h.log.Warn("mid-stream copy failed",
-				"bucket", bucket, "key", key, "chunk", ci, "err", err)
+			h.log.LogAttrs(r.Context(), slog.LevelWarn, "mid-stream copy failed",
+				slog.String("bucket", bucket),
+				slog.String("key", key),
+				slog.Int64("chunk", ci),
+				slog.Any("err", err),
+			)
 
 			return
 		}
@@ -256,6 +305,12 @@ func (h *EdgeHandler) handleGet(w http.ResponseWriter, r *http.Request, bucket, 
 			f.Flush()
 		}
 	}
+
+	h.log.LogAttrs(r.Context(), slog.LevelDebug, "edge_get_complete",
+		slog.String("bucket", bucket),
+		slog.String("key", key),
+		slog.Int64("bytes", rangeEnd-rangeStart+1),
+	)
 }
 
 // streamSlice copies length bytes starting at off from src to dst.
@@ -355,7 +410,9 @@ func (h *EdgeHandler) writeOriginError(w http.ResponseWriter, err error) {
 		case errors.As(err, &ec):
 			http.Error(w, "OriginETagChanged", http.StatusBadGateway)
 		default:
-			h.log.Warn("origin error", "err", err)
+			h.log.LogAttrs(context.Background(), slog.LevelWarn, "origin error",
+				slog.Any("err", err),
+			)
 			http.Error(w, "OriginUnreachable", http.StatusBadGateway)
 		}
 	}
@@ -472,14 +529,28 @@ func (h *InternalHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.log.LogAttrs(r.Context(), slog.LevelDebug, "internal_fill_request",
+		intChunkAttrs(k),
+		slog.Int64("object_size", objectSize),
+		slog.String("remote", r.RemoteAddr),
+	)
+
 	if !h.cl.IsCoordinator(k) {
+		h.log.LogAttrs(r.Context(), slog.LevelDebug, "internal_fill_not_coordinator",
+			intChunkAttrs(k),
+			slog.String("remote", r.RemoteAddr),
+		)
 		http.Error(w, `{"reason":"not_coordinator"}`, http.StatusConflict)
+
 		return
 	}
 
 	body, err := h.fc.FillForPeer(r.Context(), k, objectSize)
 	if err != nil {
-		h.log.Warn("internal fill failed", "chunk", k.String(), "err", err)
+		h.log.LogAttrs(r.Context(), slog.LevelWarn, "internal fill failed",
+			intChunkAttrs(k),
+			slog.Any("err", err),
+		)
 		http.Error(w, "fill failed", http.StatusBadGateway)
 
 		return
@@ -500,6 +571,27 @@ func (h *InternalHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 
 	if _, copyErr := io.Copy(w, body); copyErr != nil {
-		h.log.Warn("internal fill copy failed", "chunk", k.String(), "err", copyErr)
+		h.log.LogAttrs(r.Context(), slog.LevelWarn, "internal fill copy failed",
+			intChunkAttrs(k),
+			slog.Any("err", copyErr),
+		)
+
+		return
 	}
+
+	h.log.LogAttrs(r.Context(), slog.LevelDebug, "internal_fill_complete",
+		intChunkAttrs(k),
+		slog.Int64("bytes", expectedLen),
+	)
+}
+
+// intChunkAttrs renders the chunk's identifying tuple as a slog
+// group attribute matching the cross-package 'chunk' taxonomy.
+func intChunkAttrs(k chunk.Key) slog.Attr {
+	return slog.Group("chunk",
+		slog.String("origin_id", k.OriginID),
+		slog.String("bucket", k.Bucket),
+		slog.String("key", k.ObjectKey),
+		slog.Int64("index", k.Index),
+	)
 }
