@@ -29,7 +29,7 @@ type NodeIdentity struct {
 // ResolveNodeIdentity resolves the agent machine/node identity shared by host
 // daemon code and nspawn machine goal state.
 func ResolveNodeIdentity(cfg *config.AgentConfig, machineName string) (*NodeIdentity, error) {
-	nodeName, err := ResolveHostNodeName(cfg.MachineName)
+	nodeName, err := resolveHostNodeName(cfg.NodeName, cfg.MachineName)
 	if err != nil {
 		return nil, fmt.Errorf("resolve node name: %w", err)
 	}
@@ -41,19 +41,24 @@ func ResolveNodeIdentity(cfg *config.AgentConfig, machineName string) (*NodeIden
 	}, nil
 }
 
-// ResolveHostNodeName resolves the Kubernetes Node name for this host.
-func ResolveHostNodeName(machineName string) (string, error) {
+func resolveHostNodeName(configNodeName, machineName string) (string, error) {
 	hostname, err := os.Hostname()
 	if err != nil {
 		hostname = ""
 	}
 
-	return ResolveNodeName(hostname, machineName)
+	return resolveNodeName(configNodeName, hostname, machineName)
 }
 
-// ResolveNodeName chooses the Kubernetes Node name from the host name when it
-// is valid, falling back to the Machine CR name.
-func ResolveNodeName(hostname, machineName string) (string, error) {
+func resolveNodeName(configNodeName, hostname, machineName string) (string, error) {
+	if nodeName := strings.TrimSpace(configNodeName); nodeName != "" {
+		if isValidKubernetesNodeName(nodeName) {
+			return nodeName, nil
+		}
+
+		return "", fmt.Errorf("node name override %q is not a valid Kubernetes node name", configNodeName)
+	}
+
 	if nodeName := strings.TrimSpace(hostname); isValidKubernetesNodeName(nodeName) {
 		return nodeName, nil
 	}

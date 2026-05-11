@@ -28,6 +28,7 @@ import (
 // provider identity) should be defined in the consuming application.
 type AgentConfig struct {
 	MachineName string             `json:"MachineName"`
+	NodeName    string             `json:"NodeName,omitempty"`
 	Cluster     AgentClusterConfig `json:"Cluster"`
 	Kubelet     AgentKubeletConfig `json:"Kubelet"`
 	CRI         CRIConfig          `json:"CRI"`

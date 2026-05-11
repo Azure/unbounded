@@ -192,12 +192,34 @@ func TestResolveKubelet_BothAuthMethodsRejected(t *testing.T) {
 
 func TestResolveNodeName(t *testing.T) {
 	tests := []struct {
-		name        string
-		hostname    string
-		machineName string
-		want        string
-		wantErr     string
+		name           string
+		configNodeName string
+		hostname       string
+		machineName    string
+		want           string
+		wantErr        string
 	}{
+		{
+			name:           "config override",
+			configNodeName: "configured-node",
+			hostname:       "worker-1",
+			machineName:    "machine-1",
+			want:           "configured-node",
+		},
+		{
+			name:           "trimmed config override",
+			configNodeName: " configured-node ",
+			hostname:       "worker-1",
+			machineName:    "machine-1",
+			want:           "configured-node",
+		},
+		{
+			name:           "invalid config override errors",
+			configNodeName: "Configured_Node",
+			hostname:       "worker-1",
+			machineName:    "machine-1",
+			wantErr:        "node name override",
+		},
 		{
 			name:        "hostname",
 			hostname:    "worker-1",
@@ -232,7 +254,7 @@ func TestResolveNodeName(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := ResolveNodeName(tt.hostname, tt.machineName)
+			got, err := resolveNodeName(tt.configNodeName, tt.hostname, tt.machineName)
 			if tt.wantErr != "" {
 				require.ErrorContains(t, err, tt.wantErr)
 				return
@@ -242,4 +264,18 @@ func TestResolveNodeName(t *testing.T) {
 			assert.Equal(t, tt.want, got)
 		})
 	}
+}
+
+func TestResolveNodeIdentity_ConfigNodeNameOverride(t *testing.T) {
+	cfg := &config.AgentConfig{
+		MachineName: "machine-1",
+		NodeName:    "configured-node",
+	}
+
+	got, err := ResolveNodeIdentity(cfg, "kube1")
+	require.NoError(t, err)
+
+	assert.Equal(t, "kube1", got.MachineName)
+	assert.Equal(t, "machine-1", got.KubeMachineName)
+	assert.Equal(t, "configured-node", got.NodeName)
 }
