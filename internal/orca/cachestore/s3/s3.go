@@ -212,23 +212,29 @@ func (d *Driver) GetChunk(ctx context.Context, k chunk.Key, off, n int64) (io.Re
 // PutChunk uploads the chunk via PutObject + If-None-Match: *. On
 // 412 returns ErrCommitLost (loser of an atomic-commit race).
 func (d *Driver) PutChunk(ctx context.Context, k chunk.Key, size int64, r io.Reader) error {
-	// AWS SDK v2 needs an io.ReadSeeker for unsigned-payload uploads.
-	// For prototype simplicity we buffer the chunk in memory (chunks
-	// are 8 MiB by default).
-	buf, err := io.ReadAll(r)
-	if err != nil {
-		return fmt.Errorf("cachestore/s3 put: read body: %w", err)
+	// AWS SDK v2 needs an io.ReadSeeker for unsigned-payload uploads
+	// (so it can rewind on signed-retry). If the caller already passed
+	// a seekable reader we hand it to the SDK directly; otherwise
+	// buffer the bytes ourselves as a fallback.
+	body, ok := r.(io.ReadSeeker)
+	if !ok {
+		buf, err := io.ReadAll(r)
+		if err != nil {
+			return fmt.Errorf("cachestore/s3 put: read body: %w", err)
+		}
+
+		if int64(len(buf)) != size && size > 0 {
+			return fmt.Errorf("cachestore/s3 put: short body (got %d want %d)", len(buf), size)
+		}
+
+		body = bytes.NewReader(buf)
 	}
 
-	if int64(len(buf)) != size && size > 0 {
-		return fmt.Errorf("cachestore/s3 put: short body (got %d want %d)", len(buf), size)
-	}
-
-	_, err = d.client.PutObject(ctx, &s3.PutObjectInput{
+	_, err := d.client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:        aws.String(d.bucket),
 		Key:           aws.String(k.Path()),
-		Body:          bytes.NewReader(buf),
-		ContentLength: aws.Int64(int64(len(buf))),
+		Body:          body,
+		ContentLength: aws.Int64(size),
 		IfNoneMatch:   aws.String("*"),
 	})
 	if err != nil {
