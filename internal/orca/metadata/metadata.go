@@ -136,9 +136,17 @@ func (c *Cache) LookupOrFetch(
 	})
 
 	if first {
+		// Delete the singleflight entry before closing done so a new
+		// caller arriving after Delete creates a fresh entry instead
+		// of silently replaying our (possibly transient-error) result.
+		// Existing joiners already loaded the old pointer and read the
+		// result via the closed done. The brief window between Delete
+		// and close where a new caller starts a concurrent fetch is
+		// benign: the new fetch either confirms or supersedes our
+		// result.
 		defer func() {
-			close(sfe.done)
 			c.sf.Delete(k)
+			close(sfe.done)
 		}()
 
 		info, err := fetch(ctx)
