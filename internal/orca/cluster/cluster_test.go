@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/http"
 	"strconv"
 	"sync/atomic"
 	"testing"
@@ -277,5 +278,167 @@ func TestFillFromPeer_DetectsTruncation(t *testing.T) {
 
 	if len(got) != delivered {
 		t.Errorf("got %d bytes, expected %d (the delivered prefix)", len(got), delivered)
+	}
+}
+
+// TestNewHTTPClient_NoWallTimeout asserts that the default
+// internal-RPC HTTP client carries no Client.Timeout. Client.Timeout
+// is a request-total wall clock that would clamp long-running fill
+// body streams (an 8 MiB chunk on a degraded inter-pod link can
+// exceed any reasonable hardcoded bound). The caller's ctx is the
+// sole deadline.
+func TestNewHTTPClient_NoWallTimeout(t *testing.T) {
+	t.Parallel()
+
+	c := newHTTPClient(config.Cluster{})
+	if c.Timeout != 0 {
+		t.Errorf("internal-RPC http.Client.Timeout = %v, want 0", c.Timeout)
+	}
+}
+
+// TestFillFromPeer_CtxDeadlineHonored verifies that the caller's ctx
+// deadline (rather than any hardcoded wall clock inside the cluster's
+// HTTP client) is what bounds the cross-replica fill. Sets up a
+// slow-paced TCP server that delivers a full Content-Length body
+// over ~250ms, and calls FillFromPeer with a 50ms ctx; expects the
+// read to fail with context.DeadlineExceeded.
+//
+// Companion to the wall-timeout removal: regression-tests that ctx
+// propagation still bounds the request even though the
+// Client.Timeout safety net is gone.
+func TestFillFromPeer_CtxDeadlineHonored(t *testing.T) {
+	t.Parallel()
+
+	const advertised = 1024
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	t.Cleanup(func() { _ = ln.Close() }) //nolint:errcheck // test cleanup
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+
+		defer conn.Close() //nolint:errcheck // test cleanup
+
+		buf := make([]byte, 4096)
+		if _, err := conn.Read(buf); err != nil {
+			return
+		}
+
+		resp := "HTTP/1.1 200 OK\r\n" +
+			"Content-Length: " + strconv.Itoa(advertised) + "\r\n" +
+			"Content-Type: application/octet-stream\r\n" +
+			"\r\n"
+		if _, err := conn.Write([]byte(resp)); err != nil {
+			return
+		}
+		// Drip body bytes slowly: 64 bytes every 20ms (~ 320ms for
+		// the full 1 KiB), far exceeding the 50ms ctx deadline.
+		body := make([]byte, advertised)
+
+		for i := 0; i < advertised; i += 64 {
+			end := i + 64
+			if end > advertised {
+				end = advertised
+			}
+
+			if _, err := conn.Write(body[i:end]); err != nil {
+				return
+			}
+
+			time.Sleep(20 * time.Millisecond)
+		}
+	}()
+
+	host, portStr, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		t.Fatalf("split host port: %v", err)
+	}
+
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("parse port: %v", err)
+	}
+
+	c, err := New(t.Context(),
+		config.Cluster{
+			Service:           "test",
+			SelfPodIP:         "10.0.0.1",
+			MembershipRefresh: time.Hour,
+			InternalListen:    "0.0.0.0:8444",
+		},
+		WithPeerSource(&fakePeerSource{mu: func() ([]Peer, error) {
+			return []Peer{{IP: "10.0.0.1", Self: true}}, nil
+		}}),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	t.Cleanup(func() { _ = c.Close(context.Background()) })
+
+	peer := Peer{IP: host, Port: port}
+	key := chunk.Key{
+		OriginID:  "test-origin",
+		Bucket:    "test-bucket",
+		ObjectKey: "test-object",
+		ETag:      "test-etag",
+		ChunkSize: advertised,
+		Index:     0,
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+
+	body, err := c.FillFromPeer(ctx, peer, key, advertised)
+	if err != nil {
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("FillFromPeer err = %v, want context.DeadlineExceeded (or success then deadline on read)", err)
+		}
+
+		return
+	}
+
+	defer body.Close() //nolint:errcheck // test cleanup
+
+	_, readErr := io.ReadAll(body)
+	if !errors.Is(readErr, context.DeadlineExceeded) {
+		t.Errorf("ReadAll err = %v, want context.DeadlineExceeded", readErr)
+	}
+}
+
+// TestWithHTTPClient_Overrides verifies the test seam: tests can
+// inject an alternate http.Client (used to give a deterministic
+// short timeout or custom transport behaviour).
+func TestWithHTTPClient_Overrides(t *testing.T) {
+	t.Parallel()
+
+	custom := &http.Client{Timeout: 42 * time.Millisecond}
+
+	c, err := New(t.Context(),
+		config.Cluster{
+			Service:           "test",
+			SelfPodIP:         "10.0.0.1",
+			MembershipRefresh: time.Hour,
+		},
+		WithPeerSource(&fakePeerSource{mu: func() ([]Peer, error) {
+			return []Peer{{IP: "10.0.0.1", Self: true}}, nil
+		}}),
+		WithHTTPClient(custom),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	t.Cleanup(func() { _ = c.Close(context.Background()) })
+
+	if c.httpClient != custom {
+		t.Errorf("httpClient not overridden by WithHTTPClient")
 	}
 }

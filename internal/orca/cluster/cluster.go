@@ -114,6 +114,14 @@ func WithPeerSource(s PeerSource) Option {
 	return func(c *Cluster) { c.source = s }
 }
 
+// WithHTTPClient overrides the internal-RPC HTTP client. TEST-ONLY:
+// production constructs the default client from cfg via newHTTPClient.
+// Used by unit tests that need to inject a client with custom timeouts
+// or transport behaviour for deterministic deadline coverage.
+func WithHTTPClient(c *http.Client) Option {
+	return func(cl *Cluster) { cl.httpClient = c }
+}
+
 func newDNSPeerSource(service, selfIP string, resolver Resolver) PeerSource {
 	if resolver == nil {
 		resolver = net.DefaultResolver
@@ -433,9 +441,14 @@ func newHTTPClient(cfg config.Cluster) *http.Client {
 	// tr.TLSClientConfig from cfg.InternalTLS.
 	_ = cfg
 
+	// No http.Client.Timeout: it is the request-total wall clock and
+	// would clamp long-running internal-fill body streams (an 8 MiB
+	// chunk on a degraded inter-pod link can exceed 60s). The caller's
+	// ctx (an edge request ctx for client-driven fills, the 5-minute
+	// detached fill ctx in fetch.runFill for leader-side ones) is the
+	// sole deadline.
 	return &http.Client{
 		Transport: tr,
-		Timeout:   60 * time.Second,
 	}
 }
 
