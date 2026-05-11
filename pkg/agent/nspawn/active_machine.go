@@ -69,15 +69,14 @@ func findActiveMachine(
 		}
 
 		checksum := checksumPath(name)
-		if err := goalstates.VerifyChecksum(data, checksum); err != nil {
-			return nil, fmt.Errorf("verify applied config checksum for %s: %w", name, err)
-		}
-
 		if _, statErr := os.Stat(checksum); errors.Is(statErr, os.ErrNotExist) {
 			log.Warn("no checksum sidecar found, skipping integrity check",
 				"config_path", path,
 				"checksum_path", checksum,
 			)
+		}
+		if err := goalstates.VerifyChecksum(data, checksum); err != nil {
+			return nil, fmt.Errorf("verify applied config checksum for %s: %w", name, err)
 		}
 
 		var cfg config.AgentConfig
