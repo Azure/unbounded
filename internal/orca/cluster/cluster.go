@@ -263,6 +263,16 @@ func (c *Cluster) Coordinator(k chunk.Key) Peer {
 		}
 	}
 
+	c.log.LogAttrs(context.Background(), slog.LevelDebug, "coordinator_selected",
+		slog.String("origin_id", k.OriginID),
+		slog.String("bucket", k.Bucket),
+		slog.String("key", k.ObjectKey),
+		slog.Int64("index", k.Index),
+		slog.String("chosen_ip", best.IP),
+		slog.Bool("is_self", best.Self),
+		slog.Uint64("score", bestScore),
+	)
+
 	return best
 }
 
@@ -308,6 +318,16 @@ func (c *Cluster) FillFromPeer(ctx context.Context, p Peer, k chunk.Key, objectS
 		RawQuery: encodeChunkKey(k, objectSize),
 	}
 
+	c.log.LogAttrs(ctx, slog.LevelDebug, "fill_from_peer_request",
+		slog.String("peer_ip", p.IP),
+		slog.String("peer_port", port),
+		slog.String("origin_id", k.OriginID),
+		slog.String("bucket", k.Bucket),
+		slog.String("key", k.ObjectKey),
+		slog.Int64("index", k.Index),
+		slog.Int64("object_size", objectSize),
+	)
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
 	if err != nil {
 		return nil, fmt.Errorf("cluster: build internal-fill request: %w", err)
@@ -322,6 +342,13 @@ func (c *Cluster) FillFromPeer(ctx context.Context, p Peer, k chunk.Key, objectS
 
 	if resp.StatusCode == http.StatusConflict {
 		_ = resp.Body.Close() //nolint:errcheck // best-effort close on error path
+
+		c.log.LogAttrs(ctx, slog.LevelDebug, "fill_from_peer_not_coordinator",
+			slog.String("peer_ip", p.IP),
+			slog.String("origin_id", k.OriginID),
+			slog.Int64("index", k.Index),
+		)
+
 		return nil, ErrPeerNotCoordinator
 	}
 
@@ -332,6 +359,12 @@ func (c *Cluster) FillFromPeer(ctx context.Context, p Peer, k chunk.Key, objectS
 		return nil, fmt.Errorf("cluster: internal-fill RPC returned %d: %s",
 			resp.StatusCode, string(body))
 	}
+
+	c.log.LogAttrs(ctx, slog.LevelDebug, "fill_from_peer_response",
+		slog.String("peer_ip", p.IP),
+		slog.Int("status", resp.StatusCode),
+		slog.Int64("content_length", resp.ContentLength),
+	)
 
 	// Wrap the response body in a defense-in-depth validator that
 	// ensures the peer delivered exactly Content-Length bytes.
@@ -416,14 +449,16 @@ func (c *Cluster) refresh(ctx context.Context) {
 		streak := c.consecutiveRefreshErrors.Add(1)
 
 		if c.peers.Load() != nil && streak <= maxStalePeerRefreshes {
-			c.log.Warn("cluster: peer discovery failed; retaining previous snapshot",
-				"err", err, "consecutive_errors", streak)
+			c.log.LogAttrs(ctx, slog.LevelWarn, "cluster: peer discovery failed; retaining previous snapshot",
+				slog.Any("err", err),
+				slog.Int64("consecutive_errors", streak),
+			)
 
 			return
 		}
 
 		self := []Peer{{IP: c.cfg.SelfPodIP, Self: true}}
-		c.peers.Store(&self)
+		c.storePeerSet(ctx, self, "self_only_fallback")
 
 		return
 	}
@@ -435,7 +470,7 @@ func (c *Cluster) refresh(ctx context.Context) {
 		// has no Ready pods other than maybe self). Apply self-only
 		// fallback.
 		self := []Peer{{IP: c.cfg.SelfPodIP, Self: true}}
-		c.peers.Store(&self)
+		c.storePeerSet(ctx, self, "empty_discovery_self_only")
 
 		return
 	}
@@ -454,7 +489,82 @@ func (c *Cluster) refresh(ctx context.Context) {
 		peers = append(peers, Peer{IP: c.cfg.SelfPodIP, Self: true})
 	}
 
+	c.storePeerSet(ctx, peers, "discovery_ok")
+}
+
+// storePeerSet atomically swaps in a fresh peer-set snapshot and
+// emits trace lines describing the transition. A per-cycle debug
+// emission fires unconditionally; an info-level 'peer_set_changed'
+// emission fires only when the rendered set differs from the
+// previously stored snapshot. The reason argument tags the source
+// of the new snapshot for diagnostic clarity.
+func (c *Cluster) storePeerSet(ctx context.Context, peers []Peer, reason string) {
+	prev := c.peers.Load()
 	c.peers.Store(&peers)
+
+	c.log.LogAttrs(ctx, slog.LevelDebug, "peer_set_refreshed",
+		slog.String("reason", reason),
+		slog.Int("count", len(peers)),
+	)
+
+	if prev == nil {
+		// First snapshot: log it at info so operators see the
+		// bootstrap transition.
+		c.log.LogAttrs(ctx, slog.LevelInfo, "peer_set_initial",
+			slog.String("reason", reason),
+			slog.Int("count", len(peers)),
+		)
+
+		return
+	}
+
+	added, removed := diffPeers(*prev, peers)
+	if len(added) == 0 && len(removed) == 0 {
+		return
+	}
+
+	c.log.LogAttrs(ctx, slog.LevelInfo, "peer_set_changed",
+		slog.String("reason", reason),
+		slog.Int("count", len(peers)),
+		slog.Any("added", added),
+		slog.Any("removed", removed),
+	)
+}
+
+// diffPeers returns the IP+Port lists added and removed between the
+// previous and next snapshots. Self flag is ignored for diff purposes
+// because membership identity is the (ip, port) tuple; the same peer
+// flipping Self is a no-op for membership transitions.
+func diffPeers(prev, next []Peer) (added, removed []string) {
+	seen := make(map[string]bool, len(prev))
+	for _, p := range prev {
+		seen[peerKey(p)] = true
+	}
+
+	nextSet := make(map[string]bool, len(next))
+	for _, p := range next {
+		nextSet[peerKey(p)] = true
+
+		if !seen[peerKey(p)] {
+			added = append(added, peerKey(p))
+		}
+	}
+
+	for _, p := range prev {
+		if !nextSet[peerKey(p)] {
+			removed = append(removed, peerKey(p))
+		}
+	}
+
+	return added, removed
+}
+
+func peerKey(p Peer) string {
+	if p.Port == 0 {
+		return p.IP
+	}
+
+	return fmt.Sprintf("%s:%d", p.IP, p.Port)
 }
 
 func newHTTPClient(cfg config.Cluster) *http.Client {

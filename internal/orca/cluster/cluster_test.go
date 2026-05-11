@@ -4,6 +4,7 @@
 package cluster
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -472,6 +474,122 @@ func TestWithLogger_OverridesDefault(t *testing.T) {
 
 	if c.log != injected {
 		t.Errorf("Cluster.log not the injected logger")
+	}
+}
+
+// TestRefresh_EmitsMembershipTransition verifies that a peer-set
+// change (member added) surfaces a Info-level 'peer_set_changed'
+// log line. Stable refreshes (no delta) must not re-emit this line.
+func TestRefresh_EmitsMembershipTransition(t *testing.T) {
+	t.Parallel()
+
+	initial := []Peer{
+		{IP: "10.0.0.2", Self: true},
+	}
+
+	current := initial
+
+	src := &fakePeerSource{
+		mu: func() ([]Peer, error) {
+			out := make([]Peer, len(current))
+			copy(out, current)
+
+			return out, nil
+		},
+	}
+
+	var buf bytes.Buffer
+
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	c, err := New(t.Context(),
+		config.Cluster{
+			Service:           "test",
+			SelfPodIP:         "10.0.0.2",
+			MembershipRefresh: time.Hour,
+		},
+		WithPeerSource(src),
+		WithLogger(log),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	t.Cleanup(func() { _ = c.Close(context.Background()) })
+
+	// Initial snapshot landed during New: peer_set_initial emitted.
+	if !strings.Contains(buf.String(), "peer_set_initial") {
+		t.Errorf("expected peer_set_initial on bootstrap; got %q", buf.String())
+	}
+
+	buf.Reset()
+
+	// Stable refresh: no delta -> only the debug peer_set_refreshed.
+	c.refresh(t.Context())
+
+	if strings.Contains(buf.String(), "peer_set_changed") {
+		t.Errorf("peer_set_changed should not fire when peer-set is stable; got %q", buf.String())
+	}
+
+	if !strings.Contains(buf.String(), "peer_set_refreshed") {
+		t.Errorf("expected per-cycle peer_set_refreshed; got %q", buf.String())
+	}
+
+	buf.Reset()
+
+	// Add a peer: peer_set_changed must fire with the 'added' key.
+	current = append([]Peer{}, initial...)
+	current = append(current, Peer{IP: "10.0.0.3"})
+
+	c.refresh(t.Context())
+
+	if !strings.Contains(buf.String(), "peer_set_changed") {
+		t.Errorf("peer_set_changed missing on add; got %q", buf.String())
+	}
+
+	if !strings.Contains(buf.String(), "10.0.0.3") {
+		t.Errorf("added peer IP missing from log; got %q", buf.String())
+	}
+}
+
+// TestCoordinator_EmitsDebugSelection verifies the per-call debug
+// emission carrying the chosen-peer and rendezvous score for a
+// chunk. Operators rely on this to diagnose routing surprises.
+func TestCoordinator_EmitsDebugSelection(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	c, err := New(t.Context(),
+		config.Cluster{
+			Service:           "test",
+			SelfPodIP:         "10.0.0.1",
+			MembershipRefresh: time.Hour,
+		},
+		WithPeerSource(&fakePeerSource{mu: func() ([]Peer, error) {
+			return []Peer{{IP: "10.0.0.1", Self: true}}, nil
+		}}),
+		WithLogger(log),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	t.Cleanup(func() { _ = c.Close(context.Background()) })
+
+	buf.Reset()
+
+	c.Coordinator(chunk.Key{
+		OriginID: "ox", Bucket: "b", ObjectKey: "o", ChunkSize: 1024, Index: 5,
+	})
+
+	out := buf.String()
+	for _, want := range []string{"coordinator_selected", "chosen_ip=10.0.0.1", "is_self=true", "index=5"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %q in coord debug output; got %q", want, out)
+		}
 	}
 }
 
