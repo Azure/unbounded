@@ -27,12 +27,17 @@ import (
 // agent library. Platform-specific extensions (e.g. attestation, cloud
 // provider identity) should be defined in the consuming application.
 type AgentConfig struct {
-	MachineName string             `json:"MachineName"`
-	NodeName    string             `json:"NodeName,omitempty"`
-	Cluster     AgentClusterConfig `json:"Cluster"`
-	Kubelet     AgentKubeletConfig `json:"Kubelet"`
-	CRI         CRIConfig          `json:"CRI"`
-	CNI         CNIConfig          `json:"CNI"`
+	MachineName string `json:"MachineName"`
+	// NodeName is the Kubernetes Node name used by kubelet and host-side
+	// daemon watches. During goal-state resolution this field is backfilled
+	// once. Resolution prefers an explicitly configured value, then a valid
+	// host hostname, then MachineName. The resolved value must be a valid
+	// Kubernetes DNS subdomain.
+	NodeName string             `json:"NodeName,omitempty"`
+	Cluster  AgentClusterConfig `json:"Cluster"`
+	Kubelet  AgentKubeletConfig `json:"Kubelet"`
+	CRI      CRIConfig          `json:"CRI"`
+	CNI      CNIConfig          `json:"CNI"`
 
 	// OCIImage is the fully-qualified OCI image reference (e.g.
 	// "ghcr.io/org/repo:tag") used to bootstrap the machine rootfs.

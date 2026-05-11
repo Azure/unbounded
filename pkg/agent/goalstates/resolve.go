@@ -20,9 +20,8 @@ import (
 // starting an nspawn machine. Callers use RootFS for the rootfs provisioning
 // phases and NodeStart for the service configuration and boot phases.
 type MachineGoalState struct {
-	NodeIdentity *NodeIdentity
-	RootFS       *RootFS
-	NodeStart    *NodeStart
+	RootFS    *RootFS
+	NodeStart *NodeStart
 }
 
 // ResolveMachine probes the host (kernel version, hostname, GPU hardware) and
@@ -34,9 +33,8 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 		return nil, fmt.Errorf("get host kernel: %w", err)
 	}
 
-	nodeIdentity, err := ResolveNodeIdentity(cfg, machineName)
-	if err != nil {
-		return nil, fmt.Errorf("resolve node identity: %w", err)
+	if err := resolveConfigNodeName(cfg); err != nil {
+		return nil, err
 	}
 
 	nvidia, err := ResolveNvidiaHost(runtime.GOARCH)
@@ -79,7 +77,7 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 		),
 		HostArch:          runtime.GOARCH,
 		HostKernel:        kernel,
-		NodeName:          nodeIdentity.NodeName,
+		HostName:          cfg.NodeName,
 		ContainerdVersion: containerdVersion,
 		RunCVersion:       runcVersion,
 		CNIPluginVersion:  cniVersion,
@@ -91,9 +89,9 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 	}
 
 	nodeStart := &NodeStart{
-		MachineName:     nodeIdentity.MachineName,
-		KubeMachineName: nodeIdentity.KubeMachineName,
-		NodeName:        nodeIdentity.NodeName,
+		MachineName:     machineName,
+		KubeMachineName: cfg.MachineName,
+		NodeName:        cfg.NodeName,
 		MachineDir:      filepath.Join("/var/lib/machines", machineName),
 		Containerd:      ResolveContainerd(),
 		Kubelet:         kubelet,
@@ -101,9 +99,8 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 	}
 
 	return &MachineGoalState{
-		NodeIdentity: nodeIdentity,
-		RootFS:       rootFS,
-		NodeStart:    nodeStart,
+		RootFS:    rootFS,
+		NodeStart: nodeStart,
 	}, nil
 }
 

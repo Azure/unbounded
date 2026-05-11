@@ -266,16 +266,36 @@ func TestResolveNodeName(t *testing.T) {
 	}
 }
 
-func TestResolveNodeIdentity_ConfigNodeNameOverride(t *testing.T) {
+func TestResolveConfigNodeName_BackfillsConfig(t *testing.T) {
 	cfg := &config.AgentConfig{
 		MachineName: "machine-1",
-		NodeName:    "configured-node",
+		NodeName:    " configured-node ",
 	}
 
-	got, err := ResolveNodeIdentity(cfg, "kube1")
+	err := resolveConfigNodeName(cfg)
 	require.NoError(t, err)
 
-	assert.Equal(t, "kube1", got.MachineName)
-	assert.Equal(t, "machine-1", got.KubeMachineName)
-	assert.Equal(t, "configured-node", got.NodeName)
+	assert.Equal(t, "configured-node", cfg.NodeName)
+}
+
+func TestResolveMachine_BackfillsConfigNodeName(t *testing.T) {
+	cfg := &config.AgentConfig{
+		MachineName: "machine-1",
+		NodeName:    " configured-node ",
+		Cluster: config.AgentClusterConfig{
+			CaCertBase64: "Y2EtYnl0ZXM=",
+		},
+		Kubelet: config.AgentKubeletConfig{
+			ApiServer: "https://api.example.com",
+		},
+	}
+
+	got, err := ResolveMachine(discardLogger(), cfg, "kube1", nil)
+	require.NoError(t, err)
+
+	assert.Equal(t, "configured-node", cfg.NodeName)
+	assert.Equal(t, "configured-node", got.RootFS.HostName)
+	assert.Equal(t, "configured-node", got.NodeStart.NodeName)
+	assert.Equal(t, "kube1", got.NodeStart.MachineName)
+	assert.Equal(t, "machine-1", got.NodeStart.KubeMachineName)
 }

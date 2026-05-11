@@ -78,7 +78,7 @@ func (c *configureOS) Do(_ context.Context) error {
 		{path: "etc/apt/sources.list", content: sources},
 		// Use the resolved Kubernetes Node name so the nspawn container and
 		// kubelet identify the node consistently.
-		{path: "etc/hostname", content: []byte(c.goalState.NodeName + "\n")},
+		{path: "etc/hostname", content: []byte(c.goalState.HostName + "\n")},
 	}
 
 	for _, f := range configs {
