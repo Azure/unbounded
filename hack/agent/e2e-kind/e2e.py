@@ -24,6 +24,7 @@ Subcommands (called as individual workflow steps):
     ensure-kind-bridge                 Verify/repair veth pair connecting Kind to VM bridge.
     run-agent                          Build agent, generate bootstrap script, run on VM.
     wait-for-node                      Wait for the node to appear and become Ready.
+    dump-persisted-agent-config        Print persisted agent config files from the VM.
     validate-workload                  Deploy test pods on the agent node.
     validate-kube-proxy                Verify kube-proxy is Running on all nodes.
     install-machine-crd                Install Machine CRD and bootstrapper RBAC.
@@ -1139,6 +1140,60 @@ def wait_for_node() -> None:
 
 
 # ---------------------------------------------------------------------------
+# dump-persisted-agent-config
+# ---------------------------------------------------------------------------
+def dump_persisted_agent_config() -> None:
+    """Print persisted agent config files from the VM with sensitive values redacted."""
+
+    log("Dumping persisted agent config from VM...")
+    ssh_cmd(r"""
+set -euo pipefail
+sudo python3 - <<'PY'
+import glob
+import json
+import pathlib
+
+CONFIG_DIR = pathlib.Path("/etc/unbounded/agent")
+SENSITIVE_KEYS = {"bootstraptoken"}
+
+
+def redact(value):
+    if isinstance(value, dict):
+        return {
+            key: "<redacted>" if key.lower() in SENSITIVE_KEYS else redact(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact(item) for item in value]
+    return value
+
+
+paths = [CONFIG_DIR / "config.json"]
+paths.extend(pathlib.Path(path) for path in sorted(glob.glob(str(CONFIG_DIR / "*-applied-config.json"))))
+
+seen = set()
+for path in paths:
+    if path in seen or not path.exists():
+        continue
+    seen.add(path)
+    print(f"===== {path} =====")
+    try:
+        data = json.loads(path.read_text())
+        print(json.dumps(redact(data), indent=2, sort_keys=True))
+    except Exception as exc:
+        print(f"<failed to read JSON: {exc}>")
+
+for path in sorted(CONFIG_DIR.glob("*.sha256")):
+    print(f"===== {path} =====")
+    try:
+        print(path.read_text().strip())
+    except Exception as exc:
+        print(f"<failed to read checksum: {exc}>")
+PY
+""")
+
+
+# ---------------------------------------------------------------------------
 # Network diagnostics (non-fatal)
 # ---------------------------------------------------------------------------
 def _run_diag(label: str, args: list[str]) -> None:
@@ -2087,6 +2142,7 @@ def cleanup() -> None:
 COMMANDS = {
     "create-vm": create_vm,
     "ensure-kind-bridge": ensure_kind_bridge,
+    "dump-persisted-agent-config": dump_persisted_agent_config,
     "run-agent": run_agent,
     "wait-for-node": wait_for_node,
     "validate-kube-proxy": validate_kube_proxy,
