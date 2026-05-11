@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -34,6 +35,7 @@ import (
 type Adapter struct {
 	cfg    Config
 	client *s3.Client
+	log    *slog.Logger
 }
 
 // Config is the awss3-driver configuration. Mirrors config.AWSS3 but
@@ -62,8 +64,11 @@ type Config struct {
 	UsePathStyle bool
 }
 
-// New constructs an Adapter.
-func New(ctx context.Context, cfg Config) (*Adapter, error) {
+// New constructs an Adapter. The log receives debug-level
+// emissions for every Head / GetRange / List call and the error
+// mapping decision (not-found / auth / precondition) on failure
+// paths. Passing nil falls back to slog.Default().
+func New(ctx context.Context, cfg Config, log *slog.Logger) (*Adapter, error) {
 	if cfg.Bucket == "" {
 		return nil, fmt.Errorf("origin/awss3: bucket required")
 	}
@@ -95,7 +100,11 @@ func New(ctx context.Context, cfg Config) (*Adapter, error) {
 		o.UsePathStyle = cfg.UsePathStyle
 	})
 
-	return &Adapter{cfg: cfg, client: client}, nil
+	if log == nil {
+		log = slog.Default()
+	}
+
+	return &Adapter{cfg: cfg, client: client, log: log}, nil
 }
 
 // Head returns ObjectInfo for the named object. The bucket arg lets

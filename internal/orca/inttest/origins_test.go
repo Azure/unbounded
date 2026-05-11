@@ -26,5 +26,5 @@ func localStackOrigin(ctx context.Context, t *testing.T, bucket string) (origin.
 		AccessKey:    pkgLocalStack.AccessKey(),
 		SecretKey:    pkgLocalStack.SecretKey(),
 		UsePathStyle: true,
-	})
+	}, nil)
 }

@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -40,6 +41,7 @@ import (
 type Driver struct {
 	client *s3.Client
 	bucket string
+	log    *slog.Logger
 }
 
 // Config is the s3-driver configuration. Mirrors config.CachestoreS3
@@ -59,9 +61,14 @@ type Config struct {
 // atomic-commit primitive (PutObject + If-None-Match: *) so the
 // driver refuses to start against one.
 //
+// The log receives debug-level emissions for every chunk operation
+// (Get, Put, Stat, Delete) and step-by-step boot trace from
+// SelfTestAtomicCommit / versioningGate. Passing nil falls back to
+// slog.Default().
+//
 // SelfTestAtomicCommit is a separate step (called by main after New)
 // to keep the constructor side-effect-light.
-func New(ctx context.Context, cfg Config) (*Driver, error) {
+func New(ctx context.Context, cfg Config, log *slog.Logger) (*Driver, error) {
 	if cfg.Bucket == "" {
 		return nil, fmt.Errorf("cachestore/s3: bucket required")
 	}
@@ -90,9 +97,14 @@ func New(ctx context.Context, cfg Config) (*Driver, error) {
 		o.UsePathStyle = cfg.UsePathStyle
 	})
 
+	if log == nil {
+		log = slog.Default()
+	}
+
 	d := &Driver{
 		client: client,
 		bucket: cfg.Bucket,
+		log:    log,
 	}
 
 	if err := d.versioningGate(ctx); err != nil {

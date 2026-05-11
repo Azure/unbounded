@@ -181,12 +181,12 @@ func Start(ctx context.Context, cfg *config.Config, opts ...Option) (*App, error
 		log = slog.Default()
 	}
 
-	or, err := buildOrigin(ctx, cfg, o.origin)
+	or, err := buildOrigin(ctx, cfg, o.origin, log)
 	if err != nil {
 		return nil, err
 	}
 
-	cs, err := buildCacheStore(ctx, cfg, o.cacheStore)
+	cs, err := buildCacheStore(ctx, cfg, o.cacheStore, log)
 	if err != nil {
 		return nil, err
 	}
@@ -463,14 +463,14 @@ func (a *App) Shutdown(ctx context.Context) error {
 	return firstErr
 }
 
-func buildOrigin(ctx context.Context, cfg *config.Config, override origin.Origin) (origin.Origin, error) {
+func buildOrigin(ctx context.Context, cfg *config.Config, override origin.Origin, log *slog.Logger) (origin.Origin, error) {
 	if override != nil {
 		return override, nil
 	}
 
 	switch cfg.Origin.Driver {
 	case "azureblob":
-		or, err := azureblob.New(cfg.Origin.Azureblob)
+		or, err := azureblob.New(cfg.Origin.Azureblob, log)
 		if err != nil {
 			return nil, fmt.Errorf("init origin/azureblob: %w", err)
 		}
@@ -484,7 +484,7 @@ func buildOrigin(ctx context.Context, cfg *config.Config, override origin.Origin
 			AccessKey:    cfg.Origin.AWSS3.AccessKey,
 			SecretKey:    cfg.Origin.AWSS3.SecretKey,
 			UsePathStyle: cfg.Origin.AWSS3.UsePathStyle,
-		})
+		}, log)
 		if err != nil {
 			return nil, fmt.Errorf("init origin/awss3: %w", err)
 		}
@@ -495,7 +495,7 @@ func buildOrigin(ctx context.Context, cfg *config.Config, override origin.Origin
 	}
 }
 
-func buildCacheStore(ctx context.Context, cfg *config.Config, override cachestore.CacheStore) (cachestore.CacheStore, error) {
+func buildCacheStore(ctx context.Context, cfg *config.Config, override cachestore.CacheStore, log *slog.Logger) (cachestore.CacheStore, error) {
 	if override != nil {
 		return override, nil
 	}
@@ -509,7 +509,7 @@ func buildCacheStore(ctx context.Context, cfg *config.Config, override cachestor
 			AccessKey:    cfg.Cachestore.S3.AccessKey,
 			SecretKey:    cfg.Cachestore.S3.SecretKey,
 			UsePathStyle: cfg.Cachestore.S3.UsePathStyle,
-		})
+		}, log)
 		if err != nil {
 			return nil, fmt.Errorf("init cachestore/s3: %w", err)
 		}

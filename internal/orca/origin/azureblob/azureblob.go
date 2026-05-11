@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -29,10 +30,15 @@ import (
 type Adapter struct {
 	cfg    config.Azureblob
 	client *azblob.Client
+	log    *slog.Logger
 }
 
-// New builds an Adapter from config.
-func New(cfg config.Azureblob) (*Adapter, error) {
+// New builds an Adapter from config. The log receives debug-level
+// emissions for every Head / GetRange / List call and the error
+// mapping decision (not-found / auth / precondition / unsupported
+// blob type) on failure paths. Passing nil falls back to
+// slog.Default().
+func New(cfg config.Azureblob, log *slog.Logger) (*Adapter, error) {
 	if cfg.Account == "" {
 		return nil, fmt.Errorf("azureblob: account required")
 	}
@@ -56,7 +62,11 @@ func New(cfg config.Azureblob) (*Adapter, error) {
 		return nil, fmt.Errorf("azureblob: client: %w", err)
 	}
 
-	return &Adapter{cfg: cfg, client: client}, nil
+	if log == nil {
+		log = slog.Default()
+	}
+
+	return &Adapter{cfg: cfg, client: client, log: log}, nil
 }
 
 // Head returns ObjectInfo for the named blob.

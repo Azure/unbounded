@@ -129,7 +129,7 @@ func TestGetRange_QuotesIfMatchHeader(t *testing.T) {
 		Endpoint:   srv.URL + "/devstoreaccount1",
 	}
 
-	a, err := New(cfg)
+	a, err := New(cfg, nil)
 	if err != nil {
 		t.Fatalf("azureblob.New: %v", err)
 	}
@@ -180,7 +180,7 @@ func TestGetRange_OmitsIfMatchWhenEtagEmpty(t *testing.T) {
 		Endpoint:   srv.URL + "/devstoreaccount1",
 	}
 
-	a, err := New(cfg)
+	a, err := New(cfg, nil)
 	if err != nil {
 		t.Fatalf("azureblob.New: %v", err)
 	}
