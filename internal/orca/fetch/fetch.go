@@ -43,6 +43,7 @@ type Coordinator struct {
 	cat *chunkcatalog.Catalog
 	mc  *metadata.Cache
 	cfg *config.Config
+	log *slog.Logger
 
 	// Per-replica origin concurrency cap. Bounds in-flight
 	// Origin.GetRange calls to floor(target_global / target_replicas).
@@ -60,7 +61,11 @@ type fill struct {
 	err     error
 }
 
-// NewCoordinator wires up the fetch coordinator.
+// NewCoordinator wires up the fetch coordinator. The log is used for
+// peer-fallback warnings and commit-after-serve failure traces; the
+// caller (usually app.Start) injects the app-wide slog.Logger so
+// fetch-path logs are unified with the rest of the runtime's output.
+// Passing nil falls back to slog.Default().
 func NewCoordinator(
 	or origin.Origin,
 	cs cachestore.CacheStore,
@@ -68,10 +73,15 @@ func NewCoordinator(
 	cat *chunkcatalog.Catalog,
 	mc *metadata.Cache,
 	cfg *config.Config,
+	log *slog.Logger,
 ) *Coordinator {
 	tpr := cfg.TargetPerReplica()
 	if tpr < 1 {
 		tpr = 1
+	}
+
+	if log == nil {
+		log = slog.Default()
 	}
 
 	return &Coordinator{
@@ -81,6 +91,7 @@ func NewCoordinator(
 		cat:       cat,
 		mc:        mc,
 		cfg:       cfg,
+		log:       log,
 		originSem: make(chan struct{}, tpr),
 		inflight:  make(map[string]*fill),
 	}
@@ -156,11 +167,11 @@ func (c *Coordinator) GetChunk(ctx context.Context, k chunk.Key, objectSize int6
 		}
 
 		if errors.Is(err, cluster.ErrPeerNotCoordinator) {
-			slog.Default().Warn("peer reported not-coordinator; falling back to local fill",
+			c.log.Warn("peer reported not-coordinator; falling back to local fill",
 				"chunk", k.String(), "peer", coord.IP)
 			// fall through to local fill
 		} else {
-			slog.Default().Warn("internal-fill RPC failed; falling back to local fill",
+			c.log.Warn("internal-fill RPC failed; falling back to local fill",
 				"chunk", k.String(), "peer", coord.IP, "err", err)
 		}
 	}
@@ -310,7 +321,7 @@ func (c *Coordinator) runFill(k chunk.Key, objectSize int64, f *fill) {
 			c.cat.Record(k, info)
 		}
 	} else {
-		slog.Default().Warn("commit-after-serve failed",
+		c.log.Warn("commit-after-serve failed",
 			"chunk", k.String(), "err", commitErr)
 		// Don't record in catalog; next request refills.
 	}

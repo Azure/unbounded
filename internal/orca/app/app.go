@@ -180,7 +180,7 @@ func Start(ctx context.Context, cfg *config.Config, opts ...Option) (*App, error
 
 	cat := chunkcatalog.New(cfg.ChunkCatalog.MaxEntries)
 	mc := metadata.NewCache(cfg.Metadata)
-	fc := fetch.NewCoordinator(or, cs, cl, cat, mc, cfg)
+	fc := fetch.NewCoordinator(or, cs, cl, cat, mc, cfg, log)
 
 	edgeHandler := server.NewEdgeHandler(fc, cfg, log)
 
