@@ -28,10 +28,17 @@ type Config struct {
 	Chunking     Chunking     `yaml:"chunking"`
 }
 
-// Server holds the client-edge listener configuration.
+// Server holds the client-edge listener configuration plus the
+// ops listener used for kubelet probes (/healthz and /readyz).
 type Server struct {
 	Listen string     `yaml:"listen"`
 	Auth   ServerAuth `yaml:"auth"`
+
+	// OpsListen is the bind address for the operations endpoint
+	// hosting /healthz and /readyz. Plain HTTP, no auth. Kubelet
+	// liveness and readiness probes target this address; production
+	// Service objects do not forward this port externally.
+	OpsListen string `yaml:"ops_listen"`
 }
 
 // ServerAuth governs the client-edge authentication path.
@@ -184,6 +191,10 @@ func (c *Config) applyDefaults() {
 	// Server.
 	if c.Server.Listen == "" {
 		c.Server.Listen = "0.0.0.0:8443"
+	}
+
+	if c.Server.OpsListen == "" {
+		c.Server.OpsListen = "0.0.0.0:8442"
 	}
 	// Origin.
 	if c.Origin.Driver == "" {

@@ -159,17 +159,19 @@ func StartCluster(ctx context.Context, t *testing.T, opts ClusterOptions) *Clust
 	// Allocate per-replica internal listeners up front (open) so each
 	// replica's peer source can advertise the full set with explicit
 	// ports from t=0. We hand the open listeners to app.Start via
-	// WithInternalListener/WithEdgeListener so there is no
-	// close-and-rebind window for races with concurrent tests.
+	// WithInternalListener/WithEdgeListener/WithOpsListener so there
+	// is no close-and-rebind window for races with concurrent tests.
 	internalListeners := make([]net.Listener, opts.Replicas)
 	internalPorts := make([]int, opts.Replicas)
 	edgeListeners := make([]net.Listener, opts.Replicas)
+	opsListeners := make([]net.Listener, opts.Replicas)
 
 	for i := range internalListeners {
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			closeListeners(internalListeners)
 			closeListeners(edgeListeners)
+			closeListeners(opsListeners)
 			t.Fatalf("alloc internal port for replica %d: %v", i+1, err)
 		}
 
@@ -180,10 +182,21 @@ func StartCluster(ctx context.Context, t *testing.T, opts ClusterOptions) *Clust
 		if err != nil {
 			closeListeners(internalListeners)
 			closeListeners(edgeListeners)
+			closeListeners(opsListeners)
 			t.Fatalf("alloc edge port for replica %d: %v", i+1, err)
 		}
 
 		edgeListeners[i] = eln
+
+		oln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			closeListeners(internalListeners)
+			closeListeners(edgeListeners)
+			closeListeners(opsListeners)
+			t.Fatalf("alloc ops port for replica %d: %v", i+1, err)
+		}
+
+		opsListeners[i] = oln
 	}
 
 	allPeers := make([]cluster.Peer, opts.Replicas)
@@ -213,6 +226,7 @@ func StartCluster(ctx context.Context, t *testing.T, opts ClusterOptions) *Clust
 			app.WithPeerSource(ps),
 			app.WithEdgeListener(edgeListeners[i]),
 			app.WithInternalListener(internalListeners[i]),
+			app.WithOpsListener(opsListeners[i]),
 		}
 
 		if opts.OriginOverride != nil {

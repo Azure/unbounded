@@ -59,6 +59,21 @@ spec:
             - containerPort: 8444
               name: internal
               protocol: TCP
+            - containerPort: 8442
+              name: ops
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: ops
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: ops
+            initialDelaySeconds: 2
+            periodSeconds: 5
           resources:
             requests:
               cpu: {{ default "200m" .ResourceCPURequest }}

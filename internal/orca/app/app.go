@@ -37,8 +37,8 @@ import (
 //
 // Construct with Start; tear down with Shutdown. Start is non-blocking:
 // the returned App's listeners are accepting connections (via
-// net.Listen) before Start returns, so EdgeAddr / InternalAddr are
-// resolved (including any :0 ports) by the time the caller sees them.
+// net.Listen) before Start returns, so EdgeAddr / InternalAddr / OpsAddr
+// are resolved (including any :0 ports) by the time the caller sees them.
 type App struct {
 	// EdgeAddr is the resolved client-edge listen address (host:port).
 	// When the config requested ":0" the port is the OS-assigned one.
@@ -46,6 +46,9 @@ type App struct {
 
 	// InternalAddr is the resolved peer-RPC listen address (host:port).
 	InternalAddr string
+
+	// OpsAddr is the resolved /healthz + /readyz listen address.
+	OpsAddr string
 
 	// Cluster is exposed so tests can inspect peer state and call
 	// Coordinator/Self for assertions. Production callers should treat
@@ -55,8 +58,14 @@ type App struct {
 	log         *slog.Logger
 	edgeSrv     *http.Server
 	internalSrv *http.Server
+	opsSrv      *http.Server
 	wg          sync.WaitGroup
 	errCh       chan error
+
+	// cachestoreReady is set true once the cachestore self-test has
+	// passed (or skipped via WithSkipCachestoreSelfTest). Gated by
+	// the /readyz endpoint.
+	cachestoreReady bool
 }
 
 type options struct {
@@ -68,6 +77,7 @@ type options struct {
 	internalHandlerWrap func(http.Handler) http.Handler
 	edgeListener        net.Listener
 	internalListener    net.Listener
+	opsListener         net.Listener
 }
 
 // Option configures Start.
@@ -138,6 +148,14 @@ func WithInternalListener(ln net.Listener) Option {
 	return func(o *options) { o.internalListener = ln }
 }
 
+// WithOpsListener supplies a pre-bound listener for the ops HTTP
+// server (/healthz, /readyz).
+//
+// TEST-ONLY: see WithEdgeListener.
+func WithOpsListener(ln net.Listener) Option {
+	return func(o *options) { o.opsListener = ln }
+}
+
 // Start wires every dependency and begins serving on the configured
 // listeners. It returns once both listeners are accepting connections
 // (or returns the error that prevented startup).
@@ -165,12 +183,21 @@ func Start(ctx context.Context, cfg *config.Config, opts ...Option) (*App, error
 		return nil, err
 	}
 
-	if !o.skipCacheSelfTest {
+	cachestoreReady := false
+
+	if o.skipCacheSelfTest {
+		// Caller has asserted the cachestore decorator honors
+		// If-None-Match: * (the in-memory store used by tests).
+		// Treat readiness as satisfied immediately.
+		cachestoreReady = true
+	} else {
 		if err := cs.SelfTestAtomicCommit(ctx); err != nil {
 			return nil, fmt.Errorf("cachestore self-test failed: %w", err)
 		}
 
 		log.Info("cachestore self-test passed")
+
+		cachestoreReady = true
 	}
 
 	cl, err := cluster.New(ctx, cfg.Cluster, o.clusterOpts...)
@@ -193,10 +220,7 @@ func Start(ctx context.Context, cfg *config.Config, opts ...Option) (*App, error
 	if edgeLn == nil {
 		ln, err := net.Listen("tcp", cfg.Server.Listen)
 		if err != nil {
-			closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			_ = cl.Close(closeCtx) //nolint:errcheck // best-effort cleanup on bind failure
-
-			cancel()
+			cleanupStartFailure(cl, nil, nil)
 
 			return nil, fmt.Errorf("edge listener bind %q: %w", cfg.Server.Listen, err)
 		}
@@ -208,12 +232,7 @@ func Start(ctx context.Context, cfg *config.Config, opts ...Option) (*App, error
 	if internalLn == nil {
 		ln, err := net.Listen("tcp", cfg.Cluster.InternalListen)
 		if err != nil {
-			_ = edgeLn.Close() //nolint:errcheck // best-effort close on bind failure
-
-			closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			_ = cl.Close(closeCtx) //nolint:errcheck // best-effort cleanup on bind failure
-
-			cancel()
+			cleanupStartFailure(cl, edgeLn, nil)
 
 			return nil, fmt.Errorf("internal listener bind %q: %w", cfg.Cluster.InternalListen, err)
 		}
@@ -221,9 +240,22 @@ func Start(ctx context.Context, cfg *config.Config, opts ...Option) (*App, error
 		internalLn = ln
 	}
 
+	opsLn := o.opsListener
+	if opsLn == nil {
+		ln, err := net.Listen("tcp", cfg.Server.OpsListen)
+		if err != nil {
+			cleanupStartFailure(cl, edgeLn, internalLn)
+
+			return nil, fmt.Errorf("ops listener bind %q: %w", cfg.Server.OpsListen, err)
+		}
+
+		opsLn = ln
+	}
+
 	a := &App{
 		EdgeAddr:     edgeLn.Addr().String(),
 		InternalAddr: internalLn.Addr().String(),
+		OpsAddr:      opsLn.Addr().String(),
 		Cluster:      cl,
 		log:          log,
 		edgeSrv: &http.Server{
@@ -234,7 +266,13 @@ func Start(ctx context.Context, cfg *config.Config, opts ...Option) (*App, error
 			Handler:           internalHandler,
 			ReadHeaderTimeout: 10 * time.Second,
 		},
-		errCh: make(chan error, 2),
+		errCh:           make(chan error, 3),
+		cachestoreReady: cachestoreReady,
+	}
+
+	a.opsSrv = &http.Server{
+		Handler:           newOpsHandler(a.isReady),
+		ReadHeaderTimeout: 5 * time.Second,
 	}
 
 	a.wg.Add(1)
@@ -277,7 +315,72 @@ func Start(ctx context.Context, cfg *config.Config, opts ...Option) (*App, error
 		}
 	}()
 
+	a.wg.Add(1)
+
+	go func() {
+		defer a.wg.Done()
+
+		log.Info("ops listener", "addr", a.OpsAddr)
+
+		if err := a.opsSrv.Serve(opsLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			a.errCh <- fmt.Errorf("ops listener: %w", err)
+		}
+	}()
+
 	return a, nil
+}
+
+// cleanupStartFailure unwinds partially-constructed Start state when
+// a subsequent step (e.g. a later net.Listen) fails. Closes any
+// listeners already bound and tells the cluster to stop its refresh
+// goroutine within a bounded budget.
+func cleanupStartFailure(cl *cluster.Cluster, listeners ...net.Listener) {
+	for _, ln := range listeners {
+		if ln == nil {
+			continue
+		}
+
+		_ = ln.Close() //nolint:errcheck // best-effort close on bind failure
+	}
+
+	closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_ = cl.Close(closeCtx) //nolint:errcheck // best-effort cleanup on bind failure
+}
+
+// newOpsHandler returns the http.Handler serving /healthz and
+// /readyz for kubelet probes. /healthz is unconditional 200
+// (process-alive); /readyz returns 200 only when isReady reports
+// true. isReady is injected so tests can drive the readiness
+// signal independently of the surrounding App.
+func newOpsHandler(isReady func() bool) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok")) //nolint:errcheck // best-effort probe response
+	})
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+		if !isReady() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("not ready")) //nolint:errcheck // best-effort probe response
+
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ready")) //nolint:errcheck // best-effort probe response
+	})
+
+	return mux
+}
+
+// isReady reports whether the app is ready to serve traffic.
+// Both conditions must hold:
+//   - cachestore self-test passed (or skipped via the test option).
+//   - cluster has loaded an initial peer-set snapshot.
+func (a *App) isReady() bool {
+	return a.cachestoreReady && a.Cluster.HasInitialSnapshot()
 }
 
 // Wait blocks until either the parent context is canceled or one of
@@ -302,7 +405,7 @@ func (a *App) Wait(ctx context.Context) error {
 	}
 }
 
-// Shutdown gracefully stops both listeners and the cluster goroutine.
+// Shutdown gracefully stops every listener and the cluster goroutine.
 // It is safe to call multiple times; subsequent calls are no-ops.
 func (a *App) Shutdown(ctx context.Context) error {
 	var firstErr error
@@ -318,6 +421,16 @@ func (a *App) Shutdown(ctx context.Context) error {
 
 		if firstErr == nil {
 			firstErr = err
+		}
+	}
+
+	if a.opsSrv != nil {
+		if err := a.opsSrv.Shutdown(ctx); err != nil {
+			a.log.Warn("ops listener shutdown failed", "err", err)
+
+			if firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
 

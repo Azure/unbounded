@@ -125,6 +125,7 @@ func TestApplyDefaults_FieldDefaults(t *testing.T) {
 		want any
 	}{
 		{"server.listen", c.Server.Listen, "0.0.0.0:8443"},
+		{"server.ops_listen", c.Server.OpsListen, "0.0.0.0:8442"},
 		{"origin.driver", c.Origin.Driver, "azureblob"},
 		{"origin.target_global", c.Origin.TargetGlobal, 192},
 		{"origin.queue_timeout", c.Origin.QueueTimeout, 5 * time.Second},

@@ -214,6 +214,16 @@ func (c *Cluster) Peers() []Peer {
 	return *p
 }
 
+// HasInitialSnapshot reports whether the cluster has loaded at least
+// one peer-set snapshot (success or failure path - any value stored
+// by refresh counts). Used by the app's /readyz endpoint to gate
+// readiness on cluster discovery having completed its initial pass.
+// Returns false only during the bootstrap window before refresh
+// runs even once.
+func (c *Cluster) HasInitialSnapshot() bool {
+	return c.peers.Load() != nil
+}
+
 // self returns the Peer for this replica.
 func (c *Cluster) self() Peer {
 	return Peer{IP: c.cfg.SelfPodIP, Self: true}
