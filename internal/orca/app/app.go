@@ -64,7 +64,7 @@ type options struct {
 	clusterOpts         []cluster.Option
 	origin              origin.Origin
 	cacheStore          cachestore.CacheStore
-	skipCacheSelfTst    bool
+	skipCacheSelfTest   bool
 	internalHandlerWrap func(http.Handler) http.Handler
 	edgeListener        net.Listener
 	internalListener    net.Listener
@@ -106,7 +106,7 @@ func WithCacheStore(cs cachestore.CacheStore) Option {
 // self-test. Useful only in tests that wire a cachestore decorator
 // already known to honor If-None-Match: *.
 func WithSkipCachestoreSelfTest() Option {
-	return func(o *options) { o.skipCacheSelfTst = true }
+	return func(o *options) { o.skipCacheSelfTest = true }
 }
 
 // WithInternalHandlerWrap installs a decorator around the internal
@@ -119,16 +119,21 @@ func WithInternalHandlerWrap(wrap func(http.Handler) http.Handler) Option {
 }
 
 // WithEdgeListener supplies a pre-bound listener for the client-edge
-// HTTP server, bypassing app.Start's own net.Listen call. Intended
-// for integration tests that need to allocate a port before starting
-// the app (so peer sets can advertise the captured port from t=0
-// without a close/re-bind race window).
+// HTTP server, bypassing app.Start's own net.Listen call.
+//
+// TEST-ONLY: production callers must not use this option. It is
+// exposed for integration tests (internal/orca/inttest) that allocate
+// the listener before the app starts so peer sets can advertise the
+// captured port from t=0 without a close-and-rebind race. Using it in
+// production silently disables the cfg.Server.Listen address.
 func WithEdgeListener(ln net.Listener) Option {
 	return func(o *options) { o.edgeListener = ln }
 }
 
 // WithInternalListener supplies a pre-bound listener for the peer-RPC
-// internal HTTP server. See WithEdgeListener for rationale.
+// internal HTTP server.
+//
+// TEST-ONLY: see WithEdgeListener.
 func WithInternalListener(ln net.Listener) Option {
 	return func(o *options) { o.internalListener = ln }
 }
@@ -160,7 +165,7 @@ func Start(ctx context.Context, cfg *config.Config, opts ...Option) (*App, error
 		return nil, err
 	}
 
-	if !o.skipCacheSelfTst {
+	if !o.skipCacheSelfTest {
 		if err := cs.SelfTestAtomicCommit(ctx); err != nil {
 			return nil, fmt.Errorf("cachestore self-test failed: %w", err)
 		}
@@ -188,7 +193,11 @@ func Start(ctx context.Context, cfg *config.Config, opts ...Option) (*App, error
 	if edgeLn == nil {
 		ln, err := net.Listen("tcp", cfg.Server.Listen)
 		if err != nil {
-			cl.Close()
+			closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = cl.Close(closeCtx) //nolint:errcheck // best-effort cleanup on bind failure
+
+			cancel()
+
 			return nil, fmt.Errorf("edge listener bind %q: %w", cfg.Server.Listen, err)
 		}
 
@@ -201,7 +210,10 @@ func Start(ctx context.Context, cfg *config.Config, opts ...Option) (*App, error
 		if err != nil {
 			_ = edgeLn.Close() //nolint:errcheck // best-effort close on bind failure
 
-			cl.Close()
+			closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = cl.Close(closeCtx) //nolint:errcheck // best-effort cleanup on bind failure
+
+			cancel()
 
 			return nil, fmt.Errorf("internal listener bind %q: %w", cfg.Cluster.InternalListen, err)
 		}
@@ -275,6 +287,15 @@ func Start(ctx context.Context, cfg *config.Config, opts ...Option) (*App, error
 func (a *App) Wait(ctx context.Context) error {
 	select {
 	case <-ctx.Done():
+		// Drain any listener error that happened to arrive at the
+		// same time as the shutdown signal so it shows up in logs
+		// rather than being silently discarded.
+		select {
+		case err := <-a.errCh:
+			a.log.Warn("listener error received during shutdown", "err", err)
+		default:
+		}
+
 		return nil
 	case err := <-a.errCh:
 		return err
@@ -300,7 +321,14 @@ func (a *App) Shutdown(ctx context.Context) error {
 		}
 	}
 
-	a.Cluster.Close()
+	if err := a.Cluster.Close(ctx); err != nil {
+		a.log.Warn("cluster close did not finish before ctx deadline", "err", err)
+
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+
 	a.wg.Wait()
 
 	return firstErr

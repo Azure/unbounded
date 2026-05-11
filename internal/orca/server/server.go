@@ -22,7 +22,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/Azure/unbounded/internal/orca/cachestore"
 	"github.com/Azure/unbounded/internal/orca/chunk"
 	"github.com/Azure/unbounded/internal/orca/cluster"
 	"github.com/Azure/unbounded/internal/orca/config"
@@ -425,11 +424,3 @@ func (h *InternalHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.log.Warn("internal fill copy failed", "chunk", k.String(), "err", copyErr)
 	}
 }
-
-// Compile-time check that the cachestore.ErrNotFound mapping survives
-// dead-code elimination across handlers (used only via errors.Is in
-// production code paths).
-var (
-	_ = cachestore.ErrNotFound
-	_ = context.Canceled
-)

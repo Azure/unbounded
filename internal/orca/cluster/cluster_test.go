@@ -66,7 +66,7 @@ func TestRefresh_RetainsPreviousOnError(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	t.Cleanup(func() { c.Close() })
+	t.Cleanup(func() { _ = c.Close(context.Background()) })
 
 	// Initial refresh ran during New; verify good peers are loaded.
 	if got := len(c.Peers()); got != 3 {
@@ -125,7 +125,7 @@ func TestRefresh_BootstrapErrorFallsBackToSelf(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	t.Cleanup(func() { c.Close() })
+	t.Cleanup(func() { _ = c.Close(context.Background()) })
 
 	got := c.Peers()
 	if len(got) != 1 || !got[0].Self {
@@ -157,7 +157,7 @@ func TestRefresh_EmptyResultFallsBackToSelf(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	t.Cleanup(func() { c.Close() })
+	t.Cleanup(func() { _ = c.Close(context.Background()) })
 
 	got := c.Peers()
 	if len(got) != 1 || !got[0].Self {

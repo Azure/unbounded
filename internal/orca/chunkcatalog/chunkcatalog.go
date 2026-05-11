@@ -8,7 +8,6 @@ package chunkcatalog
 
 import (
 	"container/list"
-	"fmt"
 	"sync"
 	"time"
 
@@ -44,7 +43,7 @@ func New(maxEntries int) *Catalog {
 }
 
 // Lookup returns the cached Info if present and bumps the LRU position.
-func (c *Catalog) Lookup(k chunk.Key) (cachestore.Info, bool, error) {
+func (c *Catalog) Lookup(k chunk.Key) (cachestore.Info, bool) {
 	path := k.Path()
 
 	c.mu.Lock()
@@ -52,21 +51,18 @@ func (c *Catalog) Lookup(k chunk.Key) (cachestore.Info, bool, error) {
 
 	el, ok := c.idx[path]
 	if !ok {
-		return cachestore.Info{}, false, nil
+		return cachestore.Info{}, false
 	}
 
 	c.ll.MoveToFront(el)
 
-	e, ok := el.Value.(*entry)
-	if !ok {
-		return cachestore.Info{}, false, fmt.Errorf("chunkcatalog: list element is not *entry")
-	}
-
-	return e.info, true, nil
+	// The list is private to this package; we control every value
+	// inserted (always *entry). The type assertion is safe.
+	return el.Value.(*entry).info, true //nolint:errcheck // type invariant: list elements are *entry
 }
 
 // Record inserts or updates the entry.
-func (c *Catalog) Record(k chunk.Key, info cachestore.Info) error {
+func (c *Catalog) Record(k chunk.Key, info cachestore.Info) {
 	path := k.Path()
 
 	c.mu.Lock()
@@ -75,15 +71,11 @@ func (c *Catalog) Record(k chunk.Key, info cachestore.Info) error {
 	if el, ok := c.idx[path]; ok {
 		c.ll.MoveToFront(el)
 
-		e, ok := el.Value.(*entry)
-		if !ok {
-			return fmt.Errorf("chunkcatalog: list element is not *entry")
-		}
-
+		e := el.Value.(*entry) //nolint:errcheck // type invariant: list elements are *entry
 		e.info = info
 		e.at = time.Now()
 
-		return nil
+		return
 	}
 
 	el := c.ll.PushFront(&entry{path: path, info: info, at: time.Now()})
@@ -97,15 +89,9 @@ func (c *Catalog) Record(k chunk.Key, info cachestore.Info) error {
 
 		c.ll.Remove(oldest)
 
-		oldEntry, ok := oldest.Value.(*entry)
-		if !ok {
-			return fmt.Errorf("chunkcatalog: list element is not *entry")
-		}
-
+		oldEntry := oldest.Value.(*entry) //nolint:errcheck // type invariant: list elements are *entry
 		delete(c.idx, oldEntry.path)
 	}
-
-	return nil
 }
 
 // Forget removes the entry if present.

@@ -16,7 +16,6 @@ import (
 	"container/list"
 	"context"
 	"errors"
-	"fmt"
 	"sync"
 	"time"
 
@@ -88,10 +87,9 @@ func (c *Cache) lookup(originID, bucket, key string) (origin.ObjectInfo, bool, e
 		return origin.ObjectInfo{}, false, nil
 	}
 
-	e, ok := el.Value.(*cacheEntry)
-	if !ok {
-		return origin.ObjectInfo{}, false, fmt.Errorf("metadata: list element is not *cacheEntry")
-	}
+	// The list is private; we control every value inserted (always
+	// *cacheEntry). The type assertion is safe.
+	e := el.Value.(*cacheEntry) //nolint:errcheck // type invariant: list elements are *cacheEntry
 
 	if time.Now().After(e.expiresAt) {
 		c.ll.Remove(el)
@@ -124,10 +122,8 @@ func (c *Cache) LookupOrFetch(
 	k := mkKey(originID, bucket, key)
 	v, _ := c.sf.LoadOrStore(k, &sfEntry{done: make(chan struct{})})
 
-	sfe, ok := v.(*sfEntry)
-	if !ok {
-		return origin.ObjectInfo{}, fmt.Errorf("metadata: singleflight value is not *sfEntry")
-	}
+	// The sync.Map only ever holds *sfEntry; the type assertion is safe.
+	sfe := v.(*sfEntry) //nolint:errcheck // type invariant: sf map values are *sfEntry
 
 	first := false
 
@@ -153,9 +149,7 @@ func (c *Cache) LookupOrFetch(
 		sfe.info = info
 		sfe.err = err
 
-		if recErr := c.recordResult(originID, bucket, key, info, err); recErr != nil {
-			err = errors.Join(err, recErr)
-		}
+		c.recordResult(originID, bucket, key, info, err)
 
 		return info, err
 	}
@@ -182,7 +176,7 @@ func (c *Cache) Invalidate(originID, bucket, key string) {
 	}
 }
 
-func (c *Cache) recordResult(originID, bucket, key string, info origin.ObjectInfo, err error) error {
+func (c *Cache) recordResult(originID, bucket, key string, info origin.ObjectInfo, err error) {
 	k := mkKey(originID, bucket, key)
 
 	c.mu.Lock()
@@ -203,7 +197,7 @@ func (c *Cache) recordResult(originID, bucket, key string, info origin.ObjectInf
 			e = &cacheEntry{key: k, negative: true, negErr: err, expiresAt: now.Add(c.cfg.NegativeTTL)}
 		} else {
 			// Other transient errors not cached.
-			return nil
+			return
 		}
 	}
 
@@ -223,15 +217,9 @@ func (c *Cache) recordResult(originID, bucket, key string, info origin.ObjectInf
 
 		c.ll.Remove(oldest)
 
-		oldEntry, ok := oldest.Value.(*cacheEntry)
-		if !ok {
-			return fmt.Errorf("metadata: list element is not *cacheEntry")
-		}
-
+		oldEntry := oldest.Value.(*cacheEntry) //nolint:errcheck // type invariant: list elements are *cacheEntry
 		delete(c.idx, oldEntry.key)
 	}
-
-	return nil
 }
 
 func mkKey(originID, bucket, key string) string {

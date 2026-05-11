@@ -54,6 +54,19 @@ type ObjectEntry struct {
 }
 
 // Sentinel errors. Wrap with %w so callers use errors.Is.
+//
+// Driver contract:
+//
+//   - ErrNotFound: blob does not exist. AWS S3 driver returns this for
+//     NoSuchKey responses; the azureblob driver for BlobNotFound /
+//     ContainerNotFound.
+//   - ErrAuth: 401 / 403. AWS S3 driver returns this for AccessDenied
+//     and similar; the azureblob driver for HTTP 401/403 and the
+//     AuthenticationFailed / AuthorizationFailure codes.
+//
+// New drivers should map their SDK-specific not-found and auth
+// indicators onto these sentinels so handlers can route consistently
+// via errors.Is.
 var (
 	ErrNotFound = errors.New("origin: not found")
 	ErrAuth     = errors.New("origin: auth")

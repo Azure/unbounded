@@ -109,12 +109,7 @@ func (c *Coordinator) HeadObject(ctx context.Context, bucket, key string) (origi
 //     fill.
 func (c *Coordinator) GetChunk(ctx context.Context, k chunk.Key) (io.ReadCloser, error) {
 	// Hot path: catalog hit -> direct CacheStore read.
-	_, ok, err := c.cat.Lookup(k)
-	if err != nil {
-		return nil, fmt.Errorf("chunkcatalog lookup: %w", err)
-	}
-
-	if ok {
+	if _, ok := c.cat.Lookup(k); ok {
 		rc, err := c.cs.GetChunk(ctx, k, 0, k.ChunkSize)
 		if err == nil {
 			return rc, nil
@@ -130,9 +125,7 @@ func (c *Coordinator) GetChunk(ctx context.Context, k chunk.Key) (io.ReadCloser,
 
 	// Stat to confirm presence.
 	if info, err := c.cs.Stat(ctx, k); err == nil {
-		if recErr := c.cat.Record(k, info); recErr != nil {
-			return nil, fmt.Errorf("chunkcatalog record: %w", recErr)
-		}
+		c.cat.Record(k, info)
 
 		return c.cs.GetChunk(ctx, k, 0, info.Size)
 	} else if !errors.Is(err, cachestore.ErrNotFound) {
@@ -168,12 +161,7 @@ func (c *Coordinator) FillForPeer(ctx context.Context, k chunk.Key) (io.ReadClos
 	// Hot path: catalog hit -> direct read. The catalog can be stale
 	// (e.g. cachestore pruned out-of-band, or operator clear-cache);
 	// on ErrNotFound we forget and fall through to a fresh fill.
-	_, ok, err := c.cat.Lookup(k)
-	if err != nil {
-		return nil, fmt.Errorf("chunkcatalog lookup: %w", err)
-	}
-
-	if ok {
+	if _, ok := c.cat.Lookup(k); ok {
 		rc, err := c.cs.GetChunk(ctx, k, 0, k.ChunkSize)
 		if err == nil {
 			return rc, nil
@@ -187,9 +175,7 @@ func (c *Coordinator) FillForPeer(ctx context.Context, k chunk.Key) (io.ReadClos
 	}
 
 	if info, err := c.cs.Stat(ctx, k); err == nil {
-		if recErr := c.cat.Record(k, info); recErr != nil {
-			return nil, fmt.Errorf("chunkcatalog record: %w", recErr)
-		}
+		c.cat.Record(k, info)
 
 		return c.cs.GetChunk(ctx, k, 0, info.Size)
 	} else if !errors.Is(err, cachestore.ErrNotFound) {
@@ -275,17 +261,11 @@ func (c *Coordinator) runFill(k chunk.Key, f *fill) {
 	// Atomic commit to CacheStore.
 	commitErr := c.cs.PutChunk(ctx, k, int64(buf.Len()), bytes.NewReader(buf.Bytes()))
 	if commitErr == nil {
-		if recErr := c.cat.Record(k, cachestore.Info{Size: int64(buf.Len()), Committed: time.Now()}); recErr != nil {
-			slog.Default().Warn("chunkcatalog record failed",
-				"chunk", k.String(), "err", recErr)
-		}
+		c.cat.Record(k, cachestore.Info{Size: int64(buf.Len()), Committed: time.Now()})
 	} else if errors.Is(commitErr, cachestore.ErrCommitLost) {
 		// Another replica won; treat existing CacheStore entry as truth.
 		if info, err := c.cs.Stat(ctx, k); err == nil {
-			if recErr := c.cat.Record(k, info); recErr != nil {
-				slog.Default().Warn("chunkcatalog record failed",
-					"chunk", k.String(), "err", recErr)
-			}
+			c.cat.Record(k, info)
 		}
 	} else {
 		slog.Default().Warn("commit-after-serve failed",
@@ -301,6 +281,10 @@ func (c *Coordinator) fetchWithRetry(ctx context.Context, k chunk.Key, off, leng
 	var lastErr error
 
 	for attempt := 1; attempt <= c.cfg.Origin.Retry.Attempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
 		if time.Now().After(deadline) {
 			return nil, fmt.Errorf("origin retry exhausted (duration); last err: %w", lastErr)
 		}

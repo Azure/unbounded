@@ -133,3 +133,13 @@ func (c *countingResponseWriter) Write(p []byte) (int, error) {
 
 	return c.ResponseWriter.Write(p)
 }
+
+// Flush passes through to the embedded ResponseWriter when it
+// implements http.Flusher. Without this method, wrapping a handler
+// that streams via Flush() (e.g. the edge handler's per-chunk
+// f.Flush()) would silently degrade to buffered responses.
+func (c *countingResponseWriter) Flush() {
+	if fl, ok := c.ResponseWriter.(http.Flusher); ok {
+		fl.Flush()
+	}
+}

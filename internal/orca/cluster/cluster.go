@@ -178,10 +178,21 @@ func New(parent context.Context, cfg config.Cluster, opts ...Option) (*Cluster, 
 	return c, nil
 }
 
-// Close stops the refresh goroutine and waits for it to exit.
-func (c *Cluster) Close() {
+// Close stops the refresh goroutine and waits for it to exit. If ctx
+// is canceled before the goroutine exits (e.g. an in-flight DNS
+// lookup is taking longer than the caller can tolerate) Close returns
+// the context error. The underlying cancellation is always signalled,
+// so the goroutine will exit eventually even if the caller stops
+// waiting.
+func (c *Cluster) Close(ctx context.Context) error {
 	c.cancelFn()
-	<-c.done
+
+	select {
+	case <-c.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // Peers returns the current peer-set snapshot.
@@ -228,16 +239,12 @@ func (c *Cluster) Coordinator(k chunk.Key) Peer {
 }
 
 // IsCoordinator reports whether this replica is the coordinator for k.
+// Every code path producing a coord value stamps the Self flag
+// authoritatively (dnsPeerSource matches by selfIP; StaticPeerSource
+// by (selfIP, selfPort); the empty-peer-set fallback constructs
+// c.self()), so checking Self is the single source of truth.
 func (c *Cluster) IsCoordinator(k chunk.Key) bool {
-	coord := c.Coordinator(k)
-	if coord.Self {
-		return true
-	}
-	// In production peers are addressed by IP only and Self is set
-	// from cfg.SelfPodIP, so the IP comparison below is the same as
-	// the Self check above. Tests with shared IPs rely on the Self
-	// flag being set authoritatively by the PeerSource.
-	return coord.IP == c.cfg.SelfPodIP && coord.Port == 0
+	return c.Coordinator(k).Self
 }
 
 // FillFromPeer issues GET /internal/fill against the named peer and
@@ -440,9 +447,17 @@ func DecodeChunkKey(values url.Values) (chunk.Key, error) {
 		return chunk.Key{}, fmt.Errorf("invalid chunk_size: %w", err)
 	}
 
+	if chunkSize <= 0 {
+		return chunk.Key{}, fmt.Errorf("invalid chunk_size: must be > 0, got %d", chunkSize)
+	}
+
 	idx, err := strconv.ParseInt(values.Get("index"), 10, 64)
 	if err != nil {
 		return chunk.Key{}, fmt.Errorf("invalid index: %w", err)
+	}
+
+	if idx < 0 {
+		return chunk.Key{}, fmt.Errorf("invalid index: must be >= 0, got %d", idx)
 	}
 
 	originID := values.Get("origin_id")
