@@ -407,24 +407,39 @@ func (a *App) isReady() bool {
 // the production "serve until SIGTERM" path; tests typically call
 // Shutdown directly.
 //
-// On ctx cancellation, any listener errors that have already landed
-// in errCh are drained and logged so they aren't silently discarded
-// when shutdown overlaps with a listener failure.
+// Any listener errors that arrive concurrently with the wait-return
+// (ctx-cancel branch or first-error branch) are drained and logged
+// at Warn so they aren't silently discarded. Without this, a
+// shutdown that overlaps with a listener failure - or a multi-
+// listener crash where two listeners errored within the same tick -
+// would lose all but the first error.
 func (a *App) Wait(ctx context.Context) error {
 	select {
 	case <-ctx.Done():
-		for {
-			select {
-			case err := <-a.errCh:
-				a.log.LogAttrs(ctx, slog.LevelWarn, "listener error received during shutdown",
-					slog.Any("err", err),
-				)
-			default:
-				return nil
-			}
-		}
+		a.drainErrCh(ctx, "listener error received during shutdown")
+
+		return nil
 	case err := <-a.errCh:
+		a.drainErrCh(ctx, "additional listener error after first")
+
 		return err
+	}
+}
+
+// drainErrCh non-blockingly consumes any remaining errors from
+// a.errCh and logs them at Warn with the given message. Used by
+// Wait on both return paths to ensure no listener error is silently
+// dropped.
+func (a *App) drainErrCh(ctx context.Context, msg string) {
+	for {
+		select {
+		case err := <-a.errCh:
+			a.log.LogAttrs(ctx, slog.LevelWarn, msg,
+				slog.Any("err", err),
+			)
+		default:
+			return
+		}
 	}
 }
 

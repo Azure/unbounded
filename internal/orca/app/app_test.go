@@ -4,8 +4,12 @@
 package app
 
 import (
+	"context"
+	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 )
@@ -97,5 +101,46 @@ func TestApp_IsReady_RequiresCachestoreReady(t *testing.T) {
 
 	if a.isReady() {
 		t.Errorf("isReady = true with cachestoreReady=false")
+	}
+}
+
+// TestApp_Wait_DrainsErrChOnCtxCancel verifies that listener errors
+// arriving alongside a shutdown ctx are all logged rather than only
+// the first being preserved. Pre-fills errCh with three errors,
+// then cancels ctx; Wait should drain all three to the logger.
+//
+// Regression for M-4 / the earlier app.Wait drain work; the
+// expanded drain helper now applies to both Wait return paths so a
+// multi-listener crash within a tick doesn't lose errors.
+func TestApp_Wait_DrainsErrChOnCtxCancel(t *testing.T) {
+	t.Parallel()
+
+	var buf strings.Builder
+
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	a := &App{
+		log:   log,
+		errCh: make(chan error, 4),
+	}
+
+	a.errCh <- errors.New("edge boom")
+
+	a.errCh <- errors.New("internal boom")
+
+	a.errCh <- errors.New("ops boom")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // ctx already cancelled when Wait starts
+
+	if err := a.Wait(ctx); err != nil {
+		t.Errorf("Wait err = %v, want nil (ctx cancelled)", err)
+	}
+
+	out := buf.String()
+	for _, want := range []string{"edge boom", "internal boom", "ops boom"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("drained log missing %q; got %q", want, out)
+		}
 	}
 }
