@@ -236,6 +236,13 @@ it, every request would re-`HEAD` the origin.
 
 Each chunk's storage path is deterministic:
 
+`LE64(x)` is the little-endian 8-byte encoding of a 64-bit unsigned
+integer, `||` is byte-string concatenation, and `LP(s)` is the
+length-prefixed encoding of `s` (its length as `LE64` followed by
+its bytes). Length-prefixing each field prevents two distinct
+inputs from producing the same hash via boundary ambiguity (e.g.
+`("ab", "c")` vs. `("a", "bc")`).
+
 ```
 LP(s)   = LE64(uint64(len(s))) || s
 hashKey = sha256(
