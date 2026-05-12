@@ -314,19 +314,40 @@ func (c *Coordinator) fillLocal(ctx context.Context, k chunk.Key, objectSize int
 
 func (c *Coordinator) runFill(k chunk.Key, objectSize int64, f *fill) {
 	// runFill runs on a fill-scoped detached context (not the
-	// caller's) so it can complete the cachestore commit-after-serve
-	// step even if the originating client disconnects mid-stream.
-	// The 5-minute ceiling bounds the cost: a fill no joiner ever
-	// reads still releases its origin-semaphore slot and clears its
-	// inflight entry within the budget. Peak per-fill heap is one
-	// ChunkSize bytes.Buffer (8 MiB default). Without metrics this
-	// cost is invisible; revisit if production telemetry shows
-	// cancelled-by-client storms.
+	// caller's) so it can complete the cachestore commit step even
+	// if the originating client disconnects mid-stream. The 5-minute
+	// ceiling bounds the cost: a fill no joiner ever reads still
+	// releases its origin-semaphore slot and clears its inflight
+	// entry within the budget. Peak per-fill heap is one ChunkSize
+	// bytes.Buffer (8 MiB default).
+	//
+	// Commit-after-serve ordering: once the origin body is fully
+	// fetched and validated, joiners are released (close(f.done))
+	// BEFORE the PutChunk RPC begins. This shaves joiner latency by
+	// the cachestore commit time on the cold-fill path: joiners get
+	// bytes as soon as origin delivered them, and the commit runs in
+	// parallel from the joiners' perspective. Correctness is
+	// preserved because the buffer is fully populated and
+	// length-validated before release; PutChunk reads buf.Bytes()
+	// concurrently with joiner reads, but bytes.Buffer is never
+	// mutated after the final io.Copy returns, so the underlying
+	// byte slice is effectively immutable and safe for concurrent
+	// reads.
+	//
+	// release() is sync.Once-wrapped so close(f.done) fires exactly
+	// once whether via the explicit success-path call or the deferred
+	// safety net (which catches panic paths).
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
+	var releaseOnce sync.Once
+
+	release := func() {
+		releaseOnce.Do(func() { close(f.done) })
+	}
+
 	defer func() {
-		close(f.done)
+		release()
 		c.mu.Lock()
 		delete(c.inflight, k.Path())
 		c.mu.Unlock()
@@ -388,7 +409,14 @@ func (c *Coordinator) runFill(k chunk.Key, objectSize int64, f *fill) {
 
 	f.bodyBuf = buf
 
-	// Atomic commit to CacheStore.
+	// Release joiners BEFORE the PutChunk commit. Joiners' reads of
+	// f.bodyBuf.Bytes() are safe to overlap with the PutChunk RPC's
+	// read of the same slice: bytes.Buffer's internal slice is no
+	// longer mutated after io.Copy returned above.
+	release()
+
+	// Atomic commit to CacheStore (asynchronous from joiners'
+	// perspective; they have their bytes already).
 	commitErr := c.cs.PutChunk(ctx, k, int64(buf.Len()), bytes.NewReader(buf.Bytes()))
 
 	switch {

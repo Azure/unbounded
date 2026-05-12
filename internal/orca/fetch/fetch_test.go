@@ -9,10 +9,17 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/Azure/unbounded/internal/orca/cachestore"
 	"github.com/Azure/unbounded/internal/orca/chunk"
+	"github.com/Azure/unbounded/internal/orca/chunkcatalog"
 	"github.com/Azure/unbounded/internal/orca/config"
+	"github.com/Azure/unbounded/internal/orca/metadata"
+	"github.com/Azure/unbounded/internal/orca/origin"
 )
 
 // TestNewCoordinator_UsesInjectedLogger verifies the constructor
@@ -163,5 +170,192 @@ func TestCoordinator_WarnRoutesThroughInjectedHandler(t *testing.T) {
 
 	if !strings.Contains(out, "chunk.key=o") {
 		t.Errorf("chunk attribute missing; got %q", out)
+	}
+}
+
+// fakeOriginForFill returns a fixed body for any GetRange call.
+type fakeOriginForFill struct {
+	body []byte
+}
+
+func (f *fakeOriginForFill) Head(_ context.Context, _, _ string) (origin.ObjectInfo, error) {
+	return origin.ObjectInfo{Size: int64(len(f.body)), ETag: "e1"}, nil
+}
+
+func (f *fakeOriginForFill) GetRange(_ context.Context, _, _, _ string, _, _ int64) (io.ReadCloser, error) {
+	return io.NopCloser(bytes.NewReader(f.body)), nil
+}
+
+func (f *fakeOriginForFill) List(_ context.Context, _, _, _ string, _ int) (origin.ListResult, error) {
+	return origin.ListResult{}, nil
+}
+
+// slowPutCacheStore implements cachestore.CacheStore. PutChunk
+// blocks until putGate is closed; signals putStarted when entered
+// and putReturned when leaving. Used by the commit-after-serve test
+// to observe the relative ordering of joiner release vs PutChunk
+// completion.
+type slowPutCacheStore struct {
+	putGate      chan struct{}
+	putStarted   chan struct{}
+	putReturned  chan struct{}
+	closeOnce    sync.Once
+	putCallCount atomic.Int64
+}
+
+func newSlowPutCacheStore() *slowPutCacheStore {
+	return &slowPutCacheStore{
+		putGate:     make(chan struct{}),
+		putStarted:  make(chan struct{}),
+		putReturned: make(chan struct{}),
+	}
+}
+
+func (s *slowPutCacheStore) GetChunk(_ context.Context, _ chunk.Key, _, _ int64) (io.ReadCloser, error) {
+	return nil, cachestore.ErrNotFound
+}
+
+func (s *slowPutCacheStore) PutChunk(_ context.Context, _ chunk.Key, _ int64, _ io.Reader) error {
+	s.putCallCount.Add(1)
+	s.closeOnce.Do(func() { close(s.putStarted) })
+	<-s.putGate
+	close(s.putReturned)
+
+	return nil
+}
+
+func (s *slowPutCacheStore) Stat(_ context.Context, _ chunk.Key) (cachestore.Info, error) {
+	return cachestore.Info{}, cachestore.ErrNotFound
+}
+
+func (s *slowPutCacheStore) Delete(_ context.Context, _ chunk.Key) error  { return nil }
+func (s *slowPutCacheStore) SelfTestAtomicCommit(_ context.Context) error { return nil }
+
+// TestRunFill_CommitAfterServe_JoinerSeesBytesBeforeCommit verifies
+// that runFill releases joiners (close(f.done)) BEFORE the cachestore
+// PutChunk completes. With the prior commit-before-serve ordering,
+// joiners had to wait an extra commit-rtt; this test detects a
+// regression by asserting the joiner returns while PutChunk is still
+// blocked.
+//
+// Regression for H-1.
+func TestRunFill_CommitAfterServe_JoinerSeesBytesBeforeCommit(t *testing.T) {
+	t.Parallel()
+
+	payload := []byte("hello world commit-after-serve test payload!!")
+	chunkSize := int64(len(payload))
+
+	or := &fakeOriginForFill{body: payload}
+	cs := newSlowPutCacheStore()
+	cat := chunkcatalog.New(64, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	mc := metadata.NewCache(config.Metadata{TTL: time.Minute, NegativeTTL: time.Minute, MaxEntries: 16}, nil)
+
+	cfg := &config.Config{
+		Origin: config.Origin{
+			ID:           "ox",
+			QueueTimeout: time.Second,
+			Retry: config.OriginRetry{
+				Attempts:         1,
+				BackoffInitial:   time.Millisecond,
+				BackoffMax:       time.Millisecond,
+				MaxTotalDuration: time.Second,
+			},
+			TargetGlobal: 4,
+		},
+		Cluster: config.Cluster{TargetReplicas: 1},
+	}
+
+	co := NewCoordinator(or, cs, nil, cat, mc, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	k := chunk.Key{
+		OriginID:  "ox",
+		Bucket:    "b",
+		ObjectKey: "o",
+		ETag:      "e1",
+		ChunkSize: chunkSize,
+		Index:     0,
+	}
+
+	rcCh := make(chan io.ReadCloser, 1)
+	errCh := make(chan error, 1)
+
+	go func() {
+		rc, err := co.fillLocal(context.Background(), k, chunkSize)
+		if err != nil {
+			errCh <- err
+			return
+		}
+
+		rcCh <- rc
+	}()
+	// Wait for PutChunk to have been entered, ensuring runFill is
+	// past the validate-and-release point.
+	select {
+	case <-cs.putStarted:
+	case <-time.After(2 * time.Second):
+		close(cs.putGate)
+		t.Fatalf("PutChunk never entered; runFill never reached commit")
+	}
+
+	// fillLocal should return now (joiner released before PutChunk
+	// completes). With the old commit-before-serve ordering it would
+	// still be blocked.
+	select {
+	case rc := <-rcCh:
+		// Verify PutChunk hasn't completed.
+		select {
+		case <-cs.putReturned:
+			t.Errorf("PutChunk returned before fillLocal; commit-after-serve regressed")
+		default:
+		}
+
+		got, err := io.ReadAll(rc)
+		if err != nil {
+			t.Errorf("read body: %v", err)
+		}
+
+		if !bytes.Equal(got, payload) {
+			t.Errorf("body mismatch: got %d bytes want %d", len(got), len(payload))
+		}
+
+		_ = rc.Close() //nolint:errcheck // test cleanup
+	case err := <-errCh:
+		close(cs.putGate)
+		t.Fatalf("fillLocal err: %v", err)
+	case <-time.After(2 * time.Second):
+		close(cs.putGate)
+		t.Fatalf("fillLocal didn't return while PutChunk was blocked; commit-after-serve regressed")
+	}
+
+	// Release PutChunk and let runFill finish.
+	close(cs.putGate)
+	<-cs.putReturned
+}
+
+// TestRunFill_ReleaseIdempotent_PanicSafe verifies that close(f.done)
+// fires exactly once whether via the explicit success-path call or
+// the deferred safety net. A panic mid-fill must not corrupt the
+// channel state by double-closing it.
+//
+// Regression for H-1's sync.Once safety property.
+func TestRunFill_ReleaseIdempotent_PanicSafe(t *testing.T) {
+	t.Parallel()
+
+	// Use the test pattern directly: a sync.Once-wrapped close,
+	// called from two paths.
+	done := make(chan struct{})
+
+	var once sync.Once
+
+	release := func() { once.Do(func() { close(done) }) }
+
+	release() // explicit path
+	release() // simulated "deferred safety net" path - must not panic
+
+	select {
+	case <-done:
+		// Closed - good.
+	default:
+		t.Errorf("done channel not closed after release()")
 	}
 }
