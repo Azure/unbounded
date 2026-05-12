@@ -15,6 +15,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"maps"
 	"os"
@@ -69,6 +70,7 @@ func (a *AgentConfig) BackfillNodeName() error {
 			a.NodeName = hostNodeName
 			return nil
 		}
+		hostnameErr = fmt.Errorf("hostname %q is not a valiad Kubenetes node name", hostNodeName)
 	}
 
 	nodeName := strings.TrimSpace(a.MachineName)
@@ -76,20 +78,9 @@ func (a *AgentConfig) BackfillNodeName() error {
 		a.NodeName = nodeName
 		return nil
 	}
+	machineNameErr := fmt.Errorf("machine name %q is not a valid Kubernetse node name", a.MachineName)
 
-	if hostnameErr != nil {
-		return fmt.Errorf(
-			"machine name %q Kubernetes node name validation failed after host hostname lookup also failed: %w",
-			a.MachineName,
-			hostnameErr,
-		)
-	}
-
-	return fmt.Errorf(
-		"machine name %q Kubernetes node name validation failed after host hostname %q also failed validation",
-		a.MachineName,
-		hostNodeName,
-	)
+	return errors.Join(hostnameErr, machineNameErr)
 }
 
 func isValidNodeName(name string) bool {
