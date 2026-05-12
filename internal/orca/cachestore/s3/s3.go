@@ -227,7 +227,21 @@ func (d *Driver) SelfTestAtomicCommit(ctx context.Context) error {
 }
 
 // GetChunk fetches [off, off+n) of the chunk path from the bucket.
+//
+// Rejects n <= 0 with a sentinel ErrInvalidArgument: the wire-format
+// boundary (cluster.DecodeChunkKey) already rejects object_size <= 0,
+// so an in-process caller asking for a zero-length read is a logic
+// bug. Forwarding the request would yield a malformed S3 Range
+// header (bytes=0--1).
 func (d *Driver) GetChunk(ctx context.Context, k chunk.Key, off, n int64) (io.ReadCloser, error) {
+	if n <= 0 {
+		return nil, fmt.Errorf("cachestore/s3 get: n must be > 0, got %d", n)
+	}
+
+	if off < 0 {
+		return nil, fmt.Errorf("cachestore/s3 get: off must be >= 0, got %d", off)
+	}
+
 	rng := fmt.Sprintf("bytes=%d-%d", off, off+n-1)
 
 	d.log.LogAttrs(ctx, slog.LevelDebug, "cachestore_get_chunk",
@@ -256,7 +270,17 @@ func (d *Driver) GetChunk(ctx context.Context, k chunk.Key, off, n int64) (io.Re
 
 // PutChunk uploads the chunk via PutObject + If-None-Match: *. On
 // 412 returns ErrCommitLost (loser of an atomic-commit race).
+//
+// Rejects size <= 0 with a sentinel error: a zero-byte chunk is
+// never a legitimate fill result (the wire-format boundary already
+// rejects object_size <= 0, and the smallest legitimate tail chunk
+// is 1 byte), and uploading a zero-byte object would poison the
+// path so later GetChunk(n=expected) reads return 0 bytes and break
+// the streaming model.
 func (d *Driver) PutChunk(ctx context.Context, k chunk.Key, size int64, r io.Reader) error {
+	if size <= 0 {
+		return fmt.Errorf("cachestore/s3 put: size must be > 0, got %d", size)
+	}
 	// AWS SDK v2 needs an io.ReadSeeker for unsigned-payload uploads
 	// (so it can rewind on signed-retry). If the caller already passed
 	// a seekable reader we hand it to the SDK directly; otherwise
@@ -267,12 +291,8 @@ func (d *Driver) PutChunk(ctx context.Context, k chunk.Key, size int64, r io.Rea
 		if err != nil {
 			return fmt.Errorf("cachestore/s3 put: read body: %w", err)
 		}
-
 		// Validate the actual byte count against the caller's
-		// claimed size. The previous '&& size > 0' carve-out
-		// silently disabled the check when callers passed size=0,
-		// which could upload arbitrary bytes with ContentLength=0
-		// and trigger backend errors that were harder to diagnose.
+		// claimed size.
 		if int64(len(buf)) != size {
 			return fmt.Errorf("cachestore/s3 put: short body (got %d want %d)", len(buf), size)
 		}

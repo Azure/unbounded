@@ -352,21 +352,15 @@ func (c *Coordinator) runFill(k chunk.Key, objectSize int64, f *fill) {
 
 	// expectedLen is the authoritative number of bytes we should
 	// receive from origin: ChunkSize for non-tail chunks, the
-	// remainder for the tail. We request at most expectedLen and
-	// reject responses that don't match.
+	// remainder for the tail. Production callers always supply a
+	// known objectSize, so expectedLen > 0; the wire format
+	// (DecodeChunkKey) and edge handler both reject the
+	// objectSize == 0 case at their boundaries, so the validation
+	// below is always exercised.
 	expectedLen := k.ExpectedLen(objectSize)
 	off := k.Index * k.ChunkSize
 
-	requestLen := expectedLen
-	if requestLen == 0 {
-		// Fallback when objectSize is unknown: request the full chunk
-		// size; the validation below cannot distinguish a legitimate
-		// short tail from a flaky-origin short read, so the caller is
-		// trusting the origin in this mode.
-		requestLen = k.ChunkSize
-	}
-
-	body, err := c.fetchWithRetry(ctx, k, off, requestLen)
+	body, err := c.fetchWithRetry(ctx, k, off, expectedLen)
 	if err != nil {
 		f.err = err
 		return
@@ -385,7 +379,7 @@ func (c *Coordinator) runFill(k chunk.Key, objectSize int64, f *fill) {
 		slog.Int64("expected_len", expectedLen),
 	)
 
-	if expectedLen > 0 && int64(buf.Len()) != expectedLen {
+	if int64(buf.Len()) != expectedLen {
 		f.err = fmt.Errorf("origin returned %d bytes, expected %d (chunk=%s)",
 			buf.Len(), expectedLen, k.String())
 

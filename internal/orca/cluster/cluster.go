@@ -660,8 +660,8 @@ func DecodeChunkKey(values url.Values) (chunk.Key, int64, error) {
 		return chunk.Key{}, 0, fmt.Errorf("invalid object_size: %w", err)
 	}
 
-	if objectSize < 0 {
-		return chunk.Key{}, 0, fmt.Errorf("invalid object_size: must be >= 0, got %d", objectSize)
+	if objectSize <= 0 {
+		return chunk.Key{}, 0, fmt.Errorf("invalid object_size: must be > 0, got %d", objectSize)
 	}
 
 	originID := values.Get("origin_id")

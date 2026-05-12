@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -652,5 +653,56 @@ func TestRefresh_CtxCanceledDoesNotBumpErrorCounter(t *testing.T) {
 
 	if got := len(c.Peers()); got != initialPeers {
 		t.Errorf("peer-set churned on ctx.Canceled; got %d want %d", got, initialPeers)
+	}
+}
+
+// TestDecodeChunkKey_RejectsZeroObjectSize verifies that the wire
+// boundary rejects object_size == 0 as well as negative values.
+// The previous code accepted 0 as a sentinel for "unknown size"
+// which became a foot-gun (validation skipped, malformed range,
+// validating-reader bypassed); production callers always know the
+// size from a prior Head, so tightening the contract removes the
+// foot-gun without breaking any real caller.
+//
+// Regression for C-2 / C-3 / C-4.
+func TestDecodeChunkKey_RejectsZeroObjectSize(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		objectSize string
+		wantErr    bool
+	}{
+		{"zero rejected", "0", true},
+		{"negative rejected", "-1", true},
+		{"positive accepted", "1024", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := url.Values{}
+			v.Set("origin_id", "ox")
+			v.Set("bucket", "b")
+			v.Set("key", "o")
+			v.Set("etag", "e1")
+			v.Set("chunk_size", "1024")
+			v.Set("index", "0")
+			v.Set("object_size", tt.objectSize)
+
+			_, _, err := DecodeChunkKey(v)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("DecodeChunkKey(object_size=%s) returned nil; want error", tt.objectSize)
+				} else if !strings.Contains(err.Error(), "object_size") {
+					t.Errorf("error does not mention object_size: %v", err)
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Errorf("DecodeChunkKey(object_size=%s) unexpected error: %v", tt.objectSize, err)
+			}
+		})
 	}
 }

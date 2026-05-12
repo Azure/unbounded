@@ -4,6 +4,7 @@
 package s3
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"testing"
@@ -14,6 +15,7 @@ import (
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 
 	"github.com/Azure/unbounded/internal/orca/cachestore"
+	"github.com/Azure/unbounded/internal/orca/chunk"
 )
 
 // makeResponseErr builds an *awshttp.ResponseError wrapping the
@@ -136,5 +138,70 @@ func TestMapErr_PassthroughUnknown(t *testing.T) {
 	src := errors.New("unrecognized")
 	if got := mapErr(src); got != src {
 		t.Errorf("mapErr(unknown) = %v, want passthrough %v", got, src)
+	}
+}
+
+// TestGetChunk_RejectsZeroN verifies that GetChunk refuses n <= 0.
+// Forwarding such a request would produce a malformed S3 Range
+// header (bytes=0--1) which the backend rejects with InvalidArgument.
+// The wire-format boundary (cluster.DecodeChunkKey) already rejects
+// object_size <= 0, so an in-process caller reaching this with n <= 0
+// is a logic bug we want surfaced as an explicit error.
+//
+// Regression for C-2.
+func TestGetChunk_RejectsZeroN(t *testing.T) {
+	t.Parallel()
+
+	d := &Driver{}
+
+	tests := []struct {
+		name string
+		off  int64
+		n    int64
+	}{
+		{"n zero", 0, 0},
+		{"n negative", 0, -1},
+		{"off negative", -1, 1024},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := d.GetChunk(context.Background(), chunkPathOnlyKey(), tt.off, tt.n)
+			if err == nil {
+				t.Errorf("GetChunk(off=%d, n=%d) returned nil; want error", tt.off, tt.n)
+			}
+		})
+	}
+}
+
+// TestPutChunk_RejectsZeroSize verifies that PutChunk refuses
+// size <= 0. A zero-byte commit would poison the path with a
+// 0-byte blob and subsequent GetChunk(n=expected) reads would
+// either error or stream zero bytes.
+//
+// Regression for C-3.
+func TestPutChunk_RejectsZeroSize(t *testing.T) {
+	t.Parallel()
+
+	d := &Driver{}
+
+	for _, size := range []int64{0, -1} {
+		if err := d.PutChunk(context.Background(), chunkPathOnlyKey(), size, nil); err == nil {
+			t.Errorf("PutChunk(size=%d) returned nil; want error", size)
+		}
+	}
+}
+
+// chunkPathOnlyKey returns a minimal chunk.Key whose Path() can be
+// computed; used by the GetChunk / PutChunk guard tests that error
+// before any S3 round-trip.
+func chunkPathOnlyKey() chunk.Key {
+	return chunk.Key{
+		OriginID:  "ox",
+		Bucket:    "b",
+		ObjectKey: "o",
+		ETag:      "e1",
+		ChunkSize: 1024,
+		Index:     0,
 	}
 }
