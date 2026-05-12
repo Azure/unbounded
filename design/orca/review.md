@@ -651,5 +651,103 @@ kubectl logs -l app=orca --tail=-1 | jq 'select(.source.file | endswith("fetch.g
 - **Runtime log-level switching**: the `slog.LevelVar` foundation is
   in place; a SIGUSR1 handler or `/loglevel` admin endpoint can
   plug in without touching the handler.
+
+---
+
+## Third-pass findings and remediation
+
+A third review pass focused exclusively on functional bugs, gaps,
+and data-corruption surfaces (no ops-level "missing X" concerns).
+Ten commits landed.
+
+### Landed findings
+
+- **C-2 / C-3 / C-4 (dropped `object_size == 0` sentinel).** The
+  "unknown object size" sentinel was dead code that surfaced three
+  reachable foot-guns: malformed S3 Range header (`bytes=0--1`)
+  when n=0, validation-skipping in runFill exploitable by an
+  adversarial peer, and Content-Length absence bypassing the
+  cross-replica validatingReader. Wire format now rejects
+  object_size <= 0; cachestore/s3 GetChunk/PutChunk reject n <= 0
+  and size <= 0 defensively.
+- **C-1 / H-5 (catalog presence-only).** chunkcatalog stored a
+  cachestore.Info per entry but the only caller discarded it; the
+  defensive value of the stored size was illusory (chunk.Path
+  encodes chunkSize so info.Size MUST equal expected, by contract).
+  Simplified to bool-returning Lookup, no Info field.
+- **H-1 (commit-after-serve).** runFill's documented intent was
+  commit-after-serve but the code was commit-before-serve due to
+  defer ordering. Joiners had to wait for both origin fetch AND
+  cachestore commit before seeing bytes. Reordered with a
+  sync.Once-wrapped release(); joiners now return as soon as
+  origin delivered the bytes, commit happens in parallel.
+- **H-7 (etag-less origin).** chunk.Path encodes ETag in its hash;
+  an origin returning empty ETags would alias different versions
+  of the same (bucket, key) to the same path and silently serve
+  stale bytes after mutation. New origin.MissingETagError sentinel
+  rejected at fetch.HeadObject, cached negatively, mapped to a
+  clear 502 OriginMissingETag at the server boundary.
+- **C-6 (orcaseed seed determinism).** Shared math/rand source
+  + mutex produced order-dependent bytes under concurrency. Each
+  blob now seeds from `userSeed + blobIndex`, so determinism is
+  invariant under upload-completion ordering.
+- **C-7 (deploy-credentials.sh dev-key safety).** The Azurite
+  well-known dev key fallback now gates on
+  AZURE_STORAGE_ACCOUNT being empty or `devstoreaccount1`. Real
+  accounts with a missing key hard-fail loud instead of silently
+  401'ing against the real backend.
+- **H-4 (HTTP transport connect timeouts).** Stuck TCP SYN or
+  stalled TLS handshake against a half-failed peer could hang
+  until the caller's ctx (the 5-minute fill ctx for leader-side
+  fills). Added bounded Transport.DialContext (10s) and
+  TLSHandshakeTimeout (10s); body-read deadlines remain ctx-driven.
+- **H-6 (PutChunk seekable-path size check).** Only the
+  non-seekable path validated size against actual bytes. The
+  seekable path trusted the caller. Added a seek-and-check probe
+  at the driver entry; mismatched seekable readers now error
+  before any S3 RPC.
+- **M-4 (app.Wait symmetric drain).** The ctx-cancel branch
+  drained errCh; the errCh-first branch did not. Extracted
+  drainErrCh helper; both Wait return paths now drain so a
+  multi-listener crash within a tick can't lose errors.
+- **M-1 (IndexRange contract clarity).** Doc comment now precisely
+  describes input invariants and the empty-range guard.
+- **M-7 (orcaseed delete stdin EOF).** Confirmation prompt error
+  now says "stdin closed without input; pass --yes" instead of
+  the opaque "read confirmation: EOF".
+
+### Deferred items (with rationale)
+
+- **H-2 (orphan chunks after etag rotation).** No GC for cached
+  chunks under old etags. Documented as "crash recovery /
+  unowned-key sweep" in design.md; v1 acceptable.
+- **H-3 (singleflight ctx propagation).** Leader's ctx-cancel
+  surfaces to all joiners as the leader's err. Self-healing on
+  next request. Mitigation requires parallel-fetch rework.
+- **H-8 (originSem starvation under cancellation storms).**
+  Operational concern, requires metrics to triage first.
+- **M-2 (RFC edge case `bytes=-0`).** Pathological; no real clients.
+- **M-3 (Self bit not in peer diff).** Cosmetic.
+- **M-5 (transient errors not negatively cached).** Trade-off; would
+  mask real-time origin-flap recovery.
+- **M-6 (refresh oscillation).** Hypothetical; no observed flap.
+- **M-8 (orcaseed silent overwrite).** Default is correct for the
+  regenerate-then-test workflow; add `--no-overwrite` opt-in later.
+- **M-9 (cachestore conditional GET).** Atomic-commit primitive
+  covers this.
+- **M-10 (well-known key duplication).** Public Microsoft constant;
+  not worth centralising.
+- All L-1..L-10. Cosmetic, documented invariants, or production-
+  readiness work scoped separately.
+
+### Verification
+
+Every third-pass commit ran `make` and `make orca-inttest` green.
+The corruption-surface commits (C-1, C-2, C-3, C-4, C-6, H-1, H-6,
+H-7) each carry regression tests that fail under the prior
+behaviour and pass after the fix; the seekable-path / connect-
+timeout / errCh-drain commits carry structural assertions
+(driver-level guards, Transport configuration, drained log
+output).
 </content>
 </invoke>

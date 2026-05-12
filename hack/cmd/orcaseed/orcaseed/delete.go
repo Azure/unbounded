@@ -6,7 +6,9 @@ package orcaseed
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -88,6 +90,10 @@ func runDelete(ctx context.Context, g *globalFlags, o *deleteOpts) error {
 
 		line, err := r.ReadString('\n')
 		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return fmt.Errorf("delete confirmation: stdin closed without input; pass --yes to skip the prompt in non-interactive contexts")
+			}
+
 			return fmt.Errorf("read confirmation: %w", err)
 		}
 

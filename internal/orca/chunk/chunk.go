@@ -104,12 +104,26 @@ func writeLP(h hash.Hash, s string) {
 // cover the byte range [start, end] of an object whose total size is
 // objectSize.
 //
-// Caller is responsible for clamping start / end against objectSize
-// before invoking; if end >= objectSize, end is clamped here. If
-// end is negative (e.g. an empty-object [0, -1] degenerate range),
-// last is clamped to 0 so the integer-division floor does not
-// silently produce a negative chunk index that could leak into
-// downstream loop bounds.
+// Inputs:
+//   - start, end: requested byte range (inclusive on both ends).
+//     Both must be >= 0 under normal use.
+//   - chunkSize: > 0; the configured chunk size.
+//   - objectSize: > 0 for any meaningful call. Empty-object callers
+//     should not invoke IndexRange; the server short-circuits to
+//     200 + empty body upstream.
+//
+// Clamping behaviour:
+//   - end >= objectSize is clamped to objectSize - 1.
+//   - end < 0 is defensively clamped to 0 (returns first=0, last=0,
+//     meaning "chunk 0" - the caller must already have prevented
+//     reaching this branch in normal flow; the clamp is a guard
+//     against an arithmetic bug elsewhere, not a supported empty-
+//     range encoding).
+//
+// The function does not validate chunkSize > 0; a zero or negative
+// chunkSize panics with a runtime division-by-zero. The config
+// validation at startup (chunking.size minimum 1 MiB) guarantees
+// this invariant in production.
 func IndexRange(start, end, chunkSize, objectSize int64) (first, last int64) {
 	if end >= objectSize {
 		end = objectSize - 1
