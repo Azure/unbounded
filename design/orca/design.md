@@ -13,7 +13,7 @@ correct under load. The shorter stakeholder version is in
 5. [Chunk model](#5-chunk-model)
 6. [Request flow](#6-request-flow)
 7. [Stampede protection](#7-stampede-protection)
-8. [Concurrency, durability, correctness](#8-concurrency-durability-correctness)
+8. [Atomic commit](#8-atomic-commit)
 9. [Bounded staleness contract](#9-bounded-staleness-contract)
 10. [Create-after-404 and negative-cache lifecycle](#10-create-after-404-and-negative-cache-lifecycle)
 11. [Eviction and capacity](#11-eviction-and-capacity)
@@ -82,7 +82,7 @@ cloud sees exactly one fetch.
   what's cached. Today this is `cachestore/s3` (an in-DC
   S3-compatible object store). Interface in
   `internal/orca/cachestore/cachestore.go`; commit rules in
-  [s8](#8-concurrency-durability-correctness).
+  [s8](#8-atomic-commit).
 - **Chunk** - one fixed-size piece of an object (8 MiB by
   default). Orca caches and fills chunks, not whole objects.
 - **ChunkKey** - the chunk's name:
@@ -720,9 +720,7 @@ How each kind of failure is handled:
   client gets a 502. Orca does not auto-refill, because that
   would just hammer a backend that's already struggling.
 
-## 8. Concurrency, durability, correctness
-
-### 8.1 Atomic commit
+## 8. Atomic commit
 
 The leader publishes a chunk to the cachestore in one step that
 won't overwrite anything: `PutObject` with `If-None-Match: *`.
@@ -752,65 +750,6 @@ buckets).
 `Suspended`, startup fails with a clear error. VAST and several
 S3-compatible backends ignore `If-None-Match: *` on versioned
 buckets, which would silently break the atomic-commit rule.
-
-### 8.2 Typed cachestore errors
-
-The cachestore returns four kinds of error (see
-`internal/orca/cachestore/cachestore.go`):
-
-- `ErrNotFound`: the chunk is missing. Triggers the miss-fill
-  path.
-- `ErrCommitLost`: another writer won the no-clobber race. The
-  leader Stats the existing entry and records it on success.
-- `ErrTransient` (5xx, timeout, throttle): the client gets a
-  502. Orca does not auto-refill.
-- `ErrAuth` (401 / 403): the client gets a 502.
-
-Callers route on these via `errors.Is`. The drivers
-(`cachestore/s3` and the origin drivers) detect them from the
-HTTP status code on `*awshttp.ResponseError` (or the Azure
-equivalent), not from substring matches on error messages.
-
-### 8.3 Range, sizes, and edge cases
-
-- The last chunk of an object is stored at its actual size, not
-  padded. `chunk.Key.ExpectedLen(info.Size)` is the truth, and
-  the leader rejects origin responses that don't match.
-- `Range` is validated against `info.Size` before any cache
-  lookup. Unsatisfiable returns 416.
-- Zero-byte objects return 200 with an empty body. Any `Range`
-  header against a zero-byte object is 416 (per RFC 7233).
-- The `cachestore/s3.PutChunk` driver checks the input reader's
-  length. For seekable readers it seeks to the end to find the
-  length. For non-seekable readers it counts the bytes during
-  the write. Either path errors before any S3 RPC if the size
-  doesn't match.
-
-### 8.4 Readiness probe (`/readyz`)
-
-The ops listener (`:8442`) serves `/healthz` (always 200 while
-the process is up) and `/readyz` (200 when ready, 503
-otherwise). Production manifests point the kubelet probes here.
-
-`/readyz` returns 200 when both:
-
-1. The cachestore self-test passed (`SelfTestAtomicCommit`), or
-   the operator passed `app.WithSkipCachestoreSelfTest`
-   (test-only).
-2. The cluster has loaded at least one peer-set snapshot
-   (`Cluster.HasInitialSnapshot`).
-
-Both conditions are sticky once true. Peer-set churn after the
-first snapshot doesn't flap readiness. If DNS is broken end to
-end and the first snapshot never lands, the replica stays
-`NotReady` and load balancers drain it.
-
-`/healthz` is deliberately trivial. It lets operators tell apart
-"process is alive" from "ready to serve". A misconfigured replica
-can sit `NotReady` indefinitely while its logs stay readable.
-
-The ops listener has no auth. The production Service doesn't
-expose it; only the kubelet talks to it.
 
 ## 9. Bounded staleness contract
 

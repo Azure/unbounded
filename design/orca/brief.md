@@ -215,7 +215,7 @@ get `412`) and a `GetBucketVersioning` gate (versioned buckets
 are rejected, because some S3-compatible backends ignore
 `If-None-Match: *` on them). Both checks must pass before the
 listener binds. See
-[design.md s8.1](./design.md#81-atomic-commit).
+[design.md s8](./design.md#8-atomic-commit).
 
 ### 5.5 Bounded staleness contract
 
@@ -355,7 +355,7 @@ sequenceDiagram
   protection.
 - [s7.7 Failure handling](./design.md#77-failure-handling-without-re-stampede) -
   pre-header retry, ETag changes, commit-after-serve failure.
-- [s8.1 Atomic commit](./design.md#81-atomic-commit) -
+- [s8 Atomic commit](./design.md#8-atomic-commit) -
   `PutObject + If-None-Match: *`, the boot self-test, the
   versioning gate.
 - [s9 Bounded staleness](./design.md#9-bounded-staleness-contract).
