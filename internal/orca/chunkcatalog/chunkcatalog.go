@@ -4,6 +4,15 @@
 // Package chunkcatalog implements a bounded LRU recording chunks known
 // to be present in the CacheStore. Pure hot-path optimization;
 // CacheStore is the source of truth.
+//
+// The catalog is presence-only: it tracks whether a chunk's path is
+// known to exist in the cachestore. No size or metadata is stored.
+// chunk.Path encodes (origin_id, bucket, key, etag, chunk_size), so
+// a path hit means the cachestore contains bytes for this exact
+// version of this chunk - the path encoding IS the integrity
+// statement, and a stale entry whose backing bytes have been deleted
+// is self-healing (cachestore.GetChunk returns ErrNotFound, caller
+// Forget()s the entry and falls through to the stat path).
 package chunkcatalog
 
 import (
@@ -12,7 +21,6 @@ import (
 	"log/slog"
 	"sync"
 
-	"github.com/Azure/unbounded/internal/orca/cachestore"
 	"github.com/Azure/unbounded/internal/orca/chunk"
 )
 
@@ -27,7 +35,6 @@ type Catalog struct {
 
 type entry struct {
 	path string
-	info cachestore.Info
 }
 
 // New constructs a Catalog. The log is used at debug level for
@@ -52,12 +59,13 @@ func New(maxEntries int, log *slog.Logger) *Catalog {
 	}
 }
 
-// Lookup returns the cached Info if present and bumps the LRU position.
+// Lookup reports whether the chunk is known to be present in the
+// cachestore. Bumps the LRU position on hit.
 //
 // This is the hottest log site in orca: it fires on every chunk read
 // attempt. The LogAttrs path ensures attribute-evaluation cost is
 // zero when the configured level is above Debug.
-func (c *Catalog) Lookup(k chunk.Key) (cachestore.Info, bool) {
+func (c *Catalog) Lookup(k chunk.Key) bool {
 	path := k.Path()
 
 	c.mu.Lock()
@@ -69,25 +77,24 @@ func (c *Catalog) Lookup(k chunk.Key) (cachestore.Info, bool) {
 			catalogAttrs(k),
 		)
 
-		return cachestore.Info{}, false
+		return false
 	}
 
 	c.ll.MoveToFront(el)
 
-	// The list is private to this package; we control every value
-	// inserted (always *entry). The type assertion is safe.
-	info := el.Value.(*entry).info //nolint:errcheck // type invariant: list elements are *entry
-
 	c.log.LogAttrs(context.Background(), slog.LevelDebug, "chunkcatalog_lookup_hit",
 		catalogAttrs(k),
-		slog.Int64("size", info.Size),
 	)
 
-	return info, true
+	return true
 }
 
-// Record inserts or updates the entry.
-func (c *Catalog) Record(k chunk.Key, info cachestore.Info) {
+// Record marks the chunk as present.
+//
+// The 'info' argument is accepted for caller convenience (most call
+// sites already have a cachestore.Info from the prior Stat) but is
+// not stored. See package docstring for the presence-only rationale.
+func (c *Catalog) Record(k chunk.Key) {
 	path := k.Path()
 
 	c.mu.Lock()
@@ -96,24 +103,19 @@ func (c *Catalog) Record(k chunk.Key, info cachestore.Info) {
 	if el, ok := c.idx[path]; ok {
 		c.ll.MoveToFront(el)
 
-		e := el.Value.(*entry) //nolint:errcheck // type invariant: list elements are *entry
-		e.info = info
-
 		c.log.LogAttrs(context.Background(), slog.LevelDebug, "chunkcatalog_record_update",
 			catalogAttrs(k),
-			slog.Int64("size", info.Size),
 		)
 
 		return
 	}
 
-	el := c.ll.PushFront(&entry{path: path, info: info})
+	el := c.ll.PushFront(&entry{path: path})
 
 	c.idx[path] = el
 
 	c.log.LogAttrs(context.Background(), slog.LevelDebug, "chunkcatalog_record_insert",
 		catalogAttrs(k),
-		slog.Int64("size", info.Size),
 	)
 
 	for c.ll.Len() > c.maxEntries {

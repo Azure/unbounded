@@ -10,7 +10,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Azure/unbounded/internal/orca/cachestore"
 	"github.com/Azure/unbounded/internal/orca/chunk"
 )
 
@@ -39,28 +38,27 @@ func TestNew_NilLoggerFallsBackToDefault(t *testing.T) {
 	}
 }
 
-// TestRecord_Lookup_Forget exercises the basic LRU operations to
-// confirm the Catalog behaviour was not regressed by the logger
-// field addition.
+// TestRecord_Lookup_Forget exercises the basic LRU operations
+// against the presence-only API.
 func TestRecord_Lookup_Forget(t *testing.T) {
 	t.Parallel()
 
 	c := New(16, nil)
 
 	k := chunk.Key{OriginID: "o", Bucket: "b", ObjectKey: "key", ChunkSize: 1024}
-	if _, ok := c.Lookup(k); ok {
+	if c.Lookup(k) {
 		t.Fatalf("lookup before record returned hit")
 	}
 
-	c.Record(k, cachestore.Info{Size: 1024})
+	c.Record(k)
 
-	if info, ok := c.Lookup(k); !ok || info.Size != 1024 {
-		t.Errorf("lookup after record: ok=%v info=%+v", ok, info)
+	if !c.Lookup(k) {
+		t.Errorf("lookup after record returned miss")
 	}
 
 	c.Forget(k)
 
-	if _, ok := c.Lookup(k); ok {
+	if c.Lookup(k) {
 		t.Errorf("lookup after forget returned hit")
 	}
 }
@@ -80,7 +78,7 @@ func TestDebugEmissions(t *testing.T) {
 	k := chunk.Key{OriginID: "ox", Bucket: "bkt", ObjectKey: "obj", ChunkSize: 1024, Index: 4}
 
 	c.Lookup(k) // miss
-	c.Record(k, cachestore.Info{Size: 1024})
+	c.Record(k)
 	c.Lookup(k) // hit
 	c.Forget(k)
 
@@ -111,7 +109,7 @@ func TestDebugFilteredAtInfo(t *testing.T) {
 	c := New(16, log)
 
 	k := chunk.Key{OriginID: "ox", Bucket: "b", ObjectKey: "o", ChunkSize: 1024}
-	c.Record(k, cachestore.Info{Size: 1024})
+	c.Record(k)
 	c.Lookup(k)
 	c.Forget(k)
 
@@ -134,8 +132,8 @@ func TestEvictEmitsAttr(t *testing.T) {
 	k1 := chunk.Key{OriginID: "o", Bucket: "b", ObjectKey: "a", ChunkSize: 1024}
 	k2 := chunk.Key{OriginID: "o", Bucket: "b", ObjectKey: "b", ChunkSize: 1024}
 
-	c.Record(k1, cachestore.Info{Size: 1024})
-	c.Record(k2, cachestore.Info{Size: 1024})
+	c.Record(k1)
+	c.Record(k2)
 
 	if !strings.Contains(buf.String(), "chunkcatalog_evict") {
 		t.Errorf("evict emission missing from output: %q", buf.String())

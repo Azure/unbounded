@@ -217,7 +217,7 @@ func (c *Coordinator) FillForPeer(ctx context.Context, k chunk.Key, objectSize i
 func (c *Coordinator) lookupOrStat(ctx context.Context, k chunk.Key, objectSize int64) (io.ReadCloser, bool, error) {
 	expected := k.ExpectedLen(objectSize)
 
-	if _, ok := c.cat.Lookup(k); ok {
+	if c.cat.Lookup(k) {
 		c.log.LogAttrs(ctx, slog.LevelDebug, "catalog_hit",
 			chunkAttrs(k),
 		)
@@ -256,7 +256,7 @@ func (c *Coordinator) lookupOrStat(ctx context.Context, k chunk.Key, objectSize 
 		slog.Int64("size", info.Size),
 	)
 
-	c.cat.Record(k, info)
+	c.cat.Record(k)
 
 	// Trust the stat's reported size if it disagrees with our
 	// expectation (e.g. older committed entry from before a chunk
@@ -393,7 +393,7 @@ func (c *Coordinator) runFill(k chunk.Key, objectSize int64, f *fill) {
 
 	switch {
 	case commitErr == nil:
-		c.cat.Record(k, cachestore.Info{Size: int64(buf.Len()), Committed: time.Now()})
+		c.cat.Record(k)
 		c.log.LogAttrs(ctx, slog.LevelDebug, "commit_success",
 			chunkAttrs(k),
 			slog.Int("bytes", buf.Len()),
@@ -404,8 +404,8 @@ func (c *Coordinator) runFill(k chunk.Key, objectSize int64, f *fill) {
 			chunkAttrs(k),
 		)
 
-		if info, err := c.cs.Stat(ctx, k); err == nil {
-			c.cat.Record(k, info)
+		if _, err := c.cs.Stat(ctx, k); err == nil {
+			c.cat.Record(k)
 		}
 	default:
 		c.log.LogAttrs(ctx, slog.LevelWarn, "commit-after-serve failed",
