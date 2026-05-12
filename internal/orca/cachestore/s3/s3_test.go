@@ -4,6 +4,7 @@
 package s3
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/http"
@@ -203,5 +204,32 @@ func chunkPathOnlyKey() chunk.Key {
 		ETag:      "e1",
 		ChunkSize: 1024,
 		Index:     0,
+	}
+}
+
+// TestPutChunk_SeekableSizeMismatch verifies that PutChunk rejects
+// a seekable reader whose actual length does not match the declared
+// size. Without the seekable-path probe, a buggy caller passing a
+// Reader of length M with size=N would either be rejected by S3
+// (ContentLength mismatch) or upload a wrong-sized blob.
+//
+// Regression for H-6.
+func TestPutChunk_SeekableSizeMismatch(t *testing.T) {
+	t.Parallel()
+
+	d := &Driver{}
+
+	// Reader has 10 bytes, but caller claims 1024. PutChunk must
+	// fail at the seek-and-check probe before any RPC.
+	r := bytes.NewReader(make([]byte, 10))
+	if err := d.PutChunk(context.Background(), chunkPathOnlyKey(), 1024, r); err == nil {
+		t.Errorf("PutChunk accepted seekable reader with size mismatch")
+	}
+
+	// Reader has 100 bytes, caller claims 50: also a mismatch
+	// (caller would upload only 50, leaving 50 unread).
+	r = bytes.NewReader(make([]byte, 100))
+	if err := d.PutChunk(context.Background(), chunkPathOnlyKey(), 50, r); err == nil {
+		t.Errorf("PutChunk accepted seekable reader longer than declared size")
 	}
 }

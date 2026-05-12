@@ -298,6 +298,28 @@ func (d *Driver) PutChunk(ctx context.Context, k chunk.Key, size int64, r io.Rea
 		}
 
 		body = bytes.NewReader(buf)
+	} else {
+		// Seekable-path size validation: probe the reader's length
+		// via Seek(0, End), confirm it matches the declared size,
+		// then rewind to position 0 for the upload. Without this
+		// guard, a buggy caller passing a Reader of length M with
+		// size=N would either be rejected by S3 (ContentLength
+		// mismatch) or upload a truncated / overlong blob,
+		// depending on backend behaviour. The wire-format boundary
+		// already rejects size <= 0; this catches the size > 0 but
+		// mismatched-bytes case at the driver entry point.
+		end, err := body.Seek(0, io.SeekEnd)
+		if err != nil {
+			return fmt.Errorf("cachestore/s3 put: seek-end: %w", err)
+		}
+
+		if end != size {
+			return fmt.Errorf("cachestore/s3 put: seekable reader length %d does not match size %d", end, size)
+		}
+
+		if _, err := body.Seek(0, io.SeekStart); err != nil {
+			return fmt.Errorf("cachestore/s3 put: seek-rewind: %w", err)
+		}
 	}
 
 	d.log.LogAttrs(ctx, slog.LevelDebug, "cachestore_put_chunk",
