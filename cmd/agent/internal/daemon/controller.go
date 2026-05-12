@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"os"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -52,13 +51,9 @@ func runController(
 	log *slog.Logger,
 	restCfg *rest.Config,
 	machineName string,
+	nodeName string,
 	nodeOperator nodeOperator,
 ) error {
-	nodeName, err := resolveNodeName(machineName)
-	if err != nil {
-		return err
-	}
-
 	reconciler := &daemonReconciler{
 		log:          log,
 		machineName:  machineName,
@@ -101,22 +96,6 @@ func runController(
 	log.Info("daemon shutting down")
 
 	return err
-}
-
-func resolveNodeName(machineName string) (string, error) {
-	// TODO: The daemon currently assumes the Kubernetes Node name matches the
-	// host hostname. We should decide the node name in the daemon and pass it
-	// into kubelet config later so node naming and Machine references are
-	// deterministic.
-	nodeName, err := os.Hostname()
-	if err != nil {
-		return "", fmt.Errorf("get hostname for Machine %s Node source: %w", machineName, err)
-	}
-	if nodeName == "" {
-		return "", fmt.Errorf("get hostname for Machine %s Node source: hostname is empty", machineName)
-	}
-
-	return nodeName, nil
 }
 
 func (r *daemonReconciler) SetupWithManager(mgr ctrl.Manager) error {

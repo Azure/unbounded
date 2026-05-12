@@ -13,6 +13,9 @@ type NodeStart struct {
 	// the local nspawn machine name.
 	KubeMachineName string
 
+	// NodeName is the Kubernetes Node name used by kubelet and host-side daemon watches.
+	NodeName string
+
 	MachineDir string // e.g. /var/lib/machines/node
 	Containerd Containerd
 	Kubelet    Kubelet
