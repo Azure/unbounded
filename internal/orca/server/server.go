@@ -402,6 +402,7 @@ func (h *EdgeHandler) writeOriginError(w http.ResponseWriter, err error) {
 		var (
 			ube *origin.UnsupportedBlobTypeError
 			ec  *origin.OriginETagChangedError
+			mte *origin.MissingETagError
 		)
 
 		switch {
@@ -409,6 +410,8 @@ func (h *EdgeHandler) writeOriginError(w http.ResponseWriter, err error) {
 			http.Error(w, "OriginUnsupported: "+ube.Error(), http.StatusBadGateway)
 		case errors.As(err, &ec):
 			http.Error(w, "OriginETagChanged", http.StatusBadGateway)
+		case errors.As(err, &mte):
+			http.Error(w, "OriginMissingETag: "+mte.Error(), http.StatusBadGateway)
 		default:
 			h.log.LogAttrs(context.Background(), slog.LevelWarn, "origin error",
 				slog.Any("err", err),

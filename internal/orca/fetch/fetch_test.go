@@ -6,6 +6,7 @@ package fetch
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"strings"
@@ -358,4 +359,92 @@ func TestRunFill_ReleaseIdempotent_PanicSafe(t *testing.T) {
 	default:
 		t.Errorf("done channel not closed after release()")
 	}
+}
+
+// stubOriginEmptyETag returns ObjectInfo with no ETag - simulating a
+// misconfigured origin (e.g. some S3-compatible backend without
+// versioning, or a custom origin not following the AWS/Azure
+// contract).
+type stubOriginEmptyETag struct{}
+
+func (stubOriginEmptyETag) Head(_ context.Context, _, _ string) (origin.ObjectInfo, error) {
+	return origin.ObjectInfo{Size: 1024, ETag: ""}, nil
+}
+
+func (stubOriginEmptyETag) GetRange(_ context.Context, _, _, _ string, _, _ int64) (io.ReadCloser, error) {
+	return nil, nil
+}
+
+func (stubOriginEmptyETag) List(_ context.Context, _, _, _ string, _ int) (origin.ListResult, error) {
+	return origin.ListResult{}, nil
+}
+
+// TestHeadObject_RejectsEmptyETag verifies that the coordinator
+// rejects an origin Head response with an empty ETag. chunk.Path
+// encodes the ETag in its hash; without it, two different versions
+// of the same (bucket, key) would alias and serve stale bytes
+// silently.
+//
+// Regression for H-7.
+func TestHeadObject_RejectsEmptyETag(t *testing.T) {
+	t.Parallel()
+
+	mc := metadata.NewCache(config.Metadata{TTL: time.Minute, NegativeTTL: time.Minute, MaxEntries: 16}, nil)
+	co := NewCoordinator(stubOriginEmptyETag{}, nil, nil, nil, mc,
+		&config.Config{Origin: config.Origin{ID: "ox"}, Cluster: config.Cluster{TargetReplicas: 1}},
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	_, err := co.HeadObject(context.Background(), "b", "o")
+	if err == nil {
+		t.Fatalf("HeadObject accepted empty ETag; want MissingETagError")
+	}
+
+	var mte *origin.MissingETagError
+	if !errors.As(err, &mte) {
+		t.Errorf("err type = %T (want *origin.MissingETagError): %v", err, err)
+	}
+}
+
+// TestHeadObject_EmptyETag_CachedNegatively verifies that a second
+// HeadObject call after a MissingETagError result does NOT re-hit
+// the origin: the negative result must be cached so we do not
+// hammer a misconfigured origin on every request.
+func TestHeadObject_EmptyETag_CachedNegatively(t *testing.T) {
+	t.Parallel()
+
+	or := &countingOrigin{inner: stubOriginEmptyETag{}}
+	mc := metadata.NewCache(config.Metadata{TTL: time.Minute, NegativeTTL: time.Minute, MaxEntries: 16}, nil)
+	co := NewCoordinator(or, nil, nil, nil, mc,
+		&config.Config{Origin: config.Origin{ID: "ox"}, Cluster: config.Cluster{TargetReplicas: 1}},
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	for i := 0; i < 3; i++ {
+		_, err := co.HeadObject(context.Background(), "b", "o")
+		if err == nil {
+			t.Errorf("call %d: HeadObject accepted empty ETag", i)
+		}
+	}
+
+	if got := or.headCalls.Load(); got != 1 {
+		t.Errorf("origin.Head invoked %d times; want 1 (negative cached)", got)
+	}
+}
+
+// countingOrigin wraps an origin.Origin and counts Head invocations.
+type countingOrigin struct {
+	inner     origin.Origin
+	headCalls atomic.Int64
+}
+
+func (c *countingOrigin) Head(ctx context.Context, bucket, key string) (origin.ObjectInfo, error) {
+	c.headCalls.Add(1)
+	return c.inner.Head(ctx, bucket, key)
+}
+
+func (c *countingOrigin) GetRange(ctx context.Context, bucket, key, etag string, off, n int64) (io.ReadCloser, error) {
+	return c.inner.GetRange(ctx, bucket, key, etag, off, n)
+}
+
+func (c *countingOrigin) List(ctx context.Context, bucket, prefix, marker string, max int) (origin.ListResult, error) {
+	return c.inner.List(ctx, bucket, prefix, marker, max)
 }

@@ -98,6 +98,26 @@ func (e *UnsupportedBlobTypeError) Error() string {
 		e.BlobType, e.Bucket, e.Key)
 }
 
+// MissingETagError is returned by the fetch coordinator when an
+// origin Head response carries an empty ETag. chunk.Path encodes the
+// ETag in its hash input; a stable cache key requires the origin to
+// supply one. Misconfigured backends (some S3-compatible
+// implementations with specific bucket policies, custom origins not
+// following the AWS/Azure contract) can omit ETags, in which case
+// two different versions of the same (bucket, key) would alias to
+// the same chunk.Path and orca would silently serve stale bytes.
+// Rejecting at Head time surfaces the misconfiguration immediately
+// instead of after observable corruption.
+type MissingETagError struct {
+	Bucket string
+	Key    string
+}
+
+func (e *MissingETagError) Error() string {
+	return fmt.Sprintf("origin returned empty ETag for %s/%s; orca requires versioned origins",
+		e.Bucket, e.Key)
+}
+
 // ETagShort returns the first 8 characters of an unquoted ETag for
 // log/debug emissions. ETags are not secrets but they're long enough
 // to make log lines hard to read; the prefix is sufficient for

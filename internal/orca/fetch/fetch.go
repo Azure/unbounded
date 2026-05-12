@@ -103,6 +103,14 @@ func NewCoordinator(
 func (c *Coordinator) Origin() origin.Origin { return c.or }
 
 // HeadObject returns object metadata, satisfying client HEAD requests.
+//
+// Rejects responses with an empty ETag via origin.MissingETagError.
+// chunk.Path encodes the ETag in its hash input; a stable cache key
+// requires the origin to supply one. Without an ETag, two different
+// versions of the same (bucket, key) would alias to the same
+// chunk.Path and serve stale bytes silently. The negative result is
+// cached at NegativeTTL so we do not re-Head a misconfigured origin
+// on every request.
 func (c *Coordinator) HeadObject(ctx context.Context, bucket, key string) (origin.ObjectInfo, error) {
 	c.log.LogAttrs(ctx, slog.LevelDebug, "head_object",
 		slog.String("origin_id", c.cfg.Origin.ID),
@@ -112,7 +120,16 @@ func (c *Coordinator) HeadObject(ctx context.Context, bucket, key string) (origi
 
 	return c.mc.LookupOrFetch(ctx, c.cfg.Origin.ID, bucket, key,
 		func(ctx context.Context) (origin.ObjectInfo, error) {
-			return c.or.Head(ctx, bucket, key)
+			info, err := c.or.Head(ctx, bucket, key)
+			if err != nil {
+				return info, err
+			}
+
+			if info.ETag == "" {
+				return info, &origin.MissingETagError{Bucket: bucket, Key: key}
+			}
+
+			return info, nil
 		})
 }
 

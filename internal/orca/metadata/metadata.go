@@ -247,12 +247,21 @@ func (c *Cache) recordResult(ctx context.Context, originID, bucket, key string, 
 		recorded = "not_found"
 		ttl = c.cfg.NegativeTTL
 	default:
-		var ube *origin.UnsupportedBlobTypeError
-		if errors.As(err, &ube) {
+		var (
+			ube *origin.UnsupportedBlobTypeError
+			mte *origin.MissingETagError
+		)
+
+		switch {
+		case errors.As(err, &ube):
 			e = &cacheEntry{key: k, negative: true, negErr: err, expiresAt: now.Add(c.cfg.NegativeTTL)}
 			recorded = "unsupported_blob_type"
 			ttl = c.cfg.NegativeTTL
-		} else {
+		case errors.As(err, &mte):
+			e = &cacheEntry{key: k, negative: true, negErr: err, expiresAt: now.Add(c.cfg.NegativeTTL)}
+			recorded = "missing_etag"
+			ttl = c.cfg.NegativeTTL
+		default:
 			c.log.LogAttrs(ctx, slog.LevelDebug, "metadata_record_skip_transient",
 				slog.String("origin_id", originID),
 				slog.String("bucket", bucket),
