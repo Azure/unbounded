@@ -93,16 +93,19 @@ func TestFormatSize(t *testing.T) {
 	}
 }
 
-// TestGenerate_SeededDeterministic verifies that two generate runs
-// with the same --seed produce byte-identical bodies. This is the
-// contract operators rely on when comparing cache behaviour across
-// experiments.
+// TestGenerate_SeededDeterministic_Concurrent verifies that two
+// generate runs with the same --seed produce byte-identical bodies
+// even under concurrency > 1. The previous implementation used a
+// shared math/rand source serialised through a mutex; bytes flowed
+// to whichever goroutine acquired the lock first, so the same
+// invocation could produce different per-blob bytes between runs
+// based on goroutine-scheduling order. The fixed implementation
+// derives each blob's stream from (seed + blobIndex), so each blob
+// is a pure function of its index and seed regardless of
+// completion ordering.
 //
-// Stands up an httptest.Server impersonating Azurite enough for the
-// SDK's UploadStream + container-Create paths to succeed: handles
-// PUT for container creation (201), PUT for block blob single-shot,
-// and stores received bodies by blob name for comparison.
-func TestGenerate_SeededDeterministic(t *testing.T) {
+// Regression for C-6.
+func TestGenerate_SeededDeterministic_Concurrent(t *testing.T) {
 	t.Parallel()
 
 	bodiesA := startFakeAzurite(t)
@@ -119,10 +122,10 @@ func TestGenerate_SeededDeterministic(t *testing.T) {
 
 	o := &generateOpts{
 		sizeStr:     "4KiB",
-		count:       2,
+		count:       4,
 		prefix:      "synth-",
 		seed:        42,
-		concurrency: 1, // deterministic ordering
+		concurrency: 4, // deliberate: prove determinism survives parallel uploads
 	}
 
 	if err := runGenerate(context.Background(), g, o); err != nil {
@@ -135,7 +138,7 @@ func TestGenerate_SeededDeterministic(t *testing.T) {
 		t.Fatalf("second runGenerate: %v", err)
 	}
 
-	for _, name := range []string{"synth-0", "synth-1"} {
+	for _, name := range []string{"synth-0", "synth-1", "synth-2", "synth-3"} {
 		a := bodiesA.get(name)
 		b := bodiesB.get(name)
 
@@ -150,8 +153,48 @@ func TestGenerate_SeededDeterministic(t *testing.T) {
 		}
 
 		if string(a) != string(b) {
-			t.Errorf("blob %q bytes differ across two seeded runs", name)
+			t.Errorf("blob %q bytes differ across two seeded runs (concurrency=%d)",
+				name, o.concurrency)
 		}
+	}
+}
+
+// TestGenerate_SeededDifferentBlobsHaveDifferentContent verifies the
+// per-blob seeding produces distinct streams (so two blobs in the
+// same run are not byte-identical).
+func TestGenerate_SeededDifferentBlobsHaveDifferentContent(t *testing.T) {
+	t.Parallel()
+
+	bodies := startFakeAzurite(t)
+	defer bodies.close()
+
+	g := defaultGlobalFlags()
+	g.endpoint = bodies.url
+	g.account = "devstoreaccount1"
+	g.accountKey = base64.StdEncoding.EncodeToString([]byte("test-shared-key-placeholder--32b"))
+	g.containerName = "ctr"
+
+	o := &generateOpts{
+		sizeStr:     "4KiB",
+		count:       2,
+		prefix:      "synth-",
+		seed:        99,
+		concurrency: 2,
+	}
+
+	if err := runGenerate(context.Background(), g, o); err != nil {
+		t.Fatalf("runGenerate: %v", err)
+	}
+
+	a := bodies.get("synth-0")
+	b := bodies.get("synth-1")
+
+	if len(a) == 0 || len(b) == 0 {
+		t.Fatalf("blobs missing: synth-0=%d synth-1=%d", len(a), len(b))
+	}
+
+	if string(a) == string(b) {
+		t.Errorf("synth-0 and synth-1 have identical content; per-blob seeding broken")
 	}
 }
 

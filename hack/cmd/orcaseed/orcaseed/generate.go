@@ -10,7 +10,6 @@ import (
 	"io"
 	mathrand "math/rand"
 	"os"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -149,25 +148,13 @@ func runGenerate(ctx context.Context, g *globalFlags, o *generateOpts) error {
 	g2, gctx := errgroup.WithContext(ctx)
 	g2.SetLimit(o.concurrency)
 
-	var seedMu sync.Mutex // serialises math/rand stream when --seed is set
-
-	var seededSrc *mathrand.Rand
-	if o.seed != 0 {
-		// Single shared source so deterministic-seed runs produce
-		// the same per-blob bytes in the same order regardless of
-		// concurrency. Concurrent uploaders serialise through
-		// seedMu when reading from it; the read is fast (a few
-		// MiB/s into the body buffer) so the contention is minor.
-		seededSrc = mathrand.New(mathrand.NewSource(o.seed)) //nolint:gosec // dev tool, deterministic-by-design
-	}
-
 	for i := 0; i < o.count; i++ {
 		i := i
 
 		g2.Go(func() error {
 			name := fmt.Sprintf("%s%d", o.prefix, i)
 
-			body := newRandomReader(size, seededSrc, &seedMu)
+			body := newRandomReader(size, o.seed, int64(i))
 
 			bc := cc.NewBlockBlobClient(name)
 			if _, err := bc.UploadStream(gctx, body, &blockblob.UploadStreamOptions{}); err != nil {
@@ -192,26 +179,36 @@ func runGenerate(ctx context.Context, g *globalFlags, o *generateOpts) error {
 	return nil
 }
 
-// newRandomReader returns an io.Reader producing exactly n bytes. If
-// seeded != nil the bytes come from the shared math/rand source
-// (deterministic per --seed); otherwise from crypto/rand. The source
-// is shared so concurrent uploaders preserve order under --seed; the
-// mutex serialises Reads through the seeded source.
-func newRandomReader(n int64, seeded *mathrand.Rand, mu *sync.Mutex) io.Reader {
-	if seeded == nil {
+// newRandomReader returns an io.Reader producing exactly n bytes.
+// When userSeed == 0 the bytes come from crypto/rand (non-
+// deterministic, intended for typical seed-data workloads). When
+// userSeed != 0 the per-blob byte stream is derived from
+// math/rand.NewSource(userSeed + blobIndex), giving each blob its
+// own independent deterministic stream. The per-blob derivation is
+// what makes determinism survive --concurrency > 1: two invocations
+// of `orcaseed generate --seed 42 --count N --concurrency K`
+// produce byte-identical blobs regardless of upload-completion
+// ordering, because each blob's content is a pure function of
+// (userSeed, blobIndex).
+func newRandomReader(n, userSeed, blobIndex int64) io.Reader {
+	if userSeed == 0 {
 		return io.LimitReader(rand.Reader, n)
 	}
 
-	return &lockedSeededReader{src: seeded, remaining: n, mu: mu}
+	src := mathrand.NewSource(userSeed + blobIndex)
+
+	return &seededReader{rng: mathrand.New(src), remaining: n} //nolint:gosec // dev tool, deterministic-by-design
 }
 
-type lockedSeededReader struct {
-	src       *mathrand.Rand
+// seededReader produces exactly remaining bytes from a per-blob
+// math/rand source. The source is not shared, so no mutex is
+// required and reads do not block other goroutines.
+type seededReader struct {
+	rng       *mathrand.Rand
 	remaining int64
-	mu        *sync.Mutex
 }
 
-func (r *lockedSeededReader) Read(p []byte) (int, error) {
+func (r *seededReader) Read(p []byte) (int, error) {
 	if r.remaining <= 0 {
 		return 0, io.EOF
 	}
@@ -221,9 +218,7 @@ func (r *lockedSeededReader) Read(p []byte) (int, error) {
 		want = r.remaining
 	}
 
-	r.mu.Lock()
-	n, _ := r.src.Read(p[:want]) //nolint:errcheck // math/rand never errors
-	r.mu.Unlock()
+	n, _ := r.rng.Read(p[:want]) //nolint:errcheck // math/rand never errors
 
 	r.remaining -= int64(n)
 	if r.remaining == 0 {
