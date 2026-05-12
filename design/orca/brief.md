@@ -142,7 +142,7 @@ in [design.md s4](./design.md#4-architecture) and
   enforcement paths are stubbed; dev runs with both disabled.
   Production deployments rely on Kubernetes NetworkPolicy or
   equivalent network isolation today. See
-  [design.md s14](./design.md#14-deferred--future-work).
+  [design.md s13](./design.md#13-deferred--future-work).
 
 ## 5. Five load-bearing mechanisms
 
@@ -202,7 +202,7 @@ loser receives `412 Precondition Failed` and is recorded as
 (versioned buckets are rejected because `If-None-Match: *` is not
 honored on them across all S3-compatible backends). Both checks
 must pass before the listener binds. See
-[design.md s9.1](./design.md#91-atomic-commit).
+[design.md s8.1](./design.md#81-atomic-commit).
 
 ### 5.5 Bounded staleness contract
 
@@ -218,12 +218,12 @@ TTL. This is the load-bearing semantic for correctness and MUST
 appear in the consumer-API documentation. Defense in depth: every
 `Origin.GetRange` carries `If-Match: <etag>`, so a mid-flight
 overwrite is caught at fill time. See
-[design.md s10](./design.md#10-bounded-staleness-contract). A
+[design.md s9](./design.md#9-bounded-staleness-contract). A
 symmetric bound applies to **create-after-404** (a key uploaded after
 a client already saw a 404 on it): at most one `metadata.negative_ttl`
 window per replica that observed the original 404 (default 60s)
 before the cache reflects the upload. See
-[design.md s11](./design.md#11-create-after-404-and-negative-cache-lifecycle).
+[design.md s10](./design.md#10-create-after-404-and-negative-cache-lifecycle).
 
 ## 6. Backing-store options
 
@@ -239,7 +239,7 @@ today:
 Shared-POSIX-filesystem drivers (`cachestore/posixfs` for NFSv4.1+,
 Weka native, CephFS, Lustre, GPFS; `cachestore/localfs` for dev)
 were designed but are not yet implemented. See
-[design.md s14](./design.md#14-deferred--future-work).
+[design.md s13](./design.md#13-deferred--future-work).
 
 ## 7. A request, end-to-end (cold miss with cross-replica fill)
 
@@ -288,7 +288,7 @@ sequenceDiagram
    publishing new keys instead of overwriting. Bounded violation
    window is `metadata.ttl` (5m default). Must be visible in
    consumer-API documentation. See
-   [design.md s10](./design.md#10-bounded-staleness-contract).
+   [design.md s9](./design.md#9-bounded-staleness-contract).
 2. **Empty-ETag rejection at the fetch coordinator** - the on-store
    path encodes the ETag in its hash; without one, two different
    versions of `(bucket, key)` would alias to the same path and the
@@ -317,7 +317,7 @@ sequenceDiagram
    loop (exponential backoff) rather than by a hard coordinated
    cap. Coordinated cluster-wide limiter and dynamic recompute
    are deferred future work; see
-   [design.md s14](./design.md#14-deferred--future-work).
+   [design.md s13](./design.md#13-deferred--future-work).
 5. **Create-after-404 staleness** - A key uploaded after clients
    already observed it as `404` will return stale `404` for up to
    `metadata.negative_ttl` (default 60s) per replica that observed
@@ -326,13 +326,13 @@ sequenceDiagram
    invalidation (the immutable-origin contract makes them
    unnecessary for the documented workload); operators must wait
    the TTL after uploading a previously-missing key. See
-   [design.md s11](./design.md#11-create-after-404-and-negative-cache-lifecycle).
+   [design.md s10](./design.md#10-create-after-404-and-negative-cache-lifecycle).
 6. **Auth enforcement is stubbed** - bearer / mTLS hooks on the
    edge and mTLS on the internal listener are configured but not
    enforced; both are disabled in dev. Production deployments
    today rely on Kubernetes NetworkPolicy or equivalent network
    isolation. Building real enforcement is scoped as future work;
-   see [design.md s14](./design.md#14-deferred--future-work).
+   see [design.md s13](./design.md#13-deferred--future-work).
 
 ## 9. Where to go next
 
@@ -343,13 +343,13 @@ sequenceDiagram
   architecture, request flow, internal interfaces, stampede protection.
 - [s7.7 Failure handling](./design.md#77-failure-handling-without-re-stampede) -
   pre-header retry, ETag-changed handling, commit-after-serve failure.
-- [s9.1 Atomic commit](./design.md#91-atomic-commit) -
+- [s8.1 Atomic commit](./design.md#81-atomic-commit) -
   `PutObject + If-None-Match: *`; SelfTestAtomicCommit; versioning gate.
-- [s10 Bounded staleness](./design.md#10-bounded-staleness-contract).
-- [s11 Create-after-404 and negative-cache lifecycle](./design.md#11-create-after-404-and-negative-cache-lifecycle).
-- [s12 Eviction and capacity](./design.md#12-eviction-and-capacity) -
+- [s9 Bounded staleness](./design.md#9-bounded-staleness-contract).
+- [s10 Create-after-404 and negative-cache lifecycle](./design.md#10-create-after-404-and-negative-cache-lifecycle).
+- [s11 Eviction and capacity](./design.md#11-eviction-and-capacity) -
   passive lifecycle; ChunkCatalog sizing guidance.
-- [s14 Deferred / future work](./design.md#14-deferred--future-work) -
+- [s13 Deferred / future work](./design.md#13-deferred--future-work) -
   auth enforcement, posixfs/localfs drivers, Prometheus metrics,
   circuit breaker, LIST cache, prefetch, active eviction, bounded-
   freshness mode, cluster-wide HEAD coordinator, coordinated origin
