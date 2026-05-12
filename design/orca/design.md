@@ -360,16 +360,17 @@ sequenceDiagram
     participant SF as Singleflight on R
     participant O as Origin
     participant CS as CacheStore
+    participant Cat as ChunkCatalog
     C->>R: GET /bucket/key Range
     R->>R: HeadObject -> info
-    R->>R: ChunkCatalog miss; Stat miss
+    R->>R: ChunkCatalog miss, then Stat miss
     R->>SF: Acquire(k) [leader]
     SF->>O: GetRange(..., If-Match: etag)<br/>(pre-header retry)
     O-->>SF: full chunk bytes
     SF->>SF: validate buf.Len() == ExpectedLen(info.Size)
     Note over SF: release joiners (close f.done)
     SF-->>R: bytes (in-memory reader over f.bodyBuf)
-    R->>R: Peek(1); commit headers
+    R->>R: Peek(1), commit headers
     R-->>C: 200/206 + headers + body
     par commit-after-serve (async vs joiner reads)
         SF->>CS: PutChunk(If-None-Match: *)
@@ -378,7 +379,7 @@ sequenceDiagram
     alt commit_won
         SF->>Cat: Record(k)
     else commit_lost
-        SF->>CS: Stat(k); Record on success
+        SF->>CS: Stat(k), Record on success
     end
 ```
 
