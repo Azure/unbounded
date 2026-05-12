@@ -568,11 +568,28 @@ func peerKey(p Peer) string {
 }
 
 func newHTTPClient(cfg config.Cluster) *http.Client {
+	// DialContext bounds connect-level latency independently of the
+	// caller's ctx. Without this, a stuck TCP SYN against a half-
+	// failed peer would hang until the caller's deadline (which can
+	// be the full 5-minute fill ctx for leader-side fills). 10s is
+	// generous for in-DC latency and short enough that a failed-fast
+	// peer fallback is visible.
+	dialer := &net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+
 	tr := &http.Transport{
+		DialContext:         dialer.DialContext,
 		MaxIdleConns:        16,
 		MaxIdleConnsPerHost: 4,
 		IdleConnTimeout:     30 * time.Second,
-		ForceAttemptHTTP2:   true,
+		// TLSHandshakeTimeout bounds the handshake separately from
+		// the request ctx so a malicious / misconfigured peer cannot
+		// hold a half-open TLS connection past the dial timeout.
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ForceAttemptHTTP2:     true,
 	}
 	// TLS configuration deliberately omitted for prototype dev mode
 	// (cluster.internal_tls.enabled=false). Production will populate
@@ -584,7 +601,9 @@ func newHTTPClient(cfg config.Cluster) *http.Client {
 	// chunk on a degraded inter-pod link can exceed 60s). The caller's
 	// ctx (an edge request ctx for client-driven fills, the 5-minute
 	// detached fill ctx in fetch.runFill for leader-side ones) is the
-	// sole deadline.
+	// body-read deadline; the Transport-level Dial / TLS handshake
+	// timeouts above bound the connection-establishment surface
+	// independently.
 	return &http.Client{
 		Transport: tr,
 	}

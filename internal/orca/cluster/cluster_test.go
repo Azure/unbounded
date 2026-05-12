@@ -290,13 +290,40 @@ func TestFillFromPeer_DetectsTruncation(t *testing.T) {
 // is a request-total wall clock that would clamp long-running fill
 // body streams (an 8 MiB chunk on a degraded inter-pod link can
 // exceed any reasonable hardcoded bound). The caller's ctx is the
-// sole deadline.
+// sole deadline for body reads.
 func TestNewHTTPClient_NoWallTimeout(t *testing.T) {
 	t.Parallel()
 
 	c := newHTTPClient(config.Cluster{})
 	if c.Timeout != 0 {
 		t.Errorf("internal-RPC http.Client.Timeout = %v, want 0", c.Timeout)
+	}
+}
+
+// TestNewHTTPClient_ConnectTimeouts asserts that the Transport
+// carries bounded connect-level timeouts independent of the
+// caller's ctx. Without these, a stuck TCP SYN or stalled TLS
+// handshake against a half-failed peer would hang until the
+// caller's deadline (which is the full 5-minute fill ctx for
+// leader-side fills, causing slot starvation).
+//
+// Regression for H-4.
+func TestNewHTTPClient_ConnectTimeouts(t *testing.T) {
+	t.Parallel()
+
+	c := newHTTPClient(config.Cluster{})
+
+	tr, ok := c.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("Transport is %T; want *http.Transport", c.Transport)
+	}
+
+	if tr.TLSHandshakeTimeout == 0 {
+		t.Errorf("TLSHandshakeTimeout is 0; want bounded")
+	}
+
+	if tr.DialContext == nil {
+		t.Errorf("DialContext is nil; expected bounded dialer")
 	}
 }
 
