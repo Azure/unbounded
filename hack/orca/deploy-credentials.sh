@@ -50,10 +50,26 @@ case "${ORIGIN_DRIVER}" in
     # In azureblob+Azurite mode (no real Azure account), fall back to
     # the well-known Azurite dev key. This is a public, documented
     # constant baked into Azurite -- not a secret.
+    #
+    # Gate the fallback on AZURE_STORAGE_ACCOUNT being empty or the
+    # well-known Azurite account name. If the operator set a real
+    # account but forgot the key, hard-fail rather than silently
+    # injecting the Azurite dev key into the Secret (which would
+    # auth-fail at runtime against the real account and obscure the
+    # real problem).
     if [[ -z "${AZURE_STORAGE_KEY:-}" ]]; then
-      AZURITE_DEV_KEY="Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
-      echo "AZURE_STORAGE_KEY not set; using Azurite well-known dev key (account: devstoreaccount1)."
-      AZURE_STORAGE_KEY="${AZURITE_DEV_KEY}"
+      case "${AZURE_STORAGE_ACCOUNT:-}" in
+        ""|"devstoreaccount1")
+          AZURITE_DEV_KEY="Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
+          echo "AZURE_STORAGE_KEY not set; using Azurite well-known dev key (account: devstoreaccount1)."
+          AZURE_STORAGE_KEY="${AZURITE_DEV_KEY}"
+          ;;
+        *)
+          echo "ERROR: AZURE_STORAGE_KEY is required when AZURE_STORAGE_ACCOUNT=${AZURE_STORAGE_ACCOUNT}." >&2
+          echo "The Azurite well-known dev key fallback only applies to account 'devstoreaccount1'." >&2
+          exit 1
+          ;;
+      esac
     fi
     literals+=("--from-literal=ORCA_AZUREBLOB_ACCOUNT_KEY=${AZURE_STORAGE_KEY}")
     ;;
