@@ -13,15 +13,14 @@ stakeholder-facing summary lives in [brief.md](./brief.md).
 4. [Architecture](#4-architecture)
 5. [Chunk model](#5-chunk-model)
 6. [Request flow](#6-request-flow)
-7. [Internal interfaces](#7-internal-interfaces)
-8. [Stampede protection](#8-stampede-protection)
-9. [Azure adapter: Block Blob only](#9-azure-adapter-block-blob-only)
-10. [Concurrency, durability, correctness](#10-concurrency-durability-correctness)
-11. [Bounded staleness contract](#11-bounded-staleness-contract)
-12. [Create-after-404 and negative-cache lifecycle](#12-create-after-404-and-negative-cache-lifecycle)
-13. [Eviction and capacity](#13-eviction-and-capacity)
-14. [Horizontal scale](#14-horizontal-scale)
-15. [Deferred / future work](#15-deferred--future-work)
+7. [Stampede protection](#7-stampede-protection)
+8. [Azure adapter: Block Blob only](#8-azure-adapter-block-blob-only)
+9. [Concurrency, durability, correctness](#9-concurrency-durability-correctness)
+10. [Bounded staleness contract](#10-bounded-staleness-contract)
+11. [Create-after-404 and negative-cache lifecycle](#11-create-after-404-and-negative-cache-lifecycle)
+12. [Eviction and capacity](#12-eviction-and-capacity)
+13. [Horizontal scale](#13-horizontal-scale)
+14. [Deferred / future work](#14-deferred--future-work)
 
 ---
 
@@ -52,14 +51,14 @@ internal listener.
 | Area | Decision |
 |---|---|
 | Client API | S3-compatible HTTP. `GET` + `HEAD` + minimal `ListObjectsV2` (pass-through). Range reads supported. |
-| Auth surface | Bearer / mTLS on the client edge and mTLS on the internal listener are configurable but the enforcement paths are not yet implemented. Dev runs both disabled. See s4 and [Deferred / future work](#15-deferred--future-work). |
+| Auth surface | Bearer / mTLS on the client edge and mTLS on the internal listener are configurable but the enforcement paths are not yet implemented. Dev runs both disabled. See s4 and [Deferred / future work](#14-deferred--future-work). |
 | Origins | AWS S3 and Azure Blob behind a pluggable `Origin` interface. |
 | Azure constraint | Block Blobs only. Page / Append blobs are rejected at `Head` with `UnsupportedBlobTypeError`. |
 | Cachestore | S3-compatible in-DC store (`cachestore/s3`). LocalStack in dev, VAST or another S3-compatible object store in production. Treated as the source of truth for chunk presence. |
 | Atomic commit | `PutObject` with `If-None-Match: *`. The second concurrent commit gets `412 Precondition Failed` and is recorded as `ErrCommitLost`. `SelfTestAtomicCommit` runs at boot and refuses to start on backends that don't honor the precondition. |
 | Versioned cachestore buckets | Not supported. `GetBucketVersioning` runs at boot; `Enabled` or `Suspended` versioning fails startup. VAST and several S3-compatible backends do not honor `If-None-Match: *` on versioned buckets, which would silently degrade the atomic-commit primitive. |
 | Chunking | Fixed 8 MiB default (`chunking.size`). `chunk_size` is folded into the path hash so a runtime config change does not corrupt or shadow existing data. Minimum 1 MiB enforced at config validation. |
-| Consistency | Origin objects are immutable per operator contract: an `(origin_id, bucket, key)` never has its bytes modified once published; replacement must be a new key. `ETag` is identity, not freshness. `If-Match: <etag>` is sent on every `Origin.GetRange` as defense-in-depth. Bounded staleness uses asymmetric TTLs: `metadata.ttl` (default 5m) on positive entries; `metadata.negative_ttl` (default 60s) on negative entries. See [s11](#11-bounded-staleness-contract). |
+| Consistency | Origin objects are immutable per operator contract: an `(origin_id, bucket, key)` never has its bytes modified once published; replacement must be a new key. `ETag` is identity, not freshness. `If-Match: <etag>` is sent on every `Origin.GetRange` as defense-in-depth. Bounded staleness uses asymmetric TTLs: `metadata.ttl` (default 5m) on positive entries; `metadata.negative_ttl` (default 60s) on negative entries. See [s10](#10-bounded-staleness-contract). |
 | ETag presence | Origins MUST return non-empty ETags on `Head`. The fetch coordinator rejects empty ETags via `origin.MissingETagError` because `chunk.Path`'s hash encodes the ETag; without one, distinct versions of `(bucket, key)` would alias to the same path and silently serve stale bytes. |
 | Catalog | In-memory `ChunkCatalog` LRU recording chunks known to be in the cachestore. Presence-only (no `Info` payload). Bounded by `chunk_catalog.max_entries` (default 100,000). |
 | Cluster | Kubernetes Deployment + headless Service for peer discovery + ClusterIP / LB for client traffic. Rendezvous hashing on pod IP selects the coordinator per `ChunkKey` for miss-fills; the receiving replica is the **assembler** that fans per-chunk fill RPCs out to coordinators. All replicas can read all chunks directly from the cachestore on hits. |
@@ -76,12 +75,12 @@ internal listener.
 - **Client** - external caller using an S3-compatible HTTP API.
 - **Origin** - upstream cloud blob store (AWS S3 or Azure Blob).
   Read-only from the cache's perspective. Interface in
-  [s7](#7-internal-interfaces).
+  `internal/orca/origin/origin.go`.
 - **CacheStore** - the in-DC chunk store, shared by all replicas.
   Source of truth for chunk presence. Implementation is
   `cachestore/s3` (in-DC S3-compatible object store). Interface in
-  [s7](#7-internal-interfaces); commit semantics in
-  [s10](#10-concurrency-durability-correctness).
+  `internal/orca/cachestore/cachestore.go`; commit semantics in
+  [s9](#9-concurrency-durability-correctness).
 - **Chunk** - a fixed-size byte range of an origin object (default
   8 MiB). Unit of caching and fill.
 - **ChunkKey** - the immutable identifier for a chunk:
@@ -104,7 +103,7 @@ internal listener.
 - **Singleflight** - per-`ChunkKey` in-process deduplication.
   Concurrent fills for the same key share one origin GET. The first
   arrival is the leader; subsequent arrivals are joiners. See
-  [s8.1](#81-per-chunkkey-singleflight).
+  [s7.1](#71-per-chunkkey-singleflight).
 - **Per-chunk internal fill RPC** - `GET /internal/fill?<chunk-key
   params>` over plain HTTP on the internal listener (default
   `:8444`). Issued by the assembler to a non-self coordinator.
@@ -114,7 +113,7 @@ internal listener.
 - **Immutable-origin contract** - the operator promise that an
   `(origin_id, bucket, key)` never has its bytes modified once
   published. Bounded staleness window on violation is
-  `metadata.ttl`. See [s11](#11-bounded-staleness-contract).
+  `metadata.ttl`. See [s10](#10-bounded-staleness-contract).
 - **Pre-header retry** - the leader's bounded retry of
   `Origin.GetRange` before any HTTP response header is sent.
   Defaults: 3 attempts, 5s total. `OriginETagChangedError` is
@@ -211,7 +210,7 @@ graph TB
   - `etag` captures immutability. A new ETag is treated as a new
     logical object and produces a fresh set of chunks. Old chunks
     age out via the cachestore's lifecycle policy (see
-    [s13](#13-eviction-and-capacity)).
+    [s12](#12-eviction-and-capacity)).
   - `chunk_size` is folded into the path hash so a runtime config
     change does not silently corrupt or shadow existing data.
 - `chunk_index = floor(byte / chunk_size)`.
@@ -317,12 +316,12 @@ flowchart LR
    cachestore. On a hit, it returns a reader over the cachestore
    bytes clamped to the chunk's `ExpectedLen(info.Size)`. On a
    miss, the coordinator runs the cluster-wide dedup path
-   ([s8.3](#83-cluster-wide-deduplication-via-per-chunk-fill-rpc)).
+   ([s7.3](#73-cluster-wide-deduplication-via-per-chunk-fill-rpc)).
 8. **Cold-path fill.** The leader issues `Origin.GetRange` with
    bounded pre-header retry, validates the response body length
    against `ExpectedLen`, buffers it in memory, releases joiners,
    and commits to the cachestore in the background (commit-after-
-   serve, [s8.2](#82-singleflight--commit-after-serve)).
+   serve, [s7.2](#72-singleflight--commit-after-serve)).
 
 ### Diagram 3: Scenario A - warm read (cache hit)
 
@@ -409,7 +408,7 @@ serializes the result as a minimal `ListBucketResult` XML body.
 
 This is intentionally narrow. A per-replica TTL'd LIST cache sized
 for the FUSE-`ls` workload is in scope as future work; see
-[Deferred / future work](#15-deferred--future-work).
+[Deferred / future work](#14-deferred--future-work).
 
 ### 6.3 HTTP error-code mapping
 
@@ -433,74 +432,7 @@ S3 SDKs accept the text body and the HTTP status code is the load-
 bearing signal. Mid-stream aborts terminate the response (HTTP/2
 `RST_STREAM` or HTTP/1.1 `Connection: close`).
 
-## 7. Internal interfaces
-
-The named seams in `internal/orca/`. Production wires the real
-implementations; integration tests under `internal/orca/inttest`
-substitute counting / fault-injecting decorators using the
-`app.With*` options.
-
-```go
-// Origin: read-only view of upstream blob store. GetRange takes the
-// etag from the prior Head and uses it as If-Match precondition;
-// mid-flight overwrite returns OriginETagChangedError.
-type Origin interface {
-    Head(ctx context.Context, bucket, key string) (ObjectInfo, error)
-    GetRange(ctx context.Context, bucket, key, etag string, off, n int64) (io.ReadCloser, error)
-    List(ctx context.Context, bucket, prefix, marker string, max int) (ListResult, error)
-}
-
-// CacheStore: where chunk bytes physically live in the DC. Source
-// of truth for chunk presence. PutChunk is atomic and no-clobber;
-// the second concurrent commit returns ErrCommitLost.
-type CacheStore interface {
-    GetChunk(ctx context.Context, k chunk.Key, off, n int64) (io.ReadCloser, error)
-    PutChunk(ctx context.Context, k chunk.Key, size int64, r io.Reader) error
-    Stat(ctx context.Context, k chunk.Key) (Info, error)
-    Delete(ctx context.Context, k chunk.Key) error
-    SelfTestAtomicCommit(ctx context.Context) error
-}
-
-// CacheStore sentinel errors. Wrap with %w so callers use errors.Is.
-var (
-    ErrNotFound   = errors.New("cachestore: not found")
-    ErrTransient  = errors.New("cachestore: transient")
-    ErrAuth       = errors.New("cachestore: auth")
-    ErrCommitLost = errors.New("cachestore: commit lost (no-clobber denied)")
-)
-```
-
-Key implementation notes:
-
-- `chunk.Key` (in `internal/orca/chunk/chunk.go`) is a value type
-  carrying the six identity fields. `Key.Path()` returns the
-  canonical on-store path. `Key.ExpectedLen(objectSize)` returns
-  the authoritative number of bytes the chunk should contain
-  (`ChunkSize` for non-tail chunks, the remainder for the tail).
-- `origin.MissingETagError`, `origin.OriginETagChangedError`, and
-  `origin.UnsupportedBlobTypeError` are exported sentinel types;
-  the fetch coordinator and edge handler dispatch on them via
-  `errors.As`.
-- `cachestore.Info` carries `Size` and `Committed` only (no access
-  counters; the chunkcatalog is presence-only).
-- `CacheStore.Delete` is defined on the interface but is not
-  invoked from production code today. It exists to support a
-  future eviction loop.
-- The cluster package exposes `Cluster.Coordinator(k)`,
-  `Cluster.Self()`, `Cluster.Peers()`, `Cluster.IsCoordinator(k)`,
-  and `Cluster.FillFromPeer(ctx, peer, k, objectSize)`. The peer
-  source is pluggable via `cluster.WithPeerSource` (production uses
-  DNS against the headless Service; tests inject `StaticPeerSource`).
-- The fetch coordinator's public surface is
-  `fetch.Coordinator.HeadObject`, `GetChunk(ctx, k, objectSize)`,
-  `FillForPeer(ctx, k, objectSize)`, and `Origin()`. Both `GetChunk`
-  and `FillForPeer` accept the authoritative `objectSize` separately
-  so the leader can compute `ExpectedLen` for the tail chunk.
-- The chunkcatalog is `Catalog.Lookup(k chunk.Key) bool`,
-  `Catalog.Record(k chunk.Key)`, `Catalog.Forget(k chunk.Key)`.
-  Presence-only: no `Info` is stored.
-
-## 8. Stampede protection
+## 7. Stampede protection
 
 The hot path. Two layers:
 
@@ -513,7 +445,17 @@ The hot path. Two layers:
    assemblers converge on the same leader through the internal-
    fill RPC.
 
-### 8.1 Per-`ChunkKey` singleflight
+The named seams these mechanisms run through:
+
+| Seam | File | Role |
+|---|---|---|
+| `origin.Origin` | `internal/orca/origin/origin.go` (interface); `internal/orca/origin/awss3/`, `internal/orca/origin/azureblob/` | Read-only adapter to the upstream blob store. `If-Match: <etag>` on every `GetRange`. |
+| `cachestore.CacheStore` | `internal/orca/cachestore/cachestore.go` (interface); `internal/orca/cachestore/s3/` | In-DC chunk store; source of truth for chunk presence. `PutChunk` is atomic + no-clobber (returns `ErrCommitLost` on conflict). |
+| `chunkcatalog.Catalog` | `internal/orca/chunkcatalog/chunkcatalog.go` | Bounded in-memory LRU recording chunks known to be in the cachestore. Presence-only. |
+| `cluster.Cluster` | `internal/orca/cluster/cluster.go` | Peer discovery (DNS), rendezvous hashing, internal-fill RPC client + response validator. |
+| `fetch.Coordinator` | `internal/orca/fetch/fetch.go` | Per-replica fill orchestrator. Owns the singleflight, the origin semaphore, and the pre-header retry loop. |
+
+### 7.1 Per-`ChunkKey` singleflight
 
 `fetch.Coordinator` maintains `inflight: map[string]*fill` keyed
 on `chunk.Key.Path()`, guarded by a mutex. Each `*fill` carries a
@@ -537,7 +479,7 @@ entirely; if the chunk has by then been committed and recorded,
 that request takes the catalog-hit path and reads from the
 cachestore.
 
-### 8.2 Singleflight + commit-after-serve
+### 7.2 Singleflight + commit-after-serve
 
 The leader's `runFill`:
 
@@ -589,7 +531,7 @@ chunk is buffered in memory; peak per-fill heap is one
 origin cap at 64, that's a ~512 MiB worst-case footprint per
 replica under saturation.
 
-### 8.3 Cluster-wide deduplication via per-chunk fill RPC
+### 7.3 Cluster-wide deduplication via per-chunk fill RPC
 
 Rendezvous hashing on `ChunkKey` against the current pod-IP set
 selects one coordinator per chunk. The replica that received the
@@ -599,12 +541,12 @@ requested range:
 - **Hit** (catalog or `Stat` says present): assembler reads from
   the cachestore directly. No internal RPC.
 - **Miss + `Coordinator(k) == self`**: assembler runs the local
-  singleflight ([s8.1](#81-per-chunkkey-singleflight)) and commits
-  ([s8.2](#82-singleflight--commit-after-serve)).
+  singleflight ([s7.1](#71-per-chunkkey-singleflight)) and commits
+  ([s7.2](#72-singleflight--commit-after-serve)).
 - **Miss + `Coordinator(k) != self`**: assembler issues
   `GET /internal/fill?<chunk-key params>` to the coordinator on
   the coordinator's internal listener
-  ([s8.4](#84-internal-rpc-listener)). The coordinator runs the
+  ([s7.4](#74-internal-rpc-listener)). The coordinator runs the
   singleflight + commit path locally and streams the chunk bytes
   back. The assembler stitches returned bytes into the client
   response, slicing the first and last chunk to match the
@@ -660,7 +602,7 @@ sequenceDiagram
     Note over A,B: 409 from B -> A falls back to local fill
 ```
 
-### 8.4 Internal RPC listener
+### 7.4 Internal RPC listener
 
 Per-chunk fill RPCs are served on a separate listener bound to a
 distinct port (default `:8444`, config `cluster.internal_listen`).
@@ -683,7 +625,7 @@ serves `GET /internal/fill` only. Health and readiness probes live
 on the ops listener (`:8442`); the client S3 API lives on the edge
 listener (`:8443`).
 
-### 8.5 Metadata-layer singleflight
+### 7.5 Metadata-layer singleflight
 
 Same pattern at the metadata cache: `metadata.LookupOrFetch` maps
 each `(origin_id, bucket, key)` to a per-replica singleflight
@@ -700,7 +642,7 @@ entry race accepts at worst one duplicated HEAD per miss
 completion under contention, in exchange for never replaying a
 transient error.
 
-### 8.6 Cancellation safety
+### 7.6 Cancellation safety
 
 The leader's `runFill` runs on a 5-minute detached context so it
 finishes regardless of caller disconnects. The per-replica origin
@@ -712,7 +654,7 @@ If the leader's context cancels (its 5-minute ceiling fires) the
 fill fails for joiners too, but at worst one fill's worth of
 work is wasted; the next request triggers a fresh fill.
 
-### 8.7 Failure handling without re-stampede
+### 7.7 Failure handling without re-stampede
 
 - **Retryable origin error during pre-header retry**: the leader
   retries up to `origin.retry.attempts` (default 3) within
@@ -747,7 +689,7 @@ work is wasted; the next request triggers a fresh fill.
   `ErrAuth`): surface to the client as 502. No automatic refill
   (would amplify load against a degraded backend).
 
-## 9. Azure adapter: Block Blob only
+## 8. Azure adapter: Block Blob only
 
 - Enforced in `internal/orca/origin/azureblob.Head`. Block type is
   immutable on an existing blob, so checking once per
@@ -766,9 +708,9 @@ work is wasted; the next request triggers a fresh fill.
 - The driver's `List` filters non-BlockBlob entries while
   preserving continuation tokens.
 
-## 10. Concurrency, durability, correctness
+## 9. Concurrency, durability, correctness
 
-### 10.1 Atomic commit
+### 9.1 Atomic commit
 
 The leader publishes a chunk to the cachestore atomically and
 no-clobber via `PutObject + If-None-Match: *`. The second
@@ -778,7 +720,7 @@ two replicas filling the same chunk race for a single winner; the
 loser treats the existing object as the source of truth.
 
 Cold-path commit is asynchronous from the joiner's perspective
-([s8.2](#82-singleflight--commit-after-serve)): joiners are
+([s7.2](#72-singleflight--commit-after-serve)): joiners are
 released when the validated bytes are in the leader's buffer, and
 the `PutChunk` RPC runs in parallel with their reads. A failure
 in commit-after-serve is invisible to the client; the chunk
@@ -800,9 +742,10 @@ VAST and other S3-compatible backends do not honor
 `If-None-Match: *` on versioned buckets, which would silently
 break the atomic-commit primitive.
 
-### 10.2 Typed cachestore errors
+### 9.2 Typed cachestore errors
 
-`CacheStore` returns four sentinel errors (`s7`); the cache layer
+`CacheStore` returns four sentinel errors (see
+`internal/orca/cachestore/cachestore.go`); the cache layer
 honors them distinctly:
 
 - `ErrNotFound`: chunk is absent. Triggers the miss-fill path.
@@ -818,7 +761,7 @@ based, not substring-based; the AWS / Azure SDKs surface
 `*awshttp.ResponseError` and equivalent typed errors that the
 drivers introspect on `StatusCode`.
 
-### 10.3 Range, sizes, and edge cases
+### 9.3 Range, sizes, and edge cases
 
 - Partial last chunk of an object is stored at its actual size;
   `chunk.Key.ExpectedLen(info.Size)` computes the authoritative
@@ -834,7 +777,7 @@ drivers introspect on `StatusCode`.
   matches the declared size. Either path errors before any S3
   RPC if the size disagrees.
 
-### 10.4 Readiness probe (`/readyz`)
+### 9.4 Readiness probe (`/readyz`)
 
 The ops listener (`:8442`) serves `/healthz` (unconditional 200
 while the process is running) and `/readyz` (200 only when ready,
@@ -863,12 +806,12 @@ The ops listener has no auth and is not exposed via the client
 Service; production manifests bind it only for the kubelet's
 direct probe.
 
-## 11. Bounded staleness contract
+## 10. Bounded staleness contract
 
 Orca trusts an operator contract for correctness, and bounds the
 consequences of contract violation by configuration.
 
-### 11.1 The contract and the staleness window
+### 10.1 The contract and the staleness window
 
 **The contract.** For a given `(origin_id, bucket, object_key)`,
 the underlying bytes are immutable for the life of the key. If
@@ -909,9 +852,9 @@ a violation happens between the cache's `Head` and its
 two complete request lifecycles within the same `metadata.ttl`
 window; the `metadata.ttl` cap is what bounds that case.
 
-## 12. Create-after-404 and negative-cache lifecycle
+## 11. Create-after-404 and negative-cache lifecycle
 
-### 12.1 The scenario
+### 11.1 The scenario
 
 A client GETs a key `K` before the operator has uploaded it. The
 cache observes 404 from `Origin.Head(K)`, records a negative
@@ -920,12 +863,12 @@ then uploads `K`. Subsequent client requests still see 404 until
 the negative entry expires - the "we forgot to upload that" case.
 
 This is operationally indistinguishable from a contract violation
-(s11): from the client's perspective, the bytes for `K` changed
+(s10): from the client's perspective, the bytes for `K` changed
 without the cache being told. Event-driven origin invalidation is
 out of scope; the cache can only bound how long it serves the
 stale 404.
 
-### 12.2 Asymmetric TTLs
+### 11.2 Asymmetric TTLs
 
 The metadata cache uses two TTLs:
 
@@ -939,14 +882,14 @@ positive-entry staleness only matters on contract violation;
 negative-entry staleness matters every time an operator uploads a
 previously-missing key, which is a normal operational event.
 
-The per-replica HEAD singleflight (s8.5) caps the HEAD load that a
+The per-replica HEAD singleflight (s7.5) caps the HEAD load that a
 short negative TTL would otherwise create: a flood of distinct
 missing keys generates at most one HEAD per object per replica
 per `metadata.negative_ttl` window. At default settings (60s, 3
 replicas), origin sees at most 3 HEADs per missing key per
 minute, well under any documented S3 / Azure HEAD rate limit.
 
-### 12.3 Worst-case unavailability window
+### 11.3 Worst-case unavailability window
 
 After an operator uploads a previously-missing key:
 
@@ -1004,9 +947,9 @@ sequenceDiagram
     Note over A,B: drain complete - replicas consistent
 ```
 
-## 13. Eviction and capacity
+## 12. Eviction and capacity
 
-### 13.1 Passive eviction (lifecycle)
+### 12.1 Passive eviction (lifecycle)
 
 Eviction is delegated to the cachestore's storage system. The
 recommended baseline is age-based expiration on the chunk prefix
@@ -1021,9 +964,9 @@ age-based expiration; configure them directly on the bucket.
 The `cachestore.CacheStore` interface defines `Delete(k)` but
 production code does not invoke it. The method exists to support
 an active-eviction loop that has not yet been built; see
-[Deferred / future work](#15-deferred--future-work).
+[Deferred / future work](#14-deferred--future-work).
 
-### 13.2 ChunkCatalog size
+### 12.2 ChunkCatalog size
 
 The catalog is bounded by `chunk_catalog.max_entries` (default
 100,000). At ~80 bytes per entry (path string + list pointer)
@@ -1035,14 +978,14 @@ A catalog smaller than the working set is correctness-safe but
 degrades to repeated `CacheStore.Stat` calls on the cold catalog
 miss path. The cachestore is the source of truth.
 
-### 13.3 `chunk_size` config-change capacity impact
+### 12.3 `chunk_size` config-change capacity impact
 
 Changing `chunk_size` orphans the existing chunk set under the
 old size (s5): storage transiently doubles and the working set is
 rebuilt at the new size on demand. The cachestore lifecycle
 policy ages the orphaned chunks out.
 
-### 13.4 Per-fill memory
+### 12.4 Per-fill memory
 
 Peak per-fill heap is one `chunk_size` byte allocation
 (8 MiB default). The per-replica origin semaphore bounds
@@ -1050,7 +993,7 @@ concurrent fills at `floor(target_global / target_replicas)`
 (default 64), so worst-case per-replica buffer footprint is
 ~512 MiB under full saturation.
 
-## 14. Horizontal scale
+## 13. Horizontal scale
 
 Cluster membership comes from the headless Service: an A-record
 lookup returns the IPs of all Ready pods backing the Service. The
@@ -1133,7 +1076,7 @@ sequenceDiagram
     Note over A,DNS: t=10s  A refreshes DNS<br/>peers converge to {A, B'}<br/>steady state restored
 ```
 
-## 15. Deferred / future work
+## 14. Deferred / future work
 
 The following design ideas were considered and explicitly not
 shipped. None requires breaking changes to existing interfaces.
