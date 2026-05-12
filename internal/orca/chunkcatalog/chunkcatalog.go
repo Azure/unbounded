@@ -91,9 +91,11 @@ func (c *Catalog) Lookup(k chunk.Key) bool {
 
 // Record marks the chunk as present.
 //
-// The 'info' argument is accepted for caller convenience (most call
-// sites already have a cachestore.Info from the prior Stat) but is
-// not stored. See package docstring for the presence-only rationale.
+// The catalog is presence-only: callers do not pass (and the catalog
+// does not store) any size or freshness metadata. chunk.Path encodes
+// (origin_id, bucket, key, etag, chunk_size), so a Recorded key is
+// sufficient to know which exact version is in the cachestore. See
+// the package docstring for the rationale.
 func (c *Catalog) Record(k chunk.Key) {
 	path := k.Path()
 
