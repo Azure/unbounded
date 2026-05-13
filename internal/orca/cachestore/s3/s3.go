@@ -22,7 +22,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
@@ -159,7 +158,12 @@ func validateBucketVersioning(bucket string, status s3types.BucketVersioningStat
 // SelfTestAtomicCommit verifies the backend honors PutObject +
 // If-None-Match: *.
 func (d *Driver) SelfTestAtomicCommit(ctx context.Context) error {
-	probeKey := fmt.Sprintf("_orca-selftest/%s", randHex(16))
+	suffix, err := randHex(16)
+	if err != nil {
+		return fmt.Errorf("cachestore/s3 self-test: generate probe key: %w", err)
+	}
+
+	probeKey := fmt.Sprintf("_orca-selftest/%s", suffix)
 	body := []byte("orca-selftest")
 
 	d.log.LogAttrs(ctx, slog.LevelDebug, "selftest_first_put",
@@ -168,7 +172,7 @@ func (d *Driver) SelfTestAtomicCommit(ctx context.Context) error {
 	)
 
 	// First put: must succeed.
-	_, err := d.client.PutObject(ctx, &s3.PutObjectInput{
+	_, err = d.client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:      aws.String(d.bucket),
 		Key:         aws.String(probeKey),
 		Body:        bytes.NewReader(body),
@@ -432,14 +436,19 @@ func csChunkAttrs(k chunk.Key) slog.Attr {
 	)
 }
 
-func randHex(n int) string {
+func randHex(n int) (string, error) {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
-		// Fallback: time-based; only used for boot-test probe key.
-		return fmt.Sprintf("ts%d", time.Now().UnixNano())
+		// crypto/rand failure is extraordinary on Linux. Surface it
+		// to the selftest caller rather than masking with a
+		// time-based fallback: a fallback could collide on parallel
+		// boots and silently fail the first-put precondition, and
+		// the underlying entropy / sandbox issue is operator-
+		// actionable in its own right.
+		return "", fmt.Errorf("cachestore/s3: rand.Read: %w", err)
 	}
 
-	return hex.EncodeToString(b)
+	return hex.EncodeToString(b), nil
 }
 
 // isPreconditionFailed reports whether err represents a 412

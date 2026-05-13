@@ -451,6 +451,15 @@ func (c *Coordinator) runFill(k chunk.Key, objectSize int64, f *fill) {
 
 		if _, err := c.cs.Stat(ctx, k); err == nil {
 			c.cat.Record(k)
+		} else {
+			// Stat failed after a lost commit: cachestore is likely
+			// unhealthy (transient or otherwise). Catalog stays
+			// unrecorded (next request refills), but log so operators
+			// can see cachestore flapping.
+			c.log.LogAttrs(ctx, slog.LevelDebug, "commit_lost_stat_failed",
+				chunkAttrs(k),
+				slog.Any("err", err),
+			)
 		}
 	default:
 		c.log.LogAttrs(ctx, slog.LevelWarn, "commit-after-serve failed",

@@ -177,10 +177,17 @@ func New(parent context.Context, cfg config.Cluster, opts ...Option) (*Cluster, 
 	}
 
 	ctx, cancel := context.WithCancel(parent)
+
+	httpClient, err := newHTTPClient(cfg)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+
 	c := &Cluster{
 		cfg:        cfg,
 		log:        slog.Default(),
-		httpClient: newHTTPClient(cfg),
+		httpClient: httpClient,
 		source:     newDNSPeerSource(cfg.Service, cfg.SelfPodIP, nil),
 		cancelFn:   cancel,
 		done:       make(chan struct{}),
@@ -567,7 +574,19 @@ func peerKey(p Peer) string {
 	return fmt.Sprintf("%s:%d", p.IP, p.Port)
 }
 
-func newHTTPClient(cfg config.Cluster) *http.Client {
+func newHTTPClient(cfg config.Cluster) (*http.Client, error) {
+	// Guard: internal TLS configuration is not yet wired through to
+	// the transport. Refusing to start when cfg.InternalTLS.Enabled
+	// is true prevents a silent security downgrade in which the
+	// client would dial https:// against the system trust store
+	// instead of the configured CA / client cert. The production
+	// path (load CAFile + optional client cert/key into
+	// tr.TLSClientConfig) is not implemented; this guard must be
+	// removed in tandem with that work.
+	if cfg.InternalTLS.Enabled {
+		return nil, fmt.Errorf("cluster: internal TLS requested (cluster.internal_tls.enabled=true) but not yet implemented; refusing to start")
+	}
+
 	// DialContext bounds connect-level latency independently of the
 	// caller's ctx. Without this, a stuck TCP SYN against a half-
 	// failed peer would hang until the caller's deadline (which can
@@ -591,10 +610,6 @@ func newHTTPClient(cfg config.Cluster) *http.Client {
 		ExpectContinueTimeout: 1 * time.Second,
 		ForceAttemptHTTP2:     true,
 	}
-	// TLS configuration deliberately omitted for prototype dev mode
-	// (cluster.internal_tls.enabled=false). Production will populate
-	// tr.TLSClientConfig from cfg.InternalTLS.
-	_ = cfg
 
 	// No http.Client.Timeout: it is the request-total wall clock and
 	// would clamp long-running internal-fill body streams (an 8 MiB
@@ -606,7 +621,7 @@ func newHTTPClient(cfg config.Cluster) *http.Client {
 	// independently.
 	return &http.Client{
 		Transport: tr,
-	}
+	}, nil
 }
 
 // Score returns the rendezvous-hash score for (peer, key). Exposed so

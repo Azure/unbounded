@@ -385,7 +385,17 @@ func (h *EdgeHandler) handleList(w http.ResponseWriter, r *http.Request, bucket 
 	w.Header().Set("Content-Type", "application/xml")
 	w.WriteHeader(http.StatusOK)
 	enc := xml.NewEncoder(w)
-	_ = enc.Encode(body) //nolint:errcheck // headers already sent; mid-stream encode error not actionable
+
+	if err := enc.Encode(body); err != nil {
+		// Headers already sent; we cannot change the status. Log so
+		// truncated / malformed LIST responses are visible, matching
+		// the mid-stream warn-level treatment in the GET path.
+		h.log.LogAttrs(r.Context(), slog.LevelWarn, "list xml encode failed",
+			slog.String("bucket", bucket),
+			slog.String("prefix", prefix),
+			slog.Any("err", err),
+		)
+	}
 }
 
 func (h *EdgeHandler) notImplemented(w http.ResponseWriter, op string) {

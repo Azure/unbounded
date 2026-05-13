@@ -104,11 +104,15 @@ func serve(parent context.Context, configPath string) error {
 	shutdownCtx, shCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shCancel()
 
-	_ = a.Shutdown(shutdownCtx) //nolint:errcheck // shutdown errors already logged inside App.Shutdown
+	// Propagate Shutdown errors to the process exit code so that
+	// failed-shutdown signals (kubelet probes, init systems) match
+	// reality. App.Shutdown also logs each individual error
+	// internally, so this only governs the exit-code semantics.
+	shutdownErr := a.Shutdown(shutdownCtx)
 
 	log.Info("orca stopped")
 
-	return nil
+	return shutdownErr
 }
 
 // resolveLogLevel determines the effective slog.Level by consulting

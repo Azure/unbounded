@@ -294,7 +294,11 @@ func TestFillFromPeer_DetectsTruncation(t *testing.T) {
 func TestNewHTTPClient_NoWallTimeout(t *testing.T) {
 	t.Parallel()
 
-	c := newHTTPClient(config.Cluster{})
+	c, err := newHTTPClient(config.Cluster{})
+	if err != nil {
+		t.Fatalf("newHTTPClient: %v", err)
+	}
+
 	if c.Timeout != 0 {
 		t.Errorf("internal-RPC http.Client.Timeout = %v, want 0", c.Timeout)
 	}
@@ -311,7 +315,10 @@ func TestNewHTTPClient_NoWallTimeout(t *testing.T) {
 func TestNewHTTPClient_ConnectTimeouts(t *testing.T) {
 	t.Parallel()
 
-	c := newHTTPClient(config.Cluster{})
+	c, err := newHTTPClient(config.Cluster{})
+	if err != nil {
+		t.Fatalf("newHTTPClient: %v", err)
+	}
 
 	tr, ok := c.Transport.(*http.Transport)
 	if !ok {
@@ -324,6 +331,27 @@ func TestNewHTTPClient_ConnectTimeouts(t *testing.T) {
 
 	if tr.DialContext == nil {
 		t.Errorf("DialContext is nil; expected bounded dialer")
+	}
+}
+
+// TestNewHTTPClient_InternalTLSEnabledRefusesToStart verifies that
+// newHTTPClient refuses to construct a client when
+// cfg.InternalTLS.Enabled=true. The TLS configuration is not yet
+// wired into the transport (no TLSClientConfig); returning a working
+// client in that case would silently dial https:// against the
+// system trust store instead of the configured CA, downgrading the
+// security posture. The constructor must fail loudly until the
+// production TLS wiring is implemented.
+func TestNewHTTPClient_InternalTLSEnabledRefusesToStart(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Cluster{
+		InternalTLS: config.InternalTLS{Enabled: true},
+	}
+
+	c, err := newHTTPClient(cfg)
+	if err == nil {
+		t.Fatalf("newHTTPClient with InternalTLS.Enabled=true returned client %v; want error", c)
 	}
 }
 
