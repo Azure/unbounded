@@ -8,4 +8,11 @@ publish = false
 name = "unbounded-storage"
 path = "src/main.rs"
 
+[lib]
+name = "unbounded_storage"
+path = "src/lib.rs"
+
 [dependencies]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
