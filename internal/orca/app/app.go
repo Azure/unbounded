@@ -413,7 +413,28 @@ func (a *App) isReady() bool {
 // shutdown that overlaps with a listener failure - or a multi-
 // listener crash where two listeners errored within the same tick -
 // would lose all but the first error.
+//
+// Priority: when ctx is already canceled at the time Wait is called,
+// the ctx-cancel branch is taken deterministically even if errCh
+// also has buffered errors. Go's select non-determinism would
+// otherwise flip the return value between nil and a buffered error
+// on a tick race, contradicting the documented "nil if ctx was
+// canceled" contract. The buffered errors are still logged via
+// drainErrCh; only their effect on Wait's return value is
+// suppressed in this specific overlap.
 func (a *App) Wait(ctx context.Context) error {
+	// Non-blocking pre-check: if ctx is already canceled, take the
+	// shutdown branch without exposing the select-randomization
+	// race against any errors that may have arrived alongside the
+	// cancellation. See the function comment for rationale.
+	select {
+	case <-ctx.Done():
+		a.drainErrCh(ctx, "listener error received during shutdown")
+
+		return nil
+	default:
+	}
+
 	select {
 	case <-ctx.Done():
 		a.drainErrCh(ctx, "listener error received during shutdown")
