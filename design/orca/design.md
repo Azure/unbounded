@@ -59,7 +59,8 @@ cloud sees exactly one fetch.
 | Cachestore | An in-DC S3-compatible store (`cachestore/s3`): LocalStack in dev, VAST or similar in production. Treated as the truth for what chunks exist. |
 | Atomic commit | `PutObject` with `If-None-Match: *`. The second concurrent commit gets a `412` and is recorded as `ErrCommitLost`. At boot, `SelfTestAtomicCommit` proves the backend honors the precondition; if it doesn't, the process refuses to start. |
 | Versioned cachestore buckets | Not supported. At boot, `GetBucketVersioning` runs; if the bucket has versioning enabled or suspended, the process refuses to start. VAST and several S3-compatible backends ignore `If-None-Match: *` on versioned buckets, which would silently break the atomic-commit rule. |
-| Chunking | 8 MiB default (`chunking.size`). The chunk size is part of the chunk's storage-path hash, so changing it never corrupts existing data. Minimum 1 MiB. |
+| Chunking | Default 8 MiB (`chunking.size`). For bigger objects, an optional tier ladder (`chunking.tiers`) picks a larger size: 64 MiB for objects over 1 GiB, 128 MiB for objects over 10 GiB. The chunk size is part of the chunk's storage path, so changing the default or any tier never breaks existing data. Minimum 1 MiB. |
+| Read-ahead | While the edge sends one chunk to the client, it can fetch the next few chunks in parallel. The default is 8 in flight. Set `chunking.readahead: 0` to turn it off. |
 | Consistency | Operators promise: once a key is published, its bytes never change. To change the data, publish a new key. Orca treats the ETag as the key's identity, not as a freshness check. We also send `If-Match: <etag>` on every fetch as a safety net. If an operator breaks the promise, the wrong data is served for at most 5 minutes (`metadata.ttl`). If a key is uploaded after someone already saw a 404 on it, the wrong 404 is served for at most 60 seconds (`metadata.negative_ttl`). See [s9](#9-bounded-staleness-contract). |
 | ETag presence | The origin must return a non-empty ETag on `Head`. If it doesn't, Orca rejects the response with `origin.MissingETagError`. Without an ETag, two different versions of the same `(bucket, key)` would hash to the same storage path and Orca would silently serve old bytes. |
 | Catalog | An in-memory LRU (`ChunkCatalog`) that remembers which chunks are in the cachestore. Presence-only - no size or access count. Capped at 100,000 entries by default. |
@@ -83,8 +84,10 @@ cloud sees exactly one fetch.
   S3-compatible object store). Interface in
   `internal/orca/cachestore/cachestore.go`; commit rules in
   [s8](#8-atomic-commit).
-- **Chunk** - one fixed-size piece of an object (8 MiB by
-  default). Orca caches and fills chunks, not whole objects.
+- **Chunk** - one piece of an object. The size is chosen per
+  request from a small ladder: 8 MiB for small objects, up to 128
+  MiB for objects over 10 GiB by default. Orca caches and fills
+  chunks, not whole objects.
 - **ChunkKey** - the chunk's name:
   `{origin_id, bucket, object_key, etag, chunk_size, chunk_index}`.
   See [s5](#5-chunk-model).
@@ -269,6 +272,47 @@ working set rebuilds at the new size: storage usage roughly
 doubles, and origin traffic spikes briefly. The old chunks age
 out on their own via the bucket's lifecycle policy.
 
+### 5.1 Effective chunk size
+
+Chunk size is not one global number. The edge handler picks it
+per request from a base size plus an optional list of tiers.
+Each tier says "for objects this big and larger, use this chunk
+size." The base covers small objects; tiers kick in at higher
+object sizes.
+
+Default ladder:
+
+| Object size | Chunk size |
+|---|---|
+| under 1 GiB | 8 MiB (base) |
+| 1 GiB to 10 GiB | 64 MiB |
+| over 10 GiB | 128 MiB |
+
+**Why a ladder.** Small objects don't need big chunks - that
+would waste memory per fill. Big objects pay a high price for
+small chunks - more HTTP requests, more per-chunk overhead. The
+ladder picks a size that fits each object.
+
+**Why it's safe to change.** Each chunk's storage path includes
+the chunk size in its hash. So a chunk written at 8 MiB and a
+chunk written at 128 MiB live at different paths and never
+overlap. If you change the ladder, old chunks at the old size
+simply age out via the bucket lifecycle policy. Nothing gets
+corrupted.
+
+**Why tiers can't overlap.** The config requires tiers to be
+sorted by their object-size threshold, with no duplicates. The
+loader rejects anything else. So for any object size there is
+exactly one matching tier (or the base, if no tier matches).
+
+**Cross-replica safety.** The peer-to-peer fill RPC sends the
+chunk size along with every request (see
+[s7.3](#73-cluster-wide-deduplication-via-per-chunk-fill-rpc)).
+If two replicas are running with different tier settings during
+a rolling deploy, every request is still self-contained - the
+receiver uses the size the sender asked for. No coordination is
+needed.
+
 To find a chunk, Orca calls `CacheStore.Stat(key)`. The
 `ChunkCatalog` (an in-memory LRU) remembers recent Stat hits so
 the hot path skips the cachestore. The catalog is a cache for
@@ -295,9 +339,12 @@ keys up front.
 
 ### Diagram 2: Range request -> chunk index mapping
 
+`SizeFor` below is the tier-ladder lookup described in
+[s5.1](#51-effective-chunk-size).
+
 ```mermaid
 flowchart LR
-    Req["GET /bucket/key<br/>Range: bytes=A-B"] --> Math["chunk_size = 8 MiB<br/>firstChunk = A / chunk_size<br/>lastChunk  = B / chunk_size"]
+    Req["GET /bucket/key<br/>Range: bytes=A-B"] --> Math["chunk_size = SizeFor(info.Size)<br/>firstChunk = A / chunk_size<br/>lastChunk  = B / chunk_size"]
     Math --> Iter["streaming iterator<br/>cid := firstChunk..lastChunk"]
     Iter --> Keys["per cid: ChunkKey =<br/>{origin_id, bucket, key,<br/>etag, chunk_size, cid}"]
     Keys --> Path["path =<br/>origin_id /<br/>hex(sha256(LP(origin_id) || ...)) /<br/>cid"]
@@ -460,6 +507,46 @@ do too. There is no per-error S3-style XML envelope yet; S3 SDKs
 accept the text body and route on the HTTP status. Mid-stream
 aborts end the response (HTTP/2 `RST_STREAM` or HTTP/1.1
 `Connection: close`).
+
+### 6.4 Edge read-ahead
+
+The chunk-by-chunk loop in step 6 of the request flow is not
+strictly one-at-a-time. While the edge is sending one chunk to
+the client, it can pull the next few chunks from the cachestore
+at the same time. The default is up to 8 in flight per client
+request.
+
+**Why this matters.** A 700 GiB object at 128 MiB chunks is
+around 5,600 chunks. Without read-ahead, each chunk is fetched,
+then sent, then the next is fetched - one round trip after
+another. With 8 in flight, most of the per-chunk round-trip time
+is hidden behind sending bytes to the client.
+
+**How it works.** The edge starts a small producer that issues
+chunk fetches in order. Each fetch runs in its own worker.
+Results come back in chunk order via a small in-memory queue, so
+the client always receives bytes in the right order even if a
+later worker finishes first.
+
+**What stays the same.** The first chunk is still fetched and
+checked before any response headers go out. If something fails
+on chunk 0 - origin down, missing ETag, anything else - the
+client gets a clean S3-style error, not a partial body.
+Read-ahead only applies to chunks 1..N. Cold fills still go
+through the per-replica origin cap
+([s7.1](#71-per-chunkkey-singleflight)), so the cluster does not
+suddenly issue more origin requests just because read-ahead is
+on. Memory stays bounded by the origin cap.
+
+**What happens on failure.** If a chunk fetch fails after
+headers are out, the response just ends - same as before. If
+the client disconnects, the producer stops and closes any chunk
+bodies it has already pulled, so nothing leaks. If a worker
+panics, it is caught, logged, and reported back to the consumer
+as a fetch error.
+
+**Turning it off.** Set `chunking.readahead: 0` to go back to
+strict one-at-a-time fetching.
 
 ## 7. Stampede protection
 
@@ -938,11 +1025,21 @@ out.
 
 ### 11.4 Per-fill memory
 
-Peak memory per fill is one chunk (8 MiB by default). The
-per-replica origin semaphore caps concurrent fills at
-`floor(target_global / target_replicas)` (64 by default), so the
-worst-case buffer footprint per replica is around 512 MiB at
-full saturation.
+Peak memory per fill is one chunk, at whatever size the tier
+ladder picked for that object. With the default ladder, that's
+8 MiB for small objects, up to 128 MiB for objects over 10 GiB.
+
+The per-replica origin cap is
+`floor(target_global / target_replicas)`. On a 4-replica cluster
+with `target_global = 64`, that's 16 concurrent fills.
+
+So the worst case per replica is `16 fills * 128 MiB = 2 GiB` of
+in-flight chunk buffers when many large objects are being filled
+at the same time.
+
+Operators with tighter memory budgets should remove the top tier
+or lower its chunk size. Read-ahead does not change this number
+- the cap on cold fills is what bounds memory.
 
 ## 12. Horizontal scale
 

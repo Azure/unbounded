@@ -113,6 +113,14 @@ path, so Orca cannot serve old bytes for a new ETag by
 construction. Empty-ETag origin responses are rejected at
 `Head`.
 
+The chunk size is not fixed. For bigger objects the edge picks a
+bigger chunk size (8 MiB up to 128 MiB by default, see
+`chunking.tiers`), so the per-object request count stays
+manageable. The edge also fetches the next few chunks in
+parallel while sending the current one to the client
+(`chunking.readahead`, default 8). Both knobs help large-blob
+throughput without changing how chunks are stored or addressed.
+
 ### 4.2 Singleflight + commit-after-serve
 
 The coordinator's singleflight collapses many concurrent misses
