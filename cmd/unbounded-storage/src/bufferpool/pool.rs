@@ -223,7 +223,19 @@ where
     }
 
     fn release_guard(&self, page_no: u64) {
-        release_guard(&self.inner, self.key, &self.fetch, page_no);
+        // `PageGuard::drop` calls this. It is logically equivalent
+        // to dropping a `ConsumerHold`: decrement `consumer_holds`
+        // and recycle if the slot is terminal with no other
+        // holders. We keep the function-call form here because
+        // `PageGuard` is dyn-erased (`Rc<dyn StreamSrc>`) and does
+        // not see the typed `ConsumerHold`.
+        let slot = match self.fetch.borrow().pages.get(&page_no).cloned() {
+            Some(s) => s,
+            None => return,
+        };
+        let prev = slot.consumer_holds.get();
+        slot.consumer_holds.set(prev.saturating_sub(1));
+        recycle_if_terminal(&self.inner, self.key, &self.fetch, &slot, page_no);
     }
 
     fn decrement_stream(&self) {
@@ -237,33 +249,92 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// Cleanup helpers.
+// ConsumerHold: RAII for `PageSlot::consumer_holds`.
 // ---------------------------------------------------------------------------
 
-fn release_guard<T, S, R>(
-    inner: &Rc<PoolInner<T, S, R>>,
-    key: StripeKey,
-    fetch: &Rc<RefCell<StripeFetch>>,
-    page_no: u64,
-) where
+/// RAII bump of `slot.consumer_holds`. Construction increments;
+/// drop decrements and runs `recycle_if_terminal`. This is the
+/// single mechanism every participant in a slot's lifecycle (the
+/// leader during I/O+tee, parked subscribers, fast-path Ready
+/// callers) uses to express "I still care about this slot".
+///
+/// On the success path the hold is transferred to the caller of
+/// [`fetch_page`] via [`ConsumerHold::forget`], which suppresses
+/// the drop decrement. The transferred bump is then balanced by
+/// [`StreamSrc::release_guard`] when the resulting `PageGuard`
+/// drops.
+struct ConsumerHold<T, S, R>
+where
     T: Transport<R>,
     S: BlockStore,
     R: Req,
 {
-    let slot = match fetch.borrow().pages.get(&page_no).cloned() {
-        Some(s) => s,
-        None => return,
-    };
-    let prev = slot.consumer_holds.get();
-    slot.consumer_holds.set(prev.saturating_sub(1));
-    recycle_if_terminal(inner, key, fetch, &slot, page_no);
+    inner: Rc<PoolInner<T, S, R>>,
+    fetch: Rc<RefCell<StripeFetch>>,
+    slot: Rc<PageSlot>,
+    key: StripeKey,
+    page_no: u64,
+    active: bool,
 }
+
+impl<T, S, R> ConsumerHold<T, S, R>
+where
+    T: Transport<R>,
+    S: BlockStore,
+    R: Req,
+{
+    fn new(
+        inner: Rc<PoolInner<T, S, R>>,
+        fetch: Rc<RefCell<StripeFetch>>,
+        slot: Rc<PageSlot>,
+        key: StripeKey,
+        page_no: u64,
+    ) -> Self {
+        slot.consumer_holds.set(slot.consumer_holds.get() + 1);
+        Self {
+            inner,
+            fetch,
+            slot,
+            key,
+            page_no,
+            active: true,
+        }
+    }
+
+    /// Transfer ownership of the bump out of this guard. The bump
+    /// remains on the slot; the caller is responsible for
+    /// balancing it (typically via the `PageGuard` returned to the
+    /// stream consumer). Drop becomes a no-op.
+    fn forget(mut self) {
+        self.active = false;
+    }
+}
+
+impl<T, S, R> Drop for ConsumerHold<T, S, R>
+where
+    T: Transport<R>,
+    S: BlockStore,
+    R: Req,
+{
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let prev = self.slot.consumer_holds.get();
+        self.slot.consumer_holds.set(prev.saturating_sub(1));
+        recycle_if_terminal(&self.inner, self.key, &self.fetch, &self.slot, self.page_no);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cleanup helpers.
+// ---------------------------------------------------------------------------
 
 /// Returns `slot`'s page to the free list and removes the slot
 /// (and possibly the entire `StripeFetch`) if it is in a terminal
-/// state and no one is holding it. Shared between [`release_guard`]
-/// and [`TeeGuard::drop`] so the cleanup invariant lives in one
-/// place.
+/// state and no one is holding it. Invoked from `ConsumerHold::drop`
+/// and from `StreamSrc::release_guard`; the cleanup invariant lives
+/// in one place.
 fn recycle_if_terminal<T, S, R>(
     inner: &Rc<PoolInner<T, S, R>>,
     key: StripeKey,
@@ -357,6 +428,25 @@ fn slot_is_terminal(slot: &PageSlot) -> bool {
 /// pollers park in `Loading`. If the leader's future drops before
 /// completing, the [`LeaderGuard`] flips state back to `Idle`,
 /// wakes parked subscribers, and the next one takes over.
+///
+/// Lifetime of `consumer_holds`. Every party that is or will be a
+/// consumer of the slot's bytes holds a [`ConsumerHold`] for the
+/// duration of its interest:
+///
+/// * The leader takes a `ConsumerHold` on entering `Action::Lead`
+///   and keeps it across I/O and the tee write. On error the hold
+///   drops and (if no parked subscribers are still around) runs
+///   `recycle_if_terminal`, returning the page to the free list
+///   and unblocking [`FreeList::alloc`] waiters elsewhere. On
+///   success the hold is `forget`'d (transferred to the caller's
+///   `PageGuard`).
+/// * Parked subscribers take a `ConsumerHold` on their first
+///   [`ParkOnSlot::poll`] (so that the leader's `PageGuard` drop
+///   cannot recycle the slot between the wake and the re-poll).
+///   The hold is transferred forward on `ParkOutcome::Ready`,
+///   dropped on `Error`/`Retry`/cancellation.
+/// * Fast-path `Action::Ready` callers construct a transient
+///   `ConsumerHold` and immediately `forget` it for the caller.
 async fn fetch_page<T, S, R>(
     inner: Rc<PoolInner<T, S, R>>,
     fetch: Rc<RefCell<StripeFetch>>,
@@ -365,9 +455,9 @@ async fn fetch_page<T, S, R>(
     page_no: u64,
 ) -> Result<u32, Error>
 where
-    T: Transport<R>,
-    S: BlockStore,
-    R: Req,
+    T: Transport<R> + 'static,
+    S: BlockStore + 'static,
+    R: Req + 'static,
 {
     let slot: Rc<PageSlot> = {
         let mut f = fetch.borrow_mut();
@@ -397,53 +487,63 @@ where
                     .page_idx
                     .get()
                     .expect("page_idx must be set when slot is Ready");
-                slot.consumer_holds.set(slot.consumer_holds.get() + 1);
+                // Take the caller's hold via `ConsumerHold` and
+                // forget it; the returned `PageGuard` will balance
+                // the bump via `StreamSrc::release_guard`.
+                ConsumerHold::new(inner.clone(), fetch.clone(), slot.clone(), key, page_no)
+                    .forget();
                 return Ok(pi);
             }
             Action::Error(e) => return Err(e),
             Action::Park => {
                 // `ParkOnSlot` pre-bumps `consumer_holds` for this
-                // subscriber on first registration and decrements
-                // on Drop if the future is cancelled before
-                // observing a state transition. When it resolves
-                // with `Ready`, the pre-bumped hold is transferred
-                // to us (we return without bumping again); on any
-                // other outcome we explicitly release it.
+                // subscriber on first registration via a
+                // `ConsumerHold`. The hold is transferred to us on
+                // `Ready`, dropped on `Error`/`Retry`/cancellation.
                 //
                 // This closes the recycle race that would otherwise
                 // let the leader free the page between "subscriber
                 // woken" and "subscriber re-polled" while we still
                 // hold an `Rc<PageSlot>` whose `page_idx` aliases a
                 // page that's already been reallocated.
-                let outcome = ParkOnSlot::new(&slot).await;
-                match outcome {
-                    ParkOutcome::Ready => {
+                let park = ParkOnSlot::new(inner.clone(), fetch.clone(), slot.clone(), key, page_no);
+                match park.await {
+                    ParkOutcome::Ready(hold) => {
                         let pi = slot
                             .page_idx
                             .get()
                             .expect("page_idx must be set when slot is Ready");
+                        hold.forget();
                         return Ok(pi);
                     }
-                    ParkOutcome::Error(e) => {
-                        // Release our pre-bumped hold. If the slot
-                        // is now terminal with no holders, recycle.
-                        let prev = slot.consumer_holds.get();
-                        slot.consumer_holds.set(prev.saturating_sub(1));
-                        recycle_if_terminal(&inner, key, &fetch, &slot, page_no);
-                        return Err(e);
-                    }
-                    ParkOutcome::Retry => {
-                        // Leader was dropped; slot is back to Idle
-                        // (or re-Loading). Release the pre-bumped
-                        // hold so the next leader's accounting is
-                        // clean, then re-enter the state machine.
-                        let prev = slot.consumer_holds.get();
-                        slot.consumer_holds.set(prev.saturating_sub(1));
-                        continue;
-                    }
+                    ParkOutcome::Error(e) => return Err(e),
+                    ParkOutcome::Retry => continue,
                 }
             }
             Action::Lead => {
+                // Leader-owned `ConsumerHold` covers the entire I/O
+                // phase plus the tee. On any path out of this arm:
+                //
+                // * Error: `leader_guard.completed = true`, state
+                //   set to `Error`, wakers woken, leader_hold drops
+                //   and recycles if there are no other holders.
+                // * Cancellation in I/O: `leader_guard` resets to
+                //   `Idle` and wakes wakers; leader_hold then drops
+                //   (state is `Idle`, not terminal, so no recycle).
+                //   A parked subscriber takes over via `Retry`.
+                // * Cancellation in tee: `tee_pending` is cleared
+                //   by `TeePendingGuard`; leader_hold drops, state
+                //   is `Ready` and terminal, so the page recycles
+                //   if no other holders remain.
+                // * Success: leader_hold is `forget`'d and the
+                //   page_idx is returned.
+                //
+                // Drop order on cancel is (locals declared first
+                // drop last): `leader_guard` flips state and wakes
+                // first, then `leader_hold` drops to release the
+                // bump and possibly recycle.
+                let leader_hold =
+                    ConsumerHold::new(inner.clone(), fetch.clone(), slot.clone(), key, page_no);
                 let mut leader_guard = LeaderGuard {
                     slot: &slot,
                     completed: false,
@@ -490,27 +590,17 @@ where
                         for w in wakers {
                             w.wake();
                         }
-                        // The leader holds no `consumer_holds` of its
-                        // own. If no parked subscribers exist, no
-                        // one else will run `recycle_if_terminal` on
-                        // this slot until the entire stripe's
-                        // `stream_refcount` hits 0 - which can be
-                        // far in the future when sibling streams on
-                        // this key are still alive. The page would
-                        // sit "held" by the error'd slot in the
-                        // meantime, starving `FreeList::alloc`
-                        // waiters on other keys and deadlocking the
-                        // pool under page pressure.
-                        //
-                        // Each parked subscriber pre-bumps
-                        // `consumer_holds` inside `ParkOnSlot::poll`,
-                        // so the call below is a no-op when any
-                        // subscriber is parked; the last one to
-                        // observe `Error` releases its hold and
-                        // triggers the same cleanup. With no
-                        // subscribers, `consumer_holds == 0` and we
-                        // release the page (and slot) immediately.
-                        recycle_if_terminal(&inner, key, &fetch, &slot, page_no);
+                        // leader_hold drops at the `return`. Its
+                        // drop runs `recycle_if_terminal`: state is
+                        // now `Error` (terminal). If parked
+                        // subscribers are still holding their
+                        // pre-bumped `ConsumerHold`s the count
+                        // stays non-zero and the recycle is a
+                        // no-op; the last subscriber to observe
+                        // `Error` runs it. If no subscribers are
+                        // parked the page returns to the free list
+                        // immediately, waking any `FreeList::alloc`
+                        // waiter.
                         return Err(e);
                     }
                 };
@@ -523,48 +613,39 @@ where
                 // across the tee via `tee_pending`.
                 //
                 // Each parked subscriber has pre-bumped its own
-                // `consumer_holds` inside `ParkOnSlot::poll`; we
-                // only bump once for the leader. The pre-bumps
-                // guarantee the slot stays alive in the gap between
-                // wake and re-poll (see the `Action::Park` branch).
+                // `consumer_holds` via its `ConsumerHold`; the
+                // leader's `ConsumerHold` covers itself.
                 let need_tee = !hit;
                 if need_tee {
                     slot.tee_pending.set(true);
                 }
                 let wakers = take_loading_wakers(&slot);
                 *slot.state.borrow_mut() = SlotState::Ready;
-                slot.consumer_holds.set(slot.consumer_holds.get() + 1);
                 leader_guard.completed = true;
                 drop(leader_guard);
                 for w in wakers {
                     w.wake();
                 }
 
-                // Phase 3: leader drives the tee. The leader keeps
-                // `consumer_holds` bumped above so the page stays
-                // pinned across the tee even if no other subscriber
-                // is around. If the leader's future is dropped here
-                // the `TeeGuard` clears `tee_pending` *and* releases
-                // the leader's pre-emptive consumer hold so the page
-                // can be recycled (the tee write is best-effort:
-                // data is still in the pool, only the on-disk cache
-                // fill is skipped).  `write_page` errors are also
-                // treated as best-effort for v1 (see
-                // designs/bufferpool.md TODO(partial-failure)).
+                // Phase 3: leader drives the tee. The leader's
+                // `ConsumerHold` keeps the page pinned across the
+                // tee even if no other subscriber is around. If the
+                // leader's future is dropped here, `TeePendingGuard`
+                // clears `tee_pending` first, then `leader_hold`
+                // drops and runs the same recycle path as
+                // `release_guard`. `write_page` errors are treated
+                // as best-effort for v1 (see designs/bufferpool.md
+                // TODO(partial-failure)).
                 if need_tee {
-                    let mut tee_guard = TeeGuard {
-                        slot: &slot,
-                        fetch: &fetch,
-                        inner: &inner,
-                        key,
-                        page_no,
-                        completed: false,
-                    };
+                    let _tee_pending_guard = TeePendingGuard { slot: &slot };
                     let _ = inner.blockstore.write_page(key, stripe_off, dst).await;
-                    slot.tee_pending.set(false);
-                    tee_guard.completed = true;
+                    // `_tee_pending_guard` drops at end of block,
+                    // clearing `tee_pending` before we forget the
+                    // leader's hold so a subsequent `PageGuard`
+                    // drop can recycle if appropriate.
                 }
 
+                leader_hold.forget();
                 return Ok(pi);
             }
         }
@@ -578,6 +659,12 @@ enum Action {
     Lead,
 }
 
+/// RAII state-reset guard for the leader. If the leader's future
+/// is dropped before it transitions the slot to `Ready` or
+/// `Error`, this resets the slot to `Idle` and wakes parked
+/// subscribers so the next one can take over leadership; the
+/// `page_idx` is preserved for reuse. Consumer-hold accounting is
+/// handled separately by [`ConsumerHold`].
 struct LeaderGuard<'a> {
     slot: &'a Rc<PageSlot>,
     completed: bool,
@@ -588,10 +675,6 @@ impl<'a> Drop for LeaderGuard<'a> {
         if self.completed {
             return;
         }
-        // Leader future was dropped before reaching Ready (during
-        // read_page or bulk_get). Reset to Idle so the next
-        // subscriber takes over leadership; preserve `page_idx` for
-        // reuse. v1 drain relaxation: see mod.rs.
         let wakers = take_loading_wakers(self.slot);
         *self.slot.state.borrow_mut() = SlotState::Idle;
         for w in wakers {
@@ -600,45 +683,17 @@ impl<'a> Drop for LeaderGuard<'a> {
     }
 }
 
-/// RAII guard for the tee phase. If the leader's future is dropped
-/// while `BlockStore::write_page` is in flight, releases the
-/// leader's pre-emptive consumer hold and clears `tee_pending` so
-/// the page can be recycled. The bytes are already in the pool and
-/// any non-leader subscribers that observed Ready keep their copy;
-/// the on-disk cache fill is simply skipped.
-struct TeeGuard<'a, T, S, R>
-where
-    T: Transport<R>,
-    S: BlockStore,
-    R: Req,
-{
+/// Clears `slot.tee_pending` on drop. Drop order in
+/// [`fetch_page`]'s tee block ensures this runs before the
+/// leader's `ConsumerHold` drops, so any subsequent recycle sees
+/// `tee_pending == false`.
+struct TeePendingGuard<'a> {
     slot: &'a Rc<PageSlot>,
-    fetch: &'a Rc<RefCell<StripeFetch>>,
-    inner: &'a Rc<PoolInner<T, S, R>>,
-    key: StripeKey,
-    page_no: u64,
-    completed: bool,
 }
 
-impl<'a, T, S, R> Drop for TeeGuard<'a, T, S, R>
-where
-    T: Transport<R>,
-    S: BlockStore,
-    R: Req,
-{
+impl<'a> Drop for TeePendingGuard<'a> {
     fn drop(&mut self) {
-        if self.completed {
-            return;
-        }
-        // Drop the leader's pre-emptive consumer hold (it never got
-        // wrapped in a PageGuard) and clear `tee_pending`. Then run
-        // the same recycle path that `release_guard` uses so the
-        // page returns to the free list and the slot/inflight entry
-        // are cleaned up if appropriate.
-        let prev = self.slot.consumer_holds.get();
-        self.slot.consumer_holds.set(prev.saturating_sub(1));
         self.slot.tee_pending.set(false);
-        recycle_if_terminal(self.inner, self.key, self.fetch, self.slot, self.page_no);
     }
 }
 
@@ -652,108 +707,150 @@ fn take_loading_wakers(slot: &Rc<PageSlot>) -> Vec<std::task::Waker> {
     }
 }
 
-struct ParkOnSlot<'a> {
-    slot: &'a Rc<PageSlot>,
-    /// `true` once we have registered our waker and pre-bumped
-    /// `consumer_holds` exactly once.
-    registered: Cell<bool>,
-    /// `true` once `poll` has observed the slot leave `Loading`.
-    /// The pre-bumped hold has been transferred to the caller of
-    /// `ParkOnSlot::await`; `Drop` must not release it.
-    consumed: Cell<bool>,
+struct ParkOnSlot<T, S, R>
+where
+    T: Transport<R>,
+    S: BlockStore,
+    R: Req,
+{
+    inner: Rc<PoolInner<T, S, R>>,
+    fetch: Rc<RefCell<StripeFetch>>,
+    slot: Rc<PageSlot>,
+    key: StripeKey,
+    page_no: u64,
+    /// `Some` once we have registered our waker and pre-bumped
+    /// `consumer_holds` via a `ConsumerHold`. The hold is taken
+    /// out on a terminal outcome: transferred to the caller on
+    /// `Ready` (via `ParkOutcome::Ready(hold)`), dropped on
+    /// `Error`/`Retry`. If the future is cancelled before reaching
+    /// a terminal outcome the `Option` drops with the hold inside,
+    /// releasing the bump.
+    hold: Option<ConsumerHold<T, S, R>>,
 }
 
-/// Outcome of awaiting [`ParkOnSlot`]. The pre-bumped
-/// `consumer_holds` is *transferred* to the caller; the caller is
-/// responsible for either (a) returning it to the pool via
-/// `release_guard`/`recycle_if_terminal` after the read finishes,
-/// or (b) decrementing it directly on error / retry paths.
-enum ParkOutcome {
-    Ready,
+/// Outcome of awaiting [`ParkOnSlot`].
+enum ParkOutcome<T, S, R>
+where
+    T: Transport<R>,
+    S: BlockStore,
+    R: Req,
+{
+    /// Slot reached `Ready`. The pre-bumped `ConsumerHold` is
+    /// handed back to the caller, which must `forget()` it so the
+    /// bump survives to be balanced by the consumer's `PageGuard`.
+    Ready(ConsumerHold<T, S, R>),
     Error(Error),
     /// Slot left `Loading` via leader-future drop (back to `Idle`
-    /// or re-entering `Loading`). Caller must release the
-    /// transferred hold and re-enter the state machine.
+    /// or re-entering `Loading`). The pre-bumped hold has already
+    /// been released; the caller re-enters the state machine.
     Retry,
 }
 
-impl<'a> ParkOnSlot<'a> {
-    fn new(slot: &'a Rc<PageSlot>) -> Self {
+impl<T, S, R> ParkOnSlot<T, S, R>
+where
+    T: Transport<R>,
+    S: BlockStore,
+    R: Req,
+{
+    fn new(
+        inner: Rc<PoolInner<T, S, R>>,
+        fetch: Rc<RefCell<StripeFetch>>,
+        slot: Rc<PageSlot>,
+        key: StripeKey,
+        page_no: u64,
+    ) -> Self {
         Self {
+            inner,
+            fetch,
             slot,
-            registered: Cell::new(false),
-            consumed: Cell::new(false),
+            key,
+            page_no,
+            hold: None,
         }
     }
 }
 
-impl<'a> Future for ParkOnSlot<'a> {
-    type Output = ParkOutcome;
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<ParkOutcome> {
+impl<T, S, R> Future for ParkOnSlot<T, S, R>
+where
+    T: Transport<R>,
+    S: BlockStore,
+    R: Req,
+{
+    type Output = ParkOutcome<T, S, R>;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // `ParkOnSlot` holds only `Rc`/`Option`/`Cell` fields; it
+        // is `Unpin`.
+        let this = self.get_mut();
+
         // First poll: register our waker and pre-bump
-        // `consumer_holds`. `Action::Park` only constructs a
-        // `ParkOnSlot` after synchronously observing `Loading`; in
-        // single-threaded use, nothing else can run between that
-        // observation and this poll, so the state must still be
-        // `Loading` here. Be defensive anyway: if it isn't, fall
-        // through into the outcome path without bumping (the caller
-        // will not see a transferred hold).
-        if !self.registered.get() {
-            let mut st = self.slot.state.borrow_mut();
-            if let SlotState::Loading(wakers) = &mut *st {
-                wakers.push(cx.waker().clone());
-                drop(st);
-                self.slot
-                    .consumer_holds
-                    .set(self.slot.consumer_holds.get() + 1);
-                self.registered.set(true);
-                return Poll::Pending;
+        // `consumer_holds` via a `ConsumerHold`.
+        //
+        // `Action::Park` constructs a `ParkOnSlot` after
+        // synchronously observing `Loading`. Between that
+        // observation and this poll, the executor may have run
+        // other tasks (in particular the leader can complete the
+        // I/O), so the state can already have moved past `Loading`
+        // by the time we get here. We still bump the hold
+        // unconditionally so the caller's "outcome path always
+        // consumes the transferred hold" accounting holds, and
+        // fall through to the match below to deliver whatever
+        // outcome the state currently dictates.
+        if this.hold.is_none() {
+            {
+                let mut st = this.slot.state.borrow_mut();
+                if let SlotState::Loading(wakers) = &mut *st {
+                    wakers.push(cx.waker().clone());
+                }
             }
-            drop(st);
-            // Defensive late-arrival path: synthesize a bump so the
-            // caller's balanced "always-release on non-Ready outcome"
-            // accounting stays consistent. Single-threaded callers
-            // should never reach this branch.
-            self.slot
-                .consumer_holds
-                .set(self.slot.consumer_holds.get() + 1);
-            self.registered.set(true);
+            this.hold = Some(ConsumerHold::new(
+                this.inner.clone(),
+                this.fetch.clone(),
+                this.slot.clone(),
+                this.key,
+                this.page_no,
+            ));
         }
 
-        // Subsequent poll: state may or may not have transitioned.
+        // Subsequent polls: state may or may not have transitioned.
         // We've already registered our waker once; spinning drivers
         // (e.g. the in-tree `block_on_two` with a noop waker) may
         // re-poll us while still `Loading`. Don't re-push: the
         // existing waker entry will be drained by the leader. This
         // bounds the wakers vec at one entry per parked subscriber.
-        let st = self.slot.state.borrow();
-        match &*st {
-            SlotState::Loading(_) => Poll::Pending,
-            SlotState::Ready => {
-                self.consumed.set(true);
-                Poll::Ready(ParkOutcome::Ready)
+        let outcome = {
+            let st = this.slot.state.borrow();
+            match &*st {
+                SlotState::Loading(_) => return Poll::Pending,
+                SlotState::Ready => Outcome::Ready,
+                SlotState::Error(e) => Outcome::Error(e.clone()),
+                SlotState::Idle => Outcome::Retry,
             }
-            SlotState::Error(e) => {
-                let e = e.clone();
-                self.consumed.set(true);
+        };
+        match outcome {
+            Outcome::Ready => {
+                let hold = this.hold.take().expect("hold registered above");
+                Poll::Ready(ParkOutcome::Ready(hold))
+            }
+            Outcome::Error(e) => {
+                // Drop the hold to release the pre-bump and run
+                // recycle_if_terminal; state is terminal so if we
+                // are the last holder the slot is reclaimed here.
+                let _ = this.hold.take();
                 Poll::Ready(ParkOutcome::Error(e))
             }
-            SlotState::Idle => {
-                self.consumed.set(true);
+            Outcome::Retry => {
+                let _ = this.hold.take();
                 Poll::Ready(ParkOutcome::Retry)
             }
         }
     }
 }
 
-impl<'a> Drop for ParkOnSlot<'a> {
-    fn drop(&mut self) {
-        // Cancellation: future dropped before observing a
-        // transition. Release the pre-bumped hold so the slot
-        // doesn't leak.
-        if self.registered.get() && !self.consumed.get() {
-            let prev = self.slot.consumer_holds.get();
-            self.slot.consumer_holds.set(prev.saturating_sub(1));
-        }
-    }
+/// Internal outcome enum used inside `ParkOnSlot::poll` to keep
+/// the `slot.state` borrow scope minimal (we observe the state,
+/// then drop the borrow before mutating `self.hold`).
+enum Outcome {
+    Ready,
+    Error(Error),
+    Retry,
 }
