@@ -177,7 +177,7 @@ func (h *EdgeHandler) handleGet(w http.ResponseWriter, r *http.Request, bucket, 
 		return
 	}
 
-	chunkSize := h.cfg.Chunking.Size
+	chunkSize := chunk.SizeFor(info.Size, h.cfg.Chunking.Size, h.cfg.Chunking.AsChunkTiers())
 	firstChunk, lastChunk := chunk.IndexRange(rangeStart, rangeEnd, chunkSize, info.Size)
 
 	h.log.LogAttrs(r.Context(), slog.LevelDebug, "edge_get_plan",
@@ -187,6 +187,7 @@ func (h *EdgeHandler) handleGet(w http.ResponseWriter, r *http.Request, bucket, 
 		slog.Int64("range_end", rangeEnd),
 		slog.Int64("first_chunk", firstChunk),
 		slog.Int64("last_chunk", lastChunk),
+		slog.Int64("chunk_size", chunkSize),
 		slog.Bool("has_range", hasRange),
 	)
 
@@ -257,7 +258,59 @@ func (h *EdgeHandler) handleGet(w http.ResponseWriter, r *http.Request, bucket, 
 		f.Flush()
 	}
 
-	for ci := firstChunk + 1; ci <= lastChunk; ci++ {
+	if firstChunk < lastChunk {
+		h.streamRemainingChunks(r.Context(), w, bucket, key, info, chunkSize,
+			rangeStart, rangeEnd, firstChunk+1, lastChunk)
+	}
+
+	h.log.LogAttrs(r.Context(), slog.LevelDebug, "edge_get_complete",
+		slog.String("bucket", bucket),
+		slog.String("key", key),
+		slog.Int64("bytes", rangeEnd-rangeStart+1),
+	)
+}
+
+// streamRemainingChunks fetches and streams chunks [firstIdx, lastIdx]
+// after the first chunk has already been delivered. Honors the
+// configured Chunking.Readahead depth: with depth > 0 a producer
+// goroutine prefetches up to depth chunks while the consumer streams
+// the current one; with depth == 0 the loop is strictly sequential
+// (zero-overhead opt-out preserving the pre-readahead behavior).
+//
+// All failures here are mid-stream aborts: response headers are
+// already committed, so the only remedy is logging and returning.
+func (h *EdgeHandler) streamRemainingChunks(
+	ctx context.Context,
+	w http.ResponseWriter,
+	bucket, key string,
+	info origin.ObjectInfo,
+	chunkSize, rangeStart, rangeEnd int64,
+	firstIdx, lastIdx int64,
+) {
+	depth := h.cfg.Chunking.ReadaheadDepth()
+	if depth <= 0 {
+		h.streamRemainingChunksSequential(ctx, w, bucket, key, info, chunkSize,
+			rangeStart, rangeEnd, firstIdx, lastIdx)
+
+		return
+	}
+
+	h.streamRemainingChunksReadahead(ctx, w, bucket, key, info, chunkSize,
+		rangeStart, rangeEnd, firstIdx, lastIdx, depth)
+}
+
+// streamRemainingChunksSequential is the pre-readahead loop body:
+// fetch chunk N, stream it, close it, advance. One in-flight chunk
+// fetch at a time. Used when Chunking.Readahead is 0.
+func (h *EdgeHandler) streamRemainingChunksSequential(
+	ctx context.Context,
+	w http.ResponseWriter,
+	bucket, key string,
+	info origin.ObjectInfo,
+	chunkSize, rangeStart, rangeEnd int64,
+	firstIdx, lastIdx int64,
+) {
+	for ci := firstIdx; ci <= lastIdx; ci++ {
 		ckey := chunk.Key{
 			OriginID:  h.cfg.Origin.ID,
 			Bucket:    bucket,
@@ -267,16 +320,15 @@ func (h *EdgeHandler) handleGet(w http.ResponseWriter, r *http.Request, bucket, 
 			Index:     ci,
 		}
 
-		h.log.LogAttrs(r.Context(), slog.LevelDebug, "edge_get_chunk_next",
+		h.log.LogAttrs(ctx, slog.LevelDebug, "edge_get_chunk_next",
 			slog.String("bucket", bucket),
 			slog.String("key", key),
 			slog.Int64("chunk", ci),
 		)
 
-		body, err := h.fc.GetChunk(r.Context(), ckey, info.Size)
+		body, err := h.fc.GetChunk(ctx, ckey, info.Size)
 		if err != nil {
-			// We've already sent headers; abort the response.
-			h.log.LogAttrs(r.Context(), slog.LevelWarn, "mid-stream chunk fetch failed",
+			h.log.LogAttrs(ctx, slog.LevelWarn, "mid-stream chunk fetch failed",
 				slog.String("bucket", bucket),
 				slog.String("key", key),
 				slog.Int64("chunk", ci),
@@ -289,7 +341,7 @@ func (h *EdgeHandler) handleGet(w http.ResponseWriter, r *http.Request, bucket, 
 		off, length := chunk.ChunkSlice(ci, chunkSize, rangeStart, rangeEnd, info.Size)
 		if err := streamSlice(w, body, off, length); err != nil {
 			body.Close() //nolint:errcheck // chunk body close best-effort, response already streaming
-			h.log.LogAttrs(r.Context(), slog.LevelWarn, "mid-stream copy failed",
+			h.log.LogAttrs(ctx, slog.LevelWarn, "mid-stream copy failed",
 				slog.String("bucket", bucket),
 				slog.String("key", key),
 				slog.Int64("chunk", ci),
@@ -305,12 +357,325 @@ func (h *EdgeHandler) handleGet(w http.ResponseWriter, r *http.Request, bucket, 
 			f.Flush()
 		}
 	}
+}
 
-	h.log.LogAttrs(r.Context(), slog.LevelDebug, "edge_get_complete",
-		slog.String("bucket", bucket),
-		slog.String("key", key),
-		slog.Int64("bytes", rangeEnd-rangeStart+1),
-	)
+// pendingChunk is one item produced by the readahead pipeline: an
+// in-order chunk body (or the error that prevented fetching it).
+// The consumer is responsible for Close()ing rc when non-nil.
+type pendingChunk struct {
+	idx int64
+	rc  io.ReadCloser
+	err error
+}
+
+// readaheadJob is a chunk-fetch slot held in the dispatcher's queue.
+// Each job owns a 1-buffered result channel that its worker writes
+// to exactly once before exiting.
+type readaheadJob struct {
+	idx int64
+	rc  chan pendingChunk
+}
+
+// streamRemainingChunksReadahead runs a producer goroutine that
+// fetches chunks ahead into a bounded channel of capacity depth,
+// while the main goroutine streams the current chunk to the client.
+// This hides per-chunk cachestore RTT behind body transfer time so
+// large-blob GETs no longer pay N strictly-serial round trips.
+//
+// Lifecycle:
+//   - Consumer aborts (mid-stream copy failure, fetch error,
+//     producer-channel closed early) cancel the producer's context;
+//     the producer drains and closes any bodies it has already
+//     prefetched on the way out.
+//   - Producer panics are recovered, logged, and surface to the
+//     consumer as an early channel close; the consumer treats that
+//     as a mid-stream abort and returns cleanly.
+//   - Context cancellation from the caller (client disconnect)
+//     propagates through prefetchCtx, cancelling in-flight
+//     GetChunk calls and causing the producer to exit.
+func (h *EdgeHandler) streamRemainingChunksReadahead(
+	ctx context.Context,
+	w http.ResponseWriter,
+	bucket, key string,
+	info origin.ObjectInfo,
+	chunkSize, rangeStart, rangeEnd int64,
+	firstIdx, lastIdx int64,
+	depth int,
+) {
+	prefetchCtx, cancelPrefetch := context.WithCancel(ctx)
+	defer cancelPrefetch()
+
+	ch := h.prefetchChunks(prefetchCtx, bucket, key, info.ETag, chunkSize, info.Size,
+		firstIdx, lastIdx, depth)
+
+	// Drain helper: close any pending bodies left in the channel
+	// after we decide to abort. The producer's own deferred
+	// per-pending close (on ctx cancel during send-select) covers
+	// the in-flight body it is currently fetching; this loop covers
+	// the buffered ones the consumer never reaches.
+	drain := func() {
+		for p := range ch {
+			if p.rc != nil {
+				_ = p.rc.Close() //nolint:errcheck // drain best-effort
+			}
+		}
+	}
+
+	expectedIdx := firstIdx
+
+	for p := range ch {
+		if p.err != nil {
+			if p.rc != nil {
+				_ = p.rc.Close() //nolint:errcheck // close error-path body
+			}
+
+			h.log.LogAttrs(ctx, slog.LevelWarn, "mid-stream chunk fetch failed",
+				slog.String("bucket", bucket),
+				slog.String("key", key),
+				slog.Int64("chunk", p.idx),
+				slog.Any("err", p.err),
+			)
+			cancelPrefetch()
+			drain()
+
+			return
+		}
+
+		if p.idx != expectedIdx {
+			// Defensive: producer is required to deliver chunks in
+			// index order. A mismatch indicates a programming error
+			// upstream; treat as mid-stream abort.
+			if p.rc != nil {
+				_ = p.rc.Close() //nolint:errcheck
+			}
+
+			h.log.LogAttrs(ctx, slog.LevelError, "readahead order violation",
+				slog.String("bucket", bucket),
+				slog.String("key", key),
+				slog.Int64("expected", expectedIdx),
+				slog.Int64("got", p.idx),
+			)
+			cancelPrefetch()
+			drain()
+
+			return
+		}
+
+		h.log.LogAttrs(ctx, slog.LevelDebug, "edge_get_chunk_next",
+			slog.String("bucket", bucket),
+			slog.String("key", key),
+			slog.Int64("chunk", p.idx),
+		)
+
+		off, length := chunk.ChunkSlice(p.idx, chunkSize, rangeStart, rangeEnd, info.Size)
+		if err := streamSlice(w, p.rc, off, length); err != nil {
+			_ = p.rc.Close() //nolint:errcheck
+			h.log.LogAttrs(ctx, slog.LevelWarn, "mid-stream copy failed",
+				slog.String("bucket", bucket),
+				slog.String("key", key),
+				slog.Int64("chunk", p.idx),
+				slog.Any("err", err),
+			)
+			cancelPrefetch()
+			drain()
+
+			return
+		}
+
+		_ = p.rc.Close() //nolint:errcheck
+
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+
+		expectedIdx++
+	}
+
+	if expectedIdx <= lastIdx {
+		// Channel closed before all chunks were delivered. The
+		// producer either panicked (already logged) or its context
+		// was cancelled (client disconnect or earlier mid-stream
+		// abort - the latter would have returned above). Surface as
+		// a mid-stream warning so operators see truncated responses.
+		h.log.LogAttrs(ctx, slog.LevelWarn, "readahead truncated response",
+			slog.String("bucket", bucket),
+			slog.String("key", key),
+			slog.Int64("expected_through", lastIdx),
+			slog.Int64("delivered_through", expectedIdx-1),
+		)
+	}
+}
+
+// prefetchChunks fetches chunks [firstIdx, lastIdx] into a bounded
+// channel of capacity depth, with up to depth fetches in flight in
+// parallel. Bodies are delivered in chunk-index order so the
+// consumer can stream them straight to the client without
+// reassembly. Caller drains the channel and owns Close() for any
+// non-nil rc it receives.
+//
+// Fan-out model:
+//   - A dispatcher goroutine spawns one worker goroutine per chunk
+//     index, gated by a depth-sized job queue so peak in-flight
+//     workers stays at depth (+ at most one in-flight push and one
+//     in-flight delivery).
+//   - Each worker calls h.fc.GetChunk for its chunk and writes the
+//     result to a per-job, 1-buffered result channel.
+//   - The dispatcher pushes job descriptors onto the queue in
+//     chunk-index order so the delivery loop reads results in that
+//     same order.
+//
+// Lifecycle:
+//   - All workers ALWAYS write exactly once to their result channel
+//     before exiting. This invariant lets the delivery loop block
+//     on `<-j.rc` without risk of deadlock even on ctx-cancel.
+//   - On ctx cancellation the dispatcher drains its currently-spawned
+//     worker (waiting for the unconditional rc write) and exits.
+//     The delivery loop drains any remaining queued jobs the same
+//     way, closing the body in each result.
+//   - Producer panics are recovered, logged, and surface to the
+//     consumer as an early channel close; the consumer treats that
+//     as a mid-stream abort.
+func (h *EdgeHandler) prefetchChunks(
+	ctx context.Context,
+	bucket, key, etag string,
+	chunkSize, objectSize int64,
+	firstIdx, lastIdx int64,
+	depth int,
+) <-chan pendingChunk {
+	out := make(chan pendingChunk, depth)
+
+	queue := make(chan readaheadJob, depth)
+
+	// Dispatcher: spawn workers in chunk-index order, gated by the
+	// queue's capacity. Each worker is independent and runs to
+	// completion (always writes its result), so the dispatcher
+	// doesn't need to track them after spawning.
+	go func() {
+		defer close(queue)
+		defer func() {
+			if r := recover(); r != nil {
+				h.log.LogAttrs(ctx, slog.LevelError, "readahead dispatcher panic",
+					slog.String("bucket", bucket),
+					slog.String("key", key),
+					slog.Any("panic", r),
+				)
+			}
+		}()
+
+		for ci := firstIdx; ci <= lastIdx; ci++ {
+			if err := ctx.Err(); err != nil {
+				return
+			}
+
+			rc := make(chan pendingChunk, 1)
+
+			// Spawn worker first so the result channel always
+			// receives a write, even if ctx is cancelled while we
+			// block on the queue push below. The worker's
+			// GetChunk call will short-circuit on a cancelled ctx
+			// with err != nil and rc == nil, satisfying the
+			// "always write" invariant.
+			go func(idx int64, rc chan<- pendingChunk) {
+				defer func() {
+					if r := recover(); r != nil {
+						h.log.LogAttrs(ctx, slog.LevelError, "readahead worker panic",
+							slog.String("bucket", bucket),
+							slog.String("key", key),
+							slog.Int64("chunk", idx),
+							slog.Any("panic", r),
+						)
+						// Preserve the write-once invariant: send a
+						// synthetic error so the delivery loop sees
+						// the panic-affected chunk as a fetch error
+						// rather than blocking forever on rc.
+						rc <- pendingChunk{idx: idx, err: fmt.Errorf("readahead worker panic: %v", r)}
+					}
+				}()
+
+				ckey := chunk.Key{
+					OriginID:  h.cfg.Origin.ID,
+					Bucket:    bucket,
+					ObjectKey: key,
+					ETag:      etag,
+					ChunkSize: chunkSize,
+					Index:     idx,
+				}
+
+				body, err := h.fc.GetChunk(ctx, ckey, objectSize)
+				rc <- pendingChunk{idx: idx, rc: body, err: err}
+			}(ci, rc)
+
+			select {
+			case queue <- readaheadJob{idx: ci, rc: rc}:
+			case <-ctx.Done():
+				// Worker is in flight; drain it so the body (if any)
+				// is closed and the goroutine doesn't leak.
+				p := <-rc
+				if p.rc != nil {
+					_ = p.rc.Close() //nolint:errcheck // ctx-cancel body close best-effort
+				}
+
+				return
+			}
+		}
+	}()
+
+	// Delivery: read worker results in chunk-index order and forward
+	// to `out`. Drains in-flight jobs on ctx-cancel.
+	go func() {
+		defer close(out)
+		defer func() {
+			if r := recover(); r != nil {
+				h.log.LogAttrs(ctx, slog.LevelError, "readahead delivery panic",
+					slog.String("bucket", bucket),
+					slog.String("key", key),
+					slog.Any("panic", r),
+				)
+			}
+		}()
+
+		for j := range queue {
+			p := <-j.rc // worker always writes; safe blocking read
+
+			if err := ctx.Err(); err != nil {
+				if p.rc != nil {
+					_ = p.rc.Close() //nolint:errcheck // drain best-effort
+				}
+
+				drainQueue(queue)
+
+				return
+			}
+
+			select {
+			case out <- p:
+			case <-ctx.Done():
+				if p.rc != nil {
+					_ = p.rc.Close() //nolint:errcheck // drain best-effort
+				}
+
+				drainQueue(queue)
+
+				return
+			}
+		}
+	}()
+
+	return out
+}
+
+// drainQueue is a helper that empties any remaining job descriptors
+// from the readahead queue, waits for each spawned worker to deliver
+// its result, and closes any body the result carries. Used on
+// ctx-cancel cleanup paths so worker goroutines and cachestore
+// response bodies do not leak when the consumer aborts mid-stream.
+func drainQueue(queue <-chan readaheadJob) {
+	for j := range queue {
+		p := <-j.rc
+		if p.rc != nil {
+			_ = p.rc.Close() //nolint:errcheck // cleanup best-effort
+		}
+	}
 }
 
 // streamSlice copies length bytes starting at off from src to dst.

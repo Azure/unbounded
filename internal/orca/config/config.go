@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/Azure/unbounded/internal/orca/chunk"
 )
 
 // Config is the top-level Orca configuration.
@@ -177,9 +179,77 @@ type Metadata struct {
 	MaxEntries  int           `yaml:"max_entries"`
 }
 
-// Chunking governs chunk size and prefetch.
+// Chunking governs chunk size and read-ahead for client GETs.
+//
+// Size is the base chunk size used for objects smaller than the
+// smallest Tier threshold. Tiers, if non-empty, override Size for
+// objects at or above each tier's MinObjectSize: the tier with the
+// largest threshold <= the object's size wins. Tiers must be
+// strictly ascending by MinObjectSize; the loader enforces this
+// at validate time so the runtime selection path can assume sorted
+// input.
+//
+// Readahead is the number of chunks the client-edge GET handler
+// prefetches while streaming the current chunk to the client. It
+// is a pointer so the loader can distinguish an omitted YAML field
+// (defaults to 8) from an explicit "readahead: 0" (disables
+// read-ahead and restores the strictly-sequential chunk-fetch
+// behavior). The cost is bounded by readahead * effective_chunk_size
+// of extra in-flight cachestore body buffers per concurrent GET;
+// cold-fill speculation is additionally bounded by the per-replica
+// origin semaphore (target_per_replica), so peak per-replica
+// cold-buffer memory is at most:
+//
+//	target_per_replica * max(Size, max ChunkSize across Tiers)
+//
+// With the defaults (Size=8 MiB, Tiers up to 128 MiB, 4 replicas at
+// target_global=64), the per-replica ceiling is 16 * 128 MiB = 2 GiB.
+// Operators with tighter memory budgets should lower the highest
+// tier's ChunkSize or drop the largest-object tier entirely.
 type Chunking struct {
-	Size int64 `yaml:"size"` // bytes per chunk; default 8 MiB
+	Size      int64       `yaml:"size"` // bytes per chunk; default 8 MiB
+	Tiers     []ChunkTier `yaml:"tiers"`
+	Readahead *int        `yaml:"readahead"`
+}
+
+// ChunkTier is one entry in the Chunking.Tiers ladder. Objects whose
+// size is at or above MinObjectSize use ChunkSize, unless a
+// higher-threshold tier also matches (in which case the higher tier
+// wins). Both fields must be > 0; ChunkSize must be >= 1 MiB (the
+// floor that applies to Chunking.Size as well).
+type ChunkTier struct {
+	MinObjectSize int64 `yaml:"min_object_size"`
+	ChunkSize     int64 `yaml:"chunk_size"`
+}
+
+// AsChunkTiers returns the configured tier ladder as a []chunk.Tier
+// slice suitable for chunk.SizeFor. Returns nil for an empty list.
+// The slice is in the validated ascending-MinObjectSize order.
+func (c Chunking) AsChunkTiers() []chunk.Tier {
+	if len(c.Tiers) == 0 {
+		return nil
+	}
+
+	out := make([]chunk.Tier, len(c.Tiers))
+	for i, t := range c.Tiers {
+		out[i] = chunk.Tier{MinObjectSize: t.MinObjectSize, ChunkSize: t.ChunkSize}
+	}
+
+	return out
+}
+
+// ReadaheadDepth returns the configured read-ahead depth. A nil
+// pointer (YAML omitted) returns 0; applyDefaults populates the
+// default-on value so configurations that loaded through Load
+// always have a non-nil pointer. Callers that bypass Load (e.g.
+// hand-constructed test configs) get 0 for nil, which matches the
+// "feature disabled" semantics.
+func (c Chunking) ReadaheadDepth() int {
+	if c.Readahead == nil {
+		return 0
+	}
+
+	return *c.Readahead
 }
 
 // Load reads the YAML config file at path and returns a populated
@@ -315,6 +385,23 @@ func (c *Config) applyDefaults() {
 	if c.Chunking.Size == 0 {
 		c.Chunking.Size = 8 * 1024 * 1024
 	}
+	// Tier ladder: default to a two-tier ramp that keeps small
+	// objects on the 8 MiB base size, bumps 1 GiB+ blobs to 64 MiB,
+	// and 10 GiB+ blobs to 128 MiB. Operators can replace or
+	// disable the ladder by setting tiers explicitly (including the
+	// empty list) in YAML.
+	if c.Chunking.Tiers == nil {
+		c.Chunking.Tiers = []ChunkTier{
+			{MinObjectSize: 1024 * 1024 * 1024, ChunkSize: 64 * 1024 * 1024},
+			{MinObjectSize: 10 * 1024 * 1024 * 1024, ChunkSize: 128 * 1024 * 1024},
+		}
+	}
+	// Readahead defaults to 8 chunks when the YAML field is omitted.
+	// An explicit "readahead: 0" disables prefetch.
+	if c.Chunking.Readahead == nil {
+		d := 8
+		c.Chunking.Readahead = &d
+	}
 	// Logging.
 	if c.Logging.Level == "" {
 		c.Logging.Level = "info"
@@ -379,8 +466,46 @@ func (c *Config) validate() error {
 		return fmt.Errorf("chunking.size %d too small; minimum 1 MiB", c.Chunking.Size)
 	}
 
+	if err := validateChunkingTiers(c.Chunking.Tiers); err != nil {
+		return err
+	}
+
+	if c.Chunking.Readahead != nil && *c.Chunking.Readahead < 0 {
+		return fmt.Errorf("chunking.readahead %d invalid; must be >= 0", *c.Chunking.Readahead)
+	}
+
 	if _, err := ParseLogLevel(c.Logging.Level); err != nil {
 		return err
+	}
+
+	return nil
+}
+
+// validateChunkingTiers enforces the unambiguous-tier invariants the
+// SizeFor selection rule depends on: every tier has positive bounds,
+// the ChunkSize floor matches Chunking.Size's 1 MiB minimum, and
+// MinObjectSize values are strictly ascending. Unsorted input is
+// rejected (rather than silently sorted) so operators see the typo
+// in their YAML rather than diagnosing a surprising chunk-size
+// selection in production.
+func validateChunkingTiers(tiers []ChunkTier) error {
+	for i, t := range tiers {
+		if t.MinObjectSize <= 0 {
+			return fmt.Errorf("chunking.tiers[%d].min_object_size %d invalid; must be > 0",
+				i, t.MinObjectSize)
+		}
+
+		if t.ChunkSize < 1024*1024 {
+			return fmt.Errorf("chunking.tiers[%d].chunk_size %d too small; minimum 1 MiB",
+				i, t.ChunkSize)
+		}
+
+		if i > 0 && t.MinObjectSize <= tiers[i-1].MinObjectSize {
+			return fmt.Errorf(
+				"chunking.tiers must be strictly ascending by min_object_size; "+
+					"tiers[%d].min_object_size=%d is not greater than tiers[%d].min_object_size=%d",
+				i, t.MinObjectSize, i-1, tiers[i-1].MinObjectSize)
+		}
 	}
 
 	return nil

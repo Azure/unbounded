@@ -234,6 +234,116 @@ func TestChunkSlice(t *testing.T) {
 	}
 }
 
+// TestSizeFor covers the chunk-size tier ladder: base for objects
+// below the first threshold (or unknown sizes), tier ChunkSize for
+// objects at or above the corresponding MinObjectSize, and
+// last-tier-wins resolution when multiple tiers match.
+func TestSizeFor(t *testing.T) {
+	t.Parallel()
+
+	const (
+		base = int64(8 * 1024 * 1024)         // 8 MiB
+		t1   = int64(64 * 1024 * 1024)        // 64 MiB
+		t2   = int64(128 * 1024 * 1024)       // 128 MiB
+		oneG = int64(1024 * 1024 * 1024)      // 1 GiB
+		tenG = int64(10 * 1024 * 1024 * 1024) // 10 GiB
+	)
+
+	defaultTiers := []Tier{
+		{MinObjectSize: oneG, ChunkSize: t1},
+		{MinObjectSize: tenG, ChunkSize: t2},
+	}
+
+	tests := []struct {
+		name       string
+		objectSize int64
+		base       int64
+		tiers      []Tier
+		want       int64
+	}{
+		{
+			name:       "empty tiers returns base",
+			objectSize: 100 << 20,
+			base:       base,
+			tiers:      nil,
+			want:       base,
+		},
+		{
+			name:       "object below first threshold returns base",
+			objectSize: 512 << 20,
+			base:       base,
+			tiers:      defaultTiers,
+			want:       base,
+		},
+		{
+			name:       "object exactly at first threshold uses first tier",
+			objectSize: oneG,
+			base:       base,
+			tiers:      defaultTiers,
+			want:       t1,
+		},
+		{
+			name:       "object between tiers uses lower tier",
+			objectSize: oneG + (1 << 20),
+			base:       base,
+			tiers:      defaultTiers,
+			want:       t1,
+		},
+		{
+			name:       "object exactly at second threshold uses second tier",
+			objectSize: tenG,
+			base:       base,
+			tiers:      defaultTiers,
+			want:       t2,
+		},
+		{
+			name:       "huge object uses highest tier",
+			objectSize: 700 * 1024 * 1024 * 1024,
+			base:       base,
+			tiers:      defaultTiers,
+			want:       t2,
+		},
+		{
+			name:       "zero objectSize (unknown) returns base",
+			objectSize: 0,
+			base:       base,
+			tiers:      defaultTiers,
+			want:       base,
+		},
+		{
+			name:       "negative objectSize returns base",
+			objectSize: -1,
+			base:       base,
+			tiers:      defaultTiers,
+			want:       base,
+		},
+		{
+			name:       "single tier above object",
+			objectSize: 500 << 20,
+			base:       base,
+			tiers:      []Tier{{MinObjectSize: oneG, ChunkSize: t1}},
+			want:       base,
+		},
+		{
+			name:       "single tier at object",
+			objectSize: oneG,
+			base:       base,
+			tiers:      []Tier{{MinObjectSize: oneG, ChunkSize: t1}},
+			want:       t1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := SizeFor(tt.objectSize, tt.base, tt.tiers)
+			if got != tt.want {
+				t.Errorf("SizeFor(%d, %d, %v)=%d want %d",
+					tt.objectSize, tt.base, tt.tiers, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestKey_String covers both formatting branches (short ETag + long
 // ETag).
 func TestKey_String(t *testing.T) {

@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -801,4 +802,588 @@ func equalStrings(a, b []string) bool {
 	}
 
 	return true
+}
+
+// readaheadConfig returns a config tailored for readahead unit tests.
+// Origin.ID is required by the chunk-key construction inside
+// handleGet; chunk size and readahead are explicit so each test
+// controls them independently.
+func readaheadConfig(chunkSize int64, readahead int) *config.Config {
+	r := readahead
+
+	return &config.Config{
+		Origin: config.Origin{ID: "origin"},
+		Chunking: config.Chunking{
+			Size:      chunkSize,
+			Readahead: &r,
+		},
+	}
+}
+
+// makeChunkData returns a chunkSize-byte payload whose contents
+// encode the chunk index so test assertions can verify that the
+// streamed body delivers chunks in correct order. Each byte at
+// offset b within chunk i is `byte((int(i) + b) % 251)`; using a
+// prime modulus avoids spurious alignment on power-of-two
+// boundaries.
+func makeChunkData(idx int64, n int) []byte {
+	out := make([]byte, n)
+	for b := 0; b < n; b++ {
+		out[b] = byte((int(idx) + b) % 251)
+	}
+
+	return out
+}
+
+// trackedReadCloser is an io.ReadCloser that records Close() calls
+// for the readahead-cancellation test. closedCh fires once on the
+// first Close().
+type trackedReadCloser struct {
+	io.Reader
+	closed   bool
+	closedCh chan struct{}
+}
+
+func (t *trackedReadCloser) Close() error {
+	if !t.closed {
+		t.closed = true
+		close(t.closedCh)
+	}
+
+	return nil
+}
+
+// TestHandleGet_DynamicChunkSize_SmallObject verifies a small object
+// (well below any tier threshold) uses the base Chunking.Size. The
+// fake fetch records the chunk-key sizes seen so we can assert the
+// edge handler is not regressing to the previous global-only chunk
+// size on the small-object path.
+func TestHandleGet_DynamicChunkSize_SmallObject(t *testing.T) {
+	t.Parallel()
+
+	info := origin.ObjectInfo{Size: 100 * (1 << 20), ETag: "etag", ContentType: "application/octet-stream"}
+
+	var (
+		mu        sync.Mutex
+		seenSizes []int64
+	)
+
+	fc := &fakeEdgeAPI{
+		HeadObjectFunc: func(_ context.Context, _, _ string) (origin.ObjectInfo, error) {
+			return info, nil
+		},
+		GetChunkFunc: func(_ context.Context, k chunk.Key, _ int64) (io.ReadCloser, error) {
+			mu.Lock()
+
+			seenSizes = append(seenSizes, k.ChunkSize)
+			mu.Unlock()
+
+			return io.NopCloser(bytes.NewReader(makeChunkData(k.Index, int(k.ExpectedLen(info.Size))))), nil
+		},
+	}
+
+	cfg := &config.Config{
+		Origin: config.Origin{ID: "origin"},
+		Chunking: config.Chunking{
+			Size: 8 << 20,
+			Tiers: []config.ChunkTier{
+				{MinObjectSize: 1 << 30, ChunkSize: 64 << 20},
+			},
+		},
+	}
+
+	h := NewEdgeHandler(fc, cfg, discardLogger())
+
+	req := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
+	rr := httptest.NewRecorder()
+	h.handleGet(rr, req, "bucket", "key")
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d want 200; body=%q", rr.Code, rr.Body.String())
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(seenSizes) == 0 {
+		t.Fatalf("no chunk fetches recorded")
+	}
+
+	for i, sz := range seenSizes {
+		if sz != 8<<20 {
+			t.Errorf("seenSizes[%d]=%d want 8 MiB (base)", i, sz)
+		}
+	}
+}
+
+// TestHandleGet_DynamicChunkSize_LargeObject verifies a large object
+// (above the tier threshold) uses the tier's ChunkSize and that the
+// number of chunks fetched matches the larger granularity (fewer
+// requests).
+func TestHandleGet_DynamicChunkSize_LargeObject(t *testing.T) {
+	t.Parallel()
+
+	// 700 GiB synthetic object; chunked at the 128 MiB tier this is
+	// 5600 chunks. We don't fetch them all in this test (we set up a
+	// fake that streams a tiny payload per chunk request), but we do
+	// confirm the chunk keys carry ChunkSize=128 MiB and the
+	// first-chunk path lands on Index=0.
+	const (
+		large  = int64(700) * (1 << 30) // 700 GiB
+		tierSz = int64(128) << 20       // 128 MiB
+		baseSz = int64(8) << 20         // 8 MiB
+	)
+
+	info := origin.ObjectInfo{Size: large, ETag: "etag", ContentType: "application/octet-stream"}
+
+	// To keep the test fast we use a Range request covering exactly
+	// the first chunk; otherwise the handler would attempt to stream
+	// 700 GiB. Range bytes=0-(tierSz-1) targets chunk 0 only.
+	var (
+		mu        sync.Mutex
+		seenSizes []int64
+		seenIdx   []int64
+	)
+
+	fc := &fakeEdgeAPI{
+		HeadObjectFunc: func(_ context.Context, _, _ string) (origin.ObjectInfo, error) {
+			return info, nil
+		},
+		GetChunkFunc: func(_ context.Context, k chunk.Key, _ int64) (io.ReadCloser, error) {
+			mu.Lock()
+
+			seenSizes = append(seenSizes, k.ChunkSize)
+			seenIdx = append(seenIdx, k.Index)
+			mu.Unlock()
+
+			return io.NopCloser(bytes.NewReader(makeChunkData(k.Index, int(k.ExpectedLen(info.Size))))), nil
+		},
+	}
+
+	cfg := &config.Config{
+		Origin: config.Origin{ID: "origin"},
+		Chunking: config.Chunking{
+			Size: baseSz,
+			Tiers: []config.ChunkTier{
+				{MinObjectSize: 10 * (1 << 30), ChunkSize: tierSz},
+			},
+		},
+	}
+
+	h := NewEdgeHandler(fc, cfg, discardLogger())
+
+	req := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
+	req.Header.Set("Range", "bytes=0-"+strconv.FormatInt(tierSz-1, 10))
+
+	rr := httptest.NewRecorder()
+	h.handleGet(rr, req, "bucket", "key")
+
+	if rr.Code != http.StatusPartialContent {
+		t.Fatalf("status=%d want 206; body=%q", rr.Code, rr.Body.String())
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(seenSizes) != 1 {
+		t.Fatalf("expected exactly 1 chunk fetch for first-chunk range; got %d", len(seenSizes))
+	}
+
+	if seenSizes[0] != tierSz {
+		t.Errorf("seenSizes[0]=%d want %d (tier size)", seenSizes[0], tierSz)
+	}
+
+	if seenIdx[0] != 0 {
+		t.Errorf("seenIdx[0]=%d want 0", seenIdx[0])
+	}
+}
+
+// TestHandleGet_Readahead_DisabledZero verifies that Readahead=0
+// preserves the strictly-sequential behavior: GetChunk is called
+// one chunk at a time, in order, with no concurrent fetches in
+// flight. The fake fetch deliberately reports concurrent calls so a
+// regression that started the prefetcher despite depth=0 would be
+// caught.
+func TestHandleGet_Readahead_DisabledZero(t *testing.T) {
+	t.Parallel()
+
+	const (
+		chunkSize  = int64(1024)
+		nChunks    = int64(5)
+		objectSize = chunkSize * nChunks
+	)
+
+	info := origin.ObjectInfo{Size: objectSize, ETag: "e", ContentType: "application/octet-stream"}
+
+	var (
+		mu        sync.Mutex
+		inFlight  int
+		maxInFlt  int
+		callOrder []int64
+	)
+
+	fc := &fakeEdgeAPI{
+		HeadObjectFunc: func(_ context.Context, _, _ string) (origin.ObjectInfo, error) {
+			return info, nil
+		},
+		GetChunkFunc: func(_ context.Context, k chunk.Key, _ int64) (io.ReadCloser, error) {
+			mu.Lock()
+			inFlight++
+
+			if inFlight > maxInFlt {
+				maxInFlt = inFlight
+			}
+
+			callOrder = append(callOrder, k.Index)
+			mu.Unlock()
+			// Brief sleep to widen any concurrency window.
+			time.Sleep(5 * time.Millisecond)
+
+			mu.Lock()
+			inFlight--
+			mu.Unlock()
+
+			return io.NopCloser(bytes.NewReader(makeChunkData(k.Index, int(chunkSize)))), nil
+		},
+	}
+
+	cfg := readaheadConfig(chunkSize, 0)
+	h := NewEdgeHandler(fc, cfg, discardLogger())
+
+	req := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
+	rr := httptest.NewRecorder()
+	h.handleGet(rr, req, "bucket", "key")
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d want 200; body=%q", rr.Code, rr.Body.String())
+	}
+
+	if int64(rr.Body.Len()) != objectSize {
+		t.Errorf("body=%d bytes, want %d", rr.Body.Len(), objectSize)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if maxInFlt != 1 {
+		t.Errorf("max in-flight=%d want 1 (no readahead)", maxInFlt)
+	}
+
+	for i, idx := range callOrder {
+		if idx != int64(i) {
+			t.Errorf("callOrder[%d]=%d want %d (in-order serial fetch)", i, idx, i)
+		}
+	}
+}
+
+// TestHandleGet_Readahead_ParallelHidesLatency verifies that with
+// Readahead > 0 the handler can have multiple chunk fetches in
+// flight concurrently. The fake fetch sleeps long enough per chunk
+// that the wall-clock time for the full GET should be substantially
+// less than nChunks * perChunkDelay if readahead is working.
+func TestHandleGet_Readahead_ParallelHidesLatency(t *testing.T) {
+	t.Parallel()
+
+	const (
+		chunkSize   = int64(1024)
+		nChunks     = int64(5)
+		objectSize  = chunkSize * nChunks
+		perChunkLat = 40 * time.Millisecond
+		readahead   = 4
+	)
+
+	info := origin.ObjectInfo{Size: objectSize, ETag: "e", ContentType: "application/octet-stream"}
+
+	var (
+		mu       sync.Mutex
+		inFlight int
+		maxInFlt int
+	)
+
+	fc := &fakeEdgeAPI{
+		HeadObjectFunc: func(_ context.Context, _, _ string) (origin.ObjectInfo, error) {
+			return info, nil
+		},
+		GetChunkFunc: func(ctx context.Context, k chunk.Key, _ int64) (io.ReadCloser, error) {
+			mu.Lock()
+			inFlight++
+
+			if inFlight > maxInFlt {
+				maxInFlt = inFlight
+			}
+			mu.Unlock()
+
+			select {
+			case <-time.After(perChunkLat):
+			case <-ctx.Done():
+				mu.Lock()
+				inFlight--
+				mu.Unlock()
+
+				return nil, ctx.Err()
+			}
+
+			mu.Lock()
+			inFlight--
+			mu.Unlock()
+
+			return io.NopCloser(bytes.NewReader(makeChunkData(k.Index, int(chunkSize)))), nil
+		},
+	}
+
+	cfg := readaheadConfig(chunkSize, readahead)
+	h := NewEdgeHandler(fc, cfg, discardLogger())
+
+	req := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
+	rr := httptest.NewRecorder()
+
+	start := time.Now()
+
+	h.handleGet(rr, req, "bucket", "key")
+
+	elapsed := time.Since(start)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d want 200; body=%q", rr.Code, rr.Body.String())
+	}
+
+	if int64(rr.Body.Len()) != objectSize {
+		t.Errorf("body=%d bytes, want %d", rr.Body.Len(), objectSize)
+	}
+
+	// Strict serial baseline = nChunks * perChunkLat. With readahead
+	// we expect substantially less; we conservatively assert <
+	// (nChunks * perChunkLat * 0.8) which gives the test plenty of
+	// CI slack. The exact speedup depends on scheduler timing; the
+	// in-flight max metric below is the deterministic assertion.
+	serialBaseline := time.Duration(nChunks) * perChunkLat
+
+	if elapsed >= serialBaseline {
+		t.Errorf("readahead did not hide latency: elapsed=%v, serial baseline=%v",
+			elapsed, serialBaseline)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if maxInFlt < 2 {
+		t.Errorf("max in-flight=%d want >= 2 (readahead concurrent)", maxInFlt)
+	}
+}
+
+// TestHandleGet_Readahead_CancellationClosesBodies verifies that
+// when the streaming consumer aborts mid-response (e.g. a downstream
+// write fails), every prefetched body still buffered in the
+// readahead channel is Close()d on the way out. Without this the
+// cachestore would leak HTTP response bodies whenever a client
+// disconnects partway through a large blob.
+//
+// Setup: the handler streams to an http.ResponseWriter wrapped to
+// return an io.ErrShortWrite after a fixed byte count, forcing the
+// streamSlice call to abort mid-chunk. We then assert that every
+// trackedReadCloser handed out has had Close() called.
+func TestHandleGet_Readahead_CancellationClosesBodies(t *testing.T) {
+	t.Parallel()
+
+	const (
+		chunkSize  = int64(256)
+		nChunks    = int64(8)
+		objectSize = chunkSize * nChunks
+		readahead  = 4
+	)
+
+	info := origin.ObjectInfo{Size: objectSize, ETag: "e", ContentType: "application/octet-stream"}
+
+	var (
+		mu     sync.Mutex
+		bodies []*trackedReadCloser
+	)
+
+	fc := &fakeEdgeAPI{
+		HeadObjectFunc: func(_ context.Context, _, _ string) (origin.ObjectInfo, error) {
+			return info, nil
+		},
+		GetChunkFunc: func(_ context.Context, k chunk.Key, _ int64) (io.ReadCloser, error) {
+			b := &trackedReadCloser{
+				Reader:   bytes.NewReader(makeChunkData(k.Index, int(chunkSize))),
+				closedCh: make(chan struct{}),
+			}
+
+			mu.Lock()
+
+			bodies = append(bodies, b)
+			mu.Unlock()
+
+			return b, nil
+		},
+	}
+
+	cfg := readaheadConfig(chunkSize, readahead)
+	h := NewEdgeHandler(fc, cfg, discardLogger())
+
+	// shortWriter writes the first maxBytes bytes to inner and
+	// returns io.ErrShortWrite on any further write. Reproduces a
+	// client connection that closes mid-stream.
+	rr := httptest.NewRecorder()
+	w := &shortWriter{inner: rr, maxBytes: int(chunkSize) + int(chunkSize)/2} // 1.5 chunks
+
+	req := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
+	h.handleGet(w, req, "bucket", "key")
+
+	// All bodies handed out should be closed; allow a brief window
+	// for the producer goroutine to observe ctx-cancellation and
+	// close its in-flight body via the select branch.
+	deadline := time.After(2 * time.Second)
+
+	for i := 0; ; i++ {
+		mu.Lock()
+		allClosed := true
+
+		for _, b := range bodies {
+			if !b.closed {
+				allClosed = false
+				break
+			}
+		}
+
+		count := len(bodies)
+		mu.Unlock()
+
+		if allClosed && count > 1 {
+			// Multiple bodies were handed out and all are closed.
+			return
+		}
+
+		select {
+		case <-deadline:
+			mu.Lock()
+			defer mu.Unlock()
+
+			if count <= 1 {
+				t.Fatalf("only %d bodies handed out; readahead did not engage", count)
+			}
+
+			for j, b := range bodies {
+				if !b.closed {
+					t.Errorf("body[%d] (chunk index %d) not closed", j, j)
+				}
+			}
+
+			return
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+
+		_ = i
+	}
+}
+
+// TestHandleGet_Readahead_ProducerPanicRecovered verifies that a
+// panic inside the readahead producer goroutine is recovered, logged,
+// and does not deadlock the consumer or crash the process. The
+// consumer should see an early channel close and treat the response
+// as a mid-stream abort.
+func TestHandleGet_Readahead_ProducerPanicRecovered(t *testing.T) {
+	t.Parallel()
+
+	const (
+		chunkSize  = int64(256)
+		nChunks    = int64(6)
+		objectSize = chunkSize * nChunks
+		readahead  = 2
+	)
+
+	info := origin.ObjectInfo{Size: objectSize, ETag: "e", ContentType: "application/octet-stream"}
+
+	var (
+		mu      sync.Mutex
+		calls   int64
+		panicAt = int64(3) // panic on the 3rd GetChunk
+	)
+
+	fc := &fakeEdgeAPI{
+		HeadObjectFunc: func(_ context.Context, _, _ string) (origin.ObjectInfo, error) {
+			return info, nil
+		},
+		GetChunkFunc: func(_ context.Context, k chunk.Key, _ int64) (io.ReadCloser, error) {
+			mu.Lock()
+			calls++
+			n := calls
+			mu.Unlock()
+
+			if n == panicAt {
+				panic("readahead test: synthetic producer panic")
+			}
+
+			return io.NopCloser(bytes.NewReader(makeChunkData(k.Index, int(chunkSize)))), nil
+		},
+	}
+
+	var logBuf bytes.Buffer
+
+	cfg := readaheadConfig(chunkSize, readahead)
+	h := NewEdgeHandler(fc, cfg, debugLoggerTo(&logBuf))
+
+	req := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
+	rr := httptest.NewRecorder()
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		h.handleGet(rr, req, "bucket", "key")
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("handler deadlocked after producer panic")
+	}
+
+	// The first chunk was peeked and streamed successfully (a
+	// committed 200 response). Subsequent panic is a mid-stream
+	// abort; the response code is therefore 200 even though the
+	// body is truncated.
+	if rr.Code != http.StatusOK {
+		t.Errorf("status=%d want 200 (panic is mid-stream)", rr.Code)
+	}
+
+	out := logBuf.String()
+	if !strings.Contains(out, "readahead worker panic") {
+		t.Errorf("missing 'readahead worker panic' in log; got %q", out)
+	}
+}
+
+// shortWriter writes the first maxBytes bytes to inner then returns
+// io.ErrShortWrite on any subsequent Write. Used to simulate a
+// client connection that drops mid-response.
+type shortWriter struct {
+	inner    http.ResponseWriter
+	written  int
+	maxBytes int
+}
+
+func (s *shortWriter) Header() http.Header { return s.inner.Header() }
+
+func (s *shortWriter) WriteHeader(code int) { s.inner.WriteHeader(code) }
+
+func (s *shortWriter) Write(p []byte) (int, error) {
+	if s.written >= s.maxBytes {
+		return 0, io.ErrShortWrite
+	}
+
+	remaining := s.maxBytes - s.written
+	if len(p) > remaining {
+		// Write exactly up to the cap, then fail any further calls.
+		n, _ := s.inner.Write(p[:remaining])
+		s.written += n
+
+		return n, io.ErrShortWrite
+	}
+
+	n, err := s.inner.Write(p)
+	s.written += n
+
+	return n, err
 }

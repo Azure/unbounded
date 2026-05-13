@@ -139,6 +139,51 @@ func IndexRange(start, end, chunkSize, objectSize int64) (first, last int64) {
 	return first, last
 }
 
+// Tier is one entry in the chunk-size policy: objects with size
+// >= MinObjectSize use ChunkSize, unless a higher-threshold tier
+// also matches (in which case the higher tier wins).
+//
+// Tiers form an ascending-threshold ladder that overrides a base
+// chunk size for sufficiently large objects, letting operators
+// trade per-chunk HTTP overhead against per-fill memory for big
+// blobs without changing the storage layout. See SizeFor for the
+// selection rule.
+type Tier struct {
+	MinObjectSize int64
+	ChunkSize     int64
+}
+
+// SizeFor returns the chunk size to use for an object of objectSize
+// bytes. tiers must be strictly ascending by MinObjectSize; callers
+// are responsible for validating this at config load time.
+// objectSize <= 0 (unknown) returns base unchanged so that callers
+// without a HEAD-resolved size still get a valid chunk size.
+//
+// Selection rule: walk tiers in ascending threshold order and pick
+// the last tier whose MinObjectSize <= objectSize. If no tier
+// matches (objectSize is smaller than the smallest threshold, or
+// tiers is empty), the base size is returned. Ties on a tier
+// boundary are inclusive of the lower bound: an object of size
+// exactly MinObjectSize uses that tier's ChunkSize.
+func SizeFor(objectSize, base int64, tiers []Tier) int64 {
+	if objectSize <= 0 {
+		return base
+	}
+
+	chosen := base
+
+	for _, t := range tiers {
+		if t.MinObjectSize > objectSize {
+			// Tiers are sorted ascending; no later tier can match.
+			break
+		}
+
+		chosen = t.ChunkSize
+	}
+
+	return chosen
+}
+
 // ChunkSlice returns the [off, len) within a single chunk that
 // satisfies the original client byte range [start, end].
 //

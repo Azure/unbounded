@@ -154,6 +154,29 @@ func TestApplyDefaults_FieldDefaults(t *testing.T) {
 			t.Errorf("%s: got %v want %v", ch.name, ch.got, ch.want)
 		}
 	}
+
+	// Tiers default to the documented 2-entry ladder. Compared
+	// separately since slice equality cannot use the table.
+	wantTiers := []ChunkTier{
+		{MinObjectSize: 1024 * 1024 * 1024, ChunkSize: 64 * 1024 * 1024},
+		{MinObjectSize: 10 * 1024 * 1024 * 1024, ChunkSize: 128 * 1024 * 1024},
+	}
+	if len(c.Chunking.Tiers) != len(wantTiers) {
+		t.Errorf("chunking.tiers length=%d want %d", len(c.Chunking.Tiers), len(wantTiers))
+	} else {
+		for i := range wantTiers {
+			if c.Chunking.Tiers[i] != wantTiers[i] {
+				t.Errorf("chunking.tiers[%d]=%+v want %+v",
+					i, c.Chunking.Tiers[i], wantTiers[i])
+			}
+		}
+	}
+	// Readahead defaults to a non-nil pointer to 8.
+	if c.Chunking.Readahead == nil {
+		t.Errorf("chunking.readahead is nil; expected default pointer")
+	} else if *c.Chunking.Readahead != 8 {
+		t.Errorf("chunking.readahead=%d want 8", *c.Chunking.Readahead)
+	}
 }
 
 // TestApplyDefaults_PreservesExplicitValues verifies that explicit
@@ -293,6 +316,207 @@ func TestLoad_Validate(t *testing.T) {
 				t.Errorf("error %q does not contain %q", err.Error(), tt.wantErr)
 			}
 		})
+	}
+}
+
+// TestValidateChunkingTiers_OK covers tier ladders that should pass
+// validation: empty (feature off), single tier, multi-tier strictly
+// ascending.
+func TestValidateChunkingTiers_OK(t *testing.T) {
+	t.Parallel()
+
+	cases := [][]ChunkTier{
+		nil,
+		{},
+		{{MinObjectSize: 1 << 30, ChunkSize: 64 << 20}},
+		{
+			{MinObjectSize: 1 << 30, ChunkSize: 64 << 20},
+			{MinObjectSize: 10 << 30, ChunkSize: 128 << 20},
+		},
+	}
+
+	for i, tiers := range cases {
+		if err := validateChunkingTiers(tiers); err != nil {
+			t.Errorf("case[%d] unexpected error: %v", i, err)
+		}
+	}
+}
+
+// TestValidateChunkingTiers_Errors covers the rejection paths: tiny
+// chunk size, zero / negative min object size, unsorted thresholds,
+// and duplicate thresholds (caught by the strict-ascending rule).
+func TestValidateChunkingTiers_Errors(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		tiers   []ChunkTier
+		wantErr string
+	}{
+		{
+			name: "chunk size below 1 MiB",
+			tiers: []ChunkTier{
+				{MinObjectSize: 1 << 30, ChunkSize: 1024},
+			},
+			wantErr: "chunk_size",
+		},
+		{
+			name: "zero min object size",
+			tiers: []ChunkTier{
+				{MinObjectSize: 0, ChunkSize: 64 << 20},
+			},
+			wantErr: "min_object_size",
+		},
+		{
+			name: "negative min object size",
+			tiers: []ChunkTier{
+				{MinObjectSize: -1, ChunkSize: 64 << 20},
+			},
+			wantErr: "min_object_size",
+		},
+		{
+			name: "unsorted ascending rejected",
+			tiers: []ChunkTier{
+				{MinObjectSize: 10 << 30, ChunkSize: 64 << 20},
+				{MinObjectSize: 1 << 30, ChunkSize: 128 << 20},
+			},
+			wantErr: "strictly ascending",
+		},
+		{
+			name: "duplicate min object size rejected",
+			tiers: []ChunkTier{
+				{MinObjectSize: 1 << 30, ChunkSize: 64 << 20},
+				{MinObjectSize: 1 << 30, ChunkSize: 128 << 20},
+			},
+			wantErr: "strictly ascending",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateChunkingTiers(tt.tiers)
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tt.wantErr)
+			}
+
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("error %q does not contain %q", err.Error(), tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestLoad_TiersAndReadahead drives validation through Load (full
+// YAML path) to ensure the tier rejection surfaces with the rich
+// error message and that an explicit readahead: 0 disables prefetch
+// (i.e. survives applyDefaults and is not bumped back to 8).
+func TestLoad_TiersAndReadahead(t *testing.T) {
+	t.Parallel()
+
+	t.Run("explicit_readahead_zero_preserved", func(t *testing.T) {
+		yaml := validAwss3YAML + "  readahead: 0\n"
+		path := writeTempYAML(t, yaml)
+
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+
+		if cfg.Chunking.Readahead == nil {
+			t.Fatalf("Readahead should be non-nil after applyDefaults")
+		}
+
+		if *cfg.Chunking.Readahead != 0 {
+			t.Errorf("Readahead=%d want 0 (explicit disable preserved)", *cfg.Chunking.Readahead)
+		}
+
+		if d := cfg.Chunking.ReadaheadDepth(); d != 0 {
+			t.Errorf("ReadaheadDepth()=%d want 0", d)
+		}
+	})
+
+	t.Run("explicit_empty_tiers_preserved", func(t *testing.T) {
+		yaml := validAwss3YAML + "  tiers: []\n"
+		path := writeTempYAML(t, yaml)
+
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		// Tiers explicitly set to [] should survive applyDefaults
+		// (the default ladder must not overwrite operator intent).
+		if len(cfg.Chunking.Tiers) != 0 {
+			t.Errorf("Tiers=%v want []; applyDefaults overwrote explicit empty",
+				cfg.Chunking.Tiers)
+		}
+
+		if cfg.Chunking.AsChunkTiers() != nil {
+			t.Errorf("AsChunkTiers() returned non-nil for empty tiers")
+		}
+	})
+
+	t.Run("unsorted_tiers_rejected", func(t *testing.T) {
+		yaml := validAwss3YAML + `  tiers:
+    - min_object_size: 10737418240
+      chunk_size: 67108864
+    - min_object_size: 1073741824
+      chunk_size: 134217728
+`
+		path := writeTempYAML(t, yaml)
+
+		_, err := Load(path)
+		if err == nil {
+			t.Fatalf("Load accepted unsorted tiers")
+		}
+
+		if !strings.Contains(err.Error(), "strictly ascending") {
+			t.Errorf("error %q does not mention strict ascending order", err.Error())
+		}
+	})
+
+	t.Run("negative_readahead_rejected", func(t *testing.T) {
+		yaml := validAwss3YAML + "  readahead: -1\n"
+		path := writeTempYAML(t, yaml)
+
+		_, err := Load(path)
+		if err == nil {
+			t.Fatalf("Load accepted negative readahead")
+		}
+
+		if !strings.Contains(err.Error(), "chunking.readahead") {
+			t.Errorf("error %q does not mention chunking.readahead", err.Error())
+		}
+	})
+}
+
+// TestChunking_AsChunkTiers covers the config -> chunk.Tier mapping
+// preserves order and field values, and returns nil for empty.
+func TestChunking_AsChunkTiers(t *testing.T) {
+	t.Parallel()
+
+	c := Chunking{
+		Size: 8 << 20,
+		Tiers: []ChunkTier{
+			{MinObjectSize: 1 << 30, ChunkSize: 64 << 20},
+			{MinObjectSize: 10 << 30, ChunkSize: 128 << 20},
+		},
+	}
+
+	got := c.AsChunkTiers()
+	if len(got) != 2 {
+		t.Fatalf("len=%d want 2", len(got))
+	}
+
+	if got[0].MinObjectSize != 1<<30 || got[0].ChunkSize != 64<<20 {
+		t.Errorf("got[0]=%+v", got[0])
+	}
+
+	if got[1].MinObjectSize != 10<<30 || got[1].ChunkSize != 128<<20 {
+		t.Errorf("got[1]=%+v", got[1])
+	}
+
+	if (Chunking{}).AsChunkTiers() != nil {
+		t.Errorf("empty Chunking.AsChunkTiers() should be nil")
 	}
 }
 
