@@ -26,7 +26,8 @@ fn noop_waker() -> Waker {
     fn raw() -> RawWaker {
         RawWaker::new(std::ptr::null(), &VTABLE)
     }
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(|_| raw(), |_| {}, |_| {}, |_| {});
+    static VTABLE: RawWakerVTable =
+        RawWakerVTable::new(|_| raw(), |_| {}, |_| {}, |_| {});
     // SAFETY: the vtable functions never dereference the data pointer.
     unsafe { Waker::from_raw(raw()) }
 }
@@ -189,7 +190,12 @@ impl Transport<TestReq> for MockTransport {
         Ok(())
     }
 
-    async fn bulk_get(&self, _req: &TestReq, src: BulkRef, dst: PageRef) -> Result<(), Error> {
+    async fn bulk_get(
+        &self,
+        _req: &TestReq,
+        src: BulkRef,
+        dst: PageRef,
+    ) -> Result<(), Error> {
         // Pend the configured number of polls (one polling round
         // per pend, decremented on each call).
         for _ in 0..*self.pend_polls.borrow() {
@@ -209,7 +215,9 @@ impl Transport<TestReq> for MockTransport {
 
         let base = self.base.borrow().expect("registered");
         let page_size = *self.page_size.borrow();
-        let dst_ptr = unsafe { base.add(dst.page_idx as usize * page_size + dst.offset as usize) };
+        let dst_ptr = unsafe {
+            base.add(dst.page_idx as usize * page_size + dst.offset as usize)
+        };
         // SAFETY: dst is a pool page, src is a Vec<u8>, both valid.
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr().add(start), dst_ptr, src.len as usize);
@@ -287,7 +295,9 @@ impl BlockStore for MockBlockStore {
         };
         let base = self.base.borrow().expect("registered");
         let page_size = *self.page_size.borrow();
-        let dst_ptr = unsafe { base.add(dst.page_idx as usize * page_size + dst.offset as usize) };
+        let dst_ptr = unsafe {
+            base.add(dst.page_idx as usize * page_size + dst.offset as usize)
+        };
         // SAFETY: dst is a pool page.
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst_ptr, bytes.len());
@@ -309,8 +319,9 @@ impl BlockStore for MockBlockStore {
         *self.writes.borrow_mut() += 1;
         let base = self.base.borrow().expect("registered");
         let page_size = *self.page_size.borrow();
-        let src_ptr =
-            unsafe { base.add(page.page_idx as usize * page_size + page.offset as usize) };
+        let src_ptr = unsafe {
+            base.add(page.page_idx as usize * page_size + page.offset as usize)
+        };
         let mut buf = vec![0u8; page.len as usize];
         // SAFETY: src is a pool page.
         unsafe {
@@ -366,7 +377,12 @@ impl Transport<TestReq> for TransportRc {
     ) -> Result<(), Error> {
         self.0.register_pages(base, page_size, page_count)
     }
-    async fn bulk_get(&self, req: &TestReq, src: BulkRef, dst: PageRef) -> Result<(), Error> {
+    async fn bulk_get(
+        &self,
+        req: &TestReq,
+        src: BulkRef,
+        dst: PageRef,
+    ) -> Result<(), Error> {
         self.0.bulk_get(req, src, dst).await
     }
 }
@@ -695,13 +711,7 @@ fn stream_limit_enforced() {
     let cfg = PoolConfig {
         max_concurrent_streams: 1,
     };
-    let pool = Pool::new(
-        cfg,
-        backing,
-        TransportRc(t.clone()),
-        BlockStoreRc(s.clone()),
-    )
-    .unwrap();
+    let pool = Pool::new(cfg, backing, TransportRc(t.clone()), BlockStoreRc(s.clone())).unwrap();
     let req = TestReq { key: key(0) };
     block_on(async {
         let s1 = pool.read(&req, 0, P as u64).await.unwrap();
