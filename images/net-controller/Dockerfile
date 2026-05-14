@@ -1,32 +1,31 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-# Combined Dockerfile for unbounded-net-controller and unbounded-net-node
-# Builds natively on each architecture (cross-compilation not supported for CGO on Azure Linux)
+# Combined Dockerfile for unbounded-net-controller and unbounded-net-node.
+# Builds natively on each target architecture (cross-compilation not
+# attempted because CGO is enabled).
 
 # =============================================================================
-# Build stage - builds natively on each target architecture
-# Uses Microsoft Go image for FIPS-compliant crypto and timely patch releases.
-# GO_VERSION is parsed from go.mod (major.minor) in CI.
+# Build stage - builds natively on each target architecture.
+# Upstream Go image on Debian bookworm. GO_VERSION is parsed from go.mod
+# (major.minor) in CI.
 # =============================================================================
 ARG GO_VERSION=1.26
-FROM mcr.microsoft.com/oss/go/microsoft/golang:${GO_VERSION}-azurelinux3.0 AS builder
+FROM docker.io/library/golang:${GO_VERSION}-bookworm AS builder
 
-# Override GOTOOLCHAIN=local set by the MCR base image so go can switch to
-# the toolchain version required by go.mod when the image patch lags behind.
-# MS_GOTOOLCHAIN_ALLOW_NON_LOCAL=1 is required by the Microsoft Go wrapper to
-# permit GOTOOLCHAIN values other than "local".
-ENV GOTOOLCHAIN=auto \
-    MS_GOTOOLCHAIN_ALLOW_NON_LOCAL=1
+# Standard Go images set GOTOOLCHAIN=auto by default, which lets `go` switch
+# to the toolchain version required by go.mod if it is newer than the image.
 
-# Install build dependencies (Go is provided by the base image)
-RUN tdnf upgrade -y \
-    && tdnf install -y \
-    ca-certificates git make curl tar which \
-    binutils gcc glibc-devel kernel-headers \
-    pkgconfig libcap-devel openssl-devel \
-    clang lld libbpf-devel \
-    && tdnf clean all
+# Install build dependencies (Go is provided by the base image).
+# bpftool is copied into the runtime image since Ubuntu 24.04 no longer
+# packages it as a standalone binary.
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ca-certificates git make curl tar \
+        binutils gcc libc6-dev linux-libc-dev \
+        pkg-config libcap-dev libssl-dev \
+        clang lld libbpf-dev bpftool \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
 
@@ -82,9 +81,9 @@ RUN clang -O2 -g -target bpf \
     -c bpf/unbounded_encap.c \
     -o internal/net/ebpf/unbounded_encap_bpfel.o
 
-# Build both binaries with CGO enabled (required for Microsoft Go FIPS crypto)
-# Cache mounts persist Go module cache and build cache across builds
-# Build cache is per-architecture to avoid conflicts
+# Build all binaries with CGO enabled (needed for runtime deps such as
+# sqlite). Cache mounts persist the Go module cache and per-arch build
+# cache across builds.
 ARG VERSION=dev
 ARG GIT_COMMIT=unknown
 ARG BUILD_TIME=unknown
@@ -93,7 +92,7 @@ ENV STAMP_LDFLAGS="-s -w \
     -X github.com/Azure/unbounded/internal/version.GitCommit=${GIT_COMMIT} \
     -X github.com/Azure/unbounded/internal/version.BuildTime=${BUILD_TIME}"
 RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/ms-go-build,id=go-build-${TARGETARCH} \
+    --mount=type=cache,target=/root/.cache/go-build,id=go-build-${TARGETARCH} \
     CGO_ENABLED=1 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
     -ldflags="${STAMP_LDFLAGS}" \
     -o /unbounded-net-controller \
@@ -112,26 +111,32 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     ./cmd/unroute
 
 # =============================================================================
-# Shared runtime base image - contains all packages needed by both images
-# This is the only stage that runs under QEMU for arm64
+# Shared runtime base image - contains all packages needed by both images.
+# This is the only stage that runs under QEMU for arm64.
 # =============================================================================
-FROM mcr.microsoft.com/azurelinux/base/core:3.0 AS runtime-base
+FROM docker.io/library/ubuntu:24.04 AS runtime-base
 
-# Install all packages needed by both controller and node in a single tdnf call
+# Install all packages needed by both controller and node in a single apt call.
 # - ca-certificates: TLS support (both)
-# - shadow-utils: user management (both)
+# - passwd: shadow-utils equivalent for groupadd/useradd (both)
 # - wireguard-tools: WireGuard support (node)
-# - iproute: ip command (node)
+# - iproute2: ip command (node)
 # - iptables: iptables/ip6tables for masquerade rules (node)
 # - util-linux: nsenter for host namespace sysctl setup (node init)
-# - hostname: provides the hostname binary in Azure Linux runtime images
-RUN tdnf upgrade -y \
-    && tdnf install -y \
-    ca-certificates shadow-utils iproute iptables util-linux hostname which wget tcpdump iputils \
-    libatomic libcap openssl vim bpftool \
-    procps-ng less sqlite-libs tar gzip jq python3 bind-utils \
-    && tdnf install -y --setopt=tsflags=noscripts wireguard-tools \
-    && tdnf clean all
+# - hostname: hostname binary
+# - bpftool: eBPF map/program inspection (node)
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ca-certificates passwd iproute2 iptables util-linux hostname \
+        wget tcpdump iputils-ping \
+        libatomic1 libcap2 openssl vim \
+        procps less libsqlite3-0 tar gzip jq python3 dnsutils \
+        wireguard-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy bpftool from the build image (Ubuntu 24.04 does not package it
+# as a standalone binary).
+COPY --from=builder /usr/sbin/bpftool /usr/sbin/bpftool
 
 # Ensure /sbin and /usr/sbin are in PATH for ip command
 ENV PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
