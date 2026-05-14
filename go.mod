@@ -50,7 +50,7 @@ require (
 	github.com/lib/pq v1.12.3
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/opencontainers/umoci v0.6.0
-	github.com/oracle/oci-go-sdk/v65 v65.114.1
+	github.com/oracle/oci-go-sdk/v65 v65.114.2
 	github.com/pin/tftp/v3 v3.2.0
 	github.com/prometheus/client_golang v1.23.2
 	github.com/spf13/cobra v1.10.2
@@ -64,7 +64,7 @@ require (
 	golang.org/x/sys v0.43.0
 	golang.org/x/term v0.42.0
 	golang.zx2c4.com/wireguard/wgctrl v0.0.0-20241231184526-a9ab2273dd10
-	google.golang.org/grpc v1.81.0
+	google.golang.org/grpc v1.81.1
 	google.golang.org/protobuf v1.36.11
 	gopkg.in/yaml.v3 v3.0.1
 	k8s.io/api v0.35.4
@@ -74,7 +74,7 @@ require (
 	k8s.io/klog/v2 v2.130.1
 	k8s.io/kube-aggregator v0.35.4
 	k8s.io/utils v0.0.0-20251002143259-bc988d571ff4
-	modernc.org/sqlite v1.50.0
+	modernc.org/sqlite v1.50.1
 	oras.land/oras-go/v2 v2.6.0
 	sigs.k8s.io/controller-runtime v0.23.3
 	sigs.k8s.io/yaml v1.6.0
@@ -234,7 +234,7 @@ require (
 	k8s.io/code-generator v0.35.4 // indirect
 	k8s.io/gengo/v2 v2.0.0-20250922181213-ec3ebc5fd46b // indirect
 	k8s.io/kube-openapi v0.0.0-20250910181357-589584f1c912 // indirect
-	modernc.org/libc v1.72.0 // indirect
+	modernc.org/libc v1.72.3 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 	sigs.k8s.io/controller-tools v0.20.1 // indirect
