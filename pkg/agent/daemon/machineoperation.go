@@ -13,13 +13,13 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/util/retry"
-
-	machinav1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	machinav1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
 
 // MachineOperationHandlers maps operation kinds to host-local MachineOperation handlers.

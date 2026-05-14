@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -15,14 +16,14 @@ import (
 func TestControllerRuntimeReconcilerDispatchesOperationRequest(t *testing.T) {
 	t.Parallel()
 
-	reconciler := &recordingReconciler{operationResult: ctrl.Result{Requeue: true}}
+	reconciler := &recordingReconciler{operationResult: ctrl.Result{RequeueAfter: time.Second}}
 	r := &controllerRuntimeReconciler{machineOperations: reconciler, repaves: &recordingReconciler{}}
 
 	result, err := r.Reconcile(context.Background(), NewMachineOperationRequest("op-1"))
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if !result.Requeue {
+	if result.RequeueAfter == 0 {
 		t.Fatalf("result = %v, want requeue", result)
 	}
 	if reconciler.operationName != "op-1" {
@@ -33,14 +34,14 @@ func TestControllerRuntimeReconcilerDispatchesOperationRequest(t *testing.T) {
 func TestControllerRuntimeReconcilerDispatchesRepaveRequest(t *testing.T) {
 	t.Parallel()
 
-	reconciler := &recordingReconciler{repaveResult: ctrl.Result{Requeue: true}}
+	reconciler := &recordingReconciler{repaveResult: ctrl.Result{RequeueAfter: time.Second}}
 	r := &controllerRuntimeReconciler{machineOperations: &recordingReconciler{}, repaves: reconciler}
 
 	result, err := r.Reconcile(context.Background(), NewRepaveRequest("node-delete"))
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if !result.Requeue {
+	if result.RequeueAfter == 0 {
 		t.Fatalf("result = %v, want requeue", result)
 	}
 	if !reconciler.repaveCalled {

@@ -6,9 +6,10 @@ package daemon
 import (
 	"context"
 
-	machinav1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
+
+	machinav1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
 
 // MachineOperation is a typed host-local daemon operation request.

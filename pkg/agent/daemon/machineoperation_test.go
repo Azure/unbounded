@@ -7,8 +7,8 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
-	machinav1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -16,6 +16,8 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	machinav1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
 
 func TestNewMachinaMachineOperationReconcilerValidatesInputs(t *testing.T) {
@@ -49,7 +51,7 @@ func TestMachinaMachineOperationReconcilerDispatchesTarget(t *testing.T) {
 		},
 	}
 	machine := &machinav1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "machine-1", Generation: 7}}
-	target := &recordingMachineOperationTargetState{result: ctrl.Result{Requeue: true}}
+	target := &recordingMachineOperationTargetState{result: ctrl.Result{RequeueAfter: time.Second}}
 	reconciler, err := NewMachinaMachineOperationReconciler(
 		fakeMachineOperationClient(machine, op),
 		"machine-1",
@@ -64,7 +66,7 @@ func TestMachinaMachineOperationReconcilerDispatchesTarget(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReconcileMachineOperation: %v", err)
 	}
-	if !result.Requeue {
+	if result.RequeueAfter == 0 {
 		t.Fatalf("result = %v, want requeue", result)
 	}
 	if !target.called || target.operation.Name != "op-1" {
