@@ -610,24 +610,26 @@ metalman-oci-push: metalman-oci ## Build and push the metalman container image
 
 image-net-controller-local: net-frontend resources/cni-plugins-linux-$(HOST_GOARCH)-$(CNI_PLUGINS_VERSION).tgz ## Build the unbounded-net-controller image locally (single-arch)
 	$(CONTAINER_ENGINE) build \
+		$(if $(PLATFORMS),--platform=$(PLATFORMS),) \
 		--target controller \
 		--build-arg VERSION=$(VERSION) \
 		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
 		--build-arg BUILD_TIME=$(BUILD_TIME) \
 		--build-arg CNI_PLUGINS_VERSION=$(CNI_PLUGINS_VERSION) \
 		-t $(NET_CONTROLLER_IMAGE) \
-		-f ./images/net-controller/Dockerfile .
+		-f ./images/net/Containerfile .
 	$(call trivy-maybe,$(NET_CONTROLLER_IMAGE))
 
 image-net-node-local: resources/cni-plugins-linux-$(HOST_GOARCH)-$(CNI_PLUGINS_VERSION).tgz ## Build the unbounded-net-node image locally (single-arch)
 	$(CONTAINER_ENGINE) build \
+		$(if $(PLATFORMS),--platform=$(PLATFORMS),) \
 		--target node \
 		--build-arg VERSION=$(VERSION) \
 		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
 		--build-arg BUILD_TIME=$(BUILD_TIME) \
 		--build-arg CNI_PLUGINS_VERSION=$(CNI_PLUGINS_VERSION) \
 		-t $(NET_NODE_IMAGE) \
-		-f ./images/net-node/Dockerfile .
+		-f ./images/net/Containerfile .
 	$(call trivy-maybe,$(NET_NODE_IMAGE))
 
 image-net-controller-push: image-net-controller-local ## Build and push the unbounded-net-controller image
