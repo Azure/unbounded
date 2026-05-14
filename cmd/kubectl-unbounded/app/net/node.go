@@ -869,7 +869,7 @@ func fetchStatusViaPortForward(
 	// Request an HMAC viewer token for authentication. When port-forwarding
 	// directly to the controller pod, the API server front-proxy is bypassed
 	// so the controller requires an HMAC token.
-	if viewerToken, tokenErr := requestViewerToken(cfg); tokenErr == nil {
+	if viewerToken, _, tokenErr := requestViewerToken(cfg); tokenErr == nil {
 		req.Header.Set("Authorization", "Bearer "+viewerToken)
 	}
 

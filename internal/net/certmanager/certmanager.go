@@ -35,7 +35,7 @@ const (
 	defaultCAConfigMap   = "unbounded-net-serving-ca"
 	rotationThreshold    = 30 * 24 * time.Hour  // rotate server cert when within 30 days of expiry
 	caRotationThreshold  = 365 * 24 * time.Hour // rotate CA when within 1 year of expiry
-	monitorInterval      = 24 * time.Hour
+	monitorInterval      = 5 * time.Minute
 	caValidityDuration   = 10 * 365 * 24 * time.Hour // 10 years
 	certValidityDuration = 365 * 24 * time.Hour      // 1 year
 )
@@ -127,7 +127,7 @@ func (cm *CertManager) EnsureCertificate(ctx context.Context) error {
 		return cm.rotateCertificate(ctx)
 	}
 
-	if !cm.validateCertificate(leaf) {
+	if !cm.validateCertificate(leaf, cm.currentServiceIPs(ctx)) {
 		klog.Infof("Server certificate validation failed, rotating")
 		return cm.rotateCertificate(ctx)
 	}
@@ -239,7 +239,7 @@ func (cm *CertManager) RunRotationMonitor(ctx context.Context) {
 				continue
 			}
 
-			if !cm.validateCertificate(leaf) {
+			if !cm.validateCertificate(leaf, cm.currentServiceIPs(ctx)) {
 				klog.Infof("Certificate needs rotation, initiating")
 
 				if err := cm.rotateCertificate(ctx); err != nil {
@@ -271,13 +271,20 @@ func (cm *CertManager) rotateCertificate(ctx context.Context) error {
 	}
 
 	now := time.Now()
+	// Look up current service IPs for IP SANs. Failures are non-fatal -
+	// the cert will still have DNS SANs and will work for DNS-based access.
+	ipSANs, ipErr := cm.serviceIPs(ctx)
+	if ipErr != nil {
+		klog.Warningf("Could not look up service IPs for certificate SANs: %v", ipErr)
+	}
+
 	serverTemplate := &x509.Certificate{
 		SerialNumber: serialNumber,
 		Subject: pkix.Name{
 			CommonName: fmt.Sprintf("%s.%s.svc", cm.serviceName, cm.namespace),
 		},
 		DNSNames:              cm.dnsNames(),
-		IPAddresses:           cm.serviceIPs(ctx),
+		IPAddresses:           ipSANs,
 		NotBefore:             now.Add(-1 * time.Hour),
 		NotAfter:              now.Add(certValidityDuration),
 		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
@@ -515,13 +522,31 @@ func (cm *CertManager) dnsNames() []string {
 	}
 }
 
+// currentServiceIPs looks up the ClusterIP(s) of the controller service,
+// returning nil on lookup failure (which skips IP validation rather than
+// triggering spurious rotations from transient API errors).
+func (cm *CertManager) currentServiceIPs(ctx context.Context) []net.IP {
+	ips, err := cm.serviceIPs(ctx)
+	if err != nil {
+		klog.V(2).Infof("Skipping IP SAN validation: %v", err)
+		return nil
+	}
+
+	return ips
+}
+
 // serviceIPs looks up the ClusterIP(s) of the controller service and returns
 // them as net.IP values for use as IP SANs in the serving certificate.
-func (cm *CertManager) serviceIPs(ctx context.Context) []net.IP {
+// It returns an error if the service cannot be looked up.
+func (cm *CertManager) serviceIPs(ctx context.Context) ([]net.IP, error) {
 	svc, err := cm.clientset.CoreV1().Services(cm.namespace).Get(ctx, cm.serviceName, metav1.GetOptions{})
 	if err != nil {
-		klog.V(2).Infof("Could not look up service %s/%s for IP SANs: %v", cm.namespace, cm.serviceName, err)
-		return nil
+		return nil, fmt.Errorf("could not look up service %s/%s: %w", cm.namespace, cm.serviceName, err)
+	}
+
+	// Headless services have ClusterIP "None" - no IP SANs needed.
+	if svc.Spec.ClusterIP == "None" || svc.Spec.ClusterIP == "" {
+		return nil, nil
 	}
 
 	var ips []net.IP
@@ -531,7 +556,7 @@ func (cm *CertManager) serviceIPs(ctx context.Context) []net.IP {
 
 	for _, cipStr := range svc.Spec.ClusterIPs {
 		if ip := net.ParseIP(cipStr); ip != nil {
-			// Deduplicate against the primary ClusterIP.
+			// Deduplicate against already-collected IPs.
 			dup := false
 
 			for _, existing := range ips {
@@ -556,12 +581,14 @@ func (cm *CertManager) serviceIPs(ctx context.Context) []net.IP {
 		klog.Infof("Including service ClusterIP(s) as IP SANs: %v", names)
 	}
 
-	return ips
+	return ips, nil
 }
 
 // validateCertificate checks that the certificate is not expired, not expiring
-// within the rotation threshold, and contains the expected DNS SANs.
-func (cm *CertManager) validateCertificate(cert *x509.Certificate) bool {
+// within the rotation threshold, contains the expected DNS SANs, and contains
+// the expected IP SANs. expectedIPs may be nil to skip IP validation (e.g.
+// when the service lookup failed).
+func (cm *CertManager) validateCertificate(cert *x509.Certificate, expectedIPs []net.IP) bool {
 	now := time.Now()
 
 	if now.After(cert.NotAfter) {
@@ -587,6 +614,23 @@ func (cm *CertManager) validateCertificate(cert *x509.Certificate) bool {
 		if !certDNS[expected] {
 			klog.Infof("Certificate missing expected DNS SAN: %s", expected)
 			return false
+		}
+	}
+
+	// Validate IP SANs when expected IPs are known (non-nil).
+	// A nil slice means the service lookup failed or wasn't attempted,
+	// so we skip IP validation to avoid spurious rotations.
+	if expectedIPs != nil {
+		certIPs := make(map[string]bool)
+		for _, ip := range cert.IPAddresses {
+			certIPs[ip.String()] = true
+		}
+
+		for _, expected := range expectedIPs {
+			if !certIPs[expected.String()] {
+				klog.Infof("Certificate missing expected IP SAN: %s", expected.String())
+				return false
+			}
 		}
 	}
 
