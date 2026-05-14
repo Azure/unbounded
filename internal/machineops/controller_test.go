@@ -18,6 +18,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
@@ -83,6 +84,7 @@ func TestMachineOperationReconciler_BuildsReplaceUserData(t *testing.T) {
 	require.Len(t, provider.replaceUserData, 1)
 	require.Contains(t, provider.replaceUserData[0], "#cloud-config")
 	require.Contains(t, provider.replaceUserData[0], "abc123.secret456")
+	require.Contains(t, provider.replaceUserData[0], `"NodeName": "machine-1"`)
 
 	var updated unboundedv1alpha3.MachineOperation
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
@@ -144,6 +146,61 @@ func TestMachineOperationReconciler_ReexecutesInProgressHostReplace(t *testing.T
 	var updated unboundedv1alpha3.MachineOperation
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
 	require.Equal(t, unboundedv1alpha3.OperationPhaseComplete, updated.Status.Phase)
+}
+
+func TestMachineOperationReconciler_PatchesReplacementProviderIDBeforeCleanup(t *testing.T) {
+	t.Parallel()
+
+	s := newOperationTestScheme(t)
+	require.NoError(t, corev1.AddToScheme(s))
+
+	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderOCIInstance)
+	machine.Spec.ProviderID = "oci://old-instance"
+	machine.Spec.Kubernetes = &unboundedv1alpha3.KubernetesSpec{BootstrapTokenRef: unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-test"}}
+	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReplace)
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: metav1.NamespaceSystem, Name: "bootstrap-token-test"},
+		Data: map[string][]byte{
+			"token-id":     []byte("abc123"),
+			"token-secret": []byte("secret456"),
+		},
+	}
+	provider := &recordingProvider{
+		provider:  unboundedv1alpha3.ExternalProviderOCIInstance,
+		supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReplace: true},
+		result:    OperationResult{ProviderID: "oci://new-instance", CleanupProviderID: "oci://old-instance"},
+	}
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, secret).WithStatusSubresource(op).WithInterceptorFuncs(interceptor.Funcs{
+		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if err := c.Patch(ctx, obj, patch, opts...); err != nil {
+				return err
+			}
+
+			if updated, ok := obj.(*unboundedv1alpha3.Machine); ok {
+				updated.Generation = 2
+				return c.Update(ctx, updated)
+			}
+
+			return nil
+		},
+	}).Build()
+	reconciler := &MachineOperationReconciler{Client: c, Providers: []Provider{provider}, Now: fixedOperationNow, ClusterInfo: testClusterInfo()}
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "op-1"}})
+	require.NoError(t, err)
+	require.Equal(t, ctrl.Result{}, result)
+
+	var updatedMachine unboundedv1alpha3.Machine
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "machine-1"}, &updatedMachine))
+	require.Equal(t, "oci://new-instance", updatedMachine.Spec.ProviderID)
+	require.Equal(t, []string{"HostReplace:machine-1:oci://old-instance"}, provider.calls)
+	require.Equal(t, []string{"HostReplace:machine-1:oci://old-instance"}, provider.cleanupCalls)
+
+	var updatedOp unboundedv1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updatedOp))
+	require.Equal(t, unboundedv1alpha3.OperationPhaseComplete, updatedOp.Status.Phase)
+	require.Equal(t, int64(2), updatedOp.Status.ObservedMachineGeneration)
 }
 
 func TestMachineOperationReconciler_UnsupportedOperationIsIgnored(t *testing.T) {
@@ -312,8 +369,11 @@ type recordingProvider struct {
 	provider        string
 	supported       map[unboundedv1alpha3.OperationKind]bool
 	calls           []string
+	cleanupCalls    []string
 	replaceUserData []string
+	result          OperationResult
 	err             error
+	cleanupErr      error
 }
 
 func (p *recordingProvider) Name() string {
@@ -324,13 +384,18 @@ func (p *recordingProvider) Supports(operation unboundedv1alpha3.OperationKind) 
 	return p.supported[operation]
 }
 
-func (p *recordingProvider) Execute(_ context.Context, request OperationRequest) error {
+func (p *recordingProvider) Execute(_ context.Context, request OperationRequest) (OperationResult, error) {
 	p.calls = append(p.calls, fmt.Sprintf("%s:%s:%s", request.Operation, request.Machine.Name, request.ProviderID))
 	if request.ReplaceUserData != "" {
 		p.replaceUserData = append(p.replaceUserData, request.ReplaceUserData)
 	}
 
-	return p.err
+	return p.result, p.err
+}
+
+func (p *recordingProvider) Cleanup(_ context.Context, request OperationRequest, result OperationResult) error {
+	p.cleanupCalls = append(p.cleanupCalls, fmt.Sprintf("%s:%s:%s", request.Operation, request.Machine.Name, result.CleanupProviderID))
+	return p.cleanupErr
 }
 
 func newOperationTestScheme(t *testing.T) *runtime.Scheme {
