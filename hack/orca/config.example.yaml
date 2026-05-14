@@ -1,0 +1,398 @@
+# Orca origin cache - annotated reference configuration.
+#
+# This file documents every Orca config knob, its default, its
+# acceptable values, and the production-vs-dev nuances. It is also a
+# working configuration: as written it points at the in-cluster dev
+# harness (`make orca-up` brings up LocalStack + Azurite + Orca on
+# kind) so an operator can:
+#
+#   cp hack/orca/config.example.yaml ~/my-orca.yaml
+#   $EDITOR ~/my-orca.yaml
+#   orca -config ~/my-orca.yaml
+#
+# Loading rules:
+#   - `config.Load(path)` parses YAML, applies defaults for fields
+#     left at zero-value, then runs validate().
+#   - Fields marked REQUIRED below are rejected by validate() when
+#     empty (with one exception: cluster.self_pod_ip, which is
+#     populated from the POD_IP environment variable in the standard
+#     Kubernetes deployment).
+#   - Secrets-bearing fields (origin.{azureblob,awss3} keys,
+#     cachestore.s3 keys) intentionally fall back to environment
+#     variables; production deployments mount a Kubernetes Secret as
+#     envFrom and leave the YAML fields blank. See "Environment
+#     variable fallbacks" below.
+#
+# Environment variable fallbacks (applied by applyDefaults when the
+# corresponding YAML field is empty):
+#   - POD_IP                        -> cluster.self_pod_ip
+#   - ORCA_AZUREBLOB_ACCOUNT_KEY    -> origin.azureblob.account_key
+#   - ORCA_AWSS3_ACCESS_KEY         -> origin.awss3.access_key
+#   - ORCA_AWSS3_SECRET_KEY         -> origin.awss3.secret_key
+#   - ORCA_CACHESTORE_S3_ACCESS_KEY -> cachestore.s3.access_key
+#   - ORCA_CACHESTORE_S3_SECRET_KEY -> cachestore.s3.secret_key
+#
+# Runtime override:
+#   - ORCA_LOG_LEVEL, if set and non-empty at process start, wins
+#     over logging.level in this file.
+#
+# Cross-references:
+#   - internal/orca/config/config.go - canonical schema source.
+#   - designs/orca/design.md         - architecture and semantics
+#                                      (bounded staleness, atomic
+#                                      commit, stampede protection).
+#   - deploy/orca/03-config.yaml.tmpl - production ConfigMap template
+#                                       (a templated subset of this
+#                                       file's surface).
+#   - hack/orca/.env.example         - environment file consumed by
+#                                      the dev harness Makefile; it
+#                                      drives the renderer for the
+#                                      template above, not this file.
+
+# =============================================================================
+# server: client-edge listener + ops listener.
+# =============================================================================
+server:
+  # Bind address for the client-facing S3-compatible API.
+  # Type:    string (host:port).
+  # Default: "0.0.0.0:8443".
+  listen: "0.0.0.0:8443"
+
+  # Bind address for the operations listener (/healthz, /readyz).
+  # Plain HTTP, no auth. Kubelet liveness and readiness probes target
+  # this address; production Service objects do not forward this port
+  # externally.
+  # Type:    string (host:port).
+  # Default: "0.0.0.0:8442".
+  ops_listen: "0.0.0.0:8442"
+
+  auth:
+    # Whether the client-edge listener enforces authentication.
+    # NOTE: the hook is wired but not yet enforced - even with
+    # enabled: true the handler does not actually validate bearer
+    # tokens or mTLS client certs today. Production deployments rely
+    # on Kubernetes NetworkPolicy (or equivalent) for access control.
+    # Type:    bool.
+    # Default: false.
+    # Production: set true once authentication is implemented.
+    enabled: false
+
+    # Authentication scheme. Only "bearer" and "mtls" are intended
+    # values; neither is enforced today.
+    # Type:    string ("bearer" | "mtls").
+    # Default: "" (no validation).
+    mode: ""
+
+    # Path inside the container to a file containing the HMAC secret
+    # used by the bearer-token verifier. Unused until auth is wired.
+    # Type:    string (filesystem path).
+    # Default: "".
+    bearer_secret_file: ""
+
+# =============================================================================
+# origin: upstream blob store. Orca only reads from it.
+# =============================================================================
+origin:
+  # Stable identifier baked into every chunk's storage path. Changing
+  # this value makes previously-cached chunks unreachable (by design);
+  # treat it as the cache namespace for this origin configuration.
+  # Type:     string.
+  # Required: yes.
+  # Example:  "awss3-localstack" for the dev harness; in production,
+  #           something like "azureblob-prod-westus2".
+  id: "awss3-localstack"
+
+  # Which origin adapter to use.
+  # Type:    string ("azureblob" | "awss3").
+  # Default: "azureblob".
+  driver: awss3
+
+  # Cluster-wide cap on concurrent in-flight Origin.GetRange calls.
+  # The per-replica cap is floor(target_global / cluster.target_replicas);
+  # if origin.target_global < cluster.target_replicas the config is
+  # rejected at validate time.
+  # Type:    int.
+  # Default: 192.
+  target_global: 192
+
+  # How long a fill is willing to wait for an origin semaphore slot
+  # before failing the fill. Bounds queue depth under overload.
+  # Type:    duration (e.g. "5s", "500ms").
+  # Default: 5s.
+  queue_timeout: 5s
+
+  retry:
+    # Maximum origin GET attempts in the pre-header retry window.
+    # OriginETagChangedError and ErrNotFound are not retried.
+    # Type:    int.
+    # Default: 3.
+    attempts: 3
+
+    # Initial backoff between retry attempts (doubled each retry,
+    # capped at backoff_max).
+    # Type:    duration.
+    # Default: 100ms.
+    backoff_initial: 100ms
+
+    # Upper bound on the exponential backoff per attempt.
+    # Type:    duration.
+    # Default: 2s.
+    backoff_max: 2s
+
+    # Wall-clock ceiling for the entire pre-header retry budget. Once
+    # exhausted, the client receives 502 OriginUnreachable. All retries
+    # happen before any byte is sent to the client.
+    # Type:    duration.
+    # Default: 5s.
+    max_total_duration: 5s
+
+  # --- azureblob driver (consumed only when driver: azureblob). ---
+  azureblob:
+    # Azure Blob storage account name (the "<name>" in
+    # https://<name>.blob.core.windows.net/).
+    # Type:     string.
+    # Required: yes when driver: azureblob (validate rejects empty).
+    # Example:  "devstoreaccount1" for Azurite; your account name in
+    #           production.
+    account: ""
+
+    # Shared-key access secret. Leave blank to source from the
+    # ORCA_AZUREBLOB_ACCOUNT_KEY environment variable (production
+    # injects via a Kubernetes Secret + envFrom).
+    # Type:    string.
+    # Default: "" (env-var fallback).
+    account_key: ""
+
+    # Storage container within the account.
+    # Type:     string.
+    # Required: yes when driver: azureblob.
+    container: ""
+
+    # Optional service-URL override. Set when targeting Azurite (dev)
+    # or any non-default endpoint; leave blank for real Azure.
+    # Type:    string (URL).
+    # Default: ""
+    # Example: "http://azurite.unbounded-kube.svc.cluster.local:10000/devstoreaccount1/"
+    #          for the in-cluster Azurite from the dev harness.
+    endpoint: ""
+
+  # --- awss3 driver (consumed only when driver: awss3). ---
+  awss3:
+    # S3 endpoint override. Empty targets real AWS S3 (auto-region).
+    # Type:    string (URL).
+    # Default: "".
+    endpoint: "http://localstack.unbounded-kube.svc.cluster.local:4566"
+
+    # S3 region.
+    # Type:    string.
+    # Default: "us-east-1".
+    region: us-east-1
+
+    # Source bucket.
+    # Type:     string.
+    # Required: yes when driver: awss3.
+    bucket: orca-origin
+
+    # AWS access key. Leave blank to source from the
+    # ORCA_AWSS3_ACCESS_KEY environment variable.
+    access_key: ""
+
+    # AWS secret key. Leave blank to source from the
+    # ORCA_AWSS3_SECRET_KEY environment variable.
+    secret_key: ""
+
+    # true selects path-style addressing (http://host/bucket/key) -
+    # required for LocalStack and most S3-compatible test backends.
+    # Real AWS S3 expects this to be false.
+    # Type:    bool.
+    # Default: false.
+    use_path_style: true
+
+# =============================================================================
+# cachestore: in-DC chunk store. Source of truth for what's cached.
+# =============================================================================
+cachestore:
+  # Cachestore driver. Only "s3" is implemented in v1.
+  # Type:    string ("s3").
+  # Default: "s3".
+  driver: s3
+
+  s3:
+    # S3 endpoint. Required.
+    # Type:     string (URL).
+    # Required: yes.
+    # Example:  the in-DC S3-compatible store URL (VAST etc.) in
+    #           production; the dev-harness LocalStack URL below.
+    endpoint: "http://localstack.unbounded-kube.svc.cluster.local:4566"
+
+    # Cachestore bucket. Required.
+    # NOTE: at boot the s3 driver calls GetBucketVersioning and
+    # refuses to start if the bucket has versioning enabled or
+    # suspended - several S3-compatible backends silently break
+    # `PutObject If-None-Match: *` on versioned buckets, which would
+    # corrupt the atomic-commit primitive. See designs/orca/design.md
+    # section 8 for details.
+    # Type:     string.
+    # Required: yes.
+    bucket: orca-cache
+
+    # Region.
+    # Type:    string.
+    # Default: "us-east-1".
+    region: us-east-1
+
+    # See origin.awss3.access_key for the env-var fallback rule. The
+    # cachestore credential pair is sourced from
+    # ORCA_CACHESTORE_S3_ACCESS_KEY / ORCA_CACHESTORE_S3_SECRET_KEY.
+    access_key: ""
+    secret_key: ""
+
+    # true for LocalStack and most S3-compatible backends.
+    # Type:    bool.
+    # Default: false.
+    use_path_style: true
+
+# =============================================================================
+# cluster: peer discovery + internal-RPC listener.
+# =============================================================================
+cluster:
+  # Headless Kubernetes Service FQDN whose A-record returns peer Pod
+  # IPs. Polled every membership_refresh.
+  # Type:     string (DNS name).
+  # Required: yes.
+  service: "orca-peers.unbounded-kube.svc.cluster.local"
+
+  # DNS poll interval for peer discovery.
+  # Type:    duration.
+  # Default: 5s.
+  membership_refresh: 5s
+
+  # Bind address for the internal-fill RPC listener
+  # (GET /internal/fill?<chunk-key>). Plain HTTP/2 in dev; mTLS
+  # in production (see internal_tls below).
+  # Type:    string (host:port).
+  # Default: "0.0.0.0:8444".
+  internal_listen: "0.0.0.0:8444"
+
+  internal_tls:
+    # mTLS posture for the internal-fill listener.
+    # CAVEAT: the runtime refuses to start with enabled: true today -
+    # the TLS plumbing is not yet implemented and refusing to start
+    # prevents a silent security downgrade (see
+    # internal/orca/cluster/cluster.go: newHTTPClient). Leave false
+    # for now; production isolation is via Kubernetes NetworkPolicy.
+    # Type:    bool.
+    # Default: false.
+    enabled: false
+
+    # Paths to the certificate, key, CA bundle, and the SNI server
+    # name presented during the handshake. Unused until mTLS is wired.
+    cert_file: ""
+    key_file: ""
+    ca_file: ""
+
+    # SNI / cert validation host name.
+    # Type:    string.
+    # Default: "orca.<ns>.svc".
+    server_name: "orca.unbounded-kube.svc"
+
+  # Number of replicas in the Deployment. Used to size the per-replica
+  # origin concurrency cap as floor(origin.target_global / target_replicas).
+  # Must match the actual ReplicaSet size for the cap math to hold; if
+  # they diverge under autoscaling, the cluster-wide cap is approximate.
+  # Type:     int (>= 1).
+  # Default:  3.
+  target_replicas: 3
+
+  # IP address the replica reports for itself in the peer set. Leave
+  # empty to inherit from the POD_IP environment variable (which the
+  # standard Deployment populates via downward API).
+  # Type:     string (IP).
+  # Required: yes (validate rejects empty after POD_IP fallback).
+  # Default:  "" (POD_IP env fallback).
+  self_pod_ip: ""
+
+# =============================================================================
+# chunk_catalog: in-memory presence cache (chunk -> "yes, in cachestore").
+# =============================================================================
+chunk_catalog:
+  # Soft cap on tracked chunks. Backed by an LRU; over-capacity
+  # entries are evicted (a forgotten entry just costs one extra Stat
+  # next time the chunk is requested).
+  # Type:    int (positive).
+  # Default: 100000.
+  max_entries: 100000
+
+# =============================================================================
+# metadata: per-replica object-metadata cache (HEAD results).
+# =============================================================================
+metadata:
+  # Positive-result TTL. Bounds the staleness window for the
+  # immutable-origin contract: if an operator overwrites a key in
+  # place, Orca may serve the old bytes for up to this duration
+  # (see designs/orca/design.md section 9).
+  # Type:    duration.
+  # Default: 5m.
+  ttl: 5m
+
+  # Negative-result TTL: how long a NotFound / MissingETagError /
+  # UnsupportedBlobTypeError outcome is cached before re-Heading. Also
+  # bounds the "uploaded after a 404" stale window.
+  # Type:    duration.
+  # Default: 60s.
+  negative_ttl: 60s
+
+  # Soft cap on the metadata cache size.
+  # Type:    int (positive).
+  # Default: 10000.
+  max_entries: 10000
+
+# =============================================================================
+# chunking: chunk-size selection + read-ahead.
+# =============================================================================
+chunking:
+  # Base chunk size for objects smaller than the smallest tier
+  # threshold. Accepts a raw byte count (`size: 8388608`) or a
+  # human-readable string with SI suffixes (KB / MB / GB / TB / PB;
+  # decimal) or IEC suffixes (KiB / MiB / GiB / TiB / PiB; binary).
+  # Type:    ByteSize.
+  # Min:     1 MiB (validate rejects smaller).
+  # Default: 8 MiB.
+  size: 8 MiB
+
+  # Tier ladder: the tier with the largest min_object_size
+  # <= info.Size wins. Strictly ascending by min_object_size
+  # (validate rejects duplicates or unsorted entries). Each
+  # chunk_size must be >= 1 MiB.
+  # Type:    []ChunkTier.
+  # Default: see ladder below (1 GiB -> 64 MiB, 10 GiB -> 128 MiB).
+  # To disable tiers and use `size` for every object, set `tiers: []`.
+  tiers:
+    - min_object_size: 1 GiB
+      chunk_size: 64 MiB
+    - min_object_size: 10 GiB
+      chunk_size: 128 MiB
+
+  # Number of chunks the edge handler prefetches in parallel while
+  # streaming the current chunk to the client. Trades memory
+  # (readahead * effective_chunk_size extra in-flight buffers per
+  # concurrent GET) for cold-path throughput.
+  # Type:    int (>= 0).
+  # Default: 8.
+  # Set to 0 to disable read-ahead and go back to strictly sequential
+  # chunk fetches.
+  readahead: 8
+
+# =============================================================================
+# logging: structured-log output.
+# =============================================================================
+logging:
+  # Log level. Empty defaults to "info". The ORCA_LOG_LEVEL
+  # environment variable wins over this value if set at process
+  # start; useful for one-shot debug sessions without re-rendering
+  # the ConfigMap.
+  # Type:    string ("debug" | "info" | "warn" | "error").
+  # Default: "info".
+  # Dev:     "debug" surfaces the full per-chunk trace through fetch
+  #          / cluster / cachestore / origin / handlers.
+  level: info
