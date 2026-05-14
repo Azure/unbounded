@@ -115,7 +115,7 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 # Frontend build toggle (dev builds produce unminified output with sourcemaps).
 REACT_DEV ?= false
 
-.PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute notice notice-check
+.PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check
 .PHONY: net-frontend net-frontend-clean net-build-ebpf net-manifests release-manifests
 .PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-net-controller-local image-net-node-local images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
@@ -403,20 +403,28 @@ metalman: test metalman-build ## Build the metalman controller (implies test)
 
 ##@ Net Binaries
 
-unbounded-net-controller: test ## Build the unbounded-net-controller (implies test)
+unbounded-net-controller-build: ## Build the unbounded-net-controller binary (no lint/test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(NET_CONTROLLER_BIN) $(NET_CONTROLLER_CMD)
 
-unbounded-net-node: test ## Build the unbounded-net-node (implies test)
+unbounded-net-controller: test unbounded-net-controller-build ## Build the unbounded-net-controller (implies test)
+
+unbounded-net-node-build: ## Build the unbounded-net-node binary (no lint/test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(NET_NODE_BIN) $(NET_NODE_CMD)
+
+unbounded-net-node: test unbounded-net-node-build ## Build the unbounded-net-node (implies test)
 
 unbounded-net-routeplan-debug: test ## Build the routeplan debug tool (implies test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(NET_ROUTEPLAN_DEBUG_BIN) $(NET_ROUTEPLAN_DEBUG_CMD)
 
-unping: test ## Build the unping utility (implies test)
+unping-build: ## Build the unping utility binary (no lint/test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(UNPING_BIN) $(UNPING_CMD)
 
-unroute: test ## Build the unroute utility (implies test)
+unping: test unping-build ## Build the unping utility (implies test)
+
+unroute-build: ## Build the unroute utility binary (no lint/test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(UNROUTE_BIN) $(UNROUTE_CMD)
+
+unroute: test unroute-build ## Build the unroute utility (implies test)
 
 ##@ Rust Binaries
 
