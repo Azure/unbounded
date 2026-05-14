@@ -5,9 +5,12 @@ package azurevm
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
+	"strings"
 	"testing"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v6"
 	"github.com/stretchr/testify/require"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
@@ -76,11 +79,12 @@ func TestProviderExecute(t *testing.T) {
 	tests := []struct {
 		name      string
 		operation unboundedv1alpha3.OperationKind
-		wantCall  string
+		wantCalls []string
 	}{
-		{name: "hard reboot", operation: unboundedv1alpha3.OperationHostReboot, wantCall: "restart:rg/vm1"},
-		{name: "power off", operation: unboundedv1alpha3.OperationHostPowerOff, wantCall: "powerOff:rg/vm1"},
-		{name: "power on", operation: unboundedv1alpha3.OperationHostPowerOn, wantCall: "start:rg/vm1"},
+		{name: "hard reboot", operation: unboundedv1alpha3.OperationHostReboot, wantCalls: []string{"restart:rg/vm1"}},
+		{name: "power off", operation: unboundedv1alpha3.OperationHostPowerOff, wantCalls: []string{"powerOff:rg/vm1"}},
+		{name: "power on", operation: unboundedv1alpha3.OperationHostPowerOn, wantCalls: []string{"start:rg/vm1"}},
+		{name: "replace", operation: unboundedv1alpha3.OperationHostReplace, wantCalls: []string{"replace:rg/vm1:cloud-init"}},
 	}
 
 	for _, tt := range tests {
@@ -95,12 +99,89 @@ func TestProviderExecute(t *testing.T) {
 				},
 			}
 
-			err := provider.Execute(context.Background(), machineops.OperationRequest{ProviderID: "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm1", Operation: tt.operation})
+			err := provider.Execute(context.Background(), machineops.OperationRequest{ProviderID: "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm1", Operation: tt.operation, ReplaceUserData: "cloud-init"})
 
 			require.NoError(t, err)
-			require.Equal(t, []string{tt.wantCall}, client.calls)
+			require.Equal(t, tt.wantCalls, client.calls)
 		})
 	}
+}
+
+func TestProviderExecuteHostReplaceRequiresUserData(t *testing.T) {
+	t.Parallel()
+
+	provider := &Provider{NewClient: func(subscriptionID string) (azureVMClient, error) {
+		require.Equal(t, "sub", subscriptionID)
+		return &recordingAzureVMClient{}, nil
+	}}
+
+	require.True(t, provider.Supports(unboundedv1alpha3.OperationHostReplace))
+	err := provider.Execute(context.Background(), machineops.OperationRequest{ProviderID: "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm1", Operation: unboundedv1alpha3.OperationHostReplace})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "replacement user data is required")
+}
+
+func TestPrepareReplacementVM(t *testing.T) {
+	t.Parallel()
+
+	vm := armcompute.VirtualMachine{
+		Name: toPtr("vm1"),
+		ID:   toPtr("/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm1"),
+		Identity: &armcompute.VirtualMachineIdentity{UserAssignedIdentities: map[string]*armcompute.UserAssignedIdentitiesValue{
+			"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id1": {ClientID: toPtr("client-id")},
+		}},
+		Properties: &armcompute.VirtualMachineProperties{
+			ProvisioningState: toPtr("Succeeded"),
+			OSProfile:         &armcompute.OSProfile{RequireGuestProvisionSignal: toPtr(true)},
+			StorageProfile: &armcompute.StorageProfile{OSDisk: &armcompute.OSDisk{
+				Name:        toPtr("old-osdisk"),
+				ManagedDisk: &armcompute.ManagedDiskParameters{},
+			}},
+		},
+	}
+
+	replacement := prepareReplacementVM(vm, "#cloud-config\n", 123)
+
+	require.Nil(t, replacement.ID)
+	require.Nil(t, replacement.Name)
+	require.Equal(t, &armcompute.UserAssignedIdentitiesValue{}, replacement.Identity.UserAssignedIdentities["/subscriptions/sub/resourceGroups/rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id1"])
+	require.Nil(t, replacement.Properties.ProvisioningState)
+
+	wantCustomData := base64.StdEncoding.EncodeToString([]byte("#cloud-config\n"))
+	require.Equal(t, wantCustomData, *replacement.Properties.UserData)
+	require.Equal(t, wantCustomData, *replacement.Properties.OSProfile.CustomData)
+	require.Nil(t, replacement.Properties.OSProfile.RequireGuestProvisionSignal)
+	require.Equal(t, armcompute.DiskCreateOptionTypesFromImage, *replacement.Properties.StorageProfile.OSDisk.CreateOption)
+	require.NotNil(t, replacement.Properties.StorageProfile.OSDisk.ManagedDisk)
+	require.Equal(t, "vm1-osdisk-123", *replacement.Properties.StorageProfile.OSDisk.Name)
+}
+
+func TestValidateAzureCustomData(t *testing.T) {
+	t.Parallel()
+
+	require.NoError(t, validateAzureCustomData(strings.Repeat("a", azureCustomDataMaxBytes)))
+	err := validateAzureCustomData(strings.Repeat("a", azureCustomDataMaxBytes+1))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "exceeding Azure customData limit")
+}
+
+func TestPrepareVMForReplacementDelete(t *testing.T) {
+	t.Parallel()
+
+	vm := armcompute.VirtualMachine{Properties: &armcompute.VirtualMachineProperties{
+		NetworkProfile: &armcompute.NetworkProfile{NetworkInterfaces: []*armcompute.NetworkInterfaceReference{{}}},
+		StorageProfile: &armcompute.StorageProfile{
+			OSDisk:    &armcompute.OSDisk{},
+			DataDisks: []*armcompute.DataDisk{{}},
+		},
+	}, Resources: []*armcompute.VirtualMachineExtension{{Name: toPtr("old-extension")}}}
+
+	updated := prepareVMForReplacementDelete(vm)
+
+	require.Nil(t, updated.Resources)
+	require.Equal(t, armcompute.DeleteOptionsDetach, *updated.Properties.NetworkProfile.NetworkInterfaces[0].Properties.DeleteOption)
+	require.Equal(t, armcompute.DiskDeleteOptionTypesDelete, *updated.Properties.StorageProfile.OSDisk.DeleteOption)
+	require.Equal(t, armcompute.DiskDeleteOptionTypesDetach, *updated.Properties.StorageProfile.DataDisks[0].DeleteOption)
 }
 
 type recordingAzureVMClient struct {
@@ -122,3 +203,10 @@ func (c *recordingAzureVMClient) Start(_ context.Context, resourceGroupName, vmN
 	c.calls = append(c.calls, fmt.Sprintf("start:%s/%s", resourceGroupName, vmName))
 	return c.err
 }
+
+func (c *recordingAzureVMClient) Replace(_ context.Context, resourceGroupName, vmName, userData string) error {
+	c.calls = append(c.calls, fmt.Sprintf("replace:%s/%s:%s", resourceGroupName, vmName, userData))
+	return c.err
+}
+
+func toPtr[T any](value T) *T { return &value }

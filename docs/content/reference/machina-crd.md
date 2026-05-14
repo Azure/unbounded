@@ -111,19 +111,21 @@ OCI operations use an OCI SDK config file mounted into the `machine-ops-controll
 | Scope | Cluster |
 | Status subresource | Yes |
 
-`MachineOperation` is a job-like CR for discrete operations. The in-host agent handles Kubernetes node operations such as `NodeReboot`; `machine-ops-controller` handles out-of-band VM operations such as Azure VM power actions. PXE/BMC operations remain owned by metalman for now.
+`MachineOperation` is a job-like CR for discrete operations. The in-host agent handles Kubernetes node operations such as `NodeReboot` and agent operations such as `AgentReset`; `machine-ops-controller` handles out-of-band VM operations such as Azure VM power actions. PXE/BMC operations remain owned by metalman for now.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `spec.machineRef` | string | No | Target `Machine` name. Either `machineRef` or `machineSelector` must be set. |
-| `spec.machineSelector` | LabelSelector | No | Selects Machines by label. Controllers may fan this out into per-Machine operations. |
-| `spec.operationKind` | string | Yes | One of `NodeReboot`, `HostReboot`, `HostPowerOff`, `HostPowerOn`. |
+| `spec.machineSelector` | LabelSelector | No | Selects Machines by label. Supported for agent-handled operations (`NodeReboot`, `AgentUpgrade`, `AgentReset`). Each matching agent independently picks up the operation. Not supported for host operations. |
+| `spec.operationKind` | string | Yes | One of `NodeReboot`, `AgentUpgrade`, `AgentReset`, `HostReboot`, `HostPowerOff`, `HostPowerOn`, `HostReplace`. |
 | `spec.parameters` | map[string]string | No | Operation-specific parameters. |
 | `spec.ttlSecondsAfterFinished` | int32 | No | Delete completed or failed operations after this many seconds. |
 | `status.phase` | string | No | `Pending`, `InProgress`, `Complete`, or `Failed`. |
 | `status.message` | string | No | Human-readable status message. |
 | `status.startedAt` | time | No | Operation start timestamp. |
 | `status.completedAt` | time | No | Terminal phase timestamp. |
+
+`AgentUpgrade` is handled by the in-host agent and requires `spec.parameters.downloadURL`. The URL must point to an `unbounded-agent` release tarball; the agent stages it as the inactive blue/green daemon binary, records the previous binary as last known good, and restarts `unbounded-agent-daemon.service`. If systemd cannot keep the upgraded daemon running, `unbounded-agent-daemon-recovery.service` switches the daemon back to the last known good binary.
 
 The Azure VM provider handles:
 
@@ -132,6 +134,11 @@ The Azure VM provider handles:
 | `HostReboot` | `VirtualMachinesClient.BeginRestart` |
 | `HostPowerOff` | `VirtualMachinesClient.BeginPowerOff` |
 | `HostPowerOn` | `VirtualMachinesClient.BeginStart` |
+| `HostReplace` | `VirtualMachinesClient.Get`, `BeginDelete`, then `BeginCreateOrUpdate` |
+
+`HostReplace` for `AzureVM` destructively replaces the VM: it reads the existing VM model, detaches NICs and data disks, deletes the VM resource, and recreates the same VM name with fresh cloud-init custom data that installs `unbounded-agent`. The old OS disk is not reused. Operation completion means the replacement VM create operation completed; it does not mean the Kubernetes `Node` is Ready. The `Machine` controller continues tracking whether the Kubernetes `Node` disappears and rejoins. Configure `machine-ops-controller --api-server-endpoint` with an API server address reachable from replaced hosts; the generated agent bootstrap config uses that value.
+
+This replacement flow avoids Azure standalone VM `customData` immutability during native reimage. It intentionally destroys host-local state on the old OS disk.
 
 The OCI instance provider handles:
 
@@ -140,6 +147,8 @@ The OCI instance provider handles:
 | `HostReboot` | `RESET` |
 | `HostPowerOff` | `STOP` |
 | `HostPowerOn` | `START` |
+
+`HostReplace` is not currently supported for `OCIInstance` because an identity-preserving OCI replacement flow with fresh `user_data` injection has not been verified.
 
 ### status
 

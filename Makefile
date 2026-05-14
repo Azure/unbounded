@@ -6,6 +6,9 @@ GOTEST=$(GOCMD) test
 GOMOD=$(GOCMD) mod
 GOLINT=golangci-lint run -c .golangci.yaml
 
+CONTAINER_ENGINE ?= podman
+CONTAINER_REGISTRY ?= ghcr.io/azure
+
 FORGE_BIN=bin/forge
 FORGE_CMD=./hack/cmd/forge
 
@@ -32,9 +35,7 @@ AGENT_CMD=./cmd/agent
 
 MACHINA_BIN=bin/machina
 MACHINA_CMD=./cmd/machina
-CONTAINER_REGISTRY ?= ghcr.io/azure
 MACHINA_IMAGE ?= $(CONTAINER_REGISTRY)/machina:$(VERSION)
-CONTAINER_ENGINE ?= podman
 
 MACHINE_OPS_CONTROLLER_BIN=bin/machine-ops-controller
 MACHINE_OPS_CONTROLLER_CMD=./cmd/machine-ops-controller
@@ -61,6 +62,11 @@ UNPING_CMD=./cmd/unping
 
 UNROUTE_BIN=bin/unroute
 UNROUTE_CMD=./cmd/unroute
+
+# Rust binaries
+UNBOUNDED_STORAGE_BIN=bin/unbounded-storage
+UNBOUNDED_STORAGE_CRATE=./cmd/unbounded-storage
+CARGO ?= cargo
 
 # Version is derived from the latest git tag. Override with: make VERSION=v1.0.0
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
@@ -113,6 +119,7 @@ REACT_DEV ?= false
 .PHONY: net-frontend net-frontend-clean net-build-ebpf net-manifests release-manifests
 .PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-net-controller-local image-net-node-local images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
+.PHONY: unbounded-storage unbounded-storage-build unbounded-storage-test
 
 ##@ General
 
@@ -158,6 +165,10 @@ help: ## Show this help
 	@echo "  unbounded-net-routeplan-debug    Build net routeplan debug tool"
 	@echo "  unping                           Build unping health-check utility"
 	@echo "  unroute                          Build unroute eBPF inspection utility"
+	@echo ""
+	@echo "Rust Binaries:"
+	@echo "  unbounded-storage | unbounded-storage-build  Build unbounded-storage (with/without test)"
+	@echo "  unbounded-storage-test           Run cargo tests for unbounded-storage"
 	@echo ""
 	@echo "Container Images (local, single-arch):"
 	@echo "  image-inventory-all-local        Build all local inventory container images"
@@ -340,7 +351,7 @@ forge: test ## Build the forge dev tool (implies test)
 	$(GOBUILD) -o $(FORGE_BIN) $(FORGE_CMD)/main.go
 
 .PHONY: inventory-all
-inventory-all: inventory-agent inventory-collector inventory-inspector inventory-viewer ## Build all inventory components
+inventory-all: inventory-agent inventory-aggregator inventory-inspector inventory-viewer ## Build all inventory components
 
 .PHONY: inventory-agent
 inventory-agent: inventory-agent-amd64 inventory-agent-arm64 ## Build inventory for amd64 and arm64, symlink to host arch
@@ -406,6 +417,18 @@ unping: test ## Build the unping utility (implies test)
 
 unroute: test ## Build the unroute utility (implies test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(UNROUTE_BIN) $(UNROUTE_CMD)
+
+##@ Rust Binaries
+
+unbounded-storage-test: ## Run cargo tests for unbounded-storage
+	$(CARGO) test --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --locked --all-targets
+
+unbounded-storage-build: ## Build the unbounded-storage binary (no test)
+	$(CARGO) build --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --release --locked
+	@mkdir -p $(dir $(UNBOUNDED_STORAGE_BIN))
+	cp $(UNBOUNDED_STORAGE_CRATE)/target/release/unbounded-storage $(UNBOUNDED_STORAGE_BIN)
+
+unbounded-storage: unbounded-storage-test unbounded-storage-build ## Build the unbounded-storage binary (implies test)
 
 ##@ Container Images
 #
@@ -525,6 +548,7 @@ MACHINA_NAMESPACE ?= unbounded-kube
 MACHINA_MANIFEST_TEMPLATES_DIR := deploy/machina
 MACHINA_MANIFEST_RENDERED_DIR  := deploy/machina/rendered
 MACHINE_OPS_NAMESPACE ?= unbounded-kube
+MACHINE_OPS_API_SERVER_ENDPOINT ?=
 MACHINE_OPS_OCI_CONFIG_SECRET ?=
 MACHINE_OPS_OCI_CONFIG_PROFILE ?= DEFAULT
 MACHINE_OPS_OCI_AUTH ?= api_key
@@ -551,6 +575,7 @@ machine-ops-manifests: ## Render machine-ops-controller manifests into deploy/ma
 		--output-dir $(MACHINE_OPS_MANIFEST_RENDERED_DIR) \
 		--set Namespace=$(MACHINE_OPS_NAMESPACE) \
 		--set ControllerImage=$(MACHINE_OPS_CONTROLLER_IMAGE) \
+		--set APIServerEndpoint=$(MACHINE_OPS_API_SERVER_ENDPOINT) \
 		--set OCIConfigSecretName=$(MACHINE_OPS_OCI_CONFIG_SECRET) \
 		--set OCIConfigProfile=$(MACHINE_OPS_OCI_CONFIG_PROFILE) \
 		--set OCIAuth=$(MACHINE_OPS_OCI_AUTH)

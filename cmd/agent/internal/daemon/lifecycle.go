@@ -4,13 +4,16 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	_ "embed"
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"text/template"
 
 	"github.com/Azure/unbounded/internal/executil"
+	"github.com/Azure/unbounded/pkg/agent/agentbinary"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
@@ -21,6 +24,12 @@ import (
 
 //go:embed assets/unbounded-agent-daemon.service
 var daemonServiceContent []byte
+
+//go:embed assets/unbounded-agent-daemon-recovery.service
+var daemonRecoveryServiceContent []byte
+
+//go:embed assets/unbounded-agent-daemon-recovery.sh
+var daemonRecoveryScriptContent []byte
 
 type enableDaemon struct {
 	log *slog.Logger
@@ -37,10 +46,38 @@ func EnableDaemon(log *slog.Logger) phases.Task {
 func (d *enableDaemon) Name() string { return "enable-daemon" }
 
 func (d *enableDaemon) Do(ctx context.Context) error {
-	unitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonUnit)
+	paths, err := goalstates.ResolvedAgentUpgradePaths()
+	if err != nil {
+		return fmt.Errorf("resolve current daemon binary symlink: %w", err)
+	}
+	if err := agentbinary.EnsureDaemonBinaryLinks(ctx, d.log, paths); err != nil {
+		return err
+	}
 
-	if err := writeFile(unitPath, daemonServiceContent, 0o644); err != nil {
+	unitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonUnit)
+	daemonService, err := renderDaemonAsset("daemon-service", daemonServiceContent)
+	if err != nil {
+		return fmt.Errorf("rendering %s: %w", unitPath, err)
+	}
+	if err := writeFile(unitPath, daemonService, 0o644); err != nil {
 		return fmt.Errorf("writing %s: %w", unitPath, err)
+	}
+
+	recoveryUnitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonRecoveryUnit)
+	recoveryService, err := renderDaemonAsset("daemon-recovery-service", daemonRecoveryServiceContent)
+	if err != nil {
+		return fmt.Errorf("rendering %s: %w", recoveryUnitPath, err)
+	}
+	if err := writeFile(recoveryUnitPath, recoveryService, 0o644); err != nil {
+		return fmt.Errorf("writing %s: %w", recoveryUnitPath, err)
+	}
+
+	recoveryScript, err := renderDaemonAsset("daemon-recovery-script", daemonRecoveryScriptContent)
+	if err != nil {
+		return fmt.Errorf("rendering %s: %w", goalstates.DaemonRecoveryScriptPath, err)
+	}
+	if err := writeFile(goalstates.DaemonRecoveryScriptPath, recoveryScript, 0o755); err != nil {
+		return fmt.Errorf("writing %s: %w", goalstates.DaemonRecoveryScriptPath, err)
 	}
 
 	sc := executil.Systemctl()
@@ -62,6 +99,36 @@ func (d *enableDaemon) Do(ctx context.Context) error {
 	return nil
 }
 
+func renderDaemonAsset(name string, content []byte) ([]byte, error) {
+	data := struct {
+		DaemonUnit                   string
+		DaemonRecoveryUnit           string
+		DaemonBinaryCurrentPath      string
+		DaemonBinaryLastGoodPath     string
+		DaemonRecoveryScriptPath     string
+		DaemonAgentUpgradeSignalPath string
+	}{
+		DaemonUnit:                   goalstates.DaemonUnit,
+		DaemonRecoveryUnit:           goalstates.DaemonRecoveryUnit,
+		DaemonBinaryCurrentPath:      goalstates.DaemonBinaryCurrentPath,
+		DaemonBinaryLastGoodPath:     goalstates.DaemonBinaryLastGoodPath,
+		DaemonRecoveryScriptPath:     goalstates.DaemonRecoveryScriptPath,
+		DaemonAgentUpgradeSignalPath: goalstates.DaemonAgentUpgradeSignalPath,
+	}
+
+	tmpl, err := template.New(name).Parse(string(content))
+	if err != nil {
+		return nil, err
+	}
+
+	var rendered bytes.Buffer
+	if err := tmpl.Execute(&rendered, data); err != nil {
+		return nil, err
+	}
+
+	return rendered.Bytes(), nil
+}
+
 // ---------------------------------------------------------------------------
 // StopDaemon
 // ---------------------------------------------------------------------------
@@ -80,18 +147,43 @@ func StopDaemon(log *slog.Logger) phases.Task {
 func (t *stopDaemon) Name() string { return "stop-daemon" }
 
 func (t *stopDaemon) Do(ctx context.Context) error {
-	sc := executil.Systemctl()
-
-	if err := executil.RunCmd(ctx, t.log, sc, "stop", goalstates.DaemonUnit); err != nil {
+	if err := executil.RunCmd(ctx, t.log, executil.Systemctl(), "stop", goalstates.DaemonUnit); err != nil {
 		t.log.Warn("failed to stop daemon (may not be running)", "error", err)
 	}
 
-	if err := executil.RunCmd(ctx, t.log, sc, "disable", goalstates.DaemonUnit); err != nil {
-		t.log.Warn("failed to disable daemon (may not be enabled)", "error", err)
+	return disableAndRemoveDaemonUnit(ctx, t.log)
+}
+
+// ---------------------------------------------------------------------------
+// RemoveDaemonUnit
+// ---------------------------------------------------------------------------
+
+type removeDaemonUnit struct {
+	log *slog.Logger
+}
+
+// RemoveDaemonUnit returns a task that disables and removes the
+// unbounded-agent-daemon systemd unit without stopping the running service.
+func RemoveDaemonUnit(log *slog.Logger) phases.Task {
+	return &removeDaemonUnit{log: log}
+}
+
+func (t *removeDaemonUnit) Name() string { return "remove-daemon-unit" }
+
+func (t *removeDaemonUnit) Do(ctx context.Context) error {
+	return disableAndRemoveDaemonUnit(ctx, t.log)
+}
+
+func disableAndRemoveDaemonUnit(ctx context.Context, log *slog.Logger) error {
+	if err := executil.RunCmd(ctx, log, executil.Systemctl(), "disable", goalstates.DaemonUnit); err != nil {
+		log.Warn("failed to disable daemon (may already be absent or systemd unavailable)", "error", err)
 	}
 
 	unitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonUnit)
-	removeFileIfExists(t.log, unitPath)
+	removeFileIfExists(log, unitPath)
+	recoveryUnitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonRecoveryUnit)
+	removeFileIfExists(log, recoveryUnitPath)
+	removeFileIfExists(log, goalstates.DaemonRecoveryScriptPath)
 
 	return nil
 }
@@ -117,7 +209,12 @@ func (t *removeAgentArtifacts) Do(_ context.Context) error {
 
 	// Remove known file paths.
 	for _, path := range []string{
-		"/usr/local/bin/unbounded-agent",
+		goalstates.DaemonBinaryPath,
+		goalstates.DaemonBinaryBluePath,
+		goalstates.DaemonBinaryGreenPath,
+		goalstates.DaemonBinaryCurrentPath,
+		goalstates.DaemonBinaryLastGoodPath,
+		goalstates.DaemonRecoveryScriptPath,
 		"/usr/local/bin/unbounded-agent-install.sh",
 		"/usr/local/bin/unbounded-agent-uninstall.sh",
 	} {

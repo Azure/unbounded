@@ -56,6 +56,9 @@ spec:
             - --leader-elect=true
             - --leader-elect-namespace={{ default "unbounded-kube" .Namespace }}
             - --max-concurrent-reconciles={{ default "10" .MaxConcurrentReconciles }}
+            {{- if .APIServerEndpoint }}
+            - --api-server-endpoint={{ .APIServerEndpoint }}
+            {{- end }}
             - --metrics-bind-address=:8080
             - --health-probe-bind-address=:8081
             {{- if .OCIConfigSecretName }}

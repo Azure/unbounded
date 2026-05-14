@@ -148,13 +148,20 @@ notices:
     license:
       - name: MIT License
         link: https://github.com/Azure/azure-sdk-for-go/blob/sdk/storage/azblob/v1.6.4/LICENSE.txt
+  - dependency: github.com/DATA-DOG/go-sqlmock
+    ecosystem: go
+    copyright:
+      - Copyright (c) 2013-2019, DATA-DOG team
+    license:
+      - name: BSD 3-Clause License
+        link: https://github.com/DATA-DOG/go-sqlmock/blob/v1.5.2/LICENSE
   - dependency: github.com/Masterminds/semver/v3
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: MIT License
-        link: https://github.com/Masterminds/semver/blob/v3.4.0/LICENSE.txt
+        link: https://github.com/Masterminds/semver/blob/v3.5.0/LICENSE.txt
   - dependency: github.com/Masterminds/sprig/v3
     ecosystem: go
     copyright:
@@ -213,7 +220,7 @@ notices:
       - Copyright © fsnotify Authors. All rights reserved.
     license:
       - name: BSD 3-Clause License
-        link: https://github.com/fsnotify/fsnotify/blob/v1.9.0/LICENSE
+        link: https://github.com/fsnotify/fsnotify/blob/v1.10.1/LICENSE
   - dependency: github.com/go-logr/logr
     ecosystem: go
     copyright:
@@ -296,9 +303,9 @@ notices:
       - Copyright (c) 2016, 2016, Oracle and/or its affiliates. All rights reserved.
     license:
       - name: UPL-1.0
-        link: https://github.com/oracle/oci-go-sdk/blob/v65.114.0/LICENSE.txt
+        link: https://github.com/oracle/oci-go-sdk/blob/v65.114.1/LICENSE.txt
       - name: Apache License, Version 2.0
-        link: https://github.com/oracle/oci-go-sdk/blob/v65.114.0/LICENSE.txt
+        link: https://github.com/oracle/oci-go-sdk/blob/v65.114.1/LICENSE.txt
   - dependency: github.com/pin/tftp/v3
     ecosystem: go
     copyright:
@@ -393,7 +400,7 @@ notices:
       - Copyright 2014 gRPC authors.
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/grpc/grpc-go/blob/v1.80.0/LICENSE
+        link: https://github.com/grpc/grpc-go/blob/v1.81.0/LICENSE
   - dependency: google.golang.org/protobuf
     ecosystem: go
     copyright:
@@ -467,7 +474,7 @@ notices:
       - Copyright (c) 2017 The Sqlite Authors. All rights reserved.
     license:
       - name: BSD 3-Clause License
-        link: https://gitlab.com/cznic/sqlite/-/blob/v1.49.1/LICENSE
+        link: https://gitlab.com/cznic/sqlite/-/blob/v1.50.0/LICENSE
   - dependency: oras.land/oras-go/v2
     ecosystem: go
     copyright:

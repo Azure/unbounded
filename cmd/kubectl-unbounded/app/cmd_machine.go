@@ -12,9 +12,13 @@ func machineCommandGroup() *cobra.Command {
 	}
 
 	cmd.AddCommand(
+		configCommandGroup(),
 		machineRegisterCommand(),
+		machineReplaceCommand(),
 		machineRebootCommand(),
+		machineHardRebootCommand(),
 		machineRepaveCommand(),
+		machineSoftRebootCommand(),
 		machineManualBootstrapCommand(),
 	)
 

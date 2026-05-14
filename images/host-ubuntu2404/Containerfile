@@ -2,7 +2,7 @@
 # Licensed under the MIT License.
 
 # ── Build the unbounded-agent binary ────────────────────────────────
-FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26@sha256:ec4debba7b371fb2eaa6169a72fc61ad93b9be6a9ae9da2a010cb81a760d36e7 AS gobuilder
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26@sha256:efaccb5b497e90df3ebe5216cc25cd9f98e73874e2d638b56e38d4a3f098c41c AS gobuilder
 
 ARG TARGETARCH
 ARG VERSION=dev

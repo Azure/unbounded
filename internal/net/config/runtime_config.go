@@ -27,16 +27,23 @@ type CommonRuntimeConfig struct {
 
 // ControllerRuntimeConfig contains controller-specific runtime settings.
 type ControllerRuntimeConfig struct {
-	InformerResyncPeriod        string                       `yaml:"informerResyncPeriod"`
-	HealthPort                  *int                         `yaml:"healthPort"`
-	NodeAgentHealthPort         *int                         `yaml:"nodeAgentHealthPort"`
-	StatusStaleThreshold        string                       `yaml:"statusStaleThreshold"`
-	StatusWSKeepaliveInterval   string                       `yaml:"statusWebsocketKeepaliveInterval"`
-	StatusWSKeepaliveFailCount  *int                         `yaml:"statusWsKeepaliveFailureCount"`
-	RegisterAggregatedAPIServer *bool                        `yaml:"registerAggregatedAPIServer"`
-	RequireDashboardAuth        *bool                        `yaml:"requireDashboardAuth"`
-	KubeProxyHealthInterval     string                       `yaml:"kubeProxyHealthInterval"`
-	LeaderElection              ControllerLeaderElectionYAML `yaml:"leaderElection"`
+	InformerResyncPeriod        string                        `yaml:"informerResyncPeriod"`
+	HealthPort                  *int                          `yaml:"healthPort"`
+	NodeAgentHealthPort         *int                          `yaml:"nodeAgentHealthPort"`
+	StatusStaleThreshold        string                        `yaml:"statusStaleThreshold"`
+	StatusWSKeepaliveInterval   string                        `yaml:"statusWebsocketKeepaliveInterval"`
+	StatusWSKeepaliveFailCount  *int                          `yaml:"statusWsKeepaliveFailureCount"`
+	RegisterAggregatedAPIServer *bool                         `yaml:"registerAggregatedAPIServer"`
+	RequireDashboardAuth        *bool                         `yaml:"requireDashboardAuth"`
+	KubeProxyHealthInterval     string                        `yaml:"kubeProxyHealthInterval"`
+	ManagedKubeProxy            ManagedKubeProxyRuntimeConfig `yaml:"managedKubeProxy"`
+	LeaderElection              ControllerLeaderElectionYAML  `yaml:"leaderElection"`
+}
+
+// ManagedKubeProxyRuntimeConfig controls unbounded-managed kube-proxy DaemonSets.
+type ManagedKubeProxyRuntimeConfig struct {
+	Enabled *bool  `yaml:"enabled"`
+	Image   string `yaml:"image"`
 }
 
 // ControllerLeaderElectionYAML configures controller leader election behavior.

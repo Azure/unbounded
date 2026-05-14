@@ -72,6 +72,19 @@ func TestLoadConfig_FromFile(t *testing.T) {
 	assert.Equal(t, []string{"dedicated=gpu:NoSchedule", "workload=ml:PreferNoSchedule"}, got.Kubelet.RegisterWithTaints)
 }
 
+func TestLoadConfig_BackfillsNodeName(t *testing.T) {
+	cfg := sampleConfig()
+	cfg.NodeName = " configured-node "
+	path := writeConfigFile(t, cfg)
+
+	t.Setenv(configFileEnv, path)
+
+	got, err := loadConfig()
+	require.NoError(t, err)
+
+	assert.Equal(t, "configured-node", got.NodeName)
+}
+
 func TestLoadConfig_FromFile_VersionWithoutPrefix(t *testing.T) {
 	cfg := sampleConfig()
 	cfg.Cluster.Version = "1.33.1" // no "v" prefix
