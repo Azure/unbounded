@@ -81,23 +81,14 @@ func (c *ociComputeClient) GetInstance(ctx context.Context, instanceID string) (
 }
 
 func (c *ociComputeClient) ListInstances(ctx context.Context, compartmentID, availabilityDomain string) ([]core.Instance, error) {
-	var instances []core.Instance
-	var page *string
-	for {
+	return listOCI(ctx, func(ctx context.Context, page *string) ([]core.Instance, *string, error) {
 		response, err := c.compute.ListInstances(ctx, core.ListInstancesRequest{
 			CompartmentId:      &compartmentID,
 			AvailabilityDomain: &availabilityDomain,
 			Page:               page,
 		})
-		if err != nil {
-			return nil, err
-		}
-		instances = append(instances, response.Items...)
-		if response.OpcNextPage == nil {
-			return instances, nil
-		}
-		page = response.OpcNextPage
-	}
+		return response.Items, response.OpcNextPage, err
+	})
 }
 
 func (c *ociComputeClient) LaunchInstance(ctx context.Context, details core.LaunchInstanceDetails, retryToken string) (core.Instance, error) {
@@ -127,9 +118,7 @@ func (c *ociComputeClient) TerminateInstance(ctx context.Context, instanceID, re
 }
 
 func (c *ociComputeClient) ListImages(ctx context.Context, compartmentID, shape string) ([]core.Image, error) {
-	var images []core.Image
-	var page *string
-	for {
+	return listOCI(ctx, func(ctx context.Context, page *string) ([]core.Image, *string, error) {
 		response, err := c.compute.ListImages(ctx, core.ListImagesRequest{
 			CompartmentId:          &compartmentID,
 			OperatingSystem:        ptrTo(defaultUbuntuOS),
@@ -140,35 +129,19 @@ func (c *ociComputeClient) ListImages(ctx context.Context, compartmentID, shape 
 			SortOrder:              core.ListImagesSortOrderDesc,
 			Page:                   page,
 		})
-		if err != nil {
-			return nil, err
-		}
-		images = append(images, response.Items...)
-		if response.OpcNextPage == nil {
-			return images, nil
-		}
-		page = response.OpcNextPage
-	}
+		return response.Items, response.OpcNextPage, err
+	})
 }
 
 func (c *ociComputeClient) ListVnicAttachments(ctx context.Context, compartmentID, instanceID string) ([]core.VnicAttachment, error) {
-	var attachments []core.VnicAttachment
-	var page *string
-	for {
+	return listOCI(ctx, func(ctx context.Context, page *string) ([]core.VnicAttachment, *string, error) {
 		response, err := c.compute.ListVnicAttachments(ctx, core.ListVnicAttachmentsRequest{
 			CompartmentId: &compartmentID,
 			InstanceId:    &instanceID,
 			Page:          page,
 		})
-		if err != nil {
-			return nil, err
-		}
-		attachments = append(attachments, response.Items...)
-		if response.OpcNextPage == nil {
-			return attachments, nil
-		}
-		page = response.OpcNextPage
-	}
+		return response.Items, response.OpcNextPage, err
+	})
 }
 
 func (c *ociComputeClient) GetVnic(ctx context.Context, vnicID string) (core.Vnic, error) {
@@ -181,21 +154,29 @@ func (c *ociComputeClient) GetVnic(ctx context.Context, vnicID string) (core.Vni
 }
 
 func (c *ociComputeClient) ListVolumeAttachments(ctx context.Context, compartmentID, instanceID string) ([]core.VolumeAttachment, error) {
-	var attachments []core.VolumeAttachment
-	var page *string
-	for {
+	return listOCI(ctx, func(ctx context.Context, page *string) ([]core.VolumeAttachment, *string, error) {
 		response, err := c.compute.ListVolumeAttachments(ctx, core.ListVolumeAttachmentsRequest{
 			CompartmentId: &compartmentID,
 			InstanceId:    &instanceID,
 			Page:          page,
 		})
+		return response.Items, response.OpcNextPage, err
+	})
+}
+
+func listOCI[T any](ctx context.Context, listPage func(context.Context, *string) ([]T, *string, error)) ([]T, error) {
+	var items []T
+	var page *string
+	for {
+		pageItems, nextPage, err := listPage(ctx, page)
 		if err != nil {
 			return nil, err
 		}
-		attachments = append(attachments, response.Items...)
-		if response.OpcNextPage == nil {
-			return attachments, nil
+
+		items = append(items, pageItems...)
+		if nextPage == nil {
+			return items, nil
 		}
-		page = response.OpcNextPage
+		page = nextPage
 	}
 }

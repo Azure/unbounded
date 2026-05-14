@@ -63,7 +63,7 @@ func TestProviderExecuteRequiresProviderID(t *testing.T) {
 	require.Contains(t, err.Error(), "providerID is required")
 }
 
-func TestProviderExecuteHostReplaceRequiresUserData(t *testing.T) {
+func TestProviderExecuteHostReplaceRequiresMachine(t *testing.T) {
 	t.Parallel()
 
 	provider := &Provider{NewClient: func() (computeClient, error) {
@@ -72,6 +72,21 @@ func TestProviderExecuteHostReplaceRequiresUserData(t *testing.T) {
 
 	require.True(t, provider.Supports(unboundedv1alpha3.OperationHostReplace))
 	_, err := provider.Execute(context.Background(), machineops.OperationRequest{ProviderID: "oci://old-instance", Operation: unboundedv1alpha3.OperationHostReplace})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "machine is required")
+}
+
+func TestProviderExecuteHostReplaceRequiresUserData(t *testing.T) {
+	t.Parallel()
+
+	provider := &Provider{NewClient: func() (computeClient, error) {
+		return &recordingComputeClient{}, nil
+	}}
+	machine := &unboundedv1alpha3.Machine{}
+	machine.Name = "machine-1"
+	machine.Spec.ProviderID = "oci://old-instance"
+
+	_, err := provider.Execute(context.Background(), machineops.OperationRequest{Machine: machine, ProviderID: "oci://old-instance", Operation: unboundedv1alpha3.OperationHostReplace})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "replacement user data is required")
 }

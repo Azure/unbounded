@@ -147,24 +147,10 @@ func (p *Provider) resolveImageID(ctx context.Context, client computeClient, old
 }
 
 func buildReplacementLaunchDetails(oldInstance core.Instance, primaryVNIC core.Vnic, imageID string, request machineops.OperationRequest) (core.LaunchInstanceDetails, error) {
-	// OCI cannot update launch user_data in place, so HostReplace recreates the
-	// instance with fresh bootstrap metadata and a new providerID.
-	metadata := copyStringMap(oldInstance.Metadata)
-	if extraKeys := strings.TrimSpace(request.Parameters[parameterSSHAuthorizedKeys]); extraKeys != "" {
-		metadata["ssh_authorized_keys"] = strings.TrimSpace(metadata["ssh_authorized_keys"] + "\n" + extraKeys)
+	metadata, err := replacementMetadata(oldInstance, request)
+	if err != nil {
+		return core.LaunchInstanceDetails{}, err
 	}
-	metadata["user_data"] = base64.StdEncoding.EncodeToString([]byte(request.ReplaceUserData))
-	if metadataSize(metadata, oldInstance.ExtendedMetadata) > ociMetadataMaxBytes {
-		return core.LaunchInstanceDetails{}, fmt.Errorf("replacement metadata exceeds OCI limit of %d bytes", ociMetadataMaxBytes)
-	}
-
-	freeformTags := copyStringMap(oldInstance.FreeformTags)
-	// OCI freeform tag keys cannot use slash-delimited Kubernetes-style names.
-	// These tags are also the restart-safe replacement lookup keys.
-	freeformTags[tagMachine] = request.Machine.Name
-	freeformTags[tagOperation] = request.OperationName
-	freeformTags[tagOperationUID] = string(request.OperationUID)
-	freeformTags[tagOldProviderID] = request.ProviderID
 
 	details := core.LaunchInstanceDetails{
 		AvailabilityDomain:      oldInstance.AvailabilityDomain,
@@ -175,7 +161,7 @@ func buildReplacementLaunchDetails(oldInstance core.Instance, primaryVNIC core.V
 		ExtendedMetadata:        oldInstance.ExtendedMetadata,
 		FaultDomain:             oldInstance.FaultDomain,
 		ClusterPlacementGroupId: oldInstance.ClusterPlacementGroupId,
-		FreeformTags:            freeformTags,
+		FreeformTags:            replacementTags(oldInstance, request),
 		IpxeScript:              oldInstance.IpxeScript,
 		InstanceOptions:         oldInstance.InstanceOptions,
 		Metadata:                metadata,
@@ -183,14 +169,51 @@ func buildReplacementLaunchDetails(oldInstance core.Instance, primaryVNIC core.V
 		SourceDetails: core.InstanceSourceViaImageDetails{
 			ImageId: &imageID,
 		},
-		CreateVnicDetails: &core.CreateVnicDetails{
-			AssignPublicIp:      ptrTo(true),
-			AssignIpv6Ip:        ptrTo(false),
-			NsgIds:              primaryVNIC.NsgIds,
-			SkipSourceDestCheck: primaryVNIC.SkipSourceDestCheck,
-			SubnetId:            primaryVNIC.SubnetId,
-		},
+		CreateVnicDetails: replacementVNIC(primaryVNIC),
 	}
+	copyOptionalLaunchSettings(&details, oldInstance)
+
+	return details, nil
+}
+
+func replacementMetadata(oldInstance core.Instance, request machineops.OperationRequest) (map[string]string, error) {
+	// OCI cannot update launch user_data in place, so HostReplace recreates the
+	// instance with fresh bootstrap metadata and a new providerID.
+	metadata := copyStringMap(oldInstance.Metadata)
+	if extraKeys := strings.TrimSpace(request.Parameters[parameterSSHAuthorizedKeys]); extraKeys != "" {
+		metadata["ssh_authorized_keys"] = strings.TrimSpace(metadata["ssh_authorized_keys"] + "\n" + extraKeys)
+	}
+	metadata["user_data"] = base64.StdEncoding.EncodeToString([]byte(request.ReplaceUserData))
+	if metadataSize(metadata, oldInstance.ExtendedMetadata) > ociMetadataMaxBytes {
+		return nil, fmt.Errorf("replacement metadata exceeds OCI limit of %d bytes", ociMetadataMaxBytes)
+	}
+
+	return metadata, nil
+}
+
+func replacementTags(oldInstance core.Instance, request machineops.OperationRequest) map[string]string {
+	freeformTags := copyStringMap(oldInstance.FreeformTags)
+	// OCI freeform tag keys cannot use slash-delimited Kubernetes-style names.
+	// These tags are also the restart-safe replacement lookup keys.
+	freeformTags[tagMachine] = request.Machine.Name
+	freeformTags[tagOperation] = request.OperationName
+	freeformTags[tagOperationUID] = string(request.OperationUID)
+	freeformTags[tagOldProviderID] = request.ProviderID
+
+	return freeformTags
+}
+
+func replacementVNIC(primaryVNIC core.Vnic) *core.CreateVnicDetails {
+	return &core.CreateVnicDetails{
+		AssignPublicIp:      ptrTo(true),
+		AssignIpv6Ip:        ptrTo(false),
+		NsgIds:              primaryVNIC.NsgIds,
+		SkipSourceDestCheck: primaryVNIC.SkipSourceDestCheck,
+		SubnetId:            primaryVNIC.SubnetId,
+	}
+}
+
+func copyOptionalLaunchSettings(details *core.LaunchInstanceDetails, oldInstance core.Instance) {
 	if oldInstance.ShapeConfig != nil {
 		details.ShapeConfig = &core.LaunchInstanceShapeConfigDetails{
 			Ocpus:       oldInstance.ShapeConfig.Ocpus,
@@ -214,8 +237,6 @@ func buildReplacementLaunchDetails(oldInstance core.Instance, primaryVNIC core.V
 			PluginsConfig:         oldInstance.AgentConfig.PluginsConfig,
 		}
 	}
-
-	return details, nil
 }
 
 func hasActiveVolumeAttachment(attachments []core.VolumeAttachment) bool {

@@ -15,21 +15,21 @@ import (
 )
 
 func (p *Provider) executeReplace(ctx context.Context, client computeClient, instanceID string, request machineops.OperationRequest) (machineops.OperationResult, error) {
+	if request.Machine == nil {
+		return machineops.OperationResult{}, fmt.Errorf("machine is required for OCI HostReplace")
+	}
+
 	// Reconcile retries may happen after providerID handoff but before cleanup.
 	// Detect that state from replacement tags and return the pending cleanup work.
-	if request.Machine != nil {
-		currentID, err := parseOCIInstanceProviderID(request.Machine.Spec.ProviderID)
-		if err == nil && currentID != "" {
-			if currentID != instanceID {
-				current, getErr := client.GetInstance(ctx, currentID)
-				if getErr == nil && isReplacementFor(current, request, request.ProviderID) {
-					return machineops.OperationResult{ProviderID: providerIDPrefix + currentID, CleanupProviderID: request.ProviderID}, nil
-				}
-			} else {
-				current, getErr := client.GetInstance(ctx, currentID)
-				if getErr == nil && isReplacementFor(current, request, current.FreeformTags[tagOldProviderID]) {
-					return machineops.OperationResult{ProviderID: providerIDPrefix + currentID, CleanupProviderID: current.FreeformTags[tagOldProviderID]}, nil
-				}
+	currentID, err := parseOCIInstanceProviderID(request.Machine.Spec.ProviderID)
+	if err == nil && currentID != "" {
+		current, getErr := client.GetInstance(ctx, currentID)
+		if getErr == nil {
+			if currentID != instanceID && isReplacementFor(current, request, request.ProviderID) {
+				return machineops.OperationResult{ProviderID: providerIDPrefix + currentID, CleanupProviderID: request.ProviderID}, nil
+			}
+			if currentID == instanceID && isReplacementFor(current, request, current.FreeformTags[tagOldProviderID]) {
+				return machineops.OperationResult{ProviderID: providerIDPrefix + currentID, CleanupProviderID: current.FreeformTags[tagOldProviderID]}, nil
 			}
 		}
 	}
@@ -40,9 +40,6 @@ func (p *Provider) executeReplace(ctx context.Context, client computeClient, ins
 func (p *Provider) replaceHost(ctx context.Context, client computeClient, oldInstanceID string, request machineops.OperationRequest) (machineops.OperationResult, error) {
 	if strings.TrimSpace(request.ReplaceUserData) == "" {
 		return machineops.OperationResult{}, fmt.Errorf("replacement user data is required for OCI HostReplace")
-	}
-	if request.Machine == nil {
-		return machineops.OperationResult{}, fmt.Errorf("machine is required for OCI HostReplace")
 	}
 
 	oldInstance, err := replacementSourceInstance(ctx, client, oldInstanceID)
@@ -110,15 +107,13 @@ func waitForInstanceState(ctx context.Context, client computeClient, instance co
 		return instance, nil
 	}
 
-	deadline := time.Now().Add(replacementPollTimeout)
-	for {
-		if time.Now().After(deadline) {
-			return core.Instance{}, fmt.Errorf("timed out waiting for OCI instance %s to reach %s", *instance.Id, target)
-		}
+	waitCtx, cancel := context.WithTimeout(ctx, replacementPollTimeout)
+	defer cancel()
 
+	for {
 		// Poll before sleeping so tests and fast OCI transitions do not wait a full
 		// interval after the target state has already been reached.
-		updated, err := client.GetInstance(ctx, *instance.Id)
+		updated, err := client.GetInstance(waitCtx, *instance.Id)
 		if err != nil {
 			return core.Instance{}, fmt.Errorf("get OCI instance %s while waiting for %s: %w", *instance.Id, target, err)
 		}
@@ -130,8 +125,12 @@ func waitForInstanceState(ctx context.Context, client computeClient, instance co
 		}
 
 		select {
-		case <-ctx.Done():
-			return core.Instance{}, ctx.Err()
+		case <-waitCtx.Done():
+			if waitCtx.Err() == context.DeadlineExceeded {
+				return core.Instance{}, fmt.Errorf("timed out waiting for OCI instance %s to reach %s", *instance.Id, target)
+			}
+
+			return core.Instance{}, waitCtx.Err()
 		case <-time.After(replacementPollInterval):
 		}
 	}
