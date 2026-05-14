@@ -118,6 +118,10 @@ type BuildAgentConfigParams struct {
 	// TPM-based attestation (e.g. "http://10.0.0.1:8880"). When non-empty
 	// an Attest section is included in the config.
 	AttestURL string
+
+	// NodeName overrides the Kubernetes Node name used by kubelet. When empty,
+	// the agent resolves the node name from the host hostname.
+	NodeName string
 }
 
 // BuildAgentConfig constructs an AgentConfig from a Machine and cluster-level
@@ -176,6 +180,7 @@ func BuildAgentConfig(params BuildAgentConfigParams) UnboundedAgentConfig {
 	cfg := UnboundedAgentConfig{
 		AgentConfig: config.AgentConfig{
 			MachineName: machine.Name,
+			NodeName:    params.NodeName,
 			Cluster: AgentClusterConfig{
 				CaCertBase64: params.Cluster.CACertBase64,
 				ClusterDNS:   params.Cluster.ClusterDNS,

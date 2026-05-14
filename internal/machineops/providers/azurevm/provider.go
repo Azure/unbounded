@@ -67,15 +67,15 @@ func (p *Provider) Supports(operation unboundedv1alpha3.OperationKind) bool {
 	return ok
 }
 
-func (p *Provider) Execute(ctx context.Context, request machineops.OperationRequest) error {
+func (p *Provider) Execute(ctx context.Context, request machineops.OperationRequest) (machineops.OperationResult, error) {
 	operation, ok := azureVMOperations[request.Operation]
 	if !ok {
-		return fmt.Errorf("unsupported Azure VM operation %q", request.Operation)
+		return machineops.OperationResult{}, fmt.Errorf("unsupported Azure VM operation %q", request.Operation)
 	}
 
 	ref, err := parseAzureVMProviderID(request.ProviderID)
 	if err != nil {
-		return err
+		return machineops.OperationResult{}, err
 	}
 
 	ref.ReplaceUserData = request.ReplaceUserData
@@ -87,10 +87,14 @@ func (p *Provider) Execute(ctx context.Context, request machineops.OperationRequ
 
 	client, err := newClient(ref.SubscriptionID)
 	if err != nil {
-		return fmt.Errorf("create Azure VM client: %w", err)
+		return machineops.OperationResult{}, fmt.Errorf("create Azure VM client: %w", err)
 	}
 
-	return operation(ctx, client, ref)
+	return machineops.OperationResult{}, operation(ctx, client, ref)
+}
+
+func (p *Provider) Cleanup(context.Context, machineops.OperationRequest, machineops.OperationResult) error {
+	return nil
 }
 
 type azureVMResourceRef struct {
