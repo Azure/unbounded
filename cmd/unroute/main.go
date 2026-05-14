@@ -1,14 +1,18 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-// unroute dumps the eBPF LPM trie tunnel maps (unbounded_endpoints_v4 and
-// unbounded_endpoints_v6) in human-readable or JSON format. It can also perform
-// a longest-prefix-match lookup for a specific IP address or dump the
-// local_cidrs map.
+// unroute dumps the eBPF tunnel-endpoint LPM trie (unb_endpts) in
+// human-readable, JSON, or raw-hex form. It can also perform a
+// longest-prefix-match lookup for a specific IP address.
+//
+// Both IPv4 and IPv6 destinations share a single map. IPv4 entries are
+// stored in IPv4-mapped IPv6 form (::ffff:<v4>); the --raw, --json, and
+// human-readable dumps unmap them on display.
 package main
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -22,60 +26,13 @@ import (
 	"github.com/cilium/ebpf"
 	flag "github.com/spf13/pflag"
 
+	ebpfpkg "github.com/Azure/unbounded/internal/net/ebpf"
 	"github.com/Azure/unbounded/internal/version"
 )
 
-const (
-	mapName   = "unbounded_endpo" // truncated from unbounded_endpoints_v{4,6}
-	v4KeySize = 8                 // sizeof(lpmKeyV4)
-	v6KeySize = 20                // sizeof(lpmKeyV6)
-)
-
-// lpmKeyV4 matches struct lpm_key_v4 in the BPF programs.
-type lpmKeyV4 struct {
-	Prefixlen uint32
-	Addr      uint32
-}
-
-// lpmKeyV6 matches struct lpm_key_v6 in the BPF programs.
-type lpmKeyV6 struct {
-	Prefixlen uint32
-	Addr      [4]uint32
-}
-
-const maxNexthops = 4
-
-// tunnelNexthopV4 matches struct tunnel_nexthop in the BPF programs.
-type tunnelNexthopV4 struct {
-	RemoteIPv4 uint32
-	VNI        uint32
-	IfIndex    uint32
-	Flags      uint32
-	Protocol   uint32
-}
-
-// tunnelEndpointV4 matches struct tunnel_endpoint_v4 in the BPF programs.
-type tunnelEndpointV4 struct {
-	Nexthops [maxNexthops]tunnelNexthopV4
-	Count    uint32
-}
-
-// tunnelNexthopV6 matches struct tunnel_nexthop_v6 in the BPF programs.
-type tunnelNexthopV6 struct {
-	RemoteIPv6 [4]uint32
-	VNI        uint32
-	IfIndex    uint32
-	Flags      uint32
-	Protocol   uint32
-}
-
-// tunnelEndpointV6 matches struct tunnel_endpoint_v6 in the BPF programs.
-type tunnelEndpointV6 struct {
-	Nexthops [maxNexthops]tunnelNexthopV6
-	Count    uint32
-}
-
-// entry is the unified representation for display output.
+// entry is the human-readable representation of one nexthop in one trie
+// entry. We emit one entry per nexthop so multi-nexthop CIDRs produce
+// multiple rows.
 type entry struct {
 	CIDR      string `json:"cidr"`
 	Remote    string `json:"remote"`
@@ -86,24 +43,37 @@ type entry struct {
 	VNI       uint32 `json:"vni"`
 	MTU       int    `json:"mtu"`
 	IfIndex   uint32 `json:"ifindex"`
+	Family    string `json:"family"` // "v4" or "v6", for client filtering
+}
+
+// rawEntry is the structured representation of one trie entry in raw-hex
+// dump mode (no annotation, no interface resolution).
+type rawEntry struct {
+	KeyHex   string `json:"key"`
+	ValueHex string `json:"value"`
+	Family   string `json:"family"`
 }
 
 func main() {
 	var (
-		showLocal   bool
 		showVersion bool
 		jsonOutput  bool
+		rawOutput   bool
 		statusPort  int
+		v4Only      bool
+		v6Only      bool
 	)
 
-	flag.BoolVarP(&jsonOutput, "json", "j", false, "Output entries as JSON array")
-	flag.BoolVar(&showLocal, "local", false, "Dump the local_cidrs map instead of tunnel endpoints")
+	flag.BoolVarP(&jsonOutput, "json", "j", false, "Output entries as JSON")
+	flag.BoolVarP(&rawOutput, "raw", "r", false, "Dump map entries as raw key/value hex")
+	flag.BoolVarP(&v4Only, "v4-only", "4", false, "Show only IPv4 entries")
+	flag.BoolVarP(&v6Only, "v6-only", "6", false, "Show only IPv6 entries")
 	flag.BoolVar(&showVersion, "version", false, "Print version and exit")
 	flag.IntVar(&statusPort, "status-port", 9998, "Port of the local node status endpoint")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: unroute [options] [IP_ADDRESS]\n\n")
-		fmt.Fprintf(os.Stderr, "Dump the eBPF LPM trie tunnel maps in human-readable format.\n")
+		fmt.Fprintf(os.Stderr, "Dump the eBPF tunnel-endpoint LPM trie (unb_endpts).\n")
 		fmt.Fprintf(os.Stderr, "If an IP address is given, perform a longest-prefix-match lookup.\n\n")
 		flag.PrintDefaults()
 	}
@@ -115,18 +85,22 @@ func main() {
 		os.Exit(0)
 	}
 
-	if showLocal {
-		if err := dumpLocalCIDRs(); err != nil {
-			fmt.Fprintf(os.Stderr, "unroute: %v\n", err)
-			os.Exit(1)
-		}
+	if v4Only && v6Only {
+		fmt.Fprintln(os.Stderr, "unroute: -4 and -6 are mutually exclusive")
+		os.Exit(2)
+	}
 
-		return
+	familyFilter := familyAll
+	switch {
+	case v4Only:
+		familyFilter = familyV4
+	case v6Only:
+		familyFilter = familyV6
 	}
 
 	args := flag.Args()
 	if len(args) > 0 {
-		if err := lookupEntry(args[0], jsonOutput, statusPort); err != nil {
+		if err := lookupEntry(args[0], jsonOutput, statusPort, familyFilter); err != nil {
 			fmt.Fprintf(os.Stderr, "unroute: %v\n", err)
 			os.Exit(1)
 		}
@@ -134,24 +108,39 @@ func main() {
 		return
 	}
 
-	if err := dumpTunnelEndpoints(jsonOutput, statusPort); err != nil {
+	if rawOutput {
+		if err := dumpRaw(jsonOutput, familyFilter); err != nil {
+			fmt.Fprintf(os.Stderr, "unroute: %v\n", err)
+			os.Exit(1)
+		}
+
+		return
+	}
+
+	if err := dumpTunnelEndpoints(jsonOutput, statusPort, familyFilter); err != nil {
 		fmt.Fprintf(os.Stderr, "unroute: %v\n", err)
 		os.Exit(1)
 	}
 }
 
+const (
+	familyAll = iota
+	familyV4
+	familyV6
+)
+
 // protocolName returns the tunnel protocol name for the given protocol constant.
 func protocolName(proto uint32) string {
 	switch proto {
-	case 1:
+	case ebpfpkg.TunnelProtoGENEVE:
 		return "GENEVE"
-	case 2:
+	case ebpfpkg.TunnelProtoVXLAN:
 		return "VXLAN"
-	case 3:
+	case ebpfpkg.TunnelProtoIPIP:
 		return "IPIP"
-	case 4:
+	case ebpfpkg.TunnelProtoWireGuard:
 		return "WireGuard"
-	case 5:
+	case ebpfpkg.TunnelProtoNone:
 		return "None"
 	default:
 		return fmt.Sprintf("unknown(%d)", proto)
@@ -169,11 +158,9 @@ func resolveInterface(ifindex uint32) (string, int) {
 	return iface.Name, iface.MTU
 }
 
-// findMapsByName scans all loaded BPF maps and returns every map matching
-// the given name.
-func findMapsByName(name string) ([]*ebpf.Map, error) {
-	var maps []*ebpf.Map
-
+// findMap returns the single unb_endpts map. Returns an explanatory error
+// if the map is not present (i.e. the BPF program is not loaded).
+func findMap() (*ebpf.Map, error) {
 	id := ebpf.MapID(0)
 
 	for {
@@ -195,146 +182,190 @@ func findMapsByName(name string) ([]*ebpf.Map, error) {
 			continue
 		}
 
-		if info.Name == name {
-			maps = append(maps, m)
-		} else {
-			_ = m.Close() //nolint:errcheck
-		}
-	}
-
-	if len(maps) == 0 {
-		return nil, fmt.Errorf("BPF map %q not found (are the BPF programs loaded?)", name)
-	}
-
-	return maps, nil
-}
-
-// findMapByNameAndKeySize scans loaded BPF maps for one matching both name
-// and key size.
-func findMapByNameAndKeySize(name string, keySize uint32) (*ebpf.Map, error) {
-	id := ebpf.MapID(0)
-
-	for {
-		var err error
-
-		id, err = ebpf.MapGetNextID(id)
-		if err != nil {
-			break
-		}
-
-		m, err := ebpf.NewMapFromID(id)
-		if err != nil {
-			continue
-		}
-
-		info, err := m.Info()
-		if err != nil {
-			_ = m.Close() //nolint:errcheck
-			continue
-		}
-
-		if info.Name == name && info.KeySize == keySize {
+		if info.Name == ebpfpkg.MapName {
 			return m, nil
 		}
 
 		_ = m.Close() //nolint:errcheck
 	}
 
-	return nil, fmt.Errorf("BPF map %q (key size %d) not found", name, keySize)
+	return nil, fmt.Errorf("BPF map %q not found (is the unbounded_encap program loaded?)", ebpfpkg.MapName)
 }
 
-// uint32ToIPv4LE converts a uint32 stored via LittleEndian.Uint32 back to
-// a dotted-decimal IPv4 string.
-func uint32ToIPv4LE(v uint32) net.IP {
-	ip := make(net.IP, 4)
-	binary.LittleEndian.PutUint32(ip, v)
-
-	return ip
-}
-
-// uint32ToIPv4BE converts a uint32 stored via BigEndian.Uint32 (network byte
-// order) back to a dotted-decimal IPv4 string.
-func uint32ToIPv4BE(v uint32) net.IP {
-	ip := make(net.IP, 4)
-	binary.BigEndian.PutUint32(ip, v)
-
-	return ip
-}
-
-// uint32ArrayToIPv6 converts a [4]uint32 array where each segment was stored
-// via LittleEndian.Uint32 back to a 16-byte IPv6 address.
-func uint32ArrayToIPv6(arr [4]uint32) net.IP {
-	ip := make(net.IP, 16)
-	binary.LittleEndian.PutUint32(ip[0:4], arr[0])
-	binary.LittleEndian.PutUint32(ip[4:8], arr[1])
-	binary.LittleEndian.PutUint32(ip[8:12], arr[2])
-	binary.LittleEndian.PutUint32(ip[12:16], arr[3])
-
-	return ip
-}
-
-// formatIP returns the string representation of an IP, using IPv4 notation
-// for IPv4-mapped IPv6 addresses.
-func formatIP(ip net.IP) string {
-	if v4 := ip.To4(); v4 != nil {
-		return v4.String()
+// dumpTunnelEndpoints walks the trie and prints one row per nexthop,
+// classifying each entry by whether the key is IPv4-mapped or native v6.
+func dumpTunnelEndpoints(jsonOutput bool, statusPort, familyFilter int) error {
+	m, err := findMap()
+	if err != nil {
+		return err
 	}
 
-	return ip.String()
+	defer func() { _ = m.Close() }() //nolint:errcheck
+
+	entries, err := collectEntries(m, familyFilter)
+	if err != nil {
+		return err
+	}
+
+	annotateEntries(entries, statusPort)
+	sort.Slice(entries, func(i, j int) bool { return entries[i].CIDR < entries[j].CIDR })
+
+	return printEntries(entries, jsonOutput)
 }
 
-// makeEntriesV4 builds entries from v4 key/value pairs, one per nexthop.
-func makeEntriesV4(key lpmKeyV4, val tunnelEndpointV4) []entry {
-	var entries []entry
+// dumpRaw prints each map entry as <key hex> -> <value hex>, with no
+// annotation, no interface resolution, and no status-server roundtrip. The
+// caller can use this for byte-exact comparisons against what the agent
+// believes it pushed.
+func dumpRaw(jsonOutput bool, familyFilter int) error {
+	m, err := findMap()
+	if err != nil {
+		return err
+	}
 
-	cidr := fmt.Sprintf("%s/%d", uint32ToIPv4LE(key.Addr), key.Prefixlen)
+	defer func() { _ = m.Close() }() //nolint:errcheck
 
-	for i := uint32(0); i < val.Count && i < maxNexthops; i++ {
-		nh := val.Nexthops[i]
-		ifName, mtu := resolveInterface(nh.IfIndex)
-		entries = append(entries, entry{
-			CIDR:      cidr,
-			Remote:    uint32ToIPv4BE(nh.RemoteIPv4).String(),
-			Interface: ifName,
-			Protocol:  protocolName(nh.Protocol),
-			Healthy:   nh.Flags&0x02 != 0,
-			VNI:       nh.VNI,
-			MTU:       mtu,
-			IfIndex:   nh.IfIndex,
+	var (
+		key  ebpfpkg.LpmKey
+		val  ebpfpkg.RawTunnelEndpoint
+		rows []rawEntry
+	)
+
+	iter := m.Iterate()
+	for iter.Next(&key, &val) {
+		family := familyOfKey(key)
+		if !familyMatches(familyFilter, family) {
+			continue
+		}
+
+		keyBytes := encodeKey(key)
+		valBytes := encodeValue(val)
+		rows = append(rows, rawEntry{
+			KeyHex:   hex.EncodeToString(keyBytes),
+			ValueHex: hex.EncodeToString(valBytes),
+			Family:   family,
 		})
 	}
 
-	return entries
+	if err := iter.Err(); err != nil {
+		return fmt.Errorf("iterate %s: %w", ebpfpkg.MapName, err)
+	}
+
+	sort.Slice(rows, func(i, j int) bool { return rows[i].KeyHex < rows[j].KeyHex })
+
+	if jsonOutput {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+
+		return enc.Encode(rows)
+	}
+
+	if len(rows) == 0 {
+		fmt.Println("(no entries)")
+		return nil
+	}
+
+	for _, r := range rows {
+		fmt.Printf("%s %s -> %s\n", r.Family, r.KeyHex, r.ValueHex)
+	}
+
+	fmt.Printf("\n%d entries\n", len(rows))
+
+	return nil
 }
 
-// makeEntriesV6 builds entries from v6 key/value pairs, one per nexthop.
-func makeEntriesV6(key lpmKeyV6, val tunnelEndpointV6) []entry {
+// lookupEntry performs an LPM lookup for the supplied IP address against
+// the unified trie. The IP is mapped to v6 form before lookup; the family
+// filter, if set, must match the IP's natural family.
+func lookupEntry(ipStr string, jsonOutput bool, statusPort, familyFilter int) error {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return fmt.Errorf("invalid IP address: %s", ipStr)
+	}
+
+	ipFamily := familyV6
+	if ip.To4() != nil {
+		ipFamily = familyV4
+	}
+
+	if !familyMatches(familyFilter, familyName(ipFamily)) {
+		return fmt.Errorf("address %s is %s but only %s entries requested", ipStr, familyName(ipFamily), familyFilterName(familyFilter))
+	}
+
+	m, err := findMap()
+	if err != nil {
+		return err
+	}
+
+	defer func() { _ = m.Close() }() //nolint:errcheck
+
+	var key ebpfpkg.LpmKey
+
+	key.Prefixlen = 128
+	copy(key.Addr[:], ip.To16())
+
+	var val ebpfpkg.RawTunnelEndpoint
+	if err := m.Lookup(&key, &val); err != nil {
+		return fmt.Errorf("lookup %s: %w", ipStr, err)
+	}
+
+	// We can't recover the prefix length the trie matched against; fall
+	// back to the lookup key. For display, take the prefix from the
+	// matched entry by iterating once more and finding the longest match.
+	// In practice users care about the value here, not the prefix.
+	entries := makeEntries(key, val, familyFilter)
+	annotateEntries(entries, statusPort)
+
+	return printEntries(entries, jsonOutput)
+}
+
+// collectEntries iterates the map and builds display entries, filtering
+// by family.
+func collectEntries(m *ebpf.Map, familyFilter int) ([]entry, error) {
+	var (
+		key ebpfpkg.LpmKey
+		val ebpfpkg.RawTunnelEndpoint
+	)
+
 	var entries []entry
 
-	cidr := fmt.Sprintf("%s/%d", formatIP(uint32ArrayToIPv6(key.Addr)), key.Prefixlen)
+	iter := m.Iterate()
+	for iter.Next(&key, &val) {
+		entries = append(entries, makeEntries(key, val, familyFilter)...)
+	}
 
-	for i := uint32(0); i < val.Count && i < maxNexthops; i++ {
+	if err := iter.Err(); err != nil {
+		return entries, fmt.Errorf("iterate %s: %w", ebpfpkg.MapName, err)
+	}
+
+	return entries, nil
+}
+
+// makeEntries builds entries from a single trie key/value pair, one per
+// nexthop, optionally filtered by family.
+func makeEntries(key ebpfpkg.LpmKey, val ebpfpkg.RawTunnelEndpoint, familyFilter int) []entry {
+	family := familyOfKey(key)
+	if !familyMatches(familyFilter, family) {
+		return nil
+	}
+
+	cidrStr := formatKey(key)
+
+	entries := make([]entry, 0, val.Count)
+	for i := uint32(0); i < val.Count && i < uint32(ebpfpkg.MaxNexthops); i++ {
 		nh := val.Nexthops[i]
-		ifName, mtu := resolveInterface(nh.IfIndex)
-
-		var remote string
-		if nh.Flags&0x04 != 0 {
-			// IPv6 underlay
-			remote = formatIP(uint32ArrayToIPv6(nh.RemoteIPv6))
-		} else {
-			// IPv4 underlay (stored in first element of union)
-			remote = uint32ToIPv4BE(nh.RemoteIPv6[0]).String()
-		}
+		ifName, mtu := resolveInterface(nh.Ifindex)
 
 		entries = append(entries, entry{
-			CIDR:      cidr,
-			Remote:    remote,
+			CIDR:      cidrStr,
+			Remote:    formatEndpoint(nh.RemoteEndpoint),
 			Interface: ifName,
 			Protocol:  protocolName(nh.Protocol),
-			Healthy:   nh.Flags&0x02 != 0,
-			VNI:       nh.VNI,
+			Healthy:   nh.Healthy != 0,
+			VNI:       nh.Vni,
 			MTU:       mtu,
-			IfIndex:   nh.IfIndex,
+			IfIndex:   nh.Ifindex,
+			Family:    family,
 		})
 	}
 
@@ -375,42 +406,108 @@ func printEntries(entries []entry, jsonOutput bool) error {
 	return nil
 }
 
-// collectV4Entries iterates a v4 tunnel endpoint map and appends entries.
-func collectV4Entries(m *ebpf.Map, entries []entry) ([]entry, error) {
-	var (
-		key lpmKeyV4
-		val tunnelEndpointV4
-	)
+// formatKey renders an LPM key as a CIDR string. v4-mapped entries are
+// unmapped to dotted-quad with the prefix length offset removed.
+func formatKey(key ebpfpkg.LpmKey) string {
+	if ebpfpkg.IsV4Mapped(key.Addr) {
+		ip := net.IPv4(key.Addr[12], key.Addr[13], key.Addr[14], key.Addr[15])
 
-	iter := m.Iterate()
-	for iter.Next(&key, &val) {
-		entries = append(entries, makeEntriesV4(key, val)...)
+		prefix := int(key.Prefixlen) - 96
+		if prefix < 0 {
+			prefix = 0
+		}
+
+		return fmt.Sprintf("%s/%d", ip.String(), prefix)
 	}
 
-	if err := iter.Err(); err != nil {
-		return entries, fmt.Errorf("iterate unbounded_endpoints_v4: %w", err)
-	}
+	ip := net.IP(append([]byte(nil), key.Addr[:]...))
 
-	return entries, nil
+	return fmt.Sprintf("%s/%d", ip.String(), key.Prefixlen)
 }
 
-// collectV6Entries iterates a v6 tunnel endpoint map and appends entries.
-func collectV6Entries(m *ebpf.Map, entries []entry) ([]entry, error) {
-	var (
-		key lpmKeyV6
-		val tunnelEndpointV6
-	)
-
-	iter := m.Iterate()
-	for iter.Next(&key, &val) {
-		entries = append(entries, makeEntriesV6(key, val)...)
+// formatEndpoint renders a 16-byte underlay endpoint as either a v4
+// dotted-quad (if it's IPv4-mapped) or the canonical v6 form.
+func formatEndpoint(addr [16]byte) string {
+	if ebpfpkg.IsV4Mapped(addr) {
+		return net.IPv4(addr[12], addr[13], addr[14], addr[15]).String()
 	}
 
-	if err := iter.Err(); err != nil {
-		return entries, fmt.Errorf("iterate unbounded_endpoints_v6: %w", err)
+	return net.IP(append([]byte(nil), addr[:]...)).String()
+}
+
+// familyOfKey returns "v4" or "v6" depending on whether the key is in
+// the IPv4-mapped IPv6 prefix.
+func familyOfKey(key ebpfpkg.LpmKey) string {
+	if ebpfpkg.IsV4Mapped(key.Addr) {
+		return "v4"
 	}
 
-	return entries, nil
+	return "v6"
+}
+
+func familyName(f int) string {
+	switch f {
+	case familyV4:
+		return "v4"
+	case familyV6:
+		return "v6"
+	}
+
+	return ""
+}
+
+func familyFilterName(f int) string {
+	switch f {
+	case familyV4:
+		return "v4"
+	case familyV6:
+		return "v6"
+	}
+
+	return "v4 or v6"
+}
+
+// familyMatches reports whether the given family ("v4" or "v6") satisfies
+// the requested filter.
+func familyMatches(filter int, family string) bool {
+	switch filter {
+	case familyV4:
+		return family == "v4"
+	case familyV6:
+		return family == "v6"
+	}
+
+	return true
+}
+
+// encodeKey serializes an LpmKey to its on-the-wire byte form (the same
+// bytes the kernel stores).
+func encodeKey(key ebpfpkg.LpmKey) []byte {
+	out := make([]byte, 4+16)
+	binary.NativeEndian.PutUint32(out[0:4], key.Prefixlen)
+	copy(out[4:], key.Addr[:])
+
+	return out
+}
+
+// encodeValue serializes a TunnelEndpointC to its on-the-wire byte form.
+func encodeValue(val ebpfpkg.RawTunnelEndpoint) []byte {
+	const nhSize = 16 + 4 + 4 + 4 + 4 // RemoteEndpoint + 4*uint32
+
+	out := make([]byte, nhSize*ebpfpkg.MaxNexthops+4)
+
+	for i := 0; i < ebpfpkg.MaxNexthops; i++ {
+		base := i * nhSize
+		copy(out[base:base+16], val.Nexthops[i].RemoteEndpoint[:])
+		binary.NativeEndian.PutUint32(out[base+16:base+20], val.Nexthops[i].Vni)
+		binary.NativeEndian.PutUint32(out[base+20:base+24], val.Nexthops[i].Ifindex)
+		binary.NativeEndian.PutUint32(out[base+24:base+28], val.Nexthops[i].Healthy)
+		binary.NativeEndian.PutUint32(out[base+28:base+32], val.Nexthops[i].Protocol)
+	}
+
+	binary.NativeEndian.PutUint32(out[nhSize*ebpfpkg.MaxNexthops:], val.Count)
+
+	return out
 }
 
 // peerInfo holds the node name for a CIDR or endpoint.
@@ -440,8 +537,7 @@ type peerMaps struct {
 	byEndpoint map[string]peerInfo
 }
 
-// fetchPeerMaps queries the local status endpoint and builds lookup maps
-// keyed by CIDR and by tunnel endpoint (underlay IP).
+// fetchPeerMaps queries the local status endpoint and builds lookup maps.
 func fetchPeerMaps(statusPort int) peerMaps {
 	result := peerMaps{
 		byCIDR:     make(map[string]peerInfo),
@@ -474,18 +570,15 @@ func fetchPeerMaps(statusPort int) peerMaps {
 
 		if p.Tunnel.Endpoint != "" {
 			result.byEndpoint[p.Tunnel.Endpoint] = info
-			// Also index by IP without port so BPF entries (which
-			// store raw underlay IPs) can be matched.
 			if host, _, err := net.SplitHostPort(p.Tunnel.Endpoint); err == nil {
 				result.byEndpoint[host] = info
 			}
 		}
-		// Index by internal IPs for peers without tunnel endpoints.
+
 		for _, ip := range p.InternalIPs {
 			result.byEndpoint[ip] = info
 		}
-		// Index pod CIDR gateways so that per-node BPF entries can
-		// be resolved by their CIDR's first usable IP.
+
 		for _, gw := range p.PodCidrGateways {
 			result.byEndpoint[gw] = info
 		}
@@ -495,10 +588,7 @@ func fetchPeerMaps(statusPort int) peerMaps {
 }
 
 // annotateEntries enriches entries with the destination node name from the
-// local status endpoint. It first tries remote (underlay) IP match, then
-// falls back to CIDR match. Remote IP is checked first because multi-nexthop
-// entries share the same CIDR but have different remote IPs pointing to
-// different nodes.
+// local status endpoint.
 func annotateEntries(entries []entry, statusPort int) {
 	pm := fetchPeerMaps(statusPort)
 	if len(pm.byCIDR) == 0 && len(pm.byEndpoint) == 0 {
@@ -506,8 +596,6 @@ func annotateEntries(entries []entry, statusPort int) {
 	}
 
 	for i := range entries {
-		// Try remote (underlay) IP first -- this correctly resolves
-		// multi-nexthop entries where each nexthop targets a different node.
 		if info, ok := pm.byEndpoint[entries[i].Remote]; ok {
 			entries[i].Node = info.Name
 			continue
@@ -517,9 +605,7 @@ func annotateEntries(entries []entry, statusPort int) {
 			entries[i].Node = info.Name
 			continue
 		}
-		// Try the CIDR's first usable IP (gateway IP) as a lookup key.
-		// This resolves per-node pod CIDR entries (e.g. 100.80.0.0/24)
-		// by matching against podCidrGateways (100.80.0.1).
+
 		if _, cidr, err := net.ParseCIDR(entries[i].CIDR); err == nil {
 			gw := make(net.IP, len(cidr.IP))
 			copy(gw, cidr.IP)
@@ -537,150 +623,4 @@ func annotateEntries(entries []entry, statusPort int) {
 			}
 		}
 	}
-}
-
-// dumpTunnelEndpoints iterates all tunnel endpoint maps (v4 and v6) and
-// prints their entries.
-func dumpTunnelEndpoints(jsonOutput bool, statusPort int) error {
-	maps, err := findMapsByName(mapName)
-	if err != nil {
-		return err
-	}
-
-	defer func() {
-		for _, m := range maps {
-			_ = m.Close() //nolint:errcheck
-		}
-	}()
-
-	var entries []entry
-
-	for _, m := range maps {
-		info, err := m.Info()
-		if err != nil {
-			return fmt.Errorf("map info: %w", err)
-		}
-
-		switch info.KeySize {
-		case v4KeySize:
-			entries, err = collectV4Entries(m, entries)
-		case v6KeySize:
-			entries, err = collectV6Entries(m, entries)
-		default:
-			continue
-		}
-
-		if err != nil {
-			return err
-		}
-	}
-
-	annotateEntries(entries, statusPort)
-	sort.Slice(entries, func(i, j int) bool { return entries[i].CIDR < entries[j].CIDR })
-
-	return printEntries(entries, jsonOutput)
-}
-
-// dumpLocalCIDRs iterates the local_cidrs map and prints each entry.
-func dumpLocalCIDRs() error {
-	maps, err := findMapsByName("local_cidrs")
-	if err != nil {
-		return err
-	}
-
-	defer func() {
-		for _, m := range maps {
-			_ = m.Close() //nolint:errcheck
-		}
-	}()
-
-	count := 0
-
-	for _, m := range maps {
-		var (
-			key lpmKeyV4
-			val uint32
-		)
-
-		iter := m.Iterate()
-		for iter.Next(&key, &val) {
-			cidr := fmt.Sprintf("%s/%d", uint32ToIPv4LE(key.Addr), key.Prefixlen)
-			fmt.Printf("%s (value=%d)\n", cidr, val)
-
-			count++
-		}
-
-		if err := iter.Err(); err != nil {
-			return fmt.Errorf("iterate local_cidrs: %w", err)
-		}
-	}
-
-	if count == 0 {
-		fmt.Println("(no entries)")
-	} else {
-		fmt.Printf("\n%d entries\n", count)
-	}
-
-	return nil
-}
-
-// lookupEntry looks up a single IP address in the appropriate tunnel
-// endpoint trie (v4 or v6) and displays the matching entry.
-func lookupEntry(ipStr string, jsonOutput bool, statusPort int) error {
-	ip := net.ParseIP(ipStr)
-	if ip == nil {
-		return fmt.Errorf("invalid IP address: %s", ipStr)
-	}
-
-	var entries []entry
-
-	if ip4 := ip.To4(); ip4 != nil {
-		m, err := findMapByNameAndKeySize(mapName, v4KeySize)
-		if err != nil {
-			return err
-		}
-
-		defer func() { _ = m.Close() }() //nolint:errcheck
-
-		key := lpmKeyV4{
-			Prefixlen: 32,
-			Addr:      binary.LittleEndian.Uint32(ip4),
-		}
-
-		var val tunnelEndpointV4
-		if err := m.Lookup(&key, &val); err != nil {
-			return fmt.Errorf("lookup %s: %w", ipStr, err)
-		}
-
-		entries = makeEntriesV4(key, val)
-	} else {
-		ip6 := ip.To16()
-		if ip6 == nil {
-			return fmt.Errorf("invalid IP address: %s", ipStr)
-		}
-
-		m, err := findMapByNameAndKeySize(mapName, v6KeySize)
-		if err != nil {
-			return err
-		}
-
-		defer func() { _ = m.Close() }() //nolint:errcheck
-
-		key := lpmKeyV6{Prefixlen: 128}
-		key.Addr[0] = binary.LittleEndian.Uint32(ip6[0:4])
-		key.Addr[1] = binary.LittleEndian.Uint32(ip6[4:8])
-		key.Addr[2] = binary.LittleEndian.Uint32(ip6[8:12])
-		key.Addr[3] = binary.LittleEndian.Uint32(ip6[12:16])
-
-		var val tunnelEndpointV6
-		if err := m.Lookup(&key, &val); err != nil {
-			return fmt.Errorf("lookup %s: %w", ipStr, err)
-		}
-
-		entries = makeEntriesV6(key, val)
-	}
-
-	annotateEntries(entries, statusPort)
-
-	return printEntries(entries, jsonOutput)
 }

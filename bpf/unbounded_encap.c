@@ -4,12 +4,25 @@
  */
 
 // SPDX-License-Identifier: MIT
-// unbounded_encap.c -- TC egress classifier for eBPF tunnel dataplane.
+// unbounded_encap.c -- TC egress classifier for the eBPF tunnel dataplane.
 //
-// Runs on unbounded0 egress. Intercepts packets destined to remote overlay
-// CIDRs, selects a nexthop using consistent hashing (HRW), and redirects
-// to the appropriate tunnel interface. Supports ECMP with health-aware
-// nexthop selection.
+// A single SEC("tc") program (unbounded_encap) runs on the egress hook of
+// the underlay-facing interface. Both IPv4 and IPv6 overlay destinations
+// are stored in one LPM trie (unb_endpts) keyed on a 16-byte address.
+// IPv4 destinations are stored in IPv4-mapped IPv6 form (::ffff:<v4>), so
+// the trie's longest-prefix-match naturally segregates v4 entries (which
+// live under ::ffff:0:0/96) from native v6 entries.
+//
+// The underlay endpoint stored in each nexthop is also a 16-byte address.
+// IPv4 underlay addresses live in IPv4-mapped form; native v6 underlay
+// addresses are stored as-is. The BPF program inspects the first 12 bytes
+// of remote_endpoint at runtime to decide whether to call
+// bpf_skb_set_tunnel_key with BPF_F_TUNINFO_IPV6 or with remote_ipv4.
+//
+// Single-nexthop entries (the common endpoint-node case) forward
+// unconditionally; the healthy flag only gates ECMP selection on
+// multi-nexthop entries (where it lets us drain a known-bad gateway
+// without dropping traffic destined to a singleton peer).
 
 #include <linux/bpf.h>
 #include <linux/pkt_cls.h>
@@ -21,85 +34,54 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
-// Healthcheck UDP port -- probes always forwarded to unhealthy peers.
-#define HEALTHCHECK_PORT 9997
-
 // Maximum number of nexthops per CIDR prefix.
 #define MAX_NEXTHOPS 4
 
-// --- Nexthop and endpoint structures ---
-
-struct tunnel_nexthop {
-	__u32 remote_ipv4;
-	__u32 vni;
-	__u32 ifindex;
-	__u32 flags;
-	__u32 protocol;
-};
-
-struct tunnel_endpoint_v4 {
-	struct tunnel_nexthop nexthops[MAX_NEXTHOPS];
-	__u32 count;
-};
-
-struct lpm_key_v4 {
-	__u32 prefixlen;
-	__u32 addr;
-};
-
-struct tunnel_nexthop_v6 {
-	union {
-		__u32 remote_ipv4;
-		__u32 remote_ipv6[4];
-	};
-	__u32 vni;
-	__u32 ifindex;
-	__u32 flags;
-	__u32 protocol;
-};
-
-struct tunnel_endpoint_v6 {
-	struct tunnel_nexthop_v6 nexthops[MAX_NEXTHOPS];
-	__u32 count;
-};
-
-struct lpm_key_v6 {
-	__u32 prefixlen;
-	__u32 addr[4];
-};
-
-// Tunnel endpoint flags.
-#define TUNNEL_F_SET_KEY       0x01
-#define TUNNEL_F_HEALTHY       0x02
-#define TUNNEL_F_IPV6_UNDERLAY 0x04
-
-// Protocol constants (display/debugging only).
+// Protocol constants matching internal/net/ebpf.TunnelProto*.
 #define PROTO_GENEVE    1
 #define PROTO_VXLAN     2
 #define PROTO_IPIP      3
 #define PROTO_WIREGUARD 4
 #define PROTO_NONE      5
 
-// --- Maps ---
+// --- Map key / value types ---
+
+struct lpm_key {
+	__u32 prefixlen;
+	__u8  addr[16];
+};
+
+struct tunnel_nexthop {
+	__u8  remote_endpoint[16]; // ::ffff:<v4> for v4; native for v6 underlay
+	__u32 vni;
+	__u32 ifindex;
+	__u32 healthy; // 0 = withdrawn; non-zero = eligible for selection
+	__u32 protocol;
+};
+
+struct tunnel_endpoint {
+	struct tunnel_nexthop nexthops[MAX_NEXTHOPS];
+	__u32 count;
+};
+
+// --- Map ---
+//
+// Single LPM trie keyed on a 16-byte address. The kernel limits map names
+// to 15 chars (+ NUL), so we keep the name short for readable
+// "bpftool map dump" output.
 
 struct {
 	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
 	__uint(max_entries, 16384);
-	__type(key, struct lpm_key_v4);
-	__type(value, struct tunnel_endpoint_v4);
+	__type(key, struct lpm_key);
+	__type(value, struct tunnel_endpoint);
 	__uint(map_flags, BPF_F_NO_PREALLOC);
-} unbounded_endpoints_v4 SEC(".maps");
-
-struct {
-	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
-	__uint(max_entries, 16384);
-	__type(key, struct lpm_key_v6);
-	__type(value, struct tunnel_endpoint_v6);
-	__uint(map_flags, BPF_F_NO_PREALLOC);
-} unbounded_endpoints_v6 SEC(".maps");
+} unb_endpts SEC(".maps");
 
 // --- Helpers ---
 
+// derive_mac_from_ipv4 fills a locally-administered destination MAC from
+// an IPv4 address in network byte order. Mirrors Go's TunnelMACFromIP.
 static __always_inline void derive_mac_from_ipv4(__u8 *mac, __u32 ip_be32)
 {
 	mac[0] = 0x02;
@@ -110,26 +92,73 @@ static __always_inline void derive_mac_from_ipv4(__u8 *mac, __u32 ip_be32)
 	mac[5] = 0xFF;
 }
 
-// jhash_3words -- Jenkins hash for HRW nexthop selection.
+// __jhash_final performs the final mixing round of the Jenkins hash. Used
+// by jhash_3words for the per-(flow, nexthop, endpoint) weighting inside
+// hrw_select. The flow hash itself comes from the kernel's skb->hash via
+// bpf_get_hash_recalc, so we do not need the full multi-round jhash2 in
+// this program.
+#define __jhash_final(a, b, c) do {                     \
+	c ^= b; c -= (b << 14) | (b >> 18);             \
+	a ^= c; a -= (c << 11) | (c >> 21);             \
+	b ^= a; b -= (a << 25) | (a >>  7);             \
+	c ^= b; c -= (b << 16) | (b >> 16);             \
+	a ^= c; a -= (c <<  4) | (c >> 28);             \
+	b ^= a; b -= (a << 14) | (a >> 18);             \
+	c ^= b; c -= (b << 24) | (b >>  8);             \
+} while (0)
+
+#define JHASH_INITVAL 0xdeadbeef
+
+// jhash_3words mirrors Linux's jhash_3words helper. We use it inside
+// hrw_select to compute a deterministic per-(flow_hash, index, endpoint)
+// weight; the full flow hash is provided by the kernel separately.
 static __always_inline __u32 jhash_3words(__u32 a, __u32 b, __u32 c)
 {
-	a += 0xdeadbeef + (3 << 2);
-	b += 0xdeadbeef + (3 << 2);
-	c += 0xdeadbeef + (3 << 2);
-	c ^= b; c -= (b << 14) | (b >> 18);
-	a ^= c; a -= (c << 11) | (c >> 21);
-	b ^= a; b -= (a << 25) | (a >> 7);
-	c ^= b; c -= (b << 16) | (b >> 16);
-	a ^= c; a -= (c << 4)  | (c >> 28);
-	b ^= a; b -= (a << 14) | (a >> 18);
-	c ^= b; c -= (b << 24) | (b >> 8);
+	a += JHASH_INITVAL + (3 << 2);
+	b += JHASH_INITVAL + (3 << 2);
+	c += JHASH_INITVAL + (3 << 2);
+	__jhash_final(a, b, c);
 	return c;
 }
 
-// hrw_select picks a nexthop using Highest Random Weight hashing.
-// Only healthy nexthops are considered unless is_healthcheck is set.
+// endpoint_low32 returns the low 32 bits of a 16-byte endpoint, used as a
+// hash mixing input. For IPv4-mapped underlays this is the IPv4 address
+// itself; for native v6 underlays it is the trailing 32 bits, which is
+// well-distributed across most address plans.
+static __always_inline __u32 endpoint_low32(const __u8 *endpoint16)
+{
+	__u32 lo;
+	__builtin_memcpy(&lo, endpoint16 + 12, sizeof(lo));
+	return lo;
+}
+
+// is_v4_mapped reports whether a 16-byte address is in ::ffff:0:0/96.
+static __always_inline int is_v4_mapped(const __u8 *addr16)
+{
+	__u64 zeros;
+	__u32 mid;
+	__builtin_memcpy(&zeros, addr16,     sizeof(zeros));
+	__builtin_memcpy(&mid,   addr16 + 8, sizeof(mid));
+	return zeros == 0 && mid == bpf_htonl(0x0000ffff);
+}
+
+// needs_tunnel_key reports whether the given protocol expects the BPF
+// program to populate bpf_tunnel_key. GENEVE/VXLAN/IPIP do; WireGuard and
+// None (plain redirect) do not.
+static __always_inline int needs_tunnel_key(__u32 protocol)
+{
+	return protocol == PROTO_GENEVE ||
+	       protocol == PROTO_VXLAN  ||
+	       protocol == PROTO_IPIP;
+}
+
+// hrw_select picks a nexthop using Highest Random Weight hashing among
+// healthy nexthops. Healthcheck packets are only routed through the
+// single-nexthop fast path in unbounded_encap; multi-nexthop entries
+// only carry production traffic, so this loop unconditionally filters
+// out unhealthy nexthops.
 static __always_inline int hrw_select(struct tunnel_nexthop *nhs, __u32 count,
-				      __u32 flow_hash, int is_healthcheck)
+				      __u32 flow_hash)
 {
 	__u32 best_weight = 0;
 	int best_idx = -1;
@@ -138,9 +167,10 @@ static __always_inline int hrw_select(struct tunnel_nexthop *nhs, __u32 count,
 	for (int i = 0; i < MAX_NEXTHOPS; i++) {
 		if ((__u32)i >= count)
 			break;
-		if (!is_healthcheck && !(nhs[i].flags & TUNNEL_F_HEALTHY))
+		if (!nhs[i].healthy)
 			continue;
-		__u32 w = jhash_3words(flow_hash, (__u32)i, nhs[i].remote_ipv4);
+		__u32 w = jhash_3words(flow_hash, (__u32)i,
+				       endpoint_low32(nhs[i].remote_endpoint));
 		if (best_idx < 0 || w > best_weight) {
 			best_weight = w;
 			best_idx = i;
@@ -149,112 +179,39 @@ static __always_inline int hrw_select(struct tunnel_nexthop *nhs, __u32 count,
 	return best_idx;
 }
 
-// Compute 5-tuple flow hash for consistent ECMP.
-static __always_inline __u32 flow_hash_v4(struct iphdr *iph, void *data_end)
+// build_v4_mapped_addr fills a 16-byte buffer with the IPv4-mapped IPv6
+// form of a 4-byte IPv4 address (already in network byte order).
+static __always_inline void build_v4_mapped_addr(__u8 *out16, __u32 v4_be)
 {
-	__u32 ports = 0;
-	if (iph->protocol == IPPROTO_TCP || iph->protocol == IPPROTO_UDP) {
-		__u16 *ph = (void *)(iph + 1);
-		if ((void *)(ph + 2) <= data_end)
-			ports = ((__u32)ph[0] << 16) | ph[1];
-	}
-	return jhash_3words(iph->saddr, iph->daddr,
-			    ((__u32)iph->protocol << 24) | ports);
+	__builtin_memset(out16, 0, 10);
+	out16[10] = 0xff;
+	out16[11] = 0xff;
+	__builtin_memcpy(&out16[12], &v4_be, sizeof(v4_be));
 }
 
-// --- IPv4 handler ---
-
-static __always_inline int handle_ipv4(struct __sk_buff *skb,
-				       struct ethhdr *eth, struct iphdr *iph,
-				       void *data_end)
+// set_tunnel_key_from_endpoint populates a bpf_tunnel_key from a
+// remote_endpoint, choosing IPv4 vs IPv6 framing based on the v4-mapped
+// check, and calls bpf_skb_set_tunnel_key.
+static __always_inline void set_tunnel_key_from_endpoint(struct __sk_buff *skb,
+							 const struct tunnel_nexthop *nh)
 {
-	struct lpm_key_v4 key = { .prefixlen = 32, .addr = iph->daddr };
+	struct bpf_tunnel_key tkey = {};
+	tkey.tunnel_ttl = 64;
+	tkey.tunnel_id = nh->vni;
 
-	struct tunnel_endpoint_v4 *ep =
-		bpf_map_lookup_elem(&unbounded_endpoints_v4, &key);
-	if (!ep || ep->count == 0)
-		return TC_ACT_OK;
-
-	int is_hc = 0;
-	if (iph->protocol == IPPROTO_UDP) {
-		struct udphdr *udp = (void *)(iph + 1);
-		if ((void *)(udp + 1) <= data_end &&
-		    bpf_ntohs(udp->dest) == HEALTHCHECK_PORT)
-			is_hc = 1;
+	if (is_v4_mapped(nh->remote_endpoint)) {
+		__u32 v4_be;
+		__builtin_memcpy(&v4_be, &nh->remote_endpoint[12], sizeof(v4_be));
+		tkey.remote_ipv4 = v4_be;
+		bpf_skb_set_tunnel_key(skb, &tkey, sizeof(tkey), 0);
+	} else {
+		__builtin_memcpy(tkey.remote_ipv6, nh->remote_endpoint, 16);
+		bpf_skb_set_tunnel_key(skb, &tkey, sizeof(tkey),
+				       BPF_F_TUNINFO_IPV6);
 	}
-
-	__u32 fh = flow_hash_v4(iph, data_end);
-	int idx = hrw_select(ep->nexthops, ep->count, fh, is_hc);
-	if (idx < 0 || idx >= MAX_NEXTHOPS)
-		return TC_ACT_OK;
-
-	struct tunnel_nexthop nh = ep->nexthops[idx];
-
-	derive_mac_from_ipv4(eth->h_dest, nh.remote_ipv4);
-
-	if (nh.flags & TUNNEL_F_SET_KEY) {
-		struct bpf_tunnel_key tkey = {};
-		tkey.remote_ipv4 = nh.remote_ipv4;
-		tkey.tunnel_id = nh.vni;
-		tkey.tunnel_ttl = 64;
-		bpf_skb_set_tunnel_key(skb, &tkey, 28, 0);
-	}
-
-	return bpf_redirect(nh.ifindex, 0);
 }
 
-// --- IPv6 handler ---
-
-static __always_inline int handle_ipv6(struct __sk_buff *skb,
-				       struct ethhdr *eth,
-				       struct ipv6hdr *ip6h, void *data_end)
-{
-	struct lpm_key_v6 key = { .prefixlen = 128 };
-	__builtin_memcpy(key.addr, &ip6h->daddr, 16);
-
-	struct tunnel_endpoint_v6 *ep =
-		bpf_map_lookup_elem(&unbounded_endpoints_v6, &key);
-	if (!ep || ep->count == 0)
-		return TC_ACT_OK;
-
-	__u32 src_lo = ((__u32 *)&ip6h->saddr)[3];
-	__u32 dst_lo = ((__u32 *)&ip6h->daddr)[3];
-	__u32 fh = jhash_3words(src_lo, dst_lo, (__u32)ip6h->nexthdr);
-
-	int is_hc = 0;
-	if (ip6h->nexthdr == IPPROTO_UDP) {
-		struct udphdr *udp = (void *)(ip6h + 1);
-		if ((void *)(udp + 1) <= data_end &&
-		    bpf_ntohs(udp->dest) == HEALTHCHECK_PORT)
-			is_hc = 1;
-	}
-
-	int idx = hrw_select(
-		(struct tunnel_nexthop *)ep->nexthops, ep->count, fh, is_hc);
-	if (idx < 0 || idx >= MAX_NEXTHOPS)
-		return TC_ACT_OK;
-
-	struct tunnel_nexthop_v6 nh = ep->nexthops[idx];
-
-	derive_mac_from_ipv4(eth->h_dest, nh.remote_ipv4);
-
-	if (nh.flags & TUNNEL_F_SET_KEY) {
-		struct bpf_tunnel_key tkey = {};
-		tkey.tunnel_ttl = 64;
-		if (nh.flags & TUNNEL_F_IPV6_UNDERLAY) {
-			__builtin_memcpy(tkey.remote_ipv6, nh.remote_ipv6, 16);
-			tkey.tunnel_id = nh.vni;
-			bpf_skb_set_tunnel_key(skb, &tkey, 28,
-					       BPF_F_TUNINFO_IPV6);
-		} else {
-			tkey.remote_ipv4 = nh.remote_ipv4;
-			tkey.tunnel_id = nh.vni;
-			bpf_skb_set_tunnel_key(skb, &tkey, 28, 0);
-		}
-	}
-
-	return bpf_redirect(nh.ifindex, 0);
-}
+// --- TC entry point ---
 
 SEC("tc")
 int unbounded_encap(struct __sk_buff *skb)
@@ -266,21 +223,56 @@ int unbounded_encap(struct __sk_buff *skb)
 	if ((void *)(eth + 1) > data_end)
 		return TC_ACT_OK;
 
+	struct lpm_key key = { .prefixlen = 128 };
+
 	if (eth->h_proto == bpf_htons(ETH_P_IP)) {
 		struct iphdr *iph = (void *)(eth + 1);
 		if ((void *)(iph + 1) > data_end)
 			return TC_ACT_OK;
-		return handle_ipv4(skb, eth, iph, data_end);
-	}
 
-	if (eth->h_proto == bpf_htons(ETH_P_IPV6)) {
+		build_v4_mapped_addr(key.addr, iph->daddr);
+	} else if (eth->h_proto == bpf_htons(ETH_P_IPV6)) {
 		struct ipv6hdr *ip6h = (void *)(eth + 1);
 		if ((void *)(ip6h + 1) > data_end)
 			return TC_ACT_OK;
-		return handle_ipv6(skb, eth, ip6h, data_end);
+
+		__builtin_memcpy(key.addr, &ip6h->daddr, 16);
+	} else {
+		return TC_ACT_OK;
 	}
 
-	return TC_ACT_OK;
+	struct tunnel_endpoint *ep = bpf_map_lookup_elem(&unb_endpts, &key);
+	if (!ep || ep->count == 0)
+		return TC_ACT_OK;
+
+	int idx;
+	if (ep->count == 1) {
+		// Common endpoint-node case: one nexthop. Forward
+		// unconditionally - the healthy flag is meaningless when there
+		// is no alternative path, and dropping locally only ensures
+		// the destination cannot recover via real traffic.
+		idx = 0;
+	} else {
+		// Multi-nexthop ECMP path: skip unhealthy nexthops so we don't
+		// load-balance through a known-bad gateway.
+		__u32 hash = bpf_get_hash_recalc(skb);
+		idx = hrw_select(ep->nexthops, ep->count, hash);
+		if (idx < 0 || idx >= MAX_NEXTHOPS)
+			return TC_ACT_OK;
+	}
+
+	struct tunnel_nexthop nh = ep->nexthops[idx];
+
+	// Destination MAC is derived from the low 32 bits of the underlay
+	// endpoint; for v4 underlay this is the IPv4 address itself, for
+	// v6 underlay this is the trailing 32 bits (sufficient to drive
+	// the bpf_redirect to the right underlay device).
+	derive_mac_from_ipv4(eth->h_dest, endpoint_low32(nh.remote_endpoint));
+
+	if (needs_tunnel_key(nh.protocol))
+		set_tunnel_key_from_endpoint(skb, &nh);
+
+	return bpf_redirect(nh.ifindex, 0);
 }
 
 char _license[] SEC("license") = "MIT";

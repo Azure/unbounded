@@ -351,8 +351,8 @@ func configureEBPFTunnelPeers(
 			continue
 		}
 
-		peerIfIdx, peerFlags, peerProto := resolveEBPFPeerTarget(peer.TunnelProtocol, geneveIfIndex, ipipIfIndex, defaultIfIdx, cfg)
-		addPeerBPFEntries(bpfEntries, peer.PodCIDRs, underlayIP, uint32(cfg.GeneveVNI), peerIfIdx, peerFlags, peerProto, peer.Name)
+		peerIfIdx, peerProto := resolveEBPFPeerTarget(peer.TunnelProtocol, geneveIfIndex, ipipIfIndex, defaultIfIdx, cfg)
+		addPeerBPFEntries(bpfEntries, peer.PodCIDRs, underlayIP, uint32(cfg.GeneveVNI), peerIfIdx, peerProto, peer.Name)
 	}
 
 	for _, gwPeer := range gatewayPeers {
@@ -365,9 +365,9 @@ func configureEBPFTunnelPeers(
 			continue
 		}
 
-		peerIfIdx, peerFlags, peerProto := resolveEBPFPeerTarget(gwPeer.TunnelProtocol, geneveIfIndex, ipipIfIndex, defaultIfIdx, cfg)
-		addPeerBPFEntries(bpfEntries, gwPeer.PodCIDRs, underlayIP, uint32(cfg.GeneveVNI), peerIfIdx, peerFlags, peerProto, gwPeer.Name)
-		addPeerBPFEntries(bpfEntries, gwPeer.RoutedCidrs, underlayIP, uint32(cfg.GeneveVNI), peerIfIdx, peerFlags, peerProto, gwPeer.Name)
+		peerIfIdx, peerProto := resolveEBPFPeerTarget(gwPeer.TunnelProtocol, geneveIfIndex, ipipIfIndex, defaultIfIdx, cfg)
+		addPeerBPFEntries(bpfEntries, gwPeer.PodCIDRs, underlayIP, uint32(cfg.GeneveVNI), peerIfIdx, peerProto, gwPeer.Name)
+		addPeerBPFEntries(bpfEntries, gwPeer.RoutedCidrs, underlayIP, uint32(cfg.GeneveVNI), peerIfIdx, peerProto, gwPeer.Name)
 	}
 
 	// Store entries for deferred reconcile (after VXLAN and WG entries are added).
@@ -529,7 +529,7 @@ func configureEBPFVXLANPeers(
 			continue
 		}
 
-		addPeerBPFEntries(bpfEntries, peer.PodCIDRs, underlayIP, vni, tunnelIfIndex, ebpfpkg.TunnelFlagSetKey, ebpfpkg.TunnelProtoVXLAN, peer.Name)
+		addPeerBPFEntries(bpfEntries, peer.PodCIDRs, underlayIP, vni, tunnelIfIndex, ebpfpkg.TunnelProtoVXLAN, peer.Name)
 	}
 
 	for _, gwPeer := range gatewayPeers {
@@ -542,8 +542,8 @@ func configureEBPFVXLANPeers(
 			continue
 		}
 
-		addPeerBPFEntries(bpfEntries, gwPeer.PodCIDRs, underlayIP, vni, tunnelIfIndex, ebpfpkg.TunnelFlagSetKey, ebpfpkg.TunnelProtoVXLAN, gwPeer.Name)
-		addPeerBPFEntries(bpfEntries, gwPeer.RoutedCidrs, underlayIP, vni, tunnelIfIndex, ebpfpkg.TunnelFlagSetKey, ebpfpkg.TunnelProtoVXLAN, gwPeer.Name)
+		addPeerBPFEntries(bpfEntries, gwPeer.PodCIDRs, underlayIP, vni, tunnelIfIndex, ebpfpkg.TunnelProtoVXLAN, gwPeer.Name)
+		addPeerBPFEntries(bpfEntries, gwPeer.RoutedCidrs, underlayIP, vni, tunnelIfIndex, ebpfpkg.TunnelProtoVXLAN, gwPeer.Name)
 	}
 
 	// Store entries for deferred reconcile.
@@ -597,10 +597,10 @@ func configureEBPFVXLANPeers(
 }
 
 // addPeerBPFEntries adds LPM trie entries for a set of CIDRs pointing to a
-// tunnel endpoint. The TUNNEL_F_HEALTHY flag is set automatically so new
-// entries are forwarded immediately; the healthcheck callback clears it
-// if the peer goes down. Supports both IPv4 and IPv6 CIDRs.
-func addPeerBPFEntries(entries map[string]ebpfpkg.TunnelEndpoint, cidrs []string, underlayIP net.IP, vni, ifindex, flags, protocol uint32, peerName string) {
+// tunnel endpoint. Healthy=true is set on every new nexthop so it is
+// forwarded immediately; the healthcheck callback later clears Healthy if
+// the peer goes down. Supports both IPv4 and IPv6 CIDRs.
+func addPeerBPFEntries(entries map[string]ebpfpkg.TunnelEndpoint, cidrs []string, underlayIP net.IP, vni, ifindex, protocol uint32, peerName string) {
 	for _, cidrStr := range cidrs {
 		_, cidr, err := net.ParseCIDR(cidrStr)
 		if err != nil {
@@ -613,7 +613,7 @@ func addPeerBPFEntries(entries map[string]ebpfpkg.TunnelEndpoint, cidrs []string
 			RemoteIP: underlayIP,
 			VNI:      vni,
 			IfIndex:  ifindex,
-			Flags:    flags | ebpfpkg.TunnelFlagHealthy,
+			Healthy:  true,
 			Protocol: protocol,
 			PeerName: peerName,
 		})
@@ -641,22 +641,22 @@ func selectUnderlayIP(internalIPs []string, ipFamily string) net.IP {
 	return nil
 }
 
-// resolveEBPFPeerTarget returns the tunnel ifindex, BPF flags, and protocol
-// constant for a peer based on its tunnel protocol. GENEVE/VXLAN get
-// set_tunnel_key; IPIP gets set_tunnel_key only; None redirects to the
-// default route interface with no tunnel key.
-func resolveEBPFPeerTarget(protocol string, geneveIfIdx, ipipIfIdx, defaultIfIdx uint32, cfg *config) (uint32, uint32, uint32) {
+// resolveEBPFPeerTarget returns the tunnel ifindex and BPF protocol constant
+// for a peer based on its tunnel protocol. The BPF program derives whether
+// to call bpf_skb_set_tunnel_key from the protocol value (GENEVE/VXLAN/IPIP
+// need it; WireGuard/None do not), so there is no separate set-key flag.
+func resolveEBPFPeerTarget(protocol string, geneveIfIdx, ipipIfIdx, defaultIfIdx uint32, cfg *config) (uint32, uint32) {
 	switch unboundednetv1alpha1.TunnelProtocol(protocol) {
 	case unboundednetv1alpha1.TunnelProtocolIPIP:
-		return ipipIfIdx, ebpfpkg.TunnelFlagSetKey, ebpfpkg.TunnelProtoIPIP
+		return ipipIfIdx, ebpfpkg.TunnelProtoIPIP
 	case unboundednetv1alpha1.TunnelProtocolVXLAN:
-		return geneveIfIdx, ebpfpkg.TunnelFlagSetKey, ebpfpkg.TunnelProtoVXLAN
+		return geneveIfIdx, ebpfpkg.TunnelProtoVXLAN
 	case unboundednetv1alpha1.TunnelProtocolNone:
 		// Direct routing: redirect to default route interface, no tunnel key.
-		return defaultIfIdx, 0, ebpfpkg.TunnelProtoNone
+		return defaultIfIdx, ebpfpkg.TunnelProtoNone
 	default:
 		// GENEVE or unset -- use GENEVE interface
-		return geneveIfIdx, ebpfpkg.TunnelFlagSetKey, ebpfpkg.TunnelProtoGENEVE
+		return geneveIfIdx, ebpfpkg.TunnelProtoGENEVE
 	}
 }
 
@@ -766,7 +766,7 @@ func addWireGuardPeersToBPFMap(cfg *config, state *wireGuardState, wgMeshPeers [
 			continue
 		}
 
-		addPeerBPFEntries(state.pendingBPFEntries, peer.PodCIDRs, underlayIP, 0, wgIfIndex, 0, ebpfpkg.TunnelProtoWireGuard, peer.Name)
+		addPeerBPFEntries(state.pendingBPFEntries, peer.PodCIDRs, underlayIP, 0, wgIfIndex, ebpfpkg.TunnelProtoWireGuard, peer.Name)
 	}
 
 	// Add gateway WG peers.
@@ -794,7 +794,7 @@ func addWireGuardPeersToBPFMap(cfg *config, state *wireGuardState, wgMeshPeers [
 		gwIfIdx := uint32(gwIface.Index)
 
 		allCIDRs := append(gwPeer.PodCIDRs, gwPeer.RoutedCidrs...)
-		addPeerBPFEntries(state.pendingBPFEntries, allCIDRs, underlayIP, 0, gwIfIdx, 0, ebpfpkg.TunnelProtoWireGuard, gwPeer.Name)
+		addPeerBPFEntries(state.pendingBPFEntries, allCIDRs, underlayIP, 0, gwIfIdx, ebpfpkg.TunnelProtoWireGuard, gwPeer.Name)
 	}
 	state.mu.Unlock()
 
