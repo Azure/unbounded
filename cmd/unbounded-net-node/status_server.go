@@ -12,7 +12,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -2435,13 +2434,7 @@ func (s *nodeStatusServer) getNodeStatus() *NodeStatusResponse {
 			continue
 		}
 
-		var ifName string
-		if s.cfg.TunnelDataplane == "ebpf" {
-			// eBPF dataplane uses shared interfaces, not per-peer.
-			ifName = ebpfTunnelInterfaceName(p.TunnelProtocol)
-		} else {
-			ifName = tunnelIfaceNameForPeer(p.TunnelProtocol, net.ParseIP(p.InternalIPs[0]))
-		}
+		ifName := ebpfTunnelInterfaceName(p.TunnelProtocol)
 
 		if ifName == "" {
 			if name, _, err := unboundednetnetlink.DetectDefaultRouteInterfaceFromCache(s.state.netlinkCache); err == nil {
@@ -2496,12 +2489,7 @@ func (s *nodeStatusServer) getNodeStatus() *NodeStatusResponse {
 			continue
 		}
 
-		var ifName string
-		if s.cfg.TunnelDataplane == "ebpf" {
-			ifName = ebpfTunnelInterfaceName(gp.TunnelProtocol)
-		} else {
-			ifName = tunnelIfaceNameForPeer(gp.TunnelProtocol, net.ParseIP(gp.InternalIPs[0]))
-		}
+		ifName := ebpfTunnelInterfaceName(gp.TunnelProtocol)
 
 		if ifName == "" {
 			if name, _, err := unboundednetnetlink.DetectDefaultRouteInterfaceFromCache(s.state.netlinkCache); err == nil {
@@ -2562,10 +2550,8 @@ func (s *nodeStatusServer) getNodeStatus() *NodeStatusResponse {
 		status.RoutingTable.ManagedRouteCount = len(installed)
 	}
 
-	// Collect BPF trie entries when using eBPF tunnel dataplane
-	if s.cfg.TunnelDataplane == "ebpf" {
-		status.BpfEntries = s.collectBpfEntries()
-	}
+	// Collect BPF trie entries.
+	status.BpfEntries = s.collectBpfEntries()
 
 	expensiveDuration := time.Since(expensiveStart)
 

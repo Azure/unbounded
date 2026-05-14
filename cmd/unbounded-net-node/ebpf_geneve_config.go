@@ -23,7 +23,50 @@ import (
 // neighbor resolution. TC egress BPF intercepts and redirects to the tunnel.
 const unbounded0DeviceName = "unbounded0"
 
-// ensureEBPFTunnelMap initializes the shared eBPF tunnel map and sets up the
+// buildEBPFSupernetRoutes returns the unbounded0 routes that attract overlay
+// traffic into the eBPF dataplane. One route per CIDR is emitted regardless
+// of how many peers contribute to that CIDR; the BPF program performs the
+// per-destination redirect once traffic reaches unbounded0.
+func buildEBPFSupernetRoutes(cfg *config, state *wireGuardState, meshPeers []meshPeerInfo, gatewayPeers []gatewayPeerInfo) []unboundednetnetlink.DesiredRoute {
+	devIface, err := net.InterfaceByName(unbounded0DeviceName)
+	if err != nil {
+		return nil
+	}
+
+	mtu := cfg.MTU
+
+	if defaultMTU := unboundednetnetlink.DetectDefaultRouteMTUFromCache(state.netlinkCache); defaultMTU > 0 {
+		detected := defaultMTU - unboundednetnetlink.GeneveMTUOverhead
+		if detected < mtu {
+			mtu = detected
+		}
+	}
+
+	supernets := collectSupernets(state, meshPeers, gatewayPeers, gatewayPeers)
+
+	routes := make([]unboundednetnetlink.DesiredRoute, 0, len(supernets))
+	for cidrStr := range supernets {
+		_, cidr, err := net.ParseCIDR(cidrStr)
+		if err != nil {
+			continue
+		}
+
+		routes = append(routes, unboundednetnetlink.DesiredRoute{
+			Prefix: *cidr,
+			Nexthops: []unboundednetnetlink.DesiredNexthop{{
+				PeerID:    "ebpf/" + unbounded0DeviceName,
+				LinkIndex: devIface.Index,
+			}},
+			Metric:      cfg.BaseMetric,
+			MTU:         mtu,
+			Table:       0,
+			ScopeGlobal: true,
+		})
+	}
+
+	return routes
+}
+
 // unbounded0 dummy device with TC egress for tunnel encapsulation.
 func ensureEBPFTunnelMap(cfg *config, state *wireGuardState) (*ebpfpkg.TunnelMap, error) {
 	if state.tunnelMaps == nil {
@@ -163,7 +206,7 @@ func configureEBPFTunnelPeers(
 	// there are no GENEVE/IPIP/None tunnel-protocol peers (e.g.
 	// WG-only gateway assignment), this function must still:
 	//   1. Create the unbounded0 dummy interface + load the TC BPF program
-	//   2. Build supernet routes on unbounded0 (from allGatewayPeersForSupernets)
+	//   2. Build supernet routes on unbounded0 (from collectSupernets)
 	//   3. Clean up stale tunnel interfaces from previous runs
 	// Without this, WG-only remote nodes never get the eBPF
 	// infrastructure and the BPF map entries added later by
@@ -381,38 +424,10 @@ func configureEBPFTunnelPeers(
 	}
 	state.mu.Unlock()
 
-	// Remove stale per-peer GENEVE interfaces from previous netlink dataplane runs.
-	removeStaleGeneveInterfaces(state, map[string]bool{ifName: true, ipipIfName: true})
-
 	// Build supernet routes on unbounded0 to attract overlay traffic.
 	// NOARP on unbounded0 means no neighbor resolution needed.
 	// TC egress BPF intercepts and redirects to geneve0.
-	devIface, devErr := net.InterfaceByName(unbounded0DeviceName)
-
 	var routes []unboundednetnetlink.DesiredRoute
-
-	if devErr == nil {
-		supernets := collectSupernets(state, meshPeers, gatewayPeers, state.allGatewayPeersForSupernets)
-		for cidrStr := range supernets {
-			_, cidr, err := net.ParseCIDR(cidrStr)
-			if err != nil {
-				continue
-			}
-
-			routes = append(routes, unboundednetnetlink.DesiredRoute{
-				Prefix: *cidr,
-				Nexthops: []unboundednetnetlink.DesiredNexthop{{
-					PeerID:    "ebpf/" + unbounded0DeviceName,
-					LinkIndex: devIface.Index,
-				}},
-				Metric:            cfg.BaseMetric,
-				MTU:               geneveMTU,
-				Table:             0,
-				HealthCheckImmune: true,
-				ScopeGlobal:       true,
-			})
-		}
-	}
 
 	hcPeers := registerPeersWithHealthCheck(meshPeers, gatewayPeers, mySiteName, false,
 		siteHealthCheckProfileNames, peeringSiteHealthCheckProfileNames,
@@ -558,32 +573,7 @@ func configureEBPFVXLANPeers(
 	state.mu.Unlock()
 
 	// Build supernet routes on unbounded0 for VXLAN overlay traffic.
-	devIface, devErr := net.InterfaceByName(unbounded0DeviceName)
-
 	var routes []unboundednetnetlink.DesiredRoute
-
-	if devErr == nil {
-		supernets := collectSupernets(state, meshPeers, gatewayPeers, state.allGatewayPeersForSupernets)
-		for cidrStr := range supernets {
-			_, cidr, err := net.ParseCIDR(cidrStr)
-			if err != nil {
-				continue
-			}
-
-			routes = append(routes, unboundednetnetlink.DesiredRoute{
-				Prefix: *cidr,
-				Nexthops: []unboundednetnetlink.DesiredNexthop{{
-					PeerID:    "ebpf/" + unbounded0DeviceName,
-					LinkIndex: devIface.Index,
-				}},
-				Metric:            cfg.BaseMetric,
-				MTU:               vxlanMTU,
-				Table:             0,
-				HealthCheckImmune: true,
-				ScopeGlobal:       true,
-			})
-		}
-	}
 
 	vxlanHCPeers := registerPeersWithHealthCheck(meshPeers, gatewayPeers, mySiteName, false,
 		siteHealthCheckProfileNames, peeringSiteHealthCheckProfileNames,

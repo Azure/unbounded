@@ -19,6 +19,32 @@ type unboundedEncapLpmKey struct {
 	Addr      [16]uint8
 }
 
+type unboundedEncapTraceEvent struct {
+	_            structs.HostLayout
+	TsNs         uint64
+	Cpu          uint32
+	SkbLen       uint32
+	EthProto     uint16
+	IpProto      uint8
+	Pad0         uint8
+	Sport        uint16
+	Dport        uint16
+	Saddr        [16]uint8
+	Daddr        [16]uint8
+	LpmPrefixlen uint32
+	NhCount      uint32
+	ChosenIdx    int32
+	Remote       [16]uint8
+	Vni          uint32
+	Ifindex      uint32
+	Protocol     uint32
+	NeedsKey     uint8
+	Pad1         [3]uint8
+	SetKeyRet    int32
+	RedirectRet  int32
+	Verdict      int32
+}
+
 type unboundedEncapTunnelEndpoint struct {
 	_        structs.HostLayout
 	Nexthops [4]struct {
@@ -82,12 +108,14 @@ type unboundedEncapProgramSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type unboundedEncapMapSpecs struct {
 	UnbEndpts *ebpf.MapSpec `ebpf:"unb_endpts"`
+	UnbTrace  *ebpf.MapSpec `ebpf:"unb_trace"`
 }
 
 // unboundedEncapVariableSpecs contains global variables before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type unboundedEncapVariableSpecs struct {
+	UnbTraceEventLayout *ebpf.VariableSpec `ebpf:"_unb_trace_event_layout"`
 }
 
 // unboundedEncapObjects contains all objects after they have been loaded into the kernel.
@@ -111,11 +139,13 @@ func (o *unboundedEncapObjects) Close() error {
 // It can be passed to loadUnboundedEncapObjects or ebpf.CollectionSpec.LoadAndAssign.
 type unboundedEncapMaps struct {
 	UnbEndpts *ebpf.Map `ebpf:"unb_endpts"`
+	UnbTrace  *ebpf.Map `ebpf:"unb_trace"`
 }
 
 func (m *unboundedEncapMaps) Close() error {
 	return _UnboundedEncapClose(
 		m.UnbEndpts,
+		m.UnbTrace,
 	)
 }
 
@@ -123,6 +153,7 @@ func (m *unboundedEncapMaps) Close() error {
 //
 // It can be passed to loadUnboundedEncapObjects or ebpf.CollectionSpec.LoadAndAssign.
 type unboundedEncapVariables struct {
+	UnbTraceEventLayout *ebpf.Variable `ebpf:"_unb_trace_event_layout"`
 }
 
 // unboundedEncapPrograms contains all programs after they have been loaded into the kernel.

@@ -96,7 +96,6 @@ type NodeRuntimeConfig struct {
 	KubeProxyHealthInterval              string `yaml:"kubeProxyHealthInterval"`
 	RouteTableID                         *int   `yaml:"routeTableId"`
 	NetlinkResyncPeriod                  string `yaml:"netlinkResyncPeriod"`
-	TunnelDataplane                      string `yaml:"tunnelDataplane"`
 	TunnelDataplaneMapSize               *int   `yaml:"tunnelDataplaneMapSize"`
 	TunnelIPFamily                       string `yaml:"tunnelIPFamily"`
 	VXLANSrcPortLow                      *int   `yaml:"vxlanSrcPortLow"`

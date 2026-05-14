@@ -124,6 +124,7 @@ func main() {
 		showVersion bool
 		jsonOutput  bool
 		rawOutput   bool
+		traceMode   bool
 		statusPort  int
 		v4Only      bool
 		v6Only      bool
@@ -132,6 +133,7 @@ func main() {
 
 	flag.BoolVarP(&jsonOutput, "json", "j", false, "Output entries as JSON")
 	flag.BoolVarP(&rawOutput, "raw", "r", false, "Dump map entries as raw key/value hex")
+	flag.BoolVarP(&traceMode, "trace", "t", false, "Stream per-packet trace events from the eBPF program (Ctrl-C to stop)")
 	flag.BoolVarP(&v4Only, "v4-only", "4", false, "Show only IPv4 entries")
 	flag.BoolVarP(&v6Only, "v6-only", "6", false, "Show only IPv6 entries")
 	flag.StringVar(&colorMode, "color", "auto", "Color output: auto, always, never")
@@ -176,6 +178,15 @@ func main() {
 	args := flag.Args()
 	if len(args) > 0 {
 		if err := lookupEntry(args[0], jsonOutput, statusPort, familyFilter, textOpts); err != nil {
+			fmt.Fprintf(os.Stderr, "unroute: %v\n", err)
+			os.Exit(1)
+		}
+
+		return
+	}
+
+	if traceMode {
+		if err := streamTrace(textOpts); err != nil {
 			fmt.Fprintf(os.Stderr, "unroute: %v\n", err)
 			os.Exit(1)
 		}

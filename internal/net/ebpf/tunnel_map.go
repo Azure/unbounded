@@ -57,8 +57,9 @@ const (
 // Map and program names exported so cmd/unroute and other diagnostic
 // tools agree on what to look for in the kernel.
 const (
-	MapName     = "unb_endpts"
-	ProgramName = "unbounded_encap"
+	MapName      = "unb_endpts"
+	TraceMapName = "unb_trace"
+	ProgramName  = "unbounded_encap"
 )
 
 // Type aliases for the bpf2go-generated kernel structs. The lower-case
@@ -81,6 +82,11 @@ type (
 	// to iterate the map without re-translating to the higher-level
 	// TunnelEndpoint type.
 	RawTunnelEndpoint = unboundedEncapTunnelEndpoint
+
+	// RawTraceEvent is one record emitted to the unb_trace ringbuf per
+	// packet processed by unbounded_encap when a consumer is reading.
+	// cmd/unroute --trace decodes the stream into human-readable form.
+	RawTraceEvent = unboundedEncapTraceEvent
 )
 
 // filterHandle, filterPriority match the values used historically for the
@@ -97,6 +103,7 @@ type TunnelMap struct {
 
 	prog        *ebpf.Program
 	endpoints   *ebpf.Map
+	trace       *ebpf.Map
 	maxEntries  uint32
 	attachedIfs map[int]string // ifindex -> name for TC egress filters
 
@@ -145,10 +152,17 @@ func NewTunnelMap(opts TunnelMapOptions) (*TunnelMap, error) {
 		return nil, fmt.Errorf("map %s not found", MapName)
 	}
 
-	// Detach the program and map from the collection wrapper so closing
+	trace := coll.Maps[TraceMapName]
+	if trace == nil {
+		coll.Close()
+		return nil, fmt.Errorf("map %s not found", TraceMapName)
+	}
+
+	// Detach the program and maps from the collection wrapper so closing
 	// the wrapper does not invalidate them; TunnelMap owns lifetime now.
 	delete(coll.Programs, ProgramName)
 	delete(coll.Maps, MapName)
+	delete(coll.Maps, TraceMapName)
 	coll.Close()
 
 	klog.Infof("eBPF unbounded_encap program loaded (map max_entries %d)", opts.MaxEntries)
@@ -156,6 +170,7 @@ func NewTunnelMap(opts TunnelMapOptions) (*TunnelMap, error) {
 	return &TunnelMap{
 		prog:        prog,
 		endpoints:   endpoints,
+		trace:       trace,
 		maxEntries:  opts.MaxEntries,
 		attachedIfs: make(map[int]string),
 	}, nil
@@ -362,6 +377,11 @@ func (tm *TunnelMap) Close() error {
 	if tm.endpoints != nil {
 		_ = tm.endpoints.Close() //nolint:errcheck
 		tm.endpoints = nil
+	}
+
+	if tm.trace != nil {
+		_ = tm.trace.Close() //nolint:errcheck
+		tm.trace = nil
 	}
 
 	return nil

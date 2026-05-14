@@ -64,6 +64,62 @@ struct tunnel_endpoint {
 	__u32 count;
 };
 
+// unb_tunnel_key mirrors the first 28 bytes of the kernel's
+// struct bpf_tunnel_key. Those 28 bytes are a documented compat point in
+// bpf_skb_set_tunnel_key (the kernel explicitly accepts size==28 as
+// "tunnel-key without local addr or label fields") so we can use this
+// shape across every kernel from 4.18 onward without depending on the
+// build-time size of struct bpf_tunnel_key. Buffer size and the size
+// argument to bpf_skb_set_tunnel_key match (both 28 bytes), so the helper
+// reads exactly the memory we own.
+struct unb_tunnel_key {
+	__u32 tunnel_id;
+	union {
+		__u32 remote_ipv4;
+		__u8  remote_ipv6[16];
+	};
+	__u8  tunnel_tos;
+	__u8  tunnel_ttl;
+	__u16 tunnel_ext;
+	__u32 tunnel_label;
+};
+_Static_assert(sizeof(struct unb_tunnel_key) == 28,
+	       "unb_tunnel_key must match bpf_tunnel_key compat layout (28 bytes)");
+
+// trace_event is one record per packet processed by unbounded_encap. The
+// userspace consumer (cmd/unroute --trace) reads these from the unb_trace
+// ringbuf via cilium/ebpf's ringbuf.Reader. Field layout is part of the
+// user-space ABI: keep it stable, append new fields at the end.
+struct trace_event {
+	__u64 ts_ns;
+	__u32 cpu;
+	__u32 skb_len;
+	__u16 eth_proto;
+	__u8  ip_proto;       // L4 protocol (IPPROTO_TCP/UDP/ICMP/...); 0 if not parsed
+	__u8  _pad0;
+	__u16 sport;          // host byte order; 0 if no L4
+	__u16 dport;          // host byte order; 0 if no L4
+	__u8  saddr[16];
+	__u8  daddr[16];
+	__u32 lpm_prefixlen; // 0 = miss or non-IP
+	__u32 nh_count;      // 0 = miss
+	__s32 chosen_idx;    // -1 = no eligible nexthop
+	__u8  remote[16];
+	__u32 vni;
+	__u32 ifindex;
+	__u32 protocol;
+	__u8  needs_key;
+	__u8  _pad1[3];
+	__s32 set_key_ret;
+	__s32 redirect_ret;
+	__s32 verdict;
+};
+
+// Force bpf2go to emit a Go binding for struct trace_event by referencing
+// it from a BTF-visible global. Marked volatile + __unused so the compiler
+// keeps the type description but elides any code that depends on it.
+volatile const struct trace_event _unb_trace_event_layout __attribute__((unused));
+
 // --- Map ---
 //
 // Single LPM trie keyed on a 16-byte address. The kernel limits map names
@@ -78,17 +134,36 @@ struct {
 	__uint(map_flags, BPF_F_NO_PREALLOC);
 } unb_endpts SEC(".maps");
 
+// unb_trace carries one trace_event per packet to userspace. The producer
+// path is unconditional: we always populate the event on stack, then call
+// bpf_ringbuf_reserve. When no consumer is attached the ring saturates
+// quickly and reserve returns NULL; we drop the event and continue.
+//
+// Cost per packet with no consumer: one failed reserve (a single CAS in
+// the kernel). With a consumer attached the full 256 KiB is available as
+// burst headroom before reserve starts failing.
+
+#define UNB_TRACE_RB_SIZE (256 * 1024)
+
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, UNB_TRACE_RB_SIZE);
+} unb_trace SEC(".maps");
+
 // --- Helpers ---
 
-// derive_mac_from_ipv4 fills a locally-administered destination MAC from
-// an IPv4 address in network byte order. Mirrors Go's TunnelMACFromIP.
-static __always_inline void derive_mac_from_ipv4(__u8 *mac, __u32 ip_be32)
+// derive_mac_from_ipv4_bytes fills a locally-administered destination MAC
+// from a 4-byte IPv4 address in network byte order. Mirrors Go's
+// TunnelMACFromIP. Taking the address as a byte pointer (not a u32)
+// avoids any endianness confusion: the bytes are copied directly into
+// the MAC in the order they appear.
+static __always_inline void derive_mac_from_ipv4_bytes(__u8 *mac, const __u8 *ip4_be)
 {
 	mac[0] = 0x02;
-	mac[1] = (ip_be32 >> 24) & 0xFF;
-	mac[2] = (ip_be32 >> 16) & 0xFF;
-	mac[3] = (ip_be32 >> 8) & 0xFF;
-	mac[4] = ip_be32 & 0xFF;
+	mac[1] = ip4_be[0];
+	mac[2] = ip4_be[1];
+	mac[3] = ip4_be[2];
+	mac[4] = ip4_be[3];
 	mac[5] = 0xFF;
 }
 
@@ -189,26 +264,85 @@ static __always_inline void build_v4_mapped_addr(__u8 *out16, __u32 v4_be)
 	__builtin_memcpy(&out16[12], &v4_be, sizeof(v4_be));
 }
 
-// set_tunnel_key_from_endpoint populates a bpf_tunnel_key from a
+// trace_l4 reads the L4 protocol's first two 16-bit fields (source &
+// destination ports for TCP/UDP/SCTP) into the trace event. For
+// non-port protocols (e.g. ICMP) the bytes still get copied but only
+// ip_proto carries meaning; the caller is expected to check ip_proto
+// before rendering port numbers.
+static __always_inline void trace_l4(struct trace_event *ev, __u8 proto,
+				     const void *l4, void *data_end)
+{
+	ev->ip_proto = proto;
+
+	switch (proto) {
+	case IPPROTO_TCP:
+	case IPPROTO_UDP:
+	case IPPROTO_SCTP: {
+		// First 4 bytes of TCP/UDP/SCTP headers are sport/dport, BE.
+		__u16 ports[2];
+		if ((const void *)((const __u8 *)l4 + sizeof(ports)) > data_end)
+			return;
+
+		__builtin_memcpy(ports, l4, sizeof(ports));
+		ev->sport = bpf_ntohs(ports[0]);
+		ev->dport = bpf_ntohs(ports[1]);
+		break;
+	}
+	default:
+		break;
+	}
+}
+
+
 // remote_endpoint, choosing IPv4 vs IPv6 framing based on the v4-mapped
-// check, and calls bpf_skb_set_tunnel_key.
-static __always_inline void set_tunnel_key_from_endpoint(struct __sk_buff *skb,
+// check, and calls bpf_skb_set_tunnel_key. Returns the helper's return
+// value so callers can record it in trace events.
+//
+// We pass sizeof(struct unb_tunnel_key) == 28, which is a documented
+// compat point in bpf_skb_set_tunnel_key accepted by every kernel from
+// 4.18 onward. Passing sizeof(struct bpf_tunnel_key) (the larger,
+// build-time size from the bpf headers) makes the call fail with
+// -EINVAL on older kernels (e.g. 5.15 on AKS) whose internal struct is
+// smaller. By matching our buffer size to the size argument we avoid
+// telling the kernel a length that does not equal the memory we own.
+//
+// remote_endpoint stores the underlay IP in network byte order (bytes
+// [12..15] for the v4-mapped form). The kernel side runs
+// cpu_to_be32(remote_ipv4) on the value we pass, so we must give it
+// the IP in *native* byte order: bpf_ntohl converts the memcpy'd
+// network-order bytes into the native form the kernel expects.
+static __always_inline long set_tunnel_key_from_endpoint(struct __sk_buff *skb,
 							 const struct tunnel_nexthop *nh)
 {
-	struct bpf_tunnel_key tkey = {};
+	struct unb_tunnel_key tkey = {};
 	tkey.tunnel_ttl = 64;
 	tkey.tunnel_id = nh->vni;
 
 	if (is_v4_mapped(nh->remote_endpoint)) {
-		__u32 v4_be;
-		__builtin_memcpy(&v4_be, &nh->remote_endpoint[12], sizeof(v4_be));
-		tkey.remote_ipv4 = v4_be;
-		bpf_skb_set_tunnel_key(skb, &tkey, sizeof(tkey), 0);
-	} else {
-		__builtin_memcpy(tkey.remote_ipv6, nh->remote_endpoint, 16);
-		bpf_skb_set_tunnel_key(skb, &tkey, sizeof(tkey),
-				       BPF_F_TUNINFO_IPV6);
+		__u32 v4_net;
+		__builtin_memcpy(&v4_net, &nh->remote_endpoint[12], sizeof(v4_net));
+		tkey.remote_ipv4 = bpf_ntohl(v4_net);
+		return bpf_skb_set_tunnel_key(skb, (struct bpf_tunnel_key *)&tkey,
+					      sizeof(tkey), 0);
 	}
+
+	__builtin_memcpy(tkey.remote_ipv6, nh->remote_endpoint, 16);
+	return bpf_skb_set_tunnel_key(skb, (struct bpf_tunnel_key *)&tkey,
+				      sizeof(tkey), BPF_F_TUNINFO_IPV6);
+}
+
+// emit_trace tries to copy a fully-populated trace_event into the
+// ringbuf. If no consumer is attached (or one is too slow), the ring is
+// full and bpf_ringbuf_reserve returns NULL; we silently drop the event.
+// Cost per dropped packet: one failed reserve (a single CAS).
+static __always_inline void emit_trace(const struct trace_event *ev)
+{
+	struct trace_event *out = bpf_ringbuf_reserve(&unb_trace, sizeof(*out), 0);
+	if (!out)
+		return;
+
+	__builtin_memcpy(out, ev, sizeof(*out));
+	bpf_ringbuf_submit(out, 0);
 }
 
 // --- TC entry point ---
@@ -219,31 +353,66 @@ int unbounded_encap(struct __sk_buff *skb)
 	void *data = (void *)(long)skb->data;
 	void *data_end = (void *)(long)skb->data_end;
 
+	struct trace_event ev = {};
+	ev.ts_ns = bpf_ktime_get_ns();
+	ev.cpu = bpf_get_smp_processor_id();
+	ev.skb_len = skb->len;
+	ev.chosen_idx = -1;
+
 	struct ethhdr *eth = data;
-	if ((void *)(eth + 1) > data_end)
+	if ((void *)(eth + 1) > data_end) {
+		ev.verdict = TC_ACT_OK;
+		emit_trace(&ev);
 		return TC_ACT_OK;
+	}
+
+	ev.eth_proto = bpf_ntohs(eth->h_proto);
 
 	struct lpm_key key = { .prefixlen = 128 };
 
 	if (eth->h_proto == bpf_htons(ETH_P_IP)) {
 		struct iphdr *iph = (void *)(eth + 1);
-		if ((void *)(iph + 1) > data_end)
+		if ((void *)(iph + 1) > data_end) {
+			ev.verdict = TC_ACT_OK;
+			emit_trace(&ev);
 			return TC_ACT_OK;
+		}
 
 		build_v4_mapped_addr(key.addr, iph->daddr);
+		build_v4_mapped_addr(ev.saddr, iph->saddr);
+		build_v4_mapped_addr(ev.daddr, iph->daddr);
+		trace_l4(&ev, iph->protocol, (const void *)iph + (iph->ihl * 4), data_end);
 	} else if (eth->h_proto == bpf_htons(ETH_P_IPV6)) {
 		struct ipv6hdr *ip6h = (void *)(eth + 1);
-		if ((void *)(ip6h + 1) > data_end)
+		if ((void *)(ip6h + 1) > data_end) {
+			ev.verdict = TC_ACT_OK;
+			emit_trace(&ev);
 			return TC_ACT_OK;
+		}
 
 		__builtin_memcpy(key.addr, &ip6h->daddr, 16);
+		__builtin_memcpy(ev.saddr, &ip6h->saddr, 16);
+		__builtin_memcpy(ev.daddr, &ip6h->daddr, 16);
+		// Treats the first L4 nexthdr verbatim; IPv6 extension headers
+		// are uncommon in pod traffic and any extension parser would
+		// blow the verifier instruction budget. If the next header
+		// isn't TCP/UDP/SCTP we just leave the ports zeroed.
+		trace_l4(&ev, ip6h->nexthdr, ip6h + 1, data_end);
 	} else {
+		ev.verdict = TC_ACT_OK;
+		emit_trace(&ev);
 		return TC_ACT_OK;
 	}
 
 	struct tunnel_endpoint *ep = bpf_map_lookup_elem(&unb_endpts, &key);
-	if (!ep || ep->count == 0)
+	if (!ep || ep->count == 0) {
+		ev.verdict = TC_ACT_OK;
+		emit_trace(&ev);
 		return TC_ACT_OK;
+	}
+
+	ev.lpm_prefixlen = key.prefixlen;
+	ev.nh_count = ep->count;
 
 	int idx;
 	if (ep->count == 1) {
@@ -257,22 +426,38 @@ int unbounded_encap(struct __sk_buff *skb)
 		// load-balance through a known-bad gateway.
 		__u32 hash = bpf_get_hash_recalc(skb);
 		idx = hrw_select(ep->nexthops, ep->count, hash);
-		if (idx < 0 || idx >= MAX_NEXTHOPS)
+		if (idx < 0 || idx >= MAX_NEXTHOPS) {
+			ev.verdict = TC_ACT_OK;
+			emit_trace(&ev);
 			return TC_ACT_OK;
+		}
 	}
 
 	struct tunnel_nexthop nh = ep->nexthops[idx];
+
+	ev.chosen_idx = idx;
+	__builtin_memcpy(ev.remote, nh.remote_endpoint, 16);
+	ev.vni = nh.vni;
+	ev.ifindex = nh.ifindex;
+	ev.protocol = nh.protocol;
 
 	// Destination MAC is derived from the low 32 bits of the underlay
 	// endpoint; for v4 underlay this is the IPv4 address itself, for
 	// v6 underlay this is the trailing 32 bits (sufficient to drive
 	// the bpf_redirect to the right underlay device).
-	derive_mac_from_ipv4(eth->h_dest, endpoint_low32(nh.remote_endpoint));
+	derive_mac_from_ipv4_bytes(eth->h_dest, &nh.remote_endpoint[12]);
 
-	if (needs_tunnel_key(nh.protocol))
-		set_tunnel_key_from_endpoint(skb, &nh);
+	if (needs_tunnel_key(nh.protocol)) {
+		ev.needs_key = 1;
+		ev.set_key_ret = (__s32)set_tunnel_key_from_endpoint(skb, &nh);
+	}
 
-	return bpf_redirect(nh.ifindex, 0);
+	long redir = bpf_redirect(nh.ifindex, 0);
+	ev.redirect_ret = (__s32)redir;
+	ev.verdict = (__s32)redir;
+	emit_trace(&ev);
+
+	return redir;
 }
 
 char _license[] SEC("license") = "MIT";

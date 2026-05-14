@@ -303,13 +303,9 @@ flowchart TD
     E2 --> E3
 ```
 
-## Tunnel Dataplane Modes
+## Tunnel Dataplane
 
-The node agent supports two tunnel dataplane modes, selected by the `--tunnel-dataplane` flag: `ebpf` (default) and `netlink`.
-
-### eBPF Dataplane (default)
-
-The eBPF dataplane uses a single dummy device (`unbounded0`) as a routing anchor, a TC egress BPF program for tunnel endpoint resolution, and shared flow-based tunnel interfaces. This design avoids per-peer interface creation and scales to large meshes with minimal kernel resource usage.
+The node agent uses an eBPF dataplane: a single dummy device (`unbounded0`) as a routing anchor, a TC egress BPF program for tunnel endpoint resolution, and shared flow-based tunnel interfaces. This design avoids per-peer interface creation and scales to large meshes with minimal kernel resource usage.
 
 #### Architecture
 
@@ -417,17 +413,6 @@ Reverse path filtering must be disabled on tunnel interfaces because decapsulate
 The node init script sets `net.ipv4.conf.all.rp_filter=0` and `net.ipv4.conf.default.rp_filter=0` so that newly created tunnel interfaces inherit the correct value. The node agent also explicitly writes `0` after creating each tunnel interface as defense-in-depth.
 
 Writes go through `/proc/1/root/proc/sys/` to bypass the container procfs overlay, which silently discards direct `/proc/sys/` writes. The kernel also resets `rp_filter` on remaining interfaces when an interface is deleted, so `disableRPFilter()` is reapplied after interface cleanup.
-
-### Netlink Dataplane
-
-The netlink dataplane uses per-peer tunnel interfaces and kernel routing tables with a dedicated routing table and ip rule:
-
-- Each GENEVE/VXLAN/IPIP peer gets a dedicated tunnel interface
-- Routes are programmed with lightweight tunnel encap (`ip_encap`) into a separate routing table
-- An ip rule directs overlay traffic to the dedicated table
-- WireGuard interfaces work identically in both modes
-
-The netlink dataplane is simpler but creates more kernel objects (interfaces, routes) as the mesh grows.
 
 ### unroute Debug Tool
 
