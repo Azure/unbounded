@@ -20,7 +20,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
-	"text/tabwriter"
+	"strings"
 	"time"
 
 	"github.com/cilium/ebpf"
@@ -127,12 +127,14 @@ func main() {
 		statusPort  int
 		v4Only      bool
 		v6Only      bool
+		colorMode   string
 	)
 
 	flag.BoolVarP(&jsonOutput, "json", "j", false, "Output entries as JSON")
 	flag.BoolVarP(&rawOutput, "raw", "r", false, "Dump map entries as raw key/value hex")
 	flag.BoolVarP(&v4Only, "v4-only", "4", false, "Show only IPv4 entries")
 	flag.BoolVarP(&v6Only, "v6-only", "6", false, "Show only IPv6 entries")
+	flag.StringVar(&colorMode, "color", "auto", "Color output: auto, always, never")
 	flag.BoolVar(&showVersion, "version", false, "Print version and exit")
 	flag.IntVar(&statusPort, "status-port", 9998, "Port of the local node status endpoint")
 
@@ -155,6 +157,12 @@ func main() {
 		os.Exit(2)
 	}
 
+	useColor, colorErr := resolveColorMode(colorMode, os.Stdout)
+	if colorErr != nil {
+		fmt.Fprintf(os.Stderr, "unroute: %v\n", colorErr)
+		os.Exit(2)
+	}
+
 	familyFilter := familyAll
 	switch {
 	case v4Only:
@@ -163,9 +171,11 @@ func main() {
 		familyFilter = familyV6
 	}
 
+	textOpts := textOptions{useColor: useColor}
+
 	args := flag.Args()
 	if len(args) > 0 {
-		if err := lookupEntry(args[0], jsonOutput, statusPort, familyFilter); err != nil {
+		if err := lookupEntry(args[0], jsonOutput, statusPort, familyFilter, textOpts); err != nil {
 			fmt.Fprintf(os.Stderr, "unroute: %v\n", err)
 			os.Exit(1)
 		}
@@ -182,7 +192,7 @@ func main() {
 		return
 	}
 
-	if err := dumpTunnelEndpoints(jsonOutput, statusPort, familyFilter); err != nil {
+	if err := dumpTunnelEndpoints(jsonOutput, statusPort, familyFilter, textOpts); err != nil {
 		fmt.Fprintf(os.Stderr, "unroute: %v\n", err)
 		os.Exit(1)
 	}
@@ -259,7 +269,7 @@ func findMap() (*ebpf.Map, error) {
 
 // dumpTunnelEndpoints walks the trie and prints one row per nexthop,
 // classifying each entry by whether the key is IPv4-mapped or native v6.
-func dumpTunnelEndpoints(jsonOutput bool, statusPort, familyFilter int) error {
+func dumpTunnelEndpoints(jsonOutput bool, statusPort, familyFilter int, opts textOptions) error {
 	m, err := findMap()
 	if err != nil {
 		return err
@@ -275,7 +285,7 @@ func dumpTunnelEndpoints(jsonOutput bool, statusPort, familyFilter int) error {
 	annotateEntries(entries, statusPort)
 	sort.Slice(entries, func(i, j int) bool { return entries[i].CIDR < entries[j].CIDR })
 
-	return printEntries(entries, jsonOutput)
+	return printEntries(entries, jsonOutput, opts)
 }
 
 // dumpRaw prints the LPM trie in a structured form matching
@@ -389,7 +399,7 @@ func makeRawEntry(key ebpfpkg.LpmKey, val ebpfpkg.RawTunnelEndpoint) rawEntry {
 // lookupEntry performs an LPM lookup for the supplied IP address against
 // the unified trie. The IP is mapped to v6 form before lookup; the family
 // filter, if set, must match the IP's natural family.
-func lookupEntry(ipStr string, jsonOutput bool, statusPort, familyFilter int) error {
+func lookupEntry(ipStr string, jsonOutput bool, statusPort, familyFilter int, opts textOptions) error {
 	ip := net.ParseIP(ipStr)
 	if ip == nil {
 		return fmt.Errorf("invalid IP address: %s", ipStr)
@@ -428,7 +438,7 @@ func lookupEntry(ipStr string, jsonOutput bool, statusPort, familyFilter int) er
 	entries := makeEntries(key, val, familyFilter)
 	annotateEntries(entries, statusPort)
 
-	return printEntries(entries, jsonOutput)
+	return printEntries(entries, jsonOutput, opts)
 }
 
 // collectEntries iterates the map and builds display entries, filtering
@@ -484,10 +494,56 @@ func makeEntries(key ebpfpkg.LpmKey, val ebpfpkg.RawTunnelEndpoint, familyFilter
 	return entries
 }
 
-// printEntries renders a slice of entries. Text output emits one row per
-// nexthop; JSON output groups nexthops under their CIDR into a single
-// object per LPM trie entry with an `endpoints` array.
-func printEntries(entries []entry, jsonOutput bool) error {
+// textOptions controls human-readable output rendering.
+type textOptions struct {
+	useColor bool
+}
+
+// resolveColorMode parses --color=auto|always|never and decides whether
+// to emit ANSI color escapes. auto = enabled if the writer is a TTY.
+func resolveColorMode(mode string, w *os.File) (bool, error) {
+	switch mode {
+	case "always":
+		return true, nil
+	case "never":
+		return false, nil
+	case "auto", "":
+		if w == nil {
+			return false, nil
+		}
+
+		fi, err := w.Stat()
+		if err != nil {
+			return false, nil
+		}
+
+		return (fi.Mode() & os.ModeCharDevice) != 0, nil
+	default:
+		return false, fmt.Errorf("invalid --color value %q (want auto|always|never)", mode)
+	}
+}
+
+// ANSI color helpers.
+const (
+	ansiReset = "\x1b[0m"
+	ansiRed   = "\x1b[31m"
+	ansiGreen = "\x1b[32m"
+)
+
+func colorize(s, code string, on bool) string {
+	if !on || code == "" {
+		return s
+	}
+
+	return code + s + ansiReset
+}
+
+// printEntries renders a slice of entries. Text output mimics `ip route`:
+// one summary line per CIDR with the nexthop appended when there is only
+// one, or a CIDR header followed by indented "nexthop ..." lines for ECMP.
+// JSON output groups nexthops under their CIDR into a single object per
+// LPM trie entry with an `endpoints` array.
+func printEntries(entries []entry, jsonOutput bool, opts textOptions) error {
 	if jsonOutput {
 		groups := groupByCIDR(entries)
 
@@ -502,24 +558,96 @@ func printEntries(entries []entry, jsonOutput bool) error {
 		return nil
 	}
 
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	_, _ = fmt.Fprintf(w, "CIDR\tREMOTE\tNODE\tIFACE\tPROTO\tHEALTHY\tVNI\tMTU\n") //nolint:errcheck
+	groups := groupByCIDR(entries)
 
-	for _, e := range entries {
-		healthStr := "yes"
-		if !e.Healthy {
-			healthStr = "NO"
+	w := bufio.NewWriter(os.Stdout)
+	defer w.Flush() //nolint:errcheck
+
+	for _, g := range groups {
+		switch len(g.Endpoints) {
+		case 0:
+			// Should not happen (an LPM entry without nexthops is
+			// filtered out upstream), but be defensive.
+			fmt.Fprintf(w, "%s (no endpoints)\n", g.CIDR)
+		case 1:
+			ep := g.Endpoints[0]
+			fmt.Fprintf(w, "%s %s\n", g.CIDR, renderEndpoint(ep, false, opts))
+		default:
+			fmt.Fprintf(w, "%s\n", g.CIDR)
+			for _, ep := range g.Endpoints {
+				fmt.Fprintf(w, "    %s\n", renderEndpoint(ep, true, opts))
+			}
 		}
-
-		_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%d\t%d\n", //nolint:errcheck
-			e.CIDR, e.Remote, e.Node, e.Interface, e.Protocol, healthStr, e.VNI, e.MTU)
 	}
 
-	_ = w.Flush() //nolint:errcheck
-
-	fmt.Printf("\n%d entries\n", len(entries))
-
 	return nil
+}
+
+// renderEndpoint formats a single endpoint as an ip-route-style line
+// fragment. If asNexthop is true, the line is prefixed with "nexthop "
+// and includes a default weight; otherwise the fields are emitted
+// inline for the single-nexthop summary line.
+func renderEndpoint(ep endpointJSON, asNexthop bool, opts textOptions) string {
+	var sb strings.Builder
+
+	if asNexthop {
+		sb.WriteString("nexthop ")
+	}
+
+	if ep.Remote != "" {
+		sb.WriteString("via ")
+		sb.WriteString(colorize(ep.Remote, healthColor(ep.Healthy), opts.useColor))
+		sb.WriteByte(' ')
+	}
+
+	if ep.Interface != "" {
+		sb.WriteString("dev ")
+		sb.WriteString(ep.Interface)
+		sb.WriteByte(' ')
+	}
+
+	if ep.Protocol != "" {
+		sb.WriteString("proto ")
+		sb.WriteString(ep.Protocol)
+		sb.WriteByte(' ')
+	}
+
+	if ep.Node != "" {
+		sb.WriteString("node ")
+		sb.WriteString(ep.Node)
+		sb.WriteByte(' ')
+	}
+
+	if ep.VNI != 0 {
+		fmt.Fprintf(&sb, "vni %d ", ep.VNI)
+	}
+
+	if ep.MTU != 0 {
+		fmt.Fprintf(&sb, "mtu %d ", ep.MTU)
+	}
+
+	if asNexthop {
+		sb.WriteString("weight 1")
+	}
+
+	if !ep.Healthy {
+		if asNexthop {
+			sb.WriteByte(' ')
+		}
+
+		sb.WriteString(colorize("unhealthy", ansiRed, opts.useColor))
+	}
+
+	return strings.TrimRight(sb.String(), " ")
+}
+
+// healthColor maps a nexthop's health state to an ANSI color code.
+func healthColor(healthy bool) string {
+	if healthy {
+		return ansiGreen
+	}
+
+	return ansiRed
 }
 
 // groupByCIDR collapses a per-nexthop entry slice into a per-CIDR slice

@@ -4,6 +4,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 
 	ebpfpkg "github.com/Azure/unbounded/internal/net/ebpf"
@@ -210,4 +211,83 @@ func TestGroupByCIDR(t *testing.T) {
 	if groups[1].CIDR != "2001:db8::/32" || groups[1].Family != "v6" || len(groups[1].Endpoints) != 1 {
 		t.Errorf("groups[1]: %+v", groups[1])
 	}
+}
+
+// TestResolveColorMode covers the --color value parser.
+func TestResolveColorMode(t *testing.T) {
+t.Parallel()
+
+cases := []struct {
+mode    string
+wantErr bool
+}{
+{"auto", false},
+{"always", false},
+{"never", false},
+{"", false}, // empty == auto
+{"yes", true},
+{"NO", true},
+}
+
+for _, tc := range cases {
+_, err := resolveColorMode(tc.mode, nil)
+if (err != nil) != tc.wantErr {
+t.Errorf("%q: gotErr=%v wantErr=%v", tc.mode, err, tc.wantErr)
+}
+}
+
+// always = on regardless of writer
+if on, _ := resolveColorMode("always", nil); !on {
+t.Errorf("always should yield on=true")
+}
+
+// never = off regardless of writer
+if on, _ := resolveColorMode("never", nil); on {
+t.Errorf("never should yield on=false")
+}
+}
+
+// TestRenderEndpoint covers the ip-route-style line builder.
+func TestRenderEndpoint(t *testing.T) {
+t.Parallel()
+
+ep := endpointJSON{
+Remote:    "10.0.0.5",
+Node:      "gw1",
+Interface: "geneve0",
+Protocol:  "GENEVE",
+Healthy:   true,
+VNI:       42,
+MTU:       1500,
+}
+
+// Single-nexthop summary: no "nexthop " prefix, no "weight" suffix.
+got := renderEndpoint(ep, false, textOptions{})
+if !strings.Contains(got, "via 10.0.0.5") || !strings.Contains(got, "dev geneve0") || !strings.Contains(got, "proto GENEVE") || !strings.Contains(got, "node gw1") || !strings.Contains(got, "vni 42") || !strings.Contains(got, "mtu 1500") {
+t.Errorf("single-nexthop render missing fields: %q", got)
+}
+
+if strings.Contains(got, "nexthop ") || strings.Contains(got, "weight ") {
+t.Errorf("single-nexthop render should not have 'nexthop' or 'weight': %q", got)
+}
+
+// Multi-nexthop: prefixed with "nexthop ", weight included.
+got = renderEndpoint(ep, true, textOptions{})
+if !strings.HasPrefix(got, "nexthop ") || !strings.Contains(got, "weight 1") {
+t.Errorf("multi-nexthop render shape wrong: %q", got)
+}
+
+// Unhealthy: "unhealthy" tag.
+ep.Healthy = false
+got = renderEndpoint(ep, false, textOptions{})
+if !strings.Contains(got, "unhealthy") {
+t.Errorf("unhealthy render missing tag: %q", got)
+}
+
+// Color: when on, remote is wrapped in ANSI.
+ep.Healthy = true
+got = renderEndpoint(ep, false, textOptions{useColor: true})
+if !strings.Contains(got, "\x1b[32m10.0.0.5\x1b[0m") {
+t.Errorf("colored render missing green remote: %q", got)
+}
 }
