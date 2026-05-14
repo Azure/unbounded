@@ -479,6 +479,37 @@ def wait_k8s_node(name: str, timeout: int = 1800) -> None:
     die(f"Timed out waiting for Node '{name}'")
 
 
+def get_node_boot_id(name: str) -> str:
+    result = subprocess.run(
+        [KUBECTL, "get", "node", name, "-o", "jsonpath={.status.nodeInfo.bootID}"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        die(f"Failed to read Node '{name}' boot ID: {result.stderr.strip()}")
+    boot_id = result.stdout.strip()
+    if not boot_id:
+        die(f"Node '{name}' has no status.nodeInfo.bootID")
+    return boot_id
+
+
+def wait_node_boot_id_changed(name: str, previous_boot_id: str, timeout: int = 600) -> None:
+    log(f"  Waiting for Node '{name}' boot ID to change...")
+    for elapsed in range(timeout):
+        check_procs()
+        result = subprocess.run(
+            [KUBECTL, "get", "node", name, "-o", "jsonpath={.status.nodeInfo.bootID}"],
+            capture_output=True, text=True,
+        )
+        boot_id = result.stdout.strip() if result.returncode == 0 else ""
+        if boot_id and boot_id != previous_boot_id:
+            log(f"  Node '{name}' boot ID changed")
+            return
+        if elapsed > 0 and elapsed % 30 == 0:
+            log(f"    ({elapsed}s) bootID={boot_id or 'not set'}")
+        time.sleep(1)
+    die(f"Timed out waiting for Node '{name}' boot ID to change")
+
+
 def _restart_crashing_pods(node_name: str, namespace: str, label: str) -> None:
     """Delete pods matching *label* on *node_name* that are in CrashLoopBackOff.
 
@@ -654,6 +685,8 @@ def create_machine_operation(
 def run_operation_smoke_suite() -> None:
     log("Running bare-metal MachineOperation smoke suite")
 
+    boot_id = get_node_boot_id(NODE_NAME)
+
     poweroff = create_machine_operation("smoke-host-poweroff", "HostPowerOff")
     wait_machine_operation_complete(poweroff, timeout=600)
     wait_vm_state("shut off", timeout=180)
@@ -661,9 +694,10 @@ def run_operation_smoke_suite() -> None:
     poweron = create_machine_operation("smoke-host-poweron", "HostPowerOn")
     wait_machine_operation_complete(poweron, timeout=600)
     wait_vm_state("running", timeout=180)
-    wait_guest_agent(timeout=300)
     wait_k8s_node(NODE_NAME, timeout=300)
+    wait_node_boot_id_changed(NODE_NAME, boot_id, timeout=600)
     assert_node_ready(NODE_NAME, timeout=480)
+    boot_id = get_node_boot_id(NODE_NAME)
 
     reboot = create_machine_operation(
         "smoke-selector-host-reboot",
@@ -673,8 +707,8 @@ def run_operation_smoke_suite() -> None:
     )
     wait_machine_operation_complete(reboot, timeout=600)
     wait_vm_state("running", timeout=180)
-    wait_guest_agent(timeout=300)
     wait_k8s_node(NODE_NAME, timeout=300)
+    wait_node_boot_id_changed(NODE_NAME, boot_id, timeout=600)
     assert_node_ready(NODE_NAME, timeout=480)
 
 
