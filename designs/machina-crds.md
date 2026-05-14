@@ -2,7 +2,7 @@
 
 The Unbounded controller will rely on two control methods - configuration CRs for machine configuration and status alongside an operational CR for operations like reboot, shutdown, and power on.
 
-![Excalidraw diagram of the below architecture](image.png)
+![Excalidraw diagram of the below architecture](machina-crds.png)
 
 [Link](https://excalidraw.com/#json=FvIvkl5uWdPAwTrVdNNua,WTKPZlW8KllB1HMfHbj0rQ)
 
@@ -34,9 +34,24 @@ When a user creates a `MachineConfiguration` object, a corresponding `MachineCon
 
 When changes are made to a `MachineConfiguration` object specification, the controller will copy the changes to the most recent `MachineConfigurationVersion` if it has not been deployed or create a new version if there are no non-deployed versions. In this way, the count of versioned objects does not grow extremely large, as they only become locked and permanent when deployed, and old configurations may be deleted.
 
+#### OnDelete update UX
+
+The initial `OnDelete` update flow should be explicit and operator-driven. After a new `MachineConfigurationVersion` is created, the operator uses `kubectl unbounded` to update the target `Machine` object's `spec.configurationRef` to the desired configuration version. The currently running `Node` keeps using the version it was provisioned with until the operator cordons, drains, and deletes that `Node`. When the node agent observes that its `Node` object no longer exists, it repaves the local machine using the `MachineConfigurationVersion` referenced by the `Machine` spec and rejoins the cluster.
+
+For example, updating a machine from version 1 to version 2 would look like:
+
+```shell
+kubectl unbounded machine config assign my-machine --config my-config --version 2
+kubectl drain my-node --ignore-daemonsets --delete-emptydir-data
+kubectl delete node my-node
+kubectl wait machine my-machine --for=condition=Ready
+```
+
+The desired/applied state should remain observable while this happens. `Machine.spec.configurationRef` represents the desired version to use for the next pave or repave. `Machine.status.configurationRef` and/or annotations on the `Node` represent the version that was actually applied to the running node. This allows the system to report that a repave is pending after the desired version changes and clear that state after the node rejoins with the requested version.
+
 #### Rollback
 
-To roll back to a previous configuration, the user updates the `Machine` object's configuration version reference to point to an earlier `MachineConfigurationVersion`. The normal repave workflow (cordon/drain/delete the `Node`) then applies the prior version. This avoids the need for a dedicated rollback mechanism — any previously deployed version can be targeted directly.
+To roll back to a previous configuration, the user updates the `Machine` object's configuration version reference to point to an earlier `MachineConfigurationVersion`. The normal repave workflow (cordon/drain/delete the `Node`) then applies the prior version. This avoids the need for a dedicated rollback mechanism - any previously deployed version can be targeted directly.
 
 ## Operational CRs
 

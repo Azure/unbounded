@@ -86,6 +86,12 @@ const (
 	// match. The Machine remains in a waiting state until a
 	// configuration is assigned.
 	MachineConditionConfigurationPending = "ConfigurationPending"
+
+	// MachineConditionRepavePending indicates that the Machine's desired
+	// configuration version has not yet been applied to the running Node.
+	// For OnDelete updates this remains True until the operator deletes
+	// the Node and the agent repaves with the desired version.
+	MachineConditionRepavePending = "RepavePending"
 )
 
 // Annotation keys.
@@ -123,6 +129,17 @@ type MachineSpec struct {
 	// +optional
 	Operations *OperationsSpec `json:"operations,omitempty"`
 
+	// Provider identifies the external control provider for this machine.
+	// +optional
+	// +kubebuilder:validation:Enum=AzureVM;OCIInstance
+	Provider string `json:"provider,omitempty"`
+
+	// ProviderID identifies the underlying infrastructure resource for this
+	// machine, using a Kubernetes-style provider ID such as
+	// azure:///subscriptions/.../virtualMachines/name or oci://ocid1.instance...
+	// +optional
+	ProviderID string `json:"providerID,omitempty"`
+
 	// ConfigurationRef references a MachineConfiguration (and
 	// optionally a specific version) that defines the configuration
 	// profile for this machine. If a specific version is set, that
@@ -132,6 +149,12 @@ type MachineSpec struct {
 	// +optional
 	ConfigurationRef *MachineConfigurationRef `json:"configurationRef,omitempty"`
 }
+
+// External provider names.
+const (
+	ExternalProviderAzureVM     = "AzureVM"
+	ExternalProviderOCIInstance = "OCIInstance"
+)
 
 // MachineConfigurationRef references a MachineConfiguration and
 // optionally a specific MachineConfigurationVersion.

@@ -68,9 +68,13 @@ docs/.hugo_build.lock
 # AI Tools
 .opencode
 .claude/settings.local.json
+.worktrees/
 
 # Python
 __pycache__/
+
+# Rust
+target/
 
 # Environment files
 .env
@@ -96,3 +100,6 @@ hack/net/templates/*.json
 
 # Temporary files
 *.tmp
+
+public/
+.hugo_build.lock

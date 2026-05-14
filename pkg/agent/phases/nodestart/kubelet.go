@@ -146,6 +146,7 @@ func (c *configureKubelet) ensureKubeletDropIns() error {
 		{
 			name: "20-node-config.conf",
 			data: map[string]any{
+				"NodeName":           c.goalState.NodeName,
 				"NodeLabels":         nodeLabels,
 				"RegisterWithTaints": registerWithTaints,
 				"ClientCAFile":       goalstates.KubeletAPIServerCACertPath,

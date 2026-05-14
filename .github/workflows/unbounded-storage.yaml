@@ -1,0 +1,53 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+name: unbounded-storage
+
+on:
+  pull_request:
+    paths:
+      - cmd/unbounded-storage/**
+      - .github/workflows/unbounded-storage.yaml
+  push:
+    branches: [main]
+    paths:
+      - cmd/unbounded-storage/**
+      - .github/workflows/unbounded-storage.yaml
+  workflow_dispatch:
+
+concurrency:
+  group: unbounded-storage-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cmd/unbounded-storage
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Rust toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            cmd/unbounded-storage/target
+          key: cargo-unbounded-storage-${{ runner.os }}-${{ hashFiles('cmd/unbounded-storage/Cargo.lock', 'cmd/unbounded-storage/Cargo.toml') }}
+          restore-keys: |
+            cargo-unbounded-storage-${{ runner.os }}-
+
+      - name: Test
+        run: cargo test --locked --all-targets

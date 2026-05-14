@@ -69,8 +69,10 @@ fi
 AGENT_BIN="/usr/local/bin/unbounded-agent"
 
 echo "Downloading unbounded-agent ${_version_desc} for ${arch} from ${AGENT_URL}..."
-curl -fsSL "${AGENT_URL}" | tar -xz -C /usr/local/bin unbounded-agent
-chmod +x "${AGENT_BIN}"
+tmp_dir="$(mktemp -d)"
+trap 'rm -rf "${tmp_dir}"' EXIT
+curl -fsSL "${AGENT_URL}" | tar -xz -C "${tmp_dir}" unbounded-agent
+install -m 0755 "${tmp_dir}/unbounded-agent" "${AGENT_BIN}"
 
 _START_ARGS=""
 case "${AGENT_DEBUG}" in
