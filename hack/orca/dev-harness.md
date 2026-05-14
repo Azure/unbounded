@@ -332,5 +332,5 @@ Stick with `ORCA_VERSION=dev` for the dev harness.
 
 For more on what's in vs out of scope, see `design/orca/design.md`
 (in particular the
-[Deferred / future work](../../design/orca/design.md#15-deferred--future-work)
+[Deferred / future work](../../designs/orca/design.md#15-deferred--future-work)
 section).
