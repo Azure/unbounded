@@ -342,34 +342,43 @@ All traffic destined for remote overlay CIDRs is routed to `unbounded0`, where t
 
 The `unbounded_encap` program (defined in `bpf/unbounded_encap.c`) is attached as a TC egress classifier on `unbounded0`. For each outgoing packet, it:
 
-1. Extracts the destination IP (v4 or v6)
-2. Performs an LPM (longest-prefix-match) lookup against the appropriate BPF trie map
-3. If the entry has `TUNNEL_F_SET_KEY` set, calls `bpf_skb_set_tunnel_key()` with the remote endpoint address and tunnel ID
-4. If the entry has `TUNNEL_F_IPV6_UNDERLAY` set, uses the IPv6 remote address with `BPF_F_TUNINFO_IPV6`
+1. Extracts the destination IP from the IPv4 or IPv6 header and builds a 16-byte LPM key (IPv4 destinations are stored in IPv4-mapped IPv6 form, `::ffff:<v4>`)
+2. Performs an LPM (longest-prefix-match) lookup against the unified `unb_endpts` trie
+3. Selects a nexthop: for single-nexthop entries forwards unconditionally; for multi-nexthop entries reads `skb->hash` via `bpf_get_hash_recalc` and runs HRW selection over healthy nexthops only
+4. If the nexthop's protocol is GENEVE, VXLAN, or IPIP, calls `bpf_skb_set_tunnel_key()`. The IPv4-mapped check on `remote_endpoint` selects between `remote_ipv4` (v4 underlay) and `remote_ipv6` + `BPF_F_TUNINFO_IPV6` (v6 underlay)
 5. Derives a deterministic inner Ethernet destination MAC and rewrites the packet header
 6. Calls `bpf_redirect()` to send the packet to the target tunnel interface
 
-#### BPF LPM Trie Maps
+#### BPF LPM Trie Map
 
-Two maps store overlay CIDR to tunnel endpoint mappings:
+A single unified LPM trie stores overlay CIDR to tunnel endpoint mappings:
 
-| Map | Key struct | Key size | Value struct | Value size |
-|-----|-----------|----------|-------------|------------|
-| `unbounded_endpoints_v4` | `lpm_key_v4` (prefixlen + IPv4 addr) | 8 bytes | `tunnel_endpoint_v4` (5x u32) | 20 bytes |
-| `unbounded_endpoints_v6` | `lpm_key_v6` (prefixlen + IPv6 addr) | 20 bytes | `tunnel_endpoint_v6` (IPv6 union + 4x u32) | 32 bytes |
+| Map | Key struct | Key size | Value struct |
+|-----|-----------|----------|--------------|
+| `unb_endpts` | `lpm_key` (prefixlen + 16-byte addr) | 20 bytes | `tunnel_endpoint` (array of `tunnel_nexthop` + count) |
 
-Both maps are `BPF_MAP_TYPE_LPM_TRIE` with `BPF_F_NO_PREALLOC` and a default max of 16384 entries.
+The trie is `BPF_MAP_TYPE_LPM_TRIE` with `BPF_F_NO_PREALLOC` and a default max of 16384 entries.
 
-Each map entry contains:
+IPv4 destinations live in IPv4-mapped IPv6 form (`::ffff:<v4>`) so they share
+the trie with native IPv6 entries. The prefix length is offset by 96 for v4
+entries (e.g. `100.80.0.0/14` becomes `::ffff:100.80.0.0/110`), which keeps
+the longest-prefix-match semantics correct across the two families.
 
-- **Remote IP**: The underlay endpoint address for the tunnel
-- **Interface index**: The target tunnel interface for `bpf_redirect()`
-- **Flags**: Bitmask controlling tunnel behavior
-  - `TUNNEL_F_SET_KEY` (0x01) -- set tunnel key/metadata (used by GENEVE, VXLAN, IPIP)
-  - `TUNNEL_F_IPV6_UNDERLAY` (0x04) -- use IPv6 underlay addressing
-- **Protocol**: Diagnostic identifier for the entry type
-  - `PROTO_GENEVE` (1), `PROTO_VXLAN` (2), `PROTO_IPIP` (3), `PROTO_WIREGUARD` (4), `PROTO_NONE` (5)
-  - The protocol field is stored for observability and diagnostic tooling (e.g., `unroute`) but does not drive BPF program behavior
+Each nexthop contains:
+
+- **Remote endpoint** (16 bytes): The underlay endpoint address for the tunnel,
+  also in IPv4-mapped form for v4 underlays. The BPF program inspects the
+  first 12 bytes to decide between `bpf_skb_set_tunnel_key` with `remote_ipv4`
+  (v4 underlay) or with `remote_ipv6` + `BPF_F_TUNINFO_IPV6` (v6 underlay).
+- **VNI**, **Ifindex**: tunnel key and interface to `bpf_redirect()` onto.
+- **Healthy** (uint32): non-zero when the agent considers this nexthop
+  eligible. Only consulted on multi-nexthop entries (gateway ECMP) -
+  single-nexthop entries forward unconditionally, so the agent can drain a
+  bad gateway without dropping traffic destined to a singleton peer.
+- **Protocol**: `PROTO_GENEVE` (1), `PROTO_VXLAN` (2), `PROTO_IPIP` (3),
+  `PROTO_WIREGUARD` (4), `PROTO_NONE` (5). The BPF program derives whether
+  to call `bpf_skb_set_tunnel_key` from this field (GENEVE/VXLAN/IPIP need
+  it; WireGuard/None do not).
 
 #### BPF Map Reconciliation
 
@@ -378,7 +387,6 @@ The node agent reconciles BPF map entries whenever the desired peer state change
 1. Iterates existing LPM entries
 2. Deletes stale entries no longer in the desired set
 3. Upserts new or changed entries
-4. Keeps IPv4 and IPv6 tries synchronized
 
 #### Shared Tunnel Interfaces
 
@@ -425,9 +433,10 @@ The netlink dataplane is simpler but creates more kernel objects (interfaces, ro
 
 The `unroute` tool (`cmd/unroute/main.go`) is a diagnostic utility for the eBPF dataplane. It can:
 
-- Dump all entries in the `unbounded_endpoints_v4` and `unbounded_endpoints_v6` LPM trie maps
-- Perform longest-prefix-match lookups for specific IPs to show which tunnel endpoint would be selected
-- Dump the `local_cidrs` map
+- Dump all entries in the `unb_endpts` LPM trie with one row per nexthop
+- Perform longest-prefix-match lookups for specific IPs to show which nexthop would be selected
+- Filter output to just IPv4 (`-4`) or just IPv6 (`-6`) entries
+- Dump raw key/value bytes for byte-exact comparison against what the agent pushed (`--raw`)
 - Output in human-readable text or JSON format
 
 ## Data Flow

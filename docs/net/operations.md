@@ -490,24 +490,24 @@ kubectl -n kube-system logs <node-agent-pod> | grep -i "bpf\|ebpf\|attach"
 
 #### Verifying BPF Maps
 
-The eBPF program uses LPM trie maps to look up tunnel endpoints. Map names are
-truncated to 15 characters by the kernel:
+The eBPF program uses a single LPM trie keyed on a 16-byte address. Map names
+are limited to 15 characters by the kernel.
 
 ```bash
-# List BPF maps (look for unbounded_endpo -- truncated from unbounded_endpoints_v4/v6)
+# List BPF maps -- the tunnel endpoint trie is named "unb_endpts".
 bpftool map list | grep unbounded
 
 # Dump map contents
-bpftool map dump name unbounded_endpo
+bpftool map dump name unb_endpts
 ```
 
-The full map names in the BPF object are `unbounded_endpoints_v4` and
-`unbounded_endpoints_v6`, but the kernel truncates them.
+IPv4 destinations are stored in IPv4-mapped IPv6 form (`::ffff:<v4>`) with a
+prefix length offset by 96, so they share the trie with native IPv6 entries.
 
 #### Using the `unroute` Tool
 
 The `unroute` diagnostic tool is included in both the controller and node agent images.
-It reads the BPF maps directly and annotates entries with node/site information from
+It reads the BPF map directly and annotates entries with node/site information from
 the controller status API:
 
 ```bash
@@ -517,8 +517,12 @@ kubectl -n kube-system exec <node-agent-pod> -- unroute
 # Look up a specific IP
 kubectl -n kube-system exec <node-agent-pod> -- unroute <ip-address>
 
-# Show local CIDRs only
-kubectl -n kube-system exec <node-agent-pod> -- unroute --local
+# Show only IPv4 entries, or only IPv6 entries
+kubectl -n kube-system exec <node-agent-pod> -- unroute -4
+kubectl -n kube-system exec <node-agent-pod> -- unroute -6
+
+# Dump raw map entries as <key hex> -> <value hex>
+kubectl -n kube-system exec <node-agent-pod> -- unroute --raw
 ```
 
 #### BPF Status via kubectl Plugin

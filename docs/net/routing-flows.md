@@ -85,14 +85,16 @@ GENEVE encapsulation via the eBPF dataplane.
    `unbounded0`. It parses the Ethernet and IP headers.
 
 4. **LPM lookup**: The BPF program performs a longest-prefix-match lookup in
-   `unbounded_endpoints_v4` (or `unbounded_endpoints_v6` for IPv6) using the
-   destination IP with a /32 prefix length.
+   the unified `unb_endpts` trie. The key is a 16-byte address with
+   `prefixlen = 128`; IPv4 destinations are mapped to `::ffff:<v4>` so both
+   families share one trie.
 
-5. **Tunnel metadata**: If the matched endpoint has `TUNNEL_F_SET_KEY` set, the
-   program calls `bpf_skb_set_tunnel_key()` with:
-   - `remote_ipv4` = underlay IP of the destination node
-   - `tunnel_id` = VNI from the map entry
-   - `tunnel_ttl` = 64
+5. **Tunnel metadata**: If the matched nexthop's `protocol` indicates a
+   header-bearing encapsulation (GENEVE, VXLAN, or IPIP), the program calls
+   `bpf_skb_set_tunnel_key()`. The IPv4-mapped check on `remote_endpoint`
+   decides whether to set `remote_ipv4` (v4 underlay) or `remote_ipv6` plus
+   `BPF_F_TUNINFO_IPV6` (native v6 underlay); `tunnel_id` is set to the VNI
+   from the map entry and `tunnel_ttl` to 64.
 
 6. **Inner MAC rewrite**: The inner Ethernet destination MAC is rewritten to a
    deterministic value derived from the remote node's underlay IP:
@@ -163,9 +165,10 @@ WireGuard-encrypted gateway nodes.
 1. **Worker egress**: Same as intra-site steps 1-4. The BPF LPM lookup matches
    a remote site's CIDR and finds a WireGuard endpoint entry.
 
-2. **BPF redirect to WireGuard**: The entry has no `TUNNEL_F_SET_KEY` flag (WG
-   handles its own encapsulation). `bpf_redirect(ep->ifindex, 0)` sends the
-   packet directly to the `wg51821` interface.
+2. **BPF redirect to WireGuard**: The nexthop's protocol is `WireGuard`, so
+   the BPF program skips `bpf_skb_set_tunnel_key` (WG handles its own
+   encapsulation) and calls `bpf_redirect(nh.ifindex, 0)` to send the packet
+   directly to the `wg51821` interface.
 
 3. **WireGuard encryption**: The WireGuard driver on the worker encrypts the
    packet and sends it as a UDP datagram to the site 1 gateway's WireGuard

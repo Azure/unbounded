@@ -134,24 +134,26 @@ program for tunnel endpoint resolution, and shared flow-based tunnel interfaces.
 | `ipip0` | Flow-based IP-in-IP. Tunnel key sets the remote endpoint. |
 | `wg<port>` | WireGuard. BPF performs redirect-only (no tunnel key). Crypto routing handled by WireGuard AllowedIPs. |
 
-#### BPF LPM Trie Maps
+#### BPF LPM Trie Map
 
-Two maps store overlay CIDR to tunnel endpoint mappings:
+A single unified trie stores overlay CIDR to tunnel endpoint mappings:
 
-| Map | Key Size | Value Size | Description |
-|-----|----------|------------|-------------|
-| `unbounded_endpoints_v4` | 8 bytes | 20 bytes | IPv4 prefix → tunnel endpoint |
-| `unbounded_endpoints_v6` | 20 bytes | 32 bytes | IPv6 prefix → tunnel endpoint |
+| Map | Key Size | Description |
+|-----|----------|-------------|
+| `unb_endpts` | 20 bytes | 16-byte address + 4-byte prefixlen; IPv4 entries use IPv4-mapped IPv6 form |
 
-Both are `BPF_MAP_TYPE_LPM_TRIE` with a default max of 16,384 entries.
+`BPF_MAP_TYPE_LPM_TRIE` with a default max of 16,384 entries. IPv4 destinations
+are stored as `::ffff:<v4>` with prefixlen offset by 96, so the trie's
+longest-prefix-match naturally segregates v4 from native v6 entries.
 
-Each entry contains:
-- **Remote IP**: Underlay endpoint address.
-- **Interface index**: Target tunnel interface for `bpf_redirect()`.
-- **Flags**: `TUNNEL_F_SET_KEY` (set tunnel metadata) and
-  `TUNNEL_F_IPV6_UNDERLAY` (use IPv6 underlay).
-- **Protocol**: Diagnostic identifier (GENEVE=1, VXLAN=2, IPIP=3,
-  WireGuard=4, None=5).
+Each nexthop contains:
+- **Remote endpoint** (16 bytes): underlay address, IPv4-mapped for v4 underlays.
+- **Interface index**: target tunnel interface for `bpf_redirect()`.
+- **Healthy** (u32): non-zero when eligible; only consulted by multi-nexthop
+  ECMP (gateway pools).
+- **Protocol**: GENEVE=1, VXLAN=2, IPIP=3, WireGuard=4, None=5. The BPF
+  program derives whether to call `bpf_skb_set_tunnel_key` (GENEVE/VXLAN/IPIP)
+  from this field.
 
 #### Deterministic MAC Derivation
 
