@@ -616,6 +616,7 @@ image-net-controller-local: net-frontend resources/cni-plugins-linux-$(HOST_GOAR
 		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
 		--build-arg BUILD_TIME=$(BUILD_TIME) \
 		--build-arg CNI_PLUGINS_VERSION=$(CNI_PLUGINS_VERSION) \
+		--build-arg BUILDARCH=$(HOST_GOARCH) \
 		-t $(NET_CONTROLLER_IMAGE) \
 		-f ./images/net/Containerfile .
 	$(call trivy-maybe,$(NET_CONTROLLER_IMAGE))
@@ -628,6 +629,7 @@ image-net-node-local: resources/cni-plugins-linux-$(HOST_GOARCH)-$(CNI_PLUGINS_V
 		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
 		--build-arg BUILD_TIME=$(BUILD_TIME) \
 		--build-arg CNI_PLUGINS_VERSION=$(CNI_PLUGINS_VERSION) \
+		--build-arg BUILDARCH=$(HOST_GOARCH) \
 		-t $(NET_NODE_IMAGE) \
 		-f ./images/net/Containerfile .
 	$(call trivy-maybe,$(NET_NODE_IMAGE))

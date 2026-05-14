@@ -17,6 +17,16 @@
 # =============================================================================
 FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26.3-trixie AS builder
 
+# Platform args. TARGETOS / TARGETARCH are populated automatically by
+# buildkit/buildah from --platform. BUILDARCH should be too, but podman
+# 4.9.x / buildah 1.33.x emits a spurious "missing BUILDARCH" warning
+# for the BUILD* family of auto-args (TARGET* are silenced correctly);
+# the Makefile passes it explicitly via --build-arg to suppress the
+# noise. The value still matches the actual build host arch.
+ARG TARGETOS
+ARG TARGETARCH
+ARG BUILDARCH
+
 ENV CGO_ENABLED=0
 ENV GOPATH=/go
 ENV GOTOOLCHAIN=auto
@@ -36,11 +46,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
-
-# Platform args populated by buildkit from --platform.
-ARG TARGETOS
-ARG TARGETARCH
-ARG BUILDARCH
 
 # Software version args.
 ARG CNI_PLUGINS_VERSION=v1.9.1
