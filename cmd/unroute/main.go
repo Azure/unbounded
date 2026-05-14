@@ -586,7 +586,8 @@ func printEntries(entries []entry, jsonOutput bool, opts textOptions) error {
 // renderEndpoint formats a single endpoint as an ip-route-style line
 // fragment. If asNexthop is true, the line is prefixed with "nexthop "
 // and includes a default weight; otherwise the fields are emitted
-// inline for the single-nexthop summary line.
+// inline for the single-nexthop summary line. The healthy/unhealthy
+// tag is always present and is the only field that receives color.
 func renderEndpoint(ep endpointJSON, asNexthop bool, opts textOptions) string {
 	var sb strings.Builder
 
@@ -596,7 +597,7 @@ func renderEndpoint(ep endpointJSON, asNexthop bool, opts textOptions) string {
 
 	if ep.Remote != "" {
 		sb.WriteString("via ")
-		sb.WriteString(colorize(ep.Remote, healthColor(ep.Healthy), opts.useColor))
+		sb.WriteString(ep.Remote)
 		sb.WriteByte(' ')
 	}
 
@@ -627,27 +628,19 @@ func renderEndpoint(ep endpointJSON, asNexthop bool, opts textOptions) string {
 	}
 
 	if asNexthop {
-		sb.WriteString("weight 1")
+		sb.WriteString("weight 1 ")
 	}
 
+	tag := "healthy"
+	color := ansiGreen
 	if !ep.Healthy {
-		if asNexthop {
-			sb.WriteByte(' ')
-		}
-
-		sb.WriteString(colorize("unhealthy", ansiRed, opts.useColor))
+		tag = "unhealthy"
+		color = ansiRed
 	}
 
-	return strings.TrimRight(sb.String(), " ")
-}
+	sb.WriteString(colorize(tag, color, opts.useColor))
 
-// healthColor maps a nexthop's health state to an ANSI color code.
-func healthColor(healthy bool) string {
-	if healthy {
-		return ansiGreen
-	}
-
-	return ansiRed
+	return sb.String()
 }
 
 // groupByCIDR collapses a per-nexthop entry slice into a per-CIDR slice

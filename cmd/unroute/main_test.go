@@ -215,79 +215,92 @@ func TestGroupByCIDR(t *testing.T) {
 
 // TestResolveColorMode covers the --color value parser.
 func TestResolveColorMode(t *testing.T) {
-t.Parallel()
+	t.Parallel()
 
-cases := []struct {
-mode    string
-wantErr bool
-}{
-{"auto", false},
-{"always", false},
-{"never", false},
-{"", false}, // empty == auto
-{"yes", true},
-{"NO", true},
+	cases := []struct {
+		mode    string
+		wantErr bool
+	}{
+		{"auto", false},
+		{"always", false},
+		{"never", false},
+		{"", false}, // empty == auto
+		{"yes", true},
+		{"NO", true},
+	}
+
+	for _, tc := range cases {
+		_, err := resolveColorMode(tc.mode, nil)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("%q: gotErr=%v wantErr=%v", tc.mode, err, tc.wantErr)
+		}
+	}
+
+	// always = on regardless of writer
+	if on, _ := resolveColorMode("always", nil); !on {
+		t.Errorf("always should yield on=true")
+	}
+
+	// never = off regardless of writer
+	if on, _ := resolveColorMode("never", nil); on {
+		t.Errorf("never should yield on=false")
+	}
 }
 
-for _, tc := range cases {
-_, err := resolveColorMode(tc.mode, nil)
-if (err != nil) != tc.wantErr {
-t.Errorf("%q: gotErr=%v wantErr=%v", tc.mode, err, tc.wantErr)
-}
-}
-
-// always = on regardless of writer
-if on, _ := resolveColorMode("always", nil); !on {
-t.Errorf("always should yield on=true")
-}
-
-// never = off regardless of writer
-if on, _ := resolveColorMode("never", nil); on {
-t.Errorf("never should yield on=false")
-}
-}
-
-// TestRenderEndpoint covers the ip-route-style line builder.
+// TestRenderEndpoint covers the ip-route-style line builder. Only the
+// trailing healthy/unhealthy tag should ever be colored.
 func TestRenderEndpoint(t *testing.T) {
-t.Parallel()
+	t.Parallel()
 
-ep := endpointJSON{
-Remote:    "10.0.0.5",
-Node:      "gw1",
-Interface: "geneve0",
-Protocol:  "GENEVE",
-Healthy:   true,
-VNI:       42,
-MTU:       1500,
-}
+	ep := endpointJSON{
+		Remote:    "10.0.0.5",
+		Node:      "gw1",
+		Interface: "geneve0",
+		Protocol:  "GENEVE",
+		Healthy:   true,
+		VNI:       42,
+		MTU:       1500,
+	}
 
-// Single-nexthop summary: no "nexthop " prefix, no "weight" suffix.
-got := renderEndpoint(ep, false, textOptions{})
-if !strings.Contains(got, "via 10.0.0.5") || !strings.Contains(got, "dev geneve0") || !strings.Contains(got, "proto GENEVE") || !strings.Contains(got, "node gw1") || !strings.Contains(got, "vni 42") || !strings.Contains(got, "mtu 1500") {
-t.Errorf("single-nexthop render missing fields: %q", got)
-}
+	got := renderEndpoint(ep, false, textOptions{})
+	for _, want := range []string{"via 10.0.0.5", "dev geneve0", "proto GENEVE", "node gw1", "vni 42", "mtu 1500"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("single-nexthop render missing %q: %q", want, got)
+		}
+	}
 
-if strings.Contains(got, "nexthop ") || strings.Contains(got, "weight ") {
-t.Errorf("single-nexthop render should not have 'nexthop' or 'weight': %q", got)
-}
+	if strings.Contains(got, "nexthop ") || strings.Contains(got, "weight ") {
+		t.Errorf("single-nexthop render should not have nexthop/weight: %q", got)
+	}
 
-// Multi-nexthop: prefixed with "nexthop ", weight included.
-got = renderEndpoint(ep, true, textOptions{})
-if !strings.HasPrefix(got, "nexthop ") || !strings.Contains(got, "weight 1") {
-t.Errorf("multi-nexthop render shape wrong: %q", got)
-}
+	if !strings.HasSuffix(got, " healthy") {
+		t.Errorf("single-nexthop render should end with ' healthy': %q", got)
+	}
 
-// Unhealthy: "unhealthy" tag.
-ep.Healthy = false
-got = renderEndpoint(ep, false, textOptions{})
-if !strings.Contains(got, "unhealthy") {
-t.Errorf("unhealthy render missing tag: %q", got)
-}
+	got = renderEndpoint(ep, true, textOptions{})
+	if !strings.HasPrefix(got, "nexthop ") || !strings.Contains(got, "weight 1") || !strings.HasSuffix(got, " healthy") {
+		t.Errorf("multi-nexthop render shape wrong: %q", got)
+	}
 
-// Color: when on, remote is wrapped in ANSI.
-ep.Healthy = true
-got = renderEndpoint(ep, false, textOptions{useColor: true})
-if !strings.Contains(got, "\x1b[32m10.0.0.5\x1b[0m") {
-t.Errorf("colored render missing green remote: %q", got)
-}
+	ep.Healthy = false
+	got = renderEndpoint(ep, false, textOptions{})
+	if !strings.HasSuffix(got, " unhealthy") {
+		t.Errorf("unhealthy render should end with ' unhealthy': %q", got)
+	}
+
+	ep.Healthy = true
+	got = renderEndpoint(ep, false, textOptions{useColor: true})
+	if !strings.HasSuffix(got, "\x1b[32mhealthy\x1b[0m") {
+		t.Errorf("colored healthy tag wrong: %q", got)
+	}
+
+	if strings.Contains(got, "\x1b[3"+"2m10.0.0.5") || strings.Contains(got, "\x1b[3"+"1m10.0.0.5") {
+		t.Errorf("remote IP should NOT be colored: %q", got)
+	}
+
+	ep.Healthy = false
+	got = renderEndpoint(ep, true, textOptions{useColor: true})
+	if !strings.HasSuffix(got, "\x1b[31munhealthy\x1b[0m") {
+		t.Errorf("colored unhealthy tag wrong: %q", got)
+	}
 }
