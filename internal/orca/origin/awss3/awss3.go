@@ -261,7 +261,7 @@ func (a *Adapter) List(ctx context.Context, bucket, prefix, marker string, maxRe
 	in := &s3.ListObjectsV2Input{
 		Bucket:  aws.String(b),
 		Prefix:  aws.String(prefix),
-		MaxKeys: aws.Int32(int32(maxResults)),
+		MaxKeys: aws.Int32(clampMaxKeys(maxResults)),
 	}
 	if marker != "" {
 		in.ContinuationToken = aws.String(marker)
@@ -375,4 +375,36 @@ func isPreconditionFailed(err error) bool {
 	}
 
 	return false
+}
+
+// s3MaxKeysCap is the documented server-side ceiling for
+// ListObjectsV2.MaxKeys. AWS S3 returns at most 1000 keys per call;
+// values above that have no effect at the backend, so clamping at
+// the wire boundary trades nothing.
+const s3MaxKeysCap = 1000
+
+// clampMaxKeys converts a host-int maxResults to a
+// guaranteed-in-range int32 suitable for s3.ListObjectsV2Input.MaxKeys.
+//
+// The lower clamp (negative -> 0) and upper clamp (> s3MaxKeysCap ->
+// s3MaxKeysCap) jointly close the silent-overflow window the int32
+// cast would otherwise expose: an untrusted caller passing
+// maxResults above int32 max would otherwise wrap around to a
+// non-deterministic (often negative) MaxKeys value, which an
+// S3-compatible backend may handle in surprising ways. CodeQL flags
+// the un-bounded conversion at the call site; this helper makes the
+// bounds explicit and locally verifiable.
+//
+// maxResults == 0 is preserved as 0 (caller intent: backend
+// default); negative inputs collapse to 0 with the same effect.
+func clampMaxKeys(maxResults int) int32 {
+	if maxResults < 0 {
+		return 0
+	}
+
+	if maxResults > s3MaxKeysCap {
+		return int32(s3MaxKeysCap)
+	}
+
+	return int32(maxResults) // safe: 0 <= maxResults <= s3MaxKeysCap (1000)
 }

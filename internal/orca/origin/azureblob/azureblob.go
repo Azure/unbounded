@@ -237,7 +237,7 @@ func (a *Adapter) List(ctx context.Context, bucket, prefix, marker string, maxRe
 	)
 
 	cc := a.client.ServiceClient().NewContainerClient(cName)
-	max := int32(maxResults)
+	max := clampMaxResults(maxResults)
 	pager := cc.NewListBlobsFlatPager(&container.ListBlobsFlatOptions{
 		Prefix:     &prefix,
 		MaxResults: &max,
@@ -366,4 +366,36 @@ func unwrapAzcoreETag(e *azcore.ETag) string {
 	}
 
 	return strings.Trim(string(*e), "\"")
+}
+
+// azureMaxResultsCap is the documented server-side ceiling for
+// ListBlobs MaxResults. Azure Blob Storage returns at most 5000
+// results per call; values above that have no effect at the
+// backend, so clamping at the wire boundary trades nothing.
+const azureMaxResultsCap = 5000
+
+// clampMaxResults converts a host-int maxResults to a
+// guaranteed-in-range int32 suitable for ListBlobsFlatOptions.MaxResults.
+//
+// The lower clamp (negative -> 0) and upper clamp (> azureMaxResultsCap
+// -> azureMaxResultsCap) jointly close the silent-overflow window
+// the int32 cast would otherwise expose: an untrusted caller passing
+// maxResults above int32 max would otherwise wrap around to a
+// non-deterministic (often negative) MaxResults value, which the
+// Azure SDK or backend may handle in surprising ways. CodeQL flags
+// the un-bounded conversion at the call site; this helper makes the
+// bounds explicit and locally verifiable.
+//
+// maxResults == 0 is preserved as 0 (caller intent: backend
+// default); negative inputs collapse to 0 with the same effect.
+func clampMaxResults(maxResults int) int32 {
+	if maxResults < 0 {
+		return 0
+	}
+
+	if maxResults > azureMaxResultsCap {
+		return int32(azureMaxResultsCap)
+	}
+
+	return int32(maxResults) // safe: 0 <= maxResults <= azureMaxResultsCap (5000)
 }
