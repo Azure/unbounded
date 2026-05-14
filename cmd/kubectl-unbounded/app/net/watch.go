@@ -208,7 +208,7 @@ func connectWatchWebSocket(ctx context.Context, rt *pluginRuntime, ns string, op
 	// directly to the controller pod, the API server front-proxy is bypassed
 	// so the controller requires an HMAC token.
 	var wsHeaders http.Header
-	if viewerToken, tokenErr := requestViewerToken(cfg); tokenErr == nil {
+	if viewerToken, _, tokenErr := requestViewerToken(cfg); tokenErr == nil {
 		wsHeaders = http.Header{}
 		wsHeaders.Set("Authorization", "Bearer "+viewerToken)
 	}
