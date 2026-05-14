@@ -11,8 +11,7 @@
 package main
 
 import (
-	"encoding/binary"
-	"encoding/hex"
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -20,6 +19,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"text/tabwriter"
 	"time"
 
@@ -46,12 +46,58 @@ type entry struct {
 	Family    string `json:"family"` // "v4" or "v6", for client filtering
 }
 
-// rawEntry is the structured representation of one trie entry in raw-hex
-// dump mode (no annotation, no interface resolution).
+// rawEntry mirrors `bpftool map dump -j`: each entry is a structured
+// key/value object with all bytes exposed as decimal arrays so the
+// agent's pushed state can be compared byte-for-byte against what the
+// kernel holds.
 type rawEntry struct {
-	KeyHex   string `json:"key"`
-	ValueHex string `json:"value"`
-	Family   string `json:"family"`
+	Key   rawKey   `json:"key"`
+	Value rawValue `json:"value"`
+}
+
+type rawKey struct {
+	Prefixlen uint32   `json:"prefixlen"`
+	Addr      byteList `json:"addr"`
+}
+
+type rawValue struct {
+	Nexthops []rawNexthop `json:"nexthops"`
+	Count    uint32       `json:"count"`
+}
+
+type rawNexthop struct {
+	RemoteEndpoint byteList `json:"remote_endpoint"`
+	VNI            uint32   `json:"vni"`
+	IfIndex        uint32   `json:"ifindex"`
+	Healthy        uint32   `json:"healthy"`
+	Protocol       uint32   `json:"protocol"`
+}
+
+// byteList is a slice of bytes that marshals to JSON as a decimal array
+// (e.g. [0, 0, 255, 255]) rather than encoding/json's default base64
+// representation. This matches `bpftool map dump -j` output.
+type byteList []uint8
+
+// MarshalJSON implements json.Marshaler for byteList.
+func (b byteList) MarshalJSON() ([]byte, error) {
+	if b == nil {
+		return []byte("[]"), nil
+	}
+
+	out := make([]byte, 0, 4*len(b)+2)
+	out = append(out, '[')
+
+	for i, v := range b {
+		if i > 0 {
+			out = append(out, ',')
+		}
+
+		out = strconv.AppendUint(out, uint64(v), 10)
+	}
+
+	out = append(out, ']')
+
+	return out, nil
 }
 
 func main() {
@@ -213,10 +259,15 @@ func dumpTunnelEndpoints(jsonOutput bool, statusPort, familyFilter int) error {
 	return printEntries(entries, jsonOutput)
 }
 
-// dumpRaw prints each map entry as <key hex> -> <value hex>, with no
-// annotation, no interface resolution, and no status-server roundtrip. The
-// caller can use this for byte-exact comparisons against what the agent
-// believes it pushed.
+// dumpRaw prints the LPM trie in a structured form matching
+// `bpftool map dump -j`: each entry is a JSON object whose key and value
+// expose every byte. No annotation, no interface resolution, no status
+// server roundtrip. Useful for byte-exact comparison against what the
+// agent believes it pushed into the kernel.
+//
+// Without --json the output is the same JSON structure pretty-printed
+// (this matches user expectations from bpftool, which also emits its
+// "raw" form as JSON-ish text).
 func dumpRaw(jsonOutput bool, familyFilter int) error {
 	m, err := findMap()
 	if err != nil {
@@ -233,45 +284,87 @@ func dumpRaw(jsonOutput bool, familyFilter int) error {
 
 	iter := m.Iterate()
 	for iter.Next(&key, &val) {
-		family := familyOfKey(key)
-		if !familyMatches(familyFilter, family) {
+		if !familyMatches(familyFilter, familyOfKey(key)) {
 			continue
 		}
 
-		keyBytes := encodeKey(key)
-		valBytes := encodeValue(val)
-		rows = append(rows, rawEntry{
-			KeyHex:   hex.EncodeToString(keyBytes),
-			ValueHex: hex.EncodeToString(valBytes),
-			Family:   family,
-		})
+		rows = append(rows, makeRawEntry(key, val))
 	}
 
 	if err := iter.Err(); err != nil {
 		return fmt.Errorf("iterate %s: %w", ebpfpkg.MapName, err)
 	}
 
-	sort.Slice(rows, func(i, j int) bool { return rows[i].KeyHex < rows[j].KeyHex })
+	sort.Slice(rows, func(i, j int) bool {
+		// Sort by raw addr bytes for stable output.
+		for k := range rows[i].Key.Addr {
+			if rows[i].Key.Addr[k] != rows[j].Key.Addr[k] {
+				return rows[i].Key.Addr[k] < rows[j].Key.Addr[k]
+			}
+		}
 
-	if jsonOutput {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
+		return rows[i].Key.Prefixlen < rows[j].Key.Prefixlen
+	})
 
-		return enc.Encode(rows)
+	_ = jsonOutput // raw output is always JSON
+
+	// Emit a JSON array with one compact entry per line so byte arrays
+	// stay inline like `bpftool map dump -j` and the output remains
+	// jq-friendly.
+	out := bufio.NewWriter(os.Stdout)
+	defer out.Flush() //nolint:errcheck
+
+	if _, err := out.WriteString("[\n"); err != nil {
+		return err
 	}
 
-	if len(rows) == 0 {
-		fmt.Println("(no entries)")
-		return nil
+	for i, r := range rows {
+		b, err := json.Marshal(r)
+		if err != nil {
+			return fmt.Errorf("marshal entry %d: %w", i, err)
+		}
+
+		sep := ","
+		if i == len(rows)-1 {
+			sep = ""
+		}
+
+		if _, err := fmt.Fprintf(out, "  %s%s\n", b, sep); err != nil {
+			return err
+		}
 	}
 
-	for _, r := range rows {
-		fmt.Printf("%s %s -> %s\n", r.Family, r.KeyHex, r.ValueHex)
+	_, err = out.WriteString("]\n")
+
+	return err
+}
+
+// makeRawEntry decodes a single LPM trie key/value pair into the
+// bpftool-style structured representation.
+func makeRawEntry(key ebpfpkg.LpmKey, val ebpfpkg.RawTunnelEndpoint) rawEntry {
+	out := rawEntry{
+		Key: rawKey{
+			Prefixlen: key.Prefixlen,
+			Addr:      append(byteList(nil), key.Addr[:]...),
+		},
+		Value: rawValue{
+			Count:    val.Count,
+			Nexthops: make([]rawNexthop, 0, val.Count),
+		},
 	}
 
-	fmt.Printf("\n%d entries\n", len(rows))
+	for i := uint32(0); i < val.Count && i < uint32(ebpfpkg.MaxNexthops); i++ {
+		nh := val.Nexthops[i]
+		out.Value.Nexthops = append(out.Value.Nexthops, rawNexthop{
+			RemoteEndpoint: append(byteList(nil), nh.RemoteEndpoint[:]...),
+			VNI:            nh.Vni,
+			IfIndex:        nh.Ifindex,
+			Healthy:        nh.Healthy,
+			Protocol:       nh.Protocol,
+		})
+	}
 
-	return nil
+	return out
 }
 
 // lookupEntry performs an LPM lookup for the supplied IP address against
@@ -478,36 +571,6 @@ func familyMatches(filter int, family string) bool {
 	}
 
 	return true
-}
-
-// encodeKey serializes an LpmKey to its on-the-wire byte form (the same
-// bytes the kernel stores).
-func encodeKey(key ebpfpkg.LpmKey) []byte {
-	out := make([]byte, 4+16)
-	binary.NativeEndian.PutUint32(out[0:4], key.Prefixlen)
-	copy(out[4:], key.Addr[:])
-
-	return out
-}
-
-// encodeValue serializes a TunnelEndpointC to its on-the-wire byte form.
-func encodeValue(val ebpfpkg.RawTunnelEndpoint) []byte {
-	const nhSize = 16 + 4 + 4 + 4 + 4 // RemoteEndpoint + 4*uint32
-
-	out := make([]byte, nhSize*ebpfpkg.MaxNexthops+4)
-
-	for i := 0; i < ebpfpkg.MaxNexthops; i++ {
-		base := i * nhSize
-		copy(out[base:base+16], val.Nexthops[i].RemoteEndpoint[:])
-		binary.NativeEndian.PutUint32(out[base+16:base+20], val.Nexthops[i].Vni)
-		binary.NativeEndian.PutUint32(out[base+20:base+24], val.Nexthops[i].Ifindex)
-		binary.NativeEndian.PutUint32(out[base+24:base+28], val.Nexthops[i].Healthy)
-		binary.NativeEndian.PutUint32(out[base+28:base+32], val.Nexthops[i].Protocol)
-	}
-
-	binary.NativeEndian.PutUint32(out[nhSize*ebpfpkg.MaxNexthops:], val.Count)
-
-	return out
 }
 
 // peerInfo holds the node name for a CIDR or endpoint.
