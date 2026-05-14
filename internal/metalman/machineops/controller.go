@@ -376,9 +376,8 @@ func (r *Reconciler) advancePowerOff(ctx context.Context, machine *v1alpha3.Mach
 		return completeTarget(target, "HostPowerOff completed", now)
 	}
 
-	if target.Stage == v1alpha3.OperationStageWaitingOff && target.LastAttemptAt != nil && now.Time.Sub(target.LastAttemptAt.Time) < r.powerActionTimeout() {
-		target.Message = "waiting for power off"
-		return targetChange{target: target}
+	if change, handled := r.waitForPowerAction(target, v1alpha3.OperationStageWaitingOff, "waiting for power off", "timed out waiting for power off", now); handled {
+		return change
 	}
 
 	if err := pc.Reset(ctx, redfish.ResetForceOff); err != nil {
@@ -408,13 +407,12 @@ func (r *Reconciler) advancePowerOn(ctx context.Context, machine *v1alpha3.Machi
 		return retryTarget(target, err, now, r.maxAttempts())
 	}
 
-	if state != redfish.PowerOff {
+	if state == redfish.PowerOn {
 		return completeTarget(target, "HostPowerOn completed", now)
 	}
 
-	if target.Stage == v1alpha3.OperationStageWaitingOn && target.LastAttemptAt != nil && now.Time.Sub(target.LastAttemptAt.Time) < r.powerActionTimeout() {
-		target.Message = "waiting for power on"
-		return targetChange{target: target}
+	if change, handled := r.waitForPowerAction(target, v1alpha3.OperationStageWaitingOn, "waiting for power on", "timed out waiting for power on", now); handled {
+		return change
 	}
 
 	if err := pc.Reset(ctx, redfish.ResetOn); err != nil {
@@ -451,9 +449,8 @@ func (r *Reconciler) advanceReboot(ctx context.Context, machine *v1alpha3.Machin
 			return targetChange{target: target}
 		}
 
-		if target.Stage == v1alpha3.OperationStageWaitingOff && target.LastAttemptAt != nil && now.Time.Sub(target.LastAttemptAt.Time) < r.powerActionTimeout() {
-			target.Message = "waiting for power off"
-			return targetChange{target: target}
+		if change, handled := r.waitForPowerAction(target, v1alpha3.OperationStageWaitingOff, "waiting for power off", "timed out waiting for reboot power off", now); handled {
+			return change
 		}
 
 		if err := pc.Reset(ctx, redfish.ResetForceOff); err != nil {
@@ -468,13 +465,12 @@ func (r *Reconciler) advanceReboot(ctx context.Context, machine *v1alpha3.Machin
 		return targetChange{target: target}
 
 	case v1alpha3.OperationStagePoweringOn, v1alpha3.OperationStageWaitingOn:
-		if state != redfish.PowerOff {
+		if state == redfish.PowerOn {
 			return completeTarget(target, "HostReboot completed", now)
 		}
 
-		if target.Stage == v1alpha3.OperationStageWaitingOn && target.LastAttemptAt != nil && now.Time.Sub(target.LastAttemptAt.Time) < r.powerActionTimeout() {
-			target.Message = "waiting for power on"
-			return targetChange{target: target}
+		if change, handled := r.waitForPowerAction(target, v1alpha3.OperationStageWaitingOn, "waiting for power on", "timed out waiting for reboot power on", now); handled {
+			return change
 		}
 
 		if err := pc.Reset(ctx, redfish.ResetOn); err != nil {
@@ -491,6 +487,21 @@ func (r *Reconciler) advanceReboot(ctx context.Context, machine *v1alpha3.Machin
 	default:
 		return failTarget(target, reasonExecutionFailed, fmt.Sprintf("unknown stage %s", target.Stage), now)
 	}
+}
+
+func (r *Reconciler) waitForPowerAction(target v1alpha3.MachineOperationTargetStatus, stage v1alpha3.OperationStage, waitingMessage, timeoutMessage string, now metav1.Time) (targetChange, bool) {
+	if target.Stage != stage || target.LastAttemptAt == nil {
+		return targetChange{}, false
+	}
+	if now.Sub(target.LastAttemptAt.Time) < r.powerActionTimeout() {
+		target.Message = waitingMessage
+		return targetChange{target: target}, true
+	}
+	if target.Attempts >= r.maxAttempts() {
+		return failTarget(target, reasonExecutionFailed, fmt.Sprintf("%s after %d attempts", timeoutMessage, target.Attempts), now), true
+	}
+
+	return targetChange{}, false
 }
 
 func (r *Reconciler) advanceReplace(ctx context.Context, machine *v1alpha3.Machine, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) targetChange {

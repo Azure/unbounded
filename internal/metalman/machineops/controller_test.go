@@ -50,6 +50,113 @@ func TestReconcilerCompletesMachineRefPowerOff(t *testing.T) {
 	require.Equal(t, []string{"machine-1:ForceOff"}, power.calls)
 }
 
+func TestReconcilerDoesNotCompletePowerOnForTransientState(t *testing.T) {
+	t.Parallel()
+
+	s := testScheme(t)
+	machine := testBareMetalMachine("machine-1", "rack-a")
+	op := testOperation("op-poweron", v1alpha3.OperationHostPowerOn)
+	op.Spec.MachineRef = machine.Name
+	op.Status.Targets = []v1alpha3.MachineOperationTargetStatus{{
+		MachineRef:    machine.Name,
+		Phase:         v1alpha3.OperationPhaseInProgress,
+		Stage:         v1alpha3.OperationStageWaitingOn,
+		Attempts:      1,
+		LastAttemptAt: ptrTo(metav1.NewTime(fixedNow().Add(-30 * time.Second))),
+		StartedAt:     ptrTo(fixedNow()),
+	}}
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, testRedfishSecret()).WithStatusSubresource(op).Build()
+	power := &recordingPowerClient{states: map[string]redfish.PowerState{machine.Name: redfish.PowerState("PoweringOn")}}
+	reconciler := testReconciler(c, power, "rack-a")
+
+	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+	require.NoError(t, err)
+
+	var updated v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated))
+	require.Equal(t, v1alpha3.OperationPhaseInProgress, updated.Status.Phase)
+	require.Equal(t, v1alpha3.OperationPhaseInProgress, updated.Status.Targets[0].Phase)
+	require.Equal(t, "waiting for power on", updated.Status.Targets[0].Message)
+	require.Empty(t, power.calls)
+}
+
+func TestReconcilerDoesNotCompleteRebootPowerOnForTransientState(t *testing.T) {
+	t.Parallel()
+
+	s := testScheme(t)
+	machine := testBareMetalMachine("machine-1", "rack-a")
+	op := testOperation("op-reboot", v1alpha3.OperationHostReboot)
+	op.Spec.MachineRef = machine.Name
+	op.Status.Targets = []v1alpha3.MachineOperationTargetStatus{{
+		MachineRef:    machine.Name,
+		Phase:         v1alpha3.OperationPhaseInProgress,
+		Stage:         v1alpha3.OperationStageWaitingOn,
+		Attempts:      2,
+		LastAttemptAt: ptrTo(metav1.NewTime(fixedNow().Add(-30 * time.Second))),
+		StartedAt:     ptrTo(fixedNow()),
+	}}
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, testRedfishSecret()).WithStatusSubresource(op).Build()
+	power := &recordingPowerClient{states: map[string]redfish.PowerState{machine.Name: redfish.PowerState("PoweringOn")}}
+	reconciler := testReconciler(c, power, "rack-a")
+
+	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+	require.NoError(t, err)
+
+	var updated v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated))
+	require.Equal(t, v1alpha3.OperationPhaseInProgress, updated.Status.Phase)
+	require.Equal(t, v1alpha3.OperationPhaseInProgress, updated.Status.Targets[0].Phase)
+	require.Equal(t, "waiting for power on", updated.Status.Targets[0].Message)
+	require.Empty(t, power.calls)
+}
+
+func TestReconcilerFailsPowerOffAfterIneffectiveResetAttempts(t *testing.T) {
+	t.Parallel()
+
+	s := testScheme(t)
+	machine := testBareMetalMachine("machine-1", "rack-a")
+	op := testOperation("op-poweroff", v1alpha3.OperationHostPowerOff)
+	op.Spec.MachineRef = machine.Name
+	op.Status.Targets = []v1alpha3.MachineOperationTargetStatus{{
+		MachineRef:    machine.Name,
+		Phase:         v1alpha3.OperationPhaseInProgress,
+		Stage:         v1alpha3.OperationStageWaitingOff,
+		Attempts:      3,
+		LastAttemptAt: ptrTo(metav1.NewTime(fixedNow().Add(-2 * time.Minute))),
+		StartedAt:     ptrTo(fixedNow()),
+	}}
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, testRedfishSecret()).WithStatusSubresource(op).Build()
+	power := &recordingPowerClient{states: map[string]redfish.PowerState{machine.Name: redfish.PowerOn}}
+	reconciler := testReconciler(c, power, "rack-a")
+
+	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+	require.NoError(t, err)
+
+	var updated v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated))
+	require.Equal(t, v1alpha3.OperationPhaseFailed, updated.Status.Phase)
+	require.Equal(t, v1alpha3.OperationPhaseFailed, updated.Status.Targets[0].Phase)
+	require.Contains(t, updated.Status.Targets[0].Message, "timed out waiting for power off after 3 attempts")
+	require.Empty(t, power.calls)
+}
+
+func TestRedfishPowerClientFactoryRejectsMissingSecretKey(t *testing.T) {
+	t.Parallel()
+
+	s := testScheme(t)
+	machine := testBareMetalMachine("machine-1", "rack-a")
+	secret := testRedfishSecret()
+	secret.Data = map[string][]byte{}
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, secret).Build()
+	factory := &RedfishPowerClientFactory{Reader: c, Pool: redfish.NewPool()}
+
+	_, err := factory.ForMachine(context.Background(), machine)
+	require.ErrorContains(t, err, `redfish password secret unbounded-kube/redfish missing key "password"`)
+}
+
 func TestReconcilerSnapshotsSiteScopedSelectorTargets(t *testing.T) {
 	t.Parallel()
 
@@ -288,6 +395,10 @@ func testRedfishSecret() *corev1.Secret {
 
 func fixedNow() metav1.Time {
 	return metav1.NewTime(time.Date(2026, 5, 14, 12, 0, 0, 0, time.UTC))
+}
+
+func ptrTo[T any](value T) *T {
+	return &value
 }
 
 func targetNames(targets []v1alpha3.MachineOperationTargetStatus) []string {

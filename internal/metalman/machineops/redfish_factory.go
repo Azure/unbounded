@@ -23,7 +23,7 @@ type RedfishPowerClientFactory struct {
 
 func (f *RedfishPowerClientFactory) ForMachine(ctx context.Context, machine *v1alpha3.Machine) (PowerClient, error) {
 	if machine.Spec.PXE == nil || machine.Spec.PXE.Redfish == nil {
-		return nil, fmt.Errorf("Machine %s has no Redfish config", machine.Name)
+		return nil, fmt.Errorf("machine %s has no Redfish config", machine.Name)
 	}
 
 	rf := machine.Spec.PXE.Redfish
@@ -32,7 +32,7 @@ func (f *RedfishPowerClientFactory) ForMachine(ctx context.Context, machine *v1a
 		fingerprint = machine.Status.Redfish.CertFingerprint
 	}
 	if fingerprint == "" {
-		return nil, fmt.Errorf("Machine %s has no Redfish certificate fingerprint", machine.Name)
+		return nil, fmt.Errorf("machine %s has no Redfish certificate fingerprint", machine.Name)
 	}
 
 	var secret corev1.Secret
@@ -40,7 +40,11 @@ func (f *RedfishPowerClientFactory) ForMachine(ctx context.Context, machine *v1a
 		return nil, fmt.Errorf("get Redfish password secret: %w", err)
 	}
 
-	password := string(secret.Data[rf.PasswordRef.Key])
+	passwordBytes, ok := secret.Data[rf.PasswordRef.Key]
+	if !ok {
+		return nil, fmt.Errorf("redfish password secret %s/%s missing key %q", rf.PasswordRef.Namespace, rf.PasswordRef.Name, rf.PasswordRef.Key)
+	}
+	password := string(passwordBytes)
 
 	c, err := f.Pool.Get(ctx, rf.URL, fingerprint, rf.Username, password, rf.DeviceID)
 	if err != nil {
