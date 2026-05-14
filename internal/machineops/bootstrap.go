@@ -117,6 +117,7 @@ func (r *MachineOperationReconciler) buildReplaceAgentConfig(ctx context.Context
 		},
 		ProviderLabels: clusterInfo.ProviderLabels,
 		BootstrapToken: bootstrapToken,
+		NodeName:       machine.Name,
 	}), nil
 }
 
