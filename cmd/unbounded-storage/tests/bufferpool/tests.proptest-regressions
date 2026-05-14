@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 9d06bb5b04c60b0ea4a3fb03477620ecc77383c7e84051fb7d6db9c97cf4db33 # shrinks to seed = 16283855356151283598, w = Workload { page_size: 128, page_count: 2, max_io_delay: 1, io_fault_rate: 3, cache_hit_rate: 0, max_concurrent_streams: 1024, key_count: 2, clients: [ClientSpec { key_idx: 0, offset: 640, len: 1 }, ClientSpec { key_idx: 55, offset: 2048, len: 1 }, ClientSpec { key_idx: 14, offset: 256, len: 1 }, ClientSpec { key_idx: 0, offset: 1664, len: 1 }, ClientSpec { key_idx: 103, offset: 640, len: 1 }] }

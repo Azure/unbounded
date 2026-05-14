@@ -50,4 +50,13 @@ jobs:
             cargo-unbounded-storage-${{ runner.os }}-
 
       - name: Test
+        env:
+          # Override the in-source `cases: 256` proptest default for CI
+          # so we get meaningful DST coverage on every run. Each case is
+          # cheap (sub-millisecond on a debug build), so a few thousand
+          # cases per property keeps the job well under a minute while
+          # exercising orders of magnitude more (seed, workload) pairs
+          # than the local default. Bump via workflow_dispatch or set
+          # `PROPTEST_CASES` locally for soak runs.
+          PROPTEST_CASES: "4096"
         run: cargo test --locked --all-targets
