@@ -1,0 +1,96 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+name: unbounded-storage-sim
+
+on:
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "Wall-clock budget for the DST loop (e.g. 20m, 1h)."
+        required: false
+        default: "20m"
+      proptest_cases:
+        description: "PROPTEST_CASES per cargo test invocation."
+        required: false
+        default: "4096"
+
+concurrency:
+  group: unbounded-storage-sim-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sim:
+    name: DST soak
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: cmd/unbounded-storage
+    env:
+      DST_DURATION: ${{ github.event.inputs.duration || '20m' }}
+      PROPTEST_CASES: ${{ github.event.inputs.proptest_cases || '4096' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Rust toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            cmd/unbounded-storage/target
+          key: cargo-unbounded-storage-sim-${{ runner.os }}-${{ hashFiles('cmd/unbounded-storage/Cargo.lock', 'cmd/unbounded-storage/Cargo.toml') }}
+          restore-keys: |
+            cargo-unbounded-storage-sim-${{ runner.os }}-
+            cargo-unbounded-storage-${{ runner.os }}-
+
+      - name: Build DST test binary
+        run: cargo test --release --locked --test dst --no-run
+
+      - name: Run DST soak
+        # Loop `cargo test` against the `dst` integration test until
+        # the wall-clock budget expires. Each iteration uses a fresh
+        # PROPTEST_SEED so the soak keeps exploring new (seed, workload)
+        # pairs rather than re-running the same cases. `timeout` exits
+        # 124 when it kills the loop; treat that as success. Any
+        # non-zero exit from cargo test itself fails the job.
+        run: |
+          set -u
+          status=0
+          iteration=0
+          start=$SECONDS
+          # `timeout --preserve-status` would propagate a SIGTERM exit;
+          # instead we rely on the explicit 124 check below.
+          timeout "${DST_DURATION}" bash -c '
+            set -eu
+            i=0
+            while :; do
+              i=$((i + 1))
+              # Derive a per-iteration seed from /dev/urandom so each
+              # cargo invocation explores fresh proptest inputs.
+              PROPTEST_SEED="$(od -An -N8 -tu8 /dev/urandom | tr -d " ")"
+              export PROPTEST_SEED
+              echo "::group::DST iteration ${i} (seed=${PROPTEST_SEED}, elapsed=$((SECONDS))s)"
+              cargo test --release --locked --test dst -- --nocapture
+              echo "::endgroup::"
+            done
+          ' || status=$?
+          elapsed=$((SECONDS - start))
+          if [ "${status}" -eq 124 ] || [ "${status}" -eq 0 ]; then
+            echo "DST soak completed after ${elapsed}s (timeout exit=${status})."
+            exit 0
+          fi
+          echo "DST soak failed after ${elapsed}s with exit code ${status}." >&2
+          exit "${status}"
