@@ -4,7 +4,6 @@
 package main
 
 import (
-	"net"
 	"testing"
 
 	ebpfpkg "github.com/Azure/unbounded/internal/net/ebpf"
@@ -176,6 +175,39 @@ func TestMakeEntries(t *testing.T) {
 	}
 }
 
-// Avoid unused-import linter complaints when the package compiles without
-// using net here (defensive in case of refactors).
-var _ = net.IPv4
+// TestGroupByCIDR verifies that per-nexthop entries are collapsed under
+// their shared CIDR into a single object with an endpoints array.
+func TestGroupByCIDR(t *testing.T) {
+	t.Parallel()
+
+	in := []entry{
+		{CIDR: "10.0.0.0/24", Family: "v4", Remote: "192.168.1.1", IfIndex: 7, Healthy: true},
+		{CIDR: "10.0.0.0/24", Family: "v4", Remote: "192.168.1.2", IfIndex: 8, Healthy: false},
+		{CIDR: "2001:db8::/32", Family: "v6", Remote: "fe80::1", IfIndex: 9, Healthy: true},
+	}
+
+	groups := groupByCIDR(in)
+	if len(groups) != 2 {
+		t.Fatalf("groups: got %d, want 2", len(groups))
+	}
+
+	if groups[0].CIDR != "10.0.0.0/24" || groups[0].Family != "v4" {
+		t.Errorf("groups[0]: %+v", groups[0])
+	}
+
+	if len(groups[0].Endpoints) != 2 {
+		t.Fatalf("groups[0].Endpoints: got %d, want 2", len(groups[0].Endpoints))
+	}
+
+	if groups[0].Endpoints[0].Remote != "192.168.1.1" || groups[0].Endpoints[0].IfIndex != 7 {
+		t.Errorf("groups[0].Endpoints[0]: %+v", groups[0].Endpoints[0])
+	}
+
+	if groups[0].Endpoints[1].Healthy {
+		t.Errorf("groups[0].Endpoints[1] should be unhealthy")
+	}
+
+	if groups[1].CIDR != "2001:db8::/32" || groups[1].Family != "v6" || len(groups[1].Endpoints) != 1 {
+		t.Errorf("groups[1]: %+v", groups[1])
+	}
+}

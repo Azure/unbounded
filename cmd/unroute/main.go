@@ -30,9 +30,8 @@ import (
 	"github.com/Azure/unbounded/internal/version"
 )
 
-// entry is the human-readable representation of one nexthop in one trie
-// entry. We emit one entry per nexthop so multi-nexthop CIDRs produce
-// multiple rows.
+// entry is the per-nexthop row used for text output. We emit one row per
+// nexthop so the tabular format stays scannable.
 type entry struct {
 	CIDR      string `json:"cidr"`
 	Remote    string `json:"remote"`
@@ -44,6 +43,26 @@ type entry struct {
 	MTU       int    `json:"mtu"`
 	IfIndex   uint32 `json:"ifindex"`
 	Family    string `json:"family"` // "v4" or "v6", for client filtering
+}
+
+// cidrGroup is the per-CIDR JSON shape used by `unroute -j`: one object
+// per LPM trie entry with all nexthops collapsed under an `endpoints`
+// array. Each endpoint mirrors a single nexthop slot.
+type cidrGroup struct {
+	CIDR      string         `json:"cidr"`
+	Family    string         `json:"family"`
+	Endpoints []endpointJSON `json:"endpoints"`
+}
+
+type endpointJSON struct {
+	Remote    string `json:"remote"`
+	Node      string `json:"node,omitempty"`
+	Interface string `json:"interface"`
+	Protocol  string `json:"protocol"`
+	Healthy   bool   `json:"healthy"`
+	VNI       uint32 `json:"vni"`
+	MTU       int    `json:"mtu"`
+	IfIndex   uint32 `json:"ifindex"`
 }
 
 // rawEntry mirrors `bpftool map dump -j`: each entry is a structured
@@ -465,13 +484,17 @@ func makeEntries(key ebpfpkg.LpmKey, val ebpfpkg.RawTunnelEndpoint, familyFilter
 	return entries
 }
 
-// printEntries renders a slice of entries in text or JSON format.
+// printEntries renders a slice of entries. Text output emits one row per
+// nexthop; JSON output groups nexthops under their CIDR into a single
+// object per LPM trie entry with an `endpoints` array.
 func printEntries(entries []entry, jsonOutput bool) error {
 	if jsonOutput {
+		groups := groupByCIDR(entries)
+
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 
-		return enc.Encode(entries)
+		return enc.Encode(groups)
 	}
 
 	if len(entries) == 0 {
@@ -497,6 +520,39 @@ func printEntries(entries []entry, jsonOutput bool) error {
 	fmt.Printf("\n%d entries\n", len(entries))
 
 	return nil
+}
+
+// groupByCIDR collapses a per-nexthop entry slice into a per-CIDR slice
+// with nexthops under each CIDR's `endpoints` array. Preserves the input
+// order of CIDRs (caller is expected to have sorted them already).
+func groupByCIDR(entries []entry) []cidrGroup {
+	groups := make([]cidrGroup, 0)
+	idx := make(map[string]int, len(entries))
+
+	for _, e := range entries {
+		i, ok := idx[e.CIDR]
+		if !ok {
+			i = len(groups)
+			idx[e.CIDR] = i
+			groups = append(groups, cidrGroup{
+				CIDR:   e.CIDR,
+				Family: e.Family,
+			})
+		}
+
+		groups[i].Endpoints = append(groups[i].Endpoints, endpointJSON{
+			Remote:    e.Remote,
+			Node:      e.Node,
+			Interface: e.Interface,
+			Protocol:  e.Protocol,
+			Healthy:   e.Healthy,
+			VNI:       e.VNI,
+			MTU:       e.MTU,
+			IfIndex:   e.IfIndex,
+		})
+	}
+
+	return groups
 }
 
 // formatKey renders an LPM key as a CIDR string. v4-mapped entries are
