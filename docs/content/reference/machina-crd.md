@@ -124,6 +124,7 @@ OCI operations use an OCI SDK config file mounted into the `machine-ops-controll
 | `status.message` | string | No | Human-readable status message. |
 | `status.startedAt` | time | No | Operation start timestamp. |
 | `status.completedAt` | time | No | Terminal phase timestamp. |
+| `status.targets` | []TargetStatus | No | Per-Machine target status snapshot used by metalman host operations. |
 
 `AgentUpgrade` is handled by the in-host agent and requires `spec.parameters.downloadURL`. The URL must point to an `unbounded-agent` release tarball; the agent stages it as the inactive blue/green daemon binary, records the previous binary as last known good, and restarts `unbounded-agent-daemon.service`. If systemd cannot keep the upgraded daemon running, `unbounded-agent-daemon-recovery.service` switches the daemon back to the last known good binary.
 
@@ -149,6 +150,28 @@ The OCI instance provider handles:
 | `HostPowerOn` | `START` |
 
 `HostReplace` is not currently supported for `OCIInstance` because an identity-preserving OCI replacement flow with fresh `user_data` injection has not been verified.
+
+Metalman handles bare-metal host operations for Machines with `spec.pxe.redfish`
+and no external `spec.provider`/`spec.providerID`. Bare-metal host operations may
+target one Machine with `spec.machineRef` or a site-scoped set of Machines with
+`spec.machineSelector`. Selector-based bare-metal host operations must select a
+single metalman site with `unbounded-cloud.io/site=<site>`.
+
+For metalman operations, `status.targets[]` is snapshotted when execution starts
+and remains authoritative even if labels later change. Each entry includes:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `machineRef` | string | Target Machine name. |
+| `phase` | string | Target phase: `Pending`, `InProgress`, `Complete`, or `Failed`. |
+| `stage` | string | Target operation stage such as `WaitingOff`, `WaitingOn`, or `WaitingRepave`. |
+| `message` | string | Human-readable target progress or failure message. |
+| `startedAt` | time | Target start timestamp. |
+| `completedAt` | time | Target terminal timestamp. |
+| `observedGeneration` | int64 | Machine generation acted on. |
+| `targetOperations` | OperationsStatus | Counter targets used by bare-metal `HostReplace`. |
+| `attempts` | int32 | External action attempts for retryable Redfish operations. |
+| `lastAttemptAt` | time | Most recent external action attempt timestamp. |
 
 ### status
 

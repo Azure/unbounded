@@ -88,6 +88,18 @@ const (
 	OperationPhaseFailed     OperationPhase = "Failed"
 )
 
+// OperationStage represents the current stage of a target operation.
+type OperationStage string
+
+const (
+	OperationStagePoweringOff     OperationStage = "PoweringOff"
+	OperationStageWaitingOff      OperationStage = "WaitingOff"
+	OperationStagePoweringOn      OperationStage = "PoweringOn"
+	OperationStageWaitingOn       OperationStage = "WaitingOn"
+	OperationStageRepaveRequested OperationStage = "RepaveRequested"
+	OperationStageWaitingRepave   OperationStage = "WaitingRepave"
+)
+
 // MachineOperationSpec defines the desired state of a MachineOperation.
 type MachineOperationSpec struct {
 	// MachineRef is the name of the Machine CR this operation targets.
@@ -149,10 +161,65 @@ type MachineOperationStatus struct {
 	// +optional
 	ObservedMachineGeneration int64 `json:"observedMachineGeneration,omitempty"`
 
+	// Targets records the per-machine execution state for this operation.
+	// For single-machine operations this contains one entry. For selector
+	// operations, targets are snapshotted when execution begins and remain
+	// authoritative even if selector matches change later.
+	// +optional
+	// +listType=map
+	// +listMapKey=machineRef
+	Targets []MachineOperationTargetStatus `json:"targets,omitempty"`
+
 	// Conditions represent the latest available observations of the
 	// operation's state.
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// MachineOperationTargetStatus records execution state for one target Machine.
+type MachineOperationTargetStatus struct {
+	// MachineRef is the name of the targeted Machine.
+	// +kubebuilder:validation:Required
+	MachineRef string `json:"machineRef"`
+
+	// Phase is the current lifecycle phase for this target.
+	// +optional
+	Phase OperationPhase `json:"phase,omitempty"`
+
+	// Stage is the current operation-specific stage for this target.
+	// +optional
+	Stage OperationStage `json:"stage,omitempty"`
+
+	// Message is a human-readable description of target progress or failure.
+	// +optional
+	Message string `json:"message,omitempty"`
+
+	// StartedAt is when execution began for this target.
+	// +optional
+	StartedAt *metav1.Time `json:"startedAt,omitempty"`
+
+	// CompletedAt is when this target reached a terminal phase.
+	// +optional
+	CompletedAt *metav1.Time `json:"completedAt,omitempty"`
+
+	// ObservedGeneration is the target Machine generation acted on.
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// TargetOperations records the Machine operation counters this operation
+	// requested. It is used by counter-backed HostReplace operations to remain
+	// idempotent across controller restarts.
+	// +optional
+	TargetOperations *OperationsStatus `json:"targetOperations,omitempty"`
+
+	// Attempts is the number of external action attempts made for this target.
+	// Polling expected state changes does not increment this field.
+	// +optional
+	Attempts int32 `json:"attempts,omitempty"`
+
+	// LastAttemptAt records when the latest external action attempt occurred.
+	// +optional
+	LastAttemptAt *metav1.Time `json:"lastAttemptAt,omitempty"`
 }
 
 // IsTerminal returns true if the operation phase is Complete or Failed.

@@ -1,0 +1,865 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+package machineops
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sort"
+	"sync"
+	"time"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+
+	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/metalman/redfish"
+)
+
+const (
+	siteLabel = "unbounded-cloud.io/site"
+
+	conditionCompleted = "Completed"
+
+	reasonSucceeded                = "Succeeded"
+	reasonInvalidTargetScope       = "InvalidTargetScope"
+	reasonNoMatchingOwnedMachines  = "NoMatchingOwnedMachines"
+	reasonMachineNotFound          = "MachineNotFound"
+	reasonUnsupportedTarget        = "UnsupportedTarget"
+	reasonTargetNoLongerOwned      = "TargetNoLongerOwned"
+	reasonExecutionFailed          = "ExecutionFailed"
+	reasonWaitingForOlderOperation = "WaitingForOlderOperation"
+)
+
+// PowerClient is the Redfish power operation subset used by MachineOperation reconciliation.
+type PowerClient interface {
+	PowerState(ctx context.Context) (redfish.PowerState, error)
+	Reset(ctx context.Context, resetType redfish.ResetType) error
+	DisableBootOverride(ctx context.Context) error
+}
+
+// PowerClientFactory builds a PowerClient for a Machine.
+type PowerClientFactory interface {
+	ForMachine(ctx context.Context, machine *v1alpha3.Machine) (PowerClient, error)
+}
+
+// Reconciler reconciles metalman-owned host MachineOperations.
+type Reconciler struct {
+	client.Client
+	APIReader client.Reader
+
+	Site                  string
+	PowerClients          PowerClientFactory
+	MaxConcurrentMachines int
+	MaxAttempts           int32
+	PollInterval          time.Duration
+	PowerActionTimeout    time.Duration
+	Now                   func() metav1.Time
+}
+
+// +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machineoperations,verbs=get;list;watch;delete
+// +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machineoperations/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machines,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machines/status,verbs=get
+
+func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
+	return ctrl.NewControllerManagedBy(mgr).
+		Named("metalman-machineoperation").
+		For(&v1alpha3.MachineOperation{}).
+		WithEventFilter(predicate.Funcs{
+			CreateFunc: func(e event.CreateEvent) bool {
+				op, ok := e.Object.(*v1alpha3.MachineOperation)
+				return ok && shouldReconcile(op)
+			},
+			UpdateFunc: func(e event.UpdateEvent) bool {
+				op, ok := e.ObjectNew.(*v1alpha3.MachineOperation)
+				return ok && shouldReconcile(op)
+			},
+			DeleteFunc: func(e event.DeleteEvent) bool { return false },
+			GenericFunc: func(e event.GenericEvent) bool {
+				op, ok := e.Object.(*v1alpha3.MachineOperation)
+				return ok && shouldReconcile(op)
+			},
+		}).
+		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
+		Complete(r)
+}
+
+func shouldReconcile(op *v1alpha3.MachineOperation) bool {
+	if isHostOperation(op.Spec.OperationKind) {
+		return true
+	}
+
+	return op.Status.IsTerminal() && op.Spec.TTLSecondsAfterFinished != nil && op.Status.CompletedAt != nil
+}
+
+func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	var op v1alpha3.MachineOperation
+	if err := r.Get(ctx, client.ObjectKey{Name: req.Name}, &op); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	if op.Status.IsTerminal() {
+		return r.reconcileTerminal(ctx, &op)
+	}
+
+	if !isHostOperation(op.Spec.OperationKind) {
+		return ctrl.Result{}, nil
+	}
+
+	if older, err := r.olderActiveOperation(ctx, &op); err != nil {
+		return ctrl.Result{}, err
+	} else if older != "" {
+		message := fmt.Sprintf("waiting for older host operation %s", older)
+		return ctrl.Result{RequeueAfter: r.pollInterval()}, r.updateOperationStatus(ctx, op.Name, func(latest *v1alpha3.MachineOperation) {
+			latest.Status.Phase = v1alpha3.OperationPhasePending
+			latest.Status.Message = message
+		})
+	}
+
+	if len(op.Status.Targets) == 0 {
+		owned, err := r.snapshotTargets(ctx, &op)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if !owned {
+			return ctrl.Result{}, nil
+		}
+
+		if err := r.Get(ctx, client.ObjectKey{Name: op.Name}, &op); err != nil {
+			return ctrl.Result{}, client.IgnoreNotFound(err)
+		}
+	}
+
+	if len(op.Status.Targets) == 0 {
+		logger.V(1).Info("operation has no targets", "operation", op.Name)
+		return ctrl.Result{}, nil
+	}
+
+	changes, requeueAfter := r.advanceTargets(ctx, &op)
+	if len(changes) > 0 {
+		if err := r.applyTargetChanges(ctx, op.Name, changes); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	if requeueAfter > 0 {
+		return ctrl.Result{RequeueAfter: requeueAfter}, nil
+	}
+
+	return ctrl.Result{}, nil
+}
+
+func (r *Reconciler) snapshotTargets(ctx context.Context, op *v1alpha3.MachineOperation) (bool, error) {
+	targets, err := r.resolveTargets(ctx, op)
+	if err != nil {
+		return true, r.finishOperation(ctx, op.Name, v1alpha3.OperationPhaseFailed, reasonForError(err), err.Error())
+	}
+
+	if len(targets) == 0 {
+		if op.Spec.MachineRef != "" {
+			return false, nil
+		}
+
+		return true, r.finishOperation(ctx, op.Name, v1alpha3.OperationPhaseFailed, reasonNoMatchingOwnedMachines, "no owned bare-metal Machines matched the operation target")
+	}
+
+	now := r.now()
+	targetStatuses := make([]v1alpha3.MachineOperationTargetStatus, 0, len(targets))
+	for _, machine := range targets {
+		targetStatuses = append(targetStatuses, v1alpha3.MachineOperationTargetStatus{
+			MachineRef:         machine.Name,
+			Phase:              v1alpha3.OperationPhasePending,
+			Message:            "target snapshotted",
+			ObservedGeneration: machine.Generation,
+		})
+	}
+
+	return true, r.updateOperationStatus(ctx, op.Name, func(latest *v1alpha3.MachineOperation) {
+		latest.Status.Phase = v1alpha3.OperationPhaseInProgress
+		latest.Status.Message = fmt.Sprintf("snapshotted %d target(s)", len(targetStatuses))
+		latest.Status.StartedAt = &now
+		latest.Status.Targets = targetStatuses
+		setCompletedCondition(latest, metav1.ConditionFalse, "InProgress", latest.Status.Message)
+	})
+}
+
+func (r *Reconciler) resolveTargets(ctx context.Context, op *v1alpha3.MachineOperation) ([]v1alpha3.Machine, error) {
+	if op.Spec.MachineRef != "" {
+		reader := r.APIReader
+		if reader == nil {
+			reader = r.Client
+		}
+
+		var machine v1alpha3.Machine
+		if err := reader.Get(ctx, client.ObjectKey{Name: op.Spec.MachineRef}, &machine); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil, operationError{reason: reasonMachineNotFound, message: fmt.Sprintf("Machine %s not found", op.Spec.MachineRef)}
+			}
+
+			return nil, fmt.Errorf("get Machine %s: %w", op.Spec.MachineRef, err)
+		}
+
+		if !r.ownsMachine(&machine) {
+			return nil, nil
+		}
+		if machine.Spec.Provider != "" || machine.Spec.ProviderID != "" {
+			return nil, nil
+		}
+
+		if !isBareMetalRedfishMachine(&machine) {
+			return nil, operationError{reason: reasonUnsupportedTarget, message: fmt.Sprintf("Machine %s is not a bare-metal Redfish target", machine.Name)}
+		}
+
+		return []v1alpha3.Machine{machine}, nil
+	}
+
+	if op.Spec.MachineSelector == nil {
+		return nil, operationError{reason: reasonInvalidTargetScope, message: "spec.machineRef or spec.machineSelector is required"}
+	}
+
+	if err := r.validateSelectorScope(op.Spec.MachineSelector); err != nil {
+		return nil, err
+	}
+
+	selector, err := metav1.LabelSelectorAsSelector(op.Spec.MachineSelector)
+	if err != nil {
+		return nil, operationError{reason: reasonInvalidTargetScope, message: fmt.Sprintf("invalid machineSelector: %v", err)}
+	}
+
+	var list v1alpha3.MachineList
+	if err := r.List(ctx, &list, client.MatchingLabelsSelector{Selector: selector}); err != nil {
+		return nil, fmt.Errorf("list Machines for selector: %w", err)
+	}
+
+	targets := make([]v1alpha3.Machine, 0, len(list.Items))
+	for _, machine := range list.Items {
+		if !r.ownsMachine(&machine) || !isBareMetalRedfishMachine(&machine) {
+			continue
+		}
+
+		targets = append(targets, machine)
+	}
+
+	sort.Slice(targets, func(i, j int) bool { return targets[i].Name < targets[j].Name })
+
+	return targets, nil
+}
+
+func (r *Reconciler) validateSelectorScope(selector *metav1.LabelSelector) error {
+	if r.Site == "" {
+		return operationError{reason: reasonInvalidTargetScope, message: "selector-based host operations require a non-empty metalman site"}
+	}
+
+	if selector.MatchLabels != nil && selector.MatchLabels[siteLabel] == r.Site {
+		return nil
+	}
+
+	for _, expr := range selector.MatchExpressions {
+		if expr.Key == siteLabel && expr.Operator == metav1.LabelSelectorOpIn && len(expr.Values) == 1 && expr.Values[0] == r.Site {
+			return nil
+		}
+	}
+
+	return operationError{reason: reasonInvalidTargetScope, message: fmt.Sprintf("machineSelector must include %s=%s", siteLabel, r.Site)}
+}
+
+func (r *Reconciler) advanceTargets(ctx context.Context, op *v1alpha3.MachineOperation) ([]targetChange, time.Duration) {
+	maxConcurrent := r.maxConcurrentMachines()
+	active := 0
+	selected := make([]v1alpha3.MachineOperationTargetStatus, 0, maxConcurrent)
+
+	for _, target := range op.Status.Targets {
+		if target.Phase == v1alpha3.OperationPhaseInProgress {
+			active++
+			selected = append(selected, target)
+		}
+	}
+
+	if active < maxConcurrent {
+		for _, target := range op.Status.Targets {
+			if target.Phase != "" && target.Phase != v1alpha3.OperationPhasePending {
+				continue
+			}
+			if active >= maxConcurrent {
+				break
+			}
+
+			target.Phase = v1alpha3.OperationPhaseInProgress
+			selected = append(selected, target)
+			active++
+		}
+	}
+
+	if len(selected) == 0 {
+		return []targetChange{{aggregateOnly: true}}, 0
+	}
+
+	changes := make([]targetChange, len(selected))
+	var wg sync.WaitGroup
+	for i, target := range selected {
+		wg.Add(1)
+		go func(i int, target v1alpha3.MachineOperationTargetStatus) {
+			defer wg.Done()
+			changes[i] = r.advanceTarget(ctx, op, target)
+		}(i, target)
+	}
+	wg.Wait()
+
+	requeue := r.pollInterval()
+	return changes, requeue
+}
+
+func (r *Reconciler) advanceTarget(ctx context.Context, op *v1alpha3.MachineOperation, target v1alpha3.MachineOperationTargetStatus) targetChange {
+	now := r.now()
+	if target.StartedAt == nil {
+		target.StartedAt = &now
+	}
+
+	var machine v1alpha3.Machine
+	if err := r.Get(ctx, client.ObjectKey{Name: target.MachineRef}, &machine); err != nil {
+		if apierrors.IsNotFound(err) {
+			return failTarget(target, reasonMachineNotFound, fmt.Sprintf("Machine %s not found", target.MachineRef), now)
+		}
+
+		return retryTarget(target, fmt.Errorf("get Machine %s: %w", target.MachineRef, err), now, r.maxAttempts())
+	}
+
+	if !r.ownsMachine(&machine) {
+		return failTarget(target, reasonTargetNoLongerOwned, fmt.Sprintf("Machine %s is no longer owned by this metalman instance", machine.Name), now)
+	}
+
+	if !isBareMetalRedfishMachine(&machine) {
+		return failTarget(target, reasonUnsupportedTarget, fmt.Sprintf("Machine %s is not a bare-metal Redfish target", machine.Name), now)
+	}
+
+	target.ObservedGeneration = machine.Generation
+
+	switch op.Spec.OperationKind {
+	case v1alpha3.OperationHostPowerOff:
+		return r.advancePowerOff(ctx, &machine, target, now)
+	case v1alpha3.OperationHostPowerOn:
+		return r.advancePowerOn(ctx, &machine, target, now)
+	case v1alpha3.OperationHostReboot:
+		return r.advanceReboot(ctx, &machine, target, now)
+	case v1alpha3.OperationHostReplace:
+		return r.advanceReplace(ctx, &machine, target, now)
+	default:
+		return failTarget(target, reasonUnsupportedTarget, fmt.Sprintf("%s is not handled by metalman", op.Spec.OperationKind), now)
+	}
+}
+
+func (r *Reconciler) advancePowerOff(ctx context.Context, machine *v1alpha3.Machine, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) targetChange {
+	pc, err := r.PowerClients.ForMachine(ctx, machine)
+	if err != nil {
+		return retryTarget(target, err, now, r.maxAttempts())
+	}
+
+	state, err := pc.PowerState(ctx)
+	if err != nil {
+		return retryTarget(target, err, now, r.maxAttempts())
+	}
+
+	if state == redfish.PowerOff {
+		return completeTarget(target, "HostPowerOff completed", now)
+	}
+
+	if target.Stage == v1alpha3.OperationStageWaitingOff && target.LastAttemptAt != nil && now.Time.Sub(target.LastAttemptAt.Time) < r.powerActionTimeout() {
+		target.Message = "waiting for power off"
+		return targetChange{target: target}
+	}
+
+	if err := pc.Reset(ctx, redfish.ResetForceOff); err != nil {
+		return retryTarget(target, err, now, r.maxAttempts())
+	}
+
+	target.Stage = v1alpha3.OperationStageWaitingOff
+	target.Attempts++
+	target.LastAttemptAt = &now
+	target.Message = "sent ForceOff"
+
+	return targetChange{target: target}
+}
+
+func (r *Reconciler) advancePowerOn(ctx context.Context, machine *v1alpha3.Machine, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) targetChange {
+	pc, err := r.PowerClients.ForMachine(ctx, machine)
+	if err != nil {
+		return retryTarget(target, err, now, r.maxAttempts())
+	}
+
+	if err := pc.DisableBootOverride(ctx); err != nil {
+		return retryTarget(target, err, now, r.maxAttempts())
+	}
+
+	state, err := pc.PowerState(ctx)
+	if err != nil {
+		return retryTarget(target, err, now, r.maxAttempts())
+	}
+
+	if state != redfish.PowerOff {
+		return completeTarget(target, "HostPowerOn completed", now)
+	}
+
+	if target.Stage == v1alpha3.OperationStageWaitingOn && target.LastAttemptAt != nil && now.Time.Sub(target.LastAttemptAt.Time) < r.powerActionTimeout() {
+		target.Message = "waiting for power on"
+		return targetChange{target: target}
+	}
+
+	if err := pc.Reset(ctx, redfish.ResetOn); err != nil {
+		return retryTarget(target, err, now, r.maxAttempts())
+	}
+
+	target.Stage = v1alpha3.OperationStageWaitingOn
+	target.Attempts++
+	target.LastAttemptAt = &now
+	target.Message = "sent On"
+
+	return targetChange{target: target}
+}
+
+func (r *Reconciler) advanceReboot(ctx context.Context, machine *v1alpha3.Machine, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) targetChange {
+	pc, err := r.PowerClients.ForMachine(ctx, machine)
+	if err != nil {
+		return retryTarget(target, err, now, r.maxAttempts())
+	}
+
+	if err := pc.DisableBootOverride(ctx); err != nil {
+		return retryTarget(target, err, now, r.maxAttempts())
+	}
+
+	state, err := pc.PowerState(ctx)
+	if err != nil {
+		return retryTarget(target, err, now, r.maxAttempts())
+	}
+
+	switch target.Stage {
+	case "", v1alpha3.OperationStagePoweringOff, v1alpha3.OperationStageWaitingOff:
+		if state == redfish.PowerOff {
+			target.Stage = v1alpha3.OperationStagePoweringOn
+			return targetChange{target: target}
+		}
+
+		if target.Stage == v1alpha3.OperationStageWaitingOff && target.LastAttemptAt != nil && now.Time.Sub(target.LastAttemptAt.Time) < r.powerActionTimeout() {
+			target.Message = "waiting for power off"
+			return targetChange{target: target}
+		}
+
+		if err := pc.Reset(ctx, redfish.ResetForceOff); err != nil {
+			return retryTarget(target, err, now, r.maxAttempts())
+		}
+
+		target.Stage = v1alpha3.OperationStageWaitingOff
+		target.Attempts++
+		target.LastAttemptAt = &now
+		target.Message = "sent ForceOff"
+
+		return targetChange{target: target}
+
+	case v1alpha3.OperationStagePoweringOn, v1alpha3.OperationStageWaitingOn:
+		if state != redfish.PowerOff {
+			return completeTarget(target, "HostReboot completed", now)
+		}
+
+		if target.Stage == v1alpha3.OperationStageWaitingOn && target.LastAttemptAt != nil && now.Time.Sub(target.LastAttemptAt.Time) < r.powerActionTimeout() {
+			target.Message = "waiting for power on"
+			return targetChange{target: target}
+		}
+
+		if err := pc.Reset(ctx, redfish.ResetOn); err != nil {
+			return retryTarget(target, err, now, r.maxAttempts())
+		}
+
+		target.Stage = v1alpha3.OperationStageWaitingOn
+		target.Attempts++
+		target.LastAttemptAt = &now
+		target.Message = "sent On"
+
+		return targetChange{target: target}
+
+	default:
+		return failTarget(target, reasonExecutionFailed, fmt.Sprintf("unknown stage %s", target.Stage), now)
+	}
+}
+
+func (r *Reconciler) advanceReplace(ctx context.Context, machine *v1alpha3.Machine, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) targetChange {
+	if target.TargetOperations == nil {
+		target.TargetOperations = computeReplaceTargets(machine)
+		target.Stage = v1alpha3.OperationStageRepaveRequested
+		target.Message = "computed PXE repave target counters"
+
+		return targetChange{target: target}
+	}
+
+	if machine.Spec.Operations == nil ||
+		machine.Spec.Operations.RebootCounter < target.TargetOperations.RebootCounter ||
+		machine.Spec.Operations.RepaveCounter < target.TargetOperations.RepaveCounter {
+		target.Stage = v1alpha3.OperationStageRepaveRequested
+		target.Message = "requesting PXE repave"
+
+		if err := r.patchMachineOperations(ctx, machine.Name, target.TargetOperations); err != nil {
+			return targetChange{target: target, err: err}
+		}
+
+		return targetChange{target: target}
+	}
+
+	if machine.Status.Operations != nil &&
+		machine.Status.Operations.RebootCounter >= target.TargetOperations.RebootCounter &&
+		machine.Status.Operations.RepaveCounter >= target.TargetOperations.RepaveCounter &&
+		apimeta.IsStatusConditionTrue(machine.Status.Conditions, v1alpha3.MachineConditionRepaved) {
+		return completeTarget(target, "HostReplace completed", now)
+	}
+
+	target.Stage = v1alpha3.OperationStageWaitingRepave
+	target.Message = "waiting for PXE repave to complete"
+
+	return targetChange{target: target}
+}
+
+func computeReplaceTargets(machine *v1alpha3.Machine) *v1alpha3.OperationsStatus {
+	var specReboot, specRepave, statusReboot, statusRepave int64
+	if machine.Spec.Operations != nil {
+		specReboot = machine.Spec.Operations.RebootCounter
+		specRepave = machine.Spec.Operations.RepaveCounter
+	}
+	if machine.Status.Operations != nil {
+		statusReboot = machine.Status.Operations.RebootCounter
+		statusRepave = machine.Status.Operations.RepaveCounter
+	}
+
+	return &v1alpha3.OperationsStatus{
+		RebootCounter: maxInt64(specReboot, statusReboot) + 1,
+		RepaveCounter: maxInt64(specRepave, statusRepave) + 1,
+	}
+}
+
+func (r *Reconciler) patchMachineOperations(ctx context.Context, machineName string, target *v1alpha3.OperationsStatus) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var machine v1alpha3.Machine
+		if err := r.Get(ctx, client.ObjectKey{Name: machineName}, &machine); err != nil {
+			return err
+		}
+
+		if machine.Spec.Operations == nil {
+			machine.Spec.Operations = &v1alpha3.OperationsSpec{}
+		}
+
+		machine.Spec.Operations.RebootCounter = target.RebootCounter
+		machine.Spec.Operations.RepaveCounter = target.RepaveCounter
+
+		return r.Update(ctx, &machine)
+	})
+}
+
+func (r *Reconciler) applyTargetChanges(ctx context.Context, opName string, changes []targetChange) error {
+	for _, change := range changes {
+		if change.err != nil {
+			return change.err
+		}
+	}
+
+	return r.updateOperationStatus(ctx, opName, func(latest *v1alpha3.MachineOperation) {
+		byName := map[string]v1alpha3.MachineOperationTargetStatus{}
+		for _, change := range changes {
+			if change.aggregateOnly || change.target.MachineRef == "" {
+				continue
+			}
+			byName[change.target.MachineRef] = change.target
+		}
+
+		for i, target := range latest.Status.Targets {
+			if updated, ok := byName[target.MachineRef]; ok {
+				latest.Status.Targets[i] = updated
+			}
+		}
+
+		r.aggregateStatus(latest)
+	})
+}
+
+func (r *Reconciler) aggregateStatus(op *v1alpha3.MachineOperation) {
+	if len(op.Status.Targets) == 0 {
+		return
+	}
+
+	var complete, failed, inProgress, pending int
+	for _, target := range op.Status.Targets {
+		switch target.Phase {
+		case v1alpha3.OperationPhaseComplete:
+			complete++
+		case v1alpha3.OperationPhaseFailed:
+			failed++
+		case v1alpha3.OperationPhaseInProgress:
+			inProgress++
+		default:
+			pending++
+		}
+	}
+
+	message := fmt.Sprintf("targets complete=%d failed=%d inProgress=%d pending=%d", complete, failed, inProgress, pending)
+	op.Status.Message = message
+
+	if complete+failed == len(op.Status.Targets) {
+		now := r.now()
+		op.Status.CompletedAt = &now
+		if failed > 0 {
+			op.Status.Phase = v1alpha3.OperationPhaseFailed
+			setCompletedCondition(op, metav1.ConditionFalse, "TargetFailed", message)
+			return
+		}
+
+		op.Status.Phase = v1alpha3.OperationPhaseComplete
+		setCompletedCondition(op, metav1.ConditionTrue, reasonSucceeded, message)
+		return
+	}
+
+	op.Status.Phase = v1alpha3.OperationPhaseInProgress
+	setCompletedCondition(op, metav1.ConditionFalse, "InProgress", message)
+}
+
+func (r *Reconciler) olderActiveOperation(ctx context.Context, op *v1alpha3.MachineOperation) (string, error) {
+	var list v1alpha3.MachineOperationList
+	if err := r.List(ctx, &list); err != nil {
+		return "", fmt.Errorf("list MachineOperations: %w", err)
+	}
+
+	for _, candidate := range list.Items {
+		if candidate.Name == op.Name || candidate.Status.IsTerminal() || !isHostOperation(candidate.Spec.OperationKind) {
+			continue
+		}
+		if !r.operationBelongsToSite(ctx, &candidate) {
+			continue
+		}
+		if operationBefore(&candidate, op) {
+			return candidate.Name, nil
+		}
+	}
+
+	return "", nil
+}
+
+func (r *Reconciler) operationBelongsToSite(ctx context.Context, op *v1alpha3.MachineOperation) bool {
+	if len(op.Status.Targets) > 0 {
+		for _, target := range op.Status.Targets {
+			var machine v1alpha3.Machine
+			if err := r.Get(ctx, client.ObjectKey{Name: target.MachineRef}, &machine); err == nil && r.ownsMachine(&machine) {
+				return true
+			}
+		}
+
+		return false
+	}
+
+	if op.Spec.MachineRef != "" {
+		var machine v1alpha3.Machine
+		if err := r.Get(ctx, client.ObjectKey{Name: op.Spec.MachineRef}, &machine); err != nil {
+			return false
+		}
+
+		return r.ownsMachine(&machine)
+	}
+
+	if op.Spec.MachineSelector != nil && r.Site != "" {
+		return r.validateSelectorScope(op.Spec.MachineSelector) == nil
+	}
+
+	return false
+}
+
+func operationBefore(a, b *v1alpha3.MachineOperation) bool {
+	if !a.CreationTimestamp.Equal(&b.CreationTimestamp) {
+		return a.CreationTimestamp.Before(&b.CreationTimestamp)
+	}
+
+	return a.Name < b.Name
+}
+
+func (r *Reconciler) reconcileTerminal(ctx context.Context, op *v1alpha3.MachineOperation) (ctrl.Result, error) {
+	if op.Spec.TTLSecondsAfterFinished == nil || op.Status.CompletedAt == nil {
+		return ctrl.Result{}, nil
+	}
+
+	deadline := op.Status.CompletedAt.Add(time.Duration(*op.Spec.TTLSecondsAfterFinished) * time.Second)
+	now := r.now().Time
+	if now.Before(deadline) {
+		return ctrl.Result{RequeueAfter: deadline.Sub(now)}, nil
+	}
+
+	if err := r.Delete(ctx, op); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	return ctrl.Result{}, nil
+}
+
+func (r *Reconciler) updateOperationStatus(ctx context.Context, name string, mutate func(*v1alpha3.MachineOperation)) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var latest v1alpha3.MachineOperation
+		if err := r.Get(ctx, client.ObjectKey{Name: name}, &latest); err != nil {
+			return err
+		}
+
+		mutate(&latest)
+
+		return r.Status().Update(ctx, &latest)
+	})
+}
+
+func (r *Reconciler) finishOperation(ctx context.Context, name string, phase v1alpha3.OperationPhase, reason, message string) error {
+	now := r.now()
+	return r.updateOperationStatus(ctx, name, func(latest *v1alpha3.MachineOperation) {
+		if latest.Status.StartedAt == nil {
+			latest.Status.StartedAt = &now
+		}
+		latest.Status.Phase = phase
+		latest.Status.Message = message
+		latest.Status.CompletedAt = &now
+		conditionStatus := metav1.ConditionTrue
+		if phase == v1alpha3.OperationPhaseFailed {
+			conditionStatus = metav1.ConditionFalse
+		}
+		setCompletedCondition(latest, conditionStatus, reason, message)
+	})
+}
+
+func setCompletedCondition(op *v1alpha3.MachineOperation, status metav1.ConditionStatus, reason, message string) {
+	apimeta.SetStatusCondition(&op.Status.Conditions, metav1.Condition{
+		Type:               conditionCompleted,
+		Status:             status,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: op.Generation,
+	})
+}
+
+func (r *Reconciler) ownsMachine(machine *v1alpha3.Machine) bool {
+	if r.Site == "" {
+		_, ok := machine.Labels[siteLabel]
+		return !ok
+	}
+
+	return machine.Labels[siteLabel] == r.Site
+}
+
+func isBareMetalRedfishMachine(machine *v1alpha3.Machine) bool {
+	return machine.Spec.Provider == "" && machine.Spec.ProviderID == "" && machine.Spec.PXE != nil && machine.Spec.PXE.Redfish != nil
+}
+
+func isHostOperation(operation v1alpha3.OperationKind) bool {
+	switch operation {
+	case v1alpha3.OperationHostReboot, v1alpha3.OperationHostPowerOff, v1alpha3.OperationHostPowerOn, v1alpha3.OperationHostReplace:
+		return true
+	default:
+		return false
+	}
+}
+
+type targetChange struct {
+	target        v1alpha3.MachineOperationTargetStatus
+	err           error
+	aggregateOnly bool
+}
+
+func completeTarget(target v1alpha3.MachineOperationTargetStatus, message string, now metav1.Time) targetChange {
+	target.Phase = v1alpha3.OperationPhaseComplete
+	target.Message = message
+	target.CompletedAt = &now
+
+	return targetChange{target: target}
+}
+
+func failTarget(target v1alpha3.MachineOperationTargetStatus, reason, message string, now metav1.Time) targetChange {
+	target.Phase = v1alpha3.OperationPhaseFailed
+	target.Message = fmt.Sprintf("%s: %s", reason, message)
+	target.CompletedAt = &now
+
+	return targetChange{target: target}
+}
+
+func retryTarget(target v1alpha3.MachineOperationTargetStatus, err error, now metav1.Time, maxAttempts int32) targetChange {
+	if target.Attempts >= maxAttempts {
+		return failTarget(target, reasonExecutionFailed, err.Error(), now)
+	}
+
+	target.Attempts++
+	target.LastAttemptAt = &now
+	target.Message = err.Error()
+
+	return targetChange{target: target}
+}
+
+type operationError struct {
+	reason  string
+	message string
+}
+
+func (e operationError) Error() string { return e.message }
+
+func reasonForError(err error) string {
+	var opErr operationError
+	if errors.As(err, &opErr) {
+		return opErr.reason
+	}
+
+	return reasonExecutionFailed
+}
+
+func (r *Reconciler) now() metav1.Time {
+	if r.Now != nil {
+		return r.Now()
+	}
+
+	return metav1.Now()
+}
+
+func (r *Reconciler) maxConcurrentMachines() int {
+	if r.MaxConcurrentMachines <= 0 {
+		return 1
+	}
+
+	return r.MaxConcurrentMachines
+}
+
+func (r *Reconciler) maxAttempts() int32 {
+	if r.MaxAttempts <= 0 {
+		return 3
+	}
+
+	return r.MaxAttempts
+}
+
+func (r *Reconciler) pollInterval() time.Duration {
+	if r.PollInterval <= 0 {
+		return 5 * time.Second
+	}
+
+	return r.PollInterval
+}
+
+func (r *Reconciler) powerActionTimeout() time.Duration {
+	if r.PowerActionTimeout <= 0 {
+		return 5 * time.Minute
+	}
+
+	return r.PowerActionTimeout
+}
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+
+	return b
+}

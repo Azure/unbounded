@@ -390,6 +390,45 @@ def _vm_is_running() -> bool:
     return result.returncode == 0 and "running" in result.stdout.strip()
 
 
+def wait_vm_state(expected: str, timeout: int = 300) -> None:
+    """Wait for the libvirt domain state to contain *expected*."""
+    log(f"  Waiting for VM '{VM_NAME}' state to contain {expected!r}...")
+    last_state = ""
+    for elapsed in range(timeout):
+        check_procs()
+        result = subprocess.run(
+            [*VIRSH, "domstate", VM_NAME],
+            capture_output=True, text=True,
+        )
+        state = result.stdout.strip() if result.returncode == 0 else result.stderr.strip()
+        if expected in state:
+            log(f"  VM '{VM_NAME}' state is {state!r}")
+            return
+        if elapsed > 0 and elapsed % 15 == 0 and state != last_state:
+            last_state = state
+            log(f"    ({elapsed}s) VM state={state or 'unknown'}")
+        time.sleep(1)
+    die(f"Timed out waiting for VM '{VM_NAME}' state to contain {expected!r}")
+
+
+def wait_guest_agent(timeout: int = 300) -> None:
+    """Wait until the guest OS responds through the QEMU guest agent."""
+    log("  Waiting for QEMU guest agent to respond...")
+    for elapsed in range(timeout):
+        check_procs()
+        try:
+            exit_code, _, _ = guest_exec("true", timeout=10)
+            if exit_code == 0:
+                log("  QEMU guest agent is responsive")
+                return
+        except (RuntimeError, TimeoutError, subprocess.TimeoutExpired, OSError):
+            pass
+        if elapsed > 0 and elapsed % 15 == 0:
+            log(f"    ({elapsed}s) guest agent not responsive yet")
+        time.sleep(1)
+    die("Timed out waiting for QEMU guest agent")
+
+
 def machine_status() -> str | None:
     """Return a short summary of Machine conditions, or None."""
     result = subprocess.run(
@@ -553,6 +592,92 @@ def assert_cloud_init_done(timeout: int = 900) -> None:
     die(f"Timed out waiting for CloudInitDone condition on Machine '{NODE_NAME}'")
 
 
+def wait_machine_operation_complete(name: str, timeout: int = 1800) -> None:
+    log(f"  Waiting for MachineOperation '{name}' to complete...")
+    for elapsed in range(timeout):
+        check_procs()
+        result = subprocess.run(
+            [KUBECTL, "get", f"machineoperations.{API_GROUP}", name, "-o", "json"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            op = json.loads(result.stdout)
+            status = op.get("status", {})
+            phase = status.get("phase", "")
+            message = status.get("message", "")
+            targets = status.get("targets", [])
+            if phase == "Complete":
+                if not targets:
+                    die(f"MachineOperation '{name}' completed without status.targets")
+                target = targets[0]
+                if target.get("machineRef") != NODE_NAME or target.get("phase") != "Complete":
+                    die(f"MachineOperation '{name}' has unexpected target status: {target}")
+                log(f"  MachineOperation '{name}' completed")
+                return
+            if phase == "Failed":
+                die(f"MachineOperation '{name}' failed: {message}")
+            if elapsed > 0 and elapsed % 30 == 0:
+                log(f"    ({elapsed}s) MachineOperation phase={phase or 'empty'} message={message or 'empty'} targets={targets}")
+        elif elapsed > 0 and elapsed % 30 == 0:
+            log(f"    ({elapsed}s) MachineOperation '{name}' not found yet")
+        time.sleep(1)
+    die(f"Timed out waiting for MachineOperation '{name}'")
+
+
+def create_machine_operation(
+    name: str,
+    kind: str,
+    *,
+    machine_ref: str | None = NODE_NAME,
+    site_selector: str | None = None,
+    ttl_seconds: int = 3600,
+) -> str:
+    spec: dict[str, Any] = {
+        "operationKind": kind,
+        "ttlSecondsAfterFinished": ttl_seconds,
+    }
+    if site_selector is not None:
+        spec["machineSelector"] = {"matchLabels": {f"{API_GROUP}/site": site_selector}}
+    elif machine_ref is not None:
+        spec["machineRef"] = machine_ref
+
+    operation = {
+        "apiVersion": API_VERSION,
+        "kind": "MachineOperation",
+        "metadata": {"name": name},
+        "spec": spec,
+    }
+    kubectl(["apply", "-f", "-"], input=json.dumps(operation).encode(), stdout=DEVNULL)
+    return name
+
+
+def run_operation_smoke_suite() -> None:
+    log("Running bare-metal MachineOperation smoke suite")
+
+    poweroff = create_machine_operation("smoke-host-poweroff", "HostPowerOff")
+    wait_machine_operation_complete(poweroff, timeout=600)
+    wait_vm_state("shut off", timeout=180)
+
+    poweron = create_machine_operation("smoke-host-poweron", "HostPowerOn")
+    wait_machine_operation_complete(poweron, timeout=600)
+    wait_vm_state("running", timeout=180)
+    wait_guest_agent(timeout=300)
+    wait_k8s_node(NODE_NAME, timeout=300)
+    assert_node_ready(NODE_NAME, timeout=480)
+
+    reboot = create_machine_operation(
+        "smoke-selector-host-reboot",
+        "HostReboot",
+        machine_ref=None,
+        site_selector=SITE,
+    )
+    wait_machine_operation_complete(reboot, timeout=600)
+    wait_vm_state("running", timeout=180)
+    wait_guest_agent(timeout=300)
+    wait_k8s_node(NODE_NAME, timeout=300)
+    assert_node_ready(NODE_NAME, timeout=480)
+
+
 def main() -> None:
     signal.signal(signal.SIGINT, _sigint_handler)
     atexit.register(cleanup)
@@ -700,6 +825,7 @@ def main() -> None:
     # Kubernetes setup runs while Go builds are in progress.
     log("Cleaning up stale Kubernetes resources")
     run_quiet([KUBECTL, "-n", NODE_NS, "delete", "secret", "bmc-pass"])
+    run_quiet([KUBECTL, "delete", f"machineoperations.{API_GROUP}", "--all"])
     run_quiet([KUBECTL, "delete", f"machines.{API_GROUP}", NODE_NAME])
     run_quiet([KUBECTL, "delete", "node", NODE_NAME])
     # Remove stale CRDs so that a version change (e.g. storedVersions
@@ -815,8 +941,8 @@ def main() -> None:
     time.sleep(2)
     check_procs()
 
-    log("Triggering repave")
-    run([str(KUBECTL_UNBOUNDED), "machine", "repave", NODE_NAME])
+    log("Triggering HostReplace MachineOperation")
+    operation_name = create_machine_operation("smoke-host-replace", "HostReplace")
 
     # Log free space so we can correlate disk exhaustion with VM failures.
     df = subprocess.run(["df", "-h", str(TMPDIR)], capture_output=True, text=True)
@@ -825,9 +951,13 @@ def main() -> None:
     log("Waiting for cloud-init to complete...")
     assert_cloud_init_done(timeout=900)
 
+    wait_machine_operation_complete(operation_name, timeout=900)
+
     log("Waiting for kubelet to join the cluster...")
     wait_k8s_node(NODE_NAME, timeout=900)
     assert_node_ready(NODE_NAME, timeout=480)
+
+    run_operation_smoke_suite()
 
     log("")
     log("Smoke test PASSED")
