@@ -61,7 +61,7 @@ impl FreeList {
         }
     }
 
-    #[cfg(test)]
+    #[allow(dead_code)]
     pub fn available(&self) -> usize {
         self.inner.borrow().free.len()
     }
