@@ -71,7 +71,7 @@ func streamTrace(opts textOptions) error {
 	if err != nil {
 		return err
 	}
-	defer m.Close()
+	defer m.Close() //nolint:errcheck
 
 	reader, err := ringbuf.NewReader(m)
 	if err != nil {

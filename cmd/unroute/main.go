@@ -579,14 +579,14 @@ func printEntries(entries []entry, jsonOutput bool, opts textOptions) error {
 		case 0:
 			// Should not happen (an LPM entry without nexthops is
 			// filtered out upstream), but be defensive.
-			fmt.Fprintf(w, "%s (no endpoints)\n", g.CIDR)
+			fmt.Fprintf(w, "%s (no endpoints)\n", g.CIDR) //nolint:errcheck
 		case 1:
 			ep := g.Endpoints[0]
-			fmt.Fprintf(w, "%s %s\n", g.CIDR, renderEndpoint(ep, false, opts))
+			fmt.Fprintf(w, "%s %s\n", g.CIDR, renderEndpoint(ep, false, opts)) //nolint:errcheck
 		default:
-			fmt.Fprintf(w, "%s\n", g.CIDR)
+			fmt.Fprintf(w, "%s\n", g.CIDR) //nolint:errcheck
 			for _, ep := range g.Endpoints {
-				fmt.Fprintf(w, "    %s\n", renderEndpoint(ep, true, opts))
+				fmt.Fprintf(w, "    %s\n", renderEndpoint(ep, true, opts)) //nolint:errcheck
 			}
 		}
 	}
