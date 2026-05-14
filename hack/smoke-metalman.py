@@ -615,7 +615,7 @@ def wait_machine_operation_complete(name: str, timeout: int = 1800) -> None:
                 log(f"  MachineOperation '{name}' completed")
                 return
             if phase == "Failed":
-                die(f"MachineOperation '{name}' failed: {message}")
+                die(f"MachineOperation '{name}' failed: {message}; targets={targets}")
             if elapsed > 0 and elapsed % 30 == 0:
                 log(f"    ({elapsed}s) MachineOperation phase={phase or 'empty'} message={message or 'empty'} targets={targets}")
         elif elapsed > 0 and elapsed % 30 == 0:

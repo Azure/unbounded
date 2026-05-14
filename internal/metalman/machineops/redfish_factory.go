@@ -41,9 +41,6 @@ func (f *RedfishPowerClientFactory) ForMachine(ctx context.Context, machine *v1a
 	}
 
 	password := string(secret.Data[rf.PasswordRef.Key])
-	if password == "" {
-		return nil, fmt.Errorf("Redfish password secret %s/%s key %q is empty", rf.PasswordRef.Namespace, rf.PasswordRef.Name, rf.PasswordRef.Key)
-	}
 
 	c, err := f.Pool.Get(ctx, rf.URL, fingerprint, rf.Username, password, rf.DeviceID)
 	if err != nil {
