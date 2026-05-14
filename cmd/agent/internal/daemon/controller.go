@@ -15,30 +15,17 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	ctrlcache "sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	daemon "github.com/Azure/unbounded/pkg/agent/daemon"
 )
 
-type queueItemKind string
-
-const (
-	queueItemMachineOperation queueItemKind = "machineOperation"
-	queueItemRepave           queueItemKind = "repave"
-)
-
-type daemonRequest struct {
-	Kind queueItemKind
-	Name string
-}
-
-type daemonReconciler struct {
+type repaveReconciler struct {
 	client.Client
 	log          *slog.Logger
 	machineName  string
@@ -54,13 +41,6 @@ func runController(
 	nodeName string,
 	nodeOperator nodeOperator,
 ) error {
-	reconciler := &daemonReconciler{
-		log:          log,
-		machineName:  machineName,
-		nodeName:     nodeName,
-		nodeOperator: nodeOperator,
-	}
-
 	mgr, err := ctrl.NewManager(restCfg, manager.Options{
 		Scheme: newScheme(),
 		Metrics: metricsserver.Options{
@@ -86,9 +66,41 @@ func runController(
 		return fmt.Errorf("create daemon manager: %w", err)
 	}
 
-	reconciler.Client = mgr.GetClient()
+	c := mgr.GetClient()
+	machineOperations := &machineOperationTarget{
+		Client:       c,
+		log:          log,
+		machineName:  machineName,
+		nodeOperator: nodeOperator,
+	}
 
-	if err := reconciler.SetupWithManager(mgr); err != nil {
+	machineOperationReconciler, err := daemon.NewMachinaMachineOperationReconciler(
+		c,
+		machineName,
+		nodeName,
+		daemon.MachineOperationHandlers{
+			v1alpha3.OperationNodeReboot:   machineOperations.reconcileNodeReboot,
+			v1alpha3.OperationAgentUpgrade: machineOperations.reconcileAgentUpgrade,
+			v1alpha3.OperationAgentReset:   machineOperations.reconcileAgentReset,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("create MachineOperation reconciler: %w", err)
+	}
+	repaveReconciler := &repaveReconciler{
+		Client:       c,
+		log:          log,
+		machineName:  machineName,
+		nodeName:     nodeName,
+		nodeOperator: nodeOperator,
+	}
+
+	if err := daemon.SetupController(
+		"unbounded-agent-daemon",
+		mgr,
+		machineOperationReconciler,
+		repaveReconciler,
+	); err != nil {
 		return fmt.Errorf("setup daemon controller: %w", err)
 	}
 
@@ -98,50 +110,25 @@ func runController(
 	return err
 }
 
-func (r *daemonReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return builder.TypedControllerManagedBy[daemonRequest](mgr).
-		Named("unbounded-agent-daemon").
-		// MachineOperation events drive explicit daemon operations. The mapper
-		// filters to local-machine NodeReboot/AgentUpgrade operations and emits
-		// typed daemon requests rather than Kubernetes object keys.
-		Watches(
-			&v1alpha3.MachineOperation{},
-			handler.TypedEnqueueRequestsFromMapFunc(r.mapMachineOperation),
-		).
-		// Node delete events drive repave. The cache is already scoped to the
-		// local Node name, and the predicate ignores create/update/generic events
-		// so only deletion is converted into a repave request.
-		Watches(
-			&corev1.Node{},
-			handler.TypedEnqueueRequestsFromMapFunc(r.mapNode),
-			builder.WithPredicates(predicate.Funcs{
-				CreateFunc:  func(event.CreateEvent) bool { return false },
-				UpdateFunc:  func(event.UpdateEvent) bool { return false },
-				DeleteFunc:  func(e event.DeleteEvent) bool { return e.Object.GetName() == r.nodeName },
-				GenericFunc: func(event.GenericEvent) bool { return false },
-			}),
-		).
-		WithOptions(controller.TypedOptions[daemonRequest]{MaxConcurrentReconciles: 1}).
-		Complete(r)
-}
+func (r *repaveReconciler) SetupController(b *builder.TypedBuilder[daemon.Request]) *builder.TypedBuilder[daemon.Request] {
+	mapNode := func(_ context.Context, obj client.Object) []daemon.Request {
+		if obj.GetName() != r.nodeName {
+			return nil
+		}
 
-func (r *daemonReconciler) Reconcile(ctx context.Context, req daemonRequest) (reconcile.Result, error) {
-	switch req.Kind {
-	case queueItemMachineOperation:
-		return r.reconcileMachineOperation(ctx, req.Name)
-	case queueItemRepave:
-		return r.reconcileRepave(ctx)
-	default:
-		return reconcile.Result{}, nil
-	}
-}
-
-func (r *daemonReconciler) mapNode(_ context.Context, obj client.Object) []daemonRequest {
-	if obj.GetName() != r.nodeName {
-		return nil
+		return []daemon.Request{daemon.NewRepaveRequest("node-delete")}
 	}
 
-	return []daemonRequest{{Kind: queueItemRepave, Name: obj.GetName()}}
+	return b.Watches(
+		&corev1.Node{},
+		handler.TypedEnqueueRequestsFromMapFunc(mapNode),
+		builder.WithPredicates(predicate.Funcs{
+			CreateFunc:  func(event.CreateEvent) bool { return false },
+			UpdateFunc:  func(event.UpdateEvent) bool { return false },
+			DeleteFunc:  func(e event.DeleteEvent) bool { return e.Object.GetName() == r.nodeName },
+			GenericFunc: func(event.GenericEvent) bool { return false },
+		}),
+	)
 }
 
-var _ reconcile.TypedReconciler[daemonRequest] = (*daemonReconciler)(nil)
+var _ daemon.RepaveReconciler = (*repaveReconciler)(nil)

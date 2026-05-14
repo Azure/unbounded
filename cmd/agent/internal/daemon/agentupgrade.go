@@ -106,8 +106,9 @@ func (o fileAgentUpgradeSignalOperator) RecordFailure(message string) error {
 	}
 
 	return o.write(agentUpgradeSignal{
-		OperationName:  pending.OperationName,
-		FailureMessage: message,
+		OperationName:             pending.OperationName,
+		ObservedMachineGeneration: pending.ObservedMachineGeneration,
+		FailureMessage:            message,
 	})
 }
 

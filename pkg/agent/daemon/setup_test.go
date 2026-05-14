@@ -18,15 +18,15 @@ func TestControllerRuntimeReconcilerDispatchesOperationRequest(t *testing.T) {
 	reconciler := &recordingReconciler{operationResult: ctrl.Result{Requeue: true}}
 	r := &controllerRuntimeReconciler{machineOperations: reconciler, repaves: &recordingReconciler{}}
 
-	result, err := r.Reconcile(context.Background(), NewMachineOperationRequest(MachineOperationRequest{Name: "op-1"}))
+	result, err := r.Reconcile(context.Background(), NewMachineOperationRequest("op-1"))
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
 	if !result.Requeue {
 		t.Fatalf("result = %v, want requeue", result)
 	}
-	if reconciler.operationReq.Name != "op-1" {
-		t.Fatalf("operation request = %#v", reconciler.operationReq)
+	if reconciler.operationName != "op-1" {
+		t.Fatalf("operation request = %q", reconciler.operationName)
 	}
 }
 
@@ -36,15 +36,18 @@ func TestControllerRuntimeReconcilerDispatchesRepaveRequest(t *testing.T) {
 	reconciler := &recordingReconciler{repaveResult: ctrl.Result{Requeue: true}}
 	r := &controllerRuntimeReconciler{machineOperations: &recordingReconciler{}, repaves: reconciler}
 
-	result, err := r.Reconcile(context.Background(), NewRepaveRequest(RepaveRequest{MachineName: "machine-1", NodeName: "node-1"}))
+	result, err := r.Reconcile(context.Background(), NewRepaveRequest("node-delete"))
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
 	if !result.Requeue {
 		t.Fatalf("result = %v, want requeue", result)
 	}
-	if reconciler.repaveReq.MachineName != "machine-1" || reconciler.repaveReq.NodeName != "node-1" {
-		t.Fatalf("repave request = %#v", reconciler.repaveReq)
+	if !reconciler.repaveCalled {
+		t.Fatal("repave request was not dispatched")
+	}
+	if reconciler.repaveSource != "node-delete" {
+		t.Fatalf("repave source = %q, want node-delete", reconciler.repaveSource)
 	}
 }
 
@@ -68,50 +71,48 @@ func TestControllerRuntimeReconcilerReturnsError(t *testing.T) {
 	wantErr := errors.New("reconcile failed")
 	r := &controllerRuntimeReconciler{machineOperations: &recordingReconciler{operationErr: wantErr}, repaves: &recordingReconciler{}}
 
-	_, err := r.Reconcile(context.Background(), NewMachineOperationRequest(MachineOperationRequest{Name: "op-1"}))
+	_, err := r.Reconcile(context.Background(), NewMachineOperationRequest("op-1"))
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("error = %v, want %v", err, wantErr)
 	}
 }
 
-func TestSetupWithManagerValidatesInputs(t *testing.T) {
+func TestSetupControllerValidatesInputs(t *testing.T) {
 	t.Parallel()
 
-	if err := SetupWithManager("", nil, &recordingReconciler{}, &recordingReconciler{}, nonNilSetupController); err == nil {
-		t.Fatal("SetupWithManager empty name error = nil")
+	if err := SetupController("", nil, &recordingReconciler{}, &recordingReconciler{}); err == nil {
+		t.Fatal("SetupController empty name error = nil")
 	}
-	if err := SetupWithManager("controller", nil, nil, &recordingReconciler{}, nonNilSetupController); err == nil {
-		t.Fatal("SetupWithManager nil machine operation reconciler error = nil")
+	if err := SetupController("controller", nil, nil, &recordingReconciler{}); err == nil {
+		t.Fatal("SetupController nil machine operation reconciler error = nil")
 	}
-	if err := SetupWithManager("controller", nil, &recordingReconciler{}, nil, nonNilSetupController); err == nil {
-		t.Fatal("SetupWithManager nil repave reconciler error = nil")
-	}
-	if err := SetupWithManager("controller", nil, &recordingReconciler{}, &recordingReconciler{}); err == nil {
-		t.Fatal("SetupWithManager empty callbacks error = nil")
-	}
-	if err := SetupWithManager("controller", nil, &recordingReconciler{}, &recordingReconciler{}, nil); err == nil {
-		t.Fatal("SetupWithManager nil callback error = nil")
+	if err := SetupController("controller", nil, &recordingReconciler{}, nil); err == nil {
+		t.Fatal("SetupController nil repave reconciler error = nil")
 	}
 }
 
-func nonNilSetupController(b *builder.TypedBuilder[Request]) *builder.TypedBuilder[Request] { return b }
-
 type recordingReconciler struct {
-	operationReq    MachineOperationRequest
+	operationName   string
 	operationResult ctrl.Result
 	operationErr    error
 
-	repaveReq    RepaveRequest
+	repaveCalled bool
+	repaveSource string
 	repaveResult ctrl.Result
 	repaveErr    error
 }
 
-func (r *recordingReconciler) ReconcileMachineOperation(_ context.Context, req MachineOperationRequest) (ctrl.Result, error) {
-	r.operationReq = req
+func (r *recordingReconciler) SetupController(b *builder.TypedBuilder[Request]) *builder.TypedBuilder[Request] {
+	return b
+}
+
+func (r *recordingReconciler) ReconcileMachineOperation(_ context.Context, name string) (ctrl.Result, error) {
+	r.operationName = name
 	return r.operationResult, r.operationErr
 }
 
-func (r *recordingReconciler) ReconcileRepave(_ context.Context, req RepaveRequest) (ctrl.Result, error) {
-	r.repaveReq = req
+func (r *recordingReconciler) ReconcileRepave(_ context.Context, source string) (ctrl.Result, error) {
+	r.repaveCalled = true
+	r.repaveSource = source
 	return r.repaveResult, r.repaveErr
 }

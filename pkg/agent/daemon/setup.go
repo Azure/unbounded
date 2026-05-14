@@ -14,28 +14,19 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
-// SetupWithManager registers a serialized controller with mgr. The reconciler
+// SetupController registers a serialized controller with mgr. The reconciler
 // owns request handling, including any goal resolution and host-local operation
 // execution. All queued requests are serialized because host-local daemon
 // operations mutate the same nspawn, systemd, filesystem, and daemon-binary
 // state.
-func SetupWithManager(
+func SetupController(
 	name string,
 	mgr ctrl.Manager,
-	machineOperations MachineOperationReconciler,
+	machineOperations MachineOperationRequestReconciler,
 	repaves RepaveReconciler,
-	setupControllers ...SetupController,
 ) error {
 	if name == "" {
 		return fmt.Errorf("controller name is required")
-	}
-	if len(setupControllers) == 0 {
-		return fmt.Errorf("at least one controller setup callback is required")
-	}
-	for i, setupController := range setupControllers {
-		if setupController == nil {
-			return fmt.Errorf("controller setup callback %d is required", i)
-		}
 	}
 	if machineOperations == nil {
 		return fmt.Errorf("machine operation reconciler is required")
@@ -46,15 +37,19 @@ func SetupWithManager(
 
 	runtimeReconciler := &controllerRuntimeReconciler{machineOperations: machineOperations, repaves: repaves}
 	b := builder.TypedControllerManagedBy[Request](mgr).Named(name)
-	for _, setupController := range setupControllers {
-		b = setupController(b)
-	}
+	b = machineOperations.SetupController(b)
+	b = repaves.SetupController(b)
 
-	return b.WithOptions(controller.TypedOptions[Request]{MaxConcurrentReconciles: 1}).Complete(runtimeReconciler)
+	return b.WithOptions(controller.TypedOptions[Request]{
+		// Host-local operations share mutable node state, including systemd units,
+		// nspawn machines, local files, and daemon binaries. Serialize requests so
+		// repave, reset, restart, and upgrade flows cannot interleave.
+		MaxConcurrentReconciles: 1,
+	}).Complete(runtimeReconciler)
 }
 
 type controllerRuntimeReconciler struct {
-	machineOperations MachineOperationReconciler
+	machineOperations MachineOperationRequestReconciler
 	repaves           RepaveReconciler
 }
 
@@ -63,10 +58,10 @@ func (r *controllerRuntimeReconciler) Reconcile(
 	req Request,
 ) (reconcile.Result, error) {
 	if operationReq, ok := req.machineOperationRequest(); ok {
-		return r.machineOperations.ReconcileMachineOperation(ctx, operationReq)
+		return r.machineOperations.ReconcileMachineOperation(ctx, operationReq.Name)
 	}
 	if repaveReq, ok := req.repaveRequest(); ok {
-		return r.repaves.ReconcileRepave(ctx, repaveReq)
+		return r.repaves.ReconcileRepave(ctx, repaveReq.Source)
 	}
 
 	log.FromContext(ctx).Error(nil, "ignoring invalid daemon request")

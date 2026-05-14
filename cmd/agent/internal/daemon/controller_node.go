@@ -21,7 +21,7 @@ import (
 	"github.com/Azure/unbounded/internal/provision"
 )
 
-func (r *daemonReconciler) reconcileRepave(ctx context.Context) (reconcile.Result, error) {
+func (r *repaveReconciler) ReconcileRepave(ctx context.Context, _ string) (reconcile.Result, error) {
 	active, err := r.nodeOperator.FindActiveMachine(r.log)
 	if err != nil {
 		return reconcile.Result{}, fmt.Errorf("find active machine: %w", err)
@@ -86,6 +86,15 @@ func resolveDesiredRepaveConfig(
 	}
 
 	return &desired, appliedRef, nil
+}
+
+func getLocalMachine(ctx context.Context, c client.Client, machineName string) (*v1alpha3.Machine, error) {
+	var machine v1alpha3.Machine
+	if err := c.Get(ctx, client.ObjectKey{Name: machineName}, &machine); err != nil {
+		return nil, fmt.Errorf("get Machine %s: %w", machineName, err)
+	}
+
+	return &machine, nil
 }
 
 func markAppliedConfiguration(
