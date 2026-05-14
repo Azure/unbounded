@@ -177,7 +177,7 @@ func (h *EdgeHandler) handleGet(w http.ResponseWriter, r *http.Request, bucket, 
 		return
 	}
 
-	chunkSize := chunk.SizeFor(info.Size, h.cfg.Chunking.Size, h.cfg.Chunking.AsChunkTiers())
+	chunkSize := chunk.SizeFor(info.Size, h.cfg.Chunking.Size.Int64(), h.cfg.Chunking.AsChunkTiers())
 	firstChunk, lastChunk := chunk.IndexRange(rangeStart, rangeEnd, chunkSize, info.Size)
 
 	h.log.LogAttrs(r.Context(), slog.LevelDebug, "edge_get_plan",

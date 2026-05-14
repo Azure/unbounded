@@ -66,7 +66,20 @@ data:
       max_entries: 10000
 
     chunking:
-      size: 8388608
+      # Base chunk size for objects smaller than the smallest tier
+      # threshold. Accepts a raw byte count or a human-readable
+      # string with SI suffixes (KB / MB / GB / TB / PB; decimal)
+      # or IEC suffixes (KiB / MiB / GiB / TiB / PiB; binary).
+      size: 8 MiB
+      # Tier ladder: the tier with the largest min_object_size
+      # <= info.Size wins. Strictly ascending by min_object_size.
+      # The bottom (`size` above) covers small objects; tiers
+      # kick in for larger ones.
+      tiers:
+        - min_object_size: 1 GiB
+          chunk_size: 64 MiB
+        - min_object_size: 10 GiB
+          chunk_size: 128 MiB
 
     logging:
       # One of debug, info, warn, error. Overridden at runtime by the

@@ -207,3 +207,15 @@ LocalStack + Azurite. Much faster, no Kind setup:
 ```bash
 make orca-inttest    # ~15-20s, requires Docker
 ```
+
+## Reference: every config knob
+
+For an annotated, top-to-bottom reference of every field Orca's
+config YAML accepts (defaults, valid ranges, environment-variable
+fallbacks, production vs dev nuances), see
+[`config.example.yaml`](./config.example.yaml). The file is
+maintained by hand alongside the schema in
+`internal/orca/config/config.go` and is exercised by a config-package
+test that re-loads it on every CI run, so it cannot silently drift
+out of sync with the parser. Copy it as a starting point for a
+custom Orca config (`orca -config /path/to/yours.yaml`).

@@ -207,7 +207,12 @@ type Metadata struct {
 // Operators with tighter memory budgets should lower the highest
 // tier's ChunkSize or drop the largest-object tier entirely.
 type Chunking struct {
-	Size      int64       `yaml:"size"` // bytes per chunk; default 8 MiB
+	// Size is the base chunk size used for objects smaller than the
+	// smallest tier threshold. Accepts a numeric byte count
+	// (`size: 8388608`) or a human-readable string
+	// (`size: 8 MiB`, `size: 1 GB`); see ByteSize for the accepted
+	// units and SI-vs-IEC semantics.
+	Size      ByteSize    `yaml:"size"` // default 8 MiB
 	Tiers     []ChunkTier `yaml:"tiers"`
 	Readahead *int        `yaml:"readahead"`
 }
@@ -216,10 +221,12 @@ type Chunking struct {
 // size is at or above MinObjectSize use ChunkSize, unless a
 // higher-threshold tier also matches (in which case the higher tier
 // wins). Both fields must be > 0; ChunkSize must be >= 1 MiB (the
-// floor that applies to Chunking.Size as well).
+// floor that applies to Chunking.Size as well). Both fields accept
+// the same numeric-or-human-readable forms as Chunking.Size; see
+// ByteSize.
 type ChunkTier struct {
-	MinObjectSize int64 `yaml:"min_object_size"`
-	ChunkSize     int64 `yaml:"chunk_size"`
+	MinObjectSize ByteSize `yaml:"min_object_size"`
+	ChunkSize     ByteSize `yaml:"chunk_size"`
 }
 
 // AsChunkTiers returns the configured tier ladder as a []chunk.Tier
@@ -232,7 +239,7 @@ func (c Chunking) AsChunkTiers() []chunk.Tier {
 
 	out := make([]chunk.Tier, len(c.Tiers))
 	for i, t := range c.Tiers {
-		out[i] = chunk.Tier{MinObjectSize: t.MinObjectSize, ChunkSize: t.ChunkSize}
+		out[i] = chunk.Tier{MinObjectSize: t.MinObjectSize.Int64(), ChunkSize: t.ChunkSize.Int64()}
 	}
 
 	return out
@@ -463,7 +470,7 @@ func (c *Config) validate() error {
 	}
 
 	if c.Chunking.Size < 1024*1024 {
-		return fmt.Errorf("chunking.size %d too small; minimum 1 MiB", c.Chunking.Size)
+		return fmt.Errorf("chunking.size %s too small; minimum 1 MiB", c.Chunking.Size)
 	}
 
 	if err := validateChunkingTiers(c.Chunking.Tiers); err != nil {
@@ -491,19 +498,19 @@ func (c *Config) validate() error {
 func validateChunkingTiers(tiers []ChunkTier) error {
 	for i, t := range tiers {
 		if t.MinObjectSize <= 0 {
-			return fmt.Errorf("chunking.tiers[%d].min_object_size %d invalid; must be > 0",
+			return fmt.Errorf("chunking.tiers[%d].min_object_size %s invalid; must be > 0",
 				i, t.MinObjectSize)
 		}
 
 		if t.ChunkSize < 1024*1024 {
-			return fmt.Errorf("chunking.tiers[%d].chunk_size %d too small; minimum 1 MiB",
+			return fmt.Errorf("chunking.tiers[%d].chunk_size %s too small; minimum 1 MiB",
 				i, t.ChunkSize)
 		}
 
 		if i > 0 && t.MinObjectSize <= tiers[i-1].MinObjectSize {
 			return fmt.Errorf(
 				"chunking.tiers must be strictly ascending by min_object_size; "+
-					"tiers[%d].min_object_size=%d is not greater than tiers[%d].min_object_size=%d",
+					"tiers[%d].min_object_size=%s is not greater than tiers[%d].min_object_size=%s",
 				i, t.MinObjectSize, i-1, tiers[i-1].MinObjectSize)
 		}
 	}

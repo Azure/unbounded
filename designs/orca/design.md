@@ -305,6 +305,17 @@ sorted by their object-size threshold, with no duplicates. The
 loader rejects anything else. So for any object size there is
 exactly one matching tier (or the base, if no tier matches).
 
+**Writing the sizes.** `chunking.size`, `chunking.tiers[*].min_object_size`,
+and `chunking.tiers[*].chunk_size` accept either a raw byte count
+(`size: 8388608`) or a human-readable string (`size: 8 MiB`,
+`min_object_size: 1 GiB`, `chunk_size: 128 MiB`). SI suffixes
+(`KB`/`MB`/`GB`/`TB`/`PB`) are decimal multipliers; IEC suffixes
+(`KiB`/`MiB`/`GiB`/`TiB`/`PiB`) are binary multipliers. Operators
+who mean exactly `2^20` bytes should write `"1 MiB"`; `"1 MB"` is
+`1 000 000`. Fractional values (`"1.5 GiB"`) are allowed and
+truncated to int64 byte counts. Negative values and overflow above
+int64 max are rejected at load time.
+
 **Cross-replica safety.** The peer-to-peer fill RPC sends the
 chunk size along with every request (see
 [s7.3](#73-cluster-wide-deduplication-via-per-chunk-fill-rpc)).

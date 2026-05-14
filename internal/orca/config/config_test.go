@@ -7,9 +7,12 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 // TestApplyDefaults_EnvFallback verifies that applyDefaults populates
@@ -144,7 +147,7 @@ func TestApplyDefaults_FieldDefaults(t *testing.T) {
 		{"metadata.ttl", c.Metadata.TTL, 5 * time.Minute},
 		{"metadata.negative_ttl", c.Metadata.NegativeTTL, 60 * time.Second},
 		{"metadata.max_entries", c.Metadata.MaxEntries, 10_000},
-		{"chunking.size", c.Chunking.Size, int64(8 * 1024 * 1024)},
+		{"chunking.size", c.Chunking.Size, ByteSize(8 * 1024 * 1024)},
 		{"origin.awss3.region", c.Origin.AWSS3.Region, "us-east-1"},
 		{"logging.level", c.Logging.Level, "info"},
 	}
@@ -591,6 +594,258 @@ logging:
 	}
 }
 
+// TestByteSize_UnmarshalYAML covers the accepted scalar forms for
+// ByteSize: numeric byte counts, IEC-suffixed strings, SI-suffixed
+// strings, fractional strings, and quoted numeric strings. The
+// table includes the legacy bare-integer form to lock in
+// backward compatibility with configs predating this type.
+func TestByteSize_UnmarshalYAML_Accepts(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		yaml string
+		want ByteSize
+	}{
+		{"bare integer (legacy)", "v: 8388608", 8 * 1024 * 1024},
+		{"quoted integer string", `v: "8388608"`, 8 * 1024 * 1024},
+		{"IEC MiB with space", `v: "8 MiB"`, 8 * 1024 * 1024},
+		{"IEC MiB no space", `v: "8MiB"`, 8 * 1024 * 1024},
+		// SI suffix is power-of-ten per humanize/IEC convention; this
+		// asserts the answer-(1) decision (accept upstream library's
+		// SI-vs-IEC semantics) and would fail a regression that
+		// silently retreats to power-of-two SI.
+		{"SI MB is decimal", `v: "1 MB"`, 1_000_000},
+		{"SI MB no space", `v: "1MB"`, 1_000_000},
+		{"IEC KiB is binary", `v: "1 KiB"`, 1024},
+		{"IEC GiB", `v: "1 GiB"`, 1024 * 1024 * 1024},
+		{"SI GB", `v: "1 GB"`, 1_000_000_000},
+		{"IEC TiB", `v: "1 TiB"`, 1024 * 1024 * 1024 * 1024},
+		// Fractional values are allowed (answer-(4)). The underlying
+		// humanize.ParseBytes truncates the resulting byte count to
+		// int64 semantics.
+		{"fractional GiB", `v: "1.5 GiB"`, 1610612736},
+		{"fractional MB", `v: "2.5 MB"`, 2_500_000},
+		{"plain bytes via B suffix", `v: "100 B"`, 100},
+		{"zero is allowed", "v: 0", 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var doc struct {
+				V ByteSize `yaml:"v"`
+			}
+
+			if err := yaml.Unmarshal([]byte(tt.yaml), &doc); err != nil {
+				t.Fatalf("yaml.Unmarshal(%q): %v", tt.yaml, err)
+			}
+
+			if doc.V != tt.want {
+				t.Errorf("got %d (%s), want %d (%s)",
+					int64(doc.V), doc.V, int64(tt.want), tt.want)
+			}
+		})
+	}
+}
+
+// TestByteSize_UnmarshalYAML_Rejects covers malformed scalars,
+// negative values, and overflow above int64 max. Every rejection
+// surfaces via the unmarshal error path (i.e. config.Load fails,
+// validate is never reached) so operators see the offending YAML
+// line via the error message.
+func TestByteSize_UnmarshalYAML_Rejects(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		yaml    string
+		wantSub string
+	}{
+		{"junk string", `v: "huge"`, "parse bytesize"},
+		{"negative integer", `v: -1`, "must be >= 0"},
+		{"negative string", `v: "-1 MiB"`, "must be >= 0"},
+		// Two empty-scalar shapes: a quoted empty value and a key
+		// with no value (which YAML resolves to the null tag, not
+		// a scalar string). The first reaches the empty-string
+		// guard; the second is rejected because the scalar value
+		// is empty after trim.
+		{"empty quoted scalar", `v: ""`, "bytesize is empty"},
+		// 9 EiB > int64 max (~8 EiB). humanize.ParseBytes accepts
+		// uint64 values larger than int64 max so the overflow guard
+		// fires.
+		{"overflow above int64 max", `v: "9 EiB"`, "overflows int64"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var doc struct {
+				V ByteSize `yaml:"v"`
+			}
+
+			err := yaml.Unmarshal([]byte(tt.yaml), &doc)
+			if err == nil {
+				t.Fatalf("yaml.Unmarshal(%q) succeeded; want error containing %q",
+					tt.yaml, tt.wantSub)
+			}
+
+			if !strings.Contains(err.Error(), tt.wantSub) {
+				t.Errorf("error %q does not contain %q", err.Error(), tt.wantSub)
+			}
+		})
+	}
+}
+
+// TestByteSize_NonScalarRejected covers the rare case of a YAML
+// sequence or mapping where a scalar is expected. yaml.v3 will
+// route the node into our UnmarshalYAML hook regardless of kind,
+// so the hook must produce a clear error rather than panic.
+func TestByteSize_NonScalarRejected(t *testing.T) {
+	t.Parallel()
+
+	var doc struct {
+		V ByteSize `yaml:"v"`
+	}
+
+	err := yaml.Unmarshal([]byte("v: [1, 2, 3]"), &doc)
+	if err == nil {
+		t.Fatal("expected error for sequence value, got nil")
+	}
+
+	if !strings.Contains(err.Error(), "must be a scalar") {
+		t.Errorf("error %q does not mention scalar requirement", err.Error())
+	}
+}
+
+// TestByteSize_String covers the IEC rendering used in validation
+// error messages. Renders rely on humanize.IBytes so the values are
+// in the same units operators see when writing the YAML, regardless
+// of whether the input was a raw byte count or a human string.
+func TestByteSize_String(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		in   ByteSize
+		want string
+	}{
+		{0, "0 B"},
+		{1, "1 B"},
+		{1024, "1.0 KiB"},
+		{1024 * 1024, "1.0 MiB"},
+		{8 * 1024 * 1024, "8.0 MiB"},
+		{1 << 30, "1.0 GiB"},
+		// Negative byte counts are not produced by valid YAML, but
+		// the String formatter must not panic if a test or future
+		// code path manufactures one.
+		{-1, "-1 B"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.want, func(t *testing.T) {
+			if got := tt.in.String(); got != tt.want {
+				t.Errorf("ByteSize(%d).String() = %q, want %q", int64(tt.in), got, tt.want)
+			}
+		})
+	}
+}
+
+// TestLoad_ChunkingHumanUnits drives a full YAML load with human
+// units for every byte-typed field under chunking, including a tier
+// ladder written entirely in IEC strings. The integration check
+// matters because Load wires UnmarshalYAML + applyDefaults +
+// validate together; a regression in any of those would surface
+// here even if the focused unit tests still passed.
+func TestLoad_ChunkingHumanUnits(t *testing.T) {
+	t.Parallel()
+
+	yamlBody := strings.ReplaceAll(validAwss3YAML, "size: 8388608", `size: "16 MiB"`)
+	yamlBody += `  tiers:
+    - min_object_size: 1 GiB
+      chunk_size: 64 MiB
+    - min_object_size: 10 GiB
+      chunk_size: 128 MiB
+`
+	path := writeTempYAML(t, yamlBody)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if cfg.Chunking.Size != 16*1024*1024 {
+		t.Errorf("Chunking.Size = %s (%d), want 16 MiB",
+			cfg.Chunking.Size, int64(cfg.Chunking.Size))
+	}
+
+	wantTiers := []ChunkTier{
+		{MinObjectSize: 1024 * 1024 * 1024, ChunkSize: 64 * 1024 * 1024},
+		{MinObjectSize: 10 * 1024 * 1024 * 1024, ChunkSize: 128 * 1024 * 1024},
+	}
+	if len(cfg.Chunking.Tiers) != len(wantTiers) {
+		t.Fatalf("len(Tiers) = %d, want %d", len(cfg.Chunking.Tiers), len(wantTiers))
+	}
+
+	for i, wt := range wantTiers {
+		if cfg.Chunking.Tiers[i] != wt {
+			t.Errorf("Tiers[%d] = %+v, want %+v",
+				i, cfg.Chunking.Tiers[i], wt)
+		}
+	}
+}
+
+// TestLoad_ChunkingHumanUnits_BelowMinimum confirms the existing
+// 1 MiB floor still bites when the operator writes the offending
+// value in human units. The error message must surface the value
+// in IEC units (via ByteSize.String) so the operator does not have
+// to convert bytes by hand.
+func TestLoad_ChunkingHumanUnits_BelowMinimum(t *testing.T) {
+	t.Parallel()
+
+	yamlBody := strings.ReplaceAll(validAwss3YAML, "size: 8388608", `size: "512 KiB"`)
+	path := writeTempYAML(t, yamlBody)
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatalf("Load accepted size below 1 MiB minimum")
+	}
+
+	if !strings.Contains(err.Error(), "chunking.size") {
+		t.Errorf("error %q does not mention chunking.size", err.Error())
+	}
+
+	if !strings.Contains(err.Error(), "512 KiB") {
+		t.Errorf("error %q does not render the offending value in IEC units",
+			err.Error())
+	}
+}
+
+// TestLoad_ChunkingHumanUnits_TierRejectionWithIECRender verifies
+// the per-tier minimum-size error renders the offending tier's
+// chunk_size in IEC units. Same motivation as the chunking.size
+// counterpart above.
+func TestLoad_ChunkingHumanUnits_TierRejectionWithIECRender(t *testing.T) {
+	t.Parallel()
+
+	yamlBody := validAwss3YAML + `  tiers:
+    - min_object_size: 1 GiB
+      chunk_size: "512 KiB"
+`
+	path := writeTempYAML(t, yamlBody)
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatalf("Load accepted tier chunk_size below 1 MiB minimum")
+	}
+
+	if !strings.Contains(err.Error(), "512 KiB") {
+		t.Errorf("error %q does not render the offending value in IEC units",
+			err.Error())
+	}
+}
+
 func writeTempYAML(t *testing.T, content string) string {
 	t.Helper()
 
@@ -602,6 +857,59 @@ func writeTempYAML(t *testing.T, content string) string {
 	}
 
 	return path
+}
+
+// TestExampleConfigLoads guards the operator-facing reference YAML
+// at hack/orca/config.example.yaml. The file is hand-maintained and
+// must remain loadable end-to-end (yaml.Unmarshal + applyDefaults +
+// validate) so an operator can `cp` it as a starting point. A
+// schema change that breaks the example surfaces here rather than
+// at the next operator's first `orca -config`. The test resolves
+// the file path relative to the package using runtime.Caller so it
+// works from any working directory `go test` is invoked from.
+func TestExampleConfigLoads(t *testing.T) {
+	// No t.Parallel: t.Setenv("POD_IP", ...) is used to simulate the
+	// downward-API value the standard Deployment supplies.
+	t.Setenv("POD_IP", "10.0.0.1")
+
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed; cannot resolve example config path")
+	}
+	// Walk up from internal/orca/config/config_test.go (3 levels) to
+	// the repo root, then down into hack/orca/config.example.yaml.
+	repoRoot := filepath.Clean(filepath.Join(filepath.Dir(thisFile), "..", "..", ".."))
+	examplePath := filepath.Join(repoRoot, "hack", "orca", "config.example.yaml")
+
+	cfg, err := Load(examplePath)
+	if err != nil {
+		t.Fatalf("Load(%s): %v", examplePath, err)
+	}
+	// Sanity-check a few load-bearing values so a regression that
+	// silently drops a section (e.g. tiers becomes the in-code default
+	// because the YAML key was renamed) surfaces here.
+	if cfg.Origin.ID == "" {
+		t.Errorf("origin.id is empty; example must declare a non-empty origin.id")
+	}
+
+	if cfg.Cachestore.Driver != "s3" {
+		t.Errorf("cachestore.driver = %q; want s3", cfg.Cachestore.Driver)
+	}
+
+	if cfg.Cluster.Service == "" {
+		t.Errorf("cluster.service is empty; example must declare a non-empty service")
+	}
+
+	if cfg.Chunking.Size <= 0 {
+		t.Errorf("chunking.size = %s; want > 0", cfg.Chunking.Size)
+	}
+	// The default tier ladder ships 2 entries; the example file
+	// spells them out, so this asserts the ladder did parse rather
+	// than fall through to applyDefaults.
+	if len(cfg.Chunking.Tiers) < 2 {
+		t.Errorf("chunking.tiers len = %d; expected the example to declare >= 2 tiers",
+			len(cfg.Chunking.Tiers))
+	}
 }
 
 const validAwss3YAML = `

@@ -67,6 +67,11 @@ cp hack/orca/.env.example hack/orca/.env
 `.env` is git-ignored. The default `ORIGIN_DRIVER=awss3` runs entirely
 on the in-cluster LocalStack.
 
+The `.env` file drives the dev-harness manifest renderer. For an
+annotated reference of every field Orca's runtime config YAML
+accepts (defaults, valid ranges, env-var fallbacks, prod-vs-dev
+nuances), see [`config.example.yaml`](./config.example.yaml).
+
 ## Bring it up
 
 ```bash

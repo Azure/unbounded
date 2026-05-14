@@ -314,7 +314,7 @@ func buildConfig(opts ClusterOptions, cacheBucket string) *config.Config {
 			NegativeTTL: 5 * time.Second,
 			MaxEntries:  1024,
 		},
-		Chunking: config.Chunking{Size: opts.ChunkSize},
+		Chunking: config.Chunking{Size: config.ByteSize(opts.ChunkSize)},
 	}
 
 	switch opts.OriginDriver {

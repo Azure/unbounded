@@ -814,7 +814,7 @@ func readaheadConfig(chunkSize int64, readahead int) *config.Config {
 	return &config.Config{
 		Origin: config.Origin{ID: "origin"},
 		Chunking: config.Chunking{
-			Size:      chunkSize,
+			Size:      config.ByteSize(chunkSize),
 			Readahead: &r,
 		},
 	}
@@ -963,9 +963,9 @@ func TestHandleGet_DynamicChunkSize_LargeObject(t *testing.T) {
 	cfg := &config.Config{
 		Origin: config.Origin{ID: "origin"},
 		Chunking: config.Chunking{
-			Size: baseSz,
+			Size: config.ByteSize(baseSz),
 			Tiers: []config.ChunkTier{
-				{MinObjectSize: 10 * (1 << 30), ChunkSize: tierSz},
+				{MinObjectSize: 10 * (1 << 30), ChunkSize: config.ByteSize(tierSz)},
 			},
 		},
 	}
