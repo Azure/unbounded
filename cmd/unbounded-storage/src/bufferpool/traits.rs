@@ -11,28 +11,27 @@ pub trait Req {
 }
 
 pub trait Transport<R: Req> {
-    /// Called once at pool init with the full pinned backing. The
-    /// impl records whatever it needs (e.g. an RDMA MR) so it can
-    /// translate `page_idx` into a wire-side handle later.
-    fn register_pages(
-        &self,
-        base: *mut u8,
-        page_size: usize,
-        page_count: usize,
-    ) -> Result<(), Error>;
-
     /// Fetch the byte range described by `src` from a peer derived
     /// from `req` into the page identified by `dst.page_idx`.
     /// Resolves when the data has landed in `dst`.
+    ///
+    /// The transport is constructed already aware of the pool's
+    /// pinned backing and page geometry: the embedder registers the
+    /// backing with whatever wire-side resource is needed (e.g. an
+    /// RDMA MR via `Class::register_backing`) before handing the
+    /// transport to `Pool::new`. The `Pool` calls only this method
+    /// at runtime.
     async fn bulk_get(&self, req: &R, src: BulkRef, dst: PageRef) -> Result<(), Error>;
     // TODO(jordan): Are both src and dst actually needed here?
 }
 
 pub trait BlockStore {
-    /// Symmetric with [`Transport::register_pages`]. Impls that don't
-    /// need pre-registration (plain `pwrite` on a regular file) can
-    /// no-op; impls that do (io_uring fixed buffers, NVMe DMA
-    /// mapping) record their per-page handles here.
+    /// Symmetric with the transport's NUMA registration handshake
+    /// (which the embedder performs out-of-band before constructing
+    /// the transport): impls that don't need pre-registration
+    /// (plain `pwrite` on a regular file) can no-op; impls that do
+    /// (io_uring fixed buffers, NVMe DMA mapping) record their
+    /// per-page handles here.
     fn register_pages(
         &self,
         base: *mut u8,

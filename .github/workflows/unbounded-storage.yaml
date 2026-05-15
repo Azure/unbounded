@@ -7,11 +7,15 @@ on:
   pull_request:
     paths:
       - cmd/unbounded-storage/**
+      - hack/scripts/install-mercury.sh
+      - Makefile
       - .github/workflows/unbounded-storage.yaml
   push:
     branches: [main]
     paths:
       - cmd/unbounded-storage/**
+      - hack/scripts/install-mercury.sh
+      - Makefile
       - .github/workflows/unbounded-storage.yaml
   workflow_dispatch:
 
@@ -22,21 +26,37 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # Keep in sync with the default in the Makefile / install-mercury.sh.
+  MERCURY_VERSION: v2.3.1
+
 jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: cmd/unbounded-storage
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Mercury build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config libfabric-dev
 
       - name: Set up Rust toolchain
         run: |
           rustup show active-toolchain || rustup toolchain install stable --profile minimal
           rustup default stable
+
+      - name: Cache Mercury prefix
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: tmp/mercury-prefix
+          key: mercury-${{ runner.os }}-${{ env.MERCURY_VERSION }}-${{ hashFiles('hack/scripts/install-mercury.sh') }}
+
+      - name: Build Mercury (if not cached)
+        run: make mercury
 
       - name: Cache cargo registry and target
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
@@ -45,8 +65,13 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             cmd/unbounded-storage/target
-          key: cargo-unbounded-storage-${{ runner.os }}-${{ hashFiles('cmd/unbounded-storage/Cargo.lock', 'cmd/unbounded-storage/Cargo.toml') }}
+          # Key on lockfile + manifest plus the native build inputs (build.rs
+          # and the Mercury C shim), since changes to either invalidate
+          # compiled artifacts under target/. Also bind to MERCURY_VERSION so
+          # a Mercury bump rebuilds the FFI layer cleanly.
+          key: cargo-unbounded-storage-${{ runner.os }}-mercury-${{ env.MERCURY_VERSION }}-${{ hashFiles('cmd/unbounded-storage/Cargo.lock', 'cmd/unbounded-storage/Cargo.toml', 'cmd/unbounded-storage/build.rs', 'cmd/unbounded-storage/src/mercury/shim.c') }}
           restore-keys: |
+            cargo-unbounded-storage-${{ runner.os }}-mercury-${{ env.MERCURY_VERSION }}-
             cargo-unbounded-storage-${{ runner.os }}-
 
       - name: Test
@@ -59,4 +84,4 @@ jobs:
           # than the local default. Bump via workflow_dispatch or set
           # `PROPTEST_CASES` locally for soak runs.
           PROPTEST_CASES: "4096"
-        run: cargo test --locked --all-targets
+        run: make unbounded-storage-test
