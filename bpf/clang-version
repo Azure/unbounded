@@ -1,0 +1,19 @@
+# Clang binary used to compile bpf/unbounded_encap.c via bpf2go.
+#
+# Pinned so the committed internal/net/ebpf/unboundedencap_bpfel.o is
+# byte-reproducible across local development and CI. Different clang
+# versions emit different debug info and instruction selection, which
+# changes the .o bytes and would otherwise trigger spurious drift in
+# the verify-bpf-binary CI job.
+#
+# The value below is the binary name to invoke (typically the package
+# name on Debian/Ubuntu). To bump:
+#   1. Install the new clang-N locally.
+#   2. Update this file and references in:
+#        internal/net/ebpf/gen.go        (bpf2go -cc flag)
+#        hack/scripts/net-ebpf-generate.sh  (CLANG default)
+#        Makefile                        (net-ebpf-build target)
+#        .github/workflows/ci.yaml       (apt-get install clang-N)
+#   3. Run `make generate` and commit the new
+#      internal/net/ebpf/unboundedencap_bpfel.{go,o}.
+clang-18

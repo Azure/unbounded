@@ -208,7 +208,7 @@ help: ## Show this help
 	@echo "  net-frontend-clean               Remove node_modules and dist artifacts"
 	@echo ""
 	@echo "Net eBPF:"
-	@echo "  net-ebpf-build                   Compile bpf/unbounded_encap.c (requires clang)"
+	@echo "  net-ebpf-build                   Compile bpf/unbounded_encap.c (requires clang-18; see bpf/clang-version)"
 	@echo "  net-ebpf-generate                Regenerate bpf/vmlinux.h from pinned Ubuntu kernel (requires bpftool, curl, dpkg-deb, python3)"
 	@echo "  net-ebpf-verify                  Verify bpf/vmlinux.h matches bpf/btf-kernel-pin{,-hashes} (no extra tools)"
 	@echo ""
@@ -753,9 +753,9 @@ net-frontend-clean: ## Remove frontend node_modules and dist artifacts
 
 ##@ Net eBPF
 
-net-ebpf-build: ## Compile bpf/unbounded_encap.c to internal/net/ebpf/unbounded_encap_bpfel.o (requires clang)
+net-ebpf-build: ## Compile bpf/unbounded_encap.c to internal/net/ebpf/unbounded_encap_bpfel.o (requires clang-18; see bpf/clang-version)
 	@echo "Compiling eBPF programs..."
-	@clang -O2 -g -target bpf \
+	@clang-18 -O2 -g -target bpf \
 		-I/usr/include \
 		-c bpf/unbounded_encap.c \
 		-o internal/net/ebpf/unbounded_encap_bpfel.o

@@ -14,7 +14,12 @@ package ebpf
 // bpf/btf-kernel-pin); contributors do not edit it by hand.
 //
 // Prerequisites for regenerating bindings (the .o + _bpfel.go pair):
-//   - clang in $PATH (Debian/Ubuntu: apt-get install clang)
+//   - The specific clang binary pinned in bpf/clang-version
+//     (currently clang-18; Debian/Ubuntu: apt-get install clang-18).
+//     The version is pinned so the committed .o is byte-reproducible
+//     between local development and the verify-bpf-binary CI gate;
+//     different clang versions emit different debug info / instruction
+//     selection.
 //
 // Prerequisites for regenerating bpf/vmlinux.h (only when bumping the pin
 // or adding new BPF types):
@@ -28,4 +33,4 @@ package ebpf
 // The generated files (*_bpfel.go and *_bpfel.o) are committed alongside
 // the source so a normal `go build` does not require clang.
 //
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target bpfel -cc clang -cflags "-O2 -g -Wall -I../../../bpf" unboundedEncap ../../../bpf/unbounded_encap.c
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target bpfel -cc clang-18 -cflags "-O2 -g -Wall -I../../../bpf" unboundedEncap ../../../bpf/unbounded_encap.c
