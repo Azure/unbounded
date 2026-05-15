@@ -27,6 +27,16 @@ const unbounded0DeviceName = "unbounded0"
 // eBPF dataplane. All VXLAN peers share this single interface.
 const vxlanInterfaceName = "vxlan0"
 
+// geneveInterfaceName is the default shared flow-based GENEVE interface
+// used by the eBPF dataplane. The runtime name is configurable via
+// --geneve-interface; this const is used in places that key off the
+// default (status filtering, peer-interface mapping).
+const geneveInterfaceName = "geneve0"
+
+// ipipInterfaceName is the shared flow-based IPIP interface used by the
+// eBPF dataplane. All IPIP peers share this single interface.
+const ipipInterfaceName = "ipip0"
+
 // buildSupernetRoutes returns the unbounded0 routes that attract overlay
 // traffic into the eBPF dataplane. One route per CIDR is emitted regardless
 // of how many peers contribute to that CIDR; the BPF program performs the
@@ -222,7 +232,7 @@ func configureTunnelPeers(
 	// addWireGuardPeersToBPFMap are silently dropped.
 	nlCache := state.netlinkCache
 	ifName := cfg.GeneveInterfaceName
-	ipipIfName := "ipip0"
+	ipipIfName := ipipInterfaceName
 
 	// Determine which tunnel interfaces are actually needed by scanning
 	// all peers before creating any interfaces. This avoids unnecessary
@@ -783,9 +793,9 @@ func peerIfaceName(gwPeer gatewayPeerInfo) string {
 	case "VXLAN":
 		return vxlanInterfaceName
 	case "IPIP":
-		return "ipip0"
+		return ipipInterfaceName
 	default:
-		return "geneve0"
+		return geneveInterfaceName
 	}
 }
 
@@ -866,9 +876,9 @@ func cleanupUnusedTunnelDevices(meshPeers []meshPeerInfo, gatewayPeers, wgGatewa
 	}
 
 	devices := []devInfo{
-		{"geneve0", usesGeneve},
+		{geneveInterfaceName, usesGeneve},
 		{vxlanInterfaceName, usesVXLAN},
-		{"ipip0", usesIPIP},
+		{ipipInterfaceName, usesIPIP},
 	}
 	for _, d := range devices {
 		if d.used {
@@ -941,9 +951,9 @@ func reapplyRPFilterOnActiveTunnels(meshPeers []meshPeerInfo, gatewayPeers, wgGa
 		used bool
 	}
 	for _, d := range []devInfo{
-		{"geneve0", usesGeneve},
+		{geneveInterfaceName, usesGeneve},
 		{vxlanInterfaceName, usesVXLAN},
-		{"ipip0", usesIPIP},
+		{ipipInterfaceName, usesIPIP},
 	} {
 		if d.used {
 			disableRPFilter(d.name)

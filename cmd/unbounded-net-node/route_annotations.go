@@ -387,7 +387,7 @@ func markSupernetRoutesExpected(routes []RouteEntry) {
 
 	for _, r := range routes {
 		for _, hop := range r.NextHops {
-			if hop.Device == "unbounded0" {
+			if hop.Device == unbounded0DeviceName {
 				hasUnbounded0 = true
 				break
 			}
@@ -409,7 +409,7 @@ func markSupernetRoutesExpected(routes []RouteEntry) {
 			// routes are in the kernel (collected by collectRoutingTable)
 			// but the per-peer annotation logic doesn't set Present/Expected
 			// because unbounded0 isn't a traditional tunnel interface.
-			if hop.Device == "unbounded0" {
+			if hop.Device == unbounded0DeviceName {
 				if hop.Expected == nil {
 					hop.Expected = boolPtr(true)
 				}
@@ -420,7 +420,7 @@ func markSupernetRoutesExpected(routes []RouteEntry) {
 			}
 			// Remove phantom nexthops on tunnel/WG interfaces that are not
 			// present in the FIB -- eBPF handles routing via the BPF map.
-			if (hop.Device == "geneve0" || hop.Device == "vxlan0" || hop.Device == "ipip0" ||
+			if (hop.Device == geneveInterfaceName || hop.Device == vxlanInterfaceName || hop.Device == ipipInterfaceName ||
 				strings.HasPrefix(hop.Device, "wg")) &&
 				(hop.Present == nil || !*hop.Present) {
 				continue // drop this nexthop
