@@ -2434,7 +2434,7 @@ func (s *nodeStatusServer) getNodeStatus() *NodeStatusResponse {
 			continue
 		}
 
-		ifName := ebpfTunnelInterfaceName(p.TunnelProtocol)
+		ifName := tunnelInterfaceName(p.TunnelProtocol)
 
 		if ifName == "" {
 			if name, _, err := unboundednetnetlink.DetectDefaultRouteInterfaceFromCache(s.state.netlinkCache); err == nil {
@@ -2489,7 +2489,7 @@ func (s *nodeStatusServer) getNodeStatus() *NodeStatusResponse {
 			continue
 		}
 
-		ifName := ebpfTunnelInterfaceName(gp.TunnelProtocol)
+		ifName := tunnelInterfaceName(gp.TunnelProtocol)
 
 		if ifName == "" {
 			if name, _, err := unboundednetnetlink.DetectDefaultRouteInterfaceFromCache(s.state.netlinkCache); err == nil {
@@ -2887,10 +2887,11 @@ func isManagedTunnelInterface(name string) bool {
 		name == "unbounded0" || name == "geneve0"
 }
 
-// ebpfTunnelInterfaceName returns the shared tunnel interface name for a
-// given protocol when using the eBPF dataplane. Unlike the netlink dataplane
-// which creates per-peer interfaces, eBPF uses a single shared interface.
-func ebpfTunnelInterfaceName(protocol string) string {
+// tunnelInterfaceName returns the shared tunnel interface name for a
+// given protocol. All peers using the same protocol share one flow-based
+// interface (geneve0/vxlan0/ipip0); the BPF program on unbounded0 selects
+// the correct underlay endpoint per packet via the LPM trie.
+func tunnelInterfaceName(protocol string) string {
 	switch unboundednetv1alpha1.TunnelProtocol(protocol) {
 	case unboundednetv1alpha1.TunnelProtocolGENEVE:
 		return "geneve0"

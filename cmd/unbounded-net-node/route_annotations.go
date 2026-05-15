@@ -359,11 +359,12 @@ func annotateNodeRoutes(
 	ipv4Routes = annotateRoutePeerDestinationsForFamily(ipv4Routes, status.Peers, actx, localSiteName)
 	ipv6Routes = annotateRoutePeerDestinationsForFamily(ipv6Routes, status.Peers, actx, localSiteName)
 
-	// Mark eBPF supernet routes on unbounded0 as expected. These are managed
+	// Mark supernet routes on unbounded0 as expected. These are managed
 	// routes that don't correspond to individual peers but exist in the FIB
-	// because the eBPF dataplane programs them as aggregate routes.
-	markEBPFSupernetRoutesExpected(ipv4Routes)
-	markEBPFSupernetRoutesExpected(ipv6Routes)
+	// because the BPF program on unbounded0 attracts overlay traffic via
+	// aggregate routes.
+	markSupernetRoutesExpected(ipv4Routes)
+	markSupernetRoutesExpected(ipv6Routes)
 
 	// Remove empty routes (all nexthops filtered).
 	ipv4Routes = filterEmptyRoutes(ipv4Routes)
@@ -372,15 +373,16 @@ func annotateNodeRoutes(
 	status.RoutingTable.Routes = append(ipv4Routes, ipv6Routes...)
 }
 
-// markEBPFSupernetRoutesExpected adjusts route annotations for the eBPF
-// dataplane. In eBPF mode:
+// markSupernetRoutesExpected adjusts route annotations to reflect the
+// BPF-on-unbounded0 forwarding model:
 //   - FIB-present routes on unbounded0 with no Expected annotation are marked
 //     as expected (these are supernet routes the per-peer logic doesn't know).
 //   - Nexthops on tunnel and WG interfaces that are not present in the FIB
-//     are removed entirely, since the eBPF dataplane uses unbounded0 + BPF
-//     maps instead of per-interface kernel routes.
-func markEBPFSupernetRoutesExpected(routes []RouteEntry) {
-	// Check if unbounded0 appears in any route (indicates eBPF mode).
+//     are removed entirely, since forwarding happens via unbounded0 + the BPF
+//     LPM trie instead of per-interface kernel routes.
+func markSupernetRoutesExpected(routes []RouteEntry) {
+	// Check if unbounded0 appears in any route (indicates the node has been
+	// fully provisioned -- unbounded0 is created by ensureTunnelMap).
 	hasUnbounded0 := false
 
 	for _, r := range routes {
