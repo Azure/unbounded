@@ -274,7 +274,13 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
     let mock_cfg = MockSimConfig::new();
     mock_cfg.max_io_delay.set(w.max_io_delay);
     mock_cfg.io_fault_rate.set(w.io_fault_rate);
-    let transport = DstTransport::new(stripes.clone(), counts.clone(), mock_cfg.clone());
+    let transport = DstTransport::new(
+        stripes.clone(),
+        counts.clone(),
+        mock_cfg.clone(),
+        backing.base,
+        backing.page_size,
+    );
     let blockstore = DstBlockStore::new(counts.clone(), stripes.clone(), mock_cfg.clone());
     blockstore.set_hit_rate(w.cache_hit_rate);
 
@@ -383,8 +389,11 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
     // recycles the slot and a new caller leads again.
     let max_pages_per_client = (stripe_len / w.page_size as u64) + 1;
     let fault_slack = 1 + w.io_fault_rate as u64 / 5;
-    let step_budget =
-        64 + (normalized.len() as u64) * max_pages_per_client * (w.max_io_delay as u64 + 4) * 16
+    let step_budget = 64
+        + (normalized.len() as u64)
+            * max_pages_per_client
+            * (w.max_io_delay as u64 + 4)
+            * 16
             * fault_slack;
 
     exec.run(step_budget)?;

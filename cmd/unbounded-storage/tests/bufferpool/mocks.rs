@@ -98,34 +98,34 @@ pub struct DstTransport {
     stripes: Stripes,
     counts: Rc<CallCounts>,
     cfg: Rc<MockSimConfig>,
-    base: Cell<Option<*mut u8>>,
-    page_size: Cell<usize>,
+    /// Bound at construction. The `Transport` trait no longer
+    /// carries a `register_pages` hook: the embedder pre-registers
+    /// the backing out-of-band, so the mock learns the geometry the
+    /// same way a real transport does (constructor argument from
+    /// whoever owns the `Backing`).
+    base: *mut u8,
+    page_size: usize,
 }
 
 impl DstTransport {
-    pub fn new(stripes: Stripes, counts: Rc<CallCounts>, cfg: Rc<MockSimConfig>) -> Self {
+    pub fn new(
+        stripes: Stripes,
+        counts: Rc<CallCounts>,
+        cfg: Rc<MockSimConfig>,
+        base: *mut u8,
+        page_size: usize,
+    ) -> Self {
         Self {
             stripes,
             counts,
             cfg,
-            base: Cell::new(None),
-            page_size: Cell::new(0),
+            base,
+            page_size,
         }
     }
 }
 
 impl Transport<TestReq> for DstTransport {
-    fn register_pages(
-        &self,
-        base: *mut u8,
-        page_size: usize,
-        _page_count: usize,
-    ) -> Result<(), Error> {
-        self.base.set(Some(base));
-        self.page_size.set(page_size);
-        Ok(())
-    }
-
     async fn bulk_get(&self, _req: &TestReq, src: BulkRef, dst: PageRef) -> Result<(), Error> {
         // Pull delay and (optional) fault decision up front; this
         // keeps the PRNG draws deterministic across re-orderings of
@@ -133,7 +133,7 @@ impl Transport<TestReq> for DstTransport {
         let delay = draw_delay(&self.cfg);
         let fault = draw_fault(&self.cfg);
 
-        let page_size = self.page_size.get();
+        let page_size = self.page_size;
         let page_no = src.offset / page_size as u64;
         // Track concurrent in-flight for the single-flight invariant.
         {
@@ -165,12 +165,13 @@ impl Transport<TestReq> for DstTransport {
         let end = start + src.len as usize;
         assert!(end <= bytes.len(), "DstTransport: src out of range");
 
-        let base = self.base.get().expect("register_pages must run first");
         // SAFETY: dst is a pool-owned page within the registered
         // backing; src is a Vec<u8> owned by `stripes`. Both ranges
         // are valid for the duration of this call.
         unsafe {
-            let dst_ptr = base.add(dst.page_idx as usize * page_size + dst.offset as usize);
+            let dst_ptr = self
+                .base
+                .add(dst.page_idx as usize * page_size + dst.offset as usize);
             std::ptr::copy_nonoverlapping(bytes.as_ptr().add(start), dst_ptr, src.len as usize);
         }
 
