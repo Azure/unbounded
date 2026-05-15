@@ -9,7 +9,6 @@ import (
 	"net"
 	"sort"
 
-	"github.com/vishvananda/netlink"
 	"k8s.io/klog/v2"
 
 	unboundednetnetlink "github.com/Azure/unbounded/internal/net/netlink"
@@ -27,8 +26,6 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 
 	port := cfg.WireGuardPort
 	iface := fmt.Sprintf("wg%d", port)
-	localPodCIDRs := routeplan.BuildNormalizedCIDRSet(nodePodCIDRs)
-	localGatewayHostCIDRs := routeplan.BuildLocalGatewayHostCIDRSetFromPodCIDRs(nodePodCIDRs)
 
 	// Detect the tunnel MTU once for all interfaces in this reconciliation.
 	// MTU = default-route interface MTU minus WireGuard encapsulation overhead.
@@ -80,6 +77,14 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 	// routes. The informer sync guard in reconcileUpdate ensures we only
 	// reach here after all caches are populated, so an empty peer list is
 	// genuine (not a transient startup state).
+	//
+	// We still need to clean up any leftover gateway wg<port> interfaces:
+	//   - Tracked in state (e.g. SiteGatewayPoolAssignment was just deleted
+	//     and the node had no other WG peers because intra-site uses GENEVE).
+	//   - Present in the kernel but not in state (e.g. agent restarted after
+	//     an SGPA was deleted, leaving orphan interfaces from the prior run).
+	// removeUnmanagedWireGuardInterfaces handles both cases by listing wg*
+	// links and deleting any that aren't in desiredGatewayIfaces.
 	if len(peers) == 0 && len(gatewayPeers) == 0 {
 		if state.linkManager.Exists() {
 			klog.Infof("No WireGuard peers -- removing mesh interface %s", iface)
@@ -88,6 +93,8 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 				klog.V(2).Infof("Failed to remove unused WireGuard interface %s: %v", iface, err)
 			}
 		}
+		// Tear down any tracked or kernel-resident gateway wg* interfaces.
+		removeUnmanagedWireGuardInterfaces(cfg, state, nil, iface)
 		// Sync routes (clear WG routes, keep any GENEVE/IPIP additional routes)
 		if state.routeManager != nil {
 			if state.netlinkCache != nil {
@@ -255,28 +262,19 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 	}
 
 	// Accept forwarded traffic arriving on the mesh WG interface.
-	ensureTunnelForwardAccept(iface)
+	if state.forwardManager != nil {
+		state.forwardManager.EnsureInterface(iface)
+	}
 
-	// Build routes for mesh interface via shared route builder.
-	// All routing is per-peer for healthcheck granularity: bootstrap host routes,
-	// pod CIDR routes, and internal IP routes for non-peered sites.
+	if state.isGatewayNode && state.notrackManager != nil {
+		state.notrackManager.EnsureInterface(iface)
+	}
+
+	// Routes are managed centrally: per-CIDR unbounded0 routes are built by
+	// buildSupernetRoutes in the parent reconcile and arrive here via
+	// additionalRoutes. No per-peer kernel routes are emitted; the BPF
+	// program performs all per-destination redirection.
 	var allDesiredRoutes []unboundednetnetlink.DesiredRoute
-
-	// Resolve the link index for the mesh interface
-	meshLink, meshLinkErr := netlink.LinkByName(iface)
-
-	meshLinkIndex := 0
-	if meshLinkErr == nil && meshLink != nil {
-		meshLinkIndex = meshLink.Attrs().Index
-	} else {
-		klog.Warningf("Failed to resolve link index for %s: %v", iface, meshLinkErr)
-	}
-
-	for _, peer := range peers {
-		peerMTU := resolveMeshPeerTunnelMTU(tunnelMTU, peer, mySiteName, siteTunnelMTUs, peeringSiteTunnelMTUs, assignmentSiteTunnelMTUs)
-		peerRoutes := buildMeshPeerRoutes(peer, meshLinkIndex, iface, mySiteName, peeredSites, cfg, peerMTU, localPodCIDRs, localGatewayHostCIDRs)
-		allDesiredRoutes = append(allDesiredRoutes, peerRoutes...)
-	}
 
 	// === Configure separate gateway interfaces for gateway peers ===
 
@@ -456,8 +454,14 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 			continue
 		}
 
-		// Set fwmark on gateway WG interface for transit traffic forwarding.
-		ensureTunnelForwardAccept(gwIfaceName)
+		// Accept forwarded traffic arriving on the gateway WG interface.
+		if state.forwardManager != nil {
+			state.forwardManager.EnsureInterface(gwIfaceName)
+		}
+
+		if state.isGatewayNode && state.notrackManager != nil {
+			state.notrackManager.EnsureInterface(gwIfaceName)
+		}
 
 		// Configure policy routing for this gateway interface
 		// This ensures return traffic leaves via the same interface it arrived on
@@ -466,24 +470,6 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 				klog.Warningf("Failed to configure policy routing for %s: %v", gwIfaceName, err)
 				// Continue - policy routing is not critical
 			}
-		}
-
-		// Build gateway peer routes via shared route builder.
-		gwLink, gwLinkErr := netlink.LinkByName(gwIfaceName)
-
-		gwLinkIdx := 0
-		if gwLinkErr == nil && gwLink != nil {
-			gwLinkIdx = gwLink.Attrs().Index
-		}
-
-		gwPeerMTU := resolveGatewayPeerTunnelMTU(tunnelMTU, mySiteName, gwPeer, siteTunnelMTUs, assignmentPoolTunnelMTUs, poolTunnelMTUs)
-		// In eBPF mode, skip creating kernel routes for WG gateway peers --
-		// the BPF program on unbounded0 handles routing to the correct WG
-		// interface via the LPM trie. Creating WG-interface routes would
-		// conflict with the unbounded0 supernet routes.
-		if cfg.TunnelDataplane != "ebpf" {
-			gwPeerRoutes := buildGatewayPeerRoutes(gwPeer, gwLinkIdx, gwIfaceName, mySiteName, cfg, gwPeerMTU, localPodCIDRs, localGatewayHostCIDRs)
-			allDesiredRoutes = append(allDesiredRoutes, gwPeerRoutes...)
 		}
 
 		prevName, hadPrevName := state.gatewayNames[gwIfaceName]
@@ -560,7 +546,13 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 			klog.Warningf("Failed to delete gateway interface %s: %v", ifaceName, err)
 		}
 
-		removeTunnelForwardAccept(ifaceName)
+		if state.forwardManager != nil {
+			state.forwardManager.RemoveInterface(ifaceName)
+		}
+
+		if state.notrackManager != nil {
+			state.notrackManager.RemoveInterface(ifaceName)
+		}
 	}
 
 	if cfg.EnablePolicyRouting && state.gatewayPolicyManager != nil {

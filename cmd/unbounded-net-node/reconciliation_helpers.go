@@ -639,6 +639,14 @@ func removeUnmanagedWireGuardInterfaces(cfg *config, state *wireGuardState, desi
 
 		klog.Infof("Removed unmanaged WireGuard interface %s", name)
 
+		if state.forwardManager != nil {
+			state.forwardManager.RemoveInterface(name)
+		}
+
+		if state.notrackManager != nil {
+			state.notrackManager.RemoveInterface(name)
+		}
+
 		delete(state.gatewayLinkManagers, name)
 		delete(state.gatewayWireguardManagers, name)
 		delete(state.gatewayHealthEndpoints, name)
