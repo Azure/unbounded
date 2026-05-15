@@ -86,7 +86,7 @@ type (
 	// RawTraceEvent is one record emitted to the unb_trace ringbuf per
 	// packet processed by unbounded_encap when a consumer is reading.
 	// cmd/unroute --trace decodes the stream into human-readable form.
-	RawTraceEvent = unboundedEncapTraceEvent
+	RawTraceEvent = unboundedEncapUnbTraceEvent
 )
 
 // filterHandle, filterPriority match the values used historically for the

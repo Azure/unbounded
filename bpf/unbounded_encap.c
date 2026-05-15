@@ -24,15 +24,26 @@
 // multi-nexthop entries (where it lets us drain a known-bad gateway
 // without dropping traffic destined to a singleton peer).
 
-#include <linux/bpf.h>
-#include <linux/pkt_cls.h>
-#include <linux/if_ether.h>
-#include <linux/ip.h>
-#include <linux/ipv6.h>
-#include <linux/udp.h>
-#include <linux/in.h>
+#include "vmlinux.h"
+
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
+#include <bpf/bpf_core_read.h>
+
+// vmlinux.h dumped from BTF carries struct definitions but neither numeric
+// uAPI constants nor every typedef libbpf's bpf_helper_defs.h depends on.
+// Re-declare the handful we use here as plain literals (the values are
+// stable kernel ABI).
+#define ETH_P_IP             0x0800
+#define ETH_P_IPV6           0x86DD
+#define IPPROTO_TCP          6
+#define IPPROTO_UDP          17
+#define IPPROTO_SCTP         132
+#define TC_ACT_OK            0
+#define BPF_F_TUNINFO_IPV6   (1ULL << 0)
+#define BPF_F_NO_PREALLOC    (1U << 0)
+#define BPF_MAP_TYPE_LPM_TRIE 11
+#define BPF_MAP_TYPE_RINGBUF  27
 
 // Maximum number of nexthops per CIDR prefix.
 #define MAX_NEXTHOPS 4
@@ -64,33 +75,11 @@ struct tunnel_endpoint {
 	__u32 count;
 };
 
-// unb_tunnel_key mirrors the first 28 bytes of the kernel's
-// struct bpf_tunnel_key. Those 28 bytes are a documented compat point in
-// bpf_skb_set_tunnel_key (the kernel explicitly accepts size==28 as
-// "tunnel-key without local addr or label fields") so we can use this
-// shape across every kernel from 4.18 onward without depending on the
-// build-time size of struct bpf_tunnel_key. Buffer size and the size
-// argument to bpf_skb_set_tunnel_key match (both 28 bytes), so the helper
-// reads exactly the memory we own.
-struct unb_tunnel_key {
-	__u32 tunnel_id;
-	union {
-		__u32 remote_ipv4;
-		__u8  remote_ipv6[16];
-	};
-	__u8  tunnel_tos;
-	__u8  tunnel_ttl;
-	__u16 tunnel_ext;
-	__u32 tunnel_label;
-};
-_Static_assert(sizeof(struct unb_tunnel_key) == 28,
-	       "unb_tunnel_key must match bpf_tunnel_key compat layout (28 bytes)");
-
 // trace_event is one record per packet processed by unbounded_encap. The
 // userspace consumer (cmd/unroute --trace) reads these from the unb_trace
 // ringbuf via cilium/ebpf's ringbuf.Reader. Field layout is part of the
 // user-space ABI: keep it stable, append new fields at the end.
-struct trace_event {
+struct unb_trace_event {
 	__u64 ts_ns;
 	__u32 cpu;
 	__u32 skb_len;
@@ -115,10 +104,10 @@ struct trace_event {
 	__s32 verdict;
 };
 
-// Force bpf2go to emit a Go binding for struct trace_event by referencing
+// Force bpf2go to emit a Go binding for struct unb_trace_event by referencing
 // it from a BTF-visible global. Marked volatile + __unused so the compiler
 // keeps the type description but elides any code that depends on it.
-volatile const struct trace_event _unb_trace_event_layout __attribute__((unused));
+volatile const struct unb_trace_event _unb_trace_event_layout __attribute__((unused));
 
 // --- Map ---
 //
@@ -269,7 +258,7 @@ static __always_inline void build_v4_mapped_addr(__u8 *out16, __u32 v4_be)
 // non-port protocols (e.g. ICMP) the bytes still get copied but only
 // ip_proto carries meaning; the caller is expected to check ip_proto
 // before rendering port numbers.
-static __always_inline void trace_l4(struct trace_event *ev, __u8 proto,
+static __always_inline void trace_l4(struct unb_trace_event *ev, __u8 proto,
 				     const void *l4, void *data_end)
 {
 	ev->ip_proto = proto;
@@ -294,17 +283,17 @@ static __always_inline void trace_l4(struct trace_event *ev, __u8 proto,
 }
 
 
+// set_tunnel_key_from_endpoint populates a struct bpf_tunnel_key from a
 // remote_endpoint, choosing IPv4 vs IPv6 framing based on the v4-mapped
 // check, and calls bpf_skb_set_tunnel_key. Returns the helper's return
 // value so callers can record it in trace events.
 //
-// We pass sizeof(struct unb_tunnel_key) == 28, which is a documented
-// compat point in bpf_skb_set_tunnel_key accepted by every kernel from
-// 4.18 onward. Passing sizeof(struct bpf_tunnel_key) (the larger,
-// build-time size from the bpf headers) makes the call fail with
-// -EINVAL on older kernels (e.g. 5.15 on AKS) whose internal struct is
-// smaller. By matching our buffer size to the size argument we avoid
-// telling the kernel a length that does not equal the memory we own.
+// The size argument is bpf_core_type_size(struct bpf_tunnel_key): the
+// cilium/ebpf loader rewrites this to the *running* kernel's actual
+// sizeof(struct bpf_tunnel_key) at load time. The helper then takes its
+// fast path (no compat-size memset), regardless of kernel version. This
+// is the CO-RE pattern: compile once against the BTF in bpf/vmlinux.h,
+// run anywhere with a different struct layout.
 //
 // remote_endpoint stores the underlay IP in network byte order (bytes
 // [12..15] for the v4-mapped form). The kernel side runs
@@ -314,7 +303,7 @@ static __always_inline void trace_l4(struct trace_event *ev, __u8 proto,
 static __always_inline long set_tunnel_key_from_endpoint(struct __sk_buff *skb,
 							 const struct tunnel_nexthop *nh)
 {
-	struct unb_tunnel_key tkey = {};
+	struct bpf_tunnel_key tkey = {};
 	tkey.tunnel_ttl = 64;
 	tkey.tunnel_id = nh->vni;
 
@@ -322,22 +311,24 @@ static __always_inline long set_tunnel_key_from_endpoint(struct __sk_buff *skb,
 		__u32 v4_net;
 		__builtin_memcpy(&v4_net, &nh->remote_endpoint[12], sizeof(v4_net));
 		tkey.remote_ipv4 = bpf_ntohl(v4_net);
-		return bpf_skb_set_tunnel_key(skb, (struct bpf_tunnel_key *)&tkey,
-					      sizeof(tkey), 0);
+		return bpf_skb_set_tunnel_key(skb, &tkey,
+					      bpf_core_type_size(struct bpf_tunnel_key),
+					      0);
 	}
 
 	__builtin_memcpy(tkey.remote_ipv6, nh->remote_endpoint, 16);
-	return bpf_skb_set_tunnel_key(skb, (struct bpf_tunnel_key *)&tkey,
-				      sizeof(tkey), BPF_F_TUNINFO_IPV6);
+	return bpf_skb_set_tunnel_key(skb, &tkey,
+				      bpf_core_type_size(struct bpf_tunnel_key),
+				      BPF_F_TUNINFO_IPV6);
 }
 
 // emit_trace tries to copy a fully-populated trace_event into the
 // ringbuf. If no consumer is attached (or one is too slow), the ring is
 // full and bpf_ringbuf_reserve returns NULL; we silently drop the event.
 // Cost per dropped packet: one failed reserve (a single CAS).
-static __always_inline void emit_trace(const struct trace_event *ev)
+static __always_inline void emit_trace(const struct unb_trace_event *ev)
 {
-	struct trace_event *out = bpf_ringbuf_reserve(&unb_trace, sizeof(*out), 0);
+	struct unb_trace_event *out = bpf_ringbuf_reserve(&unb_trace, sizeof(*out), 0);
 	if (!out)
 		return;
 
@@ -353,7 +344,7 @@ int unbounded_encap(struct __sk_buff *skb)
 	void *data = (void *)(long)skb->data;
 	void *data_end = (void *)(long)skb->data_end;
 
-	struct trace_event ev = {};
+	struct unb_trace_event ev = {};
 	ev.ts_ns = bpf_ktime_get_ns();
 	ev.cpu = bpf_get_smp_processor_id();
 	ev.skb_len = skb->len;

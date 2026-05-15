@@ -116,7 +116,7 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 REACT_DEV ?= false
 
 .PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check
-.PHONY: net-frontend net-frontend-clean net-build-ebpf net-manifests release-manifests
+.PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-manifests
 .PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-net-controller-local image-net-node-local images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
 .PHONY: unbounded-storage unbounded-storage-build unbounded-storage-test
@@ -198,7 +198,9 @@ help: ## Show this help
 	@echo "  net-frontend-clean               Remove node_modules and dist artifacts"
 	@echo ""
 	@echo "Net eBPF:"
-	@echo "  net-build-ebpf                   Compile bpf/unbounded_encap.c (requires clang)"
+	@echo "  net-ebpf-build                   Compile bpf/unbounded_encap.c (requires clang)"
+	@echo "  net-ebpf-generate                Regenerate bpf/vmlinux.h from pinned Ubuntu kernel (requires bpftool, curl, dpkg-deb, python3)"
+	@echo "  net-ebpf-verify                  Verify bpf/vmlinux.h matches bpf/btf-kernel-pin{,-hashes} (no extra tools)"
 	@echo ""
 	@echo "Net Manifests:"
 	@echo "  machina-manifests                Render machina manifests into deploy/machina/rendered"
@@ -678,13 +680,19 @@ net-frontend-clean: ## Remove frontend node_modules and dist artifacts
 
 ##@ Net eBPF
 
-net-build-ebpf: ## Compile bpf/unbounded_encap.c to internal/net/ebpf/unbounded_encap_bpfel.o (requires clang)
+net-ebpf-build: ## Compile bpf/unbounded_encap.c to internal/net/ebpf/unbounded_encap_bpfel.o (requires clang)
 	@echo "Compiling eBPF programs..."
 	@clang -O2 -g -target bpf \
 		-I/usr/include \
 		-c bpf/unbounded_encap.c \
 		-o internal/net/ebpf/unbounded_encap_bpfel.o
 	@echo "eBPF programs compiled."
+
+net-ebpf-generate: ## Regenerate bpf/vmlinux.h from pinned kernel and run bpf2go (requires bpftool, curl, dpkg-deb, python3)
+	@hack/scripts/net-ebpf-generate.sh
+
+net-ebpf-verify: ## Verify bpf/vmlinux.h matches bpf/btf-kernel-pin and bpf/btf-kernel-pin-hashes
+	@hack/scripts/net-ebpf-verify.sh
 
 ##@ Net Manifests
 

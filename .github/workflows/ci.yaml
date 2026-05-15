@@ -190,12 +190,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            clang llvm libbpf-dev linux-libc-dev
-          # bpf2go invokes clang with -target bpf, which does not search the
-          # multi-arch include dirs by default. Symlink the host arch's asm
-          # headers into the search path.
-          arch_triple=$(dpkg-architecture -qDEB_HOST_MULTIARCH)
-          sudo ln -sf "/usr/include/${arch_triple}/asm" /usr/include/asm
+            clang llvm libbpf-dev
+
+      - name: Verify BPF CO-RE pin artifacts
+        run: make net-ebpf-verify
 
       - name: Regenerate
         run: make generate

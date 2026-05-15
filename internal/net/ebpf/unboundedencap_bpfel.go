@@ -19,7 +19,20 @@ type unboundedEncapLpmKey struct {
 	Addr      [16]uint8
 }
 
-type unboundedEncapTraceEvent struct {
+type unboundedEncapTunnelEndpoint struct {
+	_        structs.HostLayout
+	Nexthops [4]struct {
+		_              structs.HostLayout
+		RemoteEndpoint [16]uint8
+		Vni            uint32
+		Ifindex        uint32
+		Healthy        uint32
+		Protocol       uint32
+	}
+	Count uint32
+}
+
+type unboundedEncapUnbTraceEvent struct {
 	_            structs.HostLayout
 	TsNs         uint64
 	Cpu          uint32
@@ -43,19 +56,6 @@ type unboundedEncapTraceEvent struct {
 	SetKeyRet    int32
 	RedirectRet  int32
 	Verdict      int32
-}
-
-type unboundedEncapTunnelEndpoint struct {
-	_        structs.HostLayout
-	Nexthops [4]struct {
-		_              structs.HostLayout
-		RemoteEndpoint [16]uint8
-		Vni            uint32
-		Ifindex        uint32
-		Healthy        uint32
-		Protocol       uint32
-	}
-	Count uint32
 }
 
 // loadUnboundedEncap returns the embedded CollectionSpec for unboundedEncap.
