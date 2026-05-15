@@ -78,13 +78,13 @@ func TestControllerRuntimeReconcilerReturnsError(t *testing.T) {
 	}
 }
 
-func TestNoopMachineOperationReconcilerIgnoresOperationRequest(t *testing.T) {
+func TestNoopMachineOperationReconcilerFailsOperationRequest(t *testing.T) {
 	t.Parallel()
 
 	reconciler := NoopMachineOperationReconciler()
 	result, err := reconciler.ReconcileMachineOperation(context.Background(), "op-1")
-	if err != nil {
-		t.Fatalf("ReconcileMachineOperation: %v", err)
+	if err == nil {
+		t.Fatal("ReconcileMachineOperation error = nil")
 	}
 	if result != (ctrl.Result{}) {
 		t.Fatalf("result = %v, want empty", result)

@@ -5,6 +5,7 @@ package daemon
 
 import (
 	"context"
+	"fmt"
 
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -78,8 +79,8 @@ type MachineOperationRequestReconciler interface {
 }
 
 // NoopMachineOperationReconciler returns a MachineOperationRequestReconciler
-// that does not register watches and ignores MachineOperation requests. Use it
-// when a daemon controller only needs repave requests.
+// that does not register watches. Use it when a daemon controller only needs
+// repave requests.
 func NoopMachineOperationReconciler() MachineOperationRequestReconciler {
 	return noopMachineOperationReconciler{}
 }
@@ -90,8 +91,8 @@ func (noopMachineOperationReconciler) SetupController(b *builder.TypedBuilder[Re
 	return b
 }
 
-func (noopMachineOperationReconciler) ReconcileMachineOperation(context.Context, string) (ctrl.Result, error) {
-	return ctrl.Result{}, nil
+func (noopMachineOperationReconciler) ReconcileMachineOperation(_ context.Context, name string) (ctrl.Result, error) {
+	return ctrl.Result{}, fmt.Errorf("unexpected MachineOperation request %q", name)
 }
 
 // RepaveReconciler handles repave requests produced by the shared controller setup.
