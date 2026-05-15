@@ -2434,7 +2434,7 @@ func (s *nodeStatusServer) getNodeStatus() *NodeStatusResponse {
 			continue
 		}
 
-		ifName := ebpfTunnelInterfaceName(p.TunnelProtocol)
+		ifName := tunnelInterfaceName(p.TunnelProtocol)
 
 		if ifName == "" {
 			if name, _, err := unboundednetnetlink.DetectDefaultRouteInterfaceFromCache(s.state.netlinkCache); err == nil {
@@ -2489,7 +2489,7 @@ func (s *nodeStatusServer) getNodeStatus() *NodeStatusResponse {
 			continue
 		}
 
-		ifName := ebpfTunnelInterfaceName(gp.TunnelProtocol)
+		ifName := tunnelInterfaceName(gp.TunnelProtocol)
 
 		if ifName == "" {
 			if name, _, err := unboundednetnetlink.DetectDefaultRouteInterfaceFromCache(s.state.netlinkCache); err == nil {
@@ -2879,29 +2879,36 @@ func (s *nodeStatusServer) collectRoutingTableFromKernel() RoutingTableInfo {
 	return info
 }
 
-// isManagedTunnelInterface returns true for WireGuard (wg*), GENEVE (gn*),
-// IPIP (ip*), VXLAN (vxlan*), and unbounded0 (eBPF dataplane) interfaces.
+// isManagedTunnelInterface returns true for the interfaces created by the
+// node agent: per-peer WireGuard devices (wg<port>) and the three shared
+// flow-based tunnel devices (geneve0, vxlan0, ipip0) plus the eBPF dummy
+// (unbounded0). The legacy netlink dataplane used per-peer gn*, ip*, and
+// vxlan* device names; those were removed in the eBPF-only refactor, so
+// exact-name matches are now sufficient for the shared devices.
 func isManagedTunnelInterface(name string) bool {
-	return strings.HasPrefix(name, "wg") || strings.HasPrefix(name, "gn") ||
-		strings.HasPrefix(name, "ip") || strings.HasPrefix(name, "vxlan") ||
-		name == "unbounded0" || name == "geneve0"
+	return strings.HasPrefix(name, "wg") ||
+		name == unbounded0DeviceName ||
+		name == geneveInterfaceName ||
+		name == vxlanInterfaceName ||
+		name == ipipInterfaceName
 }
 
-// ebpfTunnelInterfaceName returns the shared tunnel interface name for a
-// given protocol when using the eBPF dataplane. Unlike the netlink dataplane
-// which creates per-peer interfaces, eBPF uses a single shared interface.
-func ebpfTunnelInterfaceName(protocol string) string {
+// tunnelInterfaceName returns the shared tunnel interface name for a
+// given protocol. All peers using the same protocol share one flow-based
+// interface (geneve0/vxlan0/ipip0); the BPF program on unbounded0 selects
+// the correct underlay endpoint per packet via the LPM trie.
+func tunnelInterfaceName(protocol string) string {
 	switch unboundednetv1alpha1.TunnelProtocol(protocol) {
 	case unboundednetv1alpha1.TunnelProtocolGENEVE:
-		return "geneve0"
+		return geneveInterfaceName
 	case unboundednetv1alpha1.TunnelProtocolVXLAN:
-		return "vxlan0"
+		return vxlanInterfaceName
 	case unboundednetv1alpha1.TunnelProtocolIPIP:
-		return "ipip0"
+		return ipipInterfaceName
 	case unboundednetv1alpha1.TunnelProtocolNone:
 		return "" // resolved to default route interface by caller
 	default:
-		return "geneve0"
+		return geneveInterfaceName
 	}
 }
 

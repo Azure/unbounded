@@ -23,7 +23,21 @@ import (
 // neighbor resolution. TC egress BPF intercepts and redirects to the tunnel.
 const unbounded0DeviceName = "unbounded0"
 
-// buildEBPFSupernetRoutes returns the unbounded0 routes that attract overlay
+// vxlanInterfaceName is the shared flow-based VXLAN interface used by the
+// eBPF dataplane. All VXLAN peers share this single interface.
+const vxlanInterfaceName = "vxlan0"
+
+// geneveInterfaceName is the default shared flow-based GENEVE interface
+// used by the eBPF dataplane. The runtime name is configurable via
+// --geneve-interface; this const is used in places that key off the
+// default (status filtering, peer-interface mapping).
+const geneveInterfaceName = "geneve0"
+
+// ipipInterfaceName is the shared flow-based IPIP interface used by the
+// eBPF dataplane. All IPIP peers share this single interface.
+const ipipInterfaceName = "ipip0"
+
+// buildSupernetRoutes returns the unbounded0 routes that attract overlay
 // traffic into the eBPF dataplane. One route per CIDR is emitted regardless
 // of how many peers contribute to that CIDR; the BPF program performs the
 // per-destination redirect once traffic reaches unbounded0.
@@ -34,7 +48,7 @@ const unbounded0DeviceName = "unbounded0"
 // directed through the BPF program instead of out the default route).
 // The caller is responsible for excluding any CIDR that should keep
 // using the host default route (e.g. the gateway's own site NodeCidr).
-func buildEBPFSupernetRoutes(cfg *config, state *wireGuardState, meshPeers []meshPeerInfo, gatewayPeers []gatewayPeerInfo, extraSupernets []string) []unboundednetnetlink.DesiredRoute {
+func buildSupernetRoutes(cfg *config, state *wireGuardState, meshPeers []meshPeerInfo, gatewayPeers []gatewayPeerInfo, extraSupernets []string) []unboundednetnetlink.DesiredRoute {
 	devIface, err := net.InterfaceByName(unbounded0DeviceName)
 	if err != nil {
 		return nil
@@ -64,7 +78,7 @@ func buildEBPFSupernetRoutes(cfg *config, state *wireGuardState, meshPeers []mes
 		routes = append(routes, unboundednetnetlink.DesiredRoute{
 			Prefix: *cidr,
 			Nexthops: []unboundednetnetlink.DesiredNexthop{{
-				PeerID:    "ebpf/" + unbounded0DeviceName,
+				PeerID:    unbounded0DeviceName,
 				LinkIndex: devIface.Index,
 			}},
 			Metric:      cfg.BaseMetric,
@@ -78,27 +92,19 @@ func buildEBPFSupernetRoutes(cfg *config, state *wireGuardState, meshPeers []mes
 }
 
 // unbounded0 dummy device with TC egress for tunnel encapsulation.
-func ensureEBPFTunnelMap(cfg *config, state *wireGuardState) (*ebpfpkg.TunnelMap, error) {
-	if state.tunnelMaps == nil {
-		state.tunnelMaps = make(map[string]*ebpfpkg.TunnelMap)
-	}
-
-	const mapKey = "ebpf"
-
-	tm := state.tunnelMaps[mapKey]
-
-	if tm == nil {
-		var err error
-
-		tm, err = ebpfpkg.NewTunnelMap(ebpfpkg.TunnelMapOptions{
+func ensureTunnelMap(cfg *config, state *wireGuardState) (*ebpfpkg.TunnelMap, error) {
+	if state.tunnelMap == nil {
+		tm, err := ebpfpkg.NewTunnelMap(ebpfpkg.TunnelMapOptions{
 			MaxEntries: uint32(cfg.TunnelDataplaneMapSize),
 		})
 		if err != nil {
-			return nil, fmt.Errorf("failed to load eBPF tunnel program -- set tunnelDataplane=netlink to use netlink dataplane instead: %w", err)
+			return nil, fmt.Errorf("failed to load eBPF tunnel program: %w", err)
 		}
 
-		state.tunnelMaps[mapKey] = tm
+		state.tunnelMap = tm
 	}
+
+	tm := state.tunnelMap
 
 	if !tm.Attached() {
 		// Create unbounded0 dummy interface with NOARP.
@@ -150,49 +156,52 @@ func ensureEBPFTunnelMap(cfg *config, state *wireGuardState) (*ebpfpkg.TunnelMap
 }
 
 // neededTunnelProtocols scans mesh and gateway peers to determine which
-// tunnel interfaces are required. GENEVE, VXLAN, Auto, and empty protocol
-// values all map to the geneve0 interface in the eBPF path. IPIP maps to
-// ipip0. None and WireGuard do not need either interface.
-func neededTunnelProtocols(meshPeers []meshPeerInfo, gatewayPeers []gatewayPeerInfo) (needsGeneve, needsIPIP bool) {
-	for _, p := range meshPeers {
-		switch unboundednetv1alpha1.TunnelProtocol(p.TunnelProtocol) {
+// tunnel interfaces are required. GENEVE, Auto, and empty protocol values
+// map to the geneve0 interface; VXLAN to vxlan0; IPIP to ipip0. None and
+// WireGuard do not need a shared tunnel interface.
+func neededTunnelProtocols(meshPeers []meshPeerInfo, gatewayPeers []gatewayPeerInfo) (needsGeneve, needsIPIP, needsVXLAN bool) {
+	scan := func(proto string) {
+		switch unboundednetv1alpha1.TunnelProtocol(proto) {
 		case unboundednetv1alpha1.TunnelProtocolIPIP:
 			needsIPIP = true
+		case unboundednetv1alpha1.TunnelProtocolVXLAN:
+			needsVXLAN = true
 		case unboundednetv1alpha1.TunnelProtocolNone:
-			// no interface needed
+			// no shared tunnel interface needed
+		case unboundednetv1alpha1.TunnelProtocolWireGuard:
+			// WG uses per-peer interfaces; no shared tunnel interface needed
 		default:
-			// GENEVE, VXLAN, Auto, empty -- all use geneve0
+			// GENEVE, Auto, empty -- use geneve0
 			needsGeneve = true
 		}
+	}
+
+	for _, p := range meshPeers {
+		scan(p.TunnelProtocol)
 	}
 
 	for _, p := range gatewayPeers {
-		switch unboundednetv1alpha1.TunnelProtocol(p.TunnelProtocol) {
-		case unboundednetv1alpha1.TunnelProtocolIPIP:
-			needsIPIP = true
-		case unboundednetv1alpha1.TunnelProtocolNone:
-			// no interface needed
-		default:
-			needsGeneve = true
-		}
+		scan(p.TunnelProtocol)
 	}
 
-	return needsGeneve, needsIPIP
+	return needsGeneve, needsIPIP, needsVXLAN
 }
 
-// configureEBPFTunnelPeers sets up a single flow-based GENEVE interface and
-// programs BPF map entries so the TC classifier on the underlay interface
-// redirects overlay traffic to geneve0 with the correct tunnel key.
+// configureTunnelPeers sets up the shared flow-based tunnel interfaces
+// (geneve0, ipip0, vxlan0) and programs BPF map entries so the TC
+// classifier on the underlay interface redirects overlay traffic to the
+// matching tunnel device with the correct tunnel key.
 //
 // No kernel routes are needed -- the BPF program on the underlay egress
 // intercepts overlay-destined packets (matched by LPM trie) before they
-// exit via the default gateway and redirects them to geneve0 with tunnel
-// metadata set.
+// exit via the default gateway and redirects them to the tunnel device
+// with tunnel metadata set.
 //
-// Tunnel interfaces (geneve0, ipip0) are only created when at least one
-// peer uses the corresponding protocol. Unneeded interfaces are removed
-// immediately so that cleanupUnusedTunnelDevices becomes a no-op.
-func configureEBPFTunnelPeers(
+// Tunnel interfaces (geneve0, ipip0, vxlan0) are only created when at
+// least one peer uses the corresponding protocol. Unneeded interfaces
+// are removed immediately so that cleanupUnusedTunnelDevices becomes a
+// no-op.
+func configureTunnelPeers(
 	ctx context.Context,
 	cfg *config,
 	meshPeers []meshPeerInfo,
@@ -213,8 +222,8 @@ func configureEBPFTunnelPeers(
 	state *wireGuardState,
 ) ([]unboundednetnetlink.DesiredRoute, map[string]bool, error) {
 	// Do NOT early-return when both peer lists are empty. Even when
-	// there are no GENEVE/IPIP/None tunnel-protocol peers (e.g.
-	// WG-only gateway assignment), this function must still:
+	// there are no tunnel-protocol peers (e.g. WG-only gateway
+	// assignment), this function must still:
 	//   1. Create the unbounded0 dummy interface + load the TC BPF program
 	//   2. Build supernet routes on unbounded0 (from collectSupernets)
 	//   3. Clean up stale tunnel interfaces from previous runs
@@ -223,12 +232,12 @@ func configureEBPFTunnelPeers(
 	// addWireGuardPeersToBPFMap are silently dropped.
 	nlCache := state.netlinkCache
 	ifName := cfg.GeneveInterfaceName
-	ipipIfName := "ipip0"
+	ipipIfName := ipipInterfaceName
 
 	// Determine which tunnel interfaces are actually needed by scanning
 	// all peers before creating any interfaces. This avoids unnecessary
 	// interface churn and rp_filter resets.
-	needsGeneve, needsIPIP := neededTunnelProtocols(meshPeers, gatewayPeers)
+	needsGeneve, needsIPIP, needsVXLAN := neededTunnelProtocols(meshPeers, gatewayPeers)
 
 	// geneveMTU is used for supernet route MTU below. Initialize to the
 	// configured MTU and refine if geneve0 is created.
@@ -380,8 +389,83 @@ func configureEBPFTunnelPeers(
 		}
 	}
 
+	var vxlanIfIndex uint32
+
+	if needsVXLAN {
+		// Ensure shared flow-based VXLAN interface exists.
+		vxlanLM := unboundednetnetlink.NewLinkManager(vxlanInterfaceName)
+		if err := vxlanLM.EnsureVXLANInterface(cfg.VXLANPort, cfg.VXLANSrcPortLow, cfg.VXLANSrcPortHigh); err != nil {
+			return nil, nil, fmt.Errorf("create flow-based VXLAN interface %s: %w", vxlanInterfaceName, err)
+		}
+
+		if err := vxlanLM.SetLinkUpWithCache(nlCache); err != nil {
+			return nil, nil, fmt.Errorf("bring up %s: %w", vxlanInterfaceName, err)
+		}
+
+		// Strip stale addresses from vxlan0 -- eBPF dataplane keeps overlay IPs
+		// on unbounded0 only.
+		if _, _, err := vxlanLM.SyncAddresses(nil, true); err != nil {
+			klog.V(2).Infof("eBPF: failed to clear addresses on %s: %v", vxlanInterfaceName, err)
+		}
+
+		// Set deterministic MAC -- same rationale as geneve0.
+		vxlanUnderlayIP := selectUnderlayIP(state.nodeInternalIPs, cfg.TunnelIPFamily)
+		if vxlanUnderlayIP != nil {
+			if err := vxlanLM.SetLinkAddress(ebpfpkg.TunnelMACFromIP(vxlanUnderlayIP)); err != nil {
+				klog.Warningf("eBPF: failed to set MAC on %s: %v", vxlanInterfaceName, err)
+			}
+		}
+
+		vxlanMTU := cfg.MTU
+
+		if defaultMTU := unboundednetnetlink.DetectDefaultRouteMTUFromCache(nlCache); defaultMTU > 0 {
+			detected := defaultMTU - unboundednetnetlink.VXLANMTUOverhead
+			if detected < vxlanMTU {
+				vxlanMTU = detected
+			}
+		}
+
+		if err := vxlanLM.EnsureMTUWithCache(nlCache, vxlanMTU); err != nil {
+			klog.Warningf("eBPF: failed to set MTU on %s: %v", vxlanInterfaceName, err)
+		}
+
+		disableRPFilter(vxlanInterfaceName)
+
+		if state.forwardManager != nil {
+			state.forwardManager.EnsureInterface(vxlanInterfaceName)
+		}
+
+		if state.isGatewayNode && state.notrackManager != nil {
+			state.notrackManager.EnsureInterface(vxlanInterfaceName)
+		}
+
+		if vxlanIface, err := net.InterfaceByName(vxlanInterfaceName); err == nil {
+			vxlanIfIndex = uint32(vxlanIface.Index)
+		} else {
+			return nil, nil, fmt.Errorf("interface %s not found after creation: %w", vxlanInterfaceName, err)
+		}
+	} else {
+		// No peers need vxlan0 -- remove it if it exists.
+		vxlanLM := unboundednetnetlink.NewLinkManager(vxlanInterfaceName)
+		if vxlanLM.Exists() {
+			klog.Infof("eBPF: removing %s (no peers use VXLAN)", vxlanInterfaceName)
+
+			if err := vxlanLM.DeleteLink(); err != nil {
+				klog.V(2).Infof("eBPF: failed to remove %s: %v", vxlanInterfaceName, err)
+			}
+
+			if state.forwardManager != nil {
+				state.forwardManager.RemoveInterface(vxlanInterfaceName)
+			}
+
+			if state.notrackManager != nil {
+				state.notrackManager.RemoveInterface(vxlanInterfaceName)
+			}
+		}
+	}
+
 	// Ensure shared eBPF tunnel map + TC on unbounded0.
-	_, err := ensureEBPFTunnelMap(cfg, state)
+	_, err := ensureTunnelMap(cfg, state)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -404,7 +488,7 @@ func configureEBPFTunnelPeers(
 			continue
 		}
 
-		peerIfIdx, peerProto := resolveEBPFPeerTarget(peer.TunnelProtocol, geneveIfIndex, ipipIfIndex, defaultIfIdx, cfg)
+		peerIfIdx, peerProto := resolveTunnelPeerTarget(peer.TunnelProtocol, geneveIfIndex, ipipIfIndex, vxlanIfIndex, defaultIfIdx, cfg)
 		addPeerBPFEntries(bpfEntries, peer.PodCIDRs, underlayIP, uint32(cfg.GeneveVNI), peerIfIdx, peerProto, peer.Name)
 		// Pin the peer's underlay IP to its tunnel so node-IP traffic
 		// LPM-matches the /32 rather than an enclosing supernet.
@@ -421,7 +505,7 @@ func configureEBPFTunnelPeers(
 			continue
 		}
 
-		peerIfIdx, peerProto := resolveEBPFPeerTarget(gwPeer.TunnelProtocol, geneveIfIndex, ipipIfIndex, defaultIfIdx, cfg)
+		peerIfIdx, peerProto := resolveTunnelPeerTarget(gwPeer.TunnelProtocol, geneveIfIndex, ipipIfIndex, vxlanIfIndex, defaultIfIdx, cfg)
 		addPeerBPFEntries(bpfEntries, gwPeer.PodCIDRs, underlayIP, uint32(cfg.GeneveVNI), peerIfIdx, peerProto, gwPeer.Name)
 		addPeerBPFEntries(bpfEntries, gwPeer.RoutedCidrs, underlayIP, uint32(cfg.GeneveVNI), peerIfIdx, peerProto, gwPeer.Name)
 		// Pin each gateway's own underlay IP to its tunnel via a host-CIDR
@@ -455,164 +539,12 @@ func configureEBPFTunnelPeers(
 	hcPeers := registerPeersWithHealthCheck(meshPeers, gatewayPeers, mySiteName, false,
 		siteHealthCheckProfileNames, peeringSiteHealthCheckProfileNames,
 		assignmentSiteHealthCheckProfileNames, assignmentPoolHealthCheckProfileNames,
-		poolHealthCheckProfileNames, state, ebpfPeerIfaceName, true)
+		poolHealthCheckProfileNames, state, peerIfaceName, true)
 
 	klog.V(2).Infof("eBPF tunnel: configured %d mesh + %d gateway peers, %d BPF entries, %d supernet routes on %s",
 		len(meshPeers), len(gatewayPeers), len(bpfEntries), len(routes), ifName)
 
 	return routes, hcPeers, nil
-}
-
-// configureEBPFVXLANPeers sets up the shared vxlan0 interface and programs
-// BPF map entries for VXLAN tunnel redirection.
-func configureEBPFVXLANPeers(
-	ctx context.Context,
-	cfg *config,
-	meshPeers []meshPeerInfo,
-	gatewayPeers []gatewayPeerInfo,
-	mySiteName string,
-	peeredSites map[string]bool,
-	siteHealthCheckProfileNames map[string]string,
-	peeringSiteHealthCheckProfileNames map[string]string,
-	assignmentSiteHealthCheckProfileNames map[string]string,
-	assignmentPoolHealthCheckProfileNames map[string]string,
-	poolHealthCheckProfileNames map[string]string,
-	siteTunnelMTUs map[string]int,
-	peeringSiteTunnelMTUs map[string]int,
-	assignmentSiteTunnelMTUs map[string]int,
-	assignmentPoolTunnelMTUs map[string]int,
-	poolTunnelMTUs map[string]int,
-	state *wireGuardState,
-) ([]unboundednetnetlink.DesiredRoute, map[string]bool, error) {
-	_ = ctx
-
-	if len(meshPeers) == 0 && len(gatewayPeers) == 0 {
-		return nil, nil, nil
-	}
-
-	nlCache := state.netlinkCache
-	ifName := vxlanInterfaceName
-
-	lm := unboundednetnetlink.NewLinkManager(ifName)
-	if err := lm.EnsureVXLANInterface(cfg.VXLANPort, cfg.VXLANSrcPortLow, cfg.VXLANSrcPortHigh); err != nil {
-		return nil, nil, err
-	}
-
-	if err := lm.SetLinkUp(); err != nil {
-		return nil, nil, err
-	}
-
-	// Strip stale addresses from vxlan0 -- eBPF dataplane keeps overlay IPs
-	// on unbounded0 only.
-	if _, _, err := lm.SyncAddresses(nil, true); err != nil {
-		klog.V(2).Infof("eBPF VXLAN: failed to clear addresses on %s: %v", ifName, err)
-	}
-
-	// Set deterministic MAC -- same rationale as geneve0.
-	vxlanUnderlayIP := selectUnderlayIP(state.nodeInternalIPs, cfg.TunnelIPFamily)
-	if vxlanUnderlayIP != nil {
-		if err := lm.SetLinkAddress(ebpfpkg.TunnelMACFromIP(vxlanUnderlayIP)); err != nil {
-			klog.Warningf("eBPF VXLAN: failed to set MAC on %s: %v", ifName, err)
-		}
-	}
-
-	vxlanMTU := cfg.MTU
-
-	if defaultMTU := unboundednetnetlink.DetectDefaultRouteMTUFromCache(nlCache); defaultMTU > 0 {
-		detected := defaultMTU - unboundednetnetlink.VXLANMTUOverhead
-		if detected < vxlanMTU {
-			vxlanMTU = detected
-		}
-	}
-
-	if err := lm.EnsureMTU(vxlanMTU); err != nil {
-		klog.Warningf("eBPF VXLAN: failed to set MTU on %s: %v", ifName, err)
-	}
-
-	// Disable rp_filter on vxlan0 AFTER all link modifications (SetLinkUp,
-	// SyncAddresses, SetLinkAddress, EnsureMTU). Some netlink operations
-	// can cause the kernel to reset interface sysctls.
-	disableRPFilter(ifName)
-
-	if state.forwardManager != nil {
-		state.forwardManager.EnsureInterface(ifName)
-	}
-
-	if state.isGatewayNode && state.notrackManager != nil {
-		state.notrackManager.EnsureInterface(ifName)
-	}
-
-	iface, err := net.InterfaceByName(ifName)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	tunnelIfIndex := uint32(iface.Index)
-	vni := uint32(cfg.GeneveVNI)
-
-	_, err = ensureEBPFTunnelMap(cfg, state)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	bpfEntries := make(map[string]ebpfpkg.TunnelEndpoint)
-
-	for _, peer := range meshPeers {
-		if len(peer.InternalIPs) == 0 || len(peer.PodCIDRs) == 0 {
-			continue
-		}
-
-		underlayIP := selectUnderlayIP(peer.InternalIPs, cfg.TunnelIPFamily)
-		if underlayIP == nil {
-			continue
-		}
-
-		addPeerBPFEntries(bpfEntries, peer.PodCIDRs, underlayIP, vni, tunnelIfIndex, ebpfpkg.TunnelProtoVXLAN, peer.Name)
-		// Pin the peer's underlay IP to its VXLAN nexthop.
-		addPeerBPFEntries(bpfEntries, ipsToHostCIDRs(peer.InternalIPs), underlayIP, vni, tunnelIfIndex, ebpfpkg.TunnelProtoVXLAN, peer.Name)
-	}
-
-	for _, gwPeer := range gatewayPeers {
-		if len(gwPeer.InternalIPs) == 0 || len(gwPeer.PodCIDRs) == 0 {
-			continue
-		}
-
-		underlayIP := selectUnderlayIP(gwPeer.InternalIPs, cfg.TunnelIPFamily)
-		if underlayIP == nil {
-			continue
-		}
-
-		addPeerBPFEntries(bpfEntries, gwPeer.PodCIDRs, underlayIP, vni, tunnelIfIndex, ebpfpkg.TunnelProtoVXLAN, gwPeer.Name)
-		addPeerBPFEntries(bpfEntries, gwPeer.RoutedCidrs, underlayIP, vni, tunnelIfIndex, ebpfpkg.TunnelProtoVXLAN, gwPeer.Name)
-		// See configureEBPFTunnelPeers: pin each gateway's underlay IP
-		// to its own VXLAN nexthop so node-IP traffic LPM-matches the
-		// /32 instead of falling into the broader RoutedCidrs ECMP.
-		addPeerBPFEntries(bpfEntries, ipsToHostCIDRs(gwPeer.InternalIPs), underlayIP, vni, tunnelIfIndex, ebpfpkg.TunnelProtoVXLAN, gwPeer.Name)
-	}
-
-	// Store entries for deferred reconcile.
-	state.mu.Lock()
-	if state.pendingBPFEntries == nil {
-		state.pendingBPFEntries = make(map[string]ebpfpkg.TunnelEndpoint)
-	}
-
-	for k, v := range bpfEntries {
-		state.pendingBPFEntries[k] = v
-	}
-	state.mu.Unlock()
-
-	// Build supernet routes on unbounded0 for VXLAN overlay traffic.
-	var routes []unboundednetnetlink.DesiredRoute
-
-	vxlanHCPeers := registerPeersWithHealthCheck(meshPeers, gatewayPeers, mySiteName, false,
-		siteHealthCheckProfileNames, peeringSiteHealthCheckProfileNames,
-		assignmentSiteHealthCheckProfileNames, assignmentPoolHealthCheckProfileNames,
-		poolHealthCheckProfileNames, state, ebpfPeerIfaceName, true)
-
-	klog.V(2).Infof("eBPF VXLAN: configured %d mesh + %d gateway peers, %d BPF entries, %d supernet routes on %s",
-		len(meshPeers), len(gatewayPeers), len(bpfEntries), len(routes), ifName)
-
-	return routes, vxlanHCPeers, nil
 }
 
 // addPeerBPFEntries adds LPM trie entries for a set of CIDRs pointing to a
@@ -660,16 +592,16 @@ func selectUnderlayIP(internalIPs []string, ipFamily string) net.IP {
 	return nil
 }
 
-// resolveEBPFPeerTarget returns the tunnel ifindex and BPF protocol constant
+// resolveTunnelPeerTarget returns the tunnel ifindex and BPF protocol constant
 // for a peer based on its tunnel protocol. The BPF program derives whether
 // to call bpf_skb_set_tunnel_key from the protocol value (GENEVE/VXLAN/IPIP
 // need it; WireGuard/None do not), so there is no separate set-key flag.
-func resolveEBPFPeerTarget(protocol string, geneveIfIdx, ipipIfIdx, defaultIfIdx uint32, cfg *config) (uint32, uint32) {
+func resolveTunnelPeerTarget(protocol string, geneveIfIdx, ipipIfIdx, vxlanIfIdx, defaultIfIdx uint32, cfg *config) (uint32, uint32) {
 	switch unboundednetv1alpha1.TunnelProtocol(protocol) {
 	case unboundednetv1alpha1.TunnelProtocolIPIP:
 		return ipipIfIdx, ebpfpkg.TunnelProtoIPIP
 	case unboundednetv1alpha1.TunnelProtocolVXLAN:
-		return geneveIfIdx, ebpfpkg.TunnelProtoVXLAN
+		return vxlanIfIdx, ebpfpkg.TunnelProtoVXLAN
 	case unboundednetv1alpha1.TunnelProtocolNone:
 		// Direct routing: redirect to default route interface, no tunnel key.
 		return defaultIfIdx, ebpfpkg.TunnelProtoNone
@@ -754,7 +686,7 @@ func collectSupernets(state *wireGuardState, meshPeers []meshPeerInfo, gatewayPe
 // interface. WG peers use redirect-only (no set_tunnel_key) -- the WireGuard
 // driver handles crypto routing via its own AllowedIPs.
 func addWireGuardPeersToBPFMap(cfg *config, state *wireGuardState, wgMeshPeers []meshPeerInfo, wgGatewayPeers []gatewayPeerInfo) {
-	if state.tunnelMaps == nil || state.tunnelMaps["ebpf"] == nil {
+	if state.tunnelMap == nil {
 		return
 	}
 
@@ -819,7 +751,7 @@ func addWireGuardPeersToBPFMap(cfg *config, state *wireGuardState, wgMeshPeers [
 		allCIDRs := append(gwPeer.PodCIDRs, gwPeer.RoutedCidrs...)
 		addPeerBPFEntries(state.pendingBPFEntries, allCIDRs, underlayIP, 0, gwIfIdx, ebpfpkg.TunnelProtoWireGuard, gwPeer.Name)
 		// Pin each gateway's underlay IP to its specific WG tunnel; see
-		// configureEBPFTunnelPeers for rationale.
+		// configureTunnelPeers for rationale.
 		addPeerBPFEntries(state.pendingBPFEntries, ipsToHostCIDRs(gwPeer.InternalIPs), underlayIP, 0, gwIfIdx, ebpfpkg.TunnelProtoWireGuard, gwPeer.Name)
 	}
 	state.mu.Unlock()
@@ -831,11 +763,7 @@ func addWireGuardPeersToBPFMap(cfg *config, state *wireGuardState, wgMeshPeers [
 // reconcilePendingBPFEntries performs a single BPF map reconcile with all
 // accumulated entries from GENEVE, VXLAN, and WireGuard config phases.
 func reconcilePendingBPFEntries(state *wireGuardState) {
-	if state.tunnelMaps == nil {
-		return
-	}
-
-	tm := state.tunnelMaps["ebpf"]
+	tm := state.tunnelMap
 	if tm == nil {
 		return
 	}
@@ -856,17 +784,18 @@ func reconcilePendingBPFEntries(state *wireGuardState) {
 	}
 }
 
-// ebpfPeerIfaceName returns the shared tunnel interface name for any gateway
-// peer in eBPF mode. Unlike the netlink dataplane which creates per-peer
-// interfaces (gn<decimal>, vx<decimal>), eBPF uses a single shared interface.
-func ebpfPeerIfaceName(gwPeer gatewayPeerInfo) string {
+// peerIfaceName returns the shared tunnel interface name for any gateway
+// peer based on its tunnel protocol. All peers using the same protocol
+// share one flow-based interface; the BPF program on unbounded0 selects
+// the per-peer underlay endpoint from the LPM trie.
+func peerIfaceName(gwPeer gatewayPeerInfo) string {
 	switch gwPeer.TunnelProtocol {
 	case "VXLAN":
 		return vxlanInterfaceName
 	case "IPIP":
-		return "ipip0"
+		return ipipInterfaceName
 	default:
-		return "geneve0"
+		return geneveInterfaceName
 	}
 }
 
@@ -947,9 +876,9 @@ func cleanupUnusedTunnelDevices(meshPeers []meshPeerInfo, gatewayPeers, wgGatewa
 	}
 
 	devices := []devInfo{
-		{"geneve0", usesGeneve},
+		{geneveInterfaceName, usesGeneve},
 		{vxlanInterfaceName, usesVXLAN},
-		{"ipip0", usesIPIP},
+		{ipipInterfaceName, usesIPIP},
 	}
 	for _, d := range devices {
 		if d.used {
@@ -1022,9 +951,9 @@ func reapplyRPFilterOnActiveTunnels(meshPeers []meshPeerInfo, gatewayPeers, wgGa
 		used bool
 	}
 	for _, d := range []devInfo{
-		{"geneve0", usesGeneve},
+		{geneveInterfaceName, usesGeneve},
 		{vxlanInterfaceName, usesVXLAN},
-		{"ipip0", usesIPIP},
+		{ipipInterfaceName, usesIPIP},
 	} {
 		if d.used {
 			disableRPFilter(d.name)
@@ -1038,4 +967,29 @@ func reapplyRPFilterOnActiveTunnels(meshPeers []meshPeerInfo, gatewayPeers, wgGa
 			}
 		}
 	}
+}
+
+// filterPeersByTunnelProtocol partitions mesh and gateway peer lists into
+// WireGuard peers and shared-tunnel peers (GENEVE, VXLAN, IPIP, None, Auto,
+// or empty). The shared-tunnel set is handled by configureTunnelPeers, which
+// creates the matching geneve0/vxlan0/ipip0 interface for each protocol that
+// has at least one peer.
+func filterPeersByTunnelProtocol(meshPeers []meshPeerInfo, gatewayPeers []gatewayPeerInfo) (wgMesh []meshPeerInfo, wgGw []gatewayPeerInfo, tunnelMesh []meshPeerInfo, tunnelGw []gatewayPeerInfo) {
+	for _, p := range meshPeers {
+		if unboundednetv1alpha1.TunnelProtocol(p.TunnelProtocol) == unboundednetv1alpha1.TunnelProtocolWireGuard {
+			wgMesh = append(wgMesh, p)
+		} else {
+			tunnelMesh = append(tunnelMesh, p)
+		}
+	}
+
+	for _, p := range gatewayPeers {
+		if unboundednetv1alpha1.TunnelProtocol(p.TunnelProtocol) == unboundednetv1alpha1.TunnelProtocolWireGuard {
+			wgGw = append(wgGw, p)
+		} else {
+			tunnelGw = append(tunnelGw, p)
+		}
+	}
+
+	return wgMesh, wgGw, tunnelMesh, tunnelGw
 }

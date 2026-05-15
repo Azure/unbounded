@@ -105,7 +105,7 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 	healthCheckMgr, err := healthcheck.NewManager(cfg.NodeName, cfg.HealthCheckPort, func(peerHostname string, newState, oldState healthcheck.SessionState) {
 		klog.V(2).Infof("Healthcheck state change for peer %s: %s -> %s", peerHostname, oldState, newState)
 		// Toggle BPF map health for eBPF dataplane peers.
-		if tm := state.tunnelMaps["ebpf"]; tm != nil {
+		if tm := state.tunnelMap; tm != nil {
 			healthy := newState == healthcheck.StateUp
 			if n := tm.SetPeerHealth(peerHostname, healthy); n > 0 {
 				klog.V(2).Infof("eBPF: set %d BPF entries for peer %s healthy=%v", n, peerHostname, healthy)
@@ -1951,13 +1951,12 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 		var (
 			tunnelMeshPeers    []meshPeerInfo
 			tunnelGatewayPeers []gatewayPeerInfo
-			vxlanMeshPeers     []meshPeerInfo
-			vxlanGatewayPeers  []gatewayPeerInfo
 		)
 
-		wgMeshPeers, wgGatewayPeers, tunnelMeshPeers, tunnelGatewayPeers, vxlanMeshPeers, vxlanGatewayPeers = filterPeersByTunnelProtocol(peers, gatewayPeers)
+		wgMeshPeers, wgGatewayPeers, tunnelMeshPeers, tunnelGatewayPeers = filterPeersByTunnelProtocol(peers, gatewayPeers)
 
-		// Configure per-peer tunnel (GENEVE/IPIP/None) peers.
+		// Configure all shared-tunnel peers (GENEVE/VXLAN/IPIP/None) on
+		// their respective flow-based interfaces (geneve0/vxlan0/ipip0).
 		var tunnelErr error
 
 		tunnelRoutes, tunnelHCPeers, tunnelErr = configureTunnelPeers(ctx, cfg, tunnelMeshPeers, tunnelGatewayPeers,
@@ -1968,31 +1967,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 			siteTunnelMTUs, peeringSiteTunnelMTUs, assignmentSiteTunnelMTUs,
 			assignmentPoolTunnelMTUs, poolTunnelMTUs, state)
 		if tunnelErr != nil {
-			klog.Warningf("GENEVE configuration failed (WireGuard will still be configured): %v", tunnelErr)
-		}
-
-		// Configure VXLAN peers (single shared interface with route-based encap).
-		if len(vxlanMeshPeers) > 0 || len(vxlanGatewayPeers) > 0 {
-			vxlanRoutes, vxlanHCPeers, vxlanErr := configureVXLANPeers(ctx, cfg, vxlanMeshPeers, vxlanGatewayPeers,
-				mySiteName, peeredSites,
-				siteHealthCheckProfileNames, peeringSiteHealthCheckProfileNames,
-				assignmentSiteHealthCheckProfileNames, assignmentPoolHealthCheckProfileNames,
-				poolHealthCheckProfileNames,
-				siteTunnelMTUs, peeringSiteTunnelMTUs, assignmentSiteTunnelMTUs,
-				assignmentPoolTunnelMTUs, poolTunnelMTUs, state)
-			if vxlanErr != nil {
-				klog.Warningf("VXLAN configuration failed: %v", vxlanErr)
-			} else {
-				tunnelRoutes = append(tunnelRoutes, vxlanRoutes...)
-
-				if tunnelHCPeers == nil {
-					tunnelHCPeers = vxlanHCPeers
-				} else {
-					for k, v := range vxlanHCPeers {
-						tunnelHCPeers[k] = v
-					}
-				}
-			}
+			klog.Warningf("Tunnel configuration failed (WireGuard will still be configured): %v", tunnelErr)
 		}
 
 		// One unbounded0 supernet route per overlay CIDR, covering every peer
@@ -2019,7 +1994,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 			}
 		}
 
-		tunnelRoutes = append(tunnelRoutes, buildEBPFSupernetRoutes(cfg, state, peers, gatewayPeers, extraSupernets)...)
+		tunnelRoutes = append(tunnelRoutes, buildSupernetRoutes(cfg, state, peers, gatewayPeers, extraSupernets)...)
 	} else {
 		wgMeshPeers = peers
 		wgGatewayPeers = gatewayPeers

@@ -271,7 +271,7 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 	}
 
 	// Routes are managed centrally: per-CIDR unbounded0 routes are built by
-	// buildEBPFSupernetRoutes in the parent reconcile and arrive here via
+	// buildSupernetRoutes in the parent reconcile and arrive here via
 	// additionalRoutes. No per-peer kernel routes are emitted; the BPF
 	// program performs all per-destination redirection.
 	var allDesiredRoutes []unboundednetnetlink.DesiredRoute

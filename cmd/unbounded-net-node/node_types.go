@@ -109,8 +109,9 @@ type wireGuardState struct {
 	// Notrack manager for skipping conntrack on transit traffic (gateway nodes only)
 	notrackManager *unboundednetnetlink.NotrackManager
 
-	// tunnelMaps holds eBPF LPM tries keyed by interface name (geneve0, vxlan0, ...).
-	tunnelMaps map[string]*ebpfpkg.TunnelMap
+	// tunnelMap is the eBPF LPM trie on unbounded0 that holds per-CIDR
+	// tunnel endpoint entries for every peer (GENEVE/VXLAN/IPIP/WG/None).
+	tunnelMap *ebpfpkg.TunnelMap
 
 	// pendingBPFEntries accumulates BPF map entries across GENEVE, VXLAN,
 	// and WG config phases. A single Reconcile is done after all entries
