@@ -10,7 +10,7 @@ Unbounded agent daemon in `cmd/agent/internal/daemon`.
 
 ## Goals
 
-- Share controller-runtime setup across Unbounded and FlexNode-style daemons.
+- Share controller-runtime setup across Unbounded and external daemons.
 - Serialize host-local daemon work so reset, restart, upgrade, and repave flows
   cannot interleave.
 - Keep Machina `MachineOperation` status handling reusable for Unbounded.
@@ -66,6 +66,68 @@ type RepaveReconciler interface {
 This lets each product register only the event sources it owns while sharing the
 runtime controller and dispatch logic.
 
+## Relationships
+
+```mermaid
+flowchart TD
+    Queue["daemon.Request queue"]
+
+    MachineSource["machine operation source"]
+    MachineReconciler["machine operation reconciler"]
+    Handlers["provider operation handlers"]
+    OperationStore["MachineOperationStore"]
+    StatusBackend["operation status backend"]
+
+    RepaveSource["repave source"]
+    Repave["provider repave reconciler"]
+
+    Noop["no-op machine operation reconciler"]
+
+    MachineSource -->|NewMachineOperationRequest| Queue
+    Queue -->|machine operation request| MachineReconciler
+    MachineReconciler -->|supported operation| Handlers
+    MachineReconciler -->|unsupported operation failure| OperationStore
+    Handlers -->|progress or final result| OperationStore
+    OperationStore -->|persist status| StatusBackend
+
+    RepaveSource -->|NewRepaveRequest source| Queue
+    Queue -->|repave request with source| Repave
+
+    Queue -->|unexpected machine operation request| Noop
+```
+
+The shared controller serializes machine operation requests and repave requests
+through the same queue. Sources are registered by the concrete reconcilers and
+enqueue either `NewMachineOperationRequest` or `NewRepaveRequest`. The machine
+operation reconciler uses `MachineOperationStore` to persist progress and final
+status; the backing status store is provider-specific. External providers that
+do not use machine operations can wire only the repave flow and pass
+`NoopMachineOperationReconciler`; any machine operation request in that
+configuration is treated as unexpected wiring.
+
+In Unbounded, these components are wired as follows:
+
+```mermaid
+flowchart TD
+    Queue["daemon.Request queue"]
+
+    MachineOperationSource["Machina MachineOperation CR input"]
+    MachineOperationStatus["Machina MachineOperation CR status"]
+    Machina["MachinaMachineOperationReconciler"]
+    MachineTarget["machineOperationTarget"]
+
+    NodeDelete["local Node delete event"]
+    Repave["Unbounded repaveReconciler"]
+
+    MachineOperationSource -->|local operation event| Queue
+    Queue -->|machine operation request| Machina
+    Machina -->|NodeReboot AgentUpgrade AgentReset| MachineTarget
+    MachineTarget -->|status through store| MachineOperationStatus
+
+    NodeDelete -->|node deleted| Queue
+    Queue -->|repave request| Repave
+```
+
 ## Serialization
 
 The shared controller sets `MaxConcurrentReconciles` to `1`.
@@ -85,9 +147,9 @@ Repave is a generic local reconcile trigger. It is not tied to a Machina object.
 
 `NewRepaveRequest(source)` carries a string source so consumers can distinguish
 why a local reconcile was queued. Current Unbounded usage passes `node-delete`.
-FlexNode can use sources such as `node-change` and `machine-poll` if it wants to
-preserve different requeue behavior for event-driven and polling-driven
-reconciles.
+External providers can use sources such as `node-change` and `machine-poll` if
+they want to preserve different requeue behavior for event-driven and
+polling-driven reconciles.
 
 The shared package does not interpret the source. It passes the string to
 `ReconcileRepave(ctx, source)`.
@@ -224,21 +286,23 @@ The machine operation target owns nspawn restart, agent upgrade, and agent reset
 execution. The repave reconciler owns Unbounded MachineConfiguration resolution
 and local nspawn repave behavior.
 
-## FlexNode Adoption Shape
+## External Provider Adoption Shape
 
-FlexNode can adopt the shared controller without adopting Machina operations:
+An external implementation can adopt the shared controller without adopting
+Machina operations:
 
-1. Implement `RepaveReconciler` for FlexNode local reconcile.
+1. Implement `RepaveReconciler` for the provider's local reconcile.
 2. Register its Node watch and optional poll or initial event sources in
    `RepaveReconciler.SetupController`.
 3. Queue `NewRepaveRequest(source)` with sources such as `node-change` or
    `machine-poll`.
 4. Pass `NoopMachineOperationReconciler()` for the machine operation reconciler.
-5. Preserve FlexNode-specific goal resolution, ARM machine reads, state files,
-   and status publishing inside its repave reconciler.
+5. Preserve provider-specific goal resolution, external machine reads, state
+   files, and status publishing inside its repave reconciler.
 
 This keeps the shared package responsible for serialized controller dispatch
-only, while FlexNode keeps ownership of ARM-specific state and lifecycle logic.
+only, while the external implementation keeps ownership of provider-specific
+state and lifecycle logic.
 
 ## Testing
 
