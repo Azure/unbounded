@@ -176,9 +176,16 @@ func authorizeDashboardRequest(requireDashboardAuth bool, tokenIssuer *authn.Tok
 	return authorizer.authorize(r.Context(), claims.Subject, claims.Groups)
 }
 
-// authorizeDashboardOrAggregated allows a request if it arrives via the
-// aggregated API server (verified front-proxy client certificate) or if it
-// passes dashboard authentication and authorization.
+// authorizeDashboardOrAggregated allows a request if it passes dashboard
+// authentication and authorization (HMAC viewer Bearer token) or if it
+// arrives via the aggregated API server (verified front-proxy client
+// certificate).
+//
+// When the request carries a Bearer token, dashboard auth is attempted
+// first to avoid logging spurious "no client certificate" rejections from
+// the local kubectl-unbounded proxy, which never presents a client cert.
+// Aggregator-style client-cert auth is still attempted as a fallback so
+// requests proxied through the kube-aggregator continue to work.
 func authorizeDashboardOrAggregated(
 	requireDashboardAuth bool,
 	tokenIssuer *authn.TokenIssuer,
@@ -186,9 +193,27 @@ func authorizeDashboardOrAggregated(
 	webhookServer *webhookpkg.Server,
 	r *http.Request,
 ) bool {
+	if hasBearerToken(r) && authorizeDashboardRequest(requireDashboardAuth, tokenIssuer, authorizer, r) {
+		return true
+	}
+
 	if webhookServer.IsTrustedAggregatedRequest(r) {
 		return true
 	}
 
+	// Final attempt: dashboard auth path for requests that did not carry a
+	// Bearer token (e.g. requireDashboardAuth=false).
 	return authorizeDashboardRequest(requireDashboardAuth, tokenIssuer, authorizer, r)
+}
+
+// hasBearerToken reports whether the request has an Authorization: Bearer
+// header.
+func hasBearerToken(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+
+	auth := r.Header.Get("Authorization")
+
+	return strings.HasPrefix(auth, "Bearer ")
 }

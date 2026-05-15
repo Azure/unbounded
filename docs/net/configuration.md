@@ -86,7 +86,6 @@ node:
   genevePort: 6081
   geneveVni: 1
   geneveInterfaceName: geneve0
-  tunnelDataplane: ebpf
   tunnelDataplaneMapSize: 16384
   tunnelIPFamily: IPv4
 ```
@@ -261,16 +260,13 @@ IPIP tunneling uses per-peer tunnel interfaces with minimal overhead (20 bytes).
 
 ### Tunnel Dataplane
 
+The node agent uses an eBPF dataplane: a single `unbounded0` interface with TC egress programs and an LPM trie that maps destination CIDRs to tunnel endpoints (GENEVE, IPIP, VXLAN, or WireGuard).
+
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--tunnel-dataplane` | string | `ebpf` | Tunnel dataplane mode. `ebpf` uses BPF LPM tries on the `unbounded0` interface for per-destination tunnel redirection. `netlink` uses traditional per-peer interfaces and kernel routes. |
-| `--tunnel-dataplane-map-size` | int | `16384` | Maximum number of entries in each BPF LPM trie map. Only used when `--tunnel-dataplane=ebpf`. |
-
-When `--tunnel-dataplane=ebpf`, the node agent attaches BPF programs to the `unbounded0` interface and populates LPM trie maps with destination CIDR-to-tunnel mappings. This replaces per-peer tunnel interfaces with a single interface and BPF-driven forwarding, reducing netlink state and improving convergence at scale.
+| `--tunnel-dataplane-map-size` | int | `16384` | Maximum number of entries in each BPF LPM trie map. |
 
 Each LPM trie entry supports up to 4 nexthops per CIDR prefix with **ECMP via HRW (Highest Random Weight / rendezvous) hashing**. The BPF program selects a nexthop deterministically per 5-tuple flow so that only flows affected by a nexthop change are rehashed. Each nexthop carries a `TUNNEL_F_HEALTHY` flag maintained by the health check system; unhealthy nexthops are skipped during forwarding, while healthcheck probes (UDP 9997) are always forwarded to enable recovery detection.
-
-When `--tunnel-dataplane=netlink`, the node agent creates individual tunnel interfaces for each peer and programs kernel routes, matching the legacy behavior.
 
 ### Tunnel IP Family
 
@@ -404,7 +400,6 @@ args:
   - --vxlan-src-port-high=47922
 
   # Tunnel dataplane
-  - --tunnel-dataplane=ebpf
   - --tunnel-dataplane-map-size=16384
   - --tunnel-ip-family=IPv4
 

@@ -132,14 +132,16 @@ tc filter show dev unbounded0 egress
 **eBPF mode -- dump BPF maps:**
 ```bash
 bpftool map list | grep unbounded
-bpftool map dump name unbounded_endpo  # kernel truncates name to 15 chars
+bpftool map dump name unb_endpts
 ```
 
 **Using the `unroute` diagnostic tool** (included in node agent image):
 ```bash
 kubectl -n kube-system exec <node-agent-pod> -- unroute           # dump all
 kubectl -n kube-system exec <node-agent-pod> -- unroute <ip>      # lookup
-kubectl -n kube-system exec <node-agent-pod> -- unroute --local   # local CIDRs
+kubectl -n kube-system exec <node-agent-pod> -- unroute -4        # v4 only
+kubectl -n kube-system exec <node-agent-pod> -- unroute -6        # v6 only
+kubectl -n kube-system exec <node-agent-pod> -- unroute --raw     # raw key/value hex
 ```
 
 **Via kubectl plugin:**

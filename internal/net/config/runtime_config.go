@@ -66,8 +66,8 @@ type NodeRuntimeConfig struct {
 	WireGuardDir         string `yaml:"wireGuardDir"`
 	WireGuardPort        *int   `yaml:"wireGuardPort"`
 	// Deprecated: EnablePolicyRouting enables connmark/fwmark/ip-rule policy
-	// routing on gateway interfaces. Replaced by per-interface FORWARD ACCEPT
-	// rules. Defaults to false; retained for backward compatibility.
+	// routing on gateway interfaces. Replaced by the UNBOUNDED-FORWARD chain.
+	// Defaults to false; retained for backward compatibility.
 	EnablePolicyRouting                  *bool  `yaml:"enablePolicyRouting"`
 	MTU                                  *int   `yaml:"mtu"`
 	HealthPort                           *int   `yaml:"healthPort"`
@@ -96,7 +96,6 @@ type NodeRuntimeConfig struct {
 	KubeProxyHealthInterval              string `yaml:"kubeProxyHealthInterval"`
 	RouteTableID                         *int   `yaml:"routeTableId"`
 	NetlinkResyncPeriod                  string `yaml:"netlinkResyncPeriod"`
-	TunnelDataplane                      string `yaml:"tunnelDataplane"`
 	TunnelDataplaneMapSize               *int   `yaml:"tunnelDataplaneMapSize"`
 	TunnelIPFamily                       string `yaml:"tunnelIPFamily"`
 	VXLANSrcPortLow                      *int   `yaml:"vxlanSrcPortLow"`
