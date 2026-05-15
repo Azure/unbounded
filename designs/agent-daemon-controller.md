@@ -1,7 +1,7 @@
 # Agent Daemon Controller
 
 The agent daemon controller package provides shared building blocks for
-host-local daemon controllers. It is intended for daemons that reconcile one
+node-local daemon controllers. It is intended for daemons that reconcile one
 local worker node and mutate local runtime state such as systemd units,
 systemd-nspawn machines, files, and daemon binaries.
 
@@ -11,17 +11,19 @@ Unbounded agent daemon in `cmd/agent/internal/daemon`.
 ## Goals
 
 - Share controller-runtime setup across Unbounded and external daemons.
-- Serialize host-local daemon work so reset, restart, upgrade, and repave flows
+- Serialize node-local daemon work so reset, restart, upgrade, and repave flows
   cannot interleave.
 - Keep Machina `MachineOperation` status handling reusable for Unbounded.
-- Keep operation handlers product-owned so host-specific work stays outside the
+- Keep operation handlers product-owned so node-specific work stays outside the
   shared package.
 - Support daemons that only need local repave-style reconcile triggers.
 
 ## Non-goals
 
 - Provide a generic cloud or machine operations abstraction. The daemon package
-  only covers host-local daemon flows.
+  only covers node-local daemon flows.
+- Model host power-management operations such as hard reboot, power off, or
+  out-of-band control.
 - Resolve product-specific desired state. Repave reconcilers still own their
   product-specific goal resolution.
 - Hide Machina API details from the Machina operation reconciler. The reusable
@@ -132,11 +134,11 @@ flowchart TD
 
 The shared controller sets `MaxConcurrentReconciles` to `1`.
 
-Host-local daemon operations mutate shared node state, including systemd units,
+Node-local daemon operations mutate shared node state, including systemd units,
 nspawn machines, local files, and daemon binaries. Running them concurrently can
-leave the host in an undefined state. For example, an agent upgrade restart must
-not interleave with an agent reset, and a repave must not race with a node
-restart.
+leave the local node runtime in an undefined state. For example, an agent
+upgrade restart must not interleave with an agent reset, and a repave must not
+race with a node restart.
 
 The shared controller therefore serializes all request kinds for one daemon
 process.
@@ -179,7 +181,7 @@ func NewMachinaMachineOperationReconciler(
 ) (*MachinaMachineOperationReconciler, error)
 ```
 
-`MachineOperationHandlers` maps Machina `OperationKind` values to host-local
+`MachineOperationHandlers` maps Machina `OperationKind` values to node-local
 handlers:
 
 ```go
@@ -271,7 +273,7 @@ declared it does not handle machine operations.
 
 The Unbounded agent daemon composes the shared package as follows:
 
-- Creates a `machineOperationTarget` with Unbounded host-local operation
+- Creates a `machineOperationTarget` with Unbounded node-local operation
   handlers.
 - Creates `MachinaMachineOperationReconciler` with handlers for:
   - `OperationNodeReboot`
