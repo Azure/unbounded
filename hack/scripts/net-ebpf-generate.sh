@@ -93,9 +93,15 @@ echo "==> dumping full BTF"
 # We copy the source to $tmp and compile from there so that #include "vmlinux.h"
 # picks up the full BTF dump in $tmp, not the (possibly stale, minified) header
 # committed under bpf/.
+#
+# -Wno-missing-declarations: the full BTF→C dump from bpftool emits bare
+# forward declarations like "struct ns_tree;" inside parent struct bodies for
+# anonymous nested types that BTF cannot express otherwise. They are no-op
+# declarations and clang warns about them; the warnings are dumper artifacts,
+# not actual problems in the kernel headers or our source.
 echo "==> probe-compiling bpf/unbounded_encap.c"
 cp "$bpf_src" "$tmp/unbounded_encap.c"
-"$CLANG" -O2 -g -Wall \
+"$CLANG" -O2 -g -Wall -Wno-missing-declarations \
 	-target bpf \
 	-I"$tmp" \
 	-c "$tmp/unbounded_encap.c" \
