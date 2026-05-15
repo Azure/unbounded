@@ -2091,9 +2091,22 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 	if state.notrackManager != nil {
 		if isGatewayNode {
 			// Build the cluster supernet list from all available sources.
+			// Gateway nodes carry transit traffic for every site they peer
+			// with, so the notrack set must cover every site's pod-CIDR
+			// pool -- not just the gateway's own site -- otherwise return
+			// packets from a remote site can land on a different gateway
+			// instance than the forward path took, conntrack marks them
+			// INVALID, and KUBE-FORWARD drops them.
 			supernetSet := make(map[string]struct{})
-			for _, cidr := range sitePodCIDRPools {
-				supernetSet[cidr] = struct{}{}
+			for _, site := range siteMap {
+				for _, assignment := range site.Spec.PodCidrAssignments {
+					for _, cidr := range assignment.CidrBlocks {
+						supernetSet[cidr] = struct{}{}
+					}
+				}
+				for _, cidr := range site.Spec.NodeCidrs {
+					supernetSet[cidr] = struct{}{}
+				}
 			}
 
 			for _, cidr := range sitePodCIDRs {
