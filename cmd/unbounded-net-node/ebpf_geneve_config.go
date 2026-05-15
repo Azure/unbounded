@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -230,7 +229,14 @@ func configureEBPFTunnelPeers(
 		// SyncAddresses, SetLinkAddress, EnsureMTU). Some netlink operations
 		// can cause the kernel to reset interface sysctls.
 		disableRPFilter(ifName)
-		ensureTunnelForwardAccept(ifName)
+
+		if state.forwardManager != nil {
+			state.forwardManager.EnsureInterface(ifName)
+		}
+
+		if state.isGatewayNode && state.notrackManager != nil {
+			state.notrackManager.EnsureInterface(ifName)
+		}
 
 		// Get tunnel interface index for BPF map entries (redirect target).
 		geneveIface, err := net.InterfaceByName(ifName)
@@ -249,7 +255,13 @@ func configureEBPFTunnelPeers(
 				klog.V(2).Infof("eBPF: failed to remove %s: %v", ifName, err)
 			}
 
-			removeTunnelForwardAccept(ifName)
+			if state.forwardManager != nil {
+				state.forwardManager.RemoveInterface(ifName)
+			}
+
+			if state.notrackManager != nil {
+				state.notrackManager.RemoveInterface(ifName)
+			}
 		}
 	}
 
@@ -283,7 +295,15 @@ func configureEBPFTunnelPeers(
 			}
 
 			disableRPFilter(ipipIfName)
-			ensureTunnelForwardAccept(ipipIfName)
+
+			if state.forwardManager != nil {
+				state.forwardManager.EnsureInterface(ipipIfName)
+			}
+
+			if state.isGatewayNode && state.notrackManager != nil {
+				state.notrackManager.EnsureInterface(ipipIfName)
+			}
+
 			// IPIP is layer 3 and does not support MAC addresses; skip
 			// SetLinkAddress (the kernel returns ENOTSUP).
 		}
@@ -297,7 +317,13 @@ func configureEBPFTunnelPeers(
 				klog.V(2).Infof("eBPF: failed to remove %s: %v", ipipIfName, err)
 			}
 
-			removeTunnelForwardAccept(ipipIfName)
+			if state.forwardManager != nil {
+				state.forwardManager.RemoveInterface(ipipIfName)
+			}
+
+			if state.notrackManager != nil {
+				state.notrackManager.RemoveInterface(ipipIfName)
+			}
 		}
 	}
 
@@ -469,7 +495,14 @@ func configureEBPFVXLANPeers(
 	// SyncAddresses, SetLinkAddress, EnsureMTU). Some netlink operations
 	// can cause the kernel to reset interface sysctls.
 	disableRPFilter(ifName)
-	ensureTunnelForwardAccept(ifName)
+
+	if state.forwardManager != nil {
+		state.forwardManager.EnsureInterface(ifName)
+	}
+
+	if state.isGatewayNode && state.notrackManager != nil {
+		state.notrackManager.EnsureInterface(ifName)
+	}
 
 	iface, err := net.InterfaceByName(ifName)
 	if err != nil {
@@ -842,48 +875,9 @@ func disableRPFilter(ifName string) {
 	}
 }
 
-// ensureTunnelForwardAccept adds an iptables FORWARD chain rule that accepts
-// forwarded traffic arriving on the specified tunnel interface. This must be
-// before KUBE-FORWARD (which drops ctstate INVALID packets) so that transit
-// overlay traffic through gateway nodes is not dropped.
-func ensureTunnelForwardAccept(ifName string) {
-	check := exec.Command("nsenter", "-t", "1", "-n", "--",
-		"iptables", "-C", "FORWARD",
-		"-i", ifName, "-j", "ACCEPT",
-		"-m", "comment", "--comment", "unbounded-net: accept tunnel traffic")
-	if check.Run() == nil {
-		return
-	}
-
-	out, err := exec.Command("nsenter", "-t", "1", "-n", "--",
-		"iptables", "-I", "FORWARD", "1",
-		"-i", ifName, "-j", "ACCEPT",
-		"-m", "comment", "--comment", "unbounded-net: accept tunnel traffic").CombinedOutput()
-	if err != nil {
-		klog.Warningf("failed to add FORWARD accept rule for %s: %v (%s)", ifName, err, strings.TrimSpace(string(out)))
-	} else {
-		klog.V(2).Infof("added FORWARD accept rule for %s", ifName)
-	}
-}
-
-// removeTunnelForwardAccept removes the FORWARD chain ACCEPT rule for
-// the specified tunnel interface. Called when an interface is deleted.
-func removeTunnelForwardAccept(ifName string) {
-	out, err := exec.Command("nsenter", "-t", "1", "-n", "--",
-		"iptables", "-D", "FORWARD",
-		"-i", ifName, "-j", "ACCEPT",
-		"-m", "comment", "--comment", "unbounded-net: accept tunnel traffic").CombinedOutput()
-	if err != nil {
-		// Rule may not exist if the interface was never set up -- ignore.
-		klog.V(4).Infof("removeTunnelForwardAccept %s: %v (%s)", ifName, err, strings.TrimSpace(string(out)))
-	} else {
-		klog.V(2).Infof("removed FORWARD accept rule for %s", ifName)
-	}
-}
-
 // using. This avoids leaving stale geneve0, vxlan0, or ipip0 interfaces
 // when the tunnel protocol has been changed or when all peers use WireGuard.
-func cleanupUnusedTunnelDevices(meshPeers []meshPeerInfo, gatewayPeers, wgGatewayPeers []gatewayPeerInfo) {
+func cleanupUnusedTunnelDevices(meshPeers []meshPeerInfo, gatewayPeers, wgGatewayPeers []gatewayPeerInfo, fwdMgr *unboundednetnetlink.ForwardManager, notrackMgr *unboundednetnetlink.NotrackManager) {
 	usesGeneve := false
 	usesVXLAN := false
 	usesIPIP := false
@@ -944,7 +938,13 @@ func cleanupUnusedTunnelDevices(meshPeers []meshPeerInfo, gatewayPeers, wgGatewa
 				klog.V(2).Infof("eBPF: failed to remove unused device %s: %v", d.name, err)
 			}
 
-			removeTunnelForwardAccept(d.name)
+			if fwdMgr != nil {
+				fwdMgr.RemoveInterface(d.name)
+			}
+
+			if notrackMgr != nil {
+				notrackMgr.RemoveInterface(d.name)
+			}
 		}
 	}
 }
@@ -953,7 +953,7 @@ func cleanupUnusedTunnelDevices(meshPeers []meshPeerInfo, gatewayPeers, wgGatewa
 // are still in use. This must be called after cleanupUnusedTunnelDevices
 // because deleting interfaces can cause the kernel to reset rp_filter on
 // remaining interfaces.
-func reapplyRPFilterOnActiveTunnels(meshPeers []meshPeerInfo, gatewayPeers, wgGatewayPeers []gatewayPeerInfo) {
+func reapplyRPFilterOnActiveTunnels(meshPeers []meshPeerInfo, gatewayPeers, wgGatewayPeers []gatewayPeerInfo, fwdMgr *unboundednetnetlink.ForwardManager, isGateway bool, notrackMgr *unboundednetnetlink.NotrackManager) {
 	usesGeneve := false
 	usesVXLAN := false
 	usesIPIP := false
@@ -1002,7 +1002,14 @@ func reapplyRPFilterOnActiveTunnels(meshPeers []meshPeerInfo, gatewayPeers, wgGa
 	} {
 		if d.used {
 			disableRPFilter(d.name)
-			ensureTunnelForwardAccept(d.name)
+
+			if fwdMgr != nil {
+				fwdMgr.EnsureInterface(d.name)
+			}
+
+			if isGateway && notrackMgr != nil {
+				notrackMgr.EnsureInterface(d.name)
+			}
 		}
 	}
 }

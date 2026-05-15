@@ -270,7 +270,7 @@ then annotates the node with the public key.`,
 	// WireGuard configuration flags
 	flags.StringVar(&cfg.WireGuardDir, "wireguard-dir", "/etc/wireguard", "Directory to store WireGuard keys")
 	flags.IntVar(&cfg.WireGuardPort, "wireguard-port", 51820, "WireGuard listen port")
-	flags.BoolVar(&cfg.EnablePolicyRouting, "enable-policy-routing", false, "Enable policy-based routing on gateway interfaces (deprecated, per-interface FORWARD rules replace PBR)")
+	flags.BoolVar(&cfg.EnablePolicyRouting, "enable-policy-routing", false, "Enable policy-based routing on gateway interfaces (deprecated, UNBOUNDED-FORWARD chain rules replace PBR)")
 
 	// GENEVE configuration flags
 	flags.IntVar(&cfg.GenevePort, "geneve-port", 6081, "GENEVE UDP destination port")
