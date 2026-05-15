@@ -51,7 +51,7 @@ func TestAgentUpgradeSignalOperator_RecordFailure(t *testing.T) {
 
 	data, err := os.ReadFile(signalPath)
 	require.NoError(t, err)
-	assert.JSONEq(t, `{"operationName":"op-1","failureMessage":"rolled back"}`, string(data))
+	assert.JSONEq(t, `{"operationName":"op-1","observedMachineGeneration":7,"failureMessage":"rolled back"}`, string(data))
 }
 
 func TestAgentUpgradeSignalOperator_ReadRejectsNonJSON(t *testing.T) {
