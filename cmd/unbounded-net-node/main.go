@@ -114,7 +114,6 @@ type config struct {
 	HealthFlapMaxBackoff          time.Duration // Maximum backoff duration for health check flap dampening
 	KubeProxyHealthInterval       time.Duration // Interval between kube-proxy health checks (0 to disable)
 	NetlinkResyncPeriod           time.Duration // Interval between full netlink cache resyncs
-	TunnelDataplane               string        // Tunnel dataplane mode: "ebpf" (default) or "netlink"
 	TunnelDataplaneMapSize        int           // Maximum LPM trie entries for eBPF tunnel map (default 16384)
 	TunnelIPFamily                string        // Tunnel underlay IP family: "IPv4" (default) or "IPv6"
 }
@@ -219,7 +218,6 @@ func main() {
 		PreferredPrivateEncap:         "GENEVE",
 		PreferredPublicEncap:          "WireGuard",
 		NetlinkResyncPeriod:           300 * time.Second,
-		TunnelDataplane:               "ebpf",
 		TunnelDataplaneMapSize:        16384,
 		TunnelIPFamily:                "IPv4",
 	}
@@ -308,7 +306,6 @@ then annotates the node with the public key.`,
 	flags.DurationVar(&cfg.HealthFlapMaxBackoff, "health-flap-max-backoff", 120*time.Second, "Maximum backoff duration for health check flap dampening")
 	flags.DurationVar(&cfg.KubeProxyHealthInterval, "kube-proxy-health-interval", 30*time.Second, "Interval between kube-proxy health checks (0 to disable)")
 	flags.DurationVar(&cfg.NetlinkResyncPeriod, "netlink-resync-period", 300*time.Second, "Interval between full netlink cache resyncs")
-	flags.StringVar(&cfg.TunnelDataplane, "tunnel-dataplane", "ebpf", "Tunnel dataplane mode: ebpf (default) or netlink")
 	flags.IntVar(&cfg.TunnelDataplaneMapSize, "tunnel-dataplane-map-size", 16384, "Maximum LPM trie entries for eBPF tunnel map")
 	flags.StringVar(&cfg.TunnelIPFamily, "tunnel-ip-family", "IPv4", "Tunnel underlay IP family: IPv4 (default) or IPv6")
 
@@ -529,10 +526,6 @@ func applyNodeRuntimeConfig(cmd *cobra.Command, cfg *config) error {
 		}
 	}
 
-	if !flags.Changed("tunnel-dataplane") && nodeCfg.TunnelDataplane != "" {
-		cfg.TunnelDataplane = nodeCfg.TunnelDataplane
-	}
-
 	if !flags.Changed("tunnel-dataplane-map-size") && nodeCfg.TunnelDataplaneMapSize != nil {
 		cfg.TunnelDataplaneMapSize = *nodeCfg.TunnelDataplaneMapSize
 	}
@@ -547,18 +540,6 @@ func applyNodeRuntimeConfig(cmd *cobra.Command, cfg *config) error {
 
 	if !flags.Changed("vxlan-src-port-high") && nodeCfg.VXLANSrcPortHigh != nil {
 		cfg.VXLANSrcPortHigh = *nodeCfg.VXLANSrcPortHigh
-	}
-
-	// Validate and default tunnelDataplane
-	if cfg.TunnelDataplane == "" {
-		cfg.TunnelDataplane = "ebpf"
-	}
-
-	switch cfg.TunnelDataplane {
-	case "ebpf", "netlink":
-		// valid
-	default:
-		return fmt.Errorf("invalid tunnel-dataplane %q: must be 'ebpf' or 'netlink'", cfg.TunnelDataplane)
 	}
 
 	// Validate and default tunnelIPFamily

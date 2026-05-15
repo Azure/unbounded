@@ -45,8 +45,9 @@ type NotrackManager struct {
 	ctSupported6 bool
 
 	// Track current CIDR sets to avoid unnecessary rebuilds.
-	currentPodCIDRs  string
-	currentSupernets string
+	currentPodCIDRs    string
+	currentReturnCIDRs string
+	currentSupernets   string
 }
 
 // NewNotrackManager creates a NotrackManager with IPv4/IPv6 handles.
@@ -173,50 +174,58 @@ func (m *NotrackManager) removeInterfaceForFamily(ipt *iptables.IPTables, family
 	}
 }
 
-// ReconcileCIDRs rebuilds the UNBOUNDED-NOTRACK chain contents if the
-// podCIDRs or supernets have changed since the last call. It installs:
+// ReconcileCIDRs rebuilds the UNBOUNDED-NOTRACK chain contents if any of
+// podCIDRs, returnCIDRs, or supernets have changed since the last call.
+// It installs (in order):
 //   - addrtype LOCAL RETURN (always first)
-//   - per-podCIDR RETURN rules
+//   - per-podCIDR RETURN rules (this node's own pod CIDRs)
+//   - per-returnCIDR RETURN rules (e.g. the gateway's own site NodeCidr,
+//     where transit packets must remain conntrack-tracked so MASQUERADE
+//     can SNAT overlay sources to the underlay-facing eth0 address)
 //   - per-supernet CT --notrack rules
 //
 // CIDRs are automatically sorted into IPv4 and IPv6 buckets.
-func (m *NotrackManager) ReconcileCIDRs(podCIDRs, supernets []string) error {
+func (m *NotrackManager) ReconcileCIDRs(podCIDRs, returnCIDRs, supernets []string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	// Deduplicate and sort for stable comparison.
 	podCIDRs = dedupeAndSort(podCIDRs)
+	returnCIDRs = dedupeAndSort(returnCIDRs)
 	supernets = dedupeAndSort(supernets)
 
 	podKey := strings.Join(podCIDRs, ",")
+	returnKey := strings.Join(returnCIDRs, ",")
 	superKey := strings.Join(supernets, ",")
 
-	if podKey == m.currentPodCIDRs && superKey == m.currentSupernets {
+	if podKey == m.currentPodCIDRs && returnKey == m.currentReturnCIDRs && superKey == m.currentSupernets {
 		return nil
 	}
 
-	klog.V(2).Infof("NotrackManager: CIDRs changed, rebuilding chain (podCIDRs=%d, supernets=%d)", len(podCIDRs), len(supernets))
+	klog.V(2).Infof("NotrackManager: CIDRs changed, rebuilding chain (podCIDRs=%d, returnCIDRs=%d, supernets=%d)", len(podCIDRs), len(returnCIDRs), len(supernets))
 
 	v4Pods, v6Pods := splitByFamily(podCIDRs)
+	v4Returns, v6Returns := splitByFamily(returnCIDRs)
 	v4Supers, v6Supers := splitByFamily(supernets)
 
-	if err := m.reconcileFamily(m.ipt4, "IPv4", m.ctSupported4, v4Pods, v4Supers); err != nil {
+	if err := m.reconcileFamily(m.ipt4, "IPv4", m.ctSupported4, v4Pods, v4Returns, v4Supers); err != nil {
 		return fmt.Errorf("failed to reconcile IPv4 notrack rules: %w", err)
 	}
 
 	if m.ipt6 != nil {
-		if err := m.reconcileFamily(m.ipt6, "IPv6", m.ctSupported6, v6Pods, v6Supers); err != nil {
+		if err := m.reconcileFamily(m.ipt6, "IPv6", m.ctSupported6, v6Pods, v6Returns, v6Supers); err != nil {
 			klog.Warningf("NotrackManager: failed to reconcile IPv6 notrack rules: %v", err)
 		}
 	}
 
 	m.currentPodCIDRs = podKey
+	m.currentReturnCIDRs = returnKey
 	m.currentSupernets = superKey
 
 	return nil
 }
 
-func (m *NotrackManager) reconcileFamily(ipt *iptables.IPTables, family string, ctSupported bool, podCIDRs, supernets []string) error {
+func (m *NotrackManager) reconcileFamily(ipt *iptables.IPTables, family string, ctSupported bool, podCIDRs, returnCIDRs, supernets []string) error {
 	if !ctSupported {
 		return nil
 	}
@@ -250,6 +259,19 @@ func (m *NotrackManager) reconcileFamily(ipt *iptables.IPTables, family string, 
 		}
 	}
 
+	// RETURN for each caller-supplied returnCIDR. These are typically the
+	// gateway's own site NodeCidr: packets destined here exit via eth0
+	// after MASQUERADE and so must keep conntrack tracking enabled.
+	for _, cidr := range returnCIDRs {
+		rule := []string{
+			"-d", cidr,
+			"-m", "comment", "--comment", notrackComment, "-j", "RETURN",
+		}
+		if err := ipt.Append("raw", notrackChain, rule...); err != nil {
+			return fmt.Errorf("failed to add %s returnCIDR RETURN for %s: %w", family, cidr, err)
+		}
+	}
+
 	// CT --notrack for each supernet.
 	for _, cidr := range supernets {
 		rule := []string{
@@ -261,8 +283,8 @@ func (m *NotrackManager) reconcileFamily(ipt *iptables.IPTables, family string, 
 		}
 	}
 
-	klog.V(2).Infof("NotrackManager: rebuilt %s chain (%d podCIDR RETURNs, %d supernet NOTRACKs)",
-		family, len(podCIDRs), len(supernets))
+	klog.V(2).Infof("NotrackManager: rebuilt %s chain (%d podCIDR RETURNs, %d returnCIDR RETURNs, %d supernet NOTRACKs)",
+		family, len(podCIDRs), len(returnCIDRs), len(supernets))
 
 	return nil
 }
@@ -298,6 +320,7 @@ func (m *NotrackManager) Cleanup() {
 	}
 
 	m.currentPodCIDRs = ""
+	m.currentReturnCIDRs = ""
 	m.currentSupernets = ""
 
 	klog.V(2).Info("NotrackManager: cleaned up notrack chain and rules")
