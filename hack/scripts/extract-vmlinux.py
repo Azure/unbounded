@@ -8,7 +8,6 @@
 # zstd), tries each candidate offset until one decompresses to something
 # starting with the ELF magic.
 
-import os
 import shutil
 import subprocess
 import sys
