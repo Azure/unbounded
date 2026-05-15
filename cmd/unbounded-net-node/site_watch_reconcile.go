@@ -1998,7 +1998,28 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 		// One unbounded0 supernet route per overlay CIDR, covering every peer
 		// (WG, GENEVE, IPIP, VXLAN). The BPF program on unbounded0 performs
 		// the per-destination redirect.
-		tunnelRoutes = append(tunnelRoutes, buildEBPFSupernetRoutes(cfg, state, peers, gatewayPeers)...)
+		//
+		// On gateway nodes, also pull in every remote site's pod-CIDR pool
+		// and NodeCidr so packets to remote-site underlay IPs (e.g. kubelet
+		// probes to a peered site's gateway node) are funnelled through
+		// unbounded0 and the BPF program's per-gateway /32 entries get a
+		// chance to pin them to the correct WG tunnel. The gateway's own
+		// site NodeCidr is excluded because that traffic must keep using
+		// the host's default route.
+		var extraSupernets []string
+		if isGatewayNode {
+			for siteName, site := range siteMap {
+				for _, assignment := range site.Spec.PodCidrAssignments {
+					extraSupernets = append(extraSupernets, assignment.CidrBlocks...)
+				}
+				if siteName == mySiteName {
+					continue
+				}
+				extraSupernets = append(extraSupernets, site.Spec.NodeCidrs...)
+			}
+		}
+
+		tunnelRoutes = append(tunnelRoutes, buildEBPFSupernetRoutes(cfg, state, peers, gatewayPeers, extraSupernets)...)
 	} else {
 		wgMeshPeers = peers
 		wgGatewayPeers = gatewayPeers
@@ -2059,7 +2080,17 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 				supernets = append(supernets, cidr)
 			}
 
-			if err := state.notrackManager.ReconcileCIDRs(state.nodePodCIDRs, supernets); err != nil {
+			// Local-site NodeCidrs must remain conntrack-tracked even on
+			// gateway nodes: transit packets bound for the gateway's own
+			// site underlay (e.g. a service ClusterIP DNAT'd by a remote
+			// node to an in-site host-network pod) leave eth0 and need
+			// MASQUERADE in nat/POSTROUTING, which requires conntrack.
+			var returnCIDRs []string
+			if mySite, ok := siteMap[mySiteName]; ok {
+				returnCIDRs = append(returnCIDRs, mySite.Spec.NodeCidrs...)
+			}
+
+			if err := state.notrackManager.ReconcileCIDRs(state.nodePodCIDRs, returnCIDRs, supernets); err != nil {
 				klog.Warningf("Failed to reconcile notrack CIDRs: %v", err)
 			}
 		} else {
