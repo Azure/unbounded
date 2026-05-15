@@ -214,6 +214,15 @@ jobs:
       - name: Install tools
         run: make install-tools
 
+      - name: Install clang/llvm for bpf2go
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang llvm libbpf-dev
+
+      - name: Verify BPF CO-RE pin artifacts
+        run: make net-ebpf-verify
+
       - name: Regenerate
         run: make generate
 
@@ -307,7 +316,7 @@ jobs:
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
         with:
           context: .
-          file: images/net-controller/Dockerfile
+          file: images/net/Containerfile
           target: controller
           platforms: ${{ matrix.platform }}
           build-args: |
@@ -324,7 +333,7 @@ jobs:
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
         with:
           context: .
-          file: images/net-node/Dockerfile
+          file: images/net/Containerfile
           target: node
           platforms: ${{ matrix.platform }}
           build-args: |

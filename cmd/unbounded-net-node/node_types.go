@@ -109,22 +109,13 @@ type wireGuardState struct {
 	// Notrack manager for skipping conntrack on transit traffic (gateway nodes only)
 	notrackManager *unboundednetnetlink.NotrackManager
 
-	// GENEVE tunnel managers -- per-peer interfaces with fixed Remote IP
-	geneveInterfaces map[string]*unboundednetnetlink.LinkManager // per-peer GENEVE interface managers keyed by iface name
-
-	// eBPF tunnel maps -- when tunnelDataplane=ebpf, manages the LPM tries
-	// on flow-based tunnel interfaces. Keyed by interface name (e.g. geneve0, vxlan0).
+	// tunnelMaps holds eBPF LPM tries keyed by interface name (geneve0, vxlan0, ...).
 	tunnelMaps map[string]*ebpfpkg.TunnelMap
 
 	// pendingBPFEntries accumulates BPF map entries across GENEVE, VXLAN,
 	// and WG config phases. A single Reconcile is done after all entries
 	// are collected to avoid protocol paths overwriting each other.
 	pendingBPFEntries map[string]ebpfpkg.TunnelEndpoint
-
-	// allGatewayPeersForSupernets holds the full gateway peer list (all
-	// protocols) so collectSupernets can create supernet routes for
-	// cross-site CIDRs regardless of the tunnel protocol used.
-	allGatewayPeersForSupernets []gatewayPeerInfo
 
 	// Prometheus collector for WireGuard per-peer stats (rx/tx bytes, last handshake)
 	wgCollector *unboundednetnetlink.WireGuardCollector

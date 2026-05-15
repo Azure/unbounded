@@ -459,62 +459,6 @@ func TestEnsureNexthop_NewAndUpdate(t *testing.T) {
 	}
 }
 
-func TestActiveNexthops_AllHealthy(t *testing.T) {
-	m := NewUnifiedRouteManager("test", 0)
-	m.peerHealthy["peer-a"] = true
-	m.peerHealthy["peer-b"] = true
-
-	dr := DesiredRoute{
-		Nexthops: []DesiredNexthop{
-			{PeerID: "peer-a", LinkIndex: 1},
-			{PeerID: "peer-b", LinkIndex: 2},
-		},
-	}
-
-	active := m.activeNexthops(dr)
-	if len(active) != 2 {
-		t.Errorf("expected 2 active nexthops, got %d", len(active))
-	}
-}
-
-func TestActiveNexthops_OneUnhealthy(t *testing.T) {
-	m := NewUnifiedRouteManager("test", 0)
-	m.peerHealthy["peer-a"] = true
-	m.peerHealthy["peer-b"] = false
-
-	dr := DesiredRoute{
-		Nexthops: []DesiredNexthop{
-			{PeerID: "peer-a", LinkIndex: 1},
-			{PeerID: "peer-b", LinkIndex: 2},
-		},
-	}
-
-	active := m.activeNexthops(dr)
-	if len(active) != 1 {
-		t.Fatalf("expected 1 active nexthop, got %d", len(active))
-	}
-
-	if active[0].PeerID != "peer-a" {
-		t.Errorf("expected peer-a, got %s", active[0].PeerID)
-	}
-}
-
-func TestActiveNexthops_UntrackedDefaultsHealthy(t *testing.T) {
-	m := NewUnifiedRouteManager("test", 0)
-	// Do NOT set any peer health state
-
-	dr := DesiredRoute{
-		Nexthops: []DesiredNexthop{
-			{PeerID: "peer-new", LinkIndex: 1},
-		},
-	}
-
-	active := m.activeNexthops(dr)
-	if len(active) != 1 {
-		t.Errorf("untracked peer should default to healthy, got %d active", len(active))
-	}
-}
-
 func TestRouteNeedsUpdate_NoChange(t *testing.T) {
 	m := NewUnifiedRouteManager("test", 0)
 
@@ -906,7 +850,6 @@ func TestSyncRoutes_DedicatedTable(t *testing.T) {
 	// Pre-populate a nexthop so the manager can build a route.
 	nh := DesiredNexthop{PeerID: "peer-a", LinkIndex: 1}
 	m.ensureNexthop(nh)
-	m.peerHealthy["peer-a"] = true
 
 	_, prefix, _ := net.ParseCIDR("10.99.0.0/24")
 	desired := []DesiredRoute{
@@ -951,7 +894,6 @@ func TestSyncRoutes_ExplicitTableNotOverridden(t *testing.T) {
 
 	nh := DesiredNexthop{PeerID: "peer-b", LinkIndex: 2, Gateway: net.ParseIP("10.0.0.1")}
 	m.ensureNexthop(nh)
-	m.peerHealthy["peer-b"] = true
 
 	_, prefix, _ := net.ParseCIDR("10.88.0.0/16")
 	desired := []DesiredRoute{
