@@ -5,12 +5,14 @@ package webhook
 
 import (
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"sort"
 	"time"
 
 	admissionv1 "k8s.io/api/admission/v1"
@@ -164,13 +166,27 @@ func (s *Server) registerAggregatedDiscoveryHandlers() {
 // isTrustedAggregatedRequest validates that aggregated API requests arrive with
 // a verified client certificate signed by the cluster trust roots.
 func (s *Server) isTrustedAggregatedRequest(r *http.Request) bool {
-	if r == nil || r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
-		klog.V(2).Info("Rejecting aggregated request without client certificate")
+	if r == nil {
+		klog.V(2).Info("Rejecting aggregated request: nil request")
+		return false
+	}
+
+	reqCtx := requestContextForLog(r)
+
+	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
+		klog.V(2).Infof("Rejecting aggregated request without client certificate: %s; tls=%t handshakeComplete=%t serverName=%q negotiatedProtocol=%q",
+			reqCtx,
+			r.TLS != nil,
+			r.TLS != nil && r.TLS.HandshakeComplete,
+			tlsServerName(r.TLS),
+			tlsNegotiatedProto(r.TLS),
+		)
+
 		return false
 	}
 
 	if s.aggregatedClientCAs == nil {
-		klog.Warning("Rejecting aggregated request because client CA pool is not configured")
+		klog.Warningf("Rejecting aggregated request because client CA pool is not configured: %s", reqCtx)
 		return false
 	}
 
@@ -186,18 +202,81 @@ func (s *Server) isTrustedAggregatedRequest(r *http.Request) bool {
 		Intermediates: intermediates,
 		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 	}); err != nil {
-		klog.V(2).Infof("Rejecting aggregated request with untrusted client certificate: %v", err)
+		klog.V(2).Infof("Rejecting aggregated request with untrusted client certificate: %s; %s; verifyErr=%v",
+			reqCtx, certDescription(leaf), err)
+
 		return false
 	}
 
 	if len(s.aggregatedClientAllowedCNs) > 0 {
 		if _, ok := s.aggregatedClientAllowedCNs[leaf.Subject.CommonName]; !ok {
-			klog.V(2).Infof("Rejecting aggregated request with unexpected client certificate CN %q", leaf.Subject.CommonName)
+			klog.V(2).Infof("Rejecting aggregated request with unexpected client certificate CN: %s; %s; allowedCNs=%v",
+				reqCtx, certDescription(leaf), allowedCNsForLog(s.aggregatedClientAllowedCNs))
+
 			return false
 		}
 	}
 
 	return true
+}
+
+// requestContextForLog returns a single-line summary of an HTTP request
+// suitable for inclusion in rejection log lines.
+func requestContextForLog(r *http.Request) string {
+	path := ""
+	if r.URL != nil {
+		path = r.URL.Path
+	}
+
+	return fmt.Sprintf("method=%s path=%q host=%q remoteAddr=%s userAgent=%q",
+		r.Method, path, r.Host, r.RemoteAddr, r.UserAgent())
+}
+
+// certDescription returns a single-line summary of an X.509 certificate.
+func certDescription(c *x509.Certificate) string {
+	if c == nil {
+		return "cert=<nil>"
+	}
+
+	return fmt.Sprintf("certSubject=%q certIssuer=%q certSerial=%s certNotBefore=%s certNotAfter=%s certDNSNames=%v",
+		c.Subject.String(),
+		c.Issuer.String(),
+		c.SerialNumber.String(),
+		c.NotBefore.UTC().Format(time.RFC3339),
+		c.NotAfter.UTC().Format(time.RFC3339),
+		c.DNSNames,
+	)
+}
+
+// tlsServerName returns the SNI server name from a TLS connection state, or
+// the empty string when none was provided.
+func tlsServerName(state *tls.ConnectionState) string {
+	if state == nil {
+		return ""
+	}
+
+	return state.ServerName
+}
+
+// tlsNegotiatedProto returns the negotiated ALPN protocol or empty string.
+func tlsNegotiatedProto(state *tls.ConnectionState) string {
+	if state == nil {
+		return ""
+	}
+
+	return state.NegotiatedProtocol
+}
+
+// allowedCNsForLog returns a slice of the allowed CNs for inclusion in logs.
+func allowedCNsForLog(set map[string]struct{}) []string {
+	out := make([]string, 0, len(set))
+	for cn := range set {
+		out = append(out, cn)
+	}
+
+	sort.Strings(out)
+
+	return out
 }
 
 // GetClientCAs returns the front-proxy client CA pool so callers can set it

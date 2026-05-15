@@ -230,6 +230,7 @@ func TestBuildAgentConfig(t *testing.T) {
 			},
 			assert: func(t *testing.T, cfg UnboundedAgentConfig) {
 				require.Equal(t, "my-machine", cfg.MachineName)
+				require.Empty(t, cfg.NodeName)
 				require.Equal(t, "dGVzdC1jYQ==", cfg.Cluster.CaCertBase64)
 				require.Equal(t, "10.0.0.10", cfg.Cluster.ClusterDNS)
 				require.Equal(t, "v1.34.0", cfg.Cluster.Version) // Machine spec overrides KubeVersion
@@ -244,6 +245,19 @@ func TestBuildAgentConfig(t *testing.T) {
 				require.Equal(t, "provider-val", cfg.Kubelet.Labels["provider-key"])
 
 				require.Equal(t, []string{"dedicated=gpu:NoSchedule"}, cfg.Kubelet.RegisterWithTaints)
+			},
+		},
+		{
+			name: "node name override",
+			params: BuildAgentConfigParams{
+				Machine: &v1alpha3.Machine{
+					ObjectMeta: metav1.ObjectMeta{Name: "machine-name"},
+				},
+				NodeName: "node-name",
+			},
+			assert: func(t *testing.T, cfg UnboundedAgentConfig) {
+				require.Equal(t, "machine-name", cfg.MachineName)
+				require.Equal(t, "node-name", cfg.NodeName)
 			},
 		},
 		{

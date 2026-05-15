@@ -128,6 +128,34 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+  # ---------- Orca Integration Tests ----------
+  # Spins up LocalStack and Azurite via testcontainers-go and runs the
+  # orca in-process integration suite (internal/orca/inttest). Docker
+  # is preinstalled on GitHub-hosted Ubuntu runners; no extra services:
+  # block is required.
+  orca-inttest:
+    name: Orca Integration Tests
+    needs: [frontend]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Download frontend dist
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: frontend-dist
+          path: internal/net/html/dist
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Run orca-inttest
+        run: make orca-inttest
+
   # ---------- Build ----------
   build:
     name: Build

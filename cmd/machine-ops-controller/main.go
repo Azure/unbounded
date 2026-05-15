@@ -16,6 +16,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -96,9 +97,13 @@ func run(ctx context.Context, cfg config) error {
 	if err != nil {
 		return fmt.Errorf("create kubernetes client: %w", err)
 	}
+	directClient, err := client.New(restConfig, client.Options{Scheme: scheme, Mapper: mgr.GetRESTMapper()})
+	if err != nil {
+		return fmt.Errorf("create direct client: %w", err)
+	}
 
 	if err := (&machineops.MachineOperationReconciler{
-		Client: mgr.GetClient(),
+		Client: directClient,
 		Providers: []machineops.Provider{
 			&azurevm.Provider{},
 			&ociinstance.Provider{ConfigFile: cfg.ociConfigFile, ConfigProfile: cfg.ociConfigProfile, Auth: cfg.ociAuth},
