@@ -77,6 +77,23 @@ type MachineOperationRequestReconciler interface {
 	ReconcileMachineOperation(context.Context, string) (ctrl.Result, error)
 }
 
+// NoopMachineOperationReconciler returns a MachineOperationRequestReconciler
+// that does not register watches and ignores MachineOperation requests. Use it
+// when a daemon controller only needs repave requests.
+func NoopMachineOperationReconciler() MachineOperationRequestReconciler {
+	return noopMachineOperationReconciler{}
+}
+
+type noopMachineOperationReconciler struct{}
+
+func (noopMachineOperationReconciler) SetupController(b *builder.TypedBuilder[Request]) *builder.TypedBuilder[Request] {
+	return b
+}
+
+func (noopMachineOperationReconciler) ReconcileMachineOperation(context.Context, string) (ctrl.Result, error) {
+	return ctrl.Result{}, nil
+}
+
 // RepaveReconciler handles repave requests produced by the shared controller setup.
 type RepaveReconciler interface {
 	// SetupController registers repave watches on builder.
