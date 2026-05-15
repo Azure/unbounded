@@ -1,0 +1,54 @@
+---
+# Init Job: creates the Azure container in Azurite so Orca's azureblob
+# origin driver has somewhere to read from. Idempotent: az container
+# create with --fail-on-exist false treats existence as success.
+#
+# Uses the well-known Azurite dev creds (devstoreaccount1 + the
+# documented public key); these are baked into Azurite and not
+# secrets.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: orca-azurite-container-init
+  namespace: {{ default "unbounded-kube" .Namespace }}
+  labels:
+    app.kubernetes.io/name: orca
+    app.kubernetes.io/part-of: orca-dev
+spec:
+  backoffLimit: 6
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: orca
+        app.kubernetes.io/part-of: orca-dev
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: az-cli
+          image: {{ default "mcr.microsoft.com/azure-cli:latest" .AzCliImage | quote }}
+          env:
+            - name: AZURE_STORAGE_CONNECTION_STRING
+              value: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite.{{ default "unbounded-kube" .Namespace }}.svc.cluster.local:10000/devstoreaccount1;"
+            - name: CONTAINER
+              value: {{ default "orca-test" .AzuriteContainer | quote }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              echo "Waiting for Azurite ..."
+              for i in $(seq 1 60); do
+                if az storage container list --output none 2>/dev/null; then
+                  echo "Azurite ready."
+                  break
+                fi
+                sleep 2
+              done
+              echo "Ensuring container ${CONTAINER} (idempotent) ..."
+              if az storage container exists --name "${CONTAINER}" --query exists --output tsv | grep -qi true; then
+                echo "Container ${CONTAINER} already exists."
+              else
+                az storage container create --name "${CONTAINER}" --output none
+                echo "Container ${CONTAINER} created."
+              fi
+              echo "Init complete."
