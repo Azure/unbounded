@@ -31,7 +31,7 @@ bpf_src="$repo_root/bpf/unbounded_encap.c"
 extract="$repo_root/hack/scripts/extract-vmlinux.py"
 
 : "${BPFTOOL:=bpftool}"
-: "${CLANG:=clang}"
+: "${CLANG:=clang-18}"
 : "${CURL:=curl}"
 
 for tool in "$BPFTOOL" "$CLANG" "$CURL" dpkg-deb sha256sum; do
