@@ -187,7 +187,14 @@ func configureTunnelPeers(ctx context.Context, cfg *config, meshPeers []meshPeer
 		// SyncAddresses, EnsureMTU). Some netlink operations can cause
 		// the kernel to reset interface sysctls.
 		disableRPFilter(ifName)
-		ensureTunnelForwardAccept(ifName)
+
+		if state.forwardManager != nil {
+			state.forwardManager.EnsureInterface(ifName)
+		}
+
+		if state.isGatewayNode && state.notrackManager != nil {
+			state.notrackManager.EnsureInterface(ifName)
+		}
 
 		iface, err := net.InterfaceByName(ifName)
 		if err != nil {
@@ -287,7 +294,14 @@ func removeStaleGeneveInterfaces(state *wireGuardState, desired map[string]bool)
 			klog.Infof("Tunnel: removed stale interface %s", ifName)
 		}
 
-		removeTunnelForwardAccept(ifName)
+		if state.forwardManager != nil {
+			state.forwardManager.RemoveInterface(ifName)
+		}
+
+		if state.notrackManager != nil {
+			state.notrackManager.RemoveInterface(ifName)
+		}
+
 		delete(state.geneveInterfaces, ifName)
 	}
 
@@ -331,7 +345,13 @@ func removeStaleGeneveInterfaces(state *wireGuardState, desired map[string]bool)
 			klog.Infof("Tunnel: removed unmanaged interface %s", name)
 		}
 
-		removeTunnelForwardAccept(name)
+		if state.forwardManager != nil {
+			state.forwardManager.RemoveInterface(name)
+		}
+
+		if state.notrackManager != nil {
+			state.notrackManager.RemoveInterface(name)
+		}
 	}
 }
 

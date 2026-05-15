@@ -1,0 +1,43 @@
+---
+# Client-facing Service: standard ClusterIP. Clients of the cache (e.g.
+# tools speaking S3 to fetch objects) connect here. Kube-proxy load
+# balances across the 3 replicas.
+apiVersion: v1
+kind: Service
+metadata:
+  name: orca
+  namespace: {{ default "unbounded-kube" .Namespace }}
+  labels:
+    app.kubernetes.io/name: orca
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: orca
+  ports:
+    - name: edge
+      port: 8443
+      targetPort: edge
+      protocol: TCP
+
+---
+# Peer-discovery Service: headless (ClusterIP: None). LookupHost on
+# orca-peers.<ns>.svc.cluster.local returns all pod IPs, enabling
+# rendezvous-hash coordination among Orca replicas.
+apiVersion: v1
+kind: Service
+metadata:
+  name: orca-peers
+  namespace: {{ default "unbounded-kube" .Namespace }}
+  labels:
+    app.kubernetes.io/name: orca
+spec:
+  type: ClusterIP
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: orca
+  ports:
+    - name: internal
+      port: 8444
+      targetPort: internal
+      protocol: TCP

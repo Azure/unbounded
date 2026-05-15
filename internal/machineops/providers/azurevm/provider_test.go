@@ -99,7 +99,7 @@ func TestProviderExecute(t *testing.T) {
 				},
 			}
 
-			err := provider.Execute(context.Background(), machineops.OperationRequest{ProviderID: "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm1", Operation: tt.operation, ReplaceUserData: "cloud-init"})
+			_, err := provider.Execute(context.Background(), machineops.OperationRequest{ProviderID: "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm1", Operation: tt.operation, ReplaceUserData: "cloud-init"})
 
 			require.NoError(t, err)
 			require.Equal(t, tt.wantCalls, client.calls)
@@ -116,7 +116,7 @@ func TestProviderExecuteHostReplaceRequiresUserData(t *testing.T) {
 	}}
 
 	require.True(t, provider.Supports(unboundedv1alpha3.OperationHostReplace))
-	err := provider.Execute(context.Background(), machineops.OperationRequest{ProviderID: "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm1", Operation: unboundedv1alpha3.OperationHostReplace})
+	_, err := provider.Execute(context.Background(), machineops.OperationRequest{ProviderID: "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm1", Operation: unboundedv1alpha3.OperationHostReplace})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "replacement user data is required")
 }

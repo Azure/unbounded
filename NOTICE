@@ -169,6 +169,42 @@ notices:
     license:
       - name: MIT License
         link: https://github.com/Masterminds/sprig/blob/v3.3.0/LICENSE.txt
+  - dependency: github.com/aws/aws-sdk-go-v2
+    ecosystem: go
+    copyright:
+      - Copyright 2015 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+      - Copyright 2014-2015 Stripe, Inc.
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/aws/aws-sdk-go-v2/blob/v1.41.7/LICENSE.txt
+  - dependency: github.com/aws/aws-sdk-go-v2/config
+    ecosystem: go
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/aws/aws-sdk-go-v2/blob/config/v1.32.17/LICENSE.txt
+  - dependency: github.com/aws/aws-sdk-go-v2/credentials
+    ecosystem: go
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/aws/aws-sdk-go-v2/blob/credentials/v1.19.16/LICENSE.txt
+  - dependency: github.com/aws/aws-sdk-go-v2/service/s3
+    ecosystem: go
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/aws/aws-sdk-go-v2/blob/service/s3/v1.101.0/LICENSE.txt
+  - dependency: github.com/aws/smithy-go
+    ecosystem: go
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/aws/smithy-go/blob/v1.25.1/LICENSE
   - dependency: github.com/bougou/go-ipmi
     ecosystem: go
     copyright:
@@ -206,6 +242,13 @@ notices:
     license:
       - name: Apache License, Version 2.0
         link: https://github.com/coreos/go-iptables/blob/v0.8.0/LICENSE
+  - dependency: github.com/dustin/go-humanize
+    ecosystem: go
+    copyright:
+      - Copyright (c) 2005-2008  Dustin Sallings <dustin@spy.net>
+    license:
+      - name: MIT License
+        link: https://github.com/dustin/go-humanize/blob/v1.0.1/LICENSE
   - dependency: github.com/fatih/color
     ecosystem: go
     copyright:
@@ -344,6 +387,13 @@ notices:
     license:
       - name: MIT License
         link: https://github.com/stretchr/testify/blob/v1.11.1/LICENSE
+  - dependency: github.com/testcontainers/testcontainers-go
+    ecosystem: go
+    copyright:
+      - Copyright (c) 2017-2019 Gianluca Arbezzano
+    license:
+      - name: MIT License
+        link: https://github.com/testcontainers/testcontainers-go/blob/v0.42.0/LICENSE
   - dependency: github.com/vishvananda/netlink
     ecosystem: go
     copyright:

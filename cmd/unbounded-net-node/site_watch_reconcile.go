@@ -209,6 +209,25 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 		}
 	}
 
+	// Initialize forward manager for tunnel-to-tunnel iptables FORWARD rules.
+	// This replaces per-interface blanket ACCEPT rules with a two-tier chain
+	// (FORWARD jump + UNBOUNDED-FORWARD accept) so that only tunnel-to-tunnel
+	// forwarded traffic bypasses KUBE-FORWARD's conntrack checks.
+	fwdMgr, err := unboundednetnetlink.NewForwardManager()
+	if err != nil {
+		klog.Warningf("Failed to create forward manager (tunnel forwarding rules will be disabled): %v", err)
+	} else {
+		state.forwardManager = fwdMgr
+	}
+
+	// Initialize notrack manager for skipping conntrack on gateway transit traffic.
+	notrackMgr, err := unboundednetnetlink.NewNotrackManager()
+	if err != nil {
+		klog.Warningf("Failed to create notrack manager (conntrack bypass will be disabled): %v", err)
+	} else {
+		state.notrackManager = notrackMgr
+	}
+
 	// Initialize gateway policy manager to allow cleanup of stale policy rules
 	// even when policy routing is currently disabled.
 	policyManager, err := unboundednetnetlink.NewGatewayPolicyManager(cfg.WireGuardPort)
@@ -529,6 +548,8 @@ func cleanupNodeNetworkingOnShutdown(cfg *config, state *wireGuardState) {
 	gatewayPolicyManager := state.gatewayPolicyManager
 	masqueradeManager := state.masqueradeManager
 	mssClampManager := state.mssClampManager
+	forwardManager := state.forwardManager
+	notrackManager := state.notrackManager
 	healthCheckMgr := state.healthCheckManager
 
 	gatewayLinkManagers := make(map[string]*unboundednetnetlink.LinkManager, len(state.gatewayLinkManagers))
@@ -601,6 +622,18 @@ func cleanupNodeNetworkingOnShutdown(cfg *config, state *wireGuardState) {
 			}
 		}
 
+		// Forward chain rules (UNBOUNDED-FORWARD)
+		if forwardManager != nil {
+			forwardManager.Cleanup()
+			klog.Info("Cleaned up forward chain rules on shutdown")
+		}
+
+		// Notrack rules (UNBOUNDED-NOTRACK, gateway nodes only)
+		if notrackManager != nil {
+			notrackManager.Cleanup()
+			klog.Info("Cleaned up notrack rules on shutdown")
+		}
+
 		// WireGuard managers (close wgctrl clients)
 		if mainWGManager != nil {
 			if err := mainWGManager.Close(); err != nil {
@@ -637,7 +670,6 @@ func cleanupNodeNetworkingOnShutdown(cfg *config, state *wireGuardState) {
 				continue
 			}
 
-			removeTunnelForwardAccept(ifaceName)
 			klog.Infof("Deleted gateway WireGuard interface %s on shutdown", ifaceName)
 		}
 
@@ -652,7 +684,6 @@ func cleanupNodeNetworkingOnShutdown(cfg *config, state *wireGuardState) {
 				continue
 			}
 
-			removeTunnelForwardAccept(ifName)
 			klog.Infof("Deleted GENEVE interface %s on shutdown", ifName)
 		}
 
@@ -670,7 +701,6 @@ func cleanupNodeNetworkingOnShutdown(cfg *config, state *wireGuardState) {
 				if err := netlink.LinkDel(link); err != nil {
 					klog.Warningf("Failed to delete managed tunnel interface %s on shutdown: %v", name, err)
 				} else {
-					removeTunnelForwardAccept(name)
 					klog.Infof("Deleted managed tunnel interface %s on shutdown", name)
 				}
 			}
@@ -2050,11 +2080,56 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 		// Remove tunnel devices that no peers are using. This avoids leaving
 		// stale interfaces (geneve0, vxlan0, ipip0) on nodes where the
 		// tunnel protocol has been changed.
-		cleanupUnusedTunnelDevices(peers, gatewayPeers, wgGatewayPeers)
+		cleanupUnusedTunnelDevices(peers, gatewayPeers, wgGatewayPeers, state.forwardManager, state.notrackManager)
 		// Re-apply rp_filter=0 on active tunnel interfaces. Deleting
 		// interfaces during cleanup can cause the kernel to reset
 		// rp_filter on remaining interfaces.
-		reapplyRPFilterOnActiveTunnels(peers, gatewayPeers, wgGatewayPeers)
+		reapplyRPFilterOnActiveTunnels(peers, gatewayPeers, wgGatewayPeers, state.forwardManager, state.isGatewayNode, state.notrackManager)
+	}
+
+	// Reconcile notrack rules for conntrack bypass on gateway nodes.
+	if state.notrackManager != nil {
+		if isGatewayNode {
+			// Build the cluster supernet list from all available sources.
+			// Gateway nodes carry transit traffic for every site they peer
+			// with, so the notrack set must cover every site's pod-CIDR
+			// pool -- not just the gateway's own site -- otherwise return
+			// packets from a remote site can land on a different gateway
+			// instance than the forward path took, conntrack marks them
+			// INVALID, and KUBE-FORWARD drops them.
+			supernetSet := make(map[string]struct{})
+			for _, site := range siteMap {
+				for _, assignment := range site.Spec.PodCidrAssignments {
+					for _, cidr := range assignment.CidrBlocks {
+						supernetSet[cidr] = struct{}{}
+					}
+				}
+				for _, cidr := range site.Spec.NodeCidrs {
+					supernetSet[cidr] = struct{}{}
+				}
+			}
+
+			for _, cidr := range sitePodCIDRs {
+				supernetSet[cidr] = struct{}{}
+			}
+
+			for _, gw := range gatewayPeers {
+				for _, cidr := range gw.RoutedCidrs {
+					supernetSet[cidr] = struct{}{}
+				}
+			}
+
+			var supernets []string
+			for cidr := range supernetSet {
+				supernets = append(supernets, cidr)
+			}
+
+			if err := state.notrackManager.ReconcileCIDRs(state.nodePodCIDRs, supernets); err != nil {
+				klog.Warningf("Failed to reconcile notrack CIDRs: %v", err)
+			}
+		} else {
+			state.notrackManager.Cleanup()
+		}
 	}
 
 	// Phase 3: Update state fields that getNodeStatus() reads (brief lock).

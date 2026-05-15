@@ -80,6 +80,14 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 	// routes. The informer sync guard in reconcileUpdate ensures we only
 	// reach here after all caches are populated, so an empty peer list is
 	// genuine (not a transient startup state).
+	//
+	// We still need to clean up any leftover gateway wg<port> interfaces:
+	//   - Tracked in state (e.g. SiteGatewayPoolAssignment was just deleted
+	//     and the node had no other WG peers because intra-site uses GENEVE).
+	//   - Present in the kernel but not in state (e.g. agent restarted after
+	//     an SGPA was deleted, leaving orphan interfaces from the prior run).
+	// removeUnmanagedWireGuardInterfaces handles both cases by listing wg*
+	// links and deleting any that aren't in desiredGatewayIfaces.
 	if len(peers) == 0 && len(gatewayPeers) == 0 {
 		if state.linkManager.Exists() {
 			klog.Infof("No WireGuard peers -- removing mesh interface %s", iface)
@@ -88,6 +96,8 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 				klog.V(2).Infof("Failed to remove unused WireGuard interface %s: %v", iface, err)
 			}
 		}
+		// Tear down any tracked or kernel-resident gateway wg* interfaces.
+		removeUnmanagedWireGuardInterfaces(cfg, state, nil, iface)
 		// Sync routes (clear WG routes, keep any GENEVE/IPIP additional routes)
 		if state.routeManager != nil {
 			if state.netlinkCache != nil {
@@ -255,7 +265,13 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 	}
 
 	// Accept forwarded traffic arriving on the mesh WG interface.
-	ensureTunnelForwardAccept(iface)
+	if state.forwardManager != nil {
+		state.forwardManager.EnsureInterface(iface)
+	}
+
+	if state.isGatewayNode && state.notrackManager != nil {
+		state.notrackManager.EnsureInterface(iface)
+	}
 
 	// Build routes for mesh interface via shared route builder.
 	// All routing is per-peer for healthcheck granularity: bootstrap host routes,
@@ -456,8 +472,14 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 			continue
 		}
 
-		// Set fwmark on gateway WG interface for transit traffic forwarding.
-		ensureTunnelForwardAccept(gwIfaceName)
+		// Accept forwarded traffic arriving on the gateway WG interface.
+		if state.forwardManager != nil {
+			state.forwardManager.EnsureInterface(gwIfaceName)
+		}
+
+		if state.isGatewayNode && state.notrackManager != nil {
+			state.notrackManager.EnsureInterface(gwIfaceName)
+		}
 
 		// Configure policy routing for this gateway interface
 		// This ensures return traffic leaves via the same interface it arrived on
@@ -560,7 +582,13 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 			klog.Warningf("Failed to delete gateway interface %s: %v", ifaceName, err)
 		}
 
-		removeTunnelForwardAccept(ifaceName)
+		if state.forwardManager != nil {
+			state.forwardManager.RemoveInterface(ifaceName)
+		}
+
+		if state.notrackManager != nil {
+			state.notrackManager.RemoveInterface(ifaceName)
+		}
 	}
 
 	if cfg.EnablePolicyRouting && state.gatewayPolicyManager != nil {

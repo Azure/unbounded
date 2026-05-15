@@ -76,7 +76,14 @@ func configureVXLANPeers(
 	// here with overlay source IPs, but overlay routes point elsewhere.
 	// Both strict and loose rp_filter would drop them.
 	disableRPFilter(vxlanInterfaceName)
-	ensureTunnelForwardAccept(vxlanInterfaceName)
+
+	if state.forwardManager != nil {
+		state.forwardManager.EnsureInterface(vxlanInterfaceName)
+	}
+
+	if state.isGatewayNode && state.notrackManager != nil {
+		state.notrackManager.EnsureInterface(vxlanInterfaceName)
+	}
 
 	// Assign this node's pod CIDR gateway IPs to vxlan0 so that
 	// the kernel can source packets from the overlay addresses.

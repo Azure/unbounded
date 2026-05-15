@@ -103,6 +103,12 @@ type wireGuardState struct {
 	// MSS clamp manager for TCP MSS clamping on WireGuard interfaces
 	mssClampManager *unboundednetnetlink.MSSClampManager
 
+	// Forward manager for tunnel-to-tunnel iptables FORWARD rules
+	forwardManager *unboundednetnetlink.ForwardManager
+
+	// Notrack manager for skipping conntrack on transit traffic (gateway nodes only)
+	notrackManager *unboundednetnetlink.NotrackManager
+
 	// GENEVE tunnel managers -- per-peer interfaces with fixed Remote IP
 	geneveInterfaces map[string]*unboundednetnetlink.LinkManager // per-peer GENEVE interface managers keyed by iface name
 
