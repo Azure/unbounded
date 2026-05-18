@@ -17,6 +17,7 @@ func TestRenderDaemonAsset(t *testing.T) {
 
 	renderedBytes, err := renderDaemonAsset("daemon-service", daemonServiceContent)
 	require.NoError(t, err)
+
 	rendered := string(renderedBytes)
 
 	require.NotContains(t, rendered, "{{")
@@ -25,6 +26,7 @@ func TestRenderDaemonAsset(t *testing.T) {
 
 	renderedRecoveryBytes, err := renderDaemonAsset("daemon-recovery-script", daemonRecoveryScriptContent)
 	require.NoError(t, err)
+
 	renderedRecovery := string(renderedRecoveryBytes)
 	require.NotContains(t, renderedRecovery, "{{")
 	assert.Contains(t, renderedRecovery, goalstates.DaemonBinaryLastGoodPath)

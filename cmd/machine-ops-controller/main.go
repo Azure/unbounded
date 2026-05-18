@@ -97,6 +97,7 @@ func run(ctx context.Context, cfg config) error {
 	if err != nil {
 		return fmt.Errorf("create kubernetes client: %w", err)
 	}
+
 	directClient, err := client.New(restConfig, client.Options{Scheme: scheme, Mapper: mgr.GetRESTMapper()})
 	if err != nil {
 		return fmt.Errorf("create direct client: %w", err)

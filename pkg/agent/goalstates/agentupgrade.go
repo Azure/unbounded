@@ -33,6 +33,7 @@ func ResolvedAgentUpgradePaths() (AgentUpgradePaths, error) {
 		LastGoodPath: resolveDaemonBinaryPath(EnvDaemonBinaryLastGood, DaemonBinaryLastGoodPath),
 		SignalPath:   resolveDaemonBinaryPath(EnvDaemonAgentUpgradeSignalPath, DaemonAgentUpgradeSignalPath),
 	}
+
 	targetPath, err := filepath.EvalSymlinks(paths.CurrentPath)
 	if err != nil {
 		if os.IsNotExist(err) {

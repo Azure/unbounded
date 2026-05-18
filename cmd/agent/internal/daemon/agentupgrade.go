@@ -56,6 +56,7 @@ func upgradeDaemonBinary(ctx context.Context, log *slog.Logger, downloadURL stri
 	if err != nil {
 		return fmt.Errorf("resolve current daemon binary symlink: %w", err)
 	}
+
 	targetPath := paths.NextTargetPath()
 	if err := agentbinary.InstallAndSwitchFromTarGz(ctx, downloadURL, paths, agentUpgradeBinaryMode); err != nil {
 		return err
@@ -95,6 +96,7 @@ func (o fileAgentUpgradeSignalOperator) RecordFailure(message string) error {
 	if err != nil {
 		return fmt.Errorf("read pending AgentUpgrade operation signal: %w", err)
 	}
+
 	if pending == nil {
 		slog.Warn("no pending AgentUpgrade operation signal found; skipping failure signal", "path", o.path)
 		return nil
@@ -143,7 +145,9 @@ func (o fileAgentUpgradeSignalOperator) Read() (*agentUpgradeSignal, error) {
 	if err := json.Unmarshal(data, &signal); err != nil {
 		return nil, fmt.Errorf("decode AgentUpgrade signal %s: %w", o.path, err)
 	}
+
 	signal.OperationName = strings.TrimSpace(signal.OperationName)
+
 	signal.FailureMessage = strings.TrimSpace(signal.FailureMessage)
 	if signal.OperationName == "" {
 		slog.Warn("AgentUpgrade signal missing operation name; ignoring signal", "path", o.path)

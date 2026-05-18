@@ -80,6 +80,7 @@ func (r *MachineConfigurationBindingReconciler) Reconcile(
 	}
 
 	updatedSpec := false
+
 	if needsConfigurationRefUpdate(&machine, selection) {
 		machine.Spec.ConfigurationRef = &unboundedv1alpha3.MachineConfigurationRef{
 			Name:    selection.configurationName,
@@ -152,6 +153,7 @@ func (r *MachineConfigurationBindingReconciler) selectConfiguration(
 	}
 
 	var matches []unboundedv1alpha3.MachineConfiguration
+
 	for i := range list.Items {
 		mc := &list.Items[i]
 		if mc.Spec.MachineSelector == nil {
@@ -244,12 +246,14 @@ func (r *MachineConfigurationBindingReconciler) findMachinesForConfiguration(
 	}
 
 	var requests []reconcile.Request
+
 	for i := range list.Items {
 		machine := &list.Items[i]
 		if machine.Spec.ConfigurationRef != nil && machine.Spec.ConfigurationRef.Name == mc.Name {
 			requests = append(requests, reconcile.Request{
 				NamespacedName: client.ObjectKey{Name: machine.Name},
 			})
+
 			continue
 		}
 
@@ -301,6 +305,7 @@ func needsConfigurationRefUpdate(
 	selection *configurationSelection,
 ) bool {
 	ref := machine.Spec.ConfigurationRef
+
 	return ref == nil ||
 		ref.Name != selection.configurationName ||
 		ref.Version == nil ||

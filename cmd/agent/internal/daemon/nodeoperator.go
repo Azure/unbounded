@@ -94,6 +94,7 @@ func (nspawnNodeOperator) FindActiveMachine(log *slog.Logger) (*ActiveMachine, e
 		if err := json.Unmarshal(data, &cfg); err != nil {
 			return nil, fmt.Errorf("decode applied config %s: %w", path, err)
 		}
+
 		if err := cfg.BackfillNodeName(); err != nil {
 			return nil, fmt.Errorf("backfill applied config node name %s: %w", path, err)
 		}
@@ -133,9 +134,11 @@ func hasDrift(applied, desired *provision.AgentConfig) bool {
 	if applied.Kubelet.Auth.BootstrapToken != desired.Kubelet.Auth.BootstrapToken {
 		return true
 	}
+
 	if !reflect.DeepEqual(applied.Kubelet.Labels, desired.Kubelet.Labels) {
 		return true
 	}
+
 	if !reflect.DeepEqual(applied.Kubelet.RegisterWithTaints, desired.Kubelet.RegisterWithTaints) {
 		return true
 	}

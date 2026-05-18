@@ -59,6 +59,7 @@ func (r *MachineConfigurationReconciler) Reconcile(ctx context.Context, req ctrl
 
 	if len(versions) == 0 {
 		logger.Info("creating initial MachineConfigurationVersion", "configuration", mc.Name, "version", 1)
+
 		if err := r.createVersion(ctx, &mc, 1); err != nil {
 			return ctrl.Result{}, fmt.Errorf("create initial MachineConfigurationVersion: %w", err)
 		}
@@ -94,6 +95,7 @@ func (r *MachineConfigurationReconciler) Reconcile(ctx context.Context, req ctrl
 		"configuration", mc.Name,
 		"version", nextVersion,
 	)
+
 	if err := r.createVersion(ctx, &mc, nextVersion); err != nil {
 		return ctrl.Result{}, fmt.Errorf("create MachineConfigurationVersion %d: %w", nextVersion, err)
 	}

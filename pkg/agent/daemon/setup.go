@@ -28,9 +28,11 @@ func SetupController(
 	if name == "" {
 		return fmt.Errorf("controller name is required")
 	}
+
 	if machineOperations == nil {
 		return fmt.Errorf("machine operation reconciler is required")
 	}
+
 	if repaves == nil {
 		return fmt.Errorf("repave reconciler is required")
 	}
@@ -60,6 +62,7 @@ func (r *controllerRuntimeReconciler) Reconcile(
 	if operationReq, ok := req.machineOperationRequest(); ok {
 		return r.machineOperations.ReconcileMachineOperation(ctx, operationReq.Name)
 	}
+
 	if repaveReq, ok := req.repaveRequest(); ok {
 		return r.repaves.ReconcileRepave(ctx, repaveReq.Source)
 	}
