@@ -528,15 +528,16 @@ def _restart_crashing_pods(node_name: str, namespace: str, label: str) -> None:
 
     pods = json.loads(result.stdout).get("items", [])
     for pod in pods:
+        pod_name = pod["metadata"]["name"]
         for cs in pod.get("status", {}).get("containerStatuses", []):
             if cs.get("ready"):
                 continue
             waiting = cs.get("state", {}).get("waiting", {})
             restart_count = cs.get("restartCount", 0)
-            if restart_count >= 2 or waiting.get("reason") == "CrashLoopBackOff":
-                pod_name = pod["metadata"]["name"]
+            waiting_reason = waiting.get("reason")
+            if restart_count >= 2 and waiting_reason == "CrashLoopBackOff":
                 log(f"    Deleting crashing pod {pod_name} "
-                    f"(restarts={restart_count}) to reset backoff")
+                    f"(restarts={restart_count}, reason={waiting_reason}) to reset backoff")
                 subprocess.run(
                     [KUBECTL, "delete", "pod", "-n", namespace, pod_name,
                      "--grace-period=0", "--force"],
@@ -544,15 +545,13 @@ def _restart_crashing_pods(node_name: str, namespace: str, label: str) -> None:
                 )
 
 
-def assert_node_ready(name: str, timeout: int = 480) -> None:
+def assert_node_ready(name: str, timeout: int = 720) -> None:
     """Assert the Node reaches Ready status within timeout seconds.
 
     The timeout must be generous enough to survive multiple kindnet
-    CrashLoopBackOff cycles.  In CI each kindnet pod runs for ~2 min
-    before crashing; with a restart threshold of 2 and a 30s check
-    interval, each cycle (crash -> detect -> delete -> new pod start)
-    takes ~90-120s.  480s accommodates 3 full cycles plus ~60s for the
-    final pod to write the CNI config and the kubelet to detect it.
+    CrashLoopBackOff cycles. In CI kindnet can need several fresh pod
+    attempts before it writes the CNI config; 720s accommodates the slow
+    tail without hiding real boot failures.
     """
     log(f"  Waiting for Node '{name}' to become Ready...")
     pod_restart_interval = 30  # seconds between CrashLoopBackOff resets
@@ -569,10 +568,9 @@ def assert_node_ready(name: str, timeout: int = 480) -> None:
             return
         if elapsed > 0 and elapsed % 30 == 0:
             log(f"    ({elapsed}s) Node not yet Ready")
-        # Periodically reset CrashLoopBackOff on critical DaemonSet pods.
-        # Kindnet can fail transiently when the VM's network is still
-        # initializing; deleting the pod resets the backoff timer and
-        # lets the DaemonSet controller schedule a fresh attempt.
+        # Periodically reset confirmed CrashLoopBackOff on critical DaemonSet pods.
+        # Avoid deleting merely restarted/running pods: a fresh kindnet pod can
+        # need a short grace period before kubelet observes the CNI config.
         if elapsed >= 30 and elapsed - last_restart_attempt >= pod_restart_interval:
             _restart_crashing_pods(name, "kube-system", "app=kindnet")
             last_restart_attempt = elapsed
@@ -696,7 +694,7 @@ def run_operation_smoke_suite() -> None:
     wait_vm_state("running", timeout=180)
     wait_k8s_node(NODE_NAME, timeout=300)
     wait_node_boot_id_changed(NODE_NAME, boot_id, timeout=600)
-    assert_node_ready(NODE_NAME, timeout=480)
+    assert_node_ready(NODE_NAME, timeout=720)
     boot_id = get_node_boot_id(NODE_NAME)
 
     reboot = create_machine_operation(
@@ -709,7 +707,7 @@ def run_operation_smoke_suite() -> None:
     wait_vm_state("running", timeout=180)
     wait_k8s_node(NODE_NAME, timeout=300)
     wait_node_boot_id_changed(NODE_NAME, boot_id, timeout=600)
-    assert_node_ready(NODE_NAME, timeout=480)
+    assert_node_ready(NODE_NAME, timeout=720)
 
 
 def main() -> None:
@@ -989,7 +987,7 @@ def main() -> None:
 
     log("Waiting for kubelet to join the cluster...")
     wait_k8s_node(NODE_NAME, timeout=900)
-    assert_node_ready(NODE_NAME, timeout=480)
+    assert_node_ready(NODE_NAME, timeout=720)
 
     run_operation_smoke_suite()
 
