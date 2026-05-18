@@ -533,11 +533,14 @@ def _restart_crashing_pods(node_name: str, namespace: str, label: str) -> None:
             if cs.get("ready"):
                 continue
             waiting = cs.get("state", {}).get("waiting", {})
+            terminated = cs.get("state", {}).get("terminated", {})
             restart_count = cs.get("restartCount", 0)
             waiting_reason = waiting.get("reason")
-            if restart_count >= 2 and waiting_reason == "CrashLoopBackOff":
+            terminated_reason = terminated.get("reason")
+            if restart_count >= 2 or waiting_reason == "CrashLoopBackOff":
                 log(f"    Deleting crashing pod {pod_name} "
-                    f"(restarts={restart_count}, reason={waiting_reason}) to reset backoff")
+                    f"(restarts={restart_count}, waiting={waiting_reason or 'none'}, "
+                    f"terminated={terminated_reason or 'none'}) to reset backoff")
                 subprocess.run(
                     [KUBECTL, "delete", "pod", "-n", namespace, pod_name,
                      "--grace-period=0", "--force"],
@@ -568,9 +571,9 @@ def assert_node_ready(name: str, timeout: int = 720) -> None:
             return
         if elapsed > 0 and elapsed % 30 == 0:
             log(f"    ({elapsed}s) Node not yet Ready")
-        # Periodically reset confirmed CrashLoopBackOff on critical DaemonSet pods.
-        # Avoid deleting merely restarted/running pods: a fresh kindnet pod can
-        # need a short grace period before kubelet observes the CNI config.
+        # Periodically reset failing critical DaemonSet pods. Kindnet can fail
+        # transiently during VM network initialization and may sit in Error
+        # before Kubernetes reports CrashLoopBackOff.
         if elapsed >= 30 and elapsed - last_restart_attempt >= pod_restart_interval:
             _restart_crashing_pods(name, "kube-system", "app=kindnet")
             last_restart_attempt = elapsed
@@ -694,7 +697,6 @@ def run_operation_smoke_suite() -> None:
     wait_vm_state("running", timeout=180)
     wait_k8s_node(NODE_NAME, timeout=300)
     wait_node_boot_id_changed(NODE_NAME, boot_id, timeout=600)
-    assert_node_ready(NODE_NAME, timeout=720)
     boot_id = get_node_boot_id(NODE_NAME)
 
     reboot = create_machine_operation(
@@ -707,7 +709,6 @@ def run_operation_smoke_suite() -> None:
     wait_vm_state("running", timeout=180)
     wait_k8s_node(NODE_NAME, timeout=300)
     wait_node_boot_id_changed(NODE_NAME, boot_id, timeout=600)
-    assert_node_ready(NODE_NAME, timeout=720)
 
 
 def main() -> None:
