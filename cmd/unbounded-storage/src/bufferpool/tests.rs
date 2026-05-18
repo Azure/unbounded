@@ -26,8 +26,7 @@ fn noop_waker() -> Waker {
     fn raw() -> RawWaker {
         RawWaker::new(std::ptr::null(), &VTABLE)
     }
-    static VTABLE: RawWakerVTable =
-        RawWakerVTable::new(|_| raw(), |_| {}, |_| {}, |_| {});
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(|_| raw(), |_| {}, |_| {}, |_| {});
     // SAFETY: the vtable functions never dereference the data pointer.
     unsafe { Waker::from_raw(raw()) }
 }
@@ -144,20 +143,21 @@ struct MockTransport {
     pend_polls: RefCell<usize>,
     /// Force `bulk_get` to return an error instead of completing.
     error_mode: RefCell<bool>,
-    /// Filled in by `register_pages`.
-    base: RefCell<Option<*mut u8>>,
-    page_size: RefCell<usize>,
+    /// Bound at construction (the embedder pre-registers the
+    /// backing; `Transport` no longer carries a registration hook).
+    base: *mut u8,
+    page_size: usize,
 }
 
 impl MockTransport {
-    fn new() -> Self {
+    fn new(base: *mut u8, page_size: usize) -> Self {
         Self {
             stripes: RefCell::new(HashMap::new()),
             calls: RefCell::new(0),
             pend_polls: RefCell::new(0),
             error_mode: RefCell::new(false),
-            base: RefCell::new(None),
-            page_size: RefCell::new(0),
+            base,
+            page_size,
         }
     }
 
@@ -179,23 +179,7 @@ impl MockTransport {
 }
 
 impl Transport<TestReq> for MockTransport {
-    fn register_pages(
-        &self,
-        base: *mut u8,
-        page_size: usize,
-        _page_count: usize,
-    ) -> Result<(), Error> {
-        *self.base.borrow_mut() = Some(base);
-        *self.page_size.borrow_mut() = page_size;
-        Ok(())
-    }
-
-    async fn bulk_get(
-        &self,
-        _req: &TestReq,
-        src: BulkRef,
-        dst: PageRef,
-    ) -> Result<(), Error> {
+    async fn bulk_get(&self, _req: &TestReq, src: BulkRef, dst: PageRef) -> Result<(), Error> {
         // Pend the configured number of polls (one polling round
         // per pend, decremented on each call).
         for _ in 0..*self.pend_polls.borrow() {
@@ -213,10 +197,10 @@ impl Transport<TestReq> for MockTransport {
         let end = start + src.len as usize;
         assert!(end <= bytes.len(), "src out of range");
 
-        let base = self.base.borrow().expect("registered");
-        let page_size = *self.page_size.borrow();
+        let page_size = self.page_size;
         let dst_ptr = unsafe {
-            base.add(dst.page_idx as usize * page_size + dst.offset as usize)
+            self.base
+                .add(dst.page_idx as usize * page_size + dst.offset as usize)
         };
         // SAFETY: dst is a pool page, src is a Vec<u8>, both valid.
         unsafe {
@@ -295,9 +279,7 @@ impl BlockStore for MockBlockStore {
         };
         let base = self.base.borrow().expect("registered");
         let page_size = *self.page_size.borrow();
-        let dst_ptr = unsafe {
-            base.add(dst.page_idx as usize * page_size + dst.offset as usize)
-        };
+        let dst_ptr = unsafe { base.add(dst.page_idx as usize * page_size + dst.offset as usize) };
         // SAFETY: dst is a pool page.
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst_ptr, bytes.len());
@@ -319,9 +301,8 @@ impl BlockStore for MockBlockStore {
         *self.writes.borrow_mut() += 1;
         let base = self.base.borrow().expect("registered");
         let page_size = *self.page_size.borrow();
-        let src_ptr = unsafe {
-            base.add(page.page_idx as usize * page_size + page.offset as usize)
-        };
+        let src_ptr =
+            unsafe { base.add(page.page_idx as usize * page_size + page.offset as usize) };
         let mut buf = vec![0u8; page.len as usize];
         // SAFETY: src is a pool page.
         unsafe {
@@ -369,20 +350,7 @@ struct TransportRc(Rc<MockTransport>);
 struct BlockStoreRc(Rc<MockBlockStore>);
 
 impl Transport<TestReq> for TransportRc {
-    fn register_pages(
-        &self,
-        base: *mut u8,
-        page_size: usize,
-        page_count: usize,
-    ) -> Result<(), Error> {
-        self.0.register_pages(base, page_size, page_count)
-    }
-    async fn bulk_get(
-        &self,
-        req: &TestReq,
-        src: BulkRef,
-        dst: PageRef,
-    ) -> Result<(), Error> {
+    async fn bulk_get(&self, req: &TestReq, src: BulkRef, dst: PageRef) -> Result<(), Error> {
         self.0.bulk_get(req, src, dst).await
     }
 }
@@ -423,7 +391,10 @@ fn make_pool_v2(
     Rc<MockBlockStore>,
 ) {
     let backing = heap_backing(page_size, page_count);
-    let t = Rc::new(MockTransport::new());
+    // `Transport` is now constructed already aware of the backing's
+    // base/page_size (embedder pre-registration model); `BlockStore`
+    // still receives the backing via `Pool::new -> register_pages`.
+    let t = Rc::new(MockTransport::new(backing.base, backing.page_size));
     let s = Rc::new(MockBlockStore::new());
     let pool = Pool::new(
         PoolConfig::default(),
@@ -705,13 +676,19 @@ fn free_list_parking_unblocks_on_release() {
 fn stream_limit_enforced() {
     const P: usize = 4096;
     let backing = heap_backing(P, 2);
-    let t = Rc::new(MockTransport::new());
+    let t = Rc::new(MockTransport::new(backing.base, backing.page_size));
     let s = Rc::new(MockBlockStore::new());
     s.preload(key(0), 0, vec![0u8; P]);
     let cfg = PoolConfig {
         max_concurrent_streams: 1,
     };
-    let pool = Pool::new(cfg, backing, TransportRc(t.clone()), BlockStoreRc(s.clone())).unwrap();
+    let pool = Pool::new(
+        cfg,
+        backing,
+        TransportRc(t.clone()),
+        BlockStoreRc(s.clone()),
+    )
+    .unwrap();
     let req = TestReq { key: key(0) };
     block_on(async {
         let s1 = pool.read(&req, 0, P as u64).await.unwrap();
@@ -734,7 +711,13 @@ fn rejects_bad_backing() {
         page_count: 1,
         _own: Box::new(()),
     };
-    let t = TransportRc(Rc::new(MockTransport::new()));
+    let t = TransportRc(Rc::new(MockTransport::new(
+        backing.base,
+        // `backing.page_size` is 0 here on purpose; the test only
+        // exercises Pool::new's BadConfig early-return, which fires
+        // before any `bulk_get` runs.
+        1,
+    )));
     let s = BlockStoreRc(Rc::new(MockBlockStore::new()));
     let r = Pool::<_, _, TestReq>::new(PoolConfig::default(), backing, t, s);
     assert!(matches!(r, Err(Error::BadConfig(_))));
