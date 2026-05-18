@@ -1,0 +1,6 @@
+# Ubuntu kernel package used to generate bpf/vmlinux.h via `make net-ebpf-generate`.
+#
+# To bump the pin, edit the package_url below and run `make net-ebpf-generate`.
+# That target re-downloads the package, regenerates bpf/vmlinux.h, and rewrites
+# bpf/btf-kernel-pin-hashes with the new sha256s.
+package_url=https://archive.ubuntu.com/ubuntu/pool/main/l/linux-signed/linux-image-7.0.0-17-generic_7.0.0-17.17_amd64.deb

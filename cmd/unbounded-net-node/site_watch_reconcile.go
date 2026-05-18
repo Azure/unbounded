@@ -69,36 +69,14 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 		netlinkCache:                  netlinkCache,
 	}
 
-	// Set up the dedicated routing table and ip rule (not needed for eBPF
-	// dataplane which uses the main table directly).
-	if cfg.TunnelDataplane != "ebpf" {
-		if cfg.RouteTableID != 0 && cfg.RouteTableID != 254 {
-			if err := unboundednetnetlink.EnsureRtTablesEntry(cfg.RouteTableID, "unbounded-net"); err != nil {
-				klog.Warningf("Failed to ensure rt_tables entry for table %d: %v", cfg.RouteTableID, err)
-			}
-
-			if err := unboundednetnetlink.EnsureIPRule(cfg.RouteTableID, 32765, 0, 0); err != nil {
-				klog.Warningf("Failed to ensure ip rule for table %d: %v", cfg.RouteTableID, err)
-			}
-		}
-	} else {
-		// Clean up old dedicated routing table from previous netlink dataplane runs.
-		if cfg.RouteTableID != 0 && cfg.RouteTableID != 254 {
-			_ = unboundednetnetlink.FlushRouteTable(cfg.RouteTableID)           //nolint:errcheck
-			_ = unboundednetnetlink.RemoveIPRule(cfg.RouteTableID, 32765, 0, 0) //nolint:errcheck
-		}
+	// Clean up any dedicated routing table left over from netlink-mode
+	// installs. eBPF dataplane uses the main table directly.
+	if cfg.RouteTableID != 0 && cfg.RouteTableID != 254 {
+		_ = unboundednetnetlink.FlushRouteTable(cfg.RouteTableID)           //nolint:errcheck
+		_ = unboundednetnetlink.RemoveIPRule(cfg.RouteTableID, 32765, 0, 0) //nolint:errcheck
 	}
 
-	// Initialize unified route manager for netlink-based route programming.
-	// eBPF dataplane uses the main routing table (0) directly.
-	var routeTable int
-	if cfg.TunnelDataplane == "ebpf" {
-		routeTable = 0
-	} else {
-		routeTable = cfg.RouteTableID
-	}
-
-	routeManager := unboundednetnetlink.NewUnifiedRouteManager(fmt.Sprintf("wg%d", cfg.WireGuardPort), routeTable)
+	routeManager := unboundednetnetlink.NewUnifiedRouteManager(fmt.Sprintf("wg%d", cfg.WireGuardPort), 0)
 	routeManager.SetNetlinkCache(netlinkCache)
 	state.routeManager = routeManager
 	state.routeTableID = cfg.RouteTableID
@@ -127,21 +105,10 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 	healthCheckMgr, err := healthcheck.NewManager(cfg.NodeName, cfg.HealthCheckPort, func(peerHostname string, newState, oldState healthcheck.SessionState) {
 		klog.V(2).Infof("Healthcheck state change for peer %s: %s -> %s", peerHostname, oldState, newState)
 		// Toggle BPF map health for eBPF dataplane peers.
-		if tm := state.tunnelMaps["ebpf"]; tm != nil {
+		if tm := state.tunnelMap; tm != nil {
 			healthy := newState == healthcheck.StateUp
 			if n := tm.SetPeerHealth(peerHostname, healthy); n > 0 {
 				klog.V(2).Infof("eBPF: set %d BPF entries for peer %s healthy=%v", n, peerHostname, healthy)
-			}
-		}
-
-		switch newState {
-		case healthcheck.StateDown:
-			if rmErr := routeManager.RemoveNexthopForPeer(peerHostname); rmErr != nil {
-				klog.Errorf("Failed to remove nexthop for peer %s on health-down: %v", peerHostname, rmErr)
-			}
-		case healthcheck.StateUp:
-			if rmErr := routeManager.RestoreNexthopForPeer(peerHostname); rmErr != nil {
-				klog.Errorf("Failed to restore nexthop for peer %s on health-up: %v", peerHostname, rmErr)
 			}
 		}
 	})
@@ -561,11 +528,6 @@ func cleanupNodeNetworkingOnShutdown(cfg *config, state *wireGuardState) {
 	for ifaceName, manager := range state.gatewayWireguardManagers {
 		gatewayWGManagers[ifaceName] = manager
 	}
-
-	geneveManagers := make(map[string]*unboundednetnetlink.LinkManager, len(state.geneveInterfaces))
-	for ifName, lm := range state.geneveInterfaces {
-		geneveManagers[ifName] = lm
-	}
 	state.mu.Unlock()
 
 	// Stop healthcheck manager
@@ -671,20 +633,6 @@ func cleanupNodeNetworkingOnShutdown(cfg *config, state *wireGuardState) {
 			}
 
 			klog.Infof("Deleted gateway WireGuard interface %s on shutdown", ifaceName)
-		}
-
-		// GENEVE interfaces
-		for ifName, lm := range geneveManagers {
-			if lm == nil {
-				continue
-			}
-
-			if err := lm.DeleteLink(); err != nil {
-				klog.Errorf("Failed to delete GENEVE interface %s on shutdown: %v", ifName, err)
-				continue
-			}
-
-			klog.Infof("Deleted GENEVE interface %s on shutdown", ifName)
 		}
 
 		// Sweep for any remaining managed tunnel interfaces (wg*, gn*, ip*, vxlan*)
@@ -1996,24 +1944,19 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 
 	geneveEnabled := cfg.GeneveInterfaceName != ""
 	if geneveEnabled {
-		// Reset pending BPF entries for this reconcile cycle.
-		if cfg.TunnelDataplane == "ebpf" {
-			state.mu.Lock()
-			state.pendingBPFEntries = nil
-			state.allGatewayPeersForSupernets = gatewayPeers
-			state.mu.Unlock()
-		}
+		state.mu.Lock()
+		state.pendingBPFEntries = nil
+		state.mu.Unlock()
 
 		var (
 			tunnelMeshPeers    []meshPeerInfo
 			tunnelGatewayPeers []gatewayPeerInfo
-			vxlanMeshPeers     []meshPeerInfo
-			vxlanGatewayPeers  []gatewayPeerInfo
 		)
 
-		wgMeshPeers, wgGatewayPeers, tunnelMeshPeers, tunnelGatewayPeers, vxlanMeshPeers, vxlanGatewayPeers = filterPeersByTunnelProtocol(peers, gatewayPeers)
+		wgMeshPeers, wgGatewayPeers, tunnelMeshPeers, tunnelGatewayPeers = filterPeersByTunnelProtocol(peers, gatewayPeers)
 
-		// Configure per-peer tunnel (GENEVE/IPIP/None) peers.
+		// Configure all shared-tunnel peers (GENEVE/VXLAN/IPIP/None) on
+		// their respective flow-based interfaces (geneve0/vxlan0/ipip0).
 		var tunnelErr error
 
 		tunnelRoutes, tunnelHCPeers, tunnelErr = configureTunnelPeers(ctx, cfg, tunnelMeshPeers, tunnelGatewayPeers,
@@ -2024,32 +1967,34 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 			siteTunnelMTUs, peeringSiteTunnelMTUs, assignmentSiteTunnelMTUs,
 			assignmentPoolTunnelMTUs, poolTunnelMTUs, state)
 		if tunnelErr != nil {
-			klog.Warningf("GENEVE configuration failed (WireGuard will still be configured): %v", tunnelErr)
+			klog.Warningf("Tunnel configuration failed (WireGuard will still be configured): %v", tunnelErr)
 		}
 
-		// Configure VXLAN peers (single shared interface with route-based encap).
-		if len(vxlanMeshPeers) > 0 || len(vxlanGatewayPeers) > 0 {
-			vxlanRoutes, vxlanHCPeers, vxlanErr := configureVXLANPeers(ctx, cfg, vxlanMeshPeers, vxlanGatewayPeers,
-				mySiteName, peeredSites,
-				siteHealthCheckProfileNames, peeringSiteHealthCheckProfileNames,
-				assignmentSiteHealthCheckProfileNames, assignmentPoolHealthCheckProfileNames,
-				poolHealthCheckProfileNames,
-				siteTunnelMTUs, peeringSiteTunnelMTUs, assignmentSiteTunnelMTUs,
-				assignmentPoolTunnelMTUs, poolTunnelMTUs, state)
-			if vxlanErr != nil {
-				klog.Warningf("VXLAN configuration failed: %v", vxlanErr)
-			} else {
-				tunnelRoutes = append(tunnelRoutes, vxlanRoutes...)
-
-				if tunnelHCPeers == nil {
-					tunnelHCPeers = vxlanHCPeers
-				} else {
-					for k, v := range vxlanHCPeers {
-						tunnelHCPeers[k] = v
-					}
+		// One unbounded0 supernet route per overlay CIDR, covering every peer
+		// (WG, GENEVE, IPIP, VXLAN). The BPF program on unbounded0 performs
+		// the per-destination redirect.
+		//
+		// On gateway nodes, also pull in every remote site's pod-CIDR pool
+		// and NodeCidr so packets to remote-site underlay IPs (e.g. kubelet
+		// probes to a peered site's gateway node) are funnelled through
+		// unbounded0 and the BPF program's per-gateway /32 entries get a
+		// chance to pin them to the correct WG tunnel. The gateway's own
+		// site NodeCidr is excluded because that traffic must keep using
+		// the host's default route.
+		var extraSupernets []string
+		if isGatewayNode {
+			for siteName, site := range siteMap {
+				for _, assignment := range site.Spec.PodCidrAssignments {
+					extraSupernets = append(extraSupernets, assignment.CidrBlocks...)
 				}
+				if siteName == mySiteName {
+					continue
+				}
+				extraSupernets = append(extraSupernets, site.Spec.NodeCidrs...)
 			}
 		}
+
+		tunnelRoutes = append(tunnelRoutes, buildSupernetRoutes(cfg, state, peers, gatewayPeers, extraSupernets)...)
 	} else {
 		wgMeshPeers = peers
 		wgGatewayPeers = gatewayPeers
@@ -2068,24 +2013,10 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 		return err
 	}
 
-	// When using eBPF dataplane, add WireGuard peer CIDRs to the BPF map
-	// so that unbounded0 routes are redirected to the WG interface.
-	// WG peers get redirect-only (no set_tunnel_key -- WG handles its own encap).
-	if cfg.TunnelDataplane == "ebpf" {
-		addWireGuardPeersToBPFMap(cfg, state, wgMeshPeers, wgGatewayPeers)
-		// Final reconcile: merge all pending entries (GENEVE + VXLAN + WG)
-		// into a single BPF map update. This avoids per-protocol Reconcile
-		// calls overwriting each other's entries.
-		reconcilePendingBPFEntries(state)
-		// Remove tunnel devices that no peers are using. This avoids leaving
-		// stale interfaces (geneve0, vxlan0, ipip0) on nodes where the
-		// tunnel protocol has been changed.
-		cleanupUnusedTunnelDevices(peers, gatewayPeers, wgGatewayPeers, state.forwardManager, state.notrackManager)
-		// Re-apply rp_filter=0 on active tunnel interfaces. Deleting
-		// interfaces during cleanup can cause the kernel to reset
-		// rp_filter on remaining interfaces.
-		reapplyRPFilterOnActiveTunnels(peers, gatewayPeers, wgGatewayPeers, state.forwardManager, state.isGatewayNode, state.notrackManager)
-	}
+	addWireGuardPeersToBPFMap(cfg, state, wgMeshPeers, wgGatewayPeers)
+	reconcilePendingBPFEntries(state)
+	cleanupUnusedTunnelDevices(peers, gatewayPeers, wgGatewayPeers, state.forwardManager, state.notrackManager)
+	reapplyRPFilterOnActiveTunnels(peers, gatewayPeers, wgGatewayPeers, state.forwardManager, state.isGatewayNode, state.notrackManager)
 
 	// Reconcile notrack rules for conntrack bypass on gateway nodes.
 	if state.notrackManager != nil {
@@ -2124,7 +2055,17 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 				supernets = append(supernets, cidr)
 			}
 
-			if err := state.notrackManager.ReconcileCIDRs(state.nodePodCIDRs, supernets); err != nil {
+			// Local-site NodeCidrs must remain conntrack-tracked even on
+			// gateway nodes: transit packets bound for the gateway's own
+			// site underlay (e.g. a service ClusterIP DNAT'd by a remote
+			// node to an in-site host-network pod) leave eth0 and need
+			// MASQUERADE in nat/POSTROUTING, which requires conntrack.
+			var returnCIDRs []string
+			if mySite, ok := siteMap[mySiteName]; ok {
+				returnCIDRs = append(returnCIDRs, mySite.Spec.NodeCidrs...)
+			}
+
+			if err := state.notrackManager.ReconcileCIDRs(state.nodePodCIDRs, returnCIDRs, supernets); err != nil {
 				klog.Warningf("Failed to reconcile notrack CIDRs: %v", err)
 			}
 		} else {

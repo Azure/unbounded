@@ -68,6 +68,16 @@ UNBOUNDED_STORAGE_BIN=bin/unbounded-storage
 UNBOUNDED_STORAGE_CRATE=./cmd/unbounded-storage
 CARGO ?= cargo
 
+# Mercury (mercury-hpc) is a native dependency of the unbounded-storage crate.
+# We build a pinned version from source into a project-local prefix; the
+# unbounded-storage build.rs honours $MERCURY_PKG_CONFIG_PATH so it picks up
+# our local install ahead of any system copy.
+MERCURY_VERSION ?= v2.3.1
+MERCURY_PREFIX  ?= $(CURDIR)/tmp/mercury-prefix
+MERCURY_SRC     ?= $(CURDIR)/tmp/mercury-src
+MERCURY_PC_FILE := $(MERCURY_PREFIX)/lib/pkgconfig/mercury.pc
+MERCURY_INSTALL_SCRIPT := hack/scripts/install-mercury.sh
+
 # Version is derived from the latest git tag. Override with: make VERSION=v1.0.0
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 GIT_COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
@@ -123,11 +133,11 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 # Frontend build toggle (dev builds produce unminified output with sourcemaps).
 REACT_DEV ?= false
 
-.PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute notice notice-check
-.PHONY: net-frontend net-frontend-clean net-build-ebpf net-manifests release-manifests
+.PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check
+.PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-manifests
 .PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-net-controller-local image-net-node-local images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
-.PHONY: unbounded-storage unbounded-storage-build unbounded-storage-test
+.PHONY: unbounded-storage unbounded-storage-build unbounded-storage-test unbounded-storage-check mercury mercury-clean
 
 ##@ General
 
@@ -177,6 +187,9 @@ help: ## Show this help
 	@echo "Rust Binaries:"
 	@echo "  unbounded-storage | unbounded-storage-build  Build unbounded-storage (with/without test)"
 	@echo "  unbounded-storage-test           Run cargo tests for unbounded-storage"
+	@echo "  unbounded-storage-check          Run cargo check for unbounded-storage"
+	@echo "  mercury                          Build pinned Mercury into \$$(MERCURY_PREFIX)"
+	@echo "  mercury-clean                    Remove the local Mercury prefix and source tree"
 	@echo ""
 	@echo "Container Images (local, single-arch):"
 	@echo "  image-inventory-all-local        Build all local inventory container images"
@@ -208,7 +221,9 @@ help: ## Show this help
 	@echo "  net-frontend-clean               Remove node_modules and dist artifacts"
 	@echo ""
 	@echo "Net eBPF:"
-	@echo "  net-build-ebpf                   Compile bpf/unbounded_encap.c (requires clang)"
+	@echo "  net-ebpf-build                   Compile bpf/unbounded_encap.c (requires clang-18; see bpf/clang-version)"
+	@echo "  net-ebpf-generate                Regenerate bpf/vmlinux.h from pinned Ubuntu kernel (requires bpftool, curl, dpkg-deb, python3)"
+	@echo "  net-ebpf-verify                  Verify bpf/vmlinux.h matches bpf/btf-kernel-pin{,-hashes} (no extra tools)"
 	@echo ""
 	@echo "Net Manifests:"
 	@echo "  machina-manifests                Render machina manifests into deploy/machina/rendered"
@@ -422,28 +437,61 @@ metalman: test metalman-build ## Build the metalman controller (implies test)
 
 ##@ Net Binaries
 
-unbounded-net-controller: test ## Build the unbounded-net-controller (implies test)
+unbounded-net-controller-build: ## Build the unbounded-net-controller binary (no lint/test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(NET_CONTROLLER_BIN) $(NET_CONTROLLER_CMD)
 
-unbounded-net-node: test ## Build the unbounded-net-node (implies test)
+unbounded-net-controller: test unbounded-net-controller-build ## Build the unbounded-net-controller (implies test)
+
+unbounded-net-node-build: ## Build the unbounded-net-node binary (no lint/test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(NET_NODE_BIN) $(NET_NODE_CMD)
+
+unbounded-net-node: test unbounded-net-node-build ## Build the unbounded-net-node (implies test)
 
 unbounded-net-routeplan-debug: test ## Build the routeplan debug tool (implies test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(NET_ROUTEPLAN_DEBUG_BIN) $(NET_ROUTEPLAN_DEBUG_CMD)
 
-unping: test ## Build the unping utility (implies test)
+unping-build: ## Build the unping utility binary (no lint/test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(UNPING_BIN) $(UNPING_CMD)
 
-unroute: test ## Build the unroute utility (implies test)
+unping: test unping-build ## Build the unping utility (implies test)
+
+unroute-build: ## Build the unroute utility binary (no lint/test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(UNROUTE_BIN) $(UNROUTE_CMD)
+
+unroute: test unroute-build ## Build the unroute utility (implies test)
 
 ##@ Rust Binaries
 
-unbounded-storage-test: ## Run cargo tests for unbounded-storage
-	$(CARGO) test --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --locked --all-targets
+# Mercury env: prepend our local prefix so cargo/build.rs find the right .pc
+# files and so the resulting binaries/tests can dlopen libmercury at runtime.
+# Targets that invoke cargo must export these via `$(UNBOUNDED_STORAGE_ENV)`.
+UNBOUNDED_STORAGE_ENV = \
+	MERCURY_PKG_CONFIG_PATH="$(MERCURY_PREFIX)/lib/pkgconfig" \
+	PKG_CONFIG_PATH="$(MERCURY_PREFIX)/lib/pkgconfig:$${PKG_CONFIG_PATH}" \
+	LD_LIBRARY_PATH="$(MERCURY_PREFIX)/lib:$${LD_LIBRARY_PATH}"
 
-unbounded-storage-build: ## Build the unbounded-storage binary (no test)
-	$(CARGO) build --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --release --locked
+mercury: $(MERCURY_PC_FILE) ## Build pinned Mercury into $(MERCURY_PREFIX) (idempotent)
+
+# The install script is itself idempotent: if mercury.pc already advertises the
+# pinned version it exits immediately. We still gate on the .pc file as the
+# Make-level sentinel so a cached prefix avoids invoking the script at all.
+$(MERCURY_PC_FILE): $(MERCURY_INSTALL_SCRIPT)
+	MERCURY_VERSION=$(MERCURY_VERSION) \
+	MERCURY_PREFIX=$(MERCURY_PREFIX) \
+	MERCURY_SRC=$(MERCURY_SRC) \
+		$(MERCURY_INSTALL_SCRIPT)
+
+mercury-clean: ## Remove the local Mercury prefix and source tree
+	rm -rf "$(MERCURY_PREFIX)" "$(MERCURY_SRC)"
+
+unbounded-storage-check: mercury ## Run cargo check for unbounded-storage
+	$(UNBOUNDED_STORAGE_ENV) $(CARGO) check --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --locked --all-targets
+
+unbounded-storage-test: mercury ## Run cargo tests for unbounded-storage
+	$(UNBOUNDED_STORAGE_ENV) $(CARGO) test --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --locked --all-targets
+
+unbounded-storage-build: mercury ## Build the unbounded-storage binary (no test)
+	$(UNBOUNDED_STORAGE_ENV) $(CARGO) build --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --release --locked
 	@mkdir -p $(dir $(UNBOUNDED_STORAGE_BIN))
 	cp $(UNBOUNDED_STORAGE_CRATE)/target/release/unbounded-storage $(UNBOUNDED_STORAGE_BIN)
 
@@ -675,24 +723,28 @@ endif
 
 image-net-controller-local: net-frontend resources/cni-plugins-linux-$(HOST_GOARCH)-$(CNI_PLUGINS_VERSION).tgz ## Build the unbounded-net-controller image locally (single-arch)
 	$(CONTAINER_ENGINE) build \
+		$(if $(PLATFORMS),--platform=$(PLATFORMS),) \
 		--target controller \
 		--build-arg VERSION=$(VERSION) \
 		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
 		--build-arg BUILD_TIME=$(BUILD_TIME) \
 		--build-arg CNI_PLUGINS_VERSION=$(CNI_PLUGINS_VERSION) \
+		--build-arg BUILDARCH=$(HOST_GOARCH) \
 		-t $(NET_CONTROLLER_IMAGE) \
-		-f ./images/net-controller/Dockerfile .
+		-f ./images/net/Containerfile .
 	$(call trivy-maybe,$(NET_CONTROLLER_IMAGE))
 
 image-net-node-local: resources/cni-plugins-linux-$(HOST_GOARCH)-$(CNI_PLUGINS_VERSION).tgz ## Build the unbounded-net-node image locally (single-arch)
 	$(CONTAINER_ENGINE) build \
+		$(if $(PLATFORMS),--platform=$(PLATFORMS),) \
 		--target node \
 		--build-arg VERSION=$(VERSION) \
 		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
 		--build-arg BUILD_TIME=$(BUILD_TIME) \
 		--build-arg CNI_PLUGINS_VERSION=$(CNI_PLUGINS_VERSION) \
+		--build-arg BUILDARCH=$(HOST_GOARCH) \
 		-t $(NET_NODE_IMAGE) \
-		-f ./images/net-node/Dockerfile .
+		-f ./images/net/Containerfile .
 	$(call trivy-maybe,$(NET_NODE_IMAGE))
 
 image-net-controller-push: image-net-controller-local ## Build and push the unbounded-net-controller image
@@ -739,13 +791,19 @@ net-frontend-clean: ## Remove frontend node_modules and dist artifacts
 
 ##@ Net eBPF
 
-net-build-ebpf: ## Compile bpf/unbounded_encap.c to internal/net/ebpf/unbounded_encap_bpfel.o (requires clang)
+net-ebpf-build: ## Compile bpf/unbounded_encap.c to internal/net/ebpf/unbounded_encap_bpfel.o (requires clang-18; see bpf/clang-version)
 	@echo "Compiling eBPF programs..."
-	@clang -O2 -g -target bpf \
+	@clang-18 -O2 -g -target bpf \
 		-I/usr/include \
 		-c bpf/unbounded_encap.c \
 		-o internal/net/ebpf/unbounded_encap_bpfel.o
 	@echo "eBPF programs compiled."
+
+net-ebpf-generate: ## Regenerate bpf/vmlinux.h from pinned kernel and run bpf2go (requires bpftool, curl, dpkg-deb, python3)
+	@hack/scripts/net-ebpf-generate.sh
+
+net-ebpf-verify: ## Verify bpf/vmlinux.h matches bpf/btf-kernel-pin and bpf/btf-kernel-pin-hashes
+	@hack/scripts/net-ebpf-verify.sh
 
 ##@ Net Manifests
 

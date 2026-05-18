@@ -38,10 +38,11 @@ Pod-to-pod traffic between two nodes in the same site:
 2. **Kernel routing**: Supernet route (e.g., `100.64.0.0/16 dev unbounded0
    scope global`) attracts packet to `unbounded0`.
 3. **TC egress BPF**: `unbounded_encap` runs on TC egress of `unbounded0`.
-4. **LPM lookup**: Longest-prefix-match in `unbounded_endpoints_v4` (or v6).
-5. **Tunnel metadata**: If `TUNNEL_F_SET_KEY` is set,
-   `bpf_skb_set_tunnel_key()` is called with remote underlay IP, VNI, and
-   TTL=64.
+4. **LPM lookup**: Longest-prefix-match in the unified `unb_endpts` trie
+   (16-byte key; v4 entries live in `::ffff:<v4>/N+96` form).
+5. **Tunnel metadata**: For GENEVE/VXLAN/IPIP nexthops, `bpf_skb_set_tunnel_key()`
+   is called with remote underlay endpoint, VNI, and TTL=64. For WireGuard and
+   `None` nexthops the program just redirects.
 6. **Inner MAC rewrite**: Destination MAC set to
    `02:<ip[0]>:<ip[1]>:<ip[2]>:<ip[3]>:FF`.
 7. **Redirect**: `bpf_redirect(geneve0)` sends packet to GENEVE driver, which
@@ -60,8 +61,9 @@ Traffic between pods in different sites, transiting through gateway nodes:
 
 **Step by step:**
 
-1. Worker BPF LPM lookup finds WireGuard endpoint entry (no `TUNNEL_F_SET_KEY`
-   flag). `bpf_redirect(wg51821)` sends packet to WireGuard.
+1. Worker BPF LPM lookup finds a WireGuard nexthop (protocol=WireGuard, so
+   the program skips `bpf_skb_set_tunnel_key`). `bpf_redirect(wg51821)`
+   sends packet to WireGuard.
 2. WireGuard encrypts and sends UDP to Site 1 gateway.
 3. Gateway decrypts, forwards via `unbounded0`. BPF lookup resolves to
    `wg51822` (gateway-to-gateway WireGuard).

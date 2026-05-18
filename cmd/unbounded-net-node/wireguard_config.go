@@ -9,7 +9,6 @@ import (
 	"net"
 	"sort"
 
-	"github.com/vishvananda/netlink"
 	"k8s.io/klog/v2"
 
 	unboundednetnetlink "github.com/Azure/unbounded/internal/net/netlink"
@@ -27,8 +26,6 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 
 	port := cfg.WireGuardPort
 	iface := fmt.Sprintf("wg%d", port)
-	localPodCIDRs := routeplan.BuildNormalizedCIDRSet(nodePodCIDRs)
-	localGatewayHostCIDRs := routeplan.BuildLocalGatewayHostCIDRSetFromPodCIDRs(nodePodCIDRs)
 
 	// Detect the tunnel MTU once for all interfaces in this reconciliation.
 	// MTU = default-route interface MTU minus WireGuard encapsulation overhead.
@@ -273,26 +270,11 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 		state.notrackManager.EnsureInterface(iface)
 	}
 
-	// Build routes for mesh interface via shared route builder.
-	// All routing is per-peer for healthcheck granularity: bootstrap host routes,
-	// pod CIDR routes, and internal IP routes for non-peered sites.
+	// Routes are managed centrally: per-CIDR unbounded0 routes are built by
+	// buildSupernetRoutes in the parent reconcile and arrive here via
+	// additionalRoutes. No per-peer kernel routes are emitted; the BPF
+	// program performs all per-destination redirection.
 	var allDesiredRoutes []unboundednetnetlink.DesiredRoute
-
-	// Resolve the link index for the mesh interface
-	meshLink, meshLinkErr := netlink.LinkByName(iface)
-
-	meshLinkIndex := 0
-	if meshLinkErr == nil && meshLink != nil {
-		meshLinkIndex = meshLink.Attrs().Index
-	} else {
-		klog.Warningf("Failed to resolve link index for %s: %v", iface, meshLinkErr)
-	}
-
-	for _, peer := range peers {
-		peerMTU := resolveMeshPeerTunnelMTU(tunnelMTU, peer, mySiteName, siteTunnelMTUs, peeringSiteTunnelMTUs, assignmentSiteTunnelMTUs)
-		peerRoutes := buildMeshPeerRoutes(peer, meshLinkIndex, iface, mySiteName, peeredSites, cfg, peerMTU, localPodCIDRs, localGatewayHostCIDRs)
-		allDesiredRoutes = append(allDesiredRoutes, peerRoutes...)
-	}
 
 	// === Configure separate gateway interfaces for gateway peers ===
 
@@ -488,24 +470,6 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 				klog.Warningf("Failed to configure policy routing for %s: %v", gwIfaceName, err)
 				// Continue - policy routing is not critical
 			}
-		}
-
-		// Build gateway peer routes via shared route builder.
-		gwLink, gwLinkErr := netlink.LinkByName(gwIfaceName)
-
-		gwLinkIdx := 0
-		if gwLinkErr == nil && gwLink != nil {
-			gwLinkIdx = gwLink.Attrs().Index
-		}
-
-		gwPeerMTU := resolveGatewayPeerTunnelMTU(tunnelMTU, mySiteName, gwPeer, siteTunnelMTUs, assignmentPoolTunnelMTUs, poolTunnelMTUs)
-		// In eBPF mode, skip creating kernel routes for WG gateway peers --
-		// the BPF program on unbounded0 handles routing to the correct WG
-		// interface via the LPM trie. Creating WG-interface routes would
-		// conflict with the unbounded0 supernet routes.
-		if cfg.TunnelDataplane != "ebpf" {
-			gwPeerRoutes := buildGatewayPeerRoutes(gwPeer, gwLinkIdx, gwIfaceName, mySiteName, cfg, gwPeerMTU, localPodCIDRs, localGatewayHostCIDRs)
-			allDesiredRoutes = append(allDesiredRoutes, gwPeerRoutes...)
 		}
 
 		prevName, hadPrevName := state.gatewayNames[gwIfaceName]

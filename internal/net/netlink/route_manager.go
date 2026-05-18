@@ -23,15 +23,14 @@ import (
 
 // DesiredRoute describes a route to be programmed by the UnifiedRouteManager.
 type DesiredRoute struct {
-	Prefix            net.IPNet        // destination prefix
-	Nexthops          []DesiredNexthop // one or more nexthops (for ECMP)
-	Metric            int              // route metric (lower = preferred)
-	MTU               int              // per-route MTU (0 = no MTU set)
-	Table             int              // routing table (0 = main)
-	HealthCheckImmune bool             // if true, route is never withdrawn by healthcheck
-	Encap             netlink.Encap    // lightweight tunnel encap (nil = none)
-	Flags             int              // route flags (e.g. unix.RTNH_F_ONLINK)
-	ScopeGlobal       bool             // if true, use scope global instead of link for gatewayless routes
+	Prefix      net.IPNet        // destination prefix
+	Nexthops    []DesiredNexthop // one or more nexthops (for ECMP)
+	Metric      int              // route metric (lower = preferred)
+	MTU         int              // per-route MTU (0 = no MTU set)
+	Table       int              // routing table (0 = main)
+	Encap       netlink.Encap    // lightweight tunnel encap (nil = none)
+	Flags       int              // route flags (e.g. unix.RTNH_F_ONLINK)
+	ScopeGlobal bool             // if true, use scope global instead of link for gatewayless routes
 }
 
 // DesiredNexthop describes a single nexthop for a route.
@@ -100,11 +99,8 @@ type UnifiedRouteManager struct {
 	// Route tracking
 	installedRoutes map[string]*installedRouteState // routeKey -> route info
 
-	// Desired routes (kept so RestoreNexthopForPeer can rebuild routes)
+	// desiredRoutes stores the last synced desired set, used by ValidateRoutes.
 	desiredRoutes []DesiredRoute
-
-	// Peer health state (for fast removal/restoration)
-	peerHealthy map[string]bool // peerID -> healthy
 
 	// Preferred source IPs for routes (one per IP family)
 	preferredSrcIPv4 net.IP
@@ -131,7 +127,6 @@ func NewUnifiedRouteManager(linkName string, defaultTable int) *UnifiedRouteMana
 		nexthops:        make(map[string]*nexthopState),
 		nexthopIDs:      make(map[uint32]string),
 		installedRoutes: make(map[string]*installedRouteState),
-		peerHealthy:     make(map[string]bool),
 	}
 
 	// Try to resolve link index; the interface may not exist yet.
@@ -204,13 +199,8 @@ func (m *UnifiedRouteManager) SyncRoutes(desired []DesiredRoute) error {
 	for _, dr := range desired {
 		normalized := normalizePrefix(dr.Prefix)
 
-		// Ensure all nexthops are tracked and default-healthy.
 		for _, nh := range dr.Nexthops {
 			m.ensureNexthop(nh)
-
-			if _, tracked := m.peerHealthy[nh.PeerID]; !tracked {
-				m.peerHealthy[nh.PeerID] = true
-			}
 		}
 
 		key := m.routeKey(dr.Table, normalized)
@@ -233,10 +223,6 @@ func (m *UnifiedRouteManager) SyncRoutes(desired []DesiredRoute) error {
 			if dr.MTU > 0 && (existing.MTU == 0 || dr.MTU < existing.MTU) {
 				existing.MTU = dr.MTU
 			}
-			// If any contributor is immune, the merged route is immune
-			if dr.HealthCheckImmune {
-				existing.HealthCheckImmune = true
-			}
 			// Preserve encap if the new route has one and the existing does not.
 			if dr.Encap != nil && existing.Encap == nil {
 				existing.Encap = dr.Encap
@@ -245,39 +231,34 @@ func (m *UnifiedRouteManager) SyncRoutes(desired []DesiredRoute) error {
 			desiredSet[key] = existing
 		} else {
 			desiredSet[key] = DesiredRoute{
-				Prefix:            normalized,
-				Nexthops:          dr.Nexthops,
-				Metric:            dr.Metric,
-				MTU:               dr.MTU,
-				Table:             dr.Table,
-				HealthCheckImmune: dr.HealthCheckImmune,
-				Encap:             dr.Encap,
+				Prefix:   normalized,
+				Nexthops: dr.Nexthops,
+				Metric:   dr.Metric,
+				MTU:      dr.MTU,
+				Table:    dr.Table,
+				Encap:    dr.Encap,
 			}
 		}
 	}
 
-	// Store the merged desired routes for use by RestoreNexthopForPeer.
-	m.desiredRoutes = make([]DesiredRoute, 0, len(desiredSet))
-	for _, dr := range desiredSet {
-		m.desiredRoutes = append(m.desiredRoutes, dr)
-	}
-
 	// Add or update routes.
+	m.desiredRoutes = m.desiredRoutes[:0]
+
 	for key, dr := range desiredSet {
-		active := m.activeNexthops(dr)
-		if len(active) == 0 {
-			klog.V(2).Infof("No healthy nexthops for route %s, skipping", dr.Prefix.String())
+		if len(dr.Nexthops) == 0 {
 			continue
 		}
 
-		route := m.buildKernelRoute(dr, active)
+		m.desiredRoutes = append(m.desiredRoutes, dr)
+
+		route := m.buildKernelRoute(dr, dr.Nexthops)
 		if route == nil {
 			klog.V(2).Infof("Could not build kernel route for %s, skipping", dr.Prefix.String())
 			continue
 		}
 
 		existing, installed := m.installedRoutes[key]
-		if installed && !m.routeNeedsUpdate(existing, dr, active) {
+		if installed && !m.routeNeedsUpdate(existing, dr, dr.Nexthops) {
 			continue
 		}
 
@@ -297,14 +278,14 @@ func (m *UnifiedRouteManager) SyncRoutes(desired []DesiredRoute) error {
 			continue
 		}
 
-		m.installedRoutes[key] = m.buildInstalledState(dr, active)
+		m.installedRoutes[key] = m.buildInstalledState(dr, dr.Nexthops)
 
 		if !installed {
 			added++
 
-			klog.Infof("Added route for %s via %d nexthop(s)", dr.Prefix.String(), len(active))
+			klog.Infof("Added route for %s via %d nexthop(s)", dr.Prefix.String(), len(dr.Nexthops))
 		} else {
-			klog.V(2).Infof("Updated route for %s via %d nexthop(s)", dr.Prefix.String(), len(active))
+			klog.V(2).Infof("Updated route for %s via %d nexthop(s)", dr.Prefix.String(), len(dr.Nexthops))
 		}
 	}
 
@@ -332,115 +313,6 @@ func (m *UnifiedRouteManager) SyncRoutes(desired []DesiredRoute) error {
 	m.cleanupOrphanedKernelRoutes(desiredSet)
 
 	return syncErr
-}
-
-// RemoveNexthopForPeer removes a peer's nexthop from all groups and routes.
-// This is called when a health-check session goes down.
-func (m *UnifiedRouteManager) RemoveNexthopForPeer(peerID string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	matched := m.setPeerHealthByPrefix(peerID, false)
-	if matched == 0 {
-		klog.V(4).Infof("No nexthops found for peer %s to mark unhealthy (may be eBPF-only)", peerID)
-		return nil
-	}
-
-	klog.Infof("Marking peer %s as unhealthy (%d nexthop(s)), updating routes", peerID, matched)
-
-	return m.rebuildRoutesForPeerPrefix(peerID)
-}
-
-// RestoreNexthopForPeer re-adds a peer's nexthop to all applicable routes.
-// This is called when a health-check session comes back up.
-func (m *UnifiedRouteManager) RestoreNexthopForPeer(peerID string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	matched := m.setPeerHealthByPrefix(peerID, true)
-	if matched == 0 {
-		klog.V(4).Infof("No nexthops found for peer %s to mark healthy (may be eBPF-only)", peerID)
-		return nil
-	}
-
-	klog.Infof("Marking peer %s as healthy (%d nexthop(s)), updating routes", peerID, matched)
-
-	return m.rebuildRoutesForPeerPrefix(peerID)
-}
-
-// setPeerHealthByPrefix sets the health state for all peer IDs that match
-// the given prefix. The healthcheck uses bare hostnames (e.g., "node-a") while
-// nexthop peer IDs include the interface (e.g., "node-a/wg51820"). This method
-// matches both exact IDs and hostname-prefixed IDs (hostname + "/").
-func (m *UnifiedRouteManager) setPeerHealthByPrefix(prefix string, healthy bool) int {
-	matched := 0
-
-	for id := range m.peerHealthy {
-		if id == prefix || strings.HasPrefix(id, prefix+"/") {
-			m.peerHealthy[id] = healthy
-			matched++
-		}
-	}
-
-	return matched
-}
-
-// rebuildRoutesForPeerPrefix rebuilds routes for any peer ID matching the
-// given prefix (hostname or exact ID).
-func (m *UnifiedRouteManager) rebuildRoutesForPeerPrefix(prefix string) error {
-	var lastErr error
-
-	for _, dr := range m.desiredRoutes {
-		if !routeReferencesPeerPrefix(dr, prefix) {
-			continue
-		}
-
-		normalized := normalizePrefix(dr.Prefix)
-		key := m.routeKey(dr.Table, normalized)
-		active := m.activeNexthops(dr)
-
-		if len(active) == 0 {
-			if state, installed := m.installedRoutes[key]; installed {
-				if err := m.deleteKernelRoute(state); err != nil {
-					klog.Errorf("Failed to remove route %s after peer %s went down: %v", normalized.String(), prefix, err)
-					lastErr = err
-
-					continue
-				}
-
-				delete(m.installedRoutes, key)
-				klog.Infof("Removed route %s (last nexthop peer %s went down)", normalized.String(), prefix)
-			}
-
-			continue
-		}
-
-		normalizedDR := DesiredRoute{
-			Prefix:   normalized,
-			Nexthops: dr.Nexthops,
-			Metric:   dr.Metric,
-			MTU:      dr.MTU,
-			Table:    dr.Table,
-			Encap:    dr.Encap,
-		}
-
-		route := m.buildKernelRoute(normalizedDR, active)
-		if route == nil {
-			continue
-		}
-
-		if err := netlink.RouteReplace(route); err != nil {
-			klog.Errorf("Failed to update route %s for peer %s change: %v", normalized.String(), prefix, err)
-			lastErr = err
-
-			continue
-		}
-
-		m.installedRoutes[key] = m.buildInstalledState(normalizedDR, active)
-		klog.V(2).Infof("Updated route %s (now %d nexthop(s) after peer %s change)", normalized.String(), len(active), prefix)
-	}
-
-	return lastErr
 }
 
 // RemoveAllRoutes removes all managed routes and clears tracking state.
@@ -526,12 +398,11 @@ func (m *UnifiedRouteManager) ValidateRoutes() int {
 	expected := make(map[string]*expectedEntry)
 
 	for _, dr := range m.desiredRoutes {
-		active := m.activeNexthops(dr)
-		if len(active) == 0 {
+		if len(dr.Nexthops) == 0 {
 			continue
 		}
 
-		kr := m.buildKernelRoute(dr, active)
+		kr := m.buildKernelRoute(dr, dr.Nexthops)
 		if kr == nil {
 			continue
 		}
@@ -540,7 +411,7 @@ func (m *UnifiedRouteManager) ValidateRoutes() int {
 		key := fmt.Sprintf("%d:%s:%d", table, dr.Prefix.String(), dr.Metric)
 		expected[key] = &expectedEntry{
 			desired:     dr,
-			activeNH:    active,
+			activeNH:    dr.Nexthops,
 			kernelRoute: kr,
 		}
 	}
@@ -760,26 +631,6 @@ func (m *UnifiedRouteManager) ensureNexthop(nh DesiredNexthop) uint32 {
 	m.nexthopIDs[id] = nh.PeerID
 
 	return id
-}
-
-// activeNexthops returns the subset of a route's nexthops whose peers are
-// considered healthy (or not yet tracked, which defaults to healthy).
-func (m *UnifiedRouteManager) activeNexthops(dr DesiredRoute) []DesiredNexthop {
-	// Health-check-immune routes always return all nexthops regardless of health.
-	if dr.HealthCheckImmune {
-		return dr.Nexthops
-	}
-
-	var active []DesiredNexthop
-
-	for _, nh := range dr.Nexthops {
-		healthy, tracked := m.peerHealthy[nh.PeerID]
-		if !tracked || healthy {
-			active = append(active, nh)
-		}
-	}
-
-	return active
 }
 
 // preferredSrc returns the configured preferred source IP for the given prefix
@@ -1109,18 +960,6 @@ func (m *UnifiedRouteManager) cleanupOrphanedKernelRoutes(desiredSet map[string]
 func routeReferencesPeer(dr DesiredRoute, peerID string) bool {
 	for _, nh := range dr.Nexthops {
 		if nh.PeerID == peerID {
-			return true
-		}
-	}
-
-	return false
-}
-
-// routeReferencesPeerPrefix returns true if any nexthop in the route has a
-// peer ID that matches the prefix exactly or starts with prefix + "/".
-func routeReferencesPeerPrefix(dr DesiredRoute, prefix string) bool {
-	for _, nh := range dr.Nexthops {
-		if nh.PeerID == prefix || strings.HasPrefix(nh.PeerID, prefix+"/") {
 			return true
 		}
 	}

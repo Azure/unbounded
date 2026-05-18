@@ -22,14 +22,16 @@ Available inside the node agent container:
 kubectl exec -n unbounded-net <pod> -c node -- unroute           # dump all entries
 kubectl exec -n unbounded-net <pod> -c node -- unroute 10.244.1.5  # LPM lookup
 kubectl exec -n unbounded-net <pod> -c node -- unroute -j         # JSON output
-kubectl exec -n unbounded-net <pod> -c node -- unroute --local    # local CIDRs map
+kubectl exec -n unbounded-net <pod> -c node -- unroute -4         # IPv4 entries only
+kubectl exec -n unbounded-net <pod> -c node -- unroute -6         # IPv6 entries only
+kubectl exec -n unbounded-net <pod> -c node -- unroute --raw      # raw key/value hex dump
 ```
 
 Columns: CIDR, REMOTE (underlay IP), NODE (destination node), IFACE, PROTO, VNI, MTU, HEALTHY
 
-The HEALTHY column shows `Y` or `N` per nexthop, indicating whether the BPF
-program considers the nexthop healthy. Unhealthy nexthops are skipped during
-HRW-based flow hashing. Healthcheck probes (UDP 9997) are always forwarded.
+The HEALTHY column shows `Y` or `N` per nexthop. The healthy flag only gates
+ECMP selection on multi-nexthop entries (gateway pools); single-nexthop entries
+forward unconditionally so the destination can still recover via real traffic.
 
 ### unping -- health check probe tool
 
