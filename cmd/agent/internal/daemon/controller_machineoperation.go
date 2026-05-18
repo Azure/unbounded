@@ -22,7 +22,7 @@ type machineOperationTarget struct {
 	nodeOperator nodeOperator
 }
 
-func (t *machineOperationTarget) reconcileNodeReboot(ctx context.Context, store daemon.MachineOperationStore[int64], op daemon.MachineOperation) (ctrl.Result, error) {
+func (t *machineOperationTarget) reconcileNodeReboot(ctx context.Context, store daemon.MachineOperationStore, op daemon.MachineOperation) (ctrl.Result, error) {
 	if err := store.MarkInProgress(ctx, op, "restarting active nspawn node"); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -41,7 +41,7 @@ func (t *machineOperationTarget) reconcileNodeReboot(ctx context.Context, store 
 		return finishFailedMachineOperation(ctx, store, op, err)
 	}
 
-	return ctrl.Result{}, store.Finish(ctx, op, daemon.MachineOperationResult[int64]{
+	return ctrl.Result{}, store.Finish(ctx, op, daemon.MachineOperationResult{
 		Phase:                     v1alpha3.OperationPhaseComplete,
 		Reason:                    "Succeeded",
 		Message:                   "NodeReboot completed",
@@ -49,7 +49,7 @@ func (t *machineOperationTarget) reconcileNodeReboot(ctx context.Context, store 
 	})
 }
 
-func (t *machineOperationTarget) reconcileAgentUpgrade(ctx context.Context, store daemon.MachineOperationStore[int64], op daemon.MachineOperation) (ctrl.Result, error) {
+func (t *machineOperationTarget) reconcileAgentUpgrade(ctx context.Context, store daemon.MachineOperationStore, op daemon.MachineOperation) (ctrl.Result, error) {
 	if err := store.MarkInProgress(ctx, op, "staging upgraded host agent binary"); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -61,7 +61,7 @@ func (t *machineOperationTarget) reconcileAgentUpgrade(ctx context.Context, stor
 
 	downloadURL, err := agentUpgradeDownloadURL(op.Parameters)
 	if err != nil {
-		return ctrl.Result{}, store.Finish(ctx, op, daemon.MachineOperationResult[int64]{Phase: v1alpha3.OperationPhaseFailed, Reason: "InvalidParameters", Message: err.Error()})
+		return ctrl.Result{}, store.Finish(ctx, op, daemon.MachineOperationResult{Phase: v1alpha3.OperationPhaseFailed, Reason: "InvalidParameters", Message: err.Error()})
 	}
 	t.log.Info("staging AgentUpgrade binary", "operation", op.Name, "url", downloadURL)
 
@@ -87,7 +87,7 @@ func (t *machineOperationTarget) reconcileAgentUpgrade(ctx context.Context, stor
 	return ctrl.Result{}, nil
 }
 
-func (t *machineOperationTarget) reconcileAgentReset(ctx context.Context, store daemon.MachineOperationStore[int64], op daemon.MachineOperation) (ctrl.Result, error) {
+func (t *machineOperationTarget) reconcileAgentReset(ctx context.Context, store daemon.MachineOperationStore, op daemon.MachineOperation) (ctrl.Result, error) {
 	if err := store.MarkInProgress(ctx, op, "resetting unbounded agent"); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -101,7 +101,7 @@ func (t *machineOperationTarget) reconcileAgentReset(ctx context.Context, store 
 		return finishFailedMachineOperation(ctx, store, op, err)
 	}
 
-	if err := store.Finish(ctx, op, daemon.MachineOperationResult[int64]{
+	if err := store.Finish(ctx, op, daemon.MachineOperationResult{
 		Phase:                     v1alpha3.OperationPhaseComplete,
 		Reason:                    "Succeeded",
 		Message:                   "AgentReset completed",
@@ -114,8 +114,8 @@ func (t *machineOperationTarget) reconcileAgentReset(ctx context.Context, store 
 	return ctrl.Result{}, t.nodeOperator.StopDaemon(ctx, t.log)
 }
 
-func finishFailedMachineOperation(ctx context.Context, store daemon.MachineOperationStore[int64], op daemon.MachineOperation, executionErr error) (ctrl.Result, error) {
-	err := store.Finish(ctx, op, daemon.MachineOperationResult[int64]{
+func finishFailedMachineOperation(ctx context.Context, store daemon.MachineOperationStore, op daemon.MachineOperation, executionErr error) (ctrl.Result, error) {
+	err := store.Finish(ctx, op, daemon.MachineOperationResult{
 		Phase:   v1alpha3.OperationPhaseFailed,
 		Reason:  "ExecutionFailed",
 		Message: executionErr.Error(),
@@ -138,7 +138,7 @@ func publishAndClearAgentUpgradeSignals(ctx context.Context, log *slog.Logger, c
 		return nil
 	case signal.FailureMessage != "":
 		op := daemon.MachineOperation{Name: signal.OperationName}
-		result := daemon.MachineOperationResult[int64]{
+		result := daemon.MachineOperationResult{
 			Phase:   v1alpha3.OperationPhaseFailed,
 			Reason:  "DaemonFailed",
 			Message: signal.FailureMessage,
@@ -155,7 +155,7 @@ func publishAndClearAgentUpgradeSignals(ctx context.Context, log *slog.Logger, c
 			ctx,
 			c,
 			daemon.MachineOperation{Name: signal.OperationName},
-			daemon.MachineOperationResult[int64]{
+			daemon.MachineOperationResult{
 				Phase:                     v1alpha3.OperationPhaseComplete,
 				Reason:                    "Succeeded",
 				Message:                   "AgentUpgrade completed",

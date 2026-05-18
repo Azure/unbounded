@@ -47,6 +47,7 @@ func TestMachinaMachineOperationReconcilerDispatchesTarget(t *testing.T) {
 	op := &machinav1alpha3.MachineOperation{
 		ObjectMeta: metav1.ObjectMeta{Name: "op-1"},
 		Spec: machinav1alpha3.MachineOperationSpec{
+			MachineRef:    "machine-1",
 			OperationKind: machinav1alpha3.OperationNodeReboot,
 		},
 	}
@@ -77,7 +78,7 @@ func TestMachinaMachineOperationReconcilerDispatchesTarget(t *testing.T) {
 	}
 }
 
-func TestMachinaMachineOperationReconcilerSkipsTerminalAndFailsUnsupported(t *testing.T) {
+func TestMachinaMachineOperationReconcilerSkipsTerminalAndIgnoresUnsupported(t *testing.T) {
 	t.Parallel()
 
 	terminal := &machinav1alpha3.MachineOperation{
@@ -87,7 +88,10 @@ func TestMachinaMachineOperationReconcilerSkipsTerminalAndFailsUnsupported(t *te
 	}
 	unsupported := &machinav1alpha3.MachineOperation{
 		ObjectMeta: metav1.ObjectMeta{Name: "unsupported"},
-		Spec:       machinav1alpha3.MachineOperationSpec{OperationKind: machinav1alpha3.OperationHostReboot},
+		Spec: machinav1alpha3.MachineOperationSpec{
+			MachineRef:    "machine-1",
+			OperationKind: machinav1alpha3.OperationHostReboot,
+		},
 	}
 	target := &recordingMachineOperationTargetState{}
 	reconciler, err := NewMachinaMachineOperationReconciler(
@@ -114,11 +118,8 @@ func TestMachinaMachineOperationReconcilerSkipsTerminalAndFailsUnsupported(t *te
 	if err := reconciler.client.Get(context.Background(), client.ObjectKey{Name: "unsupported"}, &updated); err != nil {
 		t.Fatalf("get unsupported MachineOperation: %v", err)
 	}
-	if updated.Status.Phase != machinav1alpha3.OperationPhaseFailed {
-		t.Fatalf("unsupported phase = %s, want %s", updated.Status.Phase, machinav1alpha3.OperationPhaseFailed)
-	}
-	if updated.Status.Conditions[0].Reason != "UnsupportedOperation" {
-		t.Fatalf("unsupported reason = %s, want UnsupportedOperation", updated.Status.Conditions[0].Reason)
+	if updated.Status.Phase != "" {
+		t.Fatalf("unsupported phase = %s, want empty", updated.Status.Phase)
 	}
 }
 
@@ -129,7 +130,10 @@ func TestMachinaMachineOperationReconcilerReturnsTargetError(t *testing.T) {
 	machine := &machinav1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "machine-1", Generation: 7}}
 	op := &machinav1alpha3.MachineOperation{
 		ObjectMeta: metav1.ObjectMeta{Name: "op-1"},
-		Spec:       machinav1alpha3.MachineOperationSpec{OperationKind: machinav1alpha3.OperationNodeReboot},
+		Spec: machinav1alpha3.MachineOperationSpec{
+			MachineRef:    "machine-1",
+			OperationKind: machinav1alpha3.OperationNodeReboot,
+		},
 	}
 	reconciler, err := NewMachinaMachineOperationReconciler(
 		fakeMachineOperationClient(machine, op),
@@ -240,6 +244,31 @@ func TestMachinaMachineOperationReconcilerSkipsNonMatchingWatchObjects(t *testin
 	}
 }
 
+func TestMachinaMachineOperationReconcilerDoesNotMapUnownedTerminalOperation(t *testing.T) {
+	t.Parallel()
+
+	completedAt := metav1.Now()
+	ttl := int32(30)
+	reconciler := newTestMachinaMachineOperationReconciler(t, fakeMachineOperationClient())
+	op := &machinav1alpha3.MachineOperation{
+		ObjectMeta: metav1.ObjectMeta{Name: "cloud-operation"},
+		Spec: machinav1alpha3.MachineOperationSpec{
+			MachineRef:              "machine-1",
+			OperationKind:           machinav1alpha3.OperationHostReboot,
+			TTLSecondsAfterFinished: &ttl,
+		},
+		Status: machinav1alpha3.MachineOperationStatus{
+			Phase:       machinav1alpha3.OperationPhaseComplete,
+			CompletedAt: &completedAt,
+		},
+	}
+
+	requests := reconciler.mapMachineOperation(context.Background(), op)
+	if len(requests) != 0 {
+		t.Fatalf("requests = %#v, want none", requests)
+	}
+}
+
 func TestMachinaMachineOperationReconcilerMapsUnsupportedMatchingOperation(t *testing.T) {
 	t.Parallel()
 
@@ -253,13 +282,8 @@ func TestMachinaMachineOperationReconcilerMapsUnsupportedMatchingOperation(t *te
 	}
 
 	requests := reconciler.mapMachineOperation(context.Background(), op)
-	if len(requests) != 1 {
-		t.Fatalf("requests = %#v, want one", requests)
-	}
-
-	req, ok := requests[0].machineOperationRequest()
-	if !ok || req.Name != "unsupported" {
-		t.Fatalf("request = %#v", requests[0])
+	if len(requests) != 0 {
+		t.Fatalf("requests = %#v, want none", requests)
 	}
 }
 
@@ -279,13 +303,13 @@ func newTestMachinaMachineOperationReconciler(t *testing.T, c client.Client) *Ma
 	return reconciler
 }
 
-func noopMachineOperationTarget(context.Context, MachineOperationStore[int64], MachineOperation) (ctrl.Result, error) {
+func noopMachineOperationTarget(context.Context, MachineOperationStore, MachineOperation) (ctrl.Result, error) {
 	return ctrl.Result{}, nil
 }
 
 type recordingMachineOperationTargetState struct {
 	operation MachineOperation
-	store     MachineOperationStore[int64]
+	store     MachineOperationStore
 	called    bool
 	result    ctrl.Result
 	err       error
@@ -293,7 +317,7 @@ type recordingMachineOperationTargetState struct {
 
 func (t *recordingMachineOperationTargetState) reconcile(
 	_ context.Context,
-	store MachineOperationStore[int64],
+	store MachineOperationStore,
 	op MachineOperation,
 ) (ctrl.Result, error) {
 	t.called = true

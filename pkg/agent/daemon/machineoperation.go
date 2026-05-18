@@ -9,26 +9,20 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	apimeta "k8s.io/apimachinery/pkg/api/meta"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	machinav1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	machineopscontroller "github.com/Azure/unbounded/pkg/machineops/controller"
 )
 
-// MachineOperationHandlers maps operation kinds to host-local MachineOperation handlers.
-type MachineOperationHandlers map[machinav1alpha3.OperationKind]MachineOperationHandler[int64]
-
-// MachinaMachineOperationReconciler fetches MachineOperation objects, skips terminal
-// operations, and dispatches non-terminal operations to kind-specific targets.
+// MachinaMachineOperationReconciler claims local MachineOperations and
+// dispatches them to kind-specific targets.
 type MachinaMachineOperationReconciler struct {
 	client      client.Client
+	controller  *machineopscontroller.Reconciler
 	machineName string
 	nodeName    string
 	handlers    MachineOperationHandlers
@@ -60,15 +54,36 @@ func NewMachinaMachineOperationReconciler(
 		}
 	}
 
-	return &MachinaMachineOperationReconciler{client: c, machineName: machineName, nodeName: nodeName, handlers: handlers}, nil
+	reconciler := &MachinaMachineOperationReconciler{client: c, machineName: machineName, nodeName: nodeName, handlers: handlers}
+	operations := make([]machineopscontroller.Operation, 0, len(handlers))
+	for kind, handler := range handlers {
+		operations = append(operations, machineopscontroller.Operation{Kind: kind, Handler: handler})
+	}
+	operationController, err := machineopscontroller.NewReconciler(machineopscontroller.Config{
+		Client:                     c,
+		Operations:                 operations,
+		TargetResolver:             machineopscontroller.TargetResolverFunc(reconciler.resolveMachineOperationTarget),
+		UnsupportedOperationPolicy: machineopscontroller.UnsupportedOperationIgnore,
+	})
+	if err != nil {
+		return nil, err
+	}
+	reconciler.controller = operationController
+
+	return reconciler, nil
 }
 
 // SetupController registers the MachineOperation watch for this reconciler.
 func (r *MachinaMachineOperationReconciler) SetupController(b *builder.TypedBuilder[Request]) *builder.TypedBuilder[Request] {
 	return b.Watches(
 		&machinav1alpha3.MachineOperation{},
-		handler.TypedEnqueueRequestsFromMapFunc(r.mapMachineOperation),
+		handler.TypedEnqueueRequestsFromMapFunc(machineopscontroller.NewTypedMapper(r.controller, NewMachineOperationRequest)),
 	)
+}
+
+func (r *MachinaMachineOperationReconciler) mapMachineOperation(ctx context.Context, obj client.Object) []Request {
+	mapper := machineopscontroller.NewTypedMapper(r.controller, NewMachineOperationRequest)
+	return mapper(ctx, obj)
 }
 
 // ReconcileMachineOperation handles a queued MachineOperation request.
@@ -76,56 +91,19 @@ func (r *MachinaMachineOperationReconciler) ReconcileMachineOperation(
 	ctx context.Context,
 	name string,
 ) (ctrl.Result, error) {
-	var op machinav1alpha3.MachineOperation
-	if err := r.client.Get(ctx, client.ObjectKey{Name: name}, &op); err != nil {
-		return ctrl.Result{}, client.IgnoreNotFound(err)
-	}
-
-	if op.Status.IsTerminal() {
-		return ctrl.Result{}, nil
-	}
-
-	operation := MachineOperation{
-		Name: op.Name,
-		Kind: op.Spec.OperationKind,
-	}
-	handler, ok := r.handlers[op.Spec.OperationKind]
-	if !ok {
-		log.FromContext(ctx).Info("failing MachineOperation with no handler", "operation", op.Name, "operationKind", op.Spec.OperationKind)
-
-		return ctrl.Result{}, r.Finish(ctx, operation, MachineOperationResult[int64]{
-			Phase:   machinav1alpha3.OperationPhaseFailed,
-			Reason:  "UnsupportedOperation",
-			Message: fmt.Sprintf("no handler registered for operation kind %s", op.Spec.OperationKind),
-		})
-	}
-
-	operation.Parameters = op.Spec.Parameters
-
-	return handler(ctx, r, operation)
+	return r.controller.ReconcileName(ctx, name)
 }
 
-func (r *MachinaMachineOperationReconciler) mapMachineOperation(ctx context.Context, obj client.Object) []Request {
-	op, ok := obj.(*machinav1alpha3.MachineOperation)
-	if !ok || !r.shouldEnqueue(ctx, op) {
-		return nil
-	}
-
-	return []Request{NewMachineOperationRequest(op.Name)}
-}
-
-func (r *MachinaMachineOperationReconciler) shouldEnqueue(ctx context.Context, op *machinav1alpha3.MachineOperation) bool {
-	if op.Status.Phase != "" && op.Status.Phase != machinav1alpha3.OperationPhasePending {
-		return false
-	}
-
+func (r *MachinaMachineOperationReconciler) resolveMachineOperationTarget(ctx context.Context, op *machinav1alpha3.MachineOperation) (machineopscontroller.TargetResult, error) {
 	matches, err := r.matchesMachine(ctx, op)
 	if err != nil {
-		log.FromContext(ctx).Error(err, "invalid MachineOperation target selector", "operation", op.Name)
-		return false
+		return machineopscontroller.TargetResult{}, err
+	}
+	if !matches {
+		return machineopscontroller.TargetResult{Decision: machineopscontroller.TargetIgnore}, nil
 	}
 
-	return matches
+	return machineopscontroller.TargetResult{Decision: machineopscontroller.TargetClaim}, nil
 }
 
 func (r *MachinaMachineOperationReconciler) matchesMachine(ctx context.Context, op *machinav1alpha3.MachineOperation) (bool, error) {
@@ -139,7 +117,7 @@ func (r *MachinaMachineOperationReconciler) matchesMachine(ctx context.Context, 
 
 	var node corev1.Node
 	if err := r.client.Get(ctx, client.ObjectKey{Name: r.nodeName}, &node); err == nil {
-		return selectorMatches(op.Spec.MachineSelector, node.Labels)
+		return machineopscontroller.SelectorMatches(op.Spec.MachineSelector, node.Labels)
 	} else if !apierrors.IsNotFound(err) {
 		return false, fmt.Errorf("get Node %s for selector match: %w", r.nodeName, err)
 	}
@@ -153,90 +131,23 @@ func (r *MachinaMachineOperationReconciler) matchesMachine(ctx context.Context, 
 		return false, fmt.Errorf("get Machine %s for selector match: %w", r.machineName, err)
 	}
 
-	return selectorMatches(op.Spec.MachineSelector, machine.Labels)
+	return machineopscontroller.SelectorMatches(op.Spec.MachineSelector, machine.Labels)
 }
 
 func (r *MachinaMachineOperationReconciler) MarkInProgress(ctx context.Context, op MachineOperation, message string) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		var latest machinav1alpha3.MachineOperation
-		if err := r.client.Get(ctx, client.ObjectKey{Name: op.Name}, &latest); err != nil {
-			return err
-		}
-
-		if latest.Status.IsTerminal() {
-			return nil
-		}
-
-		now := metav1.Now()
-		latest.Status.Phase = machinav1alpha3.OperationPhaseInProgress
-		latest.Status.Message = message
-		if latest.Status.StartedAt == nil {
-			latest.Status.StartedAt = &now
-		}
-
-		apimeta.SetStatusCondition(&latest.Status.Conditions, metav1.Condition{
-			Type:               "Completed",
-			Status:             metav1.ConditionFalse,
-			Reason:             "InProgress",
-			Message:            message,
-			ObservedGeneration: latest.Generation,
-		})
-
-		return r.client.Status().Update(ctx, &latest)
-	})
+	return r.controller.MarkInProgress(ctx, op, message)
 }
 
 // Finish records the final status for a MachineOperation.
-func (r *MachinaMachineOperationReconciler) Finish(ctx context.Context, op MachineOperation, result MachineOperationResult[int64]) error {
-	return FinishMachineOperation(ctx, r.client, op, result)
+func (r *MachinaMachineOperationReconciler) Finish(ctx context.Context, op MachineOperation, result MachineOperationResult) error {
+	return r.controller.Finish(ctx, op, result)
 }
 
 // FinishMachineOperation records the final status for a MachineOperation.
-func FinishMachineOperation(ctx context.Context, c client.Client, op MachineOperation, result MachineOperationResult[int64]) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		var latest machinav1alpha3.MachineOperation
-		if err := c.Get(ctx, client.ObjectKey{Name: op.Name}, &latest); err != nil {
-			return client.IgnoreNotFound(err)
-		}
-
-		now := metav1.Now()
-		if latest.Status.StartedAt == nil {
-			latest.Status.StartedAt = &now
-		}
-
-		latest.Status.Phase = result.Phase
-		latest.Status.Message = result.Message
-		latest.Status.CompletedAt = &now
-		if result.ObservedMachineGeneration > 0 {
-			latest.Status.ObservedMachineGeneration = result.ObservedMachineGeneration
-		}
-
-		conditionStatus := metav1.ConditionTrue
-		if result.Phase == machinav1alpha3.OperationPhaseFailed {
-			conditionStatus = metav1.ConditionFalse
-		}
-
-		apimeta.SetStatusCondition(&latest.Status.Conditions, metav1.Condition{
-			Type:               "Completed",
-			Status:             conditionStatus,
-			Reason:             result.Reason,
-			Message:            result.Message,
-			ObservedGeneration: latest.Generation,
-		})
-
-		return c.Status().Update(ctx, &latest)
-	})
+func FinishMachineOperation(ctx context.Context, c client.Client, op MachineOperation, result MachineOperationResult) error {
+	return machineopscontroller.NewStatusStore(c, nil).Finish(ctx, op, result)
 }
 
-var _ MachineOperationStore[int64] = (*MachinaMachineOperationReconciler)(nil)
-
-func selectorMatches(selector *metav1.LabelSelector, targetLabels map[string]string) (bool, error) {
-	compiled, err := metav1.LabelSelectorAsSelector(selector)
-	if err != nil {
-		return false, err
-	}
-
-	return compiled.Matches(labels.Set(targetLabels)), nil
-}
+var _ MachineOperationStore = (*MachinaMachineOperationReconciler)(nil)
 
 var _ MachineOperationRequestReconciler = (*MachinaMachineOperationReconciler)(nil)

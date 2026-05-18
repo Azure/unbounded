@@ -11,49 +11,23 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 
 	machinav1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	machineopscontroller "github.com/Azure/unbounded/pkg/machineops/controller"
 )
 
 // MachineOperation is a typed host-local daemon operation request.
-type MachineOperation struct {
-	// Name is the operation name in its source system.
-	Name string
-
-	// Kind is the requested host-local operation kind.
-	Kind machinav1alpha3.OperationKind
-
-	// Parameters contains operation-specific inputs, such as an AgentUpgrade download URL.
-	Parameters map[string]string
-}
+type MachineOperation = machineopscontroller.OperationRequest
 
 // MachineOperationResult describes the outcome of a host-local daemon operation.
-type MachineOperationResult[TGeneration comparable] struct {
-	// Phase is the resulting operation phase.
-	Phase machinav1alpha3.OperationPhase
-
-	// Reason is a stable, machine-readable reason for the result.
-	Reason string
-
-	// Message is a human-readable result description.
-	Message string
-
-	// ObservedMachineGeneration records the machine generation acted on by the operation.
-	ObservedMachineGeneration TGeneration
-}
+type MachineOperationResult = machineopscontroller.OperationResult
 
 // MachineOperationHandler executes a host-local daemon operation.
-type MachineOperationHandler[TGeneration comparable] func(context.Context, MachineOperationStore[TGeneration], MachineOperation) (ctrl.Result, error)
+type MachineOperationHandler = machineopscontroller.OperationHandler
+
+// MachineOperationHandlers maps operation kinds to host-local MachineOperation handlers.
+type MachineOperationHandlers map[machinav1alpha3.OperationKind]MachineOperationHandler
 
 // MachineOperationStore records operation lifecycle state.
-type MachineOperationStore[TGeneration comparable] interface {
-	// MarkInProgress records that op has started execution with message as the
-	// human-readable in-progress status.
-	MarkInProgress(context.Context, MachineOperation, string) error
-
-	// Finish records the terminal or non-terminal result for op. The result
-	// carries the desired phase, reason, message, observed generation, and any
-	// controller-runtime requeue request.
-	Finish(context.Context, MachineOperation, MachineOperationResult[TGeneration]) error
-}
+type MachineOperationStore = machineopscontroller.Store
 
 // machineOperationRequest identifies a MachineOperation reconcile request.
 type machineOperationRequest struct {
