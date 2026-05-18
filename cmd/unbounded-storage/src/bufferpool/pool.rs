@@ -51,15 +51,17 @@ where
     S: BlockStore + 'static,
     R: Req + 'static,
 {
-    /// One per NUMA shard. Carves `backing` into pages, calls
-    /// `transport.register_pages(...)` and
-    /// `blockstore.register_pages(...)` exactly once. No async I/O
-    /// happens here; on a real RDMA `Transport` the synchronous
-    /// `ibv_reg_mr` is the dominant cost (see the design's
-    /// "Page registration" section). Embedders should run
-    /// `Pool::new` off the pinned executor thread before handing
-    /// the constructed `Pool` to the per-shard executor for
-    /// service.
+    /// One per NUMA shard. Carves `backing` into pages and calls
+    /// `blockstore.register_pages(...)` exactly once. The
+    /// `Transport` is expected to have been bound to the same
+    /// `backing` out-of-band by the embedder before this call (e.g.
+    /// via `mercury::Class::register_backing`); the pool no longer
+    /// drives that handshake. No async I/O happens here; on a real
+    /// RDMA `Transport` the synchronous `ibv_reg_mr` is the
+    /// dominant cost (see the design's "Page registration"
+    /// section). Embedders should run `Pool::new` off the pinned
+    /// executor thread before handing the constructed `Pool` to the
+    /// per-shard executor for service.
     pub fn new(
         cfg: PoolConfig,
         backing: Backing,
@@ -79,7 +81,6 @@ where
             return Err(Error::BadConfig("backing.base is null"));
         }
 
-        transport.register_pages(backing.base, backing.page_size, backing.page_count)?;
         blockstore.register_pages(backing.base, backing.page_size, backing.page_count)?;
 
         let page_count_u32 = backing.page_count as u32;
