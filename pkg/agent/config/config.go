@@ -63,6 +63,7 @@ func (a *AgentConfig) BackfillNodeName() error {
 	}
 
 	hostname, hostnameErr := os.Hostname()
+
 	hostNodeName := ""
 	if hostnameErr == nil {
 		hostNodeName = strings.TrimSpace(hostname)
@@ -70,6 +71,7 @@ func (a *AgentConfig) BackfillNodeName() error {
 			a.NodeName = hostNodeName
 			return nil
 		}
+
 		hostnameErr = fmt.Errorf("hostname %q is not a valiad Kubenetes node name", hostNodeName)
 	}
 
@@ -78,6 +80,7 @@ func (a *AgentConfig) BackfillNodeName() error {
 		a.NodeName = nodeName
 		return nil
 	}
+
 	machineNameErr := fmt.Errorf("machine name %q is not a valid Kubernetse node name", a.MachineName)
 
 	return errors.Join(hostnameErr, machineNameErr)
@@ -102,6 +105,7 @@ func (a *AgentConfig) DeepCopy() *AgentConfig {
 		out.Kubelet.Labels = make(map[string]string, len(a.Kubelet.Labels))
 		maps.Copy(out.Kubelet.Labels, a.Kubelet.Labels)
 	}
+
 	out.Kubelet.RegisterWithTaints = slices.Clone(a.Kubelet.RegisterWithTaints)
 
 	return &out

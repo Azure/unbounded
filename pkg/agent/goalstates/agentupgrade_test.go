@@ -81,6 +81,7 @@ func TestResolvedAgentUpgradePaths_ResolvesCurrentTarget(t *testing.T) {
 	binaryPath := filepath.Join(dir, "agent")
 	currentTargetPath := filepath.Join(dir, "agent-blue")
 	currentPath := filepath.Join(dir, "agent-current")
+
 	require.NoError(t, os.WriteFile(currentTargetPath, []byte("agent"), 0o755))
 	require.NoError(t, os.Symlink(currentTargetPath, currentPath))
 	t.Setenv(EnvDaemonBinary, binaryPath)

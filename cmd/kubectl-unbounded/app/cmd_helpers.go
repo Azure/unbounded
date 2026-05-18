@@ -70,9 +70,11 @@ func parseTaints(spec []string) ([]corev1.Taint, error) {
 func parseTaint(st string) (corev1.Taint, error) {
 	var taint corev1.Taint
 
-	var key string
-	var value string
-	var effect corev1.TaintEffect
+	var (
+		key    string
+		value  string
+		effect corev1.TaintEffect
+	)
 
 	parts := strings.Split(st, ":")
 	switch len(parts) {
@@ -88,6 +90,7 @@ func parseTaint(st string) (corev1.Taint, error) {
 		if len(partsKV) > 2 {
 			return taint, fmt.Errorf("invalid taint spec: %v", st)
 		}
+
 		key = partsKV[0]
 		if len(partsKV) == 2 {
 			value = partsKV[1]
@@ -123,5 +126,6 @@ func formatTaint(t corev1.Taint) string {
 	if t.Value == "" {
 		return fmt.Sprintf("%s:%s", t.Key, t.Effect)
 	}
+
 	return fmt.Sprintf("%s=%s:%s", t.Key, t.Value, t.Effect)
 }

@@ -23,9 +23,11 @@ func TestControllerRuntimeReconcilerDispatchesOperationRequest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
+
 	if result.RequeueAfter == 0 {
 		t.Fatalf("result = %v, want requeue", result)
 	}
+
 	if reconciler.operationName != "op-1" {
 		t.Fatalf("operation request = %q", reconciler.operationName)
 	}
@@ -41,12 +43,15 @@ func TestControllerRuntimeReconcilerDispatchesRepaveRequest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
+
 	if result.RequeueAfter == 0 {
 		t.Fatalf("result = %v, want requeue", result)
 	}
+
 	if !reconciler.repaveCalled {
 		t.Fatal("repave request was not dispatched")
 	}
+
 	if reconciler.repaveSource != "node-delete" {
 		t.Fatalf("repave source = %q, want node-delete", reconciler.repaveSource)
 	}
@@ -61,6 +66,7 @@ func TestControllerRuntimeReconcilerIgnoresEmptyRequest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
+
 	if result != (ctrl.Result{}) {
 		t.Fatalf("result = %v, want empty", result)
 	}
@@ -82,10 +88,12 @@ func TestNoopMachineOperationReconcilerFailsOperationRequest(t *testing.T) {
 	t.Parallel()
 
 	reconciler := NoopMachineOperationReconciler()
+
 	result, err := reconciler.ReconcileMachineOperation(context.Background(), "op-1")
 	if err == nil {
 		t.Fatal("ReconcileMachineOperation error = nil")
 	}
+
 	if result != (ctrl.Result{}) {
 		t.Fatalf("result = %v, want empty", result)
 	}
@@ -97,9 +105,11 @@ func TestSetupControllerValidatesInputs(t *testing.T) {
 	if err := SetupController("", nil, &recordingReconciler{}, &recordingReconciler{}); err == nil {
 		t.Fatal("SetupController empty name error = nil")
 	}
+
 	if err := SetupController("controller", nil, nil, &recordingReconciler{}); err == nil {
 		t.Fatal("SetupController nil machine operation reconciler error = nil")
 	}
+
 	if err := SetupController("controller", nil, &recordingReconciler{}, nil); err == nil {
 		t.Fatal("SetupController nil repave reconciler error = nil")
 	}
@@ -128,5 +138,6 @@ func (r *recordingReconciler) ReconcileMachineOperation(_ context.Context, name 
 func (r *recordingReconciler) ReconcileRepave(_ context.Context, source string) (ctrl.Result, error) {
 	r.repaveCalled = true
 	r.repaveSource = source
+
 	return r.repaveResult, r.repaveErr
 }

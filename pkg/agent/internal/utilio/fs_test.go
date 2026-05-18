@@ -105,6 +105,7 @@ func TestUpdateSymlink(t *testing.T) {
 	if err := os.WriteFile(firstTarget, []byte("first"), 0o644); err != nil {
 		t.Fatalf("setup first target: %v", err)
 	}
+
 	if err := os.WriteFile(secondTarget, []byte("second"), 0o644); err != nil {
 		t.Fatalf("setup second target: %v", err)
 	}
@@ -112,10 +113,12 @@ func TestUpdateSymlink(t *testing.T) {
 	if err := UpdateSymlink(linkPath, firstTarget); err != nil {
 		t.Fatalf("update symlink to first target: %v", err)
 	}
+
 	info, err := os.Stat(filepath.Dir(linkPath))
 	if err != nil {
 		t.Fatalf("stat created link directory: %v", err)
 	}
+
 	if got := info.Mode().Perm(); got != 0o750 {
 		t.Fatalf("link directory mode = %o, want %o", got, 0o750)
 	}
@@ -124,6 +127,7 @@ func TestUpdateSymlink(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve first symlink target: %v", err)
 	}
+
 	if target != firstTarget {
 		t.Fatalf("first target = %q, want %q", target, firstTarget)
 	}
@@ -136,6 +140,7 @@ func TestUpdateSymlink(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve second symlink target: %v", err)
 	}
+
 	if target != secondTarget {
 		t.Fatalf("second target = %q, want %q", target, secondTarget)
 	}

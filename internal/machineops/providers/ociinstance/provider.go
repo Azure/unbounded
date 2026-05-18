@@ -141,6 +141,7 @@ func (p *Provider) Cleanup(ctx context.Context, request machineops.OperationRequ
 	if err == nil && isTerminalInstance(instance) {
 		return nil
 	}
+
 	if err != nil && strings.Contains(strings.ToLower(err.Error()), "notfound") {
 		return nil
 	}

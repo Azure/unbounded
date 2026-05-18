@@ -19,15 +19,18 @@ func (p *Provider) newDefaultComputeClient() (computeClient, error) {
 	if profile == "" {
 		profile = defaultConfigProfile
 	}
+
 	auth := strings.TrimSpace(p.Auth)
 	if auth == "" {
 		auth = AuthAPIKey
 	}
+
 	if auth != AuthAPIKey && auth != AuthSecurityToken {
 		return nil, fmt.Errorf("unsupported OCI auth mode %q", p.Auth)
 	}
 
 	provider := common.DefaultConfigProvider()
+
 	if strings.TrimSpace(p.ConfigFile) != "" {
 		switch auth {
 		case AuthAPIKey:
@@ -43,6 +46,7 @@ func (p *Provider) newDefaultComputeClient() (computeClient, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create compute client: %w", err)
 	}
+
 	networkClient, err := core.NewVirtualNetworkClientWithConfigurationProvider(provider)
 	if err != nil {
 		return nil, fmt.Errorf("create virtual network client: %w", err)
@@ -87,6 +91,7 @@ func (c *ociComputeClient) ListInstances(ctx context.Context, compartmentID, ava
 			AvailabilityDomain: &availabilityDomain,
 			Page:               page,
 		})
+
 		return response.Items, response.OpcNextPage, err
 	})
 }
@@ -105,6 +110,7 @@ func (c *ociComputeClient) LaunchInstance(ctx context.Context, details core.Laun
 
 func (c *ociComputeClient) TerminateInstance(ctx context.Context, instanceID, retryToken string) error {
 	preserveBootVolume := false
+
 	_, err := c.compute.TerminateInstance(ctx, core.TerminateInstanceRequest{
 		InstanceId:         &instanceID,
 		PreserveBootVolume: &preserveBootVolume,
@@ -129,6 +135,7 @@ func (c *ociComputeClient) ListImages(ctx context.Context, compartmentID, shape 
 			SortOrder:              core.ListImagesSortOrderDesc,
 			Page:                   page,
 		})
+
 		return response.Items, response.OpcNextPage, err
 	})
 }
@@ -140,6 +147,7 @@ func (c *ociComputeClient) ListVnicAttachments(ctx context.Context, compartmentI
 			InstanceId:    &instanceID,
 			Page:          page,
 		})
+
 		return response.Items, response.OpcNextPage, err
 	})
 }
@@ -160,13 +168,17 @@ func (c *ociComputeClient) ListVolumeAttachments(ctx context.Context, compartmen
 			InstanceId:    &instanceID,
 			Page:          page,
 		})
+
 		return response.Items, response.OpcNextPage, err
 	})
 }
 
 func listOCI[T any](ctx context.Context, listPage func(context.Context, *string) ([]T, *string, error)) ([]T, error) {
-	var items []T
-	var page *string
+	var (
+		items []T
+		page  *string
+	)
+
 	for {
 		pageItems, nextPage, err := listPage(ctx, page)
 		if err != nil {
@@ -177,6 +189,7 @@ func listOCI[T any](ctx context.Context, listPage func(context.Context, *string)
 		if nextPage == nil {
 			return items, nil
 		}
+
 		page = nextPage
 	}
 }

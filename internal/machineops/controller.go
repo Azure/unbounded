@@ -190,6 +190,7 @@ func (r *MachineOperationReconciler) updateMachineProviderID(ctx context.Context
 		}
 
 		patch := client.MergeFrom(latest.DeepCopy())
+
 		latest.Spec.ProviderID = providerID
 		if err := r.Patch(ctx, &latest, patch); err != nil {
 			return fmt.Errorf("patch Machine providerID: %w", err)
@@ -198,10 +199,12 @@ func (r *MachineOperationReconciler) updateMachineProviderID(ctx context.Context
 		if err := r.Get(ctx, client.ObjectKeyFromObject(machine), &latest); err != nil {
 			return err
 		}
+
 		updatedGeneration = latest.Generation
 
 		return nil
 	})
+
 	return updatedGeneration, err
 }
 

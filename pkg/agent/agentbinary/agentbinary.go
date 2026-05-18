@@ -32,6 +32,7 @@ func InstallFromTarGz(ctx context.Context, downloadURL, targetPath, binaryName s
 	if err != nil {
 		return fmt.Errorf("parse download URL %q: %w", downloadURL, err)
 	}
+
 	if parsedURL.Scheme != "http" && parsedURL.Scheme != "https" {
 		return fmt.Errorf("unsupported agent download URL scheme %q", parsedURL.Scheme)
 	}
@@ -40,9 +41,11 @@ func InstallFromTarGz(ctx context.Context, downloadURL, targetPath, binaryName s
 		if err != nil {
 			return err
 		}
+
 		if filepath.Base(tarFile.Name) != binaryName {
 			continue
 		}
+
 		if tarFile.Size == 0 {
 			return fmt.Errorf("agent binary %q in archive %q is empty", binaryName, downloadURL)
 		}
@@ -67,6 +70,7 @@ func InstallFromFile(sourcePath, targetPath string, perm os.FileMode) (err error
 	if err != nil {
 		return fmt.Errorf("open %s: %w", sourcePath, err)
 	}
+
 	defer func() {
 		if closeErr := source.Close(); closeErr != nil && err == nil {
 			err = fmt.Errorf("close %s: %w", sourcePath, closeErr)
@@ -110,13 +114,16 @@ func EnsureDaemonBinaryLinks(ctx context.Context, log *slog.Logger, paths goalst
 		if !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("stat current daemon binary symlink: %w", err)
 		}
+
 		target, targetErr := initialDaemonBinaryTarget(paths)
 		if targetErr != nil {
 			return fmt.Errorf("no executable agent binary found for daemon link initialization: %w", targetErr)
 		}
+
 		if err := utilio.UpdateSymlink(paths.CurrentPath, target); err != nil {
 			return fmt.Errorf("initialize current daemon symlink: %w", err)
 		}
+
 		currentTarget = target
 	}
 
@@ -124,6 +131,7 @@ func EnsureDaemonBinaryLinks(ctx context.Context, log *slog.Logger, paths goalst
 		if !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("resolve last-good daemon binary symlink: %w", err)
 		}
+
 		if err := utilio.UpdateSymlink(paths.LastGoodPath, currentTarget); err != nil {
 			return fmt.Errorf("initialize last-good daemon symlink: %w", err)
 		}
@@ -151,9 +159,11 @@ func initialDaemonBinaryTarget(paths goalstates.AgentUpgradePaths) (string, erro
 	if err != nil {
 		return "", err
 	}
+
 	if target != paths.BinaryPath {
 		return target, nil
 	}
+
 	if err := InstallFromFile(paths.BinaryPath, paths.BluePath, daemonBinaryMode); err != nil {
 		return "", err
 	}
@@ -185,6 +195,7 @@ func Verify(ctx context.Context, path string) error {
 		if details != "" {
 			return fmt.Errorf("verify agent binary %s: %w: %s", path, err, details)
 		}
+
 		return fmt.Errorf("verify agent binary %s: %w", path, err)
 	}
 }

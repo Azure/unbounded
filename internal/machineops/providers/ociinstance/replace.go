@@ -28,6 +28,7 @@ func (p *Provider) executeReplace(ctx context.Context, client computeClient, ins
 			if currentID != instanceID && isReplacementFor(current, request, request.ProviderID) {
 				return machineops.OperationResult{ProviderID: providerIDPrefix + currentID, CleanupProviderID: request.ProviderID}, nil
 			}
+
 			if currentID == instanceID && isReplacementFor(current, request, current.FreeformTags[tagOldProviderID]) {
 				return machineops.OperationResult{ProviderID: providerIDPrefix + currentID, CleanupProviderID: current.FreeformTags[tagOldProviderID]}, nil
 			}
@@ -46,6 +47,7 @@ func (p *Provider) replaceHost(ctx context.Context, client computeClient, oldIns
 	if err != nil {
 		return machineops.OperationResult{}, err
 	}
+
 	if err := rejectAttachedDataVolumes(ctx, client, oldInstance); err != nil {
 		return machineops.OperationResult{}, err
 	}
@@ -59,6 +61,7 @@ func (p *Provider) replaceHost(ctx context.Context, client computeClient, oldIns
 	if err != nil {
 		return machineops.OperationResult{}, err
 	}
+
 	if !ok {
 		// Build all launch inputs before stopping the old host so validation
 		// failures do not create an avoidable outage.
@@ -74,6 +77,7 @@ func (p *Provider) replaceHost(ctx context.Context, client computeClient, oldIns
 				return machineops.OperationResult{}, err
 			}
 		}
+
 		_, err = waitForInstanceState(ctx, client, oldInstance, core.InstanceLifecycleStateStopped)
 		if err != nil {
 			return machineops.OperationResult{}, err
@@ -89,6 +93,7 @@ func (p *Provider) replaceHost(ctx context.Context, client computeClient, oldIns
 	if err != nil {
 		return machineops.OperationResult{}, err
 	}
+
 	if running.Id == nil || *running.Id == "" {
 		return machineops.OperationResult{}, fmt.Errorf("OCI replacement instance has no ID")
 	}
@@ -103,6 +108,7 @@ func waitForInstanceState(ctx context.Context, client computeClient, instance co
 	if instance.Id == nil || *instance.Id == "" {
 		return core.Instance{}, fmt.Errorf("OCI instance has no ID")
 	}
+
 	if instance.LifecycleState == target {
 		return instance, nil
 	}
@@ -117,9 +123,11 @@ func waitForInstanceState(ctx context.Context, client computeClient, instance co
 		if err != nil {
 			return core.Instance{}, fmt.Errorf("get OCI instance %s while waiting for %s: %w", *instance.Id, target, err)
 		}
+
 		if updated.LifecycleState == target {
 			return updated, nil
 		}
+
 		if isTerminalInstance(updated) {
 			return core.Instance{}, fmt.Errorf("OCI instance %s reached terminal state %s while waiting for %s", *instance.Id, updated.LifecycleState, target)
 		}

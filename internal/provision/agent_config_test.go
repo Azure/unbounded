@@ -130,6 +130,7 @@ func TestAgentConfig_EmptyFields(t *testing.T) {
 	// OCIImage has omitempty so should be absent from zero-value config.
 	_, hasOCIImage := parsed["OCIImage"]
 	require.False(t, hasOCIImage, "OCIImage should be omitted when empty")
+
 	_, hasNodeName := parsed["NodeName"]
 	require.False(t, hasNodeName, "NodeName should be omitted when empty")
 }
