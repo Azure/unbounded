@@ -27,16 +27,23 @@ type CommonRuntimeConfig struct {
 
 // ControllerRuntimeConfig contains controller-specific runtime settings.
 type ControllerRuntimeConfig struct {
-	InformerResyncPeriod        string                       `yaml:"informerResyncPeriod"`
-	HealthPort                  *int                         `yaml:"healthPort"`
-	NodeAgentHealthPort         *int                         `yaml:"nodeAgentHealthPort"`
-	StatusStaleThreshold        string                       `yaml:"statusStaleThreshold"`
-	StatusWSKeepaliveInterval   string                       `yaml:"statusWebsocketKeepaliveInterval"`
-	StatusWSKeepaliveFailCount  *int                         `yaml:"statusWsKeepaliveFailureCount"`
-	RegisterAggregatedAPIServer *bool                        `yaml:"registerAggregatedAPIServer"`
-	RequireDashboardAuth        *bool                        `yaml:"requireDashboardAuth"`
-	KubeProxyHealthInterval     string                       `yaml:"kubeProxyHealthInterval"`
-	LeaderElection              ControllerLeaderElectionYAML `yaml:"leaderElection"`
+	InformerResyncPeriod        string                        `yaml:"informerResyncPeriod"`
+	HealthPort                  *int                          `yaml:"healthPort"`
+	NodeAgentHealthPort         *int                          `yaml:"nodeAgentHealthPort"`
+	StatusStaleThreshold        string                        `yaml:"statusStaleThreshold"`
+	StatusWSKeepaliveInterval   string                        `yaml:"statusWebsocketKeepaliveInterval"`
+	StatusWSKeepaliveFailCount  *int                          `yaml:"statusWsKeepaliveFailureCount"`
+	RegisterAggregatedAPIServer *bool                         `yaml:"registerAggregatedAPIServer"`
+	RequireDashboardAuth        *bool                         `yaml:"requireDashboardAuth"`
+	KubeProxyHealthInterval     string                        `yaml:"kubeProxyHealthInterval"`
+	ManagedKubeProxy            ManagedKubeProxyRuntimeConfig `yaml:"managedKubeProxy"`
+	LeaderElection              ControllerLeaderElectionYAML  `yaml:"leaderElection"`
+}
+
+// ManagedKubeProxyRuntimeConfig controls unbounded-managed kube-proxy DaemonSets.
+type ManagedKubeProxyRuntimeConfig struct {
+	Enabled *bool  `yaml:"enabled"`
+	Image   string `yaml:"image"`
 }
 
 // ControllerLeaderElectionYAML configures controller leader election behavior.
@@ -59,8 +66,8 @@ type NodeRuntimeConfig struct {
 	WireGuardDir         string `yaml:"wireGuardDir"`
 	WireGuardPort        *int   `yaml:"wireGuardPort"`
 	// Deprecated: EnablePolicyRouting enables connmark/fwmark/ip-rule policy
-	// routing on gateway interfaces. Replaced by per-interface FORWARD ACCEPT
-	// rules. Defaults to false; retained for backward compatibility.
+	// routing on gateway interfaces. Replaced by the UNBOUNDED-FORWARD chain.
+	// Defaults to false; retained for backward compatibility.
 	EnablePolicyRouting                  *bool  `yaml:"enablePolicyRouting"`
 	MTU                                  *int   `yaml:"mtu"`
 	HealthPort                           *int   `yaml:"healthPort"`
@@ -89,7 +96,6 @@ type NodeRuntimeConfig struct {
 	KubeProxyHealthInterval              string `yaml:"kubeProxyHealthInterval"`
 	RouteTableID                         *int   `yaml:"routeTableId"`
 	NetlinkResyncPeriod                  string `yaml:"netlinkResyncPeriod"`
-	TunnelDataplane                      string `yaml:"tunnelDataplane"`
 	TunnelDataplaneMapSize               *int   `yaml:"tunnelDataplaneMapSize"`
 	TunnelIPFamily                       string `yaml:"tunnelIPFamily"`
 	VXLANSrcPortLow                      *int   `yaml:"vxlanSrcPortLow"`

@@ -1,0 +1,130 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+name: unbounded-storage-sim
+
+on:
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "Wall-clock budget for the DST loop (e.g. 20m, 1h)."
+        required: false
+        default: "20m"
+      proptest_cases:
+        description: "PROPTEST_CASES per cargo test invocation."
+        required: false
+        default: "4096"
+
+concurrency:
+  group: unbounded-storage-sim-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # Keep in sync with the default in the Makefile / install-mercury.sh and
+  # the unbounded-storage.yaml workflow.
+  MERCURY_VERSION: v2.3.1
+
+jobs:
+  sim:
+    name: DST soak
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      DST_DURATION: ${{ github.event.inputs.duration || '20m' }}
+      PROPTEST_CASES: ${{ github.event.inputs.proptest_cases || '4096' }}
+      # Mercury env: cargo/build.rs and the resulting binary both need these.
+      # We set them at the job level so every cargo invocation (including the
+      # inner `bash -c` loop) inherits them without per-step plumbing.
+      MERCURY_PKG_CONFIG_PATH: ${{ github.workspace }}/tmp/mercury-prefix/lib/pkgconfig
+      PKG_CONFIG_PATH: ${{ github.workspace }}/tmp/mercury-prefix/lib/pkgconfig
+      LD_LIBRARY_PATH: ${{ github.workspace }}/tmp/mercury-prefix/lib
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Mercury build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config libfabric-dev
+
+      - name: Set up Rust toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache Mercury prefix
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: tmp/mercury-prefix
+          key: mercury-${{ runner.os }}-${{ env.MERCURY_VERSION }}-${{ hashFiles('hack/scripts/install-mercury.sh') }}
+
+      - name: Build Mercury (if not cached)
+        run: make mercury
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            cmd/unbounded-storage/target
+          # Key on lockfile + manifest plus the native build inputs (build.rs
+          # and the Mercury C shim), since changes to either invalidate
+          # compiled artifacts under target/. Also bind to MERCURY_VERSION so
+          # a Mercury bump rebuilds the FFI layer cleanly. The `-sim-` tier
+          # lets the soak job share a key space with the PR job's restore
+          # keys while keeping a dedicated primary key for release-mode
+          # artifacts.
+          key: cargo-unbounded-storage-sim-${{ runner.os }}-mercury-${{ env.MERCURY_VERSION }}-${{ hashFiles('cmd/unbounded-storage/Cargo.lock', 'cmd/unbounded-storage/Cargo.toml', 'cmd/unbounded-storage/build.rs', 'cmd/unbounded-storage/src/mercury/shim.c') }}
+          restore-keys: |
+            cargo-unbounded-storage-sim-${{ runner.os }}-mercury-${{ env.MERCURY_VERSION }}-
+            cargo-unbounded-storage-sim-${{ runner.os }}-
+            cargo-unbounded-storage-${{ runner.os }}-mercury-${{ env.MERCURY_VERSION }}-
+            cargo-unbounded-storage-${{ runner.os }}-
+
+      - name: Build DST test binary
+        working-directory: cmd/unbounded-storage
+        run: cargo test --release --locked --test dst --no-run
+
+      - name: Run DST soak
+        working-directory: cmd/unbounded-storage
+        # Loop `cargo test` against the `dst` integration test until
+        # the wall-clock budget expires. Each iteration uses a fresh
+        # PROPTEST_SEED so the soak keeps exploring new (seed, workload)
+        # pairs rather than re-running the same cases. `timeout` exits
+        # 124 when it kills the loop; treat that as success. Any
+        # non-zero exit from cargo test itself fails the job.
+        run: |
+          set -u
+          status=0
+          iteration=0
+          start=$SECONDS
+          # `timeout --preserve-status` would propagate a SIGTERM exit;
+          # instead we rely on the explicit 124 check below.
+          timeout "${DST_DURATION}" bash -c '
+            set -eu
+            i=0
+            while :; do
+              i=$((i + 1))
+              # Derive a per-iteration seed from /dev/urandom so each
+              # cargo invocation explores fresh proptest inputs.
+              PROPTEST_SEED="$(od -An -N8 -tu8 /dev/urandom | tr -d " ")"
+              export PROPTEST_SEED
+              echo "::group::DST iteration ${i} (seed=${PROPTEST_SEED}, elapsed=$((SECONDS))s)"
+              cargo test --release --locked --test dst -- --nocapture
+              echo "::endgroup::"
+            done
+          ' || status=$?
+          elapsed=$((SECONDS - start))
+          if [ "${status}" -eq 124 ] || [ "${status}" -eq 0 ]; then
+            echo "DST soak completed after ${elapsed}s (timeout exit=${status})."
+            exit 0
+          fi
+          echo "DST soak failed after ${elapsed}s with exit code ${status}." >&2
+          exit "${status}"

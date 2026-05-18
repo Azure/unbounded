@@ -68,7 +68,11 @@ func run(ctx context.Context, log *slog.Logger, newClient kubeClientFunc, nodeOp
 		return fmt.Errorf("register machine: %w", err)
 	}
 
-	return runController(ctx, log, restCfg, active.Config.MachineName, nodeOperator)
+	if err := publishAndClearAgentUpgradeSignals(ctx, log, kubeClient); err != nil {
+		log.Warn("failed to publish and clear AgentUpgrade daemon signals", "error", err)
+	}
+
+	return runController(ctx, log, restCfg, active.Config.MachineName, active.Config.NodeName, nodeOperator)
 }
 
 // buildRESTConfig builds a Kubernetes REST config from the applied agent

@@ -85,14 +85,16 @@ GENEVE encapsulation via the eBPF dataplane.
    `unbounded0`. It parses the Ethernet and IP headers.
 
 4. **LPM lookup**: The BPF program performs a longest-prefix-match lookup in
-   `unbounded_endpoints_v4` (or `unbounded_endpoints_v6` for IPv6) using the
-   destination IP with a /32 prefix length.
+   the unified `unb_endpts` trie. The key is a 16-byte address with
+   `prefixlen = 128`; IPv4 destinations are mapped to `::ffff:<v4>` so both
+   families share one trie.
 
-5. **Tunnel metadata**: If the matched endpoint has `TUNNEL_F_SET_KEY` set, the
-   program calls `bpf_skb_set_tunnel_key()` with:
-   - `remote_ipv4` = underlay IP of the destination node
-   - `tunnel_id` = VNI from the map entry
-   - `tunnel_ttl` = 64
+5. **Tunnel metadata**: If the matched nexthop's `protocol` indicates a
+   header-bearing encapsulation (GENEVE, VXLAN, or IPIP), the program calls
+   `bpf_skb_set_tunnel_key()`. The IPv4-mapped check on `remote_endpoint`
+   decides whether to set `remote_ipv4` (v4 underlay) or `remote_ipv6` plus
+   `BPF_F_TUNINFO_IPV6` (native v6 underlay); `tunnel_id` is set to the VNI
+   from the map entry and `tunnel_ttl` to 64.
 
 6. **Inner MAC rewrite**: The inner Ethernet destination MAC is rewritten to a
    deterministic value derived from the remote node's underlay IP:
@@ -163,9 +165,10 @@ WireGuard-encrypted gateway nodes.
 1. **Worker egress**: Same as intra-site steps 1-4. The BPF LPM lookup matches
    a remote site's CIDR and finds a WireGuard endpoint entry.
 
-2. **BPF redirect to WireGuard**: The entry has no `TUNNEL_F_SET_KEY` flag (WG
-   handles its own encapsulation). `bpf_redirect(ep->ifindex, 0)` sends the
-   packet directly to the `wg51821` interface.
+2. **BPF redirect to WireGuard**: The nexthop's protocol is `WireGuard`, so
+   the BPF program skips `bpf_skb_set_tunnel_key` (WG handles its own
+   encapsulation) and calls `bpf_redirect(nh.ifindex, 0)` to send the packet
+   directly to the `wg51821` interface.
 
 3. **WireGuard encryption**: The WireGuard driver on the worker encrypts the
    packet and sends it as a UDP datagram to the site 1 gateway's WireGuard
@@ -454,96 +457,6 @@ On deletion, the node agent:
 2. Deletes the interface.
 3. Reapplies `rp_filter=0` on remaining interfaces (kernel resets values on
    interface deletion).
-
----
-
-## Netlink Dataplane Mode (legacy)
-
-The netlink dataplane does not use BPF. Instead, it creates per-peer tunnel
-interfaces and relies on kernel routes to steer traffic. This mode is selected
-with `--tunnel-dataplane=netlink`.
-
-### Intra-Site Mesh (GENEVE)
-
-Each peer gets a dedicated GENEVE interface named `gn<decimal_ip>`, where
-`<decimal_ip>` is the big-endian uint32 representation of the peer's underlay
-IPv4 address.
-
-```
-  Node A                                       Node B
-  +------------------+                         +------------------+
-  | Pod (src)        |                         | Pod (dst)        |
-  |   |              |                         |   ^              |
-  |   v              |                         |   |              |
-  | cbr0             |                         | cbr0             |
-  |   |              |                         |   ^              |
-  |   v              |                         |   |              |
-  | kernel routing   |                         | kernel routing   |
-  | (per-/24 route   |                         | (local delivery) |
-  |  dev gn<B_ip>)   |                         |   ^              |
-  |   |              |                         |   |              |
-  |   v              |                         |   |              |
-  | gn<B_decimal_ip> |                         | gn<A_decimal_ip> |
-  | (GENEVE encap)   |                         | (GENEVE decap)   |
-  | fixed remote=B   |                         | fixed remote=A   |
-  | fixed VNI        |                         | fixed VNI        |
-  |   |              |                         |   ^              |
-  |   v              |                         |   |              |
-  | eth0  -----------+---- UDP 6081 -----------+ eth0             |
-  +------------------+                         +------------------+
-```
-
-#### Detail
-
-- Interface name example: node B has IP `172.16.1.5` --
-  `gn2886729989` (= `0xAC100105`).
-- Each GENEVE interface has a fixed remote endpoint IP and VNI configured at
-  creation time (not flow-based).
-- Kernel routes for the peer's pod CIDRs (typically /24s) point to the
-  per-peer interface.
-- The deterministic MAC (`02:<ip_bytes>:FF`) is set on each interface.
-- `rp_filter=0` is set on each per-peer interface.
-
-See `cmd/unbounded-net-node/geneve_config.go:geneveIfaceName()`.
-
-### Per-Peer IPIP
-
-Similar to GENEVE, but using IPIP encapsulation. Each peer gets a dedicated
-interface named `ip<decimal_ip>`.
-
-```
-  ip<decimal_ip>     IPIP tunnel interface, one per peer.
-                     Fixed local/remote underlay IPs.
-                     Kernel routes for peer pod CIDRs point here.
-```
-
-IPIP provides the lowest overhead (no UDP header) but no VNI multiplexing and
-no encryption. Suitable for private networks where encryption is handled at a
-different layer.
-
-See `cmd/unbounded-net-node/geneve_config.go:ipipIfaceName()`.
-
-### Shared VXLAN
-
-VXLAN in netlink mode uses a single shared `vxlan0` interface (not per-peer).
-Per-peer routing is achieved via lightweight tunnel encapsulation metadata on
-each route:
-
-```
-  ip route add <peer_cidr> encap ip src <local_ip> dst <peer_ip> dev vxlan0
-```
-
-The `vxlan0` interface is configured with source port range and destination
-port settings from the node configuration.
-
-See `cmd/unbounded-net-node/vxlan_config.go`.
-
-### WireGuard in Netlink Mode
-
-WireGuard operates the same way in both dataplane modes. The WireGuard driver
-handles its own encapsulation/decryption. In netlink mode, kernel routes for
-remote CIDRs point directly to the `wg<port>` interface (rather than being
-handled by BPF redirect).
 
 ---
 

@@ -1,0 +1,91 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orca
+  namespace: {{ default "unbounded-kube" .Namespace }}
+  labels:
+    app.kubernetes.io/name: orca
+spec:
+  replicas: {{ default "3" .TargetReplicas }}
+  # Required pod-anti-affinity below pins one Orca pod per node.
+  # In the dev harness the worker count == replica count, so default
+  # RollingUpdate can't surge: the new pod has no node to land on.
+  # maxSurge=0 / maxUnavailable=1 walks the replicas one-at-a-time.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: orca
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: orca
+    spec:
+      serviceAccountName: orca
+      # Required anti-affinity: at most one Orca pod per node so that a
+      # single node failure does not knock out multiple replicas. The
+      # dev harness Kind cluster has 3 worker nodes to match the default
+      # 3 replicas.
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: orca
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: orca
+          image: {{ default "ghcr.io/azure/orca:latest" .Image | quote }}
+          imagePullPolicy: {{ default "IfNotPresent" .ImagePullPolicy }}
+          args:
+            - serve
+            - --config=/etc/orca/config.yaml
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          envFrom:
+            - secretRef:
+                name: orca-credentials
+          ports:
+            - containerPort: 8443
+              name: edge
+              protocol: TCP
+            - containerPort: 8444
+              name: internal
+              protocol: TCP
+            - containerPort: 8442
+              name: ops
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: ops
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: ops
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: {{ default "200m" .ResourceCPURequest }}
+              memory: {{ default "256Mi" .ResourceMemoryRequest }}
+            limits:
+              cpu: {{ default "2" .ResourceCPULimit }}
+              memory: {{ default "1Gi" .ResourceMemoryLimit }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/orca
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: orca-config

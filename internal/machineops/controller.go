@@ -12,6 +12,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -31,17 +32,27 @@ const (
 // OperationRequest is the generic provider-facing view of a MachineOperation.
 type OperationRequest struct {
 	Machine         *unboundedv1alpha3.Machine
+	OperationName   string
+	OperationUID    types.UID
 	ProviderID      string
 	Operation       unboundedv1alpha3.OperationKind
 	Parameters      map[string]string
 	ReplaceUserData string
 }
 
+// OperationResult describes provider-side changes that must be reflected after
+// execution, such as replacement of an underlying cloud resource identity.
+type OperationResult struct {
+	ProviderID        string
+	CleanupProviderID string
+}
+
 // Provider executes MachineOperation requests for a specific external provider.
 type Provider interface {
 	Name() string
 	Supports(operation unboundedv1alpha3.OperationKind) bool
-	Execute(ctx context.Context, request OperationRequest) error
+	Execute(ctx context.Context, request OperationRequest) (OperationResult, error)
+	Cleanup(ctx context.Context, request OperationRequest, result OperationResult) error
 }
 
 // MachineOperationReconciler reconciles MachineOperation objects that target
@@ -59,7 +70,7 @@ type MachineOperationReconciler struct {
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machineoperations,verbs=get;list;watch;delete
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machineoperations/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machineoperations/finalizers,verbs=update
-// +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machines,verbs=get;list;watch
+// +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machines,verbs=get;list;watch;patch
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=list
 // +kubebuilder:rbac:groups="",resources=configmaps;services;secrets,verbs=get
 // +kubebuilder:rbac:nonResourceURLs=/version,verbs=get
@@ -131,7 +142,14 @@ func (r *MachineOperationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, nil
 	}
 
-	operationRequest := OperationRequest{Machine: &machine, ProviderID: providerMatch.providerID, Operation: op.Spec.OperationKind, Parameters: op.Spec.Parameters}
+	operationRequest := OperationRequest{
+		Machine:       &machine,
+		OperationName: op.Name,
+		OperationUID:  op.UID,
+		ProviderID:    providerMatch.providerID,
+		Operation:     op.Spec.OperationKind,
+		Parameters:    op.Spec.Parameters,
+	}
 	if op.Spec.OperationKind == unboundedv1alpha3.OperationHostReplace {
 		userData, err := r.buildReplaceUserData(ctx, &machine)
 		if err != nil {
@@ -141,11 +159,50 @@ func (r *MachineOperationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		operationRequest.ReplaceUserData = userData
 	}
 
-	if err := providerMatch.provider.Execute(ctx, operationRequest); err != nil {
+	operationResult, err := providerMatch.provider.Execute(ctx, operationRequest)
+	if err != nil {
 		return r.failOperation(ctx, &op, "ExecutionFailed", err.Error())
 	}
 
+	if operationResult.ProviderID != "" && operationResult.ProviderID != machine.Spec.ProviderID {
+		updatedGeneration, err := r.updateMachineProviderID(ctx, &machine, operationResult.ProviderID)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+
+		machine.Spec.ProviderID = operationResult.ProviderID
+		machine.Generation = updatedGeneration
+	}
+
+	if err := providerMatch.provider.Cleanup(ctx, operationRequest, operationResult); err != nil {
+		return ctrl.Result{}, fmt.Errorf("cleanup %s via %s: %w", op.Spec.OperationKind, providerMatch.provider.Name(), err)
+	}
+
 	return r.completeOperation(ctx, &op, machine.Generation, fmt.Sprintf("%s completed via %s", op.Spec.OperationKind, providerMatch.provider.Name()))
+}
+
+func (r *MachineOperationReconciler) updateMachineProviderID(ctx context.Context, machine *unboundedv1alpha3.Machine, providerID string) (int64, error) {
+	updatedGeneration := machine.Generation
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var latest unboundedv1alpha3.Machine
+		if err := r.Get(ctx, client.ObjectKeyFromObject(machine), &latest); err != nil {
+			return err
+		}
+
+		patch := client.MergeFrom(latest.DeepCopy())
+		latest.Spec.ProviderID = providerID
+		if err := r.Patch(ctx, &latest, patch); err != nil {
+			return fmt.Errorf("patch Machine providerID: %w", err)
+		}
+
+		if err := r.Get(ctx, client.ObjectKeyFromObject(machine), &latest); err != nil {
+			return err
+		}
+		updatedGeneration = latest.Generation
+
+		return nil
+	})
+	return updatedGeneration, err
 }
 
 func shouldExecuteOperation(op *unboundedv1alpha3.MachineOperation) bool {

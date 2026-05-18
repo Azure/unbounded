@@ -237,14 +237,14 @@ if [[ "$SKIP_NET" != "1" || "$INCLUDE_HOST" == "1" || -n "${FORCE_IMAGES:-}" ]];
         echo ""
         echo "--- unbounded-net-controller ---"
         docker buildx build "${net_args[@]}" \
-            -f images/net-controller/Dockerfile \
+            -f images/net/Containerfile \
             --target controller \
             -t "ghcr.io/azure/unbounded-net-controller:${TAG}" .
 
         echo ""
         echo "--- unbounded-net-node ---"
         docker buildx build "${net_args[@]}" \
-            -f images/net-node/Dockerfile \
+            -f images/net/Containerfile \
             --target node \
             -t "ghcr.io/azure/unbounded-net-node:${TAG}" .
     else

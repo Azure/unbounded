@@ -7,6 +7,8 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -20,6 +22,8 @@ import (
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/provision"
+	daemon "github.com/Azure/unbounded/pkg/agent/daemon"
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
 type fakeNodeOperator struct {
@@ -39,6 +43,13 @@ type fakeNodeOperator struct {
 	repaveActive *ActiveMachine
 	repaveConfig *provision.UnboundedAgentConfig
 	repaveErr    error
+
+	stageUpgradeCalled bool
+	stageUpgradeURL    string
+	stageUpgradeErr    error
+
+	restartAgentCalled bool
+	restartAgentErr    error
 }
 
 func (op *fakeNodeOperator) FindActiveMachine(*slog.Logger) (*ActiveMachine, error) {
@@ -80,6 +91,19 @@ func (op *fakeNodeOperator) RepaveNode(
 	return op.repaveErr
 }
 
+func (op *fakeNodeOperator) StageAgentUpgrade(_ context.Context, _ *slog.Logger, downloadURL string) error {
+	op.stageUpgradeCalled = true
+	op.stageUpgradeURL = downloadURL
+
+	return op.stageUpgradeErr
+}
+
+func (op *fakeNodeOperator) RestartAgentDaemon(_ context.Context, _ *slog.Logger) error {
+	op.restartAgentCalled = true
+
+	return op.restartAgentErr
+}
+
 func fakeStatusClient(objs ...client.Object) client.Client {
 	return fake.NewClientBuilder().
 		WithScheme(fakeScheme()).
@@ -87,6 +111,41 @@ func fakeStatusClient(objs ...client.Object) client.Client {
 		WithStatusSubresource(&v1alpha3.MachineOperation{}).
 		WithObjects(objs...).
 		Build()
+}
+
+func newTestMachinaMachineOperationReconciler(t *testing.T, c client.Client, op nodeOperator) *daemon.MachinaMachineOperationReconciler {
+	t.Helper()
+
+	target := &machineOperationTarget{
+		Client:       c,
+		log:          discardLogger(),
+		machineName:  "test-machine",
+		nodeOperator: op,
+	}
+
+	reconciler, err := daemon.NewMachinaMachineOperationReconciler(
+		c,
+		"test-machine",
+		"test-node",
+		daemon.MachineOperationHandlers{
+			v1alpha3.OperationNodeReboot:   target.reconcileNodeReboot,
+			v1alpha3.OperationAgentUpgrade: target.reconcileAgentUpgrade,
+			v1alpha3.OperationAgentReset:   target.reconcileAgentReset,
+		},
+	)
+	require.NoError(t, err)
+
+	return reconciler
+}
+
+func setAgentUpgradeSignalPath(t *testing.T) string {
+	t.Helper()
+
+	dir := t.TempDir()
+	agentUpgradeSignalPath := filepath.Join(dir, "agent-upgrade-signal")
+	t.Setenv(goalstates.EnvDaemonAgentUpgradeSignalPath, agentUpgradeSignalPath)
+
+	return agentUpgradeSignalPath
 }
 
 func TestReconcileNodeReboot_Complete(t *testing.T) {
@@ -101,20 +160,16 @@ func TestReconcileNodeReboot_Complete(t *testing.T) {
 
 	active := &ActiveMachine{Name: "kube1", Config: baseConfig()}
 	op := &fakeNodeOperator{active: active}
-	reconciler := &daemonReconciler{
-		Client:       fakeStatusClient(machine, machineOp),
-		log:          discardLogger(),
-		machineName:  "test-machine",
-		nodeOperator: op,
-	}
+	c := fakeStatusClient(machine, machineOp)
+	reconciler := newTestMachinaMachineOperationReconciler(t, c, op)
 
-	_, err := reconciler.reconcileMachineOperation(context.Background(), "op-1")
+	_, err := reconciler.ReconcileMachineOperation(context.Background(), "op-1")
 	require.NoError(t, err)
 	assert.True(t, op.restartCalled)
 	assert.Same(t, active, op.restartActive)
 
 	var updated v1alpha3.MachineOperation
-	require.NoError(t, reconciler.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
 	assert.Equal(t, v1alpha3.OperationPhaseComplete, updated.Status.Phase)
 	assert.Equal(t, "NodeReboot completed", updated.Status.Message)
 	assert.Equal(t, int64(7), updated.Status.ObservedMachineGeneration)
@@ -133,18 +188,14 @@ func TestReconcileNodeReboot_Failed(t *testing.T) {
 	}
 
 	op := &fakeNodeOperator{restartErr: errors.New("restart failed")}
-	reconciler := &daemonReconciler{
-		Client:       fakeStatusClient(machine, machineOp),
-		log:          discardLogger(),
-		machineName:  "test-machine",
-		nodeOperator: op,
-	}
+	c := fakeStatusClient(machine, machineOp)
+	reconciler := newTestMachinaMachineOperationReconciler(t, c, op)
 
-	_, err := reconciler.reconcileMachineOperation(context.Background(), "op-1")
+	_, err := reconciler.ReconcileMachineOperation(context.Background(), "op-1")
 	require.NoError(t, err)
 
 	var updated v1alpha3.MachineOperation
-	require.NoError(t, reconciler.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
 	assert.Equal(t, v1alpha3.OperationPhaseFailed, updated.Status.Phase)
 	assert.Equal(t, "restart failed", updated.Status.Message)
 	require.NotNil(t, updated.Status.StartedAt)
@@ -162,23 +213,185 @@ func TestReconcileNodeReboot_FindActiveMachineFailed(t *testing.T) {
 	}
 
 	op := &fakeNodeOperator{findErr: errors.New("no active machine")}
-	reconciler := &daemonReconciler{
-		Client:       fakeStatusClient(machine, machineOp),
-		log:          discardLogger(),
-		machineName:  "test-machine",
-		nodeOperator: op,
-	}
+	c := fakeStatusClient(machine, machineOp)
+	reconciler := newTestMachinaMachineOperationReconciler(t, c, op)
 
-	_, err := reconciler.reconcileMachineOperation(context.Background(), "op-1")
+	_, err := reconciler.ReconcileMachineOperation(context.Background(), "op-1")
 	require.NoError(t, err)
 	assert.False(t, op.restartCalled)
 
 	var updated v1alpha3.MachineOperation
-	require.NoError(t, reconciler.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
 	assert.Equal(t, v1alpha3.OperationPhaseFailed, updated.Status.Phase)
 	assert.Equal(t, "no active machine", updated.Status.Message)
 	require.NotNil(t, updated.Status.StartedAt)
 	require.NotNil(t, updated.Status.CompletedAt)
+}
+
+func TestReconcileAgentUpgrade_Complete(t *testing.T) {
+	signalPath := setAgentUpgradeSignalPath(t)
+	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Generation: 9}}
+	machineOp := &v1alpha3.MachineOperation{
+		ObjectMeta: metav1.ObjectMeta{Name: "op-1"},
+		Spec: v1alpha3.MachineOperationSpec{
+			MachineRef:    "test-machine",
+			OperationKind: v1alpha3.OperationAgentUpgrade,
+			Parameters: map[string]string{
+				agentUpgradeDownloadURLParameter: "https://example.com/unbounded-agent.tar.gz",
+			},
+		},
+	}
+
+	op := &fakeNodeOperator{}
+	c := fakeStatusClient(machine, machineOp)
+	reconciler := newTestMachinaMachineOperationReconciler(t, c, op)
+
+	_, err := reconciler.ReconcileMachineOperation(context.Background(), "op-1")
+	require.NoError(t, err)
+	assert.True(t, op.stageUpgradeCalled)
+	assert.Equal(t, "https://example.com/unbounded-agent.tar.gz", op.stageUpgradeURL)
+	assert.True(t, op.restartAgentCalled)
+
+	var updated v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
+	assert.Equal(t, v1alpha3.OperationPhaseInProgress, updated.Status.Phase)
+	require.NotNil(t, updated.Status.StartedAt)
+	assert.Nil(t, updated.Status.CompletedAt)
+	data, err := os.ReadFile(signalPath)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"operationName":"op-1","observedMachineGeneration":9}`, string(data))
+
+	require.NoError(t, publishAndClearAgentUpgradeSignals(context.Background(), discardLogger(), c))
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
+	assert.Equal(t, v1alpha3.OperationPhaseComplete, updated.Status.Phase)
+	assert.Equal(t, "AgentUpgrade completed", updated.Status.Message)
+	assert.Equal(t, int64(9), updated.Status.ObservedMachineGeneration)
+	require.NotNil(t, updated.Status.StartedAt)
+	require.NotNil(t, updated.Status.CompletedAt)
+	assert.NoFileExists(t, signalPath)
+}
+
+func TestReconcileAgentUpgrade_MissingDownloadURL(t *testing.T) {
+	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Generation: 9}}
+	machineOp := &v1alpha3.MachineOperation{
+		ObjectMeta: metav1.ObjectMeta{Name: "op-1"},
+		Spec: v1alpha3.MachineOperationSpec{
+			MachineRef:    "test-machine",
+			OperationKind: v1alpha3.OperationAgentUpgrade,
+		},
+	}
+
+	op := &fakeNodeOperator{}
+	c := fakeStatusClient(machine, machineOp)
+	reconciler := newTestMachinaMachineOperationReconciler(t, c, op)
+
+	_, err := reconciler.ReconcileMachineOperation(context.Background(), "op-1")
+	require.NoError(t, err)
+	assert.False(t, op.stageUpgradeCalled)
+	assert.False(t, op.restartAgentCalled)
+
+	var updated v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
+	assert.Equal(t, v1alpha3.OperationPhaseFailed, updated.Status.Phase)
+	assert.Contains(t, updated.Status.Message, agentUpgradeDownloadURLParameter)
+}
+
+func TestReconcileAgentUpgrade_Failed(t *testing.T) {
+	signalPath := setAgentUpgradeSignalPath(t)
+	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Generation: 9}}
+	machineOp := &v1alpha3.MachineOperation{
+		ObjectMeta: metav1.ObjectMeta{Name: "op-1"},
+		Spec: v1alpha3.MachineOperationSpec{
+			MachineRef:    "test-machine",
+			OperationKind: v1alpha3.OperationAgentUpgrade,
+			Parameters: map[string]string{
+				agentUpgradeDownloadURLParameter: "https://example.com/unbounded-agent.tar.gz",
+			},
+		},
+	}
+
+	op := &fakeNodeOperator{stageUpgradeErr: errors.New("upgrade failed")}
+	c := fakeStatusClient(machine, machineOp)
+	reconciler := newTestMachinaMachineOperationReconciler(t, c, op)
+
+	_, err := reconciler.ReconcileMachineOperation(context.Background(), "op-1")
+	require.NoError(t, err)
+
+	var updated v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
+	assert.Equal(t, v1alpha3.OperationPhaseFailed, updated.Status.Phase)
+	assert.Equal(t, "upgrade failed", updated.Status.Message)
+	assert.False(t, op.restartAgentCalled)
+	assert.NoFileExists(t, signalPath)
+}
+
+func TestReconcileAgentUpgrade_RestartFailureFailsOperation(t *testing.T) {
+	signalPath := setAgentUpgradeSignalPath(t)
+	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Generation: 9}}
+	machineOp := &v1alpha3.MachineOperation{
+		ObjectMeta: metav1.ObjectMeta{Name: "op-1"},
+		Spec: v1alpha3.MachineOperationSpec{
+			MachineRef:    "test-machine",
+			OperationKind: v1alpha3.OperationAgentUpgrade,
+			Parameters: map[string]string{
+				agentUpgradeDownloadURLParameter: "https://example.com/unbounded-agent.tar.gz",
+			},
+		},
+	}
+
+	op := &fakeNodeOperator{restartAgentErr: errors.New("restart failed")}
+	c := fakeStatusClient(machine, machineOp)
+	reconciler := newTestMachinaMachineOperationReconciler(t, c, op)
+
+	_, err := reconciler.ReconcileMachineOperation(context.Background(), "op-1")
+	require.NoError(t, err)
+	assert.True(t, op.stageUpgradeCalled)
+	assert.True(t, op.restartAgentCalled)
+
+	var updated v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
+	assert.Equal(t, v1alpha3.OperationPhaseFailed, updated.Status.Phase)
+	assert.Equal(t, "restart failed", updated.Status.Message)
+	assert.NoFileExists(t, signalPath)
+}
+
+func TestPublishAndClearAgentUpgradeSignals_NoSignal(t *testing.T) {
+	signalPath := setAgentUpgradeSignalPath(t)
+
+	require.NoError(t, publishAndClearAgentUpgradeSignals(context.Background(), discardLogger(), fakeStatusClient()))
+	assert.NoFileExists(t, signalPath)
+}
+
+func TestPublishAndClearAgentUpgradeSignals_Failure(t *testing.T) {
+	signalPath := setAgentUpgradeSignalPath(t)
+	const rollbackMessage = "rolled back to last good"
+	machineOp := &v1alpha3.MachineOperation{
+		ObjectMeta: metav1.ObjectMeta{Name: "op-1"},
+		Spec: v1alpha3.MachineOperationSpec{
+			MachineRef:    "test-machine",
+			OperationKind: v1alpha3.OperationAgentUpgrade,
+		},
+		Status: v1alpha3.MachineOperationStatus{
+			Phase:   v1alpha3.OperationPhaseComplete,
+			Message: "AgentUpgrade completed",
+		},
+	}
+	c := fakeStatusClient(machineOp)
+	signals := newAgentUpgradeSignalOperatorForPath(signalPath)
+	require.NoError(t, signals.RecordPending("op-1", 7))
+	require.NoError(t, RecordAgentUpgradeFailureSignal(rollbackMessage))
+
+	require.NoError(t, publishAndClearAgentUpgradeSignals(context.Background(), discardLogger(), c))
+
+	var updated v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
+	assert.Equal(t, v1alpha3.OperationPhaseFailed, updated.Status.Phase)
+	assert.Equal(t, rollbackMessage, updated.Status.Message)
+	condition := apimeta.FindStatusCondition(updated.Status.Conditions, "Completed")
+	require.NotNil(t, condition)
+	assert.Equal(t, metav1.ConditionFalse, condition.Status)
+	assert.Equal(t, "DaemonFailed", condition.Reason)
+	assert.NoFileExists(t, signalPath)
 }
 
 func TestReconcileAgentReset_Complete(t *testing.T) {
@@ -192,20 +405,16 @@ func TestReconcileAgentReset_Complete(t *testing.T) {
 	}
 
 	op := &fakeNodeOperator{}
-	reconciler := &daemonReconciler{
-		Client:       fakeStatusClient(machine, machineOp),
-		log:          discardLogger(),
-		machineName:  "test-machine",
-		nodeOperator: op,
-	}
+	c := fakeStatusClient(machine, machineOp)
+	reconciler := newTestMachinaMachineOperationReconciler(t, c, op)
 
-	_, err := reconciler.reconcileMachineOperation(context.Background(), "op-1")
+	_, err := reconciler.ReconcileMachineOperation(context.Background(), "op-1")
 	require.NoError(t, err)
 	assert.True(t, op.resetCalled)
 	assert.True(t, op.stopCalled)
 
 	var updated v1alpha3.MachineOperation
-	require.NoError(t, reconciler.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
 	assert.Equal(t, v1alpha3.OperationPhaseComplete, updated.Status.Phase)
 	assert.Equal(t, "AgentReset completed", updated.Status.Message)
 	assert.Equal(t, int64(7), updated.Status.ObservedMachineGeneration)
@@ -224,20 +433,16 @@ func TestReconcileAgentReset_Failed(t *testing.T) {
 	}
 
 	op := &fakeNodeOperator{resetErr: errors.New("reset failed")}
-	reconciler := &daemonReconciler{
-		Client:       fakeStatusClient(machine, machineOp),
-		log:          discardLogger(),
-		machineName:  "test-machine",
-		nodeOperator: op,
-	}
+	c := fakeStatusClient(machine, machineOp)
+	reconciler := newTestMachinaMachineOperationReconciler(t, c, op)
 
-	_, err := reconciler.reconcileMachineOperation(context.Background(), "op-1")
+	_, err := reconciler.ReconcileMachineOperation(context.Background(), "op-1")
 	require.NoError(t, err)
 	assert.True(t, op.resetCalled)
 	assert.False(t, op.stopCalled)
 
 	var updated v1alpha3.MachineOperation
-	require.NoError(t, reconciler.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
 	assert.Equal(t, v1alpha3.OperationPhaseFailed, updated.Status.Phase)
 	assert.Equal(t, "reset failed", updated.Status.Message)
 	require.NotNil(t, updated.Status.StartedAt)
@@ -272,15 +477,15 @@ func TestReconcileRepave_UsesDesiredMachineConfigurationVersion(t *testing.T) {
 
 	active := &ActiveMachine{Name: "kube1", Config: baseConfig()}
 	op := &fakeNodeOperator{active: active}
-	reconciler := &daemonReconciler{
-		Client:       fakeStatusClient(machine, mcv),
+	c := fakeStatusClient(machine, mcv)
+	reconciler := &repaveReconciler{
+		Client:       c,
 		log:          discardLogger(),
 		machineName:  "test-machine",
-		nodeName:     "test-node",
 		nodeOperator: op,
 	}
 
-	_, err := reconciler.Reconcile(context.Background(), daemonRequest{Kind: queueItemRepave, Name: "test-node"})
+	_, err := reconciler.ReconcileRepave(context.Background(), "node-delete")
 	require.NoError(t, err)
 	require.Same(t, active, op.repaveActive)
 	require.NotNil(t, op.repaveConfig)
@@ -292,7 +497,7 @@ func TestReconcileRepave_UsesDesiredMachineConfigurationVersion(t *testing.T) {
 	assert.Equal(t, active.Config.Kubelet.Auth.BootstrapToken, op.repaveConfig.Kubelet.Auth.BootstrapToken)
 
 	var updated v1alpha3.Machine
-	require.NoError(t, reconciler.Get(context.Background(), client.ObjectKey{Name: "test-machine"}, &updated))
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "test-machine"}, &updated))
 	require.NotNil(t, updated.Status.Configuration)
 	assert.Equal(t, "config-a", updated.Status.Configuration.Name)
 	assert.Equal(t, int32(2), updated.Status.Configuration.Version)
@@ -327,21 +532,21 @@ func TestReconcileRepave_NoDriftMarksDesiredConfigurationApplied(t *testing.T) {
 	})
 
 	op := &fakeNodeOperator{active: &ActiveMachine{Name: "kube1", Config: base}}
-	reconciler := &daemonReconciler{
-		Client:       fakeStatusClient(machine, mcv),
+	c := fakeStatusClient(machine, mcv)
+	reconciler := &repaveReconciler{
+		Client:       c,
 		log:          discardLogger(),
 		machineName:  "test-machine",
-		nodeName:     "test-node",
 		nodeOperator: op,
 	}
 
-	_, err := reconciler.Reconcile(context.Background(), daemonRequest{Kind: queueItemRepave, Name: "test-node"})
+	_, err := reconciler.ReconcileRepave(context.Background(), "node-delete")
 	require.NoError(t, err)
 	assert.Nil(t, op.repaveActive)
 	assert.Nil(t, op.repaveConfig)
 
 	var updated v1alpha3.Machine
-	require.NoError(t, reconciler.Get(context.Background(), client.ObjectKey{Name: "test-machine"}, &updated))
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "test-machine"}, &updated))
 	require.NotNil(t, updated.Status.Configuration)
 	assert.Equal(t, "config-a", updated.Status.Configuration.Name)
 	assert.Equal(t, int32(2), updated.Status.Configuration.Version)
@@ -382,19 +587,6 @@ func TestResolveDesiredRepaveConfig_UsesLatestWhenVersionOmitted(t *testing.T) {
 	require.NotNil(t, appliedRef)
 	assert.Equal(t, int32(3), appliedRef.Version)
 	assert.Equal(t, "config-a-v3", appliedRef.VersionName)
-}
-
-func TestShouldEnqueueMachineOperation_AgentReset(t *testing.T) {
-	machineOp := &v1alpha3.MachineOperation{
-		ObjectMeta: metav1.ObjectMeta{Name: "op-1"},
-		Spec: v1alpha3.MachineOperationSpec{
-			MachineRef:    "test-machine",
-			OperationKind: v1alpha3.OperationAgentReset,
-		},
-	}
-
-	matches := shouldEnqueueMachineOperation(context.Background(), fakeStatusClient(machineOp), discardLogger(), "test-machine", "test-node", machineOp)
-	assert.True(t, matches)
 }
 
 func machineConfigurationVersion(

@@ -34,8 +34,8 @@ func validateInterfaceName(name string) error {
 }
 
 // Deprecated: GatewayPolicyManager is deprecated. Policy-based routing (PBR) via
-// connmark/fwmark/ip-rule is replaced by per-interface iptables FORWARD ACCEPT
-// rules. This type is retained for backward compatibility when
+// connmark/fwmark/ip-rule is replaced by the UNBOUNDED-FORWARD iptables chain.
+// This type is retained for backward compatibility when
 // enablePolicyRouting is explicitly set to true.
 //
 // GatewayPolicyManager manages policy routing rules to ensure return traffic

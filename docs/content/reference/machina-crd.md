@@ -125,6 +125,8 @@ OCI operations use an OCI SDK config file mounted into the `machine-ops-controll
 | `status.startedAt` | time | No | Operation start timestamp. |
 | `status.completedAt` | time | No | Terminal phase timestamp. |
 
+`AgentUpgrade` is handled by the in-host agent and requires `spec.parameters.downloadURL`. The URL must point to an `unbounded-agent` release tarball; the agent stages it as the inactive blue/green daemon binary, records the previous binary as last known good, and restarts `unbounded-agent-daemon.service`. If systemd cannot keep the upgraded daemon running, `unbounded-agent-daemon-recovery.service` switches the daemon back to the last known good binary.
+
 The Azure VM provider handles:
 
 | Operation | Azure action |
@@ -145,8 +147,11 @@ The OCI instance provider handles:
 | `HostReboot` | `RESET` |
 | `HostPowerOff` | `STOP` |
 | `HostPowerOn` | `START` |
+| `HostReplace` | `STOP` old instance, `LaunchInstance` replacement, patch `Machine.spec.providerID`, then terminate old instance |
 
-`HostReplace` is not currently supported for `OCIInstance` because an identity-preserving OCI replacement flow with fresh `user_data` injection has not been verified.
+`HostReplace` for `OCIInstance` creates a replacement instance because OCI launch `user_data` is immutable after instance creation. The controller stops the old instance, launches a new instance in the same availability domain, subnet, shape, and fault domain, requests a public IP for bootstrap egress, patches `Machine.spec.providerID` to the new instance OCID after the replacement reaches `RUNNING`, and then terminates the old instance. The replacement reuses the original `Machine` name as the kubelet node name so it rejoins through the existing Kubernetes `Node` object. Operation completion means the replacement is running, provider ID handoff succeeded, and old-instance cleanup succeeded; it does not wait for the Kubernetes `Node` to become Ready.
+
+The OCI replacement flow copies display name, defined tags, freeform tags, selected agent/availability/shape settings, and primary VNIC subnet/NSG/source-destination-check settings. It adds Unbounded freeform tags for idempotent retry lookup. It does not preserve the exact private IP, boot volume, or attached data volumes; active attached data volumes fail the operation before the old instance is stopped. By default, the replacement uses the latest compatible `Canonical Ubuntu` `24.04` image for the source instance shape. Set `spec.parameters.imageID` to use a specific OCI image OCID. Set `spec.parameters.sshAuthorizedKeys` to append SSH authorized keys to replacement metadata for break-glass debugging.
 
 ### status
 

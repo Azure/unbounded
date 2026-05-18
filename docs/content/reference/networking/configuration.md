@@ -45,7 +45,6 @@ node:
   wireGuardPort: 51820
   mtu: 1280
   healthPort: 9998
-  tunnelDataplane: ebpf
   tunnelDataplaneMapSize: 16384
   tunnelIPFamily: IPv4
   preferredPrivateEncap: GENEVE
@@ -162,10 +161,11 @@ avoid flow table limits on cloud platforms (e.g., Azure).
 
 ### Tunnel Dataplane
 
+The node agent uses an eBPF dataplane: BPF LPM tries on the `unbounded0` interface drive per-destination tunnel redirection.
+
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--tunnel-dataplane` | `ebpf` | `ebpf` (BPF LPM tries) or `netlink` (per-peer interfaces). |
-| `--tunnel-dataplane-map-size` | `16384` | Max entries per BPF LPM trie map (eBPF only). |
+| `--tunnel-dataplane-map-size` | `16384` | Max entries per BPF LPM trie map. |
 | `--tunnel-ip-family` | `IPv4` | Underlay IP family for tunnel encapsulation (`IPv4` or `IPv6`). |
 
 ### Tunnel Protocol Selection

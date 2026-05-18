@@ -1,0 +1,87 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: orca-config
+  namespace: {{ default "unbounded-kube" .Namespace }}
+  labels:
+    app.kubernetes.io/name: orca
+data:
+  config.yaml: |
+    # Orca origin cache configuration.
+    # Secret values (account keys, S3 access/secret) are sourced from
+    # environment variables ORCA_AZUREBLOB_ACCOUNT_KEY,
+    # ORCA_CACHESTORE_S3_ACCESS_KEY, ORCA_CACHESTORE_S3_SECRET_KEY,
+    # populated by the orca-credentials Secret via envFrom.
+
+    server:
+      listen: "0.0.0.0:8443"
+      auth:
+        # Dev: disabled. Production: enable bearer or mtls.
+        enabled: {{ default "false" .ServerAuthEnabled }}
+
+    origin:
+      id: {{ default "azureblob-default" .OriginID | quote }}
+      driver: {{ default "azureblob" .OriginDriver }}
+      target_global: {{ default "192" .TargetGlobal }}
+      queue_timeout: 5s
+      retry:
+        attempts: 3
+        backoff_initial: 100ms
+        backoff_max: 2s
+        max_total_duration: 5s
+      azureblob:
+        account: {{ default "" .AzureAccount | quote }}
+        container: {{ default "" .AzureContainer | quote }}
+        endpoint: {{ default "" .AzureEndpoint | quote }}
+      awss3:
+        endpoint: {{ default "" .OriginAWSS3Endpoint | quote }}
+        region: {{ default "us-east-1" .OriginAWSS3Region | quote }}
+        bucket: {{ default "" .OriginAWSS3Bucket | quote }}
+        use_path_style: {{ default "false" .OriginAWSS3UsePathStyle }}
+
+    cachestore:
+      driver: s3
+      s3:
+        endpoint: {{ default "http://localstack.unbounded-kube.svc.cluster.local:4566" .CachestoreEndpoint | quote }}
+        bucket: {{ default "orca-cache" .CachestoreBucket | quote }}
+        region: {{ default "us-east-1" .CachestoreRegion | quote }}
+        use_path_style: true
+
+    cluster:
+      service: {{ default "orca-peers.unbounded-kube.svc.cluster.local" .ClusterService | quote }}
+      membership_refresh: 5s
+      internal_listen: "0.0.0.0:8444"
+      target_replicas: {{ default "3" .TargetReplicas }}
+      internal_tls:
+        # Dev: disabled (plain HTTP/2 between peers). Production: true.
+        enabled: {{ default "false" .InternalTLSEnabled }}
+
+    chunk_catalog:
+      max_entries: 100000
+
+    metadata:
+      ttl: 5m
+      negative_ttl: 60s
+      max_entries: 10000
+
+    chunking:
+      # Base chunk size for objects smaller than the smallest tier
+      # threshold. Accepts a raw byte count or a human-readable
+      # string with SI suffixes (KB / MB / GB / TB / PB; decimal)
+      # or IEC suffixes (KiB / MiB / GiB / TiB / PiB; binary).
+      size: 8 MiB
+      # Tier ladder: the tier with the largest min_object_size
+      # <= info.Size wins. Strictly ascending by min_object_size.
+      # The bottom (`size` above) covers small objects; tiers
+      # kick in for larger ones.
+      tiers:
+        - min_object_size: 1 GiB
+          chunk_size: 64 MiB
+        - min_object_size: 10 GiB
+          chunk_size: 128 MiB
+
+    logging:
+      # One of debug, info, warn, error. Overridden at runtime by the
+      # ORCA_LOG_LEVEL environment variable when set.
+      level: {{ default "info" .LogLevel | quote }}

@@ -141,41 +141,6 @@ func TestGatewayPolicyFormattingHelpers(t *testing.T) {
 	}
 }
 
-// TestUnifiedRouteManagerPeerHealthTracking tests peer health state tracking.
-func TestUnifiedRouteManagerPeerHealthTracking(t *testing.T) {
-	m := NewUnifiedRouteManager("test-iface", 0)
-
-	// Initially no peers tracked.
-	if len(m.peerHealthy) != 0 {
-		t.Fatalf("expected empty peer health map, got %d entries", len(m.peerHealthy))
-	}
-
-	// Ensure nexthops registers peers.
-	m.ensureNexthop(DesiredNexthop{PeerID: "peer-a", LinkIndex: 1})
-	m.peerHealthy["peer-a"] = true
-	m.ensureNexthop(DesiredNexthop{PeerID: "peer-b", LinkIndex: 2})
-	m.peerHealthy["peer-b"] = true
-
-	if !m.peerHealthy["peer-a"] || !m.peerHealthy["peer-b"] {
-		t.Fatalf("expected both peers healthy")
-	}
-
-	// Mark peer-b unhealthy.
-	m.peerHealthy["peer-b"] = false
-
-	dr := DesiredRoute{
-		Nexthops: []DesiredNexthop{
-			{PeerID: "peer-a", LinkIndex: 1},
-			{PeerID: "peer-b", LinkIndex: 2},
-		},
-	}
-
-	active := m.activeNexthops(dr)
-	if len(active) != 1 || active[0].PeerID != "peer-a" {
-		t.Fatalf("expected only peer-a active, got %v", active)
-	}
-}
-
 // TestIntSliceEqualityFromHelpers tests int slice equality (previously covered by ECMP helper test).
 func TestIntSliceEqualityFromHelpers(t *testing.T) {
 	if !intSlicesEqual([]int{1, 2, 3}, []int{1, 2, 3}) {

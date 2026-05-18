@@ -4,7 +4,6 @@
 package main
 
 import (
-	"encoding/binary"
 	"fmt"
 	"net"
 	"sort"
@@ -12,100 +11,29 @@ import (
 	"github.com/cilium/ebpf"
 	"k8s.io/klog/v2"
 
+	ebpfpkg "github.com/Azure/unbounded/internal/net/ebpf"
 	statusv1alpha1 "github.com/Azure/unbounded/internal/net/status/v1alpha1"
 )
 
-const (
-	bpfMapName     = "unbounded_endpo" // kernel truncates to 15 chars
-	bpfV4KeySize   = 8                 // sizeof(lpmKeyV4)
-	bpfV6KeySize   = 20                // sizeof(lpmKeyV6)
-	bpfMaxNexthops = 4
-)
-
-// bpfLpmKeyV4 matches struct lpm_key_v4 in the BPF programs.
-type bpfLpmKeyV4 struct {
-	Prefixlen uint32
-	Addr      uint32
-}
-
-// bpfLpmKeyV6 matches struct lpm_key_v6 in the BPF programs.
-type bpfLpmKeyV6 struct {
-	Prefixlen uint32
-	Addr      [4]uint32
-}
-
-// bpfTunnelNexthopV4 matches struct tunnel_nexthop in the BPF programs.
-type bpfTunnelNexthopV4 struct {
-	RemoteIPv4 uint32
-	VNI        uint32
-	IfIndex    uint32
-	Flags      uint32
-	Protocol   uint32
-}
-
-// bpfTunnelEndpointV4 matches struct tunnel_endpoint_v4 in the BPF programs.
-type bpfTunnelEndpointV4 struct {
-	Nexthops [bpfMaxNexthops]bpfTunnelNexthopV4
-	Count    uint32
-}
-
-// bpfTunnelNexthopV6 matches struct tunnel_nexthop_v6 in the BPF programs.
-type bpfTunnelNexthopV6 struct {
-	RemoteIPv6 [4]uint32
-	VNI        uint32
-	IfIndex    uint32
-	Flags      uint32
-	Protocol   uint32
-}
-
-// bpfTunnelEndpointV6 matches struct tunnel_endpoint_v6 in the BPF programs.
-type bpfTunnelEndpointV6 struct {
-	Nexthops [bpfMaxNexthops]bpfTunnelNexthopV6
-	Count    uint32
-}
-
-// collectBpfEntries reads the eBPF LPM trie tunnel maps and returns BPF entries
-// annotated with node names from the peer list. Returns an empty slice if the
-// maps are not found (e.g. when not running as root or BPF programs not loaded).
+// collectBpfEntries reads the unified eBPF LPM trie (unb_endpts) and returns
+// BPF entries annotated with node names from the peer list. Returns an empty
+// slice if the map is not present (e.g. running without root, or the
+// unbounded_encap program is not loaded).
 func (s *nodeStatusServer) collectBpfEntries() []statusv1alpha1.BpfEntry {
-	maps, err := bpfFindMapsByName(bpfMapName)
+	m, err := bpfFindMap(ebpfpkg.MapName)
 	if err != nil {
-		klog.V(4).Infof("BPF maps not available: %v", err)
+		klog.V(4).Infof("BPF map %q not available: %v", ebpfpkg.MapName, err)
 		return nil
 	}
 
-	defer func() {
-		for _, m := range maps {
-			_ = m.Close() //nolint:errcheck
-		}
-	}()
+	defer func() { _ = m.Close() }() //nolint:errcheck
 
-	var entries []statusv1alpha1.BpfEntry
-
-	for _, m := range maps {
-		info, err := m.Info()
-		if err != nil {
-			klog.V(4).Infof("BPF map info error: %v", err)
-			continue
-		}
-
-		switch info.KeySize {
-		case bpfV4KeySize:
-			entries, err = bpfCollectV4Entries(m, entries)
-		case bpfV6KeySize:
-			entries, err = bpfCollectV6Entries(m, entries)
-		default:
-			continue
-		}
-
-		if err != nil {
-			klog.Warningf("Error iterating BPF map (key_size=%d): %v", info.KeySize, err)
-		}
+	entries, err := bpfCollectEntries(m)
+	if err != nil {
+		klog.Warningf("Error iterating BPF map %q: %v", ebpfpkg.MapName, err)
 	}
 
-	// Annotate entries with node names from the peer list
 	s.annotateBpfEntries(entries)
-
 	sort.Slice(entries, func(i, j int) bool { return entries[i].CIDR < entries[j].CIDR })
 
 	return entries
@@ -168,11 +96,8 @@ func (s *nodeStatusServer) annotateBpfEntries(entries []statusv1alpha1.BpfEntry)
 	}
 }
 
-// bpfFindMapsByName scans all loaded BPF maps and returns every map matching
-// the given name. Returns an error if no maps are found.
-func bpfFindMapsByName(name string) ([]*ebpf.Map, error) {
-	var maps []*ebpf.Map
-
+// bpfFindMap scans loaded BPF maps for one matching the given name.
+func bpfFindMap(name string) (*ebpf.Map, error) {
 	id := ebpf.MapID(0)
 
 	for {
@@ -195,134 +120,113 @@ func bpfFindMapsByName(name string) ([]*ebpf.Map, error) {
 		}
 
 		if info.Name == name {
-			maps = append(maps, m)
-		} else {
-			_ = m.Close() //nolint:errcheck
+			return m, nil
 		}
+
+		_ = m.Close() //nolint:errcheck
 	}
 
-	if len(maps) == 0 {
-		return nil, fmt.Errorf("BPF map %q not found", name)
-	}
-
-	return maps, nil
+	return nil, fmt.Errorf("BPF map %q not found", name)
 }
 
-// bpfCollectV4Entries iterates a v4 tunnel endpoint map and appends entries.
-func bpfCollectV4Entries(m *ebpf.Map, entries []statusv1alpha1.BpfEntry) ([]statusv1alpha1.BpfEntry, error) {
+// bpfCollectEntries iterates the unified LPM trie and produces one BpfEntry
+// per nexthop.
+func bpfCollectEntries(m *ebpf.Map) ([]statusv1alpha1.BpfEntry, error) {
 	var (
-		key bpfLpmKeyV4
-		val bpfTunnelEndpointV4
+		key ebpfpkg.LpmKey
+		val ebpfpkg.RawTunnelEndpoint
 	)
 
-	iter := m.Iterate()
-	for iter.Next(&key, &val) {
-		entries = append(entries, bpfMakeEntriesV4(key, val)...)
-	}
-
-	if err := iter.Err(); err != nil {
-		return entries, fmt.Errorf("iterate unbounded_endpoints_v4: %w", err)
-	}
-
-	return entries, nil
-}
-
-// bpfCollectV6Entries iterates a v6 tunnel endpoint map and appends entries.
-func bpfCollectV6Entries(m *ebpf.Map, entries []statusv1alpha1.BpfEntry) ([]statusv1alpha1.BpfEntry, error) {
-	var (
-		key bpfLpmKeyV6
-		val bpfTunnelEndpointV6
-	)
-
-	iter := m.Iterate()
-	for iter.Next(&key, &val) {
-		entries = append(entries, bpfMakeEntriesV6(key, val)...)
-	}
-
-	if err := iter.Err(); err != nil {
-		return entries, fmt.Errorf("iterate unbounded_endpoints_v6: %w", err)
-	}
-
-	return entries, nil
-}
-
-// bpfMakeEntriesV4 builds BpfEntry values from v4 key/value pairs, one per nexthop.
-func bpfMakeEntriesV4(key bpfLpmKeyV4, val bpfTunnelEndpointV4) []statusv1alpha1.BpfEntry {
 	var entries []statusv1alpha1.BpfEntry
 
-	cidr := fmt.Sprintf("%s/%d", bpfUint32ToIPv4LE(key.Addr), key.Prefixlen)
+	iter := m.Iterate()
+	for iter.Next(&key, &val) {
+		entries = append(entries, bpfMakeEntries(key, val)...)
+	}
 
-	for i := uint32(0); i < val.Count && i < bpfMaxNexthops; i++ {
+	if err := iter.Err(); err != nil {
+		return entries, fmt.Errorf("iterate %s: %w", ebpfpkg.MapName, err)
+	}
+
+	return entries, nil
+}
+
+// bpfMakeEntries expands a single LPM trie entry into one BpfEntry per
+// nexthop. v4 entries (those whose key is IPv4-mapped) are rendered with
+// dotted-quad CIDR notation; v6 entries use canonical v6 form. Underlay
+// addresses follow the same rule.
+func bpfMakeEntries(key ebpfpkg.LpmKey, val ebpfpkg.RawTunnelEndpoint) []statusv1alpha1.BpfEntry {
+	cidr := bpfFormatKey(key)
+
+	entries := make([]statusv1alpha1.BpfEntry, 0, val.Count)
+	for i := uint32(0); i < val.Count && i < uint32(ebpfpkg.MaxNexthops); i++ {
 		nh := val.Nexthops[i]
-		ifName, mtu := bpfResolveInterface(nh.IfIndex)
+		ifName, mtu := bpfResolveInterface(nh.Ifindex)
+
 		entries = append(entries, statusv1alpha1.BpfEntry{
 			CIDR:      cidr,
-			Remote:    bpfUint32ToIPv4BE(nh.RemoteIPv4).String(),
+			Remote:    bpfFormatEndpoint(nh.RemoteEndpoint),
 			Interface: ifName,
 			Protocol:  bpfProtocolName(nh.Protocol),
-			Healthy:   nh.Flags&0x02 != 0,
-			VNI:       nh.VNI,
+			Healthy:   nh.Healthy != 0,
+			VNI:       nh.Vni,
 			MTU:       mtu,
-			IfIndex:   nh.IfIndex,
+			IfIndex:   nh.Ifindex,
 		})
 	}
 
 	return entries
 }
 
-// bpfMakeEntriesV6 builds BpfEntry values from v6 key/value pairs, one per nexthop.
-func bpfMakeEntriesV6(key bpfLpmKeyV6, val bpfTunnelEndpointV6) []statusv1alpha1.BpfEntry {
-	var entries []statusv1alpha1.BpfEntry
+// bpfFormatKey renders an LPM key as a CIDR string. v4-mapped entries are
+// unmapped to dotted-quad with the +96 prefix offset removed.
+func bpfFormatKey(key ebpfpkg.LpmKey) string {
+	if ebpfpkg.IsV4Mapped(key.Addr) {
+		ip := net.IPv4(key.Addr[12], key.Addr[13], key.Addr[14], key.Addr[15])
 
-	cidr := fmt.Sprintf("%s/%d", bpfFormatIP(bpfUint32ArrayToIPv6(key.Addr)), key.Prefixlen)
-
-	for i := uint32(0); i < val.Count && i < bpfMaxNexthops; i++ {
-		nh := val.Nexthops[i]
-		ifName, mtu := bpfResolveInterface(nh.IfIndex)
-
-		var remote string
-		if nh.Flags&0x04 != 0 {
-			// IPv6 underlay
-			remote = bpfFormatIP(bpfUint32ArrayToIPv6(nh.RemoteIPv6))
-		} else {
-			// IPv4 underlay (stored in first element of union)
-			remote = bpfUint32ToIPv4BE(nh.RemoteIPv6[0]).String()
+		prefix := int(key.Prefixlen) - 96
+		if prefix < 0 {
+			prefix = 0
 		}
 
-		entries = append(entries, statusv1alpha1.BpfEntry{
-			CIDR:      cidr,
-			Remote:    remote,
-			Interface: ifName,
-			Protocol:  bpfProtocolName(nh.Protocol),
-			Healthy:   nh.Flags&0x02 != 0,
-			VNI:       nh.VNI,
-			MTU:       mtu,
-			IfIndex:   nh.IfIndex,
-		})
+		return fmt.Sprintf("%s/%d", ip.String(), prefix)
 	}
 
-	return entries
+	ip := net.IP(append([]byte(nil), key.Addr[:]...))
+
+	return fmt.Sprintf("%s/%d", ip.String(), key.Prefixlen)
+}
+
+// bpfFormatEndpoint renders a 16-byte underlay endpoint as either a v4
+// dotted-quad (if IPv4-mapped) or canonical v6.
+func bpfFormatEndpoint(addr [16]byte) string {
+	if ebpfpkg.IsV4Mapped(addr) {
+		return net.IPv4(addr[12], addr[13], addr[14], addr[15]).String()
+	}
+
+	return net.IP(append([]byte(nil), addr[:]...)).String()
 }
 
 // bpfProtocolName returns the tunnel protocol name for the given constant.
 func bpfProtocolName(proto uint32) string {
 	switch proto {
-	case 1:
+	case ebpfpkg.TunnelProtoGENEVE:
 		return "GENEVE"
-	case 2:
+	case ebpfpkg.TunnelProtoVXLAN:
 		return "VXLAN"
-	case 3:
+	case ebpfpkg.TunnelProtoIPIP:
 		return "IPIP"
-	case 4:
+	case ebpfpkg.TunnelProtoWireGuard:
 		return "WireGuard"
-	case 5:
+	case ebpfpkg.TunnelProtoNone:
 		return "None"
 	default:
 		return fmt.Sprintf("unknown(%d)", proto)
 	}
 }
 
-// bpfResolveInterface returns the interface name and MTU for the given ifindex.
+// bpfResolveInterface returns the interface name and MTU for the given
+// ifindex; returns a placeholder if the interface no longer exists.
 func bpfResolveInterface(ifindex uint32) (string, int) {
 	iface, err := net.InterfaceByIndex(int(ifindex))
 	if err != nil {
@@ -330,44 +234,4 @@ func bpfResolveInterface(ifindex uint32) (string, int) {
 	}
 
 	return iface.Name, iface.MTU
-}
-
-// bpfUint32ToIPv4LE converts a uint32 stored via LittleEndian.Uint32 back to
-// a dotted-decimal IPv4 address.
-func bpfUint32ToIPv4LE(v uint32) net.IP {
-	ip := make(net.IP, 4)
-	binary.LittleEndian.PutUint32(ip, v)
-
-	return ip
-}
-
-// bpfUint32ToIPv4BE converts a uint32 stored via BigEndian.Uint32 (network byte
-// order) back to a dotted-decimal IPv4 address.
-func bpfUint32ToIPv4BE(v uint32) net.IP {
-	ip := make(net.IP, 4)
-	binary.BigEndian.PutUint32(ip, v)
-
-	return ip
-}
-
-// bpfUint32ArrayToIPv6 converts a [4]uint32 array where each segment was stored
-// via LittleEndian.Uint32 back to a 16-byte IPv6 address.
-func bpfUint32ArrayToIPv6(arr [4]uint32) net.IP {
-	ip := make(net.IP, 16)
-	binary.LittleEndian.PutUint32(ip[0:4], arr[0])
-	binary.LittleEndian.PutUint32(ip[4:8], arr[1])
-	binary.LittleEndian.PutUint32(ip[8:12], arr[2])
-	binary.LittleEndian.PutUint32(ip[12:16], arr[3])
-
-	return ip
-}
-
-// bpfFormatIP returns the string representation of an IP, using IPv4 notation
-// for IPv4-mapped IPv6 addresses.
-func bpfFormatIP(ip net.IP) string {
-	if v4 := ip.To4(); v4 != nil {
-		return v4.String()
-	}
-
-	return ip.String()
 }

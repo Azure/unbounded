@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"strings"
 
+	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/phases"
@@ -50,6 +51,11 @@ type nodeOperator interface {
 	//  4. Verify kubelet health
 	//  5. Remove the old machine and its applied config
 	RepaveNode(context.Context, *slog.Logger, *ActiveMachine, *provision.UnboundedAgentConfig) error
+	// StageAgentUpgrade stages a new host-side agent binary.
+	StageAgentUpgrade(context.Context, *slog.Logger, string) error
+	// RestartAgentDaemon restarts the host-side agent daemon after an upgrade
+	// operation has been recorded as complete.
+	RestartAgentDaemon(context.Context, *slog.Logger) error
 }
 
 type nspawnNodeOperator struct{}
@@ -87,6 +93,9 @@ func (nspawnNodeOperator) FindActiveMachine(log *slog.Logger) (*ActiveMachine, e
 		var cfg provision.AgentConfig
 		if err := json.Unmarshal(data, &cfg); err != nil {
 			return nil, fmt.Errorf("decode applied config %s: %w", path, err)
+		}
+		if err := cfg.BackfillNodeName(); err != nil {
+			return nil, fmt.Errorf("backfill applied config node name %s: %w", path, err)
 		}
 
 		return &ActiveMachine{Name: name, Config: &cfg}, nil
@@ -203,6 +212,19 @@ func (nspawnNodeOperator) RepaveNode(
 		"active_machine", newMachine,
 		"version", newCfg.Cluster.Version,
 	)
+
+	return nil
+}
+
+func (nspawnNodeOperator) StageAgentUpgrade(ctx context.Context, log *slog.Logger, downloadURL string) error {
+	return upgradeDaemonBinary(ctx, log, downloadURL)
+}
+
+func (nspawnNodeOperator) RestartAgentDaemon(ctx context.Context, log *slog.Logger) error {
+	sc := executil.Systemctl()
+	if err := executil.RunCmd(ctx, log, sc, "restart", "--no-block", goalstates.DaemonUnit); err != nil {
+		return fmt.Errorf("systemctl restart %s: %w", goalstates.DaemonUnit, err)
+	}
 
 	return nil
 }

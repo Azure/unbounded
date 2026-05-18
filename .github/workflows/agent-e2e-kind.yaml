@@ -8,6 +8,7 @@ on:
     paths:
       - cmd/agent/**
       - cmd/kubectl-unbounded/**
+      - internal/cloudprovider/**
       - pkg/agent/**
       - internal/provision/**
       - internal/kube/**
@@ -26,6 +27,7 @@ on:
     paths:
       - cmd/agent/**
       - cmd/kubectl-unbounded/**
+      - internal/cloudprovider/**
       - pkg/agent/**
       - internal/provision/**
       - internal/kube/**
@@ -170,6 +172,9 @@ jobs:
       - name: Wait for node to become Ready
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose wait-for-node
 
+      - name: Dump persisted agent config
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose dump-persisted-agent-config
+
       - name: Validate kube-proxy on all nodes
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-kube-proxy
 
@@ -178,6 +183,12 @@ jobs:
 
       - name: Validate node restart operation
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-node-reboot-operation
+
+      - name: Validate agent upgrade operation
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-agent-upgrade-operation
+
+      - name: Validate agent upgrade rollback
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-agent-upgrade-rollback
 
       - name: Validate workload on agent node
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-workload
@@ -197,6 +208,9 @@ jobs:
 
       - name: Wait for node to become Ready (rejoin)
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose wait-for-node
+
+      - name: Dump persisted agent config (rejoin)
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose dump-persisted-agent-config
 
       - name: Validate kube-proxy on all nodes (rejoin)
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-kube-proxy

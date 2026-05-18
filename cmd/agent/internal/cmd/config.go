@@ -43,19 +43,27 @@ func loadConfig() (*provision.UnboundedAgentConfig, error) {
 		return nil, err
 	}
 
-	normalizeConfig(cfg)
+	if err := normalizeConfig(cfg); err != nil {
+		return nil, err
+	}
 
 	return cfg, nil
 }
 
 // normalizeConfig applies common fixups regardless of how the config was loaded.
-func normalizeConfig(cfg *provision.UnboundedAgentConfig) {
+func normalizeConfig(cfg *provision.UnboundedAgentConfig) error {
 	cfg.Cluster.Version = strings.TrimPrefix(cfg.Cluster.Version, "v")
 
 	// FIXME: should we set the scheme in machina side?
 	if !strings.HasPrefix(cfg.Kubelet.ApiServer, "https://") {
 		cfg.Kubelet.ApiServer = "https://" + cfg.Kubelet.ApiServer
 	}
+
+	if err := cfg.BackfillNodeName(); err != nil {
+		return fmt.Errorf("backfill node name: %w", err)
+	}
+
+	return nil
 }
 
 // loadConfigFromFile reads and decodes the JSON config file at path.

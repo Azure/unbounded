@@ -51,6 +51,14 @@ type Config struct {
 	// KubeProxyHealthInterval is the interval between kube-proxy health checks on the controller node.
 	// Set to 0 to disable the check.
 	KubeProxyHealthInterval time.Duration
+	// ManagedKubeProxyEnabled controls whether the controller creates kube-proxy
+	// DaemonSets for unbounded-managed site nodes that are not covered by the
+	// cloud provider's kube-proxy DaemonSet.
+	ManagedKubeProxyEnabled bool
+	// ManagedKubeProxyImage overrides the kube-proxy image used by managed
+	// per-site DaemonSets. Empty means reuse kube-system/kube-proxy if present,
+	// otherwise derive registry.k8s.io/kube-proxy from the Kubernetes server version.
+	ManagedKubeProxyImage string
 	// NetlinkResyncPeriod is the interval between full netlink cache resyncs on node agents.
 	NetlinkResyncPeriod time.Duration
 	// NodeTokenLifetime is the lifetime of HMAC tokens issued to node agents.

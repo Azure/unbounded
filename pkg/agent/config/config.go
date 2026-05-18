@@ -15,10 +15,14 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"maps"
+	"os"
 	"slices"
+	"strings"
 
+	"k8s.io/apimachinery/pkg/util/validation"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 )
 
@@ -27,16 +31,64 @@ import (
 // agent library. Platform-specific extensions (e.g. attestation, cloud
 // provider identity) should be defined in the consuming application.
 type AgentConfig struct {
-	MachineName string             `json:"MachineName"`
-	Cluster     AgentClusterConfig `json:"Cluster"`
-	Kubelet     AgentKubeletConfig `json:"Kubelet"`
-	CRI         CRIConfig          `json:"CRI"`
-	CNI         CNIConfig          `json:"CNI"`
+	MachineName string `json:"MachineName"`
+	// NodeName is the Kubernetes Node name used by kubelet and host-side
+	// daemon watches. During goal-state resolution this field is backfilled
+	// once. Resolution prefers an explicitly configured value, then a valid
+	// host hostname, then MachineName. Explicit and resolved values must be
+	// valid Kubernetes DNS subdomains.
+	NodeName string             `json:"NodeName,omitempty"`
+	Cluster  AgentClusterConfig `json:"Cluster"`
+	Kubelet  AgentKubeletConfig `json:"Kubelet"`
+	CRI      CRIConfig          `json:"CRI"`
+	CNI      CNIConfig          `json:"CNI"`
 
 	// OCIImage is the fully-qualified OCI image reference (e.g.
 	// "ghcr.io/org/repo:tag") used to bootstrap the machine rootfs.
 	// When empty the agent falls back to debootstrap.
 	OCIImage string `json:"OCIImage,omitempty"`
+}
+
+// BackfillNodeName resolves and stores the Kubernetes Node name once. An
+// explicit NodeName wins when set. Otherwise, a valid host hostname wins, then
+// MachineName is used as the final fallback.
+func (a *AgentConfig) BackfillNodeName() error {
+	if nodeName := strings.TrimSpace(a.NodeName); nodeName != "" {
+		if isValidNodeName(nodeName) {
+			a.NodeName = nodeName
+			return nil
+		}
+
+		return fmt.Errorf("node name override %q is not a valid Kubernetes node name", nodeName)
+	}
+
+	hostname, hostnameErr := os.Hostname()
+	hostNodeName := ""
+	if hostnameErr == nil {
+		hostNodeName = strings.TrimSpace(hostname)
+		if isValidNodeName(hostNodeName) {
+			a.NodeName = hostNodeName
+			return nil
+		}
+		hostnameErr = fmt.Errorf("hostname %q is not a valiad Kubenetes node name", hostNodeName)
+	}
+
+	nodeName := strings.TrimSpace(a.MachineName)
+	if isValidNodeName(nodeName) {
+		a.NodeName = nodeName
+		return nil
+	}
+	machineNameErr := fmt.Errorf("machine name %q is not a valid Kubernetse node name", a.MachineName)
+
+	return errors.Join(hostnameErr, machineNameErr)
+}
+
+func isValidNodeName(name string) bool {
+	if name == "" {
+		return false
+	}
+
+	return len(validation.IsDNS1123Subdomain(name)) == 0
 }
 
 // DeepCopy returns a copy of AgentConfig with mutable nested values cloned.

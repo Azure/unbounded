@@ -18,6 +18,7 @@ func TestAgentConfig_MarshalJSON(t *testing.T) {
 
 	cfg := AgentConfig{
 		MachineName: "my-machine",
+		NodeName:    "my-node",
 		Cluster: AgentClusterConfig{
 			CaCertBase64: "dGVzdC1jYQ==",
 			ClusterDNS:   "10.0.0.10",
@@ -44,6 +45,7 @@ func TestAgentConfig_MarshalJSON(t *testing.T) {
 	require.NoError(t, json.Unmarshal(data, &parsed))
 
 	require.Equal(t, "my-machine", parsed["MachineName"])
+	require.Equal(t, "my-node", parsed["NodeName"])
 
 	cluster := parsed["Cluster"].(map[string]interface{})
 	require.Equal(t, "dGVzdC1jYQ==", cluster["CaCertBase64"])
@@ -71,6 +73,7 @@ func TestAgentConfig_RoundTrip(t *testing.T) {
 
 	original := AgentConfig{
 		MachineName: "round-trip-machine",
+		NodeName:    "round-trip-node",
 		Cluster: AgentClusterConfig{
 			CaCertBase64: "Y2VydA==",
 			ClusterDNS:   "10.96.0.10",
@@ -94,6 +97,7 @@ func TestAgentConfig_RoundTrip(t *testing.T) {
 	require.NoError(t, json.Unmarshal(data, &decoded))
 
 	require.Equal(t, original.MachineName, decoded.MachineName)
+	require.Equal(t, original.NodeName, decoded.NodeName)
 	require.Equal(t, original.Cluster, decoded.Cluster)
 	require.Equal(t, original.Kubelet.Labels, decoded.Kubelet.Labels)
 	require.Equal(t, original.Kubelet.RegisterWithTaints, decoded.Kubelet.RegisterWithTaints)
@@ -126,6 +130,8 @@ func TestAgentConfig_EmptyFields(t *testing.T) {
 	// OCIImage has omitempty so should be absent from zero-value config.
 	_, hasOCIImage := parsed["OCIImage"]
 	require.False(t, hasOCIImage, "OCIImage should be omitted when empty")
+	_, hasNodeName := parsed["NodeName"]
+	require.False(t, hasNodeName, "NodeName should be omitted when empty")
 }
 
 func TestUnboundedAgentConfig_WithAttest(t *testing.T) {
@@ -224,6 +230,7 @@ func TestBuildAgentConfig(t *testing.T) {
 			},
 			assert: func(t *testing.T, cfg UnboundedAgentConfig) {
 				require.Equal(t, "my-machine", cfg.MachineName)
+				require.Empty(t, cfg.NodeName)
 				require.Equal(t, "dGVzdC1jYQ==", cfg.Cluster.CaCertBase64)
 				require.Equal(t, "10.0.0.10", cfg.Cluster.ClusterDNS)
 				require.Equal(t, "v1.34.0", cfg.Cluster.Version) // Machine spec overrides KubeVersion
@@ -238,6 +245,19 @@ func TestBuildAgentConfig(t *testing.T) {
 				require.Equal(t, "provider-val", cfg.Kubelet.Labels["provider-key"])
 
 				require.Equal(t, []string{"dedicated=gpu:NoSchedule"}, cfg.Kubelet.RegisterWithTaints)
+			},
+		},
+		{
+			name: "node name override",
+			params: BuildAgentConfigParams{
+				Machine: &v1alpha3.Machine{
+					ObjectMeta: metav1.ObjectMeta{Name: "machine-name"},
+				},
+				NodeName: "node-name",
+			},
+			assert: func(t *testing.T, cfg UnboundedAgentConfig) {
+				require.Equal(t, "machine-name", cfg.MachineName)
+				require.Equal(t, "node-name", cfg.NodeName)
 			},
 		},
 		{

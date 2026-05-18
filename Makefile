@@ -63,6 +63,21 @@ UNPING_CMD=./cmd/unping
 UNROUTE_BIN=bin/unroute
 UNROUTE_CMD=./cmd/unroute
 
+# Rust binaries
+UNBOUNDED_STORAGE_BIN=bin/unbounded-storage
+UNBOUNDED_STORAGE_CRATE=./cmd/unbounded-storage
+CARGO ?= cargo
+
+# Mercury (mercury-hpc) is a native dependency of the unbounded-storage crate.
+# We build a pinned version from source into a project-local prefix; the
+# unbounded-storage build.rs honours $MERCURY_PKG_CONFIG_PATH so it picks up
+# our local install ahead of any system copy.
+MERCURY_VERSION ?= v2.3.1
+MERCURY_PREFIX  ?= $(CURDIR)/tmp/mercury-prefix
+MERCURY_SRC     ?= $(CURDIR)/tmp/mercury-src
+MERCURY_PC_FILE := $(MERCURY_PREFIX)/lib/pkgconfig/mercury.pc
+MERCURY_INSTALL_SCRIPT := hack/scripts/install-mercury.sh
+
 # Version is derived from the latest git tag. Override with: make VERSION=v1.0.0
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 GIT_COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
@@ -74,6 +89,14 @@ STAMP_LDFLAGS=-X github.com/Azure/unbounded/internal/version.Version=$(VERSION) 
               -X github.com/Azure/unbounded/internal/version.BuildTime=$(BUILD_TIME)
 
 METALMAN_IMAGE=$(CONTAINER_REGISTRY)/metalman:$(VERSION)
+
+# Orca configuration
+ORCA_BIN=bin/orca
+ORCA_CMD=./cmd/orca
+ORCA_IMAGE ?= $(CONTAINER_REGISTRY)/orca:$(VERSION)
+ORCA_NAMESPACE ?= unbounded-kube
+ORCA_MANIFEST_TEMPLATES_DIR := deploy/orca
+ORCA_MANIFEST_RENDERED_DIR  := deploy/orca/rendered
 
 # kubectl-unbounded also stamps the metalman image reference.
 KUBECTL_UNBOUNDED_LDFLAGS=$(STAMP_LDFLAGS) -X github.com/Azure/unbounded/cmd/kubectl-unbounded/app.MetalmanImage=$(METALMAN_IMAGE)
@@ -110,9 +133,11 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 # Frontend build toggle (dev builds produce unminified output with sourcemaps).
 REACT_DEV ?= false
 
-.PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute notice notice-check
-.PHONY: net-frontend net-frontend-clean net-build-ebpf net-manifests release-manifests
+.PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check
+.PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-manifests
 .PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-net-controller-local image-net-node-local images-local
+.PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
+.PHONY: unbounded-storage unbounded-storage-build unbounded-storage-test unbounded-storage-check mercury mercury-clean
 
 ##@ General
 
@@ -159,6 +184,13 @@ help: ## Show this help
 	@echo "  unping                           Build unping health-check utility"
 	@echo "  unroute                          Build unroute eBPF inspection utility"
 	@echo ""
+	@echo "Rust Binaries:"
+	@echo "  unbounded-storage | unbounded-storage-build  Build unbounded-storage (with/without test)"
+	@echo "  unbounded-storage-test           Run cargo tests for unbounded-storage"
+	@echo "  unbounded-storage-check          Run cargo check for unbounded-storage"
+	@echo "  mercury                          Build pinned Mercury into \$$(MERCURY_PREFIX)"
+	@echo "  mercury-clean                    Remove the local Mercury prefix and source tree"
+	@echo ""
 	@echo "Container Images (local, single-arch):"
 	@echo "  image-inventory-all-local        Build all local inventory container images"
 	@echo "  image-inventory-all-push         Build and push all inventory container images"
@@ -172,26 +204,43 @@ help: ## Show this help
 	@echo "  image-machine-ops-controller-local Build machine-ops-controller image"
 	@echo "  image-metalman-local             Build metalman image"
 	@echo "  image-net-controller-local       Build unbounded-net-controller image"
+	@echo "  image-net-controller-push        Build and push unbounded-net-controller image"
 	@echo "  image-net-node-local             Build unbounded-net-node image"
+	@echo "  image-net-node-push              Build and push unbounded-net-node image"
+	@echo "  images-net-all                   Build all unbounded-net images"
+	@echo "  images-net-all-push              Build and push all unbounded-net images"
 	@echo "  images-local                     Build all local images"
 	@echo "  machina-oci-push                 Build machina image and push"
 	@echo "  machine-ops-controller-oci-push  Build machine-ops-controller image and push"
 	@echo "  metalman-oci-push                Build metalman image and push"
+	@echo "  image-orca-local                 Build orca image"
+	@echo "  orca-oci-push                    Build orca image and push"
 	@echo ""
 	@echo "Net Frontend:"
 	@echo "  net-frontend                     Build frontend into \$$(NET_FRONTEND_DIST_DIR) (cached)"
 	@echo "  net-frontend-clean               Remove node_modules and dist artifacts"
 	@echo ""
 	@echo "Net eBPF:"
-	@echo "  net-build-ebpf                   Compile bpf/unbounded_encap.c (requires clang)"
+	@echo "  net-ebpf-build                   Compile bpf/unbounded_encap.c (requires clang-18; see bpf/clang-version)"
+	@echo "  net-ebpf-generate                Regenerate bpf/vmlinux.h from pinned Ubuntu kernel (requires bpftool, curl, dpkg-deb, python3)"
+	@echo "  net-ebpf-verify                  Verify bpf/vmlinux.h matches bpf/btf-kernel-pin{,-hashes} (no extra tools)"
 	@echo ""
 	@echo "Net Manifests:"
 	@echo "  machina-manifests                Render machina manifests into deploy/machina/rendered"
 	@echo "  machine-ops-manifests            Render machine-ops manifests into deploy/machine-ops/rendered"
 	@echo "  net-manifests                    Render net manifests into \$$(NET_MANIFEST_RENDERED_DIR)"
+	@echo "  orca-manifests                   Render orca manifests into deploy/orca/rendered"
 	@echo ""
 	@echo "Net Kubernetes (apply to current kubectl context):"
 	@echo "  See \`make -C hack/net help\` for cluster deploy/undeploy targets."
+	@echo ""
+	@echo "Orca Dev Harness (Kind cluster):"
+	@echo "  orca | orca-build                Build orca binary (with/without lint/test)"
+	@echo "  orca-up                          Bring up Orca dev harness in Kind"
+	@echo "  orca-down                        Tear down Orca dev harness Kind cluster"
+	@echo "  orca-reset                       Rebuild image and rollout-restart deployment"
+	@echo "  orca-inttest                     Run orca integration tests (Docker required)"
+	@echo "  See \`make -C hack/orca help\` for full list."
 	@echo ""
 	@echo "Documentation:"
 	@echo "  docs-serve                       Start local Hugo dev server"
@@ -388,20 +437,65 @@ metalman: test metalman-build ## Build the metalman controller (implies test)
 
 ##@ Net Binaries
 
-unbounded-net-controller: test ## Build the unbounded-net-controller (implies test)
+unbounded-net-controller-build: ## Build the unbounded-net-controller binary (no lint/test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(NET_CONTROLLER_BIN) $(NET_CONTROLLER_CMD)
 
-unbounded-net-node: test ## Build the unbounded-net-node (implies test)
+unbounded-net-controller: test unbounded-net-controller-build ## Build the unbounded-net-controller (implies test)
+
+unbounded-net-node-build: ## Build the unbounded-net-node binary (no lint/test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(NET_NODE_BIN) $(NET_NODE_CMD)
+
+unbounded-net-node: test unbounded-net-node-build ## Build the unbounded-net-node (implies test)
 
 unbounded-net-routeplan-debug: test ## Build the routeplan debug tool (implies test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(NET_ROUTEPLAN_DEBUG_BIN) $(NET_ROUTEPLAN_DEBUG_CMD)
 
-unping: test ## Build the unping utility (implies test)
+unping-build: ## Build the unping utility binary (no lint/test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(UNPING_BIN) $(UNPING_CMD)
 
-unroute: test ## Build the unroute utility (implies test)
+unping: test unping-build ## Build the unping utility (implies test)
+
+unroute-build: ## Build the unroute utility binary (no lint/test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(UNROUTE_BIN) $(UNROUTE_CMD)
+
+unroute: test unroute-build ## Build the unroute utility (implies test)
+
+##@ Rust Binaries
+
+# Mercury env: prepend our local prefix so cargo/build.rs find the right .pc
+# files and so the resulting binaries/tests can dlopen libmercury at runtime.
+# Targets that invoke cargo must export these via `$(UNBOUNDED_STORAGE_ENV)`.
+UNBOUNDED_STORAGE_ENV = \
+	MERCURY_PKG_CONFIG_PATH="$(MERCURY_PREFIX)/lib/pkgconfig" \
+	PKG_CONFIG_PATH="$(MERCURY_PREFIX)/lib/pkgconfig:$${PKG_CONFIG_PATH}" \
+	LD_LIBRARY_PATH="$(MERCURY_PREFIX)/lib:$${LD_LIBRARY_PATH}"
+
+mercury: $(MERCURY_PC_FILE) ## Build pinned Mercury into $(MERCURY_PREFIX) (idempotent)
+
+# The install script is itself idempotent: if mercury.pc already advertises the
+# pinned version it exits immediately. We still gate on the .pc file as the
+# Make-level sentinel so a cached prefix avoids invoking the script at all.
+$(MERCURY_PC_FILE): $(MERCURY_INSTALL_SCRIPT)
+	MERCURY_VERSION=$(MERCURY_VERSION) \
+	MERCURY_PREFIX=$(MERCURY_PREFIX) \
+	MERCURY_SRC=$(MERCURY_SRC) \
+		$(MERCURY_INSTALL_SCRIPT)
+
+mercury-clean: ## Remove the local Mercury prefix and source tree
+	rm -rf "$(MERCURY_PREFIX)" "$(MERCURY_SRC)"
+
+unbounded-storage-check: mercury ## Run cargo check for unbounded-storage
+	$(UNBOUNDED_STORAGE_ENV) $(CARGO) check --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --locked --all-targets
+
+unbounded-storage-test: mercury ## Run cargo tests for unbounded-storage
+	$(UNBOUNDED_STORAGE_ENV) $(CARGO) test --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --locked --all-targets
+
+unbounded-storage-build: mercury ## Build the unbounded-storage binary (no test)
+	$(UNBOUNDED_STORAGE_ENV) $(CARGO) build --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --release --locked
+	@mkdir -p $(dir $(UNBOUNDED_STORAGE_BIN))
+	cp $(UNBOUNDED_STORAGE_CRATE)/target/release/unbounded-storage $(UNBOUNDED_STORAGE_BIN)
+
+unbounded-storage: unbounded-storage-test unbounded-storage-build ## Build the unbounded-storage binary (implies test)
 
 ##@ Container Images
 #
@@ -573,27 +667,95 @@ metalman-oci: image-metalman-local ## Alias for image-metalman-local
 metalman-oci-push: metalman-oci ## Build and push the metalman container image
 	$(CONTAINER_ENGINE) push $(METALMAN_IMAGE)
 
+##@ Orca
+
+.PHONY: orca orca-build orca-manifests orca-oci orca-oci-push orca-up orca-down orca-reset orca-inttest image-orca-local
+
+orca-build: ## Build the orca binary (no lint/test)
+	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(ORCA_BIN) $(ORCA_CMD)/main.go
+
+orca: test orca-build ## Build the orca binary (implies test)
+
+orca-manifests: ## Render orca deployment manifests into deploy/orca/rendered
+	@mkdir -p $(ORCA_MANIFEST_RENDERED_DIR)
+	@find $(ORCA_MANIFEST_RENDERED_DIR) -mindepth 1 -not -name .gitignore -delete 2>/dev/null || true
+	$(GOCMD) run ./hack/cmd/render-manifests \
+		--templates-dir $(ORCA_MANIFEST_TEMPLATES_DIR) \
+		--output-dir $(ORCA_MANIFEST_RENDERED_DIR) \
+		--set Namespace=$(ORCA_NAMESPACE) \
+		--set Image=$(ORCA_IMAGE)
+	@echo "Rendered orca manifests into $(ORCA_MANIFEST_RENDERED_DIR) (image: $(ORCA_IMAGE))"
+
+image-orca-local: ## Build the orca container image locally (single-arch)
+	$(CONTAINER_ENGINE) build \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
+		--build-arg BUILD_TIME=$(BUILD_TIME) \
+		-t orca:$(VERSION) -t $(ORCA_IMAGE) \
+		-f ./images/orca/Containerfile .
+
+orca-oci: image-orca-local ## Alias for image-orca-local
+
+orca-oci-push: orca-oci ## Build and push the orca container image
+	$(CONTAINER_ENGINE) push $(ORCA_IMAGE)
+
+# Dev-cluster proxy targets. The actual implementations live in
+# hack/orca/Makefile (see AGENTS.md convention; mirrors hack/net/).
+orca-up: ## Bring up the Orca dev harness in a Kind cluster
+	$(MAKE) -C hack/orca up
+
+orca-down: ## Tear down the Orca dev harness Kind cluster
+	$(MAKE) -C hack/orca down
+
+orca-reset: ## Rebuild orca image and rolling-restart the dev deployment
+	$(MAKE) -C hack/orca reset
+
+# orca-inttest mirrors the test/test-race pattern: race detector in CI
+# (ubuntu-latest has gcc), no -race locally so developers without a C
+# toolchain can still run integration tests.
+ifdef CI
+orca-inttest: ## Run orca integration tests (LocalStack + Azurite via testcontainers; requires Docker)
+	$(GOTEST) -tags=integrationtest -race -timeout 15m ./internal/orca/inttest/...
+else
+orca-inttest: ## Run orca integration tests (LocalStack + Azurite via testcontainers; requires Docker)
+	$(GOTEST) -tags=integrationtest -timeout 15m ./internal/orca/inttest/...
+endif
+
 image-net-controller-local: net-frontend resources/cni-plugins-linux-$(HOST_GOARCH)-$(CNI_PLUGINS_VERSION).tgz ## Build the unbounded-net-controller image locally (single-arch)
 	$(CONTAINER_ENGINE) build \
+		$(if $(PLATFORMS),--platform=$(PLATFORMS),) \
 		--target controller \
 		--build-arg VERSION=$(VERSION) \
 		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
 		--build-arg BUILD_TIME=$(BUILD_TIME) \
 		--build-arg CNI_PLUGINS_VERSION=$(CNI_PLUGINS_VERSION) \
+		--build-arg BUILDARCH=$(HOST_GOARCH) \
 		-t $(NET_CONTROLLER_IMAGE) \
-		-f ./images/net-controller/Dockerfile .
+		-f ./images/net/Containerfile .
 	$(call trivy-maybe,$(NET_CONTROLLER_IMAGE))
 
 image-net-node-local: resources/cni-plugins-linux-$(HOST_GOARCH)-$(CNI_PLUGINS_VERSION).tgz ## Build the unbounded-net-node image locally (single-arch)
 	$(CONTAINER_ENGINE) build \
+		$(if $(PLATFORMS),--platform=$(PLATFORMS),) \
 		--target node \
 		--build-arg VERSION=$(VERSION) \
 		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
 		--build-arg BUILD_TIME=$(BUILD_TIME) \
 		--build-arg CNI_PLUGINS_VERSION=$(CNI_PLUGINS_VERSION) \
+		--build-arg BUILDARCH=$(HOST_GOARCH) \
 		-t $(NET_NODE_IMAGE) \
-		-f ./images/net-node/Dockerfile .
+		-f ./images/net/Containerfile .
 	$(call trivy-maybe,$(NET_NODE_IMAGE))
+
+image-net-controller-push: image-net-controller-local ## Build and push the unbounded-net-controller image
+	$(CONTAINER_ENGINE) push $(NET_CONTROLLER_IMAGE)
+
+image-net-node-push: image-net-node-local ## Build and push the unbounded-net-node image
+	$(CONTAINER_ENGINE) push $(NET_NODE_IMAGE)
+
+images-net-all: image-net-controller-local image-net-node-local ## Build all unbounded-net container images locally
+
+images-net-all-push: image-net-controller-push image-net-node-push ## Build and push all unbounded-net container images
 
 images-local: image-machina-local image-machine-ops-controller-local image-metalman-local image-net-controller-local image-net-node-local ## Build all container images locally
 
@@ -629,13 +791,19 @@ net-frontend-clean: ## Remove frontend node_modules and dist artifacts
 
 ##@ Net eBPF
 
-net-build-ebpf: ## Compile bpf/unbounded_encap.c to internal/net/ebpf/unbounded_encap_bpfel.o (requires clang)
+net-ebpf-build: ## Compile bpf/unbounded_encap.c to internal/net/ebpf/unbounded_encap_bpfel.o (requires clang-18; see bpf/clang-version)
 	@echo "Compiling eBPF programs..."
-	@clang -O2 -g -target bpf \
+	@clang-18 -O2 -g -target bpf \
 		-I/usr/include \
 		-c bpf/unbounded_encap.c \
 		-o internal/net/ebpf/unbounded_encap_bpfel.o
 	@echo "eBPF programs compiled."
+
+net-ebpf-generate: ## Regenerate bpf/vmlinux.h from pinned kernel and run bpf2go (requires bpftool, curl, dpkg-deb, python3)
+	@hack/scripts/net-ebpf-generate.sh
+
+net-ebpf-verify: ## Verify bpf/vmlinux.h matches bpf/btf-kernel-pin and bpf/btf-kernel-pin-hashes
+	@hack/scripts/net-ebpf-verify.sh
 
 ##@ Net Manifests
 

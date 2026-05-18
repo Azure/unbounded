@@ -1,0 +1,514 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+mod backing;
+
+use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+
+use unbounded_storage::bufferpool::{
+    NullBlockStore, Pool, PoolConfig, PoolGroup, Req, ShardDescriptor, StripeKey,
+};
+use unbounded_storage::mercury::{Class, MercuryTransport, PeerEntry, StaticPeer, TransportConfig};
+use unbounded_storage::runtime::{PinnedRuntime, Threading, WorkerIdx, WorkerSpec};
+use unbounded_storage::topology::{
+    NicShard, ProgressSlot, discover_nic_shards, fallback_shard, flatten_shards,
+};
+
+use crate::backing::{BackingKind, BackingRequest, HUGEPAGE_2MB, allocate};
+
+/// Threads per NIC in the TCP fallback case. RDMA shards size
+/// themselves via the topology discovery path; the fallback is a
+/// single best-effort progress thread because there is no NIC pool
+/// to spread across.
+const FALLBACK_THREADS: usize = 1;
+
+const PROGRESS_POLL_MS: u32 = 100;
+const MAX_INFLIGHT: usize = 1024;
+const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
+
+/// Per-shard buffer-pool sizing. The page size is fixed at 2 MiB
+/// to match the hugepage allocator; the byte budget per shard is
+/// configurable via `--bytes-per-shard` (default 128 MiB == 64
+/// hugepages). The allocator rounds the requested size up to a
+/// whole number of pages, so non-multiples of 2 MiB are tolerated
+/// but discouraged.
+const DEFAULT_BYTES_PER_SHARD: usize = 128 * 1024 * 1024;
+
+/// Process-wide shutdown flag. Set by the signal handler (which
+/// is restricted to async-signal-safe operations) and polled by
+/// the main thread plus every shard thread.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// Placeholder request type for the per-shard `Pool`. Carries a
+/// `StripeKey` and satisfies the trait bounds required by
+/// `MercuryTransport` (`Serialize`). No reads are issued against
+/// the pool today; this exists so `Pool::new` type-checks.
+#[derive(Clone, Serialize, Deserialize)]
+struct PlaceholderReq {
+    key: [u8; 32],
+}
+
+impl Req for PlaceholderReq {
+    fn key(&self) -> StripeKey {
+        StripeKey(self.key)
+    }
+}
+
+type ShardPool = Pool<MercuryTransport<PlaceholderReq, StaticPeer>, NullBlockStore, PlaceholderReq>;
+
+fn main() -> ExitCode {
+    let cli = match Cli::parse(std::env::args().skip(1)) {
+        Ok(CliAction::Run(cli)) => cli,
+        Ok(CliAction::Help) => {
+            print_help();
+            return ExitCode::SUCCESS;
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            eprintln!();
+            print_help();
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let shards = enumerate_shards();
+    let slots = flatten_shards(&shards);
+    if slots.is_empty() {
+        eprintln!("no progress slots after topology flatten; exiting");
+        return ExitCode::FAILURE;
+    }
+    let specs: Vec<WorkerSpec> = slots
+        .iter()
+        .map(|s| WorkerSpec::new(s.cpu, s.numa))
+        .collect();
+    let runtime = PinnedRuntime::new(specs);
+    install_signal_handler();
+
+    // Each shard thread reports either an error or a populated
+    // `ShardDescriptor` on this channel. The main thread aggregates
+    // descriptors into a `PoolGroup` once every shard has reported.
+    let (ready_tx, ready_rx) = mpsc::channel::<ShardReady>();
+    let mut joins = Vec::with_capacity(slots.len());
+    for (i, slot) in slots.iter().enumerate() {
+        let worker = WorkerIdx(u16::try_from(i).expect("worker index fits in u16"));
+        let parent = &shards[slot.shard];
+        let dev_name = parent.dev_name.clone();
+        let na_info = match &dev_name {
+            // Placeholder until the per-NIC config-parsing follow-up
+            // wires through provider-specific `domain=`, listen port,
+            // etc.
+            Some(_) => "ofi+verbs;ofi_rxm://".to_string(),
+            None => "ofi+tcp://0.0.0.0:0".to_string(),
+        };
+        let slot = *slot;
+        let runtime = runtime.clone();
+        let tx = ready_tx.clone();
+        let backing_kind = cli.backing_kind;
+        let bytes_per_shard = cli.bytes_per_shard;
+        joins.push(
+            thread::Builder::new()
+                .name(format!("ub-storage-shard-{i}"))
+                .spawn(move || {
+                    let rt = runtime.clone();
+                    rt.run_worker(
+                        worker,
+                        Box::new(move || {
+                            run_shard(
+                                worker,
+                                slot,
+                                dev_name,
+                                na_info,
+                                runtime,
+                                tx,
+                                backing_kind,
+                                bytes_per_shard,
+                            );
+                        }),
+                    );
+                })
+                .expect("spawn shard thread"),
+        );
+    }
+    drop(ready_tx);
+
+    // Drain shard readiness messages, separating successes from
+    // failures. We wait for every shard so a partial bring-up
+    // produces a coherent error path rather than a half-built
+    // `PoolGroup`.
+    let mut descriptors: Vec<ShardDescriptor> = Vec::with_capacity(joins.len());
+    let mut errors: Vec<String> = Vec::new();
+    for msg in ready_rx {
+        match msg {
+            ShardReady::Up(d) => descriptors.push(d),
+            ShardReady::Failed(err) => {
+                eprintln!("shard failed: {err}");
+                errors.push(err);
+                SHUTDOWN.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    // Build the process-wide `PoolGroup` over the successful
+    // shards. Routing is content-addressed: hash the request's
+    // `StripeKey` into the shard index. This is the simplest
+    // routing that distributes load uniformly across shards and
+    // is replaceable per design once topology-aware peer routing
+    // lands.
+    if errors.is_empty() && !descriptors.is_empty() {
+        descriptors.sort_by_key(|d| d.worker_idx.0);
+        let shard_count = descriptors.len();
+        let _group: PoolGroup<PlaceholderReq> =
+            PoolGroup::new(descriptors, move |req: &PlaceholderReq| {
+                stripe_key_to_shard(&req.key(), shard_count)
+            });
+        // No consumer yet; the group is built to validate the
+        // bring-up surface. A future change will hand it to
+        // whichever subsystem first needs cross-shard fan-out.
+        eprintln!("pool group up: shards={}", shard_count);
+    }
+
+    // Wait for shutdown
+    wait_for_shutdown();
+    eprintln!("shutdown signaled; tearing down shards");
+
+    // (reverse order so the last-built shard tears down first)
+    for h in joins.into_iter().rev() {
+        if let Err(e) = h.join() {
+            eprintln!("shard thread panicked: {e:?}");
+            errors.push(format!("panic: {e:?}"));
+        }
+    }
+
+    if errors.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// Body of one shard thread. Runs on the pinned executor: builds
+/// the Mercury `Class`, registers a NUMA-local `Backing`, wires up
+/// the `Pool`, reports readiness, then idles until shutdown so the
+/// `Class` (and its progress thread) plus the `Pool` are dropped
+/// together.
+fn run_shard(
+    worker: WorkerIdx,
+    slot: ProgressSlot,
+    dev_name: Option<String>,
+    na_info: String,
+    runtime: std::sync::Arc<dyn unbounded_storage::runtime::Threading>,
+    tx: mpsc::Sender<ShardReady>,
+    backing_kind: BackingKind,
+    bytes_per_shard: usize,
+) {
+    let cfg = TransportConfig {
+        na_info,
+        listen: true,
+        peers: Vec::<PeerEntry>::new(),
+        max_inflight: MAX_INFLIGHT,
+        progress_poll_ms: PROGRESS_POLL_MS,
+        runtime,
+        worker_idx: worker,
+    };
+    let class = match Class::new(cfg).and_then(|c| c.self_address().map(|a| (c, a))) {
+        Ok((class, self_addr)) => {
+            println!(
+                "shard up: worker={} dev={} numa={} cpu={} self_addr={}",
+                worker.0,
+                dev_name.as_deref().unwrap_or("tcp-fallback"),
+                slot.numa
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "none".into()),
+                slot.cpu,
+                self_addr,
+            );
+            class
+        }
+        Err(e) => {
+            let _ = tx.send(ShardReady::Failed(format!("worker={}: {e}", worker.0)));
+            return;
+        }
+    };
+
+    // NUMA-local backing. Allocated on the pinned shard thread so
+    // the `PinnedRuntime`'s `set_mempolicy` keeps the pages on the
+    // intended node; the hugepage variant additionally pins via
+    // `mbind` when `slot.numa` is known. Register it with the
+    // Mercury class before building the transport (the new
+    // embedder-pre-registers model replaces the old
+    // `Transport::register_pages` handshake).
+    let backing = match allocate(BackingRequest {
+        kind: backing_kind,
+        bytes: bytes_per_shard,
+        numa: slot.numa,
+    }) {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = tx.send(ShardReady::Failed(format!(
+                "worker={}: backing allocation failed: {e}",
+                worker.0,
+            )));
+            return;
+        }
+    };
+    let backing_bytes = backing.page_size * backing.page_count;
+    let page_size = backing.page_size;
+    if let Err(e) = class.register_backing(backing.base, backing_bytes) {
+        let _ = tx.send(ShardReady::Failed(format!(
+            "worker={}: register_backing: {e}",
+            worker.0,
+        )));
+        return;
+    }
+
+    // `StaticPeer(PeerId(0))` is a placeholder: with `peers`
+    // empty, no `bulk_get` will resolve, but constructing the
+    // transport is harmless. A real router will be installed when
+    // peer discovery lands.
+    let transport = MercuryTransport::<PlaceholderReq, _>::new(
+        &class,
+        StaticPeer(unbounded_storage::bufferpool::PeerId(0)),
+        page_size,
+    );
+    let blockstore = NullBlockStore::new();
+    let pool: ShardPool = match Pool::new(PoolConfig::default(), backing, transport, blockstore) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = tx.send(ShardReady::Failed(format!(
+                "worker={}: Pool::new: {e}",
+                worker.0,
+            )));
+            return;
+        }
+    };
+
+    let _ = tx.send(ShardReady::Up(ShardDescriptor {
+        worker_idx: worker,
+        numa: slot.numa,
+    }));
+
+    wait_for_shutdown();
+
+    // Drop order matters: drop the `Pool` first so the
+    // `MercuryTransport` (which holds an `Arc<ClassInner>`) goes
+    // away before the owning `Class` runs its own drop. `Class::drop`
+    // closes the server queue and signals the progress thread; the
+    // last `Arc` release inside `ClassInner::drop` joins that thread
+    // and finalizes Mercury.
+    drop(pool);
+    drop(class);
+}
+
+/// Hash a `StripeKey` into a shard index. The first eight bytes of
+/// the 32-byte key are interpreted as a little-endian `u64`; that
+/// distributes uniformly under a content-addressed key (which is
+/// already a hash) and avoids pulling in a hash crate. The modulus
+/// is the shard count; `shard_count` is asserted non-zero by
+/// `PoolGroup::new`.
+fn stripe_key_to_shard(key: &StripeKey, shard_count: usize) -> usize {
+    let bytes = &key.0[..8];
+    let h = u64::from_le_bytes(bytes.try_into().expect("8 bytes"));
+    (h as usize) % shard_count
+}
+
+/// Status a shard thread reports once it has either come up or
+/// failed during bring-up.
+enum ShardReady {
+    Up(ShardDescriptor),
+    Failed(String),
+}
+
+/// Parsed command-line options for one run of the daemon.
+#[derive(Copy, Clone, Debug)]
+struct Cli {
+    backing_kind: BackingKind,
+    bytes_per_shard: usize,
+}
+
+enum CliAction {
+    Run(Cli),
+    Help,
+}
+
+impl Cli {
+    fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<CliAction, String> {
+        let mut backing_kind = BackingKind::Hugepage2Mb;
+        let mut bytes_per_shard = DEFAULT_BYTES_PER_SHARD;
+        let mut it = args.into_iter();
+        while let Some(arg) = it.next() {
+            match arg.as_str() {
+                "-h" | "--help" => return Ok(CliAction::Help),
+                "--no-hugepages" => backing_kind = BackingKind::Heap,
+                s if s.starts_with("--bytes-per-shard=") => {
+                    let v = &s["--bytes-per-shard=".len()..];
+                    bytes_per_shard = parse_bytes(v)?;
+                }
+                "--bytes-per-shard" => {
+                    let v = it
+                        .next()
+                        .ok_or_else(|| "--bytes-per-shard requires a value".to_string())?;
+                    bytes_per_shard = parse_bytes(&v)?;
+                }
+                other => return Err(format!("unknown argument: {other}")),
+            }
+        }
+        if bytes_per_shard == 0 {
+            return Err("--bytes-per-shard must be > 0".into());
+        }
+        Ok(CliAction::Run(Cli {
+            backing_kind,
+            bytes_per_shard,
+        }))
+    }
+}
+
+/// Parse a byte count with an optional `K`/`M`/`G` suffix (powers
+/// of 1024). Bare integers are bytes.
+fn parse_bytes(s: &str) -> Result<usize, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty byte count".into());
+    }
+    let (num, mult) = match s.as_bytes().last().copied() {
+        Some(b'K') | Some(b'k') => (&s[..s.len() - 1], 1024usize),
+        Some(b'M') | Some(b'm') => (&s[..s.len() - 1], 1024 * 1024),
+        Some(b'G') | Some(b'g') => (&s[..s.len() - 1], 1024 * 1024 * 1024),
+        _ => (s, 1usize),
+    };
+    let n: usize = num
+        .parse()
+        .map_err(|e| format!("invalid byte count {s:?}: {e}"))?;
+    n.checked_mul(mult)
+        .ok_or_else(|| format!("byte count {s:?} overflows usize"))
+}
+
+fn print_help() {
+    let default_mib = DEFAULT_BYTES_PER_SHARD / (1024 * 1024);
+    let hp_mib = HUGEPAGE_2MB / (1024 * 1024);
+    eprintln!("Usage: unbounded-storage [OPTIONS]");
+    eprintln!();
+    eprintln!("Options:");
+    eprintln!("  --no-hugepages              Allocate the per-shard backing with the");
+    eprintln!("                              global allocator instead of {hp_mib} MiB");
+    eprintln!("                              hugepages. The default requires reserved");
+    eprintln!("                              hugepages on the host; there is no");
+    eprintln!("                              automatic fallback.");
+    eprintln!("  --bytes-per-shard=<BYTES>   Per-shard buffer pool size. Accepts a");
+    eprintln!("                              K/M/G suffix (powers of 1024). Rounded");
+    eprintln!("                              up to a multiple of the {hp_mib} MiB page");
+    eprintln!("                              size. Default: {default_mib} MiB.");
+    eprintln!("  -h, --help                  Print this help and exit.");
+}
+
+fn enumerate_shards() -> Vec<NicShard> {
+    let mut shards = discover_nic_shards();
+    if shards.is_empty() {
+        eprintln!(
+            "no RDMA NICs discovered under /sys/class/infiniband; \
+             falling back to a single TCP shard"
+        );
+        shards.push(fallback_shard(FALLBACK_THREADS));
+    }
+    shards
+}
+
+fn wait_for_shutdown() {
+    while !SHUTDOWN.load(Ordering::Acquire) {
+        thread::sleep(SHUTDOWN_POLL);
+    }
+}
+
+/// Install a SIGINT/SIGTERM handler that flips [`SHUTDOWN`]. The
+/// handler is async-signal-safe (only a relaxed atomic store).
+/// All threads observe the flag via their poll loops.
+fn install_signal_handler() {
+    unsafe extern "C" fn handler(_sig: libc::c_int) {
+        // SAFETY: AtomicBool::store with Relaxed compiles to a
+        // single machine store on every supported arch; it is
+        // async-signal-safe. Readers synchronize via their own
+        // Acquire loads.
+        SHUTDOWN.store(true, Ordering::Relaxed);
+    }
+    // SAFETY: sigaction is invoked once at startup with a
+    // zero-initialized sigaction whose handler does not touch
+    // any non-async-signal-safe state.
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = handler as *const () as usize;
+        libc::sigemptyset(&mut sa.sa_mask);
+        sa.sa_flags = 0;
+        for sig in [libc::SIGINT, libc::SIGTERM] {
+            if libc::sigaction(sig, &sa, std::ptr::null_mut()) != 0 {
+                let e = std::io::Error::last_os_error();
+                eprintln!("failed to install signal handler for sig={sig}: {e}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Cli, String> {
+        match Cli::parse(args.iter().map(|s| s.to_string()))? {
+            CliAction::Run(c) => Ok(c),
+            CliAction::Help => Err("unexpected help".into()),
+        }
+    }
+
+    #[test]
+    fn defaults_to_hugepages() {
+        let c = parse(&[]).unwrap();
+        assert!(matches!(c.backing_kind, BackingKind::Hugepage2Mb));
+        assert_eq!(c.bytes_per_shard, DEFAULT_BYTES_PER_SHARD);
+    }
+
+    #[test]
+    fn no_hugepages_selects_heap() {
+        let c = parse(&["--no-hugepages"]).unwrap();
+        assert!(matches!(c.backing_kind, BackingKind::Heap));
+    }
+
+    #[test]
+    fn bytes_per_shard_equals_form() {
+        let c = parse(&["--bytes-per-shard=64M"]).unwrap();
+        assert_eq!(c.bytes_per_shard, 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn bytes_per_shard_space_form() {
+        let c = parse(&["--bytes-per-shard", "2G"]).unwrap();
+        assert_eq!(c.bytes_per_shard, 2 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn bytes_plain_integer_is_bytes() {
+        let c = parse(&["--bytes-per-shard=4194304"]).unwrap();
+        assert_eq!(c.bytes_per_shard, 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn help_flag_returns_help_action() {
+        let action = Cli::parse(["--help".to_string()].into_iter()).unwrap();
+        assert!(matches!(action, CliAction::Help));
+    }
+
+    #[test]
+    fn unknown_arg_is_rejected() {
+        let err = parse(&["--nope"]).err().unwrap();
+        assert!(err.contains("unknown argument"), "got: {err}");
+    }
+
+    #[test]
+    fn zero_bytes_rejected() {
+        let err = parse(&["--bytes-per-shard=0"]).err().unwrap();
+        assert!(err.contains("must be > 0"), "got: {err}");
+    }
+}
