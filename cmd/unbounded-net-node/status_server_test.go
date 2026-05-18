@@ -445,7 +445,7 @@ func TestComputeStatusDelta_JsonRoundTripFields(t *testing.T) {
 // TestGetNodeStatusBasicAndHandleStatusJSON tests GetNodeStatusBasicAndHandleStatusJSON.
 func TestGetNodeStatusBasicAndHandleStatusJSON(t *testing.T) {
 	s := &nodeStatusServer{
-		cfg:    &config{NodeName: "node-a", WireGuardPort: 51820},
+		cfg:    &config{NodeName: "node-a", WireGuardPort: 51820, WireGuardInterfacePrefix: "wg"},
 		pubKey: "pub-self",
 		state: &wireGuardState{
 			nodePodCIDRs:    []string{"10.244.0.0/24"},
@@ -493,7 +493,7 @@ func TestGetNodeStatusBasicAndHandleStatusJSON(t *testing.T) {
 // TestGetNodeStatusIncludesNodeErrors tests GetNodeStatusIncludesNodeErrors.
 func TestGetNodeStatusIncludesNodeErrors(t *testing.T) {
 	s := &nodeStatusServer{
-		cfg:    &config{NodeName: "node-a", WireGuardPort: 51820},
+		cfg:    &config{NodeName: "node-a", WireGuardPort: 51820, WireGuardInterfacePrefix: "wg"},
 		pubKey: "pub-self",
 		state: &wireGuardState{
 			nodePodCIDRs:    []string{"10.244.0.0/24"},

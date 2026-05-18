@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/vishvananda/netlink"
 	"k8s.io/klog/v2"
 
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
@@ -21,21 +22,10 @@ import (
 // unbounded0DeviceName is the dedicated dummy interface for the eBPF tunnel
 // dataplane. It has NOARP set so the kernel sends packets directly without
 // neighbor resolution. TC egress BPF intercepts and redirects to the tunnel.
+// This name is fixed (not configurable); the agent owns the device end to
+// end and validateTunnelInterfaceNames refuses any tunnel-interface flag
+// that collides with it.
 const unbounded0DeviceName = "unbounded0"
-
-// vxlanInterfaceName is the shared flow-based VXLAN interface used by the
-// eBPF dataplane. All VXLAN peers share this single interface.
-const vxlanInterfaceName = "vxlan0"
-
-// geneveInterfaceName is the default shared flow-based GENEVE interface
-// used by the eBPF dataplane. The runtime name is configurable via
-// --geneve-interface; this const is used in places that key off the
-// default (status filtering, peer-interface mapping).
-const geneveInterfaceName = "geneve0"
-
-// ipipInterfaceName is the shared flow-based IPIP interface used by the
-// eBPF dataplane. All IPIP peers share this single interface.
-const ipipInterfaceName = "ipip0"
 
 // buildSupernetRoutes returns the unbounded0 routes that attract overlay
 // traffic into the eBPF dataplane. One route per CIDR is emitted regardless
@@ -232,7 +222,14 @@ func configureTunnelPeers(
 	// addWireGuardPeersToBPFMap are silently dropped.
 	nlCache := state.netlinkCache
 	ifName := cfg.GeneveInterfaceName
-	ipipIfName := ipipInterfaceName
+	ipipIfName := cfg.IPIPInterfaceName
+	vxlanIfName := cfg.VXLANInterfaceName
+
+	// Remove any stale flow-based GENEVE/VXLAN devices whose name doesn't
+	// match the currently configured names (scoped by configured UDP port
+	// so we don't touch other agents' overlay devices). See the function's
+	// docstring for the rationale; IPIP is intentionally not swept.
+	cleanupStaleFlowBasedTunnels(cfg)
 
 	// Determine which tunnel interfaces are actually needed by scanning
 	// all peers before creating any interfaces. This avoids unnecessary
@@ -250,12 +247,25 @@ func configureTunnelPeers(
 		}
 	}
 
+	// Compute the deterministic MAC used for both shared GENEVE and VXLAN
+	// devices. It is set at create time via LinkAttrs.HardwareAddr so the
+	// device is born with the right MAC; SetLinkAddress is also called
+	// below as a safety net for the case where the device already exists
+	// with the wrong MAC (e.g. created by a previous agent version that
+	// hit the LinkAdd/SetHWAddr race and ended up with a kernel-random MAC).
+	var localUnderlayMAC net.HardwareAddr
+
+	localUnderlayIP := selectUnderlayIP(state.nodeInternalIPs, cfg.TunnelIPFamily)
+	if localUnderlayIP != nil {
+		localUnderlayMAC = ebpfpkg.TunnelMACFromIP(localUnderlayIP)
+	}
+
 	var geneveIfIndex uint32
 
 	if needsGeneve {
 		// Ensure single flow-based GENEVE interface exists (external, no VNI).
 		lm := unboundednetnetlink.NewLinkManager(ifName)
-		if err := lm.EnsureGeneveInterface(uint32(cfg.GeneveVNI), cfg.GenevePort); err != nil {
+		if err := lm.EnsureGeneveInterface(uint32(cfg.GeneveVNI), cfg.GenevePort, localUnderlayMAC); err != nil {
 			return nil, nil, fmt.Errorf("create flow-based GENEVE interface %s: %w", ifName, err)
 		}
 
@@ -270,16 +280,15 @@ func configureTunnelPeers(
 			klog.V(2).Infof("eBPF: failed to clear addresses on %s: %v", ifName, err)
 		}
 
-		// Set the geneve0 MAC to a deterministic value derived from our underlay
-		// IP. Remote nodes' BPF programs derive the inner dst MAC from the remote
-		// underlay IP using the same formula, so the MACs must match.
-		localUnderlayIP := selectUnderlayIP(state.nodeInternalIPs, cfg.TunnelIPFamily)
-		if localUnderlayIP != nil {
-			mac := ebpfpkg.TunnelMACFromIP(localUnderlayIP)
-			if err := lm.SetLinkAddress(mac); err != nil {
+		// Reconcile the MAC for the existing-device case (no-op when the MAC
+		// was just set at LinkAdd time above). Remote nodes' BPF programs
+		// derive the inner dst MAC from the remote underlay IP using the
+		// same TunnelMACFromIP formula, so the MACs must match.
+		if localUnderlayMAC != nil {
+			if err := lm.SetLinkAddress(localUnderlayMAC); err != nil {
 				klog.Warningf("eBPF: failed to set MAC on %s: %v", ifName, err)
 			} else {
-				klog.V(2).Infof("eBPF: set %s MAC to %s (from underlay %s)", ifName, mac, localUnderlayIP)
+				klog.V(2).Infof("eBPF: set %s MAC to %s (from underlay %s)", ifName, localUnderlayMAC, localUnderlayIP)
 			}
 		}
 
@@ -393,26 +402,26 @@ func configureTunnelPeers(
 
 	if needsVXLAN {
 		// Ensure shared flow-based VXLAN interface exists.
-		vxlanLM := unboundednetnetlink.NewLinkManager(vxlanInterfaceName)
-		if err := vxlanLM.EnsureVXLANInterface(cfg.VXLANPort, cfg.VXLANSrcPortLow, cfg.VXLANSrcPortHigh); err != nil {
-			return nil, nil, fmt.Errorf("create flow-based VXLAN interface %s: %w", vxlanInterfaceName, err)
+		vxlanLM := unboundednetnetlink.NewLinkManager(vxlanIfName)
+		if err := vxlanLM.EnsureVXLANInterface(cfg.VXLANPort, cfg.VXLANSrcPortLow, cfg.VXLANSrcPortHigh, localUnderlayMAC); err != nil {
+			return nil, nil, fmt.Errorf("create flow-based VXLAN interface %s: %w", vxlanIfName, err)
 		}
 
 		if err := vxlanLM.SetLinkUpWithCache(nlCache); err != nil {
-			return nil, nil, fmt.Errorf("bring up %s: %w", vxlanInterfaceName, err)
+			return nil, nil, fmt.Errorf("bring up %s: %w", vxlanIfName, err)
 		}
 
 		// Strip stale addresses from vxlan0 -- eBPF dataplane keeps overlay IPs
 		// on unbounded0 only.
 		if _, _, err := vxlanLM.SyncAddresses(nil, true); err != nil {
-			klog.V(2).Infof("eBPF: failed to clear addresses on %s: %v", vxlanInterfaceName, err)
+			klog.V(2).Infof("eBPF: failed to clear addresses on %s: %v", vxlanIfName, err)
 		}
 
-		// Set deterministic MAC -- same rationale as geneve0.
-		vxlanUnderlayIP := selectUnderlayIP(state.nodeInternalIPs, cfg.TunnelIPFamily)
-		if vxlanUnderlayIP != nil {
-			if err := vxlanLM.SetLinkAddress(ebpfpkg.TunnelMACFromIP(vxlanUnderlayIP)); err != nil {
-				klog.Warningf("eBPF: failed to set MAC on %s: %v", vxlanInterfaceName, err)
+		// Reconcile the MAC for the existing-device case (no-op after a
+		// fresh LinkAdd that already set it). Same rationale as geneve0.
+		if localUnderlayMAC != nil {
+			if err := vxlanLM.SetLinkAddress(localUnderlayMAC); err != nil {
+				klog.Warningf("eBPF: failed to set MAC on %s: %v", vxlanIfName, err)
 			}
 		}
 
@@ -426,40 +435,40 @@ func configureTunnelPeers(
 		}
 
 		if err := vxlanLM.EnsureMTUWithCache(nlCache, vxlanMTU); err != nil {
-			klog.Warningf("eBPF: failed to set MTU on %s: %v", vxlanInterfaceName, err)
+			klog.Warningf("eBPF: failed to set MTU on %s: %v", vxlanIfName, err)
 		}
 
-		disableRPFilter(vxlanInterfaceName)
+		disableRPFilter(vxlanIfName)
 
 		if state.forwardManager != nil {
-			state.forwardManager.EnsureInterface(vxlanInterfaceName)
+			state.forwardManager.EnsureInterface(vxlanIfName)
 		}
 
 		if state.isGatewayNode && state.notrackManager != nil {
-			state.notrackManager.EnsureInterface(vxlanInterfaceName)
+			state.notrackManager.EnsureInterface(vxlanIfName)
 		}
 
-		if vxlanIface, err := net.InterfaceByName(vxlanInterfaceName); err == nil {
+		if vxlanIface, err := net.InterfaceByName(vxlanIfName); err == nil {
 			vxlanIfIndex = uint32(vxlanIface.Index)
 		} else {
-			return nil, nil, fmt.Errorf("interface %s not found after creation: %w", vxlanInterfaceName, err)
+			return nil, nil, fmt.Errorf("interface %s not found after creation: %w", vxlanIfName, err)
 		}
 	} else {
 		// No peers need vxlan0 -- remove it if it exists.
-		vxlanLM := unboundednetnetlink.NewLinkManager(vxlanInterfaceName)
+		vxlanLM := unboundednetnetlink.NewLinkManager(vxlanIfName)
 		if vxlanLM.Exists() {
-			klog.Infof("eBPF: removing %s (no peers use VXLAN)", vxlanInterfaceName)
+			klog.Infof("eBPF: removing %s (no peers use VXLAN)", vxlanIfName)
 
 			if err := vxlanLM.DeleteLink(); err != nil {
-				klog.V(2).Infof("eBPF: failed to remove %s: %v", vxlanInterfaceName, err)
+				klog.V(2).Infof("eBPF: failed to remove %s: %v", vxlanIfName, err)
 			}
 
 			if state.forwardManager != nil {
-				state.forwardManager.RemoveInterface(vxlanInterfaceName)
+				state.forwardManager.RemoveInterface(vxlanIfName)
 			}
 
 			if state.notrackManager != nil {
-				state.notrackManager.RemoveInterface(vxlanInterfaceName)
+				state.notrackManager.RemoveInterface(vxlanIfName)
 			}
 		}
 	}
@@ -539,7 +548,9 @@ func configureTunnelPeers(
 	hcPeers := registerPeersWithHealthCheck(meshPeers, gatewayPeers, mySiteName, false,
 		siteHealthCheckProfileNames, peeringSiteHealthCheckProfileNames,
 		assignmentSiteHealthCheckProfileNames, assignmentPoolHealthCheckProfileNames,
-		poolHealthCheckProfileNames, state, peerIfaceName, true)
+		poolHealthCheckProfileNames, state,
+		func(gw gatewayPeerInfo) string { return peerIfaceName(cfg, gw) },
+		true)
 
 	klog.V(2).Infof("eBPF tunnel: configured %d mesh + %d gateway peers, %d BPF entries, %d supernet routes on %s",
 		len(meshPeers), len(gatewayPeers), len(bpfEntries), len(routes), ifName)
@@ -691,7 +702,7 @@ func addWireGuardPeersToBPFMap(cfg *config, state *wireGuardState, wgMeshPeers [
 	}
 
 	// Determine WG interface index. The mesh WG interface is wg<port>.
-	wgIfName := fmt.Sprintf("wg%d", cfg.WireGuardPort)
+	wgIfName := wireGuardInterfaceName(cfg, cfg.WireGuardPort)
 
 	wgIface, err := net.InterfaceByName(wgIfName)
 	if err != nil {
@@ -739,7 +750,7 @@ func addWireGuardPeersToBPFMap(cfg *config, state *wireGuardState, wgMeshPeers [
 			continue
 		}
 
-		gwWgIfName := fmt.Sprintf("wg%d", gwPeer.GatewayWireguardPort)
+		gwWgIfName := wireGuardInterfaceName(cfg, int(gwPeer.GatewayWireguardPort))
 
 		gwIface, gwErr := net.InterfaceByName(gwWgIfName)
 		if gwErr != nil {
@@ -788,15 +799,28 @@ func reconcilePendingBPFEntries(state *wireGuardState) {
 // peer based on its tunnel protocol. All peers using the same protocol
 // share one flow-based interface; the BPF program on unbounded0 selects
 // the per-peer underlay endpoint from the LPM trie.
-func peerIfaceName(gwPeer gatewayPeerInfo) string {
+func peerIfaceName(cfg *config, gwPeer gatewayPeerInfo) string {
 	switch gwPeer.TunnelProtocol {
 	case "VXLAN":
-		return vxlanInterfaceName
+		return cfg.VXLANInterfaceName
 	case "IPIP":
-		return ipipInterfaceName
+		return cfg.IPIPInterfaceName
 	default:
-		return geneveInterfaceName
+		return cfg.GeneveInterfaceName
 	}
+}
+
+// wireGuardInterfaceName returns the per-port WireGuard interface name
+// using the configured prefix.
+func wireGuardInterfaceName(cfg *config, port int) string {
+	return fmt.Sprintf("%s%d", cfg.WireGuardInterfacePrefix, port)
+}
+
+// isWireGuardInterface reports whether name belongs to the per-port
+// WireGuard interface namespace (prefix + numeric port). It matches the
+// pattern produced by wireGuardInterfaceName.
+func isWireGuardInterface(cfg *config, name string) bool {
+	return strings.HasPrefix(name, cfg.WireGuardInterfacePrefix)
 }
 
 // disableRPFilter sets rp_filter=0 on the given interface and on the "all"
@@ -832,7 +856,7 @@ func disableRPFilter(ifName string) {
 
 // using. This avoids leaving stale geneve0, vxlan0, or ipip0 interfaces
 // when the tunnel protocol has been changed or when all peers use WireGuard.
-func cleanupUnusedTunnelDevices(meshPeers []meshPeerInfo, gatewayPeers, wgGatewayPeers []gatewayPeerInfo, fwdMgr *unboundednetnetlink.ForwardManager, notrackMgr *unboundednetnetlink.NotrackManager) {
+func cleanupUnusedTunnelDevices(cfg *config, meshPeers []meshPeerInfo, gatewayPeers, wgGatewayPeers []gatewayPeerInfo, fwdMgr *unboundednetnetlink.ForwardManager, notrackMgr *unboundednetnetlink.NotrackManager) {
 	usesGeneve := false
 	usesVXLAN := false
 	usesIPIP := false
@@ -876,9 +900,9 @@ func cleanupUnusedTunnelDevices(meshPeers []meshPeerInfo, gatewayPeers, wgGatewa
 	}
 
 	devices := []devInfo{
-		{geneveInterfaceName, usesGeneve},
-		{vxlanInterfaceName, usesVXLAN},
-		{ipipInterfaceName, usesIPIP},
+		{cfg.GeneveInterfaceName, usesGeneve},
+		{cfg.VXLANInterfaceName, usesVXLAN},
+		{cfg.IPIPInterfaceName, usesIPIP},
 	}
 	for _, d := range devices {
 		if d.used {
@@ -908,7 +932,7 @@ func cleanupUnusedTunnelDevices(meshPeers []meshPeerInfo, gatewayPeers, wgGatewa
 // are still in use. This must be called after cleanupUnusedTunnelDevices
 // because deleting interfaces can cause the kernel to reset rp_filter on
 // remaining interfaces.
-func reapplyRPFilterOnActiveTunnels(meshPeers []meshPeerInfo, gatewayPeers, wgGatewayPeers []gatewayPeerInfo, fwdMgr *unboundednetnetlink.ForwardManager, isGateway bool, notrackMgr *unboundednetnetlink.NotrackManager) {
+func reapplyRPFilterOnActiveTunnels(cfg *config, meshPeers []meshPeerInfo, gatewayPeers, wgGatewayPeers []gatewayPeerInfo, fwdMgr *unboundednetnetlink.ForwardManager, isGateway bool, notrackMgr *unboundednetnetlink.NotrackManager) {
 	usesGeneve := false
 	usesVXLAN := false
 	usesIPIP := false
@@ -951,9 +975,9 @@ func reapplyRPFilterOnActiveTunnels(meshPeers []meshPeerInfo, gatewayPeers, wgGa
 		used bool
 	}
 	for _, d := range []devInfo{
-		{geneveInterfaceName, usesGeneve},
-		{vxlanInterfaceName, usesVXLAN},
-		{ipipInterfaceName, usesIPIP},
+		{cfg.GeneveInterfaceName, usesGeneve},
+		{cfg.VXLANInterfaceName, usesVXLAN},
+		{cfg.IPIPInterfaceName, usesIPIP},
 	} {
 		if d.used {
 			disableRPFilter(d.name)
@@ -992,4 +1016,61 @@ func filterPeersByTunnelProtocol(meshPeers []meshPeerInfo, gatewayPeers []gatewa
 	}
 
 	return wgMesh, wgGw, tunnelMesh, tunnelGw
+}
+
+// cleanupStaleFlowBasedTunnels removes leftover flow-based GENEVE and
+// VXLAN devices that belong to a previous agent run. A device is
+// considered stale if it is flow-based AND its UDP port matches the
+// port this agent is configured to use AND its name does not match the
+// currently configured cfg.GeneveInterfaceName / cfg.VXLANInterfaceName.
+// Without this sweep, renaming via --geneve-interface or --vxlan-interface
+// would fail to fully take effect: the old device would remain bound to
+// the configured port and would interfere with the new device, including
+// the flow-based dispatch by the BPF program on unbounded0.
+//
+// CRITICAL: we deliberately key on the configured UDP port (Dport for
+// GENEVE, Port for VXLAN). The whole motivation for letting operators
+// rename our shared tunnel interfaces is so we can coexist with another
+// local agent (for example a CNI like Cilium running in the same site)
+// that may also be running flow-based GENEVE or VXLAN encap. Cilium-style
+// overlay devices typically use a different UDP port than ours; matching
+// on port keeps this sweep scoped to devices we ourselves created. Two
+// agents on the same host that both choose the same port + flow-based
+// configuration cannot coexist regardless -- only one device can own a
+// given UDP port -- and renaming would not help that case anyway.
+//
+// IPIP is intentionally not swept here. The kernel IPIP "external mode"
+// device exposes no port or other configuration field we can use to
+// safely tell our device apart from another agent's. If an operator
+// renames --ipip-interface, the previous IPIP device must be removed
+// manually (typically `ip link del <old-name>`).
+func cleanupStaleFlowBasedTunnels(cfg *config) {
+	links, err := netlink.LinkList()
+	if err != nil {
+		klog.V(2).Infof("eBPF: failed to list links for stale-tunnel sweep: %v", err)
+		return
+	}
+
+	for _, link := range links {
+		name := link.Attrs().Name
+
+		var stale bool
+
+		switch tl := link.(type) {
+		case *netlink.Geneve:
+			stale = tl.FlowBased && int(tl.Dport) == cfg.GenevePort && name != cfg.GeneveInterfaceName
+		case *netlink.Vxlan:
+			stale = tl.FlowBased && tl.Port == cfg.VXLANPort && name != cfg.VXLANInterfaceName
+		}
+
+		if !stale {
+			continue
+		}
+
+		klog.Infof("eBPF: removing stale flow-based %s device %s (matches our configured port but not our configured name)", link.Type(), name)
+
+		if err := netlink.LinkDel(link); err != nil {
+			klog.Warningf("eBPF: failed to delete stale flow-based device %s: %v", name, err)
+		}
+	}
 }

@@ -216,9 +216,19 @@ func main() {
 		return peerOutput[i].Interface < peerOutput[j].Interface
 	})
 
-	expectedIPv4, expectedIPv6 := routeplan.BuildExpectedWireGuardRoutes(routePeers, routeNodes)
-	expectedIPv4Routes := buildExpectedRouteOutput(expectedIPv4, routePeers, routeNodes)
-	expectedIPv6Routes := buildExpectedRouteOutput(expectedIPv6, routePeers, routeNodes)
+	// Use the default tunnel-interface names: most debug invocations
+	// run against clusters that haven't overridden the names. Adjust here
+	// (or add CLI flags) if you need to debug a cluster with custom names.
+	ifaceNames := routeplan.InterfaceNames{
+		WireGuardPrefix: "wg",
+		Geneve:          "geneve0",
+		VXLAN:           "vxlan0",
+		IPIP:            "ipip0",
+	}
+
+	expectedIPv4, expectedIPv6 := routeplan.BuildExpectedWireGuardRoutes(routePeers, routeNodes, ifaceNames)
+	expectedIPv4Routes := buildExpectedRouteOutput(expectedIPv4, routePeers, routeNodes, ifaceNames)
+	expectedIPv6Routes := buildExpectedRouteOutput(expectedIPv6, routePeers, routeNodes, ifaceNames)
 	unexpectedIPv4Routes, unexpectedIPv6Routes := buildUnexpectedRouteOutput(target, expectedIPv4Routes, expectedIPv6Routes)
 
 	out := debugOutput{
@@ -300,7 +310,7 @@ func expectedDestinationsForPeer(peer routeplan.Peer, nodesByName map[string]rou
 	return entries
 }
 
-func buildExpectedRouteOutput(routes []routeplan.ExpectedRoute, peers []routeplan.Peer, nodesByName map[string]routeplan.Node) []expectedRoute {
+func buildExpectedRouteOutput(routes []routeplan.ExpectedRoute, peers []routeplan.Peer, nodesByName map[string]routeplan.Node, ifaceNames routeplan.InterfaceNames) []expectedRoute {
 	peerByName := make(map[string]routeplan.Peer, len(peers))
 	for _, peer := range peers {
 		peerByName[strings.TrimSpace(peer.Name)] = peer
@@ -326,7 +336,7 @@ func buildExpectedRouteOutput(routes []routeplan.ExpectedRoute, peers []routepla
 			continue
 		}
 
-		peerExpectedIPv4, peerExpectedIPv6 := routeplan.BuildExpectedWireGuardRoutes([]routeplan.Peer{peer}, nodesByName)
+		peerExpectedIPv4, peerExpectedIPv6 := routeplan.BuildExpectedWireGuardRoutes([]routeplan.Peer{peer}, nodesByName, ifaceNames)
 		for _, peerRoute := range append(peerExpectedIPv4, peerExpectedIPv6...) {
 			key := buildRouteKey(peerRoute.Destination, peerRoute.Gateway, peerRoute.Device, peerRoute.Family)
 			peerNamesByRouteKey[key] = append(peerNamesByRouteKey[key], name)

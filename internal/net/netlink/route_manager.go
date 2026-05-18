@@ -84,6 +84,11 @@ type UnifiedRouteManager struct {
 	linkName  string
 	linkIndex int
 
+	// wgPrefix is the configured WireGuard interface prefix (e.g. "wg").
+	// Used by the orphan-route cleanup scan to identify routes pointing at
+	// per-port WireGuard devices vs other kernel routes.
+	wgPrefix string
+
 	// defaultTable is the routing table ID used for routes that do not
 	// specify an explicit Table (i.e. Table==0 in DesiredRoute). When set
 	// to a dedicated table (not 0 and not RT_TABLE_MAIN), cleanup and
@@ -114,15 +119,23 @@ type UnifiedRouteManager struct {
 // interface used for metrics labelling; actual route interfaces come from each
 // DesiredNexthop.LinkIndex. defaultTable is the routing table ID used for
 // routes whose Table field is 0; pass 0 to use the main table (254) for
-// backward compatibility.
-func NewUnifiedRouteManager(linkName string, defaultTable int) *UnifiedRouteManager {
+// backward compatibility. wgPrefix is the per-port WireGuard interface
+// name prefix (e.g. "wg") used by the orphan-route cleanup scan to match
+// kernel routes pointing at managed WireGuard devices; pass "" to default
+// to "wg".
+func NewUnifiedRouteManager(linkName string, defaultTable int, wgPrefix string) *UnifiedRouteManager {
 	effectiveTable := defaultTable
 	if effectiveTable == 0 {
 		effectiveTable = unix.RT_TABLE_MAIN
 	}
 
+	if wgPrefix == "" {
+		wgPrefix = "wg"
+	}
+
 	m := &UnifiedRouteManager{
 		linkName:        linkName,
+		wgPrefix:        wgPrefix,
 		defaultTable:    effectiveTable,
 		nexthops:        make(map[string]*nexthopState),
 		nexthopIDs:      make(map[uint32]string),
@@ -908,7 +921,7 @@ func (m *UnifiedRouteManager) cleanupOrphanedKernelRoutes(desiredSet map[string]
 					continue
 				}
 
-				if !strings.HasPrefix(link.Attrs().Name, "wg") && link.Attrs().Name != "unbounded0" {
+				if !strings.HasPrefix(link.Attrs().Name, m.wgPrefix) && link.Attrs().Name != "unbounded0" {
 					continue
 				}
 			} else if len(r.MultiPath) > 0 {
@@ -930,7 +943,7 @@ func (m *UnifiedRouteManager) cleanupOrphanedKernelRoutes(desiredSet map[string]
 						continue
 					}
 
-					if strings.HasPrefix(link.Attrs().Name, "wg") || link.Attrs().Name == "unbounded0" {
+					if strings.HasPrefix(link.Attrs().Name, m.wgPrefix) || link.Attrs().Name == "unbounded0" {
 						hasWG = true
 						break
 					}
