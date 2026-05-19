@@ -222,9 +222,16 @@ func TestBuildExpectedRouteOutputAndExpectedDestinationsForPeer(t *testing.T) {
 		t.Fatalf("expected expectedDestinationsForPeer to return entries")
 	}
 
-	ipv4Routes, _ := routeplan.BuildExpectedWireGuardRoutes(peers, nodesByName)
+	ifaceNames := routeplan.InterfaceNames{
+		WireGuardPrefix: "wg",
+		Geneve:          "geneve0",
+		VXLAN:           "vxlan0",
+		IPIP:            "ipip0",
+	}
 
-	output := buildExpectedRouteOutput(ipv4Routes, peers, nodesByName)
+	ipv4Routes, _ := routeplan.BuildExpectedWireGuardRoutes(peers, nodesByName, ifaceNames)
+
+	output := buildExpectedRouteOutput(ipv4Routes, peers, nodesByName, ifaceNames)
 	if len(output) == 0 {
 		t.Fatalf("expected buildExpectedRouteOutput to return routes")
 	}

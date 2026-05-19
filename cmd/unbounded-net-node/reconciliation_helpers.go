@@ -695,7 +695,11 @@ func removeStaleWireGuardInterfaces(cfg *config) {
 		return
 	}
 
-	defer func() { _ = wgClient.Close() }()
+	defer func() {
+		if err := wgClient.Close(); err != nil {
+			klog.V(4).Infof("WireGuard: failed to close wgctrl client after stale-prefix sweep: %v", err)
+		}
+	}()
 
 	links, err := netlink.LinkList()
 	if err != nil {
