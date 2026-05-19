@@ -425,6 +425,71 @@ def apiserver_url() -> str:
     return url
 
 
+def _kind_docker_subnet() -> str | None:
+    """Return the IPv4 subnet (CIDR) of the 'kind' docker network, or None."""
+    result = subprocess.run(
+        ["docker", "network", "inspect", "kind",
+         "--format", "{{range .IPAM.Config}}{{if .Subnet}}{{.Subnet}}\n{{end}}{{end}}"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        cidr = line.strip()
+        # Only return the IPv4 subnet; skip IPv6.
+        if cidr and ":" not in cidr:
+            return cidr
+    return None
+
+
+def _install_kind_route_in_vm() -> None:
+    """Add a link-scope route to the kind docker subnet inside the smoke VM.
+
+    Kindnet on smoke-node attempts to install pod-CIDR routes of the form
+    '10.244.0.0/24 via 172.18.0.2', where 172.18.0.2 is kind-control-plane's
+    InternalIP (its docker0 address).  Linux requires the gateway IP to be
+    reachable via a directly-connected (scope=link) route at install time;
+    otherwise it returns ENETUNREACH.  In our setup the kind docker subnet
+    (typically 172.18.0.0/16) is not on any of the VM's interfaces, so
+    kindnet panics with 'Maximum retries reconciling node routes: network
+    is unreachable' after 5 retries and enters CrashLoopBackOff.
+
+    Adding a link-scope route '<kind_subnet> dev <iface>' makes those IPs
+    appear directly connected to the VM, so kindnet's route additions
+    succeed and the Node can transition to Ready.  ARP for the gateway
+    (172.18.0.2) will not resolve from virbr-smoke, so pod traffic to the
+    kind control plane will not actually flow; this is acceptable because
+    the smoke test only verifies that the bare-metal node joins and
+    becomes Ready, not pod-to-pod connectivity to the kind control plane.
+    """
+    kind_subnet = _kind_docker_subnet()
+    if not kind_subnet:
+        log("  (warning: could not determine kind docker subnet; "
+            "skipping VM route install)")
+        return
+    log(f"  Installing link-scope route {kind_subnet} in VM "
+        "(so kindnet's via-gateway is on-link)")
+    # Find the VM-side interface that owns NODE_IP, then add a link-scope
+    # route for the kind docker subnet on that interface.  'ip route
+    # replace' is idempotent, so re-runs are safe.
+    cmd = (
+        "set -e; "
+        f"iface=$(ip -o -4 addr show | awk '/inet {NODE_IP}\\//{{print $2; exit}}'); "
+        "if [ -z \"$iface\" ]; then echo 'no interface found' >&2; exit 1; fi; "
+        f"ip route replace {kind_subnet} dev \"$iface\" scope link; "
+        f"echo \"installed {kind_subnet} dev $iface\""
+    )
+    try:
+        rc, stdout, stderr = guest_exec(cmd, timeout=15)
+        out = (stdout + stderr).strip()
+        if rc == 0:
+            log(f"    {out}")
+        else:
+            log(f"    (warning: route install failed rc={rc}: {out})")
+    except Exception as e:
+        log(f"    (warning: route install failed: {e})")
+
+
 def _probe_vm_network() -> None:
     """Run quick network diagnostics inside the VM via guest agent."""
     log("  Probing VM network (one-time diagnostic)...")
@@ -885,6 +950,11 @@ def main() -> None:
 
     log("Waiting for cloud-init to complete...")
     assert_cloud_init_done(timeout=900)
+
+    # Once the VM is up, install a link-scope route in the VM so kindnet's
+    # 'via <kind-control-plane-docker-IP>' pod-CIDR routes can be inserted
+    # without ENETUNREACH.  See _install_kind_route_in_vm for details.
+    _install_kind_route_in_vm()
 
     log("Waiting for kubelet to join the cluster...")
     wait_k8s_node(NODE_NAME, timeout=900)
