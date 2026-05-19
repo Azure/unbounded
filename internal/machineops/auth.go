@@ -15,6 +15,13 @@ import (
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
 
+const (
+	machineSiteLabelKey = "unbounded-cloud.io/site"
+	netSiteLabelKey     = "net.unbounded-cloud.io/site"
+)
+
+var machineSiteLabelKeys = []string{machineSiteLabelKey, netSiteLabelKey}
+
 type authResolutionFailure struct {
 	Reason  string
 	Message string
@@ -53,12 +60,8 @@ func (r *MachineOperationReconciler) resolveOperationAuth(ctx context.Context, m
 }
 
 func operationAuthTargetFor(machine *unboundedv1alpha3.Machine) (operationAuthTarget, bool) {
-	if machine.Spec.SiteRef == nil {
-		return operationAuthTarget{}, false
-	}
-
 	target := operationAuthTarget{
-		SiteName: strings.TrimSpace(machine.Spec.SiteRef.Name),
+		SiteName: siteNameFromLabels(machine.Labels),
 		Provider: strings.TrimSpace(machine.Spec.Provider),
 	}
 	if target.SiteName == "" || target.Provider == "" {
@@ -80,7 +83,7 @@ func (r *MachineOperationReconciler) machineOperationCredentialFor(
 	var match *unboundedv1alpha3.MachineOperationCredential
 	for i := range credentials.Items {
 		credential := &credentials.Items[i]
-		if credential.Spec.SiteRef.Name != target.SiteName || credential.Spec.Provider != target.Provider {
+		if credential.Spec.SiteName != target.SiteName || credential.Spec.Provider != target.Provider {
 			continue
 		}
 
@@ -95,6 +98,16 @@ func (r *MachineOperationReconciler) machineOperationCredentialFor(
 	}
 
 	return match, nil, nil
+}
+
+func siteNameFromLabels(labels map[string]string) string {
+	for _, key := range machineSiteLabelKeys {
+		if value := strings.TrimSpace(labels[key]); value != "" {
+			return value
+		}
+	}
+
+	return ""
 }
 
 func (r *MachineOperationReconciler) authFromCredential(

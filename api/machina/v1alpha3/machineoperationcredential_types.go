@@ -32,7 +32,7 @@ const (
 
 // +kubebuilder:object:root=true
 // +kubebuilder:resource:scope=Cluster,shortName=mocred
-// +kubebuilder:printcolumn:name="Site",type="string",JSONPath=".spec.siteRef.name"
+// +kubebuilder:printcolumn:name="Site",type="string",JSONPath=".spec.siteName"
 // +kubebuilder:printcolumn:name="Provider",type="string",JSONPath=".spec.provider"
 // +kubebuilder:printcolumn:name="Auth Type",type="string",JSONPath=".spec.authType"
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
@@ -58,9 +58,10 @@ type MachineOperationCredentialList struct {
 // MachineOperationCredentialSpec defines a provider credential source for a
 // site.
 type MachineOperationCredentialSpec struct {
-	// SiteRef identifies the site this credential applies to.
+	// SiteName is matched against the Machine site label.
 	// +kubebuilder:validation:Required
-	SiteRef LocalObjectReference `json:"siteRef"`
+	// +kubebuilder:validation:MinLength=1
+	SiteName string `json:"siteName"`
 
 	// Provider identifies the external control provider this credential applies
 	// to.

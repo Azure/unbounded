@@ -140,11 +140,6 @@ type MachineSpec struct {
 	// +optional
 	ProviderID string `json:"providerID,omitempty"`
 
-	// SiteRef identifies the site that contains this machine. Machine operation
-	// controllers use this to resolve site-scoped cloud provider credentials.
-	// +optional
-	SiteRef *LocalObjectReference `json:"siteRef,omitempty"`
-
 	// ConfigurationRef references a MachineConfiguration (and
 	// optionally a specific version) that defines the configuration
 	// profile for this machine. If a specific version is set, that

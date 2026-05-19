@@ -70,7 +70,7 @@ func Test_buildMachineCR_NilLabelsAndTaints(t *testing.T) {
 	assert.Nil(t, machine.Spec.Kubernetes.RegisterWithTaints)
 }
 
-func Test_buildMachineCR_SiteRefFromLabels(t *testing.T) {
+func Test_buildMachineCR_SiteLabelFromKubeletLabels(t *testing.T) {
 	cfg := baseConfig()
 	cfg.Kubelet.Labels = map[string]string{
 		"env":                         "test",
@@ -78,8 +78,8 @@ func Test_buildMachineCR_SiteRefFromLabels(t *testing.T) {
 	}
 	machine := buildMachineCR(cfg)
 
-	require.NotNil(t, machine.Spec.SiteRef)
-	assert.Equal(t, "site-a", machine.Spec.SiteRef.Name)
+	require.NotNil(t, machine.Labels)
+	assert.Equal(t, "site-a", machine.Labels["unbounded-cloud.io/site"])
 }
 
 // ---------------------------------------------------------------------------

@@ -59,12 +59,12 @@ func TestMachineOperationReconciler_ResolvesSiteCredential(t *testing.T) {
 	require.NoError(t, corev1.AddToScheme(s))
 
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
-	machine.Spec.SiteRef = &unboundedv1alpha3.LocalObjectReference{Name: "site-a"}
+	machine.Labels = map[string]string{"unbounded-cloud.io/site": "site-a"}
 	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReboot)
 	credential := &unboundedv1alpha3.MachineOperationCredential{
 		ObjectMeta: metav1ObjectMeta("site-a-azure"),
 		Spec: unboundedv1alpha3.MachineOperationCredentialSpec{
-			SiteRef:  unboundedv1alpha3.LocalObjectReference{Name: "site-a"},
+			SiteName: "site-a",
 			Provider: unboundedv1alpha3.ExternalProviderAzureVM,
 			AuthType: unboundedv1alpha3.MachineOperationAuthServicePrincipalSecret,
 			SecretRef: &unboundedv1alpha3.NamespacedSecretReference{
@@ -95,17 +95,30 @@ func TestMachineOperationReconciler_ResolvesSiteCredential(t *testing.T) {
 	require.Equal(t, "secret", provider.authData[0]["clientSecret"])
 }
 
+func TestOperationAuthTargetForUsesNetSiteLabel(t *testing.T) {
+	t.Parallel()
+
+	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
+	machine.Labels = map[string]string{"net.unbounded-cloud.io/site": "site-a"}
+
+	target, ok := operationAuthTargetFor(machine)
+
+	require.True(t, ok)
+	require.Equal(t, "site-a", target.SiteName)
+	require.Equal(t, unboundedv1alpha3.ExternalProviderAzureVM, target.Provider)
+}
+
 func TestMachineOperationReconciler_PassesSecretlessCredentialToProvider(t *testing.T) {
 	t.Parallel()
 
 	s := newOperationTestScheme(t)
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
-	machine.Spec.SiteRef = &unboundedv1alpha3.LocalObjectReference{Name: "site-a"}
+	machine.Labels = map[string]string{"unbounded-cloud.io/site": "site-a"}
 	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReboot)
 	credential := &unboundedv1alpha3.MachineOperationCredential{
 		ObjectMeta: metav1ObjectMeta("site-a-azure"),
 		Spec: unboundedv1alpha3.MachineOperationCredentialSpec{
-			SiteRef:  unboundedv1alpha3.LocalObjectReference{Name: "site-a"},
+			SiteName: "site-a",
 			Provider: unboundedv1alpha3.ExternalProviderAzureVM,
 			AuthType: unboundedv1alpha3.MachineOperationAuthAPIKey,
 		},
@@ -127,7 +140,7 @@ func TestMachineOperationReconciler_FailsAmbiguousSiteCredential(t *testing.T) {
 
 	s := newOperationTestScheme(t)
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
-	machine.Spec.SiteRef = &unboundedv1alpha3.LocalObjectReference{Name: "site-a"}
+	machine.Labels = map[string]string{"unbounded-cloud.io/site": "site-a"}
 	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReboot)
 	credentialA := newMachineOperationCredential("cred-a", "site-a", unboundedv1alpha3.ExternalProviderAzureVM)
 	credentialB := newMachineOperationCredential("cred-b", "site-a", unboundedv1alpha3.ExternalProviderAzureVM)
@@ -158,7 +171,7 @@ func TestMachineOperationReconciler_FailsMissingCredentialSecret(t *testing.T) {
 	require.NoError(t, corev1.AddToScheme(s))
 
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
-	machine.Spec.SiteRef = &unboundedv1alpha3.LocalObjectReference{Name: "site-a"}
+	machine.Labels = map[string]string{"unbounded-cloud.io/site": "site-a"}
 	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReboot)
 	credential := newMachineOperationCredential("cred-a", "site-a", unboundedv1alpha3.ExternalProviderAzureVM)
 	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReboot: true}}
@@ -185,7 +198,7 @@ func TestMachineOperationReconciler_FailsCredentialSecretOutsideAllowedNamespace
 
 	s := newOperationTestScheme(t)
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
-	machine.Spec.SiteRef = &unboundedv1alpha3.LocalObjectReference{Name: "site-a"}
+	machine.Labels = map[string]string{"unbounded-cloud.io/site": "site-a"}
 	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReboot)
 	credential := newMachineOperationCredential("cred-a", "site-a", unboundedv1alpha3.ExternalProviderAzureVM)
 	credential.Spec.SecretRef.Namespace = "other"
@@ -292,7 +305,7 @@ func TestMachineOperationReconciler_DoesNotResolveAuthForSkippedInProgressOperat
 
 	s := newOperationTestScheme(t)
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
-	machine.Spec.SiteRef = &unboundedv1alpha3.LocalObjectReference{Name: "site-a"}
+	machine.Labels = map[string]string{"unbounded-cloud.io/site": "site-a"}
 	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReboot)
 	op.Status.Phase = unboundedv1alpha3.OperationPhaseInProgress
 	op.Status.StartedAt = ptrTo(fixedOperationNow())
@@ -636,7 +649,7 @@ func newMachineOperationCredential(name, site, provider string) *unboundedv1alph
 	return &unboundedv1alpha3.MachineOperationCredential{
 		ObjectMeta: metav1ObjectMeta(name),
 		Spec: unboundedv1alpha3.MachineOperationCredentialSpec{
-			SiteRef:  unboundedv1alpha3.LocalObjectReference{Name: site},
+			SiteName: site,
 			Provider: provider,
 			AuthType: unboundedv1alpha3.MachineOperationAuthServicePrincipalSecret,
 			SecretRef: &unboundedv1alpha3.NamespacedSecretReference{
