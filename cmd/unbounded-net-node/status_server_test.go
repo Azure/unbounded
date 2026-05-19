@@ -557,7 +557,15 @@ func TestTryDirectRecoveryProbeClearsNodeErrors(t *testing.T) {
 // TestCollectRoutingTableFromKernelEmptyState tests that collectRoutingTableFromKernel
 // returns empty routes when no wg interfaces exist.
 func TestCollectRoutingTableFromKernelEmptyState(t *testing.T) {
-	s := &nodeStatusServer{state: &wireGuardState{}}
+	s := &nodeStatusServer{
+		cfg: &config{
+			WireGuardInterfacePrefix: "wg",
+			GeneveInterfaceName:      "geneve0",
+			VXLANInterfaceName:       "vxlan0",
+			IPIPInterfaceName:        "ipip0",
+		},
+		state: &wireGuardState{},
+	}
 
 	info := s.collectRoutingTableFromKernel()
 	if len(info.Routes) != 0 {
