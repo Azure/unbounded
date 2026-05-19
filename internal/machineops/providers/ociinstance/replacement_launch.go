@@ -22,12 +22,15 @@ func replacementSourceInstance(ctx context.Context, client computeClient, instan
 	if err != nil {
 		return core.Instance{}, fmt.Errorf("get OCI instance %s: %w", instanceID, err)
 	}
+
 	if instance.CompartmentId == nil || *instance.CompartmentId == "" {
 		return core.Instance{}, fmt.Errorf("OCI instance %s has no compartment ID", instanceID)
 	}
+
 	if instance.AvailabilityDomain == nil || *instance.AvailabilityDomain == "" {
 		return core.Instance{}, fmt.Errorf("OCI instance %s has no availability domain", instanceID)
 	}
+
 	if instance.Shape == nil || *instance.Shape == "" {
 		return core.Instance{}, fmt.Errorf("OCI instance %s has no shape", instanceID)
 	}
@@ -42,6 +45,7 @@ func rejectAttachedDataVolumes(ctx context.Context, client computeClient, instan
 	if err != nil {
 		return fmt.Errorf("list OCI volume attachments for %s: %w", *instance.Id, err)
 	}
+
 	if hasActiveVolumeAttachment(volumeAttachments) {
 		return fmt.Errorf("OCI HostReplace does not support preserving attached data volumes")
 	}
@@ -66,6 +70,7 @@ func primaryVNIC(ctx context.Context, client computeClient, instance core.Instan
 		if err != nil {
 			return core.Vnic{}, fmt.Errorf("get OCI VNIC %s: %w", *attachment.VnicId, err)
 		}
+
 		if vnic.IsPrimary != nil && *vnic.IsPrimary {
 			if vnic.SubnetId == nil || *vnic.SubnetId == "" {
 				return core.Vnic{}, fmt.Errorf("OCI primary VNIC %s has no subnet ID", *attachment.VnicId)
@@ -88,10 +93,12 @@ func (p *Provider) findExistingReplacement(ctx context.Context, client computeCl
 
 	oldProviderID := providerIDPrefix + *oldInstance.Id
 	operationUID := string(request.OperationUID)
+
 	for _, instance := range instances {
 		if isTerminalInstance(instance) {
 			continue
 		}
+
 		if instance.FreeformTags[tagOperationUID] == operationUID && instance.FreeformTags[tagOldProviderID] == oldProviderID {
 			return instance, true, nil
 		}
@@ -120,10 +127,12 @@ func (p *Provider) resolveImageID(ctx context.Context, client computeClient, old
 	if err != nil {
 		return "", fmt.Errorf("list OCI images: %w", err)
 	}
+
 	sort.SliceStable(images, func(i, j int) bool {
 		if images[i].TimeCreated == nil {
 			return false
 		}
+
 		if images[j].TimeCreated == nil {
 			return true
 		}
@@ -135,9 +144,11 @@ func (p *Provider) resolveImageID(ctx context.Context, client computeClient, old
 		if image.Id == nil || image.LifecycleState != core.ImageLifecycleStateAvailable {
 			continue
 		}
+
 		if image.OperatingSystem == nil || image.OperatingSystemVersion == nil {
 			continue
 		}
+
 		if *image.OperatingSystem == defaultUbuntuOS && *image.OperatingSystemVersion == defaultUbuntuOSVersion {
 			return *image.Id, nil
 		}
@@ -183,6 +194,7 @@ func replacementMetadata(oldInstance core.Instance, request machineops.Operation
 	if extraKeys := strings.TrimSpace(request.Parameters[parameterSSHAuthorizedKeys]); extraKeys != "" {
 		metadata["ssh_authorized_keys"] = strings.TrimSpace(metadata["ssh_authorized_keys"] + "\n" + extraKeys)
 	}
+
 	metadata["user_data"] = base64.StdEncoding.EncodeToString([]byte(request.ReplaceUserData))
 	if metadataSize(metadata, oldInstance.ExtendedMetadata) > ociMetadataMaxBytes {
 		return nil, fmt.Errorf("replacement metadata exceeds OCI limit of %d bytes", ociMetadataMaxBytes)
@@ -221,6 +233,7 @@ func copyOptionalLaunchSettings(details *core.LaunchInstanceDetails, oldInstance
 			MemoryInGBs: oldInstance.ShapeConfig.MemoryInGBs,
 		}
 	}
+
 	if oldInstance.AvailabilityConfig != nil {
 		details.AvailabilityConfig = &core.LaunchInstanceAvailabilityConfigDetails{
 			IsLiveMigrationPreferred: oldInstance.AvailabilityConfig.IsLiveMigrationPreferred,
@@ -229,6 +242,7 @@ func copyOptionalLaunchSettings(details *core.LaunchInstanceDetails, oldInstance
 			details.AvailabilityConfig.RecoveryAction = core.LaunchInstanceAvailabilityConfigDetailsRecoveryActionEnum(oldInstance.AvailabilityConfig.RecoveryAction)
 		}
 	}
+
 	if oldInstance.AgentConfig != nil {
 		details.AgentConfig = &core.LaunchInstanceAgentConfigDetails{
 			IsMonitoringDisabled:  oldInstance.AgentConfig.IsMonitoringDisabled,
@@ -264,6 +278,7 @@ func metadataSize(metadata map[string]string, extended map[string]interface{}) i
 	for k, v := range metadata {
 		total += len(k) + len(v)
 	}
+
 	for k := range extended {
 		total += len(k)
 	}

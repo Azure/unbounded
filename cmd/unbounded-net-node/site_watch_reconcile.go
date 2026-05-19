@@ -1982,14 +1982,17 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 		// site NodeCidr is excluded because that traffic must keep using
 		// the host's default route.
 		var extraSupernets []string
+
 		if isGatewayNode {
 			for siteName, site := range siteMap {
 				for _, assignment := range site.Spec.PodCidrAssignments {
 					extraSupernets = append(extraSupernets, assignment.CidrBlocks...)
 				}
+
 				if siteName == mySiteName {
 					continue
 				}
+
 				extraSupernets = append(extraSupernets, site.Spec.NodeCidrs...)
 			}
 		}
@@ -2029,12 +2032,14 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 			// instance than the forward path took, conntrack marks them
 			// INVALID, and KUBE-FORWARD drops them.
 			supernetSet := make(map[string]struct{})
+
 			for _, site := range siteMap {
 				for _, assignment := range site.Spec.PodCidrAssignments {
 					for _, cidr := range assignment.CidrBlocks {
 						supernetSet[cidr] = struct{}{}
 					}
 				}
+
 				for _, cidr := range site.Spec.NodeCidrs {
 					supernetSet[cidr] = struct{}{}
 				}

@@ -166,6 +166,7 @@ func main() {
 	}
 
 	familyFilter := familyAll
+
 	switch {
 	case v4Only:
 		familyFilter = familyV4
@@ -585,6 +586,7 @@ func printEntries(entries []entry, jsonOutput bool, opts textOptions) error {
 			fmt.Fprintf(w, "%s %s\n", g.CIDR, renderEndpoint(ep, false, opts)) //nolint:errcheck
 		default:
 			fmt.Fprintf(w, "%s\n", g.CIDR) //nolint:errcheck
+
 			for _, ep := range g.Endpoints {
 				fmt.Fprintf(w, "    %s\n", renderEndpoint(ep, true, opts)) //nolint:errcheck
 			}
@@ -644,6 +646,7 @@ func renderEndpoint(ep endpointJSON, asNexthop bool, opts textOptions) string {
 
 	tag := "healthy"
 	color := ansiGreen
+
 	if !ep.Healthy {
 		tag = "unhealthy"
 		color = ansiRed

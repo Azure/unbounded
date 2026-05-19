@@ -150,9 +150,11 @@ func TestProviderExecuteHostReplaceLaunchesDefaultUbuntuReplacement(t *testing.T
 	require.Equal(t, "replace-machine-1", launch.FreeformTags[tagOperation])
 	require.Equal(t, "operation-uid", launch.FreeformTags[tagOperationUID])
 	require.Equal(t, "oci://old-instance", launch.FreeformTags[tagOldProviderID])
+
 	for key := range launch.FreeformTags {
 		require.NotContains(t, key, "/")
 	}
+
 	require.Equal(t, base64.StdEncoding.EncodeToString([]byte("#cloud-config\n")), launch.Metadata["user_data"])
 }
 
@@ -406,6 +408,7 @@ func (c *recordingComputeClient) GetInstance(_ context.Context, instanceID strin
 	if c.getCalls == nil {
 		c.getCalls = map[string]int{}
 	}
+
 	c.getCalls[instanceID]++
 	for i, instance := range c.instances {
 		if instance.Id != nil && *instance.Id == instanceID {

@@ -50,24 +50,29 @@ func (d *enableDaemon) Do(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("resolve current daemon binary symlink: %w", err)
 	}
+
 	if err := agentbinary.EnsureDaemonBinaryLinks(ctx, d.log, paths); err != nil {
 		return err
 	}
 
 	unitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonUnit)
+
 	daemonService, err := renderDaemonAsset("daemon-service", daemonServiceContent)
 	if err != nil {
 		return fmt.Errorf("rendering %s: %w", unitPath, err)
 	}
+
 	if err := writeFile(unitPath, daemonService, 0o644); err != nil {
 		return fmt.Errorf("writing %s: %w", unitPath, err)
 	}
 
 	recoveryUnitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonRecoveryUnit)
+
 	recoveryService, err := renderDaemonAsset("daemon-recovery-service", daemonRecoveryServiceContent)
 	if err != nil {
 		return fmt.Errorf("rendering %s: %w", recoveryUnitPath, err)
 	}
+
 	if err := writeFile(recoveryUnitPath, recoveryService, 0o644); err != nil {
 		return fmt.Errorf("writing %s: %w", recoveryUnitPath, err)
 	}
@@ -76,6 +81,7 @@ func (d *enableDaemon) Do(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("rendering %s: %w", goalstates.DaemonRecoveryScriptPath, err)
 	}
+
 	if err := writeFile(goalstates.DaemonRecoveryScriptPath, recoveryScript, 0o755); err != nil {
 		return fmt.Errorf("writing %s: %w", goalstates.DaemonRecoveryScriptPath, err)
 	}
@@ -181,6 +187,7 @@ func disableAndRemoveDaemonUnit(ctx context.Context, log *slog.Logger) error {
 
 	unitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonUnit)
 	removeFileIfExists(log, unitPath)
+
 	recoveryUnitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonRecoveryUnit)
 	removeFileIfExists(log, recoveryUnitPath)
 	removeFileIfExists(log, goalstates.DaemonRecoveryScriptPath)

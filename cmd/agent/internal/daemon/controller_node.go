@@ -37,6 +37,7 @@ func (r *repaveReconciler) ReconcileRepave(ctx context.Context, _ string) (recon
 
 		return reconcile.Result{}, err
 	}
+
 	if !hasDrift(active.Config, &desiredConfig.AgentConfig) {
 		r.log.Info("repave skipped because no desired configuration drift exists")
 
@@ -70,7 +71,9 @@ func resolveDesiredRepaveConfig(
 	}
 
 	desired := configFromApplied(applied)
+
 	var appliedRef *v1alpha3.MachineConfigurationRefStatus
+
 	if machine.Spec.ConfigurationRef != nil {
 		mcv, err := machineconfigs.ResolveVersionFromRef(ctx, c, machine.Spec.ConfigurationRef)
 		if err != nil {
@@ -132,9 +135,11 @@ func applyMachineConfigurationTemplate(
 		if template.Kubernetes.Version != "" {
 			cfg.Cluster.Version = strings.TrimPrefix(template.Kubernetes.Version, "v")
 		}
+
 		if template.Kubernetes.NodeLabels != nil {
 			cfg.Kubelet.Labels = template.Kubernetes.NodeLabels
 		}
+
 		if template.Kubernetes.RegisterWithTaints != nil {
 			cfg.Kubelet.RegisterWithTaints = taintStrings(template.Kubernetes.RegisterWithTaints)
 		}
@@ -152,6 +157,7 @@ func taintStrings(taints []corev1.Taint) []string {
 		if taint.Value != "" {
 			value += "=" + taint.Value
 		}
+
 		value += ":" + string(taint.Effect)
 		out = append(out, value)
 	}
@@ -167,6 +173,7 @@ func setRepavePendingCondition(machine *v1alpha3.Machine) {
 	status := metav1.ConditionTrue
 	reason := "Pending"
 	message := "Machine has not been repaved with the desired configuration version"
+
 	if machine.Status.Configuration.Name == machine.Spec.ConfigurationRef.Name &&
 		machine.Spec.ConfigurationRef.Version != nil &&
 		machine.Status.Configuration.Version == *machine.Spec.ConfigurationRef.Version {
