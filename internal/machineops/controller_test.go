@@ -52,6 +52,178 @@ func TestMachineOperationReconciler_CompletesSupportedOperation(t *testing.T) {
 	require.Equal(t, metav1.ConditionTrue, cond.Status)
 }
 
+func TestMachineOperationReconciler_ResolvesSiteCredential(t *testing.T) {
+	t.Parallel()
+
+	s := newOperationTestScheme(t)
+	require.NoError(t, corev1.AddToScheme(s))
+
+	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
+	machine.Spec.SiteRef = &unboundedv1alpha3.LocalObjectReference{Name: "site-a"}
+	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReboot)
+	credential := &unboundedv1alpha3.MachineOperationCredential{
+		ObjectMeta: metav1ObjectMeta("site-a-azure"),
+		Spec: unboundedv1alpha3.MachineOperationCredentialSpec{
+			SiteRef:  unboundedv1alpha3.LocalObjectReference{Name: "site-a"},
+			Provider: unboundedv1alpha3.ExternalProviderAzureVM,
+			AuthType: unboundedv1alpha3.MachineOperationAuthServicePrincipalSecret,
+			SecretRef: &unboundedv1alpha3.NamespacedSecretReference{
+				Namespace: "unbounded-kube",
+				Name:      "site-a-azure-sp",
+			},
+		},
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "unbounded-kube", Name: "site-a-azure-sp"},
+		Data: map[string][]byte{
+			"tenantID":     []byte("tenant"),
+			"clientID":     []byte("client"),
+			"clientSecret": []byte("secret"),
+		},
+	}
+	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReboot: true}}
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, credential, secret).WithStatusSubresource(op).Build()
+	reconciler := &MachineOperationReconciler{Client: c, Providers: []Provider{provider}, Now: fixedOperationNow}
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "op-1"}})
+	require.NoError(t, err)
+	require.Equal(t, ctrl.Result{}, result)
+	require.Equal(t, []unboundedv1alpha3.MachineOperationAuthType{unboundedv1alpha3.MachineOperationAuthServicePrincipalSecret}, provider.authTypes)
+	require.Equal(t, "tenant", provider.authData[0]["tenantID"])
+	require.Equal(t, "client", provider.authData[0]["clientID"])
+	require.Equal(t, "secret", provider.authData[0]["clientSecret"])
+}
+
+func TestMachineOperationReconciler_PassesSecretlessCredentialToProvider(t *testing.T) {
+	t.Parallel()
+
+	s := newOperationTestScheme(t)
+	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
+	machine.Spec.SiteRef = &unboundedv1alpha3.LocalObjectReference{Name: "site-a"}
+	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReboot)
+	credential := &unboundedv1alpha3.MachineOperationCredential{
+		ObjectMeta: metav1ObjectMeta("site-a-azure"),
+		Spec: unboundedv1alpha3.MachineOperationCredentialSpec{
+			SiteRef:  unboundedv1alpha3.LocalObjectReference{Name: "site-a"},
+			Provider: unboundedv1alpha3.ExternalProviderAzureVM,
+			AuthType: unboundedv1alpha3.MachineOperationAuthAPIKey,
+		},
+	}
+	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReboot: true}}
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, credential).WithStatusSubresource(op).Build()
+	reconciler := &MachineOperationReconciler{Client: c, Providers: []Provider{provider}, Now: fixedOperationNow}
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "op-1"}})
+	require.NoError(t, err)
+	require.Equal(t, ctrl.Result{}, result)
+	require.Equal(t, []unboundedv1alpha3.MachineOperationAuthType{unboundedv1alpha3.MachineOperationAuthAPIKey}, provider.authTypes)
+	require.Nil(t, provider.authData[0])
+}
+
+func TestMachineOperationReconciler_FailsAmbiguousSiteCredential(t *testing.T) {
+	t.Parallel()
+
+	s := newOperationTestScheme(t)
+	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
+	machine.Spec.SiteRef = &unboundedv1alpha3.LocalObjectReference{Name: "site-a"}
+	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReboot)
+	credentialA := newMachineOperationCredential("cred-a", "site-a", unboundedv1alpha3.ExternalProviderAzureVM)
+	credentialB := newMachineOperationCredential("cred-b", "site-a", unboundedv1alpha3.ExternalProviderAzureVM)
+	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReboot: true}}
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, credentialA, credentialB).WithStatusSubresource(op).Build()
+	reconciler := &MachineOperationReconciler{Client: c, Providers: []Provider{provider}, Now: fixedOperationNow}
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "op-1"}})
+	require.NoError(t, err)
+	require.Equal(t, ctrl.Result{}, result)
+	require.Empty(t, provider.calls)
+
+	var updated unboundedv1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
+	require.Equal(t, unboundedv1alpha3.OperationPhaseFailed, updated.Status.Phase)
+	require.Contains(t, updated.Status.Message, "multiple MachineOperationCredentials")
+
+	cond := apimeta.FindStatusCondition(updated.Status.Conditions, OperationConditionCompleted)
+	require.NotNil(t, cond)
+	require.Equal(t, "AuthAmbiguous", cond.Reason)
+}
+
+func TestMachineOperationReconciler_FailsMissingCredentialSecret(t *testing.T) {
+	t.Parallel()
+
+	s := newOperationTestScheme(t)
+	require.NoError(t, corev1.AddToScheme(s))
+
+	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
+	machine.Spec.SiteRef = &unboundedv1alpha3.LocalObjectReference{Name: "site-a"}
+	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReboot)
+	credential := newMachineOperationCredential("cred-a", "site-a", unboundedv1alpha3.ExternalProviderAzureVM)
+	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReboot: true}}
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, credential).WithStatusSubresource(op).Build()
+	reconciler := &MachineOperationReconciler{Client: c, Providers: []Provider{provider}, Now: fixedOperationNow}
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "op-1"}})
+	require.NoError(t, err)
+	require.Equal(t, ctrl.Result{}, result)
+	require.Empty(t, provider.calls)
+
+	var updated unboundedv1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
+	require.Equal(t, unboundedv1alpha3.OperationPhaseFailed, updated.Status.Phase)
+
+	cond := apimeta.FindStatusCondition(updated.Status.Conditions, OperationConditionCompleted)
+	require.NotNil(t, cond)
+	require.Equal(t, "AuthSecretNotFound", cond.Reason)
+}
+
+func TestMachineOperationReconciler_FailsCredentialSecretOutsideAllowedNamespace(t *testing.T) {
+	t.Parallel()
+
+	s := newOperationTestScheme(t)
+	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
+	machine.Spec.SiteRef = &unboundedv1alpha3.LocalObjectReference{Name: "site-a"}
+	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReboot)
+	credential := newMachineOperationCredential("cred-a", "site-a", unboundedv1alpha3.ExternalProviderAzureVM)
+	credential.Spec.SecretRef.Namespace = "other"
+	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReboot: true}}
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, credential).WithStatusSubresource(op).Build()
+	reconciler := &MachineOperationReconciler{
+		Client:                    c,
+		Providers:                 []Provider{provider},
+		Now:                       fixedOperationNow,
+		CredentialSecretNamespace: "unbounded-kube",
+	}
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "op-1"}})
+	require.NoError(t, err)
+	require.Equal(t, ctrl.Result{}, result)
+	require.Empty(t, provider.calls)
+
+	var updated unboundedv1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
+	require.Equal(t, unboundedv1alpha3.OperationPhaseFailed, updated.Status.Phase)
+
+	cond := apimeta.FindStatusCondition(updated.Status.Conditions, OperationConditionCompleted)
+	require.NotNil(t, cond)
+	require.Equal(t, "AuthSecretForbidden", cond.Reason)
+}
+
+func TestOperationAuthRequiredSecretValuePreservesOpaqueValue(t *testing.T) {
+	t.Parallel()
+
+	auth := &OperationAuth{SecretData: map[string]string{"clientSecret": " secret-with-padding\n"}}
+
+	value, err := auth.RequiredSecretValue("clientSecret")
+
+	require.NoError(t, err)
+	require.Equal(t, " secret-with-padding\n", value)
+}
+
 func TestMachineOperationReconciler_BuildsReplaceUserData(t *testing.T) {
 	t.Parallel()
 
@@ -102,6 +274,33 @@ func TestMachineOperationReconciler_DoesNotReexecuteInProgressOperation(t *testi
 	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReboot: true}}
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op).WithStatusSubresource(op).Build()
+	reconciler := &MachineOperationReconciler{Client: c, Providers: []Provider{provider}, Now: fixedOperationNow}
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "op-1"}})
+	require.NoError(t, err)
+	require.Equal(t, ctrl.Result{}, result)
+	require.Empty(t, provider.calls)
+
+	var updated unboundedv1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
+	require.Equal(t, unboundedv1alpha3.OperationPhaseInProgress, updated.Status.Phase)
+	require.Nil(t, updated.Status.CompletedAt)
+}
+
+func TestMachineOperationReconciler_DoesNotResolveAuthForSkippedInProgressOperation(t *testing.T) {
+	t.Parallel()
+
+	s := newOperationTestScheme(t)
+	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
+	machine.Spec.SiteRef = &unboundedv1alpha3.LocalObjectReference{Name: "site-a"}
+	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReboot)
+	op.Status.Phase = unboundedv1alpha3.OperationPhaseInProgress
+	op.Status.StartedAt = ptrTo(fixedOperationNow())
+	credentialA := newMachineOperationCredential("cred-a", "site-a", unboundedv1alpha3.ExternalProviderAzureVM)
+	credentialB := newMachineOperationCredential("cred-b", "site-a", unboundedv1alpha3.ExternalProviderAzureVM)
+	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReboot: true}}
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, credentialA, credentialB).WithStatusSubresource(op).Build()
 	reconciler := &MachineOperationReconciler{Client: c, Providers: []Provider{provider}, Now: fixedOperationNow}
 
 	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "op-1"}})
@@ -371,6 +570,8 @@ type recordingProvider struct {
 	calls           []string
 	cleanupCalls    []string
 	replaceUserData []string
+	authTypes       []unboundedv1alpha3.MachineOperationAuthType
+	authData        []map[string]string
 	result          OperationResult
 	err             error
 	cleanupErr      error
@@ -388,6 +589,10 @@ func (p *recordingProvider) Execute(_ context.Context, request OperationRequest)
 	p.calls = append(p.calls, fmt.Sprintf("%s:%s:%s", request.Operation, request.Machine.Name, request.ProviderID))
 	if request.ReplaceUserData != "" {
 		p.replaceUserData = append(p.replaceUserData, request.ReplaceUserData)
+	}
+	if request.Auth != nil {
+		p.authTypes = append(p.authTypes, request.Auth.Type)
+		p.authData = append(p.authData, request.Auth.SecretData)
 	}
 
 	return p.result, p.err
@@ -423,6 +628,21 @@ func newExternalMachine(name, provider string) *unboundedv1alpha3.Machine {
 		Spec: unboundedv1alpha3.MachineSpec{
 			Provider:   provider,
 			ProviderID: "azure:///subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/" + name,
+		},
+	}
+}
+
+func newMachineOperationCredential(name, site, provider string) *unboundedv1alpha3.MachineOperationCredential {
+	return &unboundedv1alpha3.MachineOperationCredential{
+		ObjectMeta: metav1ObjectMeta(name),
+		Spec: unboundedv1alpha3.MachineOperationCredentialSpec{
+			SiteRef:  unboundedv1alpha3.LocalObjectReference{Name: site},
+			Provider: provider,
+			AuthType: unboundedv1alpha3.MachineOperationAuthServicePrincipalSecret,
+			SecretRef: &unboundedv1alpha3.NamespacedSecretReference{
+				Namespace: "unbounded-kube",
+				Name:      name,
+			},
 		},
 	}
 }

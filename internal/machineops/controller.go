@@ -38,6 +38,14 @@ type OperationRequest struct {
 	Operation       unboundedv1alpha3.OperationKind
 	Parameters      map[string]string
 	ReplaceUserData string
+	Auth            *OperationAuth
+}
+
+// OperationAuth is the provider-facing credential material resolved for an
+// operation. Provider packages own the interpretation of SecretData.
+type OperationAuth struct {
+	Type       unboundedv1alpha3.MachineOperationAuthType
+	SecretData map[string]string
 }
 
 // OperationResult describes provider-side changes that must be reflected after
@@ -59,18 +67,20 @@ type Provider interface {
 // externally controlled machines.
 type MachineOperationReconciler struct {
 	client.Client
-	Providers               []Provider
-	MaxConcurrentReconciles int
-	Now                     func() metav1.Time
-	ClusterInfo             *ClusterInfo
-	KubeClient              kubernetes.Interface
-	APIServerEndpoint       string
+	Providers                 []Provider
+	MaxConcurrentReconciles   int
+	Now                       func() metav1.Time
+	ClusterInfo               *ClusterInfo
+	KubeClient                kubernetes.Interface
+	APIServerEndpoint         string
+	CredentialSecretNamespace string
 }
 
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machineoperations,verbs=get;list;watch;delete
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machineoperations/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machineoperations/finalizers,verbs=update
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machines,verbs=get;list;watch;patch
+// +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machineoperationcredentials,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=list
 // +kubebuilder:rbac:groups="",resources=configmaps;services;secrets,verbs=get
 // +kubebuilder:rbac:nonResourceURLs=/version,verbs=get
@@ -120,19 +130,19 @@ func (r *MachineOperationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, nil
 	}
 
-	shouldExecute := shouldExecuteOperation(&op)
-	if shouldExecute {
-		if op.Status.Phase != unboundedv1alpha3.OperationPhaseInProgress {
-			if err := r.markInProgress(ctx, &op, fmt.Sprintf("executing %s via %s", op.Spec.OperationKind, providerMatch.provider.Name())); err != nil {
-				return ctrl.Result{}, err
-			}
+	return r.reconcileSupportedOperation(ctx, opKey, &op, &machine, providerMatch)
+}
 
-			if err := r.Get(ctx, opKey, &op); err != nil {
-				return ctrl.Result{}, client.IgnoreNotFound(err)
-			}
-		}
-	}
+func (r *MachineOperationReconciler) reconcileSupportedOperation(
+	ctx context.Context,
+	opKey client.ObjectKey,
+	op *unboundedv1alpha3.MachineOperation,
+	machine *unboundedv1alpha3.Machine,
+	providerMatch providerMatch,
+) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
 
+	shouldExecute := shouldExecuteOperation(op)
 	if !shouldExecute {
 		logger.V(1).Info("operation already in progress, not re-executing external power action",
 			"operation", op.Name,
@@ -142,43 +152,105 @@ func (r *MachineOperationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, nil
 	}
 
-	operationRequest := OperationRequest{
-		Machine:       &machine,
-		OperationName: op.Name,
-		OperationUID:  op.UID,
-		ProviderID:    providerMatch.providerID,
-		Operation:     op.Spec.OperationKind,
-		Parameters:    op.Spec.Parameters,
+	auth, authFailure, err := r.resolveOperationAuth(ctx, machine)
+	if err != nil {
+		return ctrl.Result{}, err
 	}
-	if op.Spec.OperationKind == unboundedv1alpha3.OperationHostReplace {
-		userData, err := r.buildReplaceUserData(ctx, &machine)
-		if err != nil {
-			return r.failOperation(ctx, &op, "BootstrapDataFailed", err.Error())
-		}
+	if authFailure != nil {
+		return r.failOperation(ctx, op, authFailure.Reason, authFailure.Message)
+	}
 
-		operationRequest.ReplaceUserData = userData
+	message := fmt.Sprintf("executing %s via %s", op.Spec.OperationKind, providerMatch.provider.Name())
+	if err := r.ensureOperationInProgress(ctx, opKey, op, message); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	operationRequest, err := r.operationRequest(ctx, op, machine, providerMatch.providerID, auth)
+	if err != nil {
+		return r.failOperation(ctx, op, "BootstrapDataFailed", err.Error())
 	}
 
 	operationResult, err := providerMatch.provider.Execute(ctx, operationRequest)
 	if err != nil {
-		return r.failOperation(ctx, &op, "ExecutionFailed", err.Error())
+		return r.failOperation(ctx, op, "ExecutionFailed", err.Error())
 	}
 
-	if operationResult.ProviderID != "" && operationResult.ProviderID != machine.Spec.ProviderID {
-		updatedGeneration, err := r.updateMachineProviderID(ctx, &machine, operationResult.ProviderID)
+	if err := r.applyOperationResult(ctx, machine, providerMatch, operationRequest, operationResult); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	return r.completeOperation(ctx, op, machine.Generation, fmt.Sprintf("%s completed via %s", op.Spec.OperationKind, providerMatch.provider.Name()))
+}
+
+func (r *MachineOperationReconciler) ensureOperationInProgress(
+	ctx context.Context,
+	opKey client.ObjectKey,
+	op *unboundedv1alpha3.MachineOperation,
+	message string,
+) error {
+	if op.Status.Phase == unboundedv1alpha3.OperationPhaseInProgress {
+		return nil
+	}
+
+	if err := r.markInProgress(ctx, op, message); err != nil {
+		return err
+	}
+
+	return client.IgnoreNotFound(r.Get(ctx, opKey, op))
+}
+
+func (r *MachineOperationReconciler) operationRequest(
+	ctx context.Context,
+	op *unboundedv1alpha3.MachineOperation,
+	machine *unboundedv1alpha3.Machine,
+	providerID string,
+	auth *OperationAuth,
+) (OperationRequest, error) {
+	request := OperationRequest{
+		Machine:       machine,
+		OperationName: op.Name,
+		OperationUID:  op.UID,
+		ProviderID:    providerID,
+		Operation:     op.Spec.OperationKind,
+		Parameters:    op.Spec.Parameters,
+		Auth:          auth,
+	}
+	if op.Spec.OperationKind != unboundedv1alpha3.OperationHostReplace {
+		return request, nil
+	}
+
+	userData, err := r.buildReplaceUserData(ctx, machine)
+	if err != nil {
+		return OperationRequest{}, err
+	}
+
+	request.ReplaceUserData = userData
+
+	return request, nil
+}
+
+func (r *MachineOperationReconciler) applyOperationResult(
+	ctx context.Context,
+	machine *unboundedv1alpha3.Machine,
+	providerMatch providerMatch,
+	request OperationRequest,
+	result OperationResult,
+) error {
+	if result.ProviderID != "" && result.ProviderID != machine.Spec.ProviderID {
+		updatedGeneration, err := r.updateMachineProviderID(ctx, machine, result.ProviderID)
 		if err != nil {
-			return ctrl.Result{}, err
+			return err
 		}
 
-		machine.Spec.ProviderID = operationResult.ProviderID
+		machine.Spec.ProviderID = result.ProviderID
 		machine.Generation = updatedGeneration
 	}
 
-	if err := providerMatch.provider.Cleanup(ctx, operationRequest, operationResult); err != nil {
-		return ctrl.Result{}, fmt.Errorf("cleanup %s via %s: %w", op.Spec.OperationKind, providerMatch.provider.Name(), err)
+	if err := providerMatch.provider.Cleanup(ctx, request, result); err != nil {
+		return fmt.Errorf("cleanup %s via %s: %w", request.Operation, providerMatch.provider.Name(), err)
 	}
 
-	return r.completeOperation(ctx, &op, machine.Generation, fmt.Sprintf("%s completed via %s", op.Spec.OperationKind, providerMatch.provider.Name()))
+	return nil
 }
 
 func (r *MachineOperationReconciler) updateMachineProviderID(ctx context.Context, machine *unboundedv1alpha3.Machine, providerID string) (int64, error) {

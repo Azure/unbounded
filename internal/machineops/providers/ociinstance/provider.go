@@ -66,12 +66,15 @@ type computeClient interface {
 
 type computeClientFactory func() (computeClient, error)
 
+type computeClientFactoryWithAuth func(auth *machineops.OperationAuth) (computeClient, error)
+
 // Provider executes operations against Oracle Cloud Infrastructure instances.
 type Provider struct {
-	ConfigFile    string
-	ConfigProfile string
-	Auth          string
-	NewClient     computeClientFactory
+	ConfigFile        string
+	ConfigProfile     string
+	Auth              string
+	NewClient         computeClientFactory
+	NewClientWithAuth computeClientFactoryWithAuth
 }
 
 func (p *Provider) Name() string {
@@ -96,7 +99,7 @@ func (p *Provider) Execute(ctx context.Context, request machineops.OperationRequ
 		return machineops.OperationResult{}, err
 	}
 
-	client, err := p.client()
+	client, err := p.client(request.Auth)
 	if err != nil {
 		return machineops.OperationResult{}, err
 	}
@@ -132,7 +135,7 @@ func (p *Provider) Cleanup(ctx context.Context, request machineops.OperationRequ
 		}
 	}
 
-	client, err := p.client()
+	client, err := p.client(request.Auth)
 	if err != nil {
 		return err
 	}
@@ -149,13 +152,26 @@ func (p *Provider) Cleanup(ctx context.Context, request machineops.OperationRequ
 	return client.TerminateInstance(ctx, instanceID, retryToken(request, "terminate-old"))
 }
 
-func (p *Provider) client() (computeClient, error) {
-	newClient := p.NewClient
-	if newClient == nil {
-		newClient = p.newDefaultComputeClient
+func (p *Provider) client(auth *machineops.OperationAuth) (computeClient, error) {
+	if p.NewClientWithAuth != nil {
+		client, err := p.NewClientWithAuth(auth)
+		if err != nil {
+			return nil, fmt.Errorf("create OCI compute client: %w", err)
+		}
+
+		return client, nil
 	}
 
-	client, err := newClient()
+	if p.NewClient != nil {
+		client, err := p.NewClient()
+		if err != nil {
+			return nil, fmt.Errorf("create OCI compute client: %w", err)
+		}
+
+		return client, nil
+	}
+
+	client, err := p.newComputeClientForAuth(auth)
 	if err != nil {
 		return nil, fmt.Errorf("create OCI compute client: %w", err)
 	}

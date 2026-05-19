@@ -107,6 +107,75 @@ func TestProviderExecute(t *testing.T) {
 	}
 }
 
+func TestProviderExecutePassesAuthToClientFactory(t *testing.T) {
+	t.Parallel()
+
+	auth := &machineops.OperationAuth{
+		Type: unboundedv1alpha3.MachineOperationAuthServicePrincipalSecret,
+		SecretData: map[string]string{
+			"tenantID":     "tenant",
+			"clientID":     "client",
+			"clientSecret": "secret",
+		},
+	}
+	client := &recordingAzureVMClient{}
+	provider := &Provider{
+		NewClientWithAuth: func(subscriptionID string, gotAuth *machineops.OperationAuth) (azureVMClient, error) {
+			require.Equal(t, "sub", subscriptionID)
+			require.Equal(t, auth, gotAuth)
+			return client, nil
+		},
+	}
+
+	_, err := provider.Execute(context.Background(), machineops.OperationRequest{
+		ProviderID: "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm1",
+		Operation:  unboundedv1alpha3.OperationHostPowerOn,
+		Auth:       auth,
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, []string{"start:rg/vm1"}, client.calls)
+}
+
+func TestNewAzureVMClientValidatesAuth(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		auth    *machineops.OperationAuth
+		wantErr string
+	}{
+		{
+			name: "service principal missing client secret",
+			auth: &machineops.OperationAuth{
+				Type: unboundedv1alpha3.MachineOperationAuthServicePrincipalSecret,
+				SecretData: map[string]string{
+					"tenantID": "tenant",
+					"clientID": "client",
+				},
+			},
+			wantErr: "clientSecret",
+		},
+		{
+			name: "unsupported auth type",
+			auth: &machineops.OperationAuth{
+				Type: unboundedv1alpha3.MachineOperationAuthAPIKey,
+			},
+			wantErr: "unsupported Azure VM auth type",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := newAzureVMClient("sub", tt.auth)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tt.wantErr)
+		})
+	}
+}
+
 func TestProviderExecuteHostReplaceRequiresUserData(t *testing.T) {
 	t.Parallel()
 

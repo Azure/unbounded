@@ -55,6 +55,7 @@ spec:
           args:
             - --leader-elect=true
             - --leader-elect-namespace={{ default "unbounded-kube" .Namespace }}
+            - --credential-secret-namespace={{ default "unbounded-kube" .Namespace }}
             - --max-concurrent-reconciles={{ default "10" .MaxConcurrentReconciles }}
             {{- if .APIServerEndpoint }}
             - --api-server-endpoint={{ .APIServerEndpoint }}

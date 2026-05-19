@@ -140,6 +140,11 @@ type MachineSpec struct {
 	// +optional
 	ProviderID string `json:"providerID,omitempty"`
 
+	// SiteRef identifies the site that contains this machine. Machine operation
+	// controllers use this to resolve site-scoped cloud provider credentials.
+	// +optional
+	SiteRef *LocalObjectReference `json:"siteRef,omitempty"`
+
 	// ConfigurationRef references a MachineConfiguration (and
 	// optionally a specific version) that defines the configuration
 	// profile for this machine. If a specific version is set, that
@@ -438,7 +443,21 @@ type OperationsSpec struct {
 // LocalObjectReference contains enough information to locate the referenced resource.
 type LocalObjectReference struct {
 	// Name of the referenced resource.
+	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`
+}
+
+// NamespacedSecretReference contains enough information to locate a Secret.
+type NamespacedSecretReference struct {
+	// Name of the secret.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+
+	// Namespace of the secret.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Namespace string `json:"namespace"`
 }
 
 // SecretKeySelector selects a key from a Secret.

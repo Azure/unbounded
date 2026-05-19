@@ -51,6 +51,79 @@ func TestProviderExecute(t *testing.T) {
 	}
 }
 
+func TestProviderExecutePassesAuthToClientFactory(t *testing.T) {
+	t.Parallel()
+
+	auth := &machineops.OperationAuth{
+		Type: unboundedv1alpha3.MachineOperationAuthAPIKey,
+		SecretData: map[string]string{
+			"tenancyOCID": "tenancy",
+			"userOCID":    "user",
+			"region":      "us-phoenix-1",
+			"fingerprint": "fingerprint",
+			"privateKey":  "private-key",
+		},
+	}
+	client := &recordingComputeClient{}
+	provider := &Provider{
+		NewClientWithAuth: func(gotAuth *machineops.OperationAuth) (computeClient, error) {
+			require.Equal(t, auth, gotAuth)
+			return client, nil
+		},
+	}
+
+	_, err := provider.Execute(context.Background(), machineops.OperationRequest{
+		ProviderID: "oci://ocid1.instance.oc1.test",
+		Operation:  unboundedv1alpha3.OperationHostPowerOn,
+		Auth:       auth,
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, []string{"START:ocid1.instance.oc1.test"}, client.calls)
+}
+
+func TestNewComputeClientForAuthValidatesAuth(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		auth    *machineops.OperationAuth
+		wantErr string
+	}{
+		{
+			name: "api key missing private key",
+			auth: &machineops.OperationAuth{
+				Type: unboundedv1alpha3.MachineOperationAuthAPIKey,
+				SecretData: map[string]string{
+					"tenancyOCID": "tenancy",
+					"userOCID":    "user",
+					"region":      "us-phoenix-1",
+					"fingerprint": "fingerprint",
+				},
+			},
+			wantErr: "privateKey",
+		},
+		{
+			name: "unsupported auth type",
+			auth: &machineops.OperationAuth{
+				Type: unboundedv1alpha3.MachineOperationAuthServicePrincipalSecret,
+			},
+			wantErr: "unsupported OCI auth type",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			provider := &Provider{}
+			_, err := provider.newComputeClientForAuth(tt.auth)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tt.wantErr)
+		})
+	}
+}
+
 func TestProviderExecuteRequiresProviderID(t *testing.T) {
 	t.Parallel()
 

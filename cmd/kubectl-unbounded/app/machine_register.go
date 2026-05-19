@@ -226,7 +226,8 @@ func (h *machineRegisterHandler) executeAfterValidation(ctx context.Context) err
 					Name: fmt.Sprintf("bootstrap-token-%s", bootstrapToken.ID),
 				},
 			},
-			Agent: h.buildAgentSpec(),
+			SiteRef: &v1alpha3.LocalObjectReference{Name: h.siteName},
+			Agent:   h.buildAgentSpec(),
 		},
 	}
 

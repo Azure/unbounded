@@ -253,6 +253,7 @@ spec:
                     properties:
                       name:
                         description: Name of the referenced resource.
+                        minLength: 1
                         type: string
                     required:
                     - name
@@ -269,6 +270,7 @@ spec:
                     properties:
                       name:
                         description: Name of the referenced resource.
+                        minLength: 1
                         type: string
                     required:
                     - name
@@ -421,6 +423,18 @@ spec:
                     type: object
                 required:
                 - image
+                type: object
+              siteRef:
+                description: |-
+                  SiteRef identifies the site that contains this machine. Machine operation
+                  controllers use this to resolve site-scoped cloud provider credentials.
+                properties:
+                  name:
+                    description: Name of the referenced resource.
+                    minLength: 1
+                    type: string
+                required:
+                - name
                 type: object
               ssh:
                 description: |-

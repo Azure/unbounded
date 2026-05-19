@@ -47,6 +47,7 @@ func main() {
 	cmd.Flags().StringVar(&cfg.probeAddr, "health-probe-bind-address", ":8081", "Address for health probes")
 	cmd.Flags().BoolVar(&cfg.leaderElection, "leader-elect", true, "Enable leader election")
 	cmd.Flags().StringVar(&cfg.leaderElectionNamespace, "leader-elect-namespace", "unbounded-kube", "Namespace for the leader election lease")
+	cmd.Flags().StringVar(&cfg.credentialSecretNamespace, "credential-secret-namespace", "", "Namespace containing MachineOperationCredential referenced Secrets")
 	cmd.Flags().IntVar(&cfg.maxConcurrentReconciles, "max-concurrent-reconciles", 10, "Maximum concurrent MachineOperation reconciles")
 	cmd.Flags().StringVar(&cfg.apiServerEndpoint, "api-server-endpoint", "", "Kubernetes API server endpoint used in host replacement bootstrap config")
 	cmd.Flags().StringVar(&cfg.ociConfigFile, "oci-config-file", "", "Path to OCI config file for OCIInstance operations")
@@ -63,15 +64,16 @@ func main() {
 }
 
 type config struct {
-	metricsAddr             string
-	probeAddr               string
-	leaderElection          bool
-	leaderElectionNamespace string
-	maxConcurrentReconciles int
-	apiServerEndpoint       string
-	ociConfigFile           string
-	ociConfigProfile        string
-	ociAuth                 string
+	metricsAddr               string
+	probeAddr                 string
+	leaderElection            bool
+	leaderElectionNamespace   string
+	credentialSecretNamespace string
+	maxConcurrentReconciles   int
+	apiServerEndpoint         string
+	ociConfigFile             string
+	ociConfigProfile          string
+	ociAuth                   string
 }
 
 func run(ctx context.Context, cfg config) error {
@@ -103,15 +105,21 @@ func run(ctx context.Context, cfg config) error {
 		return fmt.Errorf("create direct client: %w", err)
 	}
 
+	credentialSecretNamespace := cfg.credentialSecretNamespace
+	if credentialSecretNamespace == "" {
+		credentialSecretNamespace = cfg.leaderElectionNamespace
+	}
+
 	if err := (&machineops.MachineOperationReconciler{
 		Client: directClient,
 		Providers: []machineops.Provider{
 			&azurevm.Provider{},
 			&ociinstance.Provider{ConfigFile: cfg.ociConfigFile, ConfigProfile: cfg.ociConfigProfile, Auth: cfg.ociAuth},
 		},
-		MaxConcurrentReconciles: cfg.maxConcurrentReconciles,
-		KubeClient:              kubeClient,
-		APIServerEndpoint:       cfg.apiServerEndpoint,
+		MaxConcurrentReconciles:   cfg.maxConcurrentReconciles,
+		KubeClient:                kubeClient,
+		APIServerEndpoint:         cfg.apiServerEndpoint,
+		CredentialSecretNamespace: credentialSecretNamespace,
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup MachineOperation controller: %w", err)
 	}

@@ -168,7 +168,7 @@ func buildMachineCR(cfg *provision.AgentConfig) v1alpha3.Machine {
 		tokenID = tokenID[:i]
 	}
 
-	return v1alpha3.Machine{
+	machine := v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: cfg.MachineName,
 		},
@@ -182,4 +182,20 @@ func buildMachineCR(cfg *provision.AgentConfig) v1alpha3.Machine {
 			},
 		},
 	}
+
+	if siteName := siteNameFromLabels(cfg.Kubelet.Labels); siteName != "" {
+		machine.Spec.SiteRef = &v1alpha3.LocalObjectReference{Name: siteName}
+	}
+
+	return machine
+}
+
+func siteNameFromLabels(labels map[string]string) string {
+	for _, key := range []string{"net.unbounded-cloud.io/site", "unbounded-cloud.io/site"} {
+		if value := strings.TrimSpace(labels[key]); value != "" {
+			return value
+		}
+	}
+
+	return ""
 }

@@ -827,6 +827,8 @@ func TestMachineRegisterHandler_Execute_WithNodeLabels(t *testing.T) {
 	// The applied YAML should contain the node labels.
 	require.Contains(t, string(appliedData), "kubernetes.azure.com/managed")
 	require.Contains(t, string(appliedData), "env: prod")
+	require.Contains(t, string(appliedData), "siteRef:")
+	require.Contains(t, string(appliedData), "name: dc1")
 }
 
 // TestMachineRegisterHandler_Execute_WithAgentOverrides verifies that the

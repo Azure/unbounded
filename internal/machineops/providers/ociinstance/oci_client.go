@@ -10,7 +10,51 @@ import (
 
 	"github.com/oracle/oci-go-sdk/v65/common"
 	"github.com/oracle/oci-go-sdk/v65/core"
+
+	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/machineops"
 )
+
+func (p *Provider) newComputeClientForAuth(auth *machineops.OperationAuth) (computeClient, error) {
+	if auth == nil || auth.Type == "" {
+		return p.newDefaultComputeClient()
+	}
+
+	switch auth.Type {
+	case unboundedv1alpha3.MachineOperationAuthAPIKey:
+		tenancyOCID, err := auth.RequiredSecretValue("tenancyOCID")
+		if err != nil {
+			return nil, err
+		}
+		userOCID, err := auth.RequiredSecretValue("userOCID")
+		if err != nil {
+			return nil, err
+		}
+		region, err := auth.RequiredSecretValue("region")
+		if err != nil {
+			return nil, err
+		}
+		fingerprint, err := auth.RequiredSecretValue("fingerprint")
+		if err != nil {
+			return nil, err
+		}
+		privateKey, err := auth.RequiredSecretValue("privateKey")
+		if err != nil {
+			return nil, err
+		}
+
+		var passphrase *string
+		if value := strings.TrimSpace(auth.SecretData["privateKeyPassphrase"]); value != "" {
+			passphrase = &value
+		}
+
+		provider := common.NewRawConfigurationProvider(tenancyOCID, userOCID, region, fingerprint, privateKey, passphrase)
+
+		return newComputeClientWithProvider(provider)
+	default:
+		return nil, fmt.Errorf("unsupported OCI auth type %q", auth.Type)
+	}
+}
 
 func (p *Provider) newDefaultComputeClient() (computeClient, error) {
 	// The controller defaults to long-lived API keys but keeps security-token auth
@@ -42,6 +86,10 @@ func (p *Provider) newDefaultComputeClient() (computeClient, error) {
 		return nil, fmt.Errorf("oci auth mode %q requires --oci-config-file", auth)
 	}
 
+	return newComputeClientWithProvider(provider)
+}
+
+func newComputeClientWithProvider(provider common.ConfigurationProvider) (computeClient, error) {
 	computeClient, err := core.NewComputeClientWithConfigurationProvider(provider)
 	if err != nil {
 		return nil, fmt.Errorf("create compute client: %w", err)

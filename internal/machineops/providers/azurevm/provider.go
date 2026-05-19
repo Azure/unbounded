@@ -32,6 +32,8 @@ type azureVMClient interface {
 
 type azureVMClientFactory func(subscriptionID string) (azureVMClient, error)
 
+type azureVMClientFactoryWithAuth func(subscriptionID string, auth *machineops.OperationAuth) (azureVMClient, error)
+
 type azureVMOperation func(context.Context, azureVMClient, azureVMResourceRef) error
 
 var azureVMOperations = map[unboundedv1alpha3.OperationKind]azureVMOperation{
@@ -55,7 +57,8 @@ var azureVMOperations = map[unboundedv1alpha3.OperationKind]azureVMOperation{
 
 // Provider executes operations against Azure virtual machines.
 type Provider struct {
-	NewClient azureVMClientFactory
+	NewClient         azureVMClientFactory
+	NewClientWithAuth azureVMClientFactoryWithAuth
 }
 
 func (p *Provider) Name() string {
@@ -80,12 +83,7 @@ func (p *Provider) Execute(ctx context.Context, request machineops.OperationRequ
 
 	ref.ReplaceUserData = request.ReplaceUserData
 
-	newClient := p.NewClient
-	if newClient == nil {
-		newClient = newDefaultAzureVMClient
-	}
-
-	client, err := newClient(ref.SubscriptionID)
+	client, err := p.client(ref.SubscriptionID, request.Auth)
 	if err != nil {
 		return machineops.OperationResult{}, fmt.Errorf("create Azure VM client: %w", err)
 	}
@@ -95,6 +93,18 @@ func (p *Provider) Execute(ctx context.Context, request machineops.OperationRequ
 
 func (p *Provider) Cleanup(context.Context, machineops.OperationRequest, machineops.OperationResult) error {
 	return nil
+}
+
+func (p *Provider) client(subscriptionID string, auth *machineops.OperationAuth) (azureVMClient, error) {
+	if p.NewClientWithAuth != nil {
+		return p.NewClientWithAuth(subscriptionID, auth)
+	}
+
+	if p.NewClient != nil {
+		return p.NewClient(subscriptionID)
+	}
+
+	return newAzureVMClient(subscriptionID, auth)
 }
 
 type azureVMResourceRef struct {
@@ -146,6 +156,41 @@ func newDefaultAzureVMClient(subscriptionID string) (azureVMClient, error) {
 		return nil, fmt.Errorf("create default Azure credential: %w", err)
 	}
 
+	return newAzureVMClientWithCredential(subscriptionID, cred)
+}
+
+func newAzureVMClient(subscriptionID string, auth *machineops.OperationAuth) (azureVMClient, error) {
+	if auth == nil || auth.Type == "" || auth.Type == unboundedv1alpha3.MachineOperationAuthDefaultAzureCredential {
+		return newDefaultAzureVMClient(subscriptionID)
+	}
+
+	switch auth.Type {
+	case unboundedv1alpha3.MachineOperationAuthServicePrincipalSecret:
+		tenantID, err := auth.RequiredSecretValue("tenantID")
+		if err != nil {
+			return nil, err
+		}
+		clientID, err := auth.RequiredSecretValue("clientID")
+		if err != nil {
+			return nil, err
+		}
+		clientSecret, err := auth.RequiredSecretValue("clientSecret")
+		if err != nil {
+			return nil, err
+		}
+
+		cred, err := azidentity.NewClientSecretCredential(tenantID, clientID, clientSecret, nil)
+		if err != nil {
+			return nil, fmt.Errorf("create Azure service principal credential: %w", err)
+		}
+
+		return newAzureVMClientWithCredential(subscriptionID, cred)
+	default:
+		return nil, fmt.Errorf("unsupported Azure VM auth type %q", auth.Type)
+	}
+}
+
+func newAzureVMClientWithCredential(subscriptionID string, cred azcore.TokenCredential) (azureVMClient, error) {
 	client, err := armcompute.NewVirtualMachinesClient(subscriptionID, cred, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create virtual machines client: %w", err)
