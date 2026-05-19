@@ -2069,6 +2069,48 @@ type nodeStatusServer struct {
 	routingTableCache     RoutingTableInfo
 	routingTableCachedAt  time.Time
 	routingTableDirty     atomic.Bool
+
+	// netlinkOps is the set of netlink-level operations used by
+	// collectRoutingTableFromKernel. Tests inject a fake to feed deterministic
+	// route + link data through the production code path without depending on
+	// the host kernel's actual routing table. Production callers leave this
+	// nil and the helpers fall back to the real netlink package.
+	netlinkOps statusServerNetlinkOps
+}
+
+// statusServerNetlinkOps abstracts the netlink reads that
+// collectRoutingTableFromKernel needs. Real production code uses the
+// netlink package directly via the zero-value fallbacks in the methods
+// below; tests construct a fake that returns canned data.
+type statusServerNetlinkOps interface {
+	RouteList(family int) ([]netlink.Route, error)
+	RouteListFiltered(family, table int) ([]netlink.Route, error)
+	LinkByIndex(index int) (netlink.Link, error)
+}
+
+func (s *nodeStatusServer) routeList(family int) ([]netlink.Route, error) {
+	if s.netlinkOps != nil {
+		return s.netlinkOps.RouteList(family)
+	}
+
+	return netlink.RouteList(nil, family)
+}
+
+func (s *nodeStatusServer) routeListFiltered(family, table int) ([]netlink.Route, error) {
+	if s.netlinkOps != nil {
+		return s.netlinkOps.RouteListFiltered(family, table)
+	}
+
+	return netlink.RouteListFiltered(family,
+		&netlink.Route{Table: table}, netlink.RT_FILTER_TABLE)
+}
+
+func (s *nodeStatusServer) linkByIndex(index int) (netlink.Link, error) {
+	if s.netlinkOps != nil {
+		return s.netlinkOps.LinkByIndex(index)
+	}
+
+	return netlink.LinkByIndex(index)
 }
 
 func (s *nodeStatusServer) handleStatusJSON(w http.ResponseWriter, _ *http.Request) {
@@ -2642,7 +2684,7 @@ func (s *nodeStatusServer) collectRoutingTableFromKernel() RoutingTableInfo {
 				allRoutes = append(allRoutes, mainRoutes...)
 			}
 		} else {
-			mainRoutes, err := netlink.RouteList(nil, family)
+			mainRoutes, err := s.routeList(family)
 			if err != nil {
 				klog.V(4).Infof("Failed to list kernel routes (family %d): %v", family, err)
 			} else {
@@ -2658,8 +2700,7 @@ func (s *nodeStatusServer) collectRoutingTableFromKernel() RoutingTableInfo {
 
 		dedicatedTableID := s.state.routeTableID
 		if dedicatedTableID != 0 && dedicatedTableID != unix.RT_TABLE_MAIN {
-			tableRoutes, tErr := netlink.RouteListFiltered(family,
-				&netlink.Route{Table: dedicatedTableID}, netlink.RT_FILTER_TABLE)
+			tableRoutes, tErr := s.routeListFiltered(family, dedicatedTableID)
 			if tErr != nil {
 				klog.V(4).Infof("Failed to list kernel routes from table %d (family %d): %v",
 					dedicatedTableID, family, tErr)
@@ -2715,7 +2756,7 @@ func (s *nodeStatusServer) collectRoutingTableFromKernel() RoutingTableInfo {
 					if s.state.netlinkCache != nil {
 						link, linkErr = s.state.netlinkCache.LinkByIndex(mp.LinkIndex)
 					} else {
-						link, linkErr = netlink.LinkByIndex(mp.LinkIndex)
+						link, linkErr = s.linkByIndex(mp.LinkIndex)
 					}
 
 					if linkErr != nil || link == nil || link.Attrs() == nil {
@@ -2784,7 +2825,7 @@ func (s *nodeStatusServer) collectRoutingTableFromKernel() RoutingTableInfo {
 			if s.state.netlinkCache != nil {
 				link, linkErr = s.state.netlinkCache.LinkByIndex(r.LinkIndex)
 			} else {
-				link, linkErr = netlink.LinkByIndex(r.LinkIndex)
+				link, linkErr = s.linkByIndex(r.LinkIndex)
 			}
 
 			if linkErr != nil || link == nil || link.Attrs() == nil {
