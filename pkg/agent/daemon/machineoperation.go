@@ -45,15 +45,19 @@ func NewMachinaMachineOperationReconciler(
 	if c == nil {
 		return nil, fmt.Errorf("client is required")
 	}
+
 	if machineName == "" {
 		return nil, fmt.Errorf("machine name is required")
 	}
+
 	if nodeName == "" {
 		return nil, fmt.Errorf("node name is required")
 	}
+
 	if handlers == nil {
 		return nil, fmt.Errorf("machine operation handlers are required")
 	}
+
 	for kind, handler := range handlers {
 		if handler == nil {
 			return nil, fmt.Errorf("machine operation handler %s is required", kind)
@@ -89,6 +93,7 @@ func (r *MachinaMachineOperationReconciler) ReconcileMachineOperation(
 		Name: op.Name,
 		Kind: op.Spec.OperationKind,
 	}
+
 	handler, ok := r.handlers[op.Spec.OperationKind]
 	if !ok {
 		log.FromContext(ctx).Info("failing MachineOperation with no handler", "operation", op.Name, "operationKind", op.Spec.OperationKind)
@@ -169,6 +174,7 @@ func (r *MachinaMachineOperationReconciler) MarkInProgress(ctx context.Context, 
 
 		now := metav1.Now()
 		latest.Status.Phase = machinav1alpha3.OperationPhaseInProgress
+
 		latest.Status.Message = message
 		if latest.Status.StartedAt == nil {
 			latest.Status.StartedAt = &now
@@ -206,6 +212,7 @@ func FinishMachineOperation(ctx context.Context, c client.Client, op MachineOper
 
 		latest.Status.Phase = result.Phase
 		latest.Status.Message = result.Message
+
 		latest.Status.CompletedAt = &now
 		if result.ObservedMachineGeneration > 0 {
 			latest.Status.ObservedMachineGeneration = result.ObservedMachineGeneration

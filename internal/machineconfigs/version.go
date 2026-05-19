@@ -23,6 +23,7 @@ func ResolveVersionFromRef(
 ) (*v1alpha3.MachineConfigurationVersion, error) {
 	if ref.Version != nil {
 		var mcv v1alpha3.MachineConfigurationVersion
+
 		name := v1alpha3.MachineConfigurationVersionName(ref.Name, *ref.Version)
 		if err := c.Get(ctx, client.ObjectKey{Name: name}, &mcv); err != nil {
 			return nil, fmt.Errorf("get MachineConfigurationVersion %s: %w", name, err)

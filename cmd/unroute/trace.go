@@ -82,6 +82,7 @@ func streamTrace(opts textOptions) error {
 	if err := unix.ClockGettime(unix.CLOCK_MONOTONIC, &startTs); err != nil {
 		return fmt.Errorf("read CLOCK_MONOTONIC: %w", err)
 	}
+
 	startKtime := uint64(startTs.Sec)*1_000_000_000 + uint64(startTs.Nsec) //nolint:gosec
 
 	sig := make(chan os.Signal, 1)
@@ -89,12 +90,14 @@ func streamTrace(opts textOptions) error {
 
 	go func() {
 		<-sig
+
 		_ = reader.Close() //nolint:errcheck
 	}()
 
 	fmt.Fprintln(os.Stderr, "unroute: tracing unbounded_encap (Ctrl-C to stop)")
 
 	var dropped uint64
+
 	for {
 		rec, err := reader.Read()
 		if err != nil {
@@ -126,6 +129,7 @@ func streamTrace(opts textOptions) error {
 
 func decodeTraceEvent(buf []byte) (ebpfpkg.RawTraceEvent, error) {
 	var ev ebpfpkg.RawTraceEvent
+
 	expected := binary.Size(ev)
 
 	if len(buf) < expected {
@@ -150,6 +154,7 @@ func printTraceEvent(ev ebpfpkg.RawTraceEvent, opts textOptions) {
 	dev := ""
 	encapProto := ""
 	vni := ""
+
 	if ev.LpmPrefixlen != 0 || ev.NhCount != 0 {
 		chosen := "-"
 		if ev.ChosenIdx >= 0 {
@@ -206,6 +211,7 @@ func hasPorts(ipProto uint8) bool {
 	case 6, 17, 132: // TCP, UDP, SCTP
 		return true
 	}
+
 	return false
 }
 
@@ -232,6 +238,7 @@ func joinHostPort(addr string, port uint16) string {
 	if isIPv6Literal(addr) {
 		return fmt.Sprintf("[%s]:%d", addr, port)
 	}
+
 	return fmt.Sprintf("%s:%d", addr, port)
 }
 
@@ -241,6 +248,7 @@ func isIPv6Literal(s string) bool {
 			return true
 		}
 	}
+
 	return false
 }
 
@@ -253,9 +261,11 @@ func formatTraceAddr(addr16 []byte) string {
 	if bytes.Equal(addr16[:10], zero) && addr16[10] == 0xff && addr16[11] == 0xff {
 		return net.IPv4(addr16[12], addr16[13], addr16[14], addr16[15]).String()
 	}
+
 	if bytes.Equal(addr16, make([]byte, 16)) {
 		return "::"
 	}
+
 	return net.IP(addr16).String()
 }
 
@@ -284,6 +294,7 @@ func verdictString(v int32) string {
 		if v < 0 {
 			return fmt.Sprintf("err(%d)", v)
 		}
+
 		return fmt.Sprintf("%d", v)
 	}
 }
@@ -296,5 +307,6 @@ func formatBPFRet(ret int32, opts textOptions) string {
 	if ret < 0 && opts.useColor {
 		return ansiRed + s + ansiReset
 	}
+
 	return s
 }

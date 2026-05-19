@@ -223,5 +223,6 @@ func TestAgentConfig_BackfillNodeName_UsesHostHostname(t *testing.T) {
 	if nodeName := strings.TrimSpace(hostname); len(validation.IsDNS1123Subdomain(nodeName)) == 0 {
 		want = nodeName
 	}
+
 	assert.Equal(t, want, cfg.NodeName)
 }

@@ -44,10 +44,12 @@ func TestInstallFromTarGzVerifiesInstalledBinary(t *testing.T) {
 			t.Cleanup(server.Close)
 
 			targetPath := filepath.Join(t.TempDir(), "unbounded-agent")
+
 			err := InstallFromTarGz(context.Background(), server.URL, targetPath, "unbounded-agent", 0o755)
 			if tt.wantErr != "" {
 				require.Error(t, err)
 				assert.Contains(t, err.Error(), tt.wantErr)
+
 				return
 			}
 
@@ -119,6 +121,7 @@ func writeTestAgentArchive(w io.Writer, binary []byte) error {
 	}
 
 	_, err := io.Copy(tw, bytes.NewReader(binary))
+
 	return err
 }
 

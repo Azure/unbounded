@@ -310,10 +310,12 @@ func newAgentArchiveSequenceServer(t *testing.T, responses []archiveResponse) *h
 	t.Helper()
 
 	next := 0
+
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		require.Less(t, next, len(responses))
 		response := responses[next]
 		next++
+
 		if response.status != 0 {
 			http.Error(w, "failed", response.status)
 			return
@@ -357,6 +359,7 @@ func writeAgentArchive(w io.Writer, binary []byte) error {
 	}
 
 	_, err := io.Copy(tw, bytes.NewReader(binary))
+
 	return err
 }
 

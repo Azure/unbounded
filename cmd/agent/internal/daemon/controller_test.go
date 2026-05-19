@@ -257,6 +257,7 @@ func TestReconcileAgentUpgrade_Complete(t *testing.T) {
 	assert.Equal(t, v1alpha3.OperationPhaseInProgress, updated.Status.Phase)
 	require.NotNil(t, updated.Status.StartedAt)
 	assert.Nil(t, updated.Status.CompletedAt)
+
 	data, err := os.ReadFile(signalPath)
 	require.NoError(t, err)
 	assert.JSONEq(t, `{"operationName":"op-1","observedMachineGeneration":9}`, string(data))
@@ -364,7 +365,9 @@ func TestPublishAndClearAgentUpgradeSignals_NoSignal(t *testing.T) {
 
 func TestPublishAndClearAgentUpgradeSignals_Failure(t *testing.T) {
 	signalPath := setAgentUpgradeSignalPath(t)
+
 	const rollbackMessage = "rolled back to last good"
+
 	machineOp := &v1alpha3.MachineOperation{
 		ObjectMeta: metav1.ObjectMeta{Name: "op-1"},
 		Spec: v1alpha3.MachineOperationSpec{

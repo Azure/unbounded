@@ -63,6 +63,7 @@ func (t *machineOperationTarget) reconcileAgentUpgrade(ctx context.Context, stor
 	if err != nil {
 		return ctrl.Result{}, store.Finish(ctx, op, daemon.MachineOperationResult[int64]{Phase: v1alpha3.OperationPhaseFailed, Reason: "InvalidParameters", Message: err.Error()})
 	}
+
 	t.log.Info("staging AgentUpgrade binary", "operation", op.Name, "url", downloadURL)
 
 	if err := t.nodeOperator.StageAgentUpgrade(ctx, t.log, downloadURL); err != nil {
@@ -73,6 +74,7 @@ func (t *machineOperationTarget) reconcileAgentUpgrade(ctx context.Context, stor
 	if err != nil {
 		return finishFailedMachineOperation(ctx, store, op, err)
 	}
+
 	if err := signals.RecordPending(op.Name, machine.Generation); err != nil {
 		return finishFailedMachineOperation(ctx, store, op, err)
 	}
@@ -81,6 +83,7 @@ func (t *machineOperationTarget) reconcileAgentUpgrade(ctx context.Context, stor
 		if clearErr := signals.Clear(); clearErr != nil {
 			t.log.Warn("failed to clear AgentUpgrade signal", "error", clearErr)
 		}
+
 		return finishFailedMachineOperation(ctx, store, op, err)
 	}
 
@@ -120,6 +123,7 @@ func finishFailedMachineOperation(ctx context.Context, store daemon.MachineOpera
 		Reason:  "ExecutionFailed",
 		Message: executionErr.Error(),
 	})
+
 	return ctrl.Result{}, err
 }
 
@@ -133,11 +137,13 @@ func publishAndClearAgentUpgradeSignals(ctx context.Context, log *slog.Logger, c
 	if err != nil {
 		return fmt.Errorf("read AgentUpgrade signal: %w", err)
 	}
+
 	switch {
 	case signal == nil:
 		return nil
 	case signal.FailureMessage != "":
 		op := daemon.MachineOperation{Name: signal.OperationName}
+
 		result := daemon.MachineOperationResult[int64]{
 			Phase:   v1alpha3.OperationPhaseFailed,
 			Reason:  "DaemonFailed",
@@ -146,9 +152,11 @@ func publishAndClearAgentUpgradeSignals(ctx context.Context, log *slog.Logger, c
 		if err := daemon.FinishMachineOperation(ctx, c, op, result); err != nil {
 			return err
 		}
+
 		if err := signals.Clear(); err != nil {
 			return fmt.Errorf("remove AgentUpgrade failure signal: %w", err)
 		}
+
 		log.Info("published AgentUpgrade daemon failure signal", "operation", signal.OperationName)
 	default:
 		if err := daemon.FinishMachineOperation(
@@ -164,9 +172,11 @@ func publishAndClearAgentUpgradeSignals(ctx context.Context, log *slog.Logger, c
 		); err != nil {
 			return err
 		}
+
 		if err := signals.Clear(); err != nil {
 			log.Warn("failed to clear AgentUpgrade signal", "error", err)
 		}
+
 		log.Info("published AgentUpgrade success signal", "operation", signal.OperationName)
 	}
 

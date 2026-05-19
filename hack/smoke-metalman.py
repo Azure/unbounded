@@ -245,6 +245,9 @@ def collect_debug_logs() -> None:
             log(f"  (failed to collect {label}: {e})")
 
     # Kubernetes-side diagnostics (run from the host via kubectl).
+    # These commands survive the QEMU guest agent dying inside the VM, which
+    # is critical because the in-guest collectors above frequently fail with
+    # "Guest agent is not responding" by the time the test gives up.
     k8s_commands = [
         ("kubectl describe node", [KUBECTL, "describe", "node", NODE_NAME]),
         ("kubectl get pods -A", [KUBECTL, "get", "pods", "-A", "-o", "wide"]),
@@ -252,6 +255,22 @@ def collect_debug_logs() -> None:
             KUBECTL, "get", "events", "-A", "--sort-by=.lastTimestamp",
         ]),
     ]
+    # Logs from system pods scheduled on the smoke-node kubelet. kindnet and
+    # kube-proxy crashing in CrashLoopBackOff is the most common failure mode
+    # seen in CI; capturing both the current and previous container logs is
+    # what makes the failure diagnosable after the fact.
+    node_pod_labels = [
+        ("kindnet", "app=kindnet"),
+        ("kube-proxy", "k8s-app=kube-proxy"),
+    ]
+    for name, selector in node_pod_labels:
+        k8s_commands.append((
+            f"kubectl get {name} pods on smoke-node",
+            [KUBECTL, "-n", "kube-system", "get", "pods",
+             "-l", selector,
+             "--field-selector", f"spec.nodeName={NODE_NAME}",
+             "-o", "wide"],
+        ))
     for label, cmd in k8s_commands:
         log(f"  --- {label} ---")
         try:
@@ -266,6 +285,48 @@ def collect_debug_logs() -> None:
                 sys.stderr.flush()
         except Exception as e:
             log(f"  (failed to collect {label}: {e})")
+
+    # For each system pod scheduled on smoke-node, also dump per-pod
+    # describe, current container logs, and previous (crashed) container
+    # logs. The previous logs are usually the only place that records why
+    # kindnet exited.
+    for name, selector in node_pod_labels:
+        try:
+            result = subprocess.run(
+                [KUBECTL, "-n", "kube-system", "get", "pods",
+                 "-l", selector,
+                 "--field-selector", f"spec.nodeName={NODE_NAME}",
+                 "-o", "jsonpath={.items[*].metadata.name}"],
+                capture_output=True, text=True, timeout=15,
+            )
+            pod_names = result.stdout.split() if result.returncode == 0 else []
+        except Exception as e:
+            log(f"  (failed to list {name} pods: {e})")
+            continue
+        for pod in pod_names:
+            for label, cmd in (
+                (f"kubectl describe pod {pod}",
+                 [KUBECTL, "-n", "kube-system", "describe", "pod", pod]),
+                (f"kubectl logs {pod}",
+                 [KUBECTL, "-n", "kube-system", "logs", pod,
+                  "--all-containers=true", "--tail=200"]),
+                (f"kubectl logs --previous {pod}",
+                 [KUBECTL, "-n", "kube-system", "logs", pod,
+                  "--all-containers=true", "--previous", "--tail=200"]),
+            ):
+                log(f"  --- {label} ---")
+                try:
+                    result = subprocess.run(
+                        cmd, capture_output=True, text=True, timeout=15,
+                    )
+                    if result.stdout:
+                        sys.stderr.write(result.stdout)
+                        sys.stderr.flush()
+                    if result.stderr:
+                        sys.stderr.write(result.stderr)
+                        sys.stderr.flush()
+                except Exception as e:
+                    log(f"  (failed to collect {label}: {e})")
 
     log("  --- end debug logs ---")
 

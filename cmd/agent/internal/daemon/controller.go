@@ -87,6 +87,7 @@ func runController(
 	if err != nil {
 		return fmt.Errorf("create MachineOperation reconciler: %w", err)
 	}
+
 	repaveReconciler := &repaveReconciler{
 		Client:       c,
 		log:          log,
@@ -105,6 +106,7 @@ func runController(
 	}
 
 	err = mgr.Start(ctx)
+
 	log.Info("daemon shutting down")
 
 	return err

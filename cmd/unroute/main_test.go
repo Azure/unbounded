@@ -48,6 +48,7 @@ func TestFormatKey(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			key := ebpfpkg.LpmKey{Prefixlen: tc.prefix, Addr: tc.addr}
+
 			got := formatKey(key)
 			if got != tc.want {
 				t.Errorf("formatKey: got %q, want %q", got, tc.want)
@@ -283,12 +284,14 @@ func TestRenderEndpoint(t *testing.T) {
 	}
 
 	ep.Healthy = false
+
 	got = renderEndpoint(ep, false, textOptions{})
 	if !strings.HasSuffix(got, " unhealthy") {
 		t.Errorf("unhealthy render should end with ' unhealthy': %q", got)
 	}
 
 	ep.Healthy = true
+
 	got = renderEndpoint(ep, false, textOptions{useColor: true})
 	if !strings.HasSuffix(got, "\x1b[32mhealthy\x1b[0m") {
 		t.Errorf("colored healthy tag wrong: %q", got)
@@ -299,6 +302,7 @@ func TestRenderEndpoint(t *testing.T) {
 	}
 
 	ep.Healthy = false
+
 	got = renderEndpoint(ep, true, textOptions{useColor: true})
 	if !strings.HasSuffix(got, "\x1b[31munhealthy\x1b[0m") {
 		t.Errorf("colored unhealthy tag wrong: %q", got)
