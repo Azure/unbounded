@@ -72,7 +72,7 @@ CARGO ?= cargo
 # We build a pinned version from source into a project-local prefix; the
 # unbounded-storage build.rs honours $MERCURY_PKG_CONFIG_PATH so it picks up
 # our local install ahead of any system copy.
-MERCURY_VERSION ?= v2.3.1
+MERCURY_VERSION ?= v2.4.1
 MERCURY_PREFIX  ?= $(CURDIR)/tmp/mercury-prefix
 MERCURY_SRC     ?= $(CURDIR)/tmp/mercury-src
 MERCURY_PC_FILE := $(MERCURY_PREFIX)/lib/pkgconfig/mercury.pc
