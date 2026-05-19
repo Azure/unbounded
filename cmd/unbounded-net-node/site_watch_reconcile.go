@@ -1722,11 +1722,8 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 		routes := mergeGatewayNodeAdvertisedRoutes(localRoutes, gatewayPeers, selectedPoolName)
 
 		summary := gatewayAdvertSummary{
-			state:            "active",
-			pool:             selectedPoolName,
-			localRouteCount:  len(localRoutes),
-			mergedRouteCount: len(routes),
-			assignmentCount:  len(assignments),
+			state: "active",
+			hash:  gatewayAdvertHashActive(selectedPoolName, localRoutes, routes, len(assignments)),
 		}
 		if summary != state.lastGatewayAdvertSummary {
 			klog.V(2).Infof("Gateway route advertisement: pool=%s, %d local + %d merged routes, %d assignments",
@@ -1740,9 +1737,8 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 		}
 	} else if isGatewayNode {
 		summary := gatewayAdvertSummary{
-			state:            "skipped",
-			hasDynamicClient: dynamicClient != nil,
-			localPoolCount:   len(localGatewayPools),
+			state: "skipped",
+			hash:  gatewayAdvertHashSkipped(dynamicClient != nil, localGatewayPools),
 		}
 		if summary != state.lastGatewayAdvertSummary {
 			klog.V(2).Infof("Gateway route advertisement skipped: dynamicClient=%v, localGatewayPools=%v",

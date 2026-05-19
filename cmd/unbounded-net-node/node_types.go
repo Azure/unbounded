@@ -152,26 +152,23 @@ type wireGuardState struct {
 	lastConfigProblemsLogSignature string
 }
 
-// gatewayAdvertSummary captures the inputs and counts of one Gateway
-// route-advertisement publish. We dedupe the periodic log line by
-// comparing successive summaries; logging happens only when the
-// summary changes (or when the publish path transitions between the
-// happy path and the "skipped" branch). The pool name + counts are
-// enough to identify any meaningful change; route-set diffs always
-// show up as a count difference. Empty (zero-value) means "no
-// advertisement has been logged yet by this process", so the next
-// publish (skipped or otherwise) will always emit.
+// gatewayAdvertSummary captures the content of one Gateway route-
+// advertisement publish via a sha256 of a canonical JSON form of the
+// inputs. We dedupe the periodic log line by comparing successive
+// summaries; logging happens only when the summary changes (e.g. when
+// the pool the node is in changes, an assignment is added/removed, an
+// upstream advertised route changes, or the publish path transitions
+// between the happy path and the "skipped" branch). The zero value
+// means "no advertisement has been logged yet by this process", so the
+// next publish (skipped or otherwise) will always emit.
 type gatewayAdvertSummary struct {
 	// state is "" (zero-value, no log emitted yet), "active" (we logged
 	// a publish summary), or "skipped" (we logged the skipped branch).
-	state            string
-	pool             string
-	localRouteCount  int
-	mergedRouteCount int
-	assignmentCount  int
-	// skipped-branch dedupe data
-	hasDynamicClient bool
-	localPoolCount   int
+	state string
+	// hash is sha256-hex of a canonical JSON encoding of the inputs to
+	// the publish branch this summary covers. Two summaries with the
+	// same hash describe an identical advertisement.
+	hash string
 }
 
 // gatewayPeerInfo contains information about a gateway peer for inter-site routing
