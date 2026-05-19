@@ -1047,7 +1047,7 @@ func filterPeersByTunnelProtocol(meshPeers []meshPeerInfo, gatewayPeers []gatewa
 func cleanupStaleFlowBasedTunnels(cfg *config) {
 	links, err := netlink.LinkList()
 	if err != nil {
-		klog.V(2).Infof("eBPF: failed to list links for stale-tunnel sweep: %v", err)
+		klog.Warningf("eBPF: failed to list links for stale-tunnel sweep; stale GENEVE/VXLAN devices from a previous --geneve-interface / --vxlan-interface value will be left in place: %v", err)
 		return
 	}
 

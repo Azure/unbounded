@@ -691,7 +691,7 @@ func removeUnmanagedWireGuardInterfaces(cfg *config, state *wireGuardState, desi
 func removeStaleWireGuardInterfaces(cfg *config) {
 	wgClient, err := wgctrl.New()
 	if err != nil {
-		klog.V(2).Infof("WireGuard: failed to open wgctrl for stale-prefix sweep: %v", err)
+		klog.Warningf("WireGuard: failed to open wgctrl for stale-prefix sweep; stale devices from a previous --wireguard-interface-prefix value will be left in place and may block port binding: %v", err)
 		return
 	}
 
@@ -703,7 +703,7 @@ func removeStaleWireGuardInterfaces(cfg *config) {
 
 	links, err := netlink.LinkList()
 	if err != nil {
-		klog.V(2).Infof("WireGuard: failed to list links for stale-prefix sweep: %v", err)
+		klog.Warningf("WireGuard: failed to list links for stale-prefix sweep; stale devices from a previous --wireguard-interface-prefix value will be left in place and may block port binding: %v", err)
 		return
 	}
 
@@ -716,7 +716,7 @@ func removeStaleWireGuardInterfaces(cfg *config) {
 
 		dev, err := wgClient.Device(name)
 		if err != nil {
-			klog.V(2).Infof("WireGuard: failed to query device %s for stale-prefix sweep: %v", name, err)
+			klog.Warningf("WireGuard: failed to query device %s via wgctrl; skipping for stale-prefix sweep (a stale device on this name may remain): %v", name, err)
 			continue
 		}
 
