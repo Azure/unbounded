@@ -13,19 +13,20 @@ import (
 )
 
 // routeKind classifies route type in the same spirit as the UI.
-func routeKind(destination string, hop statusv1alpha1.NextHop) string {
+func routeKind(destination string, hop statusv1alpha1.NextHop, ifaceNames tunnelInterfaceNames) string {
 	dest := strings.TrimSpace(destination)
-	dev := strings.ToLower(strings.TrimSpace(hop.Device))
+	dev := strings.TrimSpace(hop.Device)
 
 	if dest == "169.254.169.254/32" {
 		return "IMDS"
 	}
 
-	if strings.HasPrefix(dev, "lo") || strings.HasPrefix(dev, "eth") || strings.HasPrefix(dev, "ens") || strings.HasPrefix(dev, "enp") {
+	lower := strings.ToLower(dev)
+	if strings.HasPrefix(lower, "lo") || strings.HasPrefix(lower, "eth") || strings.HasPrefix(lower, "ens") || strings.HasPrefix(lower, "enp") {
 		return "Local"
 	}
 
-	if isTunnelDevice(dev) {
+	if isTunnelDevice(dev, ifaceNames) {
 		if strings.HasSuffix(dest, "/32") || strings.HasSuffix(dest, "/128") {
 			return "Tunnel peer"
 		}
@@ -36,13 +37,27 @@ func routeKind(destination string, hop statusv1alpha1.NextHop) string {
 	return "Other"
 }
 
-// isTunnelDevice returns true for any managed tunnel interface:
-// WireGuard (wg*), GENEVE (gn*), VXLAN (vxlan*), and IPIP (ipip*).
-func isTunnelDevice(dev string) bool {
-	return strings.HasPrefix(dev, "wg") ||
-		strings.HasPrefix(dev, "gn") ||
-		strings.HasPrefix(dev, "vxlan") ||
-		strings.HasPrefix(dev, "ipip")
+// isTunnelDevice returns true for any managed tunnel interface created by
+// the unbounded-net node agent: a per-port WireGuard device
+// (HasPrefix(ifaceNames.WireGuardPrefix)) or one of the three shared
+// flow-based tunnel devices (Geneve/VXLAN/IPIP, exact-match on the
+// configured names).
+func isTunnelDevice(dev string, ifaceNames tunnelInterfaceNames) bool {
+	dev = strings.TrimSpace(dev)
+	if dev == "" {
+		return false
+	}
+
+	if ifaceNames.WireGuardPrefix != "" && strings.HasPrefix(dev, ifaceNames.WireGuardPrefix) {
+		return true
+	}
+
+	switch dev {
+	case ifaceNames.Geneve, ifaceNames.VXLAN, ifaceNames.IPIP:
+		return dev != ""
+	}
+
+	return false
 }
 
 // isTunnelKind reports whether the route kind is a managed tunnel route.

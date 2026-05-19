@@ -76,7 +76,7 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 		_ = unboundednetnetlink.RemoveIPRule(cfg.RouteTableID, 32765, 0, 0) //nolint:errcheck
 	}
 
-	routeManager := unboundednetnetlink.NewUnifiedRouteManager(wireGuardInterfaceName(cfg, cfg.WireGuardPort), 0, cfg.WireGuardInterfacePrefix)
+	routeManager := unboundednetnetlink.NewUnifiedRouteManager(wireGuardInterfaceName(cfg, cfg.WireGuardPort), 0, cfg.WireGuardInterfacePrefix, unbounded0DeviceName)
 	routeManager.SetNetlinkCache(netlinkCache)
 	state.routeManager = routeManager
 	state.routeTableID = cfg.RouteTableID
@@ -166,7 +166,7 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 	// This prevents pods (with 1500-byte veth MTU) from advertising an MSS that
 	// exceeds the WireGuard tunnel MTU, which would cause silent drops of large
 	// TCP responses (e.g., TLS ServerHello) at gateway forwarding hops.
-	mssClampMgr, err := unboundednetnetlink.NewMSSClampManager()
+	mssClampMgr, err := unboundednetnetlink.NewMSSClampManager(cfg.WireGuardInterfacePrefix)
 	if err != nil {
 		klog.Warningf("Failed to create MSS clamp manager (MSS clamping will be disabled): %v", err)
 	} else {

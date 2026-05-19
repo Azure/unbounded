@@ -86,8 +86,15 @@ type UnifiedRouteManager struct {
 
 	// wgPrefix is the configured WireGuard interface prefix (e.g. "wg").
 	// Used by the orphan-route cleanup scan to identify routes pointing at
-	// per-port WireGuard devices vs other kernel routes.
+	// per-port WireGuard devices vs other kernel routes. Must be non-empty;
+	// the caller is required to supply it.
 	wgPrefix string
+
+	// dummyDeviceName is the name of the eBPF dummy device used by the
+	// agent (currently always "unbounded0"). Routes via this device are
+	// preserved by the orphan-route cleanup scan. Must be non-empty; the
+	// caller is required to supply it.
+	dummyDeviceName string
 
 	// defaultTable is the routing table ID used for routes that do not
 	// specify an explicit Table (i.e. Table==0 in DesiredRoute). When set
@@ -115,27 +122,35 @@ type UnifiedRouteManager struct {
 	netlinkCache *NetlinkCache
 }
 
-// NewUnifiedRouteManager creates a new route manager. linkName is the primary
-// interface used for metrics labelling; actual route interfaces come from each
-// DesiredNexthop.LinkIndex. defaultTable is the routing table ID used for
-// routes whose Table field is 0; pass 0 to use the main table (254) for
-// backward compatibility. wgPrefix is the per-port WireGuard interface
-// name prefix (e.g. "wg") used by the orphan-route cleanup scan to match
-// kernel routes pointing at managed WireGuard devices; pass "" to default
-// to "wg".
-func NewUnifiedRouteManager(linkName string, defaultTable int, wgPrefix string) *UnifiedRouteManager {
+// NewUnifiedRouteManager creates a new route manager.
+//
+// linkName is the primary interface used for metrics labelling; actual
+// route interfaces come from each DesiredNexthop.LinkIndex.
+//
+// defaultTable is the routing table ID used for routes whose Table field
+// is 0; pass 0 to use the main table (254) for backward compatibility.
+//
+// wgPrefix is the per-port WireGuard interface name prefix (typically
+// the operator-configurable cfg.WireGuardInterfacePrefix, e.g. "wg" by
+// default). Used by the orphan-route cleanup scan to match kernel routes
+// pointing at managed WireGuard devices.
+//
+// dummyDeviceName is the name of the agent's eBPF dummy device
+// (typically the unbounded0DeviceName constant). Routes via this device
+// are preserved by the orphan-route cleanup scan.
+//
+// Both wgPrefix and dummyDeviceName must be non-empty; the caller is
+// responsible for supplying the values from the merged runtime config.
+func NewUnifiedRouteManager(linkName string, defaultTable int, wgPrefix, dummyDeviceName string) *UnifiedRouteManager {
 	effectiveTable := defaultTable
 	if effectiveTable == 0 {
 		effectiveTable = unix.RT_TABLE_MAIN
 	}
 
-	if wgPrefix == "" {
-		wgPrefix = "wg"
-	}
-
 	m := &UnifiedRouteManager{
 		linkName:        linkName,
 		wgPrefix:        wgPrefix,
+		dummyDeviceName: dummyDeviceName,
 		defaultTable:    effectiveTable,
 		nexthops:        make(map[string]*nexthopState),
 		nexthopIDs:      make(map[uint32]string),
@@ -921,7 +936,7 @@ func (m *UnifiedRouteManager) cleanupOrphanedKernelRoutes(desiredSet map[string]
 					continue
 				}
 
-				if !strings.HasPrefix(link.Attrs().Name, m.wgPrefix) && link.Attrs().Name != "unbounded0" {
+				if !strings.HasPrefix(link.Attrs().Name, m.wgPrefix) && link.Attrs().Name != m.dummyDeviceName {
 					continue
 				}
 			} else if len(r.MultiPath) > 0 {
@@ -943,7 +958,7 @@ func (m *UnifiedRouteManager) cleanupOrphanedKernelRoutes(desiredSet map[string]
 						continue
 					}
 
-					if strings.HasPrefix(link.Attrs().Name, m.wgPrefix) || link.Attrs().Name == "unbounded0" {
+					if strings.HasPrefix(link.Attrs().Name, m.wgPrefix) || link.Attrs().Name == m.dummyDeviceName {
 						hasWG = true
 						break
 					}

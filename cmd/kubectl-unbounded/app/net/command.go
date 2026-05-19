@@ -76,12 +76,36 @@ var symlinkCreateNames = []string{
 // pluginRuntime carries shared clients and config behavior for all commands.
 type pluginRuntime struct {
 	configFlags *genericclioptions.ConfigFlags
+
+	// interfaceNames captures the tunnel-interface naming the target
+	// cluster's node agents are configured with. Defaults match the
+	// agent defaults; override on the command line when running against
+	// a cluster that uses non-default --geneve-interface /
+	// --vxlan-interface / --ipip-interface / --wireguard-interface-prefix
+	// values. Used by display helpers (e.g. routeKind) so route rows are
+	// classified correctly.
+	interfaceNames tunnelInterfaceNames
+}
+
+// tunnelInterfaceNames matches the node agent's tunnel-interface
+// configuration surface for display purposes.
+type tunnelInterfaceNames struct {
+	WireGuardPrefix string
+	Geneve          string
+	VXLAN           string
+	IPIP            string
 }
 
 // newPluginRuntime creates the shared runtime with kubectl-compatible config flags.
 func newPluginRuntime() *pluginRuntime {
 	return &pluginRuntime{
 		configFlags: genericclioptions.NewConfigFlags(true),
+		interfaceNames: tunnelInterfaceNames{
+			WireGuardPrefix: "wg",
+			Geneve:          "geneve0",
+			VXLAN:           "vxlan0",
+			IPIP:            "ipip0",
+		},
 	}
 }
 
@@ -177,6 +201,10 @@ func Command() *cobra.Command {
 	}
 
 	rt.configFlags.AddFlags(cmd.PersistentFlags())
+	cmd.PersistentFlags().StringVar(&rt.interfaceNames.WireGuardPrefix, "wireguard-interface-prefix", rt.interfaceNames.WireGuardPrefix, "WireGuard interface name prefix the cluster's node agents are configured with")
+	cmd.PersistentFlags().StringVar(&rt.interfaceNames.Geneve, "geneve-interface", rt.interfaceNames.Geneve, "GENEVE interface name the cluster's node agents are configured with")
+	cmd.PersistentFlags().StringVar(&rt.interfaceNames.VXLAN, "vxlan-interface", rt.interfaceNames.VXLAN, "VXLAN interface name the cluster's node agents are configured with")
+	cmd.PersistentFlags().StringVar(&rt.interfaceNames.IPIP, "ipip-interface", rt.interfaceNames.IPIP, "IPIP interface name the cluster's node agents are configured with")
 	cmd.AddCommand(newCreateRootCommand(rt))
 	cmd.AddCommand(newControllerRootCommand(rt))
 	cmd.AddCommand(newDashboardCommand(rt))

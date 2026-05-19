@@ -215,7 +215,7 @@ func TestIsLinkScopeRoute_Empty(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestRouteKey_MainTable(t *testing.T) {
-	m := NewUnifiedRouteManager("test", 0, "wg")
+	m := NewUnifiedRouteManager("test", 0, "wg", "unbounded0")
 	_, prefix, _ := net.ParseCIDR("10.0.0.0/24")
 	key := m.routeKey(0, *prefix)
 
@@ -226,7 +226,7 @@ func TestRouteKey_MainTable(t *testing.T) {
 }
 
 func TestRouteKey_CustomTable(t *testing.T) {
-	m := NewUnifiedRouteManager("test", 0, "wg")
+	m := NewUnifiedRouteManager("test", 0, "wg", "unbounded0")
 	_, prefix, _ := net.ParseCIDR("fd00::/64")
 	key := m.routeKey(1001, *prefix)
 
@@ -237,7 +237,7 @@ func TestRouteKey_CustomTable(t *testing.T) {
 }
 
 func TestRouteKey_ExplicitMainTable(t *testing.T) {
-	m := NewUnifiedRouteManager("test", 0, "wg")
+	m := NewUnifiedRouteManager("test", 0, "wg", "unbounded0")
 	_, prefix, _ := net.ParseCIDR("192.168.0.0/16")
 	key := m.routeKey(254, *prefix)
 
@@ -248,7 +248,7 @@ func TestRouteKey_ExplicitMainTable(t *testing.T) {
 }
 
 func TestRouteKey_DedicatedDefaultTable(t *testing.T) {
-	m := NewUnifiedRouteManager("test", 500, "wg")
+	m := NewUnifiedRouteManager("test", 500, "wg", "unbounded0")
 	_, prefix, _ := net.ParseCIDR("10.0.0.0/24")
 	// Table==0 should resolve to the dedicated default table, not main.
 	key := m.routeKey(0, *prefix)
@@ -324,7 +324,7 @@ func TestRouteReferencesPeer_NotFound(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestNewUnifiedRouteManager(t *testing.T) {
-	m := NewUnifiedRouteManager("test-iface", 0, "wg")
+	m := NewUnifiedRouteManager("test-iface", 0, "wg", "unbounded0")
 	if m == nil {
 		t.Fatal("expected non-nil manager")
 	}
@@ -347,7 +347,7 @@ func TestNewUnifiedRouteManager(t *testing.T) {
 }
 
 func TestNewUnifiedRouteManager_DedicatedTable(t *testing.T) {
-	m := NewUnifiedRouteManager("test-iface", 500, "wg")
+	m := NewUnifiedRouteManager("test-iface", 500, "wg", "unbounded0")
 	if m == nil {
 		t.Fatal("expected non-nil manager")
 	}
@@ -362,7 +362,7 @@ func TestNewUnifiedRouteManager_DedicatedTable(t *testing.T) {
 }
 
 func TestEffectiveTable(t *testing.T) {
-	m := NewUnifiedRouteManager("test", 500, "wg")
+	m := NewUnifiedRouteManager("test", 500, "wg", "unbounded0")
 
 	// Table==0 should resolve to defaultTable.
 	if got := m.effectiveTable(0); got != 500 {
@@ -385,7 +385,7 @@ func TestIsDedicatedTable(t *testing.T) {
 		{51820, true},
 	}
 	for _, tt := range tests {
-		m := NewUnifiedRouteManager("test", tt.table, "wg")
+		m := NewUnifiedRouteManager("test", tt.table, "wg", "unbounded0")
 		if got := m.isDedicatedTable(); got != tt.want {
 			t.Errorf("NewUnifiedRouteManager(_, %d).isDedicatedTable() = %v, want %v", tt.table, got, tt.want)
 		}
@@ -393,7 +393,7 @@ func TestIsDedicatedTable(t *testing.T) {
 }
 
 func TestPeerNexthopID_Deterministic(t *testing.T) {
-	m := NewUnifiedRouteManager("test", 0, "wg")
+	m := NewUnifiedRouteManager("test", 0, "wg", "unbounded0")
 	id1 := m.peerNexthopID("peer-a")
 
 	id2 := m.peerNexthopID("peer-a")
@@ -407,7 +407,7 @@ func TestPeerNexthopID_Deterministic(t *testing.T) {
 }
 
 func TestPeerNexthopID_CollisionHandling(t *testing.T) {
-	m := NewUnifiedRouteManager("test", 0, "wg")
+	m := NewUnifiedRouteManager("test", 0, "wg", "unbounded0")
 
 	// Allocate a nexthop for peer-a
 	idA := m.peerNexthopID("peer-a")
@@ -428,7 +428,7 @@ func TestPeerNexthopID_CollisionHandling(t *testing.T) {
 }
 
 func TestEnsureNexthop_NewAndUpdate(t *testing.T) {
-	m := NewUnifiedRouteManager("test", 0, "wg")
+	m := NewUnifiedRouteManager("test", 0, "wg", "unbounded0")
 
 	nh := DesiredNexthop{PeerID: "peer-a", LinkIndex: 5, Gateway: net.ParseIP("10.0.0.1")}
 
@@ -460,7 +460,7 @@ func TestEnsureNexthop_NewAndUpdate(t *testing.T) {
 }
 
 func TestRouteNeedsUpdate_NoChange(t *testing.T) {
-	m := NewUnifiedRouteManager("test", 0, "wg")
+	m := NewUnifiedRouteManager("test", 0, "wg", "unbounded0")
 
 	installed := &installedRouteState{
 		metric: 100,
@@ -478,7 +478,7 @@ func TestRouteNeedsUpdate_NoChange(t *testing.T) {
 }
 
 func TestRouteNeedsUpdate_MetricChanged(t *testing.T) {
-	m := NewUnifiedRouteManager("test", 0, "wg")
+	m := NewUnifiedRouteManager("test", 0, "wg", "unbounded0")
 
 	installed := &installedRouteState{metric: 100, mtu: 1400, peerNexthops: map[string]DesiredNexthop{}}
 	desired := DesiredRoute{Metric: 200, MTU: 1400}
@@ -489,7 +489,7 @@ func TestRouteNeedsUpdate_MetricChanged(t *testing.T) {
 }
 
 func TestRouteNeedsUpdate_MTUChanged(t *testing.T) {
-	m := NewUnifiedRouteManager("test", 0, "wg")
+	m := NewUnifiedRouteManager("test", 0, "wg", "unbounded0")
 
 	installed := &installedRouteState{metric: 100, mtu: 1400, peerNexthops: map[string]DesiredNexthop{}}
 	desired := DesiredRoute{Metric: 100, MTU: 1500}
@@ -500,7 +500,7 @@ func TestRouteNeedsUpdate_MTUChanged(t *testing.T) {
 }
 
 func TestRouteNeedsUpdate_NexthopAdded(t *testing.T) {
-	m := NewUnifiedRouteManager("test", 0, "wg")
+	m := NewUnifiedRouteManager("test", 0, "wg", "unbounded0")
 
 	installed := &installedRouteState{
 		metric: 0, mtu: 0,
@@ -520,7 +520,7 @@ func TestRouteNeedsUpdate_NexthopAdded(t *testing.T) {
 }
 
 func TestRouteNeedsUpdate_LinkIndexChanged(t *testing.T) {
-	m := NewUnifiedRouteManager("test", 0, "wg")
+	m := NewUnifiedRouteManager("test", 0, "wg", "unbounded0")
 
 	installed := &installedRouteState{
 		peerNexthops: map[string]DesiredNexthop{
@@ -536,7 +536,7 @@ func TestRouteNeedsUpdate_LinkIndexChanged(t *testing.T) {
 }
 
 func TestRouteNeedsUpdate_GatewayChanged(t *testing.T) {
-	m := NewUnifiedRouteManager("test", 0, "wg")
+	m := NewUnifiedRouteManager("test", 0, "wg", "unbounded0")
 
 	installed := &installedRouteState{
 		peerNexthops: map[string]DesiredNexthop{
@@ -552,7 +552,7 @@ func TestRouteNeedsUpdate_GatewayChanged(t *testing.T) {
 }
 
 func TestSetPreferredSourceIPs(t *testing.T) {
-	m := NewUnifiedRouteManager("test", 0, "wg")
+	m := NewUnifiedRouteManager("test", 0, "wg", "unbounded0")
 
 	v4 := net.ParseIP("192.168.1.1")
 	v6 := net.ParseIP("fd00::1")
@@ -568,7 +568,7 @@ func TestSetPreferredSourceIPs(t *testing.T) {
 }
 
 func TestPreferredSrc_IPv4(t *testing.T) {
-	m := NewUnifiedRouteManager("test", 0, "wg")
+	m := NewUnifiedRouteManager("test", 0, "wg", "unbounded0")
 	m.preferredSrcIPv4 = net.ParseIP("192.168.1.1")
 	m.preferredSrcIPv6 = net.ParseIP("fd00::1")
 
@@ -581,7 +581,7 @@ func TestPreferredSrc_IPv4(t *testing.T) {
 }
 
 func TestPreferredSrc_IPv6(t *testing.T) {
-	m := NewUnifiedRouteManager("test", 0, "wg")
+	m := NewUnifiedRouteManager("test", 0, "wg", "unbounded0")
 	m.preferredSrcIPv4 = net.ParseIP("192.168.1.1")
 	m.preferredSrcIPv6 = net.ParseIP("fd00::1")
 
@@ -594,7 +594,7 @@ func TestPreferredSrc_IPv6(t *testing.T) {
 }
 
 func TestBuildInstalledState(t *testing.T) {
-	m := NewUnifiedRouteManager("test", 0, "wg")
+	m := NewUnifiedRouteManager("test", 0, "wg", "unbounded0")
 	_, prefix, _ := net.ParseCIDR("10.0.0.0/24")
 
 	dr := DesiredRoute{
@@ -639,7 +639,7 @@ func TestBuildInstalledState(t *testing.T) {
 }
 
 func TestBuildInstalledState_LinkScope(t *testing.T) {
-	m := NewUnifiedRouteManager("test", 0, "wg")
+	m := NewUnifiedRouteManager("test", 0, "wg", "unbounded0")
 	_, prefix, _ := net.ParseCIDR("10.0.0.1/32")
 
 	dr := DesiredRoute{Prefix: *prefix}
@@ -652,7 +652,7 @@ func TestBuildInstalledState_LinkScope(t *testing.T) {
 }
 
 func TestGetInstalledRoutes_Empty(t *testing.T) {
-	m := NewUnifiedRouteManager("test", 0, "wg")
+	m := NewUnifiedRouteManager("test", 0, "wg", "unbounded0")
 
 	routes := m.GetInstalledRoutes()
 	if len(routes) != 0 {
@@ -661,7 +661,7 @@ func TestGetInstalledRoutes_Empty(t *testing.T) {
 }
 
 func TestGetInstalledRoutes_WithState(t *testing.T) {
-	m := NewUnifiedRouteManager("test", 0, "wg")
+	m := NewUnifiedRouteManager("test", 0, "wg", "unbounded0")
 	_, prefix, _ := net.ParseCIDR("10.0.0.0/24")
 
 	m.installedRoutes["254:10.0.0.0/24"] = &installedRouteState{
@@ -703,7 +703,7 @@ func TestGetInstalledRoutes_WithState(t *testing.T) {
 }
 
 func TestBuildKernelRoute_LinkScope(t *testing.T) {
-	m := NewUnifiedRouteManager("test", 0, "wg")
+	m := NewUnifiedRouteManager("test", 0, "wg", "unbounded0")
 	_, prefix, _ := net.ParseCIDR("10.0.0.1/32")
 
 	dr := DesiredRoute{
@@ -732,7 +732,7 @@ func TestBuildKernelRoute_LinkScope(t *testing.T) {
 }
 
 func TestBuildKernelRoute_MultipathIPv4(t *testing.T) {
-	m := NewUnifiedRouteManager("test", 0, "wg")
+	m := NewUnifiedRouteManager("test", 0, "wg", "unbounded0")
 	_, prefix, _ := net.ParseCIDR("100.64.0.0/16")
 
 	dr := DesiredRoute{
@@ -764,7 +764,7 @@ func TestBuildKernelRoute_MultipathIPv4(t *testing.T) {
 }
 
 func TestBuildKernelRoute_MultipathIPv6_SkipNoGateway(t *testing.T) {
-	m := NewUnifiedRouteManager("test", 0, "wg")
+	m := NewUnifiedRouteManager("test", 0, "wg", "unbounded0")
 	_, prefix, _ := net.ParseCIDR("fd00:100::/48")
 
 	dr := DesiredRoute{Prefix: *prefix}
@@ -784,7 +784,7 @@ func TestBuildKernelRoute_MultipathIPv6_SkipNoGateway(t *testing.T) {
 }
 
 func TestBuildKernelRoute_MultipathIPv6_AllNoGateway(t *testing.T) {
-	m := NewUnifiedRouteManager("test", 0, "wg")
+	m := NewUnifiedRouteManager("test", 0, "wg", "unbounded0")
 	_, prefix, _ := net.ParseCIDR("fd00:100::/48")
 
 	// Multiple IPv6 nexthops all without gateways -- multipath cannot be built.
@@ -801,7 +801,7 @@ func TestBuildKernelRoute_MultipathIPv6_AllNoGateway(t *testing.T) {
 }
 
 func TestBuildKernelRoute_SingleIPv6LinkScope(t *testing.T) {
-	m := NewUnifiedRouteManager("test", 0, "wg")
+	m := NewUnifiedRouteManager("test", 0, "wg", "unbounded0")
 	_, prefix, _ := net.ParseCIDR("fd00::1/128")
 
 	// Single IPv6 nexthop with no gateway is a valid link-scope route.
@@ -821,7 +821,7 @@ func TestBuildKernelRoute_SingleIPv6LinkScope(t *testing.T) {
 }
 
 func TestBuildKernelRoute_PreferredSource(t *testing.T) {
-	m := NewUnifiedRouteManager("test", 0, "wg")
+	m := NewUnifiedRouteManager("test", 0, "wg", "unbounded0")
 	m.preferredSrcIPv4 = net.ParseIP("192.168.1.1")
 
 	_, prefix, _ := net.ParseCIDR("10.0.0.0/24")
@@ -845,7 +845,7 @@ func TestBuildKernelRoute_PreferredSource(t *testing.T) {
 // TestSyncRoutes_DedicatedTable verifies that routes with Table==0 get keyed
 // under the manager's default table when a dedicated table is configured.
 func TestSyncRoutes_DedicatedTable(t *testing.T) {
-	m := NewUnifiedRouteManager("test", 252, "wg")
+	m := NewUnifiedRouteManager("test", 252, "wg", "unbounded0")
 
 	// Pre-populate a nexthop so the manager can build a route.
 	nh := DesiredNexthop{PeerID: "peer-a", LinkIndex: 1}
@@ -890,7 +890,7 @@ func TestSyncRoutes_DedicatedTable(t *testing.T) {
 // TestSyncRoutes_ExplicitTableNotOverridden verifies that a route with an
 // explicit non-zero Table is not overridden by the manager's default table.
 func TestSyncRoutes_ExplicitTableNotOverridden(t *testing.T) {
-	m := NewUnifiedRouteManager("test", 252, "wg")
+	m := NewUnifiedRouteManager("test", 252, "wg", "unbounded0")
 
 	nh := DesiredNexthop{PeerID: "peer-b", LinkIndex: 2, Gateway: net.ParseIP("10.0.0.1")}
 	m.ensureNexthop(nh)
@@ -935,13 +935,13 @@ func TestSyncRoutes_ExplicitTableNotOverridden(t *testing.T) {
 // with a dedicated table reports isDedicatedTable() == true, which
 // selects the simplified validation code path.
 func TestValidateRoutes_DedicatedTable_NoFilterNeeded(t *testing.T) {
-	m := NewUnifiedRouteManager("test", 252, "wg")
+	m := NewUnifiedRouteManager("test", 252, "wg", "unbounded0")
 	if !m.isDedicatedTable() {
 		t.Fatal("expected isDedicatedTable() == true for table 252")
 	}
 
 	// Contrast with the main table.
-	mMain := NewUnifiedRouteManager("test", 0, "wg")
+	mMain := NewUnifiedRouteManager("test", 0, "wg", "unbounded0")
 	if mMain.isDedicatedTable() {
 		t.Fatal("expected isDedicatedTable() == false for default (main) table")
 	}
@@ -956,7 +956,7 @@ func TestValidateRoutes_DedicatedTable_NoFilterNeeded(t *testing.T) {
 // records the raw DesiredRoute.Table value (the route key handles resolution
 // via effectiveTable, while the state preserves the original).
 func TestBuildInstalledState_DedicatedTable(t *testing.T) {
-	m := NewUnifiedRouteManager("test", 252, "wg")
+	m := NewUnifiedRouteManager("test", 252, "wg", "unbounded0")
 
 	_, prefix, _ := net.ParseCIDR("10.50.0.0/24")
 	dr := DesiredRoute{
