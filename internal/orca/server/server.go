@@ -54,6 +54,7 @@ func NewEdgeHandler(fc edgeFetchAPI, cfg *config.Config, log *slog.Logger) *Edge
 // use path-style):
 //
 //	GET  /                                  -> ListBuckets (not supported; 405)
+//	GET  /{bucket}/                         -> ListObjectsV2 (not supported; 501)
 //	GET  /{bucket}/{key}                    -> GetObject (with optional Range)
 //	HEAD /{bucket}/{key}                    -> HeadObject
 //	HEAD /{bucket}/                         -> HeadBucket (not supported; 405)
