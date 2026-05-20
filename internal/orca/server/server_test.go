@@ -40,21 +40,6 @@ func (f *fakeEdgeAPI) GetChunk(ctx context.Context, k chunk.Key, objectSize int6
 	return f.GetChunkFunc(ctx, k, objectSize)
 }
 
-// fakeOrigin satisfies origin.Origin for handler tests. Only the
-// fields used in the test need to be populated.
-type fakeOrigin struct {
-	HeadFunc     func(ctx context.Context, bucket, key string) (origin.ObjectInfo, error)
-	GetRangeFunc func(ctx context.Context, bucket, key, etag string, off, n int64) (io.ReadCloser, error)
-}
-
-func (f *fakeOrigin) Head(ctx context.Context, bucket, key string) (origin.ObjectInfo, error) {
-	return f.HeadFunc(ctx, bucket, key)
-}
-
-func (f *fakeOrigin) GetRange(ctx context.Context, bucket, key, etag string, off, n int64) (io.ReadCloser, error) {
-	return f.GetRangeFunc(ctx, bucket, key, etag, off, n)
-}
-
 // TestWriteOriginError covers all five branches of the error mapping.
 // Previously only ErrNotFound was exercised (via integration test).
 func TestWriteOriginError(t *testing.T) {
@@ -648,20 +633,6 @@ func discardLogger() *slog.Logger {
 // at known call sites.
 func debugLoggerTo(buf *bytes.Buffer) *slog.Logger {
 	return slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-}
-
-func equalStrings(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-
-	return true
 }
 
 // readaheadConfig returns a config tailored for readahead unit tests.
