@@ -152,13 +152,19 @@ fn decode_leaf(page: &[u8], nentries: usize, txn_id: u64) -> Decoded {
             return Decoded::Empty;
         };
         let lba = Lba(u64::from_le_bytes(
-            page[base + LEAF_LBA_OFF..base + LEAF_CSUM_OFF].try_into().unwrap(),
+            page[base + LEAF_LBA_OFF..base + LEAF_CSUM_OFF]
+                .try_into()
+                .unwrap(),
         ));
         let data_checksum = Checksum(u64::from_le_bytes(
-            page[base + LEAF_CSUM_OFF..base + LEAF_LEN_OFF].try_into().unwrap(),
+            page[base + LEAF_CSUM_OFF..base + LEAF_LEN_OFF]
+                .try_into()
+                .unwrap(),
         ));
         let byte_len = u32::from_le_bytes(
-            page[base + LEAF_LEN_OFF..base + LEAF_LEN_END].try_into().unwrap(),
+            page[base + LEAF_LEN_OFF..base + LEAF_LEN_END]
+                .try_into()
+                .unwrap(),
         );
         entries.push((
             key,
@@ -185,7 +191,9 @@ fn decode_internal(page: &[u8], nentries: usize, txn_id: u64) -> Decoded {
             return Decoded::Empty;
         };
         let child = Lba(u64::from_le_bytes(
-            page[base + INT_CHILD_OFF..base + INT_CHILD_END].try_into().unwrap(),
+            page[base + INT_CHILD_OFF..base + INT_CHILD_END]
+                .try_into()
+                .unwrap(),
         ));
         keys.push(key);
         children.push(child);
@@ -226,8 +234,7 @@ pub fn encode_leaf(
         page[base + LEAF_LBA_OFF..base + LEAF_CSUM_OFF].copy_from_slice(&v.lba.0.to_le_bytes());
         page[base + LEAF_CSUM_OFF..base + LEAF_LEN_OFF]
             .copy_from_slice(&v.data_checksum.0.to_le_bytes());
-        page[base + LEAF_LEN_OFF..base + LEAF_LEN_END]
-            .copy_from_slice(&v.byte_len.to_le_bytes());
+        page[base + LEAF_LEN_OFF..base + LEAF_LEN_END].copy_from_slice(&v.byte_len.to_le_bytes());
     }
     seal_checksum(&mut page);
     Ok(page)
@@ -312,7 +319,10 @@ mod tests {
         ];
         let p = encode_leaf(4096, 42, &entries).unwrap();
         match decode(&p) {
-            Decoded::Leaf { txn_id, entries: got } => {
+            Decoded::Leaf {
+                txn_id,
+                entries: got,
+            } => {
                 assert_eq!(txn_id, 42);
                 assert_eq!(got, entries);
             }

@@ -126,8 +126,8 @@ mod uring_tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::block_on;
     use super::super::{BlockDevice, UringBlockDevice, UringConfig};
+    use super::block_on;
     use crate::storage::types::{Error, Lba};
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -177,8 +177,8 @@ mod uring_tests {
     fn open_reports_capacity() {
         let (page_size, pages) = geometry();
         let path = TempPath(make_tempfile(pages, page_size));
-        let dev = UringBlockDevice::open(&path.0, UringConfig::test_local())
-            .expect("open uring device");
+        let dev =
+            UringBlockDevice::open(&path.0, UringConfig::test_local()).expect("open uring device");
         assert_eq!(dev.page_size(), page_size);
         assert_eq!(dev.capacity_pages(), pages);
         assert_eq!(dev.write_queue_depth(), 8);
@@ -188,8 +188,8 @@ mod uring_tests {
     fn read_back_what_we_wrote() {
         let (page_size, pages) = geometry();
         let path = TempPath(make_tempfile(pages, page_size));
-        let dev = UringBlockDevice::open(&path.0, UringConfig::test_local())
-            .expect("open uring device");
+        let dev =
+            UringBlockDevice::open(&path.0, UringConfig::test_local()).expect("open uring device");
 
         let buf_len = page_size * 4;
         let (_owner, base) = aligned_buffer(buf_len);
@@ -217,8 +217,8 @@ mod uring_tests {
     fn read_unwritten_page_returns_seed_bytes() {
         let (page_size, pages) = geometry();
         let path = TempPath(make_tempfile(pages, page_size));
-        let dev = UringBlockDevice::open(&path.0, UringConfig::test_local())
-            .expect("open uring device");
+        let dev =
+            UringBlockDevice::open(&path.0, UringConfig::test_local()).expect("open uring device");
 
         let buf_len = page_size;
         let (_owner, base) = aligned_buffer(buf_len);
@@ -235,8 +235,8 @@ mod uring_tests {
     fn out_of_range_lba_rejected_without_io() {
         let (page_size, pages) = geometry();
         let path = TempPath(make_tempfile(pages, page_size));
-        let dev = UringBlockDevice::open(&path.0, UringConfig::test_local())
-            .expect("open uring device");
+        let dev =
+            UringBlockDevice::open(&path.0, UringConfig::test_local()).expect("open uring device");
 
         let buf_len = page_size;
         let (_owner, base) = aligned_buffer(buf_len);
@@ -250,8 +250,8 @@ mod uring_tests {
     fn write_without_registered_buffer_errors() {
         let (page_size, pages) = geometry();
         let path = TempPath(make_tempfile(pages, page_size));
-        let dev = UringBlockDevice::open(&path.0, UringConfig::test_local())
-            .expect("open uring device");
+        let dev =
+            UringBlockDevice::open(&path.0, UringConfig::test_local()).expect("open uring device");
 
         let (_owner, base) = aligned_buffer(page_size);
         let src = unsafe { std::slice::from_raw_parts(base, page_size) };

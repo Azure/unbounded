@@ -313,40 +313,41 @@ fn torn_data_page_reports_miss() {
     let mut pool = Pool::new(8);
     let pool_base = pool.base() as usize;
 
-    let outcome = run_with_engine::<(bool, u64), _>(0x00D0_DA7A, device.clone(), move |eng, slot| {
-        let device = device.clone();
-        Box::pin(async move {
-            eng.register_pages(pool_base as *mut u8, PAGE_SIZE, 8)
-                .unwrap();
+    let outcome =
+        run_with_engine::<(bool, u64), _>(0x00D0_DA7A, device.clone(), move |eng, slot| {
+            let device = device.clone();
+            Box::pin(async move {
+                eng.register_pages(pool_base as *mut u8, PAGE_SIZE, 8)
+                    .unwrap();
 
-            let bytes = payload(1, 0, 7);
-            admit_one(&eng, pool_base as *mut u8, 0, stripe(1), 0, &bytes).await;
+                let bytes = payload(1, 0, 7);
+                admit_one(&eng, pool_base as *mut u8, 0, stripe(1), 0, &bytes).await;
 
-            // Locate the data page on disk and corrupt one byte.
-            let lba =
-                find_data_lba(&device, &bytes).expect("admitted page must be reachable on disk");
-            let mut bad = vec![0u8; PAGE_SIZE];
-            device.peek(Lba(lba), &mut bad);
-            bad[0] ^= 0xff;
-            device.poke(Lba(lba), &bad);
+                // Locate the data page on disk and corrupt one byte.
+                let lba = find_data_lba(&device, &bytes)
+                    .expect("admitted page must be reachable on disk");
+                let mut bad = vec![0u8; PAGE_SIZE];
+                device.peek(Lba(lba), &mut bad);
+                bad[0] ^= 0xff;
+                device.poke(Lba(lba), &bad);
 
-            // Read into a different pool slot. The engine MUST
-            // detect the checksum mismatch and report a miss.
-            // SAFETY: slot 1 is dedicated to this read.
-            unsafe {
-                let p = (pool_base as *mut u8).add(PAGE_SIZE);
-                std::ptr::write_bytes(p, 0, PAGE_SIZE);
-            }
-            let dst = PageRef {
-                page_idx: 1,
-                offset: 0,
-                len: PAGE_SIZE as u32,
-            };
-            let hit = eng.read_page(stripe(1), 0, dst).await.unwrap();
-            let snap = eng.snapshot();
-            *slot.borrow_mut() = Some((hit, snap.checksum_misses));
-        })
-    });
+                // Read into a different pool slot. The engine MUST
+                // detect the checksum mismatch and report a miss.
+                // SAFETY: slot 1 is dedicated to this read.
+                unsafe {
+                    let p = (pool_base as *mut u8).add(PAGE_SIZE);
+                    std::ptr::write_bytes(p, 0, PAGE_SIZE);
+                }
+                let dst = PageRef {
+                    page_idx: 1,
+                    offset: 0,
+                    len: PAGE_SIZE as u32,
+                };
+                let hit = eng.read_page(stripe(1), 0, dst).await.unwrap();
+                let snap = eng.snapshot();
+                *slot.borrow_mut() = Some((hit, snap.checksum_misses));
+            })
+        });
 
     assert!(!outcome.0, "engine returned a hit on a corrupted data page");
     assert!(
@@ -381,57 +382,58 @@ fn torn_btree_leaf_reports_miss() {
     }
     let writes_for_task = writes.clone();
 
-    let outcome = run_with_engine::<Vec<(bool, Vec<u8>)>, _>(0xBEE_F00, device.clone(), move |eng, slot| {
-        let device = device.clone();
-        Box::pin(async move {
-            eng.register_pages(pool_base as *mut u8, PAGE_SIZE, 16)
-                .unwrap();
+    let outcome =
+        run_with_engine::<Vec<(bool, Vec<u8>)>, _>(0xBEE_F00, device.clone(), move |eng, slot| {
+            let device = device.clone();
+            Box::pin(async move {
+                eng.register_pages(pool_base as *mut u8, PAGE_SIZE, 16)
+                    .unwrap();
 
-            for (i, (k, off, bytes)) in writes_for_task.iter().enumerate() {
-                admit_one(&eng, pool_base as *mut u8, i, *k, *off, bytes).await;
-            }
-
-            // Corrupt a leaf page on disk.
-            let leaf_lba =
-                find_leaf_lba(&device).expect("at least one leaf must be on disk after writes");
-            let mut bad = vec![0u8; PAGE_SIZE];
-            device.peek(Lba(leaf_lba), &mut bad);
-            // Flip a byte well past the page-type marker so the
-            // page still claims to be a leaf but the checksum
-            // disagrees.
-            bad[64] ^= 0xff;
-            device.poke(Lba(leaf_lba), &bad);
-
-            // Now read every key back. Each read either misses or
-            // hits with the EXACT bytes we wrote; nothing else is
-            // acceptable.
-            let mut results: Vec<(bool, Vec<u8>)> = Vec::new();
-            let read_base = writes_for_task.len();
-            for (i, (k, off, _)) in writes_for_task.iter().enumerate() {
-                let slot_idx = read_base + i;
-                // SAFETY: each read uses a dedicated slot.
-                unsafe {
-                    let p = (pool_base as *mut u8).add(slot_idx * PAGE_SIZE);
-                    std::ptr::write_bytes(p, 0, PAGE_SIZE);
+                for (i, (k, off, bytes)) in writes_for_task.iter().enumerate() {
+                    admit_one(&eng, pool_base as *mut u8, i, *k, *off, bytes).await;
                 }
-                let dst = PageRef {
-                    page_idx: slot_idx as u32,
-                    offset: 0,
-                    len: PAGE_SIZE as u32,
-                };
-                let hit = eng.read_page(*k, *off, dst).await.unwrap();
-                let bytes_back = if hit {
-                    let p = unsafe { (pool_base as *const u8).add(slot_idx * PAGE_SIZE) };
-                    unsafe { std::slice::from_raw_parts(p, PAGE_SIZE) }.to_vec()
-                } else {
-                    Vec::new()
-                };
-                results.push((hit, bytes_back));
-            }
 
-            *slot.borrow_mut() = Some(results);
-        })
-    });
+                // Corrupt a leaf page on disk.
+                let leaf_lba =
+                    find_leaf_lba(&device).expect("at least one leaf must be on disk after writes");
+                let mut bad = vec![0u8; PAGE_SIZE];
+                device.peek(Lba(leaf_lba), &mut bad);
+                // Flip a byte well past the page-type marker so the
+                // page still claims to be a leaf but the checksum
+                // disagrees.
+                bad[64] ^= 0xff;
+                device.poke(Lba(leaf_lba), &bad);
+
+                // Now read every key back. Each read either misses or
+                // hits with the EXACT bytes we wrote; nothing else is
+                // acceptable.
+                let mut results: Vec<(bool, Vec<u8>)> = Vec::new();
+                let read_base = writes_for_task.len();
+                for (i, (k, off, _)) in writes_for_task.iter().enumerate() {
+                    let slot_idx = read_base + i;
+                    // SAFETY: each read uses a dedicated slot.
+                    unsafe {
+                        let p = (pool_base as *mut u8).add(slot_idx * PAGE_SIZE);
+                        std::ptr::write_bytes(p, 0, PAGE_SIZE);
+                    }
+                    let dst = PageRef {
+                        page_idx: slot_idx as u32,
+                        offset: 0,
+                        len: PAGE_SIZE as u32,
+                    };
+                    let hit = eng.read_page(*k, *off, dst).await.unwrap();
+                    let bytes_back = if hit {
+                        let p = unsafe { (pool_base as *const u8).add(slot_idx * PAGE_SIZE) };
+                        unsafe { std::slice::from_raw_parts(p, PAGE_SIZE) }.to_vec()
+                    } else {
+                        Vec::new()
+                    };
+                    results.push((hit, bytes_back));
+                }
+
+                *slot.borrow_mut() = Some(results);
+            })
+        });
 
     // Every hit must match the corresponding write exactly. Misses
     // are tolerated for any key whose leaf we just torched.
@@ -767,7 +769,10 @@ fn concurrent_writes_same_key_collapse_to_one_entry() {
                     return;
                 }
             };
-            if eng.register_pages(pool_base as *mut u8, PAGE_SIZE, NUM_WRITERS + 1).is_err() {
+            if eng
+                .register_pages(pool_base as *mut u8, PAGE_SIZE, NUM_WRITERS + 1)
+                .is_err()
+            {
                 *stage.borrow_mut() = Stage::Failed;
                 return;
             }
@@ -906,9 +911,14 @@ fn concurrent_writes_same_key_collapse_to_one_entry() {
     assert!(
         max_inflight <= NUM_WRITERS as u32,
         "max_inflight ({}) somehow exceeded the writer count ({}); inflight accounting is wrong",
-        max_inflight, NUM_WRITERS,
+        max_inflight,
+        NUM_WRITERS,
     );
-    assert!(hit, "read-back missed after {} concurrent writes", NUM_WRITERS);
+    assert!(
+        hit,
+        "read-back missed after {} concurrent writes",
+        NUM_WRITERS
+    );
     assert_eq!(
         bytes, payload_bytes,
         "read-back returned bytes that no writer ever wrote",

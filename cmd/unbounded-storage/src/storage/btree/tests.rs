@@ -10,8 +10,8 @@ use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use crate::storage::alloc::Allocator;
 use crate::storage::blockdev::{MockDevice, MockDeviceConfig};
-use crate::storage::btree::{BTreeIndex, LeafEntry, Mutation};
 use crate::storage::btree::page::{META_SLOT_A, META_SLOT_B};
+use crate::storage::btree::{BTreeIndex, LeafEntry, Mutation};
 use crate::storage::types::{Checksum, Lba, PageKey};
 
 fn noop_waker() -> Waker {

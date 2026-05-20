@@ -35,9 +35,7 @@ use crate::storage::alloc::Allocator;
 use crate::storage::blockdev::BlockDevice;
 use crate::storage::btree::{BTreeIndex, LeafEntry, Mutation};
 use crate::storage::lru::SieveLru;
-use crate::storage::mutator::{
-    MutatorOutcome, MutatorQueue, MutatorReply, MutatorReq, yield_once,
-};
+use crate::storage::mutator::{MutatorOutcome, MutatorQueue, MutatorReply, MutatorReq, yield_once};
 use crate::storage::refcount::RefcountTable;
 use crate::storage::singleflight::{Acquire, Singleflight};
 use crate::storage::traits::{PageChecksum, Xxh3Checksum};
@@ -247,9 +245,7 @@ impl<B: BlockDevice> StorageEngine<B> {
     unsafe fn slice_mut_from_ref(&self, page: PageRef) -> *mut [u8] {
         let bp = self.bufferpool.lock().unwrap();
         let base = bp.base.expect("register_pages not called");
-        let p = unsafe {
-            base.add(page.page_idx as usize * bp.page_size + page.offset as usize)
-        };
+        let p = unsafe { base.add(page.page_idx as usize * bp.page_size + page.offset as usize) };
         std::ptr::slice_from_raw_parts_mut(p, page.len as usize)
     }
 
@@ -257,9 +253,7 @@ impl<B: BlockDevice> StorageEngine<B> {
     unsafe fn slice_from_ref(&self, page: PageRef) -> *const [u8] {
         let bp = self.bufferpool.lock().unwrap();
         let base = bp.base.expect("register_pages not called");
-        let p = unsafe {
-            base.add(page.page_idx as usize * bp.page_size + page.offset as usize)
-        };
+        let p = unsafe { base.add(page.page_idx as usize * bp.page_size + page.offset as usize) };
         std::ptr::slice_from_raw_parts(p, page.len as usize)
     }
 
@@ -300,13 +294,14 @@ impl<B: BlockDevice> StorageEngine<B> {
         }
     }
 
-    fn evict_if_over_watermark<'a>(
-        &'a self,
-    ) -> Pin<Box<dyn Future<Output = ()> + 'a>> {
+    fn evict_if_over_watermark<'a>(&'a self) -> Pin<Box<dyn Future<Output = ()> + 'a>> {
         // Boxed because called from inside an async fn that's
         // already 'a; eviction may itself await on the mutator.
         Box::pin(async move {
-            if !self.lru.watermark_exceeded(self.cfg.eviction_watermark as f64) {
+            if !self
+                .lru
+                .watermark_exceeded(self.cfg.eviction_watermark as f64)
+            {
                 return;
             }
             let candidates = self.lru.sweep(8);
@@ -394,9 +389,7 @@ impl<B: BlockDevice> bufferpool::BlockStore for StorageEngine<B> {
         // device for io_uring's fixed-buffer table. Errors here
         // are not fatal - the device falls back to its slower
         // path.
-        let _ = self
-            .device
-            .register_buffers(base, page_size * page_count);
+        let _ = self.device.register_buffers(base, page_size * page_count);
         Ok(())
     }
 
@@ -571,9 +564,9 @@ impl<B: BlockDevice> StorageEngine<B> {
                 leader.abandon();
                 return Ok(());
             }
-            MutatorOutcome::DeleteCommitted => unreachable!(
-                "mutator returned DeleteCommitted for an Insert request"
-            ),
+            MutatorOutcome::DeleteCommitted => {
+                unreachable!("mutator returned DeleteCommitted for an Insert request")
+            }
         };
 
         if let Some(old) = prior_lba {
@@ -674,13 +667,7 @@ impl<B: BlockDevice> StorageEngine<B> {
         for req in &batch {
             match req {
                 MutatorReq::Insert { key, entry, .. } => {
-                    let prior = self
-                        .btree
-                        .lookup(key)
-                        .await
-                        .ok()
-                        .flatten()
-                        .map(|e| e.lba);
+                    let prior = self.btree.lookup(key).await.ok().flatten().map(|e| e.lba);
                     prior_lbas.push(prior);
                     mutations.push(Mutation::Insert {
                         key: *key,
@@ -704,9 +691,7 @@ impl<B: BlockDevice> StorageEngine<B> {
 
         for (i, req) in batch.into_iter().enumerate() {
             let done = match &req {
-                MutatorReq::Insert { done, .. } | MutatorReq::Delete { done, .. } => {
-                    done.clone()
-                }
+                MutatorReq::Insert { done, .. } | MutatorReq::Delete { done, .. } => done.clone(),
             };
             let outcome = if !ok {
                 MutatorOutcome::Failed
@@ -745,8 +730,7 @@ mod tests {
         fn raw() -> RawWaker {
             RawWaker::new(std::ptr::null(), &VTABLE)
         }
-        static VTABLE: RawWakerVTable =
-            RawWakerVTable::new(|_| raw(), |_| {}, |_| {}, |_| {});
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(|_| raw(), |_| {}, |_| {}, |_| {});
         unsafe { Waker::from_raw(raw()) }
     }
 
@@ -754,10 +738,7 @@ mod tests {
     /// `mutator`. The mutator is expected to stay pending until
     /// `close_mutator` is invoked; we poll it on every spin so
     /// reply wakeups are observed promptly.
-    fn block_on_pair<F: Future>(
-        body: F,
-        mutator: Pin<&mut dyn Future<Output = ()>>,
-    ) -> F::Output {
+    fn block_on_pair<F: Future>(body: F, mutator: Pin<&mut dyn Future<Output = ()>>) -> F::Output {
         let w = noop_waker();
         let mut cx = Context::from_waker(&w);
         let mut body = pin!(body);
@@ -805,7 +786,8 @@ mod tests {
         let eng = Arc::new(block_on(StorageEngine::open(device, cfg)).unwrap());
         // 64 pool pages of 4 KiB each.
         let buf: Box<[u8]> = vec![0u8; 4096 * 64].into_boxed_slice();
-        eng.register_pages(buf.as_ptr() as *mut u8, 4096, 64).unwrap();
+        eng.register_pages(buf.as_ptr() as *mut u8, 4096, 64)
+            .unwrap();
         (eng, buf)
     }
 

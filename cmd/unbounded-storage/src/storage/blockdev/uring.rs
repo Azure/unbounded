@@ -183,9 +183,7 @@ impl UringBlockDevice {
         if cfg.defer_taskrun {
             builder.setup_defer_taskrun();
         }
-        let ring = builder
-            .build(cfg.queue_depth)
-            .map_err(io_err_to_storage)?;
+        let ring = builder.build(cfg.queue_depth).map_err(io_err_to_storage)?;
 
         ring.submitter()
             .register_files(&[file.as_raw_fd()])
@@ -272,9 +270,7 @@ impl UringBlockDevice {
         if start < base {
             return Err(Error::Io(libc::EFAULT));
         }
-        let end = start
-            .checked_add(len)
-            .ok_or(Error::Io(libc::EOVERFLOW))?;
+        let end = start.checked_add(len).ok_or(Error::Io(libc::EOVERFLOW))?;
         if end > base + reg.len {
             return Err(Error::Io(libc::EFAULT));
         }
@@ -455,9 +451,7 @@ impl<'a> Future for SubmitSlot<'a> {
         if dev.submitted.get() < dev.queue_depth {
             return Poll::Ready(());
         }
-        dev.submit_waiters
-            .borrow_mut()
-            .push(cx.waker().clone());
+        dev.submit_waiters.borrow_mut().push(cx.waker().clone());
         Poll::Pending
     }
 }
@@ -507,8 +501,8 @@ fn pop_front_waker(v: &mut Vec<Waker>) -> Option<Waker> {
 }
 
 fn open_file(path: &Path, o_direct: bool) -> Result<File, Error> {
-    let cpath = CString::new(path.as_os_str().as_encoded_bytes())
-        .map_err(|_| Error::Io(libc::EINVAL))?;
+    let cpath =
+        CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| Error::Io(libc::EINVAL))?;
     let mut flags = libc::O_RDWR | libc::O_CLOEXEC;
     if o_direct {
         flags |= libc::O_DIRECT;
@@ -516,9 +510,11 @@ fn open_file(path: &Path, o_direct: bool) -> Result<File, Error> {
     // SAFETY: cpath is null-terminated and outlives the call.
     let fd = unsafe { libc::open(cpath.as_ptr(), flags) };
     if fd < 0 {
-        return Err(Error::Io(io::Error::last_os_error()
-            .raw_os_error()
-            .unwrap_or(libc::EIO)));
+        return Err(Error::Io(
+            io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO),
+        ));
     }
     // SAFETY: fd is freshly opened by us and not aliased elsewhere.
     Ok(unsafe { File::from_raw_fd(fd as RawFd) })
@@ -544,9 +540,11 @@ fn blkgetsize64(fd: RawFd) -> Result<u64, Error> {
     // SAFETY: out is a writable u64 of the correct size.
     let rc = unsafe { libc::ioctl(fd, BLKGETSIZE64, &mut out as *mut u64) };
     if rc != 0 {
-        return Err(Error::Io(io::Error::last_os_error()
-            .raw_os_error()
-            .unwrap_or(libc::EIO)));
+        return Err(Error::Io(
+            io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO),
+        ));
     }
     Ok(out)
 }
@@ -720,8 +718,7 @@ mod tests {
         // Drive the pump and check the invariant on every step.
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
-        let mut out: Vec<Option<Result<(), Error>>> =
-            (0..futs.len()).map(|_| None).collect();
+        let mut out: Vec<Option<Result<(), Error>>> = (0..futs.len()).map(|_| None).collect();
         let mut spins = 0u32;
         let mut max_submitted: u32 = 0;
         loop {

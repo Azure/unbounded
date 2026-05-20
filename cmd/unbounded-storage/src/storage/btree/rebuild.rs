@@ -36,9 +36,7 @@ pub struct RebuildResult {
 /// Scan the disk for the highest-txn-id leaf cohort. In practice
 /// the per-disk capacity is a few hundred thousand 4 KiB pages and
 /// we expect to scan all of them.
-pub async fn scan_for_leaves<B: BlockDevice>(
-    device: &B,
-) -> Result<Option<RebuildResult>, Error> {
+pub async fn scan_for_leaves<B: BlockDevice>(device: &B) -> Result<Option<RebuildResult>, Error> {
     let ps = device.page_size();
     let cap = device.capacity_pages();
     let mut buf = vec![0u8; ps];

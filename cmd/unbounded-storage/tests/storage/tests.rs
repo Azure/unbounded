@@ -666,14 +666,25 @@ fn smoke_concurrent_reads_overlap() {
     // admission. Subsequent clients then read in parallel.
     let mut primer = Vec::new();
     for k in 0..key_count {
-        primer.push(Op::Write { key_idx: k, off_idx: 0, payload_seed: k });
-        primer.push(Op::Write { key_idx: k, off_idx: 0, payload_seed: k });
+        primer.push(Op::Write {
+            key_idx: k,
+            off_idx: 0,
+            payload_seed: k,
+        });
+        primer.push(Op::Write {
+            key_idx: k,
+            off_idx: 0,
+            payload_seed: k,
+        });
     }
     clients.push(ClientSpec { ops: primer });
     for _ in 0..4 {
         let mut ops = Vec::new();
         for k in 0..key_count {
-            ops.push(Op::Read { key_idx: k, off_idx: 0 });
+            ops.push(Op::Read {
+                key_idx: k,
+                off_idx: 0,
+            });
         }
         clients.push(ClientSpec { ops });
     }
@@ -702,6 +713,8 @@ fn smoke_concurrent_reads_overlap() {
         "engine never saw overlapping device ops despite 4 concurrent readers over 6 \
          primed keys with max_io_delay=8: per-disk peaks={:?}, device_reads={}, \
          device_writes={}",
-        report.max_inflight_per_disk, report.device_reads, report.device_writes,
+        report.max_inflight_per_disk,
+        report.device_reads,
+        report.device_writes,
     );
 }

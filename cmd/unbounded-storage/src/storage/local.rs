@@ -99,7 +99,11 @@ impl<B: BlockDevice + 'static> LocalStorage<B> {
                         }
                     }
                 }
-                if all_done { Poll::Ready(()) } else { Poll::Pending }
+                if all_done {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
             }
         }
 
@@ -107,8 +111,7 @@ impl<B: BlockDevice + 'static> LocalStorage<B> {
             .engines
             .iter()
             .map(|e| {
-                Some(Box::pin(e.clone().run_mutator())
-                    as Pin<Box<dyn Future<Output = ()> + '_>>)
+                Some(Box::pin(e.clone().run_mutator()) as Pin<Box<dyn Future<Output = ()> + '_>>)
             })
             .collect();
         RunAll { futs }.await
@@ -146,11 +149,7 @@ impl<B: BlockDevice + 'static> LocalStorage<B> {
     /// just teaches each device about the region. Used by
     /// [`ShardLocalStore`] so multiple NUMA-local backings can
     /// coexist behind a shared `LocalStorage`.
-    pub fn register_extra_buffer(
-        &self,
-        base: *mut u8,
-        bytes: usize,
-    ) -> Result<(), Error> {
+    pub fn register_extra_buffer(&self, base: *mut u8, bytes: usize) -> Result<(), Error> {
         for eng in &self.engines {
             eng.register_extra_buffer(base, bytes)?;
         }
@@ -167,11 +166,7 @@ impl<B: BlockDevice + 'static> LocalStorage<B> {
         dst: *mut [u8],
     ) -> Result<bool, Error> {
         let idx = self.disk_for(key, stripe_off);
-        unsafe {
-            self.engines[idx]
-                .read_page_into(key, stripe_off, dst)
-                .await
-        }
+        unsafe { self.engines[idx].read_page_into(key, stripe_off, dst).await }
     }
 
     /// Route a raw-slice write to the disk that owns the page.
@@ -405,8 +400,7 @@ mod tests {
         fn raw() -> RawWaker {
             RawWaker::new(std::ptr::null(), &VTABLE)
         }
-        static VTABLE: RawWakerVTable =
-            RawWakerVTable::new(|_| raw(), |_| {}, |_| {}, |_| {});
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(|_| raw(), |_| {}, |_| {}, |_| {});
         unsafe { Waker::from_raw(raw()) }
     }
 
@@ -526,8 +520,7 @@ mod tests {
         let m1 = e1.clone().run_mutator();
         let mut m0 = pin!(m0);
         let mut m1 = pin!(m1);
-        let aux: &mut [Pin<&mut dyn Future<Output = ()>>] =
-            &mut [m0.as_mut(), m1.as_mut()];
+        let aux: &mut [Pin<&mut dyn Future<Output = ()>>] = &mut [m0.as_mut(), m1.as_mut()];
         block_on_with_aux(body, aux);
 
         unsafe {

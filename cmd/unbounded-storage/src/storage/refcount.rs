@@ -53,9 +53,7 @@ impl RefcountTable {
     }
 
     fn slot(&self, lba: u64) -> Result<&AtomicU32, Error> {
-        self.slots
-            .get(lba as usize)
-            .ok_or(Error::OutOfRange)
+        self.slots.get(lba as usize).ok_or(Error::OutOfRange)
     }
 
     /// Increment the pin counter; returns a [`PinGuard`] that

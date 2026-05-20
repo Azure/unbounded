@@ -117,8 +117,7 @@ fn doorkeeper_probe_and_set(words: &mut [u64], bits: u64, key: &PageKey) -> bool
     let h = key.mix(0);
     let mut all_set = true;
     for i in 0..NUM_HASHES {
-        let bit =
-            h.wrapping_add((i as u64).wrapping_mul(GOLDEN_RATIO_64)) % bits;
+        let bit = h.wrapping_add((i as u64).wrapping_mul(GOLDEN_RATIO_64)) % bits;
         let word = (bit / 64) as usize;
         let mask = 1u64 << (bit % 64);
         if words[word] & mask == 0 {

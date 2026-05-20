@@ -835,113 +835,113 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
     // contract (no wrong bytes), not to retest fault tolerance of
     // the rebuild path - which `recovery.rs` covers scripted-ly.
     // The disable mirrors the bootstrap-time disable above exactly.
-    let (restart_performed, post_restart_hits, post_restart_misses, post_restart_errors) =
-        if w.restart_after && matches!(*slot.borrow(), BootstrapStatus::Ready(_)) {
-            // Drop the pre-restart router (and with it every
-            // engine). Holding any Rc clone would leak the
-            // devices' buffer-pool registrations past the second
-            // open. Replacing the slot with `Failed` is just for
-            // tidiness; nothing reads it after this point.
-            let pre = std::mem::replace(&mut *slot.borrow_mut(), BootstrapStatus::Failed);
-            drop(pre);
+    let (restart_performed, post_restart_hits, post_restart_misses, post_restart_errors) = if w
+        .restart_after
+        && matches!(*slot.borrow(), BootstrapStatus::Ready(_))
+    {
+        // Drop the pre-restart router (and with it every
+        // engine). Holding any Rc clone would leak the
+        // devices' buffer-pool registrations past the second
+        // open. Replacing the slot with `Failed` is just for
+        // tidiness; nothing reads it after this point.
+        let pre = std::mem::replace(&mut *slot.borrow_mut(), BootstrapStatus::Failed);
+        drop(pre);
 
-            sim_cfg.max_io_delay.set(0);
-            sim_cfg.io_fault_rate.set(0);
-            sim_cfg.read_corrupt_rate.set(0);
+        sim_cfg.max_io_delay.set(0);
+        sim_cfg.io_fault_rate.set(0);
+        sim_cfg.read_corrupt_rate.set(0);
 
-            let mut exec2 = Executor::new(seed ^ 0xA5A5_A5A5_A5A5_A5A5);
-            let outcomes2 = outcomes.clone();
-            let devices2 = devices.clone();
-            let w2 = w.clone();
-            let pool_base_v = pool_base as usize;
-            let stats: Rc<RefCell<(u64, u64, u64, bool)>> =
-                Rc::new(RefCell::new((0, 0, 0, false)));
-            let stats_task = stats.clone();
-            exec2.spawn(async move {
-                let local = match open_local(
-                    &devices2,
-                    engine_cfg,
-                    pool_base_v as *mut u8,
-                    w2.page_size,
-                    pool_pages,
-                )
-                .await
-                {
-                    Ok(l) => l,
-                    Err(e) => {
-                        outcomes2
-                            .borrow_mut()
-                            .push(Outcome::Err(format!("restart {e}")));
-                        stats_task.borrow_mut().3 = false;
-                        return;
+        let mut exec2 = Executor::new(seed ^ 0xA5A5_A5A5_A5A5_A5A5);
+        let outcomes2 = outcomes.clone();
+        let devices2 = devices.clone();
+        let w2 = w.clone();
+        let pool_base_v = pool_base as usize;
+        let stats: Rc<RefCell<(u64, u64, u64, bool)>> = Rc::new(RefCell::new((0, 0, 0, false)));
+        let stats_task = stats.clone();
+        exec2.spawn(async move {
+            let local = match open_local(
+                &devices2,
+                engine_cfg,
+                pool_base_v as *mut u8,
+                w2.page_size,
+                pool_pages,
+            )
+            .await
+            {
+                Ok(l) => l,
+                Err(e) => {
+                    outcomes2
+                        .borrow_mut()
+                        .push(Outcome::Err(format!("restart {e}")));
+                    stats_task.borrow_mut().3 = false;
+                    return;
+                }
+            };
+            stats_task.borrow_mut().3 = true;
+            let mut slot_idx = 0usize;
+            for ki in 0..w2.key_count.max(1) {
+                for oi in 0..w2.offset_count.max(1) {
+                    let key = w2.key(ki);
+                    let offset = w2.offset(oi);
+                    let byte_len = w2.byte_len(ki, oi);
+                    // SAFETY: every read uses a unique pool
+                    // slot; the modulus keeps us inside
+                    // `pool_pages` even when grid >= pool size.
+                    let pool_slot = slot_idx % pool_pages;
+                    slot_idx += 1;
+                    unsafe {
+                        let p = (pool_base_v as *mut u8).add(pool_slot * w2.page_size);
+                        std::ptr::write_bytes(p, 0, w2.page_size);
                     }
-                };
-                stats_task.borrow_mut().3 = true;
-                let mut slot_idx = 0usize;
-                for ki in 0..w2.key_count.max(1) {
-                    for oi in 0..w2.offset_count.max(1) {
-                        let key = w2.key(ki);
-                        let offset = w2.offset(oi);
-                        let byte_len = w2.byte_len(ki, oi);
-                        // SAFETY: every read uses a unique pool
-                        // slot; the modulus keeps us inside
-                        // `pool_pages` even when grid >= pool size.
-                        let pool_slot = slot_idx % pool_pages;
-                        slot_idx += 1;
-                        unsafe {
-                            let p = (pool_base_v as *mut u8).add(pool_slot * w2.page_size);
-                            std::ptr::write_bytes(p, 0, w2.page_size);
+                    let page = PageRef {
+                        page_idx: pool_slot as u32,
+                        offset: 0,
+                        len: byte_len as u32,
+                    };
+                    match local.read_page(key, offset, page).await {
+                        Ok(true) => {
+                            let bytes = unsafe {
+                                let p = (pool_base_v as *const u8).add(pool_slot * w2.page_size);
+                                std::slice::from_raw_parts(p, byte_len).to_vec()
+                            };
+                            outcomes2
+                                .borrow_mut()
+                                .push(Outcome::ReadHit { key, offset, bytes });
+                            stats_task.borrow_mut().0 += 1;
                         }
-                        let page = PageRef {
-                            page_idx: pool_slot as u32,
-                            offset: 0,
-                            len: byte_len as u32,
-                        };
-                        match local.read_page(key, offset, page).await {
-                            Ok(true) => {
-                                let bytes = unsafe {
-                                    let p = (pool_base_v as *const u8)
-                                        .add(pool_slot * w2.page_size);
-                                    std::slice::from_raw_parts(p, byte_len).to_vec()
-                                };
-                                outcomes2
-                                    .borrow_mut()
-                                    .push(Outcome::ReadHit { key, offset, bytes });
-                                stats_task.borrow_mut().0 += 1;
-                            }
-                            Ok(false) => {
-                                outcomes2
-                                    .borrow_mut()
-                                    .push(Outcome::ReadMiss { key, offset });
-                                stats_task.borrow_mut().1 += 1;
-                            }
-                            Err(e) => {
-                                outcomes2
-                                    .borrow_mut()
-                                    .push(Outcome::Err(format!("restart read: {e}")));
-                                stats_task.borrow_mut().2 += 1;
-                            }
+                        Ok(false) => {
+                            outcomes2
+                                .borrow_mut()
+                                .push(Outcome::ReadMiss { key, offset });
+                            stats_task.borrow_mut().1 += 1;
+                        }
+                        Err(e) => {
+                            outcomes2
+                                .borrow_mut()
+                                .push(Outcome::Err(format!("restart read: {e}")));
+                            stats_task.borrow_mut().2 += 1;
                         }
                     }
                 }
-            });
+            }
+        });
 
-            // Replay touches one read per grid cell. Each read
-            // typically costs O(delay + btree-internal awaits);
-            // delays are zero here, but the engine still yields
-            // through admission/singleflight/device, so allow
-            // generous headroom. Scale mildly with `num_disks`
-            // because the per-disk btree opens dominate the
-            // replay setup cost.
-            let grid = (w.key_count.max(1) as u64) * (w.offset_count.max(1) as u64);
-            let replay_budget = 4096 + grid * 256 + (num_disks as u64) * 1024;
-            exec2.run(replay_budget)?;
+        // Replay touches one read per grid cell. Each read
+        // typically costs O(delay + btree-internal awaits);
+        // delays are zero here, but the engine still yields
+        // through admission/singleflight/device, so allow
+        // generous headroom. Scale mildly with `num_disks`
+        // because the per-disk btree opens dominate the
+        // replay setup cost.
+        let grid = (w.key_count.max(1) as u64) * (w.offset_count.max(1) as u64);
+        let replay_budget = 4096 + grid * 256 + (num_disks as u64) * 1024;
+        exec2.run(replay_budget)?;
 
-            let (h, m, e, performed) = *stats.borrow();
-            (performed, h, m, e)
-        } else {
-            (false, 0, 0, 0)
-        };
+        let (h, m, e, performed) = *stats.borrow();
+        (performed, h, m, e)
+    } else {
+        (false, 0, 0, 0)
+    };
 
     let dev_agg = aggregate_devices(&devices);
     let max_inflight_per_disk: Vec<u32> = devices.iter().map(|d| d.max_inflight()).collect();

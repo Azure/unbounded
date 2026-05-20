@@ -113,11 +113,7 @@ impl Future for ReplyWait {
         if let Some(o) = g.result.take() {
             Poll::Ready(o)
         } else {
-            if !g
-                .waker
-                .as_ref()
-                .is_some_and(|w| w.will_wake(cx.waker()))
-            {
+            if !g.waker.as_ref().is_some_and(|w| w.will_wake(cx.waker())) {
                 g.waker = Some(cx.waker().clone());
             }
             Poll::Pending
@@ -296,8 +292,7 @@ mod tests {
         fn raw() -> RawWaker {
             RawWaker::new(std::ptr::null(), &VTABLE)
         }
-        static VTABLE: RawWakerVTable =
-            RawWakerVTable::new(|_| raw(), |_| {}, |_| {}, |_| {});
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(|_| raw(), |_| {}, |_| {}, |_| {});
         unsafe { Waker::from_raw(raw()) }
     }
 

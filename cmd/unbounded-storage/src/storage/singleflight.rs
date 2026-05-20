@@ -70,9 +70,7 @@ impl Singleflight {
         let shard = self.shard(&key);
         let mut map = shard.lock().unwrap();
         if let Some(existing) = map.get(&key).cloned() {
-            return Acquire::Follower(LeaseWait {
-                lease: existing,
-            });
+            return Acquire::Follower(LeaseWait { lease: existing });
         }
         let lease = Arc::new(Lease {
             result: Mutex::new(LeaseInner {
@@ -176,8 +174,7 @@ mod tests {
         fn raw() -> RawWaker {
             RawWaker::new(std::ptr::null(), &VTABLE)
         }
-        static VTABLE: RawWakerVTable =
-            RawWakerVTable::new(|_| raw(), |_| {}, |_| {}, |_| {});
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(|_| raw(), |_| {}, |_| {}, |_| {});
         unsafe { Waker::from_raw(raw()) }
     }
 

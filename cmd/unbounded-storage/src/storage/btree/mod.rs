@@ -71,12 +71,7 @@ pub struct RootSnapshot {
 }
 
 impl RootSnapshot {
-    fn new(
-        root_lba: Lba,
-        txn_id: u64,
-        pages: Vec<Lba>,
-        allocator: Arc<Allocator>,
-    ) -> Arc<Self> {
+    fn new(root_lba: Lba, txn_id: u64, pages: Vec<Lba>, allocator: Arc<Allocator>) -> Arc<Self> {
         Arc::new(Self {
             root_lba,
             txn_id,
@@ -159,12 +154,7 @@ impl<B: BlockDevice> BTreeIndex<B> {
         })
         .await?;
 
-        let snapshot = RootSnapshot::new(
-            state.root_lba,
-            state.txn_id,
-            pages,
-            allocator.clone(),
-        );
+        let snapshot = RootSnapshot::new(state.root_lba, state.txn_id, pages, allocator.clone());
 
         Ok(Some(Self {
             device: device.clone(),
@@ -184,10 +174,8 @@ impl<B: BlockDevice> BTreeIndex<B> {
         txn_id: u64,
         entries: BTreeMap<PageKey, LeafEntry>,
     ) -> Result<Self, Error> {
-        let sorted: Vec<(PageKey, LeafEntry)> =
-            entries.iter().map(|(k, v)| (*k, *v)).collect();
-        let (root_lba, pages) =
-            cow::build_tree(&*device, &allocator, txn_id, &sorted).await?;
+        let sorted: Vec<(PageKey, LeafEntry)> = entries.iter().map(|(k, v)| (*k, *v)).collect();
+        let (root_lba, pages) = cow::build_tree(&*device, &allocator, txn_id, &sorted).await?;
 
         // Write meta into slot A by default (active=B means we
         // wrote to A; on next commit we'll write to B).
@@ -235,8 +223,7 @@ impl<B: BlockDevice> BTreeIndex<B> {
                     }
                 }
             }
-            let sorted: Vec<(PageKey, LeafEntry)> =
-                next.iter().map(|(k, v)| (*k, *v)).collect();
+            let sorted: Vec<(PageKey, LeafEntry)> = next.iter().map(|(k, v)| (*k, *v)).collect();
             let txn_id = state.next_txn_id;
             (sorted, txn_id, next)
         };
@@ -245,14 +232,13 @@ impl<B: BlockDevice> BTreeIndex<B> {
             cow::build_tree(&*self.device, &self.allocator, txn_id, &sorted).await?;
 
         let active = self.active_meta.get();
-        let new_active =
-            match meta::write_inactive(&*self.device, active, txn_id, root_lba).await {
-                Ok(s) => s,
-                Err(e) => {
-                    cow::free_all(&self.allocator, &pages);
-                    return Err(e);
-                }
-            };
+        let new_active = match meta::write_inactive(&*self.device, active, txn_id, root_lba).await {
+            Ok(s) => s,
+            Err(e) => {
+                cow::free_all(&self.allocator, &pages);
+                return Err(e);
+            }
+        };
 
         // Commit point: from here on, in-memory mirror, txn
         // counter, active meta slot, and the published snapshot

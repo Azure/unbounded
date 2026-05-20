@@ -26,9 +26,7 @@ use std::sync::Arc;
 
 use crate::storage::alloc::Allocator;
 use crate::storage::blockdev::BlockDevice;
-use crate::storage::btree::page::{
-    self, Decoded, LeafEntry, max_internal_keys, max_leaf_entries,
-};
+use crate::storage::btree::page::{self, Decoded, LeafEntry, max_internal_keys, max_leaf_entries};
 use crate::storage::types::{Error, Lba, PageKey};
 
 /// Cycle guard for DFS traversals over the on-disk tree:
@@ -105,10 +103,7 @@ pub async fn for_each_leaf<B: BlockDevice>(
 
 /// Collect every non-meta LBA reachable from `root_lba`. Used
 /// after open to seed the snapshot's "owned pages" list.
-pub async fn collect_pages<B: BlockDevice>(
-    device: &B,
-    root_lba: Lba,
-) -> Result<Vec<Lba>, Error> {
+pub async fn collect_pages<B: BlockDevice>(device: &B, root_lba: Lba) -> Result<Vec<Lba>, Error> {
     let mut out = Vec::new();
     walk_tree(device, root_lba, |node, decoded| match decoded {
         Decoded::Leaf { .. } | Decoded::Internal { .. } => out.push(node),
@@ -184,9 +179,8 @@ pub async fn build_tree<B: BlockDevice>(
 
     // Build leaves in order. Track (smallest_key, lba) per leaf
     // so the next internal level can be built without re-reading.
-    let mut current: Vec<(PageKey, Lba)> = Vec::with_capacity(
-        sorted_entries.len().div_ceil(leaf_cap),
-    );
+    let mut current: Vec<(PageKey, Lba)> =
+        Vec::with_capacity(sorted_entries.len().div_ceil(leaf_cap));
     for chunk in sorted_entries.chunks(leaf_cap) {
         let lba = allocator.alloc()?;
         allocated.push(lba);
@@ -196,7 +190,8 @@ pub async fn build_tree<B: BlockDevice>(
     }
 
     while current.len() > 1 {
-        let mut next: Vec<(PageKey, Lba)> = Vec::with_capacity(current.len().div_ceil(internal_cap));
+        let mut next: Vec<(PageKey, Lba)> =
+            Vec::with_capacity(current.len().div_ceil(internal_cap));
         for chunk in current.chunks(internal_cap) {
             let keys: Vec<PageKey> = chunk.iter().map(|(k, _)| *k).collect();
             let children: Vec<Lba> = chunk.iter().map(|(_, l)| *l).collect();
