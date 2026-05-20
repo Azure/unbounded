@@ -1,0 +1,9 @@
+{
+  "name": "labels-and-taints",
+  "nodeLabels": {
+    "e2e.unbounded-cloud.io/config": "labels-and-taints"
+  },
+  "registerWithTaints": [
+    "e2e.unbounded-cloud.io/dedicated=agent:NoSchedule"
+  ]
+}

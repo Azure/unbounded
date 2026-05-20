@@ -18,11 +18,7 @@ The test follows a single linear sequence:
 
 Options:
     --verbose                          Enable diagnostic output (network diags).
-
-Environment:
-    AGENT_E2E_CONFIG_NAME              Name for the active node config variant.
-    AGENT_E2E_NODE_LABELS              Comma-separated kubelet node labels.
-    AGENT_E2E_REGISTER_WITH_TAINTS     Comma-separated kubelet registration taints.
+    --node-config PATH                 JSON file with node config variant settings.
 
 Subcommands (called as individual workflow steps):
     create-vm                          Create bridge networking and launch a QEMU VM.
@@ -81,9 +77,6 @@ KIND_CLUSTER_NAME = os.environ.get("KIND_CLUSTER_NAME", "kind")
 KIND_CONTAINER = f"{KIND_CLUSTER_NAME}-control-plane"
 AGENT_MACHINE_NAME = os.environ.get("AGENT_MACHINE_NAME", "agent-e2e")
 AGENT_DEBUG = os.environ.get("AGENT_DEBUG", "")
-AGENT_E2E_CONFIG_NAME = os.environ.get("AGENT_E2E_CONFIG_NAME", "default")
-AGENT_E2E_NODE_LABELS = os.environ.get("AGENT_E2E_NODE_LABELS", "")
-AGENT_E2E_REGISTER_WITH_TAINTS = os.environ.get("AGENT_E2E_REGISTER_WITH_TAINTS", "")
 
 # Site name used when generating the bootstrap script via kubectl-unbounded.
 E2E_SITE_NAME = "e2e"
@@ -120,6 +113,11 @@ MACHINA_CONFIG_FILE = VM_DIR / "machina-config.yaml"
 MACHINE_CONFIG_NAME = f"{AGENT_MACHINE_NAME}-config"
 DAEMON_BINARY_CURRENT = "/usr/local/bin/unbounded-agent-current"
 DAEMON_BINARY_LAST_GOOD = "/usr/local/bin/unbounded-agent-last-good"
+NODE_CONFIG: dict[str, Any] = {
+    "name": "default",
+    "nodeLabels": {},
+    "registerWithTaints": [],
+}
 
 
 # ---------------------------------------------------------------------------
@@ -205,37 +203,73 @@ def _b64(val: str) -> str:
     return base64.b64encode(val.encode()).decode()
 
 
-def _csv_env_values(raw: str) -> list[str]:
-    """Split a comma-separated environment value into non-empty entries."""
-    return [item.strip() for item in raw.split(",") if item.strip()]
+def load_node_config(path: str | None) -> dict[str, Any]:
+    """Load a node config variant from *path*, or return the default config."""
+    if not path:
+        return {
+            "name": "default",
+            "nodeLabels": {},
+            "registerWithTaints": [],
+        }
+
+    config_path = Path(path)
+    if not config_path.is_absolute():
+        config_path = REPO_ROOT / config_path
+
+    try:
+        cfg = json.loads(config_path.read_text())
+    except Exception as exc:
+        die(f"failed to read node config {config_path}: {exc}")
+
+    if not isinstance(cfg, dict):
+        die(f"node config {config_path} must contain a JSON object")
+
+    name = cfg.get("name", config_path.stem)
+    node_labels = cfg.get("nodeLabels", {})
+    register_with_taints = cfg.get("registerWithTaints", [])
+
+    if not isinstance(name, str) or not name:
+        die(f"node config {config_path} field 'name' must be a non-empty string")
+    if not isinstance(node_labels, dict) or not all(
+        isinstance(key, str) and isinstance(value, str)
+        for key, value in node_labels.items()
+    ):
+        die(f"node config {config_path} field 'nodeLabels' must be an object of string values")
+    if not isinstance(register_with_taints, list) or not all(
+        isinstance(taint, str) for taint in register_with_taints
+    ):
+        die(f"node config {config_path} field 'registerWithTaints' must be a list of strings")
+
+    return {
+        "name": name,
+        "nodeLabels": dict(node_labels),
+        "registerWithTaints": list(register_with_taints),
+    }
 
 
 def expected_node_labels() -> dict[str, str]:
     """Return labels configured for this e2e node variant."""
-    labels: dict[str, str] = {}
-    for item in _csv_env_values(AGENT_E2E_NODE_LABELS):
-        if "=" not in item:
-            die(f"invalid AGENT_E2E_NODE_LABELS entry {item!r}, expected key=value")
-        key, value = item.split("=", 1)
-        if not key:
-            die(f"invalid AGENT_E2E_NODE_LABELS entry {item!r}, label key is empty")
-        labels[key] = value
-    return labels
+    return dict(NODE_CONFIG["nodeLabels"])
+
+
+def expected_node_taint_strings() -> list[str]:
+    """Return configured taint strings for this e2e node variant."""
+    return list(NODE_CONFIG["registerWithTaints"])
 
 
 def expected_node_taints() -> list[dict[str, str]]:
     """Return taints configured for this e2e node variant."""
     taints: list[dict[str, str]] = []
-    for item in _csv_env_values(AGENT_E2E_REGISTER_WITH_TAINTS):
+    for item in expected_node_taint_strings():
         if ":" not in item:
-            die(f"invalid AGENT_E2E_REGISTER_WITH_TAINTS entry {item!r}, expected key[=value]:Effect")
+            die(f"invalid registerWithTaints entry {item!r}, expected key[=value]:Effect")
         body, effect = item.rsplit(":", 1)
         if "=" in body:
             key, value = body.split("=", 1)
         else:
             key, value = body, ""
         if not key or not effect:
-            die(f"invalid AGENT_E2E_REGISTER_WITH_TAINTS entry {item!r}, key and effect are required")
+            die(f"invalid registerWithTaints entry {item!r}, key and effect are required")
         taints.append({"key": key, "value": value, "effect": effect})
     return taints
 
@@ -243,18 +277,18 @@ def expected_node_taints() -> list[dict[str, str]]:
 def node_config_bootstrap_args() -> list[str]:
     """Return manual-bootstrap flags for the active node config variant."""
     args: list[str] = []
-    for label in _csv_env_values(AGENT_E2E_NODE_LABELS):
-        args.extend(["--node-label", label])
-    for taint in _csv_env_values(AGENT_E2E_REGISTER_WITH_TAINTS):
+    for key, value in sorted(expected_node_labels().items()):
+        args.extend(["--node-label", f"{key}={value}"])
+    for taint in expected_node_taint_strings():
         args.extend(["--register-with-taint", taint])
     return args
 
 
 def log_active_node_config() -> None:
     """Log the active e2e node config variant."""
-    labels = _csv_env_values(AGENT_E2E_NODE_LABELS)
-    taints = _csv_env_values(AGENT_E2E_REGISTER_WITH_TAINTS)
-    log(f"Agent e2e node config variant: {AGENT_E2E_CONFIG_NAME}")
+    labels = [f"{key}={value}" for key, value in sorted(expected_node_labels().items())]
+    taints = expected_node_taint_strings()
+    log(f"Agent e2e node config variant: {NODE_CONFIG['name']}")
     log(f"  node labels: {', '.join(labels) if labels else '<none>'}")
     log(f"  register-with-taints: {', '.join(taints) if taints else '<none>'}")
 
@@ -1949,7 +1983,7 @@ def validate_machine_cr_created() -> None:
         if actual != value:
             die(f"Machine CR nodeLabels mismatch for {key!r}: got {actual!r}, expected {value!r}")
 
-    expected_taints = _csv_env_values(AGENT_E2E_REGISTER_WITH_TAINTS)
+    expected_taints = expected_node_taint_strings()
     actual_taints = k8s_spec.get("registerWithTaints") or []
     for taint in expected_taints:
         if taint not in actual_taints:
@@ -2284,7 +2318,7 @@ COMMANDS = {
 
 
 def main() -> None:
-    global VERBOSE  # noqa: PLW0603
+    global NODE_CONFIG, VERBOSE  # noqa: PLW0603
 
     parser = argparse.ArgumentParser(
         description="Agent E2E Kind test harness",
@@ -2300,8 +2334,14 @@ def main() -> None:
         default=False,
         help="Enable verbose diagnostic output",
     )
+    parser.add_argument(
+        "--node-config",
+        default="",
+        help="Path to a JSON node config variant file",
+    )
     args = parser.parse_args()
     VERBOSE = args.verbose
+    NODE_CONFIG = load_node_config(args.node_config)
 
     COMMANDS[args.command]()
 

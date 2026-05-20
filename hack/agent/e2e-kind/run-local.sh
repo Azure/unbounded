@@ -26,23 +26,31 @@
 # Usage:
 #   ./hack/agent/e2e-kind/run-local.sh
 #   ./hack/agent/e2e-kind/run-local.sh --verbose   # enable diagnostic output
-#
-# Optional node config variant environment:
-#   AGENT_E2E_CONFIG_NAME=labels-and-taints \
-#   AGENT_E2E_NODE_LABELS=e2e.unbounded-cloud.io/config=labels-and-taints \
-#   AGENT_E2E_REGISTER_WITH_TAINTS=e2e.unbounded-cloud.io/dedicated=agent:NoSchedule \
-#     ./hack/agent/e2e-kind/run-local.sh
+#   ./hack/agent/e2e-kind/run-local.sh \
+#     --node-config hack/agent/e2e-kind/node-configs/labels-and-taints.json
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 E2E="${REPO_ROOT}/hack/agent/e2e-kind/e2e.py"
 
-# Forward --verbose to e2e.py when passed to this script.
-E2E_VERBOSE=""
-for arg in "$@"; do
+# Forward selected options to e2e.py.
+E2E_ARGS=()
+while [[ $# -gt 0 ]]; do
+    arg="$1"
     case "$arg" in
-        --verbose) E2E_VERBOSE="--verbose" ;;
+        --verbose)
+            E2E_ARGS+=("--verbose")
+            shift
+            ;;
+        --node-config)
+            if [[ $# -lt 2 ]]; then
+                echo "[ERROR] --node-config requires a path" >&2
+                exit 1
+            fi
+            E2E_ARGS+=("--node-config" "$2")
+            shift 2
+            ;;
         *) echo "[ERROR] Unknown argument: $arg" >&2; exit 1 ;;
     esac
 done
@@ -130,7 +138,7 @@ cleanup_forwarding() {
 cleanup() {
     info "Running cleanup..."
     cleanup_forwarding "${BRIDGE}"
-    python3 "$E2E" $E2E_VERBOSE cleanup 2>/dev/null || true
+    python3 "$E2E" "${E2E_ARGS[@]}" cleanup 2>/dev/null || true
     kind delete cluster --name "${KIND_CLUSTER_NAME}" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -200,7 +208,7 @@ kubectl -n kube-system rollout status daemonset/kindnet --timeout=60s
 # ---------------------------------------------------------------------------
 # QEMU VM
 # ---------------------------------------------------------------------------
-python3 "$E2E" $E2E_VERBOSE create-vm
+python3 "$E2E" "${E2E_ARGS[@]}" create-vm
 
 # Attach Kind container to VM bridge via a veth pair so that the VM
 # subnet is directly reachable at L2.
@@ -222,7 +230,7 @@ fi
 # ---------------------------------------------------------------------------
 # Install Machine CRD
 # ---------------------------------------------------------------------------
-python3 "$E2E" $E2E_VERBOSE install-machine-crd
+python3 "$E2E" "${E2E_ARGS[@]}" install-machine-crd
 
 # ---------------------------------------------------------------------------
 # Initial join: agent self-registers Machine CR
@@ -233,13 +241,13 @@ echo "  Phase 1: Initial join (no pre-existing CR)"
 echo "============================================"
 echo ""
 
-python3 "$E2E" $E2E_VERBOSE run-agent
-python3 "$E2E" $E2E_VERBOSE wait-for-node
-python3 "$E2E" $E2E_VERBOSE validate-node-config
-python3 "$E2E" $E2E_VERBOSE dump-persisted-agent-config
-python3 "$E2E" $E2E_VERBOSE validate-kube-proxy
-python3 "$E2E" $E2E_VERBOSE validate-machine-cr-created
-python3 "$E2E" $E2E_VERBOSE validate-workload
+python3 "$E2E" "${E2E_ARGS[@]}" run-agent
+python3 "$E2E" "${E2E_ARGS[@]}" wait-for-node
+python3 "$E2E" "${E2E_ARGS[@]}" validate-node-config
+python3 "$E2E" "${E2E_ARGS[@]}" dump-persisted-agent-config
+python3 "$E2E" "${E2E_ARGS[@]}" validate-kube-proxy
+python3 "$E2E" "${E2E_ARGS[@]}" validate-machine-cr-created
+python3 "$E2E" "${E2E_ARGS[@]}" validate-workload
 
 # ---------------------------------------------------------------------------
 # Reset and rejoin
@@ -250,17 +258,17 @@ echo "  Phase 2: Reset and rejoin"
 echo "============================================"
 echo ""
 
-python3 "$E2E" $E2E_VERBOSE reset-agent
-python3 "$E2E" $E2E_VERBOSE delete-machine-cr
+python3 "$E2E" "${E2E_ARGS[@]}" reset-agent
+python3 "$E2E" "${E2E_ARGS[@]}" delete-machine-cr
 
-python3 "$E2E" $E2E_VERBOSE ensure-kind-bridge
-python3 "$E2E" $E2E_VERBOSE run-agent
-python3 "$E2E" $E2E_VERBOSE wait-for-node
-python3 "$E2E" $E2E_VERBOSE validate-node-config
-python3 "$E2E" $E2E_VERBOSE dump-persisted-agent-config
-python3 "$E2E" $E2E_VERBOSE validate-kube-proxy
-python3 "$E2E" $E2E_VERBOSE validate-machine-cr-created
-python3 "$E2E" $E2E_VERBOSE validate-workload
+python3 "$E2E" "${E2E_ARGS[@]}" ensure-kind-bridge
+python3 "$E2E" "${E2E_ARGS[@]}" run-agent
+python3 "$E2E" "${E2E_ARGS[@]}" wait-for-node
+python3 "$E2E" "${E2E_ARGS[@]}" validate-node-config
+python3 "$E2E" "${E2E_ARGS[@]}" dump-persisted-agent-config
+python3 "$E2E" "${E2E_ARGS[@]}" validate-kube-proxy
+python3 "$E2E" "${E2E_ARGS[@]}" validate-machine-cr-created
+python3 "$E2E" "${E2E_ARGS[@]}" validate-workload
 
 # ---------------------------------------------------------------------------
 # Done (cleanup runs via trap)
