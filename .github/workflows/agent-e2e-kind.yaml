@@ -214,15 +214,9 @@ jobs:
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose cleanup
 
   agent-config-e2e:
-    name: agent config e2e (${{ matrix.node_config.name }})
+    name: agent config e2e
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        node_config:
-          - name: labels-and-taints
-            file: hack/agent/e2e-kind/node-configs/labels-and-taints.json
+    timeout-minutes: 60
     env:
       KIND_CLUSTER_NAME: agent-config-e2e
       VM_NAME: agent-config-e2e
@@ -248,29 +242,36 @@ jobs:
       - name: Validate machina controller
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-machina-controller
 
-      - name: Run agent with node config
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose --node-config "${{ matrix.node_config.file }}" run-agent
+      - name: Discover and validate node configs
+        run: |
+          set -euo pipefail
+          mapfile -t NODE_CONFIGS < <(find hack/agent/e2e-kind/node-configs \
+            -maxdepth 1 -type f -name '*.json' | sort)
+          if [[ "${#NODE_CONFIGS[@]}" -eq 0 ]]; then
+            echo "::error::No node config scenarios found"
+            exit 1
+          fi
 
-      - name: Wait for configured node to become Ready
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose wait-for-node
+          last_index=$((${#NODE_CONFIGS[@]} - 1))
+          for index in "${!NODE_CONFIGS[@]}"; do
+            node_config="${NODE_CONFIGS[$index]}"
+            scenario="$(basename "${node_config}" .json)"
+            echo "::group::agent config e2e: ${scenario}"
+            python3 ./hack/agent/e2e-kind/e2e.py --verbose --node-config "${node_config}" run-agent
+            python3 ./hack/agent/e2e-kind/e2e.py --verbose wait-for-node
+            python3 ./hack/agent/e2e-kind/e2e.py --verbose --node-config "${node_config}" validate-node-config
+            python3 ./hack/agent/e2e-kind/e2e.py --verbose dump-persisted-agent-config
+            python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-kube-proxy
+            python3 ./hack/agent/e2e-kind/e2e.py --verbose --node-config "${node_config}" validate-machine-cr-created
+            python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-workload
+            python3 ./hack/agent/e2e-kind/e2e.py --verbose --node-config "${node_config}" validate-node-repave-upgrade
 
-      - name: Validate node config
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose --node-config "${{ matrix.node_config.file }}" validate-node-config
-
-      - name: Dump persisted agent config
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose dump-persisted-agent-config
-
-      - name: Validate kube-proxy on all nodes
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-kube-proxy
-
-      - name: Validate Machine CR config
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose --node-config "${{ matrix.node_config.file }}" validate-machine-cr-created
-
-      - name: Validate workload on configured node
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-workload
-
-      - name: Validate node config repave
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose --node-config "${{ matrix.node_config.file }}" validate-node-repave-upgrade
+            if [[ "${index}" -lt "${last_index}" ]]; then
+              python3 ./hack/agent/e2e-kind/e2e.py --verbose reset-agent
+              python3 ./hack/agent/e2e-kind/e2e.py --verbose delete-machine-cr
+            fi
+            echo "::endgroup::"
+          done
 
       - name: Collect VM logs
         if: always()
@@ -320,7 +321,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
-          name: agent-config-e2e-${{ matrix.node_config.name }}-logs
+          name: agent-config-e2e-logs
           path: logs/
           retention-days: 30
 
