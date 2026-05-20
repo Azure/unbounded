@@ -16,19 +16,11 @@ import (
 )
 
 const (
-	defaultConfigProfile    = "DEFAULT"
 	defaultUbuntuOS         = "Canonical Ubuntu"
 	defaultUbuntuOSVersion  = "24.04"
 	ociMetadataMaxBytes     = 32000
 	replacementPollInterval = 15 * time.Second
 	replacementPollTimeout  = 20 * time.Minute
-)
-
-const (
-	// AuthAPIKey uses the standard OCI config-file API key fields.
-	AuthAPIKey = "api_key"
-	// AuthSecurityToken uses OCI CLI session-token credentials.
-	AuthSecurityToken = "security_token"
 )
 
 const (
@@ -70,9 +62,6 @@ type computeClientFactoryWithAuth func(auth *machineops.OperationAuth) (computeC
 
 // Provider executes operations against Oracle Cloud Infrastructure instances.
 type Provider struct {
-	ConfigFile        string
-	ConfigProfile     string
-	Auth              string
 	NewClient         computeClientFactory
 	NewClientWithAuth computeClientFactoryWithAuth
 }

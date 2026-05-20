@@ -50,9 +50,6 @@ func main() {
 	cmd.Flags().StringVar(&cfg.credentialSecretNamespace, "credential-secret-namespace", "", "Namespace containing MachineOperationCredential referenced Secrets")
 	cmd.Flags().IntVar(&cfg.maxConcurrentReconciles, "max-concurrent-reconciles", 10, "Maximum concurrent MachineOperation reconciles")
 	cmd.Flags().StringVar(&cfg.apiServerEndpoint, "api-server-endpoint", "", "Kubernetes API server endpoint used in host replacement bootstrap config")
-	cmd.Flags().StringVar(&cfg.ociConfigFile, "oci-config-file", "", "Path to OCI config file for OCIInstance operations")
-	cmd.Flags().StringVar(&cfg.ociConfigProfile, "oci-config-profile", "DEFAULT", "OCI config profile for OCIInstance operations")
-	cmd.Flags().StringVar(&cfg.ociAuth, "oci-auth", "api_key", "OCI auth mode for OCIInstance operations: api_key or security_token")
 
 	cmd.CompletionOptions.DisableDefaultCmd = true
 	cmd.SetVersionTemplate(`{{printf "%s\n" .Version}}`)
@@ -71,9 +68,6 @@ type config struct {
 	credentialSecretNamespace string
 	maxConcurrentReconciles   int
 	apiServerEndpoint         string
-	ociConfigFile             string
-	ociConfigProfile          string
-	ociAuth                   string
 }
 
 func run(ctx context.Context, cfg config) error {
@@ -114,7 +108,7 @@ func run(ctx context.Context, cfg config) error {
 		Client: directClient,
 		Providers: []machineops.Provider{
 			&azurevm.Provider{},
-			&ociinstance.Provider{ConfigFile: cfg.ociConfigFile, ConfigProfile: cfg.ociConfigProfile, Auth: cfg.ociAuth},
+			&ociinstance.Provider{},
 		},
 		MaxConcurrentReconciles:   cfg.maxConcurrentReconciles,
 		KubeClient:                kubeClient,

@@ -17,7 +17,7 @@ import (
 
 func (p *Provider) newComputeClientForAuth(auth *machineops.OperationAuth) (computeClient, error) {
 	if auth == nil || auth.Type == "" {
-		return p.newDefaultComputeClient()
+		return nil, fmt.Errorf("OCI auth is required")
 	}
 
 	switch auth.Type {
@@ -54,39 +54,6 @@ func (p *Provider) newComputeClientForAuth(auth *machineops.OperationAuth) (comp
 	default:
 		return nil, fmt.Errorf("unsupported OCI auth type %q", auth.Type)
 	}
-}
-
-func (p *Provider) newDefaultComputeClient() (computeClient, error) {
-	// The controller defaults to long-lived API keys but keeps security-token auth
-	// for local/e2e workflows that mount an OCI CLI config file.
-	profile := strings.TrimSpace(p.ConfigProfile)
-	if profile == "" {
-		profile = defaultConfigProfile
-	}
-
-	auth := strings.TrimSpace(p.Auth)
-	if auth == "" {
-		auth = AuthAPIKey
-	}
-
-	if auth != AuthAPIKey && auth != AuthSecurityToken {
-		return nil, fmt.Errorf("unsupported OCI auth mode %q", p.Auth)
-	}
-
-	provider := common.DefaultConfigProvider()
-
-	if strings.TrimSpace(p.ConfigFile) != "" {
-		switch auth {
-		case AuthAPIKey:
-			provider = common.CustomProfileConfigProvider(p.ConfigFile, profile)
-		case AuthSecurityToken:
-			provider = common.CustomProfileSessionTokenConfigProvider(p.ConfigFile, profile)
-		}
-	} else if auth != AuthAPIKey {
-		return nil, fmt.Errorf("oci auth mode %q requires --oci-config-file", auth)
-	}
-
-	return newComputeClientWithProvider(provider)
 }
 
 func newComputeClientWithProvider(provider common.ConfigurationProvider) (computeClient, error) {
