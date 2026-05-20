@@ -11,6 +11,11 @@ func init() {
 	SchemeBuilder.Register(&Machine{}, &MachineList{})
 }
 
+const (
+	// MachineSiteLabelKey identifies the site a Machine belongs to.
+	MachineSiteLabelKey = "unbounded-cloud.io/site"
+)
+
 // +kubebuilder:object:root=true
 // +kubebuilder:resource:scope=Cluster,shortName=mach
 // +kubebuilder:subresource:status

@@ -168,15 +168,15 @@ func newAzureVMClient(subscriptionID string, auth *machineops.OperationAuth) (az
 	case unboundedv1alpha3.MachineOperationCredentialAuthExternalPlugin:
 		tenantID, err := auth.RequiredSecretValue("tenantID")
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("read Azure external plugin tenantID: %w", err)
 		}
 		clientID, err := auth.RequiredSecretValue("clientID")
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("read Azure external plugin clientID: %w", err)
 		}
 		clientSecret, err := auth.RequiredSecretValue("clientSecret")
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("read Azure external plugin clientSecret: %w", err)
 		}
 
 		cred, err := azidentity.NewClientSecretCredential(tenantID, clientID, clientSecret, nil)
@@ -244,7 +244,7 @@ func (c *armAzureVMClient) Restart(ctx context.Context, resourceGroupName, vmNam
 
 func (c *armAzureVMClient) Replace(ctx context.Context, resourceGroupName, vmName, userData string) error {
 	if err := validateAzureCustomData(userData); err != nil {
-		return err
+		return fmt.Errorf("validate Azure replacement custom data: %w", err)
 	}
 
 	vm, err := c.client.Get(ctx, resourceGroupName, vmName, nil)

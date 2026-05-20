@@ -24,23 +24,23 @@ func (p *Provider) newComputeClientForAuth(auth *machineops.OperationAuth) (comp
 	case unboundedv1alpha3.MachineOperationCredentialAuthExternalPlugin:
 		tenancyOCID, err := auth.RequiredSecretValue("tenancyOCID")
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("read OCI external plugin tenancyOCID: %w", err)
 		}
 		userOCID, err := auth.RequiredSecretValue("userOCID")
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("read OCI external plugin userOCID: %w", err)
 		}
 		region, err := auth.RequiredSecretValue("region")
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("read OCI external plugin region: %w", err)
 		}
 		fingerprint, err := auth.RequiredSecretValue("fingerprint")
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("read OCI external plugin fingerprint: %w", err)
 		}
 		privateKey, err := auth.RequiredSecretValue("privateKey")
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("read OCI external plugin privateKey: %w", err)
 		}
 
 		var passphrase *string
@@ -93,7 +93,7 @@ func (c *ociComputeClient) InstanceAction(ctx context.Context, instanceID, actio
 func (c *ociComputeClient) GetInstance(ctx context.Context, instanceID string) (core.Instance, error) {
 	response, err := c.compute.GetInstance(ctx, core.GetInstanceRequest{InstanceId: &instanceID})
 	if err != nil {
-		return core.Instance{}, err
+		return core.Instance{}, fmt.Errorf("get OCI instance %s: %w", instanceID, err)
 	}
 
 	return response.Instance, nil
@@ -117,7 +117,7 @@ func (c *ociComputeClient) LaunchInstance(ctx context.Context, details core.Laun
 		OpcRetryToken:         &retryToken,
 	})
 	if err != nil {
-		return core.Instance{}, err
+		return core.Instance{}, fmt.Errorf("launch OCI instance: %w", err)
 	}
 
 	return response.Instance, nil
@@ -170,7 +170,7 @@ func (c *ociComputeClient) ListVnicAttachments(ctx context.Context, compartmentI
 func (c *ociComputeClient) GetVnic(ctx context.Context, vnicID string) (core.Vnic, error) {
 	response, err := c.network.GetVnic(ctx, core.GetVnicRequest{VnicId: &vnicID})
 	if err != nil {
-		return core.Vnic{}, err
+		return core.Vnic{}, fmt.Errorf("get OCI VNIC %s: %w", vnicID, err)
 	}
 
 	return response.Vnic, nil

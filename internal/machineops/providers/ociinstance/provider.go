@@ -85,7 +85,7 @@ func (p *Provider) Supports(operation unboundedv1alpha3.OperationKind) bool {
 func (p *Provider) Execute(ctx context.Context, request machineops.OperationRequest) (machineops.OperationResult, error) {
 	instanceID, err := parseOCIInstanceProviderID(request.ProviderID)
 	if err != nil {
-		return machineops.OperationResult{}, err
+		return machineops.OperationResult{}, fmt.Errorf("parse OCI providerID: %w", err)
 	}
 
 	client, err := p.client(request.Auth)
@@ -94,15 +94,24 @@ func (p *Provider) Execute(ctx context.Context, request machineops.OperationRequ
 	}
 
 	if request.Operation == unboundedv1alpha3.OperationHostReplace {
-		return p.executeReplace(ctx, client, instanceID, request)
+		result, err := p.executeReplace(ctx, client, instanceID, request)
+		if err != nil {
+			return machineops.OperationResult{}, fmt.Errorf("replace OCI instance %s: %w", instanceID, err)
+		}
+
+		return result, nil
 	}
 
 	action, err := actionForOperation(request.Operation)
 	if err != nil {
-		return machineops.OperationResult{}, err
+		return machineops.OperationResult{}, fmt.Errorf("resolve OCI action for %s: %w", request.Operation, err)
 	}
 
-	return machineops.OperationResult{}, client.InstanceAction(ctx, instanceID, action)
+	if err := client.InstanceAction(ctx, instanceID, action); err != nil {
+		return machineops.OperationResult{}, fmt.Errorf("run OCI %s for %s: %w", action, instanceID, err)
+	}
+
+	return machineops.OperationResult{}, nil
 }
 
 func (p *Provider) Cleanup(ctx context.Context, request machineops.OperationRequest, result machineops.OperationResult) error {
@@ -112,7 +121,7 @@ func (p *Provider) Cleanup(ctx context.Context, request machineops.OperationRequ
 
 	instanceID, err := parseOCIInstanceProviderID(result.CleanupProviderID)
 	if err != nil {
-		return err
+		return fmt.Errorf("parse cleanup OCI providerID: %w", err)
 	}
 
 	if request.Machine != nil {
@@ -126,7 +135,7 @@ func (p *Provider) Cleanup(ctx context.Context, request machineops.OperationRequ
 
 	client, err := p.client(request.Auth)
 	if err != nil {
-		return err
+		return fmt.Errorf("create OCI cleanup client: %w", err)
 	}
 
 	instance, err := client.GetInstance(ctx, instanceID)
@@ -138,7 +147,11 @@ func (p *Provider) Cleanup(ctx context.Context, request machineops.OperationRequ
 		return nil
 	}
 
-	return client.TerminateInstance(ctx, instanceID, retryToken(request, "terminate-old"))
+	if err := client.TerminateInstance(ctx, instanceID, retryToken(request, "terminate-old")); err != nil {
+		return fmt.Errorf("terminate old OCI instance %s: %w", instanceID, err)
+	}
+
+	return nil
 }
 
 func (p *Provider) client(auth *machineops.OperationAuth) (computeClient, error) {

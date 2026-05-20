@@ -13,14 +13,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	netv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 )
 
-const (
-	machineSiteLabelKey = "unbounded-cloud.io/site"
-	netSiteLabelKey     = "net.unbounded-cloud.io/site"
-)
-
-var machineSiteLabelKeys = []string{machineSiteLabelKey, netSiteLabelKey}
+var machineSiteLabelKeys = []string{unboundedv1alpha3.MachineSiteLabelKey, netv1alpha1.SiteLabelKey}
 
 type authResolutionFailure struct {
 	Reason  string
@@ -46,29 +42,44 @@ func (a *OperationAuth) RequiredSecretValue(key string) (string, error) {
 }
 
 func (r *MachineOperationReconciler) resolveOperationAuth(ctx context.Context, machine *unboundedv1alpha3.Machine) (*OperationAuth, *authResolutionFailure, error) {
-	target, ok := operationAuthTargetFor(machine)
-	if !ok {
-		return nil, nil, nil
+	target, failure := operationAuthTargetFor(machine)
+	if failure != nil {
+		return nil, failure, nil
 	}
 
 	credential, failure, err := r.machineOperationCredentialFor(ctx, target)
-	if credential == nil || failure != nil || err != nil {
+	if failure != nil || err != nil {
 		return nil, failure, err
+	}
+	if credential == nil {
+		return nil, &authResolutionFailure{
+			Reason:  "AuthNotFound",
+			Message: fmt.Sprintf("no MachineOperationCredential matches site %q and provider %q", target.SiteName, target.Provider),
+		}, nil
 	}
 
 	return r.authFromCredential(ctx, credential)
 }
 
-func operationAuthTargetFor(machine *unboundedv1alpha3.Machine) (operationAuthTarget, bool) {
+func operationAuthTargetFor(machine *unboundedv1alpha3.Machine) (operationAuthTarget, *authResolutionFailure) {
 	target := operationAuthTarget{
 		SiteName: siteNameFromLabels(machine.Labels),
 		Provider: strings.TrimSpace(machine.Spec.Provider),
 	}
-	if target.SiteName == "" || target.Provider == "" {
-		return operationAuthTarget{}, false
+	if target.SiteName == "" {
+		return operationAuthTarget{}, &authResolutionFailure{
+			Reason:  "AuthInvalid",
+			Message: fmt.Sprintf("Machine %s is missing site label %q", machine.Name, unboundedv1alpha3.MachineSiteLabelKey),
+		}
+	}
+	if target.Provider == "" {
+		return operationAuthTarget{}, &authResolutionFailure{
+			Reason:  "AuthInvalid",
+			Message: fmt.Sprintf("Machine %s is missing spec.provider", machine.Name),
+		}
 	}
 
-	return target, true
+	return target, nil
 }
 
 func (r *MachineOperationReconciler) machineOperationCredentialFor(

@@ -100,6 +100,33 @@ Kubernetes join configuration.
 
 Machine operation credentials are selected by the Machine site label. Providers that support OIDC/workload identity use `WorkloadIdentity`; providers or sites that need provider-specific credential material use `ExternalPlugin` with a referenced Secret.
 
+```yaml
+apiVersion: unbounded-cloud.io/v1alpha3
+kind: MachineOperationCredential
+metadata:
+  name: remote-azure
+spec:
+  siteName: remote
+  provider: AzureVM
+  auth:
+    mode: WorkloadIdentity
+```
+
+```yaml
+apiVersion: unbounded-cloud.io/v1alpha3
+kind: MachineOperationCredential
+metadata:
+  name: remote-oci
+spec:
+  siteName: remote
+  provider: OCIInstance
+  auth:
+    mode: ExternalPlugin
+    secretRef:
+      namespace: unbounded-kube
+      name: remote-oci-auth
+```
+
 ## MachineOperation
 
 | Property | Value |

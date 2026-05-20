@@ -209,7 +209,7 @@ func (h *machineRegisterHandler) executeAfterValidation(ctx context.Context) err
 		ObjectMeta: metav1.ObjectMeta{
 			Name: h.name,
 			Labels: map[string]string{
-				"unbounded-cloud.io/site": h.siteName,
+				v1alpha3.MachineSiteLabelKey: h.siteName,
 			},
 		},
 		Spec: v1alpha3.MachineSpec{
