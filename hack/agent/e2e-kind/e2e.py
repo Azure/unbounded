@@ -1926,6 +1926,7 @@ def start_machina_controller() -> None:
     if not api_server:
         die("Could not determine API server URL from kubeconfig")
 
+    VM_DIR.mkdir(parents=True, exist_ok=True)
     MACHINA_CONFIG_FILE.write_text(textwrap.dedent(f"""\
         apiServerEndpoint: {api_server}
         metricsAddr: "0"
