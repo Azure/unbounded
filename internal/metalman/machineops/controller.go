@@ -123,7 +123,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, err
 	} else if older != "" {
 		message := fmt.Sprintf("waiting for older host operation %s", older)
-
 		return ctrl.Result{RequeueAfter: r.pollInterval()}, r.updateOperationStatus(ctx, op.Name, func(latest *v1alpha3.MachineOperation) {
 			latest.Status.Phase = v1alpha3.OperationPhasePending
 			latest.Status.Message = message
@@ -135,7 +134,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-
 		if !owned {
 			return ctrl.Result{}, nil
 		}
@@ -179,7 +177,6 @@ func (r *Reconciler) snapshotTargets(ctx context.Context, op *v1alpha3.MachineOp
 	}
 
 	now := r.now()
-
 	targetStatuses := make([]v1alpha3.MachineOperationTargetStatus, 0, len(targets))
 	for _, machine := range targets {
 		targetStatuses = append(targetStatuses, v1alpha3.MachineOperationTargetStatus{
@@ -218,7 +215,6 @@ func (r *Reconciler) resolveTargets(ctx context.Context, op *v1alpha3.MachineOpe
 		if !r.ownsMachine(&machine) {
 			return nil, nil
 		}
-
 		if machine.Spec.Provider != "" || machine.Spec.ProviderID != "" {
 			return nil, nil
 		}
@@ -288,7 +284,6 @@ func (r *Reconciler) advanceTargets(ctx context.Context, op *v1alpha3.MachineOpe
 	for _, target := range op.Status.Targets {
 		if target.Phase == v1alpha3.OperationPhaseInProgress {
 			active++
-
 			selected = append(selected, target)
 		}
 	}
@@ -298,7 +293,6 @@ func (r *Reconciler) advanceTargets(ctx context.Context, op *v1alpha3.MachineOpe
 			if target.Phase != "" && target.Phase != v1alpha3.OperationPhasePending {
 				continue
 			}
-
 			if active >= maxConcurrent {
 				break
 			}
@@ -314,22 +308,17 @@ func (r *Reconciler) advanceTargets(ctx context.Context, op *v1alpha3.MachineOpe
 	}
 
 	changes := make([]targetChange, len(selected))
-
 	var wg sync.WaitGroup
 	for i, target := range selected {
 		wg.Add(1)
-
 		go func(i int, target v1alpha3.MachineOperationTargetStatus) {
 			defer wg.Done()
-
 			changes[i] = r.advanceTarget(ctx, op, target)
 		}(i, target)
 	}
-
 	wg.Wait()
 
 	requeue := r.pollInterval()
-
 	return changes, requeue
 }
 
@@ -504,12 +493,10 @@ func (r *Reconciler) waitForPowerAction(target v1alpha3.MachineOperationTargetSt
 	if target.Stage != stage || target.LastAttemptAt == nil {
 		return targetChange{}, false
 	}
-
 	if now.Sub(target.LastAttemptAt.Time) < r.powerActionTimeout() {
 		target.Message = waitingMessage
 		return targetChange{target: target}, true
 	}
-
 	if target.Attempts >= r.maxAttempts() {
 		return failTarget(target, reasonExecutionFailed, fmt.Sprintf("%s after %d attempts", timeoutMessage, target.Attempts), now), true
 	}
@@ -558,7 +545,6 @@ func computeReplaceTargets(machine *v1alpha3.Machine) *v1alpha3.OperationsStatus
 		specReboot = machine.Spec.Operations.RebootCounter
 		specRepave = machine.Spec.Operations.RepaveCounter
 	}
-
 	if machine.Status.Operations != nil {
 		statusReboot = machine.Status.Operations.RebootCounter
 		statusRepave = machine.Status.Operations.RepaveCounter
@@ -597,12 +583,10 @@ func (r *Reconciler) applyTargetChanges(ctx context.Context, opName string, chan
 
 	return r.updateOperationStatus(ctx, opName, func(latest *v1alpha3.MachineOperation) {
 		byName := map[string]v1alpha3.MachineOperationTargetStatus{}
-
 		for _, change := range changes {
 			if change.aggregateOnly || change.target.MachineRef == "" {
 				continue
 			}
-
 			byName[change.target.MachineRef] = change.target
 		}
 
@@ -622,7 +606,6 @@ func (r *Reconciler) aggregateStatus(op *v1alpha3.MachineOperation) {
 	}
 
 	var complete, failed, inProgress, pending int
-
 	for _, target := range op.Status.Targets {
 		switch target.Phase {
 		case v1alpha3.OperationPhaseComplete:
@@ -641,18 +624,15 @@ func (r *Reconciler) aggregateStatus(op *v1alpha3.MachineOperation) {
 
 	if complete+failed == len(op.Status.Targets) {
 		now := r.now()
-
 		op.Status.CompletedAt = &now
 		if failed > 0 {
 			op.Status.Phase = v1alpha3.OperationPhaseFailed
 			setCompletedCondition(op, metav1.ConditionFalse, "TargetFailed", message)
-
 			return
 		}
 
 		op.Status.Phase = v1alpha3.OperationPhaseComplete
 		setCompletedCondition(op, metav1.ConditionTrue, reasonSucceeded, message)
-
 		return
 	}
 
@@ -670,11 +650,9 @@ func (r *Reconciler) olderActiveOperation(ctx context.Context, op *v1alpha3.Mach
 		if candidate.Name == op.Name || candidate.Status.IsTerminal() || !isHostOperation(candidate.Spec.OperationKind) {
 			continue
 		}
-
 		if !r.operationBelongsToSite(ctx, &candidate) {
 			continue
 		}
-
 		if operationBefore(&candidate, op) {
 			return candidate.Name, nil
 		}
@@ -725,7 +703,6 @@ func (r *Reconciler) reconcileTerminal(ctx context.Context, op *v1alpha3.Machine
 	}
 
 	deadline := op.Status.CompletedAt.Add(time.Duration(*op.Spec.TTLSecondsAfterFinished) * time.Second)
-
 	now := r.now().Time
 	if now.Before(deadline) {
 		return ctrl.Result{RequeueAfter: deadline.Sub(now)}, nil
@@ -753,21 +730,17 @@ func (r *Reconciler) updateOperationStatus(ctx context.Context, name string, mut
 
 func (r *Reconciler) finishOperation(ctx context.Context, name string, phase v1alpha3.OperationPhase, reason, message string) error {
 	now := r.now()
-
 	return r.updateOperationStatus(ctx, name, func(latest *v1alpha3.MachineOperation) {
 		if latest.Status.StartedAt == nil {
 			latest.Status.StartedAt = &now
 		}
-
 		latest.Status.Phase = phase
 		latest.Status.Message = message
 		latest.Status.CompletedAt = &now
-
 		conditionStatus := metav1.ConditionTrue
 		if phase == v1alpha3.OperationPhaseFailed {
 			conditionStatus = metav1.ConditionFalse
 		}
-
 		setCompletedCondition(latest, conditionStatus, reason, message)
 	})
 }

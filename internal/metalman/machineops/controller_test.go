@@ -315,7 +315,6 @@ func (r *recordingPowerClient) ForMachine(_ context.Context, machine *v1alpha3.M
 	if r.states == nil {
 		r.states = map[string]redfish.PowerState{}
 	}
-
 	if _, ok := r.states[machine.Name]; !ok {
 		r.states[machine.Name] = redfish.PowerOn
 	}
