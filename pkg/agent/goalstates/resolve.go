@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -119,6 +120,15 @@ func resolveKubelet(cfg *config.AgentConfig) (Kubelet, error) {
 		labels = make(map[string]string)
 	}
 
+	nodeIP := strings.TrimSpace(cfg.Kubelet.NodeIP)
+	if nodeIP != "" {
+		for _, value := range strings.Split(nodeIP, ",") {
+			if _, err := netip.ParseAddr(strings.TrimSpace(value)); err != nil {
+				return zero, fmt.Errorf("invalid Kubelet.NodeIP %q: %w", cfg.Kubelet.NodeIP, err)
+			}
+		}
+	}
+
 	// Skip the "must have one" check when both fields are empty: in the
 	// metalman PXE/attestation flow the agent config intentionally ships
 	// with an empty Kubelet.Auth and the bootstrap token is filled in
@@ -139,6 +149,7 @@ func resolveKubelet(cfg *config.AgentConfig) (Kubelet, error) {
 		APIServer:          cfg.Kubelet.ApiServer,
 		CACertData:         caCert,
 		ClusterDNS:         cfg.Cluster.ClusterDNS,
+		NodeIP:             nodeIP,
 		NodeLabels:         labels,
 		RegisterWithTaints: cfg.Kubelet.RegisterWithTaints,
 	}, nil
