@@ -11,30 +11,26 @@ func init() {
 	SchemeBuilder.Register(&MachineOperationCredential{}, &MachineOperationCredentialList{})
 }
 
-// MachineOperationAuthType identifies how a MachineOperation controller should
-// authenticate to a cloud provider.
-// +kubebuilder:validation:Enum=DefaultAzureCredential;ServicePrincipalSecret;APIKey
-type MachineOperationAuthType string
+// MachineOperationCredentialAuthMode identifies the credential source used by a
+// MachineOperation controller.
+// +kubebuilder:validation:Enum=WorkloadIdentity;ExternalPlugin
+type MachineOperationCredentialAuthMode string
 
 const (
-	// MachineOperationAuthDefaultAzureCredential uses the Azure SDK default
-	// credential chain configured in the controller environment.
-	MachineOperationAuthDefaultAzureCredential MachineOperationAuthType = "DefaultAzureCredential"
+	// MachineOperationCredentialAuthWorkloadIdentity uses OIDC/workload identity
+	// credentials available to the controller process.
+	MachineOperationCredentialAuthWorkloadIdentity MachineOperationCredentialAuthMode = "WorkloadIdentity"
 
-	// MachineOperationAuthServicePrincipalSecret uses an Azure service principal
-	// stored in a referenced Secret.
-	MachineOperationAuthServicePrincipalSecret MachineOperationAuthType = "ServicePrincipalSecret"
-
-	// MachineOperationAuthAPIKey uses provider-specific API key fields stored in
-	// a referenced Secret.
-	MachineOperationAuthAPIKey MachineOperationAuthType = "APIKey"
+	// MachineOperationCredentialAuthExternalPlugin delegates credential handling
+	// to provider-specific external plugin configuration.
+	MachineOperationCredentialAuthExternalPlugin MachineOperationCredentialAuthMode = "ExternalPlugin"
 )
 
 // +kubebuilder:object:root=true
 // +kubebuilder:resource:scope=Cluster,shortName=mocred
 // +kubebuilder:printcolumn:name="Site",type="string",JSONPath=".spec.siteName"
 // +kubebuilder:printcolumn:name="Provider",type="string",JSONPath=".spec.provider"
-// +kubebuilder:printcolumn:name="Auth Type",type="string",JSONPath=".spec.authType"
+// +kubebuilder:printcolumn:name="Auth Mode",type="string",JSONPath=".spec.auth.mode"
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
 // MachineOperationCredential defines the credential source used by external
@@ -69,12 +65,19 @@ type MachineOperationCredentialSpec struct {
 	// +kubebuilder:validation:Enum=AzureVM;OCIInstance
 	Provider string `json:"provider"`
 
-	// AuthType identifies how the provider should authenticate.
+	// Auth identifies how the provider should authenticate.
 	// +kubebuilder:validation:Required
-	AuthType MachineOperationAuthType `json:"authType"`
+	Auth MachineOperationCredentialAuth `json:"auth"`
+}
 
-	// SecretRef references provider-specific credential material. It is not
-	// required for auth types that use ambient controller credentials.
+// MachineOperationCredentialAuth defines the credential source configuration.
+type MachineOperationCredentialAuth struct {
+	// Mode identifies the credential source.
+	// +kubebuilder:validation:Required
+	Mode MachineOperationCredentialAuthMode `json:"mode"`
+
+	// SecretRef references provider-specific external plugin configuration. It
+	// is required for ExternalPlugin mode.
 	// +optional
 	SecretRef *NamespacedSecretReference `json:"secretRef,omitempty"`
 }

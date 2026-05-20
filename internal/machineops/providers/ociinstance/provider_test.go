@@ -55,7 +55,7 @@ func TestProviderExecutePassesAuthToClientFactory(t *testing.T) {
 	t.Parallel()
 
 	auth := &machineops.OperationAuth{
-		Type: unboundedv1alpha3.MachineOperationAuthAPIKey,
+		Mode: unboundedv1alpha3.MachineOperationCredentialAuthExternalPlugin,
 		SecretData: map[string]string{
 			"tenancyOCID": "tenancy",
 			"userOCID":    "user",
@@ -97,7 +97,7 @@ func TestNewComputeClientForAuthValidatesAuth(t *testing.T) {
 		{
 			name: "api key missing private key",
 			auth: &machineops.OperationAuth{
-				Type: unboundedv1alpha3.MachineOperationAuthAPIKey,
+				Mode: unboundedv1alpha3.MachineOperationCredentialAuthExternalPlugin,
 				SecretData: map[string]string{
 					"tenancyOCID": "tenancy",
 					"userOCID":    "user",
@@ -108,11 +108,11 @@ func TestNewComputeClientForAuthValidatesAuth(t *testing.T) {
 			wantErr: "privateKey",
 		},
 		{
-			name: "unsupported auth type",
+			name: "unsupported auth mode",
 			auth: &machineops.OperationAuth{
-				Type: unboundedv1alpha3.MachineOperationAuthServicePrincipalSecret,
+				Mode: unboundedv1alpha3.MachineOperationCredentialAuthWorkloadIdentity,
 			},
-			wantErr: "unsupported OCI auth type",
+			wantErr: "unsupported OCI auth mode",
 		},
 	}
 

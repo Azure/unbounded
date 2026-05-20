@@ -44,7 +44,7 @@ type OperationRequest struct {
 // OperationAuth is the provider-facing credential material resolved for an
 // operation. Provider packages own the interpretation of SecretData.
 type OperationAuth struct {
-	Type       unboundedv1alpha3.MachineOperationAuthType
+	Mode       unboundedv1alpha3.MachineOperationCredentialAuthMode
 	SecretData map[string]string
 }
 

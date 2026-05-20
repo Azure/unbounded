@@ -16,12 +16,12 @@ import (
 )
 
 func (p *Provider) newComputeClientForAuth(auth *machineops.OperationAuth) (computeClient, error) {
-	if auth == nil || auth.Type == "" {
+	if auth == nil || auth.Mode == "" {
 		return nil, fmt.Errorf("OCI auth is required")
 	}
 
-	switch auth.Type {
-	case unboundedv1alpha3.MachineOperationAuthAPIKey:
+	switch auth.Mode {
+	case unboundedv1alpha3.MachineOperationCredentialAuthExternalPlugin:
 		tenancyOCID, err := auth.RequiredSecretValue("tenancyOCID")
 		if err != nil {
 			return nil, err
@@ -52,7 +52,7 @@ func (p *Provider) newComputeClientForAuth(auth *machineops.OperationAuth) (comp
 
 		return newComputeClientWithProvider(provider)
 	default:
-		return nil, fmt.Errorf("unsupported OCI auth type %q", auth.Type)
+		return nil, fmt.Errorf("unsupported OCI auth mode %q", auth.Mode)
 	}
 }
 

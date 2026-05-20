@@ -114,8 +114,22 @@ func (r *MachineOperationReconciler) authFromCredential(
 	ctx context.Context,
 	credential *unboundedv1alpha3.MachineOperationCredential,
 ) (*OperationAuth, *authResolutionFailure, error) {
-	auth := &OperationAuth{Type: credential.Spec.AuthType}
-	if credential.Spec.SecretRef == nil {
+	auth := &OperationAuth{Mode: credential.Spec.Auth.Mode}
+	if auth.Mode == "" {
+		return nil, &authResolutionFailure{
+			Reason:  "AuthInvalid",
+			Message: fmt.Sprintf("MachineOperationCredential %s has an empty spec.auth.mode", credential.Name),
+		}, nil
+	}
+
+	if credential.Spec.Auth.Mode == unboundedv1alpha3.MachineOperationCredentialAuthExternalPlugin && credential.Spec.Auth.SecretRef == nil {
+		return nil, &authResolutionFailure{
+			Reason:  "AuthInvalid",
+			Message: fmt.Sprintf("MachineOperationCredential %s uses ExternalPlugin mode without spec.auth.secretRef", credential.Name),
+		}, nil
+	}
+
+	if credential.Spec.Auth.SecretRef == nil {
 		return auth, nil, nil
 	}
 
@@ -136,11 +150,11 @@ func (r *MachineOperationReconciler) credentialSecret(
 	ctx context.Context,
 	credential *unboundedv1alpha3.MachineOperationCredential,
 ) (*corev1.Secret, *authResolutionFailure, error) {
-	ref := credential.Spec.SecretRef
+	ref := credential.Spec.Auth.SecretRef
 	if strings.TrimSpace(ref.Name) == "" || strings.TrimSpace(ref.Namespace) == "" {
 		return nil, &authResolutionFailure{
 			Reason:  "AuthInvalid",
-			Message: fmt.Sprintf("MachineOperationCredential %s has an incomplete spec.secretRef", credential.Name),
+			Message: fmt.Sprintf("MachineOperationCredential %s has an incomplete spec.auth.secretRef", credential.Name),
 		}, nil
 	}
 

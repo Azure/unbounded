@@ -66,10 +66,12 @@ func TestMachineOperationReconciler_ResolvesSiteCredential(t *testing.T) {
 		Spec: unboundedv1alpha3.MachineOperationCredentialSpec{
 			SiteName: "site-a",
 			Provider: unboundedv1alpha3.ExternalProviderAzureVM,
-			AuthType: unboundedv1alpha3.MachineOperationAuthServicePrincipalSecret,
-			SecretRef: &unboundedv1alpha3.NamespacedSecretReference{
-				Namespace: "unbounded-kube",
-				Name:      "site-a-azure-sp",
+			Auth: unboundedv1alpha3.MachineOperationCredentialAuth{
+				Mode: unboundedv1alpha3.MachineOperationCredentialAuthExternalPlugin,
+				SecretRef: &unboundedv1alpha3.NamespacedSecretReference{
+					Namespace: "unbounded-kube",
+					Name:      "site-a-azure-sp",
+				},
 			},
 		},
 	}
@@ -89,7 +91,7 @@ func TestMachineOperationReconciler_ResolvesSiteCredential(t *testing.T) {
 	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "op-1"}})
 	require.NoError(t, err)
 	require.Equal(t, ctrl.Result{}, result)
-	require.Equal(t, []unboundedv1alpha3.MachineOperationAuthType{unboundedv1alpha3.MachineOperationAuthServicePrincipalSecret}, provider.authTypes)
+	require.Equal(t, []unboundedv1alpha3.MachineOperationCredentialAuthMode{unboundedv1alpha3.MachineOperationCredentialAuthExternalPlugin}, provider.authModes)
 	require.Equal(t, "tenant", provider.authData[0]["tenantID"])
 	require.Equal(t, "client", provider.authData[0]["clientID"])
 	require.Equal(t, "secret", provider.authData[0]["clientSecret"])
@@ -108,7 +110,7 @@ func TestOperationAuthTargetForUsesNetSiteLabel(t *testing.T) {
 	require.Equal(t, unboundedv1alpha3.ExternalProviderAzureVM, target.Provider)
 }
 
-func TestMachineOperationReconciler_PassesSecretlessCredentialToProvider(t *testing.T) {
+func TestMachineOperationReconciler_PassesWorkloadIdentityCredentialToProvider(t *testing.T) {
 	t.Parallel()
 
 	s := newOperationTestScheme(t)
@@ -120,7 +122,9 @@ func TestMachineOperationReconciler_PassesSecretlessCredentialToProvider(t *test
 		Spec: unboundedv1alpha3.MachineOperationCredentialSpec{
 			SiteName: "site-a",
 			Provider: unboundedv1alpha3.ExternalProviderAzureVM,
-			AuthType: unboundedv1alpha3.MachineOperationAuthAPIKey,
+			Auth: unboundedv1alpha3.MachineOperationCredentialAuth{
+				Mode: unboundedv1alpha3.MachineOperationCredentialAuthWorkloadIdentity,
+			},
 		},
 	}
 	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReboot: true}}
@@ -131,7 +135,7 @@ func TestMachineOperationReconciler_PassesSecretlessCredentialToProvider(t *test
 	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "op-1"}})
 	require.NoError(t, err)
 	require.Equal(t, ctrl.Result{}, result)
-	require.Equal(t, []unboundedv1alpha3.MachineOperationAuthType{unboundedv1alpha3.MachineOperationAuthAPIKey}, provider.authTypes)
+	require.Equal(t, []unboundedv1alpha3.MachineOperationCredentialAuthMode{unboundedv1alpha3.MachineOperationCredentialAuthWorkloadIdentity}, provider.authModes)
 	require.Nil(t, provider.authData[0])
 }
 
@@ -193,6 +197,62 @@ func TestMachineOperationReconciler_FailsMissingCredentialSecret(t *testing.T) {
 	require.Equal(t, "AuthSecretNotFound", cond.Reason)
 }
 
+func TestMachineOperationReconciler_FailsExternalPluginWithoutSecretRef(t *testing.T) {
+	t.Parallel()
+
+	s := newOperationTestScheme(t)
+	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
+	machine.Labels = map[string]string{"unbounded-cloud.io/site": "site-a"}
+	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReboot)
+	credential := newMachineOperationCredential("cred-a", "site-a", unboundedv1alpha3.ExternalProviderAzureVM)
+	credential.Spec.Auth.SecretRef = nil
+	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReboot: true}}
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, credential).WithStatusSubresource(op).Build()
+	reconciler := &MachineOperationReconciler{Client: c, Providers: []Provider{provider}, Now: fixedOperationNow}
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "op-1"}})
+	require.NoError(t, err)
+	require.Equal(t, ctrl.Result{}, result)
+	require.Empty(t, provider.calls)
+
+	var updated unboundedv1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
+	require.Equal(t, unboundedv1alpha3.OperationPhaseFailed, updated.Status.Phase)
+
+	cond := apimeta.FindStatusCondition(updated.Status.Conditions, OperationConditionCompleted)
+	require.NotNil(t, cond)
+	require.Equal(t, "AuthInvalid", cond.Reason)
+}
+
+func TestMachineOperationReconciler_FailsCredentialWithEmptyAuthMode(t *testing.T) {
+	t.Parallel()
+
+	s := newOperationTestScheme(t)
+	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
+	machine.Labels = map[string]string{"unbounded-cloud.io/site": "site-a"}
+	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReboot)
+	credential := newMachineOperationCredential("cred-a", "site-a", unboundedv1alpha3.ExternalProviderAzureVM)
+	credential.Spec.Auth.Mode = ""
+	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReboot: true}}
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, credential).WithStatusSubresource(op).Build()
+	reconciler := &MachineOperationReconciler{Client: c, Providers: []Provider{provider}, Now: fixedOperationNow}
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "op-1"}})
+	require.NoError(t, err)
+	require.Equal(t, ctrl.Result{}, result)
+	require.Empty(t, provider.calls)
+
+	var updated unboundedv1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
+	require.Equal(t, unboundedv1alpha3.OperationPhaseFailed, updated.Status.Phase)
+
+	cond := apimeta.FindStatusCondition(updated.Status.Conditions, OperationConditionCompleted)
+	require.NotNil(t, cond)
+	require.Equal(t, "AuthInvalid", cond.Reason)
+}
+
 func TestMachineOperationReconciler_FailsCredentialSecretOutsideAllowedNamespace(t *testing.T) {
 	t.Parallel()
 
@@ -201,7 +261,7 @@ func TestMachineOperationReconciler_FailsCredentialSecretOutsideAllowedNamespace
 	machine.Labels = map[string]string{"unbounded-cloud.io/site": "site-a"}
 	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReboot)
 	credential := newMachineOperationCredential("cred-a", "site-a", unboundedv1alpha3.ExternalProviderAzureVM)
-	credential.Spec.SecretRef.Namespace = "other"
+	credential.Spec.Auth.SecretRef.Namespace = "other"
 	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReboot: true}}
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, credential).WithStatusSubresource(op).Build()
@@ -583,7 +643,7 @@ type recordingProvider struct {
 	calls           []string
 	cleanupCalls    []string
 	replaceUserData []string
-	authTypes       []unboundedv1alpha3.MachineOperationAuthType
+	authModes       []unboundedv1alpha3.MachineOperationCredentialAuthMode
 	authData        []map[string]string
 	result          OperationResult
 	err             error
@@ -604,7 +664,7 @@ func (p *recordingProvider) Execute(_ context.Context, request OperationRequest)
 		p.replaceUserData = append(p.replaceUserData, request.ReplaceUserData)
 	}
 	if request.Auth != nil {
-		p.authTypes = append(p.authTypes, request.Auth.Type)
+		p.authModes = append(p.authModes, request.Auth.Mode)
 		p.authData = append(p.authData, request.Auth.SecretData)
 	}
 
@@ -651,10 +711,12 @@ func newMachineOperationCredential(name, site, provider string) *unboundedv1alph
 		Spec: unboundedv1alpha3.MachineOperationCredentialSpec{
 			SiteName: site,
 			Provider: provider,
-			AuthType: unboundedv1alpha3.MachineOperationAuthServicePrincipalSecret,
-			SecretRef: &unboundedv1alpha3.NamespacedSecretReference{
-				Namespace: "unbounded-kube",
-				Name:      name,
+			Auth: unboundedv1alpha3.MachineOperationCredentialAuth{
+				Mode: unboundedv1alpha3.MachineOperationCredentialAuthExternalPlugin,
+				SecretRef: &unboundedv1alpha3.NamespacedSecretReference{
+					Namespace: "unbounded-kube",
+					Name:      name,
+				},
 			},
 		},
 	}

@@ -111,7 +111,7 @@ func TestProviderExecutePassesAuthToClientFactory(t *testing.T) {
 	t.Parallel()
 
 	auth := &machineops.OperationAuth{
-		Type: unboundedv1alpha3.MachineOperationAuthServicePrincipalSecret,
+		Mode: unboundedv1alpha3.MachineOperationCredentialAuthExternalPlugin,
 		SecretData: map[string]string{
 			"tenantID":     "tenant",
 			"clientID":     "client",
@@ -148,7 +148,7 @@ func TestNewAzureVMClientValidatesAuth(t *testing.T) {
 		{
 			name: "service principal missing client secret",
 			auth: &machineops.OperationAuth{
-				Type: unboundedv1alpha3.MachineOperationAuthServicePrincipalSecret,
+				Mode: unboundedv1alpha3.MachineOperationCredentialAuthExternalPlugin,
 				SecretData: map[string]string{
 					"tenantID": "tenant",
 					"clientID": "client",
@@ -157,11 +157,11 @@ func TestNewAzureVMClientValidatesAuth(t *testing.T) {
 			wantErr: "clientSecret",
 		},
 		{
-			name: "unsupported auth type",
+			name: "unsupported auth mode",
 			auth: &machineops.OperationAuth{
-				Type: unboundedv1alpha3.MachineOperationAuthAPIKey,
+				Mode: unboundedv1alpha3.MachineOperationCredentialAuthMode("unsupported"),
 			},
-			wantErr: "unsupported Azure VM auth type",
+			wantErr: "unsupported Azure VM auth mode",
 		},
 	}
 

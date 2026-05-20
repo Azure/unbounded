@@ -160,12 +160,12 @@ func newDefaultAzureVMClient(subscriptionID string) (azureVMClient, error) {
 }
 
 func newAzureVMClient(subscriptionID string, auth *machineops.OperationAuth) (azureVMClient, error) {
-	if auth == nil || auth.Type == "" || auth.Type == unboundedv1alpha3.MachineOperationAuthDefaultAzureCredential {
+	if auth == nil || auth.Mode == "" || auth.Mode == unboundedv1alpha3.MachineOperationCredentialAuthWorkloadIdentity {
 		return newDefaultAzureVMClient(subscriptionID)
 	}
 
-	switch auth.Type {
-	case unboundedv1alpha3.MachineOperationAuthServicePrincipalSecret:
+	switch auth.Mode {
+	case unboundedv1alpha3.MachineOperationCredentialAuthExternalPlugin:
 		tenantID, err := auth.RequiredSecretValue("tenantID")
 		if err != nil {
 			return nil, err
@@ -186,7 +186,7 @@ func newAzureVMClient(subscriptionID string, auth *machineops.OperationAuth) (az
 
 		return newAzureVMClientWithCredential(subscriptionID, cred)
 	default:
-		return nil, fmt.Errorf("unsupported Azure VM auth type %q", auth.Type)
+		return nil, fmt.Errorf("unsupported Azure VM auth mode %q", auth.Mode)
 	}
 }
 
