@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 3783d3937fe30d47fa14cc59ebfb58bc384cfc8756c857d4785415a7d3026c00 # shrinks to seed = 1587146049828279305, w = Workload { page_size: 4096, device_pages: 128, max_io_delay: 0, io_fault_rate: 0, key_count: 1, offset_count: 1, clients: [ClientSpec { ops: [Write { key_idx: 0, off_idx: 0, payload_seed: 0 }, Write { key_idx: 0, off_idx: 0, payload_seed: 0 }, Write { key_idx: 0, off_idx: 0, payload_seed: 0 }] }] }
+cc a4a17a16036af3ed74e6a0f043dfe1b4087c6b7ecc1b5416db22dd4cadbbc263 # shrinks to seed = 6119958299502756725, w = Workload { page_size: 4096, device_pages: 128, max_io_delay: 2, io_fault_rate: 2, key_count: 1, offset_count: 1, clients: [ClientSpec { ops: [Write { key_idx: 0, off_idx: 0, payload_seed: 0 }] }] }
+cc 117d6254283ccff27d54c9edeb5ce1137c662202b69a6b482d31c2526958e72d # shrinks to seed = 4493537529144328136, w = Workload { page_size: 4096, device_pages: 128, max_io_delay: 1, io_fault_rate: 6, key_count: 1, offset_count: 1, clients: [ClientSpec { ops: [Write { key_idx: 0, off_idx: 0, payload_seed: 0 }] }] }
+cc 2f48079327ce9200732ba7ac50baf32c58b7e87e801531a97a0369130f6f11af # shrinks to seed = 6701045851988619980, w = Workload { page_size: 4096, device_pages: 128, max_io_delay: 0, io_fault_rate: 10, key_count: 1, offset_count: 1, clients: [ClientSpec { ops: [Write { key_idx: 0, off_idx: 0, payload_seed: 0 }] }] }

@@ -5,4 +5,5 @@ pub mod bufferpool;
 pub mod mercury;
 pub mod p2p;
 pub mod runtime;
+pub mod storage;
 pub mod topology;
