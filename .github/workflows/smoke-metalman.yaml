@@ -10,7 +10,7 @@ on:
     paths:
       - cmd/metalman/**
       - internal/metalman/**
-      - api/v1alpha3/**
+      - api/machina/v1alpha3/**
       - deploy/machina/**
       - deploy/net/**
       - hack/smoke-metalman.py

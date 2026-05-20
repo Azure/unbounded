@@ -29,6 +29,7 @@ import (
 	"github.com/Azure/unbounded/internal/metalman/dhcp"
 	"github.com/Azure/unbounded/internal/metalman/indexing"
 	"github.com/Azure/unbounded/internal/metalman/lifecycle"
+	metalmachineops "github.com/Azure/unbounded/internal/metalman/machineops"
 	"github.com/Azure/unbounded/internal/metalman/netboot"
 	"github.com/Azure/unbounded/internal/metalman/redfish"
 )
@@ -36,18 +37,21 @@ import (
 // ServePXECmd returns a cobra.Command that runs PXE servers and the BMC control loop.
 func ServePXECmd() *cobra.Command {
 	var (
-		site              string
-		cacheDir          string
-		bindAddress       string
-		httpPort          int
-		healthPort        int
-		dhcpInterface     string
-		dhcpAutoInterface bool
-		dhcpPort          int
-		serveURL          string
-		leaseDuration     time.Duration
-		renewDeadline     time.Duration
-		retryPeriod       time.Duration
+		site                           string
+		cacheDir                       string
+		bindAddress                    string
+		httpPort                       int
+		healthPort                     int
+		dhcpInterface                  string
+		dhcpAutoInterface              bool
+		dhcpPort                       int
+		serveURL                       string
+		leaseDuration                  time.Duration
+		renewDeadline                  time.Duration
+		retryPeriod                    time.Duration
+		operationMaxConcurrentMachines int
+		operationMaxAttempts           int32
+		operationPollInterval          time.Duration
 	)
 
 	cmd := &cobra.Command{
@@ -192,6 +196,18 @@ func ServePXECmd() *cobra.Command {
 				return fmt.Errorf("setting up Redfish reconciler: %w", err)
 			}
 
+			if err := (&metalmachineops.Reconciler{
+				Client:                mgr.GetClient(),
+				APIReader:             mgr.GetAPIReader(),
+				Site:                  site,
+				PowerClients:          &metalmachineops.RedfishPowerClientFactory{Reader: mgr.GetClient(), Pool: redfishPool},
+				MaxConcurrentMachines: operationMaxConcurrentMachines,
+				MaxAttempts:           operationMaxAttempts,
+				PollInterval:          operationPollInterval,
+			}).SetupWithManager(mgr); err != nil {
+				return fmt.Errorf("setting up MachineOperation reconciler: %w", err)
+			}
+
 			if err := (&lifecycle.Reconciler{Client: mgr.GetClient()}).SetupWithManager(mgr); err != nil {
 				return fmt.Errorf("setting up Lifecycle reconciler: %w", err)
 			}
@@ -314,6 +330,9 @@ func ServePXECmd() *cobra.Command {
 	cmd.Flags().DurationVar(&leaseDuration, "leader-elect-lease-duration", 15*time.Second, "Duration that non-leader candidates will wait before attempting to acquire leadership")
 	cmd.Flags().DurationVar(&renewDeadline, "leader-elect-renew-deadline", 10*time.Second, "Duration the acting leader will retry refreshing leadership before giving up")
 	cmd.Flags().DurationVar(&retryPeriod, "leader-elect-retry-period", 2*time.Second, "Duration between leader election retries")
+	cmd.Flags().IntVar(&operationMaxConcurrentMachines, "operation-max-concurrent-machines", 10, "Maximum target Machines advanced concurrently within one MachineOperation")
+	cmd.Flags().Int32Var(&operationMaxAttempts, "operation-max-attempts", 3, "Maximum Redfish action attempts per target Machine")
+	cmd.Flags().DurationVar(&operationPollInterval, "operation-poll-interval", 5*time.Second, "Poll interval for in-progress MachineOperations")
 
 	return cmd
 }

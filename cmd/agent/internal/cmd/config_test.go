@@ -85,6 +85,19 @@ func TestLoadConfig_BackfillsNodeName(t *testing.T) {
 	assert.Equal(t, "configured-node", got.NodeName)
 }
 
+func TestLoadConfig_TrimsNodeIP(t *testing.T) {
+	cfg := sampleConfig()
+	cfg.Kubelet.NodeIP = " 10.0.0.15 "
+	path := writeConfigFile(t, cfg)
+
+	t.Setenv(configFileEnv, path)
+
+	got, err := loadConfig()
+	require.NoError(t, err)
+
+	assert.Equal(t, "10.0.0.15", got.Kubelet.NodeIP)
+}
+
 func TestLoadConfig_FromFile_VersionWithoutPrefix(t *testing.T) {
 	cfg := sampleConfig()
 	cfg.Cluster.Version = "1.33.1" // no "v" prefix
