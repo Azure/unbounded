@@ -2,4 +2,5 @@
 
 This folder contains different kinds of agent config used by the agent e2e tests.
 Each file describes one node config scenario that can be passed to `e2e.py` with
-`--node-config`.
+`--node-config`. Scenarios may configure kubelet settings such as labels, taints,
+or the node IP used by the e2e VM.

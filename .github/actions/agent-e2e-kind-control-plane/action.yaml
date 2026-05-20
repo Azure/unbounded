@@ -7,6 +7,10 @@ inputs:
   vm-subnet:
     description: VM subnet prefix.
     required: true
+  create-vm:
+    description: Whether to launch the default e2e VM.
+    required: false
+    default: "true"
 runs:
   using: composite
   steps:
@@ -81,8 +85,14 @@ runs:
         kubectl -n kube-system rollout status daemonset/kindnet --timeout=60s
 
     - name: Create QEMU VM
+      if: ${{ inputs['create-vm'] == 'true' }}
       shell: bash
       run: python3 ./hack/agent/e2e-kind/e2e.py --verbose create-vm
+
+    - name: Create VM bridge
+      if: ${{ inputs['create-vm'] != 'true' }}
+      shell: bash
+      run: python3 ./hack/agent/e2e-kind/e2e.py --verbose create-vm-bridge
 
     - name: Attach Kind container to VM bridge
       shell: bash

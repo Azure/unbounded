@@ -73,6 +73,9 @@ type manualBootstrapHandler struct {
 	// taints are taint strings passed through to kubelet --register-with-taints.
 	taints []string
 
+	// nodeIP is passed through to kubelet --node-ip.
+	nodeIP string
+
 	// ociImage is an optional OCI image reference for the agent. When set,
 	// it is included in the AgentConfig JSON so the agent uses a container
 	// image to bootstrap the machine rootfs instead of debootstrap.
@@ -301,6 +304,7 @@ func (h *manualBootstrapHandler) buildAgentConfig(ctx context.Context) (*provisi
 		ProviderLabels: providerLabels,
 		BootstrapToken: bootstrapToken,
 	})
+	cfg.Kubelet.NodeIP = strings.TrimSpace(h.nodeIP)
 
 	return &cfg, nil
 }
@@ -467,6 +471,7 @@ Examples:
 	cmd.Flags().StringVar(&handler.kubeconfigPath, "kubeconfig", "", "Path to kubeconfig file")
 	cmd.Flags().StringArrayVar(&handler.nodeLabels, "node-label", nil, "Label in key=value format to pass to kubelet (can be repeated)")
 	cmd.Flags().StringArrayVar(&handler.taints, "register-with-taint", nil, "Taint to register on the node (can be repeated)")
+	cmd.Flags().StringVar(&handler.nodeIP, "node-ip", "", "IP address to pass to kubelet")
 	cmd.Flags().StringVar(&handler.ociImage, "oci-image", "", "OCI image reference for the agent rootfs")
 	cmd.Flags().StringVar(&handler.kubernetesVersion, "kubernetes-version", "", "Override the Kubernetes version (default: auto-detected from API server)")
 	cmd.Flags().StringVar(&handler.variant, "variant", "script", "Output format: script or cloud-init")

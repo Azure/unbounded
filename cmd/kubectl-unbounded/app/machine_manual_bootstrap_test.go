@@ -175,6 +175,7 @@ func TestManualBootstrapHandler_BuildAgentConfig(t *testing.T) {
 		machineName: "my-node",
 		nodeLabels:  []string{"env=prod"},
 		taints:      []string{"dedicated=gpu:NoSchedule"},
+		nodeIP:      " 10.0.0.15 ",
 		ociImage:    "ghcr.io/azure/rootfs:v1",
 		kubeCli:     kubeCli,
 		kubeConfig:  &rest.Config{Host: "https://my-api-server:6443"},
@@ -190,6 +191,7 @@ func TestManualBootstrapHandler_BuildAgentConfig(t *testing.T) {
 	require.NotEmpty(t, cfg.Cluster.CaCertBase64)
 	require.NotEmpty(t, cfg.Cluster.Version) // fake client returns empty string but it's still set
 	require.Contains(t, cfg.Kubelet.Auth.BootstrapToken, "abc123.")
+	require.Equal(t, "10.0.0.15", cfg.Kubelet.NodeIP)
 	require.Equal(t, map[string]string{"env": "prod"}, cfg.Kubelet.Labels)
 	require.Equal(t, []string{"dedicated=gpu:NoSchedule"}, cfg.Kubelet.RegisterWithTaints)
 	require.Equal(t, "ghcr.io/azure/rootfs:v1", cfg.OCIImage)
