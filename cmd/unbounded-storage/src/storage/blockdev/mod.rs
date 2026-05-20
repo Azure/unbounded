@@ -17,9 +17,12 @@ mod mock;
 mod tests;
 
 #[cfg(target_os = "linux")]
-pub mod uring;
+mod uring;
 
 pub use mock::{MockDevice, MockDeviceConfig, MockFaultMode};
+
+#[cfg(target_os = "linux")]
+pub use uring::{UringBlockDevice, UringConfig};
 
 use crate::storage::types::{Error, Lba};
 
@@ -63,4 +66,17 @@ pub trait BlockDevice {
     /// efficiently. The mutator uses this to size its commit
     /// batches.
     fn write_queue_depth(&self) -> u32;
+
+    /// Drive any submitted-but-not-yet-completed I/O forward. The
+    /// io_uring backend pushes queued SQEs to the kernel and reaps
+    /// available CQEs, waking the tasks awaiting them. Backends
+    /// that complete synchronously (mocks, simulator) leave this
+    /// as the default no-op.
+    ///
+    /// Executors should call this periodically (e.g. on idle) so
+    /// in-flight ops can make progress without per-future kernel
+    /// waits.
+    fn progress(&self) -> Result<(), Error> {
+        Ok(())
+    }
 }

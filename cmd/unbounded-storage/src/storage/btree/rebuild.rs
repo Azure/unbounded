@@ -18,6 +18,8 @@
 
 use std::collections::BTreeMap;
 
+use std::cmp::Ordering;
+
 use crate::storage::blockdev::BlockDevice;
 use crate::storage::btree::page::{self, Decoded, LeafEntry, META_SLOT_A, META_SLOT_B};
 use crate::storage::types::{Error, Lba, PageKey};
@@ -31,10 +33,9 @@ pub struct RebuildResult {
     pub entries: BTreeMap<PageKey, LeafEntry>,
 }
 
-/// Scan the disk for the highest-txn-id leaf cohort. Capped by
-/// `max_pages_scanned` to bound work on huge disks; in practice
-/// the per-disk capacity is a few hundred thousand 4 KiB pages
-/// and we expect to scan all of them.
+/// Scan the disk for the highest-txn-id leaf cohort. In practice
+/// the per-disk capacity is a few hundred thousand 4 KiB pages and
+/// we expect to scan all of them.
 pub async fn scan_for_leaves<B: BlockDevice>(
     device: &B,
 ) -> Result<Option<RebuildResult>, Error> {
@@ -52,7 +53,6 @@ pub async fn scan_for_leaves<B: BlockDevice>(
             continue;
         }
         if let Decoded::Leaf { txn_id, entries } = page::decode(&buf) {
-            use std::cmp::Ordering;
             match txn_id.cmp(&best_txn) {
                 Ordering::Greater => {
                     best_txn = txn_id;
@@ -62,10 +62,10 @@ pub async fn scan_for_leaves<B: BlockDevice>(
                     }
                 }
                 Ordering::Equal if best_txn > 0 => {
-                    // Same epoch: merge. If two leaves both claim
-                    // a key (it can happen across CoW generations
-                    // sharing a txn id never, but a torn neighbor
-                    // may), the higher LBA wins arbitrarily.
+                    // Same epoch: merge. Distinct leaves of the same
+                    // CoW generation should never share a txn id, but
+                    // a torn neighbor write can leave two leaves that
+                    // both claim a key; the higher LBA wins arbitrarily.
                     for (k, v) in entries {
                         best.insert(k, v);
                     }

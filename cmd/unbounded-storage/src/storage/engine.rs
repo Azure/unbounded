@@ -28,7 +28,6 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
 
 use crate::bufferpool::{self, BulkRef, PageRef, StripeKey};
 use crate::storage::admission::AdmissionFilter;
@@ -36,6 +35,9 @@ use crate::storage::alloc::Allocator;
 use crate::storage::blockdev::BlockDevice;
 use crate::storage::btree::{BTreeIndex, LeafEntry, Mutation};
 use crate::storage::lru::SieveLru;
+use crate::storage::mutator::{
+    MutatorOutcome, MutatorQueue, MutatorReply, MutatorReq, yield_once,
+};
 use crate::storage::refcount::RefcountTable;
 use crate::storage::singleflight::{Acquire, Singleflight};
 use crate::storage::traits::{PageChecksum, Xxh3Checksum};
@@ -74,72 +76,6 @@ impl Default for EngineConfig {
     }
 }
 
-/// Trivial async mutex. Single-threaded executor friendly: a
-/// caller awaits a lock and the future resolves the next time
-/// the holder drops their guard. Used here to serialize
-/// [`BTreeIndex::apply_batch`] across concurrent
-/// [`StorageEngine::write_page`] callers.
-struct AsyncMutex {
-    inner: Mutex<AsyncMutexInner>,
-}
-
-struct AsyncMutexInner {
-    locked: bool,
-    waiters: Vec<Waker>,
-}
-
-impl AsyncMutex {
-    fn new() -> Self {
-        Self {
-            inner: Mutex::new(AsyncMutexInner {
-                locked: false,
-                waiters: Vec::new(),
-            }),
-        }
-    }
-
-    fn lock<'a>(&'a self) -> AsyncMutexLock<'a> {
-        AsyncMutexLock { mutex: self }
-    }
-}
-
-struct AsyncMutexLock<'a> {
-    mutex: &'a AsyncMutex,
-}
-
-impl<'a> Future for AsyncMutexLock<'a> {
-    type Output = AsyncMutexGuard<'a>;
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut inner = self.mutex.inner.lock().unwrap();
-        if !inner.locked {
-            inner.locked = true;
-            Poll::Ready(AsyncMutexGuard { mutex: self.mutex })
-        } else {
-            if !inner.waiters.iter().any(|w| w.will_wake(cx.waker())) {
-                inner.waiters.push(cx.waker().clone());
-            }
-            Poll::Pending
-        }
-    }
-}
-
-struct AsyncMutexGuard<'a> {
-    mutex: &'a AsyncMutex,
-}
-
-impl<'a> Drop for AsyncMutexGuard<'a> {
-    fn drop(&mut self) {
-        let wakers = {
-            let mut inner = self.mutex.inner.lock().unwrap();
-            inner.locked = false;
-            std::mem::take(&mut inner.waiters)
-        };
-        for w in wakers {
-            w.wake();
-        }
-    }
-}
-
 struct BufferpoolBinding {
     base: Option<*mut u8>,
     page_size: usize,
@@ -157,14 +93,19 @@ pub struct StorageEngine<B: BlockDevice> {
     cfg: EngineConfig,
     bufferpool: Mutex<BufferpoolBinding>,
     /// Reverse map LBA -> PageKey, used by evictions to remove
-    /// stale btree entries. Guarded by the mutator gate.
+    /// stale btree entries. Only the mutator task and writers
+    /// holding their own freshly-allocated LBA mutate this map;
+    /// readers are read-only consumers.
     reverse: Mutex<HashMap<u64, PageKey>>,
     /// LBAs that have been logically orphaned (no btree entry,
     /// removed from the LRU) but cannot be freed yet because a
-    /// reader still holds a pin. The mutator gate's holders
-    /// drain this list whenever a candidate becomes unpinned.
+    /// reader still holds a pin. The mutator task drains this
+    /// list once per committed batch.
     pending_free: Mutex<Vec<Lba>>,
-    mutator_gate: AsyncMutex,
+    /// Single-consumer queue: writers and the eviction path
+    /// enqueue here, the engine's `run_mutator` task drains and
+    /// commits batches.
+    mutator_queue: Arc<MutatorQueue>,
     metrics: EngineMetrics,
 }
 
@@ -225,6 +166,12 @@ pub struct EngineSnapshot {
     pub checksum_misses: u64,
     pub resident_pages: usize,
     pub btree_entries: usize,
+    /// Length of the deferred-reclaim queue: LBAs that were
+    /// displaced (overwrite or eviction) while their old page
+    /// was still pinned and that have not yet been returned to
+    /// the allocator. Exposed for DST observability; at end-of-
+    /// run quiescence this should drain to zero.
+    pub pending_free_len: usize,
 }
 
 impl<B: BlockDevice> StorageEngine<B> {
@@ -258,9 +205,16 @@ impl<B: BlockDevice> StorageEngine<B> {
             }),
             reverse: Mutex::new(HashMap::new()),
             pending_free: Mutex::new(Vec::new()),
-            mutator_gate: AsyncMutex::new(),
+            mutator_queue: Arc::new(MutatorQueue::new()),
             metrics: EngineMetrics::new(),
         })
+    }
+
+    /// Borrow the underlying block device. Used by `LocalStorage`
+    /// to fan out [`BlockDevice::progress`] across every engine on
+    /// the node without needing a separate handle to each device.
+    pub(crate) fn device(&self) -> &Arc<B> {
+        &self.device
     }
 
     pub fn snapshot(&self) -> EngineSnapshot {
@@ -276,6 +230,7 @@ impl<B: BlockDevice> StorageEngine<B> {
             checksum_misses: m.checksum_misses,
             resident_pages: self.lru.len(),
             btree_entries: self.btree.live_entries(),
+            pending_free_len: self.pending_free.lock().unwrap().len(),
         }
     }
 
@@ -372,26 +327,42 @@ impl<B: BlockDevice> StorageEngine<B> {
             if victims.is_empty() {
                 return;
             }
-            // Serialize against writers. The btree mutation must
-            // commit BEFORE the allocator slot is released: a
-            // concurrent writer that observes the stale btree
-            // entry would otherwise call retire_lba and double-
-            // free the slot the allocator already handed back to
-            // a new write.
-            let _g = self.mutator_gate.lock().await;
-            let mut deletes: Vec<Mutation> = Vec::with_capacity(victims.len());
+            // Resolve victim LBAs to keys via the reverse map
+            // before submitting: the mutator only needs the keys
+            // to commit the delete, and we still own the LBAs
+            // here for the post-commit free below.
+            let mut keys: Vec<PageKey> = Vec::with_capacity(victims.len());
             {
                 let rev = self.reverse.lock().unwrap();
                 for lba in &victims {
                     if let Some(k) = rev.get(&lba.0).copied() {
-                        deletes.push(Mutation::Delete { key: k });
+                        keys.push(k);
                     }
                 }
             }
-            if !deletes.is_empty() && self.btree.apply_batch(deletes).await.is_err() {
-                // Apply failed: leave the LBAs allocated and
-                // tracked - a later sweep will retry.
+            if keys.is_empty() {
                 return;
+            }
+            // The btree mutation MUST commit before the allocator
+            // slot is released: a concurrent writer that observes
+            // the stale btree entry would otherwise call
+            // retire_lba and double-free the slot the allocator
+            // already handed back. The mutator is the single
+            // committer, so this ordering is preserved by
+            // construction once `done.wait()` returns.
+            let done = MutatorReply::new();
+            self.mutator_queue.push(MutatorReq::Delete {
+                keys,
+                done: done.clone(),
+            });
+            match done.wait().await {
+                MutatorOutcome::DeleteCommitted => {}
+                _ => {
+                    // Apply failed or queue closed: leave the
+                    // LBAs allocated and tracked. A later sweep
+                    // will retry.
+                    return;
+                }
             }
             {
                 let mut rev = self.reverse.lock().unwrap();
@@ -582,31 +553,28 @@ impl<B: BlockDevice> StorageEngine<B> {
             byte_len: src_buf.len() as u32,
         };
 
-        let prior_lba: Option<Lba>;
-        {
-            let _g = self.mutator_gate.lock().await;
-            prior_lba = self
-                .btree
-                .lookup(&pk)
-                .await
-                .ok()
-                .flatten()
-                .map(|e| e.lba);
-            if self
-                .btree
-                .apply_batch(vec![Mutation::Insert {
-                    key: pk,
-                    value: entry,
-                }])
-                .await
-                .is_err()
-            {
+        // Submit the insert to the mutator and wait for its
+        // batched commit. The mutator returns the prior LBA the
+        // btree mapped this key to (if any) so we can retire it.
+        let done = MutatorReply::new();
+        self.mutator_queue.push(MutatorReq::Insert {
+            key: pk,
+            entry,
+            lba,
+            done: done.clone(),
+        });
+        let prior_lba = match done.wait().await {
+            MutatorOutcome::InsertCommitted { prior_lba } => prior_lba,
+            MutatorOutcome::Failed => {
                 self.metric(|m| m.write_io_errors += 1);
                 let _ = self.allocator.free(lba);
                 leader.abandon();
                 return Ok(());
             }
-        }
+            MutatorOutcome::DeleteCommitted => unreachable!(
+                "mutator returned DeleteCommitted for an Insert request"
+            ),
+        };
 
         if let Some(old) = prior_lba {
             self.retire_lba(old);
@@ -620,10 +588,138 @@ impl<B: BlockDevice> StorageEngine<B> {
         self.metric(|m| m.admitted += 1);
         leader.publish(entry);
 
-        self.drain_pending_free();
         self.evict_if_over_watermark().await;
 
         Ok(())
+    }
+
+    /// Drive the single-committer mutator loop. The engine owns
+    /// the only consumer; call this exactly once per engine and
+    /// keep it alive for the lifetime of the engine. Returns
+    /// when [`close_mutator`] is called and the queue has
+    /// drained.
+    pub async fn run_mutator(self: Arc<Self>) {
+        loop {
+            // Park until something is queued or the engine is
+            // shutting down. `false` here means "closed and
+            // empty"; drain and exit.
+            if !self.mutator_queue.wait_nonempty().await {
+                return;
+            }
+            let max = self.cfg.commit_batch_max.max(1);
+            let mut batch = self.mutator_queue.try_drain_up_to(max);
+            // Best-effort coalescing: if we did not fill the
+            // batch, yield once to let other producers enqueue
+            // before we commit. Wall-clock-free approximation of
+            // `commit_batch_deadline_us`; see the note on
+            // `mutator::yield_once`.
+            if batch.len() < max {
+                yield_once().await;
+                if batch.len() < max {
+                    let more = self.mutator_queue.try_drain_up_to(max - batch.len());
+                    batch.extend(more);
+                }
+            }
+
+            self.process_batch(batch).await;
+            self.drain_pending_free();
+        }
+    }
+
+    /// Signal the mutator loop to exit once it has drained. Safe
+    /// to call from any task; idempotent. Primarily used by
+    /// tests and shutdown paths.
+    pub fn close_mutator(&self) {
+        self.mutator_queue.close();
+    }
+
+    /// Number of requests currently buffered in the mutator queue.
+    /// Tests use this after `close_mutator` + `run_mutator` join
+    /// to assert the mutator drained every submitted request
+    /// rather than exiting with backlog.
+    pub fn mutator_pending_len(&self) -> usize {
+        self.mutator_queue.pending_len()
+    }
+
+    async fn process_batch(&self, batch: Vec<MutatorReq>) {
+        if batch.is_empty() {
+            return;
+        }
+        // Look up prior LBAs for every Insert before applying;
+        // the mutator is the single committer so these reads are
+        // consistent with what `apply_batch` is about to replace.
+        // Singleflight guarantees at most one Insert per key is
+        // in flight at a time, so an Insert key cannot also
+        // appear in a Delete in the same batch (a Delete only
+        // comes from eviction, which would not target a key that
+        // has an in-flight write because the LBA is admitted to
+        // the LRU only after publish). Debug-assert the simpler
+        // condition: each insert key appears at most once.
+        #[cfg(debug_assertions)]
+        {
+            use std::collections::HashSet;
+            let mut seen: HashSet<PageKey> = HashSet::new();
+            for r in &batch {
+                if let MutatorReq::Insert { key, .. } = r {
+                    debug_assert!(
+                        seen.insert(*key),
+                        "singleflight violated: duplicate Insert key in one batch",
+                    );
+                }
+            }
+        }
+
+        let mut prior_lbas: Vec<Option<Lba>> = Vec::with_capacity(batch.len());
+        let mut mutations: Vec<Mutation> = Vec::new();
+        for req in &batch {
+            match req {
+                MutatorReq::Insert { key, entry, .. } => {
+                    let prior = self
+                        .btree
+                        .lookup(key)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|e| e.lba);
+                    prior_lbas.push(prior);
+                    mutations.push(Mutation::Insert {
+                        key: *key,
+                        value: *entry,
+                    });
+                }
+                MutatorReq::Delete { keys, .. } => {
+                    prior_lbas.push(None);
+                    for k in keys {
+                        mutations.push(Mutation::Delete { key: *k });
+                    }
+                }
+            }
+        }
+
+        let ok = if mutations.is_empty() {
+            true
+        } else {
+            self.btree.apply_batch(mutations).await.is_ok()
+        };
+
+        for (i, req) in batch.into_iter().enumerate() {
+            let done = match &req {
+                MutatorReq::Insert { done, .. } | MutatorReq::Delete { done, .. } => {
+                    done.clone()
+                }
+            };
+            let outcome = if !ok {
+                MutatorOutcome::Failed
+            } else {
+                match req {
+                    MutatorReq::Insert { .. } => MutatorOutcome::InsertCommitted {
+                        prior_lba: prior_lbas[i],
+                    },
+                    MutatorReq::Delete { .. } => MutatorOutcome::DeleteCommitted,
+                }
+            };
+            done.set(outcome);
+        }
     }
 }
 
@@ -642,7 +738,7 @@ mod tests {
     use crate::storage::blockdev::{MockDevice, MockDeviceConfig};
     use crate::storage::types::Lba;
     use std::future::Future;
-    use std::pin::pin;
+    use std::pin::{Pin, pin};
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
     fn noop_waker() -> Waker {
@@ -652,6 +748,33 @@ mod tests {
         static VTABLE: RawWakerVTable =
             RawWakerVTable::new(|_| raw(), |_| {}, |_| {}, |_| {});
         unsafe { Waker::from_raw(raw()) }
+    }
+
+    /// Pump `body` to completion while concurrently driving
+    /// `mutator`. The mutator is expected to stay pending until
+    /// `close_mutator` is invoked; we poll it on every spin so
+    /// reply wakeups are observed promptly.
+    fn block_on_pair<F: Future>(
+        body: F,
+        mutator: Pin<&mut dyn Future<Output = ()>>,
+    ) -> F::Output {
+        let w = noop_waker();
+        let mut cx = Context::from_waker(&w);
+        let mut body = pin!(body);
+        let mut mutator = mutator;
+        let mut spins = 0u64;
+        loop {
+            // Drive the mutator first so that any replies it
+            // produces this spin are visible to the body's poll.
+            let _ = mutator.as_mut().poll(&mut cx);
+            match body.as_mut().poll(&mut cx) {
+                Poll::Ready(v) => return v,
+                Poll::Pending => {
+                    spins += 1;
+                    assert!(spins < 1_000_000, "stuck");
+                }
+            }
+        }
     }
 
     fn block_on<F: Future>(f: F) -> F::Output {
@@ -670,7 +793,7 @@ mod tests {
         }
     }
 
-    fn engine(capacity: u64) -> (StorageEngine<MockDevice>, Box<[u8]>) {
+    fn engine(capacity: u64) -> (Arc<StorageEngine<MockDevice>>, Box<[u8]>) {
         let device = Arc::new(MockDevice::new(MockDeviceConfig {
             page_size: 4096,
             capacity_pages: capacity,
@@ -679,7 +802,7 @@ mod tests {
         let mut cfg = EngineConfig::default();
         cfg.page_size_bytes = 4096; // collapse cache page == device block for tests
         cfg.btree_page_bytes = 4096;
-        let eng = block_on(StorageEngine::open(device, cfg)).unwrap();
+        let eng = Arc::new(block_on(StorageEngine::open(device, cfg)).unwrap());
         // 64 pool pages of 4 KiB each.
         let buf: Box<[u8]> = vec![0u8; 4096 * 64].into_boxed_slice();
         eng.register_pages(buf.as_ptr() as *mut u8, 4096, 64).unwrap();
@@ -695,49 +818,55 @@ mod tests {
     #[test]
     fn write_then_read_roundtrip() {
         let (eng, buf) = engine(256);
-        let src_page = PageRef {
-            page_idx: 0,
-            offset: 0,
-            len: 4096,
-        };
-        // Fill page idx 0 with a pattern.
-        unsafe {
-            let p = buf.as_ptr() as *mut u8;
-            for i in 0..4096 {
-                p.add(i).write(((i * 37) & 0xff) as u8);
+        let eng_body = eng.clone();
+        let mutator = eng.clone().run_mutator();
+        let mut mutator = pin!(mutator);
+        let body = async move {
+            let src_page = PageRef {
+                page_idx: 0,
+                offset: 0,
+                len: 4096,
+            };
+            unsafe {
+                let p = buf.as_ptr() as *mut u8;
+                for i in 0..4096 {
+                    p.add(i).write(((i * 37) & 0xff) as u8);
+                }
             }
-        }
-        // First write: admission filter rejects (first touch).
-        block_on(eng.write_page(stripe(1), 0, src_page)).unwrap();
-        assert_eq!(eng.snapshot().rejected_by_filter, 1);
-        // Second write: admitted.
-        block_on(eng.write_page(stripe(1), 0, src_page)).unwrap();
-        assert_eq!(eng.snapshot().admitted, 1);
+            // First write: admission filter rejects (first touch).
+            eng_body.write_page(stripe(1), 0, src_page).await.unwrap();
+            assert_eq!(eng_body.snapshot().rejected_by_filter, 1);
+            // Second write: admitted.
+            eng_body.write_page(stripe(1), 0, src_page).await.unwrap();
+            assert_eq!(eng_body.snapshot().admitted, 1);
 
-        // Read into page idx 1.
-        let dst_page = PageRef {
-            page_idx: 1,
-            offset: 0,
-            len: 4096,
-        };
-        let hit = block_on(eng.read_page(stripe(1), 0, dst_page)).unwrap();
-        assert!(hit, "expected cache hit");
-        // Verify bytes match source pattern.
-        unsafe {
-            let p = buf.as_ptr().add(4096);
-            for i in 0..4096 {
-                assert_eq!(
-                    p.add(i).read(),
-                    ((i * 37) & 0xff) as u8,
-                    "mismatch at byte {i}"
-                );
+            let dst_page = PageRef {
+                page_idx: 1,
+                offset: 0,
+                len: 4096,
+            };
+            let hit = eng_body.read_page(stripe(1), 0, dst_page).await.unwrap();
+            assert!(hit, "expected cache hit");
+            unsafe {
+                let p = buf.as_ptr().add(4096);
+                for i in 0..4096 {
+                    assert_eq!(
+                        p.add(i).read(),
+                        ((i * 37) & 0xff) as u8,
+                        "mismatch at byte {i}"
+                    );
+                }
             }
-        }
+            eng_body.close_mutator();
+        };
+        block_on_pair(body, mutator.as_mut());
     }
 
     #[test]
     fn read_unknown_key_is_miss() {
-        let (eng, _) = engine(64);
+        let (eng, _buf) = engine(64);
+        // No writes, no need to drive the mutator: reads do not
+        // enqueue. Plain block_on suffices.
         let dst = PageRef {
             page_idx: 0,
             offset: 0,
@@ -750,7 +879,9 @@ mod tests {
 
     #[test]
     fn admission_filter_drops_first_touch() {
-        let (eng, _) = engine(64);
+        let (eng, _buf) = engine(64);
+        // First write is rejected pre-mutator; mutator never sees
+        // anything so plain block_on is fine.
         let src = PageRef {
             page_idx: 0,
             offset: 0,
@@ -765,44 +896,44 @@ mod tests {
     #[test]
     fn checksum_mismatch_reports_miss() {
         let (eng, buf) = engine(64);
-        let src = PageRef {
-            page_idx: 0,
-            offset: 0,
-            len: 4096,
-        };
-        // Admit a page.
-        block_on(eng.write_page(stripe(3), 0, src)).unwrap();
-        block_on(eng.write_page(stripe(3), 0, src)).unwrap();
-        assert_eq!(eng.snapshot().admitted, 1);
-        // Corrupt the underlying device storage.
-        // Find the LBA from the btree.
-        let mut bytes = [0u8; 4096];
-        // Page 0 in the cache lives at some allocated LBA >= 2.
-        // Scan to find it.
-        let device: &MockDevice = &eng.device;
-        let mut data_lba: Option<u64> = None;
-        for lba in 2..64 {
-            device.peek(Lba(lba), &mut bytes);
-            // Look for our pattern (zeros in buf at page_idx 0).
-            if bytes.iter().all(|&b| b == 0) {
-                data_lba = Some(lba);
-                break;
+        let eng_body = eng.clone();
+        let mutator = eng.clone().run_mutator();
+        let mut mutator = pin!(mutator);
+        let body = async move {
+            let src = PageRef {
+                page_idx: 0,
+                offset: 0,
+                len: 4096,
+            };
+            eng_body.write_page(stripe(3), 0, src).await.unwrap();
+            eng_body.write_page(stripe(3), 0, src).await.unwrap();
+            assert_eq!(eng_body.snapshot().admitted, 1);
+            let device: &MockDevice = &eng_body.device;
+            let mut bytes = [0u8; 4096];
+            let mut data_lba: Option<u64> = None;
+            for lba in 2..64 {
+                device.peek(Lba(lba), &mut bytes);
+                if bytes.iter().all(|&b| b == 0) {
+                    data_lba = Some(lba);
+                    break;
+                }
             }
-        }
-        let lba = data_lba.expect("data page on disk");
-        let mut bad = [0u8; 4096];
-        bad[0] = 0xFF;
-        device.poke(Lba(lba), &bad);
+            let lba = data_lba.expect("data page on disk");
+            let mut bad = [0u8; 4096];
+            bad[0] = 0xFF;
+            device.poke(Lba(lba), &bad);
 
-        // Now lookup should checksum-miss.
-        let dst = PageRef {
-            page_idx: 1,
-            offset: 0,
-            len: 4096,
+            let dst = PageRef {
+                page_idx: 1,
+                offset: 0,
+                len: 4096,
+            };
+            let hit = eng_body.read_page(stripe(3), 0, dst).await.unwrap();
+            assert!(!hit);
+            assert!(eng_body.snapshot().checksum_misses >= 1);
+            eng_body.close_mutator();
+            let _ = buf;
         };
-        let hit = block_on(eng.read_page(stripe(3), 0, dst)).unwrap();
-        assert!(!hit);
-        assert!(eng.snapshot().checksum_misses >= 1);
-        let _ = buf; // keep alive
+        block_on_pair(body, mutator.as_mut());
     }
 }

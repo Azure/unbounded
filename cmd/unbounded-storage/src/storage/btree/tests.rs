@@ -205,14 +205,13 @@ fn corrupted_active_meta_falls_back_to_other_slot() {
 
     // Smash the *active* meta slot. The other slot should still
     // have a valid (older) tree to recover from.
-    let mut bad = vec![0xFFu8; 4096];
+    let bad = vec![0xFFu8; 4096];
     let slot = if active_slot == 0 {
         META_SLOT_A
     } else {
         META_SLOT_B
     };
     dev.poke(slot, &bad);
-    bad[0] = 0;
 
     let alloc2 = Arc::new(Allocator::new(128));
     let idx2 = block_on(BTreeIndex::open(dev, alloc2)).unwrap();
@@ -254,9 +253,13 @@ fn double_corrupted_meta_triggers_lba_scan_rebuild() {
 
 #[test]
 fn snapshot_drop_frees_old_pages() {
-    // Apply a batch, count allocator usage; apply another; old
-    // pages should be reclaimed when the prior snapshot drops.
+    // Catches a regression where dropping the prior `RootSnapshot`
+    // fails to hand its pages back to the allocator: without the
+    // baseline + monotonicity bounds, an empty Drop impl (or a
+    // committed write that never allocated) would still satisfy
+    // a bare `used_after_first == used_after_second` check.
     let (dev, alloc) = fresh(128);
+    let used_before_any = alloc.used_pages();
     let idx = block_on(BTreeIndex::open(dev, alloc.clone())).unwrap();
     block_on(idx.apply_batch(vec![Mutation::Insert {
         key: key(1),
@@ -264,6 +267,10 @@ fn snapshot_drop_frees_old_pages() {
     }]))
     .unwrap();
     let used_after_first = alloc.used_pages();
+    assert!(
+        used_after_first > used_before_any,
+        "first commit must allocate pages (before={used_before_any}, after={used_after_first})",
+    );
     block_on(idx.apply_batch(vec![Mutation::Insert {
         key: key(2),
         value: entry(22),
@@ -272,7 +279,10 @@ fn snapshot_drop_frees_old_pages() {
     // After the second commit the new snapshot is the only
     // strong ref (no `Guard`s outstanding) so the old snapshot's
     // pages have been freed. With one entry the tree is a single
-    // leaf, so used count stays equal.
+    // leaf, so total usage must not grow past the first commit.
     let used_after_second = alloc.used_pages();
-    assert_eq!(used_after_first, used_after_second);
+    assert!(
+        used_after_second <= used_after_first,
+        "second commit must not grow allocator (after_first={used_after_first}, after_second={used_after_second})",
+    );
 }

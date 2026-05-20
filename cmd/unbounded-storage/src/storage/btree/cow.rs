@@ -31,6 +31,12 @@ use crate::storage::btree::page::{
 };
 use crate::storage::types::{Error, Lba, PageKey};
 
+/// Cycle guard for DFS traversals over the on-disk tree:
+/// checksum-valid but structurally corrupt pages could otherwise
+/// loop forever. Sized well above any plausible real tree depth
+/// times fanout.
+const MAX_TRAVERSAL_NODES: u64 = 1 << 24;
+
 /// Walk the tree rooted at `root_lba` for `key`. Returns `None`
 /// for any miss, including structural corruption / checksum
 /// mismatches (the design's silent-miss policy).
@@ -87,6 +93,42 @@ pub async fn for_each_leaf<B: BlockDevice>(
     root_lba: Lba,
     mut visit: impl FnMut(PageKey, LeafEntry, Lba),
 ) -> Result<(), Error> {
+    walk_tree(device, root_lba, |node, decoded| {
+        if let Decoded::Leaf { entries, .. } = decoded {
+            for (k, v) in entries {
+                visit(k, v, node);
+            }
+        }
+    })
+    .await
+}
+
+/// Collect every non-meta LBA reachable from `root_lba`. Used
+/// after open to seed the snapshot's "owned pages" list.
+pub async fn collect_pages<B: BlockDevice>(
+    device: &B,
+    root_lba: Lba,
+) -> Result<Vec<Lba>, Error> {
+    let mut out = Vec::new();
+    walk_tree(device, root_lba, |node, decoded| match decoded {
+        Decoded::Leaf { .. } | Decoded::Internal { .. } => out.push(node),
+        _ => {}
+    })
+    .await?;
+    Ok(out)
+}
+
+/// DFS the on-disk tree from `root_lba`, invoking `visitor(node,
+/// decoded)` for every page that reads back. Unreadable pages are
+/// skipped (silent-miss policy); structural cycles are bounded by
+/// [`MAX_TRAVERSAL_NODES`] and surfaced as `Error::Corrupt`.
+/// Internal-node children are enqueued for descent regardless of
+/// what the visitor does, so callers do not need to recurse.
+async fn walk_tree<B, F>(device: &B, root_lba: Lba, mut visitor: F) -> Result<(), Error>
+where
+    B: BlockDevice,
+    F: FnMut(Lba, Decoded),
+{
     if !root_lba.is_valid() {
         return Ok(());
     }
@@ -96,63 +138,21 @@ pub async fn for_each_leaf<B: BlockDevice>(
     let mut visited = 0u64;
     while let Some(node) = stack.pop() {
         visited += 1;
-        if visited > 1 << 24 {
+        if visited > MAX_TRAVERSAL_NODES {
             return Err(Error::Corrupt);
         }
         if device.read(node, &mut buf).await.is_err() {
             continue;
         }
-        match page::decode(&buf) {
-            Decoded::Leaf { entries, .. } => {
-                for (k, v) in entries {
-                    visit(k, v, node);
-                }
+        let decoded = page::decode(&buf);
+        if let Decoded::Internal { ref children, .. } = decoded {
+            for &c in children {
+                stack.push(c);
             }
-            Decoded::Internal { children, .. } => {
-                for c in children {
-                    stack.push(c);
-                }
-            }
-            _ => {}
         }
+        visitor(node, decoded);
     }
     Ok(())
-}
-
-/// Collect every non-meta LBA reachable from `root_lba`. Used
-/// after open to seed the snapshot's "owned pages" list.
-pub async fn collect_pages<B: BlockDevice>(
-    device: &B,
-    root_lba: Lba,
-) -> Result<Vec<Lba>, Error> {
-    if !root_lba.is_valid() {
-        return Ok(Vec::new());
-    }
-    let ps = device.page_size();
-    let mut stack = vec![root_lba];
-    let mut buf = vec![0u8; ps];
-    let mut out = Vec::new();
-    let mut steps = 0u64;
-    while let Some(node) = stack.pop() {
-        steps += 1;
-        if steps > 1 << 24 {
-            return Err(Error::Corrupt);
-        }
-        if device.read(node, &mut buf).await.is_err() {
-            continue;
-        }
-        match page::decode(&buf) {
-            Decoded::Leaf { .. } => out.push(node),
-            Decoded::Internal { children, .. } => {
-                out.push(node);
-                for c in children {
-                    stack.push(c);
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(out)
 }
 
 /// Bulk-load `sorted_entries` into a fresh tree under `device`.

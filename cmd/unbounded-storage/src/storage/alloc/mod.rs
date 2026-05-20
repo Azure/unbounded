@@ -58,7 +58,7 @@ impl Allocator {
     }
 
     pub fn used_pages(&self) -> u64 {
-        self.inner.lock().expect("alloc mutex").used
+        self.inner.lock().unwrap().used
     }
 
     pub fn free_pages(&self) -> u64 {
@@ -69,7 +69,7 @@ impl Allocator {
     /// full. Scans from a rolling hint to amortize the search
     /// cost.
     pub fn alloc(&self) -> Result<Lba, Error> {
-        let mut g = self.inner.lock().expect("alloc mutex");
+        let mut g = self.inner.lock().unwrap();
         if g.used >= self.capacity {
             return Err(Error::OutOfSpace);
         }
@@ -94,7 +94,7 @@ impl Allocator {
             return Err(Error::OutOfRange);
         }
         let (w, b) = word_bit(lba.0);
-        let mut g = self.inner.lock().expect("alloc mutex");
+        let mut g = self.inner.lock().unwrap();
         let mask = 1u64 << b;
         if g.words[w] & mask == 0 {
             debug_assert!(false, "free of already-free lba {:?}", lba);
@@ -118,7 +118,7 @@ impl Allocator {
             return Err(Error::OutOfRange);
         }
         let (w, b) = word_bit(lba.0);
-        let mut g = self.inner.lock().expect("alloc mutex");
+        let mut g = self.inner.lock().unwrap();
         let mask = 1u64 << b;
         if g.words[w] & mask == 0 {
             g.words[w] |= mask;
@@ -132,7 +132,7 @@ impl Allocator {
             return Err(Error::OutOfRange);
         }
         let (w, b) = word_bit(lba.0);
-        let g = self.inner.lock().expect("alloc mutex");
+        let g = self.inner.lock().unwrap();
         Ok(g.words[w] & (1u64 << b) != 0)
     }
 }

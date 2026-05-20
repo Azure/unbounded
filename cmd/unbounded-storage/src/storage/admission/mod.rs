@@ -22,7 +22,7 @@
 
 use std::sync::Mutex;
 
-use crate::storage::types::PageKey;
+use crate::storage::types::{GOLDEN_RATIO_64, PageKey};
 
 pub struct AdmissionFilter {
     inner: Mutex<Inner>,
@@ -114,11 +114,11 @@ impl AdmissionFilter {
 }
 
 fn doorkeeper_probe_and_set(words: &mut [u64], bits: u64, key: &PageKey) -> bool {
-    let h = hash_key(key, 0);
+    let h = key.mix(0);
     let mut all_set = true;
     for i in 0..NUM_HASHES {
         let bit =
-            h.wrapping_add((i as u64).wrapping_mul(0x9e3779b97f4a7c15)) % bits;
+            h.wrapping_add((i as u64).wrapping_mul(GOLDEN_RATIO_64)) % bits;
         let word = (bit / 64) as usize;
         let mask = 1u64 << (bit % 64);
         if words[word] & mask == 0 {
@@ -140,7 +140,7 @@ fn sketch_bump(rows: &mut [Box<[u8]>; 4], width: u32, key: &PageKey) {
 }
 
 fn sketch_index(key: &PageKey, row: u32, width: u32) -> usize {
-    let h = hash_key(key, row.wrapping_add(1));
+    let h = key.mix(row.wrapping_add(1));
     (h % (width as u64)) as usize
 }
 
@@ -150,16 +150,6 @@ fn age(rows: &mut [Box<[u8]>; 4]) {
             *c >>= 1;
         }
     }
-}
-
-fn hash_key(key: &PageKey, salt: u32) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325 ^ ((salt as u64).wrapping_mul(0x9e3779b97f4a7c15));
-    for b in key.value_hash {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h ^= key.page_index as u64;
-    h.wrapping_mul(0x100000001b3)
 }
 
 #[cfg(test)]

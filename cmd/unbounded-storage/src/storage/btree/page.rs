@@ -40,6 +40,20 @@ pub const KEY_LEN: usize = 36;
 pub const LEAF_ENTRY_LEN: usize = KEY_LEN + 8 + 8 + 4; // 56
 pub const INTERNAL_ENTRY_LEN: usize = KEY_LEN + 8; // 44
 
+// Offsets within a leaf entry (relative to the entry base).
+const LEAF_LBA_OFF: usize = KEY_LEN; // 36
+const LEAF_CSUM_OFF: usize = LEAF_LBA_OFF + 8; // 44
+const LEAF_LEN_OFF: usize = LEAF_CSUM_OFF + 8; // 52
+const LEAF_LEN_END: usize = LEAF_LEN_OFF + 4; // 56
+
+// Offsets within an internal entry.
+const INT_CHILD_OFF: usize = KEY_LEN; // 36
+const INT_CHILD_END: usize = INT_CHILD_OFF + 8; // 44
+
+// Offsets of header fields where the layout matters in encode/decode.
+const HDR_CSUM_OFF: usize = 16;
+const HDR_CSUM_END: usize = 24;
+
 pub const PAGE_TYPE_EMPTY: u8 = 0;
 pub const PAGE_TYPE_LEAF: u8 = 1;
 pub const PAGE_TYPE_INTERNAL: u8 = 2;
@@ -99,7 +113,7 @@ pub fn decode(page: &[u8]) -> Decoded {
     let page_type = page[0];
     let nentries = u16::from_le_bytes([page[2], page[3]]) as usize;
     let txn_id = u64::from_le_bytes(page[8..16].try_into().unwrap());
-    let stored_checksum = u64::from_le_bytes(page[16..24].try_into().unwrap());
+    let stored_checksum = u64::from_le_bytes(page[HDR_CSUM_OFF..HDR_CSUM_END].try_into().unwrap());
 
     // Validate checksum: clone the page with checksum field zeroed.
     if !verify_checksum(page, stored_checksum) {
@@ -115,20 +129,14 @@ pub fn decode(page: &[u8]) -> Decoded {
 }
 
 fn verify_checksum(page: &[u8], stored: u64) -> bool {
-    // Compute over the page with the checksum field zeroed. We do
-    // this without copying by hashing the two slices around the
-    // field separately - but xxh3 is a streaming hash and we only
-    // have the one-shot helper here, so a stack copy of the page
-    // header is fine; the body is the bulk of the bytes and we
-    // hash that directly.
-    let mut header = [0u8; HEADER_LEN];
-    header.copy_from_slice(&page[..HEADER_LEN]);
-    for b in &mut header[16..24] {
+    // xxh3 in this crate only has a one-shot helper, so we hash a
+    // copy of the page with the checksum field zeroed. One Vec
+    // allocation; the body bytes copy is unavoidable without a
+    // streaming API.
+    let mut buf = page.to_vec();
+    for b in &mut buf[HDR_CSUM_OFF..HDR_CSUM_END] {
         *b = 0;
     }
-    let mut buf = Vec::with_capacity(page.len());
-    buf.extend_from_slice(&header);
-    buf.extend_from_slice(&page[HEADER_LEN..]);
     Xxh3Checksum::checksum_of(&buf).0 == stored
 }
 
@@ -144,12 +152,14 @@ fn decode_leaf(page: &[u8], nentries: usize, txn_id: u64) -> Decoded {
             return Decoded::Empty;
         };
         let lba = Lba(u64::from_le_bytes(
-            page[base + 36..base + 44].try_into().unwrap(),
+            page[base + LEAF_LBA_OFF..base + LEAF_CSUM_OFF].try_into().unwrap(),
         ));
         let data_checksum = Checksum(u64::from_le_bytes(
-            page[base + 44..base + 52].try_into().unwrap(),
+            page[base + LEAF_CSUM_OFF..base + LEAF_LEN_OFF].try_into().unwrap(),
         ));
-        let byte_len = u32::from_le_bytes(page[base + 52..base + 56].try_into().unwrap());
+        let byte_len = u32::from_le_bytes(
+            page[base + LEAF_LEN_OFF..base + LEAF_LEN_END].try_into().unwrap(),
+        );
         entries.push((
             key,
             LeafEntry {
@@ -175,7 +185,7 @@ fn decode_internal(page: &[u8], nentries: usize, txn_id: u64) -> Decoded {
             return Decoded::Empty;
         };
         let child = Lba(u64::from_le_bytes(
-            page[base + 36..base + 44].try_into().unwrap(),
+            page[base + INT_CHILD_OFF..base + INT_CHILD_END].try_into().unwrap(),
         ));
         keys.push(key);
         children.push(child);
@@ -197,13 +207,12 @@ fn decode_meta(page: &[u8], txn_id: u64) -> Decoded {
     Decoded::Meta { txn_id, root_lba }
 }
 
-/// Build a leaf page. Asserts at debug-time that `entries` fits.
+/// Build a leaf page. Returns `OutOfSpace` if `entries` doesn't fit.
 pub fn encode_leaf(
     page_size: usize,
     txn_id: u64,
     entries: &[(PageKey, LeafEntry)],
 ) -> Result<Vec<u8>, Error> {
-    debug_assert!(entries.len() <= max_leaf_entries(page_size));
     if entries.len() > max_leaf_entries(page_size) {
         return Err(Error::OutOfSpace);
     }
@@ -214,9 +223,11 @@ pub fn encode_leaf(
     for (i, (k, v)) in entries.iter().enumerate() {
         let base = HEADER_LEN + i * LEAF_ENTRY_LEN;
         page[base..base + KEY_LEN].copy_from_slice(&k.encode());
-        page[base + 36..base + 44].copy_from_slice(&v.lba.0.to_le_bytes());
-        page[base + 44..base + 52].copy_from_slice(&v.data_checksum.0.to_le_bytes());
-        page[base + 52..base + 56].copy_from_slice(&v.byte_len.to_le_bytes());
+        page[base + LEAF_LBA_OFF..base + LEAF_CSUM_OFF].copy_from_slice(&v.lba.0.to_le_bytes());
+        page[base + LEAF_CSUM_OFF..base + LEAF_LEN_OFF]
+            .copy_from_slice(&v.data_checksum.0.to_le_bytes());
+        page[base + LEAF_LEN_OFF..base + LEAF_LEN_END]
+            .copy_from_slice(&v.byte_len.to_le_bytes());
     }
     seal_checksum(&mut page);
     Ok(page)
@@ -242,7 +253,8 @@ pub fn encode_internal(
     for (i, k) in keys.iter().enumerate() {
         let base = HEADER_LEN + i * INTERNAL_ENTRY_LEN;
         page[base..base + KEY_LEN].copy_from_slice(&k.encode());
-        page[base + 36..base + 44].copy_from_slice(&children[i].0.to_le_bytes());
+        page[base + INT_CHILD_OFF..base + INT_CHILD_END]
+            .copy_from_slice(&children[i].0.to_le_bytes());
     }
     seal_checksum(&mut page);
     Ok(page)
@@ -263,13 +275,11 @@ pub fn encode_empty_leaf(page_size: usize, txn_id: u64) -> Vec<u8> {
 }
 
 fn seal_checksum(page: &mut [u8]) {
-    // checksum field is bytes 16..24; clear then hash full page,
-    // then write the result there.
-    for b in &mut page[16..24] {
+    for b in &mut page[HDR_CSUM_OFF..HDR_CSUM_END] {
         *b = 0;
     }
     let cs = Xxh3Checksum::checksum_of(page).0;
-    page[16..24].copy_from_slice(&cs.to_le_bytes());
+    page[HDR_CSUM_OFF..HDR_CSUM_END].copy_from_slice(&cs.to_le_bytes());
 }
 
 #[cfg(test)]

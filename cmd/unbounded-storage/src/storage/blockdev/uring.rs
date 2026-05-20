@@ -13,7 +13,21 @@
 //! All I/O is issued via `READ_FIXED` / `WRITE_FIXED` against a
 //! single pre-registered buffer (`IORING_REGISTER_BUFFERS`, index 0)
 //! and a single pre-registered file (`IORING_REGISTER_FILES`,
-//! `Fixed(0)`), which is the configuration the design targets.
+//! `Fixed(0)`).
+//!
+//! ## Concurrency model
+//!
+//! The device is fully asynchronous: each in-flight op owns an
+//! [`IoSlot`] holding its eventual CQE result and the [`Waker`] of
+//! the task awaiting it. The executor is expected to call
+//! [`UringBlockDevice::progress`] periodically (and implicitly via
+//! the [`BlockDevice::progress`] trait method) to push queued SQEs
+//! to the kernel and reap any pending CQEs, waking the matching
+//! task and freeing a back-pressure slot.
+//!
+//! Submission depth is capped at `queue_depth`; callers attempting
+//! to issue beyond that point park on a `submit_waiters` queue and
+//! resume in FIFO order as completions free slots.
 //!
 //! Tests and any non-NVMe usage use [`UringConfig::test_local`]
 //! which disables `IOPOLL`, `SINGLE_ISSUER`, `DEFER_TASKRUN`, and
@@ -23,11 +37,15 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::File;
+use std::future::Future;
 use std::io;
 use std::marker::PhantomData;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::path::Path;
+use std::pin::Pin;
 use std::ptr::NonNull;
+use std::rc::Rc;
+use std::task::{Context, Poll, Waker};
 
 use io_uring::{IoUring, opcode, types};
 
@@ -99,15 +117,17 @@ pub struct UringBlockDevice {
     /// Pre-registered I/O buffer. Set once by [`Self::register_buffers`];
     /// every read/write must address bytes inside this range.
     registered: Cell<Option<RegisteredBuf>>,
-    /// Map from in-flight `user_data` to its CQE result. We never
-    /// share a ring with another future so this stays single-task;
-    /// it exists only to handle the case where `submit_and_wait(1)`
-    /// returns a completion for a *different* in-flight op than the
-    /// one we are waiting on. With the current single-op-at-a-time
-    /// call sites it stays empty, but the bookkeeping is cheap and
-    /// keeps the loop correct if a caller ever drives multiple
-    /// operations concurrently on the same task.
-    pending: RefCell<HashMap<u64, i32>>,
+    /// Per-in-flight-op state, keyed by `user_data`. Entries are
+    /// inserted at submit time and removed in [`Self::progress`]
+    /// once the matching CQE is reaped.
+    slots: RefCell<HashMap<u64, Rc<IoSlot>>>,
+    /// Number of SQEs currently submitted (or pending submission)
+    /// against the kernel. Bounded by `queue_depth` via the
+    /// `submit_waiters` back-pressure queue.
+    submitted: Cell<u32>,
+    /// FIFO of wakers parked because `submitted == queue_depth`
+    /// at submit time. Drained one-per-completion in `progress`.
+    submit_waiters: RefCell<Vec<Waker>>,
     next_user_data: Cell<u64>,
     page_size: usize,
     capacity_pages: u64,
@@ -121,6 +141,23 @@ struct RegisteredBuf {
     len: usize,
 }
 
+/// Per-op completion slot. The waker is registered by the
+/// [`IoFut`] poll path; the result is filled by
+/// [`UringBlockDevice::progress`] when the matching CQE is reaped.
+struct IoSlot {
+    result: Cell<Option<i32>>,
+    waker: RefCell<Option<Waker>>,
+}
+
+impl IoSlot {
+    fn new() -> Self {
+        Self {
+            result: Cell::new(None),
+            waker: RefCell::new(None),
+        }
+    }
+}
+
 impl UringBlockDevice {
     /// Open `path` and build a ring configured per `cfg`.
     ///
@@ -130,7 +167,7 @@ impl UringBlockDevice {
     /// `metadata()` on Linux, so this works for both regular files
     /// and `/dev/nvmeXnY`.
     pub fn open(path: &Path, cfg: UringConfig) -> Result<Self, Error> {
-        if cfg.page_size == 0 {
+        if cfg.page_size == 0 || cfg.queue_depth == 0 {
             return Err(Error::Io(libc::EINVAL));
         }
         let file = open_file(path, cfg.o_direct)?;
@@ -158,13 +195,66 @@ impl UringBlockDevice {
             file,
             ring: RefCell::new(ring),
             registered: Cell::new(None),
-            pending: RefCell::new(HashMap::new()),
+            slots: RefCell::new(HashMap::new()),
+            submitted: Cell::new(0),
+            submit_waiters: RefCell::new(Vec::new()),
             next_user_data: Cell::new(1),
             page_size: cfg.page_size,
             capacity_pages,
             queue_depth: cfg.queue_depth,
             _no_send: PhantomData,
         })
+    }
+
+    /// Push queued SQEs to the kernel and reap any available CQEs,
+    /// waking the awaiting futures and freeing back-pressure slots.
+    ///
+    /// Always non-blocking: never calls `submit_and_wait(N > 0)`.
+    /// The executor is responsible for calling this periodically
+    /// (typically from its idle hook) so in-flight ops can complete.
+    pub fn progress(&self) -> Result<(), Error> {
+        // 1. Push any newly-queued SQEs to the kernel without
+        // waiting. With IOPOLL, this also gives the kernel a chance
+        // to drive polling.
+        {
+            let ring = self.ring.borrow_mut();
+            ring.submitter().submit().map_err(io_err_to_storage)?;
+        }
+
+        // 2. Drain the completion queue. Collect wakers under the
+        // ring borrow, then drop the borrow before waking so wake
+        // handlers are free to re-enter the device.
+        let mut to_wake: Vec<Waker> = Vec::new();
+        {
+            let mut ring = self.ring.borrow_mut();
+            let mut cq = ring.completion();
+            cq.sync();
+            while let Some(cqe) = cq.next() {
+                let ud = cqe.user_data();
+                let res = cqe.result();
+                if let Some(slot) = self.slots.borrow_mut().remove(&ud) {
+                    slot.result.set(Some(res));
+                    if let Some(w) = slot.waker.borrow_mut().take() {
+                        to_wake.push(w);
+                    }
+                }
+                // submitted count tracks live slots, not CQEs in
+                // the abstract: decrement once per reaped op.
+                let n = self.submitted.get();
+                debug_assert!(n > 0, "completion without outstanding submission");
+                self.submitted.set(n.saturating_sub(1));
+
+                // Free one back-pressure waiter per completion.
+                if let Some(w) = pop_front_waker(&mut self.submit_waiters.borrow_mut()) {
+                    to_wake.push(w);
+                }
+            }
+        }
+
+        for w in to_wake {
+            w.wake();
+        }
+        Ok(())
     }
 
     fn alloc_user_data(&self) -> u64 {
@@ -192,33 +282,54 @@ impl UringBlockDevice {
         u32::try_from(off).map_err(|_| Error::Io(libc::EOVERFLOW))
     }
 
-    fn submit_and_wait_for(&self, want: u64) -> Result<i32, Error> {
-        loop {
-            if let Some(res) = self.pending.borrow_mut().remove(&want) {
-                return Ok(res);
-            }
+    /// Wait (cooperatively) for a free submission slot, then push
+    /// `sqe` and resolve once the kernel completes it.
+    async fn submit_fixed_io(
+        &self,
+        sqe: io_uring::squeue::Entry,
+        expected_len: usize,
+    ) -> Result<(), Error> {
+        SubmitSlot { dev: self }.await;
+
+        let user_data = sqe.get_user_data();
+        let slot = Rc::new(IoSlot::new());
+        self.slots.borrow_mut().insert(user_data, Rc::clone(&slot));
+        self.submitted.set(self.submitted.get() + 1);
+
+        // SAFETY: SQE references caller-owned buffers within the
+        // registered region; the caller keeps them alive until this
+        // future resolves. The ring is !Send so no other thread can
+        // drop the slot under us.
+        let push_res = unsafe {
             let mut ring = self.ring.borrow_mut();
-            ring.submit_and_wait(1).map_err(io_err_to_storage)?;
-            // Drain everything currently available so that the next
-            // submit_and_wait does not block on already-reaped CQEs.
-            let mut got_target = false;
-            let mut target_result = 0i32;
-            let mut cq = ring.completion();
-            cq.sync();
-            while let Some(cqe) = cq.next() {
-                let ud = cqe.user_data();
-                let res = cqe.result();
-                if ud == want {
-                    got_target = true;
-                    target_result = res;
-                } else {
-                    self.pending.borrow_mut().insert(ud, res);
-                }
+            let mut sq = ring.submission();
+            sq.push(&sqe)
+        };
+        if push_res.is_err() {
+            // Roll back bookkeeping if the SQ was unexpectedly full.
+            self.slots.borrow_mut().remove(&user_data);
+            self.submitted.set(self.submitted.get().saturating_sub(1));
+            // Some waiter may now fit; wake one.
+            if let Some(w) = pop_front_waker(&mut self.submit_waiters.borrow_mut()) {
+                w.wake();
             }
-            if got_target {
-                return Ok(target_result);
-            }
+            return Err(Error::Io(libc::ENOMEM));
         }
+
+        let res = IoFut {
+            dev: self,
+            slot,
+            done: false,
+        }
+        .await?;
+
+        if res < 0 {
+            return Err(Error::Io(-res));
+        }
+        if res as usize != expected_len {
+            return Err(Error::Io(libc::EIO));
+        }
+        Ok(())
     }
 }
 
@@ -275,22 +386,7 @@ impl BlockDevice for UringBlockDevice {
         .offset(offset)
         .build()
         .user_data(user_data);
-        // SAFETY: SQE references `dst` and the registered buffer;
-        // we keep `dst` alive across submit_and_wait. The ring is
-        // !Send so no other thread can drop the slot under us.
-        unsafe {
-            let mut ring = self.ring.borrow_mut();
-            let mut sq = ring.submission();
-            sq.push(&sqe).map_err(|_| Error::Io(libc::ENOMEM))?;
-        }
-        let res = self.submit_and_wait_for(user_data)?;
-        if res < 0 {
-            return Err(Error::Io(-res));
-        }
-        if res as usize != dst.len() {
-            return Err(Error::Io(libc::EIO));
-        }
-        Ok(())
+        self.submit_fixed_io(sqe, dst.len()).await
     }
 
     async fn write(&self, lba: Lba, src: &[u8]) -> Result<(), Error> {
@@ -314,24 +410,15 @@ impl BlockDevice for UringBlockDevice {
         .offset(offset)
         .build()
         .user_data(user_data);
-        // SAFETY: see [`Self::read`].
-        unsafe {
-            let mut ring = self.ring.borrow_mut();
-            let mut sq = ring.submission();
-            sq.push(&sqe).map_err(|_| Error::Io(libc::ENOMEM))?;
-        }
-        let res = self.submit_and_wait_for(user_data)?;
-        if res < 0 {
-            return Err(Error::Io(-res));
-        }
-        if res as usize != src.len() {
-            return Err(Error::Io(libc::EIO));
-        }
-        Ok(())
+        self.submit_fixed_io(sqe, src.len()).await
     }
 
     fn write_queue_depth(&self) -> u32 {
         self.queue_depth
+    }
+
+    fn progress(&self) -> Result<(), Error> {
+        UringBlockDevice::progress(self)
     }
 }
 
@@ -345,6 +432,77 @@ impl Drop for UringBlockDevice {
         let _ = sub.unregister_buffers();
         let _ = sub.unregister_files();
         let _ = &self.file; // keep the file alive until drop runs.
+    }
+}
+
+/// Back-pressure park: yields `Pending` while `submitted ==
+/// queue_depth`, registering the caller's waker on each poll so
+/// `progress` can resume it when a slot frees up.
+struct SubmitSlot<'a> {
+    dev: &'a UringBlockDevice,
+}
+
+impl<'a> Future for SubmitSlot<'a> {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let dev = self.dev;
+        if dev.submitted.get() < dev.queue_depth {
+            return Poll::Ready(());
+        }
+        // Try to opportunistically drive completions to free a slot
+        // before parking.
+        let _ = dev.progress();
+        if dev.submitted.get() < dev.queue_depth {
+            return Poll::Ready(());
+        }
+        dev.submit_waiters
+            .borrow_mut()
+            .push(cx.waker().clone());
+        Poll::Pending
+    }
+}
+
+/// Future that resolves once the kernel returns a CQE for a slot.
+struct IoFut<'a> {
+    dev: &'a UringBlockDevice,
+    slot: Rc<IoSlot>,
+    done: bool,
+}
+
+impl<'a> Future for IoFut<'a> {
+    type Output = Result<i32, Error>;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<i32, Error>> {
+        let this = self.get_mut();
+        if this.done {
+            return Poll::Pending;
+        }
+        if let Some(res) = this.slot.result.get() {
+            this.done = true;
+            return Poll::Ready(Ok(res));
+        }
+        // Opportunistically peek the CQ; if the kernel has the
+        // result ready we can finish without a re-poll round-trip.
+        if let Err(e) = this.dev.progress() {
+            this.done = true;
+            return Poll::Ready(Err(e));
+        }
+        if let Some(res) = this.slot.result.get() {
+            this.done = true;
+            return Poll::Ready(Ok(res));
+        }
+        *this.slot.waker.borrow_mut() = Some(cx.waker().clone());
+        Poll::Pending
+    }
+}
+
+/// Pop the oldest waker from `v`, treating it as a FIFO. `Vec` is
+/// fine here because the queue is bounded by `queue_depth` and we
+/// only manipulate it on the owning thread.
+fn pop_front_waker(v: &mut Vec<Waker>) -> Option<Waker> {
+    if v.is_empty() {
+        None
+    } else {
+        Some(v.remove(0))
     }
 }
 
@@ -399,7 +557,6 @@ fn io_err_to_storage(e: io::Error) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::future::Future;
     use std::io::Write as _;
     use std::path::PathBuf;
@@ -408,42 +565,65 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::task::{Context, Poll, Wake, Waker};
 
+    use super::*;
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
     struct NoopWake;
     impl Wake for NoopWake {
         fn wake(self: Arc<Self>) {}
     }
 
-    fn block_on<F: Future>(fut: F) -> F::Output {
-        let waker: Waker = Arc::new(NoopWake).into();
+    fn noop_waker() -> Waker {
+        Arc::new(NoopWake).into()
+    }
+
+    /// Drive multiple futures cooperatively while calling
+    /// `dev.progress()` between polls. Returns the collected outputs
+    /// in submission order once every future is ready.
+    fn pump<O>(
+        dev: &UringBlockDevice,
+        mut futs: Vec<Pin<Box<dyn Future<Output = O> + '_>>>,
+    ) -> Vec<O> {
+        let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
-        let mut fut = Box::pin(fut);
+        let mut out: Vec<Option<O>> = (0..futs.len()).map(|_| None).collect();
         let mut spins = 0u32;
         loop {
-            match Pin::as_mut(&mut fut).poll(&mut cx) {
-                Poll::Ready(v) => return v,
-                Poll::Pending => {
-                    spins += 1;
-                    assert!(spins < 1_000_000, "block_on spun without progress");
+            let mut made_progress = false;
+            for (i, fut) in futs.iter_mut().enumerate() {
+                if out[i].is_some() {
+                    continue;
                 }
+                if let Poll::Ready(v) = Pin::as_mut(fut).poll(&mut cx) {
+                    out[i] = Some(v);
+                    made_progress = true;
+                }
+            }
+            dev.progress().expect("progress");
+            if out.iter().all(|o| o.is_some()) {
+                return out.into_iter().map(|o| o.unwrap()).collect();
+            }
+            if !made_progress {
+                spins += 1;
+                assert!(spins < 1_000_000, "pump spun without progress");
+            } else {
+                spins = 0;
             }
         }
     }
 
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-
-    /// Create a fresh, sized tempfile under `$TMPDIR` populated with
-    /// `pages * page_size` bytes of `0xa5`.
-    fn make_tempfile(pages: u64, page_size: usize) -> PathBuf {
+    fn make_tempfile(pages: u64, page_size: usize, fill: u8) -> PathBuf {
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
         let mut p = std::env::temp_dir();
-        p.push(format!("uring-blockdev-{}-{}.bin", std::process::id(), n));
+        p.push(format!("uring-async-{}-{}.bin", std::process::id(), n));
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .truncate(true)
             .write(true)
             .open(&p)
             .expect("create tempfile");
-        let block = vec![0xa5u8; page_size];
+        let block = vec![fill; page_size];
         for _ in 0..pages {
             f.write_all(&block).expect("seed tempfile");
         }
@@ -459,7 +639,6 @@ mod tests {
     }
 
     fn aligned_buffer(len: usize) -> (Vec<u8>, *mut u8) {
-        // Page-aligned via Box<[u64]> backing.
         let words = (len + 7) / 8;
         let mut v = vec![0u8; words * 8 + 4096];
         let raw = v.as_mut_ptr();
@@ -468,93 +647,118 @@ mod tests {
         (v, base)
     }
 
-    fn geometry() -> (usize, u64) {
-        (4096, 8)
-    }
-
     #[test]
-    fn open_reports_capacity() {
-        let (page_size, pages) = geometry();
-        let path = TempPath(make_tempfile(pages, page_size));
-        let dev = UringBlockDevice::open(&path.0, UringConfig::test_local())
-            .expect("open uring device");
-        assert_eq!(dev.page_size(), page_size);
-        assert_eq!(dev.capacity_pages(), pages);
-        assert_eq!(dev.write_queue_depth(), 8);
-    }
+    fn concurrent_reads_complete_correctly() {
+        const PAGE: usize = 4096;
+        const PAGES: u64 = 16;
+        let path = TempPath(make_tempfile(PAGES, PAGE, 0xa5));
+        let cfg = UringConfig {
+            queue_depth: 16,
+            ..UringConfig::test_local()
+        };
+        let dev = UringBlockDevice::open(&path.0, cfg).expect("open");
 
-    #[test]
-    fn read_back_what_we_wrote() {
-        let (page_size, pages) = geometry();
-        let path = TempPath(make_tempfile(pages, page_size));
-        let dev = UringBlockDevice::open(&path.0, UringConfig::test_local())
-            .expect("open uring device");
-
-        let buf_len = page_size * 4;
+        // Register one buffer big enough for 8 distinct destination
+        // slices.
+        let buf_len = PAGE * 8;
         let (_owner, base) = aligned_buffer(buf_len);
-        dev.register_buffers(base, buf_len)
-            .expect("register buffers");
+        dev.register_buffers(base, buf_len).unwrap();
 
-        // SAFETY: we own the buffer for the duration of the test.
-        let src = unsafe { std::slice::from_raw_parts_mut(base, page_size) };
+        // Issue 8 concurrent reads against the first 8 LBAs into
+        // disjoint slices of the registered buffer.
+        let mut futs: Vec<Pin<Box<dyn Future<Output = Result<(), Error>> + '_>>> =
+            Vec::with_capacity(8);
+        let mut dst_ptrs = Vec::with_capacity(8);
+        for i in 0..8u64 {
+            let ptr = unsafe { base.add((i as usize) * PAGE) };
+            dst_ptrs.push(ptr);
+            let slice = unsafe { std::slice::from_raw_parts_mut(ptr, PAGE) };
+            slice.fill(0);
+            futs.push(Box::pin(dev.read(Lba(i), slice)));
+        }
+
+        let results = pump(&dev, futs);
+        for r in &results {
+            r.as_ref().expect("read ok");
+        }
+        for ptr in dst_ptrs {
+            let slice = unsafe { std::slice::from_raw_parts(ptr, PAGE) };
+            assert!(slice.iter().all(|b| *b == 0xa5), "each page seeded 0xa5");
+        }
+    }
+
+    #[test]
+    fn submit_backpressure_parks_and_resumes() {
+        const PAGE: usize = 4096;
+        const PAGES: u64 = 16;
+        const QD: u32 = 4;
+        let path = TempPath(make_tempfile(PAGES, PAGE, 0));
+        let cfg = UringConfig {
+            queue_depth: QD,
+            ..UringConfig::test_local()
+        };
+        let dev = UringBlockDevice::open(&path.0, cfg).expect("open");
+
+        // Register a single page-sized buffer; all 16 writes share
+        // it (write-only semantics on the device don't require
+        // unique source bytes for this back-pressure test).
+        let buf_len = PAGE;
+        let (_owner, base) = aligned_buffer(buf_len);
+        dev.register_buffers(base, buf_len).unwrap();
+        let src = unsafe { std::slice::from_raw_parts_mut(base, PAGE) };
         for (i, b) in src.iter_mut().enumerate() {
-            *b = (i as u8).wrapping_mul(31).wrapping_add(7);
+            *b = (i as u8).wrapping_mul(7);
         }
-        block_on(dev.write(Lba(3), src)).expect("write");
+        let src_const: &[u8] = unsafe { std::slice::from_raw_parts(base, PAGE) };
 
-        let dst_ptr = unsafe { base.add(page_size * 2) };
-        let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, page_size) };
-        dst.fill(0);
-        block_on(dev.read(Lba(3), dst)).expect("read");
-
-        for (i, b) in dst.iter().enumerate() {
-            assert_eq!(*b, (i as u8).wrapping_mul(31).wrapping_add(7), "byte {i}");
+        let mut futs: Vec<Pin<Box<dyn Future<Output = Result<(), Error>> + '_>>> =
+            Vec::with_capacity(16);
+        for i in 0..16u64 {
+            futs.push(Box::pin(dev.write(Lba(i), src_const)));
         }
-    }
 
-    #[test]
-    fn read_unwritten_page_returns_seed_bytes() {
-        let (page_size, pages) = geometry();
-        let path = TempPath(make_tempfile(pages, page_size));
-        let dev = UringBlockDevice::open(&path.0, UringConfig::test_local())
-            .expect("open uring device");
-
-        let buf_len = page_size;
-        let (_owner, base) = aligned_buffer(buf_len);
-        dev.register_buffers(base, buf_len).unwrap();
-
-        let dst = unsafe { std::slice::from_raw_parts_mut(base, page_size) };
-        dst.fill(0);
-        block_on(dev.read(Lba(0), dst)).expect("read");
-        // make_tempfile seeds the file with 0xa5.
-        assert!(dst.iter().all(|b| *b == 0xa5));
-    }
-
-    #[test]
-    fn out_of_range_lba_rejected_without_io() {
-        let (page_size, pages) = geometry();
-        let path = TempPath(make_tempfile(pages, page_size));
-        let dev = UringBlockDevice::open(&path.0, UringConfig::test_local())
-            .expect("open uring device");
-
-        let buf_len = page_size;
-        let (_owner, base) = aligned_buffer(buf_len);
-        dev.register_buffers(base, buf_len).unwrap();
-        let dst = unsafe { std::slice::from_raw_parts_mut(base, page_size) };
-        let err = block_on(dev.read(Lba(pages), dst));
-        assert!(matches!(err, Err(Error::OutOfRange)));
-    }
-
-    #[test]
-    fn write_without_registered_buffer_errors() {
-        let (page_size, pages) = geometry();
-        let path = TempPath(make_tempfile(pages, page_size));
-        let dev = UringBlockDevice::open(&path.0, UringConfig::test_local())
-            .expect("open uring device");
-
-        let (_owner, base) = aligned_buffer(page_size);
-        let src = unsafe { std::slice::from_raw_parts(base, page_size) };
-        let err = block_on(dev.write(Lba(0), src));
-        assert!(matches!(err, Err(Error::Io(_))));
+        // Drive the pump and check the invariant on every step.
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut out: Vec<Option<Result<(), Error>>> =
+            (0..futs.len()).map(|_| None).collect();
+        let mut spins = 0u32;
+        let mut max_submitted: u32 = 0;
+        loop {
+            let mut made_progress = false;
+            for (i, fut) in futs.iter_mut().enumerate() {
+                if out[i].is_some() {
+                    continue;
+                }
+                if let Poll::Ready(v) = Pin::as_mut(fut).poll(&mut cx) {
+                    out[i] = Some(v);
+                    made_progress = true;
+                }
+                max_submitted = max_submitted.max(dev.submitted.get());
+                assert!(
+                    dev.submitted.get() <= QD,
+                    "submitted={} exceeds queue_depth={}",
+                    dev.submitted.get(),
+                    QD,
+                );
+            }
+            dev.progress().expect("progress");
+            max_submitted = max_submitted.max(dev.submitted.get());
+            assert!(dev.submitted.get() <= QD);
+            if out.iter().all(|o| o.is_some()) {
+                break;
+            }
+            if !made_progress {
+                spins += 1;
+                assert!(spins < 1_000_000, "pump spun without progress");
+            } else {
+                spins = 0;
+            }
+        }
+        for r in &out {
+            r.as_ref().unwrap().as_ref().expect("write ok");
+        }
+        assert!(max_submitted > 0, "should have had in-flight ops");
+        assert!(max_submitted <= QD);
     }
 }

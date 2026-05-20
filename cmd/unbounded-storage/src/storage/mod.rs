@@ -14,17 +14,19 @@
 //! side, and finally [`engine`] wires everything into the
 //! `bufferpool::BlockStore` surface the rest of the project sees.
 
-pub mod admission;
-pub mod alloc;
 pub mod blockdev;
-pub mod btree;
-pub mod engine;
-pub mod local;
-pub mod lru;
-pub mod refcount;
-pub mod singleflight;
-pub mod traits;
 pub mod types;
+
+mod admission;
+mod alloc;
+mod btree;
+mod engine;
+mod local;
+mod lru;
+mod mutator;
+mod refcount;
+mod singleflight;
+mod traits;
 
 pub use engine::{EngineConfig, StorageEngine};
 pub use local::{LocalStorage, ShardLocalStore};

@@ -15,6 +15,8 @@
 //! way to enforce that is a single function with no inputs other than
 //! the page identity.
 
+use std::sync::Arc;
+
 use crate::bufferpool;
 use crate::bufferpool::{Error, PageRef, StripeKey};
 use crate::storage::blockdev::BlockDevice;
@@ -28,14 +30,14 @@ use crate::storage::traits::{PageChecksum, Xxh3Checksum};
 /// `num_local_devices`, so if the disk count changes the cache must
 /// be considered cold.
 pub struct LocalStorage<B: BlockDevice + 'static> {
-    engines: Vec<StorageEngine<B>>,
+    engines: Vec<Arc<StorageEngine<B>>>,
 }
 
 impl<B: BlockDevice + 'static> LocalStorage<B> {
     /// Build a router over `engines`. Panics if `engines` is empty:
     /// a node with zero disks cannot serve any page and the caller
     /// should fail loudly rather than route to a phantom disk.
-    pub fn new(engines: Vec<StorageEngine<B>>) -> Self {
+    pub fn new(engines: Vec<Arc<StorageEngine<B>>>) -> Self {
         assert!(
             !engines.is_empty(),
             "LocalStorage requires at least one engine",
@@ -56,10 +58,71 @@ impl<B: BlockDevice + 'static> LocalStorage<B> {
         &self.engines[idx]
     }
 
+    /// Owned-Arc accessor used by callers (notably the DST harness
+    /// and tests) that need to spawn the engine's mutator task on
+    /// a separate executor task.
+    pub fn engine_arc(&self, idx: usize) -> Arc<StorageEngine<B>> {
+        self.engines[idx].clone()
+    }
+
     /// Disk selector. Pure function over the page identity; see the
     /// module-level comment for the invariant this preserves.
     pub fn disk_for(&self, key: StripeKey, stripe_off: u64) -> usize {
         disk_for(&key, stripe_off, self.engines.len())
+    }
+
+    /// Drive every engine's mutator loop to completion concurrently.
+    ///
+    /// Intended to be called once per shard thread by the embedder:
+    /// one thread owns the `LocalStorage` for that shard and pumps
+    /// all of its engines from a single task. `ShardLocalStore`
+    /// deliberately does not expose this; it is a per-shard handle
+    /// over a shared `LocalStorage`, and the embedder drives the
+    /// shared instance directly.
+    pub async fn run(&self) {
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        struct RunAll<'a> {
+            futs: Vec<Option<Pin<Box<dyn Future<Output = ()> + 'a>>>>,
+        }
+        impl<'a> Future for RunAll<'a> {
+            type Output = ();
+            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                let mut all_done = true;
+                for slot in self.futs.iter_mut() {
+                    if let Some(f) = slot.as_mut() {
+                        match f.as_mut().poll(cx) {
+                            Poll::Ready(()) => *slot = None,
+                            Poll::Pending => all_done = false,
+                        }
+                    }
+                }
+                if all_done { Poll::Ready(()) } else { Poll::Pending }
+            }
+        }
+
+        let futs = self
+            .engines
+            .iter()
+            .map(|e| {
+                Some(Box::pin(e.clone().run_mutator())
+                    as Pin<Box<dyn Future<Output = ()> + '_>>)
+            })
+            .collect();
+        RunAll { futs }.await
+    }
+
+    /// Fan [`BlockDevice::progress`] out to every engine's device.
+    /// Bails on the first error to match the crate's existing
+    /// error-propagation style; a partial sweep is acceptable
+    /// because the embedder calls this repeatedly on idle.
+    pub fn progress(&self) -> Result<(), crate::storage::types::Error> {
+        for e in &self.engines {
+            e.device().progress()?;
+        }
+        Ok(())
     }
 }
 
@@ -334,7 +397,7 @@ mod tests {
     use crate::storage::blockdev::{MockDevice, MockDeviceConfig};
     use crate::storage::engine::{EngineConfig, StorageEngine};
     use std::future::Future;
-    use std::pin::pin;
+    use std::pin::{Pin, pin};
     use std::sync::Arc;
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
@@ -363,7 +426,33 @@ mod tests {
         }
     }
 
-    fn engine() -> StorageEngine<MockDevice> {
+    /// Pump `body` to completion while concurrently driving every
+    /// future in `aux`. Used to keep per-engine mutator loops
+    /// running alongside a test body in tests that exercise
+    /// writes through one or more engines.
+    fn block_on_with_aux<F: Future>(
+        body: F,
+        aux: &mut [Pin<&mut dyn Future<Output = ()>>],
+    ) -> F::Output {
+        let w = noop_waker();
+        let mut cx = Context::from_waker(&w);
+        let mut body = pin!(body);
+        let mut spins = 0u64;
+        loop {
+            for a in aux.iter_mut() {
+                let _ = a.as_mut().poll(&mut cx);
+            }
+            match body.as_mut().poll(&mut cx) {
+                Poll::Ready(v) => return v,
+                Poll::Pending => {
+                    spins += 1;
+                    assert!(spins < 1_000_000, "stuck");
+                }
+            }
+        }
+    }
+
+    fn engine() -> Arc<StorageEngine<MockDevice>> {
         let device = Arc::new(MockDevice::new(MockDeviceConfig {
             page_size: 4096,
             capacity_pages: 128,
@@ -372,7 +461,7 @@ mod tests {
         let mut cfg = EngineConfig::default();
         cfg.page_size_bytes = 4096;
         cfg.btree_page_bytes = 4096;
-        block_on(StorageEngine::open(device, cfg)).unwrap()
+        Arc::new(block_on(StorageEngine::open(device, cfg)).unwrap())
     }
 
     #[test]
@@ -381,7 +470,9 @@ mod tests {
         // We exercise the wrapper from two simulated shards in
         // sequence (the executor is single-threaded; "different
         // shard" here just means "different backing region").
-        let inner = Arc::new(LocalStorage::new(vec![engine(), engine()]));
+        let e0 = engine();
+        let e1 = engine();
+        let inner = Arc::new(LocalStorage::new(vec![e0.clone(), e1.clone()]));
 
         // Shard A: 32 pool pages of 4 KiB at base_a.
         let mut buf_a = vec![0u8; 4096 * 32].into_boxed_slice();
@@ -410,21 +501,34 @@ mod tests {
             offset: 0,
             len: 4096,
         };
-        // First write is rejected by the admission filter on first
-        // touch; the second admits.
-        block_on(store_a.write_page(key, 0, src)).unwrap();
-        block_on(store_a.write_page(key, 0, src)).unwrap();
 
-        // Read into shard B's page 7. The router must hit the same
-        // engine as the writer (disk_for is pure), and the engine
-        // must DMA into shard B's backing, not shard A's.
-        let dst = PageRef {
-            page_idx: 7,
-            offset: 0,
-            len: 4096,
+        let e0_body = e0.clone();
+        let e1_body = e1.clone();
+        let store_a_clone = &store_a;
+        let store_b_clone = &store_b;
+        let body = async move {
+            // First write is rejected by the admission filter on
+            // first touch; the second admits.
+            store_a_clone.write_page(key, 0, src).await.unwrap();
+            store_a_clone.write_page(key, 0, src).await.unwrap();
+
+            let dst = PageRef {
+                page_idx: 7,
+                offset: 0,
+                len: 4096,
+            };
+            let hit = store_b_clone.read_page(key, 0, dst).await.unwrap();
+            assert!(hit, "expected cache hit across shards");
+            e0_body.close_mutator();
+            e1_body.close_mutator();
         };
-        let hit = block_on(store_b.read_page(key, 0, dst)).unwrap();
-        assert!(hit, "expected cache hit across shards");
+        let m0 = e0.clone().run_mutator();
+        let m1 = e1.clone().run_mutator();
+        let mut m0 = pin!(m0);
+        let mut m1 = pin!(m1);
+        let aux: &mut [Pin<&mut dyn Future<Output = ()>>] =
+            &mut [m0.as_mut(), m1.as_mut()];
+        block_on_with_aux(body, aux);
 
         unsafe {
             let p = buf_b.as_ptr().add(4096 * 7);

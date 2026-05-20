@@ -62,14 +62,7 @@ impl Singleflight {
     }
 
     fn shard(&self, key: &PageKey) -> &Mutex<HashMap<PageKey, Arc<Lease>>> {
-        // Cheap mixer over PageKey's bytes.
-        let mut h: u64 = 0xcbf29ce484222325;
-        for b in key.value_hash {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x100000001b3);
-        }
-        h ^= key.page_index as u64;
-        h = h.wrapping_mul(0x100000001b3);
+        let h = key.mix(0);
         &self.shards[(h as usize) % self.shards.len()]
     }
 

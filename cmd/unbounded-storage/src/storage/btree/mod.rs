@@ -68,18 +68,27 @@ pub struct RootSnapshot {
     pub txn_id: u64,
     pages: Vec<Lba>,
     allocator: Arc<Allocator>,
-    /// Set to `true` on the very first snapshot built from
-    /// `open()`; suppresses freeing the bootstrap pages we just
-    /// wrote on top of a previously-good tree. Subsequent
-    /// snapshots always drop their pages.
-    skip_free: bool,
+}
+
+impl RootSnapshot {
+    fn new(
+        root_lba: Lba,
+        txn_id: u64,
+        pages: Vec<Lba>,
+        allocator: Arc<Allocator>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            root_lba,
+            txn_id,
+            pages,
+            allocator,
+        })
+    }
 }
 
 impl Drop for RootSnapshot {
     fn drop(&mut self) {
-        if !self.skip_free {
-            cow::free_all(&self.allocator, &self.pages);
-        }
+        cow::free_all(&self.allocator, &self.pages);
     }
 }
 
@@ -150,15 +159,12 @@ impl<B: BlockDevice> BTreeIndex<B> {
         })
         .await?;
 
-        let snapshot = Arc::new(RootSnapshot {
-            root_lba: state.root_lba,
-            txn_id: state.txn_id,
+        let snapshot = RootSnapshot::new(
+            state.root_lba,
+            state.txn_id,
             pages,
-            allocator: allocator.clone(),
-            // Live tree on disk: keep it. Subsequent commits
-            // build their own snapshots that may free this one.
-            skip_free: false,
-        });
+            allocator.clone(),
+        );
 
         Ok(Some(Self {
             device: device.clone(),
@@ -187,13 +193,7 @@ impl<B: BlockDevice> BTreeIndex<B> {
         // wrote to A; on next commit we'll write to B).
         let active = meta::write_inactive(&*device, meta::MetaSlot::B, txn_id, root_lba).await?;
 
-        let snapshot = Arc::new(RootSnapshot {
-            root_lba,
-            txn_id,
-            pages,
-            allocator: allocator.clone(),
-            skip_free: false,
-        });
+        let snapshot = RootSnapshot::new(root_lba, txn_id, pages, allocator.clone());
 
         Ok(Self {
             device,
@@ -262,13 +262,7 @@ impl<B: BlockDevice> BTreeIndex<B> {
             state.entries = next_entries;
             state.next_txn_id = txn_id + 1;
         }
-        let snapshot = Arc::new(RootSnapshot {
-            root_lba,
-            txn_id,
-            pages,
-            allocator: self.allocator.clone(),
-            skip_free: false,
-        });
+        let snapshot = RootSnapshot::new(root_lba, txn_id, pages, self.allocator.clone());
         self.active_meta.set(new_active);
         self.root.store(snapshot);
         Ok(())

@@ -79,7 +79,28 @@ impl PageKey {
             page_index: u32::from_be_bytes(pi),
         })
     }
+
+    /// FNV-1a-style mixer over the key's bytes, salted with an
+    /// arbitrary tag. Used by admission's count-min sketch and the
+    /// singleflight shard selector. Not cryptographic; meant only
+    /// to give different callers near-independent 64-bit lanes.
+    pub fn mix(&self, salt: u32) -> u64 {
+        const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+        const FNV_PRIME: u64 = 0x100000001b3;
+        let mut h: u64 = FNV_OFFSET ^ ((salt as u64).wrapping_mul(GOLDEN_RATIO_64));
+        for b in self.value_hash {
+            h ^= b as u64;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+        h ^= self.page_index as u64;
+        h.wrapping_mul(FNV_PRIME)
+    }
 }
+
+/// 2^64 / phi, the standard 64-bit golden-ratio mixer constant
+/// (Knuth, TAOCP 6.4). Used to decorrelate salt values and to
+/// spread bloom-filter probe positions.
+pub const GOLDEN_RATIO_64: u64 = 0x9e3779b97f4a7c15;
 
 /// 64-bit page/data checksum. We use xxh3 (non-cryptographic but
 /// fast and well-distributed) for both btree-page integrity and

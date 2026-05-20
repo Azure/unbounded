@@ -11,5 +11,6 @@
 
 pub mod mocks;
 pub mod oracle;
+pub mod recovery;
 pub mod tests;
 pub mod workload;
