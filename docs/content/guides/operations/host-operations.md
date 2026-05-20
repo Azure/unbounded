@@ -8,6 +8,13 @@ Host operations change the power state of the VM, PXE host, or bare-metal
 machine. They are handled by `machine-ops-controller` for cloud VMs and by
 `metalman` for PXE/bare-metal machines with BMC.
 
+For metalman-managed bare-metal machines, host operations may target a single
+machine with `spec.machineRef` or multiple machines with `spec.machineSelector`.
+Selector-based bare-metal host operations must include
+`unbounded-cloud.io/site=<site>` so exactly one metalman instance owns the
+operation. The default unlabeled metalman instance supports `machineRef` host
+operations only.
+
 ## Provider Requirements
 
 Host operations require out-of-band management access to the machine through a
@@ -168,7 +175,9 @@ replacement flow with fresh `user_data` injection has not been verified.
 
 **Bare metal (PXE)** - metalman boots the machine through PXE, writes the
 selected host OS image, installs or configures the agent, and lets the agent
-create the nspawn node.
+create the nspawn node. The `MachineOperation` records per-machine progress in
+`status.targets[]`; each target completes after the Machine status shows the
+requested repave and reboot counters were observed and `Repaved=True`.
 
 ### HostReplace vs Node Recreation
 
