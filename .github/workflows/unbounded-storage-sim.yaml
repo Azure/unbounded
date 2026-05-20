@@ -27,7 +27,7 @@ permissions:
 env:
   # Keep in sync with the default in the Makefile / install-mercury.sh and
   # the unbounded-storage.yaml workflow.
-  MERCURY_VERSION: v2.3.1
+  MERCURY_VERSION: v2.4.1
 
 jobs:
   sim:

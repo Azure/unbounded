@@ -23,7 +23,7 @@
 #   - libfabric-dev (provides the libfabric NA backend)
 #
 # Configuration (override via environment):
-#   MERCURY_VERSION  Mercury release tag to build. Default: v2.3.1.
+#   MERCURY_VERSION  Mercury release tag to build. Default: v2.4.1.
 #   MERCURY_PREFIX   Install prefix. Default: $REPO_ROOT/tmp/mercury-prefix.
 #   MERCURY_SRC      Scratch source tree. Default: $REPO_ROOT/tmp/mercury-src.
 #   MERCURY_REPO     Upstream repo. Default: https://github.com/mercury-hpc/mercury.git
@@ -34,14 +34,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-MERCURY_VERSION="${MERCURY_VERSION:-v2.3.1}"
+MERCURY_VERSION="${MERCURY_VERSION:-v2.4.1}"
 MERCURY_PREFIX="${MERCURY_PREFIX:-${REPO_ROOT}/tmp/mercury-prefix}"
 MERCURY_SRC="${MERCURY_SRC:-${REPO_ROOT}/tmp/mercury-src}"
 MERCURY_REPO="${MERCURY_REPO:-https://github.com/mercury-hpc/mercury.git}"
 JOBS="${JOBS:-$(nproc 2>/dev/null || echo 4)}"
 
 # Strip leading 'v' from tag for pkg-config comparison (Mercury's mercury.pc
-# advertises "2.3.1", the git tag is "v2.3.1").
+# advertises "2.4.1", the git tag is "v2.4.1").
 expected_pc_version="${MERCURY_VERSION#v}"
 
 pc_file="${MERCURY_PREFIX}/lib/pkgconfig/mercury.pc"
