@@ -6,7 +6,6 @@ package server
 import (
 	"bytes"
 	"context"
-	"encoding/xml"
 	"errors"
 	"io"
 	"log/slog"
@@ -31,7 +30,6 @@ import (
 type fakeEdgeAPI struct {
 	HeadObjectFunc func(ctx context.Context, bucket, key string) (origin.ObjectInfo, error)
 	GetChunkFunc   func(ctx context.Context, k chunk.Key, objectSize int64) (io.ReadCloser, error)
-	OriginVal      origin.Origin
 }
 
 func (f *fakeEdgeAPI) HeadObject(ctx context.Context, bucket, key string) (origin.ObjectInfo, error) {
@@ -40,28 +38,6 @@ func (f *fakeEdgeAPI) HeadObject(ctx context.Context, bucket, key string) (origi
 
 func (f *fakeEdgeAPI) GetChunk(ctx context.Context, k chunk.Key, objectSize int64) (io.ReadCloser, error) {
 	return f.GetChunkFunc(ctx, k, objectSize)
-}
-
-func (f *fakeEdgeAPI) Origin() origin.Origin { return f.OriginVal }
-
-// fakeOrigin satisfies origin.Origin for handler tests. Only the
-// fields used in the test need to be populated.
-type fakeOrigin struct {
-	HeadFunc     func(ctx context.Context, bucket, key string) (origin.ObjectInfo, error)
-	GetRangeFunc func(ctx context.Context, bucket, key, etag string, off, n int64) (io.ReadCloser, error)
-	ListFunc     func(ctx context.Context, bucket, prefix, marker string, max int) (origin.ListResult, error)
-}
-
-func (f *fakeOrigin) Head(ctx context.Context, bucket, key string) (origin.ObjectInfo, error) {
-	return f.HeadFunc(ctx, bucket, key)
-}
-
-func (f *fakeOrigin) GetRange(ctx context.Context, bucket, key, etag string, off, n int64) (io.ReadCloser, error) {
-	return f.GetRangeFunc(ctx, bucket, key, etag, off, n)
-}
-
-func (f *fakeOrigin) List(ctx context.Context, bucket, prefix, marker string, max int) (origin.ListResult, error) {
-	return f.ListFunc(ctx, bucket, prefix, marker, max)
 }
 
 // TestWriteOriginError covers all five branches of the error mapping.
@@ -207,137 +183,6 @@ func TestHandleHead(t *testing.T) {
 
 			if rr.Body.Len() != 0 && tt.wantStatus == http.StatusOK {
 				t.Errorf("HEAD body should be empty; got %d bytes", rr.Body.Len())
-			}
-		})
-	}
-}
-
-// TestHandleList covers the XML pass-through, prefix propagation,
-// truncation, and empty-list handling.
-func TestHandleList(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name        string
-		prefix      string
-		listResult  origin.ListResult
-		listErr     error
-		wantStatus  int
-		wantKeys    []string
-		wantTrunc   bool
-		wantNextTok string
-	}{
-		{
-			name:   "normal list",
-			prefix: "alpha/",
-			listResult: origin.ListResult{
-				Entries: []origin.ObjectEntry{
-					{Key: "alpha/one", Size: 3, ETag: "e1"},
-					{Key: "alpha/two", Size: 5, ETag: "e2"},
-				},
-			},
-			wantStatus: http.StatusOK,
-			wantKeys:   []string{"alpha/one", "alpha/two"},
-		},
-		{
-			name:       "empty list",
-			prefix:     "missing/",
-			listResult: origin.ListResult{},
-			wantStatus: http.StatusOK,
-			wantKeys:   nil,
-		},
-		{
-			name: "truncated list",
-			listResult: origin.ListResult{
-				Entries:     []origin.ObjectEntry{{Key: "k1"}},
-				IsTruncated: true,
-				NextMarker:  "next-page",
-			},
-			wantStatus:  http.StatusOK,
-			wantKeys:    []string{"k1"},
-			wantTrunc:   true,
-			wantNextTok: "next-page",
-		},
-		{
-			name:       "origin error yields 502",
-			listErr:    errors.New("upstream broken"),
-			wantStatus: http.StatusBadGateway,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			or := &fakeOrigin{
-				ListFunc: func(_ context.Context, bucket, prefix, _ string, _ int) (origin.ListResult, error) {
-					if bucket != "b" {
-						t.Errorf("bucket=%q want %q", bucket, "b")
-					}
-
-					if prefix != tt.prefix {
-						t.Errorf("prefix=%q want %q", prefix, tt.prefix)
-					}
-
-					return tt.listResult, tt.listErr
-				},
-			}
-			fc := &fakeEdgeAPI{OriginVal: or}
-			h := NewEdgeHandler(fc, &config.Config{}, discardLogger())
-
-			req := httptest.NewRequest(http.MethodGet,
-				"/b/?list-type=2&prefix="+tt.prefix, nil)
-			rr := httptest.NewRecorder()
-			h.handleList(rr, req, "b")
-
-			if rr.Code != tt.wantStatus {
-				t.Errorf("status=%d want %d body=%s", rr.Code, tt.wantStatus, rr.Body.String())
-			}
-
-			if tt.wantStatus != http.StatusOK {
-				return
-			}
-
-			var got struct {
-				XMLName     xml.Name `xml:"ListBucketResult"`
-				Name        string   `xml:"Name"`
-				Prefix      string   `xml:"Prefix"`
-				KeyCount    int      `xml:"KeyCount"`
-				IsTruncated bool     `xml:"IsTruncated"`
-				NextMarker  string   `xml:"NextContinuationToken"`
-				Contents    []struct {
-					Key string `xml:"Key"`
-				} `xml:"Contents"`
-			}
-			if err := xml.Unmarshal(rr.Body.Bytes(), &got); err != nil {
-				t.Fatalf("xml decode: %v body=%s", err, rr.Body.String())
-			}
-
-			if got.Name != "b" {
-				t.Errorf("Name=%q want %q", got.Name, "b")
-			}
-
-			if got.Prefix != tt.prefix {
-				t.Errorf("Prefix=%q want %q", got.Prefix, tt.prefix)
-			}
-
-			if got.KeyCount != len(tt.wantKeys) {
-				t.Errorf("KeyCount=%d want %d", got.KeyCount, len(tt.wantKeys))
-			}
-
-			if got.IsTruncated != tt.wantTrunc {
-				t.Errorf("IsTruncated=%v want %v", got.IsTruncated, tt.wantTrunc)
-			}
-
-			if got.NextMarker != tt.wantNextTok {
-				t.Errorf("NextMarker=%q want %q", got.NextMarker, tt.wantNextTok)
-			}
-
-			gotKeys := make([]string, 0, len(got.Contents))
-			for _, c := range got.Contents {
-				gotKeys = append(gotKeys, c.Key)
-			}
-
-			if !equalStrings(gotKeys, tt.wantKeys) {
-				t.Errorf("keys=%v want %v", gotKeys, tt.wantKeys)
 			}
 		})
 	}
@@ -788,20 +633,6 @@ func discardLogger() *slog.Logger {
 // at known call sites.
 func debugLoggerTo(buf *bytes.Buffer) *slog.Logger {
 	return slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-}
-
-func equalStrings(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-
-	return true
 }
 
 // readaheadConfig returns a config tailored for readahead unit tests.

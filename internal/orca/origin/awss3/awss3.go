@@ -6,8 +6,8 @@
 // LocalStack. Useful as a credential-free origin for the dev harness:
 // LocalStack acts as both origin and cachestore (different buckets).
 //
-// This driver is read-only from Orca's perspective (Head, GetRange,
-// List). The seed step that uploads test objects to the origin bucket
+// This driver is read-only from Orca's perspective (Head, GetRange).
+// The seed step that uploads test objects to the origin bucket
 // happens out-of-band via aws-cli or similar.
 package awss3
 
@@ -244,78 +244,6 @@ func (a *Adapter) GetRange(ctx context.Context, bucket, key, etag string, off, n
 	return out.Body, nil
 }
 
-// List enumerates objects under prefix.
-func (a *Adapter) List(ctx context.Context, bucket, prefix, marker string, maxResults int) (origin.ListResult, error) {
-	b := bucket
-	if b == "" {
-		b = a.cfg.Bucket
-	}
-
-	a.log.LogAttrs(ctx, slog.LevelDebug, "awss3_list_request",
-		slog.String("bucket", b),
-		slog.String("prefix", prefix),
-		slog.String("marker", marker),
-		slog.Int("max", maxResults),
-	)
-
-	in := &s3.ListObjectsV2Input{
-		Bucket:  aws.String(b),
-		Prefix:  aws.String(prefix),
-		MaxKeys: aws.Int32(clampMaxKeys(maxResults)),
-	}
-	if marker != "" {
-		in.ContinuationToken = aws.String(marker)
-	}
-
-	out, err := a.client.ListObjectsV2(ctx, in)
-	if err != nil {
-		if isAuth(err) {
-			a.log.LogAttrs(ctx, slog.LevelDebug, "awss3_list_auth",
-				slog.String("bucket", b),
-			)
-
-			return origin.ListResult{}, origin.ErrAuth
-		}
-
-		return origin.ListResult{}, fmt.Errorf("awss3 list: %w", err)
-	}
-
-	res := origin.ListResult{}
-
-	for _, item := range out.Contents {
-		entry := origin.ObjectEntry{}
-		if item.Key != nil {
-			entry.Key = *item.Key
-		}
-
-		if item.Size != nil {
-			entry.Size = *item.Size
-		}
-
-		if item.ETag != nil {
-			entry.ETag = strings.Trim(*item.ETag, "\"")
-		}
-
-		res.Entries = append(res.Entries, entry)
-	}
-
-	if out.IsTruncated != nil {
-		res.IsTruncated = *out.IsTruncated
-	}
-
-	if out.NextContinuationToken != nil {
-		res.NextMarker = *out.NextContinuationToken
-	}
-
-	a.log.LogAttrs(ctx, slog.LevelDebug, "awss3_list_response",
-		slog.String("bucket", b),
-		slog.Int("count", len(res.Entries)),
-		slog.Bool("truncated", res.IsTruncated),
-	)
-
-	return res, nil
-}
-
 func isNotFound(err error) bool {
 	var nsk *s3types.NoSuchKey
 	if errors.As(err, &nsk) {
@@ -375,36 +303,4 @@ func isPreconditionFailed(err error) bool {
 	}
 
 	return false
-}
-
-// s3MaxKeysCap is the documented server-side ceiling for
-// ListObjectsV2.MaxKeys. AWS S3 returns at most 1000 keys per call;
-// values above that have no effect at the backend, so clamping at
-// the wire boundary trades nothing.
-const s3MaxKeysCap = 1000
-
-// clampMaxKeys converts a host-int maxResults to a
-// guaranteed-in-range int32 suitable for s3.ListObjectsV2Input.MaxKeys.
-//
-// The lower clamp (negative -> 0) and upper clamp (> s3MaxKeysCap ->
-// s3MaxKeysCap) jointly close the silent-overflow window the int32
-// cast would otherwise expose: an untrusted caller passing
-// maxResults above int32 max would otherwise wrap around to a
-// non-deterministic (often negative) MaxKeys value, which an
-// S3-compatible backend may handle in surprising ways. CodeQL flags
-// the un-bounded conversion at the call site; this helper makes the
-// bounds explicit and locally verifiable.
-//
-// maxResults == 0 is preserved as 0 (caller intent: backend
-// default); negative inputs collapse to 0 with the same effect.
-func clampMaxKeys(maxResults int) int32 {
-	if maxResults < 0 {
-		return 0
-	}
-
-	if maxResults > s3MaxKeysCap {
-		return int32(s3MaxKeysCap)
-	}
-
-	return int32(maxResults) // safe: 0 <= maxResults <= s3MaxKeysCap (1000)
 }
