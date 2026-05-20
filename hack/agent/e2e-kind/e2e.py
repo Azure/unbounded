@@ -57,7 +57,7 @@ import time
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from threading import Thread
-from typing import Any
+from typing import Any, Callable
 
 # ---------------------------------------------------------------------------
 # Paths and defaults
@@ -113,11 +113,6 @@ MACHINA_CONFIG_FILE = VM_DIR / "machina-config.yaml"
 MACHINE_CONFIG_NAME = f"{AGENT_MACHINE_NAME}-config"
 DAEMON_BINARY_CURRENT = "/usr/local/bin/unbounded-agent-current"
 DAEMON_BINARY_LAST_GOOD = "/usr/local/bin/unbounded-agent-last-good"
-NODE_CONFIG: dict[str, Any] = {
-    "name": "default",
-    "nodeLabels": {},
-    "registerWithTaints": [],
-}
 
 
 # ---------------------------------------------------------------------------
@@ -247,20 +242,20 @@ def load_node_config(path: str | None) -> dict[str, Any]:
     }
 
 
-def expected_node_labels() -> dict[str, str]:
+def expected_node_labels(node_config: dict[str, Any]) -> dict[str, str]:
     """Return labels configured for this e2e node variant."""
-    return dict(NODE_CONFIG["nodeLabels"])
+    return dict(node_config["nodeLabels"])
 
 
-def expected_node_taint_strings() -> list[str]:
+def expected_node_taint_strings(node_config: dict[str, Any]) -> list[str]:
     """Return configured taint strings for this e2e node variant."""
-    return list(NODE_CONFIG["registerWithTaints"])
+    return list(node_config["registerWithTaints"])
 
 
-def expected_node_taints() -> list[dict[str, str]]:
+def expected_node_taints(node_config: dict[str, Any]) -> list[dict[str, str]]:
     """Return taints configured for this e2e node variant."""
     taints: list[dict[str, str]] = []
-    for item in expected_node_taint_strings():
+    for item in expected_node_taint_strings(node_config):
         if ":" not in item:
             die(f"invalid registerWithTaints entry {item!r}, expected key[=value]:Effect")
         body, effect = item.rsplit(":", 1)
@@ -274,21 +269,21 @@ def expected_node_taints() -> list[dict[str, str]]:
     return taints
 
 
-def node_config_bootstrap_args() -> list[str]:
+def node_config_bootstrap_args(node_config: dict[str, Any]) -> list[str]:
     """Return manual-bootstrap flags for the active node config variant."""
     args: list[str] = []
-    for key, value in sorted(expected_node_labels().items()):
+    for key, value in sorted(expected_node_labels(node_config).items()):
         args.extend(["--node-label", f"{key}={value}"])
-    for taint in expected_node_taint_strings():
+    for taint in expected_node_taint_strings(node_config):
         args.extend(["--register-with-taint", taint])
     return args
 
 
-def log_active_node_config() -> None:
+def log_active_node_config(node_config: dict[str, Any]) -> None:
     """Log the active e2e node config variant."""
-    labels = [f"{key}={value}" for key, value in sorted(expected_node_labels().items())]
-    taints = expected_node_taint_strings()
-    log(f"Agent e2e node config variant: {NODE_CONFIG['name']}")
+    labels = [f"{key}={value}" for key, value in sorted(expected_node_labels(node_config).items())]
+    taints = expected_node_taint_strings(node_config)
+    log(f"Agent e2e node config variant: {node_config['name']}")
     log(f"  node labels: {', '.join(labels) if labels else '<none>'}")
     log(f"  register-with-taints: {', '.join(taints) if taints else '<none>'}")
 
@@ -1024,7 +1019,7 @@ def ensure_kind_bridge() -> None:
 # ---------------------------------------------------------------------------
 # run-agent
 # ---------------------------------------------------------------------------
-def run_agent() -> None:
+def run_agent(node_config: dict[str, Any]) -> None:
     """Build agent, generate bootstrap script, and run it on the VM."""
 
     if not SSH_KEY.exists():
@@ -1066,7 +1061,7 @@ def run_agent() -> None:
     log(f"Agent download URL: {agent_url}")
 
     try:
-        _run_agent_inner(agent_url)
+        _run_agent_inner(agent_url, node_config)
     finally:
         httpd.shutdown()
 
@@ -1083,7 +1078,7 @@ def _make_handler(directory: str) -> type:
     return Handler
 
 
-def _run_agent_inner(agent_url: str) -> None:
+def _run_agent_inner(agent_url: str, node_config: dict[str, Any]) -> None:
     """Core logic for run-agent (after HTTP server is up)."""
 
     # Determine the Kind control-plane IP so connectivity checks have the
@@ -1138,7 +1133,7 @@ def _run_agent_inner(agent_url: str) -> None:
     # version, and cluster DNS from the active kubeconfig. The bootstrap
     # token is resolved via the site label on the secret.
     log("Generating bootstrap script with kubectl-unbounded machine manual-bootstrap...")
-    log_active_node_config()
+    log_active_node_config(node_config)
 
     # Capture the local API server URL from the kubeconfig (typically
     # https://127.0.0.1:<port> for Kind) so we can replace it with the
@@ -1156,7 +1151,7 @@ def _run_agent_inner(agent_url: str) -> None:
         KUBECTL_UNBOUNDED, "machine", "manual-bootstrap",
         AGENT_MACHINE_NAME,
         "--site", E2E_SITE_NAME,
-        *node_config_bootstrap_args(),
+        *node_config_bootstrap_args(node_config),
     ]
     bootstrap_script = capture(bootstrap_args)
 
@@ -1242,9 +1237,9 @@ def wait_for_node() -> None:
 # ---------------------------------------------------------------------------
 # validate-node-config
 # ---------------------------------------------------------------------------
-def _assert_expected_node_config(node: dict[str, Any]) -> None:
-    expected_labels = expected_node_labels()
-    expected_taints = expected_node_taints()
+def _assert_expected_node_config(node: dict[str, Any], node_config: dict[str, Any]) -> None:
+    expected_labels = expected_node_labels(node_config)
+    expected_taints = expected_node_taints(node_config)
 
     labels = node.get("metadata", {}).get("labels", {})
     for key, value in expected_labels.items():
@@ -1262,13 +1257,21 @@ def _assert_expected_node_config(node: dict[str, Any]) -> None:
         ):
             die(f"expected node taint not found: {expected}; node taints: {taints}")
 
+    internal_ips = [
+        address.get("address")
+        for address in node.get("status", {}).get("addresses", [])
+        if address.get("type") == "InternalIP"
+    ]
+    if VM_IP not in internal_ips:
+        die(f"node InternalIP mismatch: got {internal_ips}, expected {VM_IP!r}")
 
-def validate_node_config() -> None:
+
+def validate_node_config(node_config: dict[str, Any]) -> None:
     """Verify configured node labels and taints are present on the Node."""
 
-    log_active_node_config()
+    log_active_node_config(node_config)
     node = json.loads(kubectl_capture(["get", "node", AGENT_MACHINE_NAME, "-o", "json"]))
-    _assert_expected_node_config(node)
+    _assert_expected_node_config(node, node_config)
 
     log("============================================")
     log("  Node config validation PASSED")
@@ -1921,7 +1924,7 @@ def delete_machine_cr() -> None:
 # ---------------------------------------------------------------------------
 # validate-machine-cr-created
 # ---------------------------------------------------------------------------
-def validate_machine_cr_created() -> None:
+def validate_machine_cr_created(node_config: dict[str, Any]) -> None:
     """Validate the agent self-registered a Machine CR during bootstrap.
 
     The daemon registers the Machine CR at startup, so this function polls
@@ -1976,14 +1979,14 @@ def validate_machine_cr_created() -> None:
 
     log(f"bootstrapTokenRef is correct: {token_ref}")
 
-    expected_labels = expected_node_labels()
+    expected_labels = expected_node_labels(node_config)
     actual_labels = k8s_spec.get("nodeLabels") or {}
     for key, value in expected_labels.items():
         actual = actual_labels.get(key)
         if actual != value:
             die(f"Machine CR nodeLabels mismatch for {key!r}: got {actual!r}, expected {value!r}")
 
-    expected_taints = expected_node_taint_strings()
+    expected_taints = expected_node_taint_strings(node_config)
     actual_taints = k8s_spec.get("registerWithTaints") or []
     for taint in expected_taints:
         if taint not in actual_taints:
@@ -2129,7 +2132,7 @@ def _next_patch_version(version: str) -> str:
     return "v" + ".".join(parts)
 
 
-def validate_node_repave_upgrade() -> None:
+def validate_node_repave_upgrade(node_config: dict[str, Any]) -> None:
     """Validate OnDelete repave applies a new MCV Kubernetes version."""
 
     config_name = MACHINE_CONFIG_NAME
@@ -2153,7 +2156,7 @@ def validate_node_repave_upgrade() -> None:
     ).setdefault("kubernetes", {})
     kubernetes_template["version"] = target_kubelet_version
     kubernetes_template["nodeLabels"] = {
-        **expected_node_labels(),
+        **expected_node_labels(node_config),
         "e2e.unbounded-cloud.io/config-version": "v3",
     }
     kubectl(["apply", "-f", "-"], input=json.dumps(manifest).encode())
@@ -2203,7 +2206,7 @@ def validate_node_repave_upgrade() -> None:
     wait_for_node()
     wait_for_node_kubelet_version(AGENT_MACHINE_NAME, target_kubelet_version)
     node = json.loads(kubectl_capture(["get", "node", AGENT_MACHINE_NAME, "-o", "json"]))
-    _assert_expected_node_config(node)
+    _assert_expected_node_config(node, node_config)
 
     machine = json.loads(kubectl_capture(["get", "machine", AGENT_MACHINE_NAME, "-o", "json"]))
     status_config = machine.get("status", {}).get("configuration", {})
@@ -2294,31 +2297,42 @@ def cleanup() -> None:
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
-COMMANDS = {
-    "create-vm": create_vm,
-    "ensure-kind-bridge": ensure_kind_bridge,
-    "dump-persisted-agent-config": dump_persisted_agent_config,
+Command = Callable[[dict[str, Any]], None]
+
+
+def _without_node_config(func: Callable[[], None]) -> Command:
+    """Adapt a command that does not use node config settings."""
+    def command(_node_config: dict[str, Any]) -> None:
+        func()
+
+    return command
+
+
+COMMANDS: dict[str, Command] = {
+    "create-vm": _without_node_config(create_vm),
+    "ensure-kind-bridge": _without_node_config(ensure_kind_bridge),
+    "dump-persisted-agent-config": _without_node_config(dump_persisted_agent_config),
     "run-agent": run_agent,
-    "wait-for-node": wait_for_node,
+    "wait-for-node": _without_node_config(wait_for_node),
     "validate-node-config": validate_node_config,
-    "validate-kube-proxy": validate_kube_proxy,
-    "validate-workload": validate_workload,
-    "install-machine-crd": install_machine_crd,
-    "start-machina-controller": start_machina_controller,
-    "validate-machina-controller": validate_machina_controller,
-    "delete-machine-cr": delete_machine_cr,
+    "validate-kube-proxy": _without_node_config(validate_kube_proxy),
+    "validate-workload": _without_node_config(validate_workload),
+    "install-machine-crd": _without_node_config(install_machine_crd),
+    "start-machina-controller": _without_node_config(start_machina_controller),
+    "validate-machina-controller": _without_node_config(validate_machina_controller),
+    "delete-machine-cr": _without_node_config(delete_machine_cr),
     "validate-machine-cr-created": validate_machine_cr_created,
-    "validate-node-reboot-operation": validate_node_reboot_operation,
-    "validate-agent-upgrade-operation": validate_agent_upgrade_operation,
-    "validate-agent-upgrade-rollback": validate_agent_upgrade_rollback,
+    "validate-node-reboot-operation": _without_node_config(validate_node_reboot_operation),
+    "validate-agent-upgrade-operation": _without_node_config(validate_agent_upgrade_operation),
+    "validate-agent-upgrade-rollback": _without_node_config(validate_agent_upgrade_rollback),
     "validate-node-repave-upgrade": validate_node_repave_upgrade,
-    "reset-agent": reset_agent,
-    "cleanup": cleanup,
+    "reset-agent": _without_node_config(reset_agent),
+    "cleanup": _without_node_config(cleanup),
 }
 
 
 def main() -> None:
-    global NODE_CONFIG, VERBOSE  # noqa: PLW0603
+    global VERBOSE  # noqa: PLW0603
 
     parser = argparse.ArgumentParser(
         description="Agent E2E Kind test harness",
@@ -2341,9 +2355,9 @@ def main() -> None:
     )
     args = parser.parse_args()
     VERBOSE = args.verbose
-    NODE_CONFIG = load_node_config(args.node_config)
+    node_config = load_node_config(args.node_config)
 
-    COMMANDS[args.command]()
+    COMMANDS[args.command](node_config)
 
 
 if __name__ == "__main__":

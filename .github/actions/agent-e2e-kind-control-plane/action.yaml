@@ -1,0 +1,105 @@
+name: Setup agent e2e Kind control plane
+description: Set up KVM, dependencies, a Kind control plane, and VM bridge networking for agent e2e tests.
+inputs:
+  cluster-name:
+    description: Kind cluster name.
+    required: true
+  vm-subnet:
+    description: VM subnet prefix.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Enable KVM
+      shell: bash
+      run: |
+        echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+        sudo udevadm control --reload-rules
+        sudo udevadm trigger --name-match=kvm
+
+    - name: Set up Go
+      uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+      with:
+        go-version-file: go.mod
+
+    - name: Install system dependencies
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          qemu-system-x86 qemu-utils genisoimage \
+          iptables
+
+    - name: Create Kind cluster
+      uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+      with:
+        cluster_name: ${{ inputs['cluster-name'] }}
+        version: v0.29.0
+
+    - name: Configure Kind cluster networking for VM
+      shell: bash
+      env:
+        KIND_CLUSTER_NAME: ${{ inputs['cluster-name'] }}
+      run: |
+        set -euo pipefail
+        KIND_CONTAINER="${KIND_CLUSTER_NAME}-control-plane"
+        KIND_IP=$(docker inspect "${KIND_CONTAINER}" \
+            --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
+        if [[ -z "${KIND_IP}" ]]; then
+          echo "::error::Could not determine Kind control-plane container IP"
+          exit 1
+        fi
+        echo "[INFO] Kind control-plane IP: ${KIND_IP}"
+        BRIDGE="virbr-e2e"
+
+        sudo iptables -I FORWARD -i "${BRIDGE}" -j ACCEPT
+        sudo iptables -I FORWARD -o "${BRIDGE}" -j ACCEPT
+        sudo iptables -t raw -I PREROUTING -i "${BRIDGE}" -j ACCEPT
+
+        echo "[INFO] Patching kindnet DaemonSet for VM-reachable control plane endpoint..."
+        PATCH=$(cat <<EOF
+        {
+          "spec": {
+            "template": {
+              "spec": {
+                "containers": [{
+                  "name": "kindnet-cni",
+                  "env": [
+                    {"name": "CONTROL_PLANE_ENDPOINT", "value": "${KIND_IP}:6443"}
+                  ]
+                }]
+              }
+            }
+          }
+        }
+        EOF
+        )
+        kubectl -n kube-system patch daemonset kindnet \
+            --type=strategic -p "${PATCH}"
+
+        echo "[INFO] Waiting for kindnet rollout..."
+        kubectl -n kube-system rollout status daemonset/kindnet --timeout=60s
+
+    - name: Create QEMU VM
+      shell: bash
+      run: python3 ./hack/agent/e2e-kind/e2e.py --verbose create-vm
+
+    - name: Attach Kind container to VM bridge
+      shell: bash
+      env:
+        KIND_CLUSTER_NAME: ${{ inputs['cluster-name'] }}
+        VM_SUBNET: ${{ inputs['vm-subnet'] }}
+      run: |
+        set -euo pipefail
+        KIND_CONTAINER="${KIND_CLUSTER_NAME}-control-plane"
+        BRIDGE="virbr-e2e"
+
+        echo "[INFO] Attaching Kind container to ${BRIDGE} bridge..."
+        KIND_PID=$(docker inspect "${KIND_CONTAINER}" --format '{{.State.Pid}}')
+        sudo ip link delete veth-kind-e2e 2>/dev/null || true
+        sudo ip link add veth-kind-e2e type veth peer name eth-e2e
+        sudo ip link set veth-kind-e2e master "${BRIDGE}"
+        sudo ip link set veth-kind-e2e up
+        sudo ip link set eth-e2e netns "${KIND_PID}"
+        sudo nsenter -t "${KIND_PID}" -n ip addr add "${VM_SUBNET}.2/24" dev eth-e2e
+        sudo nsenter -t "${KIND_PID}" -n ip link set eth-e2e up
