@@ -19,11 +19,17 @@ The test follows a single linear sequence:
 Options:
     --verbose                          Enable diagnostic output (network diags).
 
+Environment:
+    AGENT_E2E_CONFIG_NAME              Name for the active node config variant.
+    AGENT_E2E_NODE_LABELS              Comma-separated kubelet node labels.
+    AGENT_E2E_REGISTER_WITH_TAINTS     Comma-separated kubelet registration taints.
+
 Subcommands (called as individual workflow steps):
     create-vm                          Create bridge networking and launch a QEMU VM.
     ensure-kind-bridge                 Verify/repair veth pair connecting Kind to VM bridge.
     run-agent                          Build agent, generate bootstrap script, run on VM.
     wait-for-node                      Wait for the node to appear and become Ready.
+    validate-node-config               Verify configured labels and taints reached the Node.
     dump-persisted-agent-config        Print persisted agent config files from the VM.
     validate-workload                  Deploy test pods on the agent node.
     validate-kube-proxy                Verify kube-proxy is Running on all nodes.
@@ -75,6 +81,9 @@ KIND_CLUSTER_NAME = os.environ.get("KIND_CLUSTER_NAME", "kind")
 KIND_CONTAINER = f"{KIND_CLUSTER_NAME}-control-plane"
 AGENT_MACHINE_NAME = os.environ.get("AGENT_MACHINE_NAME", "agent-e2e")
 AGENT_DEBUG = os.environ.get("AGENT_DEBUG", "")
+AGENT_E2E_CONFIG_NAME = os.environ.get("AGENT_E2E_CONFIG_NAME", "default")
+AGENT_E2E_NODE_LABELS = os.environ.get("AGENT_E2E_NODE_LABELS", "")
+AGENT_E2E_REGISTER_WITH_TAINTS = os.environ.get("AGENT_E2E_REGISTER_WITH_TAINTS", "")
 
 # Site name used when generating the bootstrap script via kubectl-unbounded.
 E2E_SITE_NAME = "e2e"
@@ -194,6 +203,60 @@ def kubectl_capture(args: list[str]) -> str:
 def _b64(val: str) -> str:
     """Base64-encode a string (no newlines)."""
     return base64.b64encode(val.encode()).decode()
+
+
+def _csv_env_values(raw: str) -> list[str]:
+    """Split a comma-separated environment value into non-empty entries."""
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def expected_node_labels() -> dict[str, str]:
+    """Return labels configured for this e2e node variant."""
+    labels: dict[str, str] = {}
+    for item in _csv_env_values(AGENT_E2E_NODE_LABELS):
+        if "=" not in item:
+            die(f"invalid AGENT_E2E_NODE_LABELS entry {item!r}, expected key=value")
+        key, value = item.split("=", 1)
+        if not key:
+            die(f"invalid AGENT_E2E_NODE_LABELS entry {item!r}, label key is empty")
+        labels[key] = value
+    return labels
+
+
+def expected_node_taints() -> list[dict[str, str]]:
+    """Return taints configured for this e2e node variant."""
+    taints: list[dict[str, str]] = []
+    for item in _csv_env_values(AGENT_E2E_REGISTER_WITH_TAINTS):
+        if ":" not in item:
+            die(f"invalid AGENT_E2E_REGISTER_WITH_TAINTS entry {item!r}, expected key[=value]:Effect")
+        body, effect = item.rsplit(":", 1)
+        if "=" in body:
+            key, value = body.split("=", 1)
+        else:
+            key, value = body, ""
+        if not key or not effect:
+            die(f"invalid AGENT_E2E_REGISTER_WITH_TAINTS entry {item!r}, key and effect are required")
+        taints.append({"key": key, "value": value, "effect": effect})
+    return taints
+
+
+def node_config_bootstrap_args() -> list[str]:
+    """Return manual-bootstrap flags for the active node config variant."""
+    args: list[str] = []
+    for label in _csv_env_values(AGENT_E2E_NODE_LABELS):
+        args.extend(["--node-label", label])
+    for taint in _csv_env_values(AGENT_E2E_REGISTER_WITH_TAINTS):
+        args.extend(["--register-with-taint", taint])
+    return args
+
+
+def log_active_node_config() -> None:
+    """Log the active e2e node config variant."""
+    labels = _csv_env_values(AGENT_E2E_NODE_LABELS)
+    taints = _csv_env_values(AGENT_E2E_REGISTER_WITH_TAINTS)
+    log(f"Agent e2e node config variant: {AGENT_E2E_CONFIG_NAME}")
+    log(f"  node labels: {', '.join(labels) if labels else '<none>'}")
+    log(f"  register-with-taints: {', '.join(taints) if taints else '<none>'}")
 
 
 def _machine_operation_resource() -> str:
@@ -1041,6 +1104,7 @@ def _run_agent_inner(agent_url: str) -> None:
     # version, and cluster DNS from the active kubeconfig. The bootstrap
     # token is resolved via the site label on the secret.
     log("Generating bootstrap script with kubectl-unbounded machine manual-bootstrap...")
+    log_active_node_config()
 
     # Capture the local API server URL from the kubeconfig (typically
     # https://127.0.0.1:<port> for Kind) so we can replace it with the
@@ -1054,11 +1118,13 @@ def _run_agent_inner(agent_url: str) -> None:
     if not local_api_server:
         die("Could not determine local API server URL from kubeconfig")
 
-    bootstrap_script = capture([
+    bootstrap_args = [
         KUBECTL_UNBOUNDED, "machine", "manual-bootstrap",
         AGENT_MACHINE_NAME,
         "--site", E2E_SITE_NAME,
-    ])
+        *node_config_bootstrap_args(),
+    ]
+    bootstrap_script = capture(bootstrap_args)
 
     # The kubeconfig uses a localhost address that is not reachable from the VM.
     # Patch the generated script to use the Kind container IP instead.
@@ -1137,6 +1203,43 @@ def wait_for_node() -> None:
     log("  Node join PASSED")
     log("============================================")
     kubectl(["get", "nodes", "-o", "wide"])
+
+
+# ---------------------------------------------------------------------------
+# validate-node-config
+# ---------------------------------------------------------------------------
+def _assert_expected_node_config(node: dict[str, Any]) -> None:
+    expected_labels = expected_node_labels()
+    expected_taints = expected_node_taints()
+
+    labels = node.get("metadata", {}).get("labels", {})
+    for key, value in expected_labels.items():
+        actual = labels.get(key)
+        if actual != value:
+            die(f"node label mismatch for {key!r}: got {actual!r}, expected {value!r}")
+
+    taints = node.get("spec", {}).get("taints", [])
+    for expected in expected_taints:
+        if not any(
+            taint.get("key") == expected["key"]
+            and taint.get("value", "") == expected["value"]
+            and taint.get("effect") == expected["effect"]
+            for taint in taints
+        ):
+            die(f"expected node taint not found: {expected}; node taints: {taints}")
+
+
+def validate_node_config() -> None:
+    """Verify configured node labels and taints are present on the Node."""
+
+    log_active_node_config()
+    node = json.loads(kubectl_capture(["get", "node", AGENT_MACHINE_NAME, "-o", "json"]))
+    _assert_expected_node_config(node)
+
+    log("============================================")
+    log("  Node config validation PASSED")
+    log("============================================")
+    kubectl(["get", "node", AGENT_MACHINE_NAME, "-o", "wide"])
 
 
 # ---------------------------------------------------------------------------
@@ -1839,6 +1942,19 @@ def validate_machine_cr_created() -> None:
 
     log(f"bootstrapTokenRef is correct: {token_ref}")
 
+    expected_labels = expected_node_labels()
+    actual_labels = k8s_spec.get("nodeLabels") or {}
+    for key, value in expected_labels.items():
+        actual = actual_labels.get(key)
+        if actual != value:
+            die(f"Machine CR nodeLabels mismatch for {key!r}: got {actual!r}, expected {value!r}")
+
+    expected_taints = _csv_env_values(AGENT_E2E_REGISTER_WITH_TAINTS)
+    actual_taints = k8s_spec.get("registerWithTaints") or []
+    for taint in expected_taints:
+        if taint not in actual_taints:
+            die(f"Machine CR registerWithTaints missing {taint!r}: {actual_taints}")
+
     log("============================================")
     log("  Machine CR validation PASSED (created)")
     log("============================================")
@@ -2002,7 +2118,10 @@ def validate_node_repave_upgrade() -> None:
         "template", {},
     ).setdefault("kubernetes", {})
     kubernetes_template["version"] = target_kubelet_version
-    kubernetes_template["nodeLabels"] = {"e2e.unbounded-cloud.io/config-version": "v3"}
+    kubernetes_template["nodeLabels"] = {
+        **expected_node_labels(),
+        "e2e.unbounded-cloud.io/config-version": "v3",
+    }
     kubectl(["apply", "-f", "-"], input=json.dumps(manifest).encode())
 
     timeout_secs = 120
@@ -2049,6 +2168,8 @@ def validate_node_repave_upgrade() -> None:
     wait_for_node_absent(AGENT_MACHINE_NAME)
     wait_for_node()
     wait_for_node_kubelet_version(AGENT_MACHINE_NAME, target_kubelet_version)
+    node = json.loads(kubectl_capture(["get", "node", AGENT_MACHINE_NAME, "-o", "json"]))
+    _assert_expected_node_config(node)
 
     machine = json.loads(kubectl_capture(["get", "machine", AGENT_MACHINE_NAME, "-o", "json"]))
     status_config = machine.get("status", {}).get("configuration", {})
@@ -2145,6 +2266,7 @@ COMMANDS = {
     "dump-persisted-agent-config": dump_persisted_agent_config,
     "run-agent": run_agent,
     "wait-for-node": wait_for_node,
+    "validate-node-config": validate_node_config,
     "validate-kube-proxy": validate_kube_proxy,
     "validate-workload": validate_workload,
     "install-machine-crd": install_machine_crd,

@@ -48,14 +48,28 @@ permissions:
 
 jobs:
   agent-e2e:
+    name: agent e2e (${{ matrix.node_config.name }})
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        node_config:
+          - name: default
+            node_labels: ""
+            register_with_taints: ""
+          - name: labels-and-taints
+            node_labels: e2e.unbounded-cloud.io/config=labels-and-taints
+            register_with_taints: e2e.unbounded-cloud.io/dedicated=agent:NoSchedule
     env:
       KIND_CLUSTER_NAME: kind
       VM_NAME: agent-e2e
       VM_SUBNET: "192.168.100"
       VM_IP: "192.168.100.10"
       AGENT_MACHINE_NAME: agent-e2e
+      AGENT_E2E_CONFIG_NAME: ${{ matrix.node_config.name }}
+      AGENT_E2E_NODE_LABELS: ${{ matrix.node_config.node_labels }}
+      AGENT_E2E_REGISTER_WITH_TAINTS: ${{ matrix.node_config.register_with_taints }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -172,6 +186,9 @@ jobs:
       - name: Wait for node to become Ready
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose wait-for-node
 
+      - name: Validate node config
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-node-config
+
       - name: Dump persisted agent config
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose dump-persisted-agent-config
 
@@ -208,6 +225,9 @@ jobs:
 
       - name: Wait for node to become Ready (rejoin)
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose wait-for-node
+
+      - name: Validate node config (rejoin)
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-node-config
 
       - name: Dump persisted agent config (rejoin)
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose dump-persisted-agent-config

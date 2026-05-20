@@ -26,6 +26,12 @@
 # Usage:
 #   ./hack/agent/e2e-kind/run-local.sh
 #   ./hack/agent/e2e-kind/run-local.sh --verbose   # enable diagnostic output
+#
+# Optional node config variant environment:
+#   AGENT_E2E_CONFIG_NAME=labels-and-taints \
+#   AGENT_E2E_NODE_LABELS=e2e.unbounded-cloud.io/config=labels-and-taints \
+#   AGENT_E2E_REGISTER_WITH_TAINTS=e2e.unbounded-cloud.io/dedicated=agent:NoSchedule \
+#     ./hack/agent/e2e-kind/run-local.sh
 
 set -euo pipefail
 
@@ -229,6 +235,7 @@ echo ""
 
 python3 "$E2E" $E2E_VERBOSE run-agent
 python3 "$E2E" $E2E_VERBOSE wait-for-node
+python3 "$E2E" $E2E_VERBOSE validate-node-config
 python3 "$E2E" $E2E_VERBOSE dump-persisted-agent-config
 python3 "$E2E" $E2E_VERBOSE validate-kube-proxy
 python3 "$E2E" $E2E_VERBOSE validate-machine-cr-created
@@ -249,6 +256,7 @@ python3 "$E2E" $E2E_VERBOSE delete-machine-cr
 python3 "$E2E" $E2E_VERBOSE ensure-kind-bridge
 python3 "$E2E" $E2E_VERBOSE run-agent
 python3 "$E2E" $E2E_VERBOSE wait-for-node
+python3 "$E2E" $E2E_VERBOSE validate-node-config
 python3 "$E2E" $E2E_VERBOSE dump-persisted-agent-config
 python3 "$E2E" $E2E_VERBOSE validate-kube-proxy
 python3 "$E2E" $E2E_VERBOSE validate-machine-cr-created
