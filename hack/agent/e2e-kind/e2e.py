@@ -58,6 +58,7 @@ import subprocess
 import sys
 import textwrap
 import time
+from dataclasses import dataclass
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from threading import Thread
@@ -203,15 +204,19 @@ def _b64(val: str) -> str:
     return base64.b64encode(val.encode()).decode()
 
 
-def load_node_config(path: str | None) -> dict[str, Any]:
+@dataclass(frozen=True)
+class NodeConfig:
+    name: str
+    node_labels: dict[str, str]
+    register_with_taints: list[str]
+    node_ip: str = ""
+    path: str = ""
+
+
+def load_node_config(path: str | None) -> NodeConfig:
     """Load a node config variant from *path*, or return the default config."""
     if not path:
-        return {
-            "name": "default",
-            "nodeLabels": {},
-            "registerWithTaints": [],
-            "nodeIP": "",
-        }
+        return NodeConfig(name="default", node_labels={}, register_with_taints=[])
 
     config_path = Path(path)
     if not config_path.is_absolute():
@@ -244,33 +249,34 @@ def load_node_config(path: str | None) -> dict[str, Any]:
     if not isinstance(node_ip, str):
         die(f"node config {config_path} field 'nodeIP' must be a string")
 
-    return {
-        "name": name,
-        "nodeLabels": dict(node_labels),
-        "registerWithTaints": list(register_with_taints),
-        "nodeIP": node_ip,
-    }
+    return NodeConfig(
+        name=name,
+        node_labels=dict(node_labels),
+        register_with_taints=list(register_with_taints),
+        node_ip=node_ip,
+        path=str(config_path),
+    )
 
 
-def expected_node_labels(node_config: dict[str, Any]) -> dict[str, str]:
+def expected_node_labels(node_config: NodeConfig) -> dict[str, str]:
     """Return labels configured for this e2e node variant."""
-    return dict(node_config["nodeLabels"])
+    return dict(node_config.node_labels)
 
 
-def expected_node_taint_strings(node_config: dict[str, Any]) -> list[str]:
+def expected_node_taint_strings(node_config: NodeConfig) -> list[str]:
     """Return configured taint strings for this e2e node variant."""
-    return list(node_config["registerWithTaints"])
+    return list(node_config.register_with_taints)
 
 
-def expected_node_ip(node_config: dict[str, Any]) -> str:
+def expected_node_ip(node_config: NodeConfig) -> str:
     """Return the expected Node InternalIP for this e2e node variant."""
-    node_ip = node_config.get("nodeIP", "")
+    node_ip = node_config.node_ip
     if node_ip in ("$VM_IP", "${VM_IP}"):
         return VM_IP
     return node_ip or VM_IP
 
 
-def expected_node_taints(node_config: dict[str, Any]) -> list[dict[str, str]]:
+def expected_node_taints(node_config: NodeConfig) -> list[dict[str, str]]:
     """Return taints configured for this e2e node variant."""
     taints: list[dict[str, str]] = []
     for item in expected_node_taint_strings(node_config):
@@ -287,11 +293,10 @@ def expected_node_taints(node_config: dict[str, Any]) -> list[dict[str, str]]:
     return taints
 
 
-def node_config_bootstrap_args(node_config: dict[str, Any]) -> list[str]:
+def node_config_bootstrap_args(node_config: NodeConfig) -> list[str]:
     """Return manual-bootstrap flags for the active node config variant."""
     args: list[str] = []
-    node_ip = node_config.get("nodeIP", "")
-    if node_ip:
+    if node_config.node_ip:
         args.extend(["--node-ip", expected_node_ip(node_config)])
     for key, value in sorted(expected_node_labels(node_config).items()):
         args.extend(["--node-label", f"{key}={value}"])
@@ -300,13 +305,12 @@ def node_config_bootstrap_args(node_config: dict[str, Any]) -> list[str]:
     return args
 
 
-def log_active_node_config(node_config: dict[str, Any]) -> None:
+def log_active_node_config(node_config: NodeConfig) -> None:
     """Log the active e2e node config variant."""
     labels = [f"{key}={value}" for key, value in sorted(expected_node_labels(node_config).items())]
     taints = expected_node_taint_strings(node_config)
-    node_ip = node_config.get("nodeIP", "")
-    log(f"Agent e2e node config variant: {node_config['name']}")
-    log(f"  node ip: {expected_node_ip(node_config) if node_ip else '<default>'}")
+    log(f"Agent e2e node config variant: {node_config.name}")
+    log(f"  node ip: {expected_node_ip(node_config) if node_config.node_ip else '<default>'}")
     log(f"  node labels: {', '.join(labels) if labels else '<none>'}")
     log(f"  register-with-taints: {', '.join(taints) if taints else '<none>'}")
 
@@ -317,21 +321,19 @@ def _safe_name(value: str) -> str:
     return safe or "config"
 
 
-def discover_node_configs() -> list[dict[str, Any]]:
+def discover_node_configs() -> list[NodeConfig]:
     """Load all node config scenario files in deterministic order."""
-    configs: list[dict[str, Any]] = []
+    configs: list[NodeConfig] = []
     for path in sorted(NODE_CONFIG_DIR.glob("*.json")):
-        cfg = load_node_config(str(path))
-        cfg["_path"] = str(path)
-        configs.append(cfg)
+        configs.append(load_node_config(str(path)))
     if not configs:
         die(f"No node config scenarios found in {NODE_CONFIG_DIR}")
     return configs
 
 
-def scenario_env(node_config: dict[str, Any], index: int) -> dict[str, str]:
+def scenario_env(node_config: NodeConfig, index: int) -> dict[str, str]:
     """Return per-scenario environment overrides for a parallel e2e node."""
-    name = _safe_name(node_config["name"])
+    name = _safe_name(node_config.name)
     vm_name = f"{VM_NAME}-{name}"
     return {
         "VM_NAME": vm_name,
@@ -1097,7 +1099,7 @@ def ensure_kind_bridge() -> None:
 # ---------------------------------------------------------------------------
 # run-agent
 # ---------------------------------------------------------------------------
-def run_agent(node_config: dict[str, Any]) -> None:
+def run_agent(node_config: NodeConfig) -> None:
     """Build agent, generate bootstrap script, and run it on the VM."""
 
     if not SSH_KEY.exists():
@@ -1169,7 +1171,7 @@ def _make_handler(directory: str) -> type:
     return Handler
 
 
-def _run_agent_inner(agent_url: str, node_config: dict[str, Any]) -> None:
+def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
     """Core logic for run-agent (after HTTP server is up)."""
 
     # Determine the Kind control-plane IP so connectivity checks have the
@@ -1328,7 +1330,7 @@ def wait_for_node() -> None:
 # ---------------------------------------------------------------------------
 # validate-node-config
 # ---------------------------------------------------------------------------
-def _assert_expected_node_config(node: dict[str, Any], node_config: dict[str, Any]) -> None:
+def _assert_expected_node_config(node: dict[str, Any], node_config: NodeConfig) -> None:
     expected_labels = expected_node_labels(node_config)
     expected_taints = expected_node_taints(node_config)
 
@@ -1358,7 +1360,7 @@ def _assert_expected_node_config(node: dict[str, Any], node_config: dict[str, An
         die(f"node InternalIP mismatch: got {internal_ips}, expected {node_ip!r}")
 
 
-def validate_node_config(node_config: dict[str, Any]) -> None:
+def validate_node_config(node_config: NodeConfig) -> None:
     """Verify configured node labels and taints are present on the Node."""
 
     log_active_node_config(node_config)
@@ -1371,20 +1373,20 @@ def validate_node_config(node_config: dict[str, Any]) -> None:
     kubectl(["get", "node", AGENT_MACHINE_NAME, "-o", "wide"])
 
 
-def _run_scenario_command(command: str, node_config: dict[str, Any], env: dict[str, str]) -> None:
+def _run_scenario_command(command: str, node_config: NodeConfig, env: dict[str, str]) -> None:
     args = [sys.executable, str(Path(__file__))]
     if VERBOSE:
         args.append("--verbose")
-    if "_path" in node_config:
-        args.extend(["--node-config", node_config["_path"]])
+    if node_config.path:
+        args.extend(["--node-config", node_config.path])
     args.append(command)
 
     child_env = {**os.environ, **env}
     run(args, env=child_env)
 
 
-def _validate_node_config_scenario(node_config: dict[str, Any], index: int, agent_url: str) -> None:
-    name = node_config["name"]
+def _validate_node_config_scenario(node_config: NodeConfig, index: int, agent_url: str) -> None:
+    name = node_config.name
     env = scenario_env(node_config, index)
     env["AGENT_URL"] = agent_url
 
@@ -1419,7 +1421,7 @@ def validate_node_config_scenarios() -> None:
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(configs)) as executor:
             futures = {
-                executor.submit(_validate_node_config_scenario, cfg, index, agent_url): cfg["name"]
+                executor.submit(_validate_node_config_scenario, cfg, index, agent_url): cfg.name
                 for index, cfg in enumerate(configs)
             }
             for future in concurrent.futures.as_completed(futures):
@@ -2087,7 +2089,7 @@ def delete_machine_cr() -> None:
 # ---------------------------------------------------------------------------
 # validate-machine-cr-created
 # ---------------------------------------------------------------------------
-def validate_machine_cr_created(node_config: dict[str, Any]) -> None:
+def validate_machine_cr_created(node_config: NodeConfig) -> None:
     """Validate the agent self-registered a Machine CR during bootstrap.
 
     The daemon registers the Machine CR at startup, so this function polls
@@ -2295,7 +2297,7 @@ def _next_patch_version(version: str) -> str:
     return "v" + ".".join(parts)
 
 
-def validate_node_repave_upgrade(node_config: dict[str, Any]) -> None:
+def validate_node_repave_upgrade(node_config: NodeConfig) -> None:
     """Validate OnDelete repave applies a new MCV Kubernetes version."""
 
     config_name = MACHINE_CONFIG_NAME
@@ -2439,7 +2441,7 @@ def collect_logs() -> None:
     if os.environ.get("COLLECT_NODE_CONFIG_LOGS", "").lower() == "true":
         for index, cfg in enumerate(discover_node_configs()):
             env = scenario_env(cfg, index)
-            prefix = f"{_safe_name(cfg['name'])}-"
+            prefix = f"{_safe_name(cfg.name)}-"
             _collect_one_vm_logs(
                 logs_dir,
                 env["VM_NAME"],
@@ -2566,12 +2568,12 @@ def cleanup() -> None:
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
-Command = Callable[[dict[str, Any]], None]
+Command = Callable[[NodeConfig], None]
 
 
 def _without_node_config(func: Callable[[], None]) -> Command:
     """Adapt a command that does not use node config settings."""
-    def command(_node_config: dict[str, Any]) -> None:
+    def command(_node_config: NodeConfig) -> None:
         func()
 
     return command

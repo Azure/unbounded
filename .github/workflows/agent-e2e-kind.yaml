@@ -66,14 +66,8 @@ jobs:
           cluster-name: ${{ env.KIND_CLUSTER_NAME }}
           vm-subnet: ${{ env.VM_SUBNET }}
 
-      - name: Install Machine CRD
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose install-machine-crd
-
-      - name: Start machina controller
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose start-machina-controller
-
-      - name: Validate machina controller
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-machina-controller
+      - name: Set up machina resources
+        uses: ./.github/actions/agent-e2e-machina-setup
 
       # No Machine CR pre-created; agent self-registers during bootstrap.
       - name: Run agent to join VM to cluster
@@ -168,14 +162,8 @@ jobs:
           vm-subnet: ${{ env.VM_SUBNET }}
           create-vm: "false"
 
-      - name: Install Machine CRD
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose install-machine-crd
-
-      - name: Start machina controller
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose start-machina-controller
-
-      - name: Validate machina controller
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-machina-controller
+      - name: Set up machina resources
+        uses: ./.github/actions/agent-e2e-machina-setup
 
       - name: Discover and validate node configs
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-node-configs
