@@ -53,6 +53,7 @@ func loadConfig() (*provision.UnboundedAgentConfig, error) {
 // normalizeConfig applies common fixups regardless of how the config was loaded.
 func normalizeConfig(cfg *provision.UnboundedAgentConfig) error {
 	cfg.Cluster.Version = strings.TrimPrefix(cfg.Cluster.Version, "v")
+	cfg.Kubelet.NodeIP = strings.TrimSpace(cfg.Kubelet.NodeIP)
 
 	// FIXME: should we set the scheme in machina side?
 	if !strings.HasPrefix(cfg.Kubelet.ApiServer, "https://") {
