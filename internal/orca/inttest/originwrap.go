@@ -21,7 +21,6 @@ type CountingOrigin struct {
 
 	heads     atomic.Int64
 	getRanges atomic.Int64
-	lists     atomic.Int64
 }
 
 // NewCountingOrigin wraps inner with call counters.
@@ -35,14 +34,10 @@ func (c *CountingOrigin) Heads() int64 { return c.heads.Load() }
 // GetRanges returns the number of GetRange() calls observed.
 func (c *CountingOrigin) GetRanges() int64 { return c.getRanges.Load() }
 
-// Lists returns the number of List() calls observed.
-func (c *CountingOrigin) Lists() int64 { return c.lists.Load() }
-
 // Reset zeroes all counters.
 func (c *CountingOrigin) Reset() {
 	c.heads.Store(0)
 	c.getRanges.Store(0)
-	c.lists.Store(0)
 }
 
 // Head implements origin.Origin.
@@ -57,11 +52,4 @@ func (c *CountingOrigin) GetRange(ctx context.Context, bucket, key, etag string,
 	c.getRanges.Add(1)
 
 	return c.inner.GetRange(ctx, bucket, key, etag, off, length)
-}
-
-// List implements origin.Origin.
-func (c *CountingOrigin) List(ctx context.Context, bucket, prefix, marker string, maxKeys int) (origin.ListResult, error) {
-	c.lists.Add(1)
-
-	return c.inner.List(ctx, bucket, prefix, marker, maxKeys)
 }

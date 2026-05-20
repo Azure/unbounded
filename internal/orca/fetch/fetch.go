@@ -99,9 +99,6 @@ func NewCoordinator(
 	}
 }
 
-// Origin returns the underlying origin (used by the LIST passthrough).
-func (c *Coordinator) Origin() origin.Origin { return c.or }
-
 // HeadObject returns object metadata, satisfying client HEAD requests.
 //
 // Rejects responses with an empty ETag via origin.MissingETagError.
