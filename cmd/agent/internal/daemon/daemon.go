@@ -17,6 +17,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	netv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 	"github.com/Azure/unbounded/internal/provision"
 )
 
@@ -168,9 +169,10 @@ func buildMachineCR(cfg *provision.AgentConfig) v1alpha3.Machine {
 		tokenID = tokenID[:i]
 	}
 
-	return v1alpha3.Machine{
+	machine := v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: cfg.MachineName,
+			Name:   cfg.MachineName,
+			Labels: machineSiteLabels(cfg.Kubelet.Labels),
 		},
 		Spec: v1alpha3.MachineSpec{
 			Kubernetes: &v1alpha3.KubernetesSpec{
@@ -182,4 +184,16 @@ func buildMachineCR(cfg *provision.AgentConfig) v1alpha3.Machine {
 			},
 		},
 	}
+
+	return machine
+}
+
+func machineSiteLabels(labels map[string]string) map[string]string {
+	for _, key := range []string{v1alpha3.MachineSiteLabelKey, netv1alpha1.SiteLabelKey} {
+		if value := strings.TrimSpace(labels[key]); value != "" {
+			return map[string]string{v1alpha3.MachineSiteLabelKey: value}
+		}
+	}
+
+	return nil
 }

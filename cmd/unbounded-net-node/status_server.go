@@ -2069,6 +2069,48 @@ type nodeStatusServer struct {
 	routingTableCache     RoutingTableInfo
 	routingTableCachedAt  time.Time
 	routingTableDirty     atomic.Bool
+
+	// netlinkOps is the set of netlink-level operations used by
+	// collectRoutingTableFromKernel. Tests inject a fake to feed deterministic
+	// route + link data through the production code path without depending on
+	// the host kernel's actual routing table. Production callers leave this
+	// nil and the helpers fall back to the real netlink package.
+	netlinkOps statusServerNetlinkOps
+}
+
+// statusServerNetlinkOps abstracts the netlink reads that
+// collectRoutingTableFromKernel needs. Real production code uses the
+// netlink package directly via the zero-value fallbacks in the methods
+// below; tests construct a fake that returns canned data.
+type statusServerNetlinkOps interface {
+	RouteList(family int) ([]netlink.Route, error)
+	RouteListFiltered(family, table int) ([]netlink.Route, error)
+	LinkByIndex(index int) (netlink.Link, error)
+}
+
+func (s *nodeStatusServer) routeList(family int) ([]netlink.Route, error) {
+	if s.netlinkOps != nil {
+		return s.netlinkOps.RouteList(family)
+	}
+
+	return netlink.RouteList(nil, family)
+}
+
+func (s *nodeStatusServer) routeListFiltered(family, table int) ([]netlink.Route, error) {
+	if s.netlinkOps != nil {
+		return s.netlinkOps.RouteListFiltered(family, table)
+	}
+
+	return netlink.RouteListFiltered(family,
+		&netlink.Route{Table: table}, netlink.RT_FILTER_TABLE)
+}
+
+func (s *nodeStatusServer) linkByIndex(index int) (netlink.Link, error) {
+	if s.netlinkOps != nil {
+		return s.netlinkOps.LinkByIndex(index)
+	}
+
+	return netlink.LinkByIndex(index)
 }
 
 func (s *nodeStatusServer) handleStatusJSON(w http.ResponseWriter, _ *http.Request) {
@@ -2150,7 +2192,7 @@ func (s *nodeStatusServer) getNodeStatus() *NodeStatusResponse {
 			PodCIDRs:  s.state.nodePodCIDRs,
 			BuildInfo: nodeAgentBuildInfo(),
 			WireGuard: &WireGuardStatusInfo{
-				Interface: fmt.Sprintf("wg%d", s.cfg.WireGuardPort),
+				Interface: wireGuardInterfaceName(s.cfg, s.cfg.WireGuardPort),
 				PublicKey: s.pubKey,
 			},
 		},
@@ -2304,7 +2346,7 @@ func (s *nodeStatusServer) getNodeStatus() *NodeStatusResponse {
 					PeerType:          "site",
 					SkipPodCIDRRoutes: peerSkipPodCIDRMap[pubKey],
 					Tunnel: PeerTunnelStatus{
-						Interface:     fmt.Sprintf("wg%d", s.cfg.WireGuardPort),
+						Interface:     wireGuardInterfaceName(s.cfg, s.cfg.WireGuardPort),
 						PublicKey:     pubKey,
 						LastHandshake: wgPeer.LastHandshakeTime,
 						RxBytes:       wgPeer.ReceiveBytes,
@@ -2434,7 +2476,7 @@ func (s *nodeStatusServer) getNodeStatus() *NodeStatusResponse {
 			continue
 		}
 
-		ifName := tunnelInterfaceName(p.TunnelProtocol)
+		ifName := tunnelInterfaceName(s.cfg, p.TunnelProtocol)
 
 		if ifName == "" {
 			if name, _, err := unboundednetnetlink.DetectDefaultRouteInterfaceFromCache(s.state.netlinkCache); err == nil {
@@ -2489,7 +2531,7 @@ func (s *nodeStatusServer) getNodeStatus() *NodeStatusResponse {
 			continue
 		}
 
-		ifName := tunnelInterfaceName(gp.TunnelProtocol)
+		ifName := tunnelInterfaceName(s.cfg, gp.TunnelProtocol)
 
 		if ifName == "" {
 			if name, _, err := unboundednetnetlink.DetectDefaultRouteInterfaceFromCache(s.state.netlinkCache); err == nil {
@@ -2541,7 +2583,7 @@ func (s *nodeStatusServer) getNodeStatus() *NodeStatusResponse {
 
 	// Annotate routes with Expected/Present/PeerDestinations/Info
 	if len(status.RoutingTable.Routes) > 0 {
-		annotateNodeRoutes(status, s.siteInformer, s.sliceInformer, s.gatewayPoolInformer, s.sitePeeringInformer)
+		annotateNodeRoutes(status, s.cfg, s.siteInformer, s.sliceInformer, s.gatewayPoolInformer, s.sitePeeringInformer)
 	}
 
 	// Add managed route info from the unified route manager
@@ -2642,7 +2684,7 @@ func (s *nodeStatusServer) collectRoutingTableFromKernel() RoutingTableInfo {
 				allRoutes = append(allRoutes, mainRoutes...)
 			}
 		} else {
-			mainRoutes, err := netlink.RouteList(nil, family)
+			mainRoutes, err := s.routeList(family)
 			if err != nil {
 				klog.V(4).Infof("Failed to list kernel routes (family %d): %v", family, err)
 			} else {
@@ -2658,8 +2700,7 @@ func (s *nodeStatusServer) collectRoutingTableFromKernel() RoutingTableInfo {
 
 		dedicatedTableID := s.state.routeTableID
 		if dedicatedTableID != 0 && dedicatedTableID != unix.RT_TABLE_MAIN {
-			tableRoutes, tErr := netlink.RouteListFiltered(family,
-				&netlink.Route{Table: dedicatedTableID}, netlink.RT_FILTER_TABLE)
+			tableRoutes, tErr := s.routeListFiltered(family, dedicatedTableID)
 			if tErr != nil {
 				klog.V(4).Infof("Failed to list kernel routes from table %d (family %d): %v",
 					dedicatedTableID, family, tErr)
@@ -2715,7 +2756,7 @@ func (s *nodeStatusServer) collectRoutingTableFromKernel() RoutingTableInfo {
 					if s.state.netlinkCache != nil {
 						link, linkErr = s.state.netlinkCache.LinkByIndex(mp.LinkIndex)
 					} else {
-						link, linkErr = netlink.LinkByIndex(mp.LinkIndex)
+						link, linkErr = s.linkByIndex(mp.LinkIndex)
 					}
 
 					if linkErr != nil || link == nil || link.Attrs() == nil {
@@ -2723,7 +2764,7 @@ func (s *nodeStatusServer) collectRoutingTableFromKernel() RoutingTableInfo {
 					}
 
 					devName := link.Attrs().Name
-					if !isManagedTunnelInterface(devName) && !managedPrefixes[r.Dst.String()] {
+					if !isManagedTunnelInterface(s.cfg, devName) && !managedPrefixes[r.Dst.String()] {
 						continue
 					}
 
@@ -2784,7 +2825,7 @@ func (s *nodeStatusServer) collectRoutingTableFromKernel() RoutingTableInfo {
 			if s.state.netlinkCache != nil {
 				link, linkErr = s.state.netlinkCache.LinkByIndex(r.LinkIndex)
 			} else {
-				link, linkErr = netlink.LinkByIndex(r.LinkIndex)
+				link, linkErr = s.linkByIndex(r.LinkIndex)
 			}
 
 			if linkErr != nil || link == nil || link.Attrs() == nil {
@@ -2792,7 +2833,7 @@ func (s *nodeStatusServer) collectRoutingTableFromKernel() RoutingTableInfo {
 			}
 
 			devName := link.Attrs().Name
-			if !isManagedTunnelInterface(devName) && !managedPrefixes[r.Dst.String()] {
+			if !isManagedTunnelInterface(s.cfg, devName) && !managedPrefixes[r.Dst.String()] {
 				continue
 			}
 
@@ -2881,34 +2922,37 @@ func (s *nodeStatusServer) collectRoutingTableFromKernel() RoutingTableInfo {
 
 // isManagedTunnelInterface returns true for the interfaces created by the
 // node agent: per-peer WireGuard devices (wg<port>) and the three shared
-// flow-based tunnel devices (geneve0, vxlan0, ipip0) plus the eBPF dummy
+// flow-based tunnel devices (named via cfg.GeneveInterfaceName,
+// cfg.VXLANInterfaceName, cfg.IPIPInterfaceName) plus the eBPF dummy
 // (unbounded0). The legacy netlink dataplane used per-peer gn*, ip*, and
 // vxlan* device names; those were removed in the eBPF-only refactor, so
 // exact-name matches are now sufficient for the shared devices.
-func isManagedTunnelInterface(name string) bool {
-	return strings.HasPrefix(name, "wg") ||
+func isManagedTunnelInterface(cfg *config, name string) bool {
+	return isWireGuardInterface(cfg, name) ||
 		name == unbounded0DeviceName ||
-		name == geneveInterfaceName ||
-		name == vxlanInterfaceName ||
-		name == ipipInterfaceName
+		name == cfg.GeneveInterfaceName ||
+		name == cfg.VXLANInterfaceName ||
+		name == cfg.IPIPInterfaceName
 }
 
 // tunnelInterfaceName returns the shared tunnel interface name for a
 // given protocol. All peers using the same protocol share one flow-based
-// interface (geneve0/vxlan0/ipip0); the BPF program on unbounded0 selects
-// the correct underlay endpoint per packet via the LPM trie.
-func tunnelInterfaceName(protocol string) string {
+// interface; the BPF program on unbounded0 selects the correct underlay
+// endpoint per packet via the LPM trie. The runtime device names are
+// configurable via the --geneve-interface / --vxlan-interface /
+// --ipip-interface flags (and their YAML equivalents).
+func tunnelInterfaceName(cfg *config, protocol string) string {
 	switch unboundednetv1alpha1.TunnelProtocol(protocol) {
 	case unboundednetv1alpha1.TunnelProtocolGENEVE:
-		return geneveInterfaceName
+		return cfg.GeneveInterfaceName
 	case unboundednetv1alpha1.TunnelProtocolVXLAN:
-		return vxlanInterfaceName
+		return cfg.VXLANInterfaceName
 	case unboundednetv1alpha1.TunnelProtocolIPIP:
-		return ipipInterfaceName
+		return cfg.IPIPInterfaceName
 	case unboundednetv1alpha1.TunnelProtocolNone:
 		return "" // resolved to default route interface by caller
 	default:
-		return geneveInterfaceName
+		return cfg.GeneveInterfaceName
 	}
 }
 

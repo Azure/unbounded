@@ -100,6 +100,10 @@ type NodeRuntimeConfig struct {
 	TunnelIPFamily                       string `yaml:"tunnelIPFamily"`
 	VXLANSrcPortLow                      *int   `yaml:"vxlanSrcPortLow"`
 	VXLANSrcPortHigh                     *int   `yaml:"vxlanSrcPortHigh"`
+	GeneveInterfaceName                  string `yaml:"geneveInterfaceName"`
+	VXLANInterfaceName                   string `yaml:"vxlanInterfaceName"`
+	IPIPInterfaceName                    string `yaml:"ipipInterfaceName"`
+	WireGuardInterfacePrefix             string `yaml:"wireGuardInterfacePrefix"`
 }
 
 // LoadRuntimeConfig reads and parses a runtime config YAML file.

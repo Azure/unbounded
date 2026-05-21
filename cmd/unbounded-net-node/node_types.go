@@ -126,6 +126,13 @@ type wireGuardState struct {
 
 	otherSitesNodeCIDRs []string
 
+	// lastGatewayAdvertSummary captures the previous Gateway-route-
+	// advertisement state so the periodic "Gateway route advertisement:
+	// ..." log line only fires on actual change instead of on every
+	// reconcile tick (the reconcile loop runs every ~10s and otherwise
+	// produces an identical line at each tick).
+	lastGatewayAdvertSummary gatewayAdvertSummary
+
 	// Node-level errors surfaced in node status for troubleshooting and health aggregation.
 	nodeErrors []NodeError
 
@@ -143,6 +150,25 @@ type wireGuardState struct {
 	// Persistent logging guard for repeated config-problem warnings.
 	lastConfigProblemsLogTime      time.Time
 	lastConfigProblemsLogSignature string
+}
+
+// gatewayAdvertSummary captures the content of one Gateway route-
+// advertisement publish via a sha256 of a canonical JSON form of the
+// inputs. We dedupe the periodic log line by comparing successive
+// summaries; logging happens only when the summary changes (e.g. when
+// the pool the node is in changes, an assignment is added/removed, an
+// upstream advertised route changes, or the publish path transitions
+// between the happy path and the "skipped" branch). The zero value
+// means "no advertisement has been logged yet by this process", so the
+// next publish (skipped or otherwise) will always emit.
+type gatewayAdvertSummary struct {
+	// state is "" (zero-value, no log emitted yet), "active" (we logged
+	// a publish summary), or "skipped" (we logged the skipped branch).
+	state string
+	// hash is sha256-hex of a canonical JSON encoding of the inputs to
+	// the publish branch this summary covers. Two summaries with the
+	// same hash describe an identical advertisement.
+	hash string
 }
 
 // gatewayPeerInfo contains information about a gateway peer for inter-site routing

@@ -14,11 +14,12 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
-
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/yaml"
+
+	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
 
 // writeTempSSHKey writes dummy SSH key content to a temp file and returns the path.
@@ -369,7 +370,7 @@ func newBootstrapTokenSecret(siteName string) *corev1.Secret {
 			Name:      "bootstrap-token-abc123",
 			Namespace: metav1.NamespaceSystem,
 			Labels: map[string]string{
-				"unbounded-cloud.io/site": siteName,
+				v1alpha3.MachineSiteLabelKey: siteName,
 			},
 		},
 		Type: corev1.SecretTypeBootstrapToken,
@@ -827,6 +828,7 @@ func TestMachineRegisterHandler_Execute_WithNodeLabels(t *testing.T) {
 	// The applied YAML should contain the node labels.
 	require.Contains(t, string(appliedData), "kubernetes.azure.com/managed")
 	require.Contains(t, string(appliedData), "env: prod")
+	require.Contains(t, string(appliedData), "unbounded-cloud.io/site: dc1")
 }
 
 // TestMachineRegisterHandler_Execute_WithAgentOverrides verifies that the

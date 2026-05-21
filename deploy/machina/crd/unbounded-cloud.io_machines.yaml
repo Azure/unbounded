@@ -253,6 +253,7 @@ spec:
                     properties:
                       name:
                         description: Name of the referenced resource.
+                        minLength: 1
                         type: string
                     required:
                     - name
@@ -269,6 +270,7 @@ spec:
                     properties:
                       name:
                         description: Name of the referenced resource.
+                        minLength: 1
                         type: string
                     required:
                     - name
@@ -308,9 +310,7 @@ spec:
               provider:
                 description: Provider identifies the external control provider for
                   this machine.
-                enum:
-                - AzureVM
-                - OCIInstance
+                minLength: 1
                 type: string
               providerID:
                 description: |-

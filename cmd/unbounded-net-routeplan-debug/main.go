@@ -78,6 +78,10 @@ func main() {
 	nodeName := flag.String("node", "", "Node name to analyze")
 	peerFilter := flag.String("peer", "", "Optional peer name filter; when set, only that peer is included")
 	pretty := flag.Bool("pretty", true, "Pretty-print JSON output")
+	wgPrefix := flag.String("wireguard-interface-prefix", "wg", "WireGuard interface name prefix the cluster's node agents are configured with")
+	geneveIface := flag.String("geneve-interface", "geneve0", "GENEVE interface name the cluster's node agents are configured with")
+	vxlanIface := flag.String("vxlan-interface", "vxlan0", "VXLAN interface name the cluster's node agents are configured with")
+	ipipIface := flag.String("ipip-interface", "ipip0", "IPIP interface name the cluster's node agents are configured with")
 
 	flag.Parse()
 
@@ -216,10 +220,21 @@ func main() {
 		return peerOutput[i].Interface < peerOutput[j].Interface
 	})
 
-	expectedIPv4, expectedIPv6 := routeplan.BuildExpectedWireGuardRoutes(routePeers, routeNodes)
-	expectedIPv4Routes := buildExpectedRouteOutput(expectedIPv4, routePeers, routeNodes)
-	expectedIPv6Routes := buildExpectedRouteOutput(expectedIPv6, routePeers, routeNodes)
-	unexpectedIPv4Routes, unexpectedIPv6Routes := buildUnexpectedRouteOutput(target, expectedIPv4Routes, expectedIPv6Routes)
+	// Tunnel-interface names the cluster's node agents are using. Override
+	// via the --wireguard-interface-prefix / --geneve-interface /
+	// --vxlan-interface / --ipip-interface flags when debugging a cluster
+	// configured with non-default names.
+	ifaceNames := routeplan.InterfaceNames{
+		WireGuardPrefix: *wgPrefix,
+		Geneve:          *geneveIface,
+		VXLAN:           *vxlanIface,
+		IPIP:            *ipipIface,
+	}
+
+	expectedIPv4, expectedIPv6 := routeplan.BuildExpectedWireGuardRoutes(routePeers, routeNodes, ifaceNames)
+	expectedIPv4Routes := buildExpectedRouteOutput(expectedIPv4, routePeers, routeNodes, ifaceNames)
+	expectedIPv6Routes := buildExpectedRouteOutput(expectedIPv6, routePeers, routeNodes, ifaceNames)
+	unexpectedIPv4Routes, unexpectedIPv6Routes := buildUnexpectedRouteOutput(target, expectedIPv4Routes, expectedIPv6Routes, ifaceNames)
 
 	out := debugOutput{
 		Node:                 targetNodeName,
@@ -300,7 +315,7 @@ func expectedDestinationsForPeer(peer routeplan.Peer, nodesByName map[string]rou
 	return entries
 }
 
-func buildExpectedRouteOutput(routes []routeplan.ExpectedRoute, peers []routeplan.Peer, nodesByName map[string]routeplan.Node) []expectedRoute {
+func buildExpectedRouteOutput(routes []routeplan.ExpectedRoute, peers []routeplan.Peer, nodesByName map[string]routeplan.Node, ifaceNames routeplan.InterfaceNames) []expectedRoute {
 	peerByName := make(map[string]routeplan.Peer, len(peers))
 	for _, peer := range peers {
 		peerByName[strings.TrimSpace(peer.Name)] = peer
@@ -326,7 +341,7 @@ func buildExpectedRouteOutput(routes []routeplan.ExpectedRoute, peers []routepla
 			continue
 		}
 
-		peerExpectedIPv4, peerExpectedIPv6 := routeplan.BuildExpectedWireGuardRoutes([]routeplan.Peer{peer}, nodesByName)
+		peerExpectedIPv4, peerExpectedIPv6 := routeplan.BuildExpectedWireGuardRoutes([]routeplan.Peer{peer}, nodesByName, ifaceNames)
 		for _, peerRoute := range append(peerExpectedIPv4, peerExpectedIPv6...) {
 			key := buildRouteKey(peerRoute.Destination, peerRoute.Gateway, peerRoute.Device, peerRoute.Family)
 			peerNamesByRouteKey[key] = append(peerNamesByRouteKey[key], name)
@@ -382,6 +397,7 @@ func buildUnexpectedRouteOutput(
 	target statusv1alpha1.NodeStatusResponse,
 	expectedIPv4 []expectedRoute,
 	expectedIPv6 []expectedRoute,
+	ifaceNames routeplan.InterfaceNames,
 ) ([]expectedRoute, []expectedRoute) {
 	expectedByFamily := map[int]map[string]struct{}{
 		4: make(map[string]struct{}, len(expectedIPv4)),
@@ -427,7 +443,7 @@ func buildUnexpectedRouteOutput(
 	}
 
 	isConnectedSelfWireGuardHostRoute := func(destination string, hop statusv1alpha1.NextHop) bool {
-		if !isWireGuardInterfaceName(hop.Device) {
+		if !ifaceNames.IsTunnelInterface(hop.Device) {
 			return false
 		}
 
@@ -461,7 +477,7 @@ func buildUnexpectedRouteOutput(
 			}
 
 			for _, hop := range route.NextHops {
-				if !isWireGuardInterfaceName(hop.Device) {
+				if !ifaceNames.IsTunnelInterface(hop.Device) {
 					continue
 				}
 
@@ -519,10 +535,6 @@ func buildUnexpectedRouteOutput(
 	}
 
 	return buildUnexpected(target.RoutingTable.Routes, 4), buildUnexpected(target.RoutingTable.Routes, 6)
-}
-
-func isWireGuardInterfaceName(device string) bool {
-	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(device)), "wg")
 }
 
 func sourceForPeerDestination(

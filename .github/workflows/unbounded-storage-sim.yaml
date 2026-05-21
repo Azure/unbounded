@@ -15,7 +15,7 @@ on:
       proptest_cases:
         description: "PROPTEST_CASES per cargo test invocation."
         required: false
-        default: "4096"
+        default: "32768"
 
 concurrency:
   group: unbounded-storage-sim-${{ github.ref }}
@@ -36,7 +36,7 @@ jobs:
     timeout-minutes: 45
     env:
       DST_DURATION: ${{ github.event.inputs.duration || '20m' }}
-      PROPTEST_CASES: ${{ github.event.inputs.proptest_cases || '4096' }}
+      PROPTEST_CASES: ${{ github.event.inputs.proptest_cases || '32768' }}
       # Mercury env: cargo/build.rs and the resulting binary both need these.
       # We set them at the job level so every cargo invocation (including the
       # inner `bash -c` loop) inherits them without per-step plumbing.
@@ -128,3 +128,28 @@ jobs:
           fi
           echo "DST soak failed after ${elapsed}s with exit code ${status}." >&2
           exit "${status}"
+
+  model-check:
+    name: TLA+ model check
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up JDK
+        uses: actions/setup-java@dded0888837ed1f317902acf8a20df0ad188d165 # v5.0.0
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Cache tla2tools.jar
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: tmp/tla2tools.jar
+          # Key derives from the pinned TLA_TOOLS_VERSION / SHA in the
+          # top-level Makefile; bump those to invalidate this cache.
+          key: tla2tools-v1.8.0
+
+      - name: Run TLC on CoW B+tree crash-consistency model
+        run: make unbounded-storage-model-check

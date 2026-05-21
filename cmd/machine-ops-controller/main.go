@@ -5,9 +5,13 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/spf13/cobra"
@@ -28,11 +32,18 @@ import (
 	"github.com/Azure/unbounded/internal/version"
 )
 
+const (
+	controllerName    = "machine-ops-controller"
+	scopeFallbackName = "scope"
+
+	errSiteProviderPair = "--site and --provider must be set together"
+)
+
 func main() {
 	var cfg config
 
 	cmd := &cobra.Command{
-		Use:   "machine-ops-controller",
+		Use:   controllerName,
 		Short: "External MachineOperation controller",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx, cancel := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
@@ -47,11 +58,11 @@ func main() {
 	cmd.Flags().StringVar(&cfg.probeAddr, "health-probe-bind-address", ":8081", "Address for health probes")
 	cmd.Flags().BoolVar(&cfg.leaderElection, "leader-elect", true, "Enable leader election")
 	cmd.Flags().StringVar(&cfg.leaderElectionNamespace, "leader-elect-namespace", "unbounded-kube", "Namespace for the leader election lease")
+	cmd.Flags().StringVar(&cfg.credentialSecretNamespace, "credential-secret-namespace", "unbounded-kube", "Namespace containing MachineOperationCredential referenced Secrets")
 	cmd.Flags().IntVar(&cfg.maxConcurrentReconciles, "max-concurrent-reconciles", 10, "Maximum concurrent MachineOperation reconciles")
 	cmd.Flags().StringVar(&cfg.apiServerEndpoint, "api-server-endpoint", "", "Kubernetes API server endpoint used in host replacement bootstrap config")
-	cmd.Flags().StringVar(&cfg.ociConfigFile, "oci-config-file", "", "Path to OCI config file for OCIInstance operations")
-	cmd.Flags().StringVar(&cfg.ociConfigProfile, "oci-config-profile", "DEFAULT", "OCI config profile for OCIInstance operations")
-	cmd.Flags().StringVar(&cfg.ociAuth, "oci-auth", "api_key", "OCI auth mode for OCIInstance operations: api_key or security_token")
+	cmd.Flags().StringVar(&cfg.siteName, "site", "", "Site name this controller should operate on")
+	cmd.Flags().StringVar(&cfg.providerName, "provider", "", "Provider name this controller should operate on")
 
 	cmd.CompletionOptions.DisableDefaultCmd = true
 	cmd.SetVersionTemplate(`{{printf "%s\n" .Version}}`)
@@ -63,19 +74,28 @@ func main() {
 }
 
 type config struct {
-	metricsAddr             string
-	probeAddr               string
-	leaderElection          bool
-	leaderElectionNamespace string
-	maxConcurrentReconciles int
-	apiServerEndpoint       string
-	ociConfigFile           string
-	ociConfigProfile        string
-	ociAuth                 string
+	metricsAddr               string
+	probeAddr                 string
+	leaderElection            bool
+	leaderElectionNamespace   string
+	credentialSecretNamespace string
+	maxConcurrentReconciles   int
+	apiServerEndpoint         string
+	siteName                  string
+	providerName              string
 }
 
 func run(ctx context.Context, cfg config) error {
 	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
+
+	if (cfg.siteName == "") != (cfg.providerName == "") {
+		return errors.New(errSiteProviderPair)
+	}
+
+	providers, err := configuredProviders(cfg.providerName)
+	if err != nil {
+		return err
+	}
 
 	restConfig := ctrl.GetConfigOrDie()
 	scheme := runtimeScheme()
@@ -85,7 +105,7 @@ func run(ctx context.Context, cfg config) error {
 		Metrics:                       metricsserver.Options{BindAddress: cfg.metricsAddr},
 		HealthProbeBindAddress:        cfg.probeAddr,
 		LeaderElection:                cfg.leaderElection,
-		LeaderElectionID:              "machine-ops-controller",
+		LeaderElectionID:              leaderElectionID(cfg),
 		LeaderElectionNamespace:       cfg.leaderElectionNamespace,
 		LeaderElectionReleaseOnCancel: true,
 	})
@@ -104,14 +124,14 @@ func run(ctx context.Context, cfg config) error {
 	}
 
 	if err := (&machineops.MachineOperationReconciler{
-		Client: directClient,
-		Providers: []machineops.Provider{
-			&azurevm.Provider{},
-			&ociinstance.Provider{ConfigFile: cfg.ociConfigFile, ConfigProfile: cfg.ociConfigProfile, Auth: cfg.ociAuth},
-		},
-		MaxConcurrentReconciles: cfg.maxConcurrentReconciles,
-		KubeClient:              kubeClient,
-		APIServerEndpoint:       cfg.apiServerEndpoint,
+		Client:                    directClient,
+		Providers:                 providers,
+		SiteName:                  cfg.siteName,
+		ProviderName:              cfg.providerName,
+		MaxConcurrentReconciles:   cfg.maxConcurrentReconciles,
+		KubeClient:                kubeClient,
+		APIServerEndpoint:         cfg.apiServerEndpoint,
+		CredentialSecretNamespace: cfg.credentialSecretNamespace,
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup MachineOperation controller: %w", err)
 	}
@@ -124,13 +144,71 @@ func run(ctx context.Context, cfg config) error {
 		return fmt.Errorf("add readyz check: %w", err)
 	}
 
-	ctrl.Log.Info("starting machine-ops-controller")
+	ctrl.Log.Info("starting machine-ops-controller", "site", cfg.siteName, "provider", cfg.providerName, "leaderElectionID", leaderElectionID(cfg))
 
 	if err := mgr.Start(ctx); err != nil {
 		return fmt.Errorf("start manager: %w", err)
 	}
 
 	return nil
+}
+
+func configuredProviders(providerName string) ([]machineops.Provider, error) {
+	factories := map[string]func() machineops.Provider{
+		unboundedv1alpha3.ExternalProviderAzureVM:     func() machineops.Provider { return &azurevm.Provider{} },
+		unboundedv1alpha3.ExternalProviderOCIInstance: func() machineops.Provider { return &ociinstance.Provider{} },
+	}
+
+	if providerName != "" {
+		factory, ok := factories[providerName]
+		if !ok {
+			return nil, fmt.Errorf("unknown machine-ops provider %q", providerName)
+		}
+
+		return []machineops.Provider{factory()}, nil
+	}
+
+	return []machineops.Provider{
+		factories[unboundedv1alpha3.ExternalProviderAzureVM](),
+		factories[unboundedv1alpha3.ExternalProviderOCIInstance](),
+	}, nil
+}
+
+func leaderElectionID(cfg config) string {
+	if cfg.siteName == "" && cfg.providerName == "" {
+		return controllerName
+	}
+
+	// Scoped controllers must not contend for the same lease. Each
+	// provider/site deployment needs its own active leader.
+	return controllerName + "-" + safeNamePart(cfg.providerName+"-"+cfg.siteName)
+}
+
+func safeNamePart(value string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(value) {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '-':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('-')
+		}
+	}
+
+	prefix := strings.Trim(b.String(), "-")
+	if prefix == "" {
+		prefix = scopeFallbackName
+	}
+	if len(prefix) > 40 {
+		prefix = strings.TrimRight(prefix[:40], "-")
+	}
+
+	sum := sha256.Sum256([]byte(value))
+	return fmt.Sprintf("%s-%s", prefix, hex.EncodeToString(sum[:])[:10])
 }
 
 func runtimeScheme() *runtime.Scheme {

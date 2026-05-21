@@ -429,3 +429,73 @@ func TestPatchGatewayNodeStatusFallbackNotFoundDetection(t *testing.T) {
 		t.Fatalf("expected not found fallback to return an error")
 	}
 }
+
+func TestGatewayAdvertHashActive(t *testing.T) {
+	t.Parallel()
+
+	localA := map[string]unboundednetv1alpha1.GatewayNodeRoute{
+		"10.0.0.0/16": {Type: "PodCidr"},
+		"10.1.0.0/16": {Type: "NodeCidr"},
+	}
+	mergedA := map[string]unboundednetv1alpha1.GatewayNodeRoute{
+		"10.0.0.0/16": {Type: "PodCidr"},
+	}
+
+	h1 := gatewayAdvertHashActive("pool-1", localA, mergedA, 3)
+	h2 := gatewayAdvertHashActive("pool-1", localA, mergedA, 3)
+
+	if h1 != h2 {
+		t.Fatalf("hash for identical inputs differs: %q vs %q", h1, h2)
+	}
+
+	// Same key count, different content -> hash MUST change. This is the
+	// case the previous count-only dedupe missed.
+	localB := map[string]unboundednetv1alpha1.GatewayNodeRoute{
+		"10.0.0.0/16": {Type: "PodCidr"},
+		"10.2.0.0/16": {Type: "NodeCidr"}, // changed CIDR
+	}
+
+	if got := gatewayAdvertHashActive("pool-1", localB, mergedA, 3); got == h1 {
+		t.Fatalf("hash unchanged after CIDR substitution at same count: %q", got)
+	}
+
+	// Same content, different pool name.
+	if got := gatewayAdvertHashActive("pool-2", localA, mergedA, 3); got == h1 {
+		t.Fatalf("hash unchanged after pool name change: %q", got)
+	}
+
+	// Same content, different assignment count.
+	if got := gatewayAdvertHashActive("pool-1", localA, mergedA, 4); got == h1 {
+		t.Fatalf("hash unchanged after assignment count change: %q", got)
+	}
+
+	// Route Type changes within the same CIDR.
+	localC := map[string]unboundednetv1alpha1.GatewayNodeRoute{
+		"10.0.0.0/16": {Type: "RoutedCidr"}, // type changed
+		"10.1.0.0/16": {Type: "NodeCidr"},
+	}
+
+	if got := gatewayAdvertHashActive("pool-1", localC, mergedA, 3); got == h1 {
+		t.Fatalf("hash unchanged after route Type change: %q", got)
+	}
+}
+
+func TestGatewayAdvertHashSkipped(t *testing.T) {
+	t.Parallel()
+
+	// Pool slice order MUST NOT affect the hash.
+	h1 := gatewayAdvertHashSkipped(true, []string{"pool-a", "pool-b"})
+	h2 := gatewayAdvertHashSkipped(true, []string{"pool-b", "pool-a"})
+
+	if h1 != h2 {
+		t.Fatalf("hash differs for reordered pool slice: %q vs %q", h1, h2)
+	}
+
+	if got := gatewayAdvertHashSkipped(false, []string{"pool-a", "pool-b"}); got == h1 {
+		t.Fatalf("hash unchanged after hasDynamicClient flip: %q", got)
+	}
+
+	if got := gatewayAdvertHashSkipped(true, []string{"pool-a"}); got == h1 {
+		t.Fatalf("hash unchanged after pool set change: %q", got)
+	}
+}
