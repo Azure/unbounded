@@ -116,6 +116,37 @@ func TestS3SDK(t *testing.T) {
 		}
 	})
 
+	// HeadObject_Size_TypedFields: verifies HEAD on a present
+	// object returns the correct object size via the SDK's typed
+	// *out.ContentLength field. Prefetchers and range planners
+	// depend on this; a regression in setObjectHeaders or the
+	// Content-Length formatting in handleHead would silently break
+	// clients that key off the typed field rather than re-parsing
+	// the header.
+	t.Run("HeadObject_Size_TypedFields", func(t *testing.T) {
+		t.Parallel()
+
+		out, err := client.HeadObject(ctx, &s3.HeadObjectInput{
+			Bucket: aws.String(bucket),
+			Key:    aws.String(blob.Key),
+		})
+		if err != nil {
+			t.Fatalf("HeadObject: %v", err)
+		}
+
+		if out.ContentLength == nil {
+			t.Fatal("ContentLength is nil")
+		}
+
+		if got, want := *out.ContentLength, int64(len(blob.Data)); got != want {
+			t.Errorf("ContentLength=%d want %d", got, want)
+		}
+
+		if out.ETag == nil || *out.ETag == "" {
+			t.Error("ETag missing on HeadObject success")
+		}
+	})
+
 	// GetObject_NoSuchKey_TypedError: the headline assertion. SDK
 	// must surface *s3types.NoSuchKey, which requires orca to emit
 	// a well-formed <Error><Code>NoSuchKey</Code></Error> body with
