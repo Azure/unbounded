@@ -60,6 +60,13 @@ pub struct EngineConfig {
     /// and always proceeds. Intended for benchmarking/tooling;
     /// production should leave this false.
     pub bypass_admission: bool,
+    /// When true, [`BTreeIndex::open`] skips the LBA-order leaf
+    /// scan on disks that have no valid meta page. Intended for
+    /// benchmarking and bring-up against freshly wiped devices
+    /// where the full-disk scan would otherwise take many minutes
+    /// per terabyte. Production should leave this false so partial
+    /// recovery still runs when the meta slots are corrupted.
+    pub skip_recovery_scan_if_no_meta: bool,
 }
 
 impl Default for EngineConfig {
@@ -75,6 +82,7 @@ impl Default for EngineConfig {
             singleflight_shards: 64,
             restart_scan_queue_depth: 256,
             bypass_admission: false,
+            skip_recovery_scan_if_no_meta: false,
         }
     }
 }
@@ -200,7 +208,13 @@ impl<B: BlockDevice> StorageEngine<B> {
         // BTreeIndex::open issues before any user-data I/O.
         let scratch = ScratchPool::new(&*device, cfg.btree_page_bytes, BTREE_SCRATCH_PAGES)?;
         let btree = Arc::new(
-            BTreeIndex::open(device.clone(), allocator.clone(), scratch.clone()).await?,
+            BTreeIndex::open(
+                device.clone(),
+                allocator.clone(),
+                scratch.clone(),
+                cfg.skip_recovery_scan_if_no_meta,
+            )
+            .await?,
         );
         let lru = Arc::new(SieveLru::new(capacity, refcount.clone()));
         let admission = Arc::new(AdmissionFilter::new(
@@ -553,11 +567,19 @@ impl<B: BlockDevice> StorageEngine<B> {
         // SAFETY: caller-provided contract on `src`.
         let src_buf: &[u8] = unsafe { &*src };
 
-        if self.device.write(lba, src_buf).await.is_err() {
+        if let Err(e) = self.device.write(lba, src_buf).await {
+            // A device write that did not land on disk MUST surface
+            // as an error to the caller. Returning Ok here would let
+            // benchmarks and any other "I observed a successful
+            // write" code path believe a page is durable when it is
+            // not: an immediate read of `key` would then miss
+            // because no btree entry was published. The engine
+            // still records the IO error in metrics for the
+            // operator-facing snapshot.
             self.metric(|m| m.write_io_errors += 1);
             let _ = self.allocator.free(lba);
             leader.abandon();
-            return Ok(());
+            return Err(bufferpool::Error::Io(io_errno(&e)));
         }
 
         let cs = Xxh3Checksum::checksum_of(src_buf);
@@ -580,10 +602,16 @@ impl<B: BlockDevice> StorageEngine<B> {
         let prior_lba = match done.wait().await {
             MutatorOutcome::InsertCommitted { prior_lba } => prior_lba,
             MutatorOutcome::Failed => {
+                // Btree commit failed: the device write landed on
+                // an LBA that is no longer referenced by the index,
+                // i.e. the page is not durably published. Treat
+                // this as a hard write failure rather than a silent
+                // success - see the matching reasoning at the
+                // device-write branch above.
                 self.metric(|m| m.write_io_errors += 1);
                 let _ = self.allocator.free(lba);
                 leader.abandon();
-                return Ok(());
+                return Err(bufferpool::Error::Io(libc::EIO));
             }
             MutatorOutcome::DeleteCommitted => {
                 unreachable!("mutator returned DeleteCommitted for an Insert request")
@@ -737,11 +765,24 @@ fn _unused_bulkref() -> Option<BulkRef> {
     None
 }
 
+/// Best-effort `errno` extraction for surfacing a device-layer
+/// error through the [`bufferpool::Error::Io`] variant. The block
+/// device crate exposes a small enum of failure shapes; the only
+/// one that carries an `errno` today is `Io(i32)`. Other variants
+/// (out-of-range, corruption, ...) collapse to `EIO` because the
+/// upper layers only need to know "the write was rejected".
+fn io_errno(e: &crate::storage::types::Error) -> i32 {
+    match e {
+        crate::storage::types::Error::Io(n) => *n,
+        _ => libc::EIO,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bufferpool::BlockStore;
-    use crate::storage::blockdev::{MockDevice, MockDeviceConfig};
+    use crate::storage::blockdev::{MockDevice, MockDeviceConfig, MockFaultMode};
     use crate::storage::types::Lba;
     use std::future::Future;
     use std::pin::{Pin, pin};
@@ -1035,6 +1076,78 @@ mod tests {
             assert_eq!(s.hits, PAGES as u64);
             assert_eq!(s.read_io_errors, 0);
             assert_eq!(s.checksum_misses, 0);
+            eng_body.close_mutator();
+        };
+        block_on_pair(body, mutator.as_mut());
+    }
+
+    /// A device-level write failure MUST propagate to the caller
+    /// as an `Err` so benchmarks and any other "I observed a
+    /// successful write" code path cannot treat the page as
+    /// durable. Before this contract was enforced, `bench storage
+    /// block` happily reported gigabytes per second while every
+    /// `write_page_from` call silently swallowed the underlying
+    /// device error and returned `Ok(())`, leaving the btree with
+    /// no entry for the key.
+    #[test]
+    fn write_page_returns_err_when_device_write_fails() {
+        const PAGE: usize = 4096;
+        let device = Arc::new(MockDevice::new(MockDeviceConfig {
+            page_size: PAGE,
+            capacity_pages: 64,
+            ..Default::default()
+        }));
+        let cfg = EngineConfig {
+            page_size_bytes: PAGE,
+            btree_page_bytes: PAGE,
+            // Bypass the doorkeeper so the first write actually
+            // reaches the device, instead of being swallowed by
+            // the admission filter and producing a benign Ok.
+            bypass_admission: true,
+            ..Default::default()
+        };
+        let eng = Arc::new(block_on(StorageEngine::open(device.clone(), cfg)).unwrap());
+        let buf: Box<[u8]> = vec![0u8; PAGE * 4].into_boxed_slice();
+        eng.register_pages(buf.as_ptr() as *mut u8, PAGE, 4).unwrap();
+
+        // Surface every write as EIO so the engine sees a device-
+        // level failure on the user-data write path. Engaging the
+        // fault *after* open lets BTreeIndex::open complete its
+        // structural meta writes; we only want to fault the
+        // user-data write here.
+        device.set_fault_mode(MockFaultMode::WriteIo);
+
+        let eng_body = eng.clone();
+        let mutator = eng.clone().run_mutator();
+        let mut mutator = pin!(mutator);
+        let body = async move {
+            let src = PageRef {
+                page_idx: 0,
+                offset: 0,
+                len: PAGE as u32,
+            };
+            let err = eng_body
+                .write_page(stripe(17), 0, src)
+                .await
+                .expect_err("device WriteIo fault must propagate as Err");
+            match err {
+                bufferpool::Error::Io(n) => assert_eq!(n, libc::EIO),
+                other => panic!("expected bufferpool::Error::Io(EIO), got {other:?}"),
+            }
+            let s = eng_body.snapshot();
+            assert_eq!(s.write_io_errors, 1);
+            assert_eq!(s.admitted, 0, "failed write must not be counted as admitted");
+
+            // A subsequent read for the same key must miss: the
+            // btree was never updated, so the engine should not
+            // pretend the page is on disk.
+            let dst = PageRef {
+                page_idx: 1,
+                offset: 0,
+                len: PAGE as u32,
+            };
+            let hit = eng_body.read_page(stripe(17), 0, dst).await.unwrap();
+            assert!(!hit, "key with failed write must not appear as a cache hit");
             eng_body.close_mutator();
         };
         block_on_pair(body, mutator.as_mut());

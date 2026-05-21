@@ -116,6 +116,7 @@ impl<B: BlockDevice> BTreeIndex<B> {
         device: Arc<B>,
         allocator: Arc<Allocator>,
         scratch: Rc<ScratchPool>,
+        skip_recovery_scan_if_no_meta: bool,
     ) -> Result<Self, Error> {
         // Reserve the meta slots regardless of disk state.
         let _ = allocator.mark_in_use(page::META_SLOT_A);
@@ -134,6 +135,22 @@ impl<B: BlockDevice> BTreeIndex<B> {
             }
             // Meta said something but the tree underneath is
             // gone; fall through to rebuild.
+        } else if skip_recovery_scan_if_no_meta {
+            // Fresh disk path used by the bench: skip the
+            // full-capacity LBA-order leaf scan and treat the
+            // device as empty. The scan is the design's degraded
+            // recovery path for the case where the meta slots are
+            // corrupted but data leaves are intact; on a wiped
+            // disk it is pure overhead (and on a multi-TB disk it
+            // can take many minutes).
+            return Self::bootstrap_from_entries(
+                device,
+                allocator,
+                scratch,
+                1,
+                BTreeMap::new(),
+            )
+            .await;
         }
 
         // Try LBA-scan rebuild.
@@ -171,6 +188,15 @@ impl<B: BlockDevice> BTreeIndex<B> {
 
         let mut entries: BTreeMap<PageKey, LeafEntry> = BTreeMap::new();
         cow::for_each_leaf(&**device, scratch, state.root_lba, |k, v, _| {
+            // Also mark the data LBA referenced by this leaf
+            // entry as in use. Without this, a reopened engine
+            // would happily hand the same LBA out via
+            // `allocator.alloc()` and overwrite live data
+            // belonging to some other key in the existing index.
+            // The structural btree pages above were already
+            // marked via `mark_in_use(lba)` from `collect_pages`;
+            // data LBAs need the same treatment.
+            let _ = allocator.mark_in_use(v.lba);
             entries.insert(k, v);
         })
         .await?;

@@ -5,9 +5,34 @@
 //! `unbounded-storage` crate. New benchmark families are added as
 //! top-level subcommands; today the only family is `storage`, whose
 //! `block` subcommand drives the io_uring + `StorageEngine` +
-//! `LocalStorage` stack with admission bypass, running a write phase
-//! followed by a read phase against a deterministic `xxh3`-derived
-//! key stream.
+//! `LocalStorage` stack, running a write phase followed by a read
+//! phase against a deterministic `xxh3`-derived key stream.
+//!
+//! ## Trust invariants
+//!
+//! The bench is only useful if its numbers reflect real on-disk
+//! work. To keep that contract honest:
+//!
+//! - Every `write_page` is awaited end-to-end: the writer counts an
+//!   op as `Ok` only after the engine's mutator commits the btree
+//!   insert that publishes the key. A device-level write error
+//!   surfaces as `Err` from `write_page` (see
+//!   `storage::engine::write_page_from`) and is *not* counted as a
+//!   successful op.
+//! - The read phase must observe near-zero misses against the keys
+//!   the write phase recorded. The driver prints both phases'
+//!   numbers plus per-engine `EngineSnapshot` so any silent drop
+//!   (admission rejection, write_io_error, etc.) is visible.
+//! - Each op stamps a per-op tag (`worker_id`, `seq`, mixed seed)
+//!   into the page's first 64 bytes so the engine's content
+//!   checksum changes per op. This prevents any future
+//!   content-addressed dedup from collapsing distinct ops into one
+//!   physical write.
+//! - `--verify` switches to a small, byte-equality round trip:
+//!   write N distinct payloads, read each back, and assert the
+//!   bytes match exactly. Use this whenever the bench is modified
+//!   to reconfirm closed-loop correctness before trusting any
+//!   throughput numbers.
 //!
 //! Threading model: `UringBlockDevice` is `!Send + !Sync` because the
 //! ring is pinned to the thread that opened it. The design
@@ -50,6 +75,19 @@ use unbounded_storage::storage::{EngineConfig, LocalStorage, StorageEngine};
 use unbounded_storage::topology::{Host, Nvme, Plan, PlanConfig, Role};
 
 const _: () = assert!(HUGEPAGE_2MB == 2 * 1024 * 1024);
+
+/// User-data page size used by the bench, in bytes.
+///
+/// Today the storage stack assumes the block device's atomic write
+/// unit equals the engine's cache page size (the btree, allocator,
+/// and engine all use the same LBA -> byte offset = LBA * page_size
+/// formula). Until that mismatch is properly disentangled, the
+/// bench operates at the device's atomic-write granularity (4 KiB
+/// on commodity SCSI/NVMe). The hugepage backing is still 2 MiB so
+/// it can be DMA'd directly, but each worker only addresses a
+/// 4 KiB sub-slice of it.
+const PAGE_BYTES: usize = 4096;
+const _: () = assert!(HUGEPAGE_2MB.is_multiple_of(PAGE_BYTES));
 
 /// Default PRNG seed for benchmark workloads.
 const DEFAULT_SEED: u64 = 0xBE_DE_CA_FE_u64;
@@ -156,6 +194,39 @@ struct BlockArgs {
     /// non-NVMe targets. Implied by `--no-iopoll`.
     #[arg(long = "no-single-issuer")]
     no_single_issuer: bool,
+
+    /// Skip the engine's admission filter on writes. The filter
+    /// rejects every first-touch key by design (it is a Bloom-style
+    /// doorkeeper for one-hit-wonders), so leaving it on causes
+    /// every workload to admit ~half its ops on the cold cache
+    /// and the read phase to miss the rejected keys. On by default
+    /// so the read phase observes the keys the write phase
+    /// recorded; set to false to measure the production path
+    /// including the doorkeeper.
+    #[arg(long = "bypass-admission", default_value_t = true)]
+    bypass_admission: bool,
+
+    /// Run a small closed-loop verification instead of the timed
+    /// throughput phases: write `--verify-ops` distinct payloads,
+    /// read each back, and assert that the returned bytes match
+    /// what was written. Exits non-zero on any mismatch or miss.
+    /// Use this whenever the bench is modified to reconfirm trust.
+    #[arg(long = "verify")]
+    verify: bool,
+
+    /// Number of ops to issue in `--verify` mode. Kept small by
+    /// default so a verify run completes in seconds.
+    #[arg(long = "verify-ops", default_value_t = 256)]
+    verify_ops: u64,
+
+    /// Run the full LBA-order leaf scan at open time when no meta
+    /// page can be loaded. Off by default: a wiped device has no
+    /// leaves to recover and a full-capacity scan (~20M reads on a
+    /// 80 GiB SSD) makes the bench unusable. Set this flag to
+    /// exercise the production "meta lost, recover from leaves"
+    /// path.
+    #[arg(long = "full-recovery-scan")]
+    full_recovery_scan: bool,
 }
 
 fn main() -> ExitCode {
@@ -215,7 +286,27 @@ fn run_block(args: BlockArgs) -> ExitCode {
 
     install_signal_handler();
 
-    let threads_per_device = args.threads_per_device;
+    let threads_per_device = if args.threads_per_device > 1 {
+        // Each shard opens its own StorageEngine, Allocator, and
+        // BTreeIndex against the same on-disk LBA space. With more
+        // than one engine per device, the per-engine allocators
+        // race for freshly-allocated LBAs (every fresh allocator
+        // starts at LBA 2) and the per-engine btrees both try to
+        // commit to meta slots A/B, silently corrupting each
+        // other's data. Until the engine supports a shared
+        // allocator + btree across shards on one device, force a
+        // single engine per device so the numbers are
+        // trustworthy and reads can hit the keys writes published.
+        eprintln!(
+            "bench: --threads-per-device > 1 ({}) currently corrupts cross-shard \
+             writes (per-engine Allocator races). Forcing threads-per-device=1.",
+            args.threads_per_device,
+        );
+        1
+    } else {
+        args.threads_per_device
+    };
+    let _ = args.verify; // verify path now folds into the same single-engine constraint above.
     let total_shards = num_devices * threads_per_device;
 
     // Build per-shard placement specs from the topology module.
@@ -257,6 +348,13 @@ fn run_block(args: BlockArgs) -> ExitCode {
     let single_issuer = iopoll && !args.no_single_issuer;
     let defer_taskrun = single_issuer;
     let o_direct = !args.no_o_direct;
+    // Verify mode bypasses the timed throughput phases entirely;
+    // each shard runs a small closed-loop write+read+compare.
+    let verify_ops_per_shard = if args.verify {
+        args.verify_ops.div_ceil(total_shards as u64).max(1)
+    } else {
+        0
+    };
     let mut joins = Vec::with_capacity(total_shards);
     for shard_idx in 0..total_shards {
         let device_idx = shard_idx / threads_per_device;
@@ -279,6 +377,15 @@ fn run_block(args: BlockArgs) -> ExitCode {
             o_direct,
             single_issuer,
             defer_taskrun,
+            // --verify implies --bypass-admission: the doorkeeper
+            // deliberately drops every first-touch write, which
+            // makes byte-equality verification impossible. Verify
+            // is about closed-loop correctness of the I/O path, so
+            // disabling the filter is the right call here.
+            bypass_admission: args.bypass_admission || args.verify,
+            verify: args.verify,
+            verify_ops_per_shard,
+            skip_recovery_scan_if_no_meta: !args.full_recovery_scan,
         };
         worker_id_offset += workers_for_shard;
         let tx = tx.clone();
@@ -457,6 +564,10 @@ struct ShardConfig {
     o_direct: bool,
     single_issuer: bool,
     defer_taskrun: bool,
+    bypass_admission: bool,
+    verify: bool,
+    verify_ops_per_shard: u64,
+    skip_recovery_scan_if_no_meta: bool,
 }
 
 /// Per-phase per-shard tally returned to the main thread.
@@ -511,7 +622,16 @@ fn run_shard_inner(
     cfg: ShardConfig,
     device_label: String,
 ) -> Result<(ShardReport, Option<ShardReport>), String> {
-    let mut uring_cfg = UringConfig::default();
+    let mut uring_cfg = UringConfig {
+        // The device must be told the same page size the engine
+        // will write: the device enforces `src.len() ==
+        // page_size` on every read/write, so a mismatch produces
+        // -EINVAL on every IO and (until the engine started
+        // propagating those errors) silently passed the bench
+        // straight through to a no-op loop.
+        page_size: PAGE_BYTES,
+        ..UringConfig::default()
+    };
     uring_cfg.iopoll = cfg.iopoll;
     uring_cfg.single_issuer = cfg.single_issuer;
     uring_cfg.defer_taskrun = cfg.defer_taskrun;
@@ -527,25 +647,28 @@ fn run_shard_inner(
             .map_err(|e| format!("UringBlockDevice::open: {e:?}"))?,
     );
 
-    // Hugepages are 2 MiB, which is also the engine's default cache
-    // page. One backing page per worker: each worker owns it
-    // exclusively across phases (write source, then read dest).
-    let page_count = cfg.workers;
+    // One PAGE_BYTES slot per worker, packed into a single
+    // hugepage-backed region. PAGE_BYTES is small (4 KiB today),
+    // so we round up to whole 2 MiB hugepages.
+    let page_count = cfg.workers.max(1);
+    let backing_bytes = (page_count * PAGE_BYTES).next_multiple_of(HUGEPAGE_2MB);
     let backing = allocate(BackingRequest {
         kind: BackingKind::Hugepage2Mb,
-        bytes: page_count * HUGEPAGE_2MB,
+        bytes: backing_bytes,
         numa: cfg.pinned_numa,
     })
     .map_err(|e| format!("backing allocate: {e}"))?;
     let backing_base = backing.base;
-    let page_size = backing.page_size;
 
     // Fill the backing with deterministic pseudo-random bytes so
-    // every worker's source page is distinct. Seeded per-shard so a
-    // reproducible run is possible.
+    // every worker's source page starts from distinct content.
+    // The write workers then overwrite the first WRITE_TAG_BYTES
+    // of their slot per op with a (seq, worker, seed) tag so the
+    // engine sees distinct content per op (and so reads can be
+    // byte-compared against the expected value).
     fill_backing_random(
         backing_base,
-        page_count * page_size,
+        backing_bytes,
         cfg.seed ^ shard_seed(cfg.shard_idx),
     );
 
@@ -556,11 +679,17 @@ fn run_shard_inner(
     // tolerant of a duplicate `register_buffers` (it ignores the
     // -EBUSY) and still installs the bufferpool binding.
     device
-        .register_buffers(backing_base, page_count * page_size)
+        .register_buffers(backing_base, backing_bytes)
         .map_err(|e| format!("device.register_buffers: {e:?}"))?;
 
     let engine_cfg = EngineConfig {
-        bypass_admission: true,
+        // Both the cache page size and the btree page size must
+        // equal the device's atomic write unit until the engine
+        // separates user-data page size from device LBA size.
+        page_size_bytes: PAGE_BYTES,
+        btree_page_bytes: PAGE_BYTES,
+        bypass_admission: cfg.bypass_admission,
+        skip_recovery_scan_if_no_meta: cfg.skip_recovery_scan_if_no_meta,
         ..Default::default()
     };
     let engine = Arc::new(
@@ -575,8 +704,12 @@ fn run_shard_inner(
     // and routing on each shard against its own one-engine router.
     let local = Arc::new(LocalStorage::new(vec![engine.clone()]));
     local
-        .register_pages(backing_base, page_size, page_count)
+        .register_pages(backing_base, PAGE_BYTES, page_count)
         .map_err(|e| format!("register_pages: {e:?}"))?;
+
+    if cfg.verify {
+        return run_verify_phase(&cfg, engine, local, device, backing_base, device_label);
+    }
 
     let phase1 = run_phase(
         Phase::Write,
@@ -584,8 +717,9 @@ fn run_shard_inner(
         engine.clone(),
         local.clone(),
         device.clone(),
-        page_size,
+        PAGE_BYTES,
         None,
+        backing_base,
     )?;
 
     let read_report = if SHUTDOWN.load(Ordering::Relaxed) {
@@ -597,8 +731,9 @@ fn run_shard_inner(
             engine.clone(),
             local.clone(),
             device.clone(),
-            page_size,
+            PAGE_BYTES,
             Some(phase1.keys_per_worker.clone()),
+            backing_base,
         )?;
         Some(ShardReport {
             shard_idx: cfg.shard_idx,
@@ -612,6 +747,7 @@ fn run_shard_inner(
         })
     };
 
+    let snapshot = engine.snapshot();
     engine.close_mutator();
 
     let write_report = ShardReport {
@@ -625,12 +761,273 @@ fn run_shard_inner(
         latency_samples: phase1.latency_samples,
     };
 
+    // Trust check: if the engine reports any write_io_errors,
+    // the bench's "ops succeeded" count is no longer a reliable
+    // measure of bytes-on-disk. Print so the operator sees it.
+    if snapshot.write_io_errors > 0 || snapshot.read_io_errors > 0 || snapshot.checksum_misses > 0
+    {
+        eprintln!(
+            "shard {} engine snapshot: write_io_errors={} read_io_errors={} \
+             checksum_misses={} rejected_by_filter={} admitted={} hits={} \
+             misses={} pending_free_len={}",
+            cfg.shard_idx,
+            snapshot.write_io_errors,
+            snapshot.read_io_errors,
+            snapshot.checksum_misses,
+            snapshot.rejected_by_filter,
+            snapshot.admitted,
+            snapshot.hits,
+            snapshot.misses,
+            snapshot.pending_free_len,
+        );
+    }
+
     drop(local);
     drop(engine);
     drop(device);
     drop(backing);
 
     Ok((write_report, read_report))
+}
+
+/// Closed-loop byte-equality round trip used by `--verify`. Writes
+/// `cfg.verify_ops_per_shard` distinct payloads (one per key,
+/// stamped with worker/seq) then reads each back and asserts byte
+/// equality. Returns a single ShardReport summarizing the verify
+/// pass under the "write" slot and `None` for the read slot so the
+/// existing report-printing code does not have to special-case
+/// verify.
+fn run_verify_phase(
+    cfg: &ShardConfig,
+    engine: Arc<StorageEngine<UringBlockDevice>>,
+    local: Arc<LocalStorage<UringBlockDevice>>,
+    device: Arc<UringBlockDevice>,
+    backing_base: *mut u8,
+    device_label: String,
+) -> Result<(ShardReport, Option<ShardReport>), String> {
+    let phase_done = Arc::new(AtomicBool::new(false));
+    let phase_done_for_progress = phase_done.clone();
+    let total_ops = cfg.verify_ops_per_shard;
+
+    let mutator_eng = engine.clone();
+    let mutator_fut: Pin<Box<dyn std::future::Future<Output = ()>>> =
+        Box::pin(mutator_eng.run_mutator());
+
+    let progress_dev = device.clone();
+    let progress_fut: Pin<Box<dyn std::future::Future<Output = ()>>> = Box::pin(async move {
+        loop {
+            if let Err(e) = progress_dev.progress() {
+                eprintln!("progress error: {e:?}");
+                SHUTDOWN.store(true, Ordering::Relaxed);
+                return;
+            }
+            yield_once().await;
+            if SHUTDOWN.load(Ordering::Relaxed) || phase_done_for_progress.load(Ordering::Relaxed) {
+                let _ = progress_dev.progress();
+                return;
+            }
+        }
+    });
+
+    let phase_done_for_body = phase_done.clone();
+    let cfg_seed = cfg.seed;
+    let total_shards = cfg.total_shards;
+    let my_shard = cfg.shard_idx;
+    let local_for_body = local.clone();
+    let engine_for_body = engine.clone();
+    let verify_label = device_label.clone();
+    let start = Instant::now();
+    let body_result: Arc<Mutex<Option<Result<(u64, Duration), String>>>> =
+        Arc::new(Mutex::new(None));
+    let body_result_for_fut = body_result.clone();
+    let body_fut: Pin<Box<dyn std::future::Future<Output = ()>>> = Box::pin(async move {
+        let res = verify_round_trip(
+            local_for_body,
+            engine_for_body,
+            backing_base,
+            cfg_seed,
+            my_shard,
+            total_shards,
+            total_ops,
+            start,
+            &verify_label,
+        )
+        .await;
+        *body_result_for_fut.lock().unwrap() = Some(res);
+        phase_done_for_body.store(true, Ordering::Relaxed);
+    });
+
+    let workers_count = 1usize;
+    let all_futs: Vec<Pin<Box<dyn std::future::Future<Output = ()>>>> =
+        vec![mutator_fut, progress_fut, body_fut];
+    block_on_many(all_futs, |statuses| {
+        let workers_done = statuses[2..2 + workers_count].iter().all(|s| *s);
+        if workers_done {
+            phase_done.store(true, Ordering::Relaxed);
+            statuses[0] = true;
+        }
+    });
+
+    let (ops, elapsed) = body_result
+        .lock()
+        .unwrap()
+        .take()
+        .unwrap_or_else(|| Err("verify: body future did not produce a result".into()))?;
+    let snapshot = engine.snapshot();
+    engine.close_mutator();
+    if snapshot.write_io_errors > 0 || snapshot.read_io_errors > 0 || snapshot.checksum_misses > 0
+    {
+        return Err(format!(
+            "verify: engine reported errors: write_io_errors={} read_io_errors={} \
+             checksum_misses={}",
+            snapshot.write_io_errors, snapshot.read_io_errors, snapshot.checksum_misses,
+        ));
+    }
+
+    let report = ShardReport {
+        shard_idx: cfg.shard_idx,
+        device_label,
+        ops,
+        bytes: ops * PAGE_BYTES as u64,
+        errors: 0,
+        read_misses: 0,
+        elapsed,
+        latency_samples: Vec::new(),
+    };
+    drop(local);
+    drop(engine);
+    drop(device);
+    Ok((report, None))
+}
+
+async fn verify_round_trip(
+    local: Arc<LocalStorage<UringBlockDevice>>,
+    engine: Arc<StorageEngine<UringBlockDevice>>,
+    backing_base: *mut u8,
+    seed: u64,
+    my_shard: usize,
+    total_shards: usize,
+    n: u64,
+    start: Instant,
+    label: &str,
+) -> Result<(u64, Duration), String> {
+    // Use two distinct PageRefs out of the registered region: one
+    // for the write source, one for the read destination, so a
+    // read that erroneously hits the source slot would still be
+    // caught by the byte-equality check.
+    let src_idx = 0u32;
+    let dst_idx = 1u32;
+    let src = PageRef {
+        page_idx: src_idx,
+        offset: 0,
+        len: PAGE_BYTES as u32,
+    };
+    let dst = PageRef {
+        page_idx: dst_idx,
+        offset: 0,
+        len: PAGE_BYTES as u32,
+    };
+    // SAFETY: `backing_base` is a freshly allocated hugepage
+    // region owned by the shard; the slots at indices 0 and 1 are
+    // disjoint and not aliased by any other task during verify
+    // (single-worker mode).
+    let src_ptr = unsafe { backing_base.add(src_idx as usize * PAGE_BYTES) };
+    let dst_ptr = unsafe { backing_base.add(dst_idx as usize * PAGE_BYTES) };
+
+    // Generate keys upfront so each op writes a distinct key
+    // routable to this shard.
+    let mut keys: Vec<StripeKey> = Vec::with_capacity(n as usize);
+    let mut seq: u64 = 0;
+    while (keys.len() as u64) < n {
+        let candidate = make_key(seed, my_shard as u64, seq);
+        seq = seq.wrapping_add(1);
+        if route_shard(&candidate, total_shards) == my_shard {
+            keys.push(candidate);
+        }
+    }
+
+    // Snapshot of "expected bytes" for each key. We stamp the
+    // first 64 bytes of the source page with the op tag and copy
+    // the entire page contents so the reader has the exact bytes
+    // it should see.
+    let mut expected: Vec<Vec<u8>> = Vec::with_capacity(n as usize);
+    for (i, key) in keys.iter().enumerate() {
+        // SAFETY: src_ptr is the start of a 4 KiB owned slot.
+        let src_slice = unsafe { std::slice::from_raw_parts_mut(src_ptr, PAGE_BYTES) };
+        stamp_page(src_slice, seed, my_shard as u64, i as u64, key);
+        let snapshot = src_slice.to_vec();
+        expected.push(snapshot);
+        if let Err(e) = local.write_page(*key, 0, src).await {
+            return Err(format!("verify[{label}] write op {i} failed: {e:?}"));
+        }
+    }
+
+    // Trust gate: any device-level write error before this point
+    // means the byte-equality compare below cannot be trusted.
+    // Surface the engine's view of the world so the operator can
+    // see at a glance whether the writes actually committed.
+    let post_write = engine.snapshot();
+    if post_write.write_io_errors > 0 {
+        return Err(format!(
+            "verify[{label}]: {} write_io_errors during write phase; aborting",
+            post_write.write_io_errors,
+        ));
+    }
+    if post_write.admitted < n {
+        return Err(format!(
+            "verify[{label}]: only {} of {n} writes were admitted; aborting",
+            post_write.admitted,
+        ));
+    }
+
+    for (i, key) in keys.iter().enumerate() {
+        // Clear the destination slot so a partial / skipped read
+        // is visible in the byte compare.
+        // SAFETY: same disjoint-slot reasoning as above.
+        unsafe {
+            std::ptr::write_bytes(dst_ptr, 0, PAGE_BYTES);
+        }
+        let hit = match local.read_page(*key, 0, dst).await {
+            Ok(b) => b,
+            Err(e) => return Err(format!("verify[{label}] read op {i} failed: {e:?}")),
+        };
+        if !hit {
+            return Err(format!(
+                "verify[{label}] read op {i} missed key it just wrote",
+            ));
+        }
+        // SAFETY: dst_ptr is the start of a 4 KiB owned slot.
+        let dst_slice = unsafe { std::slice::from_raw_parts(dst_ptr, PAGE_BYTES) };
+        if dst_slice != expected[i].as_slice() {
+            // Find the first mismatch for a useful message.
+            let mismatch = dst_slice
+                .iter()
+                .zip(expected[i].iter())
+                .position(|(a, b)| a != b)
+                .unwrap_or(0);
+            return Err(format!(
+                "verify[{label}] op {i} byte mismatch at offset {mismatch}: \
+                 got 0x{:02x}, expected 0x{:02x}",
+                dst_slice[mismatch], expected[i][mismatch],
+            ));
+        }
+    }
+    Ok((n, start.elapsed()))
+}
+
+/// Stamp a per-op tag into the first 64 bytes of `page`. The tag
+/// mixes `(seed, worker_id, seq, key)` so every op produces a
+/// content-distinct page even when the bench reuses the same
+/// backing slot across many ops. The tail of the page keeps
+/// whatever the caller put there (typically random bytes from
+/// startup).
+fn stamp_page(page: &mut [u8], seed: u64, worker_id: u64, seq: u64, key: &StripeKey) {
+    debug_assert!(page.len() >= 64);
+    page[0..8].copy_from_slice(&seed.to_le_bytes());
+    page[8..16].copy_from_slice(&worker_id.to_le_bytes());
+    page[16..24].copy_from_slice(&seq.to_le_bytes());
+    page[24..32].copy_from_slice(b"UNB-OPv1");
+    page[32..64].copy_from_slice(&key.0);
 }
 
 #[derive(Copy, Clone)]
@@ -657,6 +1054,7 @@ fn run_phase(
     device: Arc<UringBlockDevice>,
     page_size: usize,
     seed_keys: Option<Vec<Vec<StripeKey>>>,
+    backing_base: *mut u8,
 ) -> Result<PhaseRun, String> {
     let phase_done = Arc::new(AtomicBool::new(false));
     let total_ops = Arc::new(AtomicU64::new(0));
@@ -750,6 +1148,7 @@ fn run_phase(
                 my_shard,
                 total_shards,
                 page_size,
+                backing_base,
             )),
             Phase::Read => Box::pin(read_worker(
                 worker,
@@ -853,6 +1252,7 @@ async fn write_worker(
     my_shard: usize,
     total_shards: usize,
     page_size: usize,
+    backing_base: *mut u8,
 ) {
     let mut consecutive_errors: u64 = 0;
     loop {
@@ -867,7 +1267,7 @@ async fn write_worker(
         {
             return;
         }
-        let (worker_id, page_ref) = {
+        let (worker_id, page_ref, page_idx) = {
             let s = state.lock().unwrap();
             (
                 s.worker_id,
@@ -876,6 +1276,7 @@ async fn write_worker(
                     offset: 0,
                     len: page_size as u32,
                 },
+                s.page_idx,
             )
         };
         // Skip keys that route to a different shard so each shard's
@@ -884,6 +1285,7 @@ async fn write_worker(
         // threads-per-device), matching the layout `LocalStorage`
         // would use if every shard's engine lived under one router.
         let key;
+        let op_seq;
         loop {
             let seq = {
                 let mut s = state.lock().unwrap();
@@ -894,10 +1296,28 @@ async fn write_worker(
             let candidate = make_key(seed, worker_id as u64, seq);
             if route_shard(&candidate, total_shards) == my_shard {
                 key = candidate;
+                op_seq = seq;
                 break;
             }
         }
 
+        // Stamp the per-op tag into the page so the engine sees
+        // content-distinct bytes for every op. Without this, a
+        // future content-addressed dedup layer (or even just
+        // identical-checksum coalescing) could collapse many
+        // logically distinct ops to one physical write and the
+        // throughput number would no longer reflect the work the
+        // bench thinks it did.
+        // SAFETY: `backing_base + page_idx * page_size` is the
+        // start of this worker's PAGE_BYTES-sized slot, exclusive
+        // to this worker for the lifetime of the run. The slice
+        // is not aliased because each worker owns a distinct
+        // `page_idx` (assigned at construction in run_phase).
+        unsafe {
+            let p = backing_base.add(page_idx as usize * page_size);
+            let s = std::slice::from_raw_parts_mut(p, page_size);
+            stamp_page(s, seed, worker_id as u64, op_seq, &key);
+        }
 
         let t0 = Instant::now();
         let res = local.write_page(key, 0, page_ref).await;
@@ -1099,9 +1519,12 @@ fn print_phase(name: &str, args: &BlockArgs, total_shards: usize, reports: &[Sha
         args.threads_per_device, total_shards,
     );
     println!("  workers:        {}", args.workers);
-    println!("  page size:      {}", human_bytes(HUGEPAGE_2MB as u64));
+    println!("  page size:      {}", human_bytes(PAGE_BYTES as u64));
     println!("  duration:       {:.2}s", elapsed_secs);
-    println!("  admission:      bypassed");
+    println!(
+        "  admission:      {}",
+        if args.bypass_admission { "bypassed" } else { "enabled" },
+    );
     println!();
     println!("  ops:            {}", total_ops);
     println!("  bytes:          {}", human_bytes(total_bytes));

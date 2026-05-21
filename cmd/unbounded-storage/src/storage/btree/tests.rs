@@ -71,7 +71,7 @@ fn open_btree(
     alloc: Arc<Allocator>,
 ) -> impl Future<Output = Result<BTreeIndex<MockDevice>, crate::storage::types::Error>> {
     let scratch = ScratchPool::new(&*dev, 4096, 8).expect("scratch pool");
-    BTreeIndex::open(dev, alloc, scratch)
+    BTreeIndex::open(dev, alloc, scratch, false)
 }
 
 #[test]
