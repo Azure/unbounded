@@ -38,11 +38,16 @@ from the awss3 origin).
 - Azurite (Microsoft's official Azure Storage emulator) deployed on
   demand when `ORIGIN_DRIVER=azureblob`. Runs from
   `mcr.microsoft.com/azure-storage/azurite`.
-- Buckets/containers pre-created by init Jobs:
+- Buckets/containers self-healing on every emulator start:
   - `orca-cache` (S3) - cachestore (versioning unset; Orca's
-    versioningGate rejects Enabled and Suspended).
+    versioningGate rejects Enabled and Suspended). Created by the
+    `localstack-init-buckets` ConfigMap mounted into LocalStack's
+    `/etc/localstack/init/ready.d/`.
   - `orca-origin` (S3) - origin (used when `ORIGIN_DRIVER=awss3`).
+    Created by the same LocalStack init hook.
   - `orca-test` (Azure container) - origin (used when `ORIGIN_DRIVER=azureblob`).
+    Created by the `container-ensurer` sidecar that runs alongside
+    Azurite in the same Pod and loops every 30 seconds.
 - Three Orca replicas. mTLS between peers and bearer auth for
   clients are both disabled in dev (`cluster.internal_tls.enabled=false`,
   `server.auth.enabled=false`).
@@ -84,12 +89,17 @@ This runs, in order:
 2. `image` - build `ghcr.io/azure/orca:dev` via `make image-orca-local`.
 3. `kind-load` - save the image to a tar and `kind load image-archive`.
 4. `render` - render `deploy/orca/*.yaml.tmpl` with values from `.env`.
-5. `render-dev` - render `deploy/orca/dev/*.yaml.tmpl` (LocalStack, Azurite, init Jobs).
-6. `deploy-localstack` - apply the namespace, LocalStack, wait until
-   ready, run the bucket-init Job (creates `orca-cache` + `orca-origin`),
-   wait for completion.
+5. `render-dev` - render `deploy/orca/dev/*.yaml.tmpl` (LocalStack
+   Deployment + init-hook ConfigMap, Azurite Deployment with its
+   container-ensurer sidecar).
+6. `deploy-localstack` - apply the namespace and LocalStack, wait
+   until Ready, then poll until LocalStack's init-hook has created
+   `orca-cache` and `orca-origin` (the hook fires on every container
+   start so this is also the clean recovery path; see "Recovery"
+   below).
 7. `deploy-azurite-maybe` - if `ORIGIN_DRIVER=azureblob`, deploy
-   Azurite + run its container-init Job. Skipped for `awss3`.
+   Azurite and poll until its in-pod `container-ensurer` sidecar has
+   created `orca-test`. Skipped for `awss3`.
 8. `deploy-credentials` - create the `orca-credentials` Secret.
 9. `deploy-orca` - apply RBAC, ConfigMap, Services, Deployment.
 10. `wait-ready` - block until all 3 replicas are Ready.
@@ -99,10 +109,8 @@ When this finishes you should see something like:
 ```
 $ make -C hack/orca status
 NAME                                READY   STATUS    RESTARTS   AGE
-azurite-...                         1/1     Running   0          1m   (only in azureblob mode)
+azurite-...                         2/2     Running   0          1m   (only in azureblob mode; 2/2 includes container-ensurer sidecar)
 localstack-...                      1/1     Running   0          1m
-orca-azurite-container-init-...     0/1     Completed 0          1m   (only in azureblob mode)
-orca-buckets-init-...               0/1     Completed 0          1m
 orca-7c5d4f9b8c-...                 1/1     Running   0          50s
 orca-7c5d4f9b8c-...                 1/1     Running   0          50s
 orca-7c5d4f9b8c-...                 1/1     Running   0          50s
@@ -230,6 +238,47 @@ To clear the cachestore bucket between manual experiments, exec into
 the LocalStack pod or run a one-off `aws s3 rm s3://orca-cache --recursive`
 job; the prior canned script was retired alongside the seeding helpers.
 
+## Recovery
+
+LocalStack and Azurite run with ephemeral storage (`emptyDir`,
+`PERSISTENCE=0`). When their pods restart for any reason (OOM,
+eviction, manual delete, kind node restart) they come back with
+empty state. Orca's cachestore startup probe will then fail with
+`NoSuchBucket` on the next restart, and operators using `azureblob`
+mode will hit a similar "container does not exist" condition.
+
+The harness handles this transparently:
+
+- **LocalStack** runs a ConfigMap-mounted init hook under
+  `/etc/localstack/init/ready.d/init-buckets.sh`. LocalStack rescans
+  that directory on every container start; the script idempotently
+  creates `orca-cache` and `orca-origin` and verifies cachestore
+  versioning is unset.
+- **Azurite** runs a `container-ensurer` sidecar in the same Pod.
+  The sidecar loops every 30 seconds calling
+  `az storage container create` idempotently. Within ~30 seconds of
+  Azurite coming back up, the container is recreated.
+
+If orca pods are still crash-looping after an emulator restart -
+e.g. because orca raced the init hook on the very first start - the
+clean recovery target is:
+
+```bash
+make -C hack/orca deploy-localstack       # awss3 / cachestore
+make -C hack/orca deploy-azurite          # azureblob mode only
+```
+
+Both targets are idempotent: re-applying the Deployment is a no-op,
+and the readiness poll confirms the bucket / container exists
+before returning. A full `make orca-down && make orca-up` works too
+but is heavier.
+
+> Note: `deploy-azurite` only succeeds if the Azurite Deployment is
+> already running (i.e. you initially brought the cluster up with
+> `ORIGIN_DRIVER=azureblob`). If you switched modes after bringing
+> the cluster up, run `make -C hack/orca up` (which calls
+> `deploy-azurite-maybe`) to deploy Azurite first.
+
 ## Logging
 
 The Orca pods default to info-level structured JSON logging. Set
@@ -268,17 +317,25 @@ The harness's manifest already passes the right flag; if you've
 overridden `AzuriteImage` to a custom build, ensure it accepts the
 flag.
 
-### `orca-buckets-init` Job fails
+### Orca pods CrashLoopBackOff with "NoSuchBucket: orca-cache"
 
-The Job waits up to 120 seconds for LocalStack readiness, then creates
-both `orca-cache` and `orca-origin` and verifies cachestore versioning
-is unset. Failures are typically LocalStack startup taking longer than
-that on a slow disk; rerun the Job:
+LocalStack pod restarted (OOM, eviction, etc.) and its in-memory
+state was wiped. The init-hook ConfigMap re-creates the buckets on
+every LocalStack start, so the clean recovery is to bounce
+LocalStack so the hook re-fires, OR re-run the deploy-localstack
+target which also waits until the buckets exist:
 
 ```bash
-kubectl --context kind-orca-dev -n unbounded-kube delete job orca-buckets-init --ignore-not-found
 make -C hack/orca deploy-localstack
+# or, equivalently:
+kubectl --context kind-orca-dev -n unbounded-kube rollout restart deploy/localstack
+kubectl --context kind-orca-dev -n unbounded-kube rollout restart deploy/orca
 ```
+
+If the buckets still aren't appearing, inspect the LocalStack
+container logs for `init:` lines emitted by the init script - they
+will surface any malformed bucket name or unexpected
+get-bucket-versioning state.
 
 ### Orca pods CrashLoopBackOff with "config invalid: ..."
 

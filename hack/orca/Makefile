@@ -58,11 +58,11 @@ help: ## Show this help
 	@echo ""
 	@echo "Pieces (typically called by 'up'):"
 	@echo "  render              Render orca manifests"
-	@echo "  render-dev          Render dev-only manifests (LocalStack, init job)"
+	@echo "  render-dev          Render dev-only manifests (LocalStack, Azurite)"
 	@echo "  image               Build Orca container image (image-orca-local)"
 	@echo "  kind-create         Create the Kind cluster (idempotent)"
 	@echo "  kind-load           Load the Orca image into Kind nodes"
-	@echo "  deploy-localstack   Apply LocalStack Deployment + bucket init Job"
+	@echo "  deploy-localstack   Apply LocalStack Deployment (init-hook ConfigMap creates buckets)"
 	@echo "  deploy-credentials  Create the orca-credentials Secret from .env"
 	@echo "  deploy-orca         Apply rendered Orca manifests"
 	@echo "  wait-ready          Block until 3/3 orca pods are Ready"
@@ -204,19 +204,42 @@ kind-load:
 
 # -- Deploy steps -------------------------------------------------------------
 
+# deploy-localstack applies the LocalStack Deployment and its
+# init-buckets ConfigMap, then waits for LocalStack to be Ready and
+# for its init-hook to have created the cachestore bucket. The hook
+# fires on every LocalStack container start (including restarts), so
+# this target is fully idempotent and is the clean recovery path if
+# orca pods are crash-looping with NoSuchBucket.
 deploy-localstack: render-dev render
 	kubectl --context kind-$(CLUSTER_NAME) apply -f "$(ORCA_RENDERED)/01-namespace.yaml"
 	kubectl --context kind-$(CLUSTER_NAME) apply -f "$(DEV_RENDERED)/01-localstack.yaml"
 	kubectl --context kind-$(CLUSTER_NAME) -n $(NAMESPACE) rollout status deployment/localstack --timeout=120s
-	kubectl --context kind-$(CLUSTER_NAME) apply -f "$(DEV_RENDERED)/02-init-job.yaml"
-	kubectl --context kind-$(CLUSTER_NAME) -n $(NAMESPACE) wait --for=condition=complete job/orca-buckets-init --timeout=120s
+	@echo "Waiting for LocalStack init-hook to create cachestore bucket ..."
+	@for i in $$(seq 1 30); do \
+		if kubectl --context kind-$(CLUSTER_NAME) -n $(NAMESPACE) exec deploy/localstack -- \
+				awslocal s3api head-bucket --bucket "$${CACHESTORE_BUCKET:-orca-cache}" >/dev/null 2>&1; then \
+			echo "LocalStack buckets ready."; exit 0; \
+		fi; sleep 2; \
+	done; \
+	echo "ERROR: LocalStack init hook did not create buckets within 60s" >&2; exit 1
 
+# deploy-azurite applies the Azurite Deployment which carries an
+# in-pod 'container-ensurer' sidecar that idempotently maintains the
+# Azure container. As with deploy-localstack this is fully
+# idempotent and the clean recovery path if Azurite has lost its
+# in-memory container state.
 deploy-azurite: render-dev
 	kubectl --context kind-$(CLUSTER_NAME) apply -f "$(ORCA_RENDERED)/01-namespace.yaml"
 	kubectl --context kind-$(CLUSTER_NAME) apply -f "$(DEV_RENDERED)/03-azurite.yaml"
 	kubectl --context kind-$(CLUSTER_NAME) -n $(NAMESPACE) rollout status deployment/azurite --timeout=180s
-	kubectl --context kind-$(CLUSTER_NAME) apply -f "$(DEV_RENDERED)/04-azurite-init.yaml"
-	kubectl --context kind-$(CLUSTER_NAME) -n $(NAMESPACE) wait --for=condition=complete job/orca-azurite-container-init --timeout=180s
+	@echo "Waiting for Azurite container-ensurer sidecar to create the container ..."
+	@for i in $$(seq 1 30); do \
+		if kubectl --context kind-$(CLUSTER_NAME) -n $(NAMESPACE) exec deploy/azurite -c container-ensurer -- \
+				az storage container exists --name "$${AZURE_CONTAINER:-orca-test}" --query exists -o tsv 2>/dev/null | grep -qi true; then \
+			echo "Azurite container ready."; exit 0; \
+		fi; sleep 2; \
+	done; \
+	echo "ERROR: Azurite container not created within 60s" >&2; exit 1
 
 deploy-credentials:
 	CLUSTER_NAME="$(CLUSTER_NAME)" \
