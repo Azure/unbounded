@@ -52,7 +52,7 @@ cloud sees exactly one fetch.
 
 | Area | Decision |
 |---|---|
-| Client API | S3-compatible HTTP. `GET` + `HEAD` + a minimal `ListObjectsV2` pass-through. Range reads work. |
+| Client API | S3-compatible HTTP. `GET` + `HEAD` only. Range reads work. `ListObjectsV2` is not supported. |
 | Auth surface | Bearer / mTLS hooks exist on the edge and the internal listener, but nothing checks them yet. Dev runs with auth off. See s4 and [Deferred / future work](#13-deferred--future-work). |
 | Origins | AWS S3 and Azure Blob, behind a pluggable `Origin` interface. |
 | Azure constraint | Block Blobs only. Page and Append blobs are rejected at `Head` with `UnsupportedBlobTypeError`. |
@@ -195,7 +195,7 @@ graph TB
         S3[("AWS S3")]
         Azure[("Azure Blob<br/>Block Blobs only")]
     end
-    Clients -- "S3 GET / HEAD / LIST<br/>+ Range" --> Service
+    Clients -- "S3 GET / HEAD<br/>+ Range" --> Service
     Service --> R1
     Service --> R2
     Service --> R3
@@ -489,14 +489,11 @@ are touched.
 
 ### 6.2 LIST request flow
 
-`GET /{bucket}/?list-type=2&prefix=...` is a thin pass-through to
-`Origin.List`. The handler pulls `prefix`, `continuation-token`,
-and `max-keys` from the query string, calls the origin, and
-turns the result into a minimal `ListBucketResult` XML body.
-
-This is deliberately narrow. A per-replica LIST cache tuned for
-FUSE `ls` workloads is in scope as future work; see
-[Deferred / future work](#13-deferred--future-work).
+`ListObjectsV2` is not supported. `GET /{bucket}/` returns 501
+Not Implemented. A per-replica LIST cache and cluster-wide LIST
+coordinator are tracked in
+[Deferred / future work](#13-deferred--future-work) for the day
+listing becomes a requirement.
 
 ### 6.3 HTTP error-code mapping
 
@@ -1205,7 +1202,8 @@ sustained `ErrAuth`, and gate any future active-eviction loop's
 
 ### LIST cache and cluster-wide LIST coordinator
 
-The LIST handler is a pass-through today. A per-replica LIST
+`ListObjectsV2` is not implemented today; `GET /{bucket}/` returns
+501. When LIST support becomes a requirement, a per-replica LIST
 cache keyed on
 `(origin_id, bucket, prefix, continuation_token, start_after, delimiter, max_keys)`
 would absorb FUSE `ls` workloads (`list_cache.ttl=60s` default,

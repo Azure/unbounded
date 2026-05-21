@@ -640,9 +640,6 @@ MACHINA_MANIFEST_TEMPLATES_DIR := deploy/machina
 MACHINA_MANIFEST_RENDERED_DIR  := deploy/machina/rendered
 MACHINE_OPS_NAMESPACE ?= unbounded-kube
 MACHINE_OPS_API_SERVER_ENDPOINT ?=
-MACHINE_OPS_OCI_CONFIG_SECRET ?=
-MACHINE_OPS_OCI_CONFIG_PROFILE ?= DEFAULT
-MACHINE_OPS_OCI_AUTH ?= api_key
 MACHINE_OPS_MANIFEST_TEMPLATES_DIR := deploy/machine-ops
 MACHINE_OPS_MANIFEST_RENDERED_DIR  := deploy/machine-ops/rendered
 
@@ -666,10 +663,7 @@ machine-ops-manifests: ## Render machine-ops-controller manifests into deploy/ma
 		--output-dir $(MACHINE_OPS_MANIFEST_RENDERED_DIR) \
 		--set Namespace=$(MACHINE_OPS_NAMESPACE) \
 		--set ControllerImage=$(MACHINE_OPS_CONTROLLER_IMAGE) \
-		--set APIServerEndpoint=$(MACHINE_OPS_API_SERVER_ENDPOINT) \
-		--set OCIConfigSecretName=$(MACHINE_OPS_OCI_CONFIG_SECRET) \
-		--set OCIConfigProfile=$(MACHINE_OPS_OCI_CONFIG_PROFILE) \
-		--set OCIAuth=$(MACHINE_OPS_OCI_AUTH)
+		--set APIServerEndpoint=$(MACHINE_OPS_API_SERVER_ENDPOINT)
 	@echo "Rendered machine-ops manifests into $(MACHINE_OPS_MANIFEST_RENDERED_DIR) (image: $(MACHINE_OPS_CONTROLLER_IMAGE))"
 
 machina-run: machina ## Replace the in-cluster machina with a locally built binary
@@ -742,7 +736,7 @@ orca-inttest: ## Run orca integration tests (LocalStack + Azurite via testcontai
 	$(GOTEST) -tags=integrationtest -race -timeout 15m ./internal/orca/inttest/...
 else
 orca-inttest: ## Run orca integration tests (LocalStack + Azurite via testcontainers; requires Docker)
-	$(GOTEST) -tags=integrationtest -timeout 15m ./internal/orca/inttest/...
+	$(GOTEST) -tags=integrationtest -race -count=1 -timeout 15m ./internal/orca/inttest/...
 endif
 
 image-net-controller-local: net-frontend resources/cni-plugins-linux-$(HOST_GOARCH)-$(CNI_PLUGINS_VERSION).tgz ## Build the unbounded-net-controller image locally (single-arch)

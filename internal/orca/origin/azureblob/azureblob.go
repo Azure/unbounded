@@ -20,7 +20,6 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
-	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 
 	"github.com/Azure/unbounded/internal/orca/config"
 	"github.com/Azure/unbounded/internal/orca/origin"
@@ -34,7 +33,7 @@ type Adapter struct {
 }
 
 // New builds an Adapter from config. The log receives debug-level
-// emissions for every Head / GetRange / List call and the error
+// emissions for every Head / GetRange call and the error
 // mapping decision (not-found / auth / precondition / unsupported
 // blob type) on failure paths. Passing nil falls back to
 // slog.Default().
@@ -222,89 +221,6 @@ func (a *Adapter) GetRange(ctx context.Context, bucket, key, etag string, off, n
 	return resp.Body, nil
 }
 
-// List enumerates blobs in the container matching prefix.
-func (a *Adapter) List(ctx context.Context, bucket, prefix, marker string, maxResults int) (origin.ListResult, error) {
-	cName := bucket
-	if cName == "" {
-		cName = a.cfg.Container
-	}
-
-	a.log.LogAttrs(ctx, slog.LevelDebug, "azureblob_list_request",
-		slog.String("container", cName),
-		slog.String("prefix", prefix),
-		slog.String("marker", marker),
-		slog.Int("max", maxResults),
-	)
-
-	cc := a.client.ServiceClient().NewContainerClient(cName)
-	max := clampMaxResults(maxResults)
-	pager := cc.NewListBlobsFlatPager(&container.ListBlobsFlatOptions{
-		Prefix:     &prefix,
-		MaxResults: &max,
-		Marker:     stringOrNil(marker),
-	})
-	out := origin.ListResult{}
-
-	if pager.More() {
-		page, err := pager.NextPage(ctx)
-		if err != nil {
-			if isAuth(err) {
-				a.log.LogAttrs(ctx, slog.LevelDebug, "azureblob_list_auth",
-					slog.String("container", cName),
-				)
-
-				return origin.ListResult{}, origin.ErrAuth
-			}
-
-			return origin.ListResult{}, fmt.Errorf("azureblob list: %w", err)
-		}
-
-		for _, item := range page.Segment.BlobItems {
-			entry := origin.ObjectEntry{}
-			if item.Name != nil {
-				entry.Key = *item.Name
-			}
-
-			if item.Properties != nil {
-				if item.Properties.ContentLength != nil {
-					entry.Size = *item.Properties.ContentLength
-				}
-
-				if item.Properties.ETag != nil {
-					entry.ETag = unwrapAzcoreETag(item.Properties.ETag)
-				}
-
-				if item.Properties.BlobType != nil {
-					entry.BlobType = string(*item.Properties.BlobType)
-				}
-			}
-
-			out.Entries = append(out.Entries, entry)
-		}
-
-		if page.NextMarker != nil {
-			out.NextMarker = *page.NextMarker
-			out.IsTruncated = *page.NextMarker != ""
-		}
-	}
-
-	a.log.LogAttrs(ctx, slog.LevelDebug, "azureblob_list_response",
-		slog.String("container", cName),
-		slog.Int("count", len(out.Entries)),
-		slog.Bool("truncated", out.IsTruncated),
-	)
-
-	return out, nil
-}
-
-func stringOrNil(s string) *string {
-	if s == "" {
-		return nil
-	}
-
-	return &s
-}
-
 func isNotFound(err error) bool {
 	return bloberror.HasCode(err, bloberror.BlobNotFound) ||
 		bloberror.HasCode(err, bloberror.ContainerNotFound) ||
@@ -366,36 +282,4 @@ func unwrapAzcoreETag(e *azcore.ETag) string {
 	}
 
 	return strings.Trim(string(*e), "\"")
-}
-
-// azureMaxResultsCap is the documented server-side ceiling for
-// ListBlobs MaxResults. Azure Blob Storage returns at most 5000
-// results per call; values above that have no effect at the
-// backend, so clamping at the wire boundary trades nothing.
-const azureMaxResultsCap = 5000
-
-// clampMaxResults converts a host-int maxResults to a
-// guaranteed-in-range int32 suitable for ListBlobsFlatOptions.MaxResults.
-//
-// The lower clamp (negative -> 0) and upper clamp (> azureMaxResultsCap
-// -> azureMaxResultsCap) jointly close the silent-overflow window
-// the int32 cast would otherwise expose: an untrusted caller passing
-// maxResults above int32 max would otherwise wrap around to a
-// non-deterministic (often negative) MaxResults value, which the
-// Azure SDK or backend may handle in surprising ways. CodeQL flags
-// the un-bounded conversion at the call site; this helper makes the
-// bounds explicit and locally verifiable.
-//
-// maxResults == 0 is preserved as 0 (caller intent: backend
-// default); negative inputs collapse to 0 with the same effect.
-func clampMaxResults(maxResults int) int32 {
-	if maxResults < 0 {
-		return 0
-	}
-
-	if maxResults > azureMaxResultsCap {
-		return int32(azureMaxResultsCap)
-	}
-
-	return int32(maxResults) // safe: 0 <= maxResults <= azureMaxResultsCap (5000)
 }
