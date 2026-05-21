@@ -983,7 +983,7 @@ def _launch_vm(ssh_pub_key: str) -> None:
         die(f"SSH did not become available after {max_attempts} attempts. Check log: {qemu_log}")
 
     print(flush=True)
-    log(f"VM is ready! SSH: ssh -i {SSH_KEY} ubuntu@{VM_IP}")
+    log(f"VM is ready at {VM_IP}")
 
 
 # ---------------------------------------------------------------------------
@@ -1274,7 +1274,7 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
         },
     })
     kubectl(["apply", "-f", "-"], input=token_manifest.encode())
-    log(f"Bootstrap token created: {token_id}.xxxxxxxxxxxxxxxx")
+    log("Bootstrap token created")
 
     # Generate bootstrap script via kubectl-unbounded.
     # manual-bootstrap auto-detects the API server, CA cert, Kubernetes
@@ -2196,7 +2196,7 @@ def validate_machine_cr_created(node_config: NodeConfig) -> None:
     if token_ref != expected_ref:
         die(f"bootstrapTokenRef mismatch: got '{token_ref}', expected '{expected_ref}'")
 
-    log(f"bootstrapTokenRef is correct: {token_ref}")
+    log("bootstrapTokenRef is correct")
 
     expected_labels = expected_node_labels(node_config)
     actual_labels = k8s_spec.get("nodeLabels") or {}
