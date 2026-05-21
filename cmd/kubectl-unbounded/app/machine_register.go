@@ -208,6 +208,9 @@ func (h *machineRegisterHandler) executeAfterValidation(ctx context.Context) err
 		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name: h.name,
+			Labels: map[string]string{
+				v1alpha3.MachineSiteLabelKey: h.siteName,
+			},
 		},
 		Spec: v1alpha3.MachineSpec{
 			SSH: &v1alpha3.SSHSpec{

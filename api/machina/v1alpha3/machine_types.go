@@ -11,6 +11,11 @@ func init() {
 	SchemeBuilder.Register(&Machine{}, &MachineList{})
 }
 
+const (
+	// MachineSiteLabelKey identifies the site a Machine belongs to.
+	MachineSiteLabelKey = "unbounded-cloud.io/site"
+)
+
 // +kubebuilder:object:root=true
 // +kubebuilder:resource:scope=Cluster,shortName=mach
 // +kubebuilder:subresource:status
@@ -438,7 +443,21 @@ type OperationsSpec struct {
 // LocalObjectReference contains enough information to locate the referenced resource.
 type LocalObjectReference struct {
 	// Name of the referenced resource.
+	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`
+}
+
+// NamespacedSecretReference contains enough information to locate a Secret.
+type NamespacedSecretReference struct {
+	// Name of the secret.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+
+	// Namespace of the secret.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Namespace string `json:"namespace"`
 }
 
 // SecretKeySelector selects a key from a Secret.
