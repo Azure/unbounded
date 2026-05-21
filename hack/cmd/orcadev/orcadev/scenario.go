@@ -103,6 +103,16 @@ func runScenario(ctx context.Context, g *globalFlags, o *scenarioOpts, name stri
 		return fmt.Errorf("--output must be 'text' or 'json'")
 	}
 
+	// Auto-start a kubectl port-forward to svc/orca if needed.
+	// Lifted to the parent so every scenario's edgeClient sees
+	// the same forwarded socket without re-probing.
+	cleanup, err := ensureEdgeReachable(ctx, g)
+	if err != nil {
+		return err
+	}
+
+	defer cleanup()
+
 	startedAt := time.Now()
 
 	res := &scenarioResult{
@@ -117,7 +127,6 @@ func runScenario(ctx context.Context, g *globalFlags, o *scenarioOpts, name stri
 		Steps:         []scenarioStep{},
 	}
 
-	var err error
 	switch name {
 	case "cold-warm":
 		err = runScenarioColdWarm(ctx, g, o, res)

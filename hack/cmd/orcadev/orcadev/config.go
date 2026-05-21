@@ -60,6 +60,18 @@ type globalFlags struct {
 
 	// Misc.
 	ensureContainer bool
+
+	// autoPortForward, when true (the default), causes any
+	// subcommand that talks to the orca edge listener to probe
+	// --orca-url; if unreachable AND the URL is the dev default
+	// (localhost:8443), orcadev spawns a managed kubectl
+	// port-forward to svc/orca for the duration of the run. Set
+	// false to suppress the auto-forward (e.g. in CI environments
+	// where kubectl is not on PATH, or against a real ingress).
+	autoPortForward bool
+	// kubeContext is the kubectl context used by autoPortForward.
+	// Default matches the dev harness's kind cluster name.
+	kubeContext string
 }
 
 // defaultGlobalFlags returns the dev-harness-tuned defaults. These
@@ -88,6 +100,8 @@ func defaultGlobalFlags() *globalFlags {
 		cachestoreAccessKey:    "test",
 		cachestoreSecretKey:    "test",
 		cachestoreUsePathStyle: true,
+		autoPortForward:        true,
+		kubeContext:            "kind-orca-dev",
 	}
 }
 

@@ -81,7 +81,7 @@ help: ## Show this help
 	@echo "  data-list     [ARGS='--prefix foo']            List origin objects"
 	@echo "  data-delete   [PREFIX=foo] [ARGS='--yes']      Delete origin objects"
 	@echo ""
-	@echo "Roundtrip / cache / bench (orcadev wrappers; requires port-forward):"
+	@echo "Roundtrip / cache / bench (orcadev wrappers; edge port-forward is auto-managed):"
 	@echo "  roundtrip FILE=/path     Upload, GET via orca, verify SHA-256"
 	@echo "  cache-list               Enumerate cache chunks"
 	@echo "  cache-inspect BUCKET=b KEY=k   Show chunk presence for an object"
@@ -303,9 +303,12 @@ dev-azure: ## Upload a file to real Azure (requires AZURE_STORAGE_* in .env; pas
 # These targets invoke hack/cmd/orcadev. The tool talks to the
 # in-cluster Azurite (azureblob origin) on NodePort 30100, the
 # LocalStack S3 (awss3 origin + cachestore) on NodePort 30200, and
-# the orca edge listener at http://localhost:8443 (requires
-# `make -C hack/orca port-forward` running in another shell for
-# anything that hits orca).
+# the orca edge listener at http://localhost:8443. For the edge
+# listener orcadev auto-manages a kubectl port-forward to svc/orca
+# (probes localhost:8443 first; spawns + cleans up only if the port
+# is not already in use). Pass --auto-port-forward=false (via ARGS)
+# to disable, or start `make -C hack/orca port-forward` in another
+# shell for a long-lived forward.
 #
 # Pass extra flags via ARGS, e.g.:
 #

@@ -105,6 +105,15 @@ func runRoundtrip(ctx context.Context, g *globalFlags, o *roundtripOpts) error {
 		}
 	}
 
+	// Auto-start a kubectl port-forward to svc/orca if needed.
+	// No-op if an operator-managed port-forward is already up.
+	cleanup, err := ensureEdgeReachable(ctx, g)
+	if err != nil {
+		return err
+	}
+
+	defer cleanup()
+
 	edge := newEdgeClient(g.orcaURL, g.timeout)
 
 	// Determine the object name + the source-hash to compare against.

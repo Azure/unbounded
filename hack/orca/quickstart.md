@@ -183,8 +183,14 @@ make -C hack/orca data-delete ARGS='--yes'
 The previous steps stand up the cluster and let you drive it with
 `curl` by hand. This step uses the `orcadev` tool to do the same
 work in one command: SHA-256-verified roundtrips, parallel
-throughput benchmarks, and canned end-to-end scenarios. Keep the
-`make -C hack/orca port-forward` from Step 4 running.
+throughput benchmarks, and canned end-to-end scenarios.
+
+> The edge port-forward to `svc/orca:8443` is auto-managed: orcadev
+> probes `localhost:8443` and spawns a short-lived
+> `kubectl port-forward` if nothing is bound. If you already have
+> `make -C hack/orca port-forward` running from Step 4 (or any
+> other binder on that port), orcadev detects it and reuses it. To
+> disable the auto-forward, pass `ARGS='--auto-port-forward=false'`.
 
 ### 8a - Roundtrip (correctness check)
 

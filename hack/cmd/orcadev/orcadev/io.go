@@ -29,3 +29,6 @@ func fprintln(w io.Writer, args ...any) {
 // printOut writes to stdout via fprintf; convenience shorthand for
 // the most common case.
 func printOut(format string, args ...any) { fprintf(os.Stdout, format, args...) }
+
+// printErr writes to stderr via fprintf; convenience shorthand.
+func printErr(format string, args ...any) { fprintf(os.Stderr, format, args...) }

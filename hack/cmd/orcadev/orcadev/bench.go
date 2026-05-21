@@ -177,6 +177,17 @@ func runBench(ctx context.Context, g *globalFlags, o *benchOpts) error {
 		return err
 	}
 
+	// Spin up an auto-managed kubectl port-forward to svc/orca if
+	// --orca-url is the dev default and the port is unreachable.
+	// Cleanup runs on subcommand return; if the operator already
+	// has their own port-forward this is a no-op.
+	cleanup, err := ensureEdgeReachable(ctx, g)
+	if err != nil {
+		return err
+	}
+
+	defer cleanup()
+
 	edge := newEdgeClient(g.orcaURL, g.timeout)
 
 	// Resolve object metadata up front; we need size to plan ranges.

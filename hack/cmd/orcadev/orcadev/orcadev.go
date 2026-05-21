@@ -113,6 +113,10 @@ func Run() {
 		"Per-operation timeout for blocking calls")
 	root.PersistentFlags().StringVar(&g.logLevel, "log-level", g.logLevel,
 		"Log level: debug, info, warn, error")
+	root.PersistentFlags().BoolVar(&g.autoPortForward, "auto-port-forward", g.autoPortForward,
+		"Auto-start a kubectl port-forward to svc/orca if --orca-url=localhost:8443 is unreachable")
+	root.PersistentFlags().StringVar(&g.kubeContext, "kube-context", g.kubeContext,
+		"kubectl context used by --auto-port-forward")
 
 	root.AddCommand(newUploadCmd(g))
 	root.AddCommand(newListCmd(g))
