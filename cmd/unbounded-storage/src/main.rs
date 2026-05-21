@@ -16,17 +16,9 @@ use unbounded_storage::bufferpool::{
 };
 use unbounded_storage::mercury::{Class, MercuryTransport, PeerEntry, StaticPeer, TransportConfig};
 use unbounded_storage::runtime::{PinnedRuntime, Threading, WorkerIdx, WorkerSpec};
-use unbounded_storage::topology::{
-    NicShard, ProgressSlot, discover_nic_shards, fallback_shard, flatten_shards,
-};
+use unbounded_storage::topology::{self, Host, Plan, Role, Worker};
 
 use crate::backing::{BackingKind, BackingRequest, HUGEPAGE_2MB, allocate};
-
-/// Threads per NIC in the TCP fallback case. RDMA shards size
-/// themselves via the topology discovery path; the fallback is a
-/// single best-effort progress thread because there is no NIC pool
-/// to spread across.
-const FALLBACK_THREADS: usize = 1;
 
 const PROGRESS_POLL_MS: u32 = 100;
 const MAX_INFLIGHT: usize = 1024;
@@ -77,15 +69,31 @@ fn main() -> ExitCode {
         }
     };
 
-    let shards = enumerate_shards();
-    let slots = flatten_shards(&shards);
-    if slots.is_empty() {
-        eprintln!("no progress slots after topology flatten; exiting");
+    let host = Host::discover();
+    let plan = Plan::for_host(&host, &topology::PlanConfig::default());
+
+    let counts = RoleCounts::from_plan(&plan);
+    eprintln!(
+        "topology plan: workers={} progress={} handlers={} nvme={} numa_pools={:?}",
+        plan.workers.len(),
+        counts.progress,
+        counts.handlers,
+        counts.nvme,
+        plan.numa_pools,
+    );
+
+    // Only RDMA progress workers are spawned in this phase; handler
+    // and NVMe placements are computed and logged for observability
+    // but not yet wired up.
+    let progress: Vec<Worker> = plan.rdma_progress().cloned().collect();
+    if progress.is_empty() {
+        eprintln!("topology plan produced no RDMA progress workers; exiting");
         return ExitCode::FAILURE;
     }
-    let specs: Vec<WorkerSpec> = slots
+
+    let specs: Vec<WorkerSpec> = progress
         .iter()
-        .map(|s| WorkerSpec::new(s.cpu, s.numa))
+        .map(|w| WorkerSpec::new(w.cpu, w.numa))
         .collect();
     let runtime = PinnedRuntime::new(specs);
     install_signal_handler();
@@ -94,11 +102,14 @@ fn main() -> ExitCode {
     // `ShardDescriptor` on this channel. The main thread aggregates
     // descriptors into a `PoolGroup` once every shard has reported.
     let (ready_tx, ready_rx) = mpsc::channel::<ShardReady>();
-    let mut joins = Vec::with_capacity(slots.len());
-    for (i, slot) in slots.iter().enumerate() {
-        let worker = WorkerIdx(u16::try_from(i).expect("worker index fits in u16"));
-        let parent = &shards[slot.shard];
-        let dev_name = parent.dev_name.clone();
+    let bytes_per_shard = cli.bytes_per_shard / progress.len();
+    let mut joins = Vec::with_capacity(progress.len());
+    for (i, worker) in progress.iter().enumerate() {
+        let widx = WorkerIdx(u16::try_from(i).expect("worker index fits in u16"));
+        let dev_name = match worker.role {
+            Role::RdmaProgress { hca } if hca != usize::MAX => Some(host.hcas[hca].dev_name.clone()),
+            _ => None,
+        };
         let na_info = match &dev_name {
             // Placeholder until the per-NIC config-parsing follow-up
             // wires through provider-specific `domain=`, listen port,
@@ -106,22 +117,21 @@ fn main() -> ExitCode {
             Some(_) => "ofi+verbs;ofi_rxm://".to_string(),
             None => "ofi+tcp://0.0.0.0:0".to_string(),
         };
-        let slot = *slot;
+        let worker = worker.clone();
         let runtime = runtime.clone();
         let tx = ready_tx.clone();
         let backing_kind = cli.backing_kind;
-        let bytes_per_shard = cli.bytes_per_shard;
         joins.push(
             thread::Builder::new()
                 .name(format!("ub-storage-shard-{i}"))
                 .spawn(move || {
                     let rt = runtime.clone();
                     rt.run_worker(
-                        worker,
+                        widx,
                         Box::new(move || {
                             run_shard(
+                                widx,
                                 worker,
-                                slot,
                                 dev_name,
                                 na_info,
                                 runtime,
@@ -198,8 +208,8 @@ fn main() -> ExitCode {
 /// `Class` (and its progress thread) plus the `Pool` are dropped
 /// together.
 fn run_shard(
-    worker: WorkerIdx,
-    slot: ProgressSlot,
+    widx: WorkerIdx,
+    worker: Worker,
     dev_name: Option<String>,
     na_info: String,
     runtime: std::sync::Arc<dyn unbounded_storage::runtime::Threading>,
@@ -214,24 +224,25 @@ fn run_shard(
         max_inflight: MAX_INFLIGHT,
         progress_poll_ms: PROGRESS_POLL_MS,
         runtime,
-        worker_idx: worker,
+        worker_idx: widx,
     };
     let class = match Class::new(cfg).and_then(|c| c.self_address().map(|a| (c, a))) {
         Ok((class, self_addr)) => {
             println!(
                 "shard up: worker={} dev={} numa={} cpu={} self_addr={}",
-                worker.0,
+                widx.0,
                 dev_name.as_deref().unwrap_or("tcp-fallback"),
-                slot.numa
+                worker
+                    .numa
                     .map(|n| n.to_string())
                     .unwrap_or_else(|| "none".into()),
-                slot.cpu,
+                worker.cpu,
                 self_addr,
             );
             class
         }
         Err(e) => {
-            let _ = tx.send(ShardReady::Failed(format!("worker={}: {e}", worker.0)));
+            let _ = tx.send(ShardReady::Failed(format!("worker={}: {e}", widx.0)));
             return;
         }
     };
@@ -239,20 +250,20 @@ fn run_shard(
     // NUMA-local backing. Allocated on the pinned shard thread so
     // the `PinnedRuntime`'s `set_mempolicy` keeps the pages on the
     // intended node; the hugepage variant additionally pins via
-    // `mbind` when `slot.numa` is known. Register it with the
+    // `mbind` when `worker.numa` is known. Register it with the
     // Mercury class before building the transport (the new
     // embedder-pre-registers model replaces the old
     // `Transport::register_pages` handshake).
     let backing = match allocate(BackingRequest {
         kind: backing_kind,
         bytes: bytes_per_shard,
-        numa: slot.numa,
+        numa: worker.numa,
     }) {
         Ok(b) => b,
         Err(e) => {
             let _ = tx.send(ShardReady::Failed(format!(
                 "worker={}: backing allocation failed: {e}",
-                worker.0,
+                widx.0,
             )));
             return;
         }
@@ -262,7 +273,7 @@ fn run_shard(
     if let Err(e) = class.register_backing(backing.base, backing_bytes) {
         let _ = tx.send(ShardReady::Failed(format!(
             "worker={}: register_backing: {e}",
-            worker.0,
+            widx.0,
         )));
         return;
     }
@@ -282,15 +293,15 @@ fn run_shard(
         Err(e) => {
             let _ = tx.send(ShardReady::Failed(format!(
                 "worker={}: Pool::new: {e}",
-                worker.0,
+                widx.0,
             )));
             return;
         }
     };
 
     let _ = tx.send(ShardReady::Up(ShardDescriptor {
-        worker_idx: worker,
-        numa: slot.numa,
+        worker_idx: widx,
+        numa: worker.numa,
     }));
 
     wait_for_shutdown();
@@ -322,6 +333,29 @@ fn stripe_key_to_shard(key: &StripeKey, shard_count: usize) -> usize {
 enum ShardReady {
     Up(ShardDescriptor),
     Failed(String),
+}
+
+/// Per-role worker counts derived from a [`Plan`]; used for the
+/// startup observability line.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+struct RoleCounts {
+    progress: usize,
+    handlers: usize,
+    nvme: usize,
+}
+
+impl RoleCounts {
+    fn from_plan(plan: &Plan) -> Self {
+        let mut c = Self::default();
+        for w in &plan.workers {
+            match w.role {
+                Role::RdmaProgress { .. } => c.progress += 1,
+                Role::RdmaHandler { .. } => c.handlers += 1,
+                Role::NvmeIoUring { .. } => c.nvme += 1,
+            }
+        }
+        c
+    }
 }
 
 /// Parsed command-line options for one run of the daemon.
@@ -406,18 +440,6 @@ fn print_help() {
     eprintln!("  -h, --help                  Print this help and exit.");
 }
 
-fn enumerate_shards() -> Vec<NicShard> {
-    let mut shards = discover_nic_shards();
-    if shards.is_empty() {
-        eprintln!(
-            "no RDMA NICs discovered under /sys/class/infiniband; \
-             falling back to a single TCP shard"
-        );
-        shards.push(fallback_shard(FALLBACK_THREADS));
-    }
-    shards
-}
-
 fn wait_for_shutdown() {
     while !SHUTDOWN.load(Ordering::Acquire) {
         thread::sleep(SHUTDOWN_POLL);
@@ -455,6 +477,7 @@ fn install_signal_handler() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use unbounded_storage::topology::NumaPool;
 
     fn parse(args: &[&str]) -> Result<Cli, String> {
         match Cli::parse(args.iter().map(|s| s.to_string()))? {
@@ -510,5 +533,27 @@ mod tests {
     fn zero_bytes_rejected() {
         let err = parse(&["--bytes-per-shard=0"]).err().unwrap();
         assert!(err.contains("must be > 0"), "got: {err}");
+    }
+
+    #[test]
+    fn role_counts_aggregate_per_role() {
+        // Synthetic plan: 2 progress, 3 handlers, 1 nvme. We do not
+        // route this through `Plan::for_host`; we just want to
+        // confirm `RoleCounts::from_plan` walks the worker list
+        // correctly because main.rs feeds that into the startup
+        // observability line.
+        let plan = Plan {
+            workers: vec![
+                Worker { cpu: 1, numa: Some(0), role: Role::NvmeIoUring { nvme: 0 } },
+                Worker { cpu: 2, numa: Some(0), role: Role::RdmaProgress { hca: 0 } },
+                Worker { cpu: 3, numa: Some(0), role: Role::RdmaProgress { hca: 1 } },
+                Worker { cpu: 4, numa: Some(0), role: Role::RdmaHandler { hca: 0 } },
+                Worker { cpu: 5, numa: Some(0), role: Role::RdmaHandler { hca: 0 } },
+                Worker { cpu: 6, numa: Some(0), role: Role::RdmaHandler { hca: 1 } },
+            ],
+            numa_pools: vec![NumaPool { numa: 0, workers: 6 }],
+        };
+        let c = RoleCounts::from_plan(&plan);
+        assert_eq!(c, RoleCounts { progress: 2, handlers: 3, nvme: 1 });
     }
 }
