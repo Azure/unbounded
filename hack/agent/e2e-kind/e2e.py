@@ -491,11 +491,46 @@ def node_kubelet_version(node_name: str) -> str:
     ]).strip()
 
 
+def restart_crashing_daemonset_pods(node_name: str, namespace: str, label: str) -> None:
+    """Delete matching DaemonSet pods stuck in restart backoff on *node_name*."""
+
+    result = subprocess.run(
+        [KUBECTL, "get", "pods", "-n", namespace,
+         "-l", label, "--field-selector", f"spec.nodeName={node_name}",
+         "-o", "json"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return
+
+    pods = json.loads(result.stdout).get("items", [])
+    for pod in pods:
+        pod_name = pod["metadata"]["name"]
+        for container_status in pod.get("status", {}).get("containerStatuses", []):
+            if container_status.get("ready"):
+                continue
+            waiting = container_status.get("state", {}).get("waiting", {})
+            terminated = container_status.get("state", {}).get("terminated", {})
+            restart_count = container_status.get("restartCount", 0)
+            waiting_reason = waiting.get("reason")
+            terminated_reason = terminated.get("reason")
+            if restart_count >= 2 or waiting_reason == "CrashLoopBackOff":
+                log(f"  Deleting crashing pod {pod_name} "
+                    f"(restarts={restart_count}, waiting={waiting_reason or 'none'}, "
+                    f"terminated={terminated_reason or 'none'}) to reset backoff")
+                subprocess.run(
+                    [KUBECTL, "delete", "pod", "-n", namespace, pod_name,
+                     "--grace-period=0", "--force"],
+                    capture_output=True, text=True,
+                )
+
+
 def wait_for_node_ready(node_name: str, timeout_secs: int = 120) -> None:
     """Wait until *node_name* reports Ready=True."""
 
     log(f"Waiting for node '{node_name}' to be Ready (timeout: {timeout_secs}s)...")
     elapsed = 0
+    last_restart_attempt = 0
     while elapsed < timeout_secs:
         result = subprocess.run(
             [KUBECTL, "get", "node", node_name,
@@ -508,6 +543,9 @@ def wait_for_node_ready(node_name: str, timeout_secs: int = 120) -> None:
             return
         if elapsed > 0 and elapsed % 30 == 0:
             log(f"  ({elapsed}s) Node not yet Ready (status: {status})")
+        if elapsed >= 30 and elapsed - last_restart_attempt >= 30:
+            restart_crashing_daemonset_pods(node_name, "kube-system", "app=kindnet")
+            last_restart_attempt = elapsed
         time.sleep(5)
         elapsed += 5
 
@@ -1314,7 +1352,7 @@ def wait_for_node() -> None:
     """Wait for the agent node to appear and become Ready."""
 
     node_timeout = int(os.environ.get("NODE_TIMEOUT", "180"))
-    ready_timeout = int(os.environ.get("READY_TIMEOUT", "120"))
+    ready_timeout = int(os.environ.get("READY_TIMEOUT", "720"))
 
     # Wait for node to appear
     log(f"Waiting for node '{AGENT_MACHINE_NAME}' to appear (timeout: {node_timeout}s)...")
@@ -2523,6 +2561,8 @@ def collect_logs() -> None:
     _write_command_log(logs_dir / "nodes-describe.txt", [KUBECTL, "describe", "nodes"])
     _write_command_log(logs_dir / "pods.txt", [KUBECTL, "get", "pods", "-A", "-o", "wide"])
     _write_command_log(logs_dir / "events.txt", [KUBECTL, "get", "events", "-A", "--sort-by=.lastTimestamp"])
+    _write_command_log(logs_dir / "kindnet.log", [KUBECTL, "logs", "-n", "kube-system", "--all-containers", "--prefix", "-l", "app=kindnet"])
+    _write_command_log(logs_dir / "kindnet-previous.log", [KUBECTL, "logs", "-n", "kube-system", "--all-containers", "--prefix", "--previous", "-l", "app=kindnet"])
     _write_command_log(logs_dir / "machines.txt", [KUBECTL, "get", "machines", "-o", "wide"])
     _write_command_log(logs_dir / "machines-full.yaml", [KUBECTL, "get", "machines", "-o", "yaml"])
     _write_command_log(logs_dir / "machineconfigurations.txt", [KUBECTL, "get", "machineconfigurations", "-o", "wide"])
