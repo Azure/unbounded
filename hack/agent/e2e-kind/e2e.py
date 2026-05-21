@@ -86,7 +86,7 @@ AGENT_MACHINE_NAME = os.environ.get("AGENT_MACHINE_NAME", "agent-e2e")
 AGENT_DEBUG = os.environ.get("AGENT_DEBUG", "")
 
 # Site name used when generating the bootstrap script via kubectl-unbounded.
-E2E_SITE_NAME = "e2e"
+E2E_SITE_NAME = os.environ.get("E2E_SITE_NAME", "e2e")
 
 # Fixed nspawn machine names used by unbounded-agent (decoupled from the kube node name).
 NSPAWN_MACHINE_NAMES = ["kube1", "kube2"]
@@ -352,6 +352,7 @@ def scenario_env(node_config: NodeConfig, index: int) -> dict[str, str]:
     return {
         "VM_NAME": vm_name,
         "AGENT_MACHINE_NAME": vm_name,
+        "E2E_SITE_NAME": f"{E2E_SITE_NAME}-{name}",
         "VM_IP": f"{VM_SUBNET}.{10 + index}",
         "VM_DIR": str(VM_DIR / name),
         "TAP_NAME": f"tap-e2e-{index}",
@@ -2314,6 +2315,51 @@ def _next_patch_version(version: str) -> str:
     return "v" + ".".join(parts)
 
 
+def ensure_machine_configuration_for_repave(
+    config_name: str,
+    kubernetes_version: str,
+    node_config: NodeConfig,
+) -> None:
+    """Create the per-machine MachineConfiguration if setup did not pre-create it."""
+
+    result = subprocess.run(
+        [KUBECTL, "get", "machineconfiguration", config_name],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        return
+
+    output = result.stdout + result.stderr
+    if "NotFound" not in output and "not found" not in output:
+        die(f"failed to get MachineConfiguration '{config_name}': {output.strip()}")
+
+    log(f"Creating MachineConfiguration '{config_name}' for repave validation...")
+    kubernetes_template: dict[str, Any] = {"version": kubernetes_version}
+    labels = expected_node_labels(node_config)
+    taints = expected_node_taints(node_config)
+    if labels:
+        kubernetes_template["nodeLabels"] = labels
+    if taints:
+        kubernetes_template["registerWithTaints"] = taints
+
+    manifest = {
+        "apiVersion": "unbounded-cloud.io/v1alpha3",
+        "kind": "MachineConfiguration",
+        "metadata": {
+            "name": config_name,
+            "labels": {"e2e.unbounded-cloud.io/test": "agent-kind"},
+        },
+        "spec": {
+            "updateStrategy": {"type": "OnDelete"},
+            "template": {
+                "kubernetes": kubernetes_template,
+            },
+        },
+    }
+    kubectl(["apply", "-f", "-"], input=json.dumps(manifest).encode())
+
+
 def validate_node_repave_upgrade(node_config: NodeConfig) -> None:
     """Validate OnDelete repave applies a new MCV Kubernetes version."""
 
@@ -2328,6 +2374,7 @@ def validate_node_repave_upgrade(node_config: NodeConfig) -> None:
     log(f"Current kubelet version: {current_kubelet_version}")
     log(f"Target kubelet version: {target_kubelet_version}")
 
+    ensure_machine_configuration_for_repave(config_name, current_kubelet_version, node_config)
     manifest = json.loads(kubectl_capture(["get", "machineconfiguration", config_name, "-o", "json"]))
     metadata = manifest.setdefault("metadata", {})
     for key in ["creationTimestamp", "generation", "resourceVersion", "uid", "managedFields"]:
