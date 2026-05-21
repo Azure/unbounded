@@ -332,6 +332,7 @@ func buildDirectSitePeeringSet(sitePeeringInformer cache.SharedIndexInformer) ma
 // if informers are nil or not synced, annotation is skipped gracefully.
 func annotateNodeRoutes(
 	status *NodeStatusResponse,
+	cfg *config,
 	siteInformer, sliceInformer, gatewayPoolInformer, sitePeeringInformer cache.SharedIndexInformer,
 ) {
 	if status == nil || len(status.RoutingTable.Routes) == 0 {
@@ -352,19 +353,19 @@ func annotateNodeRoutes(
 	annotatePeerRouteDestinations(status, actx.routeNodes, actx.sitePodCIDRs, localSiteName, actx.directSitePeerings)
 
 	// Build expected routes and annotate
-	expectedIPv4, expectedIPv6 := buildExpectedRoutes(status, actx, localSiteName)
+	expectedIPv4, expectedIPv6 := buildExpectedRoutes(cfg, status, actx, localSiteName)
 	ipv4Routes, ipv6Routes := splitRoutesByFamily(status.RoutingTable.Routes)
-	ipv4Routes = annotateFamilyRoutes(ipv4Routes, expectedIPv4)
-	ipv6Routes = annotateFamilyRoutes(ipv6Routes, expectedIPv6)
-	ipv4Routes = annotateRoutePeerDestinationsForFamily(ipv4Routes, status.Peers, actx, localSiteName)
-	ipv6Routes = annotateRoutePeerDestinationsForFamily(ipv6Routes, status.Peers, actx, localSiteName)
+	ipv4Routes = annotateFamilyRoutes(cfg, ipv4Routes, expectedIPv4)
+	ipv6Routes = annotateFamilyRoutes(cfg, ipv6Routes, expectedIPv6)
+	ipv4Routes = annotateRoutePeerDestinationsForFamily(cfg, ipv4Routes, status.Peers, actx, localSiteName)
+	ipv6Routes = annotateRoutePeerDestinationsForFamily(cfg, ipv6Routes, status.Peers, actx, localSiteName)
 
 	// Mark supernet routes on unbounded0 as expected. These are managed
 	// routes that don't correspond to individual peers but exist in the FIB
 	// because the BPF program on unbounded0 attracts overlay traffic via
 	// aggregate routes.
-	markSupernetRoutesExpected(ipv4Routes)
-	markSupernetRoutesExpected(ipv6Routes)
+	markSupernetRoutesExpected(cfg, ipv4Routes)
+	markSupernetRoutesExpected(cfg, ipv6Routes)
 
 	// Remove empty routes (all nexthops filtered).
 	ipv4Routes = filterEmptyRoutes(ipv4Routes)
@@ -380,7 +381,7 @@ func annotateNodeRoutes(
 //   - Nexthops on tunnel and WG interfaces that are not present in the FIB
 //     are removed entirely, since forwarding happens via unbounded0 + the BPF
 //     LPM trie instead of per-interface kernel routes.
-func markSupernetRoutesExpected(routes []RouteEntry) {
+func markSupernetRoutesExpected(cfg *config, routes []RouteEntry) {
 	// Check if unbounded0 appears in any route (indicates the node has been
 	// fully provisioned -- unbounded0 is created by ensureTunnelMap).
 	hasUnbounded0 := false
@@ -420,8 +421,8 @@ func markSupernetRoutesExpected(routes []RouteEntry) {
 			}
 			// Remove phantom nexthops on tunnel/WG interfaces that are not
 			// present in the FIB -- eBPF handles routing via the BPF map.
-			if (hop.Device == geneveInterfaceName || hop.Device == vxlanInterfaceName || hop.Device == ipipInterfaceName ||
-				strings.HasPrefix(hop.Device, "wg")) &&
+			if (hop.Device == cfg.GeneveInterfaceName || hop.Device == cfg.VXLANInterfaceName || hop.Device == cfg.IPIPInterfaceName ||
+				isWireGuardInterface(cfg, hop.Device)) &&
 				(hop.Present == nil || !*hop.Present) {
 				continue // drop this nexthop
 			}
@@ -574,6 +575,7 @@ func expectedDestinationsForPeer(
 // buildExpectedRoutes builds expected IPv4 and IPv6 route maps from the
 // node's peer status and annotation context.
 func buildExpectedRoutes(
+	cfg *config,
 	nodeStatus *NodeStatusResponse,
 	actx *annotationContext,
 	localSiteName string,
@@ -661,7 +663,12 @@ func buildExpectedRoutes(
 		}, peerNames
 	}
 
-	ipv4Plan, ipv6Plan := routeplan.BuildExpectedWireGuardRoutes(routePeers, actx.routeNodes)
+	ipv4Plan, ipv6Plan := routeplan.BuildExpectedWireGuardRoutes(routePeers, actx.routeNodes, routeplan.InterfaceNames{
+		WireGuardPrefix: cfg.WireGuardInterfacePrefix,
+		Geneve:          cfg.GeneveInterfaceName,
+		VXLAN:           cfg.VXLANInterfaceName,
+		IPIP:            cfg.IPIPInterfaceName,
+	})
 
 	for _, route := range ipv4Plan {
 		routeDistance := effectiveRouteDistance(route.Distance)
@@ -693,7 +700,7 @@ func buildExpectedRoutes(
 // annotateFamilyRoutes annotates a slice of route entries for a single IP
 // family (IPv4 or IPv6) with Expected and Present flags. Routes that are
 // expected but missing from the kernel are appended as synthetic entries.
-func annotateFamilyRoutes(routes []RouteEntry, expected map[routeKey]expectedRoute) []RouteEntry {
+func annotateFamilyRoutes(cfg *config, routes []RouteEntry, expected map[routeKey]expectedRoute) []RouteEntry {
 	annotated := make([]RouteEntry, len(routes))
 	copy(annotated, routes)
 
@@ -711,7 +718,7 @@ func annotateFamilyRoutes(routes []RouteEntry, expected map[routeKey]expectedRou
 		normalizedDestination, _ := normalizeRouteDestination(annotated[routeIndex].Destination)
 		for hopIndex := range annotated[routeIndex].NextHops {
 			hop := &annotated[routeIndex].NextHops[hopIndex]
-			if !isWireGuardInterfaceName(hop.Device) {
+			if !isPeerRoutingInterface(cfg, hop.Device) {
 				continue
 			}
 
@@ -733,7 +740,7 @@ func annotateFamilyRoutes(routes []RouteEntry, expected map[routeKey]expectedRou
 						RouteType:  matchedRoute.info.RouteType,
 					}
 				}
-			} else if isConnectedSelfWireGuardHostRoute(normalizedDestination, hop) {
+			} else if isConnectedSelfWireGuardHostRoute(cfg, normalizedDestination, hop) {
 				hop.Expected = boolPtr(true)
 			} else {
 				hop.Expected = boolPtr(false)
@@ -826,6 +833,7 @@ func annotateFamilyRoutes(routes []RouteEntry, expected map[routeKey]expectedRou
 // annotateRoutePeerDestinationsForFamily sets PeerDestinations and Info on
 // each next-hop of the provided routes by matching against peer expectations.
 func annotateRoutePeerDestinationsForFamily(
+	cfg *config,
 	routes []RouteEntry,
 	peers []WireGuardPeerStatus,
 	actx *annotationContext,
@@ -850,7 +858,7 @@ func annotateRoutePeerDestinationsForFamily(
 		peerName := strings.TrimSpace(peer.Name)
 
 		interfaceName := strings.TrimSpace(peer.Tunnel.Interface)
-		if peerName == "" || !isWireGuardInterfaceName(interfaceName) {
+		if peerName == "" || !isPeerRoutingInterface(cfg, interfaceName) {
 			continue
 		}
 
@@ -894,7 +902,7 @@ func annotateRoutePeerDestinationsForFamily(
 			hop := &routes[routeIndex].NextHops[hopIndex]
 
 			interfaceName := strings.TrimSpace(hop.Device)
-			if !isWireGuardInterfaceName(interfaceName) {
+			if !isPeerRoutingInterface(cfg, interfaceName) {
 				hop.PeerDestinations = nil
 				hop.Info = nil
 
@@ -1045,31 +1053,38 @@ func boolPtr(value bool) *bool {
 	return &b
 }
 
-// isWireGuardInterfaceName returns true if the device name matches a managed
-// tunnel interface pattern.
-func isWireGuardInterfaceName(device string) bool {
-	return isTunnelInterfaceName(device)
-}
+// isPeerRoutingInterface reports whether name belongs to one of the tunnel
+// interfaces used for peer-destined routes: the configured per-port
+// WireGuard interfaces (wg<port>) and the three shared flow-based tunnel
+// devices (cfg.GeneveInterfaceName, cfg.VXLANInterfaceName,
+// cfg.IPIPInterfaceName). It returns false for unbounded0, whose routes
+// are managed separately by markSupernetRoutesExpected.
+func isPeerRoutingInterface(cfg *config, device string) bool {
+	dev := strings.TrimSpace(device)
+	if dev == "" {
+		return false
+	}
 
-// isTunnelInterfaceName returns true for any managed tunnel interface:
-// WireGuard (wg*), GENEVE (gn*), VXLAN (vxlan*), and IPIP (ipip*).
-func isTunnelInterfaceName(device string) bool {
-	dev := strings.ToLower(strings.TrimSpace(device))
+	if isWireGuardInterface(cfg, dev) {
+		return true
+	}
 
-	return strings.HasPrefix(dev, "wg") ||
-		strings.HasPrefix(dev, "gn") ||
-		strings.HasPrefix(dev, "vxlan") ||
-		strings.HasPrefix(dev, "ipip")
+	switch dev {
+	case cfg.GeneveInterfaceName, cfg.VXLANInterfaceName, cfg.IPIPInterfaceName:
+		return true
+	}
+
+	return false
 }
 
 // isConnectedSelfWireGuardHostRoute returns true if the hop is a connected
 // or local host route (/32 or /128) on a tunnel interface with no gateway.
-func isConnectedSelfWireGuardHostRoute(normalizedDestination string, hop *NextHop) bool {
+func isConnectedSelfWireGuardHostRoute(cfg *config, normalizedDestination string, hop *NextHop) bool {
 	if hop == nil {
 		return false
 	}
 
-	if !isWireGuardInterfaceName(hop.Device) {
+	if !isPeerRoutingInterface(cfg, hop.Device) {
 		return false
 	}
 

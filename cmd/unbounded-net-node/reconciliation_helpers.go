@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/vishvananda/netlink"
+	"golang.zx2c4.com/wireguard/wgctrl"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -618,7 +619,12 @@ func removeUnmanagedWireGuardInterfaces(cfg *config, state *wireGuardState, desi
 
 	for _, link := range links {
 		name := link.Attrs().Name
-		if !strings.HasPrefix(name, "wg") {
+
+		// Only consider devices whose name matches our configured WG
+		// prefix. Cross-prefix stale cleanup is handled by
+		// removeStaleWireGuardInterfaces (which is much more careful
+		// about not deleting devices owned by other tooling).
+		if !isWireGuardInterface(cfg, name) {
 			continue
 		}
 
@@ -657,4 +663,107 @@ func removeUnmanagedWireGuardInterfaces(cfg *config, state *wireGuardState, desi
 		delete(state.gatewayNames, name)
 		delete(state.gatewaySiteNames, name)
 	}
+}
+
+// removeStaleWireGuardInterfaces deletes kernel-resident WireGuard
+// devices that look like they were created by a previous agent run with
+// a different --wireguard-interface-prefix value but still own a UDP
+// port we care about. A device is considered stale only when ALL of:
+//
+//   - link kind is "wireguard"
+//   - its WireGuard ListenPort is queryable via wgctrl
+//   - its current name does NOT match the name we would now compute for
+//     a device on that port (cfg.WireGuardInterfacePrefix + ListenPort)
+//   - its current name DOES match some other prefix followed by exactly
+//     that ListenPort (i.e. the device was clearly named by an
+//     unbounded-net agent under a different prefix)
+//
+// The last condition is what makes this safe to run on a host that may
+// also be running an unrelated WireGuard daemon (Tailscale, Netbird, a
+// user's own wg<n> device, etc.): we only delete devices whose name fits
+// the unbounded-net agent's "<prefix><port>" pattern. Other WireGuard
+// tooling typically names devices "wg0" or "tailscale0" or a UUID, which
+// won't match the strict "<alpha-prefix><exact-listen-port>" pattern.
+//
+// If an operator's other tooling happens to use the same "<alpha><port>"
+// pattern on the SAME UDP port, they cannot coexist on the same host
+// regardless of this code (only one UDP listener per port).
+func removeStaleWireGuardInterfaces(cfg *config) {
+	wgClient, err := wgctrl.New()
+	if err != nil {
+		klog.Warningf("WireGuard: failed to open wgctrl for stale-prefix sweep; stale devices from a previous --wireguard-interface-prefix value will be left in place and may block port binding: %v", err)
+		return
+	}
+
+	defer func() {
+		if err := wgClient.Close(); err != nil {
+			klog.V(4).Infof("WireGuard: failed to close wgctrl client after stale-prefix sweep: %v", err)
+		}
+	}()
+
+	links, err := netlink.LinkList()
+	if err != nil {
+		klog.Warningf("WireGuard: failed to list links for stale-prefix sweep; stale devices from a previous --wireguard-interface-prefix value will be left in place and may block port binding: %v", err)
+		return
+	}
+
+	for _, link := range links {
+		if link.Type() != "wireguard" {
+			continue
+		}
+
+		name := link.Attrs().Name
+
+		dev, err := wgClient.Device(name)
+		if err != nil {
+			klog.Warningf("WireGuard: failed to query device %s via wgctrl; skipping for stale-prefix sweep (a stale device on this name may remain): %v", name, err)
+			continue
+		}
+
+		port := dev.ListenPort
+		if port <= 0 {
+			continue
+		}
+
+		portSuffix := strconv.Itoa(port)
+		if !strings.HasSuffix(name, portSuffix) {
+			continue
+		}
+
+		// Confirm the part before the digits is alpha-only. This is the
+		// "<prefix><port>" pattern that the unbounded-net agent uses; it
+		// rejects names like "wg0" (port suffix would be "0" while
+		// ListenPort might be 51820) and names like "myiface-13" (suffix
+		// is non-port-decimal).
+		oldPrefix := name[:len(name)-len(portSuffix)]
+		if oldPrefix == "" || !isAlphaPrefix(oldPrefix) {
+			continue
+		}
+
+		expected := wireGuardInterfaceName(cfg, port)
+		if name == expected {
+			continue
+		}
+
+		klog.Infof("WireGuard: removing stale device %s (matches the unbounded-net agent's <prefix><port> pattern for ListenPort=%d but does not match our configured prefix %q)", name, port, cfg.WireGuardInterfacePrefix)
+
+		if err := netlink.LinkDel(link); err != nil {
+			klog.Warningf("WireGuard: failed to delete stale device %s: %v", name, err)
+		}
+	}
+}
+
+// isAlphaPrefix reports whether s is non-empty and consists only of ASCII
+// letters. Used by removeStaleWireGuardInterfaces to filter out names
+// like "tailscale0" (which would otherwise look like prefix "tailscale"
+// + port "0" -- safe to leave alone because wgctrl ListenPort would
+// disagree, but this is a cheap extra defense).
+func isAlphaPrefix(s string) bool {
+	for _, r := range s {
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') {
+			return false
+		}
+	}
+
+	return true
 }

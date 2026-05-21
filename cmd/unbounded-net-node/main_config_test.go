@@ -71,6 +71,10 @@ func TestApplyNodeRuntimeConfig(t *testing.T) {
 		StatusWSKeepaliveFailureCount: 2,
 		CriticalDeltaEvery:            time.Second,
 		StatsDeltaEvery:               15 * time.Second,
+		GeneveInterfaceName:           "geneve0",
+		VXLANInterfaceName:            "vxlan0",
+		IPIPInterfaceName:             "ipip0",
+		WireGuardInterfacePrefix:      "wg",
 	}
 
 	tmpPath := filepath.Join(".", "runtime-config-node-test.tmp")
@@ -170,7 +174,7 @@ func TestApplyNodeRuntimeConfig(t *testing.T) {
 
 // TestApplyNodeRuntimeConfigRespectsChangedFlags tests ApplyNodeRuntimeConfigRespectsChangedFlags.
 func TestApplyNodeRuntimeConfigRespectsChangedFlags(t *testing.T) {
-	cfg := &config{ConfigFile: filepath.Join(".", "runtime-config-node-flags-test.tmp"), NodeName: "from-flag", HealthPort: 9998}
+	cfg := &config{ConfigFile: filepath.Join(".", "runtime-config-node-flags-test.tmp"), NodeName: "from-flag", HealthPort: 9998, GeneveInterfaceName: "geneve0", VXLANInterfaceName: "vxlan0", IPIPInterfaceName: "ipip0", WireGuardInterfacePrefix: "wg"}
 
 	t.Cleanup(func() { _ = os.Remove(cfg.ConfigFile) })
 

@@ -139,6 +139,7 @@ For standard 1500-byte links: `1500 - 80 = 1420`.
 |------|---------|-------------|
 | `--wireguard-dir` | `/etc/wireguard` | WireGuard key storage directory. |
 | `--wireguard-port` | `51820` | WireGuard listen port. |
+| `--wireguard-interface-prefix` | `wg` | Prefix for per-port WireGuard interface names; runtime name is `<prefix><port>`. See [Tunnel interface names](#tunnel-interface-names). |
 
 ### GENEVE
 
@@ -146,7 +147,7 @@ For standard 1500-byte links: `1500 - 80 = 1420`.
 |------|---------|-------------|
 | `--geneve-port` | `6081` | GENEVE UDP destination port. |
 | `--geneve-vni` | `1` | GENEVE Virtual Network Identifier. |
-| `--geneve-interface` | `geneve0` | GENEVE tunnel interface name. |
+| `--geneve-interface` | `geneve0` | Shared flow-based GENEVE interface name. See [Tunnel interface names](#tunnel-interface-names). |
 
 ### VXLAN
 
@@ -155,9 +156,29 @@ For standard 1500-byte links: `1500 - 80 = 1420`.
 | `--vxlan-port` | `4789` | VXLAN UDP destination port. |
 | `--vxlan-src-port-low` | `47891` | VXLAN source port range low. |
 | `--vxlan-src-port-high` | `47922` | VXLAN source port range high. |
+| `--vxlan-interface` | `vxlan0` | Shared flow-based VXLAN interface name. See [Tunnel interface names](#tunnel-interface-names). |
 
 The narrow source port range (32 ports) limits distinct flows from VMs, helping
 avoid flow table limits on cloud platforms (e.g., Azure).
+
+### IPIP
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--ipip-interface` | `ipip0` | Shared flow-based IPIP interface name. See [Tunnel interface names](#tunnel-interface-names). |
+
+### Tunnel interface names
+
+The three shared tunnel device names (`geneve0`, `vxlan0`, `ipip0`) and the per-port WireGuard interface prefix (default `wg`) are configurable via the flags above and via the matching YAML fields under `node:` (`geneveInterfaceName`, `vxlanInterfaceName`, `ipipInterfaceName`, `wireGuardInterfacePrefix`). Operators rarely need to change them.
+
+Constraints, enforced at startup:
+
+* Shared tunnel names: non-empty, at most 15 bytes (Linux IFNAMSIZ limit), pairwise distinct, must not equal `unbounded0`.
+* WireGuard prefix: non-empty, at most 10 bytes (so `prefix + 5-digit UDP port` fits in IFNAMSIZ), no `/`, must not equal `unbounded0`.
+* `unbounded0` (the agent's eBPF dummy device) is not configurable.
+
+When the names are changed, the agent automatically removes previous-run devices it can confidently identify, scoped narrowly so other CNIs (e.g. Cilium) running flow-based GENEVE / VXLAN on different UDP ports are not touched. IPIP is not auto-cleaned: remove a renamed-away IPIP device manually with `ip link del <old-name>`.
+
 
 ### Tunnel Dataplane
 
