@@ -17,9 +17,9 @@ metadata:
     app.kubernetes.io/name: azurite
     app.kubernetes.io/part-of: orca-dev
 spec:
-  # NodePort so the host-side seeder tool (hack/cmd/orcaseed) can
-  # reach Azurite without a kubectl port-forward. Kind binds node
-  # ports to the host's loopback, so the seeder talks to
+  # NodePort so the host-side dev tool (hack/cmd/orcadev) can reach
+  # Azurite without a kubectl port-forward. Kind binds node ports
+  # to the host's loopback, so the tool talks to
   # http://localhost:<nodePort>/devstoreaccount1/. The fixed port
   # (default 30100) sits in the Kubernetes NodePort range
   # (30000-32767). Two concurrent dev clusters on the same host

@@ -128,18 +128,20 @@ make -C hack/orca reset         # rolling-restart Orca with new ConfigMap
 
 ## Seed sample data
 
-The dev harness ships a small Go tool, `hack/cmd/orcaseed`, that
-populates the origin container (Azurite or real Azure) with synthetic
-or operator-supplied content. For the canonical recipe (Azurite
-endpoint via NodePort 30100, the four subcommands wrapped as Make
-targets, the per-blob ceiling, etc.) see
+The dev harness ships a multi-purpose Go tool, `hack/cmd/orcadev`,
+that populates the origin (Azurite or LocalStack S3 or real Azure)
+with synthetic or operator-supplied content, drives roundtrip
+correctness checks through orca, inspects the cachestore, and runs
+throughput benchmarks + canned scenarios. For the canonical recipe
+(NodePort 30100 for Azurite, NodePort 30200 for LocalStack S3, the
+seed subcommands wrapped as Make targets) see
 [quickstart.md - Step 3](./quickstart.md#step-3---seed-the-origin).
 
-For real Azure storage, the `seed-azure` Make target invokes
-`orcaseed upload` against your account using credentials from `.env`:
+For real Azure storage, the `dev-azure` Make target invokes
+`orcadev upload` against your account using credentials from `.env`:
 
 ```bash
-make -C hack/orca seed-azure FILE=/path/to/local-file
+make -C hack/orca dev-azure FILE=/path/to/local-file
 ```
 
 This replaces the legacy `seed-azure.sh` script (retired). Required
@@ -147,18 +149,12 @@ in `.env`: `AZURE_STORAGE_ACCOUNT`, `AZURE_STORAGE_KEY`,
 `AZURE_CONTAINER`. The endpoint is computed as
 `https://<account>.blob.core.windows.net/`.
 
-For ad-hoc seeding into the in-cluster LocalStack S3 origin (the
-default `awss3` mode), `orcaseed` does not currently speak S3; use a
-one-off Job:
+For seeding into the in-cluster LocalStack S3 origin (the default
+`awss3` mode), `orcadev` speaks S3 natively via the NodePort 30200:
 
 ```bash
-kubectl --context kind-orca-dev -n unbounded-kube run orca-seed --rm -it \
-  --image=amazon/aws-cli:latest --restart=Never \
-  --env=AWS_ACCESS_KEY_ID=test \
-  --env=AWS_SECRET_ACCESS_KEY=test \
-  -- \
-  --endpoint-url http://localstack.unbounded-kube.svc.cluster.local:4566 \
-  s3 cp /tmp/your-file s3://orca-origin/your-key
+make -C hack/orca data-upload FILE=/path/to/local-file
+make -C hack/orca data-generate ARGS='--size 10MiB --count 5'
 ```
 
 ## Exercise the cache
@@ -207,13 +203,13 @@ Then:
 
 ```bash
 make -C hack/orca deploy                          # idempotent
-make -C hack/orca seed-azure FILE=/path/to/file   # uploads via orcaseed -> real Azure
+make -C hack/orca dev-azure FILE=/path/to/file    # uploads via orcadev -> real Azure
 make -C hack/orca reset
 ```
 
-The `seed-azure` target uses `hack/cmd/orcaseed` under the hood,
+The `dev-azure` target uses `hack/cmd/orcadev` under the hood,
 constructing the endpoint as `https://<account>.blob.core.windows.net/`
-and authenticating with `AZURE_STORAGE_KEY`. Pass `SEED_ARGS='--name foo'`
+and authenticating with `AZURE_STORAGE_KEY`. Pass `ARGS='--name foo'`
 to override the destination blob name.
 
 ## Reset / iterate
@@ -313,7 +309,7 @@ In awss3 (default) mode:
 
 In Azure mode:
 - Account key wrong or revoked. Re-run `make -C hack/orca deploy-credentials && make -C hack/orca reset`.
-- The blob doesn't exist in `$AZURE_CONTAINER`. Run `make -C hack/orca seed-azure`.
+- The blob doesn't exist in `$AZURE_CONTAINER`. Run `make -C hack/orca dev-azure`.
 
 ### kind load fails with "tag not found"
 

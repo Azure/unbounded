@@ -8,13 +8,23 @@ metadata:
     app.kubernetes.io/name: localstack
     app.kubernetes.io/part-of: orca-dev
 spec:
-  type: ClusterIP
+  # NodePort so the host-side dev tool (hack/cmd/orcadev) can talk to
+  # LocalStack S3 without a kubectl port-forward. Kind binds node
+  # ports to the host's loopback, so the tool talks to
+  # http://localhost:<nodePort>/. The fixed port (default 30200)
+  # mirrors the Azurite NodePort pattern (30100) and sits in the
+  # Kubernetes NodePort range (30000-32767). Two concurrent dev
+  # clusters on the same host would collide; override via
+  # LocalstackNodePort in the renderer invocation if you run more
+  # than one.
+  type: NodePort
   selector:
     app.kubernetes.io/name: localstack
   ports:
     - name: edge
       port: 4566
       targetPort: 4566
+      nodePort: {{ default "30200" .LocalstackNodePort }}
       protocol: TCP
 
 ---

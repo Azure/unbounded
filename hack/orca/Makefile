@@ -44,8 +44,9 @@ DEV_RENDERED      := $(HACK_DIR)rendered-dev
 .PHONY: help up down reset render render-dev image kind-create kind-load \
         deploy deploy-localstack deploy-azurite deploy-azurite-maybe \
         deploy-credentials deploy-orca \
-        wait-ready logs port-forward seed-azure status \
-        seed-generate seed-upload seed-list seed-delete
+        wait-ready logs port-forward dev-azure status \
+        data-generate data-upload data-list data-delete \
+        roundtrip cache-list cache-inspect cache-clear bench scenario
 
 help: ## Show this help
 	@echo ""
@@ -71,13 +72,21 @@ help: ## Show this help
 	@echo "  status              kubectl get pods -n $(NAMESPACE)"
 	@echo "  logs                Tail logs from all Orca pods"
 	@echo "  port-forward        Forward localhost:8443 -> svc/orca"
-	@echo "  seed-azure          Upload a file to real Azure (FILE=path; requires .env creds)"
+	@echo "  dev-azure           Upload a file to real Azure (FILE=path; requires .env creds)"
 	@echo ""
-	@echo "Seed origin (Azurite via NodePort 30100; needs cluster up + ORIGIN_DRIVER=azureblob):"
-	@echo "  seed-generate SEED_ARGS='--size 10MiB --count 5'  Synthesise N blobs of size S"
-	@echo "  seed-upload   FILE=/path/to/file                   Upload a single file"
-	@echo "  seed-list     [SEED_ARGS='--prefix foo']           List blobs in the container"
-	@echo "  seed-delete   [PREFIX=foo] [SEED_ARGS='--yes']     Delete blobs (interactive by default)"
+	@echo "Seed origin (NodePort 30200 for awss3 / 30100 for azureblob; needs cluster up):"
+	@echo "  data-generate ARGS='--size 10MiB --count 5'   Synthesise N blobs"
+	@echo "  data-upload   FILE=/path/to/file               Upload a single file"
+	@echo "  data-list     [ARGS='--prefix foo']            List origin objects"
+	@echo "  data-delete   [PREFIX=foo] [ARGS='--yes']      Delete origin objects"
+	@echo ""
+	@echo "Roundtrip / cache / bench (orcadev wrappers; requires port-forward):"
+	@echo "  roundtrip FILE=/path     Upload, GET via orca, verify SHA-256"
+	@echo "  cache-list               Enumerate cache chunks"
+	@echo "  cache-inspect BUCKET=b KEY=k   Show chunk presence for an object"
+	@echo "  cache-clear   [ARGS='--all --yes']             Clear cache chunks"
+	@echo "  bench KEY=k              Parallel GET throughput benchmark"
+	@echo "  scenario NAME=cold-warm  Run a canned end-to-end scenario"
 	@echo ""
 	@echo "Note: For Go-level behavior testing (chunked GETs, cluster routing,"
 	@echo "singleflight, peer fallback) use 'make orca-inttest' from the repo"
@@ -182,7 +191,8 @@ render-dev:
 		--set CachestoreBucket="$${CACHESTORE_BUCKET:-orca-cache}" \
 		--set OriginBucket="$${ORIGIN_AWSS3_BUCKET:-orca-origin}" \
 		--set AzuriteContainer="$${AZURE_CONTAINER:-$${AZURITE_CONTAINER:-orca-test}}" \
-		--set AzuriteNodePort="$${AZURITE_NODE_PORT:-30100}"
+		--set AzuriteNodePort="$${AZURITE_NODE_PORT:-30100}" \
+		--set LocalstackNodePort="$${LOCALSTACK_NODE_PORT:-30200}"
 
 # -- Image + cluster ----------------------------------------------------------
 
@@ -249,62 +259,83 @@ port-forward:
 	@echo "Forwarding localhost:8443 -> svc/orca:8443 ..."
 	kubectl --context kind-$(CLUSTER_NAME) -n $(NAMESPACE) port-forward svc/orca 8443:8443
 
-seed-azure: ## Upload a file to real Azure (requires AZURE_STORAGE_* in .env; pass FILE=...)
-	@[ -n "$(FILE)" ] || { echo "Usage: make seed-azure FILE=/path/to/file [SEED_ARGS='--name foo']" >&2; exit 1; }
+dev-azure: ## Upload a file to real Azure (requires AZURE_STORAGE_* in .env; pass FILE=...)
+	@[ -n "$(FILE)" ] || { echo "Usage: make dev-azure FILE=/path/to/file [ARGS='--name foo']" >&2; exit 1; }
 	@if [ -f "$(ENV_FILE)" ]; then set -a && . "$(ENV_FILE)" && set +a; fi; \
 	[ -n "$${AZURE_STORAGE_ACCOUNT:-}" ] || { echo "AZURE_STORAGE_ACCOUNT not set in $(ENV_FILE)" >&2; exit 1; }; \
 	[ -n "$${AZURE_STORAGE_KEY:-}" ]     || { echo "AZURE_STORAGE_KEY not set in $(ENV_FILE)"     >&2; exit 1; }; \
 	[ -n "$${AZURE_CONTAINER:-}" ]       || { echo "AZURE_CONTAINER not set in $(ENV_FILE)"       >&2; exit 1; }; \
-	go run "$(REPO_ROOT)/hack/cmd/orcaseed" upload \
-		--endpoint "https://$${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/" \
-		--account "$${AZURE_STORAGE_ACCOUNT}" \
-		--account-key "$${AZURE_STORAGE_KEY}" \
-		--container "$${AZURE_CONTAINER}" \
+	go run "$(REPO_ROOT)/hack/cmd/orcadev" upload \
+		--origin-driver azureblob \
+		--origin-endpoint "https://$${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/" \
+		--origin-account "$${AZURE_STORAGE_ACCOUNT}" \
+		--origin-account-key "$${AZURE_STORAGE_KEY}" \
+		--origin-bucket "$${AZURE_CONTAINER}" \
 		--file "$(FILE)" \
-		$(SEED_ARGS)
+		$(ARGS)
 
-# -- Seeder (orcaseed) helpers ------------------------------------------------
+# -- orcadev: dev / debug tool --------------------------------------------------
 #
-# These targets invoke hack/cmd/orcaseed against the in-cluster Azurite
-# emulator exposed on the host loopback via the NodePort 30100 baked
-# into deploy/orca/dev/03-azurite.yaml.tmpl. Override AZURITE_NODE_PORT
-# in .env if you've bumped the NodePort to avoid a host-port conflict.
-# Pass extra flags via SEED_ARGS, e.g.:
+# These targets invoke hack/cmd/orcadev. The tool talks to the
+# in-cluster Azurite (azureblob origin) on NodePort 30100, the
+# LocalStack S3 (awss3 origin + cachestore) on NodePort 30200, and
+# the orca edge listener at http://localhost:8443 (requires
+# `make -C hack/orca port-forward` running in another shell for
+# anything that hits orca).
 #
-#   make -C hack/orca seed-generate SEED_ARGS='--size 10MiB --count 5'
-#   make -C hack/orca seed-upload FILE=~/data.tar.gz
-#   make -C hack/orca seed-list
-#   make -C hack/orca seed-delete PREFIX=synth- SEED_ARGS='--yes'
+# Pass extra flags via ARGS, e.g.:
+#
+#   make -C hack/orca data-generate ARGS='--size 10MiB --count 5'
+#   make -C hack/orca data-upload   FILE=~/data.tar.gz
+#   make -C hack/orca data-list
+#   make -C hack/orca data-delete   PREFIX=synth- ARGS='--yes'
+#   make -C hack/orca roundtrip     FILE=~/data.bin
+#   make -C hack/orca cache-list
+#   make -C hack/orca cache-inspect BUCKET=orca-origin KEY=data.bin
+#   make -C hack/orca bench         KEY=data.bin ARGS='--duration 30s'
+#   make -C hack/orca scenario      NAME=cold-warm
 
-SEED_ENDPOINT ?= http://localhost:$${AZURITE_NODE_PORT:-30100}/devstoreaccount1/
-
-seed-generate: ## Generate synthetic blobs and upload to the Azurite origin
+data-generate: ## Generate synthetic blobs and upload to the origin
 	@if [ -f "$(ENV_FILE)" ]; then set -a && . "$(ENV_FILE)" && set +a; fi; \
-	go run "$(REPO_ROOT)/hack/cmd/orcaseed" generate \
-		--endpoint "$(SEED_ENDPOINT)" \
-		--container "$${AZURE_CONTAINER:-orca-test}" \
-		$(SEED_ARGS)
+	go run "$(REPO_ROOT)/hack/cmd/orcadev" upload --generate $(ARGS)
 
-seed-upload: ## Upload a file to the Azurite origin (use FILE=/path/to/file)
-	@[ -n "$(FILE)" ] || { echo "Usage: make seed-upload FILE=/path/to/file [SEED_ARGS='--name foo']" >&2; exit 1; }
+data-upload: ## Upload a file to the origin (use FILE=/path/to/file)
+	@[ -n "$(FILE)" ] || { echo "Usage: make data-upload FILE=/path/to/file [ARGS='--name foo']" >&2; exit 1; }
 	@if [ -f "$(ENV_FILE)" ]; then set -a && . "$(ENV_FILE)" && set +a; fi; \
-	go run "$(REPO_ROOT)/hack/cmd/orcaseed" upload \
-		--endpoint "$(SEED_ENDPOINT)" \
-		--container "$${AZURE_CONTAINER:-orca-test}" \
-		--file "$(FILE)" \
-		$(SEED_ARGS)
+	go run "$(REPO_ROOT)/hack/cmd/orcadev" upload --file "$(FILE)" $(ARGS)
 
-seed-list: ## List blobs in the Azurite origin container
+data-list: ## List objects in the origin
 	@if [ -f "$(ENV_FILE)" ]; then set -a && . "$(ENV_FILE)" && set +a; fi; \
-	go run "$(REPO_ROOT)/hack/cmd/orcaseed" list \
-		--endpoint "$(SEED_ENDPOINT)" \
-		--container "$${AZURE_CONTAINER:-orca-test}" \
-		$(SEED_ARGS)
+	go run "$(REPO_ROOT)/hack/cmd/orcadev" list $(ARGS)
 
-seed-delete: ## Delete blobs from the Azurite origin container (use PREFIX=foo)
+data-delete: ## Delete objects from the origin (use PREFIX=foo)
 	@if [ -f "$(ENV_FILE)" ]; then set -a && . "$(ENV_FILE)" && set +a; fi; \
-	go run "$(REPO_ROOT)/hack/cmd/orcaseed" delete \
-		--endpoint "$(SEED_ENDPOINT)" \
-		--container "$${AZURE_CONTAINER:-orca-test}" \
-		--prefix "$(PREFIX)" \
-		$(SEED_ARGS)
+	go run "$(REPO_ROOT)/hack/cmd/orcadev" delete --prefix "$(PREFIX)" $(ARGS)
+
+roundtrip: ## Upload a file, fetch via orca, verify SHA-256 matches (FILE=path)
+	@[ -n "$(FILE)" ] || { echo "Usage: make roundtrip FILE=/path/to/file [ARGS='--repeat 3']" >&2; exit 1; }
+	@if [ -f "$(ENV_FILE)" ]; then set -a && . "$(ENV_FILE)" && set +a; fi; \
+	go run "$(REPO_ROOT)/hack/cmd/orcadev" roundtrip --file "$(FILE)" $(ARGS)
+
+cache-list: ## Enumerate cachestore chunks
+	@if [ -f "$(ENV_FILE)" ]; then set -a && . "$(ENV_FILE)" && set +a; fi; \
+	go run "$(REPO_ROOT)/hack/cmd/orcadev" cache list $(ARGS)
+
+cache-inspect: ## Show chunk presence for an object (BUCKET=b KEY=k)
+	@[ -n "$(BUCKET)" ] && [ -n "$(KEY)" ] || { echo "Usage: make cache-inspect BUCKET=b KEY=k" >&2; exit 1; }
+	@if [ -f "$(ENV_FILE)" ]; then set -a && . "$(ENV_FILE)" && set +a; fi; \
+	go run "$(REPO_ROOT)/hack/cmd/orcadev" cache inspect --bucket "$(BUCKET)" --key "$(KEY)" $(ARGS)
+
+cache-clear: ## Delete chunks from the cachestore (see --all / --origin-id / --object)
+	@if [ -f "$(ENV_FILE)" ]; then set -a && . "$(ENV_FILE)" && set +a; fi; \
+	go run "$(REPO_ROOT)/hack/cmd/orcadev" cache clear $(ARGS)
+
+bench: ## Parallel GET throughput / latency benchmark (KEY=name)
+	@[ -n "$(KEY)" ] || { echo "Usage: make bench KEY=foo [ARGS='--duration 30s --concurrency 16']" >&2; exit 1; }
+	@if [ -f "$(ENV_FILE)" ]; then set -a && . "$(ENV_FILE)" && set +a; fi; \
+	go run "$(REPO_ROOT)/hack/cmd/orcadev" bench --key "$(KEY)" $(ARGS)
+
+scenario: ## Run a canned end-to-end scenario (NAME=cold-warm|range-stress|empty-object|etag-change)
+	@[ -n "$(NAME)" ] || { echo "Usage: make scenario NAME=cold-warm [ARGS='--size 8MiB']" >&2; exit 1; }
+	@if [ -f "$(ENV_FILE)" ]; then set -a && . "$(ENV_FILE)" && set +a; fi; \
+	go run "$(REPO_ROOT)/hack/cmd/orcadev" scenario "$(NAME)" $(ARGS)

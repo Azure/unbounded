@@ -13,7 +13,7 @@ prerequisites, switching origin modes), see [dev-harness.md](./dev-harness.md).
 
 - `kind`, `kubectl`, `podman` (or `docker`).
 - `go` toolchain (used to build the orca image and run the
-  `hack/cmd/orcaseed` tool).
+  `hack/cmd/orcadev` tool).
 
 ## Step 1 - One-time setup
 
@@ -63,30 +63,31 @@ make -C hack/orca status
 
 ## Step 3 - Seed the origin
 
-Azurite is exposed to the host via NodePort `30100` (Kind's
-extraPortMapping forwards it to `localhost:30100`), so no
-`kubectl port-forward` is needed for the seeder.
+Both Azurite (NodePort 30100) and LocalStack S3 (NodePort 30200) are
+exposed to the host via Kind's `extraPortMappings`, so no
+`kubectl port-forward` is needed for the dev tool. Pick the driver
+that matches your `.env` ORIGIN_DRIVER value.
 
 ```bash
 # 5 x 10 MiB random blobs named synth-0 ... synth-4
-make -C hack/orca seed-generate SEED_ARGS='--size 10MiB --count 5'
+make -C hack/orca data-generate ARGS='--size 10MiB --count 5'
 
 # Or a single 100 MiB blob named big-0
-make -C hack/orca seed-generate SEED_ARGS='--size 100MiB --count 1 --prefix big-'
+make -C hack/orca data-generate ARGS='--size 100MiB --count 1 --prefix big-'
 
 # Or upload a real file from disk
-make -C hack/orca seed-upload FILE=~/data.tar.gz
+make -C hack/orca data-upload FILE=~/data.tar.gz
 
 # Reproducible content (same --seed -> byte-identical blobs)
-make -C hack/orca seed-generate SEED_ARGS='--size 10MiB --count 3 --seed 42'
+make -C hack/orca data-generate ARGS='--size 10MiB --count 3 --seed 42'
 
 # Inspect / clean up
-make -C hack/orca seed-list
-make -C hack/orca seed-delete PREFIX=synth- SEED_ARGS='--yes'
+make -C hack/orca data-list
+make -C hack/orca data-delete PREFIX=synth- ARGS='--yes'
 ```
 
 Per-blob ceiling: 1 GiB unless `--force`. Cumulative-bytes warning at
-1 GiB. The seeder uses chunked uploads, so very large blobs do not
+1 GiB. orcadev uses chunked uploads, so very large blobs do not
 buffer in host memory.
 
 ## Step 4 - Port-forward the Orca edge
@@ -171,7 +172,7 @@ kubectl --context kind-orca-dev -n unbounded-kube exec deploy/localstack -- \
   awslocal s3 rm s3://orca-cache --recursive
 
 # Clear the origin between experiments:
-make -C hack/orca seed-delete SEED_ARGS='--yes'
+make -C hack/orca data-delete ARGS='--yes'
 ```
 
 ## Step 8 - Tear down
@@ -192,10 +193,15 @@ Deletes the Kind cluster (and everything in it).
 | `make -C hack/orca status` | `kubectl get pods -o wide` in the namespace. |
 | `make -C hack/orca logs` | Tail all Orca pods. |
 | `make -C hack/orca port-forward` | localhost:8443 -> edge service. |
-| `make -C hack/orca seed-generate SEED_ARGS='...'` | Synthetic content. |
-| `make -C hack/orca seed-upload FILE=...` | Upload a real file. |
-| `make -C hack/orca seed-list` | What's in the container. |
-| `make -C hack/orca seed-delete [PREFIX=...]` | Remove blobs. |
+| `make -C hack/orca data-generate ARGS='...'` | Synthetic content. |
+| `make -C hack/orca data-upload FILE=...` | Upload a real file. |
+| `make -C hack/orca data-list` | What's in the origin. |
+| `make -C hack/orca data-delete [PREFIX=...]` | Remove origin objects. |
+| `make -C hack/orca roundtrip FILE=...` | Upload + fetch via orca + verify checksum. |
+| `make -C hack/orca cache-list` | Enumerate cachestore chunks. |
+| `make -C hack/orca cache-inspect BUCKET=b KEY=k` | Per-chunk presence for one object. |
+| `make -C hack/orca bench KEY=...` | Parallel GET throughput benchmark. |
+| `make -C hack/orca scenario NAME=...` | Canned end-to-end scenario. |
 
 ## Alternative: integration tests (no Kind cluster)
 

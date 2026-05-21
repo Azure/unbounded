@@ -3,9 +3,11 @@
 # 1 control-plane + 3 workers. The 3 workers match Orca's default
 # replica count and the required pod-anti-affinity (hostname topology).
 #
-# extraPortMappings on the first worker exposes Azurite's NodePort
-# (default 30100) to the host so the seeder tool (hack/cmd/orcaseed)
-# can reach Azurite at http://localhost:30100/devstoreaccount1/
+# extraPortMappings on the first worker expose:
+#   30100 -> Azurite (azureblob origin in dev)
+#   30200 -> LocalStack (awss3 origin + cachestore in dev)
+# Both NodePorts are reached at http://localhost:<nodePort>/ from the
+# host so host-side dev tools (hack/cmd/orcadev) can talk to them
 # without a kubectl port-forward. NodePort services in Kind aren't
 # routable from the host without explicit port mappings.
 kind: Cluster
@@ -17,6 +19,9 @@ nodes:
     extraPortMappings:
       - containerPort: 30100
         hostPort: 30100
+        protocol: TCP
+      - containerPort: 30200
+        hostPort: 30200
         protocol: TCP
   - role: worker
   - role: worker
