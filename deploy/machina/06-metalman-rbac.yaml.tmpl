@@ -109,10 +109,17 @@ rules:
   # Machine controller
   - apiGroups: ["unbounded-cloud.io"]
     resources: ["machines"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "update", "patch"]
   - apiGroups: ["unbounded-cloud.io"]
     resources: ["machines/status"]
-    verbs: ["update"]
+    verbs: ["get", "update"]
+  # MachineOperation controller
+  - apiGroups: ["unbounded-cloud.io"]
+    resources: ["machineoperations"]
+    verbs: ["get", "list", "watch", "delete"]
+  - apiGroups: ["unbounded-cloud.io"]
+    resources: ["machineoperations/status"]
+    verbs: ["get", "update", "patch"]
   # Secrets (Redfish passwords)
   - apiGroups: [""]
     resources: ["secrets"]

@@ -191,6 +191,37 @@ func TestResolveKubelet_BothAuthMethodsRejected(t *testing.T) {
 	assert.ErrorContains(t, err, "mutually exclusive")
 }
 
+func TestResolveKubelet_NodeIP(t *testing.T) {
+	cfg := &config.AgentConfig{
+		Cluster: config.AgentClusterConfig{
+			CaCertBase64: "Y2EtYnl0ZXM=",
+		},
+		Kubelet: config.AgentKubeletConfig{
+			ApiServer: "https://api.example.com",
+			NodeIP:    "10.0.0.15,fd00::15",
+		},
+	}
+
+	k, err := resolveKubelet(cfg)
+	assert.NoError(t, err)
+	assert.Equal(t, "10.0.0.15,fd00::15", k.NodeIP)
+}
+
+func TestResolveKubelet_InvalidNodeIPRejected(t *testing.T) {
+	cfg := &config.AgentConfig{
+		Cluster: config.AgentClusterConfig{
+			CaCertBase64: "Y2EtYnl0ZXM=",
+		},
+		Kubelet: config.AgentKubeletConfig{
+			ApiServer: "https://api.example.com",
+			NodeIP:    "not-an-ip",
+		},
+	}
+
+	_, err := resolveKubelet(cfg)
+	assert.ErrorContains(t, err, "invalid Kubelet.NodeIP")
+}
+
 func TestResolveMachine_UsesConfigNodeName(t *testing.T) {
 	cfg := &config.AgentConfig{
 		MachineName: "machine-1",

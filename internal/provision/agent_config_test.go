@@ -26,6 +26,7 @@ func TestAgentConfig_MarshalJSON(t *testing.T) {
 		},
 		Kubelet: AgentKubeletConfig{
 			ApiServer: "api.example.com:443",
+			NodeIP:    "10.0.0.15",
 			Auth: KubeletAuthInfo{
 				BootstrapToken: "abc123.secret456",
 			},
@@ -54,6 +55,7 @@ func TestAgentConfig_MarshalJSON(t *testing.T) {
 
 	kubelet := parsed["Kubelet"].(map[string]interface{})
 	require.Equal(t, "api.example.com:443", kubelet["ApiServer"])
+	require.Equal(t, "10.0.0.15", kubelet["NodeIP"])
 	auth := kubelet["Auth"].(map[string]interface{})
 	require.Equal(t, "abc123.secret456", auth["BootstrapToken"])
 
@@ -81,6 +83,7 @@ func TestAgentConfig_RoundTrip(t *testing.T) {
 		},
 		Kubelet: AgentKubeletConfig{
 			ApiServer: "k8s.example.com:6443",
+			NodeIP:    "10.0.0.16",
 			Auth: KubeletAuthInfo{
 				BootstrapToken: "tok.sec",
 			},
@@ -98,6 +101,7 @@ func TestAgentConfig_RoundTrip(t *testing.T) {
 
 	require.Equal(t, original.MachineName, decoded.MachineName)
 	require.Equal(t, original.NodeName, decoded.NodeName)
+	require.Equal(t, original.Kubelet.NodeIP, decoded.Kubelet.NodeIP)
 	require.Equal(t, original.Cluster, decoded.Cluster)
 	require.Equal(t, original.Kubelet.Labels, decoded.Kubelet.Labels)
 	require.Equal(t, original.Kubelet.RegisterWithTaints, decoded.Kubelet.RegisterWithTaints)

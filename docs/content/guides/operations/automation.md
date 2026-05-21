@@ -27,7 +27,8 @@ spec:
 Agent-handled operations (`NodeReboot`, `AgentUpgrade`, `AgentReset`) support
 `spec.machineSelector` to target machines by label. Each agent independently
 checks whether its machine matches the selector and executes the operation if it
-does.
+does. Metalman-managed bare-metal host operations also support selectors when
+the selector is scoped to one metalman site with `unbounded-cloud.io/site=<site>`.
 
 ```yaml
 apiVersion: unbounded-cloud.io/v1alpha3
@@ -46,14 +47,13 @@ kubectl apply -f reboot-gpu-nodes.yaml
 kubectl get mop reboot-gpu-nodes -w
 ```
 
-> **Note:** `machineSelector` is not supported for host operations
-> (`HostReboot`, `HostPowerOff`, `HostPowerOn`, `HostReplace`). For those,
-> create individual operations per machine using the loop patterns below.
+> **Note:** Cloud VM host operations still require one operation per machine.
+> Bare-metal host selectors are handled only by the metalman instance for the
+> selected site.
 
 ## Batch Host Operations
 
-To apply host operations across multiple machines, create one MachineOperation
-per machine:
+For cloud VM host operations, create one MachineOperation per machine:
 
 ```bash
 # Reboot all machines in a list
