@@ -49,6 +49,7 @@ from __future__ import annotations
 import argparse
 import base64
 import concurrent.futures
+import hashlib
 import json
 import os
 import re
@@ -319,6 +320,19 @@ def _safe_name(value: str) -> str:
     """Return a DNS-label-safe name fragment for VM and node names."""
     safe = re.sub(r"[^a-z0-9-]+", "-", value.lower()).strip("-")
     return safe or "config"
+
+
+def qemu_mac_address() -> str:
+    """Return a stable, per-VM MAC address for the QEMU tap interface."""
+    try:
+        octets = [int(part) for part in VM_IP.split(".")]
+        if len(octets) == 4 and all(0 <= part <= 255 for part in octets):
+            return f"52:54:00:{octets[1]:02x}:{octets[2]:02x}:{octets[3]:02x}"
+    except ValueError:
+        pass
+
+    digest = hashlib.sha256(f"{VM_NAME}-{VM_IP}".encode()).digest()
+    return f"52:54:00:{digest[0]:02x}:{digest[1]:02x}:{digest[2]:02x}"
 
 
 def discover_node_configs() -> list[NodeConfig]:
@@ -877,6 +891,7 @@ def _launch_vm(ssh_pub_key: str) -> None:
     # Launch QEMU VM
     pid_file = VM_DIR / f"{VM_NAME}.pid"
     qemu_log = VM_DIR / f"{VM_NAME}.log"
+    mac_address = qemu_mac_address()
 
     log("============================================")
     log(f"  Launching VM: {VM_NAME}")
@@ -884,6 +899,7 @@ def _launch_vm(ssh_pub_key: str) -> None:
     log(f"  CPUs:         {VM_CPUS}")
     log(f"  Disk:         {vm_disk}")
     log(f"  IP:           {VM_IP}")
+    log(f"  MAC:          {mac_address}")
     log(f"  Bridge:       {BRIDGE_NAME}")
     log(f"  Log:          {qemu_log}")
     log("============================================")
@@ -895,7 +911,7 @@ def _launch_vm(ssh_pub_key: str) -> None:
         "-drive", f"file={vm_disk},format=qcow2,if=virtio",
         "-drive", f"file={seed_iso},format=raw,if=virtio",
         "-netdev", f"tap,id=net0,ifname={TAP_NAME},script=no,downscript=no",
-        "-device", "virtio-net-pci,netdev=net0",
+        "-device", f"virtio-net-pci,netdev=net0,mac={mac_address}",
         "-daemonize", "-pidfile", str(pid_file),
         "-serial", f"file:{qemu_log}",
         "-display", "none",
