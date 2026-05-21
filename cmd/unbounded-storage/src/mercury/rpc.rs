@@ -1,27 +1,19 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Wire schema for the single `ub.bufferpool.bulk_get.v1` RPC.
+//! On-the-wire RPC structs and context selector.
 //!
-//! The Rust side stages input/output through plain `#[repr(C)]`
-//! structs that mirror `shim.c` byte-for-byte. The C shim provides
-//! the two proc callbacks Mercury needs to walk these structs on
-//! encode / decode; we never poke at proc internals from Rust.
-//!
-//! The opaque `req_bytes` slice carries the bincode-encoded
-//! `R: Serialize`. Routing metadata (`stripe_key`, `stripe_off`,
-//! `len`) is duplicated on the wire so the server can dispatch a
-//! request without deserializing `R` if its source happens not to
-//! need it.
+//! `BulkGetIn` / `BulkGetOut` mirror the C structs declared in
+//! `mercury/shim.c`; the wire format is owned by that file and these
+//! Rust types must keep field order and types identical to the C
+//! definitions. The inline tests below cross-check the layout via
+//! `ub_sizeof_*` shims.
 
-use crate::mercury::ffi;
+use super::ffi::hg_bulk_t;
 
-/// Single registered RPC name. Bumping `v1` is the migration path
-/// if the wire ever needs to change.
-pub const RPC_NAME: &[u8] = b"ub.bufferpool.bulk_get.v1\0";
-
-/// Wire input. Field order and types match `struct ub_bulk_get_in`
-/// in `shim.c`; do not reorder without updating the shim.
+/// Mirror of `struct ub_bulk_get_in` defined in `mercury/shim.c`.
+/// Wire format is owned by `shim.c`; this struct must keep field order
+/// and types identical to that definition.
 #[repr(C)]
 pub struct BulkGetIn {
     pub stripe_key: [u8; 32],
@@ -29,75 +21,143 @@ pub struct BulkGetIn {
     pub dst_offset: u64,
     pub len: u32,
     pub req_bytes_len: u32,
-    /// On the client side, points into a `Box<[u8]>` owned by the
-    /// caller for the lifetime of the `HG_Forward` call. On the
-    /// server side, allocated by `malloc` inside the shim and freed
-    /// by `HG_Free_input` (which invokes the proc with `HG_FREE`).
     pub req_bytes: *mut u8,
-    pub dst_bulk: ffi::hg_bulk_t,
+    pub dst_bulk: hg_bulk_t,
 }
 
-impl BulkGetIn {
-    pub fn zeroed() -> Self {
-        Self {
-            stripe_key: [0u8; 32],
-            stripe_off: 0,
-            dst_offset: 0,
-            len: 0,
-            req_bytes_len: 0,
-            req_bytes: std::ptr::null_mut(),
-            dst_bulk: std::ptr::null_mut(),
-        }
-    }
-}
-
-/// Wire output. Single status code; non-zero means the server-side
-/// bulk push failed or the source rejected the request.
+/// Mirror of `struct ub_bulk_get_out` defined in `mercury/shim.c`.
 #[repr(C)]
 pub struct BulkGetOut {
     pub status: i32,
 }
 
+impl BulkGetIn {
+    /// Returns a fully-zeroed `BulkGetIn`. Useful as a starting point for
+    /// either populating before `HG_Forward` or as the receiving struct
+    /// passed to `HG_Get_input`.
+    ///
+    /// # Safety
+    /// `req_bytes` and `dst_bulk` are zeroed; the caller must populate
+    /// them before any FFI use.
+    pub unsafe fn zeroed() -> Self {
+        // SAFETY: `BulkGetIn` is `#[repr(C)]` and contains only POD-style
+        // fields (integers, fixed array, raw pointers). An all-zero
+        // bit pattern is a valid value for every field; the pointer
+        // fields become null, which the caller must overwrite before
+        // any FFI use as documented above.
+        unsafe { std::mem::zeroed() }
+    }
+}
+
 impl BulkGetOut {
-    pub fn zeroed() -> Self {
+    /// Returns `BulkGetOut { status: 0 }`.
+    pub fn ok() -> Self {
         Self { status: 0 }
     }
 }
 
-/// Defensive check: the Rust `#[repr(C)]` struct must match the C
-/// shim's view of the same layout. Mismatch would corrupt every
-/// in-flight RPC; bail loudly at construction time instead.
-pub(crate) fn assert_layouts() -> Result<(), &'static str> {
-    // SAFETY: shim symbols return a `size_t` and have no side effects.
-    let in_c = unsafe { ffi::ub_sizeof_bulk_get_in() };
-    if in_c != std::mem::size_of::<BulkGetIn>() {
-        return Err("BulkGetIn size mismatches shim layout");
-    }
-    let out_c = unsafe { ffi::ub_sizeof_bulk_get_out() };
-    if out_c != std::mem::size_of::<BulkGetOut>() {
-        return Err("BulkGetOut size mismatches shim layout");
-    }
-    Ok(())
+/// Distributes inbound RPCs across the contexts of a single `Nic`.
+#[derive(Debug, Clone, Copy)]
+pub struct CtxSelector {
+    pub contexts: u16,
 }
 
-/// Re-export the shim proc callbacks at safe-ish types. Mercury
-/// invokes these on its progress thread; we never call them
-/// directly. The functions only touch their `data` pointer and the
-/// proc state, neither of which has Rust-visible aliasing concerns.
-pub(crate) fn in_proc() -> ffi::hg_proc_cb_t {
-    ffi::ub_proc_bulk_get_in
-}
+impl CtxSelector {
+    /// Construct. `contexts` must be >= 1.
+    pub fn new(contexts: u16) -> Self {
+        assert!(contexts >= 1, "CtxSelector requires at least one context");
+        Self { contexts }
+    }
 
-pub(crate) fn out_proc() -> ffi::hg_proc_cb_t {
-    ffi::ub_proc_bulk_get_out
+    /// Map a hash to a context index in `[0, self.contexts)`.
+    pub fn pick(&self, addr_hash: u64) -> u16 {
+        // Modulo bias on a 64-bit hash is negligible for the small
+        // `contexts` values we use (typically <= 64).
+        (addr_hash % self.contexts as u64) as u16
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mercury::ffi::{ub_sizeof_bulk_get_in, ub_sizeof_bulk_get_out};
+    use rand::{Rng, SeedableRng};
+    use rand_chacha::ChaCha8Rng;
 
     #[test]
-    fn wire_layout_matches_shim() {
-        assert_layouts().expect("layout mismatch");
+    fn layout_matches_c_shim() {
+        // SAFETY: `ub_sizeof_*` are pure C functions that return
+        // `sizeof(struct)` and have no preconditions.
+        assert_eq!(std::mem::size_of::<BulkGetIn>(), unsafe {
+            ub_sizeof_bulk_get_in()
+        });
+        // SAFETY: as above.
+        assert_eq!(std::mem::size_of::<BulkGetOut>(), unsafe {
+            ub_sizeof_bulk_get_out()
+        });
+    }
+
+    #[test]
+    fn bulk_get_in_zeroed_is_all_zero() {
+        // SAFETY: `zeroed()` returns a valid all-zero `BulkGetIn`; we
+        // only read its fields here, never dereference the null
+        // pointers it contains.
+        let v = unsafe { BulkGetIn::zeroed() };
+        assert_eq!(v.stripe_key, [0u8; 32]);
+        assert_eq!(v.stripe_off, 0);
+        assert_eq!(v.dst_offset, 0);
+        assert_eq!(v.len, 0);
+        assert_eq!(v.req_bytes_len, 0);
+        assert!(v.req_bytes.is_null());
+        assert!(v.dst_bulk.is_null());
+    }
+
+    #[test]
+    fn bulk_get_out_ok_is_zero() {
+        assert_eq!(BulkGetOut::ok().status, 0);
+    }
+
+    #[test]
+    fn pick_stays_in_range() {
+        for &contexts in &[1u16, 2, 4, 8] {
+            let sel = CtxSelector::new(contexts);
+            // 1024 evenly spaced u64 values across the full range.
+            let step = u64::MAX / 1024;
+            for i in 0..1024u64 {
+                let h = i.wrapping_mul(step);
+                let idx = sel.pick(h);
+                assert!(idx < contexts, "pick({h}) = {idx} not in [0, {contexts})");
+            }
+        }
+    }
+
+    #[test]
+    fn pick_distribution_is_balanced() {
+        let sel = CtxSelector::new(4);
+        let mut rng = ChaCha8Rng::seed_from_u64(0);
+        let mut hist = [0usize; 4];
+        let n = 4096usize;
+        for _ in 0..n {
+            let h: u64 = rng.r#gen();
+            hist[sel.pick(h) as usize] += 1;
+        }
+        let mean = n as f64 / 4.0;
+        let lo = mean * 0.75;
+        let hi = mean * 1.25;
+        for (i, &c) in hist.iter().enumerate() {
+            let cf = c as f64;
+            assert!(
+                cf >= lo && cf <= hi,
+                "bucket {i} count {c} outside [{lo}, {hi}] (mean {mean})"
+            );
+        }
+    }
+
+    #[test]
+    fn pick_with_one_context_is_zero() {
+        let sel = CtxSelector::new(1);
+        for h in [0u64, 1, 42, u64::MAX, 0xDEAD_BEEF_CAFE_F00D] {
+            assert_eq!(sel.pick(h), 0);
+        }
     }
 }

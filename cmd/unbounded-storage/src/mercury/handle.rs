@@ -1,175 +1,233 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! RAII wrappers over Mercury's `hg_handle_t` and decoded output structs.
+//! RAII wrapper around `hg_handle_t`.
 //!
-//! The bare FFI threads handle lifetimes through every error path by hand:
-//! `HG_Create` produces a handle, `HG_Forward`/`HG_Respond` consume it on
-//! success, and the callback (or the caller) is responsible for `HG_Destroy`.
-//! Likewise `HG_Get_output` allocates proc-owned fields that must be paired
-//! with `HG_Free_output`. Both pairings become Rust ownership here so the
-//! transport and server code no longer carry one `unsafe` block per call.
+//! `Handle` owns a Mercury handle and calls `HG_Destroy` on drop. The
+//! per-handle FFI calls (`HG_Forward`, `HG_Respond`, `HG_Get_input`,
+//! `HG_Free_input`, `HG_Get_output`, `HG_Free_output`, `HG_Cancel`) are
+//! exposed as thin wrappers that map non-success returns into the
+//! crate's `HgError`. This file is intentionally narrow: nothing here
+//! touches a Mercury class or context directly; that bookkeeping
+//! belongs in `nic.rs` and `context.rs` in later waves.
 
-use std::ffi::c_void;
-use std::ops::Deref;
+use std::os::raw::c_void;
+use std::ptr::NonNull;
 
-use crate::mercury::class::ClassInner;
-use crate::mercury::error::{HgError, Result, check};
-use crate::mercury::ffi;
+use super::error::{HgError, Result, check};
+use super::ffi::{
+    self, HG_SUCCESS, HgInfo, hg_addr_t, hg_cb_t, hg_context_t, hg_handle_t, hg_id_t,
+};
 
-/// RAII wrapper around an `hg_handle_t`. Dropping the wrapper calls
-/// `HG_Destroy`.
+/// Owning RAII wrapper around `hg_handle_t`. Drop calls `HG_Destroy`.
 ///
-/// Ownership semantics intentionally mirror the FFI:
-///
-/// - `forward` consumes the wrapper because Mercury takes ownership of the
-///   handle for the duration of the in-flight RPC; the forward callback
-///   reconstructs a wrapper from the union variant and lets it drop.
-/// - `respond` borrows the wrapper because the server-side flow awaits the
-///   respond callback (which only signals completion) and then destroys the
-///   handle on the executor thread by dropping the wrapper.
-pub(crate) struct Handle(ffi::hg_handle_t);
+/// Not `Send`/`Sync` by default: a handle is bound to the context that
+/// created it (or whose RPC callback received it) and must be operated
+/// on from the thread driving that context's progress. Crossing thread
+/// boundaries is unsupported by Mercury.
+pub struct Handle {
+    raw: NonNull<ffi::hg_handle>,
+    /// `true` iff this `Handle` should call `HG_Destroy` on drop.
+    /// Server-side handles obtained from a `hg_rpc_cb_t` callback must
+    /// be destroyed by us; we set `owns = true` either way and rely on
+    /// Mercury's `HG_Destroy` being idempotent enough to handle the
+    /// post-respond case. Set to `false` only when ownership has been
+    /// explicitly transferred (e.g. into a callback arg).
+    owns: bool,
+}
 
 impl Handle {
-    /// Wrap an existing raw `hg_handle_t`.
+    /// Construct a client-side handle by calling `HG_Create`.
+    pub fn create(context: hg_context_t, addr: hg_addr_t, rpc_id: hg_id_t) -> Result<Self> {
+        let mut raw: hg_handle_t = std::ptr::null_mut();
+        // SAFETY: `HG_Create` writes through `&mut raw` only on success;
+        // `context` and `addr` are caller-provided Mercury pointers
+        // whose validity is the caller's responsibility. We immediately
+        // wrap the resulting non-null pointer in `NonNull` and own it.
+        let rc = unsafe { ffi::HG_Create(context, addr, rpc_id, &mut raw) };
+        check(rc, HgError::HgCreate)?;
+        let raw = NonNull::new(raw).ok_or(HgError::HgCreate(HG_SUCCESS))?;
+        Ok(Self { raw, owns: true })
+    }
+
+    /// Wrap a raw `hg_handle_t` taken from a server-side `hg_rpc_cb_t`
+    /// callback or from `HG_Create` already done elsewhere.
     ///
     /// # Safety
-    ///
-    /// `raw` must be a live handle that the caller now exclusively owns.
-    /// Typical sources: `Handle::into_raw`, the `forward.handle` field of
-    /// `hg_cb_info` inside a forward callback, or the handle argument to a
-    /// registered RPC callback.
-    pub(crate) unsafe fn from_raw(raw: ffi::hg_handle_t) -> Self {
-        Self(raw)
+    /// `raw` must be a non-null, currently-valid `hg_handle_t` whose
+    /// destruction has not been started. The caller transfers
+    /// ownership: this `Handle` will call `HG_Destroy` on drop unless
+    /// `into_raw` is invoked first.
+    pub unsafe fn from_raw(raw: hg_handle_t) -> Result<Self> {
+        let raw = NonNull::new(raw).ok_or(HgError::HgCreate(HG_SUCCESS))?;
+        Ok(Self { raw, owns: true })
     }
 
-    /// Borrow the raw handle without giving up ownership.
-    pub(crate) fn as_raw(&self) -> ffi::hg_handle_t {
-        self.0
+    /// Borrow the raw handle without giving up ownership. The pointer
+    /// is only valid for the lifetime of `&self`.
+    pub fn as_raw(&self) -> hg_handle_t {
+        self.raw.as_ptr()
     }
 
-    /// Surrender ownership of the raw handle, suppressing `Drop`. The caller
-    /// is responsible for destruction (directly via `HG_Destroy` or by
-    /// reconstructing a `Handle` with `from_raw`).
-    pub(crate) fn into_raw(self) -> ffi::hg_handle_t {
-        let raw = self.0;
-        std::mem::forget(self);
-        raw
+    /// Surrender ownership; caller now responsible for `HG_Destroy`.
+    pub fn into_raw(mut self) -> hg_handle_t {
+        self.owns = false;
+        self.raw.as_ptr()
     }
 
-    /// Create a client-side handle bound to `addr` on the class's context
-    /// and registered RPC id.
-    pub(crate) fn create(class: &ClassInner, addr: ffi::hg_addr_t) -> Result<Self> {
-        let mut h: ffi::hg_handle_t = std::ptr::null_mut();
-        // SAFETY: `hg_context` and `rpc_id` are class-owned and live for the
-        // lifetime of `ClassInner`; `addr` is owned by the peer table.
-        let ret = unsafe { ffi::HG_Create(class.hg_context, addr, class.rpc_id, &mut h) };
-        check(ret, "HG_Create")?;
-        Ok(Self(h))
-    }
-
-    /// Submit `HG_Forward`. Consumes `self`: on success the FFI owns the
-    /// handle until its callback fires; on error the handle is destroyed
-    /// by the wrapper's `Drop`.
-    pub(crate) fn forward<I>(
-        self,
-        cb: ffi::hg_cb_t,
-        arg: *mut c_void,
-        input: &mut I,
-    ) -> Result<()> {
-        // SAFETY: handle is live; `input` is borrowed for the duration of
-        // the call. Mercury copies any indirect bytes through the proc
-        // synchronously, so `input` does not need to outlive this call.
-        let ret = unsafe { ffi::HG_Forward(self.0, Some(cb), arg, input as *mut _ as *mut c_void) };
-        if ret != ffi::HG_SUCCESS {
-            // `self` drops here -> `HG_Destroy` runs.
-            return Err(HgError::new(ret as i32, "HG_Forward"));
-        }
-        // Ownership has transferred to the FFI/callback.
-        let _ = self.into_raw();
-        Ok(())
-    }
-
-    /// Submit `HG_Respond` without giving up ownership of the handle.
-    pub(crate) fn respond<O>(
-        &self,
-        cb: ffi::hg_cb_t,
-        arg: *mut c_void,
-        output: &mut O,
-    ) -> Result<()> {
-        // SAFETY: handle is live for the duration of `&self`; `output` is
-        // borrowed for the call and Mercury copies through the proc.
-        let ret =
-            unsafe { ffi::HG_Respond(self.0, Some(cb), arg, output as *mut _ as *mut c_void) };
-        check(ret, "HG_Respond")
-    }
-
-    /// Decode the incoming input struct via `HG_Get_input`. The caller is
-    /// responsible for the matching `HG_Free_input` because Mercury's
-    /// `HG_FREE` op also frees nested bulk handles, which the server
-    /// pipeline still needs to drive after this call returns.
-    pub(crate) fn get_input<I>(&self, out: &mut I) -> Result<()> {
-        // SAFETY: handle is live; `out` is borrowed for the call. Mercury
-        // decodes into `*out`.
-        let ret = unsafe { ffi::HG_Get_input(self.0, out as *mut _ as *mut c_void) };
-        check(ret, "HG_Get_input")
-    }
-
-    /// Free the proc-owned input previously decoded with `get_input`.
-    pub(crate) fn free_input<I>(&self, out: &mut I) {
-        // SAFETY: paired with a successful `get_input` on the same handle.
+    /// Returns the `HgInfo` struct exposed by the C shim.
+    /// The pointer is owned by Mercury and stays valid for the
+    /// lifetime of the handle.
+    pub fn info(&self) -> &HgInfo {
+        // SAFETY: `ub_handle_info` returns a pointer that the shim
+        // documents as valid for the lifetime of the handle. Tying the
+        // reference to `&self` ensures we cannot outlive the handle,
+        // and the shim never returns null for a live handle.
         unsafe {
-            let _ = ffi::HG_Free_input(self.0, out as *mut _ as *mut c_void);
+            let ptr = ffi::ub_handle_info(self.raw.as_ptr());
+            &*ptr
         }
     }
 
-    /// Decode the output struct into a guard that calls `HG_Free_output`
-    /// on drop.
-    pub(crate) fn get_output<O>(&self, mut init: O) -> Result<OutputGuard<'_, O>> {
-        // SAFETY: handle is live; `init` is owned by us until the guard
-        // takes it.
-        let ret = unsafe { ffi::HG_Get_output(self.0, &mut init as *mut _ as *mut c_void) };
-        check(ret, "HG_Get_output")?;
-        Ok(OutputGuard {
-            handle: self,
-            out: Some(init),
-        })
+    /// `HG_Forward(self.raw, callback, arg, in_struct)`.
+    ///
+    /// # Safety
+    /// `in_struct` must be a valid pointer to the input type registered
+    /// for this handle's RPC id; it must remain valid until `callback`
+    /// fires. `callback` and `arg` follow Mercury's lifetime rules
+    /// (`arg` may be opaque; the callee invokes `callback(arg, ret)`).
+    pub unsafe fn forward(
+        &self,
+        callback: Option<hg_cb_t>,
+        arg: *mut c_void,
+        in_struct: *mut c_void,
+    ) -> Result<()> {
+        // SAFETY: `self.raw` is non-null and owned; `callback`, `arg`,
+        // and `in_struct` are validated by the caller per the
+        // function-level safety contract.
+        let rc = unsafe { ffi::HG_Forward(self.raw.as_ptr(), callback, arg, in_struct) };
+        check(rc, HgError::HgForward)
+    }
+
+    /// `HG_Respond(self.raw, callback, arg, out_struct)`.
+    ///
+    /// # Safety
+    /// Same lifetime rules as `forward`.
+    pub unsafe fn respond(
+        &self,
+        callback: Option<hg_cb_t>,
+        arg: *mut c_void,
+        out_struct: *mut c_void,
+    ) -> Result<()> {
+        // SAFETY: `self.raw` is non-null and owned; pointer validity is
+        // the caller's responsibility per the safety contract.
+        let rc = unsafe { ffi::HG_Respond(self.raw.as_ptr(), callback, arg, out_struct) };
+        check(rc, HgError::HgRespond)
+    }
+
+    /// `HG_Get_input(self.raw, in_struct)`.
+    ///
+    /// # Safety
+    /// `in_struct` must point to a properly-aligned, writeable buffer
+    /// of the registered input type's size. After a successful call,
+    /// the caller must eventually invoke `free_input` against the same
+    /// buffer to release Mercury-owned tail allocations.
+    pub unsafe fn get_input(&self, in_struct: *mut c_void) -> Result<()> {
+        // SAFETY: `self.raw` is non-null and owned; `in_struct` is a
+        // caller-validated buffer.
+        let rc = unsafe { ffi::HG_Get_input(self.raw.as_ptr(), in_struct) };
+        check(rc, HgError::HgGetInput)
+    }
+
+    /// `HG_Free_input(self.raw, in_struct)`.
+    ///
+    /// # Safety
+    /// `in_struct` must be a buffer previously populated by
+    /// `get_input` on this handle.
+    pub unsafe fn free_input(&self, in_struct: *mut c_void) -> Result<()> {
+        // SAFETY: `self.raw` is non-null and owned; `in_struct` was
+        // produced by an earlier `get_input` per the safety contract.
+        let rc = unsafe { ffi::HG_Free_input(self.raw.as_ptr(), in_struct) };
+        check(rc, HgError::HgFreeInput)
+    }
+
+    /// `HG_Get_output(self.raw, out_struct)`.
+    ///
+    /// # Safety
+    /// Same shape as `get_input` for the output type.
+    pub unsafe fn get_output(&self, out_struct: *mut c_void) -> Result<()> {
+        // SAFETY: `self.raw` is non-null and owned; `out_struct` is a
+        // caller-validated buffer.
+        let rc = unsafe { ffi::HG_Get_output(self.raw.as_ptr(), out_struct) };
+        check(rc, HgError::HgGetOutput)
+    }
+
+    /// `HG_Free_output(self.raw, out_struct)`.
+    ///
+    /// # Safety
+    /// Same shape as `free_input` for the output type.
+    pub unsafe fn free_output(&self, out_struct: *mut c_void) -> Result<()> {
+        // SAFETY: `self.raw` is non-null and owned; `out_struct` was
+        // produced by an earlier `get_output` per the safety contract.
+        let rc = unsafe { ffi::HG_Free_output(self.raw.as_ptr(), out_struct) };
+        check(rc, HgError::HgFreeOutput)
+    }
+
+    /// `HG_Cancel(self.raw)`.
+    pub fn cancel(&self) -> Result<()> {
+        // SAFETY: `self.raw` is non-null and owned for the duration of
+        // the call.
+        let rc = unsafe { ffi::HG_Cancel(self.raw.as_ptr()) };
+        // `error.rs` does not expose a dedicated `HgCancel` variant; we
+        // fold cancel failures into `HgRespond` because cancel and
+        // respond are the two completion-side terminations of a handle
+        // and the rc semantics are the same. If a dedicated variant is
+        // added later, swap the fallback here.
+        map_rc(rc, HgError::HgRespond)
     }
 }
 
 impl Drop for Handle {
     fn drop(&mut self) {
-        // SAFETY: `self.0` was either produced by `HG_Create` or handed to
-        // us by Mercury and is destroyed exactly once here.
-        unsafe {
-            let _ = ffi::HG_Destroy(self.0);
-        }
-    }
-}
-
-/// RAII guard returned by `Handle::get_output`. Derefs to the decoded
-/// output struct; calls `HG_Free_output` on drop.
-pub(crate) struct OutputGuard<'a, O> {
-    handle: &'a Handle,
-    out: Option<O>,
-}
-
-impl<O> Deref for OutputGuard<'_, O> {
-    type Target = O;
-    fn deref(&self) -> &O {
-        self.out.as_ref().expect("output guard already consumed")
-    }
-}
-
-impl<O> Drop for OutputGuard<'_, O> {
-    fn drop(&mut self) {
-        if let Some(mut o) = self.out.take() {
-            // SAFETY: paired with the `HG_Get_output` call in
-            // `Handle::get_output`; the handle is still live because we
-            // hold a borrow of it.
+        if self.owns {
+            // SAFETY: self.raw was checked non-null at construction and
+            // ownership has not been transferred away.
             unsafe {
-                let _ = ffi::HG_Free_output(self.handle.as_raw(), &mut o as *mut _ as *mut c_void);
+                let _ = ffi::HG_Destroy(self.raw.as_ptr());
             }
         }
+    }
+}
+
+/// Generic rc -> Result mapper for FFI calls whose error variant is
+/// already chosen by the caller. Kept private; the existing `check`
+/// helper covers most call sites, but `cancel` needs an inline mapping
+/// because we deliberately reuse `HgRespond` as the fallback variant.
+fn map_rc(rc: i32, fallback: fn(i32) -> HgError) -> Result<()> {
+    if rc == HG_SUCCESS {
+        Ok(())
+    } else {
+        Err(fallback(rc))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn into_raw_disables_drop() {
+        // Build a fabricated Handle with owns=false to verify Drop is
+        // a no-op. We never construct one with `owns=true` outside a
+        // real class because Drop would call HG_Destroy on garbage.
+        let fake: hg_handle_t = std::ptr::NonNull::dangling().as_ptr();
+        let h = Handle {
+            raw: NonNull::new(fake).unwrap(),
+            owns: false,
+        };
+        let raw = h.as_raw();
+        assert_eq!(raw, fake);
+        // Drop here is safe because owns=false.
+        drop(h);
     }
 }

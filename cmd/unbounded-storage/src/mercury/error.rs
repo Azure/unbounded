@@ -1,54 +1,91 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Errors returned by the Mercury transport. Mercury returns `int`
-//! status codes from every C entry point; we wrap the failure path
-//! in a single struct that implements `std::error::Error` so it
-//! flows cleanly through `bufferpool::Error::transport`.
+//! Mercury error type and result alias.
+//!
+//! `HgError` enumerates the failure modes the Mercury transport can surface:
+//! one variant per Mercury entry point that returns `hg_return_t`, plus a
+//! handful of higher-level codec/protocol errors. The `check` helper turns a
+//! raw `hg_return_t` into a `Result<()>` using a caller-supplied constructor,
+//! which keeps call sites free of boilerplate `match` on `HG_SUCCESS`.
 
 use std::fmt;
 
-use crate::mercury::ffi;
+use crate::mercury::ffi::HG_SUCCESS;
 
-/// Result alias for the Mercury transport.
+#[derive(Debug)]
+pub enum HgError {
+    HgInit(i32),
+    HgFinalize(i32),
+    HgRegister(i32),
+    HgAddrLookup(i32),
+    HgCreate(i32),
+    HgForward(i32),
+    HgRespond(i32),
+    HgBulkCreate(i32),
+    HgBulkTransfer(i32),
+    HgGetInput(i32),
+    HgFreeInput(i32),
+    HgGetOutput(i32),
+    HgFreeOutput(i32),
+    Encode(&'static str),
+    Decode(&'static str),
+    ShortRead { expected: u32, got: u32 },
+    Closed,
+    Capacity,
+    BadConfig(&'static str),
+}
+
 pub type Result<T> = std::result::Result<T, HgError>;
-
-/// Failure returned from a Mercury entry point. `code` is the raw
-/// `hg_return_t`; `ctx` names the call site so log messages identify
-/// which step failed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HgError {
-    pub code: i32,
-    pub ctx: &'static str,
-}
-
-impl HgError {
-    pub fn new(code: i32, ctx: &'static str) -> Self {
-        Self { code, ctx }
-    }
-}
 
 impl fmt::Display for HgError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "mercury {ctx} failed: code {code}",
-            ctx = self.ctx,
-            code = self.code
-        )
+        match self {
+            HgError::HgInit(rc) => write!(f, "HG_Init failed: rc={rc}"),
+            HgError::HgFinalize(rc) => write!(f, "HG_Finalize failed: rc={rc}"),
+            HgError::HgRegister(rc) => write!(f, "HG_Register failed: rc={rc}"),
+            HgError::HgAddrLookup(rc) => write!(f, "HG_Addr_lookup failed: rc={rc}"),
+            HgError::HgCreate(rc) => write!(f, "HG_Create failed: rc={rc}"),
+            HgError::HgForward(rc) => write!(f, "HG_Forward failed: rc={rc}"),
+            HgError::HgRespond(rc) => write!(f, "HG_Respond failed: rc={rc}"),
+            HgError::HgBulkCreate(rc) => write!(f, "HG_Bulk_create failed: rc={rc}"),
+            HgError::HgBulkTransfer(rc) => write!(f, "HG_Bulk_transfer failed: rc={rc}"),
+            HgError::HgGetInput(rc) => write!(f, "HG_Get_input failed: rc={rc}"),
+            HgError::HgFreeInput(rc) => write!(f, "HG_Free_input failed: rc={rc}"),
+            HgError::HgGetOutput(rc) => write!(f, "HG_Get_output failed: rc={rc}"),
+            HgError::HgFreeOutput(rc) => write!(f, "HG_Free_output failed: rc={rc}"),
+            HgError::Encode(s) => write!(f, "encode error: {s}"),
+            HgError::Decode(s) => write!(f, "decode error: {s}"),
+            HgError::ShortRead { expected, got } => {
+                write!(f, "short read: expected {expected} bytes, got {got}")
+            }
+            HgError::Closed => write!(f, "transport closed"),
+            HgError::Capacity => write!(f, "transport at capacity"),
+            HgError::BadConfig(s) => write!(f, "bad config: {s}"),
+        }
     }
 }
 
 impl std::error::Error for HgError {}
 
-/// Translate a Mercury return code into `Result<()>`. Use at every
-/// FFI boundary; the `ctx` argument is a static string identifying
-/// the caller so error messages are debuggable without backtraces.
-pub fn check(ret: ffi::hg_return_t, ctx: &'static str) -> Result<()> {
-    if ret == ffi::HG_SUCCESS {
+impl From<HgError> for crate::bufferpool::Error {
+    fn from(e: HgError) -> Self {
+        crate::bufferpool::Error::transport(e)
+    }
+}
+
+/// Convert a raw `hg_return_t` into `Result<()>`. On `HG_SUCCESS` returns
+/// `Ok(())`; otherwise builds the error via `into_err(rc)`.
+///
+/// Usage: `check(rc, HgError::HgInit)?;`
+pub(crate) fn check<F>(rc: i32, into_err: F) -> Result<()>
+where
+    F: FnOnce(i32) -> HgError,
+{
+    if rc == HG_SUCCESS {
         Ok(())
     } else {
-        Err(HgError::new(ret as i32, ctx))
+        Err(into_err(rc))
     }
 }
 
@@ -56,36 +93,61 @@ pub fn check(ret: ffi::hg_return_t, ctx: &'static str) -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn check_success_returns_ok() {
-        assert!(check(ffi::HG_SUCCESS, "ctx").is_ok());
+    fn all_variants() -> Vec<HgError> {
+        vec![
+            HgError::HgInit(1),
+            HgError::HgFinalize(2),
+            HgError::HgRegister(3),
+            HgError::HgAddrLookup(4),
+            HgError::HgCreate(5),
+            HgError::HgForward(6),
+            HgError::HgRespond(7),
+            HgError::HgBulkCreate(8),
+            HgError::HgBulkTransfer(9),
+            HgError::HgGetInput(10),
+            HgError::HgFreeInput(11),
+            HgError::HgGetOutput(12),
+            HgError::HgFreeOutput(13),
+            HgError::Encode("enc"),
+            HgError::Decode("dec"),
+            HgError::ShortRead {
+                expected: 16,
+                got: 8,
+            },
+            HgError::Closed,
+            HgError::Capacity,
+            HgError::BadConfig("cfg"),
+        ]
     }
 
     #[test]
-    fn check_nonzero_returns_error_with_code_and_ctx() {
-        let e = check(-7, "did-fail").unwrap_err();
-        assert_eq!(e.code, -7);
-        assert_eq!(e.ctx, "did-fail");
+    fn display_is_non_empty_for_every_variant() {
+        for v in all_variants() {
+            let s = format!("{v}");
+            assert!(!s.is_empty(), "empty display for {v:?}");
+        }
     }
 
     #[test]
-    fn display_includes_code_and_ctx() {
-        let e = HgError::new(42, "site");
-        let s = format!("{e}");
-        assert!(s.contains("42"), "missing code: {s}");
-        assert!(s.contains("site"), "missing ctx: {s}");
+    fn check_success_is_ok() {
+        assert!(matches!(check(HG_SUCCESS, HgError::HgInit), Ok(())));
     }
 
     #[test]
-    fn error_implements_std_error() {
-        fn assert_err<E: std::error::Error>(_: &E) {}
-        assert_err(&HgError::new(0, "x"));
+    fn check_failure_builds_error() {
+        let r = check(1, HgError::HgInit);
+        match r {
+            Err(HgError::HgInit(1)) => {}
+            other => panic!("expected Err(HgInit(1)), got {other:?}"),
+        }
     }
 
     #[test]
-    fn equality_is_by_code_and_ctx() {
-        assert_eq!(HgError::new(1, "a"), HgError::new(1, "a"));
-        assert_ne!(HgError::new(1, "a"), HgError::new(2, "a"));
-        assert_ne!(HgError::new(1, "a"), HgError::new(1, "b"));
+    fn into_bufferpool_error_is_transport() {
+        let e: crate::bufferpool::Error = HgError::Closed.into();
+        match e {
+            crate::bufferpool::Error::Transport(_) => {}
+            other => panic!("expected Transport(_), got {other:?}"),
+        }
     }
 }

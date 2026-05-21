@@ -54,9 +54,8 @@ where
     /// One per NUMA shard. Carves `backing` into pages and calls
     /// `blockstore.register_pages(...)` exactly once. The
     /// `Transport` is expected to have been bound to the same
-    /// `backing` out-of-band by the embedder before this call (e.g.
-    /// via `mercury::Class::register_backing`); the pool no longer
-    /// drives that handshake. No async I/O happens here; on a real
+    /// `backing` out-of-band by the embedder before this call; the
+    /// pool no longer drives that handshake. No async I/O happens here; on a real
     /// RDMA `Transport` the synchronous `ibv_reg_mr` is the
     /// dominant cost (see the design's "Page registration"
     /// section). Embedders should run `Pool::new` off the pinned

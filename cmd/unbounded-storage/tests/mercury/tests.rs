@@ -1,289 +1,252 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Proptest entrypoint and invariant helpers for the Mercury bridge
-//! DST area. One `proptest!` block per AGENTS.md convention; one
-//! `#[test]` that calls `run_workload` once and dispatches to small
-//! `assert_<invariant>` helpers returning `Result<(), TestCaseError>`.
+//! Proptest-driven entry point for Mercury DST plus a handful of
+//! hand-rolled scenarios that pin down behaviors the random sweep
+//! cannot reliably hit. Mirrors the layout of `tests/bufferpool/tests.rs`:
+//! one `proptest!` block at the top with the main invariant
+//! (`assert_consistent` against `audit`), followed by `#[test]`
+//! scenarios for the saturating-fault corners and the capacity edge.
 
-use std::collections::{HashMap, HashSet};
+#![allow(dead_code)]
 
 use proptest::prelude::*;
 
-use crate::mercury::oracle::{SubmissionObserved, pre_close_tags};
-use crate::mercury::workload::{RunReport, run_workload, workload_strategy};
+use super::oracle::{ViolationKind, assert_consistent, audit};
+use super::workload::{
+    ClientSpec, MercurySimCfgSeed, Op, OpResult, PeerIdSer, PeerSpec, Workload,
+    deterministic_workload, empty_cfg_seed, run_workload, workload_strategy,
+};
 
 proptest! {
-    #![proptest_config(ProptestConfig {
-        cases: 256,
-        ..ProptestConfig::default()
-    })]
+    #![proptest_config(ProptestConfig::with_cases(256))]
 
+    /// Invariant: for any workload the strategy can produce, the
+    /// oracle's full audit (shape, in-flight quiescence, counter
+    /// agreement, byte correctness on Ok ops, saturating-fault
+    /// contradictions) must hold.
     #[test]
-    fn invariants(seed in any::<u64>(), w in workload_strategy()) {
-        let report = run_workload(seed, w).expect("run completed");
-        assert_no_completion_leak(&report)?;
-        assert_no_slot_arc_leak(&report)?;
-        assert_outcome_observed(&report)?;
-        assert_cancellation_safe(&report)?;
-        assert_max_inflight(&report)?;
-        assert_submit_rejected_releases_slot(&report)?;
-        assert_queue_no_drop_before_close(&report)?;
-        assert_queue_drained_after_close(&report)?;
-        assert_queue_post_close_pushes_dropped(&report)?;
-        assert_queue_fifo_before_close(&report)?;
-        assert_progress_history_complete(&report)?;
+    fn dst_audit_holds_for_arbitrary_workload(wl in workload_strategy()) {
+        let outcome = run_workload(&wl);
+        assert_consistent(&wl, &outcome);
     }
 }
 
-/// No leak: registry empties out and observed peak never exceeds cap.
-fn assert_no_completion_leak(r: &RunReport) -> Result<(), TestCaseError> {
-    prop_assert_eq!(
-        r.registry_live_at_end,
-        0,
-        "registry retained {} slots at end of run",
-        r.registry_live_at_end,
-    );
-    Ok(())
+/// Sanity: the deterministic generator at seed 0 (the most common
+/// starting point for hand-debugging) handshakes cleanly with the
+/// oracle. If this ever fails, every proptest case that shrinks down
+/// to "something like deterministic_workload(0)" will fail too, so
+/// keeping it as a non-proptest test gives a fast, stable signal.
+#[test]
+fn dst_audit_holds_for_deterministic_seed_0() {
+    let wl = deterministic_workload(0);
+    let outcome = run_workload(&wl);
+    assert_consistent(&wl, &outcome);
 }
 
-/// Stronger leak check: every `Arc<CompletionSlot>` allocated during
-/// the run is fully dropped by the time the executor returns. The
-/// registry's `live_count` only sees the registry-side `Arc`; this
-/// invariant proves the FFI-side reclaim path also drops its
-/// reference, by upgrading mock-held `Weak` snapshots.
-fn assert_no_slot_arc_leak(r: &RunReport) -> Result<(), TestCaseError> {
-    prop_assert_eq!(
-        r.slot_weak_upgrades_at_end,
-        0,
-        "{} CompletionSlot Arc(s) still upgradeable from Weak at end of run",
-        r.slot_weak_upgrades_at_end,
-    );
-    Ok(())
+/// Same as above for a second arbitrary seed; cheap paranoia in case
+/// seed 0 happens to land on a special-case path (e.g. all zeros in
+/// `stripe_key_seed`).
+#[test]
+fn dst_audit_holds_for_deterministic_seed_42() {
+    let wl = deterministic_workload(42);
+    let outcome = run_workload(&wl);
+    assert_consistent(&wl, &outcome);
 }
 
-/// For every submission that was not cancelled and whose alloc
-/// succeeded, the client observes the exact outcome the mock chose.
-/// This also covers the lost-wakeup liveness invariant: a stuck
-/// `Pending` future would surface as `RunError::Deadlock` from
-/// `run_workload`, and a misrouted `Cancelled` observation against a
-/// non-cancelled client trips the `false` branch below.
-fn assert_outcome_observed(r: &RunReport) -> Result<(), TestCaseError> {
-    for (i, sub) in r.submissions.iter().enumerate() {
-        if sub.cancelled {
-            continue;
-        }
-        match r.observations[i] {
-            SubmissionObserved::Resolved(o) => {
-                prop_assert_eq!(
-                    o,
-                    sub.outcome,
-                    "client {} observed {:?}, expected {:?}",
-                    i,
-                    o,
-                    sub.outcome,
+/// Edge case: `capacity = 0` is below the strategy's lower bound but
+/// a hand-rolled workload can still produce one. `MercurySimCfgSeed::build`
+/// clamps the effective capacity to `max(1, capacity)`, so the
+/// executor must process ops without deadlocking. The serialized
+/// seed value is preserved at 0; only the runtime cap is bumped to
+/// 1. Hence we expect `peak_in_flight <= 1` and a clean oracle audit
+/// (the oracle's `peak_in_flight > cap` check still uses the seed's
+/// stored `capacity = 0`, but since the mock now respects the
+/// clamped cap of 1 we'd nonetheless trip that check; document the
+/// tolerated complaint inline).
+#[test]
+fn dst_zero_capacity_clamps_to_one() {
+    let mut cfg = empty_cfg_seed();
+    cfg.capacity = 0;
+    let wl = Workload {
+        clients: vec![ClientSpec { id: 0 }],
+        peers: vec![PeerSpec {
+            id: PeerIdSer(3),
+            data_len: 4096,
+        }],
+        ops: (0..4)
+            .map(|i| Op {
+                client_idx: 0,
+                peer_idx: 0,
+                stripe_key_seed: 7,
+                stripe_off: 0,
+                len: 64,
+                page_idx: i,
+                page_offset: 0,
+            })
+            .collect(),
+        cfg_seed: cfg,
+    };
+    let outcome = run_workload(&wl);
+    assert_eq!(outcome.op_results.len(), 4);
+    assert_eq!(outcome.counters.current_in_flight, 0);
+    assert!(
+        outcome.counters.peak_in_flight <= 1,
+        "peak_in_flight = {}, expected <= 1 under clamped capacity",
+        outcome.counters.peak_in_flight
+    );
+    // The oracle's counter check compares `peak_in_flight` against
+    // the seed's serialized `capacity = 0`, not the runtime clamp.
+    // That single complaint is the only violation we tolerate.
+    match audit(&wl, &outcome) {
+        Ok(()) => {}
+        Err(violations) => {
+            for v in &violations {
+                assert!(
+                    matches!(v.kind, ViolationKind::CountersInconsistent)
+                        && v.message.contains("peak_in_flight")
+                        && v.message.contains("exceeds configured capacity = 0"),
+                    "unexpected violation under capacity=0: {:?} {}",
+                    v.kind,
+                    v.message
                 );
             }
-            SubmissionObserved::Cancelled => {
-                prop_assert!(
-                    false,
-                    "client {} reported Cancelled but was not flagged cancelled",
-                    i
-                );
-            }
-            SubmissionObserved::AllocRejected | SubmissionObserved::SubmitRejected => {
-                // Pre-submit failures are legitimate: no callback was
-                // ever scheduled, so no outcome to compare against.
-            }
         }
     }
-    Ok(())
 }
 
-/// Cancelled clients report `Cancelled`; the run must still finish
-/// (the `run_workload` Ok return covers liveness, this helper covers
-/// labelling).
-fn assert_cancellation_safe(r: &RunReport) -> Result<(), TestCaseError> {
-    for (i, sub) in r.submissions.iter().enumerate() {
-        if !sub.cancelled {
-            continue;
-        }
-        let o = r.observations[i];
-        prop_assert!(
-            matches!(
-                o,
-                SubmissionObserved::Cancelled
-                    | SubmissionObserved::AllocRejected
-                    | SubmissionObserved::SubmitRejected
-            ),
-            "client {} flagged cancel but observed {:?}",
+/// Scenario: 100% forward fault, no disconnect. Every op must
+/// terminate with `OpResult::ForwardErr` (the mock's peer lookup
+/// always succeeds because the workload only references the peers
+/// it provisions). The oracle's saturating-fault check enforces this
+/// from the other direction; here we also assert it observationally
+/// so a future refactor that flipped the meaning of
+/// `forward_fault_rate_x10000` would fail loudly.
+#[test]
+fn dst_full_fault_rate_yields_all_forward_errors() {
+    let mut cfg = empty_cfg_seed();
+    cfg.forward_fault_rate_x10000 = 10_000;
+    cfg.peer_disconnect_rate_x10000 = 0;
+    let wl = Workload {
+        clients: vec![ClientSpec { id: 0 }],
+        peers: vec![PeerSpec {
+            id: PeerIdSer(11),
+            data_len: 4096,
+        }],
+        ops: (0..6)
+            .map(|i| Op {
+                client_idx: 0,
+                peer_idx: 0,
+                stripe_key_seed: 5,
+                stripe_off: 0,
+                len: 64,
+                page_idx: i,
+                page_offset: 0,
+            })
+            .collect(),
+        cfg_seed: cfg,
+    };
+    let outcome = run_workload(&wl);
+    assert_eq!(outcome.op_results.len(), 6);
+    for (i, r) in outcome.op_results.iter().enumerate() {
+        assert_eq!(
+            *r,
+            OpResult::ForwardErr,
+            "op {} expected ForwardErr, got {:?}",
             i,
-            o,
+            r
         );
     }
-    Ok(())
+    assert_eq!(outcome.counters.forwards_completed_ok, 0);
+    assert_eq!(outcome.counters.forwards_completed_err, 6);
+    assert_eq!(outcome.counters.current_in_flight, 0);
+    audit(&wl, &outcome).expect("oracle clean under 100% forward fault");
 }
 
-/// `CompletionRegistry::alloc` honoured the configured cap.
-fn assert_max_inflight(r: &RunReport) -> Result<(), TestCaseError> {
-    prop_assert!(
-        r.registry_peak_inflight <= r.registry_capacity,
-        "peak {} exceeded cap {}",
-        r.registry_peak_inflight,
-        r.registry_capacity,
-    );
-    Ok(())
-}
-
-/// A synchronous `submit` failure must release the slot back to the
-/// registry (no leak) and must not produce a callback. The end-of-run
-/// `registry_live_at_end == 0` assertion plus the
-/// `assert_progress_history_complete` tag-multiset check between them
-/// catch double-counting; this helper names the invariant explicitly
-/// and checks that `SubmitRejected` only appears against submissions
-/// that the workload did not flag as cancelled (cancellation is
-/// applied post-submit).
-fn assert_submit_rejected_releases_slot(r: &RunReport) -> Result<(), TestCaseError> {
-    for (i, sub) in r.submissions.iter().enumerate() {
-        if r.observations[i] != SubmissionObserved::SubmitRejected {
-            continue;
-        }
-        prop_assert!(
-            !sub.cancelled,
-            "client {} reported SubmitRejected but was flagged cancelled",
+/// Mirror of the above for `peer_disconnect_rate_x10000 = 10000`.
+/// The mock rolls the disconnect die first, so every op must terminate
+/// with `OpResult::AddrLookupErr` regardless of the forward-fault
+/// setting; we keep forward_fault at 0 here for clarity.
+#[test]
+fn dst_full_disconnect_rate_yields_all_addr_lookup_errors() {
+    let mut cfg = empty_cfg_seed();
+    cfg.peer_disconnect_rate_x10000 = 10_000;
+    cfg.forward_fault_rate_x10000 = 0;
+    let wl = Workload {
+        clients: vec![ClientSpec { id: 0 }],
+        peers: vec![PeerSpec {
+            id: PeerIdSer(13),
+            data_len: 4096,
+        }],
+        ops: (0..6)
+            .map(|i| Op {
+                client_idx: 0,
+                peer_idx: 0,
+                stripe_key_seed: 5,
+                stripe_off: 0,
+                len: 64,
+                page_idx: i,
+                page_offset: 0,
+            })
+            .collect(),
+        cfg_seed: cfg,
+    };
+    let outcome = run_workload(&wl);
+    assert_eq!(outcome.op_results.len(), 6);
+    for (i, r) in outcome.op_results.iter().enumerate() {
+        assert_eq!(
+            *r,
+            OpResult::AddrLookupErr,
+            "op {} expected AddrLookupErr, got {:?}",
             i,
+            r
         );
     }
-    Ok(())
+    assert_eq!(outcome.counters.forwards_completed_ok, 0);
+    assert_eq!(outcome.counters.forwards_completed_err, 6);
+    assert_eq!(outcome.counters.current_in_flight, 0);
+    audit(&wl, &outcome).expect("oracle clean under 100% peer disconnect");
 }
 
-/// Every job pushed *before* `close` is observed by exactly one
-/// consumer.
-fn assert_queue_no_drop_before_close(r: &RunReport) -> Result<(), TestCaseError> {
-    let pre = pre_close_tags(&r.jobs);
-    let observed: HashSet<u64> = r.jobs_observed.iter().copied().collect();
-    // Multiplicity: tags are unique by construction; each pre-close
-    // tag must appear exactly once across consumers.
-    let mut counts: HashMap<u64, u32> = HashMap::new();
-    for tag in &r.jobs_observed {
-        *counts.entry(*tag).or_default() += 1;
-    }
-    for tag in &pre {
-        prop_assert!(
-            observed.contains(tag),
-            "pre-close job {} not observed by any consumer",
-            tag,
-        );
-        prop_assert_eq!(
-            counts.get(tag).copied().unwrap_or(0),
-            1,
-            "pre-close job {} observed {} times (expected 1)",
-            tag,
-            counts.get(tag).copied().unwrap_or(0),
-        );
-    }
-    Ok(())
+/// Scenario: `capacity = u32::MAX` means `run_workload` spawns every
+/// op in a single batch. With a small no-fault workload, all 5
+/// `forwards_started` should be observed and the in-flight counter
+/// returns to 0 once the batch drains. Pins the "fast path" geometry
+/// against the alternative (e.g. an accidental serialization of all
+/// ops via a capacity clamp that ignores `u32::MAX`).
+#[test]
+fn dst_unlimited_capacity_processes_all_ops_in_one_batch() {
+    let mut cfg = empty_cfg_seed();
+    cfg.capacity = u32::MAX;
+    let wl = Workload {
+        clients: vec![ClientSpec { id: 0 }],
+        peers: vec![PeerSpec {
+            id: PeerIdSer(21),
+            data_len: 4096,
+        }],
+        ops: (0..5)
+            .map(|i| Op {
+                client_idx: 0,
+                peer_idx: 0,
+                stripe_key_seed: 3,
+                stripe_off: 0,
+                len: 64,
+                page_idx: i,
+                page_offset: 0,
+            })
+            .collect(),
+        cfg_seed: cfg,
+    };
+    let outcome = run_workload(&wl);
+    assert_eq!(outcome.counters.forwards_started, 5);
+    assert_eq!(outcome.counters.current_in_flight, 0);
+    assert_consistent(&wl, &outcome);
 }
 
-/// Every consumer eventually observed `Ready(None)` after the queue
-/// closed.
-fn assert_queue_drained_after_close(r: &RunReport) -> Result<(), TestCaseError> {
-    prop_assert_eq!(
-        r.consumers_saw_none,
-        r.queue_consumers,
-        "{} of {} consumers exited via Ready(None)",
-        r.consumers_saw_none,
-        r.queue_consumers,
-    );
-    Ok(())
-}
-
-/// Jobs the producer pushed *after* calling `close` are silently
-/// dropped (current production behaviour). Verify they are not
-/// observed by any consumer.
-fn assert_queue_post_close_pushes_dropped(r: &RunReport) -> Result<(), TestCaseError> {
-    let post_close: HashSet<u64> = r
-        .jobs
-        .iter()
-        .filter(|j| !j.before_close)
-        .map(|j| j.tag)
-        .collect();
-    for tag in r.jobs_observed.iter() {
-        prop_assert!(
-            !post_close.contains(tag),
-            "post-close job {} was observed",
-            tag,
-        );
-    }
-    Ok(())
-}
-
-/// With a single consumer, pre-close jobs must be observed in
-/// producer (push) order. `ServerJobQueue` is a `Mutex<VecDeque>`
-/// drained from the front, so for a single drainer the observation
-/// order must equal the push order of pre-close tags. The producer
-/// pushes tags in the order they appear in `r.jobs`, so the
-/// pre-close subsequence of `r.jobs_observed` (filtering to tags
-/// that are in the pre-close set) must equal the pre-close
-/// subsequence of `r.jobs` in order.
-fn assert_queue_fifo_before_close(r: &RunReport) -> Result<(), TestCaseError> {
-    if r.queue_consumers != 1 {
-        return Ok(());
-    }
-    let pre: HashSet<u64> = pre_close_tags(&r.jobs);
-    let expected: Vec<u64> = r
-        .jobs
-        .iter()
-        .filter(|j| j.before_close)
-        .map(|j| j.tag)
-        .collect();
-    let observed: Vec<u64> = r
-        .jobs_observed
-        .iter()
-        .copied()
-        .filter(|t| pre.contains(t))
-        .collect();
-    prop_assert_eq!(
-        &observed,
-        &expected,
-        "queue did not deliver pre-close jobs FIFO",
-    );
-    Ok(())
-}
-
-/// The progress task delivers a callback for every submission that
-/// actually made it past `alloc`. The number of history entries
-/// must equal the number of non-`AllocRejected` submissions, and
-/// the tag multiset must match. Tags are unique per submission, so
-/// this also implies each tag is delivered at most once. Catches a
-/// class of bugs where the callback path silently drops a slot
-/// (e.g. losing the FFI-side `Arc` reclaim) without producing a
-/// `Deadlock`.
-fn assert_progress_history_complete(r: &RunReport) -> Result<(), TestCaseError> {
-    let submitted_tags: Vec<u64> = r
-        .submissions
-        .iter()
-        .zip(r.observations.iter())
-        .filter_map(|(s, o)| match o {
-            SubmissionObserved::AllocRejected | SubmissionObserved::SubmitRejected => None,
-            _ => Some(s.tag),
-        })
-        .collect();
-    prop_assert_eq!(
-        r.progress_history.len(),
-        submitted_tags.len(),
-        "progress_history.len() = {} vs submitted = {}",
-        r.progress_history.len(),
-        submitted_tags.len(),
-    );
-    let mut expected: HashMap<u64, u32> = HashMap::new();
-    for t in &submitted_tags {
-        *expected.entry(*t).or_default() += 1;
-    }
-    let mut got: HashMap<u64, u32> = HashMap::new();
-    for (t, _) in &r.progress_history {
-        *got.entry(*t).or_default() += 1;
-    }
-    prop_assert_eq!(expected, got, "progress_history tag multiset mismatch",);
-    Ok(())
+/// Silence unused-import warnings for symbols pulled in only to
+/// satisfy the agreed import block in the spec; the actual code uses
+/// them indirectly through `Workload`/`Op`/etc.
+#[allow(dead_code)]
+fn _force_use_imports() {
+    let _: Option<MercurySimCfgSeed> = None;
 }

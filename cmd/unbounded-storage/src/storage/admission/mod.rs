@@ -19,6 +19,24 @@
 //! All state is in memory and is intentionally rebuilt empty
 //! on restart - bloom mistakes are bounded and the cache is
 //! warm-up tolerant.
+//!
+//! ## Bounded-saturation invariant
+//!
+//! The doorkeeper bloom filter is a *bounded-memory* structure:
+//! every set bit must eventually be cleared, otherwise after
+//! roughly `capacity_bits / NUM_HASHES` distinct touches every
+//! probe returns `all_set == true` and admission degenerates to
+//! "admit everything", violating the second-touch policy and
+//! amplifying NVMe writes.
+//!
+//! To prevent that, the doorkeeper is cleared on a probe-count
+//! cadence sized to the bloom's bit budget (`~capacity_pages`
+//! probes between clears, well below the bloom's saturation
+//! point). The count-min sketch continues to age on its own
+//! admit-count cadence (`~10 * capacity_pages`). Both cadences
+//! are bounded by `capacity_pages`, so the filter's "memory
+//! window" for first-vs-second-touch judgments stays proportional
+//! to the working set the cache is sized for, per the design.
 
 use std::sync::Mutex;
 
@@ -33,8 +51,10 @@ pub struct AdmissionFilter {
 struct Inner {
     doorkeeper: Box<[u64]>,
     sketch: [Box<[u8]>; 4],
-    inserts_since_reset: u64,
-    reset_threshold: u64,
+    inserts_since_sketch_age: u64,
+    sketch_age_threshold: u64,
+    probes_since_doorkeeper_clear: u64,
+    doorkeeper_clear_threshold: u64,
 }
 
 const NUM_HASHES: u32 = 3;
@@ -50,13 +70,25 @@ impl AdmissionFilter {
         let words = capacity_bits.div_ceil(64) as usize;
         let sketch_width = (capacity_pages.max(1) as u32).saturating_mul(sketch_multiplier.max(1));
         let row = vec![0u8; sketch_width as usize].into_boxed_slice();
+        let capacity_pages = capacity_pages.max(1);
         Self {
             inner: Mutex::new(Inner {
                 doorkeeper: vec![0u64; words].into_boxed_slice(),
                 sketch: [row.clone(), row.clone(), row.clone(), row],
-                inserts_since_reset: 0,
+                inserts_since_sketch_age: 0,
                 // Halve the sketch (aging) every ~10 * capacity admits.
-                reset_threshold: capacity_pages.max(1).saturating_mul(10),
+                sketch_age_threshold: capacity_pages.saturating_mul(10),
+                probes_since_doorkeeper_clear: 0,
+                // Clear the doorkeeper before it saturates. With
+                // `capacity_bits = 8 * capacity_pages` and
+                // NUM_HASHES = 3, every ~capacity_pages distinct
+                // touches set ~3 * capacity_pages bits out of
+                // 8 * capacity_pages, well under the 50%-fill point
+                // (~1.85 * capacity_pages keys) where false positives
+                // explode. Clearing every `capacity_pages` probes
+                // therefore keeps the all-set probability bounded
+                // regardless of workload shape.
+                doorkeeper_clear_threshold: capacity_pages,
             }),
             capacity_bits,
             sketch_width,
@@ -72,11 +104,21 @@ impl AdmissionFilter {
         let admit = doorkeeper_probe_and_set(&mut inner.doorkeeper, self.capacity_bits, key);
         if admit {
             sketch_bump(&mut inner.sketch, self.sketch_width, key);
-            inner.inserts_since_reset += 1;
-            if inner.inserts_since_reset >= inner.reset_threshold {
+            inner.inserts_since_sketch_age += 1;
+            if inner.inserts_since_sketch_age >= inner.sketch_age_threshold {
                 age(&mut inner.sketch);
-                inner.inserts_since_reset = 0;
+                inner.inserts_since_sketch_age = 0;
             }
+        }
+        // The doorkeeper consumes bit budget on *every* probe (first
+        // touches set bits but return `false`), so it must be cleared
+        // on a probe-count cadence rather than an admit-count cadence.
+        // Without this, a stream of one-hit-wonders saturates the
+        // bloom and `should_admit` degenerates to "admit everything".
+        inner.probes_since_doorkeeper_clear += 1;
+        if inner.probes_since_doorkeeper_clear >= inner.doorkeeper_clear_threshold {
+            clear_doorkeeper(&mut inner.doorkeeper);
+            inner.probes_since_doorkeeper_clear = 0;
         }
         admit
     }
@@ -94,7 +136,8 @@ impl AdmissionFilter {
                 *c = 0;
             }
         }
-        inner.inserts_since_reset = 0;
+        inner.inserts_since_sketch_age = 0;
+        inner.probes_since_doorkeeper_clear = 0;
     }
 
     /// Approximate frequency estimate from the count-min
@@ -153,6 +196,12 @@ fn age(rows: &mut [Box<[u8]>; 4]) {
         for c in row.iter_mut() {
             *c >>= 1;
         }
+    }
+}
+
+fn clear_doorkeeper(words: &mut [u64]) {
+    for w in words.iter_mut() {
+        *w = 0;
     }
 }
 

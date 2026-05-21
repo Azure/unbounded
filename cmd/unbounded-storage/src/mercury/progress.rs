@@ -1,677 +1,866 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Cross-thread bridges between Mercury's progress thread and the
-//! single-threaded async executor that owns the bufferpool.
+//! Progress loop and completion-future primitives.
 //!
-//! Two flows cross the thread boundary:
+//! This file is the bridge between Mercury's synchronous C callback model
+//! and the rest of the crate's async code. There are five primary types:
 //!
-//!  1. *Completion bridge* (`CompletionRegistry`): client-side
-//!     `bulk_get` futures wait for forward-RPC callbacks fired by
-//!     `HG_Trigger` on the progress thread. The future allocates a
-//!     `CompletionSlot`, hands its raw pointer to `HG_Forward` as
-//!     the user arg, and parks via an `AtomicWaker`. The progress
-//!     thread writes the result into the slot and wakes the waker.
+//! - [`CompletionSlot`] holds the outcome of one in-flight operation plus
+//!   the [`Waker`] of the task awaiting it.
+//! - [`CompletionRegistry`] owns a bounded set of `CompletionSlot`s with
+//!   capacity-based backpressure, one registry per progress context.
+//! - [`CompletionFuture`] is the awaitable handle a caller drops onto a
+//!   slot once it has issued the corresponding Mercury call.
+//! - [`Oneshot`] is a registry-less single-use slot used by callbacks
+//!   that do not need backpressure (server-side bulk push / respond).
+//! - [`ServerJobQueue`] is a bounded MPSC queue feeding the server's
+//!   async loop from the synchronous RPC callback.
 //!
-//!  2. *Server-job bridge* (`ServerJobQueue`): the registered RPC
-//!     callback runs on the progress thread but the application's
-//!     bulk source lives on the executor thread. The callback
-//!     pushes a job onto the queue and the executor pulls jobs out
-//!     of it via the future returned by `next_job`.
-//!
-//! Both bridges are pure synchronization primitives - no Mercury
-//! calls happen here; that keeps the unsafe surface minimal and
-//! testable in isolation.
+//! [`progress_loop`] drives a single `hg_context_t` from a dedicated
+//! thread, alternating `HG_Progress` and `HG_Trigger` until shutdown.
 
 use std::collections::VecDeque;
 use std::future::Future;
+use std::os::raw::c_void;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
-use crate::mercury::error::{HgError, Result};
+use super::config::NicConfig;
+use super::error::{HgError, Result};
+use super::ffi::{self, HG_SUCCESS, hg_context_t};
 
-const WAKER_NONE: u8 = 0;
-const WAKER_REGISTERED: u8 = 1;
-const WAKER_WOKEN: u8 = 3;
+// -------------------- CompletionSlot ----------------------------------
 
-/// Minimal `AtomicWaker`: register-store-wake state machine,
-/// avoiding a dependency on `futures-util`. Behaves like
-/// `futures_util::task::AtomicWaker` for our single-producer
-/// single-consumer use: the future registers on poll; the
-/// completer wakes exactly once.
-struct AtomicWaker {
-    state: AtomicU8,
-    waker: Mutex<Option<Waker>>,
-}
-
-impl AtomicWaker {
-    fn new() -> Self {
-        Self {
-            state: AtomicU8::new(WAKER_NONE),
-            waker: Mutex::new(None),
-        }
-    }
-
-    /// Register a fresh waker for later wakeup. Idempotent; safe to
-    /// call from successive polls.
-    fn register(&self, w: &Waker) {
-        // Fast path: if already woken, no need to store the waker.
-        if self.state.load(Ordering::Acquire) == WAKER_WOKEN {
-            w.wake_by_ref();
-            return;
-        }
-        if let Ok(mut slot) = self.waker.lock() {
-            *slot = Some(w.clone());
-        }
-        // Publish that a waker is now installed. If a wake raced us
-        // and saw WAKER_NONE, the state will already be WAKER_WOKEN,
-        // and the next caller path handles it.
-        let prev = self.state.swap(WAKER_REGISTERED, Ordering::AcqRel);
-        if prev == WAKER_WOKEN {
-            if let Ok(mut slot) = self.waker.lock() {
-                if let Some(w) = slot.take() {
-                    w.wake();
-                }
-            }
-        }
-    }
-
-    /// Wake the registered waker if any. Idempotent.
-    fn wake(&self) {
-        let prev = self.state.swap(WAKER_WOKEN, Ordering::AcqRel);
-        if prev == WAKER_REGISTERED {
-            if let Ok(mut slot) = self.waker.lock() {
-                if let Some(w) = slot.take() {
-                    w.wake();
-                }
-            }
-        }
-    }
-}
-
-/// State for one in-flight `bulk_get` future. `result` is `None`
-/// until the progress thread fills it in. `cancelled` short-circuits
-/// the future drop path so a callback that races a drop simply
-/// stores its result and finds nobody waiting.
+/// State of a single outstanding forward / bulk / respond callback.
+///
+/// The slot is shared between the FFI callback (which calls
+/// [`CompletionSlot::complete`]) and the async task awaiting the
+/// outcome via [`CompletionFuture`]. The `Mutex` is uncontended in the
+/// common case: the producer locks once at completion time, the
+/// consumer locks once per poll.
 pub struct CompletionSlot {
-    pub(crate) result: Mutex<Option<Result<()>>>,
-    pub(crate) cancelled: AtomicBool,
-    waker: AtomicWaker,
+    inner: Mutex<SlotInner>,
+}
+
+struct SlotInner {
+    outcome: Option<Result<()>>,
+    waker: Option<Waker>,
+    /// `true` once `complete` has fired. Idempotency guard so a
+    /// retransmitted callback (or a second producer racing with the
+    /// first) does not overwrite the recorded outcome.
+    completed: bool,
 }
 
 impl CompletionSlot {
-    fn new() -> Self {
-        Self {
-            result: Mutex::new(None),
-            cancelled: AtomicBool::new(false),
-            waker: AtomicWaker::new(),
-        }
-    }
-
-    /// Called from the progress thread when a forward callback
-    /// fires. The slot retains the result regardless of cancellation
-    /// because the FFI guarantees the callback runs exactly once.
-    pub fn complete(&self, result: Result<()>) {
-        if let Ok(mut slot) = self.result.lock() {
-            *slot = Some(result);
-        }
-        self.waker.wake();
-    }
-
-    /// Returns whether the owning `CompletionFuture` has been dropped.
-    /// Visible to tests; production code does not need it because the
-    /// callback always runs to completion regardless.
-    pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
-    }
-
-    /// Convert an owned `Arc<Self>` into a `*mut c_void` suitable as the
-    /// user-arg for an FFI callback. The returned pointer carries one
-    /// strong reference that must later be reclaimed via
-    /// [`from_callback_arg`].
-    pub fn into_callback_arg(self: Arc<Self>) -> *mut std::ffi::c_void {
-        Arc::into_raw(self) as *mut std::ffi::c_void
-    }
-
-    /// Reclaim the strong reference produced by [`into_callback_arg`].
-    ///
-    /// # Safety
-    ///
-    /// `arg` must be a pointer produced by [`into_callback_arg`], used
-    /// to reclaim that reference exactly once.
-    pub unsafe fn from_callback_arg(arg: *mut std::ffi::c_void) -> Arc<Self> {
-        unsafe { Arc::from_raw(arg as *const CompletionSlot) }
-    }
-}
-
-/// Bounded registry of in-flight completion slots. Slot identity is
-/// the `Arc<CompletionSlot>` itself; we don't hand opaque integer
-/// ids to C because the FFI accepts a `void *` user arg directly,
-/// which is much harder to misuse.
-///
-/// The "registry" exists to enforce `max_inflight` and to keep
-/// strong references alive while the FFI holds the raw pointer.
-pub struct CompletionRegistry {
-    cap: usize,
-    live: Mutex<Vec<Arc<CompletionSlot>>>,
-    /// Peak observed `live.len()` across the lifetime of this
-    /// registry. Used by DST tests to assert `max_inflight` was
-    /// honored; production code does not read this.
-    peak: AtomicUsize,
-}
-
-impl CompletionRegistry {
-    pub fn new(cap: usize) -> Arc<Self> {
+    /// Construct an empty slot wrapped in an `Arc` for sharing with
+    /// the FFI callback.
+    pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            cap: cap.max(1),
-            live: Mutex::new(Vec::with_capacity(cap.min(1024))),
-            peak: AtomicUsize::new(0),
+            inner: Mutex::new(SlotInner {
+                outcome: None,
+                waker: None,
+                completed: false,
+            }),
         })
     }
 
-    /// Allocate a new slot. Fails with `HgError` if the registry is
-    /// full; this surfaces as `bufferpool::Error::Transport`.
-    pub fn alloc(&self) -> Result<Arc<CompletionSlot>> {
-        let mut live = self.live.lock().expect("completion registry mutex");
-        if live.len() >= self.cap {
-            return Err(HgError::new(0, "completion registry full"));
-        }
-        let slot = Arc::new(CompletionSlot::new());
-        live.push(slot.clone());
-        let now = live.len();
-        // Relaxed: we only need a monotonic upper bound for the
-        // peak; readers in tests fence via their own ordering.
-        let mut prev = self.peak.load(Ordering::Relaxed);
-        while now > prev {
-            match self
-                .peak
-                .compare_exchange_weak(prev, now, Ordering::Relaxed, Ordering::Relaxed)
-            {
-                Ok(_) => break,
-                Err(observed) => prev = observed,
+    /// Publish the outcome and wake the parked task, if any.
+    ///
+    /// Idempotent: the second and subsequent calls are dropped on the
+    /// floor. This matches Mercury's behavior where a cancelled forward
+    /// can still surface a late completion callback.
+    pub fn complete(&self, outcome: Result<()>) {
+        let waker = {
+            let mut g = self.inner.lock().expect("CompletionSlot mutex poisoned");
+            if g.completed {
+                return;
             }
-        }
-        Ok(slot)
-    }
-
-    /// Release a slot once the caller is done with it. The shared
-    /// `Arc<CompletionSlot>` only goes away when *both* the
-    /// registry-side and FFI-side references drop, so a late
-    /// callback never dereferences freed memory.
-    pub fn release(&self, slot: &Arc<CompletionSlot>) {
-        if let Ok(mut live) = self.live.lock() {
-            live.retain(|s| !Arc::ptr_eq(s, slot));
+            g.completed = true;
+            g.outcome = Some(outcome);
+            g.waker.take()
+        };
+        if let Some(w) = waker {
+            w.wake();
         }
     }
 
-    /// Number of slots currently held by the registry. Visible to
-    /// tests for the "no leak" invariant; production code does not
-    /// read this.
-    pub fn live_count(&self) -> usize {
-        self.live.lock().map(|g| g.len()).unwrap_or(0)
+    /// Take the outcome if `complete` has fired, leaving the slot
+    /// drained. A second `try_take` after a successful first call
+    /// returns `None`.
+    pub fn try_take(&self) -> Option<Result<()>> {
+        let mut g = self.inner.lock().expect("CompletionSlot mutex poisoned");
+        g.outcome.take()
     }
 
-    /// Highest `live_count` observed since construction. Test-only.
-    pub fn peak_inflight(&self) -> usize {
-        self.peak.load(Ordering::Relaxed)
+    /// Install or refresh the parked waker.
+    ///
+    /// If the slot has already completed when this is called, the
+    /// caller will observe the outcome on its next `try_take` without
+    /// needing the waker to fire; we still install it for symmetry.
+    pub fn set_waker(&self, waker: &Waker) {
+        let mut g = self.inner.lock().expect("CompletionSlot mutex poisoned");
+        match &g.waker {
+            Some(existing) if existing.will_wake(waker) => {}
+            _ => g.waker = Some(waker.clone()),
+        }
     }
 
-    /// Configured upper bound. Test-only accessor.
+    /// `true` if `complete` has fired, regardless of whether the
+    /// outcome has been taken yet.
+    #[allow(dead_code)]
+    fn is_completed(&self) -> bool {
+        self.inner
+            .lock()
+            .expect("CompletionSlot mutex poisoned")
+            .completed
+    }
+}
+
+// -------------------- CompletionRegistry ------------------------------
+
+/// Bounded slab of [`CompletionSlot`]s with allocation backpressure.
+///
+/// One registry lives alongside each `ProgressContext`. Callers acquire
+/// a slot via [`CompletionRegistry::acquire`]; if the in-flight count
+/// has reached `capacity`, the returned future parks until another
+/// caller releases a slot. The capacity bookkeeping is independent of
+/// the slots themselves so that a slot's outcome can be observed
+/// (releasing capacity) without invalidating the slot's `Arc`.
+pub struct CompletionRegistry {
+    inner: Mutex<RegistryInner>,
+    capacity: usize,
+}
+
+struct RegistryInner {
+    in_flight: usize,
+    waiters: VecDeque<Waker>,
+}
+
+impl CompletionRegistry {
+    /// Construct a registry with room for `capacity` outstanding
+    /// completions. `capacity` of zero means every `acquire` parks
+    /// forever; callers should reject that at config time.
+    pub fn new(capacity: usize) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(RegistryInner {
+                in_flight: 0,
+                waiters: VecDeque::new(),
+            }),
+            capacity,
+        })
+    }
+
+    /// Synchronously try to allocate a slot. Returns `None` when the
+    /// registry is at capacity.
+    pub fn try_alloc(&self) -> Option<Arc<CompletionSlot>> {
+        let mut g = self
+            .inner
+            .lock()
+            .expect("CompletionRegistry mutex poisoned");
+        if g.in_flight >= self.capacity {
+            None
+        } else {
+            g.in_flight += 1;
+            Some(CompletionSlot::new())
+        }
+    }
+
+    /// Allocate a slot, awaiting capacity if needed.
+    pub fn acquire<'a>(self: &'a Arc<Self>) -> AcquireFuture<'a> {
+        AcquireFuture { registry: self }
+    }
+
+    /// Release one unit of capacity and wake the oldest pending
+    /// `acquire` waiter. Private; called by [`RegisteredSlot`] and
+    /// [`CompletionFuture`] on drop / completion.
+    fn release(&self) {
+        let waker = {
+            let mut g = self
+                .inner
+                .lock()
+                .expect("CompletionRegistry mutex poisoned");
+            debug_assert!(g.in_flight > 0, "release without matching acquire");
+            if g.in_flight > 0 {
+                g.in_flight -= 1;
+            }
+            g.waiters.pop_front()
+        };
+        if let Some(w) = waker {
+            w.wake();
+        }
+    }
+
+    /// Capacity bound passed to [`CompletionRegistry::new`].
     pub fn capacity(&self) -> usize {
-        self.cap
+        self.capacity
+    }
+
+    /// Current count of allocated-but-not-yet-released slots.
+    pub fn in_flight(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("CompletionRegistry mutex poisoned")
+            .in_flight
     }
 }
 
-/// One-shot completion bundle. Bundles a fresh single-slot registry,
-/// the future the caller awaits, and the raw `*mut c_void` that the
-/// caller hands to an FFI submission as its user arg. If the
-/// submission fails synchronously, the caller must invoke
-/// [`Oneshot::reclaim`] on the arg so the leaked strong reference
-/// drops instead of leaking forever.
-pub(crate) struct Oneshot {
-    pub(crate) future: CompletionFuture,
-    pub(crate) arg: *mut std::ffi::c_void,
+/// Future returned by [`CompletionRegistry::acquire`].
+///
+/// Polls to a [`RegisteredSlot`] once capacity is available; parks the
+/// caller's waker on the registry's FIFO when it is not.
+pub struct AcquireFuture<'a> {
+    registry: &'a Arc<CompletionRegistry>,
 }
 
-impl Oneshot {
-    /// Build a fresh oneshot bundle. The slot's strong-ref count is
-    /// two: one held by the future, one leaked into `arg`.
-    pub(crate) fn new() -> Self {
-        let registry = CompletionRegistry::new(1);
-        let slot = registry.alloc().expect("oneshot registry has capacity 1");
-        let arg = slot.clone().into_callback_arg();
-        Self {
-            future: CompletionFuture { slot, registry },
-            arg,
+impl<'a> Future for AcquireFuture<'a> {
+    type Output = RegisteredSlot;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let registry = self.registry;
+        let mut g = registry
+            .inner
+            .lock()
+            .expect("CompletionRegistry mutex poisoned");
+        if g.in_flight < registry.capacity {
+            g.in_flight += 1;
+            drop(g);
+            Poll::Ready(RegisteredSlot {
+                slot: CompletionSlot::new(),
+                registry: Arc::clone(registry),
+                released: false,
+            })
+        } else {
+            // Replace any prior waker rather than appending a duplicate
+            // entry on every poll; matches the bufferpool free_list
+            // pattern but keeps FIFO order across distinct callers by
+            // pushing only when the queue does not already hold one
+            // that will wake the same task.
+            let already_parked = g.waiters.iter().any(|w| w.will_wake(cx.waker()));
+            if !already_parked {
+                g.waiters.push_back(cx.waker().clone());
+            }
+            Poll::Pending
+        }
+    }
+}
+
+/// An allocated [`CompletionSlot`] paired with the registry handle
+/// needed to release capacity exactly once.
+///
+/// Capacity is released in exactly one of three places:
+/// 1. The `CompletionFuture` produced by [`RegisteredSlot::into_future`]
+///    resolves.
+/// 2. That `CompletionFuture` is dropped before resolving.
+/// 3. The `RegisteredSlot` itself is dropped without ever calling
+///    `into_future`.
+pub struct RegisteredSlot {
+    slot: Arc<CompletionSlot>,
+    registry: Arc<CompletionRegistry>,
+    released: bool,
+}
+
+impl RegisteredSlot {
+    /// Borrow the underlying slot. Useful for installing the slot
+    /// reference on a callback context before `into_future` is called.
+    pub fn slot(&self) -> &Arc<CompletionSlot> {
+        &self.slot
+    }
+
+    /// Convert this allocation into a [`CompletionFuture`]. The future
+    /// owns the capacity release from this point on; dropping the
+    /// future without polling to completion still releases.
+    pub fn into_future(mut self) -> CompletionFuture {
+        self.released = true;
+        CompletionFuture {
+            slot: Arc::clone(&self.slot),
+            registry: Some(Arc::clone(&self.registry)),
+            released: false,
         }
     }
 
-    /// Reclaim the strong reference embedded in `arg` after an FFI
-    /// submission failed and its callback will not fire.
-    ///
-    /// # Safety
-    ///
-    /// `arg` must be the pointer returned by [`Oneshot::new`] from
-    /// the same bundle, and must not have been delivered to a
-    /// callback.
-    pub(crate) unsafe fn reclaim(arg: *mut std::ffi::c_void) {
-        // SAFETY: `arg` came from `CompletionSlot::into_callback_arg`
-        // in `Oneshot::new`.
-        unsafe {
-            let _ = CompletionSlot::from_callback_arg(arg);
+    /// Produce an opaque pointer to the slot suitable for an FFI
+    /// callback `arg`. Each call clones the inner `Arc` and leaks it
+    /// via `Arc::into_raw`; the receiving callback must reclaim the
+    /// strong reference exactly once with [`from_callback_arg`].
+    #[allow(clippy::wrong_self_convention)]
+    pub fn into_callback_arg(&self) -> *mut c_void {
+        let cloned = Arc::clone(&self.slot);
+        Arc::into_raw(cloned) as *mut c_void
+    }
+}
+
+impl Drop for RegisteredSlot {
+    fn drop(&mut self) {
+        if !self.released {
+            self.released = true;
+            self.registry.release();
         }
     }
 }
 
-/// Body shared by every one-shot FFI completion callback in the
-/// crate. Reclaims the slot from `arg`, resolves it with `Ok(())` on
-/// `HG_SUCCESS` or `Err(HgError::new(ret, ctx))` otherwise, and
-/// returns `HG_SUCCESS` so Mercury treats the callback as handled.
+// -------------------- Callback arg helpers ----------------------------
+
+/// Recover an `Arc<CompletionSlot>` from the opaque pointer originally
+/// produced by [`RegisteredSlot::into_callback_arg`] or
+/// [`Oneshot::into_callback_arg`].
 ///
 /// # Safety
-///
-/// `arg` must be a pointer previously produced by
-/// [`CompletionSlot::into_callback_arg`] (typically via
-/// [`Oneshot::new`]) and not yet reclaimed.
-pub(crate) unsafe fn complete_oneshot(
-    ret: crate::mercury::ffi::hg_return_t,
-    arg: *mut std::ffi::c_void,
-    ctx: &'static str,
-) -> crate::mercury::ffi::hg_return_t {
-    // SAFETY: caller contract.
-    let slot = unsafe { CompletionSlot::from_callback_arg(arg) };
-    let outcome = if ret == crate::mercury::ffi::HG_SUCCESS {
-        Ok(())
-    } else {
-        Err(HgError::new(ret as i32, ctx))
-    };
-    slot.complete(outcome);
-    crate::mercury::ffi::HG_SUCCESS
+/// `arg` must be a non-null pointer produced by one of the above
+/// methods on a still-live slot, and must not have been reclaimed.
+/// Calling `from_callback_arg` more than once for the same pointer is
+/// undefined behavior; clone the recovered `Arc` if you need
+/// additional references.
+pub unsafe fn from_callback_arg(arg: *mut c_void) -> Arc<CompletionSlot> {
+    debug_assert!(!arg.is_null(), "from_callback_arg: null arg");
+    // SAFETY: per the function-level safety contract, `arg` was
+    // produced by `Arc::into_raw(Arc<CompletionSlot>)` and has not yet
+    // been reclaimed. `Arc::from_raw` re-establishes ownership of that
+    // strong reference.
+    unsafe { Arc::from_raw(arg as *const CompletionSlot) }
 }
 
-/// Future returned by the transport to its caller. Drops are safe:
-/// the `CompletionFuture` releases its slot through `release_on_drop`,
-/// and the FFI-side `Arc` (handed in as the forward user arg) is
-/// dropped from the C callback path regardless of caller liveness.
+// -------------------- CompletionFuture --------------------------------
+
+/// Future resolving to the outcome of a registered completion.
+///
+/// Capacity is released back to the originating registry the first
+/// time the future either resolves or is dropped.
 pub struct CompletionFuture {
-    pub slot: Arc<CompletionSlot>,
-    pub registry: Arc<CompletionRegistry>,
+    slot: Arc<CompletionSlot>,
+    registry: Option<Arc<CompletionRegistry>>,
+    released: bool,
+}
+
+impl CompletionFuture {
+    fn release_capacity(&mut self) {
+        if !self.released {
+            self.released = true;
+            if let Some(r) = self.registry.take() {
+                r.release();
+            }
+        }
+    }
 }
 
 impl Future for CompletionFuture {
     type Output = Result<()>;
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // Register first so a wake that arrives between the check
-        // and the park stores into a queued waker, not the void.
-        self.slot.waker.register(cx.waker());
-        let mut result = self.slot.result.lock().expect("completion slot mutex");
-        if let Some(r) = result.take() {
-            Poll::Ready(r)
-        } else {
-            Poll::Pending
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Install/refresh the waker before checking the outcome to
+        // avoid a missed wakeup if the producer fires between the
+        // outcome check and the waker store.
+        self.slot.set_waker(cx.waker());
+        match self.slot.try_take() {
+            Some(outcome) => {
+                self.release_capacity();
+                Poll::Ready(outcome)
+            }
+            None => Poll::Pending,
         }
     }
 }
 
 impl Drop for CompletionFuture {
     fn drop(&mut self) {
-        self.slot.cancelled.store(true, Ordering::Release);
-        self.registry.release(&self.slot);
+        self.release_capacity();
     }
 }
 
-// ---------------------------------------------------------------------------
-// Server-job bridge.
-// ---------------------------------------------------------------------------
+// -------------------- Oneshot -----------------------------------------
 
-/// One incoming RPC waiting for the executor to handle it. The
-/// `hg_handle` and the decoded input are wrapped in `Send` newtypes
-/// (`UnsafeSendPtr`) so the queue itself is `Send`; the executor
-/// thread is responsible for honoring Mercury's threading rules
-/// when it touches them (in practice we only call `HG_Bulk_transfer`
-/// and `HG_Respond` from the progress thread, never the executor).
-pub struct ServerJob {
-    pub handle: UnsafeSendPtr,
-    pub input_struct: UnsafeSendPtr,
+/// Single-use callback bridge with no registry / capacity bookkeeping.
+///
+/// Used for FFI callbacks that do not participate in per-context
+/// inflight accounting: server-side `HG_Bulk_transfer` waits and
+/// server-side `HG_Respond` waits.
+pub struct Oneshot {
+    slot: Arc<CompletionSlot>,
 }
 
-/// Newtype that promises the embedder upholds Mercury's
-/// thread-safety contract for the wrapped pointer. We only use it to
-/// shuttle pointers across the bridge; no read or write happens
-/// inside the type.
-#[derive(Copy, Clone)]
-pub struct UnsafeSendPtr(pub *mut std::ffi::c_void);
-unsafe impl Send for UnsafeSendPtr {}
-unsafe impl Sync for UnsafeSendPtr {}
+impl Oneshot {
+    /// Allocate a new oneshot. Cheap; just an `Arc<CompletionSlot>`.
+    pub fn new() -> Self {
+        Self {
+            slot: CompletionSlot::new(),
+        }
+    }
 
-/// MPSC queue feeding the executor-side server task. The progress
-/// thread pushes; the executor polls `next_job`.
-pub struct ServerJobQueue {
-    inner: Mutex<ServerJobInner>,
-    waker: AtomicWaker,
+    /// Pointer to hand to an FFI callback's `arg`. The callback must
+    /// recover the `Arc` with [`from_callback_arg`] exactly once.
+    #[allow(clippy::wrong_self_convention)]
+    pub fn into_callback_arg(&self) -> *mut c_void {
+        let cloned = Arc::clone(&self.slot);
+        Arc::into_raw(cloned) as *mut c_void
+    }
+
+    /// Convert into the future awaiting the callback.
+    pub fn into_future(self) -> OneshotFuture {
+        OneshotFuture { slot: self.slot }
+    }
 }
 
-struct ServerJobInner {
-    jobs: VecDeque<ServerJob>,
+impl Default for Oneshot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Future returned by [`Oneshot::into_future`].
+pub struct OneshotFuture {
+    slot: Arc<CompletionSlot>,
+}
+
+impl Future for OneshotFuture {
+    type Output = Result<()>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.slot.set_waker(cx.waker());
+        match self.slot.try_take() {
+            Some(outcome) => Poll::Ready(outcome),
+            None => Poll::Pending,
+        }
+    }
+}
+
+// -------------------- ServerJobQueue ----------------------------------
+
+/// Bounded MPSC queue feeding the server's async loop from the
+/// synchronous RPC callback.
+///
+/// Producers are Mercury RPC callbacks (any number, all calling
+/// [`ServerJobQueue::push`] synchronously). The single consumer is the
+/// server's async dispatch task, awaiting [`ServerJobQueue::next_job`].
+/// Closing the queue drains pending pops with `None`.
+pub struct ServerJobQueue<J: Send + 'static> {
+    inner: Mutex<QueueInner<J>>,
+}
+
+struct QueueInner<J> {
+    queue: VecDeque<J>,
+    capacity: usize,
     closed: bool,
+    waiter: Option<Waker>,
 }
 
-impl ServerJobQueue {
-    pub fn new() -> Arc<Self> {
+impl<J: Send + 'static> ServerJobQueue<J> {
+    /// Construct a queue bounded at `capacity` jobs.
+    pub fn new(capacity: usize) -> Arc<Self> {
         Arc::new(Self {
-            inner: Mutex::new(ServerJobInner {
-                jobs: VecDeque::new(),
+            inner: Mutex::new(QueueInner {
+                queue: VecDeque::new(),
+                capacity,
                 closed: false,
+                waiter: None,
             }),
-            waker: AtomicWaker::new(),
         })
     }
 
-    /// Called from the Mercury RPC callback on the progress thread.
-    #[doc(hidden)]
-    pub fn push(&self, job: ServerJob) {
-        if let Ok(mut inner) = self.inner.lock() {
-            if !inner.closed {
-                inner.jobs.push_back(job);
+    /// Synchronous push from an RPC callback.
+    ///
+    /// Returns the job back inside `PushError` on failure: `Full` when
+    /// at capacity (the callback should respond with `HG_Cancel`) and
+    /// `Closed` when [`ServerJobQueue::close`] has been called (the
+    /// server is shutting down).
+    pub fn push(&self, job: J) -> std::result::Result<(), PushError<J>> {
+        let waker = {
+            let mut g = self.inner.lock().expect("ServerJobQueue mutex poisoned");
+            if g.closed {
+                return Err(PushError::Closed(job));
             }
+            if g.queue.len() >= g.capacity {
+                return Err(PushError::Full(job));
+            }
+            g.queue.push_back(job);
+            g.waiter.take()
+        };
+        if let Some(w) = waker {
+            w.wake();
         }
-        self.waker.wake();
+        Ok(())
     }
 
-    /// Called by `Class::shutdown` so pending `next_job` futures
-    /// resolve to `None` and the executor-side server task exits.
-    pub fn close(&self) {
-        if let Ok(mut inner) = self.inner.lock() {
-            inner.closed = true;
-        }
-        self.waker.wake();
-    }
-
-    /// Async pop, used by the executor-side server task to await
-    /// the next RPC. Returns `None` once the queue is closed and
+    /// Async pop. Resolves to `None` once the queue is both closed and
     /// drained.
-    pub fn next_job(self: &Arc<Self>) -> NextJob {
-        NextJob {
-            queue: self.clone(),
+    pub fn next_job<'a>(self: &'a Arc<Self>) -> NextJobFuture<'a, J> {
+        NextJobFuture { queue: self }
+    }
+
+    /// Mark the queue closed. Subsequent `push` calls fail with
+    /// `Closed`; a pending `next_job` observing an empty queue
+    /// resolves to `None`.
+    pub fn close(&self) {
+        let waker = {
+            let mut g = self.inner.lock().expect("ServerJobQueue mutex poisoned");
+            g.closed = true;
+            g.waiter.take()
+        };
+        if let Some(w) = waker {
+            w.wake();
         }
+    }
+
+    /// Number of jobs currently buffered.
+    pub fn len(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("ServerJobQueue mutex poisoned")
+            .queue
+            .len()
+    }
+
+    /// `true` if the queue has no buffered jobs (regardless of close
+    /// state).
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// `true` if [`ServerJobQueue::close`] has been called.
+    pub fn is_closed(&self) -> bool {
+        self.inner
+            .lock()
+            .expect("ServerJobQueue mutex poisoned")
+            .closed
     }
 }
 
-pub struct NextJob {
-    queue: Arc<ServerJobQueue>,
+/// Failure mode returned from [`ServerJobQueue::push`]. The job is
+/// returned so the caller can decide how to respond to Mercury (cancel
+/// vs. drop).
+#[derive(Debug)]
+pub enum PushError<J> {
+    /// Queue at capacity; callback should reject the RPC.
+    Full(J),
+    /// Queue closed; server is shutting down.
+    Closed(J),
 }
 
-impl Future for NextJob {
-    type Output = Option<ServerJob>;
+/// Future returned by [`ServerJobQueue::next_job`].
+pub struct NextJobFuture<'a, J: Send + 'static> {
+    queue: &'a Arc<ServerJobQueue<J>>,
+}
+
+impl<'a, J: Send + 'static> Future for NextJobFuture<'a, J> {
+    type Output = Option<J>;
+
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.queue.waker.register(cx.waker());
-        let mut inner = self.queue.inner.lock().expect("server queue mutex");
-        if let Some(job) = inner.jobs.pop_front() {
-            Poll::Ready(Some(job))
-        } else if inner.closed {
-            Poll::Ready(None)
-        } else {
-            Poll::Pending
+        let mut g = self
+            .queue
+            .inner
+            .lock()
+            .expect("ServerJobQueue mutex poisoned");
+        if let Some(job) = g.queue.pop_front() {
+            return Poll::Ready(Some(job));
         }
+        if g.closed {
+            return Poll::Ready(None);
+        }
+        // Single-consumer queue, so we keep at most one waker.
+        match &g.waiter {
+            Some(existing) if existing.will_wake(cx.waker()) => {}
+            _ => g.waiter = Some(cx.waker().clone()),
+        }
+        Poll::Pending
     }
 }
+
+// -------------------- progress_loop -----------------------------------
+
+/// Drive a single Mercury context until `shutdown` is set, then drain.
+///
+/// Designed to run on a dedicated thread (typically spawned via the
+/// crate's threading helper). Returns `Ok(())` once shutdown drain
+/// completes; never returns errors today because Mercury's
+/// `HG_Progress` legitimately returns non-success rcs (timeout, no
+/// pending operations, etc.) on the happy path.
+pub fn progress_loop(ctx_raw: hg_context_t, shutdown: &AtomicBool, cfg: &NicConfig) -> Result<()> {
+    if ctx_raw.is_null() {
+        return Err(HgError::BadConfig("progress_loop: null context"));
+    }
+
+    while !shutdown.load(Ordering::Acquire) {
+        // SAFETY: `ctx_raw` is a non-null Mercury context that the
+        // caller guarantees is alive for the duration of this call.
+        let _ = unsafe { ffi::HG_Progress(ctx_raw, cfg.progress_timeout_ms) };
+
+        let mut actual: u32 = 0;
+        // SAFETY: same as above; `&mut actual` is a valid pointer to a
+        // u32 owned by this stack frame.
+        let rc =
+            unsafe { ffi::HG_Trigger(ctx_raw, 0, cfg.trigger_max_count, &mut actual as *mut u32) };
+        if rc != HG_SUCCESS || actual == 0 {
+            continue;
+        }
+    }
+
+    // Final drain. Cap iterations to avoid pathological infinite loops
+    // if Mercury ever fails to make progress.
+    for _ in 0..1024 {
+        let mut actual: u32 = 0;
+        // SAFETY: same as the in-loop call above.
+        let rc =
+            unsafe { ffi::HG_Trigger(ctx_raw, 0, cfg.trigger_max_count, &mut actual as *mut u32) };
+        if rc != HG_SUCCESS || actual == 0 {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+// =====================================================================
+// Tests
+// =====================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::task::{RawWaker, RawWakerVTable, Waker};
+    use std::sync::atomic::AtomicUsize;
+
+    // -- Noop waker ----------------------------------------------------
+
+    fn noop_raw_waker() -> std::task::RawWaker {
+        fn no_op(_: *const ()) {}
+        fn clone(_: *const ()) -> std::task::RawWaker {
+            noop_raw_waker()
+        }
+        let vt = &std::task::RawWakerVTable::new(clone, no_op, no_op, no_op);
+        std::task::RawWaker::new(std::ptr::null(), vt)
+    }
 
     fn noop_waker() -> Waker {
-        fn no(_: *const ()) {}
-        fn clone(_: *const ()) -> RawWaker {
-            RawWaker::new(std::ptr::null(), &VT)
+        // SAFETY: the vtable is `'static`, all functions are no-ops,
+        // and the data pointer is never dereferenced.
+        unsafe { Waker::from_raw(noop_raw_waker()) }
+    }
+
+    fn block_on<F: Future>(mut f: F) -> F::Output {
+        // SAFETY: `f` is owned by this stack frame for the duration of
+        // the call and is not moved after pinning.
+        let mut f = unsafe { Pin::new_unchecked(&mut f) };
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        for _ in 0..1_000_000 {
+            match f.as_mut().poll(&mut cx) {
+                Poll::Ready(v) => return v,
+                Poll::Pending => continue,
+            }
         }
-        static VT: RawWakerVTable = RawWakerVTable::new(clone, no, no, no);
-        // SAFETY: the vtable's functions never dereference the data
-        // pointer, so a null data pointer is sound for this waker.
-        unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VT)) }
+        panic!("block_on: future did not complete within 1M polls");
+    }
+
+    // -- Counting waker ------------------------------------------------
+
+    fn counting_raw_waker(counter: *const AtomicUsize) -> std::task::RawWaker {
+        unsafe fn clone(data: *const ()) -> std::task::RawWaker {
+            counting_raw_waker(data as *const AtomicUsize)
+        }
+        unsafe fn wake(data: *const ()) {
+            // SAFETY: `data` was produced from a `&AtomicUsize` whose
+            // lifetime outlives the waker by construction in tests.
+            unsafe { (*(data as *const AtomicUsize)).fetch_add(1, Ordering::SeqCst) };
+        }
+        unsafe fn wake_by_ref(data: *const ()) {
+            // SAFETY: same as `wake`.
+            unsafe { (*(data as *const AtomicUsize)).fetch_add(1, Ordering::SeqCst) };
+        }
+        unsafe fn drop_(_: *const ()) {}
+        let vt = &std::task::RawWakerVTable::new(clone, wake, wake_by_ref, drop_);
+        std::task::RawWaker::new(counter as *const (), vt)
+    }
+
+    fn counting_waker(counter: &AtomicUsize) -> Waker {
+        // SAFETY: caller keeps `counter` alive at least as long as the
+        // returned waker (it's borrowed for the test's duration).
+        unsafe { Waker::from_raw(counting_raw_waker(counter as *const AtomicUsize)) }
+    }
+
+    // -- CompletionSlot ------------------------------------------------
+
+    #[test]
+    fn slot_complete_then_take_round_trip() {
+        let s = CompletionSlot::new();
+        s.complete(Ok(()));
+        let out = s.try_take().expect("outcome present");
+        assert!(out.is_ok());
+        assert!(s.try_take().is_none(), "second take returns None");
     }
 
     #[test]
-    fn completion_completes_and_wakes() {
-        let reg = CompletionRegistry::new(4);
-        let slot = reg.alloc().unwrap();
-        let mut fut = CompletionFuture {
-            slot: slot.clone(),
-            registry: reg.clone(),
-        };
-        let w = noop_waker();
-        let mut cx = Context::from_waker(&w);
-        assert!(Pin::new(&mut fut).poll(&mut cx).is_pending());
+    fn slot_complete_is_idempotent() {
+        let s = CompletionSlot::new();
+        s.complete(Ok(()));
+        s.complete(Err(HgError::Closed));
+        let out = s.try_take().expect("outcome present");
+        assert!(out.is_ok(), "first outcome wins");
+    }
+
+    #[test]
+    fn completion_future_wakes_on_complete() {
+        let counter = AtomicUsize::new(0);
+        let waker = counting_waker(&counter);
+        let mut cx = Context::from_waker(&waker);
+
+        let slot = CompletionSlot::new();
+        let mut fut = Box::pin(CompletionFuture {
+            slot: Arc::clone(&slot),
+            registry: None,
+            released: false,
+        });
+
+        assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending));
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
 
         slot.complete(Ok(()));
-        match Pin::new(&mut fut).poll(&mut cx) {
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "wake fired");
+
+        match fut.as_mut().poll(&mut cx) {
             Poll::Ready(Ok(())) => {}
-            other => panic!(
-                "expected ready Ok, got {:?}",
-                matches!(other, Poll::Ready(_))
-            ),
+            other => panic!("expected Ready(Ok), got {other:?}"),
+        }
+    }
+
+    // -- CompletionRegistry --------------------------------------------
+
+    #[test]
+    fn registry_try_alloc_respects_capacity() {
+        let r = CompletionRegistry::new(2);
+        let _a = r.try_alloc().expect("first alloc ok");
+        let _b = r.try_alloc().expect("second alloc ok");
+        assert!(r.try_alloc().is_none(), "third alloc blocked");
+        assert_eq!(r.in_flight(), 2);
+        assert_eq!(r.capacity(), 2);
+    }
+
+    #[test]
+    fn registry_acquire_wakes_on_release() {
+        let counter = AtomicUsize::new(0);
+        let waker = counting_waker(&counter);
+        let mut cx = Context::from_waker(&waker);
+
+        let r = CompletionRegistry::new(1);
+
+        // First acquire resolves immediately.
+        let first = block_on(r.acquire());
+        assert_eq!(r.in_flight(), 1);
+
+        // Second acquire parks.
+        let acquire2 = r.acquire();
+        let mut acquire2 = Box::pin(acquire2);
+        assert!(matches!(acquire2.as_mut().poll(&mut cx), Poll::Pending));
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+
+        // Drop first; capacity is released and waker fires.
+        drop(first);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        match acquire2.as_mut().poll(&mut cx) {
+            Poll::Ready(_slot) => {}
+            Poll::Pending => panic!("acquire2 still pending after release"),
         }
     }
 
     #[test]
-    fn registry_full_returns_error() {
-        let reg = CompletionRegistry::new(2);
-        let a = reg.alloc().unwrap();
-        let _b = reg.alloc().unwrap();
-        assert!(reg.alloc().is_err());
-        // Releasing through the future-drop path frees a slot.
-        let fut = CompletionFuture {
-            slot: a.clone(),
-            registry: reg.clone(),
-        };
-        drop(fut);
-        assert!(reg.alloc().is_ok());
+    fn registered_slot_drop_releases_capacity() {
+        let r = CompletionRegistry::new(1);
+        {
+            let _slot = block_on(r.acquire());
+            assert_eq!(r.in_flight(), 1);
+        }
+        assert_eq!(r.in_flight(), 0, "drop released capacity");
+        // Subsequent acquire succeeds.
+        let _slot = block_on(r.acquire());
+        assert_eq!(r.in_flight(), 1);
     }
 
     #[test]
-    fn server_queue_round_trips() {
-        let q = ServerJobQueue::new();
-        let q2 = q.clone();
-        let t = std::thread::spawn(move || {
-            q2.push(ServerJob {
-                handle: UnsafeSendPtr(0x1 as *mut _),
-                input_struct: UnsafeSendPtr(0x2 as *mut _),
-            });
-        });
-        t.join().unwrap();
+    fn callback_arg_round_trip_propagates_outcome() {
+        let r = CompletionRegistry::new(1);
+        let allocated = block_on(r.acquire());
+        let arg = allocated.into_callback_arg();
+        let fut = allocated.into_future();
+        // SAFETY: `arg` was produced by `into_callback_arg` above and
+        // has not been reclaimed yet.
+        let recovered = unsafe { from_callback_arg(arg) };
+        recovered.complete(Ok(()));
+        let outcome = block_on(fut);
+        assert!(outcome.is_ok());
+        assert_eq!(r.in_flight(), 0, "completion released capacity");
+    }
 
-        let mut fut = q.next_job();
-        let w = noop_waker();
-        let mut cx = Context::from_waker(&w);
-        match Pin::new(&mut fut).poll(&mut cx) {
-            Poll::Ready(Some(job)) => {
-                assert_eq!(job.handle.0 as usize, 0x1);
-                assert_eq!(job.input_struct.0 as usize, 0x2);
-            }
-            _ => panic!("expected job"),
-        }
+    // -- Oneshot -------------------------------------------------------
 
+    #[test]
+    fn oneshot_complete_via_callback_arg() {
+        let one = Oneshot::new();
+        let arg = one.into_callback_arg();
+        let fut = one.into_future();
+        // SAFETY: `arg` was produced just above and not yet reclaimed.
+        let recovered = unsafe { from_callback_arg(arg) };
+        recovered.complete(Ok(()));
+        let outcome = block_on(fut);
+        assert!(outcome.is_ok());
+    }
+
+    // -- ServerJobQueue ------------------------------------------------
+
+    #[test]
+    fn job_queue_push_next_round_trip() {
+        let q: Arc<ServerJobQueue<u32>> = ServerJobQueue::new(4);
+        q.push(7).expect("push ok");
+        let got = block_on(q.next_job());
+        assert_eq!(got, Some(7));
+    }
+
+    #[test]
+    fn job_queue_close_drains_then_resolves_none() {
+        let q: Arc<ServerJobQueue<u32>> = ServerJobQueue::new(4);
+        q.push(1).unwrap();
+        q.push(2).unwrap();
         q.close();
-        let mut fut = q.next_job();
-        match Pin::new(&mut fut).poll(&mut cx) {
-            Poll::Ready(None) => {}
-            _ => panic!("expected None after close"),
+        assert_eq!(block_on(q.next_job()), Some(1));
+        assert_eq!(block_on(q.next_job()), Some(2));
+        assert_eq!(block_on(q.next_job()), None);
+        assert!(matches!(q.push(3), Err(PushError::Closed(3))));
+    }
+
+    #[test]
+    fn job_queue_full_returns_error_with_job() {
+        let q: Arc<ServerJobQueue<u32>> = ServerJobQueue::new(1);
+        q.push(10).unwrap();
+        match q.push(20) {
+            Err(PushError::Full(20)) => {}
+            other => panic!("expected Full(20), got {other:?}"),
         }
     }
 
     #[test]
-    fn completion_error_propagates() {
-        let reg = CompletionRegistry::new(1);
-        let slot = reg.alloc().unwrap();
-        let mut fut = CompletionFuture {
-            slot: slot.clone(),
-            registry: reg.clone(),
-        };
-        let w = noop_waker();
-        let mut cx = Context::from_waker(&w);
-        assert!(Pin::new(&mut fut).poll(&mut cx).is_pending());
+    fn job_queue_next_parks_and_wakes_on_push() {
+        let counter = AtomicUsize::new(0);
+        let waker = counting_waker(&counter);
+        let mut cx = Context::from_waker(&waker);
 
-        slot.complete(Err(HgError::new(-3, "boom")));
-        match Pin::new(&mut fut).poll(&mut cx) {
-            Poll::Ready(Err(e)) => {
-                assert_eq!(e.code, -3);
-                assert_eq!(e.ctx, "boom");
-            }
-            _ => panic!("expected ready err"),
+        let q: Arc<ServerJobQueue<u32>> = ServerJobQueue::new(4);
+        let next = q.next_job();
+        let mut next = Box::pin(next);
+        assert!(matches!(next.as_mut().poll(&mut cx), Poll::Pending));
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+
+        q.push(42).unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        match next.as_mut().poll(&mut cx) {
+            Poll::Ready(Some(42)) => {}
+            other => panic!("expected Ready(Some(42)), got {other:?}"),
         }
     }
 
-    #[test]
-    fn registry_peak_tracks_highest_live() {
-        let reg = CompletionRegistry::new(4);
-        let _a = reg.alloc().unwrap();
-        let _b = reg.alloc().unwrap();
-        let c = reg.alloc().unwrap();
-        assert_eq!(reg.peak_inflight(), 3);
-        reg.release(&c);
-        drop(c);
-        // Releasing does not lower the peak.
-        let _d = reg.alloc().unwrap();
-        assert_eq!(reg.peak_inflight(), 3);
-        assert_eq!(reg.capacity(), 4);
-    }
+    // -- progress_loop signature ---------------------------------------
 
-    #[test]
-    fn registry_release_via_future_drop_lowers_live_count() {
-        let reg = CompletionRegistry::new(2);
-        let a = reg.alloc().unwrap();
-        assert_eq!(reg.live_count(), 1);
-        let fut = CompletionFuture {
-            slot: a.clone(),
-            registry: reg.clone(),
-        };
-        drop(fut);
-        assert_eq!(reg.live_count(), 0);
-        assert!(a.is_cancelled());
-    }
-
-    #[test]
-    fn callback_arg_round_trip_preserves_strong_count() {
-        let reg = CompletionRegistry::new(1);
-        let slot = reg.alloc().unwrap();
-        // alloc returns one ref; registry retains another.
-        assert_eq!(Arc::strong_count(&slot), 2);
-        let arg = slot.clone().into_callback_arg();
-        assert_eq!(Arc::strong_count(&slot), 3);
-        // SAFETY: `arg` was just produced by `into_callback_arg`.
-        let reclaimed = unsafe { CompletionSlot::from_callback_arg(arg) };
-        assert!(Arc::ptr_eq(&reclaimed, &slot));
-        assert_eq!(Arc::strong_count(&slot), 3); // reclaim consumed the leaked ref
-        drop(reclaimed);
-        assert_eq!(Arc::strong_count(&slot), 2);
-    }
-
-    #[test]
-    fn oneshot_reclaim_releases_strong_ref() {
-        let oneshot = Oneshot::new();
-        // future holds one slot ref; arg holds another.
-        let slot_weak = Arc::downgrade(&oneshot.future.slot);
-        let arg = oneshot.arg;
-        // Drop future first so only the leaked Arc keeps the slot alive.
-        drop(oneshot.future);
-        assert!(slot_weak.strong_count() >= 1);
-        // SAFETY: `arg` came from `Oneshot::new` and has not been delivered.
-        unsafe {
-            Oneshot::reclaim(arg);
-        }
-        assert_eq!(slot_weak.strong_count(), 0);
-    }
-
-    #[test]
-    fn oneshot_future_completes_via_complete_oneshot() {
-        let oneshot = Oneshot::new();
-        let arg = oneshot.arg;
-        let mut fut = oneshot.future;
-        let w = noop_waker();
-        let mut cx = Context::from_waker(&w);
-        assert!(Pin::new(&mut fut).poll(&mut cx).is_pending());
-
-        // SAFETY: `arg` came from `Oneshot::new`.
-        let ret = unsafe { complete_oneshot(crate::mercury::ffi::HG_SUCCESS, arg, "test-ctx") };
-        assert_eq!(ret, crate::mercury::ffi::HG_SUCCESS);
-
-        match Pin::new(&mut fut).poll(&mut cx) {
-            Poll::Ready(Ok(())) => {}
-            _ => panic!("expected Ready(Ok)"),
-        }
-    }
-
-    #[test]
-    fn complete_oneshot_propagates_error_with_ctx() {
-        let oneshot = Oneshot::new();
-        let arg = oneshot.arg;
-        let mut fut = oneshot.future;
-        let w = noop_waker();
-        let mut cx = Context::from_waker(&w);
-        assert!(Pin::new(&mut fut).poll(&mut cx).is_pending());
-
-        // SAFETY: `arg` came from `Oneshot::new`.
-        let _ = unsafe { complete_oneshot(-9, arg, "site") };
-
-        match Pin::new(&mut fut).poll(&mut cx) {
-            Poll::Ready(Err(e)) => {
-                assert_eq!(e.code, -9);
-                assert_eq!(e.ctx, "site");
-            }
-            _ => panic!("expected Ready(Err)"),
-        }
-    }
-
-    #[test]
-    fn waker_wake_before_register_still_wakes() {
-        // Models the race the AtomicWaker is meant to handle.
-        let reg = CompletionRegistry::new(1);
-        let slot = reg.alloc().unwrap();
-        // Complete *before* anyone polls / registers a waker.
-        slot.complete(Ok(()));
-
-        let mut fut = CompletionFuture {
-            slot,
-            registry: reg.clone(),
-        };
-        let w = noop_waker();
-        let mut cx = Context::from_waker(&w);
-        match Pin::new(&mut fut).poll(&mut cx) {
-            Poll::Ready(Ok(())) => {}
-            _ => panic!("expected Ready(Ok) on first poll"),
-        }
-    }
-
-    #[test]
-    fn server_queue_post_close_pushes_are_dropped() {
-        let q = ServerJobQueue::new();
-        q.push(ServerJob {
-            handle: UnsafeSendPtr(0xAA as *mut _),
-            input_struct: UnsafeSendPtr(0xBB as *mut _),
-        });
-        q.close();
-        // Post-close push silently dropped.
-        q.push(ServerJob {
-            handle: UnsafeSendPtr(0xCC as *mut _),
-            input_struct: UnsafeSendPtr(0xDD as *mut _),
-        });
-
-        let mut fut = q.next_job();
-        let w = noop_waker();
-        let mut cx = Context::from_waker(&w);
-        match Pin::new(&mut fut).poll(&mut cx) {
-            Poll::Ready(Some(job)) => {
-                assert_eq!(job.handle.0 as usize, 0xAA);
-            }
-            _ => panic!("expected pre-close job"),
-        }
-        let mut fut = q.next_job();
-        match Pin::new(&mut fut).poll(&mut cx) {
-            Poll::Ready(None) => {}
-            _ => panic!("expected None: post-close push must be dropped"),
-        }
+    fn _progress_loop_takes_atomic(_: hg_context_t, _: &AtomicBool, _: &NicConfig) {
+        // Type-check the signature only; never call. A real
+        // `hg_context_t` is not available in unit tests.
     }
 }

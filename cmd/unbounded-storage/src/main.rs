@@ -7,19 +7,10 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
-
-use unbounded_storage::bufferpool::{
-    NullBlockStore, Pool, PoolConfig, PoolGroup, Req, ShardDescriptor, StripeKey,
-};
-use unbounded_storage::mercury::{Class, MercuryTransport, PeerEntry, StaticPeer, TransportConfig};
+use unbounded_storage::backing::{BackingKind, BackingRequest, HUGEPAGE_2MB, allocate};
 use unbounded_storage::runtime::{PinnedRuntime, Threading, WorkerIdx, WorkerSpec};
 use unbounded_storage::topology::{self, Host, Plan, Role, Worker};
 
-use unbounded_storage::backing::{BackingKind, BackingRequest, HUGEPAGE_2MB, allocate};
-
-const PROGRESS_POLL_MS: u32 = 100;
-const MAX_INFLIGHT: usize = 1024;
 const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
 
 /// Per-shard buffer-pool sizing. The page size is fixed at 2 MiB
@@ -34,23 +25,6 @@ const DEFAULT_BYTES_PER_SHARD: usize = 128 * 1024 * 1024;
 /// is restricted to async-signal-safe operations) and polled by
 /// the main thread plus every shard thread.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
-
-/// Placeholder request type for the per-shard `Pool`. Carries a
-/// `StripeKey` and satisfies the trait bounds required by
-/// `MercuryTransport` (`Serialize`). No reads are issued against
-/// the pool today; this exists so `Pool::new` type-checks.
-#[derive(Clone, Serialize, Deserialize)]
-struct PlaceholderReq {
-    key: [u8; 32],
-}
-
-impl Req for PlaceholderReq {
-    fn key(&self) -> StripeKey {
-        StripeKey(self.key)
-    }
-}
-
-type ShardPool = Pool<MercuryTransport<PlaceholderReq, StaticPeer>, NullBlockStore, PlaceholderReq>;
 
 fn main() -> ExitCode {
     let cli = match Cli::parse(std::env::args().skip(1)) {
@@ -96,9 +70,10 @@ fn main() -> ExitCode {
     let runtime = PinnedRuntime::new(specs);
     install_signal_handler();
 
-    // Each shard thread reports either an error or a populated
-    // `ShardDescriptor` on this channel. The main thread aggregates
-    // descriptors into a `PoolGroup` once every shard has reported.
+    // Each shard thread reports either a successful bring-up or an
+    // error on this channel. The main thread waits for every shard
+    // to report so a partial bring-up produces a coherent error
+    // path.
     let (ready_tx, ready_rx) = mpsc::channel::<ShardReady>();
     let bytes_per_shard = cli.bytes_per_shard / progress.len();
     let mut joins = Vec::with_capacity(progress.len());
@@ -107,13 +82,6 @@ fn main() -> ExitCode {
         let dev_name = match worker.role {
             Role::RdmaProgress { hca } if hca != usize::MAX => Some(host.hcas[hca].dev_name.clone()),
             _ => None,
-        };
-        let na_info = match &dev_name {
-            // Placeholder until the per-NIC config-parsing follow-up
-            // wires through provider-specific `domain=`, listen port,
-            // etc.
-            Some(_) => "ofi+verbs;ofi_rxm://".to_string(),
-            None => "ofi+tcp://0.0.0.0:0".to_string(),
         };
         let worker = worker.clone();
         let runtime = runtime.clone();
@@ -127,16 +95,7 @@ fn main() -> ExitCode {
                     rt.run_worker(
                         widx,
                         Box::new(move || {
-                            run_shard(
-                                widx,
-                                worker,
-                                dev_name,
-                                na_info,
-                                runtime,
-                                tx,
-                                backing_kind,
-                                bytes_per_shard,
-                            );
+                            run_shard(widx, worker, dev_name, tx, backing_kind, bytes_per_shard);
                         }),
                     );
                 })
@@ -145,15 +104,11 @@ fn main() -> ExitCode {
     }
     drop(ready_tx);
 
-    // Drain shard readiness messages, separating successes from
-    // failures. We wait for every shard so a partial bring-up
-    // produces a coherent error path rather than a half-built
-    // `PoolGroup`.
-    let mut descriptors: Vec<ShardDescriptor> = Vec::with_capacity(joins.len());
+    let mut up = 0usize;
     let mut errors: Vec<String> = Vec::new();
     for msg in ready_rx {
         match msg {
-            ShardReady::Up(d) => descriptors.push(d),
+            ShardReady::Up => up += 1,
             ShardReady::Failed(err) => {
                 eprintln!("shard failed: {err}");
                 errors.push(err);
@@ -162,23 +117,8 @@ fn main() -> ExitCode {
         }
     }
 
-    // Build the process-wide `PoolGroup` over the successful
-    // shards. Routing is content-addressed: hash the request's
-    // `StripeKey` into the shard index. This is the simplest
-    // routing that distributes load uniformly across shards and
-    // is replaceable per design once topology-aware peer routing
-    // lands.
-    if errors.is_empty() && !descriptors.is_empty() {
-        descriptors.sort_by_key(|d| d.worker_idx.0);
-        let shard_count = descriptors.len();
-        let _group: PoolGroup<PlaceholderReq> =
-            PoolGroup::new(descriptors, move |req: &PlaceholderReq| {
-                stripe_key_to_shard(&req.key(), shard_count)
-            });
-        // No consumer yet; the group is built to validate the
-        // bring-up surface. A future change will hand it to
-        // whichever subsystem first needs cross-shard fan-out.
-        eprintln!("pool group up: shards={}", shard_count);
+    if errors.is_empty() && up > 0 {
+        eprintln!("shards up: {up}");
     }
 
     // Wait for shutdown
@@ -200,58 +140,19 @@ fn main() -> ExitCode {
     }
 }
 
-/// Body of one shard thread. Runs on the pinned executor: builds
-/// the Mercury `Class`, registers a NUMA-local `Backing`, wires up
-/// the `Pool`, reports readiness, then idles until shutdown so the
-/// `Class` (and its progress thread) plus the `Pool` are dropped
-/// together.
+/// Body of one shard thread. Runs on the pinned executor: allocates
+/// a NUMA-local backing region, reports readiness, then idles until
+/// shutdown. The transport that previously consumed this backing
+/// has been removed; this is the bring-up shell that the next
+/// transport will plug into.
 fn run_shard(
     widx: WorkerIdx,
     worker: Worker,
     dev_name: Option<String>,
-    na_info: String,
-    runtime: std::sync::Arc<dyn unbounded_storage::runtime::Threading>,
     tx: mpsc::Sender<ShardReady>,
     backing_kind: BackingKind,
     bytes_per_shard: usize,
 ) {
-    let cfg = TransportConfig {
-        na_info,
-        listen: true,
-        peers: Vec::<PeerEntry>::new(),
-        max_inflight: MAX_INFLIGHT,
-        progress_poll_ms: PROGRESS_POLL_MS,
-        runtime,
-        worker_idx: widx,
-    };
-    let class = match Class::new(cfg).and_then(|c| c.self_address().map(|a| (c, a))) {
-        Ok((class, self_addr)) => {
-            println!(
-                "shard up: worker={} dev={} numa={} cpu={} self_addr={}",
-                widx.0,
-                dev_name.as_deref().unwrap_or("tcp-fallback"),
-                worker
-                    .numa
-                    .map(|n| n.to_string())
-                    .unwrap_or_else(|| "none".into()),
-                worker.cpu,
-                self_addr,
-            );
-            class
-        }
-        Err(e) => {
-            let _ = tx.send(ShardReady::Failed(format!("worker={}: {e}", widx.0)));
-            return;
-        }
-    };
-
-    // NUMA-local backing. Allocated on the pinned shard thread so
-    // the `PinnedRuntime`'s `set_mempolicy` keeps the pages on the
-    // intended node; the hugepage variant additionally pins via
-    // `mbind` when `worker.numa` is known. Register it with the
-    // Mercury class before building the transport (the new
-    // embedder-pre-registers model replaces the old
-    // `Transport::register_pages` handshake).
     let backing = match allocate(BackingRequest {
         kind: backing_kind,
         bytes: bytes_per_shard,
@@ -266,70 +167,30 @@ fn run_shard(
             return;
         }
     };
-    let backing_bytes = backing.page_size * backing.page_count;
-    let page_size = backing.page_size;
-    if let Err(e) = class.register_backing(backing.base, backing_bytes) {
-        let _ = tx.send(ShardReady::Failed(format!(
-            "worker={}: register_backing: {e}",
-            widx.0,
-        )));
-        return;
-    }
 
-    // `StaticPeer(PeerId(0))` is a placeholder: with `peers`
-    // empty, no `bulk_get` will resolve, but constructing the
-    // transport is harmless. A real router will be installed when
-    // peer discovery lands.
-    let transport = MercuryTransport::<PlaceholderReq, _>::new(
-        &class,
-        StaticPeer(unbounded_storage::bufferpool::PeerId(0)),
-        page_size,
+    println!(
+        "shard up: worker={} dev={} numa={} cpu={} backing_bytes={}",
+        widx.0,
+        dev_name.as_deref().unwrap_or("tcp-fallback"),
+        worker
+            .numa
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "none".into()),
+        worker.cpu,
+        backing.page_size * backing.page_count,
     );
-    let blockstore = NullBlockStore::new();
-    let pool: ShardPool = match Pool::new(PoolConfig::default(), backing, transport, blockstore) {
-        Ok(p) => p,
-        Err(e) => {
-            let _ = tx.send(ShardReady::Failed(format!(
-                "worker={}: Pool::new: {e}",
-                widx.0,
-            )));
-            return;
-        }
-    };
 
-    let _ = tx.send(ShardReady::Up(ShardDescriptor {
-        worker_idx: widx,
-        numa: worker.numa,
-    }));
+    let _ = tx.send(ShardReady::Up);
 
     wait_for_shutdown();
 
-    // Drop order matters: drop the `Pool` first so the
-    // `MercuryTransport` (which holds an `Arc<ClassInner>`) goes
-    // away before the owning `Class` runs its own drop. `Class::drop`
-    // closes the server queue and signals the progress thread; the
-    // last `Arc` release inside `ClassInner::drop` joins that thread
-    // and finalizes Mercury.
-    drop(pool);
-    drop(class);
-}
-
-/// Hash a `StripeKey` into a shard index. The first eight bytes of
-/// the 32-byte key are interpreted as a little-endian `u64`; that
-/// distributes uniformly under a content-addressed key (which is
-/// already a hash) and avoids pulling in a hash crate. The modulus
-/// is the shard count; `shard_count` is asserted non-zero by
-/// `PoolGroup::new`.
-fn stripe_key_to_shard(key: &StripeKey, shard_count: usize) -> usize {
-    let bytes = &key.0[..8];
-    let h = u64::from_le_bytes(bytes.try_into().expect("8 bytes"));
-    (h as usize) % shard_count
+    drop(backing);
 }
 
 /// Status a shard thread reports once it has either come up or
 /// failed during bring-up.
 enum ShardReady {
-    Up(ShardDescriptor),
+    Up,
     Failed(String),
 }
 

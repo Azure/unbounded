@@ -1,250 +1,613 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! DST-aware fakes for the Mercury cross-thread bridge.
+//! DST-aware mocks for Mercury's `Transport` (client) and `BulkSource`
+//! (server) traits. Each async path routes its "RPC latency" through
+//! [`yield_n`] with a per-call random count drawn from the framework's
+//! [`SimState::rng`], and may inject synthetic faults governed by the
+//! per-area [`MercurySimCfg`]. Counters are exposed so workloads can
+//! assert higher-level properties (capacity backpressure, completion
+//! totals, ...).
 //!
-//! The bridge under test is `mercury::progress`: an
-//! `Arc<CompletionSlot>` is handed to the FFI as a raw pointer, and a
-//! callback fires later from the progress thread. The single-threaded
-//! DST executor cannot run a second OS thread, so we model the
-//! progress thread as another async task. The "FFI" surface this
-//! suite cares about is just the raw-pointer round trip:
-//!
-//!   1. The client `into_callback_arg()`s its `Arc<CompletionSlot>`
-//!      and registers the resulting pointer with `FakeProgress`.
-//!   2. The progress task picks one pending entry per loop iteration
-//!      (uniformly via `with_sim`), `yield_n`s a random delay drawn
-//!      from `MercurySimCfg`, reclaims the slot via
-//!      `from_callback_arg`, and calls `slot.complete(outcome)`.
-//!   3. The shared `ServerJobQueue` is exercised the same way: a
-//!      producer task pushes jobs interleaved with yields and then
-//!      calls `close()`; consumer tasks pull via `next_job().await`.
-//!
-//! Per-area knobs (delay bound, error rate, out-of-order delivery)
-//! live on `MercurySimCfg` rather than the framework's `SimState`.
+//! The mocks are deliberately `!Send` (they hold `Rc`/`RefCell`); a
+//! production `MercuryTransport` is `Send + Sync`, but the DST harness
+//! runs everything on a single executor and does not need that. The
+//! one place this matters is `BulkSource::fetch`, whose signature
+//! returns a `Send` future. We satisfy that bound by computing all
+//! random draws and data clones synchronously up front and returning a
+//! future whose captured state is only `Send`-safe primitives plus a
+//! `Vec<u8>`.
 
-use std::cell::{Cell, RefCell};
-use std::ffi::c_void;
+#![allow(dead_code)]
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::Arc;
 
 use rand::Rng;
-use unbounded_storage::mercury::progress::{CompletionSlot, ServerJob, UnsafeSendPtr};
+use serde::{Deserialize, Serialize};
 
-use crate::framework::executor::{with_sim, yield_n};
+use unbounded_storage::bufferpool::{
+    BulkRef, Error as BpError, PageRef, Req, StripeKey, Transport,
+};
+use unbounded_storage::mercury::{BulkSource, HgError, PeerId};
 
-/// Per-run simulation knobs for the Mercury bridge mocks. Held
-/// behind an `Rc` so both the workload driver and the progress task
-/// can share a single configuration instance.
-pub struct MercurySimCfg {
-    /// Maximum number of `yield_once` pends the progress task emits
-    /// before delivering a single pending completion. Actual count
-    /// per delivery is drawn uniformly from `0..=max_delivery_delay`.
-    pub max_delivery_delay: Cell<u32>,
-    /// Probability in `[0, 100]` that a delivery resolves with a
-    /// synthetic error. `0` is the all-success regime.
-    pub error_rate: Cell<u32>,
-    /// If true, the progress task picks the pending entry to deliver
-    /// uniformly at random; if false it delivers FIFO. Out-of-order
-    /// delivery exercises the bridge's "callback for a future the
-    /// client has not yet polled" cases.
-    pub out_of_order: Cell<bool>,
-    /// Probability in `[0, 100]` that a `submit` call fails
-    /// synchronously, mirroring an `HG_Forward` rejection. The slot
-    /// is released by the client and no callback is ever scheduled,
-    /// so no entry is added to `pending` or the history.
-    pub submit_failure_rate: Cell<u32>,
+use crate::framework::executor::{with_sim, yield_n, yield_once};
+
+// =====================================================================
+// Configuration
+// =====================================================================
+
+/// Mercury-specific simulation knobs that ride alongside the
+/// framework's [`SimState`]. Held behind an `Rc` so the client mock,
+/// server mock, and the workload driver can share a single instance
+/// without leaking knowledge into the framework crate.
+pub(crate) struct MercurySimCfg {
+    /// Min/max yield count for "RPC latency" in [`MockTransport::bulk_get`]
+    /// (drawn from `SimState`'s PRNG on each call).
+    pub min_latency_yields: u32,
+    pub max_latency_yields: u32,
+    /// Probability that an RPC fails outright with [`HgError::HgForward`].
+    pub forward_fault_rate: f64,
+    /// Probability that a fetch returns fewer bytes than requested,
+    /// surfaced to the client as [`HgError::ShortRead`].
+    pub short_read_rate: f64,
+    /// Probability that a peer is reported as unreachable
+    /// ([`HgError::HgAddrLookup`]).
+    pub peer_disconnect_rate: f64,
+    /// Maximum in-flight RPCs the mock will run concurrently before
+    /// backpressuring callers via additional yields.
+    pub capacity: u32,
+    /// Counters shared with the harness for invariant assertions.
+    pub counters: Rc<RefCell<MercuryCounters>>,
 }
 
 impl MercurySimCfg {
     pub fn new() -> Rc<Self> {
         Rc::new(Self {
-            max_delivery_delay: Cell::new(0),
-            error_rate: Cell::new(0),
-            out_of_order: Cell::new(false),
-            submit_failure_rate: Cell::new(0),
+            min_latency_yields: 0,
+            max_latency_yields: 0,
+            forward_fault_rate: 0.0,
+            short_read_rate: 0.0,
+            peer_disconnect_rate: 0.0,
+            capacity: u32::MAX,
+            counters: Rc::new(RefCell::new(MercuryCounters::default())),
         })
     }
 }
 
-/// Returns true with probability `MercurySimCfg::submit_failure_rate / 100`.
-/// All randomness flows through `with_sim` so the run is deterministic
-/// in `(seed, workload)`.
-pub fn draw_submit_failure(cfg: &MercurySimCfg) -> bool {
-    let rate = cfg.submit_failure_rate.get();
-    rate > 0 && with_sim(|s| s.rng.gen_ratio(rate.min(100), 100))
+#[derive(Default)]
+pub(crate) struct MercuryCounters {
+    pub forwards_started: u64,
+    pub forwards_completed_ok: u64,
+    pub forwards_completed_err: u64,
+    pub bytes_pushed: u64,
+    pub fetches_invoked: u64,
+    pub fetches_short: u64,
+    pub capacity_waits: u64,
+    pub peak_in_flight: u32,
+    pub current_in_flight: u32,
 }
 
-/// Identity tag a client stamps onto each submission so the oracle
-/// and history can correlate "submitted X" with "completed X".
-pub type SlotTag = u64;
+// =====================================================================
+// Request type
+// =====================================================================
 
-/// One outcome the progress task will deliver. `Ok(())` and `Err(code)`
-/// flatten down to the same `Result<(), HgError>` the production
-/// callback path would store on the slot.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Outcome {
-    Ok,
-    Err(i32),
+/// Test request type. The pool only inspects `req.key()`; Mercury also
+/// requires `Serialize + DeserializeOwned + Send + Sync + 'static` for
+/// the on-wire trip, so we derive serde here even though the DST never
+/// actually serializes.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct MockReq {
+    pub key: [u8; 32],
 }
 
-/// One in-flight submission held by the fake progress thread until
-/// it fires the callback.
-pub struct Pending {
-    pub tag: SlotTag,
-    /// Raw pointer produced by `CompletionSlot::into_callback_arg`.
-    /// `UnsafeSendPtr` is `Send + Sync` only to keep the type usable
-    /// across the bridge; the executor is single-threaded so no real
-    /// thread crossing happens here.
-    pub arg: UnsafeSendPtr,
-    pub outcome: Outcome,
-}
-
-/// Shared mock state. All mutators run on the single executor
-/// thread; `RefCell` is sufficient.
-pub struct FakeProgress {
-    pending: RefCell<Vec<Pending>>,
-    history: RefCell<Vec<(SlotTag, Outcome)>>,
-    /// Set by the workload driver after every client task has
-    /// finished spawning its submissions and any cancellations have
-    /// been initiated. The progress task exits its loop once this is
-    /// set and the pending queue is empty.
-    done: Cell<bool>,
-}
-
-impl FakeProgress {
-    pub fn new() -> Rc<Self> {
-        Rc::new(Self {
-            pending: RefCell::new(Vec::new()),
-            history: RefCell::new(Vec::new()),
-            done: Cell::new(false),
-        })
-    }
-
-    /// Called by a client task to enqueue a submission for later
-    /// delivery. Mirrors `HG_Forward`: the FFI now owns the slot
-    /// reference (`arg`) until the callback fires.
-    pub fn submit(&self, tag: SlotTag, slot: Arc<CompletionSlot>, outcome: Outcome) {
-        let arg = UnsafeSendPtr(slot.into_callback_arg());
-        self.pending
-            .borrow_mut()
-            .push(Pending { tag, arg, outcome });
-    }
-
-    /// Mark the workload as finished so the progress task can exit.
-    /// Any remaining pending entries are still delivered before exit
-    /// so cancelled futures observe their callback fire (modelling
-    /// Mercury's "exactly once" callback guarantee).
-    pub fn mark_done(&self) {
-        self.done.set(true);
-    }
-
-    /// History accessor used by invariants.
-    pub fn history(&self) -> std::cell::Ref<'_, Vec<(SlotTag, Outcome)>> {
-        self.history.borrow()
-    }
-
-    pub fn pending_len(&self) -> usize {
-        self.pending.borrow().len()
-    }
-
-    fn pop_next(&self, cfg: &MercurySimCfg) -> Option<Pending> {
-        let mut q = self.pending.borrow_mut();
-        if q.is_empty() {
-            return None;
-        }
-        let idx = if cfg.out_of_order.get() {
-            with_sim(|s| s.rng.gen_range(0..q.len()))
-        } else {
-            0
-        };
-        Some(q.swap_remove(idx))
-    }
-
-    fn record(&self, tag: SlotTag, outcome: Outcome) {
-        self.history.borrow_mut().push((tag, outcome));
+impl Req for MockReq {
+    fn key(&self) -> StripeKey {
+        StripeKey(self.key)
     }
 }
 
-/// Body of the simulated progress thread. Spawned as a task by the
-/// workload driver. Loops until `FakeProgress::done` is set *and*
-/// every pending submission has been delivered.
-pub async fn progress_task(progress: Rc<FakeProgress>, cfg: Rc<MercurySimCfg>) {
-    loop {
-        let delay = if cfg.max_delivery_delay.get() == 0 {
-            0
-        } else {
-            with_sim(|s| s.rng.gen_range(0..=cfg.max_delivery_delay.get()))
-        };
-        yield_n(delay).await;
+// =====================================================================
+// Client transport
+// =====================================================================
 
-        let Some(p) = progress.pop_next(&cfg) else {
-            if progress.done.get() {
-                return;
-            }
-            // Nothing to do this tick; yield so other tasks can run.
-            yield_n(1).await;
-            continue;
-        };
+/// Per-peer reference data: the canonical bytes a `MockBulkSource`
+/// will hand out when fetched, and that a `MockTransport` will copy
+/// into the destination buffer on success. Shared between the client
+/// and server mocks so they agree on payload contents.
+pub(crate) type PeerBytes = Rc<RefCell<HashMap<PeerId, Vec<u8>>>>;
 
-        // SAFETY: `p.arg` was produced by `CompletionSlot::into_callback_arg`
-        // in `FakeProgress::submit`; reclaim exactly once here, mirroring
-        // the production forward-callback path.
-        let slot: Arc<CompletionSlot> = unsafe { CompletionSlot::from_callback_arg(p.arg.0) };
-        let result = match p.outcome {
-            Outcome::Ok => Ok(()),
-            Outcome::Err(code) => Err(unbounded_storage::mercury::HgError::new(code, "dst-error")),
-        };
-        slot.complete(result);
-        progress.record(p.tag, p.outcome);
-        // Drop the reclaimed Arc here; the slot may still be alive
-        // via the registry plus the client's `CompletionFuture`.
-    }
+/// Client-side mock. Each instance routes to a fixed peer (DST routing
+/// is static); the workload constructs one transport per peer it wants
+/// to speak to. Writes successful fetches into a shared `dst_buffer`
+/// owned by the harness.
+pub(crate) struct MockTransport {
+    cfg: Rc<MercurySimCfg>,
+    bytes_by_peer: PeerBytes,
+    peer: PeerId,
+    page_size: u32,
+    /// Destination buffer the harness pre-allocated. The DST harness
+    /// does not pin a real `Backing` through Mercury; instead the
+    /// destination is a plain `Vec<u8>` and the mock writes into it
+    /// directly using `(page_idx, offset)` from `PageRef`.
+    dst_buffer: Rc<RefCell<Vec<u8>>>,
 }
 
-/// Decide a per-submission outcome from `MercurySimCfg::error_rate`.
-pub fn draw_outcome(cfg: &MercurySimCfg) -> Outcome {
-    let rate = cfg.error_rate.get();
-    if rate > 0 && with_sim(|s| s.rng.gen_ratio(rate.min(100), 100)) {
-        Outcome::Err(-1)
-    } else {
-        Outcome::Ok
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Server-job queue producer/consumer helpers.
-// ---------------------------------------------------------------------------
-
-/// One job the producer task will push onto a `ServerJobQueue`.
-/// The handle/input pointers are sentinel values: nothing in the
-/// bridge dereferences them, so we can stamp identity bits into
-/// `handle.0` and assert that consumers see exactly those bits.
-pub struct QueueJobSpec {
-    pub tag: SlotTag,
-    /// Number of yields the producer emits before pushing this job.
-    pub pre_push_delay: u32,
-}
-
-impl Clone for QueueJobSpec {
-    fn clone(&self) -> Self {
+impl MockTransport {
+    pub fn new(
+        cfg: Rc<MercurySimCfg>,
+        bytes_by_peer: PeerBytes,
+        peer: PeerId,
+        page_size: u32,
+        dst_buffer: Rc<RefCell<Vec<u8>>>,
+    ) -> Self {
         Self {
-            tag: self.tag,
-            pre_push_delay: self.pre_push_delay,
+            cfg,
+            bytes_by_peer,
+            peer,
+            page_size,
+            dst_buffer,
+        }
+    }
+
+    fn dec_in_flight(&self) {
+        let mut c = self.cfg.counters.borrow_mut();
+        c.current_in_flight = c.current_in_flight.saturating_sub(1);
+    }
+}
+
+impl Transport<MockReq> for MockTransport {
+    async fn bulk_get(&self, _req: &MockReq, src: BulkRef, dst: PageRef) -> Result<(), BpError> {
+        // Account the start of an RPC and update the peak watermark.
+        {
+            let mut c = self.cfg.counters.borrow_mut();
+            c.forwards_started += 1;
+            c.current_in_flight += 1;
+            if c.current_in_flight > c.peak_in_flight {
+                c.peak_in_flight = c.current_in_flight;
+            }
+        }
+
+        // Capacity backpressure: while we're over the cap, yield to
+        // give other in-flight RPCs a chance to drain. We count the
+        // first wait per call so the harness can assert that capacity
+        // was actually exercised.
+        let capacity = self.cfg.capacity;
+        let over_cap = {
+            let c = self.cfg.counters.borrow();
+            c.current_in_flight > capacity
+        };
+        if over_cap {
+            self.cfg.counters.borrow_mut().capacity_waits += 1;
+            loop {
+                yield_once().await;
+                if self.cfg.counters.borrow().current_in_flight <= capacity {
+                    break;
+                }
+            }
+        }
+
+        // Peer reachability check. A simulated lookup failure is the
+        // earliest possible failure mode; account it as a completed
+        // error.
+        let disconnect_rate = clamp01(self.cfg.peer_disconnect_rate);
+        let disconnected = disconnect_rate > 0.0 && with_sim(|s| s.rng.gen_bool(disconnect_rate));
+        if disconnected {
+            self.cfg.counters.borrow_mut().forwards_completed_err += 1;
+            self.dec_in_flight();
+            return Err(BpError::transport(HgError::HgAddrLookup(0)));
+        }
+
+        // Variable RPC latency. Drawn before any data work so PRNG
+        // consumption is stable across reorderings of independent
+        // tasks.
+        let latency = draw_latency(&self.cfg);
+        yield_n(latency).await;
+
+        // Forward fault: terminal RPC error after the latency window.
+        let fault_rate = clamp01(self.cfg.forward_fault_rate);
+        let faulted = fault_rate > 0.0 && with_sim(|s| s.rng.gen_bool(fault_rate));
+        if faulted {
+            self.cfg.counters.borrow_mut().forwards_completed_err += 1;
+            self.dec_in_flight();
+            return Err(BpError::transport(HgError::HgForward(-1)));
+        }
+
+        // Short-read fault: server returned fewer bytes than asked
+        // for. The contract says non-zero status means the client
+        // should treat `dst` as undefined, so we deliberately do not
+        // touch `dst_buffer` and surface the `ShortRead` to the
+        // caller.
+        let short_rate = clamp01(self.cfg.short_read_rate);
+        let short = short_rate > 0.0 && with_sim(|s| s.rng.gen_bool(short_rate));
+        if short {
+            let got = if src.len > 1 {
+                with_sim(|s| s.rng.gen_range(0..src.len))
+            } else {
+                0
+            };
+            {
+                let mut c = self.cfg.counters.borrow_mut();
+                c.fetches_short += 1;
+                c.forwards_completed_err += 1;
+            }
+            self.dec_in_flight();
+            return Err(BpError::transport(HgError::ShortRead {
+                expected: src.len,
+                got,
+            }));
+        }
+
+        // Happy path: copy `[off, off+len)` from the peer's reference
+        // bytes into the destination slice.
+        let off = src.offset as usize;
+        let len = src.len as usize;
+        let slice: Vec<u8> = {
+            let map = self.bytes_by_peer.borrow();
+            let Some(peer_bytes) = map.get(&self.peer) else {
+                self.cfg.counters.borrow_mut().forwards_completed_err += 1;
+                self.dec_in_flight();
+                return Err(BpError::transport(HgError::HgAddrLookup(0)));
+            };
+            if off.saturating_add(len) > peer_bytes.len() {
+                self.cfg.counters.borrow_mut().forwards_completed_err += 1;
+                self.dec_in_flight();
+                return Err(BpError::transport(HgError::ShortRead {
+                    expected: src.len,
+                    got: 0,
+                }));
+            }
+            peer_bytes[off..off + len].to_vec()
+        };
+
+        {
+            let page_size = self.page_size as usize;
+            let dst_off = dst.page_idx as usize * page_size + dst.offset as usize;
+            let mut buf = self.dst_buffer.borrow_mut();
+            assert!(
+                dst_off + len <= buf.len(),
+                "MockTransport: dst out of range (dst_off={dst_off} len={len} buf.len={})",
+                buf.len()
+            );
+            buf[dst_off..dst_off + len].copy_from_slice(&slice);
+        }
+
+        {
+            let mut c = self.cfg.counters.borrow_mut();
+            c.bytes_pushed += len as u64;
+            c.forwards_completed_ok += 1;
+        }
+        self.dec_in_flight();
+        Ok(())
+    }
+}
+
+// =====================================================================
+// Server: BulkSource
+// =====================================================================
+
+/// Server-side mock. Owns a shared per-peer byte map (so multiple
+/// clients agree on payload contents) and serves bytes for its own
+/// `self_peer`. Latency and short-read decisions flow through the
+/// same [`MercurySimCfg`] as the client.
+pub(crate) struct MockBulkSource {
+    cfg: Rc<MercurySimCfg>,
+    bytes: PeerBytes,
+    self_peer: PeerId,
+}
+
+impl MockBulkSource {
+    pub fn new(cfg: Rc<MercurySimCfg>, bytes: PeerBytes, self_peer: PeerId) -> Self {
+        Self {
+            cfg,
+            bytes,
+            self_peer,
         }
     }
 }
 
-/// Construct a synthetic `ServerJob`. Pointers are tagged so the
-/// consumer can read them back without touching memory.
-pub fn make_synthetic_job(tag: SlotTag) -> ServerJob {
-    ServerJob {
-        handle: UnsafeSendPtr(tag as *mut c_void),
-        input_struct: UnsafeSendPtr((!tag) as *mut c_void),
+// SAFETY: `MockBulkSource` holds `Rc`/`RefCell`, so it is genuinely
+// `!Send + !Sync`. The DST harness is single-threaded and the executor
+// never moves a future across threads, but `BulkSource<R>` requires
+// `Send + Sync + 'static` to match the production trait shape. We
+// satisfy the bound here; nothing in the test target ever sends a
+// `MockBulkSource` across a real thread boundary.
+unsafe impl Send for MockBulkSource {}
+unsafe impl Sync for MockBulkSource {}
+
+impl BulkSource<MockReq> for MockBulkSource {
+    fn fetch<'a>(
+        &'a self,
+        _req: &'a MockReq,
+        offset: u64,
+        len: u32,
+    ) -> Pin<Box<dyn Future<Output = std::result::Result<Vec<u8>, HgError>> + Send + 'a>> {
+        // The DST harness is single-threaded, but `BulkSource::fetch`
+        // requires a `Send` future. We satisfy that by doing all the
+        // randomness-and-`Rc` work synchronously here and capturing
+        // only `Send` primitives (the latency count and the resulting
+        // `Vec<u8>`) into the returned future. No `Rc`/`RefCell`
+        // borrow ever crosses an `.await` below.
+        self.cfg.counters.borrow_mut().fetches_invoked += 1;
+
+        let latency = draw_latency(&self.cfg);
+        let short_rate = clamp01(self.cfg.short_read_rate);
+        let short = short_rate > 0.0 && with_sim(|s| s.rng.gen_bool(short_rate));
+
+        let result: std::result::Result<Vec<u8>, HgError> = {
+            let map = self.bytes.borrow();
+            match map.get(&self.self_peer) {
+                None => Err(HgError::HgAddrLookup(0)),
+                Some(peer_bytes) => {
+                    let off = offset as usize;
+                    let want = len as usize;
+                    if off.saturating_add(want) > peer_bytes.len() {
+                        Ok(Vec::new())
+                    } else if short {
+                        let actual = if len > 0 {
+                            with_sim(|s| s.rng.gen_range(0..len))
+                        } else {
+                            0
+                        };
+                        self.cfg.counters.borrow_mut().fetches_short += 1;
+                        Ok(peer_bytes[off..off + actual as usize].to_vec())
+                    } else {
+                        Ok(peer_bytes[off..off + want].to_vec())
+                    }
+                }
+            }
+        };
+
+        Box::pin(async move {
+            yield_n(latency).await;
+            result
+        })
     }
 }
 
-/// Recover the tag from a `ServerJob` produced by `make_synthetic_job`.
-pub fn job_tag(job: &ServerJob) -> SlotTag {
-    job.handle.0 as usize as SlotTag
+// =====================================================================
+// Construction helpers
+// =====================================================================
+
+/// Build a matched set of client transports (one per peer) and a
+/// single shared server source. Pre-fills the per-peer reference
+/// bytes deterministically (a peer's data is `[peer.0 as u8; N]`)
+/// so the oracle can verify any successful read against the same
+/// rule.
+///
+/// Returns `(transports, source, dst_buffer)`. Each transport's
+/// `bulk_get` will write into `dst_buffer`; the harness reads from
+/// `dst_buffer` to check what landed.
+pub(crate) fn make_pair(
+    cfg: Rc<MercurySimCfg>,
+    peers: Vec<PeerId>,
+    page_size: u32,
+    peer_data_len: usize,
+) -> (
+    HashMap<PeerId, MockTransport>,
+    MockBulkSource,
+    Rc<RefCell<Vec<u8>>>,
+) {
+    let bytes_by_peer: PeerBytes = Rc::new(RefCell::new(HashMap::new()));
+    {
+        let mut map = bytes_by_peer.borrow_mut();
+        for p in &peers {
+            map.insert(*p, vec![p.0 as u8; peer_data_len]);
+        }
+    }
+
+    // Sized for a generous worst-case page count; tests can adjust by
+    // resizing the returned buffer if needed.
+    let dst_buffer = Rc::new(RefCell::new(vec![0u8; (page_size as usize) * 64]));
+
+    let mut transports = HashMap::new();
+    for p in &peers {
+        transports.insert(
+            *p,
+            MockTransport::new(
+                Rc::clone(&cfg),
+                Rc::clone(&bytes_by_peer),
+                *p,
+                page_size,
+                Rc::clone(&dst_buffer),
+            ),
+        );
+    }
+
+    // The mock server arbitrarily owns the first peer's identity. The
+    // workload that uses this helper can construct additional sources
+    // for peers that need their own identity by calling
+    // `MockBulkSource::new` directly.
+    let self_peer = *peers.first().expect("make_pair: at least one peer");
+    let source = MockBulkSource::new(Rc::clone(&cfg), Rc::clone(&bytes_by_peer), self_peer);
+
+    (transports, source, dst_buffer)
+}
+
+// =====================================================================
+// Internal helpers
+// =====================================================================
+
+fn clamp01(p: f64) -> f64 {
+    if p.is_nan() {
+        0.0
+    } else if p < 0.0 {
+        0.0
+    } else if p > 1.0 {
+        1.0
+    } else {
+        p
+    }
+}
+
+fn draw_latency(cfg: &MercurySimCfg) -> u32 {
+    let lo = cfg.min_latency_yields;
+    let hi = cfg.max_latency_yields.max(lo);
+    if hi == 0 {
+        0
+    } else if lo == hi {
+        lo
+    } else {
+        with_sim(|s| s.rng.gen_range(lo..=hi))
+    }
+}
+
+// =====================================================================
+// Tests
+// =====================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::framework::executor::Executor;
+    use std::sync::Arc;
+
+    /// Drive a single future to completion under a fresh executor.
+    fn drive<F, T>(seed: u64, f: F) -> T
+    where
+        F: Future<Output = T> + 'static,
+        T: 'static,
+    {
+        let out: Rc<RefCell<Option<T>>> = Rc::new(RefCell::new(None));
+        let out_w = Rc::clone(&out);
+        let mut exec = Executor::new(seed);
+        exec.spawn(async move {
+            let v = f.await;
+            *out_w.borrow_mut() = Some(v);
+        });
+        exec.run(1_000_000).expect("executor ran cleanly");
+        out.borrow_mut().take().expect("future produced no value")
+    }
+
+    fn cfg_with(rate_forward: f64, rate_short: f64, rate_disc: f64) -> Rc<MercurySimCfg> {
+        Rc::new(MercurySimCfg {
+            min_latency_yields: 0,
+            max_latency_yields: 2,
+            forward_fault_rate: rate_forward,
+            short_read_rate: rate_short,
+            peer_disconnect_rate: rate_disc,
+            capacity: u32::MAX,
+            counters: Rc::new(RefCell::new(MercuryCounters::default())),
+        })
+    }
+
+    #[test]
+    fn mock_transport_basic_round_trip() {
+        let page_size: u32 = 64;
+        let peer = PeerId(7);
+        let cfg = cfg_with(0.0, 0.0, 0.0);
+        let counters = Rc::clone(&cfg.counters);
+        let (transports, _source, dst) = make_pair(Rc::clone(&cfg), vec![peer], page_size, 4096);
+
+        // Move the transport into the future.
+        let transport = transports.into_iter().next().unwrap().1;
+        let dst_for_check = Rc::clone(&dst);
+
+        let req = MockReq { key: [0u8; 32] };
+        let bulk = BulkRef {
+            stripe: req.key(),
+            offset: 128,
+            len: 32,
+        };
+        let page = PageRef {
+            page_idx: 1,
+            offset: 0,
+            len: 32,
+        };
+
+        let res = drive(0xC0FFEE, async move {
+            transport.bulk_get(&req, bulk, page).await
+        });
+        res.expect("happy-path bulk_get should succeed");
+
+        // Bytes copied are `[peer.0 as u8; 32]`.
+        let buf = dst_for_check.borrow();
+        let dst_off = (page.page_idx as usize) * (page_size as usize) + page.offset as usize;
+        for b in &buf[dst_off..dst_off + 32] {
+            assert_eq!(*b, peer.0 as u8, "unexpected dst byte");
+        }
+        let c = counters.borrow();
+        assert_eq!(c.forwards_started, 1);
+        assert_eq!(c.forwards_completed_ok, 1);
+        assert_eq!(c.forwards_completed_err, 0);
+        assert_eq!(c.bytes_pushed, 32);
+        assert_eq!(c.current_in_flight, 0);
+    }
+
+    #[test]
+    fn forward_fault_increments_err_counter() {
+        let cfg = cfg_with(1.0, 0.0, 0.0);
+        let counters = Rc::clone(&cfg.counters);
+        let peer = PeerId(1);
+        let (transports, _source, _dst) = make_pair(Rc::clone(&cfg), vec![peer], 64, 1024);
+        let transport = transports.into_iter().next().unwrap().1;
+        let req = MockReq { key: [0u8; 32] };
+        let bulk = BulkRef {
+            stripe: req.key(),
+            offset: 0,
+            len: 16,
+        };
+        let page = PageRef {
+            page_idx: 0,
+            offset: 0,
+            len: 16,
+        };
+        let res = drive(1, async move { transport.bulk_get(&req, bulk, page).await });
+        let err = res.expect_err("forward_fault_rate=1.0 must error");
+        match err {
+            BpError::Transport(_) => {}
+            other => panic!("expected Transport error, got {other:?}"),
+        }
+        let c = counters.borrow();
+        assert_eq!(c.forwards_completed_err, 1);
+        assert_eq!(c.forwards_completed_ok, 0);
+        assert_eq!(c.current_in_flight, 0);
+    }
+
+    #[test]
+    fn short_read_returns_error() {
+        let cfg = cfg_with(0.0, 1.0, 0.0);
+        let counters = Rc::clone(&cfg.counters);
+        let peer = PeerId(3);
+        let (transports, _source, _dst) = make_pair(Rc::clone(&cfg), vec![peer], 64, 1024);
+        let transport = transports.into_iter().next().unwrap().1;
+        let req = MockReq { key: [0u8; 32] };
+        let bulk = BulkRef {
+            stripe: req.key(),
+            offset: 0,
+            len: 16,
+        };
+        let page = PageRef {
+            page_idx: 0,
+            offset: 0,
+            len: 16,
+        };
+        let res = drive(2, async move { transport.bulk_get(&req, bulk, page).await });
+        let err = res.expect_err("short_read_rate=1.0 must error");
+        match err {
+            BpError::Transport(e) => {
+                let s = format!("{e}");
+                assert!(s.contains("short read"), "unexpected message: {s}");
+            }
+            other => panic!("expected Transport error, got {other:?}"),
+        }
+        let c = counters.borrow();
+        assert_eq!(c.fetches_short, 1, "client-side short read counted");
+        assert_eq!(c.forwards_completed_err, 1);
+        assert_eq!(c.current_in_flight, 0);
+    }
+
+    /// Sanity-check the trait object shape mirrors what
+    /// `MercuryServer::new` will accept.
+    #[test]
+    fn bulk_source_trait_object_compiles() {
+        let cfg = MercurySimCfg::new();
+        let bytes: PeerBytes = Rc::new(RefCell::new(HashMap::new()));
+        let src: Arc<dyn BulkSource<MockReq>> =
+            Arc::new(MockBulkSource::new(cfg, bytes, PeerId(0)));
+        let _ = Arc::clone(&src);
+    }
 }

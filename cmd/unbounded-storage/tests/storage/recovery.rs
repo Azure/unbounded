@@ -344,7 +344,7 @@ fn torn_data_page_reports_miss() {
                     len: PAGE_SIZE as u32,
                 };
                 let hit = eng.read_page(stripe(1), 0, dst).await.unwrap();
-                let snap = eng.snapshot();
+        let snap = eng.snapshot();
                 *slot.borrow_mut() = Some((hit, snap.checksum_misses));
             })
         });
@@ -937,4 +937,400 @@ fn concurrent_writes_same_key_collapse_to_one_entry() {
     );
 
     drop(pool);
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 6: eviction lock-ordering (S6).
+// ---------------------------------------------------------------------------
+
+/// Forward-looking invariant guard for S6 (eviction lock
+/// ordering). Under the old engine, `evict_if_over_watermark`
+/// would (1) call `lru.sweep`, (2) look up victim LBAs in the
+/// reverse map, and (3) submit a `Delete` batch to the mutator -
+/// all outside the mutator's single-committer region. A
+/// concurrent `write_page_from` could rewrite a victim key in
+/// the gap between steps 2 and 3, causing the eviction batch to
+/// (a) clobber the fresh btree mapping with a stale `Delete`,
+/// and (b) double-free the victim's old LBA (the writer's
+/// `retire_lba` already returned it to the allocator).
+///
+/// The fix routes victim selection through the mutator as an
+/// `Evict` request: sweep, reverse-map resolve, and `Delete`
+/// mutations all enter `apply_batch` together, and an
+/// in-batch `pending_inserts` map ensures Evict never queues
+/// a Delete for a key that has a concurrent Insert in the same
+/// batch.
+///
+/// This test churns many concurrent writers against a tightly
+/// budgeted LRU watermark so eviction races writers
+/// continually. It pins down the post-fix invariants the engine
+/// must satisfy:
+///   - the workload actually exercises eviction (sanity check
+///     against silently gutting the regression);
+///   - the engine completes without tripping the allocator's
+///     `free of already-free lba` debug_assert (the loud signal
+///     of the historical double-free bug);
+///   - `pending_free` is drained at quiescence (no leaked
+///     reclamation under steady-state);
+///   - resident pages stay within capacity;
+///   - reading every key the btree still holds returns the
+///     canonical payload for that key (no wrong bytes from a
+///     clobbered Delete, no LBA-reuse corruption).
+///
+/// Reproducing the historical S6 failure mode deterministically
+/// requires forcing a specific co-batch interleave that the
+/// single-threaded sim executor does not generate from this
+/// workload alone; the test is retained as a forward-looking
+/// guard against regressions of the post-fix invariants rather
+/// than as a direct reproducer of the original bug.
+#[test]
+fn eviction_lock_ordering_no_double_free() {
+    use std::cell::Cell;
+    use unbounded_storage::storage::StorageEngine;
+
+    // Small capacity forces the 90% watermark to trip after a
+    // handful of admitted writes; many distinct keys force
+    // continuous churn through eviction.
+    // Capacity must leave enough headroom for the btree COW
+    // build (apply_batch allocates fresh internal pages on
+    // every commit) on top of the data pages we want resident.
+    // 256 pages gives us comfortable room: data tops out
+    // around 200 distinct keys, the watermark we configure on
+    // this test's engine trips well below that, and the btree
+    // has dozens of free LBAs to spend on splits.
+    const CAPACITY: u64 = 256;
+    const NUM_WRITERS: usize = 4;
+    // The workload has two key strata. A small "hot" set is
+    // shared across all writers: this is where the S6 race
+    // window opens, because a key being overwritten by one
+    // writer can simultaneously be a victim selected by the
+    // mutator's Evict sweep. A larger "cold" set is partitioned
+    // per writer so admissions outpace retire_lba and the
+    // resident page count climbs past the watermark; without
+    // this, every overwrite frees the prior LBA via retire_lba
+    // and the LRU never fills enough to trigger eviction.
+    const HOT_KEYS: u8 = 24;
+    const COLD_KEYS_PER_WRITER: u8 = 48;
+    // Many passes per writer so each (writer, key) is visited
+    // repeatedly. Each pass writes the SAME key twice in a
+    // row, which is the only reliable way to get past the
+    // admission filter's doorkeeper-clear cadence: back-to-back
+    // touches see the doorkeeper marker the first call set,
+    // independent of clears that happen between writers.
+    const PASSES_PER_WRITER: usize = 2;
+
+    // A handful of seeds; the cheap ones reproduce reliably under
+    // debug_assertions. Keep the count modest so this stays fast.
+    for &seed in &[
+        0x5EED_0001_u64,
+        0x5EED_0002,
+        0x5EED_0003,
+        0x5EED_0004,
+        0x5EED_0005,
+    ] {
+        let sim_cfg = MockSimConfig::new();
+        sim_cfg.max_io_delay.set(8);
+        sim_cfg.io_fault_rate.set(0);
+        sim_cfg.read_corrupt_rate.set(0);
+        let device = Arc::new(SimBlockDevice::new(
+            MockDeviceConfig {
+                page_size: PAGE_SIZE,
+                capacity_pages: CAPACITY,
+                ..Default::default()
+            },
+            sim_cfg,
+        ));
+
+        // One pool slot per writer + a generous read-back area
+        // sized to the total distinct key universe.
+        let total_keys = HOT_KEYS as usize + NUM_WRITERS * COLD_KEYS_PER_WRITER as usize;
+        let total_pool_slots = NUM_WRITERS + total_keys;
+        let mut pool = Pool::new(total_pool_slots);
+        let pool_base = pool.base() as usize;
+
+        // Per-key payload. Hot keys are written by every
+        // writer with identical bytes so a read hit either
+        // returns the canonical payload or the read missed
+        // (evicted). Cold keys are owned by a single writer and
+        // also use the same payload-of-key function for the same
+        // reason. A wrong-bytes return signals a Delete clobber
+        // (S6).
+        let payload_of = |key_idx: u8| -> Vec<u8> { payload(0xAA, key_idx, 99) };
+
+        // The "stripe id" of every key in the union. Hot keys
+        // get ids [0, HOT_KEYS); writer w's cold keys get ids
+        // [HOT_KEYS + w*COLD_KEYS_PER_WRITER,
+        //  HOT_KEYS + (w+1)*COLD_KEYS_PER_WRITER).
+        let cold_id_of = |w: usize, off: u8| -> u8 {
+            HOT_KEYS + (w as u8) * COLD_KEYS_PER_WRITER + off
+        };
+
+        type Engine = StorageEngine<SimBlockDevice>;
+        enum Stage {
+            Pending,
+            Failed,
+            Ready(Arc<Engine>),
+        }
+        let stage: Rc<RefCell<Stage>> = Rc::new(RefCell::new(Stage::Pending));
+        let pending: Rc<Cell<usize>> = Rc::new(Cell::new(NUM_WRITERS));
+
+        let mut exec = Executor::new(seed);
+
+        // Bootstrap.
+        {
+            let stage = stage.clone();
+            let device = device.clone();
+            exec.spawn(Box::pin(async move {
+                let cfg = EngineConfig {
+                    page_size_bytes: PAGE_SIZE,
+                    btree_page_bytes: PAGE_SIZE,
+                    // A low watermark forces eviction to trip
+                    // well before the data region exhausts the
+                    // LBA pool. Pegging the threshold at a
+                    // fraction of CAPACITY that the workload
+                    // is guaranteed to cross (resident climbs
+                    // to ~HOT + NUM_WRITERS * COLD before any
+                    // eviction lands) is the easiest way to
+                    // make the race window open every run.
+                    eviction_watermark: 0.25,
+                    ..EngineConfig::default()
+                };
+                let eng = match StorageEngine::open(device, cfg).await {
+                    Ok(e) => Arc::new(e),
+                    Err(_) => {
+                        *stage.borrow_mut() = Stage::Failed;
+                        return;
+                    }
+                };
+                if eng
+                    .register_pages(pool_base as *mut u8, PAGE_SIZE, total_pool_slots)
+                    .is_err()
+                {
+                    *stage.borrow_mut() = Stage::Failed;
+                    return;
+                }
+                *stage.borrow_mut() = Stage::Ready(eng);
+            }));
+        }
+
+        // Mutator.
+        {
+            let stage = stage.clone();
+            exec.spawn(Box::pin(async move {
+                let eng = loop {
+                    match &*stage.borrow() {
+                        Stage::Pending => {}
+                        Stage::Failed => return,
+                        Stage::Ready(e) => break e.clone(),
+                    }
+                    crate::framework::executor::yield_once().await;
+                };
+                eng.run_mutator().await;
+            }));
+        }
+
+        // Writers. Each writer owns slot `w` in the pool and
+        // interleaves writes against the shared hot keys (where
+        // the race window opens) with writes against its own
+        // private cold keys (whose unique LBAs push the resident
+        // page count past the watermark and force the mutator
+        // to evict).
+        for w in 0..NUM_WRITERS {
+            let stage = stage.clone();
+            let pending = pending.clone();
+            exec.spawn(Box::pin(async move {
+                let eng = loop {
+                    match &*stage.borrow() {
+                        Stage::Pending => {}
+                        Stage::Failed => {
+                            pending.set(pending.get() - 1);
+                            return;
+                        }
+                        Stage::Ready(e) => break e.clone(),
+                    }
+                    crate::framework::executor::yield_once().await;
+                };
+                // Rotate the starting hot key per writer so all
+                // NUM_WRITERS aren't lockstep on key 0 every
+                // pass; this maximizes overlap and exposes the
+                // race more reliably across seeds.
+                let hot_start = (w as u8).wrapping_mul(7) % HOT_KEYS;
+                for _pass in 0..PASSES_PER_WRITER {
+                    // Cold pass: fill private keys to drive
+                    // resident pages up.
+                    for off in 0..COLD_KEYS_PER_WRITER {
+                        let id = cold_id_of(w, off);
+                        let bytes = payload_of(id);
+                        unsafe {
+                            let p = (pool_base as *mut u8).add(w * PAGE_SIZE);
+                            std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, PAGE_SIZE);
+                        }
+                        let page = PageRef {
+                            page_idx: w as u32,
+                            offset: 0,
+                            len: PAGE_SIZE as u32,
+                        };
+                        let key = stripe(id);
+                        let _ = eng.write_page(key, 0, page).await;
+                        let _ = eng.write_page(key, 0, page).await;
+                    }
+                    // Hot pass: race shared keys with other
+                    // writers.
+                    for offset in 0..HOT_KEYS {
+                        let id = (hot_start.wrapping_add(offset)) % HOT_KEYS;
+                        let bytes = payload_of(id);
+                        unsafe {
+                            let p = (pool_base as *mut u8).add(w * PAGE_SIZE);
+                            std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, PAGE_SIZE);
+                        }
+                        let page = PageRef {
+                            page_idx: w as u32,
+                            offset: 0,
+                            len: PAGE_SIZE as u32,
+                        };
+                        let key = stripe(id);
+                        // Back-to-back writes on the same key:
+                        // the second one observes the
+                        // doorkeeper bits the first one set,
+                        // independent of how many doorkeeper
+                        // clears the other writers triggered
+                        // in between passes.
+                        let _ = eng.write_page(key, 0, page).await;
+                        let _ = eng.write_page(key, 0, page).await;
+                    }
+                }
+                pending.set(pending.get() - 1);
+            }));
+        }
+
+        // Supervisor: wait for all writers, then close the
+        // mutator and let the executor drain.
+        {
+            let stage = stage.clone();
+            let pending = pending.clone();
+            exec.spawn(Box::pin(async move {
+                while pending.get() > 0 {
+                    crate::framework::executor::yield_once().await;
+                }
+                let eng = match &*stage.borrow() {
+                    Stage::Ready(e) => e.clone(),
+                    _ => return,
+                };
+                eng.close_mutator();
+            }));
+        }
+
+        exec.run(5_000_000)
+            .expect("executor finished without deadlock or budget exhaustion");
+
+        // Post-run invariants.
+        let eng = match &*stage.borrow() {
+            Stage::Ready(e) => e.clone(),
+            _ => panic!("seed {:#x}: engine never reached Ready", seed),
+        };
+        let snap = eng.snapshot();
+
+        // Engine must not have leaked pending_free past
+        // quiescence: by the time every writer has finished and
+        // the mutator has drained, no reader is pinning anything.
+        // The mutator's drain_pending_free runs after every
+        // batch; anything left here is a leak.
+        assert_eq!(
+            snap.pending_free_len, 0,
+            "seed {:#x}: pending_free not drained at quiescence: {:?}",
+            seed, snap,
+        );
+
+        // Sanity check: this workload MUST trip the eviction
+        // path. Without evictions, the test reduces to "many
+        // writes finished without crashing" which is a much
+        // weaker assertion than what S6 demands. Catching a
+        // seed/workload pair that never evicts would silently
+        // gut the regression.
+        assert!(
+            snap.evictions > 0,
+            "seed {:#x}: workload never triggered eviction; the regression \
+             does not actually exercise S6. snap={:?}",
+            seed,
+            snap,
+        );
+
+        // The resident count must not exceed capacity, must not
+        // exceed btree_entries + pending_free, and must equal
+        // the number of LRU-tracked entries (already enforced by
+        // `lru.len()`). Use this as a coarse sanity check that
+        // no LBA was leaked into the LRU twice.
+        assert!(
+            snap.resident_pages <= CAPACITY as usize,
+            "seed {:#x}: resident_pages ({}) exceeded capacity ({}): {:?}",
+            seed,
+            snap.resident_pages,
+            CAPACITY,
+            snap,
+        );
+
+        // Read every hot and cold key back. Each must either
+        // miss (evicted) or return the canonical payload for
+        // that key. A wrong-bytes return would mean a Delete
+        // clobbered a fresh Insert and a later writer (or
+        // rebuilder) re-used the freed LBA for a different
+        // key's bytes.
+        let read_base = NUM_WRITERS;
+        let read_results = Rc::new(RefCell::new(Vec::<(u8, bool, Vec<u8>)>::new()));
+        let mut exec2 = Executor::new(seed.wrapping_add(0xA5A5));
+        {
+            let eng = eng.clone();
+            let read_results = read_results.clone();
+            exec2.spawn(Box::pin(async move {
+                let mut ids: Vec<u8> = (0..HOT_KEYS).collect();
+                for w in 0..NUM_WRITERS {
+                    for off in 0..COLD_KEYS_PER_WRITER {
+                        ids.push(cold_id_of(w, off));
+                    }
+                }
+                let mut out: Vec<(u8, bool, Vec<u8>)> = Vec::new();
+                for (i, &id) in ids.iter().enumerate() {
+                    let slot_idx = read_base + i;
+                    // SAFETY: dedicated slot per i.
+                    unsafe {
+                        let p = (pool_base as *mut u8).add(slot_idx * PAGE_SIZE);
+                        std::ptr::write_bytes(p, 0, PAGE_SIZE);
+                    }
+                    let dst = PageRef {
+                        page_idx: slot_idx as u32,
+                        offset: 0,
+                        len: PAGE_SIZE as u32,
+                    };
+                    let key = stripe(id);
+                    let hit = eng.read_page(key, 0, dst).await.unwrap_or(false);
+                    let bytes = if hit {
+                        let p = unsafe { (pool_base as *const u8).add(slot_idx * PAGE_SIZE) };
+                        unsafe { std::slice::from_raw_parts(p, PAGE_SIZE) }.to_vec()
+                    } else {
+                        Vec::new()
+                    };
+                    out.push((id, hit, bytes));
+                }
+                *read_results.borrow_mut() = out;
+            }));
+        }
+        exec2
+            .run(5_000_000)
+            .expect("read-back executor finished without deadlock or budget exhaustion");
+
+        let results = read_results.borrow();
+        for (k, hit, bytes) in results.iter() {
+            if *hit {
+                let expected = payload_of(*k);
+                assert_eq!(
+                    bytes, &expected,
+                    "seed {:#x}: key k={} returned wrong bytes after race; \
+                     this is the S6 clobber signature",
+                    seed, k,
+                );
+            }
+        }
+
+        drop(pool);
+    }
 }

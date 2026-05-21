@@ -44,6 +44,17 @@ pub(crate) enum MutatorReq {
         keys: Vec<PageKey>,
         done: Arc<MutatorReply>,
     },
+    /// Request that the mutator perform an eviction sweep. The
+    /// mutator selects victims, removes their btree entries, and
+    /// returns the freed LBAs to the submitter so the submitter
+    /// can free them in the allocator. Routing eviction through
+    /// the mutator is the only way to make "pick victims" and
+    /// "delete victims from btree" atomic with respect to
+    /// concurrent inserts; see `StorageEngine::evict_if_over_watermark`.
+    Evict {
+        count: usize,
+        done: Arc<MutatorReply>,
+    },
 }
 
 /// What the mutator observed when it processed a request.
@@ -55,6 +66,11 @@ pub(crate) enum MutatorOutcome {
     InsertCommitted { prior_lba: Option<Lba> },
     /// `apply_batch` committed the delete set.
     DeleteCommitted,
+    /// Eviction sweep committed. `freed` lists the LBAs whose
+    /// btree entries were removed in the same batch; the
+    /// submitter owns them and must hand them back to the
+    /// allocator after the reply.
+    EvictCommitted { freed: Vec<Lba> },
     /// `apply_batch` returned an error. The submitter must clean
     /// up the LBA it allocated (insert) or leave eviction state
     /// untouched (delete).
@@ -158,7 +174,9 @@ impl MutatorQueue {
                 // doesn't deadlock.
                 drop(g);
                 match req {
-                    MutatorReq::Insert { done, .. } | MutatorReq::Delete { done, .. } => {
+                    MutatorReq::Insert { done, .. }
+                    | MutatorReq::Delete { done, .. }
+                    | MutatorReq::Evict { done, .. } => {
                         done.set(MutatorOutcome::Failed);
                     }
                 }

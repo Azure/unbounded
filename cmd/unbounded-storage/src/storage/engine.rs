@@ -309,72 +309,40 @@ impl<B: BlockDevice> StorageEngine<B> {
             {
                 return;
             }
-            let candidates = self.lru.sweep(8);
-            if candidates.is_empty() {
-                return;
-            }
-            // Skip pinned LBAs - an in-flight reader still
-            // references them. Re-admit so they remain tracked
-            // and are reconsidered on a later sweep.
-            let mut victims: Vec<Lba> = Vec::with_capacity(candidates.len());
-            for lba in candidates {
-                if self.refcount.pin_count(lba.0).unwrap_or(0) == 0 {
-                    victims.push(lba);
-                } else {
-                    self.lru.admit(lba);
-                }
-            }
-            if victims.is_empty() {
-                return;
-            }
-            // Resolve victim LBAs to keys via the reverse map
-            // before submitting: the mutator only needs the keys
-            // to commit the delete, and we still own the LBAs
-            // here for the post-commit free below.
-            let mut keys: Vec<PageKey> = Vec::with_capacity(victims.len());
-            {
-                let rev = self.reverse.lock().unwrap();
-                for lba in &victims {
-                    if let Some(k) = rev.get(&lba.0).copied() {
-                        keys.push(k);
-                    }
-                }
-            }
-            if keys.is_empty() {
-                return;
-            }
-            // The btree mutation MUST commit before the allocator
-            // slot is released: a concurrent writer that observes
-            // the stale btree entry would otherwise call
-            // retire_lba and double-free the slot the allocator
-            // already handed back. The mutator is the single
-            // committer, so this ordering is preserved by
-            // construction once `done.wait()` returns.
+            // Routing the sweep through the mutator is the
+            // correctness invariant for eviction: victim
+            // selection, reverse-map resolution, and the btree
+            // Delete must all happen inside the mutator's
+            // single-committer critical section, otherwise a
+            // concurrent overwrite of a victim key can be
+            // clobbered by an Evict batch that captured the
+            // pre-overwrite (key, lba) pair. See S6 in
+            // designs/.../storage.md and the regression test
+            // `eviction_lock_ordering_no_double_free` in
+            // tests/storage/recovery.rs.
             let done = MutatorReply::new();
-            self.mutator_queue.push(MutatorReq::Delete {
-                keys,
+            self.mutator_queue.push(MutatorReq::Evict {
+                count: 8,
                 done: done.clone(),
             });
-            match done.wait().await {
-                MutatorOutcome::DeleteCommitted => {}
-                _ => {
-                    // Apply failed or queue closed: leave the
-                    // LBAs allocated and tracked. A later sweep
-                    // will retry.
-                    return;
-                }
+            let freed = match done.wait().await {
+                MutatorOutcome::EvictCommitted { freed } => freed,
+                _ => return,
+            };
+            if freed.is_empty() {
+                return;
             }
             {
                 let mut rev = self.reverse.lock().unwrap();
-                for lba in &victims {
+                for lba in &freed {
                     rev.remove(&lba.0);
                 }
             }
-            for lba in &victims {
+            for lba in &freed {
                 let _ = self.allocator.free(*lba);
                 let _ = self.refcount.reset(lba.0);
             }
-            self.metric(|m| m.evictions += victims.len() as u64);
+            self.metric(|m| m.evictions += freed.len() as u64);
         })
     }
 }
@@ -569,8 +537,8 @@ impl<B: BlockDevice> StorageEngine<B> {
                 leader.abandon();
                 return Ok(());
             }
-            MutatorOutcome::DeleteCommitted => {
-                unreachable!("mutator returned DeleteCommitted for an Insert request")
+            MutatorOutcome::DeleteCommitted | MutatorOutcome::EvictCommitted { .. } => {
+                unreachable!("mutator returned a non-Insert outcome for an Insert request")
             }
         };
 
@@ -667,23 +635,129 @@ impl<B: BlockDevice> StorageEngine<B> {
             }
         }
 
-        let mut prior_lbas: Vec<Option<Lba>> = Vec::with_capacity(batch.len());
+        // Per-request output we need to retain across apply_batch
+        // so we can build the right `MutatorOutcome` after commit:
+        //  - Insert: prior_lba seen by this commit.
+        //  - Delete: nothing per-request.
+        //  - Evict: the list of LBAs whose Delete mutations were
+        //    added to this batch, in the order they were enqueued.
+        enum RequestRecord {
+            Insert { prior_lba: Option<Lba> },
+            Delete,
+            Evict { freed: Vec<Lba> },
+        }
+
+        let mut records: Vec<RequestRecord> = Vec::with_capacity(batch.len());
         let mut mutations: Vec<Mutation> = Vec::new();
+        // Track keys with a pending Insert in this batch so an
+        // Evict request anywhere in the same batch does not
+        // queue a Delete that would either:
+        //   (a) when ordered before the Insert in apply_batch,
+        //       race the original writer's retire_lba on the
+        //       same prior LBA (double free); or
+        //   (b) when ordered after the Insert, clobber the
+        //       freshly inserted mapping (wrong bytes / lost
+        //       update).
+        // Pre-populate this map BEFORE the main loop so Evict
+        // requests positioned earlier in the batch than their
+        // colliding Insert still see the pending Insert and skip
+        // that victim. The writer that issued the Insert will
+        // retire the prior LBA via the InsertCommitted reply
+        // and is solely responsible for freeing it.
+        let mut pending_inserts: HashMap<PageKey, Lba> = HashMap::new();
+        for req in &batch {
+            if let MutatorReq::Insert { key, entry, .. } = req {
+                pending_inserts.insert(*key, entry.lba);
+            }
+        }
         for req in &batch {
             match req {
                 MutatorReq::Insert { key, entry, .. } => {
                     let prior = self.btree.lookup(key).await.ok().flatten().map(|e| e.lba);
-                    prior_lbas.push(prior);
+                    records.push(RequestRecord::Insert { prior_lba: prior });
                     mutations.push(Mutation::Insert {
                         key: *key,
                         value: *entry,
                     });
                 }
                 MutatorReq::Delete { keys, .. } => {
-                    prior_lbas.push(None);
+                    records.push(RequestRecord::Delete);
                     for k in keys {
                         mutations.push(Mutation::Delete { key: *k });
                     }
+                }
+                MutatorReq::Evict { count, .. } => {
+                    // Victim selection MUST happen here, inside
+                    // the mutator's serialized region, so that
+                    // the (lba -> key) resolution and the
+                    // matching Delete enter `apply_batch`
+                    // together. Pre-sweep selection followed by
+                    // a separate Delete submission lets a
+                    // concurrent Insert overwrite a victim key
+                    // and have its fresh mapping deleted instead
+                    // (S6).
+                    let candidates = self.lru.sweep(*count);
+                    let mut freed: Vec<Lba> = Vec::with_capacity(candidates.len());
+                    for lba in candidates {
+                        if self.refcount.pin_count(lba.0).unwrap_or(0) != 0 {
+                            // Pinned: preserve current behavior
+                            // and re-admit to the head. (Issue
+                            // S5 - re-admitting to MRU is its
+                            // own bug, tracked separately.)
+                            self.lru.admit(lba);
+                            continue;
+                        }
+                        let key = {
+                            let rev = self.reverse.lock().unwrap();
+                            rev.get(&lba.0).copied()
+                        };
+                        let Some(key) = key else {
+                            // No reverse mapping: the LBA is
+                            // orphaned or about to be freed by
+                            // a writer's retire_lba. Drop it
+                            // from our victim set and do not
+                            // re-admit; the LBA's lifecycle is
+                            // already owned elsewhere.
+                            continue;
+                        };
+                        // Confirm the live btree mapping for
+                        // `key` still points at `lba`. If a
+                        // concurrent Insert in this very batch
+                        // (or a prior batch whose retire_lba
+                        // has not yet run) has rewritten the
+                        // key to a different LBA, deleting
+                        // `key` would clobber that fresh
+                        // mapping. Skip such victims. Check
+                        // the in-batch pending Inserts first
+                        // (they will overwrite the committed
+                        // mapping in `apply_batch`), then fall
+                        // back to the live snapshot.
+                        if let Some(&new_lba) = pending_inserts.get(&key) {
+                            if new_lba != lba {
+                                continue;
+                            }
+                            // An in-batch insert that points at
+                            // the same LBA we're about to evict
+                            // is nonsensical (the writer must
+                            // have allocated a fresh LBA), but
+                            // be defensive: drop the victim.
+                            continue;
+                        }
+                        let live = self.btree.lookup(&key).await.ok().flatten();
+                        match live {
+                            Some(e) if e.lba == lba => {
+                                mutations.push(Mutation::Delete { key });
+                                freed.push(lba);
+                            }
+                            _ => {
+                                // The key was rewritten or
+                                // already deleted. Leave the
+                                // LBA alone; whoever displaced
+                                // it owns the free.
+                            }
+                        }
+                    }
+                    records.push(RequestRecord::Evict { freed });
                 }
             }
         }
@@ -696,16 +770,19 @@ impl<B: BlockDevice> StorageEngine<B> {
 
         for (i, req) in batch.into_iter().enumerate() {
             let done = match &req {
-                MutatorReq::Insert { done, .. } | MutatorReq::Delete { done, .. } => done.clone(),
+                MutatorReq::Insert { done, .. }
+                | MutatorReq::Delete { done, .. }
+                | MutatorReq::Evict { done, .. } => done.clone(),
             };
             let outcome = if !ok {
                 MutatorOutcome::Failed
             } else {
-                match req {
-                    MutatorReq::Insert { .. } => MutatorOutcome::InsertCommitted {
-                        prior_lba: prior_lbas[i],
-                    },
-                    MutatorReq::Delete { .. } => MutatorOutcome::DeleteCommitted,
+                match std::mem::replace(&mut records[i], RequestRecord::Delete) {
+                    RequestRecord::Insert { prior_lba } => {
+                        MutatorOutcome::InsertCommitted { prior_lba }
+                    }
+                    RequestRecord::Delete => MutatorOutcome::DeleteCommitted,
+                    RequestRecord::Evict { freed } => MutatorOutcome::EvictCommitted { freed },
                 }
             };
             done.set(outcome);
