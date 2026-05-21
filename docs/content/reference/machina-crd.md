@@ -91,14 +91,19 @@ Kubernetes join configuration.
 
 ### spec.provider and spec.providerID
 
-`provider` selects the external control provider for out-of-band operations. `providerID` identifies the underlying infrastructure resource and follows the Kubernetes Node provider ID convention.
+`provider` selects the external control provider for out-of-band operations.
+Built-in providers are `AzureVM` and `OCIInstance`, and provider-specific
+controllers may use their own non-empty provider names. `providerID` identifies
+the underlying infrastructure resource and follows the Kubernetes Node provider
+ID convention.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `provider` | string | For external operations | -- | External control provider. Supported values: `AzureVM`, `OCIInstance`. |
+| `provider` | string | For external operations | -- | External control provider, such as `AzureVM`, `OCIInstance`, or a provider-specific value handled by a custom controller. |
 | `providerID` | string | For external operations | -- | Provider-specific resource ID such as `azure:///subscriptions/.../virtualMachines/name` or `oci://ocid1.instance...`. |
 
 Machine operation credentials are selected by the Machine site label. Providers that support OIDC/workload identity use `WorkloadIdentity`; providers or sites that need provider-specific credential material use `ExternalPlugin` with a referenced Secret.
+Custom provider controllers can implement `pkg/machineops.Provider` and reuse `pkg/machineops/controller.MachineOperationReconciler` with `SiteName` and `ProviderName` set for their deployment.
 
 ```yaml
 apiVersion: unbounded-cloud.io/v1alpha3

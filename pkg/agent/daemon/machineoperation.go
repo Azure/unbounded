@@ -96,13 +96,8 @@ func (r *MachinaMachineOperationReconciler) ReconcileMachineOperation(
 
 	handler, ok := r.handlers[op.Spec.OperationKind]
 	if !ok {
-		log.FromContext(ctx).Info("failing MachineOperation with no handler", "operation", op.Name, "operationKind", op.Spec.OperationKind)
-
-		return ctrl.Result{}, r.Finish(ctx, operation, MachineOperationResult[int64]{
-			Phase:   machinav1alpha3.OperationPhaseFailed,
-			Reason:  "UnsupportedOperation",
-			Message: fmt.Sprintf("no handler registered for operation kind %s", op.Spec.OperationKind),
-		})
+		log.FromContext(ctx).V(1).Info("ignoring MachineOperation with no local handler", "operation", op.Name, "operationKind", op.Spec.OperationKind)
+		return ctrl.Result{}, nil
 	}
 
 	operation.Parameters = op.Spec.Parameters
@@ -121,6 +116,10 @@ func (r *MachinaMachineOperationReconciler) mapMachineOperation(ctx context.Cont
 
 func (r *MachinaMachineOperationReconciler) shouldEnqueue(ctx context.Context, op *machinav1alpha3.MachineOperation) bool {
 	if op.Status.Phase != "" && op.Status.Phase != machinav1alpha3.OperationPhasePending {
+		return false
+	}
+
+	if _, ok := r.handlers[op.Spec.OperationKind]; !ok {
 		return false
 	}
 
