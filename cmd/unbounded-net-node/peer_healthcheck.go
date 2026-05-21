@@ -4,7 +4,6 @@
 package main
 
 import (
-	"fmt"
 	"net"
 
 	"k8s.io/klog/v2"
@@ -121,11 +120,11 @@ func registerPeersWithHealthCheck(
 }
 
 // peerIfaceNameWireGuard maps a gateway peer to its WireGuard interface name
-// (wg<port>). Returns "" for peers with no port.
-func peerIfaceNameWireGuard(gwPeer gatewayPeerInfo) string {
+// (<prefix><port>). Returns "" for peers with no port.
+func peerIfaceNameWireGuard(cfg *config, gwPeer gatewayPeerInfo) string {
 	if gwPeer.GatewayWireguardPort == 0 {
 		return ""
 	}
 
-	return fmt.Sprintf("wg%d", gwPeer.GatewayWireguardPort)
+	return wireGuardInterfaceName(cfg, int(gwPeer.GatewayWireguardPort))
 }

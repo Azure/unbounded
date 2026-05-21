@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -445,7 +446,7 @@ func TestComputeStatusDelta_JsonRoundTripFields(t *testing.T) {
 // TestGetNodeStatusBasicAndHandleStatusJSON tests GetNodeStatusBasicAndHandleStatusJSON.
 func TestGetNodeStatusBasicAndHandleStatusJSON(t *testing.T) {
 	s := &nodeStatusServer{
-		cfg:    &config{NodeName: "node-a", WireGuardPort: 51820},
+		cfg:    &config{NodeName: "node-a", WireGuardPort: 51820, WireGuardInterfacePrefix: "wg"},
 		pubKey: "pub-self",
 		state: &wireGuardState{
 			nodePodCIDRs:    []string{"10.244.0.0/24"},
@@ -493,7 +494,7 @@ func TestGetNodeStatusBasicAndHandleStatusJSON(t *testing.T) {
 // TestGetNodeStatusIncludesNodeErrors tests GetNodeStatusIncludesNodeErrors.
 func TestGetNodeStatusIncludesNodeErrors(t *testing.T) {
 	s := &nodeStatusServer{
-		cfg:    &config{NodeName: "node-a", WireGuardPort: 51820},
+		cfg:    &config{NodeName: "node-a", WireGuardPort: 51820, WireGuardInterfacePrefix: "wg"},
 		pubKey: "pub-self",
 		state: &wireGuardState{
 			nodePodCIDRs:    []string{"10.244.0.0/24"},
@@ -554,14 +555,156 @@ func TestTryDirectRecoveryProbeClearsNodeErrors(t *testing.T) {
 	}
 }
 
+// fakeNetlinkOps implements statusServerNetlinkOps with canned data so
+// collectRoutingTableFromKernel tests are deterministic regardless of
+// what's in the host kernel's routing table.
+type fakeNetlinkOps struct {
+	mainRoutes  map[int][]netlink.Route         // family -> routes
+	tableRoutes map[int]map[int][]netlink.Route // family -> table -> routes
+	links       map[int]netlink.Link
+}
+
+func (f *fakeNetlinkOps) RouteList(family int) ([]netlink.Route, error) {
+	if f.mainRoutes == nil {
+		return nil, nil
+	}
+
+	return f.mainRoutes[family], nil
+}
+
+func (f *fakeNetlinkOps) RouteListFiltered(family, table int) ([]netlink.Route, error) {
+	if f.tableRoutes == nil {
+		return nil, nil
+	}
+
+	if byTable, ok := f.tableRoutes[family]; ok {
+		return byTable[table], nil
+	}
+
+	return nil, nil
+}
+
+func (f *fakeNetlinkOps) LinkByIndex(index int) (netlink.Link, error) {
+	link, ok := f.links[index]
+	if !ok {
+		return nil, netlink.LinkNotFoundError{}
+	}
+
+	return link, nil
+}
+
+// fakeLink is a minimal netlink.Link implementation for tests. It exists
+// because netlink.LinkAttrs.Name is what isManagedTunnelInterface keys on.
+type fakeLink struct {
+	attrs netlink.LinkAttrs
+}
+
+func (l *fakeLink) Attrs() *netlink.LinkAttrs { return &l.attrs }
+func (l *fakeLink) Type() string              { return "dummy" }
+
 // TestCollectRoutingTableFromKernelEmptyState tests that collectRoutingTableFromKernel
 // returns empty routes when no wg interfaces exist.
 func TestCollectRoutingTableFromKernelEmptyState(t *testing.T) {
-	s := &nodeStatusServer{state: &wireGuardState{}}
+	// Inject routes that go through non-managed interfaces (eth0, lo) plus
+	// one route through a wg<port> interface that should NOT be classified
+	// as ours because the test cfg uses the "ugw" prefix. With deterministic
+	// input, this test exercises the full route-filter closure regardless of
+	// the host kernel's actual routing table, and fails loudly on any
+	// regression that nil-derefs the cfg or mis-classifies device names.
+	_, ipnet1, _ := net.ParseCIDR("10.0.0.0/24")
+	_, ipnetDefault, _ := net.ParseCIDR("0.0.0.0/0")
+	_, ipnetWG, _ := net.ParseCIDR("10.42.0.0/16")
+
+	ops := &fakeNetlinkOps{
+		mainRoutes: map[int][]netlink.Route{
+			netlink.FAMILY_V4: {
+				{Dst: ipnet1, LinkIndex: 1, Protocol: 7 /* RTPROT_BOOT, non-kernel */},
+				{Dst: ipnetDefault, LinkIndex: 1, Protocol: 7},
+				{Dst: ipnetWG, LinkIndex: 2, Protocol: 7},
+			},
+		},
+		links: map[int]netlink.Link{
+			1: &fakeLink{attrs: netlink.LinkAttrs{Index: 1, Name: "eth0"}},
+			2: &fakeLink{attrs: netlink.LinkAttrs{Index: 2, Name: "wg51820"}},
+		},
+	}
+
+	s := &nodeStatusServer{
+		cfg: &config{
+			WireGuardInterfacePrefix: "ugw",
+			GeneveInterfaceName:      "ugn0",
+			VXLANInterfaceName:       "uvx0",
+			IPIPInterfaceName:        "uipip0",
+		},
+		state:      &wireGuardState{},
+		netlinkOps: ops,
+	}
 
 	info := s.collectRoutingTableFromKernel()
 	if len(info.Routes) != 0 {
-		t.Fatalf("expected empty routes without wg interfaces: %#v", info)
+		t.Fatalf("expected empty routes when no devices match the configured cfg prefix/names: %#v", info)
+	}
+}
+
+// TestCollectRoutingTableFromKernelManagedInterfaces tests that routes on
+// the configured tunnel devices ARE returned, exercising the positive case
+// of isManagedTunnelInterface against custom-named devices.
+func TestCollectRoutingTableFromKernelManagedInterfaces(t *testing.T) {
+	_, ipnetWG, _ := net.ParseCIDR("10.42.0.0/16")
+	_, ipnetGENEVE, _ := net.ParseCIDR("10.43.0.0/16")
+	_, ipnetEth, _ := net.ParseCIDR("172.16.0.0/16")
+
+	ops := &fakeNetlinkOps{
+		mainRoutes: map[int][]netlink.Route{
+			netlink.FAMILY_V4: {
+				{Dst: ipnetWG, LinkIndex: 10, Protocol: 7},
+				{Dst: ipnetGENEVE, LinkIndex: 11, Protocol: 7},
+				{Dst: ipnetEth, LinkIndex: 12, Protocol: 7},
+			},
+		},
+		links: map[int]netlink.Link{
+			10: &fakeLink{attrs: netlink.LinkAttrs{Index: 10, Name: "ugw51820"}},
+			11: &fakeLink{attrs: netlink.LinkAttrs{Index: 11, Name: "ugn0"}},
+			12: &fakeLink{attrs: netlink.LinkAttrs{Index: 12, Name: "eth0"}},
+		},
+	}
+
+	s := &nodeStatusServer{
+		cfg: &config{
+			WireGuardInterfacePrefix: "ugw",
+			GeneveInterfaceName:      "ugn0",
+			VXLANInterfaceName:       "uvx0",
+			IPIPInterfaceName:        "uipip0",
+		},
+		state:      &wireGuardState{},
+		netlinkOps: ops,
+	}
+
+	info := s.collectRoutingTableFromKernel()
+
+	// Should pick up the two routes on ugw51820 and ugn0; the eth0 route is
+	// filtered out (not a managed tunnel, no managed prefix).
+	if len(info.Routes) != 2 {
+		t.Fatalf("expected 2 routes (one each on ugw51820 and ugn0), got %d: %#v", len(info.Routes), info)
+	}
+
+	devices := make(map[string]bool)
+	for _, r := range info.Routes {
+		for _, hop := range r.NextHops {
+			devices[hop.Device] = true
+		}
+	}
+
+	if !devices["ugw51820"] {
+		t.Errorf("expected route on ugw51820, got devices=%v", devices)
+	}
+
+	if !devices["ugn0"] {
+		t.Errorf("expected route on ugn0, got devices=%v", devices)
+	}
+
+	if devices["eth0"] {
+		t.Errorf("did not expect route on eth0 to be included, got devices=%v", devices)
 	}
 }
 

@@ -320,13 +320,13 @@ func printNodePeerings(w io.Writer, status clusterStatusResponse, node statusv1a
 }
 
 // printNodeRoutes prints a route table for one node.
-func printNodeRoutes(w io.Writer, node statusv1alpha1.NodeStatusResponse, useColor bool) error {
+func printNodeRoutes(w io.Writer, node statusv1alpha1.NodeStatusResponse, useColor bool, ifaceNames tunnelInterfaceNames) error {
 	headers := []string{"FAMILY", "DESTINATION", "KIND", "DEVICE", "GATEWAY", "DIST", "MTU", "EXPECTED", "PRESENT", "INFO"}
 	rows := [][]string{}
 
 	for _, route := range node.RoutingTable.Routes {
 		for _, hop := range route.NextHops {
-			kind := routeKind(route.Destination, hop)
+			kind := routeKind(route.Destination, hop, ifaceNames)
 			expected := boolPtrValue(hop.Expected)
 			present := boolPtrValue(hop.Present)
 			expText := fmt.Sprintf("%t", expected)
