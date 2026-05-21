@@ -51,6 +51,83 @@ func TestProviderExecute(t *testing.T) {
 	}
 }
 
+func TestProviderExecutePassesAuthToClientFactory(t *testing.T) {
+	t.Parallel()
+
+	auth := &machineops.OperationAuth{
+		Mode: unboundedv1alpha3.MachineOperationCredentialAuthExternalPlugin,
+		SecretData: map[string]string{
+			"tenancyOCID": "tenancy",
+			"userOCID":    "user",
+			"region":      "us-phoenix-1",
+			"fingerprint": "fingerprint",
+			"privateKey":  "private-key",
+		},
+	}
+	client := &recordingComputeClient{}
+	provider := &Provider{
+		NewClientWithAuth: func(gotAuth *machineops.OperationAuth) (computeClient, error) {
+			require.Equal(t, auth, gotAuth)
+			return client, nil
+		},
+	}
+
+	_, err := provider.Execute(context.Background(), machineops.OperationRequest{
+		ProviderID: "oci://ocid1.instance.oc1.test",
+		Operation:  unboundedv1alpha3.OperationHostPowerOn,
+		Auth:       auth,
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, []string{"START:ocid1.instance.oc1.test"}, client.calls)
+}
+
+func TestNewComputeClientForAuthValidatesAuth(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		auth    *machineops.OperationAuth
+		wantErr string
+	}{
+		{
+			name:    "missing auth",
+			wantErr: "OCI auth is required",
+		},
+		{
+			name: "api key missing private key",
+			auth: &machineops.OperationAuth{
+				Mode: unboundedv1alpha3.MachineOperationCredentialAuthExternalPlugin,
+				SecretData: map[string]string{
+					"tenancyOCID": "tenancy",
+					"userOCID":    "user",
+					"region":      "us-phoenix-1",
+					"fingerprint": "fingerprint",
+				},
+			},
+			wantErr: "privateKey",
+		},
+		{
+			name: "unsupported auth mode",
+			auth: &machineops.OperationAuth{
+				Mode: unboundedv1alpha3.MachineOperationCredentialAuthWorkloadIdentity,
+			},
+			wantErr: "unsupported OCI auth mode",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			provider := &Provider{}
+			_, err := provider.newComputeClientForAuth(tt.auth)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tt.wantErr)
+		})
+	}
+}
+
 func TestProviderExecuteRequiresProviderID(t *testing.T) {
 	t.Parallel()
 
@@ -345,31 +422,6 @@ func TestProviderCleanupTerminatesOldInstance(t *testing.T) {
 
 	require.NoError(t, err)
 	require.Equal(t, []string{"old-instance"}, client.terminated)
-}
-
-func TestNewDefaultComputeClientValidatesAuth(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name    string
-		config  string
-		auth    string
-		wantErr string
-	}{
-		{name: "unsupported auth", config: "/not-used", auth: "instance_principal", wantErr: "unsupported OCI auth mode"},
-		{name: "security token requires config file", auth: AuthSecurityToken, wantErr: "requires --oci-config-file"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			provider := &Provider{ConfigFile: tt.config, Auth: tt.auth}
-			_, err := provider.newDefaultComputeClient()
-			require.Error(t, err)
-			require.Contains(t, err.Error(), tt.wantErr)
-		})
-	}
 }
 
 func TestActionForOperation(t *testing.T) {
