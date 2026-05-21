@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use crate::storage::alloc::Allocator;
-use crate::storage::blockdev::{BlockDevice, MockDevice, MockDeviceConfig};
+use crate::storage::blockdev::{BlockDevice, MockDevice, MockDeviceConfig, ScratchPool};
 use crate::storage::btree::page::{self, Decoded, META_SLOT_A, META_SLOT_B};
 use crate::storage::btree::{BTreeIndex, LeafEntry, Mutation};
 use crate::storage::types::{Checksum, Lba, PageKey};
@@ -63,11 +63,22 @@ fn fresh(capacity_pages: u64) -> (Arc<MockDevice>, Arc<Allocator>) {
     (device, alloc)
 }
 
+/// Construct a [`BTreeIndex`] against `dev`/`alloc`, with a
+/// fresh [`ScratchPool`] registered on the device. Used by every
+/// test below so the registered-buffer contract holds end-to-end.
+fn open_btree(
+    dev: Arc<MockDevice>,
+    alloc: Arc<Allocator>,
+) -> impl Future<Output = Result<BTreeIndex<MockDevice>, crate::storage::types::Error>> {
+    let scratch = ScratchPool::new(&*dev, 4096, 8).expect("scratch pool");
+    BTreeIndex::open(dev, alloc, scratch)
+}
+
 #[test]
 fn open_empty_creates_meta_and_root() {
     let (dev, alloc) = fresh(64);
     let idx: BTreeIndex<MockDevice> =
-        block_on(BTreeIndex::open(dev.clone(), alloc.clone())).unwrap();
+        block_on(open_btree(dev.clone(), alloc.clone())).unwrap();
     assert_eq!(idx.current_txn(), 1);
     // Meta slots are reserved + at least one root page.
     assert!(alloc.is_in_use(META_SLOT_A).unwrap());
@@ -81,7 +92,7 @@ fn open_empty_creates_meta_and_root() {
 #[test]
 fn insert_then_lookup() {
     let (dev, alloc) = fresh(64);
-    let idx = block_on(BTreeIndex::open(dev, alloc)).unwrap();
+    let idx = block_on(open_btree(dev, alloc)).unwrap();
     let muts = vec![
         Mutation::Insert {
             key: key(1),
@@ -101,7 +112,7 @@ fn insert_then_lookup() {
 #[test]
 fn delete_removes_entry() {
     let (dev, alloc) = fresh(64);
-    let idx = block_on(BTreeIndex::open(dev, alloc)).unwrap();
+    let idx = block_on(open_btree(dev, alloc)).unwrap();
     block_on(idx.apply_batch(vec![Mutation::Insert {
         key: key(1),
         value: entry(100),
@@ -116,7 +127,7 @@ fn large_batch_spans_multiple_leaves() {
     // 200 entries > one 4 KiB leaf (cap = 72) so this forces at
     // least one internal page above the leaves.
     let (dev, alloc) = fresh(512);
-    let idx = block_on(BTreeIndex::open(dev, alloc)).unwrap();
+    let idx = block_on(open_btree(dev, alloc)).unwrap();
     let muts: Vec<_> = (0..200u32)
         .map(|i| Mutation::Insert {
             key: key(i),
@@ -138,7 +149,7 @@ fn large_batch_spans_multiple_leaves() {
 fn restart_from_meta_restores_entries() {
     let (dev, alloc) = fresh(128);
     {
-        let idx = block_on(BTreeIndex::open(dev.clone(), alloc)).unwrap();
+        let idx = block_on(open_btree(dev.clone(), alloc)).unwrap();
         for i in 0..50u32 {
             block_on(idx.apply_batch(vec![Mutation::Insert {
                 key: key(i),
@@ -150,7 +161,7 @@ fn restart_from_meta_restores_entries() {
     // New allocator (simulates restart): only the persistent
     // device survives.
     let alloc2 = Arc::new(Allocator::new(128));
-    let idx2 = block_on(BTreeIndex::open(dev, alloc2)).unwrap();
+    let idx2 = block_on(open_btree(dev, alloc2)).unwrap();
     for i in 0..50u32 {
         assert_eq!(
             block_on(idx2.lookup(&key(i))).unwrap(),
@@ -165,7 +176,7 @@ fn restart_picks_highest_txn_meta() {
     // Walk the index a few times so both meta slots get written
     // at least once; then make sure the higher-txn one wins.
     let (dev, alloc) = fresh(128);
-    let idx = block_on(BTreeIndex::open(dev.clone(), alloc)).unwrap();
+    let idx = block_on(open_btree(dev.clone(), alloc)).unwrap();
     block_on(idx.apply_batch(vec![Mutation::Insert {
         key: key(1),
         value: entry(11),
@@ -180,7 +191,7 @@ fn restart_picks_highest_txn_meta() {
     drop(idx);
 
     let alloc2 = Arc::new(Allocator::new(128));
-    let idx2 = block_on(BTreeIndex::open(dev, alloc2)).unwrap();
+    let idx2 = block_on(open_btree(dev, alloc2)).unwrap();
     assert_eq!(idx2.current_txn(), txn);
     assert_eq!(block_on(idx2.lookup(&key(1))).unwrap(), Some(entry(11)));
     assert_eq!(block_on(idx2.lookup(&key(2))).unwrap(), Some(entry(22)));
@@ -189,7 +200,7 @@ fn restart_picks_highest_txn_meta() {
 #[test]
 fn corrupted_active_meta_falls_back_to_other_slot() {
     let (dev, alloc) = fresh(128);
-    let idx = block_on(BTreeIndex::open(dev.clone(), alloc)).unwrap();
+    let idx = block_on(open_btree(dev.clone(), alloc)).unwrap();
     block_on(idx.apply_batch(vec![Mutation::Insert {
         key: key(1),
         value: entry(11),
@@ -214,7 +225,7 @@ fn corrupted_active_meta_falls_back_to_other_slot() {
     dev.poke(slot, &bad);
 
     let alloc2 = Arc::new(Allocator::new(128));
-    let idx2 = block_on(BTreeIndex::open(dev, alloc2)).unwrap();
+    let idx2 = block_on(open_btree(dev, alloc2)).unwrap();
     // The older meta only saw the first insert.
     assert_eq!(block_on(idx2.lookup(&key(1))).unwrap(), Some(entry(11)));
 }
@@ -222,7 +233,7 @@ fn corrupted_active_meta_falls_back_to_other_slot() {
 #[test]
 fn double_corrupted_meta_triggers_lba_scan_rebuild() {
     let (dev, alloc) = fresh(128);
-    let idx = block_on(BTreeIndex::open(dev.clone(), alloc)).unwrap();
+    let idx = block_on(open_btree(dev.clone(), alloc)).unwrap();
     block_on(idx.apply_batch(vec![
         Mutation::Insert {
             key: key(1),
@@ -245,7 +256,7 @@ fn double_corrupted_meta_triggers_lba_scan_rebuild() {
     dev.poke(META_SLOT_B, &garbage);
 
     let alloc2 = Arc::new(Allocator::new(128));
-    let idx2 = block_on(BTreeIndex::open(dev, alloc2)).unwrap();
+    let idx2 = block_on(open_btree(dev, alloc2)).unwrap();
     assert_eq!(block_on(idx2.lookup(&key(1))).unwrap(), Some(entry(11)));
     assert_eq!(block_on(idx2.lookup(&key(2))).unwrap(), Some(entry(22)));
     assert_eq!(block_on(idx2.lookup(&key(3))).unwrap(), Some(entry(33)));
@@ -260,7 +271,7 @@ fn snapshot_drop_frees_old_pages() {
     // a bare `used_after_first == used_after_second` check.
     let (dev, alloc) = fresh(128);
     let used_before_any = alloc.used_pages();
-    let idx = block_on(BTreeIndex::open(dev, alloc.clone())).unwrap();
+    let idx = block_on(open_btree(dev, alloc.clone())).unwrap();
     block_on(idx.apply_batch(vec![Mutation::Insert {
         key: key(1),
         value: entry(11),
@@ -320,7 +331,7 @@ fn hwm_persisted_in_meta_after_bootstrap() {
     // reserves META_SLOT_B (LBA 1) before the first commit.
     let (dev, alloc) = fresh(64);
     let _idx: BTreeIndex<MockDevice> =
-        block_on(BTreeIndex::open(dev.clone(), alloc.clone())).unwrap();
+        block_on(open_btree(dev.clone(), alloc.clone())).unwrap();
     let (_txn, _root, hwm) = read_live_meta(&dev).expect("bootstrap writes a valid meta slot");
     assert!(
         hwm >= 1,
@@ -333,7 +344,7 @@ fn hwm_grows_with_commits() {
     // The recorded hwm must cover at least the new root LBA after
     // a commit; otherwise a bounded rebuild would miss the root.
     let (dev, alloc) = fresh(128);
-    let idx = block_on(BTreeIndex::open(dev.clone(), alloc)).unwrap();
+    let idx = block_on(open_btree(dev.clone(), alloc)).unwrap();
     let muts: Vec<_> = (0..20u32)
         .map(|i| Mutation::Insert {
             key: key(i),
@@ -357,7 +368,7 @@ fn hwm_monotonic_across_reopen() {
     // regression would let bounded recovery skip a real LBA.
     let (dev, alloc) = fresh(128);
     {
-        let idx = block_on(BTreeIndex::open(dev.clone(), alloc)).unwrap();
+        let idx = block_on(open_btree(dev.clone(), alloc)).unwrap();
         block_on(idx.apply_batch(vec![
             Mutation::Insert {
                 key: key(1),
@@ -373,7 +384,7 @@ fn hwm_monotonic_across_reopen() {
     let (_t1, _r1, hwm_before) = read_live_meta(&dev).expect("post-first-commit meta");
 
     let alloc2 = Arc::new(Allocator::new(128));
-    let idx2 = block_on(BTreeIndex::open(dev.clone(), alloc2)).unwrap();
+    let idx2 = block_on(open_btree(dev.clone(), alloc2)).unwrap();
     block_on(idx2.apply_batch(vec![Mutation::Insert {
         key: key(3),
         value: entry(33),
@@ -393,7 +404,7 @@ fn reopen_seeds_allocator_hwm() {
     // monotonic across restarts (bounded recovery relies on it).
     let (dev, alloc) = fresh(128);
     {
-        let idx = block_on(BTreeIndex::open(dev.clone(), alloc)).unwrap();
+        let idx = block_on(open_btree(dev.clone(), alloc)).unwrap();
         let muts: Vec<_> = (0..30u32)
             .map(|i| Mutation::Insert {
                 key: key(i),
@@ -406,7 +417,7 @@ fn reopen_seeds_allocator_hwm() {
         read_live_meta(&dev).expect("post-commit meta must decode");
 
     let alloc2 = Arc::new(Allocator::new(128));
-    let idx2 = block_on(BTreeIndex::open(dev.clone(), alloc2)).unwrap();
+    let idx2 = block_on(open_btree(dev.clone(), alloc2)).unwrap();
     assert!(
         idx2.allocator_high_water() >= persisted_hwm,
         "allocator hwm ({}) after reopen must cover persisted hwm ({})",

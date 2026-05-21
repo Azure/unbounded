@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex};
 use crate::bufferpool::{self, BulkRef, PageRef, StripeKey};
 use crate::storage::admission::AdmissionFilter;
 use crate::storage::alloc::Allocator;
-use crate::storage::blockdev::BlockDevice;
+use crate::storage::blockdev::{BlockDevice, ScratchPool};
 use crate::storage::btree::{BTreeIndex, LeafEntry, Mutation};
 use crate::storage::lru::SieveLru;
 use crate::storage::mutator::{MutatorOutcome, MutatorQueue, MutatorReply, MutatorReq, yield_once};
@@ -84,6 +84,13 @@ struct BufferpoolBinding {
     page_size: usize,
     page_count: usize,
 }
+
+/// Number of scratch pages allocated for btree / meta I/O. Sized
+/// to comfortably cover the worst-case concurrent demand from a
+/// single shard: two pages for [`crate::storage::btree::meta`]
+/// load, one for an in-flight lookup, one for a parallel
+/// `build_tree` write, and a small buffer beyond that.
+const BTREE_SCRATCH_PAGES: usize = 8;
 
 pub struct StorageEngine<B: BlockDevice> {
     device: Arc<B>,
@@ -185,7 +192,16 @@ impl<B: BlockDevice> StorageEngine<B> {
         let capacity = device.capacity_pages();
         let allocator = Arc::new(Allocator::new(capacity));
         let refcount = Arc::new(RefcountTable::new(capacity));
-        let btree = Arc::new(BTreeIndex::open(device.clone(), allocator.clone()).await?);
+        // Scratch pool for btree/meta I/O: every page handed to
+        // BlockDevice::{read,write} must lie inside a region
+        // registered with the device. The bufferpool's larger
+        // backing is registered later (via `register_pages`);
+        // this small dedicated region covers the structural I/O
+        // BTreeIndex::open issues before any user-data I/O.
+        let scratch = ScratchPool::new(&*device, cfg.btree_page_bytes, BTREE_SCRATCH_PAGES)?;
+        let btree = Arc::new(
+            BTreeIndex::open(device.clone(), allocator.clone(), scratch.clone()).await?,
+        );
         let lru = Arc::new(SieveLru::new(capacity, refcount.clone()));
         let admission = Arc::new(AdmissionFilter::new(
             capacity,

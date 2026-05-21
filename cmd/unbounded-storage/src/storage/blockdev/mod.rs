@@ -13,6 +13,7 @@
 #![allow(async_fn_in_trait)]
 
 mod mock;
+mod scratch;
 #[cfg(test)]
 mod tests;
 
@@ -20,6 +21,7 @@ mod tests;
 mod uring;
 
 pub use mock::{MockDevice, MockDeviceConfig, MockFaultMode};
+pub use scratch::{AcquireFut, ScratchPage, ScratchPool};
 
 #[cfg(target_os = "linux")]
 pub use uring::{UringBlockDevice, UringConfig};
@@ -46,9 +48,13 @@ pub trait BlockDevice {
     fn capacity_pages(&self) -> u64;
 
     /// Pre-register a pinned buffer with the device. The
-    /// io_uring backend uses `IORING_REGISTER_BUFFERS`; mocks
-    /// no-op. Calling this multiple times replaces the previous
-    /// registration.
+    /// io_uring backend tracks each registration as an
+    /// `IORING_REGISTER_BUFFERS` slot and matches per-I/O buffer
+    /// pointers back to the appropriate slot at submission time;
+    /// mocks no-op. Multiple calls accumulate: each call adds a
+    /// new registered region. All buffers handed to
+    /// [`Self::read`] / [`Self::write`] must lie inside one of
+    /// the registered regions.
     fn register_buffers(&self, base: *mut u8, len: usize) -> Result<(), Error>;
 
     /// Read exactly `dst.len()` bytes from `lba * page_size` into

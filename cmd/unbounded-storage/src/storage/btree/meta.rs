@@ -12,7 +12,9 @@
 //! checksum). On open we choose the slot with the highest valid
 //! `txn_id`.
 
-use crate::storage::blockdev::BlockDevice;
+use std::rc::Rc;
+
+use crate::storage::blockdev::{BlockDevice, ScratchPool};
 use crate::storage::btree::page::{self, Decoded};
 use crate::storage::types::{Error, Lba};
 
@@ -49,18 +51,20 @@ pub struct MetaState {
 /// `Ok(None)` if neither slot decodes (fresh disk or
 /// double-torn-write). The page-size of the device is used to
 /// know how many bytes to load.
-pub async fn load_meta<B: BlockDevice>(device: &B) -> Result<Option<MetaState>, Error> {
-    let ps = device.page_size();
-    let mut buf_a = vec![0u8; ps];
-    let mut buf_b = vec![0u8; ps];
+pub async fn load_meta<B: BlockDevice>(
+    device: &B,
+    scratch: &Rc<ScratchPool>,
+) -> Result<Option<MetaState>, Error> {
+    let mut buf_a = scratch.acquire().await;
+    let mut buf_b = scratch.acquire().await;
     // We tolerate I/O errors here: the design wants us to treat a
     // partially-failing disk as "no meta", not propagate the error.
-    let a = match device.read(page::META_SLOT_A, &mut buf_a).await {
-        Ok(()) => page::decode(&buf_a),
+    let a = match device.read(page::META_SLOT_A, buf_a.as_mut_slice()).await {
+        Ok(()) => page::decode(buf_a.as_slice()),
         Err(_) => Decoded::Empty,
     };
-    let b = match device.read(page::META_SLOT_B, &mut buf_b).await {
-        Ok(()) => page::decode(&buf_b),
+    let b = match device.read(page::META_SLOT_B, buf_b.as_mut_slice()).await {
+        Ok(()) => page::decode(buf_b.as_slice()),
         Err(_) => Decoded::Empty,
     };
     let a_meta = as_meta(a, MetaSlot::A);
@@ -93,13 +97,19 @@ fn as_meta(d: Decoded, slot: MetaSlot) -> Option<MetaState> {
 /// current active slot untouched until the caller swaps state.
 pub async fn write_inactive<B: BlockDevice>(
     device: &B,
+    scratch: &Rc<ScratchPool>,
     current_active: MetaSlot,
     new_txn_id: u64,
     new_root: Lba,
     new_hwm: u64,
 ) -> Result<MetaSlot, Error> {
     let target = current_active.other();
-    let page = page::encode_meta(device.page_size(), new_txn_id, new_root, new_hwm);
-    device.write(target.lba(), &page).await?;
+    let ps = device.page_size();
+    let encoded = page::encode_meta(ps, new_txn_id, new_root, new_hwm);
+    let mut page = scratch.acquire().await;
+    let slice = page.as_mut_slice();
+    debug_assert_eq!(slice.len(), encoded.len());
+    slice.copy_from_slice(&encoded);
+    device.write(target.lba(), slice).await?;
     Ok(target)
 }

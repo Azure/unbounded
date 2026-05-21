@@ -33,12 +33,13 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 
 use crate::storage::alloc::Allocator;
-use crate::storage::blockdev::BlockDevice;
+use crate::storage::blockdev::{BlockDevice, ScratchPool};
 use crate::storage::types::{Error, Lba, PageKey};
 
 mod cow;
@@ -95,6 +96,7 @@ struct MutatorState {
 pub struct BTreeIndex<B: BlockDevice> {
     device: Arc<B>,
     allocator: Arc<Allocator>,
+    scratch: Rc<ScratchPool>,
     root: ArcSwap<RootSnapshot>,
     mutator: RefCell<MutatorState>,
     active_meta: Cell<meta::MetaSlot>,
@@ -105,18 +107,29 @@ impl<B: BlockDevice> BTreeIndex<B> {
     /// place: meta slots are pinned, and any pages reachable from
     /// the recovered root are marked in-use so subsequent
     /// allocations do not collide with the live tree.
-    pub async fn open(device: Arc<B>, allocator: Arc<Allocator>) -> Result<Self, Error> {
+    ///
+    /// `scratch` is a [`ScratchPool`] sized for at least two
+    /// concurrent registered-buffer pages (meta load needs two);
+    /// the engine constructs and shares it across the lifetime of
+    /// the index.
+    pub async fn open(
+        device: Arc<B>,
+        allocator: Arc<Allocator>,
+        scratch: Rc<ScratchPool>,
+    ) -> Result<Self, Error> {
         // Reserve the meta slots regardless of disk state.
         let _ = allocator.mark_in_use(page::META_SLOT_A);
         let _ = allocator.mark_in_use(page::META_SLOT_B);
 
-        let loaded = meta::load_meta(&*device).await?;
+        let loaded = meta::load_meta(&*device, &scratch).await?;
         if let Some(state) = loaded {
             // Seed allocator HWM from persisted meta so future
             // commits keep monotonicity even if tree walk visits a
             // subset of the live frontier.
             allocator.observe_high_water(state.hwm);
-            if let Some(idx) = Self::open_from_meta(&device, &allocator, state).await? {
+            if let Some(idx) =
+                Self::open_from_meta(&device, &allocator, &scratch, state).await?
+            {
                 return Ok(idx);
             }
             // Meta said something but the tree underneath is
@@ -125,11 +138,12 @@ impl<B: BlockDevice> BTreeIndex<B> {
 
         // Try LBA-scan rebuild.
         if let Some(rebuilt) =
-            rebuild::scan_for_leaves(&*device, loaded.as_ref().map(|s| s.hwm)).await?
+            rebuild::scan_for_leaves(&*device, &scratch, loaded.as_ref().map(|s| s.hwm)).await?
         {
             return Self::bootstrap_from_entries(
                 device,
                 allocator,
+                scratch,
                 rebuilt.txn_id + 1,
                 rebuilt.entries,
             )
@@ -137,15 +151,16 @@ impl<B: BlockDevice> BTreeIndex<B> {
         }
 
         // Fresh disk: install an empty tree at txn 1.
-        Self::bootstrap_from_entries(device, allocator, 1, BTreeMap::new()).await
+        Self::bootstrap_from_entries(device, allocator, scratch, 1, BTreeMap::new()).await
     }
 
     async fn open_from_meta(
         device: &Arc<B>,
         allocator: &Arc<Allocator>,
+        scratch: &Rc<ScratchPool>,
         state: meta::MetaState,
     ) -> Result<Option<Self>, Error> {
-        let pages = cow::collect_pages(&**device, state.root_lba).await?;
+        let pages = cow::collect_pages(&**device, scratch, state.root_lba).await?;
         if pages.is_empty() {
             // Root was unreadable / corrupt.
             return Ok(None);
@@ -155,7 +170,7 @@ impl<B: BlockDevice> BTreeIndex<B> {
         }
 
         let mut entries: BTreeMap<PageKey, LeafEntry> = BTreeMap::new();
-        cow::for_each_leaf(&**device, state.root_lba, |k, v, _| {
+        cow::for_each_leaf(&**device, scratch, state.root_lba, |k, v, _| {
             entries.insert(k, v);
         })
         .await?;
@@ -165,6 +180,7 @@ impl<B: BlockDevice> BTreeIndex<B> {
         Ok(Some(Self {
             device: device.clone(),
             allocator: allocator.clone(),
+            scratch: scratch.clone(),
             root: ArcSwap::new(snapshot),
             mutator: RefCell::new(MutatorState {
                 entries,
@@ -177,16 +193,19 @@ impl<B: BlockDevice> BTreeIndex<B> {
     async fn bootstrap_from_entries(
         device: Arc<B>,
         allocator: Arc<Allocator>,
+        scratch: Rc<ScratchPool>,
         txn_id: u64,
         entries: BTreeMap<PageKey, LeafEntry>,
     ) -> Result<Self, Error> {
         let sorted: Vec<(PageKey, LeafEntry)> = entries.iter().map(|(k, v)| (*k, *v)).collect();
-        let (root_lba, pages) = cow::build_tree(&*device, &allocator, txn_id, &sorted).await?;
+        let (root_lba, pages) =
+            cow::build_tree(&*device, &scratch, &allocator, txn_id, &sorted).await?;
 
         // Write meta into slot A by default (active=B means we
         // wrote to A; on next commit we'll write to B).
         let active = meta::write_inactive(
             &*device,
+            &scratch,
             meta::MetaSlot::B,
             txn_id,
             root_lba,
@@ -199,6 +218,7 @@ impl<B: BlockDevice> BTreeIndex<B> {
         Ok(Self {
             device,
             allocator,
+            scratch,
             root: ArcSwap::new(snapshot),
             mutator: RefCell::new(MutatorState {
                 entries,
@@ -212,7 +232,7 @@ impl<B: BlockDevice> BTreeIndex<B> {
     /// surface as `Ok(None)` per the design's silent-miss policy.
     pub async fn lookup(&self, key: &PageKey) -> Result<Option<LeafEntry>, Error> {
         let snap = self.root.load();
-        cow::lookup(&*self.device, snap.root_lba, key).await
+        cow::lookup(&*self.device, &self.scratch, snap.root_lba, key).await
     }
 
     /// Apply a batch of mutations atomically. Must be called by
@@ -242,13 +262,15 @@ impl<B: BlockDevice> BTreeIndex<B> {
         };
 
         let (root_lba, pages) =
-            cow::build_tree(&*self.device, &self.allocator, txn_id, &sorted).await?;
+            cow::build_tree(&*self.device, &self.scratch, &self.allocator, txn_id, &sorted)
+                .await?;
 
         let active = self.active_meta.get();
         // build_tree above has already marked the new pages in
         // use, so high_water() reflects them.
         let new_active = match meta::write_inactive(
             &*self.device,
+            &self.scratch,
             active,
             txn_id,
             root_lba,

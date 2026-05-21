@@ -62,8 +62,11 @@ pub struct MockDevice {
     storage: RefCell<Vec<u8>>,
     read_count: Cell<u64>,
     write_count: Cell<u64>,
-    registered_base: Cell<Option<*mut u8>>,
-    registered_len: Cell<usize>,
+    /// Every region passed to [`Self::register_buffers`]. The
+    /// real device demands the I/O pointer lies inside one of
+    /// these; the mock accepts any pointer but records the
+    /// registrations so tests can assert on them.
+    registered: RefCell<Vec<(*mut u8, usize)>>,
 }
 
 impl MockDevice {
@@ -74,8 +77,7 @@ impl MockDevice {
             storage: RefCell::new(vec![0u8; bytes]),
             read_count: Cell::new(0),
             write_count: Cell::new(0),
-            registered_base: Cell::new(None),
-            registered_len: Cell::new(0),
+            registered: RefCell::new(Vec::new()),
         }
     }
 
@@ -93,12 +95,20 @@ impl MockDevice {
         self.write_count.get()
     }
 
+    /// Base of the first registered region, if any. Test-only
+    /// shorthand; the device tracks every registration.
     pub fn registered_base(&self) -> Option<*mut u8> {
-        self.registered_base.get()
+        self.registered.borrow().first().map(|(b, _)| *b)
     }
 
+    /// Total bytes across every registered region.
     pub fn registered_len(&self) -> usize {
-        self.registered_len.get()
+        self.registered.borrow().iter().map(|(_, l)| *l).sum()
+    }
+
+    /// Number of distinct buffer regions currently registered.
+    pub fn registered_count(&self) -> usize {
+        self.registered.borrow().len()
     }
 
     /// Direct backdoor for tests: read raw bytes without going
@@ -131,8 +141,7 @@ impl BlockDevice for MockDevice {
     }
 
     fn register_buffers(&self, base: *mut u8, len: usize) -> Result<(), Error> {
-        self.registered_base.set(Some(base));
-        self.registered_len.set(len);
+        self.registered.borrow_mut().push((base, len));
         Ok(())
     }
 

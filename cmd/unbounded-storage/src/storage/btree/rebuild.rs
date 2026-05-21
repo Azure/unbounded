@@ -25,8 +25,9 @@
 use std::collections::BTreeMap;
 
 use std::cmp::Ordering;
+use std::rc::Rc;
 
-use crate::storage::blockdev::BlockDevice;
+use crate::storage::blockdev::{BlockDevice, ScratchPool};
 use crate::storage::btree::page::{self, Decoded, LeafEntry, META_SLOT_A, META_SLOT_B};
 use crate::storage::types::{Error, Lba, PageKey};
 
@@ -49,15 +50,15 @@ pub struct RebuildResult {
 ///   allocator never handed out a higher LBA.
 pub async fn scan_for_leaves<B: BlockDevice>(
     device: &B,
+    scratch: &Rc<ScratchPool>,
     upper_bound: Option<u64>,
 ) -> Result<Option<RebuildResult>, Error> {
-    let ps = device.page_size();
     let cap = device.capacity_pages();
     let end = match upper_bound {
         None | Some(0) => cap,
         Some(hwm) => hwm.min(cap.saturating_sub(1)).saturating_add(1),
     };
-    let mut buf = vec![0u8; ps];
+    let mut buf = scratch.acquire().await;
     let mut best_txn: u64 = 0;
     let mut best: BTreeMap<PageKey, LeafEntry> = BTreeMap::new();
 
@@ -65,10 +66,10 @@ pub async fn scan_for_leaves<B: BlockDevice>(
         if lba == META_SLOT_A.0 || lba == META_SLOT_B.0 {
             continue;
         }
-        if device.read(Lba(lba), &mut buf).await.is_err() {
+        if device.read(Lba(lba), buf.as_mut_slice()).await.is_err() {
             continue;
         }
-        if let Decoded::Leaf { txn_id, entries } = page::decode(&buf) {
+        if let Decoded::Leaf { txn_id, entries } = page::decode(buf.as_slice()) {
             match txn_id.cmp(&best_txn) {
                 Ordering::Greater => {
                     best_txn = txn_id;

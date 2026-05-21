@@ -11,9 +11,12 @@
 //! therefore `!Send + !Sync` by construction.
 //!
 //! All I/O is issued via `READ_FIXED` / `WRITE_FIXED` against a
-//! single pre-registered buffer (`IORING_REGISTER_BUFFERS`, index 0)
-//! and a single pre-registered file (`IORING_REGISTER_FILES`,
-//! `Fixed(0)`).
+//! sparse table of `IORING_REGISTER_BUFFERS` slots. Each call to
+//! [`UringBlockDevice::register_buffers`] fills the next free slot;
+//! per-I/O the device resolves the right `buf_index` by locating
+//! the destination pointer inside one of the registered regions.
+//! A single registered file (`IORING_REGISTER_FILES`, `Fixed(0)`)
+//! is also installed at open time.
 //!
 //! ## Concurrency model
 //!
@@ -108,15 +111,20 @@ impl UringConfig {
     }
 }
 
-/// One ring + one file descriptor + one registered buffer. Pinned
-/// to the thread that opened it; `PhantomData<*const ()>` makes
-/// that non-negotiable to the type system.
+/// One ring + one file descriptor + a sparse table of registered
+/// buffers. Pinned to the thread that opened it;
+/// `PhantomData<*const ()>` makes that non-negotiable to the type
+/// system.
 pub struct UringBlockDevice {
     file: File,
     ring: RefCell<IoUring>,
-    /// Pre-registered I/O buffer. Set once by [`Self::register_buffers`];
-    /// every read/write must address bytes inside this range.
-    registered: Cell<Option<RegisteredBuf>>,
+    /// Pre-registered I/O buffer slots. Each call to
+    /// [`Self::register_buffers`] fills the next entry; reads and
+    /// writes locate their slot by pointer.
+    registered: RefCell<Vec<RegisteredBuf>>,
+    /// Number of slots the sparse table was created with.
+    /// Registrations beyond this fail with `-ENOSPC`.
+    slot_capacity: u32,
     /// Per-in-flight-op state, keyed by `user_data`. Entries are
     /// inserted at submit time and removed in [`Self::progress`]
     /// once the matching CQE is reaped.
@@ -140,6 +148,12 @@ struct RegisteredBuf {
     base: NonNull<u8>,
     len: usize,
 }
+
+/// Maximum number of distinct registered regions a single ring
+/// can hold. Sized for "bufferpool backing + a small handful of
+/// scratch / extra backings" with comfortable headroom; bump if a
+/// real deployment ever needs more than this.
+const MAX_REGISTERED_SLOTS: u32 = 32;
 
 /// Per-op completion slot. The waker is registered by the
 /// [`IoFut`] poll path; the result is filled by
@@ -192,7 +206,8 @@ impl UringBlockDevice {
         Ok(Self {
             file,
             ring: RefCell::new(ring),
-            registered: Cell::new(None),
+            registered: RefCell::new(Vec::new()),
+            slot_capacity: MAX_REGISTERED_SLOTS,
             slots: RefCell::new(HashMap::new()),
             submitted: Cell::new(0),
             submit_waiters: RefCell::new(Vec::new()),
@@ -263,19 +278,20 @@ impl UringBlockDevice {
         v
     }
 
-    fn buffer_offset(&self, ptr: *const u8, len: usize) -> Result<u32, Error> {
-        let reg = self.registered.get().ok_or(Error::Io(libc::EINVAL))?;
-        let base = reg.base.as_ptr() as usize;
+    fn resolve_buf_index(&self, ptr: *const u8, len: usize) -> Result<u16, Error> {
+        let regs = self.registered.borrow();
+        if regs.is_empty() {
+            return Err(Error::Io(libc::EINVAL));
+        }
         let start = ptr as usize;
-        if start < base {
-            return Err(Error::Io(libc::EFAULT));
-        }
         let end = start.checked_add(len).ok_or(Error::Io(libc::EOVERFLOW))?;
-        if end > base + reg.len {
-            return Err(Error::Io(libc::EFAULT));
+        for (idx, reg) in regs.iter().enumerate() {
+            let base = reg.base.as_ptr() as usize;
+            if start >= base && end <= base + reg.len {
+                return Ok(idx as u16);
+            }
         }
-        let off = start - base;
-        u32::try_from(off).map_err(|_| Error::Io(libc::EOVERFLOW))
+        Err(Error::Io(libc::EFAULT))
     }
 
     /// Wait (cooperatively) for a free submission slot, then push
@@ -340,22 +356,42 @@ impl BlockDevice for UringBlockDevice {
 
     fn register_buffers(&self, base: *mut u8, len: usize) -> Result<(), Error> {
         let nn = NonNull::new(base).ok_or(Error::Io(libc::EINVAL))?;
-        let iov = libc::iovec {
-            iov_base: base as *mut libc::c_void,
-            iov_len: len,
-        };
-        // SAFETY: caller owns `base..base+len` for the lifetime of
-        // the device per the BlockDevice contract. The kernel will
-        // hold the pages registered until the ring is dropped or
-        // `unregister_buffers` is called.
+        {
+            let regs = self.registered.borrow();
+            if regs.len() as u32 >= self.slot_capacity {
+                return Err(Error::Io(libc::ENOSPC));
+            }
+        }
+        // The io-uring 0.6 surface only exposes the "replace the
+        // whole table" form, so re-register every region every
+        // time. Registration is open-time only (no in-flight I/O),
+        // so the unregister-then-register window is fine.
+        let mut new_regs = self.registered.borrow().clone();
+        new_regs.push(RegisteredBuf { base: nn, len });
+        let iovs: Vec<libc::iovec> = new_regs
+            .iter()
+            .map(|r| libc::iovec {
+                iov_base: r.base.as_ptr() as *mut libc::c_void,
+                iov_len: r.len,
+            })
+            .collect();
+        // SAFETY: every (base, len) in `new_regs` was provided by a
+        // caller that owns the region for the lifetime of the
+        // device; we keep `new_regs` parallel to the kernel-side
+        // table.
         unsafe {
-            self.ring
-                .borrow()
-                .submitter()
-                .register_buffers(&[iov])
+            let submitter = self.ring.borrow();
+            let submitter = submitter.submitter();
+            // If there is already a table, drop it first; the
+            // kernel rejects a second `register_buffers` otherwise.
+            if !self.registered.borrow().is_empty() {
+                let _ = submitter.unregister_buffers();
+            }
+            submitter
+                .register_buffers(&iovs)
                 .map_err(io_err_to_storage)?;
         }
-        self.registered.set(Some(RegisteredBuf { base: nn, len }));
+        *self.registered.borrow_mut() = new_regs;
         Ok(())
     }
 
@@ -366,18 +402,17 @@ impl BlockDevice for UringBlockDevice {
         if lba.0 >= self.capacity_pages {
             return Err(Error::OutOfRange);
         }
-        // Bounds-check the destination against the registered
-        // region; READ_FIXED takes the raw pointer, not an offset,
-        // so the only purpose here is to fail loudly before the
-        // kernel does.
-        self.buffer_offset(dst.as_ptr(), dst.len())?;
+        // Locate which registered region holds `dst` so we can
+        // address it via READ_FIXED's buf_index. -EFAULT here
+        // surfaces as a clean Err rather than a kernel rejection.
+        let buf_index = self.resolve_buf_index(dst.as_ptr(), dst.len())?;
         let user_data = self.alloc_user_data();
         let offset = lba.0.saturating_mul(self.page_size as u64);
         let sqe = opcode::ReadFixed::new(
             types::Fixed(0),
             dst.as_mut_ptr(),
             dst.len() as u32,
-            0, /* buf_index */
+            buf_index,
         )
         .offset(offset)
         .build()
@@ -392,16 +427,15 @@ impl BlockDevice for UringBlockDevice {
         if lba.0 >= self.capacity_pages {
             return Err(Error::OutOfRange);
         }
-        // Bounds-check the source against the registered region;
-        // see [`Self::read`] for why we ignore the offset.
-        self.buffer_offset(src.as_ptr(), src.len())?;
+        // See [`Self::read`] for buf_index resolution.
+        let buf_index = self.resolve_buf_index(src.as_ptr(), src.len())?;
         let user_data = self.alloc_user_data();
         let offset = lba.0.saturating_mul(self.page_size as u64);
         let sqe = opcode::WriteFixed::new(
             types::Fixed(0),
             src.as_ptr(),
             src.len() as u32,
-            0, /* buf_index */
+            buf_index,
         )
         .offset(offset)
         .build()

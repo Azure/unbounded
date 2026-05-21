@@ -22,10 +22,11 @@
 //! [`arc_swap::ArcSwap`]. That keeps lookups honest - they
 //! exercise the exact disk path a fresh process would.
 
+use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::storage::alloc::Allocator;
-use crate::storage::blockdev::BlockDevice;
+use crate::storage::blockdev::{BlockDevice, ScratchPool};
 use crate::storage::btree::page::{self, Decoded, LeafEntry, max_internal_keys, max_leaf_entries};
 use crate::storage::types::{Error, Lba, PageKey};
 
@@ -40,23 +41,23 @@ const MAX_TRAVERSAL_NODES: u64 = 1 << 24;
 /// mismatches (the design's silent-miss policy).
 pub async fn lookup<B: BlockDevice>(
     device: &B,
+    scratch: &Rc<ScratchPool>,
     root_lba: Lba,
     key: &PageKey,
 ) -> Result<Option<LeafEntry>, Error> {
     if !root_lba.is_valid() {
         return Ok(None);
     }
-    let ps = device.page_size();
     let mut cur = root_lba;
-    let mut buf = vec![0u8; ps];
+    let mut buf = scratch.acquire().await;
     // Bound the descent by the worst-case depth so a cycle in
     // corrupted-but-checksum-valid pages can't loop forever.
     for _ in 0..32 {
-        match device.read(cur, &mut buf).await {
+        match device.read(cur, buf.as_mut_slice()).await {
             Ok(()) => {}
             Err(_) => return Ok(None),
         }
-        match page::decode(&buf) {
+        match page::decode(buf.as_slice()) {
             Decoded::Empty => return Ok(None),
             Decoded::Leaf { entries, .. } => {
                 // Linear scan; leaves are at most ~72 entries on
@@ -88,10 +89,11 @@ pub async fn lookup<B: BlockDevice>(
 /// hand in a visitor that records each `(key, value)`.
 pub async fn for_each_leaf<B: BlockDevice>(
     device: &B,
+    scratch: &Rc<ScratchPool>,
     root_lba: Lba,
     mut visit: impl FnMut(PageKey, LeafEntry, Lba),
 ) -> Result<(), Error> {
-    walk_tree(device, root_lba, |node, decoded| {
+    walk_tree(device, scratch, root_lba, |node, decoded| {
         if let Decoded::Leaf { entries, .. } = decoded {
             for (k, v) in entries {
                 visit(k, v, node);
@@ -103,9 +105,13 @@ pub async fn for_each_leaf<B: BlockDevice>(
 
 /// Collect every non-meta LBA reachable from `root_lba`. Used
 /// after open to seed the snapshot's "owned pages" list.
-pub async fn collect_pages<B: BlockDevice>(device: &B, root_lba: Lba) -> Result<Vec<Lba>, Error> {
+pub async fn collect_pages<B: BlockDevice>(
+    device: &B,
+    scratch: &Rc<ScratchPool>,
+    root_lba: Lba,
+) -> Result<Vec<Lba>, Error> {
     let mut out = Vec::new();
-    walk_tree(device, root_lba, |node, decoded| match decoded {
+    walk_tree(device, scratch, root_lba, |node, decoded| match decoded {
         Decoded::Leaf { .. } | Decoded::Internal { .. } => out.push(node),
         _ => {}
     })
@@ -119,7 +125,12 @@ pub async fn collect_pages<B: BlockDevice>(device: &B, root_lba: Lba) -> Result<
 /// [`MAX_TRAVERSAL_NODES`] and surfaced as `Error::Corrupt`.
 /// Internal-node children are enqueued for descent regardless of
 /// what the visitor does, so callers do not need to recurse.
-async fn walk_tree<B, F>(device: &B, root_lba: Lba, mut visitor: F) -> Result<(), Error>
+async fn walk_tree<B, F>(
+    device: &B,
+    scratch: &Rc<ScratchPool>,
+    root_lba: Lba,
+    mut visitor: F,
+) -> Result<(), Error>
 where
     B: BlockDevice,
     F: FnMut(Lba, Decoded),
@@ -127,19 +138,18 @@ where
     if !root_lba.is_valid() {
         return Ok(());
     }
-    let ps = device.page_size();
     let mut stack = vec![root_lba];
-    let mut buf = vec![0u8; ps];
+    let mut buf = scratch.acquire().await;
     let mut visited = 0u64;
     while let Some(node) = stack.pop() {
         visited += 1;
         if visited > MAX_TRAVERSAL_NODES {
             return Err(Error::Corrupt);
         }
-        if device.read(node, &mut buf).await.is_err() {
+        if device.read(node, buf.as_mut_slice()).await.is_err() {
             continue;
         }
-        let decoded = page::decode(&buf);
+        let decoded = page::decode(buf.as_slice());
         if let Decoded::Internal { ref children, .. } = decoded {
             for &c in children {
                 stack.push(c);
@@ -157,6 +167,7 @@ where
 /// owned by the new snapshot.
 pub async fn build_tree<B: BlockDevice>(
     device: &B,
+    scratch: &Rc<ScratchPool>,
     allocator: &Allocator,
     txn_id: u64,
     sorted_entries: &[(PageKey, LeafEntry)],
@@ -173,7 +184,7 @@ pub async fn build_tree<B: BlockDevice>(
         let lba = allocator.alloc()?;
         allocated.push(lba);
         let page = page::encode_empty_leaf(ps, txn_id);
-        write_or_unwind(device, allocator, lba, &page, &mut allocated).await?;
+        write_or_unwind(device, scratch, allocator, lba, &page, &mut allocated).await?;
         return Ok((lba, allocated));
     }
 
@@ -185,7 +196,7 @@ pub async fn build_tree<B: BlockDevice>(
         let lba = allocator.alloc()?;
         allocated.push(lba);
         let page = page::encode_leaf(ps, txn_id, chunk)?;
-        write_or_unwind(device, allocator, lba, &page, &mut allocated).await?;
+        write_or_unwind(device, scratch, allocator, lba, &page, &mut allocated).await?;
         current.push((chunk[0].0, lba));
     }
 
@@ -198,7 +209,7 @@ pub async fn build_tree<B: BlockDevice>(
             let lba = allocator.alloc()?;
             allocated.push(lba);
             let page = page::encode_internal(ps, txn_id, &keys, &children)?;
-            write_or_unwind(device, allocator, lba, &page, &mut allocated).await?;
+            write_or_unwind(device, scratch, allocator, lba, &page, &mut allocated).await?;
             next.push((chunk[0].0, lba));
         }
         current = next;
@@ -209,12 +220,21 @@ pub async fn build_tree<B: BlockDevice>(
 
 async fn write_or_unwind<B: BlockDevice>(
     device: &B,
+    scratch: &Rc<ScratchPool>,
     allocator: &Allocator,
     lba: Lba,
     page: &[u8],
     allocated: &mut Vec<Lba>,
 ) -> Result<(), Error> {
-    match device.write(lba, page).await {
+    // Copy the encoded page into a registered scratch buffer
+    // before submitting the write: io_uring's WRITE_FIXED path
+    // requires the buffer to lie inside a previously registered
+    // region, which heap `Vec` allocations do not.
+    let mut buf = scratch.acquire().await;
+    let slice = buf.as_mut_slice();
+    debug_assert_eq!(slice.len(), page.len());
+    slice.copy_from_slice(page);
+    match device.write(lba, slice).await {
         Ok(()) => Ok(()),
         Err(e) => {
             // Roll back every LBA we've allocated in this commit
