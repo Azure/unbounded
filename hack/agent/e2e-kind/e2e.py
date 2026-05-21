@@ -1316,8 +1316,6 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
     bootstrap_script_path.write_text(bootstrap_script)
     bootstrap_script_path.chmod(0o600)
     log(f"Bootstrap script written to {bootstrap_script_path}")
-    log("Bootstrap script contents:")
-    print(bootstrap_script, flush=True)
 
     # Wait for cloud-init and verify connectivity
     log("Waiting for cloud-init to complete on VM...")
