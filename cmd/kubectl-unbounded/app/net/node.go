@@ -572,7 +572,7 @@ func newNodeShowCommand(rt *pluginRuntime, baseFetch nodeStatusFetchOptions) *co
 					case "peer", "peers":
 						return printNodePeerings(w, status, node, peerName, useColor)
 					case "route", "routes":
-						return printNodeRoutes(w, node, useColor)
+						return printNodeRoutes(w, node, useColor, rt.interfaceNames)
 					case "bpf":
 						return printNodeBpf(w, node)
 					case "json":
@@ -618,7 +618,7 @@ func newNodeShowCommand(rt *pluginRuntime, baseFetch nodeStatusFetchOptions) *co
 
 				return printNodePeerings(cmd.OutOrStdout(), status, node, peerName, useColor)
 			case "route", "routes":
-				return printNodeRoutes(cmd.OutOrStdout(), node, useColor)
+				return printNodeRoutes(cmd.OutOrStdout(), node, useColor, rt.interfaceNames)
 			case "bpf":
 				return printNodeBpf(cmd.OutOrStdout(), node)
 			case "json":

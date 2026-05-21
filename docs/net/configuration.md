@@ -231,6 +231,7 @@ the configured MTU must be based on the smallest value: `1500 - 80 = 1420`.
 |------|------|---------|-------------|
 | `--wireguard-dir` | string | `/etc/wireguard` | Directory to store WireGuard keys. |
 | `--wireguard-port` | int | `51820` | WireGuard listen port. |
+| `--wireguard-interface-prefix` | string | `wg` | Prefix for per-port WireGuard interface names; runtime name is `<prefix><port>`. See [Tunnel interface names](#tunnel-interface-names). |
 
 ### GENEVE Configuration
 
@@ -238,7 +239,7 @@ the configured MTU must be based on the smallest value: `1500 - 80 = 1420`.
 |------|------|---------|-------------|
 | `--geneve-port` | int | `6081` | GENEVE UDP destination port. |
 | `--geneve-vni` | int | `1` | GENEVE Virtual Network Identifier. |
-| `--geneve-interface` | string | `geneve0` | Name of the GENEVE tunnel interface. |
+| `--geneve-interface` | string | `geneve0` | Shared flow-based GENEVE interface name. See [Tunnel interface names](#tunnel-interface-names). |
 
 GENEVE is the default tunnel type for links between peers that communicate over internal IPs only. It provides higher throughput than WireGuard on high-bandwidth links (100Gbps+) by eliminating encryption overhead. The `tunnelProtocol` field on CRD specs controls which encapsulation is used; when set to `Auto` (the default), links using external IPs use WireGuard and links using only internal IPs use GENEVE.
 
@@ -249,6 +250,7 @@ GENEVE is the default tunnel type for links between peers that communicate over 
 | `--vxlan-port` | int | `4789` | VXLAN UDP destination port. |
 | `--vxlan-src-port-low` | int | `47891` | VXLAN UDP source port range low bound. A narrow range reduces the number of distinct flows created from VMs, helping avoid flow table limits on cloud platforms. |
 | `--vxlan-src-port-high` | int | `47922` | VXLAN UDP source port range high bound. |
+| `--vxlan-interface` | string | `vxlan0` | Shared flow-based VXLAN interface name. See [Tunnel interface names](#tunnel-interface-names). |
 
 VXLAN uses a single external flow-based `vxlan0` interface. Similar to GENEVE but may benefit from hardware VXLAN offload on some network adapters.
 
@@ -256,7 +258,28 @@ The `--vxlan-src-port-low` and `--vxlan-src-port-high` flags constrain the ephem
 
 ### IPIP Configuration
 
-IPIP tunneling uses per-peer tunnel interfaces with minimal overhead (20 bytes). No additional configuration flags are required -- IPIP interfaces are created and managed automatically when `tunnelProtocol` is set to `IPIP`.
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--ipip-interface` | string | `ipip0` | Shared flow-based IPIP interface name. See [Tunnel interface names](#tunnel-interface-names). |
+
+IPIP tunneling uses a single external flow-based `ipip0` interface with minimal overhead (20 bytes). No additional protocol-specific flags are required -- IPIP entries are created and managed automatically when `tunnelProtocol` is set to `IPIP`.
+
+### Tunnel interface names
+
+The three shared tunnel device names (`geneve0`, `vxlan0`, `ipip0`) and the per-port WireGuard interface prefix (default `wg`, so per-peer names look like `wg51820`) are configurable via CLI flags (`--geneve-interface`, `--vxlan-interface`, `--ipip-interface`, `--wireguard-interface-prefix`) and matching YAML fields under `node:` (`geneveInterfaceName`, `vxlanInterfaceName`, `ipipInterfaceName`, `wireGuardInterfacePrefix`). Operators almost never need to change these; the flags exist for cases where the defaults collide with another network plugin or with site-local conventions.
+
+Constraints (enforced at startup; the agent fails to start otherwise):
+
+* Shared tunnel names (`--geneve-interface`, `--vxlan-interface`, `--ipip-interface`): non-empty, at most 15 bytes (Linux IFNAMSIZ limit), pairwise distinct, must not equal `unbounded0`.
+* WireGuard prefix (`--wireguard-interface-prefix`): non-empty, at most 10 bytes (so that `prefix + 5-digit UDP port` still fits in IFNAMSIZ), must not contain `/`, must not equal `unbounded0`.
+
+The dedicated `unbounded0` dummy interface used by the eBPF dataplane is not configurable.
+
+**Renaming an existing deployment**: when the agent starts and detects that a previously-managed device exists under a different name, it cleans up that device automatically, but only for devices it can confidently identify as having been created by a previous unbounded-net agent run:
+
+* GENEVE / VXLAN: deletes any flow-based `geneve` or `vxlan` device whose UDP port matches `--geneve-port` / `--vxlan-port` and whose name does not match the currently configured `<protocol>InterfaceName`. Matching on the configured port is what keeps the sweep safe when another CNI (e.g. Cilium) runs flow-based GENEVE/VXLAN encap on a different port.
+* IPIP: not swept automatically. The kernel IPIP external-mode device exposes no configuration field that lets the agent distinguish its own device from another agent's. If you rename `--ipip-interface`, remove the previous device manually: `sudo ip link del <old-name>`.
+* WireGuard: deletes any `wireguard` kernel device whose name matches the pattern `<some-alpha-prefix><ListenPort>` (the unbounded-net agent's naming convention) and whose ListenPort matches one we'd assign, but whose actual prefix differs from `--wireguard-interface-prefix`. Tooling that uses a different naming convention (e.g. Tailscale's `tailscale0`, a UUID-based name, or a plain `wg0`) is left alone.
 
 ### Tunnel Dataplane
 

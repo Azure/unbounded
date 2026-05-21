@@ -25,7 +25,17 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 	myGatewayPort := state.myGatewayPort
 
 	port := cfg.WireGuardPort
-	iface := fmt.Sprintf("wg%d", port)
+	iface := wireGuardInterfaceName(cfg, port)
+
+	// Remove any leftover WireGuard kernel devices whose name does not
+	// match the currently configured prefix. The kernel binds each WG
+	// device to a UDP port (wg51820 on port 51820, etc.), so if a previous
+	// agent run used --wireguard-interface-prefix=wg and we're now booting
+	// with a different prefix, the old wg<port> devices still own those
+	// listen ports and the new <prefix><port> devices fail to bring up
+	// with EADDRINUSE. Removing stale devices before any creation lets
+	// the prefix change converge in a single reconcile.
+	removeStaleWireGuardInterfaces(cfg)
 
 	// Detect the tunnel MTU once for all interfaces in this reconciliation.
 	// MTU = default-route interface MTU minus WireGuard encapsulation overhead.
@@ -339,7 +349,7 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 
 		gwPort := int(gwPeer.GatewayWireguardPort)
 
-		gwIfaceName := fmt.Sprintf("wg%d", gwPort)
+		gwIfaceName := wireGuardInterfaceName(cfg, gwPort)
 		desiredGatewayIfaces[gwIfaceName] = true
 		desiredGatewayPolicyTables[gwIfaceName] = gwPort
 
@@ -598,7 +608,9 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 	wgHCPeers := registerPeersWithHealthCheck(peers, gatewayPeers, mySiteName, isGatewayNode,
 		siteHealthCheckProfileNames, peeringSiteHealthCheckProfileNames,
 		assignmentSiteHealthCheckProfileNames, assignmentPoolHealthCheckProfileNames,
-		poolHealthCheckProfileNames, state, peerIfaceNameWireGuard, false)
+		poolHealthCheckProfileNames, state,
+		func(gw gatewayPeerInfo) string { return peerIfaceNameWireGuard(cfg, gw) },
+		false)
 
 	// Remove peers that are no longer desired (preserve GENEVE HC peers)
 	if state.healthCheckManager != nil {

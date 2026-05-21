@@ -49,12 +49,19 @@ func TestEndpointHostAndWireGuardInterfaceName(t *testing.T) {
 		}
 	}
 
-	if !isWireGuardInterfaceName("wg0") || !isWireGuardInterfaceName("WG1") {
-		t.Fatalf("expected wg-prefixed interface names to match")
+	ifaceNames := routeplan.InterfaceNames{
+		WireGuardPrefix: "wg",
+		Geneve:          "geneve0",
+		VXLAN:           "vxlan0",
+		IPIP:            "ipip0",
 	}
 
-	if isWireGuardInterfaceName("eth0") {
-		t.Fatalf("expected non-wg interface name to not match")
+	if !ifaceNames.IsTunnelInterface("wg0") {
+		t.Fatalf("expected wg-prefixed interface name to be classified as a tunnel interface")
+	}
+
+	if ifaceNames.IsTunnelInterface("eth0") {
+		t.Fatalf("expected non-tunnel interface name to not be classified as a tunnel interface")
 	}
 }
 
@@ -143,7 +150,14 @@ func TestBuildUnexpectedRouteOutputAndExplainPeerDecisions(t *testing.T) {
 
 	expectedIPv4 := []expectedRoute{{Destination: "10.0.0.0/24", Gateway: "10.0.0.1", Device: "wg0", Weight: 10, Family: 4}}
 
-	unexpectedIPv4, unexpectedIPv6 := buildUnexpectedRouteOutput(target, expectedIPv4, nil)
+	ifaceNames := routeplan.InterfaceNames{
+		WireGuardPrefix: "wg",
+		Geneve:          "geneve0",
+		VXLAN:           "vxlan0",
+		IPIP:            "ipip0",
+	}
+
+	unexpectedIPv4, unexpectedIPv6 := buildUnexpectedRouteOutput(target, expectedIPv4, nil, ifaceNames)
 	if len(unexpectedIPv6) != 0 {
 		t.Fatalf("expected no unexpected IPv6 routes, got %#v", unexpectedIPv6)
 	}
@@ -222,9 +236,16 @@ func TestBuildExpectedRouteOutputAndExpectedDestinationsForPeer(t *testing.T) {
 		t.Fatalf("expected expectedDestinationsForPeer to return entries")
 	}
 
-	ipv4Routes, _ := routeplan.BuildExpectedWireGuardRoutes(peers, nodesByName)
+	ifaceNames := routeplan.InterfaceNames{
+		WireGuardPrefix: "wg",
+		Geneve:          "geneve0",
+		VXLAN:           "vxlan0",
+		IPIP:            "ipip0",
+	}
 
-	output := buildExpectedRouteOutput(ipv4Routes, peers, nodesByName)
+	ipv4Routes, _ := routeplan.BuildExpectedWireGuardRoutes(peers, nodesByName, ifaceNames)
+
+	output := buildExpectedRouteOutput(ipv4Routes, peers, nodesByName, ifaceNames)
 	if len(output) == 0 {
 		t.Fatalf("expected buildExpectedRouteOutput to return routes")
 	}

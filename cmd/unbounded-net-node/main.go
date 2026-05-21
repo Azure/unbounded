@@ -105,7 +105,10 @@ type config struct {
 	FullSyncEvery                 time.Duration // Forced full status sync interval; ensures controller has complete status periodically
 	GenevePort                    int           // GENEVE UDP destination port (default 6081)
 	GeneveVNI                     int           // GENEVE Virtual Network Identifier (default 1)
-	GeneveInterfaceName           string        // GENEVE interface name (default geneve0)
+	GeneveInterfaceName           string        // GENEVE shared tunnel interface name (default geneve0)
+	VXLANInterfaceName            string        // VXLAN shared tunnel interface name (default vxlan0)
+	IPIPInterfaceName             string        // IPIP shared tunnel interface name (default ipip0)
+	WireGuardInterfacePrefix      string        // Prefix for per-port WireGuard interfaces (default "wg"; per-peer name is <prefix><port>)
 	VXLANPort                     int           // VXLAN UDP destination port (default 4789)
 	VXLANSrcPortLow               int           // VXLAN UDP source port range low (default 47891)
 	VXLANSrcPortHigh              int           // VXLAN UDP source port range high (default 47922)
@@ -212,6 +215,9 @@ func main() {
 		GenevePort:                    6081,
 		GeneveVNI:                     1,
 		GeneveInterfaceName:           "geneve0",
+		VXLANInterfaceName:            "vxlan0",
+		IPIPInterfaceName:             "ipip0",
+		WireGuardInterfacePrefix:      "wg",
 		VXLANPort:                     4789,
 		VXLANSrcPortLow:               47891,
 		VXLANSrcPortHigh:              47922,
@@ -270,10 +276,16 @@ then annotates the node with the public key.`,
 	flags.IntVar(&cfg.WireGuardPort, "wireguard-port", 51820, "WireGuard listen port")
 	flags.BoolVar(&cfg.EnablePolicyRouting, "enable-policy-routing", false, "Enable policy-based routing on gateway interfaces (deprecated, UNBOUNDED-FORWARD chain rules replace PBR)")
 
-	// GENEVE configuration flags
+	// Tunnel-interface configuration flags. All three shared tunnel device
+	// names must be non-empty, distinct, and must not collide with
+	// "unbounded0" (the agent's eBPF dummy device). Kernel interface names
+	// are limited to 15 bytes.
 	flags.IntVar(&cfg.GenevePort, "geneve-port", 6081, "GENEVE UDP destination port")
 	flags.IntVar(&cfg.GeneveVNI, "geneve-vni", 1, "GENEVE Virtual Network Identifier")
-	flags.StringVar(&cfg.GeneveInterfaceName, "geneve-interface", "geneve0", "GENEVE interface name (empty = disabled)")
+	flags.StringVar(&cfg.GeneveInterfaceName, "geneve-interface", "geneve0", "Shared flow-based GENEVE interface name")
+	flags.StringVar(&cfg.VXLANInterfaceName, "vxlan-interface", "vxlan0", "Shared flow-based VXLAN interface name")
+	flags.StringVar(&cfg.IPIPInterfaceName, "ipip-interface", "ipip0", "Shared flow-based IPIP interface name")
+	flags.StringVar(&cfg.WireGuardInterfacePrefix, "wireguard-interface-prefix", "wg", "Prefix for per-port WireGuard interfaces; runtime name is <prefix><port>")
 	flags.IntVar(&cfg.VXLANPort, "vxlan-port", 4789, "VXLAN UDP destination port")
 	flags.IntVar(&cfg.VXLANSrcPortLow, "vxlan-src-port-low", 47891, "VXLAN UDP source port range low (narrow range reduces VM flow count in cloud platforms)")
 	flags.IntVar(&cfg.VXLANSrcPortHigh, "vxlan-src-port-high", 47922, "VXLAN UDP source port range high (narrow range reduces VM flow count in cloud platforms)")
@@ -542,6 +554,22 @@ func applyNodeRuntimeConfig(cmd *cobra.Command, cfg *config) error {
 		cfg.VXLANSrcPortHigh = *nodeCfg.VXLANSrcPortHigh
 	}
 
+	if !flags.Changed("geneve-interface") && nodeCfg.GeneveInterfaceName != "" {
+		cfg.GeneveInterfaceName = nodeCfg.GeneveInterfaceName
+	}
+
+	if !flags.Changed("vxlan-interface") && nodeCfg.VXLANInterfaceName != "" {
+		cfg.VXLANInterfaceName = nodeCfg.VXLANInterfaceName
+	}
+
+	if !flags.Changed("ipip-interface") && nodeCfg.IPIPInterfaceName != "" {
+		cfg.IPIPInterfaceName = nodeCfg.IPIPInterfaceName
+	}
+
+	if !flags.Changed("wireguard-interface-prefix") && nodeCfg.WireGuardInterfacePrefix != "" {
+		cfg.WireGuardInterfacePrefix = nodeCfg.WireGuardInterfacePrefix
+	}
+
 	// Validate and default tunnelIPFamily
 	switch cfg.TunnelIPFamily {
 	case "IPv4", "IPv6":
@@ -550,6 +578,14 @@ func applyNodeRuntimeConfig(cmd *cobra.Command, cfg *config) error {
 		cfg.TunnelIPFamily = "IPv4"
 	default:
 		return fmt.Errorf("invalid tunnel-ip-family %q: must be 'IPv4' or 'IPv6'", cfg.TunnelIPFamily)
+	}
+
+	if err := validateTunnelInterfaceNames(cfg.GeneveInterfaceName, cfg.VXLANInterfaceName, cfg.IPIPInterfaceName); err != nil {
+		return err
+	}
+
+	if err := validateWireGuardInterfacePrefix(cfg.WireGuardInterfacePrefix); err != nil {
+		return err
 	}
 
 	// Normalize MTU: treat 0 as 1280 (the IPv6 minimum, safe for all links).

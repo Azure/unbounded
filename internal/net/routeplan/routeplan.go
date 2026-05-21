@@ -628,14 +628,16 @@ func normalizeEndpointHost(endpoint string) string {
 }
 
 // BuildExpectedWireGuardRoutes builds expected IPv4 and IPv6 WireGuard routes.
-func BuildExpectedWireGuardRoutes(peers []Peer, nodesByName map[string]Node) ([]ExpectedRoute, []ExpectedRoute) {
+// ifaceNames declares which peer.Interface values are considered managed
+// tunnel devices.
+func BuildExpectedWireGuardRoutes(peers []Peer, nodesByName map[string]Node, ifaceNames InterfaceNames) ([]ExpectedRoute, []ExpectedRoute) {
 	ipv4Routes := make([]ExpectedRoute, 0)
 	ipv6Routes := make([]ExpectedRoute, 0)
 	seen := make(map[string]struct{})
 
 	for _, peer := range peers {
 		iface := strings.TrimSpace(peer.Interface)
-		if !isWireGuardInterfaceName(iface) {
+		if !ifaceNames.IsTunnelInterface(iface) {
 			continue
 		}
 
@@ -1580,17 +1582,35 @@ func dedupeStrings(values []string) []string {
 	return out
 }
 
-func isWireGuardInterfaceName(device string) bool {
-	return isTunnelInterfaceName(device)
+// InterfaceNames captures the runtime-configurable tunnel interface names
+// used by the node agent. Callers in cmd/unbounded-net-node populate it
+// from the merged CLI/YAML config and pass it into routeplan helpers that
+// need to decide whether a peer.Interface value belongs to a managed
+// tunnel device.
+type InterfaceNames struct {
+	WireGuardPrefix string
+	Geneve          string
+	VXLAN           string
+	IPIP            string
 }
 
-// isTunnelInterfaceName returns true for any managed tunnel interface:
-// WireGuard (wg*), GENEVE (gn*), VXLAN (vxlan*), and IPIP (ipip*).
-func isTunnelInterfaceName(device string) bool {
-	dev := strings.ToLower(strings.TrimSpace(device))
+// IsTunnelInterface reports whether device is one of the managed tunnel
+// interfaces: a per-port WireGuard device (HasPrefix(WireGuardPrefix)) or
+// one of the three shared flow-based tunnel devices (exact-match).
+func (n InterfaceNames) IsTunnelInterface(device string) bool {
+	dev := strings.TrimSpace(device)
+	if dev == "" {
+		return false
+	}
 
-	return strings.HasPrefix(dev, "wg") ||
-		strings.HasPrefix(dev, "gn") ||
-		strings.HasPrefix(dev, "vxlan") ||
-		strings.HasPrefix(dev, "ipip")
+	if n.WireGuardPrefix != "" && strings.HasPrefix(dev, n.WireGuardPrefix) {
+		return true
+	}
+
+	switch dev {
+	case n.Geneve, n.VXLAN, n.IPIP:
+		return dev != ""
+	}
+
+	return false
 }

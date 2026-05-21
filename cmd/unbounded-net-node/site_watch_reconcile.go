@@ -48,7 +48,7 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 	privKey := strings.TrimSpace(string(privKeyData))
 
 	// Initialize link manager for interface operations
-	linkManager := unboundednetnetlink.NewLinkManager(fmt.Sprintf("wg%d", cfg.WireGuardPort))
+	linkManager := unboundednetnetlink.NewLinkManager(wireGuardInterfaceName(cfg, cfg.WireGuardPort))
 
 	// Track current state with netlink managers
 	wgCollector := unboundednetnetlink.NewWireGuardCollector()
@@ -76,7 +76,7 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 		_ = unboundednetnetlink.RemoveIPRule(cfg.RouteTableID, 32765, 0, 0) //nolint:errcheck
 	}
 
-	routeManager := unboundednetnetlink.NewUnifiedRouteManager(fmt.Sprintf("wg%d", cfg.WireGuardPort), 0)
+	routeManager := unboundednetnetlink.NewUnifiedRouteManager(wireGuardInterfaceName(cfg, cfg.WireGuardPort), 0, cfg.WireGuardInterfacePrefix, unbounded0DeviceName)
 	routeManager.SetNetlinkCache(netlinkCache)
 	state.routeManager = routeManager
 	state.routeTableID = cfg.RouteTableID
@@ -166,7 +166,7 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 	// This prevents pods (with 1500-byte veth MTU) from advertising an MSS that
 	// exceeds the WireGuard tunnel MTU, which would cause silent drops of large
 	// TCP responses (e.g., TLS ServerHello) at gateway forwarding hops.
-	mssClampMgr, err := unboundednetnetlink.NewMSSClampManager()
+	mssClampMgr, err := unboundednetnetlink.NewMSSClampManager(cfg.WireGuardInterfacePrefix)
 	if err != nil {
 		klog.Warningf("Failed to create MSS clamp manager (MSS clamping will be disabled): %v", err)
 	} else {
@@ -642,7 +642,7 @@ func cleanupNodeNetworkingOnShutdown(cfg *config, state *wireGuardState) {
 		} else {
 			for _, link := range links {
 				name := link.Attrs().Name
-				if !isManagedTunnelInterface(name) {
+				if !isManagedTunnelInterface(cfg, name) {
 					continue
 				}
 
@@ -2035,8 +2035,8 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 
 	addWireGuardPeersToBPFMap(cfg, state, wgMeshPeers, wgGatewayPeers)
 	reconcilePendingBPFEntries(state)
-	cleanupUnusedTunnelDevices(peers, gatewayPeers, wgGatewayPeers, state.forwardManager, state.notrackManager)
-	reapplyRPFilterOnActiveTunnels(peers, gatewayPeers, wgGatewayPeers, state.forwardManager, state.isGatewayNode, state.notrackManager)
+	cleanupUnusedTunnelDevices(cfg, peers, gatewayPeers, wgGatewayPeers, state.forwardManager, state.notrackManager)
+	reapplyRPFilterOnActiveTunnels(cfg, peers, gatewayPeers, wgGatewayPeers, state.forwardManager, state.isGatewayNode, state.notrackManager)
 
 	// Reconcile notrack rules for conntrack bypass on gateway nodes.
 	if state.notrackManager != nil {
