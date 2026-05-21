@@ -137,7 +137,7 @@ REACT_DEV ?= false
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-manifests
 .PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-net-controller-local image-net-node-local images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
-.PHONY: unbounded-storage unbounded-storage-build unbounded-storage-test unbounded-storage-check unbounded-storage-model-check mercury mercury-clean
+.PHONY: unbounded-storage unbounded-storage-build bench unbounded-storage-test unbounded-storage-check unbounded-storage-model-check mercury mercury-clean
 
 ##@ General
 
@@ -186,6 +186,7 @@ help: ## Show this help
 	@echo ""
 	@echo "Rust Binaries:"
 	@echo "  unbounded-storage | unbounded-storage-build  Build unbounded-storage (with/without test)"
+	@echo "  bench                            Build the bench tool (excluded from images)"
 	@echo "  unbounded-storage-test           Run cargo tests for unbounded-storage"
 	@echo "  unbounded-storage-check          Run cargo check for unbounded-storage"
 	@echo "  unbounded-storage-model-check    Run TLC on the CoW B+tree crash-consistency model"
@@ -497,6 +498,11 @@ unbounded-storage-build: mercury ## Build the unbounded-storage binary (no test)
 	cp $(UNBOUNDED_STORAGE_CRATE)/target/release/unbounded-storage $(UNBOUNDED_STORAGE_BIN)
 
 unbounded-storage: unbounded-storage-test unbounded-storage-build ## Build the unbounded-storage binary (implies test)
+
+bench: mercury ## Build the bench tool (excluded from images)
+	$(UNBOUNDED_STORAGE_ENV) $(CARGO) build --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --release --locked --bin bench
+	@mkdir -p $(dir $(UNBOUNDED_STORAGE_BIN))
+	cp $(UNBOUNDED_STORAGE_CRATE)/target/release/bench bin/bench
 
 # TLA+ tooling for the unbounded-storage CoW B+tree crash-consistency model.
 # tla2tools.jar is fetched on demand into tmp/ (gitignored).  Override

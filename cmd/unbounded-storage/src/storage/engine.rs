@@ -56,6 +56,10 @@ pub struct EngineConfig {
     pub admission_sketch_multiplier: usize,
     pub singleflight_shards: usize,
     pub restart_scan_queue_depth: u32,
+    /// When true, `write_page` skips AdmissionFilter::should_admit
+    /// and always proceeds. Intended for benchmarking/tooling;
+    /// production should leave this false.
+    pub bypass_admission: bool,
 }
 
 impl Default for EngineConfig {
@@ -70,6 +74,7 @@ impl Default for EngineConfig {
             admission_sketch_multiplier: 2,
             singleflight_shards: 64,
             restart_scan_queue_depth: 256,
+            bypass_admission: false,
         }
     }
 }
@@ -508,7 +513,7 @@ impl<B: BlockDevice> StorageEngine<B> {
     ) -> Result<(), bufferpool::Error> {
         let pk = Self::page_key(&key, stripe_off, self.cfg.page_size_bytes);
 
-        if !self.admission.should_admit(&pk) {
+        if !self.cfg.bypass_admission && !self.admission.should_admit(&pk) {
             self.metric(|m| m.rejected_by_filter += 1);
             return Ok(());
         }
@@ -876,6 +881,45 @@ mod tests {
     }
 
     #[test]
+    fn bypass_admission_admits_first_touch() {
+        // With bypass_admission = true, a single write to a fresh
+        // key skips the doorkeeper rejection and goes through to
+        // singleflight + alloc + device write.
+        let device = Arc::new(MockDevice::new(MockDeviceConfig {
+            page_size: 4096,
+            capacity_pages: 64,
+            ..Default::default()
+        }));
+        let cfg = EngineConfig {
+            page_size_bytes: 4096,
+            btree_page_bytes: 4096,
+            bypass_admission: true,
+            ..Default::default()
+        };
+        let eng = Arc::new(block_on(StorageEngine::open(device, cfg)).unwrap());
+        let buf: Box<[u8]> = vec![0u8; 4096 * 64].into_boxed_slice();
+        eng.register_pages(buf.as_ptr() as *mut u8, 4096, 64)
+            .unwrap();
+
+        let eng_body = eng.clone();
+        let mutator = eng.clone().run_mutator();
+        let mut mutator = pin!(mutator);
+        let body = async move {
+            let src = PageRef {
+                page_idx: 0,
+                offset: 0,
+                len: 4096,
+            };
+            eng_body.write_page(stripe(11), 0, src).await.unwrap();
+            let s = eng_body.snapshot();
+            assert_eq!(s.admitted, 1);
+            assert_eq!(s.rejected_by_filter, 0);
+            eng_body.close_mutator();
+        };
+        block_on_pair(body, mutator.as_mut());
+    }
+
+    #[test]
     fn checksum_mismatch_reports_miss() {
         let (eng, buf) = engine(64);
         let eng_body = eng.clone();
@@ -915,6 +959,67 @@ mod tests {
             assert!(eng_body.snapshot().checksum_misses >= 1);
             eng_body.close_mutator();
             let _ = buf;
+        };
+        block_on_pair(body, mutator.as_mut());
+    }
+
+    /// Stand-in for the `bench storage block` executor + workload when
+    /// hugepages are not available on the host: drive ~64 writes
+    /// followed by ~64 reads through a `bypass_admission` engine
+    /// over `MockDevice` and assert the bench's success criteria
+    /// (ops produced, no errors, every read is a cache hit).
+    #[test]
+    fn bench_mock_write_then_read_roundtrip() {
+        const PAGES: usize = 64;
+        const PAGE: usize = 4096;
+        let device = Arc::new(MockDevice::new(MockDeviceConfig {
+            page_size: PAGE,
+            capacity_pages: 256,
+            ..Default::default()
+        }));
+        let cfg = EngineConfig {
+            page_size_bytes: PAGE,
+            btree_page_bytes: PAGE,
+            bypass_admission: true,
+            ..Default::default()
+        };
+        let eng = Arc::new(block_on(StorageEngine::open(device, cfg)).unwrap());
+        let buf: Box<[u8]> = vec![0u8; PAGE * PAGES].into_boxed_slice();
+        eng.register_pages(buf.as_ptr() as *mut u8, PAGE, PAGES)
+            .unwrap();
+
+        let eng_body = eng.clone();
+        let mutator = eng.clone().run_mutator();
+        let mut mutator = pin!(mutator);
+        let body = async move {
+            let src = PageRef {
+                page_idx: 0,
+                offset: 0,
+                len: PAGE as u32,
+            };
+            // Phase 1: 64 writes against distinct keys.
+            for i in 0..PAGES as u8 {
+                eng_body.write_page(stripe(i), 0, src).await.unwrap();
+            }
+            let s = eng_body.snapshot();
+            assert_eq!(s.admitted, PAGES as u64);
+            assert_eq!(s.write_io_errors, 0);
+
+            // Phase 2: read every key back. Each must hit.
+            let dst = PageRef {
+                page_idx: 1,
+                offset: 0,
+                len: PAGE as u32,
+            };
+            for i in 0..PAGES as u8 {
+                let hit = eng_body.read_page(stripe(i), 0, dst).await.unwrap();
+                assert!(hit, "miss on key {i}");
+            }
+            let s = eng_body.snapshot();
+            assert_eq!(s.hits, PAGES as u64);
+            assert_eq!(s.read_io_errors, 0);
+            assert_eq!(s.checksum_misses, 0);
+            eng_body.close_mutator();
         };
         block_on_pair(body, mutator.as_mut());
     }

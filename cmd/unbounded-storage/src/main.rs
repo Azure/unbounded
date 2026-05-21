@@ -1,8 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-mod backing;
-
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -18,7 +16,7 @@ use unbounded_storage::mercury::{Class, MercuryTransport, PeerEntry, StaticPeer,
 use unbounded_storage::runtime::{PinnedRuntime, Threading, WorkerIdx, WorkerSpec};
 use unbounded_storage::topology::{self, Host, Plan, Role, Worker};
 
-use crate::backing::{BackingKind, BackingRequest, HUGEPAGE_2MB, allocate};
+use unbounded_storage::backing::{BackingKind, BackingRequest, HUGEPAGE_2MB, allocate};
 
 const PROGRESS_POLL_MS: u32 = 100;
 const MAX_INFLIGHT: usize = 1024;
