@@ -98,8 +98,34 @@ Kubernetes join configuration.
 | `provider` | string | For external operations | -- | External control provider. Supported values: `AzureVM`, `OCIInstance`. |
 | `providerID` | string | For external operations | -- | Provider-specific resource ID such as `azure:///subscriptions/.../virtualMachines/name` or `oci://ocid1.instance...`. |
 
-Azure VM operations use `DefaultAzureCredential`, so the `machine-ops-controller` deployment can authenticate with workload identity, managed identity, or environment-based Azure credentials.
-OCI operations use an OCI SDK config file mounted into the `machine-ops-controller` deployment.
+Machine operation credentials are selected by the Machine site label. Providers that support OIDC/workload identity use `WorkloadIdentity`; providers or sites that need provider-specific credential material use `ExternalPlugin` with a referenced Secret.
+
+```yaml
+apiVersion: unbounded-cloud.io/v1alpha3
+kind: MachineOperationCredential
+metadata:
+  name: remote-azure
+spec:
+  siteName: remote
+  provider: AzureVM
+  auth:
+    mode: WorkloadIdentity
+```
+
+```yaml
+apiVersion: unbounded-cloud.io/v1alpha3
+kind: MachineOperationCredential
+metadata:
+  name: remote-oci
+spec:
+  siteName: remote
+  provider: OCIInstance
+  auth:
+    mode: ExternalPlugin
+    secretRef:
+      namespace: unbounded-kube
+      name: remote-oci-auth
+```
 
 ## MachineOperation
 

@@ -16,6 +16,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	netv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 	"github.com/Azure/unbounded/internal/provision"
 )
 
@@ -68,6 +69,42 @@ func Test_buildMachineCR_NilLabelsAndTaints(t *testing.T) {
 
 	assert.Nil(t, machine.Spec.Kubernetes.NodeLabels)
 	assert.Nil(t, machine.Spec.Kubernetes.RegisterWithTaints)
+}
+
+func Test_buildMachineCR_SiteLabelFromKubeletMachineSiteLabel(t *testing.T) {
+	cfg := baseConfig()
+	cfg.Kubelet.Labels = map[string]string{
+		"env":                        "test",
+		v1alpha3.MachineSiteLabelKey: "site-a",
+	}
+	machine := buildMachineCR(cfg)
+
+	require.NotNil(t, machine.Labels)
+	assert.Equal(t, "site-a", machine.Labels[v1alpha3.MachineSiteLabelKey])
+}
+
+func Test_buildMachineCR_SiteLabelFromKubeletNetSiteLabel(t *testing.T) {
+	cfg := baseConfig()
+	cfg.Kubelet.Labels = map[string]string{
+		"env":                    "test",
+		netv1alpha1.SiteLabelKey: "site-a",
+	}
+	machine := buildMachineCR(cfg)
+
+	require.NotNil(t, machine.Labels)
+	assert.Equal(t, "site-a", machine.Labels[v1alpha3.MachineSiteLabelKey])
+}
+
+func Test_buildMachineCR_MachineSiteLabelTakesPrecedence(t *testing.T) {
+	cfg := baseConfig()
+	cfg.Kubelet.Labels = map[string]string{
+		v1alpha3.MachineSiteLabelKey: "machine-site",
+		netv1alpha1.SiteLabelKey:     "net-site",
+	}
+	machine := buildMachineCR(cfg)
+
+	require.NotNil(t, machine.Labels)
+	assert.Equal(t, "machine-site", machine.Labels[v1alpha3.MachineSiteLabelKey])
 }
 
 // ---------------------------------------------------------------------------

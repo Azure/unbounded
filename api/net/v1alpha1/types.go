@@ -8,6 +8,11 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
+const (
+	// SiteLabelKey identifies the site a Node belongs to.
+	SiteLabelKey = "net.unbounded-cloud.io/site"
+)
+
 // +genclient
 // +genclient:nonNamespaced
 // +kubebuilder:resource:scope=Cluster,shortName=st
