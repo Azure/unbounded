@@ -12,7 +12,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -23,6 +22,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	publicmachineops "github.com/Azure/unbounded/pkg/machineops"
 )
 
 const (
@@ -30,44 +30,24 @@ const (
 )
 
 // OperationRequest is the generic provider-facing view of a MachineOperation.
-type OperationRequest struct {
-	Machine         *unboundedv1alpha3.Machine
-	OperationName   string
-	OperationUID    types.UID
-	ProviderID      string
-	Operation       unboundedv1alpha3.OperationKind
-	Parameters      map[string]string
-	ReplaceUserData string
-	Auth            *OperationAuth
-}
+type OperationRequest = publicmachineops.OperationRequest
 
-// OperationAuth is the provider-facing credential material resolved for an
-// operation. Provider packages own the interpretation of SecretData.
-type OperationAuth struct {
-	Mode       unboundedv1alpha3.MachineOperationCredentialAuthMode
-	SecretData map[string]string
-}
+// OperationAuth is the provider-facing credential material resolved for an operation.
+type OperationAuth = publicmachineops.OperationAuth
 
-// OperationResult describes provider-side changes that must be reflected after
-// execution, such as replacement of an underlying cloud resource identity.
-type OperationResult struct {
-	ProviderID        string
-	CleanupProviderID string
-}
+// OperationResult describes provider-side changes that must be reflected after execution.
+type OperationResult = publicmachineops.OperationResult
 
 // Provider executes MachineOperation requests for a specific external provider.
-type Provider interface {
-	Name() string
-	Supports(operation unboundedv1alpha3.OperationKind) bool
-	Execute(ctx context.Context, request OperationRequest) (OperationResult, error)
-	Cleanup(ctx context.Context, request OperationRequest, result OperationResult) error
-}
+type Provider = publicmachineops.Provider
 
 // MachineOperationReconciler reconciles MachineOperation objects that target
 // externally controlled machines.
 type MachineOperationReconciler struct {
 	client.Client
 	Providers                 []Provider
+	SiteName                  string
+	ProviderName              string
 	MaxConcurrentReconciles   int
 	Now                       func() metav1.Time
 	ClusterInfo               *ClusterInfo
@@ -114,6 +94,19 @@ func (r *MachineOperationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		}
 
 		return ctrl.Result{}, fmt.Errorf("get Machine %s: %w", op.Spec.MachineRef, err)
+	}
+
+	if !r.ownsMachine(&machine) {
+		logger.V(1).Info("operation not owned by this external power controller",
+			"operation", op.Name,
+			"operationKind", op.Spec.OperationKind,
+			"machine", machine.Name,
+			"machineSite", siteNameFromLabels(machine.Labels),
+			"machineProvider", machine.Spec.Provider,
+			"controllerSite", r.SiteName,
+			"controllerProvider", r.ProviderName)
+
+		return ctrl.Result{}, nil
 	}
 
 	providerMatch := r.providerFor(&machine, op.Spec.OperationKind)
@@ -356,6 +349,18 @@ func (r *MachineOperationReconciler) providerFor(machine *unboundedv1alpha3.Mach
 	}
 
 	return matched
+}
+
+func (r *MachineOperationReconciler) ownsMachine(machine *unboundedv1alpha3.Machine) bool {
+	if r.SiteName != "" && siteNameFromLabels(machine.Labels) != r.SiteName {
+		return false
+	}
+
+	if r.ProviderName != "" && machine.Spec.Provider != r.ProviderName {
+		return false
+	}
+
+	return true
 }
 
 func (r *MachineOperationReconciler) reconcileTerminal(ctx context.Context, op *unboundedv1alpha3.MachineOperation) (ctrl.Result, error) {

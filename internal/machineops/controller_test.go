@@ -54,6 +54,62 @@ func TestMachineOperationReconciler_CompletesSupportedOperation(t *testing.T) {
 	require.Equal(t, metav1.ConditionTrue, cond.Status)
 }
 
+func TestMachineOperationReconciler_SkipsOperationForDifferentSite(t *testing.T) {
+	t.Parallel()
+
+	s := newOperationTestScheme(t)
+	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
+	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReboot)
+	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReboot: true}}
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op).WithStatusSubresource(op).Build()
+	reconciler := &MachineOperationReconciler{
+		Client:       c,
+		Providers:    []Provider{provider},
+		SiteName:     "site-b",
+		ProviderName: unboundedv1alpha3.ExternalProviderAzureVM,
+		Now:          fixedOperationNow,
+	}
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "op-1"}})
+	require.NoError(t, err)
+	require.Equal(t, ctrl.Result{}, result)
+	require.Empty(t, provider.calls)
+
+	var updated unboundedv1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
+	require.Empty(t, updated.Status.Phase)
+	require.Empty(t, updated.Status.Conditions)
+}
+
+func TestMachineOperationReconciler_SkipsOperationForDifferentProviderScope(t *testing.T) {
+	t.Parallel()
+
+	s := newOperationTestScheme(t)
+	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderOCIInstance)
+	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReboot)
+	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReboot: true}}
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op).WithStatusSubresource(op).Build()
+	reconciler := &MachineOperationReconciler{
+		Client:       c,
+		Providers:    []Provider{provider},
+		SiteName:     "site-a",
+		ProviderName: unboundedv1alpha3.ExternalProviderAzureVM,
+		Now:          fixedOperationNow,
+	}
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "op-1"}})
+	require.NoError(t, err)
+	require.Equal(t, ctrl.Result{}, result)
+	require.Empty(t, provider.calls)
+
+	var updated unboundedv1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
+	require.Empty(t, updated.Status.Phase)
+	require.Empty(t, updated.Status.Conditions)
+}
+
 func TestMachineOperationReconciler_ResolvesSiteCredential(t *testing.T) {
 	t.Parallel()
 
@@ -111,19 +167,35 @@ func TestOperationAuthTargetForUsesNetSiteLabel(t *testing.T) {
 	require.Equal(t, unboundedv1alpha3.ExternalProviderAzureVM, target.Provider)
 }
 
-func TestOperationAuthTargetForPrefersMachineSiteLabel(t *testing.T) {
+func TestOperationAuthTargetForAcceptsMatchingSiteLabels(t *testing.T) {
 	t.Parallel()
 
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
 	machine.Labels = map[string]string{
-		unboundedv1alpha3.MachineSiteLabelKey: "machine-site",
-		netv1alpha1.SiteLabelKey:              "net-site",
+		unboundedv1alpha3.MachineSiteLabelKey: "site-a",
+		netv1alpha1.SiteLabelKey:              "site-a",
 	}
 
 	target, failure := operationAuthTargetFor(machine)
 
 	require.Nil(t, failure)
-	require.Equal(t, "machine-site", target.SiteName)
+	require.Equal(t, "site-a", target.SiteName)
+}
+
+func TestOperationAuthTargetForRejectsConflictingSiteLabels(t *testing.T) {
+	t.Parallel()
+
+	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
+	machine.Labels = map[string]string{
+		unboundedv1alpha3.MachineSiteLabelKey: "site-a",
+		netv1alpha1.SiteLabelKey:              "site-b",
+	}
+
+	_, failure := operationAuthTargetFor(machine)
+
+	require.NotNil(t, failure)
+	require.Equal(t, authReasonInvalid, failure.Reason)
+	require.Contains(t, failure.Message, "conflicting site labels")
 }
 
 func TestMachineOperationReconciler_FailsMachineWithoutSiteLabel(t *testing.T) {
@@ -149,7 +221,7 @@ func TestMachineOperationReconciler_FailsMachineWithoutSiteLabel(t *testing.T) {
 
 	cond := apimeta.FindStatusCondition(updated.Status.Conditions, OperationConditionCompleted)
 	require.NotNil(t, cond)
-	require.Equal(t, "AuthInvalid", cond.Reason)
+	require.Equal(t, authReasonInvalid, cond.Reason)
 	require.Contains(t, updated.Status.Message, "missing site label")
 }
 
@@ -175,7 +247,7 @@ func TestMachineOperationReconciler_FailsMissingSiteCredential(t *testing.T) {
 
 	cond := apimeta.FindStatusCondition(updated.Status.Conditions, OperationConditionCompleted)
 	require.NotNil(t, cond)
-	require.Equal(t, "AuthNotFound", cond.Reason)
+	require.Equal(t, authReasonNotFound, cond.Reason)
 }
 
 func TestMachineOperationReconciler_PassesWorkloadIdentityCredentialToProvider(t *testing.T) {
@@ -222,7 +294,7 @@ func TestMachineOperationReconciler_FailsAmbiguousSiteCredential(t *testing.T) {
 
 	cond := apimeta.FindStatusCondition(updated.Status.Conditions, OperationConditionCompleted)
 	require.NotNil(t, cond)
-	require.Equal(t, "AuthAmbiguous", cond.Reason)
+	require.Equal(t, authReasonAmbiguous, cond.Reason)
 }
 
 func TestMachineOperationReconciler_FailsMissingCredentialSecret(t *testing.T) {
@@ -250,7 +322,7 @@ func TestMachineOperationReconciler_FailsMissingCredentialSecret(t *testing.T) {
 
 	cond := apimeta.FindStatusCondition(updated.Status.Conditions, OperationConditionCompleted)
 	require.NotNil(t, cond)
-	require.Equal(t, "AuthSecretNotFound", cond.Reason)
+	require.Equal(t, authReasonSecretNotFound, cond.Reason)
 }
 
 func TestMachineOperationReconciler_FailsExternalPluginWithoutSecretRef(t *testing.T) {
@@ -277,7 +349,7 @@ func TestMachineOperationReconciler_FailsExternalPluginWithoutSecretRef(t *testi
 
 	cond := apimeta.FindStatusCondition(updated.Status.Conditions, OperationConditionCompleted)
 	require.NotNil(t, cond)
-	require.Equal(t, "AuthInvalid", cond.Reason)
+	require.Equal(t, authReasonInvalid, cond.Reason)
 }
 
 func TestMachineOperationReconciler_FailsCredentialWithEmptyAuthMode(t *testing.T) {
@@ -304,7 +376,7 @@ func TestMachineOperationReconciler_FailsCredentialWithEmptyAuthMode(t *testing.
 
 	cond := apimeta.FindStatusCondition(updated.Status.Conditions, OperationConditionCompleted)
 	require.NotNil(t, cond)
-	require.Equal(t, "AuthInvalid", cond.Reason)
+	require.Equal(t, authReasonInvalid, cond.Reason)
 }
 
 func TestMachineOperationReconciler_FailsCredentialSecretOutsideAllowedNamespace(t *testing.T) {
@@ -336,7 +408,7 @@ func TestMachineOperationReconciler_FailsCredentialSecretOutsideAllowedNamespace
 
 	cond := apimeta.FindStatusCondition(updated.Status.Conditions, OperationConditionCompleted)
 	require.NotNil(t, cond)
-	require.Equal(t, "AuthSecretForbidden", cond.Reason)
+	require.Equal(t, authReasonSecretForbidden, cond.Reason)
 }
 
 func TestOperationAuthRequiredSecretValuePreservesOpaqueValue(t *testing.T) {

@@ -1,25 +1,26 @@
+{{- $controllerName := default "machine-ops-controller" .ControllerName }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: machine-ops-controller
+  name: {{ $controllerName }}
   namespace: {{ default "unbounded-kube" .Namespace }}
   labels:
-    app.kubernetes.io/name: machine-ops-controller
+    app.kubernetes.io/name: {{ $controllerName }}
     app.kubernetes.io/component: controller
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app.kubernetes.io/name: machine-ops-controller
+      app.kubernetes.io/name: {{ $controllerName }}
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: machine-ops-controller
+        app.kubernetes.io/name: {{ $controllerName }}
         app.kubernetes.io/component: controller
       annotations:
         kubernetes.azure.com/set-kube-service-host-fqdn: "true"
     spec:
-      serviceAccountName: machine-ops-controller
+      serviceAccountName: {{ $controllerName }}
       affinity:
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -52,6 +53,12 @@ spec:
             - --leader-elect-namespace={{ default "unbounded-kube" .Namespace }}
             - --credential-secret-namespace={{ default "unbounded-kube" .Namespace }}
             - --max-concurrent-reconciles={{ default "10" .MaxConcurrentReconciles }}
+            {{- if .Provider }}
+            - --provider={{ .Provider }}
+            {{- end }}
+            {{- if .Site }}
+            - --site={{ .Site }}
+            {{- end }}
             {{- if .APIServerEndpoint }}
             - --api-server-endpoint={{ .APIServerEndpoint }}
             {{- end }}

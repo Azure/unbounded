@@ -62,7 +62,7 @@ type MachineOperationCredentialSpec struct {
 	// Provider identifies the external control provider this credential applies
 	// to.
 	// +kubebuilder:validation:Required
-	// +kubebuilder:validation:Enum=AzureVM;OCIInstance
+	// +kubebuilder:validation:MinLength=1
 	Provider string `json:"provider"`
 
 	// Auth identifies how the provider should authenticate.

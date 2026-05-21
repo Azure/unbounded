@@ -40,6 +40,9 @@ MACHINA_IMAGE ?= $(CONTAINER_REGISTRY)/machina:$(VERSION)
 MACHINE_OPS_CONTROLLER_BIN=bin/machine-ops-controller
 MACHINE_OPS_CONTROLLER_CMD=./cmd/machine-ops-controller
 MACHINE_OPS_CONTROLLER_IMAGE ?= $(CONTAINER_REGISTRY)/machine-ops-controller:$(VERSION)
+MACHINE_OPS_CONTROLLER_NAME ?= machine-ops-controller
+MACHINE_OPS_PROVIDER ?=
+MACHINE_OPS_SITE ?=
 
 METALMAN_BIN=bin/metalman
 METALMAN_CMD=./cmd/metalman
@@ -668,7 +671,10 @@ machine-ops-manifests: ## Render machine-ops-controller manifests into deploy/ma
 		--templates-dir $(MACHINE_OPS_MANIFEST_TEMPLATES_DIR) \
 		--output-dir $(MACHINE_OPS_MANIFEST_RENDERED_DIR) \
 		--set Namespace=$(MACHINE_OPS_NAMESPACE) \
+		--set ControllerName=$(MACHINE_OPS_CONTROLLER_NAME) \
 		--set ControllerImage=$(MACHINE_OPS_CONTROLLER_IMAGE) \
+		--set Provider=$(MACHINE_OPS_PROVIDER) \
+		--set Site=$(MACHINE_OPS_SITE) \
 		--set APIServerEndpoint=$(MACHINE_OPS_API_SERVER_ENDPOINT)
 	@echo "Rendered machine-ops manifests into $(MACHINE_OPS_MANIFEST_RENDERED_DIR) (image: $(MACHINE_OPS_CONTROLLER_IMAGE))"
 
