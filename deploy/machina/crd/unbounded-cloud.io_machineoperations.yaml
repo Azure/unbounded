@@ -237,6 +237,79 @@ spec:
                 description: StartedAt is when the agent began executing the operation.
                 format: date-time
                 type: string
+              targets:
+                description: |-
+                  Targets records the per-machine execution state for this operation.
+                  For single-machine operations this contains one entry. For selector
+                  operations, targets are snapshotted when execution begins and remain
+                  authoritative even if selector matches change later.
+                items:
+                  description: MachineOperationTargetStatus records execution state
+                    for one target Machine.
+                  properties:
+                    attempts:
+                      description: |-
+                        Attempts is the number of external action attempts made for this target.
+                        Polling expected state changes does not increment this field.
+                      format: int32
+                      type: integer
+                    completedAt:
+                      description: CompletedAt is when this target reached a terminal
+                        phase.
+                      format: date-time
+                      type: string
+                    lastAttemptAt:
+                      description: LastAttemptAt records when the latest external
+                        action attempt occurred.
+                      format: date-time
+                      type: string
+                    machineRef:
+                      description: MachineRef is the name of the targeted Machine.
+                      type: string
+                    message:
+                      description: Message is a human-readable description of target
+                        progress or failure.
+                      type: string
+                    observedGeneration:
+                      description: ObservedGeneration is the target Machine generation
+                        acted on.
+                      format: int64
+                      type: integer
+                    phase:
+                      description: Phase is the current lifecycle phase for this target.
+                      type: string
+                    stage:
+                      description: Stage is the current operation-specific stage for
+                        this target.
+                      type: string
+                    startedAt:
+                      description: StartedAt is when execution began for this target.
+                      format: date-time
+                      type: string
+                    targetOperations:
+                      description: |-
+                        TargetOperations records the Machine operation counters this operation
+                        requested. It is used by counter-backed HostReplace operations to remain
+                        idempotent across controller restarts.
+                      properties:
+                        rebootCounter:
+                          description: RebootCounter is the last reboot counter value
+                            that was acted on.
+                          format: int64
+                          type: integer
+                        repaveCounter:
+                          description: RepaveCounter is the last repave counter value
+                            that was acted on.
+                          format: int64
+                          type: integer
+                      type: object
+                  required:
+                  - machineRef
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - machineRef
+                x-kubernetes-list-type: map
             type: object
         type: object
     served: true

@@ -18,14 +18,14 @@ the on-prem datacenter as a multi-replica Kubernetes Deployment.
 It fronts AWS S3 and Azure Blob, serves chunked bytes keyed by
 ETag out of a shared in-DC store, and makes sure the same chunk
 is fetched only once no matter how many clients ask for it.
-Clients use the same `GetObject` / `HeadObject` / `ListObjectsV2`
-calls they already use.
+Clients use the same `GetObject` / `HeadObject` calls they
+already use. `ListObjectsV2` is not supported.
 
 ## 2. Goals and non-goals
 
 In scope:
-- Read-only S3-compatible API: `GetObject` with `Range`,
-  `HeadObject`, minimal `ListObjectsV2` pass-through.
+- Read-only S3-compatible API: `GetObject` with `Range` and
+  `HeadObject`. `ListObjectsV2` is not supported.
 - Multi-PB working set; thousands of concurrent clients.
 - One Orca deployment per datacenter, no cross-DC peering.
 - Near-zero origin stampede under correlated cold-access bursts.

@@ -451,6 +451,45 @@ def _vm_is_running() -> bool:
     return result.returncode == 0 and "running" in result.stdout.strip()
 
 
+def wait_vm_state(expected: str, timeout: int = 300) -> None:
+    """Wait for the libvirt domain state to contain *expected*."""
+    log(f"  Waiting for VM '{VM_NAME}' state to contain {expected!r}...")
+    last_state = ""
+    for elapsed in range(timeout):
+        check_procs()
+        result = subprocess.run(
+            [*VIRSH, "domstate", VM_NAME],
+            capture_output=True, text=True,
+        )
+        state = result.stdout.strip() if result.returncode == 0 else result.stderr.strip()
+        if expected in state:
+            log(f"  VM '{VM_NAME}' state is {state!r}")
+            return
+        if elapsed > 0 and elapsed % 15 == 0 and state != last_state:
+            last_state = state
+            log(f"    ({elapsed}s) VM state={state or 'unknown'}")
+        time.sleep(1)
+    die(f"Timed out waiting for VM '{VM_NAME}' state to contain {expected!r}")
+
+
+def wait_guest_agent(timeout: int = 300) -> None:
+    """Wait until the guest OS responds through the QEMU guest agent."""
+    log("  Waiting for QEMU guest agent to respond...")
+    for elapsed in range(timeout):
+        check_procs()
+        try:
+            exit_code, _, _ = guest_exec("true", timeout=10)
+            if exit_code == 0:
+                log("  QEMU guest agent is responsive")
+                return
+        except (RuntimeError, TimeoutError, subprocess.TimeoutExpired, OSError):
+            pass
+        if elapsed > 0 and elapsed % 15 == 0:
+            log(f"    ({elapsed}s) guest agent not responsive yet")
+        time.sleep(1)
+    die("Timed out waiting for QEMU guest agent")
+
+
 def machine_status() -> str | None:
     """Return a short summary of Machine conditions, or None."""
     result = subprocess.run(
@@ -501,6 +540,37 @@ def wait_k8s_node(name: str, timeout: int = 1800) -> None:
     die(f"Timed out waiting for Node '{name}'")
 
 
+def get_node_boot_id(name: str) -> str:
+    result = subprocess.run(
+        [KUBECTL, "get", "node", name, "-o", "jsonpath={.status.nodeInfo.bootID}"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        die(f"Failed to read Node '{name}' boot ID: {result.stderr.strip()}")
+    boot_id = result.stdout.strip()
+    if not boot_id:
+        die(f"Node '{name}' has no status.nodeInfo.bootID")
+    return boot_id
+
+
+def wait_node_boot_id_changed(name: str, previous_boot_id: str, timeout: int = 600) -> None:
+    log(f"  Waiting for Node '{name}' boot ID to change...")
+    for elapsed in range(timeout):
+        check_procs()
+        result = subprocess.run(
+            [KUBECTL, "get", "node", name, "-o", "jsonpath={.status.nodeInfo.bootID}"],
+            capture_output=True, text=True,
+        )
+        boot_id = result.stdout.strip() if result.returncode == 0 else ""
+        if boot_id and boot_id != previous_boot_id:
+            log(f"  Node '{name}' boot ID changed")
+            return
+        if elapsed > 0 and elapsed % 30 == 0:
+            log(f"    ({elapsed}s) bootID={boot_id or 'not set'}")
+        time.sleep(1)
+    die(f"Timed out waiting for Node '{name}' boot ID to change")
+
+
 def _restart_crashing_pods(node_name: str, namespace: str, label: str) -> None:
     """Delete pods matching *label* on *node_name* that are in CrashLoopBackOff.
 
@@ -519,15 +589,19 @@ def _restart_crashing_pods(node_name: str, namespace: str, label: str) -> None:
 
     pods = json.loads(result.stdout).get("items", [])
     for pod in pods:
+        pod_name = pod["metadata"]["name"]
         for cs in pod.get("status", {}).get("containerStatuses", []):
             if cs.get("ready"):
                 continue
             waiting = cs.get("state", {}).get("waiting", {})
+            terminated = cs.get("state", {}).get("terminated", {})
             restart_count = cs.get("restartCount", 0)
-            if restart_count >= 2 or waiting.get("reason") == "CrashLoopBackOff":
-                pod_name = pod["metadata"]["name"]
+            waiting_reason = waiting.get("reason")
+            terminated_reason = terminated.get("reason")
+            if restart_count >= 2 or waiting_reason == "CrashLoopBackOff":
                 log(f"    Deleting crashing pod {pod_name} "
-                    f"(restarts={restart_count}) to reset backoff")
+                    f"(restarts={restart_count}, waiting={waiting_reason or 'none'}, "
+                    f"terminated={terminated_reason or 'none'}) to reset backoff")
                 subprocess.run(
                     [KUBECTL, "delete", "pod", "-n", namespace, pod_name,
                      "--grace-period=0", "--force"],
@@ -535,15 +609,13 @@ def _restart_crashing_pods(node_name: str, namespace: str, label: str) -> None:
                 )
 
 
-def assert_node_ready(name: str, timeout: int = 480) -> None:
+def assert_node_ready(name: str, timeout: int = 720) -> None:
     """Assert the Node reaches Ready status within timeout seconds.
 
     The timeout must be generous enough to survive multiple kindnet
-    CrashLoopBackOff cycles.  In CI each kindnet pod runs for ~2 min
-    before crashing; with a restart threshold of 2 and a 30s check
-    interval, each cycle (crash -> detect -> delete -> new pod start)
-    takes ~90-120s.  480s accommodates 3 full cycles plus ~60s for the
-    final pod to write the CNI config and the kubelet to detect it.
+    CrashLoopBackOff cycles. In CI kindnet can need several fresh pod
+    attempts before it writes the CNI config; 720s accommodates the slow
+    tail without hiding real boot failures.
     """
     log(f"  Waiting for Node '{name}' to become Ready...")
     pod_restart_interval = 30  # seconds between CrashLoopBackOff resets
@@ -560,10 +632,9 @@ def assert_node_ready(name: str, timeout: int = 480) -> None:
             return
         if elapsed > 0 and elapsed % 30 == 0:
             log(f"    ({elapsed}s) Node not yet Ready")
-        # Periodically reset CrashLoopBackOff on critical DaemonSet pods.
-        # Kindnet can fail transiently when the VM's network is still
-        # initializing; deleting the pod resets the backoff timer and
-        # lets the DaemonSet controller schedule a fresh attempt.
+        # Periodically reset failing critical DaemonSet pods. Kindnet can fail
+        # transiently during VM network initialization and may sit in Error
+        # before Kubernetes reports CrashLoopBackOff.
         if elapsed >= 30 and elapsed - last_restart_attempt >= pod_restart_interval:
             _restart_crashing_pods(name, "kube-system", "app=kindnet")
             last_restart_attempt = elapsed
@@ -612,6 +683,93 @@ def assert_cloud_init_done(timeout: int = 900) -> None:
             log(f"    ({elapsed}s) CloudInitDone status={status or 'not set'} reason={reason or 'not set'}")
         time.sleep(1)
     die(f"Timed out waiting for CloudInitDone condition on Machine '{NODE_NAME}'")
+
+
+def wait_machine_operation_complete(name: str, timeout: int = 1800) -> None:
+    log(f"  Waiting for MachineOperation '{name}' to complete...")
+    for elapsed in range(timeout):
+        check_procs()
+        result = subprocess.run(
+            [KUBECTL, "get", f"machineoperations.{API_GROUP}", name, "-o", "json"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            op = json.loads(result.stdout)
+            status = op.get("status", {})
+            phase = status.get("phase", "")
+            message = status.get("message", "")
+            targets = status.get("targets", [])
+            if phase == "Complete":
+                if not targets:
+                    die(f"MachineOperation '{name}' completed without status.targets")
+                target = targets[0]
+                if target.get("machineRef") != NODE_NAME or target.get("phase") != "Complete":
+                    die(f"MachineOperation '{name}' has unexpected target status: {target}")
+                log(f"  MachineOperation '{name}' completed")
+                return
+            if phase == "Failed":
+                die(f"MachineOperation '{name}' failed: {message}; targets={targets}")
+            if elapsed > 0 and elapsed % 30 == 0:
+                log(f"    ({elapsed}s) MachineOperation phase={phase or 'empty'} message={message or 'empty'} targets={targets}")
+        elif elapsed > 0 and elapsed % 30 == 0:
+            log(f"    ({elapsed}s) MachineOperation '{name}' not found yet")
+        time.sleep(1)
+    die(f"Timed out waiting for MachineOperation '{name}'")
+
+
+def create_machine_operation(
+    name: str,
+    kind: str,
+    *,
+    machine_ref: str | None = NODE_NAME,
+    site_selector: str | None = None,
+    ttl_seconds: int = 3600,
+) -> str:
+    spec: dict[str, Any] = {
+        "operationKind": kind,
+        "ttlSecondsAfterFinished": ttl_seconds,
+    }
+    if site_selector is not None:
+        spec["machineSelector"] = {"matchLabels": {f"{API_GROUP}/site": site_selector}}
+    elif machine_ref is not None:
+        spec["machineRef"] = machine_ref
+
+    operation = {
+        "apiVersion": API_VERSION,
+        "kind": "MachineOperation",
+        "metadata": {"name": name},
+        "spec": spec,
+    }
+    kubectl(["apply", "-f", "-"], input=json.dumps(operation).encode(), stdout=DEVNULL)
+    return name
+
+
+def run_operation_smoke_suite() -> None:
+    log("Running bare-metal MachineOperation smoke suite")
+
+    boot_id = get_node_boot_id(NODE_NAME)
+
+    poweroff = create_machine_operation("smoke-host-poweroff", "HostPowerOff")
+    wait_machine_operation_complete(poweroff, timeout=600)
+    wait_vm_state("shut off", timeout=180)
+
+    poweron = create_machine_operation("smoke-host-poweron", "HostPowerOn")
+    wait_machine_operation_complete(poweron, timeout=600)
+    wait_vm_state("running", timeout=180)
+    wait_k8s_node(NODE_NAME, timeout=300)
+    wait_node_boot_id_changed(NODE_NAME, boot_id, timeout=600)
+    boot_id = get_node_boot_id(NODE_NAME)
+
+    reboot = create_machine_operation(
+        "smoke-selector-host-reboot",
+        "HostReboot",
+        machine_ref=None,
+        site_selector=SITE,
+    )
+    wait_machine_operation_complete(reboot, timeout=600)
+    wait_vm_state("running", timeout=180)
+    wait_k8s_node(NODE_NAME, timeout=300)
+    wait_node_boot_id_changed(NODE_NAME, boot_id, timeout=600)
 
 
 def main() -> None:
@@ -761,6 +919,7 @@ def main() -> None:
     # Kubernetes setup runs while Go builds are in progress.
     log("Cleaning up stale Kubernetes resources")
     run_quiet([KUBECTL, "-n", NODE_NS, "delete", "secret", "bmc-pass"])
+    run_quiet([KUBECTL, "delete", f"machineoperations.{API_GROUP}", "--all"])
     run_quiet([KUBECTL, "delete", f"machines.{API_GROUP}", NODE_NAME])
     run_quiet([KUBECTL, "delete", "node", NODE_NAME])
     # Remove stale CRDs so that a version change (e.g. storedVersions
@@ -876,8 +1035,8 @@ def main() -> None:
     time.sleep(2)
     check_procs()
 
-    log("Triggering repave")
-    run([str(KUBECTL_UNBOUNDED), "machine", "repave", NODE_NAME])
+    log("Triggering HostReplace MachineOperation")
+    operation_name = create_machine_operation("smoke-host-replace", "HostReplace")
 
     # Log free space so we can correlate disk exhaustion with VM failures.
     df = subprocess.run(["df", "-h", str(TMPDIR)], capture_output=True, text=True)
@@ -886,9 +1045,13 @@ def main() -> None:
     log("Waiting for cloud-init to complete...")
     assert_cloud_init_done(timeout=900)
 
+    wait_machine_operation_complete(operation_name, timeout=900)
+
     log("Waiting for kubelet to join the cluster...")
     wait_k8s_node(NODE_NAME, timeout=900)
-    assert_node_ready(NODE_NAME, timeout=480)
+    assert_node_ready(NODE_NAME, timeout=720)
+
+    run_operation_smoke_suite()
 
     log("")
     log("Smoke test PASSED")

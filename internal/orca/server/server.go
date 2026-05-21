@@ -14,7 +14,6 @@ package server
 import (
 	"bufio"
 	"context"
-	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -42,7 +41,6 @@ type EdgeHandler struct {
 type edgeFetchAPI interface {
 	HeadObject(ctx context.Context, bucket, key string) (origin.ObjectInfo, error)
 	GetChunk(ctx context.Context, k chunk.Key, objectSize int64) (io.ReadCloser, error)
-	Origin() origin.Origin
 }
 
 // NewEdgeHandler wires the edge handler.
@@ -56,8 +54,7 @@ func NewEdgeHandler(fc edgeFetchAPI, cfg *config.Config, log *slog.Logger) *Edge
 // use path-style):
 //
 //	GET  /                                  -> ListBuckets (not supported; 405)
-//	GET  /{bucket}/?list-type=2&prefix=...  -> ListObjectsV2
-//	GET  /{bucket}/                         -> ListObjectsV2 (default)
+//	GET  /{bucket}/                         -> ListObjectsV2 (not supported; 501)
 //	GET  /{bucket}/{key}                    -> GetObject (with optional Range)
 //	HEAD /{bucket}/{key}                    -> HeadObject
 //	HEAD /{bucket}/                         -> HeadBucket (not supported; 405)
@@ -92,7 +89,7 @@ func (h *EdgeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleHead(w, r, bucket, key)
 	case http.MethodGet:
 		if key == "" {
-			h.handleList(w, r, bucket)
+			h.notImplemented(w, "ListObjectsV2")
 			return
 		}
 
@@ -693,74 +690,6 @@ func streamSlice(dst io.Writer, src io.Reader, off, length int64) error {
 	}
 
 	return nil
-}
-
-// handleList is a thin pass-through to Origin.List for v1 prototype.
-func (h *EdgeHandler) handleList(w http.ResponseWriter, r *http.Request, bucket string) {
-	// Pass-through; very minimal S3 ListObjectsV2 shape. Reviewers can
-	// curl this for sanity but full S3 list semantics are not in MVP.
-	prefix := r.URL.Query().Get("prefix")
-	marker := r.URL.Query().Get("continuation-token")
-	maxStr := r.URL.Query().Get("max-keys")
-	maxKeys := 1000
-
-	if maxStr != "" {
-		if v, err := strconv.Atoi(maxStr); err == nil && v > 0 {
-			maxKeys = v
-		}
-	}
-
-	type listEntry struct {
-		Key  string `xml:"Key"`
-		Size int64  `xml:"Size"`
-		ETag string `xml:"ETag"`
-	}
-
-	type listResult struct {
-		XMLName     xml.Name    `xml:"ListBucketResult"`
-		Name        string      `xml:"Name"`
-		Prefix      string      `xml:"Prefix"`
-		KeyCount    int         `xml:"KeyCount"`
-		MaxKeys     int         `xml:"MaxKeys"`
-		IsTruncated bool        `xml:"IsTruncated"`
-		NextMarker  string      `xml:"NextContinuationToken,omitempty"`
-		Contents    []listEntry `xml:"Contents"`
-	}
-
-	or := h.fc.Origin()
-
-	res, err := or.List(r.Context(), bucket, prefix, marker, maxKeys)
-	if err != nil {
-		h.writeOriginError(w, err)
-		return
-	}
-
-	body := listResult{
-		Name:        bucket,
-		Prefix:      prefix,
-		KeyCount:    len(res.Entries),
-		MaxKeys:     maxKeys,
-		IsTruncated: res.IsTruncated,
-		NextMarker:  res.NextMarker,
-	}
-	for _, e := range res.Entries {
-		body.Contents = append(body.Contents, listEntry{Key: e.Key, Size: e.Size, ETag: e.ETag})
-	}
-
-	w.Header().Set("Content-Type", "application/xml")
-	w.WriteHeader(http.StatusOK)
-	enc := xml.NewEncoder(w)
-
-	if err := enc.Encode(body); err != nil {
-		// Headers already sent; we cannot change the status. Log so
-		// truncated / malformed LIST responses are visible, matching
-		// the mid-stream warn-level treatment in the GET path.
-		h.log.LogAttrs(r.Context(), slog.LevelWarn, "list xml encode failed",
-			slog.String("bucket", bucket),
-			slog.String("prefix", prefix),
-			slog.Any("err", err),
-		)
-	}
 }
 
 func (h *EdgeHandler) notImplemented(w http.ResponseWriter, op string) {

@@ -8,7 +8,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"io"
-	"math"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -198,40 +197,5 @@ func TestGetRange_OmitsIfMatchWhenEtagEmpty(t *testing.T) {
 	got, _ := captured.Load().(string)
 	if got != "" {
 		t.Errorf("If-Match present (%q) when etag was empty; want absent", got)
-	}
-}
-
-// TestClampMaxResults covers the upper-bound, lower-bound, and
-// passthrough branches of the ListBlobs MaxResults clamp. The
-// helper exists to close the int32-overflow window CodeQL flagged
-// at the original Adapter.List call site (the cast of a
-// host-int maxResults to int32 without an upper-bound check). The
-// upper-bound case asserts that an arbitrarily large host-int
-// produces the documented Azure ceiling rather than wrapping to a
-// non-deterministic (and possibly negative) int32 value.
-func TestClampMaxResults(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name string
-		in   int
-		want int32
-	}{
-		{"zero passthrough", 0, 0},
-		{"small positive passthrough", 100, 100},
-		{"exactly the cap", azureMaxResultsCap, int32(azureMaxResultsCap)},
-		{"one above the cap", azureMaxResultsCap + 1, int32(azureMaxResultsCap)},
-		{"int32 max -> cap", math.MaxInt32, int32(azureMaxResultsCap)},
-		{"int64 max -> cap (no overflow)", math.MaxInt, int32(azureMaxResultsCap)},
-		{"negative one -> 0", -1, 0},
-		{"int min -> 0 (no overflow)", math.MinInt, 0},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := clampMaxResults(tt.in); got != tt.want {
-				t.Errorf("clampMaxResults(%d) = %d, want %d", tt.in, got, tt.want)
-			}
-		})
 	}
 }

@@ -25,6 +25,10 @@ type Kubelet struct {
 	// ClusterDNS is the ClusterIP of the kube-dns service.
 	ClusterDNS string
 
+	// NodeIP overrides kubelet --node-ip. Supports a single IP or a
+	// comma-separated dual-stack pair.
+	NodeIP string
+
 	// NodeLabels are key=value labels applied to the node at registration.
 	NodeLabels map[string]string
 

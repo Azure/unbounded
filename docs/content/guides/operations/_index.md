@@ -49,8 +49,10 @@ alongside `machinectl`, systemd, and the nspawn rootfs.
 
 Operations are created by applying a `MachineOperation` resource. Target a
 single machine with `spec.machineRef` or, for agent-handled operations
-(`NodeReboot`, `AgentUpgrade`, `AgentReset`), a group of machines with
-`spec.machineSelector`. Host operations require one operation per machine.
+(`NodeReboot`, `AgentUpgrade`, `AgentReset`) and metalman bare-metal host
+operations, a group of machines with `spec.machineSelector`. Bare-metal host
+selectors must be scoped to one metalman site with
+`unbounded-cloud.io/site=<site>`.
 
 ```yaml
 apiVersion: unbounded-cloud.io/v1alpha3
