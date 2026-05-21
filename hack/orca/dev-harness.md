@@ -160,12 +160,18 @@ make -C hack/orca data-generate ARGS='--size 10MiB --count 5'
 ## Exercise the cache
 
 See [quickstart.md - Steps 4-5](./quickstart.md#step-4---port-forward-the-orca-edge)
-for the port-forward + `curl` walkthrough. The cluster-wide
-deduplication, singleflight collapse, and warm-cache behavior are
-verified deterministically by `make orca-inttest` against
-testcontainers; this Kind harness is for validating the Kubernetes
-deployment shape (manifests, image, headless DNS, RBAC, init-Job
-ordering) and for ad-hoc operator exploration.
+for the port-forward + `curl` walkthrough. For SHA-256 roundtrip
+verification, parallel-GET benchmarks (with JSON output for
+cross-run comparison), canned end-to-end scenarios, and cachestore
+inspection via the `orcadev` tool, see
+[quickstart.md - Step 8](./quickstart.md#step-8---roundtrip-benchmarks-and-scenarios).
+
+The cluster-wide deduplication, singleflight collapse, and
+warm-cache behavior are verified deterministically by
+`make orca-inttest` against testcontainers; this Kind harness is
+for validating the Kubernetes deployment shape (manifests, image,
+headless DNS, RBAC, init-Job ordering) and for ad-hoc operator
+exploration.
 
 ## See cluster-wide deduplication in action
 

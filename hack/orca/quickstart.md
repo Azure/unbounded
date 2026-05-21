@@ -175,7 +175,117 @@ kubectl --context kind-orca-dev -n unbounded-kube exec deploy/localstack -- \
 make -C hack/orca data-delete ARGS='--yes'
 ```
 
-## Step 8 - Tear down
+## Step 8 - Roundtrip, benchmarks, and scenarios
+
+The previous steps stand up the cluster and let you drive it with
+`curl` by hand. This step uses the `orcadev` tool to do the same
+work in one command: SHA-256-verified roundtrips, parallel
+throughput benchmarks, and canned end-to-end scenarios. Keep the
+`make -C hack/orca port-forward` from Step 4 running.
+
+### 8a - Roundtrip (correctness check)
+
+```bash
+dd if=/dev/urandom of=/tmp/orca-test.bin bs=1M count=10 status=none
+make -C hack/orca roundtrip FILE=/tmp/orca-test.bin
+```
+
+orcadev uploads the file, fetches it back via orca, and compares a
+streaming SHA-256 of the source bytes against a streaming SHA-256 of
+the response. Exit code 0 on PASS, 1 on mismatch (suitable for CI).
+
+Useful flags via `ARGS=`:
+
+- `--repeat 3` to issue three sequential GETs (first cold, rest
+  warm).
+- `--cleanup` to delete the uploaded blob after the run.
+- `--dump-diff` to print a side-by-side hex dump of the first
+  differing bytes when the checksums disagree.
+
+A failure with `--dump-diff` looks like:
+
+```text
+MISMATCH
+  source sha256:   3a7bd9...e21f
+  received sha256: 9a1c0c...4a8e
+  first difference at offset 1024 (0x400)
+
+  offset 0x0 (0):
+             SOURCE                                          | RECEIVED
+    00000400  aa bb cc dd ee ff 00 11 22 33 44 55 66 77 88 99  ........"3DUfw.. | aa bb cc dd ee ff 00 11 22 33 44 55 66 77 88 00  ........"3DUfw..
+    ...
+```
+
+### 8b - Benchmarks
+
+Seed an object to bench against (or reuse the roundtrip blob), then
+run the benchmark:
+
+```bash
+make -C hack/orca data-upload FILE=/tmp/orca-test.bin
+make -C hack/orca bench KEY=orca-test.bin \
+  ARGS='--duration 30s --concurrency 16 --range-size 1MiB --read-pattern random'
+```
+
+orcadev prints a human summary on stdout (requests, throughput,
+min/p50/p90/p99/max latency). Use `--output json` to switch the
+stdout payload to JSON, or `--json-out PATH` to keep human text on
+stdout and persist JSON to a file for comparison across runs:
+
+```bash
+# Capture a baseline
+make -C hack/orca bench KEY=orca-test.bin \
+  ARGS='--duration 30s --concurrency 16 --json-out /tmp/run-a.json --label baseline'
+
+# Iterate on code (make orca-reset), then re-bench
+make -C hack/orca bench KEY=orca-test.bin \
+  ARGS='--duration 30s --concurrency 16 --json-out /tmp/run-b.json --label after-fix'
+
+# Compare with jq
+jq -r '"\(.label)\tMiB/s=\(.results.throughput_bytes_per_second/1048576|floor)\tp99ms=\(.results.latency_ns.p99/1000000)"' \
+  /tmp/run-*.json
+```
+
+The JSON envelope is versioned (`schema_version: 1`) and includes a
+log-spaced latency histogram in `latency_histogram` (configurable
+bounds and bucket count). See `go run ./hack/cmd/orcadev bench --help`
+for tuning knobs.
+
+### 8c - Scenarios
+
+Canned end-to-end scenarios are one-line invocations that string
+together upload + fetch + verify against a specific behaviour:
+
+```bash
+make -C hack/orca scenario NAME=cold-warm       # cold-vs-warm GET ratio
+make -C hack/orca scenario NAME=range-stress    # concurrent ranges, all bytes verified
+make -C hack/orca scenario NAME=empty-object    # zero-byte regression check
+make -C hack/orca scenario NAME=etag-change     # mid-stream etag rotation
+```
+
+Each prints PASS or FAIL with per-step timings. `ARGS='--json-out
+PATH'` writes a machine-parseable result for CI; `ARGS='--keep-data'`
+skips end-of-run cleanup so you can inspect the post-mortem state.
+
+### 8d - Cache inspection while iterating
+
+After a roundtrip or bench you can see what landed in the cache, and
+force a cold state before the next experiment:
+
+```bash
+make -C hack/orca cache-list
+make -C hack/orca cache-inspect BUCKET=orca-origin KEY=orca-test.bin
+
+# Force a cold-cache state for orca-test.bin before the next bench
+make -C hack/orca cache-clear ARGS='--object orca-origin/orca-test.bin --yes'
+```
+
+`cache-inspect` answers the "did my fix actually populate the
+cache?" question: it HEADs the origin for size + etag, computes the
+canonical chunk paths via `internal/orca/chunk`, then HEADs each
+path in the cachestore.
+
+## Step 9 - Tear down
 
 ```bash
 make orca-down
