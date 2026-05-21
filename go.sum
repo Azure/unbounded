@@ -387,8 +387,8 @@ github.com/opencontainers/runtime-spec v1.2.1 h1:S4k4ryNgEpxW1dzyqffOmhI1BHYcjzU
 github.com/opencontainers/runtime-spec v1.2.1/go.mod h1:jwyrGlmzljRJv/Fgzds9SsS/C5hL+LL3ko9hs6T5lQ0=
 github.com/opencontainers/umoci v0.6.0 h1:Dsm4beJpglN5y2E2EUSZZcNey4Ml4+nKepvwLQwgIec=
 github.com/opencontainers/umoci v0.6.0/go.mod h1:2DS3cxVN9pRJGYaCK5mnmmwVKV5vd9r6HIYAV0IvdbI=
-github.com/oracle/oci-go-sdk/v65 v65.114.2 h1:7ROvpCkL5v63HTHKGajlL+++zqz3+jAflfJt4wLE+J8=
-github.com/oracle/oci-go-sdk/v65 v65.114.2/go.mod h1:oo33NDf2XPqx3/N6oLG4jFlrqJ0xu4Rlt9SfuAbtDFs=
+github.com/oracle/oci-go-sdk/v65 v65.115.0 h1:tIkIx/A/eW5cX5VF4cpOGXp8iw/aAwzxAfgWZ+G0WV0=
+github.com/oracle/oci-go-sdk/v65 v65.115.0/go.mod h1:oo33NDf2XPqx3/N6oLG4jFlrqJ0xu4Rlt9SfuAbtDFs=
 github.com/peterbourgon/diskv v2.0.1+incompatible h1:UBdAOUP5p4RWqPBg048CAvpKN+vxiaj6gdUUzhl4XmI=
 github.com/peterbourgon/diskv v2.0.1+incompatible/go.mod h1:uqqh8zWWbv1HBMNONnaR/tNboyR3/BZd58JJSHlUSCU=
 github.com/pierrec/lz4/v4 v4.1.14 h1:+fL8AQEZtz/ijeNnpduH0bROTu0O3NZAlPjQxGn8LwE=

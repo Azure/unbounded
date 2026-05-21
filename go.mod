@@ -50,7 +50,7 @@ require (
 	github.com/lib/pq v1.12.3
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/opencontainers/umoci v0.6.0
-	github.com/oracle/oci-go-sdk/v65 v65.114.2
+	github.com/oracle/oci-go-sdk/v65 v65.115.0
 	github.com/pin/tftp/v3 v3.2.0
 	github.com/prometheus/client_golang v1.23.2
 	github.com/spf13/cobra v1.10.2
