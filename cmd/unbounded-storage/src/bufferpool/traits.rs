@@ -3,6 +3,8 @@
 
 #![allow(async_fn_in_trait)]
 
+use std::sync::Arc;
+
 use crate::bufferpool::stream::ReadStream;
 use crate::bufferpool::types::{BulkRef, Error, PageRef, StripeKey};
 
@@ -49,6 +51,40 @@ pub trait BlockStore {
     /// miss after the peer fetch lands.
     async fn write_page(&self, key: StripeKey, stripe_off: u64, page: PageRef)
     -> Result<(), Error>;
+}
+
+/// Blanket impl so a `LocalStorage` (or any other `BlockStore`)
+/// can be shared across shards by handing each `Pool` an
+/// `Arc`-wrapped clone instead of an owned instance. Required by
+/// the node-level engine ownership model: one engine per disk,
+/// shared by every NIC shard.
+impl<T: BlockStore + ?Sized> BlockStore for Arc<T> {
+    fn register_pages(
+        &self,
+        base: *mut u8,
+        page_size: usize,
+        page_count: usize,
+    ) -> Result<(), Error> {
+        (**self).register_pages(base, page_size, page_count)
+    }
+
+    async fn read_page(
+        &self,
+        key: StripeKey,
+        stripe_off: u64,
+        dst: PageRef,
+    ) -> Result<bool, Error> {
+        (**self).read_page(key, stripe_off, dst).await
+    }
+
+    async fn write_page(
+        &self,
+        key: StripeKey,
+        stripe_off: u64,
+        page: PageRef,
+    ) -> Result<(), Error> {
+        (**self).write_page(key, stripe_off, page).await
+    }
 }
 
 pub trait BufferPool {

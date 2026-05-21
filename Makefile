@@ -137,7 +137,7 @@ REACT_DEV ?= false
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-manifests
 .PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-net-controller-local image-net-node-local images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
-.PHONY: unbounded-storage unbounded-storage-build unbounded-storage-test unbounded-storage-check mercury mercury-clean
+.PHONY: unbounded-storage unbounded-storage-build bench unbounded-storage-test unbounded-storage-check unbounded-storage-model-check mercury mercury-clean
 
 ##@ General
 
@@ -186,8 +186,10 @@ help: ## Show this help
 	@echo ""
 	@echo "Rust Binaries:"
 	@echo "  unbounded-storage | unbounded-storage-build  Build unbounded-storage (with/without test)"
+	@echo "  bench                            Build the bench tool (excluded from images)"
 	@echo "  unbounded-storage-test           Run cargo tests for unbounded-storage"
 	@echo "  unbounded-storage-check          Run cargo check for unbounded-storage"
+	@echo "  unbounded-storage-model-check    Run TLC on the CoW B+tree crash-consistency model"
 	@echo "  mercury                          Build pinned Mercury into \$$(MERCURY_PREFIX)"
 	@echo "  mercury-clean                    Remove the local Mercury prefix and source tree"
 	@echo ""
@@ -496,6 +498,34 @@ unbounded-storage-build: mercury ## Build the unbounded-storage binary (no test)
 	cp $(UNBOUNDED_STORAGE_CRATE)/target/release/unbounded-storage $(UNBOUNDED_STORAGE_BIN)
 
 unbounded-storage: unbounded-storage-test unbounded-storage-build ## Build the unbounded-storage binary (implies test)
+
+bench: mercury ## Build the bench tool (excluded from images)
+	$(UNBOUNDED_STORAGE_ENV) $(CARGO) build --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --release --locked --bin bench
+	@mkdir -p $(dir $(UNBOUNDED_STORAGE_BIN))
+	cp $(UNBOUNDED_STORAGE_CRATE)/target/release/bench bin/bench
+
+# TLA+ tooling for the unbounded-storage CoW B+tree crash-consistency model.
+# tla2tools.jar is fetched on demand into tmp/ (gitignored).  Override
+# TLA_TOOLS_JAR to use a locally installed copy.
+#
+# The URL is pinned to a tagged release (not `latest/download`) and the
+# downloaded artifact is verified against TLA_TOOLS_SHA256 so model-check
+# runs are reproducible across machines and over time.
+TLA_TOOLS_JAR ?= tmp/tla2tools.jar
+TLA_TOOLS_VERSION ?= v1.8.0
+TLA_TOOLS_URL ?= https://github.com/tlaplus/tlaplus/releases/download/$(TLA_TOOLS_VERSION)/tla2tools.jar
+TLA_TOOLS_SHA256 ?= 71546dff3897a01b0ee4fa64135d9f5e9384d2b7e47b3cc20a16b655b0eb4f86
+COW_MODEL_DIR := cmd/unbounded-storage/models/copy-on-write
+
+$(TLA_TOOLS_JAR):
+	@mkdir -p $(dir $(TLA_TOOLS_JAR))
+	@echo "Downloading tla2tools.jar ($(TLA_TOOLS_VERSION)) -> $(TLA_TOOLS_JAR)"
+	@curl -fsSL -o $(TLA_TOOLS_JAR) $(TLA_TOOLS_URL)
+	@echo "$(TLA_TOOLS_SHA256)  $(TLA_TOOLS_JAR)" | sha256sum -c -
+
+unbounded-storage-model-check: $(TLA_TOOLS_JAR) ## Run TLC on the CoW B+tree crash-consistency model
+	@command -v java >/dev/null 2>&1 || { echo "java is required to run TLC" >&2; exit 1; }
+	cd $(COW_MODEL_DIR) && java -XX:+UseParallelGC -cp $(CURDIR)/$(TLA_TOOLS_JAR) tlc2.TLC -workers auto -config CowBtreeCrash.cfg CowBtreeCrash.tla
 
 ##@ Container Images
 #

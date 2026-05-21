@@ -284,10 +284,6 @@ fn assert_progress_history_complete(r: &RunReport) -> Result<(), TestCaseError> 
     for (t, _) in &r.progress_history {
         *got.entry(*t).or_default() += 1;
     }
-    prop_assert_eq!(
-        expected,
-        got,
-        "progress_history tag multiset mismatch",
-    );
+    prop_assert_eq!(expected, got, "progress_history tag multiset mismatch",);
     Ok(())
 }
