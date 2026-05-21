@@ -45,7 +45,7 @@ use unbounded_storage::bufferpool::{BlockStore, PageRef, StripeKey};
 use unbounded_storage::runtime::{
     DefaultRuntime, PinnedRuntime, Threading, WorkerIdx, WorkerSpec,
 };
-use unbounded_storage::storage::blockdev::{UringBlockDevice, UringConfig};
+use unbounded_storage::storage::blockdev::{BlockDevice, UringBlockDevice, UringConfig};
 use unbounded_storage::storage::{EngineConfig, LocalStorage, StorageEngine};
 use unbounded_storage::topology::{Host, Nvme, Plan, PlanConfig, Role};
 
@@ -134,6 +134,28 @@ struct BlockArgs {
     /// section).
     #[arg(long = "threads-per-device", default_value_t = DEFAULT_THREADS_PER_DEVICE)]
     threads_per_device: usize,
+
+    /// Disable `IORING_SETUP_IOPOLL`. Required for devices whose
+    /// request queue does not support polled I/O (e.g. SATA, SCSI,
+    /// virtio-blk). The production default targets NVMe and assumes
+    /// IOPOLL is supported.
+    #[arg(long = "no-iopoll")]
+    no_iopoll: bool,
+
+    /// Open the underlying file without `O_DIRECT`. Required for
+    /// regular files on filesystems that reject direct I/O, and
+    /// usable for non-NVMe block devices that mis-handle 2 MiB
+    /// direct I/O. Trades realistic numbers for the ability to run
+    /// at all.
+    #[arg(long = "no-o-direct")]
+    no_o_direct: bool,
+
+    /// Disable `IORING_SETUP_SINGLE_ISSUER` and
+    /// `IORING_SETUP_DEFER_TASKRUN`. These two flags pair with
+    /// IOPOLL on NVMe; turn them off together when running against
+    /// non-NVMe targets. Implied by `--no-iopoll`.
+    #[arg(long = "no-single-issuer")]
+    no_single_issuer: bool,
 }
 
 fn main() -> ExitCode {
@@ -229,6 +251,12 @@ fn run_block(args: BlockArgs) -> ExitCode {
 
     let (tx, rx) = mpsc::channel::<ShardOutcome>();
     let phase_duration = Duration::from_secs(args.duration);
+    // `--no-iopoll` forces the single-issuer / defer-taskrun pair off
+    // too: those flags only make sense on the IOPOLL fast path.
+    let iopoll = !args.no_iopoll;
+    let single_issuer = iopoll && !args.no_single_issuer;
+    let defer_taskrun = single_issuer;
+    let o_direct = !args.no_o_direct;
     let mut joins = Vec::with_capacity(total_shards);
     for shard_idx in 0..total_shards {
         let device_idx = shard_idx / threads_per_device;
@@ -247,6 +275,10 @@ fn run_block(args: BlockArgs) -> ExitCode {
             seed: args.seed,
             duration: phase_duration,
             ops_cap_per_shard,
+            iopoll,
+            o_direct,
+            single_issuer,
+            defer_taskrun,
         };
         worker_id_offset += workers_for_shard;
         let tx = tx.clone();
@@ -421,6 +453,10 @@ struct ShardConfig {
     seed: u64,
     duration: Duration,
     ops_cap_per_shard: Option<u64>,
+    iopoll: bool,
+    o_direct: bool,
+    single_issuer: bool,
+    defer_taskrun: bool,
 }
 
 /// Per-phase per-shard tally returned to the main thread.
@@ -476,6 +512,10 @@ fn run_shard_inner(
     device_label: String,
 ) -> Result<(ShardReport, Option<ShardReport>), String> {
     let mut uring_cfg = UringConfig::default();
+    uring_cfg.iopoll = cfg.iopoll;
+    uring_cfg.single_issuer = cfg.single_issuer;
+    uring_cfg.defer_taskrun = cfg.defer_taskrun;
+    uring_cfg.o_direct = cfg.o_direct;
     if let Some(qd) = cfg.queue_depth {
         if qd == 0 {
             return Err("--queue-depth must be >= 1".into());
@@ -508,6 +548,16 @@ fn run_shard_inner(
         page_count * page_size,
         cfg.seed ^ shard_seed(cfg.shard_idx),
     );
+
+    // Register the backing region with the io_uring ring before
+    // opening the engine: `BTreeIndex::open` issues meta writes
+    // through the device, and `READ_FIXED` / `WRITE_FIXED` need a
+    // registered buffer. The later `local.register_pages` call is
+    // tolerant of a duplicate `register_buffers` (it ignores the
+    // -EBUSY) and still installs the bufferpool binding.
+    device
+        .register_buffers(backing_base, page_count * page_size)
+        .map_err(|e| format!("device.register_buffers: {e:?}"))?;
 
     let engine_cfg = EngineConfig {
         bypass_admission: true,
