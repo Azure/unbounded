@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use crate::storage::alloc::Allocator;
-use crate::storage::blockdev::{MockDevice, MockDeviceConfig};
-use crate::storage::btree::page::{META_SLOT_A, META_SLOT_B};
+use crate::storage::blockdev::{BlockDevice, MockDevice, MockDeviceConfig};
+use crate::storage::btree::page::{self, Decoded, META_SLOT_A, META_SLOT_B};
 use crate::storage::btree::{BTreeIndex, LeafEntry, Mutation};
 use crate::storage::types::{Checksum, Lba, PageKey};
 
@@ -284,5 +284,145 @@ fn snapshot_drop_frees_old_pages() {
     assert!(
         used_after_second <= used_after_first,
         "second commit must not grow allocator (after_first={used_after_first}, after_second={used_after_second})",
+    );
+}
+
+// Decode one meta slot via direct device peek. Returns `None` if
+// the slot does not decode (corrupt / empty).
+fn read_meta_slot(dev: &MockDevice, lba: Lba) -> Option<(u64, Lba, u64)> {
+    let mut buf = vec![0u8; dev.page_size()];
+    dev.peek(lba, &mut buf);
+    match page::decode(&buf) {
+        Decoded::Meta {
+            txn_id,
+            root_lba,
+            hwm,
+        } => Some((txn_id, root_lba, hwm)),
+        _ => None,
+    }
+}
+
+// Highest-txn-id meta slot currently on disk, or `None` if neither
+// slot decodes. Mirrors what `meta::load_meta` would select.
+fn read_live_meta(dev: &MockDevice) -> Option<(u64, Lba, u64)> {
+    let a = read_meta_slot(dev, META_SLOT_A);
+    let b = read_meta_slot(dev, META_SLOT_B);
+    match (a, b) {
+        (None, None) => None,
+        (Some(m), None) | (None, Some(m)) => Some(m),
+        (Some(ma), Some(mb)) => Some(if ma.0 >= mb.0 { ma } else { mb }),
+    }
+}
+
+#[test]
+fn hwm_persisted_in_meta_after_bootstrap() {
+    // Bootstrap must persist a non-zero hwm because the allocator
+    // reserves META_SLOT_B (LBA 1) before the first commit.
+    let (dev, alloc) = fresh(64);
+    let _idx: BTreeIndex<MockDevice> =
+        block_on(BTreeIndex::open(dev.clone(), alloc.clone())).unwrap();
+    let (_txn, _root, hwm) = read_live_meta(&dev).expect("bootstrap writes a valid meta slot");
+    assert!(
+        hwm >= 1,
+        "bootstrap should observe at least the reserved meta slot LBAs in hwm; got {hwm}",
+    );
+}
+
+#[test]
+fn hwm_grows_with_commits() {
+    // The recorded hwm must cover at least the new root LBA after
+    // a commit; otherwise a bounded rebuild would miss the root.
+    let (dev, alloc) = fresh(128);
+    let idx = block_on(BTreeIndex::open(dev.clone(), alloc)).unwrap();
+    let muts: Vec<_> = (0..20u32)
+        .map(|i| Mutation::Insert {
+            key: key(i),
+            value: entry(1000 + i as u64),
+        })
+        .collect();
+    block_on(idx.apply_batch(muts)).unwrap();
+    let root = idx.current_root();
+    let (_txn, _root_meta, hwm) =
+        read_live_meta(&dev).expect("post-commit meta must decode");
+    assert!(
+        hwm >= root.0,
+        "hwm ({hwm}) must cover the new root LBA ({})",
+        root.0,
+    );
+}
+
+#[test]
+fn hwm_monotonic_across_reopen() {
+    // Reopen + commit must not let the persisted hwm regress: a
+    // regression would let bounded recovery skip a real LBA.
+    let (dev, alloc) = fresh(128);
+    {
+        let idx = block_on(BTreeIndex::open(dev.clone(), alloc)).unwrap();
+        block_on(idx.apply_batch(vec![
+            Mutation::Insert {
+                key: key(1),
+                value: entry(11),
+            },
+            Mutation::Insert {
+                key: key(2),
+                value: entry(22),
+            },
+        ]))
+        .unwrap();
+    }
+    let (_t1, _r1, hwm_before) = read_live_meta(&dev).expect("post-first-commit meta");
+
+    let alloc2 = Arc::new(Allocator::new(128));
+    let idx2 = block_on(BTreeIndex::open(dev.clone(), alloc2)).unwrap();
+    block_on(idx2.apply_batch(vec![Mutation::Insert {
+        key: key(3),
+        value: entry(33),
+    }]))
+    .unwrap();
+    let (_t2, _r2, hwm_after) = read_live_meta(&dev).expect("post-second-commit meta");
+    assert!(
+        hwm_after >= hwm_before,
+        "hwm regressed across reopen: before={hwm_before}, after={hwm_after}",
+    );
+}
+
+#[test]
+fn reopen_seeds_allocator_hwm() {
+    // After reopen the allocator's HWM must be at least the
+    // persisted hwm so future commits keep the recorded hwm
+    // monotonic across restarts (bounded recovery relies on it).
+    let (dev, alloc) = fresh(128);
+    {
+        let idx = block_on(BTreeIndex::open(dev.clone(), alloc)).unwrap();
+        let muts: Vec<_> = (0..30u32)
+            .map(|i| Mutation::Insert {
+                key: key(i),
+                value: entry(2000 + i as u64),
+            })
+            .collect();
+        block_on(idx.apply_batch(muts)).unwrap();
+    }
+    let (_t, _r, persisted_hwm) =
+        read_live_meta(&dev).expect("post-commit meta must decode");
+
+    let alloc2 = Arc::new(Allocator::new(128));
+    let idx2 = block_on(BTreeIndex::open(dev.clone(), alloc2)).unwrap();
+    assert!(
+        idx2.allocator_high_water() >= persisted_hwm,
+        "allocator hwm ({}) after reopen must cover persisted hwm ({})",
+        idx2.allocator_high_water(),
+        persisted_hwm,
+    );
+
+    // A follow-up commit must not let the persisted hwm regress.
+    block_on(idx2.apply_batch(vec![Mutation::Insert {
+        key: key(999),
+        value: entry(9999),
+    }]))
+    .unwrap();
+    let (_t2, _r2, hwm_after) = read_live_meta(&dev).expect("post-reopen-commit meta");
+    assert!(
+        hwm_after >= persisted_hwm,
+        "persisted hwm regressed after reopen+commit: before={persisted_hwm}, after={hwm_after}",
     );
 }

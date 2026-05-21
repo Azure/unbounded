@@ -4,12 +4,18 @@
 //! Restart-time recovery: LBA-order leaf scan.
 //!
 //! If both meta pages fail to decode we fall back to scanning
-//! every disk LBA looking for leaf pages. Among those, we pick
-//! the highest `txn_id` group and synthesize a fresh tree from
-//! their entries. This is the design's "LBA-order restart scan"
-//! and is intentionally tolerant of arbitrary garbage on disk -
-//! anything that doesn't parse as a leaf, or whose checksum
-//! mismatches, is silently skipped.
+//! disk LBAs looking for leaf pages. Among those, we pick the
+//! highest `txn_id` group and synthesize a fresh tree from their
+//! entries. This is the design's "LBA-order restart scan" and is
+//! intentionally tolerant of arbitrary garbage on disk - anything
+//! that doesn't parse as a leaf, or whose checksum mismatches, is
+//! silently skipped.
+//!
+//! The scan is bounded by the persisted high-water mark from the
+//! active meta slot: if a meta page survives we never need to
+//! look past its recorded HWM, since the allocator never handed
+//! out a higher LBA. If neither meta slot decodes we degrade to a
+//! full-capacity scan.
 //!
 //! Internal pages are *not* trusted during rebuild: torn writes
 //! that took out the meta slots may also have corrupted the
@@ -33,17 +39,29 @@ pub struct RebuildResult {
     pub entries: BTreeMap<PageKey, LeafEntry>,
 }
 
-/// Scan the disk for the highest-txn-id leaf cohort. In practice
-/// the per-disk capacity is a few hundred thousand 4 KiB pages and
-/// we expect to scan all of them.
-pub async fn scan_for_leaves<B: BlockDevice>(device: &B) -> Result<Option<RebuildResult>, Error> {
+/// Scan the disk for the highest-txn-id leaf cohort.
+///
+/// `upper_bound` bounds the LBA range scanned:
+/// - `None` means scan the full device (legacy / no meta survived).
+/// - `Some(0)` means a legacy meta page with no HWM info; also
+///   degrades to a full-capacity scan.
+/// - `Some(hwm)` scans `0..=hwm` clamped to the device, since the
+///   allocator never handed out a higher LBA.
+pub async fn scan_for_leaves<B: BlockDevice>(
+    device: &B,
+    upper_bound: Option<u64>,
+) -> Result<Option<RebuildResult>, Error> {
     let ps = device.page_size();
     let cap = device.capacity_pages();
+    let end = match upper_bound {
+        None | Some(0) => cap,
+        Some(hwm) => hwm.min(cap.saturating_sub(1)).saturating_add(1),
+    };
     let mut buf = vec![0u8; ps];
     let mut best_txn: u64 = 0;
     let mut best: BTreeMap<PageKey, LeafEntry> = BTreeMap::new();
 
-    for lba in 0..cap {
+    for lba in 0..end {
         if lba == META_SLOT_A.0 || lba == META_SLOT_B.0 {
             continue;
         }

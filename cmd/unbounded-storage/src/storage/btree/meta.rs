@@ -42,6 +42,7 @@ pub struct MetaState {
     pub active: MetaSlot,
     pub txn_id: u64,
     pub root_lba: Lba,
+    pub hwm: u64,
 }
 
 /// Read both meta slots. Returns the higher-valid-txn slot;
@@ -74,10 +75,15 @@ pub async fn load_meta<B: BlockDevice>(device: &B) -> Result<Option<MetaState>, 
 
 fn as_meta(d: Decoded, slot: MetaSlot) -> Option<MetaState> {
     match d {
-        Decoded::Meta { txn_id, root_lba } => Some(MetaState {
+        Decoded::Meta {
+            txn_id,
+            root_lba,
+            hwm,
+        } => Some(MetaState {
             active: slot,
             txn_id,
             root_lba,
+            hwm,
         }),
         _ => None,
     }
@@ -90,9 +96,10 @@ pub async fn write_inactive<B: BlockDevice>(
     current_active: MetaSlot,
     new_txn_id: u64,
     new_root: Lba,
+    new_hwm: u64,
 ) -> Result<MetaSlot, Error> {
     let target = current_active.other();
-    let page = page::encode_meta(device.page_size(), new_txn_id, new_root);
+    let page = page::encode_meta(device.page_size(), new_txn_id, new_root, new_hwm);
     device.write(target.lba(), &page).await?;
     Ok(target)
 }

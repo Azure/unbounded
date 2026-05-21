@@ -112,6 +112,10 @@ impl<B: BlockDevice> BTreeIndex<B> {
 
         let loaded = meta::load_meta(&*device).await?;
         if let Some(state) = loaded {
+            // Seed allocator HWM from persisted meta so future
+            // commits keep monotonicity even if tree walk visits a
+            // subset of the live frontier.
+            allocator.observe_high_water(state.hwm);
             if let Some(idx) = Self::open_from_meta(&device, &allocator, state).await? {
                 return Ok(idx);
             }
@@ -120,7 +124,9 @@ impl<B: BlockDevice> BTreeIndex<B> {
         }
 
         // Try LBA-scan rebuild.
-        if let Some(rebuilt) = rebuild::scan_for_leaves(&*device).await? {
+        if let Some(rebuilt) =
+            rebuild::scan_for_leaves(&*device, loaded.as_ref().map(|s| s.hwm)).await?
+        {
             return Self::bootstrap_from_entries(
                 device,
                 allocator,
@@ -179,7 +185,14 @@ impl<B: BlockDevice> BTreeIndex<B> {
 
         // Write meta into slot A by default (active=B means we
         // wrote to A; on next commit we'll write to B).
-        let active = meta::write_inactive(&*device, meta::MetaSlot::B, txn_id, root_lba).await?;
+        let active = meta::write_inactive(
+            &*device,
+            meta::MetaSlot::B,
+            txn_id,
+            root_lba,
+            allocator.high_water(),
+        )
+        .await?;
 
         let snapshot = RootSnapshot::new(root_lba, txn_id, pages, allocator.clone());
 
@@ -232,7 +245,17 @@ impl<B: BlockDevice> BTreeIndex<B> {
             cow::build_tree(&*self.device, &self.allocator, txn_id, &sorted).await?;
 
         let active = self.active_meta.get();
-        let new_active = match meta::write_inactive(&*self.device, active, txn_id, root_lba).await {
+        // build_tree above has already marked the new pages in
+        // use, so high_water() reflects them.
+        let new_active = match meta::write_inactive(
+            &*self.device,
+            active,
+            txn_id,
+            root_lba,
+            self.allocator.high_water(),
+        )
+        .await
+        {
             Ok(s) => s,
             Err(e) => {
                 cow::free_all(&self.allocator, &pages);
@@ -273,5 +296,10 @@ impl<B: BlockDevice> BTreeIndex<B> {
     /// for diagnostics and tests; lookups never use this.
     pub fn live_entries(&self) -> usize {
         self.mutator.borrow().entries.len()
+    }
+
+    /// Largest LBA ever allocated on the underlying allocator. Exposed for diagnostics and tests.
+    pub fn allocator_high_water(&self) -> u64 {
+        self.allocator.high_water()
     }
 }

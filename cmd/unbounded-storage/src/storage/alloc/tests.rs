@@ -81,3 +81,72 @@ fn used_and_free_accounting() {
     a.free(l).unwrap();
     assert_eq!(a.used_pages(), 0);
 }
+
+#[test]
+fn high_water_starts_zero() {
+    let a = Allocator::new(128);
+    assert_eq!(a.high_water(), 0);
+}
+
+#[test]
+fn high_water_tracks_alloc() {
+    let a = Allocator::new(128);
+    let mut max_seen = 0u64;
+    for _ in 0..10 {
+        let lba = a.alloc().unwrap();
+        max_seen = max_seen.max(lba.0);
+    }
+    assert_eq!(a.high_water(), max_seen);
+}
+
+#[test]
+fn high_water_tracks_mark_in_use() {
+    let a = Allocator::new(128);
+    a.mark_in_use(Lba(42)).unwrap();
+    assert!(a.high_water() >= 42);
+    a.mark_in_use(Lba(7)).unwrap();
+    assert!(a.high_water() >= 42);
+}
+
+#[test]
+fn high_water_monotonic_on_free() {
+    let a = Allocator::new(128);
+    let mut lbas = Vec::new();
+    for _ in 0..5 {
+        lbas.push(a.alloc().unwrap());
+    }
+    let hwm_before = a.high_water();
+    for l in lbas {
+        a.free(l).unwrap();
+    }
+    assert_eq!(a.high_water(), hwm_before);
+}
+
+#[test]
+fn observe_high_water_raises() {
+    let a = Allocator::new(1024);
+    a.observe_high_water(100);
+    assert_eq!(a.high_water(), 100);
+}
+
+#[test]
+fn observe_high_water_never_lowers() {
+    let a = Allocator::new(1024);
+    a.observe_high_water(100);
+    a.observe_high_water(50);
+    assert_eq!(a.high_water(), 100);
+}
+
+#[test]
+fn observe_high_water_below_current_allocations() {
+    let a = Allocator::new(1024);
+    let mut max_seen = 0u64;
+    for _ in 0..20 {
+        let lba = a.alloc().unwrap();
+        max_seen = max_seen.max(lba.0);
+    }
+    let hwm_before = a.high_water();
+    assert_eq!(hwm_before, max_seen);
+    a.observe_high_water(max_seen / 2);
+    assert_eq!(a.high_water(), hwm_before);
+}

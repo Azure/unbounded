@@ -38,6 +38,11 @@ struct Inner {
     /// Count of bits currently set; cheap to maintain and lets
     /// `is_full` / `used_pages` answer without scanning.
     used: u64,
+    /// Maximum LBA value ever recorded as in-use through this
+    /// allocator instance. Monotonic non-decreasing: `free` does
+    /// not lower it. Btree recovery uses this to bound its
+    /// rebuild-fallback scan.
+    max_ever: u64,
 }
 
 impl Allocator {
@@ -48,6 +53,7 @@ impl Allocator {
                 words: vec![0u64; n_words],
                 next: 0,
                 used: 0,
+                max_ever: 0,
             }),
             capacity: capacity_pages,
         }
@@ -124,6 +130,7 @@ impl Allocator {
             g.words[w] |= mask;
             g.used += 1;
         }
+        g.max_ever = g.max_ever.max(lba.0);
         Ok(())
     }
 
@@ -134,6 +141,23 @@ impl Allocator {
         let (w, b) = word_bit(lba.0);
         let g = self.inner.lock().unwrap();
         Ok(g.words[w] & (1u64 << b) != 0)
+    }
+
+    /// Largest LBA that has ever been recorded as in-use through this
+    /// allocator instance. Monotonic non-decreasing across the lifetime
+    /// of the allocator: freeing an LBA does not lower this value. Used
+    /// by btree recovery to bound the rebuild-fallback scan to the region
+    /// of the disk that has actually been touched.
+    pub fn high_water(&self) -> u64 {
+        self.inner.lock().unwrap().max_ever
+    }
+
+    /// Raise the high-water mark to at least `hwm`. Never lowers it.
+    /// Called by recovery to seed the in-memory HWM from a persisted
+    /// value before any new allocations occur.
+    pub fn observe_high_water(&self, hwm: u64) {
+        let mut g = self.inner.lock().unwrap();
+        g.max_ever = g.max_ever.max(hwm);
     }
 }
 
@@ -172,6 +196,7 @@ fn scan_from(inner: &mut Inner, start: u64, end: u64) -> Option<u64> {
                     inner.words[w] |= 1u64 << b;
                     inner.used += 1;
                     inner.next = candidate + 1;
+                    inner.max_ever = inner.max_ever.max(candidate);
                     return Some(candidate);
                 }
             }

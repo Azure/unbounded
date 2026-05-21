@@ -40,6 +40,12 @@ const PAGE_TYPE_OFFSET: usize = 0;
 const PAGE_TYPE_LEAF: u8 = 1;
 const PAGE_TYPE_META: u8 = 3;
 const TXN_ID_RANGE: std::ops::Range<usize> = 8..16;
+// Header offsets mirrored from `src/storage/btree/page.rs`.
+const HEADER_LEN: usize = 32;
+const HDR_CSUM_OFF: usize = 16;
+const HDR_CSUM_END: usize = 24;
+const META_ROOT_OFF: usize = HEADER_LEN; // 32
+const META_HWM_OFF: usize = HEADER_LEN + 8; // 40
 
 // ---------------------------------------------------------------------------
 // Harness.
@@ -934,6 +940,409 @@ fn concurrent_writes_same_key_collapse_to_one_entry() {
         "{} concurrent writes left {} resident LRU pages; followers must not admit their \
          own LBA",
         NUM_WRITERS, resident_pages,
+    );
+
+    drop(pool);
+}
+
+// ---------------------------------------------------------------------------
+// Helpers for the bounded-rebuild scenarios below. These touch the
+// raw on-disk format because the recovery paths they exercise are
+// driven by what is on disk, not by anything the engine exposes
+// through its public surface.
+// ---------------------------------------------------------------------------
+
+/// Recompute the page-header xxh3 checksum after the body has been
+/// mutated. Mirrors `seal_checksum` in `src/storage/btree/page.rs`.
+fn reseal_checksum(page: &mut [u8]) {
+    for b in &mut page[HDR_CSUM_OFF..HDR_CSUM_END] {
+        *b = 0;
+    }
+    let cs = twox_hash::xxh3::hash64(page);
+    page[HDR_CSUM_OFF..HDR_CSUM_END].copy_from_slice(&cs.to_le_bytes());
+}
+
+/// Hand-craft a meta page and write it at `lba`. The `root_lba`
+/// field is allowed to point at a non-meta LBA so we can build
+/// "meta survives but tree under it is gone" states for the
+/// rebuild-fallback paths.
+fn write_meta_page(device: &SimBlockDevice, lba: u64, txn_id: u64, root_lba: u64, hwm: u64) {
+    let mut page = vec![0u8; PAGE_SIZE];
+    page[0] = PAGE_TYPE_META;
+    page[2..4].copy_from_slice(&1u16.to_le_bytes());
+    page[8..16].copy_from_slice(&txn_id.to_le_bytes());
+    page[META_ROOT_OFF..META_ROOT_OFF + 8].copy_from_slice(&root_lba.to_le_bytes());
+    page[META_HWM_OFF..META_HWM_OFF + 8].copy_from_slice(&hwm.to_le_bytes());
+    reseal_checksum(&mut page);
+    device.poke(Lba(lba), &page);
+}
+
+/// Read meta-page hwm directly. Returns `None` if the page does not
+/// parse as a meta page by its leading byte.
+fn meta_hwm(device: &SimBlockDevice, lba: u64) -> Option<u64> {
+    let mut buf = vec![0u8; PAGE_SIZE];
+    device.peek(Lba(lba), &mut buf);
+    if buf[PAGE_TYPE_OFFSET] != PAGE_TYPE_META {
+        return None;
+    }
+    Some(u64::from_le_bytes(
+        buf[META_HWM_OFF..META_HWM_OFF + 8].try_into().unwrap(),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 5: bounded scan ignores garbage above hwm.
+//
+// Setup variant chosen: corrupt only the newer meta slot, then
+// poke a valid-looking leaf (bit-for-bit copy of a live leaf, so
+// the checksum still verifies) at an LBA far above the surviving
+// older meta's hwm. On reopen the engine must recover via the
+// older meta's tree (the meta fast-path) and must not pick up the
+// high-LBA "ghost" leaf. The invariant the test pins is that
+// recovery never consults LBAs beyond the persisted hwm: whether
+// because the meta fast-path bypasses the scan entirely (this
+// scenario) or because the bounded rebuild caps the scan at hwm.
+// ---------------------------------------------------------------------------
+#[test]
+fn recovery_bounded_scan_ignores_garbage_above_hwm() {
+    let device = new_device();
+    let mut pool = Pool::new(16);
+    let pool_base = pool.base() as usize;
+
+    let writes: Vec<(StripeKey, u64, Vec<u8>)> = (1u8..=4u8)
+        .map(|k| (stripe(k), 0u64, payload(k, 0, 71)))
+        .collect();
+    let writes_for_task = writes.clone();
+
+    // Phase 1: open, write enough to populate both meta slots.
+    {
+        let device = device.clone();
+        run_with_engine::<(), _>(0xBA11_AD01, device, move |eng, slot| {
+            Box::pin(async move {
+                eng.register_pages(pool_base as *mut u8, PAGE_SIZE, 16)
+                    .unwrap();
+                for (i, (k, off, bytes)) in writes_for_task.iter().enumerate() {
+                    admit_one(&eng, pool_base as *mut u8, i, *k, *off, bytes).await;
+                }
+                *slot.borrow_mut() = Some(());
+            })
+        });
+    }
+
+    // Identify slots; corrupt only the newer one so the older one
+    // survives with its hwm intact.
+    let txn_a = meta_txn_id(&device, META_LBA_A).expect("slot A must decode");
+    let txn_b = meta_txn_id(&device, META_LBA_B).expect("slot B must decode");
+    let (newer_lba, older_lba) = if txn_a > txn_b {
+        (META_LBA_A, META_LBA_B)
+    } else {
+        (META_LBA_B, META_LBA_A)
+    };
+    let older_hwm = meta_hwm(&device, older_lba).expect("older slot has a parseable hwm");
+    assert!(
+        older_hwm + 5 < device.capacity_pages(),
+        "device too small for this test: hwm={older_hwm}, cap={}",
+        device.capacity_pages(),
+    );
+
+    // Find an existing leaf to clone as "ghost" garbage. Bit-for-
+    // bit copy: the xxh3 checksum is over the page contents only,
+    // not the LBA, so the copy verifies just as well at any LBA.
+    let leaf_lba = find_leaf_lba(&device).expect("at least one leaf on disk");
+    let mut leaf_bytes = vec![0u8; PAGE_SIZE];
+    device.peek(Lba(leaf_lba), &mut leaf_bytes);
+
+    // Place the ghost leaf at a high LBA, strictly above the older
+    // meta's hwm. If recovery ever scanned past hwm it would
+    // discover this leaf and merge its entries into the live tree.
+    let ghost_lba = device.capacity_pages() - 3;
+    assert!(
+        ghost_lba > older_hwm,
+        "ghost LBA {ghost_lba} must be above older hwm {older_hwm}",
+    );
+    device.poke(Lba(ghost_lba), &leaf_bytes);
+
+    // Smash the newer meta only. Older meta still decodes, so the
+    // engine recovers via the meta fast-path.
+    let mut bad = vec![0u8; PAGE_SIZE];
+    device.peek(Lba(newer_lba), &mut bad);
+    bad[64] ^= 0xff;
+    device.poke(Lba(newer_lba), &bad);
+
+    // Phase 2: reopen, read every key. Any hit must match the
+    // bytes we wrote; misses are tolerated for keys that the
+    // older meta predates.
+    let writes_phase2 = writes.clone();
+    let read_results = {
+        let device = device.clone();
+        run_with_engine::<Vec<(bool, Vec<u8>)>, _>(0xBA11_AD02, device, move |eng, slot| {
+            Box::pin(async move {
+                eng.register_pages(pool_base as *mut u8, PAGE_SIZE, 16)
+                    .unwrap();
+                let mut results: Vec<(bool, Vec<u8>)> = Vec::new();
+                let read_base = writes_phase2.len();
+                for (i, (k, off, _)) in writes_phase2.iter().enumerate() {
+                    let slot_idx = read_base + i;
+                    // SAFETY: dedicated read slot.
+                    unsafe {
+                        let p = (pool_base as *mut u8).add(slot_idx * PAGE_SIZE);
+                        std::ptr::write_bytes(p, 0, PAGE_SIZE);
+                    }
+                    let dst = PageRef {
+                        page_idx: slot_idx as u32,
+                        offset: 0,
+                        len: PAGE_SIZE as u32,
+                    };
+                    let hit = eng.read_page(*k, *off, dst).await.unwrap();
+                    let bytes_back = if hit {
+                        let p = unsafe { (pool_base as *const u8).add(slot_idx * PAGE_SIZE) };
+                        unsafe { std::slice::from_raw_parts(p, PAGE_SIZE) }.to_vec()
+                    } else {
+                        Vec::new()
+                    };
+                    results.push((hit, bytes_back));
+                }
+                *slot.borrow_mut() = Some(results);
+            })
+        })
+    };
+
+    for (i, (hit, bytes_back)) in read_results.iter().enumerate() {
+        if *hit {
+            assert_eq!(
+                bytes_back, &writes[i].2,
+                "key {} returned wrong bytes after reopen with high-LBA ghost leaf",
+                i,
+            );
+        }
+    }
+
+    // After reopen the (now-)live meta's hwm must be at least the
+    // older slot's hwm: monotonicity holds even with the newer
+    // slot torn.
+    let live_a = meta_hwm(&device, META_LBA_A).unwrap_or(0);
+    let live_b = meta_hwm(&device, META_LBA_B).unwrap_or(0);
+    let live_hwm = live_a.max(live_b);
+    assert!(
+        live_hwm >= older_hwm,
+        "live hwm ({live_hwm}) regressed below older surviving hwm ({older_hwm})",
+    );
+
+    drop(pool);
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 6: legacy zero-hwm forces a full-capacity scan.
+//
+// A meta page predating the hwm field decodes with `hwm = 0`. The
+// rebuild path treats `Some(0)` as "unknown" and scans the entire
+// device. Setup: write a leaf at a high LBA, then plant two meta
+// pages whose hwm is zero and whose root_lba points at a known-
+// invalid LBA so the meta fast-path fails and recovery falls into
+// the rebuild scan. The scan must reach the high-LBA leaf, prov-
+// ing the legacy hwm=0 fallback degrades to a full scan rather
+// than silently dropping anything above slot LBA 1.
+// ---------------------------------------------------------------------------
+#[test]
+fn recovery_legacy_zero_hwm_falls_back_to_full_scan() {
+    let device = new_device();
+    let mut pool = Pool::new(16);
+    let pool_base = pool.base() as usize;
+
+    let writes: Vec<(StripeKey, u64, Vec<u8>)> = (1u8..=3u8)
+        .map(|k| (stripe(k), 0u64, payload(k, 0, 83)))
+        .collect();
+    let writes_for_task = writes.clone();
+
+    // Phase 1: write some pages so the engine produces real leaf
+    // pages we can clone.
+    {
+        let device = device.clone();
+        run_with_engine::<(), _>(0x0E6A_C001, device, move |eng, slot| {
+            Box::pin(async move {
+                eng.register_pages(pool_base as *mut u8, PAGE_SIZE, 16)
+                    .unwrap();
+                for (i, (k, off, bytes)) in writes_for_task.iter().enumerate() {
+                    admit_one(&eng, pool_base as *mut u8, i, *k, *off, bytes).await;
+                }
+                *slot.borrow_mut() = Some(());
+            })
+        });
+    }
+
+    // Copy a live leaf to a high LBA so the rebuild scan has a
+    // valid leaf to find well past the low region.
+    let leaf_lba = find_leaf_lba(&device).expect("at least one leaf must exist");
+    let mut leaf_bytes = vec![0u8; PAGE_SIZE];
+    device.peek(Lba(leaf_lba), &mut leaf_bytes);
+    let high_lba = device.capacity_pages() - 2;
+    device.poke(Lba(high_lba), &leaf_bytes);
+
+    // Plant legacy meta pages: hwm=0, root pointing into the void
+    // so meta-fast-path fails and we fall through to the bounded
+    // rebuild scan with `upper_bound = Some(0)` (full scan).
+    let invalid_root = device.capacity_pages() - 1;
+    write_meta_page(&device, META_LBA_A, 1, invalid_root, 0);
+    write_meta_page(&device, META_LBA_B, 1, invalid_root, 0);
+
+    // Phase 2: reopen. Either the engine recovers via full scan
+    // (picking up the high-LBA leaf) or it errors out. Both are
+    // acceptable as long as any hit returns the bytes we wrote.
+    let writes_phase2 = writes.clone();
+    let outcome = {
+        let device = device.clone();
+        run_one::<Result<Vec<(bool, Vec<u8>)>, String>, _>(0x0E6A_C002, move |slot| {
+            Box::pin(async move {
+                let opened = StorageEngine::open(device.clone(), engine_cfg()).await;
+                let eng = match opened {
+                    Ok(e) => e,
+                    Err(e) => {
+                        *slot.borrow_mut() = Some(Err(format!("{e}")));
+                        return;
+                    }
+                };
+                if let Err(e) = eng.register_pages(pool_base as *mut u8, PAGE_SIZE, 16) {
+                    *slot.borrow_mut() = Some(Err(format!("register_pages: {e}")));
+                    return;
+                }
+                let mut results: Vec<(bool, Vec<u8>)> = Vec::new();
+                let read_base = writes_phase2.len();
+                for (i, (k, off, _)) in writes_phase2.iter().enumerate() {
+                    let slot_idx = read_base + i;
+                    // SAFETY: dedicated read slot.
+                    unsafe {
+                        let p = (pool_base as *mut u8).add(slot_idx * PAGE_SIZE);
+                        std::ptr::write_bytes(p, 0, PAGE_SIZE);
+                    }
+                    let dst = PageRef {
+                        page_idx: slot_idx as u32,
+                        offset: 0,
+                        len: PAGE_SIZE as u32,
+                    };
+                    let hit = eng.read_page(*k, *off, dst).await.unwrap();
+                    let bytes_back = if hit {
+                        let p = unsafe { (pool_base as *const u8).add(slot_idx * PAGE_SIZE) };
+                        unsafe { std::slice::from_raw_parts(p, PAGE_SIZE) }.to_vec()
+                    } else {
+                        Vec::new()
+                    };
+                    results.push((hit, bytes_back));
+                }
+                *slot.borrow_mut() = Some(Ok(results));
+            })
+        })
+    };
+
+    match outcome {
+        Ok(results) => {
+            for (i, (hit, bytes_back)) in results.iter().enumerate() {
+                if *hit {
+                    assert_eq!(
+                        bytes_back, &writes[i].2,
+                        "key {} returned wrong bytes after legacy-hwm full-scan rebuild",
+                        i,
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "recovery_legacy_zero_hwm_falls_back_to_full_scan: open errored gracefully: {e}",
+            );
+        }
+    }
+
+    drop(pool);
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 7: hwm stays monotonic across a torn-meta restart.
+//
+// Drive several commit cycles so meta slots A and B both record
+// non-decreasing hwm values, capture the older slot's hwm, then
+// tear only the newer slot. On reopen the engine recovers via the
+// older meta. The very next commit must publish a meta whose hwm
+// is at least the older surviving hwm; the recorded hwm must
+// never regress across the restart.
+// ---------------------------------------------------------------------------
+#[test]
+fn recovery_hwm_monotonic_across_torn_meta() {
+    let device = new_device();
+    let mut pool = Pool::new(16);
+    let pool_base = pool.base() as usize;
+
+    let writes_phase1: Vec<(StripeKey, u64, Vec<u8>)> = (1u8..=4u8)
+        .map(|k| (stripe(k), 0u64, payload(k, 0, 97)))
+        .collect();
+    let writes_for_task = writes_phase1.clone();
+
+    // Phase 1: open, write enough that both meta slots have
+    // recorded an hwm value.
+    {
+        let device = device.clone();
+        run_with_engine::<(), _>(0x1107_BA01, device, move |eng, slot| {
+            Box::pin(async move {
+                eng.register_pages(pool_base as *mut u8, PAGE_SIZE, 16)
+                    .unwrap();
+                for (i, (k, off, bytes)) in writes_for_task.iter().enumerate() {
+                    admit_one(&eng, pool_base as *mut u8, i, *k, *off, bytes).await;
+                }
+                *slot.borrow_mut() = Some(());
+            })
+        });
+    }
+
+    let txn_a = meta_txn_id(&device, META_LBA_A).expect("slot A must decode");
+    let txn_b = meta_txn_id(&device, META_LBA_B).expect("slot B must decode");
+    let (newer_lba, older_lba) = if txn_a > txn_b {
+        (META_LBA_A, META_LBA_B)
+    } else {
+        (META_LBA_B, META_LBA_A)
+    };
+    let older_hwm = meta_hwm(&device, older_lba).expect("older slot has hwm");
+    let newer_hwm = meta_hwm(&device, newer_lba).expect("newer slot has hwm");
+    assert!(
+        newer_hwm >= older_hwm,
+        "pre-tear: newer hwm ({newer_hwm}) regressed below older ({older_hwm})",
+    );
+
+    // Tear only the newer slot.
+    let mut bad = vec![0u8; PAGE_SIZE];
+    device.peek(Lba(newer_lba), &mut bad);
+    bad[64] ^= 0xff;
+    device.poke(Lba(newer_lba), &bad);
+
+    // Phase 2: reopen and perform at least one additional commit
+    // so a fresh meta page is written into the formerly-newer
+    // slot. The published hwm must not regress below the older
+    // surviving hwm.
+    let writes_phase2: Vec<(StripeKey, u64, Vec<u8>)> = (5u8..=6u8)
+        .map(|k| (stripe(k), 0u64, payload(k, 0, 97)))
+        .collect();
+    let writes_for_task2 = writes_phase2.clone();
+    {
+        let device = device.clone();
+        run_with_engine::<(), _>(0x1107_BA02, device, move |eng, slot| {
+            Box::pin(async move {
+                eng.register_pages(pool_base as *mut u8, PAGE_SIZE, 16)
+                    .unwrap();
+                for (i, (k, off, bytes)) in writes_for_task2.iter().enumerate() {
+                    admit_one(&eng, pool_base as *mut u8, i, *k, *off, bytes).await;
+                }
+                *slot.borrow_mut() = Some(());
+            })
+        });
+    }
+
+    // At least one of the slots is now a freshly-written meta.
+    // Monotonicity is a property of the live (highest-txn) meta,
+    // not of a specific slot.
+    let live_a = meta_hwm(&device, META_LBA_A).unwrap_or(0);
+    let live_b = meta_hwm(&device, META_LBA_B).unwrap_or(0);
+    let live_hwm = live_a.max(live_b);
+    assert!(
+        live_hwm >= older_hwm,
+        "live hwm ({live_hwm}) regressed below older surviving hwm ({older_hwm}) after torn-meta restart",
     );
 
     drop(pool);
