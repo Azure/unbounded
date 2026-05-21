@@ -45,7 +45,7 @@ DEV_RENDERED      := $(HACK_DIR)rendered-dev
         deploy deploy-localstack deploy-azurite deploy-azurite-maybe \
         deploy-credentials deploy-orca \
         wait-ready logs port-forward dev-azure status \
-        data-generate data-upload data-list data-delete \
+        data-generate data-upload data-random data-list data-delete \
         roundtrip cache-list cache-inspect cache-clear bench scenario
 
 help: ## Show this help
@@ -76,6 +76,7 @@ help: ## Show this help
 	@echo ""
 	@echo "Seed origin (NodePort 30200 for awss3 / 30100 for azureblob; needs cluster up):"
 	@echo "  data-generate ARGS='--size 10MiB --count 5'   Synthesise N blobs"
+	@echo "  data-random   NAME=foo [SIZE=10MiB]            Synthesise one random blob 'foo1' of SIZE"
 	@echo "  data-upload   FILE=/path/to/file               Upload a single file"
 	@echo "  data-list     [ARGS='--prefix foo']            List origin objects"
 	@echo "  data-delete   [PREFIX=foo] [ARGS='--yes']      Delete origin objects"
@@ -310,8 +311,9 @@ dev-azure: ## Upload a file to real Azure (requires AZURE_STORAGE_* in .env; pas
 #
 #   make -C hack/orca data-generate ARGS='--size 10MiB --count 5'
 #   make -C hack/orca data-upload   FILE=~/data.tar.gz
+#   make -C hack/orca data-random   NAME=orca-test SIZE=10MiB
 #   make -C hack/orca data-list
-#   make -C hack/orca data-delete   PREFIX=synth- ARGS='--yes'
+#   make -C hack/orca data-delete   PREFIX=synth ARGS='--yes'
 #   make -C hack/orca roundtrip     FILE=~/data.bin
 #   make -C hack/orca cache-list
 #   make -C hack/orca cache-inspect BUCKET=orca-origin KEY=data.bin
@@ -326,6 +328,12 @@ data-upload: ## Upload a file to the origin (use FILE=/path/to/file)
 	@[ -n "$(FILE)" ] || { echo "Usage: make data-upload FILE=/path/to/file [ARGS='--name foo']" >&2; exit 1; }
 	@if [ -f "$(ENV_FILE)" ]; then set -a && . "$(ENV_FILE)" && set +a; fi; \
 	go run "$(REPO_ROOT)/hack/cmd/orcadev" upload --file "$(FILE)" $(ARGS)
+
+data-random: ## Synthesise one random blob and upload it (NAME=foo [SIZE=10MiB])
+	@[ -n "$(NAME)" ] || { echo "Usage: make data-random NAME=foo [SIZE=10MiB] [ARGS='--seed 42']" >&2; exit 1; }
+	@if [ -f "$(ENV_FILE)" ]; then set -a && . "$(ENV_FILE)" && set +a; fi; \
+	go run "$(REPO_ROOT)/hack/cmd/orcadev" upload --generate \
+		--count 1 --name "$(NAME)" --size "$${SIZE:-10MiB}" $(ARGS)
 
 data-list: ## List objects in the origin
 	@if [ -f "$(ENV_FILE)" ]; then set -a && . "$(ENV_FILE)" && set +a; fi; \

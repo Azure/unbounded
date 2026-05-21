@@ -69,11 +69,14 @@ exposed to the host via Kind's `extraPortMappings`, so no
 that matches your `.env` ORIGIN_DRIVER value.
 
 ```bash
-# 5 x 10 MiB random blobs named synth-0 ... synth-4
+# 5 x 10 MiB random blobs named synth1 ... synth5
 make -C hack/orca data-generate ARGS='--size 10MiB --count 5'
 
-# Or a single 100 MiB blob named big-0
-make -C hack/orca data-generate ARGS='--size 100MiB --count 1 --prefix big-'
+# Single random blob (use this for benchmarks; named "orca-test1")
+make -C hack/orca data-random NAME=orca-test SIZE=10MiB
+
+# Or a single 100 MiB blob named big1
+make -C hack/orca data-generate ARGS='--size 100MiB --count 1 --name big'
 
 # Or upload a real file from disk
 make -C hack/orca data-upload FILE=~/data.tar.gz
@@ -83,7 +86,7 @@ make -C hack/orca data-generate ARGS='--size 10MiB --count 3 --seed 42'
 
 # Inspect / clean up
 make -C hack/orca data-list
-make -C hack/orca data-delete PREFIX=synth- ARGS='--yes'
+make -C hack/orca data-delete PREFIX=synth ARGS='--yes'
 ```
 
 Per-blob ceiling: 1 GiB unless `--force`. Cumulative-bytes warning at
@@ -105,14 +108,14 @@ Leave this running.
 
 ```bash
 # First hit: cold fill. Triggers origin GetRange, cachestore PutChunk.
-curl -v http://localhost:8443/orca-test/synth-0 -o /dev/null
+curl -v http://localhost:8443/orca-test/synth1 -o /dev/null
 
 # Second hit: warm cache. catalog hit -> cachestore_get_chunk.
-curl -v http://localhost:8443/orca-test/synth-0 -o /dev/null
+curl -v http://localhost:8443/orca-test/synth1 -o /dev/null
 ```
 
 For the bigger blob, you can watch chunked streaming behaviour by
-running the GET against `big-0` (12 chunks at the default 8 MiB
+running the GET against `big1` (12 chunks at the default 8 MiB
 chunk size) and tailing the logs in parallel.
 
 ## Step 6 - Watch the per-chunk debug trace
@@ -304,6 +307,7 @@ Deletes the Kind cluster (and everything in it).
 | `make -C hack/orca logs` | Tail all Orca pods. |
 | `make -C hack/orca port-forward` | localhost:8443 -> edge service. |
 | `make -C hack/orca data-generate ARGS='...'` | Synthetic content. |
+| `make -C hack/orca data-random NAME=foo [SIZE=10MiB]` | One random blob `foo1` of SIZE. |
 | `make -C hack/orca data-upload FILE=...` | Upload a real file. |
 | `make -C hack/orca data-list` | What's in the origin. |
 | `make -C hack/orca data-delete [PREFIX=...]` | Remove origin objects. |

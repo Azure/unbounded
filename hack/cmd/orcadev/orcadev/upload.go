@@ -30,7 +30,6 @@ type uploadOpts struct {
 	generate    bool
 	count       int
 	sizeStr     string
-	prefix      string
 	seed        int64
 	concurrency int
 	force       bool
@@ -46,13 +45,16 @@ const (
 	// uploadTotalWarn is the cumulative-bytes threshold above which
 	// the command logs a warning before proceeding.
 	uploadTotalWarn int64 = 1024 * 1024 * 1024
+	// uploadDefaultName is the default --name in --generate mode
+	// when the operator does not pass one explicitly. Yields blobs
+	// "synth1", "synth2", ... .
+	uploadDefaultName = "synth"
 )
 
 func newUploadCmd(g *globalFlags) *cobra.Command {
 	o := &uploadOpts{
 		sizeStr:     "1MiB",
 		count:       1,
-		prefix:      "synth-",
 		concurrency: 4,
 	}
 
@@ -66,10 +68,11 @@ container. Two modes:
       Stream a single file from disk. Default destination name is
       filepath.Base(--file).
 
-  orcadev upload --generate --count 5 --size 10MiB
+  orcadev upload --generate --count 5 --size 10MiB [--name foo]
       Synthesise --count blobs of --size random bytes each, named
-      <prefix>0, <prefix>1, ... Set --seed for reproducible content
-      across runs.
+      <name>1, <name>2, ... <name>N. Default --name is "synth"
+      (so the default output is "synth1", "synth2", ...). Set
+      --seed for reproducible content across runs.
 
 In both modes --print-checksum streams an extra SHA-256 over the
 uploaded bytes and prints the digest, useful for later verification.`,
@@ -79,11 +82,13 @@ uploaded bytes and prints the digest, useful for later verification.`,
 	}
 
 	cmd.Flags().StringVar(&o.file, "file", "", "local file to upload (mutually exclusive with --generate)")
-	cmd.Flags().StringVar(&o.name, "name", "", "destination object name (defaults to basename of --file)")
+	cmd.Flags().StringVar(&o.name, "name", "",
+		"destination object name; in --generate mode the per-blob index "+
+			"is appended (defaults to basename of --file in file mode, "+
+			"or \"synth\" in --generate mode)")
 	cmd.Flags().BoolVar(&o.generate, "generate", false, "synthesise --count blobs instead of uploading a file")
 	cmd.Flags().StringVar(&o.sizeStr, "size", o.sizeStr, "per-blob size (e.g. 1MiB, 100MB, 1GiB)")
 	cmd.Flags().IntVar(&o.count, "count", o.count, "number of blobs to generate")
-	cmd.Flags().StringVar(&o.prefix, "prefix", o.prefix, "synthetic blob name prefix")
 	cmd.Flags().Int64Var(&o.seed, "seed", o.seed, "PRNG seed for deterministic content; 0 = crypto/rand")
 	cmd.Flags().IntVar(&o.concurrency, "concurrency", o.concurrency, "parallel uploads in --generate mode")
 	cmd.Flags().BoolVar(&o.force, "force", o.force, "allow per-blob size > 1 GiB")
@@ -173,6 +178,16 @@ func runUploadGenerate(ctx context.Context, oc originClient, o *uploadOpts) erro
 		o.concurrency = 1
 	}
 
+	// In --generate mode --name doubles as the per-blob base name;
+	// the index 1..count is appended to produce the destination
+	// object name. An empty --name falls back to "synth" so the
+	// command works without surprises if the operator forgets the
+	// flag.
+	name := o.name
+	if name == "" {
+		name = uploadDefaultName
+	}
+
 	size, err := parseSize(o.sizeStr)
 	if err != nil {
 		return fmt.Errorf("--size: %w", err)
@@ -236,11 +251,16 @@ func runUploadGenerate(ctx context.Context, oc originClient, o *uploadOpts) erro
 
 	checksums := make([]checksumEntry, o.count)
 
-	for i := 0; i < o.count; i++ {
+	// 1-based loop: blobs are named <name>1, <name>2, ..., <name>N.
+	// 1-based indexing was chosen over 0-based so the single-blob
+	// case (--count 1) yields "<name>1" rather than "<name>0",
+	// which reads more naturally for an operator typing
+	// `orcadev bench KEY=foo1`.
+	for i := 1; i <= o.count; i++ {
 		i := i
 
 		eg.Go(func() error {
-			name := fmt.Sprintf("%s%d", o.prefix, i)
+			blobName := fmt.Sprintf("%s%d", name, i)
 			body := newRandomReader(size, o.seed, int64(i))
 
 			h := hasher()
@@ -250,7 +270,7 @@ func runUploadGenerate(ctx context.Context, oc originClient, o *uploadOpts) erro
 				reader = newTeeHashReader(reader, h)
 			}
 
-			if err := oc.Put(gctx, name, reader, size); err != nil {
+			if err := oc.Put(gctx, blobName, reader, size); err != nil {
 				return err
 			}
 
@@ -258,7 +278,8 @@ func runUploadGenerate(ctx context.Context, oc originClient, o *uploadOpts) erro
 			bytes.Add(size)
 
 			if o.printChecksum {
-				checksums[i] = checksumEntry{Name: name, Hex: hexSum(h), Size: size}
+				// Slice is 0-indexed; i is 1-based.
+				checksums[i-1] = checksumEntry{Name: blobName, Hex: hexSum(h), Size: size}
 			}
 
 			return nil

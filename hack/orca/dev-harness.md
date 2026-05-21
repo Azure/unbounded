@@ -163,6 +163,7 @@ For seeding into the in-cluster LocalStack S3 origin (the default
 ```bash
 make -C hack/orca data-upload FILE=/path/to/local-file
 make -C hack/orca data-generate ARGS='--size 10MiB --count 5'
+make -C hack/orca data-random NAME=orca-test SIZE=10MiB
 ```
 
 ## Exercise the cache

@@ -4,6 +4,7 @@
 package orcadev
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -186,15 +187,32 @@ func (a *awss3Origin) Get(ctx context.Context, key string) (io.ReadCloser, int64
 }
 
 func (a *awss3Origin) Put(ctx context.Context, key string, r io.Reader, n int64) error {
-	// PutObject streams r in a single request. For very large files
-	// (multi-GiB) a multipart upload would let us parallelize, but
-	// orcadev uploads are dev-only and a single-request stream
-	// keeps the implementation simple. If perf becomes an issue,
-	// swap in feature/s3/transfermanager.
+	// PutObject with SigV4 needs a seekable body so the SDK can
+	// compute X-Amz-Content-SHA256 over the payload and then re-read
+	// the body for the actual upload. Generators (e.g. crypto/rand,
+	// math/rand) and os.File-with-seek-disabled are NOT seekable,
+	// causing "failed to seek body to start". Buffer the body to a
+	// bytes.Buffer up front so the resulting bytes.Reader is
+	// seekable. The orcadev tool caps synthetic blob sizes at 1 GiB
+	// by default (--force to override) so this in-memory buffer
+	// stays bounded.
+	//
+	// If perf becomes an issue for multi-GiB payloads, swap in
+	// feature/s3/transfermanager (multipart upload, streams
+	// natively).
+	buf := &bytes.Buffer{}
+	if n > 0 {
+		buf.Grow(int(n))
+	}
+
+	if _, err := io.Copy(buf, r); err != nil {
+		return fmt.Errorf("origin/awss3: read body for %s: %w", key, err)
+	}
+
 	in := &s3.PutObjectInput{
 		Bucket: aws.String(a.cfg.originBucket),
 		Key:    aws.String(key),
-		Body:   r,
+		Body:   bytes.NewReader(buf.Bytes()),
 	}
 	if n > 0 {
 		in.ContentLength = aws.Int64(n)
