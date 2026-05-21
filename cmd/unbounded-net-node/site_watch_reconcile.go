@@ -1720,15 +1720,32 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 		selectedPool := gatewayPoolMap[selectedPoolName]
 		localRoutes := buildGatewayNodeRoutesForAssignedSitesStatus(selectedPoolName, selectedPool, assignments, siteMap)
 		routes := mergeGatewayNodeAdvertisedRoutes(localRoutes, gatewayPeers, selectedPoolName)
-		klog.V(2).Infof("Gateway route advertisement: pool=%s, %d local + %d merged routes, %d assignments",
-			selectedPoolName, len(localRoutes), len(routes), len(assignments))
+
+		summary := gatewayAdvertSummary{
+			state: "active",
+			hash:  gatewayAdvertHashActive(selectedPoolName, localRoutes, routes, len(assignments)),
+		}
+		if summary != state.lastGatewayAdvertSummary {
+			klog.V(2).Infof("Gateway route advertisement: pool=%s, %d local + %d merged routes, %d assignments",
+				selectedPoolName, len(localRoutes), len(routes), len(assignments))
+
+			state.lastGatewayAdvertSummary = summary
+		}
 
 		if err := syncGatewayNodeRoutesStatus(ctx, dynamicClient, gatewayNodeInformer, cfg.NodeName, routes); err != nil {
 			klog.Warningf("Failed to publish GatewayNode routes for node %s: %v", cfg.NodeName, err)
 		}
 	} else if isGatewayNode {
-		klog.V(2).Infof("Gateway route advertisement skipped: dynamicClient=%v, localGatewayPools=%v",
-			dynamicClient != nil, localGatewayPools)
+		summary := gatewayAdvertSummary{
+			state: "skipped",
+			hash:  gatewayAdvertHashSkipped(dynamicClient != nil, localGatewayPools),
+		}
+		if summary != state.lastGatewayAdvertSummary {
+			klog.V(2).Infof("Gateway route advertisement skipped: dynamicClient=%v, localGatewayPools=%v",
+				dynamicClient != nil, localGatewayPools)
+
+			state.lastGatewayAdvertSummary = summary
+		}
 	}
 
 	// Collect all mesh peers from allSlices using a unified loop.
