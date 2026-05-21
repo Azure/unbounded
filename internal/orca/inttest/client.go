@@ -7,7 +7,6 @@ package inttest
 
 import (
 	"context"
-	"encoding/xml"
 	"fmt"
 	"io"
 	"net/http"
@@ -59,38 +58,6 @@ func (c *Client) Head(ctx context.Context, t *testing.T, bucket, key string) Get
 	t.Helper()
 
 	return c.do(ctx, t, http.MethodHead, fmt.Sprintf("/%s/%s", bucket, key), nil)
-}
-
-// ListBucketResult mirrors the (subset) S3 ListObjectsV2 XML response
-// shape produced by the orca edge handler.
-type ListBucketResult struct {
-	XMLName  xml.Name `xml:"ListBucketResult"`
-	Name     string   `xml:"Name"`
-	Prefix   string   `xml:"Prefix"`
-	KeyCount int      `xml:"KeyCount"`
-	Contents []struct {
-		Key  string `xml:"Key"`
-		Size int64  `xml:"Size"`
-		ETag string `xml:"ETag"`
-	} `xml:"Contents"`
-}
-
-// List issues a LIST against /bucket/?list-type=2&prefix=<prefix>.
-func (c *Client) List(ctx context.Context, t *testing.T, bucket, prefix string) ListBucketResult {
-	t.Helper()
-
-	resp := c.do(ctx, t, http.MethodGet,
-		fmt.Sprintf("/%s/?list-type=2&prefix=%s", bucket, prefix), nil)
-	if resp.Status != http.StatusOK {
-		t.Fatalf("LIST status=%d body=%s", resp.Status, string(resp.Body))
-	}
-
-	var out ListBucketResult
-	if err := xml.Unmarshal(resp.Body, &out); err != nil {
-		t.Fatalf("LIST decode: %v body=%s", err, string(resp.Body))
-	}
-
-	return out
 }
 
 func (c *Client) do(ctx context.Context, t *testing.T, method, path string, hdr http.Header) GetResponse {

@@ -24,9 +24,6 @@ type Origin interface {
 	// passed as `If-Match: <etag>` so a mid-flight overwrite is detected
 	// at the wire (returns OriginETagChangedError).
 	GetRange(ctx context.Context, bucket, key, etag string, off, n int64) (io.ReadCloser, error)
-
-	// List enumerates objects under prefix. Pagination via marker.
-	List(ctx context.Context, bucket, prefix, marker string, max int) (ListResult, error)
 }
 
 // ObjectInfo is the result of a successful Head.
@@ -36,21 +33,6 @@ type ObjectInfo struct {
 	ContentType   string
 	LastValidated time.Time
 	LastStatus    int
-}
-
-// ListResult is the paginated result of List.
-type ListResult struct {
-	Entries     []ObjectEntry
-	NextMarker  string
-	IsTruncated bool
-}
-
-// ObjectEntry is one item in a ListResult.
-type ObjectEntry struct {
-	Key      string
-	Size     int64
-	ETag     string
-	BlobType string // "" for s3; "BlockBlob" / "PageBlob" / "AppendBlob" for azureblob
 }
 
 // Sentinel errors. Wrap with %w so callers use errors.Is.

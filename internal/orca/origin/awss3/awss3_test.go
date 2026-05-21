@@ -5,7 +5,6 @@ package awss3
 
 import (
 	"errors"
-	"math"
 	"net/http"
 	"testing"
 
@@ -120,41 +119,6 @@ func TestIsAuth(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := isAuth(tt.err); got != tt.want {
 				t.Errorf("isAuth = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
-// TestClampMaxKeys covers the upper-bound, lower-bound, and
-// passthrough branches of the ListObjectsV2.MaxKeys clamp. The
-// helper exists to close the int32-overflow window CodeQL flagged
-// at the original Adapter.List call site (the cast of a
-// host-int maxResults to int32 without an upper-bound check). The
-// upper-bound case asserts that an arbitrarily large host-int
-// produces the documented S3 ceiling rather than wrapping to a
-// non-deterministic (and possibly negative) int32 value.
-func TestClampMaxKeys(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name string
-		in   int
-		want int32
-	}{
-		{"zero passthrough", 0, 0},
-		{"small positive passthrough", 100, 100},
-		{"exactly the cap", s3MaxKeysCap, int32(s3MaxKeysCap)},
-		{"one above the cap", s3MaxKeysCap + 1, int32(s3MaxKeysCap)},
-		{"int32 max -> cap", math.MaxInt32, int32(s3MaxKeysCap)},
-		{"int64 max -> cap (no overflow)", math.MaxInt, int32(s3MaxKeysCap)},
-		{"negative one -> 0", -1, 0},
-		{"int min -> 0 (no overflow)", math.MinInt, 0},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := clampMaxKeys(tt.in); got != tt.want {
-				t.Errorf("clampMaxKeys(%d) = %d, want %d", tt.in, got, tt.want)
 			}
 		})
 	}

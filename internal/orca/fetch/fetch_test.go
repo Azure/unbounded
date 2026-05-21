@@ -187,10 +187,6 @@ func (f *fakeOriginForFill) GetRange(_ context.Context, _, _, _ string, _, _ int
 	return io.NopCloser(bytes.NewReader(f.body)), nil
 }
 
-func (f *fakeOriginForFill) List(_ context.Context, _, _, _ string, _ int) (origin.ListResult, error) {
-	return origin.ListResult{}, nil
-}
-
 // slowPutCacheStore implements cachestore.CacheStore. PutChunk
 // blocks until putGate is closed; signals putStarted when entered
 // and putReturned when leaving. Used by the commit-after-serve test
@@ -375,10 +371,6 @@ func (stubOriginEmptyETag) GetRange(_ context.Context, _, _, _ string, _, _ int6
 	return nil, nil
 }
 
-func (stubOriginEmptyETag) List(_ context.Context, _, _, _ string, _ int) (origin.ListResult, error) {
-	return origin.ListResult{}, nil
-}
-
 // TestHeadObject_RejectsEmptyETag verifies that the coordinator
 // rejects an origin Head response with an empty ETag. chunk.Path
 // encodes the ETag in its hash; without it, two different versions
@@ -443,8 +435,4 @@ func (c *countingOrigin) Head(ctx context.Context, bucket, key string) (origin.O
 
 func (c *countingOrigin) GetRange(ctx context.Context, bucket, key, etag string, off, n int64) (io.ReadCloser, error) {
 	return c.inner.GetRange(ctx, bucket, key, etag, off, n)
-}
-
-func (c *countingOrigin) List(ctx context.Context, bucket, prefix, marker string, max int) (origin.ListResult, error) {
-	return c.inner.List(ctx, bucket, prefix, marker, max)
 }
