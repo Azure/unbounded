@@ -267,6 +267,34 @@ pub fn workload_strategy() -> impl Strategy<Value = Workload> {
         )
 }
 
+/// Same shape as [`workload_strategy`] but pins
+/// `io_fault_rate = read_corrupt_rate = 0` and forces at least two
+/// clients. Used by invariants that are only meaningful in the
+/// fault-free, multi-writer regime so they don't lean on
+/// `prop_assume!` at run time. Filtering at the strategy level keeps
+/// soak runs (large `PROPTEST_CASES`) from tripping
+/// `max_global_rejects` once the surrounding strategy's fault
+/// distribution shifts.
+pub fn workload_strategy_no_faults_multi_client() -> impl Strategy<Value = Workload> {
+    workload_strategy().prop_map(|mut w| {
+        w.io_fault_rate = 0;
+        w.read_corrupt_rate = 0;
+        // The base strategy already samples `2..=4` clients, but
+        // pin the floor explicitly so a future relaxation there
+        // can't silently weaken this strategy.
+        if w.clients.len() < 2 {
+            // Duplicate the first client spec to reach the floor.
+            // Cheap and deterministic; avoids reaching back into
+            // `client_strategy` from inside a `prop_map`.
+            let dup = w.clients.first().cloned().unwrap_or(ClientSpec { ops: Vec::new() });
+            while w.clients.len() < 2 {
+                w.clients.push(dup.clone());
+            }
+        }
+        w
+    })
+}
+
 fn client_strategy() -> impl Strategy<Value = ClientSpec> {
     vec(op_strategy(), 1..=8).prop_map(|ops| ClientSpec { ops })
 }

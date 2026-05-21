@@ -62,7 +62,10 @@ impl Singleflight {
     }
 
     fn shard(&self, key: &PageKey) -> &Mutex<HashMap<PageKey, Arc<Lease>>> {
-        let h = key.mix(0);
+        // Domain tag for the singleflight shard selector. Not a
+        // secret; see PageKey::mix.
+        const SHARD_DOMAIN: u32 = 0;
+        let h = key.mix(SHARD_DOMAIN);
         &self.shards[(h as usize) % self.shards.len()]
     }
 

@@ -39,6 +39,11 @@ struct Inner {
 
 const NUM_HASHES: u32 = 3;
 
+// Domain tag for the doorkeeper bloom filter probes. Not a
+// secret; see PageKey::mix. Sketch rows use domains 1..=4 via
+// sketch_index, so 0 is reserved for the doorkeeper.
+const DOORKEEPER_DOMAIN: u32 = 0;
+
 impl AdmissionFilter {
     pub fn new(capacity_pages: u64, sketch_multiplier: u32) -> Self {
         let capacity_bits = (capacity_pages.max(1) * 8).max(64);
@@ -114,7 +119,7 @@ impl AdmissionFilter {
 }
 
 fn doorkeeper_probe_and_set(words: &mut [u64], bits: u64, key: &PageKey) -> bool {
-    let h = key.mix(0);
+    let h = key.mix(DOORKEEPER_DOMAIN);
     let mut all_set = true;
     for i in 0..NUM_HASHES {
         let bit = h.wrapping_add((i as u64).wrapping_mul(GOLDEN_RATIO_64)) % bits;

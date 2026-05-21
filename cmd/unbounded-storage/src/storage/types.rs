@@ -80,14 +80,15 @@ impl PageKey {
         })
     }
 
-    /// FNV-1a-style mixer over the key's bytes, salted with an
-    /// arbitrary tag. Used by admission's count-min sketch and the
-    /// singleflight shard selector. Not cryptographic; meant only
-    /// to give different callers near-independent 64-bit lanes.
-    pub fn mix(&self, salt: u32) -> u64 {
+    /// FNV-1a-style mixer over the key's bytes, tagged with a
+    /// per-caller domain separator. Used by admission's count-min
+    /// sketch and the singleflight shard selector. Not cryptographic;
+    /// the `domain` tag is not a secret and only exists to give
+    /// different callers near-independent 64-bit lanes.
+    pub fn mix(&self, domain: u32) -> u64 {
         const FNV_OFFSET: u64 = 0xcbf29ce484222325;
         const FNV_PRIME: u64 = 0x100000001b3;
-        let mut h: u64 = FNV_OFFSET ^ ((salt as u64).wrapping_mul(GOLDEN_RATIO_64));
+        let mut h: u64 = FNV_OFFSET ^ ((domain as u64).wrapping_mul(GOLDEN_RATIO_64));
         for b in self.value_hash {
             h ^= b as u64;
             h = h.wrapping_mul(FNV_PRIME);

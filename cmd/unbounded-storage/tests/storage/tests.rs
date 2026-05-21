@@ -8,6 +8,7 @@ use proptest::prelude::*;
 use crate::storage::oracle::Oracle;
 use crate::storage::workload::{
     ClientSpec, Op, Outcome, RunReport, Workload, run_workload, workload_strategy,
+    workload_strategy_no_faults_multi_client,
 };
 
 proptest! {
@@ -332,8 +333,17 @@ proptest! {
     #[test]
     fn invariant_multidisk_routing_diverse(seed in any::<u64>(), w in workload_strategy()) {
         let report = run_workload(seed, w).expect("run completed");
-        prop_assume!(report.num_disks_used >= 2);
-        prop_assume!(report.device_writes >= 8);
+        // Scope guards: this invariant is only meaningful when the
+        // router has more than one disk and the workload issued
+        // enough device writes that a healthy hash should land on
+        // at least two of them. Use early returns instead of
+        // `prop_assume!` so workloads outside the scope do not
+        // count against proptest's global reject budget; otherwise
+        // the strategy's mix of `num_disks=1` and short op
+        // sequences exhausts the budget long before 128 cases run.
+        if report.num_disks_used < 2 || report.device_writes < 8 {
+            return Ok(());
+        }
         let touched = report
             .device_writes_per_disk
             .iter()
@@ -546,12 +556,17 @@ proptest! {
     /// in the fault-free regime.
     #[test]
     fn invariant_no_lost_writes_under_concurrent_writers(
-        seed in any::<u64>(), w in workload_strategy(),
+        seed in any::<u64>(), w in workload_strategy_no_faults_multi_client(),
     ) {
-        let faults_enabled = w.io_fault_rate > 0 || w.read_corrupt_rate > 0;
-        let many_clients = w.clients.len() >= 2;
+        // Strategy already pins `io_fault_rate == 0`,
+        // `read_corrupt_rate == 0`, and `clients.len() >= 2`, so we
+        // don't need a `prop_assume!` gate here. Doing the filtering
+        // in the strategy keeps soak runs (high `PROPTEST_CASES`)
+        // from tripping `max_global_rejects`.
+        debug_assert_eq!(w.io_fault_rate, 0);
+        debug_assert_eq!(w.read_corrupt_rate, 0);
+        debug_assert!(w.clients.len() >= 2);
         let report = run_workload(seed, w).expect("run completed");
-        prop_assume!(!faults_enabled && many_clients);
         if report.admitted == 0 {
             return Ok(());
         }
