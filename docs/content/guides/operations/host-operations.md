@@ -15,6 +15,12 @@ Selector-based bare-metal host operations must include
 operation. The default unlabeled metalman instance supports `machineRef` host
 operations only.
 
+For cloud VMs, run `machine-ops-controller` scoped to the Machine's site and
+provider, for example `--site=remote --provider=AzureVM`. A scoped controller
+only executes operations whose target Machine has the matching
+`unbounded-cloud.io/site` label and `spec.provider`; other controllers ignore
+the operation.
+
 ## Provider Requirements
 
 Host operations require out-of-band management access to the machine through a

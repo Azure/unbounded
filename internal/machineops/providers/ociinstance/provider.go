@@ -16,19 +16,11 @@ import (
 )
 
 const (
-	defaultConfigProfile    = "DEFAULT"
 	defaultUbuntuOS         = "Canonical Ubuntu"
 	defaultUbuntuOSVersion  = "24.04"
 	ociMetadataMaxBytes     = 32000
 	replacementPollInterval = 15 * time.Second
 	replacementPollTimeout  = 20 * time.Minute
-)
-
-const (
-	// AuthAPIKey uses the standard OCI config-file API key fields.
-	AuthAPIKey = "api_key"
-	// AuthSecurityToken uses OCI CLI session-token credentials.
-	AuthSecurityToken = "security_token"
 )
 
 const (
@@ -66,12 +58,12 @@ type computeClient interface {
 
 type computeClientFactory func() (computeClient, error)
 
+type computeClientFactoryWithAuth func(auth *machineops.OperationAuth) (computeClient, error)
+
 // Provider executes operations against Oracle Cloud Infrastructure instances.
 type Provider struct {
-	ConfigFile    string
-	ConfigProfile string
-	Auth          string
-	NewClient     computeClientFactory
+	NewClient         computeClientFactory
+	NewClientWithAuth computeClientFactoryWithAuth
 }
 
 func (p *Provider) Name() string {
@@ -93,24 +85,33 @@ func (p *Provider) Supports(operation unboundedv1alpha3.OperationKind) bool {
 func (p *Provider) Execute(ctx context.Context, request machineops.OperationRequest) (machineops.OperationResult, error) {
 	instanceID, err := parseOCIInstanceProviderID(request.ProviderID)
 	if err != nil {
-		return machineops.OperationResult{}, err
+		return machineops.OperationResult{}, fmt.Errorf("parse OCI providerID: %w", err)
 	}
 
-	client, err := p.client()
+	client, err := p.client(request.Auth)
 	if err != nil {
 		return machineops.OperationResult{}, err
 	}
 
 	if request.Operation == unboundedv1alpha3.OperationHostReplace {
-		return p.executeReplace(ctx, client, instanceID, request)
+		result, err := p.executeReplace(ctx, client, instanceID, request)
+		if err != nil {
+			return machineops.OperationResult{}, fmt.Errorf("replace OCI instance %s: %w", instanceID, err)
+		}
+
+		return result, nil
 	}
 
 	action, err := actionForOperation(request.Operation)
 	if err != nil {
-		return machineops.OperationResult{}, err
+		return machineops.OperationResult{}, fmt.Errorf("resolve OCI action for %s: %w", request.Operation, err)
 	}
 
-	return machineops.OperationResult{}, client.InstanceAction(ctx, instanceID, action)
+	if err := client.InstanceAction(ctx, instanceID, action); err != nil {
+		return machineops.OperationResult{}, fmt.Errorf("run OCI %s for %s: %w", action, instanceID, err)
+	}
+
+	return machineops.OperationResult{}, nil
 }
 
 func (p *Provider) Cleanup(ctx context.Context, request machineops.OperationRequest, result machineops.OperationResult) error {
@@ -120,7 +121,7 @@ func (p *Provider) Cleanup(ctx context.Context, request machineops.OperationRequ
 
 	instanceID, err := parseOCIInstanceProviderID(result.CleanupProviderID)
 	if err != nil {
-		return err
+		return fmt.Errorf("parse cleanup OCI providerID: %w", err)
 	}
 
 	if request.Machine != nil {
@@ -132,9 +133,9 @@ func (p *Provider) Cleanup(ctx context.Context, request machineops.OperationRequ
 		}
 	}
 
-	client, err := p.client()
+	client, err := p.client(request.Auth)
 	if err != nil {
-		return err
+		return fmt.Errorf("create OCI cleanup client: %w", err)
 	}
 
 	instance, err := client.GetInstance(ctx, instanceID)
@@ -146,16 +147,33 @@ func (p *Provider) Cleanup(ctx context.Context, request machineops.OperationRequ
 		return nil
 	}
 
-	return client.TerminateInstance(ctx, instanceID, retryToken(request, "terminate-old"))
-}
-
-func (p *Provider) client() (computeClient, error) {
-	newClient := p.NewClient
-	if newClient == nil {
-		newClient = p.newDefaultComputeClient
+	if err := client.TerminateInstance(ctx, instanceID, retryToken(request, "terminate-old")); err != nil {
+		return fmt.Errorf("terminate old OCI instance %s: %w", instanceID, err)
 	}
 
-	client, err := newClient()
+	return nil
+}
+
+func (p *Provider) client(auth *machineops.OperationAuth) (computeClient, error) {
+	if p.NewClientWithAuth != nil {
+		client, err := p.NewClientWithAuth(auth)
+		if err != nil {
+			return nil, fmt.Errorf("create OCI compute client: %w", err)
+		}
+
+		return client, nil
+	}
+
+	if p.NewClient != nil {
+		client, err := p.NewClient()
+		if err != nil {
+			return nil, fmt.Errorf("create OCI compute client: %w", err)
+		}
+
+		return client, nil
+	}
+
+	client, err := p.newComputeClientForAuth(auth)
 	if err != nil {
 		return nil, fmt.Errorf("create OCI compute client: %w", err)
 	}

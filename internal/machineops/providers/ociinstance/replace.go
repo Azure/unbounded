@@ -45,21 +45,21 @@ func (p *Provider) replaceHost(ctx context.Context, client computeClient, oldIns
 
 	oldInstance, err := replacementSourceInstance(ctx, client, oldInstanceID)
 	if err != nil {
-		return machineops.OperationResult{}, err
+		return machineops.OperationResult{}, fmt.Errorf("inspect OCI replacement source %s: %w", oldInstanceID, err)
 	}
 
 	if err := rejectAttachedDataVolumes(ctx, client, oldInstance); err != nil {
-		return machineops.OperationResult{}, err
+		return machineops.OperationResult{}, fmt.Errorf("validate OCI replacement source %s: %w", oldInstanceID, err)
 	}
 
 	primaryVNIC, err := primaryVNIC(ctx, client, oldInstance)
 	if err != nil {
-		return machineops.OperationResult{}, err
+		return machineops.OperationResult{}, fmt.Errorf("resolve primary OCI VNIC for %s: %w", oldInstanceID, err)
 	}
 
 	replacement, ok, err := p.findExistingReplacement(ctx, client, oldInstance, request)
 	if err != nil {
-		return machineops.OperationResult{}, err
+		return machineops.OperationResult{}, fmt.Errorf("find existing OCI replacement for %s: %w", oldInstanceID, err)
 	}
 
 	if !ok {
@@ -67,20 +67,20 @@ func (p *Provider) replaceHost(ctx context.Context, client computeClient, oldIns
 		// failures do not create an avoidable outage.
 		launchDetails, err := p.buildReplacementLaunchDetails(ctx, client, oldInstance, primaryVNIC, request)
 		if err != nil {
-			return machineops.OperationResult{}, err
+			return machineops.OperationResult{}, fmt.Errorf("build OCI replacement launch details for %s: %w", oldInstanceID, err)
 		}
 
 		// STOPPING still owns the old Node identity. Wait for STOPPED before
 		// launching a replacement that will use the same kubelet node name.
 		if !isStopped(oldInstance) && !isStopping(oldInstance) {
 			if err := client.InstanceAction(ctx, oldInstanceID, instanceActionStop); err != nil {
-				return machineops.OperationResult{}, err
+				return machineops.OperationResult{}, fmt.Errorf("stop OCI source instance %s: %w", oldInstanceID, err)
 			}
 		}
 
 		_, err = waitForInstanceState(ctx, client, oldInstance, core.InstanceLifecycleStateStopped)
 		if err != nil {
-			return machineops.OperationResult{}, err
+			return machineops.OperationResult{}, fmt.Errorf("wait for OCI source instance %s to stop: %w", oldInstanceID, err)
 		}
 
 		replacement, err = client.LaunchInstance(ctx, launchDetails, retryToken(request, "launch-replacement"))
@@ -91,7 +91,7 @@ func (p *Provider) replaceHost(ctx context.Context, client computeClient, oldIns
 
 	running, err := waitForInstanceState(ctx, client, replacement, core.InstanceLifecycleStateRunning)
 	if err != nil {
-		return machineops.OperationResult{}, err
+		return machineops.OperationResult{}, fmt.Errorf("wait for OCI replacement instance to run: %w", err)
 	}
 
 	if running.Id == nil || *running.Id == "" {

@@ -1,14 +1,18 @@
+{{- $controllerName := default "machine-ops-controller" .ControllerName }}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: machine-ops-controller
+  name: {{ $controllerName }}
   labels:
-    app.kubernetes.io/name: machine-ops-controller
+    app.kubernetes.io/name: {{ $controllerName }}
     app.kubernetes.io/component: controller
 rules:
   - apiGroups: ["unbounded-cloud.io"]
     resources: ["machines"]
     verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: ["unbounded-cloud.io"]
+    resources: ["machineoperationcredentials"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["unbounded-cloud.io"]
     resources: ["machineoperations"]
     verbs: ["get", "list", "watch", "delete"]
@@ -28,27 +32,27 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: machine-ops-controller
+  name: {{ $controllerName }}
   labels:
-    app.kubernetes.io/name: machine-ops-controller
+    app.kubernetes.io/name: {{ $controllerName }}
     app.kubernetes.io/component: controller
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: machine-ops-controller
+  name: {{ $controllerName }}
 subjects:
   - kind: ServiceAccount
-    name: machine-ops-controller
+    name: {{ $controllerName }}
     namespace: {{ default "unbounded-kube" .Namespace }}
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: machine-ops-controller-bootstrap
+  name: {{ $controllerName }}-bootstrap
   namespace: kube-public
   labels:
-    app.kubernetes.io/name: machine-ops-controller
+    app.kubernetes.io/name: {{ $controllerName }}
     app.kubernetes.io/component: controller
 rules:
   - apiGroups: [""]
@@ -60,28 +64,28 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: machine-ops-controller-bootstrap
+  name: {{ $controllerName }}-bootstrap
   namespace: kube-public
   labels:
-    app.kubernetes.io/name: machine-ops-controller
+    app.kubernetes.io/name: {{ $controllerName }}
     app.kubernetes.io/component: controller
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: machine-ops-controller-bootstrap
+  name: {{ $controllerName }}-bootstrap
 subjects:
   - kind: ServiceAccount
-    name: machine-ops-controller
+    name: {{ $controllerName }}
     namespace: {{ default "unbounded-kube" .Namespace }}
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: machine-ops-controller-bootstrap
+  name: {{ $controllerName }}-bootstrap
   namespace: kube-system
   labels:
-    app.kubernetes.io/name: machine-ops-controller
+    app.kubernetes.io/name: {{ $controllerName }}
     app.kubernetes.io/component: controller
 rules:
   - apiGroups: [""]
@@ -92,28 +96,28 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: machine-ops-controller-bootstrap
+  name: {{ $controllerName }}-bootstrap
   namespace: kube-system
   labels:
-    app.kubernetes.io/name: machine-ops-controller
+    app.kubernetes.io/name: {{ $controllerName }}
     app.kubernetes.io/component: controller
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: machine-ops-controller-bootstrap
+  name: {{ $controllerName }}-bootstrap
 subjects:
   - kind: ServiceAccount
-    name: machine-ops-controller
+    name: {{ $controllerName }}
     namespace: {{ default "unbounded-kube" .Namespace }}
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: machine-ops-controller
+  name: {{ $controllerName }}
   namespace: {{ default "unbounded-kube" .Namespace }}
   labels:
-    app.kubernetes.io/name: machine-ops-controller
+    app.kubernetes.io/name: {{ $controllerName }}
     app.kubernetes.io/component: controller
 rules:
   - apiGroups: ["coordination.k8s.io"]
@@ -122,21 +126,24 @@ rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: machine-ops-controller
+  name: {{ $controllerName }}
   namespace: {{ default "unbounded-kube" .Namespace }}
   labels:
-    app.kubernetes.io/name: machine-ops-controller
+    app.kubernetes.io/name: {{ $controllerName }}
     app.kubernetes.io/component: controller
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: machine-ops-controller
+  name: {{ $controllerName }}
 subjects:
   - kind: ServiceAccount
-    name: machine-ops-controller
+    name: {{ $controllerName }}
     namespace: {{ default "unbounded-kube" .Namespace }}

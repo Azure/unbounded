@@ -27,12 +27,19 @@ type MSSClampManager struct {
 	ipt4 *iptables.IPTables
 	ipt6 *iptables.IPTables
 	mu   sync.Mutex
+	// wgPrefix is the configured WireGuard interface prefix (e.g. "wg").
+	// The mangle rule matches the iptables interface-name pattern
+	// "<wgPrefix>+" so all per-port WG devices created with that prefix
+	// are covered.
+	wgPrefix string
 	// installed tracks whether rules have been applied.
 	installed bool
 }
 
 // NewMSSClampManager creates a manager and ensures the mangle chain exists.
-func NewMSSClampManager() (*MSSClampManager, error) {
+// wgPrefix is the configured WireGuard interface prefix (typically
+// cfg.WireGuardInterfacePrefix); it must be non-empty.
+func NewMSSClampManager(wgPrefix string) (*MSSClampManager, error) {
 	ipt4, err := iptables.New()
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize IPv4 iptables: %w", err)
@@ -45,7 +52,7 @@ func NewMSSClampManager() (*MSSClampManager, error) {
 		ipt6 = nil
 	}
 
-	m := &MSSClampManager{ipt4: ipt4, ipt6: ipt6}
+	m := &MSSClampManager{ipt4: ipt4, ipt6: ipt6, wgPrefix: wgPrefix}
 
 	if err := m.ensureChain(ipt4, "IPv4"); err != nil {
 		return nil, fmt.Errorf("failed to create IPv4 MSS clamp chain: %w", err)
@@ -128,7 +135,7 @@ func (m *MSSClampManager) ensureRulesForFamily(ipt *iptables.IPTables, family st
 	}
 
 	rule := []string{
-		"-o", "wg+",
+		"-o", m.wgPrefix + "+",
 		"-p", "tcp", "--tcp-flags", "SYN,RST", "SYN",
 		"-m", "comment", "--comment", mssClampComment,
 		"-j", "TCPMSS", "--clamp-mss-to-pmtu",
@@ -144,7 +151,7 @@ func (m *MSSClampManager) ensureRulesForFamily(ipt *iptables.IPTables, family st
 			return fmt.Errorf("failed to add %s MSS clamp rule: %w", family, err)
 		}
 
-		klog.V(2).Infof("Added %s MSS clamp rule for wg+ interfaces", family)
+		klog.V(2).Infof("Added %s MSS clamp rule for %s+ interfaces", family, m.wgPrefix)
 	}
 
 	return nil

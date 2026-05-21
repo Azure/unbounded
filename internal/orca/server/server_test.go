@@ -41,7 +41,9 @@ func (f *fakeEdgeAPI) GetChunk(ctx context.Context, k chunk.Key, objectSize int6
 }
 
 // TestWriteOriginError covers all five branches of the error mapping.
-// Previously only ErrNotFound was exercised (via integration test).
+// Each branch returns an S3 XML <Error> envelope; we assert both the
+// HTTP status and the S3 Code so callers using typed SDK error
+// branching continue to see the correct code.
 func TestWriteOriginError(t *testing.T) {
 	t.Parallel()
 
@@ -49,19 +51,19 @@ func TestWriteOriginError(t *testing.T) {
 		name       string
 		err        error
 		wantStatus int
-		wantBody   string
+		wantCode   string
 	}{
 		{
 			name:       "not found",
 			err:        origin.ErrNotFound,
 			wantStatus: http.StatusNotFound,
-			wantBody:   "NoSuchKey",
+			wantCode:   "NoSuchKey",
 		},
 		{
 			name:       "auth",
 			err:        origin.ErrAuth,
 			wantStatus: http.StatusBadGateway,
-			wantBody:   "Unauthorized origin",
+			wantCode:   "OriginUnauthorized",
 		},
 		{
 			name: "unsupported blob type",
@@ -71,7 +73,7 @@ func TestWriteOriginError(t *testing.T) {
 				BlobType: "PageBlob",
 			},
 			wantStatus: http.StatusBadGateway,
-			wantBody:   "OriginUnsupported",
+			wantCode:   "OriginUnsupported",
 		},
 		{
 			name: "etag changed",
@@ -79,13 +81,13 @@ func TestWriteOriginError(t *testing.T) {
 				Bucket: "b", Key: "k", Want: "old",
 			},
 			wantStatus: http.StatusBadGateway,
-			wantBody:   "OriginETagChanged",
+			wantCode:   "OriginETagChanged",
 		},
 		{
 			name:       "generic error",
 			err:        errors.New("unexpected"),
 			wantStatus: http.StatusBadGateway,
-			wantBody:   "OriginUnreachable",
+			wantCode:   "OriginUnreachable",
 		},
 	}
 
@@ -93,15 +95,21 @@ func TestWriteOriginError(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/b/k", nil)
 			rr := httptest.NewRecorder()
-			h.writeOriginError(rr, tt.err)
+			h.writeOriginError(rr, req, tt.err)
 
 			if rr.Code != tt.wantStatus {
 				t.Errorf("status=%d want %d", rr.Code, tt.wantStatus)
 			}
 
-			if !strings.Contains(rr.Body.String(), tt.wantBody) {
-				t.Errorf("body %q does not contain %q", rr.Body.String(), tt.wantBody)
+			body := parseS3Error(t, rr)
+			if body.Code != tt.wantCode {
+				t.Errorf("Code=%q want %q", body.Code, tt.wantCode)
+			}
+
+			if body.Message == "" {
+				t.Error("Message is empty")
 			}
 		})
 	}
@@ -185,6 +193,127 @@ func TestHandleHead(t *testing.T) {
 				t.Errorf("HEAD body should be empty; got %d bytes", rr.Body.Len())
 			}
 		})
+	}
+}
+
+// TestRouting_GetRoot_ListBuckets verifies that GET / returns 501
+// with a NotImplemented S3 error code naming ListBuckets. Regression
+// test for the doc/code mismatch where the routing comment said 405
+// but the handler actually returned 501; also locks in the 1b split
+// between root and bucket-level GETs so the operation name in the
+// error message is accurate.
+func TestRouting_GetRoot_ListBuckets(t *testing.T) {
+	t.Parallel()
+
+	h := NewEdgeHandler(&fakeEdgeAPI{}, &config.Config{}, discardLogger())
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNotImplemented {
+		t.Errorf("status=%d want 501", rr.Code)
+	}
+
+	body := parseS3Error(t, rr)
+	if body.Code != "NotImplemented" {
+		t.Errorf("Code=%q want NotImplemented", body.Code)
+	}
+
+	if !strings.Contains(body.Message, "ListBuckets") {
+		t.Errorf("Message=%q should mention ListBuckets", body.Message)
+	}
+}
+
+// TestRouting_GetBucket_ListObjectsV2 verifies that GET /{bucket}/
+// returns 501 with a NotImplemented code naming ListObjectsV2.
+func TestRouting_GetBucket_ListObjectsV2(t *testing.T) {
+	t.Parallel()
+
+	h := NewEdgeHandler(&fakeEdgeAPI{}, &config.Config{}, discardLogger())
+
+	req := httptest.NewRequest(http.MethodGet, "/bucket/", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNotImplemented {
+		t.Errorf("status=%d want 501", rr.Code)
+	}
+
+	body := parseS3Error(t, rr)
+	if body.Code != "NotImplemented" {
+		t.Errorf("Code=%q want NotImplemented", body.Code)
+	}
+
+	if !strings.Contains(body.Message, "ListObjectsV2") {
+		t.Errorf("Message=%q should mention ListObjectsV2", body.Message)
+	}
+}
+
+// TestRouting_HeadBucket_NoBody verifies that HEAD /{bucket}/ returns
+// 501 with no body (HEAD must not have a body per RFC 9110; AWS S3
+// communicates failure via status code only on HEAD).
+func TestRouting_HeadBucket_NoBody(t *testing.T) {
+	t.Parallel()
+
+	h := NewEdgeHandler(&fakeEdgeAPI{}, &config.Config{}, discardLogger())
+
+	req := httptest.NewRequest(http.MethodHead, "/bucket/", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNotImplemented {
+		t.Errorf("status=%d want 501", rr.Code)
+	}
+
+	if rr.Body.Len() != 0 {
+		t.Errorf("HEAD body must be empty; got %d bytes", rr.Body.Len())
+	}
+}
+
+// TestRouting_MethodNotAllowed verifies that unsupported HTTP methods
+// (PUT, DELETE, POST, etc.) return 405 with an S3 MethodNotAllowed
+// error code.
+func TestRouting_MethodNotAllowed(t *testing.T) {
+	t.Parallel()
+
+	h := NewEdgeHandler(&fakeEdgeAPI{}, &config.Config{}, discardLogger())
+
+	req := httptest.NewRequest(http.MethodPut, "/bucket/key", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Errorf("status=%d want 405", rr.Code)
+	}
+
+	body := parseS3Error(t, rr)
+	if body.Code != "MethodNotAllowed" {
+		t.Errorf("Code=%q want MethodNotAllowed", body.Code)
+	}
+}
+
+// TestRouting_AuthEnabled_AccessDenied verifies that when the auth
+// stub is enabled (production-shaped config) the handler returns 401
+// with an S3 AccessDenied code, not a plain-text error.
+func TestRouting_AuthEnabled_AccessDenied(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{}
+	cfg.Server.Auth.Enabled = true
+	h := NewEdgeHandler(&fakeEdgeAPI{}, cfg, discardLogger())
+
+	req := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("status=%d want 401", rr.Code)
+	}
+
+	body := parseS3Error(t, rr)
+	if body.Code != "AccessDenied" {
+		t.Errorf("Code=%q want AccessDenied", body.Code)
 	}
 }
 
@@ -388,6 +517,11 @@ func TestHandleGet_EmptyObject_WithRange_Returns416(t *testing.T) {
 	if rr.Code != http.StatusRequestedRangeNotSatisfiable {
 		t.Errorf("status=%d want %d", rr.Code, http.StatusRequestedRangeNotSatisfiable)
 	}
+
+	body := parseS3Error(t, rr)
+	if body.Code != "InvalidRange" {
+		t.Errorf("Code=%q want InvalidRange", body.Code)
+	}
 }
 
 // TestHandleGet_FirstChunkErrorReturnsCleanError verifies that when
@@ -405,25 +539,25 @@ func TestHandleGet_FirstChunkErrorReturnsCleanError(t *testing.T) {
 		fetchErr   error
 		peekErr    error // non-nil means GetChunk succeeds but first Read fails
 		wantStatus int
-		wantBody   string // substring assertion on the error body
+		wantCode   string // S3 <Error><Code> assertion
 	}{
 		{
 			name:       "GetChunk returns NotFound",
 			fetchErr:   origin.ErrNotFound,
 			wantStatus: http.StatusNotFound,
-			wantBody:   "NoSuchKey",
+			wantCode:   "NoSuchKey",
 		},
 		{
 			name:       "GetChunk returns generic origin error",
 			fetchErr:   errors.New("origin: connect: timeout"),
 			wantStatus: http.StatusBadGateway,
-			wantBody:   "OriginUnreachable",
+			wantCode:   "OriginUnreachable",
 		},
 		{
 			name:       "GetChunk succeeds but first Read fails",
 			peekErr:    errors.New("cachestore: blob fetch 503"),
 			wantStatus: http.StatusBadGateway,
-			wantBody:   "OriginUnreachable",
+			wantCode:   "OriginUnreachable",
 		},
 	}
 
@@ -459,8 +593,9 @@ func TestHandleGet_FirstChunkErrorReturnsCleanError(t *testing.T) {
 				t.Errorf("status=%d want %d; body=%q", rr.Code, tt.wantStatus, rr.Body.String())
 			}
 
-			if !strings.Contains(rr.Body.String(), tt.wantBody) {
-				t.Errorf("body=%q want substring %q", rr.Body.String(), tt.wantBody)
+			body := parseS3Error(t, rr)
+			if body.Code != tt.wantCode {
+				t.Errorf("Code=%q want %q", body.Code, tt.wantCode)
 			}
 			// A bug here would 200 first, then write nothing or
 			// partial bytes; verify the response did not commit a
