@@ -413,7 +413,7 @@ def wait_for_machine_operation_complete(name: str, timeout_secs: int = 180) -> d
             phase = status.get("phase", "")
             message = status.get("message", "")
             if phase != last_phase or message != last_message:
-                log(f"  MachineOperation phase={phase or '<empty>'} message={message or '<empty>'}")
+                log(f"  MachineOperation phase={phase or '<empty>'}")
                 last_phase = phase
                 last_message = message
             if phase == "Complete":
@@ -455,7 +455,7 @@ def wait_for_machine_operation_failed(
             phase = status.get("phase", "")
             message = status.get("message", "")
             if phase != last_phase or message != last_message:
-                log(f"  MachineOperation phase={phase or '<empty>'} message={message or '<empty>'}")
+                log(f"  MachineOperation phase={phase or '<empty>'}")
                 last_phase = phase
                 last_message = message
             if phase == "Failed":
@@ -643,7 +643,7 @@ def wait_for_node_reboot_event(node_name: str, boot_id: str, timeout_secs: int =
             for event in events:
                 message = event.get("message", "")
                 if boot_id in message:
-                    log(f"Observed Node Rebooted event: {message}")
+                    log("Observed Node Rebooted event")
                     return
 
         if elapsed > 0 and elapsed % 30 == 0:
