@@ -385,10 +385,19 @@ func fetchAndHash(ctx context.Context, edge *edgeClient, bucket, key, rangeSpec 
 	return hex.EncodeToString(h.Sum(nil)), resp.Status, n, resp.ETag, nil
 }
 
+// normalizeETag canonicalises an ETag value for comparison:
+// strips surrounding whitespace, the weak-validator W/ or w/
+// prefix (along with any whitespace that follows it), and the
+// surrounding double quotes RFC 7232 mandates. Comparison after
+// normalisation is case-sensitive on the opaque tag body, matching
+// RFC 7232 section 2.3 ("Strong comparison").
 func normalizeETag(etag string) string {
 	etag = strings.TrimSpace(etag)
-	etag = strings.TrimPrefix(etag, "W/")
-	etag = strings.TrimPrefix(etag, "w/")
+
+	if strings.HasPrefix(etag, "W/") || strings.HasPrefix(etag, "w/") {
+		etag = strings.TrimSpace(etag[2:])
+	}
+
 	etag = strings.Trim(etag, "\"")
 
 	return etag

@@ -26,6 +26,9 @@ func TestValidateExpectedETag(t *testing.T) {
 		{name: "exact", got: "abc", want: "abc", wantErr: false},
 		{name: "quoted", got: "\"abc\"", want: "abc", wantErr: false},
 		{name: "weak", got: "W/\"abc\"", want: "abc", wantErr: false},
+		{name: "weak lowercase", got: "w/\"abc\"", want: "abc", wantErr: false},
+		{name: "weak with space", got: `W/ "abc"`, want: "abc", wantErr: false},
+		{name: "got whitespace padded", got: "  \"abc\"  ", want: "abc", wantErr: false},
 		{name: "mismatch", got: "abc", want: "def", wantErr: true},
 	}
 
