@@ -36,6 +36,7 @@ type benchOpts struct {
 	histBuckets    int
 	warmupRequests int
 	drainTimeout   time.Duration
+	durationSet    bool
 }
 
 func newBenchCmd(g *globalFlags) *cobra.Command {
@@ -87,6 +88,8 @@ configurable via --hist-lower / --hist-upper / --hist-buckets;
 defaults are 100us..10s in 50 buckets, suitable for orca's
 expected steady-state latency distribution.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			o.durationSet = cmd.Flags().Changed("duration")
+
 			return runBench(cmd.Context(), g, o)
 		},
 	}
@@ -178,10 +181,6 @@ func runBench(ctx context.Context, g *globalFlags, o *benchOpts) error {
 		return fmt.Errorf("--key is required")
 	}
 
-	if o.durationStr != "" && o.requests > 0 {
-		return fmt.Errorf("--duration and --requests are mutually exclusive")
-	}
-
 	if o.concurrency < 1 {
 		return fmt.Errorf("--concurrency must be >= 1")
 	}
@@ -232,26 +231,9 @@ func runBench(ctx context.Context, g *globalFlags, o *benchOpts) error {
 		rangeSize = rs
 	}
 
-	var (
-		duration time.Duration
-		reqLimit int
-	)
-
-	if o.durationStr != "" {
-		d, err := time.ParseDuration(o.durationStr)
-		if err != nil {
-			return fmt.Errorf("--duration: %w", err)
-		}
-
-		duration = d
-	}
-
-	if o.requests > 0 {
-		reqLimit = o.requests
-	}
-
-	if duration == 0 && reqLimit == 0 {
-		duration = 30 * time.Second
+	duration, reqLimit, err := o.resolveStopCondition()
+	if err != nil {
+		return err
 	}
 
 	fmt.Fprintf(os.Stderr, "bench: key=%s size=%s range=%s concurrency=%d pattern=%s\n",
@@ -343,6 +325,31 @@ func runBench(ctx context.Context, g *globalFlags, o *benchOpts) error {
 	}
 
 	return nil
+}
+
+func (o *benchOpts) resolveStopCondition() (time.Duration, int, error) {
+	if o.requests > 0 {
+		if o.durationSet && o.durationStr != "" {
+			return 0, 0, fmt.Errorf("--duration and --requests are mutually exclusive")
+		}
+
+		return 0, o.requests, nil
+	}
+
+	if o.durationStr == "" {
+		return 30 * time.Second, 0, nil
+	}
+
+	duration, err := time.ParseDuration(o.durationStr)
+	if err != nil {
+		return 0, 0, fmt.Errorf("--duration: %w", err)
+	}
+
+	if duration == 0 {
+		duration = 30 * time.Second
+	}
+
+	return duration, 0, nil
 }
 
 // benchAcc accumulates per-request results in a thread-safe manner.
