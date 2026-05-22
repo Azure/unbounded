@@ -242,6 +242,12 @@ func recordStep(res *scenarioResult, name string, t0 time.Time, err error, detai
 	res.Steps = append(res.Steps, step)
 }
 
+func recordDropCacheStep(res *scenarioResult, t0 time.Time, err error) error {
+	recordStep(res, "drop_cache", t0, err, nil)
+
+	return err
+}
+
 // --- cold-warm ---
 
 func runScenarioColdWarm(ctx context.Context, g *globalFlags, o *scenarioOpts, res *scenarioResult) error {
@@ -285,7 +291,9 @@ func runScenarioColdWarm(ctx context.Context, g *globalFlags, o *scenarioOpts, r
 	// Step 2: ensure cold cache by clearing any chunks for this key.
 	t0 = time.Now()
 	clearErr := clearScenarioObject(ctx, g, oc, key, "")
-	recordStep(res, "drop_cache", t0, clearErr, nil)
+	if err := recordDropCacheStep(res, t0, clearErr); err != nil {
+		return err
+	}
 
 	// Step 3: cold GET.
 	t0 = time.Now()
