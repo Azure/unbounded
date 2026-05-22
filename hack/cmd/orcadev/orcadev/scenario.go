@@ -245,6 +245,12 @@ func recordStep(res *scenarioResult, name string, t0 time.Time, err error, detai
 	res.Steps = append(res.Steps, step)
 }
 
+// recordDropCacheStep records the drop_cache step and returns err so
+// the caller is forced to propagate failure rather than silently
+// continuing into a false-positive "cold" GET. The function is named
+// rather than inlined because the record-then-return-err contract is
+// easy to break by accident when copy-pasting the cold-warm step
+// pattern into a new scenario.
 func recordDropCacheStep(res *scenarioResult, t0 time.Time, err error) error {
 	recordStep(res, "drop_cache", t0, err, nil)
 
