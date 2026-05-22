@@ -4,8 +4,8 @@
 
 A local end-to-end harness for the Orca origin cache. Stands up a Kind
 cluster with three Orca replicas, an in-cluster LocalStack as the
-cachestore, and an in-cluster origin (LocalStack S3 by default; Azurite
-when `ORIGIN_DRIVER=azureblob`). Both default paths run with zero real
+cachestore, and an in-cluster origin (Azurite by default; LocalStack
+S3 when `ORIGIN_DRIVER=awss3`). Both default paths run with zero real
 cloud credentials. The harness can also be flipped to point at a real
 Azure Blob storage account.
 
@@ -21,12 +21,12 @@ build/load); the integration tests cover the Go runtime behavior.
 
 | `ORIGIN_DRIVER` value | Origin backend | Driver path exercised | Creds needed |
 | --------------------- | -------------- | --------------------- | ------------ |
-| `awss3` (default)     | LocalStack S3 (in-cluster) | `internal/orca/origin/awss3` | None |
-| `azureblob` (Azurite) | Azurite (in-cluster) | `internal/orca/origin/azureblob` | None (well-known dev key) |
+| `azureblob` (default; Azurite) | Azurite (in-cluster) | `internal/orca/origin/azureblob` | None (well-known dev key) |
+| `awss3` (opt-in)      | LocalStack S3 (in-cluster) | `internal/orca/origin/awss3` | None |
 | `azureblob` (real Azure) | Azure Blob Storage | `internal/orca/origin/azureblob` | Account + key in `.env` |
 
-The cachestore is always in-cluster LocalStack S3 (different bucket
-from the awss3 origin).
+The cachestore is always in-cluster LocalStack S3 (a different bucket
+from the awss3 origin, in awss3 mode).
 
 ## What you get
 
@@ -35,9 +35,12 @@ from the awss3 origin).
 - LocalStack 3.8 running in the cluster as the S3-compatible
   cachestore (and origin in `awss3` mode). Community tier (`latest`
   is Pro-only and exits with code 55 "License activation failed").
-- Azurite (Microsoft's official Azure Storage emulator) deployed on
-  demand when `ORIGIN_DRIVER=azureblob`. Runs from
-  `mcr.microsoft.com/azure-storage/azurite`.
+  Always-on regardless of `ORIGIN_DRIVER`.
+- Azurite (Microsoft's official Azure Storage emulator) running in
+  the cluster as the default azureblob origin. Image
+  `mcr.microsoft.com/azure-storage/azurite`. Always-on regardless
+  of `ORIGIN_DRIVER` so switching modes via `.env` requires no
+  redeploy.
 - Buckets/containers self-healing on every emulator start:
   - `orca-cache` (S3) - cachestore (versioning unset; Orca's
     versioningGate rejects Enabled and Suspended). Created by the
@@ -45,7 +48,7 @@ from the awss3 origin).
     `/etc/localstack/init/ready.d/`.
   - `orca-origin` (S3) - origin (used when `ORIGIN_DRIVER=awss3`).
     Created by the same LocalStack init hook.
-  - `orca-test` (Azure container) - origin (used when `ORIGIN_DRIVER=azureblob`).
+  - `orca-test` (Azure container) - origin (used when `ORIGIN_DRIVER=azureblob`, the default).
     Created by the `container-ensurer` sidecar that runs alongside
     Azurite in the same Pod and loops every 30 seconds.
 - Three Orca replicas. mTLS between peers and bearer auth for
@@ -66,11 +69,12 @@ No real cloud credentials are required for the default flow.
 
 ```bash
 cp hack/orca/.env.example hack/orca/.env
-# Default values work; only edit if you want Azure mode.
+# Default values work; only edit if you want awss3 mode or real Azure.
 ```
 
-`.env` is git-ignored. The default `ORIGIN_DRIVER=awss3` runs entirely
-on the in-cluster LocalStack.
+`.env` is git-ignored. The default `ORIGIN_DRIVER=azureblob` runs
+entirely on the in-cluster Azurite emulator (well-known dev key,
+zero credentials).
 
 The `.env` file drives the dev-harness manifest renderer. For an
 annotated reference of every field Orca's runtime config YAML
@@ -97,9 +101,9 @@ This runs, in order:
    `orca-cache` and `orca-origin` (the hook fires on every container
    start so this is also the clean recovery path; see "Recovery"
    below).
-7. `deploy-azurite-maybe` - if `ORIGIN_DRIVER=azureblob`, deploy
-   Azurite and poll until its in-pod `container-ensurer` sidecar has
-   created `orca-test`. Skipped for `awss3`.
+7. `deploy-azurite` - apply Azurite (always; it's the default
+   origin), wait until Ready, then poll until its in-pod
+   `container-ensurer` sidecar has created `orca-test`.
 8. `deploy-credentials` - create the `orca-credentials` Secret.
 9. `deploy-orca` - apply RBAC, ConfigMap, Services, Deployment.
 10. `wait-ready` - block until all 3 replicas are Ready.
@@ -109,7 +113,7 @@ When this finishes you should see something like:
 ```
 $ make -C hack/orca status
 NAME                                READY   STATUS    RESTARTS   AGE
-azurite-...                         2/2     Running   0          1m   (only in azureblob mode; 2/2 includes container-ensurer sidecar)
+azurite-...                         2/2     Running   0          1m   (2/2 includes container-ensurer sidecar)
 localstack-...                      1/1     Running   0          1m
 orca-7c5d4f9b8c-...                 1/1     Running   0          50s
 orca-7c5d4f9b8c-...                 1/1     Running   0          50s
@@ -118,21 +122,38 @@ orca-7c5d4f9b8c-...                 1/1     Running   0          50s
 
 ## Switching origins
 
-Edit `hack/orca/.env`, change `ORIGIN_DRIVER`, then:
+The default origin is azureblob (Azurite). To switch to the awss3
+(LocalStack) origin path, edit `hack/orca/.env`:
+
+```
+ORIGIN_DRIVER=awss3
+ORIGIN_ID=awss3-localstack
+```
+
+Then either bounce the cluster cleanly:
 
 ```bash
 make -C hack/orca down
 make -C hack/orca up
 ```
 
-Or, to keep the cluster but reconfigure Orca and pull in any newly
-needed backends:
+Or keep the cluster and reconfigure Orca in place (Azurite +
+LocalStack are both already deployed; switching modes is just a
+ConfigMap change):
 
 ```bash
 $EDITOR hack/orca/.env
-make -C hack/orca deploy        # idempotent; brings up Azurite if needed
+make -C hack/orca deploy        # idempotent re-render + apply
 make -C hack/orca reset         # rolling-restart Orca with new ConfigMap
 ```
+
+When switching modes, remember that orcadev's defaults match the
+default `.env` (azureblob). After switching to awss3 you'll either
+update `defaultGlobalFlags` (don't; it's the dev default), pass
+`--origin-driver=awss3 --origin-endpoint=http://localhost:30200
+--origin-bucket=orca-origin` to each orcadev invocation, OR keep
+your own pointer to a `--config` YAML that captures the awss3
+coordinates.
 
 ## Seed sample data
 
@@ -365,15 +386,19 @@ make -C hack/orca reset
 
 ### "OriginUnreachable" or 502 from manual GETs
 
-In awss3 (default) mode:
-- The bucket name in the URL must match `ORIGIN_AWSS3_BUCKET` (default
-  `orca-origin`).
-- Seed the bucket manually with `kubectl run orca-seed --rm -it
-  --image=amazon/aws-cli:latest -- ...`.
+In azureblob (default) mode:
+- The blob doesn't exist in `$AZURE_CONTAINER` (default `orca-test`).
+  Seed it with `make -C hack/orca data-upload FILE=...` or
+  `make -C hack/orca data-random NAME=... SIZE=...`.
+- For real-Azure mode, account key wrong or revoked. Re-run
+  `make -C hack/orca deploy-credentials && make -C hack/orca reset`.
 
-In Azure mode:
-- Account key wrong or revoked. Re-run `make -C hack/orca deploy-credentials && make -C hack/orca reset`.
-- The blob doesn't exist in `$AZURE_CONTAINER`. Run `make -C hack/orca dev-azure`.
+In awss3 mode (opt-in via `.env`):
+- The bucket name in the URL must match `ORIGIN_AWSS3_BUCKET`
+  (default `orca-origin`).
+- Pass `--origin-driver=awss3 --origin-endpoint=http://localhost:30200
+  --origin-bucket=orca-origin` to orcadev invocations so they seed
+  the correct backend, OR use `kubectl exec` against LocalStack.
 
 ### kind load fails with "tag not found"
 

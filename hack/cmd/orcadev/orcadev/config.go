@@ -78,16 +78,20 @@ type globalFlags struct {
 // are deliberately weighted toward the most common dev scenario:
 // orca running in the kind harness, port-forward in place for the
 // edge listener, NodePorts exposing the cachestore and Azurite to
-// the host.
+// the host. The default origin driver is azureblob (Azurite), which
+// matches the dev harness's default ORIGIN_DRIVER value in
+// hack/orca/.env.example. To target the awss3 (LocalStack) origin
+// instead, pass --origin-driver=awss3 with the matching
+// --origin-endpoint / --origin-bucket overrides.
 func defaultGlobalFlags() *globalFlags {
 	return &globalFlags{
 		orcaURL:                "http://localhost:8443",
 		timeout:                30 * time.Second,
 		logLevel:               "info",
-		originDriver:           "awss3",
-		originID:               "inttest-origin",
-		originBucket:           "orca-origin",
-		originEndpoint:         "http://localhost:30200",
+		originDriver:           "azureblob",
+		originID:               "azureblob-azurite",
+		originBucket:           "orca-test",
+		originEndpoint:         "http://localhost:30100/devstoreaccount1/",
 		originRegion:           "us-east-1",
 		originAccessKey:        "test",
 		originSecretKey:        "test",

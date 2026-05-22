@@ -108,8 +108,8 @@ func TestDefaultGlobalFlags(t *testing.T) {
 		t.Error("orcaURL should have a default")
 	}
 
-	if g.originDriver != "awss3" {
-		t.Errorf("originDriver default = %q want awss3", g.originDriver)
+	if g.originDriver != "azureblob" {
+		t.Errorf("originDriver default = %q want azureblob", g.originDriver)
 	}
 
 	if g.cachestoreEndpoint == "" {

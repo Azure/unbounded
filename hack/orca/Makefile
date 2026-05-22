@@ -42,7 +42,7 @@ DEV_TEMPLATES     := $(REPO_ROOT)/deploy/orca/dev
 DEV_RENDERED      := $(HACK_DIR)rendered-dev
 
 .PHONY: help up down reset render render-dev image kind-create kind-load \
-        deploy deploy-localstack deploy-azurite deploy-azurite-maybe \
+        deploy deploy-localstack deploy-azurite \
         deploy-credentials deploy-orca \
         wait-ready logs port-forward dev-azure status \
         data-generate data-upload data-random data-list data-delete \
@@ -112,31 +112,23 @@ reset: image kind-load ## Rebuild image and rolling-restart Orca
 	kubectl --context kind-$(CLUSTER_NAME) -n $(NAMESPACE) rollout restart deployment/orca
 	kubectl --context kind-$(CLUSTER_NAME) -n $(NAMESPACE) rollout status deployment/orca --timeout=120s
 
-# `deploy` deploys whichever origin backend matches ORIGIN_DRIVER in
-# .env (default: awss3 -> LocalStack only; azureblob also brings up
-# Azurite). The cachestore is always LocalStack regardless. Init Jobs
-# are idempotent so re-applying is safe.
-deploy: render render-dev deploy-localstack deploy-azurite-maybe deploy-credentials deploy-orca wait-ready ## Apply all manifests + Secret
-
-deploy-azurite-maybe: render-dev
-	@if [ -f "$(ENV_FILE)" ]; then set -a && . "$(ENV_FILE)" && set +a; fi; \
-	driver="$${ORIGIN_DRIVER:-awss3}"; \
-	if [ "$$driver" = "azureblob" ]; then \
-		echo "ORIGIN_DRIVER=azureblob -> deploying Azurite"; \
-		$(MAKE) deploy-azurite; \
-	else \
-		echo "ORIGIN_DRIVER=$$driver -> Azurite not required (skipping)"; \
-	fi
+# `deploy` brings up both LocalStack (cachestore + optional awss3
+# origin) and Azurite (default azureblob origin). Both emulators
+# are always deployed regardless of ORIGIN_DRIVER so switching modes
+# via .env requires no harness changes. Init mechanisms live in
+# each emulator's pod (LocalStack init-hook ConfigMap, Azurite
+# container-ensurer sidecar); they are idempotent and re-fire on
+# every pod start.
+deploy: render render-dev deploy-localstack deploy-azurite deploy-credentials deploy-orca wait-ready ## Apply all manifests + Secret
 
 # -- Rendering ----------------------------------------------------------------
 
 # Render the pluggable orca manifests with the dev image. Default
-# origin driver in the dev harness is awss3 pointing at the same
-# in-cluster LocalStack instance (different bucket); reviewers can
-# override by setting ORIGIN_DRIVER=azureblob and the appropriate
-# AZURE_* values in .env. Credentials are NOT rendered into the
-# ConfigMap; they ride in via the orca-credentials Secret as env vars
-# (envFrom).
+# origin driver in the dev harness is azureblob pointing at the
+# in-cluster Azurite Service; reviewers can override by setting
+# ORIGIN_DRIVER=awss3 (LocalStack origin) in .env. Credentials are
+# NOT rendered into the ConfigMap; they ride in via the
+# orca-credentials Secret as env vars (envFrom).
 render:
 	@echo "Rendering orca manifests with image=$(ORCA_IMAGE)"
 	@mkdir -p "$(ORCA_RENDERED)"
@@ -144,7 +136,7 @@ render:
 	@if [ -f "$(ENV_FILE)" ]; then \
 		set -a && . "$(ENV_FILE)" && set +a; \
 	fi; \
-	driver="$${ORIGIN_DRIVER:-awss3}"; \
+	driver="$${ORIGIN_DRIVER:-azureblob}"; \
 	if [ "$$driver" = "azureblob" ]; then \
 		azure_account="$${AZURE_STORAGE_ACCOUNT:-devstoreaccount1}"; \
 		azure_container="$${AZURE_CONTAINER:-$${AZURITE_CONTAINER:-orca-test}}"; \
@@ -161,7 +153,7 @@ render:
 		--set Image="$(ORCA_IMAGE)" \
 		--set ImagePullPolicy=IfNotPresent \
 		--set TargetReplicas="$${TARGET_REPLICAS:-3}" \
-		--set OriginID="$${ORIGIN_ID:-awss3-localstack}" \
+		--set OriginID="$${ORIGIN_ID:-azureblob-azurite}" \
 		--set OriginDriver="$$driver" \
 		--set AzureAccount="$$azure_account" \
 		--set AzureContainer="$$azure_container" \

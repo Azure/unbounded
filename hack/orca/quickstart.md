@@ -17,26 +17,21 @@ prerequisites, switching origin modes), see [dev-harness.md](./dev-harness.md).
 
 ## Step 1 - One-time setup
 
-Copy the example env file and edit it for Azurite-with-debug:
+Copy the example env file. The defaults (`ORIGIN_DRIVER=azureblob`,
+`ORIGIN_ID=azureblob-azurite`, `AZURE_CONTAINER=orca-test`) are
+what you want for this walkthrough, so the only edit you might
+want is `LOG_LEVEL=debug` to see the per-chunk trace from the very
+first request.
 
 ```bash
 cp hack/orca/.env.example hack/orca/.env
-$EDITOR hack/orca/.env
+# Optional: $EDITOR hack/orca/.env and set LOG_LEVEL=debug.
 ```
 
-Set:
-
-```
-ORIGIN_DRIVER=azureblob
-ORIGIN_ID=azureblob-azurite
-AZURE_CONTAINER=orca-test
-LOG_LEVEL=debug
-```
-
-Leave `AZURE_STORAGE_ACCOUNT`, `AZURE_STORAGE_KEY`, and
-`AZUREBLOB_ENDPOINT` blank - the harness auto-selects
-`devstoreaccount1` + the well-known Azurite dev key + the in-cluster
-Azurite Service URL.
+`AZURE_STORAGE_ACCOUNT`, `AZURE_STORAGE_KEY`, and
+`AZUREBLOB_ENDPOINT` are left blank by the example - the harness
+auto-selects `devstoreaccount1` + the well-known Azurite dev key +
+the in-cluster Azurite Service URL.
 
 ## Step 2 - Bring up the cluster
 
@@ -46,18 +41,14 @@ make orca-up
 
 Single command. Builds the orca image, creates the Kind cluster,
 loads the image, deploys LocalStack + Azurite + Orca, waits until
-all three Orca replicas are Ready. Orca pods start with
-`logging.level: debug` so the per-chunk trace is live from the very
-first request.
+all three Orca replicas are Ready.
 
 Expected pods after bring-up:
 
 ```bash
 make -C hack/orca status
-# azurite-...                        1/1 Running
+# azurite-...                        2/2 Running   (Azurite + container-ensurer sidecar)
 # localstack-...                     1/1 Running
-# orca-azurite-container-init-...    0/1 Completed
-# orca-buckets-init-...              0/1 Completed
 # orca-...                           1/1 Running   (x3)
 ```
 
