@@ -254,13 +254,6 @@ func recordDropCacheStep(res *scenarioResult, t0 time.Time, err error) error {
 // --- cold-warm ---
 
 func runScenarioColdWarm(ctx context.Context, g *globalFlags, o *scenarioOpts, res *scenarioResult) error {
-	size, err := parseSize(o.sizeStr)
-	if err != nil {
-		return fmt.Errorf("--size: %w", err)
-	}
-
-	res.Config["size_bytes"] = size
-
 	oc, err := newOriginClient(ctx, g)
 	if err != nil {
 		return err
@@ -272,7 +265,36 @@ func runScenarioColdWarm(ctx context.Context, g *globalFlags, o *scenarioOpts, r
 		}
 	}
 
+	cs, err := newCachestoreClient(ctx, g)
+	if err != nil {
+		return err
+	}
+
 	edge := newEdgeClient(g.orcaURL, g.timeout)
+
+	return runScenarioColdWarmWith(ctx, g, o, res, oc, cs, edge)
+}
+
+// runScenarioColdWarmWith runs the cold-warm scenario against an
+// already-constructed origin client, cachestore, and edge client.
+// Split out from runScenarioColdWarm so tests can drive the full
+// step sequence (including failure paths like drop_cache returning
+// an error) without standing up real Azure / S3 / orca backends.
+func runScenarioColdWarmWith(
+	ctx context.Context,
+	g *globalFlags,
+	o *scenarioOpts,
+	res *scenarioResult,
+	oc originClient,
+	cs cachestoreOps,
+	edge *edgeClient,
+) error {
+	size, err := parseSize(o.sizeStr)
+	if err != nil {
+		return fmt.Errorf("--size: %w", err)
+	}
+
+	res.Config["size_bytes"] = size
 
 	key := fmt.Sprintf("scenario-cold-warm-%d", time.Now().UnixNano())
 
@@ -293,7 +315,7 @@ func runScenarioColdWarm(ctx context.Context, g *globalFlags, o *scenarioOpts, r
 
 	// Step 2: ensure cold cache by clearing any chunks for this key.
 	t0 = time.Now()
-	clearErr := clearScenarioObject(ctx, g, oc, key, "", o.chunkSize)
+	clearErr := clearScenarioObject(ctx, g, cs, oc, key, "", o.chunkSize)
 	if err := recordDropCacheStep(res, t0, clearErr); err != nil {
 		return err
 	}
@@ -680,12 +702,7 @@ func scenarioGet(ctx context.Context, edge *edgeClient, bucket, key string) (int
 // clearScenarioObject removes cached chunks for the given object so
 // the next GET is forced to refill from origin. Used by the
 // cold-warm scenario.
-func clearScenarioObject(ctx context.Context, g *globalFlags, oc originClient, key, etag, chunkSizeOverride string) error {
-	cs, err := newCachestoreClient(ctx, g)
-	if err != nil {
-		return err
-	}
-
+func clearScenarioObject(ctx context.Context, g *globalFlags, cs cachestoreOps, oc originClient, key, etag, chunkSizeOverride string) error {
 	chunkSize, err := resolveScenarioChunkSize(g, chunkSizeOverride)
 	if err != nil {
 		return err

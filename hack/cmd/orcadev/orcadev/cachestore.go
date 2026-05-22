@@ -176,3 +176,17 @@ func (c *cachestoreClient) Delete(ctx context.Context, path string) error {
 // ErrCacheNotFound is returned by Head when the chunk is absent.
 // Used by `cache inspect` to render "no" vs an error.
 var ErrCacheNotFound = errors.New("cache: chunk not found")
+
+// cachestoreOps is the minimal subset of cachestoreClient that
+// scenarios use to interact with the cachestore. Declared as an
+// interface so tests can inject an in-memory fake without standing
+// up a real S3 endpoint. The production *cachestoreClient satisfies
+// this interface implicitly.
+type cachestoreOps interface {
+	Head(ctx context.Context, path string) (cacheObject, error)
+	Delete(ctx context.Context, path string) error
+}
+
+// Compile-time check that the production client satisfies the ops
+// interface used by scenarios.
+var _ cachestoreOps = (*cachestoreClient)(nil)
