@@ -36,8 +36,11 @@ ENV_FILE          ?= $(HACK_DIR).env
 
 # Shell snippet used by the orcadev wrapper targets. It sources .env
 # and translates the in-cluster endpoints used by rendered manifests
-# into host-reachable NodePort endpoints expected by orcadev. Literal
-# endpoint matches intentionally track hack/orca/.env.example.
+# into host-reachable NodePort endpoints expected by orcadev. The
+# in-cluster endpoint literals are parameterised on $(NAMESPACE) so
+# overriding the harness namespace keeps the translation correct;
+# values that don't match the in-cluster URL are passed through
+# verbatim.
 ORCADEV_ENV_SETUP = if [ -f "$(ENV_FILE)" ]; then set -a && . "$(ENV_FILE)" && set +a; fi; \
 	set --; \
 	driver="$${ORIGIN_DRIVER:-azureblob}"; \
@@ -49,7 +52,7 @@ ORCADEV_ENV_SETUP = if [ -f "$(ENV_FILE)" ]; then set -a && . "$(ENV_FILE)" && s
 			azure_container="$${AZURE_CONTAINER:-$${AZURITE_CONTAINER:-orca-test}}"; \
 			azure_endpoint="$${AZUREBLOB_ENDPOINT:-}"; \
 			azure_key="$${AZURE_STORAGE_KEY:-}"; \
-			if [ "$$azure_endpoint" = "http://azurite.unbounded-kube.svc.cluster.local:10000/devstoreaccount1/" ]; then azure_endpoint="http://localhost:30100/devstoreaccount1/"; fi; \
+			if [ "$$azure_endpoint" = "http://azurite.$(NAMESPACE).svc.cluster.local:10000/devstoreaccount1/" ]; then azure_endpoint="http://localhost:30100/devstoreaccount1/"; fi; \
 			set -- "$$@" --origin-account "$$azure_account" --origin-bucket "$$azure_container"; \
 			if [ -n "$$azure_endpoint" ] || [ "$$azure_account" != "devstoreaccount1" ]; then set -- "$$@" --origin-endpoint "$$azure_endpoint"; fi; \
 			if [ -n "$$azure_key" ]; then \
@@ -59,16 +62,16 @@ ORCADEV_ENV_SETUP = if [ -f "$(ENV_FILE)" ]; then set -a && . "$(ENV_FILE)" && s
 			fi; \
 			;; \
 		awss3) \
-			origin_endpoint="$${ORIGIN_AWSS3_ENDPOINT:-http://localstack.unbounded-kube.svc.cluster.local:4566}"; \
-			if [ "$$origin_endpoint" = "http://localstack.unbounded-kube.svc.cluster.local:4566" ]; then origin_endpoint="http://localhost:30200"; fi; \
+			origin_endpoint="$${ORIGIN_AWSS3_ENDPOINT:-http://localstack.$(NAMESPACE).svc.cluster.local:4566}"; \
+			if [ "$$origin_endpoint" = "http://localstack.$(NAMESPACE).svc.cluster.local:4566" ]; then origin_endpoint="http://localhost:30200"; fi; \
 			set -- "$$@" --origin-bucket "$${ORIGIN_AWSS3_BUCKET:-orca-origin}" --origin-endpoint "$$origin_endpoint" --origin-region "$${ORIGIN_AWSS3_REGION:-us-east-1}" --origin-access-key "$${ORCA_AWSS3_ACCESS_KEY:-test}" --origin-secret-key "$${ORCA_AWSS3_SECRET_KEY:-test}" --origin-use-path-style=true; \
 			;; \
 		*) \
 			echo "ERROR: unknown ORIGIN_DRIVER=$$driver" >&2; exit 1; \
 			;; \
 	esac; \
-	cachestore_endpoint="$${CACHESTORE_ENDPOINT:-http://localstack.unbounded-kube.svc.cluster.local:4566}"; \
-	if [ "$$cachestore_endpoint" = "http://localstack.unbounded-kube.svc.cluster.local:4566" ]; then cachestore_endpoint="http://localhost:30200"; fi; \
+	cachestore_endpoint="$${CACHESTORE_ENDPOINT:-http://localstack.$(NAMESPACE).svc.cluster.local:4566}"; \
+	if [ "$$cachestore_endpoint" = "http://localstack.$(NAMESPACE).svc.cluster.local:4566" ]; then cachestore_endpoint="http://localhost:30200"; fi; \
 	set -- "$$@" --cachestore-bucket "$${CACHESTORE_BUCKET:-orca-cache}" --cachestore-endpoint "$$cachestore_endpoint" --cachestore-region "$${CACHESTORE_REGION:-us-east-1}" --cachestore-access-key "$${ORCA_CACHESTORE_S3_ACCESS_KEY:-test}" --cachestore-secret-key "$${ORCA_CACHESTORE_S3_SECRET_KEY:-test}" --cachestore-use-path-style=true;
 
 # Rendered manifest dirs (per-Makefile target overrides for the dev
