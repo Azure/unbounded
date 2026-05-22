@@ -79,7 +79,12 @@ type originClient interface {
 // global flags. The chosen driver dictates which fields are
 // required; missing-required fields surface here so subcommands
 // fail fast with a useful message.
-func newOriginClient(ctx context.Context, g *globalFlags) (originClient, error) {
+//
+// Held in a package-level variable so tests can swap in a fake
+// origin client without standing up real Azure/S3 backends.
+var newOriginClient = newOriginClientImpl
+
+func newOriginClientImpl(ctx context.Context, g *globalFlags) (originClient, error) {
 	switch g.originDriver {
 	case "awss3":
 		return newAWSS3Origin(ctx, g)

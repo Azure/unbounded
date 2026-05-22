@@ -3,7 +3,12 @@
 
 package orcadev
 
-import "testing"
+import (
+	"context"
+	"fmt"
+	"strings"
+	"testing"
+)
 
 func TestCacheInspectOverridesOriginBucketBeforeClientConstruction(t *testing.T) {
 	t.Parallel()
@@ -22,5 +27,44 @@ func TestCacheInspectOverridesOriginBucketBeforeClientConstruction(t *testing.T)
 
 	if g.originBucket != "requested-bucket" {
 		t.Fatalf("originBucket = %q, want requested-bucket", g.originBucket)
+	}
+}
+
+// TestRunCacheInspect_BucketOverrideReachesOrigin drives
+// runCacheInspect end-to-end and verifies that the origin client
+// factory sees the operator-supplied --bucket value (rather than the
+// default that was on globalFlags before runCacheInspect ran). Guards
+// the bug fix from a regression that would put the bucket assignment
+// back AFTER newOriginClient is called.
+//
+// Not t.Parallel: swaps the package-level newOriginClient factory.
+func TestRunCacheInspect_BucketOverrideReachesOrigin(t *testing.T) {
+	var capturedBucket string
+
+	original := newOriginClient
+	newOriginClient = func(_ context.Context, g *globalFlags) (originClient, error) {
+		capturedBucket = g.originBucket
+
+		return nil, fmt.Errorf("test halt after capture")
+	}
+
+	t.Cleanup(func() { newOriginClient = original })
+
+	g := defaultGlobalFlags()
+	g.originBucket = "default-bucket"
+	g.originID = "origin-id"
+
+	o := &cacheInspectOpts{
+		bucket: "requested-bucket",
+		key:    "key",
+	}
+
+	err := runCacheInspect(context.Background(), g, o)
+	if err == nil || !strings.Contains(err.Error(), "test halt") {
+		t.Fatalf("runCacheInspect() = %v, want error containing 'test halt'", err)
+	}
+
+	if capturedBucket != "requested-bucket" {
+		t.Fatalf("captured originBucket = %q, want requested-bucket", capturedBucket)
 	}
 }
