@@ -140,7 +140,11 @@ render:
 	if [ "$$driver" = "azureblob" ]; then \
 		azure_account="$${AZURE_STORAGE_ACCOUNT:-devstoreaccount1}"; \
 		azure_container="$${AZURE_CONTAINER:-$${AZURITE_CONTAINER:-orca-test}}"; \
-		azure_endpoint="$${AZUREBLOB_ENDPOINT:-http://azurite.$(NAMESPACE).svc.cluster.local:10000/devstoreaccount1/}"; \
+		if [ "$$azure_account" = "devstoreaccount1" ]; then \
+			azure_endpoint="$${AZUREBLOB_ENDPOINT:-http://azurite.$(NAMESPACE).svc.cluster.local:10000/devstoreaccount1/}"; \
+		else \
+			azure_endpoint="$${AZUREBLOB_ENDPOINT:-}"; \
+		fi; \
 	else \
 		azure_account="$${AZURE_STORAGE_ACCOUNT:-}"; \
 		azure_container="$${AZURE_CONTAINER:-orca-test}"; \
