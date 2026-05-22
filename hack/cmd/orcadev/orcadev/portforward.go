@@ -247,14 +247,11 @@ func spawnPortForward(_ context.Context, g *globalFlags, port string) (func(), e
 	return cleanup, nil
 }
 
-// waitForForwarding reads from r until it sees the kubectl
-// "Forwarding from" sentinel string or r is closed.
-func waitForForwarding(r io.Reader) error {
-	_, err := waitForForwardingReader(r)
-
-	return err
-}
-
+// waitForForwardingAndDrain blocks until r either yields the
+// kubectl "Forwarding from" readiness sentinel or hits EOF/an error.
+// On success it spawns a fire-and-forget goroutine that continues
+// draining r so kubectl can keep writing per-connection log lines
+// without blocking on a full stdout pipe.
 func waitForForwardingAndDrain(r io.Reader) error {
 	drain, err := waitForForwardingReader(r)
 	if err != nil {
@@ -268,6 +265,10 @@ func waitForForwardingAndDrain(r io.Reader) error {
 	return nil
 }
 
+// waitForForwardingReader reads from r until it sees the kubectl
+// "Forwarding from" sentinel string and returns r so the caller can
+// continue draining post-readiness output, or an error if EOF / a
+// read error occurs first.
 func waitForForwardingReader(r io.Reader) (io.Reader, error) {
 	const sentinel = "Forwarding from"
 

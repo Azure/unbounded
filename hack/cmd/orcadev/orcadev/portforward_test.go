@@ -92,26 +92,27 @@ func TestProbeTCP_Closed(t *testing.T) {
 	}
 }
 
-// TestWaitForForwarding_Match verifies the stdout sentinel detection.
-func TestWaitForForwarding_Match(t *testing.T) {
+// TestWaitForForwardingReader_Match verifies the stdout sentinel detection.
+func TestWaitForForwardingReader_Match(t *testing.T) {
 	t.Parallel()
 
 	r := strings.NewReader("Forwarding from 127.0.0.1:8443 -> 8443\n")
-	if err := waitForForwarding(r); err != nil {
-		t.Errorf("waitForForwarding on sentinel input = %v; want nil", err)
+	if _, err := waitForForwardingReader(r); err != nil {
+		t.Errorf("waitForForwardingReader on sentinel input = %v; want nil", err)
 	}
 }
 
-// TestWaitForForwarding_EOFBeforeSentinel verifies that EOF before
-// the sentinel surfaces as an error including the captured output.
-func TestWaitForForwarding_EOFBeforeSentinel(t *testing.T) {
+// TestWaitForForwardingReader_EOFBeforeSentinel verifies that EOF
+// before the sentinel surfaces as an error including the captured
+// output.
+func TestWaitForForwardingReader_EOFBeforeSentinel(t *testing.T) {
 	t.Parallel()
 
 	r := strings.NewReader("error: services \"orca\" not found\n")
 
-	err := waitForForwarding(r)
+	_, err := waitForForwardingReader(r)
 	if err == nil {
-		t.Fatal("waitForForwarding on EOF input = nil; want error")
+		t.Fatal("waitForForwardingReader on EOF input = nil; want error")
 	}
 
 	if !strings.Contains(err.Error(), "services \"orca\" not found") {
