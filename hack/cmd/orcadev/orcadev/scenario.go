@@ -293,7 +293,7 @@ func runScenarioColdWarm(ctx context.Context, g *globalFlags, o *scenarioOpts, r
 
 	// Step 2: ensure cold cache by clearing any chunks for this key.
 	t0 = time.Now()
-	clearErr := clearScenarioObject(ctx, g, oc, key, "")
+	clearErr := clearScenarioObject(ctx, g, oc, key, "", o.chunkSize)
 	if err := recordDropCacheStep(res, t0, clearErr); err != nil {
 		return err
 	}
@@ -680,13 +680,13 @@ func scenarioGet(ctx context.Context, edge *edgeClient, bucket, key string) (int
 // clearScenarioObject removes cached chunks for the given object so
 // the next GET is forced to refill from origin. Used by the
 // cold-warm scenario.
-func clearScenarioObject(ctx context.Context, g *globalFlags, oc originClient, key, etag string) error {
+func clearScenarioObject(ctx context.Context, g *globalFlags, oc originClient, key, etag, chunkSizeOverride string) error {
 	cs, err := newCachestoreClient(ctx, g)
 	if err != nil {
 		return err
 	}
 
-	chunkSize, err := resolveChunkSize(g, "")
+	chunkSize, err := resolveScenarioChunkSize(g, chunkSizeOverride)
 	if err != nil {
 		return err
 	}
@@ -725,4 +725,8 @@ func clearScenarioObject(ctx context.Context, g *globalFlags, oc originClient, k
 	}
 
 	return nil
+}
+
+func resolveScenarioChunkSize(g *globalFlags, override string) (int64, error) {
+	return resolveChunkSize(g, override)
 }
