@@ -263,45 +263,31 @@ fn run_block(args: BlockArgs) -> ExitCode {
 
     install_signal_handler();
 
-    let threads_per_device = if args.threads_per_device > 1 {
-        // Each shard opens its own StorageEngine, Allocator, and
-        // BTreeIndex against the same on-disk LBA space. With more
-        // than one engine per device, the per-engine allocators
-        // race for freshly-allocated LBAs (every fresh allocator
-        // starts at LBA 2) and the per-engine btrees both try to
-        // commit to meta slots A/B, silently corrupting each
-        // other's data. Until the engine supports a shared
-        // allocator + btree across shards on one device, force a
-        // single engine per device so the numbers are
-        // trustworthy and reads can hit the keys writes published.
-        eprintln!(
-            "bench: --threads-per-device > 1 ({}) currently corrupts cross-shard \
-             writes (per-engine Allocator races). Forcing threads-per-device=1.",
-            args.threads_per_device,
-        );
-        1
-    } else {
-        args.threads_per_device
-    };
-    let _ = args.verify; // verify path now folds into the same single-engine constraint above.
+    let threads_per_device = args.threads_per_device;
     let total_shards = num_devices * threads_per_device;
 
-    // Build per-shard placement specs from the topology module.
+    // Build per-device placement specs from the topology module.
     // `build_pinned_specs` returns `Some` only when every --device
     // path was matched to a topology NVMe controller; otherwise we
     // fall back to an unpinned runtime so the bench still runs in
-    // containers / dev hosts.
+    // containers / dev hosts. We only spawn one OS thread per
+    // device because all shards on a device share a single
+    // `StorageEngine` (see `run_device`); see `build_pinned_specs`
+    // for how `threads_per_device` still influences CPU planning.
     let pinned_specs = build_pinned_specs(&args.device, threads_per_device);
     let runtime: Arc<dyn Threading> = match pinned_specs {
         Some(specs) => {
-            debug_assert_eq!(specs.len(), total_shards);
+            debug_assert_eq!(specs.len(), num_devices);
             PinnedRuntime::new(specs)
         }
-        None => DefaultRuntime::new(total_shards),
+        None => DefaultRuntime::new(num_devices),
     };
 
-    // Distribute workers across shards: first `workers % total_shards`
-    // shards get one extra so the sum is exactly `--workers`.
+    // Distribute workers across the global shard count so the
+    // workload still routes to `total_shards` partitions; the
+    // OS-thread count is `num_devices`, but each thread runs
+    // `threads_per_device` logical shards' worth of workers
+    // sharing one engine.
     let base = args.workers / total_shards;
     let extra = args.workers % total_shards;
     let workers_per_shard: Vec<usize> = (0..total_shards)
@@ -317,7 +303,7 @@ fn run_block(args: BlockArgs) -> ExitCode {
     // sub-seed).
     let mut worker_id_offset = 0usize;
 
-    let (tx, rx) = mpsc::channel::<ShardOutcome>();
+    let (tx, rx) = mpsc::channel::<DeviceOutcome>();
     let phase_duration = Duration::from_secs(args.duration);
     // `--no-iopoll` forces the single-issuer / defer-taskrun pair off
     // too: those flags only make sense on the IOPOLL fast path.
@@ -332,46 +318,48 @@ fn run_block(args: BlockArgs) -> ExitCode {
     } else {
         0
     };
-    let mut joins = Vec::with_capacity(total_shards);
-    for shard_idx in 0..total_shards {
-        let device_idx = shard_idx / threads_per_device;
-        let thread_idx = shard_idx % threads_per_device;
-        let workers_for_shard = workers_per_shard[shard_idx];
-        let pinned_numa = runtime.numa_of(WorkerIdx(shard_idx as u16));
-        let cfg = ShardConfig {
-            shard_idx,
-            total_shards,
-            thread_idx,
-            device_path: args.device[device_idx].clone(),
-            pinned_numa,
-            queue_depth: args.queue_depth,
-            workers: workers_for_shard,
-            worker_id_base: worker_id_offset,
-            seed: args.seed,
-            duration: phase_duration,
-            ops_cap_per_shard,
-            iopoll,
-            o_direct,
-            single_issuer,
-            defer_taskrun,
-            // --verify implies --bypass-admission: the doorkeeper
-            // deliberately drops every first-touch write, which
-            // makes byte-equality verification impossible. Verify
-            // is about closed-loop correctness of the I/O path, so
-            // disabling the filter is the right call here.
-            bypass_admission: args.bypass_admission || args.verify,
-            verify: args.verify,
-            verify_ops_per_shard,
-            skip_recovery_scan_if_no_meta: !args.full_recovery_scan,
-        };
-        worker_id_offset += workers_for_shard;
+    let mut joins = Vec::with_capacity(num_devices);
+    for device_idx in 0..num_devices {
+        let pinned_numa = runtime.numa_of(WorkerIdx(device_idx as u16));
+        let mut shard_cfgs: Vec<ShardConfig> = Vec::with_capacity(threads_per_device);
+        for thread_idx in 0..threads_per_device {
+            let shard_idx = device_idx * threads_per_device + thread_idx;
+            let workers_for_shard = workers_per_shard[shard_idx];
+            shard_cfgs.push(ShardConfig {
+                shard_idx,
+                total_shards,
+                thread_idx,
+                device_path: args.device[device_idx].clone(),
+                pinned_numa,
+                queue_depth: args.queue_depth,
+                workers: workers_for_shard,
+                worker_id_base: worker_id_offset,
+                seed: args.seed,
+                duration: phase_duration,
+                ops_cap_per_shard,
+                iopoll,
+                o_direct,
+                single_issuer,
+                defer_taskrun,
+                // --verify implies --bypass-admission: the doorkeeper
+                // deliberately drops every first-touch write, which
+                // makes byte-equality verification impossible. Verify
+                // is about closed-loop correctness of the I/O path, so
+                // disabling the filter is the right call here.
+                bypass_admission: args.bypass_admission || args.verify,
+                verify: args.verify,
+                verify_ops_per_shard,
+                skip_recovery_scan_if_no_meta: !args.full_recovery_scan,
+            });
+            worker_id_offset += workers_for_shard;
+        }
         let tx = tx.clone();
-        let name = format!("bench-shard-{shard_idx}");
+        let name = format!("bench-dev-{device_idx}");
         let handle = runtime.spawn_aux(
-            WorkerIdx(shard_idx as u16),
+            WorkerIdx(device_idx as u16),
             &name,
             Box::new(move || {
-                let outcome = run_shard(cfg);
+                let outcome = run_device(device_idx, shard_cfgs);
                 let _ = tx.send(outcome);
             }),
         );
@@ -384,14 +372,12 @@ fn run_block(args: BlockArgs) -> ExitCode {
     let mut errors: Vec<String> = Vec::new();
     while let Ok(outcome) = rx.recv() {
         match outcome {
-            ShardOutcome::Ok { write, read } => {
-                write_reports.push(write);
-                if let Some(r) = read {
-                    read_reports.push(r);
-                }
+            DeviceOutcome::Ok { writes, reads } => {
+                write_reports.extend(writes);
+                read_reports.extend(reads);
             }
-            ShardOutcome::Failed { shard_idx, err } => {
-                eprintln!("shard {shard_idx} failed: {err}");
+            DeviceOutcome::Failed { device_idx, err } => {
+                eprintln!("device {device_idx} failed: {err}");
                 errors.push(err);
                 SHUTDOWN.store(true, Ordering::Relaxed);
             }
@@ -418,17 +404,19 @@ fn run_block(args: BlockArgs) -> ExitCode {
     }
 }
 
-/// Build per-shard `WorkerSpec`s from the host topology.
+/// Build per-device `WorkerSpec`s from the host topology.
 ///
-/// Returns `Some(specs)` of length `devices.len() * threads_per_device`
-/// when every device path could be mapped onto a topology NVMe
-/// controller; otherwise prints a warning and returns `None` to signal
-/// "no pinning available, use a `DefaultRuntime` fallback".
+/// Returns `Some(specs)` of length `devices.len()` when every device
+/// path could be mapped onto a topology NVMe controller; otherwise
+/// prints a warning and returns `None` to signal "no pinning
+/// available, use a `DefaultRuntime` fallback".
 ///
-/// The returned specs are ordered so `specs[device_idx * N +
-/// thread_idx]` is the slot for thread `thread_idx` on device
-/// `device_idx`, matching the `(device_idx, thread_idx) -> shard_idx`
-/// layout the caller uses elsewhere.
+/// `threads_per_device` is still consulted so the topology planner
+/// reserves disjoint CPU sets per drive (the bench then picks the
+/// first slot for the device's owning OS thread). The remaining
+/// pinned slots are not used as OS threads today: all shards on a
+/// given device share one engine and one ring on one OS thread to
+/// preserve crash-consistency invariants on the device's LBA space.
 fn build_pinned_specs(
     devices: &[PathBuf],
     threads_per_device: usize,
@@ -488,25 +476,30 @@ fn build_pinned_specs(
     };
     let plan = Plan::for_host(&synthetic, &cfg);
 
-    let specs: Vec<WorkerSpec> = plan
+    // Take the first plan worker per drive as the device's owning
+    // OS thread; the remaining `threads_per_device - 1` planner
+    // slots stay disjoint from other drives but are not used as
+    // separate OS threads (see the function doc).
+    let all_nvme: Vec<&_> = plan
         .workers
         .iter()
         .filter(|w| matches!(w.role, Role::NvmeIoUring { .. }))
-        .map(|w| WorkerSpec::new(w.cpu, w.numa))
         .collect();
-    let expected = devices.len() * threads_per_device;
-    if specs.len() != expected {
-        // Defensive: Plan::for_host should always emit exactly
-        // nvme_threads_per_drive workers per NVMe in the synthetic
-        // host. If it doesn't, fall back rather than misalign the
-        // shard <-> spec mapping.
+    let expected_total = devices.len() * threads_per_device;
+    if all_nvme.len() != expected_total {
         eprintln!(
             "bench: topology plan produced {} nvme workers, expected {}; pinning disabled",
-            specs.len(),
-            expected,
+            all_nvme.len(),
+            expected_total,
         );
         return None;
     }
+    let specs: Vec<WorkerSpec> = (0..devices.len())
+        .map(|device_idx| {
+            let w = all_nvme[device_idx * threads_per_device];
+            WorkerSpec::new(w.cpu, w.numa)
+        })
+        .collect();
     Some(specs)
 }
 
@@ -559,25 +552,25 @@ struct ShardReport {
     latency_samples: Vec<Duration>,
 }
 
-enum ShardOutcome {
+enum DeviceOutcome {
     Ok {
-        write: ShardReport,
-        read: Option<ShardReport>,
+        writes: Vec<ShardReport>,
+        reads: Vec<ShardReport>,
     },
     Failed {
-        shard_idx: usize,
+        device_idx: usize,
         err: String,
     },
 }
 
-fn run_shard(cfg: ShardConfig) -> ShardOutcome {
-    let device_label = shard_label(&cfg);
-    let shard_idx = cfg.shard_idx;
-    match run_shard_inner(cfg, device_label.clone()) {
-        Ok((write, read)) => ShardOutcome::Ok { write, read },
-        Err(err) => ShardOutcome::Failed {
-            shard_idx,
-            err: format!("{device_label}: {err}"),
+fn run_device(device_idx: usize, cfgs: Vec<ShardConfig>) -> DeviceOutcome {
+    assert!(!cfgs.is_empty(), "run_device called with no shards");
+    let label = device_label(&cfgs[0]);
+    match run_device_inner(&cfgs) {
+        Ok((writes, reads)) => DeviceOutcome::Ok { writes, reads },
+        Err(err) => DeviceOutcome::Failed {
+            device_idx,
+            err: format!("{label}: {err}"),
         },
     }
 }
@@ -595,10 +588,37 @@ fn shard_label(cfg: &ShardConfig) -> String {
     )
 }
 
-fn run_shard_inner(
-    cfg: ShardConfig,
-    device_label: String,
-) -> Result<(ShardReport, Option<ShardReport>), String> {
+/// Label for the device thread as a whole; the per-shard label is
+/// derived per `ShardConfig` once the shards run inside that thread.
+fn device_label(cfg: &ShardConfig) -> String {
+    let numa = match cfg.pinned_numa {
+        Some(n) => format!("numa={n}"),
+        None => "numa=?".to_string(),
+    };
+    format!("{} ({})", cfg.device_path.display(), numa)
+}
+
+fn run_device_inner(
+    cfgs: &[ShardConfig],
+) -> Result<(Vec<ShardReport>, Vec<ShardReport>), String> {
+    // Every shard in `cfgs` targets the same device, was given the
+    // same device-level knobs by `run_block`, and shares a single
+    // OS thread. Sanity-check the invariants the rest of the
+    // function relies on so a regression in `run_block` shows up
+    // here rather than as a subtle correctness bug.
+    let head = &cfgs[0];
+    for c in &cfgs[1..] {
+        debug_assert_eq!(c.device_path, head.device_path);
+        debug_assert_eq!(c.iopoll, head.iopoll);
+        debug_assert_eq!(c.single_issuer, head.single_issuer);
+        debug_assert_eq!(c.defer_taskrun, head.defer_taskrun);
+        debug_assert_eq!(c.o_direct, head.o_direct);
+        debug_assert_eq!(c.queue_depth, head.queue_depth);
+        debug_assert_eq!(c.bypass_admission, head.bypass_admission);
+        debug_assert_eq!(c.verify, head.verify);
+        debug_assert_eq!(c.skip_recovery_scan_if_no_meta, head.skip_recovery_scan_if_no_meta);
+    }
+
     let mut uring_cfg = UringConfig {
         // The device must be told the same page size the engine
         // will write: the device enforces `src.len() ==
@@ -609,47 +629,42 @@ fn run_shard_inner(
         page_size: PAGE_BYTES,
         ..UringConfig::default()
     };
-    uring_cfg.iopoll = cfg.iopoll;
-    uring_cfg.single_issuer = cfg.single_issuer;
-    uring_cfg.defer_taskrun = cfg.defer_taskrun;
-    uring_cfg.o_direct = cfg.o_direct;
-    if let Some(qd) = cfg.queue_depth {
+    uring_cfg.iopoll = head.iopoll;
+    uring_cfg.single_issuer = head.single_issuer;
+    uring_cfg.defer_taskrun = head.defer_taskrun;
+    uring_cfg.o_direct = head.o_direct;
+    if let Some(qd) = head.queue_depth {
         if qd == 0 {
             return Err("--queue-depth must be >= 1".into());
         }
         uring_cfg.queue_depth = qd;
     }
     let device = Arc::new(
-        UringBlockDevice::open(&cfg.device_path, uring_cfg)
+        UringBlockDevice::open(&head.device_path, uring_cfg)
             .map_err(|e| format!("UringBlockDevice::open: {e:?}"))?,
     );
 
-    // One PAGE_BYTES slot per worker, packed into a single
-    // backing region. PAGE_BYTES is small (4 KiB today), so we
-    // round up to the backing's native page size (2 MiB).
-    // BackingKind::Heap means no operator setup is required;
-    // switch to `Hugepage2Mb` if a host reserves hugepages and a
-    // TLB benefit is wanted.
-    let page_count = cfg.workers.max(1);
+    // One PAGE_BYTES slot per worker across every shard on this
+    // device, packed into a single page-aligned region. All shards
+    // on this device share the same registered buffer; each worker
+    // gets a unique `page_idx` so the slots are disjoint.
+    // BackingKind::Heap avoids any host hugepage setup; flip to
+    // Hugepage2Mb for a TLB benefit when hugepages are reserved.
+    let total_workers: usize = cfgs.iter().map(|c| c.workers).sum();
+    let page_count = total_workers.max(1);
     let backing_bytes = (page_count * PAGE_BYTES).next_multiple_of(HUGEPAGE_2MB);
     let backing = allocate(BackingRequest {
         kind: BackingKind::Heap,
         bytes: backing_bytes,
-        numa: cfg.pinned_numa,
+        numa: cfgs.first().and_then(|c| c.pinned_numa),
     })
     .map_err(|e| format!("backing allocate: {e}"))?;
     let backing_base = backing.base;
 
-    // Fill the backing with deterministic pseudo-random bytes so
-    // every worker's source page starts from distinct content.
-    // The write workers then overwrite the first WRITE_TAG_BYTES
-    // of their slot per op with a (seq, worker, seed) tag so the
-    // engine sees distinct content per op (and so reads can be
-    // byte-compared against the expected value).
     fill_backing_random(
         backing_base,
         backing_bytes,
-        cfg.seed ^ shard_seed(cfg.shard_idx),
+        head.seed ^ shard_seed(head.shard_idx),
     );
 
     // Register the backing region with the io_uring ring before
@@ -668,8 +683,8 @@ fn run_shard_inner(
         // separates user-data page size from device LBA size.
         page_size_bytes: PAGE_BYTES,
         btree_page_bytes: PAGE_BYTES,
-        bypass_admission: cfg.bypass_admission,
-        skip_recovery_scan_if_no_meta: cfg.skip_recovery_scan_if_no_meta,
+        bypass_admission: head.bypass_admission,
+        skip_recovery_scan_if_no_meta: head.skip_recovery_scan_if_no_meta,
         ..Default::default()
     };
     let engine = Arc::new(
@@ -677,23 +692,43 @@ fn run_shard_inner(
             .map_err(|e| format!("StorageEngine::open: {e:?}"))?,
     );
 
-    // Build a single-engine LocalStorage on this shard. Engines
-    // owning a UringBlockDevice are !Send so this construct cannot
-    // be hoisted to the main thread; the design's "compose via
-    // LocalStorage" intent is satisfied by exercising registration
-    // and routing on each shard against its own one-engine router.
+    // Build a single-engine LocalStorage that every shard on this
+    // device shares. Engines owning a `UringBlockDevice` are
+    // `!Send`, which forces one OS thread per device; sharing the
+    // engine across the `threads_per_device` logical shards on
+    // that thread is what makes the multi-shard configuration
+    // correct (single allocator + btree per LBA space).
     let local = Arc::new(LocalStorage::new(vec![engine.clone()]));
     local
         .register_pages(backing_base, PAGE_BYTES, page_count)
         .map_err(|e| format!("register_pages: {e:?}"))?;
 
-    if cfg.verify {
-        return run_verify_phase(&cfg, engine, local, device, backing_base, device_label);
+    // Assign each shard a disjoint `page_idx` range in the shared
+    // backing so its workers never collide on a slot.
+    let mut page_offsets: Vec<usize> = Vec::with_capacity(cfgs.len());
+    {
+        let mut cursor = 0usize;
+        for c in cfgs {
+            page_offsets.push(cursor);
+            cursor += c.workers;
+        }
     }
 
-    let phase1 = run_phase(
+    if head.verify {
+        let report =
+            run_verify_device(&engine, &local, &device, backing_base, cfgs, &page_offsets)?;
+        engine.close_mutator();
+        drop(local);
+        drop(engine);
+        drop(device);
+        drop(backing);
+        return Ok((report, Vec::new()));
+    }
+
+    let phase1 = run_phase_device(
         Phase::Write,
-        &cfg,
+        cfgs,
+        &page_offsets,
         engine.clone(),
         local.clone(),
         device.clone(),
@@ -702,44 +737,52 @@ fn run_shard_inner(
         backing_base,
     )?;
 
-    let read_report = if SHUTDOWN.load(Ordering::Relaxed) {
-        None
+    let read_reports = if SHUTDOWN.load(Ordering::Relaxed) {
+        Vec::new()
     } else {
-        let read = run_phase(
+        let read = run_phase_device(
             Phase::Read,
-            &cfg,
+            cfgs,
+            &page_offsets,
             engine.clone(),
             local.clone(),
             device.clone(),
             PAGE_BYTES,
-            Some(phase1.keys_per_worker.clone()),
+            Some(phase1.iter().map(|p| p.keys_per_worker.clone()).collect()),
             backing_base,
         )?;
-        Some(ShardReport {
-            shard_idx: cfg.shard_idx,
-            device_label: device_label.clone(),
-            ops: read.ops,
-            bytes: read.bytes,
-            errors: read.errors,
-            read_misses: read.read_misses,
-            elapsed: read.elapsed,
-            latency_samples: read.latency_samples,
-        })
+        read.into_iter()
+            .zip(cfgs.iter())
+            .map(|(r, c)| ShardReport {
+                shard_idx: c.shard_idx,
+                device_label: shard_label(c),
+                ops: r.ops,
+                bytes: r.bytes,
+                errors: r.errors,
+                read_misses: r.read_misses,
+                elapsed: r.elapsed,
+                latency_samples: r.latency_samples,
+            })
+            .collect()
     };
 
     let snapshot = engine.snapshot();
     engine.close_mutator();
 
-    let write_report = ShardReport {
-        shard_idx: cfg.shard_idx,
-        device_label,
-        ops: phase1.ops,
-        bytes: phase1.bytes,
-        errors: phase1.errors,
-        read_misses: phase1.read_misses,
-        elapsed: phase1.elapsed,
-        latency_samples: phase1.latency_samples,
-    };
+    let write_reports: Vec<ShardReport> = phase1
+        .into_iter()
+        .zip(cfgs.iter())
+        .map(|(p, c)| ShardReport {
+            shard_idx: c.shard_idx,
+            device_label: shard_label(c),
+            ops: p.ops,
+            bytes: p.bytes,
+            errors: p.errors,
+            read_misses: p.read_misses,
+            elapsed: p.elapsed,
+            latency_samples: p.latency_samples,
+        })
+        .collect();
 
     // Trust check: if the engine reports any write_io_errors,
     // the bench's "ops succeeded" count is no longer a reliable
@@ -747,10 +790,10 @@ fn run_shard_inner(
     if snapshot.write_io_errors > 0 || snapshot.read_io_errors > 0 || snapshot.checksum_misses > 0
     {
         eprintln!(
-            "shard {} engine snapshot: write_io_errors={} read_io_errors={} \
+            "device {} engine snapshot: write_io_errors={} read_io_errors={} \
              checksum_misses={} rejected_by_filter={} admitted={} hits={} \
              misses={} pending_free_len={}",
-            cfg.shard_idx,
+            head.device_path.display(),
             snapshot.write_io_errors,
             snapshot.read_io_errors,
             snapshot.checksum_misses,
@@ -767,7 +810,7 @@ fn run_shard_inner(
     drop(device);
     drop(backing);
 
-    Ok((write_report, read_report))
+    Ok((write_reports, read_reports))
 }
 
 /// Closed-loop byte-equality round trip used by `--verify`. Writes
@@ -777,23 +820,22 @@ fn run_shard_inner(
 /// pass under the "write" slot and `None` for the read slot so the
 /// existing report-printing code does not have to special-case
 /// verify.
-fn run_verify_phase(
-    cfg: &ShardConfig,
-    engine: Arc<StorageEngine<UringBlockDevice>>,
-    local: Arc<LocalStorage<UringBlockDevice>>,
-    device: Arc<UringBlockDevice>,
+fn run_verify_device(
+    engine: &Arc<StorageEngine<UringBlockDevice>>,
+    local: &Arc<LocalStorage<UringBlockDevice>>,
+    device: &Arc<UringBlockDevice>,
     backing_base: *mut u8,
-    device_label: String,
-) -> Result<(ShardReport, Option<ShardReport>), String> {
+    cfgs: &[ShardConfig],
+    page_offsets: &[usize],
+) -> Result<Vec<ShardReport>, String> {
     let phase_done = Arc::new(AtomicBool::new(false));
-    let phase_done_for_progress = phase_done.clone();
-    let total_ops = cfg.verify_ops_per_shard;
 
     let mutator_eng = engine.clone();
     let mutator_fut: Pin<Box<dyn std::future::Future<Output = ()>>> =
         Box::pin(mutator_eng.run_mutator());
 
     let progress_dev = device.clone();
+    let phase_done_for_progress = phase_done.clone();
     let progress_fut: Pin<Box<dyn std::future::Future<Output = ()>>> = Box::pin(async move {
         loop {
             if let Err(e) = progress_dev.progress() {
@@ -809,52 +851,69 @@ fn run_verify_phase(
         }
     });
 
-    let phase_done_for_body = phase_done.clone();
-    let cfg_seed = cfg.seed;
-    let total_shards = cfg.total_shards;
-    let my_shard = cfg.shard_idx;
-    let local_for_body = local.clone();
-    let engine_for_body = engine.clone();
-    let verify_label = device_label.clone();
-    let start = Instant::now();
-    let body_result: Arc<Mutex<Option<Result<(u64, Duration), String>>>> =
-        Arc::new(Mutex::new(None));
-    let body_result_for_fut = body_result.clone();
-    let body_fut: Pin<Box<dyn std::future::Future<Output = ()>>> = Box::pin(async move {
-        let res = verify_round_trip(
-            local_for_body,
-            engine_for_body,
-            backing_base,
-            cfg_seed,
-            my_shard,
-            total_shards,
-            total_ops,
-            start,
-            &verify_label,
-        )
-        .await;
-        *body_result_for_fut.lock().unwrap() = Some(res);
-        phase_done_for_body.store(true, Ordering::Relaxed);
-    });
+    let mut all_futs: Vec<Pin<Box<dyn std::future::Future<Output = ()>>>> =
+        Vec::with_capacity(2 + cfgs.len());
+    all_futs.push(mutator_fut);
+    all_futs.push(progress_fut);
 
-    let workers_count = 1usize;
-    let all_futs: Vec<Pin<Box<dyn std::future::Future<Output = ()>>>> =
-        vec![mutator_fut, progress_fut, body_fut];
+    let body_results: Vec<Arc<Mutex<Option<Result<(u64, Duration), String>>>>> = (0..cfgs.len())
+        .map(|_| Arc::new(Mutex::new(None)))
+        .collect();
+    let start = Instant::now();
+    for (i, cfg) in cfgs.iter().enumerate() {
+        // Each verify shard needs two disjoint pages: a write
+        // source and a read destination. Reserve the first two
+        // slots of this shard's `page_offsets` window for those;
+        // the bench requires `--workers >= 2 * threads_per_device`
+        // in verify mode so each shard has its pair.
+        if cfg.workers < 2 {
+            return Err(format!(
+                "verify: shard {} needs workers >= 2 (got {}); rerun with \
+                 --workers >= 2*--threads-per-device",
+                cfg.shard_idx, cfg.workers,
+            ));
+        }
+        let base = page_offsets[i] as u32;
+        let src_idx = base;
+        let dst_idx = base + 1;
+        let local_for_body = local.clone();
+        let engine_for_body = engine.clone();
+        let result_slot = body_results[i].clone();
+        let label = shard_label(cfg);
+        let cfg_seed = cfg.seed;
+        let total_shards = cfg.total_shards;
+        let my_shard = cfg.shard_idx;
+        let total_ops = cfg.verify_ops_per_shard;
+        let body_fut: Pin<Box<dyn std::future::Future<Output = ()>>> = Box::pin(async move {
+            let res = verify_round_trip(
+                local_for_body,
+                engine_for_body,
+                backing_base,
+                src_idx,
+                dst_idx,
+                cfg_seed,
+                my_shard,
+                total_shards,
+                total_ops,
+                start,
+                &label,
+            )
+            .await;
+            *result_slot.lock().unwrap() = Some(res);
+        });
+        all_futs.push(body_fut);
+    }
+
+    let shard_count = cfgs.len();
     block_on_many(all_futs, |statuses| {
-        let workers_done = statuses[2..2 + workers_count].iter().all(|s| *s);
+        let workers_done = statuses[2..2 + shard_count].iter().all(|s| *s);
         if workers_done {
             phase_done.store(true, Ordering::Relaxed);
             statuses[0] = true;
         }
     });
 
-    let (ops, elapsed) = body_result
-        .lock()
-        .unwrap()
-        .take()
-        .unwrap_or_else(|| Err("verify: body future did not produce a result".into()))?;
     let snapshot = engine.snapshot();
-    engine.close_mutator();
     if snapshot.write_io_errors > 0 || snapshot.read_io_errors > 0 || snapshot.checksum_misses > 0
     {
         return Err(format!(
@@ -864,26 +923,34 @@ fn run_verify_phase(
         ));
     }
 
-    let report = ShardReport {
-        shard_idx: cfg.shard_idx,
-        device_label,
-        ops,
-        bytes: ops * PAGE_BYTES as u64,
-        errors: 0,
-        read_misses: 0,
-        elapsed,
-        latency_samples: Vec::new(),
-    };
-    drop(local);
-    drop(engine);
-    drop(device);
-    Ok((report, None))
+    let mut reports = Vec::with_capacity(cfgs.len());
+    for (i, cfg) in cfgs.iter().enumerate() {
+        let (ops, elapsed) = body_results[i]
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or_else(|| Err("verify: body future did not produce a result".into()))?;
+        reports.push(ShardReport {
+            shard_idx: cfg.shard_idx,
+            device_label: shard_label(cfg),
+            ops,
+            bytes: ops * PAGE_BYTES as u64,
+            errors: 0,
+            read_misses: 0,
+            elapsed,
+            latency_samples: Vec::new(),
+        });
+    }
+    Ok(reports)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn verify_round_trip(
     local: Arc<LocalStorage<UringBlockDevice>>,
     engine: Arc<StorageEngine<UringBlockDevice>>,
     backing_base: *mut u8,
+    src_idx: u32,
+    dst_idx: u32,
     seed: u64,
     my_shard: usize,
     total_shards: usize,
@@ -894,9 +961,9 @@ async fn verify_round_trip(
     // Use two distinct PageRefs out of the registered region: one
     // for the write source, one for the read destination, so a
     // read that erroneously hits the source slot would still be
-    // caught by the byte-equality check.
-    let src_idx = 0u32;
-    let dst_idx = 1u32;
+    // caught by the byte-equality check. The caller assigns
+    // `src_idx`/`dst_idx` from this shard's disjoint window into
+    // the device-wide backing.
     let src = PageRef {
         page_idx: src_idx,
         offset: 0,
@@ -907,10 +974,10 @@ async fn verify_round_trip(
         offset: 0,
         len: PAGE_BYTES as u32,
     };
-    // SAFETY: `backing_base` is a freshly allocated hugepage
-    // region owned by the shard; the slots at indices 0 and 1 are
-    // disjoint and not aliased by any other task during verify
-    // (single-worker mode).
+    // SAFETY: `backing_base` is a freshly allocated region owned
+    // by the device thread; the slots at `src_idx` and `dst_idx`
+    // are disjoint per shard (the caller reserves a 2-page window
+    // for each shard).
     let src_ptr = unsafe { backing_base.add(src_idx as usize * PAGE_BYTES) };
     let dst_ptr = unsafe { backing_base.add(dst_idx as usize * PAGE_BYTES) };
 
@@ -951,12 +1018,6 @@ async fn verify_round_trip(
         return Err(format!(
             "verify[{label}]: {} write_io_errors during write phase; aborting",
             post_write.write_io_errors,
-        ));
-    }
-    if post_write.admitted < n {
-        return Err(format!(
-            "verify[{label}]: only {} of {n} writes were admitted; aborting",
-            post_write.admitted,
         ));
     }
 
@@ -1026,57 +1087,66 @@ struct PhaseRun {
     keys_per_worker: Vec<Vec<StripeKey>>,
 }
 
-fn run_phase(
+#[allow(clippy::too_many_arguments)]
+fn run_phase_device(
     phase: Phase,
-    cfg: &ShardConfig,
+    cfgs: &[ShardConfig],
+    page_offsets: &[usize],
     engine: Arc<StorageEngine<UringBlockDevice>>,
     local: Arc<LocalStorage<UringBlockDevice>>,
     device: Arc<UringBlockDevice>,
     page_size: usize,
-    seed_keys: Option<Vec<Vec<StripeKey>>>,
+    seed_keys: Option<Vec<Vec<Vec<StripeKey>>>>,
     backing_base: *mut u8,
-) -> Result<PhaseRun, String> {
+) -> Result<Vec<PhaseRun>, String> {
     let phase_done = Arc::new(AtomicBool::new(false));
     let total_ops = Arc::new(AtomicU64::new(0));
 
-    let workers: Vec<Arc<Mutex<WorkerState>>> = (0..cfg.workers)
-        .map(|i| {
-            let worker_id = cfg.worker_id_base + i;
-            let mut keys: Vec<StripeKey> = match phase {
-                Phase::Write => Vec::new(),
-                Phase::Read => seed_keys
-                    .as_ref()
-                    .map(|all| all.get(i).cloned().unwrap_or_default())
-                    .unwrap_or_default(),
-            };
-            // Shuffle the read key list per worker so the read
-            // phase doesn't replay phase 1's exact submission order.
-            if matches!(phase, Phase::Read) && !keys.is_empty() {
-                shuffle(
-                    &mut keys,
-                    cfg.seed ^ (worker_id as u64) ^ 0xDEAD_u64,
-                );
-            }
-            Arc::new(Mutex::new(WorkerState {
-                worker_id,
-                page_idx: i as u32,
-                seq: 0,
-                keys,
-                ops: 0,
-                bytes: 0,
-                errors: 0,
-                read_misses: 0,
-                latency: Vec::with_capacity(LATENCY_RING),
-                latency_cursor: 0,
-            }))
+    // Build per-shard worker states. Workers from different shards
+    // get disjoint `page_idx` ranges in the shared device backing
+    // so their source/destination slots never collide.
+    let workers_per_shard: Vec<Vec<Arc<Mutex<WorkerState>>>> = cfgs
+        .iter()
+        .enumerate()
+        .map(|(s_idx, cfg)| {
+            (0..cfg.workers)
+                .map(|i| {
+                    let worker_id = cfg.worker_id_base + i;
+                    let mut keys: Vec<StripeKey> = match phase {
+                        Phase::Write => Vec::new(),
+                        Phase::Read => seed_keys
+                            .as_ref()
+                            .and_then(|all| all.get(s_idx))
+                            .and_then(|per_shard| per_shard.get(i).cloned())
+                            .unwrap_or_default(),
+                    };
+                    if matches!(phase, Phase::Read) && !keys.is_empty() {
+                        shuffle(
+                            &mut keys,
+                            cfg.seed ^ (worker_id as u64) ^ 0xDEAD_u64,
+                        );
+                    }
+                    Arc::new(Mutex::new(WorkerState {
+                        worker_id,
+                        page_idx: (page_offsets[s_idx] + i) as u32,
+                        seq: 0,
+                        keys,
+                        ops: 0,
+                        bytes: 0,
+                        errors: 0,
+                        read_misses: 0,
+                        latency: Vec::with_capacity(LATENCY_RING),
+                        latency_cursor: 0,
+                    }))
+                })
+                .collect()
         })
         .collect();
 
     let phase_start = Instant::now();
-    let phase_duration = cfg.duration;
-    let ops_cap = cfg.ops_cap_per_shard;
+    let phase_duration = cfgs[0].duration;
+    let ops_cap = cfgs[0].ops_cap_per_shard;
 
-    // Build the futures: one mutator, one progress, plus N workers.
     let mutator_eng = engine.clone();
     let mutator_fut: Pin<Box<dyn std::future::Future<Output = ()>>> =
         Box::pin(mutator_eng.run_mutator());
@@ -1093,8 +1163,6 @@ fn run_phase(
                 }
                 yield_once().await;
                 if SHUTDOWN.load(Ordering::Relaxed) || phase_done.load(Ordering::Relaxed) {
-                    // One last drain so any in-flight CQEs wake their
-                    // tasks before we exit.
                     let _ = device.progress();
                     return;
                 }
@@ -1102,97 +1170,96 @@ fn run_phase(
         })
     };
 
+    let total_worker_count: usize = workers_per_shard.iter().map(|v| v.len()).sum();
     let mut all_futs: Vec<Pin<Box<dyn std::future::Future<Output = ()>>>> =
-        Vec::with_capacity(2 + cfg.workers);
+        Vec::with_capacity(2 + total_worker_count);
     all_futs.push(mutator_fut);
     all_futs.push(progress_fut);
 
-    let total_shards = cfg.total_shards;
-    let my_shard = cfg.shard_idx;
-    for w in &workers {
-        let worker = w.clone();
-        let local = local.clone();
-        let phase_done = phase_done.clone();
-        let total_ops = total_ops.clone();
+    for (s_idx, shard_workers) in workers_per_shard.iter().enumerate() {
+        let cfg = &cfgs[s_idx];
+        let total_shards = cfg.total_shards;
+        let my_shard = cfg.shard_idx;
         let seed = cfg.seed;
-        let fut: Pin<Box<dyn std::future::Future<Output = ()>>> = match phase {
-            Phase::Write => Box::pin(write_worker(
-                worker,
-                local,
-                phase_done,
-                total_ops,
-                phase_start,
-                phase_duration,
-                ops_cap,
-                seed,
-                my_shard,
-                total_shards,
-                page_size,
-                backing_base,
-            )),
-            Phase::Read => Box::pin(read_worker(
-                worker,
-                local,
-                phase_done,
-                total_ops,
-                phase_start,
-                phase_duration,
-                ops_cap,
-                page_size,
-            )),
-        };
-        all_futs.push(fut);
+        for w in shard_workers {
+            let worker = w.clone();
+            let local = local.clone();
+            let phase_done = phase_done.clone();
+            let total_ops = total_ops.clone();
+            let fut: Pin<Box<dyn std::future::Future<Output = ()>>> = match phase {
+                Phase::Write => Box::pin(write_worker(
+                    worker,
+                    local,
+                    phase_done,
+                    total_ops,
+                    phase_start,
+                    phase_duration,
+                    ops_cap,
+                    seed,
+                    my_shard,
+                    total_shards,
+                    page_size,
+                    backing_base,
+                )),
+                Phase::Read => Box::pin(read_worker(
+                    worker,
+                    local,
+                    phase_done,
+                    total_ops,
+                    phase_start,
+                    phase_duration,
+                    ops_cap,
+                    page_size,
+                )),
+            };
+            all_futs.push(fut);
+        }
     }
 
-    // Single-threaded executor: round-robin poll every future on
-    // each spin until they're all done. We mark the mutator and
-    // progress futures as the "ambient" pair: they only finish
-    // after the workers do (and after `close_mutator` runs).
-    let workers_count = cfg.workers;
     block_on_many(all_futs, |statuses| {
         // statuses[0] = mutator, statuses[1] = progress, [2..] = workers.
-        let workers_done = statuses[2..2 + workers_count].iter().all(|s| *s);
+        let workers_done = statuses[2..2 + total_worker_count].iter().all(|s| *s);
         if workers_done {
             phase_done.store(true, Ordering::Relaxed);
-            // Mutator only exits when close_mutator is called; we
-            // want it to keep running until reads finish on this
-            // phase, but for the write phase we still need it. So
-            // we let it finish by calling close_mutator from
-            // run_shard_inner *after* both phases. Here, once the
-            // workers and the progress task are done we treat the
-            // phase as complete and break out.
+            // The mutator only exits when `close_mutator` is called,
+            // which `run_device_inner` does after both phases. Mark
+            // it as done here so this `block_on_many` returns; the
+            // outer loop will start the next phase or finalize.
             statuses[0] = true;
         }
     });
 
     let elapsed = phase_start.elapsed();
 
-    // Aggregate.
-    let mut ops = 0u64;
-    let mut bytes = 0u64;
-    let mut errors = 0u64;
-    let mut read_misses = 0u64;
-    let mut latency_samples: Vec<Duration> = Vec::new();
-    let mut keys_per_worker: Vec<Vec<StripeKey>> = Vec::with_capacity(workers.len());
-    for w in &workers {
-        let s = w.lock().unwrap();
-        ops += s.ops;
-        bytes += s.bytes;
-        errors += s.errors;
-        read_misses += s.read_misses;
-        latency_samples.extend_from_slice(&s.latency);
-        keys_per_worker.push(s.keys.clone());
+    let mut runs: Vec<PhaseRun> = Vec::with_capacity(cfgs.len());
+    for shard_workers in &workers_per_shard {
+        let mut ops = 0u64;
+        let mut bytes = 0u64;
+        let mut errors = 0u64;
+        let mut read_misses = 0u64;
+        let mut latency_samples: Vec<Duration> = Vec::new();
+        let mut keys_per_worker: Vec<Vec<StripeKey>> = Vec::with_capacity(shard_workers.len());
+        for w in shard_workers {
+            let s = w.lock().unwrap();
+            ops += s.ops;
+            bytes += s.bytes;
+            errors += s.errors;
+            read_misses += s.read_misses;
+            latency_samples.extend_from_slice(&s.latency);
+            keys_per_worker.push(s.keys.clone());
+        }
+        runs.push(PhaseRun {
+            ops,
+            bytes,
+            errors,
+            read_misses,
+            elapsed,
+            latency_samples,
+            keys_per_worker,
+        });
     }
 
-    Ok(PhaseRun {
-        ops,
-        bytes,
-        errors,
-        read_misses,
-        elapsed,
-        latency_samples,
-        keys_per_worker,
-    })
+    Ok(runs)
 }
 
 struct WorkerState {
