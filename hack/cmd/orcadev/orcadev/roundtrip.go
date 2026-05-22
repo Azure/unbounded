@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -128,7 +129,7 @@ func runRoundtrip(ctx context.Context, g *globalFlags, o *roundtripOpts) error {
 	for i := 0; i < o.repeat; i++ {
 		start := time.Now()
 
-		recvHash, status, gotSize, err := fetchAndHash(ctx, edge, oc.Bucket(), key, o.rangeSpec)
+		recvHash, status, gotSize, gotETag, err := fetchAndHash(ctx, edge, oc.Bucket(), key, o.rangeSpec)
 		elapsed := time.Since(start)
 
 		if err != nil {
@@ -137,6 +138,10 @@ func runRoundtrip(ctx context.Context, g *globalFlags, o *roundtripOpts) error {
 
 		if status != http.StatusOK && status != http.StatusPartialContent {
 			return fmt.Errorf("iter %d: orca returned status %d", i, status)
+		}
+
+		if err := validateExpectedETag(i, gotETag, o.expectETag); err != nil {
+			return err
 		}
 
 		throughput := "n/a"
@@ -325,7 +330,7 @@ func hashSlice(r io.Reader, h hash.Hash, start, end int64) (int64, error) {
 
 // fetchAndHash issues a GET (with optional Range) against the orca
 // edge and streams the response through SHA-256 without buffering.
-func fetchAndHash(ctx context.Context, edge *edgeClient, bucket, key, rangeSpec string) (string, int, int64, error) {
+func fetchAndHash(ctx context.Context, edge *edgeClient, bucket, key, rangeSpec string) (string, int, int64, string, error) {
 	var (
 		resp edgeResponse
 		err  error
@@ -338,27 +343,27 @@ func fetchAndHash(ctx context.Context, edge *edgeClient, bucket, key, rangeSpec 
 		// GetRange-equivalent that just sets the header value.
 		hd, err := edge.Head(ctx, bucket, key)
 		if err != nil {
-			return "", 0, 0, err
+			return "", 0, 0, "", err
 		}
 
 		start, end, perr := parseByteRange(rangeSpec, hd.Size)
 		if perr != nil {
-			return "", 0, 0, perr
+			return "", 0, 0, "", perr
 		}
 
 		resp, err = edge.GetRange(ctx, bucket, key, start, end)
 		if err != nil {
-			return "", 0, 0, err
+			return "", 0, 0, "", err
 		}
 	} else {
 		resp, err = edge.Get(ctx, bucket, key)
 		if err != nil {
-			return "", 0, 0, err
+			return "", 0, 0, "", err
 		}
 	}
 
 	if resp.Body == nil {
-		return "", resp.Status, 0, nil
+		return "", resp.Status, 0, resp.ETag, nil
 	}
 
 	defer resp.Body.Close() //nolint:errcheck
@@ -366,10 +371,31 @@ func fetchAndHash(ctx context.Context, edge *edgeClient, bucket, key, rangeSpec 
 	h := hasher()
 	n, err := io.Copy(h, resp.Body)
 	if err != nil {
-		return "", resp.Status, 0, fmt.Errorf("read body: %w", err)
+		return "", resp.Status, 0, resp.ETag, fmt.Errorf("read body: %w", err)
 	}
 
-	return hex.EncodeToString(h.Sum(nil)), resp.Status, n, nil
+	return hex.EncodeToString(h.Sum(nil)), resp.Status, n, resp.ETag, nil
+}
+
+func normalizeETag(etag string) string {
+	etag = strings.TrimSpace(etag)
+	etag = strings.TrimPrefix(etag, "W/")
+	etag = strings.TrimPrefix(etag, "w/")
+	etag = strings.Trim(etag, "\"")
+
+	return etag
+}
+
+func validateExpectedETag(iter int, got, want string) error {
+	if want == "" {
+		return nil
+	}
+
+	if normalizeETag(got) != normalizeETag(want) {
+		return fmt.Errorf("iter %d: ETag mismatch: got %q want %q", iter, got, want)
+	}
+
+	return nil
 }
 
 // emitHexDiff fetches the requested range twice (once from the

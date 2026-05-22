@@ -546,7 +546,7 @@ func runScenarioETagChange(ctx context.Context, g *globalFlags, o *scenarioOpts,
 	// v1 GET via orca (populates cache).
 	t0 = time.Now()
 
-	v1Hash, _, _, err := fetchAndHash(ctx, edge, oc.Bucket(), key, "")
+	v1Hash, _, _, _, err := fetchAndHash(ctx, edge, oc.Bucket(), key, "")
 	recordStep(res, "get_v1", t0, err, map[string]any{"sha256": v1Hash, "match": v1Hash == hash1})
 
 	if err != nil || v1Hash != hash1 {
@@ -571,7 +571,7 @@ func runScenarioETagChange(ctx context.Context, g *globalFlags, o *scenarioOpts,
 	// stale bytes).
 	t0 = time.Now()
 
-	v2Hash, status, _, err := fetchAndHash(ctx, edge, oc.Bucket(), key, "")
+	v2Hash, status, _, _, err := fetchAndHash(ctx, edge, oc.Bucket(), key, "")
 	recordStep(res, "get_v2", t0, err, map[string]any{
 		"status": status,
 		"sha256": v2Hash,
