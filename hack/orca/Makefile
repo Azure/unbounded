@@ -41,6 +41,11 @@ ENV_FILE          ?= $(HACK_DIR).env
 # overriding the harness namespace keeps the translation correct;
 # values that don't match the in-cluster URL are passed through
 # verbatim.
+#
+# Credential flags are forwarded only when .env supplies them.
+# Otherwise we let orcadev's built-in defaults take over so the
+# "test"/"test" fallback lives in exactly one place
+# (defaultGlobalFlags + deploy-credentials.sh agree on it).
 ORCADEV_ENV_SETUP = if [ -f "$(ENV_FILE)" ]; then set -a && . "$(ENV_FILE)" && set +a; fi; \
 	set --; \
 	driver="$${ORIGIN_DRIVER:-azureblob}"; \
@@ -64,7 +69,9 @@ ORCADEV_ENV_SETUP = if [ -f "$(ENV_FILE)" ]; then set -a && . "$(ENV_FILE)" && s
 		awss3) \
 			origin_endpoint="$${ORIGIN_AWSS3_ENDPOINT:-http://localstack.$(NAMESPACE).svc.cluster.local:4566}"; \
 			if [ "$$origin_endpoint" = "http://localstack.$(NAMESPACE).svc.cluster.local:4566" ]; then origin_endpoint="http://localhost:30200"; fi; \
-			set -- "$$@" --origin-bucket "$${ORIGIN_AWSS3_BUCKET:-orca-origin}" --origin-endpoint "$$origin_endpoint" --origin-region "$${ORIGIN_AWSS3_REGION:-us-east-1}" --origin-access-key "$${ORCA_AWSS3_ACCESS_KEY:-test}" --origin-secret-key "$${ORCA_AWSS3_SECRET_KEY:-test}" --origin-use-path-style=true; \
+			set -- "$$@" --origin-bucket "$${ORIGIN_AWSS3_BUCKET:-orca-origin}" --origin-endpoint "$$origin_endpoint" --origin-region "$${ORIGIN_AWSS3_REGION:-us-east-1}" --origin-use-path-style=true; \
+			if [ -n "$${ORCA_AWSS3_ACCESS_KEY:-}" ]; then set -- "$$@" --origin-access-key "$${ORCA_AWSS3_ACCESS_KEY}"; fi; \
+			if [ -n "$${ORCA_AWSS3_SECRET_KEY:-}" ]; then set -- "$$@" --origin-secret-key "$${ORCA_AWSS3_SECRET_KEY}"; fi; \
 			;; \
 		*) \
 			echo "ERROR: unknown ORIGIN_DRIVER=$$driver" >&2; exit 1; \
@@ -72,7 +79,9 @@ ORCADEV_ENV_SETUP = if [ -f "$(ENV_FILE)" ]; then set -a && . "$(ENV_FILE)" && s
 	esac; \
 	cachestore_endpoint="$${CACHESTORE_ENDPOINT:-http://localstack.$(NAMESPACE).svc.cluster.local:4566}"; \
 	if [ "$$cachestore_endpoint" = "http://localstack.$(NAMESPACE).svc.cluster.local:4566" ]; then cachestore_endpoint="http://localhost:30200"; fi; \
-	set -- "$$@" --cachestore-bucket "$${CACHESTORE_BUCKET:-orca-cache}" --cachestore-endpoint "$$cachestore_endpoint" --cachestore-region "$${CACHESTORE_REGION:-us-east-1}" --cachestore-access-key "$${ORCA_CACHESTORE_S3_ACCESS_KEY:-test}" --cachestore-secret-key "$${ORCA_CACHESTORE_S3_SECRET_KEY:-test}" --cachestore-use-path-style=true;
+	set -- "$$@" --cachestore-bucket "$${CACHESTORE_BUCKET:-orca-cache}" --cachestore-endpoint "$$cachestore_endpoint" --cachestore-region "$${CACHESTORE_REGION:-us-east-1}" --cachestore-use-path-style=true; \
+	if [ -n "$${ORCA_CACHESTORE_S3_ACCESS_KEY:-}" ]; then set -- "$$@" --cachestore-access-key "$${ORCA_CACHESTORE_S3_ACCESS_KEY}"; fi; \
+	if [ -n "$${ORCA_CACHESTORE_S3_SECRET_KEY:-}" ]; then set -- "$$@" --cachestore-secret-key "$${ORCA_CACHESTORE_S3_SECRET_KEY}"; fi;
 
 # Rendered manifest dirs (per-Makefile target overrides for the dev
 # rendering of pluggable orca manifests + the dev-only LocalStack/init
