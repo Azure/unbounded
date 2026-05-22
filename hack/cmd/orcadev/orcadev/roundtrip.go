@@ -117,6 +117,14 @@ func runRoundtrip(ctx context.Context, g *globalFlags, o *roundtripOpts) error {
 
 	edge := newEdgeClient(g.orcaURL, g.timeout)
 
+	return runRoundtripWith(ctx, oc, edge, o)
+}
+
+// runRoundtripWith executes the roundtrip loop against an already-
+// constructed origin client and edge client. Split out from
+// runRoundtrip so tests can drive the full verify cycle with a
+// fake origin + httptest edge without spinning a kind cluster.
+func runRoundtripWith(ctx context.Context, oc originClient, edge *edgeClient, o *roundtripOpts) error {
 	// Determine the object name + the source-hash to compare against.
 	key, sourceHash, size, err := prepareRoundtripSource(ctx, oc, o)
 	if err != nil {
