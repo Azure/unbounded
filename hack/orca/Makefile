@@ -34,6 +34,43 @@ CONTAINER_ENGINE  ?= podman
 # Path to user .env (sourced by helper scripts that need it).
 ENV_FILE          ?= $(HACK_DIR).env
 
+# Shell snippet used by the orcadev wrapper targets. It sources .env
+# and translates the in-cluster endpoints used by rendered manifests
+# into host-reachable NodePort endpoints expected by orcadev. Literal
+# endpoint matches intentionally track hack/orca/.env.example.
+ORCADEV_ENV_SETUP = if [ -f "$(ENV_FILE)" ]; then set -a && . "$(ENV_FILE)" && set +a; fi; \
+	set --; \
+	driver="$${ORIGIN_DRIVER:-azureblob}"; \
+	set -- "$$@" --origin-driver "$$driver"; \
+	if [ -n "$${ORIGIN_ID:-}" ]; then set -- "$$@" --origin-id "$${ORIGIN_ID}"; fi; \
+	case "$$driver" in \
+		azureblob) \
+			azure_account="$${AZURE_STORAGE_ACCOUNT:-devstoreaccount1}"; \
+			azure_container="$${AZURE_CONTAINER:-$${AZURITE_CONTAINER:-orca-test}}"; \
+			azure_endpoint="$${AZUREBLOB_ENDPOINT:-}"; \
+			azure_key="$${AZURE_STORAGE_KEY:-}"; \
+			if [ "$$azure_endpoint" = "http://azurite.unbounded-kube.svc.cluster.local:10000/devstoreaccount1/" ]; then azure_endpoint="http://localhost:30100/devstoreaccount1/"; fi; \
+			set -- "$$@" --origin-account "$$azure_account" --origin-bucket "$$azure_container"; \
+			if [ -n "$$azure_endpoint" ] || [ "$$azure_account" != "devstoreaccount1" ]; then set -- "$$@" --origin-endpoint "$$azure_endpoint"; fi; \
+			if [ -n "$$azure_key" ]; then \
+				set -- "$$@" --origin-account-key "$$azure_key"; \
+			elif [ "$$azure_account" != "devstoreaccount1" ]; then \
+				echo "ERROR: AZURE_STORAGE_KEY is required for AZURE_STORAGE_ACCOUNT=$$azure_account" >&2; exit 1; \
+			fi; \
+			;; \
+		awss3) \
+			origin_endpoint="$${ORIGIN_AWSS3_ENDPOINT:-http://localstack.unbounded-kube.svc.cluster.local:4566}"; \
+			if [ "$$origin_endpoint" = "http://localstack.unbounded-kube.svc.cluster.local:4566" ]; then origin_endpoint="http://localhost:30200"; fi; \
+			set -- "$$@" --origin-bucket "$${ORIGIN_AWSS3_BUCKET:-orca-origin}" --origin-endpoint "$$origin_endpoint" --origin-region "$${ORIGIN_AWSS3_REGION:-us-east-1}" --origin-access-key "$${ORCA_AWSS3_ACCESS_KEY:-test}" --origin-secret-key "$${ORCA_AWSS3_SECRET_KEY:-test}" --origin-use-path-style=true; \
+			;; \
+		*) \
+			echo "ERROR: unknown ORIGIN_DRIVER=$$driver" >&2; exit 1; \
+			;; \
+	esac; \
+	cachestore_endpoint="$${CACHESTORE_ENDPOINT:-http://localstack.unbounded-kube.svc.cluster.local:4566}"; \
+	if [ "$$cachestore_endpoint" = "http://localstack.unbounded-kube.svc.cluster.local:4566" ]; then cachestore_endpoint="http://localhost:30200"; fi; \
+	set -- "$$@" --cachestore-bucket "$${CACHESTORE_BUCKET:-orca-cache}" --cachestore-endpoint "$$cachestore_endpoint" --cachestore-region "$${CACHESTORE_REGION:-us-east-1}" --cachestore-access-key "$${ORCA_CACHESTORE_S3_ACCESS_KEY:-test}" --cachestore-secret-key "$${ORCA_CACHESTORE_S3_SECRET_KEY:-test}" --cachestore-use-path-style=true;
+
 # Rendered manifest dirs (per-Makefile target overrides for the dev
 # rendering of pluggable orca manifests + the dev-only LocalStack/init
 # manifests).
@@ -320,52 +357,52 @@ dev-azure: ## Upload a file to real Azure (requires AZURE_STORAGE_* in .env; pas
 #   make -C hack/orca scenario      NAME=cold-warm
 
 data-generate: ## Generate synthetic blobs and upload to the origin
-	@if [ -f "$(ENV_FILE)" ]; then set -a && . "$(ENV_FILE)" && set +a; fi; \
-	go run "$(REPO_ROOT)/hack/cmd/orcadev" upload --generate $(ARGS)
+	@$(ORCADEV_ENV_SETUP) \
+	go run "$(REPO_ROOT)/hack/cmd/orcadev" "$$@" upload --generate $(ARGS)
 
 data-upload: ## Upload a file to the origin (use FILE=/path/to/file)
 	@[ -n "$(FILE)" ] || { echo "Usage: make data-upload FILE=/path/to/file [ARGS='--name foo']" >&2; exit 1; }
-	@if [ -f "$(ENV_FILE)" ]; then set -a && . "$(ENV_FILE)" && set +a; fi; \
-	go run "$(REPO_ROOT)/hack/cmd/orcadev" upload --file "$(FILE)" $(ARGS)
+	@$(ORCADEV_ENV_SETUP) \
+	go run "$(REPO_ROOT)/hack/cmd/orcadev" "$$@" upload --file "$(FILE)" $(ARGS)
 
 data-random: ## Synthesise one random blob and upload it (NAME=foo [SIZE=10MiB])
 	@[ -n "$(NAME)" ] || { echo "Usage: make data-random NAME=foo [SIZE=10MiB] [ARGS='--seed 42']" >&2; exit 1; }
-	@if [ -f "$(ENV_FILE)" ]; then set -a && . "$(ENV_FILE)" && set +a; fi; \
-	go run "$(REPO_ROOT)/hack/cmd/orcadev" upload --generate \
+	@$(ORCADEV_ENV_SETUP) \
+	go run "$(REPO_ROOT)/hack/cmd/orcadev" "$$@" upload --generate \
 		--count 1 --name "$(NAME)" --size "$${SIZE:-10MiB}" $(ARGS)
 
 data-list: ## List objects in the origin
-	@if [ -f "$(ENV_FILE)" ]; then set -a && . "$(ENV_FILE)" && set +a; fi; \
-	go run "$(REPO_ROOT)/hack/cmd/orcadev" list $(ARGS)
+	@$(ORCADEV_ENV_SETUP) \
+	go run "$(REPO_ROOT)/hack/cmd/orcadev" "$$@" list $(ARGS)
 
 data-delete: ## Delete objects from the origin (use PREFIX=foo)
-	@if [ -f "$(ENV_FILE)" ]; then set -a && . "$(ENV_FILE)" && set +a; fi; \
-	go run "$(REPO_ROOT)/hack/cmd/orcadev" delete --prefix "$(PREFIX)" $(ARGS)
+	@$(ORCADEV_ENV_SETUP) \
+	go run "$(REPO_ROOT)/hack/cmd/orcadev" "$$@" delete --prefix "$(PREFIX)" $(ARGS)
 
 roundtrip: ## Upload a file, fetch via orca, verify SHA-256 matches (FILE=path)
 	@[ -n "$(FILE)" ] || { echo "Usage: make roundtrip FILE=/path/to/file [ARGS='--repeat 3']" >&2; exit 1; }
-	@if [ -f "$(ENV_FILE)" ]; then set -a && . "$(ENV_FILE)" && set +a; fi; \
-	go run "$(REPO_ROOT)/hack/cmd/orcadev" roundtrip --file "$(FILE)" $(ARGS)
+	@$(ORCADEV_ENV_SETUP) \
+	go run "$(REPO_ROOT)/hack/cmd/orcadev" "$$@" roundtrip --file "$(FILE)" $(ARGS)
 
 cache-list: ## Enumerate cachestore chunks
-	@if [ -f "$(ENV_FILE)" ]; then set -a && . "$(ENV_FILE)" && set +a; fi; \
-	go run "$(REPO_ROOT)/hack/cmd/orcadev" cache list $(ARGS)
+	@$(ORCADEV_ENV_SETUP) \
+	go run "$(REPO_ROOT)/hack/cmd/orcadev" "$$@" cache list $(ARGS)
 
 cache-inspect: ## Show chunk presence for an object (BUCKET=b KEY=k)
 	@[ -n "$(BUCKET)" ] && [ -n "$(KEY)" ] || { echo "Usage: make cache-inspect BUCKET=b KEY=k" >&2; exit 1; }
-	@if [ -f "$(ENV_FILE)" ]; then set -a && . "$(ENV_FILE)" && set +a; fi; \
-	go run "$(REPO_ROOT)/hack/cmd/orcadev" cache inspect --bucket "$(BUCKET)" --key "$(KEY)" $(ARGS)
+	@$(ORCADEV_ENV_SETUP) \
+	go run "$(REPO_ROOT)/hack/cmd/orcadev" "$$@" cache inspect --bucket "$(BUCKET)" --key "$(KEY)" $(ARGS)
 
 cache-clear: ## Delete chunks from the cachestore (see --all / --origin-id / --object)
-	@if [ -f "$(ENV_FILE)" ]; then set -a && . "$(ENV_FILE)" && set +a; fi; \
-	go run "$(REPO_ROOT)/hack/cmd/orcadev" cache clear $(ARGS)
+	@$(ORCADEV_ENV_SETUP) \
+	go run "$(REPO_ROOT)/hack/cmd/orcadev" "$$@" cache clear $(ARGS)
 
 bench: ## Parallel GET throughput / latency benchmark (KEY=name)
 	@[ -n "$(KEY)" ] || { echo "Usage: make bench KEY=foo [ARGS='--duration 30s --concurrency 16']" >&2; exit 1; }
-	@if [ -f "$(ENV_FILE)" ]; then set -a && . "$(ENV_FILE)" && set +a; fi; \
-	go run "$(REPO_ROOT)/hack/cmd/orcadev" bench --key "$(KEY)" $(ARGS)
+	@$(ORCADEV_ENV_SETUP) \
+	go run "$(REPO_ROOT)/hack/cmd/orcadev" "$$@" bench --key "$(KEY)" $(ARGS)
 
 scenario: ## Run a canned end-to-end scenario (NAME=cold-warm|range-stress|empty-object|etag-change)
 	@[ -n "$(NAME)" ] || { echo "Usage: make scenario NAME=cold-warm [ARGS='--size 8MiB']" >&2; exit 1; }
-	@if [ -f "$(ENV_FILE)" ]; then set -a && . "$(ENV_FILE)" && set +a; fi; \
-	go run "$(REPO_ROOT)/hack/cmd/orcadev" scenario "$(NAME)" $(ARGS)
+	@$(ORCADEV_ENV_SETUP) \
+	go run "$(REPO_ROOT)/hack/cmd/orcadev" "$$@" scenario "$(NAME)" $(ARGS)
