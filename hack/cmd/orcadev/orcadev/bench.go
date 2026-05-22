@@ -35,6 +35,7 @@ type benchOpts struct {
 	histUpper      time.Duration
 	histBuckets    int
 	warmupRequests int
+	drainTimeout   time.Duration
 }
 
 func newBenchCmd(g *globalFlags) *cobra.Command {
@@ -48,6 +49,7 @@ func newBenchCmd(g *globalFlags) *cobra.Command {
 		histUpper:      10 * time.Second,
 		histBuckets:    50,
 		warmupRequests: 1,
+		drainTimeout:   10 * time.Second,
 	}
 
 	cmd := &cobra.Command{
@@ -60,8 +62,13 @@ requests, errors, bytes read, throughput, and latency percentiles
 
 Two stop conditions, mutually exclusive:
 
-  --duration 30s     run for the wall-clock duration
-  --requests 1000    run until N requests have completed
+  --duration 30s     run for the wall-clock duration. When the
+                     deadline fires, no new requests are issued
+                     but in-flight requests are allowed to drain
+                     for up to --drain-timeout (default 10s)
+                     before being cancelled.
+  --requests 1000    run until N requests have completed (no
+                     drain phase).
 
 Two read shapes:
 
@@ -98,6 +105,8 @@ expected steady-state latency distribution.`,
 	cmd.Flags().DurationVar(&o.histUpper, "hist-upper", o.histUpper, "latency histogram upper bound")
 	cmd.Flags().IntVar(&o.histBuckets, "hist-buckets", o.histBuckets, "latency histogram bucket count")
 	cmd.Flags().IntVar(&o.warmupRequests, "warmup-requests", o.warmupRequests, "single-worker requests issued before timing starts")
+	cmd.Flags().DurationVar(&o.drainTimeout, "drain-timeout", o.drainTimeout,
+		"how long to let in-flight requests finish after --duration expires before cancelling them")
 
 	return cmd
 }
@@ -119,25 +128,38 @@ type benchResult struct {
 }
 
 type benchResultConfig struct {
-	OrcaURL         string  `json:"orca_url"`
-	Bucket          string  `json:"bucket"`
-	Key             string  `json:"key"`
-	ObjectSizeBytes int64   `json:"object_size_bytes"`
-	ETag            string  `json:"etag,omitempty"`
-	Concurrency     int     `json:"concurrency"`
-	DurationSeconds float64 `json:"duration_seconds"`
-	RequestCount    *int    `json:"request_count_target"`
-	RangeSizeBytes  int64   `json:"range_size_bytes"`
-	Full            bool    `json:"full"`
-	ReadPattern     string  `json:"read_pattern"`
-	WarmupRequests  int     `json:"warmup_requests"`
+	OrcaURL             string  `json:"orca_url"`
+	Bucket              string  `json:"bucket"`
+	Key                 string  `json:"key"`
+	ObjectSizeBytes     int64   `json:"object_size_bytes"`
+	ETag                string  `json:"etag,omitempty"`
+	Concurrency         int     `json:"concurrency"`
+	DurationSeconds     float64 `json:"duration_seconds"`
+	DrainTimeoutSeconds float64 `json:"drain_timeout_seconds"`
+	RequestCount        *int    `json:"request_count_target"`
+	RangeSizeBytes      int64   `json:"range_size_bytes"`
+	Full                bool    `json:"full"`
+	ReadPattern         string  `json:"read_pattern"`
+	WarmupRequests      int     `json:"warmup_requests"`
 }
 
 type benchResultPayload struct {
-	Requests          int64               `json:"requests"`
-	Errors            int64               `json:"errors"`
-	BytesRead         int64               `json:"bytes_read"`
-	ElapsedSeconds    float64             `json:"elapsed_seconds"`
+	Requests       int64   `json:"requests"`
+	Errors         int64   `json:"errors"`
+	BytesRead      int64   `json:"bytes_read"`
+	ElapsedSeconds float64 `json:"elapsed_seconds"`
+	// GateSeconds is wall-clock time the gate was open (i.e. the
+	// window during which new requests could be issued). For
+	// --duration runs this equals the configured duration; for
+	// --requests N runs this is the time until the Nth request
+	// finished.
+	GateSeconds float64 `json:"gate_seconds"`
+	// DrainSeconds is wall-clock time spent after the gate closed
+	// waiting for in-flight requests to finish. Zero for
+	// --requests N runs. Bounded above by DrainTimeoutSeconds; if
+	// the drain budget is exhausted, remaining in-flight requests
+	// are cancelled and counted as errors.
+	DrainSeconds      float64             `json:"drain_seconds"`
 	ThroughputBytes   float64             `json:"throughput_bytes_per_second"`
 	RequestsPerSecond float64             `json:"requests_per_second"`
 	LatencyNs         benchLatencySummary `json:"latency_ns"`
@@ -247,10 +269,19 @@ func runBench(ctx context.Context, g *globalFlags, o *benchOpts) error {
 
 	startedAt := time.Now()
 
-	results := runBenchLoop(ctx, edge, oc.Bucket(), o.key, info.Size, rangeSize, o, duration, reqLimit)
+	results, gateClosedAt := runBenchLoop(ctx, edge, oc.Bucket(), o.key, info.Size, rangeSize, o, duration, reqLimit)
 
 	finishedAt := time.Now()
 	elapsed := finishedAt.Sub(startedAt)
+	gateDuration := gateClosedAt.Sub(startedAt)
+	if gateDuration < 0 {
+		gateDuration = 0
+	}
+
+	drainDuration := finishedAt.Sub(gateClosedAt)
+	if drainDuration < 0 {
+		drainDuration = 0
+	}
 
 	stats := computeLatencyStats(results.latencies)
 	hist := buildHistogram(results.latencies, o.histLower, o.histUpper, o.histBuckets)
@@ -263,23 +294,26 @@ func runBench(ctx context.Context, g *globalFlags, o *benchOpts) error {
 		StartedAt:     startedAt.UTC().Format(time.RFC3339Nano),
 		FinishedAt:    finishedAt.UTC().Format(time.RFC3339Nano),
 		Config: benchResultConfig{
-			OrcaURL:         g.orcaURL,
-			Bucket:          oc.Bucket(),
-			Key:             o.key,
-			ObjectSizeBytes: info.Size,
-			ETag:            info.ETag,
-			Concurrency:     o.concurrency,
-			DurationSeconds: duration.Seconds(),
-			RangeSizeBytes:  rangeSize,
-			Full:            o.full,
-			ReadPattern:     o.readPattern,
-			WarmupRequests:  o.warmupRequests,
+			OrcaURL:             g.orcaURL,
+			Bucket:              oc.Bucket(),
+			Key:                 o.key,
+			ObjectSizeBytes:     info.Size,
+			ETag:                info.ETag,
+			Concurrency:         o.concurrency,
+			DurationSeconds:     duration.Seconds(),
+			DrainTimeoutSeconds: o.drainTimeout.Seconds(),
+			RangeSizeBytes:      rangeSize,
+			Full:                o.full,
+			ReadPattern:         o.readPattern,
+			WarmupRequests:      o.warmupRequests,
 		},
 		Results: benchResultPayload{
 			Requests:          results.requests,
 			Errors:            results.errors,
 			BytesRead:         results.bytes,
 			ElapsedSeconds:    elapsed.Seconds(),
+			GateSeconds:       gateDuration.Seconds(),
+			DrainSeconds:      drainDuration.Seconds(),
 			ThroughputBytes:   ratePerSec(results.bytes, elapsed),
 			RequestsPerSecond: ratePerSec(results.requests, elapsed),
 			LatencyNs: benchLatencySummary{
@@ -343,7 +377,18 @@ func (a *benchAcc) record(elapsed time.Duration, n int64, err error, code string
 
 // runBenchLoop launches o.concurrency workers and runs until either
 // the deadline elapses or reqLimit requests have completed. The
-// shared benchAcc carries results out.
+// shared benchAcc carries per-request results out; the returned
+// gateClosedAt is the wall-clock time the gate stopped admitting
+// new work (zero in --requests mode where the gate closes only
+// after the Nth request completes; non-zero in --duration mode
+// where the deadline fired).
+//
+// In --duration mode the two contexts are split: gateCtx bounds
+// new-work admission to `duration`, while reqCtx bounds the
+// underlying HTTP calls to `duration + drainTimeout`. After the
+// gate closes, in-flight requests are given drainTimeout to
+// finish; any still pending past that get reqCtx-cancelled and
+// counted as errors.
 func runBenchLoop(
 	ctx context.Context,
 	edge *edgeClient,
@@ -352,15 +397,61 @@ func runBenchLoop(
 	o *benchOpts,
 	duration time.Duration,
 	reqLimit int,
-) *benchAcc {
+) (*benchAcc, time.Time) {
 	acc := &benchAcc{latencies: make([]time.Duration, 0, 1024)}
 
-	loopCtx := ctx
-	var cancel context.CancelFunc
+	// gateCtx controls "may a worker start another request?". In
+	// --duration mode it expires at `duration`; in --requests mode
+	// it inherits ctx and is never deadline-cancelled (the issued
+	// counter does the gating).
+	gateCtx := ctx
+
+	var gateCancel context.CancelFunc
 
 	if duration > 0 {
-		loopCtx, cancel = context.WithTimeout(ctx, duration)
-		defer cancel()
+		gateCtx, gateCancel = context.WithTimeout(ctx, duration)
+		defer gateCancel()
+	}
+
+	// reqCtx is what the HTTP calls actually use. It is deliberately
+	// NOT bound by `duration`: after the gate closes, in-flight
+	// requests continue against reqCtx until they finish or until
+	// the drain timer (below) cancels them. Ctrl-C on the parent
+	// ctx still propagates to reqCtx for prompt teardown.
+	reqCtx, reqCancel := context.WithCancel(ctx)
+	defer reqCancel()
+
+	// gateClosedAt is set the instant the gate stops admitting
+	// new work. We capture it in two places: (a) when the gate's
+	// deadline fires (via context.AfterFunc), (b) when all workers
+	// exit voluntarily in --requests mode (set below in the
+	// post-Wait fallback). gateClosedCh provides a one-shot signal
+	// so the drain timer doesn't double-fire.
+	var (
+		gateClosedAt     time.Time
+		gateClosedMu     sync.Mutex
+		gateClosedOnce   sync.Once
+		drainCancelTimer *time.Timer
+	)
+
+	setGateClosed := func() {
+		gateClosedOnce.Do(func() {
+			gateClosedMu.Lock()
+			gateClosedAt = time.Now()
+			gateClosedMu.Unlock()
+			// Arm the drain cap: after o.drainTimeout, force-cancel
+			// any still-in-flight requests via reqCtx.
+			if o.drainTimeout > 0 {
+				drainCancelTimer = time.AfterFunc(o.drainTimeout, reqCancel)
+			}
+		})
+	}
+
+	// In --duration mode, wire the gate's expiration to setGateClosed.
+	// In --requests mode, the workers themselves call it after the
+	// reqLimit is reached.
+	if duration > 0 {
+		context.AfterFunc(gateCtx, setGateClosed)
 	}
 
 	var (
@@ -377,13 +468,20 @@ func runBenchLoop(
 
 		for {
 			select {
-			case <-loopCtx.Done():
+			case <-gateCtx.Done():
 				return
 			default:
 			}
 
-			if reqLimit > 0 && issued.Add(1) > int64(reqLimit) {
-				return
+			if reqLimit > 0 {
+				next := issued.Add(1)
+				if next > int64(reqLimit) {
+					// Last worker through closes the gate so the
+					// --requests run reports gate_seconds equal to
+					// elapsed (no separate drain phase).
+					setGateClosed()
+					return
+				}
 			}
 
 			// Pick a range.
@@ -423,9 +521,9 @@ func runBenchLoop(
 			)
 
 			if o.full || (start == 0 && end == objectSize-1) {
-				resp, err = edge.Get(loopCtx, bucket, key)
+				resp, err = edge.Get(reqCtx, bucket, key)
 			} else {
-				resp, err = edge.GetRange(loopCtx, bucket, key, start, end)
+				resp, err = edge.GetRange(reqCtx, bucket, key, start, end)
 			}
 
 			if err != nil {
@@ -466,7 +564,27 @@ func runBenchLoop(
 
 	wg.Wait()
 
-	return acc
+	// All workers exited. Stop the drain-cancel timer if it's
+	// still pending so we don't fire reqCancel after Wait
+	// returned (harmless either way; tidier this way).
+	if drainCancelTimer != nil {
+		drainCancelTimer.Stop()
+	}
+
+	// In --requests mode, if no worker exited via the reqLimit
+	// path (e.g. parent ctx was cancelled before the limit was
+	// reached), gateClosedAt may still be zero. Treat the Wait
+	// return as the gate close so the caller can still compute a
+	// meaningful gate_seconds.
+	gateClosedMu.Lock()
+	if gateClosedAt.IsZero() {
+		gateClosedAt = time.Now()
+	}
+
+	out := gateClosedAt
+	gateClosedMu.Unlock()
+
+	return acc, out
 }
 
 // emitBenchResult writes the human + JSON outputs per the --output
@@ -511,6 +629,8 @@ func writeBenchHuman(w io.Writer, br benchResult) {
 	fprintf(w, "  range:       %s\n", rangeDescription(br.Config))
 	fprintf(w, "  concurrency: %d\n", br.Config.Concurrency)
 	fprintf(w, "  elapsed:     %s\n", time.Duration(br.Results.ElapsedSeconds*float64(time.Second)).Round(time.Millisecond))
+	fprintf(w, "  gate open:   %s\n", time.Duration(br.Results.GateSeconds*float64(time.Second)).Round(time.Millisecond))
+	fprintf(w, "  drain:       %s\n", time.Duration(br.Results.DrainSeconds*float64(time.Second)).Round(time.Millisecond))
 	fprintln(w)
 	fprintf(w, "  requests:    %d\n", br.Results.Requests)
 	fprintf(w, "  errors:      %d\n", br.Results.Errors)
