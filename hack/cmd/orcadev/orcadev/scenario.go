@@ -517,7 +517,7 @@ func scenarioSourceBuffer(size int64) ([]byte, string, error) {
 }
 
 func shouldLogRangeStressBufferNotice(size int64) bool {
-	return size > 1*1024*1024*1024
+	return size > 1024*1024*1024
 }
 
 func verifyRangeResponse(resp edgeResponse, want []byte) error {
