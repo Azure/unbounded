@@ -703,7 +703,7 @@ func scenarioGet(ctx context.Context, edge *edgeClient, bucket, key string) (int
 // the next GET is forced to refill from origin. Used by the
 // cold-warm scenario.
 func clearScenarioObject(ctx context.Context, g *globalFlags, cs cachestoreOps, oc originClient, key, etag, chunkSizeOverride string) error {
-	chunkSize, err := resolveScenarioChunkSize(g, chunkSizeOverride)
+	chunkSize, err := resolveChunkSize(g, chunkSizeOverride)
 	if err != nil {
 		return err
 	}
@@ -742,8 +742,4 @@ func clearScenarioObject(ctx context.Context, g *globalFlags, cs cachestoreOps, 
 	}
 
 	return nil
-}
-
-func resolveScenarioChunkSize(g *globalFlags, override string) (int64, error) {
-	return resolveChunkSize(g, override)
 }
