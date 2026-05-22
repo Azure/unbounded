@@ -170,7 +170,7 @@ func spawnPortForward(_ context.Context, g *globalFlags, port string) (func(), e
 	ready := make(chan error, 1)
 
 	go func() {
-		ready <- waitForForwarding(stdout)
+		ready <- waitForForwardingAndDrain(stdout)
 	}()
 
 	select {
@@ -203,6 +203,25 @@ func spawnPortForward(_ context.Context, g *globalFlags, port string) (func(), e
 // waitForForwarding reads from r until it sees the kubectl
 // "Forwarding from" sentinel string or r is closed.
 func waitForForwarding(r io.Reader) error {
+	_, err := waitForForwardingReader(r)
+
+	return err
+}
+
+func waitForForwardingAndDrain(r io.Reader) error {
+	drain, err := waitForForwardingReader(r)
+	if err != nil {
+		return err
+	}
+
+	go func() {
+		_, _ = io.Copy(io.Discard, drain) //nolint:errcheck // drain best-effort
+	}()
+
+	return nil
+}
+
+func waitForForwardingReader(r io.Reader) (io.Reader, error) {
 	const sentinel = "Forwarding from"
 
 	buf := make([]byte, 4096)
@@ -214,12 +233,12 @@ func waitForForwarding(r io.Reader) error {
 		if n > 0 {
 			seen.Write(buf[:n])
 			if strings.Contains(seen.String(), sentinel) {
-				return nil
+				return r, nil
 			}
 		}
 
 		if err != nil {
-			return fmt.Errorf("kubectl exited before forwarding: %w; output: %s",
+			return nil, fmt.Errorf("kubectl exited before forwarding: %w; output: %s",
 				err, strings.TrimSpace(seen.String()))
 		}
 	}
