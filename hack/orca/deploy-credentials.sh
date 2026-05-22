@@ -6,10 +6,10 @@
 # Azure Blob and S3 cachestore credentials. Sourced from .env so secret
 # values never land in YAML.
 #
-# The dev harness defaults to ORIGIN_DRIVER=awss3 (LocalStack as both
-# origin and cachestore), in which case AZURE_STORAGE_KEY is optional
-# and the Azure key is omitted from the Secret. If you switch to
-# ORIGIN_DRIVER=azureblob, AZURE_STORAGE_KEY becomes required.
+# The dev harness defaults to ORIGIN_DRIVER=azureblob (Azurite as
+# origin, LocalStack as cachestore). In that mode AZURE_STORAGE_KEY is
+# auto-filled with Azurite's well-known dev key unless a real Azure
+# account is configured. ORIGIN_DRIVER=awss3 keeps Azure optional.
 set -euo pipefail
 
 CLUSTER_NAME=${CLUSTER_NAME:?CLUSTER_NAME must be set}
@@ -22,10 +22,10 @@ if [[ -f "${ENV_FILE}" ]]; then
   . "${ENV_FILE}"
   set +a
 else
-  echo "Note: ${ENV_FILE} not found; proceeding with default awss3 origin (LocalStack)."
+  echo "Note: ${ENV_FILE} not found; proceeding with default azureblob origin (Azurite)."
 fi
 
-ORIGIN_DRIVER=${ORIGIN_DRIVER:-awss3}
+ORIGIN_DRIVER=${ORIGIN_DRIVER:-azureblob}
 
 # LocalStack accepts any non-empty creds; pin to test/test for parity
 # with manual aws-cli calls in the init Job. Both the cachestore and
