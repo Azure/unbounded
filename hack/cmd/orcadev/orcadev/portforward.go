@@ -37,6 +37,13 @@ const (
 	orcaEdgeService   = "orca"
 )
 
+// portForwardRetryDelay is the backoff before re-probing localhost
+// and re-attempting kubectl after a "bind: address already in use"
+// failure. Long enough for a concurrent orcadev's port-forward to
+// finish its own startup, short enough to keep the perceived
+// latency tolerable.
+const portForwardRetryDelay = 500 * time.Millisecond
+
 // ensureEdgeReachable probes --orca-url; if unreachable AND the URL
 // looks like the documented dev default (localhost:8443) AND
 // --auto-port-forward is enabled, spawns a kubectl port-forward in
@@ -59,6 +66,12 @@ const (
 //	                                       port, is honored)
 //	probe fails + everything else true  -> spawn port-forward, return
 //	                                       cleanup that SIGTERMs it
+//
+// Concurrent orcadev invocations can race on the localhost:8443
+// bind: probe sees the port free, then a sibling process binds it
+// before our kubectl starts. We detect that case via
+// isPortInUseError and re-probe; if the sibling is now serving we
+// return a no-op cleanup, otherwise we retry the spawn once.
 func ensureEdgeReachable(ctx context.Context, g *globalFlags) (func(), error) {
 	if !g.autoPortForward {
 		return func() {}, nil
@@ -86,7 +99,41 @@ func ensureEdgeReachable(ctx context.Context, g *globalFlags) (func(), error) {
 		return func() {}, nil
 	}
 
+	cleanup, err := spawnPortForward(ctx, g, port)
+	if err == nil {
+		return cleanup, nil
+	}
+
+	if !isPortInUseError(err) {
+		return nil, err
+	}
+
+	// A concurrent process likely grabbed the port between our probe
+	// and kubectl's listen. Sleep a short jitter and re-probe; if a
+	// sibling now serves the port we can ride its forward.
+	time.Sleep(portForwardRetryDelay)
+
+	if probeTCP(host, port, portForwardProbeTimeout) {
+		return func() {}, nil
+	}
+
 	return spawnPortForward(ctx, g, port)
+}
+
+// isPortInUseError returns true when err looks like the kubectl
+// "Unable to listen on port" / "bind: address already in use"
+// failure that occurs when another process holds the local port at
+// the moment kubectl attempts to bind. Matched substrings are taken
+// verbatim from observed kubectl 1.29 - 1.31 output.
+func isPortInUseError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	msg := err.Error()
+
+	return strings.Contains(msg, "address already in use") ||
+		strings.Contains(msg, "unable to listen on any of the requested ports")
 }
 
 // probeTCP returns true if a TCP connection to host:port completes
