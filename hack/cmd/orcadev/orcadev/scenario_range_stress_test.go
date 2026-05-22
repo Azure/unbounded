@@ -14,15 +14,23 @@ func TestVerifyRangeResponse(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name    string
-		status  int
-		body    string
-		want    string
-		wantErr bool
+		name        string
+		status      int
+		body        string
+		want        string
+		wantErr     bool
+		wantErrSubs []string
 	}{
 		{name: "match", status: http.StatusPartialContent, body: "abcd", want: "abcd"},
-		{name: "wrong status", status: http.StatusOK, body: "abcd", want: "abcd", wantErr: true},
-		{name: "wrong bytes", status: http.StatusPartialContent, body: "abce", want: "abcd", wantErr: true},
+		{name: "wrong status", status: http.StatusOK, body: "abcd", want: "abcd", wantErr: true, wantErrSubs: []string{"status 200"}},
+		{
+			name:        "wrong bytes",
+			status:      http.StatusPartialContent,
+			body:        "abce",
+			want:        "abcd",
+			wantErr:     true,
+			wantErrSubs: []string{"mismatch at offset 3"},
+		},
 	}
 
 	for _, tt := range tests {
@@ -36,6 +44,12 @@ func TestVerifyRangeResponse(t *testing.T) {
 			if tt.wantErr {
 				if err == nil {
 					t.Fatal("verifyRangeResponse() = nil, want error")
+				}
+
+				for _, sub := range tt.wantErrSubs {
+					if !strings.Contains(err.Error(), sub) {
+						t.Fatalf("err = %v, want substring %q", err, sub)
+					}
 				}
 
 				return

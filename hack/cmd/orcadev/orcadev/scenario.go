@@ -517,7 +517,20 @@ func verifyRangeResponse(resp edgeResponse, want []byte) error {
 	}
 
 	if !bytes.Equal(got, want) {
-		return fmt.Errorf("range body mismatch: got %d bytes, want %d bytes", len(got), len(want))
+		offset := firstDiffOffset(want, got)
+		// Align the hex window to the previous 16-byte boundary so
+		// the dump is human-readable; cap at 64 bytes so a single
+		// mismatch doesn't dump a megabyte of context.
+		startOffset := offset - (offset % 16)
+		if startOffset < 0 {
+			startOffset = 0
+		}
+
+		return fmt.Errorf(
+			"range body mismatch at offset %d: got %d bytes, want %d bytes\n%s",
+			offset, len(got), len(want),
+			hexDiffDump(want, got, startOffset, 64),
+		)
 	}
 
 	return nil
