@@ -73,3 +73,16 @@ func TestShouldLogRangeStressBufferNotice(t *testing.T) {
 		t.Fatal("notice should be emitted above 1 GiB")
 	}
 }
+
+func TestScenarioSourceBufferRejectsOversize(t *testing.T) {
+	t.Parallel()
+
+	_, _, err := scenarioSourceBuffer(scenarioRangeStressMaxSize + 1)
+	if err == nil {
+		t.Fatal("scenarioSourceBuffer() = nil error, want oversize rejection")
+	}
+
+	if !strings.Contains(err.Error(), "exceeds the range-stress in-memory ceiling") {
+		t.Fatalf("err = %v, want oversize message", err)
+	}
+}

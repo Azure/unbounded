@@ -478,7 +478,23 @@ func runScenarioRangeStress(ctx context.Context, g *globalFlags, o *scenarioOpts
 	return nil
 }
 
+// scenarioRangeStressMaxSize caps the in-memory source buffer for
+// the range-stress scenario. The verifier holds the full payload
+// in RAM and each ranged GET response is buffered through
+// io.ReadAll, so a 4 GiB ceiling keeps peak memory bounded at
+// around 5 GiB on the host (source + one range read at a time)
+// while still leaving headroom for serious load tests.
+const scenarioRangeStressMaxSize = 4 * 1024 * 1024 * 1024
+
 func scenarioSourceBuffer(size int64) ([]byte, string, error) {
+	if size > scenarioRangeStressMaxSize {
+		return nil, "", fmt.Errorf(
+			"--size %s exceeds the range-stress in-memory ceiling of %s; "+
+				"use bench or scale down --size",
+			formatSize(size), formatSize(scenarioRangeStressMaxSize),
+		)
+	}
+
 	if size > int64(math.MaxInt) {
 		return nil, "", fmt.Errorf("--size %s exceeds addressable memory on this platform", formatSize(size))
 	}
