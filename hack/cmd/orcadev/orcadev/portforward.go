@@ -172,6 +172,13 @@ func hostPortFromURL(u string) (string, string, error) {
 	return host, port, nil
 }
 
+// portForwardStderrCapacity bounds the in-memory buffer used to
+// surface kubectl stderr in failure messages. 16 KiB is more than
+// enough for an "Unable to listen on port" stanza yet small enough
+// that a multi-hour port-forward leaking spurious stderr (e.g.
+// recurring connection-reset warnings) cannot grow without bound.
+const portForwardStderrCapacity = 16 * 1024
+
 // spawnPortForward starts `kubectl port-forward svc/orca <port>:8443`
 // as a subprocess under g.kubeContext and waits up to
 // portForwardReadyTimeout for the "Forwarding from" line on stdout.
@@ -179,10 +186,10 @@ func hostPortFromURL(u string) (string, string, error) {
 // or an error if the subprocess didn't reach the ready state in
 // time.
 //
-// Stderr is drained into an in-memory buffer so it can be surfaced
-// in the error message; we deliberately do NOT stream it to the
-// user's stderr during the run (kubectl is chatty about
-// "Handling connection for X" lines that would clutter output).
+// Stderr is drained into a bounded ring buffer so a failing kubectl
+// reports something useful; we deliberately do NOT stream it to the
+// user's stderr during the run (kubectl is chatty about "Handling
+// connection for X" lines that would clutter output).
 func spawnPortForward(_ context.Context, g *globalFlags, port string) (func(), error) {
 	cmd := exec.Command("kubectl",
 		"--context", g.kubeContext,
@@ -205,13 +212,13 @@ func spawnPortForward(_ context.Context, g *globalFlags, port string) (func(), e
 		return nil, fmt.Errorf("port-forward start: %w", err)
 	}
 
-	// Drain stderr into a buffer so a failing kubectl reports
-	// something useful, AND so the subprocess doesn't block on a
-	// full pipe if we ever forget to drain it.
-	var errBuf strings.Builder
+	// Drain stderr into a bounded buffer so the subprocess never
+	// blocks on a full pipe and our diagnostic memory footprint is
+	// capped regardless of session length.
+	errBuf := newRingBuffer(portForwardStderrCapacity)
 
 	go func() {
-		_, _ = io.Copy(&errBuf, stderr) //nolint:errcheck // drain best-effort
+		_, _ = io.Copy(errBuf, stderr) //nolint:errcheck // drain best-effort
 	}()
 
 	ready := make(chan error, 1)
