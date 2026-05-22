@@ -223,7 +223,10 @@ func runCacheInspect(ctx context.Context, g *globalFlags, o *cacheInspectOpts) e
 		return err
 	}
 
-	prepareCacheInspectOriginBucket(g, o)
+	// Override the resolved origin bucket BEFORE constructing the
+	// origin client; azureblob binds the container at construction
+	// time, so a later mutation would not take effect.
+	g.originBucket = o.bucket
 
 	oc, err := newOriginClient(ctx, g)
 	if err != nil {
@@ -303,13 +306,6 @@ func runCacheInspect(ctx context.Context, g *globalFlags, o *cacheInspectOpts) e
 	fmt.Fprintf(os.Stderr, "\ncached: %d/%d chunks (%.1f%%) %s\n", present, nChunks, pct, formatSize(bytes))
 
 	return nil
-}
-
-func prepareCacheInspectOriginBucket(g *globalFlags, o *cacheInspectOpts) {
-	// Override the resolved bucket before constructing the origin
-	// client so drivers that bind bucket/container at construction
-	// time (azureblob) target what the operator asked for.
-	g.originBucket = o.bucket
 }
 
 // resolveChunkSize returns the chunk size to use for chunk-path

@@ -10,26 +10,6 @@ import (
 	"testing"
 )
 
-func TestCacheInspectOverridesOriginBucketBeforeClientConstruction(t *testing.T) {
-	t.Parallel()
-
-	g := defaultGlobalFlags()
-	g.originBucket = "default-bucket"
-
-	o := &cacheInspectOpts{
-		bucket:    "requested-bucket",
-		key:       "key",
-		etag:      "etag",
-		chunkSize: "1MiB",
-	}
-
-	prepareCacheInspectOriginBucket(g, o)
-
-	if g.originBucket != "requested-bucket" {
-		t.Fatalf("originBucket = %q, want requested-bucket", g.originBucket)
-	}
-}
-
 // TestRunCacheInspect_BucketOverrideReachesOrigin drives
 // runCacheInspect end-to-end and verifies that the origin client
 // factory sees the operator-supplied --bucket value (rather than the
