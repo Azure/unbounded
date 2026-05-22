@@ -4,11 +4,14 @@
 package orcadev
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -359,11 +362,16 @@ func runScenarioRangeStress(ctx context.Context, g *globalFlags, o *scenarioOpts
 
 	key := fmt.Sprintf("scenario-range-stress-%d", time.Now().UnixNano())
 
-	// Step 1: upload with a known checksum.
+	// Step 1: upload with known bytes and a known checksum.
 	t0 := time.Now()
-	h := hasher()
-	uploadErr := oc.Put(ctx, key, newTeeHashReader(io.LimitReader(rand.Reader, size), h), size)
-	sourceHash := hexSum(h)
+	source, sourceHash, sourceErr := scenarioSourceBuffer(size)
+	if sourceErr != nil {
+		recordStep(res, "upload", t0, sourceErr, map[string]any{"bytes": size})
+
+		return sourceErr
+	}
+
+	uploadErr := oc.Put(ctx, key, bytes.NewReader(source), size)
 	recordStep(res, "upload", t0, uploadErr, map[string]any{"bytes": size, "sha256": sourceHash})
 
 	if uploadErr != nil {
@@ -408,6 +416,7 @@ func runScenarioRangeStress(ctx context.Context, g *globalFlags, o *scenarioOpts
 	step := size / int64(ranges)
 
 	var mismatch bool
+	var rangeErr error
 
 	for i := int64(0); i < int64(ranges); i++ {
 		start := i * step
@@ -420,27 +429,67 @@ func runScenarioRangeStress(ctx context.Context, g *globalFlags, o *scenarioOpts
 		rresp, rerr := edge.GetRange(ctx, oc.Bucket(), key, start, end)
 		if rerr != nil {
 			mismatch = true
+			rangeErr = rerr
 			break
 		}
 
-		buf := make([]byte, end-start+1)
-
-		if _, err := io.ReadFull(rresp.Body, buf); err != nil {
-			_ = rresp.Body.Close() //nolint:errcheck
-
+		if err := verifyRangeResponse(rresp, source[start:end+1]); err != nil {
 			mismatch = true
+			rangeErr = err
 
 			break
 		}
-
-		_ = rresp.Body.Close() //nolint:errcheck
-		_ = buf                //nolint:wsl // bytes consumed; further validation requires re-reading source
 	}
 
-	recordStep(res, "ranges", t0, nil, map[string]any{"count": ranges, "mismatch": mismatch})
+	recordStep(res, "ranges", t0, rangeErr, map[string]any{"count": ranges, "mismatch": mismatch})
 
 	if mismatch {
 		return fmt.Errorf("range fetch failed (one or more ranges did not return expected bytes)")
+	}
+
+	return nil
+}
+
+func scenarioSourceBuffer(size int64) ([]byte, string, error) {
+	if size > int64(math.MaxInt) {
+		return nil, "", fmt.Errorf("--size %s exceeds addressable memory on this platform", formatSize(size))
+	}
+
+	if shouldLogRangeStressBufferNotice(size) {
+		printErr("verifying: hashing %s source buffer for range comparison\n", formatSize(size))
+	}
+
+	buf := make([]byte, int(size))
+	if _, err := rand.Read(buf); err != nil {
+		return nil, "", fmt.Errorf("generate source bytes: %w", err)
+	}
+
+	h := hasher()
+	if _, err := h.Write(buf); err != nil {
+		return nil, "", fmt.Errorf("hash source bytes: %w", err)
+	}
+
+	return buf, hexSum(h), nil
+}
+
+func shouldLogRangeStressBufferNotice(size int64) bool {
+	return size > 1*1024*1024*1024
+}
+
+func verifyRangeResponse(resp edgeResponse, want []byte) error {
+	defer resp.Body.Close() //nolint:errcheck
+
+	if resp.Status != http.StatusPartialContent {
+		return fmt.Errorf("range GET returned status %d, want %d", resp.Status, http.StatusPartialContent)
+	}
+
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("read range body: %w", err)
+	}
+
+	if !bytes.Equal(got, want) {
+		return fmt.Errorf("range body mismatch: got %d bytes, want %d bytes", len(got), len(want))
 	}
 
 	return nil
