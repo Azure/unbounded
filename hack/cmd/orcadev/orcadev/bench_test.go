@@ -40,6 +40,11 @@ func TestBenchResolveStopCondition(t *testing.T) {
 			wantDuration: 0,
 			wantRequests: 100,
 		},
+		{
+			name:    "explicit zero duration rejected",
+			opts:    benchOpts{durationStr: "0s", durationSet: true},
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {

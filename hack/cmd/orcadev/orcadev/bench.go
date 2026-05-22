@@ -346,6 +346,10 @@ func (o *benchOpts) resolveStopCondition() (time.Duration, int, error) {
 	}
 
 	if duration == 0 {
+		if o.durationSet {
+			return 0, 0, fmt.Errorf("--duration 0 is not a valid stop condition; pass --requests N to bound by request count")
+		}
+
 		duration = 30 * time.Second
 	}
 
