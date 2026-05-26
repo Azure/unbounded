@@ -93,9 +93,11 @@ impl Allocator {
     /// Reserve `n` contiguous LBAs. Returns the start LBA. A bump-
     /// style scan from the current hint suffices because the
     /// engine writes user pages as soon as it allocates them, so
-    /// the high-water region stays mostly contiguous and the scan
-    /// is O(n) on a fresh disk. Falls back to a full wrap-around
-    /// scan only when the hint region is exhausted.
+    /// the high-water region stays mostly contiguous: scanning is
+    /// O(`n`) (the requested run length) per allocation on a fresh
+    /// disk, with worst case O(`capacity`) under fragmentation when
+    /// the hint region is exhausted and the wrap-around scan walks
+    /// the full bitmap.
     pub fn alloc_contig(&self, n: u64) -> Result<Lba, Error> {
         if n == 0 {
             return Err(Error::OutOfRange);
