@@ -4,11 +4,16 @@
 // Package server holds the HTTP handlers for the client edge and the
 // internal-listener.
 //
-// Client edge (8443): GET /{bucket}/{key} (with optional Range), HEAD,
-// LIST. No auth in dev (server.auth.enabled=false).
+// Client edge (8443): GET /{bucket}/{key} (with optional Range) and
+// HEAD /{bucket}/{key}. No auth in dev (server.auth.enabled=false).
+// Errors are returned as S3-compatible XML <Error> envelopes so that
+// AWS S3 SDKs surface a typed error code to the caller; HEAD errors
+// carry status + headers only (no body), matching real S3 behavior.
 //
 // Internal listener (8444): GET /internal/fill?<chunk-key>. No mTLS in
-// dev (cluster.internal_tls.enabled=false).
+// dev (cluster.internal_tls.enabled=false). Internal-listener errors
+// are plain text or JSON; the internal API is peer-to-peer between
+// orca replicas and is never consumed by an S3 SDK.
 package server
 
 import (
@@ -53,17 +58,18 @@ func NewEdgeHandler(fc edgeFetchAPI, cfg *config.Config, log *slog.Logger) *Edge
 // Routing (path-style only, since LocalStack and most dev clients
 // use path-style):
 //
-//	GET  /                                  -> ListBuckets (not supported; 405)
+//	GET  /                                  -> ListBuckets (not supported; 501)
 //	GET  /{bucket}/                         -> ListObjectsV2 (not supported; 501)
 //	GET  /{bucket}/{key}                    -> GetObject (with optional Range)
+//	HEAD /                                  -> (not supported; 501)
+//	HEAD /{bucket}/                         -> HeadBucket (not supported; 501)
 //	HEAD /{bucket}/{key}                    -> HeadObject
-//	HEAD /{bucket}/                         -> HeadBucket (not supported; 405)
 func (h *EdgeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.Server.Auth.Enabled {
 		// Stub: production would dispatch to bearer/mTLS validation.
 		// In dev (auth.enabled=false) we skip entirely.
-		http.Error(w, "auth required (server.auth.enabled=true) but not implemented in MVP",
-			http.StatusUnauthorized)
+		writeS3Error(w, r, http.StatusUnauthorized, s3ErrAccessDenied,
+			"Server auth is enabled but no auth handler is implemented in this build.")
 
 		return
 	}
@@ -82,27 +88,34 @@ func (h *EdgeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodHead:
 		if key == "" {
-			h.notImplemented(w, "HeadBucket")
+			// Both HEAD / and HEAD /{bucket}/ are reported as
+			// HeadBucket. HEAD / is not a real S3 operation, but
+			// labelling it HeadBucket keeps the surface uniform and
+			// makes the 501 self-explanatory.
+			h.notImplemented(w, r, "HeadBucket")
 			return
 		}
 
 		h.handleHead(w, r, bucket, key)
 	case http.MethodGet:
-		if key == "" {
-			h.notImplemented(w, "ListObjectsV2")
-			return
+		switch {
+		case bucket == "":
+			h.notImplemented(w, r, "ListBuckets")
+		case key == "":
+			h.notImplemented(w, r, "ListObjectsV2")
+		default:
+			h.handleGet(w, r, bucket, key)
 		}
-
-		h.handleGet(w, r, bucket, key)
 	default:
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeS3Error(w, r, http.StatusMethodNotAllowed, s3ErrMethodNotAllowed,
+			"The specified method is not allowed against this resource.")
 	}
 }
 
 func (h *EdgeHandler) handleHead(w http.ResponseWriter, r *http.Request, bucket, key string) {
 	info, err := h.fc.HeadObject(r.Context(), bucket, key)
 	if err != nil {
-		h.writeOriginError(w, err)
+		h.writeOriginError(w, r, err)
 		return
 	}
 
@@ -122,7 +135,7 @@ func (h *EdgeHandler) handleHead(w http.ResponseWriter, r *http.Request, bucket,
 func (h *EdgeHandler) handleGet(w http.ResponseWriter, r *http.Request, bucket, key string) {
 	info, err := h.fc.HeadObject(r.Context(), bucket, key)
 	if err != nil {
-		h.writeOriginError(w, err)
+		h.writeOriginError(w, r, err)
 		return
 	}
 
@@ -134,7 +147,9 @@ func (h *EdgeHandler) handleGet(w http.ResponseWriter, r *http.Request, bucket, 
 	// and remains a 416 (RFC 7233).
 	if info.Size == 0 {
 		if r.Header.Get("Range") != "" {
-			http.Error(w, "range not satisfiable", http.StatusRequestedRangeNotSatisfiable)
+			writeS3Error(w, r, http.StatusRequestedRangeNotSatisfiable, s3ErrInvalidRange,
+				"The requested range is not satisfiable.",
+				withBucketKey(bucket, key))
 			return
 		}
 
@@ -160,7 +175,9 @@ func (h *EdgeHandler) handleGet(w http.ResponseWriter, r *http.Request, bucket, 
 	if rh := r.Header.Get("Range"); rh != "" {
 		s, e, ok := parseSimpleByteRange(rh, info.Size)
 		if !ok {
-			http.Error(w, "invalid Range", http.StatusRequestedRangeNotSatisfiable)
+			writeS3Error(w, r, http.StatusRequestedRangeNotSatisfiable, s3ErrInvalidRange,
+				"The requested range is not valid for the resource.",
+				withBucketKey(bucket, key))
 			return
 		}
 
@@ -170,7 +187,9 @@ func (h *EdgeHandler) handleGet(w http.ResponseWriter, r *http.Request, bucket, 
 	}
 
 	if rangeStart > rangeEnd {
-		http.Error(w, "range not satisfiable", http.StatusRequestedRangeNotSatisfiable)
+		writeS3Error(w, r, http.StatusRequestedRangeNotSatisfiable, s3ErrInvalidRange,
+			"The requested range is not satisfiable.",
+			withBucketKey(bucket, key))
 		return
 	}
 
@@ -206,7 +225,7 @@ func (h *EdgeHandler) handleGet(w http.ResponseWriter, r *http.Request, bucket, 
 
 	firstBody, err := h.fc.GetChunk(r.Context(), firstKey, info.Size)
 	if err != nil {
-		h.writeOriginError(w, err)
+		h.writeOriginError(w, r, err)
 		return
 	}
 	// Peek a single byte to drain any first-read errors from the
@@ -216,7 +235,7 @@ func (h *EdgeHandler) handleGet(w http.ResponseWriter, r *http.Request, bucket, 
 	firstReader := bufio.NewReader(firstBody)
 	if _, err := firstReader.Peek(1); err != nil && !errors.Is(err, io.EOF) {
 		firstBody.Close() //nolint:errcheck // closing on error path
-		h.writeOriginError(w, err)
+		h.writeOriginError(w, r, err)
 
 		return
 	}
@@ -692,16 +711,34 @@ func streamSlice(dst io.Writer, src io.Reader, off, length int64) error {
 	return nil
 }
 
-func (h *EdgeHandler) notImplemented(w http.ResponseWriter, op string) {
-	http.Error(w, op+" not implemented in MVP", http.StatusNotImplemented)
+func (h *EdgeHandler) notImplemented(w http.ResponseWriter, r *http.Request, op string) {
+	writeS3Error(w, r, http.StatusNotImplemented, s3ErrNotImplemented,
+		op+" is not implemented by orca.")
 }
 
-func (h *EdgeHandler) writeOriginError(w http.ResponseWriter, err error) {
+func (h *EdgeHandler) writeOriginError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, origin.ErrNotFound):
-		http.Error(w, "NoSuchKey", http.StatusNotFound)
+		writeS3Error(w, r, http.StatusNotFound, s3ErrNoSuchKey,
+			"The specified key does not exist.")
 	case errors.Is(err, origin.ErrAuth):
-		http.Error(w, "Unauthorized origin", http.StatusBadGateway)
+		// ErrAuth maps to 502 BadGateway, NOT 403 AccessDenied.
+		//
+		// A 401/403 from the upstream origin means *orca's* own
+		// credentials were rejected by the origin; the calling
+		// client's credentials are not at fault. Returning 403 to the
+		// client would falsely imply the client should rotate its
+		// own credentials, which would not fix anything.
+		//
+		// From the client's perspective an orca-vs-origin auth
+		// failure is functionally an upstream outage: orca cannot
+		// satisfy the request through no fault of the client.
+		// 502 BadGateway communicates that accurately, and the
+		// orca-specific OriginUnauthorized code lets operators with
+		// access to orca logs tell this case apart from a generic
+		// origin failure.
+		writeS3Error(w, r, http.StatusBadGateway, s3ErrOriginUnauthorized,
+			"Origin rejected orca's credentials. This is an orca/origin configuration issue, not a client problem.")
 	default:
 		var (
 			ube *origin.UnsupportedBlobTypeError
@@ -711,16 +748,18 @@ func (h *EdgeHandler) writeOriginError(w http.ResponseWriter, err error) {
 
 		switch {
 		case errors.As(err, &ube):
-			http.Error(w, "OriginUnsupported: "+ube.Error(), http.StatusBadGateway)
+			writeS3Error(w, r, http.StatusBadGateway, s3ErrOriginUnsupported, ube.Error())
 		case errors.As(err, &ec):
-			http.Error(w, "OriginETagChanged", http.StatusBadGateway)
+			writeS3Error(w, r, http.StatusBadGateway, s3ErrOriginETagChanged,
+				"Object changed at origin mid-fetch.")
 		case errors.As(err, &mte):
-			http.Error(w, "OriginMissingETag: "+mte.Error(), http.StatusBadGateway)
+			writeS3Error(w, r, http.StatusBadGateway, s3ErrOriginMissingETag, mte.Error())
 		default:
 			h.log.LogAttrs(context.Background(), slog.LevelWarn, "origin error",
 				slog.Any("err", err),
 			)
-			http.Error(w, "OriginUnreachable", http.StatusBadGateway)
+			writeS3Error(w, r, http.StatusBadGateway, s3ErrOriginUnreachable,
+				"Origin request failed; see orca logs for details.")
 		}
 	}
 }

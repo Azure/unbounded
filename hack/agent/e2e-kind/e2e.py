@@ -18,12 +18,14 @@ The test follows a single linear sequence:
 
 Options:
     --verbose                          Enable diagnostic output (network diags).
+    --node-config PATH                 JSON file with node config variant settings.
 
 Subcommands (called as individual workflow steps):
     create-vm                          Create bridge networking and launch a QEMU VM.
     ensure-kind-bridge                 Verify/repair veth pair connecting Kind to VM bridge.
     run-agent                          Build agent, generate bootstrap script, run on VM.
     wait-for-node                      Wait for the node to appear and become Ready.
+    validate-node-config               Verify configured labels and taints reached the Node.
     dump-persisted-agent-config        Print persisted agent config files from the VM.
     validate-workload                  Deploy test pods on the agent node.
     validate-kube-proxy                Verify kube-proxy is Running on all nodes.
@@ -36,6 +38,8 @@ Subcommands (called as individual workflow steps):
     validate-agent-upgrade-operation   Verify AgentUpgrade switches the host daemon binary.
     validate-agent-upgrade-rollback    Verify AgentUpgrade rollback restores last-known-good.
     validate-node-repave-upgrade       Verify OnDelete repave applies a new MCV Kubernetes version.
+    validate-node-configs              Discover and validate node config scenarios in parallel.
+    collect-logs                       Collect VM and cluster diagnostic logs.
     reset-agent                        Trigger AgentReset and verify cleanup.
     cleanup                            Tear down VM, networking, and Kind cluster.
 """
@@ -44,18 +48,22 @@ from __future__ import annotations
 
 import argparse
 import base64
+import concurrent.futures
+import hashlib
 import json
 import os
+import re
 import secrets
 import shutil
 import subprocess
 import sys
 import textwrap
 import time
+from dataclasses import dataclass
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from threading import Thread
-from typing import Any
+from typing import Any, Callable
 
 # ---------------------------------------------------------------------------
 # Paths and defaults
@@ -70,6 +78,7 @@ VM_SUBNET = os.environ.get("VM_SUBNET", "192.168.100")
 VM_IP = os.environ.get("VM_IP", f"{VM_SUBNET}.10")
 VM_GATEWAY = f"{VM_SUBNET}.1"
 VM_DIR = Path(os.environ.get("VM_DIR", str(REPO_ROOT / ".vm-e2e")))
+NODE_CONFIG_DIR = REPO_ROOT / "hack" / "agent" / "e2e-kind" / "node-configs"
 
 KIND_CLUSTER_NAME = os.environ.get("KIND_CLUSTER_NAME", "kind")
 KIND_CONTAINER = f"{KIND_CLUSTER_NAME}-control-plane"
@@ -77,13 +86,13 @@ AGENT_MACHINE_NAME = os.environ.get("AGENT_MACHINE_NAME", "agent-e2e")
 AGENT_DEBUG = os.environ.get("AGENT_DEBUG", "")
 
 # Site name used when generating the bootstrap script via kubectl-unbounded.
-E2E_SITE_NAME = "e2e"
+E2E_SITE_NAME = os.environ.get("E2E_SITE_NAME", "e2e")
 
 # Fixed nspawn machine names used by unbounded-agent (decoupled from the kube node name).
 NSPAWN_MACHINE_NAMES = ["kube1", "kube2"]
 
 BRIDGE_NAME = "virbr-e2e"
-TAP_NAME = "tap-e2e"
+TAP_NAME = os.environ.get("TAP_NAME", "tap-e2e")
 SERVE_PORT = 8199
 AGENT_UPGRADE_ROLLBACK_MESSAGE_FRAGMENT = "rolled back"
 
@@ -196,6 +205,160 @@ def _b64(val: str) -> str:
     return base64.b64encode(val.encode()).decode()
 
 
+@dataclass(frozen=True)
+class NodeConfig:
+    name: str
+    node_labels: dict[str, str]
+    register_with_taints: list[str]
+    node_ip: str = ""
+    path: str = ""
+
+
+def load_node_config(path: str | None) -> NodeConfig:
+    """Load a node config variant from *path*, or return the default config."""
+    if not path:
+        return NodeConfig(name="default", node_labels={}, register_with_taints=[])
+
+    config_path = Path(path)
+    if not config_path.is_absolute():
+        config_path = REPO_ROOT / config_path
+
+    try:
+        cfg = json.loads(config_path.read_text())
+    except Exception as exc:
+        die(f"failed to read node config {config_path}: {exc}")
+
+    if not isinstance(cfg, dict):
+        die(f"node config {config_path} must contain a JSON object")
+
+    name = cfg.get("name", config_path.stem)
+    node_labels = cfg.get("nodeLabels", {})
+    register_with_taints = cfg.get("registerWithTaints", [])
+    node_ip = cfg.get("nodeIP", "")
+
+    if not isinstance(name, str) or not name:
+        die(f"node config {config_path} field 'name' must be a non-empty string")
+    if not isinstance(node_labels, dict) or not all(
+        isinstance(key, str) and isinstance(value, str)
+        for key, value in node_labels.items()
+    ):
+        die(f"node config {config_path} field 'nodeLabels' must be an object of string values")
+    if not isinstance(register_with_taints, list) or not all(
+        isinstance(taint, str) for taint in register_with_taints
+    ):
+        die(f"node config {config_path} field 'registerWithTaints' must be a list of strings")
+    if not isinstance(node_ip, str):
+        die(f"node config {config_path} field 'nodeIP' must be a string")
+
+    return NodeConfig(
+        name=name,
+        node_labels=dict(node_labels),
+        register_with_taints=list(register_with_taints),
+        node_ip=node_ip,
+        path=str(config_path),
+    )
+
+
+def expected_node_labels(node_config: NodeConfig) -> dict[str, str]:
+    """Return labels configured for this e2e node variant."""
+    return dict(node_config.node_labels)
+
+
+def expected_node_taint_strings(node_config: NodeConfig) -> list[str]:
+    """Return configured taint strings for this e2e node variant."""
+    return list(node_config.register_with_taints)
+
+
+def expected_node_ip(node_config: NodeConfig) -> str:
+    """Return the expected Node InternalIP for this e2e node variant."""
+    node_ip = node_config.node_ip
+    if node_ip in ("$VM_IP", "${VM_IP}"):
+        return VM_IP
+    return node_ip or VM_IP
+
+
+def expected_node_taints(node_config: NodeConfig) -> list[dict[str, str]]:
+    """Return taints configured for this e2e node variant."""
+    taints: list[dict[str, str]] = []
+    for item in expected_node_taint_strings(node_config):
+        if ":" not in item:
+            die(f"invalid registerWithTaints entry {item!r}, expected key[=value]:Effect")
+        body, effect = item.rsplit(":", 1)
+        if "=" in body:
+            key, value = body.split("=", 1)
+        else:
+            key, value = body, ""
+        if not key or not effect:
+            die(f"invalid registerWithTaints entry {item!r}, key and effect are required")
+        taints.append({"key": key, "value": value, "effect": effect})
+    return taints
+
+
+def node_config_bootstrap_args(node_config: NodeConfig) -> list[str]:
+    """Return manual-bootstrap flags for the active node config variant."""
+    args: list[str] = []
+    if node_config.node_ip:
+        args.extend(["--node-ip", expected_node_ip(node_config)])
+    for key, value in sorted(expected_node_labels(node_config).items()):
+        args.extend(["--node-label", f"{key}={value}"])
+    for taint in expected_node_taint_strings(node_config):
+        args.extend(["--register-with-taint", taint])
+    return args
+
+
+def log_active_node_config(node_config: NodeConfig) -> None:
+    """Log the active e2e node config variant."""
+    labels = [f"{key}={value}" for key, value in sorted(expected_node_labels(node_config).items())]
+    taints = expected_node_taint_strings(node_config)
+    log(f"Agent e2e node config variant: {node_config.name}")
+    log(f"  node ip: {expected_node_ip(node_config) if node_config.node_ip else '<default>'}")
+    log(f"  node labels: {', '.join(labels) if labels else '<none>'}")
+    log(f"  register-with-taints: {', '.join(taints) if taints else '<none>'}")
+
+
+def _safe_name(value: str) -> str:
+    """Return a DNS-label-safe name fragment for VM and node names."""
+    safe = re.sub(r"[^a-z0-9-]+", "-", value.lower()).strip("-")
+    return safe or "config"
+
+
+def qemu_mac_address() -> str:
+    """Return a stable, per-VM MAC address for the QEMU tap interface."""
+    try:
+        octets = [int(part) for part in VM_IP.split(".")]
+        if len(octets) == 4 and all(0 <= part <= 255 for part in octets):
+            return f"52:54:00:{octets[1]:02x}:{octets[2]:02x}:{octets[3]:02x}"
+    except ValueError:
+        pass
+
+    digest = hashlib.sha256(f"{VM_NAME}-{VM_IP}".encode()).digest()
+    return f"52:54:00:{digest[0]:02x}:{digest[1]:02x}:{digest[2]:02x}"
+
+
+def discover_node_configs() -> list[NodeConfig]:
+    """Load all node config scenario files in deterministic order."""
+    configs: list[NodeConfig] = []
+    for path in sorted(NODE_CONFIG_DIR.glob("*.json")):
+        configs.append(load_node_config(str(path)))
+    if not configs:
+        die(f"No node config scenarios found in {NODE_CONFIG_DIR}")
+    return configs
+
+
+def scenario_env(node_config: NodeConfig, index: int) -> dict[str, str]:
+    """Return per-scenario environment overrides for a parallel e2e node."""
+    name = _safe_name(node_config.name)
+    vm_name = f"{VM_NAME}-{name}"
+    return {
+        "VM_NAME": vm_name,
+        "AGENT_MACHINE_NAME": vm_name,
+        "E2E_SITE_NAME": f"{E2E_SITE_NAME}-{name}",
+        "VM_IP": f"{VM_SUBNET}.{10 + index}",
+        "VM_DIR": str(VM_DIR / name),
+        "TAP_NAME": f"tap-e2e-{index}",
+    }
+
+
 def _machine_operation_resource() -> str:
     """Return the fully-qualified MachineOperation resource name."""
     return "machineoperations.v1alpha3.unbounded-cloud.io"
@@ -250,7 +413,7 @@ def wait_for_machine_operation_complete(name: str, timeout_secs: int = 180) -> d
             phase = status.get("phase", "")
             message = status.get("message", "")
             if phase != last_phase or message != last_message:
-                log(f"  MachineOperation phase={phase or '<empty>'} message={message or '<empty>'}")
+                log(f"  MachineOperation phase={phase or '<empty>'}")
                 last_phase = phase
                 last_message = message
             if phase == "Complete":
@@ -292,7 +455,7 @@ def wait_for_machine_operation_failed(
             phase = status.get("phase", "")
             message = status.get("message", "")
             if phase != last_phase or message != last_message:
-                log(f"  MachineOperation phase={phase or '<empty>'} message={message or '<empty>'}")
+                log(f"  MachineOperation phase={phase or '<empty>'}")
                 last_phase = phase
                 last_message = message
             if phase == "Failed":
@@ -328,11 +491,46 @@ def node_kubelet_version(node_name: str) -> str:
     ]).strip()
 
 
+def restart_crashing_daemonset_pods(node_name: str, namespace: str, label: str) -> None:
+    """Delete matching DaemonSet pods stuck in restart backoff on *node_name*."""
+
+    result = subprocess.run(
+        [KUBECTL, "get", "pods", "-n", namespace,
+         "-l", label, "--field-selector", f"spec.nodeName={node_name}",
+         "-o", "json"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return
+
+    pods = json.loads(result.stdout).get("items", [])
+    for pod in pods:
+        pod_name = pod["metadata"]["name"]
+        for container_status in pod.get("status", {}).get("containerStatuses", []):
+            if container_status.get("ready"):
+                continue
+            waiting = container_status.get("state", {}).get("waiting", {})
+            terminated = container_status.get("state", {}).get("terminated", {})
+            restart_count = container_status.get("restartCount", 0)
+            waiting_reason = waiting.get("reason")
+            terminated_reason = terminated.get("reason")
+            if restart_count >= 2 or waiting_reason == "CrashLoopBackOff":
+                log(f"  Deleting crashing pod {pod_name} "
+                    f"(restarts={restart_count}, waiting={waiting_reason or 'none'}, "
+                    f"terminated={terminated_reason or 'none'}) to reset backoff")
+                subprocess.run(
+                    [KUBECTL, "delete", "pod", "-n", namespace, pod_name,
+                     "--grace-period=0", "--force"],
+                    capture_output=True, text=True,
+                )
+
+
 def wait_for_node_ready(node_name: str, timeout_secs: int = 120) -> None:
     """Wait until *node_name* reports Ready=True."""
 
     log(f"Waiting for node '{node_name}' to be Ready (timeout: {timeout_secs}s)...")
     elapsed = 0
+    last_restart_attempt = 0
     while elapsed < timeout_secs:
         result = subprocess.run(
             [KUBECTL, "get", "node", node_name,
@@ -345,6 +543,9 @@ def wait_for_node_ready(node_name: str, timeout_secs: int = 120) -> None:
             return
         if elapsed > 0 and elapsed % 30 == 0:
             log(f"  ({elapsed}s) Node not yet Ready (status: {status})")
+        if elapsed >= 30 and elapsed - last_restart_attempt >= 30:
+            restart_crashing_daemonset_pods(node_name, "kube-system", "app=kindnet")
+            last_restart_attempt = elapsed
         time.sleep(5)
         elapsed += 5
 
@@ -442,7 +643,7 @@ def wait_for_node_reboot_event(node_name: str, boot_id: str, timeout_secs: int =
             for event in events:
                 message = event.get("message", "")
                 if boot_id in message:
-                    log(f"Observed Node Rebooted event: {message}")
+                    log("Observed Node Rebooted event")
                     return
 
         if elapsed > 0 and elapsed % 30 == 0:
@@ -601,16 +802,14 @@ def _build_script_agent_tarball(tarball: Path, build_name: str, script: str) -> 
 # ---------------------------------------------------------------------------
 # create-vm / recreate-vm helpers
 # ---------------------------------------------------------------------------
-def _stop_qemu() -> None:
-    """Stop the QEMU VM process if it is running."""
-    pid_file = VM_DIR / f"{VM_NAME}.pid"
+def _stop_qemu_by_pid_file(pid_file: Path, vm_name: str) -> None:
     if not pid_file.exists():
         return
 
     pid = int(pid_file.read_text().strip())
     try:
         os.kill(pid, 0)
-        log(f"Stopping VM '{VM_NAME}' (PID: {pid})...")
+        log(f"Stopping VM '{vm_name}' (PID: {pid})...")
         os.kill(pid, 15)
         time.sleep(2)
         try:
@@ -622,6 +821,11 @@ def _stop_qemu() -> None:
     except OSError:
         pass  # already gone
     pid_file.unlink(missing_ok=True)
+
+
+def _stop_qemu() -> None:
+    """Stop the QEMU VM process if it is running."""
+    _stop_qemu_by_pid_file(VM_DIR / f"{VM_NAME}.pid", VM_NAME)
 
 
 def _launch_vm(ssh_pub_key: str) -> None:
@@ -726,6 +930,7 @@ def _launch_vm(ssh_pub_key: str) -> None:
     # Launch QEMU VM
     pid_file = VM_DIR / f"{VM_NAME}.pid"
     qemu_log = VM_DIR / f"{VM_NAME}.log"
+    mac_address = qemu_mac_address()
 
     log("============================================")
     log(f"  Launching VM: {VM_NAME}")
@@ -733,6 +938,7 @@ def _launch_vm(ssh_pub_key: str) -> None:
     log(f"  CPUs:         {VM_CPUS}")
     log(f"  Disk:         {vm_disk}")
     log(f"  IP:           {VM_IP}")
+    log(f"  MAC:          {mac_address}")
     log(f"  Bridge:       {BRIDGE_NAME}")
     log(f"  Log:          {qemu_log}")
     log("============================================")
@@ -744,7 +950,7 @@ def _launch_vm(ssh_pub_key: str) -> None:
         "-drive", f"file={vm_disk},format=qcow2,if=virtio",
         "-drive", f"file={seed_iso},format=raw,if=virtio",
         "-netdev", f"tap,id=net0,ifname={TAP_NAME},script=no,downscript=no",
-        "-device", "virtio-net-pci,netdev=net0",
+        "-device", f"virtio-net-pci,netdev=net0,mac={mac_address}",
         "-daemonize", "-pidfile", str(pid_file),
         "-serial", f"file:{qemu_log}",
         "-display", "none",
@@ -777,15 +983,13 @@ def _launch_vm(ssh_pub_key: str) -> None:
         die(f"SSH did not become available after {max_attempts} attempts. Check log: {qemu_log}")
 
     print(flush=True)
-    log(f"VM is ready! SSH: ssh -i {SSH_KEY} ubuntu@{VM_IP}")
+    log(f"VM is ready at {VM_IP}")
 
 
 # ---------------------------------------------------------------------------
 # create-vm
 # ---------------------------------------------------------------------------
-def create_vm() -> None:
-    """Create bridge networking and launch a QEMU VM."""
-
+def _check_vm_prereqs() -> None:
     # Pre-flight
     for cmd in ("qemu-system-x86_64", "qemu-img", "genisoimage"):
         if shutil.which(cmd) is None:
@@ -793,6 +997,8 @@ def create_vm() -> None:
     if not os.access("/dev/kvm", os.R_OK):
         die("/dev/kvm is not accessible. Enable KVM for hardware acceleration.")
 
+
+def _ensure_vm_ssh_key() -> str:
     VM_DIR.mkdir(parents=True, exist_ok=True)
     SSH_KEY_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -801,9 +1007,11 @@ def create_vm() -> None:
         log("Generating SSH key pair...")
         run(["ssh-keygen", "-t", "ed25519", "-f", str(SSH_KEY), "-N", "", "-q"])
 
-    ssh_pub_key = SSH_KEY.with_suffix(".pub").read_text().strip()
+    return SSH_KEY.with_suffix(".pub").read_text().strip()
 
-    # Create bridge network
+
+def create_vm_bridge() -> None:
+    """Create bridge networking shared by e2e VMs."""
     log(f"Creating bridge network {BRIDGE_NAME}...")
     run_quiet(["sudo", "ip", "link", "del", BRIDGE_NAME], check=False)
     run(["sudo", "ip", "link", "add", BRIDGE_NAME, "type", "bridge"])
@@ -821,6 +1029,18 @@ def create_vm() -> None:
 
     # Prevent NetworkManager from detaching interfaces from the bridge.
     _nm_unmanage(BRIDGE_NAME)
+
+
+def launch_vm() -> None:
+    """Launch a QEMU VM on an existing e2e bridge."""
+    _check_vm_prereqs()
+    ssh_pub_key = _ensure_vm_ssh_key()
+
+    # TAP device
+    run_quiet(["sudo", "ip", "link", "delete", TAP_NAME], check=False)
+    run(["sudo", "ip", "tuntap", "add", "dev", TAP_NAME, "mode", "tap"])
+    run(["sudo", "ip", "link", "set", TAP_NAME, "master", BRIDGE_NAME])
+    run(["sudo", "ip", "link", "set", TAP_NAME, "up"])
     _nm_unmanage(TAP_NAME)
 
     # Download Ubuntu cloud image
@@ -833,6 +1053,13 @@ def create_vm() -> None:
         log(f"Using existing image: {image_file}")
 
     _launch_vm(ssh_pub_key)
+
+
+def create_vm() -> None:
+    """Create bridge networking and launch a QEMU VM."""
+    _check_vm_prereqs()
+    create_vm_bridge()
+    launch_vm()
 
 
 # ---------------------------------------------------------------------------
@@ -927,7 +1154,7 @@ def ensure_kind_bridge() -> None:
 # ---------------------------------------------------------------------------
 # run-agent
 # ---------------------------------------------------------------------------
-def run_agent() -> None:
+def run_agent(node_config: NodeConfig) -> None:
     """Build agent, generate bootstrap script, and run it on the VM."""
 
     if not SSH_KEY.exists():
@@ -935,6 +1162,32 @@ def run_agent() -> None:
     for cmd in (KUBECTL,):
         if shutil.which(cmd) is None:
             die(f"{cmd} is required but not found in PATH")
+
+    agent_url_override = os.environ.get("AGENT_URL", "")
+    if agent_url_override:
+        _run_agent_inner(agent_url_override, node_config)
+        log("Agent bootstrap completed")
+        return
+
+    agent_url = prepare_agent_artifacts()
+    log(f"Starting HTTP file server on {VM_GATEWAY}:{SERVE_PORT}...")
+    handler = _make_handler(str(VM_DIR))
+    httpd = HTTPServer((VM_GATEWAY, SERVE_PORT), handler)
+    server_thread = Thread(target=httpd.serve_forever, daemon=True)
+    server_thread.start()
+    log(f"Agent download URL: {agent_url}")
+
+    try:
+        _run_agent_inner(agent_url, node_config)
+    finally:
+        httpd.shutdown()
+
+    log("Agent bootstrap completed")
+
+
+def prepare_agent_artifacts() -> str:
+    """Build agent artifacts and return the URL that serves the tarball."""
+    VM_DIR.mkdir(parents=True, exist_ok=True)
 
     # Build agent binary and package as tarball
     log("Building unbounded-agent...")
@@ -960,20 +1213,7 @@ def run_agent() -> None:
     # Serve the tarball over HTTP
     runner_ip = VM_GATEWAY
     agent_url = f"http://{runner_ip}:{SERVE_PORT}/unbounded-agent-linux-amd64.tar.gz"
-
-    log(f"Starting HTTP file server on {runner_ip}:{SERVE_PORT}...")
-    handler = _make_handler(str(VM_DIR))
-    httpd = HTTPServer((runner_ip, SERVE_PORT), handler)
-    server_thread = Thread(target=httpd.serve_forever, daemon=True)
-    server_thread.start()
-    log(f"Agent download URL: {agent_url}")
-
-    try:
-        _run_agent_inner(agent_url)
-    finally:
-        httpd.shutdown()
-
-    log("Agent bootstrap completed")
+    return agent_url
 
 
 def _make_handler(directory: str) -> type:
@@ -986,7 +1226,7 @@ def _make_handler(directory: str) -> type:
     return Handler
 
 
-def _run_agent_inner(agent_url: str) -> None:
+def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
     """Core logic for run-agent (after HTTP server is up)."""
 
     # Determine the Kind control-plane IP so connectivity checks have the
@@ -1034,13 +1274,14 @@ def _run_agent_inner(agent_url: str) -> None:
         },
     })
     kubectl(["apply", "-f", "-"], input=token_manifest.encode())
-    log(f"Bootstrap token created: {token_id}.xxxxxxxxxxxxxxxx")
+    log("Bootstrap token created")
 
     # Generate bootstrap script via kubectl-unbounded.
     # manual-bootstrap auto-detects the API server, CA cert, Kubernetes
     # version, and cluster DNS from the active kubeconfig. The bootstrap
     # token is resolved via the site label on the secret.
     log("Generating bootstrap script with kubectl-unbounded machine manual-bootstrap...")
+    log_active_node_config(node_config)
 
     # Capture the local API server URL from the kubeconfig (typically
     # https://127.0.0.1:<port> for Kind) so we can replace it with the
@@ -1054,11 +1295,13 @@ def _run_agent_inner(agent_url: str) -> None:
     if not local_api_server:
         die("Could not determine local API server URL from kubeconfig")
 
-    bootstrap_script = capture([
+    bootstrap_args = [
         KUBECTL_UNBOUNDED, "machine", "manual-bootstrap",
         AGENT_MACHINE_NAME,
         "--site", E2E_SITE_NAME,
-    ])
+        *node_config_bootstrap_args(node_config),
+    ]
+    bootstrap_script = capture(bootstrap_args)
 
     # The kubeconfig uses a localhost address that is not reachable from the VM.
     # Patch the generated script to use the Kind container IP instead.
@@ -1073,8 +1316,6 @@ def _run_agent_inner(agent_url: str) -> None:
     bootstrap_script_path.write_text(bootstrap_script)
     bootstrap_script_path.chmod(0o600)
     log(f"Bootstrap script written to {bootstrap_script_path}")
-    log("Bootstrap script contents:")
-    print(bootstrap_script, flush=True)
 
     # Wait for cloud-init and verify connectivity
     log("Waiting for cloud-init to complete on VM...")
@@ -1109,7 +1350,7 @@ def wait_for_node() -> None:
     """Wait for the agent node to appear and become Ready."""
 
     node_timeout = int(os.environ.get("NODE_TIMEOUT", "180"))
-    ready_timeout = int(os.environ.get("READY_TIMEOUT", "120"))
+    ready_timeout = int(os.environ.get("READY_TIMEOUT", "720"))
 
     # Wait for node to appear
     log(f"Waiting for node '{AGENT_MACHINE_NAME}' to appear (timeout: {node_timeout}s)...")
@@ -1137,6 +1378,120 @@ def wait_for_node() -> None:
     log("  Node join PASSED")
     log("============================================")
     kubectl(["get", "nodes", "-o", "wide"])
+
+
+# ---------------------------------------------------------------------------
+# validate-node-config
+# ---------------------------------------------------------------------------
+def _assert_expected_node_config(node: dict[str, Any], node_config: NodeConfig) -> None:
+    expected_labels = expected_node_labels(node_config)
+    expected_taints = expected_node_taints(node_config)
+
+    labels = node.get("metadata", {}).get("labels", {})
+    for key, value in expected_labels.items():
+        actual = labels.get(key)
+        if actual != value:
+            die(f"node label mismatch for {key!r}: got {actual!r}, expected {value!r}")
+
+    taints = node.get("spec", {}).get("taints", [])
+    for expected in expected_taints:
+        if not any(
+            taint.get("key") == expected["key"]
+            and taint.get("value", "") == expected["value"]
+            and taint.get("effect") == expected["effect"]
+            for taint in taints
+        ):
+            die(f"expected node taint not found: {expected}; node taints: {taints}")
+
+    internal_ips = [
+        address.get("address")
+        for address in node.get("status", {}).get("addresses", [])
+        if address.get("type") == "InternalIP"
+    ]
+    node_ip = expected_node_ip(node_config)
+    if node_ip not in internal_ips:
+        die(f"node InternalIP mismatch: got {internal_ips}, expected {node_ip!r}")
+
+
+def validate_node_config(node_config: NodeConfig) -> None:
+    """Verify configured node labels and taints are present on the Node."""
+
+    log_active_node_config(node_config)
+    node = json.loads(kubectl_capture(["get", "node", AGENT_MACHINE_NAME, "-o", "json"]))
+    _assert_expected_node_config(node, node_config)
+
+    log("============================================")
+    log("  Node config validation PASSED")
+    log("============================================")
+    kubectl(["get", "node", AGENT_MACHINE_NAME, "-o", "wide"])
+
+
+def _run_scenario_command(command: str, node_config: NodeConfig, env: dict[str, str]) -> None:
+    args = [sys.executable, str(Path(__file__))]
+    if VERBOSE:
+        args.append("--verbose")
+    if node_config.path:
+        args.extend(["--node-config", node_config.path])
+    args.append(command)
+
+    child_env = {**os.environ, **env}
+    run(args, env=child_env)
+
+
+def _validate_node_config_scenario(node_config: NodeConfig, index: int, agent_url: str) -> None:
+    name = node_config.name
+    env = scenario_env(node_config, index)
+    env["AGENT_URL"] = agent_url
+
+    log(f"Starting agent config scenario {name!r} on {env['VM_NAME']} ({env['VM_IP']})")
+    for command in (
+        "launch-vm",
+        "run-agent",
+        "wait-for-node",
+        "validate-node-config",
+        "dump-persisted-agent-config",
+        "validate-machine-cr-created",
+        "validate-workload",
+        "validate-node-repave-upgrade",
+    ):
+        _run_scenario_command(command, node_config, env)
+    log(f"Agent config scenario {name!r} passed")
+
+
+def validate_node_config_scenarios() -> None:
+    """Discover node config scenarios and validate them in parallel."""
+    configs = discover_node_configs()
+    agent_url = prepare_agent_artifacts()
+
+    log(f"Starting HTTP file server on {VM_GATEWAY}:{SERVE_PORT}...")
+    handler = _make_handler(str(VM_DIR))
+    httpd = HTTPServer((VM_GATEWAY, SERVE_PORT), handler)
+    server_thread = Thread(target=httpd.serve_forever, daemon=True)
+    server_thread.start()
+    log(f"Agent download URL: {agent_url}")
+
+    failures: list[str] = []
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(configs)) as executor:
+            futures = {
+                executor.submit(_validate_node_config_scenario, cfg, index, agent_url): cfg.name
+                for index, cfg in enumerate(configs)
+            }
+            for future in concurrent.futures.as_completed(futures):
+                name = futures[future]
+                try:
+                    future.result()
+                except subprocess.CalledProcessError as exc:
+                    failures.append(f"{name}: {exc.cmd} exited with {exc.returncode}")
+                except Exception as exc:
+                    failures.append(f"{name}: {exc}")
+    finally:
+        httpd.shutdown()
+
+    if failures:
+        die("agent config scenario validation failed: " + "; ".join(failures))
+
+    validate_kube_proxy()
 
 
 # ---------------------------------------------------------------------------
@@ -1351,6 +1706,9 @@ def validate_workload() -> None:
     """Deploy test pods on the agent node and verify they run."""
 
     timeout_secs = 300
+    pod_suffix = _safe_name(AGENT_MACHINE_NAME)
+    hello_pod_name = f"e2e-hello-{pod_suffix}"
+    dns_pod_name = f"e2e-dns-test-{pod_suffix}"
 
     # Create test namespace (idempotent)
     log(f"Creating test namespace '{TEST_NS}'...")
@@ -1359,7 +1717,7 @@ def validate_workload() -> None:
     kubectl(["apply", "-f", "-"], input=ns_yaml.encode())
 
     # Clean up any stale pods from a previous run (e.g. after reset + rejoin)
-    for pod_name in ("e2e-hello", "e2e-dns-test"):
+    for pod_name in (hello_pod_name, dns_pod_name):
         run_quiet([KUBECTL, "delete", "pod", pod_name, "-n", TEST_NS,
                    "--ignore-not-found"], check=False)
 
@@ -1368,7 +1726,7 @@ def validate_workload() -> None:
     hello_pod = {
         "apiVersion": "v1",
         "kind": "Pod",
-        "metadata": {"name": "e2e-hello", "namespace": TEST_NS, "labels": {"app": "e2e-hello"}},
+        "metadata": {"name": hello_pod_name, "namespace": TEST_NS, "labels": {"app": "e2e-hello"}},
         "spec": {
             "nodeName": AGENT_MACHINE_NAME,
             "containers": [{
@@ -1383,28 +1741,28 @@ def validate_workload() -> None:
     kubectl(["apply", "-f", "-"], input=json.dumps(hello_pod).encode())
 
     # Wait for Running
-    log("Waiting for pod 'e2e-hello' to be Running...")
+    log(f"Waiting for pod '{hello_pod_name}' to be Running...")
     elapsed = 0
     while elapsed < timeout_secs:
         result = subprocess.run(
-            [KUBECTL, "get", "pod", "e2e-hello", "-n", TEST_NS,
+            [KUBECTL, "get", "pod", hello_pod_name, "-n", TEST_NS,
              "-o", "jsonpath={.status.phase}"],
             capture_output=True, text=True,
         )
         phase = result.stdout.strip() if result.returncode == 0 else ""
         if phase == "Running":
-            log(f"Pod 'e2e-hello' is Running after {elapsed}s")
+            log(f"Pod '{hello_pod_name}' is Running after {elapsed}s")
             break
         if phase in ("Failed", "Unknown"):
-            subprocess.run([KUBECTL, "describe", "pod", "e2e-hello", "-n", TEST_NS], check=False)
-            die(f"Pod 'e2e-hello' entered {phase} state")
+            subprocess.run([KUBECTL, "describe", "pod", hello_pod_name, "-n", TEST_NS], check=False)
+            die(f"Pod '{hello_pod_name}' entered {phase} state")
         if elapsed > 0 and elapsed % 30 == 0:
             log(f"  ({elapsed}s) Pod phase: {phase or 'Pending'}")
         time.sleep(5)
         elapsed += 5
     else:
-        subprocess.run([KUBECTL, "describe", "pod", "e2e-hello", "-n", TEST_NS], check=False)
-        die(f"Timed out waiting for pod 'e2e-hello' to be Running after {timeout_secs}s")
+        subprocess.run([KUBECTL, "describe", "pod", hello_pod_name, "-n", TEST_NS], check=False)
+        die(f"Timed out waiting for pod '{hello_pod_name}' to be Running after {timeout_secs}s")
 
     # Emit network diagnostics before attempting kubectl logs.  The API
     # server proxies log requests through the kubelet (port 10250) on the
@@ -1420,7 +1778,7 @@ def validate_workload() -> None:
     log_attempts = 6
     for attempt in range(1, log_attempts + 1):
         result = subprocess.run(
-            [KUBECTL, "logs", "e2e-hello", "-n", TEST_NS],
+            [KUBECTL, "logs", hello_pod_name, "-n", TEST_NS],
             capture_output=True, text=True,
         )
         if result.returncode == 0:
@@ -1431,7 +1789,7 @@ def validate_workload() -> None:
             time.sleep(5)
         else:
             log(f"  kubectl logs failed (attempt {attempt}/{log_attempts}): {result.stderr.strip()}")
-            subprocess.run([KUBECTL, "describe", "pod", "e2e-hello", "-n", TEST_NS], check=False)
+            subprocess.run([KUBECTL, "describe", "pod", hello_pod_name, "-n", TEST_NS], check=False)
             die(f"kubectl logs failed after {log_attempts} attempts")
 
     print(logs, flush=True)
@@ -1440,7 +1798,7 @@ def validate_workload() -> None:
     log("Pod logs contain expected message")
 
     # Verify node placement
-    pod_node = kubectl_capture(["get", "pod", "e2e-hello", "-n", TEST_NS,
+    pod_node = kubectl_capture(["get", "pod", hello_pod_name, "-n", TEST_NS,
                                  "-o", "jsonpath={.spec.nodeName}"])
     if pod_node != AGENT_MACHINE_NAME:
         die(f"Pod is running on '{pod_node}' instead of '{AGENT_MACHINE_NAME}'")
@@ -1451,7 +1809,7 @@ def validate_workload() -> None:
     dns_pod = {
         "apiVersion": "v1",
         "kind": "Pod",
-        "metadata": {"name": "e2e-dns-test", "namespace": TEST_NS},
+        "metadata": {"name": dns_pod_name, "namespace": TEST_NS, "labels": {"app": "e2e-dns-test"}},
         "spec": {
             "nodeName": AGENT_MACHINE_NAME,
             "containers": [{
@@ -1471,7 +1829,7 @@ def validate_workload() -> None:
     elapsed = 0
     while elapsed < timeout_secs:
         result = subprocess.run(
-            [KUBECTL, "get", "pod", "e2e-dns-test", "-n", TEST_NS,
+            [KUBECTL, "get", "pod", dns_pod_name, "-n", TEST_NS,
              "-o", "jsonpath={.status.phase}"],
             capture_output=True, text=True,
         )
@@ -1489,7 +1847,7 @@ def validate_workload() -> None:
         elapsed += 5
 
     dns_result = subprocess.run(
-        [KUBECTL, "logs", "e2e-dns-test", "-n", TEST_NS],
+        [KUBECTL, "logs", dns_pod_name, "-n", TEST_NS],
         capture_output=True, text=True,
     )
     dns_logs = dns_result.stdout.strip() if dns_result.returncode == 0 else ""
@@ -1621,6 +1979,7 @@ def start_machina_controller() -> None:
     if not api_server:
         die("Could not determine API server URL from kubeconfig")
 
+    VM_DIR.mkdir(parents=True, exist_ok=True)
     MACHINA_CONFIG_FILE.write_text(textwrap.dedent(f"""\
         apiServerEndpoint: {api_server}
         metricsAddr: "0"
@@ -1784,7 +2143,7 @@ def delete_machine_cr() -> None:
 # ---------------------------------------------------------------------------
 # validate-machine-cr-created
 # ---------------------------------------------------------------------------
-def validate_machine_cr_created() -> None:
+def validate_machine_cr_created(node_config: NodeConfig) -> None:
     """Validate the agent self-registered a Machine CR during bootstrap.
 
     The daemon registers the Machine CR at startup, so this function polls
@@ -1837,7 +2196,20 @@ def validate_machine_cr_created() -> None:
     if token_ref != expected_ref:
         die(f"bootstrapTokenRef mismatch: got '{token_ref}', expected '{expected_ref}'")
 
-    log(f"bootstrapTokenRef is correct: {token_ref}")
+    log("bootstrapTokenRef is correct")
+
+    expected_labels = expected_node_labels(node_config)
+    actual_labels = k8s_spec.get("nodeLabels") or {}
+    for key, value in expected_labels.items():
+        actual = actual_labels.get(key)
+        if actual != value:
+            die(f"Machine CR nodeLabels mismatch for {key!r}: got {actual!r}, expected {value!r}")
+
+    expected_taints = expected_node_taint_strings(node_config)
+    actual_taints = k8s_spec.get("registerWithTaints") or []
+    for taint in expected_taints:
+        if taint not in actual_taints:
+            die(f"Machine CR registerWithTaints missing {taint!r}: {actual_taints}")
 
     log("============================================")
     log("  Machine CR validation PASSED (created)")
@@ -1979,7 +2351,52 @@ def _next_patch_version(version: str) -> str:
     return "v" + ".".join(parts)
 
 
-def validate_node_repave_upgrade() -> None:
+def ensure_machine_configuration_for_repave(
+    config_name: str,
+    kubernetes_version: str,
+    node_config: NodeConfig,
+) -> None:
+    """Create the per-machine MachineConfiguration if setup did not pre-create it."""
+
+    result = subprocess.run(
+        [KUBECTL, "get", "machineconfiguration", config_name],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        return
+
+    output = result.stdout + result.stderr
+    if "NotFound" not in output and "not found" not in output:
+        die(f"failed to get MachineConfiguration '{config_name}': {output.strip()}")
+
+    log(f"Creating MachineConfiguration '{config_name}' for repave validation...")
+    kubernetes_template: dict[str, Any] = {"version": kubernetes_version}
+    labels = expected_node_labels(node_config)
+    taints = expected_node_taints(node_config)
+    if labels:
+        kubernetes_template["nodeLabels"] = labels
+    if taints:
+        kubernetes_template["registerWithTaints"] = taints
+
+    manifest = {
+        "apiVersion": "unbounded-cloud.io/v1alpha3",
+        "kind": "MachineConfiguration",
+        "metadata": {
+            "name": config_name,
+            "labels": {"e2e.unbounded-cloud.io/test": "agent-kind"},
+        },
+        "spec": {
+            "updateStrategy": {"type": "OnDelete"},
+            "template": {
+                "kubernetes": kubernetes_template,
+            },
+        },
+    }
+    kubectl(["apply", "-f", "-"], input=json.dumps(manifest).encode())
+
+
+def validate_node_repave_upgrade(node_config: NodeConfig) -> None:
     """Validate OnDelete repave applies a new MCV Kubernetes version."""
 
     config_name = MACHINE_CONFIG_NAME
@@ -1993,6 +2410,7 @@ def validate_node_repave_upgrade() -> None:
     log(f"Current kubelet version: {current_kubelet_version}")
     log(f"Target kubelet version: {target_kubelet_version}")
 
+    ensure_machine_configuration_for_repave(config_name, current_kubelet_version, node_config)
     manifest = json.loads(kubectl_capture(["get", "machineconfiguration", config_name, "-o", "json"]))
     metadata = manifest.setdefault("metadata", {})
     for key in ["creationTimestamp", "generation", "resourceVersion", "uid", "managedFields"]:
@@ -2002,7 +2420,10 @@ def validate_node_repave_upgrade() -> None:
         "template", {},
     ).setdefault("kubernetes", {})
     kubernetes_template["version"] = target_kubelet_version
-    kubernetes_template["nodeLabels"] = {"e2e.unbounded-cloud.io/config-version": "v3"}
+    kubernetes_template["nodeLabels"] = {
+        **expected_node_labels(node_config),
+        "e2e.unbounded-cloud.io/config-version": "v3",
+    }
     kubectl(["apply", "-f", "-"], input=json.dumps(manifest).encode())
 
     timeout_secs = 120
@@ -2049,6 +2470,8 @@ def validate_node_repave_upgrade() -> None:
     wait_for_node_absent(AGENT_MACHINE_NAME)
     wait_for_node()
     wait_for_node_kubelet_version(AGENT_MACHINE_NAME, target_kubelet_version)
+    node = json.loads(kubectl_capture(["get", "node", AGENT_MACHINE_NAME, "-o", "json"]))
+    _assert_expected_node_config(node, node_config)
 
     machine = json.loads(kubectl_capture(["get", "machine", AGENT_MACHINE_NAME, "-o", "json"]))
     status_config = machine.get("status", {}).get("configuration", {})
@@ -2071,6 +2494,107 @@ def validate_node_repave_upgrade() -> None:
 
 
 # ---------------------------------------------------------------------------
+# collect-logs
+# ---------------------------------------------------------------------------
+def _write_command_log(path: Path, args: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as out:
+        subprocess.run(args, stdout=out, stderr=subprocess.STDOUT, check=False)
+
+
+def _collect_one_vm_logs(logs_dir: Path, vm_name: str, vm_ip: str, vm_dir: Path, prefix: str) -> None:
+    serial_log = vm_dir / f"{vm_name}.log"
+    if serial_log.exists():
+        shutil.copyfile(serial_log, logs_dir / f"{prefix}vm-serial.log")
+
+    ssh_opts = [
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=5",
+        "-i", str(vm_dir / "ssh" / "id_ed25519"),
+    ]
+    ssh_target = f"ubuntu@{vm_ip}"
+
+    def ssh_log(name: str, command: str) -> None:
+        _write_command_log(logs_dir / f"{prefix}{name}", ["ssh", *ssh_opts, ssh_target, command])
+
+    ssh_log("vm-journal.log", "sudo journalctl --no-pager -l")
+    ssh_log("vm-unbounded-agent.log", "sudo journalctl -u unbounded-agent --no-pager -l")
+    ssh_log("vm-unbounded-agent-daemon.log", "sudo journalctl -u unbounded-agent-daemon --no-pager -l")
+    ssh_log("vm-machines.txt", "sudo machinectl list --no-pager")
+    for machine in NSPAWN_MACHINE_NAMES:
+        ssh_log(f"nspawn-{machine}-journal.log", f"sudo journalctl -M {machine} --no-pager -l")
+        ssh_log(f"nspawn-{machine}-kubelet.log", f"sudo journalctl -M {machine} -u kubelet --no-pager -l")
+        ssh_log(f"nspawn-{machine}-containerd.log", f"sudo journalctl -M {machine} -u containerd --no-pager -l")
+        ssh_log(f"vm-machine-{machine}-status.txt", f"sudo machinectl status {machine} --no-pager")
+        ssh_log(
+            f"nspawn-{machine}-units.txt",
+            f"sudo machinectl shell {machine} /usr/bin/systemctl list-units --no-pager",
+        )
+
+
+def collect_logs() -> None:
+    """Collect VM and cluster diagnostics into the logs directory."""
+    logs_dir = REPO_ROOT / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    if os.environ.get("COLLECT_NODE_CONFIG_LOGS", "").lower() == "true":
+        for index, cfg in enumerate(discover_node_configs()):
+            env = scenario_env(cfg, index)
+            prefix = f"{_safe_name(cfg.name)}-"
+            _collect_one_vm_logs(
+                logs_dir,
+                env["VM_NAME"],
+                env["VM_IP"],
+                Path(env["VM_DIR"]),
+                prefix,
+            )
+    else:
+        _collect_one_vm_logs(logs_dir, VM_NAME, VM_IP, VM_DIR, "")
+
+    if MACHINA_LOG_FILE.exists():
+        shutil.copyfile(MACHINA_LOG_FILE, logs_dir / "machina-controller.log")
+
+    _write_command_log(logs_dir / "nodes.txt", [KUBECTL, "get", "nodes", "-o", "wide"])
+    _write_command_log(logs_dir / "nodes-describe.txt", [KUBECTL, "describe", "nodes"])
+    _write_command_log(logs_dir / "pods.txt", [KUBECTL, "get", "pods", "-A", "-o", "wide"])
+    _write_command_log(logs_dir / "events.txt", [KUBECTL, "get", "events", "-A", "--sort-by=.lastTimestamp"])
+    _write_command_log(logs_dir / "kindnet.log", [KUBECTL, "logs", "-n", "kube-system", "--all-containers", "--prefix", "-l", "app=kindnet"])
+    _write_command_log(logs_dir / "kindnet-previous.log", [KUBECTL, "logs", "-n", "kube-system", "--all-containers", "--prefix", "--previous", "-l", "app=kindnet"])
+    _write_command_log(logs_dir / "machines.txt", [KUBECTL, "get", "machines", "-o", "wide"])
+    _write_command_log(logs_dir / "machines-full.yaml", [KUBECTL, "get", "machines", "-o", "yaml"])
+    _write_command_log(logs_dir / "machineconfigurations.txt", [KUBECTL, "get", "machineconfigurations", "-o", "wide"])
+    _write_command_log(logs_dir / "machineconfigurations-full.yaml", [KUBECTL, "get", "machineconfigurations", "-o", "yaml"])
+    _write_command_log(logs_dir / "machineconfigurationversions.txt", [KUBECTL, "get", "machineconfigurationversions", "-o", "wide"])
+    _write_command_log(logs_dir / "machineconfigurationversions-full.yaml", [KUBECTL, "get", "machineconfigurationversions", "-o", "yaml"])
+    _write_command_log(logs_dir / "machineoperations.txt", [KUBECTL, "get", "machineoperations", "-o", "wide"])
+    _write_command_log(logs_dir / "machineoperations-full.yaml", [KUBECTL, "get", "machineoperations", "-o", "yaml"])
+    _write_command_log(logs_dir / "kind-kubelet.log", ["docker", "exec", KIND_CONTAINER, "journalctl", "-u", "kubelet", "--no-pager", "-l"])
+    kube_apiserver = subprocess.run(
+        ["docker", "exec", KIND_CONTAINER, "crictl", "ps", "-a", "--name", "kube-apiserver", "-q"],
+        capture_output=True, text=True, check=False,
+    )
+    apiserver_id = kube_apiserver.stdout.splitlines()[0] if kube_apiserver.stdout.splitlines() else ""
+    if apiserver_id:
+        _write_command_log(logs_dir / "kube-apiserver.log", ["docker", "exec", KIND_CONTAINER, "crictl", "logs", apiserver_id])
+    _write_command_log(logs_dir / "clusterrolebindings.txt", [KUBECTL, "get", "clusterrolebindings", "-o", "wide"])
+    _write_command_log(logs_dir / "clusterrolebindings-full.yaml", [KUBECTL, "get", "clusterrolebindings", "-o", "yaml"])
+    _write_command_log(logs_dir / "csrs.txt", [KUBECTL, "get", "csr", "-o", "wide"])
+    _write_command_log(logs_dir / "csrs-describe.txt", [KUBECTL, "describe", "csr"])
+    _write_command_log(
+        logs_dir / "bootstrap-tokens.txt",
+        [KUBECTL, "get", "secrets", "-n", "kube-system", "-l", "kubernetes.io/legacy-token-last-used", "-o", "wide"],
+    )
+    _write_command_log(
+        logs_dir / "bootstrap-token-secrets.yaml",
+        [KUBECTL, "get", "secrets", "-n", "kube-system", "--field-selector", "type=bootstrap.kubernetes.io/token", "-o", "yaml"],
+    )
+    _write_command_log(logs_dir / "workload-pods-describe.txt", [KUBECTL, "describe", "pods", "-n", TEST_NS])
+    _write_command_log(logs_dir / "workload-hello.log", [KUBECTL, "logs", "-n", TEST_NS, "--all-containers", "--prefix", "-l", "app=e2e-hello"])
+    _write_command_log(logs_dir / "workload-dns.log", [KUBECTL, "logs", "-n", TEST_NS, "--all-containers", "--prefix", "-l", "app=e2e-dns-test"])
+
+
+# ---------------------------------------------------------------------------
 # cleanup
 # ---------------------------------------------------------------------------
 def cleanup() -> None:
@@ -2086,10 +2610,17 @@ def cleanup() -> None:
 
     # Stop QEMU VM
     _stop_qemu()
+    if os.environ.get("COLLECT_NODE_CONFIG_LOGS", "").lower() == "true" or VM_NAME == "agent-config-e2e":
+        for index, cfg in enumerate(discover_node_configs()):
+            env = scenario_env(cfg, index)
+            _stop_qemu_by_pid_file(Path(env["VM_DIR"]) / f"{env['VM_NAME']}.pid", env["VM_NAME"])
 
     # Remove networking
     log("Cleaning up networking...")
     run_quiet(["sudo", "ip", "link", "del", TAP_NAME], check=False)
+    if VM_NAME == "agent-config-e2e":
+        for index, _cfg in enumerate(discover_node_configs()):
+            run_quiet(["sudo", "ip", "link", "del", f"tap-e2e-{index}"], check=False)
     run_quiet(["sudo", "ip", "link", "del", BRIDGE_NAME], check=False)
 
     # Remove iptables/nftables forwarding rules (best-effort).
@@ -2139,25 +2670,41 @@ def cleanup() -> None:
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
-COMMANDS = {
-    "create-vm": create_vm,
-    "ensure-kind-bridge": ensure_kind_bridge,
-    "dump-persisted-agent-config": dump_persisted_agent_config,
+Command = Callable[[NodeConfig], None]
+
+
+def _without_node_config(func: Callable[[], None]) -> Command:
+    """Adapt a command that does not use node config settings."""
+    def command(_node_config: NodeConfig) -> None:
+        func()
+
+    return command
+
+
+COMMANDS: dict[str, Command] = {
+    "collect-logs": _without_node_config(collect_logs),
+    "create-vm-bridge": _without_node_config(create_vm_bridge),
+    "create-vm": _without_node_config(create_vm),
+    "ensure-kind-bridge": _without_node_config(ensure_kind_bridge),
+    "dump-persisted-agent-config": _without_node_config(dump_persisted_agent_config),
+    "launch-vm": _without_node_config(launch_vm),
     "run-agent": run_agent,
-    "wait-for-node": wait_for_node,
-    "validate-kube-proxy": validate_kube_proxy,
-    "validate-workload": validate_workload,
-    "install-machine-crd": install_machine_crd,
-    "start-machina-controller": start_machina_controller,
-    "validate-machina-controller": validate_machina_controller,
-    "delete-machine-cr": delete_machine_cr,
+    "wait-for-node": _without_node_config(wait_for_node),
+    "validate-node-config": validate_node_config,
+    "validate-kube-proxy": _without_node_config(validate_kube_proxy),
+    "validate-workload": _without_node_config(validate_workload),
+    "install-machine-crd": _without_node_config(install_machine_crd),
+    "start-machina-controller": _without_node_config(start_machina_controller),
+    "validate-machina-controller": _without_node_config(validate_machina_controller),
+    "delete-machine-cr": _without_node_config(delete_machine_cr),
     "validate-machine-cr-created": validate_machine_cr_created,
-    "validate-node-reboot-operation": validate_node_reboot_operation,
-    "validate-agent-upgrade-operation": validate_agent_upgrade_operation,
-    "validate-agent-upgrade-rollback": validate_agent_upgrade_rollback,
+    "validate-node-reboot-operation": _without_node_config(validate_node_reboot_operation),
+    "validate-agent-upgrade-operation": _without_node_config(validate_agent_upgrade_operation),
+    "validate-agent-upgrade-rollback": _without_node_config(validate_agent_upgrade_rollback),
     "validate-node-repave-upgrade": validate_node_repave_upgrade,
-    "reset-agent": reset_agent,
-    "cleanup": cleanup,
+    "validate-node-configs": _without_node_config(validate_node_config_scenarios),
+    "reset-agent": _without_node_config(reset_agent),
+    "cleanup": _without_node_config(cleanup),
 }
 
 
@@ -2178,10 +2725,16 @@ def main() -> None:
         default=False,
         help="Enable verbose diagnostic output",
     )
+    parser.add_argument(
+        "--node-config",
+        default="",
+        help="Path to a JSON node config variant file",
+    )
     args = parser.parse_args()
     VERBOSE = args.verbose
+    node_config = load_node_config(args.node_config)
 
-    COMMANDS[args.command]()
+    COMMANDS[args.command](node_config)
 
 
 if __name__ == "__main__":

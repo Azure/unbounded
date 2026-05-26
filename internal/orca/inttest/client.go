@@ -7,6 +7,7 @@ package inttest
 
 import (
 	"context"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"net/http"
@@ -36,6 +37,32 @@ type GetResponse struct {
 	Body   []byte
 }
 
+// S3Error is the parsed shape of an S3 <Error> envelope as returned
+// by orca's edge handler on non-2xx responses. Field names mirror the
+// AWS S3 REST API.
+type S3Error struct {
+	XMLName    xml.Name `xml:"Error"`
+	Code       string   `xml:"Code"`
+	Message    string   `xml:"Message"`
+	Resource   string   `xml:"Resource,omitempty"`
+	BucketName string   `xml:"BucketName,omitempty"`
+	Key        string   `xml:"Key,omitempty"`
+}
+
+// ParseS3Error decodes r.Body as an S3 <Error> envelope. Fails the
+// test on parse error; callers should already know the response was
+// non-2xx.
+func (r GetResponse) ParseS3Error(t *testing.T) S3Error {
+	t.Helper()
+
+	var e S3Error
+	if err := xml.Unmarshal(r.Body, &e); err != nil {
+		t.Fatalf("parse S3 error: %v; body=%q", err, string(r.Body))
+	}
+
+	return e
+}
+
 // Get fetches the full body of /bucket/key.
 func (c *Client) Get(ctx context.Context, t *testing.T, bucket, key string) GetResponse {
 	t.Helper()
@@ -58,6 +85,16 @@ func (c *Client) Head(ctx context.Context, t *testing.T, bucket, key string) Get
 	t.Helper()
 
 	return c.do(ctx, t, http.MethodHead, fmt.Sprintf("/%s/%s", bucket, key), nil)
+}
+
+// Do issues a raw request against an arbitrary path. Used by tests
+// that exercise non-object surfaces (e.g. GET /bucket/ -> 501) or
+// that need to send headers (e.g. an out-of-range Range) the typed
+// helpers do not provide.
+func (c *Client) Do(ctx context.Context, t *testing.T, method, path string, hdr http.Header) GetResponse {
+	t.Helper()
+
+	return c.do(ctx, t, method, path, hdr)
 }
 
 func (c *Client) do(ctx context.Context, t *testing.T, method, path string, hdr http.Header) GetResponse {

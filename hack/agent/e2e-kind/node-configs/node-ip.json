@@ -1,0 +1,7 @@
+{
+  "name": "node-ip",
+  "nodeIP": "$VM_IP",
+  "nodeLabels": {
+    "e2e.unbounded-cloud.io/config": "node-ip"
+  }
+}
