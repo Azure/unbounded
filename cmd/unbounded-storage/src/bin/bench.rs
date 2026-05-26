@@ -64,7 +64,7 @@ use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
 use unbounded_storage::backing::{
-    BackingError, BackingKind, BackingRequest, HUGEPAGE_2MB, allocate,
+    BackingKind, BackingRequest, HUGEPAGE_2MB, allocate,
 };
 use unbounded_storage::bufferpool::{BlockStore, PageRef, StripeKey};
 use unbounded_storage::runtime::{
@@ -259,29 +259,6 @@ fn run_block(args: BlockArgs) -> ExitCode {
     if num_devices == 0 {
         eprintln!("bench: at least one --device required");
         return ExitCode::FAILURE;
-    }
-
-    // Fail fast: confirm hugepages are reservable on this host
-    // before spawning shard threads. The probe is deliberately a
-    // single page so it returns to the pool immediately.
-    match allocate(BackingRequest {
-        kind: BackingKind::Hugepage2Mb,
-        bytes: HUGEPAGE_2MB,
-        numa: None,
-    }) {
-        Ok(b) => drop(b),
-        Err(e) => {
-            eprintln!("bench: hugepage probe failed: {e}");
-            if let BackingError::HugepageMmap { free_hugepages, .. } = &e
-                && free_hugepages.unwrap_or(0) == 0
-            {
-                eprintln!(
-                    "bench: reserve 2 MiB hugepages before running, e.g. \
-                     `echo N > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages`",
-                );
-            }
-            return ExitCode::FAILURE;
-        }
     }
 
     install_signal_handler();
@@ -648,12 +625,15 @@ fn run_shard_inner(
     );
 
     // One PAGE_BYTES slot per worker, packed into a single
-    // hugepage-backed region. PAGE_BYTES is small (4 KiB today),
-    // so we round up to whole 2 MiB hugepages.
+    // backing region. PAGE_BYTES is small (4 KiB today), so we
+    // round up to the backing's native page size (2 MiB).
+    // BackingKind::Heap means no operator setup is required;
+    // switch to `Hugepage2Mb` if a host reserves hugepages and a
+    // TLB benefit is wanted.
     let page_count = cfg.workers.max(1);
     let backing_bytes = (page_count * PAGE_BYTES).next_multiple_of(HUGEPAGE_2MB);
     let backing = allocate(BackingRequest {
-        kind: BackingKind::Hugepage2Mb,
+        kind: BackingKind::Heap,
         bytes: backing_bytes,
         numa: cfg.pinned_numa,
     })
