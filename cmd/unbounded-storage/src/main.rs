@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -10,6 +11,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+use clap::Parser;
 use serde::{Deserialize, Serialize};
 
 use unbounded_storage::bufferpool::{
@@ -21,7 +23,7 @@ use unbounded_storage::fabric::{self, ConnectionSpec, Fabric, FabricTransport, P
 use unbounded_storage::runtime::{PinnedRuntime, Threading, WorkerIdx, WorkerSpec};
 use unbounded_storage::topology::{Host, Plan, Role, Worker};
 
-use unbounded_storage::backing::{BackingKind, BackingRequest, HUGEPAGE_2MB, allocate};
+use unbounded_storage::backing::{BackingKind, BackingRequest, allocate};
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/unbounded-storage/config.toml";
 const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
@@ -50,21 +52,13 @@ impl Req for PlaceholderReq {
 type ShardPool = Pool<FabricTransport<PlaceholderReq, StaticPeer>, NullBlockStore, PlaceholderReq>;
 
 fn main() -> ExitCode {
-    let cli = match Cli::parse(std::env::args().skip(1)) {
-        Ok(CliAction::Run(cli)) => cli,
-        Ok(CliAction::Help) => {
-            print_help();
-            return ExitCode::SUCCESS;
-        }
-        Err(e) => {
-            eprintln!("{e}");
-            eprintln!();
-            print_help();
-            return ExitCode::FAILURE;
-        }
+    let cli = Cli::parse();
+    let (config_path, config_explicit) = match cli.config.as_ref() {
+        Some(p) => (p.clone(), true),
+        None => (PathBuf::from(DEFAULT_CONFIG_PATH), false),
     };
 
-    let mut config = match load_config(&cli.config_path, cli.config_explicit) {
+    let mut config = match load_config(&config_path, config_explicit) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("config error: {e}");
@@ -72,9 +66,9 @@ fn main() -> ExitCode {
         }
     };
     // CLI overrides config for back-compat.
-    if let Some(b) = cli.bytes_per_shard_override {
+    if let Some(b) = cli.bytes_per_shard {
         config.storage.bytes_per_shard =
-            unbounded_storage::config::schema::ByteSize(b);
+            unbounded_storage::config::schema::ByteSize(b.get());
     }
     if cli.no_hugepages {
         config.storage.backing_kind = config::BackingKindCfg::Heap;
@@ -261,7 +255,7 @@ fn main() -> ExitCode {
     // watcher installs cleanly. Reconciling the updates back into
     // running subsystems is intentionally deferred to a later phase;
     // for now main only logs receipt.
-    match config::ConfigWatcher::new(cli.config_path.clone()) {
+    match config::ConfigWatcher::new(config_path.clone()) {
         Ok((_watcher, update_rx)) => {
             wait_for_shutdown_with_updates(
                 update_rx,
@@ -477,65 +471,42 @@ impl RoleCounts {
     }
 }
 
-/// Parsed command-line options for one run of the daemon.
-#[derive(Clone, Debug)]
+/// Parsed command-line options for one run of the daemon. All
+/// flags are either absent (let the TOML config drive the field)
+/// or override the matching `[storage]` knob for this run.
+#[derive(Clone, Debug, Parser)]
+#[command(
+    name = "unbounded-storage",
+    version,
+    about = "Unbounded storage daemon",
+    long_about = "Daemon process for the unbounded-storage subsystem. Reads its \
+                  configuration from a TOML file (default: \
+                  /etc/unbounded-storage/config.toml) and reloads peer and disk \
+                  state in place when the file changes."
+)]
 struct Cli {
-    config_path: PathBuf,
-    config_explicit: bool,
+    /// Path to the TOML config file.
+    ///
+    /// If left at the default and the file is missing, the daemon
+    /// continues with built-in defaults. An explicit path that is
+    /// missing or invalid is fatal.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+
+    /// Override `[storage] backing_kind` to `heap`.
+    ///
+    /// Without this flag (and without an override in the config),
+    /// the per-shard backing is allocated from 2 MiB hugepages.
+    #[arg(long)]
     no_hugepages: bool,
-    bytes_per_shard_override: Option<usize>,
-}
 
-enum CliAction {
-    Run(Cli),
-    Help,
-}
-
-impl Cli {
-    fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<CliAction, String> {
-        let mut config_path = PathBuf::from(DEFAULT_CONFIG_PATH);
-        let mut config_explicit = false;
-        let mut no_hugepages = false;
-        let mut bytes_per_shard_override: Option<usize> = None;
-        let mut it = args.into_iter();
-        while let Some(arg) = it.next() {
-            match arg.as_str() {
-                "-h" | "--help" => return Ok(CliAction::Help),
-                "--no-hugepages" => no_hugepages = true,
-                s if s.starts_with("--config=") => {
-                    config_path = PathBuf::from(&s["--config=".len()..]);
-                    config_explicit = true;
-                }
-                "--config" => {
-                    let v = it
-                        .next()
-                        .ok_or_else(|| "--config requires a value".to_string())?;
-                    config_path = PathBuf::from(v);
-                    config_explicit = true;
-                }
-                s if s.starts_with("--bytes-per-shard=") => {
-                    let v = &s["--bytes-per-shard=".len()..];
-                    bytes_per_shard_override = Some(parse_bytes(v)?);
-                }
-                "--bytes-per-shard" => {
-                    let v = it
-                        .next()
-                        .ok_or_else(|| "--bytes-per-shard requires a value".to_string())?;
-                    bytes_per_shard_override = Some(parse_bytes(&v)?);
-                }
-                other => return Err(format!("unknown argument: {other}")),
-            }
-        }
-        if let Some(0) = bytes_per_shard_override {
-            return Err("--bytes-per-shard must be > 0".into());
-        }
-        Ok(CliAction::Run(Cli {
-            config_path,
-            config_explicit,
-            no_hugepages,
-            bytes_per_shard_override,
-        }))
-    }
+    /// Override `[storage] bytes_per_shard`.
+    ///
+    /// Accepts a bare integer (bytes) or a string with a `K`, `M`,
+    /// or `G` suffix interpreted as powers of 1024. Zero is
+    /// rejected.
+    #[arg(long, value_name = "BYTES", value_parser = parse_bytes)]
+    bytes_per_shard: Option<NonZeroUsize>,
 }
 
 /// Load the daemon configuration. When the default path is used and
@@ -559,8 +530,10 @@ fn load_config(path: &Path, explicit: bool) -> Result<Config, String> {
 }
 
 /// Parse a byte count with an optional `K`/`M`/`G` suffix (powers
-/// of 1024). Bare integers are bytes.
-fn parse_bytes(s: &str) -> Result<usize, String> {
+/// of 1024). Bare integers are bytes. Used as the `clap`
+/// `value_parser` for `--bytes-per-shard`, so its `Err` strings are
+/// surfaced directly to the user by clap.
+fn parse_bytes(s: &str) -> Result<NonZeroUsize, String> {
     let s = s.trim();
     if s.is_empty() {
         return Err("empty byte count".into());
@@ -574,28 +547,10 @@ fn parse_bytes(s: &str) -> Result<usize, String> {
     let n: usize = num
         .parse()
         .map_err(|e| format!("invalid byte count {s:?}: {e}"))?;
-    n.checked_mul(mult)
-        .ok_or_else(|| format!("byte count {s:?} overflows usize"))
-}
-
-fn print_help() {
-    let hp_mib = HUGEPAGE_2MB / (1024 * 1024);
-    eprintln!("Usage: unbounded-storage [OPTIONS]");
-    eprintln!();
-    eprintln!("Options:");
-    eprintln!("  --config=<PATH>             Path to the TOML config file.");
-    eprintln!("                              Default: {DEFAULT_CONFIG_PATH}.");
-    eprintln!("                              If the default path is missing the daemon");
-    eprintln!("                              continues with built-in defaults; an");
-    eprintln!("                              explicit path that is missing or invalid");
-    eprintln!("                              is fatal.");
-    eprintln!("  --no-hugepages              Override [storage] backing_kind to heap.");
-    eprintln!("                              Without this flag (and without an override");
-    eprintln!("                              in the config), the per-shard backing is");
-    eprintln!("                              allocated from {hp_mib} MiB hugepages.");
-    eprintln!("  --bytes-per-shard=<BYTES>   Override [storage] bytes_per_shard. Accepts");
-    eprintln!("                              a K/M/G suffix (powers of 1024).");
-    eprintln!("  -h, --help                  Print this help and exit.");
+    let total = n
+        .checked_mul(mult)
+        .ok_or_else(|| format!("byte count {s:?} overflows usize"))?;
+    NonZeroUsize::new(total).ok_or_else(|| "byte count must be > 0".to_string())
 }
 
 fn wait_for_shutdown() {
@@ -713,20 +668,24 @@ mod tests {
     use super::*;
     use unbounded_storage::topology::NumaPool;
 
-    fn parse(args: &[&str]) -> Result<Cli, String> {
-        match Cli::parse(args.iter().map(|s| s.to_string()))? {
-            CliAction::Run(c) => Ok(c),
-            CliAction::Help => Err("unexpected help".into()),
-        }
+    use clap::error::ErrorKind;
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        let mut argv = vec!["unbounded-storage".to_string()];
+        argv.extend(args.iter().map(|s| s.to_string()));
+        Cli::try_parse_from(argv)
+    }
+
+    fn nz(n: usize) -> NonZeroUsize {
+        NonZeroUsize::new(n).expect("non-zero")
     }
 
     #[test]
     fn defaults_to_hugepages() {
         let c = parse(&[]).unwrap();
         assert!(!c.no_hugepages);
-        assert_eq!(c.bytes_per_shard_override, None);
-        assert_eq!(c.config_path, PathBuf::from(DEFAULT_CONFIG_PATH));
-        assert!(!c.config_explicit);
+        assert_eq!(c.bytes_per_shard, None);
+        assert_eq!(c.config, None);
     }
 
     #[test]
@@ -738,58 +697,63 @@ mod tests {
     #[test]
     fn bytes_per_shard_equals_form() {
         let c = parse(&["--bytes-per-shard=64M"]).unwrap();
-        assert_eq!(c.bytes_per_shard_override, Some(64 * 1024 * 1024));
+        assert_eq!(c.bytes_per_shard, Some(nz(64 * 1024 * 1024)));
     }
 
     #[test]
     fn bytes_per_shard_space_form() {
         let c = parse(&["--bytes-per-shard", "2G"]).unwrap();
-        assert_eq!(c.bytes_per_shard_override, Some(2 * 1024 * 1024 * 1024));
+        assert_eq!(c.bytes_per_shard, Some(nz(2 * 1024 * 1024 * 1024)));
     }
 
     #[test]
     fn bytes_plain_integer_is_bytes() {
         let c = parse(&["--bytes-per-shard=4194304"]).unwrap();
-        assert_eq!(c.bytes_per_shard_override, Some(4 * 1024 * 1024));
+        assert_eq!(c.bytes_per_shard, Some(nz(4 * 1024 * 1024)));
     }
 
     #[test]
     fn config_path_default_when_absent() {
         let c = parse(&[]).unwrap();
-        assert_eq!(c.config_path, PathBuf::from(DEFAULT_CONFIG_PATH));
-        assert!(!c.config_explicit);
+        assert_eq!(c.config, None);
     }
 
     #[test]
     fn config_path_explicit_equals_form() {
         let c = parse(&["--config=/tmp/foo.toml"]).unwrap();
-        assert_eq!(c.config_path, PathBuf::from("/tmp/foo.toml"));
-        assert!(c.config_explicit);
+        assert_eq!(c.config, Some(PathBuf::from("/tmp/foo.toml")));
     }
 
     #[test]
     fn config_path_explicit_space_form() {
         let c = parse(&["--config", "/tmp/foo.toml"]).unwrap();
-        assert_eq!(c.config_path, PathBuf::from("/tmp/foo.toml"));
-        assert!(c.config_explicit);
+        assert_eq!(c.config, Some(PathBuf::from("/tmp/foo.toml")));
     }
 
     #[test]
     fn help_flag_returns_help_action() {
-        let action = Cli::parse(["--help".to_string()].into_iter()).unwrap();
-        assert!(matches!(action, CliAction::Help));
+        // clap signals `--help` by returning an `Err` whose
+        // `ErrorKind` is `DisplayHelp`; calling `.exit()` on it
+        // would print help and exit with success.
+        let err = parse(&["--help"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DisplayHelp);
     }
 
     #[test]
     fn unknown_arg_is_rejected() {
-        let err = parse(&["--nope"]).err().unwrap();
-        assert!(err.contains("unknown argument"), "got: {err}");
+        let err = parse(&["--nope"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument);
     }
 
     #[test]
     fn zero_bytes_rejected() {
-        let err = parse(&["--bytes-per-shard=0"]).err().unwrap();
-        assert!(err.contains("must be > 0"), "got: {err}");
+        let err = parse(&["--bytes-per-shard=0"]).unwrap_err();
+        // clap wraps value-parser errors in `ValueValidation`; the
+        // underlying message from `parse_bytes` is in the rendered
+        // error body.
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
+        let rendered = err.to_string();
+        assert!(rendered.contains("must be > 0"), "got: {rendered}");
     }
 
     #[test]
