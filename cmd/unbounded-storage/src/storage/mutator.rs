@@ -25,19 +25,17 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
 use crate::storage::btree::LeafEntry;
-use crate::storage::types::{Lba, PageKey};
+use crate::storage::types::PageKey;
 
-/// A single submission to the mutator. Each variant carries the
-/// shared [`MutatorReply`] the submitter awaits.
+/// A single submission to the mutator. The submitter has already
+/// allocated the LBA run (recorded in `entry.lba`) and written the
+/// page to the device; the mutator only owns the btree mutation.
+/// Each variant carries the shared [`MutatorReply`] the submitter
+/// awaits.
 pub(crate) enum MutatorReq {
     Insert {
         key: PageKey,
         entry: LeafEntry,
-        /// The freshly allocated LBA for this insert. Carried
-        /// alongside `entry.lba` so the mutator can return it to
-        /// the allocator if `apply_batch` fails; the submitter
-        /// has already done the device write.
-        lba: Lba,
         done: Arc<MutatorReply>,
     },
     Delete {
@@ -49,15 +47,16 @@ pub(crate) enum MutatorReq {
 /// What the mutator observed when it processed a request.
 #[derive(Clone, Debug)]
 pub(crate) enum MutatorOutcome {
-    /// `apply_batch` committed; `prior_lba` is whatever LBA the
+    /// `apply_batch` committed; `prior` is the full LeafEntry the
     /// btree mapped `key` to immediately before this batch, or
-    /// `None` if the key was unmapped.
-    InsertCommitted { prior_lba: Option<Lba> },
+    /// `None` if the key was unmapped. The entry's `byte_len` lets
+    /// the submitter free the entire prior contiguous LBA range.
+    InsertCommitted { prior: Option<LeafEntry> },
     /// `apply_batch` committed the delete set.
     DeleteCommitted,
     /// `apply_batch` returned an error. The submitter must clean
-    /// up the LBA it allocated (insert) or leave eviction state
-    /// untouched (delete).
+    /// up the LBA range it allocated (insert) or leave eviction
+    /// state untouched (delete).
     Failed,
 }
 

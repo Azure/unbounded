@@ -396,10 +396,11 @@ impl BlockDevice for UringBlockDevice {
     }
 
     async fn read(&self, lba: Lba, dst: &mut [u8]) -> Result<(), Error> {
-        if dst.len() != self.page_size {
+        if dst.is_empty() || dst.len() % self.page_size != 0 {
             return Err(Error::Io(libc::EINVAL));
         }
-        if lba.0 >= self.capacity_pages {
+        let n_pages = (dst.len() / self.page_size) as u64;
+        if lba.0.checked_add(n_pages).is_none_or(|end| end > self.capacity_pages) {
             return Err(Error::OutOfRange);
         }
         // Locate which registered region holds `dst` so we can
@@ -421,10 +422,11 @@ impl BlockDevice for UringBlockDevice {
     }
 
     async fn write(&self, lba: Lba, src: &[u8]) -> Result<(), Error> {
-        if src.len() != self.page_size {
+        if src.is_empty() || src.len() % self.page_size != 0 {
             return Err(Error::Io(libc::EINVAL));
         }
-        if lba.0 >= self.capacity_pages {
+        let n_pages = (src.len() / self.page_size) as u64;
+        if lba.0.checked_add(n_pages).is_none_or(|end| end > self.capacity_pages) {
             return Err(Error::OutOfRange);
         }
         // See [`Self::read`] for buf_index resolution.

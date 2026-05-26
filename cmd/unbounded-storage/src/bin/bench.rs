@@ -78,16 +78,15 @@ const _: () = assert!(HUGEPAGE_2MB == 2 * 1024 * 1024);
 
 /// User-data page size used by the bench, in bytes.
 ///
-/// Today the storage stack assumes the block device's atomic write
-/// unit equals the engine's cache page size (the btree, allocator,
-/// and engine all use the same LBA -> byte offset = LBA * page_size
-/// formula). Until that mismatch is properly disentangled, the
-/// bench operates at the device's atomic-write granularity (4 KiB
-/// on commodity SCSI/NVMe). The hugepage backing is still 2 MiB so
-/// it can be DMA'd directly, but each worker only addresses a
-/// 4 KiB sub-slice of it.
-const PAGE_BYTES: usize = 4096;
-const _: () = assert!(HUGEPAGE_2MB.is_multiple_of(PAGE_BYTES));
+/// Cache pages are 2 MiB so each user write_page is one large
+/// device I/O. 4 KiB writes are IOPS-bound on commodity disks
+/// (~100 MiB/s at 4 KiB qd=128 on /dev/sdc); 2 MiB writes reach
+/// the device's bandwidth ceiling (~1.9 GiB/s on the same disk
+/// under fio). The engine still uses 4 KiB btree pages internally
+/// (see `btree_page_bytes` below), so the device's atomic-write
+/// unit remains 4 KiB and torn-write safety of the index is
+/// preserved.
+const PAGE_BYTES: usize = 2 * 1024 * 1024;
 
 /// Default PRNG seed for benchmark workloads.
 const DEFAULT_SEED: u64 = 0xBE_DE_CA_FE_u64;
@@ -620,13 +619,11 @@ fn run_device_inner(
     }
 
     let mut uring_cfg = UringConfig {
-        // The device must be told the same page size the engine
-        // will write: the device enforces `src.len() ==
-        // page_size` on every read/write, so a mismatch produces
-        // -EINVAL on every IO and (until the engine started
-        // propagating those errors) silently passed the bench
-        // straight through to a no-op loop.
-        page_size: PAGE_BYTES,
+        // Device page size is the atomic write unit (4 KiB on
+        // commodity SCSI/NVMe). Cache pages are PAGE_BYTES and
+        // each cache-page write spans `PAGE_BYTES / 4096`
+        // consecutive LBAs.
+        page_size: 4096,
         ..UringConfig::default()
     };
     uring_cfg.iopoll = head.iopoll;
@@ -678,11 +675,13 @@ fn run_device_inner(
         .map_err(|e| format!("device.register_buffers: {e:?}"))?;
 
     let engine_cfg = EngineConfig {
-        // Both the cache page size and the btree page size must
-        // equal the device's atomic write unit until the engine
-        // separates user-data page size from device LBA size.
+        // PAGE_BYTES (2 MiB) is the cache page size; the btree
+        // and the device addressing operate in 4 KiB units (one
+        // cache page = 512 contiguous LBAs). Keeping the btree
+        // small confines per-commit metadata I/O to a few 4 KiB
+        // writes regardless of user-write size.
         page_size_bytes: PAGE_BYTES,
-        btree_page_bytes: PAGE_BYTES,
+        btree_page_bytes: 4096,
         bypass_admission: head.bypass_admission,
         skip_recovery_scan_if_no_meta: head.skip_recovery_scan_if_no_meta,
         ..Default::default()

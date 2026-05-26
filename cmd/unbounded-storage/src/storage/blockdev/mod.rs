@@ -57,15 +57,18 @@ pub trait BlockDevice {
     /// the registered regions.
     fn register_buffers(&self, base: *mut u8, len: usize) -> Result<(), Error>;
 
-    /// Read exactly `dst.len()` bytes from `lba * page_size` into
-    /// `dst`. Resolves with `Err(Io)` on hard I/O failure; the
-    /// engine collapses corruption-style failures into a cache
-    /// miss at a higher layer, so this method does not validate
-    /// content.
+    /// Read into `dst` starting at `lba * page_size`. `dst.len()`
+    /// must be a positive multiple of `page_size`; the read spans
+    /// `dst.len() / page_size` consecutive LBAs. Resolves with
+    /// `Err(Io)` on hard I/O failure; the engine collapses
+    /// corruption-style failures into a cache miss at a higher
+    /// layer, so this method does not validate content.
     async fn read(&self, lba: Lba, dst: &mut [u8]) -> Result<(), Error>;
 
-    /// Write `src` to `lba * page_size`. Same semantics as
-    /// [`BlockDevice::read`] regarding errors.
+    /// Write `src` starting at `lba * page_size`. `src.len()` must
+    /// be a positive multiple of `page_size`; the write spans
+    /// `src.len() / page_size` consecutive LBAs. Same error
+    /// semantics as [`BlockDevice::read`].
     async fn write(&self, lba: Lba, src: &[u8]) -> Result<(), Error>;
 
     /// Hint for how many concurrent writes the device can absorb

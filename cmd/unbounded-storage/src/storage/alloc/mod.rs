@@ -90,6 +90,59 @@ impl Allocator {
         Err(Error::OutOfSpace)
     }
 
+    /// Reserve `n` contiguous LBAs. Returns the start LBA. A bump-
+    /// style scan from the current hint suffices because the
+    /// engine writes user pages as soon as it allocates them, so
+    /// the high-water region stays mostly contiguous and the scan
+    /// is O(n) on a fresh disk. Falls back to a full wrap-around
+    /// scan only when the hint region is exhausted.
+    pub fn alloc_contig(&self, n: u64) -> Result<Lba, Error> {
+        if n == 0 {
+            return Err(Error::OutOfRange);
+        }
+        if n == 1 {
+            return self.alloc();
+        }
+        let mut g = self.inner.lock().unwrap();
+        if g.used + n > self.capacity {
+            return Err(Error::OutOfSpace);
+        }
+        let start = g.next;
+        if let Some(lba) = scan_run(&mut g, start, self.capacity, n) {
+            return Ok(Lba(lba));
+        }
+        if let Some(lba) = scan_run(&mut g, 0, start, n) {
+            return Ok(Lba(lba));
+        }
+        Err(Error::OutOfSpace)
+    }
+
+    /// Mark a run of `n` LBAs starting at `start` free. Equivalent
+    /// to calling `free` for each LBA in the run but holds the
+    /// mutex once and skips the per-LBA debug_assert; callers
+    /// guarantee the run was previously allocated as a single
+    /// [`Self::alloc_contig`] call.
+    pub fn free_range(&self, start: Lba, n: u64) -> Result<(), Error> {
+        if n == 0 {
+            return Ok(());
+        }
+        let end = start.0.checked_add(n).ok_or(Error::OutOfRange)?;
+        if end > self.capacity {
+            return Err(Error::OutOfRange);
+        }
+        let mut g = self.inner.lock().unwrap();
+        for lba in start.0..end {
+            let (w, b) = word_bit(lba);
+            let mask = 1u64 << b;
+            if g.words[w] & mask != 0 {
+                g.words[w] &= !mask;
+                g.used -= 1;
+            }
+        }
+        g.next = start.0;
+        Ok(())
+    }
+
     /// Mark `lba` free. Returns `OutOfRange` if `lba` is past the
     /// configured capacity. Idempotent: freeing an already-free
     /// LBA is a logic bug we surface via a debug_assert but the
@@ -165,6 +218,46 @@ fn word_bit(lba: u64) -> (usize, u32) {
     ((lba / 64) as usize, (lba % 64) as u32)
 }
 
+/// Find a run of `n` consecutive zero bits in `[start, end)` and
+/// set them all in one pass. Returns the run's starting LBA.
+/// The caller must hold the allocator mutex and have verified
+/// `used + n <= capacity`.
+fn scan_run(inner: &mut Inner, start: u64, end: u64, n: u64) -> Option<u64> {
+    if start >= end || end - start < n {
+        return None;
+    }
+    let mut lba = start;
+    while lba + n <= end {
+        if word_get(&inner.words, lba) {
+            lba += 1;
+            continue;
+        }
+        // `lba` is free; greedily extend the run.
+        let mut k = 1u64;
+        while k < n && !word_get(&inner.words, lba + k) {
+            k += 1;
+        }
+        if k == n {
+            for i in 0..n {
+                let (w, b) = word_bit(lba + i);
+                inner.words[w] |= 1u64 << b;
+            }
+            inner.used += n;
+            inner.next = lba + n;
+            inner.max_ever = inner.max_ever.max(lba + n - 1);
+            return Some(lba);
+        }
+        // Hit a used bit at `lba + k`; resume past it.
+        lba += k + 1;
+    }
+    None
+}
+
+fn word_get(words: &[u64], lba: u64) -> bool {
+    let (w, b) = word_bit(lba);
+    words[w] & (1u64 << b) != 0
+}
+
 /// Scans `[start, end)` looking for the first cleared bit. Returns
 /// the LBA on success and updates the allocator's `next` hint /
 /// `used` count.
@@ -178,11 +271,7 @@ fn scan_from(inner: &mut Inner, start: u64, end: u64) -> Option<u64> {
     while w <= last_word {
         let word = inner.words[w];
         if word != u64::MAX {
-            // At least one zero bit in this word; find the lowest
-            // free bit that's also within [start, end).
             let inverted = !word;
-            // `trailing_zeros` finds the lowest set bit; mask off
-            // anything before `lba`'s bit-offset within the word.
             let bit_offset = if (lba / 64) as usize == w {
                 lba % 64
             } else {

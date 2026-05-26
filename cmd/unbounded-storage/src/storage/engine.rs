@@ -110,16 +110,17 @@ pub struct StorageEngine<B: BlockDevice> {
     singleflight: Arc<Singleflight>,
     cfg: EngineConfig,
     bufferpool: Mutex<BufferpoolBinding>,
-    /// Reverse map LBA -> PageKey, used by evictions to remove
-    /// stale btree entries. Only the mutator task and writers
-    /// holding their own freshly-allocated LBA mutate this map;
-    /// readers are read-only consumers.
-    reverse: Mutex<HashMap<u64, PageKey>>,
-    /// LBAs that have been logically orphaned (no btree entry,
+    /// Reverse map start-LBA -> (PageKey, byte_len). Eviction
+    /// targets pick a start LBA from the LRU; the entry's
+    /// byte_len tells the engine how many contiguous LBAs the
+    /// run covers so the whole run is freed atomically.
+    reverse: Mutex<HashMap<u64, (PageKey, u32)>>,
+    /// Runs that have been logically orphaned (no btree entry,
     /// removed from the LRU) but cannot be freed yet because a
-    /// reader still holds a pin. The mutator task drains this
-    /// list once per committed batch.
-    pending_free: Mutex<Vec<Lba>>,
+    /// reader still holds a pin on the start LBA. Drained by the
+    /// mutator once per committed batch. Each entry is
+    /// `(start_lba, n_pages)`.
+    pending_free: Mutex<Vec<(Lba, u64)>>,
     /// Single-consumer queue: writers and the eviction path
     /// enqueue here, the engine's `run_mutator` task drains and
     /// commits batches.
@@ -296,14 +297,22 @@ impl<B: BlockDevice> StorageEngine<B> {
         f(&mut self.metrics.inner.lock().unwrap())
     }
 
-    /// Reclaim every queued orphan LBA whose pin count has
+    fn n_pages(&self, byte_len: u32) -> u64 {
+        // byte_len is the size of the cached page in bytes; each
+        // contiguous run is `byte_len / btree_page_bytes` device
+        // pages long. Insert paths construct entries this way so
+        // the division is exact.
+        (byte_len as usize / self.cfg.btree_page_bytes) as u64
+    }
+
+    /// Reclaim every queued orphan run whose pin count has
     /// dropped to zero. Called opportunistically by the writer
     /// path so deferred frees don't accumulate indefinitely.
     fn drain_pending_free(&self) {
         let mut pending = self.pending_free.lock().unwrap();
-        pending.retain(|lba| {
+        pending.retain(|(lba, n)| {
             if self.refcount.pin_count(lba.0).unwrap_or(0) == 0 {
-                let _ = self.allocator.free(*lba);
+                let _ = self.allocator.free_range(*lba, *n);
                 let _ = self.refcount.reset(lba.0);
                 false
             } else {
@@ -312,20 +321,20 @@ impl<B: BlockDevice> StorageEngine<B> {
         });
     }
 
-    /// Detach `old` from the engine's bookkeeping and either
-    /// free it immediately or queue it for later reclamation
-    /// when its readers are done.
-    fn retire_lba(&self, old: Lba) {
+    /// Detach a `n`-page run starting at `old` from the engine's
+    /// bookkeeping and either free it immediately or queue it for
+    /// later reclamation when its readers are done.
+    fn retire_range(&self, old: Lba, n: u64) {
         {
             let mut rev = self.reverse.lock().unwrap();
             rev.remove(&old.0);
         }
         self.lru.forget(old);
         if self.refcount.pin_count(old.0).unwrap_or(0) == 0 {
-            let _ = self.allocator.free(old);
+            let _ = self.allocator.free_range(old, n);
             let _ = self.refcount.reset(old.0);
         } else {
-            self.pending_free.lock().unwrap().push(old);
+            self.pending_free.lock().unwrap().push((old, n));
         }
     }
 
@@ -357,16 +366,19 @@ impl<B: BlockDevice> StorageEngine<B> {
             if victims.is_empty() {
                 return;
             }
-            // Resolve victim LBAs to keys via the reverse map
-            // before submitting: the mutator only needs the keys
-            // to commit the delete, and we still own the LBAs
-            // here for the post-commit free below.
+            // Resolve victim start-LBAs to (key, byte_len) via
+            // the reverse map before submitting: the mutator only
+            // needs the keys to commit the delete, and we still
+            // own the LBA runs here for the post-commit free
+            // below.
             let mut keys: Vec<PageKey> = Vec::with_capacity(victims.len());
+            let mut victim_runs: Vec<(Lba, u64)> = Vec::with_capacity(victims.len());
             {
                 let rev = self.reverse.lock().unwrap();
                 for lba in &victims {
-                    if let Some(k) = rev.get(&lba.0).copied() {
+                    if let Some((k, byte_len)) = rev.get(&lba.0).copied() {
                         keys.push(k);
+                        victim_runs.push((*lba, self.n_pages(byte_len)));
                     }
                 }
             }
@@ -396,15 +408,15 @@ impl<B: BlockDevice> StorageEngine<B> {
             }
             {
                 let mut rev = self.reverse.lock().unwrap();
-                for lba in &victims {
+                for (lba, _) in &victim_runs {
                     rev.remove(&lba.0);
                 }
             }
-            for lba in &victims {
-                let _ = self.allocator.free(*lba);
+            for (lba, n) in &victim_runs {
+                let _ = self.allocator.free_range(*lba, *n);
                 let _ = self.refcount.reset(lba.0);
             }
-            self.metric(|m| m.evictions += victims.len() as u64);
+            self.metric(|m| m.evictions += victim_runs.len() as u64);
         })
     }
 }
@@ -556,16 +568,22 @@ impl<B: BlockDevice> StorageEngine<B> {
             }
         };
 
-        let lba = match self.allocator.alloc() {
+        // SAFETY: caller-provided contract on `src`.
+        let src_buf: &[u8] = unsafe { &*src };
+
+        // The write spans `ceil(src.len() / btree_page_bytes)`
+        // consecutive LBAs. For full-page user writes (the
+        // production case) this divides exactly; partial-page
+        // writes used by DST workloads round up to one LBA.
+        let n_pages = src_buf.len().div_ceil(self.cfg.btree_page_bytes) as u64;
+        debug_assert!(n_pages > 0, "write_page_from called with empty src");
+        let lba = match self.allocator.alloc_contig(n_pages) {
             Ok(l) => l,
             Err(_) => {
                 leader.abandon();
                 return Ok(());
             }
         };
-
-        // SAFETY: caller-provided contract on `src`.
-        let src_buf: &[u8] = unsafe { &*src };
 
         if let Err(e) = self.device.write(lba, src_buf).await {
             // A device write that did not land on disk MUST surface
@@ -577,7 +595,7 @@ impl<B: BlockDevice> StorageEngine<B> {
             // still records the IO error in metrics for the
             // operator-facing snapshot.
             self.metric(|m| m.write_io_errors += 1);
-            let _ = self.allocator.free(lba);
+            let _ = self.allocator.free_range(lba, n_pages);
             leader.abandon();
             return Err(bufferpool::Error::Io(io_errno(&e)));
         }
@@ -590,26 +608,26 @@ impl<B: BlockDevice> StorageEngine<B> {
         };
 
         // Submit the insert to the mutator and wait for its
-        // batched commit. The mutator returns the prior LBA the
-        // btree mapped this key to (if any) so we can retire it.
+        // batched commit. The mutator returns the prior LeafEntry
+        // the btree mapped this key to (if any) so we can retire
+        // the entire prior run.
         let done = MutatorReply::new();
         self.mutator_queue.push(MutatorReq::Insert {
             key: pk,
             entry,
-            lba,
             done: done.clone(),
         });
-        let prior_lba = match done.wait().await {
-            MutatorOutcome::InsertCommitted { prior_lba } => prior_lba,
+        let prior = match done.wait().await {
+            MutatorOutcome::InsertCommitted { prior } => prior,
             MutatorOutcome::Failed => {
                 // Btree commit failed: the device write landed on
-                // an LBA that is no longer referenced by the index,
-                // i.e. the page is not durably published. Treat
-                // this as a hard write failure rather than a silent
-                // success - see the matching reasoning at the
-                // device-write branch above.
+                // an LBA run that is no longer referenced by the
+                // index, i.e. the page is not durably published.
+                // Treat this as a hard write failure rather than a
+                // silent success - see the matching reasoning at
+                // the device-write branch above.
                 self.metric(|m| m.write_io_errors += 1);
-                let _ = self.allocator.free(lba);
+                let _ = self.allocator.free_range(lba, n_pages);
                 leader.abandon();
                 return Err(bufferpool::Error::Io(libc::EIO));
             }
@@ -618,13 +636,13 @@ impl<B: BlockDevice> StorageEngine<B> {
             }
         };
 
-        if let Some(old) = prior_lba {
-            self.retire_lba(old);
+        if let Some(old) = prior {
+            self.retire_range(old.lba, self.n_pages(old.byte_len));
         }
 
         {
             let mut rev = self.reverse.lock().unwrap();
-            rev.insert(lba.0, pk);
+            rev.insert(lba.0, (pk, src_buf.len() as u32));
         }
         self.lru.admit(lba);
         self.metric(|m| m.admitted += 1);
@@ -711,20 +729,20 @@ impl<B: BlockDevice> StorageEngine<B> {
             }
         }
 
-        let mut prior_lbas: Vec<Option<Lba>> = Vec::with_capacity(batch.len());
+        let mut priors: Vec<Option<LeafEntry>> = Vec::with_capacity(batch.len());
         let mut mutations: Vec<Mutation> = Vec::new();
         for req in &batch {
             match req {
                 MutatorReq::Insert { key, entry, .. } => {
-                    let prior = self.btree.lookup(key).await.ok().flatten().map(|e| e.lba);
-                    prior_lbas.push(prior);
+                    let prior = self.btree.lookup(key).await.ok().flatten();
+                    priors.push(prior);
                     mutations.push(Mutation::Insert {
                         key: *key,
                         value: *entry,
                     });
                 }
                 MutatorReq::Delete { keys, .. } => {
-                    prior_lbas.push(None);
+                    priors.push(None);
                     for k in keys {
                         mutations.push(Mutation::Delete { key: *k });
                     }
@@ -747,7 +765,7 @@ impl<B: BlockDevice> StorageEngine<B> {
             } else {
                 match req {
                     MutatorReq::Insert { .. } => MutatorOutcome::InsertCommitted {
-                        prior_lba: prior_lbas[i],
+                        prior: priors[i],
                     },
                     MutatorReq::Delete { .. } => MutatorOutcome::DeleteCommitted,
                 }

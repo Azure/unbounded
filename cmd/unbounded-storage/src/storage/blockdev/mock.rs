@@ -152,10 +152,14 @@ impl BlockDevice for MockDevice {
     async fn read(&self, lba: Lba, dst: &mut [u8]) -> Result<(), Error> {
         self.read_count.set(self.read_count.get() + 1);
         let cfg = self.cfg.get();
-        if lba.0 >= cfg.capacity_pages {
+        if dst.is_empty() {
             return Err(Error::OutOfRange);
         }
-        if dst.len() > cfg.page_size {
+        // Span `ceil(dst.len() / page_size)` LBAs. The mock allows
+        // a trailing partial page so DST workloads can exercise
+        // byte-sized writes alongside full-page ones.
+        let n_pages = dst.len().div_ceil(cfg.page_size) as u64;
+        if lba.0.checked_add(n_pages).is_none_or(|end| end > cfg.capacity_pages) {
             return Err(Error::OutOfRange);
         }
         if matches!(cfg.fault_mode, MockFaultMode::ReadIo) {
@@ -173,10 +177,11 @@ impl BlockDevice for MockDevice {
     async fn write(&self, lba: Lba, src: &[u8]) -> Result<(), Error> {
         self.write_count.set(self.write_count.get() + 1);
         let cfg = self.cfg.get();
-        if lba.0 >= cfg.capacity_pages {
+        if src.is_empty() {
             return Err(Error::OutOfRange);
         }
-        if src.len() > cfg.page_size {
+        let n_pages = src.len().div_ceil(cfg.page_size) as u64;
+        if lba.0.checked_add(n_pages).is_none_or(|end| end > cfg.capacity_pages) {
             return Err(Error::OutOfRange);
         }
         if matches!(cfg.fault_mode, MockFaultMode::WriteIo) {
