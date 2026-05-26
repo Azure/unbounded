@@ -9,10 +9,7 @@ pub mod reconcile;
 pub mod schema;
 pub mod watch;
 
-pub use apply::{
-    backing_kind_from_cfg, disk_specs_to_nvmes, peer_spec_to_connection,
-    topology_cfg_to_plan_config,
-};
+pub use apply::{backing_kind_from_cfg, peer_spec_to_connection, topology_cfg_to_plan_config};
 pub use load::ConfigError;
 pub use reconcile::{
     ApplyReport, PeerReconcileTarget, ReconcileReport, apply_peers_startup, reconcile_peers,

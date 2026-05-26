@@ -83,7 +83,6 @@ impl Default for BackingKindCfg {
 pub struct TopologyCfg {
     pub rdma_progress_per_hca: usize,
     pub rdma_handlers_per_hca: usize,
-    pub nvme_threads_per_drive: usize,
     pub use_smt_siblings: bool,
     pub respect_isolated: bool,
     pub exclude_node_cpu0: bool,
@@ -96,7 +95,6 @@ impl Default for TopologyCfg {
         Self {
             rdma_progress_per_hca: 1,
             rdma_handlers_per_hca: 4,
-            nvme_threads_per_drive: 2,
             use_smt_siblings: false,
             respect_isolated: true,
             exclude_node_cpu0: true,
@@ -234,7 +232,6 @@ mod tests {
         assert_eq!(c.storage.backing_kind, BackingKindCfg::Hugepage2Mb);
         assert_eq!(c.topology.rdma_progress_per_hca, 1);
         assert_eq!(c.topology.rdma_handlers_per_hca, 4);
-        assert_eq!(c.topology.nvme_threads_per_drive, 2);
         assert!(!c.topology.use_smt_siblings);
         assert!(c.topology.respect_isolated);
         assert!(c.topology.exclude_node_cpu0);

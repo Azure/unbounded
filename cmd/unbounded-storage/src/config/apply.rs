@@ -10,7 +10,7 @@ use crate::bufferpool::PeerId;
 use crate::fabric::ConnectionSpec;
 use crate::topology;
 
-use super::schema::{BackingKindCfg, DiskSpec, PeerSpec, TopologyCfg};
+use super::schema::{BackingKindCfg, PeerSpec, TopologyCfg};
 
 pub fn peer_spec_to_connection(p: &PeerSpec) -> ConnectionSpec {
     ConnectionSpec {
@@ -20,32 +20,22 @@ pub fn peer_spec_to_connection(p: &PeerSpec) -> ConnectionSpec {
     }
 }
 
-pub fn disk_specs_to_nvmes(disks: &[DiskSpec]) -> Vec<topology::Nvme> {
-    disks
-        .iter()
-        .map(|d| {
-            let dev_name = match d.path.file_name() {
-                Some(n) => n.to_string_lossy().into_owned(),
-                None => d.path.to_string_lossy().into_owned(),
-            };
-            topology::Nvme {
-                dev_name,
-                pci_bdf: None,
-                numa: d.numa,
-            }
-        })
-        .collect()
-}
-
 pub fn topology_cfg_to_plan_config(t: &TopologyCfg) -> topology::PlanConfig {
+    let defaults = topology::PlanConfig::default();
     topology::PlanConfig {
         rdma_progress_per_hca: t.rdma_progress_per_hca,
         rdma_handlers_per_hca: t.rdma_handlers_per_hca,
-        nvme_threads_per_drive: t.nvme_threads_per_drive,
+        // The production daemon no longer schedules NVMe progress
+        // threads via the topology plan: per-disk supervision lives
+        // in `disk_supervisor::DiskRegistry`. The plan still emits
+        // NVMe workers because the bench binary consumes them, so
+        // we keep the default `nvme_threads_per_drive` here and do
+        // not expose it as a knob in the daemon config.
+        nvme_threads_per_drive: defaults.nvme_threads_per_drive,
         use_smt_siblings: t.use_smt_siblings,
         respect_isolated: t.respect_isolated,
         exclude_node_cpu0: t.exclude_node_cpu0,
-        require_node_type_ca: topology::PlanConfig::default().require_node_type_ca,
+        require_node_type_ca: defaults.require_node_type_ca,
         require_active_port: t.require_active_port,
         tcp_fallback_threads: t.tcp_fallback_threads,
     }
@@ -61,7 +51,6 @@ pub fn backing_kind_from_cfg(k: BackingKindCfg) -> BackingKind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     use crate::config::schema::PeerTransport;
 
@@ -80,36 +69,10 @@ mod tests {
     }
 
     #[test]
-    fn disk_specs_derive_dev_name_from_file_name() {
-        let disks = vec![
-            DiskSpec {
-                path: PathBuf::from("/dev/nvme0n1"),
-                kind: super::super::schema::DiskKind::Nvme,
-                numa: Some(0),
-                queue_depth: None,
-            },
-            DiskSpec {
-                path: PathBuf::from("nvme9n1"),
-                kind: super::super::schema::DiskKind::Nvme,
-                numa: None,
-                queue_depth: None,
-            },
-        ];
-        let nvmes = disk_specs_to_nvmes(&disks);
-        assert_eq!(nvmes.len(), 2);
-        assert_eq!(nvmes[0].dev_name, "nvme0n1");
-        assert_eq!(nvmes[0].pci_bdf, None);
-        assert_eq!(nvmes[0].numa, Some(0));
-        assert_eq!(nvmes[1].dev_name, "nvme9n1");
-        assert_eq!(nvmes[1].numa, None);
-    }
-
-    #[test]
     fn topology_cfg_maps_field_by_field() {
         let mut t = TopologyCfg::default();
         t.rdma_progress_per_hca = 3;
         t.rdma_handlers_per_hca = 7;
-        t.nvme_threads_per_drive = 5;
         t.use_smt_siblings = true;
         t.respect_isolated = false;
         t.exclude_node_cpu0 = false;
@@ -117,18 +80,20 @@ mod tests {
         t.tcp_fallback_threads = 4;
 
         let p = topology_cfg_to_plan_config(&t);
+        let defaults = topology::PlanConfig::default();
         assert_eq!(p.rdma_progress_per_hca, 3);
         assert_eq!(p.rdma_handlers_per_hca, 7);
-        assert_eq!(p.nvme_threads_per_drive, 5);
+        // `nvme_threads_per_drive` is no longer config-driven; it
+        // stays at the `PlanConfig` default so the bench binary
+        // (the only remaining consumer of NVMe placements) keeps
+        // working unchanged.
+        assert_eq!(p.nvme_threads_per_drive, defaults.nvme_threads_per_drive);
         assert!(p.use_smt_siblings);
         assert!(!p.respect_isolated);
         assert!(!p.exclude_node_cpu0);
         assert!(!p.require_active_port);
         assert_eq!(p.tcp_fallback_threads, 4);
-        assert_eq!(
-            p.require_node_type_ca,
-            topology::PlanConfig::default().require_node_type_ca
-        );
+        assert_eq!(p.require_node_type_ca, defaults.require_node_type_ca);
     }
 
     #[test]

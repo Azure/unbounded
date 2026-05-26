@@ -82,23 +82,15 @@ fn main() -> ExitCode {
     let backing_kind = config::backing_kind_from_cfg(config.storage.backing_kind);
     let bytes_per_shard_total = config.storage.bytes_per_shard.bytes();
 
-    let mut host = Host::discover();
-    if !config.disks.is_empty() {
-        eprintln!(
-            "config: authoritative disk list ({} entries) overrides discovered nvmes",
-            config.disks.len()
-        );
-        host.nvmes = config::disk_specs_to_nvmes(&config.disks);
-    }
+    let host = Host::discover();
     let plan = Plan::for_host(&host, &config::topology_cfg_to_plan_config(&config.topology));
 
     let counts = RoleCounts::from_plan(&plan);
     eprintln!(
-        "topology plan: workers={} progress={} handlers={} nvme={} numa_pools={:?}",
+        "topology plan: workers={} progress={} handlers={} numa_pools={:?}",
         plan.workers.len(),
         counts.progress,
         counts.handlers,
-        counts.nvme,
         plan.numa_pools,
     );
 
@@ -209,11 +201,17 @@ fn main() -> ExitCode {
     }
 
     // Disk supervisor: open `[[disks]]` entries (progress threads
-    // only, no data-path wiring yet). The CPU hint list comes from
-    // the topology plan's NVMe placements so opens are pinned near
-    // the shard that will eventually consume them.
-    let nvme_cpus: Vec<usize> = plan.nvme().map(|w| w.cpu as usize).collect();
-    let mut disk_registry = DiskRegistry::new(UringDiskTarget, nvme_cpus);
+    // only, no data-path wiring yet). Open hints are derived from
+    // the per-disk `numa` field where present; absent that, opens
+    // are unpinned and `DiskRegistry` falls back to round-robin
+    // across the empty hint list.
+    let disk_cpu_hints: Vec<usize> = config
+        .disks
+        .iter()
+        .filter_map(|d| d.numa)
+        .filter_map(|n| host.cpus_on(Some(n)).first().copied().map(|c| c as usize))
+        .collect();
+    let mut disk_registry = DiskRegistry::new(UringDiskTarget, disk_cpu_hints);
     // Hot-swap publication surface for shards. Engines are *not*
     // opened from this thread: `UringBlockDevice` is `!Send` and
     // can only be wrapped in a `StorageEngine` on its own progress
@@ -463,7 +461,6 @@ enum ShardReady {
 struct RoleCounts {
     progress: usize,
     handlers: usize,
-    nvme: usize,
 }
 
 impl RoleCounts {
@@ -473,7 +470,7 @@ impl RoleCounts {
             match w.role {
                 Role::RdmaProgress { .. } => c.progress += 1,
                 Role::RdmaHandler { .. } => c.handlers += 1,
-                Role::NvmeIoUring { .. } => c.nvme += 1,
+                Role::NvmeIoUring { .. } => {}
             }
         }
         c
@@ -801,7 +798,10 @@ mod tests {
         // route this through `Plan::for_host`; we just want to
         // confirm `RoleCounts::from_plan` walks the worker list
         // correctly because main.rs feeds that into the startup
-        // observability line.
+        // observability line. NvmeIoUring workers are intentionally
+        // not counted: the production daemon no longer pins per-disk
+        // progress threads from the topology plan, so any such
+        // worker that survives in a synthetic fixture is ignored.
         let plan = Plan {
             workers: vec![
                 Worker {
@@ -846,7 +846,6 @@ mod tests {
             RoleCounts {
                 progress: 2,
                 handlers: 3,
-                nvme: 1
             }
         );
     }
