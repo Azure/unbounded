@@ -21,6 +21,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 
+	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 	"github.com/Azure/unbounded/internal/net/allocator"
 	unboundednet "github.com/Azure/unbounded/internal/net/client/unboundednet"
@@ -137,6 +138,10 @@ func (v *Validator) validateSite(ctx context.Context, req *admissionv1.Admission
 	}
 
 	sites := mergeSiteList(siteList.Items, site, req.Operation)
+
+	if err := validateSiteLabelsUnique(sites); err != nil {
+		return denyResponse(err.Error())
+	}
 
 	if err := validateNodeCIDRsNoOverlap(sites); err != nil {
 		return denyResponse(err.Error())
@@ -779,6 +784,25 @@ func mergeSiteList(existing []unboundednetv1alpha1.Site, site unboundednetv1alph
 	}
 
 	return merged
+}
+
+func validateSiteLabelsUnique(sites []unboundednetv1alpha1.Site) error {
+	seen := make(map[string]string, len(sites))
+
+	for _, site := range sites {
+		label := strings.TrimSpace(site.Labels[unboundedv1alpha3.MachineSiteLabelKey])
+		if label == "" {
+			continue
+		}
+
+		if existingSite, ok := seen[label]; ok && existingSite != site.Name {
+			return fmt.Errorf("metadata.labels[%q]=%q must be unique across Sites; already used by Site %q", unboundedv1alpha3.MachineSiteLabelKey, label, existingSite)
+		}
+
+		seen[label] = site.Name
+	}
+
+	return nil
 }
 
 func denyResponse(message string) *admissionv1.AdmissionResponse {
