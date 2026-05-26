@@ -24,6 +24,7 @@ twox-hash = { version = "1.6", default-features = false }
 clap = { version = "4", features = ["derive"] }
 rand = "0.8"
 rand_chacha = "0.3"
+toml = "0.8"
 
 [build-dependencies]
 cc = "1"
@@ -35,4 +36,5 @@ io-uring = "0.6"
 
 [dev-dependencies]
 proptest = "1"
+tempfile = "3"
 
