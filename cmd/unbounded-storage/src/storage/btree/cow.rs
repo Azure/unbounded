@@ -385,15 +385,25 @@ impl<'a, B: BlockDevice> PathCopyCtx<'a, B> {
                     self.retired_pages.push(node_lba);
                     self.recurse_internal(keys, children, ops).await
                 }
-                Decoded::Empty => {
-                    // Treat an empty page along the spine as an
-                    // empty leaf - retire it and build new
-                    // leaves from `ops` alone.
-                    self.retired_pages.push(node_lba);
-                    let merged = merge_leaf(Vec::new(), &ops);
-                    self.write_leaves(&merged).await
-                }
-                Decoded::Meta { .. } => Err(Error::Corrupt),
+                // Empty here means the page failed to decode:
+                // checksum mismatch, unknown page type, or a
+                // structurally invalid leaf/internal page. The
+                // encoder never produces a `PAGE_TYPE_EMPTY` page
+                // (an "empty tree" is encoded as a leaf with zero
+                // entries via `encode_empty_leaf`), so an Empty
+                // result during a path-copy descent is always a
+                // corruption signal. Treating it as a freshly
+                // empty subtree (the previous behavior) silently
+                // dropped every key reachable through this node
+                // from the new tree while the engine's LRU and
+                // reverse map kept pointing at their data LBAs,
+                // breaking the resident-vs-btree invariant in
+                // `tests/storage/tests.rs`. Surface it as a
+                // corrupt-tree error so the commit aborts and
+                // the writer cleans up its allocated LBA; a
+                // retry will see the (uncorrupted) page on a
+                // fresh read.
+                Decoded::Empty | Decoded::Meta { .. } => Err(Error::Corrupt),
             }
         })
     }
