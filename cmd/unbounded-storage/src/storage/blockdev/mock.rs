@@ -57,6 +57,12 @@ const fn libc_eio() -> i32 {
     5
 }
 
+/// `EINVAL`. Hardcoded for the same reason as [`libc_eio`]: the
+/// mock keeps libc out of non-Linux builds.
+const fn libc_einval() -> i32 {
+    22
+}
+
 pub struct MockDevice {
     cfg: Cell<MockDeviceConfig>,
     storage: RefCell<Vec<u8>>,
@@ -152,13 +158,14 @@ impl BlockDevice for MockDevice {
     async fn read(&self, lba: Lba, dst: &mut [u8]) -> Result<(), Error> {
         self.read_count.set(self.read_count.get() + 1);
         let cfg = self.cfg.get();
-        if dst.is_empty() {
-            return Err(Error::OutOfRange);
+        // Match `UringBlockDevice::read`: reject empty buffers and
+        // any length that is not a whole multiple of `page_size`.
+        // The two implementations are interchangeable behind the
+        // `BlockDevice` trait, so their input contracts must agree.
+        if dst.is_empty() || dst.len() % cfg.page_size != 0 {
+            return Err(Error::Io(libc_einval()));
         }
-        // Span `ceil(dst.len() / page_size)` LBAs. The mock allows
-        // a trailing partial page so DST workloads can exercise
-        // byte-sized writes alongside full-page ones.
-        let n_pages = dst.len().div_ceil(cfg.page_size) as u64;
+        let n_pages = (dst.len() / cfg.page_size) as u64;
         if lba.0.checked_add(n_pages).is_none_or(|end| end > cfg.capacity_pages) {
             return Err(Error::OutOfRange);
         }
@@ -177,10 +184,11 @@ impl BlockDevice for MockDevice {
     async fn write(&self, lba: Lba, src: &[u8]) -> Result<(), Error> {
         self.write_count.set(self.write_count.get() + 1);
         let cfg = self.cfg.get();
-        if src.is_empty() {
-            return Err(Error::OutOfRange);
+        // See [`Self::read`] for the rationale; same contract.
+        if src.is_empty() || src.len() % cfg.page_size != 0 {
+            return Err(Error::Io(libc_einval()));
         }
-        let n_pages = src.len().div_ceil(cfg.page_size) as u64;
+        let n_pages = (src.len() / cfg.page_size) as u64;
         if lba.0.checked_add(n_pages).is_none_or(|end| end > cfg.capacity_pages) {
             return Err(Error::OutOfRange);
         }

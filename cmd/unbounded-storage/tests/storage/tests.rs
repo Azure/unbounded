@@ -635,7 +635,6 @@ fn smoke() {
         ],
         restart_after: false,
         num_disks: 1,
-        short_page_byte_len: None,
     };
     let report: RunReport = run_workload(0xC0FFEE, w).expect("smoke run");
     // At least one of the two reads should hit; admission filter
@@ -714,7 +713,6 @@ fn smoke_concurrent_reads_overlap() {
         clients,
         restart_after: false,
         num_disks: 1,
-        short_page_byte_len: None,
     };
     let report = run_workload(0xDEADBEEF, w).expect("smoke run");
     let peak = report
