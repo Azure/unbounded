@@ -301,8 +301,15 @@ impl<B: BlockDevice> StorageEngine<B> {
     fn n_pages(&self, byte_len: u32) -> u64 {
         // byte_len is the size of the cached page in bytes; each
         // contiguous run is `byte_len / btree_page_bytes` device
-        // pages long. Insert paths construct entries this way so
-        // the division is exact.
+        // pages long. `write_page_from` rejects any write whose
+        // length is not a positive multiple of `btree_page_bytes`,
+        // so every `LeafEntry.byte_len` reaching this helper
+        // divides exactly.
+        debug_assert!(
+            byte_len as usize % self.cfg.btree_page_bytes == 0 && byte_len > 0,
+            "LeafEntry.byte_len ({byte_len}) must be a positive multiple of btree_page_bytes ({})",
+            self.cfg.btree_page_bytes,
+        );
         (byte_len as usize / self.cfg.btree_page_bytes) as u64
     }
 
@@ -572,12 +579,25 @@ impl<B: BlockDevice> StorageEngine<B> {
         // SAFETY: caller-provided contract on `src`.
         let src_buf: &[u8] = unsafe { &*src };
 
-        // The write spans `ceil(src.len() / btree_page_bytes)`
-        // consecutive LBAs. For full-page user writes (the
-        // production case) this divides exactly; partial-page
-        // writes used by DST workloads round up to one LBA.
-        let n_pages = src_buf.len().div_ceil(self.cfg.btree_page_bytes) as u64;
-        debug_assert!(n_pages > 0, "write_page_from called with empty src");
+        // The engine only accepts writes whose length is a
+        // positive multiple of `btree_page_bytes`. This keeps
+        // alloc, on-disk layout, and retire bookkeeping in lockstep
+        // (alloc and retire both compute the run length as
+        // `byte_len / btree_page_bytes` with no rounding). Callers
+        // that need partial-page semantics must pad the source
+        // buffer up to a full btree page before calling.
+        if src_buf.is_empty() || src_buf.len() % self.cfg.btree_page_bytes != 0 {
+            debug_assert!(
+                false,
+                "write_page_from requires src.len() ({}) to be a positive multiple of btree_page_bytes ({})",
+                src_buf.len(),
+                self.cfg.btree_page_bytes,
+            );
+            leader.abandon();
+            return Err(bufferpool::Error::Io(libc::EINVAL));
+        }
+
+        let n_pages = (src_buf.len() / self.cfg.btree_page_bytes) as u64;
         let lba = match self.allocator.alloc_contig(n_pages) {
             Ok(l) => l,
             Err(_) => {

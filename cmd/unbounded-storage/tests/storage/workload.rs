@@ -210,21 +210,12 @@ pub fn workload_strategy() -> impl Strategy<Value = Workload> {
         2 => 33u64..=64,
         1 => Just(128u64),
     ];
-    // Bias heavily toward `None` (full-page only) so the existing
-    // sweep is not disturbed; when enabled, pick a non-trivial
-    // short length in (0, page_size). 1, page_size-1, and a couple
-    // of midrange anchors cover the boundaries plus the typical
-    // case.
-    let short_page_byte_len = prop_oneof![
-        9 => Just(None),
-        1 => prop_oneof![
-            Just(Some(1u32)),
-            Just(Some(7u32)),
-            Just(Some(100u32)),
-            Just(Some(2048u32)),
-            Just(Some(4095u32)),
-        ],
-    ];
+    // The engine now requires every write length to be a positive
+    // multiple of `btree_page_bytes` (see `write_page_from`), so
+    // the DST sweep only generates full-page writes. The field is
+    // retained on `Workload` so hand-rolled regression cases still
+    // compile, but the strategy always picks `None`.
+    let short_page_byte_len = Just(None);
     (
         max_io_delay,
         io_fault_rate,
