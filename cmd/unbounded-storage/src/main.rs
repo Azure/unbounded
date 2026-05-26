@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,22 +15,16 @@ use serde::{Deserialize, Serialize};
 use unbounded_storage::bufferpool::{
     NullBlockStore, PeerId, Pool, PoolConfig, PoolGroup, Req, ShardDescriptor, StripeKey,
 };
-use unbounded_storage::fabric::{self, Fabric, FabricTransport, Provider, StaticPeer};
+use unbounded_storage::config::{self, Config, FabricCfg};
+use unbounded_storage::disk_supervisor::{DiskRegistry, LiveDiskTopology, UringDiskTarget};
+use unbounded_storage::fabric::{self, ConnectionSpec, Fabric, FabricTransport, Provider, StaticPeer};
 use unbounded_storage::runtime::{PinnedRuntime, Threading, WorkerIdx, WorkerSpec};
-use unbounded_storage::topology::{self, Host, Plan, Role, Worker};
+use unbounded_storage::topology::{Host, Plan, Role, Worker};
 
 use unbounded_storage::backing::{BackingKind, BackingRequest, HUGEPAGE_2MB, allocate};
 
-const MAX_INFLIGHT: usize = 1024;
+const DEFAULT_CONFIG_PATH: &str = "/etc/unbounded-storage/config.toml";
 const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
-
-/// Per-shard buffer-pool sizing. The page size is fixed at 2 MiB
-/// to match the hugepage allocator; the byte budget per shard is
-/// configurable via `--bytes-per-shard` (default 128 MiB == 64
-/// hugepages). The allocator rounds the requested size up to a
-/// whole number of pages, so non-multiples of 2 MiB are tolerated
-/// but discouraged.
-const DEFAULT_BYTES_PER_SHARD: usize = 128 * 1024 * 1024;
 
 /// Process-wide shutdown flag. Set by the signal handler (which
 /// is restricted to async-signal-safe operations) and polled by
@@ -68,8 +64,33 @@ fn main() -> ExitCode {
         }
     };
 
-    let host = Host::discover();
-    let plan = Plan::for_host(&host, &topology::PlanConfig::default());
+    let mut config = match load_config(&cli.config_path, cli.config_explicit) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("config error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // CLI overrides config for back-compat.
+    if let Some(b) = cli.bytes_per_shard_override {
+        config.storage.bytes_per_shard =
+            unbounded_storage::config::schema::ByteSize(b);
+    }
+    if cli.no_hugepages {
+        config.storage.backing_kind = config::BackingKindCfg::Heap;
+    }
+    let backing_kind = config::backing_kind_from_cfg(config.storage.backing_kind);
+    let bytes_per_shard_total = config.storage.bytes_per_shard.bytes();
+
+    let mut host = Host::discover();
+    if !config.disks.is_empty() {
+        eprintln!(
+            "config: authoritative disk list ({} entries) overrides discovered nvmes",
+            config.disks.len()
+        );
+        host.nvmes = config::disk_specs_to_nvmes(&config.disks);
+    }
+    let plan = Plan::for_host(&host, &config::topology_cfg_to_plan_config(&config.topology));
 
     let counts = RoleCounts::from_plan(&plan);
     eprintln!(
@@ -101,7 +122,8 @@ fn main() -> ExitCode {
     // `ShardDescriptor` on this channel. The main thread aggregates
     // descriptors into a `PoolGroup` once every shard has reported.
     let (ready_tx, ready_rx) = mpsc::channel::<ShardReady>();
-    let bytes_per_shard = cli.bytes_per_shard / progress.len();
+    let bytes_per_shard = bytes_per_shard_total / progress.len();
+    let fabric_cfg = Arc::new(config.fabric.clone());
     let mut joins = Vec::with_capacity(progress.len());
     for (i, worker) in progress.iter().enumerate() {
         let widx = WorkerIdx(u16::try_from(i).expect("worker index fits in u16"));
@@ -114,7 +136,7 @@ fn main() -> ExitCode {
         let worker = worker.clone();
         let runtime = runtime.clone();
         let tx = ready_tx.clone();
-        let backing_kind = cli.backing_kind;
+        let fabric_cfg = fabric_cfg.clone();
         joins.push(
             thread::Builder::new()
                 .name(format!("ub-storage-shard-{i}"))
@@ -131,6 +153,7 @@ fn main() -> ExitCode {
                                 tx,
                                 backing_kind,
                                 bytes_per_shard,
+                                fabric_cfg,
                             );
                         }),
                     );
@@ -145,16 +168,76 @@ fn main() -> ExitCode {
     // produces a coherent error path rather than a half-built
     // `PoolGroup`.
     let mut descriptors: Vec<ShardDescriptor> = Vec::with_capacity(joins.len());
+    let mut shard_fabrics: Vec<(WorkerIdx, Arc<Fabric>)> = Vec::with_capacity(joins.len());
     let mut errors: Vec<String> = Vec::new();
     for msg in ready_rx {
         match msg {
-            ShardReady::Up(d) => descriptors.push(d),
+            ShardReady::Up { descriptor, fabric } => {
+                shard_fabrics.push((descriptor.worker_idx, fabric));
+                descriptors.push(descriptor);
+            }
             ShardReady::Failed(err) => {
                 eprintln!("shard failed: {err}");
                 errors.push(err);
                 SHUTDOWN.store(true, Ordering::Relaxed);
             }
         }
+    }
+
+    let mut shard_state: Vec<(WorkerIdx, Arc<Fabric>, HashMap<PeerId, ConnectionSpec>)> =
+        Vec::with_capacity(shard_fabrics.len());
+    if errors.is_empty() {
+        let mut total_added = 0usize;
+        let mut total_failures = 0usize;
+        for (widx, fabric) in &shard_fabrics {
+            let report = config::reconcile_peers(fabric, &config.peers, None);
+            total_added += report.added;
+            total_failures += report.failures.len();
+            for (peer_id, msg) in &report.failures {
+                eprintln!(
+                    "shard {}: peer {} failed to apply: {msg}",
+                    widx.0, peer_id.0
+                );
+            }
+            shard_state.push((*widx, fabric.clone(), report.applied));
+        }
+        if !config.peers.is_empty() {
+            eprintln!(
+                "config: peers applied across shards: applied={total_added} failures={total_failures}"
+            );
+        }
+    }
+
+    // Disk supervisor: open `[[disks]]` entries (progress threads
+    // only, no data-path wiring yet). The CPU hint list comes from
+    // the topology plan's NVMe placements so opens are pinned near
+    // the shard that will eventually consume them.
+    let nvme_cpus: Vec<usize> = plan.nvme().map(|w| w.cpu as usize).collect();
+    let mut disk_registry = DiskRegistry::new(UringDiskTarget, nvme_cpus);
+    // Hot-swap publication surface for shards. Engines are *not*
+    // opened from this thread: `UringBlockDevice` is `!Send` and
+    // can only be wrapped in a `StorageEngine` on its own progress
+    // thread. Until the disk supervisor grows that per-thread open
+    // path, `topology` stays empty in production and shards fall
+    // back to `NullBlockStore` for the data path. The plumbing
+    // below exercises the generation/swap surface and per-shard
+    // backing replay so the wiring is in place when engines start
+    // being published.
+    let topology: Arc<LiveDiskTopology<
+        unbounded_storage::storage::blockdev::UringBlockDevice,
+    >> = LiveDiskTopology::new();
+    if errors.is_empty() {
+        let report = disk_registry.reconcile(&config.disks);
+        eprintln!(
+            "config: disks: added={} removed={} failures={}",
+            report.added,
+            report.removed,
+            report.failures.len(),
+        );
+        for (path, msg) in &report.failures {
+            eprintln!("disk {}: open failed: {msg}", path.display());
+        }
+        topology.apply_engines(Vec::new());
     }
 
     // Build the process-wide `PoolGroup` over the successful
@@ -176,9 +259,31 @@ fn main() -> ExitCode {
         eprintln!("pool group up: shards={}", shard_count);
     }
 
-    // Wait for shutdown
-    wait_for_shutdown();
+    // Wait for shutdown, listening for config updates if the
+    // watcher installs cleanly. Reconciling the updates back into
+    // running subsystems is intentionally deferred to a later phase;
+    // for now main only logs receipt.
+    match config::ConfigWatcher::new(cli.config_path.clone()) {
+        Ok((_watcher, update_rx)) => {
+            wait_for_shutdown_with_updates(
+                update_rx,
+                &mut shard_state,
+                &mut disk_registry,
+                topology.clone(),
+            );
+        }
+        Err(e) => {
+            eprintln!("config watch: not installed: {e}");
+            wait_for_shutdown();
+        }
+    }
     eprintln!("shutdown signaled; tearing down shards");
+
+    // Close opened disks (joining their progress threads) before
+    // shard threads exit so all background workers tear down in a
+    // deterministic order.
+    disk_registry.drain();
+    drop(topology);
 
     // (reverse order so the last-built shard tears down first)
     for h in joins.into_iter().rev() {
@@ -208,6 +313,7 @@ fn run_shard(
     tx: mpsc::Sender<ShardReady>,
     backing_kind: BackingKind,
     bytes_per_shard: usize,
+    fabric_cfg: Arc<FabricCfg>,
 ) {
     // Default to the loopback device when no HCA is bound to this
     // shard; the `tcp` provider is the fallback path.
@@ -219,8 +325,10 @@ fn run_shard(
     let mut cfg = fabric::defaults_for(device_name, runtime, widx);
     cfg.provider = provider;
     cfg.listen = true;
-    cfg.listen_addr = Some("0.0.0.0:0".into());
-    cfg.max_inflight = MAX_INFLIGHT;
+    cfg.listen_addr = Some(fabric_cfg.listen_addr.clone());
+    cfg.max_inflight = fabric_cfg.max_inflight;
+    cfg.progress_threads = fabric_cfg.progress_threads;
+    cfg.progress_poll_us = fabric_cfg.progress_poll_us;
     cfg.numa = worker.numa;
 
     let fabric = match Fabric::new(cfg).and_then(|f| f.self_address().map(|a| (f, a))) {
@@ -308,10 +416,13 @@ fn run_shard(
         }
     };
 
-    let _ = tx.send(ShardReady::Up(ShardDescriptor {
-        worker_idx: widx,
-        numa: worker.numa,
-    }));
+    let _ = tx.send(ShardReady::Up {
+        descriptor: ShardDescriptor {
+            worker_idx: widx,
+            numa: worker.numa,
+        },
+        fabric: fabric.clone(),
+    });
 
     wait_for_shutdown();
 
@@ -339,7 +450,10 @@ fn stripe_key_to_shard(key: &StripeKey, shard_count: usize) -> usize {
 /// Status a shard thread reports once it has either come up or
 /// failed during bring-up.
 enum ShardReady {
-    Up(ShardDescriptor),
+    Up {
+        descriptor: ShardDescriptor,
+        fabric: Arc<Fabric>,
+    },
     Failed(String),
 }
 
@@ -367,10 +481,12 @@ impl RoleCounts {
 }
 
 /// Parsed command-line options for one run of the daemon.
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 struct Cli {
-    backing_kind: BackingKind,
-    bytes_per_shard: usize,
+    config_path: PathBuf,
+    config_explicit: bool,
+    no_hugepages: bool,
+    bytes_per_shard_override: Option<usize>,
 }
 
 enum CliAction {
@@ -380,33 +496,68 @@ enum CliAction {
 
 impl Cli {
     fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<CliAction, String> {
-        let mut backing_kind = BackingKind::Hugepage2Mb;
-        let mut bytes_per_shard = DEFAULT_BYTES_PER_SHARD;
+        let mut config_path = PathBuf::from(DEFAULT_CONFIG_PATH);
+        let mut config_explicit = false;
+        let mut no_hugepages = false;
+        let mut bytes_per_shard_override: Option<usize> = None;
         let mut it = args.into_iter();
         while let Some(arg) = it.next() {
             match arg.as_str() {
                 "-h" | "--help" => return Ok(CliAction::Help),
-                "--no-hugepages" => backing_kind = BackingKind::Heap,
+                "--no-hugepages" => no_hugepages = true,
+                s if s.starts_with("--config=") => {
+                    config_path = PathBuf::from(&s["--config=".len()..]);
+                    config_explicit = true;
+                }
+                "--config" => {
+                    let v = it
+                        .next()
+                        .ok_or_else(|| "--config requires a value".to_string())?;
+                    config_path = PathBuf::from(v);
+                    config_explicit = true;
+                }
                 s if s.starts_with("--bytes-per-shard=") => {
                     let v = &s["--bytes-per-shard=".len()..];
-                    bytes_per_shard = parse_bytes(v)?;
+                    bytes_per_shard_override = Some(parse_bytes(v)?);
                 }
                 "--bytes-per-shard" => {
                     let v = it
                         .next()
                         .ok_or_else(|| "--bytes-per-shard requires a value".to_string())?;
-                    bytes_per_shard = parse_bytes(&v)?;
+                    bytes_per_shard_override = Some(parse_bytes(&v)?);
                 }
                 other => return Err(format!("unknown argument: {other}")),
             }
         }
-        if bytes_per_shard == 0 {
+        if let Some(0) = bytes_per_shard_override {
             return Err("--bytes-per-shard must be > 0".into());
         }
         Ok(CliAction::Run(Cli {
-            backing_kind,
-            bytes_per_shard,
+            config_path,
+            config_explicit,
+            no_hugepages,
+            bytes_per_shard_override,
         }))
+    }
+}
+
+/// Load the daemon configuration. When the default path is used and
+/// the file is absent, fall back to [`Config::default`] with a
+/// warning. Any other failure - including explicit missing paths and
+/// parse errors - is fatal.
+fn load_config(path: &Path, explicit: bool) -> Result<Config, String> {
+    match Config::load(path) {
+        Ok(c) => Ok(c),
+        Err(config::ConfigError::Io(e))
+            if !explicit && e.kind() == std::io::ErrorKind::NotFound =>
+        {
+            eprintln!(
+                "config: {} not found; continuing with built-in defaults",
+                path.display()
+            );
+            Ok(Config::default())
+        }
+        Err(e) => Err(format!("loading {}: {e}", path.display())),
     }
 }
 
@@ -431,26 +582,104 @@ fn parse_bytes(s: &str) -> Result<usize, String> {
 }
 
 fn print_help() {
-    let default_mib = DEFAULT_BYTES_PER_SHARD / (1024 * 1024);
     let hp_mib = HUGEPAGE_2MB / (1024 * 1024);
     eprintln!("Usage: unbounded-storage [OPTIONS]");
     eprintln!();
     eprintln!("Options:");
-    eprintln!("  --no-hugepages              Allocate the per-shard backing with the");
-    eprintln!("                              global allocator instead of {hp_mib} MiB");
-    eprintln!("                              hugepages. The default requires reserved");
-    eprintln!("                              hugepages on the host; there is no");
-    eprintln!("                              automatic fallback.");
-    eprintln!("  --bytes-per-shard=<BYTES>   Per-shard buffer pool size. Accepts a");
-    eprintln!("                              K/M/G suffix (powers of 1024). Rounded");
-    eprintln!("                              up to a multiple of the {hp_mib} MiB page");
-    eprintln!("                              size. Default: {default_mib} MiB.");
+    eprintln!("  --config=<PATH>             Path to the TOML config file.");
+    eprintln!("                              Default: {DEFAULT_CONFIG_PATH}.");
+    eprintln!("                              If the default path is missing the daemon");
+    eprintln!("                              continues with built-in defaults; an");
+    eprintln!("                              explicit path that is missing or invalid");
+    eprintln!("                              is fatal.");
+    eprintln!("  --no-hugepages              Override [storage] backing_kind to heap.");
+    eprintln!("                              Without this flag (and without an override");
+    eprintln!("                              in the config), the per-shard backing is");
+    eprintln!("                              allocated from {hp_mib} MiB hugepages.");
+    eprintln!("  --bytes-per-shard=<BYTES>   Override [storage] bytes_per_shard. Accepts");
+    eprintln!("                              a K/M/G suffix (powers of 1024).");
     eprintln!("  -h, --help                  Print this help and exit.");
 }
 
 fn wait_for_shutdown() {
     while !SHUTDOWN.load(Ordering::Acquire) {
         thread::sleep(SHUTDOWN_POLL);
+    }
+}
+
+/// Same as [`wait_for_shutdown`] but also drains `ConfigUpdate`
+/// events. Each update is reconciled against every shard's fabric;
+/// the per-shard `last_applied` cache in `shard_state` lets us detect
+/// address/numa drift for an existing peer id as a remove+add.
+fn wait_for_shutdown_with_updates(
+    update_rx: mpsc::Receiver<config::ConfigUpdate>,
+    shard_state: &mut [(WorkerIdx, Arc<Fabric>, HashMap<PeerId, ConnectionSpec>)],
+    disk_registry: &mut DiskRegistry<UringDiskTarget>,
+    topology: Arc<LiveDiskTopology<unbounded_storage::storage::blockdev::UringBlockDevice>>,
+) {
+    while !SHUTDOWN.load(Ordering::Acquire) {
+        match update_rx.recv_timeout(SHUTDOWN_POLL) {
+            Ok(update) => {
+                let mut added = 0usize;
+                let mut removed = 0usize;
+                let mut updated = 0usize;
+                let mut failures = 0usize;
+                let mut first_failure: Option<String> = None;
+                for (widx, fabric, last_applied) in shard_state.iter_mut() {
+                    let report = config::reconcile_peers(
+                        fabric,
+                        &update.config.peers,
+                        Some(last_applied),
+                    );
+                    added += report.added;
+                    removed += report.removed;
+                    updated += report.updated;
+                    failures += report.failures.len();
+                    for (peer_id, msg) in &report.failures {
+                        if first_failure.is_none() {
+                            first_failure = Some(format!(
+                                "shard {} peer {} {}",
+                                widx.0, peer_id.0, msg
+                            ));
+                        }
+                    }
+                    *last_applied = report.applied;
+                }
+                let shards = shard_state.len();
+                match first_failure {
+                    Some(msg) => eprintln!(
+                        "config gen={} peers: shards={shards} added={added} removed={removed} updated={updated} failures={failures} first_failure={msg}",
+                        update.generation,
+                    ),
+                    None => eprintln!(
+                        "config gen={} peers: shards={shards} added={added} removed={removed} updated={updated} failures={failures}",
+                        update.generation,
+                    ),
+                }
+                let disk_report = disk_registry.reconcile(&update.config.disks);
+                eprintln!(
+                    "config gen={} disks: added={} removed={} failures={}",
+                    update.generation,
+                    disk_report.added,
+                    disk_report.removed,
+                    disk_report.failures.len(),
+                );
+                for (path, msg) in &disk_report.failures {
+                    eprintln!(
+                        "config gen={} disk {}: open failed: {msg}",
+                        update.generation,
+                        path.display(),
+                    );
+                }
+                // Republish a fresh `LocalStorage` snapshot on
+                // every config update so any shard view caches its
+                // new generation. Engines remain unpublished until
+                // the per-thread open path lands.
+                topology.apply_engines(Vec::new());
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
     }
 }
 
@@ -497,32 +726,55 @@ mod tests {
     #[test]
     fn defaults_to_hugepages() {
         let c = parse(&[]).unwrap();
-        assert!(matches!(c.backing_kind, BackingKind::Hugepage2Mb));
-        assert_eq!(c.bytes_per_shard, DEFAULT_BYTES_PER_SHARD);
+        assert!(!c.no_hugepages);
+        assert_eq!(c.bytes_per_shard_override, None);
+        assert_eq!(c.config_path, PathBuf::from(DEFAULT_CONFIG_PATH));
+        assert!(!c.config_explicit);
     }
 
     #[test]
     fn no_hugepages_selects_heap() {
         let c = parse(&["--no-hugepages"]).unwrap();
-        assert!(matches!(c.backing_kind, BackingKind::Heap));
+        assert!(c.no_hugepages);
     }
 
     #[test]
     fn bytes_per_shard_equals_form() {
         let c = parse(&["--bytes-per-shard=64M"]).unwrap();
-        assert_eq!(c.bytes_per_shard, 64 * 1024 * 1024);
+        assert_eq!(c.bytes_per_shard_override, Some(64 * 1024 * 1024));
     }
 
     #[test]
     fn bytes_per_shard_space_form() {
         let c = parse(&["--bytes-per-shard", "2G"]).unwrap();
-        assert_eq!(c.bytes_per_shard, 2 * 1024 * 1024 * 1024);
+        assert_eq!(c.bytes_per_shard_override, Some(2 * 1024 * 1024 * 1024));
     }
 
     #[test]
     fn bytes_plain_integer_is_bytes() {
         let c = parse(&["--bytes-per-shard=4194304"]).unwrap();
-        assert_eq!(c.bytes_per_shard, 4 * 1024 * 1024);
+        assert_eq!(c.bytes_per_shard_override, Some(4 * 1024 * 1024));
+    }
+
+    #[test]
+    fn config_path_default_when_absent() {
+        let c = parse(&[]).unwrap();
+        assert_eq!(c.config_path, PathBuf::from(DEFAULT_CONFIG_PATH));
+        assert!(!c.config_explicit);
+    }
+
+    #[test]
+    fn config_path_explicit_equals_form() {
+        let c = parse(&["--config=/tmp/foo.toml"]).unwrap();
+        assert_eq!(c.config_path, PathBuf::from("/tmp/foo.toml"));
+        assert!(c.config_explicit);
+    }
+
+    #[test]
+    fn config_path_explicit_space_form() {
+        let c = parse(&["--config", "/tmp/foo.toml"]).unwrap();
+        assert_eq!(c.config_path, PathBuf::from("/tmp/foo.toml"));
+        assert!(c.config_explicit);
     }
 
     #[test]
