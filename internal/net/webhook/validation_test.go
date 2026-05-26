@@ -22,6 +22,7 @@ import (
 	"k8s.io/apimachinery/pkg/watch"
 	kubefake "k8s.io/client-go/kubernetes/fake"
 
+	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 )
 
@@ -612,6 +613,80 @@ func TestValidateSiteCreateAndDelete(t *testing.T) {
 	})
 	if !resp.Allowed {
 		t.Fatalf("expected site delete to be allowed (finalizer protects), got %#v", resp.Result)
+	}
+}
+
+// TestValidateSiteRejectsDuplicateMachineSiteLabel tests duplicate Machine site labels are rejected across Sites.
+func TestValidateSiteRejectsDuplicateMachineSiteLabel(t *testing.T) {
+	validator := &Validator{
+		clientset: kubefake.NewClientset(),
+		siteClient: &fakeSiteClient{items: []unboundednetv1alpha1.Site{{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   "remote",
+				Labels: map[string]string{unboundedv1alpha3.MachineSiteLabelKey: "remote"},
+			},
+			Spec: unboundednetv1alpha1.SiteSpec{NodeCidrs: []string{"10.1.0.0/16"}},
+		}}},
+	}
+
+	site := unboundednetv1alpha1.Site{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "remote-copy",
+			Labels: map[string]string{unboundedv1alpha3.MachineSiteLabelKey: "remote"},
+		},
+		Spec: unboundednetv1alpha1.SiteSpec{NodeCidrs: []string{"10.2.0.0/16"}},
+	}
+
+	raw, err := json.Marshal(site)
+	if err != nil {
+		t.Fatalf("marshal site: %v", err)
+	}
+
+	resp := validator.validateSite(context.Background(), &admissionv1.AdmissionRequest{
+		Operation: admissionv1.Create,
+		Object:    runtime.RawExtension{Raw: raw},
+	})
+	if resp.Allowed {
+		t.Fatalf("expected duplicate site label to be rejected")
+	}
+
+	if resp.Result == nil || !strings.Contains(resp.Result.Message, "must be unique across Sites") {
+		t.Fatalf("expected uniqueness error, got %#v", resp.Result)
+	}
+}
+
+// TestValidateSiteAllowsUpdateWithSameMachineSiteLabel tests a Site may keep its own Machine site label.
+func TestValidateSiteAllowsUpdateWithSameMachineSiteLabel(t *testing.T) {
+	validator := &Validator{
+		clientset: kubefake.NewClientset(),
+		siteClient: &fakeSiteClient{items: []unboundednetv1alpha1.Site{{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   "remote",
+				Labels: map[string]string{unboundedv1alpha3.MachineSiteLabelKey: "remote"},
+			},
+			Spec: unboundednetv1alpha1.SiteSpec{NodeCidrs: []string{"10.1.0.0/16"}},
+		}}},
+	}
+
+	site := unboundednetv1alpha1.Site{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "remote",
+			Labels: map[string]string{unboundedv1alpha3.MachineSiteLabelKey: "remote"},
+		},
+		Spec: unboundednetv1alpha1.SiteSpec{NodeCidrs: []string{"10.1.0.0/16"}},
+	}
+
+	raw, err := json.Marshal(site)
+	if err != nil {
+		t.Fatalf("marshal site: %v", err)
+	}
+
+	resp := validator.validateSite(context.Background(), &admissionv1.AdmissionRequest{
+		Operation: admissionv1.Update,
+		Object:    runtime.RawExtension{Raw: raw},
+	})
+	if !resp.Allowed {
+		t.Fatalf("expected update preserving site label to be allowed, got %#v", resp.Result)
 	}
 }
 
