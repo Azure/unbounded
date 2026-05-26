@@ -75,15 +75,6 @@ pub struct Workload {
     /// Distinct page offsets within each stripe.
     pub offset_count: u8,
     pub clients: Vec<ClientSpec>,
-    /// Optional shorter byte length for selected grid cells. When
-    /// `Some(n)`, a deterministic subset of `(key, offset)` slots
-    /// stores `n` bytes instead of a full `page_size` payload, so
-    /// the engine writes a short trailing-page value through
-    /// `PageRef.len < page_size`. Exercises `LeafEntry.byte_len`
-    /// round-trip and the page checksum's coverage of the variable
-    /// tail. `None` keeps every slot at full `page_size`, which is
-    /// the legacy behavior.
-    pub short_page_byte_len: Option<u32>,
     /// If true, after the main workload completes, drop the engines
     /// and reopen one engine per surviving sim device, then
     /// read-replay every `(key, offset)` in the grid. Verifies the
@@ -128,40 +119,17 @@ impl Workload {
     }
 
     /// Deterministic byte pattern for `(key_idx, off_idx, seed)`.
-    /// Length matches `self.byte_len(key_idx, off_idx)` so the
-    /// payload and the engine's recorded `LeafEntry.byte_len` agree
-    /// on a per-slot basis.
+    /// Length is always `page_size`: the engine requires every
+    /// write to be a positive multiple of `btree_page_bytes`, so
+    /// the workload only generates full-page payloads.
     pub fn payload(&self, key_idx: u8, off_idx: u8, seed: u8) -> Vec<u8> {
-        let len = self.byte_len(key_idx, off_idx);
+        let len = self.page_size;
         let mut out = vec![0u8; len];
         let mix = key_idx.wrapping_mul(31) ^ off_idx.wrapping_mul(17) ^ seed;
         for (i, b) in out.iter_mut().enumerate() {
             *b = (i as u8).wrapping_add(mix);
         }
         out
-    }
-
-    /// Logical byte length stored at `(key_idx, off_idx)`. Returns
-    /// `page_size` for every slot when `short_page_byte_len` is
-    /// `None`. Otherwise a deterministic subset of slots returns
-    /// the configured short length; the subset is a pure function
-    /// of the normalized `(key_idx, off_idx)` pair so writes and
-    /// reads against the same slot always agree on length.
-    pub fn byte_len(&self, key_idx: u8, off_idx: u8) -> usize {
-        match self.short_page_byte_len {
-            Some(n) if self.slot_is_short(key_idx, off_idx) => n as usize,
-            _ => self.page_size,
-        }
-    }
-
-    fn slot_is_short(&self, key_idx: u8, off_idx: u8) -> bool {
-        let k = key_idx % self.key_count.max(1);
-        let o = off_idx % self.offset_count.max(1);
-        // Roughly one in three slots is short. The mix uses two
-        // small primes so adjacent (key, offset) pairs do not all
-        // share the same fate, but the function stays trivially
-        // reproducible.
-        (k as u16 * 3 + o as u16 * 5) % 3 == 0
     }
 }
 
@@ -210,21 +178,6 @@ pub fn workload_strategy() -> impl Strategy<Value = Workload> {
         2 => 33u64..=64,
         1 => Just(128u64),
     ];
-    // Bias heavily toward `None` (full-page only) so the existing
-    // sweep is not disturbed; when enabled, pick a non-trivial
-    // short length in (0, page_size). 1, page_size-1, and a couple
-    // of midrange anchors cover the boundaries plus the typical
-    // case.
-    let short_page_byte_len = prop_oneof![
-        9 => Just(None),
-        1 => prop_oneof![
-            Just(Some(1u32)),
-            Just(Some(7u32)),
-            Just(Some(100u32)),
-            Just(Some(2048u32)),
-            Just(Some(4095u32)),
-        ],
-    ];
     (
         max_io_delay,
         io_fault_rate,
@@ -235,7 +188,6 @@ pub fn workload_strategy() -> impl Strategy<Value = Workload> {
         restart_after,
         num_disks,
         device_pages,
-        short_page_byte_len,
     )
         .prop_map(
             |(
@@ -248,7 +200,6 @@ pub fn workload_strategy() -> impl Strategy<Value = Workload> {
                 restart_after,
                 num_disks,
                 device_pages,
-                short_page_byte_len,
             )| {
                 Workload {
                     page_size: 4096,
@@ -261,7 +212,6 @@ pub fn workload_strategy() -> impl Strategy<Value = Workload> {
                     clients,
                     restart_after,
                     num_disks,
-                    short_page_byte_len,
                 }
             },
         )
@@ -749,7 +699,7 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
                     Op::Read { key_idx, off_idx } => {
                         let key = w.key(*key_idx);
                         let offset = w.offset(*off_idx);
-                        let byte_len = w.byte_len(*key_idx, *off_idx);
+                        let byte_len = w.page_size;
                         // Zero the destination slot so a partial /
                         // skipped fill is visible to the oracle
                         // check.
@@ -911,7 +861,7 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
                 for oi in 0..w2.offset_count.max(1) {
                     let key = w2.key(ki);
                     let offset = w2.offset(oi);
-                    let byte_len = w2.byte_len(ki, oi);
+                    let byte_len = w2.page_size;
                     // SAFETY: every read uses a unique pool
                     // slot; the modulus keeps us inside
                     // `pool_pages` even when grid >= pool size.

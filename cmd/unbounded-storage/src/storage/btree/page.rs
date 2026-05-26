@@ -27,7 +27,7 @@
 //!   Each entry's `key` is the smallest [`PageKey`] reachable through
 //!   `child_lba`; `nentries` keys map to `nentries` children. A search
 //!   for `q` descends into the rightmost entry with `key <= q`.
-//! - **meta** (one entry, 16 bytes): `[ root_lba:8 | reserved:8 ]`.
+//! - **meta** (one entry, 16 bytes): `[ root_lba:8 | hwm:8 ]`.
 //!
 //! Internal entries store, in their `key` slot, the *smallest* key
 //! reachable through their child.
@@ -91,6 +91,7 @@ pub enum Decoded {
     Meta {
         txn_id: u64,
         root_lba: Lba,
+        hwm: u64,
     },
 }
 
@@ -212,7 +213,18 @@ fn decode_meta(page: &[u8], txn_id: u64) -> Decoded {
     let root_lba = Lba(u64::from_le_bytes(
         page[HEADER_LEN..HEADER_LEN + 8].try_into().unwrap(),
     ));
-    Decoded::Meta { txn_id, root_lba }
+    // Pages predating the hwm field leave the trailing 8 bytes as
+    // zero, which is the correct legacy value for hwm.
+    let hwm = if page.len() >= HEADER_LEN + 16 {
+        u64::from_le_bytes(page[HEADER_LEN + 8..HEADER_LEN + 16].try_into().unwrap())
+    } else {
+        0
+    };
+    Decoded::Meta {
+        txn_id,
+        root_lba,
+        hwm,
+    }
 }
 
 /// Build a leaf page. Returns `OutOfSpace` if `entries` doesn't fit.
@@ -267,12 +279,13 @@ pub fn encode_internal(
     Ok(page)
 }
 
-pub fn encode_meta(page_size: usize, txn_id: u64, root_lba: Lba) -> Vec<u8> {
+pub fn encode_meta(page_size: usize, txn_id: u64, root_lba: Lba, hwm: u64) -> Vec<u8> {
     let mut page = vec![0u8; page_size];
     page[0] = PAGE_TYPE_META;
     page[2..4].copy_from_slice(&1u16.to_le_bytes());
     page[8..16].copy_from_slice(&txn_id.to_le_bytes());
     page[HEADER_LEN..HEADER_LEN + 8].copy_from_slice(&root_lba.0.to_le_bytes());
+    page[HEADER_LEN + 8..HEADER_LEN + 16].copy_from_slice(&hwm.to_le_bytes());
     seal_checksum(&mut page);
     page
 }
@@ -351,19 +364,37 @@ mod tests {
 
     #[test]
     fn meta_roundtrip() {
-        let p = encode_meta(4096, 99, Lba(12345));
+        let p = encode_meta(4096, 99, Lba(12345), 7777);
         match decode(&p) {
-            Decoded::Meta { txn_id, root_lba } => {
+            Decoded::Meta {
+                txn_id,
+                root_lba,
+                hwm,
+            } => {
                 assert_eq!(txn_id, 99);
                 assert_eq!(root_lba, Lba(12345));
+                assert_eq!(hwm, 7777);
             }
             other => panic!("expected meta, got {other:?}"),
         }
     }
 
     #[test]
+    fn meta_legacy_zero_hwm() {
+        // Documents the legacy-format compatibility behavior: a
+        // meta page written with hwm = 0 decodes back as hwm = 0,
+        // matching what an old encoder that left the trailing
+        // reserved bytes zeroed would produce.
+        let p = encode_meta(4096, 1, Lba(42), 0);
+        match decode(&p) {
+            Decoded::Meta { hwm, .. } => assert_eq!(hwm, 0),
+            other => panic!("expected meta, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn checksum_mismatch_decodes_as_empty() {
-        let p = encode_meta(4096, 1, Lba(1));
+        let p = encode_meta(4096, 1, Lba(1), 0);
         let mut bad = p.clone();
         bad[HEADER_LEN] ^= 0x01; // flip a byte in the body
         assert!(matches!(decode(&bad), Decoded::Empty));
@@ -371,7 +402,7 @@ mod tests {
 
     #[test]
     fn unknown_page_type_is_empty() {
-        let mut p = encode_meta(4096, 1, Lba(1));
+        let mut p = encode_meta(4096, 1, Lba(1), 0);
         p[0] = 99;
         // reseal so checksum is valid but type is unknown
         seal_checksum(&mut p);

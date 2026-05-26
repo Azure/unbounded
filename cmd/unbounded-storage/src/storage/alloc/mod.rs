@@ -38,6 +38,11 @@ struct Inner {
     /// Count of bits currently set; cheap to maintain and lets
     /// `is_full` / `used_pages` answer without scanning.
     used: u64,
+    /// Maximum LBA value ever recorded as in-use through this
+    /// allocator instance. Monotonic non-decreasing: `free` does
+    /// not lower it. Btree recovery uses this to bound its
+    /// rebuild-fallback scan.
+    max_ever: u64,
 }
 
 impl Allocator {
@@ -48,6 +53,7 @@ impl Allocator {
                 words: vec![0u64; n_words],
                 next: 0,
                 used: 0,
+                max_ever: 0,
             }),
             capacity: capacity_pages,
         }
@@ -82,6 +88,61 @@ impl Allocator {
             return Ok(Lba(lba));
         }
         Err(Error::OutOfSpace)
+    }
+
+    /// Reserve `n` contiguous LBAs. Returns the start LBA. A bump-
+    /// style scan from the current hint suffices because the
+    /// engine writes user pages as soon as it allocates them, so
+    /// the high-water region stays mostly contiguous: scanning is
+    /// O(`n`) (the requested run length) per allocation on a fresh
+    /// disk, with worst case O(`capacity`) under fragmentation when
+    /// the hint region is exhausted and the wrap-around scan walks
+    /// the full bitmap.
+    pub fn alloc_contig(&self, n: u64) -> Result<Lba, Error> {
+        if n == 0 {
+            return Err(Error::OutOfRange);
+        }
+        if n == 1 {
+            return self.alloc();
+        }
+        let mut g = self.inner.lock().unwrap();
+        if g.used + n > self.capacity {
+            return Err(Error::OutOfSpace);
+        }
+        let start = g.next;
+        if let Some(lba) = scan_run(&mut g, start, self.capacity, n) {
+            return Ok(Lba(lba));
+        }
+        if let Some(lba) = scan_run(&mut g, 0, start, n) {
+            return Ok(Lba(lba));
+        }
+        Err(Error::OutOfSpace)
+    }
+
+    /// Mark a run of `n` LBAs starting at `start` free. Equivalent
+    /// to calling `free` for each LBA in the run but holds the
+    /// mutex once and skips the per-LBA debug_assert; callers
+    /// guarantee the run was previously allocated as a single
+    /// [`Self::alloc_contig`] call.
+    pub fn free_range(&self, start: Lba, n: u64) -> Result<(), Error> {
+        if n == 0 {
+            return Ok(());
+        }
+        let end = start.0.checked_add(n).ok_or(Error::OutOfRange)?;
+        if end > self.capacity {
+            return Err(Error::OutOfRange);
+        }
+        let mut g = self.inner.lock().unwrap();
+        for lba in start.0..end {
+            let (w, b) = word_bit(lba);
+            let mask = 1u64 << b;
+            if g.words[w] & mask != 0 {
+                g.words[w] &= !mask;
+                g.used -= 1;
+            }
+        }
+        g.next = start.0;
+        Ok(())
     }
 
     /// Mark `lba` free. Returns `OutOfRange` if `lba` is past the
@@ -124,6 +185,34 @@ impl Allocator {
             g.words[w] |= mask;
             g.used += 1;
         }
+        g.max_ever = g.max_ever.max(lba.0);
+        Ok(())
+    }
+
+    /// Mark a run of `n` LBAs starting at `start` in-use.
+    /// Mirror of [`Self::free_range`]; takes the lock once and
+    /// is idempotent per-bit. Used during btree recovery to
+    /// replay a contiguous data-page run referenced by a leaf
+    /// entry into the bitmap so subsequent allocations cannot
+    /// hand out any LBA in the run.
+    pub fn mark_range_in_use(&self, start: Lba, n: u64) -> Result<(), Error> {
+        if n == 0 {
+            return Ok(());
+        }
+        let end = start.0.checked_add(n).ok_or(Error::OutOfRange)?;
+        if end > self.capacity {
+            return Err(Error::OutOfRange);
+        }
+        let mut g = self.inner.lock().unwrap();
+        for lba in start.0..end {
+            let (w, b) = word_bit(lba);
+            let mask = 1u64 << b;
+            if g.words[w] & mask == 0 {
+                g.words[w] |= mask;
+                g.used += 1;
+            }
+        }
+        g.max_ever = g.max_ever.max(end - 1);
         Ok(())
     }
 
@@ -135,10 +224,67 @@ impl Allocator {
         let g = self.inner.lock().unwrap();
         Ok(g.words[w] & (1u64 << b) != 0)
     }
+
+    /// Largest LBA that has ever been recorded as in-use through this
+    /// allocator instance. Monotonic non-decreasing across the lifetime
+    /// of the allocator: freeing an LBA does not lower this value. Used
+    /// by btree recovery to bound the rebuild-fallback scan to the region
+    /// of the disk that has actually been touched.
+    pub fn high_water(&self) -> u64 {
+        self.inner.lock().unwrap().max_ever
+    }
+
+    /// Raise the high-water mark to at least `hwm`. Never lowers it.
+    /// Called by recovery to seed the in-memory HWM from a persisted
+    /// value before any new allocations occur.
+    pub fn observe_high_water(&self, hwm: u64) {
+        let mut g = self.inner.lock().unwrap();
+        g.max_ever = g.max_ever.max(hwm);
+    }
 }
 
 fn word_bit(lba: u64) -> (usize, u32) {
     ((lba / 64) as usize, (lba % 64) as u32)
+}
+
+/// Find a run of `n` consecutive zero bits in `[start, end)` and
+/// set them all in one pass. Returns the run's starting LBA.
+/// The caller must hold the allocator mutex and have verified
+/// `used + n <= capacity`.
+fn scan_run(inner: &mut Inner, start: u64, end: u64, n: u64) -> Option<u64> {
+    if start >= end || end - start < n {
+        return None;
+    }
+    let mut lba = start;
+    while lba + n <= end {
+        if word_get(&inner.words, lba) {
+            lba += 1;
+            continue;
+        }
+        // `lba` is free; greedily extend the run.
+        let mut k = 1u64;
+        while k < n && !word_get(&inner.words, lba + k) {
+            k += 1;
+        }
+        if k == n {
+            for i in 0..n {
+                let (w, b) = word_bit(lba + i);
+                inner.words[w] |= 1u64 << b;
+            }
+            inner.used += n;
+            inner.next = lba + n;
+            inner.max_ever = inner.max_ever.max(lba + n - 1);
+            return Some(lba);
+        }
+        // Hit a used bit at `lba + k`; resume past it.
+        lba += k + 1;
+    }
+    None
+}
+
+fn word_get(words: &[u64], lba: u64) -> bool {
+    let (w, b) = word_bit(lba);
+    words[w] & (1u64 << b) != 0
 }
 
 /// Scans `[start, end)` looking for the first cleared bit. Returns
@@ -154,11 +300,7 @@ fn scan_from(inner: &mut Inner, start: u64, end: u64) -> Option<u64> {
     while w <= last_word {
         let word = inner.words[w];
         if word != u64::MAX {
-            // At least one zero bit in this word; find the lowest
-            // free bit that's also within [start, end).
             let inverted = !word;
-            // `trailing_zeros` finds the lowest set bit; mask off
-            // anything before `lba`'s bit-offset within the word.
             let bit_offset = if (lba / 64) as usize == w {
                 lba % 64
             } else {
@@ -172,6 +314,7 @@ fn scan_from(inner: &mut Inner, start: u64, end: u64) -> Option<u64> {
                     inner.words[w] |= 1u64 << b;
                     inner.used += 1;
                     inner.next = candidate + 1;
+                    inner.max_ever = inner.max_ever.max(candidate);
                     return Some(candidate);
                 }
             }

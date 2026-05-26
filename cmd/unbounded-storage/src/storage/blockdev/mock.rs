@@ -57,13 +57,22 @@ const fn libc_eio() -> i32 {
     5
 }
 
+/// `EINVAL`. Hardcoded for the same reason as [`libc_eio`]: the
+/// mock keeps libc out of non-Linux builds.
+const fn libc_einval() -> i32 {
+    22
+}
+
 pub struct MockDevice {
     cfg: Cell<MockDeviceConfig>,
     storage: RefCell<Vec<u8>>,
     read_count: Cell<u64>,
     write_count: Cell<u64>,
-    registered_base: Cell<Option<*mut u8>>,
-    registered_len: Cell<usize>,
+    /// Every region passed to [`Self::register_buffers`]. The
+    /// real device demands the I/O pointer lies inside one of
+    /// these; the mock accepts any pointer but records the
+    /// registrations so tests can assert on them.
+    registered: RefCell<Vec<(*mut u8, usize)>>,
 }
 
 impl MockDevice {
@@ -74,8 +83,7 @@ impl MockDevice {
             storage: RefCell::new(vec![0u8; bytes]),
             read_count: Cell::new(0),
             write_count: Cell::new(0),
-            registered_base: Cell::new(None),
-            registered_len: Cell::new(0),
+            registered: RefCell::new(Vec::new()),
         }
     }
 
@@ -93,12 +101,20 @@ impl MockDevice {
         self.write_count.get()
     }
 
+    /// Base of the first registered region, if any. Test-only
+    /// shorthand; the device tracks every registration.
     pub fn registered_base(&self) -> Option<*mut u8> {
-        self.registered_base.get()
+        self.registered.borrow().first().map(|(b, _)| *b)
     }
 
+    /// Total bytes across every registered region.
     pub fn registered_len(&self) -> usize {
-        self.registered_len.get()
+        self.registered.borrow().iter().map(|(_, l)| *l).sum()
+    }
+
+    /// Number of distinct buffer regions currently registered.
+    pub fn registered_count(&self) -> usize {
+        self.registered.borrow().len()
     }
 
     /// Direct backdoor for tests: read raw bytes without going
@@ -131,8 +147,7 @@ impl BlockDevice for MockDevice {
     }
 
     fn register_buffers(&self, base: *mut u8, len: usize) -> Result<(), Error> {
-        self.registered_base.set(Some(base));
-        self.registered_len.set(len);
+        self.registered.borrow_mut().push((base, len));
         Ok(())
     }
 
@@ -143,10 +158,15 @@ impl BlockDevice for MockDevice {
     async fn read(&self, lba: Lba, dst: &mut [u8]) -> Result<(), Error> {
         self.read_count.set(self.read_count.get() + 1);
         let cfg = self.cfg.get();
-        if lba.0 >= cfg.capacity_pages {
-            return Err(Error::OutOfRange);
+        // Match `UringBlockDevice::read`: reject empty buffers and
+        // any length that is not a whole multiple of `page_size`.
+        // The two implementations are interchangeable behind the
+        // `BlockDevice` trait, so their input contracts must agree.
+        if dst.is_empty() || dst.len() % cfg.page_size != 0 {
+            return Err(Error::Io(libc_einval()));
         }
-        if dst.len() > cfg.page_size {
+        let n_pages = (dst.len() / cfg.page_size) as u64;
+        if lba.0.checked_add(n_pages).is_none_or(|end| end > cfg.capacity_pages) {
             return Err(Error::OutOfRange);
         }
         if matches!(cfg.fault_mode, MockFaultMode::ReadIo) {
@@ -164,10 +184,12 @@ impl BlockDevice for MockDevice {
     async fn write(&self, lba: Lba, src: &[u8]) -> Result<(), Error> {
         self.write_count.set(self.write_count.get() + 1);
         let cfg = self.cfg.get();
-        if lba.0 >= cfg.capacity_pages {
-            return Err(Error::OutOfRange);
+        // See [`Self::read`] for the rationale; same contract.
+        if src.is_empty() || src.len() % cfg.page_size != 0 {
+            return Err(Error::Io(libc_einval()));
         }
-        if src.len() > cfg.page_size {
+        let n_pages = (src.len() / cfg.page_size) as u64;
+        if lba.0.checked_add(n_pages).is_none_or(|end| end > cfg.capacity_pages) {
             return Err(Error::OutOfRange);
         }
         if matches!(cfg.fault_mode, MockFaultMode::WriteIo) {
