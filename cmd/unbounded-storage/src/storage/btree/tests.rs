@@ -499,3 +499,202 @@ fn reopen_marks_full_data_run_in_use() {
         next.0, run_start.0, run_end,
     );
 }
+
+#[test]
+fn apply_batch_empty_is_noop() {
+    // Empty mutation lists must not bump the txn counter, change
+    // the published root, or allocate new pages: a no-op commit
+    // would otherwise burn LBAs and meta-slot writes on every
+    // empty flush the engine schedules.
+    let (dev, alloc) = fresh(64);
+    let idx = block_on(open_btree(dev, alloc.clone())).unwrap();
+    let txn_before = idx.current_txn();
+    let root_before = idx.current_root();
+    let used_before = alloc.used_pages();
+    block_on(idx.apply_batch(Vec::new())).unwrap();
+    assert_eq!(idx.current_txn(), txn_before, "empty batch bumped txn");
+    assert_eq!(idx.current_root(), root_before, "empty batch rotated root");
+    assert_eq!(
+        alloc.used_pages(),
+        used_before,
+        "empty batch allocated pages",
+    );
+}
+
+#[test]
+fn many_commits_to_small_keyset_bounds_allocator_growth() {
+    // Path-copy CoW must reuse untouched subtrees: rewriting the
+    // same handful of keys over and over should retire each
+    // commit's spine and free it on the next snapshot drop. A
+    // regression to bulk-rewrite (or a broken pending-free queue)
+    // would let `used_pages` grow with commit count.
+    let (dev, alloc) = fresh(256);
+    let idx = block_on(open_btree(dev, alloc.clone())).unwrap();
+    // Seed a small tree.
+    let seed: Vec<_> = (0..8u32)
+        .map(|i| Mutation::Insert {
+            key: key(i),
+            value: entry(i as u64),
+        })
+        .collect();
+    block_on(idx.apply_batch(seed)).unwrap();
+    let used_after_seed = alloc.used_pages();
+    // Many commits, each touching one key. Each commit retires
+    // the previous spine; on the next commit the published
+    // snapshot drops and its retired pages free.
+    for round in 0..50u32 {
+        block_on(idx.apply_batch(vec![Mutation::Insert {
+            key: key(round % 8),
+            value: entry((round as u64) + 1000),
+        }]))
+        .unwrap();
+    }
+    let used_after_many = alloc.used_pages();
+    // Allow modest slack (one in-flight spine plus pending
+    // bundles for the currently-published snapshot) but not
+    // linear growth with the 50 commits above.
+    assert!(
+        used_after_many <= used_after_seed + 8,
+        "allocator grew without bound across commits: \
+         after_seed={used_after_seed}, after_many={used_after_many}",
+    );
+    // And the data must still be correct.
+    for i in 0..8u32 {
+        assert!(
+            block_on(idx.lookup(&key(i))).unwrap().is_some(),
+            "key {i} missing after path-copy rewrites",
+        );
+    }
+}
+
+#[test]
+fn outstanding_snapshot_pins_retired_pages_until_drop() {
+    // Generation-tracked deferred free: a `Guard` taken on
+    // snapshot N must keep N's pages reachable. Commits made
+    // while the guard is held must not free anything N can still
+    // see; dropping the guard must release them.
+    let (dev, alloc) = fresh(256);
+    let idx = block_on(open_btree(dev, alloc.clone())).unwrap();
+    block_on(idx.apply_batch(
+        (0..16u32)
+            .map(|i| Mutation::Insert {
+                key: key(i),
+                value: entry(i as u64),
+            })
+            .collect(),
+    ))
+    .unwrap();
+    // Pin the current snapshot. We intentionally hold the `Arc`
+    // (which is what `arc_swap::Guard::into_inner` would also
+    // yield) so the pre-commit pages cannot be freed until we
+    // drop it.
+    let pinned = idx.root.load_full();
+    let pinned_txn = pinned.txn_id;
+    let used_pinned = alloc.used_pages();
+    // Several commits while the snapshot is pinned. Pages they
+    // retire belong to `pinned_txn` and must stay live.
+    for round in 0..10u32 {
+        block_on(idx.apply_batch(vec![Mutation::Insert {
+            key: key(round % 16),
+            value: entry((round as u64) + 500),
+        }]))
+        .unwrap();
+    }
+    // Pinned snapshot must still be in the alive set: a commit
+    // path that forgot to insert before publishing would let an
+    // intermediate Drop compute a min_alive past `pinned_txn`.
+    assert!(
+        idx.alive.borrow().alive.contains(&pinned_txn),
+        "pinned txn {pinned_txn} dropped out of alive set",
+    );
+    let used_while_pinned = alloc.used_pages();
+    assert!(
+        used_while_pinned >= used_pinned,
+        "allocator shrank while a snapshot was pinned",
+    );
+    // Drop the pin: every retired bundle whose retire_t fell
+    // before `min_alive` should now flush.
+    drop(pinned);
+    let used_after_drop = alloc.used_pages();
+    assert!(
+        used_after_drop < used_while_pinned,
+        "dropping pinned snapshot freed nothing: while_pinned={used_while_pinned}, \
+         after_drop={used_after_drop}",
+    );
+    // And the pending queue must drain past the dropped txn.
+    let pending_min = idx.pending.borrow().by_retire_t.keys().next().copied();
+    assert!(
+        pending_min.map(|t| t > pinned_txn).unwrap_or(true),
+        "pending queue still holds bundles retired at/before pinned txn {pinned_txn}: \
+         next pending retire_t = {pending_min:?}",
+    );
+}
+
+#[test]
+fn overwrites_and_deletes_path_copy_consistent() {
+    // Mixed overwrite / delete batches drive every arm of
+    // `merge_leaf` and the internal-node recursion in
+    // `apply_path_copy`. Walk through several commits and assert
+    // both the in-memory mirror and a fresh lookup agree.
+    let (dev, alloc) = fresh(256);
+    let idx = block_on(open_btree(dev, alloc)).unwrap();
+    // Seed 32 keys spanning multiple leaves.
+    block_on(idx.apply_batch(
+        (0..32u32)
+            .map(|i| Mutation::Insert {
+                key: key(i),
+                value: entry(i as u64),
+            })
+            .collect(),
+    ))
+    .unwrap();
+    // Overwrite every even key, delete every key divisible by 5.
+    let mut muts: Vec<Mutation> = Vec::new();
+    for i in 0..32u32 {
+        if i % 5 == 0 {
+            muts.push(Mutation::Delete { key: key(i) });
+        } else if i % 2 == 0 {
+            muts.push(Mutation::Insert {
+                key: key(i),
+                value: entry((i as u64) + 10_000),
+            });
+        }
+    }
+    block_on(idx.apply_batch(muts)).unwrap();
+    for i in 0..32u32 {
+        let got = block_on(idx.lookup(&key(i))).unwrap();
+        if i % 5 == 0 {
+            assert!(got.is_none(), "key {i} should be deleted, got {got:?}");
+        } else if i % 2 == 0 {
+            assert_eq!(
+                got,
+                Some(entry((i as u64) + 10_000)),
+                "even key {i} should be overwritten",
+            );
+        } else {
+            assert_eq!(
+                got,
+                Some(entry(i as u64)),
+                "odd key {i} should be untouched",
+            );
+        }
+    }
+    // One more pass: reinsert the deleted keys with fresh values
+    // so the path-copy code rebuilds previously-collapsed
+    // subtrees.
+    let muts: Vec<Mutation> = (0..32u32)
+        .filter(|i| i % 5 == 0)
+        .map(|i| Mutation::Insert {
+            key: key(i),
+            value: entry((i as u64) + 99_000),
+        })
+        .collect();
+    block_on(idx.apply_batch(muts)).unwrap();
+    for i in (0..32u32).step_by(5) {
+        assert_eq!(
+            block_on(idx.lookup(&key(i))).unwrap(),
+            Some(entry((i as u64) + 99_000)),
+            "key {i} reinsert lost",
+        );
+    }
+}

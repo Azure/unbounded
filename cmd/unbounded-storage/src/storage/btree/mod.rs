@@ -18,21 +18,30 @@
 //!
 //! ## Commit protocol
 //!
-//! For each [`apply_batch`] call:
+//! For each [`BTreeIndex::apply_batch`] call:
 //!
-//! 1. Apply the mutations to the in-memory `BTreeMap`.
-//! 2. Bulk-write a fresh tree under freshly-allocated LBAs.
+//! 1. Coalesce the mutation list into a sorted `(key, op)`
+//!    vector and update the in-memory mirror.
+//! 2. [`cow::apply_path_copy`] rewrites only the spine pages on
+//!    the touched paths and shares every untouched subtree with
+//!    the previous root. The result reports both the freshly
+//!    allocated pages (owned by the new snapshot) and the
+//!    retired pages (owned by some earlier snapshot up until
+//!    this commit).
 //! 3. Write the new meta page into the *inactive* slot.
-//! 4. `ArcSwap::store` the new [`RootSnapshot`], which causes
-//!    the old snapshot to be freed once the last in-flight
-//!    lookup releases its [`arc_swap::Guard`]. The old
-//!    snapshot's [`Drop`] hands every LBA back to the allocator.
+//! 4. Record the retired pages and this txn as alive, then
+//!    [`arc_swap::ArcSwap::store`] the new [`RootSnapshot`].
+//!    Once the previous snapshot's last [`arc_swap::Guard`]
+//!    drops, its `Drop` impl recomputes the
+//!    minimum-still-alive txn and frees every retired-page
+//!    bundle that no live snapshot can still need.
 //!
 //! If step 2 or 3 fails the new pages are unwound back to the
-//! allocator and the old snapshot remains the source of truth.
+//! allocator and the old snapshot remains the source of truth;
+//! the retired-page accounting is not touched in that case.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -61,22 +70,34 @@ pub enum Mutation {
 }
 
 /// Immutable view of one transaction id's tree. Snapshots are
-/// shared via `ArcSwap`; their `Drop` returns the LBAs they own
-/// (everything reachable from `root_lba`, minus meta slots) to
-/// the allocator.
+/// shared via `ArcSwap`. The on-disk pages a snapshot reaches
+/// are *not* listed here: every page is either still reachable
+/// from some later snapshot (in which case it stays live) or it
+/// was retired by a later commit (in which case that commit
+/// recorded it in [`PendingFree`] under its own `txn_id`). The
+/// snapshot's `Drop` simply removes itself from the alive set
+/// and flushes any retired bundles that are now safe to free.
 pub struct RootSnapshot {
     pub root_lba: Lba,
     pub txn_id: u64,
-    pages: Vec<Lba>,
+    tracker: Rc<RefCell<AliveTracker>>,
+    pending: Rc<RefCell<PendingFree>>,
     allocator: Arc<Allocator>,
 }
 
 impl RootSnapshot {
-    fn new(root_lba: Lba, txn_id: u64, pages: Vec<Lba>, allocator: Arc<Allocator>) -> Arc<Self> {
+    fn new(
+        root_lba: Lba,
+        txn_id: u64,
+        tracker: Rc<RefCell<AliveTracker>>,
+        pending: Rc<RefCell<PendingFree>>,
+        allocator: Arc<Allocator>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             root_lba,
             txn_id,
-            pages,
+            tracker,
+            pending,
             allocator,
         })
     }
@@ -84,7 +105,74 @@ impl RootSnapshot {
 
 impl Drop for RootSnapshot {
     fn drop(&mut self) {
-        cow::free_all(&self.allocator, &self.pages);
+        // Pull our txn out of the alive set and recompute the
+        // minimum-still-alive txn. Any retired-page bundle whose
+        // retire_t <= new_min is now safe to free: every snapshot
+        // that could possibly have referenced those pages has
+        // been dropped.
+        let new_min = {
+            let mut tracker = self.tracker.borrow_mut();
+            tracker.alive.remove(&self.txn_id);
+            tracker.min_alive()
+        };
+        self.pending
+            .borrow_mut()
+            .flush_up_to(new_min, &self.allocator);
+    }
+}
+
+/// Set of `txn_id`s for which a [`RootSnapshot`] is still alive
+/// (held either by `ArcSwap` or by at least one outstanding
+/// `Guard`). A txn is added in [`BTreeIndex::apply_batch`]
+/// immediately before publishing the new snapshot and removed in
+/// [`RootSnapshot::drop`] when the last reference goes away.
+#[derive(Default)]
+struct AliveTracker {
+    alive: BTreeSet<u64>,
+}
+
+impl AliveTracker {
+    fn min_alive(&self) -> u64 {
+        // `u64::MAX` is the "no live snapshots" sentinel: every
+        // pending bundle is then safe to flush. Real `txn_id`s
+        // start at 1 and never reach `u64::MAX` in practice.
+        self.alive.iter().next().copied().unwrap_or(u64::MAX)
+    }
+}
+
+/// Deferred-free queue keyed by the `txn_id` of the commit that
+/// retired the pages. Bundles are inserted by
+/// [`BTreeIndex::apply_batch`] and drained by
+/// [`RootSnapshot::drop`] once
+/// [`AliveTracker::min_alive`] advances past `retire_t`.
+#[derive(Default)]
+struct PendingFree {
+    by_retire_t: BTreeMap<u64, Vec<Lba>>,
+}
+
+impl PendingFree {
+    fn push(&mut self, retire_t: u64, pages: Vec<Lba>) {
+        if pages.is_empty() {
+            return;
+        }
+        self.by_retire_t.entry(retire_t).or_default().extend(pages);
+    }
+
+    fn flush_up_to(&mut self, min_alive: u64, allocator: &Allocator) {
+        // Free every bundle whose retire_t is no longer
+        // reachable by any live snapshot. `min_alive == u64::MAX`
+        // (no live snapshots) collapses to "free everything".
+        loop {
+            let next = match self.by_retire_t.keys().next().copied() {
+                Some(t) => t,
+                None => return,
+            };
+            if next > min_alive {
+                return;
+            }
+            let pages = self.by_retire_t.remove(&next).unwrap_or_default();
+            cow::free_all(allocator, &pages);
+        }
     }
 }
 
@@ -100,6 +188,8 @@ pub struct BTreeIndex<B: BlockDevice> {
     root: ArcSwap<RootSnapshot>,
     mutator: RefCell<MutatorState>,
     active_meta: Cell<meta::MetaSlot>,
+    alive: Rc<RefCell<AliveTracker>>,
+    pending: Rc<RefCell<PendingFree>>,
 }
 
 impl<B: BlockDevice> BTreeIndex<B> {
@@ -182,9 +272,16 @@ impl<B: BlockDevice> BTreeIndex<B> {
         btree_page_bytes: usize,
         state: meta::MetaState,
     ) -> Result<Option<Self>, Error> {
+        // `collect_pages` doubles as the "is the recovered root
+        // structurally readable?" check: an empty list means
+        // every page failed to read and we should fall through to
+        // the LBA-scan rebuild path. We also use it to mark every
+        // structural page in-use so the allocator bitmap matches
+        // disk; we deliberately don't carry the list onto the
+        // snapshot - retired pages are tracked per-commit via
+        // path-copy, not per-snapshot.
         let pages = cow::collect_pages(&**device, scratch, state.root_lba).await?;
         if pages.is_empty() {
-            // Root was unreadable / corrupt.
             return Ok(None);
         }
         for &lba in &pages {
@@ -208,7 +305,17 @@ impl<B: BlockDevice> BTreeIndex<B> {
         })
         .await?;
 
-        let snapshot = RootSnapshot::new(state.root_lba, state.txn_id, pages, allocator.clone());
+        let alive = Rc::new(RefCell::new(AliveTracker::default()));
+        let pending = Rc::new(RefCell::new(PendingFree::default()));
+        alive.borrow_mut().alive.insert(state.txn_id);
+
+        let snapshot = RootSnapshot::new(
+            state.root_lba,
+            state.txn_id,
+            alive.clone(),
+            pending.clone(),
+            allocator.clone(),
+        );
 
         Ok(Some(Self {
             device: device.clone(),
@@ -220,6 +327,8 @@ impl<B: BlockDevice> BTreeIndex<B> {
                 next_txn_id: state.txn_id + 1,
             }),
             active_meta: Cell::new(state.active),
+            alive,
+            pending,
         }))
     }
 
@@ -244,7 +353,10 @@ impl<B: BlockDevice> BTreeIndex<B> {
         }
 
         let sorted: Vec<(PageKey, LeafEntry)> = entries.iter().map(|(k, v)| (*k, *v)).collect();
-        let (root_lba, pages) =
+        // Bulk-load the initial tree. The returned LBA list is not
+        // tracked on the snapshot; those pages stay live until a
+        // future path-copy commit retires them.
+        let (root_lba, _bootstrap_pages) =
             cow::build_tree(&*device, &scratch, &allocator, txn_id, &sorted).await?;
 
         // Write meta into slot A by default (active=B means we
@@ -259,7 +371,17 @@ impl<B: BlockDevice> BTreeIndex<B> {
         )
         .await?;
 
-        let snapshot = RootSnapshot::new(root_lba, txn_id, pages, allocator.clone());
+        let alive = Rc::new(RefCell::new(AliveTracker::default()));
+        let pending = Rc::new(RefCell::new(PendingFree::default()));
+        alive.borrow_mut().alive.insert(txn_id);
+
+        let snapshot = RootSnapshot::new(
+            root_lba,
+            txn_id,
+            alive.clone(),
+            pending.clone(),
+            allocator.clone(),
+        );
 
         Ok(Self {
             device,
@@ -271,6 +393,8 @@ impl<B: BlockDevice> BTreeIndex<B> {
                 next_txn_id: txn_id + 1,
             }),
             active_meta: Cell::new(active),
+            alive,
+            pending,
         })
     }
 
@@ -284,63 +408,106 @@ impl<B: BlockDevice> BTreeIndex<B> {
     /// Apply a batch of mutations atomically. Must be called by
     /// at most one task at a time (the engine's mutator).
     pub async fn apply_batch(&self, mutations: Vec<Mutation>) -> Result<(), Error> {
-        // Build the next-state map without touching the live
-        // mirror yet. If build_tree or the meta-page write fails
-        // we leave the in-memory state exactly as it was so the
-        // caller's recovery (freeing the new data LBA, etc.)
-        // matches what is on disk.
-        let (sorted, txn_id, next_entries) = {
+        // Coalesce the input mutations into a sorted (key, op)
+        // list with at most one entry per key, while also building
+        // the next-state mirror. We don't touch the live mirror
+        // yet: if path-copy or the meta-page write fails we leave
+        // the in-memory state exactly as it was so the caller's
+        // recovery (freeing the new data LBA, etc.) matches what
+        // is on disk.
+        let (sorted_ops, txn_id, next_entries) = {
             let state = self.mutator.borrow();
             let mut next = state.entries.clone();
+            let mut ops: BTreeMap<PageKey, Option<LeafEntry>> = BTreeMap::new();
             for m in mutations {
                 match m {
                     Mutation::Insert { key, value } => {
+                        ops.insert(key, Some(value));
                         next.insert(key, value);
                     }
                     Mutation::Delete { key } => {
+                        ops.insert(key, None);
                         next.remove(&key);
                     }
                 }
             }
-            let sorted: Vec<(PageKey, LeafEntry)> = next.iter().map(|(k, v)| (*k, *v)).collect();
-            let txn_id = state.next_txn_id;
-            (sorted, txn_id, next)
+            let sorted_ops: Vec<(PageKey, Option<LeafEntry>)> = ops.into_iter().collect();
+            (sorted_ops, state.next_txn_id, next)
         };
 
-        let (root_lba, pages) =
-            cow::build_tree(&*self.device, &self.scratch, &self.allocator, txn_id, &sorted)
-                .await?;
+        if sorted_ops.is_empty() {
+            // No-op commit: skip the path-copy, meta write, and
+            // snapshot publish. The current state remains durable
+            // at the previously published txn.
+            return Ok(());
+        }
+
+        let parent_root = self.root.load().root_lba;
+        let result = cow::apply_path_copy(
+            &*self.device,
+            &self.scratch,
+            &self.allocator,
+            parent_root,
+            txn_id,
+            sorted_ops,
+        )
+        .await?;
 
         let active = self.active_meta.get();
-        // build_tree above has already marked the new pages in
-        // use, so high_water() reflects them.
+        // apply_path_copy above has already marked the new pages
+        // in use, so high_water() reflects them.
         let new_active = match meta::write_inactive(
             &*self.device,
             &self.scratch,
             active,
             txn_id,
-            root_lba,
+            result.new_root,
             self.allocator.high_water(),
         )
         .await
         {
             Ok(s) => s,
             Err(e) => {
-                cow::free_all(&self.allocator, &pages);
+                // Roll back the path-copy: free every newly
+                // allocated page. Retired pages stay live because
+                // the still-published parent snapshot still
+                // reaches them.
+                cow::free_all(&self.allocator, &result.new_pages);
                 return Err(e);
             }
         };
 
         // Commit point: from here on, in-memory mirror, txn
-        // counter, active meta slot, and the published snapshot
-        // all advance together.
+        // counter, active meta slot, retired-page accounting, and
+        // the published snapshot all advance together.
         {
             let mut state = self.mutator.borrow_mut();
             state.entries = next_entries;
             state.next_txn_id = txn_id + 1;
         }
-        let snapshot = RootSnapshot::new(root_lba, txn_id, pages, self.allocator.clone());
         self.active_meta.set(new_active);
+
+        // Queue the retired pages under this commit's `txn_id`.
+        // They become safe to free once every snapshot with
+        // `txn < txn_id` has been dropped - see
+        // [`RootSnapshot::drop`].
+        self.pending
+            .borrow_mut()
+            .push(txn_id, result.retired_pages);
+        // Register this txn as alive *before* publishing the new
+        // snapshot. If we published first, an immediate Drop of
+        // the previous snapshot could observe an alive set that
+        // doesn't yet include `txn_id`, compute the wrong
+        // `min_alive`, and free pages we still need.
+        self.alive.borrow_mut().alive.insert(txn_id);
+
+        let snapshot = RootSnapshot::new(
+            result.new_root,
+            txn_id,
+            self.alive.clone(),
+            self.pending.clone(),
+            self.allocator.clone(),
+        );
         self.root.store(snapshot);
         Ok(())
     }
