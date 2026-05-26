@@ -187,6 +187,33 @@ impl Allocator {
         Ok(())
     }
 
+    /// Mark a run of `n` LBAs starting at `start` in-use.
+    /// Mirror of [`Self::free_range`]; takes the lock once and
+    /// is idempotent per-bit. Used during btree recovery to
+    /// replay a contiguous data-page run referenced by a leaf
+    /// entry into the bitmap so subsequent allocations cannot
+    /// hand out any LBA in the run.
+    pub fn mark_range_in_use(&self, start: Lba, n: u64) -> Result<(), Error> {
+        if n == 0 {
+            return Ok(());
+        }
+        let end = start.0.checked_add(n).ok_or(Error::OutOfRange)?;
+        if end > self.capacity {
+            return Err(Error::OutOfRange);
+        }
+        let mut g = self.inner.lock().unwrap();
+        for lba in start.0..end {
+            let (w, b) = word_bit(lba);
+            let mask = 1u64 << b;
+            if g.words[w] & mask == 0 {
+                g.words[w] |= mask;
+                g.used += 1;
+            }
+        }
+        g.max_ever = g.max_ever.max(end - 1);
+        Ok(())
+    }
+
     pub fn is_in_use(&self, lba: Lba) -> Result<bool, Error> {
         if lba.0 >= self.capacity {
             return Err(Error::OutOfRange);

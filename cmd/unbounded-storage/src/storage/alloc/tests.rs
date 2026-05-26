@@ -138,6 +138,63 @@ fn observe_high_water_never_lowers() {
 }
 
 #[test]
+fn mark_range_in_use_marks_every_lba_in_run() {
+    let a = Allocator::new(64);
+    a.mark_range_in_use(Lba(10), 5).unwrap();
+    for lba in 10..15 {
+        assert!(a.is_in_use(Lba(lba)).unwrap(), "lba {lba} not marked");
+    }
+    assert!(!a.is_in_use(Lba(9)).unwrap());
+    assert!(!a.is_in_use(Lba(15)).unwrap());
+    assert_eq!(a.used_pages(), 5);
+    assert_eq!(a.high_water(), 14);
+}
+
+#[test]
+fn mark_range_in_use_is_idempotent() {
+    let a = Allocator::new(64);
+    a.mark_range_in_use(Lba(10), 3).unwrap();
+    a.mark_range_in_use(Lba(10), 3).unwrap();
+    assert_eq!(a.used_pages(), 3);
+}
+
+#[test]
+fn mark_range_in_use_blocks_subsequent_alloc() {
+    let a = Allocator::new(16);
+    // Reserve a run; the very next alloc must not collide with
+    // any LBA inside it. This is the scenario the btree open
+    // path depends on: a multi-LBA leaf-entry run must be
+    // fully recorded so `alloc` / `alloc_contig` skip it.
+    a.mark_range_in_use(Lba(0), 8).unwrap();
+    for _ in 0..(16 - 8) {
+        let l = a.alloc().unwrap();
+        assert!(l.0 >= 8, "alloc handed out lba {} inside marked run", l.0);
+    }
+    assert!(matches!(a.alloc(), Err(Error::OutOfSpace)));
+}
+
+#[test]
+fn mark_range_in_use_rejects_overflow() {
+    let a = Allocator::new(16);
+    assert!(matches!(
+        a.mark_range_in_use(Lba(15), 2),
+        Err(Error::OutOfRange)
+    ));
+    assert!(matches!(
+        a.mark_range_in_use(Lba(u64::MAX), 1),
+        Err(Error::OutOfRange)
+    ));
+}
+
+#[test]
+fn mark_range_in_use_zero_is_noop() {
+    let a = Allocator::new(16);
+    a.mark_range_in_use(Lba(5), 0).unwrap();
+    assert_eq!(a.used_pages(), 0);
+    assert_eq!(a.high_water(), 0);
+}
+
+#[test]
 fn observe_high_water_below_current_allocations() {
     let a = Allocator::new(1024);
     let mut max_seen = 0u64;

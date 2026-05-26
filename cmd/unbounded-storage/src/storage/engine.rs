@@ -213,6 +213,7 @@ impl<B: BlockDevice> StorageEngine<B> {
                 device.clone(),
                 allocator.clone(),
                 scratch.clone(),
+                cfg.btree_page_bytes,
                 cfg.skip_recovery_scan_if_no_meta,
             )
             .await?,

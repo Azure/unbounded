@@ -71,7 +71,7 @@ fn open_btree(
     alloc: Arc<Allocator>,
 ) -> impl Future<Output = Result<BTreeIndex<MockDevice>, crate::storage::types::Error>> {
     let scratch = ScratchPool::new(&*dev, 4096, 8).expect("scratch pool");
-    BTreeIndex::open(dev, alloc, scratch, false)
+    BTreeIndex::open(dev, alloc, scratch, 4096, false)
 }
 
 #[test]
@@ -435,5 +435,67 @@ fn reopen_seeds_allocator_hwm() {
     assert!(
         hwm_after >= persisted_hwm,
         "persisted hwm regressed after reopen+commit: before={persisted_hwm}, after={hwm_after}",
+    );
+}
+
+#[test]
+fn reopen_marks_full_data_run_in_use() {
+    // The write path allocates a contiguous LBA run of
+    // `byte_len / btree_page_bytes` pages per entry. On reopen
+    // the allocator bitmap must reflect every LBA in the run,
+    // not just the start: a later `alloc` / `alloc_contig` that
+    // landed inside the run would silently overwrite live data.
+    // `entry()` here uses byte_len = 2 MiB with btree_page_bytes
+    // = 4 KiB, so each entry covers 512 LBAs.
+    const CAP: u64 = 8 * 1024;
+    const BTREE_PAGE_BYTES: usize = 4096;
+
+    let (dev, alloc) = fresh(CAP);
+    // Allocate a real contiguous run for the entry so its LBAs
+    // are actually in-use during phase 1 (mirrors the engine's
+    // write path).
+    let n_pages = (entry(0).byte_len as usize / BTREE_PAGE_BYTES) as u64;
+    let run_start = alloc.alloc_contig(n_pages).unwrap();
+    let leaf_entry = LeafEntry {
+        lba: run_start,
+        data_checksum: Checksum(0xCAFEBABE),
+        byte_len: 2 * 1024 * 1024,
+    };
+    {
+        let idx = block_on(open_btree(dev.clone(), alloc.clone())).unwrap();
+        block_on(idx.apply_batch(vec![Mutation::Insert {
+            key: key(1),
+            value: leaf_entry,
+        }]))
+        .unwrap();
+    }
+
+    // Reopen with a fresh allocator: this is the regression
+    // surface. Before the fix, only `run_start` would be marked;
+    // `run_start + 1 .. run_start + n_pages` would be cleared.
+    let alloc2 = Arc::new(Allocator::new(CAP));
+    let _idx2 = block_on(open_btree(dev.clone(), alloc2.clone())).unwrap();
+
+    for off in 0..n_pages {
+        let lba = Lba(run_start.0 + off);
+        assert!(
+            alloc2.is_in_use(lba).unwrap(),
+            "lba {} inside entry run [{}..{}) was not marked in use on reopen",
+            lba.0,
+            run_start.0,
+            run_start.0 + n_pages,
+        );
+    }
+
+    // And `alloc_contig` of the same size must not land inside
+    // the existing run: that would be the silent-overwrite bug.
+    let next = alloc2.alloc_contig(n_pages).unwrap();
+    let next_end = next.0 + n_pages;
+    let run_end = run_start.0 + n_pages;
+    let overlaps = next.0 < run_end && run_start.0 < next_end;
+    assert!(
+        !overlaps,
+        "alloc_contig({n_pages}) returned {} which overlaps the live run [{}..{})",
+        next.0, run_start.0, run_end,
     );
 }

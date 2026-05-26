@@ -116,6 +116,7 @@ impl<B: BlockDevice> BTreeIndex<B> {
         device: Arc<B>,
         allocator: Arc<Allocator>,
         scratch: Rc<ScratchPool>,
+        btree_page_bytes: usize,
         skip_recovery_scan_if_no_meta: bool,
     ) -> Result<Self, Error> {
         // Reserve the meta slots regardless of disk state.
@@ -129,7 +130,7 @@ impl<B: BlockDevice> BTreeIndex<B> {
             // subset of the live frontier.
             allocator.observe_high_water(state.hwm);
             if let Some(idx) =
-                Self::open_from_meta(&device, &allocator, &scratch, state).await?
+                Self::open_from_meta(&device, &allocator, &scratch, btree_page_bytes, state).await?
             {
                 return Ok(idx);
             }
@@ -147,6 +148,7 @@ impl<B: BlockDevice> BTreeIndex<B> {
                 device,
                 allocator,
                 scratch,
+                btree_page_bytes,
                 1,
                 BTreeMap::new(),
             )
@@ -161,6 +163,7 @@ impl<B: BlockDevice> BTreeIndex<B> {
                 device,
                 allocator,
                 scratch,
+                btree_page_bytes,
                 rebuilt.txn_id + 1,
                 rebuilt.entries,
             )
@@ -168,13 +171,15 @@ impl<B: BlockDevice> BTreeIndex<B> {
         }
 
         // Fresh disk: install an empty tree at txn 1.
-        Self::bootstrap_from_entries(device, allocator, scratch, 1, BTreeMap::new()).await
+        Self::bootstrap_from_entries(device, allocator, scratch, btree_page_bytes, 1, BTreeMap::new())
+            .await
     }
 
     async fn open_from_meta(
         device: &Arc<B>,
         allocator: &Arc<Allocator>,
         scratch: &Rc<ScratchPool>,
+        btree_page_bytes: usize,
         state: meta::MetaState,
     ) -> Result<Option<Self>, Error> {
         let pages = cow::collect_pages(&**device, scratch, state.root_lba).await?;
@@ -188,15 +193,17 @@ impl<B: BlockDevice> BTreeIndex<B> {
 
         let mut entries: BTreeMap<PageKey, LeafEntry> = BTreeMap::new();
         cow::for_each_leaf(&**device, scratch, state.root_lba, |k, v, _| {
-            // Also mark the data LBA referenced by this leaf
-            // entry as in use. Without this, a reopened engine
-            // would happily hand the same LBA out via
-            // `allocator.alloc()` and overwrite live data
-            // belonging to some other key in the existing index.
-            // The structural btree pages above were already
-            // marked via `mark_in_use(lba)` from `collect_pages`;
-            // data LBAs need the same treatment.
-            let _ = allocator.mark_in_use(v.lba);
+            // Mark the entire contiguous data-page run referenced
+            // by this leaf entry as in use. The entry covers
+            // `byte_len / btree_page_bytes` device pages starting
+            // at `v.lba`; without this, a reopened engine would
+            // hand out an LBA inside the run via
+            // `allocator.alloc()` / `alloc_contig()` and the next
+            // write would overwrite live data. The structural
+            // btree pages above are already marked via
+            // `collect_pages`.
+            let n = leaf_run_pages(v.byte_len, btree_page_bytes);
+            let _ = allocator.mark_range_in_use(v.lba, n);
             entries.insert(k, v);
         })
         .await?;
@@ -220,9 +227,22 @@ impl<B: BlockDevice> BTreeIndex<B> {
         device: Arc<B>,
         allocator: Arc<Allocator>,
         scratch: Rc<ScratchPool>,
+        btree_page_bytes: usize,
         txn_id: u64,
         entries: BTreeMap<PageKey, LeafEntry>,
     ) -> Result<Self, Error> {
+        // Reserve every data-page run referenced by the seeded
+        // entries before `build_tree` allocates the new structural
+        // pages. The rebuild path lands here with entries pulled
+        // from on-disk leaves; their LBAs are live but not yet in
+        // the bitmap. Missing this lets `build_tree` (or any later
+        // user write) hand out an LBA inside an existing run and
+        // overwrite the data the entry points at.
+        for v in entries.values() {
+            let n = leaf_run_pages(v.byte_len, btree_page_bytes);
+            let _ = allocator.mark_range_in_use(v.lba, n);
+        }
+
         let sorted: Vec<(PageKey, LeafEntry)> = entries.iter().map(|(k, v)| (*k, *v)).collect();
         let (root_lba, pages) =
             cow::build_tree(&*device, &scratch, &allocator, txn_id, &sorted).await?;
@@ -350,4 +370,18 @@ impl<B: BlockDevice> BTreeIndex<B> {
     pub fn allocator_high_water(&self) -> u64 {
         self.allocator.high_water()
     }
+}
+
+/// Number of device pages spanned by a leaf entry whose payload is
+/// `byte_len` bytes wide over a `btree_page_bytes`-page device.
+/// Mirrors [`crate::storage::engine::StorageEngine::n_pages`]: the
+/// write path constructs entries with `byte_len` a multiple of
+/// `btree_page_bytes`, so this division is exact. Returns 0 if
+/// `btree_page_bytes` is zero (defensive; the engine enforces a
+/// positive value on construction).
+fn leaf_run_pages(byte_len: u32, btree_page_bytes: usize) -> u64 {
+    if btree_page_bytes == 0 {
+        return 0;
+    }
+    (byte_len as usize / btree_page_bytes) as u64
 }
