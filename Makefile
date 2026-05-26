@@ -71,16 +71,6 @@ UNBOUNDED_STORAGE_BIN=bin/unbounded-storage
 UNBOUNDED_STORAGE_CRATE=./cmd/unbounded-storage
 CARGO ?= cargo
 
-# Mercury (mercury-hpc) is a native dependency of the unbounded-storage crate.
-# We build a pinned version from source into a project-local prefix; the
-# unbounded-storage build.rs honours $MERCURY_PKG_CONFIG_PATH so it picks up
-# our local install ahead of any system copy.
-MERCURY_VERSION ?= v2.4.1
-MERCURY_PREFIX  ?= $(CURDIR)/tmp/mercury-prefix
-MERCURY_SRC     ?= $(CURDIR)/tmp/mercury-src
-MERCURY_PC_FILE := $(MERCURY_PREFIX)/lib/pkgconfig/mercury.pc
-MERCURY_INSTALL_SCRIPT := hack/scripts/install-mercury.sh
-
 # Version is derived from the latest git tag. Override with: make VERSION=v1.0.0
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 GIT_COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
@@ -140,7 +130,7 @@ REACT_DEV ?= false
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-manifests
 .PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-net-controller-local image-net-node-local images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
-.PHONY: unbounded-storage unbounded-storage-build bench unbounded-storage-test unbounded-storage-check unbounded-storage-model-check mercury mercury-clean
+.PHONY: unbounded-storage unbounded-storage-build bench unbounded-storage-test unbounded-storage-check unbounded-storage-model-check
 
 ##@ General
 
@@ -193,8 +183,6 @@ help: ## Show this help
 	@echo "  unbounded-storage-test           Run cargo tests for unbounded-storage"
 	@echo "  unbounded-storage-check          Run cargo check for unbounded-storage"
 	@echo "  unbounded-storage-model-check    Run TLC on the CoW B+tree crash-consistency model"
-	@echo "  mercury                          Build pinned Mercury into \$$(MERCURY_PREFIX)"
-	@echo "  mercury-clean                    Remove the local Mercury prefix and source tree"
 	@echo ""
 	@echo "Container Images (local, single-arch):"
 	@echo "  image-inventory-all-local        Build all local inventory container images"
@@ -467,43 +455,21 @@ unroute: test unroute-build ## Build the unroute utility (implies test)
 
 ##@ Rust Binaries
 
-# Mercury env: prepend our local prefix so cargo/build.rs find the right .pc
-# files and so the resulting binaries/tests can dlopen libmercury at runtime.
-# Targets that invoke cargo must export these via `$(UNBOUNDED_STORAGE_ENV)`.
-UNBOUNDED_STORAGE_ENV = \
-	MERCURY_PKG_CONFIG_PATH="$(MERCURY_PREFIX)/lib/pkgconfig" \
-	PKG_CONFIG_PATH="$(MERCURY_PREFIX)/lib/pkgconfig:$${PKG_CONFIG_PATH}" \
-	LD_LIBRARY_PATH="$(MERCURY_PREFIX)/lib:$${LD_LIBRARY_PATH}"
+unbounded-storage-check: ## Run cargo check for unbounded-storage
+	$(CARGO) check --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --locked --all-targets
 
-mercury: $(MERCURY_PC_FILE) ## Build pinned Mercury into $(MERCURY_PREFIX) (idempotent)
+unbounded-storage-test: ## Run cargo tests for unbounded-storage
+	$(CARGO) test --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --locked --all-targets
 
-# The install script is itself idempotent: if mercury.pc already advertises the
-# pinned version it exits immediately. We still gate on the .pc file as the
-# Make-level sentinel so a cached prefix avoids invoking the script at all.
-$(MERCURY_PC_FILE): $(MERCURY_INSTALL_SCRIPT)
-	MERCURY_VERSION=$(MERCURY_VERSION) \
-	MERCURY_PREFIX=$(MERCURY_PREFIX) \
-	MERCURY_SRC=$(MERCURY_SRC) \
-		$(MERCURY_INSTALL_SCRIPT)
-
-mercury-clean: ## Remove the local Mercury prefix and source tree
-	rm -rf "$(MERCURY_PREFIX)" "$(MERCURY_SRC)"
-
-unbounded-storage-check: mercury ## Run cargo check for unbounded-storage
-	$(UNBOUNDED_STORAGE_ENV) $(CARGO) check --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --locked --all-targets
-
-unbounded-storage-test: mercury ## Run cargo tests for unbounded-storage
-	$(UNBOUNDED_STORAGE_ENV) $(CARGO) test --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --locked --all-targets
-
-unbounded-storage-build: mercury ## Build the unbounded-storage binary (no test)
-	$(UNBOUNDED_STORAGE_ENV) $(CARGO) build --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --release --locked
+unbounded-storage-build: ## Build the unbounded-storage binary (no test)
+	$(CARGO) build --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --release --locked
 	@mkdir -p $(dir $(UNBOUNDED_STORAGE_BIN))
 	cp $(UNBOUNDED_STORAGE_CRATE)/target/release/unbounded-storage $(UNBOUNDED_STORAGE_BIN)
 
 unbounded-storage: unbounded-storage-test unbounded-storage-build ## Build the unbounded-storage binary (implies test)
 
-bench: mercury ## Build the bench tool (excluded from images)
-	$(UNBOUNDED_STORAGE_ENV) $(CARGO) build --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --release --locked --bin bench
+bench: ## Build the bench tool (excluded from images)
+	$(CARGO) build --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --release --locked --bin bench
 	@mkdir -p $(dir $(UNBOUNDED_STORAGE_BIN))
 	cp $(UNBOUNDED_STORAGE_CRATE)/target/release/bench bin/bench
 

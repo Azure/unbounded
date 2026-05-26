@@ -11,7 +11,7 @@
 //! io_uring or NVMe-backed impl as soon as one is available.
 
 use crate::bufferpool::traits::BlockStore;
-use crate::bufferpool::types::{Error, PageRef, StripeKey};
+use crate::bufferpool::types::{Backing, Error, PageRef, StripeKey};
 
 #[derive(Default)]
 pub struct NullBlockStore;
@@ -23,12 +23,7 @@ impl NullBlockStore {
 }
 
 impl BlockStore for NullBlockStore {
-    fn register_pages(
-        &self,
-        _base: *mut u8,
-        _page_size: usize,
-        _page_count: usize,
-    ) -> Result<(), Error> {
+    fn register_pages(&self, _backing: &Backing) -> Result<(), Error> {
         Ok(())
     }
 
@@ -97,6 +92,12 @@ mod tests {
     #[test]
     fn register_pages_accepts_anything() {
         let s = NullBlockStore::new();
-        assert!(s.register_pages(std::ptr::null_mut(), 4096, 0).is_ok());
+        let backing = Backing {
+            base: std::ptr::null_mut(),
+            page_size: 4096,
+            page_count: 0,
+            _own: Box::new(()),
+        };
+        assert!(s.register_pages(&backing).is_ok());
     }
 }

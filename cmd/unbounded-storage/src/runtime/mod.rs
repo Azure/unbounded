@@ -10,7 +10,7 @@ mod pinned;
 pub use pinned::{PinnedRuntime, WorkerSpec};
 
 /// Universal identifier for a worker slot. The bufferpool runs one
-/// `Pool` per worker, Mercury constructs one `Class` per worker, and
+/// `Pool` per worker, the fabric layer constructs one `Fabric` per worker, and
 /// the future io_uring layer registers one submission ring per
 /// worker. All three pin against the same `WorkerIdx`.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]

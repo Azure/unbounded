@@ -147,10 +147,7 @@ mod tests {
             "DRIVER=mlx5_core\nPCI_SLOT_NAME=0000:af:00.0\nMODALIAS=pci:foo\n",
         )
         .unwrap();
-        assert_eq!(
-            read_pci_bdf(&path).as_deref(),
-            Some("0000:af:00.0"),
-        );
+        assert_eq!(read_pci_bdf(&path).as_deref(), Some("0000:af:00.0"),);
         let _ = fs::remove_dir_all(&root);
     }
 

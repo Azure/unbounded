@@ -14,11 +14,14 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::rc::Rc;
+use std::task::{Context, Poll};
 
 use rand::Rng;
 use unbounded_storage::bufferpool::{
-    BlockStore, BulkRef, Error, PageRef, Req, StripeKey, Transport,
+    Backing, BlockStore, BulkRef, Error, PageRef, PageStream, Req, StripeKey, Transport,
 };
 
 use crate::framework::executor::{with_sim, yield_n};
@@ -123,10 +126,8 @@ impl DstTransport {
             page_size,
         }
     }
-}
 
-impl Transport<TestReq> for DstTransport {
-    async fn bulk_get(&self, _req: &TestReq, src: BulkRef, dst: PageRef) -> Result<(), Error> {
+    async fn do_bulk_get(&self, _req: &TestReq, src: BulkRef, dst: PageRef) -> Result<(), Error> {
         // Pull delay and (optional) fault decision up front; this
         // keeps the PRNG draws deterministic across re-orderings of
         // independent tasks.
@@ -187,6 +188,57 @@ impl Transport<TestReq> for DstTransport {
     }
 }
 
+/// Single-page stream returned by `DstTransport::bulk_get`. Pool
+/// always issues a one-element `dsts`; the stream yields that page
+/// when the underlying future resolves `Ok`, or surfaces the error.
+pub struct DstBulkStream<'a> {
+    fut: Option<Pin<Box<dyn Future<Output = Result<(), Error>> + 'a>>>,
+    page: PageRef,
+}
+
+impl<'a> PageStream for DstBulkStream<'a> {
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<PageRef, Error>>> {
+        // SAFETY: structural pin projection; `fut` is the only
+        // polled field and we never move out of it.
+        let this = unsafe { self.as_mut().get_unchecked_mut() };
+        let Some(fut) = this.fut.as_mut() else {
+            return Poll::Ready(None);
+        };
+        match fut.as_mut().poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(())) => {
+                this.fut = None;
+                Poll::Ready(Some(Ok(this.page)))
+            }
+            Poll::Ready(Err(e)) => {
+                this.fut = None;
+                Poll::Ready(Some(Err(e)))
+            }
+        }
+    }
+}
+
+impl Transport<TestReq> for DstTransport {
+    type Stream<'a> = DstBulkStream<'a>;
+
+    fn bulk_get<'a>(
+        &'a self,
+        req: &'a TestReq,
+        src: BulkRef,
+        dsts: &'a [PageRef],
+    ) -> Self::Stream<'a> {
+        assert_eq!(dsts.len(), 1, "Pool issues single-page bulk_get");
+        let page = dsts[0];
+        DstBulkStream {
+            fut: Some(Box::pin(self.do_bulk_get(req, src, page))),
+            page,
+        }
+    }
+}
+
 /// Blockstore mock with a configurable hit rate. On a miss
 /// (probability `1 - hit_rate/100`) returns `Ok(false)` and the
 /// pool falls through to `Transport::bulk_get`. On a hit, copies
@@ -222,14 +274,9 @@ impl DstBlockStore {
 }
 
 impl BlockStore for DstBlockStore {
-    fn register_pages(
-        &self,
-        base: *mut u8,
-        page_size: usize,
-        _page_count: usize,
-    ) -> Result<(), Error> {
-        self.base.set(Some(base));
-        self.page_size.set(page_size);
+    fn register_pages(&self, backing: &Backing) -> Result<(), Error> {
+        self.base.set(Some(backing.base));
+        self.page_size.set(backing.page_size);
         Ok(())
     }
 

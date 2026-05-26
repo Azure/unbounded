@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
@@ -10,15 +11,14 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use unbounded_storage::bufferpool::{
-    NullBlockStore, Pool, PoolConfig, PoolGroup, Req, ShardDescriptor, StripeKey,
+    NullBlockStore, PeerId, Pool, PoolConfig, PoolGroup, Req, ShardDescriptor, StripeKey,
 };
-use unbounded_storage::mercury::{Class, MercuryTransport, PeerEntry, StaticPeer, TransportConfig};
+use unbounded_storage::fabric::{self, Fabric, FabricTransport, Provider, StaticPeer};
 use unbounded_storage::runtime::{PinnedRuntime, Threading, WorkerIdx, WorkerSpec};
 use unbounded_storage::topology::{self, Host, Plan, Role, Worker};
 
 use unbounded_storage::backing::{BackingKind, BackingRequest, HUGEPAGE_2MB, allocate};
 
-const PROGRESS_POLL_MS: u32 = 100;
 const MAX_INFLIGHT: usize = 1024;
 const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
 
@@ -37,8 +37,9 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 /// Placeholder request type for the per-shard `Pool`. Carries a
 /// `StripeKey` and satisfies the trait bounds required by
-/// `MercuryTransport` (`Serialize`). No reads are issued against
-/// the pool today; this exists so `Pool::new` type-checks.
+/// `FabricTransport` (`Serialize` + `DeserializeOwned`). No reads
+/// are issued against the pool today; this exists so `Pool::new`
+/// type-checks.
 #[derive(Clone, Serialize, Deserialize)]
 struct PlaceholderReq {
     key: [u8; 32],
@@ -50,7 +51,7 @@ impl Req for PlaceholderReq {
     }
 }
 
-type ShardPool = Pool<MercuryTransport<PlaceholderReq, StaticPeer>, NullBlockStore, PlaceholderReq>;
+type ShardPool = Pool<FabricTransport<PlaceholderReq, StaticPeer>, NullBlockStore, PlaceholderReq>;
 
 fn main() -> ExitCode {
     let cli = match Cli::parse(std::env::args().skip(1)) {
@@ -105,15 +106,10 @@ fn main() -> ExitCode {
     for (i, worker) in progress.iter().enumerate() {
         let widx = WorkerIdx(u16::try_from(i).expect("worker index fits in u16"));
         let dev_name = match worker.role {
-            Role::RdmaProgress { hca } if hca != usize::MAX => Some(host.hcas[hca].dev_name.clone()),
+            Role::RdmaProgress { hca } if hca != usize::MAX => {
+                Some(host.hcas[hca].dev_name.clone())
+            }
             _ => None,
-        };
-        let na_info = match &dev_name {
-            // Placeholder until the per-NIC config-parsing follow-up
-            // wires through provider-specific `domain=`, listen port,
-            // etc.
-            Some(_) => "ofi+verbs;ofi_rxm://".to_string(),
-            None => "ofi+tcp://0.0.0.0:0".to_string(),
         };
         let worker = worker.clone();
         let runtime = runtime.clone();
@@ -131,7 +127,6 @@ fn main() -> ExitCode {
                                 widx,
                                 worker,
                                 dev_name,
-                                na_info,
                                 runtime,
                                 tx,
                                 backing_kind,
@@ -200,34 +195,38 @@ fn main() -> ExitCode {
     }
 }
 
-/// Body of one shard thread. Runs on the pinned executor: builds
-/// the Mercury `Class`, registers a NUMA-local `Backing`, wires up
-/// the `Pool`, reports readiness, then idles until shutdown so the
-/// `Class` (and its progress thread) plus the `Pool` are dropped
+/// Body of one shard thread. Runs on the pinned executor: brings up
+/// the `Fabric`, registers a NUMA-local `Backing`, wires up the
+/// `Pool`, reports readiness, then idles until shutdown so the
+/// `Fabric` (and its progress threads) plus the `Pool` are dropped
 /// together.
 fn run_shard(
     widx: WorkerIdx,
     worker: Worker,
     dev_name: Option<String>,
-    na_info: String,
-    runtime: std::sync::Arc<dyn unbounded_storage::runtime::Threading>,
+    runtime: Arc<dyn Threading>,
     tx: mpsc::Sender<ShardReady>,
     backing_kind: BackingKind,
     bytes_per_shard: usize,
 ) {
-    let cfg = TransportConfig {
-        na_info,
-        listen: true,
-        peers: Vec::<PeerEntry>::new(),
-        max_inflight: MAX_INFLIGHT,
-        progress_poll_ms: PROGRESS_POLL_MS,
-        runtime,
-        worker_idx: widx,
+    // Default to the loopback device when no HCA is bound to this
+    // shard; the `tcp` provider is the fallback path.
+    let device_name = dev_name.clone().unwrap_or_else(|| "lo".to_string());
+    let provider = match &dev_name {
+        Some(name) => Provider::from_device_name(name),
+        None => Provider::Tcp,
     };
-    let class = match Class::new(cfg).and_then(|c| c.self_address().map(|a| (c, a))) {
-        Ok((class, self_addr)) => {
+    let mut cfg = fabric::defaults_for(device_name, runtime, widx);
+    cfg.provider = provider;
+    cfg.listen = true;
+    cfg.listen_addr = Some("0.0.0.0:0".into());
+    cfg.max_inflight = MAX_INFLIGHT;
+    cfg.numa = worker.numa;
+
+    let fabric = match Fabric::new(cfg).and_then(|f| f.self_address().map(|a| (f, a))) {
+        Ok((fabric, self_addr)) => {
             println!(
-                "shard up: worker={} dev={} numa={} cpu={} self_addr={}",
+                "shard up: worker={} dev={} numa={} cpu={} self_addr_bytes={}",
                 widx.0,
                 dev_name.as_deref().unwrap_or("tcp-fallback"),
                 worker
@@ -235,9 +234,9 @@ fn run_shard(
                     .map(|n| n.to_string())
                     .unwrap_or_else(|| "none".into()),
                 worker.cpu,
-                self_addr,
+                self_addr.len(),
             );
-            class
+            Arc::new(fabric)
         }
         Err(e) => {
             let _ = tx.send(ShardReady::Failed(format!("worker={}: {e}", widx.0)));
@@ -249,9 +248,9 @@ fn run_shard(
     // the `PinnedRuntime`'s `set_mempolicy` keeps the pages on the
     // intended node; the hugepage variant additionally pins via
     // `mbind` when `worker.numa` is known. Register it with the
-    // Mercury class before building the transport (the new
-    // embedder-pre-registers model replaces the old
-    // `Transport::register_pages` handshake).
+    // fabric before building the transport (the embedder
+    // pre-registers model replaces the old `Transport::register_pages`
+    // handshake).
     let backing = match allocate(BackingRequest {
         kind: backing_kind,
         bytes: bytes_per_shard,
@@ -266,25 +265,37 @@ fn run_shard(
             return;
         }
     };
-    let backing_bytes = backing.page_size * backing.page_count;
     let page_size = backing.page_size;
-    if let Err(e) = class.register_backing(backing.base, backing_bytes) {
-        let _ = tx.send(ShardReady::Failed(format!(
-            "worker={}: register_backing: {e}",
-            widx.0,
-        )));
-        return;
-    }
+    let mr = match fabric.register_backing(&backing, worker.numa) {
+        Ok(mr) => mr,
+        Err(e) => {
+            let _ = tx.send(ShardReady::Failed(format!(
+                "worker={}: register_backing: {e}",
+                widx.0,
+            )));
+            return;
+        }
+    };
 
-    // `StaticPeer(PeerId(0))` is a placeholder: with `peers`
-    // empty, no `bulk_get` will resolve, but constructing the
-    // transport is harmless. A real router will be installed when
-    // peer discovery lands.
-    let transport = MercuryTransport::<PlaceholderReq, _>::new(
-        &class,
-        StaticPeer(unbounded_storage::bufferpool::PeerId(0)),
+    // `StaticPeer { peer: PeerId(0) }` is a placeholder: with no
+    // connections added to the fabric, no `bulk_get` will resolve,
+    // but constructing the transport is harmless. A real router
+    // will be installed when peer discovery lands.
+    let transport = match FabricTransport::<PlaceholderReq, _>::new(
+        fabric.clone(),
+        mr,
+        StaticPeer { peer: PeerId(0) },
         page_size,
-    );
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = tx.send(ShardReady::Failed(format!(
+                "worker={}: FabricTransport::new: {e}",
+                widx.0,
+            )));
+            return;
+        }
+    };
     let blockstore = NullBlockStore::new();
     let pool: ShardPool = match Pool::new(PoolConfig::default(), backing, transport, blockstore) {
         Ok(p) => p,
@@ -305,13 +316,12 @@ fn run_shard(
     wait_for_shutdown();
 
     // Drop order matters: drop the `Pool` first so the
-    // `MercuryTransport` (which holds an `Arc<ClassInner>`) goes
-    // away before the owning `Class` runs its own drop. `Class::drop`
-    // closes the server queue and signals the progress thread; the
-    // last `Arc` release inside `ClassInner::drop` joins that thread
-    // and finalizes Mercury.
+    // `FabricTransport` (which holds an `Arc<Fabric>`) goes away
+    // before the owning `Fabric` runs its own drop. `Fabric::drop`
+    // joins its progress threads and tears the libfabric stack
+    // down in the documented order.
     drop(pool);
-    drop(class);
+    drop(fabric);
 }
 
 /// Hash a `StripeKey` into a shard index. The first eight bytes of
@@ -542,16 +552,50 @@ mod tests {
         // observability line.
         let plan = Plan {
             workers: vec![
-                Worker { cpu: 1, numa: Some(0), role: Role::NvmeIoUring { nvme: 0 } },
-                Worker { cpu: 2, numa: Some(0), role: Role::RdmaProgress { hca: 0 } },
-                Worker { cpu: 3, numa: Some(0), role: Role::RdmaProgress { hca: 1 } },
-                Worker { cpu: 4, numa: Some(0), role: Role::RdmaHandler { hca: 0 } },
-                Worker { cpu: 5, numa: Some(0), role: Role::RdmaHandler { hca: 0 } },
-                Worker { cpu: 6, numa: Some(0), role: Role::RdmaHandler { hca: 1 } },
+                Worker {
+                    cpu: 1,
+                    numa: Some(0),
+                    role: Role::NvmeIoUring { nvme: 0 },
+                },
+                Worker {
+                    cpu: 2,
+                    numa: Some(0),
+                    role: Role::RdmaProgress { hca: 0 },
+                },
+                Worker {
+                    cpu: 3,
+                    numa: Some(0),
+                    role: Role::RdmaProgress { hca: 1 },
+                },
+                Worker {
+                    cpu: 4,
+                    numa: Some(0),
+                    role: Role::RdmaHandler { hca: 0 },
+                },
+                Worker {
+                    cpu: 5,
+                    numa: Some(0),
+                    role: Role::RdmaHandler { hca: 0 },
+                },
+                Worker {
+                    cpu: 6,
+                    numa: Some(0),
+                    role: Role::RdmaHandler { hca: 1 },
+                },
             ],
-            numa_pools: vec![NumaPool { numa: 0, workers: 6 }],
+            numa_pools: vec![NumaPool {
+                numa: 0,
+                workers: 6,
+            }],
         };
         let c = RoleCounts::from_plan(&plan);
-        assert_eq!(c, RoleCounts { progress: 2, handlers: 3, nvme: 1 });
+        assert_eq!(
+            c,
+            RoleCounts {
+                progress: 2,
+                handlers: 3,
+                nvme: 1
+            }
+        );
     }
 }

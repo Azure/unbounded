@@ -3,7 +3,7 @@
 
 pub mod backing;
 pub mod bufferpool;
-pub mod mercury;
+pub mod fabric;
 pub mod p2p;
 pub mod runtime;
 pub mod storage;

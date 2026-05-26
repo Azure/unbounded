@@ -188,19 +188,14 @@ impl<B: BlockDevice + 'static> LocalStorage<B> {
 }
 
 impl<B: BlockDevice + 'static> bufferpool::BlockStore for LocalStorage<B> {
-    fn register_pages(
-        &self,
-        base: *mut u8,
-        page_size: usize,
-        page_count: usize,
-    ) -> Result<(), Error> {
+    fn register_pages(&self, backing: &bufferpool::Backing) -> Result<(), Error> {
         // Single-backing convenience path used by inline tests and
         // the single-shard configuration: every engine sees the
         // same backing and resolves `PageRef`s against it. Multi-
         // shard deployments wrap `LocalStorage` in
         // `ShardLocalStore` instead and never call this method.
         for eng in &self.engines {
-            eng.register_pages(base, page_size, page_count)?;
+            <StorageEngine<B> as bufferpool::BlockStore>::register_pages(eng, backing)?;
         }
         Ok(())
     }
@@ -289,22 +284,17 @@ impl<B: BlockDevice + 'static> ShardLocalStore<B> {
 }
 
 impl<B: BlockDevice + 'static> bufferpool::BlockStore for ShardLocalStore<B> {
-    fn register_pages(
-        &self,
-        base: *mut u8,
-        page_size: usize,
-        page_count: usize,
-    ) -> Result<(), Error> {
+    fn register_pages(&self, backing: &bufferpool::Backing) -> Result<(), Error> {
         {
             let mut b = self.backing.lock().unwrap();
             *b = Some(ShardBacking {
-                base,
-                page_size,
-                page_count,
+                base: backing.base,
+                page_size: backing.page_size,
+                page_count: backing.page_count,
             });
         }
         self.inner
-            .register_extra_buffer(base, page_size * page_count)
+            .register_extra_buffer(backing.base, backing.page_size * backing.page_count)
     }
 
     async fn read_page(
@@ -470,17 +460,25 @@ mod tests {
 
         // Shard A: 32 pool pages of 4 KiB at base_a.
         let mut buf_a = vec![0u8; 4096 * 32].into_boxed_slice();
+        let backing_a = bufferpool::Backing {
+            base: buf_a.as_mut_ptr(),
+            page_size: 4096,
+            page_count: 32,
+            _own: Box::new(()),
+        };
         let store_a = ShardLocalStore::new(inner.clone());
-        store_a
-            .register_pages(buf_a.as_mut_ptr(), 4096, 32)
-            .unwrap();
+        store_a.register_pages(&backing_a).unwrap();
 
         // Shard B: distinct backing.
         let mut buf_b = vec![0u8; 4096 * 32].into_boxed_slice();
+        let backing_b = bufferpool::Backing {
+            base: buf_b.as_mut_ptr(),
+            page_size: 4096,
+            page_count: 32,
+            _own: Box::new(()),
+        };
         let store_b = ShardLocalStore::new(inner.clone());
-        store_b
-            .register_pages(buf_b.as_mut_ptr(), 4096, 32)
-            .unwrap();
+        store_b.register_pages(&backing_b).unwrap();
 
         // Write a pattern from shard A's page 0 to (key, off=0).
         let key = StripeKey([0x42; 32]);

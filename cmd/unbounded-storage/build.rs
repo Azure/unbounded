@@ -1,19 +1,14 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Locates Mercury via `pkg-config` and compiles the small C shim that
-//! exposes Mercury's `static HG_INLINE` proc helpers as real symbols
-//! our Rust FFI can call. The shim is the only C we write; everything
-//! else is plain Rust `extern "C"`.
+//! Probes the C libraries this crate links against. We compile the
+//! `fabric` module's shim against the headers reported by pkg-config
+//! for `libfabric`.
 
 use std::env;
-use std::path::PathBuf;
 
-fn main() {
-    // Allow developers to point at a local mercury install (e.g. the
-    // in-tree `tmp/mercury-prefix/`) without touching system pkg-config
-    // paths.
-    if let Ok(extra) = env::var("MERCURY_PKG_CONFIG_PATH") {
+fn prepend_pkg_config_path(extra_var: &str) {
+    if let Ok(extra) = env::var(extra_var) {
         let cur = env::var("PKG_CONFIG_PATH").unwrap_or_default();
         let combined = if cur.is_empty() {
             extra
@@ -27,25 +22,24 @@ fn main() {
             env::set_var("PKG_CONFIG_PATH", combined);
         }
     }
+}
 
-    let mercury = pkg_config::Config::new()
-        .probe("mercury")
-        .expect("pkg-config could not locate `mercury` (try setting MERCURY_PKG_CONFIG_PATH)");
-    pkg_config::Config::new()
-        .probe("na")
-        .expect("pkg-config could not locate `na` (Mercury Network Abstraction)");
+fn main() {
+    prepend_pkg_config_path("LIBFABRIC_PKG_CONFIG_PATH");
 
-    let include_paths: Vec<PathBuf> = mercury.include_paths.clone();
+    let libfabric = pkg_config::Config::new()
+        .probe("libfabric")
+        .expect("pkg-config could not locate `libfabric` (try setting LIBFABRIC_PKG_CONFIG_PATH)");
 
-    let mut build = cc::Build::new();
-    build.file("src/mercury/shim.c");
-    for p in &include_paths {
-        build.include(p);
+    let mut fabric_build = cc::Build::new();
+    fabric_build.file("src/fabric/shim.c");
+    for p in &libfabric.include_paths {
+        fabric_build.include(p);
     }
-    build.warnings(true).compile("unbounded_mercury_shim");
+    fabric_build.warnings(true).compile("unbounded_fabric_shim");
 
-    println!("cargo:rerun-if-changed=src/mercury/shim.c");
+    println!("cargo:rerun-if-changed=src/fabric/shim.c");
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-env-changed=MERCURY_PKG_CONFIG_PATH");
+    println!("cargo:rerun-if-env-changed=LIBFABRIC_PKG_CONFIG_PATH");
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
 }

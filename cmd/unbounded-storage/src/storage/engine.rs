@@ -430,21 +430,18 @@ impl<B: BlockDevice> StorageEngine<B> {
 }
 
 impl<B: BlockDevice> bufferpool::BlockStore for StorageEngine<B> {
-    fn register_pages(
-        &self,
-        base: *mut u8,
-        page_size: usize,
-        page_count: usize,
-    ) -> Result<(), bufferpool::Error> {
+    fn register_pages(&self, backing: &bufferpool::Backing) -> Result<(), bufferpool::Error> {
         let mut bp = self.bufferpool.lock().unwrap();
-        bp.base = Some(base);
-        bp.page_size = page_size;
-        bp.page_count = page_count;
+        bp.base = Some(backing.base);
+        bp.page_size = backing.page_size;
+        bp.page_count = backing.page_count;
         // Best-effort: also register against the underlying
         // device for io_uring's fixed-buffer table. Errors here
         // are not fatal - the device falls back to its slower
         // path.
-        let _ = self.device.register_buffers(base, page_size * page_count);
+        let _ = self
+            .device
+            .register_buffers(backing.base, backing.page_size * backing.page_count);
         Ok(())
     }
 
@@ -820,9 +817,18 @@ fn io_errno(e: &crate::storage::types::Error) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bufferpool::BlockStore;
+    use crate::bufferpool::{Backing, BlockStore};
     use crate::storage::blockdev::{MockDevice, MockDeviceConfig, MockFaultMode};
     use crate::storage::types::Lba;
+
+    fn test_backing(base: *mut u8, page_size: usize, page_count: usize) -> Backing {
+        Backing {
+            base,
+            page_size,
+            page_count,
+            _own: Box::new(()),
+        }
+    }
     use std::future::Future;
     use std::pin::{Pin, pin};
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
@@ -887,7 +893,7 @@ mod tests {
         let eng = Arc::new(block_on(StorageEngine::open(device, cfg)).unwrap());
         // 64 pool pages of 4 KiB each.
         let buf: Box<[u8]> = vec![0u8; 4096 * 64].into_boxed_slice();
-        eng.register_pages(buf.as_ptr() as *mut u8, 4096, 64)
+        eng.register_pages(&test_backing(buf.as_ptr() as *mut u8, 4096, 64))
             .unwrap();
         (eng, buf)
     }
@@ -994,7 +1000,7 @@ mod tests {
         };
         let eng = Arc::new(block_on(StorageEngine::open(device, cfg)).unwrap());
         let buf: Box<[u8]> = vec![0u8; 4096 * 64].into_boxed_slice();
-        eng.register_pages(buf.as_ptr() as *mut u8, 4096, 64)
+        eng.register_pages(&test_backing(buf.as_ptr() as *mut u8, 4096, 64))
             .unwrap();
 
         let eng_body = eng.clone();
@@ -1081,7 +1087,7 @@ mod tests {
         };
         let eng = Arc::new(block_on(StorageEngine::open(device, cfg)).unwrap());
         let buf: Box<[u8]> = vec![0u8; PAGE * PAGES].into_boxed_slice();
-        eng.register_pages(buf.as_ptr() as *mut u8, PAGE, PAGES)
+        eng.register_pages(&test_backing(buf.as_ptr() as *mut u8, PAGE, PAGES))
             .unwrap();
 
         let eng_body = eng.clone();
@@ -1147,7 +1153,8 @@ mod tests {
         };
         let eng = Arc::new(block_on(StorageEngine::open(device.clone(), cfg)).unwrap());
         let buf: Box<[u8]> = vec![0u8; PAGE * 4].into_boxed_slice();
-        eng.register_pages(buf.as_ptr() as *mut u8, PAGE, 4).unwrap();
+        eng.register_pages(&test_backing(buf.as_ptr() as *mut u8, PAGE, 4))
+            .unwrap();
 
         // Surface every write as EIO so the engine sees a device-
         // level failure on the user-data write path. Engaging the
