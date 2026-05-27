@@ -22,7 +22,8 @@ unbounded-kube is organized into several directories:
   - `unbounded-net-controller` - sources for the unbounded-net network controller.
   - `unbounded-net-node` - sources for the unbounded-net node agent.
   - `unbounded-net-routeplan-debug` - debugging tool for route plans.
-  - `unbounded-storage` - sources for the unbounded-storage daemon. **This is the only Rust crate in the repository** and is a special case: it has its own conventions for layout, build, and testing (in particular a deterministic simulation testing harness under `cmd/unbounded-storage/tests/`). Agents working on anything under `cmd/unbounded-storage/` must read `cmd/unbounded-storage/AGENTS.md` first; the rules in this file are Go-oriented and largely do not apply there.
+  - `unbounded-storage` - sources for the unbounded-storage daemon. The first of two Rust crates in the repository; it is a special case with its own conventions for layout, build, and testing (in particular a deterministic simulation testing harness under `cmd/unbounded-storage/tests/`). Agents working on anything under `cmd/unbounded-storage/` must read `cmd/unbounded-storage/AGENTS.md` first; the rules in this file are Go-oriented and largely do not apply there.
+  - `unbounded-s3` - sources for the unbounded-s3 daemon, an S3-compatible read-only HTTP frontend over the unbounded-storage p2p layer. The second Rust crate; defers to `cmd/unbounded-storage/AGENTS.md` for code style but has its own `cmd/unbounded-s3/AGENTS.md` for the differences.
   - `unping` - health check probe utility.
   - `unroute` - eBPF route inspection utility.
 - `deploy/` - component manifests for deploying on a Kubernetes cluster.

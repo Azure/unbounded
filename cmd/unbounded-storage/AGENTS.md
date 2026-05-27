@@ -1,7 +1,9 @@
 # unbounded-storage
 
-`unbounded-storage` is the only Rust crate in this repository. The rest of
-the project is Go, so the conventions below intentionally diverge from
+`unbounded-storage` is one of two Rust crates in this repository; the
+rest of the project is Go. The other Rust crate is `unbounded-s3`
+(see `cmd/unbounded-s3/AGENTS.md`), which depends on `unbounded-storage`
+as a library. The conventions below intentionally diverge from
 the top-level `AGENTS.md` where they need to. Read this file before
 touching anything under `cmd/unbounded-storage/`.
 
