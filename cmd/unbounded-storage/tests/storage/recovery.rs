@@ -17,7 +17,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use unbounded_storage::bufferpool::{BlockStore, PageRef, StripeKey};
+use unbounded_storage::bufferpool::{Backing, BlockStore, PageRef, StripeKey};
 use unbounded_storage::storage::blockdev::{BlockDevice, MockDeviceConfig};
 use unbounded_storage::storage::types::Lba;
 use unbounded_storage::storage::{EngineConfig, StorageEngine};
@@ -38,6 +38,19 @@ const META_LBA_A: u64 = 0;
 const META_LBA_B: u64 = 1;
 const PAGE_TYPE_OFFSET: usize = 0;
 const PAGE_TYPE_LEAF: u8 = 1;
+
+/// Test helper: synthesize a `Backing` whose pool-visible geometry
+/// matches `(base, page_size, page_count)`. These tests own the
+/// underlying allocation outside the `Backing`; the `_own` slot
+/// just needs a unit drop carrier.
+fn backing(base: *mut u8, page_size: usize, page_count: usize) -> Backing {
+    Backing {
+        base,
+        page_size,
+        page_count,
+        _own: Box::new(()),
+    }
+}
 const PAGE_TYPE_META: u8 = 3;
 const TXN_ID_RANGE: std::ops::Range<usize> = 8..16;
 // Header offsets mirrored from `src/storage/btree/page.rs`.
@@ -323,7 +336,7 @@ fn torn_data_page_reports_miss() {
         run_with_engine::<(bool, u64), _>(0x00D0_DA7A, device.clone(), move |eng, slot| {
             let device = device.clone();
             Box::pin(async move {
-                eng.register_pages(pool_base as *mut u8, PAGE_SIZE, 8)
+                eng.register_pages(&backing(pool_base as *mut u8, PAGE_SIZE, 8))
                     .unwrap();
 
                 let bytes = payload(1, 0, 7);
@@ -392,7 +405,7 @@ fn torn_btree_leaf_reports_miss() {
         run_with_engine::<Vec<(bool, Vec<u8>)>, _>(0xBEE_F00, device.clone(), move |eng, slot| {
             let device = device.clone();
             Box::pin(async move {
-                eng.register_pages(pool_base as *mut u8, PAGE_SIZE, 16)
+                eng.register_pages(&backing(pool_base as *mut u8, PAGE_SIZE, 16))
                     .unwrap();
 
                 for (i, (k, off, bytes)) in writes_for_task.iter().enumerate() {
@@ -489,7 +502,7 @@ fn torn_newer_meta_slot_falls_back_to_older() {
         let device = device.clone();
         run_with_engine::<(), _>(0xC0FF_EE01, device, move |eng, slot| {
             Box::pin(async move {
-                eng.register_pages(pool_base as *mut u8, PAGE_SIZE, 16)
+                eng.register_pages(&backing(pool_base as *mut u8, PAGE_SIZE, 16))
                     .unwrap();
                 for (i, (k, off, bytes)) in writes_for_task.iter().enumerate() {
                     admit_one(&eng, pool_base as *mut u8, i, *k, *off, bytes).await;
@@ -525,7 +538,7 @@ fn torn_newer_meta_slot_falls_back_to_older() {
         let device = device.clone();
         run_with_engine::<Vec<(bool, Vec<u8>)>, _>(0xC0FF_EE02, device, move |eng, slot| {
             Box::pin(async move {
-                eng.register_pages(pool_base2 as *mut u8, PAGE_SIZE, 16)
+                eng.register_pages(&backing(pool_base2 as *mut u8, PAGE_SIZE, 16))
                     .unwrap();
 
                 // Confirm we're operating off the older root, not
@@ -605,7 +618,7 @@ fn torn_both_meta_slots_open_either_succeeds_via_rebuild_or_errors() {
         let device = device.clone();
         run_with_engine::<(), _>(0x00DE_ADBE_EF01, device, move |eng, slot| {
             Box::pin(async move {
-                eng.register_pages(pool_base as *mut u8, PAGE_SIZE, 16)
+                eng.register_pages(&backing(pool_base as *mut u8, PAGE_SIZE, 16))
                     .unwrap();
                 for (i, (k, off, bytes)) in writes_for_task.iter().enumerate() {
                     admit_one(&eng, pool_base as *mut u8, i, *k, *off, bytes).await;
@@ -638,7 +651,7 @@ fn torn_both_meta_slots_open_either_succeeds_via_rebuild_or_errors() {
                         return;
                     }
                 };
-                if let Err(e) = eng.register_pages(pool_base as *mut u8, PAGE_SIZE, 16) {
+                if let Err(e) = eng.register_pages(&backing(pool_base as *mut u8, PAGE_SIZE, 16)) {
                     *slot.borrow_mut() = Some(Err(format!("register_pages: {e}")));
                     return;
                 }
@@ -776,7 +789,7 @@ fn concurrent_writes_same_key_collapse_to_one_entry() {
                 }
             };
             if eng
-                .register_pages(pool_base as *mut u8, PAGE_SIZE, NUM_WRITERS + 1)
+                .register_pages(&backing(pool_base as *mut u8, PAGE_SIZE, NUM_WRITERS + 1))
                 .is_err()
             {
                 *stage.borrow_mut() = Stage::Failed;
@@ -1019,7 +1032,7 @@ fn recovery_bounded_scan_ignores_garbage_above_hwm() {
         let device = device.clone();
         run_with_engine::<(), _>(0xBA11_AD01, device, move |eng, slot| {
             Box::pin(async move {
-                eng.register_pages(pool_base as *mut u8, PAGE_SIZE, 16)
+                eng.register_pages(&backing(pool_base as *mut u8, PAGE_SIZE, 16))
                     .unwrap();
                 for (i, (k, off, bytes)) in writes_for_task.iter().enumerate() {
                     admit_one(&eng, pool_base as *mut u8, i, *k, *off, bytes).await;
@@ -1077,7 +1090,7 @@ fn recovery_bounded_scan_ignores_garbage_above_hwm() {
         let device = device.clone();
         run_with_engine::<Vec<(bool, Vec<u8>)>, _>(0xBA11_AD02, device, move |eng, slot| {
             Box::pin(async move {
-                eng.register_pages(pool_base as *mut u8, PAGE_SIZE, 16)
+                eng.register_pages(&backing(pool_base as *mut u8, PAGE_SIZE, 16))
                     .unwrap();
                 let mut results: Vec<(bool, Vec<u8>)> = Vec::new();
                 let read_base = writes_phase2.len();
@@ -1160,7 +1173,7 @@ fn recovery_legacy_zero_hwm_falls_back_to_full_scan() {
         let device = device.clone();
         run_with_engine::<(), _>(0x0E6A_C001, device, move |eng, slot| {
             Box::pin(async move {
-                eng.register_pages(pool_base as *mut u8, PAGE_SIZE, 16)
+                eng.register_pages(&backing(pool_base as *mut u8, PAGE_SIZE, 16))
                     .unwrap();
                 for (i, (k, off, bytes)) in writes_for_task.iter().enumerate() {
                     admit_one(&eng, pool_base as *mut u8, i, *k, *off, bytes).await;
@@ -1201,7 +1214,7 @@ fn recovery_legacy_zero_hwm_falls_back_to_full_scan() {
                         return;
                     }
                 };
-                if let Err(e) = eng.register_pages(pool_base as *mut u8, PAGE_SIZE, 16) {
+                if let Err(e) = eng.register_pages(&backing(pool_base as *mut u8, PAGE_SIZE, 16)) {
                     *slot.borrow_mut() = Some(Err(format!("register_pages: {e}")));
                     return;
                 }
@@ -1282,7 +1295,7 @@ fn recovery_hwm_monotonic_across_torn_meta() {
         let device = device.clone();
         run_with_engine::<(), _>(0x1107_BA01, device, move |eng, slot| {
             Box::pin(async move {
-                eng.register_pages(pool_base as *mut u8, PAGE_SIZE, 16)
+                eng.register_pages(&backing(pool_base as *mut u8, PAGE_SIZE, 16))
                     .unwrap();
                 for (i, (k, off, bytes)) in writes_for_task.iter().enumerate() {
                     admit_one(&eng, pool_base as *mut u8, i, *k, *off, bytes).await;
@@ -1324,7 +1337,7 @@ fn recovery_hwm_monotonic_across_torn_meta() {
         let device = device.clone();
         run_with_engine::<(), _>(0x1107_BA02, device, move |eng, slot| {
             Box::pin(async move {
-                eng.register_pages(pool_base as *mut u8, PAGE_SIZE, 16)
+                eng.register_pages(&backing(pool_base as *mut u8, PAGE_SIZE, 16))
                     .unwrap();
                 for (i, (k, off, bytes)) in writes_for_task2.iter().enumerate() {
                     admit_one(&eng, pool_base as *mut u8, i, *k, *off, bytes).await;

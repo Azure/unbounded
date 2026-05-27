@@ -355,7 +355,10 @@ mod tests {
         s.add_hca("mlx5_2", "0000:02:00.0", 0, true);
         let h = Host::discover_with(&s.root);
         assert_eq!(
-            h.hcas.iter().map(|x| x.dev_name.as_str()).collect::<Vec<_>>(),
+            h.hcas
+                .iter()
+                .map(|x| x.dev_name.as_str())
+                .collect::<Vec<_>>(),
             vec!["mlx5_2", "mlx5_10"]
         );
     }
@@ -402,10 +405,7 @@ mod tests {
         }
         s.add_node_cpulist(0, "0-3");
         let h = Host::discover_with(&s.root);
-        assert_eq!(
-            h.isolated.iter().copied().collect::<Vec<_>>(),
-            vec![2, 3]
-        );
+        assert_eq!(h.isolated.iter().copied().collect::<Vec<_>>(), vec![2, 3]);
         assert!(!h.cpus[&0].isolated);
         assert!(!h.cpus[&1].isolated);
         assert!(h.cpus[&2].isolated);

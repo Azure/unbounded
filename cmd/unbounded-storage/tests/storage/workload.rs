@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use proptest::collection::vec;
 use proptest::prelude::*;
-use unbounded_storage::bufferpool::{BlockStore, PageRef, StripeKey};
+use unbounded_storage::bufferpool::{Backing, BlockStore, PageRef, StripeKey};
 use unbounded_storage::storage::blockdev::MockDeviceConfig;
 use unbounded_storage::storage::{EngineConfig, LocalStorage, StorageEngine};
 
@@ -236,7 +236,11 @@ pub fn workload_strategy_no_faults_multi_client() -> impl Strategy<Value = Workl
             // Duplicate the first client spec to reach the floor.
             // Cheap and deterministic; avoids reaching back into
             // `client_strategy` from inside a `prop_map`.
-            let dup = w.clients.first().cloned().unwrap_or(ClientSpec { ops: Vec::new() });
+            let dup = w
+                .clients
+                .first()
+                .cloned()
+                .unwrap_or(ClientSpec { ops: Vec::new() });
             while w.clients.len() < 2 {
                 w.clients.push(dup.clone());
             }
@@ -414,7 +418,12 @@ async fn open_local(
     // `ShardLocalStore` and use per-shard backings, which is out of
     // scope for this harness.
     local
-        .register_pages(pool_base, page_size, pool_pages)
+        .register_pages(&Backing {
+            base: pool_base,
+            page_size,
+            page_count: pool_pages,
+            _own: Box::new(()),
+        })
         .map_err(|e| format!("register: {e}"))?;
     Ok(Rc::new(local))
 }

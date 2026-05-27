@@ -14,8 +14,8 @@ use std::rc::Rc;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use crate::bufferpool::{
-    Backing, BlockStore, BufferPool, BulkRef, Error, PageRef, Pool, PoolConfig, Req, StripeKey,
-    Transport,
+    Backing, BlockStore, BufferPool, BulkRef, Error, PageRef, PageStream, Pool, PoolConfig, Req,
+    StripeKey, Transport,
 };
 
 // ---------------------------------------------------------------------------
@@ -176,10 +176,8 @@ impl MockTransport {
     fn set_error_mode(&self, on: bool) {
         *self.error_mode.borrow_mut() = on;
     }
-}
 
-impl Transport<TestReq> for MockTransport {
-    async fn bulk_get(&self, _req: &TestReq, src: BulkRef, dst: PageRef) -> Result<(), Error> {
+    async fn do_bulk_get(&self, _req: &TestReq, src: BulkRef, dst: PageRef) -> Result<(), Error> {
         // Pend the configured number of polls (one polling round
         // per pend, decremented on each call).
         for _ in 0..*self.pend_polls.borrow() {
@@ -208,6 +206,56 @@ impl Transport<TestReq> for MockTransport {
         }
         *self.calls.borrow_mut() += 1;
         Ok(())
+    }
+}
+
+/// Single-page stream adapter wrapping a boxed future. Yields the
+/// one configured `PageRef` on success, or the future's error.
+struct OneShotStream<'a> {
+    fut: Option<Pin<Box<dyn Future<Output = Result<(), Error>> + 'a>>>,
+    page: PageRef,
+}
+
+impl<'a> PageStream for OneShotStream<'a> {
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<PageRef, Error>>> {
+        // SAFETY: `OneShotStream` is `Unpin`-safe in practice: we
+        // never move `fut` once Some, only poll it.
+        let this = unsafe { self.as_mut().get_unchecked_mut() };
+        let Some(fut) = this.fut.as_mut() else {
+            return Poll::Ready(None);
+        };
+        match fut.as_mut().poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(())) => {
+                this.fut = None;
+                Poll::Ready(Some(Ok(this.page)))
+            }
+            Poll::Ready(Err(e)) => {
+                this.fut = None;
+                Poll::Ready(Some(Err(e)))
+            }
+        }
+    }
+}
+
+impl Transport<TestReq> for MockTransport {
+    type Stream<'a> = OneShotStream<'a>;
+
+    fn bulk_get<'a>(
+        &'a self,
+        req: &'a TestReq,
+        src: BulkRef,
+        dsts: &'a [PageRef],
+    ) -> Self::Stream<'a> {
+        assert_eq!(dsts.len(), 1, "Pool always issues single-page bulk_get");
+        let page = dsts[0];
+        OneShotStream {
+            fut: Some(Box::pin(self.do_bulk_get(req, src, page))),
+            page,
+        }
     }
 }
 
@@ -255,14 +303,9 @@ impl MockBlockStore {
 }
 
 impl BlockStore for MockBlockStore {
-    fn register_pages(
-        &self,
-        base: *mut u8,
-        page_size: usize,
-        _page_count: usize,
-    ) -> Result<(), Error> {
-        *self.base.borrow_mut() = Some(base);
-        *self.page_size.borrow_mut() = page_size;
+    fn register_pages(&self, backing: &Backing) -> Result<(), Error> {
+        *self.base.borrow_mut() = Some(backing.base);
+        *self.page_size.borrow_mut() = backing.page_size;
         Ok(())
     }
 
@@ -350,19 +393,21 @@ struct TransportRc(Rc<MockTransport>);
 struct BlockStoreRc(Rc<MockBlockStore>);
 
 impl Transport<TestReq> for TransportRc {
-    async fn bulk_get(&self, req: &TestReq, src: BulkRef, dst: PageRef) -> Result<(), Error> {
-        self.0.bulk_get(req, src, dst).await
+    type Stream<'a> = OneShotStream<'a>;
+
+    fn bulk_get<'a>(
+        &'a self,
+        req: &'a TestReq,
+        src: BulkRef,
+        dsts: &'a [PageRef],
+    ) -> Self::Stream<'a> {
+        self.0.bulk_get(req, src, dsts)
     }
 }
 
 impl BlockStore for BlockStoreRc {
-    fn register_pages(
-        &self,
-        base: *mut u8,
-        page_size: usize,
-        page_count: usize,
-    ) -> Result<(), Error> {
-        self.0.register_pages(base, page_size, page_count)
+    fn register_pages(&self, backing: &Backing) -> Result<(), Error> {
+        self.0.register_pages(backing)
     }
     async fn read_page(
         &self,

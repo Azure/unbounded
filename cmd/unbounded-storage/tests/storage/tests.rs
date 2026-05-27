@@ -46,7 +46,7 @@ proptest! {
                 }
             }
         }
-        let faults_enabled = w.io_fault_rate > 0;
+        let faults_enabled = w.io_fault_rate > 0 || w.read_corrupt_rate > 0;
         let report = run_workload(seed, w).expect("run completed");
         for (i, o) in report.outcomes.iter().enumerate() {
             match o {
@@ -157,15 +157,21 @@ proptest! {
     ///      `btree_entries` exceeds `resident_pages` by up to
     ///      `EVICT_SWEEP_TARGET` per failure.
     ///   2. A corrupted btree-internal read of the prior-LBA
-    ///      probe in `write_page_from`. A flipped byte that makes
-    ///      `lookup` return `Ok(None)` when a prior entry existed
-    ///      causes the engine to skip `retire_lba(old)`; the new
-    ///      LBA is admitted to both sides but the old LBA stays
-    ///      in the LRU and `reverse` map even though its btree
-    ///      key was overwritten by the new insert. That orphans
-    ///      one LRU entry per corruption, so
-    ///      `resident_pages` can exceed `btree_entries` by up to
-    ///      `device_corruptions_injected`.
+    ///      probe in the mutator's `process_batch`. A flipped
+    ///      byte that makes `btree::lookup` return `Ok(None)`
+    ///      when a prior entry existed causes the engine to skip
+    ///      `retire_range(old)`; the new LBA is admitted to both
+    ///      sides but the old LBA stays in the LRU and `reverse`
+    ///      map even though its btree key was overwritten by the
+    ///      new insert. That orphans one LRU entry per
+    ///      corruption, so `resident_pages` can exceed
+    ///      `btree_entries` by up to `device_corruptions_injected`.
+    ///      A corruption that hits the path-copy descent inside
+    ///      `apply_batch` itself aborts the commit (the engine's
+    ///      `apply_node` surfaces `Decoded::Empty` as
+    ///      `Error::Corrupt` so a subtree is never silently
+    ///      dropped from the new tree), so it doesn't contribute
+    ///      to the gap.
     ///   The data-write failure paths in `write_page_from` either
     ///   rewind both sides or touch neither, so they don't
     ///   contribute. `pending_free_len` is added as a small

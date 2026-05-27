@@ -67,9 +67,7 @@ use unbounded_storage::backing::{
     BackingKind, BackingRequest, HUGEPAGE_2MB, allocate,
 };
 use unbounded_storage::bufferpool::{BlockStore, PageRef, StripeKey};
-use unbounded_storage::runtime::{
-    DefaultRuntime, PinnedRuntime, Threading, WorkerIdx, WorkerSpec,
-};
+use unbounded_storage::runtime::{DefaultRuntime, PinnedRuntime, Threading, WorkerIdx, WorkerSpec};
 use unbounded_storage::storage::blockdev::{BlockDevice, UringBlockDevice, UringConfig};
 use unbounded_storage::storage::{EngineConfig, LocalStorage, StorageEngine};
 use unbounded_storage::topology::{Host, Nvme, Plan, PlanConfig, Role};
@@ -110,10 +108,7 @@ const MAX_CONSECUTIVE_ERRORS: u64 = 64;
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 #[derive(Parser)]
-#[command(
-    name = "bench",
-    about = "Benchmark harness for unbounded subsystems."
-)]
+#[command(name = "bench", about = "Benchmark harness for unbounded subsystems.")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -294,8 +289,7 @@ fn run_block(args: BlockArgs) -> ExitCode {
         .collect();
 
     // Per-phase per-shard op cap. Spread the global cap evenly.
-    let ops_cap_per_shard: Option<u64> =
-        args.ops.map(|n| n.div_ceil(total_shards as u64).max(1));
+    let ops_cap_per_shard: Option<u64> = args.ops.map(|n| n.div_ceil(total_shards as u64).max(1));
 
     // Cumulative worker_id offset so every worker has a globally
     // unique id (used as both a routing tiebreaker and a ChaCha
@@ -416,10 +410,7 @@ fn run_block(args: BlockArgs) -> ExitCode {
 /// pinned slots are not used as OS threads today: all shards on a
 /// given device share one engine and one ring on one OS thread to
 /// preserve crash-consistency invariants on the device's LBA space.
-fn build_pinned_specs(
-    devices: &[PathBuf],
-    threads_per_device: usize,
-) -> Option<Vec<WorkerSpec>> {
+fn build_pinned_specs(devices: &[PathBuf], threads_per_device: usize) -> Option<Vec<WorkerSpec>> {
     let host = Host::discover();
     if host.cpus.is_empty() {
         eprintln!(
@@ -699,7 +690,7 @@ fn run_device_inner(
     // correct (single allocator + btree per LBA space).
     let local = Arc::new(LocalStorage::new(vec![engine.clone()]));
     local
-        .register_pages(backing_base, PAGE_BYTES, page_count)
+        .register_pages(&backing)
         .map_err(|e| format!("register_pages: {e:?}"))?;
 
     // Assign each shard a disjoint `page_idx` range in the shared
@@ -1524,11 +1515,7 @@ fn print_phase(name: &str, args: &BlockArgs, total_shards: usize, reports: &[Sha
     let total_bytes: u64 = reports.iter().map(|r| r.bytes).sum();
     let total_errors: u64 = reports.iter().map(|r| r.errors).sum();
     let total_misses: u64 = reports.iter().map(|r| r.read_misses).sum();
-    let elapsed = reports
-        .iter()
-        .map(|r| r.elapsed)
-        .max()
-        .unwrap_or_default();
+    let elapsed = reports.iter().map(|r| r.elapsed).max().unwrap_or_default();
     let elapsed_secs = elapsed.as_secs_f64();
     let throughput_bps = if elapsed_secs > 0.0 {
         total_bytes as f64 / elapsed_secs
@@ -1555,11 +1542,7 @@ fn print_phase(name: &str, args: &BlockArgs, total_shards: usize, reports: &[Sha
         .join(", ");
 
     println!("bench storage block - {name} phase");
-    println!(
-        "  devices:        {} ({})",
-        args.device.len(),
-        device_list,
-    );
+    println!("  devices:        {} ({})", args.device.len(), device_list,);
     println!(
         "  threads/device: {} (total shards: {})",
         args.threads_per_device, total_shards,
@@ -1579,9 +1562,18 @@ fn print_phase(name: &str, args: &BlockArgs, total_shards: usize, reports: &[Sha
         human_bytes(throughput_bps as u64),
         ops_per_sec,
     );
-    println!("  latency p50:    {}", format_duration(percentile(&all_lat, 0.50)));
-    println!("  latency p99:    {}", format_duration(percentile(&all_lat, 0.99)));
-    println!("  latency max:    {}", format_duration(all_lat.last().copied().unwrap_or_default()));
+    println!(
+        "  latency p50:    {}",
+        format_duration(percentile(&all_lat, 0.50))
+    );
+    println!(
+        "  latency p99:    {}",
+        format_duration(percentile(&all_lat, 0.99))
+    );
+    println!(
+        "  latency max:    {}",
+        format_duration(all_lat.last().copied().unwrap_or_default())
+    );
     if total_errors > 0 {
         println!("  errors:         {}", total_errors);
     }
@@ -1748,10 +1740,7 @@ struct YieldOnce {
 
 impl std::future::Future for YieldOnce {
     type Output = ();
-    fn poll(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<()> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
         if self.yielded {
             std::task::Poll::Ready(())
         } else {

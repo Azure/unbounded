@@ -580,8 +580,8 @@ mod tests {
         let mut cfg = defaults();
         cfg.exclude_node_cpu0 = true;
         cfg.respect_isolated = true; // isolated empty so this branch
-                                     // is bypassed and exclude path
-                                     // applies.
+        // is bypassed and exclude path
+        // applies.
         let plan = Plan::for_host(&host, &cfg);
         for w in &plan.workers {
             assert_ne!(w.cpu, 0, "cpu0 should be excluded");
@@ -691,10 +691,11 @@ mod tests {
             }
         }
         // No TCP fallback because hca 1 survived.
-        assert!(plan
-            .workers
-            .iter()
-            .all(|w| !matches!(w.role, Role::RdmaProgress { hca } if hca == usize::MAX)));
+        assert!(
+            plan.workers
+                .iter()
+                .all(|w| !matches!(w.role, Role::RdmaProgress { hca } if hca == usize::MAX))
+        );
     }
 
     #[test]
@@ -746,7 +747,10 @@ mod tests {
     fn numa_pools_count_per_node_workers() {
         // Reuse the GB200 shape: 10 workers per node.
         let host = fake_host(
-            vec![(0, (0..16).collect(), vec![]), (1, (16..32).collect(), vec![])],
+            vec![
+                (0, (0..16).collect(), vec![]),
+                (1, (16..32).collect(), vec![]),
+            ],
             vec![],
             vec![
                 hca("mlx5_0", "0000:01:00.0", Some(0), true),
