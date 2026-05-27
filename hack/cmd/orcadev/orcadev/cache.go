@@ -519,11 +519,20 @@ func splitBucketKey(s string) (string, string) {
 	return s[:idx], s[idx+1:]
 }
 
-// confirmPrompt asks for y/N confirmation on stdin. Returns an
-// error wrapping the user response when the user declines or stdin
-// is closed.
+// errConfirmAborted is returned by confirmPrompt when the user
+// declines. Callers that treat a decline as a clean exit (vs. an
+// error) can detect it with errors.Is.
+var errConfirmAborted = errors.New("aborted")
+
+// confirmPrompt asks for y/N confirmation on stdin. Returns
+// errConfirmAborted when the user declines, or an error wrapping
+// the read failure if stdin is closed before any input.
 func confirmPrompt(msg string) error {
-	fmt.Fprintf(os.Stderr, "%s proceed? [y/N]: ", msg)
+	if msg != "" {
+		fmt.Fprint(os.Stderr, msg+" ")
+	}
+
+	fmt.Fprint(os.Stderr, "proceed? [y/N]: ")
 
 	r := bufio.NewReader(os.Stdin)
 
@@ -537,7 +546,7 @@ func confirmPrompt(msg string) error {
 	}
 
 	if strings.ToLower(strings.TrimSpace(line)) != "y" {
-		return fmt.Errorf("aborted")
+		return errConfirmAborted
 	}
 
 	return nil

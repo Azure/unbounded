@@ -17,32 +17,13 @@ import (
 // for percentile reporting on small-to-medium sample sizes and
 // avoids interpolation surprises on log-distributed latency data.
 func percentile(samples []time.Duration, v float64) time.Duration {
-	n := len(samples)
-	if n == 0 {
+	if len(samples) == 0 {
 		return 0
 	}
 
 	sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
 
-	if v <= 0 {
-		return samples[0]
-	}
-
-	if v >= 100 {
-		return samples[n-1]
-	}
-
-	// nearest-rank, ceiling
-	idx := int((v/100.0)*float64(n) + 0.999999)
-	if idx < 1 {
-		idx = 1
-	}
-
-	if idx > n {
-		idx = n
-	}
-
-	return samples[idx-1]
+	return percentileSorted(samples, v)
 }
 
 // latencyStats is the canonical set of percentile + min/max numbers
@@ -70,9 +51,9 @@ func computeLatencyStats(samples []time.Duration) latencyStats {
 	}
 }
 
-// percentileSorted is the same as percentile but skips the sort. Used
-// internally by computeLatencyStats so we sort once and read out
-// multiple percentiles.
+// percentileSorted returns the v-th percentile of an already-sorted
+// samples slice (ascending). Used internally so we sort once and
+// read out multiple percentiles.
 func percentileSorted(samples []time.Duration, v float64) time.Duration {
 	n := len(samples)
 	if n == 0 {
@@ -87,6 +68,7 @@ func percentileSorted(samples []time.Duration, v float64) time.Duration {
 		return samples[n-1]
 	}
 
+	// nearest-rank, ceiling
 	idx := int((v/100.0)*float64(n) + 0.999999)
 	if idx < 1 {
 		idx = 1

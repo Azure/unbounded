@@ -168,7 +168,7 @@ func (a *awss3Origin) Head(ctx context.Context, key string) (originInfo, error) 
 	}
 
 	if out.ETag != nil {
-		info.ETag = strings.Trim(*out.ETag, "\"")
+		info.ETag = unquoteETag(*out.ETag)
 	}
 
 	return info, nil
@@ -259,7 +259,7 @@ func (a *awss3Origin) List(ctx context.Context, prefix string, limit int) ([]ori
 			}
 
 			if c.ETag != nil {
-				obj.ETag = strings.Trim(*c.ETag, "\"")
+				obj.ETag = unquoteETag(*c.ETag)
 			}
 
 			out = append(out, obj)
@@ -360,7 +360,7 @@ func (a *azureblobOrigin) Head(ctx context.Context, key string) (originInfo, err
 	}
 
 	if props.ETag != nil {
-		info.ETag = strings.Trim(string(*props.ETag), "\"")
+		info.ETag = unquoteETag(string(*props.ETag))
 	}
 
 	return info, nil
@@ -416,7 +416,7 @@ func (a *azureblobOrigin) List(ctx context.Context, prefix string, limit int) ([
 				}
 
 				if item.Properties.ETag != nil {
-					obj.ETag = strings.Trim(string(*item.Properties.ETag), "\"")
+					obj.ETag = unquoteETag(string(*item.Properties.ETag))
 				}
 			}
 

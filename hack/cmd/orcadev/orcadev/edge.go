@@ -98,7 +98,7 @@ func (c *edgeClient) do(ctx context.Context, method, path string, hdr http.Heade
 	}
 
 	if v := resp.Header.Get("ETag"); v != "" {
-		out.ETag = strings.Trim(v, "\"")
+		out.ETag = unquoteETag(v)
 	}
 
 	// HEAD has no body but Go still allocates a (empty) ReadCloser

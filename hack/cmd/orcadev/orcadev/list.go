@@ -4,13 +4,10 @@
 package orcadev
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
-	"strings"
 
 	"github.com/spf13/cobra"
 )
@@ -111,22 +108,13 @@ func runDelete(ctx context.Context, g *globalFlags, o *deleteOpts) error {
 			fmt.Fprintf(os.Stderr, "  %s\n", obj.Name)
 		}
 
-		fmt.Fprint(os.Stderr, "proceed? [y/N]: ")
-
-		r := bufio.NewReader(os.Stdin)
-
-		line, err := r.ReadString('\n')
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return fmt.Errorf("delete confirmation: stdin closed without input; pass --yes to skip the prompt in non-interactive contexts")
+		if err := confirmPrompt(""); err != nil {
+			if errors.Is(err, errConfirmAborted) {
+				fmt.Fprintln(os.Stderr, "aborted.")
+				return nil
 			}
 
-			return fmt.Errorf("read confirmation: %w", err)
-		}
-
-		if strings.ToLower(strings.TrimSpace(line)) != "y" {
-			fmt.Fprintln(os.Stderr, "aborted.")
-			return nil
+			return err
 		}
 	}
 

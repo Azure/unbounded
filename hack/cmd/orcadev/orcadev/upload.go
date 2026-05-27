@@ -257,8 +257,6 @@ func runUploadGenerate(ctx context.Context, oc originClient, o *uploadOpts) erro
 	// which reads more naturally for an operator typing
 	// `orcadev bench KEY=foo1`.
 	for i := 1; i <= o.count; i++ {
-		i := i
-
 		eg.Go(func() error {
 			blobName := fmt.Sprintf("%s%d", name, i)
 			body := newRandomReader(size, o.seed, int64(i))

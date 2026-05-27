@@ -19,6 +19,14 @@ func hasher() hash.Hash { return sha256.New() }
 // hexSum returns the hex-encoded final digest of h.
 func hexSum(h hash.Hash) string { return hex.EncodeToString(h.Sum(nil)) }
 
+// unquoteETag strips the surrounding double-quote characters HTTP /
+// S3 / Azure return on ETag header and metadata values. Used by the
+// origin and cachestore client wrappers to normalize ETag strings
+// before exposing them to the rest of the tool. Does NOT strip the
+// weak-validator "W/" prefix; for RFC 7232 comparison use
+// normalizeETag instead.
+func unquoteETag(s string) string { return strings.Trim(s, "\"") }
+
 // teeHashReader wraps r so every byte read flows through h before
 // being returned. Read returns r.Read's results unchanged. Closing
 // it closes the underlying ReadCloser if it implements io.Closer.

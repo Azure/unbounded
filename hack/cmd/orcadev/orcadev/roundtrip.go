@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -525,21 +526,13 @@ func parseByteRange(spec string, size int64) (int64, int64, error) {
 	// Defer to a real parser via origin/server logic would be
 	// overkill; the dev tool accepts the common shapes only.
 	const prefix = "bytes="
-	if len(spec) < len(prefix) || spec[:len(prefix)] != prefix {
+	if !strings.HasPrefix(spec, prefix) {
 		return 0, 0, fmt.Errorf("range %q: must start with %q", spec, prefix)
 	}
 
 	body := spec[len(prefix):]
 
-	dash := -1
-
-	for i := 0; i < len(body); i++ {
-		if body[i] == '-' {
-			dash = i
-			break
-		}
-	}
-
+	dash := strings.IndexByte(body, '-')
 	if dash < 0 {
 		return 0, 0, fmt.Errorf("range %q: missing dash", spec)
 	}
@@ -548,7 +541,7 @@ func parseByteRange(spec string, size int64) (int64, int64, error) {
 
 	if leftStr == "" {
 		// suffix: -N
-		n, err := parseInt(rightStr)
+		n, err := strconv.ParseInt(rightStr, 10, 64)
 		if err != nil || n <= 0 || n > size {
 			return 0, 0, fmt.Errorf("range %q: invalid suffix", spec)
 		}
@@ -556,14 +549,14 @@ func parseByteRange(spec string, size int64) (int64, int64, error) {
 		return size - n, size - 1, nil
 	}
 
-	start, err := parseInt(leftStr)
+	start, err := strconv.ParseInt(leftStr, 10, 64)
 	if err != nil || start < 0 {
 		return 0, 0, fmt.Errorf("range %q: invalid start", spec)
 	}
 
 	end := size - 1
 	if rightStr != "" {
-		e, err := parseInt(rightStr)
+		e, err := strconv.ParseInt(rightStr, 10, 64)
 		if err != nil || e < start {
 			return 0, 0, fmt.Errorf("range %q: invalid end", spec)
 		}
@@ -574,24 +567,6 @@ func parseByteRange(spec string, size int64) (int64, int64, error) {
 	}
 
 	return start, end, nil
-}
-
-// parseInt is a thin int64 parser without depending on strconv.Atoi.
-func parseInt(s string) (int64, error) {
-	if s == "" {
-		return 0, fmt.Errorf("empty")
-	}
-
-	var n int64
-	for _, c := range s {
-		if c < '0' || c > '9' {
-			return 0, fmt.Errorf("non-digit")
-		}
-
-		n = n*10 + int64(c-'0')
-	}
-
-	return n, nil
 }
 
 // formatRate renders bytes/elapsed as a human-friendly throughput
