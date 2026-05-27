@@ -39,8 +39,13 @@ func TestProductionManifestsRender(t *testing.T) {
 	)
 }
 
-// TestDevManifestsRender renders the LocalStack + Azurite + init-Job
-// manifests used by the Kind dev harness.
+// TestDevManifestsRender renders the LocalStack + Azurite manifests
+// used by the Kind dev harness. The previous one-shot bucket-init
+// Jobs (02-init-job.yaml.tmpl, 04-azurite-init.yaml.tmpl) were
+// replaced by self-healing PostStart lifecycle hooks / sidecars
+// driven by an inline ConfigMap, so the required-kind set is
+// Deployment + Service + ConfigMap rather than the old
+// Deployment + Service + Job.
 func TestDevManifestsRender(t *testing.T) {
 	t.Parallel()
 
@@ -48,7 +53,7 @@ func TestDevManifestsRender(t *testing.T) {
 	templatesDir := filepath.Join(root, "deploy", "orca", "dev")
 
 	renderAndValidate(t, templatesDir, devData(),
-		expectKindsAtLeastOnce("Deployment", "Service", "Job"),
+		expectKindsAtLeastOnce("Deployment", "Service", "ConfigMap"),
 	)
 }
 
