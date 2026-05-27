@@ -73,6 +73,14 @@ pub struct ProxyMetadata {
 pub struct BlockDeviceProxy {
     cmd_tx: Sender<Command>,
     metadata: ProxyMetadata,
+    /// Set to `false` by [`run_proxy_service`] after its final
+    /// receiver-drain and before the receiver is dropped. The
+    /// proxy's synchronous waits check this flag so that a command
+    /// whose `send` raced the service's shutdown can fail cleanly
+    /// with `EIO` instead of parking on a reply slot that will
+    /// never be set (the channel destructor silently discards
+    /// in-flight commands without completing their replies).
+    service_alive: Arc<AtomicBool>,
 }
 
 impl BlockDeviceProxy {
@@ -81,12 +89,17 @@ impl BlockDeviceProxy {
     /// thread that owns the underlying device.
     pub fn new(metadata: ProxyMetadata) -> (Self, ProxyReceiver) {
         let (tx, rx) = channel();
+        let service_alive = Arc::new(AtomicBool::new(true));
         (
             Self {
                 cmd_tx: tx,
                 metadata,
+                service_alive: service_alive.clone(),
             },
-            ProxyReceiver(rx),
+            ProxyReceiver {
+                rx,
+                service_alive,
+            },
         )
     }
 }
@@ -96,6 +109,7 @@ impl Clone for BlockDeviceProxy {
         Self {
             cmd_tx: self.cmd_tx.clone(),
             metadata: self.metadata,
+            service_alive: self.service_alive.clone(),
         }
     }
 }
@@ -117,7 +131,12 @@ impl BlockDevice for BlockDeviceProxy {
         // The trait is synchronous; callers (Pool::new,
         // register_extra_buffer) are setup paths that already block
         // their thread, so a brief yield-loop on the reply slot is
-        // acceptable here.
+        // acceptable here. The service-alive check guarantees the
+        // wait cannot outlive the service: any send that races the
+        // service's exit either lands in the final drain (reply set
+        // to EIO) or sits in the channel until the receiver is
+        // dropped (no completion); the latter case is caught by the
+        // `service_alive == false` check below.
         let ptr = NonNull::new(base).ok_or(Error::Io(libc::EINVAL))?;
         let reply = ReplySlot::new();
         self.cmd_tx
@@ -127,7 +146,7 @@ impl BlockDevice for BlockDeviceProxy {
                 reply: reply.clone(),
             })
             .map_err(|_| Error::Io(libc::EPIPE))?;
-        spin_block_on(reply.wait())
+        spin_block_on_with_alive(reply.wait(), &self.service_alive)
     }
 
     async fn read(&self, lba: Lba, dst: &mut [u8]) -> Result<(), Error> {
@@ -142,7 +161,7 @@ impl BlockDevice for BlockDeviceProxy {
                 reply: reply.clone(),
             })
             .map_err(|_| Error::Io(libc::EPIPE))?;
-        reply.wait().await
+        AliveAwareWait::new(reply, self.service_alive.clone()).await
     }
 
     async fn write(&self, lba: Lba, src: &[u8]) -> Result<(), Error> {
@@ -159,7 +178,7 @@ impl BlockDevice for BlockDeviceProxy {
                 reply: reply.clone(),
             })
             .map_err(|_| Error::Io(libc::EPIPE))?;
-        reply.wait().await
+        AliveAwareWait::new(reply, self.service_alive.clone()).await
     }
 
     fn progress(&self) -> Result<(), Error> {
@@ -172,8 +191,12 @@ impl BlockDevice for BlockDeviceProxy {
 /// Single-consumer receiver half of the command channel.
 ///
 /// Not `Clone`: only one [`run_proxy_service`] call may drain a
-/// given proxy.
-pub struct ProxyReceiver(Receiver<Command>);
+/// given proxy. Carries the shared `service_alive` flag forward so
+/// the eventual [`ProxyService`] can flip it during shutdown.
+pub struct ProxyReceiver {
+    rx: Receiver<Command>,
+    service_alive: Arc<AtomicBool>,
+}
 
 /// Single-iteration core of the proxy service loop.
 ///
@@ -191,6 +214,7 @@ pub struct ProxyService<B: BlockDevice + 'static> {
     rx: Receiver<Command>,
     in_flight: Vec<InflightOp>,
     disconnected: bool,
+    service_alive: Arc<AtomicBool>,
 }
 
 impl<B: BlockDevice + 'static> ProxyService<B> {
@@ -198,10 +222,23 @@ impl<B: BlockDevice + 'static> ProxyService<B> {
     pub fn new(device: B, rx: ProxyReceiver) -> Self {
         Self {
             device: Rc::new(device),
-            rx: rx.0,
+            rx: rx.rx,
             in_flight: Vec::new(),
             disconnected: false,
+            service_alive: rx.service_alive,
         }
+    }
+
+    /// Flip the shared `service_alive` flag to `false`. Callers
+    /// driving [`Self::poll_once`] directly must call this once
+    /// they have committed to never polling again, so that
+    /// synchronous proxy waits ([`BlockDeviceProxy::register_buffers`])
+    /// and async ones ([`BlockDeviceProxy::read`] /
+    /// [`BlockDeviceProxy::write`]) can stop waiting for replies
+    /// that will never arrive. [`run_proxy_service`] handles this
+    /// automatically.
+    pub fn mark_dead(&self) {
+        self.service_alive.store(false, Ordering::Release);
     }
 
     /// The underlying device, shared via `Rc` so each in-flight
@@ -313,12 +350,37 @@ impl<B: BlockDevice + 'static> ProxyService<B> {
 
     /// Fail every in-flight op and every still-queued command with
     /// the supplied errno. Used on shutdown and on a progress error.
+    ///
+    /// Invariant for shutdown callers: after this returns, any send
+    /// that races with our final drain either (a) was caught by the
+    /// drain and its reply slot was set with `Err(Io(errno))`, or
+    /// (b) will fail at the producer with `SendError` once the
+    /// receiver is dropped, which the proxy translates to `EPIPE`.
+    /// Either way no caller hangs waiting on a reply slot that
+    /// nobody will set. Callers that want to close the window
+    /// further should call [`Self::drain_pending`] one more time
+    /// before dropping the service.
     pub fn fail_all(&mut self, errno: i32) {
         for op in self.in_flight.drain(..) {
             op.reply.set(Err(Error::Io(errno)));
         }
-        while let Ok(cmd) = self.rx.try_recv() {
-            fail_command(cmd, errno);
+        self.drain_pending(errno);
+    }
+
+    /// Drain any commands sitting in the channel, failing each one
+    /// with `errno`. Cheap to call repeatedly; used by the shutdown
+    /// path to close the race window between the drain inside
+    /// [`Self::fail_all`] and the eventual drop of the receiver.
+    pub fn drain_pending(&mut self, errno: i32) {
+        loop {
+            match self.rx.try_recv() {
+                Ok(cmd) => fail_command(cmd, errno),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.disconnected = true;
+                    break;
+                }
+            }
         }
     }
 }
@@ -347,12 +409,31 @@ pub fn run_proxy_service<B: BlockDevice + 'static>(
     loop {
         if let Err(e) = svc.poll_once(&mut cx) {
             eprintln!("uring proxy service: progress failed: {e}");
+            svc.mark_dead();
             return;
         }
 
         let shutdown_requested = stop.load(Ordering::Acquire) || svc.channel_disconnected();
         if shutdown_requested && !svc.has_inflight() {
+            // Closing the shutdown race: `fail_all` drains both the
+            // in-flight set and the receiver, but a producer thread
+            // may sneak a `send` in between that drain and the
+            // implicit drop of `svc.rx` at function exit. Drain one
+            // more time so any such command is failed with EIO
+            // instead of leaving its `ReplySlot` permanently unset.
+            //
+            // The drain alone still does not close the window: a
+            // send that lands after the second drain but before
+            // `svc` (and therefore `rx`) is dropped would sit in
+            // the channel and be silently discarded by the channel
+            // destructor, parking the producer's reply slot
+            // forever. `mark_dead` flips `service_alive` to false
+            // so the proxy's `spin_block_on_with_alive` and
+            // `AliveAwareWait` see the service is gone and resolve
+            // the wait with `EIO` rather than spin.
             svc.fail_all(libc::EIO);
+            svc.drain_pending(libc::EIO);
+            svc.mark_dead();
             return;
         }
 
@@ -484,6 +565,79 @@ fn spin_block_on<F: Future>(fut: F) -> F::Output {
         match fut.as_mut().poll(&mut cx) {
             Poll::Ready(v) => return v,
             Poll::Pending => std::thread::yield_now(),
+        }
+    }
+}
+
+/// Variant of [`spin_block_on`] specialized for proxy reply slots
+/// that bails with `EIO` once the service flips `service_alive` to
+/// false. The trailing extra poll guards the race where the
+/// service drained the command (filling the slot) and then flipped
+/// the flag before our last poll observed the result.
+fn spin_block_on_with_alive(
+    fut: ReplyWait,
+    service_alive: &AtomicBool,
+) -> Result<(), Error> {
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = Box::pin(fut);
+    loop {
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(v) => return v,
+            Poll::Pending => {
+                if !service_alive.load(Ordering::Acquire) {
+                    return match fut.as_mut().poll(&mut cx) {
+                        Poll::Ready(v) => v,
+                        Poll::Pending => Err(Error::Io(libc::EIO)),
+                    };
+                }
+                std::thread::yield_now();
+            }
+        }
+    }
+}
+
+/// `Future` adapter for the async proxy paths (`read` / `write`).
+/// Polls the underlying [`ReplyWait`]; if the slot is still pending
+/// and `service_alive` is false, polls once more to absorb the
+/// race window described in [`spin_block_on_with_alive`] and then
+/// resolves with `Err(Error::Io(EIO))`.
+struct AliveAwareWait {
+    reply: ReplyWait,
+    service_alive: Arc<AtomicBool>,
+}
+
+impl AliveAwareWait {
+    fn new(reply: Arc<ReplySlot>, service_alive: Arc<AtomicBool>) -> Self {
+        Self {
+            reply: ReplyWait { inner: reply },
+            service_alive,
+        }
+    }
+}
+
+impl Future for AliveAwareWait {
+    type Output = Result<(), Error>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: we project a pinned reference into a field that
+        // is itself trivially `Unpin` (ReplyWait holds an Arc), so
+        // moving the inner is sound. We never expose `&mut self`
+        // to user code.
+        let this = unsafe { self.get_unchecked_mut() };
+        let reply_pin = Pin::new(&mut this.reply);
+        match reply_pin.poll(cx) {
+            Poll::Ready(v) => Poll::Ready(v),
+            Poll::Pending => {
+                if !this.service_alive.load(Ordering::Acquire) {
+                    let reply_pin = Pin::new(&mut this.reply);
+                    return match reply_pin.poll(cx) {
+                        Poll::Ready(v) => Poll::Ready(v),
+                        Poll::Pending => Poll::Ready(Err(Error::Io(libc::EIO))),
+                    };
+                }
+                Poll::Pending
+            }
         }
     }
 }
@@ -652,6 +806,21 @@ mod tests {
     /// Stop flag flipped while a write is in flight: the service
     /// must finish that write before exiting so the caller's reply
     /// slot completes.
+    ///
+    /// Synchronization: `BlockDeviceProxy::write` is an `async fn`
+    /// and does not enqueue its `Command` until first polled. If we
+    /// flipped `stop` from the test thread before polling the
+    /// future even once, the service could observe `stop && rx
+    /// empty && no in_flight` and exit before the send ever
+    /// happened - the producer would then get `EPIPE`, not the
+    /// "in-flight op completes despite stop" outcome this test is
+    /// supposed to pin down. To eliminate that window we drive the
+    /// write to completion on a worker thread and only flip `stop`
+    /// after a sleep that comfortably exceeds the service's ~100us
+    /// poll cadence; by then the worker has had dozens of polls
+    /// worth of headroom to enqueue the command. If the send had
+    /// not happened by then this test would fail loudly (the worker
+    /// would return `EPIPE`) rather than flake silently.
     #[test]
     fn proxy_shutdown_after_inflight_completes() {
         let (proxy_tx, proxy_rx) = std_channel::<BlockDeviceProxy>();
@@ -673,11 +842,119 @@ mod tests {
         let proxy = proxy_rx.recv().expect("receive proxy");
         let payload = vec![1u8; proxy.page_size()];
 
-        // Submit the write, then immediately signal stop. The
-        // service must drain the in-flight op before exiting.
-        let write_fut = proxy.write(Lba(0), &payload);
+        let (result_tx, result_rx) = std_channel::<Result<(), Error>>();
+        let writer_proxy = proxy.clone();
+        let writer = std::thread::spawn(move || {
+            let res = block_on(writer_proxy.write(Lba(0), &payload));
+            result_tx.send(res).expect("send write result");
+        });
+
+        // 50ms >> the service's 100us poll cadence, so the worker's
+        // first poll (which performs the send) has long happened by
+        // the time we flip `stop`. If this assumption ever ceases
+        // to hold the worker returns EPIPE and the assertion below
+        // fails loudly instead of hanging.
+        std::thread::sleep(Duration::from_millis(50));
         stop.store(true, Ordering::Release);
-        block_on(write_fut).expect("write completes after stop");
+
+        let result = result_rx.recv().expect("write result");
+        result.expect("write completes after stop");
+        writer.join().expect("writer thread");
+
+        drop(proxy);
+        service.join().expect("service thread");
+    }
+
+    /// Once the service has exited, a fresh `write` must fail
+    /// promptly with `EPIPE` instead of parking on a reply slot
+    /// nobody will set.
+    #[test]
+    fn proxy_send_after_shutdown_returns_epipe() {
+        let (proxy_tx, proxy_rx) = std_channel::<BlockDeviceProxy>();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop.clone();
+
+        let service = std::thread::spawn(move || {
+            let device = MockDevice::new(MockDeviceConfig::default());
+            let metadata = ProxyMetadata {
+                page_size: device.page_size(),
+                capacity_pages: device.capacity_pages(),
+                write_queue_depth: device.write_queue_depth(),
+            };
+            let (proxy, rx) = BlockDeviceProxy::new(metadata);
+            proxy_tx.send(proxy).expect("send proxy back");
+            run_proxy_service(device, rx, stop_clone);
+        });
+
+        let proxy = proxy_rx.recv().expect("receive proxy");
+        stop.store(true, Ordering::Release);
+        service.join().expect("service thread");
+
+        let payload = vec![0u8; proxy.page_size()];
+        let result = block_on(proxy.write(Lba(0), &payload));
+        assert!(
+            matches!(result, Err(Error::Io(n)) if n == libc::EPIPE),
+            "expected EPIPE after service exit, got {result:?}",
+        );
+    }
+
+    /// Synchronous `register_buffers` must not hang when the
+    /// service shuts down concurrently. A watchdog thread bounds
+    /// the test so a regression fails loudly instead of wedging
+    /// CI; `std::thread::JoinHandle` has no timed `join`, so we
+    /// fall back to "panic if the worker has not finished within
+    /// the deadline".
+    #[test]
+    fn proxy_register_buffers_does_not_hang_on_shutdown_race() {
+        let (proxy_tx, proxy_rx) = std_channel::<BlockDeviceProxy>();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop.clone();
+
+        let service = std::thread::spawn(move || {
+            let device = MockDevice::new(MockDeviceConfig::default());
+            let metadata = ProxyMetadata {
+                page_size: device.page_size(),
+                capacity_pages: device.capacity_pages(),
+                write_queue_depth: device.write_queue_depth(),
+            };
+            let (proxy, rx) = BlockDeviceProxy::new(metadata);
+            proxy_tx.send(proxy).expect("send proxy back");
+            run_proxy_service(device, rx, stop_clone);
+        });
+
+        let proxy = proxy_rx.recv().expect("receive proxy");
+
+        let done = Arc::new(AtomicBool::new(false));
+        let done_worker = done.clone();
+        let worker_proxy = proxy.clone();
+        let worker = std::thread::spawn(move || {
+            let mut buf = vec![0u8; 4096];
+            let r = worker_proxy.register_buffers(buf.as_mut_ptr(), buf.len());
+            done_worker.store(true, Ordering::Release);
+            r
+        });
+
+        // Flip stop concurrently to provoke the race.
+        stop.store(true, Ordering::Release);
+
+        // Watchdog: 5s is generous against a healthy build and
+        // tight against an actual hang.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !done.load(Ordering::Acquire) {
+            if std::time::Instant::now() >= deadline {
+                panic!("register_buffers hung past deadline");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let result = worker.join().expect("worker thread");
+        // Either outcome is acceptable: the contract is "do not
+        // hang", not a specific status.
+        match result {
+            Ok(()) => {}
+            Err(Error::Io(n)) if n == libc::EPIPE || n == libc::EIO => {}
+            other => panic!("unexpected register_buffers result: {other:?}"),
+        }
 
         drop(proxy);
         service.join().expect("service thread");
