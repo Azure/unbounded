@@ -5,12 +5,16 @@
 //! [`LiveDiskTopology`].
 //!
 //! Each shard holds a [`LiveShardLocalStore`] and registers its
-//! NUMA-local backing exactly once via [`Self::register_backing`].
-//! On every `BlockStore` call the view compares the topology's
-//! currently-published `Arc<LocalStorage>` against the one it last
-//! saw; on a mismatch it replays the registered backing through the
+//! NUMA-local backing through [`Self::register_backing`]. On every
+//! `BlockStore` call the view compares the topology's current
+//! generation against the one it last replayed against; on a
+//! mismatch it re-registers every recorded backing through the
 //! newly-published [`LocalStorage::register_extra_buffer`] before
-//! delegating.
+//! delegating. Multiple backings and concurrent topology swaps are
+//! both safe: registration replay always re-seats the *full*
+//! recorded set under a single critical section, so we never mark a
+//! `LocalStorage` as "fully registered" without having actually
+//! registered every entry against it.
 //!
 //! When the topology has no engines published (empty `[[disks]]`)
 //! reads and writes return [`Error::Transport`] - the data path is
@@ -28,11 +32,19 @@ use super::topology::LiveDiskTopology;
 
 /// `BlockStore` that forwards to whichever [`LocalStorage`] is
 /// currently published by the topology, replaying buffer
-/// registrations whenever the published `LocalStorage` changes.
+/// registrations whenever the topology generation advances.
 pub struct LiveShardLocalStore<B: BlockDevice + 'static> {
     topology: Arc<LiveDiskTopology<B>>,
-    registered: Mutex<Vec<ShardBacking>>,
-    last_seen_ptr: Mutex<Option<*const LocalStorage<B>>>,
+    state: Mutex<ReplayState>,
+}
+
+/// Registered backings plus the topology generation we last
+/// replayed against. Kept together behind one mutex so a concurrent
+/// `apply_engines` cannot wedge an updated generation between an
+/// in-flight registration loop and the bookkeeping that records it.
+struct ReplayState {
+    registered: Vec<ShardBacking>,
+    last_seen_generation: Option<u64>,
 }
 
 #[derive(Copy, Clone)]
@@ -55,52 +67,68 @@ impl<B: BlockDevice + 'static> LiveShardLocalStore<B> {
     pub fn new(topology: Arc<LiveDiskTopology<B>>) -> Self {
         Self {
             topology,
-            registered: Mutex::new(Vec::new()),
-            last_seen_ptr: Mutex::new(None),
+            state: Mutex::new(ReplayState {
+                registered: Vec::new(),
+                last_seen_generation: None,
+            }),
         }
     }
 
-    /// Record `backing` and register it against the currently-
-    /// published [`LocalStorage`] (if any). Subsequent changes to
-    /// the published `LocalStorage` will replay the same
-    /// registration against the new instance.
+    /// Record `backing` and register the full set of recorded
+    /// backings against the currently-published [`LocalStorage`]
+    /// (if any). Subsequent topology swaps will replay the same
+    /// set against the new `LocalStorage`.
     pub fn register_backing(&self, backing: &bufferpool::Backing) -> Result<(), Error> {
         let entry = ShardBacking {
             base: backing.base,
             page_size: backing.page_size,
             page_count: backing.page_count,
         };
-        self.registered.lock().unwrap().push(entry);
-        if let Some(ls) = self.topology.current() {
-            ls.register_extra_buffer(entry.base, entry.page_size * entry.page_count)?;
-            // Mark *this* `Arc<LocalStorage>` as the one we have
-            // registered against. Reading the pointer from the
-            // same `Arc` we just registered avoids the TOCTOU
-            // where another `apply_engines` between the
-            // `current()` call and a generation read would cause
-            // the next swap to be missed.
-            *self.last_seen_ptr.lock().unwrap() = Some(Arc::as_ptr(&ls));
+        {
+            let mut guard = self.state.lock().unwrap();
+            guard.registered.push(entry);
+            // Force a replay even if the generation matches what
+            // we last saw: the new entry has never been
+            // registered against the current `LocalStorage`.
+            guard.last_seen_generation = None;
         }
+        let _ = self.current_or_replay();
         Ok(())
     }
 
     /// Resolve the currently-published `LocalStorage`, replaying
-    /// any registered backings if the published instance changed.
-    /// Returns `None` when the topology has no engines.
+    /// every registered backing if the topology generation has
+    /// advanced since we last replayed. Returns `None` when the
+    /// topology has no engines.
     fn current_or_replay(&self) -> Option<Arc<LocalStorage<B>>> {
         let ls = self.topology.current()?;
-        let ls_ptr = Arc::as_ptr(&ls);
-        let mut last_ptr = self.last_seen_ptr.lock().unwrap();
-        if *last_ptr != Some(ls_ptr) {
-            let backings: Vec<ShardBacking> = self.registered.lock().unwrap().clone();
-            for b in &backings {
-                if let Err(e) = ls.register_extra_buffer(b.base, b.page_size * b.page_count) {
-                    eprintln!("disks: replay register_extra_buffer failed: {e:?}");
-                }
-            }
-            *last_ptr = Some(ls_ptr);
+        // `apply_engines` publishes the snapshot *before* it bumps
+        // the generation counter (see `topology::apply_engines`).
+        // Reading the generation after `current()` is therefore
+        // conservative: if a concurrent swap is in progress we
+        // either observe the old snapshot + old gen (we will
+        // catch up on the next call) or the new snapshot + an
+        // old-or-new gen. We can never observe a new gen paired
+        // with an old snapshot, so "have I registered against
+        // this gen yet?" is a sound staleness check.
+        let gen_n = self.topology.generation();
+        let mut guard = self.state.lock().unwrap();
+        if guard.last_seen_generation != Some(gen_n) {
+            Self::replay_locked(&ls, &guard.registered);
+            guard.last_seen_generation = Some(gen_n);
         }
         Some(ls)
+    }
+
+    /// Re-register every recorded backing against `ls`. Errors
+    /// are logged and swallowed: a single bad registration must
+    /// not prevent the rest of the set from being seated.
+    fn replay_locked(ls: &LocalStorage<B>, backings: &[ShardBacking]) {
+        for b in backings {
+            if let Err(e) = ls.register_extra_buffer(b.base, b.page_size * b.page_count) {
+                eprintln!("disks: replay register_extra_buffer failed: {e:?}");
+            }
+        }
     }
 }
 
@@ -169,6 +197,10 @@ mod tests {
     }
 
     fn engine() -> Arc<StorageEngine<MockDevice>> {
+        engine_with_device().0
+    }
+
+    fn engine_with_device() -> (Arc<StorageEngine<MockDevice>>, Arc<MockDevice>) {
         let device = Arc::new(MockDevice::new(MockDeviceConfig {
             page_size: 4096,
             capacity_pages: 64,
@@ -177,7 +209,20 @@ mod tests {
         let mut cfg = EngineConfig::default();
         cfg.page_size_bytes = 4096;
         cfg.btree_page_bytes = 4096;
-        Arc::new(block_on(StorageEngine::open(device, cfg)).unwrap())
+        let eng = Arc::new(block_on(StorageEngine::open(device.clone(), cfg)).unwrap());
+        (eng, device)
+    }
+
+    fn make_backing(pages: usize) -> (Box<[u8]>, bufferpool::Backing) {
+        let mut buf = vec![0u8; 4096 * pages].into_boxed_slice();
+        let base = buf.as_mut_ptr();
+        let backing = bufferpool::Backing {
+            base,
+            page_size: 4096,
+            page_count: pages,
+            _own: Box::new(()),
+        };
+        (buf, backing)
     }
 
     #[test]
@@ -186,27 +231,75 @@ mod tests {
         t.apply_engines(vec![(PathBuf::from("/a"), engine())]);
 
         let view = LiveShardLocalStore::new(t.clone());
-        let mut buf = vec![0u8; 4096 * 8].into_boxed_slice();
-        let backing = bufferpool::Backing {
-            base: buf.as_mut_ptr(),
-            page_size: 4096,
-            page_count: 8,
-            _own: Box::new(()),
-        };
+        let (_buf, backing) = make_backing(8);
         view.register_backing(&backing).unwrap();
-        let ls1 = t.current().unwrap();
-        let p1 = view.last_seen_ptr.lock().unwrap().clone();
-        assert_eq!(p1, Some(Arc::as_ptr(&ls1)));
+        let gen1 = t.generation();
+        assert_eq!(view.state.lock().unwrap().last_seen_generation, Some(gen1));
 
         // Swap to a new engine set; the view must catch up on the
         // next `current_or_replay` call by re-registering against
-        // the freshly-published `LocalStorage`.
+        // the freshly-published `LocalStorage` and recording the
+        // new generation.
         t.apply_engines(vec![(PathBuf::from("/b"), engine())]);
-        let ls2 = t.current().unwrap();
-        assert!(!Arc::ptr_eq(&ls1, &ls2));
+        let gen2 = t.generation();
+        assert_ne!(gen1, gen2);
         let _ = view.current_or_replay();
-        let p2 = view.last_seen_ptr.lock().unwrap().clone();
-        assert_eq!(p2, Some(Arc::as_ptr(&ls2)));
+        assert_eq!(view.state.lock().unwrap().last_seen_generation, Some(gen2));
+    }
+
+    #[test]
+    fn replays_every_backing_against_newest_local_storage() {
+        // Registers two backings across two topology swaps, then
+        // forces a third swap and asserts that BOTH backings are
+        // re-registered against the freshest `LocalStorage`.
+        // Observability comes from the underlying `MockDevice`,
+        // which records every `register_buffers` call.
+        let t: Arc<LiveDiskTopology<MockDevice>> = LiveDiskTopology::new();
+        let (e1, _d1) = engine_with_device();
+        t.apply_engines(vec![(PathBuf::from("/a"), e1)]);
+
+        let view = LiveShardLocalStore::new(t.clone());
+        let (_buf_a, backing_a) = make_backing(4);
+        view.register_backing(&backing_a).unwrap();
+
+        // Swap to a fresh engine; the next BlockStore-style call
+        // will replay `backing_a` against the new device.
+        let (e2, _d2) = engine_with_device();
+        t.apply_engines(vec![(PathBuf::from("/b"), e2)]);
+
+        // Register a second backing. This must also replay
+        // `backing_a` against whatever LocalStorage is current
+        // (otherwise we would mark the new LocalStorage "fully
+        // registered" with only `backing_b` actually wired up).
+        let (_buf_b, backing_b) = make_backing(4);
+        view.register_backing(&backing_b).unwrap();
+
+        // Now drive a third swap with a brand-new device we can
+        // inspect. `StorageEngine::open` may itself perform
+        // bookkeeping registrations on the device, so snapshot
+        // the registration count immediately after the swap and
+        // measure the delta produced by `current_or_replay`.
+        let (e3, d3) = engine_with_device();
+        t.apply_engines(vec![(PathBuf::from("/c"), e3)]);
+        let baseline = d3.registered_count();
+        let baseline_bytes = d3.registered_len();
+        let _ = view.current_or_replay();
+
+        assert_eq!(
+            d3.registered_count() - baseline,
+            2,
+            "expected both backings to be replayed against the newest device"
+        );
+        assert_eq!(
+            d3.registered_len() - baseline_bytes,
+            backing_a.page_size * backing_a.page_count
+                + backing_b.page_size * backing_b.page_count,
+            "replay sizes do not match the recorded backings"
+        );
+        assert_eq!(
+            view.state.lock().unwrap().last_seen_generation,
+            Some(t.generation())
+        );
     }
 
     #[test]
