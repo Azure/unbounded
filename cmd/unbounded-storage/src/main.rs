@@ -15,10 +15,12 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 
 use unbounded_storage::bufferpool::{
-    NullBlockStore, PeerId, Pool, PoolConfig, PoolGroup, Req, ShardDescriptor, StripeKey,
+    PeerId, Pool, PoolConfig, PoolGroup, Req, ShardDescriptor, StripeKey,
 };
 use unbounded_storage::config::{self, Config, FabricCfg};
-use unbounded_storage::disk_supervisor::{DiskRegistry, LiveDiskTopology, UringDiskTarget};
+use unbounded_storage::disk_supervisor::{
+    DiskRegistry, LiveDiskTopology, LiveShardLocalStore, UringDiskTarget,
+};
 use unbounded_storage::storage::blockdev::BlockDeviceProxy;
 use unbounded_storage::fabric::{self, ConnectionSpec, Fabric, FabricTransport, Provider, StaticPeer};
 use unbounded_storage::runtime::{PinnedRuntime, Threading, WorkerIdx, WorkerSpec};
@@ -50,7 +52,11 @@ impl Req for PlaceholderReq {
     }
 }
 
-type ShardPool = Pool<FabricTransport<PlaceholderReq, StaticPeer>, NullBlockStore, PlaceholderReq>;
+type ShardPool = Pool<
+    FabricTransport<PlaceholderReq, StaticPeer>,
+    LiveShardLocalStore<BlockDeviceProxy>,
+    PlaceholderReq,
+>;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -105,6 +111,15 @@ fn main() -> ExitCode {
     let runtime = PinnedRuntime::new(specs);
     install_signal_handler();
 
+    // Hot-swap publication surface for shards. The disk supervisor
+    // opens each `UringBlockDevice` on its own progress thread,
+    // wraps it in a `BlockDeviceProxy` so the resulting
+    // `StorageEngine<BlockDeviceProxy>` is `Send + Sync`, and hands
+    // the engine `Arc`s back here for publication. Shards observe
+    // the snapshot through `LiveShardLocalStore`. Created before
+    // the shard loop so each shard receives a clone.
+    let topology: Arc<LiveDiskTopology<BlockDeviceProxy>> = LiveDiskTopology::new();
+
     // Each shard thread reports either an error or a populated
     // `ShardDescriptor` on this channel. The main thread aggregates
     // descriptors into a `PoolGroup` once every shard has reported.
@@ -124,6 +139,7 @@ fn main() -> ExitCode {
         let runtime = runtime.clone();
         let tx = ready_tx.clone();
         let fabric_cfg = fabric_cfg.clone();
+        let topology = topology.clone();
         joins.push(
             thread::Builder::new()
                 .name(format!("ub-storage-shard-{i}"))
@@ -141,6 +157,7 @@ fn main() -> ExitCode {
                                 backing_kind,
                                 bytes_per_shard,
                                 fabric_cfg,
+                                topology,
                             );
                         }),
                     );
@@ -207,14 +224,6 @@ fn main() -> ExitCode {
         .filter_map(|n| host.cpus_on(Some(n)).first().copied().map(|c| c as usize))
         .collect();
     let mut disk_registry = DiskRegistry::new(UringDiskTarget, disk_cpu_hints);
-    // Hot-swap publication surface for shards. The disk supervisor
-    // opens each `UringBlockDevice` on its own progress thread,
-    // wraps it in a `BlockDeviceProxy` so the resulting
-    // `StorageEngine<BlockDeviceProxy>` is `Send + Sync`, and hands
-    // the engine `Arc`s back here for publication. Shards observe
-    // the snapshot through `LiveShardLocalStore`.
-    let topology: Arc<LiveDiskTopology<BlockDeviceProxy>> =
-        LiveDiskTopology::new();
     if errors.is_empty() {
         let report = disk_registry.reconcile(&config.disks);
         eprintln!(
@@ -304,6 +313,7 @@ fn run_shard(
     backing_kind: BackingKind,
     bytes_per_shard: usize,
     fabric_cfg: Arc<FabricCfg>,
+    topology: Arc<LiveDiskTopology<BlockDeviceProxy>>,
 ) {
     // Default to the loopback device when no HCA is bound to this
     // shard; the `tcp` provider is the fallback path.
@@ -394,7 +404,13 @@ fn run_shard(
             return;
         }
     };
-    let blockstore = NullBlockStore::new();
+    // Wire the per-shard view over the live disk topology. When
+    // the topology is empty (no engines yet), `register_pages`
+    // records the backing silently and reads/writes return
+    // `Error::Transport("no disks open")`. Once the disk supervisor
+    // publishes engines, the view's `current_or_replay` catches the
+    // swap and replays buffer registration before delegating.
+    let blockstore = LiveShardLocalStore::new(topology);
     let pool: ShardPool = match Pool::new(PoolConfig::default(), backing, transport, blockstore) {
         Ok(p) => p,
         Err(e) => {
