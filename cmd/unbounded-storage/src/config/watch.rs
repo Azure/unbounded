@@ -270,8 +270,11 @@ listen_addr = "0.0.0.0:5678"
         let (_w, rx) = ConfigWatcher::new(path.clone()).unwrap();
         thread::sleep(Duration::from_millis(100));
 
-        // Five quick writes inside ~50ms. The debounce window is
+        // Five quick back-to-back writes. The debounce window is
         // 200ms, so these should fold down into far fewer updates.
+        // We deliberately do not sleep between writes: any inter-write
+        // delay just eats into the debounce budget on slow/loaded
+        // systems (e.g. CI) and turns this into a flaky timing test.
         let start = Instant::now();
         for i in 0..5 {
             let body = format!(
@@ -279,7 +282,6 @@ listen_addr = "0.0.0.0:5678"
                 4000 + i
             );
             write(&path, &body);
-            thread::sleep(Duration::from_millis(10));
         }
         assert!(
             start.elapsed() < Duration::from_millis(200),
