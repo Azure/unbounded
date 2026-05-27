@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"strings"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -19,24 +20,60 @@ import (
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	netv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 	"github.com/Azure/unbounded/internal/provision"
+	"github.com/Azure/unbounded/pkg/agent/daemoncred"
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
 // kubeClientFunc constructs a controller-runtime client from a rest.Config.
 // The production implementation is client.NewWithWatch; tests can supply a fake.
 type kubeClientFunc func(cfg *rest.Config, opts client.Options) (client.WithWatch, error)
 
+// runOptions configures daemon runtime behavior.
+type runOptions struct {
+	// DaemonCredentialDir stores the daemon-controller client certificate and key.
+	// When empty, the default path under the agent config directory is used.
+	DaemonCredentialDir string
+
+	// NewClient constructs controller-runtime clients. Defaults to client.NewWithWatch.
+	NewClient kubeClientFunc
+
+	// NodeOperator performs host-local nspawn operations. Defaults to nspawnNodeOperator.
+	NodeOperator nodeOperator
+}
+
+func (o *runOptions) validate() error {
+	if o == nil {
+		return fmt.Errorf("run options are required")
+	}
+	if o.NewClient == nil {
+		o.NewClient = client.NewWithWatch
+	}
+	if o.NodeOperator == nil {
+		o.NodeOperator = nspawnNodeOperator{}
+	}
+	if o.DaemonCredentialDir == "" {
+		o.DaemonCredentialDir = filepath.Join(goalstates.AgentConfigDir, "daemon-controller")
+	}
+
+	return nil
+}
+
 // Run is the main daemon entry point. It discovers the active nspawn
 // machine, builds a Kubernetes client, registers the Machine CR if needed,
 // and blocks until the context is cancelled.
 func Run(ctx context.Context, log *slog.Logger) error {
-	return run(ctx, log, client.NewWithWatch, nspawnNodeOperator{})
+	return run(ctx, log, runOptions{})
 }
 
-// run is the inner loop, accepting a client constructor so tests can
-// inject a fake.
-func run(ctx context.Context, log *slog.Logger, newClient kubeClientFunc, nodeOperator nodeOperator) error {
+// run is the inner loop. Tests can override external dependencies through opts.
+func run(ctx context.Context, log *slog.Logger, opts runOptions) error {
+	runOpts := &opts
+	if err := runOpts.validate(); err != nil {
+		return err
+	}
+
 	// Find the active machine and its applied config.
-	active, err := nodeOperator.FindActiveMachine(log)
+	active, err := runOpts.NodeOperator.FindActiveMachine(log)
 	if err != nil {
 		return fmt.Errorf("find active machine: %w", err)
 	}
@@ -47,18 +84,18 @@ func run(ctx context.Context, log *slog.Logger, newClient kubeClientFunc, nodeOp
 		"applied_version", active.Config.Cluster.Version,
 	)
 
-	// Build Kubernetes clients from the applied config.
-	restCfg, err := buildRESTConfig(active.Config)
+	controllerCfg, stopControllerCreds, err := daemonControllerCredentials(ctx, log, active.Config, runOpts)
 	if err != nil {
-		return fmt.Errorf("build rest config: %w", err)
+		return fmt.Errorf("build daemon controller credentials: %w", err)
 	}
+	defer stopControllerCreds()
 
-	kubeClient, err := newClient(restCfg, client.Options{Scheme: newScheme()})
+	kubeClient, err := runOpts.NewClient(controllerCfg, client.Options{Scheme: newScheme()})
 	if err != nil {
 		return fmt.Errorf("build kube client: %w", err)
 	}
 
-	log.Info("kube client ready",
+	log.Info("daemon controller kube client ready",
 		"api_server", active.Config.Kubelet.ApiServer,
 	)
 
@@ -73,16 +110,43 @@ func run(ctx context.Context, log *slog.Logger, newClient kubeClientFunc, nodeOp
 		log.Warn("failed to publish and clear AgentUpgrade daemon signals", "error", err)
 	}
 
-	return runController(ctx, log, restCfg, active.Config.MachineName, active.Config.NodeName, nodeOperator)
+	return runController(ctx, log, controllerCfg, active.Config.MachineName, active.Config.NodeName, runOpts.NodeOperator)
 }
 
-// buildRESTConfig builds a Kubernetes REST config from the applied agent
+func daemonControllerCredentials(
+	ctx context.Context,
+	log *slog.Logger,
+	agentCfg *provision.AgentConfig,
+	runOpts *runOptions,
+) (*rest.Config, context.CancelFunc, error) {
+	// Build bootstrap credentials from the applied config. These are used only
+	// to obtain the daemon-controller certificate.
+	bootstrapCfg, err := buildBootstrapRESTConfig(agentCfg)
+	if err != nil {
+		return nil, nil, fmt.Errorf("build bootstrap rest config: %w", err)
+	}
+
+	opts := daemoncred.DefaultControllerCertificateOptions(runOpts.DaemonCredentialDir)
+
+	provider, err := daemoncred.NewRESTConfigProvider(ctx, bootstrapCfg, agentCfg.NodeName, opts)
+	if err != nil {
+		return nil, nil, fmt.Errorf("issue daemon controller certificate: %w", err)
+	}
+
+	log.Info("daemon controller certificate ready", "credentialDir", runOpts.DaemonCredentialDir)
+	providerCtx, stopProvider := context.WithCancel(ctx)
+	go provider.Run(providerCtx)
+
+	return provider.RESTConfig(), stopProvider, nil
+}
+
+// buildBootstrapRESTConfig builds a Kubernetes REST config from the applied agent
 // config. It authenticates with the bootstrap token and trusts the cluster CA
 // certificate embedded in the config.
 //
 // This avoids reading kubeconfig files from inside the nspawn machine, which
 // contain nspawn-internal paths that do not resolve on the host filesystem.
-func buildRESTConfig(cfg *provision.AgentConfig) (*rest.Config, error) {
+func buildBootstrapRESTConfig(cfg *provision.AgentConfig) (*rest.Config, error) {
 	if cfg.Kubelet.ApiServer == "" {
 		return nil, fmt.Errorf("applied config has no API server URL")
 	}
@@ -100,11 +164,6 @@ func buildRESTConfig(cfg *provision.AgentConfig) (*rest.Config, error) {
 		return nil, fmt.Errorf("applied config has no bootstrap token")
 	}
 
-	// TODO: Bootstrap tokens are short-lived and not intended for long-running
-	// daemons. We need to define a proper agent credential strategy - for
-	// example, signing dedicated client certificates for the agent so it remains
-	// authenticated even when the bootstrap token expires or the kubelet is
-	// unavailable.
 	restCfg := &rest.Config{
 		Host:        cfg.Kubelet.ApiServer,
 		BearerToken: cfg.Kubelet.Auth.BootstrapToken,
