@@ -330,6 +330,9 @@ mod tests {
             kind: DiskKind::Nvme,
             numa: None,
             queue_depth: qd,
+            page_size_bytes: None,
+            bypass_admission: false,
+            skip_recovery_scan_if_no_meta: false,
         }
     }
 

@@ -131,6 +131,21 @@ pub struct DiskSpec {
     pub numa: Option<u16>,
     #[serde(default)]
     pub queue_depth: Option<u32>,
+    /// Engine page size in bytes. When unset, the disk supervisor
+    /// applies its default (4 KiB) for both the storage engine and
+    /// the underlying io_uring device.
+    #[serde(default)]
+    pub page_size_bytes: Option<usize>,
+    /// Skip the engine's admission filter on the write path. Useful
+    /// for benchmarking and for tests that want every write to
+    /// commit unconditionally; should be left `false` in production.
+    #[serde(default)]
+    pub bypass_admission: bool,
+    /// Skip the recovery scan when the disk has no engine metadata.
+    /// Set on fresh disks at bring-up to avoid the no-op scan; safe
+    /// to leave `false` otherwise.
+    #[serde(default)]
+    pub skip_recovery_scan_if_no_meta: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -327,5 +342,32 @@ path = "/dev/nvme0n1"
 "#;
         let c: Config = toml::from_str(s).unwrap();
         assert_eq!(c.disks[0].kind, DiskKind::Nvme);
+    }
+
+    #[test]
+    fn disk_engine_fields_default_to_unset_and_off() {
+        let s = r#"
+[[disks]]
+path = "/dev/nvme0n1"
+"#;
+        let c: Config = toml::from_str(s).unwrap();
+        assert_eq!(c.disks[0].page_size_bytes, None);
+        assert!(!c.disks[0].bypass_admission);
+        assert!(!c.disks[0].skip_recovery_scan_if_no_meta);
+    }
+
+    #[test]
+    fn disk_engine_fields_round_trip() {
+        let s = r#"
+[[disks]]
+path = "/dev/nvme0n1"
+page_size_bytes = 4096
+bypass_admission = true
+skip_recovery_scan_if_no_meta = true
+"#;
+        let c: Config = toml::from_str(s).unwrap();
+        assert_eq!(c.disks[0].page_size_bytes, Some(4096));
+        assert!(c.disks[0].bypass_admission);
+        assert!(c.disks[0].skip_recovery_scan_if_no_meta);
     }
 }

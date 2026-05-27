@@ -175,6 +175,154 @@ impl BlockDevice for BlockDeviceProxy {
 /// given proxy.
 pub struct ProxyReceiver(Receiver<Command>);
 
+/// Single-iteration core of the proxy service loop.
+///
+/// `ProxyService` owns the device end of the channel - the `Rc<B>`
+/// device, the receiver, and the in-flight queue - and exposes
+/// [`Self::poll_once`] so callers can drive it alongside other
+/// futures on the same thread. The disk supervisor uses this to
+/// interleave the proxy with `StorageEngine::open` and
+/// `StorageEngine::run_mutator` on the disk-owning thread.
+///
+/// Standalone callers usually want [`run_proxy_service`], which
+/// wraps this in a stop-aware loop.
+pub struct ProxyService<B: BlockDevice + 'static> {
+    device: Rc<B>,
+    rx: Receiver<Command>,
+    in_flight: Vec<InflightOp>,
+    disconnected: bool,
+}
+
+impl<B: BlockDevice + 'static> ProxyService<B> {
+    /// Wrap an owned device and its companion receiver.
+    pub fn new(device: B, rx: ProxyReceiver) -> Self {
+        Self {
+            device: Rc::new(device),
+            rx: rx.0,
+            in_flight: Vec::new(),
+            disconnected: false,
+        }
+    }
+
+    /// The underlying device, shared via `Rc` so each in-flight
+    /// future can keep it alive for the duration of its I/O.
+    pub fn device(&self) -> &Rc<B> {
+        &self.device
+    }
+
+    /// Whether the command channel has disconnected (all proxies
+    /// dropped). Once true, no further commands will arrive.
+    pub fn channel_disconnected(&self) -> bool {
+        self.disconnected
+    }
+
+    /// Whether any in-flight ops are still being polled.
+    pub fn has_inflight(&self) -> bool {
+        !self.in_flight.is_empty()
+    }
+
+    /// Drain queued commands into the in-flight set, poll each
+    /// in-flight future once, and drive [`BlockDevice::progress`].
+    ///
+    /// On a progress failure every in-flight op and every queued
+    /// command is failed with the underlying errno and the error is
+    /// returned; the caller is expected to tear down the device.
+    /// `Disconnected` on the command channel is not fatal - it is
+    /// surfaced via [`Self::channel_disconnected`] so the caller can
+    /// decide when to exit.
+    pub fn poll_once(&mut self, cx: &mut Context<'_>) -> Result<(), Error> {
+        // 1. Drain pending commands into the in-flight set.
+        loop {
+            match self.rx.try_recv() {
+                Ok(Command::Read {
+                    lba,
+                    ptr,
+                    len,
+                    reply,
+                }) => {
+                    let dev = Rc::clone(&self.device);
+                    let fut: Pin<Box<dyn Future<Output = Result<(), Error>>>> =
+                        Box::pin(async move {
+                            // SAFETY: caller guarantees the buffer at
+                            // `ptr` remains valid until `reply.set` is
+                            // invoked (see module docs).
+                            let slice = unsafe {
+                                std::slice::from_raw_parts_mut(ptr.0.as_ptr(), len)
+                            };
+                            dev.read(lba, slice).await
+                        });
+                    self.in_flight.push(InflightOp { fut, reply });
+                }
+                Ok(Command::Write {
+                    lba,
+                    ptr,
+                    len,
+                    reply,
+                }) => {
+                    let dev = Rc::clone(&self.device);
+                    let fut: Pin<Box<dyn Future<Output = Result<(), Error>>>> =
+                        Box::pin(async move {
+                            // SAFETY: same contract as Read; the
+                            // service treats this slice as immutable.
+                            let slice = unsafe {
+                                std::slice::from_raw_parts(
+                                    ptr.0.as_ptr() as *const u8,
+                                    len,
+                                )
+                            };
+                            dev.write(lba, slice).await
+                        });
+                    self.in_flight.push(InflightOp { fut, reply });
+                }
+                Ok(Command::RegisterBuffers { base, len, reply }) => {
+                    let res = self.device.register_buffers(base.0.as_ptr(), len);
+                    reply.set(res);
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.disconnected = true;
+                    break;
+                }
+            }
+        }
+
+        // 2. Poll in-flight ops; complete any that finished.
+        let mut i = 0;
+        while i < self.in_flight.len() {
+            let outcome = self.in_flight[i].fut.as_mut().poll(cx);
+            match outcome {
+                Poll::Ready(result) => {
+                    let op = self.in_flight.swap_remove(i);
+                    op.reply.set(result);
+                }
+                Poll::Pending => i += 1,
+            }
+        }
+
+        // 3. Drive the underlying device. A progress failure is
+        //    treated as fatal: there is nothing useful we can do
+        //    with in-flight requests except fail them and exit.
+        if let Err(e) = self.device.progress() {
+            let errno = errno_of(&e);
+            self.fail_all(errno);
+            return Err(e);
+        }
+
+        Ok(())
+    }
+
+    /// Fail every in-flight op and every still-queued command with
+    /// the supplied errno. Used on shutdown and on a progress error.
+    pub fn fail_all(&mut self, errno: i32) {
+        for op in self.in_flight.drain(..) {
+            op.reply.set(Err(Error::Io(errno)));
+        }
+        while let Ok(cmd) = self.rx.try_recv() {
+            fail_command(cmd, errno);
+        }
+    }
+}
+
 /// Drive a proxy's underlying [`BlockDevice`].
 ///
 /// Runs on the thread that owns the device and returns when the
@@ -192,108 +340,22 @@ pub fn run_proxy_service<B: BlockDevice + 'static>(
     rx: ProxyReceiver,
     stop: Arc<AtomicBool>,
 ) {
-    let device = Rc::new(device);
-    let mut in_flight: Vec<InflightOp> = Vec::new();
+    let mut svc = ProxyService::new(device, rx);
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
-    let rx = rx.0;
 
     loop {
-        let mut disconnected = false;
-
-        // 1. Drain pending commands into the in-flight set.
-        loop {
-            match rx.try_recv() {
-                Ok(Command::Read {
-                    lba,
-                    ptr,
-                    len,
-                    reply,
-                }) => {
-                    let dev = Rc::clone(&device);
-                    let fut: Pin<Box<dyn Future<Output = Result<(), Error>>>> =
-                        Box::pin(async move {
-                            // SAFETY: caller guarantees the buffer at
-                            // `ptr` remains valid until `reply.set` is
-                            // invoked (see module docs).
-                            let slice = unsafe {
-                                std::slice::from_raw_parts_mut(ptr.0.as_ptr(), len)
-                            };
-                            dev.read(lba, slice).await
-                        });
-                    in_flight.push(InflightOp { fut, reply });
-                }
-                Ok(Command::Write {
-                    lba,
-                    ptr,
-                    len,
-                    reply,
-                }) => {
-                    let dev = Rc::clone(&device);
-                    let fut: Pin<Box<dyn Future<Output = Result<(), Error>>>> =
-                        Box::pin(async move {
-                            // SAFETY: same contract as Read; the
-                            // service treats this slice as immutable.
-                            let slice = unsafe {
-                                std::slice::from_raw_parts(
-                                    ptr.0.as_ptr() as *const u8,
-                                    len,
-                                )
-                            };
-                            dev.write(lba, slice).await
-                        });
-                    in_flight.push(InflightOp { fut, reply });
-                }
-                Ok(Command::RegisterBuffers { base, len, reply }) => {
-                    let res = device.register_buffers(base.0.as_ptr(), len);
-                    reply.set(res);
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    disconnected = true;
-                    break;
-                }
-            }
-        }
-
-        // 2. Poll in-flight ops; complete any that finished.
-        let mut i = 0;
-        while i < in_flight.len() {
-            let outcome = in_flight[i].fut.as_mut().poll(&mut cx);
-            match outcome {
-                Poll::Ready(result) => {
-                    let op = in_flight.swap_remove(i);
-                    op.reply.set(result);
-                }
-                Poll::Pending => i += 1,
-            }
-        }
-
-        // 3. Drive the underlying device. A progress failure is
-        //    treated as fatal: there is nothing useful we can do with
-        //    in-flight requests except fail them and exit.
-        if let Err(e) = device.progress() {
-            let errno = errno_of(&e);
-            for op in in_flight.drain(..) {
-                op.reply.set(Err(Error::Io(errno)));
-            }
-            while let Ok(cmd) = rx.try_recv() {
-                fail_command(cmd, errno);
-            }
+        if let Err(e) = svc.poll_once(&mut cx) {
             eprintln!("uring proxy service: progress failed: {e}");
             return;
         }
 
-        // 4. Exit conditions: shutdown requested AND nothing to do.
-        let shutdown_requested = stop.load(Ordering::Acquire) || disconnected;
-        if shutdown_requested && in_flight.is_empty() {
-            while let Ok(cmd) = rx.try_recv() {
-                fail_command(cmd, libc::EIO);
-            }
+        let shutdown_requested = stop.load(Ordering::Acquire) || svc.channel_disconnected();
+        if shutdown_requested && !svc.has_inflight() {
+            svc.fail_all(libc::EIO);
             return;
         }
 
-        // 5. Brief park so we do not pin a CPU when idle.
         std::thread::sleep(Duration::from_micros(100));
     }
 }

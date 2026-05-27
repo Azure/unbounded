@@ -22,7 +22,7 @@ mod tests;
 mod uring;
 
 pub use mock::{MockDevice, MockDeviceConfig, MockFaultMode};
-pub use proxy::{BlockDeviceProxy, ProxyMetadata, ProxyReceiver, run_proxy_service};
+pub use proxy::{BlockDeviceProxy, ProxyMetadata, ProxyReceiver, ProxyService, run_proxy_service};
 pub use scratch::{AcquireFut, ScratchPage, ScratchPool};
 
 #[cfg(target_os = "linux")]
