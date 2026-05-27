@@ -13,6 +13,7 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 )
 
@@ -49,79 +50,116 @@ func newCachestoreClient(ctx context.Context, g *globalFlags) (*cachestoreClient
 		return nil, fmt.Errorf("cachestore: --cachestore-bucket required")
 	}
 
+	client, err := buildS3Client(ctx,
+		g.cachestoreRegion,
+		g.cachestoreAccessKey, g.cachestoreSecretKey,
+		g.cachestoreEndpoint,
+		g.cachestoreUsePathStyle,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("cachestore: %w", err)
+	}
+
+	return &cachestoreClient{cfg: g, client: client}, nil
+}
+
+// buildS3Client constructs an aws-sdk-go-v2 S3 client matching
+// orca's own configuration: static credentials and the
+// LocalStack-3.8 compatible request/response checksum opt-out
+// (CRC64NVME breaks against LocalStack and orca itself opts out
+// when talking to its S3 surfaces). When endpoint is non-empty it
+// is set as the BaseEndpoint, and usePathStyle is forwarded so
+// LocalStack-style backends work without DNS gymnastics.
+func buildS3Client(ctx context.Context, region, accessKey, secretKey, endpoint string, usePathStyle bool) (*s3.Client, error) {
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx,
-		awsconfig.WithRegion(g.cachestoreRegion),
+		awsconfig.WithRegion(region),
 		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
-			g.cachestoreAccessKey, g.cachestoreSecretKey, "",
+			accessKey, secretKey, "",
 		)),
 		awsconfig.WithRequestChecksumCalculation(aws.RequestChecksumCalculationWhenRequired),
 		awsconfig.WithResponseChecksumValidation(aws.ResponseChecksumValidationWhenRequired),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("cachestore: aws config: %w", err)
+		return nil, fmt.Errorf("aws config: %w", err)
 	}
 
-	client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
-		if g.cachestoreEndpoint != "" {
-			o.BaseEndpoint = aws.String(g.cachestoreEndpoint)
+	return s3.NewFromConfig(awsCfg, func(o *s3.Options) {
+		if endpoint != "" {
+			o.BaseEndpoint = aws.String(endpoint)
 		}
 
-		o.UsePathStyle = g.cachestoreUsePathStyle
-	})
-
-	return &cachestoreClient{cfg: g, client: client}, nil
+		o.UsePathStyle = usePathStyle
+	}), nil
 }
 
 // List enumerates objects whose path starts with prefix. Returns up
 // to limit entries; pass 0 to read everything.
 func (c *cachestoreClient) List(ctx context.Context, prefix string, limit int) ([]cacheObject, error) {
-	var (
-		out  []cacheObject
-		next *string
-	)
+	var out []cacheObject
+
+	err := walkS3(ctx, c.client, c.cfg.cachestoreBucket, prefix, func(obj s3types.Object) bool {
+		o := cacheObject{}
+		if obj.Key != nil {
+			o.Path = *obj.Key
+		}
+
+		if obj.Size != nil {
+			o.Size = *obj.Size
+		}
+
+		if obj.LastModified != nil {
+			o.LastModified = *obj.LastModified
+		}
+
+		if obj.ETag != nil {
+			o.ETag = *obj.ETag
+		}
+
+		out = append(out, o)
+
+		return limit <= 0 || len(out) < limit
+	})
+	if err != nil {
+		return nil, fmt.Errorf("cachestore: list: %w", err)
+	}
+
+	return out, nil
+}
+
+// walkS3 iterates an S3 bucket's objects matching prefix using
+// ListObjectsV2 pagination. The visit callback is invoked once per
+// object; returning false short-circuits the walk (used to honor a
+// caller-supplied result limit).
+func walkS3(
+	ctx context.Context,
+	client *s3.Client,
+	bucket, prefix string,
+	visit func(s3types.Object) bool,
+) error {
+	var next *string
 
 	for {
-		page, err := c.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-			Bucket:            aws.String(c.cfg.cachestoreBucket),
+		page, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(bucket),
 			Prefix:            aws.String(prefix),
 			ContinuationToken: next,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("cachestore: list: %w", err)
+			return err
 		}
 
-		for _, c2 := range page.Contents {
-			o := cacheObject{}
-			if c2.Key != nil {
-				o.Path = *c2.Key
-			}
-
-			if c2.Size != nil {
-				o.Size = *c2.Size
-			}
-
-			if c2.LastModified != nil {
-				o.LastModified = *c2.LastModified
-			}
-
-			if c2.ETag != nil {
-				o.ETag = *c2.ETag
-			}
-
-			out = append(out, o)
-			if limit > 0 && len(out) >= limit {
-				return out, nil
+		for _, obj := range page.Contents {
+			if !visit(obj) {
+				return nil
 			}
 		}
 
 		if page.IsTruncated == nil || !*page.IsTruncated {
-			break
+			return nil
 		}
 
 		next = page.NextContinuationToken
 	}
-
-	return out, nil
 }
 
 // Head returns size + last-modified for a single chunk path. Returns

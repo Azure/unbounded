@@ -15,9 +15,8 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blockblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 	"github.com/aws/aws-sdk-go-v2/aws"
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 // originInfo is the per-object metadata an orcadev subcommand cares
@@ -107,28 +106,15 @@ func newAWSS3Origin(ctx context.Context, g *globalFlags) (*awss3Origin, error) {
 		return nil, fmt.Errorf("origin/awss3: --origin-bucket required")
 	}
 
-	awsCfg, err := awsconfig.LoadDefaultConfig(ctx,
-		awsconfig.WithRegion(g.originRegion),
-		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
-			g.originAccessKey, g.originSecretKey, "",
-		)),
-		// Opt out of CRC64NVME default introduced in aws-sdk-go-v2
-		// 1.32; LocalStack 3.8 returns InvalidRequest on it and orca
-		// itself opts out as well.
-		awsconfig.WithRequestChecksumCalculation(aws.RequestChecksumCalculationWhenRequired),
-		awsconfig.WithResponseChecksumValidation(aws.ResponseChecksumValidationWhenRequired),
+	client, err := buildS3Client(ctx,
+		g.originRegion,
+		g.originAccessKey, g.originSecretKey,
+		g.originEndpoint,
+		g.originUsePathStyle,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("origin/awss3: aws config: %w", err)
+		return nil, fmt.Errorf("origin/awss3: %w", err)
 	}
-
-	client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
-		if g.originEndpoint != "" {
-			o.BaseEndpoint = aws.String(g.originEndpoint)
-		}
-
-		o.UsePathStyle = g.originUsePathStyle
-	})
 
 	return &awss3Origin{cfg: g, client: client}, nil
 }
@@ -231,48 +217,28 @@ func (a *awss3Origin) Put(ctx context.Context, key string, r io.Reader, n int64)
 }
 
 func (a *awss3Origin) List(ctx context.Context, prefix string, limit int) ([]originObject, error) {
-	var (
-		out  []originObject
-		next *string
-	)
+	var out []originObject
 
-	for {
-		in := &s3.ListObjectsV2Input{
-			Bucket:            aws.String(a.cfg.originBucket),
-			Prefix:            aws.String(prefix),
-			ContinuationToken: next,
+	err := walkS3(ctx, a.client, a.cfg.originBucket, prefix, func(obj s3types.Object) bool {
+		o := originObject{}
+		if obj.Key != nil {
+			o.Name = *obj.Key
 		}
 
-		page, err := a.client.ListObjectsV2(ctx, in)
-		if err != nil {
-			return nil, fmt.Errorf("origin/awss3: list: %w", err)
+		if obj.Size != nil {
+			o.Size = *obj.Size
 		}
 
-		for _, c := range page.Contents {
-			obj := originObject{}
-			if c.Key != nil {
-				obj.Name = *c.Key
-			}
-
-			if c.Size != nil {
-				obj.Size = *c.Size
-			}
-
-			if c.ETag != nil {
-				obj.ETag = unquoteETag(*c.ETag)
-			}
-
-			out = append(out, obj)
-			if limit > 0 && len(out) >= limit {
-				return out, nil
-			}
+		if obj.ETag != nil {
+			o.ETag = unquoteETag(*obj.ETag)
 		}
 
-		if page.IsTruncated == nil || !*page.IsTruncated {
-			break
-		}
+		out = append(out, o)
 
-		next = page.NextContinuationToken
+		return limit <= 0 || len(out) < limit
+	})
+	if err != nil {
+		return nil, fmt.Errorf("origin/awss3: list: %w", err)
 	}
 
 	return out, nil

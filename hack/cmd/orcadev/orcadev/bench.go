@@ -5,7 +5,6 @@ package orcadev
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -601,35 +600,7 @@ func runBenchLoop(
 // emitBenchResult writes the human + JSON outputs per the --output
 // and --json-out flags.
 func emitBenchResult(br benchResult, o *benchOpts) error {
-	switch o.output {
-	case "text":
-		writeBenchHuman(os.Stdout, br)
-	case "json":
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-
-		if err := enc.Encode(br); err != nil {
-			return fmt.Errorf("encode json: %w", err)
-		}
-	}
-
-	if o.jsonOut != "" {
-		f, err := os.Create(o.jsonOut)
-		if err != nil {
-			return fmt.Errorf("create --json-out: %w", err)
-		}
-
-		defer f.Close() //nolint:errcheck
-
-		enc := json.NewEncoder(f)
-		enc.SetIndent("", "  ")
-
-		if err := enc.Encode(br); err != nil {
-			return fmt.Errorf("write --json-out: %w", err)
-		}
-	}
-
-	return nil
+	return emitJSONResult(br, o.output, o.jsonOut, writeBenchHuman)
 }
 
 func writeBenchHuman(w io.Writer, br benchResult) {

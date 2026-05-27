@@ -4,6 +4,7 @@
 package orcadev
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -32,3 +33,41 @@ func printOut(format string, args ...any) { fprintf(os.Stdout, format, args...) 
 
 // printErr writes to stderr via fprintf; convenience shorthand.
 func printErr(format string, args ...any) { fprintf(os.Stderr, format, args...) }
+
+// emitJSONResult is the shared output dispatcher used by bench and
+// scenario. It writes a human-readable summary to stdout via
+// writeHuman when output == "text", encodes v as indented JSON when
+// output == "json", and (independently) writes v as indented JSON
+// to jsonOutPath when non-empty. Unknown output values are tolerated
+// silently so the caller's flag validation owns that contract.
+func emitJSONResult[T any](v T, output, jsonOutPath string, writeHuman func(io.Writer, T)) error {
+	switch output {
+	case "text":
+		writeHuman(os.Stdout, v)
+	case "json":
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+
+		if err := enc.Encode(v); err != nil {
+			return fmt.Errorf("encode json: %w", err)
+		}
+	}
+
+	if jsonOutPath != "" {
+		f, err := os.Create(jsonOutPath)
+		if err != nil {
+			return fmt.Errorf("create --json-out: %w", err)
+		}
+
+		defer f.Close() //nolint:errcheck // best-effort; encode error below is the meaningful one
+
+		enc := json.NewEncoder(f)
+		enc.SetIndent("", "  ")
+
+		if err := enc.Encode(v); err != nil {
+			return fmt.Errorf("write --json-out: %w", err)
+		}
+	}
+
+	return nil
+}

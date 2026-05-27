@@ -7,18 +7,14 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"encoding/json"
 	"fmt"
 	"io"
 	"math"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
-
-	"github.com/Azure/unbounded/internal/orca/chunk"
 )
 
 // scenarioOpts captures the flag set shared by every scenario plus
@@ -158,35 +154,7 @@ func runScenario(ctx context.Context, g *globalFlags, o *scenarioOpts, name stri
 
 // emitScenarioResult writes the human + JSON outputs.
 func emitScenarioResult(res *scenarioResult, o *scenarioOpts) error {
-	switch o.output {
-	case "text":
-		writeScenarioHuman(os.Stdout, res)
-	case "json":
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-
-		if err := enc.Encode(res); err != nil {
-			return fmt.Errorf("encode json: %w", err)
-		}
-	}
-
-	if o.jsonOut != "" {
-		f, err := os.Create(o.jsonOut)
-		if err != nil {
-			return fmt.Errorf("create --json-out: %w", err)
-		}
-
-		defer f.Close() //nolint:errcheck
-
-		enc := json.NewEncoder(f)
-		enc.SetIndent("", "  ")
-
-		if err := enc.Encode(res); err != nil {
-			return fmt.Errorf("write --json-out: %w", err)
-		}
-	}
-
-	return nil
+	return emitJSONResult(res, o.output, o.jsonOut, writeScenarioHuman)
 }
 
 func writeScenarioHuman(w io.Writer, res *scenarioResult) {
@@ -259,16 +227,53 @@ func recordDropCacheStep(res *scenarioResult, t0 time.Time, err error) error {
 
 // --- cold-warm ---
 
-func runScenarioColdWarm(ctx context.Context, g *globalFlags, o *scenarioOpts, res *scenarioResult) error {
+// scenarioEnv is the shared environment every scenario starts with:
+// an origin client (EnsureBucket already run when --ensure-container
+// is set) and an edge client targeting the resolved orca URL. The
+// per-scenario chunk path key + cleanup are generated locally so
+// each scenario can adopt its own naming and per-step logic.
+type scenarioEnv struct {
+	oc   originClient
+	edge *edgeClient
+}
+
+// newScenarioEnv builds the standard origin + edge environment
+// shared by every scenario. Pulled out so the four scenarios don't
+// each carry a copy of the same 8-line construction block.
+func newScenarioEnv(ctx context.Context, g *globalFlags) (*scenarioEnv, error) {
 	oc, err := newOriginClient(ctx, g)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	if g.ensureContainer {
 		if err := oc.EnsureBucket(ctx); err != nil {
-			return err
+			return nil, err
 		}
+	}
+
+	return &scenarioEnv{
+		oc:   oc,
+		edge: newEdgeClient(g.orcaURL, g.timeout),
+	}, nil
+}
+
+// scenarioCleanup is the deferred origin-object cleanup pattern
+// every scenario runs after a successful upload. When keepData is
+// true (--keep-data) the object is left in place for post-run
+// inspection; otherwise the delete is best-effort.
+func scenarioCleanup(ctx context.Context, oc originClient, key string, keepData bool) {
+	if keepData {
+		return
+	}
+
+	_ = oc.Delete(ctx, key) //nolint:errcheck // cleanup best-effort
+}
+
+func runScenarioColdWarm(ctx context.Context, g *globalFlags, o *scenarioOpts, res *scenarioResult) error {
+	env, err := newScenarioEnv(ctx, g)
+	if err != nil {
+		return err
 	}
 
 	cs, err := newCachestoreClient(ctx, g)
@@ -276,9 +281,7 @@ func runScenarioColdWarm(ctx context.Context, g *globalFlags, o *scenarioOpts, r
 		return err
 	}
 
-	edge := newEdgeClient(g.orcaURL, g.timeout)
-
-	return runScenarioColdWarmWith(ctx, g, o, res, oc, cs, edge)
+	return runScenarioColdWarmWith(ctx, g, o, res, env.oc, cs, env.edge)
 }
 
 // runScenarioColdWarmWith runs the cold-warm scenario against an
@@ -313,11 +316,7 @@ func runScenarioColdWarmWith(
 		return uploadErr
 	}
 
-	defer func() {
-		if !o.keepData {
-			_ = oc.Delete(ctx, key) //nolint:errcheck // cleanup best-effort
-		}
-	}()
+	defer scenarioCleanup(ctx, oc, key, o.keepData)
 
 	// Step 2: ensure cold cache by clearing any chunks for this key.
 	t0 = time.Now()
@@ -375,18 +374,10 @@ func runScenarioRangeStress(ctx context.Context, g *globalFlags, o *scenarioOpts
 
 	res.Config["size_bytes"] = size
 
-	oc, err := newOriginClient(ctx, g)
+	env, err := newScenarioEnv(ctx, g)
 	if err != nil {
 		return err
 	}
-
-	if g.ensureContainer {
-		if err := oc.EnsureBucket(ctx); err != nil {
-			return err
-		}
-	}
-
-	edge := newEdgeClient(g.orcaURL, g.timeout)
 
 	key := fmt.Sprintf("scenario-range-stress-%d", time.Now().UnixNano())
 
@@ -399,23 +390,19 @@ func runScenarioRangeStress(ctx context.Context, g *globalFlags, o *scenarioOpts
 		return sourceErr
 	}
 
-	uploadErr := oc.Put(ctx, key, bytes.NewReader(source), size)
+	uploadErr := env.oc.Put(ctx, key, bytes.NewReader(source), size)
 	recordStep(res, "upload", t0, uploadErr, map[string]any{"bytes": size, "sha256": sourceHash})
 
 	if uploadErr != nil {
 		return uploadErr
 	}
 
-	defer func() {
-		if !o.keepData {
-			_ = oc.Delete(ctx, key) //nolint:errcheck
-		}
-	}()
+	defer scenarioCleanup(ctx, env.oc, key, o.keepData)
 
 	// Step 2: full GET, verify checksum.
 	t0 = time.Now()
 
-	resp, err := edge.Get(ctx, oc.Bucket(), key)
+	resp, err := env.edge.Get(ctx, env.oc.Bucket(), key)
 	if err != nil {
 		recordStep(res, "full_get", t0, err, nil)
 		return err
@@ -454,7 +441,7 @@ func runScenarioRangeStress(ctx context.Context, g *globalFlags, o *scenarioOpts
 			end = size - 1
 		}
 
-		rresp, rerr := edge.GetRange(ctx, oc.Bucket(), key, start, end)
+		rresp, rerr := env.edge.GetRange(ctx, env.oc.Bucket(), key, start, end)
 		if rerr != nil {
 			mismatch = true
 			rangeErr = rerr
@@ -555,39 +542,27 @@ func verifyRangeResponse(resp edgeResponse, want []byte) error {
 // --- empty-object ---
 
 func runScenarioEmptyObject(ctx context.Context, g *globalFlags, o *scenarioOpts, res *scenarioResult) error {
-	oc, err := newOriginClient(ctx, g)
+	env, err := newScenarioEnv(ctx, g)
 	if err != nil {
 		return err
 	}
-
-	if g.ensureContainer {
-		if err := oc.EnsureBucket(ctx); err != nil {
-			return err
-		}
-	}
-
-	edge := newEdgeClient(g.orcaURL, g.timeout)
 
 	key := fmt.Sprintf("scenario-empty-%d", time.Now().UnixNano())
 
 	// Step 1: upload zero bytes.
 	t0 := time.Now()
-	uploadErr := oc.Put(ctx, key, strings.NewReader(""), 0)
+	uploadErr := env.oc.Put(ctx, key, strings.NewReader(""), 0)
 	recordStep(res, "upload_empty", t0, uploadErr, map[string]any{"bytes": 0, "key": key})
 
 	if uploadErr != nil {
 		return uploadErr
 	}
 
-	defer func() {
-		if !o.keepData {
-			_ = oc.Delete(ctx, key) //nolint:errcheck
-		}
-	}()
+	defer scenarioCleanup(ctx, env.oc, key, o.keepData)
 
 	// Step 2: GET via orca; expect 200 + empty body.
 	t0 = time.Now()
-	resp, getErr := edge.Get(ctx, oc.Bucket(), key)
+	resp, getErr := env.edge.Get(ctx, env.oc.Bucket(), key)
 
 	var bytesRead int64
 	if getErr == nil && resp.Body != nil {
@@ -625,25 +600,17 @@ func runScenarioETagChange(ctx context.Context, g *globalFlags, o *scenarioOpts,
 
 	res.Config["size_bytes"] = size
 
-	oc, err := newOriginClient(ctx, g)
+	env, err := newScenarioEnv(ctx, g)
 	if err != nil {
 		return err
 	}
-
-	if g.ensureContainer {
-		if err := oc.EnsureBucket(ctx); err != nil {
-			return err
-		}
-	}
-
-	edge := newEdgeClient(g.orcaURL, g.timeout)
 
 	key := fmt.Sprintf("scenario-etag-change-%d", time.Now().UnixNano())
 
 	// v1 upload.
 	t0 := time.Now()
 	h1 := hasher()
-	err = oc.Put(ctx, key, newTeeHashReader(io.LimitReader(rand.Reader, size), h1), size)
+	err = env.oc.Put(ctx, key, newTeeHashReader(io.LimitReader(rand.Reader, size), h1), size)
 	hash1 := hexSum(h1)
 	recordStep(res, "upload_v1", t0, err, map[string]any{"bytes": size, "sha256": hash1})
 
@@ -651,16 +618,12 @@ func runScenarioETagChange(ctx context.Context, g *globalFlags, o *scenarioOpts,
 		return err
 	}
 
-	defer func() {
-		if !o.keepData {
-			_ = oc.Delete(ctx, key) //nolint:errcheck
-		}
-	}()
+	defer scenarioCleanup(ctx, env.oc, key, o.keepData)
 
 	// v1 GET via orca (populates cache).
 	t0 = time.Now()
 
-	v1Hash, _, _, _, err := fetchAndHash(ctx, edge, oc.Bucket(), key, "")
+	v1Hash, _, _, _, err := fetchAndHash(ctx, env.edge, env.oc.Bucket(), key, "")
 	recordStep(res, "get_v1", t0, err, map[string]any{"sha256": v1Hash, "match": v1Hash == hash1})
 
 	if err != nil || v1Hash != hash1 {
@@ -670,7 +633,7 @@ func runScenarioETagChange(ctx context.Context, g *globalFlags, o *scenarioOpts,
 	// Overwrite with v2 content (new etag).
 	t0 = time.Now()
 	h2 := hasher()
-	err = oc.Put(ctx, key, newTeeHashReader(io.LimitReader(rand.Reader, size), h2), size)
+	err = env.oc.Put(ctx, key, newTeeHashReader(io.LimitReader(rand.Reader, size), h2), size)
 	hash2 := hexSum(h2)
 	recordStep(res, "upload_v2", t0, err, map[string]any{"bytes": size, "sha256": hash2})
 
@@ -685,7 +648,7 @@ func runScenarioETagChange(ctx context.Context, g *globalFlags, o *scenarioOpts,
 	// stale bytes).
 	t0 = time.Now()
 
-	v2Hash, status, _, _, err := fetchAndHash(ctx, edge, oc.Bucket(), key, "")
+	v2Hash, status, _, _, err := fetchAndHash(ctx, env.edge, env.oc.Bucket(), key, "")
 	recordStep(res, "get_v2", t0, err, map[string]any{
 		"status": status,
 		"sha256": v2Hash,
@@ -736,45 +699,26 @@ func scenarioGet(ctx context.Context, edge *edgeClient, bucket, key string) (int
 
 // clearScenarioObject removes cached chunks for the given object so
 // the next GET is forced to refill from origin. Used by the
-// cold-warm scenario.
+// cold-warm scenario. The walk is bounded by the object's current
+// size (from an origin HEAD when etag is empty) so we don't probe
+// past the object's actual chunk count, and stops on the first
+// missing chunk index because chunks are written sequentially.
 func clearScenarioObject(ctx context.Context, g *globalFlags, cs cachestoreOps, oc originClient, key, etag, chunkSizeOverride string) error {
 	chunkSize, err := resolveChunkSize(g, chunkSizeOverride)
 	if err != nil {
 		return err
 	}
 
-	if etag == "" {
-		info, err := oc.Head(ctx, key)
-		if err != nil {
-			return err
-		}
-
-		etag = info.ETag
+	etag, size, err := resolveObjectMetadata(ctx, oc, key, etag, chunkSize)
+	if err != nil {
+		return err
 	}
 
-	// Walk a bounded index range deleting any chunks that exist.
-	for i := int64(0); i < 1024; i++ {
-		k := chunk.Key{
-			OriginID:  g.originID,
-			Bucket:    oc.Bucket(),
-			ObjectKey: key,
-			ETag:      etag,
-			ChunkSize: chunkSize,
-			Index:     i,
-		}
-		path := k.Path()
+	nChunks := (size + chunkSize - 1) / chunkSize
 
-		_, herr := cs.Head(ctx, path)
-		if herr != nil {
-			// not found at this index = no more chunks for this
-			// object (chunk paths are sequential).
-			break
-		}
-
-		if err := cs.Delete(ctx, path); err != nil {
-			return err
-		}
-	}
-
-	return nil
+	return forEachChunk(ctx, cs, g.originID, oc.Bucket(), key, etag, chunkSize, nChunks, true,
+		func(_ int64, path string) error {
+			return cs.Delete(ctx, path)
+		},
+	)
 }

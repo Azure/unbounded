@@ -445,24 +445,9 @@ func clearByObject(ctx context.Context, g *globalFlags, cs *cachestoreClient, bu
 		return err
 	}
 
-	size := int64(0)
-	if etag == "" {
-		info, err := oc.Head(ctx, key)
-		if err != nil {
-			return fmt.Errorf("origin head: %w", err)
-		}
-
-		etag = info.ETag
-		size = info.Size
-	}
-
-	if etag == "" {
-		return fmt.Errorf("could not determine ETag; pass --etag explicitly")
-	}
-	// If size unknown, probe and delete indices until we exhaust
-	// the chain. We cap at 1024 to avoid runaway loops.
-	if size <= 0 {
-		size = chunkSize * 1024
+	etag, size, err := resolveObjectMetadata(ctx, oc, key, etag, chunkSize)
+	if err != nil {
+		return err
 	}
 
 	nChunks := (size + chunkSize - 1) / chunkSize
@@ -475,9 +460,79 @@ func clearByObject(ctx context.Context, g *globalFlags, cs *cachestoreClient, bu
 
 	var deleted int64
 
+	err = forEachChunk(ctx, cs, g.originID, bucket, key, etag, chunkSize, nChunks, false,
+		func(_ int64, path string) error {
+			if err := cs.Delete(ctx, path); err != nil {
+				return err
+			}
+
+			deleted++
+
+			return nil
+		},
+	)
+	if err != nil {
+		return err
+	}
+
+	fmt.Fprintf(os.Stderr, "deleted %d chunks for %s/%s\n", deleted, bucket, key)
+
+	return nil
+}
+
+// defaultMaxClearChunks bounds the per-object chunk walk used by
+// clearByObject / clearScenarioObject when the origin object's size
+// is unknown. The product of this constant with --chunk-size is the
+// effective per-object delete budget in the unknown-size path.
+const defaultMaxClearChunks = 1024
+
+// resolveObjectMetadata returns the effective etag + size for a
+// chunk-walking operation. When etag is empty, it issues an origin
+// HEAD to populate both fields. When the resolved size is unknown
+// (HEAD did not surface a size, or the caller passed an explicit
+// etag), it falls back to chunkSize * defaultMaxClearChunks so the
+// caller can still bound the walk.
+func resolveObjectMetadata(ctx context.Context, oc originClient, key, etag string, chunkSize int64) (string, int64, error) {
+	size := int64(0)
+	if etag == "" {
+		info, err := oc.Head(ctx, key)
+		if err != nil {
+			return "", 0, fmt.Errorf("origin head: %w", err)
+		}
+
+		etag = info.ETag
+		size = info.Size
+	}
+
+	if etag == "" {
+		return "", 0, fmt.Errorf("could not determine ETag; pass --etag explicitly")
+	}
+
+	if size <= 0 {
+		size = chunkSize * defaultMaxClearChunks
+	}
+
+	return etag, size, nil
+}
+
+// forEachChunk walks the chunk indices [0, nChunks) for the given
+// origin/bucket/key/etag/chunkSize tuple, HEADing each path. When a
+// chunk is present, onPresent is invoked with the index and full
+// chunk path. When a chunk is absent the behavior depends on
+// stopOnMiss: true terminates the walk (chunks are stored
+// sequentially per object), false skips the index and continues.
+// Errors from cs.Head other than ErrCacheNotFound abort the walk.
+func forEachChunk(
+	ctx context.Context,
+	cs cachestoreOps,
+	originID, bucket, key, etag string,
+	chunkSize, nChunks int64,
+	stopOnMiss bool,
+	onPresent func(idx int64, path string) error,
+) error {
 	for i := int64(0); i < nChunks; i++ {
 		k := chunk.Key{
-			OriginID:  g.originID,
+			OriginID:  originID,
 			Bucket:    bucket,
 			ObjectKey: key,
 			ETag:      etag,
@@ -485,25 +540,23 @@ func clearByObject(ctx context.Context, g *globalFlags, cs *cachestoreClient, bu
 			Index:     i,
 		}
 		path := k.Path()
-		// Delete is idempotent so we just issue it; if the chunk
-		// was already absent the call still succeeds. To get a
-		// meaningful count, HEAD first.
+
 		if _, err := cs.Head(ctx, path); err != nil {
 			if errors.Is(err, ErrCacheNotFound) {
+				if stopOnMiss {
+					return nil
+				}
+
 				continue
 			}
 
 			return err
 		}
 
-		if err := cs.Delete(ctx, path); err != nil {
+		if err := onPresent(i, path); err != nil {
 			return err
 		}
-
-		deleted++
 	}
-
-	fmt.Fprintf(os.Stderr, "deleted %d chunks for %s/%s\n", deleted, bucket, key)
 
 	return nil
 }
