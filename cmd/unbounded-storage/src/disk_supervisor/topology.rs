@@ -4,23 +4,24 @@
 //! Hot-swappable [`LocalStorage`] published to shards.
 //!
 //! `LiveDiskTopology` owns the set of currently-engined disks
-//! (indexed by path), publishes an `Arc<LocalStorage<B>>` via
-//! `ArcSwap`, and bumps a generation counter on every successful
-//! [`Self::apply_engines`] call. Shards observe the swap through
-//! [`Self::current`] and use [`Self::generation`] to detect when the
-//! pointer they last cached is stale.
+//! (indexed by path) and publishes a `(LocalStorage, generation)`
+//! pair via `ArcSwap`. Every successful [`Self::apply_engines`] call
+//! builds a fresh pair and stores it as a single atomic publication,
+//! so consumers that resolve through [`Self::snapshot`] observe the
+//! snapshot and its generation together. Per-shard registration
+//! caches key off that generation, so "registered against gen N"
+//! always refers to the snapshot that was published as gen N.
 //!
 //! Engines are not opened here. `UringBlockDevice` is `!Send`, so any
 //! [`crate::storage::engine::StorageEngine::open`] must run on the
 //! same thread that owns the device. The caller (production wiring or
 //! tests) is responsible for producing `Arc<StorageEngine<B>>` values
 //! and handing them in via [`Self::apply_engines`]; this type only
-//! manages the generation/swap discipline.
+//! manages the publication discipline.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 
@@ -38,12 +39,19 @@ pub type LocalStorageSnapshot<B> = Option<Arc<LocalStorage<B>>>;
 pub struct LiveDiskTopology<B: BlockDevice + 'static> {
     engines: std::sync::Mutex<HashMap<PathBuf, Arc<StorageEngine<B>>>>,
     current: ArcSwap<LocalStorageSnapshotInner<B>>,
-    generation: AtomicU64,
 }
 
-// `ArcSwap` requires `Sized + 'static` over the inner; wrap the
-// `Option` so we can store it directly.
-struct LocalStorageSnapshotInner<B: BlockDevice + 'static>(LocalStorageSnapshot<B>);
+/// Published unit: the `LocalStorage` snapshot and the generation it
+/// was published under, kept together so a single `ArcSwap` load
+/// returns a consistent pair. The generation is *only* read out of
+/// this bundle; pairing it with a separately-loaded snapshot
+/// reintroduces a tear (an older snapshot can be observed alongside
+/// a newer counter), so consumers must go through
+/// [`LiveDiskTopology::snapshot`] for any staleness decision.
+struct LocalStorageSnapshotInner<B: BlockDevice + 'static> {
+    ls: LocalStorageSnapshot<B>,
+    generation: u64,
+}
 
 impl<B: BlockDevice + 'static> LiveDiskTopology<B> {
     /// Build an empty topology with generation 0 and no published
@@ -51,8 +59,10 @@ impl<B: BlockDevice + 'static> LiveDiskTopology<B> {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             engines: std::sync::Mutex::new(HashMap::new()),
-            current: ArcSwap::new(Arc::new(LocalStorageSnapshotInner(None))),
-            generation: AtomicU64::new(0),
+            current: ArcSwap::new(Arc::new(LocalStorageSnapshotInner {
+                ls: None,
+                generation: 0,
+            })),
         })
     }
 
@@ -60,10 +70,11 @@ impl<B: BlockDevice + 'static> LiveDiskTopology<B> {
     /// already present are preserved (the supplied `Arc` is
     /// ignored); paths removed from the input are dropped; new
     /// paths are inserted. A new [`LocalStorage`] is built over the
-    /// resulting set and published via `ArcSwap`. Generation is
-    /// bumped on every call regardless of whether the set changed,
-    /// so consumers re-resolve any cached `Arc<LocalStorage>` and
-    /// reseat per-shard registrations.
+    /// resulting set and published via `ArcSwap` paired with the
+    /// next generation number. Generation is bumped on every call
+    /// regardless of whether the set changed, so consumers
+    /// re-resolve any cached `Arc<LocalStorage>` and reseat
+    /// per-shard registrations.
     pub fn apply_engines(&self, engines: Vec<(PathBuf, Arc<StorageEngine<B>>)>) {
         let mut table = self.engines.lock().unwrap();
         let mut next: HashMap<PathBuf, Arc<StorageEngine<B>>> = HashMap::new();
@@ -78,32 +89,56 @@ impl<B: BlockDevice + 'static> LiveDiskTopology<B> {
             paths.sort();
             paths.iter().map(|p| table[*p].clone()).collect()
         };
-        let snapshot: LocalStorageSnapshot<B> = if ordered.is_empty() {
+        let ls: LocalStorageSnapshot<B> = if ordered.is_empty() {
             None
         } else {
             Some(Arc::new(LocalStorage::new(ordered)))
         };
         let n = table.len();
 
-        // Publish and bump the generation while still holding the
-        // engines lock so concurrent `apply_engines` calls cannot
-        // reorder publications relative to the generation counter.
+        // `apply_engines` is serialized by `engines`, so reading
+        // the previously-published gen, adding one, and storing
+        // the new (ls, gen) bundle is race-free under this lock.
+        // The atomic `ArcSwap::store` is the entire publication:
+        // any consumer that loads the bundle sees both fields from
+        // the same generation, with no possibility of seeing a
+        // new gen paired with an old snapshot or vice versa.
+        let gen_n = self.current.load().generation + 1;
         self.current
-            .store(Arc::new(LocalStorageSnapshotInner(snapshot)));
-        let gen_n = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+            .store(Arc::new(LocalStorageSnapshotInner {
+                ls,
+                generation: gen_n,
+            }));
         drop(table);
         eprintln!("disks: hot-swap to generation {gen_n} (cache cold; engine count={n})");
     }
 
-    /// Load the currently-published `LocalStorage` snapshot. `None`
-    /// when no engines are open.
-    pub fn current(&self) -> LocalStorageSnapshot<B> {
-        self.current.load_full().0.clone()
+    /// Atomically load the currently-published `LocalStorage`
+    /// paired with the generation it was published under. This is
+    /// the only API that yields a consistent (snapshot, gen) pair;
+    /// staleness checks (e.g.
+    /// [`crate::disk_supervisor::LiveShardLocalStore`]'s
+    /// per-shard registration cache) must use it.
+    pub fn snapshot(&self) -> (LocalStorageSnapshot<B>, u64) {
+        let inner = self.current.load_full();
+        (inner.ls.clone(), inner.generation)
     }
 
-    /// Generation counter; advances on every [`Self::apply_engines`].
+    /// Load the currently-published `LocalStorage` snapshot. `None`
+    /// when no engines are open. Prefer [`Self::snapshot`] in any
+    /// context that also needs the generation; loading the snapshot
+    /// and the generation through separate accessors observes two
+    /// independent points in the publication timeline and is not a
+    /// sound basis for a staleness check.
+    pub fn current(&self) -> LocalStorageSnapshot<B> {
+        self.current.load_full().ls.clone()
+    }
+
+    /// Generation of the currently-published snapshot. Observability
+    /// only; read together with the snapshot via [`Self::snapshot`]
+    /// when both are needed.
     pub fn generation(&self) -> u64 {
-        self.generation.load(Ordering::Acquire)
+        self.current.load().generation
     }
 }
 
@@ -208,5 +243,36 @@ mod tests {
         t.apply_engines(vec![]);
         assert!(t.current().is_none());
         assert_eq!(t.generation(), 2);
+    }
+
+    #[test]
+    fn snapshot_returns_matched_pair_across_swaps() {
+        // Bundle guarantee: `snapshot()` returns the
+        // `LocalStorage` and the generation it was published under
+        // from the same `ArcSwap` load. After N applies the
+        // generation in the bundle equals N and matches the
+        // observability accessor; distinct apply calls publish
+        // distinct snapshot `Arc`s.
+        let t: Arc<LiveDiskTopology<MockDevice>> = LiveDiskTopology::new();
+        let (ls0, g0) = t.snapshot();
+        assert!(ls0.is_none());
+        assert_eq!(g0, 0);
+        assert_eq!(g0, t.generation());
+
+        t.apply_engines(vec![(PathBuf::from("/a"), engine())]);
+        let (ls1, g1) = t.snapshot();
+        assert_eq!(g1, 1);
+        assert_eq!(g1, t.generation());
+        let ls1 = ls1.expect("snapshot present after apply");
+
+        t.apply_engines(vec![(PathBuf::from("/b"), engine())]);
+        let (ls2, g2) = t.snapshot();
+        assert_eq!(g2, 2);
+        assert_eq!(g2, t.generation());
+        let ls2 = ls2.expect("snapshot present after second apply");
+
+        // Each apply publishes a fresh `LocalStorage`, so the
+        // returned `Arc`s do not alias across generations.
+        assert!(!Arc::ptr_eq(&ls1, &ls2));
     }
 }

@@ -6,13 +6,20 @@
 //!
 //! Each shard holds a [`LiveShardLocalStore`] and registers its
 //! NUMA-local backing through [`Self::register_backing`]. On every
-//! `BlockStore` call the view compares the topology's current
+//! `BlockStore` call the view loads the topology's published
+//! `(snapshot, generation)` pair atomically and compares the
 //! generation against the one it last replayed against; on a
 //! mismatch it re-registers every recorded backing through the
 //! newly-published [`LocalStorage::register_extra_buffer`] before
-//! delegating. Multiple backings and concurrent topology swaps are
-//! both safe: registration replay always re-seats the *full*
-//! recorded set under a single critical section, so we never mark a
+//! delegating. Because the snapshot and generation come from a
+//! single `ArcSwap` load, "last_seen_generation == N" always means
+//! the recorded set was registered against the snapshot published
+//! as gen N - the staleness check cannot tear between two adjacent
+//! publications.
+//!
+//! Multiple backings and concurrent topology swaps are both safe:
+//! registration replay always re-seats the *full* recorded set
+//! under a single critical section, so we never mark a
 //! `LocalStorage` as "fully registered" without having actually
 //! registered every entry against it.
 //!
@@ -98,20 +105,17 @@ impl<B: BlockDevice + 'static> LiveShardLocalStore<B> {
 
     /// Resolve the currently-published `LocalStorage`, replaying
     /// every registered backing if the topology generation has
-    /// advanced since we last replayed. Returns `None` when the
-    /// topology has no engines.
+    /// advanced since we last replayed. The snapshot and its
+    /// publishing generation come from a single
+    /// [`LiveDiskTopology::snapshot`] load, so the pair is
+    /// consistent: "registered against gen N" always means
+    /// registrations were applied to the snapshot published as gen
+    /// N, not to some earlier publication that a separate load
+    /// happened to observe. Returns `None` when the topology has
+    /// no engines.
     fn current_or_replay(&self) -> Option<Arc<LocalStorage<B>>> {
-        let ls = self.topology.current()?;
-        // `apply_engines` publishes the snapshot *before* it bumps
-        // the generation counter (see `topology::apply_engines`).
-        // Reading the generation after `current()` is therefore
-        // conservative: if a concurrent swap is in progress we
-        // either observe the old snapshot + old gen (we will
-        // catch up on the next call) or the new snapshot + an
-        // old-or-new gen. We can never observe a new gen paired
-        // with an old snapshot, so "have I registered against
-        // this gen yet?" is a sound staleness check.
-        let gen_n = self.topology.generation();
+        let (ls, gen_n) = self.topology.snapshot();
+        let ls = ls?;
         let mut guard = self.state.lock().unwrap();
         if guard.last_seen_generation != Some(gen_n) {
             Self::replay_locked(&ls, &guard.registered);
