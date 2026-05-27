@@ -76,8 +76,9 @@ impl DiskTarget for UringDiskTarget {
         _cpu_hint: Option<usize>,
     ) -> Result<(UringDiskHandle, Arc<StorageEngine<BlockDeviceProxy>>), DiskError> {
         // TODO(phase6): pin the disk thread to `_cpu_hint`. The
-        // placement is computed by the topology plan today but no
-        // pinning is wired in yet.
+        // hint is now computed per-disk from the spec's `numa`
+        // field via the registry's `CpuPlacer`; no pinning is
+        // wired in yet.
         let engine_cfg = engine_config_from(spec);
         let mut uring_cfg = UringConfig::default();
         if let Some(qd) = spec.queue_depth {

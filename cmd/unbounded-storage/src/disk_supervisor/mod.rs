@@ -93,30 +93,46 @@ pub struct DiskReport {
     pub failures: Vec<(PathBuf, String)>,
 }
 
+/// Maps a disk's NUMA preference to a best-effort CPU pin target.
+/// Production builds this from [`crate::topology::Host`]; tests
+/// pass a closure (or a no-op) so the registry can be exercised
+/// without a real `Host`. A blanket impl below makes any
+/// `Fn(Option<u16>) -> Option<usize>` usable directly.
+pub trait CpuPlacer: Send + Sync + 'static {
+    fn cpu_for_numa(&self, numa: Option<u16>) -> Option<usize>;
+}
+
+impl<F> CpuPlacer for F
+where
+    F: Fn(Option<u16>) -> Option<usize> + Send + Sync + 'static,
+{
+    fn cpu_for_numa(&self, numa: Option<u16>) -> Option<usize> {
+        (self)(numa)
+    }
+}
+
 /// Tracks the set of currently-open disks and reconciles it against a
 /// desired list each time the config changes. Generic over a
 /// [`DiskTarget`] so production and tests share the algorithm.
 pub struct DiskRegistry<T: DiskTarget> {
     target: T,
+    placer: Box<dyn CpuPlacer>,
     handles: HashMap<PathBuf, T::Handle>,
     engines: HashMap<PathBuf, Arc<StorageEngine<T::Device>>>,
     applied: HashMap<PathBuf, DiskSpec>,
-    plan_slots: Vec<usize>,
-    next_slot: usize,
 }
 
 impl<T: DiskTarget> DiskRegistry<T> {
-    /// Build an empty registry. `plan_slots` is a best-effort list of
-    /// CPU ids drawn from the topology plan's NVMe placements; opens
-    /// consume the list round-robin to pin their progress threads.
-    pub fn new(target: T, plan_slots: Vec<usize>) -> Self {
+    /// Build an empty registry. `placer` resolves each disk's `numa`
+    /// preference to a CPU id used as a best-effort pin target when
+    /// the disk is opened.
+    pub fn new<P: CpuPlacer>(target: T, placer: P) -> Self {
         Self {
             target,
+            placer: Box::new(placer),
             handles: HashMap::new(),
             engines: HashMap::new(),
             applied: HashMap::new(),
-            plan_slots,
-            next_slot: 0,
         }
     }
 
@@ -158,7 +174,7 @@ impl<T: DiskTarget> DiskRegistry<T> {
             if self.handles.contains_key(&spec.path) {
                 continue;
             }
-            let hint = self.next_cpu_hint();
+            let hint = self.placer.cpu_for_numa(spec.numa);
             match self.target.open(spec, hint) {
                 Ok((handle, engine)) => {
                     self.handles.insert(spec.path.clone(), handle);
@@ -202,15 +218,6 @@ impl<T: DiskTarget> DiskRegistry<T> {
     /// Paths whose handle is currently open. Order is unspecified.
     pub fn current_paths(&self) -> Vec<PathBuf> {
         self.handles.keys().cloned().collect()
-    }
-
-    fn next_cpu_hint(&mut self) -> Option<usize> {
-        if self.plan_slots.is_empty() {
-            return None;
-        }
-        let cpu = self.plan_slots[self.next_slot % self.plan_slots.len()];
-        self.next_slot = self.next_slot.wrapping_add(1);
-        Some(cpu)
     }
 }
 
@@ -348,10 +355,14 @@ mod tests {
         }
     }
 
+    fn no_placer() -> impl CpuPlacer {
+        |_: Option<u16>| -> Option<usize> { None }
+    }
+
     #[test]
     fn empty_to_two_adds_both() {
         let (target, state) = MockDiskTarget::new();
-        let mut reg = DiskRegistry::new(target, Vec::new());
+        let mut reg = DiskRegistry::new(target, no_placer());
         let report = reg.reconcile(&[spec("/a", None), spec("/b", None)]);
         assert_eq!(report.added, 2);
         assert_eq!(report.removed, 0);
@@ -363,7 +374,7 @@ mod tests {
     #[test]
     fn swap_adds_and_removes() {
         let (target, state) = MockDiskTarget::new();
-        let mut reg = DiskRegistry::new(target, Vec::new());
+        let mut reg = DiskRegistry::new(target, no_placer());
         reg.reconcile(&[spec("/a", None), spec("/b", None)]);
         let report = reg.reconcile(&[spec("/b", None), spec("/c", None)]);
         assert_eq!(report.added, 1);
@@ -377,7 +388,7 @@ mod tests {
     #[test]
     fn same_desired_twice_is_idempotent() {
         let (target, state) = MockDiskTarget::new();
-        let mut reg = DiskRegistry::new(target, Vec::new());
+        let mut reg = DiskRegistry::new(target, no_placer());
         let desired = [spec("/a", None), spec("/b", None)];
         reg.reconcile(&desired);
         let calls_after_first = state.lock().unwrap().open_calls;
@@ -390,7 +401,7 @@ mod tests {
     #[test]
     fn queue_depth_drift_triggers_remove_add() {
         let (target, _state) = MockDiskTarget::new();
-        let mut reg = DiskRegistry::new(target, Vec::new());
+        let mut reg = DiskRegistry::new(target, no_placer());
         reg.reconcile(&[spec("/a", Some(8))]);
         let report = reg.reconcile(&[spec("/a", Some(32))]);
         assert_eq!(report.added, 1);
@@ -401,7 +412,7 @@ mod tests {
     #[test]
     fn engine_field_drift_triggers_remove_add() {
         let (target, _state) = MockDiskTarget::new();
-        let mut reg = DiskRegistry::new(target, Vec::new());
+        let mut reg = DiskRegistry::new(target, no_placer());
         reg.reconcile(&[spec("/a", None)]);
         let mut next = spec("/a", None);
         next.bypass_admission = true;
@@ -419,7 +430,7 @@ mod tests {
             .unwrap()
             .fail_on
             .insert(PathBuf::from("/bad"));
-        let mut reg = DiskRegistry::new(target, Vec::new());
+        let mut reg = DiskRegistry::new(target, no_placer());
         let report = reg.reconcile(&[spec("/bad", None), spec("/good", None)]);
         assert_eq!(report.added, 1);
         assert_eq!(report.failures.len(), 1);
@@ -431,7 +442,7 @@ mod tests {
     }
 
     #[test]
-    fn round_robin_cpu_hint() {
+    fn cpu_hint_per_disk_from_numa() {
         struct CpuRecorder {
             hints: Arc<Mutex<Vec<Option<usize>>>>,
         }
@@ -448,22 +459,34 @@ mod tests {
                 Ok((H, mock_engine()))
             }
         }
+        let placer = |numa: Option<u16>| -> Option<usize> {
+            match numa {
+                Some(0) => Some(7),
+                Some(1) => Some(11),
+                _ => None,
+            }
+        };
         let hints = Arc::new(Mutex::new(Vec::new()));
         let mut reg = DiskRegistry::new(
             CpuRecorder {
                 hints: hints.clone(),
             },
-            vec![3, 5],
+            placer,
         );
-        reg.reconcile(&[spec("/a", None), spec("/b", None), spec("/c", None)]);
+        let mut d0 = spec("/a", None);
+        d0.numa = Some(0);
+        let mut d1 = spec("/b", None);
+        d1.numa = Some(1);
+        let d2 = spec("/c", None); // numa: None
+        reg.reconcile(&[d0, d1, d2]);
         let got = hints.lock().unwrap().clone();
-        assert_eq!(got, vec![Some(3), Some(5), Some(3)]);
+        assert_eq!(got, vec![Some(7), Some(11), None]);
     }
 
     #[test]
     fn drain_closes_all() {
         let (target, state) = MockDiskTarget::new();
-        let mut reg = DiskRegistry::new(target, Vec::new());
+        let mut reg = DiskRegistry::new(target, no_placer());
         reg.reconcile(&[spec("/a", None), spec("/b", None)]);
         assert_eq!(state.lock().unwrap().opened.len(), 2);
         reg.drain();
@@ -473,7 +496,7 @@ mod tests {
     #[test]
     fn engines_snapshot_is_path_sorted() {
         let (target, _state) = MockDiskTarget::new();
-        let mut reg = DiskRegistry::new(target, Vec::new());
+        let mut reg = DiskRegistry::new(target, no_placer());
         reg.reconcile(&[spec("/c", None), spec("/a", None), spec("/b", None)]);
         let snap = reg.engines_snapshot();
         let paths: Vec<PathBuf> = snap.into_iter().map(|(p, _)| p).collect();

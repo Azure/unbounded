@@ -213,17 +213,23 @@ fn main() -> ExitCode {
     }
 
     // Disk supervisor: open `[[disks]]` entries (progress threads
-    // only, no data-path wiring yet). Open hints are derived from
-    // the per-disk `numa` field where present; absent that, opens
-    // are unpinned and `DiskRegistry` falls back to round-robin
-    // across the empty hint list.
-    let disk_cpu_hints: Vec<usize> = config
-        .disks
-        .iter()
-        .filter_map(|d| d.numa)
-        .filter_map(|n| host.cpus_on(Some(n)).first().copied().map(|c| c as usize))
-        .collect();
-    let mut disk_registry = DiskRegistry::new(UringDiskTarget, disk_cpu_hints);
+    // only, no data-path wiring yet). The CPU pin hint for each
+    // disk is derived per-disk from its `numa` field via the
+    // placer closure below; disks without a NUMA preference get
+    // no hint and the underlying open path leaves the thread
+    // unpinned.
+    let host_for_placer = host.clone();
+    let placer = move |numa: Option<u16>| -> Option<usize> {
+        match numa {
+            None => None,
+            Some(_) => host_for_placer
+                .cpus_on(numa)
+                .first()
+                .copied()
+                .map(|c| c as usize),
+        }
+    };
+    let mut disk_registry = DiskRegistry::new(UringDiskTarget, placer);
     if errors.is_empty() {
         let report = disk_registry.reconcile(&config.disks);
         eprintln!(
