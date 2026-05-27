@@ -27,7 +27,7 @@ import (
 )
 
 const (
-	DefaultControllerCertificateSignerName = "unbounded-cloud.io/daemon-controller-client"
+	DefaultControllerCertificateSignerName = "kubernetes.io/kube-apiserver-client"
 	DefaultControllerCertificateGroup      = "unbounded-agent-daemons"
 	DefaultControllerCertificateName       = "unbounded-agent-daemon-controller"
 

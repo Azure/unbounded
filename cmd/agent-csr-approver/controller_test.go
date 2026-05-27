@@ -115,7 +115,7 @@ func TestEvaluate_RejectsUnexpectedGroup(t *testing.T) {
 }
 
 const (
-	testSignerName  = "unbounded-cloud.io/daemon-controller-client"
+	testSignerName  = "kubernetes.io/kube-apiserver-client"
 	testDaemonGroup = "unbounded-agent-daemons"
 )
 

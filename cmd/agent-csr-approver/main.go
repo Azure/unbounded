@@ -27,7 +27,7 @@ import (
 
 const (
 	controllerName     = "agent-csr-approver"
-	defaultSignerName  = "unbounded-cloud.io/daemon-controller-client"
+	defaultSignerName  = "kubernetes.io/kube-apiserver-client"
 	defaultDaemonGroup = "unbounded-agent-daemons"
 )
 
