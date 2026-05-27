@@ -5,45 +5,62 @@
 //!
 //! The supervisor tracks which disk paths are currently "open" and
 //! reconciles that set against the desired list each time the config
-//! changes. Production opens are backed by [`UringBlockDevice`]; tests
-//! plug in a [`MockDiskTarget`].
+//! changes. Production opens are backed by [`UringBlockDevice`] via
+//! [`UringDiskTarget`]; tests plug in a mock target.
 //!
-//! This module deliberately does not wire devices into the data path -
-//! shards still do not consume the opened handles. Phase 6 will hand
-//! the handles to the bufferpool / `LocalStorage`.
+//! Each successful open returns both a per-disk handle (whose `Drop`
+//! tears down the disk thread) and an `Arc<StorageEngine<...>>`
+//! published into [`LiveDiskTopology`] by the caller. See the
+//! sub-module docs for the device-side details.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
-use std::thread::{self, JoinHandle};
-use std::time::Duration;
 
 use crate::config::schema::DiskSpec;
-#[cfg(target_os = "linux")]
-use crate::storage::blockdev::{UringBlockDevice, UringConfig};
+use crate::storage::StorageEngine;
+use crate::storage::blockdev::BlockDevice;
 
 mod shard_view;
 mod topology;
+#[cfg(target_os = "linux")]
+mod uring;
 
 pub use shard_view::LiveShardLocalStore;
 pub use topology::{LiveDiskTopology, LocalStorageSnapshot};
+#[cfg(target_os = "linux")]
+pub use uring::{UringDiskHandle, UringDiskTarget};
 
-/// Abstraction over "open a disk and start its progress loop". The
-/// production implementation is [`UringDiskTarget`]; tests provide a
-/// mock so reconciliation logic can be exercised without touching the
-/// filesystem or io_uring.
+/// Abstraction over "open a disk, start its progress loop, hand back
+/// an engine". Production is [`UringDiskTarget`]; tests provide a
+/// mock so reconciliation logic can be exercised without touching
+/// real I/O.
 pub trait DiskTarget: Send + Sync + 'static {
+    /// The block-device flavor produced by this target. Production
+    /// targets use a `Send + Sync` proxy so the resulting engine can
+    /// be published to other threads even though the underlying
+    /// device is `!Send`. The trait itself does not require
+    /// `Self::Device: Send + Sync`; test mocks may use `!Send`
+    /// devices and confine their use to a single thread.
+    type Device: BlockDevice + 'static;
+
     /// The per-disk handle returned by [`Self::open`]. The handle is
     /// expected to own any background progress thread it spawned and
     /// to join it from its own `Drop`.
     type Handle: Send + 'static;
 
-    /// Open the disk described by `spec`. `cpu_hint` is a best-effort
-    /// pin target drawn from [`Plan`]'s NVMe slot list. Implementations
-    /// may ignore the hint.
-    fn open(&self, spec: &DiskSpec, cpu_hint: Option<usize>) -> Result<Self::Handle, DiskError>;
+    /// Open the disk described by `spec`. On success the returned
+    /// engine `Arc` is suitable for publication through
+    /// [`LiveDiskTopology::apply_engines`]; the caller retains
+    /// ownership of the handle so it can drive shutdown deterministi-
+    /// cally. `cpu_hint` is a best-effort pin target drawn from
+    /// the topology plan's NVMe slot list; implementations may
+    /// ignore it.
+    fn open(
+        &self,
+        spec: &DiskSpec,
+        cpu_hint: Option<usize>,
+    ) -> Result<(Self::Handle, Arc<StorageEngine<Self::Device>>), DiskError>;
 }
 
 /// Reasons a disk open can fail. Kept simple by design: every variant
@@ -51,7 +68,8 @@ pub trait DiskTarget: Send + Sync + 'static {
 /// in an error crate.
 #[derive(Debug)]
 pub enum DiskError {
-    /// The underlying [`UringBlockDevice::open`] call failed.
+    /// The underlying [`UringBlockDevice::open`] call or engine open
+    /// failed.
     Open(String),
 }
 
@@ -81,6 +99,7 @@ pub struct DiskReport {
 pub struct DiskRegistry<T: DiskTarget> {
     target: T,
     handles: HashMap<PathBuf, T::Handle>,
+    engines: HashMap<PathBuf, Arc<StorageEngine<T::Device>>>,
     applied: HashMap<PathBuf, DiskSpec>,
     plan_slots: Vec<usize>,
     next_slot: usize,
@@ -94,6 +113,7 @@ impl<T: DiskTarget> DiskRegistry<T> {
         Self {
             target,
             handles: HashMap::new(),
+            engines: HashMap::new(),
             applied: HashMap::new(),
             plan_slots,
             next_slot: 0,
@@ -104,10 +124,11 @@ impl<T: DiskTarget> DiskRegistry<T> {
     ///
     /// Paths missing from `desired` are dropped (closing the handle).
     /// Paths present in `desired` but not currently open are opened.
-    /// Paths whose [`DiskSpec`] drifted (`kind`/`numa`/`queue_depth`
-    /// changed) are treated as a remove followed by an add. Partial
-    /// failures during opens are reported but do not abort the
-    /// reconcile.
+    /// Paths whose [`DiskSpec`] drifted in any field that affects how
+    /// the disk is opened (kind / numa / queue_depth / page_size_bytes
+    /// / bypass_admission / skip_recovery_scan_if_no_meta) are treated
+    /// as a remove followed by an add. Partial failures during opens
+    /// are reported but do not abort the reconcile.
     pub fn reconcile(&mut self, desired: &[DiskSpec]) -> DiskReport {
         let mut report = DiskReport::default();
 
@@ -127,6 +148,7 @@ impl<T: DiskTarget> DiskRegistry<T> {
             .collect();
         for path in to_remove {
             if self.handles.remove(&path).is_some() {
+                self.engines.remove(&path);
                 self.applied.remove(&path);
                 report.removed += 1;
             }
@@ -138,8 +160,9 @@ impl<T: DiskTarget> DiskRegistry<T> {
             }
             let hint = self.next_cpu_hint();
             match self.target.open(spec, hint) {
-                Ok(handle) => {
+                Ok((handle, engine)) => {
                     self.handles.insert(spec.path.clone(), handle);
+                    self.engines.insert(spec.path.clone(), engine);
                     self.applied.insert(spec.path.clone(), spec.clone());
                     report.added += 1;
                 }
@@ -152,21 +175,31 @@ impl<T: DiskTarget> DiskRegistry<T> {
         report
     }
 
-    /// Close every open handle. Called at shutdown so progress
-    /// threads join deterministically before the rest of the daemon
-    /// tears down.
+    /// Snapshot of currently-open engines suitable for handing to
+    /// [`LiveDiskTopology::apply_engines`]. Returned in path-sorted
+    /// order so downstream hashing is stable across reconciles.
+    pub fn engines_snapshot(&self) -> Vec<(PathBuf, Arc<StorageEngine<T::Device>>)> {
+        let mut out: Vec<(PathBuf, Arc<StorageEngine<T::Device>>)> = self
+            .engines
+            .iter()
+            .map(|(p, e)| (p.clone(), e.clone()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Close every open handle. Engines are dropped first so the
+    /// registry's `Arc` clones are gone before the handles signal
+    /// shutdown to the disk threads; that lets the disk threads exit
+    /// promptly once any outside `Arc<StorageEngine>` clones (held
+    /// by the topology / shards) are also released.
     pub fn drain(mut self) {
+        self.engines.clear();
         self.handles.clear();
         self.applied.clear();
     }
 
     /// Paths whose handle is currently open. Order is unspecified.
-    /// Production handles (`UringDiskHandle`) do not expose their
-    /// `Arc<UringBlockDevice>` because the device is `!Send` and
-    /// lives on the per-disk progress thread; engines therefore
-    /// cannot be constructed from the caller's thread here. See the
-    /// `disk_supervisor::topology` module doc for the open-path
-    /// constraint.
     pub fn current_paths(&self) -> Vec<PathBuf> {
         self.handles.keys().cloned().collect()
     }
@@ -184,84 +217,13 @@ impl<T: DiskTarget> DiskRegistry<T> {
 fn specs_drifted(prev: Option<&DiskSpec>, next: &DiskSpec) -> bool {
     match prev {
         None => false,
-        Some(p) => p.kind != next.kind || p.numa != next.numa || p.queue_depth != next.queue_depth,
-    }
-}
-
-/// Production [`DiskTarget`] that opens a real [`UringBlockDevice`]
-/// and spawns a dedicated thread to drive its `progress()` loop.
-pub struct UringDiskTarget;
-
-/// Handle owning the progress thread that drives a [`UringBlockDevice`]
-/// opened on that thread. Dropping the handle sets the stop flag and
-/// joins the thread (which drops the device on its own stack since
-/// `UringBlockDevice` is `!Send`).
-pub struct UringDiskHandle {
-    stop: Arc<AtomicBool>,
-    join: Option<JoinHandle<()>>,
-}
-
-impl Drop for UringDiskHandle {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(j) = self.join.take() {
-            let _ = j.join();
-        }
-    }
-}
-
-impl DiskTarget for UringDiskTarget {
-    type Handle = UringDiskHandle;
-
-    fn open(&self, spec: &DiskSpec, _cpu_hint: Option<usize>) -> Result<Self::Handle, DiskError> {
-        // `UringBlockDevice` is `!Send`, so it can only ever live on
-        // the progress thread. Open it there and signal success back
-        // via a oneshot channel so this call still surfaces open
-        // errors synchronously.
-        // TODO(phase6): pin the progress thread to `_cpu_hint` and
-        // share the opened device with the shard's bufferpool via a
-        // channel-based command surface.
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_thr = stop.clone();
-        let path = spec.path.clone();
-        let mut cfg = UringConfig::default();
-        if let Some(qd) = spec.queue_depth {
-            cfg.queue_depth = qd;
-        }
-        let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), String>>(1);
-        let join = thread::Builder::new()
-            .name(format!("ub-disk-{}", path.display()))
-            .spawn(move || {
-                let dev = match UringBlockDevice::open(&path, cfg) {
-                    Ok(d) => {
-                        let _ = ready_tx.send(Ok(()));
-                        d
-                    }
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(format!("{e:?}")));
-                        return;
-                    }
-                };
-                while !stop_thr.load(Ordering::Acquire) {
-                    let _ = dev.progress();
-                    thread::sleep(Duration::from_micros(100));
-                }
-                drop(dev);
-            })
-            .map_err(|e| DiskError::Open(format!("spawn progress thread: {e}")))?;
-        match ready_rx.recv() {
-            Ok(Ok(())) => Ok(UringDiskHandle {
-                stop,
-                join: Some(join),
-            }),
-            Ok(Err(msg)) => {
-                let _ = join.join();
-                Err(DiskError::Open(msg))
-            }
-            Err(_) => {
-                let _ = join.join();
-                Err(DiskError::Open("progress thread exited without status".into()))
-            }
+        Some(p) => {
+            p.kind != next.kind
+                || p.numa != next.numa
+                || p.queue_depth != next.queue_depth
+                || p.page_size_bytes != next.page_size_bytes
+                || p.bypass_admission != next.bypass_admission
+                || p.skip_recovery_scan_if_no_meta != next.skip_recovery_scan_if_no_meta
         }
     }
 }
@@ -270,8 +232,49 @@ impl DiskTarget for UringDiskTarget {
 mod tests {
     use super::*;
     use crate::config::schema::DiskKind;
+    use crate::storage::EngineConfig;
+    use crate::storage::blockdev::{MockDevice, MockDeviceConfig};
     use std::collections::HashSet;
+    use std::future::Future;
+    use std::pin::pin;
     use std::sync::Mutex;
+    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    fn noop_waker() -> Waker {
+        fn raw() -> RawWaker {
+            RawWaker::new(std::ptr::null(), &VTABLE)
+        }
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(|_| raw(), |_| {}, |_| {}, |_| {});
+        unsafe { Waker::from_raw(raw()) }
+    }
+
+    fn block_on<F: Future>(f: F) -> F::Output {
+        let w = noop_waker();
+        let mut cx = Context::from_waker(&w);
+        let mut f = pin!(f);
+        let mut spins = 0u64;
+        loop {
+            match f.as_mut().poll(&mut cx) {
+                Poll::Ready(v) => return v,
+                Poll::Pending => {
+                    spins += 1;
+                    assert!(spins < 1_000_000, "stuck");
+                }
+            }
+        }
+    }
+
+    fn mock_engine() -> Arc<StorageEngine<MockDevice>> {
+        let device = Arc::new(MockDevice::new(MockDeviceConfig {
+            page_size: 4096,
+            capacity_pages: 64,
+            ..Default::default()
+        }));
+        let mut cfg = EngineConfig::default();
+        cfg.page_size_bytes = 4096;
+        cfg.btree_page_bytes = 4096;
+        Arc::new(block_on(StorageEngine::open(device, cfg)).unwrap())
+    }
 
     struct MockDiskTarget {
         state: Arc<Mutex<MockState>>,
@@ -308,19 +311,28 @@ mod tests {
     }
 
     impl DiskTarget for MockDiskTarget {
+        type Device = MockDevice;
         type Handle = MockHandle;
 
-        fn open(&self, spec: &DiskSpec, _cpu_hint: Option<usize>) -> Result<MockHandle, DiskError> {
+        fn open(
+            &self,
+            spec: &DiskSpec,
+            _cpu_hint: Option<usize>,
+        ) -> Result<(MockHandle, Arc<StorageEngine<MockDevice>>), DiskError> {
             let mut s = self.state.lock().unwrap();
             s.open_calls += 1;
             if s.fail_on.contains(&spec.path) {
                 return Err(DiskError::Open("injected".into()));
             }
             s.opened.insert(spec.path.clone());
-            Ok(MockHandle {
-                path: spec.path.clone(),
-                state: self.state.clone(),
-            })
+            drop(s);
+            Ok((
+                MockHandle {
+                    path: spec.path.clone(),
+                    state: self.state.clone(),
+                },
+                mock_engine(),
+            ))
         }
     }
 
@@ -345,6 +357,7 @@ mod tests {
         assert_eq!(report.removed, 0);
         assert!(report.failures.is_empty());
         assert_eq!(state.lock().unwrap().opened.len(), 2);
+        assert_eq!(reg.engines_snapshot().len(), 2);
     }
 
     #[test]
@@ -386,6 +399,19 @@ mod tests {
     }
 
     #[test]
+    fn engine_field_drift_triggers_remove_add() {
+        let (target, _state) = MockDiskTarget::new();
+        let mut reg = DiskRegistry::new(target, Vec::new());
+        reg.reconcile(&[spec("/a", None)]);
+        let mut next = spec("/a", None);
+        next.bypass_admission = true;
+        let report = reg.reconcile(&[next]);
+        assert_eq!(report.added, 1);
+        assert_eq!(report.removed, 1);
+        assert!(reg.applied[&PathBuf::from("/a")].bypass_admission);
+    }
+
+    #[test]
     fn failure_injection_does_not_block_others() {
         let (target, state) = MockDiskTarget::new();
         state
@@ -399,6 +425,9 @@ mod tests {
         assert_eq!(report.failures.len(), 1);
         assert_eq!(report.failures[0].0, PathBuf::from("/bad"));
         assert!(state.lock().unwrap().opened.contains(&PathBuf::from("/good")));
+        // Failed open must not pollute the engine map.
+        assert_eq!(reg.engines_snapshot().len(), 1);
+        assert_eq!(reg.engines_snapshot()[0].0, PathBuf::from("/good"));
     }
 
     #[test]
@@ -408,10 +437,15 @@ mod tests {
         }
         struct H;
         impl DiskTarget for CpuRecorder {
+            type Device = MockDevice;
             type Handle = H;
-            fn open(&self, _spec: &DiskSpec, hint: Option<usize>) -> Result<H, DiskError> {
+            fn open(
+                &self,
+                _spec: &DiskSpec,
+                hint: Option<usize>,
+            ) -> Result<(H, Arc<StorageEngine<MockDevice>>), DiskError> {
                 self.hints.lock().unwrap().push(hint);
-                Ok(H)
+                Ok((H, mock_engine()))
             }
         }
         let hints = Arc::new(Mutex::new(Vec::new()));
@@ -434,5 +468,22 @@ mod tests {
         assert_eq!(state.lock().unwrap().opened.len(), 2);
         reg.drain();
         assert!(state.lock().unwrap().opened.is_empty());
+    }
+
+    #[test]
+    fn engines_snapshot_is_path_sorted() {
+        let (target, _state) = MockDiskTarget::new();
+        let mut reg = DiskRegistry::new(target, Vec::new());
+        reg.reconcile(&[spec("/c", None), spec("/a", None), spec("/b", None)]);
+        let snap = reg.engines_snapshot();
+        let paths: Vec<PathBuf> = snap.into_iter().map(|(p, _)| p).collect();
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/a"),
+                PathBuf::from("/b"),
+                PathBuf::from("/c"),
+            ]
+        );
     }
 }

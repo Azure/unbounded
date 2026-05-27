@@ -19,6 +19,7 @@ use unbounded_storage::bufferpool::{
 };
 use unbounded_storage::config::{self, Config, FabricCfg};
 use unbounded_storage::disk_supervisor::{DiskRegistry, LiveDiskTopology, UringDiskTarget};
+use unbounded_storage::storage::blockdev::BlockDeviceProxy;
 use unbounded_storage::fabric::{self, ConnectionSpec, Fabric, FabricTransport, Provider, StaticPeer};
 use unbounded_storage::runtime::{PinnedRuntime, Threading, WorkerIdx, WorkerSpec};
 use unbounded_storage::topology::{Host, Plan, Role, Worker};
@@ -206,18 +207,14 @@ fn main() -> ExitCode {
         .filter_map(|n| host.cpus_on(Some(n)).first().copied().map(|c| c as usize))
         .collect();
     let mut disk_registry = DiskRegistry::new(UringDiskTarget, disk_cpu_hints);
-    // Hot-swap publication surface for shards. Engines are *not*
-    // opened from this thread: `UringBlockDevice` is `!Send` and
-    // can only be wrapped in a `StorageEngine` on its own progress
-    // thread. Until the disk supervisor grows that per-thread open
-    // path, `topology` stays empty in production and shards fall
-    // back to `NullBlockStore` for the data path. The plumbing
-    // below exercises the generation/swap surface and per-shard
-    // backing replay so the wiring is in place when engines start
-    // being published.
-    let topology: Arc<LiveDiskTopology<
-        unbounded_storage::storage::blockdev::UringBlockDevice,
-    >> = LiveDiskTopology::new();
+    // Hot-swap publication surface for shards. The disk supervisor
+    // opens each `UringBlockDevice` on its own progress thread,
+    // wraps it in a `BlockDeviceProxy` so the resulting
+    // `StorageEngine<BlockDeviceProxy>` is `Send + Sync`, and hands
+    // the engine `Arc`s back here for publication. Shards observe
+    // the snapshot through `LiveShardLocalStore`.
+    let topology: Arc<LiveDiskTopology<BlockDeviceProxy>> =
+        LiveDiskTopology::new();
     if errors.is_empty() {
         let report = disk_registry.reconcile(&config.disks);
         eprintln!(
@@ -229,7 +226,7 @@ fn main() -> ExitCode {
         for (path, msg) in &report.failures {
             eprintln!("disk {}: open failed: {msg}", path.display());
         }
-        topology.apply_engines(Vec::new());
+        topology.apply_engines(disk_registry.engines_snapshot());
     }
 
     // Build the process-wide `PoolGroup` over the successful
@@ -271,12 +268,11 @@ fn main() -> ExitCode {
     }
     eprintln!("shutdown signaled; tearing down shards");
 
-    // Close opened disks (joining their progress threads) before
-    // shard threads exit so all background workers tear down in a
-    // deterministic order.
-    disk_registry.drain();
-    drop(topology);
-
+    // Shard threads must exit first so they release any
+    // `Arc<StorageEngine>` refs published via the topology. Then
+    // drop the topology snapshot, then drain the disk supervisor
+    // so each per-disk thread sees its engine refcount fall before
+    // its stop flag.
     // (reverse order so the last-built shard tears down first)
     for h in joins.into_iter().rev() {
         if let Err(e) = h.join() {
@@ -284,6 +280,8 @@ fn main() -> ExitCode {
             errors.push(format!("panic: {e:?}"));
         }
     }
+    drop(topology);
+    disk_registry.drain();
 
     if errors.is_empty() {
         ExitCode::SUCCESS
@@ -567,7 +565,7 @@ fn wait_for_shutdown_with_updates(
     update_rx: mpsc::Receiver<config::ConfigUpdate>,
     shard_state: &mut [(WorkerIdx, Arc<Fabric>, HashMap<PeerId, ConnectionSpec>)],
     disk_registry: &mut DiskRegistry<UringDiskTarget>,
-    topology: Arc<LiveDiskTopology<unbounded_storage::storage::blockdev::UringBlockDevice>>,
+    topology: Arc<LiveDiskTopology<BlockDeviceProxy>>,
 ) {
     while !SHUTDOWN.load(Ordering::Acquire) {
         match update_rx.recv_timeout(SHUTDOWN_POLL) {
@@ -627,7 +625,7 @@ fn wait_for_shutdown_with_updates(
                 // every config update so any shard view caches its
                 // new generation. Engines remain unpublished until
                 // the per-thread open path lands.
-                topology.apply_engines(Vec::new());
+        topology.apply_engines(disk_registry.engines_snapshot());
             }
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
