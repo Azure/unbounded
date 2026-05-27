@@ -1976,6 +1976,8 @@ def start_agent_csr_approver() -> None:
     log("Building agent CSR approver...")
     run(["go", "build", "-o", AGENT_CSR_APPROVER, str(REPO_ROOT / "cmd" / "agent-csr-approver")])
 
+    VM_DIR.mkdir(parents=True, exist_ok=True)
+
     if AGENT_CSR_APPROVER_PID_FILE.exists():
         old_pid = AGENT_CSR_APPROVER_PID_FILE.read_text().strip()
         if old_pid:
