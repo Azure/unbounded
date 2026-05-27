@@ -231,6 +231,7 @@ fi
 # Install Machine CRD
 # ---------------------------------------------------------------------------
 python3 "$E2E" "${E2E_ARGS[@]}" install-machine-crd
+python3 "$E2E" "${E2E_ARGS[@]}" start-agent-csr-approver
 
 # ---------------------------------------------------------------------------
 # Initial join: agent self-registers Machine CR

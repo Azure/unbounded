@@ -7,6 +7,10 @@ runs:
       shell: bash
       run: python3 ./hack/agent/e2e-kind/e2e.py --verbose install-machine-crd
 
+    - name: Start agent CSR approver
+      shell: bash
+      run: python3 ./hack/agent/e2e-kind/e2e.py --verbose start-agent-csr-approver
+
     - name: Start machina controller
       shell: bash
       run: python3 ./hack/agent/e2e-kind/e2e.py --verbose start-machina-controller

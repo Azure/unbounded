@@ -7,6 +7,7 @@ on:
   pull_request:
     paths:
       - cmd/agent/**
+      - cmd/agent-csr-approver/**
       - cmd/kubectl-unbounded/**
       - internal/cloudprovider/**
       - pkg/agent/**
@@ -26,6 +27,7 @@ on:
     branches: [main]
     paths:
       - cmd/agent/**
+      - cmd/agent-csr-approver/**
       - cmd/kubectl-unbounded/**
       - internal/cloudprovider/**
       - pkg/agent/**
