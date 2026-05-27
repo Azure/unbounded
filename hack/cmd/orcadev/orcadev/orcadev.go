@@ -55,7 +55,7 @@ func Run() {
 		SilenceUsage:  true,
 		SilenceErrors: false,
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
-			return g.resolve(cmd.Context())
+			return g.resolve(cmd)
 		},
 	}
 

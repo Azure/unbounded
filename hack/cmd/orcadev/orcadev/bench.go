@@ -494,32 +494,7 @@ func runBenchLoop(
 				}
 			}
 
-			// Pick a range.
-			var (
-				start, end int64
-			)
-
-			if o.full || rangeSize >= objectSize {
-				start, end = 0, objectSize-1
-			} else if o.readPattern == "random" {
-				maxStart := objectSize - rangeSize
-				if maxStart <= 0 {
-					start = 0
-				} else {
-					start = rng.Int63n(maxStart + 1)
-				}
-
-				end = start + rangeSize - 1
-			} else {
-				// sequential: each worker takes the next stride
-				start = nextOffset.Add(rangeSize) - rangeSize
-				start %= objectSize
-
-				end = start + rangeSize - 1
-				if end >= objectSize {
-					end = objectSize - 1
-				}
-			}
+			start, end := pickBenchRange(rng, o.readPattern, o.full, objectSize, rangeSize, &nextOffset)
 
 			reqStart := time.Now()
 
@@ -660,4 +635,55 @@ func ratePerSec(n int64, d time.Duration) float64 {
 	}
 
 	return float64(n) / d.Seconds()
+}
+
+// pickBenchRange computes the [start, end] (inclusive) byte range a
+// bench worker should request next. Three placements are supported:
+//
+//   - full: returns [0, objectSize-1] regardless of rangeSize. Also
+//     selected when rangeSize >= objectSize (the range would cover
+//     the whole object anyway).
+//   - random: start is uniform over the legal interval
+//     [0, objectSize-rangeSize]; end follows from rangeSize.
+//   - sequential (default): worker takes the next stride from the
+//     shared nextOffset counter, wrapping at objectSize. This
+//     produces a contiguous read pattern when one worker is active
+//     and an interleaved-stride pattern across N workers, which is
+//     the closest single-pattern proxy for "linear scan with
+//     bounded concurrency".
+//
+// pickBenchRange is the single point of range placement in the
+// benchmark loop so the policy is independently testable.
+func pickBenchRange(
+	rng *mathrand.Rand,
+	pattern string,
+	full bool,
+	objectSize, rangeSize int64,
+	nextOffset *atomic.Int64,
+) (int64, int64) {
+	if full || rangeSize >= objectSize {
+		return 0, objectSize - 1
+	}
+
+	if pattern == "random" {
+		maxStart := objectSize - rangeSize
+
+		var start int64
+		if maxStart > 0 {
+			start = rng.Int63n(maxStart + 1)
+		}
+
+		return start, start + rangeSize - 1
+	}
+
+	// sequential: each worker takes the next stride.
+	start := nextOffset.Add(rangeSize) - rangeSize
+	start %= objectSize
+
+	end := start + rangeSize - 1
+	if end >= objectSize {
+		end = objectSize - 1
+	}
+
+	return start, end
 }

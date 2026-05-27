@@ -4,10 +4,11 @@
 package orcadev
 
 import (
-	"context"
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/spf13/cobra"
 
 	"github.com/Azure/unbounded/internal/orca/config"
 )
@@ -114,12 +115,14 @@ func defaultGlobalFlags() *globalFlags {
 // PersistentPreRunE so every subcommand sees fully-resolved fields
 // without re-running this logic.
 //
-// Precedence: per-flag override > YAML value > built-in default.
-// "Per-flag override" is detected as a non-zero value DIFFERENT from
-// the built-in default. This is good-enough for a dev tool; the
-// alternative is teaching cobra about each flag's Changed() state,
-// which adds complexity without operator-visible benefit.
-func (g *globalFlags) resolve(_ context.Context) error {
+// Precedence: per-flag override > YAML value > built-in default. A
+// flag is considered "overridden" when the operator actually passed
+// it on the command line, detected via cobra's Flag.Changed bit.
+// This is more correct than comparing against the default value:
+// passing --origin-bucket=orca-test (which happens to be the
+// default) now wins over a YAML value pointing at a different
+// bucket.
+func (g *globalFlags) resolve(cmd *cobra.Command) error {
 	if g.configPath == "" {
 		return nil
 	}
@@ -129,67 +132,69 @@ func (g *globalFlags) resolve(_ context.Context) error {
 		return fmt.Errorf("load --config: %w", err)
 	}
 
-	defaults := defaultGlobalFlags()
+	flags := cmd.Flags()
+	notSet := func(name string) bool { return !flags.Changed(name) }
 
-	// Origin: pull from YAML unless the user supplied a non-default
-	// flag value.
-	if g.originDriver == defaults.originDriver {
+	// Origin: pull from YAML unless the user supplied the flag.
+	if notSet("origin-driver") && cfg.Origin.Driver != "" {
 		g.originDriver = cfg.Origin.Driver
 	}
 
-	if g.originID == defaults.originID && cfg.Origin.ID != "" {
+	if notSet("origin-id") && cfg.Origin.ID != "" {
 		g.originID = cfg.Origin.ID
 	}
 
 	switch g.originDriver {
 	case "awss3":
-		if g.originBucket == defaults.originBucket && cfg.Origin.AWSS3.Bucket != "" {
+		if notSet("origin-bucket") && cfg.Origin.AWSS3.Bucket != "" {
 			g.originBucket = cfg.Origin.AWSS3.Bucket
 		}
 
-		if g.originEndpoint == defaults.originEndpoint && cfg.Origin.AWSS3.Endpoint != "" {
+		if notSet("origin-endpoint") && cfg.Origin.AWSS3.Endpoint != "" {
 			g.originEndpoint = cfg.Origin.AWSS3.Endpoint
 		}
 
-		if g.originRegion == defaults.originRegion && cfg.Origin.AWSS3.Region != "" {
+		if notSet("origin-region") && cfg.Origin.AWSS3.Region != "" {
 			g.originRegion = cfg.Origin.AWSS3.Region
 		}
 
-		if g.originAccessKey == defaults.originAccessKey && cfg.Origin.AWSS3.AccessKey != "" {
+		if notSet("origin-access-key") && cfg.Origin.AWSS3.AccessKey != "" {
 			g.originAccessKey = cfg.Origin.AWSS3.AccessKey
 		}
 
-		if g.originSecretKey == defaults.originSecretKey && cfg.Origin.AWSS3.SecretKey != "" {
+		if notSet("origin-secret-key") && cfg.Origin.AWSS3.SecretKey != "" {
 			g.originSecretKey = cfg.Origin.AWSS3.SecretKey
 		}
 		// Path-style is a bool; the YAML can flip it on. We treat
 		// the default as truthy (LocalStack assumption) and let the
-		// YAML override.
-		g.originUsePathStyle = cfg.Origin.AWSS3.UsePathStyle
+		// YAML override unless the operator passed the flag.
+		if notSet("origin-use-path-style") {
+			g.originUsePathStyle = cfg.Origin.AWSS3.UsePathStyle
+		}
 	case "azureblob":
-		if g.originBucket == defaults.originBucket && cfg.Origin.Azureblob.Container != "" {
+		if notSet("origin-bucket") && cfg.Origin.Azureblob.Container != "" {
 			g.originBucket = cfg.Origin.Azureblob.Container
 		}
 
-		if g.originEndpoint == defaults.originEndpoint && cfg.Origin.Azureblob.Endpoint != "" {
+		if notSet("origin-endpoint") && cfg.Origin.Azureblob.Endpoint != "" {
 			g.originEndpoint = cfg.Origin.Azureblob.Endpoint
 		}
 
-		if g.originAccount == defaults.originAccount && cfg.Origin.Azureblob.Account != "" {
+		if notSet("origin-account") && cfg.Origin.Azureblob.Account != "" {
 			g.originAccount = cfg.Origin.Azureblob.Account
 		}
 
-		if g.originAccountKey == defaults.originAccountKey && cfg.Origin.Azureblob.AccountKey != "" {
+		if notSet("origin-account-key") && cfg.Origin.Azureblob.AccountKey != "" {
 			g.originAccountKey = cfg.Origin.Azureblob.AccountKey
 		}
 	}
 
 	// Cachestore.
-	if g.cachestoreBucket == defaults.cachestoreBucket && cfg.Cachestore.S3.Bucket != "" {
+	if notSet("cachestore-bucket") && cfg.Cachestore.S3.Bucket != "" {
 		g.cachestoreBucket = cfg.Cachestore.S3.Bucket
 	}
 
-	if g.cachestoreEndpoint == defaults.cachestoreEndpoint && cfg.Cachestore.S3.Endpoint != "" {
+	if notSet("cachestore-endpoint") && cfg.Cachestore.S3.Endpoint != "" {
 		// YAML endpoint is the in-cluster one (svc.cluster.local);
 		// the dev tool runs on the host so we cannot reach it
 		// directly. Only adopt the YAML value when it is NOT an
@@ -201,19 +206,21 @@ func (g *globalFlags) resolve(_ context.Context) error {
 		}
 	}
 
-	if g.cachestoreRegion == defaults.cachestoreRegion && cfg.Cachestore.S3.Region != "" {
+	if notSet("cachestore-region") && cfg.Cachestore.S3.Region != "" {
 		g.cachestoreRegion = cfg.Cachestore.S3.Region
 	}
 
-	if g.cachestoreAccessKey == defaults.cachestoreAccessKey && cfg.Cachestore.S3.AccessKey != "" {
+	if notSet("cachestore-access-key") && cfg.Cachestore.S3.AccessKey != "" {
 		g.cachestoreAccessKey = cfg.Cachestore.S3.AccessKey
 	}
 
-	if g.cachestoreSecretKey == defaults.cachestoreSecretKey && cfg.Cachestore.S3.SecretKey != "" {
+	if notSet("cachestore-secret-key") && cfg.Cachestore.S3.SecretKey != "" {
 		g.cachestoreSecretKey = cfg.Cachestore.S3.SecretKey
 	}
 
-	g.cachestoreUsePathStyle = cfg.Cachestore.S3.UsePathStyle
+	if notSet("cachestore-use-path-style") {
+		g.cachestoreUsePathStyle = cfg.Cachestore.S3.UsePathStyle
+	}
 
 	return nil
 }
