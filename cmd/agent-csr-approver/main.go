@@ -26,9 +26,10 @@ import (
 )
 
 const (
-	controllerName     = "agent-csr-approver"
-	defaultSignerName  = "kubernetes.io/kube-apiserver-client"
-	defaultDaemonGroup = "unbounded-agent-daemons"
+	controllerName        = "agent-csr-approver"
+	defaultSignerName     = "kubernetes.io/kube-apiserver-client"
+	defaultDaemonGroup    = "unbounded-agent-daemons"
+	defaultBootstrapGroup = "system:bootstrappers:unbounded-agent-daemons"
 )
 
 type config struct {
@@ -38,6 +39,7 @@ type config struct {
 	leaderElectionNamespace string
 	signerName              string
 	daemonGroup             string
+	bootstrapGroup          string
 }
 
 func main() {
@@ -61,6 +63,7 @@ func main() {
 	cmd.Flags().StringVar(&cfg.leaderElectionNamespace, "leader-elect-namespace", "unbounded-kube", "Namespace for the leader election lease")
 	cmd.Flags().StringVar(&cfg.signerName, "signer-name", defaultSignerName, "CSR signerName this approver handles")
 	cmd.Flags().StringVar(&cfg.daemonGroup, "daemon-group", defaultDaemonGroup, "Additional daemon controller group required in approved CSRs")
+	cmd.Flags().StringVar(&cfg.bootstrapGroup, "bootstrap-group", defaultBootstrapGroup, "Bootstrap token group allowed to request initial daemon controller certificates")
 
 	cmd.CompletionOptions.DisableDefaultCmd = true
 	cmd.SetVersionTemplate(`{{printf "%s\n" .Version}}`)
@@ -104,8 +107,9 @@ func run(ctx context.Context, cfg config) error {
 		Client:     directClient,
 		KubeClient: kubeClient,
 		Evaluator: csrEvaluator{
-			SignerName:  cfg.signerName,
-			DaemonGroup: cfg.daemonGroup,
+			SignerName:     cfg.signerName,
+			DaemonGroup:    cfg.daemonGroup,
+			BootstrapGroup: cfg.bootstrapGroup,
 		},
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup CSR approver controller: %w", err)

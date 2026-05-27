@@ -1256,7 +1256,7 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
     token_id = secrets.token_hex(3)
     token_secret = secrets.token_hex(8)
     (VM_DIR / "token-id").write_text(token_id)
-    bootstrap_group = "system:bootstrappers:kubeadm:default-node-token,unbounded-agent-daemons"
+    bootstrap_group = "system:bootstrappers:kubeadm:default-node-token,system:bootstrappers:unbounded-agent-daemons"
 
     token_manifest = json.dumps({
         "apiVersion": "v1",

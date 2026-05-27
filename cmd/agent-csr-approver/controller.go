@@ -89,8 +89,9 @@ func (r *csrApproverReconciler) SetupWithManager(mgr ctrl.Manager) error {
 }
 
 type csrEvaluator struct {
-	SignerName  string
-	DaemonGroup string
+	SignerName     string
+	DaemonGroup    string
+	BootstrapGroup string
 }
 
 type csrDecision struct {
@@ -134,8 +135,8 @@ func (e csrEvaluator) Evaluate(ctx context.Context, c client.Client, csr *certif
 		// This group check is only a coarse bootstrap gate. Production use needs
 		// a stronger node-claim check that proves this bootstrap token is allowed
 		// to request the specific system:node:<nodeName> identity in the CSR.
-		if !hasString(csr.Spec.Groups, e.DaemonGroup) {
-			return deny("bootstrap token requester is missing required group %q", e.DaemonGroup), nil
+		if !hasString(csr.Spec.Groups, e.BootstrapGroup) {
+			return deny("bootstrap token requester is missing required group %q", e.BootstrapGroup), nil
 		}
 
 		return approve("approved initial daemon-controller certificate for node %q", nodeName), nil

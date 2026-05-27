@@ -25,7 +25,7 @@ func TestEvaluate_BootstrapTokenAllowed(t *testing.T) {
 	csr := csrFor(t, certificatesv1.CertificateSigningRequestSpec{
 		SignerName: testSignerName,
 		Username:   "system:bootstrap:abc123",
-		Groups:     []string{testDaemonGroup},
+		Groups:     []string{testBootstrapGroup},
 		Usages:     clientAuthUsages(),
 	}, csrSubject{
 		CommonName:   "system:node:node-a",
@@ -115,8 +115,9 @@ func TestEvaluate_RejectsUnexpectedGroup(t *testing.T) {
 }
 
 const (
-	testSignerName  = "kubernetes.io/kube-apiserver-client"
-	testDaemonGroup = "unbounded-agent-daemons"
+	testSignerName     = "kubernetes.io/kube-apiserver-client"
+	testDaemonGroup    = "unbounded-agent-daemons"
+	testBootstrapGroup = "system:bootstrappers:unbounded-agent-daemons"
 )
 
 type csrSubject struct {
@@ -126,8 +127,9 @@ type csrSubject struct {
 
 func testEvaluator() csrEvaluator {
 	return csrEvaluator{
-		SignerName:  testSignerName,
-		DaemonGroup: testDaemonGroup,
+		SignerName:     testSignerName,
+		DaemonGroup:    testDaemonGroup,
+		BootstrapGroup: testBootstrapGroup,
 	}
 }
 
