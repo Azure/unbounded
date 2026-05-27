@@ -484,6 +484,48 @@ mod tests {
     }
 
     #[test]
+    fn page_size_drift_triggers_remove_add() {
+        let (target, _state) = MockDiskTarget::new();
+        let mut reg = DiskRegistry::new(target, no_placer());
+        reg.reconcile(&[spec("/a", None)]);
+        let mut next = spec("/a", None);
+        next.page_size_bytes = Some(4096);
+        let report = reg.reconcile(&[next]);
+        assert_eq!(report.added, 1);
+        assert_eq!(report.removed, 1);
+        assert_eq!(
+            reg.applied[&PathBuf::from("/a")].page_size_bytes,
+            Some(4096)
+        );
+    }
+
+    #[test]
+    fn bypass_admission_drift_triggers_remove_add() {
+        let (target, _state) = MockDiskTarget::new();
+        let mut reg = DiskRegistry::new(target, no_placer());
+        reg.reconcile(&[spec("/a", None)]);
+        let mut next = spec("/a", None);
+        next.bypass_admission = true;
+        let report = reg.reconcile(&[next]);
+        assert_eq!(report.added, 1);
+        assert_eq!(report.removed, 1);
+        assert!(reg.applied[&PathBuf::from("/a")].bypass_admission);
+    }
+
+    #[test]
+    fn skip_recovery_scan_drift_triggers_remove_add() {
+        let (target, _state) = MockDiskTarget::new();
+        let mut reg = DiskRegistry::new(target, no_placer());
+        reg.reconcile(&[spec("/a", None)]);
+        let mut next = spec("/a", None);
+        next.skip_recovery_scan_if_no_meta = true;
+        let report = reg.reconcile(&[next]);
+        assert_eq!(report.added, 1);
+        assert_eq!(report.removed, 1);
+        assert!(reg.applied[&PathBuf::from("/a")].skip_recovery_scan_if_no_meta);
+    }
+
+    #[test]
     fn drain_closes_all() {
         let (target, state) = MockDiskTarget::new();
         let mut reg = DiskRegistry::new(target, no_placer());
