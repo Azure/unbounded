@@ -443,9 +443,12 @@ Origin: ${ORIGIN_DRIVER}$( [[ "${real_azure}" == "1" ]] && echo " (real Azure ac
 
 Next steps:
   bin/orcadev upload --generate --count 5 --size 10MiB   # seed synthetic blobs
-  bin/orcadev roundtrip --file /tmp/test.bin             # verify SHA-256 roundtrip
-  bin/orcadev scenario cold-warm                         # canned end-to-end scenario
-  bin/orcadev bench --key synth1 --duration 30s          # parallel-GET benchmark
+  bin/orcadev scenario cold-warm                         # canned end-to-end scenario (no seed file needed)
+  bin/orcadev bench --key synth1 --duration 30s          # parallel-GET benchmark against synth1
+
+  # SHA-256 roundtrip verification (create a seed file first):
+  dd if=/dev/urandom of=/tmp/orca-test.bin bs=1M count=10 status=none
+  bin/orcadev roundtrip --file /tmp/orca-test.bin
 
 orcadev auto-port-forwards svc/orca, svc/azurite, svc/localstack as
 needed, so no separate \`kubectl port-forward\` is required. If you

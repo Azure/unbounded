@@ -127,6 +127,22 @@ func runRoundtrip(ctx context.Context, g *globalFlags, o *roundtripOpts) error {
 // constructed origin client and edge client. Split out from
 // runRoundtrip so tests can drive the full verify cycle with a
 // fake origin + httptest edge without spinning a kind cluster.
+//
+// Output layout is intentionally vertical so a human can compare the
+// source and received SHA-256s at a glance:
+//
+//	source: <key> (<size>)
+//	  sha256: <hex>
+//
+//	iter 0: status=200 bytes=<size> elapsed=<dur> rate=<rate>
+//	  sha256: <hex>  MATCH
+//	...
+//
+//	PASS sha256=<short> (N iter[s])
+//
+// On mismatch the per-iter sha256 line is tagged MISMATCH, and the
+// full source / received hashes are reprinted in the summary block
+// below it for copy-paste.
 func runRoundtripWith(ctx context.Context, oc originClient, edge *edgeClient, o *roundtripOpts) error {
 	// Determine the object name + the source-hash to compare against.
 	key, sourceHash, size, err := prepareRoundtripSource(ctx, oc, o)
@@ -134,7 +150,8 @@ func runRoundtripWith(ctx context.Context, oc originClient, edge *edgeClient, o 
 		return err
 	}
 
-	fmt.Fprintf(os.Stderr, "source: %s (%s, sha256=%s)\n", key, formatSize(size), sourceHash)
+	fmt.Fprintf(os.Stderr, "source: %s (%s)\n", key, formatSize(size))
+	fmt.Fprintf(os.Stderr, "  sha256: %s\n\n", sourceHash)
 
 	// Run the configured number of iterations.
 	for i := 0; i < o.repeat; i++ {
@@ -160,11 +177,18 @@ func runRoundtripWith(ctx context.Context, oc originClient, edge *edgeClient, o 
 			throughput = formatRate(gotSize, elapsed)
 		}
 
-		fmt.Fprintf(os.Stderr, "iter %d: status=%d bytes=%s elapsed=%s rate=%s sha256=%s\n",
-			i, status, formatSize(gotSize), elapsed.Round(time.Microsecond), throughput, recvHash)
+		fmt.Fprintf(os.Stderr, "iter %d: status=%d bytes=%s elapsed=%s rate=%s\n",
+			i, status, formatSize(gotSize), elapsed.Round(time.Microsecond), throughput)
+
+		marker := "MATCH"
+		if recvHash != sourceHash {
+			marker = "MISMATCH"
+		}
+
+		fmt.Fprintf(os.Stderr, "  sha256: %s  %s\n\n", recvHash, marker)
 
 		if recvHash != sourceHash {
-			fmt.Fprintln(os.Stderr, "MISMATCH")
+			fmt.Fprintf(os.Stderr, "MISMATCH on iter %d\n", i)
 			fmt.Fprintf(os.Stderr, "  source sha256:   %s\n", sourceHash)
 			fmt.Fprintf(os.Stderr, "  received sha256: %s\n", recvHash)
 
@@ -178,7 +202,7 @@ func runRoundtripWith(ctx context.Context, oc originClient, edge *edgeClient, o 
 		}
 	}
 
-	fmt.Fprintln(os.Stderr, "PASS")
+	fmt.Fprintf(os.Stderr, "PASS sha256=%s (%s)\n", shortHash(sourceHash), iterLabel(o.repeat))
 
 	if o.cleanup && o.file != "" {
 		if err := oc.Delete(ctx, key); err != nil {
@@ -187,6 +211,27 @@ func runRoundtripWith(ctx context.Context, oc originClient, edge *edgeClient, o 
 	}
 
 	return nil
+}
+
+// shortHash returns the first 8 hex characters of a sha256 digest
+// (plus an ellipsis) for the at-a-glance PASS summary line. Eight
+// hex chars give a 1-in-4-billion collision space which is more
+// than enough to confirm two runs landed on the same content.
+func shortHash(full string) string {
+	if len(full) <= 8 {
+		return full + "..."
+	}
+
+	return full[:8] + "..."
+}
+
+// iterLabel returns "1 iter" or "N iters" for the PASS summary.
+func iterLabel(n int) string {
+	if n == 1 {
+		return "1 iter"
+	}
+
+	return fmt.Sprintf("%d iters", n)
 }
 
 // prepareRoundtripSource handles the upload-or-fetch path and returns
