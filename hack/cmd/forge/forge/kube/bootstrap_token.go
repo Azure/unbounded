@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -20,7 +21,8 @@ import (
 var ErrBootstrapTokenNotFound = errors.New("bootstrap token not found")
 
 const (
-	alphanumeric = "abcdefghijklmnopqrstuvwxyz0123456789"
+	alphanumeric             = "abcdefghijklmnopqrstuvwxyz0123456789"
+	defaultBootstrapTokenTTL = 24 * time.Hour
 )
 
 type BootstrapToken struct {
@@ -83,6 +85,8 @@ func GenerateBootstrapIDAndToken() (string, string, error) {
 }
 
 func BootstrapTokenManifest(id, token string) string {
+	expiresAt := time.Now().UTC().Add(defaultBootstrapTokenTTL).Format(time.RFC3339)
+
 	return fmt.Sprintf(`apiVersion: v1
 kind: Secret
 metadata:
@@ -96,7 +100,8 @@ stringData:
   token-secret: "%[2]s"
   usage-bootstrap-authentication: "true"
   usage-bootstrap-signing: "true"
-  auth-extra-groups: "system:bootstrappers:kubeadm:default-node-token"`, id, token)
+  auth-extra-groups: "system:bootstrappers:kubeadm:default-node-token"
+  expiration: "%[3]s"`, id, token, expiresAt)
 }
 
 func generateRandomString(length int) (string, error) {
