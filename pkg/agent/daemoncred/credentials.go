@@ -28,8 +28,6 @@ import (
 
 const (
 	DefaultControllerCertificateSignerName = "kubernetes.io/kube-apiserver-client"
-	DefaultControllerCertificateGroup      = "unbounded-agent-daemons"
-	DefaultControllerCertificateName       = "unbounded-agent-daemon-controller"
 
 	controllerCertificateStorePrefix               = "daemon-controller"
 	defaultControllerCertificateWaitTimeout        = 10 * time.Second
@@ -38,43 +36,39 @@ const (
 	defaultControllerCertificateReloadPeriod       = 10 * time.Second
 )
 
+// ControllerCertificateOptions configures daemon-controller client certificate
+// issuance, storage, and REST client rotation.
 type ControllerCertificateOptions struct {
 	// Name identifies this certificate manager in logs.
 	Name string
 
 	// SignerName is the certificates.k8s.io signerName used for daemon-controller CSRs.
+	// Defaults to kubernetes.io/kube-apiserver-client when empty.
 	SignerName string
 
 	// DaemonGroup is the additional group requested alongside system:nodes.
+	// It is required and must not use reserved or privileged group names.
 	DaemonGroup string
 
 	// CredentialDir stores the daemon-controller certificate material.
+	// It is required.
 	CredentialDir string
 
 	// WaitTimeout is how long initial certificate issuance waits before failing.
+	// Defaults to 10 seconds when unset.
 	WaitTimeout time.Duration
 
 	// WaitPoll is the polling interval used while waiting for initial issuance.
+	// Defaults to 500 milliseconds when unset.
 	WaitPoll time.Duration
 
 	// ExpirationDuration is the requested lifetime for issued certificates.
+	// Defaults to 365 days when unset.
 	ExpirationDuration time.Duration
 
 	// ReloadPeriod is how often the REST config provider checks for rotation.
+	// Defaults to 10 seconds when unset.
 	ReloadPeriod time.Duration
-}
-
-func DefaultControllerCertificateOptions(credentialDir string) ControllerCertificateOptions {
-	return ControllerCertificateOptions{
-		Name:               DefaultControllerCertificateName,
-		SignerName:         DefaultControllerCertificateSignerName,
-		DaemonGroup:        DefaultControllerCertificateGroup,
-		CredentialDir:      credentialDir,
-		WaitTimeout:        defaultControllerCertificateWaitTimeout,
-		WaitPoll:           defaultControllerCertificateWaitPoll,
-		ExpirationDuration: defaultControllerCertificateExpirationDuration,
-		ReloadPeriod:       defaultControllerCertificateReloadPeriod,
-	}
 }
 
 func (o *ControllerCertificateOptions) validate() error {
@@ -85,10 +79,10 @@ func (o *ControllerCertificateOptions) validate() error {
 		o.SignerName = DefaultControllerCertificateSignerName
 	}
 	if o.Name == "" {
-		o.Name = DefaultControllerCertificateName
+		return fmt.Errorf("certificate manager name is required")
 	}
 	if o.DaemonGroup == "" {
-		o.DaemonGroup = DefaultControllerCertificateGroup
+		return fmt.Errorf("daemon group is required")
 	}
 	if isReservedDaemonGroup(o.DaemonGroup) {
 		return fmt.Errorf("daemon group must not use reserved or privileged group name: %s", o.DaemonGroup)

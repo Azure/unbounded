@@ -86,8 +86,15 @@ func storeControllerCertificateForTest(
 func testControllerCertificateOptions(t *testing.T) ControllerCertificateOptions {
 	t.Helper()
 
-	return DefaultControllerCertificateOptions(t.TempDir())
+	return ControllerCertificateOptions{
+		Name:          "test-daemon-controller",
+		SignerName:    DefaultControllerCertificateSignerName,
+		DaemonGroup:   testDaemonGroup,
+		CredentialDir: t.TempDir(),
+	}
 }
+
+const testDaemonGroup = "test-daemon-group"
 
 func testCertificate(t *testing.T, commonName string) ([]byte, []byte) {
 	t.Helper()

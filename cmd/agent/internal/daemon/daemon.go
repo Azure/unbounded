@@ -24,6 +24,11 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
+const (
+	daemonControllerCertificateName = "unbounded-agent-daemon-controller"
+	daemonControllerGroup           = "unbounded-agent-daemons"
+)
+
 // kubeClientFunc constructs a controller-runtime client from a rest.Config.
 // The production implementation is client.NewWithWatch; tests can supply a fake.
 type kubeClientFunc func(cfg *rest.Config, opts client.Options) (client.WithWatch, error)
@@ -126,7 +131,12 @@ func daemonControllerCredentials(
 		return nil, nil, fmt.Errorf("build bootstrap rest config: %w", err)
 	}
 
-	opts := daemoncred.DefaultControllerCertificateOptions(runOpts.DaemonCredentialDir)
+	opts := daemoncred.ControllerCertificateOptions{
+		Name:          daemonControllerCertificateName,
+		SignerName:    daemoncred.DefaultControllerCertificateSignerName,
+		DaemonGroup:   daemonControllerGroup,
+		CredentialDir: runOpts.DaemonCredentialDir,
+	}
 
 	provider, err := daemoncred.NewRESTConfigProvider(ctx, bootstrapCfg, agentCfg.NodeName, opts)
 	if err != nil {

@@ -88,7 +88,11 @@ func RunManager(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("setup Machine configuration binding controller: %w", err)
 	}
 
-	if err := NewDaemonCSRApproverReconciler(mgr.GetClient(), kubeClient).SetupWithManager(mgr); err != nil {
+	daemonCSRApprover, err := NewDaemonCSRApprover(mgr.GetClient(), kubeClient)
+	if err != nil {
+		return fmt.Errorf("create daemon CSR approver controller: %w", err)
+	}
+	if err := daemonCSRApprover.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup daemon CSR approver controller: %w", err)
 	}
 
