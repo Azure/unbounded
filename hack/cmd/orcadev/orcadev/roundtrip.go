@@ -85,11 +85,16 @@ Exits non-zero on any mismatch.`,
 // exit code.
 func runRoundtrip(ctx context.Context, g *globalFlags, o *roundtripOpts) error {
 	if o.file == "" && o.key == "" {
-		return fmt.Errorf("one of --file or --key is required")
+		return fmt.Errorf("one of --file or --key is required: " +
+			"--file PATH uploads a local file and fetches it back (source-of-truth = the local file), " +
+			"--key NAME fetches an existing origin object (source-of-truth = the origin)")
 	}
 
 	if o.file != "" && o.key != "" {
-		return fmt.Errorf("--file and --key are mutually exclusive")
+		return fmt.Errorf("--file and --key are mutually exclusive: " +
+			"--file PATH means \"upload this file then fetch it back\" (source-of-truth = the local file); " +
+			"--key NAME means \"fetch this existing origin object\" (source-of-truth = the current origin bytes); " +
+			"pick one - to compare a file against an existing origin object, upload it under a different name first")
 	}
 
 	if o.repeat < 1 {

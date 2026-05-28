@@ -211,6 +211,68 @@ func TestIterLabel(t *testing.T) {
 	}
 }
 
+// TestRunRoundtrip_FlagErrors locks the actionable error messages
+// for the two flag-validation paths. Both were previously terse
+// ("--file and --key are mutually exclusive" with no explanation of
+// what the two modes mean); the messages now spell out the
+// source-of-truth semantics so the operator can pick the right one
+// without re-reading the long help.
+func TestRunRoundtrip_FlagErrors(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		o        *roundtripOpts
+		wantSubs []string
+	}{
+		{
+			name: "neither --file nor --key",
+			o:    &roundtripOpts{},
+			wantSubs: []string{
+				"one of --file or --key is required",
+				"source-of-truth = the local file",
+				"source-of-truth = the origin",
+			},
+		},
+		{
+			name: "both --file and --key",
+			o:    &roundtripOpts{file: "/tmp/x", key: "y"},
+			wantSubs: []string{
+				"mutually exclusive",
+				"source-of-truth = the local file",
+				"source-of-truth = the current origin bytes",
+				"upload it under a different name",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			// runRoundtrip needs the flag-validation paths, not
+			// the network paths. Pass a minimal globalFlags with
+			// autoPortForward off so we never try to spawn
+			// kubectl; both error branches return BEFORE the
+			// port-forward call.
+			g := defaultGlobalFlags()
+			g.autoPortForward = false
+
+			err := runRoundtrip(context.Background(), g, tt.o)
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+
+			msg := err.Error()
+			for _, want := range tt.wantSubs {
+				if !strings.Contains(msg, want) {
+					t.Errorf("error missing substring %q\ngot: %s", want, msg)
+				}
+			}
+		})
+	}
+}
+
 // captureStderr swaps os.Stderr for the duration of fn and returns
 // everything fn wrote to it. Safe to call sequentially across
 // subtests; NOT safe to use with t.Parallel because os.Stderr is
