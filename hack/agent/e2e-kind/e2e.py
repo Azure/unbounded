@@ -30,7 +30,6 @@ Subcommands (called as individual workflow steps):
     validate-workload                  Deploy test pods on the agent node.
     validate-kube-proxy                Verify kube-proxy is Running on all nodes.
     install-machine-crd                Install Machine CRD and bootstrapper RBAC.
-    start-agent-csr-approver           Run the agent CSR approver against Kind.
     start-machina-controller           Run the machina controller against Kind.
     validate-machina-controller        Verify machina creates an MCV.
     delete-machine-cr                  Delete the Machine CR.
@@ -113,11 +112,8 @@ SSH_TARGET = f"ubuntu@{VM_IP}"
 KUBECTL = "kubectl"
 KUBECTL_UNBOUNDED = str(REPO_ROOT / "bin" / "kubectl-unbounded")
 MACHINA = str(REPO_ROOT / "bin" / "machina")
-AGENT_CSR_APPROVER = str(REPO_ROOT / "bin" / "agent-csr-approver")
 
 TEST_NS = "e2e-workload-test"
-AGENT_CSR_APPROVER_PID_FILE = VM_DIR / "agent-csr-approver.pid"
-AGENT_CSR_APPROVER_LOG_FILE = VM_DIR / "agent-csr-approver.log"
 MACHINA_PID_FILE = VM_DIR / "machina-controller.pid"
 MACHINA_LOG_FILE = VM_DIR / "machina-controller.log"
 MACHINA_CONFIG_FILE = VM_DIR / "machina-config.yaml"
@@ -1968,55 +1964,6 @@ def install_machine_crd() -> None:
 
 
 # ---------------------------------------------------------------------------
-# start-agent-csr-approver
-# ---------------------------------------------------------------------------
-def start_agent_csr_approver() -> None:
-    """Build and run the agent CSR approver locally against the Kind cluster."""
-
-    log("Building agent CSR approver...")
-    run(["go", "build", "-o", AGENT_CSR_APPROVER, str(REPO_ROOT / "cmd" / "agent-csr-approver")])
-
-    VM_DIR.mkdir(parents=True, exist_ok=True)
-
-    if AGENT_CSR_APPROVER_PID_FILE.exists():
-        old_pid = AGENT_CSR_APPROVER_PID_FILE.read_text().strip()
-        if old_pid:
-            run_quiet(["kill", old_pid], check=False)
-
-    log("Starting agent CSR approver in background...")
-    log(f"Agent CSR approver logs: {AGENT_CSR_APPROVER_LOG_FILE}")
-    log_file = AGENT_CSR_APPROVER_LOG_FILE.open("w")
-    env = os.environ.copy()
-    # GitHub Actions uses RUNNER_TRACKING_ID to clean up processes it started.
-    # Clear it so the approver survives across later workflow steps.
-    env["RUNNER_TRACKING_ID"] = ""
-    proc = subprocess.Popen(
-        [
-            AGENT_CSR_APPROVER,
-            "--leader-elect=false",
-            "--metrics-bind-address=0",
-            "--health-probe-bind-address=0",
-        ],
-        cwd=str(REPO_ROOT),
-        env=env,
-        stdout=log_file,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-        text=True,
-    )
-    log_file.close()
-    AGENT_CSR_APPROVER_PID_FILE.write_text(str(proc.pid))
-
-    time.sleep(3)
-    if proc.poll() is not None:
-        if AGENT_CSR_APPROVER_LOG_FILE.exists():
-            print(AGENT_CSR_APPROVER_LOG_FILE.read_text(), flush=True)
-        die(f"agent CSR approver exited early with code {proc.returncode}")
-
-    log(f"Agent CSR approver started (pid={proc.pid})")
-
-
-# ---------------------------------------------------------------------------
 # start-machina-controller
 # ---------------------------------------------------------------------------
 def start_machina_controller() -> None:
@@ -2607,8 +2554,6 @@ def collect_logs() -> None:
 
     if MACHINA_LOG_FILE.exists():
         shutil.copyfile(MACHINA_LOG_FILE, logs_dir / "machina-controller.log")
-    if AGENT_CSR_APPROVER_LOG_FILE.exists():
-        shutil.copyfile(AGENT_CSR_APPROVER_LOG_FILE, logs_dir / "agent-csr-approver.log")
 
     _write_command_log(logs_dir / "nodes.txt", [KUBECTL, "get", "nodes", "-o", "wide"])
     _write_command_log(logs_dir / "nodes-describe.txt", [KUBECTL, "describe", "nodes"])
@@ -2654,14 +2599,6 @@ def collect_logs() -> None:
 # ---------------------------------------------------------------------------
 def cleanup() -> None:
     """Tear down VM, networking, and Kind cluster."""
-
-    # Stop locally running agent CSR approver if this e2e started one.
-    if AGENT_CSR_APPROVER_PID_FILE.exists():
-        pid = AGENT_CSR_APPROVER_PID_FILE.read_text().strip()
-        if pid:
-            log(f"Stopping agent CSR approver pid {pid}...")
-            run_quiet(["kill", pid], check=False)
-        AGENT_CSR_APPROVER_PID_FILE.unlink(missing_ok=True)
 
     # Stop locally running machina controller if this e2e started one.
     if MACHINA_PID_FILE.exists():
@@ -2757,7 +2694,6 @@ COMMANDS: dict[str, Command] = {
     "validate-kube-proxy": _without_node_config(validate_kube_proxy),
     "validate-workload": _without_node_config(validate_workload),
     "install-machine-crd": _without_node_config(install_machine_crd),
-    "start-agent-csr-approver": _without_node_config(start_agent_csr_approver),
     "start-machina-controller": _without_node_config(start_machina_controller),
     "validate-machina-controller": _without_node_config(validate_machina_controller),
     "delete-machine-cr": _without_node_config(delete_machine_cr),

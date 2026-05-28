@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 
+	certificatesv1 "k8s.io/api/certificates/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/kubernetes"
@@ -23,6 +24,7 @@ var scheme = runtime.NewScheme()
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(certificatesv1.AddToScheme(scheme))
 	utilruntime.Must(unboundedv1alpha3.AddToScheme(scheme))
 }
 
@@ -84,6 +86,10 @@ func RunManager(ctx context.Context, cfg Config) error {
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup Machine configuration binding controller: %w", err)
+	}
+
+	if err := NewDaemonCSRApproverReconciler(mgr.GetClient(), kubeClient).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("setup daemon CSR approver controller: %w", err)
 	}
 
 	// Add health checks
