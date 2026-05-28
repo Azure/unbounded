@@ -1,6 +1,6 @@
 ---
-# Grant bootstrap token users (system:bootstrappers group) the permissions
-# required by the unbounded-agent daemon. The daemon self-registers a
+# Grant daemon controller certificates the permissions required by the
+# unbounded-agent daemon. The daemon self-registers a
 # Machine CR at startup when one does not already exist, then runs an in-VM
 # controller loop that watches its local Node, its Machine CR, and
 # MachineOperation CRs targeting the machine. It also reads configuration
@@ -35,9 +35,6 @@ kind: ClusterRoleBinding
 metadata:
   name: unbounded-bootstrapper-machine
 subjects:
-  - kind: Group
-    name: system:bootstrappers
-    apiGroup: rbac.authorization.k8s.io
   - kind: Group
     name: unbounded-agent-daemons
     apiGroup: rbac.authorization.k8s.io

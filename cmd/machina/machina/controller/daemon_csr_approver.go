@@ -19,9 +19,10 @@ import (
 )
 
 const (
-	bootstrapSecretPref = "bootstrap-token-"
-	daemonGroup         = "unbounded-agent-daemons"
-	bootstrapGroup      = "system:bootstrappers:unbounded-agent-daemons"
+	bootstrapSecretPref        = "bootstrap-token-"
+	defaultBootstrapTokenLabel = "unbounded-cloud.io/default-bootstrap-token"
+	daemonGroup                = "unbounded-agent-daemons"
+	bootstrapGroup             = "system:bootstrappers:unbounded-agent-daemons"
 )
 
 type daemonCSRClaimChecker struct {
@@ -63,7 +64,8 @@ func (c *daemonCSRClaimChecker) bootstrapTokenMayClaimNode(
 	}
 
 	siteName := strings.TrimSpace(token.Labels[unboundedv1alpha3.MachineSiteLabelKey])
-	if siteName == "" {
+	isDefaultToken := strings.EqualFold(strings.TrimSpace(token.Labels[defaultBootstrapTokenLabel]), "true")
+	if siteName == "" && !isDefaultToken {
 		return false, nil
 	}
 
@@ -82,15 +84,15 @@ func (c *daemonCSRClaimChecker) bootstrapTokenMayClaimNode(
 
 		// During early bootstrap, the Machine may not exist yet. When a Machine
 		// already references this token, enforce token-to-Machine-to-Node binding.
-		if machine.Labels[unboundedv1alpha3.MachineSiteLabelKey] != siteName {
+		if siteName != "" && machine.Labels[unboundedv1alpha3.MachineSiteLabelKey] != siteName {
 			return false, nil
 		}
 
 		return machineNodeName(&machine) == nodeName, nil
 	}
 
-	// No Machine references this token yet. Allow initial issuance based on the
-	// site-bound bootstrap token; the daemon may create the Machine afterward.
+	// No Machine references this token yet. Allow initial issuance based on a
+	// trusted bootstrap token label; the daemon may create the Machine afterward.
 	return true, nil
 }
 

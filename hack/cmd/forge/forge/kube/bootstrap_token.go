@@ -22,7 +22,7 @@ var ErrBootstrapTokenNotFound = errors.New("bootstrap token not found")
 
 const (
 	alphanumeric             = "abcdefghijklmnopqrstuvwxyz0123456789"
-	defaultBootstrapTokenTTL = 24 * time.Hour
+	defaultBootstrapTokenTTL = 3 * time.Hour
 )
 
 type BootstrapToken struct {
@@ -100,7 +100,7 @@ stringData:
   token-secret: "%[2]s"
   usage-bootstrap-authentication: "true"
   usage-bootstrap-signing: "true"
-  auth-extra-groups: "system:bootstrappers:kubeadm:default-node-token"
+  auth-extra-groups: "system:bootstrappers:unbounded-agent-daemons"
   expiration: "%[3]s"`, id, token, expiresAt)
 }
 

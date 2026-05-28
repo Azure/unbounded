@@ -20,7 +20,7 @@ import (
 
 const (
 	bootstrapTokenAlphabet   = "abcdefghijklmnopqrstuvwxyz0123456789"
-	DefaultBootstrapTokenTTL = 24 * time.Hour
+	DefaultBootstrapTokenTTL = 3 * time.Hour
 )
 
 // ErrBootstrapTokenNotFound is returned by GetBootstrapToken when no matching
@@ -78,7 +78,7 @@ func ApplyBootstrapToken(ctx context.Context, kubeCli kubernetes.Interface, fiel
 		WithType(corev1.SecretTypeBootstrapToken).
 		WithLabels(token.Labels).
 		WithData(map[string][]byte{
-			"auth-extra-groups":              []byte("system:bootstrappers:kubeadm:default-node-token"),
+			"auth-extra-groups":              []byte("system:bootstrappers:unbounded-agent-daemons"),
 			"expiration":                     []byte(expiresAt.UTC().Format(time.RFC3339)),
 			"token-id":                       []byte(token.ID),
 			"token-secret":                   []byte(token.Secret),

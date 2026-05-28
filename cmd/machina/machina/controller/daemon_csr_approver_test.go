@@ -38,6 +38,15 @@ func TestDaemonCSRBootstrapTokenMayClaimNodeBeforeMachineExists(t *testing.T) {
 	require.True(t, allowed)
 }
 
+func TestDaemonCSRBootstrapTokenMayClaimNodeWithDefaultToken(t *testing.T) {
+	checker := testDaemonCSRClaimChecker(defaultBootstrapToken("abc123"))
+	csr := csrForBinding("system:bootstrap:abc123")
+
+	allowed, err := checker.bootstrapTokenMayClaimNode(context.Background(), csr, "node-a")
+	require.NoError(t, err)
+	require.True(t, allowed)
+}
+
 func TestDaemonCSRBootstrapTokenMayClaimNodeRequiresSiteBinding(t *testing.T) {
 	checker := testDaemonCSRClaimChecker(
 		bootstrapToken("abc123", ""),
@@ -72,6 +81,18 @@ func TestDaemonCSRBootstrapTokenMayClaimNodeRejectsWrongSite(t *testing.T) {
 	allowed, err := checker.bootstrapTokenMayClaimNode(context.Background(), csr, "node-a")
 	require.NoError(t, err)
 	require.False(t, allowed)
+}
+
+func TestDaemonCSRBootstrapTokenMayClaimNodeAllowsDefaultTokenMachineSite(t *testing.T) {
+	checker := testDaemonCSRClaimChecker(
+		defaultBootstrapToken("abc123"),
+		machineForToken("machine-a", "node-a", "abc123", "site-a"),
+	)
+	csr := csrForBinding("system:bootstrap:abc123")
+
+	allowed, err := checker.bootstrapTokenMayClaimNode(context.Background(), csr, "node-a")
+	require.NoError(t, err)
+	require.True(t, allowed)
 }
 
 func TestDaemonCSRNodeHasMachineBinding(t *testing.T) {
@@ -122,6 +143,13 @@ func bootstrapToken(tokenID string, site string) *corev1.Secret {
 		},
 		Type: corev1.SecretType("bootstrap.kubernetes.io/token"),
 	}
+}
+
+func defaultBootstrapToken(tokenID string) *corev1.Secret {
+	token := bootstrapToken(tokenID, "")
+	token.Labels[defaultBootstrapTokenLabel] = "true"
+
+	return token
 }
 
 func machineForToken(machineName, nodeName, tokenID, site string) *unboundedv1alpha3.Machine {

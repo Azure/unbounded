@@ -24,6 +24,7 @@ func TestApplyBootstrapTokenAddsExpiration(t *testing.T) {
 
 	secret, err := client.CoreV1().Secrets(metav1.NamespaceSystem).Get(ctx, "bootstrap-token-abc123", metav1.GetOptions{})
 	require.NoError(t, err)
+	require.Equal(t, "system:bootstrappers:unbounded-agent-daemons", string(secret.Data["auth-extra-groups"]))
 	require.NotEmpty(t, secret.Data["expiration"])
 	expiresAt, err := time.Parse(time.RFC3339, string(secret.Data["expiration"]))
 	require.NoError(t, err)
