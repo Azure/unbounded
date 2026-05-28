@@ -44,6 +44,27 @@ func TestDaemonCSREvaluate_BootstrapTokenAllowed(t *testing.T) {
 	require.Contains(t, decision.Message, "node-a")
 }
 
+func TestDaemonCSREvaluate_BootstrapTokenAllowedBeforeMachineExists(t *testing.T) {
+	evaluator := testDaemonCSREvaluator()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		bootstrapToken("abc123", "site-a"),
+	).Build()
+	csr := csrFor(t, certificatesv1.CertificateSigningRequestSpec{
+		SignerName: testDaemonCSRSignerName,
+		Username:   "system:bootstrap:abc123",
+		Groups:     []string{testDaemonCSRBootstrapGroup},
+		Usages:     clientAuthUsages(),
+	}, csrSubject{
+		CommonName:   "system:node:node-a",
+		Organization: []string{systemNodesGroup, testDaemonCSRDaemonGroup},
+	})
+
+	decision, err := evaluator.Evaluate(context.Background(), c, csr)
+	require.NoError(t, err)
+	require.True(t, decision.Approve)
+	require.Contains(t, decision.Message, "node-a")
+}
+
 func TestDaemonCSREvaluate_BootstrapTokenRequiresDaemonGroup(t *testing.T) {
 	evaluator := testDaemonCSREvaluator()
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
@@ -133,7 +154,9 @@ func TestDaemonCSREvaluate_BootstrapTokenRejectsWrongSite(t *testing.T) {
 
 func TestDaemonCSREvaluate_RenewalAllowedForSameIdentity(t *testing.T) {
 	evaluator := testDaemonCSREvaluator()
-	c := fake.NewClientBuilder().WithScheme(scheme).Build()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		machineForToken("machine-a", "node-a", "abc123", "site-a"),
+	).Build()
 	csr := csrFor(t, certificatesv1.CertificateSigningRequestSpec{
 		SignerName: testDaemonCSRSignerName,
 		Username:   "system:node:node-a",
@@ -166,7 +189,7 @@ func TestDaemonCSREvaluate_StockKubeletCertCannotRenew(t *testing.T) {
 	decision, err := evaluator.Evaluate(context.Background(), c, csr)
 	require.NoError(t, err)
 	require.False(t, decision.Approve)
-	require.Contains(t, decision.Message, "neither")
+	require.Contains(t, decision.Message, "missing required node or daemon group")
 }
 
 func TestDaemonCSREvaluate_RejectsUnexpectedGroup(t *testing.T) {

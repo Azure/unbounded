@@ -9,6 +9,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
@@ -130,63 +131,106 @@ func (e daemonCSREvaluator) Evaluate(ctx context.Context, c client.Client, csr *
 		return daemonCSRDecision{AlreadyDecided: true}, nil
 	}
 
+	nodeName, errDecision, err := e.validateCSRShape(csr)
+	if err != nil || errDecision.Message != "" {
+		return errDecision, err
+	}
+
+	return e.evaluateRequester(ctx, c, csr, nodeName)
+}
+
+func (e daemonCSREvaluator) validateCSRShape(csr *certificatesv1.CertificateSigningRequest) (string, daemonCSRDecision, error) {
 	x509cr, err := parseCSR(csr.Spec.Request)
 	if err != nil {
-		return deny("unable to parse CSR: %v", err), nil
+		return "", deny("unable to parse CSR: %v", err), nil
 	}
 	if err := x509cr.CheckSignature(); err != nil {
-		return deny("CSR signature is invalid: %v", err), nil
+		return "", deny("CSR signature is invalid: %v", err), nil
 	}
 
 	nodeName, ok := strings.CutPrefix(x509cr.Subject.CommonName, systemNodeUserPrefix)
 	if !ok || nodeName == "" {
-		return deny("common name must be %s<nodeName>", systemNodeUserPrefix), nil
+		return "", deny("common name must be %s<nodeName>", systemNodeUserPrefix), nil
 	}
 	if hasUnexpectedSubjectFields(x509cr.Subject) {
-		return deny("subject must contain only common name and organizations"), nil
+		return "", deny("subject must contain only common name and organizations"), nil
 	}
 
 	if !equalStringSet(x509cr.Subject.Organization, []string{systemNodesGroup, e.DaemonGroup}) {
-		return deny("organizations must be exactly %s and %s", systemNodesGroup, e.DaemonGroup), nil
+		return "", deny("organizations must be exactly %s and %s", systemNodesGroup, e.DaemonGroup), nil
 	}
 
 	if len(x509cr.DNSNames) > 0 || len(x509cr.EmailAddresses) > 0 || len(x509cr.IPAddresses) > 0 || len(x509cr.URIs) > 0 {
-		return deny("subject alternative names are not allowed"), nil
+		return "", deny("subject alternative names are not allowed"), nil
 	}
 	if len(x509cr.Extensions) > 0 || len(x509cr.ExtraExtensions) > 0 {
-		return deny("CSR extensions are not allowed"), nil
+		return "", deny("CSR extensions are not allowed"), nil
 	}
 
 	if err := validateClientAuthUsages(csr.Spec.Usages); err != nil {
-		return deny("invalid usages: %v", err), nil
+		return "", deny("invalid usages: %v", err), nil
 	}
 	if csr.Spec.ExpirationSeconds != nil && *csr.Spec.ExpirationSeconds > maxDaemonCertificateExpirationSeconds {
-		return deny("requested expiration %d exceeds maximum %d", *csr.Spec.ExpirationSeconds, maxDaemonCertificateExpirationSeconds), nil
+		return "", deny("requested expiration %d exceeds maximum %d", *csr.Spec.ExpirationSeconds, maxDaemonCertificateExpirationSeconds), nil
 	}
 
+	return nodeName, daemonCSRDecision{}, nil
+}
+
+func (e daemonCSREvaluator) evaluateRequester(ctx context.Context, c client.Client, csr *certificatesv1.CertificateSigningRequest, nodeName string) (daemonCSRDecision, error) {
 	if strings.HasPrefix(csr.Spec.Username, bootstrapUserPrefix) {
-		// This group check is only a coarse bootstrap gate. Production use needs
-		// a stronger node-claim check that proves this bootstrap token is allowed
-		// to request the specific system:node:<nodeName> identity in the CSR.
-		if !hasString(csr.Spec.Groups, e.BootstrapGroup) {
-			return deny("bootstrap token requester is missing required group %q", e.BootstrapGroup), nil
-		}
-		allowed, err := e.bootstrapTokenMayClaimNode(ctx, c, csr.Spec.Username, nodeName)
-		if err != nil {
-			return daemonCSRDecision{}, err
-		}
-		if !allowed {
-			return deny("bootstrap token is not allowed to claim node %q", nodeName), nil
-		}
-
-		return approve("approved initial daemon-controller certificate for node %q", nodeName), nil
+		return e.evaluateBootstrapRequester(ctx, c, csr, nodeName)
 	}
 
-	if csr.Spec.Username == x509cr.Subject.CommonName && hasString(csr.Spec.Groups, systemNodesGroup) && hasString(csr.Spec.Groups, e.DaemonGroup) {
-		return approve("approved daemon-controller certificate renewal for node %q", nodeName), nil
+	if csr.Spec.Username == systemNodeUserPrefix+nodeName {
+		return e.evaluateRenewalRequester(ctx, c, csr, nodeName)
 	}
 
 	return deny("requester is neither an authorized bootstrap token nor matching daemon-controller identity"), nil
+}
+
+func (e daemonCSREvaluator) evaluateBootstrapRequester(ctx context.Context, c client.Client, csr *certificatesv1.CertificateSigningRequest, nodeName string) (daemonCSRDecision, error) {
+	if !slices.Contains(csr.Spec.Groups, e.BootstrapGroup) {
+		return deny("bootstrap token requester is missing required group %q", e.BootstrapGroup), nil
+	}
+	allowed, err := e.bootstrapTokenMayClaimNode(ctx, c, csr.Spec.Username, nodeName)
+	if err != nil {
+		return daemonCSRDecision{}, err
+	}
+	if !allowed {
+		return deny("bootstrap token is not allowed to claim node %q", nodeName), nil
+	}
+
+	return approve("approved initial daemon-controller certificate for node %q", nodeName), nil
+}
+
+func (e daemonCSREvaluator) evaluateRenewalRequester(ctx context.Context, c client.Client, csr *certificatesv1.CertificateSigningRequest, nodeName string) (daemonCSRDecision, error) {
+	if !slices.Contains(csr.Spec.Groups, systemNodesGroup) || !slices.Contains(csr.Spec.Groups, e.DaemonGroup) {
+		return deny("renewal requester is missing required node or daemon group"), nil
+	}
+
+	var machine unboundedv1alpha3.Machine
+	if err := c.Get(ctx, client.ObjectKey{Name: nodeName}, &machine); err == nil {
+		if machineNodeName(&machine) != nodeName {
+			return deny("node %q is not bound to a Machine", nodeName), nil
+		}
+
+		return approve("approved daemon-controller certificate renewal for node %q", nodeName), nil
+	} else if !apierrors.IsNotFound(err) {
+		return daemonCSRDecision{}, fmt.Errorf("get Machine %s for renewal claim check: %w", nodeName, err)
+	}
+
+	var machines unboundedv1alpha3.MachineList
+	if err := c.List(ctx, &machines); err != nil {
+		return daemonCSRDecision{}, fmt.Errorf("list Machines for renewal claim check: %w", err)
+	}
+	for _, machine := range machines.Items {
+		if machineNodeName(&machine) == nodeName {
+			return approve("approved daemon-controller certificate renewal for node %q", nodeName), nil
+		}
+	}
+
+	return deny("node %q is not bound to a Machine", nodeName), nil
 }
 
 func (e daemonCSREvaluator) bootstrapTokenMayClaimNode(ctx context.Context, c client.Client, username string, nodeName string) (bool, error) {
@@ -212,9 +256,6 @@ func (e daemonCSREvaluator) bootstrapTokenMayClaimNode(ctx context.Context, c cl
 	}
 
 	for _, machine := range machines.Items {
-		if machine.Labels[unboundedv1alpha3.MachineSiteLabelKey] != siteName {
-			continue
-		}
 		if machine.Spec.Kubernetes == nil {
 			continue
 		}
@@ -222,15 +263,26 @@ func (e daemonCSREvaluator) bootstrapTokenMayClaimNode(ctx context.Context, c cl
 			continue
 		}
 
-		expectedNodeName := machine.Name
-		if machine.Spec.Kubernetes.NodeRef != nil && machine.Spec.Kubernetes.NodeRef.Name != "" {
-			expectedNodeName = machine.Spec.Kubernetes.NodeRef.Name
+		// During early bootstrap, the Machine may not exist yet. When a Machine
+		// already references this token, enforce token-to-Machine-to-Node binding.
+		if machine.Labels[unboundedv1alpha3.MachineSiteLabelKey] != siteName {
+			return false, nil
 		}
 
-		return expectedNodeName == nodeName, nil
+		return machineNodeName(&machine) == nodeName, nil
 	}
 
-	return false, nil
+	// No Machine references this token yet. Allow initial issuance based on the
+	// site-bound bootstrap token; the daemon may create the Machine afterward.
+	return true, nil
+}
+
+func machineNodeName(machine *unboundedv1alpha3.Machine) string {
+	if machine.Spec.Kubernetes != nil && machine.Spec.Kubernetes.NodeRef != nil && machine.Spec.Kubernetes.NodeRef.Name != "" {
+		return machine.Spec.Kubernetes.NodeRef.Name
+	}
+
+	return machine.Name
 }
 
 func hasUnexpectedSubjectFields(subject pkix.Name) bool {
@@ -316,14 +368,4 @@ func equalStringSet(a, b []string) bool {
 	}
 
 	return true
-}
-
-func hasString(values []string, value string) bool {
-	for _, v := range values {
-		if v == value {
-			return true
-		}
-	}
-
-	return false
 }
