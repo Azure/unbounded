@@ -104,11 +104,10 @@ impl<B: BlockDevice + 'static> LiveDiskTopology<B> {
         // the same generation, with no possibility of seeing a
         // new gen paired with an old snapshot or vice versa.
         let gen_n = self.current.load().generation + 1;
-        self.current
-            .store(Arc::new(LocalStorageSnapshotInner {
-                ls,
-                generation: gen_n,
-            }));
+        self.current.store(Arc::new(LocalStorageSnapshotInner {
+            ls,
+            generation: gen_n,
+        }));
         drop(table);
         eprintln!("disks: hot-swap to generation {gen_n} (cache cold; engine count={n})");
     }

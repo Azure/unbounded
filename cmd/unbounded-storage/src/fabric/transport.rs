@@ -48,7 +48,8 @@ use std::task::{Context, Poll, Waker};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::bufferpool::{BulkRef, Error as PoolError, PageRef, PageStream, PeerId, Req, Transport};
+use crate::bufferpool::{BulkRef, Error as PoolError, PageRef, PageStream, Req, Transport};
+use crate::fabric::PeerId;
 
 use super::backing::MrHandle;
 use super::completion::{CompletionInfo, CompletionSlot};

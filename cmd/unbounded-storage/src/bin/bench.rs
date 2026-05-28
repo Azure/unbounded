@@ -63,9 +63,7 @@ use clap::{Parser, Subcommand};
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
-use unbounded_storage::backing::{
-    BackingKind, BackingRequest, HUGEPAGE_2MB, allocate,
-};
+use unbounded_storage::backing::{BackingKind, BackingRequest, HUGEPAGE_2MB, allocate};
 use unbounded_storage::bufferpool::{BlockStore, PageRef, StripeKey};
 use unbounded_storage::runtime::{DefaultRuntime, PinnedRuntime, Threading, WorkerIdx, WorkerSpec};
 use unbounded_storage::storage::blockdev::{BlockDevice, UringBlockDevice, UringConfig};
@@ -588,9 +586,7 @@ fn device_label(cfg: &ShardConfig) -> String {
     format!("{} ({})", cfg.device_path.display(), numa)
 }
 
-fn run_device_inner(
-    cfgs: &[ShardConfig],
-) -> Result<(Vec<ShardReport>, Vec<ShardReport>), String> {
+fn run_device_inner(cfgs: &[ShardConfig]) -> Result<(Vec<ShardReport>, Vec<ShardReport>), String> {
     // Every shard in `cfgs` targets the same device, was given the
     // same device-level knobs by `run_block`, and shares a single
     // OS thread. Sanity-check the invariants the rest of the
@@ -606,7 +602,10 @@ fn run_device_inner(
         debug_assert_eq!(c.queue_depth, head.queue_depth);
         debug_assert_eq!(c.bypass_admission, head.bypass_admission);
         debug_assert_eq!(c.verify, head.verify);
-        debug_assert_eq!(c.skip_recovery_scan_if_no_meta, head.skip_recovery_scan_if_no_meta);
+        debug_assert_eq!(
+            c.skip_recovery_scan_if_no_meta,
+            head.skip_recovery_scan_if_no_meta
+        );
     }
 
     let mut uring_cfg = UringConfig {
@@ -777,8 +776,7 @@ fn run_device_inner(
     // Trust check: if the engine reports any write_io_errors,
     // the bench's "ops succeeded" count is no longer a reliable
     // measure of bytes-on-disk. Print so the operator sees it.
-    if snapshot.write_io_errors > 0 || snapshot.read_io_errors > 0 || snapshot.checksum_misses > 0
-    {
+    if snapshot.write_io_errors > 0 || snapshot.read_io_errors > 0 || snapshot.checksum_misses > 0 {
         eprintln!(
             "device {} engine snapshot: write_io_errors={} read_io_errors={} \
              checksum_misses={} rejected_by_filter={} admitted={} hits={} \
@@ -904,8 +902,7 @@ fn run_verify_device(
     });
 
     let snapshot = engine.snapshot();
-    if snapshot.write_io_errors > 0 || snapshot.read_io_errors > 0 || snapshot.checksum_misses > 0
-    {
+    if snapshot.write_io_errors > 0 || snapshot.read_io_errors > 0 || snapshot.checksum_misses > 0 {
         return Err(format!(
             "verify: engine reported errors: write_io_errors={} read_io_errors={} \
              checksum_misses={}",
@@ -1111,10 +1108,7 @@ fn run_phase_device(
                             .unwrap_or_default(),
                     };
                     if matches!(phase, Phase::Read) && !keys.is_empty() {
-                        shuffle(
-                            &mut keys,
-                            cfg.seed ^ (worker_id as u64) ^ 0xDEAD_u64,
-                        );
+                        shuffle(&mut keys, cfg.seed ^ (worker_id as u64) ^ 0xDEAD_u64);
                     }
                     Arc::new(Mutex::new(WorkerState {
                         worker_id,
@@ -1552,7 +1546,11 @@ fn print_phase(name: &str, args: &BlockArgs, total_shards: usize, reports: &[Sha
     println!("  duration:       {:.2}s", elapsed_secs);
     println!(
         "  admission:      {}",
-        if args.bypass_admission { "bypassed" } else { "enabled" },
+        if args.bypass_admission {
+            "bypassed"
+        } else {
+            "enabled"
+        },
     );
     println!();
     println!("  ops:            {}", total_ops);

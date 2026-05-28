@@ -296,8 +296,7 @@ mod tests {
         );
         assert_eq!(
             d3.registered_len() - baseline_bytes,
-            backing_a.page_size * backing_a.page_count
-                + backing_b.page_size * backing_b.page_count,
+            backing_a.page_size * backing_a.page_count + backing_b.page_size * backing_b.page_count,
             "replay sizes do not match the recorded backings"
         );
         assert_eq!(

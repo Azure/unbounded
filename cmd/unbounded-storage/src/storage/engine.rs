@@ -782,9 +782,9 @@ impl<B: BlockDevice> StorageEngine<B> {
                 MutatorOutcome::Failed
             } else {
                 match req {
-                    MutatorReq::Insert { .. } => MutatorOutcome::InsertCommitted {
-                        prior: priors[i],
-                    },
+                    MutatorReq::Insert { .. } => {
+                        MutatorOutcome::InsertCommitted { prior: priors[i] }
+                    }
                     MutatorReq::Delete { .. } => MutatorOutcome::DeleteCommitted,
                 }
             };
@@ -1182,7 +1182,10 @@ mod tests {
             }
             let s = eng_body.snapshot();
             assert_eq!(s.write_io_errors, 1);
-            assert_eq!(s.admitted, 0, "failed write must not be counted as admitted");
+            assert_eq!(
+                s.admitted, 0,
+                "failed write must not be counted as admitted"
+            );
 
             // A subsequent read for the same key must miss: the
             // btree was never updated, so the engine should not

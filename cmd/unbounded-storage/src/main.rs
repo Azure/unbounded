@@ -14,16 +14,17 @@ use std::time::Duration;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 
-use unbounded_storage::bufferpool::{
-    PeerId, Pool, PoolConfig, PoolGroup, Req, ShardDescriptor, StripeKey,
-};
+use unbounded_storage::bufferpool::{Pool, PoolConfig, PoolGroup, Req, ShardDescriptor, StripeKey};
 use unbounded_storage::config::{self, Config, FabricCfg};
 use unbounded_storage::disk_supervisor::{
     DiskRegistry, LiveDiskTopology, LiveShardLocalStore, UringDiskTarget,
 };
-use unbounded_storage::storage::blockdev::BlockDeviceProxy;
-use unbounded_storage::fabric::{self, ConnectionSpec, Fabric, FabricTransport, Provider, StaticPeer};
+use unbounded_storage::fabric::PeerId;
+use unbounded_storage::fabric::{
+    self, ConnectionSpec, Fabric, FabricTransport, Provider, StaticPeer,
+};
 use unbounded_storage::runtime::{PinnedRuntime, Threading, WorkerIdx, WorkerSpec};
+use unbounded_storage::storage::blockdev::BlockDeviceProxy;
 use unbounded_storage::topology::{Host, Plan, Role, Worker};
 
 use unbounded_storage::backing::{BackingKind, BackingRequest, allocate};
@@ -74,8 +75,7 @@ fn main() -> ExitCode {
     };
     // CLI overrides config for back-compat.
     if let Some(b) = cli.bytes_per_shard {
-        config.storage.bytes_per_shard =
-            unbounded_storage::config::schema::ByteSize(b.get());
+        config.storage.bytes_per_shard = unbounded_storage::config::schema::ByteSize(b.get());
     }
     if cli.no_hugepages {
         config.storage.backing_kind = config::BackingKindCfg::Heap;
@@ -84,7 +84,10 @@ fn main() -> ExitCode {
     let bytes_per_shard_total = config.storage.bytes_per_shard.bytes();
 
     let host = Host::discover();
-    let plan = Plan::for_host(&host, &config::topology_cfg_to_plan_config(&config.topology));
+    let plan = Plan::for_host(
+        &host,
+        &config::topology_cfg_to_plan_config(&config.topology),
+    );
 
     let counts = RoleCounts::from_plan(&plan);
     eprintln!(
@@ -167,22 +170,37 @@ fn main() -> ExitCode {
     }
     drop(ready_tx);
 
-    // Drain shard readiness messages, separating successes from
-    // failures. We wait for every shard so a partial bring-up
-    // produces a coherent error path rather than a half-built
-    // `PoolGroup`.
+    // Collect shard readiness messages, separating successes from
+    // failures. We wait for every shard so a partial bring-up produces
+    // a coherent error path rather than a half-built `PoolGroup`.
     let mut descriptors: Vec<ShardDescriptor> = Vec::with_capacity(joins.len());
     let mut shard_fabrics: Vec<(WorkerIdx, Arc<Fabric>)> = Vec::with_capacity(joins.len());
     let mut errors: Vec<String> = Vec::new();
-    for msg in ready_rx {
-        match msg {
-            ShardReady::Up { descriptor, fabric } => {
+    // Receive exactly one readiness message per shard. We must NOT
+    // iterate the receiver to channel-disconnect here: a successful
+    // shard reports `Up` and then parks in `wait_for_shutdown`, holding
+    // its `Sender` alive for the lifetime of the process. Draining to
+    // disconnect would therefore block forever on the happy path. Each
+    // shard sends exactly one message before either parking (`Up`) or
+    // returning (`Failed`), so a bounded recv is both sufficient and
+    // correct.
+    for _ in 0..joins.len() {
+        match ready_rx.recv() {
+            Ok(ShardReady::Up { descriptor, fabric }) => {
                 shard_fabrics.push((descriptor.worker_idx, fabric));
                 descriptors.push(descriptor);
             }
-            ShardReady::Failed(err) => {
+            Ok(ShardReady::Failed(err)) => {
                 eprintln!("shard failed: {err}");
                 errors.push(err);
+                SHUTDOWN.store(true, Ordering::Relaxed);
+            }
+            Err(_) => {
+                // A shard thread panicked or dropped its sender without
+                // reporting. Treat the missing report as a bring-up
+                // failure so we take the coherent error path rather than
+                // proceeding with a half-built PoolGroup.
+                errors.push("shard thread exited without reporting readiness".into());
                 SHUTDOWN.store(true, Ordering::Relaxed);
             }
         }
@@ -598,21 +616,16 @@ fn wait_for_shutdown_with_updates(
                 let mut failures = 0usize;
                 let mut first_failure: Option<String> = None;
                 for (widx, fabric, last_applied) in shard_state.iter_mut() {
-                    let report = config::reconcile_peers(
-                        fabric,
-                        &update.config.peers,
-                        Some(last_applied),
-                    );
+                    let report =
+                        config::reconcile_peers(fabric, &update.config.peers, Some(last_applied));
                     added += report.added;
                     removed += report.removed;
                     updated += report.updated;
                     failures += report.failures.len();
                     for (peer_id, msg) in &report.failures {
                         if first_failure.is_none() {
-                            first_failure = Some(format!(
-                                "shard {} peer {} {}",
-                                widx.0, peer_id.0, msg
-                            ));
+                            first_failure =
+                                Some(format!("shard {} peer {} {}", widx.0, peer_id.0, msg));
                         }
                     }
                     *last_applied = report.applied;
@@ -647,7 +660,7 @@ fn wait_for_shutdown_with_updates(
                 // every config update so any shard view caches its
                 // new generation. Engines remain unpublished until
                 // the per-thread open path lands.
-        topology.apply_engines(disk_registry.engines_snapshot());
+                topology.apply_engines(disk_registry.engines_snapshot());
             }
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,

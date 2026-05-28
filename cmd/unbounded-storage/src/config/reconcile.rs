@@ -14,7 +14,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::bufferpool::PeerId;
+use crate::fabric::PeerId;
 use crate::fabric::{ConnectionSpec, Fabric, FabricError};
 
 use super::apply::peer_spec_to_connection;
@@ -59,10 +59,7 @@ pub struct ReconcileReport {
     pub applied: HashMap<PeerId, ConnectionSpec>,
 }
 
-pub fn apply_peers_startup(
-    target: &dyn PeerReconcileTarget,
-    peers: &[PeerSpec],
-) -> ApplyReport {
+pub fn apply_peers_startup(target: &dyn PeerReconcileTarget, peers: &[PeerSpec]) -> ApplyReport {
     let mut report = ApplyReport::default();
     for p in peers {
         match target.add(peer_spec_to_connection(p)) {
@@ -130,6 +127,7 @@ pub fn reconcile_peers(
             if let Some(old_spec) = prev.get(id) {
                 if old_spec.wire_addr != new_spec.wire_addr
                     || old_spec.hca_numa != new_spec.hca_numa
+                    || old_spec.labels != new_spec.labels
                 {
                     to_update.insert(*id);
                 }
@@ -161,9 +159,7 @@ pub fn reconcile_peers(
             }
             Err(e) => {
                 let op = if is_update { "update-remove" } else { "remove" };
-                report
-                    .failures
-                    .push((id, format!("{op}: {e}")));
+                report.failures.push((id, format!("{op}: {e}")));
             }
         }
     }
@@ -173,10 +169,7 @@ pub fn reconcile_peers(
     let mut to_add: Vec<PeerId> = desired_map
         .keys()
         .copied()
-        .filter(|id| {
-            !current.contains(id)
-                || (to_update.contains(id) && removed_ok.contains(id))
-        })
+        .filter(|id| !current.contains(id) || (to_update.contains(id) && removed_ok.contains(id)))
         .collect();
     to_add.sort_by_key(|p| p.0);
     for id in to_add {
@@ -198,22 +191,33 @@ pub fn reconcile_peers(
         }
     }
 
-    // Carry forward the prior spec for every id the fabric still
-    // holds and that we have not already recorded under `applied`.
-    // "Still holds" means the id was in `current` at the start of
-    // the pass and we did not successfully remove it - which covers
-    // both untouched steady-state peers and failed-remove (plain or
+    // Carry forward a spec for every id the fabric still holds and
+    // that we have not already recorded under `applied`. "Still
+    // holds" means the id was in `current` at the start of the pass
+    // and we did not successfully remove it - which covers both
+    // untouched steady-state peers and failed-remove (plain or
     // update-half) peers. Successful update-removes whose re-add
     // failed deliberately fall out here: the fabric does not have
     // the peer anymore, so the next pass should re-add via the
     // id-not-in-current branch rather than re-detect drift.
+    //
+    // For a peer that is still desired and was NOT part of an update
+    // (`to_update`), every observable field - addr, hca, and labels -
+    // already matches the last applied spec by construction, so
+    // recording the desired spec is equivalent to keeping the old
+    // one. Ids that are not desired (plain failed-remove) or that are
+    // in `to_update` with a failed remove (failed update-remove) keep
+    // the old spec so the next pass can retry the removal / re-detect
+    // the drift; the fabric still holds the peer at that old spec.
     if let Some(prev) = last_applied {
-        for (id, spec) in prev {
-            if current.contains(id)
-                && !removed_ok.contains(id)
-                && !report.applied.contains_key(id)
+        for (id, old_spec) in prev {
+            if current.contains(id) && !removed_ok.contains(id) && !report.applied.contains_key(id)
             {
-                report.applied.insert(*id, spec.clone());
+                let spec = match desired_map.get(id) {
+                    Some(desired_spec) if !to_update.contains(id) => desired_spec.clone(),
+                    _ => old_spec.clone(),
+                };
+                report.applied.insert(*id, spec);
             }
         }
     }
@@ -244,9 +248,7 @@ mod tests {
         fn new(initial: &[u64]) -> Self {
             Self {
                 ops: RefCell::new(Vec::new()),
-                present: RefCell::new(
-                    initial.iter().map(|i| PeerId(*i)).collect(),
-                ),
+                present: RefCell::new(initial.iter().map(|i| PeerId(*i)).collect()),
                 fail_add_on: None,
                 fail_remove_on: None,
             }
@@ -265,8 +267,7 @@ mod tests {
 
     impl PeerReconcileTarget for MockTarget {
         fn list(&self) -> Vec<PeerId> {
-            let mut v: Vec<PeerId> =
-                self.present.borrow().iter().copied().collect();
+            let mut v: Vec<PeerId> = self.present.borrow().iter().copied().collect();
             v.sort_by_key(|p| p.0);
             v
         }
@@ -294,6 +295,7 @@ mod tests {
             transport: PeerTransport::Tcp,
             address: format!("10.0.0.{id}:9000"),
             hca_numa: None,
+            labels: Vec::new(),
         }
     }
 
@@ -303,6 +305,17 @@ mod tests {
             transport: PeerTransport::Tcp,
             address: addr.to_string(),
             hca_numa: None,
+            labels: Vec::new(),
+        }
+    }
+
+    fn peer_labels(id: u64, labels: &[&str]) -> PeerSpec {
+        PeerSpec {
+            id,
+            transport: PeerTransport::Tcp,
+            address: format!("10.0.0.{id}:9000"),
+            hca_numa: None,
+            labels: labels.iter().map(|s| s.to_string()).collect(),
         }
     }
 
@@ -313,10 +326,7 @@ mod tests {
         let r = apply_peers_startup(&t, &peers);
         assert_eq!(r.applied, 3);
         assert!(r.failures.is_empty());
-        assert_eq!(
-            *t.ops.borrow(),
-            vec![Op::Add(1), Op::Add(2), Op::Add(3)]
-        );
+        assert_eq!(*t.ops.borrow(), vec![Op::Add(1), Op::Add(2), Op::Add(3)]);
     }
 
     #[test]
@@ -327,10 +337,7 @@ mod tests {
         assert_eq!(r.applied, 2);
         assert_eq!(r.failures.len(), 1);
         assert_eq!(r.failures[0].0, 2);
-        assert_eq!(
-            *t.ops.borrow(),
-            vec![Op::Add(1), Op::Add(2), Op::Add(3)]
-        );
+        assert_eq!(*t.ops.borrow(), vec![Op::Add(1), Op::Add(2), Op::Add(3)]);
     }
 
     #[test]
@@ -352,10 +359,7 @@ mod tests {
         assert_eq!(r.updated, 0);
         assert!(r.failures.is_empty());
         assert_eq!(r.applied.len(), 3);
-        assert_eq!(
-            *t.ops.borrow(),
-            vec![Op::Add(1), Op::Add(2), Op::Add(3)]
-        );
+        assert_eq!(*t.ops.borrow(), vec![Op::Add(1), Op::Add(2), Op::Add(3)]);
     }
 
     #[test]
@@ -367,10 +371,7 @@ mod tests {
         assert_eq!(r.removed, 1);
         assert_eq!(r.updated, 0);
         assert!(r.failures.is_empty());
-        assert_eq!(
-            *t.ops.borrow(),
-            vec![Op::Remove(1), Op::Add(4)]
-        );
+        assert_eq!(*t.ops.borrow(), vec![Op::Remove(1), Op::Add(4)]);
     }
 
     #[test]
@@ -393,21 +394,44 @@ mod tests {
     fn reconcile_detects_address_drift_as_update() {
         let t = MockTarget::new(&[1]);
         let mut prev = HashMap::new();
-        prev.insert(
-            PeerId(1),
-            peer_spec_to_connection(&peer_addr(1, "a:1")),
-        );
+        prev.insert(PeerId(1), peer_spec_to_connection(&peer_addr(1, "a:1")));
         let peers = vec![peer_addr(1, "b:2")];
         let r = reconcile_peers(&t, &peers, Some(&prev));
         assert_eq!(r.added, 0);
         assert_eq!(r.removed, 0);
         assert_eq!(r.updated, 1);
         assert!(r.failures.is_empty());
-        assert_eq!(
-            *t.ops.borrow(),
-            vec![Op::Remove(1), Op::Add(1)]
-        );
+        assert_eq!(*t.ops.borrow(), vec![Op::Remove(1), Op::Add(1)]);
         assert_eq!(r.applied[&PeerId(1)].wire_addr, "b:2");
+    }
+
+    #[test]
+    fn reconcile_label_only_change_churns_connection() {
+        // A relabel with identical wire_addr/hca_numa must drive a
+        // remove-then-add so the new labels reach the runtime, and
+        // the tracked applied spec must reflect the NEW labels.
+        let t = MockTarget::new(&[1]);
+        let mut prev = HashMap::new();
+        prev.insert(
+            PeerId(1),
+            peer_spec_to_connection(&peer_labels(1, &["us-west"])),
+        );
+        let peers = vec![peer_labels(1, &["us-east", "rack9"])];
+        let r = reconcile_peers(&t, &peers, Some(&prev));
+        assert_eq!(r.added, 0);
+        assert_eq!(r.removed, 0);
+        assert_eq!(r.updated, 1);
+        assert!(r.failures.is_empty());
+        // The connection was churned via remove-then-add.
+        assert_eq!(*t.ops.borrow(), vec![Op::Remove(1), Op::Add(1)]);
+        // Applied state carries the freshest desired labels.
+        assert_eq!(
+            r.applied[&PeerId(1)].labels,
+            vec!["us-east".to_string(), "rack9".to_string()]
+        );
+        // Address/HCA are unchanged.
+        assert_eq!(r.applied[&PeerId(1)].wire_addr, "10.0.0.1:9000");
+        assert_eq!(r.applied[&PeerId(1)].hca_numa, None);
     }
 
     #[test]
@@ -431,10 +455,7 @@ mod tests {
         // next pass re-detects the drift.
         let t = MockTarget::new(&[1]).with_remove_failure(1);
         let mut prev = HashMap::new();
-        prev.insert(
-            PeerId(1),
-            peer_spec_to_connection(&peer_addr(1, "a:1")),
-        );
+        prev.insert(PeerId(1), peer_spec_to_connection(&peer_addr(1, "a:1")));
         let peers = vec![peer_addr(1, "b:2")];
         let r = reconcile_peers(&t, &peers, Some(&prev));
         assert_eq!(r.updated, 0);
@@ -454,10 +475,7 @@ mod tests {
         assert_eq!(r2.updated, 1);
         assert!(r2.failures.is_empty());
         assert_eq!(r2.applied[&PeerId(1)].wire_addr, "b:2");
-        assert_eq!(
-            *t2.ops.borrow(),
-            vec![Op::Remove(1), Op::Add(1)]
-        );
+        assert_eq!(*t2.ops.borrow(), vec![Op::Remove(1), Op::Add(1)]);
     }
 
     #[test]
@@ -467,10 +485,7 @@ mod tests {
         // be carried forward; the id simply drops out of `applied`.
         let t = MockTarget::new(&[1]).with_add_failure(1);
         let mut prev = HashMap::new();
-        prev.insert(
-            PeerId(1),
-            peer_spec_to_connection(&peer_addr(1, "a:1")),
-        );
+        prev.insert(PeerId(1), peer_spec_to_connection(&peer_addr(1, "a:1")));
         let peers = vec![peer_addr(1, "b:2")];
         let r = reconcile_peers(&t, &peers, Some(&prev));
         assert_eq!(r.updated, 0);
@@ -479,10 +494,7 @@ mod tests {
         assert_eq!(r.failures[0].0, PeerId(1));
         assert!(r.failures[0].1.starts_with("update-add:"));
         assert!(!r.applied.contains_key(&PeerId(1)));
-        assert_eq!(
-            *t.ops.borrow(),
-            vec![Op::Remove(1), Op::Add(1)]
-        );
+        assert_eq!(*t.ops.borrow(), vec![Op::Remove(1), Op::Add(1)]);
 
         // Second pass: the id is in `desired` but not in
         // `target.list()` (fabric is empty post-remove), so the
@@ -506,10 +518,7 @@ mod tests {
         // `desired_map`, driving the same remove path).
         let t = MockTarget::new(&[1]).with_remove_failure(1);
         let mut prev = HashMap::new();
-        prev.insert(
-            PeerId(1),
-            peer_spec_to_connection(&peer_addr(1, "a:1")),
-        );
+        prev.insert(PeerId(1), peer_spec_to_connection(&peer_addr(1, "a:1")));
         let peers: Vec<PeerSpec> = vec![];
         let r = reconcile_peers(&t, &peers, Some(&prev));
         assert_eq!(r.removed, 0);
