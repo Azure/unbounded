@@ -166,11 +166,7 @@ impl BlockDevice for MockDevice {
             return Err(Error::Io(libc_einval()));
         }
         let n_pages = (dst.len() / cfg.page_size) as u64;
-        if lba
-            .0
-            .checked_add(n_pages)
-            .is_none_or(|end| end > cfg.capacity_pages)
-        {
+        if lba.0.checked_add(n_pages).is_none_or(|end| end > cfg.capacity_pages) {
             return Err(Error::OutOfRange);
         }
         if matches!(cfg.fault_mode, MockFaultMode::ReadIo) {
@@ -193,11 +189,7 @@ impl BlockDevice for MockDevice {
             return Err(Error::Io(libc_einval()));
         }
         let n_pages = (src.len() / cfg.page_size) as u64;
-        if lba
-            .0
-            .checked_add(n_pages)
-            .is_none_or(|end| end > cfg.capacity_pages)
-        {
+        if lba.0.checked_add(n_pages).is_none_or(|end| end > cfg.capacity_pages) {
             return Err(Error::OutOfRange);
         }
         if matches!(cfg.fault_mode, MockFaultMode::WriteIo) {

@@ -207,7 +207,10 @@ fn run_disk_thread(
         // Quiescent: mutator has drained and no proxy I/O is in
         // flight. Exit if shutdown was requested or the proxy channel
         // disconnected (no proxy clones left to send work).
-        if mutator_done && !svc.has_inflight() && (close_signaled || svc.channel_disconnected()) {
+        if mutator_done
+            && !svc.has_inflight()
+            && (close_signaled || svc.channel_disconnected())
+        {
             break;
         }
         thread::sleep(Duration::from_micros(100));

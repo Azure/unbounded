@@ -96,7 +96,10 @@ impl BlockDeviceProxy {
                 metadata,
                 service_alive: service_alive.clone(),
             },
-            ProxyReceiver { rx, service_alive },
+            ProxyReceiver {
+                rx,
+                service_alive,
+            },
         )
     }
 }
@@ -280,8 +283,9 @@ impl<B: BlockDevice + 'static> ProxyService<B> {
                             // SAFETY: caller guarantees the buffer at
                             // `ptr` remains valid until `reply.set` is
                             // invoked (see module docs).
-                            let slice =
-                                unsafe { std::slice::from_raw_parts_mut(ptr.0.as_ptr(), len) };
+                            let slice = unsafe {
+                                std::slice::from_raw_parts_mut(ptr.0.as_ptr(), len)
+                            };
                             dev.read(lba, slice).await
                         });
                     self.in_flight.push(InflightOp { fut, reply });
@@ -298,7 +302,10 @@ impl<B: BlockDevice + 'static> ProxyService<B> {
                             // SAFETY: same contract as Read; the
                             // service treats this slice as immutable.
                             let slice = unsafe {
-                                std::slice::from_raw_parts(ptr.0.as_ptr() as *const u8, len)
+                                std::slice::from_raw_parts(
+                                    ptr.0.as_ptr() as *const u8,
+                                    len,
+                                )
                             };
                             dev.write(lba, slice).await
                         });
@@ -567,7 +574,10 @@ fn spin_block_on<F: Future>(fut: F) -> F::Output {
 /// false. The trailing extra poll guards the race where the
 /// service drained the command (filling the slot) and then flipped
 /// the flag before our last poll observed the result.
-fn spin_block_on_with_alive(fut: ReplyWait, service_alive: &AtomicBool) -> Result<(), Error> {
+fn spin_block_on_with_alive(
+    fut: ReplyWait,
+    service_alive: &AtomicBool,
+) -> Result<(), Error> {
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
     let mut fut = Box::pin(fut);

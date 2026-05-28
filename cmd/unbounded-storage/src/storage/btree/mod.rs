@@ -261,15 +261,8 @@ impl<B: BlockDevice> BTreeIndex<B> {
         }
 
         // Fresh disk: install an empty tree at txn 1.
-        Self::bootstrap_from_entries(
-            device,
-            allocator,
-            scratch,
-            btree_page_bytes,
-            1,
-            BTreeMap::new(),
-        )
-        .await
+        Self::bootstrap_from_entries(device, allocator, scratch, btree_page_bytes, 1, BTreeMap::new())
+            .await
     }
 
     async fn open_from_meta(
@@ -498,7 +491,9 @@ impl<B: BlockDevice> BTreeIndex<B> {
         // They become safe to free once every snapshot with
         // `txn < txn_id` has been dropped - see
         // [`RootSnapshot::drop`].
-        self.pending.borrow_mut().push(txn_id, result.retired_pages);
+        self.pending
+            .borrow_mut()
+            .push(txn_id, result.retired_pages);
         // Register this txn as alive *before* publishing the new
         // snapshot. If we published first, an immediate Drop of
         // the previous snapshot could observe an alive set that

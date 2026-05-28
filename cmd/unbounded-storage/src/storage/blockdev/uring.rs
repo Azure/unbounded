@@ -400,11 +400,7 @@ impl BlockDevice for UringBlockDevice {
             return Err(Error::Io(libc::EINVAL));
         }
         let n_pages = (dst.len() / self.page_size) as u64;
-        if lba
-            .0
-            .checked_add(n_pages)
-            .is_none_or(|end| end > self.capacity_pages)
-        {
+        if lba.0.checked_add(n_pages).is_none_or(|end| end > self.capacity_pages) {
             return Err(Error::OutOfRange);
         }
         // Locate which registered region holds `dst` so we can
@@ -430,22 +426,22 @@ impl BlockDevice for UringBlockDevice {
             return Err(Error::Io(libc::EINVAL));
         }
         let n_pages = (src.len() / self.page_size) as u64;
-        if lba
-            .0
-            .checked_add(n_pages)
-            .is_none_or(|end| end > self.capacity_pages)
-        {
+        if lba.0.checked_add(n_pages).is_none_or(|end| end > self.capacity_pages) {
             return Err(Error::OutOfRange);
         }
         // See [`Self::read`] for buf_index resolution.
         let buf_index = self.resolve_buf_index(src.as_ptr(), src.len())?;
         let user_data = self.alloc_user_data();
         let offset = lba.0.saturating_mul(self.page_size as u64);
-        let sqe =
-            opcode::WriteFixed::new(types::Fixed(0), src.as_ptr(), src.len() as u32, buf_index)
-                .offset(offset)
-                .build()
-                .user_data(user_data);
+        let sqe = opcode::WriteFixed::new(
+            types::Fixed(0),
+            src.as_ptr(),
+            src.len() as u32,
+            buf_index,
+        )
+        .offset(offset)
+        .build()
+        .user_data(user_data);
         self.submit_fixed_io(sqe, src.len()).await
     }
 

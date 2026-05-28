@@ -77,7 +77,8 @@ fn open_btree(
 #[test]
 fn open_empty_creates_meta_and_root() {
     let (dev, alloc) = fresh(64);
-    let idx: BTreeIndex<MockDevice> = block_on(open_btree(dev.clone(), alloc.clone())).unwrap();
+    let idx: BTreeIndex<MockDevice> =
+        block_on(open_btree(dev.clone(), alloc.clone())).unwrap();
     assert_eq!(idx.current_txn(), 1);
     // Meta slots are reserved + at least one root page.
     assert!(alloc.is_in_use(META_SLOT_A).unwrap());
@@ -329,7 +330,8 @@ fn hwm_persisted_in_meta_after_bootstrap() {
     // Bootstrap must persist a non-zero hwm because the allocator
     // reserves META_SLOT_B (LBA 1) before the first commit.
     let (dev, alloc) = fresh(64);
-    let _idx: BTreeIndex<MockDevice> = block_on(open_btree(dev.clone(), alloc.clone())).unwrap();
+    let _idx: BTreeIndex<MockDevice> =
+        block_on(open_btree(dev.clone(), alloc.clone())).unwrap();
     let (_txn, _root, hwm) = read_live_meta(&dev).expect("bootstrap writes a valid meta slot");
     assert!(
         hwm >= 1,
@@ -351,7 +353,8 @@ fn hwm_grows_with_commits() {
         .collect();
     block_on(idx.apply_batch(muts)).unwrap();
     let root = idx.current_root();
-    let (_txn, _root_meta, hwm) = read_live_meta(&dev).expect("post-commit meta must decode");
+    let (_txn, _root_meta, hwm) =
+        read_live_meta(&dev).expect("post-commit meta must decode");
     assert!(
         hwm >= root.0,
         "hwm ({hwm}) must cover the new root LBA ({})",
@@ -410,7 +413,8 @@ fn reopen_seeds_allocator_hwm() {
             .collect();
         block_on(idx.apply_batch(muts)).unwrap();
     }
-    let (_t, _r, persisted_hwm) = read_live_meta(&dev).expect("post-commit meta must decode");
+    let (_t, _r, persisted_hwm) =
+        read_live_meta(&dev).expect("post-commit meta must decode");
 
     let alloc2 = Arc::new(Allocator::new(128));
     let idx2 = block_on(open_btree(dev.clone(), alloc2)).unwrap();
@@ -571,16 +575,14 @@ fn outstanding_snapshot_pins_retired_pages_until_drop() {
     // see; dropping the guard must release them.
     let (dev, alloc) = fresh(256);
     let idx = block_on(open_btree(dev, alloc.clone())).unwrap();
-    block_on(
-        idx.apply_batch(
-            (0..16u32)
-                .map(|i| Mutation::Insert {
-                    key: key(i),
-                    value: entry(i as u64),
-                })
-                .collect(),
-        ),
-    )
+    block_on(idx.apply_batch(
+        (0..16u32)
+            .map(|i| Mutation::Insert {
+                key: key(i),
+                value: entry(i as u64),
+            })
+            .collect(),
+    ))
     .unwrap();
     // Pin the current snapshot. We intentionally hold the `Arc`
     // (which is what `arc_swap::Guard::into_inner` would also
@@ -637,16 +639,14 @@ fn overwrites_and_deletes_path_copy_consistent() {
     let (dev, alloc) = fresh(256);
     let idx = block_on(open_btree(dev, alloc)).unwrap();
     // Seed 32 keys spanning multiple leaves.
-    block_on(
-        idx.apply_batch(
-            (0..32u32)
-                .map(|i| Mutation::Insert {
-                    key: key(i),
-                    value: entry(i as u64),
-                })
-                .collect(),
-        ),
-    )
+    block_on(idx.apply_batch(
+        (0..32u32)
+            .map(|i| Mutation::Insert {
+                key: key(i),
+                value: entry(i as u64),
+            })
+            .collect(),
+    ))
     .unwrap();
     // Overwrite every even key, delete every key divisible by 5.
     let mut muts: Vec<Mutation> = Vec::new();

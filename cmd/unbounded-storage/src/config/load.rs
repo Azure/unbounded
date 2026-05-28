@@ -295,10 +295,7 @@ address = "{bad}"
             );
             let f = write_cfg(&s);
             assert!(
-                matches!(
-                    load(f.path()),
-                    Err(ConfigError::InvalidRdmaHex { peer_id: 3 })
-                ),
+                matches!(load(f.path()), Err(ConfigError::InvalidRdmaHex { peer_id: 3 })),
                 "expected InvalidRdmaHex for {bad:?}"
             );
         }

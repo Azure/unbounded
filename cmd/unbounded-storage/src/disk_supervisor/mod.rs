@@ -425,19 +425,17 @@ mod tests {
     #[test]
     fn failure_injection_does_not_block_others() {
         let (target, state) = MockDiskTarget::new();
-        state.lock().unwrap().fail_on.insert(PathBuf::from("/bad"));
+        state
+            .lock()
+            .unwrap()
+            .fail_on
+            .insert(PathBuf::from("/bad"));
         let mut reg = DiskRegistry::new(target, no_placer());
         let report = reg.reconcile(&[spec("/bad", None), spec("/good", None)]);
         assert_eq!(report.added, 1);
         assert_eq!(report.failures.len(), 1);
         assert_eq!(report.failures[0].0, PathBuf::from("/bad"));
-        assert!(
-            state
-                .lock()
-                .unwrap()
-                .opened
-                .contains(&PathBuf::from("/good"))
-        );
+        assert!(state.lock().unwrap().opened.contains(&PathBuf::from("/good")));
         // Failed open must not pollute the engine map.
         assert_eq!(reg.engines_snapshot().len(), 1);
         assert_eq!(reg.engines_snapshot()[0].0, PathBuf::from("/good"));
