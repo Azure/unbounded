@@ -33,10 +33,40 @@ type edgeResponse struct {
 	ETag   string
 }
 
+// edgeMaxIdleConnsPerHost caps the size of the keep-alive pool the
+// edge client maintains to a single orca host. Go's net/http default
+// is MaxIdleConnsPerHost=2, which forces a fresh TCP handshake (and,
+// for large blobs, fresh TLS on production deployments) on every
+// concurrent request beyond the first two. The bench subcommand
+// defaults to 8 workers, the README suggests --concurrency 16, and
+// some scenarios spin a few dozen parallel range reads. 256 covers
+// every realistic dev concurrency level without forcing the
+// operator to think about transport tuning.
+const edgeMaxIdleConnsPerHost = 256
+
 func newEdgeClient(baseURL string, timeout time.Duration) *edgeClient {
+	// Clone http.DefaultTransport so we inherit its sensible
+	// defaults (Dial timeouts, expect-continue timeout, the
+	// HTTP/2 negotiator wiring) and only override the
+	// connection-pool sizing knobs.
+	transport, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		// Defensive: should never happen with the stdlib, but
+		// if some early-init shim replaces DefaultTransport we
+		// fall back to a fresh Transport rather than panicking.
+		transport = &http.Transport{}
+	}
+
+	t := transport.Clone()
+	t.MaxIdleConnsPerHost = edgeMaxIdleConnsPerHost
+	// MaxConnsPerHost=0 means "no cap"; explicit so a future
+	// reviewer can see we deliberately do not throttle.
+	t.MaxConnsPerHost = 0
+
 	return &edgeClient{
 		baseURL: strings.TrimRight(baseURL, "/"),
 		http: &http.Client{
+			Transport: t,
 			// Per-request deadline is enforced by the request
 			// context; the http.Client timeout is the upper bound
 			// for an entire request including body read, which can
