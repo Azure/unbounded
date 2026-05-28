@@ -6,10 +6,13 @@
 # extraPortMappings on the first worker expose:
 #   30100 -> Azurite (azureblob origin in dev)
 #   30200 -> LocalStack (awss3 origin + cachestore in dev)
-# Both NodePorts are reached at http://localhost:<nodePort>/ from the
-# host so host-side dev tools (hack/cmd/orcadev) can talk to them
-# without a kubectl port-forward. NodePort services in Kind aren't
-# routable from the host without explicit port mappings.
+#
+# These mappings are a convenience for ad-hoc `curl
+# http://localhost:30100/...` from the host; they are NOT load-bearing
+# for orcadev. orcadev auto-opens kubectl port-forwards to svc/azurite,
+# svc/localstack, and svc/orca as needed, which is what lets the same
+# `bin/orcadev <verb>` invocation work on non-kind clusters (AKS, EKS,
+# k3d, ...) that have no NodePort hostPort mapping.
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 name: orca-dev

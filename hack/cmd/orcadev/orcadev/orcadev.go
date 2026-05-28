@@ -29,8 +29,13 @@
 // All subcommands accept --config <path> to point at an orca YAML
 // (the same shape internal/orca/config consumes); per-flag overrides
 // let the operator point at a different origin or cachestore without
-// editing the YAML. The default `--orca-url http://localhost:8443`
-// targets the dev harness's port-forwarded edge listener.
+// editing the YAML. The default `--preset=dev` bundles the
+// dev-install coordinates (azureblob origin against in-cluster
+// Azurite, S3 cachestore against in-cluster LocalStack, edge URL
+// http://localhost:8443), and orcadev auto-opens kubectl
+// port-forwards to svc/orca, svc/azurite, svc/localstack as needed.
+// This works on any cluster reachable via kubectl - kind, AKS, EKS,
+// k3d. For the full install + driving recipe, see hack/orca/README.md.
 package orcadev
 
 import (
@@ -60,13 +65,21 @@ func Run() {
 	}
 
 	// Connection-shape flags shared by every subcommand. --config is
-	// the recommended path: it populates origin + cachestore +
-	// orca-url defaults from the same YAML the orca daemon consumes,
-	// so the tool always sees the same world the daemon does.
+	// the recommended path for production-shape pointers; it
+	// populates origin + cachestore + orca-url defaults from the
+	// same YAML the orca daemon consumes, so the tool always sees
+	// the same world the daemon does. For the standard dev install
+	// the built-in --preset=dev defaults already wire everything up
+	// (Azurite origin + LocalStack cachestore via auto port-forward),
+	// so `bin/orcadev <verb>` works out of the box.
+	root.PersistentFlags().StringVar(&g.preset, "preset", g.preset,
+		"Defaults bundle: dev (Azurite origin + LocalStack cachestore + auto port-forward) or none")
 	root.PersistentFlags().StringVar(&g.configPath, "config", g.configPath,
 		"Orca YAML config to populate origin + cachestore coordinates")
 	root.PersistentFlags().StringVar(&g.orcaURL, "orca-url", g.orcaURL,
 		"Edge URL of the orca instance (default http://localhost:8443 via kubectl port-forward)")
+	root.PersistentFlags().StringVar(&g.namespace, "namespace", g.namespace,
+		"Kubernetes namespace where Orca + Azurite + LocalStack are deployed (default unbounded-kube)")
 
 	// Origin overrides.
 	root.PersistentFlags().StringVar(&g.originDriver, "origin-driver", g.originDriver,
@@ -114,9 +127,9 @@ func Run() {
 	root.PersistentFlags().StringVar(&g.logLevel, "log-level", g.logLevel,
 		"Log level: debug, info, warn, error")
 	root.PersistentFlags().BoolVar(&g.autoPortForward, "auto-port-forward", g.autoPortForward,
-		"Auto-start a kubectl port-forward to svc/orca if --orca-url=localhost:8443 is unreachable")
+		"Auto-start kubectl port-forwards to svc/orca, svc/azurite, svc/localstack as needed when their localhost endpoints are unreachable")
 	root.PersistentFlags().StringVar(&g.kubeContext, "kube-context", g.kubeContext,
-		"kubectl context used by --auto-port-forward")
+		"kubectl context used by --auto-port-forward (empty = current context)")
 
 	root.AddCommand(newUploadCmd(g))
 	root.AddCommand(newListCmd(g))

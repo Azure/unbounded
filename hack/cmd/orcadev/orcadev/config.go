@@ -19,20 +19,42 @@ import (
 // https://learn.microsoft.com/azure/storage/common/storage-use-azurite
 const azuriteWellKnownDevKey = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
 
+// PresetDev is the only currently-supported value for --preset. It
+// selects the dev-install defaults: azureblob origin pointing at the
+// in-cluster Azurite, S3 cachestore pointing at the in-cluster
+// LocalStack, well-known credentials for both, and auto-port-forward
+// to every relevant Service. See preset.go for the full definition.
+const PresetDev = "dev"
+
 // globalFlags carries connection-shape flags shared by every
 // subcommand. `--config` populates the origin + cachestore fields
 // from an orca YAML; per-flag overrides win when both are set.
 //
-// Origin defaults target the dev harness's NodePort Azurite at
-// localhost:30100; cachestore defaults target the planned LocalStack
-// NodePort 30200 (mirrors the Azurite pattern). The orca edge URL
-// default assumes `make -C hack/orca port-forward`.
+// The defaults baked into defaultGlobalFlags() reflect --preset=dev:
+// origin = Azurite via localhost:30100, cachestore = LocalStack via
+// localhost:30200, orca edge = localhost:8443. orcadev auto-opens
+// kubectl port-forwards for any of these services that isn't already
+// bound on localhost, so the same defaults work on kind (where the
+// NodePorts mean the probes succeed without spawning kubectl) and on
+// any other cluster (AKS, EKS, k3d, ...) reachable via kubectl.
 type globalFlags struct {
 	// Global / shared.
 	configPath string
 	orcaURL    string
 	timeout    time.Duration
 	logLevel   string
+
+	// preset is the named defaults bundle. Only "dev" is currently
+	// supported. Validated after PersistentPreRunE resolves
+	// --config; the flag-precedence is unchanged (per-flag overrides
+	// still win over preset defaults, which still win over YAML
+	// values pulled by --config).
+	preset string
+
+	// namespace is the Kubernetes namespace where Orca and its
+	// emulator dependencies are deployed. Used by the auto
+	// port-forward to address `svc/<service>` correctly.
+	namespace string
 
 	// Origin fields. Driver selects between awss3 and azureblob.
 	// originID is the value baked into chunk paths and is required
@@ -49,9 +71,9 @@ type globalFlags struct {
 	// originUsePathStyle: true for LocalStack-backed origins.
 	originUsePathStyle bool
 
-	// Cachestore fields. Always S3-shaped; the dev harness uses
-	// LocalStack for both origin (awss3 mode) and cachestore but on
-	// different buckets.
+	// Cachestore fields. Always S3-shaped; the dev install uses
+	// LocalStack as the cachestore (and also as the origin in
+	// awss3 mode, on a different bucket).
 	cachestoreEndpoint     string
 	cachestoreBucket       string
 	cachestoreRegion       string
@@ -63,51 +85,41 @@ type globalFlags struct {
 	ensureContainer bool
 
 	// autoPortForward, when true (the default), causes any
-	// subcommand that talks to the orca edge listener to probe
-	// --orca-url; if unreachable AND the URL is the dev default
-	// (localhost:8443), orcadev spawns a managed kubectl
-	// port-forward to svc/orca for the duration of the run. Set
-	// false to suppress the auto-forward (e.g. in CI environments
-	// where kubectl is not on PATH, or against a real ingress).
+	// subcommand that talks to the orca edge listener (and, when
+	// the preset implies localhost-routed origin/cachestore
+	// endpoints, the corresponding emulator Services) to probe the
+	// configured localhost ports; if unreachable, orcadev spawns
+	// managed kubectl port-forwards to the in-cluster Services
+	// for the duration of the run. Set false to suppress every
+	// auto-forward (e.g. in CI environments without kubectl on
+	// PATH, or against a real ingress).
 	autoPortForward bool
 	// kubeContext is the kubectl context used by autoPortForward.
-	// Default matches the dev harness's kind cluster name.
+	// Empty means "current context" (matches kubectl's default
+	// behavior).
 	kubeContext string
 }
 
-// defaultGlobalFlags returns the dev-harness-tuned defaults. These
-// are deliberately weighted toward the most common dev scenario:
-// orca running in the kind harness, port-forward in place for the
-// edge listener, NodePorts exposing the cachestore and Azurite to
-// the host. The default origin driver is azureblob (Azurite), which
-// matches the dev harness's default ORIGIN_DRIVER value in
-// hack/orca/.env.example. To target the awss3 (LocalStack) origin
-// instead, pass --origin-driver=awss3 with the matching
-// --origin-endpoint / --origin-bucket overrides.
+// defaultGlobalFlags returns the dev-install-tuned defaults. These
+// are the same as applyPresetDev would produce, baked in directly so
+// that the zero-config invocation `bin/orcadev <verb>` works out of
+// the box against a freshly installed dev cluster on whichever
+// kubectl context is current.
+//
+// To target a non-dev orca (production-shape config, real cloud
+// origins, ...), pass --preset=none and use --config plus the
+// per-flag overrides.
 func defaultGlobalFlags() *globalFlags {
-	return &globalFlags{
-		orcaURL:                "http://localhost:8443",
-		timeout:                30 * time.Second,
-		logLevel:               "info",
-		originDriver:           "azureblob",
-		originID:               "azureblob-azurite",
-		originBucket:           "orca-test",
-		originEndpoint:         "http://localhost:30100/devstoreaccount1/",
-		originRegion:           "us-east-1",
-		originAccessKey:        "test",
-		originSecretKey:        "test",
-		originUsePathStyle:     true,
-		originAccount:          "devstoreaccount1",
-		originAccountKey:       azuriteWellKnownDevKey,
-		cachestoreEndpoint:     "http://localhost:30200",
-		cachestoreBucket:       "orca-cache",
-		cachestoreRegion:       "us-east-1",
-		cachestoreAccessKey:    "test",
-		cachestoreSecretKey:    "test",
-		cachestoreUsePathStyle: true,
-		autoPortForward:        true,
-		kubeContext:            "kind-orca-dev",
+	g := &globalFlags{
+		// preset+namespace are the structural defaults; everything
+		// else is filled by applyPresetDev below.
+		preset:    PresetDev,
+		namespace: defaultNamespace,
 	}
+
+	applyPresetDev(g)
+
+	return g
 }
 
 // resolve loads --config (if set) and overlays per-flag overrides on
@@ -115,14 +127,31 @@ func defaultGlobalFlags() *globalFlags {
 // PersistentPreRunE so every subcommand sees fully-resolved fields
 // without re-running this logic.
 //
-// Precedence: per-flag override > YAML value > built-in default. A
-// flag is considered "overridden" when the operator actually passed
-// it on the command line, detected via cobra's Flag.Changed bit.
-// This is more correct than comparing against the default value:
-// passing --origin-bucket=orca-test (which happens to be the
-// default) now wins over a YAML value pointing at a different
-// bucket.
+// Precedence: per-flag override > YAML value > preset default >
+// built-in default. A flag is considered "overridden" when the
+// operator actually passed it on the command line, detected via
+// cobra's Flag.Changed bit.
+//
+// When --preset=dev is selected AND --origin-driver=awss3 is passed
+// without other origin flags, the awss3-flavor preset defaults are
+// re-applied to the un-overridden origin fields (origin-id,
+// origin-bucket, origin-endpoint, etc.). This is the same logic the
+// retired orcadev-flags.sh shell wrapper used to perform.
 func (g *globalFlags) resolve(cmd *cobra.Command) error {
+	flags := cmd.Flags()
+
+	if err := validatePreset(g.preset); err != nil {
+		return err
+	}
+
+	// If preset=dev and the operator switched to awss3 without
+	// re-specifying the origin fields, swap in the awss3 dev
+	// defaults. The default-driver case (azureblob) is already
+	// baked in by defaultGlobalFlags().
+	if g.preset == PresetDev && g.originDriver == "awss3" {
+		applyPresetDevAWSS3(g, flags)
+	}
+
 	if g.configPath == "" {
 		return nil
 	}
@@ -132,7 +161,6 @@ func (g *globalFlags) resolve(cmd *cobra.Command) error {
 		return fmt.Errorf("load --config: %w", err)
 	}
 
-	flags := cmd.Flags()
 	notSet := func(name string) bool { return !flags.Changed(name) }
 
 	// Origin: pull from YAML unless the user supplied the flag.

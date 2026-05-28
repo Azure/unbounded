@@ -10,15 +10,18 @@ import (
 	"net"
 	"net/url"
 	"os/exec"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 )
 
-// portForwardProbeTimeout bounds the initial TCP probe used to
-// decide whether the orca edge is already reachable on localhost.
-// 500 ms is plenty for a loopback dial; longer would slow every
-// subcommand startup, shorter risks a false negative on a busy host.
+// portForwardProbeTimeout bounds the initial TCP probe used to decide
+// whether a target service is already reachable on localhost (because
+// of a kind NodePort mapping, an operator's own `kubectl
+// port-forward`, or a sibling orcadev process). 500 ms is plenty for
+// a loopback dial; longer would slow every subcommand startup,
+// shorter risks a false negative on a busy host.
 const portForwardProbeTimeout = 500 * time.Millisecond
 
 // portForwardReadyTimeout bounds how long we wait for kubectl to
@@ -28,15 +31,6 @@ const portForwardProbeTimeout = 500 * time.Millisecond
 // and slow API-server contact.
 const portForwardReadyTimeout = 10 * time.Second
 
-// orcaEdgeNamespace and orcaEdgeService are hard-coded to the dev
-// harness defaults that --orca-url=http://localhost:8443 implies.
-// The auto-forward only fires when --orca-url IS the dev default,
-// so deriving these from --orca-url would add nothing.
-const (
-	orcaEdgeNamespace = "unbounded-kube"
-	orcaEdgeService   = "orca"
-)
-
 // portForwardRetryDelay is the backoff before re-probing localhost
 // and re-attempting kubectl after a "bind: address already in use"
 // failure. Long enough for a concurrent orcadev's port-forward to
@@ -44,62 +38,188 @@ const (
 // latency tolerable.
 const portForwardRetryDelay = 500 * time.Millisecond
 
-// ensureEdgeReachable probes --orca-url; if unreachable AND the URL
-// looks like the documented dev default (localhost:8443) AND
-// --auto-port-forward is enabled, spawns a kubectl port-forward in
-// the background and returns a cleanup that tears it down on
-// caller exit. If the URL is already reachable, returns immediately
-// with a no-op cleanup.
+// portForwardSpec describes one Service to forward. The local-side
+// port is bound on 127.0.0.1; the remote-side port is the Service's
+// in-cluster port.
+type portForwardSpec struct {
+	// label is the human-readable name used in startup messages.
+	label string
+	// service is the Service name in g.namespace.
+	service string
+	// localPort is the 127.0.0.1 port operators reach via the
+	// configured endpoint URL.
+	localPort int
+	// remotePort is the in-Pod / in-Service port kubectl forwards
+	// to.
+	remotePort int
+}
+
+// ensurePortForwards is the canonical entrypoint every subcommand
+// uses. It opens (or reuses) auto port-forwards for all Services
+// implied by the resolved global flags - the orca edge, the origin
+// emulator (when --origin-endpoint points at localhost), and the
+// cachestore emulator (when --cachestore-endpoint points at
+// localhost). Each individual forward is independent, lazy
+// (TCP-probed first), and cleaned up in reverse order on caller
+// exit.
 //
-// Caller MUST defer the returned cleanup so the port-forward
-// subprocess is stopped on exit. The cleanup is always safe to call,
-// even on the no-op path.
-//
-// Behaviour matrix:
-//
-//	--auto-port-forward=false           -> no-op cleanup
-//	URL host not localhost/127.0.0.1    -> no-op cleanup
-//	URL port not 8443                   -> no-op cleanup
-//	probe succeeds                      -> no-op cleanup (operator's
-//	                                       own port-forward, or any
-//	                                       other process bound to the
-//	                                       port, is honored)
-//	probe fails + everything else true  -> spawn port-forward, return
-//	                                       cleanup that SIGTERMs it
-//
-// Concurrent orcadev invocations can race on the localhost:8443
-// bind: probe sees the port free, then a sibling process binds it
-// before our kubectl starts. We detect that case via
-// isPortInUseError and re-probe; if the sibling is now serving we
-// return a no-op cleanup, otherwise we retry the spawn once.
-func ensureEdgeReachable(ctx context.Context, g *globalFlags) (func(), error) {
+// Caller MUST defer the returned cleanup so each subprocess is
+// stopped on exit. The cleanup is always safe to call, even on the
+// no-op path (when --auto-port-forward=false or every target is
+// already bound).
+func ensurePortForwards(ctx context.Context, g *globalFlags) (func(), error) {
 	if !g.autoPortForward {
 		return func() {}, nil
 	}
 
-	host, port, err := hostPortFromURL(g.orcaURL)
-	if err != nil {
-		// Don't gate on this; the real HTTP call will surface the
-		// URL parse error if it actually matters.
-		return func() {}, nil
+	specs := derivePortForwardSpecs(g)
+
+	cleanups := make([]func(), 0, len(specs))
+
+	rollback := func() {
+		for i := len(cleanups) - 1; i >= 0; i-- {
+			cleanups[i]()
+		}
 	}
 
-	// Only auto-forward when the user is hitting localhost on the
-	// documented edge port. Any other URL means the operator
-	// configured a real endpoint and we should stay out of the way.
+	for _, spec := range specs {
+		cu, err := ensureOnePortForward(ctx, g, spec)
+		if err != nil {
+			rollback()
+
+			return nil, err
+		}
+
+		cleanups = append(cleanups, cu)
+	}
+
+	return rollback, nil
+}
+
+// ensureEdgeReachable is a thin back-compat wrapper. New code should
+// call ensurePortForwards directly. Kept so existing subcommands and
+// tests don't churn.
+func ensureEdgeReachable(ctx context.Context, g *globalFlags) (func(), error) {
+	return ensurePortForwards(ctx, g)
+}
+
+// derivePortForwardSpecs inspects the resolved global flags and
+// returns the set of port-forwards to maintain for this invocation.
+// The order is significant: orca edge first (it's the only one every
+// subcommand uses), origin next, cachestore last. Duplicates (e.g.
+// origin and cachestore both pointing at LocalStack) are deduped on
+// the (service, localPort) pair.
+func derivePortForwardSpecs(g *globalFlags) []portForwardSpec {
+	specs := []portForwardSpec{}
+
+	seen := map[string]struct{}{}
+
+	add := func(s portForwardSpec) {
+		key := s.service + ":" + strconv.Itoa(s.localPort)
+		if _, dup := seen[key]; dup {
+			return
+		}
+
+		seen[key] = struct{}{}
+		specs = append(specs, s)
+	}
+
+	// Orca edge: forward whenever --orca-url is a localhost URL.
+	if host, port, ok := localhostHostPort(g.orcaURL); ok {
+		// Only honor the port from the URL; the in-cluster Service
+		// always exposes 8443 (it's the deployment contract).
+		_ = host
+
+		add(portForwardSpec{
+			label:      "orca edge",
+			service:    devSvcOrca,
+			localPort:  port,
+			remotePort: devRemotePortOrca,
+		})
+	}
+
+	// Origin emulator: only relevant when the operator did not
+	// override the endpoint to a real cloud URL.
+	if host, port, ok := localhostHostPort(g.originEndpoint); ok {
+		_ = host
+
+		switch g.originDriver {
+		case "azureblob":
+			add(portForwardSpec{
+				label:      "azurite (origin)",
+				service:    devSvcAzurite,
+				localPort:  port,
+				remotePort: devRemotePortAzurite,
+			})
+		case "awss3":
+			add(portForwardSpec{
+				label:      "localstack (origin)",
+				service:    devSvcLocalstack,
+				localPort:  port,
+				remotePort: devRemotePortLocalstack,
+			})
+		}
+	}
+
+	// Cachestore: always LocalStack-shaped.
+	if host, port, ok := localhostHostPort(g.cachestoreEndpoint); ok {
+		_ = host
+
+		add(portForwardSpec{
+			label:      "localstack (cachestore)",
+			service:    devSvcLocalstack,
+			localPort:  port,
+			remotePort: devRemotePortLocalstack,
+		})
+	}
+
+	return specs
+}
+
+// localhostHostPort parses u and returns the host, port and a bool
+// indicating whether the URL is a localhost (or 127.0.0.1) URL we
+// should consider for auto-port-forward. Defaults the port from the
+// scheme when the URL omits it. A parse error returns false rather
+// than surfacing - the real HTTP call will report any URL problem
+// more usefully than this probe could.
+func localhostHostPort(u string) (host string, port int, ok bool) {
+	parsed, err := url.Parse(u)
+	if err != nil || parsed.Host == "" {
+		return "", 0, false
+	}
+
+	host = parsed.Hostname()
 	if host != "localhost" && host != "127.0.0.1" {
+		return "", 0, false
+	}
+
+	portStr := parsed.Port()
+	if portStr == "" {
+		if parsed.Scheme == "https" {
+			portStr = "443"
+		} else {
+			portStr = "80"
+		}
+	}
+
+	p, err := strconv.Atoi(portStr)
+	if err != nil {
+		return "", 0, false
+	}
+
+	return host, p, true
+}
+
+// ensureOnePortForward implements the per-spec contract: probe;
+// short-circuit if already bound; otherwise spawn kubectl and
+// (carefully) handle the race against a concurrent process binding
+// the local port between the probe and our listen.
+func ensureOnePortForward(ctx context.Context, g *globalFlags, spec portForwardSpec) (func(), error) {
+	if probeTCP("127.0.0.1", strconv.Itoa(spec.localPort), portForwardProbeTimeout) {
 		return func() {}, nil
 	}
 
-	if port != "8443" {
-		return func() {}, nil
-	}
-
-	if probeTCP(host, port, portForwardProbeTimeout) {
-		return func() {}, nil
-	}
-
-	cleanup, err := spawnPortForward(ctx, g, port)
+	cleanup, err := spawnPortForward(ctx, g, spec)
 	if err == nil {
 		return cleanup, nil
 	}
@@ -108,16 +228,17 @@ func ensureEdgeReachable(ctx context.Context, g *globalFlags) (func(), error) {
 		return nil, err
 	}
 
-	// A concurrent process likely grabbed the port between our probe
-	// and kubectl's listen. Sleep a short jitter and re-probe; if a
-	// sibling now serves the port we can ride its forward.
+	// A concurrent process likely grabbed the port between our
+	// probe and kubectl's listen. Sleep a short jitter and re-
+	// probe; if a sibling now serves the port we can ride its
+	// forward.
 	time.Sleep(portForwardRetryDelay)
 
-	if probeTCP(host, port, portForwardProbeTimeout) {
+	if probeTCP("127.0.0.1", strconv.Itoa(spec.localPort), portForwardProbeTimeout) {
 		return func() {}, nil
 	}
 
-	return spawnPortForward(ctx, g, port)
+	return spawnPortForward(ctx, g, spec)
 }
 
 // isPortInUseError returns true when err looks like the kubectl
@@ -151,7 +272,8 @@ func probeTCP(host, port string, timeout time.Duration) bool {
 
 // hostPortFromURL parses u and returns the host and port. Missing
 // port is filled from the scheme default (80 for http, 443 for
-// https). A parse error is surfaced verbatim.
+// https). A parse error is surfaced verbatim. Retained for the
+// existing unit tests.
 func hostPortFromURL(u string) (string, string, error) {
 	parsed, err := url.Parse(u)
 	if err != nil {
@@ -179,24 +301,37 @@ func hostPortFromURL(u string) (string, string, error) {
 // recurring connection-reset warnings) cannot grow without bound.
 const portForwardStderrCapacity = 16 * 1024
 
-// spawnPortForward starts `kubectl port-forward svc/orca <port>:8443`
-// as a subprocess under g.kubeContext and waits up to
-// portForwardReadyTimeout for the "Forwarding from" line on stdout.
-// Returns a cleanup that SIGTERMs the subprocess and waits for it,
-// or an error if the subprocess didn't reach the ready state in
-// time.
+// spawnPortForward starts `kubectl port-forward svc/<service>
+// <localPort>:<remotePort>` as a subprocess under g.kubeContext
+// (defaults to the current context when empty) in g.namespace, and
+// waits up to portForwardReadyTimeout for the "Forwarding from"
+// line on stdout. Returns a cleanup that SIGTERMs the subprocess
+// and waits for it, or an error if the subprocess didn't reach the
+// ready state in time.
 //
 // Stderr is drained into a bounded ring buffer so a failing kubectl
 // reports something useful; we deliberately do NOT stream it to the
 // user's stderr during the run (kubectl is chatty about "Handling
 // connection for X" lines that would clutter output).
-func spawnPortForward(_ context.Context, g *globalFlags, port string) (func(), error) {
-	cmd := exec.Command("kubectl",
-		"--context", g.kubeContext,
-		"-n", orcaEdgeNamespace,
-		"port-forward", "svc/"+orcaEdgeService,
-		port+":8443",
+func spawnPortForward(_ context.Context, g *globalFlags, spec portForwardSpec) (func(), error) {
+	args := []string{}
+
+	if g.kubeContext != "" {
+		args = append(args, "--context", g.kubeContext)
+	}
+
+	namespace := g.namespace
+	if namespace == "" {
+		namespace = defaultNamespace
+	}
+
+	args = append(args,
+		"-n", namespace,
+		"port-forward", "svc/"+spec.service,
+		fmt.Sprintf("%d:%d", spec.localPort, spec.remotePort),
 	)
+
+	cmd := exec.Command("kubectl", args...)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -244,7 +379,8 @@ func spawnPortForward(_ context.Context, g *globalFlags, port string) (func(), e
 			portForwardReadyTimeout, strings.TrimSpace(errBuf.String()))
 	}
 
-	printErr("auto port-forward: localhost:%s -> svc/%s:8443\n", port, orcaEdgeService)
+	printErr("auto port-forward: localhost:%d -> svc/%s:%d (%s)\n",
+		spec.localPort, spec.service, spec.remotePort, spec.label)
 
 	cleanup := func() {
 		_ = cmd.Process.Signal(syscall.SIGTERM) //nolint:errcheck // best-effort
@@ -287,6 +423,7 @@ func waitForForwardingReader(r io.Reader) (io.Reader, error) {
 		n, err := r.Read(buf)
 		if n > 0 {
 			seen.Write(buf[:n])
+
 			if strings.Contains(seen.String(), sentinel) {
 				return r, nil
 			}
