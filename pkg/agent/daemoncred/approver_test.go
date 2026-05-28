@@ -229,7 +229,7 @@ type csrSubject struct {
 	DNSNames           []string
 }
 
-func testCSRApprover(t *testing.T, bootstrapAllowed bool, renewalAllowed bool) *CSRApprover {
+func testCSRApprover(t *testing.T, bootstrapAllowed, renewalAllowed bool) *CSRApprover {
 	t.Helper()
 
 	approver, err := NewCSRApprover(CSRApproverOptions{
