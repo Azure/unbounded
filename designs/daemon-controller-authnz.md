@@ -71,32 +71,38 @@ modifying another node or changing protected parts of its own `Node` object. Thi
 identity cannot delete Nodes through the Node authorizer path.
 
 The daemon controller should get the same baseline `Node` behavior, so its custom
-client certificate is intentionally kubelet-shaped and adds one Unbounded group:
+client certificate is intentionally kubelet-shaped and adds one configurable
+Unbounded group:
 
 ```text
 CN = system:node:<nodeName>
 O  = system:nodes
-O  = unbounded-agent-daemons
+O  = <daemonGroup>
 ```
 
-`unbounded-agent-daemons` is the default group name used in this design. The
-group name should be configurable by deployment as long as the CSR approver, CSR
-signer, and RBAC binding agree on the same value.
+`<daemonGroup>` is the extra group used by RBAC for Machina CR access. The
+default value is `unbounded-agent-daemons`, but deployments may choose a different
+non-privileged group name. The daemon, CSR approver, signer configuration when a
+custom signer is used, and RBAC bindings must all use the same value.
 
 Including `system:nodes` causes the built-in Node authorizer and NodeRestriction
 admission plugin to apply the same own-node restrictions used for kubelets. This
 is how the daemon controller satisfies the baseline `Node` requirement. This is
 kubelet-style Node access, not a custom status-only permission model.
 
-Including `unbounded-agent-daemons` allows RBAC to grant additional Unbounded CR
+Including `<daemonGroup>` allows RBAC to grant additional Unbounded CR
 permissions without granting those permissions to all kubelets.
 
-This certificate must be issued by a custom signer. The built-in Kubernetes kubelet
-client signer validates kubelet client CSRs as exactly `O=system:nodes` in the
+This certificate cannot use the built-in kubelet client signer. The built-in
+Kubernetes kubelet client signer validates kubelet client CSRs as exactly
+`O=system:nodes` in the
 [kubelet client CSR validation helper](https://github.com/kubernetes/kubernetes/blob/master/pkg/apis/certificates/helpers.go)
 and does not preserve bootstrap-token extra groups into the issued kubelet client
-certificate. The daemon-controller certificate therefore needs a custom CSR
-approval and signing path that deliberately permits the extra Unbounded group.
+certificate. By default, this design uses a strict custom CSR approver with the
+built-in `kubernetes.io/kube-apiserver-client` signer. The generic API client
+signer can issue kube-apiserver client certificates using the cluster's existing
+client certificate signing configuration, so using it avoids duplicating signing
+logic when the cluster supports that signer.
 
 ## Authorization Model
 
@@ -104,8 +110,7 @@ Authorization is split by resource family:
 
 - Built-in Node authorizer and NodeRestriction admission handle `Node` access for
   the `system:node:<nodeName>` / `system:nodes` part of the identity.
-- Kubernetes RBAC grants Machina CR access through the `unbounded-agent-daemons`
-  group.
+- Kubernetes RBAC grants Machina CR access through the configured daemon group.
 
 The Unbounded group must not grant additional `Node` mutation permissions. Node
 labels, taints, privileged annotations, and Node deletion remain outside the
@@ -114,7 +119,7 @@ daemon controller.
 ## Machina RBAC
 
 RBAC grants Machina-related permissions to the extra group, not directly to
-`system:nodes`:
+`system:nodes`. This example uses the default daemon group:
 
 ```yaml
 apiVersion: rbac.authorization.k8s.io/v1
@@ -154,20 +159,36 @@ subjects:
   name: unbounded-agent-daemons
 ```
 
-## CSR Approval And Signing
+If a deployment configures a different daemon group, replace
+`unbounded-agent-daemons` in the `ClusterRoleBinding` subject with that value.
 
-The custom CSR approver is responsible for ensuring only the local daemon
-controller can receive the kubelet-shaped certificate with the extra group.
+## CSR Approver And Signer Setup
+
+The default setup uses a custom approver and the built-in
+`kubernetes.io/kube-apiserver-client` signer.
+
+The approver is the security boundary. It is responsible for ensuring only the
+local daemon controller can receive the kubelet-shaped certificate with the extra
+group. It must be stricter than the signer: the signer proves the certificate is a
+valid client certificate, while the approver proves this requester may receive
+this specific daemon-controller identity.
+
+Using `kubernetes.io/kube-apiserver-client` means the signer enforces only generic
+API-client certificate constraints. All daemon-specific constraints are enforced
+by the custom approver before the CSR is approved.
 
 The approver validates:
 
-- `spec.signerName` is the Unbounded daemon-controller signer.
+- `spec.signerName` is `kubernetes.io/kube-apiserver-client` by default, or the
+  configured daemon-controller signer for deployments that use a custom signer.
 - The requested common name is `system:node:<expected-node-name>`.
 - The requested organizations are exactly `system:nodes` and
-  `unbounded-agent-daemons`.
+  the configured daemon group, for example `unbounded-agent-daemons` by default.
 - The requested usages are limited to client authentication.
 - The request has no subject alternative names unless a future design explicitly
   allows them.
+- The PKCS#10 CSR in `spec.request` does not request CA privileges, unexpected
+  subject fields, unsupported key usages, or unexpected extensions.
 - For initial issuance, the bootstrap requester is allowed to claim the requested
   node name.
 - Renewal requests cannot change the node name or group set.
@@ -175,9 +196,72 @@ The approver validates:
   configured Unbounded daemon group cannot renew into a daemon-controller
   certificate.
 
-The custom signer signs only approved CSRs for this signer. The issued
-certificate must chain to a CA trusted by the kube-apiserver client certificate
-authenticator.
+For production use, the approver must validate the corresponding node and
+resource binding. In particular, initial issuance must prove that the bootstrap
+token submitting the CSR is allowed to claim the requested Node and the expected
+Machine CR. Renewal must prove that the existing certificate is already the same
+daemon-controller identity and still maps to the same node/resource binding.
+
+When the kube-controller-manager CSR signing controller is configured for
+`kubernetes.io/kube-apiserver-client`, approved CSRs are signed using the
+cluster's client certificate signing configuration, and the resulting
+certificates are intended to be honored as client certificates by kube-apiserver.
+This avoids implementing and operating a separate signer for the default
+deployment.
+
+The approver needs RBAC permission to approve CSRs for
+`kubernetes.io/kube-apiserver-client`. That signer can issue general API client
+certificates, not only daemon-controller certificates. For that reason, the
+approval permission should be granted only to the daemon-controller CSR approver
+service account. Other users or controllers should not receive this approval
+permission unless they have their own independent policy and validation path.
+
+Concretely, the approver service account needs permission to update CSR approval
+subresources and to approve only the signer it handles:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: daemon-controller-csr-approver
+rules:
+- apiGroups: ["certificates.k8s.io"]
+  resources: ["certificatesigningrequests"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["certificates.k8s.io"]
+  resources: ["certificatesigningrequests/approval"]
+  verbs: ["update"]
+- apiGroups: ["certificates.k8s.io"]
+  resources: ["signers"]
+  resourceNames: ["kubernetes.io/kube-apiserver-client"]
+  verbs: ["approve"]
+```
+
+Bind this role only to the daemon-controller CSR approver service account. Do not
+bind it to broad groups such as `system:authenticated`, `system:masters`, or the
+daemon group itself.
+
+Deployments may provide their own approver and signer instead. A custom approver
+can enforce stricter node/resource validation, and a custom signer can use a
+different CA or signer name if the cluster policy requires it. In that case, the
+daemon, approver, signer, and RBAC configuration must agree on the signer name and
+daemon group. See [Appendix: Integration Examples](#appendix-integration-examples)
+for example wiring in Machina/Unbounded and AKS Flex Node environments.
+
+Security-sensitive or multi-tenant deployments should prefer a custom signer name
+so approval and signing RBAC can be scoped to the daemon-controller certificate
+contract instead of the generic API client signer.
+
+### Built-in Signer Requirements
+
+The default model requires kube-controller-manager CSR signing to be enabled for
+`kubernetes.io/kube-apiserver-client` and configured with a client signing CA/key
+whose issued certificates are trusted by kube-apiserver client certificate
+authentication.
+
+If the cluster disables kube-controller-manager CSR signing, does not configure
+the client signing key, or does not trust the resulting CA for API client
+authentication, this default signer model cannot be used.
 
 ## Certificate Issuing Process
 
@@ -188,7 +272,7 @@ certificate. Both paths produce the same certificate shape:
 ```text
 CN = system:node:<nodeName>
 O  = system:nodes
-O  = unbounded-agent-daemons
+O  = <daemonGroup>
 ```
 
 ### Initial Issuance From Bootstrap Token
@@ -206,15 +290,15 @@ The initial issuance flow is:
 
 1. The daemon builds a bootstrap REST client from the API server URL, cluster CA,
    and kubelet TLS bootstrap token in the applied agent config.
-2. The daemon creates a private key and CSR for the daemon-controller signer with
-   `CN=system:node:<nodeName>`, `O=system:nodes`, and the configured Unbounded
-   daemon group.
+2. The daemon creates a private key and CSR for
+   `kubernetes.io/kube-apiserver-client` with `CN=system:node:<nodeName>`,
+   `O=system:nodes`, and the configured Unbounded daemon group.
 3. The custom approver validates the CSR shape, signer, usages, and requested
    expiration.
 4. The custom approver resolves the bootstrap token identity and verifies that the
    token is authorized to claim the requested Machine and Node name.
-5. The custom signer signs the approved CSR with a CA trusted by the kube-apiserver
-   client certificate authenticator.
+5. The built-in API client signer signs the approved CSR with a CA trusted by the
+   kube-apiserver client certificate authenticator.
 6. The daemon stores the issued certificate and private key on the host with
    permissions limited to the daemon user.
 7. The daemon uses the issued certificate for daemon-controller API requests.
@@ -265,7 +349,7 @@ flowchart TD
     Approver["Custom approver validates CSR shape and requester"]
     ClaimCheck["Initial issuance: verify bootstrap token may claim node"]
     RenewalCheck["Renewal: verify requester matches requested identity"]
-    Signer["Custom signer issues daemon-controller certificate"]
+    Signer["Built-in API client signer issues daemon-controller certificate"]
     StoredCert["Daemon stores cert and key on host"]
 
     BootstrapToken --> InitialCSR
@@ -285,7 +369,7 @@ Authentication and authorization:
 flowchart TD
     Daemon["Daemon controller uses daemon-controller certificate"]
     APIServer["kube-apiserver authenticates client certificate"]
-    Identity["username: system:node:<nodeName><br/>groups: system:nodes, unbounded-agent-daemons"]
+    Identity["username: system:node:<nodeName><br/>groups: system:nodes, <daemonGroup>"]
     NodeRequest["Kubelet-style own-Node request"]
     MachinaRequest["Machina CR request"]
     NodeAuthz["Node authorizer and NodeRestriction enforce own-node access"]
@@ -301,7 +385,7 @@ flowchart TD
 
 ## Machina CR Scoping
 
-RBAC bound to `unbounded-agent-daemons` is group-wide. The built-in Node
+RBAC bound to the configured daemon group is group-wide. The built-in Node
 authorizer does not scope Unbounded CRDs to the local node or Machine. This
 design assumes daemon controllers are trusted to reconcile only their local
 `Machine` and `MachineOperation` objects by implementation logic and
@@ -320,7 +404,7 @@ updates. The same credential can also attempt kubelet-style own-Node
 main-resource create/update/patch, subject to NodeRestriction. The daemon
 implementation will not rely on main-resource `Node` updates.
 
-The `unbounded-agent-daemons` group must not grant any additional `Node`
+The configured daemon group must not grant any additional `Node`
 permissions.
 
 The daemon controller implementation must not perform lifecycle `Node` mutations
@@ -351,6 +435,9 @@ CN = unbounded-agent:<nodeName>
 O  = unbounded-agent-daemons
 ```
 
+The group shown here is only an example. If a deployment uses a different daemon
+group, the same concern applies to that configured group.
+
 That has cleaner audit separation from kubelet identities, but it no longer uses
 the built-in Node authorizer and NodeRestriction admission behavior. To preserve
 the same own-node safety guarantees, Unbounded would need to replicate that logic
@@ -368,13 +455,13 @@ Unbounded daemon controllers.
 
 The custom certificate includes `system:nodes`, so requests appear as
 `system:node:<nodeName>` in server-side audit logs. The extra group records that
-the request also belongs to `unbounded-agent-daemons`, but the username is still a
-node-shaped identity.
+the request also belongs to the configured daemon group, but the username is still
+a node-shaped identity.
 
-The custom signer must use a CA trusted by the kube-apiserver client certificate
-authenticator. Clusters that do not allow a custom trusted client CA, or do not
-allow signing with an existing trusted client CA, cannot use this certificate
-model without a different authentication mechanism.
+The default signer is `kubernetes.io/kube-apiserver-client`, so this model depends
+on the cluster's kube-controller-manager CSR signing configuration. Deployments
+that choose a custom signer must ensure the custom signer issues certificates
+from a CA trusted by the kube-apiserver client certificate authenticator.
 
 The bootstrap-token-to-node claim check is the critical approval decision. The
 approver must have controller-owned state that maps the bootstrap token to the
@@ -402,4 +489,80 @@ and the desired behavior is to inherit Kubernetes' existing kubelet node-scoping
 model rather than replicate it with a custom authorizer or ValidatingAdmissionPolicy.
 Compromise of this certificate should be treated similarly to compromise of a
 kubelet client credential for that node, plus the additional Machina CR
-permissions granted to `unbounded-agent-daemons`.
+permissions granted to the configured daemon group.
+
+## Appendix: Integration Examples
+
+### Machina / Unbounded
+
+In the default Machina/Unbounded deployment, the daemon group is
+`unbounded-agent-daemons` and the signer is
+`kubernetes.io/kube-apiserver-client`.
+
+The CSR approver is included as part of the Machina controller deployment. This
+keeps approval decisions close to the controller-owned Machine, bootstrap token,
+and site state used to validate daemon-controller certificate requests.
+
+The bootstrap token should authenticate with a bootstrap-scoped group that allows
+the approver to identify requests for daemon-controller certificates, for example:
+
+```text
+system:bootstrappers:unbounded-agent-daemons
+```
+
+Unbounded should issue bootstrap token Secrets with controller-owned binding data,
+including the site name the token is allowed to join. The token Secret can carry
+that binding through labels or annotations owned by Unbounded, for example the
+site label used by the bootstrap flow.
+
+The approver validates the bootstrap requester, the CSR shape, and the requested
+node identity. For initial issuance, the approver resolves the bootstrap token
+Secret from the authenticated `system:bootstrap:<tokenID>` requester and verifies
+that the requested node belongs to a valid Unbounded site for that token. If the
+token is not bound to a valid site, or the requested node does not match the
+token's site binding, the approver rejects the CSR.
+
+When a `Machine` exists, the approver can also verify that the token is bound to
+the expected `Machine` and `Node` through controller-owned state, such as the
+Machine's bootstrap token reference and node reference.
+
+Machina RBAC grants CR access to the configured daemon group. The group binding
+must include the same group that appears in the issued certificate:
+
+```yaml
+subjects:
+- kind: Group
+  apiGroup: rbac.authorization.k8s.io
+  name: unbounded-agent-daemons
+```
+
+This gives daemon controllers access to Machina resources without granting those
+permissions to all kubelets in `system:nodes`.
+
+### AKS Flex Node
+
+In an AKS Flex Node style environment, the same certificate shape can be used, but
+the deployment may choose a different daemon group and a different approver or
+signer implementation.
+
+The AKS resource provider should run a managed CSR approver for this flow. That
+approver validates that the bootstrap token and requested daemon-controller
+certificate come from an expected Flex agent node ARM resource before approving
+the CSR. In other words, the AKS RP owns the platform-specific ARM
+resource-to-node binding check instead of relying on Machina site or Machine
+state.
+
+The integration contract is:
+
+- The daemon requests `CN=system:node:<nodeName>`.
+- The certificate includes `O=system:nodes` so Kubernetes applies Node authorizer
+  and NodeRestriction behavior.
+- The certificate includes the configured daemon group so RBAC can grant the
+  platform-specific CR permissions required by the daemon controller.
+- The managed AKS RP approver verifies the platform's node/resource binding before
+  approving the CSR.
+
+The daemon group value should be treated as deployment configuration. For example,
+AKS Flex Node may use a platform-owned group name instead of
+`unbounded-agent-daemons`, as long as the daemon, approver, signer configuration,
+and RBAC bindings use the same value.
