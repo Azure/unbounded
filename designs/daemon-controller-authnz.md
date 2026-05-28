@@ -198,8 +198,11 @@ The approver validates:
 
 For production use, the approver must validate the corresponding node and
 resource binding. In particular, initial issuance must prove that the bootstrap
-token submitting the CSR is allowed to claim the requested Node and the expected
-Machine CR. Renewal must prove that the existing certificate is already the same
+token submitting the CSR is allowed to claim the requested Node. In the
+Machina/Unbounded integration, the minimum early-bootstrap gate is a
+controller-owned site binding on the bootstrap token. If a matching `Machine`
+already exists, the approver also enforces the stronger token-to-Machine-to-Node
+binding. Renewal must prove that the existing certificate is already the same
 daemon-controller identity and still maps to the same node/resource binding.
 
 When the kube-controller-manager CSR signing controller is configured for
@@ -237,7 +240,9 @@ rules:
   verbs: ["approve"]
 ```
 
-Bind this role only to the daemon-controller CSR approver service account. Do not
+Bind this role only to the service account that runs the daemon-controller CSR
+approver. In the Machina/Unbounded integration, this is the Machina controller
+service account because the approver runs inside the Machina controller. Do not
 bind it to broad groups such as `system:authenticated`, `system:masters`, or the
 daemon group itself.
 
@@ -247,6 +252,13 @@ different CA or signer name if the cluster policy requires it. In that case, the
 daemon, approver, signer, and RBAC configuration must agree on the signer name and
 daemon group. See [Appendix: Integration Examples](#appendix-integration-examples)
 for example wiring in Machina/Unbounded and AKS Flex Node environments.
+
+The reusable implementation in `pkg/agent/daemoncred` separates generic CSR
+validation from deployment-specific binding checks. It validates the signer,
+requested subject, requested organizations, usages, SANs, extensions, requester
+identity, and requester groups. The caller supplies callbacks for bootstrap and
+renewal authorization so each integration can enforce its own node/resource
+binding rules.
 
 Security-sensitive or multi-tenant deployments should prefer a custom signer name
 so approval and signing RBAC can be scoped to the daemon-controller certificate
@@ -296,11 +308,13 @@ The initial issuance flow is:
 3. The custom approver validates the CSR shape, signer, usages, and requested
    expiration.
 4. The custom approver resolves the bootstrap token identity and verifies that the
-   token is authorized to claim the requested Machine and Node name.
+   token is authorized to claim the requested Node. If a matching Machine already
+   exists, the approver also verifies the Machine and Node binding.
 5. The built-in API client signer signs the approved CSR with a CA trusted by the
    kube-apiserver client certificate authenticator.
 6. The daemon stores the issued certificate and private key on the host with
-   permissions limited to the daemon user.
+   permissions limited to the daemon user. The implementation uses the
+   `client-go` certificate file store under the daemon credential directory.
 7. The daemon uses the issued certificate for daemon-controller API requests.
 
 The token-to-node check should use controller-owned state, such as Machine data,
@@ -311,14 +325,13 @@ that this bootstrap token is allowed to request this node name.
 ### Renewal From Existing Certificate
 
 Renewal starts after the daemon already has a valid daemon-controller
-certificate. Renewal does not use the bootstrap token unless the existing
-certificate has expired and the daemon must fall back to the initial issuance
-path.
+certificate. Renewal uses `client-go`'s certificate manager and does not use the
+bootstrap token while the existing certificate remains valid.
 
 The renewal flow is:
 
-1. The daemon periodically checks the stored certificate lifetime.
-2. When the certificate enters its renewal window, the daemon creates a new
+1. The `client-go` certificate manager monitors the stored certificate lifetime.
+2. When the certificate enters its renewal window, the manager creates a new
    private key and CSR for the same signer, common name, organizations, and
    usages.
 3. The daemon submits the CSR using the current daemon-controller certificate.
@@ -328,13 +341,14 @@ The renewal flow is:
 5. The custom approver rejects renewal if the requested node name, group set,
    signer, or usages changed.
 6. The signer issues a replacement certificate.
-7. The daemon atomically replaces the stored certificate and uses it for new API
-   connections.
+7. The certificate manager updates the file store and the daemon REST transport
+   closes existing connections so new API connections use the renewed certificate.
 
-If renewal fails while the current certificate remains valid, the daemon should
-retry with backoff and expose metrics. If the certificate expires and no valid
-bootstrap path exists, the daemon must fail closed and stop reconciling API-backed
-operations until a valid credential is available.
+If renewal fails while the current certificate remains valid, the certificate
+manager retries. The daemon still needs metrics for renewal failures and time to
+expiry. If the certificate expires and no valid bootstrap path exists, the daemon
+must fail closed and stop reconciling API-backed operations until a valid
+credential is available.
 
 ## Request Flow
 
@@ -465,16 +479,16 @@ from a CA trusted by the kube-apiserver client certificate authenticator.
 
 The bootstrap-token-to-node claim check is the critical approval decision. The
 approver must have controller-owned state that maps the bootstrap token to the
-expected Machine and Node name. Until that mapping is available and reliable, the
-approver cannot safely issue daemon-controller certificates.
+scope of nodes it may claim. In the Machina/Unbounded integration, this starts
+with a site binding on the bootstrap token and upgrades to a token/Machine/Node
+binding when a matching `Machine` exists.
 
-The daemon needs a concrete storage path for the custom certificate and key. The
-path should be on the host, not inside the nspawn machine, because the host-side
-daemon is the certificate consumer.
+The daemon stores certificate material on the host, not inside the nspawn machine,
+because the host-side daemon is the certificate consumer. The implementation uses
+the `client-go` certificate file store in the daemon credential directory.
 
-Renewal timing, retry backoff, and metrics names still need implementation-level
-definition. The daemon must expose enough state to detect renewal failures before
-the current certificate expires.
+Renewal metrics still need implementation-level definition. The daemon must expose
+enough state to detect renewal failures before the current certificate expires.
 
 There is no online revocation mechanism for these daemon-controller certificates
 in this design. If a certificate should stop working before expiry, enforcement
@@ -501,7 +515,9 @@ In the default Machina/Unbounded deployment, the daemon group is
 
 The CSR approver is included as part of the Machina controller deployment. This
 keeps approval decisions close to the controller-owned Machine, bootstrap token,
-and site state used to validate daemon-controller certificate requests.
+and site state used to validate daemon-controller certificate requests. The
+Machina controller uses the reusable `pkg/agent/daemoncred` approver and provides
+Machina-specific binding callbacks.
 
 The bootstrap token should authenticate with a bootstrap-scoped group that allows
 the approver to identify requests for daemon-controller certificates, for example:
@@ -518,13 +534,15 @@ site label used by the bootstrap flow.
 The approver validates the bootstrap requester, the CSR shape, and the requested
 node identity. For initial issuance, the approver resolves the bootstrap token
 Secret from the authenticated `system:bootstrap:<tokenID>` requester and verifies
-that the requested node belongs to a valid Unbounded site for that token. If the
-token is not bound to a valid site, or the requested node does not match the
-token's site binding, the approver rejects the CSR.
+that the token is bound to a valid Unbounded site. If the token is not bound to a
+valid site, the approver rejects the CSR.
 
-When a `Machine` exists, the approver can also verify that the token is bound to
-the expected `Machine` and `Node` through controller-owned state, such as the
-Machine's bootstrap token reference and node reference.
+When a `Machine` exists and references that bootstrap token, the approver also
+verifies that the Machine has the same site binding and that the requested node
+matches the Machine's `spec.kubernetes.nodeRef.name` when set, otherwise the
+Machine name. If no Machine references the token yet, initial issuance may proceed
+from the site-bound bootstrap token so the daemon can create the Machine during
+bootstrap.
 
 Machina RBAC grants CR access to the configured daemon group. The group binding
 must include the same group that appears in the issued certificate:
