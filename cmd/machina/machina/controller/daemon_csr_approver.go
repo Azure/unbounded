@@ -13,7 +13,6 @@ import (
 	"sort"
 	"strings"
 
-	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	certificatesv1 "k8s.io/api/certificates/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -23,6 +22,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+
+	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
 
 const (
@@ -233,7 +234,12 @@ func (e daemonCSREvaluator) evaluateRenewalRequester(ctx context.Context, c clie
 	return deny("node %q is not bound to a Machine", nodeName), nil
 }
 
-func (e daemonCSREvaluator) bootstrapTokenMayClaimNode(ctx context.Context, c client.Client, username string, nodeName string) (bool, error) {
+func (e daemonCSREvaluator) bootstrapTokenMayClaimNode(
+	ctx context.Context,
+	c client.Client,
+	username string,
+	nodeName string,
+) (bool, error) {
 	tokenID := strings.TrimPrefix(username, bootstrapUserPrefix)
 	if tokenID == "" {
 		return false, nil

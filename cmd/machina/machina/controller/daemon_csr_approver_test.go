@@ -13,12 +13,13 @@ import (
 	"encoding/pem"
 	"testing"
 
-	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/stretchr/testify/require"
 	certificatesv1 "k8s.io/api/certificates/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
 
 func TestDaemonCSREvaluate_BootstrapTokenAllowed(t *testing.T) {
@@ -324,7 +325,10 @@ func csrFor(t *testing.T, spec certificatesv1.CertificateSigningRequestSpec, sub
 	}
 }
 
-func bootstrapToken(tokenID string, site string) *corev1.Secret {
+func bootstrapToken(
+	tokenID string,
+	site string,
+) *corev1.Secret {
 	labels := map[string]string{}
 	if site != "" {
 		labels[unboundedv1alpha3.MachineSiteLabelKey] = site
