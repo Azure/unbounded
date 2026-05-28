@@ -106,6 +106,17 @@ func runUpload(ctx context.Context, g *globalFlags, o *uploadOpts) error {
 		return fmt.Errorf("--file and --generate are mutually exclusive")
 	}
 
+	// Auto-open kubectl port-forwards to any localhost-routed dev
+	// endpoints before constructing the origin client. ClusterIP
+	// emulator Services mean upload to localhost:30100 / :10000
+	// has no listener until orcadev opens the forward itself.
+	cleanup, err := ensurePortForwards(ctx, g)
+	if err != nil {
+		return err
+	}
+
+	defer cleanup()
+
 	oc, err := newOriginClient(ctx, g)
 	if err != nil {
 		return err

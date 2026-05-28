@@ -70,6 +70,12 @@ The setup script is cluster-agnostic. It applies vanilla
 `kubectl apply -f` against the chosen context and waits for the
 emulator init hooks plus the orca rollout to settle.
 
+On clusters with fewer than 3 schedulable nodes, the default install
+relaxes Orca's pod anti-affinity from `required` to `preferred` so
+the rollout still completes. Kind installs keep the strict
+`required` anti-affinity (mirrors production topology). Pass
+`--replicas N` to override the default of 3.
+
 ## 3. Verify the install
 
 ```bash
@@ -136,10 +142,8 @@ fetch + verify against a specific behaviour:
 ```bash
 bin/orcadev scenario cold-warm        # cold-vs-warm GET ratio
 bin/orcadev scenario range-stress     # concurrent ranges, all bytes verified
-bin/orcadev scenario multi-object     # parallel GETs across many objects
 bin/orcadev scenario empty-object     # zero-byte regression check
 bin/orcadev scenario etag-change      # mid-stream etag rotation
-bin/orcadev scenario range-large      # very large ranges
 ```
 
 Each prints PASS or FAIL with per-step timings. `--json-out PATH`
@@ -192,15 +196,18 @@ force a cold state before the next experiment:
 
 ```bash
 bin/orcadev cache list
-bin/orcadev cache inspect --bucket orca-origin --key orca-test.bin
+bin/orcadev cache inspect --bucket orca-test --key orca-test.bin
 
 # Force a cold-cache state for orca-test.bin before the next bench
-bin/orcadev cache clear --object orca-origin/orca-test.bin --yes
+bin/orcadev cache clear --object orca-test/orca-test.bin --yes
 ```
 
 `cache inspect` answers the "did my fix actually populate the cache?"
 question: it HEADs the origin for size + etag, computes the canonical
 chunk paths, then HEADs each path in the cachestore.
+
+In `awss3` mode the origin bucket is `orca-origin`; substitute that
+for `orca-test` in the examples above.
 
 ## 9. Iterate / reset / tear down
 
@@ -216,8 +223,12 @@ make -C hack/orca logs
 make orca-kind-down       # or: make orca-down
 
 # Or uninstall just Orca + emulators from a non-kind cluster, leaving
-# the cluster intact:
+# the namespace and any unrelated resources in it intact:
 ./hack/orca/setup-orca.sh --context my-cluster --uninstall
+
+# Also remove the namespace (DESTRUCTIVE - removes every resource in
+# the namespace, including ones this script did not create):
+./hack/orca/setup-orca.sh --context my-cluster --uninstall --delete-namespace
 ```
 
 ## 10. Watch the per-chunk debug trace
@@ -318,8 +329,8 @@ slash-free.
 ### orcadev says "auto port-forward: ..." even though kubectl is running locally
 
 orcadev probes the configured localhost ports first; if anything is
-bound (your own `make port-forward`, kind's NodePort mapping, a
-sibling orcadev), it reuses that. The "auto port-forward: ..."
+bound (your own `make port-forward`, a sibling orcadev, or a stale
+foreground forward), it reuses that. The "auto port-forward: ..."
 message means the probe failed and orcadev opened its own forward
 for the duration of the run. Both are fine.
 

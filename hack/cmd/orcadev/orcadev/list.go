@@ -38,6 +38,13 @@ and azureblob drivers.`,
 }
 
 func runList(ctx context.Context, g *globalFlags, o *listOpts) error {
+	cleanup, err := ensurePortForwards(ctx, g)
+	if err != nil {
+		return err
+	}
+
+	defer cleanup()
+
 	oc, err := newOriginClient(ctx, g)
 	if err != nil {
 		return err
@@ -86,6 +93,13 @@ the matching set and prompts for confirmation on stdin.`,
 }
 
 func runDelete(ctx context.Context, g *globalFlags, o *deleteOpts) error {
+	cleanup, err := ensurePortForwards(ctx, g)
+	if err != nil {
+		return err
+	}
+
+	defer cleanup()
+
 	oc, err := newOriginClient(ctx, g)
 	if err != nil {
 		return err

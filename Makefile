@@ -721,6 +721,22 @@ orca-oci-push: orca-oci ## Build and push the orca container image
 # the developer quickstart.
 
 orca-install: ## Install Orca into the current kubectl context (no kind assumptions)
+	@ctx=$$(kubectl config current-context 2>/dev/null || echo none); \
+	case "$$ctx" in \
+	  kind-*) : ;; \
+	  *) \
+	    if [ "$(ORCA_DEV_IMAGE)" = "ghcr.io/azure/orca:dev" ]; then \
+	      echo "ERROR: current kubectl context '$$ctx' is not kind-*, but ORCA_DEV_IMAGE is the default ghcr.io/azure/orca:dev." >&2; \
+	      echo "       That image is not in any registry your cluster can pull from and the install will ImagePullBackOff." >&2; \
+	      echo "       Either:" >&2; \
+	      echo "         (a) switch to a kind context: kubectl config use-context kind-orca-dev" >&2; \
+	      echo "         (b) build, push, and pass a reachable image:" >&2; \
+	      echo "             make image-orca-local ORCA_IMAGE=my-registry/orca:dev" >&2; \
+	      echo "             podman push my-registry/orca:dev" >&2; \
+	      echo "             make orca-install ORCA_DEV_IMAGE=my-registry/orca:dev" >&2; \
+	      exit 1; \
+	    fi ;; \
+	esac
 	./hack/orca/setup-orca.sh --image $(ORCA_DEV_IMAGE) --namespace $(ORCA_NAMESPACE)
 
 orca-kind-up: ## Create the orca-dev kind cluster + install Orca (build + side-load image)

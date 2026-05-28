@@ -74,6 +74,13 @@ to know whether its chunks are present.`,
 }
 
 func runCacheList(ctx context.Context, g *globalFlags, o *cacheListOpts) error {
+	cleanup, err := ensurePortForwards(ctx, g)
+	if err != nil {
+		return err
+	}
+
+	defer cleanup()
+
 	cs, err := newCachestoreClient(ctx, g)
 	if err != nil {
 		return err
@@ -223,6 +230,13 @@ func runCacheInspect(ctx context.Context, g *globalFlags, o *cacheInspectOpts) e
 		return err
 	}
 
+	cleanup, err := ensurePortForwards(ctx, g)
+	if err != nil {
+		return err
+	}
+
+	defer cleanup()
+
 	// Override the resolved origin bucket BEFORE constructing the
 	// origin client; azureblob binds the container at construction
 	// time, so a later mutation would not take effect.
@@ -366,6 +380,13 @@ func newCacheClearCmd(g *globalFlags) *cobra.Command {
 }
 
 func runCacheClear(ctx context.Context, g *globalFlags, o *cacheClearOpts) error {
+	cleanup, err := ensurePortForwards(ctx, g)
+	if err != nil {
+		return err
+	}
+
+	defer cleanup()
+
 	cs, err := newCachestoreClient(ctx, g)
 	if err != nil {
 		return err

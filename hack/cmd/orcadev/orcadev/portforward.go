@@ -96,13 +96,6 @@ func ensurePortForwards(ctx context.Context, g *globalFlags) (func(), error) {
 	return rollback, nil
 }
 
-// ensureEdgeReachable is a thin back-compat wrapper. New code should
-// call ensurePortForwards directly. Kept so existing subcommands and
-// tests don't churn.
-func ensureEdgeReachable(ctx context.Context, g *globalFlags) (func(), error) {
-	return ensurePortForwards(ctx, g)
-}
-
 // derivePortForwardSpecs inspects the resolved global flags and
 // returns the set of port-forwards to maintain for this invocation.
 // The order is significant: orca edge first (it's the only one every

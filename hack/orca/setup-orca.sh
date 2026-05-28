@@ -28,7 +28,13 @@
 #                        worker-node count in hack/orca/kind-config.yaml)
 #   --no-wait            apply manifests and exit without waiting for
 #                        emulators / orca to reach Ready
-#   --uninstall          delete everything this script created and exit
+#   --uninstall          delete every Orca-owned resource in the
+#                        namespace (label-selector based) and exit;
+#                        the namespace itself is left intact unless
+#                        --delete-namespace is also passed
+#   --delete-namespace   only meaningful with --uninstall: delete the
+#                        namespace too, including any unrelated
+#                        resources it may contain
 #
 # Real-Azure mode (advanced): set AZURE_STORAGE_ACCOUNT, AZURE_STORAGE_KEY,
 # and AZURE_CONTAINER in the environment before invoking. Endpoint is
@@ -69,6 +75,7 @@ LOG_LEVEL="info"
 REPLICAS=3
 DO_WAIT=1
 DO_UNINSTALL=0
+DO_DELETE_NAMESPACE=0
 
 # Computed paths.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -77,6 +84,25 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 # Well-known Azurite dev key. Public Microsoft-documented constant,
 # not a secret. Used when no real Azure account is configured.
 AZURITE_DEV_KEY="Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
+
+# -----------------------------------------------------------------------------
+# Cleanup stack
+#
+# Each `mktemp -d` appends to cleanup_paths; the single EXIT trap
+# removes them all in reverse order on script exit. Avoids the
+# previous bug where the rendered-manifest trap overwrote the
+# kind-image-archive trap and leaked one tempdir per --kind-load
+# invocation.
+
+cleanup_paths=()
+cleanup() {
+  local p
+  for ((i=${#cleanup_paths[@]}-1; i>=0; i--)); do
+    p="${cleanup_paths[$i]}"
+    [[ -n "${p}" && -e "${p}" ]] && rm -rf "${p}"
+  done
+}
+trap cleanup EXIT
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -145,6 +171,7 @@ while [[ $# -gt 0 ]]; do
     --replicas)   REPLICAS="$2"; shift 2 ;;
     --no-wait)    DO_WAIT=0; shift ;;
     --uninstall)  DO_UNINSTALL=1; shift ;;
+    --delete-namespace) DO_DELETE_NAMESPACE=1; shift ;;
     -h|--help)    usage 0 ;;
     *)            err "unknown flag: $1"; usage 1 ;;
   esac
@@ -159,22 +186,49 @@ if [[ "${DO_KIND_LOAD}" == "1" ]] && ! is_kind_context; then
   die "--kind-load requires a kind context; current context is not kind-* (use --context or switch with kubectl config use-context)"
 fi
 
+if [[ "${DO_BUILD}" == "1" && "${DO_KIND_LOAD}" == "0" ]]; then
+  # Building a local image without loading it anywhere is almost
+  # always a mistake: the rendered Deployment uses --image, so the
+  # cluster will try to pull from a registry the local build never
+  # reached. Force the operator to be explicit.
+  die "--build without --kind-load: nothing would load the built image into the cluster. Pass --kind-load for kind, or push the image manually (\$CONTAINER_ENGINE push ${ORCA_IMAGE}) and re-run without --build."
+fi
+
 # -----------------------------------------------------------------------------
 # Uninstall path: short-circuit before any rendering / waiting.
+#
+# Deletes only resources whose labels mark them as owned by the Orca
+# dev install:
+#   app.kubernetes.io/name=orca       -> Orca's own resources
+#   app.kubernetes.io/part-of=orca-dev -> Azurite + LocalStack
+#
+# Unrelated resources in the same namespace (other Unbounded
+# components, sentinel ConfigMaps, etc.) are left alone. Pass
+# --delete-namespace to also remove the namespace, which removes
+# every resource it contains regardless of ownership.
 
 if [[ "${DO_UNINSTALL}" == "1" ]]; then
-  log "Uninstalling orca + dev emulators from namespace ${NAMESPACE}"
-  # Use --ignore-not-found so this is idempotent against partial
-  # installs. We delete the namespace last to take everything in
-  # the namespace with it; the explicit per-kind deletes above are
-  # belt-and-suspenders so RBAC clusterRoleBindings (none today,
-  # but future-proof) get cleaned up too.
-  kubectl_ctx -n "${NAMESPACE}" delete deployment orca azurite localstack --ignore-not-found
-  kubectl_ctx -n "${NAMESPACE}" delete service orca orca-peers azurite localstack --ignore-not-found
-  kubectl_ctx -n "${NAMESPACE}" delete configmap orca-config localstack-init-buckets --ignore-not-found
-  kubectl_ctx -n "${NAMESPACE}" delete secret orca-credentials --ignore-not-found
-  kubectl_ctx -n "${NAMESPACE}" delete serviceaccount orca --ignore-not-found
-  kubectl_ctx delete namespace "${NAMESPACE}" --ignore-not-found
+  log "Uninstalling Orca + dev emulators from namespace ${NAMESPACE}"
+
+  # Resource kinds the install creates. Listed explicitly so a stray
+  # cluster-scoped resource with our labels is not accidentally
+  # affected. All deletes are namespace-scoped.
+  kinds="deployment,service,configmap,secret,serviceaccount"
+
+  for selector in \
+      "app.kubernetes.io/name=orca" \
+      "app.kubernetes.io/part-of=orca-dev"; do
+    kubectl_ctx -n "${NAMESPACE}" delete "${kinds}" \
+      -l "${selector}" --ignore-not-found
+  done
+
+  if [[ "${DO_DELETE_NAMESPACE}" == "1" ]]; then
+    err "--delete-namespace: deleting namespace ${NAMESPACE} and EVERY resource it contains"
+    kubectl_ctx delete namespace "${NAMESPACE}" --ignore-not-found
+  else
+    log "Namespace ${NAMESPACE} left intact (pass --delete-namespace to remove it)"
+  fi
+
   log "Uninstall complete."
   exit 0
 fi
@@ -197,7 +251,7 @@ if [[ "${DO_KIND_LOAD}" == "1" ]]; then
   log "Side-loading ${ORCA_IMAGE} into kind cluster '${cluster}' via ${engine##*/}"
 
   tmpdir="$(mktemp -d)"
-  trap 'rm -rf "${tmpdir}"' EXIT
+  cleanup_paths+=("${tmpdir}")
   archive="${tmpdir}/orca.tar"
   "${engine}" save -o "${archive}" "${ORCA_IMAGE}"
   kind load image-archive "${archive}" --name "${cluster}"
@@ -244,8 +298,19 @@ fi
 # -----------------------------------------------------------------------------
 # Render manifests to a temp dir.
 
+# Pod anti-affinity defaults to strict for kind installs (the kind
+# cluster has 3 worker nodes by spec, so the strict requirement
+# matches production topology and surfaces scheduling regressions
+# fast). For non-kind installs the default is preferred so clusters
+# with fewer than 3 schedulable nodes can still roll out cleanly.
+if is_kind_context; then
+  require_anti_affinity="true"
+else
+  require_anti_affinity="false"
+fi
+
 rendered="$(mktemp -d)"
-trap 'rm -rf "${rendered}"' EXIT
+cleanup_paths+=("${rendered}")
 rendered_orca="${rendered}/orca"
 rendered_dev="${rendered}/dev"
 mkdir -p "${rendered_orca}" "${rendered_dev}"
@@ -258,6 +323,7 @@ log "Rendering orca manifests"
     --set "Image=${ORCA_IMAGE}" \
     --set "ImagePullPolicy=IfNotPresent" \
     --set "TargetReplicas=${REPLICAS}" \
+    --set "RequireAntiAffinity=${require_anti_affinity}" \
     --set "OriginID=${origin_id}" \
     --set "OriginDriver=${ORIGIN_DRIVER}" \
     --set "AzureAccount=${azure_account}" \
@@ -284,8 +350,6 @@ log "Rendering dev emulator manifests (Azurite + LocalStack)"
     --set "CachestoreBucket=orca-cache" \
     --set "OriginBucket=orca-origin" \
     --set "AzuriteContainer=orca-test" \
-    --set "AzuriteNodePort=30100" \
-    --set "LocalstackNodePort=30200" \
 )
 
 # -----------------------------------------------------------------------------
@@ -338,6 +402,8 @@ fi
 # idempotent against re-runs that change credentials.
 
 log "Creating/updating orca-credentials Secret"
+# Labels match the manifest convention so the Secret is also covered
+# by the label-selector uninstall path below.
 kubectl_ctx -n "${NAMESPACE}" create secret generic orca-credentials \
   --from-literal=ORCA_CACHESTORE_S3_ACCESS_KEY=test \
   --from-literal=ORCA_CACHESTORE_S3_SECRET_KEY=test \
@@ -345,6 +411,8 @@ kubectl_ctx -n "${NAMESPACE}" create secret generic orca-credentials \
   --from-literal=ORCA_AWSS3_SECRET_KEY=test \
   --from-literal=ORCA_AZUREBLOB_ACCOUNT_KEY="${azure_key}" \
   --dry-run=client -o yaml \
+  | kubectl_ctx label --local -f - --dry-run=client -o yaml \
+      app.kubernetes.io/name=orca \
   | kubectl_ctx apply -f -
 
 # -----------------------------------------------------------------------------

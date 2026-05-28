@@ -96,6 +96,17 @@ func runRoundtrip(ctx context.Context, g *globalFlags, o *roundtripOpts) error {
 		o.repeat = 1
 	}
 
+	// Auto-open kubectl port-forwards to svc/orca, svc/azurite,
+	// svc/localstack as needed. No-op for any endpoint that is
+	// already bound on localhost (user-managed port-forward, sibling
+	// orcadev). See ensurePortForwards / derivePortForwardSpecs.
+	cleanup, err := ensurePortForwards(ctx, g)
+	if err != nil {
+		return err
+	}
+
+	defer cleanup()
+
 	oc, err := newOriginClient(ctx, g)
 	if err != nil {
 		return err
@@ -106,15 +117,6 @@ func runRoundtrip(ctx context.Context, g *globalFlags, o *roundtripOpts) error {
 			return err
 		}
 	}
-
-	// Auto-start a kubectl port-forward to svc/orca if needed.
-	// No-op if an operator-managed port-forward is already up.
-	cleanup, err := ensureEdgeReachable(ctx, g)
-	if err != nil {
-		return err
-	}
-
-	defer cleanup()
 
 	edge := newEdgeClient(g.orcaURL, g.timeout)
 

@@ -39,6 +39,68 @@ func TestProductionManifestsRender(t *testing.T) {
 	)
 }
 
+// TestDeploymentAntiAffinityModes asserts the strict vs. relaxed
+// anti-affinity render paths controlled by the RequireAntiAffinity
+// template knob. Kind installs render `required...`; non-kind
+// installs render `preferred...`. This keeps small dev clusters
+// schedulable while preserving the strict topology on kind.
+func TestDeploymentAntiAffinityModes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		setValue  string
+		wantField string
+		denyField string
+	}{
+		{
+			name:      "required",
+			setValue:  "true",
+			wantField: "requiredDuringSchedulingIgnoredDuringExecution",
+			denyField: "preferredDuringSchedulingIgnoredDuringExecution",
+		},
+		{
+			name:      "preferred",
+			setValue:  "false",
+			wantField: "preferredDuringSchedulingIgnoredDuringExecution",
+			denyField: "requiredDuringSchedulingIgnoredDuringExecution",
+		},
+	}
+
+	root := repoRoot(t)
+	templatesDir := filepath.Join(root, "deploy", "orca")
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			data := productionData()
+			data["RequireAntiAffinity"] = tt.setValue
+
+			outputDir := t.TempDir()
+			if err := render.Render(templatesDir, outputDir, data); err != nil {
+				t.Fatalf("render.Render: %v", err)
+			}
+
+			raw, err := os.ReadFile(filepath.Join(outputDir, "04-deployment.yaml"))
+			if err != nil {
+				t.Fatalf("read deployment: %v", err)
+			}
+
+			body := string(raw)
+			if !strings.Contains(body, tt.wantField) {
+				t.Errorf("RequireAntiAffinity=%q: expected %q in rendered deployment\n---\n%s",
+					tt.setValue, tt.wantField, body)
+			}
+
+			if strings.Contains(body, tt.denyField) {
+				t.Errorf("RequireAntiAffinity=%q: did not expect %q in rendered deployment\n---\n%s",
+					tt.setValue, tt.denyField, body)
+			}
+		})
+	}
+}
+
 // TestDevManifestsRender renders the LocalStack + Azurite manifests
 // used by the Kind dev harness. The previous one-shot bucket-init
 // Jobs (02-init-job.yaml.tmpl, 04-azurite-init.yaml.tmpl) were
@@ -54,6 +116,11 @@ func TestDevManifestsRender(t *testing.T) {
 
 	renderAndValidate(t, templatesDir, devData(),
 		expectKindsAtLeastOnce("Deployment", "Service", "ConfigMap"),
+		// Dev emulator Services must be ClusterIP with no nodePort
+		// fields. orcadev port-forwards everywhere, so fixed
+		// NodePorts are an AKS / shared-cluster footgun we
+		// deliberately removed.
+		expectAllServicesClusterIP(),
 	)
 }
 
@@ -252,6 +319,49 @@ func (v kindsAtLeastOnce) skipDir() string { return "" }
 func expectKindsAtLeastOnce(kinds ...string) Validator {
 	return kindsAtLeastOnce{kinds: kinds}
 }
+
+// allServicesClusterIP asserts every rendered Service is ClusterIP
+// (or has an empty type, which is also ClusterIP per Kubernetes
+// defaulting) and carries no nodePort fields. Dev orcadev relies on
+// `kubectl port-forward`, not NodePort, so a NodePort rendering would
+// silently regress the AKS / shared-cluster install path.
+type allServicesClusterIP struct{}
+
+func (allServicesClusterIP) Validate(t *testing.T, docs []renderedDoc) {
+	t.Helper()
+
+	for _, d := range docs {
+		if k, _ := d.Doc["kind"].(string); k != "Service" {
+			continue
+		}
+
+		spec, _ := d.Doc["spec"].(map[string]any)
+		if spec == nil {
+			t.Errorf("%s doc %d: Service has no spec", d.SourcePath, d.Index)
+			continue
+		}
+
+		if svcType, _ := spec["type"].(string); svcType != "" && svcType != "ClusterIP" {
+			t.Errorf("%s doc %d: Service type %q; want ClusterIP", d.SourcePath, d.Index, svcType)
+		}
+
+		ports, _ := spec["ports"].([]any)
+		for i, p := range ports {
+			pm, _ := p.(map[string]any)
+			if pm == nil {
+				continue
+			}
+
+			if _, hasNodePort := pm["nodePort"]; hasNodePort {
+				t.Errorf("%s doc %d: Service ports[%d] has nodePort; expected ClusterIP-only", d.SourcePath, d.Index, i)
+			}
+		}
+	}
+}
+
+func (allServicesClusterIP) skipDir() string { return "" }
+
+func expectAllServicesClusterIP() Validator { return allServicesClusterIP{} }
 
 type dirSkipper struct{ name string }
 

@@ -192,21 +192,20 @@ func runBench(ctx context.Context, g *globalFlags, o *benchOpts) error {
 		return fmt.Errorf("--output must be 'text' or 'json'")
 	}
 
-	oc, err := newOriginClient(ctx, g)
-	if err != nil {
-		return err
-	}
-
-	// Spin up an auto-managed kubectl port-forward to svc/orca if
-	// --orca-url is the dev default and the port is unreachable.
-	// Cleanup runs on subcommand return; if the operator already
-	// has their own port-forward this is a no-op.
-	cleanup, err := ensureEdgeReachable(ctx, g)
+	// Auto-open kubectl port-forwards to svc/orca, svc/azurite,
+	// svc/localstack as needed. No-op for any endpoint that is
+	// already bound on localhost. See ensurePortForwards.
+	cleanup, err := ensurePortForwards(ctx, g)
 	if err != nil {
 		return err
 	}
 
 	defer cleanup()
+
+	oc, err := newOriginClient(ctx, g)
+	if err != nil {
+		return err
+	}
 
 	edge := newEdgeClient(g.orcaURL, g.timeout)
 

@@ -102,10 +102,11 @@ func runScenario(ctx context.Context, g *globalFlags, o *scenarioOpts, name stri
 		return fmt.Errorf("--output must be 'text' or 'json'")
 	}
 
-	// Auto-start a kubectl port-forward to svc/orca if needed.
-	// Lifted to the parent so every scenario's edgeClient sees
-	// the same forwarded socket without re-probing.
-	cleanup, err := ensureEdgeReachable(ctx, g)
+	// Auto-open kubectl port-forwards to svc/orca, svc/azurite,
+	// svc/localstack as needed. Lifted to the parent so every
+	// scenario's edge + origin + cachestore clients share one
+	// forwarded socket without re-probing.
+	cleanup, err := ensurePortForwards(ctx, g)
 	if err != nil {
 		return err
 	}

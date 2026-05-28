@@ -24,7 +24,7 @@
 //	bench      - parallel GET throughput / latency benchmark with
 //	             JSON output and log-spaced latency histogram
 //	scenario   - canned end-to-end scenarios (cold-warm, range-stress,
-//	             multi-object, etag-change, empty-object, range-large)
+//	             empty-object, etag-change)
 //
 // All subcommands accept --config <path> to point at an orca YAML
 // (the same shape internal/orca/config consumes); per-flag overrides

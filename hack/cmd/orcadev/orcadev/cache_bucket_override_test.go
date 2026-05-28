@@ -33,6 +33,10 @@ func TestRunCacheInspect_BucketOverrideReachesOrigin(t *testing.T) {
 	g := defaultGlobalFlags()
 	g.originBucket = "default-bucket"
 	g.originID = "origin-id"
+	// runCacheInspect now opens port-forwards before constructing
+	// the origin client; this test doesn't need (or want) kubectl
+	// involvement so we suppress the auto-forward entirely.
+	g.autoPortForward = false
 
 	o := &cacheInspectOpts{
 		bucket: "requested-bucket",

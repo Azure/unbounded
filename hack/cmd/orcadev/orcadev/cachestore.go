@@ -45,7 +45,16 @@ type cachestoreClient struct {
 // flags. Mirrors the orca cachestore driver's SDK configuration:
 // path-style addressing, checksum opt-out for LocalStack 3.8
 // compatibility, static credentials.
+//
+// Indirected through a package-level variable so tests can swap in
+// a stub without standing up a real S3 backend.
+var newCachestoreClientFn = newCachestoreClientImpl
+
 func newCachestoreClient(ctx context.Context, g *globalFlags) (*cachestoreClient, error) {
+	return newCachestoreClientFn(ctx, g)
+}
+
+func newCachestoreClientImpl(ctx context.Context, g *globalFlags) (*cachestoreClient, error) {
 	if g.cachestoreBucket == "" {
 		return nil, fmt.Errorf("cachestore: --cachestore-bucket required")
 	}
