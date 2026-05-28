@@ -69,7 +69,12 @@ func TestValidateRejectsReservedDaemonGroup(t *testing.T) {
 	}
 }
 
-func storeControllerCertificateForTest(t *testing.T, opts ControllerCertificateOptions, certPEM []byte, keyPEM []byte) {
+func storeControllerCertificateForTest(
+	t *testing.T,
+	opts ControllerCertificateOptions,
+	certPEM []byte,
+	keyPEM []byte,
+) {
 	t.Helper()
 
 	store, err := newCertificateStore(opts)
