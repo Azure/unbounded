@@ -17,7 +17,7 @@ pub use group::{PoolGroup, ShardDescriptor, ShardRouter};
 pub use null::NullBlockStore;
 pub use pool::Pool;
 pub use stream::{PageGuard, ReadStream};
-pub use traits::{BlockStore, BufferPool, Req, Transport};
+pub use traits::{BlockStore, BufferPool, PageStream, Req, Transport};
 pub use types::{
     Backing, BulkRef, Error, NodeId, PageRef, PeerId, PoolConfig, StripeKey, TraceCtx,
 };

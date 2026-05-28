@@ -550,7 +550,7 @@ func TestBuildExpectedWireGuardRoutes_UsesFamilyAwareGatewayForIPv6Network(t *te
 		},
 	}
 
-	_, ipv6Routes := BuildExpectedWireGuardRoutes(peers, nodes)
+	_, ipv6Routes := BuildExpectedWireGuardRoutes(peers, nodes, InterfaceNames{WireGuardPrefix: "wg", Geneve: "geneve0", VXLAN: "vxlan0", IPIP: "ipip0"})
 
 	var (
 		networkRoute *ExpectedRoute
@@ -600,7 +600,7 @@ func TestBuildExpectedWireGuardRoutes_GatewayPeerUsesPeerScopedIPv6FallbackGatew
 		},
 	}
 
-	_, ipv6Routes := BuildExpectedWireGuardRoutes(peers, map[string]Node{})
+	_, ipv6Routes := BuildExpectedWireGuardRoutes(peers, map[string]Node{}, InterfaceNames{WireGuardPrefix: "wg", Geneve: "geneve0", VXLAN: "vxlan0", IPIP: "ipip0"})
 
 	var siteRoute *ExpectedRoute
 

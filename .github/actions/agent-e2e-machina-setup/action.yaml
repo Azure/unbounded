@@ -1,0 +1,16 @@
+name: Set up agent e2e machina resources
+description: Install Machine CRDs and start/validate the machina controller for agent e2e tests.
+runs:
+  using: composite
+  steps:
+    - name: Install Machine CRD
+      shell: bash
+      run: python3 ./hack/agent/e2e-kind/e2e.py --verbose install-machine-crd
+
+    - name: Start machina controller
+      shell: bash
+      run: python3 ./hack/agent/e2e-kind/e2e.py --verbose start-machina-controller
+
+    - name: Validate machina controller
+      shell: bash
+      run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-machina-controller

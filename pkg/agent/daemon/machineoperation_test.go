@@ -86,7 +86,7 @@ func TestMachinaMachineOperationReconcilerDispatchesTarget(t *testing.T) {
 	}
 }
 
-func TestMachinaMachineOperationReconcilerSkipsTerminalAndFailsUnsupported(t *testing.T) {
+func TestMachinaMachineOperationReconcilerSkipsTerminalAndIgnoresUnsupported(t *testing.T) {
 	t.Parallel()
 
 	terminal := &machinav1alpha3.MachineOperation{
@@ -127,12 +127,8 @@ func TestMachinaMachineOperationReconcilerSkipsTerminalAndFailsUnsupported(t *te
 		t.Fatalf("get unsupported MachineOperation: %v", err)
 	}
 
-	if updated.Status.Phase != machinav1alpha3.OperationPhaseFailed {
-		t.Fatalf("unsupported phase = %s, want %s", updated.Status.Phase, machinav1alpha3.OperationPhaseFailed)
-	}
-
-	if updated.Status.Conditions[0].Reason != "UnsupportedOperation" {
-		t.Fatalf("unsupported reason = %s, want UnsupportedOperation", updated.Status.Conditions[0].Reason)
+	if updated.Status.Phase != "" {
+		t.Fatalf("unsupported phase = %s, want empty", updated.Status.Phase)
 	}
 }
 
@@ -255,7 +251,7 @@ func TestMachinaMachineOperationReconcilerSkipsNonMatchingWatchObjects(t *testin
 	}
 }
 
-func TestMachinaMachineOperationReconcilerMapsUnsupportedMatchingOperation(t *testing.T) {
+func TestMachinaMachineOperationReconcilerIgnoresUnsupportedMatchingOperation(t *testing.T) {
 	t.Parallel()
 
 	reconciler := newTestMachinaMachineOperationReconciler(t, fakeMachineOperationClient())
@@ -268,13 +264,8 @@ func TestMachinaMachineOperationReconcilerMapsUnsupportedMatchingOperation(t *te
 	}
 
 	requests := reconciler.mapMachineOperation(context.Background(), op)
-	if len(requests) != 1 {
-		t.Fatalf("requests = %#v, want one", requests)
-	}
-
-	req, ok := requests[0].machineOperationRequest()
-	if !ok || req.Name != "unsupported" {
-		t.Fatalf("request = %#v", requests[0])
+	if len(requests) != 0 {
+		t.Fatalf("requests = %#v, want nil", requests)
 	}
 }
 

@@ -120,7 +120,13 @@ func (lm *LinkManager) EnsureGeneveInterfaceWithRemote(vni uint32, dstPort int, 
 // EnsureGeneveInterface creates a GENEVE interface if it does not already
 // exist. The interface is created in point-to-multipoint mode (no fixed
 // remote) with learning disabled so that FDB entries are managed explicitly.
-func (lm *LinkManager) EnsureGeneveInterface(vni uint32, dstPort int) error {
+//
+// If mac is non-nil it is applied as the hardware address at creation
+// time via LinkAttrs.HardwareAddr. This avoids a race where LinkAdd
+// returns before the kernel finishes async MAC assignment and a
+// subsequent LinkSetHardwareAddr is silently dropped, leaving the
+// device with a kernel-randomized MAC.
+func (lm *LinkManager) EnsureGeneveInterface(vni uint32, dstPort int, mac net.HardwareAddr) error {
 	existing, err := netlink.LinkByName(lm.ifaceName)
 	if err == nil {
 		// If the existing interface is not in external/FlowBased mode (or has
@@ -139,7 +145,8 @@ func (lm *LinkManager) EnsureGeneveInterface(vni uint32, dstPort int) error {
 	klog.Infof("Creating GENEVE interface %s (port %d, external/FlowBased)", lm.ifaceName, dstPort)
 	geneveLink := &netlink.Geneve{
 		LinkAttrs: netlink.LinkAttrs{
-			Name: lm.ifaceName,
+			Name:         lm.ifaceName,
+			HardwareAddr: mac,
 		},
 		Dport:     uint16(dstPort),
 		FlowBased: true,
@@ -166,7 +173,13 @@ func (lm *LinkManager) EnsureGeneveInterface(vni uint32, dstPort int) error {
 // range used for outbound VXLAN packets. A narrow range reduces the number
 // of distinct flows seen by cloud platform networking, helping avoid VM flow
 // table limits on platforms like Azure or GCP.
-func (lm *LinkManager) EnsureVXLANInterface(dstPort, srcPortLow, srcPortHigh int) error {
+//
+// If mac is non-nil it is applied as the hardware address at creation
+// time via LinkAttrs.HardwareAddr. This avoids a race where LinkAdd
+// returns before the kernel finishes async MAC assignment and a
+// subsequent LinkSetHardwareAddr is silently dropped, leaving the
+// device with a kernel-randomized MAC.
+func (lm *LinkManager) EnsureVXLANInterface(dstPort, srcPortLow, srcPortHigh int, mac net.HardwareAddr) error {
 	_, err := netlink.LinkByName(lm.ifaceName)
 	if err == nil {
 		return nil
@@ -175,7 +188,8 @@ func (lm *LinkManager) EnsureVXLANInterface(dstPort, srcPortLow, srcPortHigh int
 	klog.Infof("Creating VXLAN interface %s (port %d, srcPorts %d-%d, external/FlowBased)", lm.ifaceName, dstPort, srcPortLow, srcPortHigh)
 	vxlanLink := &netlink.Vxlan{
 		LinkAttrs: netlink.LinkAttrs{
-			Name: lm.ifaceName,
+			Name:         lm.ifaceName,
+			HardwareAddr: mac,
 		},
 		FlowBased: true,
 		Learning:  false,

@@ -136,7 +136,7 @@ type MachineSpec struct {
 
 	// Provider identifies the external control provider for this machine.
 	// +optional
-	// +kubebuilder:validation:Enum=AzureVM;OCIInstance
+	// +kubebuilder:validation:MinLength=1
 	Provider string `json:"provider,omitempty"`
 
 	// ProviderID identifies the underlying infrastructure resource for this

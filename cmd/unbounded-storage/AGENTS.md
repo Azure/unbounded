@@ -214,6 +214,32 @@ Required properties of any DST mock or workload code:
   invariant function takes `&RunReport` and returns
   `Result<(), TestCaseError>`; this keeps shrinking output legible.
 
+### Re-running a specific DST failure
+
+A DST run is fully determined by `(seed, Workload)`, so you can
+iterate on one failing case without re-running the whole suite:
+
+- Proptest writes shrunk failures to `tests/<area>/tests.proptest-regressions`
+  and replays them before any novel cases. To iterate on just those,
+  filter by the failing test name and cap novel generation, e.g.:
+
+  ```
+  PROPTEST_CASES=1 cargo test --manifest-path cmd/unbounded-storage/Cargo.toml \
+      --locked --all-targets --test dst \
+      bufferpool::tests::invariant_single_flight_per_page
+  ```
+
+  The persisted regression(s) still replay; `PROPTEST_CASES=1`
+  suppresses the rest of the sweep.
+
+- For a one-off seed (e.g. from a failure not yet in the regressions
+  file, or to bisect under a debugger), promote it to a hand-rolled
+  `#[test] fn regression_*` next to the proptest that calls
+  `run_workload(seed, w)` with the seed and `Workload` literal from
+  the shrunk output. See `regression_freelist_deadlock_under_faults`
+  in `tests/bufferpool/tests.rs` for the pattern. Keep the test
+  committed once the bug is fixed so the case is a permanent guard.
+
 ### Adding a new subsystem
 
 1. Add `pub mod <area>;` to `src/lib.rs` and create `src/<area>/mod.rs`

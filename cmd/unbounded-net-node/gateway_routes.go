@@ -5,6 +5,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -643,4 +645,65 @@ func dedupeStrings(values []string) []string {
 	}
 
 	return setToSortedStrings(seen)
+}
+
+// gatewayAdvertHashActive returns a deterministic content hash of the
+// inputs to the active-branch "Gateway route advertisement" publish.
+// The hash changes whenever the pool, the local route set, the merged
+// route set, or the assignment count change. Used to dedupe the
+// periodic log line in site_watch_reconcile.
+//
+// json.Marshal sorts map keys, so the canonical form is stable across
+// reconcile ticks despite map iteration being unordered in Go.
+func gatewayAdvertHashActive(poolName string, localRoutes, mergedRoutes map[string]unboundednetv1alpha1.GatewayNodeRoute, assignmentCount int) string {
+	payload := struct {
+		Pool            string                                           `json:"pool"`
+		LocalRoutes     map[string]unboundednetv1alpha1.GatewayNodeRoute `json:"localRoutes"`
+		MergedRoutes    map[string]unboundednetv1alpha1.GatewayNodeRoute `json:"mergedRoutes"`
+		AssignmentCount int                                              `json:"assignmentCount"`
+	}{
+		Pool:            poolName,
+		LocalRoutes:     localRoutes,
+		MergedRoutes:    mergedRoutes,
+		AssignmentCount: assignmentCount,
+	}
+
+	return canonicalHash(payload)
+}
+
+// gatewayAdvertHashSkipped returns a deterministic content hash of the
+// inputs that determine why the publish was skipped.
+func gatewayAdvertHashSkipped(hasDynamicClient bool, localGatewayPools []string) string {
+	pools := append([]string(nil), localGatewayPools...)
+	sort.Strings(pools)
+
+	payload := struct {
+		HasDynamicClient  bool     `json:"hasDynamicClient"`
+		LocalGatewayPools []string `json:"localGatewayPools"`
+	}{
+		HasDynamicClient:  hasDynamicClient,
+		LocalGatewayPools: pools,
+	}
+
+	return canonicalHash(payload)
+}
+
+// canonicalHash sha256-hex-encodes the json.Marshal of v. Used by the
+// gatewayAdvert hash helpers above to produce a stable string key
+// suitable for equality comparison across reconcile ticks. On marshal
+// failure (extremely unlikely for our payloads, which are stdlib
+// types + bare structs) we return a sentinel that compares unequal to
+// any past or future hash, causing the dedupe to log once on this
+// tick and skip the cached comparison until inputs change again.
+func canonicalHash(v any) string {
+	buf, err := json.Marshal(v)
+	if err != nil {
+		// Sentinel: include the error text so two consecutive ticks
+		// with the same json.Marshal failure still dedupe to one log.
+		return "marshal-error:" + err.Error()
+	}
+
+	sum := sha256.Sum256(buf)
+
+	return hex.EncodeToString(sum[:])
 }

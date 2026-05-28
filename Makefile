@@ -40,6 +40,9 @@ MACHINA_IMAGE ?= $(CONTAINER_REGISTRY)/machina:$(VERSION)
 MACHINE_OPS_CONTROLLER_BIN=bin/machine-ops-controller
 MACHINE_OPS_CONTROLLER_CMD=./cmd/machine-ops-controller
 MACHINE_OPS_CONTROLLER_IMAGE ?= $(CONTAINER_REGISTRY)/machine-ops-controller:$(VERSION)
+MACHINE_OPS_CONTROLLER_NAME ?= machine-ops-controller
+MACHINE_OPS_PROVIDER ?=
+MACHINE_OPS_SITE ?=
 
 METALMAN_BIN=bin/metalman
 METALMAN_CMD=./cmd/metalman
@@ -67,16 +70,6 @@ UNROUTE_CMD=./cmd/unroute
 UNBOUNDED_STORAGE_BIN=bin/unbounded-storage
 UNBOUNDED_STORAGE_CRATE=./cmd/unbounded-storage
 CARGO ?= cargo
-
-# Mercury (mercury-hpc) is a native dependency of the unbounded-storage crate.
-# We build a pinned version from source into a project-local prefix; the
-# unbounded-storage build.rs honours $MERCURY_PKG_CONFIG_PATH so it picks up
-# our local install ahead of any system copy.
-MERCURY_VERSION ?= v2.4.1
-MERCURY_PREFIX  ?= $(CURDIR)/tmp/mercury-prefix
-MERCURY_SRC     ?= $(CURDIR)/tmp/mercury-src
-MERCURY_PC_FILE := $(MERCURY_PREFIX)/lib/pkgconfig/mercury.pc
-MERCURY_INSTALL_SCRIPT := hack/scripts/install-mercury.sh
 
 # Version is derived from the latest git tag. Override with: make VERSION=v1.0.0
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
@@ -149,7 +142,7 @@ REACT_DEV ?= false
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-manifests
 .PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-net-controller-local image-net-node-local images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
-.PHONY: unbounded-storage unbounded-storage-build unbounded-storage-test unbounded-storage-check mercury mercury-clean
+.PHONY: unbounded-storage unbounded-storage-build bench unbounded-storage-test unbounded-storage-check unbounded-storage-model-check
 
 ##@ General
 
@@ -199,10 +192,10 @@ help: ## Show this help
 	@echo ""
 	@echo "Rust Binaries:"
 	@echo "  unbounded-storage | unbounded-storage-build  Build unbounded-storage (with/without test)"
+	@echo "  bench                            Build the bench tool (excluded from images)"
 	@echo "  unbounded-storage-test           Run cargo tests for unbounded-storage"
 	@echo "  unbounded-storage-check          Run cargo check for unbounded-storage"
-	@echo "  mercury                          Build pinned Mercury into \$$(MERCURY_PREFIX)"
-	@echo "  mercury-clean                    Remove the local Mercury prefix and source tree"
+	@echo "  unbounded-storage-model-check    Run TLC on the CoW B+tree crash-consistency model"
 	@echo ""
 	@echo "Container Images (local, single-arch):"
 	@echo "  image-inventory-all-local        Build all local inventory container images"
@@ -482,40 +475,46 @@ unroute: test unroute-build ## Build the unroute utility (implies test)
 
 ##@ Rust Binaries
 
-# Mercury env: prepend our local prefix so cargo/build.rs find the right .pc
-# files and so the resulting binaries/tests can dlopen libmercury at runtime.
-# Targets that invoke cargo must export these via `$(UNBOUNDED_STORAGE_ENV)`.
-UNBOUNDED_STORAGE_ENV = \
-	MERCURY_PKG_CONFIG_PATH="$(MERCURY_PREFIX)/lib/pkgconfig" \
-	PKG_CONFIG_PATH="$(MERCURY_PREFIX)/lib/pkgconfig:$${PKG_CONFIG_PATH}" \
-	LD_LIBRARY_PATH="$(MERCURY_PREFIX)/lib:$${LD_LIBRARY_PATH}"
+unbounded-storage-check: ## Run cargo check for unbounded-storage
+	$(CARGO) check --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --locked --all-targets
 
-mercury: $(MERCURY_PC_FILE) ## Build pinned Mercury into $(MERCURY_PREFIX) (idempotent)
+unbounded-storage-test: ## Run cargo tests for unbounded-storage
+	$(CARGO) test --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --locked --all-targets
 
-# The install script is itself idempotent: if mercury.pc already advertises the
-# pinned version it exits immediately. We still gate on the .pc file as the
-# Make-level sentinel so a cached prefix avoids invoking the script at all.
-$(MERCURY_PC_FILE): $(MERCURY_INSTALL_SCRIPT)
-	MERCURY_VERSION=$(MERCURY_VERSION) \
-	MERCURY_PREFIX=$(MERCURY_PREFIX) \
-	MERCURY_SRC=$(MERCURY_SRC) \
-		$(MERCURY_INSTALL_SCRIPT)
-
-mercury-clean: ## Remove the local Mercury prefix and source tree
-	rm -rf "$(MERCURY_PREFIX)" "$(MERCURY_SRC)"
-
-unbounded-storage-check: mercury ## Run cargo check for unbounded-storage
-	$(UNBOUNDED_STORAGE_ENV) $(CARGO) check --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --locked --all-targets
-
-unbounded-storage-test: mercury ## Run cargo tests for unbounded-storage
-	$(UNBOUNDED_STORAGE_ENV) $(CARGO) test --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --locked --all-targets
-
-unbounded-storage-build: mercury ## Build the unbounded-storage binary (no test)
-	$(UNBOUNDED_STORAGE_ENV) $(CARGO) build --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --release --locked
+unbounded-storage-build: ## Build the unbounded-storage binary (no test)
+	$(CARGO) build --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --release --locked
 	@mkdir -p $(dir $(UNBOUNDED_STORAGE_BIN))
 	cp $(UNBOUNDED_STORAGE_CRATE)/target/release/unbounded-storage $(UNBOUNDED_STORAGE_BIN)
 
 unbounded-storage: unbounded-storage-test unbounded-storage-build ## Build the unbounded-storage binary (implies test)
+
+bench: ## Build the bench tool (excluded from images)
+	$(CARGO) build --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --release --locked --bin bench
+	@mkdir -p $(dir $(UNBOUNDED_STORAGE_BIN))
+	cp $(UNBOUNDED_STORAGE_CRATE)/target/release/bench bin/bench
+
+# TLA+ tooling for the unbounded-storage CoW B+tree crash-consistency model.
+# tla2tools.jar is fetched on demand into tmp/ (gitignored).  Override
+# TLA_TOOLS_JAR to use a locally installed copy.
+#
+# The URL is pinned to a tagged release (not `latest/download`) and the
+# downloaded artifact is verified against TLA_TOOLS_SHA256 so model-check
+# runs are reproducible across machines and over time.
+TLA_TOOLS_JAR ?= tmp/tla2tools.jar
+TLA_TOOLS_VERSION ?= v1.8.0
+TLA_TOOLS_URL ?= https://github.com/tlaplus/tlaplus/releases/download/$(TLA_TOOLS_VERSION)/tla2tools.jar
+TLA_TOOLS_SHA256 ?= 71546dff3897a01b0ee4fa64135d9f5e9384d2b7e47b3cc20a16b655b0eb4f86
+COW_MODEL_DIR := cmd/unbounded-storage/models/copy-on-write
+
+$(TLA_TOOLS_JAR):
+	@mkdir -p $(dir $(TLA_TOOLS_JAR))
+	@echo "Downloading tla2tools.jar ($(TLA_TOOLS_VERSION)) -> $(TLA_TOOLS_JAR)"
+	@curl -fsSL -o $(TLA_TOOLS_JAR) $(TLA_TOOLS_URL)
+	@echo "$(TLA_TOOLS_SHA256)  $(TLA_TOOLS_JAR)" | sha256sum -c -
+
+unbounded-storage-model-check: $(TLA_TOOLS_JAR) ## Run TLC on the CoW B+tree crash-consistency model
+	@command -v java >/dev/null 2>&1 || { echo "java is required to run TLC" >&2; exit 1; }
+	cd $(COW_MODEL_DIR) && java -XX:+UseParallelGC -cp $(CURDIR)/$(TLA_TOOLS_JAR) tlc2.TLC -workers auto -config CowBtreeCrash.cfg CowBtreeCrash.tla
 
 ##@ Container Images
 #
@@ -658,7 +657,10 @@ machine-ops-manifests: ## Render machine-ops-controller manifests into deploy/ma
 		--templates-dir $(MACHINE_OPS_MANIFEST_TEMPLATES_DIR) \
 		--output-dir $(MACHINE_OPS_MANIFEST_RENDERED_DIR) \
 		--set Namespace=$(MACHINE_OPS_NAMESPACE) \
+		--set ControllerName=$(MACHINE_OPS_CONTROLLER_NAME) \
 		--set ControllerImage=$(MACHINE_OPS_CONTROLLER_IMAGE) \
+		--set Provider=$(MACHINE_OPS_PROVIDER) \
+		--set Site=$(MACHINE_OPS_SITE) \
 		--set APIServerEndpoint=$(MACHINE_OPS_API_SERVER_ENDPOINT)
 	@echo "Rendered machine-ops manifests into $(MACHINE_OPS_MANIFEST_RENDERED_DIR) (image: $(MACHINE_OPS_CONTROLLER_IMAGE))"
 

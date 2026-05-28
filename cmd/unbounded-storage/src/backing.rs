@@ -3,7 +3,7 @@
 
 use std::fmt;
 
-use unbounded_storage::bufferpool::Backing;
+use crate::bufferpool::Backing;
 
 /// 2 MiB hugepage size in bytes. Hard-coded; 1 GiB hugepages are
 /// intentionally out of scope.

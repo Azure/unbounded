@@ -12,7 +12,7 @@ use std::task::{Context, Poll};
 use crate::bufferpool::free_list::FreeList;
 use crate::bufferpool::inflight::{PageSlot, SlotState, StripeFetch};
 use crate::bufferpool::stream::{LocalBoxFuture, ReadStream, StreamSrc};
-use crate::bufferpool::traits::{BlockStore, BufferPool, Req, Transport};
+use crate::bufferpool::traits::{BlockStore, BufferPool, PageStream, Req, Transport};
 use crate::bufferpool::types::{Backing, BulkRef, Error, PageRef, PoolConfig, StripeKey};
 
 /// One per shard. Per the design's runtime model, a single `Pool`
@@ -55,7 +55,7 @@ where
     /// `blockstore.register_pages(...)` exactly once. The
     /// `Transport` is expected to have been bound to the same
     /// `backing` out-of-band by the embedder before this call (e.g.
-    /// via `mercury::Class::register_backing`); the pool no longer
+    /// via `fabric::Fabric::register_backing`); the pool no longer
     /// drives that handshake. No async I/O happens here; on a real
     /// RDMA `Transport` the synchronous `ibv_reg_mr` is the
     /// dominant cost (see the design's "Page registration"
@@ -81,7 +81,7 @@ where
             return Err(Error::BadConfig("backing.base is null"));
         }
 
-        blockstore.register_pages(backing.base, backing.page_size, backing.page_count)?;
+        blockstore.register_pages(&backing)?;
 
         let page_count_u32 = backing.page_count as u32;
         let page_size = backing.page_size;
@@ -536,7 +536,9 @@ where
                             offset: stripe_off,
                             len: inner.page_size as u32,
                         };
-                        inner.transport.bulk_get(req, bulk, dst).await?;
+                        let dsts: [PageRef; 1] = [dst];
+                        let stream = inner.transport.bulk_get(req, bulk, &dsts);
+                        drive_single_page(stream).await?;
                     }
                     Ok(hit)
                 }
@@ -773,4 +775,38 @@ enum Outcome {
     Ready,
     Error(Error),
     Retry,
+}
+
+// ---------------------------------------------------------------------------
+// PageStream -> single-page adapter.
+// ---------------------------------------------------------------------------
+
+/// Drive a transport stream that the pool issued for a single
+/// `dsts: &[PageRef]` of length 1. Resolves `Ok(())` on the first
+/// `Some(Ok(_))`, propagates `Some(Err(_))`, and surfaces a
+/// premature `None` as `Error::Transport`.
+fn drive_single_page<S: PageStream>(stream: S) -> DriveSinglePage<S> {
+    DriveSinglePage { stream }
+}
+
+struct DriveSinglePage<S: PageStream> {
+    stream: S,
+}
+
+impl<S: PageStream> Future for DriveSinglePage<S> {
+    type Output = Result<(), Error>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: standard structural pin projection through the
+        // single `stream` field; we never move out of `self`.
+        let stream = unsafe { self.map_unchecked_mut(|s| &mut s.stream) };
+        match stream.poll_next(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Some(Ok(_page))) => Poll::Ready(Ok(())),
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(e)),
+            Poll::Ready(None) => Poll::Ready(Err(Error::from(
+                "transport stream ended without delivering page",
+            ))),
+        }
+    }
 }
