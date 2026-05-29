@@ -64,6 +64,9 @@ func (c *daemonCSRClaimChecker) bootstrapTokenMayClaimNode(
 	if err := c.Get(ctx, client.ObjectKey{Namespace: metav1.NamespaceSystem, Name: secretName}, &token); err != nil {
 		return false, client.IgnoreNotFound(err)
 	}
+	if token.Type != corev1.SecretTypeBootstrapToken {
+		return false, nil
+	}
 
 	siteName := strings.TrimSpace(token.Labels[unboundedv1alpha3.MachineSiteLabelKey])
 	isDefaultToken := strings.EqualFold(strings.TrimSpace(token.Labels[defaultBootstrapTokenLabel]), "true")
@@ -71,6 +74,8 @@ func (c *daemonCSRClaimChecker) bootstrapTokenMayClaimNode(
 		return false, nil
 	}
 
+	// Follow-up: consider removing default-token authorization so daemon
+	// bootstrap is always explicitly site-scoped.
 	// Bootstrap tokens are site-scoped credentials, not single-Machine leases.
 	// During the token's valid time window, multiple nodes in that site may use it
 	// to obtain daemon-controller credentials and create or bind their Machines.

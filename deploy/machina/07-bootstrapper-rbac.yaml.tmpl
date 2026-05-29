@@ -1,6 +1,7 @@
 ---
 # Grant daemon controller certificates the permissions required by the
-# unbounded-agent daemon. The daemon self-registers a
+# unbounded-agent daemon. Further per-daemon restrictions can be enforced via
+# VPA. The daemon self-registers a
 # Machine CR at startup when one does not already exist, then runs an in-VM
 # controller loop that watches its local Node, its Machine CR, and
 # MachineOperation CRs targeting the machine. It also reads configuration

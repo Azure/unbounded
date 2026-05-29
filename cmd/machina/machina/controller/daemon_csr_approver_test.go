@@ -60,6 +60,17 @@ func TestDaemonCSRBootstrapTokenMayClaimNodeRequiresSiteBinding(t *testing.T) {
 	require.False(t, allowed)
 }
 
+func TestDaemonCSRBootstrapTokenMayClaimNodeRequiresBootstrapTokenSecret(t *testing.T) {
+	token := bootstrapToken("abc123", "site-a")
+	token.Type = corev1.SecretTypeOpaque
+	checker := testDaemonCSRClaimChecker(token)
+	csr := csrForBinding("system:bootstrap:abc123")
+
+	allowed, err := checker.bootstrapTokenMayClaimNode(context.Background(), csr, "node-a")
+	require.NoError(t, err)
+	require.False(t, allowed)
+}
+
 func TestDaemonCSRBootstrapTokenMayClaimNodeAllowsSiteTokenReuseWithExistingMachine(t *testing.T) {
 	checker := testDaemonCSRClaimChecker(
 		bootstrapToken("abc123", "site-a"),
