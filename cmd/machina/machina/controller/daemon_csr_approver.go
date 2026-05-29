@@ -10,7 +10,6 @@ import (
 
 	certificatesv1 "k8s.io/api/certificates/v1"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -83,30 +82,12 @@ func (c *daemonCSRClaimChecker) nodeHasMachineBinding(
 	_ *certificatesv1.CertificateSigningRequest,
 	nodeName string,
 ) (bool, error) {
-	var machine unboundedv1alpha3.Machine
-	if err := c.Get(ctx, client.ObjectKey{Name: nodeName}, &machine); err == nil {
-		return machineNodeName(&machine) == nodeName, nil
-	} else if !apierrors.IsNotFound(err) {
-		return false, fmt.Errorf("get Machine %s for renewal claim check: %w", nodeName, err)
-	}
-
+	// Renewal requires an explicit Machine -> Node binding. Do not fall back to
+	// Machine name: clearing NodeRef must sever daemon-controller renewal.
 	var machines unboundedv1alpha3.MachineList
 	if err := c.List(ctx, &machines, client.MatchingFields{machineNodeRefNameField: nodeName}); err != nil {
 		return false, fmt.Errorf("list Machines by node ref for renewal claim check: %w", err)
 	}
-	for _, machine := range machines.Items {
-		if machineNodeName(&machine) == nodeName {
-			return true, nil
-		}
-	}
 
-	return false, nil
-}
-
-func machineNodeName(machine *unboundedv1alpha3.Machine) string {
-	if machine.Spec.Kubernetes != nil && machine.Spec.Kubernetes.NodeRef != nil && machine.Spec.Kubernetes.NodeRef.Name != "" {
-		return machine.Spec.Kubernetes.NodeRef.Name
-	}
-
-	return machine.Name
+	return len(machines.Items) > 0, nil
 }

@@ -102,6 +102,15 @@ func TestDaemonCSRNodeHasMachineBindingRejectsMissingMachine(t *testing.T) {
 	require.False(t, allowed)
 }
 
+func TestDaemonCSRNodeHasMachineBindingRequiresExplicitNodeRef(t *testing.T) {
+	checker := testDaemonCSRClaimChecker(machineWithoutNodeRef("node-a", "abc123", "site-a"))
+	csr := csrForBinding("system:node:node-a")
+
+	allowed, err := checker.nodeHasMachineBinding(context.Background(), csr, "node-a")
+	require.NoError(t, err)
+	require.False(t, allowed)
+}
+
 func testDaemonCSRClaimChecker(objs ...client.Object) *daemonCSRClaimChecker {
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -172,4 +181,11 @@ func machineForToken(machineName, nodeName, tokenID, site string) *unboundedv1al
 			},
 		},
 	}
+}
+
+func machineWithoutNodeRef(machineName, tokenID, site string) *unboundedv1alpha3.Machine {
+	machine := machineForToken(machineName, "", tokenID, site)
+	machine.Spec.Kubernetes.NodeRef = nil
+
+	return machine
 }
