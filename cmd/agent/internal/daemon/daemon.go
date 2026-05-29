@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"path/filepath"
 	"strings"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -27,6 +28,7 @@ import (
 const (
 	daemonControllerCertificateName = "unbounded-agent-daemon-controller"
 	daemonControllerGroup           = "unbounded-agent-daemons"
+	daemonControllerCertWaitTimeout = 2 * time.Minute
 )
 
 // kubeClientFunc constructs a controller-runtime client from a rest.Config.
@@ -136,6 +138,7 @@ func daemonControllerCredentials(
 		SignerName:    daemoncred.DefaultControllerCertificateSignerName,
 		DaemonGroup:   daemonControllerGroup,
 		CredentialDir: runOpts.DaemonCredentialDir,
+		WaitTimeout:   daemonControllerCertWaitTimeout,
 	}
 
 	provider, err := daemoncred.NewRESTConfigProvider(ctx, bootstrapCfg, agentCfg.NodeName, opts)
