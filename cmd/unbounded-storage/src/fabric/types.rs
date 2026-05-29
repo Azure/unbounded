@@ -4,7 +4,11 @@
 //! Public-facing fabric value types. Kept thin so later phases can
 //! attach transport metadata without touching the bufferpool surface.
 
-use crate::bufferpool::{PageRef, PeerId};
+use crate::bufferpool::PageRef;
+
+/// Opaque peer identifier minted by the fabric/connection layer.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct PeerId(pub u64);
 
 pub type ConnectionId = PeerId;
 
@@ -13,6 +17,11 @@ pub struct ConnectionSpec {
     pub peer: ConnectionId,
     pub wire_addr: String,
     pub hca_numa: Option<u16>,
+    /// Topology labels for the peer, propagated from
+    /// `PeerSpec.labels`. Consumed by the p2p FingerTable's
+    /// topology-distance heuristic when peers are added to the local
+    /// routing table; ignored by the fabric itself.
+    pub labels: Vec<String>,
 }
 
 /// Newtype around a buffer-pool page so the fabric layer can attach
