@@ -44,10 +44,15 @@
 #   - deploy/orca/03-config.yaml.tmpl - production ConfigMap template
 #                                       (a templated subset of this
 #                                       file's surface).
-#   - hack/orca/.env.example         - environment file consumed by
-#                                      the dev harness Makefile; it
-#                                      drives the renderer for the
-#                                      template above, not this file.
+#   - hack/orca/setup-orca.sh        - the single dev install
+#                                      entrypoint; it drives the
+#                                      same renderer for the
+#                                      production-shape template
+#                                      above (not this file). Use
+#                                      this file as a starting
+#                                      point when running orca
+#                                      directly with --config (not
+#                                      via setup-orca.sh).
 
 # =============================================================================
 # server: client-edge listener + ops listener.
@@ -222,7 +227,7 @@ cachestore:
     # Type:     string (URL).
     # Required: yes.
     # Example:  the in-DC S3-compatible store URL (VAST etc.) in
-    #           production; the dev-harness LocalStack URL below.
+    #           production; the in-cluster LocalStack URL below.
     endpoint: "http://localstack.unbounded-kube.svc.cluster.local:4566"
 
     # Cachestore bucket. Required.

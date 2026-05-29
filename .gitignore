@@ -81,6 +81,11 @@ target/
 .env
 .env.*
 .envrc
+# Exception: .env.example is the template-of-record for new operators
+# copying to .env. Without this re-include the .env.* rule above would
+# silently swallow it.
+!.env.example
+!**/.env.example
 
 # Frontend
 /frontend/node_modules/

@@ -1,22 +1,19 @@
 # Kind cluster config for the Orca dev harness.
 #
 # 1 control-plane + 3 workers. The 3 workers match Orca's default
-# replica count and the required pod-anti-affinity (hostname topology).
+# replica count and the strict pod-anti-affinity that kind installs
+# use (one Orca pod per node).
 #
-# extraPortMappings on the first worker exposes Azurite's NodePort
-# (default 30100) to the host so the seeder tool (hack/cmd/orcaseed)
-# can reach Azurite at http://localhost:30100/devstoreaccount1/
-# without a kubectl port-forward. NodePort services in Kind aren't
-# routable from the host without explicit port mappings.
+# No extraPortMappings: orcadev opens kubectl port-forwards to
+# svc/azurite, svc/localstack, and svc/orca as needed, which is the
+# same code path used on non-kind clusters (AKS, EKS, k3d). Users
+# who want ad-hoc curl from the host can run
+# `kubectl port-forward svc/azurite 10000:10000` themselves.
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 name: orca-dev
 nodes:
   - role: control-plane
   - role: worker
-    extraPortMappings:
-      - containerPort: 30100
-        hostPort: 30100
-        protocol: TCP
   - role: worker
   - role: worker
