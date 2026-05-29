@@ -17,22 +17,19 @@ metadata:
     app.kubernetes.io/name: azurite
     app.kubernetes.io/part-of: orca-dev
 spec:
-  # NodePort so the host-side seeder tool (hack/cmd/orcaseed) can
-  # reach Azurite without a kubectl port-forward. Kind binds node
-  # ports to the host's loopback, so the seeder talks to
-  # http://localhost:<nodePort>/devstoreaccount1/. The fixed port
-  # (default 30100) sits in the Kubernetes NodePort range
-  # (30000-32767). Two concurrent dev clusters on the same host
-  # would collide; override via AzuriteNodePort in the renderer
-  # invocation if you run more than one.
-  type: NodePort
+  # ClusterIP: orcadev reaches Azurite via `kubectl port-forward
+  # svc/azurite 10000:10000` (opened automatically by orcadev when
+  # the local port isn't already bound). This works uniformly across
+  # kind, AKS, EKS, k3d and avoids fixed NodePort collisions.
+  # Anyone who wants ad-hoc curl can run `kubectl port-forward`
+  # themselves.
+  type: ClusterIP
   selector:
     app.kubernetes.io/name: azurite
   ports:
     - name: blob
       port: 10000
       targetPort: 10000
-      nodePort: {{ default "30100" .AzuriteNodePort }}
       protocol: TCP
 
 ---
@@ -112,6 +109,49 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+        # Sidecar that idempotently ensures the Azurite container
+        # exists. Runs a forever-loop because Azurite has no
+        # equivalent of LocalStack's init-hooks; this sidecar is
+        # the structural replacement for the one-shot
+        # 'orca-azurite-container-init' Job, which could not re-run
+        # after Azurite pod restarts dropped its in-memory state.
+        # Talks to Azurite over loopback (127.0.0.1:10000) so the
+        # sidecar does not depend on cluster DNS for the loop.
+        - name: container-ensurer
+          image: {{ default "mcr.microsoft.com/azure-cli:latest" .AzCliImage | quote }}
+          env:
+            - name: AZURE_STORAGE_CONNECTION_STRING
+              value: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
+            - name: CONTAINER
+              value: {{ default "orca-test" .AzuriteContainer | quote }}
+          command:
+            - /bin/sh
+          args:
+            - -c
+            - |
+              # set -u catches unset-var typos. We intentionally do
+              # NOT use 'set -e' here: a transient Azurite hiccup
+              # (network blip, mid-restart) would otherwise kill
+              # the sidecar. The loop body swallows individual
+              # command failures and retries on the next tick.
+              set -u
+              while true; do
+                if az storage container exists --name "$CONTAINER" --query exists -o tsv 2>/dev/null | grep -qi true; then
+                  :
+                else
+                  if az storage container create --name "$CONTAINER" --output none 2>/dev/null; then
+                    echo "ensurer: created container $CONTAINER"
+                  fi
+                fi
+                sleep 30
+              done
+          resources:
+            requests:
+              cpu: 10m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
       volumes:
         - name: data
           emptyDir: {}

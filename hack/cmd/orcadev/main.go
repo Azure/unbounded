@@ -3,8 +3,8 @@
 
 package main
 
-import "github.com/Azure/unbounded/hack/cmd/orcaseed/orcaseed"
+import "github.com/Azure/unbounded/hack/cmd/orcadev/orcadev"
 
 func main() {
-	orcaseed.Run()
+	orcadev.Run()
 }

@@ -1,4 +1,65 @@
 ---
+# ConfigMap carrying the LocalStack init-hook script. LocalStack 3.x
+# scans /etc/localstack/init/ready.d/ once it reports ready and runs
+# every executable script it finds there. Scripts re-run on every
+# container start (including restarts following pod eviction or the
+# LocalStack process crashing), which makes this the right mechanism
+# for "make these buckets exist whenever LocalStack is up".
+#
+# This replaces the previous one-shot 'orca-buckets-init' Kubernetes
+# Job. That Job ran once at first deploy and could not re-run after
+# a LocalStack pod restart wiped the buckets - producing the orca
+# CrashLoopBackOff failure mode with NoSuchBucket on the cachestore
+# versioning probe.
+#
+# Reference: https://docs.localstack.cloud/references/init-hooks/
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: localstack-init-buckets
+  namespace: {{ default "unbounded-kube" .Namespace }}
+  labels:
+    app.kubernetes.io/name: localstack
+    app.kubernetes.io/part-of: orca-dev
+data:
+  init-buckets.sh: |
+    #!/bin/sh
+    # LocalStack init-hook (stage=ready). Runs after LocalStack
+    # reports ready, on every container start including restarts.
+    # Idempotent: head-bucket gates the create-bucket call so reruns
+    # against an already-populated bucket are a no-op.
+    set -eu
+
+    ensure_bucket() {
+      bucket="$1"
+      if awslocal s3api head-bucket --bucket "$bucket" >/dev/null 2>&1; then
+        echo "init: bucket $bucket already exists"
+      else
+        awslocal s3 mb "s3://$bucket"
+        echo "init: created bucket $bucket"
+      fi
+    }
+
+    ensure_bucket "{{ default "orca-cache" .CachestoreBucket }}"
+    ensure_bucket "{{ default "orca-origin" .OriginBucket }}"
+
+    # Cachestore versioning must remain unset (Enabled / Suspended
+    # would break the no-clobber atomic-commit primitive orca
+    # depends on). The driver's versioningGate enforces this at
+    # startup; we double-check here so misconfiguration also surfaces
+    # in LocalStack logs.
+    status=$(awslocal s3api get-bucket-versioning \
+      --bucket "{{ default "orca-cache" .CachestoreBucket }}" \
+      --query Status --output text 2>/dev/null || echo "None")
+    echo "init: cachestore versioning = $status (expected None)"
+    if [ "$status" = "Enabled" ] || [ "$status" = "Suspended" ]; then
+      echo "init: ERROR: cachestore bucket has versioning $status; orca refuses to start"
+      exit 1
+    fi
+
+    echo "init: complete"
+
+---
 apiVersion: v1
 kind: Service
 metadata:
@@ -8,6 +69,12 @@ metadata:
     app.kubernetes.io/name: localstack
     app.kubernetes.io/part-of: orca-dev
 spec:
+  # ClusterIP: orcadev reaches LocalStack via `kubectl port-forward
+  # svc/localstack 4566:4566` (opened automatically by orcadev when
+  # the local port isn't already bound). This works uniformly across
+  # kind, AKS, EKS, k3d and avoids fixed NodePort collisions.
+  # Anyone who wants ad-hoc curl can run `kubectl port-forward`
+  # themselves.
   type: ClusterIP
   selector:
     app.kubernetes.io/name: localstack
@@ -78,6 +145,16 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/localstack
+            - name: init-buckets
+              mountPath: /etc/localstack/init/ready.d
+              readOnly: true
       volumes:
         - name: data
           emptyDir: {}
+        - name: init-buckets
+          configMap:
+            name: localstack-init-buckets
+            # 0755 (decimal 493) so LocalStack's init runner can exec
+            # the script. The default ConfigMap mount mode is 0644
+            # (no exec bit), which LocalStack silently skips.
+            defaultMode: 0755
