@@ -8,11 +8,15 @@ import (
 	"fmt"
 
 	certificatesv1 "k8s.io/api/certificates/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -34,6 +38,7 @@ func RunManager(ctx context.Context, cfg Config) error {
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                 scheme,
+		Cache:                  machinaCacheOptions(),
 		Metrics:                metricsserver.Options{BindAddress: cfg.MetricsAddr},
 		HealthProbeBindAddress: cfg.ProbeAddr,
 		LeaderElection:         cfg.EnableLeaderElection,
@@ -112,4 +117,19 @@ func RunManager(ctx context.Context, cfg Config) error {
 	}
 
 	return nil
+}
+
+func machinaCacheOptions() cache.Options {
+	return cache.Options{
+		ByObject: map[client.Object]cache.ByObject{
+			// Limit Secret caching to bootstrap tokens in kube-system and
+			// Machina-managed secrets in the controller namespace.
+			&corev1.Secret{}: {
+				Namespaces: map[string]cache.Config{
+					metav1.NamespaceSystem:       {},
+					SecretNamespaceUnboundedKube: {},
+				},
+			},
+		},
+	}
 }
