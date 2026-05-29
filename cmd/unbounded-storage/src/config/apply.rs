@@ -6,8 +6,8 @@
 //! daemon's runtime types and vice versa.
 
 use crate::backing::BackingKind;
-use crate::bufferpool::PeerId;
 use crate::fabric::ConnectionSpec;
+use crate::fabric::PeerId;
 use crate::topology;
 
 use super::schema::{BackingKindCfg, PeerSpec, TopologyCfg};
@@ -17,6 +17,7 @@ pub fn peer_spec_to_connection(p: &PeerSpec) -> ConnectionSpec {
         peer: PeerId(p.id),
         wire_addr: p.address.clone(),
         hca_numa: p.hca_numa,
+        labels: p.labels.clone(),
     }
 }
 
@@ -61,11 +62,13 @@ mod tests {
             transport: PeerTransport::Tcp,
             address: "10.0.0.1:9000".into(),
             hca_numa: Some(1),
+            labels: vec!["us-west".to_string(), "rack7".to_string()],
         };
         let c = peer_spec_to_connection(&p);
         assert_eq!(c.peer, PeerId(42));
         assert_eq!(c.wire_addr, "10.0.0.1:9000");
         assert_eq!(c.hca_numa, Some(1));
+        assert_eq!(c.labels, p.labels);
     }
 
     #[test]

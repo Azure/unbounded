@@ -67,14 +67,6 @@ pub struct BulkRef {
     pub len: u32,
 }
 
-/// Opaque peer identifier minted by the p2p layer.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct PeerId(pub u64);
-
-/// Opaque node identifier minted by the p2p layer.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct NodeId(pub u64);
-
 /// Opaque tracing handle. The pool does not inspect it.
 #[derive(Clone, Debug, Default)]
 pub struct TraceCtx;

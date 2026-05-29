@@ -21,6 +21,9 @@ pub enum ConfigError {
     InvalidTcpAddr { peer_id: u64, addr: String },
     InvalidRdmaHex { peer_id: u64 },
     EmptyDiskPath,
+    MissingLocalNodeId,
+    LocalNodeIdCollidesWithPeer(u64),
+    ZeroFingersPerNode,
 }
 
 impl fmt::Display for ConfigError {
@@ -39,6 +42,21 @@ impl fmt::Display for ConfigError {
                 write!(f, "peer {peer_id}: invalid rdma hex address")
             }
             ConfigError::EmptyDiskPath => write!(f, "disk path must not be empty"),
+            ConfigError::MissingLocalNodeId => write!(
+                f,
+                "p2p.local_node_id must be set when [[peers]] are configured: a multi-node \
+                 deployment requires a stable local node id to avoid silent NodeId(0) collisions"
+            ),
+            ConfigError::LocalNodeIdCollidesWithPeer(id) => write!(
+                f,
+                "p2p.local_node_id {id} collides with a peer id: the local node and a peer \
+                 cannot share a node id, or the p2p finger table will silently drop that peer"
+            ),
+            ConfigError::ZeroFingersPerNode => write!(
+                f,
+                "p2p.fingers_per_node must be greater than zero: the p2p subsystem needs at \
+                 least one finger per node"
+            ),
         }
     }
 }
@@ -79,10 +97,20 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
 }
 
 fn validate(cfg: &Config) -> Result<(), ConfigError> {
+    if cfg.p2p.fingers_per_node == 0 {
+        return Err(ConfigError::ZeroFingersPerNode);
+    }
+    if !cfg.peers.is_empty() && cfg.p2p.local_node_id.is_none() {
+        return Err(ConfigError::MissingLocalNodeId);
+    }
+
     let mut seen_peers: HashSet<u64> = HashSet::new();
     for p in &cfg.peers {
         if !seen_peers.insert(p.id) {
             return Err(ConfigError::DuplicatePeer(p.id));
+        }
+        if cfg.p2p.local_node_id == Some(p.id) {
+            return Err(ConfigError::LocalNodeIdCollidesWithPeer(p.id));
         }
         match p.transport {
             PeerTransport::Tcp => {
@@ -147,6 +175,9 @@ listen_addr = "0.0.0.0:1234"
 bytes_per_shard = "64M"
 backing_kind = "heap"
 
+[p2p]
+local_node_id = 99
+
 [[peers]]
 id = 1
 transport = "tcp"
@@ -176,6 +207,9 @@ path = "/dev/nvme1n1"
     #[test]
     fn rejects_duplicate_peer_ids() {
         let s = r#"
+[p2p]
+local_node_id = 99
+
 [[peers]]
 id = 1
 transport = "tcp"
@@ -212,6 +246,9 @@ path = "/dev/nvme0n1"
     #[test]
     fn rejects_invalid_tcp_addr() {
         let s = r#"
+[p2p]
+local_node_id = 1
+
 [[peers]]
 id = 7
 transport = "tcp"
@@ -227,6 +264,9 @@ address = "not-an-addr"
     #[test]
     fn rejects_hostname_for_tcp() {
         let s = r#"
+[p2p]
+local_node_id = 1
+
 [[peers]]
 id = 8
 transport = "tcp"
@@ -244,6 +284,9 @@ address = "example.com:9000"
         for bad in ["xyzz", "abc", "", "deadbeefg0"] {
             let s = format!(
                 r#"
+[p2p]
+local_node_id = 1
+
 [[peers]]
 id = 3
 transport = "rdma"
@@ -281,5 +324,90 @@ path = ""
     fn toml_error_on_bad_syntax() {
         let f = write_cfg("this is = not = valid = toml");
         assert!(matches!(load(f.path()), Err(ConfigError::Toml(_))));
+    }
+
+    #[test]
+    fn rejects_peers_without_local_node_id() {
+        let s = r#"
+[[peers]]
+id = 1
+transport = "tcp"
+address = "10.0.0.1:9000"
+"#;
+        let f = write_cfg(s);
+        match load(f.path()) {
+            Err(ConfigError::MissingLocalNodeId) => {}
+            other => panic!("expected MissingLocalNodeId, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_peers_with_local_node_id() {
+        let s = r#"
+[p2p]
+local_node_id = 7
+
+[[peers]]
+id = 1
+transport = "tcp"
+address = "10.0.0.1:9000"
+"#;
+        let f = write_cfg(s);
+        let cfg = load(f.path()).expect("load should succeed");
+        assert_eq!(cfg.p2p.local_node_id, Some(7));
+        assert_eq!(cfg.peers.len(), 1);
+    }
+
+    #[test]
+    fn rejects_local_node_id_colliding_with_peer() {
+        let s = r#"
+[p2p]
+local_node_id = 1
+
+[[peers]]
+id = 1
+transport = "tcp"
+address = "10.0.0.1:9000"
+"#;
+        let f = write_cfg(s);
+        match load(f.path()) {
+            Err(ConfigError::LocalNodeIdCollidesWithPeer(1)) => {}
+            other => panic!("expected LocalNodeIdCollidesWithPeer(1), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_local_node_id_distinct_from_peers() {
+        let s = r#"
+[p2p]
+local_node_id = 99
+
+[[peers]]
+id = 1
+transport = "tcp"
+address = "10.0.0.1:9000"
+
+[[peers]]
+id = 2
+transport = "tcp"
+address = "10.0.0.2:9000"
+"#;
+        let f = write_cfg(s);
+        let cfg = load(f.path()).expect("load should succeed");
+        assert_eq!(cfg.p2p.local_node_id, Some(99));
+        assert_eq!(cfg.peers.len(), 2);
+    }
+
+    #[test]
+    fn rejects_zero_fingers_per_node() {
+        let s = r#"
+[p2p]
+fingers_per_node = 0
+"#;
+        let f = write_cfg(s);
+        match load(f.path()) {
+            Err(ConfigError::ZeroFingersPerNode) => {}
+            other => panic!("expected ZeroFingersPerNode, got {other:?}"),
+        }
     }
 }

@@ -13,6 +13,7 @@ pub struct Config {
     pub fabric: FabricCfg,
     pub storage: StorageCfg,
     pub topology: TopologyCfg,
+    pub p2p: P2pCfg,
     pub peers: Vec<PeerSpec>,
     pub disks: Vec<DiskSpec>,
 }
@@ -23,6 +24,7 @@ impl Default for Config {
             fabric: FabricCfg::default(),
             storage: StorageCfg::default(),
             topology: TopologyCfg::default(),
+            p2p: P2pCfg::default(),
             peers: Vec::new(),
             disks: Vec::new(),
         }
@@ -104,6 +106,35 @@ impl Default for TopologyCfg {
     }
 }
 
+/// Peer-to-peer / DHT knobs.
+///
+/// `fingers_per_node` and `local_node_id` are validated at load time
+/// (see `config::load::validate`) but are not yet consumed by a
+/// runtime FingerTable: that wiring lands with the stripe-DHT
+/// subsystem in a later phase. `local_labels` is similarly validated
+/// for shape (present, possibly empty) but not yet consumed.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct P2pCfg {
+    pub fingers_per_node: u32,
+    /// Stable identifier for this daemon in the p2p ring. `None`
+    /// means "unset"; load-time validation rejects unset ids when
+    /// peers are configured, since the silent NodeId(0) collision
+    /// would otherwise lurk until the DHT runtime tried to use it.
+    pub local_node_id: Option<u64>,
+    pub local_labels: Vec<String>,
+}
+
+impl Default for P2pCfg {
+    fn default() -> Self {
+        Self {
+            fingers_per_node: 100,
+            local_node_id: None,
+            local_labels: Vec::new(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PeerSpec {
@@ -112,6 +143,12 @@ pub struct PeerSpec {
     pub address: String,
     #[serde(default)]
     pub hca_numa: Option<u16>,
+    /// Topology labels for this peer. Propagated into
+    /// `ConnectionSpec.labels`; consumed by the p2p FingerTable's
+    /// topology-distance heuristic when peers are added to the local
+    /// routing table.
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -252,6 +289,9 @@ mod tests {
         assert!(c.topology.exclude_node_cpu0);
         assert!(c.topology.require_active_port);
         assert_eq!(c.topology.tcp_fallback_threads, 1);
+        assert_eq!(c.p2p.fingers_per_node, 100);
+        assert!(c.p2p.local_node_id.is_none());
+        assert!(c.p2p.local_labels.is_empty());
         assert!(c.peers.is_empty());
         assert!(c.disks.is_empty());
     }
@@ -369,5 +409,74 @@ skip_recovery_scan_if_no_meta = true
         assert_eq!(c.disks[0].page_size_bytes, Some(4096));
         assert!(c.disks[0].bypass_admission);
         assert!(c.disks[0].skip_recovery_scan_if_no_meta);
+    }
+
+    #[test]
+    fn p2p_defaults_are_populated() {
+        let c: Config = toml::from_str("").unwrap();
+        assert_eq!(c.p2p.fingers_per_node, 100);
+        assert!(c.p2p.local_node_id.is_none());
+        assert!(c.p2p.local_labels.is_empty());
+    }
+
+    #[test]
+    fn p2p_round_trips() {
+        let s = r#"
+[p2p]
+fingers_per_node = 128
+local_node_id = 42
+local_labels = ["us-west", "az1", "row3", "rack7"]
+"#;
+        let c: Config = toml::from_str(s).unwrap();
+        assert_eq!(c.p2p.fingers_per_node, 128);
+        assert_eq!(c.p2p.local_node_id, Some(42));
+        assert_eq!(
+            c.p2p.local_labels,
+            vec![
+                "us-west".to_string(),
+                "az1".to_string(),
+                "row3".to_string(),
+                "rack7".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn unknown_fields_rejected_in_p2p() {
+        let s = "[p2p]\nbogus = 1\n";
+        assert!(toml::from_str::<Config>(s).is_err());
+    }
+
+    #[test]
+    fn peer_labels_default_to_empty() {
+        let s = r#"
+[[peers]]
+id = 1
+transport = "tcp"
+address = "127.0.0.1:9000"
+"#;
+        let c: Config = toml::from_str(s).unwrap();
+        assert!(c.peers[0].labels.is_empty());
+    }
+
+    #[test]
+    fn peer_labels_round_trip() {
+        let s = r#"
+[[peers]]
+id = 1
+transport = "tcp"
+address = "127.0.0.1:9000"
+labels = ["us-west", "az1", "row3", "rack7"]
+"#;
+        let c: Config = toml::from_str(s).unwrap();
+        assert_eq!(
+            c.peers[0].labels,
+            vec![
+                "us-west".to_string(),
+                "az1".to_string(),
+                "row3".to_string(),
+                "rack7".to_string(),
+            ]
+        );
     }
 }

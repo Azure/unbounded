@@ -14,7 +14,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::bufferpool::PeerId;
+use crate::fabric::PeerId;
 use crate::fabric::{ConnectionSpec, Fabric, FabricError};
 
 use super::apply::peer_spec_to_connection;
@@ -130,6 +130,7 @@ pub fn reconcile_peers(
             if let Some(old_spec) = prev.get(id) {
                 if old_spec.wire_addr != new_spec.wire_addr
                     || old_spec.hca_numa != new_spec.hca_numa
+                    || old_spec.labels != new_spec.labels
                 {
                     to_update.insert(*id);
                 }
@@ -198,22 +199,35 @@ pub fn reconcile_peers(
         }
     }
 
-    // Carry forward the prior spec for every id the fabric still
-    // holds and that we have not already recorded under `applied`.
-    // "Still holds" means the id was in `current` at the start of
-    // the pass and we did not successfully remove it - which covers
-    // both untouched steady-state peers and failed-remove (plain or
+    // Carry forward a spec for every id the fabric still holds and
+    // that we have not already recorded under `applied`. "Still
+    // holds" means the id was in `current` at the start of the pass
+    // and we did not successfully remove it - which covers both
+    // untouched steady-state peers and failed-remove (plain or
     // update-half) peers. Successful update-removes whose re-add
     // failed deliberately fall out here: the fabric does not have
     // the peer anymore, so the next pass should re-add via the
     // id-not-in-current branch rather than re-detect drift.
+    //
+    // For a peer that is still desired and was NOT part of an update
+    // (`to_update`), every observable field - addr, hca, and labels -
+    // already matches the last applied spec by construction, so
+    // recording the desired spec is equivalent to keeping the old
+    // one. Ids that are not desired (plain failed-remove) or that are
+    // in `to_update` with a failed remove (failed update-remove) keep
+    // the old spec so the next pass can retry the removal / re-detect
+    // the drift; the fabric still holds the peer at that old spec.
     if let Some(prev) = last_applied {
-        for (id, spec) in prev {
+        for (id, old_spec) in prev {
             if current.contains(id)
                 && !removed_ok.contains(id)
                 && !report.applied.contains_key(id)
             {
-                report.applied.insert(*id, spec.clone());
+                let spec = match desired_map.get(id) {
+                    Some(desired_spec) if !to_update.contains(id) => desired_spec.clone(),
+                    _ => old_spec.clone(),
+                };
+                report.applied.insert(*id, spec);
             }
         }
     }
@@ -294,6 +308,7 @@ mod tests {
             transport: PeerTransport::Tcp,
             address: format!("10.0.0.{id}:9000"),
             hca_numa: None,
+            labels: Vec::new(),
         }
     }
 
@@ -303,6 +318,17 @@ mod tests {
             transport: PeerTransport::Tcp,
             address: addr.to_string(),
             hca_numa: None,
+            labels: Vec::new(),
+        }
+    }
+
+    fn peer_labels(id: u64, labels: &[&str]) -> PeerSpec {
+        PeerSpec {
+            id,
+            transport: PeerTransport::Tcp,
+            address: format!("10.0.0.{id}:9000"),
+            hca_numa: None,
+            labels: labels.iter().map(|s| s.to_string()).collect(),
         }
     }
 
@@ -408,6 +434,35 @@ mod tests {
             vec![Op::Remove(1), Op::Add(1)]
         );
         assert_eq!(r.applied[&PeerId(1)].wire_addr, "b:2");
+    }
+
+    #[test]
+    fn reconcile_label_only_change_churns_connection() {
+        // A relabel with identical wire_addr/hca_numa must drive a
+        // remove-then-add so the new labels reach the runtime, and
+        // the tracked applied spec must reflect the NEW labels.
+        let t = MockTarget::new(&[1]);
+        let mut prev = HashMap::new();
+        prev.insert(
+            PeerId(1),
+            peer_spec_to_connection(&peer_labels(1, &["us-west"])),
+        );
+        let peers = vec![peer_labels(1, &["us-east", "rack9"])];
+        let r = reconcile_peers(&t, &peers, Some(&prev));
+        assert_eq!(r.added, 0);
+        assert_eq!(r.removed, 0);
+        assert_eq!(r.updated, 1);
+        assert!(r.failures.is_empty());
+        // The connection was churned via remove-then-add.
+        assert_eq!(*t.ops.borrow(), vec![Op::Remove(1), Op::Add(1)]);
+        // Applied state carries the freshest desired labels.
+        assert_eq!(
+            r.applied[&PeerId(1)].labels,
+            vec!["us-east".to_string(), "rack9".to_string()]
+        );
+        // Address/HCA are unchanged.
+        assert_eq!(r.applied[&PeerId(1)].wire_addr, "10.0.0.1:9000");
+        assert_eq!(r.applied[&PeerId(1)].hca_numa, None);
     }
 
     #[test]

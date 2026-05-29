@@ -39,4 +39,4 @@ pub use rpc::{
 pub use transport::{
     FabricTransport, PeerRouter, StaticPeer, ensure_launch_fits_registry, required_completion_slots,
 };
-pub use types::{ConnectionId, ConnectionSpec, Page};
+pub use types::{ConnectionId, ConnectionSpec, Page, PeerId};
