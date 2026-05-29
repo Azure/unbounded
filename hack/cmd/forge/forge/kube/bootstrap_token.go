@@ -22,7 +22,7 @@ var ErrBootstrapTokenNotFound = errors.New("bootstrap token not found")
 
 const (
 	alphanumeric             = "abcdefghijklmnopqrstuvwxyz0123456789"
-	defaultBootstrapTokenTTL = 3 * time.Hour
+	defaultBootstrapTokenTTL = 24 * time.Hour
 )
 
 type BootstrapToken struct {

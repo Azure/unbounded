@@ -20,7 +20,7 @@ import (
 
 const (
 	bootstrapTokenAlphabet   = "abcdefghijklmnopqrstuvwxyz0123456789"
-	DefaultBootstrapTokenTTL = 3 * time.Hour
+	DefaultBootstrapTokenTTL = 24 * time.Hour
 )
 
 // ErrBootstrapTokenNotFound is returned by GetBootstrapToken when no matching

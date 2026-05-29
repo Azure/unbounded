@@ -1247,7 +1247,7 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
     log("Creating bootstrap token...")
     token_id = secrets.token_hex(3)
     token_secret = secrets.token_hex(8)
-    token_expiration = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3 * 60 * 60))
+    token_expiration = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 24 * 60 * 60))
     (VM_DIR / "token-id").write_text(token_id)
     bootstrap_group = "system:bootstrappers:unbounded-agent-daemons"
 
