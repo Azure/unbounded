@@ -60,7 +60,7 @@ func TestDaemonCSRBootstrapTokenMayClaimNodeRequiresSiteBinding(t *testing.T) {
 	require.False(t, allowed)
 }
 
-func TestDaemonCSRBootstrapTokenMayClaimNodeRejectsWrongNode(t *testing.T) {
+func TestDaemonCSRBootstrapTokenMayClaimNodeAllowsSiteTokenReuseWithExistingMachine(t *testing.T) {
 	checker := testDaemonCSRClaimChecker(
 		bootstrapToken("abc123", "site-a"),
 		machineForToken("machine-a", "node-a", "abc123", "site-a"),
@@ -69,19 +69,7 @@ func TestDaemonCSRBootstrapTokenMayClaimNodeRejectsWrongNode(t *testing.T) {
 
 	allowed, err := checker.bootstrapTokenMayClaimNode(context.Background(), csr, "node-b")
 	require.NoError(t, err)
-	require.False(t, allowed)
-}
-
-func TestDaemonCSRBootstrapTokenMayClaimNodeRejectsWrongSite(t *testing.T) {
-	checker := testDaemonCSRClaimChecker(
-		bootstrapToken("abc123", "site-a"),
-		machineForToken("machine-a", "node-a", "abc123", "site-b"),
-	)
-	csr := csrForBinding("system:bootstrap:abc123")
-
-	allowed, err := checker.bootstrapTokenMayClaimNode(context.Background(), csr, "node-a")
-	require.NoError(t, err)
-	require.False(t, allowed)
+	require.True(t, allowed)
 }
 
 func TestDaemonCSRBootstrapTokenMayClaimNodeAllowsDefaultTokenMachineSite(t *testing.T) {
@@ -115,7 +103,18 @@ func TestDaemonCSRNodeHasMachineBindingRejectsMissingMachine(t *testing.T) {
 }
 
 func testDaemonCSRClaimChecker(objs ...client.Object) *daemonCSRClaimChecker {
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(objs...).
+		WithIndex(&unboundedv1alpha3.Machine{}, machineNodeRefNameField, func(obj client.Object) []string {
+			machine := obj.(*unboundedv1alpha3.Machine)
+			if machine.Spec.Kubernetes == nil || machine.Spec.Kubernetes.NodeRef == nil || machine.Spec.Kubernetes.NodeRef.Name == "" {
+				return nil
+			}
+
+			return []string{machine.Spec.Kubernetes.NodeRef.Name}
+		}).
+		Build()
 
 	return &daemonCSRClaimChecker{Client: c}
 }

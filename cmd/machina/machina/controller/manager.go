@@ -66,6 +66,10 @@ func RunManager(ctx context.Context, cfg Config) error {
 	}
 
 	// Setup Machine controller — handles both reachability and provisioning.
+	if err := setupMachineFieldIndexes(ctx, mgr.GetFieldIndexer()); err != nil {
+		return fmt.Errorf("setup Machine field indexes: %w", err)
+	}
+
 	if err := (&MachineReconciler{
 		Client:                      mgr.GetClient(),
 		Scheme:                      mgr.GetScheme(),
@@ -132,4 +136,19 @@ func machinaCacheOptions() cache.Options {
 			},
 		},
 	}
+}
+
+func setupMachineFieldIndexes(ctx context.Context, indexer client.FieldIndexer) error {
+	if err := indexer.IndexField(ctx, &unboundedv1alpha3.Machine{}, machineNodeRefNameField, func(obj client.Object) []string {
+		machine, ok := obj.(*unboundedv1alpha3.Machine)
+		if !ok || machine.Spec.Kubernetes == nil || machine.Spec.Kubernetes.NodeRef == nil || machine.Spec.Kubernetes.NodeRef.Name == "" {
+			return nil
+		}
+
+		return []string{machine.Spec.Kubernetes.NodeRef.Name}
+	}); err != nil {
+		return fmt.Errorf("index Machine node ref: %w", err)
+	}
+
+	return nil
 }

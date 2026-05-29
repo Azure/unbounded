@@ -24,6 +24,8 @@ const (
 	defaultBootstrapTokenLabel = "unbounded-cloud.io/default-bootstrap-token"
 	daemonGroup                = "unbounded-agent-daemons"
 	bootstrapGroup             = "system:bootstrappers:unbounded-agent-daemons"
+
+	machineNodeRefNameField = "spec.kubernetes.nodeRef.name"
 )
 
 type daemonCSRClaimChecker struct {
@@ -70,30 +72,9 @@ func (c *daemonCSRClaimChecker) bootstrapTokenMayClaimNode(
 		return false, nil
 	}
 
-	var machines unboundedv1alpha3.MachineList
-	if err := c.List(ctx, &machines); err != nil {
-		return false, fmt.Errorf("list Machines for bootstrap token claim check: %w", err)
-	}
-
-	for _, machine := range machines.Items {
-		if machine.Spec.Kubernetes == nil {
-			continue
-		}
-		if machine.Spec.Kubernetes.BootstrapTokenRef.Name != secretName {
-			continue
-		}
-
-		// During early bootstrap, the Machine may not exist yet. When a Machine
-		// already references this token, enforce token-to-Machine-to-Node binding.
-		if siteName != "" && machine.Labels[unboundedv1alpha3.MachineSiteLabelKey] != siteName {
-			return false, nil
-		}
-
-		return machineNodeName(&machine) == nodeName, nil
-	}
-
-	// No Machine references this token yet. Allow initial issuance based on a
-	// trusted bootstrap token label; the daemon may create the Machine afterward.
+	// Bootstrap tokens are site-scoped credentials, not single-Machine leases.
+	// During the token's valid time window, multiple nodes in that site may use it
+	// to obtain daemon-controller credentials and create or bind their Machines.
 	return true, nil
 }
 
@@ -110,8 +91,8 @@ func (c *daemonCSRClaimChecker) nodeHasMachineBinding(
 	}
 
 	var machines unboundedv1alpha3.MachineList
-	if err := c.List(ctx, &machines); err != nil {
-		return false, fmt.Errorf("list Machines for renewal claim check: %w", err)
+	if err := c.List(ctx, &machines, client.MatchingFields{machineNodeRefNameField: nodeName}); err != nil {
+		return false, fmt.Errorf("list Machines by node ref for renewal claim check: %w", err)
 	}
 	for _, machine := range machines.Items {
 		if machineNodeName(&machine) == nodeName {
