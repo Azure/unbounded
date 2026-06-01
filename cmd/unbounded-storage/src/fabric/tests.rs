@@ -12,7 +12,7 @@ use std::ptr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::bufferpool::PeerId;
+use crate::fabric::PeerId;
 use crate::fabric::{ConnectionSpec, Fabric, FabricConfig, FabricError, Provider, defaults_for};
 use crate::runtime::{DefaultRuntime, Threading, WorkerIdx};
 
@@ -145,11 +145,13 @@ fn tcp_loopback_ping_roundtrip() {
         peer: PeerId(2),
         wire_addr: b_addr,
         hca_numa: None,
+        labels: Vec::new(),
     };
     let b_to_a = ConnectionSpec {
         peer: PeerId(1),
         wire_addr: a_addr,
         hca_numa: None,
+        labels: Vec::new(),
     };
     a.add_connection(a_to_b)
         .expect("add_connection a->b failed after provider availability gate");
@@ -183,6 +185,7 @@ fn add_remove_add_cycle() {
         peer: PeerId(42),
         wire_addr: addr.clone(),
         hca_numa: None,
+        labels: Vec::new(),
     };
     f.add_connection(spec.clone()).expect("add 1");
     assert!(f.list_connections().contains(&PeerId(42)));
@@ -204,6 +207,7 @@ fn numa_mismatch_rejects() {
         peer: PeerId(7),
         wire_addr: "127.0.0.1:1".to_string(),
         hca_numa: Some(1),
+        labels: Vec::new(),
     };
     match f.add_connection(spec) {
         Err(FabricError::NumaMismatch { expected, got }) => {
@@ -361,6 +365,7 @@ fn paired_fabrics(n_pages: usize) -> (Arc<Fabric>, Arc<Fabric>, MrHandle, MrHand
             peer: PeerId(1), // client peer-id in server's table
             wire_addr: client_addr,
             hca_numa: None,
+            labels: Vec::new(),
         })
         .expect("server.add_connection failed after provider availability gate");
     client
@@ -368,6 +373,7 @@ fn paired_fabrics(n_pages: usize) -> (Arc<Fabric>, Arc<Fabric>, MrHandle, MrHand
             peer: PeerId(2), // server peer-id in client's table
             wire_addr: server_addr,
             hca_numa: None,
+            labels: Vec::new(),
         })
         .expect("client.add_connection failed after provider availability gate");
 
