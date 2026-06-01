@@ -1242,17 +1242,14 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
     log(f"API server: {api_server}")
 
     # Create bootstrap token.
-    # Kind clusters use kubeadm, which creates ClusterRoleBindings for TLS
-    # bootstrap (CSR creation + auto-approval) scoped to the group
-    # "system:bootstrappers:kubeadm:default-node-token".  Without
-    # auth-extra-groups the token only belongs to the generic
-    # "system:bootstrappers" group, and the kubelet's CSR is rejected with
-    # "certificatesigningrequests is forbidden".
+    # Add the daemon-specific bootstrap group so Machina can approve the
+    # daemon controller CSR after kubelet bootstrap completes.
     log("Creating bootstrap token...")
     token_id = secrets.token_hex(3)
     token_secret = secrets.token_hex(8)
+    token_expiration = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 24 * 60 * 60))
     (VM_DIR / "token-id").write_text(token_id)
-    bootstrap_group = "system:bootstrappers:kubeadm:default-node-token"
+    bootstrap_group = "system:bootstrappers:unbounded-agent-daemons"
 
     token_manifest = json.dumps({
         "apiVersion": "v1",
@@ -1268,6 +1265,7 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
         "data": {
             "token-id": _b64(token_id),
             "token-secret": _b64(token_secret),
+            "expiration": _b64(token_expiration),
             "usage-bootstrap-authentication": _b64("true"),
             "usage-bootstrap-signing": _b64("true"),
             "auth-extra-groups": _b64(bootstrap_group),
