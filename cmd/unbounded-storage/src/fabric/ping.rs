@@ -28,7 +28,7 @@ use std::ptr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::bufferpool::PeerId;
+use crate::fabric::PeerId;
 
 use super::completion::CompletionInfo;
 use super::error::{FabricError, Result};

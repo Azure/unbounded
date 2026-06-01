@@ -1,310 +1,60 @@
-# hack/orca/Makefile - dev-harness targets for the Orca origin cache.
+# hack/orca/Makefile - operational convenience verbs for an
+# already-installed Orca dev cluster.
 #
-# Invoke from the repo root: `make -C hack/orca <target>`. The root
-# Makefile also defines `orca-up`, `orca-down`, `orca-reset` which
-# proxy here.
+# The single coherent install entrypoint is hack/orca/setup-orca.sh
+# (with hack/orca/kind-up.sh / hack/orca/kind-down.sh for kind cluster
+# lifecycle). The root Makefile exposes proxies:
 #
-# These targets stand up a local Kind cluster, build the Orca container
-# image with podman, side-load it into Kind, deploy LocalStack as the
-# cachestore backend, and apply the rendered Orca manifests. The
-# harness validates the Kubernetes deployment shape (manifests, image,
-# headless-Service DNS, RBAC, init-Job ordering); for Go-level
-# behavior coverage use `make orca-inttest` which runs the in-process
-# integration suite under internal/orca/inttest/.
+#   make orca-install      install Orca into the current kubectl context
+#   make orca-kind-up      create kind cluster + install Orca (== make orca-up)
+#   make orca-kind-down    delete kind cluster (== make orca-down)
+#   make orca-reset        rebuild image + side-load + rollout-restart on kind
+#
+# This file only contains the post-install operational verbs (status,
+# logs, port-forward) that don't fit naturally into the install
+# script. Everything else - seeding data, roundtrips, benchmarks,
+# scenarios, cachestore inspection - is done directly with
+# `bin/orcadev <verb>`. See hack/orca/README.md.
 
 REPO_ROOT  := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
-HACK_DIR   := $(dir $(lastword $(MAKEFILE_LIST)))
 
-# Cluster + namespace knobs.
-CLUSTER_NAME      ?= orca-dev
-NAMESPACE         ?= unbounded-kube
-KIND_CONFIG       ?= $(HACK_DIR)kind-config.yaml
+# Cluster + namespace knobs. Defaults match setup-orca.sh /
+# kind-up.sh; override on the command line if your install used a
+# non-default context or namespace.
+CLUSTER_NAME ?= orca-dev
+NAMESPACE    ?= unbounded-kube
+KUBECTL_CTX   = kind-$(CLUSTER_NAME)
 
-# Image tag pinned to :dev so kind load and rollout-restart use a
-# stable identifier (the auto-derived VERSION can include slashes from
-# git tags like images/agent-ubuntu2404-nvidia/v..., which are illegal
-# in OCI tags).
-ORCA_VERSION      ?= dev
-ORCA_IMAGE        ?= ghcr.io/azure/orca:$(ORCA_VERSION)
-
-# Container engine (podman in CI, podman or docker locally). kind load
-# image-archive accepts an OCI tarball produced by either.
-CONTAINER_ENGINE  ?= podman
-
-# Path to user .env (sourced by helper scripts that need it).
-ENV_FILE          ?= $(HACK_DIR).env
-
-# Rendered manifest dirs (per-Makefile target overrides for the dev
-# rendering of pluggable orca manifests + the dev-only LocalStack/init
-# manifests).
-ORCA_RENDERED     := $(REPO_ROOT)/deploy/orca/rendered
-DEV_TEMPLATES     := $(REPO_ROOT)/deploy/orca/dev
-DEV_RENDERED      := $(HACK_DIR)rendered-dev
-
-.PHONY: help up down reset render render-dev image kind-create kind-load \
-        deploy deploy-localstack deploy-azurite deploy-azurite-maybe \
-        deploy-credentials deploy-orca \
-        wait-ready logs port-forward seed-azure status \
-        seed-generate seed-upload seed-list seed-delete
+.PHONY: help status logs port-forward
 
 help: ## Show this help
 	@echo ""
 	@echo "Usage: make -C hack/orca <target> [VAR=value ...]"
 	@echo ""
-	@echo "Lifecycle:"
-	@echo "  up                  Bring up Kind cluster + LocalStack + Orca"
-	@echo "  down                Delete Kind cluster"
-	@echo "  reset               Rebuild image + rollout-restart deployment"
+	@echo "Install / uninstall live in the root Makefile and use the"
+	@echo "single coherent setup-orca.sh entrypoint. See hack/orca/README.md."
 	@echo ""
-	@echo "Pieces (typically called by 'up'):"
-	@echo "  render              Render orca manifests"
-	@echo "  render-dev          Render dev-only manifests (LocalStack, init job)"
-	@echo "  image               Build Orca container image (image-orca-local)"
-	@echo "  kind-create         Create the Kind cluster (idempotent)"
-	@echo "  kind-load           Load the Orca image into Kind nodes"
-	@echo "  deploy-localstack   Apply LocalStack Deployment + bucket init Job"
-	@echo "  deploy-credentials  Create the orca-credentials Secret from .env"
-	@echo "  deploy-orca         Apply rendered Orca manifests"
-	@echo "  wait-ready          Block until 3/3 orca pods are Ready"
-	@echo ""
-	@echo "Operate:"
+	@echo "Operate (post-install convenience):"
 	@echo "  status              kubectl get pods -n $(NAMESPACE)"
 	@echo "  logs                Tail logs from all Orca pods"
-	@echo "  port-forward        Forward localhost:8443 -> svc/orca"
-	@echo "  seed-azure          Upload a file to real Azure (FILE=path; requires .env creds)"
+	@echo "  port-forward        Foreground forward localhost:8443 -> svc/orca"
 	@echo ""
-	@echo "Seed origin (Azurite via NodePort 30100; needs cluster up + ORIGIN_DRIVER=azureblob):"
-	@echo "  seed-generate SEED_ARGS='--size 10MiB --count 5'  Synthesise N blobs of size S"
-	@echo "  seed-upload   FILE=/path/to/file                   Upload a single file"
-	@echo "  seed-list     [SEED_ARGS='--prefix foo']           List blobs in the container"
-	@echo "  seed-delete   [PREFIX=foo] [SEED_ARGS='--yes']     Delete blobs (interactive by default)"
-	@echo ""
-	@echo "Note: For Go-level behavior testing (chunked GETs, cluster routing,"
-	@echo "singleflight, peer fallback) use 'make orca-inttest' from the repo"
-	@echo "root. That suite exercises the same code paths against testcontainers"
-	@echo "without needing Kind."
+	@echo "Seed data, roundtrips, benchmarks, scenarios:"
+	@echo "  Use bin/orcadev <verb> directly. Run 'bin/orcadev --help'"
+	@echo "  for the full subcommand tree. orcadev auto-opens port-forwards"
+	@echo "  to svc/orca, svc/azurite, svc/localstack as needed."
 	@echo ""
 	@echo "Variables:"
 	@echo "  CLUSTER_NAME=$(CLUSTER_NAME)"
 	@echo "  NAMESPACE=$(NAMESPACE)"
-	@echo "  ORCA_IMAGE=$(ORCA_IMAGE)"
-	@echo "  CONTAINER_ENGINE=$(CONTAINER_ENGINE)"
-	@echo "  ENV_FILE=$(ENV_FILE)"
+	@echo "  KUBECTL_CTX=$(KUBECTL_CTX)"
 
-# -- Top-level lifecycle ------------------------------------------------------
+status: ## kubectl get pods -o wide -n $(NAMESPACE)
+	kubectl --context $(KUBECTL_CTX) -n $(NAMESPACE) get pods -o wide
 
-up: kind-create image kind-load deploy ## End-to-end bring-up
+logs: ## Tail logs from all Orca pods
+	kubectl --context $(KUBECTL_CTX) -n $(NAMESPACE) logs -l app.kubernetes.io/name=orca --tail=200 -f
 
-down: ## Delete Kind cluster
-	CLUSTER_NAME="$(CLUSTER_NAME)" $(HACK_DIR)down.sh
-
-reset: image kind-load ## Rebuild image and rolling-restart Orca
-	kubectl --context kind-$(CLUSTER_NAME) -n $(NAMESPACE) rollout restart deployment/orca
-	kubectl --context kind-$(CLUSTER_NAME) -n $(NAMESPACE) rollout status deployment/orca --timeout=120s
-
-# `deploy` deploys whichever origin backend matches ORIGIN_DRIVER in
-# .env (default: awss3 -> LocalStack only; azureblob also brings up
-# Azurite). The cachestore is always LocalStack regardless. Init Jobs
-# are idempotent so re-applying is safe.
-deploy: render render-dev deploy-localstack deploy-azurite-maybe deploy-credentials deploy-orca wait-ready ## Apply all manifests + Secret
-
-deploy-azurite-maybe: render-dev
-	@if [ -f "$(ENV_FILE)" ]; then set -a && . "$(ENV_FILE)" && set +a; fi; \
-	driver="$${ORIGIN_DRIVER:-awss3}"; \
-	if [ "$$driver" = "azureblob" ]; then \
-		echo "ORIGIN_DRIVER=azureblob -> deploying Azurite"; \
-		$(MAKE) deploy-azurite; \
-	else \
-		echo "ORIGIN_DRIVER=$$driver -> Azurite not required (skipping)"; \
-	fi
-
-# -- Rendering ----------------------------------------------------------------
-
-# Render the pluggable orca manifests with the dev image. Default
-# origin driver in the dev harness is awss3 pointing at the same
-# in-cluster LocalStack instance (different bucket); reviewers can
-# override by setting ORIGIN_DRIVER=azureblob and the appropriate
-# AZURE_* values in .env. Credentials are NOT rendered into the
-# ConfigMap; they ride in via the orca-credentials Secret as env vars
-# (envFrom).
-render:
-	@echo "Rendering orca manifests with image=$(ORCA_IMAGE)"
-	@mkdir -p "$(ORCA_RENDERED)"
-	@find "$(ORCA_RENDERED)" -mindepth 1 -not -name .gitignore -delete 2>/dev/null || true
-	@if [ -f "$(ENV_FILE)" ]; then \
-		set -a && . "$(ENV_FILE)" && set +a; \
-	fi; \
-	driver="$${ORIGIN_DRIVER:-awss3}"; \
-	if [ "$$driver" = "azureblob" ]; then \
-		azure_account="$${AZURE_STORAGE_ACCOUNT:-devstoreaccount1}"; \
-		azure_container="$${AZURE_CONTAINER:-$${AZURITE_CONTAINER:-orca-test}}"; \
-		azure_endpoint="$${AZUREBLOB_ENDPOINT:-http://azurite.$(NAMESPACE).svc.cluster.local:10000/devstoreaccount1/}"; \
-	else \
-		azure_account="$${AZURE_STORAGE_ACCOUNT:-}"; \
-		azure_container="$${AZURE_CONTAINER:-orca-test}"; \
-		azure_endpoint="$${AZUREBLOB_ENDPOINT:-}"; \
-	fi; \
-	go run "$(REPO_ROOT)/hack/cmd/render-manifests" \
-		--templates-dir "$(REPO_ROOT)/deploy/orca" \
-		--output-dir "$(ORCA_RENDERED)" \
-		--set Namespace="$(NAMESPACE)" \
-		--set Image="$(ORCA_IMAGE)" \
-		--set ImagePullPolicy=IfNotPresent \
-		--set TargetReplicas="$${TARGET_REPLICAS:-3}" \
-		--set OriginID="$${ORIGIN_ID:-awss3-localstack}" \
-		--set OriginDriver="$$driver" \
-		--set AzureAccount="$$azure_account" \
-		--set AzureContainer="$$azure_container" \
-		--set AzureEndpoint="$$azure_endpoint" \
-		--set OriginAWSS3Endpoint="$${ORIGIN_AWSS3_ENDPOINT:-http://localstack.$(NAMESPACE).svc.cluster.local:4566}" \
-		--set OriginAWSS3Region="$${ORIGIN_AWSS3_REGION:-us-east-1}" \
-		--set OriginAWSS3Bucket="$${ORIGIN_AWSS3_BUCKET:-orca-origin}" \
-		--set OriginAWSS3UsePathStyle="true" \
-		--set CachestoreBucket="$${CACHESTORE_BUCKET:-orca-cache}" \
-		--set CachestoreEndpoint="$${CACHESTORE_ENDPOINT:-http://localstack.$(NAMESPACE).svc.cluster.local:4566}" \
-		--set CachestoreRegion="$${CACHESTORE_REGION:-us-east-1}" \
-		--set ClusterService="orca-peers.$(NAMESPACE).svc.cluster.local" \
-		--set ServerAuthEnabled=false \
-		--set InternalTLSEnabled=false \
-		--set LogLevel="$${LOG_LEVEL:-info}"
-
-render-dev:
-	@echo "Rendering dev manifests (LocalStack, init job, Azurite)"
-	@mkdir -p "$(DEV_RENDERED)"
-	@find "$(DEV_RENDERED)" -mindepth 1 -delete 2>/dev/null || true
-	@if [ -f "$(ENV_FILE)" ]; then \
-		set -a && . "$(ENV_FILE)" && set +a; \
-	fi; \
-	go run "$(REPO_ROOT)/hack/cmd/render-manifests" \
-		--templates-dir "$(DEV_TEMPLATES)" \
-		--output-dir "$(DEV_RENDERED)" \
-		--set Namespace="$(NAMESPACE)" \
-		--set CachestoreBucket="$${CACHESTORE_BUCKET:-orca-cache}" \
-		--set OriginBucket="$${ORIGIN_AWSS3_BUCKET:-orca-origin}" \
-		--set AzuriteContainer="$${AZURE_CONTAINER:-$${AZURITE_CONTAINER:-orca-test}}" \
-		--set AzuriteNodePort="$${AZURITE_NODE_PORT:-30100}"
-
-# -- Image + cluster ----------------------------------------------------------
-
-image:
-	@echo "Building Orca image $(ORCA_IMAGE) with $(CONTAINER_ENGINE)"
-	cd "$(REPO_ROOT)" && $(MAKE) image-orca-local \
-		VERSION=$(ORCA_VERSION) \
-		CONTAINER_ENGINE=$(CONTAINER_ENGINE) \
-		ORCA_IMAGE=$(ORCA_IMAGE)
-
-kind-create:
-	CLUSTER_NAME="$(CLUSTER_NAME)" KIND_CONFIG="$(KIND_CONFIG)" $(HACK_DIR)kind-create.sh
-
-kind-load:
-	CLUSTER_NAME="$(CLUSTER_NAME)" \
-	ORCA_IMAGE="$(ORCA_IMAGE)" \
-	CONTAINER_ENGINE="$(CONTAINER_ENGINE)" \
-		$(HACK_DIR)kind-load.sh
-
-# -- Deploy steps -------------------------------------------------------------
-
-deploy-localstack: render-dev render
-	kubectl --context kind-$(CLUSTER_NAME) apply -f "$(ORCA_RENDERED)/01-namespace.yaml"
-	kubectl --context kind-$(CLUSTER_NAME) apply -f "$(DEV_RENDERED)/01-localstack.yaml"
-	kubectl --context kind-$(CLUSTER_NAME) -n $(NAMESPACE) rollout status deployment/localstack --timeout=120s
-	kubectl --context kind-$(CLUSTER_NAME) apply -f "$(DEV_RENDERED)/02-init-job.yaml"
-	kubectl --context kind-$(CLUSTER_NAME) -n $(NAMESPACE) wait --for=condition=complete job/orca-buckets-init --timeout=120s
-
-deploy-azurite: render-dev
-	kubectl --context kind-$(CLUSTER_NAME) apply -f "$(ORCA_RENDERED)/01-namespace.yaml"
-	kubectl --context kind-$(CLUSTER_NAME) apply -f "$(DEV_RENDERED)/03-azurite.yaml"
-	kubectl --context kind-$(CLUSTER_NAME) -n $(NAMESPACE) rollout status deployment/azurite --timeout=180s
-	kubectl --context kind-$(CLUSTER_NAME) apply -f "$(DEV_RENDERED)/04-azurite-init.yaml"
-	kubectl --context kind-$(CLUSTER_NAME) -n $(NAMESPACE) wait --for=condition=complete job/orca-azurite-container-init --timeout=180s
-
-deploy-credentials:
-	CLUSTER_NAME="$(CLUSTER_NAME)" \
-	NAMESPACE="$(NAMESPACE)" \
-	ENV_FILE="$(ENV_FILE)" \
-		$(HACK_DIR)deploy-credentials.sh
-
-deploy-orca: render
-	kubectl --context kind-$(CLUSTER_NAME) apply -f "$(ORCA_RENDERED)/02-rbac.yaml"
-	kubectl --context kind-$(CLUSTER_NAME) apply -f "$(ORCA_RENDERED)/03-config.yaml"
-	# Service before Deployment: the headless orca-peers Service must
-	# exist (with its DNS A-records) before the pods start so the
-	# initial cluster.refresh sees the full peer set instead of
-	# bootstrapping into the self-only fallback.
-	kubectl --context kind-$(CLUSTER_NAME) apply -f "$(ORCA_RENDERED)/05-service.yaml"
-	kubectl --context kind-$(CLUSTER_NAME) apply -f "$(ORCA_RENDERED)/04-deployment.yaml"
-
-wait-ready:
-	kubectl --context kind-$(CLUSTER_NAME) -n $(NAMESPACE) rollout status deployment/orca --timeout=180s
-
-# -- Operate ------------------------------------------------------------------
-
-status:
-	kubectl --context kind-$(CLUSTER_NAME) -n $(NAMESPACE) get pods -o wide
-
-logs:
-	kubectl --context kind-$(CLUSTER_NAME) -n $(NAMESPACE) logs -l app.kubernetes.io/name=orca --tail=200 -f
-
-port-forward:
-	@echo "Forwarding localhost:8443 -> svc/orca:8443 ..."
-	kubectl --context kind-$(CLUSTER_NAME) -n $(NAMESPACE) port-forward svc/orca 8443:8443
-
-seed-azure: ## Upload a file to real Azure (requires AZURE_STORAGE_* in .env; pass FILE=...)
-	@[ -n "$(FILE)" ] || { echo "Usage: make seed-azure FILE=/path/to/file [SEED_ARGS='--name foo']" >&2; exit 1; }
-	@if [ -f "$(ENV_FILE)" ]; then set -a && . "$(ENV_FILE)" && set +a; fi; \
-	[ -n "$${AZURE_STORAGE_ACCOUNT:-}" ] || { echo "AZURE_STORAGE_ACCOUNT not set in $(ENV_FILE)" >&2; exit 1; }; \
-	[ -n "$${AZURE_STORAGE_KEY:-}" ]     || { echo "AZURE_STORAGE_KEY not set in $(ENV_FILE)"     >&2; exit 1; }; \
-	[ -n "$${AZURE_CONTAINER:-}" ]       || { echo "AZURE_CONTAINER not set in $(ENV_FILE)"       >&2; exit 1; }; \
-	go run "$(REPO_ROOT)/hack/cmd/orcaseed" upload \
-		--endpoint "https://$${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/" \
-		--account "$${AZURE_STORAGE_ACCOUNT}" \
-		--account-key "$${AZURE_STORAGE_KEY}" \
-		--container "$${AZURE_CONTAINER}" \
-		--file "$(FILE)" \
-		$(SEED_ARGS)
-
-# -- Seeder (orcaseed) helpers ------------------------------------------------
-#
-# These targets invoke hack/cmd/orcaseed against the in-cluster Azurite
-# emulator exposed on the host loopback via the NodePort 30100 baked
-# into deploy/orca/dev/03-azurite.yaml.tmpl. Override AZURITE_NODE_PORT
-# in .env if you've bumped the NodePort to avoid a host-port conflict.
-# Pass extra flags via SEED_ARGS, e.g.:
-#
-#   make -C hack/orca seed-generate SEED_ARGS='--size 10MiB --count 5'
-#   make -C hack/orca seed-upload FILE=~/data.tar.gz
-#   make -C hack/orca seed-list
-#   make -C hack/orca seed-delete PREFIX=synth- SEED_ARGS='--yes'
-
-SEED_ENDPOINT ?= http://localhost:$${AZURITE_NODE_PORT:-30100}/devstoreaccount1/
-
-seed-generate: ## Generate synthetic blobs and upload to the Azurite origin
-	@if [ -f "$(ENV_FILE)" ]; then set -a && . "$(ENV_FILE)" && set +a; fi; \
-	go run "$(REPO_ROOT)/hack/cmd/orcaseed" generate \
-		--endpoint "$(SEED_ENDPOINT)" \
-		--container "$${AZURE_CONTAINER:-orca-test}" \
-		$(SEED_ARGS)
-
-seed-upload: ## Upload a file to the Azurite origin (use FILE=/path/to/file)
-	@[ -n "$(FILE)" ] || { echo "Usage: make seed-upload FILE=/path/to/file [SEED_ARGS='--name foo']" >&2; exit 1; }
-	@if [ -f "$(ENV_FILE)" ]; then set -a && . "$(ENV_FILE)" && set +a; fi; \
-	go run "$(REPO_ROOT)/hack/cmd/orcaseed" upload \
-		--endpoint "$(SEED_ENDPOINT)" \
-		--container "$${AZURE_CONTAINER:-orca-test}" \
-		--file "$(FILE)" \
-		$(SEED_ARGS)
-
-seed-list: ## List blobs in the Azurite origin container
-	@if [ -f "$(ENV_FILE)" ]; then set -a && . "$(ENV_FILE)" && set +a; fi; \
-	go run "$(REPO_ROOT)/hack/cmd/orcaseed" list \
-		--endpoint "$(SEED_ENDPOINT)" \
-		--container "$${AZURE_CONTAINER:-orca-test}" \
-		$(SEED_ARGS)
-
-seed-delete: ## Delete blobs from the Azurite origin container (use PREFIX=foo)
-	@if [ -f "$(ENV_FILE)" ]; then set -a && . "$(ENV_FILE)" && set +a; fi; \
-	go run "$(REPO_ROOT)/hack/cmd/orcaseed" delete \
-		--endpoint "$(SEED_ENDPOINT)" \
-		--container "$${AZURE_CONTAINER:-orca-test}" \
-		--prefix "$(PREFIX)" \
-		$(SEED_ARGS)
+port-forward: ## Foreground forward localhost:8443 -> svc/orca:8443
+	@echo "Forwarding localhost:8443 -> svc/orca:8443 (Ctrl-C to stop)"
+	kubectl --context $(KUBECTL_CTX) -n $(NAMESPACE) port-forward svc/orca 8443:8443

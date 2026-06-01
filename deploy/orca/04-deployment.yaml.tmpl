@@ -26,17 +26,33 @@ spec:
         app.kubernetes.io/name: orca
     spec:
       serviceAccountName: orca
-      # Required anti-affinity: at most one Orca pod per node so that a
-      # single node failure does not knock out multiple replicas. The
-      # dev harness Kind cluster has 3 worker nodes to match the default
-      # 3 replicas.
+      # Pod anti-affinity controls how Orca replicas spread across
+      # nodes. The dev install picks the right shape based on the
+      # cluster:
+      #   * Kind installs render the strict `required` block so the
+      #     dev harness mirrors the production topology (1 pod per
+      #     node, 3-node kind cluster matches 3 replicas).
+      #   * Non-kind installs render the relaxed `preferred` block so
+      #     clusters with fewer than 3 schedulable nodes still roll
+      #     out cleanly.
+      # Override via setup-orca.sh's RequireAntiAffinity knob.
       affinity:
         podAntiAffinity:
+          {{- if eq (default "true" .RequireAntiAffinity) "true" }}
           requiredDuringSchedulingIgnoredDuringExecution:
             - labelSelector:
                 matchLabels:
                   app.kubernetes.io/name: orca
               topologyKey: kubernetes.io/hostname
+          {{- else }}
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: orca
+                topologyKey: kubernetes.io/hostname
+          {{- end }}
       containers:
         - name: orca
           image: {{ default "ghcr.io/azure/orca:latest" .Image | quote }}

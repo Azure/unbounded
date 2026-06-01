@@ -20,7 +20,7 @@ use std::ffi::CString;
 use std::ptr;
 use std::sync::RwLock;
 
-use crate::bufferpool::PeerId;
+use crate::fabric::PeerId;
 
 use super::error::{FabricError, Result, check};
 use super::fabric::Fabric;
