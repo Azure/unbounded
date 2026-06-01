@@ -91,6 +91,18 @@ ORCA_NAMESPACE ?= unbounded-kube
 ORCA_MANIFEST_TEMPLATES_DIR := deploy/orca
 ORCA_MANIFEST_RENDERED_DIR  := deploy/orca/rendered
 
+# Dev image tag used by the orca-kind-up / orca-install paths.
+# Pinned to :dev so kind load and rollout-restart use a stable
+# identifier (the auto-derived VERSION can include slashes from git
+# tags like images/agent-ubuntu2404-nvidia/v..., which are illegal
+# in OCI tags). Override with ORCA_DEV_IMAGE=... when targeting a
+# remote registry.
+ORCA_DEV_IMAGE ?= ghcr.io/azure/orca:dev
+
+# Kind cluster name used by orca-kind-up / orca-kind-down. Mirrors
+# the default in hack/orca/kind-up.sh.
+ORCA_KIND_CLUSTER ?= orca-dev
+
 # kubectl-unbounded also stamps the metalman image reference.
 KUBECTL_UNBOUNDED_LDFLAGS=$(STAMP_LDFLAGS) -X github.com/Azure/unbounded/cmd/kubectl-unbounded/app.MetalmanImage=$(METALMAN_IMAGE)
 
@@ -126,7 +138,7 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 # Frontend build toggle (dev builds produce unminified output with sourcemaps).
 REACT_DEV ?= false
 
-.PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check
+.PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-manifests
 .PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-net-controller-local image-net-node-local images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
@@ -160,6 +172,7 @@ help: ## Show this help
 	@echo "Build:"
 	@echo "  kubectl-unbounded                Build kubectl-unbounded plugin"
 	@echo "  forge                            Build forge dev tool"
+	@echo "  orcadev                          Build orcadev dev/debug tool"
 	@echo "  inventory-all                    Build all inventory components"
 	@echo "  inventory-agent                  Build inventory-agent for amd64 and arm64"
 	@echo "  inventory-agent-amd64            Build inventory-agent for amd64"
@@ -227,13 +240,14 @@ help: ## Show this help
 	@echo "Net Kubernetes (apply to current kubectl context):"
 	@echo "  See \`make -C hack/net help\` for cluster deploy/undeploy targets."
 	@echo ""
-	@echo "Orca Dev Harness (Kind cluster):"
+	@echo "Orca Dev Install (see hack/orca/README.md for the developer quickstart):"
 	@echo "  orca | orca-build                Build orca binary (with/without lint/test)"
-	@echo "  orca-up                          Bring up Orca dev harness in Kind"
-	@echo "  orca-down                        Tear down Orca dev harness Kind cluster"
-	@echo "  orca-reset                       Rebuild image and rollout-restart deployment"
+	@echo "  orcadev                          Build orcadev dev/debug tool"
+	@echo "  orca-install                     Install Orca into the current kubectl context"
+	@echo "  orca-kind-up | orca-up           Create kind cluster + install Orca (build + side-load image)"
+	@echo "  orca-kind-down | orca-down       Delete the kind cluster"
+	@echo "  orca-reset                       Rebuild image and rolling-restart Orca on kind"
 	@echo "  orca-inttest                     Run orca integration tests (Docker required)"
-	@echo "  See \`make -C hack/orca help\` for full list."
 	@echo ""
 	@echo "Documentation:"
 	@echo "  docs-serve                       Start local Hugo dev server"
@@ -376,6 +390,12 @@ kubectl-unbounded: test kubectl-unbounded-build ## Build the kubectl-unbounded p
 
 forge: test ## Build the forge dev tool (implies test)
 	$(GOBUILD) -o $(FORGE_BIN) $(FORGE_CMD)/main.go
+
+ORCADEV_BIN=bin/orcadev
+ORCADEV_CMD=./hack/cmd/orcadev
+
+orcadev: test ## Build the orcadev dev/debug tool (implies test)
+	$(GOBUILD) -o $(ORCADEV_BIN) $(ORCADEV_CMD)/main.go
 
 .PHONY: inventory-all
 inventory-all: inventory-agent inventory-aggregator inventory-inspector inventory-viewer ## Build all inventory components
@@ -665,7 +685,9 @@ metalman-oci-push: metalman-oci ## Build and push the metalman container image
 
 ##@ Orca
 
-.PHONY: orca orca-build orca-manifests orca-oci orca-oci-push orca-up orca-down orca-reset orca-inttest image-orca-local
+.PHONY: orca orca-build orca-manifests orca-oci orca-oci-push \
+        orca-install orca-kind-up orca-kind-down orca-up orca-down orca-reset \
+        orca-inttest image-orca-local
 
 orca-build: ## Build the orca binary (no lint/test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(ORCA_BIN) $(ORCA_CMD)/main.go
@@ -695,16 +717,53 @@ orca-oci: image-orca-local ## Alias for image-orca-local
 orca-oci-push: orca-oci ## Build and push the orca container image
 	$(CONTAINER_ENGINE) push $(ORCA_IMAGE)
 
-# Dev-cluster proxy targets. The actual implementations live in
-# hack/orca/Makefile (see AGENTS.md convention; mirrors hack/net/).
-orca-up: ## Bring up the Orca dev harness in a Kind cluster
-	$(MAKE) -C hack/orca up
+# Dev install entrypoints. There is exactly one supported install
+# path: ./hack/orca/setup-orca.sh. The Make targets below are thin
+# wrappers around it for muscle memory. See hack/orca/README.md for
+# the developer quickstart.
 
-orca-down: ## Tear down the Orca dev harness Kind cluster
-	$(MAKE) -C hack/orca down
+orca-install: ## Install Orca into the current kubectl context (no kind assumptions)
+	@ctx=$$(kubectl config current-context 2>/dev/null || echo none); \
+	case "$$ctx" in \
+	  kind-*) : ;; \
+	  *) \
+	    if [ "$(ORCA_DEV_IMAGE)" = "ghcr.io/azure/orca:dev" ]; then \
+	      echo "ERROR: current kubectl context '$$ctx' is not kind-*, but ORCA_DEV_IMAGE is the default ghcr.io/azure/orca:dev." >&2; \
+	      echo "       That image is not in any registry your cluster can pull from and the install will ImagePullBackOff." >&2; \
+	      echo "       Either:" >&2; \
+	      echo "         (a) switch to a kind context: kubectl config use-context kind-orca-dev" >&2; \
+	      echo "         (b) build, push, and pass a reachable image:" >&2; \
+	      echo "             make image-orca-local ORCA_IMAGE=my-registry/orca:dev" >&2; \
+	      echo "             podman push my-registry/orca:dev" >&2; \
+	      echo "             make orca-install ORCA_DEV_IMAGE=my-registry/orca:dev" >&2; \
+	      exit 1; \
+	    fi ;; \
+	esac
+	./hack/orca/setup-orca.sh --image $(ORCA_DEV_IMAGE) --namespace $(ORCA_NAMESPACE)
 
-orca-reset: ## Rebuild orca image and rolling-restart the dev deployment
-	$(MAKE) -C hack/orca reset
+orca-kind-up: ## Create the orca-dev kind cluster + install Orca (build + side-load image)
+	./hack/orca/kind-up.sh --name $(ORCA_KIND_CLUSTER)
+	./hack/orca/setup-orca.sh \
+		--context kind-$(ORCA_KIND_CLUSTER) \
+		--namespace $(ORCA_NAMESPACE) \
+		--image $(ORCA_DEV_IMAGE) \
+		--build --kind-load
+
+orca-kind-down: ## Delete the orca-dev kind cluster
+	./hack/orca/kind-down.sh --name $(ORCA_KIND_CLUSTER)
+
+# Back-compat aliases. orca-up / orca-down used to be the only
+# entrypoints and developers' muscle memory still reaches for them.
+orca-up: orca-kind-up ## Alias for orca-kind-up
+orca-down: orca-kind-down ## Alias for orca-kind-down
+
+orca-reset: ## Rebuild orca image, side-load into kind, rolling-restart the deployment
+	$(MAKE) image-orca-local ORCA_IMAGE=$(ORCA_DEV_IMAGE)
+	tmp=$$(mktemp -d) && trap "rm -rf $$tmp" EXIT && \
+		$(CONTAINER_ENGINE) save -o $$tmp/orca.tar $(ORCA_DEV_IMAGE) && \
+		kind load image-archive $$tmp/orca.tar --name $(ORCA_KIND_CLUSTER)
+	kubectl --context kind-$(ORCA_KIND_CLUSTER) -n $(ORCA_NAMESPACE) rollout restart deployment/orca
+	kubectl --context kind-$(ORCA_KIND_CLUSTER) -n $(ORCA_NAMESPACE) rollout status deployment/orca --timeout=180s
 
 # orca-inttest mirrors the test/test-race pattern: race detector in CI
 # (ubuntu-latest has gcc), no -race locally so developers without a C

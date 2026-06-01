@@ -14,10 +14,10 @@
 //! side, and finally [`engine`] wires everything into the
 //! `bufferpool::BlockStore` surface the rest of the project sees.
 
+pub mod admission;
 pub mod blockdev;
 pub mod types;
 
-mod admission;
 mod alloc;
 mod btree;
 mod engine;
@@ -28,6 +28,7 @@ mod refcount;
 mod singleflight;
 mod traits;
 
+pub use admission::{AdmissionFilter, AdmitDecision, StripeAdmission};
 pub use engine::{EngineConfig, StorageEngine};
 pub use local::{LocalStorage, ShardLocalStore};
 pub use traits::PageChecksum;

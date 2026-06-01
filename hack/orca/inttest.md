@@ -8,7 +8,7 @@ brings up real LocalStack and Azurite containers via
 wired to those containers. No Kubernetes cluster is required.
 
 For the Kubernetes-flavored deployment validation harness (Kind +
-manifests + headless DNS), see [dev-harness.md](./dev-harness.md). The
+manifests + headless DNS), see [README.md](./README.md). The
 two harnesses are complementary: the integration tests cover Go-level
 behavior (origin, cachestore, fetch coordinator, cluster routing,
 internal-fill RPC); the dev harness covers the manifest + deployment
