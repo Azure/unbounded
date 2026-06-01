@@ -51,15 +51,6 @@ func (k Key) Path() string {
 	return fmt.Sprintf("%s/%s/%d", k.OriginID, hex.EncodeToString(sum), k.Index)
 }
 
-// Range returns the byte range [Off, Off+Len) within the origin
-// object that this chunk corresponds to.
-func (k Key) Range() (off, length int64) {
-	off = k.Index * k.ChunkSize
-	length = k.ChunkSize
-
-	return off, length
-}
-
 // ExpectedLen returns the authoritative number of bytes this chunk
 // should contain given the object's total size. For non-tail chunks
 // this is k.ChunkSize; for the tail chunk it is the remainder. If

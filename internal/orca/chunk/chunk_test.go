@@ -136,22 +136,6 @@ func TestKey_Path_Format(t *testing.T) {
 	}
 }
 
-// TestKey_Range verifies (off, length) = (Index*ChunkSize, ChunkSize).
-func TestKey_Range(t *testing.T) {
-	t.Parallel()
-
-	k := Key{ChunkSize: 1 << 20, Index: 3}
-
-	off, length := k.Range()
-	if off != 3<<20 {
-		t.Errorf("off=%d want %d", off, 3<<20)
-	}
-
-	if length != 1<<20 {
-		t.Errorf("length=%d want %d", length, 1<<20)
-	}
-}
-
 // TestIndexRange covers the chunk-index span computed from a byte
 // range plus the end clamping to objectSize.
 func TestIndexRange(t *testing.T) {
