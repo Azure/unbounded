@@ -210,7 +210,8 @@ help: ## Show this help
 	@echo "  bench                            Build the bench tool (excluded from images)"
 	@echo "  unbounded-storage-test           Run cargo tests for unbounded-storage"
 	@echo "  unbounded-storage-check          Run cargo check for unbounded-storage"
-	@echo "  unbounded-storage-model-check    Run TLC on the CoW B+tree crash-consistency model"
+	@echo "  unbounded-storage-model-check    Run TLC on all unbounded-storage TLA+ models"
+	@echo "  unbounded-storage-model-check-<model>  Run TLC on one model (e.g. copy-on-write)"
 	@echo "  libfabric                        Build/install the pinned libfabric from source"
 	@echo ""
 	@echo "Container Images (local, single-arch):"
@@ -527,7 +528,7 @@ bench: $(LIBFABRIC_STAMP) ## Build the bench tool (excluded from images)
 	@mkdir -p $(dir $(UNBOUNDED_STORAGE_BIN))
 	cp $(UNBOUNDED_STORAGE_CRATE)/target/release/bench bin/bench
 
-# TLA+ tooling for the unbounded-storage CoW B+tree crash-consistency model.
+# TLA+ tooling for the unbounded-storage models.
 # tla2tools.jar is fetched on demand into tmp/ (gitignored).  Override
 # TLA_TOOLS_JAR to use a locally installed copy.
 #
@@ -538,7 +539,13 @@ TLA_TOOLS_JAR ?= tmp/tla2tools.jar
 TLA_TOOLS_VERSION ?= v1.8.0
 TLA_TOOLS_URL ?= https://github.com/tlaplus/tlaplus/releases/download/$(TLA_TOOLS_VERSION)/tla2tools.jar
 TLA_TOOLS_SHA256 ?= 71546dff3897a01b0ee4fa64135d9f5e9384d2b7e47b3cc20a16b655b0eb4f86
-COW_MODEL_DIR := cmd/unbounded-storage/models/copy-on-write
+
+# Root directory holding the TLA+ models.  Each subdirectory contains exactly
+# one <Name>.tla plus a matching <Name>.cfg and is model-checked by a per-model
+# target.  STORAGE_MODEL_DIRS lists the model basenames the aggregate target
+# iterates over.
+STORAGE_MODELS_ROOT := cmd/unbounded-storage/models
+STORAGE_MODEL_DIRS := bufferpool-singleflight chord-routing copy-on-write engine-reclamation fabric-completion
 
 $(TLA_TOOLS_JAR):
 	@mkdir -p $(dir $(TLA_TOOLS_JAR))
@@ -546,9 +553,34 @@ $(TLA_TOOLS_JAR):
 	@curl -fsSL -o $(TLA_TOOLS_JAR) $(TLA_TOOLS_URL)
 	@echo "$(TLA_TOOLS_SHA256)  $(TLA_TOOLS_JAR)" | sha256sum -c -
 
-unbounded-storage-model-check: $(TLA_TOOLS_JAR) ## Run TLC on the CoW B+tree crash-consistency model
+# Per-model pattern target: `make unbounded-storage-model-check-<dir>` runs TLC
+# on the single .tla/.cfg pair found in cmd/unbounded-storage/models/<dir>.
+unbounded-storage-model-check-%: $(TLA_TOOLS_JAR)
 	@command -v java >/dev/null 2>&1 || { echo "java is required to run TLC" >&2; exit 1; }
-	cd $(COW_MODEL_DIR) && java -XX:+UseParallelGC -cp $(CURDIR)/$(TLA_TOOLS_JAR) tlc2.TLC -workers auto -config CowBtreeCrash.cfg CowBtreeCrash.tla
+	@dir="$(STORAGE_MODELS_ROOT)/$*"; \
+	test -d "$$dir" || { echo "no such model directory: $$dir" >&2; exit 1; }; \
+	echo "==> Model-checking $*"; \
+	cd "$$dir" || exit 1; \
+	count=0; tla=; \
+	for f in *.tla; do \
+		test -e "$$f" || continue; \
+		count=$$((count + 1)); tla=$$f; \
+	done; \
+	if [ "$$count" -ne 1 ]; then \
+		if [ "$$count" -eq 0 ]; then \
+			echo "model directory $$dir contains no .tla file" >&2; \
+		else \
+			echo "model directory $$dir must contain exactly one .tla file, found $$count: "*.tla >&2; \
+		fi; \
+		exit 1; \
+	fi; \
+	base=$${tla%.tla}; \
+	java -XX:+UseParallelGC -cp $(CURDIR)/$(TLA_TOOLS_JAR) tlc2.TLC -workers auto -config $$base.cfg $$base.tla
+
+# Aggregate target: run TLC on every unbounded-storage TLA+ model.  Fails if any
+# individual model fails.
+unbounded-storage-model-check: $(addprefix unbounded-storage-model-check-,$(STORAGE_MODEL_DIRS)) ## Run TLC on all unbounded-storage TLA+ models
+	@echo "All unbounded-storage TLA+ models checked successfully."
 
 ##@ Container Images
 #

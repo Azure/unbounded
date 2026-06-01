@@ -9,8 +9,7 @@
   The single invariant we defend:
 
       If the cache reports a hit for key K and returns bytes B, then B is
-      the bytes that some prior successful Fault committed for K, and that
-      commit has not since been superseded.
+      bytes that some prior successful Fault committed for K.
 
   Only leaf B+tree pages are modelled: internal pages share the same
   per-page checksum argument and add no states the invariant can
@@ -42,15 +41,12 @@ EmptyEntries == [k \in Key |-> NONE]
 VARIABLES
   truth,        \* Key -> SUBSET Data.  History of every value ever
                 \* committed by a successful Fault for each key.  The
-                \* invariant checks "Hit(d) for k => d \in truth[k]",
-                \* which is the existential reading of MODEL.md's prose
-                \* ("some prior successful fault committed for K").  This
+                \* invariant checks "Hit(d) for k => d \in truth[k]". This
                 \* flags returning bytes never written, returning bytes
                 \* committed under a different key, and returning bytes
                 \* synthesized from a torn page; it intentionally tolerates
-                \* a recovery that falls back to a still-durable older
-                \* version of K, since under no-fsync that prior version
-                \* was never actually superseded on the platter.
+                \* recovery falling back to a still-durable older version of
+                \* K under the no-fsync persistence model.
   durable,      \* LBA -> Page \cup {NONE}.  What is on the platter and
                 \* survives a crash.  NONE means the slot has never been
                 \* written.
@@ -185,7 +181,7 @@ Recover ==
   highest txn into a fresh tree at txn+1.  Under the single-leaf
   abstraction there is only one leaf per txn cohort, so adopting it
   directly is equivalent: every entry in a valid leaf was placed there by
-  some past successful Fault and therefore lives in truth[k].
+  some prior successful Fault and therefore lives in truth[k].
  ***************************************************************************)
 Rebuild ==
   /\ loaded_root = NONE
