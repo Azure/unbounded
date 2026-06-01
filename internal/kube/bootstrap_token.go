@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -18,7 +19,8 @@ import (
 )
 
 const (
-	bootstrapTokenAlphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
+	bootstrapTokenAlphabet   = "abcdefghijklmnopqrstuvwxyz0123456789"
+	DefaultBootstrapTokenTTL = 24 * time.Hour
 )
 
 // ErrBootstrapTokenNotFound is returned by GetBootstrapToken when no matching
@@ -26,9 +28,10 @@ const (
 var ErrBootstrapTokenNotFound = errors.New("bootstrap token not found")
 
 type BootstrapToken struct {
-	ID     string
-	Secret string
-	Labels map[string]string
+	ID        string
+	Secret    string
+	Labels    map[string]string
+	ExpiresAt time.Time
 }
 
 func (t *BootstrapToken) WithLabel(key, value string) *BootstrapToken {
@@ -58,7 +61,7 @@ func NewBootstrapToken() (*BootstrapToken, error) {
 		return nil, fmt.Errorf("failed to generate bootstrap token secret: %w", err)
 	}
 
-	return &BootstrapToken{ID: id, Secret: secret}, nil
+	return &BootstrapToken{ID: id, Secret: secret, ExpiresAt: time.Now().UTC().Add(DefaultBootstrapTokenTTL)}, nil
 }
 
 func ApplyBootstrapToken(ctx context.Context, kubeCli kubernetes.Interface, fieldManager string, token *BootstrapToken) error {
@@ -66,11 +69,17 @@ func ApplyBootstrapToken(ctx context.Context, kubeCli kubernetes.Interface, fiel
 		FieldManager: fieldManager,
 	}
 
+	expiresAt := token.ExpiresAt
+	if expiresAt.IsZero() {
+		expiresAt = time.Now().UTC().Add(DefaultBootstrapTokenTTL)
+	}
+
 	s := v1.Secret(bootstrapTokenName(token), metav1.NamespaceSystem).
 		WithType(corev1.SecretTypeBootstrapToken).
 		WithLabels(token.Labels).
 		WithData(map[string][]byte{
-			"auth-extra-groups":              []byte("system:bootstrappers:kubeadm:default-node-token"),
+			"auth-extra-groups":              []byte("system:bootstrappers:unbounded-agent-daemons"),
+			"expiration":                     []byte(expiresAt.UTC().Format(time.RFC3339)),
 			"token-id":                       []byte(token.ID),
 			"token-secret":                   []byte(token.Secret),
 			"usage-bootstrap-authentication": []byte("true"),
@@ -104,6 +113,9 @@ func GetBootstrapTokenForSite(ctx context.Context, kubeCli kubernetes.Interface,
 		if _, ok := secret.Data["token-secret"]; !ok {
 			continue
 		}
+		if isExpiredBootstrapToken(secret, time.Now()) {
+			continue
+		}
 
 		if newest == nil || secret.CreationTimestamp.After(newest.CreationTimestamp.Time) {
 			newest = secret
@@ -115,10 +127,30 @@ func GetBootstrapTokenForSite(ctx context.Context, kubeCli kubernetes.Interface,
 	}
 
 	return &BootstrapToken{
-		ID:     string(newest.Data["token-id"]),
-		Secret: string(newest.Data["token-secret"]),
-		Labels: newest.Labels,
+		ID:        string(newest.Data["token-id"]),
+		Secret:    string(newest.Data["token-secret"]),
+		Labels:    newest.Labels,
+		ExpiresAt: bootstrapTokenExpiration(newest),
 	}, nil
+}
+
+func isExpiredBootstrapToken(secret *corev1.Secret, now time.Time) bool {
+	expiresAt := bootstrapTokenExpiration(secret)
+
+	return !expiresAt.IsZero() && !now.Before(expiresAt)
+}
+
+func bootstrapTokenExpiration(secret *corev1.Secret) time.Time {
+	raw := strings.TrimSpace(string(secret.Data["expiration"]))
+	if raw == "" {
+		return time.Time{}
+	}
+	expiresAt, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return time.Time{}
+	}
+
+	return expiresAt
 }
 
 func bootstrapTokenName(tok *BootstrapToken) string {
