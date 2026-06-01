@@ -147,7 +147,7 @@ notices:
       - Copyright (c) Microsoft Corporation. All rights reserved.
     license:
       - name: MIT License
-        link: https://github.com/Azure/azure-sdk-for-go/blob/sdk/storage/azblob/v1.6.4/LICENSE.txt
+        link: https://github.com/Azure/azure-sdk-for-go/blob/sdk/storage/azblob/v1.7.0/LICENSE.txt
   - dependency: github.com/DATA-DOG/go-sqlmock
     ecosystem: go
     copyright:
