@@ -1,6 +1,7 @@
 ---
-# Grant bootstrap token users (system:bootstrappers group) the permissions
-# required by the unbounded-agent daemon. The daemon self-registers a
+# Grant daemon controller certificates the permissions required by the
+# unbounded-agent daemon. Further per-daemon restrictions can be enforced via
+# VPA. The daemon self-registers a
 # Machine CR at startup when one does not already exist, then runs an in-VM
 # controller loop that watches its local Node, its Machine CR, and
 # MachineOperation CRs targeting the machine. It also reads configuration
@@ -8,7 +9,7 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: unbounded-bootstrapper-machine
+  name: unbounded-daemon-controller-machine
 rules:
   - apiGroups: ["unbounded-cloud.io"]
     resources: ["machines"]
@@ -33,12 +34,46 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: unbounded-bootstrapper-machine
+  name: unbounded-daemon-controller-machine
 subjects:
   - kind: Group
-    name: system:bootstrappers
+    name: unbounded-agent-daemons
     apiGroup: rbac.authorization.k8s.io
 roleRef:
   kind: ClusterRole
-  name: unbounded-bootstrapper-machine
+  name: unbounded-daemon-controller-machine
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# Allow the bootstrap token group used by unbounded-agent to create the
+# kubelet's initial node client CSR. This is for kubelet TLS bootstrap, not the
+# daemon-controller CSR; daemon-controller CSR approval is handled by Machina.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: unbounded-bootstrapper-node
+subjects:
+  - kind: Group
+    name: system:bootstrappers:unbounded-agent-daemons
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: system:node-bootstrapper
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# Allow kube-controller-manager to auto-approve the kubelet's initial node
+# client CSR from the unbounded-agent bootstrap token group. This is not used
+# for daemon-controller CSR approval.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: unbounded-bootstrapper-node-autoapprove
+subjects:
+  - kind: Group
+    name: system:bootstrappers:unbounded-agent-daemons
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: system:certificates.k8s.io:certificatesigningrequests:nodeclient
   apiGroup: rbac.authorization.k8s.io
