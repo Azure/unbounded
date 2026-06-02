@@ -36,15 +36,15 @@ type ClusterOptions struct {
 	// OriginID is the logical origin identifier (echoed in chunk paths).
 	OriginID string
 
-	// OriginBucket is the bucket on the origin LocalStack/Azurite.
+	// OriginBucket is the bucket on the origin Garage/Azurite.
 	OriginBucket string
 
 	// OriginDriver is "awss3" (default) or "azureblob".
 	OriginDriver string
 
-	// LocalStack is the LocalStack handle used for origin (when
+	// Garage is the Garage handle used for origin (when
 	// OriginDriver=="awss3") and always for cachestore.
-	LocalStack *LocalStack
+	Garage *Garage
 
 	// Azurite is required when OriginDriver=="azureblob".
 	Azurite *Azurite
@@ -52,7 +52,7 @@ type ClusterOptions struct {
 	// AzureContainer is the Azurite container name for the origin.
 	AzureContainer string
 
-	// CachestoreBucket is the bucket on LocalStack used as the orca
+	// CachestoreBucket is the bucket on Garage used as the orca
 	// cachestore. If empty, a fresh bucket is allocated.
 	CachestoreBucket string
 
@@ -133,8 +133,8 @@ func StartCluster(ctx context.Context, t *testing.T, opts ClusterOptions) *Clust
 		opts.OriginID = "inttest-origin"
 	}
 
-	if opts.LocalStack == nil {
-		t.Fatal("StartCluster: LocalStack handle required")
+	if opts.Garage == nil {
+		t.Fatal("StartCluster: Garage handle required")
 	}
 
 	if opts.OriginDriver == "azureblob" {
@@ -153,7 +153,7 @@ func StartCluster(ctx context.Context, t *testing.T, opts ClusterOptions) *Clust
 
 	cacheBucket := opts.CachestoreBucket
 	if cacheBucket == "" {
-		cacheBucket = opts.LocalStack.NewBucket(ctx, t, "orca-cache")
+		cacheBucket = opts.Garage.NewBucket(ctx, t, "orca-cache")
 	}
 
 	// Allocate per-replica internal listeners up front (open) so each
@@ -292,11 +292,11 @@ func buildConfig(opts ClusterOptions, cacheBucket string) *config.Config {
 		Cachestore: config.Cachestore{
 			Driver: "s3",
 			S3: config.CachestoreS3{
-				Endpoint:     opts.LocalStack.Endpoint(),
+				Endpoint:     opts.Garage.Endpoint(),
 				Bucket:       cacheBucket,
-				Region:       opts.LocalStack.Region(),
-				AccessKey:    opts.LocalStack.AccessKey(),
-				SecretKey:    opts.LocalStack.SecretKey(),
+				Region:       opts.Garage.Region(),
+				AccessKey:    opts.Garage.AccessKey(),
+				SecretKey:    opts.Garage.SecretKey(),
 				UsePathStyle: true,
 			},
 		},
@@ -320,11 +320,11 @@ func buildConfig(opts ClusterOptions, cacheBucket string) *config.Config {
 	switch opts.OriginDriver {
 	case "awss3":
 		cfg.Origin.AWSS3 = config.AWSS3{
-			Endpoint:     opts.LocalStack.Endpoint(),
-			Region:       opts.LocalStack.Region(),
+			Endpoint:     opts.Garage.Endpoint(),
+			Region:       opts.Garage.Region(),
 			Bucket:       opts.OriginBucket,
-			AccessKey:    opts.LocalStack.AccessKey(),
-			SecretKey:    opts.LocalStack.SecretKey(),
+			AccessKey:    opts.Garage.AccessKey(),
+			SecretKey:    opts.Garage.SecretKey(),
 			UsePathStyle: true,
 		}
 	case "azureblob":
