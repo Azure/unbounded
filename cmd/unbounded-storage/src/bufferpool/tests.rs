@@ -727,6 +727,7 @@ fn stream_limit_enforced() {
     s.preload(key(0), 0, vec![0u8; P]);
     let cfg = PoolConfig {
         max_concurrent_streams: 1,
+        ..PoolConfig::default()
     };
     let pool = Pool::new(
         cfg,

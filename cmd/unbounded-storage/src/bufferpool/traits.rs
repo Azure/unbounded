@@ -9,6 +9,7 @@ use std::task::{Context, Poll};
 
 use crate::bufferpool::stream::ReadStream;
 use crate::bufferpool::types::{BulkRef, Error, PageRef, StripeKey};
+use crate::bufferpool::window::WindowedRead;
 use crate::memory::Backing;
 
 pub trait Req {
@@ -125,4 +126,22 @@ pub trait BufferPool {
         offset: u64,
         len: u64,
     ) -> Result<ReadStream<'p>, Error>;
+
+    /// Windowed counterpart to [`BufferPool::read`]. Returns a
+    /// [`WindowedRead`] that keeps up to `window` `fetch_page`
+    /// futures outstanding ahead of its consumer cursor (within a
+    /// single stripe) while still delivering pages strictly in
+    /// cursor order, one at a time. This is the high-throughput
+    /// read path: it overlaps fabric fetches of pages ahead of the
+    /// cursor with the in-order consumption of the current page, so
+    /// a single large read keeps many RDMA transfers in flight.
+    /// `window` is clamped by the implementation to the pool's
+    /// configured prefetch budget.
+    fn read_windowed<'p>(
+        &'p self,
+        req: &'p Self::Req,
+        offset: u64,
+        len: u64,
+        window: usize,
+    ) -> Result<WindowedRead<'p>, Error>;
 }

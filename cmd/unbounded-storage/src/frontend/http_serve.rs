@@ -413,6 +413,16 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
     }
 
     // 8. Stream the body stripe-by-stripe out of the bufferpool.
+    //
+    // Within each stripe we use the windowed read path so the pool
+    // keeps many page fetches in flight ahead of the byte we are
+    // currently sending. The client send (`send_zc_fixed`) is
+    // strictly in order on the single TCP stream, but the fabric
+    // fetches of pages ahead of the cursor overlap with it, which is
+    // what lets a single large object saturate the RDMA fabric NIC.
+    // `usize::MAX` requests the full window: `read_windowed` clamps
+    // it to the pool's configured `max_inflight_pages` budget, so the
+    // prefetch depth is governed by that single knob.
     for slice in stripe_set(resolved, stripe_size) {
         let origin_ref = OriginRef {
             backend_id: backend_id.to_string(),
@@ -421,8 +431,7 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
         };
         let pool_req = StripeReq::new(origin_ref.stripe_key()).with_origin(origin_ref);
         let mut rs = pool
-            .read(&pool_req, slice.intra_offset, slice.intra_len)
-            .await
+            .read_windowed(&pool_req, slice.intra_offset, slice.intra_len, usize::MAX)
             .map_err(|_| ())?;
         while let Some(page) = rs.next_page().await {
             let page = page.map_err(|_| ())?;
@@ -744,7 +753,7 @@ fn noop_waker() -> Waker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bufferpool::{Error, ReadStream};
+    use crate::bufferpool::{Error, ReadStream, WindowedRead};
     use crate::config::TlsCfg;
     use crate::frontend::range::StripeSlice;
 
@@ -952,6 +961,16 @@ mod tests {
             _offset: u64,
             _len: u64,
         ) -> Result<ReadStream<'p>, Error> {
+            Err(Error::from("mock pool has no data"))
+        }
+
+        fn read_windowed<'p>(
+            &'p self,
+            _req: &'p StripeReq,
+            _offset: u64,
+            _len: u64,
+            _window: usize,
+        ) -> Result<WindowedRead<'p>, Error> {
             Err(Error::from("mock pool has no data"))
         }
     }

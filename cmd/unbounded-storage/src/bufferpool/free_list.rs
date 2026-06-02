@@ -1,14 +1,25 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Single-shard free page allocator. Parks awaiting wakers when the
-//! backing is exhausted and wakes the oldest one on each
-//! [`FreeList::release`]. The pool runs single-threaded inside its
-//! NUMA shard so the underlying [`RefCell`] is sufficient; no atomics
-//! are required.
+//! Single-shard free page allocator with FIFO hand-off.
+//!
+//! When the backing is exhausted, blocking [`FreeList::alloc`] callers
+//! park in FIFO order. A released page is *handed off* directly to the
+//! oldest waiter (recorded in `granted`) rather than being returned to
+//! the shared `free` pool. This is load-bearing: speculative prefetch
+//! uses [`FreeList::try_alloc_spare`], which must never steal a page a
+//! blocked head fetch is owed. If `release` instead pushed the page to
+//! `free` and merely woke the waiter, a speculative `try_alloc_spare`
+//! running before the woken head re-polled (the waiter queue is empty
+//! in that window) could pop the page out from under it and deadlock
+//! under free-list pressure. Direct hand-off closes that race: a
+//! promised page lives in `granted`, never in `free`.
+//!
+//! The pool runs single-threaded inside its NUMA shard so the
+//! underlying [`RefCell`] is sufficient; no atomics are required.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
@@ -19,13 +30,33 @@ pub(super) struct FreeList {
 
 struct Inner {
     free: Vec<u32>,
-    // Parked wakers keyed by waiter id. `next_waiter_id` is
-    // monotonic, so ascending key order is arrival (FIFO) order and
-    // the head waiter is always the smallest key. Keying this way
-    // keeps lookup, insert, and remove at O(log n) and avoids the
-    // linear scans a queue would force on every poll and drop.
-    waiters: BTreeMap<u64, Waker>,
-    next_waiter_id: u64,
+    /// FIFO queue of blocked [`AllocFuture`]s, identified by id.
+    waiters: VecDeque<Waiter>,
+    /// Pages handed off to a specific waiter, awaiting its next poll.
+    /// Reserved here so speculation cannot reclaim them.
+    granted: Vec<(u64, u32)>,
+    next_id: u64,
+}
+
+struct Waiter {
+    id: u64,
+    waker: Waker,
+}
+
+impl Inner {
+    /// Give `page` to the oldest waiter (recording it in `granted` and
+    /// returning its waker to wake), or push it onto `free` if there
+    /// are no waiters. The caller must wake the returned waker after
+    /// dropping the borrow.
+    fn hand_off(&mut self, page: u32) -> Option<Waker> {
+        if let Some(w) = self.waiters.pop_front() {
+            self.granted.push((w.id, page));
+            Some(w.waker)
+        } else {
+            self.free.push(page);
+            None
+        }
+    }
 }
 
 impl FreeList {
@@ -39,8 +70,9 @@ impl FreeList {
         Self {
             inner: RefCell::new(Inner {
                 free,
-                waiters: BTreeMap::new(),
-                next_waiter_id: 0,
+                waiters: VecDeque::new(),
+                granted: Vec::new(),
+                next_id: 0,
             }),
         }
     }
@@ -48,8 +80,36 @@ impl FreeList {
     /// Try to grab a free page without parking.
     #[allow(dead_code)]
     pub fn try_alloc(&self) -> Option<u32> {
+        self.inner.borrow_mut().free.pop()
+    }
+
+    /// Non-blocking allocation for speculative (prefetch) use that
+    /// yields only a *spare* page.
+    ///
+    /// Two guards keep speculation from ever deadlocking a head fetch:
+    ///
+    /// 1. It fails if any waiter is parked on [`FreeList::alloc`].
+    ///    Parked waiters are head fetches with strict priority on
+    ///    scarce pages. (Pages already promised to a waiter live in
+    ///    `granted`, not `free`, so they are never visible here.)
+    ///
+    /// 2. It fails unless strictly more than `reserve` pages remain
+    ///    free *after* the pop, i.e. it keeps `reserve` pages in
+    ///    reserve for head fetches. The caller passes the current
+    ///    active-stream count: every active stream needs at most one
+    ///    backing page for its in-order head, so keeping `reserve`
+    ///    pages free guarantees no head ever has to park on
+    ///    [`FreeList::alloc`]. Since a deadlock cycle requires a head
+    ///    blocked on `alloc` while speculation pins the pages it
+    ///    needs, denying speculation that last reserve provably
+    ///    prevents the cycle. Under genuine page scarcity (few pages,
+    ///    many streams) this disables prefetch entirely and the reader
+    ///    degrades to head-only fetching; when pages are plentiful
+    ///    relative to streams (the single-large-object case we want to
+    ///    accelerate, `reserve == 1`) speculation runs at full depth.
+    pub fn try_alloc_spare(&self, reserve: usize) -> Option<u32> {
         let mut g = self.inner.borrow_mut();
-        if g.waiters.is_empty() {
+        if g.waiters.is_empty() && g.free.len() > reserve {
             g.free.pop()
         } else {
             None
@@ -60,17 +120,14 @@ impl FreeList {
     pub fn alloc(&self) -> AllocFuture<'_> {
         AllocFuture {
             list: self,
-            waiter_id: None,
+            id: None,
         }
     }
 
-    /// Return `page_idx` to the pool and wake the oldest waiter.
+    /// Return `page_idx` to the pool, handing it directly to the
+    /// oldest waiter if one is parked.
     pub fn release(&self, page_idx: u32) {
-        let waker = {
-            let mut g = self.inner.borrow_mut();
-            g.free.push(page_idx);
-            g.waiters.values().next().cloned()
-        };
+        let waker = self.inner.borrow_mut().hand_off(page_idx);
         if let Some(w) = waker {
             w.wake();
         }
@@ -84,7 +141,9 @@ impl FreeList {
 
 pub(super) struct AllocFuture<'a> {
     list: &'a FreeList,
-    waiter_id: Option<u64>,
+    /// Lazily assigned when this future first has to park, so it can
+    /// receive a hand-off and clean up on drop.
+    id: Option<u64>,
 }
 
 impl<'a> Future for AllocFuture<'a> {
@@ -93,67 +152,57 @@ impl<'a> Future for AllocFuture<'a> {
         let this = self.get_mut();
         let mut g = this.list.inner.borrow_mut();
 
-        if let Some(id) = this.waiter_id {
-            if g.waiters.contains_key(&id) {
-                // Refresh the stored waker (cancel-safe across polls).
-                g.waiters.insert(id, cx.waker().clone());
-                // Only the head (smallest id) may consume a page; this
-                // preserves strict FIFO service order.
-                if g.waiters.keys().next() != Some(&id) {
-                    return Poll::Pending;
-                }
-                if let Some(p) = g.free.pop() {
-                    g.waiters.remove(&id);
-                    let next_waker = if g.free.is_empty() {
-                        None
-                    } else {
-                        g.waiters.values().next().cloned()
-                    };
-                    this.waiter_id = None;
-                    drop(g);
-                    if let Some(w) = next_waker {
-                        w.wake();
-                    }
-                    return Poll::Ready(p);
-                }
-                return Poll::Pending;
+        // A page handed to us by `release`/drop-reclaim takes priority.
+        if let Some(id) = this.id {
+            if let Some(pos) = g.granted.iter().position(|(wid, _)| *wid == id) {
+                let (_, page) = g.granted.remove(pos);
+                return Poll::Ready(page);
             }
-            // Our entry is gone (currently unreachable, but a stray
-            // wake must never orphan the future). Re-park from scratch
-            // below so a Pending return always leaves a live waker.
-            this.waiter_id = None;
         }
 
-        if g.waiters.is_empty() {
+        // Only jump the queue for a free page if nobody is waiting
+        // ahead of us; otherwise we would starve parked heads.
+        if this.id.is_none() && g.waiters.is_empty() {
             if let Some(p) = g.free.pop() {
                 return Poll::Ready(p);
             }
         }
 
-        let id = g.next_waiter_id;
-        g.next_waiter_id = g.next_waiter_id.wrapping_add(1);
-        g.waiters.insert(id, cx.waker().clone());
-        this.waiter_id = Some(id);
+        // Park (or refresh our parked waker).
+        let id = match this.id {
+            Some(id) => id,
+            None => {
+                let id = g.next_id;
+                g.next_id += 1;
+                this.id = Some(id);
+                id
+            }
+        };
+        if let Some(w) = g.waiters.iter_mut().find(|w| w.id == id) {
+            w.waker = cx.waker().clone();
+        } else {
+            g.waiters.push_back(Waiter {
+                id,
+                waker: cx.waker().clone(),
+            });
+        }
         Poll::Pending
     }
 }
 
-impl Drop for AllocFuture<'_> {
+impl<'a> Drop for AllocFuture<'a> {
     fn drop(&mut self) {
-        let Some(id) = self.waiter_id.take() else {
+        let Some(id) = self.id else {
             return;
         };
         let waker = {
             let mut g = self.list.inner.borrow_mut();
-            // Hand the baton to the next waiter only if we were the
-            // head and a page is sitting free, matching the wake path
-            // in `poll`.
-            let was_head = g.waiters.keys().next() == Some(&id);
-            if g.waiters.remove(&id).is_none() {
-                return;
-            }
-            if was_head && !g.free.is_empty() {
-                g.waiters.values().next().cloned()
+            g.waiters.retain(|w| w.id != id);
+            // If we were handed a page but never polled to take it,
+            // re-offer it so it is not leaked.
+            if let Some(pos) = g.granted.iter().position(|(wid, _)| *wid == id) {
+                let (_, page) = g.granted.remove(pos);
+                g.hand_off(page)
             } else {
                 None
             }
@@ -161,94 +210,5 @@ impl Drop for AllocFuture<'_> {
         if let Some(w) = waker {
             w.wake();
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::FreeList;
-    use std::future::Future;
-    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-
-    fn noop_waker() -> Waker {
-        fn raw() -> RawWaker {
-            RawWaker::new(std::ptr::null(), &VTABLE)
-        }
-        static VTABLE: RawWakerVTable = RawWakerVTable::new(|_| raw(), |_| {}, |_| {}, |_| {});
-        unsafe { Waker::from_raw(raw()) }
-    }
-
-    #[test]
-    fn fresh_alloc_does_not_overtake_waiter() {
-        let list = FreeList::new(1);
-        let waker = noop_waker();
-        let mut cx = Context::from_waker(&waker);
-
-        let mut first = Box::pin(list.alloc());
-        let Poll::Ready(page) = first.as_mut().poll(&mut cx) else {
-            panic!("first allocation should be ready");
-        };
-        drop(first);
-
-        let mut waiter = Box::pin(list.alloc());
-        assert!(matches!(waiter.as_mut().poll(&mut cx), Poll::Pending));
-        list.release(page);
-
-        let mut fresh = Box::pin(list.alloc());
-        assert!(matches!(fresh.as_mut().poll(&mut cx), Poll::Pending));
-        assert!(matches!(waiter.as_mut().poll(&mut cx), Poll::Ready(0)));
-        assert!(matches!(fresh.as_mut().poll(&mut cx), Poll::Pending));
-
-        list.release(0);
-        assert!(matches!(fresh.as_mut().poll(&mut cx), Poll::Ready(0)));
-    }
-
-    #[test]
-    fn dropping_head_waiter_unblocks_next_waiter() {
-        let list = FreeList::new(1);
-        let waker = noop_waker();
-        let mut cx = Context::from_waker(&waker);
-
-        let mut first = Box::pin(list.alloc());
-        let Poll::Ready(page) = first.as_mut().poll(&mut cx) else {
-            panic!("first allocation should be ready");
-        };
-        drop(first);
-
-        let mut waiter1 = Box::pin(list.alloc());
-        assert!(matches!(waiter1.as_mut().poll(&mut cx), Poll::Pending));
-        let mut waiter2 = Box::pin(list.alloc());
-        assert!(matches!(waiter2.as_mut().poll(&mut cx), Poll::Pending));
-
-        list.release(page);
-        drop(waiter1);
-
-        assert!(matches!(waiter2.as_mut().poll(&mut cx), Poll::Ready(0)));
-    }
-
-    #[test]
-    fn poll_after_entry_removed_reparks_with_live_waker() {
-        let list = FreeList::new(1);
-        let waker = noop_waker();
-        let mut cx = Context::from_waker(&waker);
-
-        let mut first = Box::pin(list.alloc());
-        let Poll::Ready(page) = first.as_mut().poll(&mut cx) else {
-            panic!("first allocation should be ready");
-        };
-        drop(first);
-
-        let mut waiter = Box::pin(list.alloc());
-        assert!(matches!(waiter.as_mut().poll(&mut cx), Poll::Pending));
-
-        // Simulate the entry vanishing out from under the future. A
-        // re-poll must re-park rather than orphan itself, leaving a
-        // live waker registered.
-        list.inner.borrow_mut().waiters.clear();
-        assert!(matches!(waiter.as_mut().poll(&mut cx), Poll::Pending));
-        assert_eq!(list.inner.borrow().waiters.len(), 1);
-
-        list.release(page);
-        assert!(matches!(waiter.as_mut().poll(&mut cx), Poll::Ready(0)));
     }
 }

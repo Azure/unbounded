@@ -9,6 +9,7 @@ pub mod pool;
 pub mod stream;
 mod traits;
 mod types;
+mod window;
 
 #[cfg(test)]
 mod tests;
@@ -19,3 +20,4 @@ pub use pool::Pool;
 pub use stream::{PageGuard, ReadStream};
 pub use traits::{BlockStore, BufferPool, PageStream, Req, Transport};
 pub use types::{BulkRef, Error, PageRef, PoolConfig, StripeKey, TraceCtx};
+pub use window::WindowedRead;
