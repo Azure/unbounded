@@ -129,13 +129,14 @@ type Cachestore struct {
 }
 
 // CachestoreS3 is the s3 driver configuration. In dev this points at
-// LocalStack; in production at VAST or another in-DC S3-compatible
-// store.
+// a self-hosted S3-compatible store (Garage); in production at VAST or
+// another in-DC S3-compatible store.
 //
-// Bucket versioning is unconditionally validated at startup: a
-// versioned bucket silently breaks the no-clobber atomic-commit
-// primitive (PutObject + If-None-Match: *) the driver depends on.
-// There is no configuration switch for this gate.
+// Bucket versioning is unconditionally validated at startup: Orca's
+// chunks are immutable and re-committed only with byte-identical
+// content, so a versioned bucket would accumulate redundant object
+// versions that only waste space. There is no configuration switch for
+// this gate.
 type CachestoreS3 struct {
 	Endpoint     string `yaml:"endpoint"`
 	Bucket       string `yaml:"bucket"`

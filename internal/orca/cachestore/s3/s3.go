@@ -3,13 +3,19 @@
 
 // Package s3 is the cachestore driver for in-DC S3-compatible stores.
 // In production this targets VAST or another S3-compatible object
-// store; in dev it targets LocalStack.
+// store; in dev it targets a self-hosted S3-compatible store (Garage).
 //
-// Atomic commit is implemented via PutObject + If-None-Match: * (s3
-// conditional writes). The boot SelfTestAtomicCommit verifies the
-// backend honors the precondition; the boot versioning gate verifies
-// the bucket is not versioned (since If-None-Match is not honored on
-// versioned buckets).
+// Commit uses stat-then-put: HeadObject the chunk path, and if it is
+// already present skip the upload and report ErrCommitLost (another
+// replica won the fill race). This needs only GET/PUT/HEAD, so it works
+// against any S3-compatible backend, not just those that implement the
+// If-None-Match: * conditional-write precondition. Correctness rests on
+// the content-addressed layout: the ETag is part of the chunk path, so
+// two writers racing on the same key always carry byte-identical bytes
+// (see designs/orca/design.md s8). The boot SelfTest verifies
+// read-after-write visibility; the versioning gate refuses versioned
+// buckets, where retaining every overwrite of an immutable chunk would
+// only waste space.
 package s3
 
 import (
@@ -56,16 +62,18 @@ type Config struct {
 }
 
 // New constructs a Driver. The bucket-versioning gate is run here
-// unconditionally: a versioned bucket silently breaks the no-clobber
-// atomic-commit primitive (PutObject + If-None-Match: *) so the
-// driver refuses to start against one.
+// unconditionally: a versioned bucket retains every overwrite, and
+// because Orca's chunks are immutable and only ever re-committed with
+// byte-identical content, versioning would accumulate redundant object
+// versions that only waste space. The driver refuses to start against
+// a versioned bucket.
 //
 // The log receives debug-level emissions for every chunk operation
 // (Get, Put, Stat, Delete) and step-by-step boot trace from
-// SelfTestAtomicCommit / versioningGate. Passing nil falls back to
+// SelfTest / versioningGate. Passing nil falls back to
 // slog.Default().
 //
-// SelfTestAtomicCommit is a separate step (called by main after New)
+// SelfTest is a separate step (called by main after New)
 // to keep the constructor side-effect-light.
 func New(ctx context.Context, cfg Config, log *slog.Logger) (*Driver, error) {
 	if cfg.Bucket == "" {
@@ -82,8 +90,9 @@ func New(ctx context.Context, cfg Config, log *slog.Logger) (*Driver, error) {
 			cfg.AccessKey, cfg.SecretKey, "",
 		)),
 		// Opt out of CRC64NVME default introduced in aws-sdk-go-v2
-		// 1.32. LocalStack 3.8 returns InvalidRequest for unknown
-		// algorithms; real AWS S3 still works either way.
+		// 1.32. Several S3-compatible backends reject unknown
+		// checksum algorithms with InvalidRequest; real AWS S3 still
+		// works either way.
 		awsconfig.WithRequestChecksumCalculation(aws.RequestChecksumCalculationWhenRequired),
 		awsconfig.WithResponseChecksumValidation(aws.ResponseChecksumValidationWhenRequired),
 	)
@@ -114,9 +123,9 @@ func New(ctx context.Context, cfg Config, log *slog.Logger) (*Driver, error) {
 }
 
 // versioningGate refuses to start if the bucket has versioning enabled
-// or suspended. If-None-Match: * is not honored against versioned
-// buckets, which would silently break atomic commit's no-clobber
-// guarantee.
+// or suspended. Orca's chunks are immutable and only ever re-committed
+// with byte-identical content, so a versioned bucket would retain
+// redundant object versions that only waste space.
 func (d *Driver) versioningGate(ctx context.Context) error {
 	d.log.LogAttrs(ctx, slog.LevelDebug, "versioning_gate_probe",
 		slog.String("bucket", d.bucket),
@@ -138,26 +147,30 @@ func (d *Driver) versioningGate(ctx context.Context) error {
 }
 
 // validateBucketVersioning returns an error if the bucket's versioning
-// status is incompatible with cachestore/s3's atomic-commit primitive.
-// Extracted as a pure function so unit tests can cover all branches
-// (empty / Enabled / Suspended) without round-tripping to a real or
-// emulated S3 backend.
+// status is incompatible with cachestore/s3. Extracted as a pure
+// function so unit tests can cover all branches (empty / Enabled /
+// Suspended) without round-tripping to a real or emulated S3 backend.
 func validateBucketVersioning(bucket string, status s3types.BucketVersioningStatus) error {
 	switch status {
 	case s3types.BucketVersioningStatusEnabled, s3types.BucketVersioningStatusSuspended:
 		return fmt.Errorf(
-			"cachestore/s3: bucket %s has versioning %s; If-None-Match: * is not "+
-				"honored on versioned buckets and the atomic-commit primitive cannot "+
-				"guarantee no-clobber; disable bucket versioning to use cachestore/s3",
+			"cachestore/s3: bucket %s has versioning %s; Orca's chunks are "+
+				"immutable and re-committed only with byte-identical content, so a "+
+				"versioned bucket would accumulate redundant object versions; "+
+				"disable bucket versioning to use cachestore/s3",
 			bucket, status)
 	}
 
 	return nil
 }
 
-// SelfTestAtomicCommit verifies the backend honors PutObject +
-// If-None-Match: *.
-func (d *Driver) SelfTestAtomicCommit(ctx context.Context) error {
+// SelfTest verifies the backend provides read-after-write visibility,
+// which the stat-then-put commit step depends on: a chunk this replica
+// (or any peer) just wrote must be observable by a subsequent
+// HeadObject so concurrent fills converge instead of all re-uploading.
+// It writes a probe key, confirms it is visible via HeadObject, reads
+// the bytes back via GetObject, and deletes the probe.
+func (d *Driver) SelfTest(ctx context.Context) error {
 	suffix, err := randHex(16)
 	if err != nil {
 		return fmt.Errorf("cachestore/s3 self-test: generate probe key: %w", err)
@@ -166,66 +179,67 @@ func (d *Driver) SelfTestAtomicCommit(ctx context.Context) error {
 	probeKey := fmt.Sprintf("_orca-selftest/%s", suffix)
 	body := []byte("orca-selftest")
 
-	d.log.LogAttrs(ctx, slog.LevelDebug, "selftest_first_put",
+	d.log.LogAttrs(ctx, slog.LevelDebug, "selftest_put",
 		slog.String("bucket", d.bucket),
 		slog.String("probe_key", probeKey),
 	)
 
-	// First put: must succeed.
-	_, err = d.client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:      aws.String(d.bucket),
-		Key:         aws.String(probeKey),
-		Body:        bytes.NewReader(body),
-		IfNoneMatch: aws.String("*"),
-	})
-	if err != nil {
-		return fmt.Errorf("cachestore/s3 self-test: first put failed: %w", err)
+	if _, err := d.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(d.bucket),
+		Key:    aws.String(probeKey),
+		Body:   bytes.NewReader(body),
+	}); err != nil {
+		return fmt.Errorf("cachestore/s3 self-test: put failed: %w", err)
 	}
 
-	d.log.LogAttrs(ctx, slog.LevelDebug, "selftest_second_put_expecting_412",
-		slog.String("bucket", d.bucket),
-		slog.String("probe_key", probeKey),
-	)
-
-	// Second put: must fail with 412.
-	_, err = d.client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:      aws.String(d.bucket),
-		Key:         aws.String(probeKey),
-		Body:        bytes.NewReader(body),
-		IfNoneMatch: aws.String("*"),
-	})
-	if err == nil {
-		// Clean up before returning the failure.
+	// Best-effort cleanup regardless of how the verification below ends.
+	defer func() {
 		_, _ = d.client.DeleteObject(ctx, &s3.DeleteObjectInput{ //nolint:errcheck // best-effort selftest cleanup
 			Bucket: aws.String(d.bucket),
 			Key:    aws.String(probeKey),
 		})
+	}()
 
+	d.log.LogAttrs(ctx, slog.LevelDebug, "selftest_head_expecting_present",
+		slog.String("bucket", d.bucket),
+		slog.String("probe_key", probeKey),
+	)
+
+	// Read-after-write: the object just written must be visible.
+	if _, err := d.client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(d.bucket),
+		Key:    aws.String(probeKey),
+	}); err != nil {
 		return fmt.Errorf(
-			"cachestore/s3: backend does not honor If-None-Match: *; refusing to start " +
-				"(second concurrent put returned 200 instead of 412)")
+			"cachestore/s3: backend does not provide read-after-write visibility; "+
+				"refusing to start (HeadObject of a just-written key failed): %w", err)
 	}
 
-	if !isPreconditionFailed(err) {
-		_, _ = d.client.DeleteObject(ctx, &s3.DeleteObjectInput{ //nolint:errcheck // best-effort selftest cleanup
-			Bucket: aws.String(d.bucket),
-			Key:    aws.String(probeKey),
-		})
-
-		return fmt.Errorf("cachestore/s3 self-test: second put returned unexpected error "+
-			"(want 412 PreconditionFailed): %w", err)
-	}
-
-	d.log.LogAttrs(ctx, slog.LevelDebug, "selftest_second_put_rejected_412",
-		slog.String("bucket", d.bucket),
-		slog.String("probe_key", probeKey),
-	)
-
-	// Cleanup probe key.
-	_, _ = d.client.DeleteObject(ctx, &s3.DeleteObjectInput{ //nolint:errcheck // best-effort selftest cleanup
+	out, err := d.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(d.bucket),
 		Key:    aws.String(probeKey),
 	})
+	if err != nil {
+		return fmt.Errorf("cachestore/s3 self-test: read-back failed: %w", err)
+	}
+
+	got, err := io.ReadAll(out.Body)
+	_ = out.Body.Close() //nolint:errcheck // best-effort selftest cleanup
+
+	if err != nil {
+		return fmt.Errorf("cachestore/s3 self-test: read-back body: %w", err)
+	}
+
+	if !bytes.Equal(got, body) {
+		return fmt.Errorf(
+			"cachestore/s3: read-after-write returned wrong bytes (got %d, want %d); "+
+				"refusing to start", len(got), len(body))
+	}
+
+	d.log.LogAttrs(ctx, slog.LevelDebug, "selftest_ok",
+		slog.String("bucket", d.bucket),
+		slog.String("probe_key", probeKey),
+	)
 
 	return nil
 }
@@ -272,8 +286,16 @@ func (d *Driver) GetChunk(ctx context.Context, k chunk.Key, off, n int64) (io.Re
 	return out.Body, nil
 }
 
-// PutChunk uploads the chunk via PutObject + If-None-Match: *. On
-// 412 returns ErrCommitLost (loser of an atomic-commit race).
+// PutChunk commits the chunk with a stat-then-put step: HeadObject the
+// chunk path, and if it is already present skip the upload and return
+// ErrCommitLost (another replica won the fill race; the existing object
+// is byte-identical because the ETag is part of the path). Otherwise
+// upload via plain PutObject.
+//
+// The HeadObject/PutObject pair has a benign time-of-check/time-of-use
+// window: two replicas may both observe the key absent and both upload.
+// That degrades to a last-writer-wins overwrite of byte-identical
+// content, so readers always observe correct bytes.
 //
 // Rejects size <= 0 with a sentinel error: a zero-byte chunk is
 // never a legitimate fill result (the wire-format boundary already
@@ -285,6 +307,10 @@ func (d *Driver) PutChunk(ctx context.Context, k chunk.Key, size int64, r io.Rea
 	if size <= 0 {
 		return fmt.Errorf("cachestore/s3 put: size must be > 0, got %d", size)
 	}
+
+	// Validate the body up front (cheap, no RPC) so malformed callers
+	// are rejected before any round-trip.
+	//
 	// AWS SDK v2 needs an io.ReadSeeker for unsigned-payload uploads
 	// (so it can rewind on signed-retry). If the caller already passed
 	// a seekable reader we hand it to the SDK directly; otherwise
@@ -326,6 +352,30 @@ func (d *Driver) PutChunk(ctx context.Context, k chunk.Key, size int64, r io.Rea
 		}
 	}
 
+	// Stat-then-put: if a peer already committed this chunk, skip the
+	// (potentially multi-MiB) upload and report the existing object as
+	// the winner.
+	if _, err := d.client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(d.bucket),
+		Key:    aws.String(k.Path()),
+	}); err == nil {
+		d.log.LogAttrs(ctx, slog.LevelDebug, "cachestore_put_commit_lost",
+			csChunkAttrs(k),
+		)
+
+		return cachestore.ErrCommitLost
+	} else if !isNotFound(err) {
+		// A non-404 Head error (auth, transient) is surfaced; only a
+		// confirmed miss proceeds to the upload.
+		mapped := mapErr(err)
+		d.log.LogAttrs(ctx, slog.LevelDebug, "cachestore_put_head_err",
+			csChunkAttrs(k),
+			slog.Any("err", mapped),
+		)
+
+		return mapped
+	}
+
 	d.log.LogAttrs(ctx, slog.LevelDebug, "cachestore_put_chunk",
 		csChunkAttrs(k),
 		slog.Int64("size", size),
@@ -336,17 +386,8 @@ func (d *Driver) PutChunk(ctx context.Context, k chunk.Key, size int64, r io.Rea
 		Key:           aws.String(k.Path()),
 		Body:          body,
 		ContentLength: aws.Int64(size),
-		IfNoneMatch:   aws.String("*"),
 	})
 	if err != nil {
-		if isPreconditionFailed(err) {
-			d.log.LogAttrs(ctx, slog.LevelDebug, "cachestore_put_commit_lost",
-				csChunkAttrs(k),
-			)
-
-			return cachestore.ErrCommitLost
-		}
-
 		mapped := mapErr(err)
 		d.log.LogAttrs(ctx, slog.LevelDebug, "cachestore_put_err",
 			csChunkAttrs(k),
@@ -451,24 +492,6 @@ func randHex(n int) (string, error) {
 	}
 
 	return hex.EncodeToString(b), nil
-}
-
-// isPreconditionFailed reports whether err represents a 412
-// Precondition Failed response from S3. The atomic-commit primitive
-// (PutObject + If-None-Match: *) returns 412 when the key already
-// exists; the SelfTest path also expects 412 on the duplicate put.
-// We use the HTTP status code carried on *awshttp.ResponseError
-// rather than matching service error codes by string, since the
-// code surface is version-dependent across SDK and backend
-// implementations whereas the HTTP status code is part of the
-// stable wire contract.
-func isPreconditionFailed(err error) bool {
-	var respErr *awshttp.ResponseError
-	if errors.As(err, &respErr) && respErr.Response != nil {
-		return respErr.Response.StatusCode == http.StatusPreconditionFailed
-	}
-
-	return false
 }
 
 func isNotFound(err error) bool {
