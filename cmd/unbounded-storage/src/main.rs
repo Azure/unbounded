@@ -1,10 +1,12 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -12,52 +14,47 @@ use std::thread;
 use std::time::Duration;
 
 use clap::Parser;
-use serde::{Deserialize, Serialize};
 
-use unbounded_storage::bufferpool::{
-    Pool, PoolConfig, PoolGroup, Req, ShardDescriptor, StripeKey,
-};
-use unbounded_storage::config::{self, Config, FabricCfg};
-use unbounded_storage::disk_supervisor::{
-    DiskRegistry, LiveDiskTopology, LiveShardLocalStore, UringDiskTarget,
-};
-use unbounded_storage::storage::blockdev::BlockDeviceProxy;
+use unbounded_storage::backend::HttpBackend;
+use unbounded_storage::bufferpool::{Pool, PoolConfig, PoolGroup, Req, ShardDescriptor, StripeKey};
+use unbounded_storage::config::{self, BackendSpec, Config, FabricCfg, FrontendSpec};
 use unbounded_storage::fabric::PeerId;
-use unbounded_storage::fabric::{self, ConnectionSpec, Fabric, FabricTransport, Provider, StaticPeer};
-use unbounded_storage::runtime::{PinnedRuntime, Threading, WorkerIdx, WorkerSpec};
+use unbounded_storage::fabric::{self, ConnectionSpec, Fabric, Provider};
+use unbounded_storage::frontend::{HttpDriver, HttpFrontend};
+use unbounded_storage::p2p::{
+    FingerTable, FingerTableConfig, NodeId, PeerEntry, RecursiveHandler, RoutedTransport,
+    TopologyLabels, node_to_ring,
+};
+use unbounded_storage::ring::{NetHandle, NetworkRing};
+use unbounded_storage::runtime::{PinnedRuntime, ShardLoop, Threading, WorkerIdx};
+use unbounded_storage::storage::StripeReq;
+use unbounded_storage::storage::disks::{
+    DiskChannelDirectory, DiskRegistry, LiveShardLocalStore, UringDiskTarget,
+};
 use unbounded_storage::topology::{Host, Plan, Role, Worker};
 
-use unbounded_storage::backing::{BackingKind, BackingRequest, allocate};
+use unbounded_storage::memory::{BackingKind, BackingRequest, allocate};
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/unbounded-storage/config.toml";
 const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
+
+/// Object-length cache TTL for the per-shard HTTP frontend driver,
+/// in milliseconds. Matches the default the frontend's `from_spec`
+/// path uses.
+const DEFAULT_META_TTL_MS: u64 = 30_000;
+
+/// Stripe granularity used to build an inert origin backend on shards
+/// that have no configured backend. Such a backend is never exercised
+/// (no frontend drives reads against the pool), so the value is
+/// immaterial; it only has to make the `ShardPool` type check.
+const DEFAULT_STRIPE_SIZE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Process-wide shutdown flag. Set by the signal handler (which
 /// is restricted to async-signal-safe operations) and polled by
 /// the main thread plus every shard thread.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
-/// Placeholder request type for the per-shard `Pool`. Carries a
-/// `StripeKey` and satisfies the trait bounds required by
-/// `FabricTransport` (`Serialize` + `DeserializeOwned`). No reads
-/// are issued against the pool today; this exists so `Pool::new`
-/// type-checks.
-#[derive(Clone, Serialize, Deserialize)]
-struct PlaceholderReq {
-    key: [u8; 32],
-}
-
-impl Req for PlaceholderReq {
-    fn key(&self) -> StripeKey {
-        StripeKey(self.key)
-    }
-}
-
-type ShardPool = Pool<
-    FabricTransport<PlaceholderReq, StaticPeer>,
-    LiveShardLocalStore<BlockDeviceProxy>,
-    PlaceholderReq,
->;
+type ShardPool = Pool<RoutedTransport<StripeReq, HttpBackend>, Arc<LiveShardLocalStore>, StripeReq>;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -75,8 +72,7 @@ fn main() -> ExitCode {
     };
     // CLI overrides config for back-compat.
     if let Some(b) = cli.bytes_per_shard {
-        config.storage.bytes_per_shard =
-            unbounded_storage::config::schema::ByteSize(b.get());
+        config.storage.bytes_per_shard = unbounded_storage::config::schema::ByteSize(b.get());
     }
     if cli.no_hugepages {
         config.storage.backing_kind = config::BackingKindCfg::Heap;
@@ -85,7 +81,10 @@ fn main() -> ExitCode {
     let bytes_per_shard_total = config.storage.bytes_per_shard.bytes();
 
     let host = Host::discover();
-    let plan = Plan::for_host(&host, &config::topology_cfg_to_plan_config(&config.topology));
+    let plan = Plan::for_host(
+        &host,
+        &config::topology_cfg_to_plan_config(&config.topology),
+    );
 
     let counts = RoleCounts::from_plan(&plan);
     eprintln!(
@@ -96,30 +95,35 @@ fn main() -> ExitCode {
         plan.numa_pools,
     );
 
-    // Only RDMA progress workers are spawned in this phase; handler
-    // and NVMe placements are computed and logged for observability
-    // but not yet wired up.
+    // RDMA progress workers are spawned here as shard threads. The
+    // per-disk storage cores are now wired separately by the disk
+    // supervisor below: each disk runs on its own pinned storage core
+    // hosting the engine and ring, exposed to shards as a
+    // `PageChannel`. RDMA handler placements are still only computed
+    // and logged, not spawned as their own threads. The `NvmeIoUring`
+    // and `NetworkShard` plan roles are vestigial and intentionally
+    // left uncounted.
+    // Per-shard `Worker` metadata, in plan order. `rdma_progress()`
+    // filters `plan.workers` by `Role::RdmaProgress`, the SAME
+    // predicate the `from_plan` closure below uses, so `WorkerIdx(i)`
+    // (which addresses the i-th retained worker in the runtime) lines
+    // up with `progress[i]`. Keep these two filters in sync.
     let progress: Vec<Worker> = plan.rdma_progress().cloned().collect();
     if progress.is_empty() {
         eprintln!("topology plan produced no RDMA progress workers; exiting");
         return ExitCode::FAILURE;
     }
 
-    let specs: Vec<WorkerSpec> = progress
-        .iter()
-        .map(|w| WorkerSpec::new(w.cpu, w.numa))
-        .collect();
-    let runtime = PinnedRuntime::new(specs);
+    let runtime = PinnedRuntime::from_plan(&plan, |w| matches!(w.role, Role::RdmaProgress { .. }));
     install_signal_handler();
 
     // Hot-swap publication surface for shards. The disk supervisor
-    // opens each `UringBlockDevice` on its own progress thread,
-    // wraps it in a `BlockDeviceProxy` so the resulting
-    // `StorageEngine<BlockDeviceProxy>` is `Send + Sync`, and hands
-    // the engine `Arc`s back here for publication. Shards observe
-    // the snapshot through `LiveShardLocalStore`. Created before
+    // runs each disk on its own pinned storage core hosting the engine
+    // and ring, and hands a `PageChannel` to that core back here for
+    // publication. Shards observe the channel set through
+    // `LiveShardLocalStore` and ship page ops over it. Created before
     // the shard loop so each shard receives a clone.
-    let topology: Arc<LiveDiskTopology<BlockDeviceProxy>> = LiveDiskTopology::new();
+    let disk_channels: Arc<DiskChannelDirectory> = DiskChannelDirectory::new();
 
     // Each shard thread reports either an error or a populated
     // `ShardDescriptor` on this channel. The main thread aggregates
@@ -127,6 +131,17 @@ fn main() -> ExitCode {
     let (ready_tx, ready_rx) = mpsc::channel::<ShardReady>();
     let bytes_per_shard = bytes_per_shard_total / progress.len();
     let fabric_cfg = Arc::new(config.fabric.clone());
+    // Frontend/backend specs are shared read-only across shards.
+    // Each shard reads them to build (frontend) or validate-and-log
+    // (backend) its per-shard tier wiring.
+    let frontend_specs = Arc::new(config.frontends.clone());
+    let backend_specs = Arc::new(config.backends.clone());
+
+    // Build the p2p routing surface once and share it across shards.
+    // Every shard's `RoutedTransport` routes through the same finger
+    // table and node->peer map.
+    let (fingers, node_to_peer) = build_routing(&config);
+
     let mut joins = Vec::with_capacity(progress.len());
     for (i, worker) in progress.iter().enumerate() {
         let widx = WorkerIdx(u16::try_from(i).expect("worker index fits in u16"));
@@ -140,31 +155,50 @@ fn main() -> ExitCode {
         let runtime = runtime.clone();
         let tx = ready_tx.clone();
         let fabric_cfg = fabric_cfg.clone();
-        let topology = topology.clone();
-        joins.push(
-            thread::Builder::new()
-                .name(format!("ub-storage-shard-{i}"))
-                .spawn(move || {
-                    let rt = runtime.clone();
-                    rt.run_worker(
+        let disk_channels = disk_channels.clone();
+        let fingers = fingers.clone();
+        let node_to_peer = node_to_peer.clone();
+        let frontend_specs = frontend_specs.clone();
+        let backend_specs = backend_specs.clone();
+        // `spawn_pinned` spawns the thread and pins it (affinity +
+        // NUMA mempolicy) before running `f`. The `!Send` shard types
+        // are constructed inside `run_shard`, which runs AFTER pinning
+        // on the spawned thread, so only the `FnOnce` crosses the
+        // thread boundary.
+        let rt = runtime.clone();
+        // `run_shard` reports exactly one `ShardReady` on every normal
+        // path (its own `tx`), but it has `.expect(...)`/index calls
+        // during bring-up that can panic before any report. The
+        // collection loop in `main` does a bounded `recv()` that only
+        // unblocks once all senders drop, so a silent panic would hang
+        // startup forever (the other shards park holding their senders).
+        // `report_on_panic` owns a dedicated `tx` clone reserved for the
+        // panic path so a panicking shard still emits one `Failed`.
+        let panic_tx = tx.clone();
+        let handle = rt.spawn_pinned(
+            widx,
+            &format!("ub-storage-shard-{i}"),
+            Box::new(move || {
+                report_on_panic(panic_tx, widx, move || {
+                    run_shard(
                         widx,
-                        Box::new(move || {
-                            run_shard(
-                                widx,
-                                worker,
-                                dev_name,
-                                runtime,
-                                tx,
-                                backing_kind,
-                                bytes_per_shard,
-                                fabric_cfg,
-                                topology,
-                            );
-                        }),
+                        worker,
+                        dev_name,
+                        runtime,
+                        tx,
+                        backing_kind,
+                        bytes_per_shard,
+                        fabric_cfg,
+                        disk_channels,
+                        fingers,
+                        node_to_peer,
+                        frontend_specs,
+                        backend_specs,
                     );
-                })
-                .expect("spawn shard thread"),
+                });
+            }),
         );
+        joins.push(handle);
     }
     drop(ready_tx);
 
@@ -228,24 +262,17 @@ fn main() -> ExitCode {
         }
     }
 
-    // Disk supervisor: open `[[disks]]` entries (progress threads
-    // only, no data-path wiring yet). The CPU pin hint for each
-    // disk is derived per-disk from its `numa` field via the
-    // placer closure below; disks without a NUMA preference get
-    // no hint and the underlying open path leaves the thread
+    // Disk supervisor: reconcile `[[disks]]` entries onto pinned
+    // storage cores. Each disk runs on its own storage core hosting the
+    // engine and ring, and publishes a `PageChannel` that carries the
+    // page data path cross-core from the shards. CPU pin hints now come
+    // from the topology plan's disjoint NVMe (`Role::NvmeIoUring`)
+    // slots: the registry assigns each disk a NUMA-local slot that is
+    // disjoint from the shard cores by construction. If the plan
+    // discovered no NVMe devices the slot list is empty and disks run
     // unpinned.
-    let host_for_placer = host.clone();
-    let placer = move |numa: Option<u16>| -> Option<usize> {
-        match numa {
-            None => None,
-            Some(_) => host_for_placer
-                .cpus_on(numa)
-                .first()
-                .copied()
-                .map(|c| c as usize),
-        }
-    };
-    let mut disk_registry = DiskRegistry::new(UringDiskTarget, placer);
+    let disk_slots = plan.disk_cpu_slots();
+    let mut disk_registry = DiskRegistry::new(UringDiskTarget::new(runtime.clone()), disk_slots);
     if errors.is_empty() {
         let report = disk_registry.reconcile(&config.disks);
         eprintln!(
@@ -257,7 +284,13 @@ fn main() -> ExitCode {
         for (path, msg) in &report.failures {
             eprintln!("disk {}: open failed: {msg}", path.display());
         }
-        topology.apply_engines(disk_registry.engines_snapshot());
+        for (path, hint) in disk_registry.placement_snapshot() {
+            match hint {
+                Some(slot) => eprintln!("disk {}: pinned to cpu {}", path.display(), slot.cpu),
+                None => eprintln!("disk {}: unpinned (no plan slot available)", path.display()),
+            }
+        }
+        disk_channels.apply_channels(disk_registry.channels_snapshot());
     }
 
     // Build the process-wide `PoolGroup` over the successful
@@ -269,10 +302,9 @@ fn main() -> ExitCode {
     if errors.is_empty() && !descriptors.is_empty() {
         descriptors.sort_by_key(|d| d.worker_idx.0);
         let shard_count = descriptors.len();
-        let _group: PoolGroup<PlaceholderReq> =
-            PoolGroup::new(descriptors, move |req: &PlaceholderReq| {
-                stripe_key_to_shard(&req.key(), shard_count)
-            });
+        let _group: PoolGroup<StripeReq> = PoolGroup::new(descriptors, move |req: &StripeReq| {
+            stripe_key_to_shard(&req.key(), shard_count)
+        });
         // No consumer yet; the group is built to validate the
         // bring-up surface. A future change will hand it to
         // whichever subsystem first needs cross-shard fan-out.
@@ -289,7 +321,7 @@ fn main() -> ExitCode {
                 update_rx,
                 &mut shard_state,
                 &mut disk_registry,
-                topology.clone(),
+                disk_channels.clone(),
             );
         }
         Err(e) => {
@@ -300,8 +332,8 @@ fn main() -> ExitCode {
     eprintln!("shutdown signaled; tearing down shards");
 
     // Shard threads must exit first so they release any
-    // `Arc<StorageEngine>` refs published via the topology. Then
-    // drop the topology snapshot, then drain the disk supervisor
+    // `Arc<StorageEngine>` refs published via the channel directory.
+    // Then drop the published snapshot, then drain the disk supervisor
     // so each per-disk thread sees its engine refcount fall before
     // its stop flag.
     // (reverse order so the last-built shard tears down first)
@@ -311,7 +343,7 @@ fn main() -> ExitCode {
             errors.push(format!("panic: {e:?}"));
         }
     }
-    drop(topology);
+    drop(disk_channels);
     disk_registry.drain();
 
     if errors.is_empty() {
@@ -335,7 +367,11 @@ fn run_shard(
     backing_kind: BackingKind,
     bytes_per_shard: usize,
     fabric_cfg: Arc<FabricCfg>,
-    topology: Arc<LiveDiskTopology<BlockDeviceProxy>>,
+    disk_channels: Arc<DiskChannelDirectory>,
+    fingers: Arc<FingerTable>,
+    node_to_peer: Arc<HashMap<NodeId, PeerId>>,
+    frontend_specs: Arc<Vec<FrontendSpec>>,
+    backend_specs: Arc<Vec<BackendSpec>>,
 ) {
     // Default to the loopback device when no HCA is bound to this
     // shard; the `tcp` provider is the fallback path.
@@ -374,13 +410,11 @@ fn run_shard(
         }
     };
 
-    // NUMA-local backing. Allocated on the pinned shard thread so
-    // the `PinnedRuntime`'s `set_mempolicy` keeps the pages on the
-    // intended node; the hugepage variant additionally pins via
-    // `mbind` when `worker.numa` is known. Register it with the
-    // fabric before building the transport (the embedder
-    // pre-registers model replaces the old `Transport::register_pages`
-    // handshake).
+    // NUMA-local backing. Allocated on the pinned shard thread so the
+    // `PinnedRuntime`'s `set_mempolicy` keeps the pages on the intended
+    // node; the hugepage variant additionally pins via `mbind` when
+    // `worker.numa` is known. Register it with the fabric before
+    // building the transport.
     let backing = match allocate(BackingRequest {
         kind: backing_kind,
         bytes: bytes_per_shard,
@@ -407,33 +441,111 @@ fn run_shard(
         }
     };
 
-    // `StaticPeer { peer: PeerId(0) }` is a placeholder: with no
-    // connections added to the fabric, no `bulk_get` will resolve,
-    // but constructing the transport is harmless. A real router
-    // will be installed when peer discovery lands.
-    let transport = match FabricTransport::<PlaceholderReq, _>::new(
-        fabric.clone(),
-        mr,
-        StaticPeer { peer: PeerId(0) },
-        page_size,
-    ) {
-        Ok(t) => t,
+    // Per-shard io_uring socket ring. Created on the pinned shard
+    // thread (the ring is !Send) and given the same backing as a single
+    // fixed buffer so SEND_ZC / RECV can target bufferpool pages. Must
+    // register while `backing` is still owned, before `Pool::new` moves
+    // it.
+    let socket = match NetworkRing::new(256) {
+        Ok(s) => Rc::new(RefCell::new(s)),
         Err(e) => {
             let _ = tx.send(ShardReady::Failed(format!(
-                "worker={}: FabricTransport::new: {e}",
+                "worker={}: NetworkRing::new: {e}",
                 widx.0,
             )));
             return;
         }
     };
-    // Wire the per-shard view over the live disk topology. When
-    // the topology is empty (no engines yet), `register_pages`
-    // records the backing silently and reads/writes return
-    // `Error::Transport("no disks open")`. Once the disk supervisor
-    // publishes engines, the view's `current_or_replay` catches the
-    // swap and replays buffer registration before delegating.
-    let blockstore = LiveShardLocalStore::new(topology);
-    let pool: ShardPool = match Pool::new(PoolConfig::default(), backing, transport, blockstore) {
+    if let Err(e) = socket.borrow().register_backing(&backing) {
+        let _ = tx.send(ShardReady::Failed(format!(
+            "worker={}: socket register_backing: {e}",
+            widx.0,
+        )));
+        return;
+    }
+
+    // Capture the backing's base pointer before `Pool::new` moves the
+    // `Backing` value. The pointer addresses the same registered region
+    // the socket ring and the pool share; the `HttpBackend` memcpys
+    // origin bytes directly into pages carved from this base.
+    let backing_base = backing.base;
+
+    // Select the single frontend this shard serves (v1: one per shard;
+    // `select_frontend_spec` logs-and-skips extras). The selection also
+    // decides which backend the origin tier fetches from: a selected
+    // frontend names its backend and load-time validation guarantees
+    // that backend exists. With no frontend we still must construct an
+    // `HttpBackend` so the `ShardPool` type checks, so fall back to the
+    // first configured backend, or an inert loopback origin when none
+    // are configured (no reads are issued against the pool without a
+    // frontend, so the backend stays dormant).
+    let selected = select_frontend_spec(widx, &frontend_specs);
+    let backend_spec = match selected {
+        Some(fe) => backend_specs.iter().find(|b| b.id == fe.backend),
+        None => backend_specs.first(),
+    };
+    let (origin, backend_id, stripe_size) = match backend_spec {
+        Some(spec) => match HttpBackend::resolve_origin(&spec.endpoint) {
+            Ok(o) => (o, spec.id.clone(), spec.stripe_size_bytes),
+            Err(e) => {
+                let _ = tx.send(ShardReady::Failed(format!(
+                    "worker={}: backend {} resolve_origin({}): {e}",
+                    widx.0, spec.id, spec.endpoint,
+                )));
+                return;
+            }
+        },
+        None => {
+            let o = HttpBackend::resolve_origin("127.0.0.1:0")
+                .expect("loopback:0 resolves to an IPv4 address");
+            (o, String::new(), DEFAULT_STRIPE_SIZE_BYTES)
+        }
+    };
+
+    log_backend_registry(widx, &backend_specs);
+
+    // Route the pool's transport through the p2p finger table: a stripe
+    // owned by a peer goes over the fabric RDMA path; a stripe this node
+    // owns (Chord `next_hop` returns None) goes to the `HttpBackend`,
+    // which fetches the missing byte range from the origin endpoint.
+    let backend = HttpBackend::new(
+        socket.clone(),
+        origin.duplicate(),
+        backend_id.clone(),
+        stripe_size,
+        page_size,
+        backing_base,
+    );
+    let transport = match RoutedTransport::new(
+        fabric.clone(),
+        mr,
+        page_size,
+        fingers.clone(),
+        node_to_peer.clone(),
+        backend,
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = tx.send(ShardReady::Failed(format!(
+                "worker={}: RoutedTransport::new: {e}",
+                widx.0,
+            )));
+            return;
+        }
+    };
+    // Per-shard view over the live disk channel directory. When the
+    // directory is empty (no engines yet), `register_pages` records the
+    // backing silently and reads/writes return `Error::Transport("no
+    // disks open")`. Once the disk supervisor publishes engines, the
+    // view's `current_or_replay` catches the swap and replays buffer
+    // registration before delegating.
+    let blockstore = Arc::new(LiveShardLocalStore::new(disk_channels.clone()));
+    let pool: ShardPool = match Pool::new(
+        PoolConfig::default(),
+        backing,
+        transport,
+        blockstore.clone(),
+    ) {
         Ok(p) => p,
         Err(e) => {
             let _ = tx.send(ShardReady::Failed(format!(
@@ -443,6 +555,178 @@ fn run_shard(
             return;
         }
     };
+    // Share the pool via `Rc` so the frontend driver can clone it onto
+    // its per-connection serve futures; it also fixes the teardown
+    // order (see the drop sequence below).
+    let pool = Rc::new(pool);
+
+    // Bring up the per-shard RPC server so remote peers can fetch
+    // stripes this node has resident locally (a peer "cache hit") and
+    // so this node can act as an intermediate Chord hop, forwarding to
+    // the next hop and relaying the downstream page back upstream. The
+    // production `RecursiveHandler` serves and forwards out of a
+    // dedicated scratch backing that only the RPC worker threads ever
+    // touch, sidestepping the `Send + Sync` requirement on `Handler`
+    // without sharing the `!Send` `Rc<Pool>` or its free list off the
+    // shard thread. The scratch backing doubles as a fabric MR (the
+    // `fi_write` source for serving and the `fi_write` destination for
+    // forwarded pages) and a `BlockStore` extra buffer. Sized at a
+    // small, fixed page count: one in-flight request consumes one
+    // scratch page for the duration of its serve/forward. See
+    // `p2p/handler.rs` for the soundness argument.
+    const RPC_SCRATCH_PAGES: u32 = 8;
+    let scratch = match allocate(BackingRequest {
+        kind: backing_kind,
+        bytes: page_size * RPC_SCRATCH_PAGES as usize,
+        numa: worker.numa,
+    }) {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = tx.send(ShardReady::Failed(format!(
+                "worker={}: rpc scratch backing allocation failed: {e}",
+                widx.0,
+            )));
+            return;
+        }
+    };
+    let scratch_mr = match fabric.register_backing(&scratch, worker.numa) {
+        Ok(mr) => mr,
+        Err(e) => {
+            let _ = tx.send(ShardReady::Failed(format!(
+                "worker={}: rpc scratch register_backing: {e}",
+                widx.0,
+            )));
+            return;
+        }
+    };
+    // The RPC handler resolves disk reads into scratch pages, so it
+    // needs a `BlockStore` whose single registered backing IS the
+    // scratch region: `LiveShardLocalStore::resolve` maps a `PageRef`
+    // through exactly one backing's geometry and refuses to guess among
+    // several. The data-path `blockstore` already owns the (much
+    // larger) pool backing, so it cannot also host scratch. We give the
+    // handler its own store over the *same* disk channel directory:
+    // scratch is still registered as an io_uring fixed buffer against
+    // every disk channel (via the shared directory's replay), but page
+    // resolution stays unambiguous.
+    let rpc_store = Arc::new(LiveShardLocalStore::new(disk_channels));
+    if let Err(e) = rpc_store.register_backing(&scratch) {
+        let _ = tx.send(ShardReady::Failed(format!(
+            "worker={}: rpc scratch blockstore register: {e}",
+            widx.0,
+        )));
+        return;
+    }
+    // `MrHandle` is a `Copy` value handle (the underlying `fid_mr` is
+    // owned by the `Fabric`), so a single scratch registration is
+    // shared by copy between the handler's forwarding `FabricTransport`
+    // (whose downstream `fi_write`s land in scratch) and the RPC
+    // server's `local_mr` (the `fi_write` source that ships served
+    // pages back to the requester). One backing, one MR, no double
+    // allocation.
+    let rpc_handler = Arc::new(
+        match RecursiveHandler::new(
+            rpc_store.clone(),
+            scratch,
+            RPC_SCRATCH_PAGES,
+            fingers.clone(),
+            node_to_peer.clone(),
+            fabric.clone(),
+            scratch_mr,
+            page_size,
+            HttpBackend::new(
+                socket.clone(),
+                origin.duplicate(),
+                backend_id.clone(),
+                stripe_size,
+                page_size,
+                backing_base,
+            ),
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                let _ = tx.send(ShardReady::Failed(format!(
+                    "worker={}: RecursiveHandler::new: {e}",
+                    widx.0,
+                )));
+                return;
+            }
+        },
+    );
+    let rpc_server =
+        match fabric.start_rpc_server::<StripeReq, _>(rpc_handler, Some(scratch_mr), page_size) {
+            Ok(h) => h,
+            Err(e) => {
+                let _ = tx.send(ShardReady::Failed(format!(
+                    "worker={}: start_rpc_server: {e}",
+                    widx.0,
+                )));
+                return;
+            }
+        };
+
+    // Build the shard's cooperative loop and register its progress
+    // sources. The socket ring's `progress()` is a tick hook; the
+    // configured frontend driver, if any, is registered as a second
+    // tick hook.
+    let mut shard_loop = ShardLoop::new();
+    {
+        let socket = socket.clone();
+        // `progress()` takes `&self`, so this must be a *shared* borrow:
+        // the origin backend holds `socket.borrow()` across its recv/send
+        // awaits (see `backend::http`), so a `borrow_mut()` here would hit
+        // a `BorrowMutError` panic whenever a cache-miss fetch is in
+        // flight across a shard tick. Shared borrows coexist.
+        shard_loop.add_tick_hook(move || socket.borrow().progress());
+    }
+
+    // Bring up the frontend selected above (if any). The `HttpFrontend`
+    // factory validates the spec and binds the shard's `SO_REUSEPORT`
+    // listener; the per-shard `HttpDriver` then serves connections out
+    // of this shard's pool, fetching origin misses through the same
+    // backend wired into the transport above. v1 drives one frontend
+    // per shard (see `select_frontend_spec`).
+    match selected {
+        Some(spec) => {
+            let frontend = match HttpFrontend::from_spec(spec) {
+                Ok(f) => f,
+                Err(e) => {
+                    let _ = tx.send(ShardReady::Failed(format!(
+                        "worker={}: frontend {} from_spec: {e}",
+                        widx.0, spec.id,
+                    )));
+                    return;
+                }
+            };
+            let listen_fd = match frontend.bind_listener() {
+                Ok(fd) => fd,
+                Err(e) => {
+                    let _ = tx.send(ShardReady::Failed(format!(
+                        "worker={}: frontend {} bind_listener: {e}",
+                        widx.0, spec.id,
+                    )));
+                    return;
+                }
+            };
+            let handle = NetHandle::new(socket.clone());
+            let mut driver: HttpDriver<ShardPool> = HttpDriver::new(
+                pool.clone(),
+                handle,
+                listen_fd,
+                backend_id.clone(),
+                stripe_size,
+                page_size,
+                origin,
+                DEFAULT_META_TTL_MS,
+            );
+            shard_loop.add_tick_hook(move || driver.progress());
+            eprintln!("shard {}: frontend {} driver registered", widx.0, spec.id);
+        }
+        None => {
+            // No frontend on this shard; the listener and serve engine
+            // are not built. The pool's origin backend stays dormant.
+        }
+    }
 
     let _ = tx.send(ShardReady::Up {
         descriptor: ShardDescriptor {
@@ -452,15 +736,123 @@ fn run_shard(
         fabric: fabric.clone(),
     });
 
-    wait_for_shutdown();
+    // Drive the shard's cooperative future set until shutdown. The loop
+    // busy-polls socket I/O and frontend work while active and idles
+    // cheaply (100us, matching the disk thread cadence) when quiet.
+    // Fabric and Pool self-drive progress on their own threads.
+    shard_loop.run_until_with(
+        || SHUTDOWN.load(Ordering::Acquire),
+        Duration::from_micros(100),
+    );
 
-    // Drop order matters: drop the `Pool` first so the
-    // `FabricTransport` (which holds an `Arc<Fabric>`) goes away
-    // before the owning `Fabric` runs its own drop. `Fabric::drop`
-    // joins its progress threads and tears the libfabric stack
-    // down in the documented order.
+    // Drop order matters:
+    //   1. `shard_loop` first - clears tick hooks and futures, releasing
+    //      their `Rc<socket>` clones and (if registered) the `HttpDriver`
+    //      that holds the pool and a `NetHandle`.
+    //   2. `pool` - tears down `Pool` and its `FabricTransport`, which
+    //      holds an `Arc<Fabric>` clone that must go before `fabric`.
+    //      The pool's `HttpBackend` also holds an `Rc<socket>` clone.
+    //   3. `socket` - the last shard-local `Rc<socket>` clone.
+    //   4. `rpc_server` - signals shutdown to outstanding RPC workers
+    //      and waits briefly for them; this must complete while `fabric`
+    //      (which they use) is still alive.
+    //   5. `fabric` last - joins its progress threads, closes the
+    //      scratch MR the RPC server used, and tears libfabric down.
+    drop(shard_loop);
     drop(pool);
+    drop(socket);
+    drop(rpc_server);
     drop(fabric);
+}
+
+/// Run a shard thread body `f`, guaranteeing exactly one
+/// [`ShardReady`] is observed on `tx` even when `f` panics during
+/// bring-up.
+///
+/// `f` (i.e. [`run_shard`]) reports its own readiness on the normal
+/// success and error paths through a sender it owns. The `tx` handed
+/// here is a *separate* clone reserved solely for the panic path: if
+/// `f` unwinds before reporting, its own sender is dropped by the
+/// unwind, but the surviving shards stay parked holding their sender
+/// clones, so `main`'s bounded `recv()` would block forever. Emitting a
+/// `Failed` here keeps the readiness count whole. A panic *after* `f`
+/// already reported `Up` produces a harmless extra `Failed`: `main`
+/// reads exactly N messages and ignores any surplus.
+fn report_on_panic<F>(tx: mpsc::Sender<ShardReady>, widx: WorkerIdx, f: F)
+where
+    F: FnOnce(),
+{
+    // `AssertUnwindSafe` is sound here: on the unwind path we touch only
+    // `tx` and `widx` (both owned, no shared mutable state), and the
+    // process is headed for the coherent failure path regardless.
+    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        eprintln!(
+            "shard worker={} panicked during bring-up: {}",
+            widx.0,
+            panic_payload_str(&payload),
+        );
+        let _ = tx.send(ShardReady::Failed(format!(
+            "worker={}: panicked during bring-up",
+            widx.0,
+        )));
+    }
+}
+
+/// Best-effort extraction of a human-readable message from a panic
+/// payload returned by [`std::panic::catch_unwind`]. Panics raised by
+/// `panic!`/`.expect(...)`/`unwrap()` carry either a `&str` or a
+/// `String`; anything else is reported generically.
+fn panic_payload_str(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.as_str()
+    } else {
+        "non-string panic payload"
+    }
+}
+
+/// Build the shared p2p routing surface from the loaded config: the
+/// local node's finger table over the configured peers, plus the
+/// `node -> peer` map the `FingerRouter` uses to resolve a finger's
+/// `NodeId` to the fabric `PeerId`.
+///
+/// `local_node_id` falls back to `0` when unset. Load-time
+/// validation rejects an unset id when peers are configured, so the
+/// fallback only fires for a single-node (no-peer) deployment, where
+/// the table routes every stripe to self/backend regardless of the
+/// id. `PeerSpec.id` doubles as both the `NodeId` and the `PeerId`,
+/// matching `config::reconcile_peers`, which adds connections keyed
+/// by `PeerId(spec.id)`.
+fn build_routing(config: &Config) -> (Arc<FingerTable>, Arc<HashMap<NodeId, PeerId>>) {
+    let local_id = config.p2p.local_node_id.unwrap_or(0);
+    let local = PeerEntry {
+        node: NodeId(local_id),
+        ring: node_to_ring(NodeId(local_id)),
+        labels: TopologyLabels(config.p2p.local_labels.clone()),
+    };
+
+    let peers: Vec<PeerEntry> = config
+        .peers
+        .iter()
+        .map(|spec| PeerEntry {
+            node: NodeId(spec.id),
+            ring: node_to_ring(NodeId(spec.id)),
+            labels: TopologyLabels(spec.labels.clone()),
+        })
+        .collect();
+
+    let node_to_peer: HashMap<NodeId, PeerId> = config
+        .peers
+        .iter()
+        .map(|spec| (NodeId(spec.id), PeerId(spec.id)))
+        .collect();
+
+    let cfg = FingerTableConfig {
+        k: config.p2p.fingers_per_node.max(1),
+    };
+    let fingers = FingerTable::build(local, &peers, cfg);
+    (Arc::new(fingers), Arc::new(node_to_peer))
 }
 
 /// Hash a `StripeKey` into a shard index. The first eight bytes of
@@ -473,6 +865,52 @@ fn stripe_key_to_shard(key: &StripeKey, shard_count: usize) -> usize {
     let bytes = &key.0[..8];
     let h = u64::from_le_bytes(bytes.try_into().expect("8 bytes"));
     (h as usize) % shard_count
+}
+
+/// Select the single [`FrontendSpec`] a shard should serve.
+///
+/// `start_on_shard` consumes the one-per-shard [`ShardContext`] by
+/// value, so a shard can drive at most one frontend through the
+/// tick-hook seam. v1 therefore supports exactly one frontend per
+/// shard: the first configured spec is selected and any extras are
+/// logged and skipped. Returns `None` when no frontends are configured.
+fn select_frontend_spec<'a>(
+    widx: WorkerIdx,
+    specs: &'a [FrontendSpec],
+) -> Option<&'a FrontendSpec> {
+    let first = specs.first()?;
+    if specs.len() > 1 {
+        let extra: Vec<&str> = specs[1..].iter().map(|s| s.id.as_str()).collect();
+        eprintln!(
+            "shard {}: multiple frontends configured; serving {:?}, skipping {:?} \
+             (v1 supports one frontend per shard)",
+            widx.0, first.id, extra,
+        );
+    }
+    Some(first)
+}
+
+/// Validate and log the configured backends.
+///
+/// [`HttpBackend`] is now the active origin tier: it is built per shard
+/// from the matching [`BackendSpec`] and plugged into the
+/// `RoutedTransport`'s backend slot (see `run_shard`). This function
+/// surfaces the configured backend set for observability and returns
+/// the number of backends seen so the caller (and tests) can assert the
+/// registry was walked.
+fn log_backend_registry(widx: WorkerIdx, specs: &[BackendSpec]) -> usize {
+    for spec in specs {
+        eprintln!(
+            "shard {}: backend {} kind={:?} endpoint={} stripe_size={} http_concurrency={} (HttpBackend active)",
+            widx.0,
+            spec.id,
+            spec.kind,
+            spec.endpoint,
+            spec.stripe_size_bytes,
+            spec.http_concurrency,
+        );
+    }
+    specs.len()
 }
 
 /// Status a shard thread reports once it has either come up or
@@ -501,6 +939,7 @@ impl RoleCounts {
                 Role::RdmaProgress { .. } => c.progress += 1,
                 Role::RdmaHandler { .. } => c.handlers += 1,
                 Role::NvmeIoUring { .. } => {}
+                Role::NetworkShard { .. } => {}
             }
         }
         c
@@ -603,7 +1042,7 @@ fn wait_for_shutdown_with_updates(
     update_rx: mpsc::Receiver<config::ConfigUpdate>,
     shard_state: &mut [(WorkerIdx, Arc<Fabric>, HashMap<PeerId, ConnectionSpec>)],
     disk_registry: &mut DiskRegistry<UringDiskTarget>,
-    topology: Arc<LiveDiskTopology<BlockDeviceProxy>>,
+    disk_channels: Arc<DiskChannelDirectory>,
 ) {
     while !SHUTDOWN.load(Ordering::Acquire) {
         match update_rx.recv_timeout(SHUTDOWN_POLL) {
@@ -614,21 +1053,16 @@ fn wait_for_shutdown_with_updates(
                 let mut failures = 0usize;
                 let mut first_failure: Option<String> = None;
                 for (widx, fabric, last_applied) in shard_state.iter_mut() {
-                    let report = config::reconcile_peers(
-                        fabric,
-                        &update.config.peers,
-                        Some(last_applied),
-                    );
+                    let report =
+                        config::reconcile_peers(fabric, &update.config.peers, Some(last_applied));
                     added += report.added;
                     removed += report.removed;
                     updated += report.updated;
                     failures += report.failures.len();
                     for (peer_id, msg) in &report.failures {
                         if first_failure.is_none() {
-                            first_failure = Some(format!(
-                                "shard {} peer {} {}",
-                                widx.0, peer_id.0, msg
-                            ));
+                            first_failure =
+                                Some(format!("shard {} peer {} {}", widx.0, peer_id.0, msg));
                         }
                     }
                     *last_applied = report.applied;
@@ -659,16 +1093,52 @@ fn wait_for_shutdown_with_updates(
                         path.display(),
                     );
                 }
-                // Republish a fresh `LocalStorage` snapshot on
-                // every config update so any shard view caches its
-                // new generation. Engines remain unpublished until
-                // the per-thread open path lands.
-        topology.apply_engines(disk_registry.engines_snapshot());
+                for (path, hint) in disk_registry.placement_snapshot() {
+                    match hint {
+                        Some(slot) => eprintln!(
+                            "config gen={} disk {}: pinned to cpu {}",
+                            update.generation,
+                            path.display(),
+                            slot.cpu,
+                        ),
+                        None => eprintln!(
+                            "config gen={} disk {}: unpinned (no plan slot available)",
+                            update.generation,
+                            path.display(),
+                        ),
+                    }
+                }
+                // Republish a fresh channel snapshot on every config
+                // update so any shard view caches its new generation
+                // and reseats its buffer registrations against the
+                // current per-disk storage cores.
+                disk_channels.apply_channels(disk_registry.channels_snapshot());
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(e) => {
+                // A timeout is just a quiet poll interval; keep waiting.
+                // A disconnect means the watcher's notify thread is gone
+                // (panic, inotify error, ...). `main` joins the shard
+                // threads after this returns, but those threads only
+                // exit once `SHUTDOWN` is set, so we must latch it here
+                // or the joins hang forever.
+                if shutdown_on_watcher_error(e) {
+                    SHUTDOWN.store(true, Ordering::Relaxed);
+                    break;
+                }
+                continue;
+            }
         }
     }
+}
+
+/// Decide whether a `recv_timeout` error on the config-update channel
+/// should drive shutdown. A `Disconnected` watcher is treated as a
+/// shutdown request so the shard joins in `main` can complete; a
+/// `Timeout` is an ordinary idle tick. Pure so the disconnect
+/// semantics can be unit-tested without touching the process-global
+/// `SHUTDOWN` latch.
+fn shutdown_on_watcher_error(err: mpsc::RecvTimeoutError) -> bool {
+    matches!(err, mpsc::RecvTimeoutError::Disconnected)
 }
 
 /// Install a SIGINT/SIGTERM handler that flips [`SHUTDOWN`]. The
@@ -848,5 +1318,105 @@ mod tests {
                 handlers: 3,
             }
         );
+    }
+
+    fn frontend_spec(id: &str) -> FrontendSpec {
+        FrontendSpec {
+            id: id.to_string(),
+            kind: config::FrontendKind::Http,
+            bind: "0.0.0.0:9000".to_string(),
+            backend: "b".to_string(),
+            tls: None,
+        }
+    }
+
+    fn backend_spec(id: &str) -> BackendSpec {
+        BackendSpec {
+            id: id.to_string(),
+            kind: config::BackendKind::Http,
+            endpoint: "https://example.com".to_string(),
+            stripe_size_bytes: 4 * 1024 * 1024,
+            http_concurrency: 64,
+        }
+    }
+
+    #[test]
+    fn select_frontend_none_when_empty() {
+        let specs: Vec<FrontendSpec> = Vec::new();
+        assert!(select_frontend_spec(WorkerIdx(0), &specs).is_none());
+    }
+
+    #[test]
+    fn select_frontend_returns_single() {
+        let specs = vec![frontend_spec("only")];
+        let sel = select_frontend_spec(WorkerIdx(0), &specs).expect("one selected");
+        assert_eq!(sel.id, "only");
+    }
+
+    #[test]
+    fn select_frontend_picks_first_and_skips_extras() {
+        // v1: a single frontend per shard. The first configured spec is
+        // selected; extras are logged-and-skipped, not an error.
+        let specs = vec![frontend_spec("a"), frontend_spec("b"), frontend_spec("c")];
+        let sel = select_frontend_spec(WorkerIdx(3), &specs).expect("first selected");
+        assert_eq!(sel.id, "a");
+    }
+
+    #[test]
+    fn log_backend_registry_counts_specs() {
+        assert_eq!(log_backend_registry(WorkerIdx(0), &[]), 0);
+        let specs = vec![backend_spec("primary"), backend_spec("secondary")];
+        assert_eq!(log_backend_registry(WorkerIdx(1), &specs), 2);
+    }
+
+    #[test]
+    fn report_on_panic_emits_failed_when_body_panics() {
+        // A shard body that panics before reporting must still leave
+        // exactly one `Failed` on the channel so `main`'s bounded recv
+        // count stays whole and startup cannot deadlock.
+        let (tx, rx) = mpsc::channel::<ShardReady>();
+        report_on_panic(tx, WorkerIdx(7), || {
+            panic!("boom during bring-up");
+        });
+        match rx.recv() {
+            Ok(ShardReady::Failed(msg)) => {
+                assert!(msg.contains("worker=7"), "got: {msg}");
+                assert!(msg.contains("panicked during bring-up"), "got: {msg}");
+            }
+            other => panic!("expected Failed, got {:?}", other.is_ok()),
+        }
+        // No second message: the panic path reports exactly once.
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn report_on_panic_is_silent_when_body_succeeds() {
+        // On the normal path `run_shard` owns the reporting; the
+        // panic-path clone must stay quiet so no spurious `Failed`
+        // is appended.
+        let (tx, rx) = mpsc::channel::<ShardReady>();
+        report_on_panic(tx, WorkerIdx(0), || {});
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn panic_payload_str_handles_str_and_string() {
+        let s: Box<dyn std::any::Any + Send> = Box::new("static str");
+        assert_eq!(panic_payload_str(&*s), "static str");
+        let s: Box<dyn std::any::Any + Send> = Box::new(String::from("owned"));
+        assert_eq!(panic_payload_str(&*s), "owned");
+        let s: Box<dyn std::any::Any + Send> = Box::new(42u32);
+        assert_eq!(panic_payload_str(&*s), "non-string panic payload");
+    }
+
+    #[test]
+    fn watcher_disconnect_signals_shutdown_but_timeout_does_not() {
+        // A disconnected config watcher must behave like a shutdown
+        // request so the shard joins complete; a timeout is an idle
+        // tick and must not.
+        assert!(shutdown_on_watcher_error(
+            mpsc::RecvTimeoutError::Disconnected
+        ));
+        assert!(!shutdown_on_watcher_error(mpsc::RecvTimeoutError::Timeout));
     }
 }

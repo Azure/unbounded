@@ -39,7 +39,7 @@ pub trait Handler<R: Req>: Send + Sync + 'static {
     where
         Self: 'a,
         R: 'a;
-    fn handle<'a>(&'a self, req: &'a R, src: BulkRef) -> Self::Stream<'a>;
+    fn handle<'a>(&'a self, req: &'a R, src: BulkRef, hops_remaining: u32) -> Self::Stream<'a>;
 }
 
 #[cfg(test)]
@@ -80,7 +80,12 @@ mod test_handlers {
         where
             Self: 'a,
             R: 'a;
-        fn handle<'a>(&'a self, _req: &'a R, _src: BulkRef) -> Self::Stream<'a> {
+        fn handle<'a>(
+            &'a self,
+            _req: &'a R,
+            _src: BulkRef,
+            _hops_remaining: u32,
+        ) -> Self::Stream<'a> {
             NoopStream
         }
     }
@@ -118,7 +123,12 @@ mod test_handlers {
         where
             Self: 'a,
             R: 'a;
-        fn handle<'a>(&'a self, _req: &'a R, _src: BulkRef) -> Self::Stream<'a> {
+        fn handle<'a>(
+            &'a self,
+            _req: &'a R,
+            _src: BulkRef,
+            _hops_remaining: u32,
+        ) -> Self::Stream<'a> {
             NPagesStream {
                 pages: &self.pages,
                 next: 0,
@@ -177,7 +187,12 @@ mod test_handlers {
         where
             Self: 'a,
             R: 'a;
-        fn handle<'a>(&'a self, _req: &'a R, _src: BulkRef) -> Self::Stream<'a> {
+        fn handle<'a>(
+            &'a self,
+            _req: &'a R,
+            _src: BulkRef,
+            _hops_remaining: u32,
+        ) -> Self::Stream<'a> {
             ErrorStream {
                 emitted: false,
                 _e: PhantomData,
@@ -232,7 +247,12 @@ mod test_handlers {
         where
             Self: 'a,
             R: 'a;
-        fn handle<'a>(&'a self, _req: &'a R, _src: BulkRef) -> Self::Stream<'a> {
+        fn handle<'a>(
+            &'a self,
+            _req: &'a R,
+            _src: BulkRef,
+            _hops_remaining: u32,
+        ) -> Self::Stream<'a> {
             self.instances.fetch_add(1, Ordering::Relaxed);
             CancelObservingStream {
                 dropped: self.dropped.clone(),

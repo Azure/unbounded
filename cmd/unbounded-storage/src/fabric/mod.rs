@@ -17,6 +17,7 @@ mod fabric;
 mod ffi;
 mod handler;
 mod ping;
+mod pool_handler;
 mod progress;
 mod rpc;
 mod transport;
@@ -32,9 +33,11 @@ pub use error::{FabricError, Result, check};
 pub use fabric::Fabric;
 pub use handler::{Handler, HandlerStream};
 pub use ping::{PING_TAG, PONG_TAG};
+pub use pool_handler::{PoolHandler, PoolHandlerError, PoolHandlerStream};
 pub use progress::ProgressThread;
 pub use rpc::{
-    PageWritePlan, RequestHeader, RequestPlan, RpcServer, RpcServerHandle, plan_page_write,
+    MAX_HOPS, PageWritePlan, RequestHeader, RequestPlan, RpcServer, RpcServerHandle,
+    plan_page_write,
 };
 pub use transport::{
     FabricTransport, PeerRouter, StaticPeer, ensure_launch_fits_registry, required_completion_slots,

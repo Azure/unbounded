@@ -10,7 +10,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use super::schema::{Config, PeerTransport};
+use super::schema::{Config, DiskKind, PeerTransport};
 
 #[derive(Debug)]
 pub enum ConfigError {
@@ -18,12 +18,49 @@ pub enum ConfigError {
     Toml(toml::de::Error),
     DuplicatePeer(u64),
     DuplicateDiskPath(PathBuf),
-    InvalidTcpAddr { peer_id: u64, addr: String },
-    InvalidRdmaHex { peer_id: u64 },
+    MissingFileDiskSize(PathBuf),
+    ZeroFileDiskSize(PathBuf),
+    FileDiskSizeNotPageMultiple {
+        path: PathBuf,
+        size: usize,
+        page_size: usize,
+    },
+    SizeOnlyForFileDisk(PathBuf),
+    InvalidTcpAddr {
+        peer_id: u64,
+        addr: String,
+    },
+    InvalidRdmaHex {
+        peer_id: u64,
+    },
     EmptyDiskPath,
     MissingLocalNodeId,
     LocalNodeIdCollidesWithPeer(u64),
     ZeroFingersPerNode,
+    DuplicateBackendId(String),
+    DuplicateFrontendId(String),
+    EmptyBackendId,
+    EmptyFrontendId,
+    EmptyBackendEndpoint(String),
+    EmptyFrontendBind(String),
+    ZeroStripeSize(String),
+    StripeSizeNotPowerOfTwo {
+        backend_id: String,
+        stripe_size_bytes: u64,
+    },
+    ZeroHttpConcurrency(String),
+    InvalidFrontendBind {
+        frontend_id: String,
+        bind: String,
+    },
+    DuplicateFrontendBind {
+        frontend_id: String,
+        bind: String,
+    },
+    DanglingFrontendBackend {
+        frontend_id: String,
+        backend_id: String,
+    },
 }
 
 impl fmt::Display for ConfigError {
@@ -35,6 +72,30 @@ impl fmt::Display for ConfigError {
             ConfigError::DuplicateDiskPath(p) => {
                 write!(f, "duplicate disk path: {}", p.display())
             }
+            ConfigError::MissingFileDiskSize(p) => {
+                write!(f, "disk {}: kind = \"file\" requires a `size`", p.display())
+            }
+            ConfigError::ZeroFileDiskSize(p) => {
+                write!(
+                    f,
+                    "disk {}: file size must be greater than zero",
+                    p.display()
+                )
+            }
+            ConfigError::FileDiskSizeNotPageMultiple {
+                path,
+                size,
+                page_size,
+            } => write!(
+                f,
+                "disk {}: file size {size} must be a positive multiple of the page size {page_size}",
+                path.display()
+            ),
+            ConfigError::SizeOnlyForFileDisk(p) => write!(
+                f,
+                "disk {}: `size` is only valid for kind = \"file\"",
+                p.display()
+            ),
             ConfigError::InvalidTcpAddr { peer_id, addr } => {
                 write!(f, "peer {peer_id}: invalid tcp socket address {addr:?}")
             }
@@ -56,6 +117,54 @@ impl fmt::Display for ConfigError {
                 f,
                 "p2p.fingers_per_node must be greater than zero: the p2p subsystem needs at \
                  least one finger per node"
+            ),
+            ConfigError::DuplicateBackendId(id) => write!(f, "duplicate backend id: {id:?}"),
+            ConfigError::DuplicateFrontendId(id) => write!(f, "duplicate frontend id: {id:?}"),
+            ConfigError::EmptyBackendId => write!(f, "backend id must not be empty"),
+            ConfigError::EmptyFrontendId => write!(f, "frontend id must not be empty"),
+            ConfigError::EmptyBackendEndpoint(id) => {
+                write!(f, "backend {id:?}: endpoint must not be empty")
+            }
+            ConfigError::EmptyFrontendBind(id) => {
+                write!(f, "frontend {id:?}: bind must not be empty")
+            }
+            ConfigError::ZeroStripeSize(id) => write!(
+                f,
+                "backend {id:?}: stripe_size_bytes must be greater than zero: a zero stripe size \
+                 is a divide-by-zero in StripeKey derivation"
+            ),
+            ConfigError::StripeSizeNotPowerOfTwo {
+                backend_id,
+                stripe_size_bytes,
+            } => write!(
+                f,
+                "backend {backend_id:?}: stripe_size_bytes {stripe_size_bytes} must be a power of \
+                 two for deterministic StripeKey derivation"
+            ),
+            ConfigError::ZeroHttpConcurrency(id) => write!(
+                f,
+                "backend {id:?}: http_concurrency must be greater than zero: a zero limit would \
+                 stall all origin fetches"
+            ),
+            ConfigError::InvalidFrontendBind { frontend_id, bind } => {
+                write!(
+                    f,
+                    "frontend {frontend_id:?}: invalid bind socket address {bind:?}"
+                )
+            }
+            ConfigError::DuplicateFrontendBind { frontend_id, bind } => {
+                write!(
+                    f,
+                    "frontend {frontend_id:?}: duplicate bind address {bind:?}"
+                )
+            }
+            ConfigError::DanglingFrontendBackend {
+                frontend_id,
+                backend_id,
+            } => write!(
+                f,
+                "frontend {frontend_id:?} references backend {backend_id:?} which is not defined \
+                 in any [[backends]] entry"
             ),
         }
     }
@@ -136,6 +245,87 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
         }
         if !seen_paths.insert(&d.path) {
             return Err(ConfigError::DuplicateDiskPath(d.path.clone()));
+        }
+        match d.kind {
+            DiskKind::File => {
+                let page_size = d.page_size_bytes.unwrap_or(4096);
+                let size = match d.size {
+                    Some(s) => s.bytes(),
+                    None => return Err(ConfigError::MissingFileDiskSize(d.path.clone())),
+                };
+                if size == 0 {
+                    return Err(ConfigError::ZeroFileDiskSize(d.path.clone()));
+                }
+                if page_size == 0 || size % page_size != 0 {
+                    return Err(ConfigError::FileDiskSizeNotPageMultiple {
+                        path: d.path.clone(),
+                        size,
+                        page_size,
+                    });
+                }
+            }
+            _ => {
+                if d.size.is_some() {
+                    return Err(ConfigError::SizeOnlyForFileDisk(d.path.clone()));
+                }
+            }
+        }
+    }
+
+    let mut seen_backends: HashSet<&str> = HashSet::new();
+    for b in &cfg.backends {
+        if b.id.is_empty() {
+            return Err(ConfigError::EmptyBackendId);
+        }
+        if !seen_backends.insert(b.id.as_str()) {
+            return Err(ConfigError::DuplicateBackendId(b.id.clone()));
+        }
+        if b.endpoint.is_empty() {
+            return Err(ConfigError::EmptyBackendEndpoint(b.id.clone()));
+        }
+        if b.stripe_size_bytes == 0 {
+            return Err(ConfigError::ZeroStripeSize(b.id.clone()));
+        }
+        if !b.stripe_size_bytes.is_power_of_two() {
+            return Err(ConfigError::StripeSizeNotPowerOfTwo {
+                backend_id: b.id.clone(),
+                stripe_size_bytes: b.stripe_size_bytes,
+            });
+        }
+        if b.http_concurrency == 0 {
+            return Err(ConfigError::ZeroHttpConcurrency(b.id.clone()));
+        }
+    }
+
+    let mut seen_frontends: HashSet<&str> = HashSet::new();
+    let mut seen_binds: HashSet<&str> = HashSet::new();
+    for fr in &cfg.frontends {
+        if fr.id.is_empty() {
+            return Err(ConfigError::EmptyFrontendId);
+        }
+        if !seen_frontends.insert(fr.id.as_str()) {
+            return Err(ConfigError::DuplicateFrontendId(fr.id.clone()));
+        }
+        if fr.bind.is_empty() {
+            return Err(ConfigError::EmptyFrontendBind(fr.id.clone()));
+        }
+        if fr.bind.parse::<SocketAddr>().is_err() {
+            return Err(ConfigError::InvalidFrontendBind {
+                frontend_id: fr.id.clone(),
+                bind: fr.bind.clone(),
+            });
+        }
+        if !seen_binds.insert(fr.bind.as_str()) {
+            return Err(ConfigError::DuplicateFrontendBind {
+                frontend_id: fr.id.clone(),
+                bind: fr.bind.clone(),
+            });
+        }
+        if !seen_backends.contains(fr.backend.as_str()) {
+            return Err(ConfigError::DanglingFrontendBackend {
+                frontend_id: fr.id.clone(),
+                backend_id: fr.backend.clone(),
+            });
         }
     }
     Ok(())
@@ -295,7 +485,10 @@ address = "{bad}"
             );
             let f = write_cfg(&s);
             assert!(
-                matches!(load(f.path()), Err(ConfigError::InvalidRdmaHex { peer_id: 3 })),
+                matches!(
+                    load(f.path()),
+                    Err(ConfigError::InvalidRdmaHex { peer_id: 3 })
+                ),
                 "expected InvalidRdmaHex for {bad:?}"
             );
         }
@@ -309,6 +502,80 @@ path = ""
 "#;
         let f = write_cfg(s);
         assert!(matches!(load(f.path()), Err(ConfigError::EmptyDiskPath)));
+    }
+
+    #[test]
+    fn loads_file_disk_with_size() {
+        let s = r#"
+[[disks]]
+path = "/tmp/unbounded-file-disk"
+kind = "file"
+size = "16M"
+"#;
+        let f = write_cfg(s);
+        let cfg = load(f.path()).expect("load should succeed");
+        assert_eq!(cfg.disks[0].kind, DiskKind::File);
+        assert!(cfg.disks[0].size.is_some());
+        assert_eq!(cfg.disks[0].size.unwrap().bytes(), 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn rejects_file_disk_without_size() {
+        let s = r#"
+[[disks]]
+path = "/tmp/unbounded-file-disk"
+kind = "file"
+"#;
+        let f = write_cfg(s);
+        assert!(matches!(
+            load(f.path()),
+            Err(ConfigError::MissingFileDiskSize(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_file_disk_with_zero_size() {
+        let s = r#"
+[[disks]]
+path = "/tmp/unbounded-file-disk"
+kind = "file"
+size = 0
+"#;
+        let f = write_cfg(s);
+        assert!(matches!(
+            load(f.path()),
+            Err(ConfigError::ZeroFileDiskSize(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_file_disk_size_not_page_multiple() {
+        let s = r#"
+[[disks]]
+path = "/tmp/unbounded-file-disk"
+kind = "file"
+size = 5000
+"#;
+        let f = write_cfg(s);
+        assert!(matches!(
+            load(f.path()),
+            Err(ConfigError::FileDiskSizeNotPageMultiple { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_size_on_non_file_disk() {
+        let s = r#"
+[[disks]]
+path = "/dev/nvme0n1"
+kind = "nvme"
+size = "16M"
+"#;
+        let f = write_cfg(s);
+        assert!(matches!(
+            load(f.path()),
+            Err(ConfigError::SizeOnlyForFileDisk(_))
+        ));
     }
 
     #[test]
@@ -408,6 +675,244 @@ fingers_per_node = 0
         match load(f.path()) {
             Err(ConfigError::ZeroFingersPerNode) => {}
             other => panic!("expected ZeroFingersPerNode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn loads_backends_and_frontends_happy_path() {
+        let s = r#"
+[[backends]]
+id = "primary-http"
+kind = "http"
+endpoint = "https://origin.example.com"
+
+[[frontends]]
+id = "workload-http"
+kind = "http"
+bind = "0.0.0.0:9000"
+backend = "primary-http"
+"#;
+        let f = write_cfg(s);
+        let cfg = load(f.path()).expect("load should succeed");
+        assert_eq!(cfg.backends.len(), 1);
+        assert_eq!(cfg.frontends.len(), 1);
+    }
+
+    #[test]
+    fn rejects_duplicate_backend_ids() {
+        let s = r#"
+[[backends]]
+id = "dup"
+kind = "http"
+endpoint = "https://e"
+
+[[backends]]
+id = "dup"
+kind = "http"
+endpoint = "https://e2"
+"#;
+        let f = write_cfg(s);
+        match load(f.path()) {
+            Err(ConfigError::DuplicateBackendId(id)) if id == "dup" => {}
+            other => panic!("expected DuplicateBackendId(dup), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_frontend_ids() {
+        let s = r#"
+[[backends]]
+id = "b"
+kind = "http"
+endpoint = "https://e"
+
+[[frontends]]
+id = "dup"
+kind = "http"
+bind = "0.0.0.0:9000"
+backend = "b"
+
+[[frontends]]
+id = "dup"
+kind = "http"
+bind = "0.0.0.0:9001"
+backend = "b"
+"#;
+        let f = write_cfg(s);
+        match load(f.path()) {
+            Err(ConfigError::DuplicateFrontendId(id)) if id == "dup" => {}
+            other => panic!("expected DuplicateFrontendId(dup), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_dangling_frontend_backend_reference() {
+        let s = r#"
+[[backends]]
+id = "real"
+kind = "http"
+endpoint = "https://e"
+
+[[frontends]]
+id = "f"
+kind = "http"
+bind = "0.0.0.0:9000"
+backend = "ghost"
+"#;
+        let f = write_cfg(s);
+        match load(f.path()) {
+            Err(ConfigError::DanglingFrontendBackend {
+                frontend_id,
+                backend_id,
+            }) if frontend_id == "f" && backend_id == "ghost" => {}
+            other => panic!("expected DanglingFrontendBackend, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_empty_backend_endpoint() {
+        let no_endpoint = r#"
+[[backends]]
+id = "b"
+kind = "http"
+endpoint = ""
+"#;
+        let f = write_cfg(no_endpoint);
+        assert!(matches!(
+            load(f.path()),
+            Err(ConfigError::EmptyBackendEndpoint(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_zero_stripe_size() {
+        let s = r#"
+[[backends]]
+id = "b"
+kind = "http"
+endpoint = "https://e"
+stripe_size_bytes = 0
+"#;
+        let f = write_cfg(s);
+        match load(f.path()) {
+            Err(ConfigError::ZeroStripeSize(id)) if id == "b" => {}
+            other => panic!("expected ZeroStripeSize(b), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_non_power_of_two_stripe_size() {
+        let s = r#"
+[[backends]]
+id = "b"
+kind = "http"
+endpoint = "https://e"
+stripe_size_bytes = 3000000
+"#;
+        let f = write_cfg(s);
+        match load(f.path()) {
+            Err(ConfigError::StripeSizeNotPowerOfTwo { backend_id, .. }) if backend_id == "b" => {}
+            other => panic!("expected StripeSizeNotPowerOfTwo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_power_of_two_stripe_size() {
+        let s = r#"
+[[backends]]
+id = "b"
+kind = "http"
+endpoint = "https://e"
+stripe_size_bytes = 8388608
+"#;
+        let f = write_cfg(s);
+        let cfg = load(f.path()).expect("load should succeed");
+        assert_eq!(cfg.backends[0].stripe_size_bytes, 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn rejects_zero_http_concurrency() {
+        let s = r#"
+[[backends]]
+id = "b"
+kind = "http"
+endpoint = "https://e"
+http_concurrency = 0
+"#;
+        let f = write_cfg(s);
+        match load(f.path()) {
+            Err(ConfigError::ZeroHttpConcurrency(id)) if id == "b" => {}
+            other => panic!("expected ZeroHttpConcurrency(b), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_frontend_bind() {
+        let s = r#"
+[[backends]]
+id = "b"
+kind = "http"
+endpoint = "https://e"
+
+[[frontends]]
+id = "f"
+kind = "http"
+bind = "not-an-addr"
+backend = "b"
+"#;
+        let f = write_cfg(s);
+        match load(f.path()) {
+            Err(ConfigError::InvalidFrontendBind { frontend_id, .. }) if frontend_id == "f" => {}
+            other => panic!("expected InvalidFrontendBind, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_hostname_for_frontend_bind() {
+        let s = r#"
+[[backends]]
+id = "b"
+kind = "http"
+endpoint = "https://e"
+
+[[frontends]]
+id = "f"
+kind = "http"
+bind = "example.com:9000"
+backend = "b"
+"#;
+        let f = write_cfg(s);
+        assert!(matches!(
+            load(f.path()),
+            Err(ConfigError::InvalidFrontendBind { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_duplicate_frontend_bind() {
+        let s = r#"
+[[backends]]
+id = "b"
+kind = "http"
+endpoint = "https://e"
+
+[[frontends]]
+id = "f1"
+kind = "http"
+bind = "0.0.0.0:9000"
+backend = "b"
+
+[[frontends]]
+id = "f2"
+kind = "http"
+bind = "0.0.0.0:9000"
+backend = "b"
+"#;
+        let f = write_cfg(s);
+        match load(f.path()) {
+            Err(ConfigError::DuplicateFrontendBind { frontend_id, bind })
+                if frontend_id == "f2" && bind == "0.0.0.0:9000" => {}
+            other => panic!("expected DuplicateFrontendBind, got {other:?}"),
         }
     }
 }

@@ -130,7 +130,7 @@ pub struct StorageEngine<B: BlockDevice> {
 
 // SAFETY: the only `!Send + !Sync` field is `bufferpool.base`,
 // which is an `Option<*mut u8>` pointing into a pinned `Backing`
-// owned by the embedder (see `bufferpool::types::Backing`'s
+// owned by the embedder (see `crate::memory::Backing`'s
 // matching unsafe impl). Production deployments share one engine
 // per disk across multiple shard threads (see `LocalStorage` and
 // the design doc); the engine reads the pointer only while
@@ -430,7 +430,7 @@ impl<B: BlockDevice> StorageEngine<B> {
 }
 
 impl<B: BlockDevice> bufferpool::BlockStore for StorageEngine<B> {
-    fn register_pages(&self, backing: &bufferpool::Backing) -> Result<(), bufferpool::Error> {
+    fn register_pages(&self, backing: &crate::memory::Backing) -> Result<(), bufferpool::Error> {
         let mut bp = self.bufferpool.lock().unwrap();
         bp.base = Some(backing.base);
         bp.page_size = backing.page_size;
@@ -782,9 +782,9 @@ impl<B: BlockDevice> StorageEngine<B> {
                 MutatorOutcome::Failed
             } else {
                 match req {
-                    MutatorReq::Insert { .. } => MutatorOutcome::InsertCommitted {
-                        prior: priors[i],
-                    },
+                    MutatorReq::Insert { .. } => {
+                        MutatorOutcome::InsertCommitted { prior: priors[i] }
+                    }
                     MutatorReq::Delete { .. } => MutatorOutcome::DeleteCommitted,
                 }
             };
@@ -817,7 +817,8 @@ fn io_errno(e: &crate::storage::types::Error) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bufferpool::{Backing, BlockStore};
+    use crate::bufferpool::BlockStore;
+    use crate::memory::Backing;
     use crate::storage::blockdev::{MockDevice, MockDeviceConfig, MockFaultMode};
     use crate::storage::types::Lba;
 
@@ -1182,7 +1183,10 @@ mod tests {
             }
             let s = eng_body.snapshot();
             assert_eq!(s.write_io_errors, 1);
-            assert_eq!(s.admitted, 0, "failed write must not be counted as admitted");
+            assert_eq!(
+                s.admitted, 0,
+                "failed write must not be counted as admitted"
+            );
 
             // A subsequent read for the same key must miss: the
             // btree was never updated, so the engine should not

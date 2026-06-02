@@ -41,12 +41,23 @@ pub struct Nvme {
     pub numa: Option<u16>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Nic {
+    pub dev_name: String,
+    pub pci_bdf: Option<String>,
+    pub numa: Option<u16>,
+    pub rx_queues: usize,
+    pub msi_irqs: Vec<u32>,
+    pub operstate_up: bool,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Host {
     pub cpus: BTreeMap<u32, Cpu>,
     pub numa_nodes: Vec<NumaNode>,
     pub hcas: Vec<Hca>,
     pub nvmes: Vec<Nvme>,
+    pub nics: Vec<Nic>,
     pub isolated: BTreeSet<u32>,
 }
 
@@ -82,12 +93,15 @@ impl Host {
         hcas.sort_by(|a, b| a.pci_bdf.cmp(&b.pci_bdf).then(a.dev_name.cmp(&b.dev_name)));
         let mut nvmes = discover_nvmes(sys_root);
         nvmes.sort_by(|a, b| a.pci_bdf.cmp(&b.pci_bdf).then(a.dev_name.cmp(&b.dev_name)));
+        let mut nics = discover_nics(sys_root);
+        nics.sort_by(|a, b| a.pci_bdf.cmp(&b.pci_bdf).then(a.dev_name.cmp(&b.dev_name)));
 
         Host {
             cpus,
             numa_nodes,
             hcas,
             nvmes,
+            nics,
             isolated,
         }
     }
@@ -183,6 +197,78 @@ fn discover_nvmes(sys_root: &Path) -> Vec<Nvme> {
         });
     }
     out
+}
+
+fn discover_nics(sys_root: &Path) -> Vec<Nic> {
+    let net_root = sys_root.join("class/net");
+    let entries = match fs::read_dir(&net_root) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let name_os = entry.file_name();
+        let dev = match name_os.to_str() {
+            Some(s) if !s.is_empty() => s.to_owned(),
+            _ => continue,
+        };
+        // Skip virtual devices (lo, bridges, veth, ...) that have no
+        // backing `device` symlink. Only physical NICs are recorded.
+        let device_dir = sys_root.join(format!("class/net/{dev}/device"));
+        if !device_dir.exists() {
+            continue;
+        }
+        let numa = read_numa_node(&sys_root.join(format!("class/net/{dev}/device/numa_node")));
+        let pci_bdf = sysfs::read_pci_bdf(&sys_root.join(format!("class/net/{dev}/device/uevent")));
+        let rx_queues = count_rx_queues(&sys_root.join(format!("class/net/{dev}/queues")));
+        let msi_irqs = read_msi_irqs(&sys_root.join(format!("class/net/{dev}/device/msi_irqs")));
+        let operstate_up = read_operstate_up(&sys_root.join(format!("class/net/{dev}/operstate")));
+        out.push(Nic {
+            dev_name: dev,
+            pci_bdf,
+            numa,
+            rx_queues,
+            msi_irqs,
+            operstate_up,
+        });
+    }
+    out
+}
+
+fn count_rx_queues(queues_dir: &Path) -> usize {
+    let entries = match fs::read_dir(queues_dir) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    entries
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .map(|n| n.starts_with("rx-"))
+                .unwrap_or(false)
+        })
+        .count()
+}
+
+fn read_msi_irqs(msi_dir: &Path) -> Vec<u32> {
+    let entries = match fs::read_dir(msi_dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut irqs: Vec<u32> = entries
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()))
+        .collect();
+    irqs.sort_unstable();
+    irqs
+}
+
+fn read_operstate_up(path: &Path) -> bool {
+    match fs::read_to_string(path) {
+        Ok(s) => s.trim() == "up",
+        Err(_) => false,
+    }
 }
 
 fn is_nvme_controller(name: &str) -> bool {
@@ -308,6 +394,45 @@ mod tests {
                 &format!("PCI_SLOT_NAME={bdf}\n"),
             );
         }
+
+        #[allow(clippy::too_many_arguments)]
+        fn add_nic(
+            &self,
+            dev: &str,
+            bdf: Option<&str>,
+            numa: i32,
+            rx_queues: usize,
+            msi_irqs: &[u32],
+            operstate: &str,
+        ) {
+            self.touch_dir(&format!("class/net/{dev}/device"));
+            self.write(
+                &format!("class/net/{dev}/device/numa_node"),
+                &format!("{numa}\n"),
+            );
+            if let Some(bdf) = bdf {
+                self.write(
+                    &format!("class/net/{dev}/device/uevent"),
+                    &format!("PCI_SLOT_NAME={bdf}\n"),
+                );
+            }
+            for q in 0..rx_queues {
+                self.touch_dir(&format!("class/net/{dev}/queues/rx-{q}"));
+            }
+            for irq in msi_irqs {
+                self.write(&format!("class/net/{dev}/device/msi_irqs/{irq}"), "");
+            }
+            self.write(
+                &format!("class/net/{dev}/operstate"),
+                &format!("{operstate}\n"),
+            );
+        }
+
+        /// Stage a virtual net device (no `device` symlink), e.g. `lo`.
+        fn add_virtual_nic(&self, dev: &str) {
+            self.touch_dir(&format!("class/net/{dev}"));
+            self.write(&format!("class/net/{dev}/operstate"), "up\n");
+        }
     }
 
     impl Drop for FakeSys {
@@ -324,6 +449,7 @@ mod tests {
         assert!(h.numa_nodes.is_empty());
         assert!(h.hcas.is_empty());
         assert!(h.nvmes.is_empty());
+        assert!(h.nics.is_empty());
         assert!(h.isolated.is_empty());
     }
 
@@ -393,6 +519,71 @@ mod tests {
         let h = Host::discover_with(&s.root);
         assert_eq!(h.nvmes.len(), 1);
         assert_eq!(h.nvmes[0].dev_name, "nvme0");
+    }
+
+    #[test]
+    fn single_nic_recorded() {
+        let s = FakeSys::new();
+        s.add_nic("eth0", Some("0000:01:00.0"), 0, 4, &[40, 41, 42], "up");
+        let h = Host::discover_with(&s.root);
+        assert_eq!(h.nics.len(), 1);
+        let nic = &h.nics[0];
+        assert_eq!(nic.dev_name, "eth0");
+        assert_eq!(nic.pci_bdf.as_deref(), Some("0000:01:00.0"));
+        assert_eq!(nic.numa, Some(0));
+        assert_eq!(nic.rx_queues, 4);
+        assert_eq!(nic.msi_irqs, vec![40, 41, 42]);
+        assert!(nic.operstate_up);
+    }
+
+    #[test]
+    fn nic_numa_minus_one_yields_none() {
+        let s = FakeSys::new();
+        s.add_nic("eth0", Some("0000:01:00.0"), -1, 1, &[], "up");
+        let h = Host::discover_with(&s.root);
+        assert_eq!(h.nics.len(), 1);
+        assert_eq!(h.nics[0].numa, None);
+    }
+
+    #[test]
+    fn virtual_nic_without_device_is_skipped() {
+        let s = FakeSys::new();
+        s.add_virtual_nic("lo");
+        s.add_nic("eth0", Some("0000:01:00.0"), 0, 2, &[10], "up");
+        let h = Host::discover_with(&s.root);
+        assert_eq!(h.nics.len(), 1);
+        assert_eq!(h.nics[0].dev_name, "eth0");
+    }
+
+    #[test]
+    fn multiple_nics_sort_by_bdf_then_dev() {
+        let s = FakeSys::new();
+        s.add_nic("eth1", Some("0000:10:00.0"), 0, 1, &[], "up");
+        s.add_nic("eth0", Some("0000:02:00.0"), 0, 1, &[], "up");
+        let h = Host::discover_with(&s.root);
+        assert_eq!(
+            h.nics
+                .iter()
+                .map(|n| n.dev_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["eth0", "eth1"]
+        );
+    }
+
+    #[test]
+    fn nic_msi_irqs_sorted() {
+        let s = FakeSys::new();
+        s.add_nic("eth0", Some("0000:01:00.0"), 0, 1, &[99, 3, 50, 7], "up");
+        let h = Host::discover_with(&s.root);
+        assert_eq!(h.nics[0].msi_irqs, vec![3, 7, 50, 99]);
+    }
+
+    #[test]
+    fn nic_operstate_down_recorded_as_false() {
+        let s = FakeSys::new();
+        s.add_nic("eth0", Some("0000:01:00.0"), 0, 1, &[], "down");
+        let h = Host::discover_with(&s.root);
+        assert!(!h.nics[0].operstate_up);
     }
 
     #[test]

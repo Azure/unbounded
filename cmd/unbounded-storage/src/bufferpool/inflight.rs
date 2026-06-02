@@ -6,7 +6,7 @@
 //! One [`StripeFetch`] lives in the pool's inflight map per active
 //! [`StripeKey`]. Each [`PageSlot`] within it tracks the lifecycle of
 //! one logical page within the stripe: which `page_idx` was allocated
-//! out of the [`crate::bufferpool::Backing`], whether the I/O is
+//! out of the [`crate::memory::Backing`], whether the I/O is
 //! still pending, how many [`crate::bufferpool::PageGuard`]s are
 //! holding the bytes, and whether the tee `BlockStore::write_page`
 //! is still draining.

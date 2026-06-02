@@ -8,6 +8,7 @@ use std::time::Instant;
 
 use crate::bufferpool::{Req, StripeKey, TraceCtx};
 use crate::p2p::ring::stripe_to_ring;
+use crate::storage::OriginRef;
 
 /// Opaque node identifier minted by the p2p layer.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -63,6 +64,14 @@ pub struct P2pReq {
     pub deadline: Instant,
     pub trace: TraceCtx,
     pub hops: u32,
+    /// Origin context for the stripe, populated by a frontend that
+    /// knows which origin object the stripe came from. Peer
+    /// handlers ignore it (they serve from their local cache by
+    /// `key`); it is consulted only when the request falls through
+    /// to the origin tier and the backend must map `key` back to an
+    /// origin byte range. `None` for peer-internal forwarding where
+    /// no origin is known or needed.
+    pub origin: Option<OriginRef>,
 }
 
 impl P2pReq {
@@ -73,6 +82,7 @@ impl P2pReq {
             deadline,
             trace,
             hops: 0,
+            origin: None,
         }
     }
 
@@ -88,7 +98,21 @@ impl P2pReq {
             deadline,
             trace,
             hops: 0,
+            origin: None,
         }
+    }
+
+    /// Attach origin context, consumed builder-style. Backward
+    /// compatible: callers that do not know the origin simply skip
+    /// this and leave `origin` as `None`.
+    pub fn with_origin(mut self, origin: OriginRef) -> Self {
+        self.origin = Some(origin);
+        self
+    }
+
+    /// Borrow the origin context, if any.
+    pub fn origin(&self) -> Option<&OriginRef> {
+        self.origin.as_ref()
     }
 }
 
@@ -118,6 +142,19 @@ mod tests {
     fn req_trait_returns_key() {
         let key = StripeKey([3u8; 32]);
         let req = P2pReq::new_with_target(key, RingId(0), Instant::now(), TraceCtx::default());
+        assert_eq!(<P2pReq as Req>::key(&req), key);
+    }
+
+    #[test]
+    fn origin_defaults_none_and_round_trips_via_builder() {
+        let origin = OriginRef::new("primary-s3", "models/llama.bin", 5);
+        let key = origin.stripe_key();
+        let req = P2pReq::new(key, Instant::now(), TraceCtx::default());
+        assert_eq!(req.origin(), None);
+
+        let req = req.with_origin(origin.clone());
+        assert_eq!(req.origin(), Some(&origin));
+        // The key contract is untouched by attaching origin.
         assert_eq!(<P2pReq as Req>::key(&req), key);
     }
 

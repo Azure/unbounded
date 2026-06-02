@@ -8,7 +8,8 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use crate::bufferpool::stream::ReadStream;
-use crate::bufferpool::types::{Backing, BulkRef, Error, PageRef, StripeKey};
+use crate::bufferpool::types::{BulkRef, Error, PageRef, StripeKey};
+use crate::memory::Backing;
 
 pub trait Req {
     fn key(&self) -> StripeKey;

@@ -94,8 +94,7 @@ mod tests {
         fn numa_of(&self, _idx: WorkerIdx) -> Option<u16> {
             None
         }
-        fn run_worker(&self, _idx: WorkerIdx, _f: Box<dyn FnOnce() + Send + 'static>) {}
-        fn spawn_aux(
+        fn spawn_pinned(
             &self,
             _idx: WorkerIdx,
             _name: &str,

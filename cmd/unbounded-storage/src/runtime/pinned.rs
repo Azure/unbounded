@@ -36,17 +36,58 @@ impl PinnedRuntime {
         Arc::new(Self { workers })
     }
 
-    /// Convenience: one worker per supplied CPU id, with each
-    /// worker's NUMA hint resolved from `/sys`.
-    pub fn one_per_cpu<I: IntoIterator<Item = u32>>(cpus: I) -> Arc<Self> {
-        let workers = cpus
-            .into_iter()
-            .map(|cpu| WorkerSpec {
-                cpu,
-                numa: numa_node_of_cpu(cpu),
-            })
+    /// Build a runtime from a topology [`Plan`](crate::topology::Plan),
+    /// keeping only workers for which `filter` returns true, in the
+    /// plan's iteration order. Each retained worker maps to a
+    /// [`WorkerSpec`] over its CPU and NUMA node, so `WorkerIdx(i)`
+    /// addresses the i-th retained worker. Because the order is
+    /// preserved, callers that independently filter `plan.workers`
+    /// with the *same* predicate get a matching index space.
+    pub fn from_plan(
+        plan: &crate::topology::Plan,
+        filter: impl Fn(&crate::topology::Worker) -> bool,
+    ) -> Arc<Self> {
+        let workers = plan
+            .workers
+            .iter()
+            .filter(|w| filter(w))
+            .map(|w| WorkerSpec::new(w.cpu, w.numa))
             .collect::<Vec<_>>();
+        assert!(
+            !workers.is_empty(),
+            "PinnedRuntime::from_plan: no workers matched the filter"
+        );
         Self::new(workers)
+    }
+
+    /// Spawn a named OS thread and, when `spec` is `Some`, pin it
+    /// (CPU affinity + NUMA mempolicy) inside the new thread before
+    /// running `f`. `None` spawns an unpinned thread. This is the one
+    /// place the runtime turns a placement into a live thread.
+    pub fn spawn_placed(
+        &self,
+        spec: Option<WorkerSpec>,
+        name: &str,
+        f: Box<dyn FnOnce() + Send + 'static>,
+    ) -> JoinHandle {
+        std::thread::Builder::new()
+            .name(name.to_string())
+            .spawn(move || {
+                // Pin (affinity + NUMA mempolicy) inside the new thread
+                // BEFORE running `f`, so any allocations `f` makes land
+                // on the worker's NUMA node. A pin failure here must not
+                // abort the host process; the work still has to run.
+                if let Some(spec) = spec {
+                    if let Err(e) = pin_current(spec) {
+                        eprintln!(
+                            "PinnedRuntime::spawn_placed: pin failed for cpu={} numa={:?}: {e}",
+                            spec.cpu, spec.numa
+                        );
+                    }
+                }
+                f();
+            })
+            .expect("PinnedRuntime::spawn_placed: thread spawn failed")
     }
 
     fn spec(&self, idx: WorkerIdx) -> WorkerSpec {
@@ -65,32 +106,13 @@ impl Threading for PinnedRuntime {
         self.spec(idx).numa
     }
 
-    fn run_worker(&self, idx: WorkerIdx, f: Box<dyn FnOnce() + Send + 'static>) {
-        pin_current(self.spec(idx)).expect("PinnedRuntime::run_worker: pin failed");
-        f();
-    }
-
-    fn spawn_aux(
+    fn spawn_pinned(
         &self,
         idx: WorkerIdx,
         name: &str,
         f: Box<dyn FnOnce() + Send + 'static>,
     ) -> JoinHandle {
-        let spec = self.spec(idx);
-        std::thread::Builder::new()
-            .name(name.to_string())
-            .spawn(move || {
-                // A pin failure inside an aux thread shouldn't abort
-                // the host process; the work still has to run.
-                if let Err(e) = pin_current(spec) {
-                    eprintln!(
-                        "PinnedRuntime::spawn_aux: pin failed for cpu={} numa={:?}: {e}",
-                        spec.cpu, spec.numa
-                    );
-                }
-                f();
-            })
-            .expect("PinnedRuntime::spawn_aux: thread spawn failed")
+        self.spawn_placed(Some(self.spec(idx)), name, f)
     }
 }
 
@@ -103,8 +125,21 @@ fn pin_current(spec: WorkerSpec) -> std::io::Result<()> {
 }
 
 fn set_affinity(cpu: u32) -> std::io::Result<()> {
-    // SAFETY: cpu_set_t is a POD bitmap; we zero it and only call
-    // libc helpers that take a valid &mut.
+    // `cpu_set_t` is a fixed-size bitmap holding `CPU_SETSIZE` bits.
+    // `CPU_SET` with an index past that capacity writes past the end
+    // of the on-stack set (undefined behavior / stack corruption), so
+    // bound-check first. Hosts with more than `CPU_SETSIZE` logical
+    // CPUs exist and sysfs CPU ids can exceed this limit.
+    let capacity = std::mem::size_of::<libc::cpu_set_t>() * 8;
+    if cpu as usize >= capacity {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("cpu {cpu} exceeds cpu_set_t capacity of {capacity} bits"),
+        ));
+    }
+    // SAFETY: cpu_set_t is a POD bitmap; we zero it and only call libc
+    // helpers that take a valid &mut. The bound check above guarantees
+    // `cpu` is in range for `CPU_SET`.
     unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
         libc::CPU_ZERO(&mut set);
@@ -144,19 +179,6 @@ fn set_preferred_node(node: u16) -> std::io::Result<()> {
     Ok(())
 }
 
-fn numa_node_of_cpu(cpu: u32) -> Option<u16> {
-    let dir = format!("/sys/devices/system/cpu/cpu{cpu}");
-    for entry in std::fs::read_dir(&dir).ok()?.flatten() {
-        let name = entry.file_name();
-        if let Some(rest) = name.to_string_lossy().strip_prefix("node") {
-            if let Ok(n) = rest.parse::<u16>() {
-                return Some(n);
-            }
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,12 +188,13 @@ mod tests {
     const TEST_CPU: u32 = 0;
 
     #[test]
-    fn run_worker_pins_to_target_cpu() {
+    fn spawn_pinned_pins_to_target_cpu() {
         let rt = PinnedRuntime::new(vec![WorkerSpec::new(TEST_CPU, None)]);
         let pinned = Arc::new(Mutex::new(false));
         let p = pinned.clone();
-        rt.run_worker(
+        let h = rt.spawn_pinned(
             WorkerIdx(0),
+            "pinned-cpu-check",
             Box::new(move || {
                 let mut got: libc::cpu_set_t = unsafe { std::mem::zeroed() };
                 let rc = unsafe {
@@ -185,25 +208,37 @@ mod tests {
                 *p.lock().unwrap() = only_test;
             }),
         );
+        h.join().expect("pinned thread");
         assert!(*pinned.lock().unwrap());
     }
 
     #[test]
-    fn spawn_aux_runs_and_joins() {
+    fn set_affinity_rejects_out_of_range_cpu() {
+        // A cpu id at or beyond the cpu_set_t bit capacity must be
+        // rejected without invoking CPU_SET out of bounds.
+        let capacity = std::mem::size_of::<libc::cpu_set_t>() * 8;
+        let err = set_affinity(capacity as u32).expect_err("at-capacity cpu must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let err = set_affinity(u32::MAX).expect_err("u32::MAX cpu must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn spawn_pinned_runs_and_joins() {
         let rt = PinnedRuntime::new(vec![WorkerSpec::new(TEST_CPU, Some(7))]);
         assert_eq!(rt.worker_count(), 1);
         assert_eq!(rt.numa_of(WorkerIdx(0)), Some(7));
         let observed = Arc::new(Mutex::new(false));
         let o = observed.clone();
         // numa=Some(7) may fail on hosts without that node; pin
-        // with numa=None for the aux side to avoid that.
+        // with numa=None for this side to avoid that.
         let rt2 = PinnedRuntime::new(vec![WorkerSpec::new(TEST_CPU, None)]);
-        let h = rt2.spawn_aux(
+        let h = rt2.spawn_pinned(
             WorkerIdx(0),
-            "pinned-aux",
+            "pinned-run",
             Box::new(move || *o.lock().unwrap() = true),
         );
-        h.join().expect("aux thread");
+        h.join().expect("pinned thread");
         assert!(*observed.lock().unwrap());
     }
 }

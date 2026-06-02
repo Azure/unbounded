@@ -50,6 +50,8 @@ use super::fabric::{Fabric, FabricInner};
 use super::ffi;
 use super::handler::{Handler, HandlerStream};
 
+// Reserved tag bases for the RPC protocol. The low 32 bits carry the
+// request id; the high 32 bits select the message class.
 pub const REQUEST_TAG_BASE: u64 = 0xFFFF_FFFC_0000_0000;
 pub const PAGE_ACK_TAG_BASE: u64 = 0xFFFF_FFFA_0000_0000;
 pub const RESPONSE_END_TAG_BASE: u64 = 0xFFFF_FFF8_0000_0000;
@@ -57,6 +59,15 @@ pub const ERROR_ACK_TAG_BASE: u64 = 0xFFFF_FFF6_0000_0000;
 
 const REQ_TAG_IGNORE: u64 = 0x0000_0000_FFFF_FFFF;
 const REQUEST_RECV_BUF_LEN: usize = 64 * 1024;
+
+/// Loop-protection safety net for recursive Chord-finger routing.
+///
+/// Real termination of a recursive lookup is guaranteed by the
+/// strictly-decreasing Chord ring distance at each hop; this hop
+/// limit only guards against bugs or misconfiguration that could
+/// otherwise let a request circulate forever. It is seeded into the
+/// request header as the initial TTL and decremented at each forward.
+pub const MAX_HOPS: u32 = 64;
 
 #[doc(hidden)]
 #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -68,19 +79,32 @@ pub struct RequestHeader {
     pub src_stripe: [u8; 32],
     pub src_offset: u64,
     pub src_len: u32,
+    /// Remaining hop budget for recursive forwarding. Decremented at
+    /// each forward. A request received with `ttl == 0` is only
+    /// rejected if it would have to be forwarded again; a node that
+    /// owns the stripe still serves it locally at `ttl == 0`. The
+    /// hop-limit decision is made by the handler, not the RPC layer.
+    pub ttl: u32,
 }
 
 impl RequestHeader {
     #[doc(hidden)]
-    pub fn new(request_id: u32, dest_mr: &MrHandle, dest_pages: u32, src: BulkRef) -> Self {
+    pub fn new(
+        request_id: u32,
+        dest_mr: &MrHandle,
+        dest_pages: u32,
+        src: BulkRef,
+        ttl: u32,
+    ) -> Self {
         Self {
             request_id,
-            dest_mr_base: dest_mr.base as u64,
+            dest_mr_base: dest_mr.remote_base,
             dest_mr_key: dest_mr.remote_key,
             dest_pages,
             src_stripe: src.stripe.0,
             src_offset: src.offset,
             src_len: src.len,
+            ttl,
         }
     }
 
@@ -100,6 +124,7 @@ impl RequestHeader {
                 mr: ptr::null_mut(),
                 remote_key: 0,
                 base: 0,
+                remote_base: 0,
                 len: 0,
             },
             0,
@@ -108,6 +133,7 @@ impl RequestHeader {
                 offset: 0,
                 len: 0,
             },
+            0,
         ))
         .map(|n| n as usize)
         .ok()
@@ -131,6 +157,11 @@ struct ServerShared {
     /// for `fi_write`s; if unset every request is failed with an
     /// `ERROR_ACK`.
     local_mr: Option<MrHandle>,
+    /// Page size used to compute source and destination offsets for
+    /// streamed page writes. Supplied by the embedder via
+    /// [`Fabric::start_rpc_server`] to match the bufferpool's actual
+    /// page size.
+    page_size: usize,
     shutdown: AtomicBool,
     inflight: AtomicU64,
 }
@@ -163,6 +194,7 @@ impl Fabric {
         self: &Arc<Self>,
         handler: Arc<H>,
         local_mr: Option<MrHandle>,
+        page_size: usize,
     ) -> FabResult<RpcServerHandle>
     where
         R: Req + Serialize + DeserializeOwned + Send + 'static,
@@ -171,6 +203,7 @@ impl Fabric {
         let shared = Arc::new(ServerShared {
             fabric: self.inner_arc(),
             local_mr,
+            page_size,
             shutdown: AtomicBool::new(false),
             inflight: AtomicU64::new(0),
         });
@@ -188,9 +221,6 @@ where
     R: Req + Serialize + DeserializeOwned + Send + 'static,
     H: Handler<R> + 'static,
 {
-    if shared.shutdown.load(Ordering::Acquire) {
-        return Ok(());
-    }
     let inner = &shared.fabric;
     let buf: Box<[u8; REQUEST_RECV_BUF_LEN]> = Box::new([0u8; REQUEST_RECV_BUF_LEN]);
     let buf_ptr = Box::into_raw(buf);
@@ -241,7 +271,7 @@ where
         shared_for_worker.inflight.fetch_add(1, Ordering::AcqRel);
         let shared_for_decr = shared_for_worker.clone();
         let runtime = shared_for_worker.fabric.cfg.runtime.clone();
-        let _h = runtime.spawn_aux(
+        let _h = runtime.spawn_pinned(
             WorkerIdx(0),
             "fabric-rpc-worker",
             Box::new(move || {
@@ -287,6 +317,18 @@ fn run_worker<R, H>(
     if src_addr == ffi::FI_ADDR_UNSPEC {
         return;
     }
+    // The hop budget (`ttl`) is NOT rejected here. The RPC layer is
+    // generic over the handler and does not run the Chord routing, so
+    // it cannot tell an owner-serve from a forward. A node that owns
+    // the requested stripe must serve locally even at `ttl == 0` (this
+    // is reachable when a chain is exactly `MAX_HOPS` long: the last
+    // forwarder, with `hops_remaining == 1`, forwards with `ttl - 1 ==
+    // 0` to the owner). Enforcing the hop limit unconditionally here
+    // silently shrank the budget by one and turned a valid owner-serve
+    // into a hard error. The decision belongs to the handler: it is
+    // handed `header.ttl` as `hops_remaining` below and rejects only
+    // when it would actually have to forward with no budget left
+    // (surfaced as a handler error that becomes an `ERROR_ACK`).
     let local_mr = match shared.local_mr {
         Some(m) => m,
         None => {
@@ -301,7 +343,7 @@ fn run_worker<R, H>(
     };
 
     let src = header.source();
-    let mut stream = handler.handle(&req, src);
+    let mut stream = handler.handle(&req, src, header.ttl);
     // SAFETY: stream is owned by this stack frame and pinned for
     // the duration of run_worker; we never move it.
     let mut stream = unsafe { std::pin::Pin::new_unchecked(&mut stream) };
@@ -354,32 +396,61 @@ fn write_page(
     dest_idx: u32,
     page: crate::bufferpool::PageRef,
 ) -> FabResult<()> {
-    let plan = plan_page_write(local_mr, &RequestPlan::from(header), dest_idx, page)?;
+    let plan = plan_page_write(
+        local_mr,
+        &RequestPlan::from(header),
+        dest_idx,
+        page,
+        shared.page_size,
+    )?;
     let src_ptr = plan.src_addr as *const std::ffi::c_void;
 
     let inner = &shared.fabric;
-    let (slot, fut) = inner.completions.allocate()?;
-    let ctx = slot.into_raw();
     // SAFETY: local_mr.mr is owned by the live fabric.
     let desc = unsafe { ffi::ub_fi_mr_desc(local_mr.mr) };
-    let rc = unsafe {
-        ffi::ub_fi_write(
-            inner.ep(),
-            src_ptr,
-            plan.len,
-            desc,
-            dest_fi_addr,
-            plan.dest_addr,
-            header.dest_mr_key,
-            ctx,
-        )
-    };
-    if rc < 0 {
-        // SAFETY: just produced.
-        let _ = unsafe { CompletionSlot::from_raw(ctx) };
-        return Err(FabricError::Pkg("fi_write", rc as i32));
+    // The reverse-direction `fi_write` can fail transiently while the
+    // `tcp` RDM connection back to the requester is still being
+    // established: the submit can return `-FI_EAGAIN`, and an accepted
+    // write can complete with a CQ error carrying `prov_errno=ENOTCONN`.
+    // Both clear once the progress thread finishes the handshake, so we
+    // retry the whole op until it succeeds or a deadline elapses.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (slot, fut) = inner.completions.allocate()?;
+        let ctx = slot.into_raw();
+        let rc = unsafe {
+            ffi::ub_fi_write(
+                inner.ep(),
+                src_ptr,
+                plan.len,
+                desc,
+                dest_fi_addr,
+                plan.dest_addr,
+                header.dest_mr_key,
+                ctx,
+            )
+        };
+        if rc < 0 {
+            // SAFETY: just produced.
+            let _ = unsafe { CompletionSlot::from_raw(ctx) };
+            if rc as i32 == -ffi::FI_EAGAIN && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            return Err(FabricError::Pkg("fi_write", rc as i32));
+        }
+        match block_on(fut, Duration::from_secs(10)) {
+            Ok(_) => break,
+            Err(FabricError::Cq { prov_errno, err })
+                if prov_errno == ffi::ENOTCONN && std::time::Instant::now() < deadline =>
+            {
+                let _ = err;
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
     }
-    let _ = block_on(fut, Duration::from_secs(10))?;
 
     let payload = bincode::serialize(&PageAck {
         page_idx: plan.ack_page_idx,
@@ -418,8 +489,8 @@ pub fn plan_page_write(
     request: &RequestPlan,
     dest_idx: u32,
     page: crate::bufferpool::PageRef,
+    page_size: usize,
 ) -> FabResult<PageWritePlan> {
-    let page_size = crate::backing::HUGEPAGE_2MB;
     if dest_idx >= request.dest_pages {
         return Err(FabricError::BadConfig(
             "destination page index out of range",
@@ -536,16 +607,29 @@ fn submit_small_send(
         };
     });
     let ctx = slot.into_raw();
-    let rc = unsafe {
-        ffi::ub_fi_tsend(
-            inner.ep(),
-            buf_ptr as *const std::ffi::c_void,
-            buf_len,
-            ptr::null_mut(),
-            dest,
-            tag,
-            ctx,
-        )
+    // Retry on `-FI_EAGAIN` while the `tcp` RDM connection back to the
+    // requester finishes establishing or the transmit queue drains.
+    // EAGAIN neither consumes the buffer nor produces a completion, so
+    // the same ctx/buffer are reused across attempts.
+    let rc = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let rc = unsafe {
+                ffi::ub_fi_tsend(
+                    inner.ep(),
+                    buf_ptr as *const std::ffi::c_void,
+                    buf_len,
+                    ptr::null_mut(),
+                    dest,
+                    tag,
+                    ctx,
+                )
+            };
+            if rc as i32 != -ffi::FI_EAGAIN || std::time::Instant::now() >= deadline {
+                break rc;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
     };
     if rc < 0 {
         // SAFETY: just produced.
@@ -603,6 +687,7 @@ mod tests {
             mr: ptr::null_mut(),
             remote_key: 0xAABB_CCDD,
             base,
+            remote_base: base as u64,
             len,
         }
     }
@@ -612,7 +697,7 @@ mod tests {
             7,
             &mr(
                 dest_base as usize,
-                dest_pages as usize * crate::backing::HUGEPAGE_2MB,
+                dest_pages as usize * crate::memory::HUGEPAGE_2MB,
             ),
             dest_pages,
             BulkRef {
@@ -620,6 +705,7 @@ mod tests {
                 offset: 0,
                 len: 0,
             },
+            MAX_HOPS,
         )
     }
 
@@ -691,7 +777,7 @@ mod tests {
             len: 0x99AA_BBCC,
         };
 
-        let header = RequestHeader::new(7, &dest_mr, 3, src);
+        let header = RequestHeader::new(7, &dest_mr, 3, src, 13);
 
         assert_eq!(header.request_id, 7);
         assert_eq!(header.dest_mr_base, 0x1000);
@@ -701,8 +787,30 @@ mod tests {
     }
 
     #[test]
+    fn request_header_round_trips_ttl_and_encoded_len_matches_prefix() {
+        let dest_mr = mr(0x2000, 8192);
+        let src = BulkRef {
+            stripe: StripeKey([0x11; 32]),
+            offset: 0xDEAD_BEEF,
+            len: 0x0BAD_F00D,
+        };
+
+        let header = RequestHeader::new(9, &dest_mr, 5, src, 42);
+        assert_eq!(header.ttl, 42);
+
+        let bytes = bincode::serialize(&header).expect("serialize header");
+        let expected_len = RequestHeader::encoded_len().expect("encoded len");
+        assert_eq!(bytes.len(), expected_len);
+
+        let decoded: RequestHeader =
+            bincode::deserialize(&bytes[..expected_len]).expect("deserialize header");
+        assert_eq!(decoded, header);
+        assert_eq!(decoded.ttl, 42);
+    }
+
+    #[test]
     fn page_write_plan_uses_handler_page_range_and_ack_ordinal() {
-        let page_size = crate::backing::HUGEPAGE_2MB;
+        let page_size = crate::memory::HUGEPAGE_2MB;
         let local_mr = mr(0x1000_0000, 4 * page_size);
         let header = header(0x2000_0000, 3);
         let page = crate::bufferpool::PageRef {
@@ -711,8 +819,8 @@ mod tests {
             len: 4096,
         };
 
-        let plan =
-            plan_page_write(&local_mr, &request_plan(&header), 1, page).expect("plan page write");
+        let plan = plan_page_write(&local_mr, &request_plan(&header), 1, page, page_size)
+            .expect("plan page write");
 
         assert_eq!(plan.src_addr, local_mr.base + 2 * page_size + 128);
         assert_eq!(plan.dest_addr, header.dest_mr_base + page_size as u64 + 128);
@@ -722,7 +830,7 @@ mod tests {
 
     #[test]
     fn page_write_plan_accepts_non_sequential_source_page() {
-        let page_size = crate::backing::HUGEPAGE_2MB;
+        let page_size = crate::memory::HUGEPAGE_2MB;
         let local_mr = mr(0x3000_0000, 4 * page_size);
         let header = header(0x4000_0000, 2);
         let page = crate::bufferpool::PageRef {
@@ -731,8 +839,8 @@ mod tests {
             len: page_size as u32,
         };
 
-        let plan =
-            plan_page_write(&local_mr, &request_plan(&header), 0, page).expect("plan page write");
+        let plan = plan_page_write(&local_mr, &request_plan(&header), 0, page, page_size)
+            .expect("plan page write");
 
         assert_eq!(plan.src_addr, local_mr.base + 3 * page_size);
         assert_eq!(plan.dest_addr, header.dest_mr_base);
@@ -741,7 +849,7 @@ mod tests {
 
     #[test]
     fn page_write_plan_rejects_local_range_out_of_bounds() {
-        let page_size = crate::backing::HUGEPAGE_2MB;
+        let page_size = crate::memory::HUGEPAGE_2MB;
         let local_mr = mr(0x5000_0000, page_size);
         let header = header(0x6000_0000, 1);
         let page = crate::bufferpool::PageRef {
@@ -750,12 +858,12 @@ mod tests {
             len: 1,
         };
 
-        assert!(plan_page_write(&local_mr, &request_plan(&header), 0, page).is_err());
+        assert!(plan_page_write(&local_mr, &request_plan(&header), 0, page, page_size).is_err());
     }
 
     #[test]
     fn page_write_plan_rejects_destination_range_out_of_bounds() {
-        let page_size = crate::backing::HUGEPAGE_2MB;
+        let page_size = crate::memory::HUGEPAGE_2MB;
         let local_mr = mr(0x7000_0000, page_size);
         let header = header(0x8000_0000, 1);
         let page = crate::bufferpool::PageRef {
@@ -764,7 +872,7 @@ mod tests {
             len: 8,
         };
 
-        assert!(plan_page_write(&local_mr, &request_plan(&header), 0, page).is_err());
+        assert!(plan_page_write(&local_mr, &request_plan(&header), 0, page, page_size).is_err());
         assert!(
             plan_page_write(
                 &local_mr,
@@ -775,8 +883,173 @@ mod tests {
                     offset: 0,
                     len: 1,
                 },
+                page_size,
             )
             .is_err()
         );
+    }
+
+    // --- hop-budget dispatch (ttl == 0 must serve an owner) ---
+    //
+    // `run_worker` is generic over the handler and hands it
+    // `header.ttl` as `hops_remaining`. These tests pin down the
+    // contract `run_worker` relies on after the unconditional
+    // `ttl == 0` short-circuit was removed: the *handler* decides the
+    // hop limit. An owner-serve must yield a page even at `ttl == 0`;
+    // a forward with no budget must surface an error (which
+    // `run_worker` turns into an `ERROR_ACK`).
+
+    /// What the first item of a handler's stream tells `run_worker` to
+    /// do: serve a page, reject with an error ack, or end the response.
+    #[derive(Debug)]
+    enum FirstOutcome {
+        Served(crate::bufferpool::PageRef),
+        Rejected(String),
+        Ended,
+    }
+
+    /// Drive a handler stream to its first ready item exactly the way
+    /// `run_worker`'s poll loop does (noop waker, blocking poll). This
+    /// is the dispatch decision the `ttl == 0` fix turns on: a page
+    /// means "served", an error means "rejected with an ERROR_ACK".
+    fn first_outcome<R, H>(handler: &H, req: &R, ttl: u32) -> FirstOutcome
+    where
+        R: Req,
+        H: Handler<R>,
+    {
+        let src = BulkRef {
+            stripe: StripeKey([0; 32]),
+            offset: 0,
+            len: 0,
+        };
+        let mut stream = handler.handle(req, src, ttl);
+        // SAFETY: stream is owned by this frame and never moved.
+        let mut stream = unsafe { std::pin::Pin::new_unchecked(&mut stream) };
+        let waker = noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        loop {
+            match stream.as_mut().poll_next(&mut cx) {
+                std::task::Poll::Ready(Some(Ok(page))) => return FirstOutcome::Served(page),
+                std::task::Poll::Ready(Some(Err(e))) => {
+                    return FirstOutcome::Rejected(format!("{e}"));
+                }
+                std::task::Poll::Ready(None) => return FirstOutcome::Ended,
+                // The mock handlers below resolve synchronously.
+                std::task::Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
+
+    struct RoutingReq(StripeKey);
+
+    impl Req for RoutingReq {
+        fn key(&self) -> StripeKey {
+            self.0
+        }
+    }
+
+    /// Handler error standing in for
+    /// `RecursiveHandlerError::HopLimitExceeded`.
+    #[derive(Debug)]
+    struct HopLimit;
+
+    impl std::fmt::Display for HopLimit {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "hop limit exceeded")
+        }
+    }
+
+    impl std::error::Error for HopLimit {}
+
+    /// Mock handler mirroring `RecursiveHandler`'s `classify`: it owns
+    /// the stripe (serves regardless of budget) or it forwards
+    /// (rejecting only when `hops_remaining == 0`).
+    struct RoutingHandler {
+        owns: bool,
+    }
+
+    struct RoutingStream {
+        outcome: Option<Result<crate::bufferpool::PageRef, HopLimit>>,
+    }
+
+    impl HandlerStream for RoutingStream {
+        type Error = HopLimit;
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<crate::bufferpool::PageRef, HopLimit>>> {
+            std::task::Poll::Ready(self.outcome.take())
+        }
+    }
+
+    impl<R: Req> Handler<R> for RoutingHandler {
+        type Error = HopLimit;
+        type Stream<'a>
+            = RoutingStream
+        where
+            Self: 'a,
+            R: 'a;
+        fn handle<'a>(
+            &'a self,
+            _req: &'a R,
+            _src: BulkRef,
+            hops_remaining: u32,
+        ) -> Self::Stream<'a> {
+            let page = crate::bufferpool::PageRef {
+                page_idx: 0,
+                offset: 0,
+                len: 4096,
+            };
+            let outcome = if self.owns {
+                // Owner: serve from the local store regardless of the
+                // remaining hop budget.
+                Some(Ok(page))
+            } else if hops_remaining == 0 {
+                // Forward with no budget: the genuine hop-limit case.
+                Some(Err(HopLimit))
+            } else {
+                // Forward with budget: relays a downstream page.
+                Some(Ok(page))
+            };
+            RoutingStream { outcome }
+        }
+    }
+
+    #[test]
+    fn owner_serves_even_with_exhausted_ttl() {
+        let handler = RoutingHandler { owns: true };
+        let req = RoutingReq(StripeKey([0; 32]));
+
+        match first_outcome(&handler, &req, 0) {
+            FirstOutcome::Served(_) => {}
+            other => panic!("owner must serve at ttl == 0, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn forward_with_exhausted_ttl_is_rejected_with_hop_limit() {
+        let handler = RoutingHandler { owns: false };
+        let req = RoutingReq(StripeKey([0; 32]));
+
+        match first_outcome(&handler, &req, 0) {
+            FirstOutcome::Rejected(msg) => {
+                assert!(
+                    msg.contains("hop limit"),
+                    "expected hop-limit rejection, got {msg:?}",
+                );
+            }
+            other => panic!("forward at ttl == 0 must be rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn forward_with_remaining_ttl_still_serves() {
+        let handler = RoutingHandler { owns: false };
+        let req = RoutingReq(StripeKey([0; 32]));
+
+        match first_outcome(&handler, &req, 1) {
+            FirstOutcome::Served(_) => {}
+            other => panic!("forward with budget must serve, got {other:?}"),
+        }
     }
 }

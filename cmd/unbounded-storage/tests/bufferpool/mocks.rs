@@ -21,8 +21,9 @@ use std::task::{Context, Poll};
 
 use rand::Rng;
 use unbounded_storage::bufferpool::{
-    Backing, BlockStore, BulkRef, Error, PageRef, PageStream, Req, StripeKey, Transport,
+    BlockStore, BulkRef, Error, PageRef, PageStream, Req, StripeKey, Transport,
 };
+use unbounded_storage::memory::Backing;
 
 use crate::framework::executor::{with_sim, yield_n};
 

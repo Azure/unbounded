@@ -13,7 +13,8 @@ use crate::bufferpool::free_list::FreeList;
 use crate::bufferpool::inflight::{PageSlot, SlotState, StripeFetch};
 use crate::bufferpool::stream::{LocalBoxFuture, ReadStream, StreamSrc};
 use crate::bufferpool::traits::{BlockStore, BufferPool, PageStream, Req, Transport};
-use crate::bufferpool::types::{Backing, BulkRef, Error, PageRef, PoolConfig, StripeKey};
+use crate::bufferpool::types::{BulkRef, Error, PageRef, PoolConfig, StripeKey};
+use crate::memory::Backing;
 
 /// One per shard. Per the design's runtime model, a single `Pool`
 /// runs single-threaded inside its NUMA shard; the embedder pins

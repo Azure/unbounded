@@ -20,6 +20,7 @@ pub enum Role {
     RdmaProgress { hca: usize },
     RdmaHandler { hca: usize },
     NvmeIoUring { nvme: usize },
+    NetworkShard { nic: usize },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,12 +41,21 @@ pub struct PlanConfig {
     pub rdma_progress_per_hca: usize,
     pub rdma_handlers_per_hca: usize,
     pub nvme_threads_per_drive: usize,
+    pub network_shards_per_nic: usize,
     pub use_smt_siblings: bool,
     pub respect_isolated: bool,
     pub exclude_node_cpu0: bool,
     pub require_node_type_ca: bool,
     pub require_active_port: bool,
     pub tcp_fallback_threads: usize,
+    /// Force the TCP fallback path even when usable HCAs are present.
+    /// When true, all discovered HCAs are dropped during planning so
+    /// no `RdmaProgress { hca }` worker binds to real hardware and the
+    /// daemon brings up the libfabric `tcp` provider instead. This is
+    /// the escape hatch for hosts that expose an RDMA-capable HCA whose
+    /// libfabric verbs provider is unusable (for example a cloud VM
+    /// with an mlx5 device but no working verbs stack).
+    pub disable_rdma: bool,
 }
 
 impl Default for PlanConfig {
@@ -54,12 +64,14 @@ impl Default for PlanConfig {
             rdma_progress_per_hca: 1,
             rdma_handlers_per_hca: 4,
             nvme_threads_per_drive: 2,
+            network_shards_per_nic: 0,
             use_smt_siblings: false,
             respect_isolated: true,
             exclude_node_cpu0: true,
             require_node_type_ca: true,
             require_active_port: true,
             tcp_fallback_threads: 1,
+            disable_rdma: false,
         }
     }
 }
@@ -68,6 +80,22 @@ impl Default for PlanConfig {
 pub struct Plan {
     pub workers: Vec<Worker>,
     pub numa_pools: Vec<NumaPool>,
+}
+
+/// A CPU slot reserved for a disk storage core: one per disk path
+/// (per NVMe drive), drawn from the plan's [`Role::NvmeIoUring`] worker
+/// allocation. These slots come out of the same disjoint, NUMA-local,
+/// SMT-collapsed, cpu0-excluded allocator that places the shard
+/// workers, so a disk pinned to one of these CPUs never collides with
+/// an RDMA progress or handler shard.
+///
+/// This is topology's own small slot type rather than a
+/// `runtime::WorkerSpec`: the dependency direction is
+/// `runtime -> topology`, so topology must not name runtime types.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DiskCpuSlot {
+    pub cpu: u32,
+    pub numa: Option<u16>,
 }
 
 impl Plan {
@@ -88,6 +116,15 @@ impl Plan {
         for (idx, nvme) in host.nvmes.iter().enumerate() {
             for _ in 0..cfg.nvme_threads_per_drive {
                 workers.push(allocator.place(nvme.numa, Role::NvmeIoUring { nvme: idx }));
+            }
+        }
+
+        // Network shards are placed before RDMA so they get NIC-local
+        // CPUs preferentially, consistent with NVMe being placed first
+        // for NVMe-locality.
+        for (idx, nic) in host.nics.iter().enumerate() {
+            for _ in 0..cfg.network_shards_per_nic {
+                workers.push(allocator.place(nic.numa, Role::NetworkShard { nic: idx }));
             }
         }
 
@@ -132,6 +169,42 @@ impl Plan {
         self.workers
             .iter()
             .filter(|w| matches!(w.role, Role::NvmeIoUring { .. }))
+    }
+
+    pub fn network(&self) -> impl Iterator<Item = &Worker> {
+        self.workers
+            .iter()
+            .filter(|w| matches!(w.role, Role::NetworkShard { .. }))
+    }
+
+    /// CPU slots available to disk storage cores: exactly one per disk
+    /// path (per NVMe drive), independent of `nvme_threads_per_drive`.
+    ///
+    /// The storage model runs exactly one storage core per disk path:
+    /// a single core hosts that disk's engine and io_uring ring (see
+    /// `storage::disks::DiskRegistry`). The plan still schedules
+    /// `nvme_threads_per_drive` [`Role::NvmeIoUring`] workers per drive
+    /// because the bench binary consumes them, but reserving a slot for
+    /// every one of them would (at the default of 2) take twice as many
+    /// disjoint CPUs from the shard pool as any storage core actually
+    /// uses, needlessly shrinking that pool. We therefore reserve one
+    /// slot per drive - the first `Role::NvmeIoUring` worker scheduled
+    /// for each drive - so the shard pool only loses the CPUs a storage
+    /// core will actually bind. The allocator still hands out each CPU
+    /// exactly once, so these slots remain disjoint from the shard
+    /// (RDMA progress / handler) CPUs by construction.
+    pub fn disk_cpu_slots(&self) -> Vec<DiskCpuSlot> {
+        let mut seen = std::collections::BTreeSet::new();
+        self.nvme()
+            .filter(|w| match w.role {
+                Role::NvmeIoUring { nvme } => seen.insert(nvme),
+                _ => false,
+            })
+            .map(|w| DiskCpuSlot {
+                cpu: w.cpu,
+                numa: w.numa,
+            })
+            .collect()
     }
 }
 
@@ -257,6 +330,9 @@ impl<'a> Allocator<'a> {
 /// keeps the original slice index so worker roles still point at
 /// the right `host.hcas[i]`.
 fn filter_hcas<'a>(hcas: &'a [Hca], cfg: &PlanConfig) -> Vec<(usize, &'a Hca)> {
+    if cfg.disable_rdma {
+        return Vec::new();
+    }
     hcas.iter()
         .enumerate()
         .filter(|(_, h)| {
@@ -351,7 +427,7 @@ fn summarize_pools(workers: &[Worker]) -> Vec<NumaPool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::topology::{Cpu, Hca, Host, NumaNode, Nvme};
+    use crate::topology::{Cpu, Hca, Host, Nic, NumaNode, Nvme};
     use std::collections::{BTreeMap, BTreeSet};
 
     /// Builds a `Host` snapshot directly without touching sysfs.
@@ -400,6 +476,7 @@ mod tests {
             numa_nodes,
             hcas,
             nvmes,
+            nics: vec![],
             isolated,
         }
     }
@@ -774,5 +851,117 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn network_shards_placed_nic_local_disjoint() {
+        let mut host = fake_host(vec![(0, (0..8).collect(), vec![])], vec![], vec![], vec![]);
+        host.nics.push(Nic {
+            dev_name: "eth0".to_string(),
+            pci_bdf: Some("0000:01:00.0".to_string()),
+            numa: Some(0),
+            rx_queues: 4,
+            msi_irqs: vec![10, 11],
+            operstate_up: true,
+        });
+        let mut cfg = defaults();
+        cfg.network_shards_per_nic = 2;
+        let plan = Plan::for_host(&host, &cfg);
+        let shards: Vec<&Worker> = plan.network().collect();
+        assert_eq!(shards.len(), 2);
+        for w in &shards {
+            assert_eq!(w.numa, Some(0));
+            assert!(matches!(w.role, Role::NetworkShard { nic } if nic == 0));
+        }
+        let cpus: BTreeSet<u32> = shards.iter().map(|w| w.cpu).collect();
+        assert_eq!(cpus.len(), 2, "network shards must land on disjoint CPUs");
+    }
+
+    #[test]
+    fn disk_cpu_slots_disjoint_from_shard_cpus() {
+        // Two NUMA nodes, two NVMe drives (one per node), two HCAs
+        // (one per node). NVMe slots and RDMA shard CPUs are drawn
+        // from the same per-NUMA allocator, so they must not overlap.
+        let host = fake_host(
+            vec![
+                (0, (0..16).collect(), vec![]),
+                (1, (16..32).collect(), vec![]),
+            ],
+            vec![],
+            vec![
+                hca("mlx5_0", "0000:01:00.0", Some(0), true),
+                hca("mlx5_1", "0000:81:00.0", Some(1), true),
+            ],
+            vec![
+                nvme("nvme0", "0000:02:00.0", Some(0)),
+                nvme("nvme1", "0000:82:00.0", Some(1)),
+            ],
+        );
+        let plan = Plan::for_host(&host, &defaults());
+
+        let disk_cpus: BTreeSet<u32> = plan.disk_cpu_slots().iter().map(|s| s.cpu).collect();
+        let shard_cpus: BTreeSet<u32> = plan.rdma_progress().map(|w| w.cpu).collect();
+
+        // One storage core runs per disk path, so disk_cpu_slots()
+        // reserves exactly one slot per drive regardless of the default
+        // nvme_threads_per_drive (2). Two drives -> two slots, and each
+        // slot's cpu is distinct.
+        assert_eq!(plan.disk_cpu_slots().len(), 2);
+        assert_eq!(disk_cpus.len(), 2, "disk slots must be on distinct cpus");
+        // The plan still schedules nvme_threads_per_drive workers per
+        // drive (4 total here); only the slot count collapses to one
+        // per drive.
+        assert_eq!(plan.nvme().count(), 4);
+        assert!(!disk_cpus.is_empty());
+        assert!(!shard_cpus.is_empty());
+        assert!(
+            disk_cpus.is_disjoint(&shard_cpus),
+            "disk slots {disk_cpus:?} overlap shard cpus {shard_cpus:?}"
+        );
+
+        // Slots are NUMA-local: each drive's slots land on its node.
+        for slot in plan.disk_cpu_slots() {
+            match slot.numa {
+                Some(0) => assert!((0..16).contains(&slot.cpu)),
+                Some(1) => assert!((16..32).contains(&slot.cpu)),
+                other => panic!("unexpected slot numa {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn disk_cpu_slots_one_per_drive_regardless_of_threads() {
+        // Single node, three NVMe drives. Whatever nvme_threads_per_drive
+        // is set to, disk_cpu_slots() reserves exactly one CPU per drive
+        // because the storage model runs one storage core per disk path.
+        let host = fake_host(
+            vec![(0, (0..64).collect(), vec![])],
+            vec![],
+            vec![],
+            vec![
+                nvme("nvme0", "0000:c0:00.0", Some(0)),
+                nvme("nvme1", "0000:c1:00.0", Some(0)),
+                nvme("nvme2", "0000:c2:00.0", Some(0)),
+            ],
+        );
+        for threads in [1usize, 2, 4] {
+            let mut cfg = defaults();
+            cfg.nvme_threads_per_drive = threads;
+            let plan = Plan::for_host(&host, &cfg);
+            // The plan schedules `threads` workers per drive...
+            assert_eq!(plan.nvme().count(), 3 * threads);
+            // ...but exactly one disk slot per drive, on distinct cpus.
+            let slots = plan.disk_cpu_slots();
+            assert_eq!(
+                slots.len(),
+                3,
+                "expected one slot per drive at threads={threads}"
+            );
+            let slot_cpus: BTreeSet<u32> = slots.iter().map(|s| s.cpu).collect();
+            assert_eq!(slot_cpus.len(), 3, "slots must be on distinct cpus");
+            // Each reserved slot matches an actual scheduled NVMe worker.
+            let nvme_cpus: BTreeSet<u32> = plan.nvme().map(|w| w.cpu).collect();
+            assert!(slot_cpus.is_subset(&nvme_cpus));
+        }
     }
 }
