@@ -95,6 +95,11 @@ proptest! {
             report.inflight_entries_at_end, 0,
             "inflight not drained: {} entries", report.inflight_entries_at_end,
         );
+        prop_assert_eq!(
+            report.prefetch_inflight_at_end, 0,
+            "prefetch budget not released: {} pages still reserved",
+            report.prefetch_inflight_at_end,
+        );
     }
 
     /// Invariant: single-flight coalescing per page.
@@ -262,6 +267,7 @@ fn stream_limit_rejects_excess_concurrent_reads() {
         io_fault_rate: 0,
         cache_hit_rate: 0,
         max_concurrent_streams: 1,
+        max_inflight_pages: 4,
         key_count: 1,
         clients: vec![
             ClientSpec {
@@ -269,24 +275,28 @@ fn stream_limit_rejects_excess_concurrent_reads() {
                 offset: 0,
                 len: 128,
                 cancel_after: None,
+                window: None,
             },
             ClientSpec {
                 key_idx: 0,
                 offset: 0,
                 len: 128,
                 cancel_after: None,
+                window: None,
             },
             ClientSpec {
                 key_idx: 0,
                 offset: 0,
                 len: 128,
                 cancel_after: None,
+                window: None,
             },
             ClientSpec {
                 key_idx: 0,
                 offset: 0,
                 len: 128,
                 cancel_after: None,
+                window: None,
             },
         ],
     };
@@ -342,6 +352,7 @@ fn regression_freelist_deadlock_under_faults() {
         io_fault_rate: 3,
         cache_hit_rate: 0,
         max_concurrent_streams: 1024,
+        max_inflight_pages: 4,
         key_count: 2,
         clients: vec![
             ClientSpec {
@@ -349,30 +360,35 @@ fn regression_freelist_deadlock_under_faults() {
                 offset: 640,
                 len: 1,
                 cancel_after: None,
+                window: None,
             },
             ClientSpec {
                 key_idx: 55,
                 offset: 2048,
                 len: 1,
                 cancel_after: None,
+                window: None,
             },
             ClientSpec {
                 key_idx: 14,
                 offset: 256,
                 len: 1,
                 cancel_after: None,
+                window: None,
             },
             ClientSpec {
                 key_idx: 0,
                 offset: 1664,
                 len: 1,
                 cancel_after: None,
+                window: None,
             },
             ClientSpec {
                 key_idx: 103,
                 offset: 640,
                 len: 1,
                 cancel_after: None,
+                window: None,
             },
         ],
     };
@@ -392,6 +408,7 @@ fn smoke() {
         io_fault_rate: 0,
         cache_hit_rate: 0,
         max_concurrent_streams: 1024,
+        max_inflight_pages: 4,
         key_count: 2,
         clients: vec![
             ClientSpec {
@@ -399,24 +416,28 @@ fn smoke() {
                 offset: 0,
                 len: 256,
                 cancel_after: None,
+                window: None,
             },
             ClientSpec {
                 key_idx: 0,
                 offset: 0,
                 len: 512,
                 cancel_after: None,
+                window: Some(3),
             },
             ClientSpec {
                 key_idx: 1,
                 offset: 0,
                 len: 1024,
                 cancel_after: None,
+                window: Some(2),
             },
         ],
     };
     let report: RunReport = run_workload(0xC0FFEE, w).expect("smoke run");
     assert_eq!(report.free_pages_at_end, 4);
     assert_eq!(report.inflight_entries_at_end, 0);
+    assert_eq!(report.prefetch_inflight_at_end, 0);
     for o in &report.outcomes {
         match o {
             ClientOutcome::Ok { got, expected } => assert_eq!(got, expected),
@@ -439,6 +460,7 @@ fn all_cache_hits_skip_bulk_get_and_tee() {
         io_fault_rate: 0,
         cache_hit_rate: 100,
         max_concurrent_streams: 1024,
+        max_inflight_pages: 4,
         key_count: 2,
         clients: vec![
             ClientSpec {
@@ -446,18 +468,21 @@ fn all_cache_hits_skip_bulk_get_and_tee() {
                 offset: 0,
                 len: 1024,
                 cancel_after: None,
+                window: None,
             },
             ClientSpec {
                 key_idx: 1,
                 offset: 64,
                 len: 512,
                 cancel_after: None,
+                window: None,
             },
             ClientSpec {
                 key_idx: 0,
                 offset: 100,
                 len: 200,
                 cancel_after: None,
+                window: None,
             },
         ],
     };
@@ -495,6 +520,7 @@ fn cancellation_drains_to_clean_state() {
         io_fault_rate: 0,
         cache_hit_rate: 0,
         max_concurrent_streams: 1024,
+        max_inflight_pages: 4,
         key_count: 2,
         clients: vec![
             // Full read.
@@ -503,6 +529,7 @@ fn cancellation_drains_to_clean_state() {
                 offset: 0,
                 len: 512,
                 cancel_after: None,
+                window: None,
             },
             // Cancels before first page.
             ClientSpec {
@@ -510,6 +537,7 @@ fn cancellation_drains_to_clean_state() {
                 offset: 0,
                 len: 512,
                 cancel_after: Some(0),
+                window: None,
             },
             // Cancels after the first page.
             ClientSpec {
@@ -517,6 +545,7 @@ fn cancellation_drains_to_clean_state() {
                 offset: 0,
                 len: 512,
                 cancel_after: Some(1),
+                window: None,
             },
             // Cancels after two pages on the same key as the full
             // reader so the slot's `stream_refcount` interleaves
@@ -526,6 +555,7 @@ fn cancellation_drains_to_clean_state() {
                 offset: 0,
                 len: 512,
                 cancel_after: Some(2),
+                window: None,
             },
         ],
     };
@@ -552,4 +582,244 @@ fn cancellation_drains_to_clean_state() {
         }
     }
     assert_eq!(cancelled, 3, "exactly three clients must have cancelled");
+}
+
+/// Scenario test: the windowed reader returns bytes in cursor order
+/// for a multi-page read with a window deeper than one page, and
+/// releases its prefetch budget by quiescence. Two clients share a
+/// stripe so the windowed path also rides the single-flight slot
+/// machinery. Pins the happy-path windowed read independent of the
+/// proptest sweep.
+#[test]
+fn windowed_read_in_order_and_drains() {
+    let w = Workload {
+        page_size: 128,
+        page_count: 6,
+        max_io_delay: 3,
+        io_fault_rate: 0,
+        cache_hit_rate: 0,
+        max_concurrent_streams: 1024,
+        max_inflight_pages: 4,
+        key_count: 1,
+        clients: vec![
+            // Full stripe via a deep window: forces speculative
+            // refill up to the budget cap.
+            ClientSpec {
+                key_idx: 0,
+                offset: 0,
+                len: 768,
+                cancel_after: None,
+                window: Some(5),
+            },
+            // Same stripe, offset start, shallower window: shares
+            // pages via single-flight while prefetching ahead.
+            ClientSpec {
+                key_idx: 0,
+                offset: 256,
+                len: 512,
+                cancel_after: None,
+                window: Some(2),
+            },
+        ],
+    };
+    let report = run_workload(0x5EED, w).expect("scenario run");
+    for o in &report.outcomes {
+        match o {
+            ClientOutcome::Ok { got, expected } => assert_eq!(got, expected),
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+    }
+    assert_eq!(report.free_pages_at_end, 6);
+    assert_eq!(report.inflight_entries_at_end, 0);
+    assert_eq!(report.prefetch_inflight_at_end, 0);
+}
+
+/// Regression: windowed reader cancelled mid-stream under page
+/// pressure used to strand a single-flight subscriber across a
+/// `Loading -> Idle -> Loading` re-lead, because `ParkOnSlot` only
+/// registered its waker on the first poll. The fix re-registers the
+/// waker into the current `Loading` waker list on every poll. This
+/// shrunk seed reproduced the lost wakeup. seed = 12581658376333696978.
+#[test]
+fn regression_windowed_cancel_under_pressure() {
+    let w = Workload {
+        page_size: 1024,
+        page_count: 3,
+        max_io_delay: 3,
+        io_fault_rate: 0,
+        cache_hit_rate: 10,
+        max_concurrent_streams: 1024,
+        max_inflight_pages: 1,
+        key_count: 2,
+        clients: vec![
+            ClientSpec {
+                key_idx: 104,
+                offset: 1024,
+                len: 1025,
+                cancel_after: Some(1),
+                window: Some(2),
+            },
+            ClientSpec {
+                key_idx: 0,
+                offset: 0,
+                len: 1,
+                cancel_after: None,
+                window: None,
+            },
+            ClientSpec {
+                key_idx: 19,
+                offset: 0,
+                len: 1,
+                cancel_after: None,
+                window: None,
+            },
+            ClientSpec {
+                key_idx: 2,
+                offset: 1325,
+                len: 724,
+                cancel_after: None,
+                window: None,
+            },
+            ClientSpec {
+                key_idx: 72,
+                offset: 1544,
+                len: 505,
+                cancel_after: None,
+                window: None,
+            },
+        ],
+    };
+    let report = run_workload(12581658376333696978, w).expect("must not deadlock");
+    let _ = report;
+}
+
+/// Scenario test: windowed readers under free-list pressure must not
+/// deadlock and must drain cleanly. `page_count` is smaller than the
+/// aggregate window demand across clients, so speculative prefetch
+/// competes with every stream's head for the few free pages. The
+/// head-of-line guarantee (head launched and polled first, never
+/// counting against the prefetch budget) is what keeps this from
+/// deadlocking; a regression there surfaces as `RunError::Deadlock`
+/// or budget exhaustion from `run_workload`. Mid-stream cancellation
+/// is mixed in so the windowed `Drop` cleanup path is exercised too.
+#[test]
+fn windowed_under_free_list_pressure_drains() {
+    let w = Workload {
+        page_size: 64,
+        page_count: 2,
+        max_io_delay: 3,
+        io_fault_rate: 0,
+        cache_hit_rate: 0,
+        max_concurrent_streams: 1024,
+        max_inflight_pages: 3,
+        key_count: 2,
+        clients: vec![
+            ClientSpec {
+                key_idx: 0,
+                offset: 0,
+                len: 128,
+                cancel_after: None,
+                window: Some(4),
+            },
+            ClientSpec {
+                key_idx: 1,
+                offset: 0,
+                len: 128,
+                cancel_after: None,
+                window: Some(4),
+            },
+            ClientSpec {
+                key_idx: 0,
+                offset: 0,
+                len: 128,
+                cancel_after: Some(1),
+                window: Some(3),
+            },
+            ClientSpec {
+                key_idx: 1,
+                offset: 64,
+                len: 64,
+                cancel_after: None,
+                window: Some(2),
+            },
+        ],
+    };
+    // Sweep a handful of seeds so several interleavings of the
+    // free-list races are covered by this one deterministic test.
+    for seed in [0u64, 1, 7, 42, 1234, 99999] {
+        let report = run_workload(seed, w.clone()).expect("must not deadlock");
+        for o in &report.outcomes {
+            match o {
+                ClientOutcome::Ok { got, expected } => assert_eq!(got, expected),
+                ClientOutcome::Cancelled { got, expected, .. } => {
+                    assert!(got.len() <= expected.len());
+                    assert_eq!(&got[..], &expected[..got.len()]);
+                }
+                other => panic!("unexpected outcome at seed {seed}: {other:?}"),
+            }
+        }
+        assert_eq!(report.free_pages_at_end, 2, "leak at seed {seed}");
+        assert_eq!(
+            report.inflight_entries_at_end, 0,
+            "inflight leak at seed {seed}"
+        );
+        assert_eq!(
+            report.prefetch_inflight_at_end, 0,
+            "prefetch budget leak at seed {seed}"
+        );
+    }
+}
+
+/// Regression: speculative prefetch must never starve another
+/// stream's in-order head of a backing page. Here four readers (three
+/// windowed) contend for only three backing pages while speculation
+/// runs ahead; without bounding the prefetch budget to leave one page
+/// per active stream, each stream pinned a prefetched-ahead page in
+/// its ready set while every head blocked on `free.alloc`, forming a
+/// circular hold-and-wait. The fix caps the global prefetch budget at
+/// `page_count - stream_count`. seed = 345758264357940050.
+#[test]
+fn regression_windowed_speculation_starves_head() {
+    let w = Workload {
+        page_size: 256,
+        page_count: 3,
+        max_io_delay: 2,
+        io_fault_rate: 0,
+        cache_hit_rate: 0,
+        max_concurrent_streams: 1024,
+        max_inflight_pages: 5,
+        key_count: 2,
+        clients: vec![
+            ClientSpec {
+                key_idx: 71,
+                offset: 1599,
+                len: 1155,
+                cancel_after: None,
+                window: Some(3),
+            },
+            ClientSpec {
+                key_idx: 32,
+                offset: 768,
+                len: 257,
+                cancel_after: None,
+                window: Some(2),
+            },
+            ClientSpec {
+                key_idx: 48,
+                offset: 256,
+                len: 1,
+                cancel_after: None,
+                window: None,
+            },
+            ClientSpec {
+                key_idx: 31,
+                offset: 1849,
+                len: 1110,
+                cancel_after: None,
+                window: Some(2),
+            },
+        ],
+    };
+    let report = run_workload(345758264357940050, w).expect("must not deadlock");
+    let _ = report;
 }

@@ -10,7 +10,9 @@ use std::rc::Rc;
 
 use proptest::collection::vec;
 use proptest::prelude::*;
-use unbounded_storage::bufferpool::{BufferPool, Pool, PoolConfig, StripeKey};
+use unbounded_storage::bufferpool::{
+    BufferPool, Error, PageGuard, Pool, PoolConfig, ReadStream, StripeKey, WindowedRead,
+};
 use unbounded_storage::memory::Backing;
 
 use crate::bufferpool::mocks::{
@@ -47,6 +49,11 @@ pub struct Workload {
     /// the `invariant_stream_limit_bounds` property can verify the
     /// reject path doesn't leak state.
     pub max_concurrent_streams: usize,
+    /// `PoolConfig::max_inflight_pages`: the global speculative
+    /// prefetch budget shared by every `WindowedRead`. Bounds how
+    /// many pages may be fetched strictly ahead of any stream's
+    /// cursor at once. Only the windowed read path consumes it.
+    pub max_inflight_pages: usize,
     /// Distinct stripes the workload may reference. Each client's
     /// `key_idx` indexes into this set modulo its length.
     pub key_count: u8,
@@ -60,13 +67,20 @@ pub struct ClientSpec {
     pub offset: u64,
     /// Length in bytes.
     pub len: u64,
-    /// If `Some(k)`, the client drops its `ReadStream` after
+    /// If `Some(k)`, the client drops its stream after
     /// successfully receiving `k` pages (a value of `0` drops it
-    /// immediately after `Pool::read` returns). Models a consumer
+    /// immediately after the stream is admitted). Models a consumer
     /// that abandons mid-iteration; exercises the drain paths in
     /// `decrement_stream`, `release_guard`, and the leader-error
     /// recycle.
     pub cancel_after: Option<u32>,
+    /// Read path selector. `None` uses the plain one-page-at-a-time
+    /// `BufferPool::read` stream; `Some(w)` uses the prefetching
+    /// `Pool::read_windowed` reader with window depth `w` (clamped
+    /// internally to `[1, max_inflight_pages + 1]`). Both deliver
+    /// `PageGuard`s strictly in cursor order, so every byte/accounting
+    /// invariant must hold identically across the two paths.
+    pub window: Option<usize>,
 }
 
 impl Workload {
@@ -92,6 +106,29 @@ impl Workload {
             *b = (i as u8).wrapping_add(seed);
         }
         out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unified read surface over both stream types.
+// ---------------------------------------------------------------------------
+
+/// Erases the difference between the plain [`ReadStream`] and the
+/// prefetching [`WindowedRead`] so the client driver can consume
+/// either through one `next_page` loop. Both yield `PageGuard`s in
+/// cursor order, one at a time, with identical observable bytes; the
+/// only difference is internal prefetch depth.
+enum AnyStream<'p> {
+    Plain(ReadStream<'p>),
+    Windowed(WindowedRead<'p>),
+}
+
+impl<'p> AnyStream<'p> {
+    async fn next_page(&mut self) -> Option<Result<PageGuard<'_>, Error>> {
+        match self {
+            AnyStream::Plain(s) => s.next_page().await,
+            AnyStream::Windowed(s) => s.next_page().await,
+        }
     }
 }
 
@@ -130,6 +167,12 @@ pub fn workload_strategy() -> impl Strategy<Value = Workload> {
         8 => Just(1024usize),
         2 => 1usize..=4,
     ];
+    // Global prefetch budget for the windowed path. Kept modest so
+    // speculation stays bounded relative to `page_count in 1..=8`,
+    // which keeps free-list contention (and thus schedule coverage
+    // of the head-of-line / no-deadlock paths) meaningful without
+    // blowing the step budget.
+    let max_inflight_pages = 1usize..=8;
     let key_count = 1u8..=3;
     let clients = vec(client_strategy(), 1..=8);
 
@@ -140,6 +183,7 @@ pub fn workload_strategy() -> impl Strategy<Value = Workload> {
         io_fault_rate,
         cache_hit_rate,
         max_concurrent_streams,
+        max_inflight_pages,
         key_count,
         clients,
     )
@@ -151,6 +195,7 @@ pub fn workload_strategy() -> impl Strategy<Value = Workload> {
                 io_fault_rate,
                 cache_hit_rate,
                 max_concurrent_streams,
+                max_inflight_pages,
                 key_count,
                 clients,
             )| Workload {
@@ -160,6 +205,7 @@ pub fn workload_strategy() -> impl Strategy<Value = Workload> {
                 io_fault_rate,
                 cache_hit_rate,
                 max_concurrent_streams,
+                max_inflight_pages,
                 key_count,
                 clients,
             },
@@ -176,12 +222,22 @@ fn client_strategy() -> impl Strategy<Value = ClientSpec> {
         7 => Just(None),
         3 => (0u32..=16).prop_map(Some),
     ];
-    (0u8..=255u8, 0u64..=4096, 1u64..=4096, cancel_after).prop_map(
-        |(key_idx, offset, len, cancel_after)| ClientSpec {
+    // Roughly half the clients use the windowed reader so every
+    // existing invariant exercises both read paths. Window depths
+    // span 1 (degenerate, head-only) through 5 (deeper than most
+    // short reads) to cover the speculative refill and budget-cap
+    // branches in `WindowedRead`.
+    let window = prop_oneof![
+        5 => Just(None),
+        5 => (1usize..=5).prop_map(Some),
+    ];
+    (0u8..=255u8, 0u64..=4096, 1u64..=4096, cancel_after, window).prop_map(
+        |(key_idx, offset, len, cancel_after, window)| ClientSpec {
             key_idx,
             offset,
             len,
             cancel_after,
+            window,
         },
     )
 }
@@ -221,6 +277,10 @@ pub struct RunReport {
     pub outcomes: Vec<ClientOutcome>,
     pub free_pages_at_end: usize,
     pub inflight_entries_at_end: usize,
+    /// Global speculative-prefetch budget still reserved at
+    /// quiescence. Must be `0`: every windowed prefetch reservation
+    /// is balanced on consume or drop.
+    pub prefetch_inflight_at_end: usize,
     pub bulk_get_calls: u32,
     pub bulk_get_by_page: HashMap<(StripeKey, u64), u32>,
     /// Max observed concurrent `bulk_get`s per `(key, page_no)`.
@@ -254,6 +314,7 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
                 offset,
                 len,
                 cancel_after: c.cancel_after,
+                window: c.window,
             }
         })
         .collect();
@@ -289,6 +350,7 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
         Pool::new(
             PoolConfig {
                 max_concurrent_streams: w.max_concurrent_streams,
+                max_inflight_pages: w.max_inflight_pages,
             },
             backing,
             transport,
@@ -313,17 +375,32 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
         let offset = c.offset;
         let len = c.len;
         let cancel_after = c.cancel_after;
+        let window = c.window;
 
         exec.spawn(async move {
             let req = TestReq { key };
-            let stream = match p.read(&req, offset, len).await {
-                Ok(s) => s,
-                Err(e) => {
-                    outcomes
-                        .borrow_mut()
-                        .push(ClientOutcome::ReadErr(format!("{e}")));
-                    return;
-                }
+            // Window `None` => plain `read`; `Some(w)` => prefetching
+            // `read_windowed`. Both admit through the same path and
+            // surface `StreamLimit` identically.
+            let stream = match window {
+                None => match p.read(&req, offset, len).await {
+                    Ok(s) => AnyStream::Plain(s),
+                    Err(e) => {
+                        outcomes
+                            .borrow_mut()
+                            .push(ClientOutcome::ReadErr(format!("{e}")));
+                        return;
+                    }
+                },
+                Some(w) => match p.read_windowed(&req, offset, len, w) {
+                    Ok(s) => AnyStream::Windowed(s),
+                    Err(e) => {
+                        outcomes
+                            .borrow_mut()
+                            .push(ClientOutcome::ReadErr(format!("{e}")));
+                        return;
+                    }
+                },
             };
             let _ = cid;
             // Cancel-before-first-page: drop the stream immediately.
@@ -401,6 +478,7 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
 
     let free_pages_at_end = pool.free_pages();
     let inflight_entries_at_end = pool.inflight_entries();
+    let prefetch_inflight_at_end = pool.prefetch_inflight();
 
     // Drain the outcomes vec; by this point all tasks have completed
     // so no other Rc references exist.
@@ -415,6 +493,7 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
         outcomes,
         free_pages_at_end,
         inflight_entries_at_end,
+        prefetch_inflight_at_end,
         bulk_get_calls: counts.bulk_get.get(),
         bulk_get_by_page,
         bulk_get_max_inflight,
