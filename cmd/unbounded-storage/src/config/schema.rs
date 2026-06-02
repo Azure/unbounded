@@ -16,6 +16,8 @@ pub struct Config {
     pub p2p: P2pCfg,
     pub peers: Vec<PeerSpec>,
     pub disks: Vec<DiskSpec>,
+    pub backends: Vec<BackendSpec>,
+    pub frontends: Vec<FrontendSpec>,
 }
 
 impl Default for Config {
@@ -27,6 +29,8 @@ impl Default for Config {
             p2p: P2pCfg::default(),
             peers: Vec::new(),
             disks: Vec::new(),
+            backends: Vec::new(),
+            frontends: Vec::new(),
         }
     }
 }
@@ -90,6 +94,11 @@ pub struct TopologyCfg {
     pub exclude_node_cpu0: bool,
     pub require_active_port: bool,
     pub tcp_fallback_threads: usize,
+    /// Force the libfabric `tcp` provider even when an HCA is present.
+    /// Drops all discovered HCAs during planning so the daemon takes
+    /// the TCP fallback path. Useful on hosts whose verbs provider is
+    /// unusable despite RDMA hardware being visible in sysfs.
+    pub disable_rdma: bool,
 }
 
 impl Default for TopologyCfg {
@@ -102,6 +111,7 @@ impl Default for TopologyCfg {
             exclude_node_cpu0: true,
             require_active_port: true,
             tcp_fallback_threads: 1,
+            disable_rdma: false,
         }
     }
 }
@@ -164,6 +174,11 @@ pub struct DiskSpec {
     pub path: PathBuf,
     #[serde(default)]
     pub kind: DiskKind,
+    /// Size of the backing file for `kind = "file"` disks. The file is
+    /// created (or grown/shrunk) to exactly this size on open. Ignored
+    /// for `nvme`/`block` kinds, where capacity comes from the device.
+    #[serde(default)]
+    pub size: Option<ByteSize>,
     #[serde(default)]
     pub numa: Option<u16>,
     #[serde(default)]
@@ -190,12 +205,89 @@ pub struct DiskSpec {
 pub enum DiskKind {
     Nvme,
     Block,
+    /// Regular file on a normal filesystem (ext4/tmpfs), sized by [`DiskSpec::size`]. Intended for testing where no dedicated device is available.
+    File,
 }
 
 impl Default for DiskKind {
     fn default() -> Self {
         DiskKind::Nvme
     }
+}
+
+/// An origin tier the daemon fetches stripes from on a P2P cache
+/// miss. Keyed by `id`; the future `backend::http` runtime is
+/// constructed from one of these. Config surface only: no runtime is
+/// wired to it yet.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BackendSpec {
+    /// Unique identifier; referenced by `FrontendSpec.backend`.
+    pub id: String,
+    /// Backend implementation selector.
+    pub kind: BackendKind,
+    /// Origin endpoint URL, e.g. `https://origin.example.com`.
+    pub endpoint: String,
+    /// Stripe granularity for deterministic StripeKey derivation.
+    #[serde(default = "default_stripe_size_bytes")]
+    pub stripe_size_bytes: u64,
+    /// Max concurrent in-flight origin HTTP requests per shard.
+    #[serde(default = "default_http_concurrency")]
+    pub http_concurrency: u32,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendKind {
+    Http,
+}
+
+fn default_stripe_size_bytes() -> u64 {
+    4 * 1024 * 1024
+}
+
+fn default_http_concurrency() -> u32 {
+    64
+}
+
+/// A workload-facing listener the daemon serves cached objects from.
+/// Keyed by `id`; `backend` must reference an existing
+/// [`BackendSpec::id`] (enforced by load-time validation). Config
+/// surface only.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FrontendSpec {
+    pub id: String,
+    /// Frontend protocol selector.
+    pub kind: FrontendKind,
+    /// Listen address, e.g. `0.0.0.0:9000`.
+    pub bind: String,
+    /// Id of the [`BackendSpec`] this frontend serves from.
+    pub backend: String,
+    #[serde(default)]
+    pub tls: Option<TlsCfg>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FrontendKind {
+    Http,
+}
+
+/// Minimal TLS material for a frontend listener. Paths point at PEM
+/// files on disk; `secret_ref` is an out-of-band reference (e.g.
+/// `k8s://namespace/name`) that, when set, supersedes the paths. At
+/// least one source is expected at runtime, but that is the runtime's
+/// concern; the schema only models the shape.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TlsCfg {
+    #[serde(default)]
+    pub cert_path: Option<PathBuf>,
+    #[serde(default)]
+    pub key_path: Option<PathBuf>,
+    #[serde(default)]
+    pub secret_ref: Option<String>,
 }
 
 /// A byte count accepted as either an integer (bytes) or a string with
@@ -294,6 +386,8 @@ mod tests {
         assert!(c.p2p.local_labels.is_empty());
         assert!(c.peers.is_empty());
         assert!(c.disks.is_empty());
+        assert!(c.backends.is_empty());
+        assert!(c.frontends.is_empty());
     }
 
     #[test]
@@ -478,5 +572,132 @@ labels = ["us-west", "az1", "row3", "rack7"]
                 "rack7".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn backend_and_frontend_round_trip() {
+        let s = r#"
+[[backends]]
+id = "primary-http"
+kind = "http"
+endpoint = "https://origin.example.com"
+stripe_size_bytes = 8388608
+http_concurrency = 32
+
+[[frontends]]
+id = "workload-http"
+kind = "http"
+bind = "0.0.0.0:9000"
+backend = "primary-http"
+
+[frontends.tls]
+cert_path = "/etc/tls/cert.pem"
+key_path = "/etc/tls/key.pem"
+"#;
+        let c: Config = toml::from_str(s).unwrap();
+        assert_eq!(c.backends.len(), 1);
+        let b = &c.backends[0];
+        assert_eq!(b.id, "primary-http");
+        assert_eq!(b.kind, BackendKind::Http);
+        assert_eq!(b.endpoint, "https://origin.example.com");
+        assert_eq!(b.stripe_size_bytes, 8 * 1024 * 1024);
+        assert_eq!(b.http_concurrency, 32);
+
+        assert_eq!(c.frontends.len(), 1);
+        let f = &c.frontends[0];
+        assert_eq!(f.id, "workload-http");
+        assert_eq!(f.kind, FrontendKind::Http);
+        assert_eq!(f.bind, "0.0.0.0:9000");
+        assert_eq!(f.backend, "primary-http");
+        let tls = f.tls.as_ref().expect("tls present");
+        assert_eq!(tls.cert_path, Some(PathBuf::from("/etc/tls/cert.pem")));
+        assert_eq!(tls.key_path, Some(PathBuf::from("/etc/tls/key.pem")));
+        assert!(tls.secret_ref.is_none());
+    }
+
+    #[test]
+    fn backend_optional_fields_default() {
+        let s = r#"
+[[backends]]
+id = "b"
+kind = "http"
+endpoint = "https://example.com"
+"#;
+        let c: Config = toml::from_str(s).unwrap();
+        let b = &c.backends[0];
+        assert_eq!(b.stripe_size_bytes, 4 * 1024 * 1024);
+        assert_eq!(b.http_concurrency, 64);
+    }
+
+    #[test]
+    fn frontend_tls_defaults_to_none() {
+        let s = r#"
+[[frontends]]
+id = "f"
+kind = "http"
+bind = "0.0.0.0:9000"
+backend = "b"
+"#;
+        let c: Config = toml::from_str(s).unwrap();
+        assert!(c.frontends[0].tls.is_none());
+    }
+
+    #[test]
+    fn unknown_fields_rejected_in_backend() {
+        let s = r#"
+[[backends]]
+id = "b"
+kind = "http"
+endpoint = "https://example.com"
+extra = "nope"
+"#;
+        assert!(toml::from_str::<Config>(s).is_err());
+    }
+
+    #[test]
+    fn unknown_fields_rejected_in_frontend() {
+        let s = r#"
+[[frontends]]
+id = "f"
+kind = "http"
+bind = "0.0.0.0:9000"
+backend = "b"
+extra = "nope"
+"#;
+        assert!(toml::from_str::<Config>(s).is_err());
+    }
+
+    #[test]
+    fn unknown_fields_rejected_in_tls() {
+        let s = r#"
+[[frontends]]
+id = "f"
+kind = "http"
+bind = "0.0.0.0:9000"
+backend = "b"
+
+[frontends.tls]
+bogus = "nope"
+"#;
+        assert!(toml::from_str::<Config>(s).is_err());
+    }
+
+    #[test]
+    fn backend_and_frontend_kind_case_sensitive() {
+        let ok = r#"
+[[backends]]
+id = "b"
+kind = "http"
+endpoint = "https://example.com"
+"#;
+        assert!(toml::from_str::<Config>(ok).is_ok());
+
+        let bad = r#"
+[[backends]]
+id = "b"
+kind = "Http"
+endpoint = "https://example.com"
+"#;
+        assert!(toml::from_str::<Config>(bad).is_err());
     }
 }

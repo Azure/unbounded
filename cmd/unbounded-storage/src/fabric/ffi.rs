@@ -23,16 +23,45 @@ pub type ssize_t = isize;
 
 pub const FI_ADDR_UNSPEC: fi_addr_t = !0u64;
 
+/// libfabric's `FI_EAGAIN`, returned negated by data-path calls
+/// (`fi_tsend`, `fi_write`, ...) when the provider's outbound queue is
+/// momentarily full or a connection-oriented provider (e.g. the `tcp`
+/// RDM provider) has not yet finished its lazy connection handshake. It
+/// is transient: the caller must retry after letting the CQ progress.
+pub const FI_EAGAIN: i32 = 11;
+
+/// System `ENOTCONN` as surfaced through a CQ error entry's
+/// `prov_errno`. A connection-oriented provider (e.g. the `tcp` RDM
+/// provider) reports this on a data-path operation (e.g. an `fi_write`
+/// issued in the reverse direction of an just-received message) while
+/// the lazy reverse connection is still being established. Like
+/// `FI_EAGAIN` it is transient and the operation should be retried.
+pub const ENOTCONN: i32 = 107;
+
 pub const FI_VERSION: u32 = (1u32 << 16) | 20;
+
+/// Version to request from `fi_getinfo`: the interface version this
+/// crate is written against (`FI_VERSION`), capped to the version of
+/// the libfabric actually linked at runtime. libfabric returns
+/// `-FI_ENOSYS` when asked for a version newer than itself, so an
+/// older installed library (e.g. 1.17) would otherwise fail outright.
+pub fn requested_version() -> u32 {
+    let runtime = unsafe { fi_version() };
+    if runtime < FI_VERSION {
+        runtime
+    } else {
+        FI_VERSION
+    }
+}
 
 pub const FI_MSG: u64 = 1 << 1;
 pub const FI_RMA: u64 = 1 << 2;
 pub const FI_TAGGED: u64 = 1 << 3;
 pub const FI_READ: u64 = 1 << 8;
 pub const FI_WRITE: u64 = 1 << 9;
-pub const FI_REMOTE_READ: u64 = 1 << 10;
-pub const FI_REMOTE_WRITE: u64 = 1 << 11;
-pub const FI_SOURCE: u64 = 1 << 18;
+pub const FI_REMOTE_READ: u64 = 1 << 12;
+pub const FI_REMOTE_WRITE: u64 = 1 << 13;
+pub const FI_SOURCE: u64 = 1 << 57;
 
 // fi_ep_type enum discriminants (rdma/fabric.h::enum fi_ep_type).
 pub const FI_EP_UNSPEC: u32 = 0;
@@ -67,9 +96,10 @@ pub const FI_MR_VIRT_ADDR: i32 = 1 << 4;
 pub const FI_MR_ALLOCATED: i32 = 1 << 5;
 pub const FI_MR_PROV_KEY: i32 = 1 << 6;
 
-// fi_ep_bind flag bits we need.
-pub const FI_TRANSMIT: u64 = 1 << 24;
-pub const FI_RECV: u64 = 1 << 25;
+// fi_ep_bind flag bits we need. FI_TRANSMIT is an alias for FI_SEND
+// and FI_RECV mirrors the capability bits in rdma/fabric.h.
+pub const FI_TRANSMIT: u64 = 1 << 11;
+pub const FI_RECV: u64 = 1 << 10;
 pub const FI_SELECTIVE_COMPLETION: u64 = 1 << 59;
 
 #[repr(C)]
@@ -200,6 +230,7 @@ pub struct fi_cq_err_entry {
     pub prov_errno: c_int,
     pub err_data: *mut c_void,
     pub err_data_size: usize,
+    pub src_addr: fi_addr_t,
 }
 
 #[repr(C)]
@@ -221,6 +252,12 @@ unsafe extern "C" {
     ) -> c_int;
 
     pub fn fi_freeinfo(info: *mut fi_info);
+
+    /// Runtime version of the linked libfabric, packed as
+    /// `(major << 16) | minor`. Used to cap the version we request
+    /// from `fi_getinfo`: asking for a newer version than the
+    /// installed library returns `-FI_ENOSYS`.
+    pub fn fi_version() -> u32;
 
     pub fn fi_fabric(
         attr: *mut fi_fabric_attr,
@@ -268,6 +305,7 @@ unsafe extern "C" {
 
     pub fn ub_fi_build_hints(prov_name: *const c_char) -> *mut fi_info;
     pub fn ub_fi_info_fabric_attr(info: *mut fi_info) -> *mut fi_fabric_attr;
+    pub fn ub_fi_info_mr_mode(info: *mut fi_info) -> c_int;
 
     pub fn ub_fi_eagain() -> c_int;
     pub fn ub_fi_eavail() -> c_int;
@@ -424,6 +462,7 @@ mod tests {
     const CQ_ERR_ENTRY_PROV_ERRNO: c_int = 23;
     const CQ_ERR_ENTRY_ERR_DATA: c_int = 24;
     const CQ_ERR_ENTRY_ERR_DATA_SIZE: c_int = 25;
+    const CQ_ERR_ENTRY_SRC_ADDR: c_int = 26;
     const RMA_IOV_ADDR: c_int = 27;
     const RMA_IOV_LEN: c_int = 28;
     const RMA_IOV_KEY: c_int = 29;
@@ -602,6 +641,11 @@ mod tests {
             FI_CQ_ERR_ENTRY,
             CQ_ERR_ENTRY_ERR_DATA_SIZE,
             offset_of!(fi_cq_err_entry, err_data_size),
+        );
+        assert_offset(
+            FI_CQ_ERR_ENTRY,
+            CQ_ERR_ENTRY_SRC_ADDR,
+            offset_of!(fi_cq_err_entry, src_addr),
         );
         assert_size(FI_RMA_IOV, size_of::<fi_rma_iov>());
         assert_offset(FI_RMA_IOV, RMA_IOV_ADDR, offset_of!(fi_rma_iov, addr));

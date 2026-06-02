@@ -13,7 +13,7 @@
 
 use std::ptr;
 
-use crate::bufferpool::Backing;
+use crate::memory::Backing;
 
 use super::error::{FabricError, Result, check};
 use super::fabric::Fabric;
@@ -26,6 +26,13 @@ pub struct MrHandle {
     pub mr: *mut ffi::fid_mr,
     pub remote_key: u64,
     pub base: usize,
+    /// Remote RMA base address a peer must target to write into this
+    /// region's first byte. Equals `base` when the provider uses
+    /// `FI_MR_VIRT_ADDR`, or `0` when it addresses by MR offset (the
+    /// tcp RDM provider). Remote peers add the intra-region byte offset to
+    /// this value; the local virtual `base` is used only for local
+    /// (source) addressing.
+    pub remote_base: u64,
     pub len: usize,
 }
 
@@ -58,6 +65,14 @@ impl Fabric {
 
         let mut mr_p: *mut ffi::fid_mr = ptr::null_mut();
         let access = ffi::FI_REMOTE_READ | ffi::FI_REMOTE_WRITE | ffi::FI_READ | ffi::FI_WRITE;
+        // Hand out a distinct requested_key per registration. Providers
+        // without FI_MR_PROV_KEY (e.g. the tcp RDM provider) reject a reused key
+        // with FI_ENOKEY; providers that assign their own keys ignore
+        // this value.
+        let requested_key = self
+            .inner()
+            .next_mr_key
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // SAFETY: domain is live; `base` and `len` describe the
         // caller's mapping which outlives the fabric per the
         // documented lifetime model.
@@ -68,7 +83,7 @@ impl Fabric {
                 len,
                 access,
                 0,
-                0,
+                requested_key,
                 0,
                 &mut mr_p,
                 ptr::null_mut(),
@@ -85,6 +100,11 @@ impl Fabric {
             mr: mr_p,
             remote_key,
             base: base as usize,
+            remote_base: if self.mr_uses_virtual_addr() {
+                base as u64
+            } else {
+                0
+            },
             len,
         })
     }

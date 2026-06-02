@@ -12,8 +12,8 @@
 
 #![allow(async_fn_in_trait)]
 
+mod core_local;
 mod mock;
-mod proxy;
 mod scratch;
 #[cfg(test)]
 mod tests;
@@ -21,12 +21,12 @@ mod tests;
 #[cfg(target_os = "linux")]
 mod uring;
 
+pub use core_local::CoreLocalDevice;
 pub use mock::{MockDevice, MockDeviceConfig, MockFaultMode};
-pub use proxy::{BlockDeviceProxy, ProxyMetadata, ProxyReceiver, ProxyService, run_proxy_service};
 pub use scratch::{AcquireFut, ScratchPage, ScratchPool};
 
 #[cfg(target_os = "linux")]
-pub use uring::{UringBlockDevice, UringConfig};
+pub use uring::{OpenDisk, OpenError, UringBlockDevice, UringConfig, UringDevice, provision_file};
 
 use crate::storage::types::{Error, Lba};
 

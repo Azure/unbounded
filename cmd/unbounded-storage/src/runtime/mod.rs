@@ -6,8 +6,18 @@ use std::sync::Arc;
 #[cfg(target_os = "linux")]
 mod pinned;
 
+mod shard;
+
+#[cfg(target_os = "linux")]
+mod context;
+
 #[cfg(target_os = "linux")]
 pub use pinned::{PinnedRuntime, WorkerSpec};
+
+#[cfg(target_os = "linux")]
+pub use context::ShardContext;
+
+pub use shard::ShardLoop;
 
 /// Universal identifier for a worker slot. The bufferpool runs one
 /// `Pool` per worker, the fabric layer constructs one `Fabric` per worker, and
@@ -25,7 +35,7 @@ pub enum NumaHint {
     Numa(u16),
 }
 
-/// Handle to an auxiliary thread spawned via [`Threading::spawn_aux`].
+/// Handle to a thread spawned via [`Threading::spawn_pinned`].
 /// A type alias because no runtime impl needs to hide the underlying
 /// thread; callers just want to join.
 pub type JoinHandle = std::thread::JoinHandle<()>;
@@ -39,13 +49,11 @@ pub trait Threading: Send + Sync + 'static {
     /// NUMA node hosting `idx`, if the runtime is NUMA-aware.
     fn numa_of(&self, idx: WorkerIdx) -> Option<u16>;
 
-    /// Pin the *current* thread to worker `idx` and run `f` to
-    /// completion. Blocks until `f` returns.
-    fn run_worker(&self, idx: WorkerIdx, f: Box<dyn FnOnce() + Send + 'static>);
-
-    /// Spawn an auxiliary OS thread pinned to the same NUMA node as
-    /// worker `idx`.
-    fn spawn_aux(
+    /// Spawn a new named OS thread for worker `idx`. Inside the new
+    /// thread the runtime pins to the worker's CPU and applies its
+    /// NUMA mempolicy *first*, then runs `f` to completion. The
+    /// returned [`JoinHandle`] joins that thread.
+    fn spawn_pinned(
         &self,
         idx: WorkerIdx,
         name: &str,
@@ -76,12 +84,7 @@ impl Threading for DefaultRuntime {
         None
     }
 
-    fn run_worker(&self, idx: WorkerIdx, f: Box<dyn FnOnce() + Send + 'static>) {
-        debug_assert!((idx.0 as usize) < self.workers);
-        f();
-    }
-
-    fn spawn_aux(
+    fn spawn_pinned(
         &self,
         idx: WorkerIdx,
         name: &str,
@@ -91,7 +94,7 @@ impl Threading for DefaultRuntime {
         std::thread::Builder::new()
             .name(name.to_string())
             .spawn(f)
-            .expect("DefaultRuntime::spawn_aux: thread spawn failed")
+            .expect("DefaultRuntime::spawn_pinned: thread spawn failed")
     }
 }
 
@@ -108,16 +111,21 @@ mod tests {
 
         let observed = Arc::new(Mutex::new(0u32));
         let o = observed.clone();
-        rt.run_worker(WorkerIdx(0), Box::new(move || *o.lock().unwrap() = 1));
+        let h = rt.spawn_pinned(
+            WorkerIdx(0),
+            "default-pinned-0",
+            Box::new(move || *o.lock().unwrap() = 1),
+        );
+        h.join().expect("pinned thread");
         assert_eq!(*observed.lock().unwrap(), 1);
 
         let o = observed.clone();
-        let h = rt.spawn_aux(
+        let h = rt.spawn_pinned(
             WorkerIdx(1),
-            "default-aux",
+            "default-pinned-1",
             Box::new(move || *o.lock().unwrap() = 2),
         );
-        h.join().expect("aux thread");
+        h.join().expect("pinned thread");
         assert_eq!(*observed.lock().unwrap(), 2);
     }
 }

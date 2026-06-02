@@ -101,17 +101,30 @@ impl Fabric {
         let send_ctx = send_slot.into_raw();
 
         let started = Instant::now();
-        // SAFETY: ep / buffer / context all live for the call.
-        let rc = unsafe {
-            ffi::ub_fi_tsend(
-                inner.ep(),
-                send_buf_ptr as *const std::ffi::c_void,
-                PAYLOAD_LEN,
-                ptr::null_mut(),
-                fi_addr,
-                PING_TAG,
-                send_ctx,
-            )
+        // The first `fi_tsend` to a peer can return `-FI_EAGAIN` while
+        // the provider's connection is still being established (the
+        // `tcp` RDM provider connects lazily on first send). On
+        // `-FI_EAGAIN` libfabric neither consumes the buffer nor the
+        // context, so we retry the same call while the progress threads
+        // drive the connection forward. Bounded by the caller timeout.
+        let send_deadline = Instant::now() + timeout;
+        let rc = loop {
+            // SAFETY: ep / buffer / context all live for the call.
+            let rc = unsafe {
+                ffi::ub_fi_tsend(
+                    inner.ep(),
+                    send_buf_ptr as *const std::ffi::c_void,
+                    PAYLOAD_LEN,
+                    ptr::null_mut(),
+                    fi_addr,
+                    PING_TAG,
+                    send_ctx,
+                )
+            };
+            if rc as i32 != -ffi::FI_EAGAIN || Instant::now() >= send_deadline {
+                break rc;
+            }
+            std::thread::sleep(Duration::from_millis(1));
         };
         if rc < 0 {
             // SAFETY: reclaim and drop the slot we just minted.

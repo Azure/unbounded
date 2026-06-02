@@ -12,10 +12,12 @@ pub mod watch;
 pub use apply::{backing_kind_from_cfg, peer_spec_to_connection, topology_cfg_to_plan_config};
 pub use load::ConfigError;
 pub use reconcile::{
-    ApplyReport, PeerReconcileTarget, ReconcileReport, apply_peers_startup, reconcile_peers,
+    ApplyReport, BackendReconcileReport, BackendReconcileTarget, FrontendReconcileReport,
+    FrontendReconcileTarget, PeerReconcileTarget, ReconcileReport, SpecReconcileReport,
+    apply_peers_startup, reconcile_backends, reconcile_frontends, reconcile_peers,
 };
 pub use schema::{
-    BackingKindCfg, Config, DiskKind, DiskSpec, FabricCfg, PeerSpec, PeerTransport, StorageCfg,
-    TopologyCfg,
+    BackendKind, BackendSpec, BackingKindCfg, Config, DiskKind, DiskSpec, FabricCfg, FrontendKind,
+    FrontendSpec, PeerSpec, PeerTransport, StorageCfg, TlsCfg, TopologyCfg,
 };
 pub use watch::{ConfigUpdate, ConfigWatcher, WatchError};

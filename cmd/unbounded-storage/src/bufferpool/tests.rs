@@ -14,9 +14,10 @@ use std::rc::Rc;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use crate::bufferpool::{
-    Backing, BlockStore, BufferPool, BulkRef, Error, PageRef, PageStream, Pool, PoolConfig, Req,
-    StripeKey, Transport,
+    BlockStore, BufferPool, BulkRef, Error, PageRef, PageStream, Pool, PoolConfig, Req, StripeKey,
+    Transport,
 };
+use crate::memory::Backing;
 
 // ---------------------------------------------------------------------------
 // Tiny single-thread executor.

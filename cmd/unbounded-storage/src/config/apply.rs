@@ -5,9 +5,9 @@
 //! types. Kept separate so the schema crate never has to depend on the
 //! daemon's runtime types and vice versa.
 
-use crate::backing::BackingKind;
 use crate::fabric::ConnectionSpec;
 use crate::fabric::PeerId;
+use crate::memory::BackingKind;
 use crate::topology;
 
 use super::schema::{BackingKindCfg, PeerSpec, TopologyCfg};
@@ -28,17 +28,21 @@ pub fn topology_cfg_to_plan_config(t: &TopologyCfg) -> topology::PlanConfig {
         rdma_handlers_per_hca: t.rdma_handlers_per_hca,
         // The production daemon no longer schedules NVMe progress
         // threads via the topology plan: per-disk supervision lives
-        // in `disk_supervisor::DiskRegistry`. The plan still emits
+        // in `storage::disks::DiskRegistry`. The plan still emits
         // NVMe workers because the bench binary consumes them, so
         // we keep the default `nvme_threads_per_drive` here and do
         // not expose it as a knob in the daemon config.
         nvme_threads_per_drive: defaults.nvme_threads_per_drive,
+        // Network shards are not exposed as a daemon config knob yet;
+        // keep the default (0) so the production plan is unchanged.
+        network_shards_per_nic: defaults.network_shards_per_nic,
         use_smt_siblings: t.use_smt_siblings,
         respect_isolated: t.respect_isolated,
         exclude_node_cpu0: t.exclude_node_cpu0,
         require_node_type_ca: defaults.require_node_type_ca,
         require_active_port: t.require_active_port,
         tcp_fallback_threads: t.tcp_fallback_threads,
+        disable_rdma: t.disable_rdma,
     }
 }
 

@@ -127,7 +127,67 @@ where
         R: 'a;
 
     fn bulk_get<'a>(&'a self, req: &'a R, src: BulkRef, dsts: &'a [PageRef]) -> Self::Stream<'a> {
-        FabricBulkStream::new_unstarted(self, req, src, dsts)
+        self.bulk_get_with_ttl(req, src, dsts, crate::fabric::MAX_HOPS)
+    }
+}
+
+impl<R, P> FabricTransport<R, P>
+where
+    R: Req + Serialize + DeserializeOwned + 'static,
+    P: PeerRouter<R>,
+{
+    /// Build a `bulk_get` stream that seeds the request header's TTL
+    /// (hop budget) with `ttl`. The plain [`Transport::bulk_get`]
+    /// entry point delegates here with [`crate::fabric::MAX_HOPS`];
+    /// the recursive-forwarding handler uses this to forward with a
+    /// decremented `hops_remaining`.
+    pub(crate) fn bulk_get_with_ttl<'a>(
+        &'a self,
+        req: &'a R,
+        src: BulkRef,
+        dsts: &'a [PageRef],
+        ttl: u32,
+    ) -> FabricBulkStream<'a, R> {
+        FabricBulkStream::new_unstarted(self, req, src, dsts, ttl, self.mr)
+    }
+
+    /// Forward `req` to the next hop, landing the downstream page(s)
+    /// at byte offset `dest_offset` within this transport's MR rather
+    /// than at offset 0.
+    ///
+    /// The wire protocol addresses each destination page as
+    /// `dest_mr_base + ordinal * page_size`, so a recursive relay that
+    /// reserved scratch slot `idx` must shift `dest_mr_base` by
+    /// `idx * page_size`. Otherwise the downstream hop would RDMA-write
+    /// into scratch slot 0 while the relay reads back slot `idx`,
+    /// relaying stale bytes upstream (and colliding across concurrent
+    /// forwards). The base is shifted by overriding the destination MR
+    /// handle; `remote_key` and the underlying `fid_mr` are unchanged
+    /// because the whole scratch backing is one registered region.
+    pub(crate) fn bulk_get_forward<'a>(
+        &'a self,
+        req: &'a R,
+        src: BulkRef,
+        dsts: &'a [PageRef],
+        ttl: u32,
+        dest_offset: usize,
+    ) -> FabricBulkStream<'a, R> {
+        let dest_mr = forward_dest_mr(self.mr, dest_offset);
+        FabricBulkStream::new_unstarted(self, req, src, dsts, ttl, dest_mr)
+    }
+}
+
+/// Shift a destination MR handle forward by `dest_offset` bytes so a
+/// recursive relay can land downstream pages at a non-zero scratch
+/// slot. `remote_key` and the underlying `fid_mr` are preserved because
+/// the whole scratch backing is registered as a single region.
+fn forward_dest_mr(mr: MrHandle, dest_offset: usize) -> MrHandle {
+    MrHandle {
+        mr: mr.mr,
+        remote_key: mr.remote_key,
+        base: mr.base.saturating_add(dest_offset),
+        remote_base: mr.remote_base.saturating_add(dest_offset as u64),
+        len: mr.len.saturating_sub(dest_offset),
     }
 }
 
@@ -187,6 +247,7 @@ enum StreamState<'a> {
         src: BulkRef,
         req_bytes: Vec<u8>,
         dsts: &'a [PageRef],
+        ttl: u32,
     },
     /// Active state: recvs posted, awaiting acks.
     Active {
@@ -219,6 +280,8 @@ where
         req: &'a R,
         src: BulkRef,
         dsts: &'a [PageRef],
+        ttl: u32,
+        mr: MrHandle,
     ) -> Self
     where
         P: PeerRouter<R>,
@@ -235,12 +298,13 @@ where
         Self {
             state: StreamState::Pending {
                 fabric: transport.fabric.clone(),
-                mr: transport.mr,
+                mr,
                 peer,
                 request_id,
                 src,
                 req_bytes,
                 dsts,
+                ttl,
             },
             _marker: PhantomData,
         }
@@ -272,7 +336,7 @@ impl<'a, R> PageStream for FabricBulkStream<'a, R> {
                 StreamState::Pending { .. } => {
                     // Transition Pending -> Active.
                     let prev = std::mem::replace(&mut this.state, StreamState::Done);
-                    let (fabric, mr, peer, request_id, src, req_bytes, dsts) = match prev {
+                    let (fabric, mr, peer, request_id, src, req_bytes, dsts, ttl) = match prev {
                         StreamState::Pending {
                             fabric,
                             mr,
@@ -281,10 +345,11 @@ impl<'a, R> PageStream for FabricBulkStream<'a, R> {
                             src,
                             req_bytes,
                             dsts,
-                        } => (fabric, mr, peer, request_id, src, req_bytes, dsts),
+                            ttl,
+                        } => (fabric, mr, peer, request_id, src, req_bytes, dsts, ttl),
                         _ => unreachable!(),
                     };
-                    match launch(&fabric, &mr, peer, request_id, src, &req_bytes, dsts) {
+                    match launch(&fabric, &mr, peer, request_id, src, &req_bytes, dsts, ttl) {
                         Ok((shared, ep, recv_ctxs)) => {
                             this.state = StreamState::Active {
                                 shared,
@@ -453,6 +518,7 @@ fn launch(
     src: BulkRef,
     req_bytes: &[u8],
     dsts: &[PageRef],
+    ttl: u32,
 ) -> FabResult<(
     Arc<StreamShared>,
     *mut ffi::fid_ep,
@@ -475,26 +541,22 @@ fn launch(
     let page_ack_tag = PAGE_ACK_TAG_BASE | (request_id as u64);
     for _ in 0..dsts.len() {
         let (slot, _fut) = fabric.completions().allocate()?;
-        let buf: Box<[u8; 64]> = Box::new([0u8; 64]);
+        let buf: Box<[u8; 512]> = Box::new([0u8; 512]);
         let buf_ptr = Box::into_raw(buf);
         let ctx_addr = (&*slot as *const CompletionSlot) as usize;
         let shared_for_handler = shared.clone();
         let buf_addr = buf_ptr as usize;
         slot.set_handler(move |result| {
             // SAFETY: buf_addr was just produced by Box::into_raw.
-            let recv_buf: Box<[u8; 64]> = unsafe { Box::from_raw(buf_addr as *mut [u8; 64]) };
+            let recv_buf: Box<[u8; 512]> = unsafe { Box::from_raw(buf_addr as *mut [u8; 512]) };
             shared_for_handler.push(recv_completion(result, ctx_addr, &recv_buf));
         });
         let ctx = slot.into_raw();
-        // SAFETY: ep, buffer, ctx all live for the call. The recv
-        // matches any low-32-bit value but we asked for the exact
-        // tag - libfabric will still match against fi_addr only when
-        // src_addr != FI_ADDR_UNSPEC. Here we accept from anyone.
         let rc = unsafe {
             ffi::ub_fi_trecv(
                 ep,
                 buf_ptr as *mut std::ffi::c_void,
-                64,
+                512,
                 ptr::null_mut(),
                 ffi::FI_ADDR_UNSPEC,
                 page_ack_tag,
@@ -587,7 +649,7 @@ fn launch(
 
     // Build and send the request: header followed by the
     // bincode-serialized req body.
-    let header = RequestHeader::new(request_id, mr, dsts.len() as u32, src);
+    let header = RequestHeader::new(request_id, mr, dsts.len() as u32, src, ttl);
     let mut buf: Vec<u8> = bincode::serialize(&header).map_err(|e| {
         FabricError::Encode(Arc::new(std::io::Error::new(
             std::io::ErrorKind::Other,
@@ -611,16 +673,37 @@ fn launch(
     });
     let send_ctx = send_slot.into_raw();
     let send_tag = REQUEST_TAG_BASE | (request_id as u64);
-    let rc = unsafe {
-        ffi::ub_fi_tsend(
-            ep,
-            send_buf_ptr as *const std::ffi::c_void,
-            send_len,
-            ptr::null_mut(),
-            fi_addr,
-            send_tag,
-            send_ctx,
-        )
+    // The first `fi_tsend` to a peer can return `-FI_EAGAIN` while a
+    // connection-oriented provider (the `tcp` RDM provider) lazily
+    // establishes the underlying connection, or whenever the transmit
+    // queue is briefly full. EAGAIN does not consume the buffer or
+    // context, so we retry the same operation while the progress
+    // thread advances the CQ, up to a bounded deadline.
+    let rc = {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            // SAFETY: ep, buffer, and ctx all remain live for the call;
+            // on `-FI_EAGAIN` libfabric neither consumes the buffer nor
+            // generates a completion, so reusing them on retry is sound.
+            let rc = unsafe {
+                ffi::ub_fi_tsend(
+                    ep,
+                    send_buf_ptr as *const std::ffi::c_void,
+                    send_len,
+                    ptr::null_mut(),
+                    fi_addr,
+                    send_tag,
+                    send_ctx,
+                )
+            };
+            if rc as i32 != -ffi::FI_EAGAIN {
+                break rc;
+            }
+            if std::time::Instant::now() >= deadline {
+                break rc;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     };
     if rc < 0 {
         // SAFETY: just produced.
@@ -1186,5 +1269,49 @@ mod tests {
         assert!(!remove_recv_context(&mut ctxs, missing as usize));
 
         assert_eq!(ctxs, vec![a, b]);
+    }
+
+    #[test]
+    fn forward_dest_mr_shifts_base_by_offset() {
+        let mr = MrHandle {
+            mr: std::ptr::null_mut(),
+            remote_key: 0xABCD,
+            base: 0x1000,
+            remote_base: 0x1000,
+            len: 0x8000,
+        };
+        let page_size = 0x1000usize;
+
+        // Slot 0 leaves the handle untouched.
+        let zero = forward_dest_mr(mr, 0);
+        assert_eq!(zero.base, 0x1000);
+        assert_eq!(zero.len, 0x8000);
+        assert_eq!(zero.remote_key, 0xABCD);
+        assert_eq!(zero.remote_base, 0x1000);
+
+        // Slot 7 shifts base by 7 pages and shrinks len to match,
+        // while preserving remote_key and the underlying fid_mr.
+        let dest_offset = 7 * page_size;
+        let shifted = forward_dest_mr(mr, dest_offset);
+        assert_eq!(shifted.base, 0x1000 + dest_offset);
+        assert_eq!(shifted.remote_base, 0x1000 + dest_offset as u64);
+        assert_eq!(shifted.len, 0x8000 - dest_offset);
+        assert_eq!(shifted.remote_key, 0xABCD);
+        assert_eq!(shifted.mr, mr.mr);
+    }
+
+    #[test]
+    fn forward_dest_mr_saturates_oversized_offset() {
+        let mr = MrHandle {
+            mr: std::ptr::null_mut(),
+            remote_key: 1,
+            base: 0,
+            remote_base: 0,
+            len: 0x1000,
+        };
+        // An offset beyond the region clamps len to zero rather than
+        // wrapping; launch's bounds checks then reject the request.
+        let shifted = forward_dest_mr(mr, 0x4000);
+        assert_eq!(shifted.len, 0);
     }
 }

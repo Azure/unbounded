@@ -337,10 +337,7 @@ fn free_range_overflow_rejects() {
 #[test]
 fn free_range_past_capacity_rejects() {
     let a = Allocator::new(16);
-    assert!(matches!(
-        a.free_range(Lba(15), 2),
-        Err(Error::OutOfRange)
-    ));
+    assert!(matches!(a.free_range(Lba(15), 2), Err(Error::OutOfRange)));
     // No state mutation on rejection.
     assert_eq!(a.used_pages(), 0);
 }

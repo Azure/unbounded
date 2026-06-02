@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 
 use proptest::prelude::*;
-use unbounded_storage::backing::HUGEPAGE_2MB;
+use unbounded_storage::memory::HUGEPAGE_2MB;
 
 use crate::fabric::workload::{RunReport, run_workload, workload_strategy};
 

@@ -45,22 +45,19 @@ pub struct ConfigWatcher {
 }
 
 impl ConfigWatcher {
-    pub fn new(
-        path: PathBuf,
-    ) -> Result<(Self, mpsc::Receiver<ConfigUpdate>), WatchError> {
+    pub fn new(path: PathBuf) -> Result<(Self, mpsc::Receiver<ConfigUpdate>), WatchError> {
         let (raw_tx, raw_rx) = mpsc::channel::<()>();
         let (update_tx, update_rx) = mpsc::channel::<ConfigUpdate>();
 
         let event_tx = raw_tx.clone();
-        let mut watcher: RecommendedWatcher = notify::recommended_watcher(
-            move |res: Result<notify::Event, notify::Error>| {
+        let mut watcher: RecommendedWatcher =
+            notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
                 // Surface only the fact that *something* changed; the
                 // debounce thread re-reads the file from disk.
                 if res.is_ok() {
                     let _ = event_tx.send(());
                 }
-            },
-        )?;
+            })?;
 
         let watch_target = match path.parent() {
             Some(p) if !p.as_os_str().is_empty() && p.exists() => p.to_path_buf(),
@@ -215,10 +212,7 @@ listen_addr = "0.0.0.0:5678"
         f.flush().unwrap();
     }
 
-    fn recv_within(
-        rx: &mpsc::Receiver<ConfigUpdate>,
-        timeout: Duration,
-    ) -> Option<ConfigUpdate> {
+    fn recv_within(rx: &mpsc::Receiver<ConfigUpdate>, timeout: Duration) -> Option<ConfigUpdate> {
         rx.recv_timeout(timeout).ok()
     }
 
@@ -277,10 +271,7 @@ listen_addr = "0.0.0.0:5678"
         // systems (e.g. CI) and turns this into a flaky timing test.
         let start = Instant::now();
         for i in 0..5 {
-            let body = format!(
-                "[fabric]\nlisten_addr = \"0.0.0.0:{}\"\n",
-                4000 + i
-            );
+            let body = format!("[fabric]\nlisten_addr = \"0.0.0.0:{}\"\n", 4000 + i);
             write(&path, &body);
         }
         assert!(

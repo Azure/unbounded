@@ -188,7 +188,7 @@ impl<B: BlockDevice + 'static> LocalStorage<B> {
 }
 
 impl<B: BlockDevice + 'static> bufferpool::BlockStore for LocalStorage<B> {
-    fn register_pages(&self, backing: &bufferpool::Backing) -> Result<(), Error> {
+    fn register_pages(&self, backing: &crate::memory::Backing) -> Result<(), Error> {
         // Single-backing convenience path used by inline tests and
         // the single-shard configuration: every engine sees the
         // same backing and resolves `PageRef`s against it. Multi-
@@ -246,7 +246,7 @@ struct ShardBacking {
 
 // SAFETY: `ShardBacking::base` is a `*mut u8` pointing into a
 // pinned, shard-owned region whose lifetime is managed by the
-// shard's `Backing` (see `bufferpool::types::Backing`). The pool
+// shard's `Backing` (see `crate::memory::Backing`). The pool
 // upholds the per-NUMA pinning invariant; we only ever read the
 // pointer to compute page offsets and never alias it across
 // shards.
@@ -284,7 +284,7 @@ impl<B: BlockDevice + 'static> ShardLocalStore<B> {
 }
 
 impl<B: BlockDevice + 'static> bufferpool::BlockStore for ShardLocalStore<B> {
-    fn register_pages(&self, backing: &bufferpool::Backing) -> Result<(), Error> {
+    fn register_pages(&self, backing: &crate::memory::Backing) -> Result<(), Error> {
         {
             let mut b = self.backing.lock().unwrap();
             *b = Some(ShardBacking {
@@ -460,7 +460,7 @@ mod tests {
 
         // Shard A: 32 pool pages of 4 KiB at base_a.
         let mut buf_a = vec![0u8; 4096 * 32].into_boxed_slice();
-        let backing_a = bufferpool::Backing {
+        let backing_a = crate::memory::Backing {
             base: buf_a.as_mut_ptr(),
             page_size: 4096,
             page_count: 32,
@@ -471,7 +471,7 @@ mod tests {
 
         // Shard B: distinct backing.
         let mut buf_b = vec![0u8; 4096 * 32].into_boxed_slice();
-        let backing_b = bufferpool::Backing {
+        let backing_b = crate::memory::Backing {
             base: buf_b.as_mut_ptr(),
             page_size: 4096,
             page_count: 32,
