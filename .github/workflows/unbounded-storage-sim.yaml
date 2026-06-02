@@ -128,5 +128,5 @@ jobs:
           # top-level Makefile; bump those to invalidate this cache.
           key: tla2tools-v1.8.0
 
-      - name: Run TLC on CoW B+tree crash-consistency model
+      - name: Run TLC
         run: make unbounded-storage-model-check
