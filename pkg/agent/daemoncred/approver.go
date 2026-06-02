@@ -129,7 +129,19 @@ func (a *CSRApprover) Evaluate(ctx context.Context, csr *certificatesv1.Certific
 		return CSRDecision{AlreadyDecided: true}, nil
 	}
 
-	nodeName, decision, err := a.validateCSRShape(csr)
+	x509cr, err := parseCSR(csr.Spec.Request)
+	if err != nil {
+		if a.hasDaemonRequester(csr) {
+			return Deny("unable to parse CSR: %v", err), nil
+		}
+
+		return CSRDecision{Ignore: true}, nil
+	}
+	if !a.handlesCSR(csr, x509cr) {
+		return CSRDecision{Ignore: true}, nil
+	}
+
+	nodeName, decision, err := a.validateCSRShape(csr, x509cr)
 	if err != nil || decision.Message != "" {
 		return decision, err
 	}
@@ -137,11 +149,10 @@ func (a *CSRApprover) Evaluate(ctx context.Context, csr *certificatesv1.Certific
 	return a.evaluateRequester(ctx, csr, nodeName)
 }
 
-func (a *CSRApprover) validateCSRShape(csr *certificatesv1.CertificateSigningRequest) (string, CSRDecision, error) {
-	x509cr, err := parseCSR(csr.Spec.Request)
-	if err != nil {
-		return "", Deny("unable to parse CSR: %v", err), nil
-	}
+func (a *CSRApprover) validateCSRShape(
+	csr *certificatesv1.CertificateSigningRequest,
+	x509cr *x509.CertificateRequest,
+) (string, CSRDecision, error) {
 	if err := x509cr.CheckSignature(); err != nil {
 		return "", Deny("CSR signature is invalid: %v", err), nil
 	}
@@ -170,6 +181,18 @@ func (a *CSRApprover) validateCSRShape(csr *certificatesv1.CertificateSigningReq
 	}
 
 	return nodeName, CSRDecision{}, nil
+}
+
+func (a *CSRApprover) handlesCSR(csr *certificatesv1.CertificateSigningRequest, x509cr *x509.CertificateRequest) bool {
+	return a.hasDaemonRequester(csr) || slices.Contains(x509cr.Subject.Organization, a.opts.DaemonGroup)
+}
+
+func (a *CSRApprover) hasDaemonRequester(csr *certificatesv1.CertificateSigningRequest) bool {
+	if strings.HasPrefix(csr.Spec.Username, BootstrapUserPrefix) && slices.Contains(csr.Spec.Groups, a.opts.BootstrapGroup) {
+		return true
+	}
+
+	return strings.HasPrefix(csr.Spec.Username, SystemNodeUserPrefix) && slices.Contains(csr.Spec.Groups, a.opts.DaemonGroup)
 }
 
 func (a *CSRApprover) evaluateRequester(ctx context.Context, csr *certificatesv1.CertificateSigningRequest, nodeName string) (CSRDecision, error) {

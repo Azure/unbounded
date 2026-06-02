@@ -147,7 +147,7 @@ notices:
       - Copyright (c) Microsoft Corporation. All rights reserved.
     license:
       - name: MIT License
-        link: https://github.com/Azure/azure-sdk-for-go/blob/sdk/storage/azblob/v1.6.4/LICENSE.txt
+        link: https://github.com/Azure/azure-sdk-for-go/blob/sdk/storage/azblob/v1.7.0/LICENSE.txt
   - dependency: github.com/DATA-DOG/go-sqlmock
     ecosystem: go
     copyright:
@@ -183,28 +183,28 @@ notices:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/aws-sdk-go-v2/blob/config/v1.32.17/LICENSE.txt
+        link: https://github.com/aws/aws-sdk-go-v2/blob/config/v1.32.18/LICENSE.txt
   - dependency: github.com/aws/aws-sdk-go-v2/credentials
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/aws-sdk-go-v2/blob/credentials/v1.19.16/LICENSE.txt
+        link: https://github.com/aws/aws-sdk-go-v2/blob/credentials/v1.19.17/LICENSE.txt
   - dependency: github.com/aws/aws-sdk-go-v2/service/s3
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/aws-sdk-go-v2/blob/service/s3/v1.101.0/LICENSE.txt
+        link: https://github.com/aws/aws-sdk-go-v2/blob/service/s3/v1.102.0/LICENSE.txt
   - dependency: github.com/aws/smithy-go
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/smithy-go/blob/v1.25.1/LICENSE
+        link: https://github.com/aws/smithy-go/blob/v1.26.0/LICENSE
   - dependency: github.com/bougou/go-ipmi
     ecosystem: go
     copyright:
@@ -346,9 +346,9 @@ notices:
       - Copyright (c) 2016, 2016, Oracle and/or its affiliates. All rights reserved.
     license:
       - name: UPL-1.0
-        link: https://github.com/oracle/oci-go-sdk/blob/v65.114.2/LICENSE.txt
+        link: https://github.com/oracle/oci-go-sdk/blob/v65.116.0/LICENSE.txt
       - name: Apache License, Version 2.0
-        link: https://github.com/oracle/oci-go-sdk/blob/v65.114.2/LICENSE.txt
+        link: https://github.com/oracle/oci-go-sdk/blob/v65.116.0/LICENSE.txt
   - dependency: github.com/pin/tftp/v3
     ecosystem: go
     copyright:
@@ -524,7 +524,7 @@ notices:
       - Copyright (c) 2017 The Sqlite Authors. All rights reserved.
     license:
       - name: BSD 3-Clause License
-        link: https://gitlab.com/cznic/sqlite/-/blob/v1.50.1/LICENSE
+        link: https://gitlab.com/cznic/sqlite/-/blob/v1.51.0/LICENSE
   - dependency: oras.land/oras-go/v2
     ecosystem: go
     copyright:

@@ -35,6 +35,42 @@ func TestCSRApproverBootstrapAllowed(t *testing.T) {
 	require.True(t, decision.Approve)
 }
 
+func TestCSRApproverIgnoresUnrelatedClientCSR(t *testing.T) {
+	approver := testCSRApprover(t, true, true)
+	csr := csrFor(t, certificatesv1.CertificateSigningRequestSpec{
+		SignerName: DefaultControllerCertificateSignerName,
+		Username:   "admin@example.test",
+		Groups:     []string{"team-a"},
+		Usages:     clientAuthUsages(),
+	}, csrSubject{
+		CommonName:   "admin@example.test",
+		Organization: []string{"team-a"},
+	})
+
+	decision, err := approver.Evaluate(context.Background(), csr)
+	require.NoError(t, err)
+	require.True(t, decision.Ignore)
+}
+
+func TestCSRApproverDeniesMalformedDaemonBootstrapCSR(t *testing.T) {
+	approver := testCSRApprover(t, true, true)
+	csr := csrFor(t, certificatesv1.CertificateSigningRequestSpec{
+		SignerName: DefaultControllerCertificateSignerName,
+		Username:   "system:bootstrap:abc123",
+		Groups:     []string{testBootstrapGroup},
+		Usages:     clientAuthUsages(),
+	}, csrSubject{
+		CommonName:   "admin@example.test",
+		Organization: []string{"team-a"},
+	})
+
+	decision, err := approver.Evaluate(context.Background(), csr)
+	require.NoError(t, err)
+	require.False(t, decision.Ignore)
+	require.False(t, decision.Approve)
+	require.Contains(t, decision.Message, "common name must be")
+}
+
 func TestCSRApproverRequiresDaemonGroup(t *testing.T) {
 	_, err := NewCSRApprover(CSRApproverOptions{
 		BootstrapGroup: testBootstrapGroup,
@@ -105,7 +141,24 @@ func TestCSRApproverRenewalAllowed(t *testing.T) {
 	require.True(t, decision.Approve)
 }
 
-func TestCSRApproverStockKubeletCertCannotRenew(t *testing.T) {
+func TestCSRApproverIgnoresStockKubeletRenewal(t *testing.T) {
+	approver := testCSRApprover(t, true, true)
+	csr := csrFor(t, certificatesv1.CertificateSigningRequestSpec{
+		SignerName: DefaultControllerCertificateSignerName,
+		Username:   "system:node:node-a",
+		Groups:     []string{SystemNodesGroup},
+		Usages:     clientAuthUsages(),
+	}, csrSubject{
+		CommonName:   "system:node:node-a",
+		Organization: []string{SystemNodesGroup},
+	})
+
+	decision, err := approver.Evaluate(context.Background(), csr)
+	require.NoError(t, err)
+	require.True(t, decision.Ignore)
+}
+
+func TestCSRApproverDaemonGroupClaimRequiresDaemonRequester(t *testing.T) {
 	approver := testCSRApprover(t, true, true)
 	csr := csrFor(t, certificatesv1.CertificateSigningRequestSpec{
 		SignerName: DefaultControllerCertificateSignerName,
@@ -119,6 +172,7 @@ func TestCSRApproverStockKubeletCertCannotRenew(t *testing.T) {
 
 	decision, err := approver.Evaluate(context.Background(), csr)
 	require.NoError(t, err)
+	require.False(t, decision.Ignore)
 	require.False(t, decision.Approve)
 	require.Contains(t, decision.Message, "missing required node or daemon group")
 }
