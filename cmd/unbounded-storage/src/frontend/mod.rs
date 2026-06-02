@@ -42,7 +42,6 @@
 //! constructs the frontend objects; `start_on_shard` is what actually
 //! binds sockets, and that happens later on each shard thread.
 
-mod cache;
 mod range;
 
 #[cfg(target_os = "linux")]
@@ -53,7 +52,6 @@ use std::sync::Arc;
 
 use crate::config::FrontendSpec;
 
-pub use cache::{Tick, TtlCache};
 pub use range::{ByteRange, RangeError, ResolvedRange, StripeSlice, full_object, stripe_set};
 
 #[cfg(target_os = "linux")]

@@ -139,7 +139,6 @@ impl Backend for HttpBackend {
         let Some(origin) = req.origin() else {
             return HttpFetchStream::immediate_error("http backend: request missing origin");
         };
-        let (start, len) = absolute_range(origin.stripe_idx, self.stripe_size, src.offset, src.len);
         let path = origin.origin_object_id.clone();
         let host = self
             .origin
@@ -152,6 +151,26 @@ impl Backend for HttpBackend {
         let origin_addr = &self.origin;
         let backing_base = self.backing_base;
         let page_size = self.page_size;
+
+        // A length entry is not a byte range of the object; it is a
+        // synthetic one-page cache entry whose payload is the object's
+        // length. The sentinel `stripe_idx` would overflow
+        // `absolute_range`, so this must branch before that is computed.
+        if origin.is_length_entry() {
+            let fut = Box::pin(fetch_length(
+                socket,
+                origin_addr,
+                host,
+                path,
+                dsts_owned.clone(),
+                backing_base,
+                page_size,
+            ));
+            return HttpFetchStream::pending(fut, dsts_owned);
+        }
+
+        debug_assert!(!origin.is_length_entry());
+        let (start, len) = absolute_range(origin.stripe_idx, self.stripe_size, src.offset, src.len);
 
         let fut = Box::pin(fetch(
             socket,
@@ -384,6 +403,84 @@ async fn fetch(
     Ok(())
 }
 
+/// Fill a length entry: HEAD the origin object, take its
+/// `Content-Length` as the object's byte length, and write that length
+/// as a little-endian `u64` into the (single) destination page. HEAD
+/// has no body, so only the header block is read.
+///
+/// The 8 length bytes are written through the same
+/// [`copy_body_into_pages`] path as the data fetch, which copies them
+/// into the first page bytes and zero-fills the remainder of the
+/// destination pages.
+async fn fetch_length(
+    socket: Rc<RefCell<NetworkRing>>,
+    origin: &SockAddr,
+    host: String,
+    path: String,
+    dsts: Vec<PageRef>,
+    backing_base: *mut u8,
+    page_size: usize,
+) -> Result<(), Error> {
+    let capacity: usize = dsts.iter().map(|p| p.len as usize).sum();
+    if capacity < 8 {
+        return Err(Error::from(
+            "http backend: length entry destination smaller than 8 bytes",
+        ));
+    }
+
+    let conn = TcpConn::open()?;
+    {
+        // See `fetch` for why the shared `RefCell` borrow held across
+        // the await is sound (every ring method takes `&self`).
+        let ring = socket.borrow();
+        ring.connect(conn.fd, clone_sockaddr(origin))
+            .await
+            .map_err(io_to_err)?;
+    }
+
+    let request = format_head_request(&path, &host)?;
+    {
+        let ring = socket.borrow();
+        ring.send(conn.fd, request).await.map_err(io_to_err)?;
+    }
+
+    // Accumulate until the full header block has arrived, capping the
+    // header buffer so a pathological origin cannot grow it unbounded.
+    const MAX_HEAD: usize = 64 * 1024;
+    let mut buf: Vec<u8> = Vec::new();
+    let (status, content_length) = loop {
+        if let Some(h) = ResponseHead::parse(&buf)
+            .map_err(|_| Error::from("http backend: malformed origin response head"))?
+        {
+            break (h.status, h.content_length());
+        }
+        if buf.len() >= MAX_HEAD {
+            return Err(Error::from(
+                "http backend: length HEAD response head exceeds 64 KiB",
+            ));
+        }
+        let chunk = recv_chunk(&socket, conn.fd).await?;
+        if chunk.is_empty() {
+            return Err(Error::from(
+                "http backend: connection closed before length HEAD headers complete",
+            ));
+        }
+        buf.extend_from_slice(&chunk);
+    };
+
+    if status != StatusCode::OK {
+        return Err(Error::from(
+            "http backend: length HEAD returned non-200 status",
+        ));
+    }
+    let length = content_length
+        .ok_or_else(|| Error::from("http backend: length HEAD missing Content-Length"))?;
+
+    let le_bytes = length.to_le_bytes();
+    copy_body_into_pages(&le_bytes, &dsts, backing_base, page_size)?;
+    Ok(())
+}
+
 /// Determine how many body bytes to read for this response, or `None`
 /// when the origin advertised no `Content-Length` and the caller must
 /// read until the `Connection: close` stream ends.
@@ -510,6 +607,21 @@ fn format_get_request(path: &str, host: &str, start: u64, end: u64) -> Result<Ve
         .header(CONNECTION, "close")
         .body(())
         .map_err(|_| Error::from("http backend: failed to build origin GET request"))?;
+    Ok(serialize_request(&req))
+}
+
+/// Format an HTTP/1.1 HEAD request. Used by the length-entry fill path
+/// to learn an object's byte length from its `Content-Length` without
+/// transferring a body. No `Range` header: HEAD asks about the whole
+/// object.
+fn format_head_request(path: &str, host: &str) -> Result<Vec<u8>, Error> {
+    let req = ::http::Request::builder()
+        .method(Method::HEAD)
+        .uri(path)
+        .header(HOST, host)
+        .header(CONNECTION, "close")
+        .body(())
+        .map_err(|_| Error::from("http backend: failed to build origin HEAD request"))?;
     Ok(serialize_request(&req))
 }
 
@@ -764,5 +876,37 @@ mod tests {
     #[test]
     fn resolve_origin_rejects_unparseable() {
         assert!(HttpBackend::resolve_origin("not a host:port at all").is_err());
+    }
+
+    #[test]
+    fn format_head_request_emits_head_line_and_headers() {
+        let req = format_head_request("/o", "h:1").unwrap();
+        let s = std::str::from_utf8(&req).unwrap();
+        assert!(s.starts_with("HEAD /o HTTP/1.1\r\n"), "got: {s}");
+        assert!(s.contains("host: h:1\r\n"), "got: {s}");
+        assert!(s.contains("connection: close\r\n"), "got: {s}");
+        assert!(s.ends_with("\r\n\r\n"), "got: {s}");
+        assert!(!s.contains("range:"), "got: {s}");
+    }
+
+    #[test]
+    fn length_bytes_written_le_into_page() {
+        // The length-fill path encodes the object length as a
+        // little-endian u64 through `copy_body_into_pages`, which must
+        // land the 8 bytes at the page start and zero-fill the tail.
+        let page_size = 4096usize;
+        let mut backing = vec![0xFFu8; page_size];
+        let base = backing.as_mut_ptr();
+        let dsts = [PageRef {
+            page_idx: 0,
+            offset: 0,
+            len: page_size as u32,
+        }];
+        copy_body_into_pages(&12345u64.to_le_bytes(), &dsts, base, page_size).unwrap();
+
+        let mut head = [0u8; 8];
+        head.copy_from_slice(&backing[0..8]);
+        assert_eq!(u64::from_le_bytes(head), 12345);
+        assert!(backing[8..].iter().all(|&b| b == 0), "tail not zeroed");
     }
 }

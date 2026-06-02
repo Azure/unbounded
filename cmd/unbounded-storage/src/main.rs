@@ -38,11 +38,6 @@ use unbounded_storage::memory::{BackingKind, BackingRequest, allocate};
 const DEFAULT_CONFIG_PATH: &str = "/etc/unbounded-storage/config.toml";
 const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
 
-/// Object-length cache TTL for the per-shard HTTP frontend driver,
-/// in milliseconds. Matches the default the frontend's `from_spec`
-/// path uses.
-const DEFAULT_META_TTL_MS: u64 = 30_000;
-
 /// Stripe granularity used to build an inert origin backend on shards
 /// that have no configured backend. Such a backend is never exercised
 /// (no frontend drives reads against the pool), so the value is
@@ -716,8 +711,6 @@ fn run_shard(
                 backend_id.clone(),
                 stripe_size,
                 page_size,
-                origin,
-                DEFAULT_META_TTL_MS,
             );
             shard_loop.add_tick_hook(move || driver.progress());
             eprintln!("shard {}: frontend {} driver registered", widx.0, spec.id);
