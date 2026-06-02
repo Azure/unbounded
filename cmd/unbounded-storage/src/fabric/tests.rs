@@ -275,26 +275,26 @@ use crate::fabric::{FabricTransport, Handler, HandlerStream, MrHandle, PoolHandl
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 struct TestReq {
-    nonce: u64,
+    tag: u64,
 }
 
 impl Req for TestReq {
     fn key(&self) -> StripeKey {
-        // Derive a per-request stripe key from the nonce so that a
+        // Derive a per-request stripe key from the tag so that a
         // request's advertised key (what a `BlockStore`-backed handler
         // reads) is unique and matches what the test populated. In
         // production `Req::key()` is the real stripe key; a constant
         // here would make every request collide on one store entry.
-        StripeKey(stripe_for_nonce(self.nonce))
+        StripeKey(stripe_for_tag(self.tag))
     }
 }
 
-/// Map a `TestReq` nonce to a deterministic 32-byte stripe key by
-/// writing the nonce into the leading bytes. Used so tests can
+/// Map a `TestReq` tag to a deterministic 32-byte stripe key by
+/// writing the tag into the leading bytes. Used so tests can
 /// populate a store under exactly the key a given request advertises.
-fn stripe_for_nonce(nonce: u64) -> [u8; 32] {
+fn stripe_for_tag(tag: u64) -> [u8; 32] {
     let mut k = [0u8; 32];
-    k[..8].copy_from_slice(&nonce.to_le_bytes());
+    k[..8].copy_from_slice(&tag.to_le_bytes());
     k
 }
 
@@ -469,7 +469,7 @@ fn rpc_success_path_n_pages() {
     )
     .expect("FabricTransport::new failed after provider availability gate");
 
-    let req = TestReq { nonce: 0xCAFE };
+    let req = TestReq { tag: 0xCAFE };
     let dsts: Vec<PageRef> = (0..n_pages)
         .map(|i| PageRef {
             page_idx: i as u32,
@@ -538,7 +538,7 @@ fn rpc_passes_bulk_source_to_handler() {
     )
     .expect("FabricTransport::new failed after provider availability gate");
 
-    let req = TestReq { nonce: 0xACE0 };
+    let req = TestReq { tag: 0xACE0 };
     let dsts = vec![PageRef {
         page_idx: 0,
         offset: 0,
@@ -585,7 +585,7 @@ fn rpc_server_error_propagates() {
     )
     .expect("FabricTransport::new failed after provider availability gate");
 
-    let req = TestReq { nonce: 0xBEEF };
+    let req = TestReq { tag: 0xBEEF };
     let dsts = vec![PageRef {
         page_idx: 0,
         offset: 0,
@@ -644,7 +644,7 @@ fn rpc_mid_stream_cancellation() {
     )
     .expect("FabricTransport::new failed after provider availability gate");
 
-    let req = TestReq { nonce: 0x1234 };
+    let req = TestReq { tag: 0x1234 };
     let dsts = vec![
         PageRef {
             page_idx: 0,
@@ -884,8 +884,8 @@ fn pool_handler_serves_resident_stripe() {
     }
     // The store must be keyed under exactly what the request advertises
     // (`TestReq::key()`), since `PoolHandler` reads via `req.key()`.
-    let req = TestReq { nonce: 1 };
-    let key = stripe_for_nonce(1);
+    let req = TestReq { tag: 1 };
+    let key = stripe_for_tag(1);
     let fill = 0xC7u8;
     let (_server, transport, page_size, _server_handle, client_mr, _client) =
         paired_with_pool_handler(&[(key, fill)]);
@@ -932,7 +932,7 @@ fn pool_handler_reports_miss_for_non_resident_stripe() {
     let (_server, transport, page_size, _server_handle, _client_mr, _client) =
         paired_with_pool_handler(&[]);
 
-    let req = TestReq { nonce: 2 };
+    let req = TestReq { tag: 2 };
     let dsts = vec![PageRef {
         page_idx: 0,
         offset: 0,
@@ -1408,7 +1408,7 @@ fn zero_ttl_owner_serves_locally() {
     let (_server, transport, page_size, _server_handle, _client_mr, _client) =
         paired_with_pool_handler(&[]);
 
-    let req = TestReq { nonce: 7 };
+    let req = TestReq { tag: 7 };
     let dsts = vec![PageRef {
         page_idx: 0,
         offset: 0,
