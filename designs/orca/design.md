@@ -57,7 +57,7 @@ cloud sees exactly one fetch.
 | Origins | AWS S3 and Azure Blob, behind a pluggable `Origin` interface. |
 | Azure constraint | Block Blobs only. Page and Append blobs are rejected at `Head` with `UnsupportedBlobTypeError`. |
 | Cachestore | An in-DC S3-compatible store (`cachestore/s3`): a self-hosted store (Garage) in dev, VAST or similar in production. Treated as the truth for what chunks exist. |
-| Commit | Stat-then-put: `HeadObject` the chunk path, and if present skip the upload and record `ErrCommitLost`; otherwise plain `PutObject`. Safe without a conditional write because the ETag is part of the path, so racing writers carry byte-identical content. At boot, `SelfTest` proves the backend provides read-after-write visibility; if it doesn't, the process refuses to start. |
+| Commit | Stat-then-put: `HeadObject` the chunk path, and if present skip the upload and record `ErrCommitLost`; otherwise plain `PutObject`. The ETag is part of the path, so racing writers always carry byte-identical content and a last-writer-wins overwrite is safe. At boot, `SelfTest` proves the backend provides read-after-write visibility; if it doesn't, the process refuses to start. |
 | Versioned cachestore buckets | Not supported. At boot, `GetBucketVersioning` runs; if the bucket has versioning enabled or suspended, the process refuses to start. Orca's chunks are immutable and re-committed only with byte-identical content, so a versioned bucket would only accumulate redundant object versions. |
 | Chunking | Default 8 MiB (`chunking.size`). For bigger objects, an optional tier ladder (`chunking.tiers`) picks a larger size: 64 MiB for objects over 1 GiB, 128 MiB for objects over 10 GiB. The chunk size is part of the chunk's storage path, so changing the default or any tier never breaks existing data. Minimum 1 MiB. |
 | Read-ahead | While the edge sends one chunk to the client, it can fetch the next few chunks in parallel. The default is 8 in flight. Set `chunking.readahead: 0` to turn it off. |
@@ -118,9 +118,9 @@ cloud sees exactly one fetch.
 - **CacheStore commit (stat-then-put)** - the write that publishes
   a chunk to the cachestore. `HeadObject` the chunk path; if present,
   skip the upload and record `ErrCommitLost`; otherwise plain
-  `PutObject`. Safe without a conditional write because racing
-  writers of the same key carry byte-identical content (the ETag is
-  part of the path).
+  `PutObject`. Racing writers of the same key always carry
+  byte-identical content (the ETag is part of the path), so a
+  last-writer-wins overwrite is safe.
 - **Immutable-origin contract** - operators promise that once
   they publish a key, its bytes never change. If they break this,
   Orca may serve the old bytes for up to `metadata.ttl`. See
@@ -833,18 +833,12 @@ uploads with a plain `PutObject`. So when two replicas race to
 fill the same chunk, the one that commits second sees the object
 already there and treats it as the truth.
 
-**Why no conditional write is needed.** The chunk's storage path
-includes its ETag ([s5](#5-chunking-and-identity)). New ETag, new
-path. So the only way two writers ever target the same key is when
-they are writing byte-identical content. A last-writer-wins
-overwrite of identical bytes is therefore safe, and even a torn
-read during such an overwrite is byte-correct. This is why the
-commit needs only `GET`/`PUT`/`HEAD` and works against any
-S3-compatible store, not just the few that implement the
-`If-None-Match: *` conditional-write precondition (an AWS S3
-feature from 2024-08 that many self-hostable stores - Garage,
-SeaweedFS, RustFS - do not implement or do not enforce under
-concurrency).
+**Why this is safe.** The chunk's storage path includes its ETag
+([s5](#5-chunking-and-identity)). New ETag, new path. So the only
+way two writers ever target the same key is when they are writing
+byte-identical content. A last-writer-wins overwrite of identical
+bytes is therefore safe, and even a torn read during such an
+overwrite is byte-correct. The commit needs only `GET`/`PUT`/`HEAD`.
 
 The `HeadObject`/`PutObject` pair has a benign
 time-of-check/time-of-use window: two replicas may both see the
@@ -1181,9 +1175,9 @@ listener.
 
 `cachestore/posixfs` (shared POSIX filesystems: NFSv4.1+, Weka
 native, CephFS, Lustre, GPFS) and `cachestore/localfs` (dev)
-were designed and not built. The atomic-commit primitive there
-is `link()` returning `EEXIST` (or
-`renameat2(RENAME_NOREPLACE)`). The posixfs flavor adds backend
+were designed and not built. Commit is the same stat-then-put as
+`cachestore/s3` (stat the path, write the file if absent), using
+ordinary filesystem operations. The posixfs flavor adds backend
 detection, an NFS minimum-version check, refusal on Alluxio
 FUSE, and a 2-character hex path fan-out. Both would share
 helpers via `internal/orca/cachestore/internal/posixcommon/`.

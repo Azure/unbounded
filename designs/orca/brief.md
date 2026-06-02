@@ -149,10 +149,10 @@ The leader publishes a chunk to the CacheStore with a
 stat-then-put step: `cachestore/s3` does a `HeadObject` on the
 chunk path, and if the object is already present it skips the
 upload and records `ErrCommitLost`; otherwise it uploads with a
-plain `PutObject`. No conditional write is needed because the
-ETag is part of the chunk path, so two replicas racing on the
-same key always carry byte-identical content (a last-writer-wins
-overwrite of identical bytes is safe). At boot the driver runs
+plain `PutObject`. The ETag is part of the chunk path, so two
+replicas racing on the same key always carry byte-identical
+content (a last-writer-wins overwrite of identical bytes is
+safe). At boot the driver runs
 two checks - a `SelfTest` that proves the backend gives
 read-after-write visibility, and a versioning gate that refuses
 to start on versioned buckets (immutable chunks would only
@@ -177,9 +177,8 @@ One driver ships today:
 
 - `cachestore/s3` - an in-DC S3-compatible object store (VAST in
   production, a self-hosted store like Garage in dev). Commit is
-  stat-then-put (`HeadObject` then `PutObject`), which works on any
-  S3-compatible backend; the boot self-test and the versioning gate
-  keep it honest.
+  stat-then-put (`HeadObject` then `PutObject`); the boot self-test
+  and the versioning gate keep it honest.
 
 Shared-POSIX-filesystem drivers (`cachestore/posixfs`,
 `cachestore/localfs`) were designed and not built. See
