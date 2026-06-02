@@ -1,0 +1,92 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# Container image for the unbounded-storage daemon (the repository's only
+# Rust crate). The daemon links against libfabric and loads libfabric.so.1
+# at runtime; the fabric needs the native FI_EP_RDM `tcp` provider that only
+# exists in libfabric 2.0+, which distro packages predate. We therefore build
+# the pinned libfabric from source with the existing `make libfabric` target
+# and ship those libraries in the runtime stage.
+
+# The official Rust image ships a ready-to-use cargo/rustc toolchain on a
+# Debian base (with curl, git, ca-certificates, and tar from its buildpack-deps
+# parent), so we only need to add the C build deps below.
+FROM docker.io/library/rust:1-bookworm AS builder
+
+# Source of truth for the version is the Makefile default (LIBFABRIC_VERSION).
+# It is repeated here only so the COPY of the install prefix and the make
+# invocation stay in sync; pass --build-arg LIBFABRIC_VERSION=... to override
+# (must match the Makefile).
+ARG LIBFABRIC_VERSION=2.5.1
+
+# Build dependencies not already in the Rust image:
+# - build-essential: compile the fabric C shim and libfabric itself.
+# - make: drive the Makefile targets.
+# - pkg-config: build.rs probes libfabric via pkg-config.
+# - bzip2: unpack the libfabric tarball (curl/tar come from the base image).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        make \
+        pkg-config \
+        bzip2 \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+
+# Copy the full source tree. libfabric and the Rust crate need the repo's
+# Makefile, the crate sources, and the lockfile; copying everything keeps this
+# in lockstep with the other images and avoids brittle per-path COPYs.
+COPY . .
+
+# Force a clean, in-container build of libfabric and the crate so stale host
+# artifacts in tmp/ (gitignored, but present in the build context) cannot leak
+# in, which matters for foreign-arch (emulated) builds.
+RUN rm -rf tmp/libfabric cmd/unbounded-storage/target
+
+# Build the pinned libfabric from source, then the release binary. The
+# unbounded-storage-build target depends on the libfabric stamp and exports the
+# pkg-config / LD_LIBRARY_PATH env for cargo automatically. Building libfabric
+# explicitly first keeps the step boundaries (and failures) legible.
+RUN make libfabric LIBFABRIC_VERSION="${LIBFABRIC_VERSION}" \
+    && make unbounded-storage-build LIBFABRIC_VERSION="${LIBFABRIC_VERSION}"
+
+# Stage the binary and the libfabric install at fixed paths so the runtime
+# stage's COPY does not need the (build-arg) version in its source path.
+RUN mkdir -p /staging/lib \
+    && cp bin/unbounded-storage /staging/unbounded-storage \
+    && cp -a "tmp/libfabric/${LIBFABRIC_VERSION}/lib/." /staging/lib/
+
+# =============================================================================
+# Runtime stage. Minimal Ubuntu 24.04 with only what the binary and the pinned
+# libfabric load at runtime: liburing2, libnuma1, libnl-3-200 (libc / libgcc_s
+# come from the base). The pinned libfabric is built with verbs/efa/psm
+# providers disabled, so none of those libraries are required.
+# =============================================================================
+FROM docker.io/library/ubuntu:24.04 AS runtime
+
+LABEL org.opencontainers.image.source="https://github.com/Azure/unbounded"
+LABEL org.opencontainers.image.description="unbounded-storage daemon"
+LABEL org.opencontainers.image.licenses="MIT"
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ca-certificates \
+        liburing2 \
+        libnuma1 \
+        libnl-3-200 \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Install the pinned libfabric into a standard library directory and refresh
+# the loader cache so the binary's NEEDED libfabric.so.1 resolves without an
+# explicit LD_LIBRARY_PATH.
+COPY --from=builder /staging/lib/ /usr/local/lib/
+RUN ldconfig
+
+COPY --from=builder /staging/unbounded-storage /usr/local/bin/unbounded-storage
+
+# Fail fast at build time if the binary cannot resolve its shared libraries
+# (notably the pinned libfabric); this is the whole point of the image.
+RUN ldd /usr/local/bin/unbounded-storage \
+    && ! ldd /usr/local/bin/unbounded-storage | grep -q 'not found'
+
+ENTRYPOINT ["/usr/local/bin/unbounded-storage"]
