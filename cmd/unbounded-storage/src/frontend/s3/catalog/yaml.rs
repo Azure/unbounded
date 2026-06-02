@@ -1,6 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+//! The static YAML object catalog: a load-time map from `(bucket, key)`
+//! to [`ObjectMeta`].
+
 use std::collections::HashMap;
 use std::io::Read;
 
@@ -14,6 +17,10 @@ use super::types::{ObjectMeta, YamlObject};
 const MAX_CATALOG_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Catalog backed by a static YAML manifest loaded at startup.
+///
+/// Loaded once before the shards fan out and shared read-only behind
+/// an `Arc`; the per-shard [`S3Policy`](super::super::policy::S3Policy)
+/// only ever calls [`Self::get`].
 pub struct YamlCatalog {
     entries: HashMap<(String, String), ObjectMeta>,
 }
@@ -26,8 +33,8 @@ impl YamlCatalog {
     /// Files larger than [`MAX_CATALOG_BYTES`] are rejected without
     /// being fully read.
     pub fn load(path: &std::path::Path) -> Result<Self, String> {
-        let file = std::fs::File::open(path)
-            .map_err(|e| format!("opening catalog {path:?}: {e}"))?;
+        let file =
+            std::fs::File::open(path).map_err(|e| format!("opening catalog {path:?}: {e}"))?;
         // `take(MAX + 1)` bounds the read regardless of file type
         // (regular file, FIFO, socket). After the read, a length
         // strictly greater than MAX means the source had more bytes
@@ -41,11 +48,11 @@ impl YamlCatalog {
                 "catalog {path:?} exceeds size limit of {MAX_CATALOG_BYTES} bytes",
             ));
         }
-        Self::from_str(&content)
+        Self::from_yaml(&content)
     }
 
     /// Parse catalog from a YAML string. Exposed for testing.
-    pub fn from_str(yaml: &str) -> Result<Self, String> {
+    pub fn from_yaml(yaml: &str) -> Result<Self, String> {
         // `deny_unknown_fields` so typos in an operator's catalog
         // (e.g. `last-modified:` with a hyphen) fail loudly at load
         // time rather than silently falling back to defaults.
@@ -54,13 +61,11 @@ impl YamlCatalog {
         struct Doc {
             objects: Vec<YamlObject>,
         }
-        let doc: Doc = serde_yaml::from_str(yaml)
-            .map_err(|e| format!("parsing catalog: {e}"))?;
+        let doc: Doc = serde_yaml::from_str(yaml).map_err(|e| format!("parsing catalog: {e}"))?;
 
         let mut entries = HashMap::new();
         for obj in doc.objects {
-            let (bucket, key, meta) = obj.into_meta()
-                .map_err(|e| format!("bad entry: {e}"))?;
+            let (bucket, key, meta) = obj.into_meta().map_err(|e| format!("bad entry: {e}"))?;
             if entries.contains_key(&(bucket.clone(), key.clone())) {
                 return Err(format!("duplicate entry: ({bucket}, {key})"));
             }
@@ -73,11 +78,6 @@ impl YamlCatalog {
     /// not in the catalog.
     pub fn get(&self, bucket: &str, key: &str) -> Option<&ObjectMeta> {
         self.entries.get(&(bucket.to_owned(), key.to_owned()))
-    }
-
-    /// Create an empty catalog.
-    pub(crate) fn empty() -> Self {
-        Self::from_str("objects: []").expect("empty catalog is valid")
     }
 }
 
@@ -99,7 +99,7 @@ objects:
     stripe: 0000000000000000000000000000000000000000000000000000000000000000
     size: 0
 "#;
-        let c = YamlCatalog::from_str(yaml).unwrap();
+        let c = YamlCatalog::from_yaml(yaml).unwrap();
         let a = c.get("test", "a.bin").unwrap();
         assert_eq!(a.size, 1024);
         assert!(a.stripe.0[0] == 0x5a);
@@ -117,11 +117,25 @@ objects:
     stripe: 5a3f000000000000000000000000000000000000000000000000000000000000
     size: 1
 "#;
-        let c = YamlCatalog::from_str(yaml).unwrap();
+        let c = YamlCatalog::from_yaml(yaml).unwrap();
         let m = c.get("b", "k").unwrap();
         assert_eq!(m.content_type, "application/octet-stream");
         // last_modified is also optional and falls back to epoch.
         assert_eq!(m.last_modified, "Thu, 01 Jan 1970 00:00:00 GMT");
+    }
+
+    #[test]
+    fn etag_derived_from_stripe_prefix() {
+        let yaml = r#"
+objects:
+  - bucket: b
+    key: k
+    stripe: 5a3f000000000000000000000000000000000000000000000000000000000000
+    size: 1
+"#;
+        let c = YamlCatalog::from_yaml(yaml).unwrap();
+        let m = c.get("b", "k").unwrap();
+        assert_eq!(m.etag, "\"5a3f000000000000\"");
     }
 
     #[test]
@@ -137,7 +151,7 @@ objects:
     size: 1
     last_modified: "2026-01-15T12:00:00Z"
 "#;
-        let c = YamlCatalog::from_str(yaml).unwrap();
+        let c = YamlCatalog::from_yaml(yaml).unwrap();
         let m = c.get("b", "k").unwrap();
         assert_eq!(m.last_modified, "Thu, 15 Jan 2026 12:00:00 GMT");
     }
@@ -155,7 +169,7 @@ objects:
     size: 1
     last_modified: "2026-01-15T07:00:00-05:00"
 "#;
-        let c = YamlCatalog::from_str(yaml).unwrap();
+        let c = YamlCatalog::from_yaml(yaml).unwrap();
         let m = c.get("b", "k").unwrap();
         assert_eq!(m.last_modified, "Thu, 15 Jan 2026 12:00:00 GMT");
     }
@@ -172,7 +186,7 @@ objects:
     size: 1
     last_modified: "not a date"
 "#;
-        assert!(YamlCatalog::from_str(yaml).is_err());
+        assert!(YamlCatalog::from_yaml(yaml).is_err());
     }
 
     #[test]
@@ -188,7 +202,7 @@ objects:
     stripe: 0000000000000000000000000000000000000000000000000000000000000000
     size: 2
 "#;
-        assert!(YamlCatalog::from_str(yaml).is_err());
+        assert!(YamlCatalog::from_yaml(yaml).is_err());
     }
 
     #[test]
@@ -200,7 +214,7 @@ objects:
     stripe: deadbeef
     size: 1
 "#;
-        assert!(YamlCatalog::from_str(yaml).is_err());
+        assert!(YamlCatalog::from_yaml(yaml).is_err());
     }
 
     #[test]
@@ -215,7 +229,7 @@ objects:
     stripe: 5a3f000000000000000000000000000000000000000000000000000000000000
     size: 1
 "#;
-        let err = match YamlCatalog::from_str(yaml) {
+        let err = match YamlCatalog::from_yaml(yaml) {
             Ok(_) => panic!("expected parse error on unknown top-level field"),
             Err(e) => e,
         };
@@ -239,7 +253,7 @@ objects:
     size: 1
     last-modified: "2026-01-15T12:00:00Z"
 "#;
-        let err = match YamlCatalog::from_str(yaml) {
+        let err = match YamlCatalog::from_yaml(yaml) {
             Ok(_) => panic!("expected parse error on unknown object field"),
             Err(e) => e,
         };
@@ -256,8 +270,8 @@ objects:
         // Build a YAML file that's just over the size cap by padding
         // a comment line. The catalog itself is otherwise valid; we
         // only want to verify the size check fires before parse.
-        let mut f = tempfile::NamedTempFile::new()
-            .expect("create tempfile for oversize catalog test");
+        let mut f =
+            tempfile::NamedTempFile::new().expect("create tempfile for oversize catalog test");
         let padding = "#".repeat((MAX_CATALOG_BYTES + 1) as usize);
         writeln!(f, "{padding}").expect("write padding");
         writeln!(f, "objects: []").expect("write objects");
@@ -279,8 +293,8 @@ objects:
         // strictly "greater than", not "greater than or equal to".
         use std::io::Write;
 
-        let mut f = tempfile::NamedTempFile::new()
-            .expect("create tempfile for at-limit catalog test");
+        let mut f =
+            tempfile::NamedTempFile::new().expect("create tempfile for at-limit catalog test");
         writeln!(f, "objects: []").expect("write objects");
         f.flush().expect("flush tempfile");
 

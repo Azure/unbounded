@@ -1,9 +1,9 @@
 # unbounded-storage
 
-`unbounded-storage` is one of two Rust crates in this repository; the
-rest of the project is Go. The other Rust crate is `unbounded-s3`
-(see `cmd/unbounded-s3/AGENTS.md`), which depends on `unbounded-storage`
-as a library. The conventions below intentionally diverge from
+`unbounded-storage` is the only Rust crate in this repository; the
+rest of the project is Go. It also hosts the S3-compatible read-only
+frontend (`kind = "s3"`) as a native frontend module under
+`src/frontend/s3/`. The conventions below intentionally diverge from
 the top-level `AGENTS.md` where they need to. Read this file before
 touching anything under `cmd/unbounded-storage/`.
 

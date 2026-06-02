@@ -262,8 +262,16 @@ pub struct FrontendSpec {
     pub kind: FrontendKind,
     /// Listen address, e.g. `0.0.0.0:9000`.
     pub bind: String,
-    /// Id of the [`BackendSpec`] this frontend serves from.
+    /// Id of the [`BackendSpec`] this frontend serves from. Required
+    /// for every kind: it wires the shard's origin tier even for an
+    /// `s3` frontend, whose object content comes from the catalog's
+    /// stripe keys but whose misses still route through this backend.
     pub backend: String,
+    /// Path to the YAML object catalog. Required when `kind = "s3"`
+    /// (it maps `(bucket, key)` to a stripe key and metadata) and
+    /// must be absent otherwise. Validated by load-time `validate`.
+    #[serde(default)]
+    pub catalog: Option<PathBuf>,
     #[serde(default)]
     pub tls: Option<TlsCfg>,
 }
@@ -272,6 +280,7 @@ pub struct FrontendSpec {
 #[serde(rename_all = "snake_case")]
 pub enum FrontendKind {
     Http,
+    S3,
 }
 
 /// Minimal TLS material for a frontend listener. Paths point at PEM
@@ -609,10 +618,35 @@ key_path = "/etc/tls/key.pem"
         assert_eq!(f.kind, FrontendKind::Http);
         assert_eq!(f.bind, "0.0.0.0:9000");
         assert_eq!(f.backend, "primary-http");
+        assert!(f.catalog.is_none());
         let tls = f.tls.as_ref().expect("tls present");
         assert_eq!(tls.cert_path, Some(PathBuf::from("/etc/tls/cert.pem")));
         assert_eq!(tls.key_path, Some(PathBuf::from("/etc/tls/key.pem")));
         assert!(tls.secret_ref.is_none());
+    }
+
+    #[test]
+    fn s3_frontend_round_trip() {
+        let s = r#"
+[[backends]]
+id = "primary"
+kind = "http"
+endpoint = "https://origin.example.com"
+
+[[frontends]]
+id = "workload-s3"
+kind = "s3"
+bind = "0.0.0.0:8080"
+backend = "primary"
+catalog = "/etc/unbounded-storage/catalog.yaml"
+"#;
+        let c: Config = toml::from_str(s).unwrap();
+        let f = &c.frontends[0];
+        assert_eq!(f.kind, FrontendKind::S3);
+        assert_eq!(
+            f.catalog,
+            Some(PathBuf::from("/etc/unbounded-storage/catalog.yaml"))
+        );
     }
 
     #[test]

@@ -1010,6 +1010,7 @@ mod tests {
             kind: FrontendKind::Http,
             bind: "0.0.0.0:9000".to_string(),
             backend: backend_id.to_string(),
+            catalog: None,
             tls: None,
         }
     }

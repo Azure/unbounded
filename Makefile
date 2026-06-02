@@ -69,8 +69,6 @@ UNROUTE_CMD=./cmd/unroute
 # Rust binaries
 UNBOUNDED_STORAGE_BIN=bin/unbounded-storage
 UNBOUNDED_STORAGE_CRATE=./cmd/unbounded-storage
-UNBOUNDED_S3_BIN=bin/unbounded-s3
-UNBOUNDED_S3_CRATE=./cmd/unbounded-s3
 CARGO ?= cargo
 
 # libfabric is built from source because distro packages predate the
@@ -214,9 +212,6 @@ help: ## Show this help
 	@echo "  unbounded-storage-check          Run cargo check for unbounded-storage"
 	@echo "  unbounded-storage-model-check    Run TLC on all unbounded-storage TLA+ models"
 	@echo "  unbounded-storage-model-check-<model>  Run TLC on one model (e.g. copy-on-write)"
-	@echo "  unbounded-s3-test                Run cargo tests for unbounded-s3"
-	@echo "  unbounded-s3-check               Run cargo check for unbounded-s3"
-	@echo "  unbounded-s3-update              Update Cargo.lock for unbounded-s3 only"
 	@echo "  libfabric                        Build/install the pinned libfabric from source"
 	@echo ""
 	@echo "Container Images (local, single-arch):"
@@ -586,30 +581,6 @@ unbounded-storage-model-check-%: $(TLA_TOOLS_JAR)
 # individual model fails.
 unbounded-storage-model-check: $(addprefix unbounded-storage-model-check-,$(STORAGE_MODEL_DIRS)) ## Run TLC on all unbounded-storage TLA+ models
 	@echo "All unbounded-storage TLA+ models checked successfully."
-
-# unbounded-s3 targets
-# ---------------------------------------------------------------------------
-.PHONY: unbounded-s3-check
-unbounded-s3-check: ## Run cargo check for unbounded-s3
-	$(CARGO) check --manifest-path $(UNBOUNDED_S3_CRATE)/Cargo.toml --locked --all-targets
-
-.PHONY: unbounded-s3-test
-unbounded-s3-test: ## Run cargo tests for unbounded-s3
-	$(CARGO) test --manifest-path $(UNBOUNDED_S3_CRATE)/Cargo.toml --locked --all-targets
-
-.PHONY: unbounded-s3-build
-unbounded-s3-build: ## Build the unbounded-s3 binary (no test)
-	$(CARGO) build --manifest-path $(UNBOUNDED_S3_CRATE)/Cargo.toml --release --locked
-	@mkdir -p $(dir $(UNBOUNDED_S3_BIN))
-	cp $(UNBOUNDED_S3_CRATE)/target/release/unbounded-s3 $(UNBOUNDED_S3_BIN)
-
-.PHONY: unbounded-s3
-unbounded-s3: unbounded-s3-test unbounded-s3-build ## Build the unbounded-s3 binary (implies test)
-
-# Refresh Cargo.lock for unbounded-s3 (independent lockfile).
-.PHONY: unbounded-s3-update
-unbounded-s3-update:
-	$(CARGO) update --manifest-path $(UNBOUNDED_S3_CRATE)/Cargo.toml
 
 ##@ Container Images
 #

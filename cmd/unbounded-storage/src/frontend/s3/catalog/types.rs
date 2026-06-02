@@ -1,11 +1,15 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+//! The resolved per-object metadata an S3 response is built from, plus
+//! the raw YAML row it is parsed out of.
+
 use std::fmt;
 
 use hex::FromHexError;
 use serde::Deserialize;
-use unbounded_storage::bufferpool::StripeKey;
+
+use crate::bufferpool::StripeKey;
 
 /// Default `Last-Modified` value (RFC 7231 IMF-fixdate) used when a
 /// catalog entry omits an explicit timestamp. The Unix epoch is a
@@ -14,6 +18,10 @@ use unbounded_storage::bufferpool::StripeKey;
 pub(crate) const EPOCH_IMF: &str = "Thu, 01 Jan 1970 00:00:00 GMT";
 
 /// Metadata about one S3 object resolved from the catalog.
+///
+/// In v0 an object is exactly one stripe: [`Self::stripe`] is the
+/// `StripeKey` the GET body is read from, and [`Self::size`] is the
+/// object's full length within that stripe.
 #[derive(Clone, Debug)]
 pub struct ObjectMeta {
     pub stripe: StripeKey,
@@ -56,7 +64,9 @@ impl YamlObject {
         arr.copy_from_slice(&bytes);
         let stripe = StripeKey(arr);
         let etag = format!("\"{}\"", &hex[..16]);
-        let content_type = self.content_type.unwrap_or_else(|| "application/octet-stream".into());
+        let content_type = self
+            .content_type
+            .unwrap_or_else(|| "application/octet-stream".into());
         let last_modified = match self.last_modified.as_deref() {
             Some(s) => rfc3339_to_imf(s).map_err(MetaError::BadLastModified)?,
             None => EPOCH_IMF.to_string(),
@@ -79,9 +89,9 @@ impl YamlObject {
 /// request, and so the request path emits the header without any
 /// per-request date work.
 fn rfc3339_to_imf(s: &str) -> Result<String, String> {
+    use time::OffsetDateTime;
     use time::format_description::well_known::Rfc3339;
     use time::macros::format_description;
-    use time::OffsetDateTime;
 
     const IMF: &[time::format_description::BorrowedFormatItem<'_>] = format_description!(
         "[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT"

@@ -46,7 +46,11 @@ mod cache;
 mod range;
 
 #[cfg(target_os = "linux")]
-mod http_serve;
+mod conn;
+#[cfg(target_os = "linux")]
+mod http;
+#[cfg(target_os = "linux")]
+mod s3;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -57,7 +61,11 @@ pub use cache::{Tick, TtlCache};
 pub use range::{ByteRange, RangeError, ResolvedRange, StripeSlice, full_object, stripe_set};
 
 #[cfg(target_os = "linux")]
-pub use http_serve::{HttpDriver, HttpFrontend};
+pub use conn::ServeDriver;
+#[cfg(target_os = "linux")]
+pub use http::{HttpDriver, HttpFrontend, HttpPolicy};
+#[cfg(target_os = "linux")]
+pub use s3::{S3Driver, S3Frontend, S3Policy, YamlCatalog};
 
 /// A workload-facing listener that serves cached objects out of the
 /// shard's bufferpool. Sibling to [`crate::backend::Backend`].
@@ -318,6 +326,7 @@ mod tests {
             kind: FrontendKind::Http,
             bind: "0.0.0.0:9000".to_string(),
             backend: "b".to_string(),
+            catalog: None,
             tls: None,
         }
     }

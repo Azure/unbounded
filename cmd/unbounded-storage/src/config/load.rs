@@ -10,7 +10,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use super::schema::{Config, DiskKind, PeerTransport};
+use super::schema::{Config, DiskKind, FrontendKind, PeerTransport};
 
 #[derive(Debug)]
 pub enum ConfigError {
@@ -61,6 +61,11 @@ pub enum ConfigError {
         frontend_id: String,
         backend_id: String,
     },
+    /// An `s3` frontend did not provide a `catalog` path.
+    MissingS3Catalog(String),
+    /// A non-`s3` frontend provided a `catalog` path, which only the
+    /// `s3` kind consumes.
+    UnexpectedCatalog(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -165,6 +170,15 @@ impl fmt::Display for ConfigError {
                 f,
                 "frontend {frontend_id:?} references backend {backend_id:?} which is not defined \
                  in any [[backends]] entry"
+            ),
+            ConfigError::MissingS3Catalog(id) => write!(
+                f,
+                "frontend {id:?}: kind = \"s3\" requires a `catalog` path mapping objects to \
+                 stripe keys"
+            ),
+            ConfigError::UnexpectedCatalog(id) => write!(
+                f,
+                "frontend {id:?}: `catalog` is only valid for kind = \"s3\""
             ),
         }
     }
@@ -326,6 +340,18 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
                 frontend_id: fr.id.clone(),
                 backend_id: fr.backend.clone(),
             });
+        }
+        match fr.kind {
+            FrontendKind::S3 => {
+                if fr.catalog.is_none() {
+                    return Err(ConfigError::MissingS3Catalog(fr.id.clone()));
+                }
+            }
+            FrontendKind::Http => {
+                if fr.catalog.is_some() {
+                    return Err(ConfigError::UnexpectedCatalog(fr.id.clone()));
+                }
+            }
         }
     }
     Ok(())
@@ -914,5 +940,68 @@ backend = "b"
                 if frontend_id == "f2" && bind == "0.0.0.0:9000" => {}
             other => panic!("expected DuplicateFrontendBind, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn s3_frontend_requires_catalog() {
+        let s = r#"
+[[backends]]
+id = "b"
+kind = "http"
+endpoint = "https://e"
+
+[[frontends]]
+id = "f"
+kind = "s3"
+bind = "0.0.0.0:8080"
+backend = "b"
+"#;
+        let f = write_cfg(s);
+        match load(f.path()) {
+            Err(ConfigError::MissingS3Catalog(id)) if id == "f" => {}
+            other => panic!("expected MissingS3Catalog, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn http_frontend_rejects_catalog() {
+        let s = r#"
+[[backends]]
+id = "b"
+kind = "http"
+endpoint = "https://e"
+
+[[frontends]]
+id = "f"
+kind = "http"
+bind = "0.0.0.0:8080"
+backend = "b"
+catalog = "/etc/catalog.yaml"
+"#;
+        let f = write_cfg(s);
+        match load(f.path()) {
+            Err(ConfigError::UnexpectedCatalog(id)) if id == "f" => {}
+            other => panic!("expected UnexpectedCatalog, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn s3_frontend_with_catalog_loads() {
+        let s = r#"
+[[backends]]
+id = "b"
+kind = "http"
+endpoint = "https://e"
+
+[[frontends]]
+id = "f"
+kind = "s3"
+bind = "0.0.0.0:8080"
+backend = "b"
+catalog = "/etc/catalog.yaml"
+"#;
+        let f = write_cfg(s);
+        let cfg = load(f.path()).expect("s3 frontend with catalog should load");
+        assert_eq!(cfg.frontends[0].kind, FrontendKind::S3);
     }
 }

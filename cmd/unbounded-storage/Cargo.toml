@@ -29,6 +29,9 @@ rand = "0.8"
 rand_chacha = "0.3"
 toml = "0.8"
 notify = "6"
+serde_yaml = "0.9"
+hex = "0.4"
+time = { version = "0.3", features = ["parsing", "formatting", "macros"] }
 
 [build-dependencies]
 cc = "1"
@@ -41,4 +44,5 @@ io-uring = "0.6"
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
+quick-xml = "0.36"
 

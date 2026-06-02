@@ -17,10 +17,12 @@ use clap::Parser;
 
 use unbounded_storage::backend::HttpBackend;
 use unbounded_storage::bufferpool::{Pool, PoolConfig, PoolGroup, Req, ShardDescriptor, StripeKey};
-use unbounded_storage::config::{self, BackendSpec, Config, FabricCfg, FrontendSpec};
+use unbounded_storage::config::{self, BackendSpec, Config, FabricCfg, FrontendKind, FrontendSpec};
 use unbounded_storage::fabric::PeerId;
 use unbounded_storage::fabric::{self, ConnectionSpec, Fabric, Provider};
-use unbounded_storage::frontend::{HttpDriver, HttpFrontend};
+use unbounded_storage::frontend::{
+    HttpFrontend, HttpPolicy, S3Frontend, S3Policy, ServeDriver, YamlCatalog,
+};
 use unbounded_storage::p2p::{
     FingerTable, FingerTableConfig, NodeId, PeerEntry, RecursiveHandler, RoutedTransport,
     TopologyLabels, node_to_ring,
@@ -137,6 +139,20 @@ fn main() -> ExitCode {
     let frontend_specs = Arc::new(config.frontends.clone());
     let backend_specs = Arc::new(config.backends.clone());
 
+    // Load the S3 object catalog once, before the shards fan out, when
+    // the selected frontend is an `s3` kind. The resulting catalog is
+    // immutable and shared across every shard's `S3Policy` behind an
+    // `Arc`; loading it once here (rather than per shard) keeps a single
+    // parse and a single source of truth. A load failure is fatal: an
+    // `s3` frontend cannot serve without its catalog.
+    let s3_catalog = match load_s3_catalog(&frontend_specs) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("config error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     // Build the p2p routing surface once and share it across shards.
     // Every shard's `RoutedTransport` routes through the same finger
     // table and node->peer map.
@@ -160,6 +176,7 @@ fn main() -> ExitCode {
         let node_to_peer = node_to_peer.clone();
         let frontend_specs = frontend_specs.clone();
         let backend_specs = backend_specs.clone();
+        let s3_catalog = s3_catalog.clone();
         // `spawn_pinned` spawns the thread and pins it (affinity +
         // NUMA mempolicy) before running `f`. The `!Send` shard types
         // are constructed inside `run_shard`, which runs AFTER pinning
@@ -194,6 +211,7 @@ fn main() -> ExitCode {
                         node_to_peer,
                         frontend_specs,
                         backend_specs,
+                        s3_catalog,
                     );
                 });
             }),
@@ -372,6 +390,7 @@ fn run_shard(
     node_to_peer: Arc<HashMap<NodeId, PeerId>>,
     frontend_specs: Arc<Vec<FrontendSpec>>,
     backend_specs: Arc<Vec<BackendSpec>>,
+    s3_catalog: Option<Arc<YamlCatalog>>,
 ) {
     // Default to the loopback device when no HCA is bound to this
     // shard; the `tcp` provider is the fallback path.
@@ -680,14 +699,18 @@ fn run_shard(
         shard_loop.add_tick_hook(move || socket.borrow().progress());
     }
 
-    // Bring up the frontend selected above (if any). The `HttpFrontend`
-    // factory validates the spec and binds the shard's `SO_REUSEPORT`
-    // listener; the per-shard `HttpDriver` then serves connections out
-    // of this shard's pool, fetching origin misses through the same
-    // backend wired into the transport above. v1 drives one frontend
-    // per shard (see `select_frontend_spec`).
+    // Bring up the frontend selected above (if any). The factory
+    // validates the spec and binds the shard's `SO_REUSEPORT` listener;
+    // the per-shard driver then serves connections out of this shard's
+    // pool over the shared serve engine. An `http` frontend fetches
+    // origin misses through the backend wired into the transport above
+    // and resolves object metadata from a live origin `HEAD`; an `s3`
+    // frontend resolves identity, length, and stripe from the
+    // pre-loaded catalog and streams the single stripe's bytes,
+    // dropping the connection on a first-byte pool miss. v1 drives one
+    // frontend per shard (see `select_frontend_spec`).
     match selected {
-        Some(spec) => {
+        Some(spec) if spec.kind == FrontendKind::Http => {
             let frontend = match HttpFrontend::from_spec(spec) {
                 Ok(f) => f,
                 Err(e) => {
@@ -709,18 +732,72 @@ fn run_shard(
                 }
             };
             let handle = NetHandle::new(socket.clone());
-            let mut driver: HttpDriver<ShardPool> = HttpDriver::new(
-                pool.clone(),
-                handle,
-                listen_fd,
+            let policy = Rc::new(HttpPolicy::new(
                 backend_id.clone(),
                 stripe_size,
-                page_size,
                 origin,
                 DEFAULT_META_TTL_MS,
-            );
+            ));
+            let mut driver: ServeDriver<ShardPool, HttpPolicy> =
+                ServeDriver::new(pool.clone(), policy, handle, listen_fd, page_size);
             shard_loop.add_tick_hook(move || driver.progress());
             eprintln!("shard {}: frontend {} driver registered", widx.0, spec.id);
+        }
+        Some(spec) if spec.kind == FrontendKind::S3 => {
+            let frontend = match S3Frontend::from_spec(spec) {
+                Ok(f) => f,
+                Err(e) => {
+                    let _ = tx.send(ShardReady::Failed(format!(
+                        "worker={}: frontend {} from_spec: {e}",
+                        widx.0, spec.id,
+                    )));
+                    return;
+                }
+            };
+            // The catalog was loaded once in `main` before fan-out; a
+            // missing `Arc` here means the selection logic disagrees
+            // with the pre-load, which is a bug rather than a config
+            // error. Fail the shard coherently instead of panicking.
+            let catalog = match s3_catalog {
+                Some(c) => c,
+                None => {
+                    let _ = tx.send(ShardReady::Failed(format!(
+                        "worker={}: s3 frontend {} selected but no catalog was loaded",
+                        widx.0, spec.id,
+                    )));
+                    return;
+                }
+            };
+            let listen_fd = match frontend.bind_listener() {
+                Ok(fd) => fd,
+                Err(e) => {
+                    let _ = tx.send(ShardReady::Failed(format!(
+                        "worker={}: frontend {} bind_listener: {e}",
+                        widx.0, spec.id,
+                    )));
+                    return;
+                }
+            };
+            let handle = NetHandle::new(socket.clone());
+            let policy = Rc::new(S3Policy::new(catalog));
+            let mut driver: ServeDriver<ShardPool, S3Policy> =
+                ServeDriver::new(pool.clone(), policy, handle, listen_fd, page_size);
+            shard_loop.add_tick_hook(move || driver.progress());
+            eprintln!(
+                "shard {}: frontend {} (s3) driver registered",
+                widx.0, spec.id
+            );
+        }
+        Some(spec) => {
+            // `select_frontend_spec` returned a spec whose kind is
+            // neither `http` nor `s3`. Load-time validation should make
+            // this unreachable; treat it as a bring-up failure rather
+            // than silently serving nothing.
+            let _ = tx.send(ShardReady::Failed(format!(
+                "worker={}: frontend {} has unsupported kind {:?}",
+                widx.0, spec.id, spec.kind,
+            )));
+            return;
         }
         None => {
             // No frontend on this shard; the listener and serve engine
@@ -888,6 +965,29 @@ fn select_frontend_spec<'a>(
         );
     }
     Some(first)
+}
+
+/// Load the S3 object catalog once when the selected frontend is an
+/// `s3` kind, returning the shareable `Arc` the shards clone into their
+/// `S3Policy`. Returns `Ok(None)` when no frontend is configured or the
+/// selected frontend is not `s3` (so no catalog is needed).
+///
+/// The selection here MUST match [`select_frontend_spec`]: both pick
+/// the first configured spec, so the catalog loaded in `main` is the
+/// one every shard's selected `s3` frontend will use. An `s3` frontend
+/// with a missing/invalid catalog path or an unparseable manifest is a
+/// fatal config error.
+fn load_s3_catalog(specs: &[FrontendSpec]) -> Result<Option<Arc<YamlCatalog>>, String> {
+    let selected = match specs.first() {
+        Some(s) if s.kind == FrontendKind::S3 => s,
+        _ => return Ok(None),
+    };
+    let frontend =
+        S3Frontend::from_spec(selected).map_err(|e| format!("s3 frontend {}: {e}", selected.id))?;
+    let catalog = frontend
+        .load_catalog()
+        .map_err(|e| format!("s3 frontend {} catalog: {e}", selected.id))?;
+    Ok(Some(catalog))
 }
 
 /// Validate and log the configured backends.
@@ -1326,6 +1426,7 @@ mod tests {
             kind: config::FrontendKind::Http,
             bind: "0.0.0.0:9000".to_string(),
             backend: "b".to_string(),
+            catalog: None,
             tls: None,
         }
     }
