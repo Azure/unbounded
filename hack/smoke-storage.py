@@ -184,9 +184,10 @@ class _OriginHandler(http.server.BaseHTTPRequestHandler):
     """Serves the single in-memory object `BODY` at `OBJECT_PATH`.
 
     Implements exactly what the storage stack requires of an origin:
-    `HEAD` returns 200 with a Content-Length (used by the frontend to
-    resolve object length), and ranged `GET` returns 206 with a matching
-    Content-Range and body slice (used by the HTTP backend on cache miss).
+    `HEAD` returns 200 with a Content-Length (the HTTP backend issues it
+    to fill an object's content-addressed length entry), and ranged
+    `GET` returns 206 with a matching Content-Range and body slice (used
+    by the HTTP backend on a data-stripe cache miss).
     """
 
     protocol_version = "HTTP/1.0"  # close per request, matching Connection: close

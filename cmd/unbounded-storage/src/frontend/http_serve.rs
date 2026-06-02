@@ -18,7 +18,8 @@
 //!    which the shard loop registers as a tick hook.
 //!
 //! The hot serve path is: parse the request, resolve the object length
-//! (cached, else an origin `HEAD`), resolve the byte range, write the
+//! by reading the object's dedicated length entry through the pool,
+//! resolve the byte range, write the
 //! response head, then stream the body stripe-by-stripe out of the
 //! bufferpool with zero-copy `SEND_ZC`, holding each [`PageGuard`]
 //! across the send (the SEND_ZC notification is when the kernel is done
@@ -27,31 +28,23 @@
 //! Linux-gated because serving depends on the io_uring
 //! [`NetHandle`](crate::ring::NetHandle).
 
-use std::cell::RefCell;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::os::fd::RawFd;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-use std::time::Instant;
 
-use ::http::header::{ACCEPT_RANGES, CONNECTION, CONTENT_LENGTH, CONTENT_RANGE, HOST};
-use ::http::{Request, Response, StatusCode};
+use ::http::header::{ACCEPT_RANGES, CONNECTION, CONTENT_LENGTH, CONTENT_RANGE};
+use ::http::{Response, StatusCode};
 
-use crate::bufferpool::BufferPool;
+use crate::bufferpool::{BufferPool, ReadStream};
 use crate::config::{FrontendKind, FrontendSpec};
 use crate::frontend::FrontendError;
-use crate::frontend::cache::{Tick, TtlCache};
 use crate::frontend::range::{ByteRange, RangeError, ResolvedRange, full_object, stripe_set};
-use crate::http::{
-    HttpRequest, Method, ParseError, ResponseHead, serialize_request, serialize_response_head,
-};
-use crate::ring::{NetHandle, SockAddr};
+use crate::http::{HttpRequest, Method, ParseError, serialize_response_head};
+use crate::ring::NetHandle;
 use crate::storage::{OriginRef, StripeReq};
-
-/// Default TTL (milliseconds) for the per-shard object-length cache.
-const DEFAULT_META_TTL_MS: u64 = 30_000;
 
 /// Cap on the request header block we will buffer before giving up, so
 /// a misbehaving client cannot make us allocate without bound.
@@ -75,7 +68,6 @@ pub struct HttpFrontend {
     id: String,
     bind: SocketAddr,
     backend_id: String,
-    meta_ttl_ms: u64,
 }
 
 impl HttpFrontend {
@@ -94,7 +86,6 @@ impl HttpFrontend {
             id: spec.id.clone(),
             bind,
             backend_id: spec.backend.clone(),
-            meta_ttl_ms: DEFAULT_META_TTL_MS,
         })
     }
 
@@ -112,11 +103,6 @@ impl HttpFrontend {
     /// The configured listen address.
     pub fn bind(&self) -> SocketAddr {
         self.bind
-    }
-
-    /// Object-length cache TTL in milliseconds.
-    pub fn meta_ttl_ms(&self) -> u64 {
-        self.meta_ttl_ms
     }
 
     /// Create, bind, and listen the per-shard accept socket with
@@ -148,11 +134,6 @@ pub struct HttpDriver<P: BufferPool<Req = StripeReq> + 'static> {
     backend_id: String,
     stripe_size: u64,
     page_size: usize,
-    origin: SockAddr,
-    origin_host: String,
-    len_cache: Rc<RefCell<TtlCache<String, u64>>>,
-    meta_ttl: Tick,
-    epoch: Instant,
     accept_fut: Pin<Box<dyn Future<Output = std::io::Result<RawFd>>>>,
     conns: Vec<Pin<Box<dyn Future<Output = ()>>>>,
     waker: Waker,
@@ -161,11 +142,8 @@ pub struct HttpDriver<P: BufferPool<Req = StripeReq> + 'static> {
 impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
     /// Build a serving engine over a bound `listen_fd`.
     ///
-    /// `origin` is the resolved origin address used for `HEAD`
-    /// object-length lookups; the `Host:` header is rendered from it.
     /// `stripe_size` and `page_size` come from the shard's pool
-    /// geometry; `meta_ttl_ms` is the object-length cache TTL.
-    #[allow(clippy::too_many_arguments)]
+    /// geometry.
     pub fn new(
         pool: Rc<P>,
         handle: NetHandle,
@@ -173,13 +151,7 @@ impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
         backend_id: String,
         stripe_size: u64,
         page_size: usize,
-        origin: SockAddr,
-        meta_ttl_ms: u64,
     ) -> Self {
-        let origin_host = origin
-            .as_ipv4()
-            .map(|(ip, port)| format!("{ip}:{port}"))
-            .unwrap_or_else(|| "origin".to_string());
         let accept_fut = Box::pin(handle.accept(listen_fd));
         Self {
             pool,
@@ -188,11 +160,6 @@ impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
             backend_id,
             stripe_size,
             page_size,
-            origin,
-            origin_host,
-            len_cache: Rc::new(RefCell::new(TtlCache::new(meta_ttl_ms))),
-            meta_ttl: meta_ttl_ms,
-            epoch: Instant::now(),
             accept_fut,
             conns: Vec::new(),
             waker: noop_waker(),
@@ -235,11 +202,6 @@ impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
                             self.backend_id.clone(),
                             self.stripe_size,
                             self.page_size,
-                            self.origin.duplicate(),
-                            self.origin_host.clone(),
-                            Rc::clone(&self.len_cache),
-                            self.meta_ttl,
-                            self.epoch,
                         );
                         self.conns.push(Box::pin(serve));
                     }
@@ -270,7 +232,6 @@ impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
 /// Owns everything it needs so the future is `'static` and can live in
 /// the driver's future set across ticks. All paths close `conn_fd` via
 /// the [`FdGuard`]; serve errors just drop the connection.
-#[allow(clippy::too_many_arguments)]
 async fn serve_connection<P: BufferPool<Req = StripeReq>>(
     pool: Rc<P>,
     handle: NetHandle,
@@ -278,33 +239,14 @@ async fn serve_connection<P: BufferPool<Req = StripeReq>>(
     backend_id: String,
     stripe_size: u64,
     page_size: usize,
-    origin: SockAddr,
-    origin_host: String,
-    len_cache: Rc<RefCell<TtlCache<String, u64>>>,
-    meta_ttl: Tick,
-    epoch: Instant,
 ) {
     let _fd = FdGuard(conn_fd);
-    let _ = serve_request(
-        &pool,
-        &handle,
-        conn_fd,
-        &backend_id,
-        stripe_size,
-        page_size,
-        &origin,
-        &origin_host,
-        &len_cache,
-        meta_ttl,
-        epoch,
-    )
-    .await;
+    let _ = serve_request(&pool, &handle, conn_fd, &backend_id, stripe_size, page_size).await;
 }
 
 /// The fallible serve body. Returns `Err(())` on any I/O, parse, or
 /// pool error; the caller closes the fd regardless. Error responses
 /// (400/405/416) are best-effort sends followed by `Ok(())`.
-#[allow(clippy::too_many_arguments)]
 async fn serve_request<P: BufferPool<Req = StripeReq>>(
     pool: &Rc<P>,
     handle: &NetHandle,
@@ -312,11 +254,6 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
     backend_id: &str,
     stripe_size: u64,
     page_size: usize,
-    origin: &SockAddr,
-    origin_host: &str,
-    len_cache: &Rc<RefCell<TtlCache<String, u64>>>,
-    meta_ttl: Tick,
-    epoch: Instant,
 ) -> Result<(), ()> {
     // 1. Read until the request head is complete (or the cap is hit).
     let mut buf: Vec<u8> = Vec::new();
@@ -367,20 +304,14 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
         None => None,
     };
 
-    // 5. Resolve object length (cached, else origin HEAD).
-    let now = now_ms(epoch);
-    let cached = len_cache.borrow_mut().get(now, &path).copied();
-    let len = match cached {
-        Some(l) => l,
-        None => {
-            let l = origin_head_length(handle, origin, origin_host, &path)
-                .await
-                .map_err(|_| ())?;
-            len_cache.borrow_mut().insert(now, path.clone(), l);
-            let _ = meta_ttl;
-            l
-        }
-    };
+    // 5. Resolve object length by reading the object's dedicated
+    // length entry through the pool. The HTTP backend fills it from
+    // an origin HEAD on a miss; local-disk and peer hits skip the
+    // origin entirely. The payload is the byte length as a
+    // little-endian u64 in the first 8 bytes of the entry's page.
+    let len = read_object_length(pool, backend_id, &path)
+        .await
+        .map_err(|_| ())?;
 
     // 6. Resolve the requested range against the length.
     let resolved = match range {
@@ -492,72 +423,27 @@ async fn send_all(handle: &NetHandle, fd: RawFd, bytes: Vec<u8>) -> Result<(), (
     Ok(())
 }
 
-/// Resolve an object's length by issuing a `HEAD` to the origin and
-/// reading back its `Content-Length`. One connection per lookup
-/// (`Connection: close`), matching the cold-path origin backend.
-async fn origin_head_length(
-    handle: &NetHandle,
-    origin: &SockAddr,
-    host: &str,
+/// Resolve an object's length by reading its dedicated content-addressed
+/// length entry through the pool. The entry's single page carries the
+/// byte length as a little-endian u64 in its first 8 bytes; the HTTP
+/// backend fills it from an origin `HEAD` on a miss, while local-disk
+/// and peer hits avoid the origin entirely.
+async fn read_object_length<P: BufferPool<Req = StripeReq>>(
+    pool: &Rc<P>,
+    backend_id: &str,
     path: &str,
-) -> std::io::Result<u64> {
-    let conn = open_tcp_v4()?;
-    let _g = FdGuard(conn);
-    handle.connect(conn, origin.duplicate()).await?;
-    let request = Request::builder()
-        .method(Method::HEAD)
-        .uri(path)
-        .header(HOST, host)
-        .header(CONNECTION, "close")
-        .body(())
-        .map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "failed to build origin HEAD request",
-            )
-        })?;
-    handle.send(conn, serialize_request(&request)).await?;
-
-    let mut buf: Vec<u8> = Vec::new();
-    loop {
-        match ResponseHead::parse(&buf) {
-            Ok(Some(head)) => {
-                if head.status != StatusCode::OK {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "origin HEAD response was not 200 OK",
-                    ));
-                }
-                return head.content_length().ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "origin HEAD response missing Content-Length",
-                    )
-                });
-            }
-            Ok(None) => {}
-            Err(_) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "origin HEAD response head malformed",
-                ));
-            }
-        }
-        if buf.len() > MAX_HEADER_BYTES {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "origin HEAD response head too large",
-            ));
-        }
-        let chunk = handle.recv(conn, RECV_CHUNK).await?;
-        if chunk.is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "origin closed before HEAD response complete",
-            ));
-        }
-        buf.extend_from_slice(&chunk);
+) -> Result<u64, ()> {
+    let origin_ref = OriginRef::length_entry(backend_id, path);
+    let req = StripeReq::new(origin_ref.stripe_key()).with_origin(origin_ref);
+    let mut rs: ReadStream = pool.read(&req, 0, 8).await.map_err(|_| ())?;
+    let page = rs.next_page().await.ok_or(())?.map_err(|_| ())?;
+    let bytes = page.as_slice();
+    if bytes.len() < 8 {
+        return Err(());
     }
+    let mut le = [0u8; 8];
+    le.copy_from_slice(&bytes[..8]);
+    Ok(u64::from_le_bytes(le))
 }
 
 /// Split a raw request target into `(path, query)` where `query` is the
@@ -623,12 +509,6 @@ fn status_line_response(status: u16) -> Vec<u8> {
         .body(())
         .expect("valid status-line response head");
     serialize_response_head(&resp)
-}
-
-/// Milliseconds since the driver's epoch, the tick unit for the
-/// object-length cache.
-fn now_ms(epoch: Instant) -> Tick {
-    epoch.elapsed().as_millis() as Tick
 }
 
 /// Create, bind, and listen a TCP socket on `addr` with `SO_REUSEADDR`
@@ -715,16 +595,6 @@ fn bind_listener(addr: SocketAddr) -> Result<RawFd, FrontendError> {
     Ok(fd)
 }
 
-/// Open a non-bound IPv4 TCP socket for an outbound origin connection.
-fn open_tcp_v4() -> std::io::Result<RawFd> {
-    // SAFETY: socket() with valid AF/type/protocol constants.
-    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(fd)
-}
-
 /// RAII closer for a socket fd. The ring never creates fds; this owns
 /// the lifecycle of fds the frontend opens with `libc`.
 struct FdGuard(RawFd);
@@ -756,6 +626,7 @@ mod tests {
     use crate::bufferpool::{Error, ReadStream, WindowedRead};
     use crate::config::TlsCfg;
     use crate::frontend::range::StripeSlice;
+    use std::cell::RefCell;
 
     fn spec(id: &str, bind: &str) -> FrontendSpec {
         FrontendSpec {
@@ -935,15 +806,17 @@ mod tests {
     }
 
     #[test]
-    fn len_cache_hit_and_ttl_expiry() {
-        let mut c: TtlCache<String, u64> = TtlCache::new(DEFAULT_META_TTL_MS);
-        let key = "/bucket/key".to_string();
-        assert!(c.get(0, &key).is_none());
-        c.insert(0, key.clone(), 4096);
-        assert_eq!(c.get(0, &key).copied(), Some(4096));
-        // Live just before the TTL boundary, gone at/after it.
-        assert_eq!(c.get(DEFAULT_META_TTL_MS - 1, &key).copied(), Some(4096));
-        assert!(c.get(DEFAULT_META_TTL_MS, &key).is_none());
+    fn length_entry_request_is_well_formed() {
+        use crate::bufferpool::Req;
+        use crate::storage::{LENGTH_STRIPE_IDX, stripe_key};
+
+        let origin_ref = OriginRef::length_entry("primary", "/o");
+        assert!(origin_ref.is_length_entry());
+
+        let req = StripeReq::new(origin_ref.stripe_key()).with_origin(origin_ref);
+        assert!(req.origin().unwrap().is_length_entry());
+        assert_eq!(req.key(), stripe_key("primary", "/o", LENGTH_STRIPE_IDX));
+        assert_eq!(LENGTH_STRIPE_IDX, u64::MAX);
     }
 
     /// A mock pool whose `read` never constructs a `ReadStream` (that
@@ -993,17 +866,6 @@ mod tests {
                 return;
             }
         };
-        let origin = {
-            let sin = libc::sockaddr_in {
-                sin_family: libc::AF_INET as libc::sa_family_t,
-                sin_port: 8080u16.to_be(),
-                sin_addr: libc::in_addr {
-                    s_addr: u32::from(std::net::Ipv4Addr::new(127, 0, 0, 1)).to_be(),
-                },
-                sin_zero: [0; 8],
-            };
-            SockAddr::from_sockaddr_in(sin)
-        };
         let mut driver = HttpDriver::new(
             Rc::new(MockPool),
             handle,
@@ -1011,8 +873,6 @@ mod tests {
             "primary".to_string(),
             4 * 1024 * 1024,
             2 * 1024 * 1024,
-            origin,
-            DEFAULT_META_TTL_MS,
         );
         // No client has connected: accept is pending, no conns, so the
         // engine reports no work and stays idle.
