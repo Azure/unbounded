@@ -390,6 +390,8 @@ func (d *Driver) Stat(ctx context.Context, k chunk.Key) (cachestore.Info, error)
 	}
 
 	if out.LastModified != nil {
+		// Recorded for the deferred active-eviction loop; no current
+		// reader. See cachestore.Info.Committed.
 		info.Committed = *out.LastModified
 	}
 

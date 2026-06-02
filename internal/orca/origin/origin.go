@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"time"
 )
 
 // Origin is a read-only view of an upstream blob store.
@@ -28,11 +27,9 @@ type Origin interface {
 
 // ObjectInfo is the result of a successful Head.
 type ObjectInfo struct {
-	Size          int64
-	ETag          string
-	ContentType   string
-	LastValidated time.Time
-	LastStatus    int
+	Size        int64
+	ETag        string
+	ContentType string
 }
 
 // Sentinel errors. Wrap with %w so callers use errors.Is.
