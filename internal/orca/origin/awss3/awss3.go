@@ -132,7 +132,7 @@ func (a *Adapter) Head(ctx context.Context, bucket, key string) (origin.ObjectIn
 				slog.String("key", key),
 			)
 
-			return origin.ObjectInfo{LastStatus: http.StatusNotFound}, origin.ErrNotFound
+			return origin.ObjectInfo{}, origin.ErrNotFound
 		}
 
 		if isAuth(err) {
@@ -147,7 +147,7 @@ func (a *Adapter) Head(ctx context.Context, bucket, key string) (origin.ObjectIn
 		return origin.ObjectInfo{}, fmt.Errorf("awss3 head: %w", err)
 	}
 
-	info := origin.ObjectInfo{LastStatus: http.StatusOK}
+	info := origin.ObjectInfo{}
 	if out.ContentLength != nil {
 		info.Size = *out.ContentLength
 	}
@@ -158,10 +158,6 @@ func (a *Adapter) Head(ctx context.Context, bucket, key string) (origin.ObjectIn
 
 	if out.ContentType != nil {
 		info.ContentType = *out.ContentType
-	}
-
-	if out.LastModified != nil {
-		info.LastValidated = *out.LastModified
 	}
 
 	a.log.LogAttrs(ctx, slog.LevelDebug, "awss3_head_response",

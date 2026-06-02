@@ -93,7 +93,7 @@ func (a *Adapter) Head(ctx context.Context, bucket, key string) (origin.ObjectIn
 				slog.String("key", key),
 			)
 
-			return origin.ObjectInfo{LastStatus: http.StatusNotFound}, origin.ErrNotFound
+			return origin.ObjectInfo{}, origin.ErrNotFound
 		}
 
 		if isAuth(err) {
@@ -117,7 +117,7 @@ func (a *Adapter) Head(ctx context.Context, bucket, key string) (origin.ObjectIn
 		return origin.ObjectInfo{}, err
 	}
 
-	info := origin.ObjectInfo{LastStatus: http.StatusOK}
+	info := origin.ObjectInfo{}
 	if props.ContentLength != nil {
 		info.Size = *props.ContentLength
 	}
@@ -128,10 +128,6 @@ func (a *Adapter) Head(ctx context.Context, bucket, key string) (origin.ObjectIn
 
 	if props.ContentType != nil {
 		info.ContentType = *props.ContentType
-	}
-
-	if props.LastModified != nil {
-		info.LastValidated = *props.LastModified
 	}
 
 	a.log.LogAttrs(ctx, slog.LevelDebug, "azureblob_head_response",
