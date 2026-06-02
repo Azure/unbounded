@@ -42,7 +42,7 @@ help: ## Show this help
 	@echo "Seed data, roundtrips, benchmarks, scenarios:"
 	@echo "  Use bin/orcadev <verb> directly. Run 'bin/orcadev --help'"
 	@echo "  for the full subcommand tree. orcadev auto-opens port-forwards"
-	@echo "  to svc/orca, svc/azurite, svc/localstack as needed."
+	@echo "  to svc/orca, svc/azurite, svc/garage as needed."
 	@echo ""
 	@echo "Variables:"
 	@echo "  CLUSTER_NAME=$(CLUSTER_NAME)"

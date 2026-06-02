@@ -1,0 +1,221 @@
+---
+# Dev S3 backend: a single-node Garage cluster, used as BOTH the
+# cachestore (s3 driver) and the awss3 origin emulator. Garage replaces
+# the previous LocalStack deployment.
+#
+# Why Garage:
+#   - It persists to a PVC, so cachestore state (and the orca-cache /
+#     orca-origin buckets) survive pod restarts and evictions. The old
+#     LocalStack Deployment used an emptyDir and re-ran a bucket
+#     init-hook on every restart.
+#   - It is fully open source with no Pro tier or license gate.
+#   - It implements plain GET/PUT/HEAD, which is all orca's cachestore
+#     commit needs now that the commit path is stat-then-put rather than
+#     a PutObject + If-None-Match conditional write.
+#
+# Garage requires SigV4 auth, so unlike LocalStack the dev credentials
+# are real Garage keys. They are deterministic constants (imported by
+# the bootstrap script below and mirrored into the orca-credentials
+# Secret by setup-orca.sh); they are dev-only and not secret. Garage
+# access key IDs must be "GK" + 12 hex bytes, so the well-known
+# all-test value cannot be used.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: garage-config
+  namespace: {{ default "unbounded-kube" .Namespace }}
+  labels:
+    app.kubernetes.io/name: garage
+    app.kubernetes.io/part-of: orca-dev
+data:
+  garage.toml: |
+    metadata_dir = "/var/lib/garage/meta"
+    data_dir = "/var/lib/garage/data"
+    db_engine = "sqlite"
+    replication_factor = 1
+
+    rpc_bind_addr = "[::]:3901"
+    rpc_public_addr = "127.0.0.1:3901"
+    # Dev-only RPC shared secret (not a credential to anything real).
+    rpc_secret = "{{ default "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" .GarageRPCSecret }}"
+
+    [s3_api]
+    s3_region = "{{ default "us-east-1" .CachestoreRegion }}"
+    api_bind_addr = "[::]:3900"
+    root_domain = ".s3.garage"
+
+    [admin]
+    api_bind_addr = "[::]:3903"
+    admin_token = "{{ default "orca-dev-admin-token" .GarageAdminToken }}"
+
+  bootstrap.sh: |
+    #!/bin/sh
+    # Idempotent Garage bootstrap, run from the container's postStart
+    # lifecycle hook (so it shares the server's metadata volume and can
+    # reach the node on 127.0.0.1). Safe to re-run on every restart:
+    # the persistent PVC keeps the node identity, applied layout, key,
+    # and buckets, so each step is gated on a presence check.
+    set -eu
+
+    G="/garage -c /etc/garage.toml"
+    AK="{{ default "GK0123456789abcdef01234567" .GarageAccessKey }}"
+    SK="{{ default "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" .GarageSecretKey }}"
+    CACHE_BUCKET="{{ default "orca-cache" .CachestoreBucket }}"
+    ORIGIN_BUCKET="{{ default "orca-origin" .OriginBucket }}"
+
+    # Wait for the local node's RPC to answer.
+    i=0
+    until $G status >/dev/null 2>&1; do
+      i=$((i+1))
+      if [ "$i" -ge 60 ]; then
+        echo "garage-bootstrap: node did not become ready" >&2
+        exit 0
+      fi
+      sleep 1
+    done
+
+    # Assign + apply a single-node layout once. `layout show` lists the
+    # staged/applied roles; an already-configured node prints its zone.
+    if ! $G layout show 2>/dev/null | grep -q "dc1"; then
+      NODE=$($G node id -q | cut -d@ -f1)
+      $G layout assign "$NODE" -z dc1 -c 1G
+      $G layout apply --version 1
+    fi
+
+    # Import the deterministic dev key once, then ensure it may create
+    # buckets (the awss3 origin and cachestore both use it).
+    if ! $G key list 2>/dev/null | grep -q "$AK"; then
+      $G key import "$AK" "$SK" -n orca-dev --yes
+    fi
+    $G key allow --create-bucket orca-dev || true
+
+    # Ensure both buckets exist and are owned by the dev key.
+    for b in "$CACHE_BUCKET" "$ORIGIN_BUCKET"; do
+      $G bucket info "$b" >/dev/null 2>&1 || $G bucket create "$b"
+      $G bucket allow --read --write --owner --key orca-dev "$b" || true
+    done
+
+    echo "garage-bootstrap: complete"
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: garage-data
+  namespace: {{ default "unbounded-kube" .Namespace }}
+  labels:
+    app.kubernetes.io/name: garage
+    app.kubernetes.io/part-of: orca-dev
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ default "2Gi" .GarageStorage | quote }}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: garage
+  namespace: {{ default "unbounded-kube" .Namespace }}
+  labels:
+    app.kubernetes.io/name: garage
+    app.kubernetes.io/part-of: orca-dev
+spec:
+  # ClusterIP: orcadev reaches Garage via `kubectl port-forward
+  # svc/garage 3900:3900` (opened automatically by orcadev when the
+  # local port isn't already bound). Matches the LocalStack pattern it
+  # replaces.
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: garage
+  ports:
+    - name: s3
+      port: 3900
+      targetPort: 3900
+      protocol: TCP
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: garage
+  namespace: {{ default "unbounded-kube" .Namespace }}
+  labels:
+    app.kubernetes.io/name: garage
+    app.kubernetes.io/part-of: orca-dev
+spec:
+  replicas: 1
+  # Recreate: the data PVC is ReadWriteOnce, so the old pod must release
+  # it before the new one mounts it. Prevents a rolling update from
+  # deadlocking on the volume.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: garage
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: garage
+        app.kubernetes.io/part-of: orca-dev
+    spec:
+      containers:
+        - name: garage
+          image: {{ default "dxflrs/garage:v1.0.1" .GarageImage | quote }}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3900
+              name: s3
+              protocol: TCP
+            - containerPort: 3901
+              name: rpc
+              protocol: TCP
+            - containerPort: 3903
+              name: admin
+              protocol: TCP
+          lifecycle:
+            postStart:
+              exec:
+                # Idempotent bootstrap: layout, dev key, buckets. Runs
+                # in this container so `garage node id` resolves the
+                # server's own identity and RPC targets 127.0.0.1.
+                command: ["/bin/sh", "/etc/garage/bootstrap.sh"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 1
+              memory: 1Gi
+          readinessProbe:
+            tcpSocket:
+              port: 3900
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            tcpSocket:
+              port: 3900
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 5
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/garage
+            - name: config
+              mountPath: /etc/garage.toml
+              subPath: garage.toml
+              readOnly: true
+            - name: config
+              mountPath: /etc/garage/bootstrap.sh
+              subPath: bootstrap.sh
+              readOnly: true
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: garage-data
+        - name: config
+          configMap:
+            name: garage-config

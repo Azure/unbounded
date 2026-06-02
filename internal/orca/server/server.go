@@ -55,7 +55,7 @@ func NewEdgeHandler(fc edgeFetchAPI, cfg *config.Config, log *slog.Logger) *Edge
 
 // ServeHTTP routes incoming client requests.
 //
-// Routing (path-style only, since LocalStack and most dev clients
+// Routing (path-style only, since Garage and most dev clients
 // use path-style):
 //
 //	GET  /                                  -> ListBuckets (not supported; 501)

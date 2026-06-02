@@ -111,7 +111,7 @@ type Azureblob struct {
 }
 
 // AWSS3 is the awss3 origin adapter configuration. In dev this points
-// at LocalStack alongside the cachestore (different bucket); in
+// at Garage alongside the cachestore (different bucket); in
 // production it points at real AWS S3 with no Endpoint override.
 type AWSS3 struct {
 	Endpoint     string `yaml:"endpoint"` // empty for real AWS S3
@@ -119,7 +119,7 @@ type AWSS3 struct {
 	Bucket       string `yaml:"bucket"`
 	AccessKey    string `yaml:"access_key"`
 	SecretKey    string `yaml:"secret_key"`
-	UsePathStyle bool   `yaml:"use_path_style"` // true for LocalStack
+	UsePathStyle bool   `yaml:"use_path_style"` // true for Garage
 }
 
 // Cachestore is the in-DC chunk store configuration.
@@ -143,7 +143,7 @@ type CachestoreS3 struct {
 	Region       string `yaml:"region"`
 	AccessKey    string `yaml:"access_key"`
 	SecretKey    string `yaml:"secret_key"`
-	UsePathStyle bool   `yaml:"use_path_style"` // true for LocalStack
+	UsePathStyle bool   `yaml:"use_path_style"` // true for Garage
 }
 
 // Cluster captures peer discovery + internal-listener configuration.

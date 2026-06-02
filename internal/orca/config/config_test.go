@@ -270,7 +270,7 @@ func TestLoad_Validate(t *testing.T) {
 		},
 		{
 			name:    "missing cachestore endpoint",
-			yaml:    strings.ReplaceAll(validAwss3YAML, "endpoint: http://localstack:4566", "endpoint: \"\""),
+			yaml:    strings.ReplaceAll(validAwss3YAML, "endpoint: http://garage:3900", "endpoint: \"\""),
 			wantErr: "cachestore.s3.endpoint is required",
 		},
 		{
@@ -919,7 +919,7 @@ origin:
   id: test-origin
   driver: awss3
   awss3:
-    endpoint: http://localstack:4566
+    endpoint: http://garage:3900
     region: us-east-1
     bucket: orca-origin
     access_key: test
@@ -928,7 +928,7 @@ origin:
 cachestore:
   driver: s3
   s3:
-    endpoint: http://localstack:4566
+    endpoint: http://garage:3900
     bucket: orca-cache
     region: us-east-1
     access_key: test
