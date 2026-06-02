@@ -7,10 +7,10 @@ package inttest
 
 // Pinned container image tags. Bump centrally when upgrading.
 const (
-	// garageImage is the Garage S3-compatible store used for both the
-	// origin (awss3) and cachestore (s3) backends. Garage persists to
-	// disk and implements plain GET/PUT/HEAD, which is all Orca's
-	// stat-then-put commit needs (no If-None-Match conditional write).
+	// garageImage is the Garage image backing the S3-compatible store
+	// used for both the origin (awss3) and cachestore (s3) backends.
+	// Garage persists to disk and implements plain GET/PUT/HEAD, which
+	// is all Orca's stat-then-put commit needs.
 	garageImage = "dxflrs/garage:v1.0.1"
 
 	// azuriteImage is the Azurite (Azure Blob emulator) image. We pin

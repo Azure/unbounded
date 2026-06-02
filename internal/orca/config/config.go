@@ -111,15 +111,15 @@ type Azureblob struct {
 }
 
 // AWSS3 is the awss3 origin adapter configuration. In dev this points
-// at Garage alongside the cachestore (different bucket); in
-// production it points at real AWS S3 with no Endpoint override.
+// at the same S3-compatible store as the cachestore (different bucket);
+// in production it points at real AWS S3 with no Endpoint override.
 type AWSS3 struct {
 	Endpoint     string `yaml:"endpoint"` // empty for real AWS S3
 	Region       string `yaml:"region"`
 	Bucket       string `yaml:"bucket"`
 	AccessKey    string `yaml:"access_key"`
 	SecretKey    string `yaml:"secret_key"`
-	UsePathStyle bool   `yaml:"use_path_style"` // true for Garage
+	UsePathStyle bool   `yaml:"use_path_style"` // true for the S3-compatible dev backend
 }
 
 // Cachestore is the in-DC chunk store configuration.
@@ -129,7 +129,7 @@ type Cachestore struct {
 }
 
 // CachestoreS3 is the s3 driver configuration. In dev this points at
-// a self-hosted S3-compatible store (Garage); in production at VAST or
+// a self-hosted S3-compatible store; in production at VAST or
 // another in-DC S3-compatible store.
 //
 // Bucket versioning is unconditionally validated at startup: Orca's
@@ -143,7 +143,7 @@ type CachestoreS3 struct {
 	Region       string `yaml:"region"`
 	AccessKey    string `yaml:"access_key"`
 	SecretKey    string `yaml:"secret_key"`
-	UsePathStyle bool   `yaml:"use_path_style"` // true for Garage
+	UsePathStyle bool   `yaml:"use_path_style"` // true for the S3-compatible dev backend
 }
 
 // Cluster captures peer discovery + internal-listener configuration.

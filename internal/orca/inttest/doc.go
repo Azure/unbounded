@@ -16,7 +16,7 @@
 //
 // # Architecture
 //
-// The harness brings up real Garage and Azurite containers via
+// The harness brings up a real S3-compatible backend and Azurite containers via
 // testcontainers-go and constructs N in-process *app.App instances
 // wired to those containers. By default StartCluster runs 3 replicas,
 // matching the production deploy/orca topology.
@@ -34,7 +34,7 @@
 //
 // # Container lifecycle
 //
-// TestMain starts one Garage and one Azurite container per
+// TestMain starts one S3 backend and one Azurite container per
 // `go test` invocation; per-test buckets/containers prevent
 // cross-test interference.
 //

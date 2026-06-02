@@ -7,12 +7,11 @@
 // Commit safety rests on the content-addressed chunk layout: a chunk's
 // ETag is part of its storage path (see designs/orca/design.md s5), so
 // the only way two concurrent fills target the same key is when they
-// are writing byte-identical content. PutChunk therefore commits with a
+// are writing byte-identical content. PutChunk commits with a
 // stat-then-put step (HeadObject; if present, skip the upload and
-// report the existing object as the winner) rather than a no-clobber
-// conditional write. SelfTest is run at boot to verify the backend
-// provides read-after-write visibility, which the stat-then-put step
-// depends on.
+// report the existing object as the winner). SelfTest is run at boot to
+// verify the backend provides read-after-write visibility, which the
+// stat-then-put step depends on.
 package cachestore
 
 import (
@@ -26,7 +25,7 @@ import (
 
 // CacheStore is where chunk bytes physically live. Source of truth for
 // chunk presence; backed by an in-DC S3-like store in production and a
-// self-hosted S3-compatible store (Garage) in dev.
+// self-hosted S3-compatible store in dev.
 type CacheStore interface {
 	GetChunk(ctx context.Context, k chunk.Key, off, n int64) (io.ReadCloser, error)
 	PutChunk(ctx context.Context, k chunk.Key, size int64, r io.Reader) error

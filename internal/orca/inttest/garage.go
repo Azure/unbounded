@@ -51,14 +51,14 @@ api_bind_addr = "[::]:3903"
 admin_token = "orca-dev-admin-token"
 `
 
-// Garage is a running single-node Garage container with helper
-// accessors for constructing AWS S3 clients pointed at it. It replaces
-// the previous LocalStack harness: Orca's cachestore commit is
-// stat-then-put (HeadObject then PutObject) and needs no conditional
-// write, so any S3-compatible store works. Use NewS3Client to get a
+// S3Backend is the S3-compatible store the integration tests run
+// against, implemented as a single-node Garage container, with helper
+// accessors for constructing AWS S3 clients pointed at it. Orca's
+// cachestore commit is stat-then-put (HeadObject then PutObject), which
+// works against any S3-compatible store. Use NewS3Client to get a
 // configured client; use NewBucket to allocate a fresh bucket for a
 // single test.
-type Garage struct {
+type S3Backend struct {
 	container testcontainers.Container
 	endpoint  string
 	accessKey string
@@ -66,16 +66,16 @@ type Garage struct {
 }
 
 // AccessKey returns the access key bootstrapped for the test key.
-func (g *Garage) AccessKey() string { return g.accessKey }
+func (g *S3Backend) AccessKey() string { return g.accessKey }
 
 // SecretKey returns the secret key bootstrapped for the test key.
-func (g *Garage) SecretKey() string { return g.secretKey }
+func (g *S3Backend) SecretKey() string { return g.secretKey }
 
 // Endpoint returns the http:// URL of the Garage S3 API port.
-func (g *Garage) Endpoint() string { return g.endpoint }
+func (g *S3Backend) Endpoint() string { return g.endpoint }
 
 // Region returns the static region the harness uses with Garage.
-func (g *Garage) Region() string { return garageRegion }
+func (g *S3Backend) Region() string { return garageRegion }
 
 // keyInfoRe extracts the access key id and secret from
 // `garage key info --show-secret` output.
@@ -84,12 +84,12 @@ var (
 	keySecretRe = regexp.MustCompile(`(?m)^Secret key:\s+(\S+)`)
 )
 
-// StartGarage launches a single-node Garage container, assigns and
+// StartS3Backend launches a single-node Garage container, assigns and
 // applies a cluster layout, creates an S3 key with bucket-creation
 // rights, and returns a handle once the S3 API is reachable. Caller is
 // responsible for terminating the container (via container.Terminate or
 // t.Cleanup).
-func StartGarage(ctx context.Context) (*Garage, error) {
+func StartS3Backend(ctx context.Context) (*S3Backend, error) {
 	req := testcontainers.ContainerRequest{
 		Image:        garageImage,
 		ExposedPorts: []string{"3900/tcp"},
@@ -111,7 +111,7 @@ func StartGarage(ctx context.Context) (*Garage, error) {
 		return nil, fmt.Errorf("start garage: %w", err)
 	}
 
-	g := &Garage{container: c}
+	g := &S3Backend{container: c}
 
 	if err := g.bootstrap(ctx); err != nil {
 		_ = c.Terminate(ctx) //nolint:errcheck // best-effort cleanup
@@ -139,7 +139,7 @@ func StartGarage(ctx context.Context) (*Garage, error) {
 // freshly-started node into a usable single-node cluster with an S3 key:
 // wait for the node to appear, assign + apply a layout, create a key
 // with create-bucket rights, and capture its credentials.
-func (g *Garage) bootstrap(ctx context.Context) error {
+func (g *S3Backend) bootstrap(ctx context.Context) error {
 	// Resolve the node id (output is "<hex>@<addr>"; layout assign
 	// accepts the hex id or a unique prefix).
 	nodeID, err := g.pollNodeID(ctx)
@@ -180,7 +180,7 @@ func (g *Garage) bootstrap(ctx context.Context) error {
 
 // pollNodeID waits for the node to register and returns its id (the hex
 // portion before the @ in `garage node id`).
-func (g *Garage) pollNodeID(ctx context.Context) (string, error) {
+func (g *S3Backend) pollNodeID(ctx context.Context) (string, error) {
 	deadline := time.Now().Add(30 * time.Second)
 
 	for {
@@ -210,7 +210,7 @@ func (g *Garage) pollNodeID(ctx context.Context) (string, error) {
 
 // exec runs a command in the container and returns its combined output.
 // A non-zero exit code is returned as an error.
-func (g *Garage) exec(ctx context.Context, cmd []string) (string, error) {
+func (g *S3Backend) exec(ctx context.Context, cmd []string) (string, error) {
 	code, reader, err := g.container.Exec(ctx, cmd, tcexec.Multiplexed())
 	if err != nil {
 		return "", err
@@ -231,14 +231,14 @@ func (g *Garage) exec(ctx context.Context, cmd []string) (string, error) {
 }
 
 // Terminate stops and removes the Garage container.
-func (g *Garage) Terminate(ctx context.Context) error {
+func (g *S3Backend) Terminate(ctx context.Context) error {
 	return g.container.Terminate(ctx)
 }
 
 // NewS3Client returns an AWS S3 client with Garage-friendly settings
 // (path-style addressing, the bootstrapped credentials, checksum quirks
 // disabled to match the cachestore/s3 driver).
-func (g *Garage) NewS3Client(ctx context.Context, t *testing.T) *s3.Client {
+func (g *S3Backend) NewS3Client(ctx context.Context, t *testing.T) *s3.Client {
 	t.Helper()
 
 	cfg, err := awsconfig.LoadDefaultConfig(ctx,
@@ -261,7 +261,7 @@ func (g *Garage) NewS3Client(ctx context.Context, t *testing.T) *s3.Client {
 
 // NewBucket creates a fresh bucket and registers a t.Cleanup hook to
 // best-effort delete it. Returns the bucket name.
-func (g *Garage) NewBucket(ctx context.Context, t *testing.T, prefix string) string {
+func (g *S3Backend) NewBucket(ctx context.Context, t *testing.T, prefix string) string {
 	t.Helper()
 
 	cli := g.NewS3Client(ctx, t)

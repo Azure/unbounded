@@ -429,7 +429,7 @@ func (c *Coordinator) runFill(k chunk.Key, objectSize int64, f *fill) {
 	// longer mutated after io.Copy returned above.
 	release()
 
-	// Atomic commit to CacheStore (asynchronous from joiners'
+	// Commit to CacheStore (asynchronous from joiners'
 	// perspective; they have their bytes already).
 	commitErr := c.cs.PutChunk(ctx, k, int64(buf.Len()), bytes.NewReader(buf.Bytes()))
 

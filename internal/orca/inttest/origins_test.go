@@ -13,18 +13,18 @@ import (
 	"github.com/Azure/unbounded/internal/orca/origin/awss3"
 )
 
-// garageOrigin builds an awss3.Origin pointed at the package-level
-// Garage with the given bucket. Used by tests that need to wrap
+// s3BackendOrigin builds an awss3.Origin pointed at the package-level
+// S3 backend with the given bucket. Used by tests that need to wrap
 // the origin in a CountingOrigin decorator.
-func garageOrigin(ctx context.Context, t *testing.T, bucket string) (origin.Origin, error) {
+func s3BackendOrigin(ctx context.Context, t *testing.T, bucket string) (origin.Origin, error) {
 	t.Helper()
 
 	return awss3.New(ctx, awss3.Config{
-		Endpoint:     pkgGarage.Endpoint(),
-		Region:       pkgGarage.Region(),
+		Endpoint:     pkgS3.Endpoint(),
+		Region:       pkgS3.Region(),
 		Bucket:       bucket,
-		AccessKey:    pkgGarage.AccessKey(),
-		SecretKey:    pkgGarage.SecretKey(),
+		AccessKey:    pkgS3.AccessKey(),
+		SecretKey:    pkgS3.SecretKey(),
 		UsePathStyle: true,
 	}, nil)
 }

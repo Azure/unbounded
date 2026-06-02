@@ -2,9 +2,10 @@
 // Licensed under the MIT License.
 
 // Package awss3 is the AWS S3 (and S3-compatible) origin driver. It
-// targets either real AWS S3 or a local S3-compatible endpoint such as
-// Garage. Useful as a credential-free origin for the dev harness:
-// Garage acts as both origin and cachestore (different buckets).
+// targets either real AWS S3 or a local S3-compatible endpoint.
+// Useful as a credential-free origin for the dev harness, where the
+// same S3-compatible store acts as both origin and cachestore
+// (different buckets).
 //
 // This driver is read-only from Orca's perspective (Head, GetRange).
 // The seed step that uploads test objects to the origin bucket
@@ -43,25 +44,25 @@ type Adapter struct {
 // importing the whole config package.
 type Config struct {
 	// Endpoint, when set, overrides the regional default and routes
-	// requests at a custom URL (Garage uses
-	// http://garage:3900). Leave empty for real AWS S3.
+	// requests at a custom URL (the dev harness uses a local
+	// S3-compatible endpoint). Leave empty for real AWS S3.
 	Endpoint string
 
-	// Region is the AWS region. Garage validates it against its
-	// configured s3_region; the SDK requires a value.
+	// Region is the AWS region. Some S3-compatible backends validate
+	// it against their configured region; the SDK requires a value.
 	Region string
 
 	// Bucket is the source bucket holding origin objects.
 	Bucket string
 
-	// AccessKey / SecretKey are static credentials. For the Garage
-	// dev harness these are the deterministic GK-format dev keys; for
-	// real AWS, supply real creds.
+	// AccessKey / SecretKey are static credentials. For the dev
+	// harness these are deterministic dev keys; for real AWS, supply
+	// real creds.
 	AccessKey string
 	SecretKey string
 
-	// UsePathStyle: true for Garage (host-based addressing
-	// requires DNS wildcards the dev backend does not provide).
+	// UsePathStyle: true for the S3-compatible dev backend (host-based
+	// addressing requires DNS wildcards it does not provide).
 	UsePathStyle bool
 }
 

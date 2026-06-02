@@ -3,19 +3,17 @@
 
 // Package s3 is the cachestore driver for in-DC S3-compatible stores.
 // In production this targets VAST or another S3-compatible object
-// store; in dev it targets a self-hosted S3-compatible store (Garage).
+// store; in dev it targets a self-hosted S3-compatible store.
 //
 // Commit uses stat-then-put: HeadObject the chunk path, and if it is
 // already present skip the upload and report ErrCommitLost (another
-// replica won the fill race). This needs only GET/PUT/HEAD, so it works
-// against any S3-compatible backend, not just those that implement the
-// If-None-Match: * conditional-write precondition. Correctness rests on
-// the content-addressed layout: the ETag is part of the chunk path, so
-// two writers racing on the same key always carry byte-identical bytes
-// (see designs/orca/design.md s8). The boot SelfTest verifies
-// read-after-write visibility; the versioning gate refuses versioned
-// buckets, where retaining every overwrite of an immutable chunk would
-// only waste space.
+// replica won the fill race). This needs only GET/PUT/HEAD. Correctness
+// rests on the content-addressed layout: the ETag is part of the chunk
+// path, so two writers racing on the same key always carry
+// byte-identical bytes (see designs/orca/design.md s8). The boot
+// SelfTest verifies read-after-write visibility; the versioning gate
+// refuses versioned buckets, where retaining every overwrite of an
+// immutable chunk would only waste space.
 package s3
 
 import (
@@ -485,9 +483,9 @@ func randHex(n int) (string, error) {
 		// crypto/rand failure is extraordinary on Linux. Surface it
 		// to the selftest caller rather than masking with a
 		// time-based fallback: a fallback could collide on parallel
-		// boots and silently fail the first-put precondition, and
-		// the underlying entropy / sandbox issue is operator-
-		// actionable in its own right.
+		// boots and corrupt the read-after-write probe, and the
+		// underlying entropy / sandbox issue is operator-actionable
+		// in its own right.
 		return "", fmt.Errorf("cachestore/s3: rand.Read: %w", err)
 	}
 

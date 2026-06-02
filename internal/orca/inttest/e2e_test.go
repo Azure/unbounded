@@ -20,7 +20,7 @@ import (
 
 // e2e_test.go is the canonical end-to-end suite for orca: every
 // scenario runs against a 3-replica in-process cluster pointed at
-// Garage. Tests that exercise chunk fetching naturally exercise
+// the S3 backend. Tests that exercise chunk fetching naturally exercise
 // both the local-fill path (when self happens to win rendezvous for
 // a chunk) and the cross-replica /internal/fill path (when a peer
 // wins).
@@ -29,8 +29,8 @@ import (
 // HTTP error mapping, range parsing, chunk arithmetic, config env
 // fallback) lives as fast unit tests in the respective driver / server
 // / chunk / config packages. The scenarios here are reserved for
-// behavior that can only be verified end-to-end against real
-// Garage (or Azurite, in azure_test.go) plus a real cluster of
+// behavior that can only be verified end-to-end against a real
+// S3 backend (or Azurite, in azure_test.go) plus a real cluster of
 // in-process orca instances.
 
 // TestColdAndWarmGet exercises GET twice for the same single-chunk
@@ -43,12 +43,12 @@ func TestColdAndWarmGet(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
 	defer cancel()
 
-	bucket := pkgGarage.NewBucket(ctx, t, "orca-origin")
+	bucket := pkgS3.NewBucket(ctx, t, "orca-origin")
 	blob := SmallBlob()
-	SeedS3(ctx, t, pkgGarage.NewS3Client(ctx, t), bucket, []SeedBlob{blob})
+	SeedS3(ctx, t, pkgS3.NewS3Client(ctx, t), bucket, []SeedBlob{blob})
 
 	cl := StartCluster(ctx, t, ClusterOptions{
-		Garage:       pkgGarage,
+		S3Backend:    pkgS3,
 		OriginBucket: bucket,
 	})
 
@@ -65,7 +65,7 @@ func TestColdAndWarmGet(t *testing.T) {
 		t.Errorf("expected ETag header on cold GET")
 	}
 
-	DeleteS3Object(ctx, t, pkgGarage.NewS3Client(ctx, t), bucket, blob.Key)
+	DeleteS3Object(ctx, t, pkgS3.NewS3Client(ctx, t), bucket, blob.Key)
 
 	warm := cl.Get(1).HTTP.Get(ctx, t, bucket, blob.Key)
 	if warm.Status != http.StatusOK {
@@ -89,13 +89,13 @@ func TestRangedGet(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 120*time.Second)
 	defer cancel()
 
-	bucket := pkgGarage.NewBucket(ctx, t, "orca-origin")
+	bucket := pkgS3.NewBucket(ctx, t, "orca-origin")
 	medium := MediumBlob() // 1.5 MiB == 2 chunks at 1 MiB
 	huge := HugeBlob()     // 64 MiB == 64 chunks at 1 MiB
-	SeedS3(ctx, t, pkgGarage.NewS3Client(ctx, t), bucket, []SeedBlob{medium, huge})
+	SeedS3(ctx, t, pkgS3.NewS3Client(ctx, t), bucket, []SeedBlob{medium, huge})
 
 	cl := StartCluster(ctx, t, ClusterOptions{
-		Garage:       pkgGarage,
+		S3Backend:    pkgS3,
 		OriginBucket: bucket,
 	})
 
@@ -166,12 +166,12 @@ func TestMultiChunkGet(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 120*time.Second)
 	defer cancel()
 
-	bucket := pkgGarage.NewBucket(ctx, t, "orca-origin")
+	bucket := pkgS3.NewBucket(ctx, t, "orca-origin")
 	blob := HugeBlob()
-	SeedS3(ctx, t, pkgGarage.NewS3Client(ctx, t), bucket, []SeedBlob{blob})
+	SeedS3(ctx, t, pkgS3.NewS3Client(ctx, t), bucket, []SeedBlob{blob})
 
 	cl := StartCluster(ctx, t, ClusterOptions{
-		Garage:       pkgGarage,
+		S3Backend:    pkgS3,
 		OriginBucket: bucket,
 	})
 
@@ -196,14 +196,14 @@ func TestRendezvousCoordinatorRouting(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 90*time.Second)
 	defer cancel()
 
-	bucket := pkgGarage.NewBucket(ctx, t, "orca-origin")
+	bucket := pkgS3.NewBucket(ctx, t, "orca-origin")
 	blob := SmallBlob()
-	SeedS3(ctx, t, pkgGarage.NewS3Client(ctx, t), bucket, []SeedBlob{blob})
+	SeedS3(ctx, t, pkgS3.NewS3Client(ctx, t), bucket, []SeedBlob{blob})
 
-	count := newCountingOriginForGarage(ctx, t, bucket)
+	count := newCountingOriginForS3Backend(ctx, t, bucket)
 
 	cl := StartCluster(ctx, t, ClusterOptions{
-		Garage:         pkgGarage,
+		S3Backend:      pkgS3,
 		OriginBucket:   bucket,
 		OriginOverride: count,
 	})
@@ -265,14 +265,14 @@ func TestSingleflightCollapse(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 120*time.Second)
 	defer cancel()
 
-	bucket := pkgGarage.NewBucket(ctx, t, "orca-origin")
+	bucket := pkgS3.NewBucket(ctx, t, "orca-origin")
 	blob := HugeBlob() // 64 chunks
-	SeedS3(ctx, t, pkgGarage.NewS3Client(ctx, t), bucket, []SeedBlob{blob})
+	SeedS3(ctx, t, pkgS3.NewS3Client(ctx, t), bucket, []SeedBlob{blob})
 
-	count := newCountingOriginForGarage(ctx, t, bucket)
+	count := newCountingOriginForS3Backend(ctx, t, bucket)
 
 	cl := StartCluster(ctx, t, ClusterOptions{
-		Garage:         pkgGarage,
+		S3Backend:      pkgS3,
 		OriginBucket:   bucket,
 		OriginOverride: count,
 	})
@@ -350,14 +350,14 @@ func TestPeerNotCoordinatorFallback(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 90*time.Second)
 	defer cancel()
 
-	bucket := pkgGarage.NewBucket(ctx, t, "orca-origin")
+	bucket := pkgS3.NewBucket(ctx, t, "orca-origin")
 	blob := SmallBlob()
-	SeedS3(ctx, t, pkgGarage.NewS3Client(ctx, t), bucket, []SeedBlob{blob})
+	SeedS3(ctx, t, pkgS3.NewS3Client(ctx, t), bucket, []SeedBlob{blob})
 
 	wrap := NewCountingInternalHandlerWrap()
 
 	cl := StartCluster(ctx, t, ClusterOptions{
-		Garage:              pkgGarage,
+		S3Backend:           pkgS3,
 		OriginBucket:        bucket,
 		InternalHandlerWrap: wrap,
 	})
@@ -455,12 +455,12 @@ func TestPeerNotCoordinatorFallback(t *testing.T) {
 	}
 }
 
-func newCountingOriginForGarage(ctx context.Context, t *testing.T, bucket string) *CountingOrigin {
+func newCountingOriginForS3Backend(ctx context.Context, t *testing.T, bucket string) *CountingOrigin {
 	t.Helper()
 
-	or, err := garageOrigin(ctx, t, bucket)
+	or, err := s3BackendOrigin(ctx, t, bucket)
 	if err != nil {
-		t.Fatalf("garageOrigin: %v", err)
+		t.Fatalf("s3BackendOrigin: %v", err)
 	}
 
 	return NewCountingOrigin(or)

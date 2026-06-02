@@ -29,12 +29,12 @@ func TestS3Errors(t *testing.T) {
 	// subtests finish instead.
 	t.Cleanup(cancel)
 
-	bucket := pkgGarage.NewBucket(ctx, t, "orca-origin")
+	bucket := pkgS3.NewBucket(ctx, t, "orca-origin")
 	blob := SmallBlob()
-	SeedS3(ctx, t, pkgGarage.NewS3Client(ctx, t), bucket, []SeedBlob{blob})
+	SeedS3(ctx, t, pkgS3.NewS3Client(ctx, t), bucket, []SeedBlob{blob})
 
 	cl := StartCluster(ctx, t, ClusterOptions{
-		Garage:       pkgGarage,
+		S3Backend:    pkgS3,
 		OriginBucket: bucket,
 	})
 

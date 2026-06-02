@@ -16,24 +16,24 @@ import (
 // Package-level container handles shared across tests in this package.
 // TestMain brings them up once and tears them down at the end.
 var (
-	pkgGarage  *Garage
+	pkgS3      *S3Backend
 	pkgAzurite *Azurite
 )
 
-// TestMain provisions Garage + Azurite once per `go test` run.
+// TestMain provisions the S3 backend + Azurite once per `go test` run.
 // Per-test buckets / containers are allocated inside individual tests
 // to avoid cross-test interference.
 func TestMain(m *testing.M) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	gr, err := StartGarage(ctx)
+	gr, err := StartS3Backend(ctx)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "TestMain: start garage: %v\n", err)
+		fmt.Fprintf(os.Stderr, "TestMain: start s3 backend: %v\n", err)
 		os.Exit(1)
 	}
 
-	pkgGarage = gr
+	pkgS3 = gr
 
 	az, err := StartAzurite(ctx)
 	if err != nil {
@@ -52,7 +52,7 @@ func TestMain(m *testing.M) {
 	defer termCancel()
 
 	_ = pkgAzurite.Terminate(termCtx) //nolint:errcheck // best-effort
-	_ = pkgGarage.Terminate(termCtx)  //nolint:errcheck // best-effort
+	_ = pkgS3.Terminate(termCtx)      //nolint:errcheck // best-effort
 
 	os.Exit(code)
 }

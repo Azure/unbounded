@@ -21,18 +21,18 @@ import (
 )
 
 // newCachestoreDriver builds a cachestore/s3 driver pointed at a fresh
-// Garage bucket. Mirrors how app.go wires the production driver.
+// S3-backend bucket. Mirrors how app.go wires the production driver.
 func newCachestoreDriver(ctx context.Context, t *testing.T) (*cachestores3.Driver, string) {
 	t.Helper()
 
-	bucket := pkgGarage.NewBucket(ctx, t, "orca-cache")
+	bucket := pkgS3.NewBucket(ctx, t, "orca-cache")
 
 	d, err := cachestores3.New(ctx, cachestores3.Config{
-		Endpoint:     pkgGarage.Endpoint(),
+		Endpoint:     pkgS3.Endpoint(),
 		Bucket:       bucket,
-		Region:       pkgGarage.Region(),
-		AccessKey:    pkgGarage.AccessKey(),
-		SecretKey:    pkgGarage.SecretKey(),
+		Region:       pkgS3.Region(),
+		AccessKey:    pkgS3.AccessKey(),
+		SecretKey:    pkgS3.SecretKey(),
 		UsePathStyle: true,
 	}, nil)
 	if err != nil {
@@ -54,24 +54,23 @@ func testChunkKey() chunk.Key {
 	}
 }
 
-// TestCachestoreSelfTest_PassesAgainstGarage verifies the boot-time
-// read-after-write self-test succeeds against Garage. This is the gate
-// app.go runs before serving; a regression here means orca would refuse
-// to start against Garage.
-func TestCachestoreSelfTest_PassesAgainstGarage(t *testing.T) {
+// TestCachestoreSelfTest_PassesAgainstS3Backend verifies the boot-time
+// read-after-write self-test succeeds against the S3 backend. This is
+// the gate app.go runs before serving; a regression here means orca
+// would refuse to start against the backend.
+func TestCachestoreSelfTest_PassesAgainstS3Backend(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
 	defer cancel()
 
 	d, _ := newCachestoreDriver(ctx, t)
 
 	if err := d.SelfTest(ctx); err != nil {
-		t.Fatalf("SelfTest against Garage: %v", err)
+		t.Fatalf("SelfTest against S3 backend: %v", err)
 	}
 }
 
 // TestCachestoreCommit_StatThenPut verifies the stat-then-put commit
-// semantics end-to-end against a real S3-compatible backend (Garage,
-// which does NOT implement If-None-Match conditional writes):
+// semantics end-to-end against a real S3-compatible backend:
 //
 //   - the first PutChunk for a key stores the bytes,
 //   - a second PutChunk for the same key returns ErrCommitLost and
