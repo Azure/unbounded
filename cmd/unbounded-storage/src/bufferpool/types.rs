@@ -4,42 +4,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-/// Pinned, NUMA-local backing. The embedder allocates it (e.g.
-/// `mmap(MAP_HUGETLB | MAP_HUGE_2MB)`); the pool just carves pages
-/// out of it. `_own` holds the Drop handle for the underlying
-/// allocation; the pool never touches it.
-///
-/// `base` is a raw pointer, so `Backing` is `!Send + !Sync` by
-/// default. The pool relies on the embedder upholding the per-NUMA
-/// pinning invariant and adds `unsafe impl Send + Sync` so
-/// `Pool<T, S>` can be constructed off the executor thread before
-/// being handed to the pinned executor for service.
-pub struct Backing {
-    pub base: *mut u8,
-    pub page_size: usize,
-    pub page_count: usize,
-    /// Drop carrier for the underlying allocation. The pool never
-    /// touches this; it exists so the mapping outlives the pool.
-    pub _own: Box<dyn Send + Sync>,
-}
-
-// SAFETY: per-NUMA pinning is the embedder's responsibility (see
-// the design's "Constraints" section). Inside its NUMA shard the
-// `Backing` is owned by a single-threaded `Pool`; we mark it
-// `Send + Sync` so the constructed `Pool` can be moved onto the
-// pinned executor thread.
-unsafe impl Send for Backing {}
-unsafe impl Sync for Backing {}
-
-impl fmt::Debug for Backing {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Backing")
-            .field("base", &self.base)
-            .field("page_size", &self.page_size)
-            .field("page_count", &self.page_count)
-            .finish()
-    }
-}
+use serde::{Deserialize, Serialize};
 
 /// Stable page identity. `page_idx` indexes into the pool's backing
 /// as `u32`; `u16` would cap the backing at 128 GiB at 2 MiB pages,
@@ -55,7 +20,7 @@ pub struct PageRef {
 
 /// Opaque content-addressed identifier for a 1 GiB stripe. The pool
 /// uses it only for `==`/`hash` in single-flight coalescing.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct StripeKey(pub [u8; 32]);
 
 /// A byte range within a peer-side stripe, passed to

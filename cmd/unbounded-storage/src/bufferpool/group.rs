@@ -13,7 +13,7 @@ use crate::runtime::WorkerIdx;
 #[derive(Clone, Debug)]
 pub struct ShardDescriptor {
     /// Worker slot this shard runs on. Matches the `WorkerIdx`
-    /// passed to `Threading::run_worker` for the shard's thread.
+    /// passed to `Threading::spawn_pinned` for the shard's thread.
     pub worker_idx: WorkerIdx,
     /// NUMA node this shard is pinned against, if the runtime is
     /// NUMA-aware. `None` for the TCP-fallback / non-pinning case.

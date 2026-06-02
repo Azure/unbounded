@@ -10,16 +10,19 @@
 //! response (caching, admission, eviction) is the storage layer's
 //! decision and lives entirely under [`crate::storage`].
 
+mod finger_router;
 mod fingers;
+mod handler;
 mod ring;
+mod transport;
 mod types;
 
 #[cfg(test)]
 mod tests;
 
+pub use finger_router::FingerRouter;
 pub use fingers::{FingerTable, FingerTableConfig};
-pub(crate) use ring::{
-    WILDCARD_LABEL, node_to_ring, rendezvous_hash, ring_distance, topology_distance,
-};
-pub use ring::{splitmix64, stripe_to_ring};
+pub use handler::{RecursiveHandler, RecursiveHandlerError, RecursiveHandlerStream};
+pub use ring::{node_to_ring, splitmix64, stripe_to_ring};
+pub use transport::{RoutedStream, RoutedTransport};
 pub use types::{NodeId, P2pReq, PeerEntry, RingId, TopologyLabels};

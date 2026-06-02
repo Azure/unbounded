@@ -39,7 +39,8 @@ unsafe impl Sync for ProgressThread {}
 
 impl ProgressThread {
     /// Spawn a progress thread driving `cq`. The thread is pinned via
-    /// `cfg.runtime.spawn_aux` to the same NUMA node as `cfg.worker_idx`.
+    /// `cfg.runtime.spawn_pinned` to the same NUMA node as
+    /// `cfg.worker_idx`.
     ///
     /// Ownership note: the spawned thread reads `cq` without owning it;
     /// the caller (the `Fabric`) must outlive the `ProgressThread` and
@@ -52,7 +53,7 @@ impl ProgressThread {
         let thread_shutdown = shutdown.clone();
         let thread_errors = transient_errors.clone();
 
-        let handle = cfg.runtime.spawn_aux(
+        let handle = cfg.runtime.spawn_pinned(
             cfg.worker_idx,
             name,
             Box::new(move || {
@@ -236,7 +237,7 @@ mod tests {
     }
 
     #[test]
-    fn spawn_aux_path_runs_and_shuts_down_cleanly() {
+    fn spawn_pinned_path_runs_and_shuts_down_cleanly() {
         // Exercises spawn -> drop without any libfabric handle. We
         // run the real `spawn` path via the DefaultRuntime and a
         // null CQ pointer; the thread immediately observes the
@@ -247,7 +248,7 @@ mod tests {
         let errors = Arc::new(AtomicU64::new(0));
         let s = shutdown.clone();
         let e = errors.clone();
-        let h = rt.spawn_aux(
+        let h = rt.spawn_pinned(
             WorkerIdx(0),
             "fabric-progress-test",
             Box::new(move || progress_loop(CqPtr(std::ptr::null_mut()), s, e, 1)),

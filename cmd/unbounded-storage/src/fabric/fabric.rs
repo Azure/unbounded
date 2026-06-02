@@ -9,6 +9,7 @@
 
 use std::ffi::CString;
 use std::ptr;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
 
 use super::completion::CompletionRegistry;
@@ -44,6 +45,21 @@ pub(crate) struct FabricInner {
     /// is owned by this `Vec` and dropped on fabric shutdown. The
     /// `MrHandle` itself does not close the MR.
     pub(crate) mrs: RwLock<Vec<*mut ffi::fid_mr>>,
+    /// Monotonic source of application-supplied MR keys. Providers that
+    /// do not advertise `FI_MR_PROV_KEY` (for example the `tcp` RDM
+    /// provider) require the caller to assign a distinct `requested_key`
+    /// to every `fi_mr_reg`; reusing a key returns `FI_ENOKEY`. We hand
+    /// out a fresh key per registration so multiple backings (the data
+    /// region plus the RPC scratch region) can coexist. Providers that
+    /// do assign their own keys simply ignore the requested value.
+    pub(crate) next_mr_key: AtomicU64,
+    /// Whether the negotiated provider addresses remote RMA targets by
+    /// virtual address (`FI_MR_VIRT_ADDR` set in the domain `mr_mode`)
+    /// or by a 0-based offset into the registered MR. The `tcp` RDM
+    /// provider clears `mr_mode` to 0 here, so remote targets are
+    /// offsets; verbs typically uses virtual addresses. The remote base
+    /// advertised in an RPC request header is derived from this.
+    pub(crate) mr_virt_addr: bool,
     /// One progress thread per CQ. Dropped before the CQ/EP/AV/domain/fabric
     /// teardown in `FabricInner::drop` so the threads join before we
     /// close their CQs.
@@ -68,10 +84,12 @@ impl Fabric {
     pub fn new(cfg: FabricConfig) -> Result<Self> {
         cfg.validate()?;
 
-        let prov_cstr = match cfg.provider {
-            Provider::Verbs => CString::new("verbs").expect("static literal"),
-            Provider::Tcp => CString::new("tcp").expect("static literal"),
+        let prov_name: &str = match cfg.provider {
+            Provider::Verbs => "verbs",
+            Provider::Tcp => "tcp",
         };
+        let prov_cstr =
+            CString::new(prov_name).map_err(|_| FabricError::BadConfig("provider name has NUL"))?;
 
         let hints = unsafe { ffi::ub_fi_build_hints(prov_cstr.as_ptr()) };
         if hints.is_null() {
@@ -79,14 +97,32 @@ impl Fabric {
         }
         let _hints_guard = FreeInfoOnDrop(hints);
 
-        let service_cstr: Option<CString> = match cfg.provider {
-            Provider::Tcp => cfg
-                .listen_addr
-                .as_deref()
-                .map(|s| CString::new(s).map_err(|_| FabricError::BadConfig("listen_addr has NUL")))
-                .transpose()?,
-            Provider::Verbs => None,
+        // libfabric expects the local address split into a `node`
+        // (host) and a `service` (port); passing the combined
+        // "host:port" string as `service` makes `fi_getinfo` fail
+        // (getaddrinfo cannot parse it). Split on the final ':' so
+        // IPv4 "127.0.0.1:9101" becomes node="127.0.0.1",
+        // service="9101".
+        let (node_cstr, service_cstr): (Option<CString>, Option<CString>) = match cfg.provider {
+            Provider::Tcp => match cfg.listen_addr.as_deref() {
+                Some(addr) => {
+                    let (host, port) = addr
+                        .rsplit_once(':')
+                        .ok_or(FabricError::BadConfig("listen_addr must be host:port"))?;
+                    let host = CString::new(host)
+                        .map_err(|_| FabricError::BadConfig("listen_addr has NUL"))?;
+                    let port = CString::new(port)
+                        .map_err(|_| FabricError::BadConfig("listen_addr has NUL"))?;
+                    (Some(host), Some(port))
+                }
+                None => (None, None),
+            },
+            Provider::Verbs => (None, None),
         };
+        let node_ptr = node_cstr
+            .as_ref()
+            .map(|s| s.as_ptr())
+            .unwrap_or(ptr::null());
         let service_ptr = service_cstr
             .as_ref()
             .map(|s| s.as_ptr())
@@ -96,8 +132,8 @@ impl Fabric {
         let mut info: *mut ffi::fi_info = ptr::null_mut();
         let rc = unsafe {
             ffi::fi_getinfo(
-                ffi::FI_VERSION,
-                ptr::null(),
+                ffi::requested_version(),
+                node_ptr,
                 service_ptr,
                 flags,
                 hints,
@@ -109,6 +145,13 @@ impl Fabric {
             return Err(FabricError::NotFound("fi_getinfo returned no info"));
         }
         let info_guard = FreeInfoOnDrop(info);
+
+        // Remote RMA addressing mode is fixed by the provider's
+        // negotiated mr_mode. With FI_MR_VIRT_ADDR the remote target is
+        // the registered virtual address; without it (the tcp RDM provider)
+        // it is a 0-based offset into the MR.
+        let mr_mode = unsafe { ffi::ub_fi_info_mr_mode(info) };
+        let mr_virt_addr = (mr_mode & ffi::FI_MR_VIRT_ADDR) != 0;
 
         // From here on we accumulate libfabric resources and must
         // release them on any error path. We do that by building
@@ -214,6 +257,8 @@ impl Fabric {
                     cfg: cfg.clone(),
                     connections: ConnectionTable::new(),
                     mrs: RwLock::new(Vec::new()),
+                    next_mr_key: AtomicU64::new(0),
+                    mr_virt_addr,
                     progress,
                     progress_cqs: cq_raw,
                     completions,
@@ -273,6 +318,12 @@ impl Fabric {
 
     pub(crate) fn inner_arc(&self) -> Arc<FabricInner> {
         self.inner.clone()
+    }
+
+    /// True when the negotiated provider addresses remote RMA targets
+    /// by virtual address; false when it uses 0-based MR offsets.
+    pub(crate) fn mr_uses_virtual_addr(&self) -> bool {
+        self.inner.mr_virt_addr
     }
 }
 
@@ -376,7 +427,7 @@ mod tests {
         let mut info: *mut ffi::fi_info = ptr::null_mut();
         let rc = unsafe {
             ffi::fi_getinfo(
-                ffi::FI_VERSION,
+                ffi::requested_version(),
                 ptr::null(),
                 ptr::null(),
                 0,

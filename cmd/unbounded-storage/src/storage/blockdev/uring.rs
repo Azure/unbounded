@@ -52,7 +52,8 @@ use std::task::{Context, Poll, Waker};
 
 use io_uring::{IoUring, opcode, types};
 
-use super::BlockDevice;
+use super::{BlockDevice, CoreLocalDevice};
+use crate::ring::{StorageRing, StorageRingConfig};
 use crate::storage::types::{Error, Lba};
 
 /// Knobs for opening a [`UringBlockDevice`]. The defaults are what
@@ -356,16 +357,30 @@ impl BlockDevice for UringBlockDevice {
 
     fn register_buffers(&self, base: *mut u8, len: usize) -> Result<(), Error> {
         let nn = NonNull::new(base).ok_or(Error::Io(libc::EINVAL))?;
-        {
+        // Compute `was_nonempty` up front so we do not hold a borrow
+        // of `self.registered` across the unsafe block, where the
+        // mirror gets mutated.
+        let was_nonempty = {
             let regs = self.registered.borrow();
             if regs.len() as u32 >= self.slot_capacity {
                 return Err(Error::Io(libc::ENOSPC));
             }
-        }
+            !regs.is_empty()
+        };
         // The io-uring 0.6 surface only exposes the "replace the
-        // whole table" form, so re-register every region every
-        // time. Registration is open-time only (no in-flight I/O),
-        // so the unregister-then-register window is fine.
+        // whole table" form, so re-register every region every time.
+        //
+        // INVARIANT: `self.registered` must always mirror the
+        // kernel-side table. This path is NOT open-time only:
+        // `shard_view::replay_locked` re-registers buffers at runtime
+        // during a hot-swap. `unregister_buffers` empties the kernel
+        // table, so if the subsequent `register_buffers` fails we must
+        // leave the mirror EMPTY (matching the now-empty kernel table)
+        // rather than the stale prior set; otherwise `resolve_buf_index`
+        // would hand out indices into a table the kernel no longer has
+        // and every later READ_FIXED/WRITE_FIXED would fail with EFAULT.
+        // The error is still propagated, so the caller (replay) must
+        // tolerate a returned error.
         let mut new_regs = self.registered.borrow().clone();
         new_regs.push(RegisteredBuf { base: nn, len });
         let iovs: Vec<libc::iovec> = new_regs
@@ -379,20 +394,18 @@ impl BlockDevice for UringBlockDevice {
         // caller that owns the region for the lifetime of the
         // device; we keep `new_regs` parallel to the kernel-side
         // table.
-        unsafe {
+        let register_result = unsafe {
             let submitter = self.ring.borrow();
             let submitter = submitter.submitter();
             // If there is already a table, drop it first; the
             // kernel rejects a second `register_buffers` otherwise.
-            if !self.registered.borrow().is_empty() {
+            if was_nonempty {
                 let _ = submitter.unregister_buffers();
             }
-            submitter
-                .register_buffers(&iovs)
-                .map_err(io_err_to_storage)?;
-        }
-        *self.registered.borrow_mut() = new_regs;
-        Ok(())
+            submitter.register_buffers(&iovs).map_err(io_err_to_storage)
+        };
+        let mut mirror = self.registered.borrow_mut();
+        apply_registration_result(&mut mirror, new_regs, register_result)
     }
 
     async fn read(&self, lba: Lba, dst: &mut [u8]) -> Result<(), Error> {
@@ -400,7 +413,11 @@ impl BlockDevice for UringBlockDevice {
             return Err(Error::Io(libc::EINVAL));
         }
         let n_pages = (dst.len() / self.page_size) as u64;
-        if lba.0.checked_add(n_pages).is_none_or(|end| end > self.capacity_pages) {
+        if lba
+            .0
+            .checked_add(n_pages)
+            .is_none_or(|end| end > self.capacity_pages)
+        {
             return Err(Error::OutOfRange);
         }
         // Locate which registered region holds `dst` so we can
@@ -426,22 +443,22 @@ impl BlockDevice for UringBlockDevice {
             return Err(Error::Io(libc::EINVAL));
         }
         let n_pages = (src.len() / self.page_size) as u64;
-        if lba.0.checked_add(n_pages).is_none_or(|end| end > self.capacity_pages) {
+        if lba
+            .0
+            .checked_add(n_pages)
+            .is_none_or(|end| end > self.capacity_pages)
+        {
             return Err(Error::OutOfRange);
         }
         // See [`Self::read`] for buf_index resolution.
         let buf_index = self.resolve_buf_index(src.as_ptr(), src.len())?;
         let user_data = self.alloc_user_data();
         let offset = lba.0.saturating_mul(self.page_size as u64);
-        let sqe = opcode::WriteFixed::new(
-            types::Fixed(0),
-            src.as_ptr(),
-            src.len() as u32,
-            buf_index,
-        )
-        .offset(offset)
-        .build()
-        .user_data(user_data);
+        let sqe =
+            opcode::WriteFixed::new(types::Fixed(0), src.as_ptr(), src.len() as u32, buf_index)
+                .offset(offset)
+                .build()
+                .user_data(user_data);
         self.submit_fixed_io(sqe, src.len()).await
     }
 
@@ -525,6 +542,88 @@ impl<'a> Future for IoFut<'a> {
     }
 }
 
+/// Opens a disk for a pinned storage core.
+///
+/// Unlike [`UringBlockDevice`], which owns its ring and is therefore
+/// `!Send`, this path produces a [`StorageRing`] the storage core owns
+/// separately (so it can install the ring into the thread-local
+/// registry and drive it alongside the engine) plus a `Send + Sync`
+/// [`CoreLocalDevice`] that resolves that ring at call time. The whole
+/// block-device lifecycle - io_uring setup flags, `O_DIRECT`, the
+/// `BLKGETSIZE64` capacity probe, and file registration - lives here
+/// rather than in the supervisor.
+pub struct UringDevice;
+
+impl UringDevice {
+    /// Open `path` for a storage core: build the ring per `ring_cfg`,
+    /// open the file (`O_DIRECT` when the ring uses `IOPOLL`), size it
+    /// (via `metadata().len()`, falling back to `BLKGETSIZE64` for raw
+    /// block devices), register its fd to get a `Fixed` index, and bind
+    /// the geometry into a [`CoreLocalDevice`].
+    ///
+    /// The syscall order is exactly: ring construction, file open,
+    /// capacity probe, file registration. The returned [`OpenDisk`]
+    /// hands the ring back un-wrapped; the caller is responsible for
+    /// installing it into the thread-local registry
+    /// ([`set_current_storage_ring`](crate::ring::set_current_storage_ring))
+    /// on the storage-core thread, and for keeping [`OpenDisk::file`]
+    /// alive for as long as the ring's registered file table addresses
+    /// it.
+    pub fn open(
+        path: &Path,
+        ring_cfg: StorageRingConfig,
+        page_size: usize,
+    ) -> Result<OpenDisk, OpenError> {
+        let ring = StorageRing::new(ring_cfg).map_err(OpenError::Ring)?;
+        // IOPOLL requires O_DIRECT; mirror that on the file open.
+        let file = open_file(path, ring_cfg.iopoll).map_err(OpenError::OpenFile)?;
+        let capacity_pages = file_capacity_pages(&file, page_size).map_err(OpenError::Capacity)?;
+        let file_index = ring
+            .register_file(file.as_raw_fd())
+            .map_err(OpenError::RegisterFile)?;
+        let device =
+            CoreLocalDevice::new(file_index, page_size, capacity_pages, ring_cfg.queue_depth);
+        Ok(OpenDisk { device, ring, file })
+    }
+}
+
+/// Product of [`UringDevice::open`]: the engine-facing device, the ring
+/// it resolves I/O through, and the owned backing file.
+pub struct OpenDisk {
+    /// `Send + Sync` device the engine is built on. Resolves the ring
+    /// from the thread-local registry at call time.
+    pub device: CoreLocalDevice,
+    /// Ring the storage core installs into the registry and drives via
+    /// [`StorageRing::progress`].
+    pub ring: StorageRing,
+    /// Owned fd backing the registered `Fixed` file. The kernel holds
+    /// its own reference once the fd is registered, but the caller keeps
+    /// this for the storage core's lifetime so the fd is not closed out
+    /// from under the ring.
+    pub file: File,
+}
+
+/// Failure from [`UringDevice::open`], tagged by the phase that failed
+/// so the supervisor surfaces the same diagnostic it did when this
+/// logic was inline on the storage-core thread.
+pub enum OpenError {
+    Ring(Error),
+    OpenFile(Error),
+    Capacity(Error),
+    RegisterFile(Error),
+}
+
+impl std::fmt::Display for OpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OpenError::Ring(e) => write!(f, "storage ring: {e}"),
+            OpenError::OpenFile(e) => write!(f, "open disk: {e}"),
+            OpenError::Capacity(e) => write!(f, "disk capacity: {e}"),
+            OpenError::RegisterFile(e) => write!(f, "register file: {e}"),
+        }
+    }
+}
+
 /// Pop the oldest waker from `v`, treating it as a FIFO. `Vec` is
 /// fine here because the queue is bounded by `queue_depth` and we
 /// only manipulate it on the owning thread.
@@ -533,6 +632,31 @@ fn pop_front_waker(v: &mut Vec<Waker>) -> Option<Waker> {
         None
     } else {
         Some(v.remove(0))
+    }
+}
+
+/// Reconcile the local mirror of the kernel registered-buffer table
+/// after a "unregister then register" swap.
+///
+/// By the time this is called the kernel table has already been
+/// emptied (`unregister_buffers`) and re-registration attempted. On
+/// success the mirror becomes the full `new_regs` table. On failure
+/// the kernel table is empty, so the mirror is cleared to match rather
+/// than left describing the stale prior set; the error is returned.
+fn apply_registration_result(
+    mirror: &mut Vec<RegisteredBuf>,
+    new_regs: Vec<RegisteredBuf>,
+    register_result: Result<(), Error>,
+) -> Result<(), Error> {
+    match register_result {
+        Ok(()) => {
+            *mirror = new_regs;
+            Ok(())
+        }
+        Err(e) => {
+            mirror.clear();
+            Err(e)
+        }
     }
 }
 
@@ -554,6 +678,65 @@ fn open_file(path: &Path, o_direct: bool) -> Result<File, Error> {
     }
     // SAFETY: fd is freshly opened by us and not aliased elsewhere.
     Ok(unsafe { File::from_raw_fd(fd as RawFd) })
+}
+
+/// Create `path` if absent and size it to exactly `size_bytes`.
+///
+/// `ftruncate` sets the file length (growing or shrinking as needed);
+/// then `fallocate` (mode 0) backs the range with real blocks so a
+/// later write cannot hit ENOSPC mid-run. On filesystems that do not
+/// support fallocate (for example tmpfs) the allocation step is
+/// skipped and the file is left sparse at the requested length.
+///
+/// Intended for `kind = "file"` disks; production block devices never
+/// go through here.
+pub fn provision_file(path: &Path, size_bytes: u64) -> Result<(), Error> {
+    let cpath =
+        CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| Error::Io(libc::EINVAL))?;
+    // SAFETY: cpath is null-terminated and outlives the call. The mode
+    // argument is consumed because O_CREAT is set.
+    let fd = unsafe {
+        libc::open(
+            cpath.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC,
+            0o644 as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return Err(Error::Io(
+            io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO),
+        ));
+    }
+    // Wrap the fd immediately so it is closed on every return path.
+    // SAFETY: fd is freshly opened by us and not aliased elsewhere.
+    let file = unsafe { File::from_raw_fd(fd as RawFd) };
+
+    // SAFETY: file.as_raw_fd() is a valid, owned descriptor.
+    let rc = unsafe { libc::ftruncate(file.as_raw_fd(), size_bytes as libc::off_t) };
+    if rc != 0 {
+        return Err(Error::Io(
+            io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO),
+        ));
+    }
+
+    // SAFETY: same owned descriptor; mode 0 is a plain allocation.
+    let rc = unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, size_bytes as libc::off_t) };
+    if rc != 0 {
+        let err = io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO);
+        // tmpfs and some other backends do not implement fallocate;
+        // the file keeps its truncated length and stays sparse.
+        if err == libc::EOPNOTSUPP || err == libc::ENOTSUP || err == libc::ENOSYS {
+            return Ok(());
+        }
+        return Err(Error::Io(err));
+    }
+    Ok(())
 }
 
 fn file_capacity_pages(file: &File, page_size: usize) -> Result<u64, Error> {
@@ -793,5 +976,112 @@ mod tests {
         }
         assert!(max_submitted > 0, "should have had in-flight ops");
         assert!(max_submitted <= QD);
+    }
+
+    fn unique_path(name: &str) -> PathBuf {
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "uring-provision-{}-{}-{}.bin",
+            name,
+            std::process::id(),
+            n
+        ));
+        p
+    }
+
+    #[test]
+    fn provision_file_creates_and_sizes() {
+        const PAGE: usize = 4096;
+        let path = TempPath(unique_path("creates"));
+        assert!(!path.0.exists());
+
+        provision_file(&path.0, (16 * PAGE) as u64).expect("provision");
+
+        let len = std::fs::metadata(&path.0).unwrap().len();
+        assert_eq!(len, (16 * PAGE) as u64);
+
+        let file = open_file(&path.0, false).expect("open");
+        let pages = file_capacity_pages(&file, PAGE).expect("capacity");
+        assert_eq!(pages, 16);
+    }
+
+    #[test]
+    fn provision_file_grows_then_shrinks() {
+        const PAGE: usize = 4096;
+        let path = TempPath(unique_path("resize"));
+
+        provision_file(&path.0, (8 * PAGE) as u64).expect("provision 8");
+        assert_eq!(std::fs::metadata(&path.0).unwrap().len(), (8 * PAGE) as u64);
+
+        provision_file(&path.0, (4 * PAGE) as u64).expect("provision 4");
+        assert_eq!(std::fs::metadata(&path.0).unwrap().len(), (4 * PAGE) as u64);
+
+        provision_file(&path.0, (12 * PAGE) as u64).expect("provision 12");
+        assert_eq!(
+            std::fs::metadata(&path.0).unwrap().len(),
+            (12 * PAGE) as u64
+        );
+    }
+
+    fn dummy_reg(addr: usize, len: usize) -> RegisteredBuf {
+        RegisteredBuf {
+            base: NonNull::new(addr as *mut u8).expect("nonnull"),
+            len,
+        }
+    }
+
+    /// On a failed re-register, the mirror must be left EMPTY to match
+    /// the now-empty kernel table, never the stale prior set. This is
+    /// the core of the desync bug: a non-empty stale mirror would feed
+    /// `resolve_buf_index` indices the kernel no longer has.
+    #[test]
+    fn apply_registration_result_clears_mirror_on_failure() {
+        let mut mirror = vec![dummy_reg(0x1000, 4096)];
+        let new_regs = vec![dummy_reg(0x1000, 4096), dummy_reg(0x2000, 4096)];
+        let res = apply_registration_result(&mut mirror, new_regs, Err(Error::Io(libc::EFAULT)));
+        assert!(matches!(res, Err(Error::Io(libc::EFAULT))));
+        assert!(
+            mirror.is_empty(),
+            "mirror must be empty after a failed re-register, got {} entries",
+            mirror.len()
+        );
+    }
+
+    /// On success the mirror adopts the full new table.
+    #[test]
+    fn apply_registration_result_adopts_table_on_success() {
+        let mut mirror = vec![dummy_reg(0x1000, 4096)];
+        let new_regs = vec![dummy_reg(0x1000, 4096), dummy_reg(0x2000, 4096)];
+        let res = apply_registration_result(&mut mirror, new_regs, Ok(()));
+        assert!(res.is_ok());
+        assert_eq!(mirror.len(), 2);
+        assert_eq!(mirror[0].base.as_ptr() as usize, 0x1000);
+        assert_eq!(mirror[1].base.as_ptr() as usize, 0x2000);
+    }
+
+    /// The success path through the real device keeps the mirror
+    /// consistent with the kernel: both registered regions resolve to
+    /// distinct buffer indices.
+    #[test]
+    fn register_buffers_success_keeps_mirror_consistent() {
+        const PAGE: usize = 4096;
+        const PAGES: u64 = 16;
+        let path = TempPath(make_tempfile(PAGES, PAGE, 0));
+        let dev = UringBlockDevice::open(&path.0, UringConfig::test_local()).expect("open");
+
+        let (_owner_a, base_a) = aligned_buffer(PAGE);
+        dev.register_buffers(base_a, PAGE).expect("register a");
+        assert_eq!(dev.registered.borrow().len(), 1);
+
+        let (_owner_b, base_b) = aligned_buffer(PAGE);
+        dev.register_buffers(base_b, PAGE).expect("register b");
+        assert_eq!(dev.registered.borrow().len(), 2);
+
+        // Both regions remain addressable via their buffer indices,
+        // proving the re-register left the mirror parallel to the
+        // kernel table.
+        assert_eq!(dev.resolve_buf_index(base_a, PAGE).unwrap(), 0);
+        assert_eq!(dev.resolve_buf_index(base_b, PAGE).unwrap(), 1);
     }
 }

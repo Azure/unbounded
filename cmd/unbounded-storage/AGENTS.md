@@ -91,10 +91,28 @@ and local runs stay aligned:
 Always pass `--locked` for any direct `cargo` use; the lockfile is the
 source of truth.
 
+### libfabric dependency
+
+The `fabric` module links against libfabric (the C `shim.c` is compiled
+against its headers by `build.rs` via pkg-config, and the binary loads
+`libfabric.so` at runtime). The fabric uses the native `tcp` RDM
+provider, which only exists in libfabric 2.0+ (the experimental `net`
+provider was merged into `tcp` and removed there). Distro packages are
+usually too old, so the Makefile builds a pinned release from source:
+
+- `make libfabric` downloads and installs the pinned `LIBFABRIC_VERSION`
+  (see the Makefile default) under `tmp/libfabric/<version>/`. It is a
+  no-op once built; remove `tmp/libfabric` to force a rebuild.
+- The `unbounded-storage-*` targets depend on it and export
+  `LIBFABRIC_PKG_CONFIG_PATH` and `LD_LIBRARY_PATH` for `cargo`
+  automatically, so prefer the Makefile targets over raw `cargo`. If you
+  must run `cargo` directly, point it at the pinned install yourself.
+
 ## Testing patterns
 
-There are three distinct test styles in this crate and they are not
-interchangeable. Pick the one that matches what you are testing.
+There are three distinct in-process test styles in this crate plus an
+out-of-process end-to-end smoke test, and they are not interchangeable.
+Pick the one that matches what you are testing.
 
 ### 1. Inline unit tests (bottom of `src/<area>/<file>.rs`)
 
@@ -239,6 +257,46 @@ iterate on one failing case without re-running the whole suite:
   the shrunk output. See `regression_freelist_deadlock_under_faults`
   in `tests/bufferpool/tests.rs` for the pattern. Keep the test
   committed once the bug is fixed so the case is a permanent guard.
+
+### 4. End-to-end smoke test (`hack/smoke-storage.py`)
+
+The smoke test is the only test that exercises the real, fully linked
+binary across a process boundary. It brings up two `unbounded-storage`
+processes on loopback, wires them together over the real libfabric `tcp`
+fabric (file-backed disks, HTTP frontends, and a stub origin), then
+fetches an object through both frontends so the second fetch is served
+cross-node over a fabric RPC. It is the gate that catches integration
+breakage the in-process Rust tests cannot: FFI/ABI mismatches against
+the installed libfabric, provider negotiation, real socket addressing,
+and the lazy-connect retry paths.
+
+How to run it:
+
+```
+make unbounded-storage-build      # builds libfabric + the release binary
+sudo -E env "PATH=$PATH" \
+  "LD_LIBRARY_PATH=$PWD/tmp/libfabric/<version>/lib" \
+  python3 hack/smoke-storage.py
+```
+
+- `sudo` is required because the processes pin io_uring buffers and the
+  harness raises `RLIMIT_MEMLOCK` (needs `CAP_SYS_RESOURCE`). `sudo`
+  strips `LD_*` even with `-E`, so the libfabric runtime path must be
+  re-applied explicitly via `env` as shown.
+- Substitute the pinned `LIBFABRIC_VERSION` for `<version>`.
+
+When to run it:
+
+- After any change to the `fabric` module (`src/fabric/**`, especially
+  `shim.c`, `ffi.rs`, provider/addressing/connection logic), to
+  `src/main.rs` shard wiring, or to the libfabric version.
+- After changing `hack/smoke-storage.py` itself.
+
+CI runs it automatically via `.github/workflows/smoke-storage.yaml` on
+changes under `cmd/unbounded-storage/**`, `hack/smoke-storage.py`, or the
+`Makefile`. The unit/module/DST tests do not cover the FFI boundary
+against a real provider, so do not treat a green `make unbounded-storage`
+as sufficient for fabric-affecting changes; run the smoke test too.
 
 ### Adding a new subsystem
 

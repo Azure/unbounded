@@ -1,0 +1,96 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+name: unbounded-storage smoke test
+
+on:
+  pull_request:
+    paths:
+      - cmd/unbounded-storage/**
+      - hack/smoke-storage.py
+      - Makefile
+      - .github/workflows/smoke-storage.yaml
+  push:
+    branches: [main]
+    paths:
+      - cmd/unbounded-storage/**
+      - hack/smoke-storage.py
+      - Makefile
+      - .github/workflows/smoke-storage.yaml
+  workflow_dispatch:
+
+concurrency:
+  group: smoke-storage-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: Smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      # Source of truth for the libfabric version is the Makefile default
+      # (LIBFABRIC_VERSION). It is pinned here too so the cache key and
+      # runtime library path stay in sync; the value is passed to make so
+      # the two never diverge.
+      LIBFABRIC_VERSION: "2.5.1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config ca-certificates curl
+
+      # The distro libfabric (1.x) predates the merge of the experimental
+      # `net` provider into `tcp`, so it lacks a native FI_EP_RDM `tcp`
+      # provider. `make libfabric` builds a pinned release from source and
+      # installs it under tmp/libfabric (cached below to skip the rebuild).
+      - name: Cache libfabric
+        id: cache-libfabric
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: tmp/libfabric
+          key: libfabric-${{ env.LIBFABRIC_VERSION }}-${{ runner.os }}
+
+      - name: Build libfabric
+        run: make libfabric LIBFABRIC_VERSION="$LIBFABRIC_VERSION"
+
+      - name: Set up Rust toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            cmd/unbounded-storage/target
+          # Key on lockfile + manifest plus the native build inputs, since
+          # changes to either invalidate compiled artifacts under target/.
+          key: cargo-unbounded-storage-${{ runner.os }}-fabric-${{ hashFiles('cmd/unbounded-storage/Cargo.lock', 'cmd/unbounded-storage/Cargo.toml', 'cmd/unbounded-storage/build.rs', 'cmd/unbounded-storage/src/fabric/shim.c') }}
+          restore-keys: |
+            cargo-unbounded-storage-${{ runner.os }}-fabric-
+            cargo-unbounded-storage-${{ runner.os }}-
+
+      - name: Build release binary
+        run: make unbounded-storage-build LIBFABRIC_VERSION="$LIBFABRIC_VERSION"
+
+      - name: Run smoke test
+        # The two storage processes use io_uring with fixed (pinned)
+        # buffers, so the harness raises RLIMIT_MEMLOCK to infinity; that
+        # requires CAP_SYS_RESOURCE, hence sudo. `-E` preserves PATH and
+        # the cargo/rustup environment for the spawned binary lookup.
+        # sudo strips LD_* from the environment even with `-E`, so the
+        # libfabric runtime path is re-applied explicitly via `env`.
+        run: |
+          libdir="$GITHUB_WORKSPACE/tmp/libfabric/$LIBFABRIC_VERSION/lib"
+          sudo -E env "PATH=$PATH" "LD_LIBRARY_PATH=$libdir" \
+            python3 hack/smoke-storage.py

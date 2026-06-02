@@ -1,13 +1,95 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+//! Pinned, NUMA-local shard backing: its type, drop carriers, and the
+//! allocator that maps or heap-allocates one.
+
 use std::fmt;
 
-use crate::bufferpool::Backing;
+use super::numa::mbind_to_node;
 
 /// 2 MiB hugepage size in bytes. Hard-coded; 1 GiB hugepages are
 /// intentionally out of scope.
 pub const HUGEPAGE_2MB: usize = 2 * 1024 * 1024;
+
+/// Pinned, NUMA-local backing. The embedder allocates it (e.g.
+/// `mmap(MAP_HUGETLB | MAP_HUGE_2MB)`); the pool just carves pages
+/// out of it. `_own` holds the Drop handle for the underlying
+/// allocation; the pool never touches it.
+///
+/// `base` is a raw pointer, so `Backing` is `!Send + !Sync` by
+/// default. The pool relies on the embedder upholding the per-NUMA
+/// pinning invariant and adds `unsafe impl Send + Sync` so
+/// `Pool<T, S>` can be constructed off the executor thread before
+/// being handed to the pinned executor for service.
+pub struct Backing {
+    pub base: *mut u8,
+    pub page_size: usize,
+    pub page_count: usize,
+    /// Drop carrier for the underlying allocation. The pool never
+    /// touches this; it exists so the mapping outlives the pool.
+    pub _own: Box<dyn Send + Sync>,
+}
+
+// SAFETY: per-NUMA pinning is the embedder's responsibility (see
+// the design's "Constraints" section). Inside its NUMA shard the
+// `Backing` is owned by a single-threaded `Pool`; we mark it
+// `Send + Sync` so the constructed `Pool` can be moved onto the
+// pinned executor thread.
+unsafe impl Send for Backing {}
+unsafe impl Sync for Backing {}
+
+impl fmt::Debug for Backing {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Backing")
+            .field("base", &self.base)
+            .field("page_size", &self.page_size)
+            .field("page_count", &self.page_count)
+            .finish()
+    }
+}
+
+/// Drop carrier for a `mmap`-backed hugepage region.
+struct HugepageOwner {
+    ptr: *mut libc::c_void,
+    size: usize,
+}
+
+// SAFETY: the owner is moved into `Backing._own`; the mapping is
+// only accessed through `Backing::base` whose synchronization is
+// upheld by the `Pool` invariants.
+unsafe impl Send for HugepageOwner {}
+unsafe impl Sync for HugepageOwner {}
+
+impl Drop for HugepageOwner {
+    fn drop(&mut self) {
+        // SAFETY: ptr/size are the values returned from mmap; no
+        // other reference into the region remains.
+        unsafe {
+            libc::munmap(self.ptr, self.size);
+        }
+    }
+}
+
+/// Drop carrier for a heap-allocated region.
+struct HeapOwner {
+    ptr: *mut u8,
+    layout: std::alloc::Layout,
+}
+
+// SAFETY: see `HugepageOwner`. The allocation lives as long as the
+// pool that references it.
+unsafe impl Send for HeapOwner {}
+unsafe impl Sync for HeapOwner {}
+
+impl Drop for HeapOwner {
+    fn drop(&mut self) {
+        // SAFETY: matches the `alloc_zeroed` call in `allocate_heap`.
+        unsafe {
+            std::alloc::dealloc(self.ptr, self.layout);
+        }
+    }
+}
 
 /// Which allocator to use for a shard's backing.
 #[derive(Copy, Clone, Debug)]
@@ -150,48 +232,6 @@ fn allocate_hugepage(
     })
 }
 
-fn mbind_to_node(ptr: *mut libc::c_void, size: usize, node: u16) -> Result<(), i32> {
-    // MPOL_BIND: strictly allocate from the named node. Stronger
-    // than the `MPOL_PREFERRED` used by the per-thread runtime
-    // policy because hugepages are reserved up front and we want a
-    // hard failure if the reservation cannot be satisfied locally.
-    const MPOL_BIND: libc::c_int = 2;
-    const MPOL_MF_STRICT: libc::c_uint = 1;
-
-    let bits_per_word = std::mem::size_of::<libc::c_ulong>() * 8;
-    let bit = node as usize;
-    let words = bit / bits_per_word + 1;
-    let mut mask = vec![0 as libc::c_ulong; words];
-    mask[bit / bits_per_word] |= (1 as libc::c_ulong) << (bit % bits_per_word);
-    let maxnode = (words * bits_per_word) as libc::c_ulong;
-
-    // SAFETY: mask is a valid bitmask sized at `maxnode` bits.
-    let rc = unsafe {
-        libc::syscall(
-            libc::SYS_mbind,
-            ptr as libc::c_long,
-            size as libc::c_long,
-            MPOL_BIND as libc::c_long,
-            mask.as_ptr() as libc::c_long,
-            maxnode as libc::c_long,
-            MPOL_MF_STRICT as libc::c_long,
-        )
-    };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
-    }
-    Ok(())
-}
-
-/// Best-effort read of the free 2 MiB hugepage count. The path is
-/// the kernel's canonical sysfs entry; we return `None` if it is
-/// unreadable rather than masking the original mmap failure.
-fn read_free_hugepages_2mb() -> Option<u64> {
-    let s =
-        std::fs::read_to_string("/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages").ok()?;
-    s.trim().parse::<u64>().ok()
-}
-
 fn allocate_heap(
     size: usize,
     page_size: usize,
@@ -213,46 +253,13 @@ fn allocate_heap(
     })
 }
 
-/// Drop carrier for a `mmap`-backed hugepage region.
-struct HugepageOwner {
-    ptr: *mut libc::c_void,
-    size: usize,
-}
-
-// SAFETY: the owner is moved into `Backing._own`; the mapping is
-// only accessed through `Backing::base` whose synchronization is
-// upheld by the `Pool` invariants.
-unsafe impl Send for HugepageOwner {}
-unsafe impl Sync for HugepageOwner {}
-
-impl Drop for HugepageOwner {
-    fn drop(&mut self) {
-        // SAFETY: ptr/size are the values returned from mmap; no
-        // other reference into the region remains.
-        unsafe {
-            libc::munmap(self.ptr, self.size);
-        }
-    }
-}
-
-/// Drop carrier for a heap-allocated region.
-struct HeapOwner {
-    ptr: *mut u8,
-    layout: std::alloc::Layout,
-}
-
-// SAFETY: see `HugepageOwner`. The allocation lives as long as the
-// pool that references it.
-unsafe impl Send for HeapOwner {}
-unsafe impl Sync for HeapOwner {}
-
-impl Drop for HeapOwner {
-    fn drop(&mut self) {
-        // SAFETY: matches the `alloc_zeroed` call in `allocate_heap`.
-        unsafe {
-            std::alloc::dealloc(self.ptr, self.layout);
-        }
-    }
+/// Best-effort read of the free 2 MiB hugepage count. The path is
+/// the kernel's canonical sysfs entry; we return `None` if it is
+/// unreadable rather than masking the original mmap failure.
+fn read_free_hugepages_2mb() -> Option<u64> {
+    let s =
+        std::fs::read_to_string("/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages").ok()?;
+    s.trim().parse::<u64>().ok()
 }
 
 #[cfg(test)]

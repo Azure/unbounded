@@ -17,7 +17,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use unbounded_storage::bufferpool::{Backing, BlockStore, PageRef, StripeKey};
+use unbounded_storage::bufferpool::{BlockStore, PageRef, StripeKey};
+use unbounded_storage::memory::Backing;
 use unbounded_storage::storage::blockdev::{BlockDevice, MockDeviceConfig};
 use unbounded_storage::storage::types::Lba;
 use unbounded_storage::storage::{EngineConfig, StorageEngine};

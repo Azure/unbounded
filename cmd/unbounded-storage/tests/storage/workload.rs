@@ -23,7 +23,8 @@ use std::sync::Arc;
 
 use proptest::collection::vec;
 use proptest::prelude::*;
-use unbounded_storage::bufferpool::{Backing, BlockStore, PageRef, StripeKey};
+use unbounded_storage::bufferpool::{BlockStore, PageRef, StripeKey};
+use unbounded_storage::memory::Backing;
 use unbounded_storage::storage::blockdev::MockDeviceConfig;
 use unbounded_storage::storage::{EngineConfig, LocalStorage, StorageEngine};
 

@@ -11,7 +11,8 @@
 //! io_uring or NVMe-backed impl as soon as one is available.
 
 use crate::bufferpool::traits::BlockStore;
-use crate::bufferpool::types::{Backing, Error, PageRef, StripeKey};
+use crate::bufferpool::types::{Error, PageRef, StripeKey};
+use crate::memory::Backing;
 
 #[derive(Default)]
 pub struct NullBlockStore;

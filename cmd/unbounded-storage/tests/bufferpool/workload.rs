@@ -10,7 +10,8 @@ use std::rc::Rc;
 
 use proptest::collection::vec;
 use proptest::prelude::*;
-use unbounded_storage::bufferpool::{Backing, BufferPool, Pool, PoolConfig, StripeKey};
+use unbounded_storage::bufferpool::{BufferPool, Pool, PoolConfig, StripeKey};
+use unbounded_storage::memory::Backing;
 
 use crate::bufferpool::mocks::{
     CallCounts, DstBlockStore, DstTransport, MockSimConfig, Stripes, TestReq,

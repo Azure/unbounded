@@ -4,12 +4,12 @@
 use std::ptr;
 
 use proptest::prelude::*;
-use unbounded_storage::backing::HUGEPAGE_2MB;
 use unbounded_storage::bufferpool::{BulkRef, PageRef, StripeKey};
 use unbounded_storage::fabric::{
-    FabricError, MrHandle, RequestHeader, RequestPlan, ensure_launch_fits_registry,
+    FabricError, MAX_HOPS, MrHandle, RequestHeader, RequestPlan, ensure_launch_fits_registry,
     plan_page_write, required_completion_slots,
 };
+use unbounded_storage::memory::HUGEPAGE_2MB;
 
 #[derive(Clone, Debug)]
 pub struct Workload {
@@ -95,7 +95,7 @@ pub fn run_workload(w: Workload) -> RunReport {
         w.dest_base as usize,
         w.dest_pages as usize * HUGEPAGE_2MB,
     );
-    let header = RequestHeader::new(w.request_id, &dest_mr, w.dest_pages, w.src);
+    let header = RequestHeader::new(w.request_id, &dest_mr, w.dest_pages, w.src, MAX_HOPS);
     let request_plan = RequestPlan {
         dest_mr_base: header.dest_mr_base,
         dest_pages: header.dest_pages,
@@ -103,7 +103,7 @@ pub fn run_workload(w: Workload) -> RunReport {
 
     RunReport {
         expected_src: w.src,
-        plan_result: plan_page_write(&local_mr, &request_plan, w.dest_idx, w.page),
+        plan_result: plan_page_write(&local_mr, &request_plan, w.dest_idx, w.page, HUGEPAGE_2MB),
         availability_result: ensure_launch_fits_registry(w.available_slots, w.dst_count),
         required_slots: required_completion_slots(w.dst_count),
         local_mr,
@@ -148,6 +148,7 @@ fn mr(remote_key: u64, base: usize, len: usize) -> MrHandle {
         mr: ptr::null_mut(),
         remote_key,
         base,
+        remote_base: base as u64,
         len,
     }
 }

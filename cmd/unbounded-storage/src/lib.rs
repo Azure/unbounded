@@ -1,12 +1,15 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-pub mod backing;
+pub mod backend;
 pub mod bufferpool;
 pub mod config;
-pub mod disk_supervisor;
 pub mod fabric;
+pub mod frontend;
+pub mod http;
+pub mod memory;
 pub mod p2p;
+pub mod ring;
 pub mod runtime;
 pub mod storage;
 pub mod topology;

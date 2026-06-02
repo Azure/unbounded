@@ -102,7 +102,7 @@ int ub_fi_getname(struct fid *fid, void *addr, size_t *addrlen) {
 /*
  * Allocate an `fi_info` (via fi_allocinfo == fi_dupinfo(NULL)) and
  * populate it with the knobs Phase 3 needs:
- *   caps                  = FI_MSG | FI_RMA | FI_TAGGED
+ *   caps                  = FI_MSG | FI_RMA | FI_TAGGED | FI_SOURCE
  *   ep_attr.type          = FI_EP_RDM
  *   domain_attr.mr_mode   = FI_MR_LOCAL | FI_MR_VIRT_ADDR
  *                         | FI_MR_ALLOCATED | FI_MR_PROV_KEY
@@ -118,7 +118,7 @@ struct fi_info *ub_fi_build_hints(const char *prov_name) {
     if (!hints) {
         return NULL;
     }
-    hints->caps = FI_MSG | FI_RMA | FI_TAGGED;
+    hints->caps = FI_MSG | FI_RMA | FI_TAGGED | FI_SOURCE;
     if (hints->ep_attr) {
         hints->ep_attr->type = FI_EP_RDM;
     }
@@ -150,6 +150,19 @@ struct fi_info *ub_fi_build_hints(const char *prov_name) {
  */
 struct fi_fabric_attr *ub_fi_info_fabric_attr(struct fi_info *info) {
     return info ? info->fabric_attr : NULL;
+}
+
+/*
+ * The negotiated `domain_attr->mr_mode` the provider selected. Used to
+ * decide remote RMA addressing: when FI_MR_VIRT_ADDR is set the remote
+ * target address is the registered virtual address; otherwise it is a
+ * 0-based offset into the MR.
+ */
+int ub_fi_info_mr_mode(struct fi_info *info) {
+    if (!info || !info->domain_attr) {
+        return 0;
+    }
+    return info->domain_attr->mr_mode;
 }
 
 /*
@@ -196,6 +209,7 @@ int ub_fi_enodata(void) { return FI_ENODATA; }
 #define UB_FI_FIELD_CQ_ERR_ENTRY_PROV_ERRNO 23
 #define UB_FI_FIELD_CQ_ERR_ENTRY_ERR_DATA 24
 #define UB_FI_FIELD_CQ_ERR_ENTRY_ERR_DATA_SIZE 25
+#define UB_FI_FIELD_CQ_ERR_ENTRY_SRC_ADDR 26
 #define UB_FI_FIELD_RMA_IOV_ADDR 27
 #define UB_FI_FIELD_RMA_IOV_LEN 28
 #define UB_FI_FIELD_RMA_IOV_KEY 29
@@ -268,6 +282,7 @@ size_t ub_fi_layout(int type, int field) {
         case UB_FI_FIELD_CQ_ERR_ENTRY_PROV_ERRNO: return offsetof(struct fi_cq_err_entry, prov_errno);
         case UB_FI_FIELD_CQ_ERR_ENTRY_ERR_DATA: return offsetof(struct fi_cq_err_entry, err_data);
         case UB_FI_FIELD_CQ_ERR_ENTRY_ERR_DATA_SIZE: return offsetof(struct fi_cq_err_entry, err_data_size);
+        case UB_FI_FIELD_CQ_ERR_ENTRY_SRC_ADDR: return offsetof(struct fi_cq_err_entry, src_addr);
         default: return (size_t)-1;
         }
     case UB_FI_LAYOUT_FI_RMA_IOV:

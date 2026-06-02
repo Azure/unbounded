@@ -16,6 +16,7 @@
 
 pub mod admission;
 pub mod blockdev;
+pub mod disks;
 pub mod types;
 
 mod alloc;
@@ -24,12 +25,16 @@ mod engine;
 mod local;
 mod lru;
 mod mutator;
+mod origin;
+mod page_channel;
 mod refcount;
 mod singleflight;
 mod traits;
 
 pub use admission::{AdmissionFilter, AdmitDecision, StripeAdmission};
 pub use engine::{EngineConfig, StorageEngine};
-pub use local::{LocalStorage, ShardLocalStore};
+pub use local::{LocalStorage, ShardLocalStore, disk_for};
+pub use origin::{OriginRef, StripeReq, stripe_key};
+pub use page_channel::{PageChannel, PageChannelReceiver, PageCommand, PageService, ReplySlot};
 pub use traits::PageChecksum;
 pub use types::{Checksum, DiskId, Error, Lba, PageKey};

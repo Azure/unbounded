@@ -71,6 +71,21 @@ UNBOUNDED_STORAGE_BIN=bin/unbounded-storage
 UNBOUNDED_STORAGE_CRATE=./cmd/unbounded-storage
 CARGO ?= cargo
 
+# libfabric is built from source because distro packages predate the
+# merge of the experimental `net` provider into `tcp` (libfabric 2.0),
+# so they lack a native FI_EP_RDM `tcp` provider. We pin a recent
+# release and install it under tmp/ (gitignored). Override LIBFABRIC_*
+# to use a system install.
+LIBFABRIC_VERSION ?= 2.5.1
+LIBFABRIC_PREFIX ?= $(CURDIR)/tmp/libfabric/$(LIBFABRIC_VERSION)
+LIBFABRIC_PKG_CONFIG_PATH := $(LIBFABRIC_PREFIX)/lib/pkgconfig
+LIBFABRIC_STAMP := $(LIBFABRIC_PREFIX)/.installed
+LIBFABRIC_URL ?= https://github.com/ofiwg/libfabric/releases/download/v$(LIBFABRIC_VERSION)/libfabric-$(LIBFABRIC_VERSION).tar.bz2
+# Environment prefix that points cargo's build.rs (pkg-config) and the
+# resulting binaries at the pinned libfabric.
+CARGO_FABRIC_ENV = LIBFABRIC_PKG_CONFIG_PATH=$(LIBFABRIC_PKG_CONFIG_PATH) \
+	LD_LIBRARY_PATH=$(LIBFABRIC_PREFIX)/lib$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}
+
 # Version is derived from the latest git tag. Override with: make VERSION=v1.0.0
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 GIT_COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
@@ -142,7 +157,7 @@ REACT_DEV ?= false
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-manifests
 .PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-net-controller-local image-net-node-local images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
-.PHONY: unbounded-storage unbounded-storage-build bench unbounded-storage-test unbounded-storage-check unbounded-storage-model-check
+.PHONY: unbounded-storage unbounded-storage-build bench unbounded-storage-test unbounded-storage-check unbounded-storage-model-check libfabric
 
 ##@ General
 
@@ -196,6 +211,7 @@ help: ## Show this help
 	@echo "  unbounded-storage-test           Run cargo tests for unbounded-storage"
 	@echo "  unbounded-storage-check          Run cargo check for unbounded-storage"
 	@echo "  unbounded-storage-model-check    Run TLC on the CoW B+tree crash-consistency model"
+	@echo "  libfabric                        Build/install the pinned libfabric from source"
 	@echo ""
 	@echo "Container Images (local, single-arch):"
 	@echo "  image-inventory-all-local        Build all local inventory container images"
@@ -475,21 +491,39 @@ unroute: test unroute-build ## Build the unroute utility (implies test)
 
 ##@ Rust Binaries
 
-unbounded-storage-check: ## Run cargo check for unbounded-storage
-	$(CARGO) check --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --locked --all-targets
+# Build and install the pinned libfabric from source (once). The stamp
+# file marks a completed install so repeat builds are no-ops; remove
+# tmp/libfabric to force a rebuild.
+$(LIBFABRIC_STAMP):
+	@echo "Building libfabric $(LIBFABRIC_VERSION) -> $(LIBFABRIC_PREFIX)"
+	@rm -rf $(CURDIR)/tmp/libfabric/src
+	@mkdir -p $(CURDIR)/tmp/libfabric/src
+	@curl -fsSL $(LIBFABRIC_URL) | tar -xj -C $(CURDIR)/tmp/libfabric/src --strip-components=1
+	cd $(CURDIR)/tmp/libfabric/src && ./configure --prefix=$(LIBFABRIC_PREFIX) \
+		--enable-tcp=yes --disable-verbs --disable-rxm --disable-sockets \
+		--disable-psm3 --disable-efa --disable-shm
+	$(MAKE) -C $(CURDIR)/tmp/libfabric/src -j$$(nproc)
+	$(MAKE) -C $(CURDIR)/tmp/libfabric/src install
+	@rm -rf $(CURDIR)/tmp/libfabric/src
+	@touch $(LIBFABRIC_STAMP)
 
-unbounded-storage-test: ## Run cargo tests for unbounded-storage
-	$(CARGO) test --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --locked --all-targets
+libfabric: $(LIBFABRIC_STAMP) ## Build/install the pinned libfabric ($(LIBFABRIC_VERSION)) from source
 
-unbounded-storage-build: ## Build the unbounded-storage binary (no test)
-	$(CARGO) build --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --release --locked
+unbounded-storage-check: $(LIBFABRIC_STAMP) ## Run cargo check for unbounded-storage
+	$(CARGO_FABRIC_ENV) $(CARGO) check --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --locked --all-targets
+
+unbounded-storage-test: $(LIBFABRIC_STAMP) ## Run cargo tests for unbounded-storage
+	$(CARGO_FABRIC_ENV) $(CARGO) test --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --locked --all-targets
+
+unbounded-storage-build: $(LIBFABRIC_STAMP) ## Build the unbounded-storage binary (no test)
+	$(CARGO_FABRIC_ENV) $(CARGO) build --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --release --locked
 	@mkdir -p $(dir $(UNBOUNDED_STORAGE_BIN))
 	cp $(UNBOUNDED_STORAGE_CRATE)/target/release/unbounded-storage $(UNBOUNDED_STORAGE_BIN)
 
 unbounded-storage: unbounded-storage-test unbounded-storage-build ## Build the unbounded-storage binary (implies test)
 
-bench: ## Build the bench tool (excluded from images)
-	$(CARGO) build --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --release --locked --bin bench
+bench: $(LIBFABRIC_STAMP) ## Build the bench tool (excluded from images)
+	$(CARGO_FABRIC_ENV) $(CARGO) build --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --release --locked --bin bench
 	@mkdir -p $(dir $(UNBOUNDED_STORAGE_BIN))
 	cp $(UNBOUNDED_STORAGE_CRATE)/target/release/bench bin/bench
 
