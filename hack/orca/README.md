@@ -284,8 +284,10 @@ kubectl --context kind-orca-dev -n unbounded-kube logs deploy/garage | tail
 ./hack/orca/setup-orca.sh
 ```
 
-The bootstrap runs from the Garage container's postStart hook; if it is
-stuck, exec in and inspect the cluster:
+The bootstrap is driven by setup-orca.sh via `kubectl exec` after
+Garage reports Ready (the Garage image has no shell, so it cannot
+self-bootstrap from an in-pod hook). If it is stuck, inspect the
+cluster directly:
 
 ```bash
 kubectl --context kind-orca-dev -n unbounded-kube exec deploy/garage -- \
@@ -295,10 +297,11 @@ kubectl --context kind-orca-dev -n unbounded-kube exec deploy/garage -- \
 ### Orca pods CrashLoopBackOff with "NoSuchBucket: orca-cache"
 
 Less likely than with the old LocalStack harness, because Garage
-persists to a PersistentVolumeClaim (`garage-data`) and the bootstrap
-is idempotent on restart. If it happens, the PVC may have been deleted
-or the bootstrap may not have completed; re-run setup-orca.sh, which
-waits until the buckets exist:
+persists to a PersistentVolumeClaim (`garage-data`), so the layout,
+dev key, and buckets survive pod restarts. If it happens, the PVC may
+have been deleted, or you applied the manifests without running
+setup-orca.sh (which performs the bootstrap). Re-run setup-orca.sh,
+which re-bootstraps idempotently and waits until the buckets exist:
 
 ```bash
 ./hack/orca/setup-orca.sh

@@ -15,10 +15,18 @@
 #
 # Garage requires SigV4 auth, so unlike LocalStack the dev credentials
 # are real Garage keys. They are deterministic constants (imported by
-# the bootstrap script below and mirrored into the orca-credentials
-# Secret by setup-orca.sh); they are dev-only and not secret. Garage
+# setup-orca.sh's post-rollout bootstrap and mirrored into the
+# orca-credentials Secret); they are dev-only and not secret. Garage
 # access key IDs must be "GK" + 12 hex bytes, so the well-known
 # all-test value cannot be used.
+#
+# Bootstrap (layout assign/apply, key import, bucket create/allow) is
+# driven by setup-orca.sh via `kubectl exec ... /garage ...` after the
+# Deployment is Ready, NOT by an in-pod hook: the Garage image is a
+# near-scratch image with only the /garage binary (no shell, no
+# coreutils), so a shell-script lifecycle hook cannot run in it. With
+# the persistent PVC the layout/key/buckets survive restarts, so
+# bootstrap only needs to run at install time.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -47,55 +55,6 @@ data:
     [admin]
     api_bind_addr = "[::]:3903"
     admin_token = "{{ default "orca-dev-admin-token" .GarageAdminToken }}"
-
-  bootstrap.sh: |
-    #!/bin/sh
-    # Idempotent Garage bootstrap, run from the container's postStart
-    # lifecycle hook (so it shares the server's metadata volume and can
-    # reach the node on 127.0.0.1). Safe to re-run on every restart:
-    # the persistent PVC keeps the node identity, applied layout, key,
-    # and buckets, so each step is gated on a presence check.
-    set -eu
-
-    G="/garage -c /etc/garage.toml"
-    AK="{{ default "GK0123456789abcdef01234567" .GarageAccessKey }}"
-    SK="{{ default "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" .GarageSecretKey }}"
-    CACHE_BUCKET="{{ default "orca-cache" .CachestoreBucket }}"
-    ORIGIN_BUCKET="{{ default "orca-origin" .OriginBucket }}"
-
-    # Wait for the local node's RPC to answer.
-    i=0
-    until $G status >/dev/null 2>&1; do
-      i=$((i+1))
-      if [ "$i" -ge 60 ]; then
-        echo "garage-bootstrap: node did not become ready" >&2
-        exit 0
-      fi
-      sleep 1
-    done
-
-    # Assign + apply a single-node layout once. `layout show` lists the
-    # staged/applied roles; an already-configured node prints its zone.
-    if ! $G layout show 2>/dev/null | grep -q "dc1"; then
-      NODE=$($G node id -q | cut -d@ -f1)
-      $G layout assign "$NODE" -z dc1 -c 1G
-      $G layout apply --version 1
-    fi
-
-    # Import the deterministic dev key once, then ensure it may create
-    # buckets (the awss3 origin and cachestore both use it).
-    if ! $G key list 2>/dev/null | grep -q "$AK"; then
-      $G key import "$AK" "$SK" -n orca-dev --yes
-    fi
-    $G key allow --create-bucket orca-dev || true
-
-    # Ensure both buckets exist and are owned by the dev key.
-    for b in "$CACHE_BUCKET" "$ORIGIN_BUCKET"; do
-      $G bucket info "$b" >/dev/null 2>&1 || $G bucket create "$b"
-      $G bucket allow --read --write --owner --key orca-dev "$b" || true
-    done
-
-    echo "garage-bootstrap: complete"
 
 ---
 apiVersion: v1
@@ -175,13 +134,6 @@ spec:
             - containerPort: 3903
               name: admin
               protocol: TCP
-          lifecycle:
-            postStart:
-              exec:
-                # Idempotent bootstrap: layout, dev key, buckets. Runs
-                # in this container so `garage node id` resolves the
-                # server's own identity and RPC targets 127.0.0.1.
-                command: ["/bin/sh", "/etc/garage/bootstrap.sh"]
           resources:
             requests:
               cpu: 100m
@@ -207,10 +159,6 @@ spec:
             - name: config
               mountPath: /etc/garage.toml
               subPath: garage.toml
-              readOnly: true
-            - name: config
-              mountPath: /etc/garage/bootstrap.sh
-              subPath: bootstrap.sh
               readOnly: true
       volumes:
         - name: data

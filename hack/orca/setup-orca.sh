@@ -27,7 +27,10 @@
 #   --replicas N         number of orca replicas (default: 3, matches the
 #                        worker-node count in hack/orca/kind-config.yaml)
 #   --no-wait            apply manifests and exit without waiting for
-#                        emulators / orca to reach Ready
+#                        Azurite / orca to reach Ready. Garage is still
+#                        waited for and bootstrapped (layout, key,
+#                        buckets), since an un-bootstrapped Garage makes
+#                        the install non-functional.
 #   --uninstall          delete every Orca-owned resource in the
 #                        namespace (label-selector based) and exit;
 #                        the namespace itself is left intact unless
@@ -355,11 +358,7 @@ log "Rendering dev emulator manifests (Azurite + Garage)"
     --templates-dir "${REPO_ROOT}/deploy/orca/dev" \
     --output-dir "${rendered_dev}" \
     --set "Namespace=${NAMESPACE}" \
-    --set "CachestoreBucket=orca-cache" \
-    --set "OriginBucket=orca-origin" \
     --set "CachestoreRegion=us-east-1" \
-    --set "GarageAccessKey=${GARAGE_ACCESS_KEY}" \
-    --set "GarageSecretKey=${GARAGE_SECRET_KEY}" \
     --set "AzuriteContainer=orca-test" \
 )
 
@@ -373,25 +372,70 @@ kubectl_ctx apply -f "${rendered_orca}/01-namespace.yaml"
 
 # Emulators next; orca's startup probe will fail until the cachestore
 # bucket and Azurite container exist, so we deploy these first and
-# wait for their init hooks to settle before bringing orca up.
+# bootstrap them before bringing orca up.
 kubectl_ctx apply -f "${rendered_dev}/01-garage.yaml"
 kubectl_ctx apply -f "${rendered_dev}/03-azurite.yaml"
 
+# -----------------------------------------------------------------------------
+# Bootstrap Garage.
+#
+# The Garage image is a near-scratch image (only the /garage binary; no
+# shell, no coreutils), so the layout/key/bucket bootstrap cannot run as
+# an in-pod shell hook. Instead we drive it here via `kubectl exec ...
+# /garage ...` (each a direct binary exec; the conditional/idempotent
+# logic runs in this script). With the persistent PVC the layout, key,
+# and buckets survive pod restarts, so this only needs to run at install
+# time. It is idempotent, so re-running setup-orca.sh is safe.
+#
+# Run unconditionally (even under --no-wait): an un-bootstrapped Garage
+# leaves the cachestore/origin buckets missing, which makes the whole
+# install non-functional, so we always wait for Garage to be Ready and
+# bootstrap it. --no-wait still skips the longer Azurite / orca waits
+# below.
+
+gexec() { kubectl_ctx -n "${NAMESPACE}" exec deploy/garage -- /garage -c /etc/garage.toml "$@"; }
+
+log "Waiting for Garage to be Ready"
+kubectl_ctx -n "${NAMESPACE}" rollout status deployment/garage --timeout=120s
+
+log "Bootstrapping Garage (layout, dev key, buckets)"
+
+# Wait for the node's RPC to answer before issuing layout commands.
+ok=0
+for _ in $(seq 1 30); do
+  if gexec status >/dev/null 2>&1; then ok=1; break; fi
+  sleep 2
+done
+[[ "${ok}" == "1" ]] || die "Garage node did not become ready within 60s"
+
+# Assign + apply a single-node layout once (idempotent: skip if a zone
+# is already configured).
+if ! gexec layout show 2>/dev/null | grep -q "dc1"; then
+  node_id="$(gexec node id -q 2>/dev/null | cut -d@ -f1 | tr -d '\r')"
+  [[ -n "${node_id}" ]] || die "could not resolve Garage node id"
+  gexec layout assign "${node_id}" -z dc1 -c 1G
+  gexec layout apply --version 1
+fi
+
+# Import the deterministic dev key once, then grant create-bucket.
+if ! gexec key list 2>/dev/null | grep -q "${GARAGE_ACCESS_KEY}"; then
+  gexec key import "${GARAGE_ACCESS_KEY}" "${GARAGE_SECRET_KEY}" -n orca-dev --yes
+fi
+gexec key allow --create-bucket orca-dev >/dev/null 2>&1 || true
+
+# Ensure both buckets exist and are owned by the dev key.
+for bucket in orca-cache orca-origin; do
+  gexec bucket info "${bucket}" >/dev/null 2>&1 || gexec bucket create "${bucket}"
+  gexec bucket allow --read --write --owner --key orca-dev "${bucket}" >/dev/null 2>&1 || true
+done
+
+# Verify the cachestore bucket is queryable before bringing orca up.
+gexec bucket info orca-cache >/dev/null 2>&1 \
+  || die "Garage bootstrap did not create orca-cache"
+
+log "Garage bootstrap complete"
+
 if [[ "${DO_WAIT}" == "1" ]]; then
-  log "Waiting for Garage to be Ready"
-  kubectl_ctx -n "${NAMESPACE}" rollout status deployment/garage --timeout=120s
-
-  log "Waiting for Garage bootstrap to create the cachestore bucket"
-  ok=0
-  for _ in $(seq 1 30); do
-    if kubectl_ctx -n "${NAMESPACE}" exec deploy/garage -- \
-        /garage -c /etc/garage.toml bucket info orca-cache >/dev/null 2>&1; then
-      ok=1; break
-    fi
-    sleep 2
-  done
-  [[ "${ok}" == "1" ]] || die "Garage bootstrap did not create orca-cache within 60s"
-
   log "Waiting for Azurite to be Ready"
   kubectl_ctx -n "${NAMESPACE}" rollout status deployment/azurite --timeout=180s
 
