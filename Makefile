@@ -835,10 +835,10 @@ orca-reset: ## Rebuild orca image, side-load into kind, rolling-restart the depl
 # (ubuntu-latest has gcc), no -race locally so developers without a C
 # toolchain can still run integration tests.
 ifdef CI
-orca-inttest: ## Run orca integration tests (LocalStack + Azurite via testcontainers; requires Docker)
+orca-inttest: ## Run orca integration tests (Garage + Azurite via testcontainers; requires Docker)
 	$(GOTEST) -tags=integrationtest -race -timeout 15m ./internal/orca/inttest/...
 else
-orca-inttest: ## Run orca integration tests (LocalStack + Azurite via testcontainers; requires Docker)
+orca-inttest: ## Run orca integration tests (Garage + Azurite via testcontainers; requires Docker)
 	$(GOTEST) -tags=integrationtest -race -count=1 -timeout 15m ./internal/orca/inttest/...
 endif
 

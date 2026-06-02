@@ -217,6 +217,7 @@ func (g *Garage) exec(ctx context.Context, cmd []string) (string, error) {
 	}
 
 	var out string
+
 	if reader != nil {
 		b, _ := io.ReadAll(reader) //nolint:errcheck // best-effort capture
 		out = string(b)
