@@ -179,6 +179,13 @@ func Machinectl() func(context.Context) *exec.Cmd {
 	}
 }
 
+// Mountpoint returns a command factory for mountpoint.
+func Mountpoint() func(context.Context) *exec.Cmd {
+	return func(ctx context.Context) *exec.Cmd {
+		return exec.CommandContext(ctx, "mountpoint")
+	}
+}
+
 // Sysctl returns a command factory for sysctl.
 func Sysctl() func(context.Context) *exec.Cmd {
 	return func(ctx context.Context) *exec.Cmd {
@@ -190,5 +197,12 @@ func Sysctl() func(context.Context) *exec.Cmd {
 func Systemctl() func(context.Context) *exec.Cmd {
 	return func(ctx context.Context) *exec.Cmd {
 		return exec.CommandContext(ctx, "systemctl")
+	}
+}
+
+// Umount returns a command factory for umount.
+func Umount() func(context.Context) *exec.Cmd {
+	return func(ctx context.Context) *exec.Cmd {
+		return exec.CommandContext(ctx, "umount")
 	}
 }

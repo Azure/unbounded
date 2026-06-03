@@ -63,7 +63,7 @@ detected on the host.
 
 | Image | Default repository | Description |
 |---|---|---|
-| [`agent-ubuntu2404`](https://github.com/Azure/unbounded/pkgs/container/agent-ubuntu2404) | `ghcr.io/azure/agent-ubuntu2404` | Base image with systemd, dbus, curl, iproute2, nftables, kmod, and wireguard-tools. ([Containerfile](https://github.com/Azure/unbounded/tree/main/images/agent-ubuntu2404/Containerfile)) |
+| [`agent-ubuntu2404`](https://github.com/Azure/unbounded/pkgs/container/agent-ubuntu2404) | `ghcr.io/azure/agent-ubuntu2404` | Base image with systemd, dbus, curl, iproute2, nftables, kmod, wireguard-tools, and bpftool. ([Containerfile](https://github.com/Azure/unbounded/tree/main/images/agent-ubuntu2404/Containerfile)) |
 | [`agent-ubuntu2404-nvidia`](https://github.com/Azure/unbounded/pkgs/container/agent-ubuntu2404-nvidia) | `ghcr.io/azure/agent-ubuntu2404-nvidia` | Extends the base image with the NVIDIA Container Toolkit (`nvidia-ctk`, `nvidia-container-runtime`). ([Containerfile](https://github.com/Azure/unbounded/tree/main/images/agent-ubuntu2404-nvidia/Containerfile)) |
 
 The agent pins a specific image tag by default at build time. The `OCIImage`
@@ -109,8 +109,8 @@ The configuration is written to two files on the host before the machine boots:
 | `PrivateUsers=no` | nspawn config | Disables user namespace remapping so runc can use real root. |
 | `SystemCallFilter=@keyring bpf perf_event_open` | nspawn config | Allows kernel keyring, eBPF, and perf event syscalls used by containerd, runc, and eBPF CNIs. |
 | `VirtualEthernet=no` | nspawn config | Shares the host network namespace. |
-| `Bind=/sys/fs/bpf:/sys/fs/bpf` | nspawn config | Exposes the host bpffs mount to eBPF CNIs such as Cilium. |
-| bpffs `ExecStartPre=` mount commands | Service override | Creates and mounts host `/sys/fs/bpf` before the machine starts. |
+| `Bind=/run/bpffs/<MachineName>:/sys/fs/bpf` | nspawn config | Exposes a machine-scoped bpffs mount to eBPF CNIs such as Cilium. |
+| bpffs `ExecStartPre=` mount commands | Service override | Creates and mounts the machine-scoped host bpffs before the machine starts. |
 | `SYSTEMD_NSPAWN_UNIFIED_HIERARCHY=1` | Service override | Forces cgroups v2 inside the container. |
 | `SYSTEMD_NSPAWN_API_VFS_WRITABLE=network` | Service override | Makes `/proc/sys/net` writable for CNI and kube-proxy. |
 | `Bind=/dev/kvm` | nspawn config | KVM device bind-mount (auto-generated when `/dev/kvm` is present). |
@@ -177,6 +177,11 @@ The container operates in the host's network namespace (`VirtualEthernet=no`):
 - Kubelet binds to `0.0.0.0` and uses the host's routable IP.
 - CNI plugins create network interfaces (WireGuard, VXLAN, overlay bridges)
   that are visible on both the host and inside the container.
+- Each nspawn machine gets a private bpffs mount at `/sys/fs/bpf`, backed by
+  `/run/bpffs/<MachineName>` on the host. This isolates pinned BPF
+  object paths between alternating nspawn machines, but it does not by itself
+  detach host-visible TC/XDP/cgroup programs or remove CNI-created network
+  devices.
 - `/proc/sys/net` is writable inside the container so that CNI plugins and
   kube-proxy can configure network sysctls.
 - Host-level sysctl values (`net.ipv4.ip_forward`, `net.bridge.bridge-nf-call-iptables`,

@@ -38,6 +38,7 @@ Subcommands (called as individual workflow steps):
     validate-agent-upgrade-operation   Verify AgentUpgrade switches the host daemon binary.
     validate-agent-upgrade-rollback    Verify AgentUpgrade rollback restores last-known-good.
     validate-node-repave-upgrade       Verify OnDelete repave applies a new MCV Kubernetes version.
+                                       Also verifies private bpffs isolation across repave.
     validate-node-configs              Discover and validate node config scenarios in parallel.
     collect-logs                       Collect VM and cluster diagnostic logs.
     reset-agent                        Trigger AgentReset and verify cleanup.
@@ -120,6 +121,8 @@ MACHINA_CONFIG_FILE = VM_DIR / "machina-config.yaml"
 MACHINE_CONFIG_NAME = f"{AGENT_MACHINE_NAME}-config"
 DAEMON_BINARY_CURRENT = "/usr/local/bin/unbounded-agent-current"
 DAEMON_BINARY_LAST_GOOD = "/usr/local/bin/unbounded-agent-last-good"
+BPFFS_HOST_ROOT = "/run/bpffs"
+BPFFS_SENTINEL = "unbounded-e2e-bpffs-sentinel"
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +191,15 @@ def ssh_capture(command: str) -> str:
     return capture(["ssh", *SSH_OPTS, SSH_TARGET, command])
 
 
+def ssh_capture_quiet(command: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["ssh", *SSH_OPTS, SSH_TARGET, command],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
 def scp_cmd(src: str, dst: str) -> subprocess.CompletedProcess[str]:
     return run(["scp", *SSH_OPTS, src, dst])
 
@@ -198,6 +210,53 @@ def kubectl(args: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
 
 def kubectl_capture(args: list[str]) -> str:
     return capture([KUBECTL, *args])
+
+
+def active_nspawn_machine() -> str:
+    for machine in NSPAWN_MACHINE_NAMES:
+        result = ssh_capture_quiet(f"sudo machinectl show {machine}")
+        if result.returncode == 0:
+            return machine
+    die("no active nspawn machine found")
+
+
+def machine_shell(machine: str, command: str) -> str:
+    quoted = json.dumps(command)
+    return ssh_capture(f"sudo machinectl shell {machine} /bin/sh -lc {quoted}")
+
+
+def machine_shell_quiet(machine: str, command: str) -> subprocess.CompletedProcess[str]:
+    quoted = json.dumps(command)
+    return ssh_capture_quiet(f"sudo machinectl shell {machine} /bin/sh -lc {quoted}")
+
+
+def create_bpffs_sentinel(machine: str) -> None:
+    log(f"Creating bpffs sentinel in nspawn machine '{machine}'...")
+    machine_shell(machine, textwrap.dedent(f"""\
+        mountpoint -q /sys/fs/bpf
+        rm -f /sys/fs/bpf/{BPFFS_SENTINEL}
+        bpftool map create /sys/fs/bpf/{BPFFS_SENTINEL} type hash key 4 value 4 entries 1 name unb_e2e
+    """))
+    host_path = f"{BPFFS_HOST_ROOT}/{machine}/{BPFFS_SENTINEL}"
+    result = ssh_capture_quiet(f"sudo test -e {host_path}")
+    if result.returncode != 0:
+        die(f"bpffs sentinel was not visible at host path {host_path}")
+
+
+def assert_bpffs_sentinel_absent(machine: str) -> None:
+    result = machine_shell_quiet(machine, f"test ! -e /sys/fs/bpf/{BPFFS_SENTINEL}")
+    if result.returncode != 0:
+        die(f"bpffs sentinel from previous machine is visible in '{machine}'")
+
+
+def install_bpftool(machine: str) -> None:
+    log(f"Installing bpftool in nspawn machine '{machine}'...")
+    # TODO: remove this once agent-ubuntu2404 and agent-ubuntu2404-nvidia
+    # images containing bpftool have been published and are used by e2e.
+    machine_shell(machine, textwrap.dedent("""\
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y bpftool
+    """))
 
 
 def _b64(val: str) -> str:
@@ -2459,6 +2518,10 @@ def validate_node_repave_upgrade(node_config: NodeConfig) -> None:
     if target_version_number == 0 or not target_mcv:
         die("Resolved target MachineConfigurationVersion was empty")
 
+    old_nspawn = active_nspawn_machine()
+    install_bpftool(old_nspawn)
+    create_bpffs_sentinel(old_nspawn)
+
     log(f"Assigning Machine '{AGENT_MACHINE_NAME}' to {target_mcv}...")
     run([KUBECTL_UNBOUNDED, "machine", "config", "assign", AGENT_MACHINE_NAME,
          "--config", config_name, "--version", str(target_version_number)])
@@ -2467,6 +2530,10 @@ def validate_node_repave_upgrade(node_config: NodeConfig) -> None:
     kubectl(["delete", "node", AGENT_MACHINE_NAME])
     wait_for_node_absent(AGENT_MACHINE_NAME)
     wait_for_node()
+    new_nspawn = active_nspawn_machine()
+    if new_nspawn == old_nspawn:
+        die(f"repave did not switch nspawn machines: still using {new_nspawn}")
+    assert_bpffs_sentinel_absent(new_nspawn)
     wait_for_node_kubelet_version(AGENT_MACHINE_NAME, target_kubelet_version)
     node = json.loads(kubectl_capture(["get", "node", AGENT_MACHINE_NAME, "-o", "json"]))
     _assert_expected_node_config(node, node_config)

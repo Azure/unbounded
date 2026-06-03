@@ -20,11 +20,13 @@ import (
 // - debootstrap: used to bootstrap a Debian rootfs.
 // - curl: used for downloading resources.
 // - nftables: provides nft, used by nftables-flush.service to reset firewall rules.
+// - util-linux: provides mountpoint for private bpffs cleanup.
 var requiredPackages = []string{
 	"systemd-container",
 	"debootstrap",
 	"curl",
 	"nftables",
+	"util-linux",
 }
 
 type installPackages struct {
