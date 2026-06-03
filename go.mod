@@ -1,6 +1,6 @@
 module github.com/Azure/unbounded
 
-go 1.26.3
+go 1.26.4
 
 tool (
 	golang.org/x/vuln/cmd/govulncheck
