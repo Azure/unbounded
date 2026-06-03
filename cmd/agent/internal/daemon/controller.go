@@ -118,8 +118,6 @@ func (r *repaveReconciler) SetupController(b *builder.TypedBuilder[daemon.Reques
 			return nil
 		}
 
-		// Repave is delete-triggered. Operators must cordon/drain first; this
-		// controller does not validate eviction or CNI cleanup state.
 		return []daemon.Request{daemon.NewRepaveRequest("node-delete")}
 	}
 
