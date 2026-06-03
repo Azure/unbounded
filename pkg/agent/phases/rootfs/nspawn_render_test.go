@@ -60,3 +60,33 @@ func TestServiceOverride_MachineNameSubstitution(t *testing.T) {
 	require.Contains(t, buf.String(), "machinectl terminate kube7")
 	require.NotContains(t, buf.String(), "machinectl terminate kube1")
 }
+
+func TestNSpawnConfig_EBPFCNISettings(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, "nspawn.conf", nspawnTemplateData{}))
+
+	out := buf.String()
+	require.Contains(t, out, "SystemCallFilter=@keyring bpf perf_event_open")
+	require.Contains(t, out, "Bind=/sys/fs/bpf:/sys/fs/bpf")
+}
+
+func TestServiceOverride_MountsBPFFSBeforeStart(t *testing.T) {
+	t.Parallel()
+
+	data := nspawnTemplateData{MachineName: "kube1"}
+
+	var buf bytes.Buffer
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, "service-override.conf", data))
+
+	out := buf.String()
+	mkdir := "ExecStartPre=/usr/bin/mkdir -p /sys/fs/bpf"
+	mount := "ExecStartPre=/bin/sh -c '/usr/bin/mountpoint -q /sys/fs/bpf || /usr/bin/mount -t bpf bpf /sys/fs/bpf'"
+	environment := "Environment=SYSTEMD_NSPAWN_UNIFIED_HIERARCHY=1"
+
+	require.Contains(t, out, mkdir)
+	require.Contains(t, out, mount)
+	require.Less(t, strings.Index(out, mkdir), strings.Index(out, mount))
+	require.Less(t, strings.Index(out, mount), strings.Index(out, environment))
+}

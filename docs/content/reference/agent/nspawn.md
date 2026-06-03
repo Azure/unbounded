@@ -107,8 +107,10 @@ The configuration is written to two files on the host before the machine boots:
 |---|---|---|
 | `Capability=all` | nspawn config | Grants all capabilities for nested container runtimes (runc). |
 | `PrivateUsers=no` | nspawn config | Disables user namespace remapping so runc can use real root. |
-| `SystemCallFilter=@keyring bpf` | nspawn config | Allows kernel keyring (containerd) and eBPF (runc cgroups v2 device control) syscalls. |
+| `SystemCallFilter=@keyring bpf perf_event_open` | nspawn config | Allows kernel keyring, eBPF, and perf event syscalls used by containerd, runc, and eBPF CNIs. |
 | `VirtualEthernet=no` | nspawn config | Shares the host network namespace. |
+| `Bind=/sys/fs/bpf:/sys/fs/bpf` | nspawn config | Exposes the host bpffs mount to eBPF CNIs such as Cilium. |
+| bpffs `ExecStartPre=` mount commands | Service override | Creates and mounts host `/sys/fs/bpf` before the machine starts. |
 | `SYSTEMD_NSPAWN_UNIFIED_HIERARCHY=1` | Service override | Forces cgroups v2 inside the container. |
 | `SYSTEMD_NSPAWN_API_VFS_WRITABLE=network` | Service override | Makes `/proc/sys/net` writable for CNI and kube-proxy. |
 | `Bind=/dev/kvm` | nspawn config | KVM device bind-mount (auto-generated when `/dev/kvm` is present). |
