@@ -134,6 +134,13 @@ pub struct UringBlockDevice {
     /// against the kernel. Bounded by `queue_depth` via the
     /// `submit_waiters` back-pressure queue.
     submitted: Cell<u32>,
+    /// High-water mark of `submitted` since the device was opened,
+    /// recorded at increment time in [`Self::submit_fixed_io`]. Lets
+    /// callers (and tests) observe that ops actually went in-flight
+    /// even when each op completes within its own poll - the
+    /// transient peak is invisible to an external sample of
+    /// `submitted`, which can return to zero before it is read.
+    peak_submitted: Cell<u32>,
     /// FIFO of wakers parked because `submitted == queue_depth`
     /// at submit time. Drained one-per-completion in `progress`.
     submit_waiters: RefCell<Vec<Waker>>,
@@ -211,6 +218,7 @@ impl UringBlockDevice {
             slot_capacity: MAX_REGISTERED_SLOTS,
             slots: RefCell::new(HashMap::new()),
             submitted: Cell::new(0),
+            peak_submitted: Cell::new(0),
             submit_waiters: RefCell::new(Vec::new()),
             next_user_data: Cell::new(1),
             page_size: cfg.page_size,
@@ -308,6 +316,9 @@ impl UringBlockDevice {
         let slot = Rc::new(IoSlot::new());
         self.slots.borrow_mut().insert(user_data, Rc::clone(&slot));
         self.submitted.set(self.submitted.get() + 1);
+        if self.submitted.get() > self.peak_submitted.get() {
+            self.peak_submitted.set(self.submitted.get());
+        }
 
         // SAFETY: SQE references caller-owned buffers within the
         // registered region; the caller keeps them alive until this
@@ -939,7 +950,6 @@ mod tests {
         let mut cx = Context::from_waker(&waker);
         let mut out: Vec<Option<Result<(), Error>>> = (0..futs.len()).map(|_| None).collect();
         let mut spins = 0u32;
-        let mut max_submitted: u32 = 0;
         loop {
             let mut made_progress = false;
             for (i, fut) in futs.iter_mut().enumerate() {
@@ -950,7 +960,6 @@ mod tests {
                     out[i] = Some(v);
                     made_progress = true;
                 }
-                max_submitted = max_submitted.max(dev.submitted.get());
                 assert!(
                     dev.submitted.get() <= QD,
                     "submitted={} exceeds queue_depth={}",
@@ -959,7 +968,6 @@ mod tests {
                 );
             }
             dev.progress().expect("progress");
-            max_submitted = max_submitted.max(dev.submitted.get());
             assert!(dev.submitted.get() <= QD);
             if out.iter().all(|o| o.is_some()) {
                 break;
@@ -974,8 +982,16 @@ mod tests {
         for r in &out {
             r.as_ref().unwrap().as_ref().expect("write ok");
         }
-        assert!(max_submitted > 0, "should have had in-flight ops");
-        assert!(max_submitted <= QD);
+        // The per-poll assertions above prove the ceiling held. The
+        // peak high-water mark is read from the device rather than
+        // sampled externally: with buffered I/O each write can complete
+        // within its own poll (the opportunistic `progress` in
+        // `IoFut::poll` reaps the CQE and decrements `submitted` back to
+        // zero before this loop ever samples it), so an external sample
+        // can legitimately never observe a non-zero in-flight count.
+        let peak = dev.peak_submitted.get();
+        assert!(peak > 0, "should have had in-flight ops");
+        assert!(peak <= QD);
     }
 
     fn unique_path(name: &str) -> PathBuf {

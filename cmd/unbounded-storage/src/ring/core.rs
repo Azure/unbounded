@@ -73,6 +73,13 @@ pub(crate) struct RingCore {
     /// Number of live (submitted, not yet reaped) ops. Bounded by
     /// `queue_depth` via the `submit_waiters` back-pressure queue.
     submitted: Cell<u32>,
+    /// High-water mark of `submitted` since the core was created,
+    /// recorded at increment time in [`Self::submit`]. Lets tests
+    /// observe that ops actually went in-flight even when each op
+    /// completes within its own poll - the transient peak is invisible
+    /// to an external sample of `submitted`, which can return to zero
+    /// before it is read.
+    peak_submitted: Cell<u32>,
     /// FIFO of wakers parked because `submitted == queue_depth` at
     /// submit time. Drained one-per-completion in [`Self::progress`].
     submit_waiters: RefCell<Vec<Waker>>,
@@ -200,6 +207,7 @@ impl RingCore {
             slots: RefCell::new(HashMap::new()),
             registered: RefCell::new(Vec::new()),
             submitted: Cell::new(0),
+            peak_submitted: Cell::new(0),
             submit_waiters: RefCell::new(Vec::new()),
             next_user_data: Cell::new(1),
             more_completions: Cell::new(0),
@@ -321,6 +329,9 @@ impl RingCore {
         let slot = Rc::new(Slot::new(expects_more, resource));
         self.slots.borrow_mut().insert(ud, Rc::clone(&slot));
         self.submitted.set(self.submitted.get() + 1);
+        if self.submitted.get() > self.peak_submitted.get() {
+            self.peak_submitted.set(self.submitted.get());
+        }
         // SAFETY: see the contract on the public submit methods.
         let push_res = unsafe {
             let mut ring = self.ring.borrow_mut();
@@ -465,6 +476,14 @@ impl RingCore {
     /// assert the back-pressure bound.
     pub(crate) fn in_flight(&self) -> u32 {
         self.submitted.get()
+    }
+
+    /// High-water mark of in-flight ops since creation. Used by the
+    /// back-pressure tests to confirm ops actually went in-flight
+    /// without racing the per-poll completion that returns `in_flight`
+    /// to zero before an external sample can read it.
+    pub(crate) fn peak_in_flight(&self) -> u32 {
+        self.peak_submitted.get()
     }
 
     /// Configured submission/completion depth.
