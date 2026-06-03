@@ -11,9 +11,10 @@ use std::task::{Context, Poll};
 
 use crate::bufferpool::free_list::FreeList;
 use crate::bufferpool::inflight::{PageSlot, SlotState, StripeFetch};
-use crate::bufferpool::stream::{LocalBoxFuture, ReadStream, StreamSrc};
+use crate::bufferpool::stream::{LocalBoxFuture, ReadStream, StaticBoxFuture, StreamSrc};
 use crate::bufferpool::traits::{BlockStore, BufferPool, PageStream, Req, Transport};
 use crate::bufferpool::types::{BulkRef, Error, PageRef, PoolConfig, StripeKey};
+use crate::bufferpool::window::WindowedRead;
 use crate::memory::Backing;
 
 /// One per shard. Per the design's runtime model, a single `Pool`
@@ -41,6 +42,11 @@ where
     pub(super) free: FreeList,
     pub(super) inflight: RefCell<HashMap<StripeKey, Rc<RefCell<StripeFetch>>>>,
     pub(super) stream_count: Cell<usize>,
+    /// Global speculative-prefetch budget shared by every
+    /// [`WindowedRead`]. Counts pages fetched strictly ahead of some
+    /// stream's cursor that are not yet consumed. Capped by
+    /// `cfg.max_inflight_pages`; the head page never counts.
+    pub(super) inflight_prefetch_pages: Cell<usize>,
     pub(super) transport: T,
     pub(super) blockstore: S,
     _r: PhantomData<R>,
@@ -93,6 +99,7 @@ where
             free: FreeList::new(page_count_u32),
             inflight: RefCell::new(HashMap::new()),
             stream_count: Cell::new(0),
+            inflight_prefetch_pages: Cell::new(0),
             transport,
             blockstore,
             _r: PhantomData,
@@ -111,13 +118,22 @@ where
     pub fn inflight_entries(&self) -> usize {
         self.inner.inflight.borrow().len()
     }
+
+    /// Test-only accessor for the global speculative-prefetch budget
+    /// currently reserved across all [`WindowedRead`]s. Used by the
+    /// out-of-tree DST harness to assert the budget returns to zero
+    /// at quiescence (every reservation is balanced on consume or
+    /// drop).
+    pub fn prefetch_inflight(&self) -> usize {
+        self.inner.inflight_prefetch_pages.get()
+    }
 }
 
 impl<T, S, R> BufferPool for Pool<T, S, R>
 where
     T: Transport<R> + 'static,
     S: BlockStore + 'static,
-    R: Req + 'static,
+    R: Req + Clone + 'static,
 {
     type Req = R;
 
@@ -127,6 +143,58 @@ where
         offset: u64,
         len: u64,
     ) -> Result<ReadStream<'p>, Error> {
+        let (src, end) = self.admit_stream(req, offset, len)?;
+        Ok(ReadStream::new(src, offset, end, self.inner.page_size))
+    }
+
+    /// Windowed counterpart to [`BufferPool::read`]. Returns a
+    /// [`WindowedRead`] that keeps up to `window` `fetch_page`
+    /// futures outstanding ahead of its consumer cursor (within
+    /// this single stripe) while still delivering `PageGuard`s
+    /// strictly in cursor order, one at a time. Speculative
+    /// prefetch is bounded by the pool's global
+    /// `max_inflight_pages` budget; the head page is always fetched
+    /// and never counts against it. `window` is clamped to
+    /// `[1, max_inflight_pages + 1]` (head plus the full budget).
+    fn read_windowed<'p>(
+        &'p self,
+        req: &'p R,
+        offset: u64,
+        len: u64,
+        window: usize,
+    ) -> Result<WindowedRead<'p>, Error> {
+        let (src, end) = self.admit_stream(req, offset, len)?;
+        let max_inflight = self.inner.cfg.max_inflight_pages;
+        let window = window.clamp(1, max_inflight.saturating_add(1));
+        Ok(WindowedRead::new(
+            src,
+            offset,
+            end,
+            self.inner.page_size,
+            window,
+            max_inflight,
+        ))
+    }
+}
+
+impl<T, S, R> Pool<T, S, R>
+where
+    T: Transport<R> + 'static,
+    S: BlockStore + 'static,
+    R: Req + Clone + 'static,
+{
+    /// Shared admission path for [`BufferPool::read`] and
+    /// [`BufferPool::read_windowed`]: enforces `max_concurrent_streams`,
+    /// bumps the stream count, gets or creates the stripe's
+    /// `StripeFetch`, and builds the type-erased `StreamSrc` that
+    /// owns an `Rc<R>` clone of the request. Returns the erased
+    /// source and the exclusive end offset.
+    fn admit_stream<'p>(
+        &'p self,
+        req: &R,
+        offset: u64,
+        len: u64,
+    ) -> Result<(Rc<dyn StreamSrc + 'p>, u64), Error> {
         let cur = self.inner.stream_count.get();
         if cur >= self.inner.cfg.max_concurrent_streams {
             return Err(Error::StreamLimit);
@@ -144,9 +212,13 @@ where
         fetch.borrow_mut().stream_refcount += 1;
 
         let end = offset.saturating_add(len);
-        let src: Rc<dyn StreamSrc + 'p> =
-            Rc::new(StreamSrcImpl::new(self.inner.clone(), req, key, fetch));
-        Ok(ReadStream::new(src, offset, end, self.inner.page_size))
+        let src: Rc<dyn StreamSrc + 'p> = Rc::new(StreamSrcImpl::new(
+            self.inner.clone(),
+            Rc::new(req.clone()),
+            key,
+            fetch,
+        ));
+        Ok((src, end))
     }
 }
 
@@ -154,14 +226,18 @@ where
 // StreamSrc: type-erased per-stream view onto the typed PoolInner.
 // ---------------------------------------------------------------------------
 
-pub(super) struct StreamSrcImpl<'p, T, S, R>
+pub(super) struct StreamSrcImpl<T, S, R>
 where
     T: Transport<R> + 'static,
     S: BlockStore + 'static,
     R: Req + 'static,
 {
     inner: Rc<PoolInner<T, S, R>>,
-    req: &'p R,
+    /// Owned (`Rc`) clone of the caller's request. Owned rather than
+    /// borrowed so [`StreamSrc::fetch_page_owned`] can hand out a
+    /// `'static` fetch future that a `WindowedRead` parks alongside
+    /// this source.
+    req: Rc<R>,
     key: StripeKey,
     fetch: Rc<RefCell<StripeFetch>>,
     /// Tracks whether `decrement_stream` has already run (it must
@@ -173,7 +249,7 @@ where
     stream_decremented: Cell<bool>,
 }
 
-impl<'p, T, S, R> StreamSrcImpl<'p, T, S, R>
+impl<T, S, R> StreamSrcImpl<T, S, R>
 where
     T: Transport<R> + 'static,
     S: BlockStore + 'static,
@@ -181,7 +257,7 @@ where
 {
     pub(super) fn new(
         inner: Rc<PoolInner<T, S, R>>,
-        req: &'p R,
+        req: Rc<R>,
         key: StripeKey,
         fetch: Rc<RefCell<StripeFetch>>,
     ) -> Self {
@@ -195,7 +271,7 @@ where
     }
 }
 
-impl<'p, T, S, R> StreamSrc for StreamSrcImpl<'p, T, S, R>
+impl<T, S, R> StreamSrc for StreamSrcImpl<T, S, R>
 where
     T: Transport<R> + 'static,
     S: BlockStore + 'static,
@@ -214,12 +290,26 @@ where
     }
 
     fn fetch_page<'a>(&'a self, page_no: u64) -> LocalBoxFuture<'a, Result<u32, Error>> {
+        // The owned future is already `'static`; coerce it to the
+        // borrowed `'a` the trait asks for. Single source of truth
+        // for the fetch machine. The borrowed (ReadStream) path
+        // never prefetches, so it is never speculative: its leader
+        // allocates blocking.
+        self.fetch_page_owned(page_no, false)
+    }
+
+    fn fetch_page_owned(
+        &self,
+        page_no: u64,
+        speculative: bool,
+    ) -> StaticBoxFuture<Result<u32, Error>> {
         Box::pin(fetch_page(
             self.inner.clone(),
             self.fetch.clone(),
             self.key,
-            self.req,
+            self.req.clone(),
             page_no,
+            speculative,
         ))
     }
 
@@ -234,6 +324,42 @@ where
         decrement_stream(&self.inner, self.key, &self.fetch);
         let prev = self.inner.stream_count.get();
         self.inner.stream_count.set(prev.saturating_sub(1));
+    }
+
+    fn try_reserve_prefetch(&self, max: usize) -> bool {
+        // Reserve one backing page per active stream for its in-order
+        // head, and only let speculation use pages beyond that. The
+        // global budget therefore cannot exceed `page_count -
+        // stream_count`. Without this bound a stream can pin pages it
+        // prefetched ahead in its `ready` buffer while another
+        // stream's head starves on the free list, a circular
+        // hold-and-wait deadlock under page pressure (the head can
+        // never get a backing page, so it can never advance to
+        // release the page that would unblock its peer). Capping the
+        // speculative footprint at `page_count - stream_count`
+        // guarantees at least `stream_count` pages remain reachable
+        // by heads, so with the FIFO hand-off free list every blocked
+        // head eventually allocates.
+        let head_reserve = self
+            .inner
+            .backing
+            .page_count
+            .saturating_sub(self.inner.stream_count.get());
+        let effective = max.min(head_reserve);
+        let cur = self.inner.inflight_prefetch_pages.get();
+        if cur < effective {
+            self.inner.inflight_prefetch_pages.set(cur + 1);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn release_prefetch(&self) {
+        let cur = self.inner.inflight_prefetch_pages.get();
+        self.inner
+            .inflight_prefetch_pages
+            .set(cur.saturating_sub(1));
     }
 }
 
@@ -390,8 +516,19 @@ fn decrement_stream<T, S, R>(
         f.stream_refcount = f.stream_refcount.saturating_sub(1);
         let mut released = Vec::new();
         if f.stream_refcount == 0 {
+            // Last stream on this stripe is gone, so no future can
+            // still be mid-flight against any of its slots (each
+            // stream drops its pending fetch futures before
+            // decrementing). Release every recyclable slot's page,
+            // not just terminal ones: a speculative `WindowedRead`
+            // prefetch that became leader and allocated a page, then
+            // was dropped mid-flight, leaves its slot in `Idle` with
+            // `page_idx` set. With no stream left to take over
+            // leadership and reuse it, that page must be reclaimed
+            // here or it leaks. `is_recyclable()` still guards
+            // against tearing down a slot with an outstanding hold.
             f.pages.retain(|_, slot| {
-                if slot.is_recyclable() && slot_is_terminal(slot) {
+                if slot.is_recyclable() {
                     if let Some(pi) = slot.page_idx.get() {
                         released.push(pi);
                     }
@@ -435,8 +572,9 @@ async fn fetch_page<T, S, R>(
     inner: Rc<PoolInner<T, S, R>>,
     fetch: Rc<RefCell<StripeFetch>>,
     key: StripeKey,
-    req: &R,
+    req: Rc<R>,
     page_no: u64,
+    speculative: bool,
 ) -> Result<u32, Error>
 where
     T: Transport<R> + 'static,
@@ -509,11 +647,42 @@ where
                     ConsumerHold::new(inner.clone(), fetch.clone(), slot.clone(), key, page_no);
                 let mut leader_guard = LeaderGuard {
                     slot: &slot,
+                    free: &inner.free,
                     completed: false,
                 };
 
                 if slot.page_idx.get().is_none() {
-                    let pi = inner.free.alloc().await;
+                    // Allocate the backing page lazily, here on the
+                    // leader's first poll, so a fetch future that is
+                    // launched but never polled holds no page. A
+                    // speculative (prefetch) fetch must never park on
+                    // the free list: it tries non-blockingly and, if
+                    // no page is free, backs off so the head keeps
+                    // priority on scarce pages. Returning here drops
+                    // `leader_guard` (resetting the slot to `Idle` and
+                    // waking parked subscribers) and `leader_hold`, so
+                    // the slot is left clean for a later retry. A
+                    // non-speculative (head) fetch blocks until a page
+                    // frees; it is the only path that parks on the
+                    // free list, which is what keeps prefetch from
+                    // starving any stream's head and deadlocking.
+                    let pi = if speculative {
+                        // Keep one reserve page free per active stream
+                        // so every stream's head can always allocate
+                        // without parking. This is what makes the
+                        // prefetch design deadlock-free: a starvation
+                        // cycle requires some head blocked on
+                        // `free.alloc` while speculation pins the pages
+                        // it needs; refusing speculation that last
+                        // reserve guarantees no head ever parks.
+                        let reserve = inner.stream_count.get();
+                        match inner.free.try_alloc_spare(reserve) {
+                            Some(pi) => pi,
+                            None => return Err(Error::PrefetchBackoff),
+                        }
+                    } else {
+                        inner.free.alloc().await
+                    };
                     slot.page_idx.set(Some(pi));
                 }
                 let pi = slot.page_idx.get().expect("page_idx set above");
@@ -538,7 +707,7 @@ where
                             len: inner.page_size as u32,
                         };
                         let dsts: [PageRef; 1] = [dst];
-                        let stream = inner.transport.bulk_get(req, bulk, &dsts);
+                        let stream = inner.transport.bulk_get(req.as_ref(), bulk, &dsts);
                         drive_single_page(stream).await?;
                     }
                     Ok(hit)
@@ -610,6 +779,9 @@ enum Action {
 
 struct LeaderGuard<'a> {
     slot: &'a Rc<PageSlot>,
+    /// Free list, so a leader cancelled mid-flight with no subscriber
+    /// to take over can return its page instead of orphaning it.
+    free: &'a FreeList,
     completed: bool,
 }
 
@@ -619,10 +791,23 @@ impl<'a> Drop for LeaderGuard<'a> {
             return;
         }
         // Leader future was dropped before reaching Ready (during
-        // read_page or bulk_get). Reset to Idle so the next
-        // subscriber takes over leadership; preserve `page_idx` for
-        // reuse. v1 drain relaxation: see mod.rs.
+        // read_page or bulk_get). Reset to Idle so a parked
+        // subscriber takes over leadership.
         let wakers = take_loading_wakers(self.slot);
+        // If a subscriber is parked, leave `page_idx` set so whichever
+        // one re-leads reuses the already-allocated page (their
+        // pre-bumped `consumer_holds` keep the slot pinned across the
+        // handoff). If there is no subscriber to take over, the page
+        // would be orphaned in an `Idle` slot that nobody is driving,
+        // holding a backing page that no fetch will ever recycle. That
+        // can deadlock other streams blocked on the free list, so
+        // return it here instead. A later fetch of this page finds the
+        // slot `Idle` with `page_idx == None` and allocates afresh.
+        if wakers.is_empty() {
+            if let Some(pi) = self.slot.page_idx.take() {
+                self.free.release(pi);
+            }
+        }
         *self.slot.state.borrow_mut() = SlotState::Idle;
         for w in wakers {
             w.wake();
@@ -723,18 +908,11 @@ where
         // is `Unpin`.
         let this = self.get_mut();
 
-        // First poll: register our waker and pre-bump
-        // `consumer_holds`. `Action::Park` observed `Loading`
-        // synchronously, but the leader may have completed before
-        // we get here; bump unconditionally so the outcome paths
-        // below always have a hold to consume, then fall through.
+        // Pre-bump `consumer_holds` once. `Action::Park` observed
+        // `Loading` synchronously, but the leader may have completed
+        // before we get here; bump unconditionally so the outcome
+        // paths below always have a hold to consume.
         if this.hold.is_none() {
-            {
-                let mut st = this.slot.state.borrow_mut();
-                if let SlotState::Loading(wakers) = &mut *st {
-                    wakers.push(cx.waker().clone());
-                }
-            }
             this.hold = Some(ConsumerHold::new(
                 this.inner.clone(),
                 this.fetch.clone(),
@@ -744,10 +922,26 @@ where
             ));
         }
 
+        // Register our waker into the *current* `Loading` waker list
+        // on every poll, not just the first. A slot can cycle
+        // `Loading -> Idle -> Loading` while we stay parked: when a
+        // leader future is dropped pre-`Ready` (e.g. a windowed reader
+        // cancels its speculative leader), `LeaderGuard::drop` drains
+        // the waker list and resets the slot to `Idle`, and a woken
+        // subscriber then re-leads with a fresh, empty waker list. A
+        // subscriber that registered only on its first poll would no
+        // longer be in that new list and would never be woken when the
+        // new leader completes, deadlocking. The executor hands out a
+        // fresh waker per poll, so re-registration appends; the list
+        // is bounded per `Loading` episode (drained on every
+        // transition) and the executor de-duplicates ready task ids.
         let outcome = {
-            let st = this.slot.state.borrow();
-            match &*st {
-                SlotState::Loading(_) => return Poll::Pending,
+            let mut st = this.slot.state.borrow_mut();
+            match &mut *st {
+                SlotState::Loading(wakers) => {
+                    wakers.push(cx.waker().clone());
+                    return Poll::Pending;
+                }
                 SlotState::Ready => Outcome::Ready,
                 SlotState::Error(e) => Outcome::Error(e.clone()),
                 SlotState::Idle => Outcome::Retry,

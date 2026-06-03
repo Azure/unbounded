@@ -197,6 +197,13 @@ impl StorageRing {
     pub(crate) fn in_flight(&self) -> u32 {
         self.core.in_flight()
     }
+
+    /// High-water mark of in-flight ops since this ring was created.
+    /// Used by the back-pressure tests to confirm ops actually went
+    /// in-flight without racing the per-poll completion path.
+    pub(crate) fn peak_in_flight(&self) -> u32 {
+        self.core.peak_in_flight()
+    }
 }
 
 /// Validate a fixed-I/O CQE `res` against the expected byte count.
@@ -411,7 +418,6 @@ mod tests {
         let mut cx = Context::from_waker(&waker);
         let mut out: Vec<Option<Result<(), Error>>> = (0..futs.len()).map(|_| None).collect();
         let mut spins = 0u32;
-        let mut max_in_flight: u32 = 0;
         loop {
             let mut made_progress = false;
             for (i, fut) in futs.iter_mut().enumerate() {
@@ -422,7 +428,6 @@ mod tests {
                     out[i] = Some(v);
                     made_progress = true;
                 }
-                max_in_flight = max_in_flight.max(ring.in_flight());
                 assert!(
                     ring.in_flight() <= QD,
                     "in_flight={} exceeds queue_depth={QD}",
@@ -430,7 +435,6 @@ mod tests {
                 );
             }
             ring.progress().expect("progress");
-            max_in_flight = max_in_flight.max(ring.in_flight());
             assert!(ring.in_flight() <= QD);
             if out.iter().all(|o| o.is_some()) {
                 break;
@@ -445,7 +449,14 @@ mod tests {
         for r in &out {
             r.as_ref().unwrap().as_ref().expect("write ok");
         }
-        assert!(max_in_flight > 0, "should have had in-flight ops");
-        assert!(max_in_flight <= QD);
+        // The per-poll assertions above prove the ceiling held. The
+        // peak high-water mark is read from the ring rather than sampled
+        // externally: with buffered I/O each write can complete within
+        // its own poll, returning `in_flight` to zero before this loop
+        // ever samples it, so an external sample can legitimately never
+        // observe a non-zero in-flight count.
+        let peak = ring.peak_in_flight();
+        assert!(peak > 0, "should have had in-flight ops");
+        assert!(peak <= QD);
     }
 }

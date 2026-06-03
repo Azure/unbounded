@@ -36,6 +36,16 @@ pub struct FabricConfig {
     pub listen: bool,
     pub listen_addr: Option<String>,
     pub max_inflight: usize,
+    /// Number of request receive buffers the RPC server keeps posted at
+    /// all times. This bounds how many distinct page requests can be in
+    /// flight to one server concurrently, which is the only axis of
+    /// server-side download concurrency (the production handler serves
+    /// exactly one page per request). It must be large enough to cover a
+    /// downloading client's prefetch window so the fabric NIC stays
+    /// saturated; the effective value is clamped to half of
+    /// `max_inflight` so write and ack completions always have registry
+    /// slots.
+    pub rpc_posted_recvs: usize,
     pub progress_threads: u8,
     pub progress_poll_us: u32,
     pub runtime: Arc<dyn Threading>,
@@ -50,6 +60,9 @@ impl FabricConfig {
         }
         if self.max_inflight == 0 {
             return Err(FabricError::BadConfig("max_inflight must be > 0"));
+        }
+        if self.rpc_posted_recvs == 0 {
+            return Err(FabricError::BadConfig("rpc_posted_recvs must be >= 1"));
         }
         if self.listen && self.listen_addr.is_none() {
             return Err(FabricError::BadConfig(
@@ -73,6 +86,7 @@ pub fn defaults_for(
         listen: false,
         listen_addr: None,
         max_inflight: 4096,
+        rpc_posted_recvs: 256,
         progress_threads: 2,
         progress_poll_us: 10,
         runtime,
@@ -135,6 +149,16 @@ mod tests {
     fn validate_rejects_zero_max_inflight() {
         let mut c = defaults_for("eth0", rt(), WorkerIdx(0));
         c.max_inflight = 0;
+        match c.validate() {
+            Err(FabricError::BadConfig(_)) => {}
+            other => panic!("expected BadConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_zero_rpc_posted_recvs() {
+        let mut c = defaults_for("eth0", rt(), WorkerIdx(0));
+        c.rpc_posted_recvs = 0;
         match c.validate() {
             Err(FabricError::BadConfig(_)) => {}
             other => panic!("expected BadConfig, got {other:?}"),

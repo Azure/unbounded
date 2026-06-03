@@ -208,12 +208,24 @@ impl Fabric {
             inflight: AtomicU64::new(0),
         });
         let max_inflight = shared.fabric.cfg.max_inflight;
-        let posted = (max_inflight / 8).max(1).min(4);
+        let posted = posted_request_recvs(shared.fabric.cfg.rpc_posted_recvs, max_inflight);
         for _ in 0..posted {
             post_request_recv::<R, H>(&shared, &handler)?;
         }
         Ok(RpcServerHandle { shared })
     }
+}
+
+/// How many request receive buffers to keep posted.
+///
+/// Server-side download concurrency for a single object is bounded by
+/// how many page requests can be outstanding at once, so this should be
+/// large enough to cover a downloading client's prefetch window. It is
+/// clamped to at least 1 and to at most half the completion registry
+/// capacity (`max_inflight`) so the write and ack completions issued
+/// while serving those requests always have free registry slots.
+fn posted_request_recvs(rpc_posted_recvs: usize, max_inflight: usize) -> usize {
+    rpc_posted_recvs.clamp(1, (max_inflight / 2).max(1))
 }
 
 fn post_request_recv<R, H>(shared: &Arc<ServerShared>, handler: &Arc<H>) -> FabResult<()>
@@ -681,6 +693,23 @@ fn block_on(mut fut: CompletionFuture, timeout: Duration) -> FabResult<Completio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn posted_request_recvs_clamps_lower_bound_to_one() {
+        assert_eq!(posted_request_recvs(0, 4096), 1);
+    }
+
+    #[test]
+    fn posted_request_recvs_caps_at_half_max_inflight() {
+        assert_eq!(posted_request_recvs(4096, 100), 50);
+        // Tiny registries still keep at least one posted recv.
+        assert_eq!(posted_request_recvs(256, 1), 1);
+    }
+
+    #[test]
+    fn posted_request_recvs_passes_through_when_in_range() {
+        assert_eq!(posted_request_recvs(256, 4096), 256);
+    }
 
     fn mr(base: usize, len: usize) -> MrHandle {
         MrHandle {

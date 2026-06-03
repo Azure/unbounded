@@ -38,11 +38,6 @@ use unbounded_storage::memory::{BackingKind, BackingRequest, allocate};
 const DEFAULT_CONFIG_PATH: &str = "/etc/unbounded-storage/config.toml";
 const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
 
-/// Object-length cache TTL for the per-shard HTTP frontend driver,
-/// in milliseconds. Matches the default the frontend's `from_spec`
-/// path uses.
-const DEFAULT_META_TTL_MS: u64 = 30_000;
-
 /// Stripe granularity used to build an inert origin backend on shards
 /// that have no configured backend. Such a backend is never exercised
 /// (no frontend drives reads against the pool), so the value is
@@ -58,6 +53,24 @@ type ShardPool = Pool<RoutedTransport<StripeReq, HttpBackend>, Arc<LiveShardLoca
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+
+    // Enable the libfabric tcp provider's kernel zero-copy send path
+    // (send(MSG_ZEROCOPY)) so the non-RDMA fallback preserves the same
+    // zero-copy semantics as the verbs RMA path. libfabric reads this
+    // fi_param lazily at provider init (first fi_getinfo), which happens
+    // per-shard on the spawned shard threads, so it must be set here while
+    // the process is still single-threaded. 16 KiB sits just above the tcp
+    // message-buffer size and well below the 2 MiB page transfers, so every
+    // bulk fi_write qualifies. Ignored by the verbs provider, and the
+    // provider falls back to a copying send on kernels without TCP
+    // MSG_ZEROCOPY support, so setting it unconditionally is safe.
+    //
+    // SAFETY: no other threads have been spawned yet in `main`, so this
+    // set_var cannot race a concurrent getenv/setenv.
+    unsafe {
+        std::env::set_var("FI_TCP_ZEROCOPY_SIZE", "16384");
+    }
+
     let (config_path, config_explicit) = match cli.config.as_ref() {
         Some(p) => (p.clone(), true),
         None => (PathBuf::from(DEFAULT_CONFIG_PATH), false),
@@ -716,8 +729,6 @@ fn run_shard(
                 backend_id.clone(),
                 stripe_size,
                 page_size,
-                origin,
-                DEFAULT_META_TTL_MS,
             );
             shard_loop.add_tick_hook(move || driver.progress());
             eprintln!("shard {}: frontend {} driver registered", widx.0, spec.id);

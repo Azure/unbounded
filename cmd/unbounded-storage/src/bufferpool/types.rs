@@ -43,12 +43,24 @@ pub struct PoolConfig {
     /// Caps the number of concurrent `ReadStream`s the pool will
     /// admit. v1 enforces this only at `read()` time.
     pub max_concurrent_streams: usize,
+    /// Global cap, shared across every windowed stream the pool is
+    /// serving, on speculative prefetch pages: pages a
+    /// [`crate::bufferpool::WindowedRead`] has launched a fetch for
+    /// while they sit strictly ahead of that stream's consumer
+    /// cursor and have not yet been consumed. The head-of-line page
+    /// (the one at the cursor) is always fetched and never counts
+    /// against this budget, so forward progress is guaranteed even
+    /// when the budget is fully reserved. Bounding speculation this
+    /// way keeps prefetch from starving the free list out from under
+    /// any stream's head fetch.
+    pub max_inflight_pages: usize,
 }
 
 impl Default for PoolConfig {
     fn default() -> Self {
         Self {
             max_concurrent_streams: 1024,
+            max_inflight_pages: 64,
         }
     }
 }
@@ -63,6 +75,13 @@ pub enum Error {
     StreamLimit,
     Transport(Arc<dyn std::error::Error + Send + Sync>),
     BlockStore(Arc<dyn std::error::Error + Send + Sync>),
+    /// Internal sentinel: a speculative (prefetch) fetch found the
+    /// free list empty and backed off rather than parking on it, so
+    /// the head fetch keeps priority on scarce pages. Never reaches a
+    /// stream consumer: [`crate::bufferpool::WindowedRead`] intercepts
+    /// it on the speculative path and a head fetch is never
+    /// speculative.
+    PrefetchBackoff,
 }
 
 impl Error {
@@ -110,6 +129,7 @@ impl fmt::Display for Error {
             Error::StreamLimit => write!(f, "max_concurrent_streams reached"),
             Error::Transport(e) => write!(f, "transport error: {e}"),
             Error::BlockStore(e) => write!(f, "block store error: {e}"),
+            Error::PrefetchBackoff => write!(f, "speculative prefetch backed off"),
         }
     }
 }

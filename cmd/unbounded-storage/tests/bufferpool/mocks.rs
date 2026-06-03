@@ -137,24 +137,16 @@ impl DstTransport {
 
         let page_size = self.page_size;
         let page_no = src.offset / page_size as u64;
-        // Track concurrent in-flight for the single-flight invariant.
-        {
-            let mut inflight = self.counts.bulk_get_inflight.borrow_mut();
-            let entry = inflight.entry((src.stripe, page_no)).or_insert(0);
-            *entry += 1;
-            let cur = *entry;
-            let mut max = self.counts.bulk_get_max_inflight.borrow_mut();
-            let m = max.entry((src.stripe, page_no)).or_insert(0);
-            if cur > *m {
-                *m = cur;
-            }
-        }
+        // Track concurrent in-flight for the single-flight invariant
+        // via an RAII guard so that a `bulk_get` future dropped
+        // mid-flight (the pool's leader-drop / subscriber-takeover
+        // path, which cancels the in-flight I/O) is correctly
+        // un-counted. A manual decrement at the end would leak the
+        // count on cancellation and spuriously report two concurrent
+        // `bulk_get`s when the next leader re-issues for the page.
+        let _inflight = InflightGuard::enter(&self.counts, src.stripe, page_no);
         yield_n(delay).await;
         if fault {
-            let mut inflight = self.counts.bulk_get_inflight.borrow_mut();
-            if let Some(e) = inflight.get_mut(&(src.stripe, page_no)) {
-                *e = e.saturating_sub(1);
-            }
             return Err(Error::from("dst: injected transport fault"));
         }
 
@@ -180,12 +172,47 @@ impl DstTransport {
         self.counts.bulk_get.set(self.counts.bulk_get.get() + 1);
         let mut by_page = self.counts.bulk_get_by_page.borrow_mut();
         *by_page.entry((src.stripe, page_no)).or_insert(0) += 1;
-        drop(by_page);
+        Ok(())
+    }
+}
+
+/// RAII tracker for concurrent `bulk_get`s against one logical page.
+/// Increments the in-flight count (and bumps the observed max) on
+/// `enter`, decrements on drop. Drop-based decrement is what makes
+/// the single-flight invariant robust to the pool dropping a leader
+/// future mid-I/O: that cancels the I/O, so the page is no longer
+/// in-flight even though `do_bulk_get` never ran to completion.
+struct InflightGuard<'a> {
+    counts: &'a CallCounts,
+    key: StripeKey,
+    page_no: u64,
+}
+
+impl<'a> InflightGuard<'a> {
+    fn enter(counts: &'a CallCounts, key: StripeKey, page_no: u64) -> Self {
+        let mut inflight = counts.bulk_get_inflight.borrow_mut();
+        let entry = inflight.entry((key, page_no)).or_insert(0);
+        *entry += 1;
+        let cur = *entry;
+        let mut max = counts.bulk_get_max_inflight.borrow_mut();
+        let m = max.entry((key, page_no)).or_insert(0);
+        if cur > *m {
+            *m = cur;
+        }
+        Self {
+            counts,
+            key,
+            page_no,
+        }
+    }
+}
+
+impl<'a> Drop for InflightGuard<'a> {
+    fn drop(&mut self) {
         let mut inflight = self.counts.bulk_get_inflight.borrow_mut();
-        if let Some(e) = inflight.get_mut(&(src.stripe, page_no)) {
+        if let Some(e) = inflight.get_mut(&(self.key, self.page_no)) {
             *e = e.saturating_sub(1);
         }
-        Ok(())
     }
 }
 

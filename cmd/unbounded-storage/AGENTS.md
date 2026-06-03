@@ -5,6 +5,12 @@ the project is Go, so the conventions below intentionally diverge from
 the top-level `AGENTS.md` where they need to. Read this file before
 touching anything under `cmd/unbounded-storage/`.
 
+For the crate's design - what the daemon does, how it is structured into
+subsystems, and how data flows through it - read
+[`ARCHITECTURE.md`](ARCHITECTURE.md). This file covers the conventions
+(layout, build, test); `ARCHITECTURE.md` covers the system itself. Read
+both before making non-trivial changes.
+
 ## Crate layout
 
 - Each subsystem is a directory module:
