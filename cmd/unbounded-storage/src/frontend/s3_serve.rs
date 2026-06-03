@@ -1,29 +1,23 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! HTTP serving frontend: the working replacement for the old S3 stub.
+//! S3 serving frontend: the HTTP serving engine speaking native S3.
 //!
-//! This file owns two concerns:
+//! This is the structural twin of [`crate::frontend::http_serve`]: the
+//! factory ([`S3Frontend`]) and the per-shard engine ([`S3Driver`])
+//! mirror [`HttpFrontend`](crate::frontend::HttpFrontend) /
+//! [`HttpDriver`](crate::frontend::HttpDriver) exactly, down to the
+//! `SO_REUSEPORT` bind, the accept loop, and the zero-copy stripe
+//! streaming. The only divergence is the per-request serve function:
+//! every error is rendered as an S3 `<Error>` XML document (see
+//! [`crate::frontend::s3_xml`]) with the matching status, and a length
+//! read that fails with
+//! [`Error::OriginNotFound`](crate::bufferpool::Error::OriginNotFound)
+//! becomes a `404 NoSuchKey` instead of a dropped connection.
 //!
-//! 1. **The factory** ([`HttpFrontend`]): validates a
-//!    [`FrontendSpec`](crate::config::FrontendSpec) and binds a
-//!    `SO_REUSEPORT` listening socket via `libc` so every shard can
-//!    accept on the same port. It does not implement the `Frontend`
-//!    trait: the concrete bufferpool type is only nameable in the
-//!    binary (Phase E), so the binary calls this directly.
-//! 2. **The serving engine** ([`HttpDriver`]): a per-shard,
-//!    cooperatively-driven engine generic over the bufferpool `P`. It
-//!    owns an internal future set (one persistent accept future plus
-//!    one future per live connection) advanced by [`HttpDriver::progress`],
-//!    which the shard loop registers as a tick hook.
-//!
-//! The hot serve path is: parse the request, resolve the object length
-//! by reading the object's dedicated length entry through the pool,
-//! resolve the byte range, write the
-//! response head, then stream the body stripe-by-stripe out of the
-//! bufferpool with zero-copy `SEND_ZC`, holding each [`PageGuard`]
-//! across the send (the SEND_ZC notification is when the kernel is done
-//! with the page) before advancing the stream.
+//! HEAD requests never carry a response body, even on error: those
+//! paths send only the status line and headers (`Content-Length: 0`,
+//! plus `Content-Range` for an unsatisfiable range), never the XML.
 //!
 //! Linux-gated because serving depends on the io_uring
 //! [`NetHandle`](crate::ring::NetHandle).
@@ -33,15 +27,19 @@ use std::net::SocketAddr;
 use std::os::fd::RawFd;
 use std::pin::Pin;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll, Waker};
 
-use ::http::header::{ACCEPT_RANGES, CONNECTION, CONTENT_LENGTH, CONTENT_RANGE};
+use ::http::header::{
+    ACCEPT_RANGES, CONNECTION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE,
+};
 use ::http::{Response, StatusCode};
 
-use crate::bufferpool::{BufferPool, ReadStream};
+use crate::bufferpool::{BufferPool, Error};
 use crate::config::{FrontendKind, FrontendSpec};
 use crate::frontend::FrontendError;
 use crate::frontend::range::{ByteRange, RangeError, ResolvedRange, full_object, stripe_set};
+use crate::frontend::s3_xml::{S3ErrorCode, error_xml};
 use crate::http::{
     FdGuard, HttpRequest, MAX_HEADER_BYTES, Method, ParseError, RECV_CHUNK, bind_listener,
     noop_waker, send_all, serialize_response_head, split_query,
@@ -49,26 +47,40 @@ use crate::http::{
 use crate::ring::NetHandle;
 use crate::storage::{OriginRef, StripeReq};
 
-/// HTTP serving frontend factory. Built once per [`FrontendSpec`];
-/// holds only the immutable configuration distilled from the spec.
+/// The `x-amz-request-id` response header name. Present on every
+/// response (success and error) so clients and proxies can correlate.
+const X_AMZ_REQUEST_ID: &str = "x-amz-request-id";
+
+/// Monotonic source for per-request `x-amz-request-id` values. A plain
+/// process-global counter is enough: the ids only need to be present
+/// and non-empty, and a counter keeps them deterministic for tests.
+static REQUEST_ID_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// S3 serving frontend factory. Built once per [`FrontendSpec`]; holds
+/// only the immutable configuration distilled from the spec.
 ///
-/// Unlike the old S3 stub this does not implement the `Frontend` trait:
-/// the per-shard [`HttpDriver`] is generic over the concrete bufferpool
-/// type, which is only nameable in the binary, so Phase E binds the
-/// listener via [`HttpFrontend::bind_listener`] and constructs the
-/// driver directly.
-pub struct HttpFrontend {
+/// Like [`HttpFrontend`](crate::frontend::HttpFrontend) it does not
+/// implement the `Frontend` trait: the per-shard [`S3Driver`] is
+/// generic over the concrete bufferpool type, which is only nameable in
+/// the binary, so the binary binds the listener via
+/// [`S3Frontend::bind_listener`] and constructs the driver directly.
+pub struct S3Frontend {
     id: String,
     bind: SocketAddr,
     backend_id: String,
 }
 
-impl HttpFrontend {
+impl S3Frontend {
     /// Construct from a [`FrontendSpec`], validating the kind and
     /// parsing the bind address.
+    ///
+    /// Mirrors [`HttpFrontend::from_spec`](crate::frontend::HttpFrontend):
+    /// a spec whose [`FrontendKind`] is not `S3` is rejected with
+    /// [`FrontendError::UnsupportedKind`], so a misrouted spec fails
+    /// loudly rather than being served by the wrong engine.
     pub fn from_spec(spec: &FrontendSpec) -> Result<Self, FrontendError> {
-        if spec.kind != FrontendKind::Http {
-            return Err(FrontendError::UnsupportedKind("non-http frontend kind"));
+        if spec.kind != FrontendKind::S3 {
+            return Err(FrontendError::UnsupportedKind("non-s3 frontend kind"));
         }
         let bind = spec
             .bind
@@ -102,24 +114,22 @@ impl HttpFrontend {
     /// same port, returning the listening [`RawFd`]. Linux-only.
     ///
     /// The caller owns the returned fd and is responsible for closing
-    /// it; [`HttpDriver`] only reads it for `accept`.
+    /// it; [`S3Driver`] only reads it for `accept`.
     pub fn bind_listener(&self) -> Result<RawFd, FrontendError> {
         bind_listener(self.bind).map_err(|_| FrontendError::BadBind(self.bind.to_string()))
     }
 }
 
-/// Per-shard HTTP serving engine, generic over the bufferpool `P` so
-/// the concrete `ShardPool` type (nameable only in the binary) can be
-/// plugged in by Phase E.
+/// Per-shard S3 serving engine, generic over the bufferpool `P` so the
+/// concrete `ShardPool` type (nameable only in the binary) can be
+/// plugged in by the binary.
 ///
-/// Owns its own internal future set: one persistent `accept` future and
-/// one serve future per live connection. [`Self::progress`] advances
-/// them with a noop waker, mirroring `ShardLoop::drive`; the shard loop
-/// registers `progress` as a tick hook. The socket ring's own
-/// `progress` is a separate tick hook (added by the shard bring-up), so
-/// the serve/accept futures' slots get filled even though this engine
-/// only polls them.
-pub struct HttpDriver<P: BufferPool<Req = StripeReq> + 'static> {
+/// Structurally identical to
+/// [`HttpDriver`](crate::frontend::HttpDriver): one persistent `accept`
+/// future plus one serve future per live connection, advanced by
+/// [`Self::progress`] with a noop waker and registered as a shard-loop
+/// tick hook.
+pub struct S3Driver<P: BufferPool<Req = StripeReq> + 'static> {
     pool: Rc<P>,
     handle: NetHandle,
     listen_fd: RawFd,
@@ -131,7 +141,7 @@ pub struct HttpDriver<P: BufferPool<Req = StripeReq> + 'static> {
     waker: Waker,
 }
 
-impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
+impl<P: BufferPool<Req = StripeReq> + 'static> S3Driver<P> {
     /// Build a serving engine over a bound `listen_fd`.
     ///
     /// `stripe_size` and `page_size` come from the shard's pool
@@ -187,7 +197,7 @@ impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
                 Poll::Ready(res) => {
                     busy = true;
                     if let Ok(fd) = res {
-                        let serve = serve_connection(
+                        let serve = serve_connection_s3(
                             Rc::clone(&self.pool),
                             self.handle.clone(),
                             fd,
@@ -224,7 +234,7 @@ impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
 /// Owns everything it needs so the future is `'static` and can live in
 /// the driver's future set across ticks. All paths close `conn_fd` via
 /// the [`FdGuard`]; serve errors just drop the connection.
-async fn serve_connection<P: BufferPool<Req = StripeReq>>(
+async fn serve_connection_s3<P: BufferPool<Req = StripeReq>>(
     pool: Rc<P>,
     handle: NetHandle,
     conn_fd: RawFd,
@@ -233,13 +243,14 @@ async fn serve_connection<P: BufferPool<Req = StripeReq>>(
     page_size: usize,
 ) {
     let _fd = FdGuard(conn_fd);
-    let _ = serve_request(&pool, &handle, conn_fd, &backend_id, stripe_size, page_size).await;
+    let _ = serve_request_s3(&pool, &handle, conn_fd, &backend_id, stripe_size, page_size).await;
 }
 
-/// The fallible serve body. Returns `Err(())` on any I/O, parse, or
-/// pool error; the caller closes the fd regardless. Error responses
-/// (400/405/416) are best-effort sends followed by `Ok(())`.
-async fn serve_request<P: BufferPool<Req = StripeReq>>(
+/// The fallible S3 serve body. Returns `Err(())` on any I/O or pool
+/// error the client cannot be told about; the caller closes the fd
+/// regardless. Error responses (S3 XML for GET, bodyless heads for
+/// HEAD) are best-effort sends followed by `Ok(())`.
+async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
     pool: &Rc<P>,
     handle: &NetHandle,
     conn_fd: RawFd,
@@ -247,6 +258,8 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
     stripe_size: u64,
     page_size: usize,
 ) -> Result<(), ()> {
+    let request_id = next_request_id();
+
     // 1. Read until the request head is complete (or the cap is hit).
     let mut buf: Vec<u8> = Vec::new();
     loop {
@@ -263,47 +276,67 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
                 buf.extend_from_slice(&chunk);
             }
             Err(_) => {
-                let _ = send_all(handle, conn_fd, status_line_response(400)).await;
+                // Malformed request line: we cannot know the method, so
+                // answer with a GET-style XML 400 against the root.
+                let bytes = error_bytes(S3ErrorCode::InvalidRequest, "/", &request_id, false, None);
+                let _ = send_all(handle, conn_fd, bytes).await;
                 return Ok(());
             }
         }
     }
     let req = HttpRequest::parse(&buf).map_err(|_| ())?;
 
-    // 2. Only GET and HEAD are served. HEAD resolves length and builds
-    // the same head as GET but never streams a body.
+    // 2. Path is the request target with any query stripped; it is the
+    // origin object id and the XML `<Resource>`.
+    let path = split_query(req.target).0.to_string();
+
+    // 3. Only GET and HEAD are served; anything else is 405. The method
+    // here is neither GET nor HEAD on the error arm, so the body is
+    // allowed (GET-style XML).
     let is_head = match req.method {
         Method::GET => false,
         Method::HEAD => true,
         _ => {
-            let _ = send_all(handle, conn_fd, status_line_response(405)).await;
+            let bytes =
+                error_bytes(S3ErrorCode::MethodNotAllowed, &path, &request_id, false, None);
+            let _ = send_all(handle, conn_fd, bytes).await;
             return Ok(());
         }
     };
 
-    // 3. Path is the request target with any query stripped.
-    let path = split_query(req.target).0.to_string();
-
-    // 4. Optional Range header.
+    // 4. Optional Range header. A malformed Range is a 400; an
+    // unsatisfiable one is handled at resolve time as a 416.
     let range = match req.header("range") {
         Some(v) => match ByteRange::parse(v) {
             Ok(r) => Some(r),
             Err(_) => {
-                let _ = send_all(handle, conn_fd, status_line_response(400)).await;
+                let bytes =
+                    error_bytes(S3ErrorCode::InvalidRequest, &path, &request_id, is_head, None);
+                let _ = send_all(handle, conn_fd, bytes).await;
                 return Ok(());
             }
         },
         None => None,
     };
 
-    // 5. Resolve object length by reading the object's dedicated
-    // length entry through the pool. The HTTP backend fills it from
-    // an origin HEAD on a miss; local-disk and peer hits skip the
-    // origin entirely. The payload is the byte length as a
-    // little-endian u64 in the first 8 bytes of the entry's page.
-    let len = read_object_length(pool, backend_id, &path)
-        .await
-        .map_err(|_| ())?;
+    // 5. Resolve object length, distinguishing a missing origin object
+    // (404 NoSuchKey) from any other failure (500 InternalError). Unlike
+    // the plain HTTP frontend, a length-read failure is never a silently
+    // dropped connection.
+    let len = match read_object_length_s3(pool, backend_id, &path).await {
+        LenResult::Len(l) => l,
+        LenResult::NotFound => {
+            let bytes = error_bytes(S3ErrorCode::NoSuchKey, &path, &request_id, is_head, None);
+            let _ = send_all(handle, conn_fd, bytes).await;
+            return Ok(());
+        }
+        LenResult::Other => {
+            let bytes =
+                error_bytes(S3ErrorCode::InternalError, &path, &request_id, is_head, None);
+            let _ = send_all(handle, conn_fd, bytes).await;
+            return Ok(());
+        }
+    };
 
     // 6. Resolve the requested range against the length.
     let resolved = match range {
@@ -311,11 +344,23 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
         Some(br) => match br.resolve(len) {
             Ok(r) => r,
             Err(RangeError::Unsatisfiable { object_len }) => {
-                let _ = send_all(handle, conn_fd, unsatisfiable_response(object_len)).await;
+                // 416 InvalidRange: include `Content-Range: bytes */LEN`
+                // for both GET and HEAD; GET additionally carries the
+                // XML body, HEAD carries only the head.
+                let bytes = error_bytes(
+                    S3ErrorCode::InvalidRange,
+                    &path,
+                    &request_id,
+                    is_head,
+                    Some(object_len),
+                );
+                let _ = send_all(handle, conn_fd, bytes).await;
                 return Ok(());
             }
             Err(_) => {
-                let _ = send_all(handle, conn_fd, status_line_response(400)).await;
+                let bytes =
+                    error_bytes(S3ErrorCode::InvalidRequest, &path, &request_id, is_head, None);
+                let _ = send_all(handle, conn_fd, bytes).await;
                 return Ok(());
             }
         },
@@ -323,9 +368,9 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
 
     // 7. Response head: 206 if the client sent a Range, else 200.
     let head = if range.is_some() {
-        partial_head(resolved, len)
+        partial_head(resolved, len, &request_id)
     } else {
-        full_head(len)
+        full_head(len, &request_id)
     };
     send_all(handle, conn_fd, head).await?;
 
@@ -390,35 +435,62 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
     Ok(())
 }
 
+/// Outcome of reading an object's length entry, preserving the one
+/// distinction the S3 frontend acts on: a missing origin object maps to
+/// a 404, every other failure to a 500.
+enum LenResult {
+    /// The length entry resolved to this byte length.
+    Len(u64),
+    /// The origin reported the object does not exist
+    /// ([`Error::OriginNotFound`]).
+    NotFound,
+    /// Any other I/O, transport, or pool error.
+    Other,
+}
+
 /// Resolve an object's length by reading its dedicated content-addressed
-/// length entry through the pool. The entry's single page carries the
-/// byte length as a little-endian u64 in its first 8 bytes; the HTTP
-/// backend fills it from an origin `HEAD` on a miss, while local-disk
-/// and peer hits avoid the origin entirely.
-async fn read_object_length<P: BufferPool<Req = StripeReq>>(
+/// length entry through the pool, preserving an
+/// [`Error::OriginNotFound`] as [`LenResult::NotFound`].
+///
+/// This is the S3 frontend's own variant of
+/// `http_serve::read_object_length`, which collapses every error into
+/// `Err(())`. Here the error is inspected at both fallible points (the
+/// `read` call and the first `next_page`) so a 404 can be told apart
+/// from a 500.
+async fn read_object_length_s3<P: BufferPool<Req = StripeReq>>(
     pool: &Rc<P>,
     backend_id: &str,
     path: &str,
-) -> Result<u64, ()> {
+) -> LenResult {
     let origin_ref = OriginRef::length_entry(backend_id, path);
     let req = StripeReq::new(origin_ref.stripe_key()).with_origin(origin_ref);
-    let mut rs: ReadStream = pool.read(&req, 0, 8).await.map_err(|_| ())?;
-    let page = rs.next_page().await.ok_or(())?.map_err(|_| ())?;
+    let mut rs = match pool.read(&req, 0, 8).await {
+        Ok(rs) => rs,
+        Err(Error::OriginNotFound) => return LenResult::NotFound,
+        Err(_) => return LenResult::Other,
+    };
+    let page = match rs.next_page().await {
+        Some(Ok(p)) => p,
+        Some(Err(Error::OriginNotFound)) => return LenResult::NotFound,
+        Some(Err(_)) => return LenResult::Other,
+        None => return LenResult::Other,
+    };
     let bytes = page.as_slice();
     if bytes.len() < 8 {
-        return Err(());
+        return LenResult::Other;
     }
     let mut le = [0u8; 8];
     le.copy_from_slice(&bytes[..8]);
-    Ok(u64::from_le_bytes(le))
+    LenResult::Len(u64::from_le_bytes(le))
 }
 
 /// Format the `200 OK` head for serving a whole object.
-fn full_head(len: u64) -> Vec<u8> {
+fn full_head(len: u64, request_id: &str) -> Vec<u8> {
     let resp = Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_LENGTH, len.to_string())
         .header(ACCEPT_RANGES, "bytes")
+        .header(X_AMZ_REQUEST_ID, request_id)
         .header(CONNECTION, "close")
         .body(())
         .expect("valid full-object response head");
@@ -427,7 +499,7 @@ fn full_head(len: u64) -> Vec<u8> {
 
 /// Format the `206 Partial Content` head for a resolved byte range.
 /// `END` in `Content-Range` is inclusive (`resolved.end - 1`).
-fn partial_head(resolved: ResolvedRange, total: u64) -> Vec<u8> {
+fn partial_head(resolved: ResolvedRange, total: u64, request_id: &str) -> Vec<u8> {
     let start = resolved.start;
     let end_incl = resolved.end - 1;
     let clen = resolved.len();
@@ -436,49 +508,78 @@ fn partial_head(resolved: ResolvedRange, total: u64) -> Vec<u8> {
         .header(CONTENT_RANGE, format!("bytes {start}-{end_incl}/{total}"))
         .header(CONTENT_LENGTH, clen.to_string())
         .header(ACCEPT_RANGES, "bytes")
+        .header(X_AMZ_REQUEST_ID, request_id)
         .header(CONNECTION, "close")
         .body(())
         .expect("valid partial-content response head");
     serialize_response_head(&resp)
 }
 
-/// Format a `416 Range Not Satisfiable` head with `Content-Range: bytes
-/// */LEN`.
-fn unsatisfiable_response(total: u64) -> Vec<u8> {
-    let resp = Response::builder()
-        .status(StatusCode::RANGE_NOT_SATISFIABLE)
-        .header(CONTENT_RANGE, format!("bytes */{total}"))
-        .header(CONTENT_LENGTH, "0")
-        .header(CONNECTION, "close")
-        .body(())
-        .expect("valid unsatisfiable-range response head");
-    serialize_response_head(&resp)
+/// Build the full byte response for an S3 error.
+///
+/// For GET (`is_head == false`) the head carries the XML body with a
+/// matching `Content-Length` and `Content-Type: application/xml`, and
+/// the body is appended. For HEAD (`is_head == true`) only the head is
+/// returned, with `Content-Length: 0` and no body, as both S3 and HTTP
+/// require. `content_range`, when set, adds `Content-Range: bytes */LEN`
+/// (used for the 416 unsatisfiable case).
+fn error_bytes(
+    code: S3ErrorCode,
+    resource: &str,
+    request_id: &str,
+    is_head: bool,
+    content_range: Option<u64>,
+) -> Vec<u8> {
+    let status = StatusCode::from_u16(code.http_status_u16())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+
+    if is_head {
+        let mut builder = Response::builder()
+            .status(status)
+            .header(CONTENT_LENGTH, "0")
+            .header(X_AMZ_REQUEST_ID, request_id)
+            .header(CONNECTION, "close");
+        if let Some(total) = content_range {
+            builder = builder.header(CONTENT_RANGE, format!("bytes */{total}"));
+        }
+        let resp = builder.body(()).expect("valid bodyless error head");
+        return serialize_response_head(&resp);
+    }
+
+    let body = error_xml(code, resource, request_id);
+    let mut builder = Response::builder()
+        .status(status)
+        .header(CONTENT_LENGTH, body.len().to_string())
+        .header(CONTENT_TYPE, "application/xml")
+        .header(X_AMZ_REQUEST_ID, request_id)
+        .header(CONNECTION, "close");
+    if let Some(total) = content_range {
+        builder = builder.header(CONTENT_RANGE, format!("bytes */{total}"));
+    }
+    let resp = builder.body(()).expect("valid error response head");
+    let mut head = serialize_response_head(&resp);
+    head.extend_from_slice(body.as_bytes());
+    head
 }
 
-/// Format a bodyless status-line response (`Content-Length: 0`) for the
-/// simple error statuses this frontend emits.
-fn status_line_response(status: u16) -> Vec<u8> {
-    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    let resp = Response::builder()
-        .status(status)
-        .header(CONTENT_LENGTH, "0")
-        .header(CONNECTION, "close")
-        .body(())
-        .expect("valid status-line response head");
-    serialize_response_head(&resp)
+/// Mint the next per-request `x-amz-request-id`. A zero-padded hex of a
+/// monotonic counter: always non-empty and deterministic for tests.
+fn next_request_id() -> String {
+    let n = REQUEST_ID_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{n:016x}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bufferpool::{Error, ReadStream, WindowedRead};
-    use crate::frontend::range::StripeSlice;
+    use crate::bufferpool::{ReadStream, WindowedRead};
+    use crate::config::FrontendKind;
     use std::cell::RefCell;
 
     fn spec(id: &str, bind: &str) -> FrontendSpec {
         FrontendSpec {
             id: id.to_string(),
-            kind: FrontendKind::Http,
+            kind: FrontendKind::S3,
             bind: bind.to_string(),
             backend: "primary".to_string(),
         }
@@ -486,30 +587,40 @@ mod tests {
 
     #[test]
     fn from_spec_validates_kind_and_bind() {
-        let f = HttpFrontend::from_spec(&spec("workload", "0.0.0.0:9000")).unwrap();
+        let f = S3Frontend::from_spec(&spec("workload", "0.0.0.0:9000")).unwrap();
         assert_eq!(f.id(), "workload");
         assert_eq!(f.backend_id(), "primary");
         assert_eq!(f.bind(), "0.0.0.0:9000".parse().unwrap());
 
-        let bad = HttpFrontend::from_spec(&spec("f", "not-an-addr"));
+        let bad = S3Frontend::from_spec(&spec("f", "not-an-addr"));
         assert!(matches!(bad, Err(FrontendError::BadBind(_))));
     }
 
     #[test]
-    fn full_head_exact_bytes() {
-        let head = full_head(4096);
+    fn from_spec_rejects_non_s3_kind() {
+        let mut s = spec("f", "127.0.0.1:9000");
+        s.kind = FrontendKind::Http;
+        assert!(matches!(
+            S3Frontend::from_spec(&s),
+            Err(FrontendError::UnsupportedKind(_))
+        ));
+    }
+
+    #[test]
+    fn full_head_has_request_id_and_accept_ranges() {
+        let head = full_head(4096, "deadbeef");
         let s = std::str::from_utf8(&head).unwrap();
         assert!(s.starts_with("HTTP/1.1 200 OK\r\n"), "got: {s}");
         assert!(s.contains("content-length: 4096\r\n"), "got: {s}");
         assert!(s.contains("accept-ranges: bytes\r\n"), "got: {s}");
+        assert!(s.contains("x-amz-request-id: deadbeef\r\n"), "got: {s}");
         assert!(s.contains("connection: close\r\n"), "got: {s}");
         assert!(s.ends_with("\r\n\r\n"), "got: {s}");
     }
 
     #[test]
-    fn partial_head_exact_bytes_inclusive_end() {
-        // Resolved [0, 100) of a 1000-byte object -> bytes 0-99/1000.
-        let head = partial_head(ResolvedRange { start: 0, end: 100 }, 1000);
+    fn partial_head_inclusive_end_and_request_id() {
+        let head = partial_head(ResolvedRange { start: 0, end: 100 }, 1000, "id1");
         let s = std::str::from_utf8(&head).unwrap();
         assert!(
             s.starts_with("HTTP/1.1 206 Partial Content\r\n"),
@@ -517,136 +628,75 @@ mod tests {
         );
         assert!(s.contains("content-range: bytes 0-99/1000\r\n"), "got: {s}");
         assert!(s.contains("content-length: 100\r\n"), "got: {s}");
-        assert!(s.contains("accept-ranges: bytes\r\n"), "got: {s}");
-        assert!(s.contains("connection: close\r\n"), "got: {s}");
+        assert!(s.contains("x-amz-request-id: id1\r\n"), "got: {s}");
         assert!(s.ends_with("\r\n\r\n"), "got: {s}");
     }
 
     #[test]
-    fn partial_head_mid_object() {
-        // Resolved [70, 100) of 100 -> bytes 70-99/100, length 30.
-        let head = partial_head(
-            ResolvedRange {
-                start: 70,
-                end: 100,
-            },
-            100,
+    fn get_error_carries_xml_body_with_matching_length() {
+        let bytes = error_bytes(S3ErrorCode::NoSuchKey, "/k", "rid", false, None);
+        let s = std::str::from_utf8(&bytes).unwrap();
+        assert!(s.starts_with("HTTP/1.1 404 Not Found\r\n"), "got: {s}");
+        assert!(s.contains("content-type: application/xml\r\n"), "got: {s}");
+        assert!(s.contains("x-amz-request-id: rid\r\n"), "got: {s}");
+        let (head, body) = s.split_once("\r\n\r\n").unwrap();
+        let expected = error_xml(S3ErrorCode::NoSuchKey, "/k", "rid");
+        assert_eq!(body, expected);
+        assert!(
+            head.contains(&format!("content-length: {}\r\n", expected.len())),
+            "got: {head}"
         );
-        let s = std::str::from_utf8(&head).unwrap();
-        assert!(s.contains("content-range: bytes 70-99/100\r\n"), "got: {s}");
-        assert!(s.contains("content-length: 30\r\n"), "got: {s}");
     }
 
     #[test]
-    fn unsatisfiable_response_exact_bytes() {
-        let head = unsatisfiable_response(100);
-        let s = std::str::from_utf8(&head).unwrap();
+    fn head_error_has_no_body_and_zero_length() {
+        let bytes = error_bytes(S3ErrorCode::NoSuchKey, "/k", "rid", true, None);
+        let s = std::str::from_utf8(&bytes).unwrap();
+        assert!(s.starts_with("HTTP/1.1 404 Not Found\r\n"), "got: {s}");
+        assert!(s.contains("content-length: 0\r\n"), "got: {s}");
+        assert!(!s.contains("<Error>"), "HEAD must not carry a body: {s}");
+        assert!(s.ends_with("\r\n\r\n"), "got: {s}");
+    }
+
+    #[test]
+    fn unsatisfiable_get_has_content_range_and_xml_body() {
+        let bytes = error_bytes(S3ErrorCode::InvalidRange, "/k", "rid", false, Some(100));
+        let s = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            s.starts_with("HTTP/1.1 416 Range Not Satisfiable\r\n"),
+            "got: {s}"
+        );
+        assert!(s.contains("content-range: bytes */100\r\n"), "got: {s}");
+        let (_head, body) = s.split_once("\r\n\r\n").unwrap();
+        assert!(body.contains("<Code>InvalidRange</Code>"), "got: {body}");
+    }
+
+    #[test]
+    fn unsatisfiable_head_has_content_range_no_body() {
+        let bytes = error_bytes(S3ErrorCode::InvalidRange, "/k", "rid", true, Some(100));
+        let s = std::str::from_utf8(&bytes).unwrap();
         assert!(
             s.starts_with("HTTP/1.1 416 Range Not Satisfiable\r\n"),
             "got: {s}"
         );
         assert!(s.contains("content-range: bytes */100\r\n"), "got: {s}");
         assert!(s.contains("content-length: 0\r\n"), "got: {s}");
-        assert!(s.contains("connection: close\r\n"), "got: {s}");
+        assert!(!s.contains("<Error>"), "HEAD must not carry a body: {s}");
         assert!(s.ends_with("\r\n\r\n"), "got: {s}");
     }
 
     #[test]
-    fn status_405_and_400_exact_bytes() {
-        let r405 = status_line_response(405);
-        let s405 = std::str::from_utf8(&r405).unwrap();
-        assert!(
-            s405.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"),
-            "got: {s405}"
-        );
-        assert!(s405.contains("content-length: 0\r\n"), "got: {s405}");
-        assert!(s405.contains("connection: close\r\n"), "got: {s405}");
-        assert!(s405.ends_with("\r\n\r\n"), "got: {s405}");
-
-        let r400 = status_line_response(400);
-        let s400 = std::str::from_utf8(&r400).unwrap();
-        assert!(
-            s400.starts_with("HTTP/1.1 400 Bad Request\r\n"),
-            "got: {s400}"
-        );
-        assert!(s400.contains("content-length: 0\r\n"), "got: {s400}");
-        assert!(s400.contains("connection: close\r\n"), "got: {s400}");
-        assert!(s400.ends_with("\r\n\r\n"), "got: {s400}");
-    }
-
-    #[test]
-    fn range_to_stripe_set_wiring_no_range() {
-        // No Range header -> full object over the stripe set. A 10-byte
-        // object at stripe 4 covers stripes 0,1,2.
-        let resolved = full_object(10);
-        let slices = stripe_set(resolved, 4);
-        assert_eq!(
-            slices,
-            vec![
-                StripeSlice {
-                    stripe_idx: 0,
-                    intra_offset: 0,
-                    intra_len: 4
-                },
-                StripeSlice {
-                    stripe_idx: 1,
-                    intra_offset: 0,
-                    intra_len: 4
-                },
-                StripeSlice {
-                    stripe_idx: 2,
-                    intra_offset: 0,
-                    intra_len: 2
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn range_to_stripe_set_wiring_with_range() {
-        // Range bytes=5-6 on a 10-byte object resolves to [5,7), which
-        // at stripe 4 is stripe 1 intra [1,3).
-        let br = ByteRange::parse("bytes=5-6").unwrap();
-        let resolved = br.resolve(10).unwrap();
-        assert_eq!(resolved, ResolvedRange { start: 5, end: 7 });
-        let slices = stripe_set(resolved, 4);
-        assert_eq!(
-            slices,
-            vec![StripeSlice {
-                stripe_idx: 1,
-                intra_offset: 1,
-                intra_len: 2
-            }]
-        );
-    }
-
-    #[test]
-    fn unsatisfiable_range_resolves_to_error() {
-        // bytes=100-200 on a 100-byte object is unsatisfiable.
-        let br = ByteRange::parse("bytes=100-200").unwrap();
-        assert!(matches!(
-            br.resolve(100),
-            Err(RangeError::Unsatisfiable { object_len: 100 })
-        ));
-    }
-
-    #[test]
-    fn length_entry_request_is_well_formed() {
-        use crate::bufferpool::Req;
-        use crate::storage::{LENGTH_STRIPE_IDX, stripe_key};
-
-        let origin_ref = OriginRef::length_entry("primary", "/o");
-        assert!(origin_ref.is_length_entry());
-
-        let req = StripeReq::new(origin_ref.stripe_key()).with_origin(origin_ref);
-        assert!(req.origin().unwrap().is_length_entry());
-        assert_eq!(req.key(), stripe_key("primary", "/o", LENGTH_STRIPE_IDX));
-        assert_eq!(LENGTH_STRIPE_IDX, u64::MAX);
+    fn request_ids_are_non_empty_and_advance() {
+        let a = next_request_id();
+        let b = next_request_id();
+        assert!(!a.is_empty());
+        assert!(!b.is_empty());
+        assert_ne!(a, b);
     }
 
     /// A mock pool whose `read` never constructs a `ReadStream` (that
     /// constructor is crate-internal to bufferpool): it always errors.
-    /// Sufficient to wire an [`HttpDriver`] for accept-loop tests, where
+    /// Sufficient to wire an [`S3Driver`] for accept-loop tests, where
     /// the serve path is not exercised against a real pool.
     struct MockPool;
 
@@ -691,7 +741,7 @@ mod tests {
                 return;
             }
         };
-        let mut driver = HttpDriver::new(
+        let mut driver = S3Driver::new(
             Rc::new(MockPool),
             handle,
             listen_fd,
