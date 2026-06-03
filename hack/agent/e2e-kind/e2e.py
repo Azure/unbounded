@@ -251,7 +251,7 @@ def install_bpftool(machine: str) -> None:
     # images containing bpftool have been published and are used by e2e.
     machine_shell(machine, textwrap.dedent("""\
         apt-get update
-        DEBIAN_FRONTEND=noninteractive apt-get install -y bpftool
+        DEBIAN_FRONTEND=noninteractive apt-get install -y linux-tools-common
     """))
 
 

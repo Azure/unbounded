@@ -9,8 +9,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/stretchr/testify/require"
+
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
 func TestServiceOverride_RenderedSnapshot(t *testing.T) {
