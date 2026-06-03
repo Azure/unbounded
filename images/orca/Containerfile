@@ -2,7 +2,7 @@
 # Licensed under the MIT License.
 
 # Build stage
-FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26.2-trixie AS builder
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26.4-trixie AS builder
 
 RUN apt-get update && apt-get install -y \
     build-essential \
