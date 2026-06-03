@@ -117,10 +117,19 @@ The configuration is written to two files on the host before the machine boots:
 | `Bind=` / `BindReadOnly=` | nspawn config | GPU device and library bind-mounts (auto-generated when GPUs are present). |
 | `DeviceAllow=` | Service override | Cgroup device permissions for GPU nodes (auto-generated when GPUs are present). |
 
-`perf_event_open` is required for eBPF CNIs such as Cilium because the Cilium
-agent creates per-CPU perf ring buffers to receive eBPF datapath events. If the
-nspawn syscall filter blocks it, Cilium startup fails when creating those perf
-rings.
+#### System call filter
+
+The `SystemCallFilter=@keyring bpf perf_event_open` setting keeps nspawn's
+default syscall filtering, but explicitly allows syscalls used by the worker
+stack:
+
+- `@keyring` allows the kernel keyring syscall group that containerd uses for
+  snapshotter and container setup operations.
+- `bpf` allows eBPF program and map operations used by runc, cgroup handling,
+  and eBPF CNIs.
+- `perf_event_open` allows eBPF CNIs such as Cilium to create per-CPU perf ring
+  buffers for datapath events. If nspawn blocks it, Cilium startup fails when
+  creating those perf rings.
 
 ## What Runs Inside the Container
 
