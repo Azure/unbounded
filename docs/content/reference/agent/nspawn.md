@@ -117,6 +117,11 @@ The configuration is written to two files on the host before the machine boots:
 | `Bind=` / `BindReadOnly=` | nspawn config | GPU device and library bind-mounts (auto-generated when GPUs are present). |
 | `DeviceAllow=` | Service override | Cgroup device permissions for GPU nodes (auto-generated when GPUs are present). |
 
+`perf_event_open` is required for eBPF CNIs such as Cilium because the Cilium
+agent creates per-CPU perf ring buffers to receive eBPF datapath events. If the
+nspawn syscall filter blocks it, Cilium startup fails when creating those perf
+rings.
+
 ## What Runs Inside the Container
 
 The nspawn container hosts the complete Kubernetes worker node stack:
