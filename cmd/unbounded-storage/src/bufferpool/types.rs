@@ -82,6 +82,10 @@ pub enum Error {
     /// it on the speculative path and a head fetch is never
     /// speculative.
     PrefetchBackoff,
+    /// The requested origin object does not exist (an HTTP/S3 404 from
+    /// the origin). Distinct from a transport failure: the fetch
+    /// completed, the origin simply has no such object.
+    OriginNotFound,
 }
 
 impl Error {
@@ -130,6 +134,7 @@ impl fmt::Display for Error {
             Error::Transport(e) => write!(f, "transport error: {e}"),
             Error::BlockStore(e) => write!(f, "block store error: {e}"),
             Error::PrefetchBackoff => write!(f, "speculative prefetch backed off"),
+            Error::OriginNotFound => write!(f, "origin object not found"),
         }
     }
 }
