@@ -53,7 +53,7 @@ func requireRenderedSnapshot(t *testing.T, goldenFile, templateName string, data
 	return buf.String()
 }
 
-func requireBPFFSExecStartPreOrder(t *testing.T, out string, bpffsPath string) {
+func requireBPFFSExecStartPreOrder(t *testing.T, out, bpffsPath string) {
 	t.Helper()
 	mkdir := "ExecStartPre=/usr/bin/mkdir -p " + bpffsPath
 	mount := "ExecStartPre=/bin/sh -c '/usr/bin/mountpoint -q " + bpffsPath + " || /usr/bin/mount -t bpf bpf " + bpffsPath + "'"

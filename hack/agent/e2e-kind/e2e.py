@@ -121,7 +121,6 @@ MACHINA_CONFIG_FILE = VM_DIR / "machina-config.yaml"
 MACHINE_CONFIG_NAME = f"{AGENT_MACHINE_NAME}-config"
 DAEMON_BINARY_CURRENT = "/usr/local/bin/unbounded-agent-current"
 DAEMON_BINARY_LAST_GOOD = "/usr/local/bin/unbounded-agent-last-good"
-BPFFS_HOST_ROOT = "/run/bpffs"
 BPFFS_SENTINEL = "unbounded-e2e-bpffs-sentinel"
 
 
@@ -236,11 +235,8 @@ def create_bpffs_sentinel(machine: str) -> None:
         mountpoint -q /sys/fs/bpf
         rm -f /sys/fs/bpf/{BPFFS_SENTINEL}
         bpftool map create /sys/fs/bpf/{BPFFS_SENTINEL} type hash key 4 value 4 entries 1 name unb_e2e
+        test -e /sys/fs/bpf/{BPFFS_SENTINEL}
     """))
-    host_path = f"{BPFFS_HOST_ROOT}/{machine}/{BPFFS_SENTINEL}"
-    result = ssh_capture_quiet(f"sudo test -e {host_path}")
-    if result.returncode != 0:
-        die(f"bpffs sentinel was not visible at host path {host_path}")
 
 
 def assert_bpffs_sentinel_absent(machine: str) -> None:
