@@ -226,7 +226,9 @@ pub struct BackendSpec {
     pub id: String,
     /// Backend implementation selector.
     pub kind: BackendKind,
-    /// Origin endpoint URL, e.g. `https://origin.example.com`.
+    /// Origin endpoint as `host:port`, resolved via DNS at startup
+    /// (IPv4-only in v1). Examples: `origin.example.com:443`,
+    /// `127.0.0.1:9000`. Must not include a URL scheme or path.
     pub endpoint: String,
     /// Stripe granularity for deterministic StripeKey derivation.
     #[serde(default = "default_stripe_size_bytes")]
@@ -234,12 +236,20 @@ pub struct BackendSpec {
     /// Max concurrent in-flight origin HTTP requests per shard.
     #[serde(default = "default_http_concurrency")]
     pub http_concurrency: u32,
+    /// Reserved: S3 bucket name. Not yet wired. S3 addressing is
+    /// currently path-style: the bucket is carried in the client's
+    /// request path (`/bucket/key`) and forwarded verbatim to the
+    /// origin, so this field has no effect today. Accepted for
+    /// forward-compatibility.
+    #[serde(default)]
+    pub bucket: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendKind {
     Http,
+    S3,
 }
 
 fn default_stripe_size_bytes() -> u64 {
@@ -264,30 +274,13 @@ pub struct FrontendSpec {
     pub bind: String,
     /// Id of the [`BackendSpec`] this frontend serves from.
     pub backend: String,
-    #[serde(default)]
-    pub tls: Option<TlsCfg>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FrontendKind {
     Http,
-}
-
-/// Minimal TLS material for a frontend listener. Paths point at PEM
-/// files on disk; `secret_ref` is an out-of-band reference (e.g.
-/// `k8s://namespace/name`) that, when set, supersedes the paths. At
-/// least one source is expected at runtime, but that is the runtime's
-/// concern; the schema only models the shape.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct TlsCfg {
-    #[serde(default)]
-    pub cert_path: Option<PathBuf>,
-    #[serde(default)]
-    pub key_path: Option<PathBuf>,
-    #[serde(default)]
-    pub secret_ref: Option<String>,
+    S3,
 }
 
 /// A byte count accepted as either an integer (bytes) or a string with
@@ -589,10 +582,6 @@ id = "workload-http"
 kind = "http"
 bind = "0.0.0.0:9000"
 backend = "primary-http"
-
-[frontends.tls]
-cert_path = "/etc/tls/cert.pem"
-key_path = "/etc/tls/key.pem"
 "#;
         let c: Config = toml::from_str(s).unwrap();
         assert_eq!(c.backends.len(), 1);
@@ -609,10 +598,6 @@ key_path = "/etc/tls/key.pem"
         assert_eq!(f.kind, FrontendKind::Http);
         assert_eq!(f.bind, "0.0.0.0:9000");
         assert_eq!(f.backend, "primary-http");
-        let tls = f.tls.as_ref().expect("tls present");
-        assert_eq!(tls.cert_path, Some(PathBuf::from("/etc/tls/cert.pem")));
-        assert_eq!(tls.key_path, Some(PathBuf::from("/etc/tls/key.pem")));
-        assert!(tls.secret_ref.is_none());
     }
 
     #[test]
@@ -627,19 +612,6 @@ endpoint = "https://example.com"
         let b = &c.backends[0];
         assert_eq!(b.stripe_size_bytes, 4 * 1024 * 1024);
         assert_eq!(b.http_concurrency, 64);
-    }
-
-    #[test]
-    fn frontend_tls_defaults_to_none() {
-        let s = r#"
-[[frontends]]
-id = "f"
-kind = "http"
-bind = "0.0.0.0:9000"
-backend = "b"
-"#;
-        let c: Config = toml::from_str(s).unwrap();
-        assert!(c.frontends[0].tls.is_none());
     }
 
     #[test]
@@ -668,21 +640,6 @@ extra = "nope"
     }
 
     #[test]
-    fn unknown_fields_rejected_in_tls() {
-        let s = r#"
-[[frontends]]
-id = "f"
-kind = "http"
-bind = "0.0.0.0:9000"
-backend = "b"
-
-[frontends.tls]
-bogus = "nope"
-"#;
-        assert!(toml::from_str::<Config>(s).is_err());
-    }
-
-    #[test]
     fn backend_and_frontend_kind_case_sensitive() {
         let ok = r#"
 [[backends]]
@@ -699,5 +656,67 @@ kind = "Http"
 endpoint = "https://example.com"
 "#;
         assert!(toml::from_str::<Config>(bad).is_err());
+    }
+
+    #[test]
+    fn s3_backend_round_trips_with_bucket() {
+        let s = r#"
+[[backends]]
+id = "primary-s3"
+kind = "s3"
+endpoint = "s3.us-east-1.amazonaws.com:443"
+bucket = "my-bucket"
+"#;
+        let c: Config = toml::from_str(s).unwrap();
+        let b = &c.backends[0];
+        assert_eq!(b.kind, BackendKind::S3);
+        assert_eq!(b.bucket.as_deref(), Some("my-bucket"));
+    }
+
+    #[test]
+    fn s3_backend_optional_fields_default_to_none() {
+        let s = r#"
+[[backends]]
+id = "b"
+kind = "s3"
+endpoint = "s3.example.com:443"
+"#;
+        let c: Config = toml::from_str(s).unwrap();
+        let b = &c.backends[0];
+        assert_eq!(b.kind, BackendKind::S3);
+        assert!(b.bucket.is_none());
+    }
+
+    #[test]
+    fn s3_frontend_kind_round_trips() {
+        let s = r#"
+[[frontends]]
+id = "workload-s3"
+kind = "s3"
+bind = "0.0.0.0:9000"
+backend = "b"
+"#;
+        let c: Config = toml::from_str(s).unwrap();
+        assert_eq!(c.frontends[0].kind, FrontendKind::S3);
+    }
+
+    #[test]
+    fn s3_kind_is_case_sensitive() {
+        let bad_backend = r#"
+[[backends]]
+id = "b"
+kind = "S3"
+endpoint = "s3.example.com:443"
+"#;
+        assert!(toml::from_str::<Config>(bad_backend).is_err());
+
+        let bad_frontend = r#"
+[[frontends]]
+id = "f"
+kind = "S3"
+bind = "0.0.0.0:9000"
+backend = "b"
+"#;
+        assert!(toml::from_str::<Config>(bad_frontend).is_err());
     }
 }
