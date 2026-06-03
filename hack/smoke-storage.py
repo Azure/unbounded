@@ -6,16 +6,28 @@
 
 Brings up two `unbounded-storage` processes on loopback, joined into a
 two-node Chord ring over TCP RPC (libfabric), each with a file-backed
-block device and an HTTP frontend whose HTTP backend points at one shared
+block device and a frontend whose origin backend points at one shared
 stub origin served by this test.
 
 The test then fetches an object through *both* frontends and asserts the
 returned body matches the stub origin's payload. Because the object's
 single stripe is owned by exactly one of the two nodes, the request to the
 non-owning frontend is necessarily routed over the fabric TCP RPC to the
-owning node, whose HTTP backend issues the outbound GET to the stub
-origin. Querying both frontends therefore guarantees the cross-node RPC
-path is exercised without reimplementing the stripe-key hashing here.
+owning node, whose backend issues the outbound GET to the stub origin.
+Querying both frontends therefore guarantees the cross-node RPC path is
+exercised without reimplementing the stripe-key hashing here.
+
+This whole two-node scenario is run once per protocol pairing so both
+frontend/backend implementations are covered against the real fabric:
+
+  - `http`: the plain HTTP frontend backed by the HTTP origin backend.
+  - `s3`:   the native S3 frontend backed by the S3 origin backend
+            (unsigned/public-bucket mode, path-style `/bucket/key`).
+
+A single `unbounded-storage` process serves exactly one frontend (the
+first configured spec wins), so the two kinds cannot share a ring; each
+scenario brings up its own fresh two-node ring on new ports and tears it
+down before the next.
 
 Pure Python 3 standard library; no pytest. Run directly:
 
@@ -48,8 +60,14 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 TMPDIR = Path(tempfile.mkdtemp(prefix="smoke-storage-"))
 BINARY = REPO_ROOT / "bin" / "unbounded-storage"
 
-# The object served by the stub origin and requested through the frontends.
-OBJECT_PATH = "/smoke-object"
+# The objects served by the stub origin and requested through the
+# frontends, one per scenario. The S3 path is path-style (`/bucket/key`)
+# because the S3 frontend forwards the request path verbatim to the
+# origin as the object id; using a bucket-prefixed key exercises that.
+HTTP_OBJECT_PATH = "/smoke-object"
+S3_OBJECT_PATH = "/smoke-bucket/smoke-object"
+VALID_OBJECTS = frozenset({HTTP_OBJECT_PATH, S3_OBJECT_PATH})
+
 BODY = b"unbounded-storage smoke test payload :: " * 50  # ~2000 bytes, one stripe
 
 STRIPE_SIZE = 65536  # power of two, larger than BODY so the object is one stripe
@@ -77,16 +95,13 @@ def die(msg: str) -> None:
 
 def dump_logs() -> None:
     """Best-effort dump of each spawned process's log on failure."""
-    for name in ("node1.log", "node2.log"):
-        p = TMPDIR / name
-        if not p.exists():
-            continue
-        log(f"  --- {name} ---")
+    for p in sorted(TMPDIR.glob("*.log")):
+        log(f"  --- {p.name} ---")
         try:
             sys.stderr.write(p.read_text())
             sys.stderr.flush()
         except OSError as e:
-            log(f"  (failed to read {name}: {e})")
+            log(f"  (failed to read {p.name}: {e})")
     log("  --- end logs ---")
 
 
@@ -130,12 +145,30 @@ def spawn(args: list[str], log_path: Path) -> subprocess.Popen[Any]:
     return proc
 
 
-def check_procs() -> None:
-    """Die if any spawned storage process has exited."""
-    for proc in _procs:
+def check_procs(procs: list[subprocess.Popen[Any]]) -> None:
+    """Die if any of *procs* (the current scenario's processes) has exited."""
+    for proc in procs:
         ret = proc.poll()
         if ret is not None:
             die(f"storage process {proc.args} exited early with code {ret}")
+
+
+def terminate(procs: list[subprocess.Popen[Any]]) -> None:
+    """Stop a scenario's processes, escalating SIGTERM to SIGKILL."""
+    for proc in procs:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except OSError:
+            pass
+    for proc in procs:
+        try:
+            proc.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
 
 
 # ============================================================================
@@ -151,20 +184,7 @@ def cleanup() -> None:
         return
     _cleaning_up = True
     log("Cleaning up...")
-    for proc in _procs:
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except OSError:
-            pass
-    for proc in _procs:
-        try:
-            proc.wait(timeout=5)
-        except (OSError, subprocess.TimeoutExpired):
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-                proc.wait(timeout=5)
-            except (OSError, subprocess.TimeoutExpired):
-                pass
+    terminate(_procs)
     import shutil
 
     shutil.rmtree(TMPDIR, ignore_errors=True)
@@ -181,13 +201,16 @@ def _sigint_handler(sig: int, frame: Any) -> None:
 
 
 class _OriginHandler(http.server.BaseHTTPRequestHandler):
-    """Serves the single in-memory object `BODY` at `OBJECT_PATH`.
+    """Serves the in-memory object `BODY` at any path in `VALID_OBJECTS`.
 
     Implements exactly what the storage stack requires of an origin:
-    `HEAD` returns 200 with a Content-Length (the HTTP backend issues it
-    to fill an object's content-addressed length entry), and ranged
-    `GET` returns 206 with a matching Content-Range and body slice (used
-    by the HTTP backend on a data-stripe cache miss).
+    `HEAD` returns 200 with a Content-Length (the backend issues it to
+    fill an object's content-addressed length entry), and ranged `GET`
+    returns 206 with a matching Content-Range and body slice (used by the
+    backend on a data-stripe cache miss). Both the HTTP and the S3 origin
+    backends speak this same plaintext HTTP/1.1 shape; the S3 backend in
+    unsigned (public-bucket) mode adds no headers the origin must honor,
+    so one handler serves both scenarios.
     """
 
     protocol_version = "HTTP/1.0"  # close per request, matching Connection: close
@@ -203,7 +226,7 @@ class _OriginHandler(http.server.BaseHTTPRequestHandler):
 
     def do_HEAD(self) -> None:  # noqa: N802
         self._record("HEAD")
-        if self._path() != OBJECT_PATH:
+        if self._path() not in VALID_OBJECTS:
             self.send_response(404)
             self.send_header("Content-Length", "0")
             self.end_headers()
@@ -216,7 +239,7 @@ class _OriginHandler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         self._record("GET")
-        if self._path() != OBJECT_PATH:
+        if self._path() not in VALID_OBJECTS:
             self.send_response(404)
             self.send_header("Content-Length", "0")
             self.end_headers()
@@ -262,6 +285,7 @@ def start_origin(port: int) -> http.server.ThreadingHTTPServer:
 def write_config(
     path: Path,
     *,
+    kind: str,
     fabric_addr: str,
     local_id: int,
     peer_id: int,
@@ -302,13 +326,13 @@ skip_recovery_scan_if_no_meta = true
 
 [[backends]]
 id = "origin"
-kind = "http"
+kind = "{kind}"
 endpoint = "{origin_addr}"
 stripe_size_bytes = {STRIPE_SIZE}
 
 [[frontends]]
 id = "fe"
-kind = "http"
+kind = "{kind}"
 bind = "{frontend_bind}"
 backend = "origin"
 """
@@ -320,11 +344,13 @@ backend = "origin"
 # ============================================================================
 
 
-def wait_port(host: str, port: int, timeout: int = 60) -> None:
+def wait_port(
+    host: str, port: int, procs: list[subprocess.Popen[Any]], timeout: int = 60
+) -> None:
     """Wait until a TCP connect to host:port succeeds."""
     log(f"  Waiting for {host}:{port} to accept connections...")
     for elapsed in range(timeout):
-        check_procs()
+        check_procs(procs)
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(1)
         try:
@@ -340,12 +366,14 @@ def wait_port(host: str, port: int, timeout: int = 60) -> None:
     die(f"Timed out waiting for {host}:{port}")
 
 
-def fetch(url: str, timeout: int = 30) -> tuple[int, bytes]:
+def fetch(
+    url: str, procs: list[subprocess.Popen[Any]], timeout: int = 30
+) -> tuple[int, bytes]:
     """GET *url*, retrying briefly while the frontend warms up."""
     deadline = time.monotonic() + timeout
     last_err: Exception | None = None
     while time.monotonic() < deadline:
-        check_procs()
+        check_procs(procs)
         try:
             with urllib.request.urlopen(url, timeout=10) as resp:
                 return resp.status, resp.read()
@@ -356,6 +384,108 @@ def fetch(url: str, timeout: int = 30) -> tuple[int, bytes]:
             time.sleep(1)
     die(f"GET {url} did not succeed within {timeout}s: {last_err}")
     raise AssertionError("unreachable")
+
+
+# ============================================================================
+# SCENARIO
+# ============================================================================
+
+
+def run_scenario(kind: str, origin_addr: str, object_path: str, origin: Any) -> None:
+    """Bring up a fresh two-node ring of frontend/backend *kind* and fetch.
+
+    Spawns its own two `unbounded-storage` processes on new ports, fetches
+    *object_path* through both frontends (asserting body and a cross-node
+    origin GET), then tears the ring down. *origin* is the shared stub
+    origin; its recorded requests are reset so the GET assertion is scoped
+    to this scenario.
+    """
+    log("")
+    log(f"=== Scenario: {kind} frontend + {kind} backend ===")
+
+    procs: list[subprocess.Popen[Any]] = []
+    fab_a, fab_b = free_port(), free_port()
+    fe_a, fe_b = free_port(), free_port()
+    log(f"Ports: fabric=({fab_a},{fab_b}) frontends=({fe_a},{fe_b})")
+
+    log("Writing node configs")
+    cfg1 = TMPDIR / f"{kind}-node1.toml"
+    cfg2 = TMPDIR / f"{kind}-node2.toml"
+    write_config(
+        cfg1,
+        kind=kind,
+        fabric_addr=f"127.0.0.1:{fab_a}",
+        local_id=1,
+        peer_id=2,
+        peer_addr=f"127.0.0.1:{fab_b}",
+        disk_path=TMPDIR / f"{kind}-node1.disk",
+        origin_addr=origin_addr,
+        frontend_bind=f"127.0.0.1:{fe_a}",
+    )
+    write_config(
+        cfg2,
+        kind=kind,
+        fabric_addr=f"127.0.0.1:{fab_b}",
+        local_id=2,
+        peer_id=1,
+        peer_addr=f"127.0.0.1:{fab_a}",
+        disk_path=TMPDIR / f"{kind}-node2.disk",
+        origin_addr=origin_addr,
+        frontend_bind=f"127.0.0.1:{fe_b}",
+    )
+
+    try:
+        log("Spawning two unbounded-storage processes")
+        procs.append(
+            spawn(
+                [str(BINARY), "--config", str(cfg1), "--no-hugepages"],
+                TMPDIR / f"{kind}-node1.log",
+            )
+        )
+        procs.append(
+            spawn(
+                [str(BINARY), "--config", str(cfg2), "--no-hugepages"],
+                TMPDIR / f"{kind}-node2.log",
+            )
+        )
+
+        wait_port("127.0.0.1", fe_a, procs)
+        wait_port("127.0.0.1", fe_b, procs)
+        # Give the fabric peers a moment to dial each other before routing.
+        log("  Letting fabric peers establish...")
+        time.sleep(3)
+        check_procs(procs)
+
+        # Scope the origin GET assertion to this scenario's requests.
+        origin.requests = []
+
+        for label, fe_port in (("A", fe_a), ("B", fe_b)):
+            log(f"Fetching object through frontend {label}")
+            status, body = fetch(f"http://127.0.0.1:{fe_port}{object_path}", procs)
+            if status != 200:
+                die(f"frontend {label} returned status {status}, expected 200")
+            if body != BODY:
+                die(
+                    f"frontend {label} body mismatch: got {len(body)} bytes, "
+                    f"expected {len(BODY)}"
+                )
+            log(f"  frontend {label} returned correct body")
+
+        # The stub origin must have been hit, proving traffic traversed
+        # frontend -> storage stack -> {kind} backend -> origin.
+        gets = [
+            r for r in origin.requests if r[0] == "GET" and r[1] == object_path
+        ]
+        if not gets:
+            die(
+                f"stub origin received no GET for {object_path}; "
+                f"the {kind} backend was not exercised"
+            )
+        log(f"  stub origin served {len(gets)} backend GET(s)")
+        log(f"  {kind} scenario PASSED")
+    finally:
+        log(f"  Tearing down {kind} ring")
+        terminate(procs)
 
 
 # ============================================================================
@@ -383,81 +513,19 @@ def main() -> None:
         log(f"  (could not raise RLIMIT_MEMLOCK: {e}; continuing)")
 
     origin_port = free_port()
-    fab_a, fab_b = free_port(), free_port()
-    fe_a, fe_b = free_port(), free_port()
     origin_addr = f"127.0.0.1:{origin_port}"
 
     log(f"Working directory: {TMPDIR}")
-    log(
-        f"Ports: origin={origin_port} fabric=({fab_a},{fab_b}) "
-        f"frontends=({fe_a},{fe_b})"
-    )
-
+    log(f"Stub origin on {origin_addr}")
     log("Starting stub origin HTTP server")
     origin = start_origin(origin_port)
 
-    log("Writing node configs")
-    cfg1, cfg2 = TMPDIR / "node1.toml", TMPDIR / "node2.toml"
-    write_config(
-        cfg1,
-        fabric_addr=f"127.0.0.1:{fab_a}",
-        local_id=1,
-        peer_id=2,
-        peer_addr=f"127.0.0.1:{fab_b}",
-        disk_path=TMPDIR / "node1.disk",
-        origin_addr=origin_addr,
-        frontend_bind=f"127.0.0.1:{fe_a}",
-    )
-    write_config(
-        cfg2,
-        fabric_addr=f"127.0.0.1:{fab_b}",
-        local_id=2,
-        peer_id=1,
-        peer_addr=f"127.0.0.1:{fab_a}",
-        disk_path=TMPDIR / "node2.disk",
-        origin_addr=origin_addr,
-        frontend_bind=f"127.0.0.1:{fe_b}",
-    )
-
-    log("Spawning two unbounded-storage processes")
-    spawn([str(BINARY), "--config", str(cfg1), "--no-hugepages"], TMPDIR / "node1.log")
-    spawn([str(BINARY), "--config", str(cfg2), "--no-hugepages"], TMPDIR / "node2.log")
-
-    wait_port("127.0.0.1", fe_a)
-    wait_port("127.0.0.1", fe_b)
-    # Give the fabric peers a moment to dial each other before routing.
-    log("  Letting fabric peers establish...")
-    time.sleep(3)
-    check_procs()
-
-    log("Fetching object through frontend A")
-    status_a, body_a = fetch(f"http://127.0.0.1:{fe_a}{OBJECT_PATH}")
-    if status_a != 200:
-        die(f"frontend A returned status {status_a}, expected 200")
-    if body_a != BODY:
-        die(
-            f"frontend A body mismatch: got {len(body_a)} bytes, "
-            f"expected {len(BODY)}"
-        )
-    log("  frontend A returned correct body")
-
-    log("Fetching object through frontend B")
-    status_b, body_b = fetch(f"http://127.0.0.1:{fe_b}{OBJECT_PATH}")
-    if status_b != 200:
-        die(f"frontend B returned status {status_b}, expected 200")
-    if body_b != BODY:
-        die(
-            f"frontend B body mismatch: got {len(body_b)} bytes, "
-            f"expected {len(BODY)}"
-        )
-    log("  frontend B returned correct body")
-
-    # The stub origin must have been hit, proving traffic traversed
-    # frontend -> storage stack -> HTTP backend -> origin.
-    gets = [r for r in origin.requests if r[0] == "GET" and r[1] == OBJECT_PATH]  # type: ignore[attr-defined]
-    if not gets:
-        die("stub origin received no GET for the object; backend was not exercised")
-    log(f"  stub origin served {len(gets)} backend GET(s)")
+    # Run the full two-node ring once per protocol pairing. Each scenario
+    # brings up and tears down its own ring on fresh ports, so the two
+    # frontend/backend kinds never share a process (only the first
+    # configured frontend is served per process).
+    run_scenario("http", origin_addr, HTTP_OBJECT_PATH, origin)
+    run_scenario("s3", origin_addr, S3_OBJECT_PATH, origin)
 
     log("")
     log("Smoke test PASSED")

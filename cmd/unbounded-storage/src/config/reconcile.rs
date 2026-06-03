@@ -1001,6 +1001,10 @@ mod tests {
             endpoint: endpoint.to_string(),
             stripe_size_bytes: 4 * 1024 * 1024,
             http_concurrency: 64,
+            region: None,
+            access_key_id: None,
+            secret_access_key: None,
+            bucket: None,
         }
     }
 

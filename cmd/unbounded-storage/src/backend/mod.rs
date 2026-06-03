@@ -4,18 +4,38 @@
 #![allow(async_fn_in_trait)]
 
 mod null;
+mod sigv4;
 
 #[cfg(target_os = "linux")]
 mod http;
+
+#[cfg(target_os = "linux")]
+mod origin;
+
+#[cfg(target_os = "linux")]
+mod origin_ring;
+
+#[cfg(target_os = "linux")]
+mod s3;
 
 use std::sync::Arc;
 
 use crate::bufferpool::{BulkRef, PageRef, PageStream, Req};
 
 pub use null::NullBackend;
+pub use sigv4::Credentials;
 
 #[cfg(target_os = "linux")]
 pub use http::HttpBackend;
+
+#[cfg(target_os = "linux")]
+pub use origin::{OriginBackend, OriginStream};
+
+#[cfg(target_os = "linux")]
+pub use origin_ring::{FixedRegion, OriginRing};
+
+#[cfg(target_os = "linux")]
+pub use s3::S3Backend;
 
 /// Origin fetch surface, sibling to `bufferpool::Transport`. A
 /// `Backend` resolves a `BulkRef` from an authoritative origin (as

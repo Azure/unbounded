@@ -10,7 +10,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use super::schema::{Config, DiskKind, PeerTransport};
+use super::schema::{BackendKind, Config, DiskKind, PeerTransport};
 
 #[derive(Debug)]
 pub enum ConfigError {
@@ -49,6 +49,9 @@ pub enum ConfigError {
         stripe_size_bytes: u64,
     },
     ZeroHttpConcurrency(String),
+    PartialS3Credentials {
+        backend: String,
+    },
     InvalidFrontendBind {
         frontend_id: String,
         bind: String,
@@ -145,6 +148,11 @@ impl fmt::Display for ConfigError {
                 f,
                 "backend {id:?}: http_concurrency must be greater than zero: a zero limit would \
                  stall all origin fetches"
+            ),
+            ConfigError::PartialS3Credentials { backend } => write!(
+                f,
+                "backend {backend:?}: access_key_id and secret_access_key must be set together \
+                 (both for signed access, neither for unsigned public-bucket access)"
             ),
             ConfigError::InvalidFrontendBind { frontend_id, bind } => {
                 write!(
@@ -294,6 +302,13 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
         }
         if b.http_concurrency == 0 {
             return Err(ConfigError::ZeroHttpConcurrency(b.id.clone()));
+        }
+        if b.kind == BackendKind::S3
+            && b.access_key_id.is_some() != b.secret_access_key.is_some()
+        {
+            return Err(ConfigError::PartialS3Credentials {
+                backend: b.id.clone(),
+            });
         }
     }
 
@@ -913,6 +928,67 @@ backend = "b"
             Err(ConfigError::DuplicateFrontendBind { frontend_id, bind })
                 if frontend_id == "f2" && bind == "0.0.0.0:9000" => {}
             other => panic!("expected DuplicateFrontendBind, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_s3_backend_with_both_credentials() {
+        let s = r#"
+[[backends]]
+id = "s3"
+kind = "s3"
+endpoint = "s3.example.com:443"
+access_key_id = "AKIDEXAMPLE"
+secret_access_key = "secret"
+"#;
+        let f = write_cfg(s);
+        let cfg = load(f.path()).expect("load should succeed");
+        assert_eq!(cfg.backends[0].kind, BackendKind::S3);
+    }
+
+    #[test]
+    fn accepts_s3_backend_with_no_credentials() {
+        let s = r#"
+[[backends]]
+id = "s3"
+kind = "s3"
+endpoint = "s3.example.com:443"
+"#;
+        let f = write_cfg(s);
+        let cfg = load(f.path()).expect("load should succeed");
+        assert!(cfg.backends[0].access_key_id.is_none());
+        assert!(cfg.backends[0].secret_access_key.is_none());
+    }
+
+    #[test]
+    fn rejects_s3_backend_with_only_access_key_id() {
+        let s = r#"
+[[backends]]
+id = "s3"
+kind = "s3"
+endpoint = "s3.example.com:443"
+access_key_id = "AKIDEXAMPLE"
+"#;
+        let f = write_cfg(s);
+        match load(f.path()) {
+            Err(ConfigError::PartialS3Credentials { backend }) if backend == "s3" => {}
+            other => panic!("expected PartialS3Credentials(s3), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_s3_backend_with_only_secret_access_key() {
+        let s = r#"
+[[backends]]
+id = "s3"
+kind = "s3"
+endpoint = "s3.example.com:443"
+secret_access_key = "secret"
+"#;
+        let f = write_cfg(s);
+        match load(f.path()) {
+            Err(ConfigError::PartialS3Credentials { backend }) if backend == "s3" => {}
+            other => panic!("expected PartialS3Credentials(s3), got {other:?}"),
         }
     }
 }

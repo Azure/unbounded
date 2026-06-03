@@ -226,7 +226,9 @@ pub struct BackendSpec {
     pub id: String,
     /// Backend implementation selector.
     pub kind: BackendKind,
-    /// Origin endpoint URL, e.g. `https://origin.example.com`.
+    /// Origin endpoint as `host:port`, resolved via DNS at startup
+    /// (IPv4-only in v1). Examples: `origin.example.com:443`,
+    /// `127.0.0.1:9000`. Must not include a URL scheme or path.
     pub endpoint: String,
     /// Stripe granularity for deterministic StripeKey derivation.
     #[serde(default = "default_stripe_size_bytes")]
@@ -234,12 +236,34 @@ pub struct BackendSpec {
     /// Max concurrent in-flight origin HTTP requests per shard.
     #[serde(default = "default_http_concurrency")]
     pub http_concurrency: u32,
+    /// S3 region used in the SigV4 credential scope (`s3` backends).
+    /// Optional: defaults to `us-east-1` at construction when unset.
+    /// Ignored by `http` backends.
+    #[serde(default)]
+    pub region: Option<String>,
+    /// S3 access key id (`s3` backends). Must be set together with
+    /// `secret_access_key`; both unset means unsigned (public bucket)
+    /// access. Ignored by `http` backends.
+    #[serde(default)]
+    pub access_key_id: Option<String>,
+    /// S3 secret access key (`s3` backends). See `access_key_id` for
+    /// the both-or-neither rule. Ignored by `http` backends.
+    #[serde(default)]
+    pub secret_access_key: Option<String>,
+    /// Reserved: S3 bucket name. Not yet wired. S3 addressing is
+    /// currently path-style: the bucket is carried in the client's
+    /// request path (`/bucket/key`) and forwarded verbatim to the
+    /// origin, so this field has no effect today. Accepted for
+    /// forward-compatibility.
+    #[serde(default)]
+    pub bucket: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendKind {
     Http,
+    S3,
 }
 
 fn default_stripe_size_bytes() -> u64 {
@@ -272,6 +296,7 @@ pub struct FrontendSpec {
 #[serde(rename_all = "snake_case")]
 pub enum FrontendKind {
     Http,
+    S3,
 }
 
 /// Minimal TLS material for a frontend listener. Paths point at PEM
@@ -699,5 +724,76 @@ kind = "Http"
 endpoint = "https://example.com"
 "#;
         assert!(toml::from_str::<Config>(bad).is_err());
+    }
+
+    #[test]
+    fn s3_backend_round_trips_with_region_and_creds() {
+        let s = r#"
+[[backends]]
+id = "primary-s3"
+kind = "s3"
+endpoint = "s3.us-east-1.amazonaws.com:443"
+region = "us-east-1"
+access_key_id = "AKIDEXAMPLE"
+secret_access_key = "secret"
+bucket = "my-bucket"
+"#;
+        let c: Config = toml::from_str(s).unwrap();
+        let b = &c.backends[0];
+        assert_eq!(b.kind, BackendKind::S3);
+        assert_eq!(b.region.as_deref(), Some("us-east-1"));
+        assert_eq!(b.access_key_id.as_deref(), Some("AKIDEXAMPLE"));
+        assert_eq!(b.secret_access_key.as_deref(), Some("secret"));
+        assert_eq!(b.bucket.as_deref(), Some("my-bucket"));
+    }
+
+    #[test]
+    fn s3_backend_optional_fields_default_to_none() {
+        let s = r#"
+[[backends]]
+id = "b"
+kind = "s3"
+endpoint = "s3.example.com:443"
+"#;
+        let c: Config = toml::from_str(s).unwrap();
+        let b = &c.backends[0];
+        assert_eq!(b.kind, BackendKind::S3);
+        assert!(b.region.is_none());
+        assert!(b.access_key_id.is_none());
+        assert!(b.secret_access_key.is_none());
+        assert!(b.bucket.is_none());
+    }
+
+    #[test]
+    fn s3_frontend_kind_round_trips() {
+        let s = r#"
+[[frontends]]
+id = "workload-s3"
+kind = "s3"
+bind = "0.0.0.0:9000"
+backend = "b"
+"#;
+        let c: Config = toml::from_str(s).unwrap();
+        assert_eq!(c.frontends[0].kind, FrontendKind::S3);
+    }
+
+    #[test]
+    fn s3_kind_is_case_sensitive() {
+        let bad_backend = r#"
+[[backends]]
+id = "b"
+kind = "S3"
+endpoint = "s3.example.com:443"
+"#;
+        assert!(toml::from_str::<Config>(bad_backend).is_err());
+
+        let bad_frontend = r#"
+[[frontends]]
+id = "f"
+kind = "S3"
+bind = "0.0.0.0:9000"
+backend = "b"
+"#;
+        assert!(toml::from_str::<Config>(bad_frontend).is_err());
     }
 }

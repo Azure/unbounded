@@ -22,6 +22,8 @@ bincode = "1.3"
 httparse = "1"
 http = "1"
 blake3 = "1.5"
+sha2 = "0.10"
+hmac = "0.12"
 arc-swap = "1.7"
 twox-hash = { version = "1.6", default-features = false }
 clap = { version = "4", features = ["derive"] }

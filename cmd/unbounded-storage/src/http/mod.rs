@@ -27,10 +27,20 @@
 mod headers;
 mod request;
 mod response;
+mod server;
 
 pub use headers::{Header, ParseError};
 pub use request::{HttpRequest, serialize_request};
 pub use response::{ResponseHead, serialize_response_head};
+
+/// Cross-platform, storage-policy-free server plumbing reused by the
+/// HTTP serving frontends.
+pub(crate) use server::{MAX_HEADER_BYTES, RECV_CHUNK, noop_waker, split_query};
+
+/// Linux-only server plumbing that depends on `libc` and the io_uring
+/// [`NetHandle`](crate::ring::NetHandle).
+#[cfg(target_os = "linux")]
+pub(crate) use server::{FdGuard, bind_listener, send_all};
 
 /// Canonical typed `Method`/`StatusCode`, re-exported from the [`http`]
 /// crate so the rest of the crate has a single source for them.
