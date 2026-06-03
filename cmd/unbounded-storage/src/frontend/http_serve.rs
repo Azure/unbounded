@@ -65,8 +65,7 @@ pub struct HttpFrontend {
 
 impl HttpFrontend {
     /// Construct from a [`FrontendSpec`], validating the kind and
-    /// parsing the bind address. A configured `tls` block is accepted
-    /// but ignored (loopback-only in v1).
+    /// parsing the bind address.
     pub fn from_spec(spec: &FrontendSpec) -> Result<Self, FrontendError> {
         if spec.kind != FrontendKind::Http {
             return Err(FrontendError::UnsupportedKind("non-http frontend kind"));
@@ -473,7 +472,6 @@ fn status_line_response(status: u16) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::bufferpool::{Error, ReadStream, WindowedRead};
-    use crate::config::TlsCfg;
     use crate::frontend::range::StripeSlice;
     use std::cell::RefCell;
 
@@ -483,7 +481,6 @@ mod tests {
             kind: FrontendKind::Http,
             bind: bind.to_string(),
             backend: "primary".to_string(),
-            tls: None,
         }
     }
 
@@ -496,17 +493,6 @@ mod tests {
 
         let bad = HttpFrontend::from_spec(&spec("f", "not-an-addr"));
         assert!(matches!(bad, Err(FrontendError::BadBind(_))));
-    }
-
-    #[test]
-    fn from_spec_accepts_tls_block_but_ignores_it() {
-        let mut s = spec("f", "127.0.0.1:9000");
-        s.tls = Some(TlsCfg {
-            cert_path: None,
-            key_path: None,
-            secret_ref: Some("k8s://ns/name".into()),
-        });
-        assert!(HttpFrontend::from_spec(&s).is_ok());
     }
 
     #[test]

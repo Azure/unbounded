@@ -324,7 +324,6 @@ mod tests {
             kind: FrontendKind::Http,
             bind: "0.0.0.0:9000".to_string(),
             backend: "b".to_string(),
-            tls: None,
         }
     }
 

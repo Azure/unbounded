@@ -16,7 +16,7 @@ use std::time::Duration;
 use clap::Parser;
 
 use unbounded_storage::backend::{
-    Credentials, FixedRegion, HttpBackend, OriginBackend, OriginRing, S3Backend,
+    FixedRegion, HttpBackend, OriginBackend, OriginRing, S3Backend,
 };
 use unbounded_storage::bufferpool::{Pool, PoolConfig, PoolGroup, Req, ShardDescriptor, StripeKey};
 use unbounded_storage::config::{
@@ -993,12 +993,9 @@ fn log_backend_registry(widx: WorkerIdx, specs: &[BackendSpec]) -> usize {
 ///
 /// For an `s3` backend the origin IP is resolved from the endpoint the
 /// same way as for HTTP (IPv4-only, v1), but the host authority is
-/// extracted separately for the `Host:` header and SigV4 `host` signed
-/// header.
-/// The region defaults to `us-east-1` when unset; credentials are built
-/// only when both `access_key_id` and `secret_access_key` are present
-/// (load-time validation rejects a partial pair), otherwise the backend
-/// signs nothing and fetches the bucket unsigned.
+/// extracted separately for the `Host:` header. Requests are sent
+/// unsigned over plaintext HTTP; the origin is expected to be a
+/// public/unauthenticated bucket.
 fn build_origin_backend(
     spec: &BackendSpec,
     ring: OriginRing,
@@ -1020,23 +1017,10 @@ fn build_origin_backend(
         BackendKind::S3 => {
             let origin = S3Backend::resolve_origin(&spec.endpoint)?;
             let host = extract_host_authority(&spec.endpoint);
-            let region = spec
-                .region
-                .clone()
-                .unwrap_or_else(|| "us-east-1".to_string());
-            let credentials = match (
-                spec.access_key_id.as_ref(),
-                spec.secret_access_key.as_ref(),
-            ) {
-                (Some(key), Some(secret)) => Some(Credentials::new(key.clone(), secret.clone())),
-                _ => None,
-            };
             Ok(OriginBackend::S3(S3Backend::new(
                 ring,
                 origin,
                 host,
-                region,
-                credentials,
                 spec.id.clone(),
                 spec.stripe_size_bytes,
                 page_size,
@@ -1047,7 +1031,7 @@ fn build_origin_backend(
 }
 
 /// Extract the `host[:port]` authority from a backend `endpoint` for
-/// use as the S3 `Host:` header and SigV4 `host` signed header.
+/// use as the S3 `Host:` header.
 ///
 /// Strips an optional `scheme://` prefix and any `/path` or `?query`
 /// suffix, but preserves the port so the `Host:` header stays
@@ -1516,7 +1500,6 @@ mod tests {
             kind: config::FrontendKind::Http,
             bind: "0.0.0.0:9000".to_string(),
             backend: "b".to_string(),
-            tls: None,
         }
     }
 
@@ -1527,9 +1510,6 @@ mod tests {
             endpoint: "https://example.com".to_string(),
             stripe_size_bytes: 4 * 1024 * 1024,
             http_concurrency: 64,
-            region: None,
-            access_key_id: None,
-            secret_access_key: None,
             bucket: None,
         }
     }

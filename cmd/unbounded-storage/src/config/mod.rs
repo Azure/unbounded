@@ -18,6 +18,6 @@ pub use reconcile::{
 };
 pub use schema::{
     BackendKind, BackendSpec, BackingKindCfg, Config, DiskKind, DiskSpec, FabricCfg, FrontendKind,
-    FrontendSpec, PeerSpec, PeerTransport, StorageCfg, TlsCfg, TopologyCfg,
+    FrontendSpec, PeerSpec, PeerTransport, StorageCfg, TopologyCfg,
 };
 pub use watch::{ConfigUpdate, ConfigWatcher, WatchError};

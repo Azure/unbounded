@@ -8,16 +8,12 @@
 //!
 //! It mirrors the HTTP backend's fetch/length structure and shares its
 //! cold-path simplicity (one TCP connection per fetch, one heap copy of
-//! the body into the registered backing). It diverges in three ways:
+//! the body into the registered backing). It diverges in two ways:
 //!
 //! - It carries the origin **hostname** (not just a resolved IPv4) so the
-//!   `Host:` header and the SigV4 `host` signed header use the real
-//!   virtual-host name the bucket policy expects, while the TCP connect
-//!   still dials the resolved IPv4 [`SockAddr`].
-//! - When [`S3Backend`] holds [`Credentials`], it signs every request with
-//!   AWS Signature Version 4 (`x-amz-date`, `x-amz-content-sha256`, and
-//!   `Authorization`). With no credentials it sends the request unsigned
-//!   (public bucket), still setting `Host:` to the hostname.
+//!   `Host:` header uses the real virtual-host name the bucket policy
+//!   expects, while the TCP connect still dials the resolved IPv4
+//!   [`SockAddr`].
 //! - A `404 Not Found` from the origin maps to
 //!   [`Error::OriginNotFound`](crate::bufferpool::Error::OriginNotFound)
 //!   rather than the generic non-2xx error, so the pool can distinguish a
@@ -27,9 +23,8 @@ use std::future::Future;
 use std::os::fd::RawFd;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use ::http::header::{AUTHORIZATION, CONNECTION, HOST, RANGE};
+use ::http::header::{CONNECTION, HOST, RANGE};
 
 use crate::bufferpool::{BulkRef, Error, PageRef, PageStream};
 use crate::http::{Method, ResponseHead, StatusCode, serialize_request};
@@ -38,14 +33,9 @@ use crate::storage::StripeReq;
 
 use super::Backend;
 use super::origin_ring::OriginRing;
-use super::sigv4::{self, Credentials, EMPTY_PAYLOAD_SHA256, SignedHeader};
-
-/// S3 service name used in the SigV4 credential scope and signing-key
-/// chain.
-const S3_SERVICE: &str = "s3";
 
 /// Origin backend that fetches stripe byte ranges from an
-/// S3-compatible origin into bufferpool pages, optionally SigV4-signed.
+/// S3-compatible origin into bufferpool pages over plaintext HTTP/1.1.
 ///
 /// Shard-pinned: the [`OriginRing`] and the raw `backing_base` pointer
 /// are only ever touched on the owning shard thread that built this
@@ -56,12 +46,10 @@ const S3_SERVICE: &str = "s3";
 pub struct S3Backend {
     ring: OriginRing,
     origin: SockAddr,
-    /// The origin hostname used for the `Host:` header and as the SigV4
-    /// `host` signed header. The TCP connect uses `origin` (the resolved
-    /// IPv4), but the bucket's virtual-host name must travel in `Host:`.
+    /// The origin hostname used for the `Host:` header. The TCP connect
+    /// uses `origin` (the resolved IPv4), but the bucket's virtual-host
+    /// name must travel in `Host:`.
     host: String,
-    region: String,
-    credentials: Option<Credentials>,
     backend_id: String,
     stripe_size: u64,
     page_size: usize,
@@ -85,8 +73,6 @@ impl S3Backend {
         ring: OriginRing,
         origin: SockAddr,
         host: String,
-        region: String,
-        credentials: Option<Credentials>,
         backend_id: String,
         stripe_size: u64,
         page_size: usize,
@@ -96,8 +82,6 @@ impl S3Backend {
             ring,
             origin,
             host,
-            region,
-            credentials,
             backend_id,
             stripe_size,
             page_size,
@@ -115,7 +99,7 @@ impl S3Backend {
     /// Delegates to [`HttpBackend::resolve_origin`](super::HttpBackend::resolve_origin),
     /// which takes the first IPv4 `ToSocketAddrs` yields and errors on
     /// IPv6-only origins (v1 dials IPv4 only). The hostname for the
-    /// `Host:`/SigV4 surface is passed separately to [`S3Backend::new`].
+    /// `Host:` header is passed separately to [`S3Backend::new`].
     pub fn resolve_origin(endpoint: &str) -> std::io::Result<SockAddr> {
         super::HttpBackend::resolve_origin(endpoint)
     }
@@ -145,8 +129,6 @@ impl Backend for S3Backend {
         let backing_base = self.backing_base;
         let page_size = self.page_size;
         let host = self.host.clone();
-        let region = self.region.clone();
-        let credentials = self.credentials.clone();
 
         // A length entry is not a byte range of the object; it is a
         // synthetic one-page cache entry whose payload is the object's
@@ -157,8 +139,6 @@ impl Backend for S3Backend {
                 handle,
                 origin_addr,
                 host,
-                region,
-                credentials,
                 path,
                 dsts_owned.clone(),
                 backing_base,
@@ -174,8 +154,6 @@ impl Backend for S3Backend {
             handle,
             origin_addr,
             host,
-            region,
-            credentials,
             path,
             start,
             len,
@@ -270,16 +248,14 @@ impl PageStream for S3FetchStream<'_> {
     }
 }
 
-/// Perform one whole origin fetch: dial the origin, send a (optionally
-/// signed) ranged GET, accumulate the response, validate it, and memcpy
-/// the body into the destination pages.
+/// Perform one whole origin fetch: dial the origin, send a ranged GET,
+/// accumulate the response, validate it, and memcpy the body into the
+/// destination pages.
 #[allow(clippy::too_many_arguments)]
 async fn fetch(
     handle: NetHandle,
     origin: &SockAddr,
     host: String,
-    region: String,
-    credentials: Option<Credentials>,
     path: String,
     start: u64,
     len: u64,
@@ -309,14 +285,7 @@ async fn fetch(
         .await
         .map_err(io_to_err)?;
 
-    let request = format_get_request(
-        &path,
-        &host,
-        &region,
-        credentials.as_ref(),
-        start,
-        start + len - 1,
-    )?;
+    let request = format_get_request(&path, &host, start, start + len - 1)?;
     handle.send(conn.fd, request).await.map_err(io_to_err)?;
 
     let mut buf: Vec<u8> = Vec::new();
@@ -439,8 +408,6 @@ async fn fetch_length(
     handle: NetHandle,
     origin: &SockAddr,
     host: String,
-    region: String,
-    credentials: Option<Credentials>,
     path: String,
     dsts: Vec<PageRef>,
     backing_base: *mut u8,
@@ -462,7 +429,7 @@ async fn fetch_length(
         .await
         .map_err(io_to_err)?;
 
-    let request = format_head_request(&path, &host, &region, credentials.as_ref())?;
+    let request = format_head_request(&path, &host)?;
     handle.send(conn.fd, request).await.map_err(io_to_err)?;
 
     const MAX_HEAD: usize = 64 * 1024;
@@ -718,166 +685,31 @@ fn absolute_range(stripe_idx: u64, stripe_size: u64, src_offset: u64, src_len: u
     (start, src_len as u64)
 }
 
-/// Format a ranged HTTP/1.1 GET request against the S3 origin. When
-/// `credentials` is `Some`, the request is SigV4-signed (adds
-/// `x-amz-date`, `x-amz-content-sha256`, and `Authorization`); otherwise
-/// it is sent unsigned. `start`/`end` are inclusive byte offsets for the
-/// `Range` header.
-fn format_get_request(
-    path: &str,
-    host: &str,
-    region: &str,
-    credentials: Option<&Credentials>,
-    start: u64,
-    end: u64,
-) -> Result<Vec<u8>, Error> {
-    let mut builder = ::http::Request::builder()
+/// Format a ranged HTTP/1.1 GET request against the S3 origin.
+/// `start`/`end` are inclusive byte offsets for the `Range` header.
+fn format_get_request(path: &str, host: &str, start: u64, end: u64) -> Result<Vec<u8>, Error> {
+    let req = ::http::Request::builder()
         .method(Method::GET)
         .uri(path)
         .header(HOST, host)
         .header(RANGE, format!("bytes={start}-{end}"))
-        .header(CONNECTION, "close");
-
-    if let Some(creds) = credentials {
-        let (amz_date, date_stamp) = now_amz_date();
-        builder = builder
-            .header("x-amz-date", &amz_date)
-            .header("x-amz-content-sha256", EMPTY_PAYLOAD_SHA256);
-        let signed = [
-            SignedHeader {
-                name: "host",
-                value: host,
-            },
-            SignedHeader {
-                name: "x-amz-content-sha256",
-                value: EMPTY_PAYLOAD_SHA256,
-            },
-            SignedHeader {
-                name: "x-amz-date",
-                value: &amz_date,
-            },
-        ];
-        let authz = sigv4::authorization_header(
-            creds,
-            "GET",
-            path,
-            "",
-            &signed,
-            EMPTY_PAYLOAD_SHA256,
-            region,
-            S3_SERVICE,
-            &amz_date,
-            &date_stamp,
-        );
-        builder = builder.header(AUTHORIZATION, authz);
-    }
-
-    let req = builder
+        .header(CONNECTION, "close")
         .body(())
         .map_err(|_| Error::from("s3 backend: failed to build origin GET request"))?;
     Ok(serialize_request(&req))
 }
 
 /// Format an HTTP/1.1 HEAD request against the S3 origin, used by the
-/// length-entry fill path. SigV4-signed when `credentials` is `Some`.
-fn format_head_request(
-    path: &str,
-    host: &str,
-    region: &str,
-    credentials: Option<&Credentials>,
-) -> Result<Vec<u8>, Error> {
-    let mut builder = ::http::Request::builder()
+/// length-entry fill path.
+fn format_head_request(path: &str, host: &str) -> Result<Vec<u8>, Error> {
+    let req = ::http::Request::builder()
         .method(Method::HEAD)
         .uri(path)
         .header(HOST, host)
-        .header(CONNECTION, "close");
-
-    if let Some(creds) = credentials {
-        let (amz_date, date_stamp) = now_amz_date();
-        builder = builder
-            .header("x-amz-date", &amz_date)
-            .header("x-amz-content-sha256", EMPTY_PAYLOAD_SHA256);
-        let signed = [
-            SignedHeader {
-                name: "host",
-                value: host,
-            },
-            SignedHeader {
-                name: "x-amz-content-sha256",
-                value: EMPTY_PAYLOAD_SHA256,
-            },
-            SignedHeader {
-                name: "x-amz-date",
-                value: &amz_date,
-            },
-        ];
-        let authz = sigv4::authorization_header(
-            creds,
-            "HEAD",
-            path,
-            "",
-            &signed,
-            EMPTY_PAYLOAD_SHA256,
-            region,
-            S3_SERVICE,
-            &amz_date,
-            &date_stamp,
-        );
-        builder = builder.header(AUTHORIZATION, authz);
-    }
-
-    let req = builder
+        .header(CONNECTION, "close")
         .body(())
         .map_err(|_| Error::from("s3 backend: failed to build origin HEAD request"))?;
     Ok(serialize_request(&req))
-}
-
-/// Render the current wall-clock time as the SigV4 date pair:
-/// `(amz_date = "YYYYMMDD'T'HHMMSS'Z'", date_stamp = "YYYYMMDD")`. A
-/// clock before the Unix epoch is clamped to the epoch rather than
-/// panicking; SigV4 origins reject the resulting timestamp anyway.
-fn now_amz_date() -> (String, String) {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format_utc(secs)
-}
-
-/// Format a Unix timestamp (seconds since the epoch, UTC) as the SigV4
-/// `(amz_date, date_stamp)` pair without pulling in a calendar crate.
-/// The year/month/day split uses Howard Hinnant's `civil_from_days`
-/// algorithm, which is exact for all proleptic-Gregorian dates.
-fn format_utc(secs: u64) -> (String, String) {
-    let days = (secs / 86_400) as i64;
-    let rem = secs % 86_400;
-    let hour = rem / 3_600;
-    let minute = (rem % 3_600) / 60;
-    let second = rem % 60;
-
-    let (year, month, day) = civil_from_days(days);
-
-    let amz_date =
-        format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z");
-    let date_stamp = format!("{year:04}{month:02}{day:02}");
-    (amz_date, date_stamp)
-}
-
-/// Convert a count of days since the Unix epoch (1970-01-01) into a
-/// `(year, month, day)` civil date. Port of Howard Hinnant's
-/// `civil_from_days`; valid for the entire proleptic Gregorian range.
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if m <= 2 { y + 1 } else { y };
-    (year, m as u32, d as u32)
 }
 
 /// Clone a [`SockAddr`] by round-tripping through its IPv4 parts, so a
@@ -976,9 +808,8 @@ mod tests {
     }
 
     #[test]
-    fn unsigned_get_request_omits_amz_headers() {
-        let req = format_get_request("/bucket/key", "s3.example.com", "us-east-1", None, 0, 4095)
-            .unwrap();
+    fn get_request_has_expected_headers() {
+        let req = format_get_request("/bucket/key", "s3.example.com", 0, 4095).unwrap();
         let s = std::str::from_utf8(&req).unwrap();
         assert!(s.starts_with("GET /bucket/key HTTP/1.1\r\n"), "got: {s}");
         assert!(s.contains("host: s3.example.com\r\n"), "got: {s}");
@@ -990,66 +821,14 @@ mod tests {
     }
 
     #[test]
-    fn signed_get_request_includes_amz_and_authorization_headers() {
-        let creds = Credentials::new("AKIDEXAMPLE", "secret");
-        let req = format_get_request(
-            "/bucket/key",
-            "s3.example.com",
-            "us-east-1",
-            Some(&creds),
-            0,
-            4095,
-        )
-        .unwrap();
-        let s = std::str::from_utf8(&req).unwrap();
-        assert!(s.contains("x-amz-date: "), "got: {s}");
-        assert!(
-            s.contains(&format!("x-amz-content-sha256: {EMPTY_PAYLOAD_SHA256}")),
-            "got: {s}"
-        );
-        assert!(
-            s.contains("authorization: AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/"),
-            "got: {s}"
-        );
-        assert!(
-            s.contains("SignedHeaders=host;x-amz-content-sha256;x-amz-date"),
-            "got: {s}"
-        );
-    }
-
-    #[test]
-    fn unsigned_head_request_omits_range_and_amz_headers() {
-        let req = format_head_request("/bucket/key", "s3.example.com", "us-east-1", None).unwrap();
+    fn head_request_omits_range() {
+        let req = format_head_request("/bucket/key", "s3.example.com").unwrap();
         let s = std::str::from_utf8(&req).unwrap();
         assert!(s.starts_with("HEAD /bucket/key HTTP/1.1\r\n"), "got: {s}");
         assert!(s.contains("host: s3.example.com\r\n"), "got: {s}");
         assert!(!s.contains("range:"), "got: {s}");
         assert!(!s.contains("x-amz-date"), "got: {s}");
         assert!(s.ends_with("\r\n\r\n"), "got: {s}");
-    }
-
-    #[test]
-    fn format_utc_matches_known_timestamps() {
-        // The Unix epoch.
-        assert_eq!(
-            format_utc(0),
-            ("19700101T000000Z".to_string(), "19700101".to_string())
-        );
-        // The AWS get-vanilla timestamp: 2015-08-30 12:36:00 UTC.
-        assert_eq!(
-            format_utc(1_440_938_160),
-            ("20150830T123600Z".to_string(), "20150830".to_string())
-        );
-    }
-
-    #[test]
-    fn civil_from_days_handles_leap_day() {
-        // 2000-02-29 is day 11_016 since the epoch (a leap day).
-        assert_eq!(civil_from_days(11_016), (2000, 2, 29));
-        // 1970-01-01 is day 0.
-        assert_eq!(civil_from_days(0), (1970, 1, 1));
-        // 2021-01-01 is day 18_628.
-        assert_eq!(civil_from_days(18_628), (2021, 1, 1));
     }
 
     #[test]

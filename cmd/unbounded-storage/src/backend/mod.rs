@@ -4,7 +4,6 @@
 #![allow(async_fn_in_trait)]
 
 mod null;
-mod sigv4;
 
 #[cfg(target_os = "linux")]
 mod http;
@@ -23,7 +22,6 @@ use std::sync::Arc;
 use crate::bufferpool::{BulkRef, PageRef, PageStream, Req};
 
 pub use null::NullBackend;
-pub use sigv4::Credentials;
 
 #[cfg(target_os = "linux")]
 pub use http::HttpBackend;

@@ -236,20 +236,6 @@ pub struct BackendSpec {
     /// Max concurrent in-flight origin HTTP requests per shard.
     #[serde(default = "default_http_concurrency")]
     pub http_concurrency: u32,
-    /// S3 region used in the SigV4 credential scope (`s3` backends).
-    /// Optional: defaults to `us-east-1` at construction when unset.
-    /// Ignored by `http` backends.
-    #[serde(default)]
-    pub region: Option<String>,
-    /// S3 access key id (`s3` backends). Must be set together with
-    /// `secret_access_key`; both unset means unsigned (public bucket)
-    /// access. Ignored by `http` backends.
-    #[serde(default)]
-    pub access_key_id: Option<String>,
-    /// S3 secret access key (`s3` backends). See `access_key_id` for
-    /// the both-or-neither rule. Ignored by `http` backends.
-    #[serde(default)]
-    pub secret_access_key: Option<String>,
     /// Reserved: S3 bucket name. Not yet wired. S3 addressing is
     /// currently path-style: the bucket is carried in the client's
     /// request path (`/bucket/key`) and forwarded verbatim to the
@@ -288,8 +274,6 @@ pub struct FrontendSpec {
     pub bind: String,
     /// Id of the [`BackendSpec`] this frontend serves from.
     pub backend: String,
-    #[serde(default)]
-    pub tls: Option<TlsCfg>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -297,22 +281,6 @@ pub struct FrontendSpec {
 pub enum FrontendKind {
     Http,
     S3,
-}
-
-/// Minimal TLS material for a frontend listener. Paths point at PEM
-/// files on disk; `secret_ref` is an out-of-band reference (e.g.
-/// `k8s://namespace/name`) that, when set, supersedes the paths. At
-/// least one source is expected at runtime, but that is the runtime's
-/// concern; the schema only models the shape.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct TlsCfg {
-    #[serde(default)]
-    pub cert_path: Option<PathBuf>,
-    #[serde(default)]
-    pub key_path: Option<PathBuf>,
-    #[serde(default)]
-    pub secret_ref: Option<String>,
 }
 
 /// A byte count accepted as either an integer (bytes) or a string with
@@ -614,10 +582,6 @@ id = "workload-http"
 kind = "http"
 bind = "0.0.0.0:9000"
 backend = "primary-http"
-
-[frontends.tls]
-cert_path = "/etc/tls/cert.pem"
-key_path = "/etc/tls/key.pem"
 "#;
         let c: Config = toml::from_str(s).unwrap();
         assert_eq!(c.backends.len(), 1);
@@ -634,10 +598,6 @@ key_path = "/etc/tls/key.pem"
         assert_eq!(f.kind, FrontendKind::Http);
         assert_eq!(f.bind, "0.0.0.0:9000");
         assert_eq!(f.backend, "primary-http");
-        let tls = f.tls.as_ref().expect("tls present");
-        assert_eq!(tls.cert_path, Some(PathBuf::from("/etc/tls/cert.pem")));
-        assert_eq!(tls.key_path, Some(PathBuf::from("/etc/tls/key.pem")));
-        assert!(tls.secret_ref.is_none());
     }
 
     #[test]
@@ -652,19 +612,6 @@ endpoint = "https://example.com"
         let b = &c.backends[0];
         assert_eq!(b.stripe_size_bytes, 4 * 1024 * 1024);
         assert_eq!(b.http_concurrency, 64);
-    }
-
-    #[test]
-    fn frontend_tls_defaults_to_none() {
-        let s = r#"
-[[frontends]]
-id = "f"
-kind = "http"
-bind = "0.0.0.0:9000"
-backend = "b"
-"#;
-        let c: Config = toml::from_str(s).unwrap();
-        assert!(c.frontends[0].tls.is_none());
     }
 
     #[test]
@@ -693,21 +640,6 @@ extra = "nope"
     }
 
     #[test]
-    fn unknown_fields_rejected_in_tls() {
-        let s = r#"
-[[frontends]]
-id = "f"
-kind = "http"
-bind = "0.0.0.0:9000"
-backend = "b"
-
-[frontends.tls]
-bogus = "nope"
-"#;
-        assert!(toml::from_str::<Config>(s).is_err());
-    }
-
-    #[test]
     fn backend_and_frontend_kind_case_sensitive() {
         let ok = r#"
 [[backends]]
@@ -727,23 +659,17 @@ endpoint = "https://example.com"
     }
 
     #[test]
-    fn s3_backend_round_trips_with_region_and_creds() {
+    fn s3_backend_round_trips_with_bucket() {
         let s = r#"
 [[backends]]
 id = "primary-s3"
 kind = "s3"
 endpoint = "s3.us-east-1.amazonaws.com:443"
-region = "us-east-1"
-access_key_id = "AKIDEXAMPLE"
-secret_access_key = "secret"
 bucket = "my-bucket"
 "#;
         let c: Config = toml::from_str(s).unwrap();
         let b = &c.backends[0];
         assert_eq!(b.kind, BackendKind::S3);
-        assert_eq!(b.region.as_deref(), Some("us-east-1"));
-        assert_eq!(b.access_key_id.as_deref(), Some("AKIDEXAMPLE"));
-        assert_eq!(b.secret_access_key.as_deref(), Some("secret"));
         assert_eq!(b.bucket.as_deref(), Some("my-bucket"));
     }
 
@@ -758,9 +684,6 @@ endpoint = "s3.example.com:443"
         let c: Config = toml::from_str(s).unwrap();
         let b = &c.backends[0];
         assert_eq!(b.kind, BackendKind::S3);
-        assert!(b.region.is_none());
-        assert!(b.access_key_id.is_none());
-        assert!(b.secret_access_key.is_none());
         assert!(b.bucket.is_none());
     }
 

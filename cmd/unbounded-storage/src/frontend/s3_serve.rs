@@ -72,8 +72,7 @@ pub struct S3Frontend {
 
 impl S3Frontend {
     /// Construct from a [`FrontendSpec`], validating the kind and
-    /// parsing the bind address. A configured `tls` block is accepted
-    /// but ignored (loopback-only in v1).
+    /// parsing the bind address.
     ///
     /// Mirrors [`HttpFrontend::from_spec`](crate::frontend::HttpFrontend):
     /// a spec whose [`FrontendKind`] is not `S3` is rejected with
@@ -574,7 +573,7 @@ fn next_request_id() -> String {
 mod tests {
     use super::*;
     use crate::bufferpool::{ReadStream, WindowedRead};
-    use crate::config::{FrontendKind, TlsCfg};
+    use crate::config::FrontendKind;
     use std::cell::RefCell;
 
     fn spec(id: &str, bind: &str) -> FrontendSpec {
@@ -583,7 +582,6 @@ mod tests {
             kind: FrontendKind::S3,
             bind: bind.to_string(),
             backend: "primary".to_string(),
-            tls: None,
         }
     }
 
@@ -606,17 +604,6 @@ mod tests {
             S3Frontend::from_spec(&s),
             Err(FrontendError::UnsupportedKind(_))
         ));
-    }
-
-    #[test]
-    fn from_spec_accepts_tls_block_but_ignores_it() {
-        let mut s = spec("f", "127.0.0.1:9000");
-        s.tls = Some(TlsCfg {
-            cert_path: None,
-            key_path: None,
-            secret_ref: Some("k8s://ns/name".into()),
-        });
-        assert!(S3Frontend::from_spec(&s).is_ok());
     }
 
     #[test]
