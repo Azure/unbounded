@@ -15,7 +15,7 @@
 # when targeting a foreign TARGETPLATFORM. ntttcp is the only piece of C code
 # we still build; for cross-arch we use a Debian cross gcc.
 # =============================================================================
-FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26.3-trixie AS builder
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26.4-trixie AS builder
 
 # Platform args. TARGETOS / TARGETARCH are populated automatically by
 # buildkit/buildah from --platform. BUILDARCH should be too, but podman
