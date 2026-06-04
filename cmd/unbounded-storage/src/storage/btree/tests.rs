@@ -691,3 +691,390 @@ fn overwrites_and_deletes_path_copy_consistent() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Concurrency + unwind coverage for the parallel commit write path.
+//
+// The two tests below pin down the contract of the within-commit
+// write parallelism: (1) independent spine pages of a single commit
+// are actually in flight simultaneously, and (2) a write failure
+// anywhere in the group unwinds the *whole* commit, freeing every
+// LBA it allocated and leaving the previously committed tree intact.
+//
+// `MockDevice` completes writes synchronously, so it can neither show
+// overlap nor fail one chosen write mid-group. `GateDevice` wraps it
+// to add exactly those two capabilities while delegating all storage
+// to the inner mock.
+// ---------------------------------------------------------------------------
+
+/// A future that returns `Pending` exactly once before completing.
+/// Under the busy-spin `block_on` above, this hands control back to
+/// the surrounding `join_all` poll sweep, so every write submitted in
+/// the same sweep is parked together and observed as concurrently in
+/// flight.
+struct YieldOnce(bool);
+
+impl Future for YieldOnce {
+    type Output = ();
+
+    fn poll(mut self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+        if self.0 {
+            Poll::Ready(())
+        } else {
+            self.0 = true;
+            Poll::Pending
+        }
+    }
+}
+
+/// `MockDevice` wrapper that (a) optionally holds each write in
+/// flight across one re-poll so concurrent writes overlap and
+/// `max_inflight` becomes observable, and (b) can fail a single write
+/// chosen by sequence number to drive mid-commit unwind.
+struct GateDevice {
+    inner: MockDevice,
+    inflight: std::cell::Cell<u32>,
+    max_inflight: std::cell::Cell<u32>,
+    writes: std::cell::Cell<u64>,
+    pend: std::cell::Cell<bool>,
+    fail_at: std::cell::Cell<Option<u64>>,
+}
+
+impl GateDevice {
+    fn new(cfg: MockDeviceConfig) -> Self {
+        Self {
+            inner: MockDevice::new(cfg),
+            inflight: std::cell::Cell::new(0),
+            max_inflight: std::cell::Cell::new(0),
+            writes: std::cell::Cell::new(0),
+            pend: std::cell::Cell::new(false),
+            fail_at: std::cell::Cell::new(None),
+        }
+    }
+
+    /// Enable one-shot pending so concurrently submitted writes
+    /// overlap instead of completing on first poll.
+    fn set_pend(&self, on: bool) {
+        self.pend.set(on);
+    }
+
+    /// Zero the in-flight high-water mark so a later commit can be
+    /// measured without `open()`'s serial writes counting.
+    fn reset_max_inflight(&self) {
+        self.max_inflight.set(0);
+    }
+
+    fn max_inflight(&self) -> u32 {
+        self.max_inflight.get()
+    }
+
+    /// Arrange for the write occurring `k` writes from now to return
+    /// `Err`, simulating a device write failure partway through a
+    /// commit.
+    fn fail_after(&self, k: u64) {
+        self.fail_at.set(Some(self.writes.get() + k));
+    }
+}
+
+impl BlockDevice for GateDevice {
+    fn page_size(&self) -> usize {
+        self.inner.page_size()
+    }
+
+    fn capacity_pages(&self) -> u64 {
+        self.inner.capacity_pages()
+    }
+
+    fn register_buffers(
+        &self,
+        base: *mut u8,
+        len: usize,
+    ) -> Result<(), crate::storage::types::Error> {
+        self.inner.register_buffers(base, len)
+    }
+
+    fn write_queue_depth(&self) -> u32 {
+        self.inner.write_queue_depth()
+    }
+
+    async fn read(&self, lba: Lba, dst: &mut [u8]) -> Result<(), crate::storage::types::Error> {
+        self.inner.read(lba, dst).await
+    }
+
+    async fn write(&self, lba: Lba, src: &[u8]) -> Result<(), crate::storage::types::Error> {
+        let seq = self.writes.get() + 1;
+        self.writes.set(seq);
+        let n = self.inflight.get() + 1;
+        self.inflight.set(n);
+        if n > self.max_inflight.get() {
+            self.max_inflight.set(n);
+        }
+        if self.pend.get() {
+            YieldOnce(false).await;
+        }
+        let res = if self.fail_at.get() == Some(seq) {
+            Err(crate::storage::types::Error::Io(5))
+        } else {
+            self.inner.write(lba, src).await
+        };
+        self.inflight.set(self.inflight.get() - 1);
+        res
+    }
+}
+
+fn open_gate(
+    dev: Arc<GateDevice>,
+    alloc: Arc<Allocator>,
+) -> impl Future<Output = Result<BTreeIndex<GateDevice>, crate::storage::types::Error>> {
+    open_gate_pool(dev, alloc, 64)
+}
+
+/// Like [`open_gate`] but with a caller-chosen scratch-pool size so a
+/// test can deliberately undersize the pool relative to the number of
+/// pages a single commit writes concurrently.
+fn open_gate_pool(
+    dev: Arc<GateDevice>,
+    alloc: Arc<Allocator>,
+    pool_pages: usize,
+) -> impl Future<Output = Result<BTreeIndex<GateDevice>, crate::storage::types::Error>> {
+    let scratch = ScratchPool::new(&*dev, 4096, pool_pages).expect("scratch pool");
+    BTreeIndex::open(dev, alloc, scratch, 4096, false)
+}
+
+fn gate_dev(capacity_pages: u64) -> (Arc<GateDevice>, Arc<Allocator>) {
+    let cfg = MockDeviceConfig {
+        page_size: 4096,
+        capacity_pages,
+        ..Default::default()
+    };
+    (
+        Arc::new(GateDevice::new(cfg)),
+        Arc::new(Allocator::new(capacity_pages)),
+    )
+}
+
+#[test]
+fn commit_writes_independent_pages_concurrently() {
+    let (dev, alloc) = gate_dev(512);
+    let idx = block_on(open_gate(dev.clone(), alloc)).unwrap();
+    // Park writes mid-flight and forget `open()`'s serial writes so
+    // the high-water mark reflects only the batch below.
+    dev.set_pend(true);
+    dev.reset_max_inflight();
+    // 200 entries exceed one leaf (cap 72) -> 3 leaves in a single
+    // commit, which the parallel path must submit concurrently.
+    let muts: Vec<_> = (0..200u32)
+        .map(|i| Mutation::Insert {
+            key: key(i),
+            value: entry(1000 + i as u64),
+        })
+        .collect();
+    block_on(idx.apply_batch(muts)).unwrap();
+    assert!(
+        dev.max_inflight() >= 2,
+        "expected >1 btree page write in flight within one commit, got {}",
+        dev.max_inflight(),
+    );
+    // Concurrency must not corrupt the result.
+    for i in 0..200u32 {
+        assert_eq!(
+            block_on(idx.lookup(&key(i))).unwrap(),
+            Some(entry(1000 + i as u64)),
+            "key {i}",
+        );
+    }
+}
+
+#[test]
+fn failed_write_mid_commit_unwinds_and_preserves_tree() {
+    let (dev, alloc) = gate_dev(512);
+    let idx = block_on(open_gate(dev.clone(), alloc.clone())).unwrap();
+    // Baseline commit: a real tree the failed commit must not disturb.
+    block_on(
+        idx.apply_batch(
+            (0..100u32)
+                .map(|i| Mutation::Insert {
+                    key: key(i),
+                    value: entry(i as u64),
+                })
+                .collect(),
+        ),
+    )
+    .unwrap();
+    let good_txn = idx.current_txn();
+    let good_root = idx.current_root();
+    let used_before = alloc.used_pages();
+
+    // Fail the second write of the next commit, after at least one
+    // sibling page has already been written to disk.
+    dev.fail_after(2);
+    let muts: Vec<_> = (100..300u32)
+        .map(|i| Mutation::Insert {
+            key: key(i),
+            value: entry(i as u64),
+        })
+        .collect();
+    let res = block_on(idx.apply_batch(muts));
+    assert!(res.is_err(), "commit must surface the device write error");
+
+    // The committed tree is untouched: same txn, same root, no
+    // entries from the failed batch, and every LBA the failed commit
+    // allocated has been freed (no leak).
+    assert_eq!(
+        idx.current_txn(),
+        good_txn,
+        "txn advanced past a failed commit"
+    );
+    assert_eq!(
+        idx.current_root(),
+        good_root,
+        "root advanced past a failed commit"
+    );
+    assert_eq!(
+        alloc.used_pages(),
+        used_before,
+        "failed commit leaked allocator pages",
+    );
+    for i in 0..100u32 {
+        assert_eq!(
+            block_on(idx.lookup(&key(i))).unwrap(),
+            Some(entry(i as u64)),
+            "pre-commit key {i} lost",
+        );
+    }
+    assert!(
+        block_on(idx.lookup(&key(250))).unwrap().is_none(),
+        "key from the failed commit must not be visible",
+    );
+
+    // The tree must still accept new commits after the failure.
+    dev.fail_at.set(None);
+    block_on(idx.apply_batch(vec![Mutation::Insert {
+        key: key(500),
+        value: entry(500),
+    }]))
+    .unwrap();
+    assert_eq!(block_on(idx.lookup(&key(500))).unwrap(), Some(entry(500)));
+}
+
+// An overwrite that lands in several leaves drives the *incremental*
+// path-copy (`recurse_internal`), which launches one `apply_node`
+// future per touched child concurrently and stitches the results back
+// by position. `commit_writes_independent_pages_concurrently` only
+// covers the bulk-load (`build_tree`) path; this points real overlap
+// at the path-copy path and checks the stitched result is correct.
+#[test]
+fn path_copy_writes_sibling_subtrees_concurrently() {
+    let (dev, alloc) = gate_dev(512);
+    let idx = block_on(open_gate(dev.clone(), alloc)).unwrap();
+    // 200 entries exceed one leaf (cap 72) -> 3 leaves under a single
+    // internal root. Sorted by key, the leaves cover roughly
+    // [0..71], [72..143], [144..199].
+    block_on(
+        idx.apply_batch(
+            (0..200u32)
+                .map(|i| Mutation::Insert {
+                    key: key(i),
+                    value: entry(i as u64),
+                })
+                .collect(),
+        ),
+    )
+    .unwrap();
+
+    // Park writes mid-flight and forget the bulk load's writes so the
+    // high-water mark reflects only the overwrite commit below.
+    dev.set_pend(true);
+    dev.reset_max_inflight();
+
+    // One overwrite per leaf forces `recurse_internal` to copy all
+    // three sibling subtrees in the same commit.
+    block_on(idx.apply_batch(vec![
+        Mutation::Insert {
+            key: key(0),
+            value: entry(9000),
+        },
+        Mutation::Insert {
+            key: key(80),
+            value: entry(9080),
+        },
+        Mutation::Insert {
+            key: key(160),
+            value: entry(9160),
+        },
+    ]))
+    .unwrap();
+
+    assert!(
+        dev.max_inflight() >= 2,
+        "expected concurrent sibling writes on the path-copy path, got {}",
+        dev.max_inflight(),
+    );
+
+    // Overwritten keys reflect the new values...
+    assert_eq!(block_on(idx.lookup(&key(0))).unwrap(), Some(entry(9000)));
+    assert_eq!(block_on(idx.lookup(&key(80))).unwrap(), Some(entry(9080)));
+    assert_eq!(block_on(idx.lookup(&key(160))).unwrap(), Some(entry(9160)));
+    // ...and untouched keys in every leaf are preserved, so the
+    // stitching did not drop or reorder a sibling subtree.
+    for i in [1u32, 40, 71, 72, 100, 143, 144, 180, 199] {
+        assert_eq!(
+            block_on(idx.lookup(&key(i))).unwrap(),
+            Some(entry(i as u64)),
+            "untouched key {i} corrupted by concurrent path copy",
+        );
+    }
+}
+
+// The deadlock-free claim under an undersized scratch pool rests on
+// `write_page` never holding its buffer across another `acquire`: a
+// commit that writes more pages than the pool has buffers must simply
+// drain in waves, never wedge. Open with a pool smaller than the
+// number of concurrent writes a single commit issues and confirm the
+// commit still completes (the busy-spin `block_on` panics on
+// no-progress, so completion itself is the deadlock guard) with a
+// correct result and an in-flight count bounded by the pool.
+#[test]
+fn commit_drains_in_waves_under_undersized_scratch_pool() {
+    let (dev, alloc) = gate_dev(512);
+    // Pool of 2 vs a 3-leaf commit: at least one write must wait for a
+    // buffer that an in-flight, parked write still holds.
+    let idx = block_on(open_gate_pool(dev.clone(), alloc, 2)).unwrap();
+    dev.set_pend(true);
+    dev.reset_max_inflight();
+
+    block_on(
+        idx.apply_batch(
+            (0..200u32)
+                .map(|i| Mutation::Insert {
+                    key: key(i),
+                    value: entry(i as u64),
+                })
+                .collect(),
+        ),
+    )
+    .unwrap();
+
+    // The leaf level wants 3 concurrent writes but the pool caps it at
+    // 2, so overlap is reached (>= 2) yet never exceeds the pool size
+    // (<= 2): the third write drained in a later wave.
+    assert!(
+        dev.max_inflight() >= 2,
+        "expected overlap up to the pool size, got {}",
+        dev.max_inflight(),
+    );
+    assert!(
+        dev.max_inflight() <= 2,
+        "in-flight writes exceeded the scratch-pool size, got {}",
+        dev.max_inflight(),
+    );
+
+    // The wave-drained commit is correct.
+    for i in 0..200u32 {
+        assert_eq!(
+            block_on(idx.lookup(&key(i))).unwrap(),
+            Some(entry(i as u64)),
+            "key {i}",
+        );
+    }
+}
