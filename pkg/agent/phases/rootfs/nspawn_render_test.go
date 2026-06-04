@@ -42,20 +42,24 @@ func TestNSpawnConfig_RenderedSnapshot(t *testing.T) {
 
 func requireRenderedSnapshot(t *testing.T, goldenFile, templateName string, data nspawnTemplateData) string {
 	t.Helper()
+
 	var buf bytes.Buffer
 	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, templateName, data))
 
 	expected, err := os.ReadFile("testdata/" + goldenFile)
 	require.NoError(t, err)
 	require.Equal(t, string(expected), buf.String())
+
 	if templateName == "service-override.conf" {
 		requireBPFFSExecStartPreOrder(t, buf.String(), data.BPFFSMountPath)
 	}
+
 	return buf.String()
 }
 
 func requireBPFFSExecStartPreOrder(t *testing.T, out, bpffsPath string) {
 	t.Helper()
+
 	mkdir := "ExecStartPre=/usr/bin/mkdir -p " + bpffsPath
 	mount := "ExecStartPre=/bin/sh -c '/usr/bin/mountpoint -q " + bpffsPath + " || /usr/bin/mount -t bpf bpf " + bpffsPath + "'"
 
