@@ -28,7 +28,7 @@ func TestAzureBlobOrigin_ColdGet(t *testing.T) {
 	SeedAzure(ctx, t, pkgAzurite, ctr, []SeedBlob{blob})
 
 	cl := StartCluster(ctx, t, ClusterOptions{
-		LocalStack:     pkgLocalStack,
+		S3Backend:      pkgS3,
 		Azurite:        pkgAzurite,
 		OriginDriver:   "azureblob",
 		AzureContainer: ctr,

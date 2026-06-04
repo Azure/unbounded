@@ -137,15 +137,28 @@ impl NetworkRing {
     /// Register the bufferpool `backing` as fixed buffer index 0, so
     /// SEND_ZC and fixed RECV can target bufferpool pages by offset.
     pub fn register_backing(&self, backing: &crate::memory::Backing) -> io::Result<()> {
-        if backing.base.is_null() || backing.page_size == 0 || backing.page_count == 0 {
+        if backing.page_size == 0 || backing.page_count == 0 {
             return Err(io::Error::from_raw_os_error(libc::EINVAL));
         }
         let len = backing
             .page_size
             .checked_mul(backing.page_count)
             .ok_or_else(|| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
-        let idx = self.core.register_buffer(backing.base, len)?;
-        debug_assert_eq!(idx, 0, "backing must be the first registered buffer");
+        self.register_region(backing.base, len)
+    }
+
+    /// Register a raw `(base, len)` region as fixed buffer index 0, so
+    /// SEND_ZC and fixed RECV can target it by offset. This is the
+    /// backing-free counterpart of [`Self::register_backing`] for
+    /// callers that hold the region as a bare pointer (e.g. a worker's
+    /// thread-local scratch backing whose `Backing` Drop carrier cannot
+    /// be re-synthesized from raw parts).
+    pub fn register_region(&self, base: *mut u8, len: usize) -> io::Result<()> {
+        if base.is_null() || len == 0 {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        let idx = self.core.register_buffer(base, len)?;
+        debug_assert_eq!(idx, 0, "region must be the first registered buffer");
         Ok(())
     }
 
@@ -340,6 +353,22 @@ impl NetHandle {
         Self { ring }
     }
 
+    /// True when both handles drive the very same ring allocation
+    /// (their `Rc`s share one `NetworkRing`). Used to assert ring
+    /// sharing/isolation across threads.
+    #[cfg(test)]
+    pub fn same_ring(&self, other: &NetHandle) -> bool {
+        Rc::ptr_eq(&self.ring, &other.ring)
+    }
+
+    /// Address identity of the underlying ring allocation. Two handles
+    /// over the same ring return equal values; handles over distinct
+    /// rings return distinct ones.
+    #[cfg(test)]
+    pub fn ring_addr(&self) -> usize {
+        Rc::as_ptr(&self.ring) as usize
+    }
+
     /// `'static` counterpart of [`NetworkRing::accept`].
     pub fn accept(&self, listen_fd: RawFd) -> impl Future<Output = io::Result<RawFd>> + 'static {
         let ring = Rc::clone(&self.ring);
@@ -476,6 +505,39 @@ impl NetHandle {
             check_res(res).map(|n| n as usize)
         }
     }
+
+    /// `'static` counterpart of [`NetworkRing::recv_fixed`].
+    pub fn recv_fixed(
+        &self,
+        fd: RawFd,
+        buf_index: u16,
+        page_byte_offset: usize,
+        len: usize,
+    ) -> impl Future<Output = io::Result<usize>> + 'static {
+        let ring = Rc::clone(&self.ring);
+        async move {
+            let (ud, slot) = {
+                let r = ring.borrow();
+                let ptr = r.fixed_ptr(buf_index, page_byte_offset)?;
+                let ud = r.core.alloc_user_data();
+                let sqe = opcode::Recv::new(types::Fd(fd), ptr as *mut u8, len as u32)
+                    .build()
+                    .user_data(ud);
+                // SAFETY: `ptr` points inside the registered backing; the
+                // caller holds the destination page until this future
+                // resolves (the RECV completion CQE). If the future is
+                // dropped early, `OwnedNetFut::draining` drains the RECV
+                // to completion before returning, so the kernel never
+                // writes into the page after the caller reuses it.
+                let slot = r.core.submit_now(sqe, false, OpResource::None)?;
+                (ud, slot)
+            };
+            let res = OwnedNetFut::new(Rc::clone(&ring), ud, slot)
+                .draining()
+                .await;
+            check_res(res).map(|n| n as usize)
+        }
+    }
 }
 
 /// `'static` op future for the [`NetHandle`] path. Owns an
@@ -487,6 +549,12 @@ struct OwnedNetFut {
     ring: Rc<RefCell<NetworkRing>>,
     user_data: u64,
     slot: Rc<Slot>,
+    /// When set, dropping before completion blocks until the op's CQE is
+    /// reaped (see [`RingCore::cancel_and_drain`]) instead of issuing a
+    /// best-effort cancel. Required for ops that write into caller-owned
+    /// memory the caller may reuse the instant this future drops (the
+    /// fixed-buffer RECV path).
+    drain_on_drop: bool,
 }
 
 impl OwnedNetFut {
@@ -495,7 +563,15 @@ impl OwnedNetFut {
             ring,
             user_data,
             slot,
+            drain_on_drop: false,
         }
+    }
+
+    /// Mark this future so that dropping it before completion drains the
+    /// in-flight op to completion rather than best-effort cancelling it.
+    fn draining(mut self) -> Self {
+        self.drain_on_drop = true;
+        self
     }
 }
 
@@ -519,7 +595,11 @@ impl Drop for OwnedNetFut {
     fn drop(&mut self) {
         if !self.slot.is_done() {
             if let Ok(ring) = self.ring.try_borrow() {
-                ring.core.cancel(self.user_data);
+                if self.drain_on_drop {
+                    ring.core.cancel_and_drain(self.user_data, &self.slot);
+                } else {
+                    ring.core.cancel(self.user_data);
+                }
             }
         }
     }
@@ -807,7 +887,158 @@ mod tests {
         }
     }
 
-    /// `NetHandle` `'static` futures round-trip over a real socketpair,
+    /// `NetHandle::recv_fixed` (the `'static` owned-future variant)
+    /// receives into a registered backing page. Bytes are sent from a
+    /// plain socket and must land at the requested page byte offset in
+    /// the backing, proving the fixed-buffer destination is resolved and
+    /// driven correctly through the owned-future path.
+    #[test]
+    fn handle_recv_fixed_lands_at_offset() {
+        let ring = match NetworkRing::new(16) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("handle_recv_fixed: ring unavailable: {e}; skipping");
+                return;
+            }
+        };
+
+        const PAGE: usize = 4096;
+        let mut store = vec![0u8; PAGE * 2];
+        let payload: &[u8] = b"nethandle recv_fixed bytes";
+        let backing = crate::memory::Backing {
+            base: store.as_mut_ptr(),
+            page_size: PAGE,
+            page_count: 2,
+            _own: Box::new(()),
+        };
+        if let Err(e) = ring.register_backing(&backing) {
+            eprintln!("handle_recv_fixed: register_backing failed: {e}; skipping");
+            return;
+        }
+
+        let ring = Rc::new(RefCell::new(ring));
+        let handle = NetHandle::new(Rc::clone(&ring));
+
+        let Some((a, b)) = tcp_loopback_pair() else {
+            eprintln!("handle_recv_fixed: tcp loopback pair failed; skipping");
+            return;
+        };
+
+        // Push the payload from the peer socket directly; the recv side
+        // lands it into page 1 (offset PAGE) of the registered backing.
+        let wrote =
+            unsafe { libc::write(a, payload.as_ptr() as *const libc::c_void, payload.len()) };
+        if wrote < 0 {
+            eprintln!("handle_recv_fixed: write failed; skipping");
+            unsafe {
+                libc::close(a);
+                libc::close(b);
+            }
+            return;
+        }
+        assert_eq!(wrote as usize, payload.len());
+
+        let got = {
+            let fut = handle.recv_fixed(b, 0, PAGE, payload.len());
+            let mut fut = Box::pin(fut);
+            match block_on_handle(fut.as_mut()) {
+                Ok(n) => n,
+                Err(e) if is_unsupported(&e) => {
+                    eprintln!("handle_recv_fixed: RECV unsupported; skipping");
+                    unsafe {
+                        libc::close(a);
+                        libc::close(b);
+                    }
+                    return;
+                }
+                Err(e) => panic!("handle recv_fixed failed: {e}"),
+            }
+        };
+
+        assert_eq!(got, payload.len());
+        assert_eq!(&store[PAGE..PAGE + payload.len()], payload);
+
+        unsafe {
+            libc::close(a);
+            libc::close(b);
+        }
+    }
+
+    /// Dropping an in-flight `recv_fixed` future must drain the RECV to
+    /// completion, not merely best-effort cancel it: the destination page
+    /// can be reused the instant the future drops, so the kernel must be
+    /// done writing first. We start a RECV with no data available (it
+    /// parks in the kernel), drop the future, and assert the ring has no
+    /// in-flight ops afterwards (the slot was reaped via ASYNC_CANCEL).
+    #[test]
+    fn drop_in_flight_recv_fixed_drains_the_op() {
+        let ring = match NetworkRing::new(16) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("drop_in_flight_recv_fixed: ring unavailable: {e}; skipping");
+                return;
+            }
+        };
+
+        const PAGE: usize = 4096;
+        let mut store = vec![0u8; PAGE * 2];
+        let backing = crate::memory::Backing {
+            base: store.as_mut_ptr(),
+            page_size: PAGE,
+            page_count: 2,
+            _own: Box::new(()),
+        };
+        if let Err(e) = ring.register_backing(&backing) {
+            eprintln!("drop_in_flight_recv_fixed: register_backing failed: {e}; skipping");
+            return;
+        }
+
+        let ring = Rc::new(RefCell::new(ring));
+        let handle = NetHandle::new(Rc::clone(&ring));
+
+        let Some((a, b)) = tcp_loopback_pair() else {
+            eprintln!("drop_in_flight_recv_fixed: tcp loopback pair failed; skipping");
+            return;
+        };
+
+        // No bytes are written to `a`, so the RECV on `b` blocks in the
+        // kernel and the future parks Pending after submitting the op.
+        let fut = handle.recv_fixed(b, 0, PAGE, PAGE);
+        let mut fut = Box::pin(fut);
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(_) => {
+                // Completed/errored without blocking (e.g. RECV
+                // unsupported). Nothing in flight to drain; skip.
+                unsafe {
+                    libc::close(a);
+                    libc::close(b);
+                }
+                return;
+            }
+            Poll::Pending => {}
+        }
+        assert_eq!(
+            ring.borrow().core.in_flight(),
+            1,
+            "the RECV should be outstanding after the first poll",
+        );
+
+        // Dropping the parked future must block until the RECV is reaped.
+        drop(fut);
+        assert_eq!(
+            ring.borrow().core.in_flight(),
+            0,
+            "dropping a draining recv_fixed must reap the in-flight op",
+        );
+
+        unsafe {
+            libc::close(a);
+            libc::close(b);
+        }
+    }
+
     /// proving the owned-future path (synchronous submit + owned slot +
     /// self-driven progress) is wired correctly.
     #[test]

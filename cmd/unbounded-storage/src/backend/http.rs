@@ -30,31 +30,32 @@
 //!   ETag yields a new key), rather than being tracked as separate
 //!   per-stripe metadata.
 
-use std::cell::RefCell;
 use std::future::Future;
 use std::os::fd::RawFd;
 use std::pin::Pin;
-use std::rc::Rc;
 use std::task::{Context, Poll};
 
 use ::http::header::{CONNECTION, HOST, RANGE};
 
 use crate::bufferpool::{BulkRef, Error, PageRef, PageStream};
 use crate::http::{Method, ResponseHead, StatusCode, serialize_request};
-use crate::ring::{NetworkRing, SockAddr};
+use crate::ring::{NetHandle, SockAddr};
 use crate::storage::StripeReq;
 
 use super::Backend;
+use super::origin_ring::OriginRing;
 
 /// Origin backend that fetches stripe byte ranges from a plaintext
 /// HTTP/1.1 origin server into bufferpool pages.
 ///
-/// Shard-pinned: the `Rc<RefCell<NetworkRing>>` and the raw
-/// `backing_base` pointer are only ever touched on the owning shard
-/// thread that built this backend. See the `unsafe impl Send + Sync`
-/// below.
+/// Shard-pinned: the [`OriginRing`] and the raw `backing_base` pointer
+/// are only ever touched on the owning shard thread that built this
+/// backend, OR (for the RPC-handler instance) on the ephemeral
+/// `fabric-rpc-worker` thread that uses an [`OriginRing::WorkerLocal`]
+/// ring private to that thread. Either way a single thread drives any
+/// one ring; see the `unsafe impl Send + Sync` below.
 pub struct HttpBackend {
-    socket: Rc<RefCell<NetworkRing>>,
+    ring: OriginRing,
     origin: SockAddr,
     backend_id: String,
     stripe_size: u64,
@@ -64,18 +65,18 @@ pub struct HttpBackend {
 
 // SAFETY: mirrors `crate::memory::Backing`. `HttpBackend` is
 // shard-pinned: the embedder constructs it on, and only ever drives it
-// from, a single pinned shard thread. The `Rc`, the `RefCell`, and the
-// raw `backing_base` pointer are never shared across threads at
-// runtime. The `Send + Sync` marker exists solely to satisfy the
-// `Backend: Send + Sync` bound the embedder requires when it stores the
-// backend in a cross-shard registry; it is not an invitation to touch
-// the backend off its shard.
+// from, a single pinned shard thread. The `OriginRing`, any `Rc`/
+// `RefCell` it holds, and the raw `backing_base` pointer are never
+// shared across threads at runtime. The `Send + Sync` marker exists
+// solely to satisfy the `Backend: Send + Sync` bound the embedder
+// requires when it stores the backend in a cross-shard registry; it is
+// not an invitation to touch the backend off its shard.
 unsafe impl Send for HttpBackend {}
 unsafe impl Sync for HttpBackend {}
 
 impl HttpBackend {
     pub fn new(
-        socket: Rc<RefCell<NetworkRing>>,
+        ring: OriginRing,
         origin: SockAddr,
         backend_id: String,
         stripe_size: u64,
@@ -83,7 +84,7 @@ impl HttpBackend {
         backing_base: *mut u8,
     ) -> Self {
         Self {
-            socket,
+            ring,
             origin,
             backend_id,
             stripe_size,
@@ -147,7 +148,10 @@ impl Backend for HttpBackend {
             .unwrap_or_else(|| "origin".to_string());
 
         let dsts_owned = dsts.to_vec();
-        let socket = Rc::clone(&self.socket);
+        let handle = match self.ring.handle() {
+            Ok(h) => h,
+            Err(e) => return HttpFetchStream::immediate_err(io_to_err(e)),
+        };
         let origin_addr = &self.origin;
         let backing_base = self.backing_base;
         let page_size = self.page_size;
@@ -158,7 +162,7 @@ impl Backend for HttpBackend {
         // `absolute_range`, so this must branch before that is computed.
         if origin.is_length_entry() {
             let fut = Box::pin(fetch_length(
-                socket,
+                handle,
                 origin_addr,
                 host,
                 path,
@@ -173,7 +177,7 @@ impl Backend for HttpBackend {
         let (start, len) = absolute_range(origin.stripe_idx, self.stripe_size, src.offset, src.len);
 
         let fut = Box::pin(fetch(
-            socket,
+            handle,
             origin_addr,
             host,
             path,
@@ -229,6 +233,14 @@ impl<'a> HttpFetchStream<'a> {
             next: 0,
         }
     }
+
+    fn immediate_err(err: Error) -> Self {
+        Self {
+            state: FetchState::Failed(Some(err)),
+            delivered: Vec::new(),
+            next: 0,
+        }
+    }
 }
 
 impl PageStream for HttpFetchStream<'_> {
@@ -269,12 +281,14 @@ impl PageStream for HttpFetchStream<'_> {
 }
 
 /// Perform one whole origin fetch: dial the origin, send a ranged GET,
-/// accumulate the response, validate it, and memcpy the body into the
-/// destination pages. The destination pages are captured in
-/// `delivered` so the stream can yield them after this resolves.
+/// receive and validate the response head, then stream the body
+/// directly into the destination bufferpool pages via `recv_fixed`
+/// (zero-copy: no heap accumulation of the body). The destination
+/// pages are captured in `delivered` so the stream can yield them after
+/// this resolves.
 #[allow(clippy::too_many_arguments)]
 async fn fetch(
-    socket: Rc<RefCell<NetworkRing>>,
+    handle: NetHandle,
     origin: &SockAddr,
     host: String,
     path: String,
@@ -298,25 +312,20 @@ async fn fetch(
     }
 
     let conn = TcpConn::open()?;
-    {
-        // The ring's op futures borrow `&NetworkRing`, so the shared
-        // `RefCell` borrow is held across the await. That is sound here:
-        // every ring method (including the shard's `progress()` tick
-        // hook) takes `&self`, so concurrent shared borrows coexist; no
-        // path takes `borrow_mut()` while a fetch is in flight.
-        // SAFETY: SockAddr is owned by the backend for the fetch's
-        // lifetime; the ring copies it into its own slot.
-        let ring = socket.borrow();
-        ring.connect(conn.fd, clone_sockaddr(origin))
-            .await
-            .map_err(io_to_err)?;
-    }
+    // The ring's op futures self-pump (each polls its own ring's
+    // `progress()`), so this fetch drives the ring entirely on the
+    // current thread. For the RPC-handler backend that is an
+    // `fabric-rpc-worker` thread with its OWN worker-local ring, so it
+    // never races the shard thread's ring. SAFETY: SockAddr is owned by
+    // the backend for the fetch's lifetime; the ring copies it into its
+    // own slot.
+    handle
+        .connect(conn.fd, clone_sockaddr(origin))
+        .await
+        .map_err(io_to_err)?;
 
     let request = format_get_request(&path, &host, start, start + len - 1)?;
-    {
-        let ring = socket.borrow();
-        ring.send(conn.fd, request).await.map_err(io_to_err)?;
-    }
+    handle.send(conn.fd, request).await.map_err(io_to_err)?;
 
     // Accumulate until the full header block has arrived. The origin
     // sends headers then body on the same stream.
@@ -332,7 +341,7 @@ async fn fetch(
                 h.content_range_start(),
             );
         }
-        let chunk = recv_chunk(&socket, conn.fd).await?;
+        let chunk = recv_chunk(&handle, conn.fd).await?;
         if chunk.is_empty() {
             return Err(Error::from(
                 "http backend: connection closed before response headers complete",
@@ -364,42 +373,74 @@ async fn fetch(
     // length, so the padding is never handed to a client. A connection
     // that closes before the advertised length is a genuine truncation.
     let body_start = header_end;
-    let body_len = match expected_body_len(status, content_length, len)? {
-        Some(n) => {
-            let want_end = body_start
-                .checked_add(n as usize)
-                .ok_or_else(|| Error::from("http backend: response length overflow"))?;
-            while buf.len() < want_end {
-                let chunk = recv_chunk(&socket, conn.fd).await?;
-                if chunk.is_empty() {
-                    return Err(Error::from("http backend: short read from origin"));
-                }
-                buf.extend_from_slice(&chunk);
-            }
-            buf.truncate(want_end);
-            n as usize
-        }
-        None => {
-            // No Content-Length advertised: read until the origin closes
-            // the (Connection: close) stream, capped at the page we asked
-            // for. EOF is unambiguous because v1 never reuses a socket.
-            let want_end = body_start
-                .checked_add(len as usize)
-                .ok_or_else(|| Error::from("http backend: response length overflow"))?;
-            while buf.len() < want_end {
-                let chunk = recv_chunk(&socket, conn.fd).await?;
-                if chunk.is_empty() {
-                    break;
-                }
-                buf.extend_from_slice(&chunk);
-            }
-            buf.truncate(want_end);
-            buf.len().saturating_sub(body_start)
-        }
-    };
+    let body_len_mode = expected_body_len(status, content_length, len)?;
 
-    let body = &buf[body_start..body_start + body_len];
-    copy_body_into_pages(body, &dsts, backing_base, page_size)?;
+    // `body_cap` is the most body bytes we will accept into the pages.
+    // For a known Content-Length it is that length (already validated by
+    // `expected_body_len` to be <= the requested range, hence <=
+    // capacity); for the close-delimited case it is the requested range,
+    // which equals the page capacity. Either way it never exceeds
+    // `capacity`, so the destination pages always have room.
+    let capacity = pages_capacity(&dsts);
+    debug_assert_eq!(capacity as u64, len, "capacity must equal requested range");
+    let body_cap: usize = match body_len_mode {
+        Some(n) => n as usize,
+        None => len as usize,
+    };
+    if body_cap > capacity {
+        return Err(Error::from("http backend: over read from origin"));
+    }
+
+    // recv_fixed targets the registered fixed backing at buf index 0,
+    // whose base is `backing_base` (Phase 2 invariant). The page math
+    // below produces registered byte offsets relative to that same base.
+
+    // Body bytes that shared the header TCP segment are already in `buf`
+    // past `header_end`; place them first with a page-aware memcpy. Any
+    // bytes beyond `body_cap` are surplus the origin overstuffed and are
+    // dropped (the old path truncated them identically).
+    let leading = &buf[body_start..];
+    let lead_take = leading.len().min(body_cap);
+    if lead_take > 0 {
+        write_slice_into_pages(&leading[..lead_take], &dsts, 0, backing_base, page_size)?;
+    }
+    let mut filled = lead_take;
+
+    // Stream the remaining body straight into the destination pages. A
+    // single recv never crosses a page boundary (pages are contiguous
+    // within themselves but not with each other in the backing), so the
+    // length is capped at the room left in the current page and at the
+    // bytes still wanted.
+    while filled < body_cap {
+        let Some((page_byte_off, room)) = locate_in_pages(&dsts, filled, page_size)? else {
+            break;
+        };
+        let recv_len = room.min(body_cap - filled);
+        // SAFETY: `page_byte_off` addresses a page inside the registered
+        // fixed backing (buf index 0, base == backing_base) that the
+        // Pool reserves for this fetch across every await here; the
+        // backend is shard-pinned so no other thread touches it. The
+        // destination stays reserved until this future resolves.
+        let n_recv = handle
+            .recv_fixed(conn.fd, 0, page_byte_off, recv_len)
+            .await
+            .map_err(io_to_err)?;
+        if n_recv == 0 {
+            // EOF. With a known length this is a truncation; for the
+            // close-delimited case it is the normal end of the body.
+            match body_len_mode {
+                Some(_) => return Err(Error::from("http backend: short read from origin")),
+                None => break,
+            }
+        }
+        filled += n_recv;
+    }
+
+    // Zero-fill the tail the body did not cover (short 206 / short 200 /
+    // close-delimited stream that ended early). The frontend clamps
+    // served reads to the object length, so this padding is never
+    // returned to a client.
+    zero_fill_pages_from(&dsts, filled, backing_base, page_size)?;
     Ok(())
 }
 
@@ -413,7 +454,7 @@ async fn fetch(
 /// into the first page bytes and zero-fills the remainder of the
 /// destination pages.
 async fn fetch_length(
-    socket: Rc<RefCell<NetworkRing>>,
+    handle: NetHandle,
     origin: &SockAddr,
     host: String,
     path: String,
@@ -429,20 +470,15 @@ async fn fetch_length(
     }
 
     let conn = TcpConn::open()?;
-    {
-        // See `fetch` for why the shared `RefCell` borrow held across
-        // the await is sound (every ring method takes `&self`).
-        let ring = socket.borrow();
-        ring.connect(conn.fd, clone_sockaddr(origin))
-            .await
-            .map_err(io_to_err)?;
-    }
+    // See `fetch` for why driving the ring on the current thread is
+    // sound (the op futures self-pump on their own thread's ring).
+    handle
+        .connect(conn.fd, clone_sockaddr(origin))
+        .await
+        .map_err(io_to_err)?;
 
     let request = format_head_request(&path, &host)?;
-    {
-        let ring = socket.borrow();
-        ring.send(conn.fd, request).await.map_err(io_to_err)?;
-    }
+    handle.send(conn.fd, request).await.map_err(io_to_err)?;
 
     // Accumulate until the full header block has arrived, capping the
     // header buffer so a pathological origin cannot grow it unbounded.
@@ -459,7 +495,7 @@ async fn fetch_length(
                 "http backend: length HEAD response head exceeds 64 KiB",
             ));
         }
-        let chunk = recv_chunk(&socket, conn.fd).await?;
+        let chunk = recv_chunk(&handle, conn.fd).await?;
         if chunk.is_empty() {
             return Err(Error::from(
                 "http backend: connection closed before length HEAD headers complete",
@@ -576,12 +612,120 @@ fn copy_body_into_pages(
     Ok(())
 }
 
-/// Receive one chunk from `fd` through the shared ring, releasing the
-/// `RefCell` borrow before awaiting so the ring's progress hook can run.
-async fn recv_chunk(socket: &Rc<RefCell<NetworkRing>>, fd: RawFd) -> Result<Vec<u8>, Error> {
+/// Total destination byte capacity across `dsts`.
+fn pages_capacity(dsts: &[PageRef]) -> usize {
+    dsts.iter().map(|p| p.len as usize).sum()
+}
+
+/// Registered byte offset of a page within the fixed backing
+/// (`page_idx * page_size + offset`). Identical to the math
+/// [`copy_body_into_pages`] uses against `backing_base`.
+fn page_byte_offset(page: &PageRef, page_size: usize) -> Result<usize, Error> {
+    (page.page_idx as usize)
+        .checked_mul(page_size)
+        .and_then(|base| base.checked_add(page.offset as usize))
+        .ok_or_else(|| Error::from("http backend: page byte offset overflow"))
+}
+
+/// Locate the destination page covering logical body offset `at` and
+/// return `(registered_byte_offset, room)` where `room` is the number
+/// of bytes left in that page from `at`. Returns `None` once `at`
+/// reaches the pages' total capacity (no page covers it).
+fn locate_in_pages(
+    dsts: &[PageRef],
+    at: usize,
+    page_size: usize,
+) -> Result<Option<(usize, usize)>, Error> {
+    let mut page_start = 0usize;
+    for page in dsts {
+        let n = page.len as usize;
+        if at < page_start + n {
+            let within = at - page_start;
+            let off = page_byte_offset(page, page_size)?
+                .checked_add(within)
+                .ok_or_else(|| Error::from("http backend: page byte offset overflow"))?;
+            return Ok(Some((off, n - within)));
+        }
+        page_start += n;
+    }
+    Ok(None)
+}
+
+/// Page-aware memcpy of `src` into the destination pages starting at
+/// logical body offset `start`, walking pages so a copy never crosses a
+/// page boundary. Unlike [`copy_body_into_pages`] this does NOT
+/// zero-fill the remainder; the tail is zeroed once after the whole
+/// body has landed (see [`zero_fill_pages_from`]). Errors if the slice
+/// would run past the pages' total capacity.
+fn write_slice_into_pages(
+    src: &[u8],
+    dsts: &[PageRef],
+    start: usize,
+    backing_base: *mut u8,
+    page_size: usize,
+) -> Result<(), Error> {
+    let end = start
+        .checked_add(src.len())
+        .ok_or_else(|| Error::from("http backend: page byte offset overflow"))?;
+    if end > pages_capacity(dsts) {
+        return Err(Error::from("http backend: over read from origin"));
+    }
+    let mut written = 0usize;
+    while written < src.len() {
+        let (off, room) = locate_in_pages(dsts, start + written, page_size)?
+            .ok_or_else(|| Error::from("http backend: over read from origin"))?;
+        let n = room.min(src.len() - written);
+        // SAFETY: `off` addresses a page inside the registered backing
+        // the embedder keeps alive for the shard's lifetime; the backend
+        // is shard-pinned so no other thread touches `backing_base`. `n`
+        // bytes fit within the located page (n <= room) and within `src`
+        // (n <= src.len() - written), both bounds-checked above.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr().add(written), backing_base.add(off), n);
+        }
+        written += n;
+    }
+    Ok(())
+}
+
+/// Zero-fill destination page bytes from logical offset `from` to the
+/// end of the pages' total capacity, writing directly into the backing.
+/// Preserves the tail-zeroing semantics of [`copy_body_into_pages`] for
+/// the zero-copy streaming path.
+fn zero_fill_pages_from(
+    dsts: &[PageRef],
+    from: usize,
+    backing_base: *mut u8,
+    page_size: usize,
+) -> Result<(), Error> {
+    let mut page_start = 0usize;
+    for page in dsts {
+        let n = page.len as usize;
+        let page_end = page_start + n;
+        if from < page_end {
+            let within = from.saturating_sub(page_start);
+            let off = page_byte_offset(page, page_size)?
+                .checked_add(within)
+                .ok_or_else(|| Error::from("http backend: page byte offset overflow"))?;
+            // SAFETY: `off` addresses a page inside the registered
+            // backing kept alive for the shard's lifetime; the backend is
+            // shard-pinned. `n - within` bytes stay within this page
+            // (within <= n), so the write does not escape it.
+            unsafe {
+                std::ptr::write_bytes(backing_base.add(off), 0, n - within);
+            }
+        }
+        page_start = page_end;
+    }
+    Ok(())
+}
+
+/// Receive one chunk from `fd` through the origin ring. The
+/// [`NetHandle`] recv future self-pumps its own ring's progress hook
+/// while awaiting.
+async fn recv_chunk(handle: &NetHandle, fd: RawFd) -> Result<Vec<u8>, Error> {
     const RECV_CHUNK: usize = 64 * 1024;
-    let ring = socket.borrow();
-    ring.recv(fd, RECV_CHUNK).await.map_err(io_to_err)
+    handle.recv(fd, RECV_CHUNK).await.map_err(io_to_err)
 }
 
 /// Compute the absolute origin byte range for a stripe sub-range. The
@@ -908,5 +1052,205 @@ mod tests {
         head.copy_from_slice(&backing[0..8]);
         assert_eq!(u64::from_le_bytes(head), 12345);
         assert!(backing[8..].iter().all(|&b| b == 0), "tail not zeroed");
+    }
+
+    #[test]
+    fn pages_capacity_sums_page_lengths() {
+        let dsts = [
+            PageRef {
+                page_idx: 0,
+                offset: 0,
+                len: 4,
+            },
+            PageRef {
+                page_idx: 1,
+                offset: 16,
+                len: 7,
+            },
+        ];
+        assert_eq!(pages_capacity(&dsts), 11);
+        assert_eq!(pages_capacity(&[]), 0);
+    }
+
+    #[test]
+    fn locate_in_pages_walks_to_correct_page() {
+        let page_size = 4096usize;
+        // page 1 offset 0 len 4, page 2 offset 8 len 3.
+        let dsts = [
+            PageRef {
+                page_idx: 1,
+                offset: 0,
+                len: 4,
+            },
+            PageRef {
+                page_idx: 2,
+                offset: 8,
+                len: 3,
+            },
+        ];
+        assert_eq!(
+            locate_in_pages(&dsts, 0, page_size).unwrap(),
+            Some((page_size, 4))
+        );
+        assert_eq!(
+            locate_in_pages(&dsts, 3, page_size).unwrap(),
+            Some((page_size + 3, 1))
+        );
+        assert_eq!(
+            locate_in_pages(&dsts, 4, page_size).unwrap(),
+            Some((2 * page_size + 8, 3))
+        );
+        assert_eq!(
+            locate_in_pages(&dsts, 5, page_size).unwrap(),
+            Some((2 * page_size + 9, 2))
+        );
+        assert_eq!(locate_in_pages(&dsts, 7, page_size).unwrap(), None);
+        assert_eq!(locate_in_pages(&dsts, 100, page_size).unwrap(), None);
+    }
+
+    #[test]
+    fn write_slice_into_pages_fills_single_page_exactly() {
+        let page_size = 4096usize;
+        let mut backing = vec![0u8; page_size * 2];
+        let base = backing.as_mut_ptr();
+        let dsts = [PageRef {
+            page_idx: 1,
+            offset: 0,
+            len: 4,
+        }];
+        write_slice_into_pages(&[1u8, 2, 3, 4], &dsts, 0, base, page_size).unwrap();
+        assert_eq!(&backing[page_size..page_size + 4], &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn write_slice_into_pages_splits_across_pages() {
+        let page_size = 4096usize;
+        let mut backing = vec![0u8; page_size * 3];
+        let base = backing.as_mut_ptr();
+        let dsts = [
+            PageRef {
+                page_idx: 1,
+                offset: 0,
+                len: 4,
+            },
+            PageRef {
+                page_idx: 2,
+                offset: 8,
+                len: 3,
+            },
+        ];
+        write_slice_into_pages(&[1u8, 2, 3, 4, 5, 6, 7], &dsts, 0, base, page_size).unwrap();
+        assert_eq!(&backing[page_size..page_size + 4], &[1, 2, 3, 4]);
+        assert_eq!(&backing[2 * page_size + 8..2 * page_size + 11], &[5, 6, 7]);
+    }
+
+    #[test]
+    fn write_slice_into_pages_assembles_in_two_calls() {
+        // Leading bytes then remainder, written at increasing logical
+        // offsets, must assemble contiguously across the page boundary.
+        let page_size = 4096usize;
+        let mut backing = vec![0u8; page_size * 3];
+        let base = backing.as_mut_ptr();
+        let dsts = [
+            PageRef {
+                page_idx: 1,
+                offset: 0,
+                len: 4,
+            },
+            PageRef {
+                page_idx: 2,
+                offset: 8,
+                len: 3,
+            },
+        ];
+        write_slice_into_pages(&[10u8, 20, 30], &dsts, 0, base, page_size).unwrap();
+        write_slice_into_pages(&[40u8, 50, 60, 70], &dsts, 3, base, page_size).unwrap();
+        assert_eq!(&backing[page_size..page_size + 4], &[10, 20, 30, 40]);
+        assert_eq!(&backing[2 * page_size + 8..2 * page_size + 11], &[50, 60, 70]);
+    }
+
+    #[test]
+    fn write_slice_into_pages_rejects_overflow() {
+        let page_size = 4096usize;
+        let mut backing = vec![0u8; page_size];
+        let base = backing.as_mut_ptr();
+        let dsts = [PageRef {
+            page_idx: 0,
+            offset: 0,
+            len: 4,
+        }];
+        let err = write_slice_into_pages(&[0u8; 6], &dsts, 0, base, page_size).unwrap_err();
+        assert!(matches!(err, Error::Transport(_)));
+        let err = write_slice_into_pages(&[0u8; 3], &dsts, 2, base, page_size).unwrap_err();
+        assert!(matches!(err, Error::Transport(_)));
+    }
+
+    #[test]
+    fn zero_fill_pages_from_zeros_tail_within_page() {
+        let page_size = 4096usize;
+        let mut backing = vec![0xFFu8; page_size];
+        let base = backing.as_mut_ptr();
+        let dsts = [PageRef {
+            page_idx: 0,
+            offset: 0,
+            len: 8,
+        }];
+        backing[0..4].copy_from_slice(&[1, 2, 3, 4]);
+        zero_fill_pages_from(&dsts, 4, base, page_size).unwrap();
+        assert_eq!(&backing[0..8], &[1, 2, 3, 4, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn zero_fill_pages_from_spans_remaining_pages() {
+        // `from` lands partway through the first page; the rest of that
+        // page and the whole second page must be zeroed.
+        let page_size = 4096usize;
+        let mut backing = vec![0xAAu8; page_size * 3];
+        let base = backing.as_mut_ptr();
+        let dsts = [
+            PageRef {
+                page_idx: 1,
+                offset: 0,
+                len: 4,
+            },
+            PageRef {
+                page_idx: 2,
+                offset: 0,
+                len: 4,
+            },
+        ];
+        zero_fill_pages_from(&dsts, 2, base, page_size).unwrap();
+        assert_eq!(&backing[page_size..page_size + 2], &[0xAA, 0xAA]);
+        assert_eq!(&backing[page_size + 2..page_size + 4], &[0, 0]);
+        assert_eq!(&backing[2 * page_size..2 * page_size + 4], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn write_then_zero_fill_matches_copy_body_into_pages() {
+        // The streaming path (write leading + zero-fill tail) must land
+        // bytes identically to the heap memcpy path for a short body.
+        let page_size = 4096usize;
+        let dsts = [
+            PageRef {
+                page_idx: 1,
+                offset: 0,
+                len: 4,
+            },
+            PageRef {
+                page_idx: 2,
+                offset: 0,
+                len: 4,
+            },
+        ];
+
+        let mut via_copy = vec![0xAAu8; page_size * 3];
+        copy_body_into_pages(&[9u8, 8], &dsts, via_copy.as_mut_ptr(), page_size).unwrap();
+
+        let mut via_stream = vec![0xAAu8; page_size * 3];
+        let base = via_stream.as_mut_ptr();
+        write_slice_into_pages(&[9u8, 8], &dsts, 0, base, page_size).unwrap();
+        zero_fill_pages_from(&dsts, 2, base, page_size).unwrap();
+
+        assert_eq!(via_copy, via_stream);
     }
 }

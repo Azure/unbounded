@@ -22,7 +22,7 @@ const azuriteWellKnownDevKey = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsu
 // PresetDev is the only currently-supported value for --preset. It
 // selects the dev-install defaults: azureblob origin pointing at the
 // in-cluster Azurite, S3 cachestore pointing at the in-cluster
-// LocalStack, well-known credentials for both, and auto-port-forward
+// Garage, well-known credentials for both, and auto-port-forward
 // to every relevant Service. See preset.go for the full definition.
 const PresetDev = "dev"
 
@@ -31,7 +31,7 @@ const PresetDev = "dev"
 // from an orca YAML; per-flag overrides win when both are set.
 //
 // The defaults baked into defaultGlobalFlags() reflect --preset=dev:
-// origin = Azurite via localhost:30100, cachestore = LocalStack via
+// origin = Azurite via localhost:30100, cachestore = Garage via
 // localhost:30200, orca edge = localhost:8443. orcadev auto-opens
 // kubectl port-forwards for any of these services that isn't already
 // bound on localhost, so the same defaults work on kind (where the
@@ -68,11 +68,11 @@ type globalFlags struct {
 	originSecretKey  string
 	originAccount    string
 	originAccountKey string
-	// originUsePathStyle: true for LocalStack-backed origins.
+	// originUsePathStyle: true for Garage-backed origins.
 	originUsePathStyle bool
 
 	// Cachestore fields. Always S3-shaped; the dev install uses
-	// LocalStack as the cachestore (and also as the origin in
+	// Garage as the cachestore (and also as the origin in
 	// awss3 mode, on a different bucket).
 	cachestoreEndpoint     string
 	cachestoreBucket       string
@@ -194,7 +194,7 @@ func (g *globalFlags) resolve(cmd *cobra.Command) error {
 			g.originSecretKey = cfg.Origin.AWSS3.SecretKey
 		}
 		// Path-style is a bool; the YAML can flip it on. We treat
-		// the default as truthy (LocalStack assumption) and let the
+		// the default as truthy (Garage assumption) and let the
 		// YAML override unless the operator passed the flag.
 		if notSet("origin-use-path-style") {
 			g.originUsePathStyle = cfg.Origin.AWSS3.UsePathStyle

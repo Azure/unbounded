@@ -3,7 +3,7 @@
 # Orca Integration Tests
 
 In-process integration tests for the Orca origin cache. The harness
-brings up real LocalStack and Azurite containers via
+brings up real Garage and Azurite containers via
 `testcontainers-go` and constructs N in-process `*app.App` instances
 wired to those containers. No Kubernetes cluster is required.
 
@@ -36,7 +36,7 @@ go test -tags=integrationtest -timeout 15m ./internal/orca/inttest/...
 # CI also adds -race
 ```
 
-First run pulls `localstack/localstack:3.8` (~700 MB) and
+First run pulls `dxflrs/garage:v1.0.1` (~100 MB) and
 `mcr.microsoft.com/azure-storage/azurite:3.34.0` (~150 MB). Subsequent
 runs reuse the cached images. Total run time on a warm runner is on
 the order of 25-30 seconds for the entire suite (most of which is
@@ -80,7 +80,7 @@ mutate one replica's view of the cluster independently.
                           ┌──────────────────┴───────────┐
                           ▼                              ▼
                   ┌────────────────┐            ┌────────────┐
-                  │  LocalStack    │            │  Azurite   │
+                  │  Garage        │            │  Azurite   │
                   │  (origin S3 +  │            │  (origin   │
                   │   cachestore)  │            │   blob)    │
                   └────────────────┘            └────────────┘
@@ -92,7 +92,7 @@ mutate one replica's view of the cluster independently.
 internal/orca/inttest/
 ├── doc.go              package overview, build tag, TODOs
 ├── images.go           pinned container image tags + Azurite dev creds
-├── localstack.go       testcontainers wrapper + S3 helpers
+├── garage.go          testcontainers wrapper + S3 helpers
 ├── azurite.go          testcontainers wrapper + azblob helpers
 ├── seed.go             SmallBlob/MediumBlob/LargeBlob + SeedS3/SeedAzure
 ├── peersource.go       StaticPeerSource (cluster.PeerSource impl)
@@ -101,7 +101,7 @@ internal/orca/inttest/
 ├── originwrap.go       CountingOrigin decorator
 ├── internalwrap.go     CountingInternalHandlerWrap (per-IP status counts)
 ├── origins_test.go     origin builder helpers
-├── main_test.go        TestMain (shared LocalStack + Azurite)
+├── main_test.go        TestMain (shared Garage + Azurite)
 ├── e2e_test.go         canonical 3-replica end-to-end suite
 └── azure_test.go       azureblob origin smoke (3 replicas)
 ```
@@ -115,8 +115,8 @@ BlockBlob / PageBlob / AppendBlob / nil / disabled).
 
 ## Test inventory
 
-The integration suite contains **7 tests** focused exclusively on
-behavior that requires real LocalStack/Azurite + a real cluster of
+The integration suite contains **10 tests** focused exclusively on
+behavior that requires real Garage/Azurite + a real cluster of
 in-process orca instances. Driver-level branch coverage (versioning
 gate, blob-type rejection, HTTP error mapping, range parsing, chunk
 arithmetic, config env-var fallback, manifest YAML validity) lives as
@@ -155,6 +155,23 @@ the cross-replica `/internal/fill` path (when a peer wins).
 
 - `TestAzureBlobOrigin_ColdGet` - the `azureblob` driver works
   end-to-end against Azurite for a 2-chunk block blob.
+
+### `commit_test.go` (cachestore/s3 driver against real Garage)
+
+These exercise the stat-then-put commit path against a real
+S3-compatible backend that does NOT implement If-None-Match
+conditional writes (the reason Garage is usable at all).
+
+- `TestCachestoreSelfTest_PassesAgainstGarage` - the boot-time
+  read-after-write `SelfTest` succeeds against Garage (orca refuses to
+  start if it does not).
+- `TestCachestoreCommit_StatThenPut` - first commit stores; a second
+  commit of identical content returns `ErrCommitLost` and leaves the
+  stored bytes intact.
+- `TestCachestoreCommit_ConcurrentIdenticalContent` - many concurrent
+  commits of byte-identical content to the same key all resolve to
+  store-or-`ErrCommitLost` (never a hard error) and the stored object
+  is byte-exact.
 
 ### Where the dropped scenarios moved
 

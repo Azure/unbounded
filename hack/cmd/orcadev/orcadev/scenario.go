@@ -103,7 +103,7 @@ func runScenario(ctx context.Context, g *globalFlags, o *scenarioOpts, name stri
 	}
 
 	// Auto-open kubectl port-forwards to svc/orca, svc/azurite,
-	// svc/localstack as needed. Lifted to the parent so every
+	// svc/garage as needed. Lifted to the parent so every
 	// scenario's edge + origin + cachestore clients share one
 	// forwarded socket without re-probing.
 	cleanup, err := ensurePortForwards(ctx, g)
@@ -321,6 +321,7 @@ func runScenarioColdWarmWith(
 
 	// Step 2: ensure cold cache by clearing any chunks for this key.
 	t0 = time.Now()
+
 	clearErr := clearScenarioObject(ctx, g, cs, oc, key, "", o.chunkSize)
 	if err := recordDropCacheStep(res, t0, clearErr); err != nil {
 		return err
@@ -384,6 +385,7 @@ func runScenarioRangeStress(ctx context.Context, g *globalFlags, o *scenarioOpts
 
 	// Step 1: upload with known bytes and a known checksum.
 	t0 := time.Now()
+
 	source, sourceHash, sourceErr := scenarioSourceBuffer(size)
 	if sourceErr != nil {
 		recordStep(res, "upload", t0, sourceErr, map[string]any{"bytes": size})
@@ -431,8 +433,10 @@ func runScenarioRangeStress(ctx context.Context, g *globalFlags, o *scenarioOpts
 
 	step := size / int64(ranges)
 
-	var mismatch bool
-	var rangeErr error
+	var (
+		mismatch bool
+		rangeErr error
+	)
 
 	for i := int64(0); i < int64(ranges); i++ {
 		start := i * step
@@ -446,6 +450,7 @@ func runScenarioRangeStress(ctx context.Context, g *globalFlags, o *scenarioOpts
 		if rerr != nil {
 			mismatch = true
 			rangeErr = rerr
+
 			break
 		}
 

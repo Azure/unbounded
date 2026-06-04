@@ -20,7 +20,7 @@
 #   ./hack/orca/setup-orca.sh --build --kind-load
 #
 # to build the orca image locally, side-load it into the kind nodes,
-# and install Orca + Azurite + LocalStack into the cluster.
+# and install Orca + Azurite + Garage into the cluster.
 
 set -euo pipefail
 

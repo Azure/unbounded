@@ -13,7 +13,7 @@ import (
 
 // TestDerivePortForwardSpecsAzureblobDev exercises the default
 // preset=dev / origin-driver=azureblob path. Edge + Azurite +
-// LocalStack-as-cachestore.
+// Garage-as-cachestore.
 func TestDerivePortForwardSpecsAzureblobDev(t *testing.T) {
 	t.Parallel()
 
@@ -32,7 +32,7 @@ func TestDerivePortForwardSpecsAzureblobDev(t *testing.T) {
 	}{
 		{devSvcOrca, devLocalPortOrca, devRemotePortOrca},
 		{devSvcAzurite, devLocalPortAzurite, devRemotePortAzurite},
-		{devSvcLocalstack, devLocalPortLocalstack, devRemotePortLocalstack},
+		{devSvcGarage, devLocalPortGarage, devRemotePortGarage},
 	}
 
 	for i, w := range want {
@@ -51,9 +51,9 @@ func TestDerivePortForwardSpecsAzureblobDev(t *testing.T) {
 }
 
 // TestDerivePortForwardSpecsAwss3DevDedup verifies that when the
-// origin and cachestore both target the same LocalStack endpoint
+// origin and cachestore both target the same Garage endpoint
 // (the awss3 + dev preset configuration), the spec list contains
-// LocalStack exactly once.
+// Garage exactly once.
 func TestDerivePortForwardSpecsAwss3DevDedup(t *testing.T) {
 	t.Parallel()
 
@@ -63,8 +63,8 @@ func TestDerivePortForwardSpecsAwss3DevDedup(t *testing.T) {
 
 	specs := derivePortForwardSpecs(g)
 
-	// orca + localstack-origin + localstack-cachestore -> deduped to
-	// orca + localstack.
+	// orca + garage-origin + garage-cachestore -> deduped to
+	// orca + garage.
 	if len(specs) != 2 {
 		t.Fatalf("expected 2 specs after dedup; got %d (%+v)", len(specs), specs)
 	}
@@ -73,8 +73,8 @@ func TestDerivePortForwardSpecsAwss3DevDedup(t *testing.T) {
 		t.Errorf("specs[0].service = %q want %q", specs[0].service, devSvcOrca)
 	}
 
-	if specs[1].service != devSvcLocalstack {
-		t.Errorf("specs[1].service = %q want %q", specs[1].service, devSvcLocalstack)
+	if specs[1].service != devSvcGarage {
+		t.Errorf("specs[1].service = %q want %q", specs[1].service, devSvcGarage)
 	}
 }
 
@@ -98,8 +98,8 @@ func TestDerivePortForwardSpecsRealCloudSkip(t *testing.T) {
 		t.Errorf("specs[0].service = %q want %q", specs[0].service, devSvcOrca)
 	}
 
-	if specs[1].service != devSvcLocalstack {
-		t.Errorf("specs[1].service = %q want %q", specs[1].service, devSvcLocalstack)
+	if specs[1].service != devSvcGarage {
+		t.Errorf("specs[1].service = %q want %q", specs[1].service, devSvcGarage)
 	}
 }
 

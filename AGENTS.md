@@ -52,8 +52,9 @@ unbounded-kube is organized into several directories:
 - `make generate` runs `go generate ./...` to regenerate deepcopy, CRDs, and protobuf for all packages.
 - `make build` compiles all Go packages (`go build ./...`).
 - `make vulncheck` runs `govulncheck` for known vulnerabilities.
-- `make fmt` formats with gofumpt; `make lint` runs golangci-lint; `make test` runs all tests.
-- Locally these chain: `test` -> `lint` -> `fmt`. In CI (`CI=1`), each runs independently.
+- `make fmt` formats Go source (gofumpt + wsl_v5 blank-line rules); `make lint` runs golangci-lint; `make test` runs all tests.
+- `make lint` runs the same checks locally and in CI and does NOT auto-fix. Always run `make fmt` before committing to satisfy the linter (gofumpt and wsl_v5 are enforced by `make lint`/CI); do not hand-format.
+- Locally `test` implies `lint`. In CI (`CI=1`), each runs independently.
 
 ## Coding Standards
 

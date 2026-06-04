@@ -102,7 +102,7 @@ func runRoundtrip(ctx context.Context, g *globalFlags, o *roundtripOpts) error {
 	}
 
 	// Auto-open kubectl port-forwards to svc/orca, svc/azurite,
-	// svc/localstack as needed. No-op for any endpoint that is
+	// svc/garage as needed. No-op for any endpoint that is
 	// already bound on localhost (user-managed port-forward, sibling
 	// orcadev). See ensurePortForwards / derivePortForwardSpecs.
 	cleanup, err := ensurePortForwards(ctx, g)
@@ -317,6 +317,7 @@ func fetchOriginAndHash(ctx context.Context, oc originClient, key, rangeSpec str
 	h := hasher()
 
 	var n int64
+
 	if rangeSpec != "" {
 		start, end, err := parseByteRange(rangeSpec, info.Size)
 		if err != nil {
@@ -430,6 +431,7 @@ func fetchAndHash(ctx context.Context, edge *edgeClient, bucket, key, rangeSpec 
 	defer resp.Body.Close() //nolint:errcheck
 
 	h := hasher()
+
 	n, err := io.Copy(h, resp.Body)
 	if err != nil {
 		return "", resp.Status, 0, resp.ETag, fmt.Errorf("read body: %w", err)
@@ -504,6 +506,7 @@ func emitHexDiff(ctx context.Context, oc originClient, edge *edgeClient, key, ra
 	}
 
 	var rcvResp edgeResponse
+
 	if rangeSpec != "" {
 		hd, err := edge.Head(ctx, oc.Bucket(), key)
 		if err != nil {
@@ -607,6 +610,7 @@ func parseByteRange(spec string, size int64) (int64, int64, error) {
 	}
 
 	end := size - 1
+
 	if rightStr != "" {
 		e, err := strconv.ParseInt(rightStr, 10, 64)
 		if err != nil || e < start {
@@ -629,6 +633,7 @@ func formatRate(bytes int64, elapsed time.Duration) string {
 	}
 
 	perSec := float64(bytes) / elapsed.Seconds()
+
 	const (
 		kib = 1024.0
 		mib = 1024 * kib

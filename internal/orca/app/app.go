@@ -113,9 +113,9 @@ func WithCacheStore(cs cachestore.CacheStore) Option {
 	return func(o *options) { o.cacheStore = cs }
 }
 
-// WithSkipCachestoreSelfTest disables the boot-time atomic-commit
+// WithSkipCachestoreSelfTest disables the boot-time cachestore
 // self-test. Useful only in tests that wire a cachestore decorator
-// already known to honor If-None-Match: *.
+// already known to provide read-after-write visibility.
 func WithSkipCachestoreSelfTest() Option {
 	return func(o *options) { o.skipCacheSelfTest = true }
 }
@@ -194,12 +194,12 @@ func Start(ctx context.Context, cfg *config.Config, opts ...Option) (*App, error
 	cachestoreReady := false
 
 	if o.skipCacheSelfTest {
-		// Caller has asserted the cachestore decorator honors
-		// If-None-Match: * (the in-memory store used by tests).
-		// Treat readiness as satisfied immediately.
+		// Caller has asserted the cachestore decorator provides
+		// read-after-write visibility (the in-memory store used by
+		// tests). Treat readiness as satisfied immediately.
 		cachestoreReady = true
 	} else {
-		if err := cs.SelfTestAtomicCommit(ctx); err != nil {
+		if err := cs.SelfTest(ctx); err != nil {
 			return nil, fmt.Errorf("cachestore self-test failed: %w", err)
 		}
 

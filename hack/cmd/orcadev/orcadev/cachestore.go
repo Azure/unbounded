@@ -43,7 +43,7 @@ type cachestoreClient struct {
 
 // newCachestoreClient constructs a client from the resolved global
 // flags. Mirrors the orca cachestore driver's SDK configuration:
-// path-style addressing, checksum opt-out for LocalStack 3.8
+// path-style addressing, checksum opt-out for S3-compatible backend
 // compatibility, static credentials.
 //
 // Indirected through a package-level variable so tests can swap in
@@ -74,11 +74,11 @@ func newCachestoreClientImpl(ctx context.Context, g *globalFlags) (*cachestoreCl
 
 // buildS3Client constructs an aws-sdk-go-v2 S3 client matching
 // orca's own configuration: static credentials and the
-// LocalStack-3.8 compatible request/response checksum opt-out
-// (CRC64NVME breaks against LocalStack and orca itself opts out
-// when talking to its S3 surfaces). When endpoint is non-empty it
-// is set as the BaseEndpoint, and usePathStyle is forwarded so
-// LocalStack-style backends work without DNS gymnastics.
+// request/response checksum opt-out (CRC64NVME breaks against
+// several S3-compatible backends, including Garage, and orca itself
+// opts out when talking to its S3 surfaces). When endpoint is
+// non-empty it is set as the BaseEndpoint, and usePathStyle is
+// forwarded so path-style backends work without DNS gymnastics.
 func buildS3Client(ctx context.Context, region, accessKey, secretKey, endpoint string, usePathStyle bool) (*s3.Client, error) {
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx,
 		awsconfig.WithRegion(region),

@@ -15,12 +15,16 @@ use std::time::Duration;
 
 use clap::Parser;
 
-use unbounded_storage::backend::HttpBackend;
+use unbounded_storage::backend::{
+    FixedRegion, HttpBackend, OriginBackend, OriginRing, S3Backend,
+};
 use unbounded_storage::bufferpool::{Pool, PoolConfig, PoolGroup, Req, ShardDescriptor, StripeKey};
-use unbounded_storage::config::{self, BackendSpec, Config, FabricCfg, FrontendSpec};
+use unbounded_storage::config::{
+    self, BackendKind, BackendSpec, Config, FabricCfg, FrontendKind, FrontendSpec,
+};
 use unbounded_storage::fabric::PeerId;
 use unbounded_storage::fabric::{self, ConnectionSpec, Fabric, Provider};
-use unbounded_storage::frontend::{HttpDriver, HttpFrontend};
+use unbounded_storage::frontend::{HttpDriver, HttpFrontend, S3Driver, S3Frontend};
 use unbounded_storage::p2p::{
     FingerTable, FingerTableConfig, NodeId, PeerEntry, RecursiveHandler, RoutedTransport,
     TopologyLabels, node_to_ring,
@@ -49,10 +53,28 @@ const DEFAULT_STRIPE_SIZE_BYTES: u64 = 4 * 1024 * 1024;
 /// the main thread plus every shard thread.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
-type ShardPool = Pool<RoutedTransport<StripeReq, HttpBackend>, Arc<LiveShardLocalStore>, StripeReq>;
+type ShardPool = Pool<RoutedTransport<StripeReq, OriginBackend>, Arc<LiveShardLocalStore>, StripeReq>;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+
+    // Enable the libfabric tcp provider's kernel zero-copy send path
+    // (send(MSG_ZEROCOPY)) so the non-RDMA fallback preserves the same
+    // zero-copy semantics as the verbs RMA path. libfabric reads this
+    // fi_param lazily at provider init (first fi_getinfo), which happens
+    // per-shard on the spawned shard threads, so it must be set here while
+    // the process is still single-threaded. 16 KiB sits just above the tcp
+    // message-buffer size and well below the 2 MiB page transfers, so every
+    // bulk fi_write qualifies. Ignored by the verbs provider, and the
+    // provider falls back to a copying send on kernels without TCP
+    // MSG_ZEROCOPY support, so setting it unconditionally is safe.
+    //
+    // SAFETY: no other threads have been spawned yet in `main`, so this
+    // set_var cannot race a concurrent getenv/setenv.
+    unsafe {
+        std::env::set_var("FI_TCP_ZEROCOPY_SIZE", "16384");
+    }
+
     let (config_path, config_explicit) = match cli.config.as_ref() {
         Some(p) => (p.clone(), true),
         None => (PathBuf::from(DEFAULT_CONFIG_PATH), false),
@@ -470,47 +492,67 @@ fn run_shard(
     // decides which backend the origin tier fetches from: a selected
     // frontend names its backend and load-time validation guarantees
     // that backend exists. With no frontend we still must construct an
-    // `HttpBackend` so the `ShardPool` type checks, so fall back to the
-    // first configured backend, or an inert loopback origin when none
-    // are configured (no reads are issued against the pool without a
-    // frontend, so the backend stays dormant).
+    // origin backend so the `ShardPool` type checks, so fall back to the
+    // first configured backend, or an inert loopback HTTP origin when
+    // none are configured (no reads are issued against the pool without
+    // a frontend, so the backend stays dormant).
     let selected = select_frontend_spec(widx, &frontend_specs);
     let backend_spec = match selected {
         Some(fe) => backend_specs.iter().find(|b| b.id == fe.backend),
         None => backend_specs.first(),
     };
-    let (origin, backend_id, stripe_size) = match backend_spec {
-        Some(spec) => match HttpBackend::resolve_origin(&spec.endpoint) {
-            Ok(o) => (o, spec.id.clone(), spec.stripe_size_bytes),
-            Err(e) => {
-                let _ = tx.send(ShardReady::Failed(format!(
-                    "worker={}: backend {} resolve_origin({}): {e}",
-                    widx.0, spec.id, spec.endpoint,
-                )));
-                return;
-            }
-        },
-        None => {
-            let o = HttpBackend::resolve_origin("127.0.0.1:0")
-                .expect("loopback:0 resolves to an IPv4 address");
-            (o, String::new(), DEFAULT_STRIPE_SIZE_BYTES)
-        }
+    let (backend_id, stripe_size) = match backend_spec {
+        Some(spec) => (spec.id.clone(), spec.stripe_size_bytes),
+        None => (String::new(), DEFAULT_STRIPE_SIZE_BYTES),
     };
+
+    // Build an `OriginBackend` for this shard, selecting the concrete
+    // origin implementation by `spec.kind`. Two independent instances
+    // are needed (the pool transport and the RPC handler each own one),
+    // so this is a closure rather than a single value. They differ in
+    // two ways the caller supplies: which ring the cache-miss fetch
+    // drives (`OriginRing`) and which registered region origin bytes are
+    // copied into (`backing_base`). The pool transport runs on the shard
+    // thread and reuses the shard ring over the pool backing; the RPC
+    // handler serves on an ephemeral worker thread and must use a
+    // worker-local ring writing into the scratch backing. The no-backend
+    // fallback is an inert loopback HTTP origin.
+    let make_origin_backend =
+        |ring: OriginRing, backing_base: *mut u8| -> std::io::Result<OriginBackend> {
+            match backend_spec {
+                Some(spec) => build_origin_backend(spec, ring, page_size, backing_base),
+                None => {
+                    let origin = HttpBackend::resolve_origin("127.0.0.1:0")?;
+                    Ok(OriginBackend::Http(HttpBackend::new(
+                        ring,
+                        origin,
+                        String::new(),
+                        DEFAULT_STRIPE_SIZE_BYTES,
+                        page_size,
+                        backing_base,
+                    )))
+                }
+            }
+        };
 
     log_backend_registry(widx, &backend_specs);
 
     // Route the pool's transport through the p2p finger table: a stripe
     // owned by a peer goes over the fabric RDMA path; a stripe this node
-    // owns (Chord `next_hop` returns None) goes to the `HttpBackend`,
-    // which fetches the missing byte range from the origin endpoint.
-    let backend = HttpBackend::new(
-        socket.clone(),
-        origin.duplicate(),
-        backend_id.clone(),
-        stripe_size,
-        page_size,
-        backing_base,
-    );
+    // owns (Chord `next_hop` returns None) goes to the `OriginBackend`,
+    // which fetches the missing byte range from the origin endpoint. The
+    // pool transport runs on the shard thread, so it reuses the shard
+    // socket ring and writes origin bytes into the pool backing.
+    let backend = match make_origin_backend(OriginRing::Shard(socket.clone()), backing_base) {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = tx.send(ShardReady::Failed(format!(
+                "worker={}: build origin backend: {e}",
+                widx.0,
+            )));
+            return;
+        }
+    };
     let transport = match RoutedTransport::new(
         fabric.clone(),
         mr,
@@ -619,6 +661,12 @@ fn run_shard(
     // server's `local_mr` (the `fi_write` source that ships served
     // pages back to the requester). One backing, one MR, no double
     // allocation.
+    // Capture the scratch backing's base before `scratch` is moved into
+    // the handler below. The RPC handler serves peer cache-misses into
+    // scratch pages (see `serve_owned` in `p2p/handler.rs`), so its
+    // origin backend must memcpy origin bytes into the scratch region,
+    // not the pool backing the data-path transport uses.
+    let scratch_base = scratch.base;
     let rpc_handler = Arc::new(
         match RecursiveHandler::new(
             rpc_store.clone(),
@@ -629,14 +677,30 @@ fn run_shard(
             fabric.clone(),
             scratch_mr,
             page_size,
-            HttpBackend::new(
-                socket.clone(),
-                origin.duplicate(),
-                backend_id.clone(),
-                stripe_size,
-                page_size,
-                backing_base,
-            ),
+            // The handler runs on an ephemeral `fabric-rpc-worker`
+            // thread per inbound RPC, so it must NOT touch the shard
+            // ring (the shard thread progresses it concurrently; a
+            // cross-thread `RefCell` borrow panics). A worker-local ring
+            // keeps every origin op on the serving thread.
+            match make_origin_backend(
+                OriginRing::WorkerLocal {
+                    queue_depth: 256,
+                    region: Some(FixedRegion {
+                        base: scratch_base,
+                        len: page_size * RPC_SCRATCH_PAGES as usize,
+                    }),
+                },
+                scratch_base,
+            ) {
+                Ok(b) => b,
+                Err(e) => {
+                    let _ = tx.send(ShardReady::Failed(format!(
+                        "worker={}: build rpc origin backend: {e}",
+                        widx.0,
+                    )));
+                    return;
+                }
+            },
         ) {
             Ok(h) => h,
             Err(e) => {
@@ -675,43 +739,78 @@ fn run_shard(
         shard_loop.add_tick_hook(move || socket.borrow().progress());
     }
 
-    // Bring up the frontend selected above (if any). The `HttpFrontend`
+    // Bring up the frontend selected above (if any). The frontend
     // factory validates the spec and binds the shard's `SO_REUSEPORT`
-    // listener; the per-shard `HttpDriver` then serves connections out
-    // of this shard's pool, fetching origin misses through the same
-    // backend wired into the transport above. v1 drives one frontend
-    // per shard (see `select_frontend_spec`).
+    // listener; the per-shard driver then serves connections out of this
+    // shard's pool, fetching origin misses through the same backend wired
+    // into the transport above. The concrete frontend/driver is chosen by
+    // `spec.kind`. v1 drives one frontend per shard (see
+    // `select_frontend_spec`).
     match selected {
         Some(spec) => {
-            let frontend = match HttpFrontend::from_spec(spec) {
-                Ok(f) => f,
-                Err(e) => {
-                    let _ = tx.send(ShardReady::Failed(format!(
-                        "worker={}: frontend {} from_spec: {e}",
-                        widx.0, spec.id,
-                    )));
-                    return;
-                }
-            };
-            let listen_fd = match frontend.bind_listener() {
-                Ok(fd) => fd,
-                Err(e) => {
-                    let _ = tx.send(ShardReady::Failed(format!(
-                        "worker={}: frontend {} bind_listener: {e}",
-                        widx.0, spec.id,
-                    )));
-                    return;
-                }
-            };
             let handle = NetHandle::new(socket.clone());
-            let mut driver: HttpDriver<ShardPool> = HttpDriver::new(
-                pool.clone(),
-                handle,
-                listen_fd,
-                backend_id.clone(),
-                stripe_size,
-                page_size,
-            );
+            let mut driver: ShardFrontendDriver = match spec.kind {
+                FrontendKind::Http => {
+                    let frontend = match HttpFrontend::from_spec(spec) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            let _ = tx.send(ShardReady::Failed(format!(
+                                "worker={}: frontend {} from_spec: {e}",
+                                widx.0, spec.id,
+                            )));
+                            return;
+                        }
+                    };
+                    let listen_fd = match frontend.bind_listener() {
+                        Ok(fd) => fd,
+                        Err(e) => {
+                            let _ = tx.send(ShardReady::Failed(format!(
+                                "worker={}: frontend {} bind_listener: {e}",
+                                widx.0, spec.id,
+                            )));
+                            return;
+                        }
+                    };
+                    ShardFrontendDriver::Http(HttpDriver::new(
+                        pool.clone(),
+                        handle,
+                        listen_fd,
+                        backend_id.clone(),
+                        stripe_size,
+                        page_size,
+                    ))
+                }
+                FrontendKind::S3 => {
+                    let frontend = match S3Frontend::from_spec(spec) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            let _ = tx.send(ShardReady::Failed(format!(
+                                "worker={}: frontend {} from_spec: {e}",
+                                widx.0, spec.id,
+                            )));
+                            return;
+                        }
+                    };
+                    let listen_fd = match frontend.bind_listener() {
+                        Ok(fd) => fd,
+                        Err(e) => {
+                            let _ = tx.send(ShardReady::Failed(format!(
+                                "worker={}: frontend {} bind_listener: {e}",
+                                widx.0, spec.id,
+                            )));
+                            return;
+                        }
+                    };
+                    ShardFrontendDriver::S3(S3Driver::new(
+                        pool.clone(),
+                        handle,
+                        listen_fd,
+                        backend_id.clone(),
+                        stripe_size,
+                        page_size,
+                    ))
+                }
+            };
             shard_loop.add_tick_hook(move || driver.progress());
             eprintln!("shard {}: frontend {} driver registered", widx.0, spec.id);
         }
@@ -885,8 +984,9 @@ fn select_frontend_spec<'a>(
 
 /// Validate and log the configured backends.
 ///
-/// [`HttpBackend`] is now the active origin tier: it is built per shard
-/// from the matching [`BackendSpec`] and plugged into the
+/// [`OriginBackend`] is now the active origin tier: it is built per
+/// shard from the matching [`BackendSpec`] (an [`HttpBackend`] or an
+/// [`S3Backend`], selected by `spec.kind`) and plugged into the
 /// `RoutedTransport`'s backend slot (see `run_shard`). This function
 /// surfaces the configured backend set for observability and returns
 /// the number of backends seen so the caller (and tests) can assert the
@@ -894,7 +994,7 @@ fn select_frontend_spec<'a>(
 fn log_backend_registry(widx: WorkerIdx, specs: &[BackendSpec]) -> usize {
     for spec in specs {
         eprintln!(
-            "shard {}: backend {} kind={:?} endpoint={} stripe_size={} http_concurrency={} (HttpBackend active)",
+            "shard {}: backend {} kind={:?} endpoint={} stripe_size={} http_concurrency={} (OriginBackend active)",
             widx.0,
             spec.id,
             spec.kind,
@@ -904,6 +1004,87 @@ fn log_backend_registry(widx: WorkerIdx, specs: &[BackendSpec]) -> usize {
         );
     }
     specs.len()
+}
+
+/// Build the per-shard [`OriginBackend`] for `spec`, selecting the
+/// concrete origin implementation by [`BackendSpec::kind`].
+///
+/// For an `s3` backend the origin IP is resolved from the endpoint the
+/// same way as for HTTP (IPv4-only, v1), but the host authority is
+/// extracted separately for the `Host:` header. Requests are sent
+/// unsigned over plaintext HTTP; the origin is expected to be a
+/// public/unauthenticated bucket.
+fn build_origin_backend(
+    spec: &BackendSpec,
+    ring: OriginRing,
+    page_size: usize,
+    backing_base: *mut u8,
+) -> std::io::Result<OriginBackend> {
+    match spec.kind {
+        BackendKind::Http => {
+            let origin = HttpBackend::resolve_origin(&spec.endpoint)?;
+            Ok(OriginBackend::Http(HttpBackend::new(
+                ring,
+                origin,
+                spec.id.clone(),
+                spec.stripe_size_bytes,
+                page_size,
+                backing_base,
+            )))
+        }
+        BackendKind::S3 => {
+            let origin = S3Backend::resolve_origin(&spec.endpoint)?;
+            let host = extract_host_authority(&spec.endpoint);
+            Ok(OriginBackend::S3(S3Backend::new(
+                ring,
+                origin,
+                host,
+                spec.id.clone(),
+                spec.stripe_size_bytes,
+                page_size,
+                backing_base,
+            )))
+        }
+    }
+}
+
+/// Extract the `host[:port]` authority from a backend `endpoint` for
+/// use as the S3 `Host:` header.
+///
+/// Strips an optional `scheme://` prefix and any `/path` or `?query`
+/// suffix, but preserves the port so the `Host:` header stays
+/// RFC 7230 conformant for custom-port origins (e.g. MinIO on `:9000`).
+/// The endpoint contract is `host:port` (see `resolve_origin`); the TCP
+/// connect dials the resolved IPv4 while this supplies the authority
+/// the origin's host/bucket policy expects.
+fn extract_host_authority(endpoint: &str) -> String {
+    let after_scheme = match endpoint.split_once("://") {
+        Some((_, rest)) => rest,
+        None => endpoint,
+    };
+    after_scheme
+        .split(['/', '?'])
+        .next()
+        .unwrap_or(after_scheme)
+        .to_string()
+}
+
+/// Per-shard frontend driver, selected by [`FrontendKind`]. Both
+/// variants are registered as a shard-loop tick hook through
+/// [`Self::progress`]; the enum lets a single boxed closure drive
+/// whichever concrete driver the frontend kind produced.
+enum ShardFrontendDriver {
+    Http(HttpDriver<ShardPool>),
+    S3(S3Driver<ShardPool>),
+}
+
+impl ShardFrontendDriver {
+    fn progress(&mut self) -> bool {
+        match self {
+            ShardFrontendDriver::Http(d) => d.progress(),
+            ShardFrontendDriver::S3(d) => d.progress(),
+        }
+    }
 }
 
 /// Status a shard thread reports once it has either come up or
@@ -1245,6 +1426,24 @@ mod tests {
     }
 
     #[test]
+    fn extract_host_authority_preserves_port_strips_scheme_and_path() {
+        assert_eq!(
+            extract_host_authority("s3.example.com:443"),
+            "s3.example.com:443"
+        );
+        assert_eq!(
+            extract_host_authority("https://s3.us-east-1.amazonaws.com:443"),
+            "s3.us-east-1.amazonaws.com:443"
+        );
+        assert_eq!(extract_host_authority("http://origin/path"), "origin");
+        assert_eq!(
+            extract_host_authority("origin.example.com"),
+            "origin.example.com"
+        );
+        assert_eq!(extract_host_authority("127.0.0.1:9000"), "127.0.0.1:9000");
+    }
+
+    #[test]
     fn zero_bytes_rejected() {
         let err = parse(&["--bytes-per-shard=0"]).unwrap_err();
         // clap wraps value-parser errors in `ValueValidation`; the
@@ -1319,7 +1518,6 @@ mod tests {
             kind: config::FrontendKind::Http,
             bind: "0.0.0.0:9000".to_string(),
             backend: "b".to_string(),
-            tls: None,
         }
     }
 
@@ -1330,6 +1528,7 @@ mod tests {
             endpoint: "https://example.com".to_string(),
             stripe_size_bytes: 4 * 1024 * 1024,
             http_concurrency: 64,
+            bucket: None,
         }
     }
 

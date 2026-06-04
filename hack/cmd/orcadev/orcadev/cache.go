@@ -113,6 +113,7 @@ func runCacheList(ctx context.Context, g *globalFlags, o *cacheListOpts) error {
 	fmt.Printf("%-80s\t%-12s\t%s\n", "PATH", "SIZE", "LAST_MODIFIED")
 
 	var total int64
+
 	for _, ob := range objs {
 		fmt.Printf("%-80s\t%-12s\t%s\n", ob.Path, formatSize(ob.Size), ob.LastModified.UTC().Format("2006-01-02T15:04:05Z"))
 		total += ob.Size
@@ -253,7 +254,9 @@ func runCacheInspect(ctx context.Context, g *globalFlags, o *cacheInspectOpts) e
 	}
 
 	etag := o.etag
+
 	var size int64
+
 	if etag == "" {
 		info, err := oc.Head(ctx, o.key)
 		if err != nil {
@@ -307,6 +310,7 @@ func runCacheInspect(ctx context.Context, g *globalFlags, o *cacheInspectOpts) e
 			fmt.Printf("%-6d\t%-80s\t%-8s\t%s\n", i, path, "ERR", err.Error())
 		default:
 			fmt.Printf("%-6d\t%-80s\t%-8s\t%s\n", i, path, "yes", formatSize(info.Size))
+
 			present++
 			bytes += info.Size
 		}
@@ -515,6 +519,7 @@ const defaultMaxClearChunks = 1024
 // caller can still bound the walk.
 func resolveObjectMetadata(ctx context.Context, oc originClient, key, etag string, chunkSize int64) (string, int64, error) {
 	size := int64(0)
+
 	if etag == "" {
 		info, err := oc.Head(ctx, key)
 		if err != nil {

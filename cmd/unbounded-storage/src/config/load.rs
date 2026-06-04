@@ -338,6 +338,7 @@ fn is_valid_even_hex(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::schema::BackendKind;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -914,5 +915,19 @@ backend = "b"
                 if frontend_id == "f2" && bind == "0.0.0.0:9000" => {}
             other => panic!("expected DuplicateFrontendBind, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn accepts_s3_backend() {
+        let s = r#"
+[[backends]]
+id = "s3"
+kind = "s3"
+endpoint = "s3.example.com:443"
+"#;
+        let f = write_cfg(s);
+        let cfg = load(f.path()).expect("load should succeed");
+        assert_eq!(cfg.backends[0].kind, BackendKind::S3);
+        assert!(cfg.backends[0].bucket.is_none());
     }
 }

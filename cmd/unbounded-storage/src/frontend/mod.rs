@@ -43,9 +43,13 @@
 //! binds sockets, and that happens later on each shard thread.
 
 mod range;
+mod s3_xml;
 
 #[cfg(target_os = "linux")]
 mod http_serve;
+
+#[cfg(target_os = "linux")]
+mod s3_serve;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -53,9 +57,13 @@ use std::sync::Arc;
 use crate::config::FrontendSpec;
 
 pub use range::{ByteRange, RangeError, ResolvedRange, StripeSlice, full_object, stripe_set};
+pub use s3_xml::{S3ErrorCode, error_xml, xml_escape};
 
 #[cfg(target_os = "linux")]
 pub use http_serve::{HttpDriver, HttpFrontend};
+
+#[cfg(target_os = "linux")]
+pub use s3_serve::{S3Driver, S3Frontend};
 
 /// A workload-facing listener that serves cached objects out of the
 /// shard's bufferpool. Sibling to [`crate::backend::Backend`].
@@ -316,7 +324,6 @@ mod tests {
             kind: FrontendKind::Http,
             bind: "0.0.0.0:9000".to_string(),
             backend: "b".to_string(),
-            tls: None,
         }
     }
 

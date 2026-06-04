@@ -55,8 +55,8 @@ func NewEdgeHandler(fc edgeFetchAPI, cfg *config.Config, log *slog.Logger) *Edge
 
 // ServeHTTP routes incoming client requests.
 //
-// Routing (path-style only, since LocalStack and most dev clients
-// use path-style):
+// Routing (path-style only, since the S3-compatible dev backend and
+// most dev clients use path-style):
 //
 //	GET  /                                  -> ListBuckets (not supported; 501)
 //	GET  /{bucket}/                         -> ListObjectsV2 (not supported; 501)
@@ -150,6 +150,7 @@ func (h *EdgeHandler) handleGet(w http.ResponseWriter, r *http.Request, bucket, 
 			writeS3Error(w, r, http.StatusRequestedRangeNotSatisfiable, s3ErrInvalidRange,
 				"The requested range is not satisfiable.",
 				withBucketKey(bucket, key))
+
 			return
 		}
 
@@ -178,6 +179,7 @@ func (h *EdgeHandler) handleGet(w http.ResponseWriter, r *http.Request, bucket, 
 			writeS3Error(w, r, http.StatusRequestedRangeNotSatisfiable, s3ErrInvalidRange,
 				"The requested range is not valid for the resource.",
 				withBucketKey(bucket, key))
+
 			return
 		}
 
@@ -190,6 +192,7 @@ func (h *EdgeHandler) handleGet(w http.ResponseWriter, r *http.Request, bucket, 
 		writeS3Error(w, r, http.StatusRequestedRangeNotSatisfiable, s3ErrInvalidRange,
 			"The requested range is not satisfiable.",
 			withBucketKey(bucket, key))
+
 		return
 	}
 

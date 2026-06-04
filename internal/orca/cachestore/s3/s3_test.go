@@ -34,36 +34,6 @@ func makeResponseErr(status int, inner error) *awshttp.ResponseError {
 	}
 }
 
-// TestIsPreconditionFailed_FromHTTPStatus verifies that 412 alone
-// signals precondition failure; other statuses (and errors lacking
-// HTTP-response context) do not. The original implementation matched
-// service error codes by string ("PreconditionFailed",
-// "InvalidArgument", "ConditionalRequestConflict") plus substring
-// "412" - fragile across SDK versions and backend implementations.
-func TestIsPreconditionFailed_FromHTTPStatus(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name string
-		err  error
-		want bool
-	}{
-		{"412 ResponseError -> true", makeResponseErr(412, errors.New("precondition")), true},
-		{"500 ResponseError -> false", makeResponseErr(500, errors.New("ise")), false},
-		{"404 ResponseError -> false", makeResponseErr(404, errors.New("not found")), false},
-		{"plain error -> false", errors.New("StatusCode: 412 something"), false},
-		{"nil -> false", nil, false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := isPreconditionFailed(tt.err); got != tt.want {
-				t.Errorf("isPreconditionFailed = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
 // TestIsNotFound covers the typed-error and HTTP-status branches.
 func TestIsNotFound(t *testing.T) {
 	t.Parallel()

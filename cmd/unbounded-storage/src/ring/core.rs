@@ -73,6 +73,13 @@ pub(crate) struct RingCore {
     /// Number of live (submitted, not yet reaped) ops. Bounded by
     /// `queue_depth` via the `submit_waiters` back-pressure queue.
     submitted: Cell<u32>,
+    /// High-water mark of `submitted` since the core was created,
+    /// recorded at increment time in [`Self::submit`]. Lets tests
+    /// observe that ops actually went in-flight even when each op
+    /// completes within its own poll - the transient peak is invisible
+    /// to an external sample of `submitted`, which can return to zero
+    /// before it is read.
+    peak_submitted: Cell<u32>,
     /// FIFO of wakers parked because `submitted == queue_depth` at
     /// submit time. Drained one-per-completion in [`Self::progress`].
     submit_waiters: RefCell<Vec<Waker>>,
@@ -200,6 +207,7 @@ impl RingCore {
             slots: RefCell::new(HashMap::new()),
             registered: RefCell::new(Vec::new()),
             submitted: Cell::new(0),
+            peak_submitted: Cell::new(0),
             submit_waiters: RefCell::new(Vec::new()),
             next_user_data: Cell::new(1),
             more_completions: Cell::new(0),
@@ -321,6 +329,9 @@ impl RingCore {
         let slot = Rc::new(Slot::new(expects_more, resource));
         self.slots.borrow_mut().insert(ud, Rc::clone(&slot));
         self.submitted.set(self.submitted.get() + 1);
+        if self.submitted.get() > self.peak_submitted.get() {
+            self.peak_submitted.set(self.submitted.get());
+        }
         // SAFETY: see the contract on the public submit methods.
         let push_res = unsafe {
             let mut ring = self.ring.borrow_mut();
@@ -461,10 +472,70 @@ impl RingCore {
         }
     }
 
+    /// Cancel the in-flight op named by `target_user_data` and BLOCK
+    /// until its slot is reaped. Unlike [`Self::cancel`] (best-effort,
+    /// may never land), this guarantees the kernel is done with the op's
+    /// memory before returning.
+    ///
+    /// Required by drop paths for ops that write directly into
+    /// caller-owned memory which may be reused the instant this returns
+    /// (the fixed-buffer RECV path: the destination bufferpool page is
+    /// handed back to the free list right after the fetch future drops).
+    /// A best-effort cancel is unsound there because the kernel could
+    /// still complete the RECV into the page after it has been
+    /// reassigned to a different key.
+    ///
+    /// Bounded: `IORING_OP_ASYNC_CANCEL` aborts a pending RECV promptly
+    /// (it completes with `-ECANCELED`), so only a handful of CQEs are
+    /// drained before the slot is done. Each iteration blocks on a real
+    /// completion, so the spin guard is a safety net, not a busy-wait.
+    pub(crate) fn cancel_and_drain(&self, target_user_data: u64, slot: &Slot) {
+        const MAX_DRAIN_ITERS: u32 = 4096;
+        let mut cancel_submitted = false;
+        let mut iters = 0u32;
+        while !slot.is_done() {
+            if !cancel_submitted {
+                let entry = opcode::AsyncCancel::new(target_user_data)
+                    .build()
+                    .user_data(0);
+                if let Ok(mut ring) = self.ring.try_borrow_mut() {
+                    // SAFETY: AsyncCancel references no user memory; it
+                    // only names another op by its user_data.
+                    cancel_submitted = unsafe { ring.submission().push(&entry) }.is_ok();
+                }
+            }
+            // Blocking enter: submit queued SQEs (including the cancel)
+            // and wait for at least one completion. Draining unrelated
+            // completions here frees SQ space so the cancel can land if
+            // its earlier push failed on a full ring.
+            {
+                let ring = self.ring.borrow();
+                let _ = ring.submitter().submit_and_wait(1);
+            }
+            let _ = self.progress();
+            iters += 1;
+            debug_assert!(
+                iters < MAX_DRAIN_ITERS,
+                "cancel_and_drain exceeded its iteration bound",
+            );
+            if iters >= MAX_DRAIN_ITERS {
+                break;
+            }
+        }
+    }
+
     /// Number of live (submitted, not yet reaped) ops. Used by tests to
     /// assert the back-pressure bound.
     pub(crate) fn in_flight(&self) -> u32 {
         self.submitted.get()
+    }
+
+    /// High-water mark of in-flight ops since creation. Used by the
+    /// back-pressure tests to confirm ops actually went in-flight
+    /// without racing the per-poll completion that returns `in_flight`
+    /// to zero before an external sample can read it.
+    pub(crate) fn peak_in_flight(&self) -> u32 {
+        self.peak_submitted.get()
     }
 
     /// Configured submission/completion depth.

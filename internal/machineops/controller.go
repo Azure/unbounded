@@ -149,6 +149,7 @@ func (r *MachineOperationReconciler) reconcileSupportedOperation(
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+
 	if authFailure != nil {
 		return r.failOperation(ctx, op, authFailure.Reason, authFailure.Message)
 	}

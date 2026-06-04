@@ -4,10 +4,14 @@
 // Package cachestore defines the in-DC chunk store interface and shared
 // types. Concrete drivers live under cachestore/<driver>/.
 //
-// All drivers must implement atomic commit (CAS-style PutChunk that
-// rejects overwrites) so concurrent fills across replicas converge
-// without clobbering each other; SelfTestAtomicCommit is run at boot
-// to verify the backend honors the precondition.
+// Commit safety rests on the content-addressed chunk layout: a chunk's
+// ETag is part of its storage path (see designs/orca/design.md s5), so
+// the only way two concurrent fills target the same key is when they
+// are writing byte-identical content. PutChunk commits with a
+// stat-then-put step (HeadObject; if present, skip the upload and
+// report the existing object as the winner). SelfTest is run at boot to
+// verify the backend provides read-after-write visibility, which the
+// stat-then-put step depends on.
 package cachestore
 
 import (
@@ -20,8 +24,8 @@ import (
 )
 
 // CacheStore is where chunk bytes physically live. Source of truth for
-// chunk presence; backed by an in-DC S3-like store in production and
-// LocalStack in dev.
+// chunk presence; backed by an in-DC S3-like store in production and a
+// self-hosted S3-compatible store in dev.
 type CacheStore interface {
 	GetChunk(ctx context.Context, k chunk.Key, off, n int64) (io.ReadCloser, error)
 	PutChunk(ctx context.Context, k chunk.Key, size int64, r io.Reader) error
@@ -34,7 +38,7 @@ type CacheStore interface {
 	// would delete cold chunks itself (see s13 "Active eviction
 	// loop").
 	Delete(ctx context.Context, k chunk.Key) error
-	SelfTestAtomicCommit(ctx context.Context) error
+	SelfTest(ctx context.Context) error
 }
 
 // Info is the result of a successful Stat.
@@ -50,8 +54,14 @@ type Info struct {
 
 // Sentinel errors. Wrap with %w so callers use errors.Is.
 var (
-	ErrNotFound   = errors.New("cachestore: not found")
-	ErrTransient  = errors.New("cachestore: transient")
-	ErrAuth       = errors.New("cachestore: auth")
-	ErrCommitLost = errors.New("cachestore: commit lost (no-clobber denied)")
+	ErrNotFound  = errors.New("cachestore: not found")
+	ErrTransient = errors.New("cachestore: transient")
+	ErrAuth      = errors.New("cachestore: auth")
+	// ErrCommitLost reports that another replica already committed this
+	// chunk: the commit's stat-then-put step found the object already
+	// present and skipped the upload. The chunk is in the cachestore;
+	// the caller treats the existing object as the truth. Because the
+	// ETag is part of the chunk path, the existing object is
+	// byte-identical to what this replica would have written.
+	ErrCommitLost = errors.New("cachestore: commit lost (chunk already present)")
 )
