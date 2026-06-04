@@ -36,6 +36,7 @@ func NewDaemonCSRApprover(
 	kubeClient kubernetes.Interface,
 ) (*daemoncred.CSRApproverReconciler, error) {
 	claims := &daemonCSRClaimChecker{Client: c}
+
 	approver, err := daemoncred.NewCSRApprover(daemoncred.CSRApproverOptions{
 		BootstrapGroup:     bootstrapGroup,
 		DaemonGroup:        daemonGroup,
@@ -60,15 +61,18 @@ func (c *daemonCSRClaimChecker) bootstrapTokenMayClaimNode(
 	}
 
 	secretName := bootstrapSecretPref + tokenID
+
 	var token corev1.Secret
 	if err := c.Get(ctx, client.ObjectKey{Namespace: metav1.NamespaceSystem, Name: secretName}, &token); err != nil {
 		return false, client.IgnoreNotFound(err)
 	}
+
 	if token.Type != corev1.SecretTypeBootstrapToken {
 		return false, nil
 	}
 
 	siteName := strings.TrimSpace(token.Labels[unboundedv1alpha3.MachineSiteLabelKey])
+
 	isDefaultToken := strings.EqualFold(strings.TrimSpace(token.Labels[defaultBootstrapTokenLabel]), "true")
 	if siteName == "" && !isDefaultToken {
 		return false, nil

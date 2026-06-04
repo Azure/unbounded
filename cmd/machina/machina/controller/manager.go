@@ -101,6 +101,7 @@ func RunManager(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("create daemon CSR approver controller: %w", err)
 	}
+
 	if err := daemonCSRApprover.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup daemon CSR approver controller: %w", err)
 	}

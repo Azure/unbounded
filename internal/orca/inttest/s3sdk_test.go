@@ -224,6 +224,7 @@ func TestS3SDK(t *testing.T) {
 		t.Parallel()
 
 		const n = 100
+
 		out, err := client.GetObject(ctx, &s3.GetObjectInput{
 			Bucket: aws.String(bucket),
 			Key:    aws.String(blob.Key),

@@ -350,20 +350,19 @@ fmt: check-deps ## Format all Go source files (gofumpt + wsl_v5 whitespace)
 	$(GOFMT) -w .
 	$(GOLINT) --fix -E wsl_v5 ./...
 
+# lint runs the same checks locally and in CI and does NOT auto-fix. Run
+# `make fmt` to apply fixes. wsl_v5 is enforced via .golangci.yaml.
+lint: ## Run golangci-lint (matches CI; run `make fmt` to auto-fix)
+	$(GOLINT) ./...
+
 ifdef CI
 # In CI each job is independent; skip chained prerequisites.
-
-lint: ## Run golangci-lint
-	$(GOLINT) ./...
 
 test: machina-manifests net-manifests ## Run all tests with race detector
 	$(GOTEST) -race ./...
 
 else
-# Locally, chain targets for convenience: test -> lint -> fmt -> check-deps.
-
-lint: fmt ## Run golangci-lint (implies fmt)
-	$(GOLINT) ./...
+# Locally, chain test -> lint for convenience.
 
 test: lint machina-manifests net-manifests ## Run all tests (implies lint)
 	$(GOTEST) ./...

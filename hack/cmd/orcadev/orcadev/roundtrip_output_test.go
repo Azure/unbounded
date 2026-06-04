@@ -32,7 +32,6 @@ import (
 // contract in tests rather than only documenting it in comments.
 func TestRunRoundtripWith_OutputFormat(t *testing.T) {
 	// Not t.Parallel: swaps os.Stderr.
-
 	const (
 		bucket = "test-bucket"
 		key    = "test-key"
@@ -107,7 +106,6 @@ func TestRunRoundtripWith_OutputFormat(t *testing.T) {
 // block still prints below it.
 func TestRunRoundtripWith_MismatchMarker(t *testing.T) {
 	// Not t.Parallel: swaps os.Stderr.
-
 	const (
 		bucket   = "test-bucket"
 		key      = "test-key"
@@ -293,6 +291,7 @@ func captureStderr(t *testing.T, fn func()) string {
 
 	go func() {
 		var buf bytes.Buffer
+
 		_, _ = io.Copy(&buf, r)
 		done <- buf.Bytes()
 	}()

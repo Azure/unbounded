@@ -46,6 +46,7 @@ func (r *MachineOperationReconciler) resolveOperationAuth(ctx context.Context, m
 	if failure != nil || err != nil {
 		return nil, failure, err
 	}
+
 	if credential == nil {
 		return nil, &authResolutionFailure{
 			Reason:  authReasonNotFound,
@@ -74,6 +75,7 @@ func operationAuthTargetFor(machine *unboundedv1alpha3.Machine) (operationAuthTa
 			Message: fmt.Sprintf("Machine %s is missing site label %q", machine.Name, unboundedv1alpha3.MachineSiteLabelKey),
 		}
 	}
+
 	if target.Provider == "" {
 		return operationAuthTarget{}, &authResolutionFailure{
 			Reason:  authReasonInvalid,
@@ -94,6 +96,7 @@ func (r *MachineOperationReconciler) machineOperationCredentialFor(
 	}
 
 	var match *unboundedv1alpha3.MachineOperationCredential
+
 	for i := range credentials.Items {
 		credential := &credentials.Items[i]
 		if credential.Spec.SiteName != target.SiteName || credential.Spec.Provider != target.Provider {
@@ -186,6 +189,7 @@ func (r *MachineOperationReconciler) credentialSecret(
 	}
 
 	var secret corev1.Secret
+
 	secretKey := client.ObjectKey{Namespace: ref.Namespace, Name: ref.Name}
 	if err := r.Get(ctx, secretKey, &secret); err != nil {
 		if apierrors.IsNotFound(err) {
