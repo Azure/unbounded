@@ -123,8 +123,8 @@ func TestApplyPresetDevAWSS3(t *testing.T) {
 
 	applyPresetDevAWSS3(g, flags)
 
-	if g.originID != "awss3-localstack" {
-		t.Errorf("originID = %q want awss3-localstack", g.originID)
+	if g.originID != "awss3-garage" {
+		t.Errorf("originID = %q want awss3-garage", g.originID)
 	}
 
 	if g.originBucket != "orca-origin" {
@@ -169,7 +169,7 @@ func TestApplyPresetDevAWSS3RespectsOverrides(t *testing.T) {
 		t.Errorf("origin-bucket override lost; got %q want custom-bucket", g.originBucket)
 	}
 
-	if g.originID != "awss3-localstack" {
+	if g.originID != "awss3-garage" {
 		t.Errorf("originID should still pick up dev default; got %q", g.originID)
 	}
 }

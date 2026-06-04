@@ -2,14 +2,14 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 #
-# setup-orca.sh - Install Orca (with Azurite origin + LocalStack S3
+# setup-orca.sh - Install Orca (with Azurite origin + Garage S3
 # cachestore) into a Kubernetes cluster.
 #
 # This is the single coherent entrypoint for developer Orca installs.
 # It works against any cluster reachable via kubectl: kind, AKS, EKS,
 # k3d, plain kubeadm. Defaults match the standard dev shape: azureblob
 # origin pointing at an in-cluster Azurite emulator, S3 cachestore
-# pointing at an in-cluster LocalStack. After this script returns,
+# pointing at an in-cluster Garage. After this script returns,
 # `bin/orcadev <verb>` can drive the install with no extra flags
 # (orcadev auto-opens port-forwards as needed).
 #
@@ -27,7 +27,10 @@
 #   --replicas N         number of orca replicas (default: 3, matches the
 #                        worker-node count in hack/orca/kind-config.yaml)
 #   --no-wait            apply manifests and exit without waiting for
-#                        emulators / orca to reach Ready
+#                        Azurite / orca to reach Ready. Garage is still
+#                        waited for and bootstrapped (layout, key,
+#                        buckets), since an un-bootstrapped Garage makes
+#                        the install non-functional.
 #   --uninstall          delete every Orca-owned resource in the
 #                        namespace (label-selector based) and exit;
 #                        the namespace itself is left intact unless
@@ -39,9 +42,9 @@
 # Real-Azure mode (advanced): set AZURE_STORAGE_ACCOUNT, AZURE_STORAGE_KEY,
 # and AZURE_CONTAINER in the environment before invoking. Endpoint is
 # computed as https://<account>.blob.core.windows.net/. The in-cluster
-# Azurite + LocalStack are still deployed in this mode but Orca ignores
+# Azurite + Garage are still deployed in this mode but Orca ignores
 # them and talks to real Azure for origin (cachestore stays on the
-# in-cluster LocalStack).
+# in-cluster Garage).
 #
 # Examples:
 #
@@ -84,6 +87,14 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 # Well-known Azurite dev key. Public Microsoft-documented constant,
 # not a secret. Used when no real Azure account is configured.
 AZURITE_DEV_KEY="Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
+
+# Deterministic Garage dev credentials. Garage (unlike LocalStack)
+# enforces SigV4, so the cachestore/origin S3 clients need real keys.
+# These are dev-only constants, mirrored by the Garage bootstrap
+# script's `key import` (deploy/orca/dev/01-garage.yaml.tmpl). The
+# access key id must be "GK" + 12 hex bytes per Garage's format rules.
+GARAGE_ACCESS_KEY="GK0123456789abcdef01234567"
+GARAGE_SECRET_KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 # -----------------------------------------------------------------------------
 # Cleanup stack
@@ -200,7 +211,7 @@ fi
 # Deletes only resources whose labels mark them as owned by the Orca
 # dev install:
 #   app.kubernetes.io/name=orca       -> Orca's own resources
-#   app.kubernetes.io/part-of=orca-dev -> Azurite + LocalStack
+#   app.kubernetes.io/part-of=orca-dev -> Azurite + Garage
 #
 # Unrelated resources in the same namespace (other Unbounded
 # components, sentinel ConfigMaps, etc.) are left alone. Pass
@@ -292,7 +303,7 @@ else
   # switch via `setup-orca.sh --origin azureblob` works without
   # re-running this script's Secret step.
   azure_key="${AZURITE_DEV_KEY}"
-  origin_id="awss3-localstack"
+  origin_id="awss3-garage"
 fi
 
 # -----------------------------------------------------------------------------
@@ -329,12 +340,12 @@ log "Rendering orca manifests"
     --set "AzureAccount=${azure_account}" \
     --set "AzureContainer=${azure_container}" \
     --set "AzureEndpoint=${azure_endpoint}" \
-    --set "OriginAWSS3Endpoint=http://localstack.${NAMESPACE}.svc.cluster.local:4566" \
+    --set "OriginAWSS3Endpoint=http://garage.${NAMESPACE}.svc.cluster.local:3900" \
     --set "OriginAWSS3Region=us-east-1" \
     --set "OriginAWSS3Bucket=orca-origin" \
     --set "OriginAWSS3UsePathStyle=true" \
     --set "CachestoreBucket=orca-cache" \
-    --set "CachestoreEndpoint=http://localstack.${NAMESPACE}.svc.cluster.local:4566" \
+    --set "CachestoreEndpoint=http://garage.${NAMESPACE}.svc.cluster.local:3900" \
     --set "CachestoreRegion=us-east-1" \
     --set "ClusterService=orca-peers.${NAMESPACE}.svc.cluster.local" \
     --set "ServerAuthEnabled=false" \
@@ -342,13 +353,12 @@ log "Rendering orca manifests"
     --set "LogLevel=${LOG_LEVEL}" \
 )
 
-log "Rendering dev emulator manifests (Azurite + LocalStack)"
+log "Rendering dev emulator manifests (Azurite + Garage)"
 ( cd "${REPO_ROOT}" && go run ./hack/cmd/render-manifests \
     --templates-dir "${REPO_ROOT}/deploy/orca/dev" \
     --output-dir "${rendered_dev}" \
     --set "Namespace=${NAMESPACE}" \
-    --set "CachestoreBucket=orca-cache" \
-    --set "OriginBucket=orca-origin" \
+    --set "CachestoreRegion=us-east-1" \
     --set "AzuriteContainer=orca-test" \
 )
 
@@ -362,25 +372,70 @@ kubectl_ctx apply -f "${rendered_orca}/01-namespace.yaml"
 
 # Emulators next; orca's startup probe will fail until the cachestore
 # bucket and Azurite container exist, so we deploy these first and
-# wait for their init hooks to settle before bringing orca up.
-kubectl_ctx apply -f "${rendered_dev}/01-localstack.yaml"
+# bootstrap them before bringing orca up.
+kubectl_ctx apply -f "${rendered_dev}/01-garage.yaml"
 kubectl_ctx apply -f "${rendered_dev}/03-azurite.yaml"
 
+# -----------------------------------------------------------------------------
+# Bootstrap Garage.
+#
+# The Garage image is a near-scratch image (only the /garage binary; no
+# shell, no coreutils), so the layout/key/bucket bootstrap cannot run as
+# an in-pod shell hook. Instead we drive it here via `kubectl exec ...
+# /garage ...` (each a direct binary exec; the conditional/idempotent
+# logic runs in this script). With the persistent PVC the layout, key,
+# and buckets survive pod restarts, so this only needs to run at install
+# time. It is idempotent, so re-running setup-orca.sh is safe.
+#
+# Run unconditionally (even under --no-wait): an un-bootstrapped Garage
+# leaves the cachestore/origin buckets missing, which makes the whole
+# install non-functional, so we always wait for Garage to be Ready and
+# bootstrap it. --no-wait still skips the longer Azurite / orca waits
+# below.
+
+gexec() { kubectl_ctx -n "${NAMESPACE}" exec deploy/garage -- /garage -c /etc/garage.toml "$@"; }
+
+log "Waiting for Garage to be Ready"
+kubectl_ctx -n "${NAMESPACE}" rollout status deployment/garage --timeout=120s
+
+log "Bootstrapping Garage (layout, dev key, buckets)"
+
+# Wait for the node's RPC to answer before issuing layout commands.
+ok=0
+for _ in $(seq 1 30); do
+  if gexec status >/dev/null 2>&1; then ok=1; break; fi
+  sleep 2
+done
+[[ "${ok}" == "1" ]] || die "Garage node did not become ready within 60s"
+
+# Assign + apply a single-node layout once (idempotent: skip if a zone
+# is already configured).
+if ! gexec layout show 2>/dev/null | grep -q "dc1"; then
+  node_id="$(gexec node id -q 2>/dev/null | cut -d@ -f1 | tr -d '\r')"
+  [[ -n "${node_id}" ]] || die "could not resolve Garage node id"
+  gexec layout assign "${node_id}" -z dc1 -c 1G
+  gexec layout apply --version 1
+fi
+
+# Import the deterministic dev key once, then grant create-bucket.
+if ! gexec key list 2>/dev/null | grep -q "${GARAGE_ACCESS_KEY}"; then
+  gexec key import "${GARAGE_ACCESS_KEY}" "${GARAGE_SECRET_KEY}" -n orca-dev --yes
+fi
+gexec key allow --create-bucket orca-dev >/dev/null 2>&1 || true
+
+# Ensure both buckets exist and are owned by the dev key.
+for bucket in orca-cache orca-origin; do
+  gexec bucket info "${bucket}" >/dev/null 2>&1 || gexec bucket create "${bucket}"
+  gexec bucket allow --read --write --owner --key orca-dev "${bucket}" >/dev/null 2>&1 || true
+done
+
+# Verify the cachestore bucket is queryable before bringing orca up.
+gexec bucket info orca-cache >/dev/null 2>&1 \
+  || die "Garage bootstrap did not create orca-cache"
+
+log "Garage bootstrap complete"
+
 if [[ "${DO_WAIT}" == "1" ]]; then
-  log "Waiting for LocalStack to be Ready"
-  kubectl_ctx -n "${NAMESPACE}" rollout status deployment/localstack --timeout=120s
-
-  log "Waiting for LocalStack init-hook to create cachestore bucket"
-  ok=0
-  for _ in $(seq 1 30); do
-    if kubectl_ctx -n "${NAMESPACE}" exec deploy/localstack -- \
-        awslocal s3api head-bucket --bucket orca-cache >/dev/null 2>&1; then
-      ok=1; break
-    fi
-    sleep 2
-  done
-  [[ "${ok}" == "1" ]] || die "LocalStack init-hook did not create orca-cache within 60s"
-
   log "Waiting for Azurite to be Ready"
   kubectl_ctx -n "${NAMESPACE}" rollout status deployment/azurite --timeout=180s
 
@@ -405,10 +460,10 @@ log "Creating/updating orca-credentials Secret"
 # Labels match the manifest convention so the Secret is also covered
 # by the label-selector uninstall path below.
 kubectl_ctx -n "${NAMESPACE}" create secret generic orca-credentials \
-  --from-literal=ORCA_CACHESTORE_S3_ACCESS_KEY=test \
-  --from-literal=ORCA_CACHESTORE_S3_SECRET_KEY=test \
-  --from-literal=ORCA_AWSS3_ACCESS_KEY=test \
-  --from-literal=ORCA_AWSS3_SECRET_KEY=test \
+  --from-literal=ORCA_CACHESTORE_S3_ACCESS_KEY="${GARAGE_ACCESS_KEY}" \
+  --from-literal=ORCA_CACHESTORE_S3_SECRET_KEY="${GARAGE_SECRET_KEY}" \
+  --from-literal=ORCA_AWSS3_ACCESS_KEY="${GARAGE_ACCESS_KEY}" \
+  --from-literal=ORCA_AWSS3_SECRET_KEY="${GARAGE_SECRET_KEY}" \
   --from-literal=ORCA_AZUREBLOB_ACCOUNT_KEY="${azure_key}" \
   --dry-run=client -o yaml \
   | kubectl_ctx label --local -f - --dry-run=client -o yaml \
@@ -450,7 +505,7 @@ Next steps:
   dd if=/dev/urandom of=/tmp/orca-test.bin bs=1M count=10 status=none
   bin/orcadev roundtrip --file /tmp/orca-test.bin
 
-orcadev auto-port-forwards svc/orca, svc/azurite, svc/localstack as
+orcadev auto-port-forwards svc/orca, svc/azurite, svc/garage as
 needed, so no separate \`kubectl port-forward\` is required. If you
 want a stable foreground forward (for ad-hoc curl), run:
   kubectl${CONTEXT:+ --context ${CONTEXT}} -n ${NAMESPACE} port-forward svc/orca 8443:8443

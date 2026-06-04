@@ -350,20 +350,19 @@ fmt: check-deps ## Format all Go source files (gofumpt + wsl_v5 whitespace)
 	$(GOFMT) -w .
 	$(GOLINT) --fix -E wsl_v5 ./...
 
+# lint runs the same checks locally and in CI and does NOT auto-fix. Run
+# `make fmt` to apply fixes. wsl_v5 is enforced via .golangci.yaml.
+lint: ## Run golangci-lint (matches CI; run `make fmt` to auto-fix)
+	$(GOLINT) ./...
+
 ifdef CI
 # In CI each job is independent; skip chained prerequisites.
-
-lint: ## Run golangci-lint
-	$(GOLINT) ./...
 
 test: machina-manifests net-manifests ## Run all tests with race detector
 	$(GOTEST) -race ./...
 
 else
-# Locally, chain targets for convenience: test -> lint -> fmt -> check-deps.
-
-lint: fmt ## Run golangci-lint (implies fmt)
-	$(GOLINT) ./...
+# Locally, chain test -> lint for convenience.
 
 test: lint machina-manifests net-manifests ## Run all tests (implies lint)
 	$(GOTEST) ./...
@@ -835,10 +834,10 @@ orca-reset: ## Rebuild orca image, side-load into kind, rolling-restart the depl
 # (ubuntu-latest has gcc), no -race locally so developers without a C
 # toolchain can still run integration tests.
 ifdef CI
-orca-inttest: ## Run orca integration tests (LocalStack + Azurite via testcontainers; requires Docker)
+orca-inttest: ## Run orca integration tests (Garage + Azurite via testcontainers; requires Docker)
 	$(GOTEST) -tags=integrationtest -race -timeout 15m ./internal/orca/inttest/...
 else
-orca-inttest: ## Run orca integration tests (LocalStack + Azurite via testcontainers; requires Docker)
+orca-inttest: ## Run orca integration tests (Garage + Azurite via testcontainers; requires Docker)
 	$(GOTEST) -tags=integrationtest -race -count=1 -timeout 15m ./internal/orca/inttest/...
 endif
 

@@ -245,9 +245,17 @@ func TestSessionSendsProbes(t *testing.T) {
 		t.Fatal("received empty packet")
 	}
 
-	status := s.status()
-	if status.PacketsSent == 0 {
-		t.Error("expected at least one packet sent")
+	// sendProbe writes the packet to the socket (making it observable to
+	// remote.ReadFrom above) before it increments packetsSent, so the
+	// counter trails the wire. Poll for it rather than reading once.
+	deadline := time.Now().Add(time.Second)
+	for s.status().PacketsSent == 0 {
+		if time.Now().After(deadline) {
+			t.Error("expected at least one packet sent")
+			break
+		}
+
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

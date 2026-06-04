@@ -5,7 +5,7 @@
 This is the single coherent entrypoint for installing Orca into a
 Kubernetes cluster and driving it for development. The default install
 runs Orca with an in-cluster Azurite Azure-Blob origin and an
-in-cluster LocalStack S3 cachestore - zero real cloud credentials
+in-cluster Garage S3 cachestore - zero real cloud credentials
 required.
 
 Orca is a read-only, S3-compatible HTTP origin cache that fronts cloud
@@ -49,7 +49,7 @@ make orca-kind-up
 
 This creates the `orca-dev` kind cluster, builds the orca container
 image locally, side-loads it into the kind nodes, deploys Azurite +
-LocalStack, creates the orca-credentials Secret, and applies the orca
+Garage, creates the orca-credentials Secret, and applies the orca
 manifests. Takes ~2 minutes on a warm host.
 
 ### Path B: I have a cluster
@@ -82,14 +82,14 @@ the rollout still completes. Kind installs keep the strict
 kubectl --context kind-orca-dev -n unbounded-kube get pods
 # NAME                          READY   STATUS    RESTARTS   AGE
 # azurite-...                   2/2     Running   0          1m   (sidecar = container-ensurer)
-# localstack-...                1/1     Running   0          1m
+# garage-...                    1/1     Running   0          1m
 # orca-...                      1/1     Running   0          50s   (x3)
 ```
 
 ## 4. Seed some data
 
 `bin/orcadev` auto-opens port-forwards to `svc/orca`, `svc/azurite`,
-and `svc/localstack` as needed, so no manual `kubectl port-forward`
+and `svc/garage` as needed, so no manual `kubectl port-forward`
 is required. The same `orcadev` invocation works on kind, AKS, EKS,
 k3d, anything reachable via kubectl.
 
@@ -273,27 +273,35 @@ call, no commit.
 
 ## Troubleshooting
 
-### `setup-orca.sh` exits with "LocalStack init-hook did not create orca-cache"
+### `setup-orca.sh` exits with "Garage bootstrap did not create orca-cache"
 
-LocalStack startup takes longer than the 60-second budget. Check its
-logs and re-run setup-orca.sh (it is idempotent):
+Garage startup + the layout/key/bucket bootstrap takes longer than the
+60-second budget. Check its logs and re-run setup-orca.sh (it is
+idempotent):
 
 ```bash
-kubectl --context kind-orca-dev -n unbounded-kube logs deploy/localstack | tail
+kubectl --context kind-orca-dev -n unbounded-kube logs deploy/garage | tail
 ./hack/orca/setup-orca.sh
 ```
 
-If you see "License activation failed" with exit code 55, you are on
-LocalStack's Pro-only `latest` tag. The dev install pins
-`localstack/localstack:3.8` specifically to avoid this; if you have
-overridden the image, switch to a community-tier tag.
+The bootstrap is driven by setup-orca.sh via `kubectl exec` after
+Garage reports Ready (the Garage image has no shell, so it cannot
+self-bootstrap from an in-pod hook). If it is stuck, inspect the
+cluster directly:
+
+```bash
+kubectl --context kind-orca-dev -n unbounded-kube exec deploy/garage -- \
+  /garage -c /etc/garage.toml status
+```
 
 ### Orca pods CrashLoopBackOff with "NoSuchBucket: orca-cache"
 
-The LocalStack pod restarted (OOM, eviction, ...) and its in-memory
-state was wiped. The init-hook ConfigMap re-creates the buckets on
-every LocalStack start, so the clean recovery is to re-run
-setup-orca.sh which also waits until the buckets exist:
+Less likely than with the old LocalStack harness, because Garage
+persists to a PersistentVolumeClaim (`garage-data`), so the layout,
+dev key, and buckets survive pod restarts. If it happens, the PVC may
+have been deleted, or you applied the manifests without running
+setup-orca.sh (which performs the bootstrap). Re-run setup-orca.sh,
+which re-bootstraps idempotently and waits until the buckets exist:
 
 ```bash
 ./hack/orca/setup-orca.sh
@@ -349,9 +357,9 @@ export AZURE_CONTAINER=my-container
 
 The endpoint is computed as `https://<account>.blob.core.windows.net/`
 and authentication uses `AZURE_STORAGE_KEY`. The in-cluster Azurite +
-LocalStack are still deployed (they are inexpensive) but Orca ignores
+Garage are still deployed (they are inexpensive) but Orca ignores
 them and talks to real Azure for the origin. The cachestore stays on
-the in-cluster LocalStack.
+the in-cluster Garage.
 
 To upload to real Azure with orcadev, pass the matching overrides:
 
@@ -365,14 +373,14 @@ bin/orcadev upload \
     --file ./my-file
 ```
 
-### awss3 origin mode (LocalStack as origin)
+### awss3 origin mode (Garage as origin)
 
 ```bash
 ./hack/orca/setup-orca.sh --origin awss3
 bin/orcadev --origin-driver awss3 upload --generate --count 5 --size 10MiB
 ```
 
-Both the cachestore and origin point at the same in-cluster LocalStack
+Both the cachestore and origin point at the same in-cluster Garage
 on different buckets (`orca-cache` and `orca-origin`).
 
 ### Custom Orca config
@@ -390,7 +398,7 @@ test on every CI run, so it cannot silently drift.
 
 For Go-level behavior coverage (chunked fetch, dedup, peer fallback)
 the integration suite under `internal/orca/inttest/` runs against
-testcontainers-managed LocalStack + Azurite and finishes in ~30s with
+testcontainers-managed Garage + Azurite and finishes in ~30s with
 no Kubernetes setup at all:
 
 ```bash

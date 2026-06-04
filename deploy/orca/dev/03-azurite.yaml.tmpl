@@ -111,7 +111,7 @@ spec:
               mountPath: /data
         # Sidecar that idempotently ensures the Azurite container
         # exists. Runs a forever-loop because Azurite has no
-        # equivalent of LocalStack's init-hooks; this sidecar is
+        # equivalent of an S3 backend init-hook; this sidecar is
         # the structural replacement for the one-shot
         # 'orca-azurite-container-init' Job, which could not re-run
         # after Azurite pod restarts dropped its in-memory state.

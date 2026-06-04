@@ -129,7 +129,7 @@ jobs:
           if-no-files-found: ignore
 
   # ---------- Orca Integration Tests ----------
-  # Spins up LocalStack and Azurite via testcontainers-go and runs the
+  # Spins up Garage and Azurite via testcontainers-go and runs the
   # orca in-process integration suite (internal/orca/inttest). Docker
   # is preinstalled on GitHub-hosted Ubuntu runners; no extra services:
   # block is required.

@@ -11,7 +11,7 @@ import (
 )
 
 // defaultNamespace is the namespace hack/orca/setup-orca.sh installs
-// Orca + Azurite + LocalStack into. Mirrored here so the dev preset
+// Orca + Azurite + Garage into. Mirrored here so the dev preset
 // can drive its own auto-port-forward without needing to read a
 // manifest or kubeconfig context annotation.
 const defaultNamespace = "unbounded-kube"
@@ -20,16 +20,26 @@ const defaultNamespace = "unbounded-kube"
 // Service objects produced by deploy/orca/**/*.yaml.tmpl, which the
 // setup-orca.sh install script applies into defaultNamespace.
 const (
-	devSvcOrca       = "orca"
-	devSvcAzurite    = "azurite"
-	devSvcLocalstack = "localstack"
+	devSvcOrca    = "orca"
+	devSvcAzurite = "azurite"
+	devSvcGarage  = "garage"
+)
+
+// Deterministic Garage dev credentials. Garage enforces SigV4, so the
+// S3 clients orcadev builds (cachestore inspection and awss3-origin
+// seeding) need real keys. These mirror the constants in
+// hack/orca/setup-orca.sh and the Garage bootstrap's `key import`;
+// dev-only, not secret. The access key id must be "GK" + 12 hex bytes.
+const (
+	devGarageAccessKey = "GK0123456789abcdef01234567"
+	devGarageSecretKey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 )
 
 // Port constants used by the dev preset.
 //
 //   - 8443  is the orca edge listener (deploy/orca/05-service.yaml.tmpl).
 //   - 10000 is the azurite blob endpoint inside the Pod (deploy/orca/dev/03-azurite.yaml.tmpl).
-//   - 4566  is the LocalStack edge endpoint inside the Pod (deploy/orca/dev/01-localstack.yaml.tmpl).
+//   - 3900  is the Garage S3 API endpoint inside the Pod (deploy/orca/dev/01-garage.yaml.tmpl).
 //
 // The local-side ports (30100, 30200) match the kind extraPortMappings
 // in hack/orca/kind-config.yaml. The preset still works on clusters
@@ -40,12 +50,12 @@ const (
 // forward is spawned automatically. Either way the dev URLs are the
 // same.
 const (
-	devLocalPortOrca        = 8443
-	devRemotePortOrca       = 8443
-	devLocalPortAzurite     = 30100
-	devRemotePortAzurite    = 10000
-	devLocalPortLocalstack  = 30200
-	devRemotePortLocalstack = 4566
+	devLocalPortOrca     = 8443
+	devRemotePortOrca    = 8443
+	devLocalPortAzurite  = 30100
+	devRemotePortAzurite = 10000
+	devLocalPortGarage   = 30200
+	devRemotePortGarage  = 3900
 )
 
 // devOrcaURL is the edge URL all dev-install orcadev invocations
@@ -60,13 +70,12 @@ const devOrcaURL = "http://localhost:8443"
 const devOriginAzuriteEndpoint = "http://localhost:30100/devstoreaccount1/"
 
 // devCachestoreEndpoint is the S3 cachestore endpoint pointing at the
-// in-cluster LocalStack emulator via the local-side port.
+// in-cluster Garage emulator via the local-side port.
 const devCachestoreEndpoint = "http://localhost:30200"
 
 // devOriginAWSS3Endpoint is the awss3-flavor origin endpoint pointing
-// at the in-cluster LocalStack emulator (same Service as the
-// cachestore but a different bucket; see the deploy/orca/dev
-// manifests).
+// at the in-cluster Garage emulator (same Service as the cachestore
+// but a different bucket; see the deploy/orca/dev manifests).
 const devOriginAWSS3Endpoint = "http://localhost:30200"
 
 // supportedPresets lists the values --preset accepts. Single entry
@@ -110,8 +119,8 @@ func applyPresetDev(g *globalFlags) {
 	g.cachestoreEndpoint = devCachestoreEndpoint
 	g.cachestoreBucket = "orca-cache"
 	g.cachestoreRegion = "us-east-1"
-	g.cachestoreAccessKey = "test"
-	g.cachestoreSecretKey = "test"
+	g.cachestoreAccessKey = devGarageAccessKey
+	g.cachestoreSecretKey = devGarageSecretKey
 	g.cachestoreUsePathStyle = true
 
 	g.autoPortForward = true
@@ -127,7 +136,7 @@ func applyPresetDevAWSS3(g *globalFlags, flags *pflag.FlagSet) {
 	notSet := func(name string) bool { return !flags.Changed(name) }
 
 	if notSet("origin-id") {
-		g.originID = "awss3-localstack"
+		g.originID = "awss3-garage"
 	}
 
 	if notSet("origin-bucket") {
@@ -147,10 +156,10 @@ func applyPresetDevAWSS3(g *globalFlags, flags *pflag.FlagSet) {
 	}
 
 	if notSet("origin-access-key") {
-		g.originAccessKey = "test"
+		g.originAccessKey = devGarageAccessKey
 	}
 
 	if notSet("origin-secret-key") {
-		g.originSecretKey = "test"
+		g.originSecretKey = devGarageSecretKey
 	}
 }

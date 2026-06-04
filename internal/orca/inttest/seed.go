@@ -45,7 +45,7 @@ func AllBlobs() []SeedBlob {
 }
 
 // SeedS3 uploads each blob to the named bucket via the provided
-// LocalStack-friendly S3 client.
+// S3-backend-friendly S3 client.
 func SeedS3(ctx context.Context, t *testing.T, cli *s3.Client, bucket string, blobs []SeedBlob) {
 	t.Helper()
 
@@ -60,7 +60,7 @@ func SeedS3(ctx context.Context, t *testing.T, cli *s3.Client, bucket string, bl
 	}
 }
 
-// DeleteS3Object removes a blob from a LocalStack bucket. Used by
+// DeleteS3Object removes a blob from an S3-backend bucket. Used by
 // warm-cache tests to prove that subsequent GETs are served from the
 // cachestore and not refetched from the origin.
 func DeleteS3Object(ctx context.Context, t *testing.T, cli *s3.Client, bucket, key string) {
