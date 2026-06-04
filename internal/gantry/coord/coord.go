@@ -5,24 +5,24 @@
 //
 // Wire protocol: `/gantry/coord/1.0.0` (one libp2p stream per
 // request/response pair, closed after reply). Framing: length-delimited
-// protobuf via `go-msgio` — the design forbids gRPC (§4.4). Forward
+// protobuf via `go-msgio` - the design forbids gRPC (the design doc). Forward
 // compatibility: additive changes bump the minor (e.g. `1.1.0`);
 // breaking changes bump the major.
 //
 // Two coordinated message families:
 //
-//   - `pull_intent_query` / `pull_intent_response` (§5.2 step 4) — a
-//     stateless probe asking a peer "do you have this digest cached,
-//     are you pulling it, or have you recently failed to pull it?".
-//     The responder fills hrw_rank from its own view of cluster
-//     membership so the requester can detect informer divergence
-//     (§5.3).
+// - `pull_intent_query` / `pull_intent_response` (the step 4) - a
+// stateless probe asking a peer "do you have this digest cached,
+// are you pulling it, or have you recently failed to pull it?".
+// The responder fills hrw_rank from its own view of cluster
+// membership so the requester can detect informer divergence
+// (the design doc).
 //
-//   - `please_pull` / `please_pull_response` (§5.2 step 6) — asks a
-//     peer (the designated puller per HRW) to pull one or more digests
-//     of a single repo. The responder's in-flight map dedupes; we get
-//     STARTED / ALREADY_PULLING / RECENTLY_FAILED per-digest results
-//     back.
+// - `please_pull` / `please_pull_response` (the step 6) - asks a
+// peer (the designated puller per HRW) to pull one or more digests
+// of a single repo. The responder's in-flight map dedupes; we get
+// STARTED / ALREADY_PULLING / RECENTLY_FAILED per-digest results
+// back.
 //
 // This package owns both the server-side stream handler and a typed
 // client. Higher layers (cold-start orchestrator, mirror) interact
@@ -66,8 +66,8 @@ const MaxMessageBytes = 1 << 20
 // DefaultStreamHandshakeTimeout bounds how long the server is willing
 // to wait for the *first* envelope on an inbound stream and how long
 // it gives itself to write the response. A peer that opens a stream
-// and never sends bytes — accidental (NAT death) or malicious
-// (slowloris-style resource exhaustion) — must not pin a goroutine
+// and never sends bytes - accidental (NAT death) or malicious
+// (slowloris-style resource exhaustion) - must not pin a goroutine
 // indefinitely.
 //
 // 5s comfortably covers a healthy in-cluster round-trip while still
@@ -88,7 +88,7 @@ type MetricsHooks struct {
 	// rather than a definitive miss. Operators use this to distinguish
 	// "DHT routes around us because we genuinely lack the blob" from
 	// "DHT routes around us because containerd is unreachable on this
-	// node" — the latter should also be caught by readiness, but the
+	// node" - the latter should also be caught by readiness, but the
 	// metric makes transient storage flaps observable independently of
 	// the readyz signal.
 	OnPullIntentStorageUnavailable func()
@@ -111,14 +111,14 @@ type Server struct {
 	members  ifaces.Members
 	inflight *inflight.Map
 	// negCache is consulted by pull_intent_query to populate
-	// recently_failed / cooldown_until / failure_class. Phase 4 lands a
-	// real implementation; Phase 3 ships with a nil-safe call site so
+	// recently_failed / cooldown_until / failure_class. lands a
+	// real implementation; ships with a nil-safe call site so
 	// the wire field round-trips even before the negative cache exists.
 	negCache NegativeCache
 	// pullerPump is invoked by the please_pull handler for each
 	// (registry, repository, digest) we accept. The supplied function
 	// is expected to start a background pull (it must not block the
-	// stream handler). nil disables please_pull semantically — the
+	// stream handler). nil disables please_pull semantically - the
 	// handler still acks but with OUTCOME_UNSPECIFIED.
 	pullerPump PullerPump
 	// streamHandshakeTimeout caps a single inbound stream's wire
@@ -126,14 +126,14 @@ type Server struct {
 	streamHandshakeTimeout time.Duration
 }
 
-// NegativeCache is the read interface coord needs from the §5.8
-// circuit-breaker (Phase 4). Returning ok == false means the digest
+// NegativeCache is the read interface coord needs from the
+// circuit-breaker . Returning ok == false means the digest
 // has no negative-cache entry on this node.
 type NegativeCache interface {
 	Lookup(d digest.Digest) (entry NegativeEntry, ok bool)
 }
 
-// NegativeEntry mirrors §5.8 state for a single digest.
+// NegativeEntry mirrors the design doc state for a single digest.
 type NegativeEntry struct {
 	CooldownUntil time.Time
 	Class         ifaces.FailureClass
@@ -146,8 +146,7 @@ type NegativeEntry struct {
 // be moved to a goroutine inside the pump's implementation.
 //
 // The returned (started_at, alreadyPulling) tuple drives the wire-
-// level OUTCOME_STARTED vs OUTCOME_ALREADY_PULLING decision. Stable
-// across phases.
+// level OUTCOME_STARTED vs OUTCOME_ALREADY_PULLING decision.
 type PullerPump func(ctx context.Context, registry, repository string, d digest.Digest, kind ifaces.OriginRefKind) (startedAt time.Time, alreadyPulling bool, fail *NegativeEntry)
 
 // Option configures a Server.
@@ -167,7 +166,7 @@ func WithMetrics(h MetricsHooks) Option {
 	return func(s *Server) { s.hooks = h }
 }
 
-// WithNegativeCache attaches a §5.8 read interface. nil is fine; the
+// WithNegativeCache attaches a the design doc read interface. nil is fine; the
 // response just doesn't set recently_failed.
 func WithNegativeCache(n NegativeCache) Option {
 	return func(s *Server) { s.negCache = n }
@@ -203,6 +202,7 @@ func NewServer(store ifaces.LocalContentStore, members ifaces.Members, inflight 
 	for _, opt := range opts {
 		opt(s)
 	}
+
 	return s
 }
 
@@ -213,7 +213,7 @@ func (s *Server) Bind(h host.Host) {
 }
 
 // handleStream is invoked by libp2p for each inbound stream. The
-// design pins "one stream per request/response pair" — we read one
+// design pins "one stream per request/response pair" - we read one
 // length-delimited envelope, dispatch, write one envelope, close.
 func (s *Server) handleStream(str network.Stream) {
 	defer func() { _ = str.Close() }() //nolint:errcheck // best-effort close
@@ -224,6 +224,7 @@ func (s *Server) handleStream(str network.Stream) {
 	if err := str.SetDeadline(time.Now().Add(s.streamHandshakeTimeout)); err != nil {
 		s.bumpStreamErr()
 		s.logger.Debug("coord: set stream deadline", slog.Any("err", err))
+
 		return
 	}
 
@@ -234,6 +235,7 @@ func (s *Server) handleStream(str network.Stream) {
 	if err != nil {
 		s.bumpStreamErr()
 		s.logger.Debug("coord: read envelope", slog.Any("err", err))
+
 		return
 	}
 	defer r.ReleaseMsg(bytes)
@@ -242,6 +244,7 @@ func (s *Server) handleStream(str network.Stream) {
 	if err := proto.Unmarshal(bytes, in); err != nil {
 		s.bumpStreamErr()
 		s.logger.Debug("coord: unmarshal envelope", slog.Any("err", err))
+
 		return
 	}
 
@@ -252,8 +255,10 @@ func (s *Server) handleStream(str network.Stream) {
 	if err != nil {
 		s.bumpStreamErr()
 		s.logger.Debug("coord: dispatch", slog.Any("err", err))
+
 		return
 	}
+
 	if out == nil {
 		return
 	}
@@ -262,11 +267,14 @@ func (s *Server) handleStream(str network.Stream) {
 	if err != nil {
 		s.bumpStreamErr()
 		s.logger.Debug("coord: marshal response", slog.Any("err", err))
+
 		return
 	}
+
 	if err := w.WriteMsg(rb); err != nil {
 		s.bumpStreamErr()
 		s.logger.Debug("coord: write response", slog.Any("err", err))
+
 		return
 	}
 }
@@ -278,18 +286,22 @@ func (s *Server) dispatch(ctx context.Context, remote peer.ID, in *coordv1.Envel
 		if err != nil {
 			return nil, err
 		}
+
 		if s.hooks.OnPullIntentServed != nil {
 			s.hooks.OnPullIntentServed()
 		}
+
 		return wrapPullIntentResponse(resp), nil
 	case *coordv1.Envelope_PleasePullRequest:
 		resp, err := s.servePleasePull(ctx, remote, m.PleasePullRequest)
 		if err != nil {
 			return nil, err
 		}
+
 		if s.hooks.OnPleasePullServed != nil {
 			s.hooks.OnPleasePullServed()
 		}
+
 		return wrapPleasePullResponse(resp), nil
 	case nil:
 		return nil, errors.New("coord: empty envelope")
@@ -316,17 +328,19 @@ func (s *Server) servePullIntent(ctx context.Context, req *coordv1.PullIntentReq
 	if !intent.StartedAt.IsZero() {
 		resp.StartedAt = timestamppb.New(intent.StartedAt)
 	}
+
 	if !intent.CooldownUntil.IsZero() {
 		resp.CooldownUntil = timestamppb.New(intent.CooldownUntil)
 	}
+
 	return resp, nil
 }
 
 // LocalPullIntent implements ifaces.LocalIntentProvider. It returns
 // the same PullIntent the wire-level pull_intent_query handler would
-// produce for d, but without the libp2p stream round-trip — the
+// produce for d, but without the libp2p stream round-trip - the
 // cold-start orchestrator uses it to include self as a first-class
-// participant in the §5.2 rule cascade.
+// participant in the rule cascade.
 func (s *Server) LocalPullIntent(ctx context.Context, d digest.Digest) ifaces.PullIntent {
 	return s.computeLocalIntent(ctx, d)
 }
@@ -335,7 +349,7 @@ func (s *Server) LocalPullIntent(ctx context.Context, d digest.Digest) ifaces.Pu
 // servePullIntent (wire path) and LocalPullIntent (in-process path).
 // Both must produce semantically identical results for the same d so
 // that the cold-start cascade's HRW-rank-0-on-self decision matches
-// what every peer would compute for us. See §5.2 step 4 and the
+// what every peer would compute for us. See the step 4 and the
 // LocalIntentProvider interface doc.
 func (s *Server) computeLocalIntent(ctx context.Context, d digest.Digest) ifaces.PullIntent {
 	intent := ifaces.PullIntent{RecipientRank: -1}
@@ -346,7 +360,7 @@ func (s *Server) computeLocalIntent(ctx context.Context, d digest.Digest) ifaces
 	// guarantees the bytes are openable, not just listed in
 	// metadata). ErrUnavailable from the backend is surfaced via the
 	// OnPullIntentStorageUnavailable hook so operators can
-	// distinguish "genuinely missing" from "storage flap" — we MUST
+	// distinguish "genuinely missing" from "storage flap" - we MUST
 	// NOT roll a backend error into has_cached=true (the peer would
 	// then issue a transfer fetch that also fails).
 	if ok, err := s.store.Has(ctx, d); err == nil && ok {
@@ -358,6 +372,7 @@ func (s *Server) computeLocalIntent(ctx context.Context, d digest.Digest) ifaces
 				slog.String("digest", d.String()),
 				slog.Any("err", err),
 			)
+
 			if s.hooks.OnPullIntentStorageUnavailable != nil {
 				s.hooks.OnPullIntentStorageUnavailable()
 			}
@@ -375,13 +390,13 @@ func (s *Server) computeLocalIntent(ctx context.Context, d digest.Digest) ifaces
 		intent.StartedAt = e.StartedAt
 	}
 
-	// hrw_rank — own rank in own membership view.
+	// hrw_rank - own rank in own membership view.
 	if s.members != nil {
 		nodes := s.members.Snapshot()
 		intent.RecipientRank = hrw.RankOf(nodes, s.members.Self(), d)
 	}
 
-	// §5.8 negative-cache fields.
+	// the design doc negative-cache fields.
 	if s.negCache != nil {
 		if e, ok := s.negCache.Lookup(d); ok {
 			intent.RecentlyFailed = true
@@ -389,13 +404,14 @@ func (s *Server) computeLocalIntent(ctx context.Context, d digest.Digest) ifaces
 			intent.FailureClass = e.Class
 		}
 	}
+
 	return intent
 }
 
 // StartLocalPull implements ifaces.LocalPullStarter. It runs the same
 // pullerPump-driven path as servePleasePull but skips the libp2p
 // stream layer entirely. Used by the cold-start orchestrator when
-// rule 7 picks self as the designated puller — Coord.PleasePull(self)
+// rule 7 picks self as the designated puller - Coord.PleasePull(self)
 // would round-trip through libp2p (or fail to dial) for no benefit.
 //
 // Returns one PleasePullOutcome per input digest. A nil/zero pump (no
@@ -406,6 +422,7 @@ func (s *Server) StartLocalPull(ctx context.Context, registry, repository string
 	if registry == "" || repository == "" {
 		return nil, errors.New("start_local_pull: missing registry/repository")
 	}
+
 	out := make([]ifaces.PleasePullOutcome, 0, len(digests))
 	for _, d := range digests {
 		oc := ifaces.PleasePullOutcome{Digest: d}
@@ -413,6 +430,7 @@ func (s *Server) StartLocalPull(ctx context.Context, registry, repository string
 			out = append(out, oc)
 			continue
 		}
+
 		startedAt, already, fail := s.pullerPump(ctx, registry, repository, d, kind)
 		switch {
 		case fail != nil:
@@ -425,20 +443,24 @@ func (s *Server) StartLocalPull(ctx context.Context, registry, repository string
 		default:
 			oc.Outcome = ifaces.PleasePullStarted
 			oc.StartedAt = startedAt
+
 			if s.hooks.OnPleasePullStarted != nil {
 				s.hooks.OnPleasePullStarted()
 			}
 		}
+
 		out = append(out, oc)
 	}
+
 	return out, nil
 }
 
 func (s *Server) servePleasePull(ctx context.Context, _ peer.ID, req *coordv1.PleasePullRequest) (*coordv1.PleasePullResponse, error) {
-	// §4.4 invariant: one repo per batch. Empty / malformed → reject.
+	// the design doc invariant: one repo per batch. Empty / malformed -> reject.
 	if req.GetUpstreamRegistry() == "" || req.GetRepository() == "" {
 		return nil, errors.New("please_pull: missing registry/repository")
 	}
+
 	if len(req.GetDigests()) == 0 {
 		return &coordv1.PleasePullResponse{}, nil
 	}
@@ -452,14 +474,18 @@ func (s *Server) servePleasePull(ctx context.Context, _ peer.ID, req *coordv1.Pl
 				slog.String("digest", raw),
 				slog.Any("err", err),
 			)
+
 			continue
 		}
+
 		r := &coordv1.PleasePullResponse_Result{Digest: d.String()}
 		if s.pullerPump == nil {
 			r.Outcome = coordv1.PleasePullResponse_Result_OUTCOME_UNSPECIFIED
 			results = append(results, r)
+
 			continue
 		}
+
 		startedAt, already, fail := s.pullerPump(ctx, req.GetUpstreamRegistry(), req.GetRepository(), d, pleasePullKindFromProto(req.GetKind()))
 		switch {
 		case fail != nil:
@@ -472,12 +498,15 @@ func (s *Server) servePleasePull(ctx context.Context, _ peer.ID, req *coordv1.Pl
 		default:
 			r.Outcome = coordv1.PleasePullResponse_Result_OUTCOME_STARTED
 			r.StartedAt = timestamppb.New(startedAt)
+
 			if s.hooks.OnPleasePullStarted != nil {
 				s.hooks.OnPleasePullStarted()
 			}
 		}
+
 		results = append(results, r)
 	}
+
 	return &coordv1.PleasePullResponse{Results: results}, nil
 }
 
@@ -492,12 +521,12 @@ func (s *Server) bumpStreamErr() {
 // ---------------------------------------------------------------------------
 
 // Client opens a libp2p stream per RPC. Members is used to resolve a
-// ifaces.NodeID to a libp2p peer.ID for the dial. Phase 3 ships a
-// minimal NodeID→peer.ID mapping that accepts the libp2p peer.ID string
+// ifaces.NodeID to a libp2p peer.ID for the dial. ships a
+// minimal NodeID->peer.ID mapping that accepts the libp2p peer.ID string
 // form directly as the NodeID (matches what `internal/discovery.Host`
-// returns from FindProviders). Real K8s-pod-name → peer.ID mapping is
+// returns from FindProviders). Real K8s-pod-name -> peer.ID mapping is
 // owned by `internal/members` and surfaces through a richer Node type
-// in Phase 4+.
+// in +.
 type Client struct {
 	h            host.Host
 	dialTimeout  time.Duration
@@ -506,7 +535,7 @@ type Client struct {
 	resolveMu    sync.RWMutex
 	resolveCache map[ifaces.NodeID]peer.ID
 	// resolveFn is consulted before the static cache. It lets higher
-	// layers (members) supply a live NodeID → peer.ID mapping derived
+	// layers (members) supply a live NodeID -> peer.ID mapping derived
 	// from pod-annotation announcements without polling. Returns
 	// (peer.ID, true) on hit; (_, false) lets the lookup fall through
 	// to resolveCache and finally peer.Decode(string(NodeID)).
@@ -547,8 +576,8 @@ func WithClientLogger(l *slog.Logger) ClientOption {
 // libp2p peer.ID at dial time. The resolver is consulted before the
 // static teach-cache populated by ResolvePeerID; returning (_, false)
 // falls through to the cache and then to peer.Decode(NodeID). Used by
-// main.go to bridge K8s node names → libp2p peer.IDs published via
-// members' pod-annotation announcements (§7.3).
+// main.go to bridge K8s node names -> libp2p peer.IDs published via
+// members' pod-annotation announcements (the design doc).
 func WithPeerIDResolver(fn func(ifaces.NodeID) (peer.ID, bool)) ClientOption {
 	return func(c *Client) {
 		if fn != nil {
@@ -570,6 +599,7 @@ func NewClient(h host.Host, opts ...ClientOption) *Client {
 	for _, opt := range opts {
 		opt(c)
 	}
+
 	return c
 }
 
@@ -578,14 +608,17 @@ func (c *Client) PullIntentQuery(ctx context.Context, target ifaces.NodeID, d di
 	in := &coordv1.Envelope{Msg: &coordv1.Envelope_PullIntentRequest{
 		PullIntentRequest: &coordv1.PullIntentRequest{Digest: d.String()},
 	}}
+
 	out, err := c.roundTrip(ctx, target, in)
 	if err != nil {
 		return ifaces.PullIntent{}, err
 	}
+
 	resp := out.GetPullIntentResponse()
 	if resp == nil {
 		return ifaces.PullIntent{}, errors.New("coord: empty pull_intent_response")
 	}
+
 	return ifaces.PullIntent{
 		HasCached:      resp.GetHasCached(),
 		InFlight:       resp.GetInFlight(),
@@ -603,6 +636,7 @@ func (c *Client) PleasePull(ctx context.Context, target ifaces.NodeID, registry,
 	for i, d := range digests {
 		raws[i] = d.String()
 	}
+
 	in := &coordv1.Envelope{Msg: &coordv1.Envelope_PleasePullRequest{
 		PleasePullRequest: &coordv1.PleasePullRequest{
 			Digests:          raws,
@@ -611,14 +645,17 @@ func (c *Client) PleasePull(ctx context.Context, target ifaces.NodeID, registry,
 			Kind:             pleasePullKindToProto(kind),
 		},
 	}}
+
 	out, err := c.roundTrip(ctx, target, in)
 	if err != nil {
 		return nil, err
 	}
+
 	resp := out.GetPleasePullResponse()
 	if resp == nil {
 		return nil, errors.New("coord: empty please_pull_response")
 	}
+
 	outs := make([]ifaces.PleasePullOutcome, 0, len(resp.GetResults()))
 	for _, r := range resp.GetResults() {
 		d, err := digest.Parse(r.GetDigest())
@@ -626,6 +663,7 @@ func (c *Client) PleasePull(ctx context.Context, target ifaces.NodeID, registry,
 			c.logger.Debug("please_pull: bad result digest", slog.String("digest", r.GetDigest()), slog.Any("err", err))
 			continue
 		}
+
 		outs = append(outs, ifaces.PleasePullOutcome{
 			Digest:        d,
 			Outcome:       pleasePullStatusFromProto(r.GetOutcome()),
@@ -634,6 +672,7 @@ func (c *Client) PleasePull(ctx context.Context, target ifaces.NodeID, registry,
 			FailureClass:  failureClassFromProto(r.GetFailureClass()),
 		})
 	}
+
 	return outs, nil
 }
 
@@ -652,11 +691,14 @@ func (c *Client) lookupPeerID(id ifaces.NodeID) (peer.ID, error) {
 			return pid, nil
 		}
 	}
+
 	c.resolveMu.RLock()
+
 	if pid, ok := c.resolveCache[id]; ok {
 		c.resolveMu.RUnlock()
 		return pid, nil
 	}
+
 	c.resolveMu.RUnlock()
 	// Fallback: treat NodeID as a peer.ID string. internal/discovery
 	// surfaces providers this way already.
@@ -664,6 +706,7 @@ func (c *Client) lookupPeerID(id ifaces.NodeID) (peer.ID, error) {
 	if err != nil {
 		return "", fmt.Errorf("coord: cannot resolve NodeID %q to peer.ID: %w", id, err)
 	}
+
 	return pid, nil
 }
 
@@ -677,11 +720,15 @@ func (c *Client) roundTrip(ctx context.Context, target ifaces.NodeID, env *coord
 	defer cancel()
 
 	dialCtx, dialCancel := context.WithTimeout(ctx, c.dialTimeout)
+
 	str, err := c.h.NewStream(dialCtx, pid, ProtocolID)
+
 	dialCancel()
+
 	if err != nil {
 		return nil, fmt.Errorf("coord: open stream: %w", err)
 	}
+
 	defer func() { _ = str.Close() }() //nolint:errcheck // best-effort close
 
 	if dl, ok := ctx.Deadline(); ok {
@@ -692,6 +739,7 @@ func (c *Client) roundTrip(ctx context.Context, target ifaces.NodeID, env *coord
 	if err != nil {
 		return nil, fmt.Errorf("coord: marshal: %w", err)
 	}
+
 	w := msgio.NewVarintWriter(str)
 	if err := w.WriteMsg(bytes); err != nil {
 		return nil, fmt.Errorf("coord: write: %w", err)
@@ -700,11 +748,13 @@ func (c *Client) roundTrip(ctx context.Context, target ifaces.NodeID, env *coord
 	_ = str.CloseWrite() //nolint:errcheck // best-effort close
 
 	r := msgio.NewVarintReaderSize(str, MaxMessageBytes)
+
 	rb, err := r.ReadMsg()
 	if err != nil {
 		if errors.Is(err, io.EOF) {
 			return nil, errors.New("coord: peer closed stream without response")
 		}
+
 		return nil, fmt.Errorf("coord: read: %w", err)
 	}
 	defer r.ReleaseMsg(rb)
@@ -713,6 +763,7 @@ func (c *Client) roundTrip(ctx context.Context, target ifaces.NodeID, env *coord
 	if err := proto.Unmarshal(rb, out); err != nil {
 		return nil, fmt.Errorf("coord: unmarshal: %w", err)
 	}
+
 	return out, nil
 }
 
@@ -780,7 +831,7 @@ func pleasePullStatusFromProto(o coordv1.PleasePullResponse_Result_Outcome) ifac
 // the wire so per-kind metrics ("manifest | config | layer") agree
 // end-to-end across the please_pull boundary. A pre-KIND_CONFIG peer
 // receiving KIND_CONFIG will treat it as KIND_BLOB (the default branch
-// in pleasePullKindFromProto below) — correct bytes, only the metric
+// in pleasePullKindFromProto below) - correct bytes, only the metric
 // label downgrades on that peer.
 func pleasePullKindToProto(k ifaces.OriginRefKind) coordv1.PleasePullRequest_Kind {
 	switch k {

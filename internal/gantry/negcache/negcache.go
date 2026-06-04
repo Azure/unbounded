@@ -2,25 +2,25 @@
 // Licensed under the MIT License.
 
 // Package negcache implements the per-puller, in-memory negative cache
-// described in §5.8 of the Gantry design.
+// described in the design doc of the Gantry design.
 //
 // When a puller's origin fetch fails terminally, the failure is
 // classified (FailureAuth, FailureNotFound, FailureRateLimited,
 // FailureTransient) and recorded against the digest. Subsequent
 // pull_intent_query / please_pull RPCs for that digest must surface
-// the cooldown state so requesters can short-circuit (§5.8 step:
+// the cooldown state so requesters can short-circuit (the step:
 // "Signal propagation via the existing probe RPCs").
 //
-// Cooldown ladder (configurable, defaults from §7.7):
+// Cooldown ladder (configurable, defaults from the design doc):
 //
-//	1st failure → 10 s     (Initial)
-//	2nd failure → 30 s     (Initial × Multiplier)
-//	3rd failure → 2 min    (Initial × Multiplier^2 capped at Max)
-//	4th+        → 10 min   (Max)
+//	1st failure -> 10 s (Initial)
+//	2nd failure -> 30 s (Initial × Multiplier)
+//	3rd failure -> 90 s (Initial × Multiplier^2 capped at Max)
+//	4th+ -> 10 min (Max)
 //
-// The first successful pull clears the entry (§5.8 "Self-healing").
+// The first successful pull clears the entry (the design doc "Self-healing").
 //
-// The cache is local-only. The design (§5.8 "Why the negative cache is
+// The cache is local-only. The design (the design doc "Why the negative cache is
 // local-only, not propagated via DHT") explicitly forbids cluster-wide
 // propagation because a stale "this digest failed" marker outliving an
 // actual recovery would be a serious correctness bug.
@@ -34,7 +34,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 )
 
-// Options configures the cooldown ladder. Zero values pick the §7.7
+// Options configures the cooldown ladder. Zero values pick the
 // defaults; callers should still pass an explicit value to make tests
 // deterministic.
 type Options struct {
@@ -43,7 +43,7 @@ type Options struct {
 	// Max caps the cooldown after exponential growth.
 	Max time.Duration
 	// Multiplier is the geometric factor between successive cooldowns.
-	// Spec default is 3× (10 s → 30 s → 90 s → ... → Max).
+	// Spec default is 3× (10 s -> 30 s -> 90 s -> ... -> Max).
 	Multiplier int
 	// Now is the clock used for cooldown comparisons. Tests override to
 	// inject a deterministic time source. Defaults to time.Now.
@@ -57,7 +57,7 @@ type Options struct {
 	OnSize func(count int)
 }
 
-// Entry mirrors §5.8's recent_failures[digest] record.
+// Entry mirrors the design doc's recent_failures[digest] record.
 type Entry struct {
 	LastFailure   time.Time
 	FailureCount  int
@@ -65,7 +65,7 @@ type Entry struct {
 	CooldownUntil time.Time
 }
 
-// Cache is the per-puller §5.8 negative cache. Safe for concurrent use.
+// Cache is the per-puller the design doc negative cache. Safe for concurrent use.
 type Cache struct {
 	opts Options
 	mu   sync.Mutex
@@ -73,20 +73,24 @@ type Cache struct {
 }
 
 // New returns an empty Cache. Required options that are zero get the
-// §7.7 defaults (Initial=10s, Max=10min, Multiplier=3, Now=time.Now).
+// the design doc defaults (Initial=10s, Max=10min, Multiplier=3, Now=time.Now).
 func New(opts Options) *Cache {
 	if opts.Initial <= 0 {
 		opts.Initial = 10 * time.Second
 	}
+
 	if opts.Max <= 0 {
 		opts.Max = 10 * time.Minute
 	}
+
 	if opts.Multiplier <= 1 {
 		opts.Multiplier = 3
 	}
+
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
+
 	return &Cache{
 		opts: opts,
 		m:    make(map[digest.Digest]Entry),
@@ -113,22 +117,27 @@ func (c *Cache) RecordFailure(d digest.Digest, class ifaces.FailureClass) Entry 
 	if c.opts.OnEnter != nil {
 		c.opts.OnEnter(class)
 	}
+
 	if c.opts.OnSize != nil {
 		c.opts.OnSize(len(c.m))
 	}
+
 	return prev
 }
 
-// RecordSuccess clears any negative-cache entry for d. The §5.8 spec
+// RecordSuccess clears any negative-cache entry for d. The the design doc spec
 // says "the first successful pull of the digest clears the entry".
 // Idempotent: a no-op when no entry exists.
 func (c *Cache) RecordSuccess(d digest.Digest) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
 	if _, ok := c.m[d]; !ok {
 		return
 	}
+
 	delete(c.m, d)
+
 	if c.opts.OnSize != nil {
 		c.opts.OnSize(len(c.m))
 	}
@@ -139,22 +148,28 @@ func (c *Cache) RecordSuccess(d digest.Digest) {
 func (c *Cache) Lookup(d digest.Digest) (Entry, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
 	e, ok := c.m[d]
 	if !ok {
 		return Entry{}, false
 	}
+
 	if c.opts.Now().After(e.CooldownUntil) {
 		// Cooldown elapsed; drop the entry so the next attempt is
-		// single-shot per §5.8 "Self-healing".
+		// single-shot per the design doc "Self-healing".
 		delete(c.m, d)
+
 		if c.opts.OnSize != nil {
 			c.opts.OnSize(len(c.m))
 		}
+
 		return Entry{}, false
 	}
+
 	if c.opts.OnHit != nil {
 		c.opts.OnHit(e.Class)
 	}
+
 	return e, true
 }
 
@@ -163,11 +178,12 @@ func (c *Cache) Lookup(d digest.Digest) (Entry, bool) {
 func (c *Cache) Len() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
 	return len(c.m)
 }
 
 // cooldownFor returns the cooldown duration for the n-th consecutive
-// failure (n=1 → Initial, growing geometrically by Multiplier, capped
+// failure (n=1 -> Initial, growing geometrically by Multiplier, capped
 // at Max).
 func (c *Cache) cooldownFor(failureCount int) time.Duration {
 	d := c.opts.Initial
@@ -176,10 +192,13 @@ func (c *Cache) cooldownFor(failureCount int) time.Duration {
 		if next > c.opts.Max || next < d {
 			return c.opts.Max
 		}
+
 		d = next
 	}
+
 	if d > c.opts.Max {
 		return c.opts.Max
 	}
+
 	return d
 }

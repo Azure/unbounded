@@ -1,6 +1,6 @@
 # kind cluster topology for the gantry e2e suite.
 #
-# One control-plane + two workers — enough to exercise inter-pod
+# One control-plane + two workers - enough to exercise inter-pod
 # coord paths (HRW top-K=3 means the requester picks a peer that's
 # not itself, which requires ≥2 peers in the membership view).
 #

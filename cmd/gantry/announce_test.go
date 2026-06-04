@@ -212,18 +212,19 @@ func TestTransferAddrFamilyMismatch(t *testing.T) {
 
 // hasMultiNodeMembership controls whether the cold-start orchestrator
 // is wired at startup. On first-cluster boot the membership snapshot
-// is empty (no peer is Ready yet) — but cold-start must still be
+// is empty (no peer is Ready yet) - but cold-start must still be
 // enabled because that is exactly the situation it exists to handle.
 // The gate therefore looks at whether the membership view is backed
 // by the real K8s informer (cold-start ON) vs the dev-mode single-
 // self fake (cold-start OFF, no peers to coordinate with).
 func TestHasMultiNodeMembership(t *testing.T) {
 	t.Run("real manager with empty snapshot still enables cold-start", func(t *testing.T) {
-		// A *members.Manager with no Start() called yet has an empty
-		// snapshot — the first-cluster-boot scenario. The previous
+		// A *members.Manager with no Start called yet has an empty
+		// snapshot - the first-cluster-boot scenario. The previous
 		// implementation returned false here and permanently disabled
 		// cold-start; the new implementation returns true.
 		var mgr *members.Manager // typed nil; only the dynamic type matters
+
 		got := hasMultiNodeMembership(mgr)
 		if !got {
 			t.Errorf("hasMultiNodeMembership(*members.Manager) = false, want true (first-cluster boot must enable cold-start)")
@@ -273,6 +274,7 @@ func TestIsProductionMode(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			c := &config.Config{}
 			tc.mut(c)
+
 			if got := isProductionMode(c); got != tc.want {
 				t.Errorf("isProductionMode = %v, want %v", got, tc.want)
 			}
@@ -283,12 +285,12 @@ func TestIsProductionMode(t *testing.T) {
 // selfAnnounceRequiredForReadiness must be true exactly when the
 // agent is in production mode AND has a PodName (so AnnounceSelf
 // has something to patch). Static bootstrap peers DO NOT bypass
-// the gate: they solve DHT seeding, not the K8s-node-name → libp2p
+// the gate: they solve DHT seeding, not the K8s-node-name -> libp2p
 // peer-ID mapping that ships through the gantry.io/peer-id pod
 // annotation. A pod that boots, completes DHT bootstrap via static
 // peers, but fails to publish its own peer-id annotation would be
 // listed in HRW membership under a node name no other agent can
-// translate to a dialable peer ID — every cold-start RPC to it 503s.
+// translate to a dialable peer ID - every cold-start RPC to it 503s.
 func TestSelfAnnounceRequiredForReadiness(t *testing.T) {
 	cases := []struct {
 		name string
@@ -372,7 +374,7 @@ func TestBootstrapConvergenceTarget(t *testing.T) {
 // implementations that don't (the dev-mode single-self fake, test
 // stubs). The bootstrap view is the correct denominator for the DHT
 // routing-table target and the /readyz DHT-convergence gate during
-// a cold rollout where no pod is Ready yet — using the serving view
+// a cold rollout where no pod is Ready yet - using the serving view
 // there is the readiness-bypass bug this helper exists to prevent.
 func TestBootstrapPeerCount(t *testing.T) {
 	t.Run("fallback to Snapshot when no SnapshotForBootstrap", func(t *testing.T) {
@@ -389,7 +391,7 @@ func TestBootstrapPeerCount(t *testing.T) {
 		}
 	})
 	t.Run("uses SnapshotForBootstrap when available and prefers it over Snapshot", func(t *testing.T) {
-		// During a cold rollout Snapshot() may report 0 while
+		// During a cold rollout Snapshot may report 0 while
 		// SnapshotForBootstrap reports the full announced set.
 		// bootstrapPeerCount MUST pick up the bootstrap value or
 		// the /readyz DHT-convergence gate gets bypassed.
@@ -447,7 +449,7 @@ func TestRunningMatchingPodCount(t *testing.T) {
 	t.Run("fallback to Snapshot when no RunningMatchingPodCount", func(t *testing.T) {
 		// fakes.Members implements ifaces.Members but NOT the
 		// runningCounter extension; verify the fallback branch.
-		// On the dev-mode path this undercount is acceptable —
+		// On the dev-mode path this undercount is acceptable -
 		// the readiness gate this helper feeds only triggers when
 		// count > 1, and the dev-mode fake is always single-self.
 		f := fakes.NewMembers(
@@ -462,8 +464,8 @@ func TestRunningMatchingPodCount(t *testing.T) {
 	})
 	t.Run("uses RunningMatchingPodCount when available, ignores Snapshot", func(t *testing.T) {
 		// Multi-node fresh rollout: every Gantry pod is Running
-		// but none has self-announced yet (Snapshot() and
-		// SnapshotForBootstrap() both empty for peers).
+		// but none has self-announced yet (Snapshot and
+		// SnapshotForBootstrap both empty for peers).
 		// RunningMatchingPodCount must still see all 4 pods so
 		// /readyz can stay 503 with "peer self-announcements
 		// pending" rather than racing to green.
@@ -478,7 +480,7 @@ func TestRunningMatchingPodCount(t *testing.T) {
 	})
 	t.Run("single-node returns 1 (real single-node cluster, not a stuck rollout)", func(t *testing.T) {
 		// On a legitimate single-node deploy the new readiness
-		// branch must NOT fire — count == 1 falls below the
+		// branch must NOT fire - count == 1 falls below the
 		// `count > 1` guard. Confirm the helper preserves that
 		// invariant.
 		m := &bootstrapStub{running: 1}
@@ -490,14 +492,14 @@ func TestRunningMatchingPodCount(t *testing.T) {
 
 // TestRoutingTableTarget guards eighth-review #3: the kad-dht
 // routing-table target is the count of *other* peers we expect to
-// learn about — snapshotSize-1 — NOT the raw snapshot size. Passing
+// learn about - snapshotSize-1 - NOT the raw snapshot size. Passing
 // snapshotSize as target meant a fully-converged N-node cluster
 // could only ever reach (N-1)/N of the target, pegging the DHT
 // health score at < 1.0 (0.5 in a 2-node deploy, 0.66 in a 3-node
 // deploy, 0.75 in a 4-node deploy …) and tripping degraded-cluster
 // alerts on healthy clusters.
 //
-// Single-node carve-out: snapshot ≤ 1 → 0. The lone-agent case
+// Single-node carve-out: snapshot ≤ 1 -> 0. The lone-agent case
 // must not produce a positive target (the routing table has nothing
 // to learn) and the bootstrap loop already encodes that contract via
 // bootstrapConvergenceTarget; routingTableTarget agrees.

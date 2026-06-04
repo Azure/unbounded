@@ -48,6 +48,7 @@ func newStreamCommitTracker(inv inventorySource, logger *slog.Logger, onObserved
 	if logger == nil {
 		logger = slog.Default()
 	}
+
 	return &streamCommitTracker{
 		inv:             inv,
 		logger:          logger.With(slog.String("subsystem", "stream_commit_tracker")),
@@ -65,12 +66,14 @@ func newStreamCommitTracker(inv inventorySource, logger *slog.Logger, onObserved
 func (t *streamCommitTracker) RecordCompleted(d digest.Digest) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+
 	t.pending[d.String()] = append(t.pending[d.String()], time.Now().Add(t.verifyWindow))
 }
 
 func (t *streamCommitTracker) Run(ctx context.Context) error {
 	ticker := time.NewTicker(t.probeInterval)
 	defer ticker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -85,24 +88,30 @@ func (t *streamCommitTracker) probe(parent context.Context) {
 	t.mu.Lock()
 	hasPending := len(t.pending) > 0
 	t.mu.Unlock()
+
 	if !hasPending || t.inv == nil {
 		return
 	}
 
 	invCtx, cancel := context.WithTimeout(parent, t.inventoryBudget)
 	digests, err := t.inv.Inventory(invCtx)
+
 	cancel()
+
 	if err != nil {
 		var unavailable *ifaces.ErrUnavailable
 		if errors.As(err, &unavailable) {
 			t.logger.Debug("inventory unavailable during stream commit probe; keeping pending responses",
 				slog.Any("err", err),
 			)
+
 			return
 		}
+
 		t.logger.Warn("inventory probe failed during stream commit correlation",
 			slog.Any("err", err),
 		)
+
 		return
 	}
 
@@ -119,21 +128,27 @@ func (t *streamCommitTracker) probe(parent context.Context) {
 	for ds, deadlines := range t.pending {
 		if _, ok := present[ds]; ok {
 			observed += len(deadlines)
+
 			delete(t.pending, ds)
+
 			continue
 		}
+
 		kept := make([]time.Time, 0, len(deadlines))
 		for _, deadline := range deadlines {
 			if now.After(deadline) || now.Equal(deadline) {
 				missing++
 				continue
 			}
+
 			kept = append(kept, deadline)
 		}
+
 		if len(kept) == 0 {
 			delete(t.pending, ds)
 			continue
 		}
+
 		t.pending[ds] = kept
 	}
 	t.mu.Unlock()
@@ -141,6 +156,7 @@ func (t *streamCommitTracker) probe(parent context.Context) {
 	if observed > 0 && t.onObserved != nil {
 		t.onObserved(observed)
 	}
+
 	if missing > 0 && t.onMissing != nil {
 		t.onMissing(missing)
 	}

@@ -16,7 +16,7 @@ import (
 // c.MetricsListen and returns the *http.Server (for Shutdown) plus a
 // receive-only channel that will report any listener-side error.
 //
-// Per §Phase 6: /metrics for Prom, /livez for the pure liveness
+// Per /metrics for Prom, /livez for the pure liveness
 // probe (always 200 while the process is up), /healthz and /readyz
 // both gated by readyCheck. Kubernetes conventions vary on whether
 // readiness goes through healthz or readyz; we expose all three so a
@@ -33,6 +33,7 @@ func startOpsEndpoint(addr string, reg *metrics.Registry, readyCheck func() (str
 			http.Error(w, reason, http.StatusServiceUnavailable)
 			return
 		}
+
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok")) //nolint:errcheck // best-effort write
 	})
@@ -41,6 +42,7 @@ func startOpsEndpoint(addr string, reg *metrics.Registry, readyCheck func() (str
 			http.Error(w, reason, http.StatusServiceUnavailable)
 			return
 		}
+
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ready")) //nolint:errcheck // best-effort write
 	})
@@ -50,15 +52,19 @@ func startOpsEndpoint(addr string, reg *metrics.Registry, readyCheck func() (str
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	errc := make(chan error, 1)
+
 	go func() {
 		err := srv.ListenAndServe()
 		if !errors.Is(err, http.ErrServerClosed) {
 			errc <- err
 		}
+
 		close(errc)
 	}()
+
 	logger.Info("ops endpoint listening",
 		slog.String("addr", addr),
 		slog.String("paths", "/metrics, /livez, /healthz, /readyz"))
+
 	return srv, errc
 }

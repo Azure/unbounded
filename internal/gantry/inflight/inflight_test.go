@@ -15,20 +15,26 @@ import (
 func TestStart_FirstStartGetsOwnership(t *testing.T) {
 	m := New(DefaultStalls(), nil)
 	d := digest.MustParse("sha256:" + zeros(64))
+
 	h, e, alreadyPulling := m.Start(d, ifaces.KindBlob, 0)
 	if alreadyPulling {
 		t.Fatal("alreadyPulling should be false on first Start")
 	}
+
 	if h == nil {
 		t.Fatal("Handle nil")
 	}
+
 	if e.StartedAt.IsZero() {
 		t.Error("StartedAt not set")
 	}
+
 	if m.Len() != 1 {
 		t.Errorf("Len = %d, want 1", m.Len())
 	}
+
 	h.Done()
+
 	if m.Len() != 0 {
 		t.Errorf("Len after Done = %d, want 0", m.Len())
 	}
@@ -38,20 +44,24 @@ func TestStart_SecondStartReportsAlreadyPulling(t *testing.T) {
 	m := New(DefaultStalls(), nil)
 	d := digest.MustParse("sha256:" + zeros(64))
 	h1, _, _ := m.Start(d, ifaces.KindBlob, 0)
+
 	h2, e2, alreadyPulling := m.Start(d, ifaces.KindBlob, 0)
 	if !alreadyPulling {
 		t.Error("alreadyPulling = false on second Start")
 	}
+
 	if e2.StartedAt.IsZero() {
 		t.Error("second Start did not surface existing StartedAt")
 	}
 	// Releasing h2 (the noop handle) must NOT clear the entry.
 	h2.Done()
+
 	if m.Len() != 1 {
 		t.Errorf("Len after noop-Done = %d, want 1", m.Len())
 	}
 	// Releasing h1 (the owning handle) clears it.
 	h1.Done()
+
 	if m.Len() != 0 {
 		t.Errorf("Len after owner Done = %d, want 0", m.Len())
 	}
@@ -61,8 +71,10 @@ func TestStart_RaceParallelClaimsExactlyOneWinner(t *testing.T) {
 	m := New(DefaultStalls(), nil)
 	d := digest.MustParse("sha256:" + zeros(64))
 
-	var winners, losers int
-	var winnerMu sync.Mutex
+	var (
+		winners, losers int
+		winnerMu        sync.Mutex
+	)
 
 	const goroutines = 64
 	// Hold every goroutine at the start line so they all race Start
@@ -72,12 +84,16 @@ func TestStart_RaceParallelClaimsExactlyOneWinner(t *testing.T) {
 
 	var wg sync.WaitGroup
 	wg.Add(goroutines)
+
 	for i := 0; i < goroutines; i++ {
 		go func() {
 			defer wg.Done()
+
 			<-start
+
 			h, _, already := m.Start(d, ifaces.KindBlob, 0)
 			handles <- h
+
 			winnerMu.Lock()
 			if already {
 				losers++
@@ -87,15 +103,19 @@ func TestStart_RaceParallelClaimsExactlyOneWinner(t *testing.T) {
 			winnerMu.Unlock()
 		}()
 	}
+
 	close(start)
 	wg.Wait()
 	close(handles)
+
 	for h := range handles {
 		h.Done()
 	}
+
 	if winners != 1 {
 		t.Errorf("winners = %d, want exactly 1", winners)
 	}
+
 	if winners+losers != goroutines {
 		t.Errorf("total = %d, want %d", winners+losers, goroutines)
 	}
@@ -103,16 +123,20 @@ func TestStart_RaceParallelClaimsExactlyOneWinner(t *testing.T) {
 
 func TestLookupForIntent(t *testing.T) {
 	m := New(DefaultStalls(), nil)
+
 	d := digest.MustParse("sha256:" + zeros(64))
 	if _, ok := m.LookupForIntent(d); ok {
 		t.Fatal("LookupForIntent should be false for unknown digest")
 	}
+
 	h, _, _ := m.Start(d, ifaces.KindManifest, 0)
 	defer h.Done()
+
 	e, ok := m.LookupForIntent(d)
 	if !ok {
 		t.Fatal("LookupForIntent should be true after Start")
 	}
+
 	if e.ExpectedClass != ifaces.KindManifest {
 		t.Errorf("ExpectedClass = %v; want KindManifest", e.ExpectedClass)
 	}
@@ -127,6 +151,7 @@ func TestIsStale_ManifestConfig(t *testing.T) {
 	if !m.IsStale(ifaces.KindManifest, 0, startedAt) {
 		t.Error("6s-old manifest pull should be stale (threshold 5s)")
 	}
+
 	startedAt = fixed.Add(-3 * time.Second) // newer
 	if m.IsStale(ifaces.KindManifest, 0, startedAt) {
 		t.Error("3s-old manifest pull should NOT be stale")
@@ -144,6 +169,7 @@ func TestIsStale_LayerSizeAware(t *testing.T) {
 	if m.IsStale(ifaces.KindBlob, 100*1024*1024, startedAt) {
 		t.Error("25s-old 100MB layer should NOT be stale (threshold 30s)")
 	}
+
 	startedAt = fixed.Add(-31 * time.Second)
 	if !m.IsStale(ifaces.KindBlob, 100*1024*1024, startedAt) {
 		t.Error("31s-old 100MB layer SHOULD be stale (threshold 30s)")
@@ -166,6 +192,7 @@ func TestIsStale_ZeroTimeNotStale(t *testing.T) {
 func TestResolveStall_UnknownSize(t *testing.T) {
 	s := DefaultStalls()
 	got := s.ResolveStall(ifaces.KindBlob, 0)
+
 	want := s.LayerFloor * time.Duration(s.LayerMultiplier)
 	if got != want {
 		t.Errorf("unknown-size stall = %v; want %v", got, want)
@@ -177,5 +204,6 @@ func zeros(n int) string {
 	for i := range b {
 		b[i] = '0'
 	}
+
 	return string(b)
 }

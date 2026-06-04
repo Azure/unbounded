@@ -1,11 +1,11 @@
-# containerd registry mirror template — drops in at
+# containerd registry mirror template - drops in at
 # /etc/containerd/certs.d/<registry-host>/hosts.toml.
 #
 # §7.1: each upstream registry the cluster pulls from gets its own
 # directory under /etc/containerd/certs.d. The directory name is the
 # canonical registry hostname (e.g. registry.example.com,
 # ghcr.io, docker.io). For docker.io specifically containerd
-# resolves to the canonical hostname index.docker.io — use that as
+# resolves to the canonical hostname index.docker.io - use that as
 # the directory name.
 #
 # Behaviour:
@@ -17,7 +17,7 @@
 #   2. The `server` line is the canonical origin used for fallback.
 #
 # `skip_verify = true` is loopback-only and limited to the agent's
-# self-signed-or-plain mirror endpoint — the upstream `server` URL
+# self-signed-or-plain mirror endpoint - the upstream `server` URL
 # still verifies TLS normally.
 #
 # `capabilities = ["pull","resolve"]` matches the §7.1 / §4.4

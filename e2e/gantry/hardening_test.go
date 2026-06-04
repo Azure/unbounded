@@ -16,7 +16,7 @@ import (
 // concrete CIDRs discovered at runtime, applies it, and verifies that
 // the DaemonSet keeps passing readiness.
 //
-// IMPORTANT — enforcement caveat:
+// IMPORTANT - enforcement caveat:
 //
 //	kind's default CNI (kindnetd) does NOT enforce NetworkPolicy. A
 //	policy applied against kindnetd is parsed and stored but never
@@ -52,7 +52,7 @@ func TestE2E_Hardening(t *testing.T) {
 	h.waitForRollout(ctx)
 	h.checkReadyz(ctx)
 
-	// Discover the kind node CIDR — apiserver and kubelet probes both
+	// Discover the kind node CIDR - apiserver and kubelet probes both
 	// originate from a node IP, so the NP's ipBlock rules need it.
 	nodeCIDR := h.discoverNodeCIDR(ctx)
 	t.Logf("discovered node CIDR for kind cluster: %s", nodeCIDR)

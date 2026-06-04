@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c" //nolint:staticcheck // h2c is deliberate for peer-to-peer cleartext HTTP/2
+	"golang.org/x/net/http2/h2c" //nolint:staticcheck // h2c deliberate
 
 	"github.com/Azure/unbounded/internal/gantry/config"
 	"github.com/Azure/unbounded/internal/gantry/digest"
@@ -33,33 +33,46 @@ import (
 // "host:port" address.
 func startPeerTransfer(t *testing.T, c ifaces.LocalContentStore) string {
 	t.Helper()
+
 	s := transfer.New(c)
+
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
+
 	h2s := &http2.Server{}
+
 	hsrv := &http.Server{
 		Handler:           h2c.NewHandler(s.Handler(), h2s), //nolint:staticcheck // h2c deliberate
 		ReadHeaderTimeout: 5 * time.Second,
 	}
+
 	go func() { _ = hsrv.Serve(ln) }() //nolint:errcheck // best-effort
+
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
+
 		_ = hsrv.Shutdown(ctx) //nolint:errcheck // best-effort
 		_ = ln.Close()         //nolint:errcheck // best-effort close
 	})
+
 	return ln.Addr().String()
 }
 
 func newMirrorWithPeer(t *testing.T, originBlobs map[digest.Digest][]byte, providers map[digest.Digest][]ifaces.Provider) (*httptest.Server, *fakes.Cache, *fakes.DHT, *int32, *int32) {
 	t.Helper()
+
 	var originHits int32
+
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&originHits, 1)
+
 		path := r.URL.Path
+
 		var refStart int
+
 		switch {
 		case strings.Contains(path, "/blobs/"):
 			refStart = strings.LastIndex(path, "/blobs/") + len("/blobs/")
@@ -69,17 +82,21 @@ func newMirrorWithPeer(t *testing.T, originBlobs map[digest.Digest][]byte, provi
 			w.WriteHeader(404)
 			return
 		}
+
 		ref := path[refStart:]
+
 		d, err := digest.Parse(ref)
 		if err != nil {
 			w.WriteHeader(404)
 			return
 		}
+
 		body, ok := originBlobs[d]
 		if !ok {
 			w.WriteHeader(404)
 			return
 		}
+
 		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
 		_, _ = w.Write(body) //nolint:errcheck // best-effort write
 	}))
@@ -103,6 +120,7 @@ func newMirrorWithPeer(t *testing.T, originBlobs map[digest.Digest][]byte, provi
 	}
 
 	var peerFetches int32
+
 	client := transfer.NewClient(transfer.WithDialTimeout(time.Second), transfer.WithRequestTimeout(5*time.Second))
 	m := mirror.New(cfg, c, oc,
 		mirror.WithDiscovery(dht, client),
@@ -118,6 +136,7 @@ func newMirrorWithPeer(t *testing.T, originBlobs map[digest.Digest][]byte, provi
 	)
 	srv := httptest.NewServer(m.Handler())
 	t.Cleanup(srv.Close)
+
 	return srv, c, dht, &originHits, &peerFetches
 }
 
@@ -139,21 +158,26 @@ func TestMirror_PeerFallback_ServesFromPeerNotOrigin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort body close
+
 	if resp.StatusCode != 200 {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
+
 	got, _ := io.ReadAll(resp.Body)
 	if string(got) != string(body) {
 		t.Errorf("body mismatch: got %q want %q", got, body)
 	}
+
 	if atomic.LoadInt32(originHits) != 0 {
 		t.Errorf("origin hits = %d, want 0 (should have served from peer)", *originHits)
 	}
+
 	if atomic.LoadInt32(peerFetches) != 1 {
 		t.Errorf("peer fetches = %d, want 1", *peerFetches)
 	}
-	// §5.2 step 7: after a successful peer fetch the digest MUST be
+	// the step 7: after a successful peer fetch the digest MUST be
 	// re-advertised to the DHT so the provider set grows. Provide is
 	// fire-and-forget in a goroutine; poll up to 2s.
 	deadline := time.Now().Add(2 * time.Second)
@@ -161,8 +185,10 @@ func TestMirror_PeerFallback_ServesFromPeerNotOrigin(t *testing.T) {
 		if dht.ProvideCount(d) >= 1 {
 			break
 		}
+
 		time.Sleep(20 * time.Millisecond)
 	}
+
 	if got := dht.ProvideCount(d); got < 1 {
 		t.Errorf("dht.Provide call count = %d, want >= 1 (post-peer-fetch re-advertise)", got)
 	}
@@ -182,17 +208,22 @@ func TestMirror_PeerFallback_NoProvidersFallsThroughToOrigin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort body close
+
 	if resp.StatusCode != 200 {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
+
 	got, _ := io.ReadAll(resp.Body)
 	if string(got) != string(body) {
 		t.Errorf("body mismatch: got %q want %q", got, body)
 	}
+
 	if atomic.LoadInt32(originHits) != 1 {
 		t.Errorf("origin hits = %d, want 1", *originHits)
 	}
+
 	if atomic.LoadInt32(peerFetches) != 0 {
 		t.Errorf("peer fetches = %d, want 0", *peerFetches)
 	}
@@ -216,14 +247,17 @@ func TestMirror_PeerFallback_PeerNotFoundExhaustsWarmPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort body close
-	// §5.1 v1 transfer policy: warm path exhausted → 5xx, NOT origin pull.
+	// the design doc v1 transfer policy: warm path exhausted -> 5xx, NOT origin pull.
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503 (warm path exhausted)", resp.StatusCode)
 	}
+
 	if atomic.LoadInt32(originHits) != 0 {
-		t.Errorf("origin hits = %d, want 0 (§5.1: containerd handles origin via hosts.toml)", *originHits)
+		t.Errorf("origin hits = %d, want 0 (the design: containerd handles origin via hosts.toml)", *originHits)
 	}
+
 	if atomic.LoadInt32(peerFetches) != 0 {
 		t.Errorf("peer hits = %d, want 0", *peerFetches)
 	}
@@ -246,6 +280,7 @@ func TestMirror_PeerFallback_StaleProviderFilteredOnNextRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	_ = resp1.Body.Close() //nolint:errcheck // best-effort body close
 	if resp1.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("first status = %d, want 503", resp1.StatusCode)
@@ -255,10 +290,13 @@ func TestMirror_PeerFallback_StaleProviderFilteredOnNextRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	defer func() { _ = resp2.Body.Close() }() //nolint:errcheck // best-effort body close
+
 	if resp2.StatusCode != http.StatusOK {
 		t.Fatalf("second status = %d, want 200 (stale provider should be filtered)", resp2.StatusCode)
 	}
+
 	if atomic.LoadInt32(originHits) != 1 {
 		t.Errorf("origin hits = %d, want 1", *originHits)
 	}
@@ -273,6 +311,7 @@ func TestMirror_PeerFallback_FiltersSelfProviderAfterLocalMiss(t *testing.T) {
 	peerAddr := startPeerTransfer(t, peerCache)
 
 	var originHits int32
+
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&originHits, 1)
 		w.WriteHeader(http.StatusNotFound)
@@ -283,10 +322,12 @@ func TestMirror_PeerFallback_FiltersSelfProviderAfterLocalMiss(t *testing.T) {
 		UpstreamRegistries: []config.UpstreamRegistry{{Name: "reg.example.com", Endpoint: up.URL}},
 	}
 	c := fakes.NewCache()
+
 	oc, err := origin.New(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	dht := fakes.NewDHT()
 	dht.Inject(d,
 		ifaces.Provider{NodeID: "self-node", Addr: "127.0.0.1:1"},
@@ -294,6 +335,7 @@ func TestMirror_PeerFallback_FiltersSelfProviderAfterLocalMiss(t *testing.T) {
 	)
 
 	var peerHits int32
+
 	m := mirror.New(cfg, c, oc,
 		mirror.WithDiscovery(dht, transfer.NewClient()),
 		mirror.WithSelfNodeID("self-node"),
@@ -311,13 +353,17 @@ func TestMirror_PeerFallback_FiltersSelfProviderAfterLocalMiss(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort body close
+
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
+
 	if atomic.LoadInt32(&peerHits) != 1 {
 		t.Errorf("peer hits = %d, want 1", peerHits)
 	}
+
 	if atomic.LoadInt32(&originHits) != 0 {
 		t.Errorf("origin hits = %d, want 0", originHits)
 	}
@@ -332,6 +378,7 @@ func TestMirror_PeerFallback_DialFailureExhaustsWarmPath(t *testing.T) {
 	dht.Inject(d, ifaces.Provider{NodeID: "peer-dead", Addr: "127.0.0.1:1"})
 
 	var originHits int32
+
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&originHits, 1)
 		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
@@ -345,11 +392,14 @@ func TestMirror_PeerFallback_DialFailureExhaustsWarmPath(t *testing.T) {
 		},
 	}
 	c := fakes.NewCache()
+
 	oc, err := origin.New(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	var dialFailures int32
+
 	client := transfer.NewClient(transfer.WithDialTimeout(200*time.Millisecond), transfer.WithRequestTimeout(2*time.Second))
 	m := mirror.New(cfg, c, oc,
 		mirror.WithDiscovery(dht, client),
@@ -367,14 +417,17 @@ func TestMirror_PeerFallback_DialFailureExhaustsWarmPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort body close
-	// §5.1 v1 transfer policy: warm path exhausted → 5xx.
+	// the design doc v1 transfer policy: warm path exhausted -> 5xx.
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503 (warm path exhausted)", resp.StatusCode)
 	}
+
 	if atomic.LoadInt32(&originHits) != 0 {
-		t.Errorf("origin hits = %d, want 0 (§5.1: agent must NOT origin-pull after warm-path exhaustion)", originHits)
+		t.Errorf("origin hits = %d, want 0 (the design: agent must NOT origin-pull after warm-path exhaustion)", originHits)
 	}
+
 	if atomic.LoadInt32(&dialFailures) == 0 {
 		t.Error("expected at least one dial failure metric")
 	}

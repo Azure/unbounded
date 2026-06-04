@@ -3,7 +3,7 @@
 
 // Package metrics owns the Prometheus registry shared across Gantry
 // subsystems and provides constructor helpers that record metric ownership
-// so Phase 6's final audit can verify the §7.6 metric set is complete.
+// so final audit can verify the metric set is complete.
 //
 // Subsystems do NOT call prometheus.MustRegister directly; they go through
 // (*Registry).NewCounter / NewGauge / NewHistogram so the ownership map is
@@ -21,17 +21,17 @@ import (
 )
 
 // Registry wraps a *prometheus.Registry with an ownership map of metric
-// name → subsystem.
+// name -> subsystem.
 type Registry struct {
 	reg   *prometheus.Registry
 	mu    sync.Mutex
 	owner map[string]string
 }
 
-// New returns a Registry with an empty Prometheus registry. New() does not
+// New returns a Registry with an empty Prometheus registry. New does not
 // install any default Go/process collectors so tests don't see runtime
 // metric noise; cmd/gantry wires those collectors explicitly via
-// reg.RegisterDefaultCollectors().
+// reg.RegisterDefaultCollectors.
 func New() *Registry {
 	return &Registry{
 		reg:   prometheus.NewRegistry(),
@@ -55,16 +55,19 @@ func (r *Registry) Handler() http.Handler {
 // or for code that must register a third-party collector directly.
 func (r *Registry) PrometheusRegistry() *prometheus.Registry { return r.reg }
 
-// Owners returns the metric-name → subsystem map, sorted by name. Used by
-// Phase 6's audit step to compare against the §7.6 inventory.
+// Owners returns the metric-name -> subsystem map, sorted by name. Used by
+// audit step to compare against the inventory.
 func (r *Registry) Owners() []NameOwner {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
 	out := make([]NameOwner, 0, len(r.owner))
 	for n, s := range r.owner {
 		out = append(out, NameOwner{Name: n, Subsystem: s})
 	}
+
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+
 	return out
 }
 
@@ -79,6 +82,7 @@ func (r *Registry) NewCounter(subsystem string, opts prometheus.CounterOpts) pro
 	c := prometheus.NewCounter(opts)
 	r.record(subsystem, opts.Name)
 	r.reg.MustRegister(c)
+
 	return c
 }
 
@@ -87,6 +91,7 @@ func (r *Registry) NewCounterVec(subsystem string, opts prometheus.CounterOpts, 
 	c := prometheus.NewCounterVec(opts, labels)
 	r.record(subsystem, opts.Name)
 	r.reg.MustRegister(c)
+
 	return c
 }
 
@@ -95,6 +100,7 @@ func (r *Registry) NewGauge(subsystem string, opts prometheus.GaugeOpts) prometh
 	g := prometheus.NewGauge(opts)
 	r.record(subsystem, opts.Name)
 	r.reg.MustRegister(g)
+
 	return g
 }
 
@@ -103,6 +109,7 @@ func (r *Registry) NewGaugeFunc(subsystem string, opts prometheus.GaugeOpts, f f
 	g := prometheus.NewGaugeFunc(opts, f)
 	r.record(subsystem, opts.Name)
 	r.reg.MustRegister(g)
+
 	return g
 }
 
@@ -111,6 +118,7 @@ func (r *Registry) NewGaugeVec(subsystem string, opts prometheus.GaugeOpts, labe
 	g := prometheus.NewGaugeVec(opts, labels)
 	r.record(subsystem, opts.Name)
 	r.reg.MustRegister(g)
+
 	return g
 }
 
@@ -119,6 +127,7 @@ func (r *Registry) NewHistogram(subsystem string, opts prometheus.HistogramOpts)
 	h := prometheus.NewHistogram(opts)
 	r.record(subsystem, opts.Name)
 	r.reg.MustRegister(h)
+
 	return h
 }
 
@@ -127,14 +136,17 @@ func (r *Registry) NewHistogramVec(subsystem string, opts prometheus.HistogramOp
 	h := prometheus.NewHistogramVec(opts, labels)
 	r.record(subsystem, opts.Name)
 	r.reg.MustRegister(h)
+
 	return h
 }
 
 func (r *Registry) record(subsystem, name string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
 	if existing, ok := r.owner[name]; ok && existing != subsystem {
 		panic("metrics: " + name + " already owned by " + existing + ", cannot reassign to " + subsystem)
 	}
+
 	r.owner[name] = subsystem
 }

@@ -1,6 +1,6 @@
 # Hardening overlay (NOT applied by default).
 #
-# This NetworkPolicy is shipped as an EXAMPLE only — it is intentionally
+# This NetworkPolicy is shipped as an EXAMPLE only - it is intentionally
 # excluded from the default `kubectl apply -f deploy/` workflow because
 # every rule below has at least one site-specific CIDR (apiserver
 # endpoint, kubelet probe source, mirror DNAT source, registry egress)
@@ -26,7 +26,7 @@
 #      (Kustomize / Helm / plain git) and edit every ipBlock marked
 #      with "OPERATOR ACTION REQUIRED" below.
 #   2. Apply it AFTER deploy/daemonset.yaml has been rolled out and
-#      verified, never as part of the initial install — a bad rule
+#      verified, never as part of the initial install - a bad rule
 #      will leave you with a NotReady DaemonSet and no clear signal
 #      that the policy is the cause.
 #   3. Discover your node CIDR(s):
@@ -109,7 +109,7 @@ spec:
     # containerd gets connection-refused on every pull.
     #
     # ─────────────────────────────────────────────────────────────
-    # OPERATOR ACTION REQUIRED — DO NOT SHIP WITH THE 127.0.0.1/32
+    # OPERATOR ACTION REQUIRED - DO NOT SHIP WITH THE 127.0.0.1/32
     # PLACEHOLDER ALONE. Replace `cidr` below with your cluster's
     # actual node CIDR(s). The default of 127.0.0.1/32 works only
     # on CNIs whose portmap chain preserves the original loopback

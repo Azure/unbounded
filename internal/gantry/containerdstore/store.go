@@ -7,7 +7,7 @@
 // of truth for image content.
 //
 // This package is the "containerd as source of truth" hop the plan
-// (docs/plan-final-copilot-v2.md, §Phase 3) introduces: instead of
+// introduces: instead of
 // maintaining a parallel hostPath cache that drifts out of sync with
 // what containerd actually has, every read goes through the live
 // content store and every commit lands directly in the same store
@@ -18,18 +18,18 @@
 // before delegating. A single Store instance is bound to exactly one
 // namespace (typically "k8s.io" for kubelet-managed pods).
 //
-// Failure-mode discipline (per plan §Phase 3):
-//   - cerrdefs.ErrNotFound from the underlying store is downgraded
-//     to *ifaces.ErrNotFound so transfer-endpoint callers can
-//     distinguish "definitively missing" from "backend hiccup".
-//   - Any other underlying error surfaces verbatim so callers treat
-//     it as "containerd unavailable" and do not advertise stale
-//     positive availability via has_cached or DHT.Provide.
+// Failure-mode discipline (per):
+// - cerrdefs.ErrNotFound from the underlying store is downgraded
+// to *ifaces.ErrNotFound so transfer-endpoint callers can
+// distinguish "definitively missing" from "backend hiccup".
+// - Any other underlying error surfaces verbatim so callers treat
+// it as "containerd unavailable" and do not advertise stale
+// positive availability via has_cached or DHT.Provide.
 //
 // The wrapped content.Store interface (not a concrete client) keeps
 // the package unit-testable on darwin against an in-memory fake; the
 // production wiring constructs Store with the real
-// containerd.Client.ContentStore() in cmd/gantry/main.go.
+// containerd.Client.ContentStore in cmd/gantry/main.go.
 package containerdstore
 
 import (
@@ -67,8 +67,8 @@ const DefaultRefPrefix = "gantry-"
 // pathological walk over a giant content store cannot pin unbounded
 // memory. 4096 entries is enough for tens of thousands of digests
 // when most entries are blobs (blobs do not need a stored media
-// type — only manifests/indexes/configs do) and the LRU-style
-// eviction below keeps the freshest entries.
+// type - only manifests/indexes/configs do) and the random
+// eviction below keeps the index bounded.
 const defaultDescIndexCap = 4096
 
 // Store wraps a containerd content.Store.
@@ -88,22 +88,20 @@ type Store struct {
 	// descMu guards descIndex. The index is an advisory media-type
 	// cache populated by cdsub walks (every walked descriptor carries
 	// its MediaType) and by callers that have parsed a manifest body.
-	// It is NOT proof of content presence — callers MUST still call
-	// Has/Open before serving — per plan-final-copilot-v2 §Phase 3
-	// "Descriptor index" ("advisory metadata only").
+	// It is NOT proof of content presence - callers MUST still call
+	// Has/Open before serving - per // "Descriptor index" ("advisory metadata only").
 	descMu    sync.Mutex
 	descIndex map[gdigest.Digest]string
 	descCap   int
 
 	// metrics fires hit/miss/unavailable/open-error counters from
-	// Has/Open. Any callback may be nil — the zero value is the
+	// Has/Open. Any callback may be nil - the zero value is the
 	// "no metrics" path used by tests.
 	metrics MetricsHooks
 }
 
 // MetricsHooks are optional callbacks invoked from Has/Open so the
-// containerd-as-truth model is observable on the wire (plan §Phase 9
-// "gantry_containerd_*_total"). Any callback may be nil; nil callbacks
+// containerd-as-truth model is observable on the wire (// "gantry_containerd_*_total"). Any callback may be nil; nil callbacks
 // are skipped. Hooks fire on every call, not just sampled ones, so
 // keep them cheap (typical implementation: prometheus.Counter.Inc).
 type MetricsHooks struct {
@@ -114,7 +112,7 @@ type MetricsHooks struct {
 	// OnUnavailable fires when Has/Open/Descriptor/Inventory/Writer
 	// return ErrUnavailable (containerd unreachable or sick).
 	OnUnavailable func()
-	// OnOpenError fires only from Open's non-ErrNotFound path — kept
+	// OnOpenError fires only from Open's non-ErrNotFound path - kept
 	// separate so dashboards can tell "open returned anything else"
 	// from generic backend unavailability.
 	OnOpenError func()
@@ -157,6 +155,7 @@ func New(cs content.Store, opts ...Option) *Store {
 	if cs == nil {
 		panic("containerdstore: nil content.Store")
 	}
+
 	s := &Store{
 		cs:        cs,
 		namespace: DefaultNamespace,
@@ -168,39 +167,40 @@ func New(cs content.Store, opts ...Option) *Store {
 	for _, opt := range opts {
 		opt(s)
 	}
+
 	return s
 }
 
 // withNS attaches the configured namespace to ctx. Centralised so
 // every code path goes through the same wrapper and we cannot
 // accidentally call the content store with an unscoped context (which
-// containerd silently treats as namespace "default" — the wrong
+// containerd silently treats as namespace "default" - the wrong
 // answer for kubelet-managed pods).
 func (s *Store) withNS(ctx context.Context) context.Context {
 	return namespaces.WithNamespace(ctx, s.namespace)
 }
 
 // Has reports whether d is present AND openable in the wrapped content
-// store. We probe via ReaderAt — opening and immediately closing the
-// handle — rather than the cheaper Info() lookup because coord
+// store. We probe via ReaderAt - opening and immediately closing the
+// handle - rather than the cheaper Info lookup because coord
 // PullIntent uses Has to drive HasCached on the wire: a peer that
 // answers HasCached=true must be able to serve the bytes through the
 // transfer endpoint, and Info-only Has would have lied for digests
 // whose content file is missing or unreadable on disk (rare after
-// disk issues but possible — and the resulting peer 404 would burn
+// disk issues but possible - and the resulting peer 404 would burn
 // a wasted dial round-trip on every requester). This matches the
-// openability semantics already used by Inventory() and the
+// openability semantics already used by Inventory and the
 // advertiser's Notify pre-check.
 //
-//	(true, nil)  → present and openable (transfer endpoint will serve it).
-//	(false, nil) → definitively absent (ErrNotFound from backend) OR
-//	               present in Info but not openable (corrupt / partial /
-//	               unreadable file). Either way callers should treat as miss.
-//	(false, err) → backend failure (containerd unreachable, namespace
-//	               misconfigured, etc.). Callers MUST NOT treat the
-//	               false return as "definitively absent" in this case;
-//	               coord.computeLocalIntent surfaces this distinctly via
-//	               OnPullIntentStorageUnavailable.
+//	(true, nil) -> present and openable (transfer endpoint will serve it).
+//	(false, nil) -> definitively absent (ErrNotFound from backend) OR
+//	 present in Info but not openable (corrupt / partial /
+//	 unreadable file). Either way callers should treat as miss.
+//	(false, err) -> backend failure (containerd unreachable, namespace
+//	 misconfigured, etc.). Callers MUST NOT treat the
+//	 false return as "definitively absent" in this case;
+//	 coord.computeLocalIntent surfaces this distinctly via
+//	 OnPullIntentStorageUnavailable.
 func (s *Store) Has(ctx context.Context, d gdigest.Digest) (bool, error) {
 	ra, err := s.cs.ReaderAt(s.withNS(ctx), ocispec.Descriptor{Digest: godigest.Digest(d.String())})
 	if err != nil {
@@ -208,17 +208,23 @@ func (s *Store) Has(ctx context.Context, d gdigest.Digest) (bool, error) {
 			if s.metrics.OnMiss != nil {
 				s.metrics.OnMiss()
 			}
+
 			return false, nil
 		}
+
 		if s.metrics.OnUnavailable != nil {
 			s.metrics.OnUnavailable()
 		}
+
 		return false, &ifaces.ErrUnavailable{Op: "ReaderAt", Cause: err}
 	}
+
 	_ = ra.Close() //nolint:errcheck // best-effort close
+
 	if s.metrics.OnHit != nil {
 		s.metrics.OnHit()
 	}
+
 	return true, nil
 }
 
@@ -227,10 +233,12 @@ func (s *Store) Has(ctx context.Context, d gdigest.Digest) (bool, error) {
 // digest means the content API is healthy enough for readiness purposes.
 func (s *Store) Ping(ctx context.Context) error {
 	probe := godigest.Digest("sha256:0000000000000000000000000000000000000000000000000000000000000000")
+
 	_, err := s.cs.Info(s.withNS(ctx), probe)
 	if err == nil || errors.Is(err, cerrdefs.ErrNotFound) {
 		return nil
 	}
+
 	return &ifaces.ErrUnavailable{Op: "Info", Cause: err}
 }
 
@@ -239,26 +247,34 @@ func (s *Store) Ping(ctx context.Context) error {
 // ContentWriter callers can distinguish miss from error.
 func (s *Store) Open(ctx context.Context, d gdigest.Digest) (io.ReadCloser, int64, error) {
 	desc := ocispec.Descriptor{Digest: godigest.Digest(d.String())}
+
 	ra, err := s.cs.ReaderAt(s.withNS(ctx), desc)
 	if err != nil {
 		if errors.Is(err, cerrdefs.ErrNotFound) {
 			if s.metrics.OnMiss != nil {
 				s.metrics.OnMiss()
 			}
+
 			return nil, 0, &ifaces.ErrNotFound{Digest: d}
 		}
+
 		if s.metrics.OnUnavailable != nil {
 			s.metrics.OnUnavailable()
 		}
+
 		if s.metrics.OnOpenError != nil {
 			s.metrics.OnOpenError()
 		}
+
 		return nil, 0, &ifaces.ErrUnavailable{Op: "ReaderAt", Cause: err}
 	}
+
 	if s.metrics.OnHit != nil {
 		s.metrics.OnHit()
 	}
+
 	size := ra.Size()
+
 	return &readerAtCloser{
 		SectionReader: io.NewSectionReader(ra, 0, size),
 		closer:        ra,
@@ -275,9 +291,12 @@ func (s *Store) Descriptor(ctx context.Context, d gdigest.Digest) (ocispec.Descr
 		if errors.Is(err, cerrdefs.ErrNotFound) {
 			return ocispec.Descriptor{}, &ifaces.ErrNotFound{Digest: d}
 		}
+
 		return ocispec.Descriptor{}, &ifaces.ErrUnavailable{Op: "Info", Cause: err}
 	}
+
 	mt := s.lookupMediaType(d)
+
 	return ocispec.Descriptor{Digest: info.Digest, Size: info.Size, MediaType: mt}, nil
 }
 
@@ -292,7 +311,7 @@ func (s *Store) Descriptor(ctx context.Context, d gdigest.Digest) (ocispec.Descr
 // what their own puller does.
 //
 // If the digest is already committed in the store, Writer returns
-// ErrAlreadyExists wrapped — callers who want "treat-as-committed"
+// ErrAlreadyExists wrapped - callers who want "treat-as-committed"
 // semantics should call Has first.
 func (s *Store) Writer(ctx context.Context, d gdigest.Digest) (ifaces.ContentWriter, error) {
 	ref := s.refPrefix + d.String()
@@ -309,12 +328,15 @@ func (s *Store) Writer(ctx context.Context, d gdigest.Digest) (ifaces.ContentWri
 			if hasErr != nil {
 				return nil, hasErr
 			}
+
 			if ok {
 				return alreadyCommittedContentWriter{}, nil
 			}
 		}
+
 		return nil, &ifaces.ErrUnavailable{Op: "Writer", Cause: err}
 	}
+
 	return &contentWriter{
 		inner:    w,
 		expected: expected,
@@ -335,26 +357,35 @@ func (s *Store) Inventory(ctx context.Context) ([]gdigest.Digest, error) {
 		out  []gdigest.Digest
 		seen = map[string]struct{}{}
 	)
+
 	nsCtx := s.withNS(ctx)
+
 	walkErr := s.cs.Walk(nsCtx, func(info content.Info) error {
 		ds := info.Digest.String()
 		if _, ok := seen[ds]; ok {
 			return nil
 		}
+
 		seen[ds] = struct{}{}
+
 		d, parseErr := gdigest.Parse(ds)
 		if parseErr != nil {
 			return nil //nolint:nilerr // unsupported algorithm; skip
 		}
+
 		ra, openErr := s.cs.ReaderAt(nsCtx, ocispec.Descriptor{Digest: info.Digest, Size: info.Size})
 		if openErr != nil {
 			if errors.Is(openErr, cerrdefs.ErrNotFound) {
 				return nil
 			}
+
 			return &ifaces.ErrUnavailable{Op: "ReaderAt", Cause: openErr}
 		}
+
 		_ = ra.Close() //nolint:errcheck // best-effort close
+
 		out = append(out, d)
+
 		return nil
 	})
 	if walkErr != nil {
@@ -362,8 +393,10 @@ func (s *Store) Inventory(ctx context.Context) ([]gdigest.Digest, error) {
 		if errors.As(walkErr, &unavailable) {
 			return nil, walkErr
 		}
+
 		return nil, &ifaces.ErrUnavailable{Op: "Walk", Cause: walkErr}
 	}
+
 	return out, nil
 }
 
@@ -395,7 +428,7 @@ func (w *contentWriter) Write(p []byte) (int, error) {
 
 // Commit finalizes the ingest. The wrapped containerd writer verifies
 // the digest of accumulated bytes against w.expected and returns a
-// non-nil error on mismatch — surfacing as a normal Commit failure to
+// non-nil error on mismatch - surfacing as a normal Commit failure to
 // the caller. Already-committed entries (ErrAlreadyExists) are
 // downgraded to nil because the iface contract semantically means
 // "the digest is now in the store", which both fresh-commit and
@@ -404,13 +437,16 @@ func (w *contentWriter) Commit(ctx context.Context) error {
 	if w.committedOrAborted {
 		return nil
 	}
+
 	w.committedOrAborted = true
 	if err := w.inner.Commit(w.store.withNS(ctx), 0, w.expected); err != nil {
 		if errors.Is(err, cerrdefs.ErrAlreadyExists) {
 			return nil
 		}
+
 		return fmt.Errorf("containerdstore: Commit: %w", err)
 	}
+
 	return nil
 }
 
@@ -420,16 +456,19 @@ func (w *contentWriter) Abort(ctx context.Context) error {
 	if w.committedOrAborted {
 		return nil
 	}
+
 	w.committedOrAborted = true
 	// Close releases any buffered state. We tolerate the error: the
 	// authoritative cancellation is IngestManager.Abort below.
-	_ = w.inner.Close() //nolint:errcheck // best-effort close
+	_ = w.inner.Close() //nolint:errcheck // best-effort
 	if err := w.store.cs.Abort(w.store.withNS(ctx), w.ref); err != nil {
 		if errors.Is(err, cerrdefs.ErrNotFound) {
 			return nil
 		}
+
 		return fmt.Errorf("containerdstore: Abort: %w", err)
 	}
+
 	return nil
 }
 
@@ -445,28 +484,31 @@ type readerAtCloser struct {
 func (r *readerAtCloser) Close() error { return r.closer.Close() }
 
 // RememberMediaType records mediaType for d in the advisory descriptor
-// index so a later Descriptor() call can return the correct
+// index so a later Descriptor call can return the correct
 // MediaType field without re-parsing manifest JSON. Empty mediaType
-// values are ignored. Per plan §"Descriptor index" the index is
+// values are ignored. Per "Descriptor index" the index is
 // populated from:
 //
-//  1. containerd image target descriptors on startup/reconcile,
-//  2. walked manifest/index child descriptors (cdsub.walk),
-//  3. response headers observed during live stream-through,
-//  4. JSON parse fallback (callers may compute and Remember).
+// 1. containerd image target descriptors on startup/reconcile,
+// 2. walked manifest/index child descriptors (cdsub.walk),
+// 3. response headers observed during live stream-through,
+// 4. JSON parse fallback (callers may compute and Remember).
 //
 // The index is bounded; when the cap is reached the oldest entry
-// (random one — we do not track LRU recency) is evicted. Callers
+// (random one - we do not track LRU recency) is evicted. Callers
 // MUST treat a missing entry as "unknown media type", not "absent".
 func (s *Store) RememberMediaType(d gdigest.Digest, mediaType string) {
 	if mediaType == "" {
 		return
 	}
+
 	s.descMu.Lock()
 	defer s.descMu.Unlock()
+
 	if existing, ok := s.descIndex[d]; ok && existing == mediaType {
 		return
 	}
+
 	if len(s.descIndex) >= s.descCap {
 		// Random eviction is sufficient: the index is advisory and
 		// the cdsub reconcile loop will refresh it. Deterministic LRU
@@ -477,6 +519,7 @@ func (s *Store) RememberMediaType(d gdigest.Digest, mediaType string) {
 			break
 		}
 	}
+
 	s.descIndex[d] = mediaType
 }
 
@@ -493,6 +536,7 @@ func (s *Store) LookupMediaType(d gdigest.Digest) string {
 func (s *Store) lookupMediaType(d gdigest.Digest) string {
 	s.descMu.Lock()
 	defer s.descMu.Unlock()
+
 	return s.descIndex[d]
 }
 

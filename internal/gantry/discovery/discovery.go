@@ -3,34 +3,34 @@
 
 // Package discovery wires Gantry's libp2p host and Kademlia DHT.
 //
-// Design (detailed-design.md §7.2):
+// Design :
 //
-//   - Each agent runs a libp2p host with TCP and (optionally) QUIC transports
-//     and Noise security. The host's identity is persisted to a hostPath so
-//     restarts don't churn the DHT routing table.
-//   - The host participates in a cluster-scoped Kademlia DHT (`/gantry/kad/1`
-//     protocol prefix) in **server mode**. Server mode is required because
-//     every Gantry agent is also a content provider; client-mode peers would
-//     not contribute provider records.
-//   - Provider records are keyed by a CIDv1 wrapping the OCI digest's raw
-//     32 bytes via SHA2-256 multihash. The CID derivation is deterministic
-//     and documented inline so any agent can re-derive the same CID from
-//     the same digest.
+// - Each agent runs a libp2p host with TCP and (optionally) QUIC transports
+// and Noise security. The host's identity is persisted to a hostPath so
+// restarts don't churn the DHT routing table.
+// - The host participates in a cluster-scoped Kademlia DHT (`/gantry/kad/1`
+// protocol prefix) in **server mode**. Server mode is required because
+// every Gantry agent is also a content provider; client-mode peers would
+// not contribute provider records.
+// - Provider records are keyed by a CIDv1 wrapping the OCI digest's raw
+// 32 bytes via SHA2-256 multihash. The CID derivation is deterministic
+// and documented inline so any agent can re-derive the same CID from
+// the same digest.
 //
-// Phase 2 scope:
+// scope:
 //
-//   - Host + DHT bring-up, Provide / FindProviders.
-//   - Health() returns the geometric-mean health score from
-//     internal/discovery/health.go (routing-table coverage, p95
-//     lookup latency, self-test success rate); in test mode where
-//     no Monitor is wired it returns 1.0.
-//   - Bootstrap pulls from operator-supplied `Libp2pBootstrapPeers`
-//     plus the dynamic K8s pod-annotation pool (see
-//     cmd/gantry/main.go announceSelfAndBootstrap): every Gantry
-//     pod self-patches its peer.AddrInfo on `gantry.io/p2p-addrs`,
-//     Members surfaces those entries via SnapshotForBootstrap, and
-//     this package's ConnectPeers dials them with the §7.2
-//     8/5/32 cascade.
+// - Host + DHT bring-up, Provide / FindProviders.
+// - Health returns the geometric-mean health score from
+// internal/discovery/health.go (routing-table coverage, p95
+// lookup latency, self-test success rate); in test mode where
+// no Monitor is wired it returns 1.0.
+// - Bootstrap pulls from operator-supplied `Libp2pBootstrapPeers`
+// plus the dynamic K8s pod-annotation pool (see
+// cmd/gantry/main.go announceSelfAndBootstrap): every Gantry
+// pod self-patches its peer.AddrInfo on `gantry.io/p2p-addrs`,
+// Members surfaces those entries via SnapshotForBootstrap, and
+// this package's ConnectPeers dials them with the
+// 8/5/32 cascade.
 package discovery
 
 import (
@@ -83,21 +83,21 @@ type Options struct {
 	// isolate the cluster's DHT from other libp2p networks.
 	ProtocolPrefix string
 
-	// Logger is the structured logger; nil uses slog.Default().
+	// Logger is the structured logger; nil uses slog.Default.
 	Logger *slog.Logger
 
 	// RoutingTableTarget returns the expected steady-state routing-table
-	// size, computed per §7.7 as `min(informer_node_count,
+	// size, computed per the design doc as `min(informer_node_count,
 	// kademlia_max_routing_table_size)`. Nil or a return value <= 0
-	// disables the routing-table component (Health()'s rt term reads
+	// disables the routing-table component (Health's rt term reads
 	// 1.0). The closure is invoked on every score read so it reflects
 	// live cluster membership.
 	RoutingTableTarget func() int
 
-	// SelfTestPeriod is the interval between Provide(self_id) →
+	// SelfTestPeriod is the interval between Provide(self_id) ->
 	// FindProviders(self_id) self-test cycles. Zero disables the
 	// background self-test loop (used in tests). Production default
-	// is 60s (§7.7).
+	// is 60s (the design doc).
 	SelfTestPeriod time.Duration
 
 	// TransferPort is the TCP port to suffix onto IP addresses returned
@@ -117,11 +117,13 @@ const DefaultTransferPort = 5001
 // FromConfig builds Options from a *config.Config.
 func FromConfig(c *config.Config) Options {
 	port := DefaultTransferPort
+
 	if _, p, err := net.SplitHostPort(c.TransferListen); err == nil {
 		if n, perr := strconv.Atoi(p); perr == nil && n > 0 {
 			port = n
 		}
 	}
+
 	return Options{
 		IdentityPath:   c.Libp2pIdentityPath,
 		ListenAddrs:    c.Libp2pListen,
@@ -139,13 +141,13 @@ type Host struct {
 	d      *dht.IpfsDHT
 
 	// transferPort is the conventional peer-transfer port suffixed to
-	// FindProviders results' IP. Captured from Options at New() so
+	// FindProviders results' IP. Captured from Options at New so
 	// FindProviders doesn't have to thread Options state.
 	transferPort int
 
-	// monitor is the Phase 5 §7.7 health tracker. Latency samples
+	// monitor is the health tracker. Latency samples
 	// flow from FindProviders; the self-test loop is owned by
-	// New() / Close().
+	// New / Close.
 	monitor      *Monitor
 	selfTestStop context.CancelFunc
 
@@ -153,13 +155,14 @@ type Host struct {
 }
 
 // New builds a Host and joins the DHT in server mode. The returned Host is
-// already announcing — Provide/FindProviders are usable immediately, though
+// already announcing - Provide/FindProviders are usable immediately, though
 // FindProviders may return empty until the routing table converges.
 func New(ctx context.Context, opts Options) (*Host, error) {
 	logger := opts.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
+
 	logger = logger.With(slog.String("subsystem", "discovery"))
 
 	priv, err := loadOrCreateIdentity(opts.IdentityPath, logger)
@@ -190,11 +193,13 @@ func New(ctx context.Context, opts Options) (*Host, error) {
 	if opts.ProtocolPrefix != "" {
 		dhtOpts = append(dhtOpts, dht.ProtocolPrefix(protocol.ID(opts.ProtocolPrefix)))
 	}
+
 	d, err := dht.New(ctx, h, dhtOpts...)
 	if err != nil {
 		_ = h.Close() //nolint:errcheck // best-effort close
 		return nil, fmt.Errorf("discovery: dht new: %w", err)
 	}
+
 	if err := d.Bootstrap(ctx); err != nil {
 		// kad-dht bootstrap runs asynchronously; this only checks the
 		// initial configuration error path.
@@ -202,42 +207,51 @@ func New(ctx context.Context, opts Options) (*Host, error) {
 	}
 
 	host := &Host{logger: logger, h: h, d: d}
+
 	host.transferPort = opts.TransferPort
 	if host.transferPort == 0 {
 		host.transferPort = DefaultTransferPort
 	}
+
 	host.monitor = NewMonitor(MonitorOptions{
 		RoutingTableSize:   func() int { return d.RoutingTable().Size() },
 		RoutingTableTarget: opts.RoutingTableTarget,
 	})
 	if opts.SelfTestPeriod > 0 {
 		stCtx, stCancel := context.WithCancel(context.Background())
+
 		host.selfTestStop = stCancel
 		go host.monitor.RunSelfTestLoop(stCtx, opts.SelfTestPeriod, host.runSelfTest)
 	}
+
 	host.dialBootstrap(ctx, opts.BootstrapPeers)
 
 	logger.Info("libp2p host ready",
 		slog.String("peer_id", h.ID().String()),
 		slog.Int("listen_addrs", len(h.Addrs())),
 	)
+
 	return host, nil
 }
 
 // Close tears down the DHT and libp2p host. Safe to call multiple times.
 func (h *Host) Close() error {
 	var err error
+
 	h.closeOnce.Do(func() {
 		if h.selfTestStop != nil {
 			h.selfTestStop()
 		}
+
 		if cerr := h.d.Close(); cerr != nil {
 			err = cerr
 		}
+
 		if cerr := h.h.Close(); cerr != nil && err == nil {
 			err = cerr
 		}
 	})
+
 	return err
 }
 
@@ -247,14 +261,13 @@ func (h *Host) PeerID() peer.ID { return h.h.ID() }
 // Addrs returns the libp2p listen multiaddrs (host-local view).
 func (h *Host) Addrs() []multiaddr.Multiaddr { return h.h.Addrs() }
 
-// LibP2P returns the underlying libp2p host. Used by the Phase 3
-// coord-stream wiring (internal/coord) to attach the gRPC-over-libp2p
+// LibP2P returns the underlying libp2p host. Used by the // coord-stream wiring (internal/coord) to attach the gRPC-over-libp2p
 // stream handler to the same host that runs the DHT.
 func (h *Host) LibP2P() host.Host { return h.h }
 
 // ConnectPeers dials a set of multiaddr strings in parallel with a 5s
 // per-peer timeout. Used by main.go to seed the DHT routing table from
-// the membership view (§7.2): after members.WaitForSync, every Ready
+// the membership view (the design doc): after members.WaitForSync, every Ready
 // peer with a published p2p multiaddr is fed back into the libp2p host
 // so kad-dht has direct-connect seeds even without operator-supplied
 // bootstrap_peers config.
@@ -265,6 +278,7 @@ func (h *Host) ConnectPeers(ctx context.Context, multiaddrs []string) int {
 	if len(multiaddrs) == 0 {
 		return 0
 	}
+
 	pool := make([]peer.AddrInfo, 0, len(multiaddrs))
 	for _, p := range multiaddrs {
 		ai, err := peer.AddrInfoFromString(p)
@@ -273,23 +287,27 @@ func (h *Host) ConnectPeers(ctx context.Context, multiaddrs []string) int {
 				slog.String("multiaddr", p),
 				slog.Any("err", err),
 			)
+
 			continue
 		}
-		// Filter out self — connecting to our own host is a no-op
+		// Filter out self - connecting to our own host is a no-op
 		// at best and a confused-state log at worst.
 		if ai.ID == h.h.ID() {
 			continue
 		}
+
 		pool = append(pool, *ai)
 	}
+
 	if len(pool) == 0 {
 		return 0
 	}
+
 	return h.dialBatch(ctx, pool)
 }
 
 // RoutingTableSize returns the current kad-dht routing-table size.
-// Used by readiness probes (§Phase 6) and the §7.7 health score.
+// Used by readiness probes and the health score.
 func (h *Host) RoutingTableSize() int { return h.d.RoutingTable().Size() }
 
 // Provide implements ifaces.DHT.
@@ -298,17 +316,18 @@ func (h *Host) Provide(ctx context.Context, d digest.Digest) error {
 	if err != nil {
 		return err
 	}
+
 	return h.d.Provide(ctx, c, true)
 }
 
 // Withdraw implements ifaces.DHT. libp2p kad-dht has no protocol-level
-// withdraw — provider records expire at the 24 h TTL. The advertiser
+// withdraw - provider records expire at the 24 h TTL. The advertiser
 // achieves the same effect by simply not re-calling Provide for
 // withdrawn digests on its next refresh tick, so this hook exists
 // purely as a cooperation point for the interface contract and is a
 // no-op today. Future work may emit a libp2p custom protocol message
 // to peers in the routing table to evict the stale record sooner, but
-// the §Phase 4 plan explicitly accepts TTL drainage as adequate.
+// the plan explicitly accepts TTL drainage as adequate.
 func (h *Host) Withdraw(_ context.Context, _ digest.Digest) error {
 	return nil
 }
@@ -317,8 +336,8 @@ func (h *Host) Withdraw(_ context.Context, _ digest.Digest) error {
 // expose at least one IP-based transport (TCP or QUIC). Provider.NodeID is
 // the libp2p peer.ID as a string; Provider.Addr is the first IP-based
 // multiaddr's IP, suffixed with the conventional transfer port `:5001`.
-// Phase 3's coord layer will reconcile peer.ID with k8s NodeID using
-// Members; Phase 2 callers (the mirror miss path) only need a dialable
+// coord layer will reconcile peer.ID with k8s NodeID using
+// Members; callers (the mirror miss path) only need a dialable
 // transfer URL.
 func (h *Host) FindProviders(ctx context.Context, d digest.Digest) ([]ifaces.Provider, error) {
 	c, err := DigestToCID(d)
@@ -329,13 +348,16 @@ func (h *Host) FindProviders(ctx context.Context, d digest.Digest) ([]ifaces.Pro
 	// the synchronous variant collects until the routing layer signals
 	// done or ctx fires.
 	start := time.Now()
+
 	ais, err := h.d.FindProviders(ctx, c)
 	if h.monitor != nil && err == nil {
 		h.monitor.ObserveLatency(time.Since(start))
 	}
+
 	if err != nil {
 		return nil, err
 	}
+
 	out := make([]ifaces.Provider, 0, len(ais))
 	for _, ai := range ais {
 		addr := transferAddrWithPort(ai, h.transferPort)
@@ -350,16 +372,18 @@ func (h *Host) FindProviders(ctx context.Context, d digest.Digest) ([]ifaces.Pro
 			Addr:   addr,
 		})
 	}
+
 	return out, nil
 }
 
-// Health returns the §7.7 geometric-mean health score (routing-table
+// Health returns the geometric-mean health score (routing-table
 // coverage, p95 lookup latency, self-test success rate). Returns 1.0
 // when no monitor is wired (test mode).
 func (h *Host) Health() float64 {
 	if h.monitor == nil {
 		return 1.0
 	}
+
 	return h.monitor.Score()
 }
 
@@ -368,7 +392,7 @@ func (h *Host) Health() float64 {
 // the host was constructed without monitoring (test mode).
 func (h *Host) Monitor() *Monitor { return h.monitor }
 
-// runSelfTest performs one Provide → FindProviders cycle on a
+// runSelfTest performs one Provide -> FindProviders cycle on a
 // peer-derived CID. Success means the routing layer accepted the
 // provider record and the immediate-follow-up FindProviders saw at
 // least one provider (which must include this host's own entry).
@@ -380,33 +404,39 @@ func (h *Host) runSelfTest(ctx context.Context) bool {
 	if err != nil {
 		return false
 	}
+
 	hashHex := digestPeerSelfID(peerBytes)
+
 	d, err := digest.Parse("sha256:" + hashHex)
 	if err != nil {
 		return false
 	}
+
 	c, err := DigestToCID(d)
 	if err != nil {
 		return false
 	}
+
 	if err := h.d.Provide(ctx, c, true); err != nil {
 		return false
 	}
+
 	ais, err := h.d.FindProviders(ctx, c)
 	if err != nil {
 		return false
 	}
+
 	return len(ais) > 0
 }
 
 // Compile-time check.
 var _ ifaces.DHT = (*Host)(nil)
 
-// dialBootstrap implements the §7.2 bootstrap cascade: randomly select 8
+// dialBootstrap implements the bootstrap cascade: randomly select 8
 // peers from the configured pool and dial them in parallel with a 5s
 // per-peer timeout. If fewer than 4 successfully connect, draw another
 // random subset of 8 from the remaining pool. The total number of dial
-// attempts is capped at 32. Failures are logged at DEBUG — kad-dht's own
+// attempts is capped at 32. Failures are logged at DEBUG - kad-dht's own
 // bootstrap routine retries periodically.
 func (h *Host) dialBootstrap(ctx context.Context, peers []string) {
 	if len(peers) == 0 {
@@ -428,10 +458,13 @@ func (h *Host) dialBootstrap(ctx context.Context, peers []string) {
 				slog.String("multiaddr", p),
 				slog.Any("err", err),
 			)
+
 			continue
 		}
+
 		pool = append(pool, *ai)
 	}
+
 	if len(pool) == 0 {
 		return
 	}
@@ -441,20 +474,24 @@ func (h *Host) dialBootstrap(ctx context.Context, peers []string) {
 	rng.Shuffle(len(pool), func(i, j int) { pool[i], pool[j] = pool[j], pool[i] })
 
 	dialed := 0
+
 	cursor := 0
 	for cursor < len(pool) && dialed < totalDialBudget {
 		end := cursor + batchSize
 		if end > len(pool) {
 			end = len(pool)
 		}
+
 		if dialed+(end-cursor) > totalDialBudget {
 			end = cursor + (totalDialBudget - dialed)
 		}
+
 		batch := pool[cursor:end]
 		cursor = end
 
 		successes := h.dialBatch(ctx, batch)
 		dialed += len(batch)
+
 		if successes >= successQuorum {
 			return
 		}
@@ -464,26 +501,36 @@ func (h *Host) dialBootstrap(ctx context.Context, peers []string) {
 // dialBatch fans out parallel Connect attempts against batch with a 5s
 // timeout each and returns the number that succeeded.
 func (h *Host) dialBatch(ctx context.Context, batch []peer.AddrInfo) int {
-	var wg sync.WaitGroup
-	var succ atomicInt
+	var (
+		wg   sync.WaitGroup
+		succ atomicInt
+	)
+
 	for _, ai := range batch {
 		wg.Add(1)
+
 		go func(ai peer.AddrInfo) {
 			defer wg.Done()
+
 			cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			defer cancel()
+
 			if err := h.h.Connect(cctx, ai); err != nil {
 				h.logger.Debug("bootstrap connect failed",
 					slog.String("peer", ai.ID.String()),
 					slog.Any("err", err),
 				)
+
 				return
 			}
+
 			succ.add(1)
 			h.logger.Info("bootstrap peer connected", slog.String("peer", ai.ID.String()))
 		}(ai)
 	}
+
 	wg.Wait()
+
 	return succ.load()
 }
 
@@ -509,14 +556,17 @@ func DigestToCID(d digest.Digest) (cid.Cid, error) {
 	if d.Algorithm() != digest.SHA256 {
 		return cid.Undef, fmt.Errorf("discovery: unsupported digest algo %q", d.Algorithm())
 	}
+
 	raw, err := hex.DecodeString(d.Hex())
 	if err != nil {
 		return cid.Undef, fmt.Errorf("discovery: decode digest hex: %w", err)
 	}
+
 	mh, err := multihash.Encode(raw, multihash.SHA2_256)
 	if err != nil {
 		return cid.Undef, fmt.Errorf("discovery: multihash encode: %w", err)
 	}
+
 	return cid.NewCidV1(cid.Raw, mh), nil
 }
 
@@ -530,8 +580,10 @@ func transferAddrWithPort(ai peer.AddrInfo, port int) string {
 		if !ok {
 			continue
 		}
+
 		return ip + ":" + strconv.Itoa(port)
 	}
+
 	return ""
 }
 
@@ -539,9 +591,11 @@ func extractIP(ma multiaddr.Multiaddr) (string, bool) {
 	if v, err := ma.ValueForProtocol(multiaddr.P_IP4); err == nil {
 		return v, true
 	}
+
 	if v, err := ma.ValueForProtocol(multiaddr.P_IP6); err == nil {
 		return "[" + v + "]", true
 	}
+
 	return "", false
 }
 
@@ -553,36 +607,45 @@ func loadOrCreateIdentity(path string, logger *slog.Logger) (crypto.PrivKey, err
 		priv, _, err := crypto.GenerateEd25519Key(nil)
 		return priv, err
 	}
+
 	if b, err := os.ReadFile(path); err == nil {
 		k, err := crypto.UnmarshalPrivateKey(b)
 		if err != nil {
 			return nil, fmt.Errorf("read %s: %w", path, err)
 		}
+
 		logger.Info("loaded libp2p identity", slog.String("path", path))
+
 		return k, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("stat %s: %w", path, err)
 	}
+
 	priv, _, err := crypto.GenerateEd25519Key(nil)
 	if err != nil {
 		return nil, fmt.Errorf("generate key: %w", err)
 	}
+
 	b, err := crypto.MarshalPrivateKey(priv)
 	if err != nil {
 		return nil, fmt.Errorf("marshal key: %w", err)
 	}
+
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, fmt.Errorf("mkdir: %w", err)
 	}
+
 	if err := os.WriteFile(path, b, 0o600); err != nil {
 		return nil, fmt.Errorf("write %s: %w", path, err)
 	}
+
 	logger.Info("generated libp2p identity", slog.String("path", path))
+
 	return priv, nil
 }
 
 // digestPeerSelfID returns the lower-case hex sha-256 of `peerBytes`,
-// used as the OCI-style digest hex for the §7.7 self-test CID.
+// used as the OCI-style digest hex for the self-test CID.
 func digestPeerSelfID(peerBytes []byte) string {
 	sum := sha256.Sum256(peerBytes)
 	return hex.EncodeToString(sum[:])

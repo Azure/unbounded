@@ -1,4 +1,4 @@
-# gantry — end-to-end test suite
+# gantry - end-to-end test suite
 
 This directory holds the kind-based integration suite. It boots a real
 Kubernetes cluster on Docker, builds the gantry container image, and
@@ -9,28 +9,28 @@ peer fetch.
 
 ## Status
 
-- ✅ Smoke test — DaemonSet rolls out, all pods reach `/readyz=200`.
-- ✅ Pull-through + warm peer reuse — installs `hosts.toml`, pulls
+- ✅ Smoke test - DaemonSet rolls out, all pods reach `/readyz=200`.
+- ✅ Pull-through + warm peer reuse - installs `hosts.toml`, pulls
    `registry.k8s.io/e2e-test-images/agnhost:2.39` on two workers, and
    asserts advertise + peer-fetch metrics increase.
-- ✅ Cold-start designated origin puller — two concurrent pulls
+- ✅ Cold-start designated origin puller - two concurrent pulls
    across two workers, asserts the **per-digest HRW invariant**: every
    blob's `please_pull served` log line appears on at most one pod (no
    digest is origin-pulled twice cluster-wide). HRW is per-digest, so
-   work naturally distributes across nodes — different blobs of the
+   work naturally distributes across nodes - different blobs of the
    same image can land on different pullers; what's prevented is
    N nodes pulling the *same* blob.
-- ✅ Eviction / stale-provider recovery — pull then evict on node A,
+- ✅ Eviction / stale-provider recovery - pull then evict on node A,
    trigger pull on node B, assert peer fetch sees `outcome="notfound"`,
    `gantry_stale_provider_filtered_total` increases, origin fallback
    succeeds, and pod becomes ready.
-- ✅ Private / authenticated registry — htpasswd-protected `registry:2`
+- ✅ Private / authenticated registry - htpasswd-protected `registry:2`
    fixture proves credential flow end-to-end through the mirror.
-- ✅ Lease lifecycle — gantry-managed containerd leases visible after
+- ✅ Lease lifecycle - gantry-managed containerd leases visible after
    background pull.
-- ✅ NetworkPolicy hardening — kind-friendly NP applied, pod still
+- ✅ NetworkPolicy hardening - kind-friendly NP applied, pod still
    reaches `/readyz=200`.
-- ✅ Containerd socket access — log + `/readyz` probe confirms the
+- ✅ Containerd socket access - log + `/readyz` probe confirms the
    socket is reachable on the kind node image. Real production node
    images must still validate this on their target node pool.
 
@@ -76,7 +76,7 @@ prereq CLIs:
 | --- | --- |
 | `bootCluster()` | `kind create cluster --config kind-config.yaml` |
 | `buildAndLoadImage()` | `deploy/build.sh -t e2e` then `kind load docker-image gantry:e2e` |
-| `applyManifests()` | rewrites the DaemonSet image to `gantry:e2e` then `kubectl apply -f deploy/` (NetworkPolicy is intentionally NOT applied — `deploy/examples/networkpolicy.yaml` is a templated production reference with placeholder CIDRs that fail validation in kind; a kind-friendly hardening overlay is a separate work item) |
+| `applyManifests()` | rewrites the DaemonSet image to `gantry:e2e` then `kubectl apply -f deploy/` (NetworkPolicy is intentionally NOT applied - `deploy/examples/networkpolicy.yaml` is a templated production reference with placeholder CIDRs that fail validation in kind; a kind-friendly hardening overlay is a separate work item) |
 | `waitForRollout()` | polls `kubectl rollout status ds/gantry -n gantry-system` |
 | `checkReadyz()` | port-forwards one Gantry pod and curls `/readyz` on port 9095 |
 | pull-through check | installs `hosts.toml` on each kind node, removes the test image from node-local containerd, schedules a pull on worker A, waits for advertise metrics, then schedules the same image on worker B and waits for `p2p_peer_fetch_total{outcome="hit"}` |
@@ -89,7 +89,7 @@ for Gantry advertisement, then pulls the same image on a second worker
 and asserts peer-fetch metrics increase.
 
 The kind config (`kind-config.yaml`) declares one control-plane + two
-worker nodes — enough to exercise multi-peer coord paths in future
+worker nodes - enough to exercise multi-peer coord paths in future
 scenarios.
 
 ## Build tag
@@ -107,7 +107,7 @@ The `make e2e` target sets `-tags=e2e` and a generous timeout for you.
 
 The scenarios below are still gaps. Each should land as a focused commit.
 
-1. **Origin failure → cluster-wide circuit (§5.8).** Inject 401/429 via a
+1. **Origin failure -> cluster-wide circuit (§5.8).** Inject 401/429 via a
    mock upstream and assert peers honor the propagated cooldown.
 2. **NF5 pod-kill simulation.** `kubectl delete pod` mid-pull and assert
    the designated-puller takeover metric increments
@@ -131,13 +131,13 @@ The scenarios below are still gaps. Each should land as a focused commit.
 - The kind cluster boot takes ~60–120 s. The Makefile target reserves
   a 10-minute test timeout to absorb that.
 - The default kind containerd uses namespace `k8s.io`, matching the
-  gantry `containerd_namespace` default — no extra config needed.
+  gantry `containerd_namespace` default - no extra config needed.
 - Containerd socket access is mandatory. The default DaemonSet runs with
    UID 65532 and primary GID 0 to work with common `root:root 0660`
    containerd sockets, and the kind smoke covers that path. Clusters
    that use a dedicated socket group should patch `runAsGroup`/`fsGroup`;
    clusters that forbid GID 0 need a site-specific ownership or privilege
    strategy. Because readiness pings the containerd content store,
-   misconfigured permissions surface as a permanent 503 — `TestE2E_
+   misconfigured permissions surface as a permanent 503 - `TestE2E_
    ContainerdSocketAccess` proves the kind node image, but the target
    production node pool must be validated separately before broad prod.

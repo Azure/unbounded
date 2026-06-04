@@ -20,7 +20,7 @@ import (
 )
 
 // Client implements ifaces.PeerDialer over HTTP/2 cleartext (h2c).
-// Reuse a single Client across all peers — the underlying http2.Transport
+// Reuse a single Client across all peers - the underlying http2.Transport
 // pools per-host connections internally.
 type Client struct {
 	hc *http.Client
@@ -60,6 +60,7 @@ func NewClient(opts ...ClientOption) *Client {
 	for _, fn := range opts {
 		fn(&o)
 	}
+
 	tr := &http2.Transport{
 		// AllowHTTP enables h2c upgrade.
 		AllowHTTP: true,
@@ -70,6 +71,7 @@ func NewClient(opts ...ClientOption) *Client {
 		},
 		ReadIdleTimeout: o.readIdleTimeout,
 	}
+
 	return &Client{
 		hc: &http.Client{
 			Transport: tr,
@@ -84,25 +86,29 @@ func (c *Client) FetchFromPeer(ctx context.Context, peerAddr string, ref ifaces.
 	if err != nil {
 		return nil, 0, err
 	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, 0, err
 	}
+
 	req.Header.Set(MirroredHeader, "1")
 	req.Header.Set("Accept", "*/*")
-	// Force h2c — the http.Transport will negotiate over plaintext.
+	// Force h2c - the http.Transport will negotiate over plaintext.
 	req.URL.Scheme = "http"
 
 	resp, err := c.hc.Do(req)
 	if err != nil {
 		return nil, 0, fmt.Errorf("peer dial %s: %w", peerAddr, err)
 	}
+
 	switch resp.StatusCode {
 	case http.StatusOK:
 		size := resp.ContentLength
 		if size < 0 {
 			size = 0
 		}
+
 		return resp.Body, size, nil
 	case http.StatusNotFound:
 		_ = resp.Body.Close() //nolint:errcheck // best-effort body close
@@ -117,13 +123,16 @@ func buildPeerURL(peerAddr string, ref ifaces.OriginRef) (string, error) {
 	if peerAddr == "" {
 		return "", errors.New("empty peerAddr")
 	}
+
 	if ref.Digest.Algorithm() != digest.SHA256 {
 		return "", fmt.Errorf("unsupported digest %s", ref.Digest.Algorithm())
 	}
+
 	kind := "blobs"
 	if ref.Kind == ifaces.KindManifest {
 		kind = "manifests"
 	}
+
 	repo := ref.Repository
 	if repo == "" {
 		// Peer endpoint doesn't actually use the repo path, but OCI URL

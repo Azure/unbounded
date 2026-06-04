@@ -17,7 +17,7 @@ import (
 // `gantry-` prefixed lease IDs round-trip through containerd's lease
 // manager.
 //
-// The test does NOT validate eager release on commit — that is not
+// The test does NOT validate eager release on commit - that is not
 // part of the design. Leases are intentionally held for the full
 // configured TTL (60m default) so freshly-ingested content is
 // protected from containerd's GC until kubelet creates its own Image
@@ -77,12 +77,12 @@ func TestE2E_LeaseLifecycle(t *testing.T) {
 	h.waitForPodReady(ctx, "gantry-e2e-lease")
 
 	// Re-list once more and log the observed leases. The leases SHOULD
-	// still be present (by design — TTL is 60m) and they SHOULD match
+	// still be present (by design - TTL is 60m) and they SHOULD match
 	// the `gantry-sha256:...-<ts>` ID shape that containerdstore.LeasePrefix
 	// emits.
 	leases := h.listGantryLeases(ctx, puller)
 	if len(leases) == 0 {
-		// This would be surprising — we just observed leases above —
+		// This would be surprising - we just observed leases above -
 		// but it would point to an eager-release path we don't have.
 		t.Fatalf("gantry leases on %s vanished between observation and pod-ready; "+
 			"this implies an unexpected early release path", puller)

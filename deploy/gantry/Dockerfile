@@ -11,14 +11,14 @@
 #   - hostNetwork is disabled in the DaemonSet (§7.5); the agent
 #     binds 5000/5001/9095/libp2p inside the pod and uses Service /
 #     direct pod-IP discovery for peering.
-#   - No shell, no package manager — distroless static is the minimal
+#   - No shell, no package manager - distroless static is the minimal
 #     usable base for a static Go binary.
 #
 # Build args:
-#   GO_VERSION       — pinned to match go.mod's `go` directive.
-#   GANTRY_VERSION   — value embedded into the binary's version
+#   GO_VERSION       - pinned to match go.mod's `go` directive.
+#   GANTRY_VERSION   - value embedded into the binary's version
 #                      string via -ldflags. Defaults to "dev".
-#   TARGETPLATFORM   — provided by buildx; the build stage cross-
+#   TARGETPLATFORM   - provided by buildx; the build stage cross-
 #                      compiles to GOOS/GOARCH derived from it.
 #
 # Tag policy: deploy/build.sh computes the tag from `git describe`.
@@ -67,7 +67,7 @@ LABEL org.opencontainers.image.source="https://github.com/vpatelsj/gantry"
 # store, not in a Gantry-owned cache directory.
 VOLUME ["/var/lib/gantry"]
 
-# Mirror, transfer, libp2p, metrics — see deploy/daemonset.yaml.
+# Mirror, transfer, libp2p, metrics - see deploy/daemonset.yaml.
 # The libp2p listen ports are operator-configurable; the defaults
 # below match config.NewDefault().
 EXPOSE 5000/tcp

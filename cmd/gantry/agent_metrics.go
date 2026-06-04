@@ -3,9 +3,9 @@
 
 package main
 
-// Phase-grouped Prometheus metric constructors used by `runAgent`. Each
-// `newPhaseNMetrics` function registers the §7.6 instruments owned by
-// that build-plan phase and returns a struct of pre-named counter/gauge
+// Prometheus metric constructors used by `runAgent`. Each
+// `newPhaseNMetrics` function registers a related group of
+// instruments and returns a struct of pre-named counter/gauge
 // handles for the agent to bump from the relevant subsystem hooks.
 //
 // Splitting these out of main.go keeps `runAgent` focused on wiring
@@ -21,7 +21,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/metrics"
 )
 
-// phase1Metrics groups the §7.6 metric subset that Phase 1 emits.
+// phase1Metrics groups the metric subset that emits.
 type phase1Metrics struct {
 	cacheHit           prometheus.Counter
 	cacheMiss          prometheus.Counter
@@ -55,13 +55,13 @@ func newPhase1Metrics(reg *metrics.Registry) *phase1Metrics {
 		}, []string{"kind", "class"}),
 		originFailureTotal: reg.NewCounterVec("mirror", prometheus.CounterOpts{
 			Name: "p2p_origin_failure_total",
-			Help: "Origin failures observed by the mirror, by §5.8 class.",
+			Help: "Origin failures observed by the mirror, by class.",
 		}, []string{"class"}),
 	}
 }
 
-// phase2Metrics groups Phase 2 metrics for peer fallback, DHT advertise,
-// and transfer endpoint (§7.6).
+// phase2Metrics groups metrics for peer fallback, DHT advertise,
+// and transfer endpoint (the design doc).
 type phase2Metrics struct {
 	peerServe       prometheus.Counter
 	peerMiss        prometheus.Counter
@@ -137,8 +137,7 @@ func newPhase2Metrics(reg *metrics.Registry) *phase2Metrics {
 	}
 }
 
-// phase3Metrics groups the §7.6 instruments owned by Phase 3:
-// HRW-rank-mismatch detection, DHT-false-empty observability, top-K
+// phase3Metrics groups the instruments owned by // HRW-rank-mismatch detection, DHT-false-empty observability, top-K
 // probe hit rate, in-flight pull gauge, cold-start latency, and coord
 // stream counters.
 type phase3Metrics struct {
@@ -157,8 +156,8 @@ type phase3Metrics struct {
 }
 
 func newPhase3Metrics(reg *metrics.Registry, infl *inflight.Map) *phase3Metrics {
-	// in_flight_pulls is a GaugeFunc that polls inflightMap.Len() on
-	// every scrape — no separate counter update path needed.
+	// in_flight_pulls is a GaugeFunc that polls inflightMap.Len on
+	// every scrape - no separate counter update path needed.
 	_ = reg.NewGaugeFunc("coord", prometheus.GaugeOpts{ //nolint:errcheck // best-effort
 		Name: "p2p_in_flight_pulls",
 		Help: "Current count of in-flight digest pulls on this node.",
@@ -167,11 +166,11 @@ func newPhase3Metrics(reg *metrics.Registry, infl *inflight.Map) *phase3Metrics 
 	return &phase3Metrics{
 		hrwRankMismatch: reg.NewCounterVec("coord", prometheus.CounterOpts{
 			Name: "p2p_hrw_rank_mismatch_total",
-			Help: "pull_intent_query responses where the responder's reported HRW rank disagrees with the requester's view (informer divergence, §5.3).",
+			Help: "pull_intent_query responses where the responder's reported HRW rank disagrees with the requester's view (informer divergence,).",
 		}, []string{"digest_kind"}),
 		dhtFalseEmpty: reg.NewCounter("coord", prometheus.CounterOpts{
 			Name: "p2p_dht_false_empty_total",
-			Help: "Cases where DHT FindProviders returned 0 but a peer's pull_intent_query reported has_cached=true (DHT degradation indicator, §5.2).",
+			Help: "Cases where DHT FindProviders returned 0 but a peer's pull_intent_query reported has_cached=true (DHT degradation indicator,).",
 		}),
 		topkProbeHit: reg.NewCounter("coord", prometheus.CounterOpts{
 			Name: "p2p_topk_probe_hit_total",
@@ -188,7 +187,7 @@ func newPhase3Metrics(reg *metrics.Registry, infl *inflight.Map) *phase3Metrics 
 		}),
 		coordPullIntentStorageUnavailable: reg.NewCounter("coord", prometheus.CounterOpts{
 			Name: "p2p_coord_pull_intent_storage_unavailable_total",
-			Help: "pull_intent_query responses whose has_cached=false answer was caused by the local storage backend (typically containerd) returning ErrUnavailable rather than a definitive miss. Distinguishes \"we genuinely lack the blob\" from \"containerd is unreachable\" so transient storage flaps are observable independently of /readyz (§5.2 PullIntent path).",
+			Help: "pull_intent_query responses whose has_cached=false answer was caused by the local storage backend (typically containerd) returning ErrUnavailable rather than a definitive miss. Distinguishes \"we genuinely lack the blob\" from \"containerd is unreachable\" so transient storage flaps are observable independently of /readyz (PullIntent path).",
 		}),
 		coordPleasePullServed: reg.NewCounter("coord", prometheus.CounterOpts{
 			Name: "p2p_coord_please_pull_served_total",
@@ -204,11 +203,11 @@ func newPhase3Metrics(reg *metrics.Registry, infl *inflight.Map) *phase3Metrics 
 		}),
 		prefetchBatchesTotal: reg.NewCounter("coord", prometheus.CounterOpts{
 			Name: "p2p_prefetch_batches_total",
-			Help: "Speculative manifest-pre-fan PleasePull batches dispatched (one per distinct HRW rank-0 puller per manifest serve, §5.2).",
+			Help: "Speculative manifest-pre-fan PleasePull batches dispatched (one per distinct HRW rank-0 puller per manifest serve,).",
 		}),
 		prefetchDigestsTotal: reg.NewCounter("coord", prometheus.CounterOpts{
 			Name: "p2p_prefetch_digests_total",
-			Help: "Layer/config digests carried in speculative manifest-pre-fan batches (cumulative sum across batches, §5.2).",
+			Help: "Layer/config digests carried in speculative manifest-pre-fan batches (cumulative sum across batches,).",
 		}),
 		prefetchPullersPerBatch: reg.NewHistogram("coord", prometheus.HistogramOpts{
 			Name:    "p2p_prefetch_pullers_per_manifest",
@@ -218,8 +217,8 @@ func newPhase3Metrics(reg *metrics.Registry, infl *inflight.Map) *phase3Metrics 
 	}
 }
 
-// phase4Metrics groups the §7.6 instruments owned by Phase 4: the §5.8
-// negative-cache entry gauge + hit counters, and the §5.6 designated-
+// phase4Metrics groups the instruments owned by the
+// negative-cache entry gauge + hit counters, and the designated-
 // puller takeover counter. The takeover counter is incremented from
 // the cold-start orchestrator (requester side); the cache metrics
 // come from negcache.Cache callbacks (puller side).
@@ -234,20 +233,21 @@ func newPhase4Metrics(reg *metrics.Registry) *phase4Metrics {
 	p := &phase4Metrics{}
 	_ = reg.NewGaugeFunc("coord", prometheus.GaugeOpts{ //nolint:errcheck // best-effort
 		Name: "p2p_negative_cache_entries",
-		Help: "Active §5.8 negative-cache entries on this puller (per-digest cooldowns).",
+		Help: "Active negative-cache entries on this puller (per-digest cooldowns).",
 	}, func() float64 { return float64(p.size.Load()) })
 	p.hits = reg.NewCounterVec("coord", prometheus.CounterOpts{
 		Name: "p2p_negative_cache_hit_total",
-		Help: "Lookups against the §5.8 negative cache that returned an active cooldown, by failure class.",
+		Help: "Lookups against the negative cache that returned an active cooldown, by failure class.",
 	}, []string{"class"})
 	p.enters = reg.NewCounterVec("coord", prometheus.CounterOpts{
 		Name: "p2p_negative_cache_enter_total",
-		Help: "New or extended §5.8 negative-cache entries by failure class.",
+		Help: "New or extended negative-cache entries by failure class.",
 	}, []string{"class"})
 	p.designatedPullerTakeoverTotal = reg.NewCounterVec("coord", prometheus.CounterOpts{
 		Name: "p2p_designated_puller_takeover_total",
-		Help: "Cold-start observations where the rank-0 puller's in-flight pull was older than the §5.2a stall threshold, triggering a §5.6 takeover by the next-ranked node.",
+		Help: "Cold-start observations where the rank-0 puller's in-flight pull was older than the stall threshold, triggering a takeover by the next-ranked node.",
 	}, []string{"digest_kind"})
+
 	return p
 }
 
@@ -265,11 +265,12 @@ func failureClassLabel(c ifaces.FailureClass) string {
 	if c == ifaces.FailureUnspecified {
 		return "unspecified"
 	}
+
 	return string(c)
 }
 
-// phase5Metrics groups the §7.6 instruments owned by Phase 5: the
-// DHT health gauge, NF5 direct-origin fallback counter, and top-K
+// phase5Metrics groups the instruments owned by the
+// DHT health gauge, direct-origin-fallback direct-origin fallback counter, and top-K
 // expansion counter.
 type phase5Metrics struct {
 	originFallbackTotal        prometheus.Counter
@@ -281,58 +282,57 @@ func newPhase5Metrics(reg *metrics.Registry, healthScore func() float64) *phase5
 	p := &phase5Metrics{}
 	_ = reg.NewGaugeFunc("discovery", prometheus.GaugeOpts{ //nolint:errcheck // best-effort
 		Name: "p2p_dht_health_score",
-		Help: "§7.7 geometric-mean DHT health score in [0, 1] (routing-table coverage × p95 lookup latency score × self-test success rate).",
+		Help: " geometric-mean DHT health score in [0, 1] (routing-table coverage × p95 lookup latency score × self-test success rate).",
 	}, healthScore)
 	p.originFallbackTotal = reg.NewCounter("mirror", prometheus.CounterOpts{
 		Name: "p2p_origin_fallback_total",
-		Help: "§5.7 NF5 direct-origin fallback pulls (last-resort path after cold-start exhaustion).",
+		Help: " NF5 direct-origin fallback pulls (last-resort path after cold-start exhaustion).",
 	})
 	p.originFallbackDeclineTotal = reg.NewCounterVec("mirror", prometheus.CounterOpts{
 		Name: "p2p_origin_fallback_decline_total",
-		Help: "§5.7 NF5 gating-sequence declines by reason. Without this counter a never-firing NF5 looks identical in metrics to a never-eligible NF5.",
+		Help: " NF5 gating-sequence declines by reason. Without this counter a never-firing NF5 looks identical in metrics to a never-eligible NF5.",
 	}, []string{"reason"})
 	p.topkExpansionTotal = reg.NewCounterVec("coord", prometheus.CounterOpts{
 		Name: "p2p_topk_expansion_total",
 		Help: "Cold-start cascade expansions from top-K to top-(K × factor) by reason (degraded DHT, all top-K unreachable).",
 	}, []string{"reason"})
+
 	return p
 }
 
-// phase6Metrics is REMOVED in Plan §Phase 8: its sole instrument was
+// phase6Metrics is REMOVED in its sole instrument was
 // the forced-eviction counter that tracked Gantry's hostPath cache
 // LRU eviction, and that cache no longer exists. containerd's own GC
 // is now responsible for blob lifetime and exposes its own metrics
 // via the containerd Prometheus endpoint.
 
-// phase9Metrics groups the new instruments added in Plan §Phase 9
-// to surface the containerd-as-truth model on the wire:
+// phase9Metrics groups the new instruments added in // to surface the containerd-as-truth model on the wire:
 //
-//   - storage_mode_info: a per-mode gauge fixed at 1 so dashboards
-//     can group panels by which backend is in use without scraping
-//     a fleet-wide label. Dimension is "mode" (currently always
-//     "containerd"; the label exists so a future remix can flip
-//     between modes without breaking the recording rules).
-//   - advertise_reconcile_*: the §Phase 4 advertiser's reconcile
-//     loop instrumentation. Pairs (duration histogram + digest
-//     count gauge + reconcile counters) describe one full pass.
-//   - withdraw_*: counter pair around DHT.Withdraw, the §Phase 4
-//     equivalent of dht_provide_*. With kad-dht's 24h TTL, the
-//     primary signal is the rate of attempted withdrawals (it
-//     should track the rate of container deletions on the node).
-//   - containerd_lease_*: §Phase 7 lease lifecycle counters. Active
-//     gauge is not maintained here (would require a List call on
-//     scrape); created + cleanup_error counters are bumped by the
-//     hooks wired into pre-ingest lease creation and CleanupExpiredLeases.
-//   - containerd_ingest_*: paired counters around ingest paths so
-//     an operator can see "of N pulls, how many committed to
-//     containerd". Failures here are downstream/cache-side, not
-//     origin-side; that's why this is separate from
-//     origin_failure_total.
-//   - origin_stream_* + containerd_commit_*: live mirror
-//     stream-through observability. These counters deliberately split
-//     "we proxied the bytes" from "containerd later showed the digest
-//     in its content inventory" so the agent does not pretend a local
-//     commit happened just because the HTTP stream completed.
+// - storage_mode_info: a per-mode gauge fixed at 1 so dashboards
+// can group panels by which backend is in use without scraping
+// a fleet-wide label. Dimension is "mode" (currently always
+// "containerd"; the label exists so a future remix can flip
+// between modes without breaking the recording rules).
+// - advertise_reconcile_*: the advertiser's reconcile
+// loop instrumentation. Pairs (duration histogram + digest
+// count gauge + reconcile counters) describe one full pass.
+// - withdraw_*: counter pair around DHT.Withdraw, the // equivalent of dht_provide_*. With kad-dht's 24h TTL, the
+// primary signal is the rate of attempted withdrawals (it
+// should track the rate of container deletions on the node).
+// - containerd_lease_*: lease lifecycle counters. Active
+// gauge is not maintained here (would require a List call on
+// scrape); created + cleanup_error counters are bumped by the
+// hooks wired into pre-ingest lease creation and CleanupExpiredLeases.
+// - containerd_ingest_*: paired counters around ingest paths so
+// an operator can see "of N pulls, how many committed to
+// containerd". Failures here are downstream/cache-side, not
+// origin-side; that's why this is separate from
+// origin_failure_total.
+// - origin_stream_* + containerd_commit_*: live mirror
+// stream-through observability. These counters deliberately split
+// "we proxied the bytes" from "containerd later showed the digest
+// in its content inventory" so the agent does not pretend a local
+// commit happened just because the HTTP stream completed.
 type phase9Metrics struct {
 	storageMode               *prometheus.GaugeVec
 	advReconcileTotal         prometheus.Counter
@@ -373,7 +373,7 @@ func newPhase9Metrics(reg *metrics.Registry) *phase9Metrics {
 		}, []string{"mode"}),
 		advReconcileTotal: reg.NewCounter("discovery", prometheus.CounterOpts{
 			Name: "gantry_advertise_reconcile_total",
-			Help: "Total reconcile passes the §Phase 4 advertiser has completed (successful or not).",
+			Help: "Total reconcile passes the advertiser has completed (successful or not).",
 		}),
 		advReconcileError: reg.NewCounter("discovery", prometheus.CounterOpts{
 			Name: "gantry_advertise_reconcile_error_total",
@@ -381,7 +381,7 @@ func newPhase9Metrics(reg *metrics.Registry) *phase9Metrics {
 		}),
 		advReconcileUnavailable: reg.NewCounter("discovery", prometheus.CounterOpts{
 			Name: "gantry_advertise_reconcile_unavailable_total",
-			Help: "Reconcile passes that aborted because the inventory backend (containerd) was unavailable. Distinct from generic errors so dashboards can separate transient backend hiccups from real misconfigurations. Per plan §Phase 4: the announced set is preserved across these — no spurious Withdraws.",
+			Help: "Reconcile passes that aborted because the inventory backend (containerd) was unavailable. Distinct from generic errors so dashboards can separate transient backend hiccups from real misconfigurations. Per plan : the announced set is preserved across these - no spurious Withdraws.",
 		}),
 		advReconcileDur: reg.NewHistogram("discovery", prometheus.HistogramOpts{
 			Name:    "gantry_advertise_reconcile_duration_seconds",
@@ -390,7 +390,7 @@ func newPhase9Metrics(reg *metrics.Registry) *phase9Metrics {
 		}),
 		advReconcileDigestCount: reg.NewGauge("discovery", prometheus.GaugeOpts{
 			Name: "gantry_advertise_reconcile_digest_count",
-			Help: "Size of the inventory snapshot at the last reconcile pass. Drift between this and containerd's actual content store indicates Inventory misses (see Phase 2).",
+			Help: "Size of the inventory snapshot at the last reconcile pass. Drift between this and containerd's actual content store indicates Inventory misses .",
 		}),
 		advReconcileAdded: reg.NewCounter("discovery", prometheus.CounterOpts{
 			Name: "gantry_advertise_reconcile_added_total",
@@ -410,15 +410,15 @@ func newPhase9Metrics(reg *metrics.Registry) *phase9Metrics {
 		}),
 		containerdLeaseCreated: reg.NewCounter("storage", prometheus.CounterOpts{
 			Name: "gantry_containerd_lease_created_total",
-			Help: "Containerd content-store leases attached by Gantry on ingest (Plan §Phase 7).",
+			Help: "Containerd content-store leases attached by Gantry on ingest (Plan).",
 		}),
 		containerdLeaseReleased: reg.NewCounter("storage", prometheus.CounterOpts{
 			Name: "gantry_containerd_lease_released_total",
-			Help: "Containerd leases deleted by Gantry — either by the periodic cleanup loop after their TTL expired, or by the startup sweep, or by an explicit per-ingest abort. Pair with gantry_containerd_lease_created_total to spot leases that outlive their TTL.",
+			Help: "Containerd leases deleted by Gantry - either by the periodic cleanup loop after their TTL expired, or by the startup sweep, or by an explicit per-ingest abort. Pair with gantry_containerd_lease_created_total to spot leases that outlive their TTL.",
 		}),
 		containerdLeaseActive: reg.NewGauge("storage", prometheus.GaugeOpts{
 			Name: "gantry_containerd_lease_active",
-			Help: "Best-effort estimate of Gantry-owned leases currently live in containerd. Sampled at every cleanup pass — between samples this gauge can drift; trust the counters for accurate rates.",
+			Help: "Best-effort estimate of Gantry-owned leases currently live in containerd. Sampled at every cleanup pass - between samples this gauge can drift; trust the counters for accurate rates.",
 		}),
 		containerdLeaseCleanupErr: reg.NewCounter("storage", prometheus.CounterOpts{
 			Name: "gantry_containerd_lease_cleanup_error_total",
@@ -466,19 +466,19 @@ func newPhase9Metrics(reg *metrics.Registry) *phase9Metrics {
 		}),
 		dhtStaleOnly: reg.NewCounter("discovery", prometheus.CounterOpts{
 			Name: "gantry_dht_stale_only_total",
-			Help: "Mirror cache-miss requests where the DHT returned candidate providers but every candidate was filtered (stale, suspicious, self, unavailable) before any peer fetch was attempted. Treated as if DHT returned empty — falls through to cold-start. Distinct from gantry_dht_lookup_total{outcome=\"miss\"} which counts true empty results.",
+			Help: "Mirror cache-miss requests where the DHT returned candidate providers but every candidate was filtered (stale, suspicious, self, unavailable) before any peer fetch was attempted. Treated as if DHT returned empty - falls through to cold-start. Distinct from gantry_dht_lookup_total{outcome=\"miss\"} which counts true empty results.",
 		}),
 		staleProviderFiltered: reg.NewCounter("discovery", prometheus.CounterOpts{
 			Name: "gantry_stale_provider_filtered_total",
-			Help: "Total provider candidates removed from a DHT lookup result by the stale/suspicious/unavailable cache before fetch attempt. Per plan §Phase 1 — measures how much DHT noise the local stale cache is absorbing.",
+			Help: "Total provider candidates removed from a DHT lookup result by the stale/suspicious/unavailable cache before fetch attempt. Per plan - measures how much DHT noise the local stale cache is absorbing.",
 		}),
 		commitMissingAfterStream: reg.NewCounter("storage", prometheus.CounterOpts{
 			Name: "gantry_containerd_commit_missing_after_stream_total",
-			Help: "Stream-through mirror responses that completed successfully but the digest did NOT appear in local containerd inventory within the verification window. Indicates either kubelet aborted the pull mid-stream or Gantry's response completed without a later containerd commit. Containerd-unavailable probe windows do NOT count as missing; correlation pauses until inventory is available again. Plan §\"Origin metric semantics\".",
+			Help: "Stream-through mirror responses that completed successfully but the digest did NOT appear in local containerd inventory within the verification window. Indicates either kubelet aborted the pull mid-stream or Gantry's response completed without a later containerd commit. Containerd-unavailable probe windows do NOT count as missing; correlation pauses until inventory is available again. \"Origin metric semantics\".",
 		}),
 		advertiseTotal: reg.NewCounter("discovery", prometheus.CounterOpts{
 			Name: "gantry_advertise_total",
-			Help: "Successful per-digest DHT.Provide calls issued by the §Phase 4 advertiser (renamed sibling of p2p_dht_advertise_total — counts the same events; kept under both names so dashboards built before the §Phase 9 rename keep working).",
+			Help: "Successful per-digest DHT.Provide calls issued by the advertiser (renamed sibling of p2p_dht_advertise_total - counts the same events; kept under both names so dashboards built before the rename keep working).",
 		}),
 		advertiseError: reg.NewCounter("discovery", prometheus.CounterOpts{
 			Name: "gantry_advertise_error_total",

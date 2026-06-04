@@ -1,11 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-// Package members — self-announce: write this agent's libp2p peer.ID,
+// Package members - self-announce: write this agent's libp2p peer.ID,
 // multiaddrs and transfer endpoint into its own Pod's annotations so
 // other agents can discover the libp2p identity without
-// operator-supplied bootstrap config. See §7.2 (libp2p bootstrap) and
-// §7.3 (membership view).
+// operator-supplied bootstrap config. See the design doc (libp2p bootstrap) and
+// the design doc (membership view).
 package members
 
 import (
@@ -45,14 +45,16 @@ type SelfAnnouncement struct {
 // values are replaced. Other annotations on the pod are left untouched.
 //
 // AnnounceSelf requires `pods` `patch` verb on the agent's own
-// namespace; see deploy/serviceaccount.yaml.
+// namespace; see deploy/gantry/serviceaccount.yaml.
 func (m *Manager) AnnounceSelf(ctx context.Context, podName string, ann SelfAnnouncement) error {
 	if podName == "" {
 		return errors.New("members: AnnounceSelf requires podName (set GANTRY_POD_NAME via Downward API)")
 	}
+
 	if m.clientset == nil {
 		return errors.New("members: AnnounceSelf called before clientset wired")
 	}
+
 	ns := m.namespace
 	if ns == "" {
 		return errors.New("members: AnnounceSelf requires Options.Namespace (cluster-wide informer cannot self-patch)")
@@ -64,7 +66,7 @@ func (m *Manager) AnnounceSelf(ctx context.Context, podName string, ann SelfAnno
 		AnnotationTransferAddr: ann.TransferAddr,
 	}
 	// JSON-merge-patch: keys with empty-string values explicitly
-	// overwrite (do NOT use `null` here — that would delete the key,
+	// overwrite (do NOT use `null` here - that would delete the key,
 	// which is also acceptable but less aligned with the other
 	// values being string-typed).
 	patch := map[string]any{
@@ -72,6 +74,7 @@ func (m *Manager) AnnounceSelf(ctx context.Context, podName string, ann SelfAnno
 			"annotations": annotations,
 		},
 	}
+
 	body, err := json.Marshal(patch)
 	if err != nil {
 		return fmt.Errorf("members: marshal self-announce patch: %w", err)
@@ -83,5 +86,6 @@ func (m *Manager) AnnounceSelf(ctx context.Context, podName string, ann SelfAnno
 	if err != nil {
 		return fmt.Errorf("members: patch pod %s/%s annotations: %w", ns, podName, err)
 	}
+
 	return nil
 }

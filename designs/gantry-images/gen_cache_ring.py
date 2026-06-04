@@ -45,7 +45,7 @@ def draw():
     ax.set_aspect("equal")
     ax.axis("off")
 
-    # Cluster boundary — faint dashed circle behind the nodes.
+    # Cluster boundary - faint dashed circle behind the nodes.
     cluster = Circle(
         (0, 0),
         RING_RADIUS + NODE_RADIUS + 0.45,

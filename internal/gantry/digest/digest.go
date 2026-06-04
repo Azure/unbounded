@@ -17,14 +17,14 @@ import (
 
 // Algorithm identifies a digest hash algorithm.
 //
-// v1 supports SHA-256 only — that is what the OCI Distribution API uses for
+// v1 supports SHA-256 only - that is what the OCI Distribution API uses for
 // `blobs/sha256:<hex>` and `manifests/sha256:<hex>` (the only digest-keyed
-// endpoints in the agent's API surface, per architecture.md §API).
+// endpoints in the agent's API surface, per architecture.md the API contract).
 type Algorithm string
 
 const (
 	// SHA256 is the only digest algorithm Gantry accepts (per OCI spec
-	// alignment in §4 of detailed-design.md).
+	// alignment in the design doc of detailed-design.md).
 	SHA256 Algorithm = "sha256"
 )
 
@@ -43,6 +43,7 @@ func Parse(s string) (Digest, error) {
 	if colon <= 0 || colon == len(s)-1 {
 		return Digest{}, fmt.Errorf("digest: malformed %q (expected algo:hex)", s)
 	}
+
 	algo := Algorithm(s[:colon])
 	hexPart := s[colon+1:]
 
@@ -58,7 +59,7 @@ func Parse(s string) (Digest, error) {
 	if _, err := hex.DecodeString(hexPart); err != nil {
 		return Digest{}, fmt.Errorf("digest: invalid hex: %w", err)
 	}
-	// Reject uppercase hex — OCI canonicalizes on lower-case.
+	// Reject uppercase hex - OCI canonicalizes on lower-case.
 	if strings.ToLower(hexPart) != hexPart {
 		return Digest{}, errors.New("digest: hex must be lower-case")
 	}
@@ -73,6 +74,7 @@ func MustParse(s string) Digest {
 	if err != nil {
 		panic(err)
 	}
+
 	return d
 }
 
@@ -87,6 +89,7 @@ func (d Digest) String() string {
 	if d.algo == "" {
 		return ""
 	}
+
 	return string(d.algo) + ":" + d.hex
 }
 

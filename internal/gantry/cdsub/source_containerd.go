@@ -7,24 +7,24 @@
 //
 // Wire-up:
 //
-//   - Connects to the host's containerd over a UNIX socket (default
-//     /run/containerd/containerd.sock). Pinned to a single containerd
-//     namespace at construction (default "k8s.io" — the namespace
-//     kubelet uses for pod containers).
+// - Connects to the host's containerd over a UNIX socket (default
+// /run/containerd/containerd.sock). Pinned to a single containerd
+// namespace at construction (default "k8s.io" - the namespace
+// kubelet uses for pod containers).
 //
-//   - List(ctx) walks every image in the namespace and resolves each
-//     image's full blob set (manifest + config + layers; for image
-//     indexes, every per-platform manifest's blobs) from the local
-//     content store via images.Walk + images.Children.
+// - List(ctx) walks every image in the namespace and resolves each
+// image's full blob set (manifest + config + layers; for image
+// indexes, every per-platform manifest's blobs) from the local
+// content store via images.Walk + images.Children.
 //
-//   - Subscribe(ctx) subscribes to "/images/create" and "/images/update"
-//     topics and emits one ImageEvent per containerd event with the
-//     resolved blob set. Image-delete events are translated to
-//     EventDelete with the image's *current* manifest target only —
-//     containerd has already pruned the content store by the time the
-//     event fires, so we can't walk children, but the manifest digest
-//     is still useful for cdsub instrumentation and (future) explicit
-//     DHT un-Provide.
+// - Subscribe(ctx) subscribes to "/images/create" and "/images/update"
+// topics and emits one ImageEvent per containerd event with the
+// resolved blob set. Image-delete events are translated to
+// EventDelete with the image's *current* manifest target only -
+// containerd has already pruned the content store by the time the
+// event fires, so we can't walk children, but the manifest digest
+// is still useful for cdsub instrumentation and (future) explicit
+// DHT un-Provide.
 //
 // Build-tag gated to linux so darwin/dev hosts compile without the
 // containerd client (which only links cleanly on linux due to ttrpc +
@@ -71,7 +71,7 @@ type ContainerdSource struct {
 
 	// mediaTypeRecorder is an optional callback invoked for every
 	// descriptor visited during List/Subscribe walks. The walker
-	// already has the (digest, mediaType) pair in hand — handing it
+	// already has the (digest, mediaType) pair in hand - handing it
 	// to containerdstore lets the transfer endpoint serve manifest
 	// requests with the correct Content-Type without re-parsing
 	// JSON. nil is a no-op.
@@ -106,9 +106,11 @@ func NewContainerdSource(socket, namespace string, opts ...ContainerdSourceOptio
 	if socket == "" {
 		socket = DefaultContainerdSocket
 	}
+
 	if namespace == "" {
 		namespace = DefaultContainerdNamespace
 	}
+
 	s := &ContainerdSource{
 		namespace:      namespace,
 		logger:         slog.Default().With(slog.String("subsystem", "cdsub.containerd")),
@@ -123,6 +125,7 @@ func NewContainerdSource(socket, namespace string, opts ...ContainerdSourceOptio
 	// socket doesn't stall startup forever.
 	dialCtx, cancel := context.WithTimeout(context.Background(), s.connectTimeout)
 	defer cancel()
+
 	c, err := containerd.New(socket,
 		containerd.WithDefaultNamespace(namespace),
 		containerd.WithTimeout(s.connectTimeout),
@@ -135,11 +138,13 @@ func NewContainerdSource(socket, namespace string, opts ...ContainerdSourceOptio
 		_ = c.Close() //nolint:errcheck // best-effort close
 		return nil, fmt.Errorf("cdsub: containerd Version() probe: %w", err)
 	}
+
 	s.client = c
 	s.logger.Info("connected to containerd",
 		slog.String("socket", socket),
 		slog.String("namespace", namespace),
 	)
+
 	return s, nil
 }
 
@@ -148,6 +153,7 @@ func (s *ContainerdSource) Close() error {
 	if s == nil || s.client == nil {
 		return nil
 	}
+
 	return s.client.Close()
 }
 
@@ -159,6 +165,7 @@ func (s *ContainerdSource) ContentStore() content.Store {
 	if s == nil || s.client == nil {
 		return nil
 	}
+
 	return s.client.ContentStore()
 }
 
@@ -169,6 +176,7 @@ func (s *ContainerdSource) Namespace() string {
 	if s == nil {
 		return ""
 	}
+
 	return s.namespace
 }
 
@@ -180,6 +188,7 @@ func (s *ContainerdSource) LeasesService() leases.Manager {
 	if s == nil || s.client == nil {
 		return nil
 	}
+
 	return s.client.LeasesService()
 }
 
@@ -189,11 +198,12 @@ func (s *ContainerdSource) LeasesService() leases.Manager {
 // endpoint can serve manifest GETs with the correct Content-Type
 // without parsing the body. Safe to call once at startup; subsequent
 // calls overwrite (the source is single-owner per process). Pass nil
-// to disable. Plan §"Descriptor index".
+// to disable. Plan "Descriptor index".
 func (s *ContainerdSource) SetMediaTypeRecorder(fn func(d gdigest.Digest, mediaType string)) {
 	if s == nil {
 		return
 	}
+
 	s.mediaTypeRecorder = fn
 }
 
@@ -215,17 +225,20 @@ func (s *ContainerdSource) List(ctx context.Context) ([]ImageEvent, error) {
 		digests, err := walkBlobsWithRecorder(ctx, s.client.ContentStore(), img.Target(), s.mediaTypeRecorder)
 		if err != nil {
 			// One bad image (e.g. an entry whose manifest the content
-			// store lacks — possible mid-pull or after a content prune)
+			// store lacks - possible mid-pull or after a content prune)
 			// shouldn't fail the whole reconciliation pass.
 			s.logger.Debug("cdsub: walk failed",
 				slog.String("image", img.Name()),
 				slog.Any("err", err),
 			)
+
 			continue
 		}
+
 		if len(digests) == 0 {
 			continue
 		}
+
 		out = append(out, ImageEvent{
 			Kind:     EventCreate,
 			Registry: registryFromImage(img.Name()),
@@ -233,12 +246,13 @@ func (s *ContainerdSource) List(ctx context.Context) ([]ImageEvent, error) {
 			Digests:  digests,
 		})
 	}
+
 	return out, nil
 }
 
 // Subscribe streams ImageEvents for the lifetime of ctx. Implements
 // ImageSource. Closes the returned channel when the underlying
-// containerd subscription errors or ctx is cancelled — the Subscriber
+// containerd subscription errors or ctx is cancelled - the Subscriber
 // reconnect loop then handles backoff + reconciliation.
 func (s *ContainerdSource) Subscribe(ctx context.Context) (<-chan ImageEvent, error) {
 	ctx = namespaces.WithNamespace(ctx, s.namespace)
@@ -257,8 +271,10 @@ func (s *ContainerdSource) Subscribe(ctx context.Context) (<-chan ImageEvent, er
 	)
 
 	out := make(chan ImageEvent, 16)
+
 	go func() {
 		defer close(out)
+
 		for {
 			select {
 			case <-ctx.Done():
@@ -267,25 +283,31 @@ func (s *ContainerdSource) Subscribe(ctx context.Context) (<-chan ImageEvent, er
 				if err != nil && !errors.Is(err, context.Canceled) {
 					s.logger.Debug("cdsub: subscribe stream lost", slog.Any("err", err))
 				}
+
 				return
 			case env, ok := <-eventsCh:
 				if !ok {
 					return
 				}
+
 				if env.Event == nil {
 					continue
 				}
+
 				evt, err := s.decodeEvent(ctx, env.Topic, env.Event)
 				if err != nil {
 					s.logger.Debug("cdsub: decode event failed",
 						slog.String("topic", env.Topic),
 						slog.Any("err", err),
 					)
+
 					continue
 				}
+
 				if evt == nil {
 					continue
 				}
+
 				select {
 				case out <- *evt:
 				case <-ctx.Done():
@@ -294,6 +316,7 @@ func (s *ContainerdSource) Subscribe(ctx context.Context) (<-chan ImageEvent, er
 			}
 		}
 	}()
+
 	return out, nil
 }
 
@@ -305,6 +328,7 @@ func (s *ContainerdSource) decodeEvent(ctx context.Context, topic string, raw ty
 	if err != nil {
 		return nil, err
 	}
+
 	switch e := v.(type) {
 	case *eventstypes.ImageCreate:
 		return s.buildEvent(ctx, EventCreate, e.Name)
@@ -329,6 +353,7 @@ func (s *ContainerdSource) decodeEvent(ctx context.Context, topic string, raw ty
 		if err != nil {
 			return nil, nil //nolint:nilerr // unsupported digest algorithm; safe to skip
 		}
+
 		return &ImageEvent{
 			Kind:    EventDelete,
 			Digests: []gdigest.Digest{dgst},
@@ -351,15 +376,19 @@ func (s *ContainerdSource) buildEvent(ctx context.Context, kind ImageEventKind, 
 			slog.String("image", name),
 			slog.Any("err", err),
 		)
+
 		return nil, nil //nolint:nilerr // benign race
 	}
+
 	digests, err := walkBlobsWithRecorder(ctx, s.client.ContentStore(), img.Target(), s.mediaTypeRecorder)
 	if err != nil {
 		return nil, fmt.Errorf("walk %s: %w", name, err)
 	}
+
 	if len(digests) == 0 {
 		return nil, nil
 	}
+
 	return &ImageEvent{
 		Kind:     kind,
 		Registry: registryFromImage(name),
@@ -378,32 +407,40 @@ func (s *ContainerdSource) buildEvent(ctx context.Context, kind ImageEventKind, 
 //
 // Performance: uses Info-equivalent metadata only; does NOT open
 // readers. Callers should bound concurrency and add jitter when
-// scheduling reconciliation passes — see plan §Phase 2 inventory
+// scheduling reconciliation passes - see inventory
 // performance constraints.
 func (s *ContainerdSource) Inventory(ctx context.Context) ([]gdigest.Digest, error) {
 	if s == nil || s.client == nil {
 		return nil, errors.New("cdsub: containerd source not initialized")
 	}
+
 	ctx = namespaces.WithNamespace(ctx, s.namespace)
 
 	var out []gdigest.Digest
+
 	seen := map[string]struct{}{}
+
 	walkErr := s.client.ContentStore().Walk(ctx, func(info content.Info) error {
 		dgstStr := info.Digest.String()
 		if _, ok := seen[dgstStr]; ok {
 			return nil
 		}
+
 		seen[dgstStr] = struct{}{}
+
 		d, err := gdigest.Parse(dgstStr)
 		if err != nil {
 			return nil //nolint:nilerr // unsupported digest algorithm; skip
 		}
+
 		out = append(out, d)
+
 		return nil
 	})
 	if walkErr != nil {
 		return nil, fmt.Errorf("cdsub: ContentStore.Walk: %w", walkErr)
 	}
+
 	return out, nil
 }
 

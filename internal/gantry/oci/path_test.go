@@ -68,9 +68,11 @@ func TestParseV2Path(t *testing.T) {
 			if ok != tc.wantOK {
 				t.Fatalf("ok = %v; want %v", ok, tc.wantOK)
 			}
+
 			if !ok {
 				return
 			}
+
 			if repo != tc.wantRepo || kind != tc.wantKind || ref != tc.wantRef {
 				t.Errorf("got (%q, %v, %q); want (%q, %v, %q)",
 					repo, kind, ref, tc.wantRepo, tc.wantKind, tc.wantRef)

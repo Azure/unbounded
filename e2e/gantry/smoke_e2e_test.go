@@ -38,7 +38,7 @@ func TestSmoke_DaemonSetBecomesReadyAndPullThrough(t *testing.T) {
 	h := newHarness(t)
 	h.checkPrereqs()
 
-	// 15-minute overall budget — kind boot can take 90 s on a cold
+	// 15-minute overall budget - kind boot can take 90 s on a cold
 	// docker pull, then image build ~30 s, rollout ~30 s, with
 	// generous slack.
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
@@ -79,7 +79,7 @@ func TestSmoke_DaemonSetBecomesReadyAndPullThrough(t *testing.T) {
 // TestE2E_ColdStartDesignatedOriginPuller proves the per-digest cold-start
 // invariant: when multiple nodes request the same image concurrently, every
 // blob in that image is origin-pulled by exactly one node (its HRW rank-0
-// owner) — not by every requester. HRW assignment is per-digest, so with N
+// owner) - not by every requester. HRW assignment is per-digest, so with N
 // workers each blob lands on one of the N nodes; the work distributes across
 // nodes but no digest is fetched twice. The thundering-herd hazard we're
 // guarding against is N nodes all pulling the *same* blob, not the fact
@@ -88,7 +88,7 @@ func TestSmoke_DaemonSetBecomesReadyAndPullThrough(t *testing.T) {
 //   - All nodes start with empty containerd (test image purged).
 //   - Multiple nodes request the same content simultaneously.
 //   - Across all pods, every "please_pull served" digest appears at most
-//     once — no per-digest double-pull.
+//     once - no per-digest double-pull.
 //   - Aggregate origin-pull count is bounded by the per-image blob count
 //     (single image, single fetch per blob), so a runaway thundering herd
 //     would inflate it well past the sanity ceiling.
@@ -142,7 +142,7 @@ func TestE2E_ColdStartDesignatedOriginPuller(t *testing.T) {
 	totalPulls := deltaA + deltaB
 
 	// At least one pod must have pulled. If both are zero, the
-	// please_pull dispatch never reached the puller pump — either
+	// please_pull dispatch never reached the puller pump - either
 	// coord broke or the test image was somehow already cached.
 	if totalPulls == 0 {
 		h.dumpDiagnostics(ctx)
@@ -151,7 +151,7 @@ func TestE2E_ColdStartDesignatedOriginPuller(t *testing.T) {
 	}
 
 	// Sanity ceiling: agnhost has ~13 blobs. A single cluster-wide
-	// pull-each-blob-once should land around that number — generous
+	// pull-each-blob-once should land around that number - generous
 	// upper bound of 20 absorbs retries. Anything above means we
 	// double-pulled at least one digest, which is the exact failure
 	// mode HRW per-digest is supposed to prevent.
@@ -161,7 +161,7 @@ func TestE2E_ColdStartDesignatedOriginPuller(t *testing.T) {
 			totalPulls, deltaA, deltaB)
 	}
 
-	// Cross-pod per-digest uniqueness — the real invariant. Extract
+	// Cross-pod per-digest uniqueness - the real invariant. Extract
 	// every "please_pull served" log digest from both pods and assert
 	// no digest appears in both pods' logs. If HRW is honoured each
 	// digest will appear in exactly one pod's log; if HRW failed for
@@ -171,7 +171,7 @@ func TestE2E_ColdStartDesignatedOriginPuller(t *testing.T) {
 	servedB := h.pleasePullServedDigests(ctx, gantryB, 500)
 	if total := len(servedA) + len(servedB); total == 0 {
 		h.dumpDiagnostics(ctx)
-		t.Fatalf("origin pulls observed (A=%.0f B=%.0f) but no 'please_pull served' log lines on either pod — metric and log disagree",
+		t.Fatalf("origin pulls observed (A=%.0f B=%.0f) but no 'please_pull served' log lines on either pod - metric and log disagree",
 			deltaA, deltaB)
 	}
 	var duplicated []string
@@ -258,7 +258,7 @@ func TestE2E_EvictionRecovery(t *testing.T) {
 
 	// Assert: the evicted node's 404s were classified into the new
 	// "notfound" outcome bucket, not silently dropped. Generic
-	// outcome="error" is no longer the carrier — see internal/mirror
+	// outcome="error" is no longer the carrier - see internal/mirror
 	// peerFetchOutcome split (notfound/unavailable/server_error/
 	// protocol_error/digest_mismatch). At least one digest must have
 	// taken the peer-then-stale path or the stale provider was never

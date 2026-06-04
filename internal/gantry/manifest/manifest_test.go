@@ -97,6 +97,7 @@ func TestChildDigests_OCIManifest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ChildDigests: %v", err)
 	}
+
 	want := []digest.Digest{
 		digest.MustParse("sha256:1111111111111111111111111111111111111111111111111111111111111111"),
 		digest.MustParse("sha256:2222222222222222222222222222222222222222222222222222222222222222"),
@@ -105,6 +106,7 @@ func TestChildDigests_OCIManifest(t *testing.T) {
 	if len(got) != len(want) {
 		t.Fatalf("count: got %d want %d (%v)", len(got), len(want), got)
 	}
+
 	for i, d := range want {
 		if got[i].String() != d.String() {
 			t.Fatalf("digest[%d]: got %s want %s", i, got[i], d)
@@ -117,6 +119,7 @@ func TestChildDigests_DockerManifest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ChildDigests: %v", err)
 	}
+
 	want := []string{
 		"sha256:4444444444444444444444444444444444444444444444444444444444444444",
 		"sha256:5555555555555555555555555555555555555555555555555555555555555555",
@@ -124,6 +127,7 @@ func TestChildDigests_DockerManifest(t *testing.T) {
 	if len(got) != len(want) {
 		t.Fatalf("count: got %d want %d", len(got), len(want))
 	}
+
 	for i, d := range want {
 		if got[i].String() != d {
 			t.Fatalf("digest[%d]: got %s want %s", i, got[i], d)
@@ -136,9 +140,11 @@ func TestChildDigests_ImageIndexReturnsEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ChildDigests: %v", err)
 	}
+
 	if len(got) != 0 {
 		t.Fatalf("image index should produce 0 digests, got %v", got)
 	}
+
 	if !manifest.IsImageIndex([]byte(ociImageIndex)) {
 		t.Fatalf("IsImageIndex returned false on image index")
 	}
@@ -149,6 +155,7 @@ func TestChildDigests_SkipsForeignLayers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ChildDigests: %v", err)
 	}
+
 	want := []string{
 		"sha256:8888888888888888888888888888888888888888888888888888888888888888",
 		// Foreign layer (sha256:9999...) skipped because of urls[].
@@ -157,6 +164,7 @@ func TestChildDigests_SkipsForeignLayers(t *testing.T) {
 	if len(got) != len(want) {
 		t.Fatalf("count: got %d want %d (%v)", len(got), len(want), got)
 	}
+
 	for i, d := range want {
 		if got[i].String() != d {
 			t.Fatalf("digest[%d]: got %s want %s", i, got[i], d)
@@ -188,6 +196,7 @@ func TestChildDigests_MalformedInnerDigestSkipped(t *testing.T) {
     {"mediaType": "x", "digest": "also-bad", "size": 1}
   ]
 }`
+
 	got, err := manifest.ChildDigests([]byte(body))
 	if err != nil {
 		t.Fatalf("ChildDigests: %v", err)
@@ -196,19 +205,20 @@ func TestChildDigests_MalformedInnerDigestSkipped(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("expected 1 digest, got %d (%v)", len(got), got)
 	}
+
 	if got[0].String() != "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" {
 		t.Fatalf("got %s", got[0])
 	}
 }
 
 // TestTypedChildren_TagsConfigAsKindConfigAndLayersAsKindBlob is the
-// load-bearing invariant for the tenth-review observability fix: the
+// load-bearing invariant for the observability fix: the
 // image-config blob MUST be tagged ifaces.KindConfig so the
 // p2p_origin_pull_total{kind="config"} bucket actually counts when
 // the prefetch path drives PleasePull/StartLocalPull through
 // PrefetchChildren. Layers stay as ifaces.KindBlob because the OCI
 // URL family is /blobs/ for both, and downstream pullers don't need
-// to distinguish — only the metric label does.
+// to distinguish - only the metric label does.
 func TestTypedChildren_TagsConfigAsKindConfigAndLayersAsKindBlob(t *testing.T) {
 	t.Parallel()
 
@@ -220,12 +230,15 @@ func TestTypedChildren_TagsConfigAsKindConfigAndLayersAsKindBlob(t *testing.T) {
 	if len(got) != 3 {
 		t.Fatalf("got %d typed children, want 3 (%v)", len(got), got)
 	}
+
 	if got[0].Digest.String() != "sha256:1111111111111111111111111111111111111111111111111111111111111111" {
 		t.Fatalf("config digest mismatch: %s", got[0].Digest)
 	}
+
 	if got[0].Kind != ifaces.KindConfig {
 		t.Fatalf("config kind = %v, want KindConfig", got[0].Kind)
 	}
+
 	for i, c := range got[1:] {
 		if c.Kind != ifaces.KindBlob {
 			t.Errorf("layer[%d] kind = %v, want KindBlob", i, c.Kind)
@@ -245,12 +258,15 @@ func TestTypedChildren_DockerManifestSameKindingAsOCI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("TypedChildren: %v", err)
 	}
+
 	if len(got) != 2 {
 		t.Fatalf("got %d, want 2", len(got))
 	}
+
 	if got[0].Kind != ifaces.KindConfig {
 		t.Fatalf("docker config kind = %v, want KindConfig", got[0].Kind)
 	}
+
 	if got[1].Kind != ifaces.KindBlob {
 		t.Fatalf("docker layer kind = %v, want KindBlob", got[1].Kind)
 	}
@@ -266,6 +282,7 @@ func TestTypedChildren_ImageIndexReturnsNil(t *testing.T) {
 	if err != nil {
 		t.Fatalf("TypedChildren: %v", err)
 	}
+
 	if got != nil {
 		t.Fatalf("image index: got %v, want nil", got)
 	}
@@ -274,7 +291,7 @@ func TestTypedChildren_ImageIndexReturnsNil(t *testing.T) {
 // TestChildDigests_MatchesTypedChildren proves the back-compat path
 // is byte-equivalent in ordering and content with the new typed API.
 // If either drifts, both callers (pre-Kind PrefetchLayers and the
-// new PrefetchChildren) would see inconsistent prefetch sets — this
+// new PrefetchChildren) would see inconsistent prefetch sets - this
 // guards against that regression.
 func TestChildDigests_MatchesTypedChildren(t *testing.T) {
 	t.Parallel()
@@ -283,13 +300,16 @@ func TestChildDigests_MatchesTypedChildren(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ChildDigests: %v", err)
 	}
+
 	typed, err := manifest.TypedChildren([]byte(ociImageManifest))
 	if err != nil {
 		t.Fatalf("TypedChildren: %v", err)
 	}
+
 	if len(flat) != len(typed) {
 		t.Fatalf("length mismatch: flat=%d typed=%d", len(flat), len(typed))
 	}
+
 	for i := range flat {
 		if flat[i] != typed[i].Digest {
 			t.Errorf("index %d: flat=%s typed=%s", i, flat[i], typed[i].Digest)

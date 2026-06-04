@@ -13,12 +13,15 @@ import (
 
 func TestNew_JSON(t *testing.T) {
 	var buf bytes.Buffer
+
 	l := New(&buf, "info", "json")
 	l.Info("hello", slog.String("k", "v"))
+
 	var rec map[string]any
 	if err := json.Unmarshal(buf.Bytes(), &rec); err != nil {
 		t.Fatalf("unmarshal: %v\nraw: %s", err, buf.String())
 	}
+
 	if rec["msg"] != "hello" || rec["k"] != "v" {
 		t.Errorf("rec = %v", rec)
 	}
@@ -26,8 +29,10 @@ func TestNew_JSON(t *testing.T) {
 
 func TestNew_Text(t *testing.T) {
 	var buf bytes.Buffer
+
 	l := New(&buf, "info", "text")
 	l.Info("hello")
+
 	out := buf.String()
 	if !strings.Contains(out, "msg=hello") {
 		t.Errorf("text output missing msg: %q", out)
@@ -36,12 +41,15 @@ func TestNew_Text(t *testing.T) {
 
 func TestSubsystemTag(t *testing.T) {
 	var buf bytes.Buffer
+
 	l := Subsystem(New(&buf, "info", "json"), "cache")
 	l.Info("evicted")
+
 	var rec map[string]any
 	if err := json.Unmarshal(buf.Bytes(), &rec); err != nil {
 		t.Fatal(err)
 	}
+
 	if rec["subsystem"] != "cache" {
 		t.Errorf("subsystem = %v, want cache", rec["subsystem"])
 	}

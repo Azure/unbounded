@@ -6,26 +6,26 @@
 //
 // Design choices:
 //
-//   - The containerd RPC client is heavy and platform-bound (Linux + a
-//     containerd socket on the node). To keep the announce-loop testable
-//     on darwin/CI without a real containerd, the package depends on a
-//     small ImageSource interface. The concrete containerd implementation
-//     lives in internal/cdsub/source_containerd.go behind a Linux build
-//     tag. Tests in this file exercise the loop against a fake source.
+// - The containerd RPC client is heavy and platform-bound (Linux + a
+// containerd socket on the node). To keep the announce-loop testable
+// on darwin/CI without a real containerd, the package depends on a
+// small ImageSource interface. The concrete containerd implementation
+// lives in internal/cdsub/source_containerd.go behind a Linux build
+// tag. Tests in this file exercise the loop against a fake source.
 //
-//   - In containerd mode, callers wire WithNotifier to route every
-//     Image/Create, Image/Update, and content-delete digest into the
-//     advertiser. The advertiser owns the DHT announced set, verifies
-//     local serveability, and performs best-effort Withdraw.
+// - In containerd mode, callers wire WithNotifier to route every
+// Image/Create, Image/Update, and content-delete digest into the
+// advertiser. The advertiser owns the DHT announced set, verifies
+// local serveability, and performs best-effort Withdraw.
 //
-//   - When no notifier is supplied, cdsub preserves the older direct
-//     dht.Provide path for tests and legacy experiments. Delete events
-//     remain a no-op in that compatibility mode.
+// - When no notifier is supplied, cdsub preserves the older direct
+// dht.Provide path for tests and legacy experiments. Delete events
+// remain a no-op in that compatibility mode.
 //
-//   - Exponential-backoff reconnect with the §7.3 cap (max 30 s). On
-//     every successful reconnect the loop calls ImageSource.List(ctx)
-//     and re-Provides every digest, closing the window where in-flight
-//     events were missed during the disconnect.
+// - Exponential-backoff reconnect with the cap (max 30 s). On
+// every successful reconnect the loop calls ImageSource.List(ctx)
+// and re-Provides every digest, closing the window where in-flight
+// events were missed during the disconnect.
 package cdsub
 
 import (
@@ -44,11 +44,11 @@ import (
 type ImageEventKind int
 
 const (
-	// EventCreate is an Image/Create — a new image landed.
+	// EventCreate is an Image/Create - a new image landed.
 	EventCreate ImageEventKind = iota
-	// EventUpdate is an Image/Update — an existing image's target changed.
+	// EventUpdate is an Image/Update - an existing image's target changed.
 	EventUpdate
-	// EventDelete is an Image/Delete — image removed.
+	// EventDelete is an Image/Delete - image removed.
 	EventDelete
 )
 
@@ -70,13 +70,13 @@ type ImageSource interface {
 	List(ctx context.Context) ([]ImageEvent, error)
 
 	// Subscribe streams ImageEvents for the lifetime of the returned
-	// context. Closing the channel signals "disconnected — caller should
+	// context. Closing the channel signals "disconnected - caller should
 	// reconnect after backoff". Subscribe MUST exit cleanly when ctx is
 	// cancelled.
 	Subscribe(ctx context.Context) (<-chan ImageEvent, error)
 }
 
-// Subscriber walks the announce loop: List → Subscribe → reconnect on error.
+// Subscriber walks the announce loop: List -> Subscribe -> reconnect on error.
 type Subscriber struct {
 	src    ImageSource
 	dht    ifaces.DHT
@@ -127,6 +127,7 @@ func WithBackoff(initial, maxBackoff time.Duration) Option {
 		if initial > 0 {
 			s.backoffInitial = initial
 		}
+
 		if maxBackoff > 0 {
 			s.backoffMax = maxBackoff
 		}
@@ -153,7 +154,7 @@ func WithNotifier(fn func(ctx context.Context, d digest.Digest, present bool)) O
 	}
 }
 
-// New builds a Subscriber. Run() drives the loop until ctx is cancelled.
+// New builds a Subscriber. Run drives the loop until ctx is cancelled.
 // dht may be nil when WithNotifier is supplied.
 func New(src ImageSource, dht ifaces.DHT, opts ...Option) *Subscriber {
 	s := &Subscriber{
@@ -168,17 +169,19 @@ func New(src ImageSource, dht ifaces.DHT, opts ...Option) *Subscriber {
 	for _, opt := range opts {
 		opt(s)
 	}
+
 	return s
 }
 
 // Run blocks until ctx is cancelled. On each iteration:
 //
-//  1. Run reconciliation: List() → notify/provide every digest.
-//  2. Subscribe() and process events as they arrive.
-//  3. On Subscribe error, channel close, or any non-context error,
-//     sleep with jittered exponential backoff and retry.
+// 1. Run reconciliation: List -> notify/provide every digest.
+// 2. Subscribe and process events as they arrive.
+// 3. On Subscribe error, channel close, or any non-context error,
+// sleep with jittered exponential backoff and retry.
 func (s *Subscriber) Run(ctx context.Context) error {
 	backoff := s.backoffInitial
+
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -188,12 +191,13 @@ func (s *Subscriber) Run(ctx context.Context) error {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return err
 			}
+
 			s.logger.Warn("cdsub: stream lost, backing off",
 				slog.Duration("backoff", backoff),
 				slog.Any("err", err),
 			)
 		} else {
-			// Channel closed without error → just reconnect with reset backoff.
+			// Channel closed without error -> just reconnect with reset backoff.
 			backoff = s.backoffInitial
 			continue
 		}
@@ -224,6 +228,7 @@ func (s *Subscriber) runOnce(ctx context.Context) error {
 	} else {
 		return err
 	}
+
 	if s.metrics.onReconnect != nil {
 		s.metrics.onReconnect()
 	}
@@ -243,6 +248,7 @@ func (s *Subscriber) runOnce(ctx context.Context) error {
 			if !ok {
 				return nil
 			}
+
 			s.handle(ctx, ev)
 		}
 	}
@@ -253,6 +259,7 @@ func (s *Subscriber) runOnce(ctx context.Context) error {
 // or compatibility DHT provider path, then bumps the reconcile metric.
 func (s *Subscriber) reconcile(ctx context.Context, events []ImageEvent) {
 	count := 0
+
 	for _, ev := range events {
 		for _, d := range ev.Digests {
 			if s.announce(ctx, d, true) {
@@ -260,9 +267,11 @@ func (s *Subscriber) reconcile(ctx context.Context, events []ImageEvent) {
 			}
 		}
 	}
+
 	if s.metrics.onReconcile != nil {
 		s.metrics.onReconcile(count)
 	}
+
 	s.logger.Info("cdsub: reconcile complete", slog.Int("digests", count))
 }
 
@@ -282,17 +291,22 @@ func (s *Subscriber) handle(ctx context.Context, ev ImageEvent) {
 func (s *Subscriber) announce(ctx context.Context, d digest.Digest, present bool) bool {
 	if s.notify != nil {
 		s.notify(ctx, d, present)
+
 		if s.metrics.onAnnounce != nil {
 			s.metrics.onAnnounce()
 		}
+
 		return true
 	}
+
 	if present {
 		return s.provide(ctx, d)
 	}
+
 	s.logger.Debug("cdsub: image deleted; no notifier wired, relying on DHT TTL expiry",
 		slog.String("digest", d.String()),
 	)
+
 	return false
 }
 
@@ -302,24 +316,32 @@ func (s *Subscriber) provide(ctx context.Context, d digest.Digest) bool {
 		if s.metrics.onAnnounceError != nil {
 			s.metrics.onAnnounceError()
 		}
+
 		s.logger.Debug("cdsub: no DHT provider wired", slog.String("digest", d.String()))
+
 		return false
 	}
+
 	pctx, cancel := context.WithTimeout(ctx, s.provideTimeout)
 	defer cancel()
+
 	if err := s.dht.Provide(pctx, d); err != nil {
 		if s.metrics.onAnnounceError != nil {
 			s.metrics.onAnnounceError()
 		}
+
 		s.logger.Debug("cdsub: provide failed",
 			slog.String("digest", d.String()),
 			slog.Any("err", err),
 		)
+
 		return false
 	}
+
 	if s.metrics.onAnnounce != nil {
 		s.metrics.onAnnounce()
 	}
+
 	return true
 }
 
@@ -328,10 +350,13 @@ func jitter(d time.Duration) time.Duration {
 	if d <= 0 {
 		return 0
 	}
+
 	span := int64(d) / 2
 	if span <= 0 {
 		return d
 	}
+
 	delta := rand.Int64N(span) - span/2 //nolint:gosec // jitter, not crypto
+
 	return d + time.Duration(delta)
 }

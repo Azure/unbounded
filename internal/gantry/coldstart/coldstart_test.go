@@ -40,26 +40,31 @@ type stubCoord struct {
 func (s *stubCoord) PullIntentQuery(_ context.Context, id ifaces.NodeID, _ digest.Digest) (ifaces.PullIntent, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	s.intentCalls++
 	if err, ok := s.intentErrs[id]; ok {
 		return ifaces.PullIntent{}, err
 	}
+
 	return s.intents[id], nil
 }
 
 func (s *stubCoord) PleasePull(_ context.Context, id ifaces.NodeID, registry, repository string, kind ifaces.OriginRefKind, ds []digest.Digest) ([]ifaces.PleasePullOutcome, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	s.pleasePullCalls = append(s.pleasePullCalls, id)
 	s.pleasePullRegs = append(s.pleasePullRegs, registry)
 	s.pleasePullRepos = append(s.pleasePullRepos, repository)
 	s.pleasePullKinds = append(s.pleasePullKinds, kind)
 	// Copy ds so the caller can reuse the slice without aliasing.
 	dsCopy := append([]digest.Digest(nil), ds...)
+
 	s.pleasePullDgs = append(s.pleasePullDgs, dsCopy)
 	if err, ok := s.pleasePullErrs[id]; ok {
 		return nil, err
 	}
+
 	out := make([]ifaces.PleasePullOutcome, len(ds))
 	for i, d := range ds {
 		if perNode, ok := s.pleasePullOutcomes[id]; ok {
@@ -68,8 +73,10 @@ func (s *stubCoord) PleasePull(_ context.Context, id ifaces.NodeID, registry, re
 				continue
 			}
 		}
+
 		out[i] = ifaces.PleasePullOutcome{Digest: d, Outcome: ifaces.PleasePullStarted}
 	}
+
 	return out, nil
 }
 
@@ -86,14 +93,18 @@ type stubDisco struct {
 func (s *stubDisco) FindProviders(_ context.Context, _ digest.Digest) ([]ifaces.Provider, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	if s.idx >= len(s.providers) {
 		if len(s.providers) == 0 {
 			return nil, nil
 		}
+
 		return s.providers[len(s.providers)-1], nil
 	}
+
 	out := s.providers[s.idx]
 	s.idx++
+
 	return out, nil
 }
 
@@ -101,6 +112,7 @@ func (s *stubDisco) Health() float64 {
 	if s.health == 0 {
 		return 1.0
 	}
+
 	return s.health
 }
 
@@ -108,8 +120,10 @@ func (s *stubDisco) Health() float64 {
 // 4-node cluster (n0, n1, n2, n3) with self=n3 by default.
 func buildResolver(t *testing.T, coord ifaces.Coordinator, disco coldstart.Discovery, self ifaces.NodeID, members []ifaces.Node, metrics coldstart.MetricsHooks, now func() time.Time) *coldstart.Resolver {
 	t.Helper()
+
 	mems := fakes.NewMembers(self, members...)
 	infl := inflight.New(inflight.DefaultStalls(), now)
+
 	return coldstart.New(coldstart.Options{
 		Members:   mems,
 		Discovery: disco,
@@ -148,6 +162,7 @@ func TestRule2_CacheHit(t *testing.T) {
 	if len(top) == 0 {
 		t.Fatal("top-K empty")
 	}
+
 	cacheHolder := top[0].Node.ID
 
 	coord := &stubCoord{intents: map[ifaces.NodeID]ifaces.PullIntent{
@@ -159,7 +174,9 @@ func TestRule2_CacheHit(t *testing.T) {
 		OnTopKProbeHit:  func() { hits++ },
 		OnDhtFalseEmpty: func() { /* counted via local int below */ },
 	}
+
 	var falseEmptyHits int
+
 	metrics.OnDhtFalseEmpty = func() { falseEmptyHits++ }
 
 	r := buildResolver(t, coord, disco, "self", nodes, metrics, time.Now)
@@ -168,15 +185,19 @@ func TestRule2_CacheHit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
+
 	if len(res.Providers) == 0 {
 		t.Fatal("Providers empty")
 	}
+
 	if res.Providers[0].NodeID != cacheHolder {
 		t.Errorf("first provider = %s; want %s", res.Providers[0].NodeID, cacheHolder)
 	}
+
 	if hits != 1 {
 		t.Errorf("OnTopKProbeHit calls = %d; want 1", hits)
 	}
+
 	if falseEmptyHits != 1 {
 		t.Errorf("OnDhtFalseEmpty calls = %d; want 1", falseEmptyHits)
 	}
@@ -185,6 +206,7 @@ func TestRule2_CacheHit(t *testing.T) {
 func TestRule1_FailureShortCircuitBeatsCacheHit(t *testing.T) {
 	d := digest.MustParse("sha256:" + rep('b', 64))
 	nodes := clusterNodes()
+
 	top := hrw.TopK(nodes, d, 3)
 	if len(top) < 2 {
 		t.Fatal("need at least 2 nodes in top-K")
@@ -205,7 +227,7 @@ func TestRule1_FailureShortCircuitBeatsCacheHit(t *testing.T) {
 	}
 }
 
-// TestRule1_ClusterWideTrustedClasses covers §5.8's requester rule:
+// TestRule1_ClusterWideTrustedClasses covers the design doc's requester rule:
 // auth / not_found / rate_limited are trusted cluster-wide, so a
 // single reachable node reporting any of them must short-circuit the
 // cascade. Transient is handled separately by rule 4 (TestRule4_*).
@@ -265,6 +287,7 @@ func TestRule3_InFlightThenDhtProvider(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
+
 	if len(res.Providers) != 1 || res.Providers[0].NodeID != "pulled-by" {
 		t.Errorf("Providers = %+v; want single 'pulled-by'", res.Providers)
 	}
@@ -275,7 +298,7 @@ func TestRule3_InFlightStaleExcluded(t *testing.T) {
 	nodes := clusterNodes()
 	top := hrw.TopK(nodes, d, 3)
 
-	// Manifest stall threshold = 5s. Report in-flight 10s ago — too
+	// Manifest stall threshold = 5s. Report in-flight 10s ago - too
 	// stale; should NOT trigger rule 3 (would fall through to rule 7).
 	now := time.Now()
 	coord := &stubCoord{intents: map[ifaces.NodeID]ifaces.PullIntent{
@@ -292,9 +315,10 @@ func TestRule3_InFlightStaleExcluded(t *testing.T) {
 		providers: [][]ifaces.Provider{nil, {{NodeID: "x", Addr: "x:5001"}}},
 	}
 
-	// §5.6: the stale puller exclusion must fire the takeover metric so
-	// operators can observe rank-0 → rank-1 routing.
+	// the design doc: the stale puller exclusion must fire the takeover metric so
+	// operators can observe rank-0 -> rank-1 routing.
 	var takeoverKinds []string
+
 	hooks := coldstart.MetricsHooks{
 		OnDesignatedPullerTakeover: func(kindLabel string) {
 			takeoverKinds = append(takeoverKinds, kindLabel)
@@ -304,20 +328,24 @@ func TestRule3_InFlightStaleExcluded(t *testing.T) {
 
 	res, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0)
 	// Healthy DHT + all-neither must fire rule 7 cold-start at top-K
-	// without an expansion pass (§5.2 rule 7). The DHT poll returns
+	// without an expansion pass (the design doc rule 7). The DHT poll returns
 	// "x:5001" on the second FindProviders call.
 	if err != nil {
 		t.Fatalf("Resolve: %v (want success via rule 7 cold-start)", err)
 	}
+
 	if len(res.Providers) != 1 || res.Providers[0].Addr != "x:5001" {
 		t.Fatalf("Providers = %+v; want single x:5001 from DHT poll", res.Providers)
 	}
+
 	if len(coord.pleasePullCalls) != 1 {
 		t.Fatalf("please_pull dialed %d times; want 1", len(coord.pleasePullCalls))
 	}
+
 	if len(takeoverKinds) == 0 {
 		t.Fatalf("OnDesignatedPullerTakeover never fired; want at least one (manifest)")
 	}
+
 	for _, k := range takeoverKinds {
 		if k != "manifest" {
 			t.Errorf("OnDesignatedPullerTakeover kind = %q; want \"manifest\"", k)
@@ -343,7 +371,7 @@ func TestRule4_TransientCooldown(t *testing.T) {
 	}
 }
 
-// TestRule4_HonorWindowSuppressesReprobe asserts §5.8: once the
+// TestRule4_HonorWindowSuppressesReprobe asserts the design doc: once the
 // requester has observed a transient cooldown for a digest, the
 // next Resolve within the honor window short-circuits without
 // hitting any top-K node (i.e., no probe traffic).
@@ -364,18 +392,20 @@ func TestRule4_HonorWindowSuppressesReprobe(t *testing.T) {
 	if _, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0); !errors.Is(err, coldstart.ErrCooldownActive) {
 		t.Fatalf("first Resolve err = %v; want ErrCooldownActive", err)
 	}
+
 	firstCalls := coord.intentCalls
 	if firstCalls == 0 {
 		t.Fatalf("expected probe traffic on first Resolve, got 0 intent calls")
 	}
 
-	// Advance the clock a tick — still well inside the honor window.
+	// Advance the clock a tick - still well inside the honor window.
 	clock = clock.Add(1 * time.Second)
 
 	// Second call: must short-circuit without re-probing.
 	if _, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0); !errors.Is(err, coldstart.ErrCooldownActive) {
 		t.Fatalf("second Resolve err = %v; want ErrCooldownActive", err)
 	}
+
 	if coord.intentCalls != firstCalls {
 		t.Fatalf("honor window did not suppress probe: intent calls went %d -> %d", firstCalls, coord.intentCalls)
 	}
@@ -402,6 +432,7 @@ func TestRule4_HonorWindowExpires(t *testing.T) {
 	if _, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0); !errors.Is(err, coldstart.ErrCooldownActive) {
 		t.Fatalf("first Resolve err = %v; want ErrCooldownActive", err)
 	}
+
 	firstCalls := coord.intentCalls
 
 	// Advance past the honor window (puller's 20s).
@@ -410,6 +441,7 @@ func TestRule4_HonorWindowExpires(t *testing.T) {
 	if _, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0); !errors.Is(err, coldstart.ErrCooldownActive) {
 		t.Fatalf("second Resolve err = %v; want ErrCooldownActive (puller still reports transient)", err)
 	}
+
 	if coord.intentCalls == firstCalls {
 		t.Fatalf("expected re-probe after honor window expired; intent calls still %d", coord.intentCalls)
 	}
@@ -435,15 +467,17 @@ func TestRule4_HonorWindowCapEnforced(t *testing.T) {
 	if _, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0); !errors.Is(err, coldstart.ErrCooldownActive) {
 		t.Fatalf("first Resolve err = %v; want ErrCooldownActive", err)
 	}
+
 	firstCalls := coord.intentCalls
 
 	// Advance past the 30s cap but well inside the puller's 10min
-	// cooldown — the cap should let the requester re-probe.
+	// cooldown - the cap should let the requester re-probe.
 	clock = clock.Add(31 * time.Second)
 
 	if _, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0); !errors.Is(err, coldstart.ErrCooldownActive) {
 		t.Fatalf("second Resolve err = %v; want ErrCooldownActive (puller still reports transient)", err)
 	}
+
 	if coord.intentCalls == firstCalls {
 		t.Fatalf("cap not enforced: requester remained suppressed past TransientCooldownCap")
 	}
@@ -461,11 +495,12 @@ func TestRule7_DegradedDhtExpansionThenColdStart(t *testing.T) {
 		{ID: "n6", Addr: "n6:5001"},
 		{ID: "n7", Addr: "n7:5001"},
 	}
-	// All nodes report "no cache, not in-flight" → rule 7.
+	// All nodes report "no cache, not in-flight" -> rule 7.
 	intents := map[ifaces.NodeID]ifaces.PullIntent{}
 	for _, n := range nodes {
 		intents[n.ID] = ifaces.PullIntent{}
 	}
+
 	coord := &stubCoord{intents: intents}
 	// DHT degraded so rule 6 expansion fires; then poll discovers the
 	// provider after please_pull is sent.
@@ -479,22 +514,26 @@ func TestRule7_DegradedDhtExpansionThenColdStart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
+
 	if len(res.Providers) != 1 || res.Providers[0].NodeID != "the-puller" {
 		t.Errorf("Providers = %+v; want single 'the-puller'", res.Providers)
 	}
+
 	if len(coord.pleasePullCalls) != 1 {
 		t.Errorf("pleasePullCalls = %d; want 1", len(coord.pleasePullCalls))
 	}
+
 	if len(coord.pleasePullRegs) != 1 || coord.pleasePullRegs[0] != "reg.example.com" {
 		t.Errorf("pleasePullRegs = %v; want [reg.example.com]", coord.pleasePullRegs)
 	}
+
 	if len(coord.pleasePullRepos) != 1 || coord.pleasePullRepos[0] != "test/repo" {
 		t.Errorf("pleasePullRepos = %v; want [test/repo]", coord.pleasePullRepos)
 	}
 }
 
 // Rule 7 must refuse to send please_pull with empty registry/repository
-// per §4.4 (single-repo-per-batch). The orchestrator surfaces this as
+// per the design doc (single-repo-per-batch). The orchestrator surfaces this as
 // ErrExhausted so the mirror returns 5xx instead of silently never
 // triggering the puller.
 func TestRule7_EmptyRegistryRejected(t *testing.T) {
@@ -509,10 +548,12 @@ func TestRule7_EmptyRegistryRejected(t *testing.T) {
 		{ID: "n6", Addr: "n6:5001"},
 		{ID: "n7", Addr: "n7:5001"},
 	}
+
 	intents := map[ifaces.NodeID]ifaces.PullIntent{}
 	for _, n := range nodes {
 		intents[n.ID] = ifaces.PullIntent{}
 	}
+
 	coord := &stubCoord{intents: intents}
 	// Degraded DHT so rule 6 expansion fires and the expanded pass
 	// reaches rule 7. Without registry/repository the orchestrator
@@ -527,6 +568,7 @@ func TestRule7_EmptyRegistryRejected(t *testing.T) {
 	if !errors.Is(err, coldstart.ErrExhausted) {
 		t.Fatalf("Resolve err = %v; want ErrExhausted (empty registry must short-circuit rule 7)", err)
 	}
+
 	if len(coord.pleasePullCalls) != 0 {
 		t.Errorf("pleasePullCalls = %d; want 0 (must not dial puller with empty registry)", len(coord.pleasePullCalls))
 	}
@@ -535,7 +577,7 @@ func TestRule7_EmptyRegistryRejected(t *testing.T) {
 // Rule 7 cold-start MUST fire on the top-K pass when DHT is healthy
 // and every reachable peer reports neither cached nor in-flight.
 // Regression test for the earlier early-return that bypassed rule 7
-// whenever expandLabel=="" — making the design's primary cold-start
+// whenever expandLabel=="" - making the design's primary cold-start
 // path unreachable on a healthy cluster.
 func TestRule7_HealthyDhtFiresColdStartAtTopK(t *testing.T) {
 	d := digest.MustParse("sha256:" + rep('a', 64))
@@ -561,16 +603,18 @@ func TestRule7_HealthyDhtFiresColdStartAtTopK(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resolve err = %v; want success via rule 7 cold-start at top-K", err)
 	}
+
 	if len(res.Providers) != 1 || res.Providers[0].Addr != "x:5001" {
 		t.Fatalf("Providers = %+v; want single x:5001 from DHT poll after please_pull", res.Providers)
 	}
+
 	if len(coord.pleasePullCalls) != 1 {
 		t.Fatalf("please_pull dialed %d times; want exactly 1 (lowest-rank reachable)", len(coord.pleasePullCalls))
 	}
 }
 
 // TestRule7_PleasePullAlreadyPulling asserts that an ALREADY_PULLING
-// outcome is treated identically to STARTED — the cascade falls
+// outcome is treated identically to STARTED - the cascade falls
 // through to the DHT poll. This is the common race where the
 // requester's rule-1 read saw the puller idle, but by the time
 // please_pull lands the puller has already begun (e.g., a
@@ -600,9 +644,11 @@ func TestRule7_PleasePullAlreadyPulling(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resolve err = %v; want success on ALREADY_PULLING (poll DHT)", err)
 	}
+
 	if len(res.Providers) != 1 || res.Providers[0].Addr != "x:5001" {
 		t.Fatalf("Providers = %+v; want x:5001 from DHT poll", res.Providers)
 	}
+
 	if len(coord.pleasePullCalls) != 1 {
 		t.Fatalf("please_pull dialed %d times; want 1", len(coord.pleasePullCalls))
 	}
@@ -651,6 +697,7 @@ func TestRule7_PleasePullRecentlyFailedTrusted(t *testing.T) {
 			if !errors.Is(err, coldstart.ErrFailureShortCircuit) {
 				t.Fatalf("class=%s err = %v; want ErrFailureShortCircuit", fc, err)
 			}
+
 			if len(coord.pleasePullCalls) != 1 {
 				t.Fatalf("class=%s please_pull dialed %d times; want 1", fc, len(coord.pleasePullCalls))
 			}
@@ -662,7 +709,7 @@ func TestRule7_PleasePullRecentlyFailedTrusted(t *testing.T) {
 // puller reports RECENTLY_FAILED with class=transient, the resolver
 // installs the honor window (so subsequent Resolves short-circuit)
 // and returns ErrCooldownActive *without polling the DHT*. The
-// honor-window install must use outcome.CooldownUntil — bounded by
+// honor-window install must use outcome.CooldownUntil - bounded by
 // TransientCooldownCap, identical to rule 4.
 func TestRule7_PleasePullRecentlyFailedTransient(t *testing.T) {
 	d := digest.MustParse("sha256:" + rep('a', 64))
@@ -693,9 +740,11 @@ func TestRule7_PleasePullRecentlyFailedTransient(t *testing.T) {
 	if _, err := r.Resolve(context.Background(), d, ifaces.KindBlob, "reg.example.com", "test/repo", 0); !errors.Is(err, coldstart.ErrCooldownActive) {
 		t.Fatalf("first Resolve err = %v; want ErrCooldownActive", err)
 	}
+
 	if len(coord.pleasePullCalls) != 1 {
 		t.Fatalf("please_pull dialed %d times; want 1 (first Resolve)", len(coord.pleasePullCalls))
 	}
+
 	firstIntentCalls := coord.intentCalls
 
 	// Second Resolve within the honor window: must short-circuit
@@ -703,10 +752,12 @@ func TestRule7_PleasePullRecentlyFailedTransient(t *testing.T) {
 	if _, err := r.Resolve(context.Background(), d, ifaces.KindBlob, "reg.example.com", "test/repo", 0); !errors.Is(err, coldstart.ErrCooldownActive) {
 		t.Fatalf("second Resolve err = %v; want ErrCooldownActive (honor window)", err)
 	}
+
 	if coord.intentCalls != firstIntentCalls {
 		t.Errorf("second Resolve issued %d new pull_intent_query calls; want 0 (honor window)",
 			coord.intentCalls-firstIntentCalls)
 	}
+
 	if len(coord.pleasePullCalls) != 1 {
 		t.Errorf("second Resolve issued additional please_pull (total %d); want still 1",
 			len(coord.pleasePullCalls))
@@ -745,6 +796,7 @@ func TestRule7_PleasePullUnspecifiedExhausts(t *testing.T) {
 	if !errors.Is(err, coldstart.ErrExhausted) {
 		t.Fatalf("Resolve err = %v; want ErrExhausted on UNSPECIFIED", err)
 	}
+
 	if res != nil {
 		t.Errorf("Resolution = %+v; want nil on UNSPECIFIED (no DHT poll)", res)
 	}
@@ -770,12 +822,15 @@ func TestRule5_NoReachableExpands(t *testing.T) {
 	for _, s := range top3 {
 		intentErrs[s.Node.ID] = errors.New("unreachable")
 	}
+
 	intents := map[ifaces.NodeID]ifaces.PullIntent{}
+
 	for _, s := range top6 {
 		if _, blocked := intentErrs[s.Node.ID]; !blocked {
 			intents[s.Node.ID] = ifaces.PullIntent{}
 		}
 	}
+
 	coord := &stubCoord{intents: intents, intentErrs: intentErrs}
 	disco := &stubDisco{
 		health:    1.0,
@@ -787,6 +842,7 @@ func TestRule5_NoReachableExpands(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
+
 	if len(res.Providers) == 0 {
 		t.Fatal("Providers empty")
 	}
@@ -796,21 +852,22 @@ func TestPollDHTTimeoutReturnsExhausted(t *testing.T) {
 	d := digest.MustParse("sha256:" + rep('2', 64))
 	nodes := clusterNodes()
 	// Force rule 7 (degraded health) but DHT never returns a provider
-	// so the poll loop must time out at the per-§5.2a threshold.
+	// so the poll loop must time out at the per-the design doc threshold.
 	intents := map[ifaces.NodeID]ifaces.PullIntent{}
 	for _, n := range nodes {
 		intents[n.ID] = ifaces.PullIntent{}
 	}
+
 	coord := &stubCoord{intents: intents}
 	disco := &stubDisco{
 		health:    0.3, // expand
 		providers: [][]ifaces.Provider{nil, nil, nil, nil},
 	}
 
-	// Pin "now" to a clock we control; the inflight Stalls() resolver
+	// Pin "now" to a clock we control; the inflight Stalls resolver
 	// will give us a 5s manifest threshold. We shrink it by configuring
 	// a tiny PollManifest so the ticker fires often but never finds a
-	// provider; the deadline based on inflight.DefaultStalls() is 5s
+	// provider; the deadline based on inflight.DefaultStalls is 5s
 	// of wall-clock time, which is too long for a unit test. Use a
 	// fake clock that advances quickly.
 	now := time.Now()
@@ -838,7 +895,7 @@ func TestRankMismatchEmitsMetric(t *testing.T) {
 	top := hrw.TopK(nodes, d, 3)
 
 	// Responder at rank 0 reports rank 99 instead of its actual rank
-	// — should trigger OnRankMismatch. The other top-K nodes report
+	// - should trigger OnRankMismatch. The other top-K nodes report
 	// their honest ranks so they don't generate false-positive
 	// mismatches.
 	intents := map[ifaces.NodeID]ifaces.PullIntent{
@@ -850,6 +907,7 @@ func TestRankMismatchEmitsMetric(t *testing.T) {
 	disco := &stubDisco{}
 
 	var mismatches []ifaces.NodeID
+
 	metrics := coldstart.MetricsHooks{
 		OnRankMismatch: func(_ string, id ifaces.NodeID) {
 			mismatches = append(mismatches, id)
@@ -857,6 +915,7 @@ func TestRankMismatchEmitsMetric(t *testing.T) {
 	}
 	r := buildResolver(t, coord, disco, "self", nodes, metrics, time.Now)
 	_, _ = r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0) //nolint:errcheck // best-effort
+
 	if len(mismatches) != 1 || mismatches[0] != top[0].Node.ID {
 		t.Errorf("mismatches = %v; want [%s]", mismatches, top[0].Node.ID)
 	}
@@ -867,6 +926,7 @@ func rep(c byte, n int) string {
 	for i := range b {
 		b[i] = c
 	}
+
 	return string(b)
 }
 
@@ -885,6 +945,7 @@ func TestTopKExpansionFactor_AllUnreachable(t *testing.T) {
 	for i := range nodes {
 		nodes[i] = ifaces.Node{ID: ifaces.NodeID("n" + string(rune('0'+i))), Addr: "x:5001"}
 	}
+
 	intentErrs := map[ifaces.NodeID]error{}
 	for _, n := range nodes {
 		intentErrs[n.ID] = errors.New("unreachable")
@@ -898,7 +959,7 @@ func TestTopKExpansionFactor_AllUnreachable(t *testing.T) {
 		{"default_factor_2", 0, 3 + 6},
 		{"explicit_factor_2", 2, 3 + 6},
 		{"factor_3", 3, 3 + 9},
-		{"factor_4_capped_by_cluster", 4, 3 + 12}, // 12 nodes, K*4=12 → all
+		{"factor_4_capped_by_cluster", 4, 3 + 12}, // 12 nodes, K*4=12 -> all
 	}
 
 	for _, tt := range tests {
@@ -906,7 +967,9 @@ func TestTopKExpansionFactor_AllUnreachable(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			coord := &stubCoord{intentErrs: intentErrs}
 			disco := &stubDisco{health: 1.0}
+
 			var expandReasons []string
+
 			metrics := coldstart.MetricsHooks{
 				OnTopKExpansion: func(reason string) {
 					expandReasons = append(expandReasons, reason)
@@ -931,10 +994,12 @@ func TestTopKExpansionFactor_AllUnreachable(t *testing.T) {
 			if !errors.Is(err, coldstart.ErrExhausted) {
 				t.Fatalf("Resolve err = %v; want ErrExhausted", err)
 			}
+
 			if coord.intentCalls != tt.wantIntentCalls {
 				t.Errorf("intentCalls = %d; want %d (factor=%d, HrwK=3)",
 					coord.intentCalls, tt.wantIntentCalls, tt.factor)
 			}
+
 			if len(expandReasons) != 1 || expandReasons[0] != "all_unreachable" {
 				t.Errorf("OnTopKExpansion reasons = %v; want [all_unreachable]", expandReasons)
 			}
@@ -944,17 +1009,20 @@ func TestTopKExpansionFactor_AllUnreachable(t *testing.T) {
 
 // TestTopKExpansion_DegradedReason asserts OnTopKExpansion fires with
 // reason="degraded_health" on the rule-6 path (rule 7 + DHT health
-// in the §7.7 Degraded band [0.3, 0.7)).
+// in the Degraded band [0.3, 0.7)).
 func TestTopKExpansion_DegradedReason(t *testing.T) {
 	d := digest.MustParse("sha256:" + rep('5', 64))
+
 	nodes := make([]ifaces.Node, 8)
 	for i := range nodes {
 		nodes[i] = ifaces.Node{ID: ifaces.NodeID("n" + string(rune('0'+i))), Addr: "x:5001"}
 	}
+
 	intents := map[ifaces.NodeID]ifaces.PullIntent{}
 	for _, n := range nodes {
-		intents[n.ID] = ifaces.PullIntent{} // empty — rule 7
+		intents[n.ID] = ifaces.PullIntent{} // empty - rule 7
 	}
+
 	coord := &stubCoord{intents: intents}
 	// Degraded DHT triggers rule 6 expansion; provider eventually
 	// shows up so pollDHT terminates and the resolve succeeds.
@@ -962,14 +1030,18 @@ func TestTopKExpansion_DegradedReason(t *testing.T) {
 		health:    0.4,
 		providers: [][]ifaces.Provider{nil, {{NodeID: "puller", Addr: "puller:5001"}}},
 	}
+
 	var reasons []string
+
 	metrics := coldstart.MetricsHooks{
 		OnTopKExpansion: func(reason string) { reasons = append(reasons, reason) },
 	}
+
 	r := buildResolver(t, coord, disco, "self", nodes, metrics, time.Now)
 	if _, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0); err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
+
 	if len(reasons) != 1 || reasons[0] != "degraded_health" {
 		t.Errorf("OnTopKExpansion reasons = %v; want [degraded_health]", reasons)
 	}
@@ -994,7 +1066,9 @@ type stubLocalIntent struct {
 func (s *stubLocalIntent) LocalPullIntent(_ context.Context, _ digest.Digest) ifaces.PullIntent {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	s.calls++
+
 	return s.intent
 }
 
@@ -1013,35 +1087,42 @@ type stubLocalPull struct {
 func (s *stubLocalPull) StartLocalPull(_ context.Context, registry, repository string, _ ifaces.OriginRefKind, ds []digest.Digest) ([]ifaces.PleasePullOutcome, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	s.registry = append(s.registry, registry)
 	s.repo = append(s.repo, repository)
 	dsCopy := make([]digest.Digest, len(ds))
 	copy(dsCopy, ds)
+
 	s.digests = append(s.digests, dsCopy)
 	if s.err != nil {
 		return nil, s.err
 	}
+
 	if s.out != nil {
 		return s.out, nil
 	}
+
 	out := make([]ifaces.PleasePullOutcome, len(ds))
 	for i, d := range ds {
 		out[i] = ifaces.PleasePullOutcome{Digest: d, Outcome: ifaces.PleasePullStarted}
 	}
+
 	return out, nil
 }
 
 // findDigestWhereSelfIsRank0 generates digests until it finds one for
 // which hrw.TopK(nodes, d, k) puts self at index 0. HRW is
 // deterministic, so this terminates quickly for any non-degenerate
-// cluster — the search just needs to find a (digest, nodeID) pair
+// cluster - the search just needs to find a (digest, nodeID) pair
 // whose double-hash maximises among the cluster. We try byte values
 // 'a'…'z' and '0'…'9' before giving up so the test never spins
 // forever on a buggy hash.
 func findDigestWhereSelfIsRank0(t *testing.T, nodes []ifaces.Node, self ifaces.NodeID, k int) digest.Digest {
 	t.Helper()
+
 	for _, c := range []byte("abcdef0123456789") {
 		d := digest.MustParse("sha256:" + rep(c, 64))
+
 		top := hrw.TopK(nodes, d, k)
 		if len(top) > 0 && top[0].Node.ID == self {
 			return d
@@ -1054,12 +1135,15 @@ func findDigestWhereSelfIsRank0(t *testing.T, nodes []ifaces.Node, self ifaces.N
 		lo := "0123456789abcdef"[(i/16)%16]
 		body := rep('a', 62)
 		d := digest.MustParse("sha256:" + string(hi) + string(lo) + body)
+
 		top := hrw.TopK(nodes, d, k)
 		if len(top) > 0 && top[0].Node.ID == self {
 			return d
 		}
 	}
+
 	t.Fatalf("no digest found where self=%s ranks 0 in top-K=%d", self, k)
+
 	return digest.Digest{}
 }
 
@@ -1072,10 +1156,12 @@ func programPeerIntentsByRank(coord *stubCoord, top []hrw.Scored, self ifaces.No
 	if coord.intents == nil {
 		coord.intents = map[ifaces.NodeID]ifaces.PullIntent{}
 	}
+
 	for i, s := range top {
 		if s.Node.ID == self {
 			continue
 		}
+
 		coord.intents[s.Node.ID] = ifaces.PullIntent{RecipientRank: int32(i)}
 	}
 }
@@ -1106,7 +1192,7 @@ func TestSelfIsRank0_UsesLocalPullNotRPC(t *testing.T) {
 			{{NodeID: self, Addr: "local:5001"}},
 		},
 	}
-	li := &stubLocalIntent{intent: ifaces.PullIntent{}} // empty — rule 7
+	li := &stubLocalIntent{intent: ifaces.PullIntent{}} // empty - rule 7
 	lp := &stubLocalPull{}
 
 	mems := fakes.NewMembers(self, nodes...)
@@ -1131,10 +1217,11 @@ func TestSelfIsRank0_UsesLocalPullNotRPC(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
+
 	if len(res.Providers) == 0 {
 		t.Fatal("Providers empty after rule 7 self-pull")
 	}
-	// Invariant A: no remote PleasePull dial — rule 7 routed locally.
+	// Invariant A: no remote PleasePull dial - rule 7 routed locally.
 	if len(coord.pleasePullCalls) != 0 {
 		t.Errorf("Coord.PleasePull dialed %d times, want 0; ids=%v", len(coord.pleasePullCalls), coord.pleasePullCalls)
 	}
@@ -1142,20 +1229,24 @@ func TestSelfIsRank0_UsesLocalPullNotRPC(t *testing.T) {
 	// digest and registry/repository.
 	lp.mu.Lock()
 	defer lp.mu.Unlock()
+
 	if len(lp.digests) != 1 {
 		t.Fatalf("StartLocalPull invocations = %d; want 1", len(lp.digests))
 	}
+
 	if len(lp.digests[0]) != 1 || lp.digests[0][0] != d {
 		t.Errorf("StartLocalPull digests = %v; want [%s]", lp.digests[0], d)
 	}
+
 	if lp.registry[0] != "reg.example.com" || lp.repo[0] != "test/repo" {
 		t.Errorf("StartLocalPull addr = %s/%s; want reg.example.com/test/repo", lp.registry[0], lp.repo[0])
 	}
-	// Invariant C: LocalPullIntent was consulted at least once — the
+	// Invariant C: LocalPullIntent was consulted at least once - the
 	// synthetic self-response is what made rule 7 pick self.
 	li.mu.Lock()
 	calls := li.calls
 	li.mu.Unlock()
+
 	if calls < 1 {
 		t.Errorf("LocalPullIntent calls = %d; want >= 1", calls)
 	}
@@ -1202,22 +1293,22 @@ func TestSelfIsRank0_NoLocalPull_FallsBackToRPC(t *testing.T) {
 	if _, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0); err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	// Coord.PleasePull(self, ...) is the fallback — exactly one call,
+	// Coord.PleasePull(self, ...) is the fallback - exactly one call,
 	// to self.
 	if len(coord.pleasePullCalls) != 1 || coord.pleasePullCalls[0] != self {
 		t.Errorf("Coord.PleasePull calls = %v; want [%s]", coord.pleasePullCalls, self)
 	}
 }
 
-// TestConcurrentResolvers_OnlyDesignatedPullerInvoked is the §F1
+// TestConcurrentResolvers_OnlyDesignatedPullerInvoked is the cache-hit
 // invariant test in cold-start unit form. Two parallel calls to
 // Resolve on the SAME resolver with the SAME digest must converge on
-// exactly one StartLocalPull invocation — the second caller's
+// exactly one StartLocalPull invocation - the second caller's
 // LocalPullIntent must see the in-flight entry from the first call
 // and piggyback (rule 3) instead of triggering a second origin pull.
 //
 // The single-resolver framing is a unit-test stand-in for "two nodes
-// each running their own resolver" — both nodes share the inflight
+// each running their own resolver" - both nodes share the inflight
 // view via the libp2p coord stream in production, and our
 // LocalIntent (backed by the same inflight map across goroutines)
 // faithfully reproduces that hand-off here.
@@ -1268,23 +1359,30 @@ func TestConcurrentResolvers_OnlyDesignatedPullerInvoked(t *testing.T) {
 	})
 
 	var wg sync.WaitGroup
+
 	errs := make([]error, 2)
 	// Launch G1 first, wait until it reaches the pump (so the
 	// inflight entry is live and observable), then launch G2.
 	wg.Add(1)
+
 	go func() {
 		defer wg.Done()
+
 		_, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0)
 		errs[0] = err
 	}()
+
 	select {
 	case <-started:
 	case <-time.After(2 * time.Second):
 		t.Fatal("first resolver never reached StartLocalPull")
 	}
+
 	wg.Add(1)
+
 	go func() {
 		defer wg.Done()
+
 		_, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0)
 		errs[1] = err
 	}()
@@ -1299,6 +1397,7 @@ func TestConcurrentResolvers_OnlyDesignatedPullerInvoked(t *testing.T) {
 			t.Errorf("Resolve[%d]: %v", i, e)
 		}
 	}
+
 	lp.mu.Lock()
 	defer lp.mu.Unlock()
 	// Exactly one local pull: the second resolver must have hit rule
@@ -1307,13 +1406,14 @@ func TestConcurrentResolvers_OnlyDesignatedPullerInvoked(t *testing.T) {
 	if lp.starts != 1 {
 		t.Errorf("StartLocalPull invocations = %d; want 1 (F1 invariant: one origin pull per digest)", lp.starts)
 	}
+
 	if len(coord.pleasePullCalls) != 0 {
 		t.Errorf("Coord.PleasePull dialed %d times, want 0", len(coord.pleasePullCalls))
 	}
 }
 
 // liFromInflight is a LocalIntentProvider that reports in_flight
-// whenever the shared inflight map has an entry — mirroring the
+// whenever the shared inflight map has an entry - mirroring the
 // production coord.Server.computeLocalIntent semantics.
 type liFromInflight struct {
 	infl *inflight.Map
@@ -1323,6 +1423,7 @@ func (l *liFromInflight) LocalPullIntent(_ context.Context, d digest.Digest) ifa
 	if e, ok := l.infl.LookupForIntent(d); ok {
 		return ifaces.PullIntent{InFlight: true, StartedAt: e.StartedAt}
 	}
+
 	return ifaces.PullIntent{}
 }
 
@@ -1342,6 +1443,7 @@ func (g *gatedLocalPull) StartLocalPull(ctx context.Context, _, _ string, _ ifac
 	g.mu.Lock()
 	g.starts++
 	g.mu.Unlock()
+
 	out := make([]ifaces.PleasePullOutcome, len(ds))
 	for i, d := range ds {
 		// Insert the in-flight entry BEFORE returning so any
@@ -1352,6 +1454,7 @@ func (g *gatedLocalPull) StartLocalPull(ctx context.Context, _, _ string, _ ifac
 		_, e, _ := g.infl.Start(d, ifaces.KindManifest, 0)
 		out[i] = ifaces.PleasePullOutcome{Digest: d, Outcome: ifaces.PleasePullStarted, StartedAt: e.StartedAt}
 	}
+
 	if g.started != nil {
 		// Non-blocking notify; only the first call matters.
 		select {
@@ -1359,11 +1462,13 @@ func (g *gatedLocalPull) StartLocalPull(ctx context.Context, _, _ string, _ ifac
 		default:
 		}
 	}
+
 	select {
 	case <-g.gate:
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+
 	return out, nil
 }
 
@@ -1400,7 +1505,9 @@ func TestLocalPullIntentObeysProbeDeadline(t *testing.T) {
 
 	mems := fakes.NewMembers(self, nodes...)
 	infl := inflight.New(inflight.DefaultStalls(), time.Now)
+
 	const queryTimeout = 200 * time.Millisecond
+
 	r := coldstart.New(coldstart.Options{
 		Members:      mems,
 		Discovery:    disco,
@@ -1415,7 +1522,7 @@ func TestLocalPullIntentObeysProbeDeadline(t *testing.T) {
 		PollLayer:    10 * time.Millisecond,
 	})
 
-	// Outer ctx has NO deadline — this is the production case for
+	// Outer ctx has NO deadline - this is the production case for
 	// most Resolve calls (the mirror handler's request ctx is
 	// derived from the long-lived service ctx). The probeCtx wrap
 	// is the only thing that can bound LocalPullIntent's view of
@@ -1450,16 +1557,19 @@ type deadlineCapturingLocalIntent struct {
 func (l *deadlineCapturingLocalIntent) LocalPullIntent(ctx context.Context, _ digest.Digest) ifaces.PullIntent {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+
 	if d, ok := ctx.Deadline(); ok {
 		l.deadline = d
 		l.hasDdl = true
 	}
+
 	return ifaces.PullIntent{}
 }
 
 func (l *deadlineCapturingLocalIntent) lastDeadline() (time.Time, bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+
 	return l.deadline, l.hasDdl
 }
 
@@ -1476,9 +1586,9 @@ func (l *deadlineCapturingLocalIntent) lastDeadline() (time.Time, bool) {
 func TestPrefetchLayers_RoutesSelfToLocalPull(t *testing.T) {
 	cluster := clusterNodes()
 	self := ifaces.NodeID("n0")
-	// 3 digests land on self, 2 on n1, 1 on n2 → expect:
-	//   - 1 StartLocalPull(self) carrying 3 digests
-	//   - 2 PleasePull calls (one to n1, one to n2)
+	// 3 digests land on self, 2 on n1, 1 on n2 -> expect:
+	// - 1 StartLocalPull(self) carrying 3 digests
+	// - 2 PleasePull calls (one to n1, one to n2)
 	targets := map[ifaces.NodeID]int{"n0": 3, "n1": 2, "n2": 1}
 	digests := findManyDigestsForPullers(t, cluster, targets)
 
@@ -1488,8 +1598,12 @@ func TestPrefetchLayers_RoutesSelfToLocalPull(t *testing.T) {
 
 	mems := fakes.NewMembers(self, cluster...)
 	infl := inflight.New(inflight.DefaultStalls(), time.Now)
-	var pullerCount, digestCount int
-	var hookMu sync.Mutex
+
+	var (
+		pullerCount, digestCount int
+		hookMu                   sync.Mutex
+	)
+
 	r := coldstart.New(coldstart.Options{
 		Members:      mems,
 		Discovery:    disco,
@@ -1505,6 +1619,7 @@ func TestPrefetchLayers_RoutesSelfToLocalPull(t *testing.T) {
 			OnPrefetchBatch: func(p, ds int) {
 				hookMu.Lock()
 				defer hookMu.Unlock()
+
 				pullerCount = p
 				digestCount = ds
 			},
@@ -1520,9 +1635,11 @@ func TestPrefetchLayers_RoutesSelfToLocalPull(t *testing.T) {
 	gotRemote := len(coord.pleasePullCalls)
 	gotPullerSet := append([]ifaces.NodeID{}, coord.pleasePullCalls...)
 	coord.mu.Unlock()
+
 	if gotRemote != 2 {
 		t.Fatalf("PleasePull remote calls: got %d (%v), want 2 (only n1+n2)", gotRemote, gotPullerSet)
 	}
+
 	for _, id := range gotPullerSet {
 		if id == self {
 			t.Fatalf("PleasePull was dispatched to self=%s; should have gone through StartLocalPull", self)
@@ -1533,15 +1650,19 @@ func TestPrefetchLayers_RoutesSelfToLocalPull(t *testing.T) {
 	// self-digests, and registry/repo plumbed through correctly.
 	lp.mu.Lock()
 	defer lp.mu.Unlock()
+
 	if got := len(lp.registry); got != 1 {
 		t.Fatalf("StartLocalPull calls: got %d, want 1 (single self-batch)", got)
 	}
+
 	if lp.registry[0] != "docker.io" {
 		t.Errorf("StartLocalPull registry: got %q, want docker.io", lp.registry[0])
 	}
+
 	if lp.repo[0] != "library/nginx" {
 		t.Errorf("StartLocalPull repository: got %q, want library/nginx", lp.repo[0])
 	}
+
 	if len(lp.digests) != 1 || len(lp.digests[0]) != 3 {
 		t.Fatalf("StartLocalPull batch shape: got %v batches with sizes %v, want 1 batch of 3", len(lp.digests), digestBatchSizes(lp.digests))
 	}
@@ -1550,9 +1671,11 @@ func TestPrefetchLayers_RoutesSelfToLocalPull(t *testing.T) {
 	// digests = 6.
 	hookMu.Lock()
 	defer hookMu.Unlock()
+
 	if pullerCount != 3 {
 		t.Errorf("OnPrefetchBatch pullers: got %d, want 3 (n1+n2+self)", pullerCount)
 	}
+
 	if digestCount != 6 {
 		t.Errorf("OnPrefetchBatch digests: got %d, want 6 (all 6 digests routed)", digestCount)
 	}
@@ -1563,6 +1686,7 @@ func digestBatchSizes(batches [][]digest.Digest) []int {
 	for i, b := range batches {
 		out[i] = len(b)
 	}
+
 	return out
 }
 
@@ -1599,8 +1723,10 @@ func TestPrefetchLayers_NilLocalPullStillSkipsSelf(t *testing.T) {
 	if err := r.PrefetchLayers(context.Background(), digests, "docker.io", "library/nginx"); err != nil {
 		t.Fatalf("PrefetchLayers: %v", err)
 	}
+
 	coord.mu.Lock()
 	defer coord.mu.Unlock()
+
 	if got := len(coord.pleasePullCalls); got != 0 {
 		t.Fatalf("PleasePull calls: got %d, want 0 (self-bucket skipped without LocalPull)", got)
 	}
@@ -1612,18 +1738,18 @@ func TestPrefetchLayers_NilLocalPullStillSkipsSelf(t *testing.T) {
 // Spec: Node A and Node B both Resolve the same digest concurrently.
 // HRW rank 0 = A. Required invariants:
 //
-//   (F1) Only A originates the origin pull. B's Resolve must either
-//        observe A's in-flight entry (rule 3 piggyback) or route its
-//        rule-7 please_pull through Coord.PleasePull(A, ...), which
-//        in turn must dedupe through A's inflight map and NOT
-//        originate a second pull.
-//   (F2) Neither resolver originates a pull on B's local side.
+// (cache-hit) Only A originates the origin pull. B's Resolve must either
+// observe A's in-flight entry (rule 3 piggyback) or route its
+// rule-7 please_pull through Coord.PleasePull(A, ...), which
+// in turn must dedupe through A's inflight map and NOT
+// originate a second pull.
+// (peer-fetch) Neither resolver originates a pull on B's local side.
 //
 // The doubles below build a "cluster of two" where Coord routes
 // per-target: PullIntentQuery reads the target's inflight map;
 // PleasePull invokes the target's LocalPullStarter (which atomically
 // claims its own inflight). This is the minimum fidelity needed to
-// exercise the inter-node ordering that the F1 invariant rests on.
+// exercise the inter-node ordering that the cache-hit invariant rests on.
 // ---------------------------------------------------------------------------
 
 // countingLocalPull implements LocalPullStarter. On each call it
@@ -1661,13 +1787,14 @@ func (c *countingLocalPull) StartLocalPull(_ context.Context, _, _ string, kind 
 		}
 		c.mu.Unlock()
 	}
+
 	return out, nil
 }
 
 // inflightLocalIntent implements LocalIntentProvider against a
 // per-node inflight map. Mirrors the production computeLocalIntent
-// for the in-flight bit (HasCached / RecentlyFailed are zero — those
-// branches aren't exercised by the F1 test).
+// for the in-flight bit (HasCached / RecentlyFailed are zero - those
+// branches aren't exercised by the cache-hit test).
 type inflightLocalIntent struct {
 	infl *inflight.Map
 }
@@ -1676,6 +1803,7 @@ func (l *inflightLocalIntent) LocalPullIntent(_ context.Context, d digest.Digest
 	if e, ok := l.infl.LookupForIntent(d); ok {
 		return ifaces.PullIntent{InFlight: true, StartedAt: e.StartedAt}
 	}
+
 	return ifaces.PullIntent{}
 }
 
@@ -1699,11 +1827,13 @@ func (c *twoNodeCoord) PullIntentQuery(_ context.Context, target ifaces.NodeID, 
 	infl := c.infl[target]
 	rank := c.rank[target]
 	c.mu.Unlock()
+
 	intent := ifaces.PullIntent{RecipientRank: rank}
 	if e, ok := infl.LookupForIntent(d); ok {
 		intent.InFlight = true
 		intent.StartedAt = e.StartedAt
 	}
+
 	return intent, nil
 }
 
@@ -1712,10 +1842,11 @@ func (c *twoNodeCoord) PleasePull(ctx context.Context, target ifaces.NodeID, reg
 	c.pleasePullsTo[target]++
 	lp := c.lp[target]
 	c.mu.Unlock()
+
 	return lp.StartLocalPull(ctx, registry, repository, kind, ds)
 }
 
-// TestColdStart_TwoNode_OnlyHRW0OriginatesPull is the F1 invariant
+// TestColdStart_TwoNode_OnlyHRW0OriginatesPull is the cache-hit invariant
 // test from seventh code review #6.
 //
 // Setup: two-node cluster (A=n0, B=n1). Pick a digest whose HRW rank
@@ -1725,21 +1856,21 @@ func (c *twoNodeCoord) PleasePull(ctx context.Context, target ifaces.NodeID, reg
 //
 // Assertions:
 //
-//   - aLP.starts == 1: A originates exactly one origin pull.
+// - aLP.starts == 1: A originates exactly one origin pull.
 //
-//   - bLP.starts == 0: B's local pull starter is never touched —
-//     because every rule-7 self-puller decision routes its
-//     PleasePull through Coord.PleasePull(target_id_of_A), which in
-//     this test's wiring lands on aLP, not on bLP.
+// - bLP.starts == 0: B's local pull starter is never touched -
+// because every rule-7 self-puller decision routes its
+// PleasePull through Coord.PleasePull(target_id_of_A), which in
+// this test's wiring lands on aLP, not on bLP.
 //
-//   - twoNodeCoord.pleasePullsTo[A] >= 0: B's resolve may issue
-//     please_pull to A (rule 7 with A as rank-0 reachable puller)
-//     OR observe rule 3 via PullIntentQuery (A already in-flight),
-//     depending on race. Both outcomes satisfy F1 because aLP
-//     dedupes via inflight.Start.
+// - twoNodeCoord.pleasePullsTo[A] >= 0: B's resolve may issue
+// please_pull to A (rule 7 with A as rank-0 reachable puller)
+// OR observe rule 3 via PullIntentQuery (A already in-flight),
+// depending on race. Both outcomes satisfy cache-hit because aLP
+// dedupes via inflight.Start.
 //
-//   - twoNodeCoord.pleasePullsTo[B] == 0: nothing ever asks B to
-//     pull from origin — A is rank 0 and reachable.
+// - twoNodeCoord.pleasePullsTo[B] == 0: nothing ever asks B to
+// pull from origin - A is rank 0 and reachable.
 func TestColdStart_TwoNode_OnlyHRW0OriginatesPull(t *testing.T) {
 	cluster := []ifaces.Node{
 		{ID: "n0", Addr: "n0:5001"},
@@ -1748,6 +1879,7 @@ func TestColdStart_TwoNode_OnlyHRW0OriginatesPull(t *testing.T) {
 
 	// Find a digest where HRW rank 0 = n0 ("A").
 	var d digest.Digest
+
 	for i := 0; i < 4096; i++ {
 		cand := digest.MustParse("sha256:" + digestHex(i))
 		if pickHRW0(cluster, cand) == "n0" {
@@ -1755,6 +1887,7 @@ func TestColdStart_TwoNode_OnlyHRW0OriginatesPull(t *testing.T) {
 			break
 		}
 	}
+
 	if d.String() == "" {
 		t.Fatalf("could not find a digest with HRW rank 0 = n0 in 4096 tries")
 	}
@@ -1795,7 +1928,9 @@ func TestColdStart_TwoNode_OnlyHRW0OriginatesPull(t *testing.T) {
 
 	mkResolver := func(self ifaces.NodeID, mems ifaces.Members, infl *inflight.Map, li ifaces.LocalIntentProvider, lp ifaces.LocalPullStarter) *coldstart.Resolver {
 		t.Helper()
+
 		_ = self //nolint:errcheck // best-effort
+
 		return coldstart.New(coldstart.Options{
 			Members:      mems,
 			Discovery:    disco,
@@ -1815,20 +1950,26 @@ func TestColdStart_TwoNode_OnlyHRW0OriginatesPull(t *testing.T) {
 	rB := mkResolver("n1", bMems, bInfl, bLI, bLP)
 
 	// Resolve concurrently. Both calls use the SAME outer ctx and
-	// race against each other — that is the production scenario.
+	// race against each other - that is the production scenario.
 	var wg sync.WaitGroup
+
 	resolveErrs := make([]error, 2)
 	resolutions := make([]*coldstart.Resolution, 2)
+
 	for i, r := range []*coldstart.Resolver{rA, rB} {
 		i, r := i, r
+
 		wg.Add(1)
+
 		go func() {
 			defer wg.Done()
+
 			res, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "docker.io", "library/nginx", 0)
 			resolutions[i] = res
 			resolveErrs[i] = err
 		}()
 	}
+
 	wg.Wait()
 
 	for i, err := range resolveErrs {
@@ -1837,47 +1978,53 @@ func TestColdStart_TwoNode_OnlyHRW0OriginatesPull(t *testing.T) {
 		}
 	}
 
-	// F1: A originated exactly one origin pull.
+	// cache-hit: A originated exactly one origin pull.
 	aLP.mu.Lock()
 	gotAStarts, gotADupes := aLP.starts, aLP.dupes
 	aLP.mu.Unlock()
+
 	if gotAStarts != 1 {
 		t.Errorf("F1: A originated %d pulls; want exactly 1 (dupes=%d)", gotAStarts, gotADupes)
 	}
 
-	// F2: B never originates.
+	// peer-fetch: B never originates.
 	bLP.mu.Lock()
 	gotBStarts := bLP.starts
 	bLP.mu.Unlock()
+
 	if gotBStarts != 0 {
 		t.Errorf("F2: B originated %d pulls; want 0 (HRW rank 0 = A, B must never originate)", gotBStarts)
 	}
 
 	// B's rule-7 path may or may not have fired please_pull to A
 	// (depending on whether A's inflight insert raced ahead of B's
-	// PullIntentQuery). Either outcome satisfies F1 because aLP
+	// PullIntentQuery). Either outcome satisfies cache-hit because aLP
 	// dedupes via inflight.Start. But please_pull MUST NEVER be
-	// addressed to B — A is the only legitimate target.
+	// addressed to B - A is the only legitimate target.
 	coord.mu.Lock()
 	pleasePullsToA := coord.pleasePullsTo["n0"]
 	pleasePullsToB := coord.pleasePullsTo["n1"]
 	intentToA := coord.intentQueries["n0"]
 	coord.mu.Unlock()
+
 	if pleasePullsToB != 0 {
 		t.Errorf("please_pull was dispatched to B %d times; want 0 (B is not the designated puller)", pleasePullsToB)
 	}
+
 	if intentToA < 1 {
 		t.Errorf("pull_intent_query to A fired %d times; want >= 1 (B must probe A)", intentToA)
 	}
+
 	t.Logf("two-node summary: A.starts=%d A.dupes=%d B.starts=%d please_pulls_to_A=%d intent_queries_to_A=%d",
 		gotAStarts, gotADupes, gotBStarts, pleasePullsToA, intentToA)
 
-	// F1 second leg: B's resolution must point at A (either via
+	// cache-hit second leg: B's resolution must point at A (either via
 	// rule-3 piggyback or rule-7 + DHT poll), not at B itself or
 	// at empty.
 	if resolutions[1] == nil {
 		t.Fatalf("B's Resolution is nil; F1 requires B to observe A as the source")
 	}
+
 	if len(resolutions[1].Providers) == 0 {
 		t.Errorf("B's Resolution has no providers; want at least A as provider")
 	} else if resolutions[1].Providers[0].NodeID != "n0" {
@@ -1903,10 +2050,10 @@ func TestColdStart_TwoNode_OnlyHRW0OriginatesPull(t *testing.T) {
 // in-flight). LocalPull is absent.
 //
 // Assertions:
-//   - sendPleasePull is dispatched to *requester* rank 0 (the
-//     node the requester locally computed as rank 0), NOT to
-//     responder-rank-0 (which here is the rank-2 liar).
-//   - Resolution providers start with that same node.
+// - sendPleasePull is dispatched to *requester* rank 0 (the
+// node the requester locally computed as rank 0), NOT to
+// responder-rank-0 (which here is the rank-2 liar).
+// - Resolution providers start with that same node.
 func TestPullerSelectionIgnoresResponderRank(t *testing.T) {
 	nodes := clusterNodes()
 	self := ifaces.NodeID("n3")
@@ -1932,6 +2079,7 @@ func TestPullerSelectionIgnoresResponderRank(t *testing.T) {
 	}
 
 	r := buildResolver(t, coord, disco, self, nodes, coldstart.MetricsHooks{}, time.Now)
+
 	res, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0)
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
@@ -1941,14 +2089,17 @@ func TestPullerSelectionIgnoresResponderRank(t *testing.T) {
 	// the rank-2 liar must NOT have.
 	coord.mu.Lock()
 	defer coord.mu.Unlock()
+
 	if len(coord.pleasePullCalls) != 1 {
 		t.Fatalf("PleasePull call count: got %d (%v); want 1", len(coord.pleasePullCalls), coord.pleasePullCalls)
 	}
+
 	got := coord.pleasePullCalls[0]
 	if got != requesterRank0 {
 		t.Fatalf("please_pull dispatched to %s; want %s (requester rank 0). The rank-2 liar=%s reported rank 0 but must NOT have won.",
 			got, requesterRank0, requesterRank2)
 	}
+
 	if res == nil || len(res.Providers) == 0 || res.Providers[0].NodeID != requesterRank0 {
 		t.Errorf("Resolution providers[0] = %v; want first = %s (requester rank 0)", res, requesterRank0)
 	}
@@ -1961,14 +2112,14 @@ func TestPullerSelectionIgnoresResponderRank(t *testing.T) {
 // Why this matters: cold-start metrics
 // (gantry_coldstart_duration_seconds, gantry_hrw_rank_mismatch_total,
 // gantry_designated_puller_takeover_total) are labelled by `kind`,
-// and a typical image pull traverses manifest → config → layer*.
+// and a typical image pull traverses manifest -> config -> layer*.
 // If KindConfig collapses into "layer" the config fetch (a small,
 // usually fast pull) drags the layer p99 down and hides regressions
-// in actual layer transfers. KindConfig.String() already returns
+// in actual layer transfers. KindConfig.String already returns
 // "config" so the package-internal label MUST agree.
 //
 // The default branch covers KindBlob (the common case) and any
-// future enum value — "layer" is the conservative fallback for
+// future enum value - "layer" is the conservative fallback for
 // "we don't have a metric bucket for that yet", not for KindConfig.
 func TestKindLabel(t *testing.T) {
 	cases := []struct {

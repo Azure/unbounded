@@ -13,12 +13,12 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/containerdstore"
 )
 
-// newCdsubSource on non-linux always returns NoOpSource — the
+// newCdsubSource on non-linux always returns NoOpSource - the
 // containerd Go client only links cleanly on linux, and gantry is
 // only meaningful as a kubelet-adjacent DaemonSet anyway. Non-linux
 // builds are dev/test only.
 func newCdsubSource(_ *config.Config, logger *slog.Logger) cdsub.ImageSource {
-	logger.Info("cdsub: containerd integration unavailable on this platform — using NoOpSource")
+	logger.Info("cdsub: containerd integration unavailable on this platform - using NoOpSource")
 	return cdsub.NoOpSource{}
 }
 
@@ -29,6 +29,6 @@ func containerdBackedStore(_ cdsub.ImageSource, _ *config.Config, _ ...container
 	return nil
 }
 
-// wireDescriptorRecorder is a no-op on non-linux — there is no
+// wireDescriptorRecorder is a no-op on non-linux - there is no
 // real containerd source to wire.
 func wireDescriptorRecorder(_ cdsub.ImageSource, _ *containerdstore.Store) {}

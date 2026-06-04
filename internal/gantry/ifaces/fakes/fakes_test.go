@@ -24,9 +24,11 @@ func TestCache_RoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Writer: %v", err)
 	}
+
 	if _, err := w.Write(body); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
+
 	if err := w.Commit(context.Background()); err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
@@ -41,9 +43,11 @@ func TestCache_RoundTrip(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer r.Close()
+
 	if n != int64(len(body)) {
 		t.Errorf("len = %d, want %d", n, len(body))
 	}
+
 	got, _ := io.ReadAll(r)
 	if string(got) != string(body) {
 		t.Errorf("body = %q, want %q", got, body)
@@ -53,13 +57,16 @@ func TestCache_RoundTrip(t *testing.T) {
 func TestCache_DigestMismatchRejectsCommit(t *testing.T) {
 	c := NewCache()
 	wrong := digest.MustParse("sha256:" + zeros(64))
+
 	w, _ := c.Writer(context.Background(), wrong)
 	if _, err := w.Write([]byte("not the right bytes")); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
+
 	if err := w.Commit(context.Background()); err == nil {
 		t.Fatal("Commit succeeded with wrong digest")
 	}
+
 	ok, _ := c.Has(context.Background(), wrong)
 	if ok {
 		t.Error("entry was committed despite digest mismatch")
@@ -68,14 +75,17 @@ func TestCache_DigestMismatchRejectsCommit(t *testing.T) {
 
 func TestOriginPuller_NotFound(t *testing.T) {
 	o := NewOriginPuller()
+
 	_, _, err := o.Pull(context.Background(), ifaces.OriginRef{Digest: mustDigest([]byte("missing"))})
 	if err == nil {
 		t.Fatal("Pull on empty origin returned no error")
 	}
+
 	var oe *ifaces.OriginError
 	if !errors.As(err, &oe) {
 		t.Fatalf("error is %T, want *OriginError", err)
 	}
+
 	if oe.Class != ifaces.FailureNotFound {
 		t.Errorf("class = %q, want not_found", oe.Class)
 	}
@@ -91,5 +101,6 @@ func zeros(n int) string {
 	for i := range out {
 		out[i] = '0'
 	}
+
 	return string(out)
 }

@@ -14,13 +14,13 @@ import (
 )
 
 // TestDefaultConfigMap_StartsCleanWithoutSecret is the regression
-// test for the thirteenth code review's main finding:
+// test for 's main finding:
 //
-//	The shipped deploy/configmap.yaml declared
+//	The shipped deploy/gantry/configmap.yaml declared
 //	`credentials_path: "/etc/gantry/registry/registry.example.com"`
 //	on its sole upstream-registry entry, while the matching
-//	registry-creds volume in deploy/daemonset.yaml is `optional: true`
-//	and the harness does NOT apply deploy/registry-secret.example.yaml.
+//	registry-creds volume in deploy/gantry/daemonset.yaml is `optional: true`
+//	and the harness does NOT apply deploy/gantry/examples/registry-secret.example.yaml.
 //	Kubernetes therefore happily starts the pod with no Secret
 //	mounted, but origin.New eagerly opens credentials_path at
 //	startup, returns a hard error, and the agent crashloops before
@@ -34,7 +34,7 @@ import (
 // If a future revision re-introduces a credentials_path on an
 // uncommented entry, origin.New(cfg) will hit
 // `read credentials %q: no such file or directory` and the test
-// trips — exactly the failure mode the reviewer caught in
+// trips - exactly the failure mode the reviewer caught in
 // production manifests.
 //
 // Why this lives in internal/origin: origin.New is the chokepoint
@@ -47,20 +47,22 @@ func TestDefaultConfigMap_StartsCleanWithoutSecret(t *testing.T) {
 	if err != nil {
 		t.Fatalf("repo root: %v", err)
 	}
+
 	yamlPath := filepath.Join(repoRoot, "deploy", "gantry", "configmap.yaml")
+
 	raw, err := os.ReadFile(yamlPath)
 	if err != nil {
 		t.Fatalf("read %s: %v", yamlPath, err)
 	}
 
-	// deploy/configmap.yaml is a Kubernetes ConfigMap whose
+	// deploy/gantry/configmap.yaml is a Kubernetes ConfigMap whose
 	// data.config.yaml field carries the actual agent config. We
 	// extract that inline YAML by string-trimming around the
-	// well-known marker block — kubectl-style apply doesn't require
+	// well-known marker block - kubectl-style apply doesn't require
 	// pulling in a kubernetes client just to read a single inlined
 	// document. The marker is deliberately chosen to be the literal
 	// first line of the inline config; if the operator reformats
-	// the ConfigMap heavily this test fails loud (good — that means
+	// the ConfigMap heavily this test fails loud (good - that means
 	// the test needs reanchoring before shipping).
 	cfgYAML := extractInlineConfig(t, string(raw))
 
@@ -72,25 +74,26 @@ func TestDefaultConfigMap_StartsCleanWithoutSecret(t *testing.T) {
 	// The actual regression check: every UpstreamRegistry whose
 	// credentials_path is non-empty must reference a file that
 	// either (a) exists or (b) is explicitly created by the apply
-	// flow. The simplest defensible invariant — and the one the
-	// thirteenth review demands — is that the SHIPPED default has
+	// flow. The simplest defensible invariant - and the one the
+	// a prior review demands - is that the SHIPPED default has
 	// no required credentials_path, so the pod starts cleanly on
-	// any cluster regardless of whether deploy/registry-secret.example.yaml
+	// any cluster regardless of whether deploy/gantry/examples/registry-secret.example.yaml
 	// has been applied.
 	for i, ur := range cfg.UpstreamRegistries {
 		if ur.CredentialsPath != "" {
-			t.Errorf("deploy/configmap.yaml UpstreamRegistries[%d] (%q) has credentials_path=%q on an active entry; the shipped default must be credentials-free so the agent starts without deploy/registry-secret.example.yaml being applied. Comment the credentials_path line out (operators uncomment when they bring real credentials).", i, ur.Name, ur.CredentialsPath)
+			t.Errorf("deploy/gantry/configmap.yaml UpstreamRegistries[%d] (%q) has credentials_path=%q on an active entry; the shipped default must be credentials-free so the agent starts without deploy/gantry/examples/registry-secret.example.yaml being applied. Comment the credentials_path line out (operators uncomment when they bring real credentials).", i, ur.Name, ur.CredentialsPath)
 		}
 	}
 
 	// And the load-bearing assertion: origin.New must succeed on
 	// the default ConfigMap. This catches the original bug exactly
-	// — even with no credentials_path set today, a future entry
+	// - even with no credentials_path set today, a future entry
 	// that references an absent file would trip this.
 	c, err := origin.New(cfg)
 	if err != nil {
-		t.Fatalf("origin.New on default ConfigMap: %v (the shipped default ConfigMap must start without any Secret being applied; see deploy/configmap.yaml and deploy/README.md 'Apply order')", err)
+		t.Fatalf("origin.New on default ConfigMap: %v (the shipped default ConfigMap must start without any Secret being applied; see deploy/gantry/configmap.yaml and deploy/gantry/README.md 'Apply order')", err)
 	}
+
 	if c == nil {
 		t.Fatal("origin.New returned nil client on default ConfigMap")
 	}
@@ -101,8 +104,8 @@ func TestDefaultConfigMap_StartsCleanWithoutSecret(t *testing.T) {
 // scalar style:
 //
 //	data:
-//	  config.yaml: |
-//	    <agent config goes here, indented 4 spaces>
+//	 config.yaml: |
+//	 <agent config goes here, indented 4 spaces>
 //
 // We anchor on the `config.yaml: |` line and read until the file
 // ends or the indentation drops back to top level. Keeping this
@@ -110,11 +113,14 @@ func TestDefaultConfigMap_StartsCleanWithoutSecret(t *testing.T) {
 // the test in internal/origin's dependency closure.
 func extractInlineConfig(t *testing.T, raw string) string {
 	t.Helper()
+
 	const marker = "config.yaml: |"
+
 	idx := strings.Index(raw, marker)
 	if idx < 0 {
 		t.Fatalf("default ConfigMap does not contain %q marker; the test needs reanchoring against the new ConfigMap layout", marker)
 	}
+
 	body := raw[idx+len(marker):]
 	// Trim leading newline that follows `|`.
 	body = strings.TrimLeft(body, "\n")
@@ -123,7 +129,9 @@ func extractInlineConfig(t *testing.T, raw string) string {
 	// child + 2 more for `config.yaml:`'s value). Strip 4 spaces
 	// per line; preserve blank lines verbatim.
 	const indent = "    "
+
 	var out strings.Builder
+
 	for _, line := range strings.Split(body, "\n") {
 		switch {
 		case line == "":
@@ -132,9 +140,10 @@ func extractInlineConfig(t *testing.T, raw string) string {
 			out.WriteString(strings.TrimPrefix(line, indent))
 			out.WriteString("\n")
 		default:
-			// Indentation dropped — end of block scalar.
+			// Indentation dropped - end of block scalar.
 			return out.String()
 		}
 	}
+
 	return out.String()
 }

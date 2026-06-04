@@ -28,7 +28,7 @@ const (
 	// with --multi-arch=all so this exact digest is preserved in the
 	// in-cluster auth registry. We reference the image by digest in the
 	// pull pod so containerd asks gantry's mirror for a digest manifest
-	// (which gantry serves through please_pull → origin with creds),
+	// (which gantry serves through please_pull -> origin with creds),
 	// rather than a tag manifest (which gantry returns 503 for by
 	// design, causing containerd to fall through to direct unauth
 	// access).
@@ -119,7 +119,7 @@ func TestE2E_PrivateAuthRegistry(t *testing.T) {
 	workers := h.workerNodes(ctx)
 
 	// Make sure the image isn't already cached on the target node from
-	// a prior run — otherwise containerd's content-store short-circuit
+	// a prior run - otherwise containerd's content-store short-circuit
 	// would skip the mirror entirely and we wouldn't actually exercise
 	// the credentialed origin pull path.
 	h.evictImageFromNode(ctx, workers[0], authRegistryRef)
@@ -142,7 +142,7 @@ func TestE2E_PrivateAuthRegistry(t *testing.T) {
 	// events for the auth-registry image's digest demonstrate that
 	// containerd routed through gantry, gantry talked to the auth
 	// registry, and auth succeeded end-to-end. We intentionally do
-	// not assert on a numeric metric — the relevant counter only
+	// not assert on a numeric metric - the relevant counter only
 	// bumps on origin.Pull starts, which can be skipped in subsequent
 	// runs when the content store already holds the bytes.
 	pullerGantry := h.gantryPodOnNode(ctx, workers[0])

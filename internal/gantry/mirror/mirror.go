@@ -2,27 +2,27 @@
 // Licensed under the MIT License.
 
 // Package mirror is the loopback OCI registry mirror containerd talks to
-// via hosts.toml (detailed-design.md §7.1).
+// via hosts.toml .
 //
-// Phase 1 endpoint contract (cited from architecture.md §API and
-// detailed-design.md §5.1a, §7.1):
+// endpoint contract (cited from architecture.md the API contract and
+// the design doc):
 //
-//	GET /v2/                                         200, {"api":"registry/2.0"}
-//	GET /healthz                                     200, "ok"
-//	GET /v2/<repo>/manifests/<tag>                   503, empty body
-//	GET /v2/<repo>/manifests/sha256:<hex>            cache or origin
-//	GET /v2/<repo>/blobs/sha256:<hex>                cache or origin
+//	GET /v2/ 200, {"api":"registry/2.0"}
+//	GET /healthz 200, "ok"
+//	GET /v2/<repo>/manifests/<tag> 503, empty body
+//	GET /v2/<repo>/manifests/sha256:<hex> cache or origin
+//	GET /v2/<repo>/blobs/sha256:<hex> cache or origin
 //
-// The tag-manifests 503 is the §5.1a "tag fallthrough" — hosts.toml lists
+// The tag-manifests 503 is the "tag fallthrough" - hosts.toml lists
 // origin as the next entry, so containerd retries against origin directly.
 // Returning 503 (NOT 404) is load-bearing: hosts.toml only falls through
 // on 5xx, NOT on 4xx. Returning the wrong code breaks tag-resolution.
 //
-// ?ns=<registry> routing (§7.1): containerd adds ?ns=<host> to every
+// ?ns=<registry> routing (the design doc): containerd adds ?ns=<host> to every
 // request when hosts.toml specifies `server=<origin>`. If exactly one
 // upstream is configured, ?ns= is optional (and ignored if present). When
 // more than one upstream is configured, ?ns= MUST match one of them or
-// the request returns 404 — there is no safe default.
+// the request returns 404 - there is no safe default.
 package mirror
 
 import (
@@ -57,24 +57,24 @@ type Server struct {
 	logger  *slog.Logger
 	metrics metricsHooks
 
-	// Phase 2 dependencies — nil-safe. When both dht and peer are set,
+	// dependencies - nil-safe. When both dht and peer are set,
 	// the cache miss path tries DHT-discovered providers before origin.
 	dht  ifaces.DHT
 	peer ifaces.PeerDialer
 
-	// Phase 3 cold-start orchestrator (§5.2 7-rule cascade). When set,
+	// cold-start orchestrator (the design doc 7-rule cascade). When set,
 	// it is consulted when DHT.FindProviders returns an empty provider
 	// set, before the request falls through to origin.
 	coldStart ColdStartResolver
 
-	// Phase 5 NF5 direct-origin fallback controller (§5.7). When set,
+	// direct-origin-fallback direct-origin fallback controller (the design doc). When set,
 	// the mirror is permitted to do a controlled direct origin pull
 	// after the cold-start cascade reports ErrColdStartExhausted (and
-	// the NF5 gating sequence passes). When nil, cold-start exhaustion
+	// the direct-origin-fallback gating sequence passes). When nil, cold-start exhaustion
 	// always returns 5xx.
 	nf5 *NF5Controller
 
-	// Speculative layer prefetcher (§5.2 detailed-design L332 / architecture
+	// Speculative layer prefetcher (the design doc detailed-design L332 / architecture
 	// L180). When set, every successful manifest serve fires a
 	// fire-and-forget OnManifestServed callback so the prefetcher can
 	// parse the body, group child digests by HRW rank-0 puller, and
@@ -82,7 +82,7 @@ type Server struct {
 	// layers. Nil-safe.
 	prefetcher LayerPrefetcher
 
-	// Phase 2 tunables (zero values fall back to package defaults).
+	// tunables (zero values fall back to package defaults).
 	peerLookupBudget time.Duration
 	peerFetchBudget  time.Duration
 	maxPeerAttempts  int
@@ -100,10 +100,10 @@ type Server struct {
 	// configured and ?ns= is absent.
 	defaultUpstream string
 
-	// negCache is the §5.8 negative-cache integration for the
+	// negCache is the negative-cache integration for the
 	// direct-origin path. Optional (nil-safe). See
 	// WithNegativeCacheRecorder for the contract and the
-	// thirteenth-review rationale.
+	// rationale.
 	negCache NegativeCacheRecorder
 
 	// liveStreamThrough switches live GET cache-miss handling from
@@ -115,44 +115,42 @@ type Server struct {
 	// containerd; containerd remains the final verifier and should reject
 	// the commit. That avoids same-digest
 	// writer races now that the active store in production is the
-	// containerd content store itself. Background please_pull / NF5
+	// containerd content store itself. Background please_pull / direct-origin-fallback
 	// ingest continues to land via runOriginPull in cmd/gantry/main.go.
 	liveStreamThrough bool
 
-	// draining is set to true via Drain() when the agent is shutting
+	// draining is set to true via Drain when the agent is shutting
 	// down. Once true, every /v2/ request returns 503 immediately so
-	// containerd's hosts.toml falls through to origin (§Phase 6
-	// graceful-shutdown contract). The check is layered ON TOP of
+	// containerd's hosts.toml falls through to origin (// graceful-shutdown contract). The check is layered ON TOP of
 	// http.Server.Shutdown so that even keep-alive connections that
 	// the kernel has already accepted get a 503 instead of normal
-	// handling once Drain() has fired.
+	// handling once Drain has fired.
 	draining atomic.Bool
 
-	// startupGated, together with `ready`, implements the §Phase 6
-	// startup mirror gate. The mirror's TCP listener accepts traffic
+	// startupGated, together with `ready`, implements the // startup mirror gate. The mirror's TCP listener accepts traffic
 	// from containerd's hostPort plumbing the moment ListenAndServe
-	// returns — well before /readyz can pass (members informer sync,
+	// returns - well before /readyz can pass (members informer sync,
 	// DHT routing-table convergence, self-announce patch, cache
 	// scan). Without a handler-level gate, image pulls during the
 	// startup window would race the agent's own bootstrap: the
 	// DHT-empty branch would route to origin instead of to the
 	// coordinated cold-start path, and every restarting pod would
 	// add its own direct origin pulls to the cluster's total. That
-	// silently shreds the F1 invariant for the duration of the
+	// silently shreds the cache-hit invariant for the duration of the
 	// startup window.
 	//
 	// startupGated is set by WithStartupReadinessGate; when set, the
 	// /v2/ handler returns 503 (containerd hosts.toml falls through
 	// to origin for THAT request, exactly the same as the shutdown
-	// drain) until MarkReady() is called. Default-false so existing
+	// drain) until MarkReady is called. Default-false so existing
 	// test fixtures (which build Server without the option) continue
 	// to serve immediately.
 	startupGated bool
 
-	// ready is a sticky atomic flag: false until MarkReady() is
+	// ready is a sticky atomic flag: false until MarkReady is
 	// called once, then true forever. Sticky so a /readyz blip
 	// (e.g. DHT routing table briefly empty during informer churn)
-	// does NOT take the mirror out of service mid-rollout — the
+	// does NOT take the mirror out of service mid-rollout - the
 	// startup gate is a one-shot 'wait for first ready' and Drain
 	// handles graceful shutdown separately.
 	ready atomic.Bool
@@ -165,7 +163,7 @@ func (s *Server) Drain() { s.draining.Store(true) }
 // MarkReady flips the startup gate from "not yet ready" to "serving"
 // for production deployments that opted into WithStartupReadinessGate.
 // Sticky: subsequent /readyz flaps do NOT take the mirror back out of
-// service — once we have decided to serve we stay serving until Drain.
+// service - once we have decided to serve we stay serving until Drain.
 // Safe to call multiple times; safe to call from any goroutine. No-op
 // for Servers that did not opt into the startup gate.
 func (s *Server) MarkReady() { s.ready.Store(true) }
@@ -202,26 +200,26 @@ func WithLogger(l *slog.Logger) Option {
 
 // WithMetrics registers metric callbacks for cache hit and cache
 // miss observed by the mirror. The origin pull-family counters are
-// intentionally NOT plumbed here — they're split across origin and
+// intentionally NOT plumbed here - they're split across origin and
 // mirror to keep one source of truth per counter:
 //
-//   - p2p_origin_pull_total{kind} and p2p_origin_failure_total{class}
-//     belong to origin.WithMetrics in the origin Client. Origin is
-//     the single chokepoint that both the mirror direct-origin path
-//     and the coordinated please_pull / runOriginPull goroutine
-//     route through, so counting there means dashboards see one
-//     source of truth and the operator-facing "is origin sick?"
-//     alert (p2p_origin_failure_total) stays consistent across both
-//     paths and free of false positives from downstream failures.
-//   - p2p_origin_pull_success_total{kind} belongs to the mirror
-//     (WithOriginSuccessMetric) because origin can't know whether
-//     the caller actually committed bytes — see that option's doc.
-//   - p2p_origin_pull_failure_total{kind,class} is fed from BOTH
-//     halves: origin's failure hook bumps it on true origin-side
-//     failures (with double-bump of p2p_origin_failure_total), and
-//     the mirror's WithDownstreamFailureMetric bumps it on
-//     downstream failures (with class=transient, NO double-bump of
-//     p2p_origin_failure_total).
+// - p2p_origin_pull_total{kind} and p2p_origin_failure_total{class}
+// belong to origin.WithMetrics in the origin Client. Origin is
+// the single chokepoint that both the mirror direct-origin path
+// and the coordinated please_pull / runOriginPull goroutine
+// route through, so counting there means dashboards see one
+// source of truth and the operator-facing "is origin sick?"
+// alert (p2p_origin_failure_total) stays consistent across both
+// paths and free of false positives from downstream failures.
+// - p2p_origin_pull_success_total{kind} belongs to the mirror
+// (WithOriginSuccessMetric) because origin can't know whether
+// the caller actually committed bytes - see that option's doc.
+// - p2p_origin_pull_failure_total{kind,class} is fed from BOTH
+// halves: origin's failure hook bumps it on true origin-side
+// failures (with double-bump of p2p_origin_failure_total), and
+// the mirror's WithDownstreamFailureMetric bumps it on
+// downstream failures (with class=transient, NO double-bump of
+// p2p_origin_failure_total).
 //
 // Counting any of these at the mirror's WithMetrics hook would
 // silently undercount the please_pull-coordinated path (the bulk of
@@ -246,8 +244,8 @@ func WithMetrics(cacheHit, cacheMiss func()) Option {
 // no way to know whether the caller actually drained and verified the
 // stream. HEAD requests (which by design never read the body),
 // io.Copy interruptions, and cache-commit failures all leave the
-// response body Closed without a real success — so reporting success
-// on Close() inside origin.Client inflated p2p_origin_pull_success_total
+// response body Closed without a real success - so reporting success
+// on Close inside origin.Client inflated p2p_origin_pull_success_total
 // against operations that never produced a usable byte. The puller
 // pump's runOriginPull owns the equivalent hook on the
 // please_pull-coordinated path; together they're the two places that
@@ -266,41 +264,41 @@ func WithOriginSuccessMetric(originSuccess func(kind string, bytes int64)) Optio
 //
 // Why this is separate from the origin failure-hook
 // (origin.WithMetrics' failure closure in cmd/gantry/main.go):
-//   - origin.WithMetrics' failure closure is the origin-side
-//     terminal counter — it bumps BOTH p2p_origin_pull_failure_total
-//     (operator dashboards) AND p2p_origin_failure_total (the
-//     "is origin sick?" alert). Origin-side failures are the
-//     ones where the origin pull never started, never returned
-//     2xx, or returned a non-2xx body. Counting downstream
-//     failures (where origin DID return 2xx but the body
-//     stalled / corrupted en route to the cache) against the
-//     same closure would falsely accuse origin of being sick.
-//   - This hook bumps ONLY p2p_origin_pull_failure_total
-//     (per-(kind,class) detail) with class="transient", leaving
-//     p2p_origin_failure_total reserved for true origin-side
-//     failures. Operators see the failure detail without the
-//     alert false-positive.
+// - origin.WithMetrics' failure closure is the origin-side
+// terminal counter - it bumps BOTH p2p_origin_pull_failure_total
+// (operator dashboards) AND p2p_origin_failure_total (the
+// "is origin sick?" alert). Origin-side failures are the
+// ones where the origin pull never started, never returned
+// 2xx, or returned a non-2xx body. Counting downstream
+// failures (where origin DID return 2xx but the body
+// stalled / corrupted en route to the cache) against the
+// same closure would falsely accuse origin of being sick.
+// - This hook bumps ONLY p2p_origin_pull_failure_total
+// (per-(kind,class) detail) with class="transient", leaving
+// p2p_origin_failure_total reserved for true origin-side
+// failures. Operators see the failure detail without the
+// alert false-positive.
 //
 // Together with onOriginSuccess and the origin-side failure
 // closure, this restores the per-pull arithmetic identity
 // for the GET path:
 //
-//	p2p_origin_pull_total{kind}  ==  p2p_origin_pull_success_total{kind}
-//	                              +  p2p_origin_pull_failure_total{kind,class=any}
-//	                              +  (in-flight at scrape time)
+//	p2p_origin_pull_total{kind} == p2p_origin_pull_success_total{kind}
+//	 + p2p_origin_pull_failure_total{kind,class=any}
+//	 + (in-flight at scrape time)
 //
-// The twelfth code review flagged the missing terminal counter
+// This constraint ensures the missing terminal counter
 // for downstream failures as the second of the two reasons that
 // identity drifted positive in production traces. (The first
-// was HEAD, fixed in Batch 61 by adding origin.Head.)
+// was HEAD, fixed by adding origin.Head.)
 func WithDownstreamFailureMetric(downstreamFailure func(kind, class string)) Option {
 	return func(s *Server) {
 		s.metrics.onOriginDownstreamFailure = downstreamFailure
 	}
 }
 
-// WithLiveStreamThrough enables the plan §"Mode A: live mirror requests
-// — stream-through" contract for cache misses handled on behalf of the
+// WithLiveStreamThrough enables the "Mode A: live mirror requests
+// - stream-through" contract for cache misses handled on behalf of the
 // local containerd mirror client. When enabled, the mirror no longer
 // writes live peer/origin responses into the active store; it proxies
 // them directly to the caller and relies on the caller's containerd to
@@ -311,7 +309,7 @@ func WithLiveStreamThrough() Option {
 	}
 }
 
-// WithOriginStreamMetrics wires the §Phase 9 live-stream-through origin
+// WithOriginStreamMetrics wires the the live-stream-through origin
 // counters. Hooks fire only from the direct-origin stream-through path:
 // start at the moment the mirror commits to the origin path, completed
 // after the full body has been proxied and the final digest check passes,
@@ -336,7 +334,7 @@ func WithLiveStreamCompletedHook(onCompleted func(d digest.Digest)) Option {
 	}
 }
 
-// NegativeCacheRecorder is the §5.8 negative-cache integration the
+// NegativeCacheRecorder is the negative-cache integration the
 // mirror's direct-origin path uses to mirror what the coordinated
 // puller-pump path (cmd/gantry/main.go's runOriginPull) already does:
 // classify a terminal origin / downstream failure into an
@@ -344,33 +342,33 @@ func WithLiveStreamCompletedHook(onCompleted func(d digest.Digest)) Option {
 // next request for the same digest short-circuits via the same
 // `recently_failed` propagation the please_pull path uses.
 //
-// Why this exists (thirteenth review): before this hook, the mirror's
-// direct-origin path — including the §5.7 NF5 fallback that fires
-// after the cold-start cascade reports ErrColdStartExhausted —
+// Why this exists (a prior review): before this hook, the mirror's
+// direct-origin path - including the direct-origin-fallback fallback that fires
+// after the cold-start cascade reports ErrColdStartExhausted -
 // recorded the failure metric but did NOT enter a negative-cache
-// cooldown. The next NF5-eligible request for the same digest could
+// cooldown. The next direct-origin-fallback-eligible request for the same digest could
 // re-fire the direct-origin pull at the bottom of the next jitter
 // window, even though the previous attempt had stalled mid-stream or
 // digest-mismatched at commit. The puller-pump path correctly drops
 // such retries on the recently_failed cooldown; the mirror direct
 // path did not. That gap is a retry-amplification hardening hole, not
-// a metrics bug — fireOriginDownstreamFailure was already wired by
-// twelfth-review fixes.
+// a metrics bug - fireOriginDownstreamFailure was already wired by
+// fixes.
 //
 // Contract:
 //
-//   - RecordFailure is invoked once per terminal mirror-direct origin
-//     failure, BEFORE the response is finalized. The class is taken
-//     from *ifaces.OriginError when origin returns one; downstream
-//     failures (io.Copy / cw.Commit / directVerifier.Verify) are
-//     recorded as FailureTransient — the same classification the
-//     puller-pump path uses for those exact paths.
-//   - RecordSuccess is invoked exactly once per successful
-//     mirror-direct origin pull, AFTER cw.Commit (or the direct-
-//     stream digest verifier) passes. It clears any prior cooldown
-//     so the next failure restarts the ladder from Initial (§5.8
-//     "Self-healing"). Symmetric with the puller-pump path's
-//     neg.RecordSuccess(d) call after a successful Commit.
+// - RecordFailure is invoked once per terminal mirror-direct origin
+// failure, BEFORE the response is finalized. The class is taken
+// from *ifaces.OriginError when origin returns one; downstream
+// failures (io.Copy / cw.Commit / directVerifier.Verify) are
+// recorded as FailureTransient - the same classification the
+// puller-pump path uses for those exact paths.
+// - RecordSuccess is invoked exactly once per successful
+// mirror-direct origin pull, AFTER cw.Commit (or the direct-
+// stream digest verifier) passes. It clears any prior cooldown
+// so the next failure restarts the ladder from Initial (the design doc
+// "Self-healing"). Symmetric with the puller-pump path's
+// neg.RecordSuccess(d) call after a successful Commit.
 //
 // HEAD requests deliberately do NOT touch the negative cache: the
 // coordinated path never issues HEAD, and HEAD does not warm the
@@ -381,7 +379,7 @@ type NegativeCacheRecorder interface {
 	RecordSuccess(d digest.Digest)
 }
 
-// WithNegativeCacheRecorder wires §5.8 negative-cache integration
+// WithNegativeCacheRecorder wires the design doc negative-cache integration
 // into the mirror's direct-origin path. See NegativeCacheRecorder
 // for the contract. Nil-safe: passing nil leaves the mirror behaving
 // exactly as it did before this option existed (metric-only failure
@@ -391,7 +389,7 @@ func WithNegativeCacheRecorder(rec NegativeCacheRecorder) Option {
 	return func(s *Server) { s.negCache = rec }
 }
 
-// WithPeerMetrics registers Phase 2 peer-fallback metric callbacks.
+// WithPeerMetrics registers peer-fallback metric callbacks.
 // peerFetchOutcome labels include: "hit", "notfound", "unavailable",
 // "auth_or_config", "server_error", "protocol_error",
 // "digest_mismatch", "stall", and "local_error".
@@ -419,7 +417,7 @@ func WithPeerFetchLatencyMetric(onPeerFetchLatency func(outcome string, d time.D
 // WithDhtLookupMetric registers a hook that fires once per FindProviders
 // call with the outcome label ("hit", "miss", "timeout", "error") and the
 // observed lookup duration. Used to populate p2p_dht_lookup_total and
-// p2p_dht_lookup_duration_seconds (§7.6).
+// p2p_dht_lookup_duration_seconds (the design doc).
 func WithDhtLookupMetric(onLookup func(outcome string, dur time.Duration)) Option {
 	return func(s *Server) {
 		s.metrics.onDhtLookup = onLookup
@@ -439,10 +437,10 @@ func WithProvideErrorMetric(onProvideErr func(op string)) Option {
 // WithDhtStaleOnlyMetric registers a hook that fires when a DHT
 // lookup returned candidate providers but the local stale/suspicious/
 // unavailable/self filters removed every one before any peer fetch
-// was attempted — treated as a "stale-only" outcome so dashboards
+// was attempted - treated as a "stale-only" outcome so dashboards
 // can separate true empty DHT responses (counted under
 // gantry_dht_lookup_total{outcome="miss"}) from "DHT had providers
-// but they were all dead". Per plan §"DHT stale-only" mitigation.
+// but they were all dead". Per "DHT stale-only" mitigation.
 func WithDhtStaleOnlyMetric(onStaleOnly func()) Option {
 	return func(s *Server) {
 		s.metrics.onDhtStaleOnly = onStaleOnly
@@ -453,16 +451,16 @@ func WithDhtStaleOnlyMetric(onStaleOnly func()) Option {
 // per DHT lookup, reporting the total number of provider candidates
 // removed by the local filter caches (stale + unavailable +
 // suspicious + self). n may be zero. Used to size the local
-// false-positive surface from the DHT layer per plan §Phase 1.
+// false-positive surface from the DHT layer per .
 func WithStaleProviderFilteredMetric(onFiltered func(n int)) Option {
 	return func(s *Server) {
 		s.metrics.onStaleProviderFiltered = onFiltered
 	}
 }
 
-// WithDiscovery wires Phase 2 P2P fetch: cache miss → DHT FindProviders →
-// PeerDialer.FetchFromPeer (across up to 3 providers) → origin fallback.
-// Either argument nil disables P2P fallback entirely (Phase 1 behavior).
+// WithDiscovery wires P2P fetch: cache miss -> DHT FindProviders ->
+// PeerDialer.FetchFromPeer (across up to 3 providers) -> origin fallback.
+// Either argument nil disables P2P fallback entirely (behavior).
 func WithDiscovery(d ifaces.DHT, peer ifaces.PeerDialer) Option {
 	return func(s *Server) {
 		s.dht = d
@@ -470,7 +468,7 @@ func WithDiscovery(d ifaces.DHT, peer ifaces.PeerDialer) Option {
 	}
 }
 
-// WithPeerBudgets overrides the default Phase 2 peer-path budgets.
+// WithPeerBudgets overrides the default peer-path budgets.
 // lookup ≤ 0 means "use default 2s"; fetch ≤ 0 means "use default 10s";
 // maxAttempts ≤ 0 means "use default 3".
 func WithPeerBudgets(lookup, fetch time.Duration, maxAttempts int) Option {
@@ -498,7 +496,7 @@ func WithProviderFailureCacheTTL(staleTTL, unavailableTTL, suspiciousTTL time.Du
 }
 
 // ColdStartResolver is the subset of *coldstart.Resolver that mirror
-// needs. Kept narrow for testability — production wires the concrete
+// needs. Kept narrow for testability - production wires the concrete
 // resolver via WithColdStart.
 type ColdStartResolver interface {
 	Resolve(ctx context.Context, d digest.Digest, kind ifaces.OriginRefKind, registry, repository string, expectedSize int64) (*ColdStartResolution, error)
@@ -512,16 +510,16 @@ type ColdStartResolution struct {
 	Outcome   string
 }
 
-// WithColdStart wires Phase 3 cold-start orchestration. When set, the
+// WithColdStart wires cold-start orchestration. When set, the
 // orchestrator is consulted on the DHT-empty branch of the cache-miss
 // path before falling through to origin.
 func WithColdStart(c ColdStartResolver) Option {
 	return func(s *Server) { s.coldStart = c }
 }
 
-// WithNF5 wires the Phase 5 §5.7 direct-origin fallback controller.
+// WithNF5 wires the direct-origin fallback controller.
 // When non-nil and cold-start exits via ErrColdStartExhausted, the
-// mirror runs the NF5 gating sequence (jitter, token bucket, dedup,
+// mirror runs the direct-origin-fallback gating sequence (jitter, token bucket, dedup,
 // re-check) before falling through to a direct origin pull. When nil,
 // cold-start exhaustion always returns 5xx.
 func WithNF5(c *NF5Controller) Option {
@@ -529,7 +527,7 @@ func WithNF5(c *NF5Controller) Option {
 }
 
 // LayerPrefetcher is the speculative wire-level optimisation hook
-// (§5.2 detailed-design.md L332 / architecture.md L180). After the
+// (the design doc detailed-design.md L332 / architecture.md L180). After the
 // mirror serves a manifest successfully the mirror invokes
 // OnManifestServed in a goroutine so an implementation can fetch
 // the just-cached manifest body, parse it, identify child
@@ -546,11 +544,11 @@ func WithLayerPrefetcher(p LayerPrefetcher) Option {
 	return func(s *Server) { s.prefetcher = p }
 }
 
-// WithStartupReadinessGate opts the mirror into the §Phase 6 startup
-// gate: until MarkReady() is called, every /v2/ request returns 503
+// WithStartupReadinessGate opts the mirror into the the startup
+// gate: until MarkReady is called, every /v2/ request returns 503
 // with reason "agent starting up". Production callers should pair
 // this with a goroutine that polls the same conditions /readyz uses
-// and calls MarkReady once they converge — see cmd/gantry/main.go's
+// and calls MarkReady once they converge - see cmd/gantry/main.go's
 // readyCheck-poller for the canonical wiring.
 //
 // Without this option the Server is "ready immediately" so unit-test
@@ -578,6 +576,7 @@ func New(cfg *config.Config, store ifaces.LocalContentStore, origin ifaces.Origi
 	for _, opt := range opts {
 		opt(s)
 	}
+
 	if len(cfg.UpstreamRegistries) == 1 {
 		s.defaultUpstream = cfg.UpstreamRegistries[0].Name
 	}
@@ -585,10 +584,11 @@ func New(cfg *config.Config, store ifaces.LocalContentStore, origin ifaces.Origi
 	// MarkReady, continue to serve immediately. Production callers
 	// flip startupGated via WithStartupReadinessGate which forces
 	// ready=false at construction and gates the /v2/ handler until
-	// MarkReady() fires.
+	// MarkReady fires.
 	if !s.startupGated {
 		s.ready.Store(true)
 	}
+
 	return s
 }
 
@@ -603,20 +603,22 @@ func (s *Server) Handler() http.Handler {
 	// also returns 503.
 	mux.HandleFunc("/v2/", s.drainGuard(s.startupGate(s.handleV2)))
 	mux.HandleFunc("/v2", s.drainGuard(s.startupGate(s.handleV2))) // some clients omit trailing slash
+
 	return mux
 }
 
-// drainGuard wraps a /v2/ handler so that once Drain() has been called,
-// every new request gets a 503 instead of normal handling. §Phase 6:
-// "stops accepting new mirror requests with 503". The 503 (not 404)
-// is load-bearing — hosts.toml only falls through on 5xx.
+// drainGuard wraps a /v2/ handler so that once Drain has been called,
+// every new request gets a 503 instead of normal handling. // "stops accepting new mirror requests with 503". The 503 (not 404)
+// is load-bearing - hosts.toml only falls through on 5xx.
 func (s *Server) drainGuard(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if s.draining.Load() {
 			w.Header().Set("Docker-Distribution-API-Version", "registry/2.0")
 			http.Error(w, "agent shutting down", http.StatusServiceUnavailable)
+
 			return
 		}
+
 		h(w, r)
 	}
 }
@@ -635,8 +637,10 @@ func (s *Server) startupGate(h http.HandlerFunc) http.HandlerFunc {
 			w.Header().Set("Docker-Distribution-API-Version", "registry/2.0")
 			w.Header().Set("Retry-After", "5")
 			http.Error(w, "agent starting up", http.StatusServiceUnavailable)
+
 			return
 		}
+
 		h(w, r)
 	}
 }
@@ -656,12 +660,14 @@ func (s *Server) handleV2(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, `{}`) //nolint:errcheck // best-effort write
+
 		return
 	}
 
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+
 		return
 	}
 
@@ -678,11 +684,12 @@ func (s *Server) handleV2(w http.ResponseWriter, r *http.Request) {
 			slog.String("path", path),
 		)
 		http.NotFound(w, r)
+
 		return
 	}
 
 	if !isDigestRef(ref) {
-		// Tag request (§5.1a) — fall through to origin via hosts.toml.
+		// Tag request (the design doc) - fall through to origin via hosts.toml.
 		// 503 (not 404) so containerd retries against the next mirror.
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
@@ -703,11 +710,14 @@ func (s *Server) resolveUpstream(r *http.Request) (string, error) {
 		if s.defaultUpstream != "" {
 			return s.defaultUpstream, nil
 		}
+
 		return "", errors.New("mirror: ?ns= is required when multiple upstreams are configured")
 	}
+
 	if ur, ok := s.cfg.ResolveUpstream(ns); ok {
 		return ur.Name, nil
 	}
+
 	return "", fmt.Errorf("mirror: unknown ns=%q", ns)
 }
 
@@ -737,30 +747,31 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 		return
 	}
 
-	// 2. Peer fallback (Phase 2). If both DHT and PeerDialer are wired,
+	// 2. Peer fallback . If both DHT and PeerDialer are wired,
 	// try up to maxPeerAttempts providers from FindProviders. The result
-	// is tri-state per design §5.1's "v1 transfer policy":
-	//   - served: bytes already written from a peer; we're done.
-	//   - exhausted: DHT had providers but all maxAttempts failed (stall
-	//     or error). Return 5xx so containerd's hosts.toml mirror chain
-	//     promotes the request to origin directly. The agent does *not*
-	//     do a direct origin pull here (Phase 5 NF5 owns the controlled
-	//     direct-origin path).
-	//   - unused: DHT not wired, errored, or returned empty providers.
-	//     Fall through to Phase 1's origin path; Phase 3's HRW probe
-	//     replaces this leg for the cold-start case.
+	// is tri-state per design the design doc's "v1 transfer policy":
+	// - served: bytes already written from a peer; we're done.
+	// - exhausted: DHT had providers but all maxAttempts failed (stall
+	// or error). Return 5xx so containerd's hosts.toml mirror chain
+	// promotes the request to origin directly. The agent does *not*
+	// do a direct origin pull here (direct-origin-fallback owns the controlled
+	// direct-origin path).
+	// - unused: DHT not wired, errored, or returned empty providers.
+	// Fall through to origin path; HRW probe
+	// replaces this leg for the cold-start case.
 	if s.dht != nil && s.peer != nil {
 		switch s.tryPeerFallback(ctx, w, r, d, kind, upstream, repo, logger) {
 		case peerFallbackServed:
 			if !s.liveStreamThrough {
 				s.firePrefetch(kind, upstream, repo, d)
 			}
+
 			return
 		case peerFallbackExhausted:
 			http.Error(w, "warm path exhausted", http.StatusServiceUnavailable)
 			return
 		case peerFallbackColdExhausted:
-			// §5.7 NF5 last-resort: only attempt a direct origin
+			// the design doc direct-origin-fallback last-resort: only attempt a direct origin
 			// pull when the controller passes its gating sequence
 			// (bootstrap done, DHT healthy enough, no dedup
 			// collision, token budget, jitter elapsed without
@@ -769,10 +780,12 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 				http.Error(w, "warm path exhausted", http.StatusServiceUnavailable)
 				return
 			}
+
 			proceed, release, err := s.nf5.Allow(ctx, d, kind, 0)
 			if release != nil {
 				defer release()
 			}
+
 			if err != nil || !proceed {
 				http.Error(w, "warm path exhausted", http.StatusServiceUnavailable)
 				return
@@ -794,47 +807,60 @@ func (s *Server) serveLocalHit(ctx context.Context, w http.ResponseWriter, r *ht
 	rc, size, err := s.store.Open(ctx, d)
 	if err == nil {
 		defer func() { _ = rc.Close() }() //nolint:errcheck // best-effort close
+
 		s.bumpCacheHit()
 		// Sniff the first bytes so writeBlobHeaders can label content
 		// with its real mediaType for two cases (see
 		// writeBlobHeadersWithPrefix for the full story):
-		//   - kind == KindBlob: a manifest returned for a
-		//     /blobs/<digest> request (via origin's /blobs/->/manifests/
-		//     fallback) would otherwise be octet-stream and containerd
-		//     CRI fails with "Target.MediaType must be set".
-		//   - kind == KindManifest: a manifest LIST/index body would
-		//     otherwise be labelled as a single OCI manifest and
-		//     containerd fails the unpack with "expected manifest but
-		//     found index".
+		// - kind == KindBlob: a manifest returned for a
+		// /blobs/<digest> request (via origin's /blobs/->/manifests/
+		// fallback) would otherwise be octet-stream and containerd
+		// CRI fails with "Target.MediaType must be set".
+		// - kind == KindManifest: a manifest LIST/index body would
+		// otherwise be labelled as a single OCI manifest and
+		// containerd fails the unpack with "expected manifest but
+		// found index".
 		br := bufio.NewReader(rc)
+
 		var sniff []byte
+
 		if kind == ifaces.KindBlob || kind == ifaces.KindManifest {
 			if peek, _ := br.Peek(512); len(peek) > 0 { //nolint:errcheck // peek best-effort for logging
 				sniff = peek
 			}
 		}
+
 		writeBlobHeadersWithPrefix(w, d, size, kind, sniff)
-		s.firePrefetch(kind, upstream, repo, d)
+
 		if r.Method == http.MethodHead {
 			return true
 		}
+
+		s.firePrefetch(kind, upstream, repo, d)
+
 		if _, err := io.Copy(w, br); err != nil {
 			logger.Debug("mirror: copy from cache failed", slog.Any("err", err))
 		}
+
 		return true
 	}
+
 	var enf *ifaces.ErrNotFound
 	if errors.As(err, &enf) {
 		return false
 	}
+
 	var eun *ifaces.ErrUnavailable
 	if errors.As(err, &eun) {
 		logger.Warn("mirror: storage unavailable", slog.Any("err", err))
 		http.Error(w, "storage unavailable", http.StatusServiceUnavailable)
+
 		return true
 	}
+
 	logger.Warn("mirror: cache open error", slog.Any("err", err))
 	http.Error(w, "cache error", http.StatusInternalServerError)
+
 	return true
 }
 
@@ -842,13 +868,13 @@ func (s *Server) serveLocalHit(ctx context.Context, w http.ResponseWriter, r *ht
 // does not have. HEAD is purely metadata: containerd uses it to learn
 // the blob's Content-Length / existence before issuing a GET. It MUST
 // NOT:
-//   - send please_pull RPCs (would commit cluster-wide work on a
-//     metadata probe),
-//   - body-GET from a peer (would cache-warm and burn peer fetch
-//     budget for a request that never reads the body),
-//   - bump p2p_origin_pull_total (HEAD is the origin.Head path, not
-//     the origin.Pull path; success and downstream-failure can never
-//     fire here, so counting starts breaks the arithmetic).
+// - send please_pull RPCs (would commit cluster-wide work on a
+// metadata probe),
+// - body-GET from a peer (would cache-warm and burn peer fetch
+// budget for a request that never reads the body),
+// - bump p2p_origin_pull_total (HEAD is the origin.Head path, not
+// the origin.Pull path; success and downstream-failure can never
+// fire here, so counting starts breaks the arithmetic).
 //
 // Before the fourteenth-review fix the HEAD branch lived AFTER the
 // peer/cold-start cascade, so a HEAD cache-miss with DHT providers
@@ -860,6 +886,7 @@ func (s *Server) serveLocalHit(ctx context.Context, w http.ResponseWriter, r *ht
 // normal cache-miss path and warms the cache then.
 func (s *Server) serveHeadMiss(ctx context.Context, w http.ResponseWriter, d digest.Digest, kind ifaces.OriginRefKind, upstream, repo string, logger *slog.Logger) {
 	pRef := ifaces.OriginRef{Registry: upstream, Repository: repo, Digest: d, Kind: kind}
+
 	hsize, hct, herr := s.origin.Head(ctx, pRef)
 	if herr != nil {
 		writeOriginError(w, herr, logger)
@@ -873,6 +900,7 @@ func (s *Server) serveHeadMiss(ctx context.Context, w http.ResponseWriter, d dig
 	if hct != "" {
 		w.Header().Set("Content-Type", hct)
 	}
+
 	writeBlobHeaders(w, d, hsize, kind)
 }
 
@@ -881,18 +909,18 @@ func (s *Server) serveHeadMiss(ctx context.Context, w http.ResponseWriter, d dig
 // after the local-store miss + peer/cold-start cascade have decided
 // that this node is the designated origin puller for d.
 //
-// Metric placement (twelfth-review correction):
-//   - p2p_origin_pull_total{kind} bumps inside origin.Pull at
-//     entry (via origin.WithMetrics' onPullStart hook).
-//   - p2p_origin_pull_failure_total{kind,class} +
-//     p2p_origin_failure_total{class} bump inside
-//     origin.recordFailure on origin-side terminal failures
-//     (same WithMetrics closure double-bumps both).
-//   - p2p_origin_pull_success_total{kind} bumps HERE after
-//     cw.Commit succeeds (and analogously in runOriginPull after
-//     that path's Commit). Success cannot live in origin because
-//     origin has no way to know whether the caller actually
-//     committed the bytes to cache.
+// Metric placement (correction):
+// - p2p_origin_pull_total{kind} bumps inside origin.Pull at
+// entry (via origin.WithMetrics' onPullStart hook).
+// - p2p_origin_pull_failure_total{kind,class} +
+// p2p_origin_failure_total{class} bump inside
+// origin.recordFailure on origin-side terminal failures
+// (same WithMetrics closure double-bumps both).
+// - p2p_origin_pull_success_total{kind} bumps HERE after
+// cw.Commit succeeds (and analogously in runOriginPull after
+// that path's Commit). Success cannot live in origin because
+// origin has no way to know whether the caller actually
+// committed the bytes to cache.
 //
 // HEAD takes the separate s.origin.Head path explicitly so it does
 // NOT bump p2p_origin_pull_total: HEAD is metadata-only, it never
@@ -908,24 +936,29 @@ func (s *Server) serveFromOrigin(ctx context.Context, w http.ResponseWriter, d d
 	if s.liveStreamThrough {
 		s.fireOriginStreamStarted(kind)
 	}
+
 	pr, psize, perr := s.origin.Pull(ctx, pRef)
 	if perr != nil {
-		// §5.8 negative-cache: classify and record the origin-side
+		// the design doc negative-cache: classify and record the origin-side
 		// failure so the next direct-origin attempt for the same
 		// digest on this node short-circuits on the recently_failed
 		// cooldown. Symmetric with the puller-pump path's
 		// recordOriginFailure(neg, d, err, "origin pull failed", ...)
-		// in cmd/gantry/main.go. Without this, NF5 direct fallback
+		// in cmd/gantry/main.go. Without this, direct-origin-fallback direct fallback
 		// could fire again on the next request through this node at
 		// the bottom of the next jitter window, retry-amplifying
 		// against an origin that just returned 4xx/5xx.
 		s.recordNegCacheFailure(d, perr)
+
 		if s.liveStreamThrough {
 			s.fireOriginStreamFailed(kind)
 		}
+
 		writeOriginError(w, perr, logger)
+
 		return
 	}
+
 	defer func() { _ = pr.Close() }() //nolint:errcheck // best-effort close
 
 	if s.liveStreamThrough {
@@ -937,24 +970,31 @@ func (s *Server) serveFromOrigin(ctx context.Context, w http.ResponseWriter, d d
 			)
 			s.fireOriginStreamFailed(kind)
 			s.recordNegCacheFailure(d, streamErr)
+
 			return
 		}
+
 		s.fireOriginStreamCompleted(kind)
 		s.fireLiveStreamCompleted(d)
 		s.recordNegCacheSuccess(d)
+
 		return
 	}
 
 	cw, cwerr := s.store.Writer(ctx, d)
+
 	var dest io.Writer
+
 	var directVerifier *digestpipe.Writer // non-nil only when caching is unavailable
+
 	if cwerr == nil {
 		defer func() { _ = cw.Abort(ctx) }() //nolint:errcheck // no-op after Commit
+
 		dest = io.MultiWriter(w, cw)
 	} else {
 		logger.Warn("mirror: cache writer unavailable; serving without caching", slog.Any("err", cwerr))
-		// F7 says the cache layer is what enforces digest verification
-		// on origin pulls — and cache.Writer wraps the stream in a
+		// digest-verification says the cache layer is what enforces digest verification
+		// on origin pulls - and cache.Writer wraps the stream in a
 		// digestpipe internally before Commit. When that path is
 		// unavailable we still need to verify, otherwise an origin
 		// returning corrupted bytes (truncation, content-injection
@@ -967,23 +1007,27 @@ func (s *Server) serveFromOrigin(ctx context.Context, w http.ResponseWriter, d d
 
 	// Peek the origin body so writeBlobHeaders can label content with
 	// the right Content-Type for two cases:
-	//   - kind == KindBlob: a manifest that arrived via origin's
-	//     /blobs/->/manifests/ fallback would otherwise be labelled
-	//     octet-stream, and containerd CRI rejects the unpacked
-	//     content as "Target.MediaType must be set".
-	//   - kind == KindManifest: a manifest LIST/index body must be
-	//     labelled with the matching list/index media type, otherwise
-	//     containerd fails the unpack with "expected manifest but
-	//     found index" when it later resolves children.
+	// - kind == KindBlob: a manifest that arrived via origin's
+	// /blobs/->/manifests/ fallback would otherwise be labelled
+	// octet-stream, and containerd CRI rejects the unpacked
+	// content as "Target.MediaType must be set".
+	// - kind == KindManifest: a manifest LIST/index body must be
+	// labelled with the matching list/index media type, otherwise
+	// containerd fails the unpack with "expected manifest but
+	// found index" when it later resolves children.
 	// The peek consumes nothing (bufio buffers the bytes).
 	prBuf := bufio.NewReader(pr)
+
 	var sniff []byte
+
 	if kind == ifaces.KindBlob || kind == ifaces.KindManifest {
 		if peek, _ := prBuf.Peek(512); len(peek) > 0 { //nolint:errcheck // peek best-effort for logging
 			sniff = peek
 		}
 	}
+
 	writeBlobHeadersWithPrefix(w, d, psize, kind, sniff)
+
 	written, err := io.Copy(dest, prBuf)
 	if err != nil {
 		// Bytes already sent; we can't undo. Cache will be aborted by defer.
@@ -992,21 +1036,23 @@ func (s *Server) serveFromOrigin(ctx context.Context, w http.ResponseWriter, d d
 		// before EOF. Count it against p2p_origin_pull_failure_total
 		// (class=transient) so the per-pull arithmetic
 		// (started == success + failure + in_flight) holds. We do
-		// NOT also bump p2p_origin_failure_total — origin gave us
+		// NOT also bump p2p_origin_failure_total - origin gave us
 		// 2xx, the failure is downstream.
 		logger.Debug("mirror: copy stalled", slog.Int64("written", written), slog.Any("err", err))
 		s.fireOriginDownstreamFailure(kind, ifaces.FailureTransient)
-		// §5.8 cooldown: io.Copy stalls are the canonical mid-stream
-		// truncation the thirteenth review flagged for NF5 direct
+		// the design doc cooldown: io.Copy stalls are the canonical mid-stream
+		// truncation a prior review flagged for direct-origin-fallback direct
 		// fallback. Classify as transient (matches the puller-pump
 		// path) so the cooldown ladder grows on repeated truncations
 		// of the same digest.
 		s.recordNegCacheFailure(d, err)
+
 		return
 	}
+
 	if directVerifier != nil {
 		if verr := directVerifier.Verify(d); verr != nil {
-			logger.Error("mirror: origin direct-stream digest mismatch — corrupted bytes were already served to client",
+			logger.Error("mirror: origin direct-stream digest mismatch - corrupted bytes were already served to client",
 				slog.String("digest", d.String()),
 				slog.Int64("written", written),
 				slog.Any("err", verr),
@@ -1019,12 +1065,13 @@ func (s *Server) serveFromOrigin(ctx context.Context, w http.ResponseWriter, d d
 			// digestpipe verifier) so it goes to the downstream
 			// counter, not to origin's failure family.
 			s.fireOriginDownstreamFailure(kind, ifaces.FailureTransient)
-			// §5.8 cooldown: a direct-stream digest mismatch is the
+			// the design doc cooldown: a direct-stream digest mismatch is the
 			// strongest "this origin is lying" signal we have on the
 			// no-cache path. Treat the failure as transient (same
 			// class the puller-pump path uses for cw.Commit
 			// mismatches) so repeated mismatches grow the cooldown.
 			s.recordNegCacheFailure(d, verr)
+
 			return
 		}
 		// Direct-stream verifier passed: bytes were delivered to
@@ -1033,12 +1080,14 @@ func (s *Server) serveFromOrigin(ctx context.Context, w http.ResponseWriter, d d
 		// unavailable), but the origin pull itself succeeded
 		// end-to-end. Count it.
 		s.fireOriginSuccess(kind, written)
-		// §5.8 "Self-healing": a successful end-to-end pull clears
+		// the design doc "Self-healing": a successful end-to-end pull clears
 		// any prior cooldown entry. Symmetric with the puller-pump
 		// path's neg.RecordSuccess(d) after cw.Commit.
 		s.recordNegCacheSuccess(d)
+
 		return
 	}
+
 	if cwerr == nil {
 		if err := cw.Commit(ctx); err != nil {
 			// The client already got the bytes; cache just doesn't keep them.
@@ -1052,20 +1101,21 @@ func (s *Server) serveFromOrigin(ctx context.Context, w http.ResponseWriter, d d
 			// family.
 			logger.Warn("mirror: cache commit failed", slog.Any("err", err))
 			s.fireOriginDownstreamFailure(kind, ifaces.FailureTransient)
-			// §5.8 cooldown: cw.Commit is where the cache's digestpipe
+			// the design doc cooldown: cw.Commit is where the cache's digestpipe
 			// fires; this branch means EITHER cache I/O failed OR
 			// origin's bytes didn't hash to d. Both are transient by
-			// the puller-pump path's classification — record so the
+			// the puller-pump path's classification - record so the
 			// next direct-origin attempt for the same digest waits
 			// out the cooldown.
 			s.recordNegCacheFailure(d, err)
+
 			return
 		}
 		// Re-advertise into the DHT now that we hold a byte-identical
-		// copy in our cache. Without this, an NF5-eligible direct
+		// copy in our cache. Without this, an direct-origin-fallback-eligible direct
 		// origin pull leaves the cluster's only known provider record
-		// pointing at the origin instead of at this node — defeating
-		// the deduplication promise of §5.2 step 7 specifically for
+		// pointing at the origin instead of at this node - defeating
+		// the deduplication promise of the step 7 specifically for
 		// the cold-start-exhausted path that just escalated to origin.
 		s.reAdvertiseDigest(d, "mirror_origin_announce", logger)
 		s.firePrefetch(kind, upstream, repo, d)
@@ -1075,7 +1125,7 @@ func (s *Server) serveFromOrigin(ctx context.Context, w http.ResponseWriter, d d
 		// the operation classified as not-yet-successful even
 		// though the client already got the bytes.
 		s.fireOriginSuccess(kind, written)
-		// §5.8 "Self-healing": clear any prior cooldown entry so
+		// the design doc "Self-healing": clear any prior cooldown entry so
 		// the next failure restarts the ladder from Initial.
 		// Symmetric with the puller-pump path's neg.RecordSuccess(d)
 		// after its cw.Commit.
@@ -1089,7 +1139,7 @@ type peerFallbackResult int
 const (
 	// peerFallbackUnused means the DHT layer was bypassed: no DHT call
 	// fired (caller-gated), or it errored, or it returned no providers.
-	// The caller may fall through to origin (Phase 1 behavior).
+	// The caller may fall through to origin (behavior).
 	peerFallbackUnused peerFallbackResult = iota
 	// peerFallbackServed means a peer's bytes were fully delivered to the
 	// client. In default mode they were verified+committed to cache first;
@@ -1100,15 +1150,15 @@ const (
 	// maxAttempts of them failed (stall or error), OR the cold-start
 	// cascade short-circuited with an error other than
 	// ErrColdStartExhausted (failure short-circuit, transient
-	// cooldown, etc.). Per §5.1's v1 transfer policy and §5.8's
+	// cooldown, etc.). Per the design doc's v1 transfer policy and the design doc's
 	// trusted-cluster-wide failure propagation, the mirror must
-	// return 5xx — NF5 must NOT fire here.
+	// return 5xx - direct-origin-fallback must NOT fire here.
 	peerFallbackExhausted
 	// peerFallbackColdExhausted means the cold-start cascade ran to
 	// its final ErrColdStartExhausted exit (no cache, no in-flight,
 	// no provider returned by HRW + DHT, both top-K and top-2K
-	// already tried). NF5 direct-origin fallback is eligible to fire
-	// — and only here.
+	// already tried). direct-origin-fallback direct-origin fallback is eligible to fire
+	// - and only here.
 	peerFallbackColdExhausted
 )
 
@@ -1157,6 +1207,7 @@ func (s peerAttemptSummary) allStaleOrFiltered() bool {
 	if s.attempted == 0 {
 		return false
 	}
+
 	return s.unavailable == 0 &&
 		s.digestMismatch == 0 &&
 		s.authOrConfig == 0 &&
@@ -1177,10 +1228,12 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 	if lookupBudget <= 0 {
 		lookupBudget = 2 * time.Second
 	}
+
 	fetchBudget := s.peerFetchBudget
 	if fetchBudget <= 0 {
 		fetchBudget = 10 * time.Second
 	}
+
 	maxAttempts := s.maxPeerAttempts
 	if maxAttempts <= 0 {
 		maxAttempts = 3
@@ -1191,13 +1244,16 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 	providers, err := s.dht.FindProviders(lookupCtx, d)
 	lookupDur := time.Since(lookupStart)
 	lookupCtxErr := lookupCtx.Err()
+
 	cancel()
+
 	switch {
 	case err != nil:
 		outcome := "error"
 		if errors.Is(lookupCtxErr, context.DeadlineExceeded) {
 			outcome = "timeout"
 		}
+
 		s.bumpDhtLookup(outcome, lookupDur)
 		logger.Debug("mirror: FindProviders error", slog.Any("err", err))
 	case len(providers) == 0:
@@ -1205,14 +1261,17 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 	default:
 		s.bumpDhtLookup("hit", lookupDur)
 	}
+
 	if err != nil || len(providers) == 0 {
 		csProviders, res := s.resolveViaColdStart(ctx, d, kind, upstream, repo, err != nil, false, peerAttemptSummary{}, logger)
 		if res != peerFallbackUnused {
 			return res
 		}
+
 		if len(csProviders) == 0 {
 			return peerFallbackUnused
 		}
+
 		providers = csProviders
 	}
 
@@ -1223,29 +1282,34 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 			s.metrics.onStaleProviderFiltered(totalFiltered)
 		}
 	}
+
 	if len(providers) == 0 {
 		// All DHT-returned providers were filtered out before we
 		// could try any of them. Distinct from "DHT returned zero"
-		// (counted as dht_lookup miss above) — this is "DHT had
+		// (counted as dht_lookup miss above) - this is "DHT had
 		// candidates but they were all dead". Falls through to
 		// cold-start the same as a true miss, but operators need to
 		// see the difference on the dashboard.
 		if s.metrics.onDhtStaleOnly != nil {
 			s.metrics.onDhtStaleOnly()
 		}
+
 		logger.Debug("mirror: DHT providers filtered",
 			slog.Int("stale_filtered", summary.staleFiltered),
 			slog.Int("unavailable_filtered", summary.unavailableFiltered),
 			slog.Int("suspicious_filtered", summary.suspiciousFiltered),
 			slog.Int("self_filtered", summary.selfFiltered),
 		)
+
 		csProviders, res := s.resolveViaColdStart(ctx, d, kind, upstream, repo, false, true, summary, logger)
 		if res != peerFallbackUnused {
 			return res
 		}
+
 		if len(csProviders) == 0 {
 			return peerFallbackUnused
 		}
+
 		providers = csProviders
 	}
 
@@ -1254,14 +1318,17 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 		if tried >= maxAttempts {
 			break
 		}
+
 		tried++
 		summary.attempted++
 		res := s.fetchOneProvider(ctx, w, r, d, kind, upstream, repo, p, fetchBudget, logger)
+
 		summary = updatePeerSummary(summary, res.outcome)
 		if res.served {
 			return peerFallbackServed
 		}
 	}
+
 	if tried > 0 {
 		allStale := summary.allStaleOrFiltered()
 		logger.Debug("mirror: peer providers exhausted, consulting cold-start",
@@ -1276,23 +1343,28 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 			slog.Int("local_error", summary.localError),
 			slog.Bool("all_stale_or_filtered", allStale),
 		)
+
 		csProviders, csResult := s.resolveViaColdStart(ctx, d, kind, upstream, repo, false, allStale, summary, logger)
 		if csResult != peerFallbackUnused {
 			return csResult
 		}
+
 		for _, p := range csProviders {
 			if tried >= maxAttempts*2 {
 				break
 			}
+
 			tried++
 			summary.attempted++
 			res := s.fetchOneProvider(ctx, w, r, d, kind, upstream, repo, p, fetchBudget, logger)
+
 			summary = updatePeerSummary(summary, res.outcome)
 			if res.served {
 				return peerFallbackServed
 			}
 		}
 	}
+
 	return peerFallbackExhausted
 }
 
@@ -1307,6 +1379,7 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 
 	fetchStart := time.Now()
 	pRef := ifaces.OriginRef{Registry: upstream, Repository: repo, Digest: d, Kind: kind}
+
 	rc, psize, err := s.peer.FetchFromPeer(pCtx, p.Addr, pRef)
 	if err != nil {
 		outcome, label := classifyPeerFetchError(err)
@@ -1315,13 +1388,16 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 			s.markProviderStale(d, p)
 		} else {
 			s.bumpPeerDial(false)
+
 			if outcome == peerFetchOutcomeUnavailable {
 				s.markProviderUnavailable(p)
 			}
+
 			if outcome == peerFetchOutcomeDigestMismatch {
 				s.markProviderSuspicious(d, p)
 			}
 		}
+
 		s.bumpPeerFetch(label)
 		s.bumpPeerFetchLatency(label, fetchStart)
 		logger.Debug("mirror: peer fetch failed",
@@ -1330,9 +1406,12 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 			slog.String("outcome", label),
 			slog.Any("err", err),
 		)
+
 		return peerAttemptResult{outcome: outcome}
 	}
+
 	defer func() { _ = rc.Close() }() //nolint:errcheck // best-effort close
+
 	s.bumpPeerDial(true)
 
 	if s.liveStreamThrough {
@@ -1347,8 +1426,10 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 					slog.Int64("written", written),
 					slog.Any("err", streamErr),
 				)
+
 				return peerAttemptResult{outcome: peerFetchOutcomeDigestMismatch, served: true}
 			}
+
 			s.bumpPeerFetch("stall")
 			s.bumpPeerFetchLatency("stall", fetchStart)
 			logger.Debug("mirror: peer live stream-through failed",
@@ -1356,11 +1437,14 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 				slog.Int64("written", written),
 				slog.Any("err", streamErr),
 			)
+
 			return peerAttemptResult{outcome: peerFetchOutcomeStall, served: true}
 		}
+
 		s.bumpPeerFetch("hit")
 		s.bumpPeerFetchLatency("hit", fetchStart)
 		s.fireLiveStreamCompleted(d)
+
 		return peerAttemptResult{outcome: peerFetchOutcomeHit, served: true}
 	}
 
@@ -1369,8 +1453,10 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 		s.bumpPeerFetch("local_error")
 		s.bumpPeerFetchLatency("local_error", fetchStart)
 		logger.Warn("mirror: cache writer unavailable for peer fetch", slog.Any("err", cwerr))
+
 		return peerAttemptResult{outcome: peerFetchOutcomeLocalError}
 	}
+
 	defer func() { _ = cw.Abort(pCtx) }() //nolint:errcheck // best-effort abort
 
 	if _, err := io.Copy(cw, rc); err != nil {
@@ -1380,8 +1466,10 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 			slog.String("peer", p.Addr),
 			slog.Any("err", err),
 		)
+
 		return peerAttemptResult{outcome: peerFetchOutcomeStall}
 	}
+
 	if err := cw.Commit(pCtx); err != nil {
 		if isDigestMismatchErr(err) {
 			s.markProviderSuspicious(d, p)
@@ -1391,22 +1479,25 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 				slog.String("peer", p.Addr),
 				slog.Any("err", err),
 			)
+
 			return peerAttemptResult{outcome: peerFetchOutcomeDigestMismatch}
 		}
+
 		s.bumpPeerFetch("local_error")
 		s.bumpPeerFetchLatency("local_error", fetchStart)
 		logger.Warn("mirror: peer commit failed",
 			slog.String("peer", p.Addr),
 			slog.Any("err", err),
 		)
+
 		return peerAttemptResult{outcome: peerFetchOutcomeLocalError}
 	}
 
 	// Re-advertise this digest into the DHT now that we've cached a
 	// byte-identical copy. Without this, peer-fetched blobs were
 	// discoverable only via the source peer's announcements, so the
-	// provider set never grew — defeating the deduplication promise
-	// of the design (detailed-design §5.2 step 7). Fire-and-forget
+	// provider set never grew - defeating the deduplication promise
+	// of the design (detailed-design the step 7). Fire-and-forget
 	// with a 30s budget; bg ctx so client cancellation can't abort
 	// the announcement.
 	s.reAdvertiseDigest(d, "peer_fetch_readvertise", logger)
@@ -1417,9 +1508,12 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 		s.bumpPeerFetch("local_error")
 		s.bumpPeerFetchLatency("local_error", fetchStart)
 		logger.Warn("mirror: post-commit cache open failed", slog.Any("err", err))
+
 		return peerAttemptResult{outcome: peerFetchOutcomeLocalError}
 	}
+
 	defer func() { _ = rcLocal.Close() }() //nolint:errcheck // best-effort close
+
 	s.bumpPeerFetch("hit")
 	s.bumpPeerFetchLatency("hit", fetchStart)
 	// Sniff the cached body's prefix so writeBlobHeaders can label
@@ -1427,19 +1521,25 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 	// bytes AND for manifests that hold a manifest list/index body
 	// (see writeBlobHeadersWithPrefix for the rationale).
 	rcLocalBuf := bufio.NewReader(rcLocal)
+
 	var sniff []byte
+
 	if kind == ifaces.KindBlob || kind == ifaces.KindManifest {
 		if peek, _ := rcLocalBuf.Peek(512); len(peek) > 0 { //nolint:errcheck // peek best-effort for logging
 			sniff = peek
 		}
 	}
+
 	writeBlobHeadersWithPrefix(w, d, size, kind, sniff)
+
 	if r.Method == http.MethodHead {
 		return peerAttemptResult{outcome: peerFetchOutcomeHit, served: true}
 	}
+
 	if _, err := io.Copy(w, rcLocalBuf); err != nil {
 		logger.Debug("mirror: copy from cache (post-peer) failed", slog.Any("err", err))
 	}
+
 	return peerAttemptResult{outcome: peerFetchOutcomeHit, served: true}
 }
 
@@ -1447,6 +1547,7 @@ func (s *Server) resolveViaColdStart(ctx context.Context, d digest.Digest, kind 
 	if s.coldStart == nil {
 		return nil, peerFallbackUnused
 	}
+
 	res, csErr := s.coldStart.Resolve(ctx, d, kind, upstream, repo, 0)
 	if csErr != nil {
 		logger.Debug("mirror: cold-start exhausted",
@@ -1455,38 +1556,48 @@ func (s *Server) resolveViaColdStart(ctx context.Context, d digest.Digest, kind 
 			slog.Int("attempted", summary.attempted),
 			slog.Any("err", csErr),
 		)
+
 		if errors.Is(csErr, ErrColdStartExhausted) {
 			return nil, peerFallbackColdExhausted
 		}
+
 		return nil, peerFallbackExhausted
 	}
+
 	return res.Providers, peerFallbackUnused
 }
 
 func (s *Server) filterProvidersForDigest(d digest.Digest, providers []ifaces.Provider) ([]ifaces.Provider, peerAttemptSummary) {
 	now := time.Now()
 	filtered := make([]ifaces.Provider, 0, len(providers))
+
 	var summary peerAttemptSummary
+
 	for _, p := range providers {
 		if s.selfNodeID != "" && p.NodeID == s.selfNodeID {
 			summary.selfFiltered++
 			continue
 		}
+
 		key := providerDigestKey{digest: d, nodeID: p.NodeID, addr: p.Addr}
 		if s.isProviderInWindow(s.staleProviders, key, now) {
 			summary.staleFiltered++
 			continue
 		}
+
 		if s.isProviderInWindow(s.suspiciousProviders, key, now) {
 			summary.suspiciousFiltered++
 			continue
 		}
+
 		if s.isUnavailablePeerInWindow(p.Addr, now) {
 			summary.unavailableFiltered++
 			continue
 		}
+
 		filtered = append(filtered, p)
 	}
+
 	return filtered, summary
 }
 
@@ -1509,6 +1620,7 @@ func updatePeerSummary(summary peerAttemptSummary, outcome peerFetchOutcomeKind)
 	case peerFetchOutcomeLocalError:
 		summary.localError++
 	}
+
 	return summary
 }
 
@@ -1517,6 +1629,7 @@ func classifyPeerFetchError(err error) (peerFetchOutcomeKind, string) {
 	if errors.As(err, &enf) {
 		return peerFetchOutcomeStaleProvider, "notfound"
 	}
+
 	var statusErr *ifaces.ErrPeerHTTPStatus
 	if errors.As(err, &statusErr) {
 		switch {
@@ -1528,9 +1641,11 @@ func classifyPeerFetchError(err error) (peerFetchOutcomeKind, string) {
 			return peerFetchOutcomeProtocolError, "protocol_error"
 		}
 	}
+
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || isDialUnavailable(err) {
 		return peerFetchOutcomeUnavailable, "unavailable"
 	}
+
 	return peerFetchOutcomeProtocolError, "protocol_error"
 }
 
@@ -1539,10 +1654,13 @@ func isDialUnavailable(err error) bool {
 	if errors.As(err, &netErr) {
 		return true
 	}
+
 	if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.EHOSTUNREACH) || errors.Is(err, syscall.ENETUNREACH) {
 		return true
 	}
+
 	errText := strings.ToLower(err.Error())
+
 	return strings.Contains(errText, "connection refused") || strings.Contains(errText, "no route to host")
 }
 
@@ -1555,8 +1673,10 @@ func (s *Server) markProviderStale(d digest.Digest, p ifaces.Provider) {
 	if s.staleProviderTTL <= 0 {
 		return
 	}
+
 	s.providerFailureMu.Lock()
 	defer s.providerFailureMu.Unlock()
+
 	s.staleProviders[providerDigestKey{digest: d, nodeID: p.NodeID, addr: p.Addr}] = time.Now().Add(s.staleProviderTTL)
 }
 
@@ -1564,8 +1684,10 @@ func (s *Server) markProviderSuspicious(d digest.Digest, p ifaces.Provider) {
 	if s.suspiciousPeerTTL <= 0 {
 		return
 	}
+
 	s.providerFailureMu.Lock()
 	defer s.providerFailureMu.Unlock()
+
 	s.suspiciousProviders[providerDigestKey{digest: d, nodeID: p.NodeID, addr: p.Addr}] = time.Now().Add(s.suspiciousPeerTTL)
 }
 
@@ -1573,36 +1695,44 @@ func (s *Server) markProviderUnavailable(p ifaces.Provider) {
 	if s.unavailablePeerTTL <= 0 {
 		return
 	}
+
 	s.providerFailureMu.Lock()
 	defer s.providerFailureMu.Unlock()
+
 	s.unavailableProviders[p.Addr] = time.Now().Add(s.unavailablePeerTTL)
 }
 
 func (s *Server) isProviderInWindow(m map[providerDigestKey]time.Time, key providerDigestKey, now time.Time) bool {
 	s.providerFailureMu.Lock()
 	defer s.providerFailureMu.Unlock()
+
 	until, ok := m[key]
 	if !ok {
 		return false
 	}
+
 	if now.After(until) {
 		delete(m, key)
 		return false
 	}
+
 	return true
 }
 
 func (s *Server) isUnavailablePeerInWindow(addr string, now time.Time) bool {
 	s.providerFailureMu.Lock()
 	defer s.providerFailureMu.Unlock()
+
 	until, ok := s.unavailableProviders[addr]
 	if !ok {
 		return false
 	}
+
 	if now.After(until) {
 		delete(s.unavailableProviders, addr)
 		return false
 	}
+
 	return true
 }
 
@@ -1615,6 +1745,7 @@ func (s *Server) firePrefetch(kind ifaces.OriginRefKind, registry, repository st
 	if s.prefetcher == nil || kind != ifaces.KindManifest {
 		return
 	}
+
 	go s.prefetcher.OnManifestServed(context.Background(), registry, repository, d)
 }
 
@@ -1630,14 +1761,18 @@ func (s *Server) reAdvertiseDigest(d digest.Digest, op string, logger *slog.Logg
 	if s.dht == nil {
 		return
 	}
+
 	dHash := d
+
 	go func() {
 		provCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
+
 		if perr := s.dht.Provide(provCtx, dHash); perr != nil {
 			if s.metrics.onProvideError != nil {
 				s.metrics.onProvideError(op)
 			}
+
 			logger.Debug("mirror: post-commit dht.Provide failed",
 				slog.String("op", op),
 				slog.String("digest", dHash.String()),
@@ -1654,24 +1789,24 @@ func (s *Server) reAdvertiseDigest(d digest.Digest, op string, logger *slog.Logg
 // across two packages (see the WithMetrics, WithOriginSuccessMetric,
 // and WithDownstreamFailureMetric doc comments):
 //
-//   - p2p_origin_pull_total{kind}            : bumped by origin.Client
-//     at Pull entry (via origin.WithMetrics' onPullStart hook).
-//     origin.Client.Head deliberately does NOT bump this counter.
-//   - p2p_origin_pull_failure_total{kind,class} : bumped from two
-//     places — origin.Client.recordFailure (true origin-side
-//     failures: non-2xx, network errors) AND the mirror's
-//     fireOriginDownstreamFailure (downstream failures after
-//     origin returned 2xx: io.Copy stall, cw.Commit, directVerifier).
-//   - p2p_origin_failure_total{class}        : bumped ONLY by
-//     origin.Client.recordFailure (true origin-side failures).
-//     Reserved for the "is the origin sick?" operator alert; the
-//     mirror's downstream-failure hook does NOT bump it.
-//   - p2p_origin_pull_success_total{kind}    : bumped by the mirror
-//     (fireOriginSuccess) after cw.Commit succeeds or the direct-
-//     stream digest verifier passes, AND by the puller pump's
-//     runOriginPull after that path's cw.Commit. Origin cannot
-//     emit success because origin has no way to know whether the
-//     caller actually committed bytes.
+// - p2p_origin_pull_total{kind} : bumped by origin.Client
+// at Pull entry (via origin.WithMetrics' onPullStart hook).
+// origin.Client.Head deliberately does NOT bump this counter.
+// - p2p_origin_pull_failure_total{kind,class} : bumped from two
+// places - origin.Client.recordFailure (true origin-side
+// failures: non-2xx, network errors) AND the mirror's
+// fireOriginDownstreamFailure (downstream failures after
+// origin returned 2xx: io.Copy stall, cw.Commit, directVerifier).
+// - p2p_origin_failure_total{class} : bumped ONLY by
+// origin.Client.recordFailure (true origin-side failures).
+// Reserved for the "is the origin sick?" operator alert; the
+// mirror's downstream-failure hook does NOT bump it.
+// - p2p_origin_pull_success_total{kind} : bumped by the mirror
+// (fireOriginSuccess) after cw.Commit succeeds or the direct-
+// stream digest verifier passes, AND by the puller pump's
+// runOriginPull after that path's cw.Commit. Origin cannot
+// emit success because origin has no way to know whether the
+// caller actually committed bytes.
 //
 // Together this layout preserves the per-pull arithmetic identity:
 //
@@ -1696,6 +1831,7 @@ func (s *Server) fireOriginStreamStarted(kind ifaces.OriginRefKind) {
 	if s.metrics.onOriginStreamStarted == nil {
 		return
 	}
+
 	s.metrics.onOriginStreamStarted(kind.MetricLabel())
 }
 
@@ -1703,6 +1839,7 @@ func (s *Server) fireOriginStreamCompleted(kind ifaces.OriginRefKind) {
 	if s.metrics.onOriginStreamCompleted == nil {
 		return
 	}
+
 	s.metrics.onOriginStreamCompleted(kind.MetricLabel())
 }
 
@@ -1710,6 +1847,7 @@ func (s *Server) fireOriginStreamFailed(kind ifaces.OriginRefKind) {
 	if s.metrics.onOriginStreamFailed == nil {
 		return
 	}
+
 	s.metrics.onOriginStreamFailed(kind.MetricLabel())
 }
 
@@ -1717,6 +1855,7 @@ func (s *Server) fireLiveStreamCompleted(d digest.Digest) {
 	if s.metrics.onLiveStreamCompleted == nil {
 		return
 	}
+
 	s.metrics.onLiveStreamCompleted(d)
 }
 
@@ -1725,14 +1864,15 @@ func (s *Server) fireLiveStreamCompleted(d digest.Digest) {
 // this AFTER the response body has been streamed AND the cluster has
 // produced a useful artifact from it (cache commit OK, or
 // direct-stream digest verifier passed when cache is unavailable).
-// Calling it earlier — e.g. inside a deferred Close() on the origin
-// reader — inflates the success counter against HEAD requests, io.Copy
+// Calling it earlier - e.g. inside a deferred Close on the origin
+// reader - inflates the success counter against HEAD requests, io.Copy
 // interruptions, and cache-commit failures (the exact bug the
-// eleventh review flagged as "false positives on the success metric").
+// a prior review flagged as "false positives on the success metric").
 func (s *Server) fireOriginSuccess(kind ifaces.OriginRefKind, bytes int64) {
 	if s.metrics.onOriginSuccess == nil {
 		return
 	}
+
 	s.metrics.onOriginSuccess(kind.MetricLabel(), bytes)
 }
 
@@ -1743,21 +1883,22 @@ func (s *Server) fireOriginSuccess(kind ifaces.OriginRefKind, bytes int64) {
 // / directVerifier.Verify) AFTER origin returned 2xx. Origin-side
 // failures (origin.Pull returned an *ifaces.OriginError) are
 // counted separately by origin.WithMetrics' failure closure and
-// must NOT also fire this hook — see WithDownstreamFailureMetric's
+// must NOT also fire this hook - see WithDownstreamFailureMetric's
 // doc for the cleanup of the two counters.
 func (s *Server) fireOriginDownstreamFailure(kind ifaces.OriginRefKind, class ifaces.FailureClass) {
 	if s.metrics.onOriginDownstreamFailure == nil {
 		return
 	}
+
 	s.metrics.onOriginDownstreamFailure(kind.MetricLabel(), string(class))
 }
 
-// classifyOriginFailureClass extracts the §5.8 FailureClass from an
+// classifyOriginFailureClass extracts the FailureClass from an
 // origin-side error. Mirrors the same classification the puller-pump
 // path's recordOriginFailure (cmd/gantry/main.go) uses: an
 // *ifaces.OriginError carries a class, anything else (cache writer
 // open errors, copy stalls, commit digest mismatches) maps to
-// FailureTransient — not the origin's fault, but treating them as
+// FailureTransient - not the origin's fault, but treating them as
 // transient blocks the cluster from re-hammering the same puller on
 // a flapping local disk or a content-injection proxy while still
 // self-healing on the next cooldown elapse.
@@ -1766,12 +1907,13 @@ func classifyOriginFailureClass(err error) ifaces.FailureClass {
 	if errors.As(err, &oe) && oe.Class != ifaces.FailureUnspecified {
 		return oe.Class
 	}
+
 	return ifaces.FailureTransient
 }
 
 // recordNegCacheFailure routes a terminal direct-origin failure into
-// the optional §5.8 negative-cache recorder. Nil-safe: leaves the
-// pre-thirteenth-review behaviour untouched when no recorder is
+// the optional the design doc negative-cache recorder. Nil-safe: leaves the
+// pre-behaviour untouched when no recorder is
 // wired. Symmetric with the puller-pump path's recordOriginFailure
 // (cmd/gantry/main.go) which seeds the same cache for the
 // please_pull-coordinated path.
@@ -1779,10 +1921,11 @@ func (s *Server) recordNegCacheFailure(d digest.Digest, err error) {
 	if s.negCache == nil {
 		return
 	}
+
 	s.negCache.RecordFailure(d, classifyOriginFailureClass(err))
 }
 
-// recordNegCacheSuccess clears any prior §5.8 cooldown entry for d
+// recordNegCacheSuccess clears any prior the design doc cooldown entry for d
 // when the mirror's direct-origin path produces a committed (or
 // direct-stream-verified) artifact. Nil-safe; symmetric with the
 // puller-pump path's neg.RecordSuccess(d) call after cw.Commit.
@@ -1790,31 +1933,37 @@ func (s *Server) recordNegCacheSuccess(d digest.Digest) {
 	if s.negCache == nil {
 		return
 	}
+
 	s.negCache.RecordSuccess(d)
 }
 
 func streamDigestToClient(w http.ResponseWriter, src io.Reader, d digest.Digest, size int64, kind ifaces.OriginRefKind) (int64, error) {
 	br := bufio.NewReader(src)
+
 	var sniff []byte
 	// Peek the first bytes for both blobs (which may carry manifest
 	// bytes via the origin /blobs/->/manifests/ fallback) AND manifests
 	// (which may carry a manifest LIST/index body that needs the
-	// matching Content-Type — see writeBlobHeadersWithPrefix for the
+	// matching Content-Type - see writeBlobHeadersWithPrefix for the
 	// "expected manifest but found index" failure mode this prevents).
 	if kind == ifaces.KindBlob || kind == ifaces.KindManifest {
 		if peek, _ := br.Peek(512); len(peek) > 0 { //nolint:errcheck // peek best-effort for logging
 			sniff = peek
 		}
 	}
+
 	writeBlobHeadersWithPrefix(w, d, size, kind, sniff)
 	verifier := digestpipe.New(w)
+
 	written, err := io.Copy(verifier, br)
 	if err != nil {
 		return written, err
 	}
+
 	if err := verifier.Verify(d); err != nil {
 		return written, err
 	}
+
 	return written, nil
 }
 
@@ -1859,6 +2008,7 @@ func writeBlobHeaders(w http.ResponseWriter, d digest.Digest, size int64, kind i
 
 func writeBlobHeadersWithPrefix(w http.ResponseWriter, d digest.Digest, size int64, kind ifaces.OriginRefKind, sniffPrefix []byte) {
 	w.Header().Set("Docker-Content-Digest", d.String())
+
 	if w.Header().Get("Content-Type") == "" {
 		switch kind {
 		case ifaces.KindManifest:
@@ -1866,7 +2016,7 @@ func writeBlobHeadersWithPrefix(w http.ResponseWriter, d digest.Digest, size int
 			// response Content-Type to populate the in-memory image's
 			// Target.MediaType. With an empty header it later rejects
 			// the unpack with "Target.MediaType must be set: invalid
-			// argument" — even though the manifest body carries its
+			// argument" - even though the manifest body carries its
 			// own schemaVersion + mediaType.
 			//
 			// Critically, containerd ALSO uses this Content-Type to
@@ -1897,6 +2047,7 @@ func writeBlobHeadersWithPrefix(w http.ResponseWriter, d digest.Digest, size int
 			}
 		}
 	}
+
 	if size >= 0 {
 		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 	}
@@ -1934,25 +2085,28 @@ func sniffManifestContentType(prefix []byte) string {
 	if bytes.Contains(prefix, []byte("\"schemaVersion\"")) || bytes.Contains(prefix, []byte("\"schemaVersion\":")) {
 		return "application/vnd.oci.image.manifest.v1+json"
 	}
+
 	return ""
 }
 
 // writeOriginError maps an *ifaces.OriginError to an HTTP status code that
 // matches what containerd expects from an OCI Distribution endpoint.
 //
-// Phase 1 mapping (refined by §5.8 in Phase 4):
+// mapping (refined by the design doc in):
 //
-//	FailureAuth         401
-//	FailureNotFound     404
-//	FailureRateLimited  429
-//	FailureTransient    503  (← lets hosts.toml fall through to origin)
+//	FailureAuth 401
+//	FailureNotFound 404
+//	FailureRateLimited 429
+//	FailureTransient 503 (← lets hosts.toml fall through to origin)
 func writeOriginError(w http.ResponseWriter, err error, logger *slog.Logger) {
 	var oe *ifaces.OriginError
 	if !errors.As(err, &oe) {
 		logger.Warn("mirror: non-classified origin error", slog.Any("err", err))
 		http.Error(w, "origin error", http.StatusBadGateway)
+
 		return
 	}
+
 	switch oe.Class {
 	case ifaces.FailureAuth:
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -1970,19 +2124,22 @@ func isDigestRef(ref string) bool { return strings.HasPrefix(ref, "sha256:") }
 // ListenAndServe runs the mirror on the configured loopback address. The
 // returned function stops the server gracefully.
 func (s *Server) ListenAndServe(addr string) (func(context.Context) error, error) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("mirror: listen %s: %w", addr, err)
+	}
+
 	srv := &http.Server{
-		Addr:              addr,
 		Handler:           s.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
-	errc := make(chan error, 1)
+
 	go func() {
-		err := srv.ListenAndServe()
-		if !errors.Is(err, http.ErrServerClosed) {
-			errc <- err
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Default().Error("mirror: serve error", slog.Any("err", err))
 		}
-		close(errc)
 	}()
+
 	return func(ctx context.Context) error {
 		return srv.Shutdown(ctx)
 	}, nil

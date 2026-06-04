@@ -41,16 +41,19 @@ func newFakeStore() *fakeContentStore {
 func (f *fakeContentStore) put(mt string, payload []byte) ocispec.Descriptor {
 	d := godigest.FromBytes(payload)
 	f.blobs[d] = payload
+
 	return ocispec.Descriptor{MediaType: mt, Digest: d, Size: int64(len(payload))}
 }
 
 // putJSON marshals v to JSON, stores it, and returns the descriptor.
 func (f *fakeContentStore) putJSON(t *testing.T, mt string, v any) ocispec.Descriptor {
 	t.Helper()
+
 	b, err := json.Marshal(v)
 	if err != nil {
 		t.Fatalf("marshal %T: %v", v, err)
 	}
+
 	return f.put(mt, b)
 }
 
@@ -59,6 +62,7 @@ func (f *fakeContentStore) Info(_ context.Context, dgst godigest.Digest) (conten
 	if !ok {
 		return content.Info{}, cerrdefs.ErrNotFound
 	}
+
 	return content.Info{Digest: dgst, Size: int64(len(b)), CreatedAt: time.Unix(0, 0), UpdatedAt: time.Unix(0, 0)}, nil
 }
 
@@ -72,12 +76,15 @@ func (f *fakeContentStore) Walk(_ context.Context, fn content.WalkFunc, _ ...str
 	for d := range f.blobs {
 		keys = append(keys, d)
 	}
+
 	sort.Slice(keys, func(i, j int) bool { return keys[i].String() < keys[j].String() })
+
 	for _, d := range keys {
 		if err := fn(content.Info{Digest: d, Size: int64(len(f.blobs[d]))}); err != nil {
 			return err
 		}
 	}
+
 	return nil
 }
 
@@ -90,6 +97,7 @@ func (f *fakeContentStore) ReaderAt(_ context.Context, desc ocispec.Descriptor) 
 	if !ok {
 		return nil, cerrdefs.ErrNotFound
 	}
+
 	return &fakeReaderAt{data: b}, nil
 }
 
@@ -117,10 +125,12 @@ func (r *fakeReaderAt) ReadAt(p []byte, off int64) (int, error) {
 	if off >= int64(len(r.data)) {
 		return 0, io.EOF
 	}
+
 	n := copy(p, r.data[off:])
 	if n < len(p) {
 		return n, io.EOF
 	}
+
 	return n, nil
 }
 
@@ -137,7 +147,9 @@ var (
 // instead of order-dependent slice equality.
 func digestSet(t *testing.T, in any) map[string]struct{} {
 	t.Helper()
+
 	out := map[string]struct{}{}
+
 	switch v := in.(type) {
 	case []godigest.Digest:
 		for _, d := range v {
@@ -145,9 +157,10 @@ func digestSet(t *testing.T, in any) map[string]struct{} {
 		}
 	default:
 		// Reflective fallback for []gdigest.Digest (gantry-internal type)
-		// not worth importing here — caller must convert first.
+		// not worth importing here - caller must convert first.
 		t.Fatalf("digestSet: unsupported type %T", in)
 	}
+
 	return out
 }
 
@@ -171,13 +184,16 @@ func TestWalkBlobs_SimpleImage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("walkBlobs: %v", err)
 	}
+
 	if len(got) != 3 {
 		t.Fatalf("walkBlobs returned %d digests, want 3", len(got))
 	}
+
 	gotSet := map[string]struct{}{}
 	for _, d := range got {
 		gotSet[d.String()] = struct{}{}
 	}
+
 	for _, want := range []godigest.Digest{manifestDesc.Digest, configDesc.Digest, layerDesc.Digest} {
 		if _, ok := gotSet[want.String()]; !ok {
 			t.Errorf("missing digest %s in walk output", want)
@@ -213,13 +229,16 @@ func TestWalkBlobs_AbsentChildNotAdvertised(t *testing.T) {
 	if err != nil {
 		t.Fatalf("walkBlobs: %v", err)
 	}
+
 	gotSet := map[string]struct{}{}
 	for _, d := range got {
 		gotSet[d.String()] = struct{}{}
 	}
+
 	if _, ok := gotSet[missingLayer.Digest.String()]; ok {
 		t.Errorf("missing layer %s was advertised despite being absent from the content store", missingLayer.Digest)
 	}
+
 	for _, want := range []godigest.Digest{manifestDesc.Digest, configDesc.Digest, presentLayer.Digest} {
 		if _, ok := gotSet[want.String()]; !ok {
 			t.Errorf("present digest %s missing from walk output", want)
@@ -264,15 +283,18 @@ func TestWalkBlobs_MultiArchIndexPartialPlatform(t *testing.T) {
 	if err != nil {
 		t.Fatalf("walkBlobs: %v", err)
 	}
+
 	gotSet := map[string]struct{}{}
 	for _, d := range got {
 		gotSet[d.String()] = struct{}{}
 	}
+
 	for _, want := range []godigest.Digest{indexDesc.Digest, amdManifestDesc.Digest, amdConfig.Digest, amdLayer.Digest} {
 		if _, ok := gotSet[want.String()]; !ok {
 			t.Errorf("present digest %s missing from walk output", want)
 		}
 	}
+
 	if _, ok := gotSet[arm64Desc.Digest.String()]; ok {
 		t.Errorf("arm64 manifest digest %s was advertised despite being absent", arm64Desc.Digest)
 	}
@@ -281,7 +303,7 @@ func TestWalkBlobs_MultiArchIndexPartialPlatform(t *testing.T) {
 // TestWalkBlobs_UnsupportedAlgorithmSkipped verifies that a descriptor
 // with a non-sha256 digest is skipped without aborting the walk.
 // Currently gdigest.Parse only accepts sha256, so anything else MUST
-// be silently dropped — the rest of the agent cannot operate on it.
+// be silently dropped - the rest of the agent cannot operate on it.
 func TestWalkBlobs_UnsupportedAlgorithmSkipped(t *testing.T) {
 	store := newFakeStore()
 	// Build a small synthetic manifest blob and register it under a
@@ -292,6 +314,7 @@ func TestWalkBlobs_UnsupportedAlgorithmSkipped(t *testing.T) {
 	// because we never asked images.Children to dereference it via
 	// its real sha256 digest).
 	const sha512Hex = "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+
 	sha512Digest := godigest.Digest("sha512:" + sha512Hex)
 	store.blobs[sha512Digest] = []byte(`{"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{},"layers":[]}`)
 	manifestDesc := ocispec.Descriptor{
@@ -304,6 +327,7 @@ func TestWalkBlobs_UnsupportedAlgorithmSkipped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("walkBlobs: %v", err)
 	}
+
 	for _, d := range got {
 		if strings.HasPrefix(d.String(), "sha512") {
 			t.Errorf("walkBlobs emitted non-sha256 digest %s", d)
@@ -348,11 +372,12 @@ func (e *errorStore) Info(ctx context.Context, dgst godigest.Digest) (content.In
 	if dgst == e.failDigest && e.failErr != nil {
 		return content.Info{}, e.failErr
 	}
+
 	return e.fakeContentStore.Info(ctx, dgst)
 }
 
 // silence digestSet linter when unused in this file
 var (
-	_ = digestSet      //nolint:errcheck // best-effort
-	_ = regexp.Compile //nolint:errcheck // best-effort
+	_ = digestSet
+	_ = regexp.Compile
 )

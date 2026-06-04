@@ -1,21 +1,21 @@
-# gantry — Kubernetes DaemonSet (one agent per worker node).
+# gantry - Kubernetes DaemonSet (one agent per worker node).
 #
 # §Phase 6 design notes:
-#   - hostNetwork: false (§7.5) — pods use the cluster Pod network and
+#   - hostNetwork: false (§7.5) - pods use the cluster Pod network and
 #     dial each other directly via Pod IPs. peering ports (5001 +
 #     libp2p) are restricted by the optional hardening overlay in
 #     deploy/examples/networkpolicy.yaml (see deploy/README.md §
-#     Hardening overlays for the workflow — the overlay is NOT part
+#     Hardening overlays for the workflow - the overlay is NOT part
 #     of the default install).
 #   - hostPath mounts:
-#       /var/lib/gantry/libp2p  — persistent libp2p identity key, so
+#       /var/lib/gantry/libp2p  - persistent libp2p identity key, so
 #                                  the same peer ID survives restarts
 #                                  and DHT routing tables don't churn.
-#       /run/containerd/containerd.sock — containerd CRI socket; the
+#       /run/containerd/containerd.sock - containerd CRI socket; the
 #                                  agent reads and writes the content
 #                                  store directly (Plan §Phase 8).
 #                                  The hostPath /var/lib/gantry/cache
-#                                  volume was REMOVED in Phase 8 — the
+#                                  volume was REMOVED in Phase 8 - the
 #                                  agent no longer maintains its own
 #                                  blob cache; containerd is the
 #                                  source of truth.
@@ -153,19 +153,19 @@ spec:
             - agent
             - --config=/etc/gantry/config.yaml
           env:
-            # NODE_NAME → membership informer's "self" lookup (§7.3).
+            # NODE_NAME -> membership informer's "self" lookup (§7.3).
             - name: GANTRY_NODE_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
-            # POD_NAME → self-patch annotations with libp2p peer.ID
+            # POD_NAME -> self-patch annotations with libp2p peer.ID
             # and transfer endpoint so peers discover us via members
             # informer (§7.2, §7.3).
             - name: GANTRY_POD_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
-            # POD_IP → used by self-announce to rewrite the 0.0.0.0
+            # POD_IP -> used by self-announce to rewrite the 0.0.0.0
             # listeners into routable advertised addresses. Without
             # this, peers see /ip4/0.0.0.0/tcp/4001 in our
             # gantry.io/p2p-addrs annotation and cannot dial back.
@@ -173,12 +173,12 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
-            # MEMBERS_NAMESPACE → scope the pod informer that
+            # MEMBERS_NAMESPACE -> scope the pod informer that
             # enumerates peer agents. Sourced from the downward API
             # (metadata.namespace) rather than hard-coded to
             # gantry-system so an overlay that renames the namespace
             # (Kustomize, Helm, separate dev/prod installs) only has
-            # to patch metadata.namespace on the DaemonSet — the env
+            # to patch metadata.namespace on the DaemonSet - the env
             # var follows automatically. Default install behaviour
             # is identical because the DaemonSet ships in
             # gantry-system.
@@ -187,7 +187,7 @@ spec:
                 fieldRef:
                   fieldPath: metadata.namespace
           ports:
-            # mirror (loopback only) — listed here for documentation.
+            # mirror (loopback only) - listed here for documentation.
             - name: mirror
               containerPort: 5000
               hostPort: 5000

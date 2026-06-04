@@ -14,10 +14,12 @@ import (
 func TestScoreDeterministic(t *testing.T) {
 	d := digest.MustParse("sha256:" + repeat('a', 64))
 	a := Score("node-1", d)
+
 	b := Score("node-1", d)
 	if a != b {
 		t.Fatalf("Score not deterministic: %x vs %x", a, b)
 	}
+
 	c := Score("node-2", d)
 	if a == c {
 		t.Fatal("Score collision across distinct node IDs")
@@ -63,11 +65,13 @@ func TestTopK_Stability(t *testing.T) {
 	for i, n := range nodes {
 		rev[len(nodes)-1-i] = n
 	}
+
 	b := TopK(rev, d, 5)
 
 	if len(a) != len(b) {
 		t.Fatalf("len mismatch %d vs %d", len(a), len(b))
 	}
+
 	for i := range a {
 		if a[i].Node.ID != b[i].Node.ID {
 			t.Errorf("rank %d: %s vs %s", i, a[i].Node.ID, b[i].Node.ID)
@@ -80,9 +84,11 @@ func TestTopK_Empty(t *testing.T) {
 	if got := TopK(nil, d, 3); got != nil {
 		t.Errorf("TopK(nil) = %v; want nil", got)
 	}
+
 	if got := TopK([]ifaces.Node{}, d, 3); got != nil {
 		t.Errorf("TopK(empty) = %v; want nil", got)
 	}
+
 	if got := TopK(makeNodes(3, ""), d, 0); got != nil {
 		t.Errorf("TopK(k=0) = %v; want nil", got)
 	}
@@ -91,6 +97,7 @@ func TestTopK_Empty(t *testing.T) {
 func TestTopK_FewerThanK(t *testing.T) {
 	nodes := makeNodes(2, "")
 	d := digest.MustParse("sha256:" + repeat('d', 64))
+
 	top := TopK(nodes, d, 5)
 	if len(top) != 2 {
 		t.Fatalf("len(top) = %d, want 2", len(top))
@@ -102,6 +109,7 @@ func TestRankOf_Consistent(t *testing.T) {
 	// top-K.
 	nodes := makeNodes(30, "")
 	d := digest.MustParse("sha256:" + repeat('e', 64))
+
 	top := TopK(nodes, d, len(nodes))
 	for i, s := range top {
 		got := RankOf(nodes, s.Node.ID, d)
@@ -113,32 +121,35 @@ func TestRankOf_Consistent(t *testing.T) {
 
 func TestRankOf_AbsentReturnsNegOne(t *testing.T) {
 	nodes := makeNodes(5, "")
+
 	d := digest.MustParse("sha256:" + repeat('f', 64))
 	if got := RankOf(nodes, "not-a-member", d); got != -1 {
 		t.Errorf("RankOf(absent) = %d, want -1", got)
 	}
 }
 
-// TestScoredLess_TieBreak locks in the §5.3 invariant that TopK's
+// TestScoredLess_TieBreak locks in the invariant that TopK's
 // internal comparator agrees with RankOf when scores collide. SHA-256
 // collisions never occur in real traffic, but this comparator is the
 // one place where the two paths could silently disagree on the
-// tie-break — and the disagreement would only surface as a flickering
+// tie-break - and the disagreement would only surface as a flickering
 // p2p_hrw_rank_mismatch_total in production. The contract is:
-// equal scores → lex-larger node ID is "better".
+// equal scores -> lex-larger node ID is "better".
 func TestScoredLess_TieBreak(t *testing.T) {
 	var same [32]byte
 	for i := range same {
 		same[i] = 0xAA
 	}
+
 	a := Scored{Node: ifaces.Node{ID: "alpha"}, Score: same}
 	b := Scored{Node: ifaces.Node{ID: "bravo"}, Score: same}
 
-	// Equal scores: lex-larger ID wins → "alpha" is the smaller
+	// Equal scores: lex-larger ID wins -> "alpha" is the smaller
 	// (lower-ranked) of the two, so scoredLess(alpha, bravo) is true.
 	if !scoredLess(a, b) {
 		t.Errorf("scoredLess(alpha, bravo) = false; want true (equal score, lex tie-break)")
 	}
+
 	if scoredLess(b, a) {
 		t.Errorf("scoredLess(bravo, alpha) = true; want false")
 	}
@@ -147,7 +158,7 @@ func TestScoredLess_TieBreak(t *testing.T) {
 	// at rank 1 and "bravo" at rank 0.
 	cluster := []ifaces.Node{a.Node, b.Node}
 	// Force-collide both scores by using a digest whose Score we don't
-	// care about — RankOf computes scores internally so we can't
+	// care about - RankOf computes scores internally so we can't
 	// pre-seed equal scores via the public API. Skip the RankOf
 	// half-check; the contract is locked in by the scoredLess test
 	// itself and the production code uses the same primitive in both
@@ -162,10 +173,12 @@ func TestCandidates_ZoneFiltersByZone(t *testing.T) {
 		{ID: "c", Zone: "z1"},
 		{ID: "d", Zone: ""},
 	}
+
 	got := Candidates(nodes, ScopeZone, "z1")
 	if len(got) != 2 {
 		t.Fatalf("len = %d; want 2", len(got))
 	}
+
 	if got[0].ID != "a" || got[1].ID != "c" {
 		t.Errorf("got IDs %v; want [a c]", []ifaces.NodeID{got[0].ID, got[1].ID})
 	}
@@ -180,6 +193,7 @@ func TestCandidates_ZoneWithEmptyRequesterZoneReturnsEmpty(t *testing.T) {
 
 func TestCandidates_ClusterPassThrough(t *testing.T) {
 	nodes := []ifaces.Node{{ID: "a"}, {ID: "b"}}
+
 	got := Candidates(nodes, ScopeCluster, "anywhere")
 	if len(got) != 2 || got[0].ID != "a" || got[1].ID != "b" {
 		t.Errorf("ScopeCluster filter changed nodes: %v", got)
@@ -209,6 +223,7 @@ func makeNodes(n int, zone string) []ifaces.Node {
 	for i := range out {
 		out[i] = ifaces.Node{ID: ifaces.NodeID("node-" + strconv.Itoa(i)), Zone: zone}
 	}
+
 	return out
 }
 
@@ -217,5 +232,6 @@ func repeat(c byte, n int) string {
 	for i := range b {
 		b[i] = c
 	}
+
 	return string(b)
 }

@@ -80,7 +80,7 @@ func TestPatchDaemonSetForE2E_TargetsGantryContainerOnly(t *testing.T) {
 
 	// Specifically: the line that follows the busybox image
 	// must still be `imagePullPolicy: IfNotPresent`. This is the
-	// load-bearing assertion — it's the exact bug class the
+	// load-bearing assertion - it's the exact bug class the
 	// twelfth review flagged.
 	busyboxIdx := strings.Index(patched, busyboxImage)
 	if busyboxIdx < 0 {
@@ -152,20 +152,20 @@ func TestPatchConfigMapForE2E_RewritesUpstreamRegistries(t *testing.T) {
 	}
 
 	// The e2e replacement must reference an anonymous public
-	// registry — no credentials_path, no placeholder host.
+	// registry - no credentials_path, no placeholder host.
 	if !strings.Contains(patched, `name: "registry.k8s.io"`) {
 		t.Errorf("patched ConfigMap missing the e2e registry.k8s.io registry entry")
 	}
 	if !strings.Contains(patched, `endpoint: "https://registry.k8s.io"`) {
 		t.Errorf("patched ConfigMap missing the registry.k8s.io endpoint")
 	}
-	// The original placeholder host must be GONE — leaving it in
+	// The original placeholder host must be GONE - leaving it in
 	// would make every cache-miss request fail DNS on kind.
 	if strings.Contains(patched, "registry.example.com") {
 		t.Errorf("patched ConfigMap still contains the production placeholder 'registry.example.com'; the swap did not apply")
 	}
 	// The commented-out ghcr.io alternative entry must also be
-	// gone — the whole upstream_registries block is replaced.
+	// gone - the whole upstream_registries block is replaced.
 	if strings.Contains(patched, `name: "ghcr.io"`) {
 		t.Errorf("patched ConfigMap still contains the commented ghcr.io alternative; the swap did not replace the whole block")
 	}

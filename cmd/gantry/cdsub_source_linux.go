@@ -21,9 +21,10 @@ import (
 // constructed.
 func newCdsubSource(c *config.Config, logger *slog.Logger) cdsub.ImageSource {
 	if c.ContainerdSocket == "" {
-		logger.Info("cdsub: containerd_socket empty — running with NoOpSource")
+		logger.Info("cdsub: containerd_socket empty - running with NoOpSource")
 		return cdsub.NoOpSource{}
 	}
+
 	src, err := cdsub.NewContainerdSource(c.ContainerdSocket, c.ContainerdNamespace,
 		cdsub.WithContainerdLogger(logger),
 	)
@@ -33,8 +34,10 @@ func newCdsubSource(c *config.Config, logger *slog.Logger) cdsub.ImageSource {
 			slog.String("namespace", c.ContainerdNamespace),
 			slog.Any("err", err),
 		)
+
 		return cdsub.NoOpSource{}
 	}
+
 	return src
 }
 
@@ -51,7 +54,7 @@ func newCdsubSource(c *config.Config, logger *slog.Logger) cdsub.ImageSource {
 // advertiser without opening a second containerd connection.
 //
 // The lease manager from the same containerd connection is wired in
-// (Plan §Phase 7) so background Gantry ingests can create a bounded
+// (Plan) so background Gantry ingests can create a bounded
 // lease before writing into the content store, without opening a
 // second gRPC channel.
 func containerdBackedStore(src cdsub.ImageSource, c *config.Config, extra ...containerdstore.Option) *containerdstore.Store {
@@ -59,35 +62,42 @@ func containerdBackedStore(src cdsub.ImageSource, c *config.Config, extra ...con
 	if !ok {
 		return nil
 	}
+
 	store := cs.ContentStore()
 	if store == nil {
 		return nil
 	}
+
 	opts := []containerdstore.Option{
 		containerdstore.WithNamespace(cs.Namespace()),
 	}
 	if lm := cs.LeasesService(); lm != nil {
 		opts = append(opts, containerdstore.WithLeaseManager(lm))
 	}
+
 	if c != nil && c.ContainerdLeaseTTL > 0 {
 		opts = append(opts, containerdstore.WithLeaseTTL(c.ContainerdLeaseTTL))
 	}
+
 	opts = append(opts, extra...)
+
 	return containerdstore.New(store, opts...)
 }
 
-// wireDescriptorRecorder plumbs cdsub walker → containerdstore
-// descriptor index (plan §"Descriptor index"). On linux the source
+// wireDescriptorRecorder plumbs cdsub walker -> containerdstore
+// descriptor index ("Descriptor index"). On linux the source
 // is the real containerd one; on non-linux dev builds it is
 // NoOpSource and this becomes a no-op.
 func wireDescriptorRecorder(src cdsub.ImageSource, store *containerdstore.Store) {
 	if store == nil {
 		return
 	}
+
 	cs, ok := src.(*cdsub.ContainerdSource)
 	if !ok {
 		return
 	}
+
 	cs.SetMediaTypeRecorder(func(d digest.Digest, mt string) {
 		store.RememberMediaType(d, mt)
 	})

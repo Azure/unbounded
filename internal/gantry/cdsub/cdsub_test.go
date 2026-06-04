@@ -31,12 +31,14 @@ func (f *fakeSource) List(_ context.Context) ([]ImageEvent, error) {
 	atomic.AddInt32(&f.listCalls, 1)
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
 	if f.listErr != nil {
 		return nil, f.listErr
 	}
 	// Return a copy.
 	out := make([]ImageEvent, len(f.listOut))
 	copy(out, f.listOut)
+
 	return out, nil
 }
 
@@ -68,8 +70,12 @@ func TestRun_ReconcilesAndAnnouncesEvents(t *testing.T) {
 	}
 
 	dht := fakes.NewDHT()
-	var announceCount int32
-	var reconcileCount int32
+
+	var (
+		announceCount  int32
+		reconcileCount int32
+	)
+
 	sub := New(src, dht,
 		WithBackoff(50*time.Millisecond, 100*time.Millisecond),
 		WithProvideTimeout(time.Second),
@@ -82,7 +88,9 @@ func TestRun_ReconcilesAndAnnouncesEvents(t *testing.T) {
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
+
 	done := make(chan error, 1)
+
 	go func() { done <- sub.Run(ctx) }()
 
 	// Wait for reconcile + event to be processed.
@@ -91,11 +99,13 @@ func TestRun_ReconcilesAndAnnouncesEvents(t *testing.T) {
 		if atomic.LoadInt32(&announceCount) >= 3 {
 			break
 		}
+
 		time.Sleep(20 * time.Millisecond)
 	}
 
 	cancel()
 	close(ch) // unblock the loop's select.
+
 	if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run returned %v", err)
 	}
@@ -103,6 +113,7 @@ func TestRun_ReconcilesAndAnnouncesEvents(t *testing.T) {
 	if got := atomic.LoadInt32(&announceCount); got != 3 {
 		t.Errorf("announce count = %d, want 3 (2 reconciled + 1 event)", got)
 	}
+
 	if got := atomic.LoadInt32(&reconcileCount); got != 2 {
 		t.Errorf("reconcile count = %d, want 2", got)
 	}
@@ -115,7 +126,9 @@ func TestRun_BackoffOnSubscribeError(t *testing.T) {
 			{Kind: EventCreate, Image: "img", Digests: []digest.Digest{d}},
 		},
 	}
+
 	var attempts int32
+
 	failures := 3
 	successCh := make(chan ImageEvent, 1)
 	src.subscribeFn = func(_ context.Context) (<-chan ImageEvent, error) {
@@ -123,18 +136,23 @@ func TestRun_BackoffOnSubscribeError(t *testing.T) {
 		if n <= failures {
 			return nil, errors.New("transient: containerd socket gone")
 		}
+
 		return successCh, nil
 	}
 
 	dht := fakes.NewDHT()
+
 	var reconnects int32
+
 	sub := New(src, dht,
 		WithBackoff(10*time.Millisecond, 100*time.Millisecond),
 		WithMetrics(nil, nil, nil, func() { atomic.AddInt32(&reconnects, 1) }),
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
+
 	done := make(chan error, 1)
+
 	go func() { done <- sub.Run(ctx) }()
 
 	// Wait until we've attempted Subscribe at least 4 times (3 fails + 1 success).
@@ -143,11 +161,13 @@ func TestRun_BackoffOnSubscribeError(t *testing.T) {
 		if atomic.LoadInt32(&attempts) >= int32(failures+1) {
 			break
 		}
+
 		time.Sleep(20 * time.Millisecond)
 	}
 
 	cancel()
 	close(successCh)
+
 	if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run returned %v", err)
 	}
@@ -164,6 +184,7 @@ func TestRun_BackoffOnSubscribeError(t *testing.T) {
 
 func TestRun_DeleteEventIsNoOp(t *testing.T) {
 	d := mkDigest("doomed")
+
 	ch := make(chan ImageEvent, 1)
 	ch <- ImageEvent{Kind: EventDelete, Image: "old", Digests: []digest.Digest{d}}
 
@@ -174,7 +195,9 @@ func TestRun_DeleteEventIsNoOp(t *testing.T) {
 		},
 	}
 	dht := fakes.NewDHT()
+
 	var announceCount int32
+
 	sub := New(src, dht,
 		WithBackoff(50*time.Millisecond, 100*time.Millisecond),
 		WithMetrics(func() { atomic.AddInt32(&announceCount, 1) }, nil, nil, nil),
@@ -182,6 +205,7 @@ func TestRun_DeleteEventIsNoOp(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
+
 	_ = sub.Run(ctx) //nolint:errcheck // best-effort
 
 	if got := atomic.LoadInt32(&announceCount); got != 0 {
@@ -192,8 +216,10 @@ func TestRun_DeleteEventIsNoOp(t *testing.T) {
 func TestRun_NotifierReceivesCreateAndDeleteEvents(t *testing.T) {
 	dCreate := mkDigest("created")
 	dDelete := mkDigest("deleted")
+
 	ch := make(chan ImageEvent, 2)
 	ch <- ImageEvent{Kind: EventCreate, Image: "new", Digests: []digest.Digest{dCreate}}
+
 	ch <- ImageEvent{Kind: EventDelete, Image: "old", Digests: []digest.Digest{dDelete}}
 
 	src := &fakeSource{
@@ -202,35 +228,43 @@ func TestRun_NotifierReceivesCreateAndDeleteEvents(t *testing.T) {
 			return ch, nil
 		},
 	}
+
 	type event struct {
 		d       digest.Digest
 		present bool
 	}
+
 	var (
 		mu     sync.Mutex
 		events []event
 	)
+
 	sub := New(src, nil,
 		WithBackoff(50*time.Millisecond, 100*time.Millisecond),
 		WithNotifier(func(_ context.Context, d digest.Digest, present bool) {
 			mu.Lock()
 			defer mu.Unlock()
+
 			events = append(events, event{d: d, present: present})
 		}),
 	)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
+
 	_ = sub.Run(ctx) //nolint:errcheck // best-effort
 
 	mu.Lock()
 	defer mu.Unlock()
+
 	if len(events) != 2 {
 		t.Fatalf("notifier events = %d, want 2", len(events))
 	}
+
 	if events[0] != (event{d: dCreate, present: true}) {
 		t.Fatalf("events[0] = %+v, want create present=true", events[0])
 	}
+
 	if events[1] != (event{d: dDelete, present: false}) {
 		t.Fatalf("events[1] = %+v, want delete present=false", events[1])
 	}
@@ -243,11 +277,15 @@ func TestRun_ChannelCloseTriggersReconnect(t *testing.T) {
 			{Kind: EventCreate, Image: "x", Digests: []digest.Digest{d}},
 		},
 	}
+
 	var subCalls int32
+
 	src.subscribeFn = func(_ context.Context) (<-chan ImageEvent, error) {
 		c := make(chan ImageEvent)
+
 		atomic.AddInt32(&subCalls, 1)
 		close(c) // immediate close = "lost connection"
+
 		return c, nil
 	}
 
@@ -258,6 +296,7 @@ func TestRun_ChannelCloseTriggersReconnect(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancel()
+
 	_ = sub.Run(ctx) //nolint:errcheck // best-effort
 
 	if got := atomic.LoadInt32(&subCalls); got < 3 {
@@ -278,13 +317,16 @@ func TestRun_ListErrorIsBackedOff(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
+
 	err := sub.Run(ctx)
 	if err == nil {
 		t.Fatal("Run returned nil, want context error")
 	}
+
 	if !strings.Contains(err.Error(), "context") {
 		t.Errorf("Run err = %v, want context error", err)
 	}
+
 	if atomic.LoadInt32(&src.listCalls) < 2 {
 		t.Errorf("list calls = %d, want >= 2 (backoff retried)", src.listCalls)
 	}
@@ -298,6 +340,7 @@ func TestJitter(t *testing.T) {
 			t.Errorf("jitter(%v) = %v, out of [75ms, 125ms]", d, j)
 		}
 	}
+
 	if got := jitter(0); got != 0 {
 		t.Errorf("jitter(0) = %v, want 0", got)
 	}

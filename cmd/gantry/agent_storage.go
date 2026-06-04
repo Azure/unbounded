@@ -15,7 +15,7 @@ import (
 )
 
 // buildContainerdStorage constructs the agent's local content store
-// (plan §Phase 8 — containerd content store is the only backend) and
+// (- containerd content store is the only backend) and
 // the related advertise.Inventory view. Wires the cdsub walker's
 // (digest, mediaType) recorder into the store's descriptor index so
 // the transfer endpoint can serve manifest replies with the right
@@ -28,7 +28,7 @@ import (
 // is the same value typed as the interface the mirror/transfer
 // servers consume; the third is the inventory interface the
 // advertiser consumes. All three values point at the same underlying
-// containerd content store — no duplicate dial.
+// containerd content store - no duplicate dial.
 //
 // An unavailable backend (NoOpSource on linux because the socket
 // could not be dialed, or any non-linux dev build) is a hard error
@@ -50,10 +50,10 @@ func buildContainerdStorage(
 		}),
 	)
 	if cdstore == nil {
-		return nil, nil, nil, fmt.Errorf("storage_mode=containerd selected but containerd content store is unavailable (check containerd_socket and platform — see plan §Phase 5)")
+		return nil, nil, nil, fmt.Errorf("storage_mode=containerd selected but containerd content store is unavailable (check containerd_socket and platform - see plan)")
 	}
-	// Wire the cdsub walker → containerdstore descriptor-index
-	// pipeline (plan §"Descriptor index"). The walker already has
+	// Wire the cdsub walker -> containerdstore descriptor-index
+	// pipeline ("Descriptor index"). The walker already has
 	// (digest, mediaType) for every visited descriptor; forwarding
 	// them now means the transfer endpoint's manifest replies can
 	// set Content-Type without re-parsing the manifest body. The
@@ -63,5 +63,6 @@ func buildContainerdStorage(
 		slog.String("namespace", c.ContainerdNamespace),
 		slog.String("socket", c.ContainerdSocket),
 	)
+
 	return cdstore, cdstore, cdstore, nil
 }

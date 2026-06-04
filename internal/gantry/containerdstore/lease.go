@@ -3,7 +3,7 @@
 
 // Lease management for containerd-mode storage.
 //
-// Background (docs/plan-final-copilot-v2.md, §Phase 7): when Gantry
+// Background : when Gantry
 // ingests bytes into containerd's content store, the bytes need a lease
 // before/during commit because no kubelet Image reference exists yet.
 // Kubelet-pulled content is protected because kubelet creates an Image
@@ -12,28 +12,28 @@
 //
 // This file adds two pieces:
 //
-//  1. CreateLease(ctx, d, source, repo): creates a containerd lease
-//     before ingest, bound to d's content resource with a configurable TTL
-//     plus the
-//     plan-mandated labels:
-//         gantry.io/managed=true
-//         gantry.io/source=<registry>
-//         gantry.io/repository=<repo>
-//         gantry.io/digest=<digest>
-//         containerd.io/gc.expire=<RFC3339 timestamp>
-//     The `containerd.io/gc.expire` label is what containerd's
-//     lease manager recognises for TTL expiration — leases.
-//     WithExpiration() sets it under the hood. The returned guard is
-//     released on failed ingest; AttachLease is retained as a compatibility
-//     wrapper for tests and older call sites.
+// 1. CreateLease(ctx, d, source, repo): creates a containerd lease
+// before ingest, bound to d's content resource with a configurable TTL
+// plus the
+// plan-mandated labels:
+// gantry.io/managed=true
+// gantry.io/source=<registry>
+// gantry.io/repository=<repo>
+// gantry.io/digest=<digest>
+// containerd.io/gc.expire=<RFC3339 timestamp>
+// The `containerd.io/gc.expire` label is what containerd's
+// lease manager recognises for TTL expiration - leases.
+// WithExpiration sets it under the hood. The returned guard is
+// released on failed ingest; AttachLease is retained as a compatibility
+// wrapper for tests and older call sites.
 //
-//  2. CleanupExpiredLeases(ctx): lists every gantry-managed lease,
-//     deletes those past their expiry, and returns the count of
-//     leases removed. Containerd's own GC will then collect any
-//     content the deleted leases were the last reference to.
+// 2. CleanupExpiredLeases(ctx): lists every gantry-managed lease,
+// deletes those past their expiry, and returns the count of
+// leases removed. Containerd's own GC will then collect any
+// content the deleted leases were the last reference to.
 //
-// The Manager interface is the containerd-shipped leases.Manager —
-// the same one production wires via client.LeasesService(). Tests
+// The Manager interface is the containerd-shipped leases.Manager -
+// the same one production wires via client.LeasesService. Tests
 // supply a fake manager that records calls in memory.
 
 package containerdstore
@@ -94,7 +94,7 @@ type LeaseManager interface {
 
 // WithLeaseManager wires the containerd lease manager into the Store
 // so AttachLease and CleanupExpiredLeases can run. Without this option
-// both methods return ErrNoLeaseManager — tests or dev-only wiring
+// both methods return ErrNoLeaseManager - tests or dev-only wiring
 // may omit it; production containerd-only wiring always sets it.
 func WithLeaseManager(m LeaseManager) Option {
 	return func(s *Store) { s.leases = m }
@@ -128,6 +128,7 @@ func (g *LeaseGuard) Release(ctx context.Context) error {
 	if g == nil || g.store == nil {
 		return nil
 	}
+
 	return g.store.leases.Delete(g.store.withNS(ctx), g.lease, leases.SynchronousDelete)
 }
 
@@ -144,6 +145,7 @@ func (s *Store) CreateLease(ctx context.Context, d gdigest.Digest, source, repos
 	if s.leases == nil {
 		return nil, ErrNoLeaseManager
 	}
+
 	ctx = s.withNS(ctx)
 	leaseID := LeasePrefix + d.String() + "-" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	labels := map[string]string{
@@ -153,6 +155,7 @@ func (s *Store) CreateLease(ctx context.Context, d gdigest.Digest, source, repos
 		LabelDigest:     d.String(),
 		LabelCreated:    time.Now().UTC().Format(time.RFC3339),
 	}
+
 	lease, err := s.leases.Create(ctx,
 		leases.WithID(leaseID),
 		leases.WithLabels(labels),
@@ -161,21 +164,25 @@ func (s *Store) CreateLease(ctx context.Context, d gdigest.Digest, source, repos
 	if err != nil {
 		return nil, fmt.Errorf("containerdstore: leases.Create: %w", err)
 	}
+
 	res := leases.Resource{
 		ID:   d.String(),
 		Type: "content",
 	}
 	if err := s.leases.AddResource(ctx, lease, res); err != nil {
-		// Roll back the lease — without a resource binding it
+		// Roll back the lease - without a resource binding it
 		// protects nothing and would still consume a slot.
-		_ = s.leases.Delete(ctx, lease) //nolint:errcheck // best-effort rollback
+		_ = s.leases.Delete(ctx, lease) //nolint:errcheck // best-effort
 		return nil, fmt.Errorf("containerdstore: leases.AddResource: %w", err)
 	}
+
 	return &LeaseGuard{store: s, lease: lease}, nil
 }
 
 // AttachLease creates a containerd lease that keeps d alive for the
-// configured TTL. Idempotent at the digest level: a digest may be
+// configured TTL. The returned LeaseGuard is intentionally discarded
+// because the caller does not need to release this lease early - it
+// will expire via TTL. Idempotent at the digest level: a digest may be
 // referenced by multiple leases without breaking anything, but
 // gantry uses one lease per Commit to keep cleanup arithmetic simple.
 func (s *Store) AttachLease(ctx context.Context, d gdigest.Digest, source, repository string) error {
@@ -197,28 +204,35 @@ func (s *Store) CleanupExpiredLeases(ctx context.Context) (int, error) {
 	if s.leases == nil {
 		return 0, ErrNoLeaseManager
 	}
+
 	ctx = s.withNS(ctx)
+
 	ls, err := s.leases.List(ctx, managedLeaseFilter())
 	if err != nil {
 		return 0, fmt.Errorf("containerdstore: leases.List: %w", err)
 	}
+
 	now := time.Now()
 	deleted := 0
+
 	for _, l := range ls {
 		if !s.isExpired(l, now) {
 			continue
 		}
+
 		if err := s.leases.Delete(ctx, l, leases.SynchronousDelete); err != nil {
 			// NotFound means another process raced us; non-NotFound
 			// errors mean the backend is unhappy. In both cases skip
-			// the counter — it tracks how many leases this pass
+			// the counter - it tracks how many leases this pass
 			// actually removed, not how many it tried to remove.
 			// One lease failing to delete shouldn't block cleanup of
 			// the others; the next pass will retry.
 			continue
 		}
+
 		deleted++
 	}
+
 	return deleted, nil
 }
 
@@ -234,12 +248,14 @@ func (s *Store) isExpired(l leases.Lease, now time.Time) bool {
 			}
 		}
 	}
+
 	if created.IsZero() {
-		// No timestamp available — treat as fresh to avoid deleting
+		// No timestamp available - treat as fresh to avoid deleting
 		// leases we can't safely reason about. The lease's own
 		// containerd.io/gc.expire label will eventually expire it.
 		return false
 	}
+
 	return now.After(created.Add(s.leaseTTL))
 }
 
@@ -251,21 +267,24 @@ func (s *Store) LeaseTTL() time.Duration {
 
 // ListManagedLeases returns the set of Gantry-managed leases currently
 // live in containerd, filtered by the LabelManaged=true label. Used by
-// the §Phase 9 gantry_containerd_lease_active gauge sampler. Returns
-// ErrNoLeaseManager when this Store was built without WithLeases.
+// the the gantry_containerd_lease_active gauge sampler. Returns
+// ErrNoLeaseManager when this Store was built without WithLeaseManager.
 //
-// This is a best-effort snapshot — the catalogue may have changed by
+// This is a best-effort snapshot - the catalogue may have changed by
 // the time the caller observes the slice. Callers that need exact
 // counts should rely on the counters (created/released) instead.
 func (s *Store) ListManagedLeases(ctx context.Context) ([]leases.Lease, error) {
 	if s.leases == nil {
 		return nil, ErrNoLeaseManager
 	}
+
 	ctx = s.withNS(ctx)
+
 	ls, err := s.leases.List(ctx, managedLeaseFilter())
 	if err != nil {
 		return nil, fmt.Errorf("containerdstore: leases.List: %w", err)
 	}
+
 	return ls, nil
 }
 

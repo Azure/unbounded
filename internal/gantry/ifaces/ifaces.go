@@ -7,11 +7,11 @@
 // Each subsystem (cache, members, origin, peer, DHT) is reachable through
 // the interfaces defined here so that:
 //
-//   - Unit tests can replace any subsystem with a fake (see internal/ifaces/fakes).
-//   - The top-level agent wiring in internal/agent depends only on interfaces,
-//     not on concrete libp2p / Kubernetes / hostPath implementations.
+// - Unit tests can replace any subsystem with a fake (see internal/ifaces/fakes).
+// - The top-level agent wiring in internal/agent depends only on interfaces,
+// not on concrete libp2p / Kubernetes / hostPath implementations.
 //
-// Interfaces are intentionally minimal — only the methods the agent actually
+// Interfaces are intentionally minimal - only the methods the agent actually
 // uses are exposed. Adding a method here should follow real demand from a
 // caller, not speculative API surface.
 package ifaces
@@ -33,10 +33,10 @@ import (
 
 // LocalContentStore is a content-addressed store keyed by OCI digest.
 // Implementations MUST verify the streamed bytes against the digest
-// before treating an entry as committed (F7 in architecture.md).
+// before treating an entry as committed (digest-verification in architecture.md).
 //
 // In production this is backed by the local containerd content store
-// (internal/containerdstore.Store) — the same store kubelet and CRI
+// (internal/containerdstore.Store) - the same store kubelet and CRI
 // already read from / write to. There is no separate Gantry-owned
 // blob cache.
 type LocalContentStore interface {
@@ -70,12 +70,12 @@ type ContentWriter interface {
 
 // ---------------------------------------------------------------------------
 // Members: cluster-membership view, sourced from a Kubernetes informer.
-// Implemented by internal/members (Phase 2).
+// Implemented by internal/members .
 // ---------------------------------------------------------------------------
 
-// NodeID is the stable identity used by HRW (§5.2 step 3) — typically the
+// NodeID is the stable identity used by HRW (the step 3) - typically the
 // pod or node name. It MUST be stable across an individual node's lifetime
-// and identical across all agents' views (modulo informer lag, §5.3).
+// and identical across all agents' views (modulo informer lag, the design doc).
 type NodeID string
 
 // Node is one entry in the cluster-membership view.
@@ -90,7 +90,7 @@ type Node struct {
 	Addr string
 
 	// Zone is the optional topology label `topology.kubernetes.io/zone`.
-	// Empty when not topology-aware (§4.3).
+	// Empty when not topology-aware (the design doc).
 	Zone string
 
 	// PeerID is the libp2p peer.ID (CID-encoded string form) the node
@@ -101,7 +101,7 @@ type Node struct {
 
 	// P2PAddrs lists the node's libp2p listen multiaddrs published via
 	// pod annotation. Empty until the peer announces. main.go reads
-	// this on startup to seed disco.Connect for DHT bootstrap (§7.2)
+	// this on startup to seed disco.Connect for DHT bootstrap (the design doc)
 	// without needing operator-supplied bootstrap_peers.
 	P2PAddrs []string
 }
@@ -122,7 +122,7 @@ type Members interface {
 
 // ---------------------------------------------------------------------------
 // OriginPuller: pulls bytes from the upstream OCI registry.
-// Implemented by internal/origin (Phase 1).
+// Implemented by internal/origin .
 // ---------------------------------------------------------------------------
 
 // OriginRef identifies a digest at a specific upstream registry / repository.
@@ -143,10 +143,10 @@ type OriginRef struct {
 // OriginRefKind discriminates manifest vs blob URLs at the upstream.
 //
 // Note on KindConfig: per the OCI Distribution Spec the image-config
-// document is fetched from /v2/<repo>/blobs/<digest> — the same URL
+// document is fetched from /v2/<repo>/blobs/<digest> - the same URL
 // family as KindBlob. KindConfig therefore does NOT change routing;
 // it exists purely to tighten metric/log labels so cold-start manifest
-// → config → blob traversal is distinguishable from regular layer
+// -> config -> blob traversal is distinguishable from regular layer
 // fetches when reading dashboards or traces.
 type OriginRefKind int
 
@@ -174,19 +174,19 @@ func (k OriginRefKind) String() string {
 //
 //	p2p_origin_pull_total{kind="manifest|config|layer"}
 //
-// MetricLabel is intentionally distinct from String(): String returns
+// MetricLabel is intentionally distinct from String: String returns
 // "blob" for KindBlob (the OCI Distribution Spec URL-family term,
 // correct in logs and on the wire) while MetricLabel returns "layer"
 // (the operator-facing observability term, what dashboards built
 // against the design spec expect). The two roles must not be
-// conflated — leaking "blob" into Prometheus labels gives dashboards
+// conflated - leaking "blob" into Prometheus labels gives dashboards
 // an empty "layer" bucket plus an undocumented "blob" series.
 //
 // KindConfig is preserved as "config" so the per-kind counter
 // distinguishes the single image-config blob per manifest from the
 // many layer blobs. This is the load-bearing observability invariant
-// the tenth-review work plumbed end-to-end through manifest.TypedChildren
-// → coldstart.PrefetchChildren → please_pull proto KIND_CONFIG; this
+// the work plumbed end-to-end through manifest.TypedChildren
+// -> coldstart.PrefetchChildren -> please_pull proto KIND_CONFIG; this
 // method is the leaf node of that chain.
 func (k OriginRefKind) MetricLabel() string {
 	switch k {
@@ -210,7 +210,7 @@ type OriginPuller interface {
 	// verify via a Cache writer or equivalent.
 	//
 	// On terminal failure the returned error is wrapped in an *OriginError
-	// carrying the failure classification used by §5.8.
+	// carrying the failure classification used by the design doc.
 	Pull(ctx context.Context, ref OriginRef) (io.ReadCloser, int64, error)
 
 	// Head fetches metadata for a digest without transferring the body.
@@ -236,13 +236,13 @@ type OriginPuller interface {
 	// a manifest list (see mirror.writeBlobHeadersWithPrefix).
 	//
 	// On terminal failure the returned error is wrapped in an
-	// *OriginError carrying the failure classification used by §5.8 so
+	// *OriginError carrying the failure classification used by the design doc so
 	// the mirror can convert it to the right HTTP status.
 	Head(ctx context.Context, ref OriginRef) (size int64, contentType string, err error)
 }
 
 // OriginError is the error returned by OriginPuller.Pull for terminal
-// failures. The Class field is the §5.8 classification used by the negative
+// failures. The Class field is the classification used by the negative
 // cache and propagated via PullIntentResponse.failure_class.
 type OriginError struct {
 	Ref   OriginRef
@@ -254,6 +254,7 @@ func (e *OriginError) Error() string {
 	if e.Err == nil {
 		return "origin error: " + string(e.Class)
 	}
+
 	return "origin error (" + string(e.Class) + "): " + e.Err.Error()
 }
 
@@ -263,7 +264,7 @@ func (e *OriginError) Unwrap() error { return e.Err }
 // callers don't import the generated package.
 type FailureClass string
 
-// Recognised §5.8 failure classifications.
+// Recognised the design doc failure classifications.
 const (
 	FailureUnspecified FailureClass = ""
 	FailureAuth        FailureClass = "auth"
@@ -274,11 +275,11 @@ const (
 
 // ---------------------------------------------------------------------------
 // PeerDialer: fetches a digest from another agent's :5001 transfer endpoint.
-// Implemented by internal/transfer (Phase 2).
+// Implemented by internal/transfer .
 // ---------------------------------------------------------------------------
 
 // PeerDialer fetches a digest from a peer's transfer endpoint with the
-// `Gantry-Mirrored: 1` header set (architecture.md §API).
+// `Gantry-Mirrored: 1` header set (architecture.md the API contract).
 type PeerDialer interface {
 	// FetchFromPeer streams the digest's bytes from peerAddr's :5001
 	// endpoint. The implementation MUST set `Gantry-Mirrored: 1` and MUST
@@ -289,7 +290,7 @@ type PeerDialer interface {
 
 // ---------------------------------------------------------------------------
 // DHT: digest-keyed discovery layer.
-// Implemented by internal/discovery (Phase 2).
+// Implemented by internal/discovery .
 // ---------------------------------------------------------------------------
 
 // Provider is one entry returned by DHT.FindProviders.
@@ -301,19 +302,19 @@ type Provider struct {
 // DHT exposes the libp2p Kademlia operations Gantry needs.
 type DHT interface {
 	// FindProviders returns providers of d. Returning an empty slice and a
-	// nil error is the "DHT-empty" case (§5.2): the caller MUST NOT treat
+	// nil error is the "DHT-empty" case (the design doc): the caller MUST NOT treat
 	// it as ground truth and SHOULD fall through to the HRW top-K probe.
 	FindProviders(ctx context.Context, d digest.Digest) ([]Provider, error)
 
 	// Provide advertises that this node holds d. Idempotent at the DHT
 	// level; refreshing is the implementation's responsibility (libp2p
-	// default 12 h refresh, 24 h TTL — §7.2).
+	// default 12 h refresh, 24 h TTL - the design doc).
 	Provide(ctx context.Context, d digest.Digest) error
 
 	// Withdraw is a soft "stop advertising" hint sent by the advertiser
 	// when the digest is no longer present in the local content store
 	// (e.g. containerd GC'd it). libp2p has no protocol-level withdraw
-	// — existing provider records expire at the 24 h TTL — so this is
+	// - existing provider records expire at the 24 h TTL - so this is
 	// implementation-defined cooperation: at minimum the local agent
 	// MUST stop re-Providing the digest on the next refresh cycle so
 	// the stale record drains naturally. Returning a non-nil error
@@ -322,14 +323,14 @@ type DHT interface {
 	Withdraw(ctx context.Context, d digest.Digest) error
 
 	// Health returns the current DHT health score in [0,1] as defined by
-	// §7.7 (geometric mean of routing-table coverage, lookup-latency
+	// the design doc (geometric mean of routing-table coverage, lookup-latency
 	// score, and self-test success rate).
 	Health() float64
 }
 
 // ---------------------------------------------------------------------------
 // Coordinator: libp2p coordination RPC client (caller side).
-// Implemented by internal/coord (Phase 3).
+// Implemented by internal/coord .
 // ---------------------------------------------------------------------------
 
 // PullIntent is the requester-side view of a PullIntentResponse.
@@ -374,9 +375,9 @@ type Coordinator interface {
 // LocalIntentProvider computes the PullIntent for self synchronously,
 // without going through a libp2p coord stream. The cold-start
 // orchestrator uses it to include self as a first-class participant
-// in the §5.2 rule cascade so that when self is HRW rank 0, self
+// in the rule cascade so that when self is HRW rank 0, self
 // pulls instead of delegating to rank 1 (which violates the
-// "one origin pull per digest" thundering-herd invariant — every
+// "one origin pull per digest" thundering-herd invariant - every
 // requester must converge on the same designated puller, and that
 // puller MAY be self).
 type LocalIntentProvider interface {
@@ -387,7 +388,7 @@ type LocalIntentProvider interface {
 // going through a libp2p coord stream. The cold-start orchestrator
 // invokes this when rule 7 selects self as the designated puller;
 // the wire-level alternative (Coord.PleasePull(self, ...)) would
-// either fail to dial self or — worse — round-trip through libp2p
+// either fail to dial self or - worse - round-trip through libp2p
 // and burn a stream slot. Semantics MUST match the server-side
 // please_pull handler: each digest either starts a new origin pull,
 // piggybacks on an already-in-flight one (PleasePullAlreadyPulling),
@@ -411,18 +412,18 @@ func (e *ErrNotFound) Error() string { return "not found: " + e.Digest.String() 
 
 // ErrUnavailable signals that the local storage backend (typically
 // containerd) is currently unreachable or otherwise unable to answer
-// presence/open requests. Per plan-final-copilot-v2 §Phase 3 callers
+// presence/open requests. Per callers
 // MUST distinguish this from ErrNotFound:
 //
-//   - mirror/coord must NOT report "cache miss" (which would trigger
-//     DHT lookup + cold-start + origin fallback on data that may
-//     still be on-node);
-//   - transfer must respond HTTP 503 (not 404), so a peer treats this
-//     node as temporarily down rather than as definitive proof the
-//     digest is absent;
-//   - advertise must pause Withdraw on an Inventory failure, since
-//     an empty inventory caused by an unavailable backend would
-//     otherwise look like "everything was evicted".
+// - mirror/coord must NOT report "cache miss" (which would trigger
+// DHT lookup + cold-start + origin fallback on data that may
+// still be on-node);
+// - transfer must respond HTTP 503 (not 404), so a peer treats this
+// node as temporarily down rather than as definitive proof the
+// digest is absent;
+// - advertise must pause Withdraw on an Inventory failure, since
+// an empty inventory caused by an unavailable backend would
+// otherwise look like "everything was evicted".
 //
 // Cause is the underlying error (typically a gRPC Unavailable, a
 // connection refused, or a context.DeadlineExceeded). Op is a short
@@ -437,6 +438,7 @@ func (e *ErrUnavailable) Error() string {
 	if e.Op == "" {
 		return "storage backend unavailable: " + e.Cause.Error()
 	}
+
 	return "storage backend unavailable (" + e.Op + "): " + e.Cause.Error()
 }
 

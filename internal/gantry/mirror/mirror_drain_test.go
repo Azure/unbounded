@@ -14,10 +14,10 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/origin"
 )
 
-// TestMirror_DrainReturns503 verifies the Phase 6 graceful-shutdown
-// contract: once Drain() has been called, every /v2/ request gets a
+// TestMirror_DrainReturns503 verifies the graceful-shutdown
+// contract: once Drain has been called, every /v2/ request gets a
 // 503 immediately so containerd's hosts.toml falls through to origin.
-// The 503 (not 404) is load-bearing per §5.1a.
+// The 503 (not 404) is load-bearing per the design doc.
 func TestMirror_DrainReturns503(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -30,6 +30,7 @@ func TestMirror_DrainReturns503(t *testing.T) {
 		},
 	}
 	c := fakes.NewCache()
+
 	oc, err := origin.New(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -44,10 +45,12 @@ func TestMirror_DrainReturns503(t *testing.T) {
 	// non-503 result is fine.
 	d := digestOf([]byte("anything"))
 	preReq, _ := http.NewRequest(http.MethodGet, srv.URL+"/v2/repo/blobs/"+d.String(), nil)
+
 	preResp, err := http.DefaultClient.Do(preReq)
 	if err != nil {
 		t.Fatalf("pre-drain request failed: %v", err)
 	}
+
 	_ = preResp.Body.Close() //nolint:errcheck // best-effort body close
 	if preResp.StatusCode == http.StatusServiceUnavailable {
 		t.Fatalf("pre-drain returned 503 unexpectedly; mirror should serve normally before Drain()")
@@ -68,11 +71,14 @@ func TestMirror_DrainReturns503(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			req, _ := http.NewRequest(http.MethodGet, srv.URL+tc.path, nil)
+
 			resp, err := http.DefaultClient.Do(req)
 			if err != nil {
 				t.Fatalf("request failed: %v", err)
 			}
+
 			defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort body close
+
 			if resp.StatusCode != http.StatusServiceUnavailable {
 				t.Errorf("status = %d, want 503 (Drain mode)", resp.StatusCode)
 			}
@@ -86,7 +92,7 @@ func TestMirror_DrainReturns503(t *testing.T) {
 	}
 }
 
-// TestMirror_DrainIdempotent verifies Drain() can be safely called
+// TestMirror_DrainIdempotent verifies Drain can be safely called
 // more than once (signal-handler robustness).
 func TestMirror_DrainIdempotent(t *testing.T) {
 	cfg := &config.Config{
@@ -95,10 +101,12 @@ func TestMirror_DrainIdempotent(t *testing.T) {
 		},
 	}
 	c := fakes.NewCache()
+
 	oc, err := origin.New(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	m := mirror.New(cfg, c, oc)
 
 	m.Drain()
@@ -107,13 +115,17 @@ func TestMirror_DrainIdempotent(t *testing.T) {
 
 	srv := httptest.NewServer(m.Handler())
 	t.Cleanup(srv.Close)
+
 	d := digestOf([]byte("anything"))
 	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/v2/repo/blobs/"+d.String(), nil)
+
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort body close
+
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want 503", resp.StatusCode)
 	}

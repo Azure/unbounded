@@ -28,10 +28,12 @@ import (
 
 func digestOf(b []byte) digest.Digest {
 	sum := sha256.Sum256(b)
+
 	d, err := digest.Parse("sha256:" + hex.EncodeToString(sum[:]))
 	if err != nil {
 		panic(err)
 	}
+
 	return d
 }
 
@@ -45,12 +47,16 @@ type fixture struct {
 
 func newFixture(t *testing.T, blobs map[digest.Digest][]byte) *fixture {
 	t.Helper()
+
 	var originHits int32
+
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&originHits, 1)
 		// Extract digest from /v2/<repo>/blobs/<digest> or /v2/<repo>/manifests/<digest>
 		path := r.URL.Path
+
 		var refStart int
+
 		switch {
 		case strings.Contains(path, "/blobs/"):
 			refStart = strings.LastIndex(path, "/blobs/") + len("/blobs/")
@@ -60,17 +66,21 @@ func newFixture(t *testing.T, blobs map[digest.Digest][]byte) *fixture {
 			w.WriteHeader(404)
 			return
 		}
+
 		ref := path[refStart:]
+
 		d, err := digest.Parse(ref)
 		if err != nil {
 			w.WriteHeader(404)
 			return
 		}
+
 		body, ok := blobs[d]
 		if !ok {
 			w.WriteHeader(404)
 			return
 		}
+
 		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
 		_, _ = w.Write(body) //nolint:errcheck // best-effort write
 	}))
@@ -132,14 +142,17 @@ func (unavailableCache) Writer(_ context.Context, _ digest.Digest) (ifaces.Conte
 
 func TestMirror_V2Root(t *testing.T) {
 	f := newFixture(t, nil)
+
 	resp, err := http.Get(f.server.URL + "/v2/")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode != 200 {
 		t.Errorf("status = %d", resp.StatusCode)
 	}
+
 	if got := resp.Header.Get("Docker-Distribution-API-Version"); got != "registry/2.0" {
 		t.Errorf("api version header = %q", got)
 	}
@@ -147,11 +160,13 @@ func TestMirror_V2Root(t *testing.T) {
 
 func TestMirror_Healthz(t *testing.T) {
 	f := newFixture(t, nil)
+
 	resp, err := http.Get(f.server.URL + "/healthz")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
+
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 || string(body) != "ok" {
 		t.Errorf("healthz: %d %q", resp.StatusCode, body)
@@ -160,14 +175,17 @@ func TestMirror_Healthz(t *testing.T) {
 
 func TestMirror_TagManifestReturns503(t *testing.T) {
 	f := newFixture(t, nil)
+
 	resp, err := http.Get(f.server.URL + "/v2/library/nginx/manifests/latest")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Errorf("tag fallthrough: got %d, want 503", resp.StatusCode)
 	}
+
 	if atomic.LoadInt32(f.originHits) != 0 {
 		t.Errorf("origin was hit during tag fallthrough; should not be (containerd retries directly)")
 	}
@@ -179,15 +197,19 @@ func TestMirror_BlobMissPullsFromOriginAndCaches(t *testing.T) {
 	f := newFixture(t, map[digest.Digest][]byte{d: body})
 
 	url := f.server.URL + "/v2/library/nginx/blobs/" + d.String()
+
 	resp, err := http.Get(url)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	got, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
+
 	if resp.StatusCode != 200 || string(got) != string(body) {
 		t.Fatalf("first GET: %d %q", resp.StatusCode, got)
 	}
+
 	if resp.Header.Get("Docker-Content-Digest") != d.String() {
 		t.Errorf("Docker-Content-Digest header missing")
 	}
@@ -197,11 +219,14 @@ func TestMirror_BlobMissPullsFromOriginAndCaches(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	got2, _ := io.ReadAll(resp2.Body)
 	resp2.Body.Close()
+
 	if string(got2) != string(body) {
 		t.Errorf("cache GET: %q", got2)
 	}
+
 	if atomic.LoadInt32(f.originHits) != 1 {
 		t.Errorf("origin hit %d times; want exactly 1 (second was a cache hit)", *f.originHits)
 	}
@@ -219,11 +244,13 @@ func TestMirror_ManifestByDigest(t *testing.T) {
 	f := newFixture(t, map[digest.Digest][]byte{d: body})
 
 	url := f.server.URL + "/v2/library/nginx/manifests/" + d.String()
+
 	resp, err := http.Get(url)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
+
 	got, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 || string(got) != string(body) {
 		t.Fatalf("manifest GET: %d %q", resp.StatusCode, got)
@@ -233,11 +260,13 @@ func TestMirror_ManifestByDigest(t *testing.T) {
 func TestMirror_OriginNotFoundIs404(t *testing.T) {
 	f := newFixture(t, nil)
 	d := digestOf([]byte("missing"))
+
 	resp, err := http.Get(f.server.URL + "/v2/library/nginx/blobs/" + d.String())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode != 404 {
 		t.Errorf("want 404, got %d", resp.StatusCode)
 	}
@@ -254,6 +283,7 @@ func TestMirror_NSParamSelectsUpstream(t *testing.T) {
 		_, _ = w.Write(body1) //nolint:errcheck // best-effort write
 	}))
 	defer upA.Close()
+
 	upB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body1)))
 		_, _ = w.Write(body1) //nolint:errcheck // best-effort write
@@ -267,6 +297,7 @@ func TestMirror_NSParamSelectsUpstream(t *testing.T) {
 	c := fakes.NewCache()
 	oc, _ := origin.New(cfg)
 	m := mirror.New(cfg, c, oc)
+
 	srv := httptest.NewServer(m.Handler())
 	defer srv.Close()
 
@@ -275,6 +306,7 @@ func TestMirror_NSParamSelectsUpstream(t *testing.T) {
 	if resp.StatusCode != 404 {
 		t.Errorf("missing ?ns=: got %d, want 404", resp.StatusCode)
 	}
+
 	resp.Body.Close()
 
 	// ?ns= unknown: 404.
@@ -282,6 +314,7 @@ func TestMirror_NSParamSelectsUpstream(t *testing.T) {
 	if resp.StatusCode != 404 {
 		t.Errorf("unknown ?ns=: got %d, want 404", resp.StatusCode)
 	}
+
 	resp.Body.Close()
 
 	// ?ns=regA.example.com works.
@@ -289,16 +322,19 @@ func TestMirror_NSParamSelectsUpstream(t *testing.T) {
 	if resp.StatusCode != 200 {
 		t.Errorf("ns=regA: got %d, want 200", resp.StatusCode)
 	}
+
 	resp.Body.Close()
 }
 
 func TestMirror_InvalidDigestRefIs400(t *testing.T) {
 	f := newFixture(t, nil)
+
 	resp, err := http.Get(f.server.URL + "/v2/lib/n/blobs/sha256:not-hex")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode != 400 {
 		t.Errorf("invalid digest: got %d, want 400", resp.StatusCode)
 	}
@@ -310,14 +346,17 @@ func TestMirror_HeadRequest(t *testing.T) {
 	f := newFixture(t, map[digest.Digest][]byte{d: body})
 
 	req, _ := http.NewRequest(http.MethodHead, f.server.URL+"/v2/lib/n/blobs/"+d.String(), nil)
+
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode != 200 {
 		t.Errorf("HEAD status = %d", resp.StatusCode)
 	}
+
 	if got := resp.Header.Get("Docker-Content-Digest"); got != d.String() {
 		t.Errorf("HEAD Docker-Content-Digest = %q", got)
 	}
@@ -336,16 +375,17 @@ func TestParseV2Path(t *testing.T) {
 	// Junk path should be 404.
 	resp, _ := http.Get(f.server.URL + "/v2/totally-bogus")
 	resp.Body.Close()
+
 	if resp.StatusCode != 404 {
 		t.Errorf("bogus v2 path: got %d, want 404", resp.StatusCode)
 	}
 }
 
 // TestMirror_OriginSuccessMetric_FiresOnlyOnCacheCommit pins the
-// eleventh-review contract: p2p_origin_pull_success_total must fire
+// contract: p2p_origin_pull_success_total must fire
 // EXACTLY when the cluster has gained a usable artifact from the
-// origin pull — body fully streamed AND cache commit succeeded.
-// Earlier the origin Client fired success on Close(), which also
+// origin pull - body fully streamed AND cache commit succeeded.
+// Earlier the origin Client fired success on Close, which also
 // fires on HEAD (body never read), on io.Copy interruption (body
 // partially read), and on cache-commit failure (commit returns
 // error after EOF). The mirror now owns the success hook and must
@@ -357,19 +397,24 @@ func TestMirror_OriginSuccessMetric_FiresOnlyOnCacheCommit(t *testing.T) {
 		d := digestOf(body)
 		f := newFixture(t, map[digest.Digest][]byte{d: body})
 
-		var successCalls int32
-		var successKinds []string
+		var (
+			successCalls int32
+			successKinds []string
+		)
 		// Rebuild server with the success hook wired.
 		oc, err := origin.New(f.cfg)
 		if err != nil {
 			t.Fatal(err)
 		}
+
 		m := mirror.New(f.cfg, f.cache, oc,
 			mirror.WithOriginSuccessMetric(func(kind string, _ int64) {
 				atomic.AddInt32(&successCalls, 1)
+
 				successKinds = append(successKinds, kind)
 			}),
 		)
+
 		srv := httptest.NewServer(m.Handler())
 		defer srv.Close()
 
@@ -377,16 +422,20 @@ func TestMirror_OriginSuccessMetric_FiresOnlyOnCacheCommit(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+
 		got, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
+
 		if resp.StatusCode != 200 || string(got) != string(body) {
 			t.Fatalf("GET: %d %q", resp.StatusCode, got)
 		}
+
 		if n := atomic.LoadInt32(&successCalls); n != 1 {
 			t.Fatalf("successCalls = %d, want 1 (one full pull + commit = one success)", n)
 		}
+
 		if len(successKinds) != 1 || successKinds[0] != "layer" {
-			t.Fatalf("successKinds = %v, want [layer] (blob → layer per design-doc Prometheus vocabulary)", successKinds)
+			t.Fatalf("successKinds = %v, want [layer] (blob -> layer per design-doc Prometheus vocabulary)", successKinds)
 		}
 	})
 
@@ -397,12 +446,13 @@ func TestMirror_OriginSuccessMetric_FiresOnlyOnCacheCommit(t *testing.T) {
 
 		var successCalls int32
 		// Also count origin.Pull starts (p2p_origin_pull_total) so
-		// we can pin the twelfth-review invariant: HEAD must NOT
-		// bump that counter. Before Batch 61 the mirror called
+		// we can pin invariant: HEAD must NOT
+		// bump that counter. Before a prior iteration the mirror called
 		// s.origin.Pull on HEAD which fired onPullStart even
 		// though HEAD never read the body, drifting the pull
 		// arithmetic.
 		var pullStarts int32
+
 		oc, err := origin.New(f.cfg,
 			origin.WithMetrics(
 				func(_ string) { atomic.AddInt32(&pullStarts, 1) },
@@ -412,26 +462,31 @@ func TestMirror_OriginSuccessMetric_FiresOnlyOnCacheCommit(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+
 		m := mirror.New(f.cfg, f.cache, oc,
 			mirror.WithOriginSuccessMetric(func(_ string, _ int64) {
 				atomic.AddInt32(&successCalls, 1)
 			}),
 		)
+
 		srv := httptest.NewServer(m.Handler())
 		defer srv.Close()
 
 		req, _ := http.NewRequest(http.MethodHead, srv.URL+"/v2/lib/n/blobs/"+d.String(), nil)
+
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatal(err)
 		}
+
 		resp.Body.Close()
+
 		if resp.StatusCode != 200 {
 			t.Fatalf("HEAD: %d", resp.StatusCode)
 		}
 		// HEAD must NOT fire success: the body was never streamed
 		// and the cache was never warmed. Counting this as a
-		// success was the central case the eleventh-review fix
+		// success was the central case fix
 		// targets.
 		if n := atomic.LoadInt32(&successCalls); n != 0 {
 			t.Fatalf("successCalls after HEAD = %d, want 0 (HEAD never reads the body so it never produces a real success)", n)
@@ -473,22 +528,28 @@ func TestMirror_OriginSuccessMetric_FiresOnlyOnCacheCommit(t *testing.T) {
 		// Twelfth-review: terminal counter for downstream failures.
 		// Capture the (kind,class) values so we can assert the
 		// exact label set this truncation maps to.
-		var downstreamCalls int32
-		var downstreamKinds, downstreamClasses []string
+		var (
+			downstreamCalls                    int32
+			downstreamKinds, downstreamClasses []string
+		)
+
 		oc, err := origin.New(cfg)
 		if err != nil {
 			t.Fatal(err)
 		}
+
 		m := mirror.New(cfg, c, oc,
 			mirror.WithOriginSuccessMetric(func(_ string, _ int64) {
 				atomic.AddInt32(&successCalls, 1)
 			}),
 			mirror.WithDownstreamFailureMetric(func(kind, class string) {
 				atomic.AddInt32(&downstreamCalls, 1)
+
 				downstreamKinds = append(downstreamKinds, kind)
 				downstreamClasses = append(downstreamClasses, class)
 			}),
 		)
+
 		srv := httptest.NewServer(m.Handler())
 		defer srv.Close()
 
@@ -498,7 +559,7 @@ func TestMirror_OriginSuccessMetric_FiresOnlyOnCacheCommit(t *testing.T) {
 		}
 		// The mirror has already written headers (200 OK) by the
 		// time the upstream truncation surfaces, so the HTTP
-		// status is 200 — but the body is short and the cache
+		// status is 200 - but the body is short and the cache
 		// commit never ran. We don't assert on body length
 		// because the truncation may surface as a copy error
 		// before the client side sees EOF; what we DO assert is
@@ -516,9 +577,11 @@ func TestMirror_OriginSuccessMetric_FiresOnlyOnCacheCommit(t *testing.T) {
 		if n := atomic.LoadInt32(&downstreamCalls); n != 1 {
 			t.Fatalf("downstreamCalls after truncated origin = %d, want 1 (origin returned 2xx; the downstream io.Copy or cw.Commit failed; must move arithmetic off in-flight)", n)
 		}
+
 		if len(downstreamKinds) != 1 || downstreamKinds[0] != "layer" {
 			t.Fatalf("downstreamKinds = %v, want [layer]", downstreamKinds)
 		}
+
 		if len(downstreamClasses) != 1 || downstreamClasses[0] != string(ifaces.FailureTransient) {
 			t.Fatalf("downstreamClasses = %v, want [transient] (downstream failures reserved class)", downstreamClasses)
 		}
@@ -529,12 +592,11 @@ func TestMirror_OriginSuccessMetric_FiresOnlyOnCacheCommit(t *testing.T) {
 	})
 }
 
-// TestMirror_OriginPullArithmeticIdentity pins the twelfth-review
-// arithmetic invariant for the mirror direct-origin path:
+// TestMirror_OriginPullArithmeticIdentity pins // arithmetic invariant for the mirror direct-origin path:
 //
-//	p2p_origin_pull_total{kind}  ==  p2p_origin_pull_success_total{kind}
-//	                              +  p2p_origin_pull_failure_total{kind,class=any}
-//	                              +  (in-flight at scrape time)
+//	p2p_origin_pull_total{kind} == p2p_origin_pull_success_total{kind}
+//	 + p2p_origin_pull_failure_total{kind,class=any}
+//	 + (in-flight at scrape time)
 //
 // Before this batch, downstream failures (io.Copy stall / cw.Commit
 // digest mismatch) bumped neither success nor failure, so started
@@ -577,6 +639,7 @@ func TestMirror_OriginPullArithmeticIdentity(t *testing.T) {
 		failures   int32
 		downstream int32
 	)
+
 	oc, err := origin.New(cfg,
 		origin.WithMetrics(
 			func(_ string) { atomic.AddInt32(&started, 1) },
@@ -586,6 +649,7 @@ func TestMirror_OriginPullArithmeticIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	m := mirror.New(cfg, c, oc,
 		mirror.WithOriginSuccessMetric(func(_ string, _ int64) {
 			atomic.AddInt32(&successes, 1)
@@ -594,6 +658,7 @@ func TestMirror_OriginPullArithmeticIdentity(t *testing.T) {
 			atomic.AddInt32(&downstream, 1)
 		}),
 	)
+
 	srv := httptest.NewServer(m.Handler())
 	defer srv.Close()
 
@@ -602,6 +667,7 @@ func TestMirror_OriginPullArithmeticIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	_, _ = io.ReadAll(resp.Body) //nolint:errcheck // best-effort
 	resp.Body.Close()
 
@@ -610,6 +676,7 @@ func TestMirror_OriginPullArithmeticIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	_, _ = io.ReadAll(resp.Body) //nolint:errcheck // best-effort
 	resp.Body.Close()
 
@@ -619,18 +686,23 @@ func TestMirror_OriginPullArithmeticIdentity(t *testing.T) {
 	su := atomic.LoadInt32(&successes)
 	fa := atomic.LoadInt32(&failures)
 	dn := atomic.LoadInt32(&downstream)
+
 	if s != 2 {
 		t.Errorf("started = %d, want 2 (one GET per pull)", s)
 	}
+
 	if su != 1 {
 		t.Errorf("successes = %d, want 1 (only the good pull committed)", su)
 	}
+
 	if fa != 0 {
 		t.Errorf("origin-side failures = %d, want 0 (both pulls got 200 from origin)", fa)
 	}
+
 	if dn != 1 {
 		t.Errorf("downstream failures = %d, want 1 (the truncation)", dn)
 	}
+
 	if s != su+fa+dn {
 		t.Errorf("arithmetic identity broken: started=%d != success(%d)+failure(%d)+downstream(%d) = %d", s, su, fa, dn, su+fa+dn)
 	}
@@ -643,6 +715,7 @@ func TestMirror_StorageUnavailableReturns503WithoutFallback(t *testing.T) {
 	originSrc := fakes.NewOriginPuller()
 	originSrc.Put(d, body)
 	m := mirror.New(cfg, unavailableCache{}, originSrc)
+
 	srv := httptest.NewServer(m.Handler())
 	defer srv.Close()
 
@@ -650,11 +723,14 @@ func TestMirror_StorageUnavailableReturns503WithoutFallback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	_, _ = io.ReadAll(resp.Body) //nolint:errcheck // best-effort
 	resp.Body.Close()
+
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", resp.StatusCode)
 	}
+
 	if n := originSrc.PullCount(d); n != 0 {
 		t.Fatalf("origin pull count = %d, want 0 (storage unavailable is not a cache miss)", n)
 	}
@@ -669,6 +745,7 @@ func TestMirror_LiveStreamThrough_OriginBypassesLocalWriter(t *testing.T) {
 	originSrc.Put(d, body)
 
 	var started, completed, failed, liveCompleted int32
+
 	m := mirror.New(cfg, local, originSrc,
 		mirror.WithLiveStreamThrough(),
 		mirror.WithOriginStreamMetrics(
@@ -680,9 +757,11 @@ func TestMirror_LiveStreamThrough_OriginBypassesLocalWriter(t *testing.T) {
 			if got != d {
 				t.Errorf("live completed digest = %v, want %v", got, d)
 			}
+
 			atomic.AddInt32(&liveCompleted, 1)
 		}),
 	)
+
 	srv := httptest.NewServer(m.Handler())
 	defer srv.Close()
 
@@ -690,29 +769,38 @@ func TestMirror_LiveStreamThrough_OriginBypassesLocalWriter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	got, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
+
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
+
 	if !bytes.Equal(got, body) {
 		t.Fatalf("served body = %q, want %q", got, body)
 	}
+
 	if calls := local.Calls(); calls != 0 {
 		t.Fatalf("local Writer calls = %d, want 0 (live origin path must not ingest into the active store)", calls)
 	}
+
 	if n := atomic.LoadInt32(&started); n != 1 {
 		t.Fatalf("origin stream started = %d, want 1", n)
 	}
+
 	if n := atomic.LoadInt32(&completed); n != 1 {
 		t.Fatalf("origin stream completed = %d, want 1", n)
 	}
+
 	if n := atomic.LoadInt32(&failed); n != 0 {
 		t.Fatalf("origin stream failed = %d, want 0", n)
 	}
+
 	if n := atomic.LoadInt32(&liveCompleted); n != 1 {
 		t.Fatalf("live stream completed hook calls = %d, want 1", n)
 	}
+
 	if n := originSrc.PullCount(d); n != 1 {
 		t.Fatalf("origin pull count = %d, want 1", n)
 	}
@@ -726,12 +814,15 @@ func TestMirror_LiveStreamThrough_PeerBypassesLocalWriterAndReadvertise(t *testi
 	originSrc := fakes.NewOriginPuller()
 	peerCache := fakes.NewCache()
 	peerCache.Put(d, body)
+
 	peerDialer := fakes.NewPeerDialer()
 	peerDialer.Register("10.0.0.8:5001", peerCache)
+
 	dht := fakes.NewDHT()
 	dht.Inject(d, ifaces.Provider{NodeID: ifaces.NodeID("peer-a"), Addr: "10.0.0.8:5001"})
 
 	var liveCompleted int32
+
 	m := mirror.New(cfg, local, originSrc,
 		mirror.WithLiveStreamThrough(),
 		mirror.WithDiscovery(dht, peerDialer),
@@ -739,9 +830,11 @@ func TestMirror_LiveStreamThrough_PeerBypassesLocalWriterAndReadvertise(t *testi
 			if got != d {
 				t.Errorf("live completed digest = %v, want %v", got, d)
 			}
+
 			atomic.AddInt32(&liveCompleted, 1)
 		}),
 	)
+
 	srv := httptest.NewServer(m.Handler())
 	defer srv.Close()
 
@@ -749,34 +842,40 @@ func TestMirror_LiveStreamThrough_PeerBypassesLocalWriterAndReadvertise(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	got, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
+
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
+
 	if !bytes.Equal(got, body) {
 		t.Fatalf("served body = %q, want %q", got, body)
 	}
+
 	if calls := local.Calls(); calls != 0 {
 		t.Fatalf("local Writer calls = %d, want 0 (live peer path must not ingest into the active store)", calls)
 	}
+
 	if n := atomic.LoadInt32(&liveCompleted); n != 1 {
 		t.Fatalf("live stream completed hook calls = %d, want 1", n)
 	}
+
 	if n := dht.ProvideCount(d); n != 0 {
 		t.Fatalf("DHT Provide count = %d, want 0 (advertisement must wait for later containerd observation)", n)
 	}
+
 	if n := originSrc.PullCount(d); n != 0 {
 		t.Fatalf("origin pull count = %d, want 0 (peer hit must not fall through to origin)", n)
 	}
 }
 
 // fakeNegCacheRecorder is an in-memory NegativeCacheRecorder used by
-// the mirror-direct §5.8 integration tests below. It records the call
+// the mirror-direct the design doc integration tests below. It records the call
 // sequence so the test can assert WHICH digests entered cooldown and
-// WHICH succeeded — the contract that distinguishes the new direct-
-// origin negative-cache integration from the pre-thirteenth-review
-// behaviour (where the mirror direct path emitted only metrics and
+// WHICH succeeded - the contract that distinguishes the new direct-
+// origin negative-cache integration from the pre-// behaviour (where the mirror direct path emitted only metrics and
 // never seeded a cooldown).
 type fakeNegCacheRecorder struct {
 	mu        sync.Mutex
@@ -792,35 +891,40 @@ type fakeNegFailure struct {
 func (r *fakeNegCacheRecorder) RecordFailure(d digest.Digest, class ifaces.FailureClass) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
 	r.failures = append(r.failures, fakeNegFailure{D: d, Class: class})
 }
 
 func (r *fakeNegCacheRecorder) RecordSuccess(d digest.Digest) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
 	r.successes = append(r.successes, d)
 }
 
 func (r *fakeNegCacheRecorder) snapshot() ([]fakeNegFailure, []digest.Digest) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
 	f := make([]fakeNegFailure, len(r.failures))
 	copy(f, r.failures)
 	s := make([]digest.Digest, len(r.successes))
 	copy(s, r.successes)
+
 	return f, s
 }
 
 // TestMirror_DirectOrigin_NegativeCache_OnTruncation pins the
-// thirteenth-review fix: when the mirror's direct-origin path returns
+// fix: when the mirror's direct-origin path returns
 // 2xx from origin but the body truncates mid-stream, the helper MUST
-// seed the §5.8 negative cache — matching what the puller-pump path
-// (runOriginPull → recordOriginFailure) already does. Without this,
-// the next NF5-eligible request for the same digest could re-fire
+// seed the negative cache - matching what the puller-pump path
+// (runOriginPull -> recordOriginFailure) already does. Without this,
+// the next direct-origin-fallback-eligible request for the same digest could re-fire
 // the direct origin pull at the bottom of the next jitter window.
 func TestMirror_DirectOrigin_NegativeCache_OnTruncation(t *testing.T) {
 	body := []byte("full-body-but-truncated-on-the-wire")
 	d := digestOf(body)
+
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
 		w.WriteHeader(http.StatusOK)
@@ -837,8 +941,10 @@ func TestMirror_DirectOrigin_NegativeCache_OnTruncation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	rec := &fakeNegCacheRecorder{}
 	m := mirror.New(cfg, c, oc, mirror.WithNegativeCacheRecorder(rec))
+
 	srv := httptest.NewServer(m.Handler())
 	defer srv.Close()
 
@@ -846,37 +952,42 @@ func TestMirror_DirectOrigin_NegativeCache_OnTruncation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	_, _ = io.ReadAll(resp.Body) //nolint:errcheck // best-effort
 	resp.Body.Close()
 
 	failures, successes := rec.snapshot()
 	if len(failures) != 1 {
-		t.Fatalf("recorder.failures = %d, want 1 (truncation must seed a §5.8 cooldown so the next direct-origin attempt waits out the ladder)", len(failures))
+		t.Fatalf("recorder.failures = %d, want 1 (truncation must seed a the cooldown so the next direct-origin attempt waits out the ladder)", len(failures))
 	}
+
 	if failures[0].D != d {
 		t.Errorf("recorder.failures[0].D = %v, want %v", failures[0].D, d)
 	}
+
 	if failures[0].Class != ifaces.FailureTransient {
 		t.Errorf("recorder.failures[0].Class = %q, want transient (matches the puller-pump path's classification for io.Copy / cw.Commit failures)", failures[0].Class)
 	}
+
 	if len(successes) != 0 {
 		t.Errorf("recorder.successes = %d, want 0 (no successful commit)", len(successes))
 	}
 }
 
 // TestMirror_DirectOrigin_NegativeCache_OnOriginError pins the
-// thirteenth-review fix for the OTHER half of the negative-cache
+// fix for the OTHER half of the negative-cache
 // contract: when origin returns a terminal error (4xx/5xx mapped via
 // *ifaces.OriginError), the mirror direct path must seed the cache
-// with the origin's own class — same as runOriginPull does. This
-// gives §5.8 trusted-cluster-wide propagation for auth/not_found/
+// with the origin's own class - same as runOriginPull does. This
+// gives the design doc trusted-cluster-wide propagation for auth/not_found/
 // rate_limited classes even when the failure was observed by the
 // mirror direct path rather than the coordinated please_pull pump.
 func TestMirror_DirectOrigin_NegativeCache_OnOriginError(t *testing.T) {
 	body := []byte("absent")
 	d := digestOf(body)
+
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		// 404 → ifaces.FailureNotFound after classification.
+		// 404 -> ifaces.FailureNotFound after classification.
 		w.WriteHeader(http.StatusNotFound)
 	}))
 	defer up.Close()
@@ -890,8 +1001,10 @@ func TestMirror_DirectOrigin_NegativeCache_OnOriginError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	rec := &fakeNegCacheRecorder{}
 	m := mirror.New(cfg, c, oc, mirror.WithNegativeCacheRecorder(rec))
+
 	srv := httptest.NewServer(m.Handler())
 	defer srv.Close()
 
@@ -899,26 +1012,30 @@ func TestMirror_DirectOrigin_NegativeCache_OnOriginError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	_, _ = io.ReadAll(resp.Body) //nolint:errcheck // best-effort
 	resp.Body.Close()
 
 	failures, successes := rec.snapshot()
 	if len(failures) != 1 {
-		t.Fatalf("recorder.failures = %d, want 1 (origin 404 must seed a §5.8 cooldown)", len(failures))
+		t.Fatalf("recorder.failures = %d, want 1 (origin 404 must seed a the cooldown)", len(failures))
 	}
+
 	if failures[0].D != d {
 		t.Errorf("recorder.failures[0].D = %v, want %v", failures[0].D, d)
 	}
+
 	if failures[0].Class != ifaces.FailureNotFound {
-		t.Errorf("recorder.failures[0].Class = %q, want not_found (origin's own class must survive the mirror-direct → recorder hop unchanged)", failures[0].Class)
+		t.Errorf("recorder.failures[0].Class = %q, want not_found (origin's own class must survive the mirror-direct -> recorder hop unchanged)", failures[0].Class)
 	}
+
 	if len(successes) != 0 {
 		t.Errorf("recorder.successes = %d, want 0", len(successes))
 	}
 }
 
 // TestMirror_DirectOrigin_NegativeCache_OnCommitSuccess pins the
-// §5.8 "Self-healing" half of the contract: a successful mirror-
+// the design doc "Self-healing" half of the contract: a successful mirror-
 // direct origin pull MUST clear any prior cooldown entry by calling
 // RecordSuccess. Symmetric with runOriginPull's neg.RecordSuccess(d)
 // after cw.Commit; without it, a transient failure that recovers on
@@ -935,8 +1052,10 @@ func TestMirror_DirectOrigin_NegativeCache_OnCommitSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	rec := &fakeNegCacheRecorder{}
 	m := mirror.New(f.cfg, f.cache, oc, mirror.WithNegativeCacheRecorder(rec))
+
 	srv := httptest.NewServer(m.Handler())
 	defer srv.Close()
 
@@ -944,8 +1063,10 @@ func TestMirror_DirectOrigin_NegativeCache_OnCommitSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	got, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
+
 	if !bytes.Equal(got, body) {
 		t.Fatalf("served body = %q, want %q", got, body)
 	}
@@ -954,9 +1075,11 @@ func TestMirror_DirectOrigin_NegativeCache_OnCommitSuccess(t *testing.T) {
 	if len(failures) != 0 {
 		t.Errorf("recorder.failures = %d, want 0 on happy-path commit", len(failures))
 	}
+
 	if len(successes) != 1 {
 		t.Fatalf("recorder.successes = %d, want 1 (cw.Commit success must clear any prior cooldown)", len(successes))
 	}
+
 	if successes[0] != d {
 		t.Errorf("recorder.successes[0] = %v, want %v", successes[0], d)
 	}
@@ -978,22 +1101,27 @@ func TestMirror_DirectOrigin_NegativeCache_NilSafe(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	got, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
+
 	if !bytes.Equal(got, body) {
 		t.Fatalf("served body = %q, want %q", got, body)
 	}
 
 	// Origin-error path on the same fixture (request a digest the
-	// upstream doesn't know): origin returns 404 → mirror tries
+	// upstream doesn't know): origin returns 404 -> mirror tries
 	// to record into nil recorder. Must not panic.
 	missing := digestOf([]byte("missing"))
+
 	resp, err = http.Get(f.server.URL + "/v2/lib/n/blobs/" + missing.String())
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	_, _ = io.ReadAll(resp.Body) //nolint:errcheck // best-effort
 	resp.Body.Close()
+
 	if resp.StatusCode == 200 {
 		t.Errorf("expected non-200 for missing digest, got %d", resp.StatusCode)
 	}

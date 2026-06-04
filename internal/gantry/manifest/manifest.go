@@ -10,7 +10,7 @@
 // cache pipeline before they reach this code, and containerd is the
 // authoritative consumer that performs full validation. The only
 // consumer here is the mirror's speculative layer-prefetch path
-// (§5.2 detailed-design.md L332 / architecture.md L180).
+// (the design doc detailed-design.md L332 / architecture.md L180).
 package manifest
 
 import (
@@ -44,7 +44,7 @@ type descriptor struct {
 
 // ChildDigests parses body as an OCI / Docker schema-2 image manifest
 // and returns the digests of every content blob the manifest
-// references — its config blob plus every layer descriptor. The
+// references - its config blob plus every layer descriptor. The
 // returned slice preserves source order: config first, then layers
 // top-to-bottom (which is also the order containerd will request
 // them).
@@ -62,7 +62,7 @@ type descriptor struct {
 // failure on the manifest envelope itself is returned as an error.
 //
 // Prefer TypedChildren over ChildDigests for new callers that need
-// the per-digest kind (image-config blob vs layer blob) — e.g. so
+// the per-digest kind (image-config blob vs layer blob) - e.g. so
 // the per-kind metric label survives end-to-end through the prefetch
 // fan-out into please_pull and StartLocalPull batches.
 func ChildDigests(body []byte) ([]digest.Digest, error) {
@@ -70,13 +70,16 @@ func ChildDigests(body []byte) ([]digest.Digest, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	if typed == nil {
 		return nil, nil
 	}
+
 	out := make([]digest.Digest, 0, len(typed))
 	for _, c := range typed {
 		out = append(out, c.Digest)
 	}
+
 	return out, nil
 }
 
@@ -93,7 +96,7 @@ func ChildDigests(body []byte) ([]digest.Digest, error) {
 // honest end-to-end through the prefetch fan-out and the please_pull
 // wire boundary. Without the split every child digest of a manifest
 // would label as "blob" and the "config" bucket would always be
-// empty in practice — the design intent the tenth-review observability
+// empty in practice - the design intent the observability
 // recommendation calls out.
 type TypedChild struct {
 	Digest digest.Digest
@@ -106,7 +109,7 @@ type TypedChild struct {
 // (.manifests with no .layers) are handled exactly as in
 // ChildDigests; only the return type changes. The config digest is
 // tagged KindConfig; every layer is tagged KindBlob (KindLayer is
-// intentionally NOT introduced — the OCI URL family is /blobs/ for
+// intentionally NOT introduced - the OCI URL family is /blobs/ for
 // both and downstream pullers do not need to distinguish, only the
 // metric label needs to).
 func TypedChildren(body []byte) ([]TypedChild, error) {
@@ -121,24 +124,29 @@ func TypedChildren(body []byte) ([]TypedChild, error) {
 	if len(m.Manifests) > 0 && len(m.Layers) == 0 {
 		return nil, nil
 	}
+
 	out := make([]TypedChild, 0, 1+len(m.Layers))
 	if m.Config.Digest != "" {
 		if d, err := digest.Parse(m.Config.Digest); err == nil {
 			out = append(out, TypedChild{Digest: d, Kind: ifaces.KindConfig})
 		}
 	}
+
 	for _, l := range m.Layers {
 		if l.Digest == "" {
 			continue
 		}
+
 		if len(l.URLs) > 0 {
-			// Foreign layer (Windows base, Microsoft-hosted) — skip.
+			// Foreign layer (Windows base, Microsoft-hosted) - skip.
 			continue
 		}
+
 		if d, err := digest.Parse(l.Digest); err == nil {
 			out = append(out, TypedChild{Digest: d, Kind: ifaces.KindBlob})
 		}
 	}
+
 	return out, nil
 }
 
@@ -150,5 +158,6 @@ func IsImageIndex(body []byte) bool {
 	if err := json.Unmarshal(body, &m); err != nil {
 		return false
 	}
+
 	return len(m.Manifests) > 0 && len(m.Layers) == 0
 }

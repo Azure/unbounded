@@ -4,20 +4,20 @@
 // Package config is the single source of truth for every operator-tunable
 // knob the Gantry agent exposes.
 //
-// The design docs enumerate configuration in many places (§7.4 cache, §7.7
-// NF5 / DHT health, §5.8 origin-failure circuit breaker, §7.1 hosts.toml /
-// upstream registries, §8 open questions). This package collects them into
+// The design docs enumerate configuration in many places (the design doc cache, the design doc
+// direct-origin-fallback / DHT health, the design doc origin-failure circuit breaker, the design doc hosts.toml /
+// upstream registries, the design doc open questions). This package collects them into
 // a single Config struct with field-level documentation pointing at the
 // design-doc citation.
 //
 // Sources, in increasing precedence:
 //
-//  1. Built-in defaults from NewDefault().
-//  2. YAML file at --config=PATH (optional).
-//  3. Environment variables prefixed GANTRY_.
-//  4. Command-line flags.
+// 1. Built-in defaults from NewDefault.
+// 2. YAML file at --config=PATH (optional).
+// 3. Environment variables prefixed GANTRY_.
+// 4. Command-line flags.
 //
-// Later sources win. Validate() runs after all sources have been merged and
+// Later sources win. Validate runs after all sources have been merged and
 // returns an aggregate of every problem found, not just the first.
 package config
 
@@ -38,14 +38,14 @@ import (
 // Recognised StorageMode values.
 const (
 	// StorageModeContainerd routes reads/writes through the local
-	// containerd content store (plan §Phase 5). This is the only
+	// containerd content store (plan). This is the only
 	// accepted storage mode; the legacy hostPath "gantry-cache" mode
-	// was removed in plan §Phase 8.
+	// was removed in plan .
 	StorageModeContainerd = "containerd"
 
 	// storageModeGantryCache is the legacy hostPath cache mode that
-	// was removed in plan §Phase 8. It is referenced only by
-	// Validate() to surface a clear migration error to operators who
+	// was removed in plan . It is referenced only by
+	// Validate to surface a clear migration error to operators who
 	// still have storage_mode: gantry-cache in their ConfigMap.
 	storageModeGantryCache = "gantry-cache"
 )
@@ -54,20 +54,20 @@ const (
 //
 // Every field carries a yaml/json tag matching the file/env name and a comment
 // citing the design-doc section it derives from. Defaults are set by
-// NewDefault(); see Validate() for hard correctness constraints.
+// NewDefault; see Validate for hard correctness constraints.
 type Config struct {
 	// ---------- Listeners ----------
 
 	// MirrorListen is the loopback address for containerd's mirror endpoint
-	// (detailed-design.md §4.1, §7.1). MUST be loopback-only unless
+	// (the design doc). MUST be loopback-only unless
 	// MirrorBindAllowNonLoopback is true (operator opt-in: e.g. when the
 	// pod is reached via a hostPort with hostIP=127.0.0.1 DNAT'ing into
-	// the pod network — see deploy/daemonset.yaml).
+	// the pod network - see deploy/gantry/daemonset.yaml).
 	MirrorListen string `yaml:"mirror_listen"`
 
 	// MirrorBindAllowNonLoopback relaxes the loopback-only validation on
 	// MirrorListen. Set to true ONLY when the deployment guarantees the
-	// mirror is unreachable from off-node by some other mechanism — the
+	// mirror is unreachable from off-node by some other mechanism - the
 	// shipped DaemonSet uses hostPort with hostIP=127.0.0.1, which DNATs
 	// the node's loopback into the pod so containerd reaches the mirror
 	// over 127.0.0.1 even though the pod itself binds 0.0.0.0. Equivalent
@@ -78,11 +78,11 @@ type Config struct {
 	// for the full opt-in checklist.
 	MirrorBindAllowNonLoopback bool `yaml:"mirror_bind_allow_non_loopback"`
 
-	// TransferListen is the peer-facing HTTP/2 endpoint (§4.4). The bind is
+	// TransferListen is the peer-facing HTTP/2 endpoint (the design doc). The bind is
 	// typically 0.0.0.0; cluster-internal isolation comes from
 	// NetworkPolicy + the `Gantry-Mirrored: 1` request-header gate +
 	// digestpipe integrity verification, not from the bind address. See
-	// README.md "Security model" for the full threat model — in
+	// README.md "Security model" for the full threat model - in
 	// particular, the endpoint is plaintext h2c by design and assumes
 	// the cluster network is trusted. Operators that need on-the-wire
 	// confidentiality should layer a service mesh (Istio / Linkerd /
@@ -90,28 +90,28 @@ type Config struct {
 	TransferListen string `yaml:"transfer_listen"`
 
 	// MetricsListen is the Prometheus scrape endpoint and /readyz /livez
-	// kubelet-probe target (§7.6). Default is 0.0.0.0:9095 because both
+	// kubelet-probe target (the design doc). Default is 0.0.0.0:9095 because both
 	// Prometheus (off-node) and the kubelet (off-pod, node-IP source)
-	// need to reach it — a loopback default would silently break the
+	// need to reach it - a loopback default would silently break the
 	// DaemonSet's readiness gate. Access control belongs in NetworkPolicy
 	// and pod ports, not in the bind address.
 	MetricsListen string `yaml:"metrics_listen"`
 
-	// Libp2pListen is the multiaddr(s) the libp2p host advertises (§7.2).
+	// Libp2pListen is the multiaddr(s) the libp2p host advertises (the design doc).
 	// Empty means "use libp2p defaults" and pick at random.
 	Libp2pListen []string `yaml:"libp2p_listen"`
 
 	// Libp2pIdentityPath is the on-disk path of the persisted libp2p key
-	// (§7.2). Lost identity is not catastrophic; old DHT records age out.
+	// (the design doc). Lost identity is not catastrophic; old DHT records age out.
 	Libp2pIdentityPath string `yaml:"libp2p_identity_path"`
 
 	// Libp2pBootstrapPeers is an optional list of static multiaddrs to seed
 	// the libp2p host's connection set on startup. In production these are
-	// usually discovered via the K8s informer (§7.2) so this field defaults
+	// usually discovered via the K8s informer (the design doc) so this field defaults
 	// to empty; tests and small clusters can use it directly.
 	Libp2pBootstrapPeers []string `yaml:"libp2p_bootstrap_peers"`
 
-	// ---------- Cluster membership (§7.3) ----------
+	// ---------- Cluster membership (the design doc) ----------
 
 	// NodeName is the Kubernetes node this agent runs on. Sourced via the
 	// Downward API (env spec.nodeName) into GANTRY_NODE_NAME. Used as the
@@ -122,13 +122,13 @@ type Config struct {
 	// PodName is the Kubernetes pod name of this agent. Sourced via the
 	// Downward API (env metadata.name) into GANTRY_POD_NAME. Used to
 	// self-patch pod annotations with the libp2p peer.ID and transfer
-	// addr so other agents can discover this peer (§7.2, §7.3).
+	// addr so other agents can discover this peer (the design doc, the design doc).
 	PodName string `yaml:"pod_name"`
 
 	// PodIP is the agent's routable Pod IP. Sourced via the Downward
 	// API (env status.podIP) into GANTRY_POD_IP. Used to rewrite
 	// 0.0.0.0 wildcard listen addresses into dialable advertised
-	// addresses when self-announcing on Pod annotations (§7.2): a peer
+	// addresses when self-announcing on Pod annotations (the design doc): a peer
 	// publishing 0.0.0.0:5001 is otherwise unreachable from other
 	// pods, defeating libp2p bootstrap on first-cluster boot. Empty
 	// when running outside Kubernetes; self-announce then publishes
@@ -136,7 +136,7 @@ type Config struct {
 	PodIP string `yaml:"pod_ip"`
 
 	// MembersNamespace restricts the Pod informer to a single namespace.
-	// Empty means cluster-wide list/watch — useful for read-only
+	// Empty means cluster-wide list/watch - useful for read-only
 	// scenarios, but production deployments MUST set this. The
 	// self-announce write path (members.AnnounceSelf) patches the
 	// agent's own pod via Pods(namespace).Patch and refuses to run
@@ -145,19 +145,19 @@ type Config struct {
 	// namespace the agent's three peer-coordination annotations
 	// (gantry.io/peer-id, gantry.io/p2p-addrs, gantry.io/transfer-addr)
 	// are never published, so peers cannot translate this agent's
-	// node name into a dialable libp2p peer ID — every inbound
+	// node name into a dialable libp2p peer ID - every inbound
 	// Coord.PleasePull / PullIntentQuery 503s silently.
 	//
 	// The shipped DaemonSet wires GANTRY_MEMBERS_NAMESPACE via the
 	// Downward API (`fieldRef: metadata.namespace`) so operators
-	// following deploy/daemonset.yaml satisfy this for free. Hand-
+	// following deploy/gantry/daemonset.yaml satisfy this for free. Hand-
 	// rolled envFrom that misses it is the failure mode this
 	// validation catches at startup rather than at first
 	// Coord.PleasePull miss.
 	MembersNamespace string `yaml:"members_namespace"`
 
 	// MembersLabelSelector is the K8s label selector that identifies Gantry
-	// DaemonSet pods. Used to find peer agents (§7.3). Default matches the
+	// DaemonSet pods. Used to find peer agents (the design doc). Default matches the
 	// canonical app.kubernetes.io label.
 	MembersLabelSelector string `yaml:"members_label_selector"`
 
@@ -168,13 +168,13 @@ type Config struct {
 	// ---------- Storage backend ----------
 
 	// StorageMode selects which backend the agent uses as the read/write
-	// content store. Only "containerd" is supported as of Plan
-	// §Phase 8 — the legacy "gantry-cache" hostPath backend was
-	// removed in that phase. The field is retained so existing
-	// ConfigMaps that still set it to "containerd" continue to parse,
-	// and so a clear migration error surfaces for any operator still
-	// on "gantry-cache". It is not exposed as a CLI flag or env var
-	// because there is no other valid value to select.
+	// content store. Only "containerd" is supported - the legacy
+	// "gantry-cache" hostPath backend was removed. The field is
+	// retained so existing ConfigMaps that still set it to "containerd"
+	// continue to parse, and so a clear migration error surfaces for
+	// any operator still on "gantry-cache". It is not exposed as a
+	// CLI flag or env var because there is no other valid value to
+	// select.
 	//
 	// Default is "containerd". Exposed via the
 	// gantry_storage_mode_info metric for observability.
@@ -192,13 +192,13 @@ type Config struct {
 
 	// ContainerdSocket is the path to the containerd gRPC API socket
 	// that the cdsub subsystem dials to discover locally-cached images
-	// and announce them on the DHT (§5.4 image-event → Provide loop),
+	// and announce them on the DHT (the design doc image-event -> Provide loop),
 	// that the transfer endpoint reads from on cache miss to serve
 	// peers without a re-download, and that the puller writes into on
 	// background origin pulls (storage_mode=containerd is the only
-	// supported mode; see plan-final-copilot-v2 §Phase 8).
+	// supported mode; see).
 	//
-	// REQUIRED. Validate() rejects an empty value when
+	// REQUIRED. Validate rejects an empty value when
 	// storage_mode=containerd (the only accepted storage_mode), which
 	// is enforced at startup. The default deploy manifests set it to
 	// "/run/containerd/containerd.sock"; operators on non-default
@@ -209,7 +209,7 @@ type Config struct {
 	ContainerdSocket string `yaml:"containerd_socket"`
 
 	// ContainerdNamespace is the containerd namespace cdsub watches.
-	// Kubelet uses "k8s.io" for pod containers — the default. Set to
+	// Kubelet uses "k8s.io" for pod containers - the default. Set to
 	// "moby" for Docker-managed images, or any custom namespace.
 	ContainerdNamespace string `yaml:"containerd_namespace"`
 
@@ -230,55 +230,55 @@ type Config struct {
 	// ---------- Upstream registries ----------
 
 	// UpstreamRegistries enumerates every OCI registry the agent mirrors
-	// (§7.1, §7.3). The agent rejects requests whose ?ns= does not match
+	// (the design doc, the design doc). The agent rejects requests whose ?ns= does not match
 	// one of these once more than one is configured.
 	UpstreamRegistries []UpstreamRegistry `yaml:"upstream_registries"`
 
 	// ---------- HRW / coordination ----------
 
-	// HRWK is the top-K size for HRW probe (§5.2 step 3 default 3; §8
+	// HRWK is the top-K size for HRW probe (the step 3 default 3; the design doc
 	// open question).
 	HRWK int `yaml:"hrw_k"`
 
 	// HRWTopologyScope selects "cluster" (HRW over all nodes) or "zone"
-	// (HRW within the requester's zone) — §4.3 / §8 open question.
+	// (HRW within the requester's zone) - the design doc / the design doc open question.
 	HRWTopologyScope string `yaml:"hrw_topology_scope"`
 
 	// ZoneLabelKey is the Kubernetes node label that identifies the zone
 	// when HRWTopologyScope == "zone". Default
-	// `topology.kubernetes.io/zone` (§7.3).
+	// `topology.kubernetes.io/zone` (the design doc).
 	ZoneLabelKey string `yaml:"zone_label_key"`
 
-	// ---------- DHT / NF5 ----------
+	// ---------- DHT / direct-origin-fallback ----------
 
-	// NF5JitterBase is the base delay in the NF5 jitter window
-	// `[0, base * ln(N))` (§7.7 default 3 s).
+	// NF5JitterBase is the base delay in the direct-origin-fallback jitter window
+	// `[0, base * ln(N))` (the design doc default 3 s).
 	NF5JitterBase time.Duration `yaml:"nf5_jitter_base"`
 
 	// NF5PerNodeRateLimit is the per-node direct-origin fallback rate
-	// (token bucket, fallbacks/minute; §7.7 default 2).
+	// (token bucket, fallbacks/minute; the design doc default 2).
 	NF5PerNodeRateLimit int `yaml:"nf5_per_node_rate_limit"`
 
 	// BootstrapWindow is the time after startup during which DHT-empty is
-	// not trusted as cold-start evidence (§7.7 default 30 s).
+	// not trusted as cold-start evidence (the design doc default 30 s).
 	BootstrapWindow time.Duration `yaml:"bootstrap_window"`
 
 	// BootstrapRoutingTablePct is the routing-table-size threshold that
-	// supersedes BootstrapWindow once met (§7.7 default 25%).
+	// supersedes BootstrapWindow once met (the design doc default 25%).
 	BootstrapRoutingTablePct int `yaml:"bootstrap_routing_table_pct"`
 
 	// TopKExpansionFactorDegraded is the multiplier applied to HRWK when
-	// expanding top-K under Degraded health (§5.2 step 5 / §7.7 default 2).
+	// expanding top-K under Degraded health (the step 5 / the design doc default 2).
 	TopKExpansionFactorDegraded int `yaml:"topk_expansion_factor_degraded"`
 
-	// ---------- Origin-failure circuit breaker (§5.8) ----------
+	// ---------- Origin-failure circuit breaker (the design doc) ----------
 
 	OriginFailureCooldownInitial    time.Duration `yaml:"origin_failure_cooldown_initial"`
 	OriginFailureCooldownMax        time.Duration `yaml:"origin_failure_cooldown_max"`
 	OriginFailureCooldownMultiplier int           `yaml:"origin_failure_cooldown_multiplier"`
 	OriginFailureHonorWindowCap     time.Duration `yaml:"origin_failure_honor_window_cap"`
 
-	// OriginFailureClassesTrustedClusterWide controls which §5.8 failure
+	// OriginFailureClassesTrustedClusterWide controls which the design doc failure
 	// classes are propagated cluster-wide as 5xx-immediate (default
 	// {auth, not_found, rate_limited}; `transient` is honored locally
 	// only).
@@ -317,15 +317,15 @@ type UpstreamRegistry struct {
 // on Config but no longer have any effect. They are accepted here
 // purely so existing ConfigMaps that still set them parse without
 // error under KnownFields=true. None of these fields are exposed via
-// CLI flags or environment variables — setting them via env/flag is
+// CLI flags or environment variables - setting them via env/flag is
 // not supported, only YAML round-trips for back-compat. A future
 // major version will remove this struct entirely.
 //
-// Removal trail (plan-final-copilot-v2 §Phase 8):
-//   - cache_dir / cache_budget_bytes / cache_forced_eviction_headroom_pct
-//     / eviction_provider_count_threshold:
-//     the hostPath cache backend was deleted; containerd's own GC owns
-//     blob lifetime now.
+// Removal trail :
+// - cache_dir / cache_budget_bytes / cache_forced_eviction_headroom_pct
+// / eviction_provider_count_threshold:
+// the hostPath cache backend was deleted; containerd's own GC owns
+// blob lifetime now.
 type LegacyDeprecatedConfig struct {
 	CacheDir                       string `yaml:"cache_dir,omitempty"`
 	CacheBudgetBytes               int64  `yaml:"cache_budget_bytes,omitempty"`
@@ -334,7 +334,7 @@ type LegacyDeprecatedConfig struct {
 }
 
 // NewDefault returns a Config populated with the design-doc defaults.
-// All fields are set; Validate() against this MUST pass.
+// All fields are set; Validate against this MUST pass.
 func NewDefault() *Config {
 	return &Config{
 		MirrorListen:               "127.0.0.1:5000",
@@ -387,6 +387,7 @@ func NewDefault() *Config {
 func (c *Config) LoadYAML(r io.Reader) error {
 	dec := yaml.NewDecoder(r)
 	dec.KnownFields(true)
+
 	return dec.Decode(c)
 }
 
@@ -395,9 +396,10 @@ func (c *Config) LoadYAML(r io.Reader) error {
 //
 // Only scalar fields are overlaid here; list fields (UpstreamRegistries,
 // Libp2pListen, OriginFailureClassesTrustedClusterWide) are file-only by
-// design — env vars are an awkward shape for them.
+// design - env vars are an awkward shape for them.
 func (c *Config) LoadEnv(env func(string) string) error {
 	var errs []error
+
 	setStr := func(key string, dst *string) {
 		if v, ok := lookup(env, key); ok {
 			*dst = v
@@ -410,6 +412,7 @@ func (c *Config) LoadEnv(env func(string) string) error {
 				errs = append(errs, fmt.Errorf("env GANTRY_%s: %w", key, err))
 				return
 			}
+
 			*dst = n
 		}
 	}
@@ -420,6 +423,7 @@ func (c *Config) LoadEnv(env func(string) string) error {
 				errs = append(errs, fmt.Errorf("env GANTRY_%s: %w", key, err))
 				return
 			}
+
 			*dst = d
 		}
 	}
@@ -430,6 +434,7 @@ func (c *Config) LoadEnv(env func(string) string) error {
 				errs = append(errs, fmt.Errorf("env GANTRY_%s: %w", key, err))
 				return
 			}
+
 			*dst = b
 		}
 	}
@@ -452,7 +457,7 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	// GANTRY_EVICTION_PROVIDER_COUNT_THRESHOLD, GANTRY_STORAGE_MODE)
 	// are no longer read. The fields they used to write to are either
 	// removed (cache_*) or no longer operator-tunable (storage_mode is
-	// fixed to "containerd" — see Validate). Existing ConfigMaps that
+	// fixed to "containerd" - see Validate). Existing ConfigMaps that
 	// still set them in YAML continue to parse via
 	// LegacyDeprecatedConfig.
 
@@ -483,7 +488,7 @@ func (c *Config) LoadEnv(env func(string) string) error {
 }
 
 // BindFlags registers command-line flags on fs that overlay c. Call after
-// LoadYAML / LoadEnv but before fs.Parse() so flags win.
+// LoadYAML / LoadEnv but before fs.Parse so flags win.
 func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.MirrorListen, "mirror-listen", c.MirrorListen, "address for the containerd-facing mirror endpoint (loopback)")
 	fs.BoolVar(&c.MirrorBindAllowNonLoopback, "mirror-bind-allow-non-loopback", c.MirrorBindAllowNonLoopback, "opt in to a non-loopback mirror bind (e.g. when using hostPort + hostIP=127.0.0.1 in Kubernetes)")
@@ -494,14 +499,14 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.NodeName, "node-name", c.NodeName, "Kubernetes node name this agent runs on (Downward API spec.nodeName)")
 	fs.StringVar(&c.PodName, "pod-name", c.PodName, "Kubernetes pod name of this agent (Downward API metadata.name)")
 	fs.StringVar(&c.PodIP, "pod-ip", c.PodIP, "Kubernetes pod IP of this agent (Downward API status.podIP); used to rewrite 0.0.0.0 listeners into dialable advertised addresses")
-	fs.StringVar(&c.MembersNamespace, "members-namespace", c.MembersNamespace, "namespace to scope the pod informer (REQUIRED when node_name+pod_name are set — AnnounceSelf needs it to self-patch; empty is dev-only)")
+	fs.StringVar(&c.MembersNamespace, "members-namespace", c.MembersNamespace, "namespace to scope the pod informer (REQUIRED when node_name+pod_name are set - AnnounceSelf needs it to self-patch; empty is dev-only)")
 	fs.StringVar(&c.MembersLabelSelector, "members-label-selector", c.MembersLabelSelector, "label selector identifying Gantry DaemonSet pods")
 	fs.StringVar(&c.MembersKubeconfig, "members-kubeconfig", c.MembersKubeconfig, "optional path to a kubeconfig file (empty = in-cluster)")
 
 	// Deprecated cache flags (--cache-dir, --cache-budget-bytes,
 	// --cache-forced-eviction-headroom-pct,
 	// --eviction-provider-count-threshold) and --storage-mode were
-	// removed in plan §Phase 8. The cache fields are no-ops under
+	// removed in plan . The cache fields are no-ops under
 	// containerd-only storage; storage_mode itself is no longer an
 	// operator knob because "containerd" is the only accepted value
 	// (Validate enforces it). YAML-only back-compat for these names
@@ -522,8 +527,8 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.IntVar(&c.BootstrapRoutingTablePct, "bootstrap-routing-table-pct", c.BootstrapRoutingTablePct, "routing-table-size percent that ends the bootstrap window")
 	fs.IntVar(&c.TopKExpansionFactorDegraded, "topk-expansion-factor-degraded", c.TopKExpansionFactorDegraded, "multiplier applied to HRW K when expanding under Degraded health")
 
-	fs.DurationVar(&c.OriginFailureCooldownInitial, "origin-failure-cooldown-initial", c.OriginFailureCooldownInitial, "initial cooldown for the §5.8 origin-failure circuit breaker")
-	fs.DurationVar(&c.OriginFailureCooldownMax, "origin-failure-cooldown-max", c.OriginFailureCooldownMax, "max cooldown for the §5.8 origin-failure circuit breaker")
+	fs.DurationVar(&c.OriginFailureCooldownInitial, "origin-failure-cooldown-initial", c.OriginFailureCooldownInitial, "initial cooldown for the origin-failure circuit breaker")
+	fs.DurationVar(&c.OriginFailureCooldownMax, "origin-failure-cooldown-max", c.OriginFailureCooldownMax, "max cooldown for the origin-failure circuit breaker")
 	fs.IntVar(&c.OriginFailureCooldownMultiplier, "origin-failure-cooldown-multiplier", c.OriginFailureCooldownMultiplier, "exponential multiplier between successive cooldowns")
 	fs.DurationVar(&c.OriginFailureHonorWindowCap, "origin-failure-honor-window-cap", c.OriginFailureHonorWindowCap, "requester-side honor window cap for transient cooldowns")
 
@@ -531,10 +536,10 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.LogFormat, "log-format", c.LogFormat, "log format (json/text)")
 }
 
-// Load is the convenience composition of NewDefault → LoadYAML(file) →
-// LoadEnv → BindFlags → fs.Parse(args). It returns the fully-merged Config
-// and the FlagSet for callers that want to print -help text. Validate() is
-// the caller's responsibility — Load does not call it so callers can
+// Load is the convenience composition of NewDefault -> LoadYAML(file) ->
+// LoadEnv -> BindFlags -> fs.Parse(args). It returns the fully-merged Config
+// and the FlagSet for callers that want to print -help text. Validate is
+// the caller's responsibility - Load does not call it so callers can
 // inspect partial configs (e.g., for `gantry version`).
 func Load(args []string, env func(string) string, configPath string) (*Config, *flag.FlagSet, error) {
 	c := NewDefault()
@@ -544,11 +549,14 @@ func Load(args []string, env func(string) string, configPath string) (*Config, *
 		if err != nil {
 			return nil, nil, fmt.Errorf("config: open %s: %w", configPath, err)
 		}
+
 		defer func() { _ = f.Close() }() //nolint:errcheck // best-effort close
+
 		if err := c.LoadYAML(f); err != nil {
 			return nil, nil, fmt.Errorf("config: parse %s: %w", configPath, err)
 		}
 	}
+
 	if err := c.LoadEnv(env); err != nil {
 		return nil, nil, err
 	}
@@ -561,6 +569,7 @@ func Load(args []string, env func(string) string, configPath string) (*Config, *
 	if err := fs.Parse(args); err != nil {
 		return nil, fs, err
 	}
+
 	return c, fs, nil
 }
 
@@ -574,6 +583,7 @@ func (c *Config) Validate() error {
 			errs = append(errs, fmt.Errorf("%s: required", field))
 			return
 		}
+
 		if _, _, err := net.SplitHostPort(val); err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", field, err))
 		}
@@ -582,15 +592,16 @@ func (c *Config) Validate() error {
 	mustAddr("transfer_listen", c.TransferListen)
 	mustAddr("metrics_listen", c.MetricsListen)
 
-	// MirrorListen MUST be loopback (§4.1, §7.5) unless the operator has
+	// MirrorListen MUST be loopback (the design doc, the design doc) unless the operator has
 	// explicitly opted in to a non-loopback bind. See the field comment on
 	// Config.MirrorBindAllowNonLoopback for when that's safe.
 	if !c.MirrorBindAllowNonLoopback {
 		if host, _, err := net.SplitHostPort(c.MirrorListen); err == nil {
 			ip := net.ParseIP(host)
 			if ip != nil && !ip.IsLoopback() {
-				errs = append(errs, fmt.Errorf("mirror_listen %q is not loopback; only 127.0.0.1 / ::1 are safe (containerd mirror uses skip_verify=true) — set mirror_bind_allow_non_loopback: true to override (operator opt-in)", c.MirrorListen))
+				errs = append(errs, fmt.Errorf("mirror_listen %q is not loopback; only 127.0.0.1 / ::1 are safe (containerd mirror uses skip_verify=true) - set mirror_bind_allow_non_loopback: true to override (operator opt-in)", c.MirrorListen))
 			}
+
 			if ip == nil && host != "localhost" && host != "" {
 				errs = append(errs, fmt.Errorf("mirror_listen host %q: must be loopback (or set mirror_bind_allow_non_loopback: true)", host))
 			}
@@ -599,7 +610,7 @@ func (c *Config) Validate() error {
 
 	// Deprecated cache fields (CacheDir, CacheBudgetBytes,
 	// CacheForcedEvictionHeadroomPct, EvictionProviderCountThreshold)
-	// are no longer validated — they are silently ignored under
+	// are no longer validated - they are silently ignored under
 	// storage_mode=containerd. Validation here would force operators
 	// to either keep sensible-looking values (defeating the
 	// "deprecated" signal) or remove them from their ConfigMap (a
@@ -610,23 +621,26 @@ func (c *Config) Validate() error {
 	case StorageModeContainerd:
 		// valid
 	case storageModeGantryCache:
-		errs = append(errs, errors.New("storage_mode \"gantry-cache\" was removed in plan-final-copilot-v2 §Phase 8; set storage_mode: containerd and remove the cache_dir/cache_budget_bytes hostPath volume from your DaemonSet"))
+		errs = append(errs, errors.New("storage_mode \"gantry-cache\" was removed in ; set storage_mode: containerd and remove the cache_dir/cache_budget_bytes hostPath volume from your DaemonSet"))
 	case "":
 		errs = append(errs, errors.New("storage_mode: required (must be \"containerd\")"))
 	default:
 		errs = append(errs, fmt.Errorf("storage_mode %q: must be \"containerd\"", c.StorageMode))
 	}
+
 	if c.StorageMode == StorageModeContainerd && c.ContainerdSocket == "" {
 		errs = append(errs, errors.New("storage_mode=containerd requires containerd_socket to be set"))
 	}
+
 	if c.StorageMode == StorageModeContainerd {
-		// Plan §Phase 7 mandates a 30m–120m TTL. We accept a wider
+		// mandates a 30m–120m TTL. We accept a wider
 		// range with warnings deferred to log; pure validation just
 		// requires positive values so the cleanup interval cannot
 		// degenerate into a tight loop.
 		if c.ContainerdLeaseTTL <= 0 {
 			errs = append(errs, fmt.Errorf("containerd_lease_ttl: must be > 0 in storage_mode=containerd, got %s", c.ContainerdLeaseTTL))
 		}
+
 		if c.ContainerdLeaseCleanupInterval <= 0 {
 			errs = append(errs, fmt.Errorf("containerd_lease_cleanup_interval: must be > 0 in storage_mode=containerd, got %s", c.ContainerdLeaseCleanupInterval))
 		}
@@ -635,6 +649,7 @@ func (c *Config) Validate() error {
 	if len(c.UpstreamRegistries) == 0 {
 		errs = append(errs, errors.New("upstream_registries: at least one entry required"))
 	}
+
 	seen := map[string]int{}
 	for i, ur := range c.UpstreamRegistries {
 		if ur.Name == "" {
@@ -644,6 +659,7 @@ func (c *Config) Validate() error {
 		} else {
 			seen[ur.Name] = i
 		}
+
 		if ur.Endpoint == "" {
 			errs = append(errs, fmt.Errorf("upstream_registries[%d].endpoint: required", i))
 		} else if !strings.HasPrefix(ur.Endpoint, "http://") && !strings.HasPrefix(ur.Endpoint, "https://") {
@@ -654,6 +670,7 @@ func (c *Config) Validate() error {
 	if c.HRWK < 1 {
 		errs = append(errs, fmt.Errorf("hrw_k: must be >= 1, got %d", c.HRWK))
 	}
+
 	switch c.HRWTopologyScope {
 	case "cluster", "zone":
 	default:
@@ -663,15 +680,19 @@ func (c *Config) Validate() error {
 	if c.NF5JitterBase <= 0 {
 		errs = append(errs, fmt.Errorf("nf5_jitter_base: must be > 0, got %v", c.NF5JitterBase))
 	}
+
 	if c.NF5PerNodeRateLimit < 1 {
 		errs = append(errs, fmt.Errorf("nf5_per_node_rate_limit: must be >= 1, got %d", c.NF5PerNodeRateLimit))
 	}
+
 	if c.BootstrapWindow <= 0 {
 		errs = append(errs, fmt.Errorf("bootstrap_window: must be > 0, got %v", c.BootstrapWindow))
 	}
+
 	if c.BootstrapRoutingTablePct < 1 || c.BootstrapRoutingTablePct > 100 {
 		errs = append(errs, fmt.Errorf("bootstrap_routing_table_pct: must be in [1,100], got %d", c.BootstrapRoutingTablePct))
 	}
+
 	if c.TopKExpansionFactorDegraded < 1 {
 		errs = append(errs, fmt.Errorf("topk_expansion_factor_degraded: must be >= 1, got %d", c.TopKExpansionFactorDegraded))
 	}
@@ -679,11 +700,13 @@ func (c *Config) Validate() error {
 	if c.OriginFailureCooldownInitial <= 0 {
 		errs = append(errs, fmt.Errorf("origin_failure_cooldown_initial: must be > 0, got %v", c.OriginFailureCooldownInitial))
 	}
+
 	if c.OriginFailureCooldownMax < c.OriginFailureCooldownInitial {
 		errs = append(errs, fmt.Errorf("origin_failure_cooldown_max %v: must be >= origin_failure_cooldown_initial %v", c.OriginFailureCooldownMax, c.OriginFailureCooldownInitial))
 	}
-	if c.OriginFailureCooldownMultiplier < 1 {
-		errs = append(errs, fmt.Errorf("origin_failure_cooldown_multiplier: must be >= 1, got %d", c.OriginFailureCooldownMultiplier))
+
+	if c.OriginFailureCooldownMultiplier < 2 {
+		errs = append(errs, fmt.Errorf("origin_failure_cooldown_multiplier: must be >= 2, got %d", c.OriginFailureCooldownMultiplier))
 	}
 
 	switch c.LogLevel {
@@ -691,6 +714,7 @@ func (c *Config) Validate() error {
 	default:
 		errs = append(errs, fmt.Errorf("log_level %q: must be debug|info|warn|error", c.LogLevel))
 	}
+
 	switch c.LogFormat {
 	case "json", "text":
 	default:
@@ -710,13 +734,13 @@ func (c *Config) Validate() error {
 	// inbound Coord.PleasePull / PullIntentQuery 503s silently
 	// because no peer can resolve our node name to a peer ID. There
 	// is no fallback peer-ID-mapping mechanism in the codebase that
-	// would rescue this case — static bootstrap peers solve DHT
+	// would rescue this case - static bootstrap peers solve DHT
 	// seeding, not annotation publication.
 	//
 	// The Downward API DaemonSet pattern shipped in deploy/ wires
 	// all three env vars together (spec.nodeName, metadata.name,
 	// metadata.namespace) so this misconfiguration only happens when
-	// an operator hand-rolls envFrom — exactly the case where a
+	// an operator hand-rolls envFrom - exactly the case where a
 	// clear startup error beats hours of silent peer-coordination
 	// failure.
 	if c.NodeName != "" && c.PodName == "" {
@@ -727,27 +751,27 @@ func (c *Config) Validate() error {
 	// NodeName + PodName are both set, the agent will (a) participate
 	// in HRW and (b) try to publish its three coordination annotations
 	// via AnnounceSelf at startup. The self-announce path is a
-	// Pods(namespace).Patch call that REQUIRES a concrete namespace —
+	// Pods(namespace).Patch call that REQUIRES a concrete namespace -
 	// members.AnnounceSelf refuses to run with an empty namespace
 	// because the apiserver cannot infer a pod's home namespace from
 	// the pod name alone (different namespaces can hold pods with the
 	// same name). Without members_namespace set, AnnounceSelf fails on
 	// every retry, /readyz never goes green (production readiness
-	// requires a successful self-announce — see
+	// requires a successful self-announce - see
 	// selfAnnounceRequiredForReadiness in cmd/gantry/main.go), and the
-	// agent is stuck unready forever — but the misconfiguration is
+	// agent is stuck unready forever - but the misconfiguration is
 	// silent at config-load time because cluster-wide list/watch is a
-	// supported informer mode in other contexts. Catch it at Validate()
+	// supported informer mode in other contexts. Catch it at Validate
 	// so the operator gets a clear startup error rather than a stuck
 	// /readyz endpoint.
 	//
-	// The shipped DaemonSet at deploy/daemonset.yaml wires this via
+	// The shipped DaemonSet at deploy/gantry/daemonset.yaml wires this via
 	// the Downward API (fieldRef: metadata.namespace), so operators
 	// following the canonical deploy path satisfy this for free; the
 	// failure mode is a hand-rolled envFrom that omits the namespace
 	// env var.
 	if c.NodeName != "" && c.PodName != "" && c.MembersNamespace == "" {
-		errs = append(errs, errors.New("members_namespace is empty but node_name and pod_name are set (production K8s mode): self-announce (members.AnnounceSelf) needs Options.Namespace to patch this agent's own pod with gantry.io/peer-id, gantry.io/p2p-addrs, and gantry.io/transfer-addr, and refuses to run cluster-wide because the apiserver cannot infer a pod's home namespace from name alone; set GANTRY_MEMBERS_NAMESPACE / members_namespace (typically via Downward API fieldRef: metadata.namespace, see deploy/daemonset.yaml) — without it the agent will never go ready because production-mode readiness requires a successful self-announce"))
+		errs = append(errs, errors.New("members_namespace is empty but node_name and pod_name are set (production K8s mode): self-announce (members.AnnounceSelf) needs Options.Namespace to patch this agent's own pod with gantry.io/peer-id, gantry.io/p2p-addrs, and gantry.io/transfer-addr, and refuses to run cluster-wide because the apiserver cannot infer a pod's home namespace from name alone; set GANTRY_MEMBERS_NAMESPACE / members_namespace (typically via Downward API fieldRef: metadata.namespace, see deploy/gantry/daemonset.yaml) - without it the agent will never go ready because production-mode readiness requires a successful self-announce"))
 	}
 
 	return errors.Join(errs...)
@@ -761,6 +785,7 @@ func (c *Config) ResolveUpstream(ns string) (UpstreamRegistry, bool) {
 			return ur, true
 		}
 	}
+
 	return UpstreamRegistry{}, false
 }
 

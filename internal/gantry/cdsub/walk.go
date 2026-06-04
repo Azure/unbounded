@@ -27,7 +27,7 @@ import (
 //
 // Uses images.Walk + images.Children which are exactly the helpers
 // containerd internally uses for image GC. Each visited descriptor is
-// probed with ContentStore.Info — a single map lookup — so the
+// probed with ContentStore.Info - a single map lookup - so the
 // resulting digest set is guaranteed to be serveable from the local
 // content store at probe time. This enforces the plan invariant
 // "advertise only present-and-serveable from containerd" instead of
@@ -47,8 +47,8 @@ func walkBlobs(ctx context.Context, store content.Store, target ocispec.Descript
 
 // walkBlobsWithRecorder is walkBlobs that additionally calls recorder
 // for every present descriptor's (digest, mediaType) pair. Used by
-// the containerdstore descriptor index — populating it during the
-// reconcile-walk we already do (per plan §"Descriptor index"
+// the containerdstore descriptor index - populating it during the
+// reconcile-walk we already do (per "Descriptor index"
 // sources of truth) means the transfer endpoint's manifest replies
 // can fill the Content-Type header without parsing the manifest
 // body. recorder may be nil; nil is a no-op for back-compat with
@@ -58,15 +58,19 @@ func walkBlobsWithRecorder(ctx context.Context, store content.Store, target ocis
 		out  []gdigest.Digest
 		seen = map[string]struct{}{}
 	)
+
 	handler := images.HandlerFunc(func(ctx context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
 		if desc.Digest == "" {
 			return nil, nil
 		}
+
 		s := desc.Digest.String()
 		if _, ok := seen[s]; ok {
 			return nil, nil
 		}
+
 		seen[s] = struct{}{}
+
 		d, parseErr := gdigest.Parse(s)
 		if parseErr != nil {
 			// Skip non-sha256 entries; the rest of the agent only
@@ -74,24 +78,29 @@ func walkBlobsWithRecorder(ctx context.Context, store content.Store, target ocis
 			return childrenIfPresent(ctx, store, desc)
 		}
 		// Present-only gate: only emit the digest if the content store
-		// can confirm it is locally available. Info() is metadata-only
+		// can confirm it is locally available. Info is metadata-only
 		// and cheap. Absent digests are skipped silently so a missing
 		// child does not invalidate sibling subtrees.
 		if _, infoErr := store.Info(ctx, desc.Digest); infoErr != nil {
 			if errdefs.IsNotFound(infoErr) {
 				return childrenIfPresent(ctx, store, desc)
 			}
+
 			return nil, infoErr
 		}
+
 		if recorder != nil && desc.MediaType != "" {
 			recorder(d, desc.MediaType)
 		}
+
 		out = append(out, d)
+
 		return childrenIfPresent(ctx, store, desc)
 	})
 	if err := images.Walk(ctx, handler, target); err != nil {
 		return nil, err
 	}
+
 	return out, nil
 }
 
@@ -102,5 +111,6 @@ func childrenIfPresent(ctx context.Context, store content.Store, desc ocispec.De
 	if err != nil && errdefs.IsNotFound(err) {
 		return nil, nil
 	}
+
 	return children, err
 }

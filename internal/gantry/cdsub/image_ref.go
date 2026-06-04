@@ -8,11 +8,11 @@ import "strings"
 // registryFromImage extracts the host (registry) portion of a
 // containerd image name. Examples:
 //
-//	"docker.io/library/alpine:3.18"     → "docker.io"
-//	"registry.k8s.io/pause:3.9"         → "registry.k8s.io"
-//	"ghcr.io/owner/repo@sha256:abc..."  → "ghcr.io"
-//	"localhost:5000/myimg:tag"          → "localhost:5000"
-//	"alpine"                            → "" (no registry component)
+//	"docker.io/library/alpine:3.18" -> "docker.io"
+//	"registry.k8s.io/pause:3.9" -> "registry.k8s.io"
+//	"ghcr.io/owner/repo@sha256:abc..." -> "ghcr.io"
+//	"localhost:5000/myimg:tag" -> "localhost:5000"
+//	"alpine" -> "" (no registry component)
 //
 // The OCI / docker reference convention is: the registry is the part
 // before the first "/" *if* it contains a "." or ":" or is "localhost".
@@ -26,13 +26,16 @@ func registryFromImage(name string) string {
 	if name == "" {
 		return ""
 	}
+
 	slash := strings.IndexByte(name, '/')
 	if slash < 0 {
 		return ""
 	}
+
 	prefix := name[:slash]
 	if prefix == "localhost" || strings.ContainsAny(prefix, ".:") {
 		return prefix
 	}
+
 	return ""
 }

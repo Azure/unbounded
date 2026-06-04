@@ -19,12 +19,12 @@ data:
     # mirror_listen binds 0.0.0.0:5000 inside the pod because the
     # DaemonSet exposes the mirror via hostPort with hostIP: 127.0.0.1
     # (deploy/daemonset.yaml). kube-proxy / portmap DNATs the host's
-    # 127.0.0.1:5000 to <podIP>:5000 in the pod's network namespace —
+    # 127.0.0.1:5000 to <podIP>:5000 in the pod's network namespace -
     # a listener on the pod's loopback (127.0.0.1 inside the pod) is
     # unreachable through that path.
     #
     # Exposure note: the hostIP=127.0.0.1 binding on the hostPort is
-    # the ONLY default protection — it constrains host-side reach to
+    # the ONLY default protection - it constrains host-side reach to
     # node-local, but the listener inside the pod is still 0.0.0.0
     # and therefore reachable from any other pod on the cluster
     # network at <podIP>:5000. Operators who do not want peer pods
@@ -46,7 +46,7 @@ data:
     # ---------- libp2p ----------
     # IPv4 wildcard listeners. The pods/patch self-announce only
     # publishes multiaddrs whose wildcard family matches the Pod IP
-    # family — a /ip4/0.0.0.0 listener with a v6 Pod IP is silently
+    # family - a /ip4/0.0.0.0 listener with a v6 Pod IP is silently
     # skipped because the kernel has no v6 socket to dial. For
     # dual-stack or v6-only clusters, append /ip6/::/ listeners
     # below; the agent will then publish /ip6/<podIP>/ multiaddrs
@@ -108,7 +108,7 @@ data:
     # which crashloops the pod. The DaemonSet's registry-creds
     # volume is `optional: true`, so a default ConfigMap that
     # references a non-existent credentials_path would let
-    # Kubernetes start the pod and then crash the agent — the
+    # Kubernetes start the pod and then crash the agent - the
     # default below is therefore credentials-free on purpose.
     upstream_registries:
       - name: "registry.example.com"

@@ -58,7 +58,7 @@ func newHarness(t *testing.T) *harness {
 	if err != nil {
 		t.Fatalf("getwd: %v", err)
 	}
-	root := filepath.Dir(wd) // e2e/ → repo root
+	root := filepath.Dir(wd) // e2e/ -> repo root
 	artifacts := filepath.Join(wd, ".artifacts")
 	if err := os.MkdirAll(artifacts, 0o755); err != nil {
 		t.Fatalf("mkdir artifacts: %v", err)
@@ -144,7 +144,7 @@ func (h *harness) applyManifests(ctx context.Context) {
 	}
 	// NetworkPolicy is intentionally NOT applied by the e2e harness.
 	// The hardening manifest at deploy/examples/networkpolicy.yaml
-	// is templated — every rule defers CIDR/namespace choices to the
+	// is templated - every rule defers CIDR/namespace choices to the
 	// operator (see deploy/README.md § Hardening overlays). It is
 	// designed for a production cluster with known control-plane,
 	// node-CIDR, and namespace values; on kind those values are
@@ -300,7 +300,7 @@ func (h *harness) metricSum(ctx context.Context, metric string, filters ...strin
 // metricSumOnPod returns the sum of all `metric{...}` series exposed by
 // a single gantry pod whose label set contains all `filters`. Used by
 // tests that need to assert "exactly this pod (and not its peers)
-// served the request" — gantry's per-node metrics are not aggregated
+// served the request" - gantry's per-node metrics are not aggregated
 // upstream, so the sharding is intrinsic.
 func (h *harness) metricSumOnPod(ctx context.Context, pod, metric string, filters ...string) float64 {
 	h.t.Helper()
@@ -548,13 +548,13 @@ func (h *harness) applyConfigMap(ctx context.Context) error {
 // identifies the GANTRY container (not the busybox initContainer) in
 // deploy/daemonset.yaml. The trailing `# build.sh fills this with
 // `git describe“ comment is part of the anchor on purpose: it makes
-// the match brittle in exactly the right way — if the gantry image
+// the match brittle in exactly the right way - if the gantry image
 // line is ever reformatted, patchDaemonSetForE2E fails fast at apply
 // time rather than silently leaving the production image in place.
 const gantryContainerAnchor = "image: ghcr.io/vpatelsj/gantry:latest   # build.sh fills this with `git describe`\n          imagePullPolicy: IfNotPresent"
 
 // patchDaemonSetForE2E rewrites deploy/daemonset.yaml's gantry
-// container — and ONLY the gantry container — to use the
+// container - and ONLY the gantry container - to use the
 // side-loaded e2e image with imagePullPolicy=Never. The busybox
 // initContainer (which also has `imagePullPolicy: IfNotPresent`)
 // is left untouched so kind's containerd can pull it from the
@@ -570,7 +570,7 @@ const gantryContainerAnchor = "image: ghcr.io/vpatelsj/gantry:latest   # build.s
 // used `strings.Replace(..., 1)` on the policy line alone, which
 // patched the busybox initContainer (first occurrence) instead of
 // gantry. The result on a fresh kind cluster was the busybox init image
-// being set to `Never` — but busybox is not preloaded into kind
+// being set to `Never` - but busybox is not preloaded into kind
 // so kubelet hit ErrImageNeverPull and the initContainer never
 // started. The eleventh-review fix was to anchor the swap on a
 // multi-line pattern that uniquely matches the gantry container,
@@ -581,7 +581,7 @@ func patchDaemonSetForE2E(raw, imageTag string) (string, error) {
 	if patched == raw {
 		// Anchor didn't match. Almost certainly because the gantry
 		// container's image line was reformatted in
-		// deploy/daemonset.yaml. Bail loud — we'd rather fail the
+		// deploy/daemonset.yaml. Bail loud - we'd rather fail the
 		// e2e test than ship a half-patched manifest that rolls
 		// out the production tag (or, worse, the wrong
 		// imagePullPolicy on the wrong container).
@@ -594,7 +594,7 @@ func patchDaemonSetForE2E(raw, imageTag string) (string, error) {
 // deploy/configmap.yaml that lists the operator-facing placeholder
 // registries. patchConfigMapForE2E swaps the whole block for a
 // single anonymous-public entry so the e2e cluster is self-contained
-// — see that helper's doc for why.
+// - see that helper's doc for why.
 const configMapUpstreamRegistriesAnchor = `    upstream_registries:
       - name: "registry.example.com"
         endpoint: "https://registry.example.com"
@@ -623,7 +623,7 @@ const e2eConfigMapUpstreamRegistriesReplacement = `    upstream_registries:
 //
 //   - If credentials_path is ever uncommented on the default entry,
 //     origin.New eagerly reads the file at startup and crashloops the
-//     pod — the registry-creds Secret volume in daemonset.yaml is
+//     pod - the registry-creds Secret volume in daemonset.yaml is
 //     `optional: true`, so kubelet still starts the pod but the agent
 //     dies on the first `os.ReadFile` in newRegistry.
 //   - Even with credentials_path commented out, leaving the host
@@ -649,7 +649,7 @@ func patchConfigMapForE2E(raw string) (string, error) {
 // waitForRollout polls until the DaemonSet reports all desired pods
 // ready, or the context fires.
 //
-// The poll cadence is 5 s — explicitly chosen to honor the
+// The poll cadence is 5 s - explicitly chosen to honor the
 // "never sleep > 5s in one call" project preference: the loop sleeps
 // in 5 s steps so the test stays interruptible by Ctrl-C / ctx.
 func (h *harness) waitForRollout(ctx context.Context) {
@@ -691,7 +691,7 @@ func (h *harness) checkReadyz(ctx context.Context) {
 // teardown deletes the kind cluster. Skipped when E2E_KEEP=1.
 func (h *harness) teardown(ctx context.Context) {
 	if h.keepCluster {
-		h.t.Logf("E2E_KEEP=1 — leaving cluster %q running", clusterName)
+		h.t.Logf("E2E_KEEP=1 - leaving cluster %q running", clusterName)
 		return
 	}
 	if err := h.run(ctx, "kind", "delete", "cluster", "--name", clusterName); err != nil {
@@ -710,7 +710,7 @@ func (h *harness) dumpDiagnostics(ctx context.Context) {
 		{"get", "pods", "-A", "-o", "wide"},
 	} {
 		out, _ := h.runOut(ctx, "kubectl", args...)
-		// Sanitize args for the filename — kubectl args can contain
+		// Sanitize args for the filename - kubectl args can contain
 		// '/' (e.g. ds/gantry, pod/foo) which os.WriteFile would
 		// silently fail on because the parent dir does not exist.
 		safe := strings.ReplaceAll(strings.Join(args, "_"), "/", "_")
@@ -729,8 +729,8 @@ func (h *harness) dumpDiagnostics(ctx context.Context) {
 // containerd's GC actually collects the blobs. Without this the
 // image bytes survive `crictl rmi` (because gantry pins them for the
 // configured lease TTL) and a subsequent kubelet pull short-circuits
-// at containerd's HEAD-then-mount fast path — never reaching the
-// mirror — which would silently bypass the credential code path
+// at containerd's HEAD-then-mount fast path - never reaching the
+// mirror - which would silently bypass the credential code path
 // under test.
 func (h *harness) evictImageFromNode(ctx context.Context, nodeName string, image ...string) {
 	h.t.Helper()
@@ -769,7 +769,7 @@ func (h *harness) verifyContainerdSocketAccess(ctx context.Context, pod string) 
 	}
 	if !strings.Contains(logs, "connected to containerd") {
 		h.dumpDiagnostics(ctx)
-		h.t.Fatalf("pod %s did not log 'connected to containerd' — socket access likely broken", pod)
+		h.t.Fatalf("pod %s did not log 'connected to containerd' - socket access likely broken", pod)
 	}
 	body, err := h.fetchPodPath(ctx, pod, "/readyz")
 	if err != nil {

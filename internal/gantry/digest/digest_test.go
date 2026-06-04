@@ -7,16 +7,20 @@ import "testing"
 
 func TestParse_Valid(t *testing.T) {
 	in := "sha256:" + repeat("a", 64)
+
 	d, err := Parse(in)
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
+
 	if d.Algorithm() != SHA256 {
 		t.Errorf("algo = %q, want sha256", d.Algorithm())
 	}
+
 	if d.String() != in {
 		t.Errorf("String() = %q, want %q", d.String(), in)
 	}
+
 	if d.IsZero() {
 		t.Error("IsZero() = true for valid digest")
 	}
@@ -48,6 +52,7 @@ func TestZeroValue(t *testing.T) {
 	if !d.IsZero() {
 		t.Error("zero Digest.IsZero() = false")
 	}
+
 	if d.String() != "" {
 		t.Errorf("zero Digest.String() = %q, want \"\"", d.String())
 	}
@@ -58,5 +63,6 @@ func repeat(s string, n int) string {
 	for i := 0; i < n; i++ {
 		copy(out[i*len(s):], s)
 	}
+
 	return string(out)
 }

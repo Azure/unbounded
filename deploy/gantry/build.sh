@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# build.sh — local container-image build helper for gantry.
+# build.sh - local container-image build helper for gantry.
 #
 # Usage:
 #   deploy/build.sh                      # single-arch, tag from `git describe`
@@ -18,7 +18,7 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
-deploy/build.sh — build the gantry container image.
+deploy/build.sh - build the gantry container image.
 
 Flags:
   -p, --platform <list>   Comma-separated buildx platforms (e.g. linux/amd64,linux/arm64).

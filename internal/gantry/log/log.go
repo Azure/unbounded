@@ -4,28 +4,28 @@
 // Package log is the structured-logging entry point for Gantry.
 //
 // The design docs mandate WARN-level emission in specific places (forced
-// cache eviction in §7.4, HRW rank mismatch in §5.3). This package wraps
+// cache eviction in the design doc, HRW rank mismatch in the design doc). This package wraps
 // log/slog with a consistent attribute vocabulary so those WARN lines are
 // uniformly tagged and machine-parseable.
 //
 // Standard attributes (use the helper constructors below to set them so
 // keys don't drift):
 //
-//	subsystem  one of {"mirror","transfer","cache","origin","coord",
-//	           "discovery","hrw","members","cdsub","agent"}
-//	digest     OCI digest string ("sha256:...")
-//	peer       NodeID of a remote peer
-//	registry   upstream registry name
-//	repo       OCI repository
-//	class      §5.8 failure class
+//	subsystem one of {"mirror","transfer","cache","origin","coord",
+//	 "discovery","hrw","members","cdsub","agent"}
+//	digest OCI digest string ("sha256:...")
+//	peer NodeID of a remote peer
+//	registry upstream registry name
+//	repo OCI repository
+//	class the design doc failure class
 //
 // Level conventions:
 //
-//	DEBUG  per-RPC traces, per-byte transfer milestones
-//	INFO   state transitions, lifecycle events
-//	WARN   §7.4 forced eviction, §5.3 HRW rank mismatch, soft failures
-//	       that the design explicitly calls out
-//	ERROR  hard failures requiring operator attention
+//	DEBUG per-RPC traces, per-byte transfer milestones
+//	INFO state transitions, lifecycle events
+//	WARN the design doc forced eviction, the design doc HRW rank mismatch, soft failures
+//	 that the design explicitly calls out
+//	ERROR hard failures requiring operator attention
 package log
 
 import (
@@ -44,13 +44,16 @@ func New(w io.Writer, level, format string) *slog.Logger {
 	if w == nil {
 		w = os.Stderr
 	}
+
 	opts := &slog.HandlerOptions{Level: parseLevel(level)}
+
 	var h slog.Handler
 	if strings.EqualFold(format, "text") {
 		h = slog.NewTextHandler(w, opts)
 	} else {
 		h = slog.NewJSONHandler(w, opts)
 	}
+
 	return slog.New(h)
 }
 
@@ -76,7 +79,7 @@ func Registry(name string) slog.Attr { return slog.String("registry", name) }
 // Repo builds a slog.Attr carrying the standard "repo" key.
 func Repo(name string) slog.Attr { return slog.String("repo", name) }
 
-// Class builds a slog.Attr carrying the standard "class" key (§5.8 failure class).
+// Class builds a slog.Attr carrying the standard "class" key (the design doc failure class).
 func Class(c string) slog.Attr { return slog.String("class", c) }
 
 // NodeID builds a slog.Attr carrying the standard "node_id" key.
@@ -86,13 +89,14 @@ func NodeID(id fmt.Stringer) slog.Attr { return slog.String("node_id", safeStrin
 func Err(err error) slog.Attr { return slog.Any("err", err) }
 
 // Context is a tiny helper for the case where a function wants to bind
-// per-request attributes onto a child logger and pass it down — e.g., a
+// per-request attributes onto a child logger and pass it down - e.g., a
 // mirror request handler binding (registry, repo, digest) once at the top.
 func Context(_ context.Context, parent *slog.Logger, attrs ...slog.Attr) *slog.Logger {
 	anys := make([]any, 0, len(attrs))
 	for _, a := range attrs {
 		anys = append(anys, a)
 	}
+
 	return parent.With(anys...)
 }
 
@@ -113,5 +117,6 @@ func safeString(v fmt.Stringer) string {
 	if v == nil {
 		return ""
 	}
+
 	return v.String()
 }

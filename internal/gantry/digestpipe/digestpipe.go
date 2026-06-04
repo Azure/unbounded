@@ -9,7 +9,7 @@
 // ends the caller invokes Verify(d) to check that the computed digest
 // matches an expected value.
 //
-// The original §6.2 design called for a "digest-verifying stream tee
+// The original the design doc design called for a "digest-verifying stream tee
 // (containerd ↔ peer ↔ cache)". This package is the primitive on which
 // containerdstore.Writer's digest verification is built; it can also
 // be composed directly by callers that already own the destination
@@ -46,6 +46,7 @@ func New(dst io.Writer) *Writer {
 		// will never match a real content digest.
 		dst = io.Discard
 	}
+
 	return &Writer{dst: dst, h: sha256.New()}
 }
 
@@ -59,6 +60,7 @@ func (w *Writer) Write(p []byte) (int, error) {
 		_, _ = w.h.Write(p[:n]) //nolint:errcheck // best-effort write
 		w.written += int64(n)
 	}
+
 	return n, err
 }
 
@@ -86,5 +88,6 @@ func (w *Writer) Verify(want digest.Digest) error {
 		return fmt.Errorf("%w: want %s, got sha256:%s",
 			ErrDigestMismatch, want.String(), got)
 	}
+
 	return nil
 }
