@@ -1,0 +1,192 @@
+# Hardening overlay (NOT applied by default).
+#
+# This NetworkPolicy is shipped as an EXAMPLE only — it is intentionally
+# excluded from the default `kubectl apply -f deploy/` workflow because
+# every rule below has at least one site-specific CIDR (apiserver
+# endpoint, kubelet probe source, mirror DNAT source, registry egress)
+# that no single shipped manifest can pick for an arbitrary cluster.
+# Applying it unmodified WILL break either readiness probes or mirror
+# pulls on most CNIs:
+#
+#   - Mirror port 5000 ingress defaults to a 127.0.0.1/32 placeholder.
+#     On Calico, Cilium, and most managed CNIs the in-pod source-IP
+#     after hostPort DNAT is the NODE IP (not 127.0.0.1), so the
+#     placeholder will drop containerd's mirror pulls cluster-wide.
+#
+#   - Apiserver egress defaults to 0.0.0.0/0 because managed control
+#     planes (EKS / GKE / AKS) and self-hosted clusters reach the
+#     apiserver at IPs that don't match any namespaceSelector.
+#
+#   - Kubelet probe ingress on 9095 defaults to 0.0.0.0/0 for the same
+#     reason (probes come from the node IP, not a labeled namespace).
+#
+# Workflow:
+#
+#   1. Copy this file out of deploy/examples/ into your own overlay
+#      (Kustomize / Helm / plain git) and edit every ipBlock marked
+#      with "OPERATOR ACTION REQUIRED" below.
+#   2. Apply it AFTER deploy/daemonset.yaml has been rolled out and
+#      verified, never as part of the initial install — a bad rule
+#      will leave you with a NotReady DaemonSet and no clear signal
+#      that the policy is the cause.
+#   3. Discover your node CIDR(s):
+#        kubectl get nodes -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}'
+#      Discover your apiserver endpoints:
+#        kubectl get endpoints kubernetes -n default -o jsonpath='{.subsets[*].addresses[*].ip}'
+#
+# Restricts transfer (5001), libp2p (4001), mirror (5000), and metrics
+# (9095) ports per §7.5. Requires a CNI that enforces NetworkPolicy
+# (Calico, Cilium, etc.).
+#
+# Phase 6: the policy was upgraded from the Phase 2 stub (ingress
+# only) to include explicit egress restrictions. Egress is allowed to
+# DNS, the Kubernetes API server (for the informer), peer gantry
+# pods (transfer + libp2p), and TCP/443 for origin registry pulls.
+# Operators with explicit registry endpoints should tighten the last
+# rule to their registry IPs or labels.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gantry-agent
+  namespace: gantry-system
+  labels:
+    app.kubernetes.io/name: gantry
+    app.kubernetes.io/component: agent
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: gantry
+      app.kubernetes.io/component: agent
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Peer-facing transfer endpoint (HTTP/2 cleartext over :5001) and
+    # libp2p transports. Only other Gantry agent pods are allowed.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: gantry
+              app.kubernetes.io/component: agent
+      ports:
+        - protocol: TCP
+          port: 5001
+        # libp2p TCP + QUIC listener (operator-configurable; reserving
+        # a stable range here so the NetworkPolicy can be reviewed
+        # without chasing config drift).
+        - protocol: TCP
+          port: 4001
+        - protocol: UDP
+          port: 4001
+    # Metrics + healthz scraped by Prometheus from the monitoring
+    # namespace AND probed by kubelet from the node itself. Kubelet
+    # liveness/readiness traffic is sourced from the node IP, not from
+    # a labeled namespace, so a namespaceSelector-only rule strands the
+    # DaemonSet in NotReady on strict CNIs (Calico with
+    # disableNamespaceSelector, strict Cilium policies, etc.).
+    #
+    # The ipBlock 0.0.0.0/0 is the kubelet-permissive default; operators
+    # who want tighter scoping should replace it with their node CIDR
+    # (kubectl get nodes -o jsonpath='{.items[*].status.addresses[?(@.type=="InternalIP")].address}').
+    # The Prometheus rule is kept as a documented selector so monitoring
+    # stacks living in non-default-CIDR namespaces don't depend on the
+    # broader ipBlock if it's later tightened.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 9095
+    # Mirror endpoint (5000) exposed via DaemonSet hostPort with
+    # hostIP: 127.0.0.1. After kubelet/portmap DNAT, the in-pod
+    # listener observes source = node IP (most CNIs SNAT hostPort
+    # for return-path routing) or source = 127.0.0.1 (CNIs that
+    # rely on conntrack to preserve the original). Without this
+    # rule, default-deny drops the DNATed mirror traffic and
+    # containerd gets connection-refused on every pull.
+    #
+    # ─────────────────────────────────────────────────────────────
+    # OPERATOR ACTION REQUIRED — DO NOT SHIP WITH THE 127.0.0.1/32
+    # PLACEHOLDER ALONE. Replace `cidr` below with your cluster's
+    # actual node CIDR(s). The default of 127.0.0.1/32 works only
+    # on CNIs whose portmap chain preserves the original loopback
+    # source IP (rare); on Calico, Cilium, and most managed CNIs
+    # the source-IP after hostPort DNAT is the node IP, and 5000
+    # will appear connection-refused to containerd until this is
+    # set to the node CIDR. To discover the right value:
+    #
+    #   kubectl get nodes -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}'
+    #
+    # Then write a CIDR that covers all of those addresses, e.g.
+    # 10.0.0.0/16 for a private VPC, 192.168.1.0/24 for a homelab.
+    # MUST NOT be widened to the pod-network CIDR: that bypasses
+    # the hostIP: 127.0.0.1 binding's whole reason for existing
+    # (containerd should be the only client, never another pod).
+    # ─────────────────────────────────────────────────────────────
+    - from:
+        - ipBlock:
+            cidr: 127.0.0.1/32
+      ports:
+        - protocol: TCP
+          port: 5000
+  egress:
+    # DNS for Service / Node lookups.
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Kubernetes API server (informer; §7.3).
+    #
+    # The default "kubernetes" Service in the default namespace is
+    # endpoint-backed by the actual apiserver address(es), not by
+    # pods labeled in that namespace, so a namespaceSelector rule
+    # never matches the real traffic on managed control planes
+    # (EKS / GKE / AKS) or on self-hosted clusters where the
+    # apiserver runs as a static pod or off-cluster.
+    #
+    # Default below is permissive (0.0.0.0/0 on the two apiserver
+    # ports). On many private clusters the apiserver lives inside
+    # RFC1918 (kube-apiserver on a control-plane node at
+    # 10.x.x.x:6443, AKS/EKS private endpoints, etc.), so an `except`
+    # clause excluding RFC1918 would silently break the informer
+    # there. Operators MUST replace this with the actual apiserver
+    # CIDR before going to production:
+    #   kubectl get endpoints kubernetes -n default -o jsonpath='{.subsets[*].addresses[*].ip}'
+    # The two ports below (443 and 6443) are the only egress this rule
+    # enables, so the blast radius from leaving 0.0.0.0/0 in place is
+    # limited to whatever else happens to listen on those ports.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 6443
+    # Peer transfer + libp2p ports on other gantry agents.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: gantry
+              app.kubernetes.io/component: agent
+      ports:
+        - protocol: TCP
+          port: 5001
+        - protocol: TCP
+          port: 4001
+        - protocol: UDP
+          port: 4001
+    # Origin registries (port 443). Operators with stable registry
+    # endpoints should tighten this to explicit IPs or labels.
+    - ports:
+        - protocol: TCP
+          port: 443

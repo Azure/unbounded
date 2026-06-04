@@ -1,0 +1,125 @@
+// Gantry coordination RPCs (libp2p, length-prefixed protobuf).
+//
+// Carried over libp2p stream protocol ID `/gantry/coord/1.0.0` as described in
+// detailed-design.md §4.4. One stream per request/response pair; the stream
+// is closed after the response is written. Forward-compat policy: additive
+// changes bump the minor (`/gantry/coord/1.1.0`), breaking changes bump the
+// major (`/gantry/coord/2.0.0`).
+//
+// gRPC is intentionally avoided — `go-msgio` length-delimited framing is
+// sufficient and avoids HTTP-over-libp2p complexity.
+
+syntax = "proto3";
+
+package gantry.coord.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/Azure/unbounded/proto/gantry/coord/v1;coordv1";
+
+// FailureClass classifies the cause of a terminal origin pull failure.
+// See detailed-design.md §5.8 for semantics and cluster-wide trust rules.
+enum FailureClass {
+  FAILURE_CLASS_UNSPECIFIED  = 0;
+  FAILURE_CLASS_AUTH         = 1; // 401 / 403 from origin
+  FAILURE_CLASS_NOT_FOUND    = 2; // 404 from origin
+  FAILURE_CLASS_RATE_LIMITED = 3; // 429 from origin
+  FAILURE_CLASS_TRANSIENT    = 4; // connection / timeout / DNS / 5xx
+}
+
+// Envelope is the single message kind sent over `/gantry/coord/1.0.0`.
+// Receivers dispatch on the `msg` oneof.
+message Envelope {
+  oneof msg {
+    PullIntentRequest   pull_intent_request   = 1;
+    PullIntentResponse  pull_intent_response  = 2;
+    PleasePullRequest   please_pull_request   = 3;
+    PleasePullResponse  please_pull_response  = 4;
+  }
+}
+
+// PullIntentRequest asks a peer whether it has a digest cached, is currently
+// pulling it, or has recently failed to pull it. See §5.2 step 4.
+message PullIntentRequest {
+  string digest = 1; // OCI digest, e.g. "sha256:abc..."
+}
+
+// PullIntentResponse carries the recipient's authoritative state for the
+// queried digest. See §5.2 step 5 for how requesters evaluate the response.
+message PullIntentResponse {
+  bool has_cached                          = 1;
+  bool in_flight                           = 2;
+  google.protobuf.Timestamp started_at     = 3;
+
+  // Recipient's own rank in recipient's view; requester compares against its
+  // own rank computation to detect informer divergence (§5.3) and emit
+  // `p2p_hrw_rank_mismatch_total`.
+  int32 hrw_rank                           = 4;
+
+  // §5.8 origin-failure circuit-breaker state. Meaningful only when
+  // recently_failed is true.
+  bool recently_failed                     = 5;
+  google.protobuf.Timestamp cooldown_until = 6;
+  FailureClass failure_class               = 7;
+}
+
+// PleasePullRequest asks a peer to pull the named digests from origin on the
+// sender's behalf. See §5.2 step 6 and §5.2a for batching rules.
+message PleasePullRequest {
+  // Kind discriminates the OCI Distribution Spec URL family the puller
+  // should target at the upstream registry:
+  //   /v2/<repo>/blobs/<digest>      (KIND_BLOB; image-config blobs are
+  //                                   KIND_CONFIG, all other blobs are
+  //                                   KIND_BLOB)
+  //   /v2/<repo>/manifests/<digest>  (KIND_MANIFEST)
+  //   /v2/<repo>/blobs/<digest>      (KIND_CONFIG; per the OCI Distribution
+  //                                   Spec the image-config blob lives in
+  //                                   the same /blobs/ URL family but is
+  //                                   typed separately so per-kind metrics
+  //                                   ("manifest | config | layer") agree
+  //                                   end-to-end across the please_pull
+  //                                   wire boundary)
+  // KIND_UNSPECIFIED is treated as KIND_BLOB for back-compat with peers
+  // running pre-Kind builds. KIND_CONFIG sent to a pre-KIND_CONFIG peer
+  // is interpreted as KIND_BLOB by pleasePullKindFromProto's default
+  // branch, which is bytes-equivalent (config blobs ARE in /blobs/) —
+  // only the per-kind metric label is lost on that peer, never
+  // correctness.
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_BLOB        = 1;
+    KIND_MANIFEST    = 2;
+    KIND_CONFIG      = 3;
+  }
+
+  // Batched (§5.2a). All digests in a single batch MUST share
+  // `upstream_registry`, `repository`, AND `kind`. Mixed-kind batches
+  // require separate calls.
+  repeated string digests   = 1;
+
+  string upstream_registry  = 2; // e.g. "registry.example.com"
+  string repository         = 3; // e.g. "library/nginx"
+  Kind   kind               = 4;
+}
+
+// PleasePullResponse reports the per-digest outcome of a `please_pull` request.
+message PleasePullResponse {
+  message Result {
+    enum Outcome {
+      OUTCOME_UNSPECIFIED     = 0;
+      OUTCOME_ALREADY_PULLING = 1;
+      OUTCOME_STARTED         = 2;
+      OUTCOME_RECENTLY_FAILED = 3;
+      reserved 4; // OUTCOME_DECLINED: held for per-source `please_pull`
+                  // rate-limiting (§8 open question).
+    }
+
+    string digest                            = 1;
+    Outcome outcome                          = 2;
+    google.protobuf.Timestamp started_at     = 3;
+    google.protobuf.Timestamp cooldown_until = 4;
+    FailureClass failure_class               = 5;
+  }
+
+  repeated Result results = 1;
+}

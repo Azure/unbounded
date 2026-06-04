@@ -1,0 +1,37 @@
+# containerd registry mirror template — drops in at
+# /etc/containerd/certs.d/<registry-host>/hosts.toml.
+#
+# §7.1: each upstream registry the cluster pulls from gets its own
+# directory under /etc/containerd/certs.d. The directory name is the
+# canonical registry hostname (e.g. registry.example.com,
+# ghcr.io, docker.io). For docker.io specifically containerd
+# resolves to the canonical hostname index.docker.io — use that as
+# the directory name.
+#
+# Behaviour:
+#   1. containerd tries 127.0.0.1:5000 (the gantry agent) FIRST. The
+#      agent serves cached / peer-fetched content with
+#      "Gantry-Mirrored: 1" so peer requests are distinguished from
+#      origin requests. If the agent returns 5xx or is unreachable,
+#      containerd falls back to the next host entry.
+#   2. The `server` line is the canonical origin used for fallback.
+#
+# `skip_verify = true` is loopback-only and limited to the agent's
+# self-signed-or-plain mirror endpoint — the upstream `server` URL
+# still verifies TLS normally.
+#
+# `capabilities = ["pull","resolve"]` matches the §7.1 / §4.4
+# semantics: gantry serves pull (blob) and resolve (manifest) but
+# never push.
+#
+# Template variables:
+#   ${REGISTRY_SERVER}  e.g. https://registry.example.com
+
+server = "${REGISTRY_SERVER}"
+
+[host."http://127.0.0.1:5000"]
+  capabilities = ["pull", "resolve"]
+  skip_verify = true
+  # The agent uses ?ns=<host> to discriminate which upstream registry
+  # the request targets, matching the canonical hostname of this
+  # certs.d directory.

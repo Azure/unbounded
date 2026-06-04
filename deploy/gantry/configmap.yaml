@@ -1,0 +1,145 @@
+# ConfigMap carrying the agent's runtime config.yaml.
+#
+# Field reference: internal/config/config.go. The values below are
+# the defaults from config.NewDefault() with operator-friendly
+# placeholders for the registry list.
+#
+# Mount: /etc/gantry/config.yaml in the agent container.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gantry-config
+  namespace: gantry-system
+  labels:
+    app.kubernetes.io/name: gantry
+data:
+  config.yaml: |
+    # ---------- Listeners ----------
+    # mirror_listen binds 0.0.0.0:5000 inside the pod because the
+    # DaemonSet exposes the mirror via hostPort with hostIP: 127.0.0.1
+    # (deploy/daemonset.yaml). kube-proxy / portmap DNATs the host's
+    # 127.0.0.1:5000 to <podIP>:5000 in the pod's network namespace —
+    # a listener on the pod's loopback (127.0.0.1 inside the pod) is
+    # unreachable through that path.
+    #
+    # Exposure note: the hostIP=127.0.0.1 binding on the hostPort is
+    # the ONLY default protection — it constrains host-side reach to
+    # node-local, but the listener inside the pod is still 0.0.0.0
+    # and therefore reachable from any other pod on the cluster
+    # network at <podIP>:5000. Operators who do not want peer pods
+    # to be able to hit the mirror directly SHOULD apply the
+    # optional NetworkPolicy overlay at
+    # deploy/examples/networkpolicy.yaml (see the "Hardening
+    # overlays" section of deploy/README.md). That overlay is
+    # recommended for production but not part of the default install
+    # because its allow-list depends on the cluster's node-CIDR
+    # range, which is site-specific.
+    #
+    # mirror_bind_allow_non_loopback is the explicit operator opt-in
+    # required by Config.Validate (§7.5).
+    mirror_listen: "0.0.0.0:5000"
+    mirror_bind_allow_non_loopback: true
+    transfer_listen: "0.0.0.0:5001"
+    metrics_listen: "0.0.0.0:9095"
+
+    # ---------- libp2p ----------
+    # IPv4 wildcard listeners. The pods/patch self-announce only
+    # publishes multiaddrs whose wildcard family matches the Pod IP
+    # family — a /ip4/0.0.0.0 listener with a v6 Pod IP is silently
+    # skipped because the kernel has no v6 socket to dial. For
+    # dual-stack or v6-only clusters, append /ip6/::/ listeners
+    # below; the agent will then publish /ip6/<podIP>/ multiaddrs
+    # too. Example:
+    #   libp2p_listen:
+    #     - "/ip4/0.0.0.0/tcp/4001"
+    #     - "/ip4/0.0.0.0/udp/4001/quic-v1"
+    #     - "/ip6/::/tcp/4001"
+    #     - "/ip6/::/udp/4001/quic-v1"
+    libp2p_listen:
+      - "/ip4/0.0.0.0/tcp/4001"
+      - "/ip4/0.0.0.0/udp/4001/quic-v1"
+    libp2p_identity_path: "/var/lib/gantry/libp2p/identity.key"
+
+    # ---------- Members (k8s informer) ----------
+    # node_name and members_namespace are filled from downward-API
+    # env vars (GANTRY_NODE_NAME, GANTRY_MEMBERS_NAMESPACE) in the
+    # DaemonSet manifest; YAML defaults keep them empty so the env
+    # vars take precedence.
+    members_label_selector: "app.kubernetes.io/name=gantry"
+
+    # ---------- Storage backend (Plan §Phase 8) ----------
+    # Containerd is the only supported backend; the legacy hostPath
+    # cache was removed in Phase 8. Setting storage_mode: "gantry-cache"
+    # produces a hard validation error pointing to the migration steps.
+    storage_mode: "containerd"
+
+    # ---------- containerd integration (cdsub, §5.4) ----------
+    # Path to the host's containerd gRPC socket. Required: the agent
+    # uses the containerd content store as the source of truth for
+    # blobs (read + write).
+    containerd_socket: "/run/containerd/containerd.sock"
+    # Containerd namespace cdsub watches AND containerdstore reads/
+    # writes from. "k8s.io" is what kubelet uses; switch to "moby"
+    # for Docker-managed images.
+    containerd_namespace: "k8s.io"
+    # TTL of containerd content-store leases attached by Gantry on
+    # ingest. Plan-recommended range: 30m–120m. Default 60m. Leases
+    # protect newly-ingested blobs from containerd's garbage
+    # collector until kubelet's own Image reference takes over.
+    containerd_lease_ttl: "60m"
+    # Period of the expired-lease sweep loop. Default 30m.
+    containerd_lease_cleanup_interval: "30m"
+
+    # ---------- Upstream registries (§7.1) ----------
+    # Edit this list for each operator deployment. At least one
+    # entry is required: origin.New fails fast on an empty list.
+    #
+    # Credentials are OPTIONAL per entry. Omit credentials_path for
+    # public / anonymous registries (the default below). When you DO
+    # need credentials:
+    #   1. apply deploy/registry-secret.example.yaml (renamed and
+    #      filled in with your "username:password" pair, keyed by
+    #      the registry's `name:` field below);
+    #   2. add `credentials_path: "/etc/gantry/registry/<name>"`
+    #      to the matching entry here.
+    # The agent reads each credentials_path EAGERLY at startup
+    # (origin.New); if the file is missing it returns a hard error,
+    # which crashloops the pod. The DaemonSet's registry-creds
+    # volume is `optional: true`, so a default ConfigMap that
+    # references a non-existent credentials_path would let
+    # Kubernetes start the pod and then crash the agent — the
+    # default below is therefore credentials-free on purpose.
+    upstream_registries:
+      - name: "registry.example.com"
+        endpoint: "https://registry.example.com"
+        # credentials_path: "/etc/gantry/registry/registry.example.com"
+      # - name: "ghcr.io"
+      #   endpoint: "https://ghcr.io"
+      #   credentials_path: "/etc/gantry/registry/ghcr.io"
+
+    # ---------- HRW / coordination (§5.2) ----------
+    hrw_k: 3
+    hrw_topology_scope: "cluster"
+    zone_label_key: "topology.kubernetes.io/zone"
+
+    # ---------- DHT / NF5 (§7.7) ----------
+    nf5_jitter_base: "3s"
+    nf5_per_node_rate_limit: 2
+    bootstrap_window: "30s"
+    bootstrap_routing_table_pct: 25
+    topk_expansion_factor_degraded: 2
+
+    # ---------- Origin-failure circuit breaker (§5.8) ----------
+    origin_failure_cooldown_initial: "5s"
+    origin_failure_cooldown_max: "5m"
+    origin_failure_cooldown_multiplier: 2
+    origin_failure_honor_window_cap: "30s"
+    origin_failure_classes_trusted_cluster_wide:
+      - "auth"
+      - "not_found"
+      - "rate_limited"
+
+    # ---------- Logging ----------
+    log_level: "info"
+    log_format: "json"

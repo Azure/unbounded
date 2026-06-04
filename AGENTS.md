@@ -15,6 +15,7 @@ unbounded-kube is organized into several directories:
 - `bpf/` - eBPF C programs for network encapsulation (compiled with clang).
 - `cmd/` - where the sources for each binary artifact are located. Each subdirectory corresponds to a binary artifact.
   - `agent` - sources for the unbounded-agent.
+  - `gantry` - sources for the gantry peer-to-peer OCI distribution agent.
   - `inventory` - sources for the inventory controller.
   - `kubectl-unbounded` - sources for the `kubectl unbounded` plugin (includes `net` subcommand).
   - `machina` - sources for the machina controller.
@@ -27,6 +28,7 @@ unbounded-kube is organized into several directories:
   - `unroute` - eBPF route inspection utility.
 - `deploy/` - component manifests for deploying on a Kubernetes cluster.
   - `machina/` - machina controller manifest templates (*.yaml.tmpl) plus generated CRDs under `crd/`; rendered output lives under `machina/rendered/` (gitignored, produced by `make machina-manifests`).
+  - `gantry/` - gantry DaemonSet, ConfigMap, and ServiceAccount manifests.
   - `net/` - unbounded-net controller and node manifest templates (*.yaml.tmpl); rendered output lives under `net/rendered/` (gitignored, produced by `make net-manifests`).
 - `designs/` - design documents, proposals, and internal planning documentation for the project.
 - `docs/` - public web site documentation only. Do not place design documents, plans, or ad-hoc internal docs here.
@@ -36,8 +38,13 @@ unbounded-kube is organized into several directories:
   - `scripts/` - operational and development shell scripts.
   - `scratch/` - scratch space for quick go experiments.
 - `images/` - where OCI image definitions and related assets for building container images are located.
+- `e2e/` - end-to-end integration test suites.
+  - `gantry/` - kind-based e2e tests for gantry (guarded by `//go:build e2e`).
 - `internal/` - where shared but internal to this project packages are located.
+  - `gantry/` - gantry shared packages (21 sub-packages: config, mirror, transfer, discovery, coord, hrw, coldstart, members, metrics, etc.).
   - `net/` - unbounded-net shared packages (APIs, controllers, networking, metrics, webhooks, etc.).
+- `proto/` - protocol buffer definitions.
+  - `gantry/coord/v1/` - gantry coordination RPC messages (pull intent, please-pull).
 - `tmp/` - project local temporary directory for intermediate stuff that will be cleaned up quickly.
 
 ## Building and Testing
@@ -48,6 +55,8 @@ unbounded-kube is organized into several directories:
 - To build `metalman` use `make metalman` which runs formatters, lint, tests, and builds the binary.
 - To build `metalman` without lint/test use `make metalman-build` (used in Containerfiles).
 - To build individual net binaries: `make unbounded-net-controller`, `make unbounded-net-node`, `make unbounded-net-routeplan-debug`, `make unping`, `make unroute`.
+- To build `gantry` use `make gantry` which runs tests and builds the binary.
+- To build `gantry` without lint/test use `make gantry-build` (used in Containerfiles).
 - Net-specific build tasks (container images, frontend, eBPF, render) are exposed via `net-` prefixed targets in the main `Makefile` (e.g., `make net-frontend`, `make net-ebpf-build`, `make net-ebpf-generate`, `make net-manifests`). Cluster deploy/undeploy targets live separately under `hack/net/` and are invoked via `make -C hack/net <target>` (e.g., `make -C hack/net deploy`). Run `make help` and `make -C hack/net help` for the full lists.
 - `make generate` runs `go generate ./...` to regenerate deepcopy, CRDs, and protobuf for all packages.
 - `make build` compiles all Go packages (`go build ./...`).
