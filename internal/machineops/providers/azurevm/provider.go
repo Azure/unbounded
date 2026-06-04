@@ -170,10 +170,12 @@ func newAzureVMClient(subscriptionID string, auth *machineops.OperationAuth) (az
 		if err != nil {
 			return nil, fmt.Errorf("read Azure external plugin tenantID: %w", err)
 		}
+
 		clientID, err := auth.RequiredSecretValue("clientID")
 		if err != nil {
 			return nil, fmt.Errorf("read Azure external plugin clientID: %w", err)
 		}
+
 		clientSecret, err := auth.RequiredSecretValue("clientSecret")
 		if err != nil {
 			return nil, fmt.Errorf("read Azure external plugin clientSecret: %w", err)

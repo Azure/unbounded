@@ -150,6 +150,7 @@ func (h *EdgeHandler) handleGet(w http.ResponseWriter, r *http.Request, bucket, 
 			writeS3Error(w, r, http.StatusRequestedRangeNotSatisfiable, s3ErrInvalidRange,
 				"The requested range is not satisfiable.",
 				withBucketKey(bucket, key))
+
 			return
 		}
 
@@ -178,6 +179,7 @@ func (h *EdgeHandler) handleGet(w http.ResponseWriter, r *http.Request, bucket, 
 			writeS3Error(w, r, http.StatusRequestedRangeNotSatisfiable, s3ErrInvalidRange,
 				"The requested range is not valid for the resource.",
 				withBucketKey(bucket, key))
+
 			return
 		}
 
@@ -190,6 +192,7 @@ func (h *EdgeHandler) handleGet(w http.ResponseWriter, r *http.Request, bucket, 
 		writeS3Error(w, r, http.StatusRequestedRangeNotSatisfiable, s3ErrInvalidRange,
 			"The requested range is not satisfiable.",
 			withBucketKey(bucket, key))
+
 		return
 	}
 

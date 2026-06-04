@@ -26,18 +26,22 @@ func (p *Provider) newComputeClientForAuth(auth *machineops.OperationAuth) (comp
 		if err != nil {
 			return nil, fmt.Errorf("read OCI external plugin tenancyOCID: %w", err)
 		}
+
 		userOCID, err := auth.RequiredSecretValue("userOCID")
 		if err != nil {
 			return nil, fmt.Errorf("read OCI external plugin userOCID: %w", err)
 		}
+
 		region, err := auth.RequiredSecretValue("region")
 		if err != nil {
 			return nil, fmt.Errorf("read OCI external plugin region: %w", err)
 		}
+
 		fingerprint, err := auth.RequiredSecretValue("fingerprint")
 		if err != nil {
 			return nil, fmt.Errorf("read OCI external plugin fingerprint: %w", err)
 		}
+
 		privateKey, err := auth.RequiredSecretValue("privateKey")
 		if err != nil {
 			return nil, fmt.Errorf("read OCI external plugin privateKey: %w", err)

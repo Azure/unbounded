@@ -216,6 +216,7 @@ func runBench(ctx context.Context, g *globalFlags, o *benchOpts) error {
 	}
 
 	rangeSize := info.Size
+
 	if !o.full {
 		rs, err := parseSize(o.rangeSizeStr)
 		if err != nil {
@@ -244,6 +245,7 @@ func runBench(ctx context.Context, g *globalFlags, o *benchOpts) error {
 		if err != nil {
 			return fmt.Errorf("warmup: %w", err)
 		}
+
 		_ = resp //nolint:wsl // warmup output is intentionally discarded
 	}
 
@@ -253,6 +255,7 @@ func runBench(ctx context.Context, g *globalFlags, o *benchOpts) error {
 
 	finishedAt := time.Now()
 	elapsed := finishedAt.Sub(startedAt)
+
 	gateDuration := gateClosedAt.Sub(startedAt)
 	if gateDuration < 0 {
 		gateDuration = 0
@@ -373,6 +376,7 @@ func (a *benchAcc) record(elapsed time.Duration, n int64, err error, code string
 	}
 
 	a.mu.Lock()
+
 	a.latencies = append(a.latencies, elapsed)
 	if code != "" {
 		if a.errorsByCode == nil {
@@ -543,6 +547,7 @@ func runBenchLoop(
 
 	for i := 0; i < o.concurrency; i++ {
 		wg.Add(1)
+
 		go worker(i)
 	}
 

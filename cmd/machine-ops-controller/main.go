@@ -186,6 +186,7 @@ func leaderElectionID(cfg config) string {
 
 func safeNamePart(value string) string {
 	var b strings.Builder
+
 	for _, r := range strings.ToLower(value) {
 		switch {
 		case r >= 'a' && r <= 'z':
@@ -203,11 +204,13 @@ func safeNamePart(value string) string {
 	if prefix == "" {
 		prefix = scopeFallbackName
 	}
+
 	if len(prefix) > 40 {
 		prefix = strings.TrimRight(prefix[:40], "-")
 	}
 
 	sum := sha256.Sum256([]byte(value))
+
 	return fmt.Sprintf("%s-%s", prefix, hex.EncodeToString(sum[:])[:10])
 }
 

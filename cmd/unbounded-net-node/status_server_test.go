@@ -689,6 +689,7 @@ func TestCollectRoutingTableFromKernelManagedInterfaces(t *testing.T) {
 	}
 
 	devices := make(map[string]bool)
+
 	for _, r := range info.Routes {
 		for _, hop := range r.NextHops {
 			devices[hop.Device] = true
