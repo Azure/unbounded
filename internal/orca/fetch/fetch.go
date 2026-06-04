@@ -140,7 +140,7 @@ func (c *Coordinator) HeadObject(ctx context.Context, bucket, key string) (origi
 //
 // On miss:
 //   - If self is the coordinator: run local fill (origin GET via retry,
-//     atomic commit to CacheStore, populate buffer for joiners).
+//     commit to CacheStore, populate buffer for joiners).
 //   - If a peer is the coordinator: send /internal/fill to that peer;
 //     stream from peer's response. On 409 Conflict, fall back to local
 //     fill.
@@ -429,7 +429,7 @@ func (c *Coordinator) runFill(k chunk.Key, objectSize int64, f *fill) {
 	// longer mutated after io.Copy returned above.
 	release()
 
-	// Atomic commit to CacheStore (asynchronous from joiners'
+	// Commit to CacheStore (asynchronous from joiners'
 	// perspective; they have their bytes already).
 	commitErr := c.cs.PutChunk(ctx, k, int64(buf.Len()), bytes.NewReader(buf.Bytes()))
 
@@ -441,23 +441,14 @@ func (c *Coordinator) runFill(k chunk.Key, objectSize int64, f *fill) {
 			slog.Int("bytes", buf.Len()),
 		)
 	case errors.Is(commitErr, cachestore.ErrCommitLost):
-		// Another replica won; treat existing CacheStore entry as truth.
+		// Another replica won the fill race. The cachestore's
+		// stat-then-put step already confirmed the chunk is present
+		// (that is how ErrCommitLost is produced), so record it as a
+		// hit without re-Stat'ing.
+		c.cat.Record(k)
 		c.log.LogAttrs(ctx, slog.LevelDebug, "commit_lost",
 			chunkAttrs(k),
 		)
-
-		if _, err := c.cs.Stat(ctx, k); err == nil {
-			c.cat.Record(k)
-		} else {
-			// Stat failed after a lost commit: cachestore is likely
-			// unhealthy (transient or otherwise). Catalog stays
-			// unrecorded (next request refills), but log so operators
-			// can see cachestore flapping.
-			c.log.LogAttrs(ctx, slog.LevelDebug, "commit_lost_stat_failed",
-				chunkAttrs(k),
-				slog.Any("err", err),
-			)
-		}
 	default:
 		c.log.LogAttrs(ctx, slog.LevelWarn, "commit-after-serve failed",
 			chunkAttrs(k),

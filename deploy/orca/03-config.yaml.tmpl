@@ -43,7 +43,7 @@ data:
     cachestore:
       driver: s3
       s3:
-        endpoint: {{ default "http://localstack.unbounded-kube.svc.cluster.local:4566" .CachestoreEndpoint | quote }}
+        endpoint: {{ default "http://garage.unbounded-kube.svc.cluster.local:3900" .CachestoreEndpoint | quote }}
         bucket: {{ default "orca-cache" .CachestoreBucket | quote }}
         region: {{ default "us-east-1" .CachestoreRegion | quote }}
         use_path_style: true

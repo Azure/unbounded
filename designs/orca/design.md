@@ -13,7 +13,7 @@ correct under load. The shorter stakeholder version is in
 5. [Chunk model](#5-chunk-model)
 6. [Request flow](#6-request-flow)
 7. [Stampede protection](#7-stampede-protection)
-8. [Atomic commit](#8-atomic-commit)
+8. [Commit (stat-then-put)](#8-commit-stat-then-put)
 9. [Bounded staleness contract](#9-bounded-staleness-contract)
 10. [Create-after-404 and negative-cache lifecycle](#10-create-after-404-and-negative-cache-lifecycle)
 11. [Eviction and capacity](#11-eviction-and-capacity)
@@ -56,9 +56,9 @@ cloud sees exactly one fetch.
 | Auth surface | Bearer / mTLS hooks exist on the edge and the internal listener, but nothing checks them yet. Dev runs with auth off. See s4 and [Deferred / future work](#13-deferred--future-work). |
 | Origins | AWS S3 and Azure Blob, behind a pluggable `Origin` interface. |
 | Azure constraint | Block Blobs only. Page and Append blobs are rejected at `Head` with `UnsupportedBlobTypeError`. |
-| Cachestore | An in-DC S3-compatible store (`cachestore/s3`): LocalStack in dev, VAST or similar in production. Treated as the truth for what chunks exist. |
-| Atomic commit | `PutObject` with `If-None-Match: *`. The second concurrent commit gets a `412` and is recorded as `ErrCommitLost`. At boot, `SelfTestAtomicCommit` proves the backend honors the precondition; if it doesn't, the process refuses to start. |
-| Versioned cachestore buckets | Not supported. At boot, `GetBucketVersioning` runs; if the bucket has versioning enabled or suspended, the process refuses to start. VAST and several S3-compatible backends ignore `If-None-Match: *` on versioned buckets, which would silently break the atomic-commit rule. |
+| Cachestore | An in-DC S3-compatible store (`cachestore/s3`): a self-hosted store (Garage) in dev, VAST or similar in production. Treated as the truth for what chunks exist. |
+| Commit | Stat-then-put: `HeadObject` the chunk path, and if present skip the upload and record `ErrCommitLost`; otherwise plain `PutObject`. The ETag is part of the path, so racing writers always carry byte-identical content and a last-writer-wins overwrite is safe. At boot, `SelfTest` proves the backend provides read-after-write visibility; if it doesn't, the process refuses to start. |
+| Versioned cachestore buckets | Not supported. At boot, `GetBucketVersioning` runs; if the bucket has versioning enabled or suspended, the process refuses to start. Orca's chunks are immutable and re-committed only with byte-identical content, so a versioned bucket would only accumulate redundant object versions. |
 | Chunking | Default 8 MiB (`chunking.size`). For bigger objects, an optional tier ladder (`chunking.tiers`) picks a larger size: 64 MiB for objects over 1 GiB, 128 MiB for objects over 10 GiB. The chunk size is part of the chunk's storage path, so changing the default or any tier never breaks existing data. Minimum 1 MiB. |
 | Read-ahead | While the edge sends one chunk to the client, it can fetch the next few chunks in parallel. The default is 8 in flight. Set `chunking.readahead: 0` to turn it off. |
 | Consistency | Operators promise: once a key is published, its bytes never change. To change the data, publish a new key. Orca treats the ETag as the key's identity, not as a freshness check. We also send `If-Match: <etag>` on every fetch as a safety net. If an operator breaks the promise, the wrong data is served for at most 5 minutes (`metadata.ttl`). If a key is uploaded after someone already saw a 404 on it, the wrong 404 is served for at most 60 seconds (`metadata.negative_ttl`). See [s9](#9-bounded-staleness-contract). |
@@ -83,7 +83,7 @@ cloud sees exactly one fetch.
   what's cached. Today this is `cachestore/s3` (an in-DC
   S3-compatible object store). Interface in
   `internal/orca/cachestore/cachestore.go`; commit rules in
-  [s8](#8-atomic-commit).
+  [s8](#8-commit-stat-then-put).
 - **Chunk** - one piece of an object. The size is chosen per
   request from a small ladder: 8 MiB for small objects, up to 128
   MiB for objects over 10 GiB by default. Orca caches and fills
@@ -115,10 +115,12 @@ cloud sees exactly one fetch.
   `GET /internal/fill?<chunk-key params>` over plain HTTP on the
   internal listener (`:8444` by default). The assembler calls it
   when the coordinator is some other replica.
-- **Atomic CacheStore commit** - the write that publishes a chunk
-  to the cachestore without overwriting anything. `PutObject` with
-  `If-None-Match: *`. If two replicas race, one wins with `200`
-  and the other gets `412` (recorded as `ErrCommitLost`).
+- **CacheStore commit (stat-then-put)** - the write that publishes
+  a chunk to the cachestore. `HeadObject` the chunk path; if present,
+  skip the upload and record `ErrCommitLost`; otherwise plain
+  `PutObject`. Racing writers of the same key always carry
+  byte-identical content (the ETag is part of the path), so a
+  last-writer-wins overwrite is safe.
 - **Immutable-origin contract** - operators promise that once
   they publish a key, its bytes never change. If they break this,
   Orca may serve the old bytes for up to `metadata.ttl`. See
@@ -457,8 +459,8 @@ sequenceDiagram
     R->>R: Peek(1), commit headers
     R-->>C: 200/206 + headers + body
     par commit-after-serve (async vs joiner reads)
-        SF->>CS: PutChunk(If-None-Match: *)
-        CS-->>SF: 200 (commit_won) or 412 (commit_lost)
+        SF->>CS: PutChunk (HeadObject then PutObject)
+        CS-->>SF: committed or already-present (commit_lost)
     end
     alt commit_won
         SF->>Cat: Record(k)
@@ -575,7 +577,7 @@ The named seams these mechanisms run through:
 | Seam | File | Role |
 |---|---|---|
 | `origin.Origin` | `internal/orca/origin/origin.go` (interface); `internal/orca/origin/awss3/`, `internal/orca/origin/azureblob/` | Read-only adapter to the upstream blob store. `If-Match: <etag>` on every `GetRange`. |
-| `cachestore.CacheStore` | `internal/orca/cachestore/cachestore.go` (interface); `internal/orca/cachestore/s3/` | In-DC chunk store; source of truth for chunk presence. `PutChunk` is atomic + no-clobber (returns `ErrCommitLost` on conflict). |
+| `cachestore.CacheStore` | `internal/orca/cachestore/cachestore.go` (interface); `internal/orca/cachestore/s3/` | In-DC chunk store; source of truth for chunk presence. `PutChunk` commits stat-then-put (returns `ErrCommitLost` when the chunk is already present). |
 | `chunkcatalog.Catalog` | `internal/orca/chunkcatalog/chunkcatalog.go` | Bounded in-memory LRU recording chunks known to be in the cachestore. Presence-only. |
 | `cluster.Cluster` | `internal/orca/cluster/cluster.go` | Peer discovery (DNS), rendezvous hashing, internal-fill RPC client + response validator. |
 | `fetch.Coordinator` | `internal/orca/fetch/fetch.go` | Per-replica fill orchestrator. Owns the singleflight, the origin semaphore, and the pre-header retry loop. |
@@ -631,12 +633,12 @@ What the leader does in `runFill`:
 6. Stores the buffer on the fill entry and **releases joiners**
    (closes `f.done`, wrapped in a `sync.Once` so it fires
    exactly once) **before** writing to the cachestore.
-7. Writes to the cachestore via `PutObject` with
-   `If-None-Match: *`.
+7. Commits to the cachestore stat-then-put: `HeadObject` the
+   chunk path, and if absent `PutObject` the bytes.
 8. On success, records the chunk in the catalog.
-9. On `ErrCommitLost` (the 412 from the cachestore), another
-   replica won the race. Stat the existing entry and record it
-   in the catalog on success.
+9. On `ErrCommitLost` (the chunk was already present at
+   `HeadObject` time), another replica won the race; the existing
+   object is byte-identical, so record it in the catalog directly.
 10. On any other error, log it and move on. The chunk is not
     recorded; the next request refills (one extra origin GET in
     the worst case). The client never sees this error because the
@@ -725,8 +727,8 @@ sequenceDiagram
     B-->>A: 200 + Content-Length + stream<br/>(validatingReader on A's side)
     A-->>C: stream sliced bytes
     par async commit-after-serve on B
-        SF->>CS: PutChunk(If-None-Match: *)
-        CS-->>SF: commit_won or commit_lost
+        SF->>CS: PutChunk (HeadObject then PutObject)
+        CS-->>SF: committed or already-present
     end
     Note over A,B: 409 from B -> A falls back to local fill
 ```
@@ -822,14 +824,29 @@ How each kind of failure is handled:
   client gets a 502. Orca does not auto-refill, because that
   would just hammer a backend that's already struggling.
 
-## 8. Atomic commit
+## 8. Commit (stat-then-put)
 
-The leader publishes a chunk to the cachestore in one step that
-won't overwrite anything: `PutObject` with `If-None-Match: *`.
-The second concurrent commit for the same key gets HTTP 412 and
-is recorded as `ErrCommitLost`. So when two replicas race to
-fill the same chunk, exactly one wins; the loser treats the
-existing object as the truth.
+The leader commits a filled chunk with a stat-then-put step: it
+`HeadObject`s the chunk path, and if the object is already present
+it skips the upload and records `ErrCommitLost`; otherwise it
+uploads with a plain `PutObject`. So when two replicas race to
+fill the same chunk, the one that commits second sees the object
+already there and treats it as the truth.
+
+**Why this is safe.** The chunk's storage path includes its ETag
+([s5](#5-chunking-and-identity)). New ETag, new path. So the only
+way two writers ever target the same key is when they are writing
+byte-identical content. A last-writer-wins overwrite of identical
+bytes is therefore safe, and even a torn read during such an
+overwrite is byte-correct. The commit needs only `GET`/`PUT`/`HEAD`.
+
+The `HeadObject`/`PutObject` pair has a benign
+time-of-check/time-of-use window: two replicas may both see the
+key absent and both upload. That degrades to a last-writer-wins
+overwrite of identical bytes, so readers always observe correct
+bytes; the cost is one redundant upload, which only happens during
+membership churn (normally the rendezvous hash picks a single
+coordinator per chunk).
 
 Joiners don't wait for the commit
 ([s7.2](#72-singleflight--commit-after-serve)). They're released
@@ -838,20 +855,20 @@ as soon as the leader's buffer is full and length-checked. The
 commit fails, the client never knows; Orca just doesn't record
 the chunk, and the next request refills.
 
-**Boot-time self-test (`SelfTestAtomicCommit`).** At startup the
-`cachestore/s3` driver writes a probe key, then writes the same
-probe key again with `If-None-Match: "*"` and expects a 412. If
-the second write returns 200 (the backend silently overwrote),
-the driver refuses to start. This catches backends that don't
-implement the precondition. Verified backends today: AWS S3
-(since 2024-08), MinIO, VAST Cluster (only on non-versioned
-buckets).
+**Boot-time self-test (`SelfTest`).** At startup the
+`cachestore/s3` driver writes a probe key, then confirms it is
+visible via `HeadObject` and reads the bytes back via `GetObject`.
+If the read-after-write check fails (the just-written object is
+not visible or returns wrong bytes), the driver refuses to start.
+This catches backends that do not provide the read-after-write
+visibility the stat-then-put step depends on.
 
 **Boot-time versioning gate.** The driver also runs
 `GetBucketVersioning(bucket)`. If versioning is `Enabled` or
-`Suspended`, startup fails with a clear error. VAST and several
-S3-compatible backends ignore `If-None-Match: *` on versioned
-buckets, which would silently break the atomic-commit rule.
+`Suspended`, startup fails with a clear error. Orca's chunks are
+immutable and only ever re-committed with byte-identical content,
+so a versioned bucket would accumulate redundant object versions
+that only waste space.
 
 ## 9. Bounded staleness contract
 
@@ -1115,12 +1132,12 @@ sequenceDiagram
     A->>A: rendezvous(k, {A,B}) = B (stale)
     A->>B: /internal/fill (connection refused)
     A->>A: fallback: fill locally
-    A->>CS: PutChunk(If-None-Match: *)
+    A->>CS: PutChunk (HeadObject: absent, PutObject)
     Note over Bp: B' bootstraps, refreshes DNS<br/>peers (B's view) = {A, B'}
     Bp->>Bp: rendezvous(k, {A,B'}) = B'
-    Bp->>CS: PutChunk(If-None-Match: *)
-    CS-->>A: 200 commit_won
-    CS-->>Bp: 412 commit_lost (ErrCommitLost)
+    Bp->>CS: PutChunk (HeadObject: present)
+    CS-->>A: committed
+    CS-->>Bp: already-present (ErrCommitLost)
     Note over A,Bp: at-most-one duplicate fill per chunk
     Note over A,DNS: t=10s  A refreshes DNS<br/>peers converge to {A, B'}<br/>steady state restored
 ```
@@ -1128,8 +1145,10 @@ sequenceDiagram
 A walks through B being replaced by B'. A still thinks B owns
 chunk k, tries B's old IP, fails, and fills locally. Meanwhile
 B' boots, decides it owns k, and fills too. Both write to the
-cachestore. The atomic-commit rule means only one write sticks;
-the other gets `ErrCommitLost`. No corruption.
+cachestore. Because the ETag is part of the chunk path, both
+writes carry byte-identical content; the stat-then-put commit
+means B' sees A's object already present and records
+`ErrCommitLost`. No corruption.
 
 ## 13. Deferred / future work
 
@@ -1156,16 +1175,16 @@ listener.
 
 `cachestore/posixfs` (shared POSIX filesystems: NFSv4.1+, Weka
 native, CephFS, Lustre, GPFS) and `cachestore/localfs` (dev)
-were designed and not built. The atomic-commit primitive there
-is `link()` returning `EEXIST` (or
-`renameat2(RENAME_NOREPLACE)`). The posixfs flavor adds backend
+were designed and not built. Commit is the same stat-then-put as
+`cachestore/s3` (stat the path, write the file if absent), using
+ordinary filesystem operations. The posixfs flavor adds backend
 detection, an NFS minimum-version check, refusal on Alluxio
 FUSE, and a 2-character hex path fan-out. Both would share
 helpers via `internal/orca/cachestore/internal/posixcommon/`.
 
 These would let Orca run against shared-filesystem deployments
 that don't have an in-DC S3-compatible object store. The
-`SelfTestAtomicCommit` hook on `CacheStore` is already shaped to
+`SelfTest` hook on `CacheStore` is already shaped to
 absorb them.
 
 ### Prometheus metrics
@@ -1275,9 +1294,9 @@ already give cross-package correlation by chunk identity.
 
 When an origin ETag rotates, the old chunks under
 `<origin_id>/<old-hash>/...` stay in the cachestore until the
-bucket lifecycle policy deletes them. The atomic-commit rule
-means there's no corruption; the only cost is storage growth in
-proportion to the rotation rate. A real GC would walk the
+bucket lifecycle policy deletes them. The content-addressed
+layout means there's no corruption; the only cost is storage
+growth in proportion to the rotation rate. A real GC would walk the
 cachestore and remove chunks whose
 `(origin_id, bucket, key, etag)` no longer matches the current
 origin `Head`. That's a lot of code for a problem that

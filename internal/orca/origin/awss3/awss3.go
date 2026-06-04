@@ -2,9 +2,10 @@
 // Licensed under the MIT License.
 
 // Package awss3 is the AWS S3 (and S3-compatible) origin driver. It
-// targets either real AWS S3 or a local S3-compatible endpoint such as
-// LocalStack. Useful as a credential-free origin for the dev harness:
-// LocalStack acts as both origin and cachestore (different buckets).
+// targets either real AWS S3 or a local S3-compatible endpoint.
+// Useful as a credential-free origin for the dev harness, where the
+// same S3-compatible store acts as both origin and cachestore
+// (different buckets).
 //
 // This driver is read-only from Orca's perspective (Head, GetRange).
 // The seed step that uploads test objects to the origin bucket
@@ -43,24 +44,25 @@ type Adapter struct {
 // importing the whole config package.
 type Config struct {
 	// Endpoint, when set, overrides the regional default and routes
-	// requests at a custom URL (LocalStack uses
-	// http://localstack:4566). Leave empty for real AWS S3.
+	// requests at a custom URL (the dev harness uses a local
+	// S3-compatible endpoint). Leave empty for real AWS S3.
 	Endpoint string
 
-	// Region is the AWS region. LocalStack ignores this; the SDK
-	// requires a value.
+	// Region is the AWS region. Some S3-compatible backends validate
+	// it against their configured region; the SDK requires a value.
 	Region string
 
 	// Bucket is the source bucket holding origin objects.
 	Bucket string
 
-	// AccessKey / SecretKey are static credentials. For LocalStack
-	// these are "test"/"test"; for real AWS, supply real creds.
+	// AccessKey / SecretKey are static credentials. For the dev
+	// harness these are deterministic dev keys; for real AWS, supply
+	// real creds.
 	AccessKey string
 	SecretKey string
 
-	// UsePathStyle: true for LocalStack (host-based addressing
-	// requires DNS wildcards LocalStack does not provide).
+	// UsePathStyle: true for the S3-compatible dev backend (host-based
+	// addressing requires DNS wildcards it does not provide).
 	UsePathStyle bool
 }
 
@@ -83,8 +85,9 @@ func New(ctx context.Context, cfg Config, log *slog.Logger) (*Adapter, error) {
 			cfg.AccessKey, cfg.SecretKey, "",
 		)),
 		// Opt out of CRC64NVME default introduced in aws-sdk-go-v2
-		// 1.32. LocalStack 3.8 returns InvalidRequest for unknown
-		// algorithms; real AWS S3 still works either way.
+		// 1.32. Several S3-compatible backends reject unknown
+		// checksum algorithms with InvalidRequest; real AWS S3 still
+		// works either way.
 		awsconfig.WithRequestChecksumCalculation(aws.RequestChecksumCalculationWhenRequired),
 		awsconfig.WithResponseChecksumValidation(aws.ResponseChecksumValidationWhenRequired),
 	)

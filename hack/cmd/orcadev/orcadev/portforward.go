@@ -100,7 +100,7 @@ func ensurePortForwards(ctx context.Context, g *globalFlags) (func(), error) {
 // returns the set of port-forwards to maintain for this invocation.
 // The order is significant: orca edge first (it's the only one every
 // subcommand uses), origin next, cachestore last. Duplicates (e.g.
-// origin and cachestore both pointing at LocalStack) are deduped on
+// origin and cachestore both pointing at Garage) are deduped on
 // the (service, localPort) pair.
 func derivePortForwardSpecs(g *globalFlags) []portForwardSpec {
 	specs := []portForwardSpec{}
@@ -146,23 +146,23 @@ func derivePortForwardSpecs(g *globalFlags) []portForwardSpec {
 			})
 		case "awss3":
 			add(portForwardSpec{
-				label:      "localstack (origin)",
-				service:    devSvcLocalstack,
+				label:      "garage (origin)",
+				service:    devSvcGarage,
 				localPort:  port,
-				remotePort: devRemotePortLocalstack,
+				remotePort: devRemotePortGarage,
 			})
 		}
 	}
 
-	// Cachestore: always LocalStack-shaped.
+	// Cachestore: always Garage-shaped.
 	if host, port, ok := localhostHostPort(g.cachestoreEndpoint); ok {
 		_ = host
 
 		add(portForwardSpec{
-			label:      "localstack (cachestore)",
-			service:    devSvcLocalstack,
+			label:      "garage (cachestore)",
+			service:    devSvcGarage,
 			localPort:  port,
-			remotePort: devRemotePortLocalstack,
+			remotePort: devRemotePortGarage,
 		})
 	}
 

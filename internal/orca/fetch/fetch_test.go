@@ -225,8 +225,8 @@ func (s *slowPutCacheStore) Stat(_ context.Context, _ chunk.Key) (cachestore.Inf
 	return cachestore.Info{}, cachestore.ErrNotFound
 }
 
-func (s *slowPutCacheStore) Delete(_ context.Context, _ chunk.Key) error  { return nil }
-func (s *slowPutCacheStore) SelfTestAtomicCommit(_ context.Context) error { return nil }
+func (s *slowPutCacheStore) Delete(_ context.Context, _ chunk.Key) error { return nil }
+func (s *slowPutCacheStore) SelfTest(_ context.Context) error            { return nil }
 
 // TestRunFill_CommitAfterServe_JoinerSeesBytesBeforeCommit verifies
 // that runFill releases joiners (close(f.done)) BEFORE the cachestore

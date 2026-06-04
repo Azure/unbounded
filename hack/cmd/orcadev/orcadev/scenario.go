@@ -103,7 +103,7 @@ func runScenario(ctx context.Context, g *globalFlags, o *scenarioOpts, name stri
 	}
 
 	// Auto-open kubectl port-forwards to svc/orca, svc/azurite,
-	// svc/localstack as needed. Lifted to the parent so every
+	// svc/garage as needed. Lifted to the parent so every
 	// scenario's edge + origin + cachestore clients share one
 	// forwarded socket without re-probing.
 	cleanup, err := ensurePortForwards(ctx, g)

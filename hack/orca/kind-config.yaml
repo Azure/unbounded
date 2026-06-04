@@ -5,7 +5,7 @@
 # use (one Orca pod per node).
 #
 # No extraPortMappings: orcadev opens kubectl port-forwards to
-# svc/azurite, svc/localstack, and svc/orca as needed, which is the
+# svc/azurite, svc/garage, and svc/orca as needed, which is the
 # same code path used on non-kind clusters (AKS, EKS, k3d). Users
 # who want ad-hoc curl from the host can run
 # `kubectl port-forward svc/azurite 10000:10000` themselves.

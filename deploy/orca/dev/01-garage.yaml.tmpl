@@ -1,0 +1,169 @@
+---
+# Dev S3 backend: a single-node Garage cluster, used as BOTH the
+# cachestore (s3 driver) and the awss3 origin emulator. Garage replaces
+# the previous LocalStack deployment.
+#
+# Why Garage:
+#   - It persists to a PVC, so cachestore state (and the orca-cache /
+#     orca-origin buckets) survive pod restarts and evictions. The old
+#     LocalStack Deployment used an emptyDir and re-ran a bucket
+#     init-hook on every restart.
+#   - It is fully open source with no Pro tier or license gate.
+#   - It implements plain GET/PUT/HEAD, which is all orca's cachestore
+#     commit needs now that the commit path is stat-then-put rather than
+#     a PutObject + If-None-Match conditional write.
+#
+# Garage requires SigV4 auth, so unlike LocalStack the dev credentials
+# are real Garage keys. They are deterministic constants (imported by
+# setup-orca.sh's post-rollout bootstrap and mirrored into the
+# orca-credentials Secret); they are dev-only and not secret. Garage
+# access key IDs must be "GK" + 12 hex bytes, so the well-known
+# all-test value cannot be used.
+#
+# Bootstrap (layout assign/apply, key import, bucket create/allow) is
+# driven by setup-orca.sh via `kubectl exec ... /garage ...` after the
+# Deployment is Ready, NOT by an in-pod hook: the Garage image is a
+# near-scratch image with only the /garage binary (no shell, no
+# coreutils), so a shell-script lifecycle hook cannot run in it. With
+# the persistent PVC the layout/key/buckets survive restarts, so
+# bootstrap only needs to run at install time.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: garage-config
+  namespace: {{ default "unbounded-kube" .Namespace }}
+  labels:
+    app.kubernetes.io/name: garage
+    app.kubernetes.io/part-of: orca-dev
+data:
+  garage.toml: |
+    metadata_dir = "/var/lib/garage/meta"
+    data_dir = "/var/lib/garage/data"
+    db_engine = "sqlite"
+    replication_factor = 1
+
+    rpc_bind_addr = "[::]:3901"
+    rpc_public_addr = "127.0.0.1:3901"
+    # Dev-only RPC shared secret (not a credential to anything real).
+    rpc_secret = "{{ default "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" .GarageRPCSecret }}"
+
+    [s3_api]
+    s3_region = "{{ default "us-east-1" .CachestoreRegion }}"
+    api_bind_addr = "[::]:3900"
+    root_domain = ".s3.garage"
+
+    [admin]
+    api_bind_addr = "[::]:3903"
+    admin_token = "{{ default "orca-dev-admin-token" .GarageAdminToken }}"
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: garage-data
+  namespace: {{ default "unbounded-kube" .Namespace }}
+  labels:
+    app.kubernetes.io/name: garage
+    app.kubernetes.io/part-of: orca-dev
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ default "2Gi" .GarageStorage | quote }}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: garage
+  namespace: {{ default "unbounded-kube" .Namespace }}
+  labels:
+    app.kubernetes.io/name: garage
+    app.kubernetes.io/part-of: orca-dev
+spec:
+  # ClusterIP: orcadev reaches Garage via `kubectl port-forward
+  # svc/garage 3900:3900` (opened automatically by orcadev when the
+  # local port isn't already bound). Matches the LocalStack pattern it
+  # replaces.
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: garage
+  ports:
+    - name: s3
+      port: 3900
+      targetPort: 3900
+      protocol: TCP
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: garage
+  namespace: {{ default "unbounded-kube" .Namespace }}
+  labels:
+    app.kubernetes.io/name: garage
+    app.kubernetes.io/part-of: orca-dev
+spec:
+  replicas: 1
+  # Recreate: the data PVC is ReadWriteOnce, so the old pod must release
+  # it before the new one mounts it. Prevents a rolling update from
+  # deadlocking on the volume.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: garage
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: garage
+        app.kubernetes.io/part-of: orca-dev
+    spec:
+      containers:
+        - name: garage
+          image: {{ default "dxflrs/garage:v1.0.1" .GarageImage | quote }}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3900
+              name: s3
+              protocol: TCP
+            - containerPort: 3901
+              name: rpc
+              protocol: TCP
+            - containerPort: 3903
+              name: admin
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 1
+              memory: 1Gi
+          readinessProbe:
+            tcpSocket:
+              port: 3900
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            tcpSocket:
+              port: 3900
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 5
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/garage
+            - name: config
+              mountPath: /etc/garage.toml
+              subPath: garage.toml
+              readOnly: true
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: garage-data
+        - name: config
+          configMap:
+            name: garage-config
