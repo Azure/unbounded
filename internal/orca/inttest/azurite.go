@@ -159,7 +159,7 @@ func (az *Azurite) UploadPageBlob(ctx context.Context, t *testing.T, ctr, name s
 }
 
 // uniqueName returns a short random-suffixed name suitable for
-// LocalStack buckets and Azurite containers.
+// S3-backend buckets and Azurite containers.
 func uniqueName(prefix string) string {
 	var b [4]byte
 

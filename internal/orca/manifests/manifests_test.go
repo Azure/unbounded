@@ -21,7 +21,7 @@ import (
 
 // TestProductionManifestsRender renders every *.yaml.tmpl under
 // deploy/orca/ (excluding the dev/ subdirectory which contains the
-// in-Kind LocalStack/Azurite manifests) with realistic inputs and
+// in-Kind Garage/Azurite manifests) with realistic inputs and
 // asserts the output is structurally valid Kubernetes YAML.
 func TestProductionManifestsRender(t *testing.T) {
 	t.Parallel()
@@ -101,7 +101,7 @@ func TestDeploymentAntiAffinityModes(t *testing.T) {
 	}
 }
 
-// TestDevManifestsRender renders the LocalStack + Azurite manifests
+// TestDevManifestsRender renders the Garage + Azurite manifests
 // used by the Kind dev harness. The previous one-shot bucket-init
 // Jobs (02-init-job.yaml.tmpl, 04-azurite-init.yaml.tmpl) were
 // replaced by self-healing PostStart lifecycle hooks / sidecars
@@ -136,11 +136,11 @@ func productionData() map[string]string {
 		"TargetReplicas":          "3",
 		"OriginID":                "test-origin",
 		"OriginDriver":            "awss3",
-		"OriginAWSS3Endpoint":     "http://localstack:4566",
+		"OriginAWSS3Endpoint":     "http://garage:3900",
 		"OriginAWSS3Region":       "us-east-1",
 		"OriginAWSS3Bucket":       "orca-origin",
 		"OriginAWSS3UsePathStyle": "true",
-		"CachestoreEndpoint":      "http://localstack:4566",
+		"CachestoreEndpoint":      "http://garage:3900",
 		"CachestoreBucket":        "orca-cache",
 		"CachestoreRegion":        "us-east-1",
 		"ClusterService":          "orca-peers.orca-test.svc.cluster.local",

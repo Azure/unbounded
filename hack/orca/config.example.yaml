@@ -3,7 +3,7 @@
 # This file documents every Orca config knob, its default, its
 # acceptable values, and the production-vs-dev nuances. It is also a
 # working configuration: as written it points at the in-cluster dev
-# harness (`make orca-up` brings up LocalStack + Azurite + Orca on
+# harness (`make orca-up` brings up Garage + Azurite + Orca on
 # kind) so an operator can:
 #
 #   cp hack/orca/config.example.yaml ~/my-orca.yaml
@@ -103,9 +103,9 @@ origin:
   # treat it as the cache namespace for this origin configuration.
   # Type:     string.
   # Required: yes.
-  # Example:  "awss3-localstack" for the dev harness; in production,
+  # Example:  "awss3-garage" for the dev harness; in production,
   #           something like "azureblob-prod-westus2".
-  id: "awss3-localstack"
+  id: "awss3-garage"
 
   # Which origin adapter to use.
   # Type:    string ("azureblob" | "awss3").
@@ -186,7 +186,7 @@ origin:
     # S3 endpoint override. Empty targets real AWS S3 (auto-region).
     # Type:    string (URL).
     # Default: "".
-    endpoint: "http://localstack.unbounded-kube.svc.cluster.local:4566"
+    endpoint: "http://garage.unbounded-kube.svc.cluster.local:3900"
 
     # S3 region.
     # Type:    string.
@@ -207,7 +207,7 @@ origin:
     secret_key: ""
 
     # true selects path-style addressing (http://host/bucket/key) -
-    # required for LocalStack and most S3-compatible test backends.
+    # required for Garage and most S3-compatible test backends.
     # Real AWS S3 expects this to be false.
     # Type:    bool.
     # Default: false.
@@ -227,8 +227,8 @@ cachestore:
     # Type:     string (URL).
     # Required: yes.
     # Example:  the in-DC S3-compatible store URL (VAST etc.) in
-    #           production; the in-cluster LocalStack URL below.
-    endpoint: "http://localstack.unbounded-kube.svc.cluster.local:4566"
+    #           production; the in-cluster Garage URL below.
+    endpoint: "http://garage.unbounded-kube.svc.cluster.local:3900"
 
     # Cachestore bucket. Required.
     # NOTE: at boot the s3 driver calls GetBucketVersioning and
@@ -252,7 +252,7 @@ cachestore:
     access_key: ""
     secret_key: ""
 
-    # true for LocalStack and most S3-compatible backends.
+    # true for Garage and most S3-compatible backends.
     # Type:    bool.
     # Default: false.
     use_path_style: true

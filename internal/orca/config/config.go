@@ -111,15 +111,15 @@ type Azureblob struct {
 }
 
 // AWSS3 is the awss3 origin adapter configuration. In dev this points
-// at LocalStack alongside the cachestore (different bucket); in
-// production it points at real AWS S3 with no Endpoint override.
+// at the same S3-compatible store as the cachestore (different bucket);
+// in production it points at real AWS S3 with no Endpoint override.
 type AWSS3 struct {
 	Endpoint     string `yaml:"endpoint"` // empty for real AWS S3
 	Region       string `yaml:"region"`
 	Bucket       string `yaml:"bucket"`
 	AccessKey    string `yaml:"access_key"`
 	SecretKey    string `yaml:"secret_key"`
-	UsePathStyle bool   `yaml:"use_path_style"` // true for LocalStack
+	UsePathStyle bool   `yaml:"use_path_style"` // true for the S3-compatible dev backend
 }
 
 // Cachestore is the in-DC chunk store configuration.
@@ -129,20 +129,21 @@ type Cachestore struct {
 }
 
 // CachestoreS3 is the s3 driver configuration. In dev this points at
-// LocalStack; in production at VAST or another in-DC S3-compatible
-// store.
+// a self-hosted S3-compatible store; in production at VAST or
+// another in-DC S3-compatible store.
 //
-// Bucket versioning is unconditionally validated at startup: a
-// versioned bucket silently breaks the no-clobber atomic-commit
-// primitive (PutObject + If-None-Match: *) the driver depends on.
-// There is no configuration switch for this gate.
+// Bucket versioning is unconditionally validated at startup: Orca's
+// chunks are immutable and re-committed only with byte-identical
+// content, so a versioned bucket would accumulate redundant object
+// versions that only waste space. There is no configuration switch for
+// this gate.
 type CachestoreS3 struct {
 	Endpoint     string `yaml:"endpoint"`
 	Bucket       string `yaml:"bucket"`
 	Region       string `yaml:"region"`
 	AccessKey    string `yaml:"access_key"`
 	SecretKey    string `yaml:"secret_key"`
-	UsePathStyle bool   `yaml:"use_path_style"` // true for LocalStack
+	UsePathStyle bool   `yaml:"use_path_style"` // true for the S3-compatible dev backend
 }
 
 // Cluster captures peer discovery + internal-listener configuration.

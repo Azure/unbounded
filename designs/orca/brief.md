@@ -143,16 +143,20 @@ membership churn are caught by an `X-Orca-Internal: 1` header
 plus a self-check on the receiver; a mismatch returns 409 and
 the caller falls back to filling locally.
 
-### 4.4 Atomic-commit primitive
+### 4.4 Commit primitive (stat-then-put)
 
-The leader publishes a chunk to the CacheStore in one write that
-won't overwrite. `cachestore/s3` uses `PutObject +
-If-None-Match: *`; the loser of a race gets 412 and is recorded
-as `ErrCommitLost`. At boot the driver runs two checks - a
-self-test that proves the precondition is honored, and a
-versioning gate that refuses to start on versioned buckets
-(several S3-compatible backends ignore `If-None-Match: *` on
-them).
+The leader publishes a chunk to the CacheStore with a
+stat-then-put step: `cachestore/s3` does a `HeadObject` on the
+chunk path, and if the object is already present it skips the
+upload and records `ErrCommitLost`; otherwise it uploads with a
+plain `PutObject`. The ETag is part of the chunk path, so two
+replicas racing on the same key always carry byte-identical
+content (a last-writer-wins overwrite of identical bytes is
+safe). At boot the driver runs
+two checks - a `SelfTest` that proves the backend gives
+read-after-write visibility, and a versioning gate that refuses
+to start on versioned buckets (immutable chunks would only
+accumulate redundant object versions there).
 
 ### 4.5 Bounded staleness contract
 
@@ -172,9 +176,9 @@ the "uploaded after a 404" case: 60 seconds
 One driver ships today:
 
 - `cachestore/s3` - an in-DC S3-compatible object store (VAST in
-  production, LocalStack in dev). Atomic-commit primitive is
-  `PutObject + If-None-Match: *`; the boot self-test and the
-  versioning gate keep it honest.
+  production, a self-hosted store like Garage in dev). Commit is
+  stat-then-put (`HeadObject` then `PutObject`); the boot self-test
+  and the versioning gate keep it honest.
 
 Shared-POSIX-filesystem drivers (`cachestore/posixfs`,
 `cachestore/localfs`) were designed and not built. See
@@ -199,7 +203,7 @@ Shared-POSIX-filesystem drivers (`cachestore/posixfs`,
 - [s3 Terminology](./design.md#3-terminology)
 - [s4 Architecture](./design.md#4-architecture)
 - [s7 Stampede protection](./design.md#7-stampede-protection)
-- [s8 Atomic commit](./design.md#8-atomic-commit)
+- [s8 Commit (stat-then-put)](./design.md#8-commit-stat-then-put)
 - [s9 Bounded staleness contract](./design.md#9-bounded-staleness-contract)
 - [s10 Create-after-404](./design.md#10-create-after-404-and-negative-cache-lifecycle)
 - [s11 Eviction and capacity](./design.md#11-eviction-and-capacity)

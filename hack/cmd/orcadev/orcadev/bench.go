@@ -193,7 +193,7 @@ func runBench(ctx context.Context, g *globalFlags, o *benchOpts) error {
 	}
 
 	// Auto-open kubectl port-forwards to svc/orca, svc/azurite,
-	// svc/localstack as needed. No-op for any endpoint that is
+	// svc/garage as needed. No-op for any endpoint that is
 	// already bound on localhost. See ensurePortForwards.
 	cleanup, err := ensurePortForwards(ctx, g)
 	if err != nil {

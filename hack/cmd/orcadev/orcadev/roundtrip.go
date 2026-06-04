@@ -102,7 +102,7 @@ func runRoundtrip(ctx context.Context, g *globalFlags, o *roundtripOpts) error {
 	}
 
 	// Auto-open kubectl port-forwards to svc/orca, svc/azurite,
-	// svc/localstack as needed. No-op for any endpoint that is
+	// svc/garage as needed. No-op for any endpoint that is
 	// already bound on localhost (user-managed port-forward, sibling
 	// orcadev). See ensurePortForwards / derivePortForwardSpecs.
 	cleanup, err := ensurePortForwards(ctx, g)
