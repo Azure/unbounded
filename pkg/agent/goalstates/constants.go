@@ -15,6 +15,7 @@ const (
 
 	SystemdNSpawnDir = "/etc/systemd/nspawn"
 	SystemdSystemDir = "/etc/systemd/system"
+	BPFFSMountDir    = "/run/bpffs"
 
 	// DaemonUnit is the systemd unit name for the unbounded-agent daemon.
 	DaemonUnit = "unbounded-agent-daemon.service"
@@ -63,6 +64,11 @@ func AlternateMachine(current string) string {
 	}
 
 	return NSpawnMachineKube1
+}
+
+// BPFFSMountPath returns the host-side bpffs mount path for an nspawn machine.
+func BPFFSMountPath(machineName string) string {
+	return fmt.Sprintf("%s/%s", BPFFSMountDir, machineName)
 }
 
 // AppliedConfigPath returns the path to the applied config file for the

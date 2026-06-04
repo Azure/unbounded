@@ -37,18 +37,8 @@ StartLimitIntervalSec=0
 [Service]
 Restart=on-failure
 RestartSec=10s
-ExecStartPre=-/usr/bin/machinectl terminate {{.MachineName}}
-ExecStartPre=/usr/bin/mkdir -p {{.BPFFSMountPath}}
-ExecStartPre=/bin/sh -c '/usr/bin/mountpoint -q {{.BPFFSMountPath}} || /usr/bin/mount -t bpf bpf {{.BPFFSMountPath}}'
+ExecStartPre=-/usr/bin/machinectl terminate kube2
+ExecStartPre=/usr/bin/mkdir -p /run/bpffs/kube2
+ExecStartPre=/bin/sh -c '/usr/bin/mountpoint -q /run/bpffs/kube2 || /usr/bin/mount -t bpf bpf /run/bpffs/kube2'
 Environment=SYSTEMD_NSPAWN_UNIFIED_HIERARCHY=1
 Environment=SYSTEMD_NSPAWN_API_VFS_WRITABLE=network
-{{- if .NvidiaGPUDevicePaths}}
-
-# GPU support - allow the container to access NVIDIA device nodes via the
-# cgroup device controller. DeviceAllow grants read/write permission so that
-# the bind-mounted devices from the [Files] section in the .nspawn config
-# are actually usable inside the container.
-{{- range .NvidiaGPUDevicePaths}}
-DeviceAllow={{.}} rwm
-{{- end}}
-{{- end}}

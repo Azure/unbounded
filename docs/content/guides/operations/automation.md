@@ -174,18 +174,25 @@ spec:
 
 ### Node Upgrade via Recreation
 
-To roll out a new Kubernetes version or rootfs configuration, delete Node
-objects one at a time and let the agent reconcile:
+To roll out a new Kubernetes version or rootfs configuration, cordon, drain, and
+delete Node objects one at a time and let the agent reconcile:
 
 ```bash
 for node in worker-01 worker-02 worker-03; do
   echo "Recreating ${node}..."
+  kubectl cordon ${node}
+  kubectl drain ${node} --ignore-daemonsets --delete-emptydir-data
   kubectl delete node ${node}
 
   # Wait for the node to rejoin
   kubectl wait node ${node} --for=condition=Ready --timeout=300s
 done
 ```
+
+Drain must complete before deletion so kubelet, containerd, and the configured
+CNI can tear down workload pod state. If the cluster uses an eBPF CNI such as
+Cilium and requires destructive dataplane cleanup, run the CNI-specific cleanup
+procedure before deleting the Node.
 
 ### Host Replacement
 

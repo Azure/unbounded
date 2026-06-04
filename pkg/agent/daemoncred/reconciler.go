@@ -48,9 +48,11 @@ func NewCSRApproverReconciler(
 	if c == nil {
 		return nil, fmt.Errorf("client is required")
 	}
+
 	if kubeClient == nil {
 		return nil, fmt.Errorf("kubernetes client is required")
 	}
+
 	if approver == nil {
 		return nil, fmt.Errorf("approver is required")
 	}
@@ -74,12 +76,14 @@ func (r *CSRApproverReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("evaluate CSR %s: %w", csr.Name, err)
 	}
+
 	if decision.Ignore || decision.AlreadyDecided {
 		return ctrl.Result{}, nil
 	}
 
 	conditionType := certificatesv1.CertificateApproved
 	reason := approvalReasonApproved
+
 	if !decision.Approve {
 		conditionType = certificatesv1.CertificateDenied
 		reason = approvalReasonDenied

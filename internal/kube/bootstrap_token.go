@@ -113,6 +113,7 @@ func GetBootstrapTokenForSite(ctx context.Context, kubeCli kubernetes.Interface,
 		if _, ok := secret.Data["token-secret"]; !ok {
 			continue
 		}
+
 		if isExpiredBootstrapToken(secret, time.Now()) {
 			continue
 		}
@@ -145,6 +146,7 @@ func bootstrapTokenExpiration(secret *corev1.Secret) time.Time {
 	if raw == "" {
 		return time.Time{}
 	}
+
 	expiresAt, err := time.Parse(time.RFC3339, raw)
 	if err != nil {
 		return time.Time{}

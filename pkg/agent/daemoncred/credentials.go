@@ -75,42 +75,55 @@ func (o *ControllerCertificateOptions) validate() error {
 	if o == nil {
 		return fmt.Errorf("controller certificate options are required")
 	}
+
 	if o.SignerName == "" {
 		o.SignerName = DefaultControllerCertificateSignerName
 	}
+
 	if o.Name == "" {
 		return fmt.Errorf("certificate manager name is required")
 	}
+
 	if o.DaemonGroup == "" {
 		return fmt.Errorf("daemon group is required")
 	}
+
 	if isReservedDaemonGroup(o.DaemonGroup) {
 		return fmt.Errorf("daemon group must not use reserved or privileged group name: %s", o.DaemonGroup)
 	}
+
 	if o.WaitTimeout == 0 {
 		o.WaitTimeout = defaultControllerCertificateWaitTimeout
 	}
+
 	if o.WaitPoll == 0 {
 		o.WaitPoll = defaultControllerCertificateWaitPoll
 	}
+
 	if o.ExpirationDuration == 0 {
 		o.ExpirationDuration = defaultControllerCertificateExpirationDuration
 	}
+
 	if o.ReloadPeriod == 0 {
 		o.ReloadPeriod = defaultControllerCertificateReloadPeriod
 	}
+
 	if o.CredentialDir == "" {
 		return fmt.Errorf("credential directory is required")
 	}
+
 	if o.WaitTimeout < 0 {
 		return fmt.Errorf("wait timeout must be non-negative")
 	}
+
 	if o.WaitPoll <= 0 {
 		return fmt.Errorf("wait poll must be positive")
 	}
+
 	if o.ExpirationDuration <= 0 {
 		return fmt.Errorf("expiration duration must be positive")
 	}
+
 	if o.ReloadPeriod <= 0 {
 		return fmt.Errorf("reload period must be positive")
 	}
@@ -149,12 +162,15 @@ func NewRESTConfigProvider(
 	if err := opts.validate(); err != nil {
 		return nil, err
 	}
+
 	provider, err := newRESTConfigProvider(base, nodeName, opts)
 	if err != nil {
 		return nil, err
 	}
+
 	if provider.manager.Current() == nil {
 		provider.start()
+
 		if err := wait.PollUntilContextTimeout(ctx, opts.WaitPoll, opts.WaitTimeout, true, func(context.Context) (bool, error) {
 			return provider.manager.Current() != nil, nil
 		}); err != nil {
@@ -175,12 +191,15 @@ func (p *RESTConfigProvider) Run(ctx context.Context) {
 	defer p.manager.Stop()
 
 	var last *tls.Certificate
+
 	wait.UntilWithContext(ctx, func(context.Context) {
 		current := p.manager.Current()
 		if current == nil || current == last {
 			return
 		}
+
 		last = current
+
 		p.closeAll()
 	}, p.reloadPeriod)
 }
@@ -202,6 +221,7 @@ func newRESTConfigProvider(base *rest.Config, nodeName string, opts ControllerCe
 	}
 
 	lifetime := opts.ExpirationDuration
+
 	manager, err := certificate.NewManager(&certificate.Config{
 		ClientsetFn: func(current *tls.Certificate) (kubernetes.Interface, error) {
 			return clientsetForCertificate(base, current)
@@ -267,15 +287,18 @@ func restConfigWithManager(base *rest.Config, manager certificate.Manager) (*res
 	if err != nil {
 		return nil, nil, fmt.Errorf("configure TLS: %w", err)
 	}
+
 	if tlsConfig == nil {
 		tlsConfig = &tls.Config{}
 	}
+
 	tlsConfig.Certificates = nil
 	tlsConfig.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
 		cert := manager.Current()
 		if cert == nil {
 			return &tls.Certificate{Certificate: nil}, nil
 		}
+
 		return cert, nil
 	}
 
@@ -310,6 +333,7 @@ func clientsetForCertificate(base *rest.Config, current *tls.Certificate) (kuber
 	if err != nil {
 		return nil, err
 	}
+
 	keyPEM, err := encodePrivateKey(current.PrivateKey)
 	if err != nil {
 		return nil, err

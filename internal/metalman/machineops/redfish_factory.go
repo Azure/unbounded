@@ -27,10 +27,12 @@ func (f *RedfishPowerClientFactory) ForMachine(ctx context.Context, machine *v1a
 	}
 
 	rf := machine.Spec.PXE.Redfish
+
 	fingerprint := ""
 	if machine.Status.Redfish != nil {
 		fingerprint = machine.Status.Redfish.CertFingerprint
 	}
+
 	if fingerprint == "" {
 		return nil, fmt.Errorf("machine %s has no Redfish certificate fingerprint", machine.Name)
 	}
@@ -44,6 +46,7 @@ func (f *RedfishPowerClientFactory) ForMachine(ctx context.Context, machine *v1a
 	if !ok {
 		return nil, fmt.Errorf("redfish password secret %s/%s missing key %q", rf.PasswordRef.Namespace, rf.PasswordRef.Name, rf.PasswordRef.Key)
 	}
+
 	password := string(passwordBytes)
 
 	c, err := f.Pool.Get(ctx, rf.URL, fingerprint, rf.Username, password, rf.DeviceID)

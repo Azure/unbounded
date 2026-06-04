@@ -52,12 +52,15 @@ func (o *runOptions) validate() error {
 	if o == nil {
 		return fmt.Errorf("run options are required")
 	}
+
 	if o.NewClient == nil {
 		o.NewClient = client.NewWithWatch
 	}
+
 	if o.NodeOperator == nil {
 		o.NodeOperator = nspawnNodeOperator{}
 	}
+
 	if o.DaemonCredentialDir == "" {
 		o.DaemonCredentialDir = filepath.Join(goalstates.AgentConfigDir, "daemon-controller")
 	}
@@ -147,6 +150,7 @@ func daemonControllerCredentials(
 	}
 
 	log.Info("daemon controller certificate ready", "credentialDir", runOpts.DaemonCredentialDir)
+
 	providerCtx, stopProvider := context.WithCancel(ctx)
 	go provider.Run(providerCtx)
 

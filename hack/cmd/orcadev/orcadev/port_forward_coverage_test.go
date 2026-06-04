@@ -90,7 +90,6 @@ func TestEverySubcommandOpensPortForwards(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Not t.Parallel: swaps package-level seams.
-
 			var called bool
 
 			switch tt.firstBackend {

@@ -67,6 +67,7 @@ func TestFetchAndHashReturnsETag(t *testing.T) {
 	defer server.Close()
 
 	edge := newEdgeClient(server.URL, time.Second)
+
 	hash, status, size, etag, err := fetchAndHash(context.Background(), edge, "bucket", "key", "")
 	if err != nil {
 		t.Fatalf("fetchAndHash() error = %v", err)

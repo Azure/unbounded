@@ -35,6 +35,7 @@ func TestNewRESTConfigProviderUsesStoredCertificate(t *testing.T) {
 
 	provider, err := NewRESTConfigProvider(context.Background(), base, "node-a", opts)
 	require.NoError(t, err)
+
 	cfg := provider.RESTConfig()
 	assert.Equal(t, base.Host, cfg.Host)
 	assert.Empty(t, cfg.BearerToken)

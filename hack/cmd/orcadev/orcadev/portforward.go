@@ -114,6 +114,7 @@ func derivePortForwardSpecs(g *globalFlags) []portForwardSpec {
 		}
 
 		seen[key] = struct{}{}
+
 		specs = append(specs, s)
 	}
 

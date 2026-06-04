@@ -254,6 +254,7 @@ func TestSessionSendsProbes(t *testing.T) {
 			t.Error("expected at least one packet sent")
 			break
 		}
+
 		time.Sleep(10 * time.Millisecond)
 	}
 }

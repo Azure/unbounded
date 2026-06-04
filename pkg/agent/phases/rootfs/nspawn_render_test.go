@@ -5,58 +5,68 @@ package rootfs
 
 import (
 	"bytes"
+	"os"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
-// TestServiceOverride_SelfHealingDirectives ensures the rendered systemd
-// drop-in carries the directives that let systemd-nspawn@kube1 recover from
-// systemd-machined being restarted out from under it (for example by
-// needrestart during an unattended-upgrades run that touches libcap).
-func TestServiceOverride_SelfHealingDirectives(t *testing.T) {
+func TestServiceOverride_RenderedSnapshot(t *testing.T) {
 	t.Parallel()
 
-	data := nspawnTemplateData{
-		MachineName: "kube1",
-	}
-
-	var buf bytes.Buffer
-	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, "service-override.conf", data))
-
-	out := buf.String()
-
-	for _, want := range []string{
-		"Restart=on-failure",
-		"RestartSec=10s",
-		"StartLimitIntervalSec=0",
-		"ExecStartPre=-/usr/bin/machinectl terminate kube1",
-		"Environment=SYSTEMD_NSPAWN_UNIFIED_HIERARCHY=1",
-		"Environment=SYSTEMD_NSPAWN_API_VFS_WRITABLE=network",
-	} {
-		require.Contains(t, out, want, "missing directive in rendered drop-in")
-	}
-
-	// ExecStartPre must come before Environment so the cleanup runs before
-	// the unit's main start logic.
-	require.Less(t,
-		strings.Index(out, "ExecStartPre=-/usr/bin/machinectl terminate kube1"),
-		strings.Index(out, "Environment=SYSTEMD_NSPAWN_UNIFIED_HIERARCHY=1"),
-		"ExecStartPre should appear before Environment lines",
-	)
+	requireRenderedSnapshot(t, "service-override-kube1.conf.golden", "service-override.conf", nspawnTemplateData{
+		MachineName:    "kube1",
+		BPFFSMountPath: goalstates.BPFFSMountPath("kube1"),
+	})
 }
 
-// TestServiceOverride_MachineNameSubstitution verifies the template uses the
-// caller-provided machine name rather than a hard-coded "kube1".
-func TestServiceOverride_MachineNameSubstitution(t *testing.T) {
+func TestServiceOverride_MachineNameSnapshot(t *testing.T) {
 	t.Parallel()
 
-	data := nspawnTemplateData{MachineName: "kube7"}
+	requireRenderedSnapshot(t, "service-override-kube2.conf.golden", "service-override.conf", nspawnTemplateData{
+		MachineName:    "kube2",
+		BPFFSMountPath: goalstates.BPFFSMountPath("kube2"),
+	})
+}
+
+func TestNSpawnConfig_RenderedSnapshot(t *testing.T) {
+	t.Parallel()
+
+	requireRenderedSnapshot(t, "nspawn.conf.golden", "nspawn.conf", nspawnTemplateData{
+		BPFFSMountPath: goalstates.BPFFSMountPath("kube1"),
+	})
+}
+
+func requireRenderedSnapshot(t *testing.T, goldenFile, templateName string, data nspawnTemplateData) string {
+	t.Helper()
 
 	var buf bytes.Buffer
-	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, "service-override.conf", data))
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, templateName, data))
 
-	require.Contains(t, buf.String(), "machinectl terminate kube7")
-	require.NotContains(t, buf.String(), "machinectl terminate kube1")
+	expected, err := os.ReadFile("testdata/" + goldenFile)
+	require.NoError(t, err)
+	require.Equal(t, string(expected), buf.String())
+
+	if templateName == "service-override.conf" {
+		requireBPFFSExecStartPreOrder(t, buf.String(), data.BPFFSMountPath)
+	}
+
+	return buf.String()
+}
+
+func requireBPFFSExecStartPreOrder(t *testing.T, out, bpffsPath string) {
+	t.Helper()
+
+	mkdir := "ExecStartPre=/usr/bin/mkdir -p " + bpffsPath
+	mount := "ExecStartPre=/bin/sh -c '/usr/bin/mountpoint -q " + bpffsPath + " || /usr/bin/mount -t bpf bpf " + bpffsPath + "'"
+
+	// systemd runs ExecStartPre entries in order; the bpffs mount depends on
+	// the target directory existing and the entries being in the [Service] section.
+	require.Contains(t, out, mkdir)
+	require.Contains(t, out, mount)
+	require.Less(t, strings.Index(out, "[Service]"), strings.Index(out, mkdir))
+	require.Less(t, strings.Index(out, mkdir), strings.Index(out, mount))
 }
