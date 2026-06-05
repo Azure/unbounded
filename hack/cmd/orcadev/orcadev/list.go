@@ -56,6 +56,7 @@ func runList(ctx context.Context, g *globalFlags, o *listOpts) error {
 	}
 
 	var total int64
+
 	for _, obj := range objs {
 		fmt.Printf("%-12s\t%s\n", formatSize(obj.Size), obj.Name)
 

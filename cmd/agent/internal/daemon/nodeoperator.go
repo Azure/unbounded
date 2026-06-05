@@ -50,6 +50,10 @@ type nodeOperator interface {
 	//  3. Start the new machine (configure, boot nspawn, start services, persist config)
 	//  4. Verify kubelet health
 	//  5. Remove the old machine and its applied config
+	//
+	// The caller is expected to trigger this only after the Kubernetes Node has
+	// been cordoned, drained, and deleted. Repave reacts to Node deletion; it does
+	// not perform Kubernetes eviction or CNI-specific dataplane cleanup itself.
 	RepaveNode(context.Context, *slog.Logger, *ActiveMachine, *provision.UnboundedAgentConfig) error
 	// StageAgentUpgrade stages a new host-side agent binary.
 	StageAgentUpgrade(context.Context, *slog.Logger, string) error

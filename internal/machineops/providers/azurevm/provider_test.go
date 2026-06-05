@@ -123,6 +123,7 @@ func TestProviderExecutePassesAuthToClientFactory(t *testing.T) {
 		NewClientWithAuth: func(subscriptionID string, gotAuth *machineops.OperationAuth) (azureVMClient, error) {
 			require.Equal(t, "sub", subscriptionID)
 			require.Equal(t, auth, gotAuth)
+
 			return client, nil
 		},
 	}

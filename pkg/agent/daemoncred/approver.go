@@ -96,24 +96,31 @@ func NewCSRApprover(opts CSRApproverOptions) (*CSRApprover, error) {
 	if opts.SignerName == "" {
 		opts.SignerName = DefaultControllerCertificateSignerName
 	}
+
 	if opts.DaemonGroup == "" {
 		return nil, fmt.Errorf("daemon group is required")
 	}
+
 	if isReservedDaemonGroup(opts.DaemonGroup) {
 		return nil, fmt.Errorf("daemon group must not use reserved or privileged group name: %s", opts.DaemonGroup)
 	}
+
 	if opts.MaxExpirationSeconds == 0 {
 		opts.MaxExpirationSeconds = defaultMaxExpirationSeconds
 	}
+
 	if opts.MaxExpirationSeconds < 0 {
 		return nil, fmt.Errorf("max expiration seconds must be non-negative")
 	}
+
 	if opts.BootstrapGroup == "" {
 		return nil, fmt.Errorf("bootstrap group is required")
 	}
+
 	if opts.AuthorizeBootstrap == nil {
 		return nil, fmt.Errorf("bootstrap authorization callback is required")
 	}
+
 	if opts.AuthorizeRenewal == nil {
 		return nil, fmt.Errorf("renewal authorization callback is required")
 	}
@@ -125,6 +132,7 @@ func (a *CSRApprover) Evaluate(ctx context.Context, csr *certificatesv1.Certific
 	if csr.Spec.SignerName != a.opts.SignerName {
 		return CSRDecision{Ignore: true}, nil
 	}
+
 	if HasApprovalDecision(csr) || len(csr.Status.Certificate) > 0 {
 		return CSRDecision{AlreadyDecided: true}, nil
 	}
@@ -137,6 +145,7 @@ func (a *CSRApprover) Evaluate(ctx context.Context, csr *certificatesv1.Certific
 
 		return CSRDecision{Ignore: true}, nil
 	}
+
 	if !a.handlesCSR(csr, x509cr) {
 		return CSRDecision{Ignore: true}, nil
 	}
@@ -161,21 +170,27 @@ func (a *CSRApprover) validateCSRShape(
 	if !ok || nodeName == "" {
 		return "", Deny("common name must be %s<nodeName>", SystemNodeUserPrefix), nil
 	}
+
 	if hasUnexpectedSubjectFields(x509cr.Subject) {
 		return "", Deny("subject must contain only common name and organizations"), nil
 	}
+
 	if !equalStringSet(x509cr.Subject.Organization, []string{SystemNodesGroup, a.opts.DaemonGroup}) {
 		return "", Deny("organizations must be exactly %s and %s", SystemNodesGroup, a.opts.DaemonGroup), nil
 	}
+
 	if len(x509cr.DNSNames) > 0 || len(x509cr.EmailAddresses) > 0 || len(x509cr.IPAddresses) > 0 || len(x509cr.URIs) > 0 {
 		return "", Deny("subject alternative names are not allowed"), nil
 	}
+
 	if len(x509cr.Extensions) > 0 || len(x509cr.ExtraExtensions) > 0 {
 		return "", Deny("CSR extensions are not allowed"), nil
 	}
+
 	if err := validateClientAuthUsages(csr.Spec.Usages); err != nil {
 		return "", Deny("invalid usages: %v", err), nil
 	}
+
 	if csr.Spec.ExpirationSeconds != nil && *csr.Spec.ExpirationSeconds > a.opts.MaxExpirationSeconds {
 		return "", Deny("requested expiration %d exceeds maximum %d", *csr.Spec.ExpirationSeconds, a.opts.MaxExpirationSeconds), nil
 	}
@@ -199,6 +214,7 @@ func (a *CSRApprover) evaluateRequester(ctx context.Context, csr *certificatesv1
 	if strings.HasPrefix(csr.Spec.Username, BootstrapUserPrefix) {
 		return a.evaluateBootstrapRequester(ctx, csr, nodeName)
 	}
+
 	if constantTimeEqual(csr.Spec.Username, SystemNodeUserPrefix+nodeName) {
 		return a.evaluateRenewalRequester(ctx, csr, nodeName)
 	}
@@ -216,13 +232,16 @@ func (a *CSRApprover) evaluateBootstrapRequester(ctx context.Context, csr *certi
 			return Deny("bootstrap token requester has forbidden group %q", group), nil
 		}
 	}
+
 	if !slices.Contains(csr.Spec.Groups, a.opts.BootstrapGroup) {
 		return Deny("bootstrap token requester is missing required group %q", a.opts.BootstrapGroup), nil
 	}
+
 	allowed, err := a.opts.AuthorizeBootstrap(ctx, csr, nodeName)
 	if err != nil {
 		return CSRDecision{}, err
 	}
+
 	if !allowed {
 		return Deny("bootstrap token is not allowed to claim node %q", nodeName), nil
 	}
@@ -240,13 +259,16 @@ func (a *CSRApprover) evaluateRenewalRequester(ctx context.Context, csr *certifi
 			return Deny("renewal requester has forbidden group %q", group), nil
 		}
 	}
+
 	if !slices.Contains(csr.Spec.Groups, SystemNodesGroup) || !slices.Contains(csr.Spec.Groups, a.opts.DaemonGroup) {
 		return Deny("renewal requester is missing required node or daemon group"), nil
 	}
+
 	allowed, err := a.opts.AuthorizeRenewal(ctx, csr, nodeName)
 	if err != nil {
 		return CSRDecision{}, err
 	}
+
 	if !allowed {
 		return Deny("node %q is not bound to a Machine", nodeName), nil
 	}
@@ -296,14 +318,17 @@ func validateClientAuthUsages(usages []certificatesv1.KeyUsage) error {
 		certificatesv1.UsageClientAuth:       true,
 	}
 	seenClientAuth := false
+
 	for _, usage := range usages {
 		if !allowed[usage] {
 			return fmt.Errorf("unsupported usage %q", usage)
 		}
+
 		if usage == certificatesv1.UsageClientAuth {
 			seenClientAuth = true
 		}
 	}
+
 	if !seenClientAuth {
 		return fmt.Errorf("missing %q", certificatesv1.UsageClientAuth)
 	}
@@ -326,10 +351,13 @@ func equalStringSet(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
 	}
+
 	aa := append([]string(nil), a...)
 	bb := append([]string(nil), b...)
+
 	sort.Strings(aa)
 	sort.Strings(bb)
+
 	for i := range aa {
 		if aa[i] != bb[i] {
 			return false

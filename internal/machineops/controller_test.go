@@ -790,6 +790,7 @@ func (p *recordingProvider) Execute(_ context.Context, request OperationRequest)
 	if request.ReplaceUserData != "" {
 		p.replaceUserData = append(p.replaceUserData, request.ReplaceUserData)
 	}
+
 	if request.Auth != nil {
 		p.authModes = append(p.authModes, request.Auth.Mode)
 		p.authData = append(p.authData, request.Auth.SecretData)
