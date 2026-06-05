@@ -51,7 +51,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/hrw"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/inflight"
-	coordv1 "github.com/Azure/unbounded/proto/gantry/coord/v1"
+	coordv1 "github.com/Azure/unbounded/internal/gantry/proto/coord/v1"
 )
 
 // ProtocolID is the libp2p stream protocol the coord handler binds.
@@ -76,6 +76,13 @@ const MaxMessageBytes = 1 << 20
 // runs under its own 2s context (see handleStream). Override via
 // WithStreamHandshakeTimeout for tests.
 const DefaultStreamHandshakeTimeout = 5 * time.Second
+
+// DefaultMaxConcurrentStreams caps simultaneous inbound coord streams. A
+// hostile or buggy peer can open thousands of streams; without a cap each
+// consumes a goroutine for up to streamHandshakeTimeout. libp2p's resource
+// manager is the next defence layer; this is a cheap, predictable, server-
+// local gate.
+const DefaultMaxConcurrentStreams = 512
 
 // MetricsHooks lets callers wire Prometheus counters/gauges without
 // importing the metrics package. All fields may be nil.
@@ -124,6 +131,8 @@ type Server struct {
 	// streamHandshakeTimeout caps a single inbound stream's wire
 	// lifetime (see DefaultStreamHandshakeTimeout).
 	streamHandshakeTimeout time.Duration
+	// streamSem bounds concurrent inbound stream handlers.
+	streamSem chan struct{}
 }
 
 // NegativeCache is the read interface coord needs from the
@@ -189,6 +198,16 @@ func WithStreamHandshakeTimeout(d time.Duration) Option {
 	}
 }
 
+// WithMaxConcurrentStreams overrides DefaultMaxConcurrentStreams. Non-positive
+// values are ignored.
+func WithMaxConcurrentStreams(n int) Option {
+	return func(s *Server) {
+		if n > 0 {
+			s.streamSem = make(chan struct{}, n)
+		}
+	}
+}
+
 // NewServer constructs a coord server. The store + members + inflight
 // dependencies are required (everything else is optional via Option).
 func NewServer(store ifaces.LocalContentStore, members ifaces.Members, inflight *inflight.Map, opts ...Option) *Server {
@@ -198,6 +217,7 @@ func NewServer(store ifaces.LocalContentStore, members ifaces.Members, inflight 
 		members:                members,
 		inflight:               inflight,
 		streamHandshakeTimeout: DefaultStreamHandshakeTimeout,
+		streamSem:              make(chan struct{}, DefaultMaxConcurrentStreams),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -216,6 +236,21 @@ func (s *Server) Bind(h host.Host) {
 // design pins "one stream per request/response pair" - we read one
 // length-delimited envelope, dispatch, write one envelope, close.
 func (s *Server) handleStream(str network.Stream) {
+	// Bound concurrent handlers. A hostile peer can open many streams in
+	// parallel; reject (rather than queue) excess so resource use stays
+	// predictable. select-with-default keeps this O(1) and lock-free.
+	select {
+	case s.streamSem <- struct{}{}:
+		defer func() { <-s.streamSem }()
+	default:
+		s.bumpStreamErr()
+		s.logger.Debug("coord: max concurrent streams reached, dropping")
+
+		_ = str.Reset() //nolint:errcheck // best-effort reset
+
+		return
+	}
+
 	defer func() { _ = str.Close() }() //nolint:errcheck // best-effort close
 
 	// Bound the entire request/response cycle on the wire. Without

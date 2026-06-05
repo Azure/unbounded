@@ -7,14 +7,15 @@ the gantry agent as a Kubernetes DaemonSet.
 
 | File | Purpose |
 | --- | --- |
-| `Dockerfile` | Multi-arch, distroless build (§Phase 6). |
-| `build.sh` | Local image build helper. Tags from `git describe`. |
-| `daemonset.yaml` | One-pod-per-node DaemonSet (§Phase 6 / §7.5). |
+| `daemonset.yaml` | One-pod-per-node DaemonSet. |
 | `serviceaccount.yaml` | ServiceAccount + ClusterRole + Role + PriorityClass. |
 | `configmap.yaml` | Default `config.yaml` (mirrors `config.NewDefault()`). |
 | `registry-secret.example.yaml` | Template Secret for upstream-registry credentials. |
 | `examples/networkpolicy.yaml` | **Hardening overlay (NOT applied by default).** See [Hardening overlays](#hardening-overlays) below. |
 | `hosts.toml.template` | containerd registry mirror config; one file per upstream registry under `/etc/containerd/certs.d/<host>/hosts.toml`. |
+
+The container image is built from `images/gantry/Containerfile` via
+`make image-gantry-local` (or `make image-gantry-push` to push).
 
 ## Apply order
 
@@ -40,14 +41,14 @@ kubectl apply -f deploy/daemonset.yaml
 ## Building the image locally
 
 ```sh
-# Single-arch into local docker (host arch):
-deploy/build.sh
+# Single-arch into local container engine:
+make image-gantry-local
 
-# Multi-arch + push:
-deploy/build.sh -p linux/amd64,linux/arm64 -r ghcr.io/your-org/gantry --push
+# Build and push to $(CONTAINER_REGISTRY):
+make image-gantry-push CONTAINER_REGISTRY=ghcr.io/your-org
 
 # Explicit tag:
-deploy/build.sh -t v0.6.0
+make image-gantry-local VERSION=v0.6.0
 ```
 
 ## Per-node containerd setup

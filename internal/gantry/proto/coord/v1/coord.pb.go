@@ -13,7 +13,7 @@
 // versions:
 // 	protoc-gen-go v1.36.11
 // 	protoc        v3.12.4
-// source: gantry/coord/v1/coord.proto
+// source: coord.proto
 
 package coordv1
 
@@ -74,11 +74,11 @@ func (x FailureClass) String() string {
 }
 
 func (FailureClass) Descriptor() protoreflect.EnumDescriptor {
-	return file_gantry_coord_v1_coord_proto_enumTypes[0].Descriptor()
+	return file_coord_proto_enumTypes[0].Descriptor()
 }
 
 func (FailureClass) Type() protoreflect.EnumType {
-	return &file_gantry_coord_v1_coord_proto_enumTypes[0]
+	return &file_coord_proto_enumTypes[0]
 }
 
 func (x FailureClass) Number() protoreflect.EnumNumber {
@@ -87,7 +87,7 @@ func (x FailureClass) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use FailureClass.Descriptor instead.
 func (FailureClass) EnumDescriptor() ([]byte, []int) {
-	return file_gantry_coord_v1_coord_proto_rawDescGZIP(), []int{0}
+	return file_coord_proto_rawDescGZIP(), []int{0}
 }
 
 // Kind discriminates the OCI Distribution Spec URL family the puller
@@ -147,11 +147,11 @@ func (x PleasePullRequest_Kind) String() string {
 }
 
 func (PleasePullRequest_Kind) Descriptor() protoreflect.EnumDescriptor {
-	return file_gantry_coord_v1_coord_proto_enumTypes[1].Descriptor()
+	return file_coord_proto_enumTypes[1].Descriptor()
 }
 
 func (PleasePullRequest_Kind) Type() protoreflect.EnumType {
-	return &file_gantry_coord_v1_coord_proto_enumTypes[1]
+	return &file_coord_proto_enumTypes[1]
 }
 
 func (x PleasePullRequest_Kind) Number() protoreflect.EnumNumber {
@@ -160,7 +160,7 @@ func (x PleasePullRequest_Kind) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use PleasePullRequest_Kind.Descriptor instead.
 func (PleasePullRequest_Kind) EnumDescriptor() ([]byte, []int) {
-	return file_gantry_coord_v1_coord_proto_rawDescGZIP(), []int{3, 0}
+	return file_coord_proto_rawDescGZIP(), []int{3, 0}
 }
 
 type PleasePullResponse_Result_Outcome int32
@@ -199,11 +199,11 @@ func (x PleasePullResponse_Result_Outcome) String() string {
 }
 
 func (PleasePullResponse_Result_Outcome) Descriptor() protoreflect.EnumDescriptor {
-	return file_gantry_coord_v1_coord_proto_enumTypes[2].Descriptor()
+	return file_coord_proto_enumTypes[2].Descriptor()
 }
 
 func (PleasePullResponse_Result_Outcome) Type() protoreflect.EnumType {
-	return &file_gantry_coord_v1_coord_proto_enumTypes[2]
+	return &file_coord_proto_enumTypes[2]
 }
 
 func (x PleasePullResponse_Result_Outcome) Number() protoreflect.EnumNumber {
@@ -212,7 +212,7 @@ func (x PleasePullResponse_Result_Outcome) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use PleasePullResponse_Result_Outcome.Descriptor instead.
 func (PleasePullResponse_Result_Outcome) EnumDescriptor() ([]byte, []int) {
-	return file_gantry_coord_v1_coord_proto_rawDescGZIP(), []int{4, 0, 0}
+	return file_coord_proto_rawDescGZIP(), []int{4, 0, 0}
 }
 
 // Envelope is the single message kind sent over `/gantry/coord/1.0.0`.
@@ -232,7 +232,7 @@ type Envelope struct {
 
 func (x *Envelope) Reset() {
 	*x = Envelope{}
-	mi := &file_gantry_coord_v1_coord_proto_msgTypes[0]
+	mi := &file_coord_proto_msgTypes[0]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -244,7 +244,7 @@ func (x *Envelope) String() string {
 func (*Envelope) ProtoMessage() {}
 
 func (x *Envelope) ProtoReflect() protoreflect.Message {
-	mi := &file_gantry_coord_v1_coord_proto_msgTypes[0]
+	mi := &file_coord_proto_msgTypes[0]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -257,7 +257,7 @@ func (x *Envelope) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Envelope.ProtoReflect.Descriptor instead.
 func (*Envelope) Descriptor() ([]byte, []int) {
-	return file_gantry_coord_v1_coord_proto_rawDescGZIP(), []int{0}
+	return file_coord_proto_rawDescGZIP(), []int{0}
 }
 
 func (x *Envelope) GetMsg() isEnvelope_Msg {
@@ -342,7 +342,7 @@ type PullIntentRequest struct {
 
 func (x *PullIntentRequest) Reset() {
 	*x = PullIntentRequest{}
-	mi := &file_gantry_coord_v1_coord_proto_msgTypes[1]
+	mi := &file_coord_proto_msgTypes[1]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -354,7 +354,7 @@ func (x *PullIntentRequest) String() string {
 func (*PullIntentRequest) ProtoMessage() {}
 
 func (x *PullIntentRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_gantry_coord_v1_coord_proto_msgTypes[1]
+	mi := &file_coord_proto_msgTypes[1]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -367,7 +367,7 @@ func (x *PullIntentRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PullIntentRequest.ProtoReflect.Descriptor instead.
 func (*PullIntentRequest) Descriptor() ([]byte, []int) {
-	return file_gantry_coord_v1_coord_proto_rawDescGZIP(), []int{1}
+	return file_coord_proto_rawDescGZIP(), []int{1}
 }
 
 func (x *PullIntentRequest) GetDigest() string {
@@ -399,7 +399,7 @@ type PullIntentResponse struct {
 
 func (x *PullIntentResponse) Reset() {
 	*x = PullIntentResponse{}
-	mi := &file_gantry_coord_v1_coord_proto_msgTypes[2]
+	mi := &file_coord_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -411,7 +411,7 @@ func (x *PullIntentResponse) String() string {
 func (*PullIntentResponse) ProtoMessage() {}
 
 func (x *PullIntentResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_gantry_coord_v1_coord_proto_msgTypes[2]
+	mi := &file_coord_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -424,7 +424,7 @@ func (x *PullIntentResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PullIntentResponse.ProtoReflect.Descriptor instead.
 func (*PullIntentResponse) Descriptor() ([]byte, []int) {
-	return file_gantry_coord_v1_coord_proto_rawDescGZIP(), []int{2}
+	return file_coord_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *PullIntentResponse) GetHasCached() bool {
@@ -493,7 +493,7 @@ type PleasePullRequest struct {
 
 func (x *PleasePullRequest) Reset() {
 	*x = PleasePullRequest{}
-	mi := &file_gantry_coord_v1_coord_proto_msgTypes[3]
+	mi := &file_coord_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -505,7 +505,7 @@ func (x *PleasePullRequest) String() string {
 func (*PleasePullRequest) ProtoMessage() {}
 
 func (x *PleasePullRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_gantry_coord_v1_coord_proto_msgTypes[3]
+	mi := &file_coord_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -518,7 +518,7 @@ func (x *PleasePullRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PleasePullRequest.ProtoReflect.Descriptor instead.
 func (*PleasePullRequest) Descriptor() ([]byte, []int) {
-	return file_gantry_coord_v1_coord_proto_rawDescGZIP(), []int{3}
+	return file_coord_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *PleasePullRequest) GetDigests() []string {
@@ -559,7 +559,7 @@ type PleasePullResponse struct {
 
 func (x *PleasePullResponse) Reset() {
 	*x = PleasePullResponse{}
-	mi := &file_gantry_coord_v1_coord_proto_msgTypes[4]
+	mi := &file_coord_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -571,7 +571,7 @@ func (x *PleasePullResponse) String() string {
 func (*PleasePullResponse) ProtoMessage() {}
 
 func (x *PleasePullResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_gantry_coord_v1_coord_proto_msgTypes[4]
+	mi := &file_coord_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -584,7 +584,7 @@ func (x *PleasePullResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PleasePullResponse.ProtoReflect.Descriptor instead.
 func (*PleasePullResponse) Descriptor() ([]byte, []int) {
-	return file_gantry_coord_v1_coord_proto_rawDescGZIP(), []int{4}
+	return file_coord_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *PleasePullResponse) GetResults() []*PleasePullResponse_Result {
@@ -607,7 +607,7 @@ type PleasePullResponse_Result struct {
 
 func (x *PleasePullResponse_Result) Reset() {
 	*x = PleasePullResponse_Result{}
-	mi := &file_gantry_coord_v1_coord_proto_msgTypes[5]
+	mi := &file_coord_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -619,7 +619,7 @@ func (x *PleasePullResponse_Result) String() string {
 func (*PleasePullResponse_Result) ProtoMessage() {}
 
 func (x *PleasePullResponse_Result) ProtoReflect() protoreflect.Message {
-	mi := &file_gantry_coord_v1_coord_proto_msgTypes[5]
+	mi := &file_coord_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -632,7 +632,7 @@ func (x *PleasePullResponse_Result) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PleasePullResponse_Result.ProtoReflect.Descriptor instead.
 func (*PleasePullResponse_Result) Descriptor() ([]byte, []int) {
-	return file_gantry_coord_v1_coord_proto_rawDescGZIP(), []int{4, 0}
+	return file_coord_proto_rawDescGZIP(), []int{4, 0}
 }
 
 func (x *PleasePullResponse_Result) GetDigest() string {
@@ -670,11 +670,11 @@ func (x *PleasePullResponse_Result) GetFailureClass() FailureClass {
 	return FailureClass_FAILURE_CLASS_UNSPECIFIED
 }
 
-var File_gantry_coord_v1_coord_proto protoreflect.FileDescriptor
+var File_coord_proto protoreflect.FileDescriptor
 
-const file_gantry_coord_v1_coord_proto_rawDesc = "" +
+const file_coord_proto_rawDesc = "" +
 	"\n" +
-	"\x1bgantry/coord/v1/coord.proto\x12\x0fgantry.coord.v1\x1a\x1fgoogle/protobuf/timestamp.proto\"\xef\x02\n" +
+	"\vcoord.proto\x12\x0fgantry.coord.v1\x1a\x1fgoogle/protobuf/timestamp.proto\"\xef\x02\n" +
 	"\bEnvelope\x12T\n" +
 	"\x13pull_intent_request\x18\x01 \x01(\v2\".gantry.coord.v1.PullIntentRequestH\x00R\x11pullIntentRequest\x12W\n" +
 	"\x14pull_intent_response\x18\x02 \x01(\v2#.gantry.coord.v1.PullIntentResponseH\x00R\x12pullIntentResponse\x12T\n" +
@@ -724,23 +724,23 @@ const file_gantry_coord_v1_coord_proto_rawDesc = "" +
 	"\x12FAILURE_CLASS_AUTH\x10\x01\x12\x1b\n" +
 	"\x17FAILURE_CLASS_NOT_FOUND\x10\x02\x12\x1e\n" +
 	"\x1aFAILURE_CLASS_RATE_LIMITED\x10\x03\x12\x1b\n" +
-	"\x17FAILURE_CLASS_TRANSIENT\x10\x04B:Z8github.com/Azure/unbounded/proto/gantry/coord/v1;coordv1b\x06proto3"
+	"\x17FAILURE_CLASS_TRANSIENT\x10\x04BCZAgithub.com/Azure/unbounded/internal/gantry/proto/coord/v1;coordv1b\x06proto3"
 
 var (
-	file_gantry_coord_v1_coord_proto_rawDescOnce sync.Once
-	file_gantry_coord_v1_coord_proto_rawDescData []byte
+	file_coord_proto_rawDescOnce sync.Once
+	file_coord_proto_rawDescData []byte
 )
 
-func file_gantry_coord_v1_coord_proto_rawDescGZIP() []byte {
-	file_gantry_coord_v1_coord_proto_rawDescOnce.Do(func() {
-		file_gantry_coord_v1_coord_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_gantry_coord_v1_coord_proto_rawDesc), len(file_gantry_coord_v1_coord_proto_rawDesc)))
+func file_coord_proto_rawDescGZIP() []byte {
+	file_coord_proto_rawDescOnce.Do(func() {
+		file_coord_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_coord_proto_rawDesc), len(file_coord_proto_rawDesc)))
 	})
-	return file_gantry_coord_v1_coord_proto_rawDescData
+	return file_coord_proto_rawDescData
 }
 
-var file_gantry_coord_v1_coord_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_gantry_coord_v1_coord_proto_msgTypes = make([]protoimpl.MessageInfo, 6)
-var file_gantry_coord_v1_coord_proto_goTypes = []any{
+var file_coord_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
+var file_coord_proto_msgTypes = make([]protoimpl.MessageInfo, 6)
+var file_coord_proto_goTypes = []any{
 	(FailureClass)(0),                      // 0: gantry.coord.v1.FailureClass
 	(PleasePullRequest_Kind)(0),            // 1: gantry.coord.v1.PleasePullRequest.Kind
 	(PleasePullResponse_Result_Outcome)(0), // 2: gantry.coord.v1.PleasePullResponse.Result.Outcome
@@ -752,7 +752,7 @@ var file_gantry_coord_v1_coord_proto_goTypes = []any{
 	(*PleasePullResponse_Result)(nil),      // 8: gantry.coord.v1.PleasePullResponse.Result
 	(*timestamp.Timestamp)(nil),            // 9: google.protobuf.Timestamp
 }
-var file_gantry_coord_v1_coord_proto_depIdxs = []int32{
+var file_coord_proto_depIdxs = []int32{
 	4,  // 0: gantry.coord.v1.Envelope.pull_intent_request:type_name -> gantry.coord.v1.PullIntentRequest
 	5,  // 1: gantry.coord.v1.Envelope.pull_intent_response:type_name -> gantry.coord.v1.PullIntentResponse
 	6,  // 2: gantry.coord.v1.Envelope.please_pull_request:type_name -> gantry.coord.v1.PleasePullRequest
@@ -773,12 +773,12 @@ var file_gantry_coord_v1_coord_proto_depIdxs = []int32{
 	0,  // [0:13] is the sub-list for field type_name
 }
 
-func init() { file_gantry_coord_v1_coord_proto_init() }
-func file_gantry_coord_v1_coord_proto_init() {
-	if File_gantry_coord_v1_coord_proto != nil {
+func init() { file_coord_proto_init() }
+func file_coord_proto_init() {
+	if File_coord_proto != nil {
 		return
 	}
-	file_gantry_coord_v1_coord_proto_msgTypes[0].OneofWrappers = []any{
+	file_coord_proto_msgTypes[0].OneofWrappers = []any{
 		(*Envelope_PullIntentRequest)(nil),
 		(*Envelope_PullIntentResponse)(nil),
 		(*Envelope_PleasePullRequest)(nil),
@@ -788,18 +788,18 @@ func file_gantry_coord_v1_coord_proto_init() {
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
-			RawDescriptor: unsafe.Slice(unsafe.StringData(file_gantry_coord_v1_coord_proto_rawDesc), len(file_gantry_coord_v1_coord_proto_rawDesc)),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_coord_proto_rawDesc), len(file_coord_proto_rawDesc)),
 			NumEnums:      3,
 			NumMessages:   6,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
-		GoTypes:           file_gantry_coord_v1_coord_proto_goTypes,
-		DependencyIndexes: file_gantry_coord_v1_coord_proto_depIdxs,
-		EnumInfos:         file_gantry_coord_v1_coord_proto_enumTypes,
-		MessageInfos:      file_gantry_coord_v1_coord_proto_msgTypes,
+		GoTypes:           file_coord_proto_goTypes,
+		DependencyIndexes: file_coord_proto_depIdxs,
+		EnumInfos:         file_coord_proto_enumTypes,
+		MessageInfos:      file_coord_proto_msgTypes,
 	}.Build()
-	File_gantry_coord_v1_coord_proto = out.File
-	file_gantry_coord_v1_coord_proto_goTypes = nil
-	file_gantry_coord_v1_coord_proto_depIdxs = nil
+	File_coord_proto = out.File
+	file_coord_proto_goTypes = nil
+	file_coord_proto_depIdxs = nil
 }

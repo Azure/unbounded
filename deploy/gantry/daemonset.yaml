@@ -147,7 +147,7 @@ spec:
               mountPath: /var/lib/gantry/libp2p
       containers:
         - name: gantry
-          image: ghcr.io/vpatelsj/gantry:latest   # build.sh fills this with `git describe`
+          image: ghcr.io/vpatelsj/gantry:latest   # override via make image-gantry-local/push (GANTRY_IMAGE)
           imagePullPolicy: IfNotPresent
           args:
             - agent

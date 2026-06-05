@@ -38,6 +38,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	eventstypes "github.com/containerd/containerd/api/events"
@@ -74,9 +75,16 @@ type ContainerdSource struct {
 	// already has the (digest, mediaType) pair in hand - handing it
 	// to containerdstore lets the transfer endpoint serve manifest
 	// requests with the correct Content-Type without re-parsing
-	// JSON. nil is a no-op.
-	mediaTypeRecorder func(d gdigest.Digest, mediaType string)
+	// JSON. nil is a no-op. atomic.Pointer because SetMediaTypeRecorder
+	// is called from the agent's main wiring goroutine after the
+	// Subscribe goroutine has already started.
+	mediaTypeRecorder atomic.Pointer[mediaTypeRecorderFn]
 }
+
+// mediaTypeRecorderFn is the registered callback type. Wrapping the
+// raw func in a struct lets us store it through atomic.Pointer (which
+// requires a pointer type) without imposing that on every call site.
+type mediaTypeRecorderFn func(d gdigest.Digest, mediaType string)
 
 // ContainerdSourceOption configures a ContainerdSource.
 type ContainerdSourceOption func(*ContainerdSource)
@@ -196,15 +204,32 @@ func (s *ContainerdSource) LeasesService() leases.Manager {
 // descriptor visited by the next List/Subscribe walk. The intent is
 // to populate containerdstore.Store.RememberMediaType so the transfer
 // endpoint can serve manifest GETs with the correct Content-Type
-// without parsing the body. Safe to call once at startup; subsequent
-// calls overwrite (the source is single-owner per process). Pass nil
-// to disable. Plan "Descriptor index".
+// without parsing the body. Safe to call concurrently with active
+// walks; subsequent calls overwrite (the source is single-owner per
+// process). Pass nil to disable. Plan "Descriptor index".
 func (s *ContainerdSource) SetMediaTypeRecorder(fn func(d gdigest.Digest, mediaType string)) {
 	if s == nil {
 		return
 	}
 
-	s.mediaTypeRecorder = fn
+	if fn == nil {
+		s.mediaTypeRecorder.Store(nil)
+
+		return
+	}
+
+	f := mediaTypeRecorderFn(fn)
+	s.mediaTypeRecorder.Store(&f)
+}
+
+// recorder loads the current mediaTypeRecorder callback or nil.
+func (s *ContainerdSource) recorder() func(d gdigest.Digest, mediaType string) {
+	p := s.mediaTypeRecorder.Load()
+	if p == nil {
+		return nil
+	}
+
+	return *p
 }
 
 // List walks every image in the configured namespace and resolves its
@@ -222,7 +247,7 @@ func (s *ContainerdSource) List(ctx context.Context) ([]ImageEvent, error) {
 
 	out := make([]ImageEvent, 0, len(imgs))
 	for _, img := range imgs {
-		digests, err := walkBlobsWithRecorder(ctx, s.client.ContentStore(), img.Target(), s.mediaTypeRecorder)
+		digests, err := walkBlobsWithRecorder(ctx, s.client.ContentStore(), img.Target(), s.recorder())
 		if err != nil {
 			// One bad image (e.g. an entry whose manifest the content
 			// store lacks - possible mid-pull or after a content prune)
@@ -380,7 +405,7 @@ func (s *ContainerdSource) buildEvent(ctx context.Context, kind ImageEventKind, 
 		return nil, nil //nolint:nilerr // benign race
 	}
 
-	digests, err := walkBlobsWithRecorder(ctx, s.client.ContentStore(), img.Target(), s.mediaTypeRecorder)
+	digests, err := walkBlobsWithRecorder(ctx, s.client.ContentStore(), img.Target(), s.recorder())
 	if err != nil {
 		return nil, fmt.Errorf("walk %s: %w", name, err)
 	}

@@ -271,8 +271,13 @@ func (m *Monitor) routingCoverageLocked() float64 {
 }
 
 // latencyScoreLocked computes the p95-latency component over the
-// rolling window. Empty window -> 1.0.
+// rolling window. Empty window -> 1.0. Evicts stale samples first
+// so that a quiet period (no DHT lookups -> no ObserveLatency calls)
+// doesn't pin the agent permanently unhealthy on the last few bad
+// samples.
 func (m *Monitor) latencyScoreLocked() float64 {
+	m.evictOldLatenciesLocked(m.opts.Now())
+
 	if len(m.latencies) == 0 {
 		return 1.0
 	}

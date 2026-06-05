@@ -15,7 +15,7 @@ package gantry.coord.v1;
 
 import "google/protobuf/timestamp.proto";
 
-option go_package = "github.com/Azure/unbounded/proto/gantry/coord/v1;coordv1";
+option go_package = "github.com/Azure/unbounded/internal/gantry/proto/coord/v1;coordv1";
 
 // FailureClass classifies the cause of a terminal origin pull failure.
 // See detailed-design.md §5.8 for semantics and cluster-wide trust rules.

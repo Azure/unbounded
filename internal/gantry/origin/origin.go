@@ -292,7 +292,7 @@ func (r *registry) pull(ctx context.Context, ref ifaces.OriginRef) (io.ReadClose
 
 	resp, err := r.do(ctx, http.MethodGet, path)
 	if err != nil {
-		return nil, 0, &ifaces.OriginError{Ref: ref, Class: ifaces.FailureTransient, Err: err}
+		return nil, 0, &ifaces.OriginError{Ref: ref, Class: classOf(err), Err: err}
 	}
 
 	if resp.StatusCode == http.StatusNotFound && ref.Kind != ifaces.KindManifest {
@@ -340,6 +340,11 @@ func (r *registry) pull(ctx context.Context, ref ifaces.OriginRef) (io.ReadClose
 			}
 
 			_ = mResp.Body.Close() //nolint:errcheck // best-effort body close
+		} else if mErr != nil {
+			// Transport error on the manifest fallback (DNS, RST, ctx
+			// deadline). Must not poison the cluster-wide negative cache
+			// with a definitive NotFound based on a transient blip.
+			return nil, 0, &ifaces.OriginError{Ref: ref, Class: ifaces.FailureTransient, Err: mErr}
 		}
 
 		// Both blob and manifest returned 404 - classify as not-found
@@ -383,7 +388,7 @@ func (r *registry) head(ctx context.Context, ref ifaces.OriginRef) (int64, strin
 
 	resp, err := r.do(ctx, http.MethodHead, path)
 	if err != nil {
-		return 0, "", &ifaces.OriginError{Ref: ref, Class: ifaces.FailureTransient, Err: err}
+		return 0, "", &ifaces.OriginError{Ref: ref, Class: classOf(err), Err: err}
 	}
 
 	if resp.StatusCode == http.StatusNotFound && ref.Kind != ifaces.KindManifest {
@@ -414,6 +419,10 @@ func (r *registry) head(ctx context.Context, ref ifaces.OriginRef) (int64, strin
 			}
 
 			_ = mResp.Body.Close() //nolint:errcheck // best-effort body close
+		} else if mErr != nil {
+			// Transport error on the manifest fallback HEAD. Must not
+			// classify as NotFound from a transient failure.
+			return 0, "", &ifaces.OriginError{Ref: ref, Class: ifaces.FailureTransient, Err: mErr}
 		}
 
 		return 0, "", &ifaces.OriginError{Ref: ref, Class: ifaces.FailureNotFound, Err: fmt.Errorf("origin HEAD: %s not found (blob 404, manifest 404)", ref.Digest)}
@@ -583,11 +592,11 @@ func (r *registry) fetchBearerToken(ctx context.Context, challenge string) (stri
 	if resp.StatusCode != http.StatusOK {
 		switch resp.StatusCode {
 		case http.StatusUnauthorized, http.StatusForbidden:
-			return "", 0, fmt.Errorf("token endpoint auth failure: %s", resp.Status)
+			return "", 0, &tokenError{class: ifaces.FailureAuth, err: fmt.Errorf("token endpoint auth failure: %s", resp.Status)}
 		case http.StatusTooManyRequests:
-			return "", 0, fmt.Errorf("token endpoint rate limited: %s", resp.Status)
+			return "", 0, &tokenError{class: ifaces.FailureRateLimited, err: fmt.Errorf("token endpoint rate limited: %s", resp.Status)}
 		default:
-			return "", 0, fmt.Errorf("token endpoint returned %s", resp.Status)
+			return "", 0, &tokenError{class: ifaces.FailureTransient, err: fmt.Errorf("token endpoint returned %s", resp.Status)}
 		}
 	}
 
@@ -596,8 +605,10 @@ func (r *registry) fetchBearerToken(ctx context.Context, challenge string) (stri
 		AccessToken string `json:"access_token"`
 		ExpiresIn   int    `json:"expires_in"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		return "", 0, err
+	// Cap token body to 64 KiB - real tokens are tiny; a misconfigured or
+	// hostile token endpoint must not be able to OOM the agent.
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&body); err != nil {
+		return "", 0, &tokenError{class: ifaces.FailureTransient, err: err}
 	}
 
 	tok := body.Token
@@ -687,6 +698,28 @@ func classify(ref ifaces.OriginRef, resp *http.Response) error {
 		Class: class,
 		Err:   fmt.Errorf("upstream returned %s", resp.Status),
 	}
+}
+
+// tokenError carries a FailureClass through the token-exchange path so that
+// pull/head can wrap it in an *OriginError without losing the actual cause
+// (auth, rate-limit) under a blanket FailureTransient.
+type tokenError struct {
+	class ifaces.FailureClass
+	err   error
+}
+
+func (e *tokenError) Error() string { return e.err.Error() }
+func (e *tokenError) Unwrap() error { return e.err }
+
+// classOf recovers a FailureClass from an error returned by r.do. Defaults to
+// FailureTransient for plain transport / context errors.
+func classOf(err error) ifaces.FailureClass {
+	var te *tokenError
+	if errors.As(err, &te) {
+		return te.class
+	}
+
+	return ifaces.FailureTransient
 }
 
 // parseChallenge parses a WWW-Authenticate Bearer challenge into its

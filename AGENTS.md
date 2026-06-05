@@ -41,10 +41,8 @@ unbounded-kube is organized into several directories:
 - `e2e/` - end-to-end integration test suites.
   - `gantry/` - kind-based e2e tests for gantry (guarded by `//go:build e2e`).
 - `internal/` - where shared but internal to this project packages are located.
-  - `gantry/` - gantry shared packages (21 sub-packages: config, mirror, transfer, discovery, coord, hrw, coldstart, members, metrics, etc.).
+  - `gantry/` - gantry shared packages (21 sub-packages: config, mirror, transfer, discovery, coord, hrw, coldstart, members, metrics, etc.). Includes `internal/gantry/proto/coord/v1/` for the libp2p coordination RPC messages (pull intent, please-pull); kept under internal/ so the wire schema isn't an exported API surface.
   - `net/` - unbounded-net shared packages (APIs, controllers, networking, metrics, webhooks, etc.).
-- `proto/` - protocol buffer definitions.
-  - `gantry/coord/v1/` - gantry coordination RPC messages (pull intent, please-pull).
 - `tmp/` - project local temporary directory for intermediate stuff that will be cleaned up quickly.
 
 ## Building and Testing

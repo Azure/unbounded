@@ -2167,7 +2167,20 @@ func runOriginPull(originClient ifaces.OriginPuller, cstore ifaces.LocalContentS
 	reopenCancel()
 
 	if reopenErr != nil {
-		releaseLeaseOnFailure()
+		// w.Commit succeeded; the bytes are in the content store and the
+		// lease's Resource{ID: d, Type: "content"} binding is the only
+		// thing keeping containerd GC from reaping them until kubelet
+		// adopts the image. Release the lease ONLY when Open is
+		// definitively NotFound (commit didn't land). Any other reopen
+		// error (containerd hiccup, ctx deadline) is "we don't know" -
+		// keep the lease so committed content survives; CleanupExpired
+		// reclaims abandoned leases later. Reverse direction here turns
+		// one transient origin pull into many under flapping.
+		var notFound *ifaces.ErrNotFound
+		if errors.As(reopenErr, &notFound) {
+			releaseLeaseOnFailure()
+		}
+
 		recordOriginFailure(neg, d, reopenErr, lg, "cache reopen failed after commit", registry, repository)
 
 		if onDownstreamFailure != nil {

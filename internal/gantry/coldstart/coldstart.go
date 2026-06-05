@@ -298,7 +298,13 @@ func (r *Resolver) Resolve(ctx context.Context, d digest.Digest, kind ifaces.Ori
 	}
 
 	// Pass 1: top-K.
-	res, outcome, err := r.probe(ctx, d, kind, registry, repository, expectedSize, candidates, r.opts.HrwK, "")
+	// Capture DHT health ONCE per Resolve invocation. probe consults
+	// health for rule-6 / rule-7 decisions and Resolve consults it
+	// again below for rule-6 expansion - reading twice can flip a
+	// healthy cluster into degraded mode mid-decision (TOCTOU).
+	health := r.opts.Discovery.Health()
+
+	res, outcome, err := r.probe(ctx, d, kind, registry, repository, expectedSize, candidates, r.opts.HrwK, "", health)
 	if err == nil {
 		r.bumpDuration(kindLabel, outcome, start)
 		return res, nil
@@ -320,7 +326,6 @@ func (r *Resolver) Resolve(ctx context.Context, d digest.Digest, kind ifaces.Ori
 		expandReason = "rule5_all_unreachable"
 		expandMetricReason = "all_unreachable"
 	case errors.Is(err, errAllNeither):
-		health := r.opts.Discovery.Health()
 		if health < 0.7 {
 			expand = true
 			expandReason = "rule6_degraded_expand"
@@ -343,7 +348,7 @@ func (r *Resolver) Resolve(ctx context.Context, d digest.Digest, kind ifaces.Ori
 			r.opts.Metrics.OnTopKExpansion(expandMetricReason)
 		}
 
-		res, outcome, err = r.probe(ctx, d, kind, registry, repository, expectedSize, candidates, r.opts.HrwK*factor, expandReason)
+		res, outcome, err = r.probe(ctx, d, kind, registry, repository, expectedSize, candidates, r.opts.HrwK*factor, expandReason, health)
 		if err == nil {
 			r.bumpDuration(kindLabel, outcome, start)
 			return res, nil
@@ -386,7 +391,7 @@ func mapTerminalErr(err error) (string, error) {
 //
 // Returns (Resolution, outcomeLabel, nil) on success; or
 // (nil, "", err) where err is one of the internal/public sentinels.
-func (r *Resolver) probe(ctx context.Context, d digest.Digest, kind ifaces.OriginRefKind, registry, repository string, expectedSize int64, candidates []ifaces.Node, k int, expandLabel string) (*Resolution, string, error) {
+func (r *Resolver) probe(ctx context.Context, d digest.Digest, kind ifaces.OriginRefKind, registry, repository string, expectedSize int64, candidates []ifaces.Node, k int, expandLabel string, health float64) (*Resolution, string, error) {
 	top := hrw.TopK(candidates, d, k)
 	if len(top) == 0 {
 		return nil, "", errNoReachable
@@ -532,8 +537,8 @@ func (r *Resolver) probe(ctx context.Context, d digest.Digest, kind ifaces.Origi
 	// can expand to top-2K *before* cold-starting (the design doc rule 6). Under
 	// Healthy DHT we proceed straight to rule 7 at top-K - expansion
 	// is the degraded-mode safety net, not a prerequisite for
-	// cold-start.
-	health := r.opts.Discovery.Health()
+	// cold-start. health is captured once per Resolve invocation to
+	// avoid a TOCTOU between rule-6 evaluation here and in Resolve.
 	if expandLabel == "" && health < 0.7 {
 		return nil, "", errAllNeither
 	}
