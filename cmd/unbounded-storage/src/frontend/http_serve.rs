@@ -48,7 +48,7 @@ use crate::http::{
 };
 use crate::ring::NetHandle;
 use crate::runtime::noop_waker;
-use crate::storage::{OriginRef, StripeReq};
+use crate::storage::{ObjectMetadata, OriginRef, StripeReq};
 
 /// HTTP serving frontend factory. Built once per [`FrontendSpec`];
 /// holds only the immutable configuration distilled from the spec.
@@ -298,11 +298,10 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
     };
 
     // 5. Resolve object length by reading the object's dedicated
-    // length entry through the pool. The HTTP backend fills it from
+    // metadata entry through the pool. The HTTP backend fills it from
     // an origin HEAD on a miss; local-disk and peer hits skip the
-    // origin entirely. The payload is the byte length as a
-    // little-endian u64 in the first 8 bytes of the entry's page.
-    let len = read_object_length(pool, backend_id, &path)
+    // origin entirely.
+    let len = read_object_length(pool, backend_id, &path, page_size)
         .await
         .map_err(|_| ())?;
 
@@ -392,26 +391,22 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
 }
 
 /// Resolve an object's length by reading its dedicated content-addressed
-/// length entry through the pool. The entry's single page carries the
-/// byte length as a little-endian u64 in its first 8 bytes; the HTTP
-/// backend fills it from an origin `HEAD` on a miss, while local-disk
-/// and peer hits avoid the origin entirely.
+/// metadata entry through the pool. The entry's single page carries the
+/// object's [`ObjectMetadata`]; the HTTP backend fills it from an origin
+/// `HEAD` on a miss, while local-disk and peer hits avoid the origin
+/// entirely. The whole page is read (a zero-copy borrow) and decoded.
 async fn read_object_length<P: BufferPool<Req = StripeReq>>(
     pool: &Rc<P>,
     backend_id: &str,
     path: &str,
+    page_size: usize,
 ) -> Result<u64, ()> {
-    let origin_ref = OriginRef::length_entry(backend_id, path);
+    let origin_ref = OriginRef::metadata_entry(backend_id, path);
     let req = StripeReq::new(origin_ref.stripe_key()).with_origin(origin_ref);
-    let mut rs: ReadStream = pool.read(&req, 0, 8).await.map_err(|_| ())?;
+    let mut rs: ReadStream = pool.read(&req, 0, page_size as u64).await.map_err(|_| ())?;
     let page = rs.next_page().await.ok_or(())?.map_err(|_| ())?;
-    let bytes = page.as_slice();
-    if bytes.len() < 8 {
-        return Err(());
-    }
-    let mut le = [0u8; 8];
-    le.copy_from_slice(&bytes[..8]);
-    Ok(u64::from_le_bytes(le))
+    let meta = ObjectMetadata::decode(page.as_slice()).map_err(|_| ())?;
+    Ok(meta.length)
 }
 
 /// Format the `200 OK` head for serving a whole object.
@@ -632,17 +627,17 @@ mod tests {
     }
 
     #[test]
-    fn length_entry_request_is_well_formed() {
+    fn metadata_entry_request_is_well_formed() {
         use crate::bufferpool::Req;
-        use crate::storage::{LENGTH_STRIPE_IDX, stripe_key};
+        use crate::storage::{METADATA_STRIPE_IDX, stripe_key};
 
-        let origin_ref = OriginRef::length_entry("primary", "/o");
-        assert!(origin_ref.is_length_entry());
+        let origin_ref = OriginRef::metadata_entry("primary", "/o");
+        assert!(origin_ref.is_metadata_entry());
 
         let req = StripeReq::new(origin_ref.stripe_key()).with_origin(origin_ref);
-        assert!(req.origin().unwrap().is_length_entry());
-        assert_eq!(req.key(), stripe_key("primary", "/o", LENGTH_STRIPE_IDX));
-        assert_eq!(LENGTH_STRIPE_IDX, u64::MAX);
+        assert!(req.origin().unwrap().is_metadata_entry());
+        assert_eq!(req.key(), stripe_key("primary", "/o", METADATA_STRIPE_IDX));
+        assert_eq!(METADATA_STRIPE_IDX, u64::MAX);
     }
 
     /// A mock pool whose `read` never constructs a `ReadStream` (that

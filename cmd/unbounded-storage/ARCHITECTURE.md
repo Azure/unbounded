@@ -482,7 +482,10 @@ path-sorted for stable hashing; `drain()` clears channels before handles.
 re-registers buffers when it observes a swap (`current_or_replay`).
 
 **Stripe keys**: `stripe_key` derives the 32-byte content-addressed key;
-`LENGTH_STRIPE_IDX` and `OriginRef`/`StripeReq` describe the request shape.
+`METADATA_STRIPE_IDX` and `OriginRef`/`StripeReq` describe the request shape.
+The metadata entry (sentinel `METADATA_STRIPE_IDX`) carries an
+`ObjectMetadata` blob (object length plus a small pass-through KV set)
+encoded into its page, rather than object data.
 
 ### 7.11 `config/` - typed, validated, hot-reloadable TOML
 
