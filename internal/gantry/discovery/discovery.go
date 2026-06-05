@@ -150,6 +150,7 @@ type Host struct {
 	// New / Close.
 	monitor      *Monitor
 	selfTestStop context.CancelFunc
+	selfTestDone chan struct{}
 
 	closeOnce sync.Once
 }
@@ -221,7 +222,13 @@ func New(ctx context.Context, opts Options) (*Host, error) {
 		stCtx, stCancel := context.WithCancel(context.Background())
 
 		host.selfTestStop = stCancel
-		go host.monitor.RunSelfTestLoop(stCtx, opts.SelfTestPeriod, host.runSelfTest)
+		host.selfTestDone = make(chan struct{})
+
+		go func() {
+			defer close(host.selfTestDone)
+
+			host.monitor.RunSelfTestLoop(stCtx, opts.SelfTestPeriod, host.runSelfTest)
+		}()
 	}
 
 	host.dialBootstrap(ctx, opts.BootstrapPeers)
@@ -241,6 +248,12 @@ func (h *Host) Close() error {
 	h.closeOnce.Do(func() {
 		if h.selfTestStop != nil {
 			h.selfTestStop()
+		}
+
+		// Wait for the self-test goroutine to finish before
+		// closing DHT/host to avoid racing teardown.
+		if h.selfTestDone != nil {
+			<-h.selfTestDone
 		}
 
 		if cerr := h.d.Close(); cerr != nil {

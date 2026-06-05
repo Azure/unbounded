@@ -337,6 +337,26 @@ func (s *Store) Writer(ctx context.Context, d gdigest.Digest) (ifaces.ContentWri
 		return nil, &ifaces.ErrUnavailable{Op: "Writer", Cause: err}
 	}
 
+	// If a previous crashed/failed pull left a partial ingest, the
+	// writer may have a non-zero offset. Callers always stream from
+	// byte 0, so appending to stale data would produce a corrupt
+	// commit. Abort and re-acquire a clean writer.
+	if st, stErr := w.Status(); stErr == nil && st.Offset > 0 {
+		_ = w.Close() //nolint:errcheck // closing stale writer
+
+		if abErr := s.cs.Abort(s.withNS(ctx), ref); abErr != nil && !errors.Is(abErr, cerrdefs.ErrNotFound) {
+			return nil, &ifaces.ErrUnavailable{Op: "Writer(abort-stale)", Cause: abErr}
+		}
+
+		w, err = s.cs.Writer(s.withNS(ctx),
+			content.WithRef(ref),
+			content.WithDescriptor(desc),
+		)
+		if err != nil {
+			return nil, &ifaces.ErrUnavailable{Op: "Writer(retry)", Cause: err}
+		}
+	}
+
 	return &contentWriter{
 		inner:    w,
 		expected: expected,
@@ -438,14 +458,17 @@ func (w *contentWriter) Commit(ctx context.Context) error {
 		return nil
 	}
 
-	w.committedOrAborted = true
 	if err := w.inner.Commit(w.store.withNS(ctx), 0, w.expected); err != nil {
 		if errors.Is(err, cerrdefs.ErrAlreadyExists) {
+			w.committedOrAborted = true
+
 			return nil
 		}
 
 		return fmt.Errorf("containerdstore: Commit: %w", err)
 	}
+
+	w.committedOrAborted = true
 
 	return nil
 }

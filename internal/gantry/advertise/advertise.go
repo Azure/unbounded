@@ -38,7 +38,6 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"math/rand/v2"
 	"sort"
 	"sync"
 	"time"
@@ -187,11 +186,14 @@ func (a *Advertiser) Run(ctx context.Context) error {
 		a.logger.Warn("advertise: initial reconcile failed", slog.Any("err", err))
 	}
 
+	ticker := time.NewTicker(a.reconcileInterval)
+	defer ticker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(jitter(a.reconcileInterval)):
+		case <-ticker.C:
 		}
 
 		if err := a.Reconcile(ctx); err != nil {
@@ -455,21 +457,4 @@ func (a *Advertiser) withdraw(ctx context.Context, d digest.Digest) bool {
 	}
 
 	return true
-}
-
-// jitter applies ±25% jitter to d, matching the cdsub jitter contract
-// so cluster nodes spread reconcile load instead of synchronising.
-func jitter(d time.Duration) time.Duration {
-	if d <= 0 {
-		return 0
-	}
-
-	span := int64(d) / 2
-	if span <= 0 {
-		return d
-	}
-
-	delta := rand.Int64N(span) - span/2 //nolint:gosec // jitter, not crypto
-
-	return d + time.Duration(delta)
 }

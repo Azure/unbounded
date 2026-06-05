@@ -14,12 +14,12 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/digest"
 )
 
-// newCdsubSource returns the production containerd-backed ImageSource
+// newContainerdImageSource returns the production containerd-backed ImageSource
 // when running on linux. In containerd-only mode the socket is required
 // by config validation; returning NoOpSource here is only a typed failure
 // sentinel so main can fail loudly when containerdBackedStore cannot be
 // constructed.
-func newCdsubSource(c *config.Config, logger *slog.Logger) cdsub.ImageSource {
+func newContainerdImageSource(c *config.Config, logger *slog.Logger) cdsub.ImageSource {
 	if c.ContainerdSocket == "" {
 		logger.Info("cdsub: containerd_socket empty - running with NoOpSource")
 		return cdsub.NoOpSource{}

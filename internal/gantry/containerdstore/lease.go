@@ -40,11 +40,13 @@ package containerdstore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"time"
 
 	"github.com/containerd/containerd/v2/core/leases"
+	cerrdefs "github.com/containerd/errdefs"
 
 	gdigest "github.com/Azure/unbounded/internal/gantry/digest"
 )
@@ -215,25 +217,25 @@ func (s *Store) CleanupExpiredLeases(ctx context.Context) (int, error) {
 	now := time.Now()
 	deleted := 0
 
+	var lastErr error
+
 	for _, l := range ls {
 		if !s.isExpired(l, now) {
 			continue
 		}
 
 		if err := s.leases.Delete(ctx, l, leases.SynchronousDelete); err != nil {
-			// NotFound means another process raced us; non-NotFound
-			// errors mean the backend is unhappy. In both cases skip
-			// the counter - it tracks how many leases this pass
-			// actually removed, not how many it tried to remove.
-			// One lease failing to delete shouldn't block cleanup of
-			// the others; the next pass will retry.
+			if !errors.Is(err, cerrdefs.ErrNotFound) {
+				lastErr = err
+			}
+			// One lease failing shouldn't block cleanup of others.
 			continue
 		}
 
 		deleted++
 	}
 
-	return deleted, nil
+	return deleted, lastErr
 }
 
 // isExpired returns true when the lease was created more than

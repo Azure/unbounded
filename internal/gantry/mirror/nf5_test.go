@@ -51,7 +51,7 @@ func nf5Digest(t *testing.T, b byte) digest.Digest {
 func TestNF5_DeclinesInBootstrapWindow(t *testing.T) {
 	var declineReason string
 
-	ctrl := mirror.NewNF5(mirror.NF5Options{
+	ctrl := mirror.NewDirectOriginFallback(mirror.DirectOriginFallbackOptions{
 		Inflight:      nf5Inflight(),
 		InBootstrap:   func() bool { return true },
 		HealthyEnough: func() bool { return true },
@@ -79,7 +79,7 @@ func TestNF5_DeclinesInBootstrapWindow(t *testing.T) {
 func TestNF5_DeclinesWhenUnhealthy(t *testing.T) {
 	var declineReason string
 
-	ctrl := mirror.NewNF5(mirror.NF5Options{
+	ctrl := mirror.NewDirectOriginFallback(mirror.DirectOriginFallbackOptions{
 		Inflight:      nf5Inflight(),
 		InBootstrap:   func() bool { return false },
 		HealthyEnough: func() bool { return false },
@@ -101,7 +101,7 @@ func TestNF5_DeclinesWhenUnhealthy(t *testing.T) {
 // caller for the same digest declines.
 func TestNF5_DeclinesOnInflightCollision(t *testing.T) {
 	infl := nf5Inflight()
-	ctrl := mirror.NewNF5(mirror.NF5Options{
+	ctrl := mirror.NewDirectOriginFallback(mirror.DirectOriginFallbackOptions{
 		Inflight:      infl,
 		InBootstrap:   func() bool { return false },
 		HealthyEnough: func() bool { return true },
@@ -121,7 +121,7 @@ func TestNF5_DeclinesOnInflightCollision(t *testing.T) {
 	// Second call sees the existing in-flight entry and declines.
 	var declineReason string
 
-	ctrl2 := mirror.NewNF5(mirror.NF5Options{
+	ctrl2 := mirror.NewDirectOriginFallback(mirror.DirectOriginFallbackOptions{
 		Inflight:      infl,
 		InBootstrap:   func() bool { return false },
 		HealthyEnough: func() bool { return true },
@@ -153,7 +153,7 @@ func TestNF5_TokenBucketExhausts(t *testing.T) {
 		declineReasons []string
 	)
 
-	ctrl := mirror.NewNF5(mirror.NF5Options{
+	ctrl := mirror.NewDirectOriginFallback(mirror.DirectOriginFallbackOptions{
 		Now:              func() time.Time { return clock },
 		Inflight:         infl,
 		InBootstrap:      func() bool { return false },
@@ -217,7 +217,7 @@ func TestNF5_TokenBucketExhausts(t *testing.T) {
 // TestNF5_DeclinesAfterRecheckHit asserts that if Recheck reports
 // a provider materialised during jitter, direct-origin-fallback cancels.
 func TestNF5_DeclinesAfterRecheckHit(t *testing.T) {
-	ctrl := mirror.NewNF5(mirror.NF5Options{
+	ctrl := mirror.NewDirectOriginFallback(mirror.DirectOriginFallbackOptions{
 		Inflight:      nf5Inflight(),
 		InBootstrap:   func() bool { return false },
 		HealthyEnough: func() bool { return true },
@@ -228,7 +228,7 @@ func TestNF5_DeclinesAfterRecheckHit(t *testing.T) {
 
 	var reason string
 
-	ctrl2 := mirror.NewNF5(mirror.NF5Options{
+	ctrl2 := mirror.NewDirectOriginFallback(mirror.DirectOriginFallbackOptions{
 		Inflight:      nf5Inflight(),
 		InBootstrap:   func() bool { return false },
 		HealthyEnough: func() bool { return true },
@@ -255,7 +255,7 @@ func TestNF5_DeclinesAfterRecheckHit(t *testing.T) {
 func TestNF5_ProceedsWhenGatesPass(t *testing.T) {
 	var fallbacks int
 
-	ctrl := mirror.NewNF5(mirror.NF5Options{
+	ctrl := mirror.NewDirectOriginFallback(mirror.DirectOriginFallbackOptions{
 		Inflight:      nf5Inflight(),
 		InBootstrap:   func() bool { return false },
 		HealthyEnough: func() bool { return true },
@@ -288,7 +288,7 @@ func TestNF5_ProceedsWhenGatesPass(t *testing.T) {
 // during the jitter sleep aborts the call and returns the context
 // error.
 func TestNF5_ContextCancelledDuringJitter(t *testing.T) {
-	ctrl := mirror.NewNF5(mirror.NF5Options{
+	ctrl := mirror.NewDirectOriginFallback(mirror.DirectOriginFallbackOptions{
 		Inflight:      nf5Inflight(),
 		InBootstrap:   func() bool { return false },
 		HealthyEnough: func() bool { return true },

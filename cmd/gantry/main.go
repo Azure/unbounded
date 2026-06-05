@@ -176,7 +176,7 @@ func runAgent(args []string) error {
 	// (image-events subscription) and the primary local content
 	// store. Plan removed the alternative hostPath cache
 	// path; containerd is now the only supported storage backend.
-	cdsubSrc := newCdsubSource(c, logger)
+	cdsubSrc := newContainerdImageSource(c, logger)
 
 	// Storage backend: containerd content store (Plan ). See
 	// agent_storage.go for the wiring details.
@@ -484,11 +484,11 @@ func runAgent(args []string) error {
 	// - direct-origin-fallback direct-origin fallback controller (the design doc). Wired
 	// only when the cold-start resolver is also wired; without
 	// orchestration there is no `ErrColdStartExhausted` path to gate.
-	var nf5Ctrl *mirror.NF5Controller
+	var nf5Ctrl *mirror.DirectOriginFallbackController
 
 	if coldStartResolver != nil {
 		monitor := disco.Monitor()
-		nf5Ctrl = mirror.NewNF5(mirror.NF5Options{
+		nf5Ctrl = mirror.NewDirectOriginFallback(mirror.DirectOriginFallbackOptions{
 			Logger:           logger,
 			JitterBase:       c.NF5JitterBase,
 			PerNodeRateLimit: c.NF5PerNodeRateLimit,

@@ -602,6 +602,12 @@ func (c *Config) Validate() error {
 				errs = append(errs, fmt.Errorf("mirror_listen %q is not loopback; only 127.0.0.1 / ::1 are safe (containerd mirror uses skip_verify=true) - set mirror_bind_allow_non_loopback: true to override (operator opt-in)", c.MirrorListen))
 			}
 
+			// Empty host (e.g. ":5000") binds all interfaces, which is
+			// equivalent to 0.0.0.0 and must also require the opt-in.
+			if host == "" {
+				errs = append(errs, fmt.Errorf("mirror_listen %q binds all interfaces; only loopback is safe (containerd mirror uses skip_verify=true) - set mirror_bind_allow_non_loopback: true to override", c.MirrorListen))
+			}
+
 			if ip == nil && host != "localhost" && host != "" {
 				errs = append(errs, fmt.Errorf("mirror_listen host %q: must be loopback (or set mirror_bind_allow_non_loopback: true)", host))
 			}
@@ -660,6 +666,15 @@ func (c *Config) Validate() error {
 			seen[ur.Name] = i
 		}
 
+		// Check NSAlias duplicates and alias-vs-name collisions.
+		if ur.NSAlias != "" {
+			if prev, ok := seen[ur.NSAlias]; ok {
+				errs = append(errs, fmt.Errorf("upstream_registries[%d].ns_alias %q: collides with upstream_registries[%d]", i, ur.NSAlias, prev))
+			} else {
+				seen[ur.NSAlias] = i
+			}
+		}
+
 		if ur.Endpoint == "" {
 			errs = append(errs, fmt.Errorf("upstream_registries[%d].endpoint: required", i))
 		} else if !strings.HasPrefix(ur.Endpoint, "http://") && !strings.HasPrefix(ur.Endpoint, "https://") {
@@ -707,6 +722,14 @@ func (c *Config) Validate() error {
 
 	if c.OriginFailureCooldownMultiplier < 2 {
 		errs = append(errs, fmt.Errorf("origin_failure_cooldown_multiplier: must be >= 2, got %d", c.OriginFailureCooldownMultiplier))
+	}
+
+	// Validate failure classes if explicitly set.
+	validClasses := map[string]bool{"auth": true, "not_found": true, "rate_limited": true, "transient": true}
+	for _, cls := range c.OriginFailureClassesTrustedClusterWide {
+		if !validClasses[cls] {
+			errs = append(errs, fmt.Errorf("origin_failure_classes_trusted_cluster_wide: unknown class %q (valid: auth, not_found, rate_limited, transient)", cls))
+		}
 	}
 
 	switch c.LogLevel {

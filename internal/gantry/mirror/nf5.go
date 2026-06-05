@@ -64,8 +64,8 @@ import (
 // so direct-origin-fallback cannot circumvent them.
 var ErrColdStartExhausted = errors.New("mirror: cold-start cascade exhausted")
 
-// NF5Options configures the last-resort fallback controller.
-type NF5Options struct {
+// DirectOriginFallbackOptions configures the last-resort fallback controller.
+type DirectOriginFallbackOptions struct {
 	// Logger is the structured logger. Required.
 	Logger *slog.Logger
 
@@ -117,10 +117,10 @@ type NF5Options struct {
 	OnDecline func(reason string)
 }
 
-// NF5Controller runs the gating sequence. Safe for concurrent
+// DirectOriginFallbackController runs the gating sequence. Safe for concurrent
 // use.
-type NF5Controller struct {
-	opts NF5Options
+type DirectOriginFallbackController struct {
+	opts DirectOriginFallbackOptions
 
 	rngMu sync.Mutex
 	rng   *mathrand.Rand
@@ -130,14 +130,19 @@ type NF5Controller struct {
 	lastRefill time.Time
 }
 
-// NewNF5 builds a controller. Inflight must be non-nil; everything
+// NewDirectOriginFallback builds a controller. Inflight must be non-nil; everything
 // else receives reasonable defaults.
-func NewNF5(opts NF5Options) *NF5Controller {
+func NewDirectOriginFallback(opts DirectOriginFallbackOptions) *DirectOriginFallbackController {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
 
 	opts.Logger = opts.Logger.With(slog.String("subsystem", "nf5"))
+
+	if opts.Inflight == nil {
+		panic("NewNF5: Inflight is required")
+	}
+
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
@@ -152,7 +157,7 @@ func NewNF5(opts NF5Options) *NF5Controller {
 
 	now := opts.Now()
 
-	return &NF5Controller{
+	return &DirectOriginFallbackController{
 		opts:       opts,
 		rng:        mathrand.New(mathrand.NewSource(now.UnixNano())),
 		tokens:     float64(opts.PerNodeRateLimit), // start with full bucket
@@ -176,7 +181,7 @@ func NewNF5(opts NF5Options) *NF5Controller {
 // kind and expectedSize are forwarded to inflight.Map.Start so the
 // in-flight entry carries enough context for the design doc stall detection
 // in case the direct-origin-fallback origin pull itself stalls.
-func (n *NF5Controller) Allow(ctx context.Context, d digest.Digest, kind ifaces.OriginRefKind, expectedSize int64) (bool, func(), error) {
+func (n *DirectOriginFallbackController) Allow(ctx context.Context, d digest.Digest, kind ifaces.OriginRefKind, expectedSize int64) (bool, func(), error) {
 	if n.opts.InBootstrap != nil && n.opts.InBootstrap() {
 		n.decline("bootstrap_window")
 		return false, nil, nil
@@ -244,7 +249,7 @@ func (n *NF5Controller) Allow(ctx context.Context, d digest.Digest, kind ifaces.
 // takeToken refills the bucket continuously at `PerNodeRateLimit`
 // tokens/minute and consumes 1 token if available. Returns true on
 // success.
-func (n *NF5Controller) takeToken() bool {
+func (n *DirectOriginFallbackController) takeToken() bool {
 	n.bucketMu.Lock()
 	defer n.bucketMu.Unlock()
 
@@ -273,7 +278,7 @@ func (n *NF5Controller) takeToken() bool {
 
 // computeJitter returns a uniform random duration in
 // `[0, JitterBase × ln(N))`. Returns 0 when N ≤ 1.
-func (n *NF5Controller) computeJitter() time.Duration {
+func (n *DirectOriginFallbackController) computeJitter() time.Duration {
 	N := 1
 	if n.opts.ClusterSize != nil {
 		N = n.opts.ClusterSize()
@@ -296,7 +301,7 @@ func (n *NF5Controller) computeJitter() time.Duration {
 }
 
 // decline calls the optional OnDecline hook with the supplied reason.
-func (n *NF5Controller) decline(reason string) {
+func (n *DirectOriginFallbackController) decline(reason string) {
 	if n.opts.OnDecline != nil {
 		n.opts.OnDecline(reason)
 	}

@@ -188,6 +188,23 @@ func New(opts Options) *Resolver {
 	}
 
 	opts.Logger = opts.Logger.With(slog.String("subsystem", "coldstart"))
+
+	if opts.Members == nil {
+		panic("coldstart.New: Members is required")
+	}
+
+	if opts.Discovery == nil {
+		panic("coldstart.New: Discovery is required")
+	}
+
+	if opts.Coord == nil {
+		panic("coldstart.New: Coord is required")
+	}
+
+	if opts.Inflight == nil {
+		panic("coldstart.New: Inflight is required")
+	}
+
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
@@ -516,7 +533,8 @@ func (r *Resolver) probe(ctx context.Context, d digest.Digest, kind ifaces.Origi
 	// Healthy DHT we proceed straight to rule 7 at top-K - expansion
 	// is the degraded-mode safety net, not a prerequisite for
 	// cold-start.
-	if expandLabel == "" && r.opts.Discovery.Health() < 0.7 {
+	health := r.opts.Discovery.Health()
+	if expandLabel == "" && health < 0.7 {
 		return nil, "", errAllNeither
 	}
 

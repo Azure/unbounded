@@ -105,9 +105,6 @@ func (c *Client) FetchFromPeer(ctx context.Context, peerAddr string, ref ifaces.
 	switch resp.StatusCode {
 	case http.StatusOK:
 		size := resp.ContentLength
-		if size < 0 {
-			size = 0
-		}
 
 		return resp.Body, size, nil
 	case http.StatusNotFound:

@@ -26,6 +26,7 @@ package origin
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -328,15 +329,22 @@ func (r *registry) pull(ctx context.Context, ref ifaces.OriginRef) (io.ReadClose
 		}
 
 		if mResp != nil {
+			// Only preserve the original blob 404 if the manifest
+			// attempt also 404'd. Non-404 manifest failures (auth,
+			// rate-limit, outage) should be surfaced directly so the
+			// negative cache classifies correctly.
+			if mResp.StatusCode != http.StatusNotFound {
+				defer func() { _ = mResp.Body.Close() }() //nolint:errcheck // best-effort body close
+
+				return nil, 0, classify(mRef, mResp)
+			}
+
 			_ = mResp.Body.Close() //nolint:errcheck // best-effort body close
 		}
-		// Manifest fallback didn't help; surface the original 404 by
-		// re-issuing it (we already drained the first response body)
-		// so classify sees a faithful response object.
-		resp, err = r.do(ctx, http.MethodGet, path)
-		if err != nil {
-			return nil, 0, &ifaces.OriginError{Ref: ref, Class: ifaces.FailureTransient, Err: err}
-		}
+
+		// Both blob and manifest returned 404 - classify as not-found
+		// without re-issuing the original request.
+		return nil, 0, &ifaces.OriginError{Ref: ref, Class: ifaces.FailureNotFound, Err: fmt.Errorf("origin: %s not found (blob 404, manifest 404)", ref.Digest)}
 	}
 
 	if resp.StatusCode != http.StatusOK {
@@ -399,13 +407,16 @@ func (r *registry) head(ctx context.Context, ref ifaces.OriginRef) (int64, strin
 		}
 
 		if mResp != nil {
+			if mResp.StatusCode != http.StatusNotFound {
+				defer func() { _ = mResp.Body.Close() }() //nolint:errcheck // best-effort body close
+
+				return 0, "", classify(mRef, mResp)
+			}
+
 			_ = mResp.Body.Close() //nolint:errcheck // best-effort body close
 		}
 
-		resp, err = r.do(ctx, http.MethodHead, path)
-		if err != nil {
-			return 0, "", &ifaces.OriginError{Ref: ref, Class: ifaces.FailureTransient, Err: err}
-		}
+		return 0, "", &ifaces.OriginError{Ref: ref, Class: ifaces.FailureNotFound, Err: fmt.Errorf("origin HEAD: %s not found (blob 404, manifest 404)", ref.Digest)}
 	}
 
 	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort body close
@@ -570,7 +581,14 @@ func (r *registry) fetchBearerToken(ctx context.Context, challenge string) (stri
 	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort body close
 
 	if resp.StatusCode != http.StatusOK {
-		return "", 0, fmt.Errorf("token endpoint returned %s", resp.Status)
+		switch resp.StatusCode {
+		case http.StatusUnauthorized, http.StatusForbidden:
+			return "", 0, fmt.Errorf("token endpoint auth failure: %s", resp.Status)
+		case http.StatusTooManyRequests:
+			return "", 0, fmt.Errorf("token endpoint rate limited: %s", resp.Status)
+		default:
+			return "", 0, fmt.Errorf("token endpoint returned %s", resp.Status)
+		}
 	}
 
 	var body struct {
@@ -578,7 +596,7 @@ func (r *registry) fetchBearerToken(ctx context.Context, challenge string) (stri
 		AccessToken string `json:"access_token"`
 		ExpiresIn   int    `json:"expires_in"`
 	}
-	if err := decodeJSON(resp.Body, &body); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		return "", 0, err
 	}
 

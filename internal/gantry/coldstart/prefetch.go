@@ -235,7 +235,16 @@ func (r *Resolver) PrefetchChildren(ctx context.Context, children []ChildDigest,
 		totalPullers++
 	}
 
-	totalDigests := len(children) - skippedSelf - skippedNoTop
+	// Count actual digests dispatched (excluding self-handled, un-routable,
+	// and duplicates removed by the seen map).
+	totalDigests := 0
+	for _, ds := range byGroup {
+		totalDigests += len(ds)
+	}
+
+	for _, ds := range selfByKind {
+		totalDigests += len(ds)
+	}
 
 	r.opts.Logger.Debug("coldstart: prefetch batching",
 		slog.Int("children", len(children)),

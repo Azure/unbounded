@@ -36,7 +36,7 @@ func (s *coldStartExhaustedStub) Resolve(_ context.Context, _ digest.Digest, _ i
 // buildMirrorWithNF5 wires a mirror with a stub cold-start (returning
 // ErrColdStartExhausted) and the supplied direct-origin-fallback controller. If `nf5` is
 // nil, the path is disabled.
-func buildMirrorWithNF5(t *testing.T, originBlobs map[digest.Digest][]byte, cs mirror.ColdStartResolver, nf5 *mirror.NF5Controller) (*httptest.Server, *int32) {
+func buildMirrorWithNF5(t *testing.T, originBlobs map[digest.Digest][]byte, cs mirror.ColdStartResolver, nf5 *mirror.DirectOriginFallbackController) (*httptest.Server, *int32) {
 	t.Helper()
 
 	var originHits int32
@@ -140,7 +140,7 @@ func TestMirror_NF5_AllGatesPassServesFromOrigin(t *testing.T) {
 
 	var fallbacks int32
 
-	nf5 := mirror.NewNF5(mirror.NF5Options{
+	nf5 := mirror.NewDirectOriginFallback(mirror.DirectOriginFallbackOptions{
 		Inflight:      inflight.New(inflight.DefaultStalls(), nil),
 		InBootstrap:   func() bool { return false },
 		HealthyEnough: func() bool { return true },
@@ -186,7 +186,7 @@ func TestMirror_NF5_DeclinesUnderUnhealthyDHT_Returns503(t *testing.T) {
 
 	var fallbacks int32
 
-	nf5 := mirror.NewNF5(mirror.NF5Options{
+	nf5 := mirror.NewDirectOriginFallback(mirror.DirectOriginFallbackOptions{
 		Inflight:      inflight.New(inflight.DefaultStalls(), nil),
 		InBootstrap:   func() bool { return false },
 		HealthyEnough: func() bool { return false }, // gate trips
@@ -224,7 +224,7 @@ func TestMirror_NF5_BootstrapWindowSuppresses_Returns503(t *testing.T) {
 	d := digestOf(body)
 	cs := &coldStartExhaustedStub{}
 
-	nf5 := mirror.NewNF5(mirror.NF5Options{
+	nf5 := mirror.NewDirectOriginFallback(mirror.DirectOriginFallbackOptions{
 		Inflight:      inflight.New(inflight.DefaultStalls(), nil),
 		InBootstrap:   func() bool { return true }, // gate trips
 		HealthyEnough: func() bool { return true },
@@ -259,7 +259,7 @@ func TestMirror_NF5_RecheckHitAbortsAfterJitter(t *testing.T) {
 	d := digestOf(body)
 	cs := &coldStartExhaustedStub{}
 
-	nf5 := mirror.NewNF5(mirror.NF5Options{
+	nf5 := mirror.NewDirectOriginFallback(mirror.DirectOriginFallbackOptions{
 		Inflight:      inflight.New(inflight.DefaultStalls(), nil),
 		InBootstrap:   func() bool { return false },
 		HealthyEnough: func() bool { return true },

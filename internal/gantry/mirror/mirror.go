@@ -72,7 +72,7 @@ type Server struct {
 	// after the cold-start cascade reports ErrColdStartExhausted (and
 	// the direct-origin-fallback gating sequence passes). When nil, cold-start exhaustion
 	// always returns 5xx.
-	nf5 *NF5Controller
+	nf5 *DirectOriginFallbackController
 
 	// Speculative layer prefetcher (the design doc detailed-design L332 / architecture
 	// L180). When set, every successful manifest serve fires a
@@ -522,7 +522,7 @@ func WithColdStart(c ColdStartResolver) Option {
 // mirror runs the direct-origin-fallback gating sequence (jitter, token bucket, dedup,
 // re-check) before falling through to a direct origin pull. When nil,
 // cold-start exhaustion always returns 5xx.
-func WithNF5(c *NF5Controller) Option {
+func WithNF5(c *DirectOriginFallbackController) Option {
 	return func(s *Server) { s.nf5 = c }
 }
 
@@ -1310,7 +1310,8 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 			return peerFallbackUnused
 		}
 
-		providers = csProviders
+		filtered, _ := s.filterProvidersForDigest(d, csProviders)
+		providers = filtered
 	}
 
 	tried := 0
@@ -1349,7 +1350,9 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 			return csResult
 		}
 
-		for _, p := range csProviders {
+		filteredCS, _ := s.filterProvidersForDigest(d, csProviders)
+
+		for _, p := range filteredCS {
 			if tried >= maxAttempts*2 {
 				break
 			}
