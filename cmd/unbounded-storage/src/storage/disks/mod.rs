@@ -68,8 +68,9 @@ pub trait DiskTarget: Send + Sync + 'static {
 /// in an error crate.
 #[derive(Debug)]
 pub enum DiskError {
-    /// The underlying [`UringBlockDevice::open`] call or engine open
-    /// failed.
+    /// The underlying
+    /// [`UringDevice::open`](crate::storage::blockdev::UringDevice::open) call
+    /// or engine open failed.
     Open(String),
 }
 

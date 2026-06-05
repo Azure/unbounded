@@ -168,18 +168,10 @@ impl Future for LeaseWait {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::noop_waker;
     use crate::storage::types::{Checksum, Lba};
     use std::future::Future;
     use std::pin::pin;
-    use std::task::{RawWaker, RawWakerVTable, Waker};
-
-    fn noop_waker() -> Waker {
-        fn raw() -> RawWaker {
-            RawWaker::new(std::ptr::null(), &VTABLE)
-        }
-        static VTABLE: RawWakerVTable = RawWakerVTable::new(|_| raw(), |_| {}, |_| {}, |_| {});
-        unsafe { Waker::from_raw(raw()) }
-    }
 
     fn key(i: u32) -> PageKey {
         PageKey::new([0u8; 32], i)

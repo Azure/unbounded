@@ -11,26 +11,18 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::{Pin, pin};
 use std::rc::Rc;
-use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use std::task::{Context, Poll};
 
 use crate::bufferpool::{
     BlockStore, BufferPool, BulkRef, Error, PageRef, PageStream, Pool, PoolConfig, Req, StripeKey,
     Transport,
 };
 use crate::memory::Backing;
+use crate::runtime::noop_waker;
 
 // ---------------------------------------------------------------------------
 // Tiny single-thread executor.
 // ---------------------------------------------------------------------------
-
-fn noop_waker() -> Waker {
-    fn raw() -> RawWaker {
-        RawWaker::new(std::ptr::null(), &VTABLE)
-    }
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(|_| raw(), |_| {}, |_| {}, |_| {});
-    // SAFETY: the vtable functions never dereference the data pointer.
-    unsafe { Waker::from_raw(raw()) }
-}
 
 fn block_on<F: Future>(future: F) -> F::Output {
     let waker = noop_waker();

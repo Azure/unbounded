@@ -14,6 +14,7 @@ mod window;
 #[cfg(test)]
 mod tests;
 
+pub use free_list::RecvQuarantineHandle;
 pub use group::{PoolGroup, ShardDescriptor, ShardRouter};
 pub use null::NullBlockStore;
 pub use pool::Pool;

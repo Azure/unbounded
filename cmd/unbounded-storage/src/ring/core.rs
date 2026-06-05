@@ -58,6 +58,26 @@ pub(crate) struct RingSetup {
     pub defer_taskrun: bool,
 }
 
+/// Sink that defers reuse of a fixed-buffer RECV's destination page
+/// until the kernel is provably done writing into it.
+///
+/// When a fixed-buffer RECV is cancelled on early drop, the kernel may
+/// still complete the RECV into the destination page after the dropping
+/// task returns. Returning that page to a free list immediately is
+/// therefore unsound. Instead the ring calls [`RecvQuarantine::quarantine`]
+/// on drop to withhold the page, and [`RecvQuarantine::reclaim`] once the
+/// RECV's CQE is reaped in [`RingCore::progress`], at which point the
+/// kernel no longer owns the page and it may be reused. Both are keyed
+/// by the destination's byte offset into the registered backing.
+///
+/// Rings whose RECV destinations are not pool-managed leave no sink
+/// installed; their drop path falls back to the blocking-but-sound
+/// [`RingCore::cancel_and_drain`].
+pub(crate) trait RecvQuarantine {
+    fn quarantine(&self, page_byte_offset: usize);
+    fn reclaim(&self, page_byte_offset: usize);
+}
+
 /// One io_uring ring plus the shared slot / buffer / back-pressure
 /// machinery every facade in this module is built on. Pinned to the
 /// thread that constructed it.
@@ -89,6 +109,15 @@ pub(crate) struct RingCore {
     more_completions: Cell<u64>,
     setup: RingSetup,
     queue_depth: u32,
+    /// Optional sink that withholds a cancelled fixed-buffer RECV's
+    /// destination page until its CQE is reaped (see [`RecvQuarantine`]).
+    /// `None` on rings whose RECV destinations are not pool-managed; such
+    /// rings fall back to the blocking [`Self::cancel_and_drain`].
+    recv_quarantine: RefCell<Option<Rc<dyn RecvQuarantine>>>,
+    /// Maps the `user_data` of a cancelled, quarantined fixed-buffer
+    /// RECV to its destination byte offset, so [`Self::progress`] can
+    /// `reclaim` the page when the RECV's CQE is finally reaped.
+    pending_recv_cancel: RefCell<HashMap<u64, usize>>,
     _no_send: PhantomData<*const ()>,
 }
 
@@ -213,6 +242,8 @@ impl RingCore {
             more_completions: Cell::new(0),
             setup,
             queue_depth,
+            recv_quarantine: RefCell::new(None),
+            pending_recv_cancel: RefCell::new(HashMap::new()),
             _no_send: PhantomData,
         })
     }
@@ -384,6 +415,7 @@ impl RingCore {
         }
 
         let mut to_wake: Vec<Waker> = Vec::new();
+        let mut to_reclaim: Vec<usize> = Vec::new();
         let mut drained = 0u32;
         {
             let mut ring = self.ring.borrow_mut();
@@ -420,6 +452,9 @@ impl RingCore {
                 }
                 slot.notified.set(true);
                 self.slots.borrow_mut().remove(&ud);
+                if let Some(off) = self.pending_recv_cancel.borrow_mut().remove(&ud) {
+                    to_reclaim.push(off);
+                }
                 let n = self.submitted.get();
                 self.submitted.set(n.saturating_sub(1));
                 if let Some(w) = slot.waker.borrow_mut().take() {
@@ -433,6 +468,17 @@ impl RingCore {
 
         for w in to_wake {
             w.wake();
+        }
+        // Release any quarantined pages whose RECV CQE was just reaped.
+        // Done after the ring borrow is dropped: `reclaim` touches the
+        // bufferpool free list, never the ring, so this cannot reenter
+        // the borrow above, but deferring past it is defensive.
+        if !to_reclaim.is_empty() {
+            if let Some(q) = self.recv_quarantine.borrow().clone() {
+                for off in to_reclaim {
+                    q.reclaim(off);
+                }
+            }
         }
         Ok(submitted_n > 0 || drained > 0)
     }
@@ -524,6 +570,45 @@ impl RingCore {
         }
     }
 
+    /// Install the sink used to defer reuse of a cancelled fixed-buffer
+    /// RECV's destination page until its CQE is reaped. Without it,
+    /// [`Self::cancel_fixed_recv`] falls back to the blocking-but-sound
+    /// [`Self::cancel_and_drain`].
+    pub(crate) fn set_recv_quarantine(&self, q: Rc<dyn RecvQuarantine>) {
+        *self.recv_quarantine.borrow_mut() = Some(q);
+    }
+
+    /// Cancel a fixed-buffer RECV on early drop.
+    ///
+    /// If a [`RecvQuarantine`] sink is installed, this is non-blocking:
+    /// the destination page is handed to the sink (which withholds it
+    /// from reuse), the op is recorded so [`Self::progress`] reclaims the
+    /// page once its CQE is reaped, and a best-effort cancel is issued.
+    /// The dropping task never blocks, yet the page is provably not
+    /// reused while the kernel may still write into it.
+    ///
+    /// With no sink installed, falls back to the blocking-but-sound
+    /// [`Self::cancel_and_drain`], which drains the op to completion
+    /// before returning.
+    pub(crate) fn cancel_fixed_recv(
+        &self,
+        target_user_data: u64,
+        page_byte_offset: usize,
+        slot: &Slot,
+    ) {
+        let q = self.recv_quarantine.borrow().clone();
+        match q {
+            Some(q) => {
+                self.pending_recv_cancel
+                    .borrow_mut()
+                    .insert(target_user_data, page_byte_offset);
+                q.quarantine(page_byte_offset);
+                self.cancel(target_user_data);
+            }
+            None => self.cancel_and_drain(target_user_data, slot),
+        }
+    }
+
     /// Number of live (submitted, not yet reaped) ops. Used by tests to
     /// assert the back-pressure bound.
     pub(crate) fn in_flight(&self) -> u32 {
@@ -547,6 +632,25 @@ impl RingCore {
     /// Used by tests to assert the two-CQE path executed.
     pub(crate) fn more_completions(&self) -> u64 {
         self.more_completions.get()
+    }
+}
+
+/// io_uring admits via the [`SubmitSlot`] park: when `submitted ==
+/// queue_depth` a submitter yields `Pending` until a completion frees a
+/// slot, so the policy is [`BackPressurePolicy::Parking`]. This impl is
+/// purely the shared introspection surface; the actual parking still
+/// lives in [`SubmitSlot`].
+impl crate::io::BackPressure for RingCore {
+    fn capacity(&self) -> usize {
+        self.queue_depth as usize
+    }
+
+    fn in_flight(&self) -> usize {
+        self.submitted.get() as usize
+    }
+
+    fn policy(&self) -> crate::io::BackPressurePolicy {
+        crate::io::BackPressurePolicy::Parking
     }
 }
 
@@ -707,5 +811,46 @@ mod tests {
         assert_eq!(check_res(5).unwrap(), 5);
         let e = check_res(-libc::EIO).unwrap_err();
         assert_eq!(e.raw_os_error(), Some(libc::EIO));
+    }
+
+    /// Registering two distinct regions hands back sequential buffer
+    /// indices, and each region resolves back to its own index. This is
+    /// the success-path registration coverage the standalone io_uring
+    /// block device carried before its engine was consolidated onto
+    /// [`RingCore`].
+    #[test]
+    fn register_buffer_assigns_distinct_indices_and_resolves() {
+        const PAGE: usize = 4096;
+        // Back the regions before the core so they outlive the ring's
+        // registered table, which Drop unregisters.
+        let mut buf_a = vec![0u8; PAGE];
+        let mut buf_b = vec![0u8; PAGE];
+        let base_a = buf_a.as_mut_ptr();
+        let base_b = buf_b.as_mut_ptr();
+
+        let core = RingCore::new(8, RingSetup::default()).expect("core");
+
+        assert_eq!(core.register_buffer(base_a, PAGE).expect("register a"), 0);
+        assert_eq!(core.register_buffer(base_b, PAGE).expect("register b"), 1);
+
+        // Each registered region resolves back to the index it was
+        // handed, proving the sparse table stays parallel to the
+        // kernel-side registration.
+        assert_eq!(core.resolve_buf_index(base_a, PAGE).expect("resolve a"), 0);
+        assert_eq!(core.resolve_buf_index(base_b, PAGE).expect("resolve b"), 1);
+    }
+
+    /// The ring reports itself through the shared [`crate::io::BackPressure`]
+    /// surface as a parking backend bounded by its queue depth.
+    #[test]
+    fn backpressure_surface_reports_parking_policy() {
+        use crate::io::{BackPressure, BackPressurePolicy};
+
+        let core = RingCore::new(8, RingSetup::default()).expect("core");
+        assert_eq!(core.capacity(), 8);
+        assert_eq!(core.in_flight(), 0);
+        assert_eq!(core.available(), 8);
+        assert!(core.admits());
+        assert_eq!(core.policy(), BackPressurePolicy::Parking);
     }
 }

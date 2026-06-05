@@ -19,9 +19,10 @@
 //! underlying [`RefCell`] is sufficient; no atomics are required.
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
 pub(super) struct FreeList {
@@ -35,7 +36,23 @@ struct Inner {
     /// Pages handed off to a specific waiter, awaiting its next poll.
     /// Reserved here so speculation cannot reclaim them.
     granted: Vec<(u64, u32)>,
+    /// Pages withheld from reuse because a fixed-buffer RECV writing
+    /// into them was cancelled while still in flight. A quarantined
+    /// page returns to circulation only once BOTH the kernel has
+    /// finished with it (`kernel_done`, set when its RECV CQE is reaped)
+    /// AND the owner has handed it back (`owner_released`, set by the
+    /// normal [`FreeList::release`]). Until then it appears neither in
+    /// `free` nor `granted`, so no allocation can hand the page out
+    /// while the kernel may still write into it. This makes cancelling
+    /// a fixed RECV sound without blocking the dropping task.
+    quarantined: HashMap<u32, QState>,
     next_id: u64,
+}
+
+#[derive(Default)]
+struct QState {
+    kernel_done: bool,
+    owner_released: bool,
 }
 
 struct Waiter {
@@ -72,6 +89,7 @@ impl FreeList {
                 free,
                 waiters: VecDeque::new(),
                 granted: Vec::new(),
+                quarantined: HashMap::new(),
                 next_id: 0,
             }),
         }
@@ -126,8 +144,78 @@ impl FreeList {
 
     /// Return `page_idx` to the pool, handing it directly to the
     /// oldest waiter if one is parked.
+    ///
+    /// If the page is in recv-quarantine (its destination was withheld
+    /// by [`FreeList::quarantine_recv`] because an in-flight RECV into
+    /// it was cancelled), this only marks the owner side done. The page
+    /// is handed back to circulation here only if the kernel has also
+    /// already finished with it; otherwise it stays withheld until
+    /// [`FreeList::reclaim_recv`] observes the RECV CQE.
     pub fn release(&self, page_idx: u32) {
-        let waker = self.inner.borrow_mut().hand_off(page_idx);
+        let waker = {
+            let mut g = self.inner.borrow_mut();
+            // `Some(kernel_done)` if quarantined, `None` if not.
+            let quarantined = match g.quarantined.get_mut(&page_idx) {
+                Some(st) => {
+                    st.owner_released = true;
+                    Some(st.kernel_done)
+                }
+                None => None,
+            };
+            match quarantined {
+                None => g.hand_off(page_idx),
+                Some(false) => None,
+                Some(true) => {
+                    g.quarantined.remove(&page_idx);
+                    g.hand_off(page_idx)
+                }
+            }
+        };
+        if let Some(w) = waker {
+            w.wake();
+        }
+    }
+
+    /// Withhold `page_idx` from reuse until its in-flight fixed-buffer
+    /// RECV CQE is reaped. Called when such a RECV is cancelled on early
+    /// drop while still owning `page_idx`: the kernel may still complete
+    /// the RECV into the page after the dropping task returns, so the
+    /// page must not be reused yet. Pairs with [`FreeList::reclaim_recv`]
+    /// (kernel side) and the owner's [`FreeList::release`]; the page
+    /// returns to circulation only once both have fired.
+    pub fn quarantine_recv(&self, page_idx: u32) {
+        let mut g = self.inner.borrow_mut();
+        let st = g.quarantined.entry(page_idx).or_default();
+        debug_assert!(
+            !st.kernel_done && !st.owner_released,
+            "page {page_idx} quarantined while already in quarantine",
+        );
+    }
+
+    /// Mark the kernel finished with a quarantined `page_idx` (its RECV
+    /// CQE has been reaped). If the owner has already released the page
+    /// it returns to circulation now (handed to the oldest waiter if one
+    /// is parked); otherwise it waits for the owner's
+    /// [`FreeList::release`]. A no-op if the page is not quarantined.
+    pub fn reclaim_recv(&self, page_idx: u32) {
+        let waker = {
+            let mut g = self.inner.borrow_mut();
+            // `Some(owner_released)` if quarantined, `None` if not.
+            let owner_released = match g.quarantined.get_mut(&page_idx) {
+                Some(st) => {
+                    st.kernel_done = true;
+                    Some(st.owner_released)
+                }
+                None => None,
+            };
+            match owner_released {
+                Some(true) => {
+                    g.quarantined.remove(&page_idx);
+                    g.hand_off(page_idx)
+                }
+                _ => None,
+            }
+        };
         if let Some(w) = waker {
             w.wake();
         }
@@ -136,6 +224,40 @@ impl FreeList {
     #[allow(dead_code)]
     pub fn available(&self) -> usize {
         self.inner.borrow().free.len()
+    }
+}
+
+/// Public, non-generic handle to a shard pool's free list, exposing
+/// only the recv-quarantine operations keyed by byte offset into the
+/// registered backing.
+///
+/// It is handed to the ring layer (via a backend adapter implementing
+/// `ring::RecvQuarantine`) so a cancelled fixed-buffer RECV can withhold
+/// its destination page until the kernel is done with it, without the
+/// ring needing to know the pool's generic parameters or page geometry.
+#[derive(Clone)]
+pub struct RecvQuarantineHandle {
+    free: Rc<FreeList>,
+    page_size: usize,
+}
+
+impl RecvQuarantineHandle {
+    pub(super) fn new(free: Rc<FreeList>, page_size: usize) -> Self {
+        Self { free, page_size }
+    }
+
+    /// Withhold the page containing `page_byte_offset` from reuse until
+    /// its RECV CQE is reaped. See [`FreeList::quarantine_recv`].
+    pub fn quarantine(&self, page_byte_offset: usize) {
+        self.free
+            .quarantine_recv((page_byte_offset / self.page_size) as u32);
+    }
+
+    /// Mark the kernel finished with the page containing
+    /// `page_byte_offset`. See [`FreeList::reclaim_recv`].
+    pub fn reclaim(&self, page_byte_offset: usize) {
+        self.free
+            .reclaim_recv((page_byte_offset / self.page_size) as u32);
     }
 }
 

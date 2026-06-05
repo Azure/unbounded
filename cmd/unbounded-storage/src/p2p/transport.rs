@@ -150,7 +150,7 @@ mod tests {
     use std::collections::HashMap;
     use std::pin::Pin;
     use std::sync::Arc;
-    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    use std::task::{Context, Poll};
 
     use crate::backend::Backend;
     use crate::bufferpool::{BulkRef, Error, PageRef, PageStream, Req, StripeKey};
@@ -159,6 +159,7 @@ mod tests {
         FingerTable, FingerTableConfig, NodeId, PeerEntry, RingId, TopologyLabels, node_to_ring,
         stripe_to_ring,
     };
+    use crate::runtime::noop_waker;
     use serde::{Deserialize, Serialize};
 
     use super::RoutedStream;
@@ -228,15 +229,6 @@ mod tests {
 
     fn node_to_peer_map(nodes: &[u64]) -> Arc<HashMap<NodeId, PeerId>> {
         Arc::new(nodes.iter().map(|&n| (NodeId(n), PeerId(n))).collect())
-    }
-
-    fn noop_waker() -> Waker {
-        fn raw() -> RawWaker {
-            RawWaker::new(std::ptr::null(), &VTABLE)
-        }
-        static VTABLE: RawWakerVTable = RawWakerVTable::new(|_| raw(), |_| {}, |_| {}, |_| {});
-        // SAFETY: VTABLE clone/wake/drop are all no-ops on static data.
-        unsafe { Waker::from_raw(raw()) }
     }
 
     /// Build a `RoutedTransport` whose `FabricTransport` is never

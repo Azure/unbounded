@@ -35,7 +35,7 @@ use std::task::{Context, Poll};
 
 use io_uring::{opcode, types};
 
-use super::core::{OpFut, OpResource, RingCore, RingSetup, Slot, check_res};
+use super::core::{OpFut, OpResource, RecvQuarantine, RingCore, RingSetup, Slot, check_res};
 
 /// Thin owned wrapper around a `libc::sockaddr` plus its length, so
 /// `connect` can hand a stable pointer to the kernel for the op's
@@ -160,6 +160,15 @@ impl NetworkRing {
         let idx = self.core.register_buffer(base, len)?;
         debug_assert_eq!(idx, 0, "region must be the first registered buffer");
         Ok(())
+    }
+
+    /// Install the sink that defers reuse of a cancelled fixed-buffer
+    /// RECV's destination page until its CQE is reaped (see
+    /// [`RecvQuarantine`]). Install it before any `recv_fixed` is issued
+    /// so every cancelled RECV is covered. Without it, the drop path
+    /// falls back to the blocking [`RingCore::cancel_and_drain`].
+    pub(crate) fn set_recv_quarantine(&self, q: Rc<dyn RecvQuarantine>) {
+        self.core.set_recv_quarantine(q);
     }
 
     /// Push queued SQEs and drain available CQEs. Returns `true` if any
@@ -526,14 +535,16 @@ impl NetHandle {
                 // SAFETY: `ptr` points inside the registered backing; the
                 // caller holds the destination page until this future
                 // resolves (the RECV completion CQE). If the future is
-                // dropped early, `OwnedNetFut::draining` drains the RECV
-                // to completion before returning, so the kernel never
-                // writes into the page after the caller reuses it.
+                // dropped early, `OwnedNetFut::fixed_recv` either hands
+                // the destination page to the ring's recv-quarantine sink
+                // (held until the RECV CQE is reaped) or, with no sink
+                // installed, drains the RECV to completion, so the kernel
+                // never writes into the page after the caller reuses it.
                 let slot = r.core.submit_now(sqe, false, OpResource::None)?;
                 (ud, slot)
             };
             let res = OwnedNetFut::new(Rc::clone(&ring), ud, slot)
-                .draining()
+                .fixed_recv(page_byte_offset)
                 .await;
             check_res(res).map(|n| n as usize)
         }
@@ -549,12 +560,14 @@ struct OwnedNetFut {
     ring: Rc<RefCell<NetworkRing>>,
     user_data: u64,
     slot: Rc<Slot>,
-    /// When set, dropping before completion blocks until the op's CQE is
-    /// reaped (see [`RingCore::cancel_and_drain`]) instead of issuing a
-    /// best-effort cancel. Required for ops that write into caller-owned
-    /// memory the caller may reuse the instant this future drops (the
-    /// fixed-buffer RECV path).
-    drain_on_drop: bool,
+    /// When `Some(offset)`, this future is a fixed-buffer RECV whose
+    /// destination begins at byte `offset` in the registered backing.
+    /// Dropping it before completion routes through
+    /// [`RingCore::cancel_fixed_recv`], which quarantines that page
+    /// (non-blocking) or drains the op (blocking fallback) so the kernel
+    /// never writes into a page the caller may reuse. `None` for ops
+    /// whose memory the ring owns, where a best-effort cancel suffices.
+    fixed_recv_offset: Option<usize>,
 }
 
 impl OwnedNetFut {
@@ -563,14 +576,15 @@ impl OwnedNetFut {
             ring,
             user_data,
             slot,
-            drain_on_drop: false,
+            fixed_recv_offset: None,
         }
     }
 
-    /// Mark this future so that dropping it before completion drains the
-    /// in-flight op to completion rather than best-effort cancelling it.
-    fn draining(mut self) -> Self {
-        self.drain_on_drop = true;
+    /// Mark this future as a fixed-buffer RECV writing into the backing
+    /// at byte `page_byte_offset`, so dropping it before completion
+    /// makes that destination page safe to reuse (see the field docs).
+    fn fixed_recv(mut self, page_byte_offset: usize) -> Self {
+        self.fixed_recv_offset = Some(page_byte_offset);
         self
     }
 }
@@ -595,10 +609,11 @@ impl Drop for OwnedNetFut {
     fn drop(&mut self) {
         if !self.slot.is_done() {
             if let Ok(ring) = self.ring.try_borrow() {
-                if self.drain_on_drop {
-                    ring.core.cancel_and_drain(self.user_data, &self.slot);
-                } else {
-                    ring.core.cancel(self.user_data);
+                match self.fixed_recv_offset {
+                    Some(off) => {
+                        ring.core.cancel_fixed_recv(self.user_data, off, &self.slot);
+                    }
+                    None => ring.core.cancel(self.user_data),
                 }
             }
         }
@@ -609,18 +624,10 @@ impl Drop for OwnedNetFut {
 mod tests {
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::Arc;
-    use std::task::{Context, Poll, Wake, Waker};
+    use std::task::{Context, Poll};
 
     use super::*;
-
-    struct NoopWake;
-    impl Wake for NoopWake {
-        fn wake(self: Arc<Self>) {}
-    }
-    fn noop_waker() -> Waker {
-        Arc::new(NoopWake).into()
-    }
+    use crate::runtime::noop_waker;
 
     fn block_on<F: Future>(ring: &NetworkRing, mut fut: Pin<&mut F>) -> F::Output {
         let waker = noop_waker();
@@ -1031,6 +1038,121 @@ mod tests {
             ring.borrow().core.in_flight(),
             0,
             "dropping a draining recv_fixed must reap the in-flight op",
+        );
+
+        unsafe {
+            libc::close(a);
+            libc::close(b);
+        }
+    }
+
+    /// With a quarantine sink installed, dropping a parked fixed RECV
+    /// must NOT block to drain the op: the destination page is handed to
+    /// the sink (quarantined) and only reclaimed once the cancelled
+    /// RECV's CQE is later reaped by `progress()`. This is the Phase 5
+    /// soundness guarantee: the page is withheld from reuse for the whole
+    /// window the kernel might still write to it, without a blocking drop.
+    #[test]
+    fn drop_in_flight_recv_fixed_quarantines_until_reaped() {
+        #[derive(Clone)]
+        struct TestQ {
+            events: Rc<RefCell<Vec<(&'static str, usize)>>>,
+        }
+        impl RecvQuarantine for TestQ {
+            fn quarantine(&self, page_byte_offset: usize) {
+                self.events
+                    .borrow_mut()
+                    .push(("quarantine", page_byte_offset));
+            }
+
+            fn reclaim(&self, page_byte_offset: usize) {
+                self.events.borrow_mut().push(("reclaim", page_byte_offset));
+            }
+        }
+
+        let ring = match NetworkRing::new(16) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("quarantine_until_reaped: ring unavailable: {e}; skipping");
+                return;
+            }
+        };
+
+        const PAGE: usize = 4096;
+        let mut store = vec![0u8; PAGE * 2];
+        let backing = crate::memory::Backing {
+            base: store.as_mut_ptr(),
+            page_size: PAGE,
+            page_count: 2,
+            _own: Box::new(()),
+        };
+        if let Err(e) = ring.register_backing(&backing) {
+            eprintln!("quarantine_until_reaped: register_backing failed: {e}; skipping");
+            return;
+        }
+
+        let events = Rc::new(RefCell::new(Vec::new()));
+        ring.set_recv_quarantine(Rc::new(TestQ {
+            events: Rc::clone(&events),
+        }));
+
+        let ring = Rc::new(RefCell::new(ring));
+        let handle = NetHandle::new(Rc::clone(&ring));
+
+        let Some((a, b)) = tcp_loopback_pair() else {
+            eprintln!("quarantine_until_reaped: tcp loopback pair failed; skipping");
+            return;
+        };
+
+        // No bytes written to `a`, so the RECV on `b` parks in the kernel.
+        // The destination is page 1 (byte offset PAGE).
+        let fut = handle.recv_fixed(b, 0, PAGE, PAGE);
+        let mut fut = Box::pin(fut);
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(_) => {
+                unsafe {
+                    libc::close(a);
+                    libc::close(b);
+                }
+                return;
+            }
+            Poll::Pending => {}
+        }
+        assert_eq!(
+            ring.borrow().core.in_flight(),
+            1,
+            "the RECV should be outstanding after the first poll",
+        );
+
+        // Dropping with a sink installed must be non-blocking: the op is
+        // still in flight (not drained) and the page is quarantined, not
+        // yet reclaimed.
+        drop(fut);
+        assert_eq!(
+            ring.borrow().core.in_flight(),
+            1,
+            "dropping a quarantined recv_fixed must not block to drain",
+        );
+        assert_eq!(
+            events.borrow().as_slice(),
+            &[("quarantine", PAGE)],
+            "the destination page must be quarantined on drop, not reclaimed",
+        );
+
+        // Pump progress() until the cancelled RECV's CQE is reaped. Only
+        // then is the page reclaimed back to the free list.
+        let mut spins = 0u32;
+        while ring.borrow().core.in_flight() != 0 {
+            ring.borrow().progress();
+            spins += 1;
+            assert!(spins < 5_000_000, "cancelled RECV was never reaped");
+        }
+        assert_eq!(
+            events.borrow().as_slice(),
+            &[("quarantine", PAGE), ("reclaim", PAGE)],
+            "the page must be reclaimed only after its RECV CQE is reaped",
         );
 
         unsafe {

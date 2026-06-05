@@ -51,13 +51,13 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use std::task::{Context, Poll};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::config::schema::{DiskKind, DiskSpec};
 use crate::ring::{StorageRingConfig, clear_current_storage_ring, set_current_storage_ring};
-use crate::runtime::{PinnedRuntime, WorkerSpec};
+use crate::runtime::{PinnedRuntime, WorkerSpec, noop_waker};
 use crate::storage::blockdev::{
     BlockDevice, CoreLocalDevice, OpenDisk, UringDevice, provision_file,
 };
@@ -205,7 +205,7 @@ fn run_storage_core(
         // Held for the storage core's lifetime: the ring addresses this
         // fd by its registered Fixed index, so it must outlive the ring.
         file: _disk_file,
-    } = match UringDevice::open(&path, ring_cfg, page_size) {
+    } = match UringDevice::open(&path, ring_cfg, ring_cfg.iopoll, page_size) {
         Ok(d) => d,
         Err(e) => {
             let _ = ready_tx.send(Err(e.to_string()));
@@ -420,16 +420,6 @@ fn engine_config_from(spec: &DiskSpec) -> EngineConfig {
 /// size `page_size_bytes`.
 fn device_page_size(cfg: &EngineConfig) -> usize {
     cfg.btree_page_bytes
-}
-
-/// Build a noop [`Waker`] for the storage-core poll loop, which makes
-/// forward progress by re-polling rather than by wakeups.
-fn noop_waker() -> Waker {
-    fn raw() -> RawWaker {
-        RawWaker::new(std::ptr::null(), &VTABLE)
-    }
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(|_| raw(), |_| {}, |_| {}, |_| {});
-    unsafe { Waker::from_raw(raw()) }
 }
 
 #[cfg(test)]

@@ -816,8 +816,8 @@ fn remove_recv_context(ctxs: &mut Vec<*mut std::ffi::c_void>, completed: usize) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::noop_waker;
     use serde::ser::Serializer;
-    use std::task::{RawWaker, RawWakerVTable};
 
     struct NoRoute;
 
@@ -936,16 +936,6 @@ mod tests {
                 payload: Vec::new(),
             }),
         });
-    }
-
-    fn noop_waker() -> std::task::Waker {
-        fn no(_: *const ()) {}
-        fn clone(_: *const ()) -> RawWaker {
-            RawWaker::new(ptr::null(), &VT)
-        }
-        static VT: RawWakerVTable = RawWakerVTable::new(clone, no, no, no);
-        // SAFETY: vtable never dereferences the data pointer.
-        unsafe { std::task::Waker::from_raw(RawWaker::new(ptr::null(), &VT)) }
     }
 
     fn poll_once<R>(

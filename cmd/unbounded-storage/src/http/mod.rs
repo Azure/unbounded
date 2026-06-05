@@ -35,7 +35,7 @@ pub use response::{ResponseHead, serialize_response_head};
 
 /// Cross-platform, storage-policy-free server plumbing reused by the
 /// HTTP serving frontends.
-pub(crate) use server::{MAX_HEADER_BYTES, RECV_CHUNK, noop_waker, split_query};
+pub(crate) use server::{MAX_HEADER_BYTES, RECV_CHUNK, split_query};
 
 /// Linux-only server plumbing that depends on `libc` and the io_uring
 /// [`NetHandle`](crate::ring::NetHandle).

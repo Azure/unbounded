@@ -7,6 +7,7 @@ pub mod config;
 pub mod fabric;
 pub mod frontend;
 pub mod http;
+pub mod io;
 pub mod memory;
 pub mod p2p;
 pub mod ring;

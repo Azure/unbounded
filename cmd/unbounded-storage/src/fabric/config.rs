@@ -46,7 +46,15 @@ pub struct FabricConfig {
     /// `max_inflight` so write and ack completions always have registry
     /// slots.
     pub rpc_posted_recvs: usize,
+    /// Number of long-lived worker threads the RPC server spawns to
+    /// serve inbound requests. Each request is enqueued by the progress
+    /// thread and picked up by one of these workers; the pool size
+    /// bounds concurrent server-side request handling (and thus the
+    /// thread count) regardless of arrival rate. Must be `>= 1`.
+    pub rpc_worker_threads: usize,
     pub progress_threads: u8,
+    /// Microseconds the progress thread sleeps when the CQ is empty,
+    /// to bound idle CPU. Default is 10.
     pub progress_poll_us: u32,
     pub runtime: Arc<dyn Threading>,
     pub worker_idx: WorkerIdx,
@@ -63,6 +71,9 @@ impl FabricConfig {
         }
         if self.rpc_posted_recvs == 0 {
             return Err(FabricError::BadConfig("rpc_posted_recvs must be >= 1"));
+        }
+        if self.rpc_worker_threads == 0 {
+            return Err(FabricError::BadConfig("rpc_worker_threads must be >= 1"));
         }
         if self.listen && self.listen_addr.is_none() {
             return Err(FabricError::BadConfig(
@@ -87,6 +98,7 @@ pub fn defaults_for(
         listen_addr: None,
         max_inflight: 4096,
         rpc_posted_recvs: 256,
+        rpc_worker_threads: 4,
         progress_threads: 2,
         progress_poll_us: 10,
         runtime,
@@ -159,6 +171,16 @@ mod tests {
     fn validate_rejects_zero_rpc_posted_recvs() {
         let mut c = defaults_for("eth0", rt(), WorkerIdx(0));
         c.rpc_posted_recvs = 0;
+        match c.validate() {
+            Err(FabricError::BadConfig(_)) => {}
+            other => panic!("expected BadConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_zero_rpc_worker_threads() {
+        let mut c = defaults_for("eth0", rt(), WorkerIdx(0));
+        c.rpc_worker_threads = 0;
         match c.validate() {
             Err(FabricError::BadConfig(_)) => {}
             other => panic!("expected BadConfig, got {other:?}"),

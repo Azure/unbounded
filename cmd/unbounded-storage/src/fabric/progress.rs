@@ -6,6 +6,9 @@
 //! resolves the `CompletionSlot` Box that libfabric handed back as
 //! the op_context. Shutdown is cooperative: the owning [`ProgressThread`]
 //! holds an `AtomicBool` flag that the loop checks each iteration.
+//!
+//! When the CQ is empty the thread sleeps for
+//! `FabricConfig::progress_poll_us` microseconds to bound idle CPU.
 
 use std::ffi::c_void;
 use std::mem::MaybeUninit;
@@ -113,6 +116,7 @@ fn progress_loop(cq: CqPtr, shutdown: Arc<AtomicBool>, errors: Arc<AtomicU64>, p
     let mut srcs: [ffi::fi_addr_t; CQ_BATCH] = [ffi::FI_ADDR_UNSPEC; CQ_BATCH];
     let eagain = unsafe { ffi::ub_fi_eagain() } as isize;
     let eavail = unsafe { ffi::ub_fi_eavail() } as isize;
+    let idle = Duration::from_micros(poll_us as u64);
 
     while !shutdown.load(Ordering::Acquire) {
         // SAFETY: cq is valid for the lifetime of this thread;
@@ -142,13 +146,13 @@ fn progress_loop(cq: CqPtr, shutdown: Arc<AtomicBool>, errors: Arc<AtomicU64>, p
 
         if n == 0 {
             // No completions; brief sleep to bound CPU.
-            std::thread::sleep(Duration::from_micros(poll_us as u64));
+            std::thread::sleep(idle);
             continue;
         }
 
         // n < 0
         if n == -eagain {
-            std::thread::sleep(Duration::from_micros(poll_us as u64));
+            std::thread::sleep(idle);
             continue;
         }
 
@@ -157,11 +161,11 @@ fn progress_loop(cq: CqPtr, shutdown: Arc<AtomicBool>, errors: Arc<AtomicU64>, p
             continue;
         }
 
-        // Unexpected negative return: bump the counter, sleep
-        // briefly, keep going. Tearing the thread down on transient
-        // errors would silently strand all in-flight ops.
+        // Unexpected negative return: bump the counter, sleep briefly,
+        // keep going. Tearing the thread down on transient errors
+        // would silently strand all in-flight ops.
         errors.fetch_add(1, Ordering::Relaxed);
-        std::thread::sleep(Duration::from_micros(poll_us as u64));
+        std::thread::sleep(idle);
     }
 }
 
