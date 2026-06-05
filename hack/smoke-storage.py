@@ -42,6 +42,7 @@ import os
 import resource
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -68,10 +69,26 @@ HTTP_OBJECT_PATH = "/smoke-object"
 S3_OBJECT_PATH = "/smoke-bucket/smoke-object"
 VALID_OBJECTS = frozenset({HTTP_OBJECT_PATH, S3_OBJECT_PATH})
 
-BODY = b"unbounded-storage smoke test payload :: " * 50  # ~2000 bytes, one stripe
+# A 1 GiB object. Built by tiling a fixed pattern so the body is fully
+# deterministic and verifiable, but cheap to construct. At this size the
+# object spans many stripes (see STRIPE_SIZE), so it can no longer fit in
+# a single in-memory buffer-pool: it must be streamed stripe-by-stripe
+# through the frontend and cached to disk, exercising the multi-stripe
+# read, eviction, and cross-node fetch paths that a single-stripe object
+# never touches.
+OBJECT_SIZE = 1 << 30  # 1 GiB
+# Position-encoded body: every 4096-byte page is filled with its own
+# page index as a little-endian u64, repeated. This makes the payload
+# fully deterministic *and* self-describing: any reordering, duplication,
+# truncation, or cross-stripe mixup in the read path shows up as a page
+# whose bytes name a different page, which a periodic/random body would
+# hide. Construction is one pass over the 262144 pages, so it stays cheap.
+_PAGE = 4096
+_PAGES = OBJECT_SIZE // _PAGE
+BODY = b"".join(struct.pack("<Q", p) * (_PAGE // 8) for p in range(_PAGES))
 
-STRIPE_SIZE = 65536  # power of two, larger than BODY so the object is one stripe
-DISK_SIZE = "64M"  # multiple of the 4096-byte page size
+STRIPE_SIZE = 4 * 1024 * 1024  # 4 MiB; the 1 GiB object spans 256 stripes
+DISK_SIZE = "2G"  # multiple of the 4096-byte page size; holds all stripes of one node
 
 DEVNULL = subprocess.DEVNULL
 
@@ -391,6 +408,49 @@ def fetch(
 # ============================================================================
 
 
+def _analyze_corruption(label: str, body: bytes) -> set[int]:
+    """Per-page diff of *body* vs BODY; return the set of corrupted stripes.
+
+    Each 4096-byte page of BODY is filled with its own LE-u64 page index, so
+    a mismatching page can be decoded back to whichever page's data actually
+    landed there. We log a histogram of (got_page - expected_page) deltas and
+    the corrupted-stripe set so local-vs-cross-node displacement is visible.
+    """
+    pages_per_stripe = STRIPE_SIZE // _PAGE
+    bad_stripes: set[int] = set()
+    deltas: dict[int, int] = {}
+    n_bad = 0
+    first_bad = -1
+    for p in range(min(len(body), len(BODY)) // _PAGE):
+        off = p * _PAGE
+        exp = BODY[off : off + _PAGE]
+        got = body[off : off + _PAGE]
+        if got == exp:
+            continue
+        n_bad += 1
+        if first_bad < 0:
+            first_bad = p
+        bad_stripes.add(p // pages_per_stripe)
+        got_page = struct.unpack("<Q", got[:8])[0]
+        delta = got_page - p
+        deltas[delta] = deltas.get(delta, 0) + 1
+    log(f"  [{label}] {n_bad} corrupted pages, first at page {first_bad}")
+    log(f"  [{label}] {len(bad_stripes)} corrupted stripes: {sorted(bad_stripes)[:16]}")
+    top = sorted(deltas.items(), key=lambda kv: -kv[1])[:8]
+    log(f"  [{label}] page-delta histogram (got_page - expected_page): {top}")
+    return bad_stripes
+
+
+def _report_corruption(corrupt: dict[str, set[int]]) -> None:
+    if "A" in corrupt and "B" in corrupt:
+        both = corrupt["A"] & corrupt["B"]
+        only_a = corrupt["A"] - corrupt["B"]
+        only_b = corrupt["B"] - corrupt["A"]
+        log(f"  stripes corrupt in BOTH A and B: {len(both)} -> {sorted(both)[:16]}")
+        log(f"  stripes corrupt only via A: {len(only_a)} -> {sorted(only_a)[:16]}")
+        log(f"  stripes corrupt only via B: {len(only_b)} -> {sorted(only_b)[:16]}")
+
+
 def run_scenario(kind: str, origin_addr: str, object_path: str, origin: Any) -> None:
     """Bring up a fresh two-node ring of frontend/backend *kind* and fetch.
 
@@ -459,17 +519,21 @@ def run_scenario(kind: str, origin_addr: str, object_path: str, origin: Any) -> 
         # Scope the origin GET assertion to this scenario's requests.
         origin.requests = []
 
+        corrupt: dict[str, set[int]] = {}
         for label, fe_port in (("A", fe_a), ("B", fe_b)):
             log(f"Fetching object through frontend {label}")
             status, body = fetch(f"http://127.0.0.1:{fe_port}{object_path}", procs)
             if status != 200:
                 die(f"frontend {label} returned status {status}, expected 200")
             if body != BODY:
-                die(
-                    f"frontend {label} body mismatch: got {len(body)} bytes, "
-                    f"expected {len(BODY)}"
-                )
-            log(f"  frontend {label} returned correct body")
+                bad_stripes = _analyze_corruption(label, body)
+                corrupt[label] = bad_stripes
+            else:
+                log(f"  frontend {label} returned correct body")
+
+        if corrupt:
+            _report_corruption(corrupt)
+            die("body mismatch (see corruption analysis above)")
 
         # The stub origin must have been hit, proving traffic traversed
         # frontend -> storage stack -> {kind} backend -> origin.
