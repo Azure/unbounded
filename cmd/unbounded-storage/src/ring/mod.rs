@@ -14,6 +14,7 @@ mod network;
 mod registry;
 mod storage;
 
+pub(crate) use core::RecvQuarantine;
 pub use network::{NetHandle, NetworkRing, SockAddr};
 pub use registry::{
     clear_current_storage_ring, current_storage_ring, set_current_storage_ring,

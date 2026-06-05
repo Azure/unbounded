@@ -251,20 +251,11 @@ impl Future for AcquireFut {
 mod tests {
     use std::future::Future;
     use std::pin::pin;
-    use std::sync::Arc;
-    use std::task::{Context, Poll, Wake, Waker};
+    use std::task::{Context, Poll};
 
     use super::*;
+    use crate::runtime::noop_waker;
     use crate::storage::blockdev::{MockDevice, MockDeviceConfig};
-
-    struct NoopWake;
-    impl Wake for NoopWake {
-        fn wake(self: Arc<Self>) {}
-    }
-
-    fn noop_waker() -> Waker {
-        Arc::new(NoopWake).into()
-    }
 
     fn block_on<F: Future>(f: F) -> F::Output {
         let w = noop_waker();

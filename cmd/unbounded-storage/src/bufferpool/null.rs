@@ -53,18 +53,10 @@ impl BlockStore for NullBlockStore {
 mod tests {
     use std::future::Future;
     use std::pin::pin;
-    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    use std::task::{Context, Poll};
 
     use super::*;
-
-    fn noop_waker() -> Waker {
-        fn raw() -> RawWaker {
-            RawWaker::new(std::ptr::null(), &VTABLE)
-        }
-        static VTABLE: RawWakerVTable = RawWakerVTable::new(|_| raw(), |_| {}, |_| {}, |_| {});
-        // SAFETY: vtable never dereferences the data pointer.
-        unsafe { Waker::from_raw(raw()) }
-    }
+    use crate::runtime::noop_waker;
 
     fn block_on<F: Future>(f: F) -> F::Output {
         let waker = noop_waker();

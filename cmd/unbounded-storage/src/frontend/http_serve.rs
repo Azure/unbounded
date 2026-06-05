@@ -44,9 +44,10 @@ use crate::frontend::FrontendError;
 use crate::frontend::range::{ByteRange, RangeError, ResolvedRange, full_object, stripe_set};
 use crate::http::{
     FdGuard, HttpRequest, MAX_HEADER_BYTES, Method, ParseError, RECV_CHUNK, bind_listener,
-    noop_waker, send_all, serialize_response_head, split_query,
+    send_all, serialize_response_head, split_query,
 };
 use crate::ring::NetHandle;
+use crate::runtime::noop_waker;
 use crate::storage::{OriginRef, StripeReq};
 
 /// HTTP serving frontend factory. Built once per [`FrontendSpec`];

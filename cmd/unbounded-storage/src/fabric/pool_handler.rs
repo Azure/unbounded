@@ -40,7 +40,7 @@
 
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use std::task::{Context, Poll};
 
 use crate::bufferpool::{BlockStore, BulkRef, PageRef, Req, StripeKey};
 use crate::memory::Backing;
@@ -259,27 +259,16 @@ impl<S: BlockStore + Send + Sync + 'static> Drop for PoolHandlerStream<S> {
 /// [`crate::fabric::rpc`]; the underlying disk I/O makes progress on
 /// its own io_uring threads while this spins.
 fn block_on_local<F: std::future::Future>(fut: F) -> F::Output {
-    fn no(_: *const ()) {}
-    fn clone(_: *const ()) -> RawWaker {
-        RawWaker::new(std::ptr::null(), &VT)
-    }
-    static VT: RawWakerVTable = RawWakerVTable::new(clone, no, no, no);
-    // SAFETY: the vtable never dereferences the data pointer.
-    let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VT)) };
-    let mut cx = Context::from_waker(&waker);
-    let mut fut = Box::pin(fut);
-    loop {
-        match fut.as_mut().poll(&mut cx) {
-            Poll::Ready(v) => return v,
-            Poll::Pending => std::thread::sleep(std::time::Duration::from_micros(50)),
-        }
-    }
+    crate::runtime::block_on_cooperative(fut, || {
+        std::thread::sleep(std::time::Duration::from_micros(50))
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bufferpool::Error;
+    use crate::runtime::noop_waker;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// In-memory `BlockStore` mock: holds page bytes keyed by stripe.
@@ -388,13 +377,7 @@ mod tests {
         let mut stream = handler.handle(&req, src, crate::fabric::MAX_HOPS);
         // SAFETY: stream is pinned to this stack frame and not moved.
         let mut stream = unsafe { Pin::new_unchecked(&mut stream) };
-        fn no(_: *const ()) {}
-        fn clone(_: *const ()) -> RawWaker {
-            RawWaker::new(std::ptr::null(), &VT)
-        }
-        static VT: RawWakerVTable = RawWakerVTable::new(clone, no, no, no);
-        // SAFETY: vtable never dereferences the data pointer.
-        let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VT)) };
+        let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
         let mut out = Vec::new();
         let mut spins = 0u64;
@@ -506,13 +489,7 @@ mod tests {
         let mut held = handler.handle(&req, src, crate::fabric::MAX_HOPS);
         // SAFETY: pinned on stack, not moved.
         let mut held_pin = unsafe { Pin::new_unchecked(&mut held) };
-        fn no(_: *const ()) {}
-        fn clone(_: *const ()) -> RawWaker {
-            RawWaker::new(std::ptr::null(), &VT)
-        }
-        static VT: RawWakerVTable = RawWakerVTable::new(clone, no, no, no);
-        // SAFETY: vtable never dereferences the data pointer.
-        let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VT)) };
+        let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
         let first = held_pin.as_mut().poll_next(&mut cx);
         assert!(matches!(first, Poll::Ready(Some(Ok(_)))));

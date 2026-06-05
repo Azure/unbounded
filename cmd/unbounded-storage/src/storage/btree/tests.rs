@@ -6,21 +6,14 @@
 use std::future::Future;
 use std::pin::pin;
 use std::sync::Arc;
-use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use std::task::{Context, Poll};
 
+use crate::runtime::noop_waker;
 use crate::storage::alloc::Allocator;
 use crate::storage::blockdev::{BlockDevice, MockDevice, MockDeviceConfig, ScratchPool};
 use crate::storage::btree::page::{self, Decoded, META_SLOT_A, META_SLOT_B};
 use crate::storage::btree::{BTreeIndex, LeafEntry, Mutation};
 use crate::storage::types::{Checksum, Lba, PageKey};
-
-fn noop_waker() -> Waker {
-    fn raw() -> RawWaker {
-        RawWaker::new(std::ptr::null(), &VTABLE)
-    }
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(|_| raw(), |_| {}, |_| {}, |_| {});
-    unsafe { Waker::from_raw(raw()) }
-}
 
 fn block_on<F: Future>(f: F) -> F::Output {
     let w = noop_waker();

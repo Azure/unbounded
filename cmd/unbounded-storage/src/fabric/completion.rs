@@ -280,21 +280,50 @@ impl CompletionRegistry {
     }
 }
 
+/// Collapse a libfabric completion outcome to the shared boundary
+/// type. `Cq` errors keep their numeric detail; the remaining
+/// `FabricError` variants have no numeric boundary form and render to
+/// [`crate::io::IoError::Other`]. Backend-specific detail (the full
+/// `CompletionInfo` with tag/src_addr) stays available to callers that
+/// take the `Result<CompletionInfo>` directly instead of going through
+/// this collapse.
+impl crate::io::CompletionOutcome for Result<CompletionInfo> {
+    fn into_io_result(self) -> crate::io::IoResult {
+        match self {
+            Ok(info) => Ok(crate::io::Completed { bytes: info.bytes }),
+            Err(FabricError::Cq { prov_errno, err }) => {
+                Err(crate::io::IoError::Provider { prov_errno, err })
+            }
+            Err(other) => Err(crate::io::IoError::Other(other.to_string())),
+        }
+    }
+}
+
+/// libfabric admits via the registry's capacity check: [`allocate`]
+/// fails once `live == cap`, so the policy is
+/// [`crate::io::BackPressurePolicy::Capacity`]. This impl is the shared
+/// introspection surface; the actual capacity check stays in
+/// [`CompletionRegistry::allocate`].
+///
+/// [`allocate`]: CompletionRegistry::allocate
+impl crate::io::BackPressure for CompletionRegistry {
+    fn capacity(&self) -> usize {
+        self.shared.cap
+    }
+
+    fn in_flight(&self) -> usize {
+        self.live_count()
+    }
+
+    fn policy(&self) -> crate::io::BackPressurePolicy {
+        crate::io::BackPressurePolicy::Capacity
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::task::{RawWaker, RawWakerVTable, Waker};
-
-    fn noop_waker() -> Waker {
-        fn no(_: *const ()) {}
-        fn clone(_: *const ()) -> RawWaker {
-            RawWaker::new(std::ptr::null(), &VT)
-        }
-        static VT: RawWakerVTable = RawWakerVTable::new(clone, no, no, no);
-        // SAFETY: the vtable's functions never dereference the data
-        // pointer, so a null data pointer is sound.
-        unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VT)) }
-    }
+    use crate::runtime::noop_waker;
 
     #[test]
     fn slot_round_trips_through_raw_context_and_resolves_future() {
@@ -409,5 +438,58 @@ mod tests {
             Poll::Ready(Ok(_)) => {}
             _ => panic!("expected Ready(Ok)"),
         }
+    }
+
+    #[test]
+    fn completion_info_collapses_to_unified_result() {
+        use crate::io::{CompletionOutcome, IoError};
+
+        let ok: Result<CompletionInfo> = Ok(CompletionInfo {
+            flags: 0,
+            bytes: 4096,
+            tag: 7,
+            src_addr: 9,
+            op_context: 0,
+        });
+        match ok.into_io_result() {
+            Ok(c) => assert_eq!(c.bytes, 4096),
+            Err(e) => panic!("expected Ok, got {e}"),
+        }
+
+        let cq: Result<CompletionInfo> = Err(FabricError::Cq {
+            prov_errno: -3,
+            err: -5,
+        });
+        match cq.into_io_result() {
+            Err(IoError::Provider { prov_errno, err }) => {
+                assert_eq!(prov_errno, -3);
+                assert_eq!(err, -5);
+            }
+            other => panic!("expected Provider, got {other:?}"),
+        }
+
+        let other: Result<CompletionInfo> = Err(FabricError::BadConfig("nope"));
+        match other.into_io_result() {
+            Err(IoError::Other(msg)) => assert!(msg.contains("nope")),
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn registry_reports_capacity_backpressure_policy() {
+        use crate::io::{BackPressure, BackPressurePolicy};
+
+        let reg = CompletionRegistry::new(2);
+        assert_eq!(reg.capacity(), 2);
+        assert_eq!(BackPressure::in_flight(&*reg), 0);
+        assert_eq!(reg.available(), 2);
+        assert!(reg.admits());
+        assert_eq!(reg.policy(), BackPressurePolicy::Capacity);
+
+        let (_s0, _f0) = reg.allocate().unwrap();
+        let (_s1, _f1) = reg.allocate().unwrap();
+        assert_eq!(BackPressure::in_flight(&*reg), 2);
+        assert_eq!(reg.available(), 0);
+        assert!(!reg.admits());
     }
 }

@@ -35,7 +35,7 @@ use crate::storage::alloc::Allocator;
 use crate::storage::blockdev::{BlockDevice, ScratchPool};
 use crate::storage::btree::{BTreeIndex, LeafEntry, Mutation};
 use crate::storage::lru::SieveLru;
-use crate::storage::mutator::{MutatorOutcome, MutatorQueue, MutatorReply, MutatorReq, yield_once};
+use crate::storage::mutator::{MutatorOutcome, MutatorQueue, MutatorReply, MutatorReq};
 use crate::storage::refcount::RefcountTable;
 use crate::storage::singleflight::{Acquire, Singleflight};
 use crate::storage::traits::{PageChecksum, Xxh3Checksum};
@@ -49,8 +49,30 @@ pub struct EngineConfig {
     /// Btree page size, in bytes. Must equal the device's atomic
     /// write unit (default 4 KiB).
     pub btree_page_bytes: usize,
+    /// Maximum number of mutator requests folded into a single
+    /// `BTreeIndex::apply_batch` commit. Larger batches amortize
+    /// the CoW B+tree commit cost; the mutator never exceeds this
+    /// per commit.
     pub commit_batch_max: usize,
+    /// Target batch-coalescing latency, in microseconds. This is a
+    /// logical hint, not a value the engine reads as elapsed time:
+    /// the deterministic-simulation harness forbids reading the
+    /// wall clock, so the mutator realizes this budget as
+    /// [`Self::commit_batch_ticks`] cooperative yields rather than
+    /// a real deadline. Retained for documentation and future
+    /// production tuning.
     pub commit_batch_deadline_us: u64,
+    /// Number of cooperative yields the mutator may spend waiting
+    /// for more requests to coalesce into a batch that has not yet
+    /// reached [`Self::commit_batch_max`]. This is the
+    /// wall-clock-free realization of
+    /// [`Self::commit_batch_deadline_us`]: each yield lets the
+    /// executor interleave producers that are about to enqueue, so
+    /// the batch grows under load while a drained or closed queue
+    /// commits immediately. Default 8 (roughly
+    /// `commit_batch_deadline_us / 25us` per yield); 0 disables
+    /// coalescing.
+    pub commit_batch_ticks: u32,
     pub eviction_watermark: f32,
     pub probationary_fraction: f32,
     pub admission_sketch_multiplier: usize,
@@ -76,6 +98,7 @@ impl Default for EngineConfig {
             btree_page_bytes: 4096,
             commit_batch_max: 1024,
             commit_batch_deadline_us: 200,
+            commit_batch_ticks: 8,
             eviction_watermark: 0.9,
             probationary_fraction: 0.1,
             admission_sketch_multiplier: 2,
@@ -138,7 +161,7 @@ pub struct StorageEngine<B: BlockDevice> {
 // path goes through `ShardLocalStore` which never touches this
 // field. All other fields are `Arc`/`Mutex` wrappers that are
 // already `Send + Sync` because their `B: BlockDevice` is
-// (`UringBlockDevice` and `MockDevice` are both `Send + Sync`).
+// (`CoreLocalDevice` and `MockDevice` are both `Send + Sync`).
 unsafe impl<B: BlockDevice + Send + Sync> Send for StorageEngine<B> {}
 unsafe impl<B: BlockDevice + Send + Sync> Sync for StorageEngine<B> {}
 
@@ -685,19 +708,18 @@ impl<B: BlockDevice> StorageEngine<B> {
                 return;
             }
             let max = self.cfg.commit_batch_max.max(1);
-            let mut batch = self.mutator_queue.try_drain_up_to(max);
-            // Best-effort coalescing: if we did not fill the
-            // batch, yield once to let other producers enqueue
-            // before we commit. Wall-clock-free approximation of
-            // `commit_batch_deadline_us`; see the note on
-            // `mutator::yield_once`.
-            if batch.len() < max {
-                yield_once().await;
-                if batch.len() < max {
-                    let more = self.mutator_queue.try_drain_up_to(max - batch.len());
-                    batch.extend(more);
-                }
-            }
+            // Coalesce up to `commit_batch_max`, spending a bounded
+            // budget of cooperative yields (`commit_batch_ticks`)
+            // so producers that are about to enqueue join this
+            // commit. Wall-clock-free stand-in for
+            // `commit_batch_deadline_us`; see
+            // `MutatorQueue::drain_batch`. The drain stops early if
+            // the queue closes, so a draining shutdown still
+            // terminates.
+            let batch = self
+                .mutator_queue
+                .drain_batch(max, self.cfg.commit_batch_ticks)
+                .await;
 
             self.process_batch(batch).await;
             self.drain_pending_free();
@@ -832,15 +854,9 @@ mod tests {
     }
     use std::future::Future;
     use std::pin::{Pin, pin};
-    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    use std::task::{Context, Poll};
 
-    fn noop_waker() -> Waker {
-        fn raw() -> RawWaker {
-            RawWaker::new(std::ptr::null(), &VTABLE)
-        }
-        static VTABLE: RawWakerVTable = RawWakerVTable::new(|_| raw(), |_| {}, |_| {}, |_| {});
-        unsafe { Waker::from_raw(raw()) }
-    }
+    use crate::runtime::noop_waker;
 
     /// Pump `body` to completion while concurrently driving
     /// `mutator`. The mutator is expected to stay pending until

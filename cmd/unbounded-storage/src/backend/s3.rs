@@ -784,7 +784,10 @@ mod tests {
     fn absolute_range_offsets_into_stripe() {
         assert_eq!(absolute_range(0, 4 * 1024 * 1024, 0, 4096), (0, 4096));
         let stripe = 4 * 1024 * 1024u64;
-        assert_eq!(absolute_range(3, stripe, 8192, 4096), (3 * stripe + 8192, 4096));
+        assert_eq!(
+            absolute_range(3, stripe, 8192, 4096),
+            (3 * stripe + 8192, 4096)
+        );
     }
 
     #[test]
@@ -966,7 +969,10 @@ mod tests {
         write_slice_into_pages(&[10u8, 20, 30], &dsts, 0, base, page_size).unwrap();
         write_slice_into_pages(&[40u8, 50, 60, 70], &dsts, 3, base, page_size).unwrap();
         assert_eq!(&backing[page_size..page_size + 4], &[10, 20, 30, 40]);
-        assert_eq!(&backing[2 * page_size + 8..2 * page_size + 11], &[50, 60, 70]);
+        assert_eq!(
+            &backing[2 * page_size + 8..2 * page_size + 11],
+            &[50, 60, 70]
+        );
     }
 
     #[test]

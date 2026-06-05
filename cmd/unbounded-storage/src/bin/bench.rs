@@ -34,18 +34,20 @@
 //!   to reconfirm closed-loop correctness before trusting any
 //!   throughput numbers.
 //!
-//! Threading model: `UringBlockDevice` is `!Send + !Sync` because the
-//! ring is pinned to the thread that opened it. The design
-//! (`docs design "io_uring"`) calls for N pinned threads per NVMe
-//! drive, where each thread owns its own ring, on a CPU in that
+//! Threading model: the `StorageRing` built by `UringDevice::open` is
+//! `!Send + !Sync` because it is pinned to the thread that opened it.
+//! The design (`docs design "io_uring"`) calls for N pinned threads per
+//! NVMe drive, where each thread owns its own ring, on a CPU in that
 //! drive's NUMA domain. We satisfy that by spawning one OS shard
 //! thread per (device, thread-slot) pair via the crate's
 //! `runtime::PinnedRuntime`, with placement derived from
-//! `topology::Plan`. Each shard owns its own `UringBlockDevice`,
-//! `StorageEngine`, hugepage `Backing`, and a single-engine
-//! `LocalStorage` so the registration and routing paths are exercised;
-//! cross-shard routing is partitioned at the workload generator (each
-//! shard only writes / reads keys hashed to its own global shard idx).
+//! `topology::Plan`. Each storage-core thread installs its own
+//! `StorageRing` into the thread-local registry, then builds a
+//! `CoreLocalDevice` (which resolves that ring), a `StorageEngine`,
+//! hugepage `Backing`, and a single-engine `LocalStorage` so the
+//! registration and routing paths are exercised; cross-shard routing is
+//! partitioned at the workload generator (each shard only writes /
+//! reads keys hashed to its own global shard idx).
 //!
 //! When the host's sysfs topology cannot be discovered or a `--device`
 //! path cannot be mapped onto a topology NVMe controller, the bench
@@ -55,6 +57,7 @@
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::ExitCode;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
@@ -65,8 +68,13 @@ use rand_chacha::ChaCha20Rng;
 
 use unbounded_storage::bufferpool::{BlockStore, PageRef, StripeKey};
 use unbounded_storage::memory::{BackingKind, BackingRequest, HUGEPAGE_2MB, allocate};
-use unbounded_storage::runtime::{DefaultRuntime, PinnedRuntime, Threading, WorkerIdx, WorkerSpec};
-use unbounded_storage::storage::blockdev::{BlockDevice, UringBlockDevice, UringConfig};
+use unbounded_storage::ring::{
+    StorageRing, StorageRingConfig, clear_current_storage_ring, set_current_storage_ring,
+};
+use unbounded_storage::runtime::{
+    DefaultRuntime, PinnedRuntime, Threading, WorkerIdx, WorkerSpec, noop_waker,
+};
+use unbounded_storage::storage::blockdev::{BlockDevice, CoreLocalDevice, OpenDisk, UringDevice};
 use unbounded_storage::storage::{EngineConfig, LocalStorage, StorageEngine};
 use unbounded_storage::topology::{Host, Nvme, Plan, PlanConfig, Role};
 
@@ -609,28 +617,39 @@ fn run_device_inner(cfgs: &[ShardConfig]) -> Result<(Vec<ShardReport>, Vec<Shard
         );
     }
 
-    let mut uring_cfg = UringConfig {
-        // Device page size is the atomic write unit (4 KiB on
-        // commodity SCSI/NVMe). Cache pages are PAGE_BYTES and
-        // each cache-page write spans `PAGE_BYTES / 4096`
-        // consecutive LBAs.
-        page_size: 4096,
-        ..UringConfig::default()
+    let mut ring_cfg = StorageRingConfig {
+        iopoll: head.iopoll,
+        single_issuer: head.single_issuer,
+        defer_taskrun: head.defer_taskrun,
+        ..StorageRingConfig::default()
     };
-    uring_cfg.iopoll = head.iopoll;
-    uring_cfg.single_issuer = head.single_issuer;
-    uring_cfg.defer_taskrun = head.defer_taskrun;
-    uring_cfg.o_direct = head.o_direct;
     if let Some(qd) = head.queue_depth {
         if qd == 0 {
             return Err("--queue-depth must be >= 1".into());
         }
-        uring_cfg.queue_depth = qd;
+        ring_cfg.queue_depth = qd;
     }
-    let device = Arc::new(
-        UringBlockDevice::open(&head.device_path, uring_cfg)
-            .map_err(|e| format!("UringBlockDevice::open: {e:?}"))?,
-    );
+    // Device page size is the atomic write unit (4 KiB on commodity
+    // SCSI/NVMe). Cache pages are PAGE_BYTES and each cache-page write
+    // spans `PAGE_BYTES / 4096` consecutive LBAs. `o_direct` is passed
+    // independently of `iopoll` (production NVMe sets both).
+    let OpenDisk {
+        device,
+        ring,
+        // Held for this storage core's lifetime: the ring addresses
+        // this fd by its registered Fixed index, so it must outlive the
+        // ring. Dropped last (after the ring) at end of scope.
+        file: _disk_file,
+    } = UringDevice::open(&head.device_path, ring_cfg, head.o_direct, 4096)
+        .map_err(|e| format!("UringDevice::open: {e}"))?;
+    let ring = Rc::new(ring);
+    let device = Arc::new(device);
+
+    // Install the ring so this thread's `CoreLocalDevice`, engine, and
+    // engine-open I/O resolve it from the thread-local registry. MUST
+    // run before `register_buffers` and `StorageEngine::open`, both of
+    // which issue ring ops on this thread.
+    set_current_storage_ring(ring.clone());
 
     // One PAGE_BYTES slot per worker across every shard on this
     // device, packed into a single page-aligned region. All shards
@@ -656,11 +675,13 @@ fn run_device_inner(cfgs: &[ShardConfig]) -> Result<(Vec<ShardReport>, Vec<Shard
     );
 
     // Register the backing region with the io_uring ring before
-    // opening the engine: `BTreeIndex::open` issues meta writes
-    // through the device, and `READ_FIXED` / `WRITE_FIXED` need a
-    // registered buffer. The later `local.register_pages` call is
-    // tolerant of a duplicate `register_buffers` (it ignores the
-    // -EBUSY) and still installs the bufferpool binding.
+    // opening the engine. `BTreeIndex::open` issues meta writes through
+    // the engine's own scratch pool (registered during open), but
+    // registering the backing up front means the bufferpool's pages are
+    // ready for `READ_FIXED` / `WRITE_FIXED` the moment the phases run.
+    // `local.register_pages` later re-registers this same region; the
+    // ring's buffer table accumulates entries and `resolve_buf_index`
+    // matches the first containing region, so the duplicate is harmless.
     device
         .register_buffers(backing_base, backing_bytes)
         .map_err(|e| format!("device.register_buffers: {e:?}"))?;
@@ -677,17 +698,17 @@ fn run_device_inner(cfgs: &[ShardConfig]) -> Result<(Vec<ShardReport>, Vec<Shard
         skip_recovery_scan_if_no_meta: head.skip_recovery_scan_if_no_meta,
         ..Default::default()
     };
-    let engine = Arc::new(
-        block_on(StorageEngine::open(device.clone(), engine_cfg))
-            .map_err(|e| format!("StorageEngine::open: {e:?}"))?,
-    );
+    let engine = Arc::new(open_engine_on_ring(
+        &ring,
+        StorageEngine::open(device.clone(), engine_cfg),
+    )?);
 
     // Build a single-engine LocalStorage that every shard on this
-    // device shares. Engines owning a `UringBlockDevice` are
-    // `!Send`, which forces one OS thread per device; sharing the
-    // engine across the `threads_per_device` logical shards on
-    // that thread is what makes the multi-shard configuration
-    // correct (single allocator + btree per LBA space).
+    // device shares. The `CoreLocalDevice` is `Send`, but the ring it
+    // resolves is pinned to this thread, which forces one OS thread per
+    // device; sharing the engine across the `threads_per_device`
+    // logical shards on that thread is what makes the multi-shard
+    // configuration correct (single allocator + btree per LBA space).
     let local = Arc::new(LocalStorage::new(vec![engine.clone()]));
     local
         .register_pages(&backing)
@@ -712,6 +733,10 @@ fn run_device_inner(cfgs: &[ShardConfig]) -> Result<(Vec<ShardReport>, Vec<Shard
         drop(engine);
         drop(device);
         drop(backing);
+        // Release the thread-local ring before `ring` (and then
+        // `_disk_file`) drop at scope end: the ring unregisters the file
+        // fd, so it must drop before the `File` closes it.
+        clear_current_storage_ring();
         return Ok((report, Vec::new()));
     }
 
@@ -798,6 +823,10 @@ fn run_device_inner(cfgs: &[ShardConfig]) -> Result<(Vec<ShardReport>, Vec<Shard
     drop(engine);
     drop(device);
     drop(backing);
+    // Release the thread-local ring before `ring` (and then
+    // `_disk_file`) drop at scope end: the ring unregisters the file fd,
+    // so it must drop before the `File` closes it.
+    clear_current_storage_ring();
 
     Ok((write_reports, read_reports))
 }
@@ -810,9 +839,9 @@ fn run_device_inner(cfgs: &[ShardConfig]) -> Result<(Vec<ShardReport>, Vec<Shard
 /// existing report-printing code does not have to special-case
 /// verify.
 fn run_verify_device(
-    engine: &Arc<StorageEngine<UringBlockDevice>>,
-    local: &Arc<LocalStorage<UringBlockDevice>>,
-    device: &Arc<UringBlockDevice>,
+    engine: &Arc<StorageEngine<CoreLocalDevice>>,
+    local: &Arc<LocalStorage<CoreLocalDevice>>,
+    device: &Arc<CoreLocalDevice>,
     backing_base: *mut u8,
     cfgs: &[ShardConfig],
     page_offsets: &[usize],
@@ -934,8 +963,8 @@ fn run_verify_device(
 
 #[allow(clippy::too_many_arguments)]
 async fn verify_round_trip(
-    local: Arc<LocalStorage<UringBlockDevice>>,
-    engine: Arc<StorageEngine<UringBlockDevice>>,
+    local: Arc<LocalStorage<CoreLocalDevice>>,
+    engine: Arc<StorageEngine<CoreLocalDevice>>,
     backing_base: *mut u8,
     src_idx: u32,
     dst_idx: u32,
@@ -1080,9 +1109,9 @@ fn run_phase_device(
     phase: Phase,
     cfgs: &[ShardConfig],
     page_offsets: &[usize],
-    engine: Arc<StorageEngine<UringBlockDevice>>,
-    local: Arc<LocalStorage<UringBlockDevice>>,
-    device: Arc<UringBlockDevice>,
+    engine: Arc<StorageEngine<CoreLocalDevice>>,
+    local: Arc<LocalStorage<CoreLocalDevice>>,
+    device: Arc<CoreLocalDevice>,
     page_size: usize,
     seed_keys: Option<Vec<Vec<Vec<StripeKey>>>>,
     backing_base: *mut u8,
@@ -1274,7 +1303,7 @@ impl WorkerState {
 #[allow(clippy::too_many_arguments)]
 async fn write_worker(
     state: Arc<Mutex<WorkerState>>,
-    local: Arc<LocalStorage<UringBlockDevice>>,
+    local: Arc<LocalStorage<CoreLocalDevice>>,
     phase_done: Arc<AtomicBool>,
     total_ops: Arc<AtomicU64>,
     phase_start: Instant,
@@ -1383,7 +1412,7 @@ async fn write_worker(
 
 async fn read_worker(
     state: Arc<Mutex<WorkerState>>,
-    local: Arc<LocalStorage<UringBlockDevice>>,
+    local: Arc<LocalStorage<CoreLocalDevice>>,
     phase_done: Arc<AtomicBool>,
     total_ops: Arc<AtomicU64>,
     phase_start: Instant,
@@ -1648,20 +1677,17 @@ fn install_signal_handler() {
     }
 }
 
-fn noop_waker() -> std::task::Waker {
-    use std::task::{RawWaker, RawWakerVTable, Waker};
-    fn raw() -> RawWaker {
-        RawWaker::new(std::ptr::null(), &VTABLE)
-    }
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(|_| raw(), |_| {}, |_| {}, |_| {});
-    // SAFETY: VTABLE clone/wake/drop are all no-ops referencing static data.
-    unsafe { Waker::from_raw(raw()) }
-}
-
-/// Drive a future to completion on a single thread using a noop
-/// waker. Used for one-shot `StorageEngine::open` futures during
-/// shard bring-up.
-fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+/// Drive a one-shot `StorageEngine::open` future to completion on this
+/// storage core, pumping `ring.progress()` between polls so the btree's
+/// open-time meta I/O (issued through the installed thread-local ring)
+/// actually reaps. Mirrors the production bring-up loop in
+/// `disks::uring::run_storage_core`. The ring must already be installed
+/// via `set_current_storage_ring` so the engine's `CoreLocalDevice`
+/// resolves it.
+fn open_engine_on_ring<E: std::fmt::Debug>(
+    ring: &StorageRing,
+    fut: impl std::future::Future<Output = Result<StorageEngine<CoreLocalDevice>, E>>,
+) -> Result<StorageEngine<CoreLocalDevice>, String> {
     use std::pin::pin;
     use std::task::{Context, Poll};
     let w = noop_waker();
@@ -1670,11 +1696,13 @@ fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     let mut spins: u64 = 0;
     loop {
         match fut.as_mut().poll(&mut cx) {
-            Poll::Ready(v) => return v,
+            Poll::Ready(r) => return r.map_err(|e| format!("StorageEngine::open: {e:?}")),
             Poll::Pending => {
+                ring.progress()
+                    .map_err(|e| format!("ring progress during open: {e:?}"))?;
                 spins += 1;
                 if spins > 100_000_000 {
-                    panic!("block_on stuck");
+                    panic!("open_engine_on_ring stuck");
                 }
             }
         }

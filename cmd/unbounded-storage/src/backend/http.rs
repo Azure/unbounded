@@ -1166,7 +1166,10 @@ mod tests {
         write_slice_into_pages(&[10u8, 20, 30], &dsts, 0, base, page_size).unwrap();
         write_slice_into_pages(&[40u8, 50, 60, 70], &dsts, 3, base, page_size).unwrap();
         assert_eq!(&backing[page_size..page_size + 4], &[10, 20, 30, 40]);
-        assert_eq!(&backing[2 * page_size + 8..2 * page_size + 11], &[50, 60, 70]);
+        assert_eq!(
+            &backing[2 * page_size + 8..2 * page_size + 11],
+            &[50, 60, 70]
+        );
     }
 
     #[test]

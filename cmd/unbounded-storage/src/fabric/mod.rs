@@ -20,6 +20,7 @@ mod ping;
 mod pool_handler;
 mod progress;
 mod rpc;
+mod rpc_queue;
 mod transport;
 mod types;
 

@@ -3,6 +3,7 @@
 
 #![allow(async_fn_in_trait)]
 
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -50,6 +51,52 @@ pub trait Transport<R: Req> {
     /// transport to `Pool::new`). The `Pool` calls only this
     /// method at runtime.
     fn bulk_get<'a>(&'a self, req: &'a R, src: BulkRef, dsts: &'a [PageRef]) -> Self::Stream<'a>;
+
+    /// Fetch exactly one page from a peer into `dst`, collapsing the
+    /// single-page `bulk_get` stream into a flat async completion.
+    ///
+    /// This is the single-page consumer surface that is symmetric
+    /// with [`BlockStore::read_page`]: both deliver one page into a
+    /// `PageRef` via a flat `async fn`, so the buffer pool can drive
+    /// a local-disk read and a remote fetch through identical shapes
+    /// with no stream adapter at the call site. Multi-page consumers
+    /// (server handlers, object-range backends) keep using
+    /// [`Transport::bulk_get`] directly.
+    ///
+    /// Resolves `Ok(())` on the first delivered page, propagates a
+    /// stream error, and surfaces a premature end-of-stream as an
+    /// `Error`.
+    async fn fetch_one(&self, req: &R, src: BulkRef, dst: PageRef) -> Result<(), Error> {
+        let dsts = [dst];
+        DriveSinglePage {
+            stream: self.bulk_get(req, src, &dsts),
+        }
+        .await
+    }
+}
+
+/// Adapter that drives a single-page `bulk_get` stream to its first
+/// delivered page. Used by [`Transport::fetch_one`].
+struct DriveSinglePage<S: PageStream> {
+    stream: S,
+}
+
+impl<S: PageStream> Future for DriveSinglePage<S> {
+    type Output = Result<(), Error>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: standard structural pin projection through the
+        // single `stream` field; we never move out of `self`.
+        let stream = unsafe { self.map_unchecked_mut(|s| &mut s.stream) };
+        match stream.poll_next(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Some(Ok(_page))) => Poll::Ready(Ok(())),
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(e)),
+            Poll::Ready(None) => Poll::Ready(Err(Error::from(
+                "transport stream ended without delivering page",
+            ))),
+        }
+    }
 }
 
 impl<R: Req, T: Transport<R> + ?Sized> Transport<R> for Arc<T> {

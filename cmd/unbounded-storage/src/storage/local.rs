@@ -379,20 +379,13 @@ mod tests {
     // assert itself is one line.
 
     use crate::bufferpool::BlockStore;
+    use crate::runtime::noop_waker;
     use crate::storage::blockdev::{MockDevice, MockDeviceConfig};
     use crate::storage::engine::{EngineConfig, StorageEngine};
     use std::future::Future;
     use std::pin::{Pin, pin};
     use std::sync::Arc;
-    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-
-    fn noop_waker() -> Waker {
-        fn raw() -> RawWaker {
-            RawWaker::new(std::ptr::null(), &VTABLE)
-        }
-        static VTABLE: RawWakerVTable = RawWakerVTable::new(|_| raw(), |_| {}, |_| {}, |_| {});
-        unsafe { Waker::from_raw(raw()) }
-    }
+    use std::task::{Context, Poll};
 
     fn block_on<F: Future>(f: F) -> F::Output {
         let w = noop_waker();

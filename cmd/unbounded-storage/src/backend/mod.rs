@@ -82,23 +82,47 @@ impl<T: Backend + ?Sized> Backend for Arc<T> {
     }
 }
 
+/// Bridge a pool's [`RecvQuarantineHandle`] onto a shard's
+/// [`NetworkRing`], so a cancelled fixed-buffer RECV withholds its
+/// destination bufferpool page from reuse until the kernel is done with
+/// it (its RECV CQE is reaped). Install once per shard, before serving
+/// begins, on the ring whose `recv_fixed` destinations are pool pages
+/// (the shard socket ring). Rings writing into non-pool memory (e.g. a
+/// worker-local scratch backing) are left without a sink and fall back
+/// to the blocking-but-sound drain on drop.
+pub fn install_recv_quarantine(
+    ring: &crate::ring::NetworkRing,
+    handle: crate::bufferpool::RecvQuarantineHandle,
+) {
+    use std::rc::Rc;
+
+    /// Adapter implementing the ring's `RecvQuarantine` in terms of the
+    /// bufferpool free-list handle. Both are keyed by byte offset into
+    /// the registered backing, so this is a thin forward.
+    struct PoolRecvQuarantine(crate::bufferpool::RecvQuarantineHandle);
+
+    impl crate::ring::RecvQuarantine for PoolRecvQuarantine {
+        fn quarantine(&self, page_byte_offset: usize) {
+            self.0.quarantine(page_byte_offset);
+        }
+
+        fn reclaim(&self, page_byte_offset: usize) {
+            self.0.reclaim(page_byte_offset);
+        }
+    }
+
+    ring.set_recv_quarantine(Rc::new(PoolRecvQuarantine(handle)));
+}
+
 #[cfg(test)]
 mod tests {
     use std::pin::Pin;
-    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    use std::task::{Context, Poll};
 
     use crate::bufferpool::{BulkRef, Error, PageRef, PageStream, Req, StripeKey};
+    use crate::runtime::noop_waker;
 
     use super::Backend;
-
-    fn noop_waker() -> Waker {
-        fn raw() -> RawWaker {
-            RawWaker::new(std::ptr::null(), &VTABLE)
-        }
-        static VTABLE: RawWakerVTable = RawWakerVTable::new(|_| raw(), |_| {}, |_| {}, |_| {});
-        // SAFETY: VTABLE clone/wake/drop are all no-ops on static data.
-        unsafe { Waker::from_raw(raw()) }
-    }
 
     /// Drive a future to completion on a single thread using a noop
     /// waker, with a generous spin bound that fails loudly rather
