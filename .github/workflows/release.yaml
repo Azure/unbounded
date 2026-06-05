@@ -516,6 +516,10 @@ jobs:
             file: images/metalman/Containerfile
             platforms: linux/amd64,linux/arm64
             trivy: true
+          - name: orca
+            file: images/orca/Containerfile
+            platforms: linux/amd64,linux/arm64
+            trivy: true
           - name: host-ubuntu2404
             file: images/host-ubuntu2404/Containerfile
             platforms: linux/amd64
