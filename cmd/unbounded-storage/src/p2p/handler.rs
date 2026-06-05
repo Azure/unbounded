@@ -40,7 +40,7 @@
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use std::task::{Context, Poll};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -51,6 +51,7 @@ use crate::fabric::Result as FabResult;
 use crate::fabric::{Fabric, FabricTransport, Handler, HandlerStream, MrHandle, PeerId};
 use crate::memory::Backing;
 use crate::p2p::{FingerRouter, FingerTable, NodeId, RingId, stripe_to_ring};
+use crate::runtime::{block_on_cooperative, noop_waker};
 
 /// Error surfaced by [`RecursiveHandler`]'s response stream.
 #[derive(Debug)]
@@ -487,25 +488,9 @@ fn drive_page_stream<P: PageStream>(stream: P) -> Result<(), crate::bufferpool::
 /// spin-poller; the underlying disk I/O makes progress on its own
 /// io_uring threads while this spins.
 fn block_on_local<F: std::future::Future>(fut: F) -> F::Output {
-    let waker = noop_waker();
-    let mut cx = Context::from_waker(&waker);
-    let mut fut = Box::pin(fut);
-    loop {
-        match fut.as_mut().poll(&mut cx) {
-            Poll::Ready(v) => return v,
-            Poll::Pending => std::thread::sleep(std::time::Duration::from_micros(50)),
-        }
-    }
-}
-
-fn noop_waker() -> Waker {
-    fn no(_: *const ()) {}
-    fn clone(_: *const ()) -> RawWaker {
-        RawWaker::new(std::ptr::null(), &VT)
-    }
-    static VT: RawWakerVTable = RawWakerVTable::new(clone, no, no, no);
-    // SAFETY: the vtable never dereferences the data pointer.
-    unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VT)) }
+    block_on_cooperative(fut, || {
+        std::thread::sleep(std::time::Duration::from_micros(50))
+    })
 }
 
 #[cfg(test)]

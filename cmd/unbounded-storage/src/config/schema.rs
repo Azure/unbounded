@@ -40,7 +40,13 @@ impl Default for Config {
 pub struct FabricCfg {
     pub listen_addr: String,
     pub max_inflight: usize,
+    /// Size of the RPC server's persistent worker-thread pool. This
+    /// bounds concurrent server-side request handling regardless of
+    /// arrival rate; see `fabric::FabricConfig::rpc_worker_threads`.
+    pub rpc_worker_threads: usize,
     pub progress_threads: u8,
+    /// Microseconds the progress thread sleeps when the CQ is empty,
+    /// to bound idle CPU. Default is 10.
     pub progress_poll_us: u32,
 }
 
@@ -49,6 +55,7 @@ impl Default for FabricCfg {
         Self {
             listen_addr: "0.0.0.0:0".to_string(),
             max_inflight: 1024,
+            rpc_worker_threads: 4,
             progress_threads: 2,
             progress_poll_us: 10,
         }
@@ -363,6 +370,7 @@ mod tests {
         let c: Config = toml::from_str("").unwrap();
         assert_eq!(c.fabric.listen_addr, "0.0.0.0:0");
         assert_eq!(c.fabric.max_inflight, 1024);
+        assert_eq!(c.fabric.rpc_worker_threads, 4);
         assert_eq!(c.fabric.progress_threads, 2);
         assert_eq!(c.fabric.progress_poll_us, 10);
         assert_eq!(c.storage.bytes_per_shard.bytes(), 128 * 1024 * 1024);

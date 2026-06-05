@@ -3,11 +3,10 @@
 
 //! `BlockDevice` backed by the current storage core's [`StorageRing`].
 //!
-//! Unlike [`UringBlockDevice`], which owns its ring and is therefore
-//! `!Send`, a [`CoreLocalDevice`] owns no ring at all. It carries only
-//! the small, copyable disk metadata (page size, capacity, write queue
-//! depth) plus the registered `Fixed` file index for its disk, and
-//! resolves the actual ring at call time from the thread-local registry
+//! A [`CoreLocalDevice`] owns no ring at all. It carries only the small,
+//! copyable disk metadata (page size, capacity, write queue depth) plus
+//! the registered `Fixed` file index for its disk, and resolves the
+//! actual ring at call time from the thread-local registry
 //! ([`crate::ring`]). That makes it trivially `Send + Sync`:
 //! the engine that holds it can be published to any thread, but every
 //! [`BlockDevice`] call only succeeds on the storage core whose ring
@@ -15,8 +14,6 @@
 //! [`set_current_storage_ring`](crate::ring::set_current_storage_ring)).
 //! Off-core calls fail with `Err(Io(ENXIO))` rather than touching a
 //! foreign ring.
-//!
-//! [`UringBlockDevice`]: crate::storage::blockdev::UringBlockDevice
 
 use crate::ring::{current_storage_ring, with_current_storage_ring};
 use crate::storage::blockdev::BlockDevice;
@@ -139,19 +136,11 @@ fn off_core_err() -> Error {
 mod tests {
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::Arc;
-    use std::task::{Context, Poll, Wake, Waker};
+    use std::task::{Context, Poll};
 
     use super::*;
     use crate::ring::clear_current_storage_ring;
-
-    struct NoopWake;
-    impl Wake for NoopWake {
-        fn wake(self: Arc<Self>) {}
-    }
-    fn noop_waker() -> Waker {
-        Arc::new(NoopWake).into()
-    }
+    use crate::runtime::noop_waker;
 
     fn block_on<F: Future>(mut fut: F) -> F::Output {
         let waker = noop_waker();

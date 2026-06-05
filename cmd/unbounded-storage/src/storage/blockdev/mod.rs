@@ -26,7 +26,7 @@ pub use mock::{MockDevice, MockDeviceConfig, MockFaultMode};
 pub use scratch::{AcquireFut, ScratchPage, ScratchPool};
 
 #[cfg(target_os = "linux")]
-pub use uring::{OpenDisk, OpenError, UringBlockDevice, UringConfig, UringDevice, provision_file};
+pub use uring::{OpenDisk, OpenError, UringDevice, provision_file};
 
 use crate::storage::types::{Error, Lba};
 

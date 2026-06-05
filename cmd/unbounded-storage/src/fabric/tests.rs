@@ -407,16 +407,9 @@ fn drain_stream<'a, S: PageStream + ?Sized>(
     mut stream: std::pin::Pin<&mut S>,
     timeout: Duration,
 ) -> Vec<Result<PageRef, crate::bufferpool::Error>> {
-    use std::ptr;
-    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    use std::task::{Context, Poll};
 
-    fn no(_: *const ()) {}
-    fn clone(_: *const ()) -> RawWaker {
-        RawWaker::new(ptr::null(), &VT)
-    }
-    static VT: RawWakerVTable = RawWakerVTable::new(clone, no, no, no);
-    // SAFETY: vtable never deref's the data pointer.
-    let waker = unsafe { Waker::from_raw(RawWaker::new(ptr::null(), &VT)) };
+    let waker = crate::runtime::noop_waker();
     let mut cx = Context::from_waker(&waker);
 
     let started = std::time::Instant::now();
@@ -668,15 +661,8 @@ fn rpc_mid_stream_cancellation() {
         // explicitly to trigger the client-side cancellation path.
         let mut s = unsafe { std::pin::Pin::new_unchecked(&mut stream) };
         // Poll until we observe the first PAGE_ACK or hit a timeout.
-        use std::ptr;
-        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-        fn no(_: *const ()) {}
-        fn clone(_: *const ()) -> RawWaker {
-            RawWaker::new(ptr::null(), &VT)
-        }
-        static VT: RawWakerVTable = RawWakerVTable::new(clone, no, no, no);
-        // SAFETY: vtable never derefs the data pointer.
-        let waker = unsafe { Waker::from_raw(RawWaker::new(ptr::null(), &VT)) };
+        use std::task::{Context, Poll};
+        let waker = crate::runtime::noop_waker();
         let mut cx = Context::from_waker(&waker);
         let started = std::time::Instant::now();
         let mut got_first = false;

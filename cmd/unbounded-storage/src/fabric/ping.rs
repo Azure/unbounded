@@ -259,15 +259,9 @@ where
     F: std::future::Future<Output = Result<CompletionInfo>>,
 {
     use std::pin::Pin;
-    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    use std::task::{Context, Poll};
 
-    fn raw() -> RawWaker {
-        static VT: RawWakerVTable =
-            RawWakerVTable::new(|_| RawWaker::new(ptr::null(), &VT), |_| {}, |_| {}, |_| {});
-        RawWaker::new(ptr::null(), &VT)
-    }
-    // SAFETY: vtable never dereferences the data pointer.
-    let waker = unsafe { Waker::from_raw(raw()) };
+    let waker = crate::runtime::noop_waker();
     let mut cx = Context::from_waker(&waker);
     // SAFETY: we own `fut` by value on the stack.
     let mut fut = unsafe { Pin::new_unchecked(&mut fut) };

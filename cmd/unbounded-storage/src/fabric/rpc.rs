@@ -17,14 +17,19 @@
 //!   `fi_tsend(RESPONSE_END_TAG_BASE | rid)` (success, zero payload)
 //!   or `fi_tsend(ERROR_ACK_TAG_BASE | rid, bincode(ErrorAck))`.
 //!
-//! **Worker model**: each in-flight request is processed by a
-//! dedicated OS thread spawned via the fabric's runtime. The thread
-//! drives the handler stream synchronously, polling it with a
-//! noop-waker; it then submits libfabric ops and blocks on their
-//! `CompletionFuture`s via a spin-poller (mirroring `ping.rs`).
-//! `RpcServerHandle::drop` sets a shutdown flag that workers check
-//! between handler-stream polls; this is the mechanism that drops
-//! mid-stream handlers when the embedder tears the server down.
+//! **Worker model**: a fixed pool of `rpc_worker_threads` long-lived
+//! OS threads is spawned at `start_rpc_server`, each pinned to the
+//! shard's `worker_idx`. The recv-completion handler runs on the
+//! progress thread; it re-posts a fresh recv and enqueues the decoded
+//! request onto a bounded [`JobQueue`](super::rpc_queue::JobQueue)
+//! rather than spawning a thread per request. A pool worker pulls the
+//! job, drives the handler stream to completion, RMA-writes pages, and
+//! blocks on each libfabric completion with a *real* waker that unparks
+//! the worker (see [`park`](super::park)); the progress-thread
+//! completion path resolves the wait immediately. Queue depth is capped
+//! at `max_inflight` (back-pressure); excess requests get a fast
+//! "server overloaded" `ERROR_ACK`. `RpcServerHandle::drop` sets a
+//! shutdown flag, closes the queue, and joins every worker.
 //!
 //! **MR strategy** (per Phase 5a spec, option (a)): we allocate
 //! request-recv buffers per outstanding recv and free them in the
@@ -41,7 +46,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::bufferpool::{BulkRef, Req, StripeKey};
-use crate::runtime::WorkerIdx;
+use crate::runtime::{JoinHandle, park_block_on_until, thread_waker};
 
 use super::backing::MrHandle;
 use super::completion::{CompletionFuture, CompletionInfo, CompletionSlot};
@@ -49,6 +54,7 @@ use super::error::{FabricError, Result as FabResult};
 use super::fabric::{Fabric, FabricInner};
 use super::ffi;
 use super::handler::{Handler, HandlerStream};
+use super::rpc_queue::{Job, JobQueue};
 
 // Reserved tag bases for the RPC protocol. The low 32 bits carry the
 // request id; the high 32 bits select the message class.
@@ -59,6 +65,14 @@ pub const ERROR_ACK_TAG_BASE: u64 = 0xFFFF_FFF6_0000_0000;
 
 const REQ_TAG_IGNORE: u64 = 0x0000_0000_FFFF_FFFF;
 const REQUEST_RECV_BUF_LEN: usize = 64 * 1024;
+
+/// How long a worker parks in a single slice while blocked on a
+/// libfabric completion before re-checking the server shutdown flag.
+/// The completion path still unparks the worker immediately on success;
+/// this only bounds how long a worker waiting on a completion that may
+/// never arrive (peer gone mid-write) lingers after shutdown is
+/// signaled, keeping `RpcServerHandle::drop` responsive.
+const SHUTDOWN_POLL_SLICE: Duration = Duration::from_millis(25);
 
 /// Loop-protection safety net for recursive Chord-finger routing.
 ///
@@ -162,25 +176,47 @@ struct ServerShared {
     /// [`Fabric::start_rpc_server`] to match the bufferpool's actual
     /// page size.
     page_size: usize,
+    /// Bounded queue feeding the persistent worker pool. The recv
+    /// handler (progress thread) pushes decoded requests; workers pop
+    /// and serve them. Closed on shutdown so workers drain and exit.
+    queue: Arc<JobQueue>,
+    /// Set on shutdown. Workers check it between handler-stream polls
+    /// to abandon an in-flight stream with a fast `ERROR_ACK`.
     shutdown: AtomicBool,
+    /// Number of requests currently queued or being served. Bounded by
+    /// `max_inflight` as the server-side back-pressure limit: a recv
+    /// that would exceed it is rejected with a "server overloaded"
+    /// `ERROR_ACK` instead of being enqueued.
     inflight: AtomicU64,
 }
 
 /// Handle returned from `Fabric::start_rpc_server`. Drop signals
-/// shutdown to outstanding workers and waits briefly for them to
-/// observe the flag.
+/// shutdown to the worker pool, closes the job queue, and joins every
+/// worker thread before returning, so no worker outlives the handle.
 pub struct RpcServerHandle {
     shared: Arc<ServerShared>,
+    /// Join handles for the persistent worker pool. Owned here (not in
+    /// `ServerShared`) because joining consumes them.
+    workers: Vec<JoinHandle>,
 }
 
 impl Drop for RpcServerHandle {
     fn drop(&mut self) {
+        // Signal in-flight handlers to bail out, then close the queue so
+        // idle workers wake and any still-queued jobs drain (each sees
+        // the shutdown flag and finishes fast). Unpark every worker so
+        // one blocked inside a completion wait (a fixed `fi_write`/ack to
+        // a slow or dead peer) re-polls, observes the shutdown flag, and
+        // abandons the wait instead of parking out its 10s deadline.
+        // Joining then guarantees every worker has stopped touching the
+        // fabric before it is torn down.
         self.shared.shutdown.store(true, Ordering::Release);
-        let started = std::time::Instant::now();
-        while self.shared.inflight.load(Ordering::Acquire) > 0
-            && started.elapsed() < Duration::from_secs(2)
-        {
-            std::thread::sleep(Duration::from_millis(5));
+        self.shared.queue.close();
+        for worker in &self.workers {
+            worker.thread().unpark();
+        }
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
         }
     }
 }
@@ -204,15 +240,42 @@ impl Fabric {
             fabric: self.inner_arc(),
             local_mr,
             page_size,
+            queue: Arc::new(JobQueue::new()),
             shutdown: AtomicBool::new(false),
             inflight: AtomicU64::new(0),
         });
+
+        // Spawn the persistent worker pool before posting recvs so a
+        // request that lands immediately has a consumer waiting. Pin to
+        // this shard's worker index (Phase 2: not the hardcoded
+        // `WorkerIdx(0)`) so handler scratch/MR access stays NUMA-local.
+        let runtime = shared.fabric.cfg.runtime.clone();
+        let worker_idx = shared.fabric.cfg.worker_idx;
+        let pool_size = shared.fabric.cfg.rpc_worker_threads.max(1);
+        let mut workers = Vec::with_capacity(pool_size);
+        for _ in 0..pool_size {
+            let queue = shared.queue.clone();
+            workers.push(runtime.spawn_pinned(
+                worker_idx,
+                "fabric-rpc-worker",
+                Box::new(move || worker_loop(&queue)),
+            ));
+        }
+
         let max_inflight = shared.fabric.cfg.max_inflight;
         let posted = posted_request_recvs(shared.fabric.cfg.rpc_posted_recvs, max_inflight);
         for _ in 0..posted {
             post_request_recv::<R, H>(&shared, &handler)?;
         }
-        Ok(RpcServerHandle { shared })
+        Ok(RpcServerHandle { shared, workers })
+    }
+}
+
+/// Body of each persistent pool thread: pull jobs and run them until
+/// the queue is closed and drained.
+fn worker_loop(queue: &JobQueue) {
+    while let Some(job) = queue.pop_blocking() {
+        job();
     }
 }
 
@@ -277,20 +340,38 @@ where
 
         let _ = post_request_recv::<R, H>(&shared_for_handler, &handler_for_handler);
 
-        let shared_for_worker = shared_for_handler.clone();
-        let handler_for_worker = handler_for_handler.clone();
         let src_addr = info.src_addr;
-        shared_for_worker.inflight.fetch_add(1, Ordering::AcqRel);
-        let shared_for_decr = shared_for_worker.clone();
-        let runtime = shared_for_worker.fabric.cfg.runtime.clone();
-        let _h = runtime.spawn_pinned(
-            WorkerIdx(0),
-            "fabric-rpc-worker",
-            Box::new(move || {
-                run_worker::<R, H>(shared_for_worker, handler_for_worker, header, req, src_addr);
-                shared_for_decr.inflight.fetch_sub(1, Ordering::AcqRel);
-            }),
-        );
+        // Back-pressure: bound the number of requests queued or being
+        // served to `max_inflight`. A request over the cap is shed with
+        // a fast "server overloaded" ack instead of being enqueued, so
+        // an overloaded server stops the queue from growing unboundedly.
+        // This runs on the progress thread, so the rejection ack is
+        // fire-and-forget (see `reject_overloaded`).
+        let max_inflight = shared_for_handler.fabric.cfg.max_inflight as u64;
+        let prev = shared_for_handler.inflight.fetch_add(1, Ordering::AcqRel);
+        if prev >= max_inflight {
+            shared_for_handler.inflight.fetch_sub(1, Ordering::AcqRel);
+            let _ = reject_overloaded(&shared_for_handler, src_addr, header.request_id);
+            return;
+        }
+
+        let shared_for_job = shared_for_handler.clone();
+        let handler_for_job = handler_for_handler.clone();
+        let job: Job = Box::new(move || {
+            run_worker::<R, H>(
+                shared_for_job.clone(),
+                handler_for_job,
+                header,
+                req,
+                src_addr,
+            );
+            shared_for_job.inflight.fetch_sub(1, Ordering::AcqRel);
+        });
+        if shared_for_handler.queue.push(job).is_err() {
+            // Queue closed (server shutting down): the job never runs, so
+            // release the in-flight reservation it would have decremented.
+            shared_for_handler.inflight.fetch_sub(1, Ordering::AcqRel);
+        }
     });
     let ctx = slot.into_raw();
     // SAFETY: ep, buf_ptr, ctx all live for the call.
@@ -360,14 +441,19 @@ fn run_worker<R, H>(
     // the duration of run_worker; we never move it.
     let mut stream = unsafe { std::pin::Pin::new_unchecked(&mut stream) };
 
+    // A real parking waker, created once for this request. Production
+    // handler streams drive synchronously and never register it, so the
+    // bounded `park_timeout` below is the safety net that re-polls and
+    // re-checks the shutdown flag; if a handler ever did register and
+    // wake it, the worker would unpark promptly instead.
+    let waker = thread_waker();
+    let mut task_cx = std::task::Context::from_waker(&waker);
     let mut next_idx: u32 = 0;
     loop {
         if shared.shutdown.load(Ordering::Acquire) {
             let _ = send_error_ack(&shared, src_addr, header.request_id, "server shutting down");
             return;
         }
-        let waker = noop_waker();
-        let mut task_cx = std::task::Context::from_waker(&waker);
         match stream.as_mut().poll_next(&mut task_cx) {
             std::task::Poll::Ready(Some(Ok(page))) => {
                 match write_page(&shared, &local_mr, src_addr, &header, next_idx, page) {
@@ -375,12 +461,18 @@ fn run_worker<R, H>(
                         next_idx = next_idx.saturating_add(1);
                     }
                     Err(e) => {
-                        let _ = send_error_ack(
-                            &shared,
-                            src_addr,
-                            header.request_id,
-                            &format!("write_page: {e}"),
-                        );
+                        // A write failure during shutdown is expected
+                        // (the wait was interrupted); skip the ack so we
+                        // do not chain another blocking send while the
+                        // server is tearing down, and just stop.
+                        if !shared.shutdown.load(Ordering::Acquire) {
+                            let _ = send_error_ack(
+                                &shared,
+                                src_addr,
+                                header.request_id,
+                                &format!("write_page: {e}"),
+                            );
+                        }
                         return;
                     }
                 }
@@ -394,7 +486,7 @@ fn run_worker<R, H>(
                 return;
             }
             std::task::Poll::Pending => {
-                std::thread::sleep(Duration::from_millis(5));
+                std::thread::park_timeout(Duration::from_millis(5));
             }
         }
     }
@@ -451,7 +543,7 @@ fn write_page(
             }
             return Err(FabricError::Pkg("fi_write", rc as i32));
         }
-        match block_on(fut, Duration::from_secs(10)) {
+        match block_on(fut, Duration::from_secs(10), &shared.shutdown) {
             Ok(_) => break,
             Err(FabricError::Cq { prov_errno, err })
                 if prov_errno == ffi::ENOTCONN && std::time::Instant::now() < deadline =>
@@ -602,6 +694,27 @@ fn submit_small_send(
     tag: u64,
     payload: &[u8],
 ) -> FabResult<()> {
+    let fut = enqueue_small_send(shared, dest, tag, payload, Duration::from_secs(10))?;
+    wait_for_small_send(fut, Duration::from_secs(10), &shared.shutdown)
+}
+
+/// Submit a small tagged send and return its completion future without
+/// waiting. The send buffer is freed by the slot handler when the send
+/// completes, so dropping the returned future is safe: the completion
+/// still fires on the progress thread and reclaims the buffer.
+///
+/// `submit_backoff` bounds the `-FI_EAGAIN` submit retry. Worker
+/// threads pass a generous budget so a send survives the `tcp` RDM
+/// connection still establishing; the progress thread (overload
+/// rejection) passes `Duration::ZERO` for a single non-blocking attempt
+/// so it never stalls completion progress.
+fn enqueue_small_send(
+    shared: &Arc<ServerShared>,
+    dest: u64,
+    tag: u64,
+    payload: &[u8],
+    submit_backoff: Duration,
+) -> FabResult<CompletionFuture> {
     let inner = &shared.fabric;
     let buf: Box<[u8]> = payload.to_vec().into_boxed_slice();
     let buf_len = buf.len();
@@ -622,9 +735,11 @@ fn submit_small_send(
     // Retry on `-FI_EAGAIN` while the `tcp` RDM connection back to the
     // requester finishes establishing or the transmit queue drains.
     // EAGAIN neither consumes the buffer nor produces a completion, so
-    // the same ctx/buffer are reused across attempts.
+    // the same ctx/buffer are reused across attempts. This is a submit
+    // wait, not a completion wait (nothing would wake a parked thread
+    // here), so it stays a bounded sleep-backoff.
     let rc = {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + submit_backoff;
         loop {
             let rc = unsafe {
                 ffi::ub_fi_tsend(
@@ -651,48 +766,61 @@ fn submit_small_send(
         };
         return Err(FabricError::Pkg("fi_tsend (small)", rc as i32));
     }
-    wait_for_small_send(fut, Duration::from_secs(10))
+    Ok(fut)
 }
 
-fn wait_for_small_send(fut: CompletionFuture, timeout: Duration) -> FabResult<()> {
-    block_on(fut, timeout).map(|_| ())
+/// Shed a request the server is too busy to admit. Runs on the progress
+/// thread (in the recv handler), so it must not block: the ErrorAck is
+/// submitted with a single non-blocking attempt and its completion is
+/// not awaited. Dropping the future is safe (the slot handler frees the
+/// send buffer when the completion is reaped).
+fn reject_overloaded(shared: &Arc<ServerShared>, dest: u64, request_id: u32) -> FabResult<()> {
+    let payload = bincode::serialize(&ErrorAck {
+        message: "server overloaded".to_string(),
+    })
+    .map_err(|_| FabricError::Pkg("bincode(ErrorAck)", 0))?;
+    let _fut = enqueue_small_send(
+        shared,
+        dest,
+        ERROR_ACK_TAG_BASE | (request_id as u64),
+        &payload,
+        Duration::ZERO,
+    )?;
+    Ok(())
 }
 
-fn noop_waker() -> std::task::Waker {
-    use std::task::{RawWaker, RawWakerVTable};
-    fn no(_: *const ()) {}
-    fn clone(_: *const ()) -> RawWaker {
-        RawWaker::new(ptr::null(), &VT)
-    }
-    static VT: RawWakerVTable = RawWakerVTable::new(clone, no, no, no);
-    // SAFETY: vtable never dereferences the data pointer.
-    unsafe { std::task::Waker::from_raw(RawWaker::new(ptr::null(), &VT)) }
+fn wait_for_small_send(
+    fut: CompletionFuture,
+    timeout: Duration,
+    shutdown: &AtomicBool,
+) -> FabResult<()> {
+    block_on(fut, timeout, shutdown).map(|_| ())
 }
 
-fn block_on(mut fut: CompletionFuture, timeout: Duration) -> FabResult<CompletionInfo> {
-    use std::future::Future;
-    use std::pin::Pin;
-    use std::task::{Context, Poll};
-    let waker = noop_waker();
-    let mut cx = Context::from_waker(&waker);
-    let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
-    let started = std::time::Instant::now();
-    loop {
-        match fut.as_mut().poll(&mut cx) {
-            Poll::Ready(v) => return v,
-            Poll::Pending => {
-                if started.elapsed() >= timeout {
-                    return Err(FabricError::Timeout);
-                }
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        }
+/// Block the calling worker thread on a libfabric completion, parking
+/// (not spinning) between polls. The progress-thread completion path
+/// (`CompletionSlot::complete` -> `AtomicWaker::wake`) unparks us, so
+/// the wait resolves as soon as the CQE is reaped. Returns
+/// `FabricError::Timeout` if `timeout` elapses first, or as soon as
+/// `shutdown` is set so a draining server does not block joining a
+/// worker stuck on a completion a dead peer will never deliver.
+fn block_on(
+    fut: CompletionFuture,
+    timeout: Duration,
+    shutdown: &AtomicBool,
+) -> FabResult<CompletionInfo> {
+    match park_block_on_until(fut, timeout, SHUTDOWN_POLL_SLICE, || {
+        shutdown.load(Ordering::Acquire)
+    }) {
+        Some(result) => result,
+        None => Err(FabricError::Timeout),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::noop_waker;
 
     #[test]
     fn posted_request_recvs_clamps_lower_bound_to_one() {
@@ -766,7 +894,7 @@ mod tests {
     fn wait_for_small_send_accepts_completion_success() {
         let fut = completion_future(Ok(completion_info()));
 
-        assert!(wait_for_small_send(fut, Duration::from_secs(1)).is_ok());
+        assert!(wait_for_small_send(fut, Duration::from_secs(1), &AtomicBool::new(false)).is_ok());
     }
 
     #[test]
@@ -776,7 +904,8 @@ mod tests {
             err: -5,
         }));
 
-        let err = wait_for_small_send(fut, Duration::from_secs(1)).unwrap_err();
+        let err =
+            wait_for_small_send(fut, Duration::from_secs(1), &AtomicBool::new(false)).unwrap_err();
 
         match err {
             FabricError::Cq { prov_errno, err } => {
@@ -792,7 +921,21 @@ mod tests {
         let reg = super::super::completion::CompletionRegistry::new(1);
         let (_slot, fut) = reg.allocate().unwrap();
 
-        let err = wait_for_small_send(fut, Duration::ZERO).unwrap_err();
+        let err = wait_for_small_send(fut, Duration::ZERO, &AtomicBool::new(false)).unwrap_err();
+
+        assert!(matches!(err, FabricError::Timeout));
+    }
+
+    #[test]
+    fn wait_for_small_send_abandons_wait_when_shutdown_is_set() {
+        // A never-completing send (slot never reaped) with a long
+        // timeout must still return promptly once shutdown is set, so a
+        // draining server is not blocked joining the worker.
+        let reg = super::super::completion::CompletionRegistry::new(1);
+        let (_slot, fut) = reg.allocate().unwrap();
+        let shutdown = AtomicBool::new(true);
+
+        let err = wait_for_small_send(fut, Duration::from_secs(3600), &shutdown).unwrap_err();
 
         assert!(matches!(err, FabricError::Timeout));
     }
