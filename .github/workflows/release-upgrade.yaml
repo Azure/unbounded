@@ -136,12 +136,26 @@ jobs:
     steps:
       - name: Resolve tag
         id: resolve
+        # Bind workflow-context values to env vars so they enter the
+        # shell script as data, not as code. Inline `${{ ... }}` in a
+        # `run:` block is template-expanded BEFORE bash parses the
+        # script, so any shell metacharacter in the source value would
+        # become script syntax. workflow_run runs in the privileged
+        # default-branch context and can poison the Actions cache or
+        # exfiltrate environment secrets, so this matters even though
+        # the source values here are constrained to authenticated
+        # repo-writers.
+        # See CodeQL rule actions/cache-poisoning/code-injection.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          UPSTREAM_TAG: ${{ github.event.workflow_run.head_branch }}
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          case "${{ github.event_name }}" in
-            workflow_run)      TAG="${{ github.event.workflow_run.head_branch }}" ;;
-            workflow_dispatch) TAG="${{ inputs.tag }}" ;;
-            *)                 echo "::error::unexpected event ${{ github.event_name }}"; exit 1 ;;
+          case "$EVENT_NAME" in
+            workflow_run)      TAG="$UPSTREAM_TAG" ;;
+            workflow_dispatch) TAG="$INPUT_TAG" ;;
+            *)                 echo "::error::unexpected event $EVENT_NAME"; exit 1 ;;
           esac
 
           if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
@@ -471,10 +485,19 @@ jobs:
 
       - name: Run smoke task ${{ matrix.task.name }}
         timeout-minutes: 15
+        # SMOKE_SCRIPT comes from a matrix entry that smoke-discover
+        # built from `find hack/release/smoke/*.sh` output. The values
+        # are committed repo paths today, but we still bind via `env:`
+        # rather than inline `${{ matrix.task.script }}` so that any
+        # future change to how the matrix is populated cannot silently
+        # introduce a code-injection sink. The `name:` above is workflow
+        # metadata, not a shell context, so inlining is fine there.
+        env:
+          SMOKE_SCRIPT: ${{ matrix.task.script }}
         run: |
           set -euo pipefail
-          chmod +x "${{ matrix.task.script }}"
-          "${{ matrix.task.script }}"
+          chmod +x "$SMOKE_SCRIPT"
+          "$SMOKE_SCRIPT"
 
   # ---------------------------------------------------------------------------
   # CUSTOMIZE: Teams notification (NOT YET ENABLED)
