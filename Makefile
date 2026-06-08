@@ -537,7 +537,7 @@ bench: $(LIBFABRIC_STAMP) ## Build the bench tool (excluded from images)
 TLA_TOOLS_JAR ?= tmp/tla2tools.jar
 TLA_TOOLS_VERSION ?= v1.8.0
 TLA_TOOLS_URL ?= https://github.com/tlaplus/tlaplus/releases/download/$(TLA_TOOLS_VERSION)/tla2tools.jar
-TLA_TOOLS_SHA256 ?= 71546dff3897a01b0ee4fa64135d9f5e9384d2b7e47b3cc20a16b655b0eb4f86
+TLA_TOOLS_SHA256 ?= 237332bdcc79a35c7d26efa7b82c77c85c2744591c5598673a8a45085ff2a4fb
 
 # Root directory holding the TLA+ models.  Each subdirectory contains exactly
 # one <Name>.tla plus a matching <Name>.cfg and is model-checked by a per-model
