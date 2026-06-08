@@ -44,7 +44,7 @@ use crate::http::{
 };
 use crate::ring::NetHandle;
 use crate::runtime::noop_waker;
-use crate::storage::{OriginRef, StripeReq};
+use crate::storage::{ObjectMetadata, OriginRef, StripeReq};
 
 /// The `x-amz-request-id` response header name. Present on every
 /// response (success and error) so clients and proxies can correlate.
@@ -332,7 +332,7 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
     // (404 NoSuchKey) from any other failure (500 InternalError). Unlike
     // the plain HTTP frontend, a length-read failure is never a silently
     // dropped connection.
-    let len = match read_object_length_s3(pool, backend_id, &path).await {
+    let len = match read_object_length_s3(pool, backend_id, &path, page_size).await {
         LenResult::Len(l) => l,
         LenResult::NotFound => {
             let bytes = error_bytes(S3ErrorCode::NoSuchKey, &path, &request_id, is_head, None);
@@ -458,7 +458,7 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
 /// distinction the S3 frontend acts on: a missing origin object maps to
 /// a 404, every other failure to a 500.
 enum LenResult {
-    /// The length entry resolved to this byte length.
+    /// The metadata entry resolved to this byte length.
     Len(u64),
     /// The origin reported the object does not exist
     /// ([`Error::OriginNotFound`]).
@@ -468,7 +468,7 @@ enum LenResult {
 }
 
 /// Resolve an object's length by reading its dedicated content-addressed
-/// length entry through the pool, preserving an
+/// metadata entry through the pool, preserving an
 /// [`Error::OriginNotFound`] as [`LenResult::NotFound`].
 ///
 /// This is the S3 frontend's own variant of
@@ -480,10 +480,11 @@ async fn read_object_length_s3<P: BufferPool<Req = StripeReq>>(
     pool: &Rc<P>,
     backend_id: &str,
     path: &str,
+    page_size: usize,
 ) -> LenResult {
-    let origin_ref = OriginRef::length_entry(backend_id, path);
+    let origin_ref = OriginRef::metadata_entry(backend_id, path);
     let req = StripeReq::new(origin_ref.stripe_key()).with_origin(origin_ref);
-    let mut rs = match pool.read(&req, 0, 8).await {
+    let mut rs = match pool.read(&req, 0, page_size as u64).await {
         Ok(rs) => rs,
         Err(Error::OriginNotFound) => return LenResult::NotFound,
         Err(_) => return LenResult::Other,
@@ -494,13 +495,10 @@ async fn read_object_length_s3<P: BufferPool<Req = StripeReq>>(
         Some(Err(_)) => return LenResult::Other,
         None => return LenResult::Other,
     };
-    let bytes = page.as_slice();
-    if bytes.len() < 8 {
-        return LenResult::Other;
+    match ObjectMetadata::decode(page.as_slice()) {
+        Ok(meta) => LenResult::Len(meta.length),
+        Err(_) => LenResult::Other,
     }
-    let mut le = [0u8; 8];
-    le.copy_from_slice(&bytes[..8]);
-    LenResult::Len(u64::from_le_bytes(le))
 }
 
 /// Format the `200 OK` head for serving a whole object.

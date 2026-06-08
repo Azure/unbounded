@@ -29,7 +29,7 @@ use ::http::header::{CONNECTION, HOST, RANGE};
 use crate::bufferpool::{BulkRef, Error, PageRef, PageStream};
 use crate::http::{Method, ResponseHead, StatusCode, serialize_request};
 use crate::ring::{NetHandle, SockAddr};
-use crate::storage::StripeReq;
+use crate::storage::{ObjectMetadata, StripeReq};
 
 use super::Backend;
 use super::origin_ring::OriginRing;
@@ -130,12 +130,12 @@ impl Backend for S3Backend {
         let page_size = self.page_size;
         let host = self.host.clone();
 
-        // A length entry is not a byte range of the object; it is a
+        // A metadata entry is not a byte range of the object; it is a
         // synthetic one-page cache entry whose payload is the object's
-        // length. The sentinel `stripe_idx` would overflow
+        // metadata. The sentinel `stripe_idx` would overflow
         // `absolute_range`, so this must branch before that is computed.
-        if origin.is_length_entry() {
-            let fut = Box::pin(fetch_length(
+        if origin.is_metadata_entry() {
+            let fut = Box::pin(fetch_metadata(
                 handle,
                 origin_addr,
                 host,
@@ -147,7 +147,7 @@ impl Backend for S3Backend {
             return S3FetchStream::pending(fut, dsts_owned);
         }
 
-        debug_assert!(!origin.is_length_entry());
+        debug_assert!(!origin.is_metadata_entry());
         let (start, len) = absolute_range(origin.stripe_idx, self.stripe_size, src.offset, src.len);
 
         let fut = Box::pin(fetch(
@@ -400,11 +400,11 @@ async fn fetch(
     Ok(())
 }
 
-/// Fill a length entry: HEAD the origin object, take its
-/// `Content-Length` as the object's byte length, and write that length
-/// as a little-endian `u64` into the (single) destination page.
+/// Fill a metadata entry: HEAD the origin object, take its
+/// `Content-Length` as the object's byte length, and write the encoded
+/// [`ObjectMetadata`] into the (single) destination page.
 #[allow(clippy::too_many_arguments)]
-async fn fetch_length(
+async fn fetch_metadata(
     handle: NetHandle,
     origin: &SockAddr,
     host: String,
@@ -413,15 +413,8 @@ async fn fetch_length(
     backing_base: *mut u8,
     page_size: usize,
 ) -> Result<(), Error> {
-    let capacity: usize = dsts.iter().map(|p| p.len as usize).sum();
-    if capacity < 8 {
-        return Err(Error::from(
-            "s3 backend: length entry destination smaller than 8 bytes",
-        ));
-    }
-
     let conn = TcpConn::open()?;
-    // See `HttpBackend::fetch` for why driving the ring on the current
+    // See `S3Backend::fetch` for why driving the ring on the current
     // thread is sound (the op futures self-pump on their own thread's
     // ring).
     handle
@@ -442,13 +435,13 @@ async fn fetch_length(
         }
         if buf.len() >= MAX_HEAD {
             return Err(Error::from(
-                "s3 backend: length HEAD response head exceeds 64 KiB",
+                "s3 backend: metadata HEAD response head exceeds 64 KiB",
             ));
         }
         let chunk = recv_chunk(&handle, conn.fd).await?;
         if chunk.is_empty() {
             return Err(Error::from(
-                "s3 backend: connection closed before length HEAD headers complete",
+                "s3 backend: connection closed before metadata HEAD headers complete",
             ));
         }
         buf.extend_from_slice(&chunk);
@@ -459,14 +452,14 @@ async fn fetch_length(
     }
     if status != StatusCode::OK {
         return Err(Error::from(
-            "s3 backend: length HEAD returned non-200 status",
+            "s3 backend: metadata HEAD returned non-200 status",
         ));
     }
     let length = content_length
-        .ok_or_else(|| Error::from("s3 backend: length HEAD missing Content-Length"))?;
+        .ok_or_else(|| Error::from("s3 backend: metadata HEAD missing Content-Length"))?;
 
-    let le_bytes = length.to_le_bytes();
-    copy_body_into_pages(&le_bytes, &dsts, backing_base, page_size)?;
+    let body = ObjectMetadata::new(length).encode()?;
+    copy_body_into_pages(&body, &dsts, backing_base, page_size)?;
     Ok(())
 }
 
