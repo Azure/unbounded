@@ -12,10 +12,20 @@
 //!   bits of every tag carry the `request_id`.
 //! * On the wire: client `fi_tsend`s a bincode-encoded
 //!   [`RequestHeader`] followed by the bincode-encoded `R` body.
-//! * Server replies with one `fi_tsend(PAGE_ACK_TAG_BASE | rid,
-//!   bincode(PageAck))` per RMA-written page, then either
-//!   `fi_tsend(RESPONSE_END_TAG_BASE | rid)` (success, zero payload)
-//!   or `fi_tsend(ERROR_ACK_TAG_BASE | rid, bincode(ErrorAck))`.
+//!   bincode(PageAck))` per RMA-written page. A full success (all
+//!   `dest_pages` written) sends no terminator: the client knows
+//!   `dest_pages` up front and treats "all pages acked" as
+//!   end-of-stream. A `fi_tsend(RESPONSE_END_TAG_BASE | rid)` (zero
+//!   payload) is sent only for a short success that wrote fewer than
+//!   `dest_pages` pages (including the zero-page case); an error at any
+//!   point sends `fi_tsend(ERROR_ACK_TAG_BASE | rid, bincode(ErrorAck))`.
+//!
+//!   The terminator is omitted on full success to avoid racing the
+//!   client's stream teardown: the client `fi_cancel`s its posted
+//!   terminator recv as soon as it has all pages, and a `RESPONSE_END`
+//!   that lost that race was stranded as an unexpected message,
+//!   accumulating until the `tcp` provider's receive buffering was
+//!   exhausted and the data path wedged.
 //!
 //! **Worker model**: a fixed pool of `rpc_worker_threads` long-lived
 //! OS threads is spawned at `start_rpc_server`, each pinned to the
@@ -482,7 +492,14 @@ fn run_worker<R, H>(
                 return;
             }
             std::task::Poll::Ready(None) => {
-                let _ = send_response_end(&shared, src_addr, header.request_id);
+                // Full success sends no terminator (the client ends on
+                // "all pages acked"); only a short/zero-page response
+                // needs an explicit RESPONSE_END. See module docs.
+                let terminated_by_last_ack =
+                    header.dest_pages > 0 && next_idx == header.dest_pages;
+                if !terminated_by_last_ack {
+                    let _ = send_response_end(&shared, src_addr, header.request_id);
+                }
                 return;
             }
             std::task::Poll::Pending => {
