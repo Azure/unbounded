@@ -40,6 +40,13 @@ use super::core::{OpFut, OpResource, RecvQuarantine, RingCore, RingSetup, Slot, 
 /// Thin owned wrapper around a `libc::sockaddr` plus its length, so
 /// `connect` can hand a stable pointer to the kernel for the op's
 /// duration.
+///
+/// `Clone`/`Copy` because the stored `sockaddr_storage` is plain bytes:
+/// an origin backend clones the resolved origin address into each
+/// self-owned fetch future so the produced page stream borrows nothing
+/// from the backend, which lets the backend live behind a hot-swappable
+/// registry (see [`crate::backend::BackendRegistry`]).
+#[derive(Clone, Copy)]
 pub struct SockAddr {
     storage: libc::sockaddr_storage,
     len: libc::socklen_t,

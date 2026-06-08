@@ -29,6 +29,26 @@ pub enum OriginBackend {
     S3(S3Backend),
 }
 
+impl OriginBackend {
+    /// Owned-stream variant of [`Backend::bulk_get`]. Delegates to the
+    /// inner backend's `fetch_stream`, which borrows nothing from the
+    /// backend, so the returned [`OriginStream`] is `'static`. This is
+    /// what lets a [`super::registry::BackendRegistry`] serve a fetch
+    /// from a backend it holds behind an `Arc`/`ArcSwap` without the
+    /// temporary `Arc` guard having to outlive the stream.
+    pub fn fetch_stream(
+        &self,
+        req: &StripeReq,
+        src: BulkRef,
+        dsts: &[PageRef],
+    ) -> OriginStream<'static> {
+        match self {
+            OriginBackend::Http(b) => OriginStream::Http(b.fetch_stream(req, src, dsts)),
+            OriginBackend::S3(b) => OriginStream::S3(b.fetch_stream(req, src, dsts)),
+        }
+    }
+}
+
 impl Backend for OriginBackend {
     type Req = StripeReq;
     type Stream<'a> = OriginStream<'a>;
@@ -39,6 +59,11 @@ impl Backend for OriginBackend {
         src: BulkRef,
         dsts: &'a [PageRef],
     ) -> Self::Stream<'a> {
+        // NB: this cannot delegate to the inherent `fetch_stream`, which
+        // returns `OriginStream<'static>`: `OriginStream<'a>` projects
+        // each inner backend's associated `Stream<'a>` and so is
+        // invariant in `'a`, which blocks the `'static -> 'a` coercion.
+        // The inner `bulk_get`s build the correctly-lifetimed stream.
         match self {
             OriginBackend::Http(b) => OriginStream::Http(b.bulk_get(req, src, dsts)),
             OriginBackend::S3(b) => OriginStream::S3(b.bulk_get(req, src, dsts)),

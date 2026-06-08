@@ -1,0 +1,165 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+syntax = "proto3";
+
+package unbounded.storage.config;
+
+message Config {
+  // Operator-assigned configuration version. The daemon treats it as an
+  // opaque counter: it never drives behavior, but it is tracked as the
+  // latest-known and latest-applied config versions so operators can
+  // confirm a pushed config has been realized across the process. The
+  // proto3 zero value (0) means "unversioned".
+  uint64 version = 6;
+  P2pCfg p2p = 1;
+  repeated PeerSpec peers = 2;
+  repeated DiskSpec disks = 3;
+  repeated BackendSpec backends = 4;
+  repeated FrontendSpec frontends = 5;
+  // Startup-fixed settings (memory backing, fabric endpoint/threads, CPU
+  // topology placement). Unlike the rest of the config these cannot be
+  // hot-reloaded: they are read exactly once when the process starts and
+  // changing them requires a restart. They are deliberately excluded from
+  // ConfigDiff; operators observe which config version's startup settings
+  // are realized via the separately tracked "startup" config version.
+  StartupCfg startup = 7;
+}
+
+// Startup-fixed settings, grouped by the subsystem that consumes them.
+// Every field's proto3 zero value means "unset" and is promoted to the
+// documented default by Config::apply_defaults.
+message StartupCfg {
+  MemoryCfg memory = 1;
+  FabricCfg fabric = 2;
+  TopologyCfg topology = 3;
+}
+
+message MemoryCfg {
+  // Allocate per-shard backing from the heap instead of 2 MiB hugepages.
+  bool no_hugepages = 1;
+  // Per-shard backing size in bytes. 0 -> 128 MiB.
+  uint64 bytes_per_shard = 2;
+}
+
+message FabricCfg {
+  // Per-shard fabric listen address. "" -> "0.0.0.0:0" (":0" picks a free
+  // port).
+  string listen_addr = 1;
+  // libfabric progress threads per shard. 0 -> 2.
+  uint32 progress_threads = 2;
+  // Progress-thread busy-poll budget in microseconds. 0 -> 10.
+  uint32 progress_poll_us = 3;
+  // Fabric RPC worker threads per shard. 0 -> 4.
+  uint32 rpc_worker_threads = 4;
+  // Max in-flight fabric operations per shard (back-pressure limit that
+  // sizes the completion registry and server-side request cap). 0 -> 1024.
+  uint32 max_inflight = 5;
+}
+
+message TopologyCfg {
+  // RDMA progress engines per HCA. 0 -> 1.
+  uint64 rdma_progress_per_hca = 1;
+  // RDMA completion handlers per HCA. 0 -> 4.
+  uint64 rdma_handlers_per_hca = 2;
+  // TCP-fallback threads when RDMA is unavailable. 0 -> 1.
+  uint64 tcp_fallback_threads = 3;
+  // Place shards on SMT sibling CPUs as well as physical cores.
+  bool use_smt_siblings = 4;
+  // Schedule shards onto isolcpus-isolated CPUs too. The proto3 false
+  // default preserves the historical "respect isolated CPUs" behavior.
+  bool ignore_isolated = 5;
+  // Allow placing a shard on each NUMA node's CPU 0. The proto3 false
+  // default preserves the historical "exclude node CPU 0" behavior.
+  bool include_node_cpu0 = 6;
+  // Use HCA ports that are not in the active state. The proto3 false
+  // default preserves the historical "require active port" behavior.
+  bool allow_inactive_port = 7;
+  // Disable RDMA and force the libfabric tcp provider.
+  bool disable_rdma = 8;
+}
+
+message P2pCfg {
+  uint32 fingers_per_node = 1;
+  optional uint64 local_node_id = 2;
+  repeated string local_labels = 3;
+  // When set, the daemon uses this precomputed routing table verbatim
+  // instead of deriving fingers from the full peer set. This is the
+  // "disjoint discovery" mode: a global-view planner selects each
+  // node's neighbors and ships them here, so a node only needs to know
+  // (and connect to) its direct routing neighbors. When unset, the
+  // daemon falls back to building the finger table from `peers` using
+  // `fingers_per_node`.
+  optional RoutingPlan routing_plan = 4;
+}
+
+// A precomputed routing table for a single node, produced by a
+// global-view planner. All ids reference `PeerSpec.id` values in the
+// `peers` list (each must be present so a fabric connection exists).
+// Ring positions are derived from ids, and labels do not affect runtime
+// routing, so only ids are carried here.
+message RoutingPlan {
+  // Peer ids selected as fingers. The local node id is excluded and
+  // the order is irrelevant (routing scans all fingers regardless).
+  repeated uint64 fingers = 1;
+  // Peer id of the nearest-forward neighbor on the ring.
+  optional uint64 successor = 2;
+  // Peer id of the nearest-backward neighbor on the ring.
+  optional uint64 predecessor = 3;
+}
+
+message PeerSpec {
+  uint64 id = 1;
+  PeerTransport transport = 2;
+  string address = 3;
+  optional uint32 hca_numa = 4;
+  repeated string labels = 5;
+}
+
+enum PeerTransport {
+  PEER_TRANSPORT_TCP = 0;
+  PEER_TRANSPORT_RDMA = 1;
+}
+
+message DiskSpec {
+  string path = 1;
+  DiskKind kind = 2;
+  optional uint64 size = 3;
+  optional uint32 numa = 4;
+  optional uint32 queue_depth = 5;
+  optional uint64 page_size_bytes = 6;
+  bool bypass_admission = 7;
+  bool skip_recovery_scan_if_no_meta = 8;
+}
+
+enum DiskKind {
+  DISK_KIND_NVME = 0;
+  DISK_KIND_BLOCK = 1;
+  DISK_KIND_FILE = 2;
+}
+
+message BackendSpec {
+  string id = 1;
+  BackendKind kind = 2;
+  string endpoint = 3;
+  uint64 stripe_size_bytes = 4;
+  uint32 http_concurrency = 5;
+  optional string bucket = 6;
+}
+
+enum BackendKind {
+  BACKEND_KIND_HTTP = 0;
+  BACKEND_KIND_S3 = 1;
+}
+
+message FrontendSpec {
+  string id = 1;
+  FrontendKind kind = 2;
+  string bind = 3;
+  string backend = 4;
+}
+
+enum FrontendKind {
+  FRONTEND_KIND_HTTP = 0;
+  FRONTEND_KIND_S3 = 1;
+}

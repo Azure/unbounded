@@ -8,9 +8,10 @@
 //! 1. **The factory** ([`HttpFrontend`]): validates a
 //!    [`FrontendSpec`](crate::config::FrontendSpec) and binds a
 //!    `SO_REUSEPORT` listening socket via `libc` so every shard can
-//!    accept on the same port. It does not implement the `Frontend`
-//!    trait: the concrete bufferpool type is only nameable in the
-//!    binary (Phase E), so the binary calls this directly.
+//!    accept on the same port. It exposes plain inherent methods
+//!    (`from_spec`, `bind_listener`) rather than a trait: the concrete
+//!    bufferpool type is only nameable in the binary, so the binary
+//!    builds and drives it directly.
 //! 2. **The serving engine** ([`HttpDriver`]): a per-shard,
 //!    cooperatively-driven engine generic over the bufferpool `P`. It
 //!    owns an internal future set (one persistent accept future plus
@@ -53,9 +54,8 @@ use crate::storage::{ObjectMetadata, OriginRef, StripeReq};
 /// HTTP serving frontend factory. Built once per [`FrontendSpec`];
 /// holds only the immutable configuration distilled from the spec.
 ///
-/// Unlike the old S3 stub this does not implement the `Frontend` trait:
-/// the per-shard [`HttpDriver`] is generic over the concrete bufferpool
-/// type, which is only nameable in the binary, so Phase E binds the
+/// The per-shard [`HttpDriver`] is generic over the concrete bufferpool
+/// type, which is only nameable in the binary, so the binary binds the
 /// listener via [`HttpFrontend::bind_listener`] and constructs the
 /// driver directly.
 pub struct HttpFrontend {
@@ -68,7 +68,7 @@ impl HttpFrontend {
     /// Construct from a [`FrontendSpec`], validating the kind and
     /// parsing the bind address.
     pub fn from_spec(spec: &FrontendSpec) -> Result<Self, FrontendError> {
-        if spec.kind != FrontendKind::Http {
+        if spec.kind() != FrontendKind::Http {
             return Err(FrontendError::UnsupportedKind("non-http frontend kind"));
         }
         let bind = spec
@@ -220,7 +220,24 @@ impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
     }
 }
 
-/// Serve one accepted connection end-to-end, then close its fd.
+impl<P: BufferPool<Req = StripeReq> + 'static> Drop for HttpDriver<P> {
+    /// Close the listen fd the driver owns. The driver is the sole owner
+    /// of this `SO_REUSEPORT` listener (the embedder hands it the fd from
+    /// `bind_listener` and never touches it again), so dropping the
+    /// driver (on shard shutdown or a live frontend removal) must close
+    /// it or the fd leaks. The accept future borrows only the fd number,
+    /// not ownership, so closing here is sound once the driver is gone.
+    fn drop(&mut self) {
+        if self.listen_fd >= 0 {
+            // SAFETY: `listen_fd` was returned by `bind_listener` and is
+            // owned exclusively by this driver; it is closed exactly once.
+            unsafe {
+                libc::close(self.listen_fd);
+            }
+        }
+    }
+}
+
 ///
 /// Owns everything it needs so the future is `'static` and can live in
 /// the driver's future set across ticks. All paths close `conn_fd` via
@@ -474,7 +491,7 @@ mod tests {
     fn spec(id: &str, bind: &str) -> FrontendSpec {
         FrontendSpec {
             id: id.to_string(),
-            kind: FrontendKind::Http,
+            kind: FrontendKind::Http as i32,
             bind: bind.to_string(),
             backend: "primary".to_string(),
         }
@@ -700,9 +717,5 @@ mod tests {
         assert!(!driver.progress());
         assert_eq!(driver.conn_count(), 0);
         assert!(driver.is_idle());
-
-        unsafe {
-            libc::close(listen_fd);
-        }
     }
 }
