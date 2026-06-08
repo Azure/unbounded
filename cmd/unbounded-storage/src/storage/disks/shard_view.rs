@@ -245,6 +245,7 @@ impl BlockStore for LiveShardLocalStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::noop_waker;
     use crate::storage::PageService;
     use crate::storage::blockdev::{BlockDevice, MockDevice, MockDeviceConfig};
     use crate::storage::types::{Error as DevError, Lba};
@@ -254,17 +255,9 @@ mod tests {
     use std::pin::{Pin, pin};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc::channel as std_channel;
-    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    use std::task::{Context, Poll};
     use std::thread::JoinHandle;
     use std::time::Duration;
-
-    fn noop_waker() -> Waker {
-        fn raw() -> RawWaker {
-            RawWaker::new(std::ptr::null(), &VTABLE)
-        }
-        static VTABLE: RawWakerVTable = RawWakerVTable::new(|_| raw(), |_| {}, |_| {}, |_| {});
-        unsafe { Waker::from_raw(raw()) }
-    }
 
     fn block_on<F: Future>(f: F) -> F::Output {
         let w = noop_waker();

@@ -15,9 +15,7 @@ use std::time::Duration;
 
 use clap::Parser;
 
-use unbounded_storage::backend::{
-    FixedRegion, HttpBackend, OriginBackend, OriginRing, S3Backend,
-};
+use unbounded_storage::backend::{FixedRegion, HttpBackend, OriginBackend, OriginRing, S3Backend};
 use unbounded_storage::bufferpool::{Pool, PoolConfig, PoolGroup, Req, ShardDescriptor, StripeKey};
 use unbounded_storage::config::{
     self, BackendKind, BackendSpec, Config, FabricCfg, FrontendKind, FrontendSpec,
@@ -53,7 +51,8 @@ const DEFAULT_STRIPE_SIZE_BYTES: u64 = 4 * 1024 * 1024;
 /// the main thread plus every shard thread.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
-type ShardPool = Pool<RoutedTransport<StripeReq, OriginBackend>, Arc<LiveShardLocalStore>, StripeReq>;
+type ShardPool =
+    Pool<RoutedTransport<StripeReq, OriginBackend>, Arc<LiveShardLocalStore>, StripeReq>;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -402,6 +401,7 @@ fn run_shard(
     cfg.listen = true;
     cfg.listen_addr = Some(fabric_cfg.listen_addr.clone());
     cfg.max_inflight = fabric_cfg.max_inflight;
+    cfg.rpc_worker_threads = fabric_cfg.rpc_worker_threads;
     cfg.progress_threads = fabric_cfg.progress_threads;
     cfg.progress_poll_us = fabric_cfg.progress_poll_us;
     cfg.numa = worker.numa;
@@ -597,6 +597,19 @@ fn run_shard(
     // order (see the drop sequence below).
     let pool = Rc::new(pool);
 
+    // Make cancelled fixed-buffer RECVs into pool pages sound without
+    // blocking the dropping task: a cancelled RECV's destination page is
+    // withheld from the free list until the kernel finishes with it (its
+    // RECV CQE is reaped). Only the shard socket ring receives into pool
+    // pages, so the quarantine is installed on it alone; the RPC worker
+    // rings receive into their own scratch backing and keep the blocking
+    // drain fallback. Installed before serving begins so every cancelled
+    // RECV is covered.
+    unbounded_storage::backend::install_recv_quarantine(
+        &socket.borrow(),
+        pool.recv_quarantine_handle(),
+    );
+
     // Bring up the per-shard RPC server so remote peers can fetch
     // stripes this node has resident locally (a peer "cache hit") and
     // so this node can act as an intermediate Chord hop, forwarding to
@@ -677,11 +690,13 @@ fn run_shard(
             fabric.clone(),
             scratch_mr,
             page_size,
-            // The handler runs on an ephemeral `fabric-rpc-worker`
-            // thread per inbound RPC, so it must NOT touch the shard
-            // ring (the shard thread progresses it concurrently; a
+            // The handler runs on one of the persistent
+            // `fabric-rpc-worker` pool threads, so it must NOT touch the
+            // shard ring (the shard thread progresses it concurrently; a
             // cross-thread `RefCell` borrow panics). A worker-local ring
-            // keeps every origin op on the serving thread.
+            // keeps every origin op on the serving thread; it is lazily
+            // initialized once per long-lived pool thread and reused
+            // across the many RPCs that thread serves.
             match make_origin_backend(
                 OriginRing::WorkerLocal {
                     queue_depth: 256,
@@ -845,9 +860,10 @@ fn run_shard(
     //      holds an `Arc<Fabric>` clone that must go before `fabric`.
     //      The pool's `HttpBackend` also holds an `Rc<socket>` clone.
     //   3. `socket` - the last shard-local `Rc<socket>` clone.
-    //   4. `rpc_server` - signals shutdown to outstanding RPC workers
-    //      and waits briefly for them; this must complete while `fabric`
-    //      (which they use) is still alive.
+    //   4. `rpc_server` - signals shutdown to the persistent RPC worker
+    //      pool, closes its job queue, and joins every worker thread;
+    //      this must complete while `fabric` (which they use) is still
+    //      alive.
     //   5. `fabric` last - joins its progress threads, closes the
     //      scratch MR the RPC server used, and tears libfabric down.
     drop(shard_loop);

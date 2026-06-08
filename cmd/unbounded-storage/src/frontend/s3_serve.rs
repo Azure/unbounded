@@ -30,9 +30,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll, Waker};
 
-use ::http::header::{
-    ACCEPT_RANGES, CONNECTION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE,
-};
+use ::http::header::{ACCEPT_RANGES, CONNECTION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE};
 use ::http::{Response, StatusCode};
 
 use crate::bufferpool::{BufferPool, Error};
@@ -42,9 +40,10 @@ use crate::frontend::range::{ByteRange, RangeError, ResolvedRange, full_object, 
 use crate::frontend::s3_xml::{S3ErrorCode, error_xml};
 use crate::http::{
     FdGuard, HttpRequest, MAX_HEADER_BYTES, Method, ParseError, RECV_CHUNK, bind_listener,
-    noop_waker, send_all, serialize_response_head, split_query,
+    send_all, serialize_response_head, split_query,
 };
 use crate::ring::NetHandle;
+use crate::runtime::noop_waker;
 use crate::storage::{OriginRef, StripeReq};
 
 /// The `x-amz-request-id` response header name. Present on every
@@ -297,8 +296,13 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
         Method::GET => false,
         Method::HEAD => true,
         _ => {
-            let bytes =
-                error_bytes(S3ErrorCode::MethodNotAllowed, &path, &request_id, false, None);
+            let bytes = error_bytes(
+                S3ErrorCode::MethodNotAllowed,
+                &path,
+                &request_id,
+                false,
+                None,
+            );
             let _ = send_all(handle, conn_fd, bytes).await;
             return Ok(());
         }
@@ -310,8 +314,13 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
         Some(v) => match ByteRange::parse(v) {
             Ok(r) => Some(r),
             Err(_) => {
-                let bytes =
-                    error_bytes(S3ErrorCode::InvalidRequest, &path, &request_id, is_head, None);
+                let bytes = error_bytes(
+                    S3ErrorCode::InvalidRequest,
+                    &path,
+                    &request_id,
+                    is_head,
+                    None,
+                );
                 let _ = send_all(handle, conn_fd, bytes).await;
                 return Ok(());
             }
@@ -331,8 +340,13 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
             return Ok(());
         }
         LenResult::Other => {
-            let bytes =
-                error_bytes(S3ErrorCode::InternalError, &path, &request_id, is_head, None);
+            let bytes = error_bytes(
+                S3ErrorCode::InternalError,
+                &path,
+                &request_id,
+                is_head,
+                None,
+            );
             let _ = send_all(handle, conn_fd, bytes).await;
             return Ok(());
         }
@@ -358,8 +372,13 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
                 return Ok(());
             }
             Err(_) => {
-                let bytes =
-                    error_bytes(S3ErrorCode::InvalidRequest, &path, &request_id, is_head, None);
+                let bytes = error_bytes(
+                    S3ErrorCode::InvalidRequest,
+                    &path,
+                    &request_id,
+                    is_head,
+                    None,
+                );
                 let _ = send_all(handle, conn_fd, bytes).await;
                 return Ok(());
             }
@@ -530,8 +549,8 @@ fn error_bytes(
     is_head: bool,
     content_range: Option<u64>,
 ) -> Vec<u8> {
-    let status = StatusCode::from_u16(code.http_status_u16())
-        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let status =
+        StatusCode::from_u16(code.http_status_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
     if is_head {
         let mut builder = Response::builder()

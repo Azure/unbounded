@@ -93,10 +93,7 @@ thread_local! {
     static WORKER_RING: RefCell<Option<Rc<RefCell<NetworkRing>>>> = const { RefCell::new(None) };
 }
 
-fn worker_local_handle(
-    queue_depth: u32,
-    region: Option<FixedRegion>,
-) -> io::Result<NetHandle> {
+fn worker_local_handle(queue_depth: u32, region: Option<FixedRegion>) -> io::Result<NetHandle> {
     WORKER_RING.with(|cell| {
         if let Some(ring) = cell.borrow().as_ref() {
             return Ok(NetHandle::new(Rc::clone(ring)));

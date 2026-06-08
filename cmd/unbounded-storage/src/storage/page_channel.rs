@@ -41,9 +41,10 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use std::task::{Context, Poll, Waker};
 
 use crate::bufferpool::{Error, StripeKey};
+use crate::runtime::noop_waker;
 use crate::storage::blockdev::BlockDevice;
 use crate::storage::engine::StorageEngine;
 
@@ -146,6 +147,17 @@ impl PageChannel {
             })
             .map_err(|_| Error::Io(libc::EPIPE))?;
         spin_block_on_with_alive(reply.wait(), &self.service_alive)
+    }
+
+    /// Stable identity of the storage-core service this channel
+    /// targets. All clones of one channel share it; a channel built by
+    /// a distinct [`Self::new`] has a distinct identity. Used by the
+    /// channel directory to skip republishing an unchanged channel set
+    /// (the `service_alive` allocation is kept alive by the holder for
+    /// as long as the channel is published, so the pointer is a sound
+    /// identity for live channels).
+    pub(crate) fn service_id(&self) -> usize {
+        Arc::as_ptr(&self.service_alive) as usize
     }
 }
 
@@ -507,22 +519,13 @@ fn spin_block_on_with_alive<T>(fut: ReplyWait<T>, service_alive: &AtomicBool) ->
     }
 }
 
-fn noop_waker() -> Waker {
-    fn raw() -> RawWaker {
-        RawWaker::new(std::ptr::null(), &VTABLE)
-    }
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(|_| raw(), |_| {}, |_| {}, |_| {});
-    // SAFETY: the vtable functions are no-ops or return the same
-    // vtable, so the waker can be cloned and dropped freely.
-    unsafe { Waker::from_raw(raw()) }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::storage::blockdev::{MockDevice, MockDeviceConfig};
     use crate::storage::engine::EngineConfig;
     use std::sync::mpsc::channel as std_channel;
+    use std::task::{RawWaker, RawWakerVTable};
     use std::time::Duration;
 
     fn block_on<F: Future>(mut fut: F) -> F::Output {

@@ -75,9 +75,8 @@ impl PageStream for NullStream {
 
 #[cfg(test)]
 mod tests {
-    use std::task::{RawWaker, RawWakerVTable, Waker};
-
     use crate::bufferpool::{BulkRef, StripeKey};
+    use crate::runtime::noop_waker;
 
     use super::*;
 
@@ -87,15 +86,6 @@ mod tests {
         fn key(&self) -> StripeKey {
             self.0
         }
-    }
-
-    fn noop_waker() -> Waker {
-        fn raw() -> RawWaker {
-            RawWaker::new(std::ptr::null(), &VTABLE)
-        }
-        static VTABLE: RawWakerVTable = RawWakerVTable::new(|_| raw(), |_| {}, |_| {}, |_| {});
-        // SAFETY: VTABLE clone/wake/drop are all no-ops on static data.
-        unsafe { Waker::from_raw(raw()) }
     }
 
     fn block_on<F: std::future::Future>(fut: F) -> F::Output {

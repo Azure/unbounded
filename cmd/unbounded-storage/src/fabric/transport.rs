@@ -85,17 +85,19 @@ pub struct FabricTransport<R, P> {
     fabric: Arc<Fabric>,
     mr: MrHandle,
     router: P,
+    page_size: usize,
     next_request_id: AtomicU32,
     _marker: PhantomData<fn() -> R>,
 }
 
 impl<R, P> FabricTransport<R, P> {
     /// Build a transport bound to `fabric` with destination MR `mr`.
-    /// `page_size` must divide `mr.len`; it is used only as a
-    /// construction-time sanity check that the caller's MR geometry
-    /// matches the pool's. The server-side wire planner still derives
-    /// page geometry from a crate-level constant - see the TODO in
-    /// `fabric/rpc.rs::plan_page_write`.
+    /// `page_size` must divide `mr.len`. It is the page geometry the
+    /// pool and the server-side wire planner share: the server
+    /// addresses each destination page as `dest_mr_base + ordinal *
+    /// page_size`, and the originating client uses `page_size` to shift
+    /// `dest_mr_base` to the caller's physical slot (see
+    /// `bulk_get_with_ttl`).
     pub fn new(fabric: Arc<Fabric>, mr: MrHandle, router: P, page_size: usize) -> FabResult<Self> {
         if page_size == 0 {
             return Err(FabricError::BadConfig("page_size must be > 0"));
@@ -109,6 +111,7 @@ impl<R, P> FabricTransport<R, P> {
             fabric,
             mr,
             router,
+            page_size,
             next_request_id: AtomicU32::new(1),
             _marker: PhantomData,
         })
@@ -141,6 +144,16 @@ where
     /// entry point delegates here with [`crate::fabric::MAX_HOPS`];
     /// the recursive-forwarding handler uses this to forward with a
     /// decremented `hops_remaining`.
+    ///
+    /// The wire protocol addresses each destination page as
+    /// `dest_mr_base + ordinal * page_size`, but the pool hands us
+    /// `dsts` pointing at arbitrary physical slots from its free list.
+    /// We therefore shift `dest_mr_base` by `dsts[0].page_idx *
+    /// page_size` so the server's ordinal-relative writes land in the
+    /// caller's actual slots, exactly as [`Self::bulk_get_forward`]
+    /// does for a recursive relay. This requires the `dsts` slots to be
+    /// physically contiguous (the pool's single-page fetches trivially
+    /// satisfy this); see the debug assertion below.
     pub(crate) fn bulk_get_with_ttl<'a>(
         &'a self,
         req: &'a R,
@@ -148,7 +161,20 @@ where
         dsts: &'a [PageRef],
         ttl: u32,
     ) -> FabricBulkStream<'a, R> {
-        FabricBulkStream::new_unstarted(self, req, src, dsts, ttl, self.mr)
+        let dest_mr = match dsts.first() {
+            Some(first) => {
+                debug_assert!(
+                    dsts.iter()
+                        .enumerate()
+                        .all(|(i, d)| { d.page_idx as usize == first.page_idx as usize + i }),
+                    "fabric bulk_get requires physically contiguous dst slots; \
+                     the wire protocol addresses pages by ordinal from dest_mr_base",
+                );
+                forward_dest_mr(self.mr, first.page_idx as usize * self.page_size)
+            }
+            None => self.mr,
+        };
+        FabricBulkStream::new_unstarted(self, req, src, dsts, ttl, dest_mr)
     }
 
     /// Forward `req` to the next hop, landing the downstream page(s)
@@ -816,8 +842,8 @@ fn remove_recv_context(ctxs: &mut Vec<*mut std::ffi::c_void>, completed: usize) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::noop_waker;
     use serde::ser::Serializer;
-    use std::task::{RawWaker, RawWakerVTable};
 
     struct NoRoute;
 
@@ -936,16 +962,6 @@ mod tests {
                 payload: Vec::new(),
             }),
         });
-    }
-
-    fn noop_waker() -> std::task::Waker {
-        fn no(_: *const ()) {}
-        fn clone(_: *const ()) -> RawWaker {
-            RawWaker::new(ptr::null(), &VT)
-        }
-        static VT: RawWakerVTable = RawWakerVTable::new(clone, no, no, no);
-        // SAFETY: vtable never dereferences the data pointer.
-        unsafe { std::task::Waker::from_raw(RawWaker::new(ptr::null(), &VT)) }
     }
 
     fn poll_once<R>(

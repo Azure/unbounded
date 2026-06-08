@@ -7,20 +7,16 @@
 //! This file owns the reusable, opinion-free pieces a server-side
 //! frontend needs regardless of which object protocol it speaks: the
 //! `SO_REUSEPORT` listener helper, the RAII socket-fd closer, the
-//! request-target query splitter, the full-buffer send loop, the noop
-//! waker for the cooperative driver, and the size constants. None of it
-//! knows about ranges, stripe geometry, or which status a frontend
-//! returns; that policy lives with the concrete frontend
-//! (`crate::frontend::http_serve`) and a future S3 frontend can reuse
-//! everything here unchanged.
+//! request-target query splitter, the full-buffer send loop, and the
+//! size constants. None of it knows about ranges, stripe geometry, or
+//! which status a frontend returns; that policy lives with the concrete
+//! frontend (`crate::frontend::http_serve`) and a future S3 frontend
+//! can reuse everything here unchanged.
 //!
 //! The libc/`io_uring`-bearing helpers ([`bind_listener`], [`FdGuard`],
 //! [`send_all`]) are Linux-gated because they depend on `libc` and the
 //! io_uring [`NetHandle`](crate::ring::NetHandle); the pure helpers
-//! ([`split_query`], [`noop_waker`]) and the constants are
-//! cross-platform.
-
-use std::task::{RawWaker, RawWakerVTable, Waker};
+//! ([`split_query`]) and the constants are cross-platform.
 
 #[cfg(target_os = "linux")]
 use std::net::SocketAddr;
@@ -182,17 +178,6 @@ pub(crate) fn split_query(target: &str) -> (&str, &str) {
         Some((p, q)) => (p, q),
         None => (target, ""),
     }
-}
-
-/// A noop waker for polling a serving engine's internal future set,
-/// mirroring `ShardLoop`'s cooperative discipline.
-pub(crate) fn noop_waker() -> Waker {
-    fn raw() -> RawWaker {
-        RawWaker::new(std::ptr::null(), &VTABLE)
-    }
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(|_| raw(), |_| {}, |_| {}, |_| {});
-    // SAFETY: VTABLE clone/wake/drop are all no-ops over static data.
-    unsafe { Waker::from_raw(raw()) }
 }
 
 #[cfg(test)]

@@ -337,8 +337,8 @@ fn is_valid_even_hex(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::schema::BackendKind;
+    use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
 

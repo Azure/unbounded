@@ -192,6 +192,14 @@ impl MutatorQueue {
         g.closed && g.items.is_empty()
     }
 
+    /// True once the queue has been closed via [`Self::close`].
+    /// The coalescing drain consults this so it stops spending its
+    /// yield budget on a queue that can no longer receive pushes,
+    /// letting a draining shutdown commit and exit promptly.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.inner.lock().unwrap().closed
+    }
+
     /// Number of items currently buffered. Used by shutdown
     /// invariants to verify the mutator drained all submitted
     /// requests before exiting.
@@ -211,6 +219,43 @@ impl MutatorQueue {
             }
         }
         out
+    }
+
+    /// Drain a coalesced batch of up to `max` items, spending at
+    /// most `ticks` cooperative yields to let in-flight producers
+    /// enqueue more before the consumer commits. Returns as soon
+    /// as the batch reaches `max`, the queue is closed, or the
+    /// yield budget is exhausted.
+    ///
+    /// This is the wall-clock-free realization of
+    /// [`crate::storage::EngineConfig::commit_batch_deadline_us`]:
+    /// the DST harness forbids reading elapsed time, so the
+    /// deadline is expressed as a budget of `ticks` logical yields
+    /// (see [`crate::storage::EngineConfig::commit_batch_ticks`]).
+    /// Each [`yield_once`] gives the executor a chance to
+    /// interleave producers that are about to push, so batches
+    /// grow under load while a drained or closed queue never
+    /// stalls. `ticks == 0` disables coalescing (a single drain).
+    ///
+    /// Callers gate on [`Self::wait_nonempty`] first, so the
+    /// returned batch is non-empty in practice; it can only be
+    /// empty if the caller raced an empty, non-closed queue.
+    pub(crate) async fn drain_batch(&self, max: usize, ticks: u32) -> Vec<MutatorReq> {
+        let mut batch = self.try_drain_up_to(max);
+        let mut spent = 0u32;
+        while batch.len() < max && spent < ticks {
+            // A closed queue will receive no further pushes, so
+            // stop waiting and let the consumer commit what it has
+            // and observe the close on its next loop.
+            if self.is_closed() {
+                break;
+            }
+            yield_once().await;
+            spent += 1;
+            let more = self.try_drain_up_to(max - batch.len());
+            batch.extend(more);
+        }
+        batch
     }
 
     /// Park the consumer until something is queued or the queue
@@ -250,15 +295,14 @@ impl Future for WaitNonEmpty {
 }
 
 /// Yield exactly once, registering the current waker to be woken
-/// immediately. Used by the mutator loop to invite further
-/// submissions to coalesce into the current batch without
-/// reaching for wall-clock time, which the DST harness forbids.
-///
-/// The crate's `commit_batch_deadline_us` config field exists to
-/// let production tune coalescing latency; here we approximate
-/// it as a single yield so the executor can interleave producers
-/// that are about to enqueue. Replacing this with a tick-aware
-/// scheme is a follow-up once a tick abstraction lands.
+/// immediately so the executor can interleave other tasks before
+/// re-polling. This is the single-tick building block the mutator
+/// uses to coalesce batches without reaching for wall-clock time,
+/// which the DST harness forbids: [`MutatorQueue::drain_batch`]
+/// spends a bounded number of these yields (see
+/// [`crate::storage::EngineConfig::commit_batch_ticks`]) to invite
+/// in-flight producers to enqueue into the current batch before it
+/// commits.
 pub(crate) fn yield_once() -> YieldOnce {
     YieldOnce { yielded: false }
 }
@@ -283,17 +327,10 @@ impl Future for YieldOnce {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::noop_waker;
     use std::future::Future;
     use std::pin::pin;
-    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-
-    fn noop_waker() -> Waker {
-        fn raw() -> RawWaker {
-            RawWaker::new(std::ptr::null(), &VTABLE)
-        }
-        static VTABLE: RawWakerVTable = RawWakerVTable::new(|_| raw(), |_| {}, |_| {}, |_| {});
-        unsafe { Waker::from_raw(raw()) }
-    }
+    use std::task::{Context, Poll};
 
     fn block_on<F: Future>(f: F) -> F::Output {
         let w = noop_waker();
@@ -355,5 +392,75 @@ mod tests {
         q.close();
         let ok = block_on(q.wait_nonempty());
         assert!(!ok);
+    }
+
+    fn push_n(q: &Arc<MutatorQueue>, n: usize) {
+        for _ in 0..n {
+            q.push(MutatorReq::Delete {
+                keys: vec![],
+                done: MutatorReply::new(),
+            });
+        }
+    }
+
+    /// Drive a `drain_batch` future to completion under a noop
+    /// waker, invoking `on_pending` before each re-poll. Returns
+    /// the drained batch and the number of `Poll::Pending`s
+    /// observed, i.e. the number of yields the drain actually
+    /// spent.
+    fn drive_drain(
+        q: &Arc<MutatorQueue>,
+        max: usize,
+        ticks: u32,
+        mut on_pending: impl FnMut(),
+    ) -> (Vec<MutatorReq>, u32) {
+        let w = noop_waker();
+        let mut cx = Context::from_waker(&w);
+        let mut fut = pin!(q.drain_batch(max, ticks));
+        let mut pendings = 0u32;
+        loop {
+            match fut.as_mut().poll(&mut cx) {
+                Poll::Ready(b) => return (b, pendings),
+                Poll::Pending => {
+                    on_pending();
+                    pendings += 1;
+                    assert!(pendings < 1_000, "drain_batch did not converge");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn drain_batch_coalesces_toward_max() {
+        let q = Arc::new(MutatorQueue::new());
+        push_n(&q, 2);
+        // Two more producers enqueue on every yield, so the batch
+        // climbs to `max` within the tick budget.
+        let (batch, _) = drive_drain(&q, 8, 8, || push_n(&q, 2));
+        assert_eq!(batch.len(), 8);
+    }
+
+    #[test]
+    fn drain_batch_stops_at_tick_budget_when_starved() {
+        let q = Arc::new(MutatorQueue::new());
+        push_n(&q, 1);
+        // No producer enqueues, so the drain spends its whole
+        // budget and returns the partial batch rather than
+        // stalling forever.
+        let (batch, pendings) = drive_drain(&q, 8, 3, || {});
+        assert_eq!(pendings, 3);
+        assert_eq!(batch.len(), 1);
+    }
+
+    #[test]
+    fn drain_batch_on_closed_queue_commits_without_yielding() {
+        let q = Arc::new(MutatorQueue::new());
+        push_n(&q, 2);
+        q.close();
+        // A closed queue must not spend any of the yield budget so
+        // a draining shutdown terminates promptly.
+        let (batch, pendings) = drive_drain(&q, 8, 8, || panic!("closed queue must not yield"));
+        assert_eq!(pendings, 0);
+        assert_eq!(batch.len(), 2);
     }
 }

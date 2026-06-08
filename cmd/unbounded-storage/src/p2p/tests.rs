@@ -10,23 +10,15 @@
 use std::collections::HashSet;
 use std::future::Future;
 use std::pin::pin;
-use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use std::task::{Context, Poll};
 
 use crate::p2p::{FingerTable, FingerTableConfig, NodeId, PeerEntry, RingId, TopologyLabels};
+use crate::runtime::noop_waker;
 
 // ---------------------------------------------------------------------------
-// Noop-waker block_on, copied from src/bufferpool/tests.rs to keep
-// the crate runtime-agnostic.
+// Noop-waker block_on built on the shared `runtime::noop_waker` helper
+// to keep the crate runtime-agnostic.
 // ---------------------------------------------------------------------------
-
-fn noop_waker() -> Waker {
-    fn raw() -> RawWaker {
-        RawWaker::new(std::ptr::null(), &VTABLE)
-    }
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(|_| raw(), |_| {}, |_| {}, |_| {});
-    // SAFETY: the vtable functions never dereference the data pointer.
-    unsafe { Waker::from_raw(raw()) }
-}
 
 fn block_on<F: Future>(future: F) -> F::Output {
     let waker = noop_waker();

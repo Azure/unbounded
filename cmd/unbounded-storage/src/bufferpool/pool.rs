@@ -9,10 +9,10 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll};
 
-use crate::bufferpool::free_list::FreeList;
+use crate::bufferpool::free_list::{FreeList, RecvQuarantineHandle};
 use crate::bufferpool::inflight::{PageSlot, SlotState, StripeFetch};
 use crate::bufferpool::stream::{LocalBoxFuture, ReadStream, StaticBoxFuture, StreamSrc};
-use crate::bufferpool::traits::{BlockStore, BufferPool, PageStream, Req, Transport};
+use crate::bufferpool::traits::{BlockStore, BufferPool, Req, Transport};
 use crate::bufferpool::types::{BulkRef, Error, PageRef, PoolConfig, StripeKey};
 use crate::bufferpool::window::WindowedRead;
 use crate::memory::Backing;
@@ -39,7 +39,7 @@ where
     pub(super) cfg: PoolConfig,
     pub(super) backing: Backing,
     pub(super) page_size: usize,
-    pub(super) free: FreeList,
+    pub(super) free: Rc<FreeList>,
     pub(super) inflight: RefCell<HashMap<StripeKey, Rc<RefCell<StripeFetch>>>>,
     pub(super) stream_count: Cell<usize>,
     /// Global speculative-prefetch budget shared by every
@@ -96,7 +96,7 @@ where
             cfg,
             backing,
             page_size,
-            free: FreeList::new(page_count_u32),
+            free: Rc::new(FreeList::new(page_count_u32)),
             inflight: RefCell::new(HashMap::new()),
             stream_count: Cell::new(0),
             inflight_prefetch_pages: Cell::new(0),
@@ -111,6 +111,16 @@ where
     /// out-of-tree DST harness under `tests/`.
     pub fn free_pages(&self) -> usize {
         self.inner.free.available()
+    }
+
+    /// Build a [`RecvQuarantineHandle`] over this pool's free list, for
+    /// installing on the shard's `NetworkRing` (see
+    /// `backend::install_recv_quarantine`). It lets a cancelled
+    /// fixed-buffer RECV withhold its destination page from reuse until
+    /// the kernel is done writing into it, keeping cancellation sound
+    /// without blocking the dropping task.
+    pub fn recv_quarantine_handle(&self) -> RecvQuarantineHandle {
+        RecvQuarantineHandle::new(self.inner.free.clone(), self.inner.page_size)
     }
 
     /// Test-only accessor for the inflight map size. Also used by
@@ -650,7 +660,6 @@ where
                     free: &inner.free,
                     completed: false,
                 };
-
                 if slot.page_idx.get().is_none() {
                     // Allocate the backing page lazily, here on the
                     // leader's first poll, so a fetch future that is
@@ -706,9 +715,7 @@ where
                             offset: stripe_off,
                             len: inner.page_size as u32,
                         };
-                        let dsts: [PageRef; 1] = [dst];
-                        let stream = inner.transport.bulk_get(req.as_ref(), bulk, &dsts);
-                        drive_single_page(stream).await?;
+                        inner.transport.fetch_one(req.as_ref(), bulk, dst).await?;
                     }
                     Ok(hit)
                 }
@@ -970,38 +977,4 @@ enum Outcome {
     Ready,
     Error(Error),
     Retry,
-}
-
-// ---------------------------------------------------------------------------
-// PageStream -> single-page adapter.
-// ---------------------------------------------------------------------------
-
-/// Drive a transport stream that the pool issued for a single
-/// `dsts: &[PageRef]` of length 1. Resolves `Ok(())` on the first
-/// `Some(Ok(_))`, propagates `Some(Err(_))`, and surfaces a
-/// premature `None` as `Error::Transport`.
-fn drive_single_page<S: PageStream>(stream: S) -> DriveSinglePage<S> {
-    DriveSinglePage { stream }
-}
-
-struct DriveSinglePage<S: PageStream> {
-    stream: S,
-}
-
-impl<S: PageStream> Future for DriveSinglePage<S> {
-    type Output = Result<(), Error>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // SAFETY: standard structural pin projection through the
-        // single `stream` field; we never move out of `self`.
-        let stream = unsafe { self.map_unchecked_mut(|s| &mut s.stream) };
-        match stream.poll_next(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Some(Ok(_page))) => Poll::Ready(Ok(())),
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(e)),
-            Poll::Ready(None) => Poll::Ready(Err(Error::from(
-                "transport stream ended without delivering page",
-            ))),
-        }
-    }
 }

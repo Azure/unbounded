@@ -453,7 +453,7 @@ generic over the runtime and not boxed (no `dyn BlockDevice`), so the engine is
 generic over the device. Implementations: `CoreLocalDevice` (resolves its
 `StorageRing` from the thread-local registry and returns `ENXIO` if driven off
 its storage core), `MockDevice` (with `MockFaultMode` for fault injection),
-`ScratchPool`/`ScratchPage`, and the Linux `UringBlockDevice`/`UringDevice`
+`ScratchPool`/`ScratchPage`, and the Linux `UringDevice` open path
 (`OpenDisk`, `provision_file`).
 
 **Cross-core bridge** (`page_channel.rs`): a `StorageEngine<CoreLocalDevice>` is

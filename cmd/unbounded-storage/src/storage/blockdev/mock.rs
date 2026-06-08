@@ -158,7 +158,7 @@ impl BlockDevice for MockDevice {
     async fn read(&self, lba: Lba, dst: &mut [u8]) -> Result<(), Error> {
         self.read_count.set(self.read_count.get() + 1);
         let cfg = self.cfg.get();
-        // Match `UringBlockDevice::read`: reject empty buffers and
+        // Match `CoreLocalDevice::read`: reject empty buffers and
         // any length that is not a whole multiple of `page_size`.
         // The two implementations are interchangeable behind the
         // `BlockDevice` trait, so their input contracts must agree.

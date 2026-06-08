@@ -228,21 +228,13 @@ mod tests {
     use std::os::fd::AsRawFd;
     use std::path::PathBuf;
     use std::pin::Pin;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::task::{Context, Poll, Wake, Waker};
+    use std::task::{Context, Poll};
 
     use super::*;
+    use crate::runtime::noop_waker;
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
-
-    struct NoopWake;
-    impl Wake for NoopWake {
-        fn wake(self: Arc<Self>) {}
-    }
-    fn noop_waker() -> Waker {
-        Arc::new(NoopWake).into()
-    }
 
     /// Drive multiple futures cooperatively, calling `ring.progress()`
     /// between polls. Returns the outputs in submission order.
