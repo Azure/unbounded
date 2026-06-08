@@ -7,6 +7,9 @@ import (
 	"net"
 	"sort"
 	"testing"
+
+	vnetlink "github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 )
 
 // ---------------------------------------------------------------------------
@@ -551,6 +554,28 @@ func TestRouteNeedsUpdate_GatewayChanged(t *testing.T) {
 	}
 }
 
+func TestRouteNeedsUpdate_FlagsChanged(t *testing.T) {
+	m := NewUnifiedRouteManager("test", 0, "wg", "unbounded0")
+
+	installed := &installedRouteState{flags: 0, peerNexthops: map[string]DesiredNexthop{}}
+	desired := DesiredRoute{Flags: unix.RTNH_F_ONLINK}
+
+	if !m.routeNeedsUpdate(installed, desired, nil) {
+		t.Error("route should need update when flags changed")
+	}
+}
+
+func TestRouteNeedsUpdate_ScopeGlobalChanged(t *testing.T) {
+	m := NewUnifiedRouteManager("test", 0, "wg", "unbounded0")
+
+	installed := &installedRouteState{scopeGlobal: false, peerNexthops: map[string]DesiredNexthop{}}
+	desired := DesiredRoute{ScopeGlobal: true}
+
+	if !m.routeNeedsUpdate(installed, desired, nil) {
+		t.Error("route should need update when gatewayless route scope changed")
+	}
+}
+
 func TestSetPreferredSourceIPs(t *testing.T) {
 	m := NewUnifiedRouteManager("test", 0, "wg", "unbounded0")
 
@@ -598,10 +623,12 @@ func TestBuildInstalledState(t *testing.T) {
 	_, prefix, _ := net.ParseCIDR("10.0.0.0/24")
 
 	dr := DesiredRoute{
-		Prefix: *prefix,
-		Metric: 100,
-		MTU:    1400,
-		Table:  1001,
+		Prefix:      *prefix,
+		Metric:      100,
+		MTU:         1400,
+		Table:       1001,
+		Flags:       unix.RTNH_F_ONLINK,
+		ScopeGlobal: true,
 	}
 	active := []DesiredNexthop{
 		{PeerID: "peer-a", LinkIndex: 1},
@@ -623,6 +650,14 @@ func TestBuildInstalledState(t *testing.T) {
 
 	if state.linkScope {
 		t.Error("should not be link-scope with multiple nexthops")
+	}
+
+	if state.flags != unix.RTNH_F_ONLINK {
+		t.Errorf("flags = %d, want %d", state.flags, unix.RTNH_F_ONLINK)
+	}
+
+	if !state.scopeGlobal {
+		t.Error("scopeGlobal should be preserved")
 	}
 
 	if len(state.peerNexthops) != 2 {
@@ -728,6 +763,39 @@ func TestBuildKernelRoute_LinkScope(t *testing.T) {
 
 	if route.MultiPath != nil {
 		t.Error("link-scope route should not have MultiPath")
+	}
+
+	if route.Scope != vnetlink.SCOPE_LINK {
+		t.Errorf("Scope = %d, want %d", route.Scope, vnetlink.SCOPE_LINK)
+	}
+}
+
+func TestBuildKernelRoute_GatewaylessScopeGlobal(t *testing.T) {
+	m := NewUnifiedRouteManager("test", 0, "wg", "unbounded0")
+	_, prefix, _ := net.ParseCIDR("10.0.0.0/14")
+
+	dr := DesiredRoute{
+		Prefix:      *prefix,
+		Flags:       unix.RTNH_F_ONLINK,
+		ScopeGlobal: true,
+	}
+	active := []DesiredNexthop{{PeerID: "unbounded0", LinkIndex: 7}}
+
+	route := m.buildKernelRoute(dr, active)
+	if route == nil {
+		t.Fatal("expected non-nil route")
+	}
+
+	if route.LinkIndex != 7 {
+		t.Errorf("LinkIndex = %d, want 7", route.LinkIndex)
+	}
+
+	if route.Scope != vnetlink.SCOPE_UNIVERSE {
+		t.Errorf("Scope = %d, want %d", route.Scope, vnetlink.SCOPE_UNIVERSE)
+	}
+
+	if route.Flags != unix.RTNH_F_ONLINK {
+		t.Errorf("Flags = %d, want %d", route.Flags, unix.RTNH_F_ONLINK)
 	}
 }
 
@@ -929,6 +997,49 @@ func TestSyncRoutes_ExplicitTableNotOverridden(t *testing.T) {
 	}
 
 	t.Logf("route not in installed state (likely non-root), key verified: %s", wantKey)
+}
+
+func TestSyncRoutes_PreservesGatewaylessRouteMetadata(t *testing.T) {
+	m := NewUnifiedRouteManager("test", 0, "wg", "unbounded0")
+
+	_, prefix, _ := net.ParseCIDR("10.244.0.0/14")
+	nh := DesiredNexthop{PeerID: "unbounded0", LinkIndex: 7}
+	desired := []DesiredRoute{
+		{
+			Prefix:      *prefix,
+			Nexthops:    []DesiredNexthop{nh},
+			Flags:       unix.RTNH_F_ONLINK,
+			ScopeGlobal: true,
+		},
+	}
+
+	_ = m.SyncRoutes(desired)
+
+	if len(m.desiredRoutes) != 1 {
+		t.Fatalf("desiredRoutes length = %d, want 1", len(m.desiredRoutes))
+	}
+
+	got := m.desiredRoutes[0]
+	if !got.ScopeGlobal {
+		t.Fatal("ScopeGlobal was not preserved through SyncRoutes")
+	}
+
+	if got.Flags != unix.RTNH_F_ONLINK {
+		t.Fatalf("Flags = %d, want %d", got.Flags, unix.RTNH_F_ONLINK)
+	}
+
+	route := m.buildKernelRoute(got, got.Nexthops)
+	if route == nil {
+		t.Fatal("expected non-nil route")
+	}
+
+	if route.Scope != vnetlink.SCOPE_UNIVERSE {
+		t.Errorf("Scope = %d, want %d", route.Scope, vnetlink.SCOPE_UNIVERSE)
+	}
+
+	if route.Flags != unix.RTNH_F_ONLINK {
+		t.Errorf("Flags = %d, want %d", route.Flags, unix.RTNH_F_ONLINK)
+	}
 }
 
 // TestValidateRoutes_DedicatedTable_NoFilterNeeded verifies that a manager

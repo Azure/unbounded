@@ -152,6 +152,47 @@ kubectl unbounded net node show <name> peers   # peers
 kubectl unbounded net node show <name> json    # full status
 ```
 
+### Migrating from Cilium
+
+When unbounded-net becomes the primary CNI on a node that previously ran
+Cilium, run Cilium's documented cleanup before starting unbounded-net. Cilium
+can leave host routes, links, cgroup socket-LB programs, and service-LB maps
+that continue to affect pod and ClusterIP traffic after the DaemonSet is gone.
+
+Recommended migration flow:
+
+1. Drain or otherwise quiesce workloads on the node.
+2. Uninstall or scale down Cilium so `cilium-agent` is no longer running.
+3. Run Cilium's post-uninstall cleanup on every node:
+
+   ```bash
+   cilium-dbg post-uninstall-cleanup --all-state -f
+   ```
+
+4. Verify Cilium host datapath state is gone:
+
+   ```bash
+   ip -d link show cilium_host cilium_net cilium_vxlan
+   ip rule show | grep 'fwmark 0x200/0xf00 lookup 2004'
+   ip route get <remote-pod-ip> # should not use cilium_host
+   ```
+
+5. Verify Cilium socket-LB/service-LB state is gone:
+
+   ```bash
+   bpftool prog list | grep cil_sock
+   bpftool map list | grep cilium_lb
+   ```
+
+6. Remove any remaining Cilium CNI config from `/etc/cni/net.d`.
+7. Deploy unbounded-net and confirm pod routes use `unbounded0`.
+
+If this cleanup is skipped or incomplete, direct pod IP traffic can still use
+`cilium_host`, and kube-dns ClusterIP traffic can still be rewritten by stale
+Cilium service-LB maps to old CoreDNS pod IPs. Manual Cilium BPF map edits can
+repair a live incident, but they should not be treated as the normal migration
+procedure.
+
 ### Interface Verification
 
 **eBPF mode:**

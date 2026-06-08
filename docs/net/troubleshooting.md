@@ -84,6 +84,42 @@ Each node agent exposes status on port 9998:
 - Check: `ip route show dev unbounded0` -- should show supernet routes
 - Phantom routes on wg*/geneve0/vxlan0 that are "expected but not present" are normal in eBPF mode and should be suppressed by the annotation system
 
+### Migrating a node from Cilium to unbounded-net
+
+When replacing Cilium with unbounded-net as the primary CNI, clean Cilium state
+before starting unbounded-net on the node. Stale Cilium host routes, interfaces,
+socket-LB programs, or service-LB maps can keep owning pod CIDR or ClusterIP
+traffic even after the Cilium DaemonSet is gone.
+
+Recommended migration flow:
+
+1. Drain or otherwise quiesce workloads on the node.
+2. Uninstall or scale down Cilium so `cilium-agent` is no longer running.
+3. Run Cilium's documented post-uninstall cleanup on every node, for example:
+   `cilium-dbg post-uninstall-cleanup --all-state -f`
+4. Verify Cilium host datapath state is gone:
+   `ip -d link show cilium_host cilium_net cilium_vxlan`
+   `ip rule show | grep 'fwmark 0x200/0xf00 lookup 2004'`
+   `ip route get <remote-pod-ip>` should not select `cilium_host`
+5. Verify Cilium socket-LB/service-LB state is gone:
+   `bpftool prog list | grep cil_sock`
+   `bpftool map list | grep cilium_lb`
+6. Remove Cilium CNI config files from `/etc/cni/net.d`.
+7. Start unbounded-net and verify new pod traffic routes through `unbounded0`.
+
+If cleanup is skipped or incomplete, common symptoms include:
+
+- `ip route get <remote-pod-ip>` selects `cilium_host` instead of `unbounded0`
+- direct pod IP traffic times out until stale Cilium host routes/interfaces are removed
+- direct CoreDNS pod IPs work, but kube-dns ClusterIP lookups fail or are
+  rewritten to old CoreDNS pod IPs
+
+Incident signature: DNS queries from pods are rewritten before kube-proxy or
+unbounded routing, then forwarded through the overlay to stale CoreDNS pod IPs.
+Use Cilium's cleanup tooling or rebuild the node to remove stale state. Manual
+BPF map edits can repair a live node, but they are not a declarative migration
+procedure.
+
 ### Cross-site connectivity not working
 
 1. Verify gateway route advertisement: `kubectl get gatewaypoolnode <name> -o yaml` -- check status.routes
