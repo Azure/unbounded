@@ -114,6 +114,17 @@ usually too old, so the Makefile builds a pinned release from source:
   automatically, so prefer the Makefile targets over raw `cargo`. If you
   must run `cargo` directly, point it at the pinned install yourself.
 
+The in-process fabric FFI tests (`src/fabric/tests.rs` and the inline
+loopback test in `src/fabric/fabric.rs`) require a loopback-capable
+`tcp` provider and pin their source bind to `127.0.0.1`. This is
+deliberate: with a null bind address libfabric selects the first
+routable NIC, so on multi-NIC or containerized dev boxes the paired
+loopback fabrics land on different interfaces (e.g. `eth0` vs a docker
+bridge) and the tcp RDM data path never makes progress, hanging every
+completion-dependent test. Pinning `127.0.0.1:0` keeps both fabrics on
+`lo`. If you hit these timeouts on an older checkout, `FI_TCP_IFACE=lo`
+is the manual override.
+
 ## Testing patterns
 
 There are three distinct in-process test styles in this crate plus an
