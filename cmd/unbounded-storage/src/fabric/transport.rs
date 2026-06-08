@@ -16,16 +16,23 @@
 //!    `ERROR_ACK_TAG_BASE | request_id`. Launch rejects requests that
 //!    cannot fit within the completion registry before posting any recv.
 //! 3. For each `PAGE_ACK`, the stream yields
-//!    `dsts[page_idx_from_payload]`.
-//! 4. `RESPONSE_END` resolves the stream with `None`; `ERROR_ACK`
-//!    yields `Some(Err(_))` and then `None`.
+//!    `dsts[page_idx_from_payload]`. Once every requested page is acked
+//!    the stream resolves with `None` on the next poll, with no separate
+//!    `RESPONSE_END` (the client knows `dsts.len()` and page acks arrive
+//!    in order, so the final ack is the end of stream).
+//! 4. `RESPONSE_END` (sent only for a short success that delivered fewer
+//!    than `dsts.len()` pages, including zero) resolves the stream with
+//!    `None`; `ERROR_ACK` yields `Some(Err(_))` and then `None`.
 //!
 //! Drop: outstanding recv contexts are `fi_cancel`led so libfabric
-//! reclaims its references promptly. The client does not currently
-//! signal the server about mid-stream cancellation - the server
-//! noticing falls out of the same fabric tear-down at the end of a
-//! test (Phase 5b will reconsider once the wire is exercised under
-//! real workloads).
+//! reclaims its references promptly. A full success sends no terminator,
+//! so the common path has no in-flight server message racing those
+//! cancels (otherwise a `RESPONSE_END` that lost the race would be
+//! stranded as an unexpected message in the provider's bounded receive
+//! buffer). The client does not currently signal the server about
+//! mid-stream cancellation - the server noticing falls out of the same
+//! fabric tear-down at the end of a test (Phase 5b will reconsider once
+//! the wire is exercised under real workloads).
 //!
 //! **MR strategy**: page data lands directly in the caller-provided
 //! `MrHandle` (the buffer pool's registered backing) via server-side
@@ -449,6 +456,11 @@ impl<'a, R> PageStream for FabricBulkStream<'a, R> {
                                     ))));
                                 }
                                 acked[idx] = true;
+                                // Full success carries no RESPONSE_END;
+                                // the last in-order ack ends the stream.
+                                if acked.iter().all(|a| *a) {
+                                    *ended = true;
+                                }
                                 return Poll::Ready(Some(Ok(dsts[idx])));
                             } else if tag_base == RESPONSE_END_TAG_BASE {
                                 *ended = true;
@@ -1172,12 +1184,22 @@ mod tests {
 
     #[test]
     fn duplicate_page_ack_returns_transport_error() {
-        let dsts = [PageRef {
-            page_idx: 0,
-            offset: 0,
-            len: 4096,
-        }];
-        let mut stream = active_stream(&dsts, vec![false]);
+        // Two destinations so the stream is still active after the first
+        // ack; a single-page stream self-terminates on "all pages acked"
+        // before a duplicate could arrive.
+        let dsts = [
+            PageRef {
+                page_idx: 0,
+                offset: 0,
+                len: 4096,
+            },
+            PageRef {
+                page_idx: 1,
+                offset: 0,
+                len: 4096,
+            },
+        ];
+        let mut stream = active_stream(&dsts, vec![false, false]);
         push_page_ack(&mut stream, 0);
         push_page_ack(&mut stream, 0);
         let waker = noop_waker();
@@ -1254,6 +1276,44 @@ mod tests {
 
         // SAFETY: stream is pinned on the stack and never moved.
         let mut stream = unsafe { Pin::new_unchecked(&mut stream) };
+        assert!(matches!(
+            stream.as_mut().poll_next(&mut cx),
+            Poll::Ready(None)
+        ));
+    }
+
+    #[test]
+    fn all_pages_acked_ends_stream_without_response_end() {
+        // Full success: every page is yielded, then None on the next
+        // poll, with no terminator message.
+        let dsts = [
+            PageRef {
+                page_idx: 0,
+                offset: 0,
+                len: 4096,
+            },
+            PageRef {
+                page_idx: 1,
+                offset: 0,
+                len: 4096,
+            },
+        ];
+        let mut stream = active_stream(&dsts, vec![false, false]);
+        push_page_ack(&mut stream, 0);
+        push_page_ack(&mut stream, 1);
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // SAFETY: stream is pinned on the stack and never moved.
+        let mut stream = unsafe { Pin::new_unchecked(&mut stream) };
+        assert!(matches!(
+            stream.as_mut().poll_next(&mut cx),
+            Poll::Ready(Some(Ok(PageRef { page_idx: 0, .. })))
+        ));
+        assert!(matches!(
+            stream.as_mut().poll_next(&mut cx),
+            Poll::Ready(Some(Ok(PageRef { page_idx: 1, .. })))
+        ));
         assert!(matches!(
             stream.as_mut().poll_next(&mut cx),
             Poll::Ready(None)
