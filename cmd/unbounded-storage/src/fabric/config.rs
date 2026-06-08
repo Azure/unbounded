@@ -84,6 +84,50 @@ impl FabricConfig {
     }
 }
 
+/// Apply this crate's libfabric `tcp` provider tuning as process-wide
+/// environment defaults. libfabric reads its tcp `fi_param`s lazily at
+/// provider init (the first `fi_getinfo`, which in this crate happens on
+/// spawned per-shard/per-worker threads), so these must be set while the
+/// process is still single-threaded, before any [`Fabric`](super::Fabric)
+/// is constructed or any shard/worker thread is spawned. Both knobs are
+/// ignored by the `verbs` provider, so applying them unconditionally is
+/// safe regardless of the device in use.
+///
+/// Call this once from `main` (or a benchmark entry point) at startup.
+///
+/// - `FI_TCP_ZEROCOPY_SIZE` (set to 16 KiB): enables the kernel
+///   zero-copy send path (`send(MSG_ZEROCOPY)`) so the non-RDMA fallback
+///   preserves the same zero-copy semantics as the verbs RMA path. 16 KiB
+///   sits just above the tcp message-buffer size and well below the 2 MiB
+///   page transfers, so every bulk `fi_write` qualifies. The provider
+///   falls back to a copying send on kernels without TCP `MSG_ZEROCOPY`,
+///   so it is always set (overriding any inherited value).
+/// - `FI_TCP_MAX_SAVED` (set to 1048576): raises the cap on received
+///   messages that arrive without a matching posted application buffer.
+///   The provider queues such "saved" messages and its default cap is
+///   only 64; once exceeded the provider stops making progress and the
+///   next fabric request never completes, wedging the shard. A busy node
+///   issues far more than 64 cross-node page fetches over the lifetime of
+///   a long-lived fabric, so the default is unsafe for this workload. An
+///   operator override (a value already present in the environment) is
+///   respected.
+///
+/// SAFETY: the caller must invoke this while the process is still
+/// single-threaded (no other threads spawned yet), so the `set_var`
+/// calls cannot race a concurrent `getenv`/`setenv`.
+pub fn apply_tcp_env_defaults() {
+    // SAFETY: documented precondition - caller is single-threaded here.
+    unsafe {
+        std::env::set_var("FI_TCP_ZEROCOPY_SIZE", "16384");
+    }
+    if std::env::var_os("FI_TCP_MAX_SAVED").is_none() {
+        // SAFETY: documented precondition - caller is single-threaded here.
+        unsafe {
+            std::env::set_var("FI_TCP_MAX_SAVED", "1048576");
+        }
+    }
+}
+
 pub fn defaults_for(
     device_name: impl Into<String>,
     runtime: Arc<dyn Threading>,

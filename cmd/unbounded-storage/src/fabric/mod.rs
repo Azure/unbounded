@@ -29,7 +29,7 @@ mod tests;
 
 pub use backing::MrHandle;
 pub use completion::{CompletionFuture, CompletionInfo, CompletionRegistry, CompletionSlot};
-pub use config::{FabricConfig, Provider, defaults_for};
+pub use config::{FabricConfig, Provider, apply_tcp_env_defaults, defaults_for};
 pub use error::{FabricError, Result, check};
 pub use fabric::Fabric;
 pub use handler::{Handler, HandlerStream};
