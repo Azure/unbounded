@@ -66,6 +66,16 @@ fn tcp_loopback_cfg() -> FabricConfig {
     cfg.provider = Provider::Tcp;
     cfg.progress_threads = 1;
     cfg.max_inflight = 64;
+    // Pin the source address to loopback. Without this, fi_getinfo with
+    // a null node lets libfabric pick the first routable NIC; on
+    // multi-NIC or containerized hosts the paired fabrics land on
+    // different interfaces and the tcp RDM data path never makes
+    // progress, so every completion-dependent test times out. The ":0"
+    // port lets the OS assign a free ephemeral port per fabric;
+    // listen=true is required so fi_getinfo treats the address as a
+    // source bind (FI_SOURCE) rather than a destination.
+    cfg.listen = true;
+    cfg.listen_addr = Some("127.0.0.1:0".to_string());
     cfg
 }
 
