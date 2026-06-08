@@ -460,6 +460,11 @@ mod tests {
         // the test lean.
         cfg.progress_threads = 1;
         cfg.max_inflight = 16;
+        // Pin the source bind to loopback so self_address() is
+        // deterministic on multi-NIC hosts (see tcp_loopback_cfg in
+        // fabric/tests.rs for the full rationale).
+        cfg.listen = true;
+        cfg.listen_addr = Some("127.0.0.1:0".to_string());
 
         let fabric = Fabric::new(cfg)
             .expect("Fabric::new should succeed after tcp provider availability is established");
