@@ -265,6 +265,7 @@ help: ## Show this help
 	@echo "  orca-kind-down | orca-down       Delete the kind cluster"
 	@echo "  orca-reset                       Rebuild image and rolling-restart Orca on kind"
 	@echo "  orca-inttest                     Run orca integration tests (Docker required)"
+	@echo "  storage-inttest                  Run unbounded-storage -> orca -> Garage integration test (Docker + sudo)"
 	@echo ""
 	@echo "Documentation:"
 	@echo "  docs-serve                       Start local Hugo dev server"
@@ -840,6 +841,27 @@ else
 orca-inttest: ## Run orca integration tests (Garage + Azurite via testcontainers; requires Docker)
 	$(GOTEST) -tags=integrationtest -race -count=1 -timeout 15m ./internal/orca/inttest/...
 endif
+
+# storage-inttest runs the unbounded-storage -> orca -> Garage
+# integration test. It builds the libfabric-linked unbounded-storage
+# binary and an integrationtest+storageboundary test binary (compiled as
+# the current user so the Go caches stay user-owned), then runs that
+# binary under sudo: it needs CAP_SYS_RESOURCE to raise RLIMIT_MEMLOCK
+# for the storage children's io_uring pinned buffers. LD_LIBRARY_PATH is
+# re-injected past sudo's env scrubbing so the spawned binaries find the
+# pinned libfabric. The -test.run filter keeps it scoped to the storage
+# boundary test alone (the rest of the orca integration suite is compiled
+# into the binary but never executed). Requires Docker (Garage + Azurite
+# via testcontainers).
+.PHONY: storage-inttest
+STORAGE_INTTEST_BIN := $(CURDIR)/tmp/storage-inttest.test
+
+storage-inttest: libfabric unbounded-storage-build ## Run the unbounded-storage -> orca -> Garage integration test (Docker + sudo)
+	@mkdir -p $(CURDIR)/tmp
+	$(GOTEST) -tags=integrationtest,storageboundary -c -o $(STORAGE_INTTEST_BIN) ./internal/orca/inttest/
+	sudo -E env "PATH=$$PATH" "LD_LIBRARY_PATH=$(LIBFABRIC_PREFIX)/lib" \
+		$(STORAGE_INTTEST_BIN) -test.v -test.timeout 30m -test.run '^TestStorageBoundaryThroughOrca$$'
+
 
 image-net-controller-local: net-frontend resources/cni-plugins-linux-$(HOST_GOARCH)-$(CNI_PLUGINS_VERSION).tgz ## Build the unbounded-net-controller image locally (single-arch)
 	$(CONTAINER_ENGINE) build \
