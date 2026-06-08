@@ -78,6 +78,20 @@ pub struct EngineConfig {
     pub admission_sketch_multiplier: usize,
     pub singleflight_shards: usize,
     pub restart_scan_queue_depth: u32,
+    /// Number of 4 KiB registered scratch buffers reserved for
+    /// btree / meta I/O. This is the hard ceiling on how many
+    /// btree page writes a single path-copy commit can keep in
+    /// flight at once: the CoW commit path submits every
+    /// independent spine-page write concurrently and joins them,
+    /// so a larger pool lets a commit overlap more of its 4 KiB
+    /// writes (trading registered-buffer memory for commit
+    /// latency). At `btree_page_bytes` = 4 KiB the default 64
+    /// costs 256 KiB of pinned memory per shard and sits well
+    /// under the io_uring queue depth; commits that need more
+    /// buffers than this simply drain in waves via backpressure
+    /// on the pool. Must be at least a few to cover meta load
+    /// plus an in-flight lookup; values below 4 are clamped up.
+    pub btree_scratch_pages: usize,
     /// When true, `write_page` skips AdmissionFilter::should_admit
     /// and always proceeds. Intended for benchmarking/tooling;
     /// production should leave this false.
@@ -104,6 +118,7 @@ impl Default for EngineConfig {
             admission_sketch_multiplier: 2,
             singleflight_shards: 64,
             restart_scan_queue_depth: 256,
+            btree_scratch_pages: 64,
             bypass_admission: false,
             skip_recovery_scan_if_no_meta: false,
         }
@@ -116,12 +131,14 @@ struct BufferpoolBinding {
     page_count: usize,
 }
 
-/// Number of scratch pages allocated for btree / meta I/O. Sized
-/// to comfortably cover the worst-case concurrent demand from a
-/// single shard: two pages for [`crate::storage::btree::meta`]
-/// load, one for an in-flight lookup, one for a parallel
-/// `build_tree` write, and a small buffer beyond that.
-const BTREE_SCRATCH_PAGES: usize = 8;
+/// Floor on the btree / meta scratch-pool size, independent of
+/// [`EngineConfig::btree_scratch_pages`]. Covers the worst-case
+/// concurrent demand that is not commit-write parallelism: two
+/// pages for [`crate::storage::btree::meta`] load, one for an
+/// in-flight lookup, one for a `build_tree` write, plus a little
+/// slack. The configured value is clamped up to this floor so a
+/// small or zero setting cannot starve those paths.
+const MIN_BTREE_SCRATCH_PAGES: usize = 8;
 
 pub struct StorageEngine<B: BlockDevice> {
     device: Arc<B>,
@@ -230,7 +247,11 @@ impl<B: BlockDevice> StorageEngine<B> {
         // backing is registered later (via `register_pages`);
         // this small dedicated region covers the structural I/O
         // BTreeIndex::open issues before any user-data I/O.
-        let scratch = ScratchPool::new(&*device, cfg.btree_page_bytes, BTREE_SCRATCH_PAGES)?;
+        let scratch = ScratchPool::new(
+            &*device,
+            cfg.btree_page_bytes,
+            cfg.btree_scratch_pages.max(MIN_BTREE_SCRATCH_PAGES),
+        )?;
         let btree = Arc::new(
             BTreeIndex::open(
                 device.clone(),

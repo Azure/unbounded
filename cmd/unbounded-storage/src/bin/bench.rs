@@ -78,6 +78,10 @@ use unbounded_storage::storage::blockdev::{BlockDevice, CoreLocalDevice, OpenDis
 use unbounded_storage::storage::{EngineConfig, LocalStorage, StorageEngine};
 use unbounded_storage::topology::{Host, Nvme, Plan, PlanConfig, Role};
 
+#[path = "bench/transport.rs"]
+mod transport;
+
+
 const _: () = assert!(HUGEPAGE_2MB == 2 * 1024 * 1024);
 
 /// User-data page size used by the bench, in bytes.
@@ -133,8 +137,8 @@ enum Cmd {
 enum StorageCmd {
     /// Block-layer (io_uring + buffer pool) benchmark.
     Block(BlockArgs),
-    /// RDMA transport benchmark (not yet implemented).
-    Rdma,
+    /// Transport (libfabric RPC + RMA + buffer pool) benchmark.
+    Transport(transport::TransportArgs),
     /// Topology probe / report (not yet implemented).
     Topology,
 }
@@ -234,10 +238,7 @@ fn main() -> ExitCode {
     match cli.cmd {
         Cmd::Storage { cmd } => match cmd {
             StorageCmd::Block(args) => run_block(args),
-            StorageCmd::Rdma => {
-                eprintln!("bench storage: rdma subcommand is not yet implemented");
-                ExitCode::from(2)
-            }
+            StorageCmd::Transport(args) => transport::run(args),
             StorageCmd::Topology => {
                 eprintln!("bench storage: topology subcommand is not yet implemented");
                 ExitCode::from(2)
