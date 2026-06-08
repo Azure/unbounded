@@ -8,7 +8,7 @@ import (
 	"sort"
 	"testing"
 
-	vnetlink "github.com/vishvananda/netlink"
+	vishnetlink "github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
 
@@ -765,8 +765,8 @@ func TestBuildKernelRoute_LinkScope(t *testing.T) {
 		t.Error("link-scope route should not have MultiPath")
 	}
 
-	if route.Scope != vnetlink.SCOPE_LINK {
-		t.Errorf("Scope = %d, want %d", route.Scope, vnetlink.SCOPE_LINK)
+	if route.Scope != vishnetlink.SCOPE_LINK {
+		t.Errorf("Scope = %d, want %d", route.Scope, vishnetlink.SCOPE_LINK)
 	}
 }
 
@@ -790,8 +790,8 @@ func TestBuildKernelRoute_GatewaylessScopeGlobal(t *testing.T) {
 		t.Errorf("LinkIndex = %d, want 7", route.LinkIndex)
 	}
 
-	if route.Scope != vnetlink.SCOPE_UNIVERSE {
-		t.Errorf("Scope = %d, want %d", route.Scope, vnetlink.SCOPE_UNIVERSE)
+	if route.Scope != vishnetlink.SCOPE_UNIVERSE {
+		t.Errorf("Scope = %d, want %d", route.Scope, vishnetlink.SCOPE_UNIVERSE)
 	}
 
 	if route.Flags != unix.RTNH_F_ONLINK {
@@ -1033,8 +1033,8 @@ func TestSyncRoutes_PreservesGatewaylessRouteMetadata(t *testing.T) {
 		t.Fatal("expected non-nil route")
 	}
 
-	if route.Scope != vnetlink.SCOPE_UNIVERSE {
-		t.Errorf("Scope = %d, want %d", route.Scope, vnetlink.SCOPE_UNIVERSE)
+	if route.Scope != vishnetlink.SCOPE_UNIVERSE {
+		t.Errorf("Scope = %d, want %d", route.Scope, vishnetlink.SCOPE_UNIVERSE)
 	}
 
 	if route.Flags != unix.RTNH_F_ONLINK {
