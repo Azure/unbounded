@@ -207,7 +207,7 @@ impl fmt::Display for ConfigError {
             ),
             ConfigError::InvalidBackendKind { backend_id, value } => write!(
                 f,
-                "backend {backend_id:?}: kind {value} is not a valid value (0 = http, 1 = s3)"
+                "backend {backend_id:?}: kind {value} is not a valid value (0 = http, 1 = s3, 2 = azure)"
             ),
             ConfigError::InvalidFrontendKind { frontend_id, value } => write!(
                 f,
@@ -965,6 +965,19 @@ endpoint = "s3.example.com:443"
     }
 
     #[test]
+    fn accepts_azure_backend() {
+        let s = r#"
+[[backends]]
+id = "azure"
+kind = 2
+endpoint = "acct.blob.core.windows.net:443"
+"#;
+        let f = write_cfg(s);
+        let cfg = load(f.path()).expect("load should succeed");
+        assert_eq!(cfg.backends[0].kind(), BackendKind::Azure);
+    }
+
+    #[test]
     fn rejects_unknown_key() {
         // A typo in a key now fails loudly at parse time instead of being
         // silently dropped (deny_unknown_fields on the TOML path).
@@ -1016,14 +1029,14 @@ kind = 3
         let s = r#"
 [[backends]]
 id = "b"
-kind = 2
+kind = 3
 endpoint = "https://e"
 "#;
         let f = write_cfg(s);
         match load(f.path()) {
             Err(ConfigError::InvalidBackendKind {
                 backend_id,
-                value: 2,
+                value: 3,
             }) if backend_id == "b" => {}
             other => panic!("expected InvalidBackendKind, got {other:?}"),
         }

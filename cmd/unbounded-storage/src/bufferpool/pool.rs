@@ -11,6 +11,7 @@ use std::task::{Context, Poll};
 
 use crate::bufferpool::free_list::{FreeList, RecvQuarantineHandle};
 use crate::bufferpool::inflight::{PageSlot, SlotState, StripeFetch};
+use crate::bufferpool::pipeline::{PipelinedRead, StripePlan};
 use crate::bufferpool::stream::{LocalBoxFuture, ReadStream, StaticBoxFuture, StreamSrc};
 use crate::bufferpool::traits::{BlockStore, BufferPool, Req, Transport};
 use crate::bufferpool::types::{BulkRef, Error, PageRef, PoolConfig, StripeKey};
@@ -181,6 +182,49 @@ where
             offset,
             end,
             self.inner.page_size,
+            window,
+            max_inflight,
+        ))
+    }
+
+    /// Cross-stripe pipelined read. Lazily admits one stream per
+    /// slice (bounded to roughly `window` concurrently-admitted
+    /// streams via [`PipelinedRead`]'s eager slice release), so a
+    /// large multi-stripe object does not exhaust
+    /// `max_concurrent_streams` up front. Zero-length slices are
+    /// dropped so the global page geometry is exact.
+    fn read_pipelined<'p>(
+        &'p self,
+        stripes: Vec<StripePlan<R>>,
+        window: usize,
+    ) -> Result<PipelinedRead<'p>, Error> {
+        let page_size = self.inner.page_size as u64;
+        let max_inflight = self.inner.cfg.max_inflight_pages;
+        let window = window.clamp(1, max_inflight.saturating_add(1));
+
+        // Two index-aligned vectors: `slices` feeds `PipelinedRead`'s
+        // geometry, `admit_inputs` feeds the lazy admission closure.
+        // Both skip empty slices so indices stay in lockstep.
+        let mut slices: Vec<(u64, u64)> = Vec::with_capacity(stripes.len());
+        let mut admit_inputs: Vec<(R, u64, u64)> = Vec::with_capacity(stripes.len());
+        for sp in stripes {
+            if sp.intra_len == 0 {
+                continue;
+            }
+            slices.push((sp.intra_offset, sp.intra_len));
+            admit_inputs.push((sp.req, sp.intra_offset, sp.intra_len));
+        }
+
+        let admit = move |s: usize| -> Result<Rc<dyn StreamSrc + 'p>, Error> {
+            let (req, offset, len) = &admit_inputs[s];
+            let (src, _end) = self.admit_stream(req, *offset, *len)?;
+            Ok(src)
+        };
+
+        Ok(PipelinedRead::new(
+            Box::new(admit),
+            slices,
+            page_size,
             window,
             max_inflight,
         ))

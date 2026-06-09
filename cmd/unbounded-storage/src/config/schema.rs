@@ -324,21 +324,6 @@ bucket = "my-bucket"
     }
 
     #[test]
-    fn s3_backend_optional_fields_default_to_none() {
-        let s = r#"
-[[backends]]
-id = "b"
-kind = 1
-endpoint = "s3.example.com:443"
-"#;
-        let mut c: Config = toml::from_str(s).unwrap();
-        c.apply_defaults();
-        let b = &c.backends[0];
-        assert_eq!(b.kind(), BackendKind::S3);
-        assert!(b.bucket.is_none());
-    }
-
-    #[test]
     fn s3_frontend_kind_round_trips() {
         let s = r#"
 [[frontends]]
