@@ -382,9 +382,20 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Discover smoke tests to run after deploy. Lists hack/release/smoke/*.sh
-  # and emits a JSON matrix. If the directory has no scripts, has_tasks is
-  # false and the smoke-tests job is skipped (GitHub Actions errors on an
-  # empty matrix, so we have to gate it explicitly).
+  # and emits a JSON matrix. If the directory is absent or has no scripts,
+  # has_tasks is false and the smoke-tests job is skipped (GitHub Actions
+  # errors on an empty matrix, so we have to gate it explicitly).
+  #
+  # Why check out the default branch instead of the deployed tag?
+  #   Smoke tests are validation of the *deployed cluster*, not of the
+  #   release artifacts. They are intentionally version-agnostic (they
+  #   check generic cluster health), and we want backfill deploys of older
+  #   tags to still benefit from the latest smoke checks. Without this,
+  #   backfilling a tag that predates hack/release/smoke/ would skip
+  #   smoke entirely; new smoke tests added on main would also never run
+  #   against old releases. If a smoke test ever needs to be tied to a
+  #   specific release, that's a signal it should live with the release
+  #   artifacts (e.g. as an integration test in CI), not here.
   # ---------------------------------------------------------------------------
   smoke-discover:
     needs: [resolve, deploy]
@@ -392,17 +403,40 @@ jobs:
     outputs:
       tasks: ${{ steps.list.outputs.tasks }}
       has_tasks: ${{ steps.list.outputs.has_tasks }}
+      smoke_sha: ${{ steps.pin.outputs.sha }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: ${{ needs.resolve.outputs.tag }}
+          # Use the default branch's hack/release/smoke/, not the deployed
+          # tag's. See the rationale above the job.
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Pin smoke ref
+        id: pin
+        run: |
+          set -euo pipefail
+          # Record the exact commit the default branch points at right now.
+          # smoke-tests checks out this SHA rather than re-resolving the
+          # default branch, so it runs precisely the scripts this job
+          # enumerated even if the branch advances between jobs.
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Discover smoke tasks
         id: list
         run: |
           set -euo pipefail
+          # Bail out cleanly if the smoke directory does not exist (older
+          # checkouts, accidentally removed directory). `find` exits
+          # non-zero on a missing path even with stderr suppressed, which
+          # would abort under `set -e`.
+          if [[ ! -d hack/release/smoke ]]; then
+            echo "has_tasks=false" >> "$GITHUB_OUTPUT"
+            echo "tasks=[]" >> "$GITHUB_OUTPUT"
+            echo "hack/release/smoke does not exist at this ref; skipping smoke tests"
+            exit 0
+          fi
           tasks=$(
-            find hack/release/smoke -maxdepth 1 -type f -name '*.sh' 2>/dev/null \
+            find hack/release/smoke -maxdepth 1 -type f -name '*.sh' \
               | sort \
               | jq -R -s -c 'split("\n") | map(select(length>0)) |
                   map({name: (. | sub(".*/"; "") | sub(".sh$"; "")), script: .})'
@@ -436,8 +470,9 @@ jobs:
   #      UI.
   #   2. The script must complete within 15 minutes (see timeout-minutes
   #      below).
-  #   3. The script runs from the repo root at the deployed tag's commit
-  #      with the following env exported:
+  #   3. The script runs from the repo root at the commit the default
+  #      branch pointed to when smoke-discover ran (NOT the deployed tag -
+  #      see smoke-discover's rationale) with the following env exported:
   #        TAG          - the deployed tag (e.g. v0.1.12)
   #        KUBECONFIG   - path to the cluster's kubeconfig
   #        SITE_NAME    - the configured site name on this cluster
@@ -465,7 +500,12 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: ${{ needs.resolve.outputs.tag }}
+          # Check out the exact commit smoke-discover enumerated, not a
+          # fresh resolve of the default branch (which may have advanced
+          # since). This guarantees we run precisely the scripts that
+          # populated the matrix. See the comment block on smoke-discover
+          # for why the smoke scripts come from the default branch at all.
+          ref: ${{ needs.smoke-discover.outputs.smoke_sha }}
 
       - name: Install kubectl
         uses: azure/setup-kubectl@829323503d1be3d00ca8346e5391ca0b07a9ab0d # v5.1.0
