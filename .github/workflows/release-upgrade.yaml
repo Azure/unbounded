@@ -403,12 +403,23 @@ jobs:
     outputs:
       tasks: ${{ steps.list.outputs.tasks }}
       has_tasks: ${{ steps.list.outputs.has_tasks }}
+      smoke_sha: ${{ steps.pin.outputs.sha }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           # Use the default branch's hack/release/smoke/, not the deployed
           # tag's. See the rationale above the job.
           ref: ${{ github.event.repository.default_branch }}
+
+      - name: Pin smoke ref
+        id: pin
+        run: |
+          set -euo pipefail
+          # Record the exact commit the default branch points at right now.
+          # smoke-tests checks out this SHA rather than re-resolving the
+          # default branch, so it runs precisely the scripts this job
+          # enumerated even if the branch advances between jobs.
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Discover smoke tasks
         id: list
@@ -459,9 +470,9 @@ jobs:
   #      UI.
   #   2. The script must complete within 15 minutes (see timeout-minutes
   #      below).
-  #   3. The script runs from the repo root at the default branch's HEAD
-  #      (NOT the deployed tag - see smoke-discover's rationale) with the
-  #      following env exported:
+  #   3. The script runs from the repo root at the commit the default
+  #      branch pointed to when smoke-discover ran (NOT the deployed tag -
+  #      see smoke-discover's rationale) with the following env exported:
   #        TAG          - the deployed tag (e.g. v0.1.12)
   #        KUBECONFIG   - path to the cluster's kubeconfig
   #        SITE_NAME    - the configured site name on this cluster
@@ -489,10 +500,12 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          # Match smoke-discover: pull the smoke scripts from the default
-          # branch so backfills of older tags use the latest checks. See
-          # the comment block on smoke-discover for the rationale.
-          ref: ${{ github.event.repository.default_branch }}
+          # Check out the exact commit smoke-discover enumerated, not a
+          # fresh resolve of the default branch (which may have advanced
+          # since). This guarantees we run precisely the scripts that
+          # populated the matrix. See the comment block on smoke-discover
+          # for why the smoke scripts come from the default branch at all.
+          ref: ${{ needs.smoke-discover.outputs.smoke_sha }}
 
       - name: Install kubectl
         uses: azure/setup-kubectl@829323503d1be3d00ca8346e5391ca0b07a9ab0d # v5.1.0
