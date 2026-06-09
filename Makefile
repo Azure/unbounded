@@ -183,6 +183,8 @@ help: ## Show this help
 	@echo "  gomod                            go mod tidy"
 	@echo "  notice                           Regenerate NOTICE from go.mod and frontend/package.json"
 	@echo "  notice-check                     Verify NOTICE is in sync with dependencies"
+	@echo "  toolchain-shell                  Drop into the toolchain container with the repo mounted at /project"
+	@echo "  toolchain-build                  Rebuild the toolchain container image"
 	@echo ""
 	@echo "Build:"
 	@echo "  kubectl-unbounded                Build kubectl-unbounded plugin"
@@ -396,6 +398,14 @@ notice-check: ## Verify NOTICE is in sync with go.mod and frontend/package.json
 		exit 1; \
 	fi
 	$(GOCMD) run ./hack/cmd/notice check --notice NOTICE
+
+.PHONY: toolchain-shell
+toolchain-shell: ## Drop into the toolchain container with the repo mounted at /project (builds the image on first use)
+	@./images/toolchain/toolchain.sh
+
+.PHONY: toolchain-build
+toolchain-build: ## Rebuild the toolchain container image (otherwise built lazily on first toolchain-shell use)
+	@TOOLCHAIN_REBUILD=1 ./images/toolchain/toolchain.sh true
 
 ##@ Build
 
