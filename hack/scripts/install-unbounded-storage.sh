@@ -12,8 +12,26 @@ STORAGE_ARGS="${STORAGE_ARGS:-}"
 NO_ENABLE="${NO_ENABLE:-0}"
 LOCAL_TARBALL="${LOCAL_TARBALL:-}"
 
+# Optional first positional argument selects where the release-layout tarball
+# comes from:
+#   (omitted)            download the latest (or VERSION) GitHub release
+#   http(s)://...        curl the artifact from the given URL
+#   /path or ./path      use the local tarball at that filesystem path
+# For backward compatibility, LOCAL_TARBALL=<path> is honored when no argument
+# is given.
+SOURCE="${1:-${LOCAL_TARBALL}}"
+
 log() { printf '%s\n' "$*"; }
 err() { printf 'error: %s\n' "$*" >&2; }
+
+# Classify SOURCE into one of: release | url | file.
+if [[ -z "${SOURCE}" ]]; then
+	SOURCE_MODE="release"
+elif [[ "${SOURCE}" =~ ^https?:// ]]; then
+	SOURCE_MODE="url"
+else
+	SOURCE_MODE="file"
+fi
 
 # --- Preconditions ----------------------------------------------------------
 
@@ -30,15 +48,20 @@ for tool in systemctl install mktemp uname tar; do
 	fi
 done
 
-# curl/sha256sum are only needed when downloading a release; in LOCAL_TARBALL
-# mode we extract a tarball that already exists on disk.
-if [[ -z "${LOCAL_TARBALL}" ]]; then
-	for tool in curl sha256sum; do
-		if ! command -v "${tool}" >/dev/null 2>&1; then
-			err "required tool '${tool}' not found in PATH."
-			exit 1
-		fi
-	done
+# curl and sha256sum are both needed whenever we fetch over the network
+# (release or url modes): every published tarball ships a companion .sha256
+# checksum that we always verify before installing. A local file is extracted
+# as-is.
+if [[ "${SOURCE_MODE}" != "file" ]]; then
+	if ! command -v curl >/dev/null 2>&1; then
+		err "required tool 'curl' not found in PATH."
+		exit 1
+	fi
+
+	if ! command -v sha256sum >/dev/null 2>&1; then
+		err "required tool 'sha256sum' not found in PATH."
+		exit 1
+	fi
 fi
 
 # --- Resolve target arch ----------------------------------------------------
@@ -73,17 +96,57 @@ trap cleanup EXIT
 extracted="${workdir}/extracted"
 mkdir -p "${extracted}"
 
-if [[ -n "${LOCAL_TARBALL}" ]]; then
-	# --- Use a release-layout tarball from disk (no download) -----------------
-	log "Installing unbounded-storage (${ARCH}, ${VERSION}) from local tarball ${LOCAL_TARBALL}"
+curl_fetch() {
+	# -f: fail on HTTP errors, -L: follow redirects (required for the
+	# latest-release and asset CDN redirects), -S/-s: quiet but show errors.
+	curl -fLsS -o "$2" "$1"
+}
 
-	if [[ ! -f "${LOCAL_TARBALL}" ]]; then
-		err "LOCAL_TARBALL '${LOCAL_TARBALL}' does not exist or is not a file."
+if [[ "${SOURCE_MODE}" == "file" ]]; then
+	# --- Use a release-layout tarball from disk (no download) -----------------
+	log "Installing unbounded-storage (${ARCH}, ${VERSION}) from local file ${SOURCE}"
+
+	if [[ ! -f "${SOURCE}" ]]; then
+		err "source '${SOURCE}' does not exist or is not a file."
 		exit 1
 	fi
-	archive="${LOCAL_TARBALL}"
+	archive="${SOURCE}"
+elif [[ "${SOURCE_MODE}" == "url" ]]; then
+	# --- Download a release-layout tarball from an explicit URL ----------------
+	log "Installing unbounded-storage (${ARCH}, ${VERSION}) from ${SOURCE}"
+
+	ARCHIVE="${NAME}.tar.gz"
+	log "Downloading ${SOURCE} ..."
+	if ! curl_fetch "${SOURCE}" "${workdir}/${ARCHIVE}"; then
+		err "failed to download ${SOURCE}"
+		exit 1
+	fi
+
+	# Always verify against the sibling .sha256 published alongside the
+	# tarball. Refuse to install if the checksum cannot be fetched.
+	log "Downloading ${SOURCE}.sha256 ..."
+	if ! curl_fetch "${SOURCE}.sha256" "${workdir}/${ARCHIVE}.sha256"; then
+		err "failed to download checksum ${SOURCE}.sha256; refusing to install."
+		exit 1
+	fi
+
+	log "Verifying SHA-256 checksum ..."
+	# Rewrite the checksum file to reference the local archive name, since
+	# the published .sha256 may point at a differently named artifact.
+	expected="$(awk '{print $1; exit}' "${workdir}/${ARCHIVE}.sha256")"
+	printf '%s  %s\n' "${expected}" "${ARCHIVE}" >"${workdir}/${ARCHIVE}.sha256"
+	(
+		cd "${workdir}"
+		sha256sum -c "${ARCHIVE}.sha256"
+	) || {
+		err "checksum verification failed; refusing to install."
+		exit 1
+	}
+	log "Checksum OK."
+
+	archive="${workdir}/${ARCHIVE}"
 else
-	# --- Download + verify a release tarball ----------------------------------
+	# --- Download + verify a release tarball from GitHub ----------------------
 	ARCHIVE="${NAME}.tar.gz"
 
 	# Use the latest-release redirect when VERSION=latest so this script keeps
@@ -95,12 +158,6 @@ else
 	fi
 
 	log "Installing unbounded-storage (${ARCH}, ${VERSION}) from ${REPO}"
-
-	curl_fetch() {
-		# -f: fail on HTTP errors, -L: follow redirects (required for the
-		# latest-release and asset CDN redirects), -S/-s: quiet but show errors.
-		curl -fLsS -o "$2" "$1"
-	}
 
 	log "Downloading ${ARCHIVE} ..."
 	if ! curl_fetch "${base_url}/${ARCHIVE}" "${workdir}/${ARCHIVE}"; then
@@ -170,19 +227,11 @@ Wants=network-online.target
 Type=simple
 User=root
 Group=root
-
-# Put the bundled libfabric runtime (lib/libfabric.so*) on the loader search
-# path so the daemon finds it without a wrapper script.
 Environment=LD_LIBRARY_PATH=${PREFIX}/current/lib
-
 ExecStart=${PREFIX}/current/bin/unbounded-storage ${STORAGE_ARGS}
-
-# Restart whenever the process crashes or otherwise exits.
 Restart=always
 RestartSec=2s
 
-# No resource restrictions: raise every rlimit to infinity and apply no
-# CPU/memory/IO cgroup caps and no sandboxing.
 LimitNOFILE=infinity
 LimitNPROC=infinity
 LimitMEMLOCK=infinity

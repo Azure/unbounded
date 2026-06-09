@@ -166,7 +166,7 @@ REACT_DEV ?= false
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-manifests
 .PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-net-controller-local image-net-node-local images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
-.PHONY: unbounded-storage unbounded-storage-build unbounded-storage-smoke unbounded-storage-tarball bench unbounded-storage-test unbounded-storage-check unbounded-storage-model-check libfabric
+.PHONY: unbounded-storage unbounded-storage-build unbounded-storage-smoke unbounded-storage-tarball unbounded-storage-push bench unbounded-storage-test unbounded-storage-check unbounded-storage-model-check libfabric
 
 ##@ General
 
@@ -218,6 +218,7 @@ help: ## Show this help
 	@echo "  unbounded-storage | unbounded-storage-build  Build unbounded-storage (with/without test)"
 	@echo "  unbounded-storage-smoke          Run the end-to-end smoke test (uses sudo)"
 	@echo "  unbounded-storage-tarball        Package unbounded-storage + libfabric into a release tarball"
+	@echo "  unbounded-storage-push           Push the unbounded-storage release tarball to Azure blob storage"
 	@echo "  bench                            Build the bench tool (excluded from images)"
 	@echo "  unbounded-storage-test           Run cargo tests for unbounded-storage"
 	@echo "  unbounded-storage-check          Run cargo check for unbounded-storage"
@@ -558,6 +559,37 @@ unbounded-storage-tarball: unbounded-storage-build ## Package unbounded-storage 
 	cd $(STORAGE_DIST_DIR) && sha256sum $(STORAGE_TARBALL_STEM).tar.gz > $(STORAGE_TARBALL_STEM).tar.gz.sha256
 	@rm -rf $(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)
 	@echo "Wrote $(STORAGE_TARBALL)"
+
+# Azure blob storage destination for publishing the unbounded-storage release
+# tarball. AZURE_STORAGE_KEY must be provided in the environment when pushing.
+STORAGE_BLOB_ACCOUNT   ?=
+STORAGE_BLOB_CONTAINER ?=
+
+unbounded-storage-push: unbounded-storage-tarball ## Push the unbounded-storage release tarball to Azure blob storage
+	@test -n "$(STORAGE_BLOB_ACCOUNT)" || { echo "error: STORAGE_BLOB_ACCOUNT is required"; exit 1; }
+	@test -n "$(AZURE_STORAGE_KEY)" || { echo "error: AZURE_STORAGE_KEY is required for pushing artifacts"; exit 1; }
+	@az storage blob upload \
+		--file $(STORAGE_TARBALL) \
+		--container-name $(STORAGE_BLOB_CONTAINER) \
+		--name $(VERSION)/$(STORAGE_TARBALL_STEM).tar.gz \
+		--account-name $(STORAGE_BLOB_ACCOUNT) \
+		--account-key $(AZURE_STORAGE_KEY) \
+		--overwrite
+	@az storage blob upload \
+		--file $(STORAGE_TARBALL).sha256 \
+		--container-name $(STORAGE_BLOB_CONTAINER) \
+		--name $(VERSION)/$(STORAGE_TARBALL_STEM).tar.gz.sha256 \
+		--account-name $(STORAGE_BLOB_ACCOUNT) \
+		--account-key $(AZURE_STORAGE_KEY) \
+		--overwrite
+	@az storage blob upload \
+		--file hack/scripts/install-unbounded-storage.sh \
+		--container-name $(STORAGE_BLOB_CONTAINER) \
+		--name $(VERSION)/install.sh \
+		--account-name $(STORAGE_BLOB_ACCOUNT) \
+		--account-key $(AZURE_STORAGE_KEY) \
+		--overwrite
+	@echo "Uploaded $(STORAGE_TARBALL_STEM).tar.gz to https://$(STORAGE_BLOB_ACCOUNT).blob.core.windows.net/$(STORAGE_BLOB_CONTAINER)/$(VERSION)/$(STORAGE_TARBALL_STEM).tar.gz"
 
 bench: $(LIBFABRIC_STAMP) ## Build the bench tool (excluded from images)
 	$(CARGO_FABRIC_ENV) $(CARGO) build --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --release --locked --bin bench
