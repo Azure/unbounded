@@ -23,6 +23,9 @@ mod registry;
 #[cfg(target_os = "linux")]
 mod s3;
 
+#[cfg(target_os = "linux")]
+mod azure;
+
 use std::sync::Arc;
 
 use crate::bufferpool::{BulkRef, PageRef, PageStream, Req};
@@ -46,6 +49,9 @@ pub use registry::{BackendRegistry, RegistryFetchStream};
 
 #[cfg(target_os = "linux")]
 pub use s3::S3Backend;
+
+#[cfg(target_os = "linux")]
+pub use azure::AzureBackend;
 
 /// Origin fetch surface, sibling to `bufferpool::Transport`. A
 /// `Backend` resolves a `BulkRef` from an authoritative origin (as
