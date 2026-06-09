@@ -136,7 +136,7 @@ impl<T: DiskTarget> DiskRegistry<T> {
 
         let mut desired_paths: HashMap<&Path, &DiskSpec> = HashMap::new();
         for spec in desired {
-            desired_paths.insert(spec.path.as_path(), spec);
+            desired_paths.insert(Path::new(&spec.path), spec);
         }
 
         let to_remove: Vec<PathBuf> = self
@@ -168,20 +168,22 @@ impl<T: DiskTarget> DiskRegistry<T> {
         let assignment = assign_disk_cpus(desired, &self.disk_slots, &self.placement);
 
         for spec in desired {
-            if self.handles.contains_key(&spec.path) {
+            if self.handles.contains_key(Path::new(&spec.path)) {
                 continue;
             }
-            let pin = assignment.get(&spec.path).copied().flatten();
+            let pin = assignment.get(Path::new(&spec.path)).copied().flatten();
             match self.target.open(spec, pin) {
                 Ok((handle, channel)) => {
-                    self.handles.insert(spec.path.clone(), handle);
-                    self.channels.insert(spec.path.clone(), channel);
-                    self.applied.insert(spec.path.clone(), spec.clone());
-                    self.placement.insert(spec.path.clone(), pin);
+                    self.handles.insert(PathBuf::from(&spec.path), handle);
+                    self.channels.insert(PathBuf::from(&spec.path), channel);
+                    self.applied.insert(PathBuf::from(&spec.path), spec.clone());
+                    self.placement.insert(PathBuf::from(&spec.path), pin);
                     report.added += 1;
                 }
                 Err(e) => {
-                    report.failures.push((spec.path.clone(), e.to_string()));
+                    report
+                        .failures
+                        .push((PathBuf::from(&spec.path), e.to_string()));
                 }
             }
         }
@@ -262,33 +264,33 @@ fn assign_disk_cpus(
     // the handle, so the fresh assignment must treat those slots as
     // reserved and echo the survivor's existing slot.
     for spec in &sorted {
-        if let Some(held) = open.get(&spec.path) {
+        if let Some(held) = open.get(Path::new(&spec.path)) {
             if let Some(slot) = held {
                 if let Some(i) = slots.iter().position(|s| s == slot) {
                     used[i] = true;
                 }
             }
-            out.insert(spec.path.clone(), *held);
+            out.insert(PathBuf::from(&spec.path), *held);
         }
     }
 
     // Hand the remaining free slots to the not-yet-open disks.
     for spec in sorted {
-        if out.contains_key(&spec.path) {
+        if out.contains_key(Path::new(&spec.path)) {
             continue;
         }
         let local = slots
             .iter()
             .enumerate()
-            .find(|(i, s)| !used[*i] && s.numa == spec.numa);
+            .find(|(i, s)| !used[*i] && s.numa == spec.numa.map(|n| n as u16));
         let pick = local.or_else(|| slots.iter().enumerate().find(|(i, _)| !used[*i]));
         match pick {
             Some((i, slot)) => {
                 used[i] = true;
-                out.insert(spec.path.clone(), Some(*slot));
+                out.insert(PathBuf::from(&spec.path), Some(*slot));
             }
             None => {
-                out.insert(spec.path.clone(), None);
+                out.insert(PathBuf::from(&spec.path), None);
             }
         }
     }
@@ -314,7 +316,7 @@ fn specs_drifted(prev: Option<&DiskSpec>, next: &DiskSpec) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::schema::{ByteSize, DiskKind};
+    use crate::config::schema::DiskKind;
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
 
@@ -369,14 +371,14 @@ mod tests {
         ) -> Result<(MockHandle, PageChannel), DiskError> {
             let mut s = self.state.lock().unwrap();
             s.open_calls += 1;
-            if s.fail_on.contains(&spec.path) {
+            if s.fail_on.contains(Path::new(&spec.path)) {
                 return Err(DiskError::Open("injected".into()));
             }
-            s.opened.insert(spec.path.clone());
+            s.opened.insert(PathBuf::from(&spec.path));
             drop(s);
             Ok((
                 MockHandle {
-                    path: spec.path.clone(),
+                    path: PathBuf::from(&spec.path),
                     state: self.state.clone(),
                 },
                 dummy_channel(),
@@ -386,8 +388,8 @@ mod tests {
 
     fn spec(path: &str, qd: Option<u32>) -> DiskSpec {
         DiskSpec {
-            path: PathBuf::from(path),
-            kind: DiskKind::Nvme,
+            path: path.to_string(),
+            kind: DiskKind::Nvme as i32,
             size: None,
             numa: None,
             queue_depth: qd,
@@ -501,7 +503,7 @@ mod tests {
             self.hints
                 .lock()
                 .unwrap()
-                .push((spec.path.clone(), pin.map(|s| s.cpu as usize)));
+                .push((PathBuf::from(&spec.path), pin.map(|s| s.cpu as usize)));
             Ok((RecorderHandle, dummy_channel()))
         }
     }
@@ -700,10 +702,10 @@ mod tests {
     /// `prev == None` contract (a first-time open never reports drift).
     #[test]
     fn size_drift_is_detected() {
-        let file_spec = |size: usize| DiskSpec {
-            path: PathBuf::from("/a"),
-            kind: DiskKind::File,
-            size: Some(ByteSize(size)),
+        let file_spec = |size: u64| DiskSpec {
+            path: "/a".to_string(),
+            kind: DiskKind::File as i32,
+            size: Some(size),
             numa: None,
             queue_depth: None,
             page_size_bytes: None,

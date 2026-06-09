@@ -50,7 +50,7 @@ use crate::bufferpool::{BlockStore, BulkRef, PageRef, PageStream, Req, StripeKey
 use crate::fabric::Result as FabResult;
 use crate::fabric::{Fabric, FabricTransport, Handler, HandlerStream, MrHandle, PeerId};
 use crate::memory::Backing;
-use crate::p2p::{FingerRouter, FingerTable, NodeId, RingId, stripe_to_ring};
+use crate::p2p::{FingerRouter, FingerTable, NodeId, RingId, RoutingHandle, stripe_to_ring};
 use crate::runtime::{block_on_cooperative, noop_waker};
 
 /// Error surfaced by [`RecursiveHandler`]'s response stream.
@@ -106,12 +106,11 @@ where
 {
     store: Arc<S>,
     scratch: Arc<ScratchBacking>,
-    fingers: Arc<FingerTable>,
-    /// Canonical record of the routing surface, co-located with
-    /// `fingers`. The active resolution happens inside `forward`'s
-    /// `FingerRouter` clone; this copy mirrors `RoutedTransport`.
-    #[allow(dead_code)]
-    node_to_peer: Arc<HashMap<NodeId, PeerId>>,
+    /// Shared, live-reloadable routing surface. `forward`'s
+    /// `FingerRouter` shares this same handle, so a peer-set republish
+    /// updates both the owner/forward classify below (next request's
+    /// snapshot) and the forward routing at once.
+    routing: RoutingHandle,
     forward: FabricTransport<B::Req, FingerRouter>,
     backend: B,
 }
@@ -122,7 +121,7 @@ where
     B: Backend + 'static,
     B::Req: Req + Serialize + DeserializeOwned + 'static,
 {
-    /// Build a recursive handler.
+    /// Build a recursive handler over a freshly-seeded routing surface.
     ///
     /// `scratch` is the dedicated backing whose pages are filled and
     /// yielded; `scratch_mr` MUST be the same backing registered as
@@ -135,7 +134,8 @@ where
     /// the page geometry separately because the backing (CPU view) and
     /// the MR handle (NIC view) are distinct objects the embedder
     /// registers out-of-band, mirroring `PoolHandler::new` plus
-    /// `FabricTransport::new`.
+    /// `FabricTransport::new`. Use [`Self::with_routing`] to share a
+    /// [`RoutingHandle`] with other consumers for live reload.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<S>,
@@ -148,19 +148,46 @@ where
         page_size: usize,
         backend: B,
     ) -> FabResult<Self> {
+        Self::with_routing(
+            store,
+            scratch,
+            scratch_pages,
+            RoutingHandle::new(fingers, node_to_peer),
+            fabric,
+            scratch_mr,
+            page_size,
+            backend,
+        )
+    }
+
+    /// Build a recursive handler that shares `routing` with other
+    /// consumers. The forwarding `FabricTransport` is built with a
+    /// `FingerRouter` over a clone of the same handle, so a republish
+    /// through any clone reloads this handler's classify and forward
+    /// paths together.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_routing(
+        store: Arc<S>,
+        scratch: Backing,
+        scratch_pages: u32,
+        routing: RoutingHandle,
+        fabric: Arc<Fabric>,
+        scratch_mr: MrHandle,
+        page_size: usize,
+        backend: B,
+    ) -> FabResult<Self> {
         let usable = scratch_pages.min(scratch.page_count as u32);
         let free: Vec<u32> = (0..usable).collect();
         let scratch = Arc::new(ScratchBacking {
             backing: scratch,
             free: Mutex::new(free),
         });
-        let router = FingerRouter::new(fingers.clone(), node_to_peer.clone());
+        let router = FingerRouter::from_handle(routing.clone());
         let forward = FabricTransport::new(fabric, scratch_mr, router, page_size)?;
         Ok(Self {
             store,
             scratch,
-            fingers,
-            node_to_peer,
+            routing,
             forward,
             backend,
         })
@@ -184,7 +211,10 @@ where
         RecursiveHandlerStream {
             store: self.store.clone(),
             scratch: self.scratch.clone(),
-            fingers: self.fingers.clone(),
+            // Capture a consistent routing snapshot for this request's
+            // lifetime. A concurrent peer-set republish affects only
+            // requests that start after the store.
+            fingers: self.routing.snapshot().fingers.clone(),
             forward: &self.forward,
             backend: &self.backend,
             req,
