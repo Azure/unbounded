@@ -39,7 +39,7 @@ use std::task::{Context, Poll, Waker};
 use ::http::header::{ACCEPT_RANGES, CONNECTION, CONTENT_LENGTH, CONTENT_RANGE};
 use ::http::{Response, StatusCode};
 
-use crate::bufferpool::{BufferPool, ReadStream};
+use crate::bufferpool::{BufferPool, ReadStream, StripePlan};
 use crate::config::{FrontendKind, FrontendSpec};
 use crate::frontend::FrontendError;
 use crate::frontend::range::{ByteRange, RangeError, ResolvedRange, full_object, stripe_set};
@@ -352,57 +352,68 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
         return Ok(());
     }
 
-    // 8. Stream the body stripe-by-stripe out of the bufferpool.
+    // 8. Stream the body out of the bufferpool, pipelined across
+    // stripe boundaries.
     //
-    // Within each stripe we use the windowed read path so the pool
+    // The whole byte range is handed to the pool as one ordered list
+    // of per-stripe slices via the pipelined read path, so the pool
     // keeps many page fetches in flight ahead of the byte we are
-    // currently sending. The client send (`send_zc_fixed`) is
-    // strictly in order on the single TCP stream, but the fabric
-    // fetches of pages ahead of the cursor overlap with it, which is
-    // what lets a single large object saturate the RDMA fabric NIC.
-    // `usize::MAX` requests the full window: `read_windowed` clamps
-    // it to the pool's configured `max_inflight_pages` budget, so the
-    // prefetch depth is governed by that single knob.
-    for slice in stripe_set(resolved, stripe_size) {
-        let origin_ref = OriginRef {
-            backend_id: backend_id.to_string(),
-            origin_object_id: path.clone(),
-            stripe_idx: slice.stripe_idx,
-        };
-        let pool_req = StripeReq::new(origin_ref.stripe_key()).with_origin(origin_ref);
-        let mut rs = pool
-            .read_windowed(&pool_req, slice.intra_offset, slice.intra_len, usize::MAX)
-            .map_err(|_| ())?;
-        while let Some(page) = rs.next_page().await {
-            let page = page.map_err(|_| ())?;
-            let pr = page.page_ref();
-            let page_byte_offset = pr.page_idx as usize * page_size + pr.offset as usize;
-            let n = pr.len as usize;
-            // The PageGuard must stay alive until the SEND_ZC
-            // notification (when the kernel is done with the source
-            // page); awaiting here holds it across every partial send,
-            // then we drop it before the next `next_page` as the stream
-            // contract requires.
-            //
-            // SEND_ZC's CQE `res` is the count the kernel accepted,
-            // which can be short under socket-send-buffer pressure, so
-            // we loop advancing the byte offset until the whole page is
-            // on the wire. A zero count means the peer closed.
-            let mut sent_offset = page_byte_offset;
-            let mut remaining = n;
-            while remaining > 0 {
-                let sent = handle
-                    .send_zc_fixed(conn_fd, 0, sent_offset, remaining)
-                    .await
-                    .map_err(|_| ())?;
-                if sent == 0 {
-                    return Err(());
-                }
-                sent_offset += sent;
-                remaining -= sent;
+    // currently sending, spanning stripe boundaries. The client send
+    // (`send_zc_fixed`) is strictly in order on the single TCP stream,
+    // but the fabric/origin fetches of pages ahead of the cursor
+    // overlap with it, which is what lets a single large object
+    // saturate the RDMA fabric NIC and the origin download. Driving
+    // the slices through a single pipelined read (rather than draining
+    // each stripe's windowed read before the next) is what lets
+    // prefetch cross stripe boundaries instead of collapsing to one
+    // stripe's depth. `usize::MAX` requests the full window:
+    // `read_pipelined` clamps it to the pool's configured
+    // `max_inflight_pages` budget, so prefetch depth is governed by
+    // that single knob.
+    let plans: Vec<StripePlan<StripeReq>> = stripe_set(resolved, stripe_size)
+        .into_iter()
+        .map(|slice| {
+            let origin_ref = OriginRef {
+                backend_id: backend_id.to_string(),
+                origin_object_id: path.clone(),
+                stripe_idx: slice.stripe_idx,
+            };
+            StripePlan {
+                req: StripeReq::new(origin_ref.stripe_key()).with_origin(origin_ref),
+                intra_offset: slice.intra_offset,
+                intra_len: slice.intra_len,
             }
-            drop(page);
+        })
+        .collect();
+    let mut rs = pool.read_pipelined(plans, usize::MAX).map_err(|_| ())?;
+    while let Some(page) = rs.next_page().await {
+        let page = page.map_err(|_| ())?;
+        let pr = page.page_ref();
+        let page_byte_offset = pr.page_idx as usize * page_size + pr.offset as usize;
+        let n = pr.len as usize;
+        // The PageGuard must stay alive until the SEND_ZC notification
+        // (when the kernel is done with the source page); awaiting here
+        // holds it across every partial send, then we drop it before
+        // the next `next_page` as the stream contract requires.
+        //
+        // SEND_ZC's CQE `res` is the count the kernel accepted, which
+        // can be short under socket-send-buffer pressure, so we loop
+        // advancing the byte offset until the whole page is on the
+        // wire. A zero count means the peer closed.
+        let mut sent_offset = page_byte_offset;
+        let mut remaining = n;
+        while remaining > 0 {
+            let sent = handle
+                .send_zc_fixed(conn_fd, 0, sent_offset, remaining)
+                .await
+                .map_err(|_| ())?;
+            if sent == 0 {
+                return Err(());
+            }
+            sent_offset += sent;
+            remaining -= sent;
         }
+        drop(page);
     }
     Ok(())
 }
@@ -484,7 +495,7 @@ fn status_line_response(status: u16) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bufferpool::{Error, ReadStream, WindowedRead};
+    use crate::bufferpool::{Error, PipelinedRead, ReadStream, WindowedRead};
     use crate::frontend::range::StripeSlice;
     use std::cell::RefCell;
 
@@ -682,6 +693,14 @@ mod tests {
             _len: u64,
             _window: usize,
         ) -> Result<WindowedRead<'p>, Error> {
+            Err(Error::from("mock pool has no data"))
+        }
+
+        fn read_pipelined<'p>(
+            &'p self,
+            _stripes: Vec<StripePlan<StripeReq>>,
+            _window: usize,
+        ) -> Result<PipelinedRead<'p>, Error> {
             Err(Error::from("mock pool has no data"))
         }
     }
