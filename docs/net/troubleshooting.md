@@ -86,10 +86,11 @@ Each node agent exposes status on port 9998:
 
 ### Migrating a node from Cilium to unbounded-net
 
-When replacing Cilium with unbounded-net as the primary CNI, clean Cilium state
-before starting unbounded-net on the node. Stale Cilium host routes, interfaces,
-socket-LB programs, or service-LB maps can keep owning pod CIDR or ClusterIP
-traffic even after the Cilium DaemonSet is gone.
+When replacing Cilium with unbounded-net as the primary CNI, rebuild or re-image
+the node before joining it back to the cluster when possible. If the node must
+be reused in place, clean Cilium state before starting unbounded-net. Stale
+Cilium host routes, interfaces, socket-LB programs, or service-LB maps can keep
+owning pod CIDR or ClusterIP traffic even after the Cilium DaemonSet is gone.
 
 Recommended migration flow:
 
@@ -97,13 +98,26 @@ Recommended migration flow:
 2. Uninstall or scale down Cilium so `cilium-agent` is no longer running.
 3. Run Cilium's documented post-uninstall cleanup on every node, for example:
    `cilium-dbg post-uninstall-cleanup --all-state -f`
-4. Verify Cilium host datapath state is gone:
-   `ip -d link show cilium_host cilium_net cilium_vxlan`
-   `ip rule show | grep 'fwmark 0x200/0xf00 lookup 2004'`
-   `ip route get <remote-pod-ip>` should not select `cilium_host`
-5. Verify Cilium socket-LB/service-LB state is gone:
-   `bpftool prog list | grep cil_sock`
-   `bpftool map list | grep cilium_lb`
+4. Verify Cilium host datapath state is gone. The link and rule checks should
+   return no Cilium state, and the route lookup should not select
+   `cilium_host`:
+
+   ```bash
+   for dev in cilium_host cilium_net cilium_vxlan; do
+     ip -d link show dev "$dev" 2>/dev/null && echo "stale Cilium link: $dev"
+   done
+   ip rule show | grep 'fwmark 0x200/0xf00 lookup 2004'
+   ip route get <remote-pod-ip>
+   ```
+
+5. Verify Cilium socket-LB/service-LB state is gone. These checks should return
+   no Cilium state:
+
+   ```bash
+   bpftool prog list | grep cil_sock
+   bpftool map list | grep cilium_lb
+   ```
+
 6. Remove Cilium CNI config files from `/etc/cni/net.d`.
 7. Start unbounded-net and verify new pod traffic routes through `unbounded0`.
 
