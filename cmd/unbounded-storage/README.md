@@ -126,7 +126,7 @@ queue_depth = 32                 # optional u32; per-disk io_uring depth.
 
 [startup.memory]                 # startup-fixed; read once at process start.
 no_hugepages   = false           # true allocates per-shard backing from the heap.
-bytes_per_shard = 536870912      # u64 bytes (no K/M/G suffix). 0 -> 512 MiB.
+bytes_per_shard = 134217728      # u64 bytes (no K/M/G suffix). 0 -> 128 MiB.
 
 [startup.fabric]
 listen_addr         = "0.0.0.0:0" # per-shard fabric listen address; :0 picks a free port.

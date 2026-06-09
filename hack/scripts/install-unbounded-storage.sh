@@ -14,11 +14,11 @@ NO_ENABLE="${NO_ENABLE:-0}"
 LOCAL_TARBALL="${LOCAL_TARBALL:-}"
 HUGEPAGES="${HUGEPAGES:-}"
 # Buffer-pool size (bytes) the hugepage reservation is sized for. Matches the
-# daemon's default 512 MiB per-shard backing so a fresh install reserves enough
+# daemon's default 128 MiB per-shard backing so a fresh install reserves enough
 # 2MiB hugepages for the buffer pool. Override with POOL_BYTES=<bytes> (keep it
 # in sync with bytes_per_shard in the daemon config). Ignored when HUGEPAGES is
 # set to an explicit count.
-POOL_BYTES="${POOL_BYTES:-536870912}"
+POOL_BYTES="${POOL_BYTES:-134217728}"
 
 # Optional first positional argument selects where the release-layout tarball
 # comes from:

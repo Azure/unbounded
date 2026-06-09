@@ -326,6 +326,52 @@ fingers_per_node = 5678
         // If Drop didn't join cleanly we'd hang or panic above.
     }
 
+    #[test]
+    fn modification_emits_update_and_sibling_is_filtered() {
+        // End-to-end coverage through the real notify watcher, replacing
+        // the old `emits_update_on_modification` test. It pins down two
+        // properties in a single watcher lifetime (so the suite does not
+        // pay for an extra concurrent watcher):
+        //   1. A valid config modification surfaces a `ConfigUpdate`
+        //      whose parsed contents reflect the new file, with an
+        //      advancing generation.
+        //   2. A write to an unrelated sibling file in the watched parent
+        //      directory is filtered out (`event_affects_config`) and
+        //      yields no update; a subsequent real config change still
+        //      does, which also proves the watcher stayed live.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        let sibling = dir.path().join("node1.disk");
+        write(&path, VALID_A);
+
+        let (_w, rx) = ConfigWatcher::new(path.clone()).unwrap();
+        // Let the notify backend finish installing the watch before the
+        // first edit so the modification is observed.
+        thread::sleep(Duration::from_millis(100));
+
+        // (1) A valid modification is surfaced with the new contents.
+        write(&path, VALID_B);
+        let update = recv_within(&rx, Duration::from_secs(3))
+            .expect("a valid modification must yield a ConfigUpdate");
+        assert_eq!(update.config.p2p().fingers_per_node, 5678);
+        assert!(update.generation >= 1, "generation must advance");
+
+        // (2a) An unrelated sibling write is filtered out.
+        write(&sibling, "not a config file");
+        assert!(
+            rx.recv_timeout(Duration::from_millis(800)).is_err(),
+            "a sibling write must be filtered out and yield no update",
+        );
+
+        // (2b) A real config change after the sibling write still emits,
+        // proving the watcher is alive and the silence above was genuine
+        // filtering rather than a dead watch.
+        write(&path, VALID_A);
+        let update = recv_within(&rx, Duration::from_secs(3))
+            .expect("a config change after a sibling write must still emit");
+        assert_eq!(update.config.p2p().fingers_per_node, 1234);
+    }
+
     fn event_for(paths: &[&Path]) -> notify::Event {
         notify::Event {
             kind: notify::EventKind::Any,

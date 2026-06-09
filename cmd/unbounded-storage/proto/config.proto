@@ -38,7 +38,7 @@ message StartupCfg {
 message MemoryCfg {
   // Allocate per-shard backing from the heap instead of 2 MiB hugepages.
   bool no_hugepages = 1;
-  // Per-shard backing size in bytes. 0 -> 512 MiB.
+  // Per-shard backing size in bytes. 0 -> 128 MiB.
   uint64 bytes_per_shard = 2;
 }
 

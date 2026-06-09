@@ -1519,7 +1519,7 @@ mod tests {
         // These accessors panic if defaults were not applied.
         assert_eq!(cfg.p2p().fingers_per_node, 100);
         assert_eq!(cfg.startup().fabric().listen_addr, "0.0.0.0:0");
-        assert_eq!(cfg.startup().memory().bytes_per_shard, 512 * 1024 * 1024);
+        assert_eq!(cfg.startup().memory().bytes_per_shard, 128 * 1024 * 1024);
     }
 
     #[test]
