@@ -345,6 +345,74 @@ jobs:
             exit 1
           fi
 
+      - name: Fetch release tooling from default branch (workaround for #235)
+        if: env.MODE == 'upgrade'
+        # The deploy job's primary checkout is pinned to the deployed tag,
+        # but the merge script for the #235 workaround lives under
+        # hack/release/ on the default branch and may not exist at older
+        # tags (e.g. when backfilling a release that predates the script).
+        # Pull just hack/release/ from the default branch into a tools
+        # subdirectory so the next step can invoke it regardless of the
+        # deployed tag.
+        #
+        # Mirrors the pattern used by smoke-discover and smoke-tests for
+        # hack/release/smoke/.
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: _release-tools
+          sparse-checkout: hack/release
+          sparse-checkout-cone-mode: true
+
+      - name: Workaround for #235 - merge bundled machina-config with live ConfigMap
+        if: env.MODE == 'upgrade'
+        # WORKAROUND for https://github.com/Azure/unbounded/issues/235.
+        #
+        # The shipped 03-config.yaml ships a machina-config ConfigMap whose
+        # inner config.yaml lacks the per-cluster `apiServerEndpoint` field
+        # required by machina-controller v0.1.5+. Only
+        # `kubectl unbounded site init` ever populates that field on the
+        # live ConfigMap. If we let the bundled template apply unmodified,
+        # it silently overwrites the live value and the controller starts
+        # crashing on the next pod restart.
+        #
+        # Instead of skipping the file outright (which would also drop any
+        # new keys the bundle introduces), we MERGE: load the live
+        # ConfigMap's inner config.yaml, load the bundle's inner
+        # config.yaml, take the union with LIVE WINNING on conflicts
+        # (policy A), and rewrite the bundle file in place. The subsequent
+        # `kubectl apply` then pushes a manifest that preserves all
+        # operator state while adding any new keys this release
+        # introduces.
+        #
+        # The merge logic lives in hack/release/merge-machina-config.py
+        # and is fetched from the default branch by the step above so
+        # backfills of older tags still get the latest version.
+        #
+        # REMOVE this step (along with the sparse checkout above and the
+        # merge script under hack/release/) once issue #235 lands upstream
+        # (e.g. controller falls back to in-cluster discovery, or the
+        # release tarball stops shipping 03-config.yaml).
+        env:
+          BUNDLE_FILE: ${{ env.MANIFESTS_DIR }}/machina/03-config.yaml
+          MERGE_SCRIPT: _release-tools/hack/release/merge-machina-config.py
+        run: |
+          set -euo pipefail
+          if [[ ! -f "$BUNDLE_FILE" ]]; then
+            echo "::warning::Workaround for #235 expected ${BUNDLE_FILE} but it was not present; the workaround may no longer be needed"
+            exit 0
+          fi
+
+          # Fetch the live inner config (empty if the ConfigMap does not exist yet).
+          LIVE_INNER=$(kubectl -n unbounded-kube get cm machina-config \
+            -o jsonpath='{.data.config\.yaml}' --ignore-not-found)
+          export LIVE_INNER
+
+          python3 "$MERGE_SCRIPT"
+
+          echo "Merged config.yaml that will be applied to the cluster:"
+          python3 -c "import yaml,sys; print(yaml.safe_load(open(sys.argv[1]))['data']['config.yaml'])" "$BUNDLE_FILE"
+
       - name: Apply manifests (upgrade)
         if: env.MODE == 'upgrade'
         run: |
@@ -382,9 +450,20 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Discover smoke tests to run after deploy. Lists hack/release/smoke/*.sh
-  # and emits a JSON matrix. If the directory has no scripts, has_tasks is
-  # false and the smoke-tests job is skipped (GitHub Actions errors on an
-  # empty matrix, so we have to gate it explicitly).
+  # and emits a JSON matrix. If the directory is absent or has no scripts,
+  # has_tasks is false and the smoke-tests job is skipped (GitHub Actions
+  # errors on an empty matrix, so we have to gate it explicitly).
+  #
+  # Why check out the default branch instead of the deployed tag?
+  #   Smoke tests are validation of the *deployed cluster*, not of the
+  #   release artifacts. They are intentionally version-agnostic (they
+  #   check generic cluster health), and we want backfill deploys of older
+  #   tags to still benefit from the latest smoke checks. Without this,
+  #   backfilling a tag that predates hack/release/smoke/ would skip
+  #   smoke entirely; new smoke tests added on main would also never run
+  #   against old releases. If a smoke test ever needs to be tied to a
+  #   specific release, that's a signal it should live with the release
+  #   artifacts (e.g. as an integration test in CI), not here.
   # ---------------------------------------------------------------------------
   smoke-discover:
     needs: [resolve, deploy]
@@ -392,17 +471,40 @@ jobs:
     outputs:
       tasks: ${{ steps.list.outputs.tasks }}
       has_tasks: ${{ steps.list.outputs.has_tasks }}
+      smoke_sha: ${{ steps.pin.outputs.sha }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: ${{ needs.resolve.outputs.tag }}
+          # Use the default branch's hack/release/smoke/, not the deployed
+          # tag's. See the rationale above the job.
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Pin smoke ref
+        id: pin
+        run: |
+          set -euo pipefail
+          # Record the exact commit the default branch points at right now.
+          # smoke-tests checks out this SHA rather than re-resolving the
+          # default branch, so it runs precisely the scripts this job
+          # enumerated even if the branch advances between jobs.
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Discover smoke tasks
         id: list
         run: |
           set -euo pipefail
+          # Bail out cleanly if the smoke directory does not exist (older
+          # checkouts, accidentally removed directory). `find` exits
+          # non-zero on a missing path even with stderr suppressed, which
+          # would abort under `set -e`.
+          if [[ ! -d hack/release/smoke ]]; then
+            echo "has_tasks=false" >> "$GITHUB_OUTPUT"
+            echo "tasks=[]" >> "$GITHUB_OUTPUT"
+            echo "hack/release/smoke does not exist at this ref; skipping smoke tests"
+            exit 0
+          fi
           tasks=$(
-            find hack/release/smoke -maxdepth 1 -type f -name '*.sh' 2>/dev/null \
+            find hack/release/smoke -maxdepth 1 -type f -name '*.sh' \
               | sort \
               | jq -R -s -c 'split("\n") | map(select(length>0)) |
                   map({name: (. | sub(".*/"; "") | sub(".sh$"; "")), script: .})'
@@ -436,8 +538,9 @@ jobs:
   #      UI.
   #   2. The script must complete within 15 minutes (see timeout-minutes
   #      below).
-  #   3. The script runs from the repo root at the deployed tag's commit
-  #      with the following env exported:
+  #   3. The script runs from the repo root at the commit the default
+  #      branch pointed to when smoke-discover ran (NOT the deployed tag -
+  #      see smoke-discover's rationale) with the following env exported:
   #        TAG          - the deployed tag (e.g. v0.1.12)
   #        KUBECONFIG   - path to the cluster's kubeconfig
   #        SITE_NAME    - the configured site name on this cluster
@@ -465,7 +568,12 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: ${{ needs.resolve.outputs.tag }}
+          # Check out the exact commit smoke-discover enumerated, not a
+          # fresh resolve of the default branch (which may have advanced
+          # since). This guarantees we run precisely the scripts that
+          # populated the matrix. See the comment block on smoke-discover
+          # for why the smoke scripts come from the default branch at all.
+          ref: ${{ needs.smoke-discover.outputs.smoke_sha }}
 
       - name: Install kubectl
         uses: azure/setup-kubectl@829323503d1be3d00ca8346e5391ca0b07a9ab0d # v5.1.0

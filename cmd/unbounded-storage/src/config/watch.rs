@@ -192,13 +192,13 @@ mod tests {
     use tempfile::TempDir;
 
     const VALID_A: &str = r#"
-[fabric]
-listen_addr = "0.0.0.0:1234"
+[p2p]
+fingers_per_node = 1234
 "#;
 
     const VALID_B: &str = r#"
-[fabric]
-listen_addr = "0.0.0.0:5678"
+[p2p]
+fingers_per_node = 5678
 "#;
 
     fn write(path: &Path, contents: &str) {
@@ -271,7 +271,7 @@ listen_addr = "0.0.0.0:5678"
         // systems (e.g. CI) and turns this into a flaky timing test.
         let start = Instant::now();
         for i in 0..5 {
-            let body = format!("[fabric]\nlisten_addr = \"0.0.0.0:{}\"\n", 4000 + i);
+            let body = format!("[p2p]\nfingers_per_node = {}\n", 4000 + i);
             write(&path, &body);
         }
         assert!(

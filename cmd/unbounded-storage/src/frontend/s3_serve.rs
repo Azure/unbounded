@@ -58,8 +58,8 @@ static REQUEST_ID_SEQ: AtomicU64 = AtomicU64::new(1);
 /// S3 serving frontend factory. Built once per [`FrontendSpec`]; holds
 /// only the immutable configuration distilled from the spec.
 ///
-/// Like [`HttpFrontend`](crate::frontend::HttpFrontend) it does not
-/// implement the `Frontend` trait: the per-shard [`S3Driver`] is
+/// Like [`HttpFrontend`](crate::frontend::HttpFrontend) it exposes plain
+/// inherent methods rather than a trait: the per-shard [`S3Driver`] is
 /// generic over the concrete bufferpool type, which is only nameable in
 /// the binary, so the binary binds the listener via
 /// [`S3Frontend::bind_listener`] and constructs the driver directly.
@@ -78,7 +78,7 @@ impl S3Frontend {
     /// [`FrontendError::UnsupportedKind`], so a misrouted spec fails
     /// loudly rather than being served by the wrong engine.
     pub fn from_spec(spec: &FrontendSpec) -> Result<Self, FrontendError> {
-        if spec.kind != FrontendKind::S3 {
+        if spec.kind() != FrontendKind::S3 {
             return Err(FrontendError::UnsupportedKind("non-s3 frontend kind"));
         }
         let bind = spec
@@ -225,6 +225,24 @@ impl<P: BufferPool<Req = StripeReq> + 'static> S3Driver<P> {
             }
         }
         busy
+    }
+}
+
+impl<P: BufferPool<Req = StripeReq> + 'static> Drop for S3Driver<P> {
+    /// Close the listen fd the driver owns. The driver is the sole owner
+    /// of this `SO_REUSEPORT` listener (the embedder hands it the fd from
+    /// `bind_listener` and never touches it again), so dropping the
+    /// driver (on shard shutdown or a live frontend removal) must close
+    /// it or the fd leaks. The accept future borrows only the fd number,
+    /// not ownership, so closing here is sound once the driver is gone.
+    fn drop(&mut self) {
+        if self.listen_fd >= 0 {
+            // SAFETY: `listen_fd` was returned by `bind_listener` and is
+            // owned exclusively by this driver; it is closed exactly once.
+            unsafe {
+                libc::close(self.listen_fd);
+            }
+        }
     }
 }
 
@@ -596,7 +614,7 @@ mod tests {
     fn spec(id: &str, bind: &str) -> FrontendSpec {
         FrontendSpec {
             id: id.to_string(),
-            kind: FrontendKind::S3,
+            kind: FrontendKind::S3 as i32,
             bind: bind.to_string(),
             backend: "primary".to_string(),
         }
@@ -616,7 +634,7 @@ mod tests {
     #[test]
     fn from_spec_rejects_non_s3_kind() {
         let mut s = spec("f", "127.0.0.1:9000");
-        s.kind = FrontendKind::Http;
+        s.kind = FrontendKind::Http as i32;
         assert!(matches!(
             S3Frontend::from_spec(&s),
             Err(FrontendError::UnsupportedKind(_))
@@ -771,9 +789,5 @@ mod tests {
         assert!(!driver.progress());
         assert_eq!(driver.conn_count(), 0);
         assert!(driver.is_idle());
-
-        unsafe {
-            libc::close(listen_fd);
-        }
     }
 }
