@@ -47,7 +47,7 @@ impl Config {
 
         let memory = startup.memory.get_or_insert_with(MemoryCfg::default);
         if memory.bytes_per_shard == 0 {
-            memory.bytes_per_shard = 128 * 1024 * 1024;
+            memory.bytes_per_shard = 512 * 1024 * 1024;
         }
 
         let fabric = startup.fabric.get_or_insert_with(FabricCfg::default);
@@ -343,7 +343,7 @@ backend = "b"
         c.apply_defaults();
         let s = c.startup();
         assert!(!s.memory().no_hugepages);
-        assert_eq!(s.memory().bytes_per_shard, 128 * 1024 * 1024);
+        assert_eq!(s.memory().bytes_per_shard, 512 * 1024 * 1024);
         assert_eq!(s.fabric().listen_addr, "0.0.0.0:0");
         assert_eq!(s.fabric().progress_threads, 2);
         assert_eq!(s.fabric().progress_poll_us, 10);
@@ -415,6 +415,6 @@ disable_rdma = true
         // unset siblings keep their documented defaults.
         assert_eq!(c.startup().fabric().progress_threads, 7);
         assert_eq!(c.startup().fabric().rpc_worker_threads, 4);
-        assert_eq!(c.startup().memory().bytes_per_shard, 128 * 1024 * 1024);
+        assert_eq!(c.startup().memory().bytes_per_shard, 512 * 1024 * 1024);
     }
 }

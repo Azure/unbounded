@@ -100,7 +100,7 @@ excluded from the live-reload diff.
 
 - `[startup.memory]` - `no_hugepages` (allocate per-shard backing from
   the heap instead of 2 MiB hugepages) and `bytes_per_shard` (u64 bytes,
-  no suffix; `0` -> 128 MiB).
+  no suffix; `0` -> 512 MiB).
 - `[startup.fabric]` - `listen_addr` (default `0.0.0.0:0`),
   `progress_threads` (2), `progress_poll_us` (10),
   `rpc_worker_threads` (4), `max_inflight` (1024) - the per-shard fabric
