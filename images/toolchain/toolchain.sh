@@ -82,8 +82,11 @@ case "${toolchain_flavor}" in
     fedora)
         containerfile="${script_dir}/Containerfile"
         ;;
+    ubuntu)
+        containerfile="${script_dir}/Containerfile.ubuntu"
+        ;;
     *)
-        die "unknown TOOLCHAIN_FLAVOR=${toolchain_flavor} (expected: fedora)"
+        die "unknown TOOLCHAIN_FLAVOR=${toolchain_flavor} (expected: fedora, ubuntu)"
         ;;
 esac
 

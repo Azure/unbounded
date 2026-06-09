@@ -183,7 +183,7 @@ help: ## Show this help
 	@echo "  gomod                            go mod tidy"
 	@echo "  notice                           Regenerate NOTICE from go.mod and frontend/package.json"
 	@echo "  notice-check                     Verify NOTICE is in sync with dependencies"
-	@echo "  toolchain-shell                  Drop into the toolchain container with the repo mounted at /project (set TOOLCHAIN_FLAVOR=fedora|... to pick a flavor)"
+	@echo "  toolchain-shell                  Drop into the toolchain container with the repo mounted at /project (set TOOLCHAIN_FLAVOR=fedora|ubuntu to pick a flavor)"
 	@echo "  toolchain-build                  Rebuild the toolchain container image (honors TOOLCHAIN_FLAVOR)"
 	@echo ""
 	@echo "Build:"
