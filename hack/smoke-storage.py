@@ -39,23 +39,6 @@ processes can pin their io_uring buffers.
 
 By default the two `unbounded-storage` processes per scenario are spawned
 directly as child processes (the local-development path, unchanged).
-
-Set SMOKE_STORAGE_SYSTEMD=1 to instead install and run each node as a
-systemd service via hack/scripts/install-unbounded-storage.sh. This is how
-CI exercises that installer end-to-end: each node is installed from a
-prebuilt release-layout tarball (SMOKE_STORAGE_TARBALL, assembled by
-`make unbounded-storage-tarball` in CI) and becomes a transient
-`unbounded-storage-smoke-<kind>-<n>` unit. Requires root (installing units
-and raising RLIMIT_MEMLOCK). Relevant env vars:
-
-    SMOKE_STORAGE_SYSTEMD   "1" to use systemd; anything else uses subprocess.
-    SMOKE_STORAGE_BINARY    Path to the unbounded-storage binary (used to spawn
-                            nodes directly in subprocess mode).
-                            Default: <repo>/bin/unbounded-storage.
-    SMOKE_STORAGE_TARBALL   Path to the release-layout tarball to install from
-                            (required in systemd mode).
-    SMOKE_STORAGE_PREFIX    Install prefix passed to the installer.
-                            Default: /opt/unbounded-storage.
 """
 
 from __future__ import annotations
@@ -88,12 +71,6 @@ BINARY = Path(
     os.environ.get("SMOKE_STORAGE_BINARY", str(REPO_ROOT / "bin" / "unbounded-storage"))
 )
 
-# When SMOKE_STORAGE_SYSTEMD=1, each node is installed and run as a systemd
-# service through hack/scripts/install-unbounded-storage.sh (so CI exercises
-# that installer) rather than spawned as a direct child process. The installer
-# is pointed at a prebuilt release-layout tarball (SMOKE_STORAGE_TARBALL,
-# assembled in CI by `make unbounded-storage-tarball`) via LOCAL_TARBALL.
-# See the module docstring for the full env-var contract.
 USE_SYSTEMD = os.environ.get("SMOKE_STORAGE_SYSTEMD", "0") == "1"
 INSTALL_SCRIPT = REPO_ROOT / "hack" / "scripts" / "install-unbounded-storage.sh"
 STORAGE_PREFIX = os.environ.get("SMOKE_STORAGE_PREFIX", "/opt/unbounded-storage")
