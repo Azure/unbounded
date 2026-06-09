@@ -200,7 +200,9 @@ class _LocalNode(_Node):
     def __init__(self, args: list[str], log_path: Path) -> None:
         self.label = f"storage process {args}"
         self.log_path = log_path
-        log_file = open(log_path, "w")  # noqa: SIM115 - intentionally long-lived
+        # Owned by this node so stop() can close it; the forwarding thread
+        # writes to it for the life of the process.
+        self.log_file = open(log_path, "w")  # noqa: SIM115 - intentionally long-lived
         self.proc: subprocess.Popen[Any] = subprocess.Popen(
             args,
             stdout=subprocess.PIPE,
@@ -209,7 +211,7 @@ class _LocalNode(_Node):
             start_new_session=True,
         )
         threading.Thread(
-            target=_forward_lines, args=(self.proc.stdout, log_file), daemon=True
+            target=_forward_lines, args=(self.proc.stdout, self.log_file), daemon=True
         ).start()
 
     def stop(self) -> None:
@@ -225,6 +227,18 @@ class _LocalNode(_Node):
                 self.proc.wait(timeout=5)
             except (OSError, subprocess.TimeoutExpired):
                 pass
+        # The process is gone (or unkillable); the forwarding thread is a
+        # daemon reading a now-closed pipe, so flush best-effort and release
+        # the log file handle.
+        try:
+            self.log_file.flush()
+            os.fsync(self.log_file.fileno())
+        except OSError:
+            pass
+        try:
+            self.log_file.close()
+        except OSError:
+            pass
 
     def dump_log(self) -> None:
         log(f"  --- {self.log_path.name} ---")
@@ -251,7 +265,11 @@ class _SystemdNode(_Node):
         env.update(
             {
                 "SERVICE_NAME": unit,
-                "STORAGE_ARGS": f"--config {cfg}",
+                # The installer puts `--config <CONFIG_PATH>` on the ExecStart
+                # line itself, so point it at this node's config rather than
+                # passing a second `--config` via STORAGE_ARGS (which the
+                # daemon rejects as a repeated argument).
+                "CONFIG_PATH": str(cfg),
                 "LOCAL_TARBALL": STORAGE_TARBALL,
                 "VERSION": "local",
                 # Give each node its own prefix so concurrent installs do not
@@ -283,8 +301,11 @@ class _SystemdNode(_Node):
         unit_path = f"/etc/systemd/system/{self.unit}.service"
         try:
             os.remove(unit_path)
-        except OSError:
+        except FileNotFoundError:
+            # Already removed (or never written); nothing to clean up.
             pass
+        except OSError as e:
+            log(f"  (failed to remove unit file {unit_path}: {e})")
         subprocess.run(
             ["systemctl", "daemon-reload"],
             stdout=DEVNULL,
@@ -411,8 +432,10 @@ def reserve_hugepages() -> None:
             try:
                 compact.write_text("1\n")
                 time.sleep(1)
-            except OSError:
-                pass
+            except OSError as e:
+                # Compaction is a best-effort nudge; if it fails we still fall
+                # through to the retry write and the final free-page check.
+                log(f"  (memory compaction failed, continuing: {e})")
             NR_HUGEPAGES_PATH.write_text(f"{target}\n")
             free = _read_int(FREE_HUGEPAGES_PATH) or 0
 
@@ -427,17 +450,19 @@ def reserve_hugepages() -> None:
 
 
 def restore_hugepages() -> None:
-    """Restore `nr_hugepages` to the value captured by `reserve_hugepages`."""
-    global _orig_nr_hugepages
+    """Restore `nr_hugepages` to the value captured by `reserve_hugepages`.
+
+    Only reads `_orig_nr_hugepages`; `cleanup()` is guarded by `_cleaning_up`
+    so this runs at most once per process, and a no-op when the pool was left
+    untouched (`_orig_nr_hugepages is None`).
+    """
     if _orig_nr_hugepages is None:
         return
-    orig = _orig_nr_hugepages
-    _orig_nr_hugepages = None
     try:
-        NR_HUGEPAGES_PATH.write_text(f"{orig}\n")
-        log(f"Restored nr_hugepages -> {orig}")
+        NR_HUGEPAGES_PATH.write_text(f"{_orig_nr_hugepages}\n")
+        log(f"Restored nr_hugepages -> {_orig_nr_hugepages}")
     except OSError as e:
-        log(f"  (could not restore nr_hugepages to {orig}: {e})")
+        log(f"  (could not restore nr_hugepages to {_orig_nr_hugepages}: {e})")
 
 
 # ============================================================================
