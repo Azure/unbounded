@@ -45,7 +45,7 @@
 //! [`PageService`]: crate::storage::PageService
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -128,25 +128,24 @@ impl DiskTarget for UringDiskTarget {
         // sized here, on the supervisor thread, before the storage core
         // opens it (capacity comes from the file length). Size validity is
         // guaranteed by config validation.
-        if spec.kind == DiskKind::File {
+        if spec.kind() == DiskKind::File {
             ring_cfg.iopoll = false;
             ring_cfg.single_issuer = false;
             ring_cfg.defer_taskrun = false;
             let size = spec
                 .size
-                .expect("file disk size is validated at config load")
-                .bytes() as u64;
-            if let Err(e) = provision_file(&spec.path, size) {
+                .expect("file disk size is validated at config load");
+            if let Err(e) = provision_file(Path::new(&spec.path), size) {
                 return Err(DiskError::Open(format!(
                     "provision file {}: {e}",
-                    spec.path.display()
+                    spec.path
                 )));
             }
         }
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thr = stop.clone();
-        let path = spec.path.clone();
+        let path = PathBuf::from(&spec.path);
         let name = format!("ub-disk-{}", path.display());
         let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<PageChannel, String>>(1);
 
@@ -405,7 +404,7 @@ fn run_core_loop<B, R>(
 fn engine_config_from(spec: &DiskSpec) -> EngineConfig {
     let mut cfg = EngineConfig::default();
     if let Some(p) = spec.page_size_bytes {
-        cfg.page_size_bytes = p;
+        cfg.page_size_bytes = p as usize;
     }
     cfg.bypass_admission = spec.bypass_admission;
     cfg.skip_recovery_scan_if_no_meta = spec.skip_recovery_scan_if_no_meta;
