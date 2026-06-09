@@ -86,6 +86,15 @@ LIBFABRIC_URL ?= https://github.com/ofiwg/libfabric/releases/download/v$(LIBFABR
 CARGO_FABRIC_ENV = LIBFABRIC_PKG_CONFIG_PATH=$(LIBFABRIC_PKG_CONFIG_PATH) \
 	LD_LIBRARY_PATH=$(LIBFABRIC_PREFIX)/lib$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}
 
+# Release tarball packaging for unbounded-storage. ARCH defaults to the
+# host (normalized to Go-style names) and can be overridden for CI matrix
+# builds. The tarball bundles the binary plus the pinned libfabric shared
+# objects under a single top-level directory.
+STORAGE_TARBALL_ARCH ?= $(shell uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/')
+STORAGE_DIST_DIR ?= dist
+STORAGE_TARBALL_STEM := unbounded-storage-linux-$(STORAGE_TARBALL_ARCH)
+STORAGE_TARBALL := $(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM).tar.gz
+
 # Version is derived from the latest git tag. Override with: make VERSION=v1.0.0
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 GIT_COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
@@ -157,7 +166,7 @@ REACT_DEV ?= false
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-manifests
 .PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-net-controller-local image-net-node-local images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
-.PHONY: unbounded-storage unbounded-storage-build bench unbounded-storage-test unbounded-storage-check unbounded-storage-model-check libfabric
+.PHONY: unbounded-storage unbounded-storage-build unbounded-storage-smoke unbounded-storage-tarball bench unbounded-storage-test unbounded-storage-check unbounded-storage-model-check libfabric
 
 ##@ General
 
@@ -207,6 +216,8 @@ help: ## Show this help
 	@echo ""
 	@echo "Rust Binaries:"
 	@echo "  unbounded-storage | unbounded-storage-build  Build unbounded-storage (with/without test)"
+	@echo "  unbounded-storage-smoke          Run the end-to-end smoke test (uses sudo)"
+	@echo "  unbounded-storage-tarball        Package unbounded-storage + libfabric into a release tarball"
 	@echo "  bench                            Build the bench tool (excluded from images)"
 	@echo "  unbounded-storage-test           Run cargo tests for unbounded-storage"
 	@echo "  unbounded-storage-check          Run cargo check for unbounded-storage"
@@ -522,6 +533,31 @@ unbounded-storage-build: $(LIBFABRIC_STAMP) ## Build the unbounded-storage binar
 	cp $(UNBOUNDED_STORAGE_CRATE)/target/release/unbounded-storage $(UNBOUNDED_STORAGE_BIN)
 
 unbounded-storage: unbounded-storage-test unbounded-storage-build ## Build the unbounded-storage binary (implies test)
+
+unbounded-storage-smoke: unbounded-storage-build ## Run the end-to-end smoke test (requires sudo for hugepages/memlock)
+	sudo -E env "PATH=$$PATH" \
+		"LD_LIBRARY_PATH=$(LIBFABRIC_PREFIX)/lib$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" \
+		python3 hack/smoke-storage.py
+
+unbounded-storage-tarball: unbounded-storage-build ## Package unbounded-storage + libfabric into a release tarball ($(STORAGE_TARBALL))
+	@echo "Assembling $(STORAGE_TARBALL)"
+	@rm -rf $(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)
+	@mkdir -p $(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)/bin $(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)/lib
+	install -m 0755 $(UNBOUNDED_STORAGE_BIN) $(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)/bin/unbounded-storage
+	@libfound=0; \
+	for d in $(LIBFABRIC_PREFIX)/lib $(LIBFABRIC_PREFIX)/lib64; do \
+		if [ -d "$$d" ] && cp -a "$$d"/libfabric.so* $(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)/lib/ 2>/dev/null; then \
+			libfound=1; \
+		fi; \
+	done; \
+	if [ "$$libfound" -ne 1 ]; then \
+		echo "error: no libfabric.so* found under $(LIBFABRIC_PREFIX)" >&2; \
+		exit 1; \
+	fi
+	tar -czf $(STORAGE_TARBALL) -C $(STORAGE_DIST_DIR) $(STORAGE_TARBALL_STEM)
+	cd $(STORAGE_DIST_DIR) && sha256sum $(STORAGE_TARBALL_STEM).tar.gz > $(STORAGE_TARBALL_STEM).tar.gz.sha256
+	@rm -rf $(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)
+	@echo "Wrote $(STORAGE_TARBALL)"
 
 bench: $(LIBFABRIC_STAMP) ## Build the bench tool (excluded from images)
 	$(CARGO_FABRIC_ENV) $(CARGO) build --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --release --locked --bin bench
