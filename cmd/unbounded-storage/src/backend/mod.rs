@@ -9,10 +9,16 @@ mod null;
 mod http;
 
 #[cfg(target_os = "linux")]
+mod limiter;
+
+#[cfg(target_os = "linux")]
 mod origin;
 
 #[cfg(target_os = "linux")]
 mod origin_ring;
+
+#[cfg(target_os = "linux")]
+mod registry;
 
 #[cfg(target_os = "linux")]
 mod s3;
@@ -27,10 +33,16 @@ pub use null::NullBackend;
 pub use http::HttpBackend;
 
 #[cfg(target_os = "linux")]
+pub use limiter::{Acquire, FetchLimiter, FetchPermit};
+
+#[cfg(target_os = "linux")]
 pub use origin::{OriginBackend, OriginStream};
 
 #[cfg(target_os = "linux")]
 pub use origin_ring::{FixedRegion, OriginRing};
+
+#[cfg(target_os = "linux")]
+pub use registry::{BackendRegistry, RegistryFetchStream};
 
 #[cfg(target_os = "linux")]
 pub use s3::S3Backend;

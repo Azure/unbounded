@@ -40,12 +40,32 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config libfabric-dev
+            build-essential pkg-config
 
       - name: Set up Rust toolchain
         run: |
           rustup show active-toolchain || rustup toolchain install stable --profile minimal
           rustup default stable
+
+      # The fabric shim is compiled against the pinned libfabric 2.5.1 built
+      # from source (see the Makefile). Distro `libfabric-dev` predates the
+      # `src_addr` member on `struct fi_cq_err_entry` that the shim references,
+      # so building against it fails to compile.
+      - name: Cache pinned libfabric
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: tmp/libfabric
+          key: libfabric-${{ runner.os }}-${{ hashFiles('Makefile') }}
+
+      - name: Build pinned libfabric
+        run: make libfabric
+
+      - name: Export pinned libfabric to the environment
+        run: |
+          version="$(sed -n 's/^LIBFABRIC_VERSION ?= //p' Makefile | head -n1)"
+          prefix="${PWD}/tmp/libfabric/${version}"
+          echo "LIBFABRIC_PKG_CONFIG_PATH=${prefix}/lib/pkgconfig" >> "${GITHUB_ENV}"
+          echo "LD_LIBRARY_PATH=${prefix}/lib" >> "${GITHUB_ENV}"
 
       - name: Cache cargo registry and target
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
@@ -126,7 +146,7 @@ jobs:
           path: tmp/tla2tools.jar
           # Key derives from the pinned TLA_TOOLS_VERSION / SHA in the
           # top-level Makefile; bump those to invalidate this cache.
-          key: tla2tools-v1.8.0
+          key: tla2tools-v1.8.0-237332bd
 
       - name: Run TLC
         run: make unbounded-storage-model-check

@@ -43,6 +43,7 @@ use crate::ring::{NetHandle, SockAddr};
 use crate::storage::{ObjectMetadata, StripeReq};
 
 use super::Backend;
+use super::limiter::FetchLimiter;
 use super::origin_ring::OriginRing;
 
 /// Origin backend that fetches stripe byte ranges from a plaintext
@@ -61,6 +62,7 @@ pub struct HttpBackend {
     stripe_size: u64,
     page_size: usize,
     backing_base: *mut u8,
+    limiter: FetchLimiter,
 }
 
 // SAFETY: mirrors `crate::memory::Backing`. `HttpBackend` is
@@ -82,6 +84,7 @@ impl HttpBackend {
         stripe_size: u64,
         page_size: usize,
         backing_base: *mut u8,
+        http_concurrency: usize,
     ) -> Self {
         Self {
             ring,
@@ -90,7 +93,14 @@ impl HttpBackend {
             stripe_size,
             page_size,
             backing_base,
+            limiter: FetchLimiter::new(http_concurrency),
         }
+    }
+
+    /// The configured `backend_id` this backend serves, i.e. the
+    /// `OriginRef::backend_id` whose stripes route here.
+    pub fn backend_id(&self) -> &str {
+        &self.backend_id
     }
 
     /// Resolve a `host:port` endpoint to a single IPv4 [`SockAddr`].
@@ -127,16 +137,22 @@ impl HttpBackend {
     }
 }
 
-impl Backend for HttpBackend {
-    type Req = StripeReq;
-    type Stream<'a> = HttpFetchStream<'a>;
-
-    fn bulk_get<'a>(
-        &'a self,
-        req: &'a Self::Req,
+impl HttpBackend {
+    /// Owned-stream variant of [`Backend::bulk_get`].
+    ///
+    /// The returned [`HttpFetchStream`] borrows nothing from `self`: the
+    /// origin address is `Copy`, the path/host are cloned, the
+    /// destination pages are copied into an owned `Vec`, and the ring
+    /// handle is owned. That makes the stream `'static`, which is what
+    /// lets a [`super::registry::BackendRegistry`] hand out streams from
+    /// a backend it only holds behind an `Arc`/`ArcSwap` (the temporary
+    /// `Arc` guard does not have to outlive the stream).
+    pub fn fetch_stream(
+        &self,
+        req: &StripeReq,
         src: BulkRef,
-        dsts: &'a [PageRef],
-    ) -> Self::Stream<'a> {
+        dsts: &[PageRef],
+    ) -> HttpFetchStream<'static> {
         let Some(origin) = req.origin() else {
             return HttpFetchStream::immediate_error("http backend: request missing origin");
         };
@@ -152,7 +168,7 @@ impl Backend for HttpBackend {
             Ok(h) => h,
             Err(e) => return HttpFetchStream::immediate_err(io_to_err(e)),
         };
-        let origin_addr = &self.origin;
+        let origin_addr = self.origin;
         let backing_base = self.backing_base;
         let page_size = self.page_size;
 
@@ -169,6 +185,7 @@ impl Backend for HttpBackend {
                 dsts_owned.clone(),
                 backing_base,
                 page_size,
+                self.limiter.clone(),
             ));
             return HttpFetchStream::pending(fut, dsts_owned);
         }
@@ -186,8 +203,23 @@ impl Backend for HttpBackend {
             dsts_owned.clone(),
             backing_base,
             page_size,
+            self.limiter.clone(),
         ));
         HttpFetchStream::pending(fut, dsts_owned)
+    }
+}
+
+impl Backend for HttpBackend {
+    type Req = StripeReq;
+    type Stream<'a> = HttpFetchStream<'a>;
+
+    fn bulk_get<'a>(
+        &'a self,
+        req: &'a Self::Req,
+        src: BulkRef,
+        dsts: &'a [PageRef],
+    ) -> Self::Stream<'a> {
+        self.fetch_stream(req, src, dsts)
     }
 }
 
@@ -289,7 +321,7 @@ impl PageStream for HttpFetchStream<'_> {
 #[allow(clippy::too_many_arguments)]
 async fn fetch(
     handle: NetHandle,
-    origin: &SockAddr,
+    origin: SockAddr,
     host: String,
     path: String,
     start: u64,
@@ -297,6 +329,7 @@ async fn fetch(
     dsts: Vec<PageRef>,
     backing_base: *mut u8,
     page_size: usize,
+    limiter: FetchLimiter,
 ) -> Result<(), Error> {
     let total: u64 = dsts.iter().map(|p| p.len as u64).sum();
     if total != len {
@@ -311,6 +344,9 @@ async fn fetch(
         return Err(Error::from("http backend: zero-length fetch requested"));
     }
 
+    // Bound concurrent origin dials to `http_concurrency`. The permit is
+    // held for the whole fetch and returned to the pool on drop.
+    let _permit = limiter.acquire().await;
     let conn = TcpConn::open()?;
     // The ring's op futures self-pump (each polls its own ring's
     // `progress()`), so this fetch drives the ring entirely on the
@@ -319,10 +355,7 @@ async fn fetch(
     // never races the shard thread's ring. SAFETY: SockAddr is owned by
     // the backend for the fetch's lifetime; the ring copies it into its
     // own slot.
-    handle
-        .connect(conn.fd, clone_sockaddr(origin))
-        .await
-        .map_err(io_to_err)?;
+    handle.connect(conn.fd, origin).await.map_err(io_to_err)?;
 
     let request = format_get_request(&path, &host, start, start + len - 1)?;
     handle.send(conn.fd, request).await.map_err(io_to_err)?;
@@ -455,20 +488,27 @@ async fn fetch(
 /// destination pages.
 async fn fetch_metadata(
     handle: NetHandle,
-    origin: &SockAddr,
+    origin: SockAddr,
     host: String,
     path: String,
     dsts: Vec<PageRef>,
     backing_base: *mut u8,
     page_size: usize,
+    limiter: FetchLimiter,
 ) -> Result<(), Error> {
+    let capacity: usize = dsts.iter().map(|p| p.len as usize).sum();
+    if capacity < 8 {
+        return Err(Error::from(
+            "http backend: length entry destination smaller than 8 bytes",
+        ));
+    }
+
+    // Bound concurrent origin dials to `http_concurrency` (see `fetch`).
+    let _permit = limiter.acquire().await;
     let conn = TcpConn::open()?;
     // See `fetch` for why driving the ring on the current thread is
     // sound (the op futures self-pump on their own thread's ring).
-    handle
-        .connect(conn.fd, clone_sockaddr(origin))
-        .await
-        .map_err(io_to_err)?;
+    handle.connect(conn.fd, origin).await.map_err(io_to_err)?;
 
     let request = format_head_request(&path, &host)?;
     handle.send(conn.fd, request).await.map_err(io_to_err)?;
@@ -760,36 +800,6 @@ fn format_head_request(path: &str, host: &str) -> Result<Vec<u8>, Error> {
         .body(())
         .map_err(|_| Error::from("http backend: failed to build origin HEAD request"))?;
     Ok(serialize_request(&req))
-}
-
-/// Clone a [`SockAddr`] by round-tripping through its raw bytes, so a
-/// fresh owned copy can be handed to the ring per `connect`.
-fn clone_sockaddr(addr: &SockAddr) -> SockAddr {
-    // Render then rebuild from the IPv4 parts; v1 origins are IPv4.
-    match addr.as_ipv4() {
-        Some((ip, port)) => {
-            let sin = libc::sockaddr_in {
-                sin_family: libc::AF_INET as libc::sa_family_t,
-                sin_port: port.to_be(),
-                sin_addr: libc::in_addr {
-                    s_addr: u32::from(ip).to_be(),
-                },
-                sin_zero: [0; 8],
-            };
-            SockAddr::from_sockaddr_in(sin)
-        }
-        None => {
-            // Non-IPv4 origins are rejected at resolve_origin; fall back
-            // to an all-zero IPv4 address, which connect will reject.
-            let sin = libc::sockaddr_in {
-                sin_family: libc::AF_INET as libc::sa_family_t,
-                sin_port: 0,
-                sin_addr: libc::in_addr { s_addr: 0 },
-                sin_zero: [0; 8],
-            };
-            SockAddr::from_sockaddr_in(sin)
-        }
-    }
 }
 
 fn io_to_err(e: std::io::Error) -> Error {

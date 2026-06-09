@@ -88,7 +88,8 @@ _PAGES = OBJECT_SIZE // _PAGE
 BODY = b"".join(struct.pack("<Q", p) * (_PAGE // 8) for p in range(_PAGES))
 
 STRIPE_SIZE = 4 * 1024 * 1024  # 4 MiB; the 1 GiB object spans 256 stripes
-DISK_SIZE = "2G"  # multiple of the 4096-byte page size; holds all stripes of one node
+# plain bytes; 2 GiB, multiple of the 4096-byte page size; holds all stripes of one node
+DISK_SIZE = 2 * 1024 * 1024 * 1024
 
 DEVNULL = subprocess.DEVNULL
 
@@ -303,55 +304,65 @@ def write_config(
     path: Path,
     *,
     kind: str,
-    fabric_addr: str,
     local_id: int,
     peer_id: int,
     peer_addr: str,
     disk_path: Path,
     origin_addr: str,
     frontend_bind: str,
+    fabric_listen: str,
 ) -> None:
+    # The config schema is proto3-native: enum fields are plain integer
+    # discriminants and byte sizes are plain integer byte counts (see
+    # cmd/unbounded-storage/proto/config.proto). Map the human-friendly
+    # `kind` string to the BackendKind/FrontendKind discriminant.
+    #
+    # Startup-fixed knobs live in the `[startup]` section of the config:
+    # the fabric listen address, heap backing (no_hugepages), and forcing
+    # the libfabric tcp provider (disable_rdma) even on hosts that expose
+    # an unusable RDMA HCA in sysfs. They only take effect at process
+    # start and are intentionally not part of the dynamic reload path.
+    kind_int = {"http": 0, "s3": 1}[kind]
     path.write_text(
         f"""\
-[fabric]
-listen_addr = "{fabric_addr}"
-
-[storage]
-backing_kind = "heap"
-
-[topology]
-# Force the libfabric tcp provider even on hosts that expose an RDMA
-# HCA in sysfs (e.g. cloud VMs with an mlx5 device but no usable verbs
-# provider). This keeps the smoke test on the TCP RPC path.
-disable_rdma = true
-
 [p2p]
 local_node_id = {local_id}
 
 [[peers]]
 id = {peer_id}
-transport = "tcp"
+# transport: 0 = tcp, 1 = rdma.
+transport = 0
 address = "{peer_addr}"
 
 [[disks]]
 path = "{disk_path}"
-kind = "file"
-size = "{DISK_SIZE}"
+# kind: 0 = nvme, 1 = block, 2 = file.
+kind = 2
+size = {DISK_SIZE}
 page_size_bytes = 4096
 bypass_admission = true
 skip_recovery_scan_if_no_meta = true
 
 [[backends]]
 id = "origin"
-kind = "{kind}"
+kind = {kind_int}
 endpoint = "{origin_addr}"
 stripe_size_bytes = {STRIPE_SIZE}
 
 [[frontends]]
 id = "fe"
-kind = "{kind}"
+kind = {kind_int}
 bind = "{frontend_bind}"
 backend = "origin"
+
+[startup.memory]
+no_hugepages = true
+
+[startup.fabric]
+listen_addr = "{fabric_listen}"
+
+[startup.topology]
+disable_rdma = true
 """
     )
 
@@ -474,37 +485,49 @@ def run_scenario(kind: str, origin_addr: str, object_path: str, origin: Any) -> 
     write_config(
         cfg1,
         kind=kind,
-        fabric_addr=f"127.0.0.1:{fab_a}",
         local_id=1,
         peer_id=2,
         peer_addr=f"127.0.0.1:{fab_b}",
         disk_path=TMPDIR / f"{kind}-node1.disk",
         origin_addr=origin_addr,
         frontend_bind=f"127.0.0.1:{fe_a}",
+        fabric_listen=f"127.0.0.1:{fab_a}",
     )
     write_config(
         cfg2,
         kind=kind,
-        fabric_addr=f"127.0.0.1:{fab_b}",
         local_id=2,
         peer_id=1,
         peer_addr=f"127.0.0.1:{fab_a}",
         disk_path=TMPDIR / f"{kind}-node2.disk",
         origin_addr=origin_addr,
         frontend_bind=f"127.0.0.1:{fe_b}",
+        fabric_listen=f"127.0.0.1:{fab_b}",
     )
 
     try:
         log("Spawning two unbounded-storage processes")
+        # Every startup-fixed knob now lives in each node's config file's
+        # `[startup]` section (fabric listen address, heap backing, and
+        # forcing the libfabric tcp provider), so the only CLI argument is
+        # the config path.
         procs.append(
             spawn(
-                [str(BINARY), "--config", str(cfg1), "--no-hugepages"],
+                [
+                    str(BINARY),
+                    "--config",
+                    str(cfg1),
+                ],
                 TMPDIR / f"{kind}-node1.log",
             )
         )
         procs.append(
             spawn(
-                [str(BINARY), "--config", str(cfg2), "--no-hugepages"],
+                [
+                    str(BINARY),
+                    "--config",
+                    str(cfg2),
+                ],
                 TMPDIR / f"{kind}-node2.log",
             )
         )

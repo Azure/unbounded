@@ -669,7 +669,7 @@ mod tests {
     fn peer(id: u64) -> PeerSpec {
         PeerSpec {
             id,
-            transport: PeerTransport::Tcp,
+            transport: PeerTransport::Tcp as i32,
             address: format!("10.0.0.{id}:9000"),
             hca_numa: None,
             labels: Vec::new(),
@@ -679,7 +679,7 @@ mod tests {
     fn peer_addr(id: u64, addr: &str) -> PeerSpec {
         PeerSpec {
             id,
-            transport: PeerTransport::Tcp,
+            transport: PeerTransport::Tcp as i32,
             address: addr.to_string(),
             hca_numa: None,
             labels: Vec::new(),
@@ -689,7 +689,7 @@ mod tests {
     fn peer_labels(id: u64, labels: &[&str]) -> PeerSpec {
         PeerSpec {
             id,
-            transport: PeerTransport::Tcp,
+            transport: PeerTransport::Tcp as i32,
             address: format!("10.0.0.{id}:9000"),
             hca_numa: None,
             labels: labels.iter().map(|s| s.to_string()).collect(),
@@ -997,7 +997,7 @@ mod tests {
     fn backend(id: &str, endpoint: &str) -> BackendSpec {
         BackendSpec {
             id: id.to_string(),
-            kind: BackendKind::Http,
+            kind: BackendKind::Http as i32,
             endpoint: endpoint.to_string(),
             stripe_size_bytes: 4 * 1024 * 1024,
             http_concurrency: 64,
@@ -1008,7 +1008,7 @@ mod tests {
     fn frontend(id: &str, backend_id: &str) -> FrontendSpec {
         FrontendSpec {
             id: id.to_string(),
-            kind: FrontendKind::Http,
+            kind: FrontendKind::Http as i32,
             bind: "0.0.0.0:9000".to_string(),
             backend: backend_id.to_string(),
         }

@@ -1,31 +1,47 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Read and validate the daemon's TOML configuration.
+//! Read and validate the daemon's configuration.
+//!
+//! Two on-disk encodings are supported, selected by the file
+//! extension:
+//!
+//! - `.binpb` is decoded as a raw binary protobuf wire message
+//!   (`prost::Message::decode`), keeping protobuf's forward-compatible
+//!   unknown-field semantics.
+//! - any other extension (notably `.toml`) is parsed as strict TOML,
+//!   where unknown keys are rejected.
+//!
+//! Both paths feed the same [`Config::apply_defaults`] and
+//! [`validate`] finalization, so the encoding only affects how bytes
+//! become a `Config`, not what counts as a valid one.
 
 use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 use std::io;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use super::schema::{Config, DiskKind, PeerTransport};
+use prost::Message;
+
+use super::schema::{BackendKind, Config, DiskKind, FrontendKind, PeerTransport};
 
 #[derive(Debug)]
 pub enum ConfigError {
     Io(io::Error),
     Toml(toml::de::Error),
+    Protobuf(prost::DecodeError),
     DuplicatePeer(u64),
-    DuplicateDiskPath(PathBuf),
-    MissingFileDiskSize(PathBuf),
-    ZeroFileDiskSize(PathBuf),
+    DuplicateDiskPath(String),
+    MissingFileDiskSize(String),
+    ZeroFileDiskSize(String),
     FileDiskSizeNotPageMultiple {
-        path: PathBuf,
-        size: usize,
-        page_size: usize,
+        path: String,
+        size: u64,
+        page_size: u64,
     },
-    SizeOnlyForFileDisk(PathBuf),
+    SizeOnlyForFileDisk(String),
     InvalidTcpAddr {
         peer_id: u64,
         addr: String,
@@ -36,19 +52,25 @@ pub enum ConfigError {
     EmptyDiskPath,
     MissingLocalNodeId,
     LocalNodeIdCollidesWithPeer(u64),
-    ZeroFingersPerNode,
+    RoutingPlanUnknownPeer {
+        id: u64,
+        role: &'static str,
+    },
+    RoutingPlanSelfReference {
+        id: u64,
+        role: &'static str,
+    },
+    RoutingPlanDuplicateFinger(u64),
     DuplicateBackendId(String),
     DuplicateFrontendId(String),
     EmptyBackendId,
     EmptyFrontendId,
     EmptyBackendEndpoint(String),
     EmptyFrontendBind(String),
-    ZeroStripeSize(String),
     StripeSizeNotPowerOfTwo {
         backend_id: String,
         stripe_size_bytes: u64,
     },
-    ZeroHttpConcurrency(String),
     InvalidFrontendBind {
         frontend_id: String,
         bind: String,
@@ -61,6 +83,22 @@ pub enum ConfigError {
         frontend_id: String,
         backend_id: String,
     },
+    InvalidPeerTransport {
+        peer_id: u64,
+        value: i32,
+    },
+    InvalidDiskKind {
+        path: String,
+        value: i32,
+    },
+    InvalidBackendKind {
+        backend_id: String,
+        value: i32,
+    },
+    InvalidFrontendKind {
+        frontend_id: String,
+        value: i32,
+    },
 }
 
 impl fmt::Display for ConfigError {
@@ -68,19 +106,16 @@ impl fmt::Display for ConfigError {
         match self {
             ConfigError::Io(e) => write!(f, "io error reading config: {e}"),
             ConfigError::Toml(e) => write!(f, "toml parse error: {e}"),
+            ConfigError::Protobuf(e) => write!(f, "protobuf decode error: {e}"),
             ConfigError::DuplicatePeer(id) => write!(f, "duplicate peer id: {id}"),
             ConfigError::DuplicateDiskPath(p) => {
-                write!(f, "duplicate disk path: {}", p.display())
+                write!(f, "duplicate disk path: {p}")
             }
             ConfigError::MissingFileDiskSize(p) => {
-                write!(f, "disk {}: kind = \"file\" requires a `size`", p.display())
+                write!(f, "disk {p}: kind = \"file\" requires a `size`")
             }
             ConfigError::ZeroFileDiskSize(p) => {
-                write!(
-                    f,
-                    "disk {}: file size must be greater than zero",
-                    p.display()
-                )
+                write!(f, "disk {p}: file size must be greater than zero")
             }
             ConfigError::FileDiskSizeNotPageMultiple {
                 path,
@@ -88,14 +123,11 @@ impl fmt::Display for ConfigError {
                 page_size,
             } => write!(
                 f,
-                "disk {}: file size {size} must be a positive multiple of the page size {page_size}",
-                path.display()
+                "disk {path}: file size {size} must be a positive multiple of the page size {page_size}"
             ),
-            ConfigError::SizeOnlyForFileDisk(p) => write!(
-                f,
-                "disk {}: `size` is only valid for kind = \"file\"",
-                p.display()
-            ),
+            ConfigError::SizeOnlyForFileDisk(p) => {
+                write!(f, "disk {p}: `size` is only valid for kind = \"file\"")
+            }
             ConfigError::InvalidTcpAddr { peer_id, addr } => {
                 write!(f, "peer {peer_id}: invalid tcp socket address {addr:?}")
             }
@@ -113,10 +145,19 @@ impl fmt::Display for ConfigError {
                 "p2p.local_node_id {id} collides with a peer id: the local node and a peer \
                  cannot share a node id, or the p2p finger table will silently drop that peer"
             ),
-            ConfigError::ZeroFingersPerNode => write!(
+            ConfigError::RoutingPlanUnknownPeer { id, role } => write!(
                 f,
-                "p2p.fingers_per_node must be greater than zero: the p2p subsystem needs at \
-                 least one finger per node"
+                "p2p.routing_plan {role} {id} does not reference any [[peers]] id: every \
+                 routing-plan neighbor must have a matching peer so a fabric connection exists"
+            ),
+            ConfigError::RoutingPlanSelfReference { id, role } => write!(
+                f,
+                "p2p.routing_plan {role} {id} equals p2p.local_node_id: a node cannot list \
+                 itself as a routing neighbor"
+            ),
+            ConfigError::RoutingPlanDuplicateFinger(id) => write!(
+                f,
+                "p2p.routing_plan.fingers contains duplicate id {id}"
             ),
             ConfigError::DuplicateBackendId(id) => write!(f, "duplicate backend id: {id:?}"),
             ConfigError::DuplicateFrontendId(id) => write!(f, "duplicate frontend id: {id:?}"),
@@ -128,11 +169,6 @@ impl fmt::Display for ConfigError {
             ConfigError::EmptyFrontendBind(id) => {
                 write!(f, "frontend {id:?}: bind must not be empty")
             }
-            ConfigError::ZeroStripeSize(id) => write!(
-                f,
-                "backend {id:?}: stripe_size_bytes must be greater than zero: a zero stripe size \
-                 is a divide-by-zero in StripeKey derivation"
-            ),
             ConfigError::StripeSizeNotPowerOfTwo {
                 backend_id,
                 stripe_size_bytes,
@@ -140,11 +176,6 @@ impl fmt::Display for ConfigError {
                 f,
                 "backend {backend_id:?}: stripe_size_bytes {stripe_size_bytes} must be a power of \
                  two for deterministic StripeKey derivation"
-            ),
-            ConfigError::ZeroHttpConcurrency(id) => write!(
-                f,
-                "backend {id:?}: http_concurrency must be greater than zero: a zero limit would \
-                 stall all origin fetches"
             ),
             ConfigError::InvalidFrontendBind { frontend_id, bind } => {
                 write!(
@@ -165,6 +196,22 @@ impl fmt::Display for ConfigError {
                 f,
                 "frontend {frontend_id:?} references backend {backend_id:?} which is not defined \
                  in any [[backends]] entry"
+            ),
+            ConfigError::InvalidPeerTransport { peer_id, value } => write!(
+                f,
+                "peer {peer_id}: transport {value} is not a valid value (0 = tcp, 1 = rdma)"
+            ),
+            ConfigError::InvalidDiskKind { path, value } => write!(
+                f,
+                "disk {path}: kind {value} is not a valid value (0 = nvme, 1 = block, 2 = file)"
+            ),
+            ConfigError::InvalidBackendKind { backend_id, value } => write!(
+                f,
+                "backend {backend_id:?}: kind {value} is not a valid value (0 = http, 1 = s3)"
+            ),
+            ConfigError::InvalidFrontendKind { frontend_id, value } => write!(
+                f,
+                "frontend {frontend_id:?}: kind {value} is not a valid value (0 = http, 1 = s3)"
             ),
         }
     }
@@ -192,24 +239,39 @@ impl From<toml::de::Error> for ConfigError {
     }
 }
 
+impl From<prost::DecodeError> for ConfigError {
+    fn from(e: prost::DecodeError) -> Self {
+        ConfigError::Protobuf(e)
+    }
+}
+
 impl Config {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         load(path.as_ref())
     }
 }
 
+/// Loads a config from `path`, decoding raw binary protobuf for a
+/// `.binpb` extension and strict TOML for anything else. Both encodings
+/// share the same defaulting and validation finalization.
 pub fn load(path: &Path) -> Result<Config, ConfigError> {
-    let raw = fs::read_to_string(path)?;
-    let cfg: Config = toml::from_str(&raw)?;
+    let mut cfg = if has_binpb_extension(path) {
+        Config::decode(fs::read(path)?.as_slice())?
+    } else {
+        toml::from_str(&fs::read_to_string(path)?)?
+    };
+    cfg.apply_defaults();
     validate(&cfg)?;
     Ok(cfg)
 }
 
+fn has_binpb_extension(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()) == Some("binpb")
+}
+
 fn validate(cfg: &Config) -> Result<(), ConfigError> {
-    if cfg.p2p.fingers_per_node == 0 {
-        return Err(ConfigError::ZeroFingersPerNode);
-    }
-    if !cfg.peers.is_empty() && cfg.p2p.local_node_id.is_none() {
+    let p2p = cfg.p2p();
+    if !cfg.peers.is_empty() && p2p.local_node_id.is_none() {
         return Err(ConfigError::MissingLocalNodeId);
     }
 
@@ -218,10 +280,16 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
         if !seen_peers.insert(p.id) {
             return Err(ConfigError::DuplicatePeer(p.id));
         }
-        if cfg.p2p.local_node_id == Some(p.id) {
+        if p2p.local_node_id == Some(p.id) {
             return Err(ConfigError::LocalNodeIdCollidesWithPeer(p.id));
         }
-        match p.transport {
+        if PeerTransport::try_from(p.transport).is_err() {
+            return Err(ConfigError::InvalidPeerTransport {
+                peer_id: p.id,
+                value: p.transport,
+            });
+        }
+        match p.transport() {
             PeerTransport::Tcp => {
                 if p.address.parse::<SocketAddr>().is_err() {
                     return Err(ConfigError::InvalidTcpAddr {
@@ -238,19 +306,52 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
         }
     }
 
-    let mut seen_paths: HashSet<&PathBuf> = HashSet::new();
+    // Disjoint-discovery routing plan: every referenced id must name a
+    // configured peer (so a fabric connection exists), must not be the
+    // local node, and fingers must be free of duplicates. `seen_peers`
+    // now holds every peer id.
+    if let Some(plan) = &p2p.routing_plan {
+        let mut seen_fingers: HashSet<u64> = HashSet::new();
+        for &id in &plan.fingers {
+            if !seen_fingers.insert(id) {
+                return Err(ConfigError::RoutingPlanDuplicateFinger(id));
+            }
+        }
+        for (id, role) in plan
+            .fingers
+            .iter()
+            .map(|id| (*id, "finger"))
+            .chain(plan.successor.map(|id| (id, "successor")))
+            .chain(plan.predecessor.map(|id| (id, "predecessor")))
+        {
+            if p2p.local_node_id == Some(id) {
+                return Err(ConfigError::RoutingPlanSelfReference { id, role });
+            }
+            if !seen_peers.contains(&id) {
+                return Err(ConfigError::RoutingPlanUnknownPeer { id, role });
+            }
+        }
+    }
+
+    let mut seen_paths: HashSet<&str> = HashSet::new();
     for d in &cfg.disks {
-        if d.path.as_os_str().is_empty() {
+        if d.path.is_empty() {
             return Err(ConfigError::EmptyDiskPath);
         }
-        if !seen_paths.insert(&d.path) {
+        if !seen_paths.insert(d.path.as_str()) {
             return Err(ConfigError::DuplicateDiskPath(d.path.clone()));
         }
-        match d.kind {
+        if DiskKind::try_from(d.kind).is_err() {
+            return Err(ConfigError::InvalidDiskKind {
+                path: d.path.clone(),
+                value: d.kind,
+            });
+        }
+        match d.kind() {
             DiskKind::File => {
                 let page_size = d.page_size_bytes.unwrap_or(4096);
                 let size = match d.size {
-                    Some(s) => s.bytes(),
+                    Some(s) => s,
                     None => return Err(ConfigError::MissingFileDiskSize(d.path.clone())),
                 };
                 if size == 0 {
@@ -280,20 +381,20 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
         if !seen_backends.insert(b.id.as_str()) {
             return Err(ConfigError::DuplicateBackendId(b.id.clone()));
         }
+        if BackendKind::try_from(b.kind).is_err() {
+            return Err(ConfigError::InvalidBackendKind {
+                backend_id: b.id.clone(),
+                value: b.kind,
+            });
+        }
         if b.endpoint.is_empty() {
             return Err(ConfigError::EmptyBackendEndpoint(b.id.clone()));
-        }
-        if b.stripe_size_bytes == 0 {
-            return Err(ConfigError::ZeroStripeSize(b.id.clone()));
         }
         if !b.stripe_size_bytes.is_power_of_two() {
             return Err(ConfigError::StripeSizeNotPowerOfTwo {
                 backend_id: b.id.clone(),
                 stripe_size_bytes: b.stripe_size_bytes,
             });
-        }
-        if b.http_concurrency == 0 {
-            return Err(ConfigError::ZeroHttpConcurrency(b.id.clone()));
         }
     }
 
@@ -305,6 +406,12 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
         }
         if !seen_frontends.insert(fr.id.as_str()) {
             return Err(ConfigError::DuplicateFrontendId(fr.id.clone()));
+        }
+        if FrontendKind::try_from(fr.kind).is_err() {
+            return Err(ConfigError::InvalidFrontendKind {
+                frontend_id: fr.id.clone(),
+                value: fr.kind,
+            });
         }
         if fr.bind.is_empty() {
             return Err(ConfigError::EmptyFrontendBind(fr.id.clone()));
@@ -359,30 +466,23 @@ mod tests {
     #[test]
     fn loads_full_happy_path() {
         let s = r#"
-[fabric]
-listen_addr = "0.0.0.0:1234"
-
-[storage]
-bytes_per_shard = "64M"
-backing_kind = "heap"
-
 [p2p]
 local_node_id = 99
 
 [[peers]]
 id = 1
-transport = "tcp"
+transport = 0
 address = "10.0.0.1:9000"
 
 [[peers]]
 id = 2
-transport = "rdma"
+transport = 1
 address = "deadbeef"
 hca_numa = 0
 
 [[disks]]
 path = "/dev/nvme0n1"
-kind = "nvme"
+kind = 0
 numa = 0
 
 [[disks]]
@@ -392,7 +492,7 @@ path = "/dev/nvme1n1"
         let cfg = load(f.path()).unwrap();
         assert_eq!(cfg.peers.len(), 2);
         assert_eq!(cfg.disks.len(), 2);
-        assert_eq!(cfg.storage.bytes_per_shard.bytes(), 64 * 1024 * 1024);
+        assert_eq!(cfg.p2p().local_node_id, Some(99));
     }
 
     #[test]
@@ -403,12 +503,12 @@ local_node_id = 99
 
 [[peers]]
 id = 1
-transport = "tcp"
+transport = 0
 address = "10.0.0.1:9000"
 
 [[peers]]
 id = 1
-transport = "tcp"
+transport = 0
 address = "10.0.0.2:9000"
 "#;
         let f = write_cfg(s);
@@ -442,7 +542,7 @@ local_node_id = 1
 
 [[peers]]
 id = 7
-transport = "tcp"
+transport = 0
 address = "not-an-addr"
 "#;
         let f = write_cfg(s);
@@ -460,7 +560,7 @@ local_node_id = 1
 
 [[peers]]
 id = 8
-transport = "tcp"
+transport = 0
 address = "example.com:9000"
 "#;
         let f = write_cfg(s);
@@ -480,7 +580,7 @@ local_node_id = 1
 
 [[peers]]
 id = 3
-transport = "rdma"
+transport = 1
 address = "{bad}"
 "#
             );
@@ -510,14 +610,14 @@ path = ""
         let s = r#"
 [[disks]]
 path = "/tmp/unbounded-file-disk"
-kind = "file"
-size = "16M"
+kind = 2
+size = 16777216
 "#;
         let f = write_cfg(s);
         let cfg = load(f.path()).expect("load should succeed");
-        assert_eq!(cfg.disks[0].kind, DiskKind::File);
+        assert_eq!(cfg.disks[0].kind(), DiskKind::File);
         assert!(cfg.disks[0].size.is_some());
-        assert_eq!(cfg.disks[0].size.unwrap().bytes(), 16 * 1024 * 1024);
+        assert_eq!(cfg.disks[0].size.unwrap(), 16 * 1024 * 1024);
     }
 
     #[test]
@@ -525,7 +625,7 @@ size = "16M"
         let s = r#"
 [[disks]]
 path = "/tmp/unbounded-file-disk"
-kind = "file"
+kind = 2
 "#;
         let f = write_cfg(s);
         assert!(matches!(
@@ -539,7 +639,7 @@ kind = "file"
         let s = r#"
 [[disks]]
 path = "/tmp/unbounded-file-disk"
-kind = "file"
+kind = 2
 size = 0
 "#;
         let f = write_cfg(s);
@@ -554,7 +654,7 @@ size = 0
         let s = r#"
 [[disks]]
 path = "/tmp/unbounded-file-disk"
-kind = "file"
+kind = 2
 size = 5000
 "#;
         let f = write_cfg(s);
@@ -569,8 +669,8 @@ size = 5000
         let s = r#"
 [[disks]]
 path = "/dev/nvme0n1"
-kind = "nvme"
-size = "16M"
+kind = 0
+size = 16777216
 "#;
         let f = write_cfg(s);
         assert!(matches!(
@@ -599,7 +699,7 @@ size = "16M"
         let s = r#"
 [[peers]]
 id = 1
-transport = "tcp"
+transport = 0
 address = "10.0.0.1:9000"
 "#;
         let f = write_cfg(s);
@@ -617,12 +717,12 @@ local_node_id = 7
 
 [[peers]]
 id = 1
-transport = "tcp"
+transport = 0
 address = "10.0.0.1:9000"
 "#;
         let f = write_cfg(s);
         let cfg = load(f.path()).expect("load should succeed");
-        assert_eq!(cfg.p2p.local_node_id, Some(7));
+        assert_eq!(cfg.p2p().local_node_id, Some(7));
         assert_eq!(cfg.peers.len(), 1);
     }
 
@@ -634,7 +734,7 @@ local_node_id = 1
 
 [[peers]]
 id = 1
-transport = "tcp"
+transport = 0
 address = "10.0.0.1:9000"
 "#;
         let f = write_cfg(s);
@@ -645,51 +745,16 @@ address = "10.0.0.1:9000"
     }
 
     #[test]
-    fn accepts_local_node_id_distinct_from_peers() {
-        let s = r#"
-[p2p]
-local_node_id = 99
-
-[[peers]]
-id = 1
-transport = "tcp"
-address = "10.0.0.1:9000"
-
-[[peers]]
-id = 2
-transport = "tcp"
-address = "10.0.0.2:9000"
-"#;
-        let f = write_cfg(s);
-        let cfg = load(f.path()).expect("load should succeed");
-        assert_eq!(cfg.p2p.local_node_id, Some(99));
-        assert_eq!(cfg.peers.len(), 2);
-    }
-
-    #[test]
-    fn rejects_zero_fingers_per_node() {
-        let s = r#"
-[p2p]
-fingers_per_node = 0
-"#;
-        let f = write_cfg(s);
-        match load(f.path()) {
-            Err(ConfigError::ZeroFingersPerNode) => {}
-            other => panic!("expected ZeroFingersPerNode, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn loads_backends_and_frontends_happy_path() {
         let s = r#"
 [[backends]]
 id = "primary-http"
-kind = "http"
+kind = 0
 endpoint = "https://origin.example.com"
 
 [[frontends]]
 id = "workload-http"
-kind = "http"
+kind = 0
 bind = "0.0.0.0:9000"
 backend = "primary-http"
 "#;
@@ -704,12 +769,12 @@ backend = "primary-http"
         let s = r#"
 [[backends]]
 id = "dup"
-kind = "http"
+kind = 0
 endpoint = "https://e"
 
 [[backends]]
 id = "dup"
-kind = "http"
+kind = 0
 endpoint = "https://e2"
 "#;
         let f = write_cfg(s);
@@ -724,18 +789,18 @@ endpoint = "https://e2"
         let s = r#"
 [[backends]]
 id = "b"
-kind = "http"
+kind = 0
 endpoint = "https://e"
 
 [[frontends]]
 id = "dup"
-kind = "http"
+kind = 0
 bind = "0.0.0.0:9000"
 backend = "b"
 
 [[frontends]]
 id = "dup"
-kind = "http"
+kind = 0
 bind = "0.0.0.0:9001"
 backend = "b"
 "#;
@@ -751,12 +816,12 @@ backend = "b"
         let s = r#"
 [[backends]]
 id = "real"
-kind = "http"
+kind = 0
 endpoint = "https://e"
 
 [[frontends]]
 id = "f"
-kind = "http"
+kind = 0
 bind = "0.0.0.0:9000"
 backend = "ghost"
 "#;
@@ -775,7 +840,7 @@ backend = "ghost"
         let no_endpoint = r#"
 [[backends]]
 id = "b"
-kind = "http"
+kind = 0
 endpoint = ""
 "#;
         let f = write_cfg(no_endpoint);
@@ -786,27 +851,11 @@ endpoint = ""
     }
 
     #[test]
-    fn rejects_zero_stripe_size() {
-        let s = r#"
-[[backends]]
-id = "b"
-kind = "http"
-endpoint = "https://e"
-stripe_size_bytes = 0
-"#;
-        let f = write_cfg(s);
-        match load(f.path()) {
-            Err(ConfigError::ZeroStripeSize(id)) if id == "b" => {}
-            other => panic!("expected ZeroStripeSize(b), got {other:?}"),
-        }
-    }
-
-    #[test]
     fn rejects_non_power_of_two_stripe_size() {
         let s = r#"
 [[backends]]
 id = "b"
-kind = "http"
+kind = 0
 endpoint = "https://e"
 stripe_size_bytes = 3000000
 "#;
@@ -822,7 +871,7 @@ stripe_size_bytes = 3000000
         let s = r#"
 [[backends]]
 id = "b"
-kind = "http"
+kind = 0
 endpoint = "https://e"
 stripe_size_bytes = 8388608
 "#;
@@ -832,32 +881,16 @@ stripe_size_bytes = 8388608
     }
 
     #[test]
-    fn rejects_zero_http_concurrency() {
-        let s = r#"
-[[backends]]
-id = "b"
-kind = "http"
-endpoint = "https://e"
-http_concurrency = 0
-"#;
-        let f = write_cfg(s);
-        match load(f.path()) {
-            Err(ConfigError::ZeroHttpConcurrency(id)) if id == "b" => {}
-            other => panic!("expected ZeroHttpConcurrency(b), got {other:?}"),
-        }
-    }
-
-    #[test]
     fn rejects_invalid_frontend_bind() {
         let s = r#"
 [[backends]]
 id = "b"
-kind = "http"
+kind = 0
 endpoint = "https://e"
 
 [[frontends]]
 id = "f"
-kind = "http"
+kind = 0
 bind = "not-an-addr"
 backend = "b"
 "#;
@@ -873,12 +906,12 @@ backend = "b"
         let s = r#"
 [[backends]]
 id = "b"
-kind = "http"
+kind = 0
 endpoint = "https://e"
 
 [[frontends]]
 id = "f"
-kind = "http"
+kind = 0
 bind = "example.com:9000"
 backend = "b"
 "#;
@@ -894,18 +927,18 @@ backend = "b"
         let s = r#"
 [[backends]]
 id = "b"
-kind = "http"
+kind = 0
 endpoint = "https://e"
 
 [[frontends]]
 id = "f1"
-kind = "http"
+kind = 0
 bind = "0.0.0.0:9000"
 backend = "b"
 
 [[frontends]]
 id = "f2"
-kind = "http"
+kind = 0
 bind = "0.0.0.0:9000"
 backend = "b"
 "#;
@@ -922,12 +955,244 @@ backend = "b"
         let s = r#"
 [[backends]]
 id = "s3"
-kind = "s3"
+kind = 1
 endpoint = "s3.example.com:443"
 "#;
         let f = write_cfg(s);
         let cfg = load(f.path()).expect("load should succeed");
-        assert_eq!(cfg.backends[0].kind, BackendKind::S3);
+        assert_eq!(cfg.backends[0].kind(), BackendKind::S3);
         assert!(cfg.backends[0].bucket.is_none());
+    }
+
+    #[test]
+    fn rejects_unknown_key() {
+        // A typo in a key now fails loudly at parse time instead of being
+        // silently dropped (deny_unknown_fields on the TOML path).
+        let s = r#"
+[p2p]
+fingers_per_nod = 128
+"#;
+        let f = write_cfg(s);
+        assert!(matches!(load(f.path()), Err(ConfigError::Toml(_))));
+    }
+
+    #[test]
+    fn rejects_out_of_range_peer_transport() {
+        let s = r#"
+[p2p]
+local_node_id = 99
+
+[[peers]]
+id = 1
+transport = 5
+address = "10.0.0.1:9000"
+"#;
+        let f = write_cfg(s);
+        match load(f.path()) {
+            Err(ConfigError::InvalidPeerTransport {
+                peer_id: 1,
+                value: 5,
+            }) => {}
+            other => panic!("expected InvalidPeerTransport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_out_of_range_disk_kind() {
+        let s = r#"
+[[disks]]
+path = "/dev/nvme0n1"
+kind = 3
+"#;
+        let f = write_cfg(s);
+        match load(f.path()) {
+            Err(ConfigError::InvalidDiskKind { path, value: 3 }) if path == "/dev/nvme0n1" => {}
+            other => panic!("expected InvalidDiskKind, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_out_of_range_backend_kind() {
+        let s = r#"
+[[backends]]
+id = "b"
+kind = 2
+endpoint = "https://e"
+"#;
+        let f = write_cfg(s);
+        match load(f.path()) {
+            Err(ConfigError::InvalidBackendKind {
+                backend_id,
+                value: 2,
+            }) if backend_id == "b" => {}
+            other => panic!("expected InvalidBackendKind, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_out_of_range_frontend_kind() {
+        let s = r#"
+[[backends]]
+id = "b"
+kind = 0
+endpoint = "https://e"
+
+[[frontends]]
+id = "f"
+kind = 2
+bind = "0.0.0.0:9000"
+backend = "b"
+"#;
+        let f = write_cfg(s);
+        match load(f.path()) {
+            Err(ConfigError::InvalidFrontendKind {
+                frontend_id,
+                value: 2,
+            }) if frontend_id == "f" => {}
+            other => panic!("expected InvalidFrontendKind, got {other:?}"),
+        }
+    }
+
+    fn write_binpb(bytes: &[u8]) -> NamedTempFile {
+        let mut f = tempfile::Builder::new()
+            .suffix(".binpb")
+            .tempfile()
+            .unwrap();
+        f.write_all(bytes).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    fn encode_config(cfg: &Config) -> Vec<u8> {
+        cfg.encode_to_vec()
+    }
+
+    #[test]
+    fn loads_binpb_config() {
+        // A `.binpb` file is decoded from the protobuf wire format that
+        // the TOML loader's `Config` round-trips to.
+        let toml = r#"
+[p2p]
+local_node_id = 99
+
+[[peers]]
+id = 1
+transport = 0
+address = "10.0.0.1:9000"
+
+[[disks]]
+path = "/dev/nvme0n1"
+kind = 0
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let f = write_binpb(&encode_config(&cfg));
+        let loaded = load(f.path()).unwrap();
+        assert_eq!(loaded.peers.len(), 1);
+        assert_eq!(loaded.peers[0].id, 1);
+        assert_eq!(loaded.disks.len(), 1);
+        assert_eq!(loaded.p2p().local_node_id, Some(99));
+    }
+
+    #[test]
+    fn binpb_applies_defaults() {
+        // The binpb path shares the TOML path's defaulting finalization.
+        let f = write_binpb(&encode_config(&Config::default()));
+        let loaded = load(f.path()).unwrap();
+        assert_eq!(loaded.p2p().fingers_per_node, 100);
+    }
+
+    #[test]
+    fn binpb_runs_validation() {
+        // Validation runs regardless of encoding: a duplicate peer id is
+        // rejected even when it arrives over the protobuf wire path.
+        let toml = r#"
+[p2p]
+local_node_id = 99
+
+[[peers]]
+id = 1
+transport = 0
+address = "10.0.0.1:9000"
+
+[[peers]]
+id = 2
+transport = 0
+address = "10.0.0.2:9000"
+"#;
+        let mut cfg: Config = toml::from_str(toml).unwrap();
+        cfg.peers[1].id = 1;
+        let f = write_binpb(&encode_config(&cfg));
+        match load(f.path()) {
+            Err(ConfigError::DuplicatePeer(1)) => {}
+            other => panic!("expected DuplicatePeer(1), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_binpb_bytes() {
+        // A field tag with a truncated varint payload is not a valid
+        // protobuf message and surfaces as a decode error.
+        let f = write_binpb(&[0x08]);
+        match load(f.path()) {
+            Err(ConfigError::Protobuf(_)) => {}
+            other => panic!("expected Protobuf decode error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn loads_startup_defaults_via_toml() {
+        // An omitted [startup] section is populated entirely from the
+        // documented defaults during load.
+        let f = write_cfg("");
+        let cfg = load(f.path()).unwrap();
+        let s = cfg.startup();
+        assert_eq!(s.memory().bytes_per_shard, 128 * 1024 * 1024);
+        assert_eq!(s.fabric().listen_addr, "0.0.0.0:0");
+        assert_eq!(s.fabric().max_inflight, 1024);
+        assert_eq!(s.topology().rdma_handlers_per_hca, 4);
+    }
+
+    #[test]
+    fn loads_startup_section_via_toml() {
+        let s = r#"
+[startup.memory]
+no_hugepages = true
+bytes_per_shard = 67108864
+
+[startup.fabric]
+listen_addr = "10.0.0.1:7000"
+
+[startup.topology]
+disable_rdma = true
+"#;
+        let f = write_cfg(s);
+        let cfg = load(f.path()).unwrap();
+        assert!(cfg.startup().memory().no_hugepages);
+        assert_eq!(cfg.startup().memory().bytes_per_shard, 64 * 1024 * 1024);
+        assert_eq!(cfg.startup().fabric().listen_addr, "10.0.0.1:7000");
+        assert!(cfg.startup().topology().disable_rdma);
+        // Unset siblings still default.
+        assert_eq!(cfg.startup().fabric().progress_threads, 2);
+    }
+
+    #[test]
+    fn startup_round_trips_through_binpb() {
+        // The startup section survives the protobuf wire encoding and is
+        // re-defaulted on decode, identically to the TOML path.
+        let toml = r#"
+[startup.fabric]
+listen_addr = "10.0.0.2:8000"
+max_inflight = 4096
+
+[startup.topology]
+disable_rdma = true
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let f = write_binpb(&encode_config(&cfg));
+        let loaded = load(f.path()).unwrap();
+        assert_eq!(loaded.startup().fabric().listen_addr, "10.0.0.2:8000");
+        assert_eq!(loaded.startup().fabric().max_inflight, 4096);
+        assert!(loaded.startup().topology().disable_rdma);
+        assert_eq!(loaded.startup().memory().bytes_per_shard, 128 * 1024 * 1024);
     }
 }
