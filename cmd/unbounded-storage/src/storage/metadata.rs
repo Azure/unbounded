@@ -65,11 +65,7 @@ impl ObjectMetadata {
 
     /// Insert a key/value pair, returning the previous value for the
     /// key if one was present.
-    pub fn insert(
-        &mut self,
-        key: impl Into<String>,
-        value: impl Into<String>,
-    ) -> Option<String> {
+    pub fn insert(&mut self, key: impl Into<String>, value: impl Into<String>) -> Option<String> {
         self.entries.insert(key.into(), value.into())
     }
 
@@ -111,15 +107,12 @@ impl ObjectMetadata {
                 "storage metadata: page smaller than length prefix",
             ));
         }
-        let blob_len =
-            u64::from_le_bytes(page[..BLOB_LEN_PREFIX].try_into().unwrap()) as usize;
+        let blob_len = u64::from_le_bytes(page[..BLOB_LEN_PREFIX].try_into().unwrap()) as usize;
         let end = BLOB_LEN_PREFIX
             .checked_add(blob_len)
             .ok_or_else(|| Error::from("storage metadata: blob length overflow"))?;
         if end > page.len() {
-            return Err(Error::from(
-                "storage metadata: blob length exceeds page",
-            ));
+            return Err(Error::from("storage metadata: blob length exceeds page"));
         }
         bincode::deserialize(&page[BLOB_LEN_PREFIX..end])
             .map_err(|_| Error::from("storage metadata: malformed bincode payload"))
@@ -152,7 +145,10 @@ mod tests {
         let decoded = ObjectMetadata::decode(&m.encode().unwrap()).unwrap();
         assert_eq!(decoded, m);
         assert_eq!(decoded.length, 4096);
-        assert_eq!(decoded.get("content-type"), Some("application/octet-stream"));
+        assert_eq!(
+            decoded.get("content-type"),
+            Some("application/octet-stream")
+        );
         assert_eq!(decoded.get("etag"), Some("\"abc123\""));
         assert_eq!(decoded.get("missing"), None);
     }

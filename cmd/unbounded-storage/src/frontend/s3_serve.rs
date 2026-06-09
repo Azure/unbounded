@@ -260,7 +260,21 @@ async fn serve_connection_s3<P: BufferPool<Req = StripeReq>>(
     page_size: usize,
 ) {
     let _fd = FdGuard(conn_fd);
-    let _ = serve_request_s3(&pool, &handle, conn_fd, &backend_id, stripe_size, page_size).await;
+    let mut log = crate::obs::ReqLog::new("frontend.s3");
+    match serve_request_s3(
+        &pool,
+        &handle,
+        conn_fd,
+        &backend_id,
+        stripe_size,
+        page_size,
+        &mut log,
+    )
+    .await
+    {
+        Ok(()) => log.finish_ok(),
+        Err(()) => log.finish_err("connection error"),
+    }
 }
 
 /// The fallible S3 serve body. Returns `Err(())` on any I/O or pool
@@ -274,8 +288,10 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
     backend_id: &str,
     stripe_size: u64,
     page_size: usize,
+    log: &mut crate::obs::ReqLog,
 ) -> Result<(), ()> {
     let request_id = next_request_id();
+    log.str_field("req_id", &request_id);
 
     // 1. Read until the request head is complete (or the cap is hit).
     let mut buf: Vec<u8> = Vec::new();
@@ -297,6 +313,7 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
                 // answer with a GET-style XML 400 against the root.
                 let bytes = error_bytes(S3ErrorCode::InvalidRequest, "/", &request_id, false, None);
                 let _ = send_all(handle, conn_fd, bytes).await;
+                log.field("status", 400);
                 return Ok(());
             }
         }
@@ -306,6 +323,7 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
     // 2. Path is the request target with any query stripped; it is the
     // origin object id and the XML `<Resource>`.
     let path = split_query(req.target).0.to_string();
+    log.str_field("path", &path);
 
     // 3. Only GET and HEAD are served; anything else is 405. The method
     // here is neither GET nor HEAD on the error arm, so the body is
@@ -322,9 +340,11 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
                 None,
             );
             let _ = send_all(handle, conn_fd, bytes).await;
+            log.field("status", 405);
             return Ok(());
         }
     };
+    log.str_field("method", if is_head { "HEAD" } else { "GET" });
 
     // 4. Optional Range header. A malformed Range is a 400; an
     // unsatisfiable one is handled at resolve time as a 416.
@@ -340,6 +360,7 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
                     None,
                 );
                 let _ = send_all(handle, conn_fd, bytes).await;
+                log.field("status", 400);
                 return Ok(());
             }
         },
@@ -355,6 +376,7 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
         LenResult::NotFound => {
             let bytes = error_bytes(S3ErrorCode::NoSuchKey, &path, &request_id, is_head, None);
             let _ = send_all(handle, conn_fd, bytes).await;
+            log.field("status", 404);
             return Ok(());
         }
         LenResult::Other => {
@@ -366,6 +388,7 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
                 None,
             );
             let _ = send_all(handle, conn_fd, bytes).await;
+            log.field("status", 500);
             return Ok(());
         }
     };
@@ -387,6 +410,7 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
                     Some(object_len),
                 );
                 let _ = send_all(handle, conn_fd, bytes).await;
+                log.field("status", 416);
                 return Ok(());
             }
             Err(_) => {
@@ -398,6 +422,7 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
                     None,
                 );
                 let _ = send_all(handle, conn_fd, bytes).await;
+                log.field("status", 400);
                 return Ok(());
             }
         },
@@ -409,6 +434,8 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
     } else {
         full_head(len, &request_id)
     };
+    log.field("status", if range.is_some() { 206 } else { 200 })
+        .field("bytes", resolved.len());
     send_all(handle, conn_fd, head).await?;
 
     // 7b. HEAD carries no body: the head (with Content-Length /

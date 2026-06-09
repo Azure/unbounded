@@ -251,7 +251,21 @@ async fn serve_connection<P: BufferPool<Req = StripeReq>>(
     page_size: usize,
 ) {
     let _fd = FdGuard(conn_fd);
-    let _ = serve_request(&pool, &handle, conn_fd, &backend_id, stripe_size, page_size).await;
+    let mut log = crate::obs::ReqLog::new("frontend.http");
+    match serve_request(
+        &pool,
+        &handle,
+        conn_fd,
+        &backend_id,
+        stripe_size,
+        page_size,
+        &mut log,
+    )
+    .await
+    {
+        Ok(()) => log.finish_ok(),
+        Err(()) => log.finish_err("connection error"),
+    }
 }
 
 /// The fallible serve body. Returns `Err(())` on any I/O, parse, or
@@ -264,6 +278,7 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
     backend_id: &str,
     stripe_size: u64,
     page_size: usize,
+    log: &mut crate::obs::ReqLog,
 ) -> Result<(), ()> {
     // 1. Read until the request head is complete (or the cap is hit).
     let mut buf: Vec<u8> = Vec::new();
@@ -282,6 +297,7 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
             }
             Err(_) => {
                 let _ = send_all(handle, conn_fd, status_line_response(400)).await;
+                log.field("status", 400);
                 return Ok(());
             }
         }
@@ -295,12 +311,15 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
         Method::HEAD => true,
         _ => {
             let _ = send_all(handle, conn_fd, status_line_response(405)).await;
+            log.field("status", 405);
             return Ok(());
         }
     };
+    log.str_field("method", if is_head { "HEAD" } else { "GET" });
 
     // 3. Path is the request target with any query stripped.
     let path = split_query(req.target).0.to_string();
+    log.str_field("path", &path);
 
     // 4. Optional Range header.
     let range = match req.header("range") {
@@ -308,6 +327,7 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
             Ok(r) => Some(r),
             Err(_) => {
                 let _ = send_all(handle, conn_fd, status_line_response(400)).await;
+                log.field("status", 400);
                 return Ok(());
             }
         },
@@ -329,10 +349,12 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
             Ok(r) => r,
             Err(RangeError::Unsatisfiable { object_len }) => {
                 let _ = send_all(handle, conn_fd, unsatisfiable_response(object_len)).await;
+                log.field("status", 416);
                 return Ok(());
             }
             Err(_) => {
                 let _ = send_all(handle, conn_fd, status_line_response(400)).await;
+                log.field("status", 400);
                 return Ok(());
             }
         },
@@ -344,6 +366,8 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
     } else {
         full_head(len)
     };
+    log.field("status", if range.is_some() { 206 } else { 200 })
+        .field("bytes", resolved.len());
     send_all(handle, conn_fd, head).await?;
 
     // 7b. HEAD carries no body: the head (with Content-Length /

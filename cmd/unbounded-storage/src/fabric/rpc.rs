@@ -420,6 +420,18 @@ fn run_worker<R, H>(
     if src_addr == ffi::FI_ADDR_UNSPEC {
         return;
     }
+
+    let mut log = Some({
+        let mut l = crate::obs::ReqLog::new("fabric.serve");
+        l.field("peer", src_addr)
+            .field("req_id", header.request_id)
+            .hexkey("stripe", &header.src_stripe)
+            .field("off", header.src_offset)
+            .field("len", header.src_len)
+            .field("pages", header.dest_pages)
+            .field("ttl", header.ttl);
+        l
+    });
     // The hop budget (`ttl`) is NOT rejected here. The RPC layer is
     // generic over the handler and does not run the Chord routing, so
     // it cannot tell an owner-serve from a forward. A node that owns
@@ -441,6 +453,11 @@ fn run_worker<R, H>(
                 header.request_id,
                 "local backing not registered",
             );
+
+            if let Some(mut l) = log.take() {
+                l.finish_err("local backing not registered");
+            }
+
             return;
         }
     };
@@ -462,6 +479,11 @@ fn run_worker<R, H>(
     loop {
         if shared.shutdown.load(Ordering::Acquire) {
             let _ = send_error_ack(&shared, src_addr, header.request_id, "server shutting down");
+
+            if let Some(mut l) = log.take() {
+                l.finish_err("server shutting down");
+            }
+
             return;
         }
         match stream.as_mut().poll_next(&mut task_cx) {
@@ -483,23 +505,38 @@ fn run_worker<R, H>(
                                 &format!("write_page: {e}"),
                             );
                         }
+
+                        if let Some(mut l) = log.take() {
+                            l.field("written", next_idx)
+                                .finish_err(format!("write_page: {e}"));
+                        }
+
                         return;
                     }
                 }
             }
             std::task::Poll::Ready(Some(Err(e))) => {
                 let _ = send_error_ack(&shared, src_addr, header.request_id, &format!("{e}"));
+
+                if let Some(mut l) = log.take() {
+                    l.field("written", next_idx).finish_err(e);
+                }
+
                 return;
             }
             std::task::Poll::Ready(None) => {
                 // Full success sends no terminator (the client ends on
                 // "all pages acked"); only a short/zero-page response
                 // needs an explicit RESPONSE_END. See module docs.
-                let terminated_by_last_ack =
-                    header.dest_pages > 0 && next_idx == header.dest_pages;
+                let terminated_by_last_ack = header.dest_pages > 0 && next_idx == header.dest_pages;
                 if !terminated_by_last_ack {
                     let _ = send_response_end(&shared, src_addr, header.request_id);
                 }
+
+                if let Some(mut l) = log.take() {
+                    l.field("written", next_idx).finish_ok();
+                }
+
                 return;
             }
             std::task::Poll::Pending => {

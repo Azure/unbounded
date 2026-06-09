@@ -112,6 +112,8 @@ fn startup_to_plan_config(topology: &config::TopologyCfg) -> PlanConfig {
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
+    unbounded_storage::obs::init_from_env();
+
     fabric::apply_tcp_env_defaults();
 
     let (config_path, config_explicit) = match cli.config.as_ref() {
