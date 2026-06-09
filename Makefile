@@ -545,14 +545,39 @@ unbounded-storage-tarball: unbounded-storage-build ## Package unbounded-storage 
 	@rm -rf $(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)
 	@mkdir -p $(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)/bin $(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)/lib
 	install -m 0755 $(UNBOUNDED_STORAGE_BIN) $(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)/bin/unbounded-storage
-	@libfound=0; \
+	@libdir=$(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)/lib; \
+	libfound=0; \
 	for d in $(LIBFABRIC_PREFIX)/lib $(LIBFABRIC_PREFIX)/lib64; do \
-		if [ -d "$$d" ] && cp -a "$$d"/libfabric.so* $(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)/lib/ 2>/dev/null; then \
+		if [ -d "$$d" ] && cp -a "$$d"/libfabric.so* "$$libdir"/ 2>/dev/null; then \
 			libfound=1; \
 		fi; \
 	done; \
 	if [ "$$libfound" -ne 1 ]; then \
 		echo "error: no libfabric.so* found under $(LIBFABRIC_PREFIX)" >&2; \
+		exit 1; \
+	fi; \
+	libfabric_real="$$(readlink -f "$$libdir"/libfabric.so)"; \
+	if [ -z "$$libfabric_real" ] || [ ! -f "$$libfabric_real" ]; then \
+		echo "error: could not resolve bundled libfabric.so" >&2; \
+		exit 1; \
+	fi; \
+	echo "Bundling libfabric runtime dependency closure ..."; \
+	ldd "$$libfabric_real" | while read -r soname arrow path rest; do \
+		[ "$$arrow" = "=>" ] || continue; \
+		[ -f "$$path" ] || continue; \
+		case "$$soname" in \
+		ld-linux*.so.* | linux-vdso.so.* | libc.so.* | libm.so.* | \
+		libdl.so.* | libpthread.so.* | librt.so.* | libresolv.so.* | \
+		libnsl.so.* | libutil.so.* | libanl.so.* | libgcc_s.so.*) \
+			continue;; \
+		esac; \
+		cp -L "$$path" "$$libdir/$$soname"; \
+		chmod 0644 "$$libdir/$$soname"; \
+		echo "  bundled $$soname"; \
+	done; \
+	if [ ! -e "$$libdir"/liburing.so.2 ]; then \
+		echo "error: liburing.so.2 was not bundled; libfabric needs it at runtime." >&2; \
+		echo "       install liburing development files on the build host and retry." >&2; \
 		exit 1; \
 	fi
 	tar -czf $(STORAGE_TARBALL) -C $(STORAGE_DIST_DIR) $(STORAGE_TARBALL_STEM)
@@ -590,6 +615,8 @@ unbounded-storage-push: unbounded-storage-tarball ## Push the unbounded-storage 
 		--account-key $(AZURE_STORAGE_KEY) \
 		--overwrite
 	@echo "Uploaded $(STORAGE_TARBALL_STEM).tar.gz to https://$(STORAGE_BLOB_ACCOUNT).blob.core.windows.net/$(STORAGE_BLOB_CONTAINER)/$(VERSION)/$(STORAGE_TARBALL_STEM).tar.gz"
+	@echo "Install with:"
+	@echo "  curl https://$(STORAGE_BLOB_ACCOUNT).blob.core.windows.net/$(STORAGE_BLOB_CONTAINER)/$(VERSION)/install.sh | bash -s -- https://$(STORAGE_BLOB_ACCOUNT).blob.core.windows.net/$(STORAGE_BLOB_CONTAINER)/$(VERSION)/$(STORAGE_TARBALL_STEM).tar.gz"
 
 bench: $(LIBFABRIC_STAMP) ## Build the bench tool (excluded from images)
 	$(CARGO_FABRIC_ENV) $(CARGO) build --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --release --locked --bin bench

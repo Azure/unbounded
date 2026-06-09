@@ -8,9 +8,11 @@ REPO="${REPO:-Azure/unbounded-kube}"
 VERSION="${VERSION:-latest}"
 PREFIX="${PREFIX:-/opt/unbounded-storage}"
 SERVICE_NAME="${SERVICE_NAME:-unbounded-storage}"
+CONFIG_PATH="${CONFIG_PATH:-/etc/unbounded-storage/config.toml}"
 STORAGE_ARGS="${STORAGE_ARGS:-}"
 NO_ENABLE="${NO_ENABLE:-0}"
 LOCAL_TARBALL="${LOCAL_TARBALL:-}"
+HUGEPAGES="${HUGEPAGES:-}"
 
 # Optional first positional argument selects where the release-layout tarball
 # comes from:
@@ -216,6 +218,12 @@ log "Linked ${PREFIX}/current -> ${release_dir}"
 unit_path="/etc/systemd/system/${SERVICE_NAME}.service"
 log "Writing systemd unit ${unit_path} ..."
 
+reserve_cmd='hp=/sys/kernel/mm/hugepages/hugepages-2048kB; [ -d "$hp" ] || { echo "unbounded-storage: kernel exposes no 2MiB hugepage pool; hugepages are required" >&2; exit 1; }; want='"${HUGEPAGES:-0}"'; if [ "$want" -le 0 ]; then pool=$(( (134217728 + 2097151) / 2097152 )); n=$(nproc 2>/dev/null || echo 1); [ "$n" -gt 8 ] && n=8; need=$(( pool + 8 * n )); want=$(( need + need / 2 )); else need=$want; fi; cur=$(cat "$hp/nr_hugepages" 2>/dev/null || echo 0); [ "$cur" -lt "$want" ] && echo "$want" > "$hp/nr_hugepages" 2>/dev/null || true; free=$(cat "$hp/free_hugepages" 2>/dev/null || echo 0); if [ "$free" -lt "$need" ] && [ -w /proc/sys/vm/compact_memory ]; then echo 1 > /proc/sys/vm/compact_memory 2>/dev/null || true; [ "$cur" -lt "$want" ] && echo "$want" > "$hp/nr_hugepages" 2>/dev/null || true; free=$(cat "$hp/free_hugepages" 2>/dev/null || echo 0); fi; nr=$(cat "$hp/nr_hugepages" 2>/dev/null || echo 0); echo "unbounded-storage: 2MiB hugepages nr=$nr free=$free (need $need target $want)" >&2; [ "$free" -ge "$need" ] || { echo "unbounded-storage: could not reserve $need free 2MiB hugepages (have $free); free host memory or reserve hugepages at boot" >&2; exit 1; }'
+HUGEPAGE_PRE="ExecStartPre=+/bin/sh -c '${reserve_cmd}'"
+
+config_ensure_cmd='d=$(dirname "'"${CONFIG_PATH}"'"); mkdir -p "$d"; [ -f "'"${CONFIG_PATH}"'" ] || : > "'"${CONFIG_PATH}"'"'
+CONFIG_PRE="ExecStartPre=+/bin/sh -c '${config_ensure_cmd}'"
+
 cat >"${unit_path}" <<EOF
 [Unit]
 Description=unbounded-storage daemon
@@ -228,7 +236,9 @@ Type=simple
 User=root
 Group=root
 Environment=LD_LIBRARY_PATH=${PREFIX}/current/lib
-ExecStart=${PREFIX}/current/bin/unbounded-storage ${STORAGE_ARGS}
+${HUGEPAGE_PRE}
+${CONFIG_PRE}
+ExecStart=${PREFIX}/current/bin/unbounded-storage --config ${CONFIG_PATH} ${STORAGE_ARGS}
 Restart=always
 RestartSec=2s
 
@@ -256,8 +266,9 @@ if [[ "${NO_ENABLE}" == "1" ]]; then
 	log "NO_ENABLE=1 set; unit installed but not enabled/started."
 	log "Start it with: systemctl enable --now ${SERVICE_NAME}"
 else
-	log "Enabling and starting ${SERVICE_NAME} ..."
-	systemctl enable --now "${SERVICE_NAME}"
+	log "Enabling and (re)starting ${SERVICE_NAME} ..."
+	systemctl enable "${SERVICE_NAME}"
+	systemctl restart "${SERVICE_NAME}"
 	log "Service status:"
 	systemctl --no-pager --full status "${SERVICE_NAME}" || true
 fi
@@ -265,5 +276,6 @@ fi
 log ""
 log "Done. unbounded-storage ${VERSION} (${ARCH}) installed."
 log "  binary : ${PREFIX}/current/bin/unbounded-storage"
+log "  config : ${CONFIG_PATH}"
 log "  unit   : ${unit_path}"
 log "  logs   : journalctl -u ${SERVICE_NAME} -f"

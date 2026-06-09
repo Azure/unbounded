@@ -83,6 +83,15 @@ pub struct FabricStartup {
 /// Build the host-`Plan` configuration from the config file's
 /// `[startup.topology]` knobs. Fields with no corresponding knob retain
 /// their `PlanConfig` defaults.
+/// Decide whether to force the tcp provider fallback because the
+/// discovered RDMA hardware cannot back a working libfabric `verbs`
+/// provider. Returns true only when RDMA is not already disabled, at
+/// least one HCA was discovered, and the verbs provider is unavailable.
+/// Pure so it can be unit-tested without touching libfabric or sysfs.
+fn should_force_tcp_fallback(disable_rdma: bool, hca_count: usize, verbs_available: bool) -> bool {
+    !disable_rdma && hca_count > 0 && !verbs_available
+}
+
 fn startup_to_plan_config(topology: &config::TopologyCfg) -> PlanConfig {
     let defaults = PlanConfig::default();
     PlanConfig {
@@ -133,6 +142,32 @@ fn main() -> ExitCode {
         BackingKind::Hugepage2Mb
     };
     let bytes_per_shard = memory.bytes_per_shard as usize;
+
+    let host = Host::discover();
+
+    // RDMA HCAs are discovered from sysfs, but a discovered HCA does not
+    // guarantee a usable libfabric `verbs` provider: some cloud VMs
+    // expose an `mlx5` device that backs an accelerated-networking
+    // datapath with no working user-space verbs stack. Binding a shard
+    // to `verbs` there fails the very first `fi_getinfo` with
+    // `-FI_ENODATA` and crash-loops the daemon. When that shape is
+    // detected, force the tcp fallback (the same path as the
+    // `disable_rdma` escape hatch) so the daemon comes up over the tcp
+    // provider instead of failing every shard at bring-up.
+    let mut plan_config = startup_to_plan_config(startup.topology());
+    if should_force_tcp_fallback(
+        plan_config.disable_rdma,
+        host.hcas.len(),
+        fabric::provider_available(Provider::Verbs),
+    ) {
+        eprintln!(
+            "fabric: {} RDMA HCA(s) discovered but the libfabric verbs provider is \
+             unavailable; forcing the tcp provider fallback",
+            host.hcas.len(),
+        );
+        plan_config.disable_rdma = true;
+    }
+
     let settings = Arc::new(StartupSettings {
         fabric: FabricStartup {
             listen_addr: fabric_cfg.listen_addr.clone(),
@@ -143,10 +178,9 @@ fn main() -> ExitCode {
         },
         bytes_per_shard,
         backing_kind,
-        plan_config: startup_to_plan_config(startup.topology()),
+        plan_config,
     });
 
-    let host = Host::discover();
     let plan = Plan::for_host(&host, &settings.plan_config);
 
     let counts = RoleCounts::from_plan(&plan);
@@ -1259,7 +1293,14 @@ fn load_config(path: &Path, explicit: bool) -> Result<Config, String> {
                 "config: {} not found; continuing with built-in defaults",
                 path.display()
             );
-            Ok(Config::default())
+            // Mirror the `load` finalization: a raw `Config::default()`
+            // leaves every section `None`, so the section accessors
+            // (`startup()`, `p2p()`, ...) would panic. Promote the proto3
+            // zero values to documented defaults exactly as the on-disk
+            // path does.
+            let mut c = Config::default();
+            c.apply_defaults();
+            Ok(c)
         }
         Err(e) => Err(format!("loading {}: {e}", path.display())),
     }
@@ -1381,6 +1422,36 @@ mod tests {
     }
 
     #[test]
+    fn force_tcp_fallback_when_hca_present_but_verbs_unavailable() {
+        // The crash-loop case: sysfs surfaced an HCA but libfabric has
+        // no usable verbs provider. Force the fallback.
+        assert!(should_force_tcp_fallback(false, 1, false));
+        assert!(should_force_tcp_fallback(false, 4, false));
+    }
+
+    #[test]
+    fn no_force_tcp_fallback_when_verbs_available() {
+        // Real RDMA hardware with a working verbs provider: keep RDMA.
+        assert!(!should_force_tcp_fallback(false, 2, true));
+    }
+
+    #[test]
+    fn no_force_tcp_fallback_without_hcas() {
+        // No HCA discovered: planning already takes the tcp_fallback
+        // path, so there is nothing to override regardless of the probe.
+        assert!(!should_force_tcp_fallback(false, 0, false));
+        assert!(!should_force_tcp_fallback(false, 0, true));
+    }
+
+    #[test]
+    fn no_force_tcp_fallback_when_already_disabled() {
+        // Operator already set disable_rdma: do not log a redundant
+        // override.
+        assert!(!should_force_tcp_fallback(true, 1, false));
+        assert!(!should_force_tcp_fallback(true, 3, true));
+    }
+
+    #[test]
     fn config_path_default_when_absent() {
         let c = parse(&[]).unwrap();
         assert_eq!(c.config, None);
@@ -1432,6 +1503,29 @@ mod tests {
                 "flag {flag} should be rejected",
             );
         }
+    }
+
+    #[test]
+    fn load_config_missing_default_path_applies_defaults() {
+        // A missing default (non-explicit) config path falls back to the
+        // built-in defaults. That fallback must run `apply_defaults` so
+        // the section accessors are populated; a raw `Config::default()`
+        // leaves `startup`/`p2p` as `None` and panics the daemon at
+        // startup when it reads `cfg.startup()`.
+        let path = Path::new("/definitely/not/a/real/path/unbounded-storage.toml");
+        let cfg = load_config(path, false).expect("missing default path falls back to defaults");
+        // These accessors panic if defaults were not applied.
+        assert_eq!(cfg.p2p().fingers_per_node, 100);
+        assert_eq!(cfg.startup().fabric().listen_addr, "0.0.0.0:0");
+        assert_eq!(cfg.startup().memory().bytes_per_shard, 128 * 1024 * 1024);
+    }
+
+    #[test]
+    fn load_config_missing_explicit_path_is_fatal() {
+        // An explicit path that is missing stays fatal: only the default
+        // path is allowed to silently fall back to built-in defaults.
+        let path = Path::new("/definitely/not/a/real/path/unbounded-storage.toml");
+        assert!(load_config(path, true).is_err());
     }
 
     #[test]

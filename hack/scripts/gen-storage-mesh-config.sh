@@ -205,12 +205,6 @@ kind = 0
 bind = "0.0.0.0:$OPT_FRONTEND_PORT"
 backend = "origin"
 
-[startup.memory]
-no_hugepages = true
-
 [startup.fabric]
 listen_addr = "0.0.0.0:$OPT_PORT"
-
-[startup.topology]
-disable_rdma = true
 EOF
