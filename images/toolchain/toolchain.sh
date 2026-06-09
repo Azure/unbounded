@@ -10,7 +10,12 @@
 # Environment variables (all optional):
 #   CONTAINER_ENGINE   Force a specific runtime. Default: podman if available,
 #                      otherwise docker.
-#   TOOLCHAIN_IMAGE    Image reference. Default: toolchain:latest.
+#   TOOLCHAIN_FLAVOR   Image flavor to build/run: "fedora" (default) or
+#                      "ubuntu". Selects the matching Containerfile next to
+#                      this script and determines the default image tag.
+#   TOOLCHAIN_IMAGE    Image reference. Default: toolchain:${TOOLCHAIN_FLAVOR}
+#                      (e.g. toolchain:fedora). Set this to override the
+#                      derived tag (e.g. for pushing to a registry).
 #   TOOLCHAIN_REBUILD  If non-empty, rebuild the image before running.
 #   PROJECT_DIR        Host path mounted at /project. Default: the repository
 #                      root inferred from this script's location.
@@ -29,7 +34,8 @@
 # Examples:
 #   ./images/toolchain/toolchain.sh                  # interactive shell
 #   ./images/toolchain/toolchain.sh go test ./...    # run a one-off command
-#   TOOLCHAIN_REBUILD=1 ./images/toolchain/toolchain.sh    # force rebuild
+#   TOOLCHAIN_FLAVOR=ubuntu ./images/toolchain/toolchain.sh  # use ubuntu image
+#   TOOLCHAIN_REBUILD=1 ./images/toolchain/toolchain.sh      # force rebuild
 #   CONTAINER_ENGINE=docker ./images/toolchain/toolchain.sh
 
 set -euo pipefail
@@ -67,7 +73,25 @@ if [[ ! -d "${project_dir}" ]]; then
     die "project directory does not exist: ${project_dir}"
 fi
 
-toolchain_image="${TOOLCHAIN_IMAGE:-toolchain:latest}"
+# --- Flavor selection -------------------------------------------------------
+# Pick the Containerfile that matches the requested flavor. Each flavor
+# produces a distinctly tagged image so multiple flavors can coexist in the
+# local image cache. TOOLCHAIN_IMAGE override (if set) still wins.
+toolchain_flavor="${TOOLCHAIN_FLAVOR:-fedora}"
+case "${toolchain_flavor}" in
+    fedora)
+        containerfile="${script_dir}/Containerfile"
+        ;;
+    *)
+        die "unknown TOOLCHAIN_FLAVOR=${toolchain_flavor} (expected: fedora)"
+        ;;
+esac
+
+if [[ ! -f "${containerfile}" ]]; then
+    die "Containerfile for flavor '${toolchain_flavor}' not found: ${containerfile}"
+fi
+
+toolchain_image="${TOOLCHAIN_IMAGE:-toolchain:${toolchain_flavor}}"
 
 # --- Image build (lazy) -----------------------------------------------------
 need_build=0
@@ -101,7 +125,8 @@ if (( need_build )); then
     protoc_gen_go_grpc_version=$(extract_version PROTOC_GEN_GO_GRPC_VERSION)
     controller_gen_version=$(extract_version CONTROLLER_GEN_VERSION)
 
-    log "building ${toolchain_image} with ${engine} from ${script_dir}"
+    log "building ${toolchain_image} (${toolchain_flavor}) with ${engine} from ${script_dir}"
+    log "  Containerfile=${containerfile}"
     log "  GOFUMPT_VERSION=${gofumpt_version}"
     log "  GOLANGCI_LINT_VERSION=${golangci_lint_version}"
     log "  PROTOC_GEN_GO_VERSION=${protoc_gen_go_version}"
@@ -109,6 +134,7 @@ if (( need_build )); then
     log "  CONTROLLER_GEN_VERSION=${controller_gen_version}"
 
     "${engine}" build \
+        --file "${containerfile}" \
         --build-arg "GOFUMPT_VERSION=${gofumpt_version}" \
         --build-arg "GOLANGCI_LINT_VERSION=${golangci_lint_version}" \
         --build-arg "PROTOC_GEN_GO_VERSION=${protoc_gen_go_version}" \
