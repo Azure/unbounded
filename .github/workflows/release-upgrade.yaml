@@ -345,6 +345,74 @@ jobs:
             exit 1
           fi
 
+      - name: Fetch release tooling from default branch (workaround for #235)
+        if: env.MODE == 'upgrade'
+        # The deploy job's primary checkout is pinned to the deployed tag,
+        # but the merge script for the #235 workaround lives under
+        # hack/release/ on the default branch and may not exist at older
+        # tags (e.g. when backfilling a release that predates the script).
+        # Pull just hack/release/ from the default branch into a tools
+        # subdirectory so the next step can invoke it regardless of the
+        # deployed tag.
+        #
+        # Mirrors the pattern used by smoke-discover and smoke-tests for
+        # hack/release/smoke/.
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: _release-tools
+          sparse-checkout: hack/release
+          sparse-checkout-cone-mode: true
+
+      - name: Workaround for #235 - merge bundled machina-config with live ConfigMap
+        if: env.MODE == 'upgrade'
+        # WORKAROUND for https://github.com/Azure/unbounded/issues/235.
+        #
+        # The shipped 03-config.yaml ships a machina-config ConfigMap whose
+        # inner config.yaml lacks the per-cluster `apiServerEndpoint` field
+        # required by machina-controller v0.1.5+. Only
+        # `kubectl unbounded site init` ever populates that field on the
+        # live ConfigMap. If we let the bundled template apply unmodified,
+        # it silently overwrites the live value and the controller starts
+        # crashing on the next pod restart.
+        #
+        # Instead of skipping the file outright (which would also drop any
+        # new keys the bundle introduces), we MERGE: load the live
+        # ConfigMap's inner config.yaml, load the bundle's inner
+        # config.yaml, take the union with LIVE WINNING on conflicts
+        # (policy A), and rewrite the bundle file in place. The subsequent
+        # `kubectl apply` then pushes a manifest that preserves all
+        # operator state while adding any new keys this release
+        # introduces.
+        #
+        # The merge logic lives in hack/release/merge-machina-config.py
+        # and is fetched from the default branch by the step above so
+        # backfills of older tags still get the latest version.
+        #
+        # REMOVE this step (along with the sparse checkout above and the
+        # merge script under hack/release/) once issue #235 lands upstream
+        # (e.g. controller falls back to in-cluster discovery, or the
+        # release tarball stops shipping 03-config.yaml).
+        env:
+          BUNDLE_FILE: ${{ env.MANIFESTS_DIR }}/machina/03-config.yaml
+          MERGE_SCRIPT: _release-tools/hack/release/merge-machina-config.py
+        run: |
+          set -euo pipefail
+          if [[ ! -f "$BUNDLE_FILE" ]]; then
+            echo "::warning::Workaround for #235 expected ${BUNDLE_FILE} but it was not present; the workaround may no longer be needed"
+            exit 0
+          fi
+
+          # Fetch the live inner config (empty if the ConfigMap does not exist yet).
+          LIVE_INNER=$(kubectl -n unbounded-kube get cm machina-config \
+            -o jsonpath='{.data.config\.yaml}' --ignore-not-found)
+          export LIVE_INNER
+
+          python3 "$MERGE_SCRIPT"
+
+          echo "Merged config.yaml that will be applied to the cluster:"
+          python3 -c "import yaml,sys; print(yaml.safe_load(open(sys.argv[1]))['data']['config.yaml'])" "$BUNDLE_FILE"
+
       - name: Apply manifests (upgrade)
         if: env.MODE == 'upgrade'
         run: |
