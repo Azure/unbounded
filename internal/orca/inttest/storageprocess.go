@@ -40,10 +40,26 @@ const (
 	// + eviction + cross-node fetch paths.
 	storageStripeSize = 4 * 1024 * 1024
 
-	// storageDiskSize is the per-node file-backed disk size. It must be
-	// a multiple of the page size and large enough to hold every stripe
-	// of the largest object on one node.
-	storageDiskSize = "2G"
+	// storageDiskSize is the per-node file-backed disk size in bytes. It
+	// must be a multiple of the page size and large enough to hold every
+	// stripe of the largest object on one node. The proto3-native config
+	// schema takes byte sizes as plain integers (see
+	// cmd/unbounded-storage/proto/config.proto), so this is 2 GiB.
+	storageDiskSize = 2 * 1024 * 1024 * 1024
+
+	// storageBackendKindS3 and storageFrontendKindS3 are the proto3
+	// BackendKind/FrontendKind discriminants for the native S3 surface
+	// (BACKEND_KIND_S3 / FRONTEND_KIND_S3 == 1).
+	storageBackendKindS3  = 1
+	storageFrontendKindS3 = 1
+
+	// storagePeerTransportTCP is the proto3 PeerTransport discriminant
+	// for the libfabric tcp provider (PEER_TRANSPORT_TCP == 0).
+	storagePeerTransportTCP = 0
+
+	// storageDiskKindFile is the proto3 DiskKind discriminant for a
+	// file-backed disk (DISK_KIND_FILE == 2).
+	storageDiskKindFile = 2
 )
 
 // storageBinary returns the path to the built unbounded-storage binary.
@@ -119,47 +135,56 @@ func freeLoopbackPort(t *testing.T) int {
 
 // writeStorageConfig writes a single unbounded-storage node TOML whose
 // S3 backend points at orcaEdge ("host:port"). The shape mirrors the
-// config produced by hack/smoke-storage.py write_config.
+// config produced by hack/smoke-storage.py write_config: the schema is
+// proto3-native, so enum fields are plain integer discriminants, byte
+// sizes are plain integer byte counts, and the startup-fixed knobs
+// (heap backing, fabric listen address, forcing the tcp provider) live
+// in the `[startup.*]` sections.
 func writeStorageConfig(t *testing.T, path, fabricAddr string, localID, peerID int, peerAddr, diskPath, orcaEdge, frontendBind string) {
 	t.Helper()
 
-	cfg := fmt.Sprintf(`[fabric]
-listen_addr = "%s"
-
-[storage]
-backing_kind = "heap"
-
-[topology]
-disable_rdma = true
-
-[p2p]
+	cfg := fmt.Sprintf(`[p2p]
 local_node_id = %d
 
 [[peers]]
 id = %d
-transport = "tcp"
+transport = %d
 address = "%s"
 
 [[disks]]
 path = "%s"
-kind = "file"
-size = "%s"
+kind = %d
+size = %d
 page_size_bytes = %d
 bypass_admission = true
 skip_recovery_scan_if_no_meta = true
 
 [[backends]]
 id = "origin"
-kind = "s3"
+kind = %d
 endpoint = "%s"
 stripe_size_bytes = %d
 
 [[frontends]]
 id = "fe"
-kind = "s3"
+kind = %d
 bind = "%s"
 backend = "origin"
-`, fabricAddr, localID, peerID, peerAddr, diskPath, storageDiskSize, storagePageSize, orcaEdge, storageStripeSize, frontendBind)
+
+[startup.memory]
+no_hugepages = true
+
+[startup.fabric]
+listen_addr = "%s"
+
+[startup.topology]
+disable_rdma = true
+`, localID,
+		peerID, storagePeerTransportTCP, peerAddr,
+		diskPath, storageDiskKindFile, storageDiskSize, storagePageSize,
+		storageBackendKindS3, orcaEdge, storageStripeSize,
+		storageFrontendKindS3, frontendBind,
+		fabricAddr)
 
 	if err := os.WriteFile(path, []byte(cfg), 0o644); err != nil {
 		t.Fatalf("write storage config %s: %v", path, err)
@@ -225,7 +250,10 @@ func spawnStorageNode(ctx context.Context, t *testing.T, bin, cfgPath, logPath s
 		t.Fatalf("create log %s: %v", logPath, err)
 	}
 
-	cmd := exec.CommandContext(ctx, bin, "--config", cfgPath, "--no-hugepages")
+	// The only CLI argument is the config path; every startup-fixed knob
+	// (heap backing via no_hugepages, fabric listen address, forcing the
+	// tcp provider) now lives in the config file's `[startup.*]` sections.
+	cmd := exec.CommandContext(ctx, bin, "--config", cfgPath)
 	cmd.Env = os.Environ() // inherit LD_LIBRARY_PATH for libfabric
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
