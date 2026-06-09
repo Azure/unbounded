@@ -1,74 +1,41 @@
 FROM fedora:44
 
-# See: entrypoint.sh to understand what this is doing
-#ARG GOSU_VERSION=1.19
-
-#ARG MAGE_VERSION=1.15.0
-#ARG MAGE_ARCHIVE=mage_${MAGE_VERSION}_Linux-64bit.tar.gz
-
-#ARG GOLANGCI_LINT_VERSION=v2.6.1
-
-# Hashicorp Packer is used to build the OS images for clusters. These vars
-# are exposed as ENV vars so the ENTRYPOINT script can download packer
-# during container init. This means that packer does not need to be
-# installed into the container itself which simplifies our security patching
-# as the security scans don't consider packer to be part of the built image.
-#
-# PACKER_VERSION and PACKER_ARCHIVE will be unset after packer installation
-# in supported entrypoint scripts.
-#ENV PACKER_VERSION=1.10.3
-#ENV PACKER_ARCHIVE=packer_${PACKER_VERSION}_linux_amd64.zip
-#ENV PACKER_CONFIG_DIR=/var/lib/packer
-#ENV PACKER_CHECKSUM=12977fde5f4fbbb0a88b4e8dc59c2f899113e57292d02a8bdc0efecf8cb3a9a2
-
-# Kubectl is used to interact with Kubernetes clusters.
-#ARG KUBECTL_VERSION=1.31.6
-
-# Protoc "protobuf compiler" is used to compile protobuf definitions such
-# as the infrasrv rpc definition.
-#ARG PROTOC_VERSION=3.15.8
-#ARG PROTOC_ARCHIVE=protoc-${PROTOC_VERSION}-linux-x86_64.zip
-
-#ARG YQ_VERSION=4.43.1
-
-# Staticcheck is a popular linter for Go code and is used in our linting pipelines
-#ARG STATICCHECK_VERSION=2025.1.1
-
 # Set so scripts and tools know they are running inside a container. This
 # env var is well-known as it is used by systemd.
 ENV container=docker
 
-# Make Python pip ignore the fact it is running as root in a container. Noisy warnings
-# if this is not set.
+# Make Python pip ignore the fact it is running as root in a container. Noisy
+# warnings if this is not set.
 ENV PIP_ROOT_USER_ACTION=ignore
 
 ENV LANG=C.UTF-8
 
-# README: <phlombar@microsoft.com> 2024-01-23
-#
 # Install runtime dependencies. Please keep this list in alphabetical order
 # for easy scanning.
 #
-# azure-cli       - should be self explanatory :)
-# bc              - mostly for base conversions (e.g. base36)
-# build-essential - needed for compilation tasks.
-# ca-certicates   - needed for anything that tries to establish TLS connections.
-# git             - should be self explanatory :)
-# jq              - shell processing of JSON documents.
-# openssh-clients - used by packer for builder communication.
-# openssl-devel   - cgo headers needed by deps that bind to OpenSSL
-#                   (e.g. github.com/google/go-tpm-tools/simulator). CI runs
-#                   on ubuntu-latest where libssl-dev is preinstalled.
-# python          - needed for ansible and some linting tools.
-# rsync           - used by packer for builder communication.
-# sudo            - allows utilizing "become" usage in ansible properly
-#                   and scripts with embedded sudo calls "just work".
-# tar             - needed to unarchive various artifacts.
-# tree            - pretty print a directory tree structure.
-# unzip           - needed to unarchive various artifacts.
-# util-linux      - provides "su" command.
-# wget            - provides "wget" command.
-# which           - provides "which" command.
+# @c-development     - C/C++ compilers and headers for cgo builds.
+# @development-tools - make, autoconf, patch, and the rest of the standard
+#                      build toolchain.
+# azure-cli          - Azure command-line interface.
+# bc                 - shell arithmetic, useful for base conversions.
+# ca-certificates    - TLS root store for anything that opens HTTPS.
+# git                - source control.
+# go                 - the Go toolchain.
+# jq                 - shell processing of JSON documents.
+# openssh-clients    - ssh/scp for git over SSH and remote shells.
+# openssl-devel      - cgo headers needed by deps that link against OpenSSL
+#                      (e.g. github.com/google/go-tpm-tools/simulator). CI
+#                      runs on ubuntu-latest where libssl-dev is preinstalled.
+# python             - required by various linting and codegen tools.
+# rsync              - file syncing for scripts and tests.
+# sudo               - the entrypoint runs as the unprivileged "dev" user;
+#                      sudoers allows escalation when needed.
+# tar                - archive extraction.
+# tree               - pretty-print a directory tree.
+# unzip              - archive extraction.
+# util-linux         - provides "su" and friends.
+# wget               - HTTP downloads.
+# which              - PATH lookup.
 RUN dnf makecache -y \
     && dnf install -y \
         @c-development \
@@ -93,26 +60,24 @@ RUN dnf makecache -y \
     && dnf upgrade -y \
     && dnf clean all
 
-# Global Go tool installation. @version must be specified in order for install to work.
-# GOBIN is set to /usr/local/bin so 'go install' places binaries on the default
-# PATH for every user without leaking a build-time GOBIN/GOPATH into the
-# runtime environment of the dev user (see entrypoint.sh, which sets a
-# per-user GOPATH/GOBIN at runtime).
 ENV GOROOT=/usr/lib/golang
 
-# Pinned Go tool versions are supplied by the caller via --build-arg. The single
-# source of truth for these versions is the repository Makefile (GOFUMPT_VERSION,
+# Pinned Go tool versions are supplied by the caller via --build-arg. The
+# repository Makefile is the single source of truth (GOFUMPT_VERSION,
 # GOLANGCI_LINT_VERSION, PROTOC_GEN_GO_VERSION, PROTOC_GEN_GO_GRPC_VERSION,
-# CONTROLLER_GEN_VERSION). images/toolchain/toolchain.sh extracts them from the
-# Makefile and passes them in when building this image. Building without these
-# args will fail fast at the `go install ...@` step, which is intentional: the
-# image should never be built with unpinned tool versions.
+# CONTROLLER_GEN_VERSION); toolchain.sh extracts them from the Makefile and
+# passes them in. Building without these args will fail fast at the
+# `go install ...@` step, which is intentional: the image should never be
+# built with unpinned tool versions.
 ARG GOFUMPT_VERSION
 ARG GOLANGCI_LINT_VERSION
 ARG PROTOC_GEN_GO_VERSION
 ARG PROTOC_GEN_GO_GRPC_VERSION
 ARG CONTROLLER_GEN_VERSION
 
+# GOBIN is set inline to /usr/local/bin so installed binaries land on the
+# default PATH for every user, without leaking a build-time GOBIN/GOPATH into
+# the runtime environment of the dev user (see entrypoint.sh).
 RUN GOBIN=/usr/local/bin go install golang.org/x/tools/cmd/goimports@latest \
         && GOBIN=/usr/local/bin go install mvdan.cc/gofumpt@${GOFUMPT_VERSION} \
         && GOBIN=/usr/local/bin go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@${GOLANGCI_LINT_VERSION} \
@@ -124,8 +89,8 @@ RUN GOBIN=/usr/local/bin go install golang.org/x/tools/cmd/goimports@latest \
 # Create the unprivileged "dev" user the entrypoint runs as. The uid/gid are
 # fixed at 1000:1000 so toolchain.sh can map the host invoking user 1:1 onto
 # them via --userns=keep-id:uid=1000,gid=1000 under rootless podman. Sudoers
-# is baked in so `sudo` Just Works inside the container without the
-# entrypoint having to mutate /etc/sudoers.d at runtime.
+# is baked in so `sudo` works inside the container without the entrypoint
+# having to mutate /etc/sudoers.d at runtime.
 RUN useradd --create-home --shell /bin/bash --uid 1000 --user-group dev \
         && echo 'dev ALL=(root) NOPASSWD:ALL' > /etc/sudoers.d/dev \
         && chmod 0440 /etc/sudoers.d/dev
