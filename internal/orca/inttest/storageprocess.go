@@ -115,22 +115,52 @@ func raiseMemlock(t *testing.T) {
 	}
 }
 
-// freeLoopbackPort returns a currently-free TCP port on loopback. There
-// is an inherent race between closing the probe socket and the child
-// binding it; this matches hack/smoke-storage.py and is acceptable for
-// a serialized single-test ring.
-func freeLoopbackPort(t *testing.T) int {
+type loopbackPortReservation struct {
+	port int
+	ln   net.Listener
+}
+
+// reserveLoopbackPorts returns currently-free TCP ports on loopback and
+// keeps their listeners open so the same test cannot allocate duplicate
+// ports before handing them to child processes.
+func reserveLoopbackPorts(t *testing.T, count int) []loopbackPortReservation {
 	t.Helper()
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("alloc loopback port: %v", err)
+	reservations := make([]loopbackPortReservation, 0, count)
+	seen := make(map[int]struct{}, count)
+
+	for len(reservations) < count {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			closeLoopbackPortReservations(reservations)
+			t.Fatalf("reserve loopback port: %v", err)
+		}
+
+		port := ln.Addr().(*net.TCPAddr).Port //nolint:errcheck // *net.TCPAddr from net.Listen
+		if _, ok := seen[port]; ok {
+			_ = ln.Close() //nolint:errcheck // best-effort
+			continue
+		}
+
+		seen[port] = struct{}{}
+		reservations = append(reservations, loopbackPortReservation{port: port, ln: ln})
 	}
 
-	port := ln.Addr().(*net.TCPAddr).Port //nolint:errcheck // *net.TCPAddr from net.Listen
-	_ = ln.Close()                        //nolint:errcheck // probe socket close best-effort
+	return reservations
+}
 
-	return port
+func releaseLoopbackPortReservation(t *testing.T, reservation loopbackPortReservation) {
+	t.Helper()
+
+	if err := reservation.ln.Close(); err != nil {
+		t.Fatalf("release loopback port %d: %v", reservation.port, err)
+	}
+}
+
+func closeLoopbackPortReservations(reservations []loopbackPortReservation) {
+	for _, reservation := range reservations {
+		_ = reservation.ln.Close() //nolint:errcheck // best-effort cleanup
+	}
 }
 
 // writeStorageConfig writes a single unbounded-storage node TOML whose
@@ -207,8 +237,11 @@ func startStorageRing(ctx context.Context, t *testing.T, orcaEdge string) *stora
 
 	dir := t.TempDir()
 
-	fabA, fabB := freeLoopbackPort(t), freeLoopbackPort(t)
-	feA, feB := freeLoopbackPort(t), freeLoopbackPort(t)
+	ports := reserveLoopbackPorts(t, 4)
+	defer closeLoopbackPortReservations(ports)
+
+	fabA, fabB := ports[0].port, ports[1].port
+	feA, feB := ports[2].port, ports[3].port
 
 	cfg1 := filepath.Join(dir, "node1.toml")
 	cfg2 := filepath.Join(dir, "node2.toml")
@@ -220,7 +253,12 @@ func startStorageRing(ctx context.Context, t *testing.T, orcaEdge string) *stora
 		fmt.Sprintf("127.0.0.1:%d", fabB), 2, 1, fmt.Sprintf("127.0.0.1:%d", fabA),
 		filepath.Join(dir, "node2.disk"), orcaEdge, fmt.Sprintf("127.0.0.1:%d", feB))
 
+	releaseLoopbackPortReservation(t, ports[0])
+	releaseLoopbackPortReservation(t, ports[2])
 	spawnStorageNode(ctx, t, bin, cfg1, filepath.Join(dir, "node1.log"))
+
+	releaseLoopbackPortReservation(t, ports[1])
+	releaseLoopbackPortReservation(t, ports[3])
 	spawnStorageNode(ctx, t, bin, cfg2, filepath.Join(dir, "node2.log"))
 
 	frontends := []string{
