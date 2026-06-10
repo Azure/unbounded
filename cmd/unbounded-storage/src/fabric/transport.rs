@@ -295,6 +295,7 @@ enum StreamState<'a> {
         acked: Vec<bool>,
         ended: bool,
         emitted_error: bool,
+        log: Option<crate::obs::ReqLog>,
     },
     Done,
 }
@@ -384,6 +385,14 @@ impl<'a, R> PageStream for FabricBulkStream<'a, R> {
                     };
                     match launch(&fabric, &mr, peer, request_id, src, &req_bytes, dsts, ttl) {
                         Ok((shared, ep, recv_ctxs)) => {
+                            let mut log = crate::obs::ReqLog::new("fabric.fetch");
+                            log.field("peer", peer.0)
+                                .field("req_id", request_id)
+                                .hexkey("stripe", &src.stripe.0)
+                                .field("off", src.offset)
+                                .field("len", src.len)
+                                .field("pages", dsts.len())
+                                .field("ttl", ttl);
                             this.state = StreamState::Active {
                                 shared,
                                 dsts,
@@ -392,10 +401,20 @@ impl<'a, R> PageStream for FabricBulkStream<'a, R> {
                                 acked: vec![false; dsts.len()],
                                 ended: false,
                                 emitted_error: false,
+                                log: Some(log),
                             };
                             // Fall through to poll the Active state.
                         }
                         Err(e) => {
+                            let mut log = crate::obs::ReqLog::new("fabric.fetch");
+                            log.field("peer", peer.0)
+                                .field("req_id", request_id)
+                                .hexkey("stripe", &src.stripe.0)
+                                .field("off", src.offset)
+                                .field("len", src.len)
+                                .field("pages", dsts.len())
+                                .field("ttl", ttl);
+                            log.finish_err(&e);
                             return Poll::Ready(Some(Err(PoolError::transport(e))));
                         }
                     }
@@ -408,6 +427,7 @@ impl<'a, R> PageStream for FabricBulkStream<'a, R> {
                     acked,
                     ended,
                     emitted_error,
+                    log,
                 } => {
                     if *ended {
                         return Poll::Ready(None);
@@ -428,6 +448,9 @@ impl<'a, R> PageStream for FabricBulkStream<'a, R> {
                                 Ok(payload) => payload,
                                 Err(e) => {
                                     *ended = true;
+                                    if let Some(mut l) = log.take() {
+                                        l.finish_err(&e);
+                                    }
                                     return Poll::Ready(Some(Err(PoolError::transport(e))));
                                 }
                             };
@@ -437,6 +460,9 @@ impl<'a, R> PageStream for FabricBulkStream<'a, R> {
                                     Ok(v) => v,
                                     Err(_) => {
                                         *ended = true;
+                                        if let Some(mut l) = log.take() {
+                                            l.finish_err("malformed PAGE_ACK");
+                                        }
                                         return Poll::Ready(Some(Err(PoolError::transport(
                                             FabricError::BadConfig("malformed PAGE_ACK"),
                                         ))));
@@ -445,12 +471,18 @@ impl<'a, R> PageStream for FabricBulkStream<'a, R> {
                                 let idx = ack.page_idx as usize;
                                 if idx >= dsts.len() {
                                     *ended = true;
+                                    if let Some(mut l) = log.take() {
+                                        l.finish_err("PAGE_ACK index out of range");
+                                    }
                                     return Poll::Ready(Some(Err(PoolError::transport(
                                         FabricError::BadConfig("PAGE_ACK index out of range"),
                                     ))));
                                 }
                                 if acked[idx] {
                                     *ended = true;
+                                    if let Some(mut l) = log.take() {
+                                        l.finish_err("duplicate PAGE_ACK index");
+                                    }
                                     return Poll::Ready(Some(Err(PoolError::transport(
                                         FabricError::BadConfig("duplicate PAGE_ACK index"),
                                     ))));
@@ -460,16 +492,28 @@ impl<'a, R> PageStream for FabricBulkStream<'a, R> {
                                 // the last in-order ack ends the stream.
                                 if acked.iter().all(|a| *a) {
                                     *ended = true;
+                                    if let Some(mut l) = log.take() {
+                                        l.field("acked", acked.len()).finish_ok();
+                                    }
                                 }
                                 return Poll::Ready(Some(Ok(dsts[idx])));
                             } else if tag_base == RESPONSE_END_TAG_BASE {
                                 *ended = true;
                                 if acked.iter().any(|acked| !*acked) {
+                                    if let Some(mut l) = log.take() {
+                                        l.finish_err(
+                                            "RESPONSE_END before all requested pages were delivered",
+                                        );
+                                    }
                                     return Poll::Ready(Some(Err(PoolError::transport(
                                         FabricError::BadConfig(
                                             "RESPONSE_END before all requested pages were delivered",
                                         ),
                                     ))));
+                                }
+                                if let Some(mut l) = log.take() {
+                                    l.field("acked", acked.iter().filter(|a| **a).count())
+                                        .finish_ok();
                                 }
                                 return Poll::Ready(None);
                             } else if tag_base == ERROR_ACK_TAG_BASE {
@@ -481,6 +525,9 @@ impl<'a, R> PageStream for FabricBulkStream<'a, R> {
                                 let msg = bincode::deserialize::<ErrorAck>(&payload)
                                     .map(|e| e.message)
                                     .unwrap_or_else(|_| "server error (undecodable)".into());
+                                if let Some(mut l) = log.take() {
+                                    l.finish_err(&msg);
+                                }
                                 return Poll::Ready(Some(Err(PoolError::transport(ServerError(
                                     msg,
                                 )))));
@@ -515,7 +562,13 @@ where
 
 impl<'a, R> Drop for FabricBulkStream<'a, R> {
     fn drop(&mut self) {
-        if let StreamState::Active { recv_ctxs, ep, .. } = &mut self.state {
+        if let StreamState::Active {
+            recv_ctxs, ep, log, ..
+        } = &mut self.state
+        {
+            if let Some(mut l) = log.take() {
+                l.finish_err("stream dropped before completion");
+            }
             if let Ok(ctxs) = recv_ctxs.lock() {
                 for ctx in ctxs.iter() {
                     // Best-effort cancel. Outstanding completions will
@@ -921,6 +974,7 @@ mod tests {
                 acked,
                 ended: false,
                 emitted_error: false,
+                log: None,
             },
             _marker: PhantomData,
         }

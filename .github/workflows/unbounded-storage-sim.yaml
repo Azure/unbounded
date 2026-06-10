@@ -40,7 +40,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config
+            build-essential pkg-config liburing-dev
 
       - name: Set up Rust toolchain
         run: |

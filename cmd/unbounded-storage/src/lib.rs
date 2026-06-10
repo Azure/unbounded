@@ -9,6 +9,7 @@ pub mod frontend;
 pub mod http;
 pub mod io;
 pub mod memory;
+pub mod obs;
 pub mod p2p;
 pub mod ring;
 pub mod runtime;

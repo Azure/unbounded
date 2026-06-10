@@ -155,10 +155,9 @@ impl fmt::Display for ConfigError {
                 "p2p.routing_plan {role} {id} equals p2p.local_node_id: a node cannot list \
                  itself as a routing neighbor"
             ),
-            ConfigError::RoutingPlanDuplicateFinger(id) => write!(
-                f,
-                "p2p.routing_plan.fingers contains duplicate id {id}"
-            ),
+            ConfigError::RoutingPlanDuplicateFinger(id) => {
+                write!(f, "p2p.routing_plan.fingers contains duplicate id {id}")
+            }
             ConfigError::DuplicateBackendId(id) => write!(f, "duplicate backend id: {id:?}"),
             ConfigError::DuplicateFrontendId(id) => write!(f, "duplicate frontend id: {id:?}"),
             ConfigError::EmptyBackendId => write!(f, "backend id must not be empty"),

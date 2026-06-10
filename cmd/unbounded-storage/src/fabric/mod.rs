@@ -31,7 +31,7 @@ pub use backing::MrHandle;
 pub use completion::{CompletionFuture, CompletionInfo, CompletionRegistry, CompletionSlot};
 pub use config::{FabricConfig, Provider, apply_tcp_env_defaults, defaults_for};
 pub use error::{FabricError, Result, check};
-pub use fabric::Fabric;
+pub use fabric::{Fabric, provider_available};
 pub use handler::{Handler, HandlerStream};
 pub use ping::{PING_TAG, PONG_TAG};
 pub use pool_handler::{PoolHandler, PoolHandlerError, PoolHandlerStream};

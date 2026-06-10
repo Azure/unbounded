@@ -327,6 +327,62 @@ impl Fabric {
     }
 }
 
+/// Probe whether `provider`'s libfabric provider can satisfy this
+/// crate's endpoint requirements in the current environment.
+///
+/// Some hosts expose an RDMA-capable device under
+/// `/sys/class/infiniband` - so topology discovers an HCA and selects
+/// the `verbs` provider - while libfabric has no working `verbs`
+/// provider for it. This is a common shape on cloud VMs whose `mlx5`
+/// device backs an accelerated-networking datapath rather than a usable
+/// user-space verbs stack. On such hosts the first `fi_getinfo` for
+/// `verbs` returns `-FI_ENODATA`, which otherwise crashes every shard at
+/// bring-up. Call this before committing the topology to RDMA so the
+/// daemon can fall back to the `tcp` provider instead.
+///
+/// Returns `true` when libfabric returns at least one matching `fi_info`
+/// for the provider, and `false` otherwise (including `-FI_ENODATA` and
+/// any other failure). The probe issues a single non-binding
+/// `fi_getinfo` (no node/service, no `FI_SOURCE`) and frees everything it
+/// allocates.
+pub fn provider_available(provider: Provider) -> bool {
+    let prov_name = match provider {
+        Provider::Verbs => "verbs",
+        Provider::Tcp => "tcp",
+    };
+    let Ok(prov_cstr) = CString::new(prov_name) else {
+        return false;
+    };
+
+    let hints = unsafe { ffi::ub_fi_build_hints(prov_cstr.as_ptr()) };
+    if hints.is_null() {
+        return false;
+    }
+
+    let mut info: *mut ffi::fi_info = ptr::null_mut();
+    let rc = unsafe {
+        ffi::fi_getinfo(
+            ffi::requested_version(),
+            ptr::null(),
+            ptr::null(),
+            0,
+            hints,
+            &mut info,
+        )
+    };
+    let available = rc == 0 && !info.is_null();
+
+    if !info.is_null() {
+        // SAFETY: `info` is a fresh chain returned by `fi_getinfo`.
+        unsafe { ffi::fi_freeinfo(info) };
+    }
+    // SAFETY: `hints` was allocated by `ub_fi_build_hints`; `fi_getinfo`
+    // does not consume it.
+    unsafe { ffi::fi_freeinfo(hints) };
+
+    available
+}
+
 impl FabricInner {
     pub(crate) fn ep(&self) -> *mut ffi::fid_ep {
         self.ep
@@ -477,5 +533,21 @@ mod tests {
         // than at process exit so any panic is attributed to this
         // test.
         drop(fabric);
+    }
+
+    #[test]
+    fn provider_available_matches_probe_for_tcp() {
+        if std::env::var_os("FABRIC_SKIP_FFI").is_some() {
+            eprintln!("FABRIC_SKIP_FFI set; skipping libfabric provider probe test");
+            return;
+        }
+        // The production `provider_available` helper must agree with the
+        // hand-rolled probe used to gate the loopback test above: both
+        // ask libfabric the same question about the tcp provider.
+        assert_eq!(
+            provider_available(Provider::Tcp),
+            tcp_provider_available(),
+            "provider_available(Tcp) must match the local tcp probe",
+        );
     }
 }
