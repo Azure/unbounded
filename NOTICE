@@ -228,13 +228,41 @@ notices:
     license:
       - name: ISC License
         link: https://github.com/coder/websocket/blob/v1.8.14/LICENSE.txt
+  - dependency: github.com/containerd/containerd/api
+    ecosystem: go
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/containerd/containerd/blob/api/v1.11.0/LICENSE
+  - dependency: github.com/containerd/containerd/v2
+    ecosystem: go
+    copyright:
+      - Copyright 2012-2015 Docker, Inc.
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/containerd/containerd/blob/v2.3.0-beta.0/LICENSE
+  - dependency: github.com/containerd/errdefs
+    ecosystem: go
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/containerd/errdefs/blob/v1.0.0/LICENSE
   - dependency: github.com/containerd/platforms
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/containerd/platforms/blob/v0.2.1/LICENSE
+        link: https://github.com/containerd/platforms/blob/v1.0.0-rc.4/LICENSE
+  - dependency: github.com/containerd/typeurl/v2
+    ecosystem: go
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/containerd/typeurl/blob/v2.2.3/LICENSE
   - dependency: github.com/coreos/go-iptables
     ecosystem: go
     copyright:
@@ -279,6 +307,13 @@ notices:
     license:
       - name: MIT License
         link: https://github.com/golang-jwt/jwt/blob/v5.3.1/LICENSE
+  - dependency: github.com/golang/protobuf
+    ecosystem: go
+    copyright:
+      - Copyright 2010 The Go Authors.  All rights reserved.
+    license:
+      - name: BSD 3-Clause License
+        link: https://github.com/golang/protobuf/blob/v1.5.4/LICENSE
   - dependency: github.com/google/go-tpm
     ecosystem: go
     copyright:
@@ -317,6 +352,13 @@ notices:
     license:
       - name: BSD 3-Clause License
         link: https://github.com/insomniacslk/dhcp/blob/5adc3eb26f91/LICENSE
+  - dependency: github.com/ipfs/go-cid
+    ecosystem: go
+    copyright:
+      - Copyright (c) 2016 Protocol Labs, Inc.
+    license:
+      - name: MIT License
+        link: https://github.com/ipfs/go-cid/blob/v0.6.1/LICENSE
   - dependency: github.com/lib/pq
     ecosystem: go
     copyright:
@@ -324,6 +366,49 @@ notices:
     license:
       - name: MIT License
         link: https://github.com/lib/pq/blob/v1.12.3/LICENSE
+  - dependency: github.com/libp2p/go-libp2p
+    ecosystem: go
+    copyright:
+      - Copyright (c) 2014 Juan Batiz-Benet
+    license:
+      - name: MIT License
+        link: https://github.com/libp2p/go-libp2p/blob/v0.48.0/LICENSE
+  - dependency: github.com/libp2p/go-libp2p-kad-dht
+    ecosystem: go
+    copyright:
+      - Copyright (c) 2016 Protocol Labs, Inc.
+    license:
+      - name: MIT License
+        link: https://github.com/libp2p/go-libp2p-kad-dht/blob/v0.39.2/LICENSE
+  - dependency: github.com/libp2p/go-msgio
+    ecosystem: go
+    copyright:
+      - Copyright (c) 2014 Juan Batiz-Benet
+    license:
+      - name: MIT License
+        link: https://github.com/libp2p/go-msgio/blob/v0.3.0/LICENSE
+  - dependency: github.com/multiformats/go-multiaddr
+    ecosystem: go
+    copyright:
+      - Copyright (c) 2014 Juan Batiz-Benet
+    license:
+      - name: MIT License
+        link: https://github.com/multiformats/go-multiaddr/blob/v0.16.1/LICENSE
+  - dependency: github.com/multiformats/go-multihash
+    ecosystem: go
+    copyright:
+      - Copyright (c) 2014 Juan Batiz-Benet
+    license:
+      - name: MIT License
+        link: https://github.com/multiformats/go-multihash/blob/v0.2.3/LICENSE
+  - dependency: github.com/opencontainers/go-digest
+    ecosystem: go
+    copyright:
+      - Copyright 2019, 2020 OCI Contributors
+      - Copyright 2016 Docker, Inc.
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/opencontainers/go-digest/blob/v1.0.0/LICENSE
   - dependency: github.com/opencontainers/image-spec
     ecosystem: go
     copyright:
@@ -416,6 +501,13 @@ notices:
     license:
       - name: BSD 3-Clause License
         link: https://go.googlesource.com/mod
+  - dependency: golang.org/x/net
+    ecosystem: go
+    copyright:
+      - Copyright 2009 The Go Authors.
+    license:
+      - name: BSD 3-Clause License
+        link: https://go.googlesource.com/net
   - dependency: golang.org/x/sync
     ecosystem: go
     copyright:
@@ -503,7 +595,7 @@ notices:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/kubernetes/klog/blob/v2.130.1/LICENSE
+        link: https://github.com/kubernetes/klog/blob/main/LICENSE
   - dependency: k8s.io/kube-aggregator
     ecosystem: go
     copyright:
@@ -517,7 +609,7 @@ notices:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/kubernetes/utils/blob/bc988d571ff4/LICENSE
+        link: https://github.com/kubernetes/utils/blob/28399d86e0b5/LICENSE
   - dependency: modernc.org/sqlite
     ecosystem: go
     copyright:
