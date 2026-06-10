@@ -103,6 +103,10 @@ func (i *kubeComponentInstaller) tempArchivePattern() string {
 	return i.tempPrefix + "-*.tar.gz"
 }
 
+func (i *kubeComponentInstaller) setSkipPaths(paths []string) {
+	i.skipPaths = paths
+}
+
 // run resolves fileOrURL to a local directory of manifests, applies them to the
 // cluster, and waits for the controller pod to become Running.
 func (i *kubeComponentInstaller) run(ctx context.Context) error {

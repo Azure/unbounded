@@ -275,11 +275,7 @@ func (r *MachineOperationReconciler) updateMachineProviderID(ctx context.Context
 }
 
 func shouldExecuteOperation(op *unboundedv1alpha3.MachineOperation) bool {
-	if op.Status.Phase == "" || op.Status.Phase == unboundedv1alpha3.OperationPhasePending {
-		return true
-	}
-
-	return op.Spec.OperationKind == unboundedv1alpha3.OperationHostReplace && op.Status.Phase == unboundedv1alpha3.OperationPhaseInProgress
+	return op.Status.Phase == "" || op.Status.Phase == unboundedv1alpha3.OperationPhasePending
 }
 
 func isHostOperation(operation unboundedv1alpha3.OperationKind) bool {

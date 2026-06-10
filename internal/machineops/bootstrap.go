@@ -12,6 +12,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
@@ -30,21 +31,32 @@ type ClusterInfo struct {
 
 // ResolveClusterInfo resolves cluster bootstrap details for HostReplace.
 func ResolveClusterInfo(ctx context.Context, apiServerEndpoint string, k kubernetes.Interface) (*ClusterInfo, error) {
-	if strings.TrimSpace(apiServerEndpoint) == "" {
-		return nil, fmt.Errorf("API server endpoint is required")
+	apiServerEndpoint = strings.TrimSpace(apiServerEndpoint)
+	caCert := ""
+
+	if apiServerEndpoint == "" {
+		discoveredEndpoint, discoveredCA, err := resolveClusterInfoConfigMap(ctx, k)
+		if err != nil {
+			return nil, err
+		}
+
+		apiServerEndpoint = discoveredEndpoint
+		caCert = discoveredCA
+	} else {
+		cm, err := k.CoreV1().ConfigMaps(metav1.NamespacePublic).Get(ctx, "kube-root-ca.crt", metav1.GetOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("get kube-root-ca.crt ConfigMap from kube-public: %w", err)
+		}
+
+		var ok bool
+
+		caCert, ok = cm.Data["ca.crt"]
+		if !ok {
+			return nil, fmt.Errorf("ca.crt key not found in kube-root-ca.crt ConfigMap")
+		}
 	}
 
 	apiServerEndpoint = strings.TrimPrefix(apiServerEndpoint, "https://")
-
-	cm, err := k.CoreV1().ConfigMaps(metav1.NamespacePublic).Get(ctx, "kube-root-ca.crt", metav1.GetOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("get kube-root-ca.crt ConfigMap from kube-public: %w", err)
-	}
-
-	caCert, ok := cm.Data["ca.crt"]
-	if !ok {
-		return nil, fmt.Errorf("ca.crt key not found in kube-root-ca.crt ConfigMap")
-	}
 
 	svc, err := k.CoreV1().Services(metav1.NamespaceSystem).Get(ctx, "kube-dns", metav1.GetOptions{})
 	if err != nil {
@@ -76,6 +88,33 @@ func ResolveClusterInfo(ctx context.Context, apiServerEndpoint string, k kuberne
 	}
 
 	return info, nil
+}
+
+func resolveClusterInfoConfigMap(ctx context.Context, k kubernetes.Interface) (string, string, error) {
+	cm, err := k.CoreV1().ConfigMaps(metav1.NamespacePublic).Get(ctx, "cluster-info", metav1.GetOptions{})
+	if err != nil {
+		return "", "", fmt.Errorf("get cluster-info ConfigMap from kube-public: %w", err)
+	}
+
+	kubeconfig, ok := cm.Data["kubeconfig"]
+	if !ok {
+		return "", "", fmt.Errorf("kubeconfig key not found in cluster-info ConfigMap")
+	}
+
+	cfg, err := clientcmd.RESTConfigFromKubeConfig([]byte(kubeconfig))
+	if err != nil {
+		return "", "", fmt.Errorf("parsing kubeconfig from cluster-info ConfigMap: %w", err)
+	}
+
+	if cfg.Host == "" {
+		return "", "", fmt.Errorf("cluster-info kubeconfig has no server URL")
+	}
+
+	if len(cfg.CAData) == 0 {
+		return "", "", fmt.Errorf("cluster-info kubeconfig has no CA certificate")
+	}
+
+	return cfg.Host, string(cfg.CAData), nil
 }
 
 func (r *MachineOperationReconciler) buildReplaceUserData(ctx context.Context, machine *unboundedv1alpha3.Machine) (string, error) {

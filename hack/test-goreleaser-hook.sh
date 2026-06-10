@@ -4,8 +4,8 @@
 
 # hack/test-goreleaser-hook.sh
 #
-# Tests that the goreleaser pre-hooks correctly stamp the machina and
-# unbounded-net deployment manifests with the release tag before
+# Tests that the goreleaser pre-hooks correctly stamp the machina,
+# machine-ops, and unbounded-net deployment manifests with the release tag before
 # building kubectl-unbounded.
 #
 # Usage: ./hack/test-goreleaser-hook.sh
@@ -17,11 +17,13 @@ MANIFEST="deploy/machina/rendered/04-deployment.yaml"
 EXPECTED_IMAGE="ghcr.io/azure/machina:${TAG}"
 NET_MANIFEST="deploy/net/rendered/controller/03-deployment.yaml"
 EXPECTED_NET_IMAGE="ghcr.io/azure/unbounded-net-controller:${TAG}"
+MACHINE_OPS_MANIFEST="deploy/machine-ops/rendered/03-deployment.yaml"
+EXPECTED_MACHINE_OPS_IMAGE="ghcr.io/azure/machine-ops-controller:${TAG}"
 
 # Save the original manifest so we can restore it on exit.
 cleanup() {
     echo "Restoring manifests to default..."
-    make machina-manifests net-manifests
+    make machina-manifests machine-ops-manifests net-manifests
     git tag -d "$TAG" 2>/dev/null || true
     echo "Done."
 }
@@ -39,6 +41,15 @@ if [[ "$actual" == *"$EXPECTED_IMAGE"* ]]; then
     echo "PASS: machina manifest stamped correctly -> ${EXPECTED_IMAGE}"
 else
     echo "FAIL: expected '${EXPECTED_IMAGE}' but got '${actual}'"
+    exit 1
+fi
+
+echo "=== Checking machine-ops manifest ==="
+actual_machine_ops=$(grep 'image:' "$MACHINE_OPS_MANIFEST" | xargs)
+if [[ "$actual_machine_ops" == *"$EXPECTED_MACHINE_OPS_IMAGE"* ]]; then
+    echo "PASS: machine-ops manifest stamped correctly -> ${EXPECTED_MACHINE_OPS_IMAGE}"
+else
+    echo "FAIL: expected '${EXPECTED_MACHINE_OPS_IMAGE}' but got '${actual_machine_ops}'"
     exit 1
 fi
 
@@ -64,6 +75,14 @@ if grep -qF "$EXPECTED_IMAGE" <(strings "$binary"); then
 else
     echo "FAIL: binary does not contain ${EXPECTED_IMAGE}"
     grep -F 'machina:' <(strings "$binary") || true
+    exit 1
+fi
+
+if grep -qF "$EXPECTED_MACHINE_OPS_IMAGE" <(strings "$binary"); then
+    echo "PASS: binary embeds ${EXPECTED_MACHINE_OPS_IMAGE}"
+else
+    echo "FAIL: binary does not contain ${EXPECTED_MACHINE_OPS_IMAGE}"
+    grep -F 'machine-ops-controller:' <(strings "$binary") || true
     exit 1
 fi
 

@@ -28,6 +28,14 @@ import (
 //go:embed assets/unbounded-net-site/*.yaml
 var siteTemplates embed.FS
 
+type componentInstaller interface {
+	run(context.Context) error
+}
+
+type skipPathInstaller interface {
+	setSkipPaths([]string)
+}
+
 // siteInitHandler is responsible for handling initial unbounded-kube bootstrap and also ensuring a site
 // is ready for machines to be added to it. The handler performs the following duties:
 //
@@ -45,7 +53,8 @@ var siteTemplates embed.FS
 // 4. Install and configure machina-controller.
 // 5. Create a bootstrap token for the site if one does not already exist.
 // 6. Verify machina-controller is up and running.
-// 7. Print out Site Initialized message and show how to access unbounded-net UI and register a machine.
+// 7. Install and verify machine-ops-controller.
+// 8. Print out Site Initialized message and show how to access unbounded-net UI and register a machine.
 type siteInitHandler struct {
 	// name is the site name and is used to create CNI resources as well as label things like machines and other
 	// secondary resources created for the site.
@@ -73,6 +82,10 @@ type siteInitHandler struct {
 	// machina controller until we have public downloadable releases coming from that repository.
 	machinaManifests string
 
+	// machineOpsManifests is a path to either a directory or archive containing machine-ops manifests to apply
+	// to the cluster for this site. When empty, the embedded manifests are used.
+	machineOpsManifests string
+
 	// manageCniPlugin controls whether unbounded-net manages the CNI plugin
 	// for the site. When false, the Site is configured with manageCniPlugin: false
 	// so that an existing CNI (e.g. Cilium, Calico) handles intra-site networking.
@@ -93,9 +106,11 @@ type siteInitHandler struct {
 	// kubectl is function that creates a kubectl command pointed to the correct KUBECONFIG for the cluster.
 	kubectl kube.KubectlFunc
 
-	installUnboundedCNI *installUnboundedCNI
+	installUnboundedCNI componentInstaller
 
-	installMachina *installMachina
+	installMachina componentInstaller
+
+	installMachineOps componentInstaller
 
 	logger *slog.Logger
 }
@@ -139,6 +154,10 @@ func (h *siteInitHandler) execute(ctx context.Context) error {
 		h.installMachina = newInstallMachina(h.machinaManifests, nil, h.logger, h.kubeResourcesCli, h.kubeCli)
 	}
 
+	if h.installMachineOps == nil {
+		h.installMachineOps = newInstallMachineOps(h.machineOpsManifests, nil, h.logger, h.kubeResourcesCli, h.kubeCli)
+	}
+
 	if err := h.ensureUnboundedCNI(ctx); err != nil {
 		return fmt.Errorf("ensuring unbounded CNI for site %s: %w", h.name, err)
 	}
@@ -174,8 +193,8 @@ func (h *siteInitHandler) execute(ctx context.Context) error {
 		return fmt.Errorf("ensuring bootstrap token for site %s: %w", h.name, err)
 	}
 
-	if err := h.ensureMachinaIsRunning(ctx); err != nil {
-		return fmt.Errorf("installing machina controller for site %s: %w", h.name, err)
+	if err := h.ensureControllersAreRunning(ctx); err != nil {
+		return err
 	}
 
 	return nil
@@ -226,6 +245,14 @@ func (h *siteInitHandler) validate() error {
 		return errors.New("CNI manifests path is invalid")
 	}
 
+	if h.machinaManifests != "" && !isHTTPSURL(h.machinaManifests) && !isDirectoryOrFile(h.machinaManifests) {
+		return errors.New("machina manifests path is invalid")
+	}
+
+	if h.machineOpsManifests != "" && !isHTTPSURL(h.machineOpsManifests) && !isDirectoryOrFile(h.machineOpsManifests) {
+		return errors.New("machine-ops manifests path is invalid")
+	}
+
 	if err := kube.CheckKubectlAvailable(); err != nil {
 		return fmt.Errorf("kubectl not available: %w", err)
 	}
@@ -234,6 +261,18 @@ func (h *siteInitHandler) validate() error {
 
 	if !isReadableFile(h.kubeconfigPath) {
 		return fmt.Errorf("kubeconfig %q not readable", h.kubeconfigPath)
+	}
+
+	return nil
+}
+
+func (h *siteInitHandler) ensureControllersAreRunning(ctx context.Context) error {
+	if err := h.ensureMachinaIsRunning(ctx); err != nil {
+		return fmt.Errorf("installing machina controller for site %s: %w", h.name, err)
+	}
+
+	if err := h.ensureMachineOpsIsRunning(ctx); err != nil {
+		return fmt.Errorf("installing machine-ops controller for site %s: %w", h.name, err)
 	}
 
 	return nil
@@ -295,7 +334,7 @@ func (h *siteInitHandler) ensureMachinaIsRunning(ctx context.Context) error {
 	}
 
 	// Ensure the unbounded-kube namespace exists before applying the
-	// ConfigMap — the namespace manifest is part of the installer bundle
+	// ConfigMap - the namespace manifest is part of the installer bundle
 	// but we need it earlier.
 	nsApply := v1.Namespace(machinaNamespace)
 	if _, err := h.kubeCli.CoreV1().Namespaces().Apply(ctx, nsApply, ao); err != nil {
@@ -320,9 +359,19 @@ func (h *siteInitHandler) ensureMachinaIsRunning(ctx context.Context) error {
 		h.logger.Info("Using embedded machina manifests")
 	}
 
-	h.installMachina.skipPaths = []string{"03-config.yaml"}
+	if installer, ok := h.installMachina.(skipPathInstaller); ok {
+		installer.setSkipPaths([]string{"03-config.yaml"})
+	}
 
 	return h.installMachina.run(ctx)
+}
+
+func (h *siteInitHandler) ensureMachineOpsIsRunning(ctx context.Context) error {
+	if h.machineOpsManifests == "" {
+		h.logger.Info("Using embedded machine-ops manifests")
+	}
+
+	return h.installMachineOps.run(ctx)
 }
 
 // ensureUnboundedSite sets up the main gateway and the cluster site that encompasses any nodes attached to the
@@ -401,6 +450,7 @@ func siteInitCommand() *cobra.Command {
 
 	cmd.Flags().StringVar(&handler.cniManifests, "cni-manifests", "", "Path or https URL to CNI plugin manifests (uses embedded manifests if omitted)")
 	cmd.Flags().StringVar(&handler.machinaManifests, "machina-manifests", "", "Path or https URL to Machina manifests (uses embedded manifests if omitted)")
+	cmd.Flags().StringVar(&handler.machineOpsManifests, "machine-ops-manifests", "", "Path or https URL to machine-ops manifests (uses embedded manifests if omitted)")
 	cmd.Flags().StringVar(&handler.kubeconfigPath, "kubeconfig", "", "Path to kubeconfig file")
 	cmd.Flags().StringVar(&handler.name, "name", "", "The name of the site")
 	cmd.Flags().StringVar(&handler.clusterNodeCIDR, "cluster-node-cidr", "", "The cluster node cidr")
