@@ -4,6 +4,7 @@ run:
   build-tags:
     - int
     - integrationtest
+    - storageboundary
   # With default 1m timeout CI sometimes fails.
   timeout: 10m
 linters:

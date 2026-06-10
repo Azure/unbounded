@@ -11,7 +11,8 @@ use std::rc::Rc;
 use proptest::collection::vec;
 use proptest::prelude::*;
 use unbounded_storage::bufferpool::{
-    BufferPool, Error, PageGuard, Pool, PoolConfig, ReadStream, StripeKey, WindowedRead,
+    BufferPool, Error, PageGuard, PipelinedRead, Pool, PoolConfig, ReadStream, StripeKey,
+    StripePlan, WindowedRead,
 };
 use unbounded_storage::memory::Backing;
 
@@ -58,6 +59,35 @@ pub struct Workload {
     /// `key_idx` indexes into this set modulo its length.
     pub key_count: u8,
     pub clients: Vec<ClientSpec>,
+    /// Multi-stripe pipelined readers driven through
+    /// `Pool::read_pipelined`. Each entry is an ordered plan of
+    /// per-stripe slices delivered as one in-order page stream that
+    /// pipelines fetches across stripe boundaries. Kept separate from
+    /// `clients` so the single-stripe invariants that reason about
+    /// `max_concurrent_streams` against `clients.len()` stay valid;
+    /// the shared `workload_strategy` leaves this empty and a
+    /// dedicated strategy/proptest exercises the pipelined path.
+    pub pipelines: Vec<PipelineSpec>,
+}
+
+/// One slice of a pipelined read plan: a byte range within the stripe
+/// identified by `key_idx`. `offset`/`len` are normalized against the
+/// stripe length in `run_workload`, exactly like [`ClientSpec`].
+#[derive(Clone, Debug)]
+pub struct PlanSliceSpec {
+    pub key_idx: u8,
+    pub offset: u64,
+    pub len: u64,
+}
+
+/// A single pipelined reader: an ordered list of plan slices plus an
+/// optional mid-stream cancellation (same semantics as
+/// [`ClientSpec::cancel_after`], counted in delivered pages across the
+/// whole plan).
+#[derive(Clone, Debug)]
+pub struct PipelineSpec {
+    pub cancel_after: Option<u32>,
+    pub slices: Vec<PlanSliceSpec>,
 }
 
 #[derive(Clone, Debug)]
@@ -121,6 +151,7 @@ impl Workload {
 enum AnyStream<'p> {
     Plain(ReadStream<'p>),
     Windowed(WindowedRead<'p>),
+    Pipelined(PipelinedRead<'p>),
 }
 
 impl<'p> AnyStream<'p> {
@@ -128,8 +159,64 @@ impl<'p> AnyStream<'p> {
         match self {
             AnyStream::Plain(s) => s.next_page().await,
             AnyStream::Windowed(s) => s.next_page().await,
+            AnyStream::Pipelined(s) => s.next_page().await,
         }
     }
+}
+
+/// Drive one [`AnyStream`] to completion (or to a mid-stream
+/// cancellation after `cancel_after` delivered pages) and classify the
+/// result. Shared by the single-stripe client tasks and the pipelined
+/// reader tasks so both go through identical in-order consumption and
+/// outcome accounting.
+async fn consume<'p>(
+    mut stream: AnyStream<'p>,
+    expected: Vec<u8>,
+    cancel_after: Option<u32>,
+) -> ClientOutcome {
+    // Cancel-before-first-page: drop the stream immediately. Exercises
+    // the "dropped while the slot is Idle and no fetch was issued"
+    // path in the readers' `Drop`.
+    if let Some(0) = cancel_after {
+        drop(stream);
+        return ClientOutcome::Cancelled {
+            got: Vec::new(),
+            expected,
+            pages_read: 0,
+        };
+    }
+    let mut got = Vec::with_capacity(expected.len());
+    let mut pages_read: u32 = 0;
+    // Set inside the `Some(Ok(_))` arm when the cancel condition fires.
+    // We can't `drop(stream)` inside the match arm because the
+    // `PageGuard` returned by `next_page` borrows `stream` until the
+    // arm ends.
+    let mut should_cancel = false;
+    loop {
+        match stream.next_page().await {
+            Some(Ok(g)) => {
+                got.extend_from_slice(g.as_slice());
+                drop(g);
+                pages_read += 1;
+                if cancel_after.map(|k| pages_read >= k).unwrap_or(false) {
+                    should_cancel = true;
+                }
+            }
+            Some(Err(e)) => {
+                return ClientOutcome::FetchErr(format!("{e}"));
+            }
+            None => break,
+        }
+        if should_cancel {
+            drop(stream);
+            return ClientOutcome::Cancelled {
+                got,
+                expected,
+                pages_read,
+            };
+        }
+    }
+    ClientOutcome::Ok { got, expected }
 }
 
 // ---------------------------------------------------------------------------
@@ -208,6 +295,13 @@ pub fn workload_strategy() -> impl Strategy<Value = Workload> {
                 max_inflight_pages,
                 key_count,
                 clients,
+                // The shared strategy never generates pipelined
+                // readers: the single-stripe invariants reason about
+                // `max_concurrent_streams` against `clients.len()`, and
+                // pipelined readers admit one stream per active slice
+                // which would invalidate that accounting. The pipelined
+                // path has its own strategy and proptest below.
+                pipelines: Vec::new(),
             },
         )
 }
@@ -240,6 +334,85 @@ fn client_strategy() -> impl Strategy<Value = ClientSpec> {
             window,
         },
     )
+}
+
+/// Strategy for pipelined-reader workloads. Distinct from
+/// [`workload_strategy`]: it generates no single-stripe `clients` and
+/// instead populates `pipelines`, and pins `max_concurrent_streams`
+/// high so the lazy per-slice admission never trips `StreamLimit`
+/// (which would surface mid-plan as a `FetchErr`). This keeps the
+/// pipelined invariants focused on ordering, accounting, single-flight,
+/// and deadlock-freedom rather than admission backpressure.
+pub fn pipelined_workload_strategy() -> impl Strategy<Value = Workload> {
+    let page_size = prop_oneof![Just(64usize), Just(128), Just(256), Just(512)];
+    let page_count = 1usize..=8;
+    let max_io_delay = 0u32..=3;
+    let io_fault_rate = prop_oneof![
+        9 => Just(0u32),
+        1 => 1u32..=30,
+    ];
+    let cache_hit_rate = prop_oneof![
+        6 => Just(0u32),
+        3 => 1u32..=80,
+        1 => Just(100u32),
+    ];
+    let max_inflight_pages = 1usize..=8;
+    let key_count = 1u8..=3;
+    let pipelines = vec(pipeline_strategy(), 1..=4);
+
+    (
+        page_size,
+        page_count,
+        max_io_delay,
+        io_fault_rate,
+        cache_hit_rate,
+        max_inflight_pages,
+        key_count,
+        pipelines,
+    )
+        .prop_map(
+            |(
+                page_size,
+                page_count,
+                max_io_delay,
+                io_fault_rate,
+                cache_hit_rate,
+                max_inflight_pages,
+                key_count,
+                pipelines,
+            )| Workload {
+                page_size,
+                page_count,
+                max_io_delay,
+                io_fault_rate,
+                cache_hit_rate,
+                // Pinned high: pipelined admission must not be
+                // rejected, so every plan slice gets a stream.
+                max_concurrent_streams: 1024,
+                max_inflight_pages,
+                key_count,
+                clients: Vec::new(),
+                pipelines,
+            },
+        )
+}
+
+fn plan_slice_strategy() -> impl Strategy<Value = PlanSliceSpec> {
+    (0u8..=255u8, 0u64..=4096, 1u64..=4096)
+        .prop_map(|(key_idx, offset, len)| PlanSliceSpec { key_idx, offset, len })
+}
+
+fn pipeline_strategy() -> impl Strategy<Value = PipelineSpec> {
+    // Most plans run to completion; a meaningful minority cancel
+    // mid-stream so the pipelined `Drop` cleanup path is covered. A
+    // plan spans 1..=4 stripe slices so prefetch crosses stripe
+    // boundaries.
+    let cancel_after = prop_oneof![
+        7 => Just(None),
+        3 => (0u32..=16).prop_map(Some),
+    ];
+    (cancel_after, vec(plan_slice_strategy(), 1..=4))
+        .prop_map(|(cancel_after, slices)| PipelineSpec { cancel_after, slices })
 }
 
 // ---------------------------------------------------------------------------
@@ -378,6 +551,7 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
         let window = c.window;
 
         exec.spawn(async move {
+            let _ = cid;
             let req = TestReq { key };
             // Window `None` => plain `read`; `Some(w)` => prefetching
             // `read_windowed`. Both admit through the same path and
@@ -402,62 +576,57 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
                     }
                 },
             };
-            let _ = cid;
-            // Cancel-before-first-page: drop the stream immediately.
-            // This exercises the "stream dropped while the slot is
-            // Idle and no fetch was issued" path in
-            // `decrement_stream`.
-            if let Some(0) = cancel_after {
-                drop(stream);
-                outcomes.borrow_mut().push(ClientOutcome::Cancelled {
-                    got: Vec::new(),
-                    expected,
-                    pages_read: 0,
-                });
-                return;
-            }
-            let mut stream = stream;
-            let mut got = Vec::with_capacity(len as usize);
-            let mut pages_read: u32 = 0;
-            // Set inside the `Some(Ok(_))` arm when the cancel
-            // condition fires. We can't `drop(stream)` inside the
-            // match arm because the `PageGuard` returned by
-            // `next_page` borrows `stream` until the arm ends.
-            let mut should_cancel = false;
-            loop {
-                match stream.next_page().await {
-                    Some(Ok(g)) => {
-                        got.extend_from_slice(g.as_slice());
-                        // Drop `g` (the PageGuard) at the end of
-                        // this match arm so the page is recyclable
-                        // before we test the cancel condition.
-                        drop(g);
-                        pages_read += 1;
-                        if cancel_after.map(|k| pages_read >= k).unwrap_or(false) {
-                            should_cancel = true;
-                        }
-                    }
-                    Some(Err(e)) => {
-                        outcomes
-                            .borrow_mut()
-                            .push(ClientOutcome::FetchErr(format!("{e}")));
-                        return;
-                    }
-                    None => break,
-                }
-                if should_cancel {
-                    drop(stream);
-                    outcomes.borrow_mut().push(ClientOutcome::Cancelled {
-                        got,
-                        expected,
-                        pages_read,
-                    });
+            let outcome = consume(stream, expected, cancel_after).await;
+            outcomes.borrow_mut().push(outcome);
+        });
+    }
+
+    // Spawn one task per pipelined reader. Each plan slice is
+    // normalized against the stripe length exactly like a single-stripe
+    // client; the per-client oracle is the in-order concatenation of
+    // every slice's bytes.
+    for pspec in &w.pipelines {
+        let mut plan_norm: Vec<(StripeKey, u64, u64)> = Vec::new();
+        let mut expected: Vec<u8> = Vec::new();
+        for s in &pspec.slices {
+            let key = w.key(s.key_idx);
+            let offset = s.offset % stripe_len;
+            let max_len = stripe_len - offset;
+            let len = ((s.len - 1) % max_len) + 1;
+            let bytes = oracle.get(&key).expect("oracle stripe must exist");
+            expected.extend_from_slice(&bytes[offset as usize..(offset + len) as usize]);
+            plan_norm.push((key, offset, len));
+        }
+        if plan_norm.is_empty() {
+            continue;
+        }
+        let p = pool.clone();
+        let outcomes = outcomes.clone();
+        let cancel_after = pspec.cancel_after;
+
+        exec.spawn(async move {
+            let plans: Vec<StripePlan<TestReq>> = plan_norm
+                .into_iter()
+                .map(|(key, intra_offset, intra_len)| StripePlan {
+                    req: TestReq { key },
+                    intra_offset,
+                    intra_len,
+                })
+                .collect();
+            // `usize::MAX` window: the pool clamps it to
+            // `max_inflight_pages + 1`, so the pipeline prefetches as
+            // aggressively as the global budget allows.
+            let stream = match p.read_pipelined(plans, usize::MAX) {
+                Ok(s) => AnyStream::Pipelined(s),
+                Err(e) => {
+                    outcomes
+                        .borrow_mut()
+                        .push(ClientOutcome::ReadErr(format!("{e}")));
                     return;
                 }
-            }
-            outcomes
-                .borrow_mut()
-                .push(ClientOutcome::Ok { got, expected });
+            };
+            let outcome = consume(stream, expected, cancel_after).await;
+            outcomes.borrow_mut().push(outcome);
         });
     }
 
@@ -467,12 +636,17 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
     // recycles the slot and a new caller leads again.
     let max_pages_per_client = (stripe_len / w.page_size as u64) + 1;
     let fault_slack = 1 + w.io_fault_rate as u64 / 5;
+    let per_page_cost = (w.max_io_delay as u64 + 4) * 16 * fault_slack;
+    // A pipelined reader may touch up to `slices * pages_per_stripe`
+    // pages, so budget each by its (normalized) plan length.
+    let pipeline_pages: u64 = w
+        .pipelines
+        .iter()
+        .map(|p| p.slices.len() as u64 * max_pages_per_client)
+        .sum();
     let step_budget = 64
-        + (normalized.len() as u64)
-            * max_pages_per_client
-            * (w.max_io_delay as u64 + 4)
-            * 16
-            * fault_slack;
+        + (normalized.len() as u64) * max_pages_per_client * per_page_cost
+        + pipeline_pages * per_page_cost;
 
     exec.run(step_budget)?;
 

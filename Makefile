@@ -86,6 +86,15 @@ LIBFABRIC_URL ?= https://github.com/ofiwg/libfabric/releases/download/v$(LIBFABR
 CARGO_FABRIC_ENV = LIBFABRIC_PKG_CONFIG_PATH=$(LIBFABRIC_PKG_CONFIG_PATH) \
 	LD_LIBRARY_PATH=$(LIBFABRIC_PREFIX)/lib$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}
 
+# Release tarball packaging for unbounded-storage. ARCH defaults to the
+# host (normalized to Go-style names) and can be overridden for CI matrix
+# builds. The tarball bundles the binary plus the pinned libfabric shared
+# objects under a single top-level directory.
+STORAGE_TARBALL_ARCH ?= $(shell uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/')
+STORAGE_DIST_DIR ?= dist
+STORAGE_TARBALL_STEM := unbounded-storage-linux-$(STORAGE_TARBALL_ARCH)
+STORAGE_TARBALL := $(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM).tar.gz
+
 # Version is derived from the latest git tag. Override with: make VERSION=v1.0.0
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 GIT_COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
@@ -157,7 +166,7 @@ REACT_DEV ?= false
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-manifests
 .PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-net-controller-local image-net-node-local images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
-.PHONY: unbounded-storage unbounded-storage-build bench unbounded-storage-test unbounded-storage-check unbounded-storage-model-check libfabric
+.PHONY: unbounded-storage unbounded-storage-build unbounded-storage-smoke unbounded-storage-tarball unbounded-storage-push bench unbounded-storage-test unbounded-storage-check unbounded-storage-model-check libfabric
 
 ##@ General
 
@@ -207,6 +216,9 @@ help: ## Show this help
 	@echo ""
 	@echo "Rust Binaries:"
 	@echo "  unbounded-storage | unbounded-storage-build  Build unbounded-storage (with/without test)"
+	@echo "  unbounded-storage-smoke          Run the end-to-end smoke test (uses sudo)"
+	@echo "  unbounded-storage-tarball        Package unbounded-storage + libfabric into a release tarball"
+	@echo "  unbounded-storage-push           Push the unbounded-storage release tarball to Azure blob storage"
 	@echo "  bench                            Build the bench tool (excluded from images)"
 	@echo "  unbounded-storage-test           Run cargo tests for unbounded-storage"
 	@echo "  unbounded-storage-check          Run cargo check for unbounded-storage"
@@ -265,6 +277,7 @@ help: ## Show this help
 	@echo "  orca-kind-down | orca-down       Delete the kind cluster"
 	@echo "  orca-reset                       Rebuild image and rolling-restart Orca on kind"
 	@echo "  orca-inttest                     Run orca integration tests (Docker required)"
+	@echo "  storage-inttest                  Run unbounded-storage -> orca -> Garage integration test (Docker + sudo)"
 	@echo ""
 	@echo "Documentation:"
 	@echo "  docs-serve                       Start local Hugo dev server"
@@ -500,8 +513,8 @@ $(LIBFABRIC_STAMP):
 	@mkdir -p $(CURDIR)/tmp/libfabric/src
 	@curl -fsSL $(LIBFABRIC_URL) | tar -xj -C $(CURDIR)/tmp/libfabric/src --strip-components=1
 	cd $(CURDIR)/tmp/libfabric/src && ./configure --prefix=$(LIBFABRIC_PREFIX) \
-		--enable-tcp=yes --disable-verbs --disable-rxm --disable-sockets \
-		--disable-psm3 --disable-efa --disable-shm
+		--enable-tcp=yes --with-uring=yes --disable-verbs --disable-rxm \
+		--disable-sockets --disable-psm3 --disable-efa --disable-shm
 	$(MAKE) -C $(CURDIR)/tmp/libfabric/src -j$$(nproc)
 	$(MAKE) -C $(CURDIR)/tmp/libfabric/src install
 	@rm -rf $(CURDIR)/tmp/libfabric/src
@@ -522,6 +535,89 @@ unbounded-storage-build: $(LIBFABRIC_STAMP) ## Build the unbounded-storage binar
 
 unbounded-storage: unbounded-storage-test unbounded-storage-build ## Build the unbounded-storage binary (implies test)
 
+unbounded-storage-smoke: unbounded-storage-build ## Run the end-to-end smoke test (requires sudo for hugepages/memlock)
+	sudo -E env "PATH=$$PATH" \
+		"LD_LIBRARY_PATH=$(LIBFABRIC_PREFIX)/lib$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" \
+		python3 hack/smoke-storage.py
+
+unbounded-storage-tarball: unbounded-storage-build ## Package unbounded-storage + libfabric into a release tarball ($(STORAGE_TARBALL))
+	@echo "Assembling $(STORAGE_TARBALL)"
+	@rm -rf $(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)
+	@mkdir -p $(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)/bin $(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)/lib
+	install -m 0755 $(UNBOUNDED_STORAGE_BIN) $(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)/bin/unbounded-storage
+	@libdir=$(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)/lib; \
+	libfound=0; \
+	for d in $(LIBFABRIC_PREFIX)/lib $(LIBFABRIC_PREFIX)/lib64; do \
+		if [ -d "$$d" ] && cp -a "$$d"/libfabric.so* "$$libdir"/ 2>/dev/null; then \
+			libfound=1; \
+		fi; \
+	done; \
+	if [ "$$libfound" -ne 1 ]; then \
+		echo "error: no libfabric.so* found under $(LIBFABRIC_PREFIX)" >&2; \
+		exit 1; \
+	fi; \
+	libfabric_real="$$(readlink -f "$$libdir"/libfabric.so)"; \
+	if [ -z "$$libfabric_real" ] || [ ! -f "$$libfabric_real" ]; then \
+		echo "error: could not resolve bundled libfabric.so" >&2; \
+		exit 1; \
+	fi; \
+	echo "Bundling libfabric runtime dependency closure ..."; \
+	ldd "$$libfabric_real" | while read -r soname arrow path rest; do \
+		[ "$$arrow" = "=>" ] || continue; \
+		[ -f "$$path" ] || continue; \
+		case "$$soname" in \
+		ld-linux*.so.* | linux-vdso.so.* | libc.so.* | libm.so.* | \
+		libdl.so.* | libpthread.so.* | librt.so.* | libresolv.so.* | \
+		libnsl.so.* | libutil.so.* | libanl.so.* | libgcc_s.so.*) \
+			continue;; \
+		esac; \
+		cp -L "$$path" "$$libdir/$$soname"; \
+		chmod 0644 "$$libdir/$$soname"; \
+		echo "  bundled $$soname"; \
+	done; \
+	if [ ! -e "$$libdir"/liburing.so.2 ]; then \
+		echo "error: liburing.so.2 was not bundled; libfabric needs it at runtime." >&2; \
+		echo "       install liburing development files on the build host and retry." >&2; \
+		exit 1; \
+	fi
+	tar -czf $(STORAGE_TARBALL) -C $(STORAGE_DIST_DIR) $(STORAGE_TARBALL_STEM)
+	cd $(STORAGE_DIST_DIR) && sha256sum $(STORAGE_TARBALL_STEM).tar.gz > $(STORAGE_TARBALL_STEM).tar.gz.sha256
+	@rm -rf $(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)
+	@echo "Wrote $(STORAGE_TARBALL)"
+
+# Azure blob storage destination for publishing the unbounded-storage release
+# tarball. AZURE_STORAGE_KEY must be provided in the environment when pushing.
+STORAGE_BLOB_ACCOUNT   ?=
+STORAGE_BLOB_CONTAINER ?=
+
+unbounded-storage-push: unbounded-storage-tarball ## Push the unbounded-storage release tarball to Azure blob storage
+	@test -n "$(STORAGE_BLOB_ACCOUNT)" || { echo "error: STORAGE_BLOB_ACCOUNT is required"; exit 1; }
+	@test -n "$(AZURE_STORAGE_KEY)" || { echo "error: AZURE_STORAGE_KEY is required for pushing artifacts"; exit 1; }
+	@az storage blob upload \
+		--file $(STORAGE_TARBALL) \
+		--container-name $(STORAGE_BLOB_CONTAINER) \
+		--name $(VERSION)/$(STORAGE_TARBALL_STEM).tar.gz \
+		--account-name $(STORAGE_BLOB_ACCOUNT) \
+		--account-key $(AZURE_STORAGE_KEY) \
+		--overwrite
+	@az storage blob upload \
+		--file $(STORAGE_TARBALL).sha256 \
+		--container-name $(STORAGE_BLOB_CONTAINER) \
+		--name $(VERSION)/$(STORAGE_TARBALL_STEM).tar.gz.sha256 \
+		--account-name $(STORAGE_BLOB_ACCOUNT) \
+		--account-key $(AZURE_STORAGE_KEY) \
+		--overwrite
+	@az storage blob upload \
+		--file hack/scripts/install-unbounded-storage.sh \
+		--container-name $(STORAGE_BLOB_CONTAINER) \
+		--name $(VERSION)/install.sh \
+		--account-name $(STORAGE_BLOB_ACCOUNT) \
+		--account-key $(AZURE_STORAGE_KEY) \
+		--overwrite
+	@echo "Uploaded $(STORAGE_TARBALL_STEM).tar.gz to https://$(STORAGE_BLOB_ACCOUNT).blob.core.windows.net/$(STORAGE_BLOB_CONTAINER)/$(VERSION)/$(STORAGE_TARBALL_STEM).tar.gz"
+	@echo "Install with:"
+	@echo "  curl https://$(STORAGE_BLOB_ACCOUNT).blob.core.windows.net/$(STORAGE_BLOB_CONTAINER)/$(VERSION)/install.sh | bash -s -- https://$(STORAGE_BLOB_ACCOUNT).blob.core.windows.net/$(STORAGE_BLOB_CONTAINER)/$(VERSION)/$(STORAGE_TARBALL_STEM).tar.gz"
+
 bench: $(LIBFABRIC_STAMP) ## Build the bench tool (excluded from images)
 	$(CARGO_FABRIC_ENV) $(CARGO) build --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --release --locked --bin bench
 	@mkdir -p $(dir $(UNBOUNDED_STORAGE_BIN))
@@ -537,7 +633,7 @@ bench: $(LIBFABRIC_STAMP) ## Build the bench tool (excluded from images)
 TLA_TOOLS_JAR ?= tmp/tla2tools.jar
 TLA_TOOLS_VERSION ?= v1.8.0
 TLA_TOOLS_URL ?= https://github.com/tlaplus/tlaplus/releases/download/$(TLA_TOOLS_VERSION)/tla2tools.jar
-TLA_TOOLS_SHA256 ?= 71546dff3897a01b0ee4fa64135d9f5e9384d2b7e47b3cc20a16b655b0eb4f86
+TLA_TOOLS_SHA256 ?= 237332bdcc79a35c7d26efa7b82c77c85c2744591c5598673a8a45085ff2a4fb
 
 # Root directory holding the TLA+ models.  Each subdirectory contains exactly
 # one <Name>.tla plus a matching <Name>.cfg and is model-checked by a per-model
@@ -840,6 +936,27 @@ else
 orca-inttest: ## Run orca integration tests (Garage + Azurite via testcontainers; requires Docker)
 	$(GOTEST) -tags=integrationtest -race -count=1 -timeout 15m ./internal/orca/inttest/...
 endif
+
+# storage-inttest runs the unbounded-storage -> orca -> Garage
+# integration test. It builds the libfabric-linked unbounded-storage
+# binary and an integrationtest+storageboundary test binary (compiled as
+# the current user so the Go caches stay user-owned), then runs that
+# binary under sudo: it needs CAP_SYS_RESOURCE to raise RLIMIT_MEMLOCK
+# for the storage children's io_uring pinned buffers. LD_LIBRARY_PATH is
+# re-injected past sudo's env scrubbing so the spawned binaries find the
+# pinned libfabric. The -test.run filter keeps it scoped to the storage
+# boundary test alone (the rest of the orca integration suite is compiled
+# into the binary but never executed). Requires Docker (Garage + Azurite
+# via testcontainers).
+.PHONY: storage-inttest
+STORAGE_INTTEST_BIN := $(CURDIR)/tmp/storage-inttest.test
+
+storage-inttest: libfabric unbounded-storage-build ## Run the unbounded-storage -> orca -> Garage integration test (Docker + sudo)
+	@mkdir -p $(CURDIR)/tmp
+	$(GOTEST) -tags=integrationtest,storageboundary -c -o $(STORAGE_INTTEST_BIN) ./internal/orca/inttest/
+	sudo -E env "PATH=$$PATH" "LD_LIBRARY_PATH=$(LIBFABRIC_PREFIX)/lib" \
+		$(STORAGE_INTTEST_BIN) -test.v -test.timeout 30m -test.run '^TestStorageBoundaryThroughOrca$$'
+
 
 image-net-controller-local: net-frontend resources/cni-plugins-linux-$(HOST_GOARCH)-$(CNI_PLUGINS_VERSION).tgz ## Build the unbounded-net-controller image locally (single-arch)
 	$(CONTAINER_ENGINE) build \

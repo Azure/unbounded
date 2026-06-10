@@ -1,23 +1,23 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! S3-compatible origin backend. [`S3Backend`] is the S3 sibling of
-//! [`HttpBackend`](super::HttpBackend): it fetches a stripe's byte range
-//! (or an object's length) from an S3-compatible origin over plaintext
-//! HTTP/1.1 and fills the destination bufferpool pages.
+//! Azure Blob Storage origin backend. [`AzureBackend`] is the Azure
+//! sibling of [`S3Backend`](super::S3Backend): it fetches a stripe's
+//! byte range (or an object's length) from an Azure Blob origin over
+//! plaintext HTTP/1.1 and fills the destination bufferpool pages.
 //!
-//! It mirrors the HTTP backend's fetch/length structure and shares its
+//! It mirrors the S3 backend's fetch/length structure and shares its
 //! cold-path simplicity (one TCP connection per fetch, one heap copy of
-//! the body into the registered backing). It diverges in two ways:
+//! the body into the registered backing). Like the S3 backend it carries
+//! the origin **hostname** for the `Host:` header (the TCP connect still
+//! dials the resolved IPv4 [`SockAddr`]) and maps a `404 Not Found` to
+//! [`Error::OriginNotFound`](crate::bufferpool::Error::OriginNotFound).
 //!
-//! - It carries the origin **hostname** (not just a resolved IPv4) so the
-//!   `Host:` header uses the real virtual-host name the bucket policy
-//!   expects, while the TCP connect still dials the resolved IPv4
-//!   [`SockAddr`].
-//! - A `404 Not Found` from the origin maps to
-//!   [`Error::OriginNotFound`](crate::bufferpool::Error::OriginNotFound)
-//!   rather than the generic non-2xx error, so the pool can distinguish a
-//!   missing object from a transport failure.
+//! It diverges from the S3 backend in one wire-level way: every GET/HEAD
+//! carries the [`AZURE_MS_VERSION`] `x-ms-version` header so the request
+//! is conformant with the Azure Blob REST API. v1 is anonymous: it
+//! targets public-read containers (or the Azurite emulator) and sends no
+//! authorization or shared-key signature.
 
 use std::future::Future;
 use std::os::fd::RawFd;
@@ -35,8 +35,14 @@ use super::Backend;
 use super::limiter::FetchLimiter;
 use super::origin_ring::OriginRing;
 
-/// Origin backend that fetches stripe byte ranges from an
-/// S3-compatible origin into bufferpool pages over plaintext HTTP/1.1.
+/// The pinned `x-ms-version` REST API version sent on every Azure Blob
+/// request. Azure requires this header to select the wire semantics of
+/// the operation; pinning it keeps the backend's behavior stable across
+/// service-side default changes.
+const AZURE_MS_VERSION: &str = "2021-08-06";
+
+/// Origin backend that fetches stripe byte ranges from an Azure Blob
+/// origin into bufferpool pages over plaintext HTTP/1.1.
 ///
 /// Shard-pinned: the [`OriginRing`] and the raw `backing_base` pointer
 /// are only ever touched on the owning shard thread that built this
@@ -44,12 +50,12 @@ use super::origin_ring::OriginRing;
 /// `fabric-rpc-worker` thread that uses an [`OriginRing::WorkerLocal`]
 /// ring private to that thread. See the `unsafe impl Send + Sync`
 /// below.
-pub struct S3Backend {
+pub struct AzureBackend {
     ring: OriginRing,
     origin: SockAddr,
     /// The origin hostname used for the `Host:` header. The TCP connect
-    /// uses `origin` (the resolved IPv4), but the bucket's virtual-host
-    /// name must travel in `Host:`.
+    /// uses `origin` (the resolved IPv4), but the storage account's
+    /// virtual-host name must travel in `Host:`.
     host: String,
     backend_id: String,
     stripe_size: u64,
@@ -58,7 +64,7 @@ pub struct S3Backend {
     limiter: FetchLimiter,
 }
 
-// SAFETY: mirrors `HttpBackend`'s justification. `S3Backend` is
+// SAFETY: mirrors `S3Backend`'s justification. `AzureBackend` is
 // shard-pinned: the embedder constructs it on, and only ever drives it
 // from, a single pinned shard thread. The `OriginRing`, any `Rc`/
 // `RefCell` it holds, and the raw `backing_base` pointer are never
@@ -66,10 +72,10 @@ pub struct S3Backend {
 // solely to satisfy the `Backend: Send + Sync` bound the embedder
 // requires when it stores the backend in a cross-shard registry; it is
 // not an invitation to touch the backend off its shard.
-unsafe impl Send for S3Backend {}
-unsafe impl Sync for S3Backend {}
+unsafe impl Send for AzureBackend {}
+unsafe impl Sync for AzureBackend {}
 
-impl S3Backend {
+impl AzureBackend {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         ring: OriginRing,
@@ -103,15 +109,15 @@ impl S3Backend {
     /// Delegates to [`HttpBackend::resolve_origin`](super::HttpBackend::resolve_origin),
     /// which takes the first IPv4 `ToSocketAddrs` yields and errors on
     /// IPv6-only origins (v1 dials IPv4 only). The hostname for the
-    /// `Host:` header is passed separately to [`S3Backend::new`].
+    /// `Host:` header is passed separately to [`AzureBackend::new`].
     pub fn resolve_origin(endpoint: &str) -> std::io::Result<SockAddr> {
         super::HttpBackend::resolve_origin(endpoint)
     }
 }
 
-impl S3Backend {
+impl AzureBackend {
     /// Owned-stream variant of [`Backend::bulk_get`]. Mirrors
-    /// [`super::HttpBackend::fetch_stream`]: the returned stream borrows
+    /// [`super::S3Backend::fetch_stream`]: the returned stream borrows
     /// nothing from `self`, so it is `'static` and can be handed out by
     /// a [`super::registry::BackendRegistry`] holding the backend behind
     /// an `Arc`/`ArcSwap`.
@@ -120,16 +126,16 @@ impl S3Backend {
         req: &StripeReq,
         src: BulkRef,
         dsts: &[PageRef],
-    ) -> S3FetchStream<'static> {
+    ) -> AzureFetchStream<'static> {
         let Some(origin) = req.origin() else {
-            return S3FetchStream::immediate_error("s3 backend: request missing origin");
+            return AzureFetchStream::immediate_error("azure backend: request missing origin");
         };
         let path = origin.origin_object_id.clone();
 
         let dsts_owned = dsts.to_vec();
         let handle = match self.ring.handle() {
             Ok(h) => h,
-            Err(e) => return S3FetchStream::immediate_err(io_to_err(e)),
+            Err(e) => return AzureFetchStream::immediate_err(io_to_err(e)),
         };
         let origin_addr = self.origin;
         let backing_base = self.backing_base;
@@ -141,59 +147,41 @@ impl S3Backend {
         // metadata. The sentinel `stripe_idx` would overflow
         // `absolute_range`, so this must branch before that is computed.
         if origin.is_metadata_entry() {
-            let mut log = crate::obs::ReqLog::new("backend.s3");
-            log.str_field("op", "HEAD")
-                .str_field("backend", self.backend_id())
-                .str_field("path", &path)
-                .field("pages", dsts_owned.len());
-            let fut = Box::pin(crate::obs::instrument(
-                log,
-                fetch_metadata(
-                    handle,
-                    origin_addr,
-                    host,
-                    path,
-                    dsts_owned.clone(),
-                    backing_base,
-                    page_size,
-                    self.limiter.clone(),
-                ),
+            let fut = Box::pin(fetch_metadata(
+                handle,
+                origin_addr,
+                host,
+                path,
+                dsts_owned.clone(),
+                backing_base,
+                page_size,
+                self.limiter.clone(),
             ));
-            return S3FetchStream::pending(fut, dsts_owned);
+            return AzureFetchStream::pending(fut, dsts_owned);
         }
 
         debug_assert!(!origin.is_metadata_entry());
         let (start, len) = absolute_range(origin.stripe_idx, self.stripe_size, src.offset, src.len);
 
-        let mut log = crate::obs::ReqLog::new("backend.s3");
-        log.str_field("op", "GET")
-            .str_field("backend", self.backend_id())
-            .str_field("path", &path)
-            .field("off", start)
-            .field("len", len)
-            .field("pages", dsts_owned.len());
-        let fut = Box::pin(crate::obs::instrument(
-            log,
-            fetch(
-                handle,
-                origin_addr,
-                host,
-                path,
-                start,
-                len,
-                dsts_owned.clone(),
-                backing_base,
-                page_size,
-                self.limiter.clone(),
-            ),
+        let fut = Box::pin(fetch(
+            handle,
+            origin_addr,
+            host,
+            path,
+            start,
+            len,
+            dsts_owned.clone(),
+            backing_base,
+            page_size,
+            self.limiter.clone(),
         ));
-        S3FetchStream::pending(fut, dsts_owned)
+        AzureFetchStream::pending(fut, dsts_owned)
     }
 }
 
-impl Backend for S3Backend {
+impl Backend for AzureBackend {
     type Req = StripeReq;
-    type Stream<'a> = S3FetchStream<'a>;
+    type Stream<'a> = AzureFetchStream<'a>;
 
     fn bulk_get<'a>(
         &'a self,
@@ -205,11 +193,11 @@ impl Backend for S3Backend {
     }
 }
 
-/// Stream produced by [`S3Backend::bulk_get`]. Drives one boxed fetch
+/// Stream produced by [`AzureBackend::bulk_get`]. Drives one boxed fetch
 /// future to completion, then yields each destination [`PageRef`] in
 /// order (one per `poll_next`) followed by `None`. On a fetch error it
 /// yields that error once then `None`.
-pub struct S3FetchStream<'a> {
+pub struct AzureFetchStream<'a> {
     state: FetchState<'a>,
     delivered: Vec<PageRef>,
     next: usize,
@@ -222,7 +210,7 @@ enum FetchState<'a> {
     Done,
 }
 
-impl<'a> S3FetchStream<'a> {
+impl<'a> AzureFetchStream<'a> {
     fn pending(
         fut: Pin<Box<dyn Future<Output = Result<(), Error>> + 'a>>,
         delivered: Vec<PageRef>,
@@ -251,7 +239,7 @@ impl<'a> S3FetchStream<'a> {
     }
 }
 
-impl PageStream for S3FetchStream<'_> {
+impl PageStream for AzureFetchStream<'_> {
     fn poll_next(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -307,14 +295,14 @@ async fn fetch(
     let total: u64 = dsts.iter().map(|p| p.len as u64).sum();
     if total != len {
         return Err(Error::from(
-            "s3 backend: destination page lengths do not match requested range",
+            "azure backend: destination page lengths do not match requested range",
         ));
     }
     if len == 0 {
         // Guards the inclusive `start + len - 1` Range bound below
         // against underflow. The Pool always requests a full page, so
         // this is defensive.
-        return Err(Error::from("s3 backend: zero-length fetch requested"));
+        return Err(Error::from("azure backend: zero-length fetch requested"));
     }
 
     // Bound concurrent origin dials to `http_concurrency`. The permit is
@@ -332,7 +320,7 @@ async fn fetch(
     let mut buf: Vec<u8> = Vec::new();
     let (status, header_end, content_length, content_range_start) = loop {
         if let Some(h) = ResponseHead::parse(&buf)
-            .map_err(|_| Error::from("s3 backend: malformed origin response head"))?
+            .map_err(|_| Error::from("azure backend: malformed origin response head"))?
         {
             break (
                 h.status,
@@ -344,7 +332,7 @@ async fn fetch(
         let chunk = recv_chunk(&handle, conn.fd).await?;
         if chunk.is_empty() {
             return Err(Error::from(
-                "s3 backend: connection closed before response headers complete",
+                "azure backend: connection closed before response headers complete",
             ));
         }
         buf.extend_from_slice(&chunk);
@@ -357,7 +345,7 @@ async fn fetch(
     if let Some(cr_start) = content_range_start {
         if cr_start != start {
             return Err(Error::from(
-                "s3 backend: origin Content-Range start does not match request",
+                "azure backend: origin Content-Range start does not match request",
             ));
         }
     }
@@ -385,7 +373,7 @@ async fn fetch(
         None => len as usize,
     };
     if body_cap > capacity {
-        return Err(Error::from("s3 backend: over read from origin"));
+        return Err(Error::from("azure backend: over read from origin"));
     }
 
     // recv_fixed targets the registered fixed backing at buf index 0,
@@ -426,7 +414,7 @@ async fn fetch(
             // EOF. With a known length this is a truncation; for the
             // close-delimited case it is the normal end of the body.
             match body_len_mode {
-                Some(_) => return Err(Error::from("s3 backend: short read from origin")),
+                Some(_) => return Err(Error::from("azure backend: short read from origin")),
                 None => break,
             }
         }
@@ -458,14 +446,14 @@ async fn fetch_metadata(
     let capacity: usize = dsts.iter().map(|p| p.len as usize).sum();
     if capacity < 8 {
         return Err(Error::from(
-            "s3 backend: length entry destination smaller than 8 bytes",
+            "azure backend: length entry destination smaller than 8 bytes",
         ));
     }
 
     // Bound concurrent origin dials to `http_concurrency` (see `fetch`).
     let _permit = limiter.acquire().await;
     let conn = TcpConn::open()?;
-    // See `S3Backend::fetch` for why driving the ring on the current
+    // See `AzureBackend::fetch` for why driving the ring on the current
     // thread is sound (the op futures self-pump on their own thread's
     // ring).
     handle.connect(conn.fd, origin).await.map_err(io_to_err)?;
@@ -477,19 +465,19 @@ async fn fetch_metadata(
     let mut buf: Vec<u8> = Vec::new();
     let (status, content_length) = loop {
         if let Some(h) = ResponseHead::parse(&buf)
-            .map_err(|_| Error::from("s3 backend: malformed origin response head"))?
+            .map_err(|_| Error::from("azure backend: malformed origin response head"))?
         {
             break (h.status, h.content_length());
         }
         if buf.len() >= MAX_HEAD {
             return Err(Error::from(
-                "s3 backend: metadata HEAD response head exceeds 64 KiB",
+                "azure backend: metadata HEAD response head exceeds 64 KiB",
             ));
         }
         let chunk = recv_chunk(&handle, conn.fd).await?;
         if chunk.is_empty() {
             return Err(Error::from(
-                "s3 backend: connection closed before metadata HEAD headers complete",
+                "azure backend: connection closed before metadata HEAD headers complete",
             ));
         }
         buf.extend_from_slice(&chunk);
@@ -500,11 +488,11 @@ async fn fetch_metadata(
     }
     if status != StatusCode::OK {
         return Err(Error::from(
-            "s3 backend: metadata HEAD returned non-200 status",
+            "azure backend: metadata HEAD returned non-200 status",
         ));
     }
     let length = content_length
-        .ok_or_else(|| Error::from("s3 backend: metadata HEAD missing Content-Length"))?;
+        .ok_or_else(|| Error::from("azure backend: metadata HEAD missing Content-Length"))?;
 
     let body = ObjectMetadata::new(length).encode()?;
     copy_body_into_pages(&body, &dsts, backing_base, page_size)?;
@@ -525,7 +513,7 @@ fn expected_body_len(
     let n = if status == StatusCode::PARTIAL_CONTENT {
         if cl > len {
             return Err(Error::from(
-                "s3 backend: origin Content-Length exceeds requested range",
+                "azure backend: origin Content-Length exceeds requested range",
             ));
         }
         cl
@@ -547,11 +535,11 @@ fn check_origin_status(status: StatusCode, start: u64) -> Result<(), Error> {
         return Err(Error::OriginNotFound);
     }
     if status != StatusCode::OK && status != StatusCode::PARTIAL_CONTENT {
-        return Err(Error::from("s3 backend: origin returned non-2xx status"));
+        return Err(Error::from("azure backend: origin returned non-2xx status"));
     }
     if status == StatusCode::OK && start != 0 {
         return Err(Error::from(
-            "s3 backend: origin ignored Range (200) for a non-zero offset",
+            "azure backend: origin ignored Range (200) for a non-zero offset",
         ));
     }
     Ok(())
@@ -569,7 +557,7 @@ fn copy_body_into_pages(
 ) -> Result<(), Error> {
     let capacity: usize = dsts.iter().map(|p| p.len as usize).sum();
     if body.len() > capacity {
-        return Err(Error::from("s3 backend: over read from origin"));
+        return Err(Error::from("azure backend: over read from origin"));
     }
     let mut consumed = 0usize;
     for page in dsts {
@@ -578,7 +566,7 @@ fn copy_body_into_pages(
         let page_offset = (page.page_idx as usize)
             .checked_mul(page_size)
             .and_then(|base| base.checked_add(page.offset as usize))
-            .ok_or_else(|| Error::from("s3 backend: page byte offset overflow"))?;
+            .ok_or_else(|| Error::from("azure backend: page byte offset overflow"))?;
         // SAFETY: the destination addresses a page inside the registered
         // backing the embedder keeps alive for the shard's lifetime; the
         // backend is shard-pinned so no other thread touches
@@ -612,7 +600,7 @@ fn page_byte_offset(page: &PageRef, page_size: usize) -> Result<usize, Error> {
     (page.page_idx as usize)
         .checked_mul(page_size)
         .and_then(|base| base.checked_add(page.offset as usize))
-        .ok_or_else(|| Error::from("s3 backend: page byte offset overflow"))
+        .ok_or_else(|| Error::from("azure backend: page byte offset overflow"))
 }
 
 /// Locate the destination page covering logical body offset `at` and
@@ -631,7 +619,7 @@ fn locate_in_pages(
             let within = at - page_start;
             let off = page_byte_offset(page, page_size)?
                 .checked_add(within)
-                .ok_or_else(|| Error::from("s3 backend: page byte offset overflow"))?;
+                .ok_or_else(|| Error::from("azure backend: page byte offset overflow"))?;
             return Ok(Some((off, n - within)));
         }
         page_start += n;
@@ -654,14 +642,14 @@ fn write_slice_into_pages(
 ) -> Result<(), Error> {
     let end = start
         .checked_add(src.len())
-        .ok_or_else(|| Error::from("s3 backend: page byte offset overflow"))?;
+        .ok_or_else(|| Error::from("azure backend: page byte offset overflow"))?;
     if end > pages_capacity(dsts) {
-        return Err(Error::from("s3 backend: over read from origin"));
+        return Err(Error::from("azure backend: over read from origin"));
     }
     let mut written = 0usize;
     while written < src.len() {
         let (off, room) = locate_in_pages(dsts, start + written, page_size)?
-            .ok_or_else(|| Error::from("s3 backend: over read from origin"))?;
+            .ok_or_else(|| Error::from("azure backend: over read from origin"))?;
         let n = room.min(src.len() - written);
         // SAFETY: `off` addresses a page inside the registered backing
         // the embedder keeps alive for the shard's lifetime; the backend
@@ -694,7 +682,7 @@ fn zero_fill_pages_from(
             let within = from.saturating_sub(page_start);
             let off = page_byte_offset(page, page_size)?
                 .checked_add(within)
-                .ok_or_else(|| Error::from("s3 backend: page byte offset overflow"))?;
+                .ok_or_else(|| Error::from("azure backend: page byte offset overflow"))?;
             // SAFETY: `off` addresses a page inside the registered
             // backing kept alive for the shard's lifetime; the backend is
             // shard-pinned. `n - within` bytes stay within this page
@@ -726,30 +714,34 @@ fn absolute_range(stripe_idx: u64, stripe_size: u64, src_offset: u64, src_len: u
     (start, src_len as u64)
 }
 
-/// Format a ranged HTTP/1.1 GET request against the S3 origin.
-/// `start`/`end` are inclusive byte offsets for the `Range` header.
+/// Format a ranged HTTP/1.1 GET request against the Azure Blob origin.
+/// `start`/`end` are inclusive byte offsets for the `Range` header. The
+/// `x-ms-version` header pins the Azure Blob REST API version.
 fn format_get_request(path: &str, host: &str, start: u64, end: u64) -> Result<Vec<u8>, Error> {
     let req = ::http::Request::builder()
         .method(Method::GET)
         .uri(path)
         .header(HOST, host)
         .header(RANGE, format!("bytes={start}-{end}"))
+        .header("x-ms-version", AZURE_MS_VERSION)
         .header(CONNECTION, "close")
         .body(())
-        .map_err(|_| Error::from("s3 backend: failed to build origin GET request"))?;
+        .map_err(|_| Error::from("azure backend: failed to build origin GET request"))?;
     Ok(serialize_request(&req))
 }
 
-/// Format an HTTP/1.1 HEAD request against the S3 origin, used by the
-/// length-entry fill path.
+/// Format an HTTP/1.1 HEAD request against the Azure Blob origin, used by
+/// the length-entry fill path. The `x-ms-version` header pins the Azure
+/// Blob REST API version.
 fn format_head_request(path: &str, host: &str) -> Result<Vec<u8>, Error> {
     let req = ::http::Request::builder()
         .method(Method::HEAD)
         .uri(path)
         .header(HOST, host)
+        .header("x-ms-version", AZURE_MS_VERSION)
         .header(CONNECTION, "close")
         .body(())
-        .map_err(|_| Error::from("s3 backend: failed to build origin HEAD request"))?;
+        .map_err(|_| Error::from("azure backend: failed to build origin HEAD request"))?;
     Ok(serialize_request(&req))
 }
 
@@ -824,25 +816,28 @@ mod tests {
 
     #[test]
     fn get_request_has_expected_headers() {
-        let req = format_get_request("/bucket/key", "s3.example.com", 0, 4095).unwrap();
+        let req = format_get_request("/container/key", "acct.blob.core.windows.net", 0, 4095)
+            .unwrap();
         let s = std::str::from_utf8(&req).unwrap();
-        assert!(s.starts_with("GET /bucket/key HTTP/1.1\r\n"), "got: {s}");
-        assert!(s.contains("host: s3.example.com\r\n"), "got: {s}");
+        assert!(s.starts_with("GET /container/key HTTP/1.1\r\n"), "got: {s}");
+        assert!(s.contains("host: acct.blob.core.windows.net\r\n"), "got: {s}");
         assert!(s.contains("range: bytes=0-4095\r\n"), "got: {s}");
+        assert!(s.contains("x-ms-version: 2021-08-06\r\n"), "got: {s}");
         assert!(s.contains("connection: close\r\n"), "got: {s}");
-        assert!(!s.contains("x-amz-date"), "got: {s}");
+        // v1 is anonymous: no shared-key signature or SAS authorization.
         assert!(!s.contains("authorization"), "got: {s}");
         assert!(s.ends_with("\r\n\r\n"), "got: {s}");
     }
 
     #[test]
-    fn head_request_omits_range() {
-        let req = format_head_request("/bucket/key", "s3.example.com").unwrap();
+    fn head_request_omits_range_keeps_version() {
+        let req = format_head_request("/container/key", "acct.blob.core.windows.net").unwrap();
         let s = std::str::from_utf8(&req).unwrap();
-        assert!(s.starts_with("HEAD /bucket/key HTTP/1.1\r\n"), "got: {s}");
-        assert!(s.contains("host: s3.example.com\r\n"), "got: {s}");
+        assert!(s.starts_with("HEAD /container/key HTTP/1.1\r\n"), "got: {s}");
+        assert!(s.contains("host: acct.blob.core.windows.net\r\n"), "got: {s}");
+        assert!(s.contains("x-ms-version: 2021-08-06\r\n"), "got: {s}");
         assert!(!s.contains("range:"), "got: {s}");
-        assert!(!s.contains("x-amz-date"), "got: {s}");
+        assert!(!s.contains("authorization"), "got: {s}");
         assert!(s.ends_with("\r\n\r\n"), "got: {s}");
     }
 
@@ -862,10 +857,10 @@ mod tests {
 
     #[test]
     fn resolve_origin_parses_ipv4() {
-        let addr = S3Backend::resolve_origin("127.0.0.1:9000").expect("resolves");
+        let addr = AzureBackend::resolve_origin("127.0.0.1:10000").expect("resolves");
         assert_eq!(
             addr.as_ipv4(),
-            Some((std::net::Ipv4Addr::new(127, 0, 0, 1), 9000))
+            Some((std::net::Ipv4Addr::new(127, 0, 0, 1), 10000))
         );
     }
 

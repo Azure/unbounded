@@ -8,6 +8,7 @@ on:
     paths:
       - cmd/unbounded-storage/**
       - hack/smoke-storage.py
+      - hack/scripts/install-unbounded-storage.sh
       - Makefile
       - .github/workflows/smoke-storage.yaml
   push:
@@ -15,6 +16,7 @@ on:
     paths:
       - cmd/unbounded-storage/**
       - hack/smoke-storage.py
+      - hack/scripts/install-unbounded-storage.sh
       - Makefile
       - .github/workflows/smoke-storage.yaml
   workflow_dispatch:
@@ -45,7 +47,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config ca-certificates curl
+            build-essential pkg-config ca-certificates curl liburing-dev
 
       # The distro libfabric (1.x) predates the merge of the experimental
       # `net` provider into `tcp`, so it lacks a native FI_EP_RDM `tcp`
@@ -56,7 +58,7 @@ jobs:
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: tmp/libfabric
-          key: libfabric-${{ env.LIBFABRIC_VERSION }}-${{ runner.os }}
+          key: libfabric-${{ env.LIBFABRIC_VERSION }}-${{ runner.os }}-${{ hashFiles('Makefile') }}
 
       - name: Build libfabric
         run: make libfabric LIBFABRIC_VERSION="$LIBFABRIC_VERSION"
@@ -83,14 +85,16 @@ jobs:
       - name: Build release binary
         run: make unbounded-storage-build LIBFABRIC_VERSION="$LIBFABRIC_VERSION"
 
-      - name: Run smoke test
-        # The two storage processes use io_uring with fixed (pinned)
-        # buffers, so the harness raises RLIMIT_MEMLOCK to infinity; that
-        # requires CAP_SYS_RESOURCE, hence sudo. `-E` preserves PATH and
-        # the cargo/rustup environment for the spawned binary lookup.
-        # sudo strips LD_* from the environment even with `-E`, so the
-        # libfabric runtime path is re-applied explicitly via `env`.
+      - name: Assemble release tarball
         run: |
-          libdir="$GITHUB_WORKSPACE/tmp/libfabric/$LIBFABRIC_VERSION/lib"
-          sudo -E env "PATH=$PATH" "LD_LIBRARY_PATH=$libdir" \
+          set -euo pipefail
+          arch="$(uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/')"
+          make unbounded-storage-tarball LIBFABRIC_VERSION="$LIBFABRIC_VERSION" STORAGE_DIST_DIR=dist
+          echo "SMOKE_STORAGE_TARBALL=$PWD/dist/unbounded-storage-linux-$arch.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Run smoke test
+        run: |
+          sudo -E env "PATH=$PATH" \
+            "SMOKE_STORAGE_SYSTEMD=1" \
+            "SMOKE_STORAGE_TARBALL=$SMOKE_STORAGE_TARBALL" \
             python3 hack/smoke-storage.py

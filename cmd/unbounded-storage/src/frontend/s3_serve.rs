@@ -33,7 +33,7 @@ use std::task::{Context, Poll, Waker};
 use ::http::header::{ACCEPT_RANGES, CONNECTION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE};
 use ::http::{Response, StatusCode};
 
-use crate::bufferpool::{BufferPool, Error};
+use crate::bufferpool::{BufferPool, Error, StripePlan};
 use crate::config::{FrontendKind, FrontendSpec};
 use crate::frontend::FrontendError;
 use crate::frontend::range::{ByteRange, RangeError, ResolvedRange, full_object, stripe_set};
@@ -260,7 +260,21 @@ async fn serve_connection_s3<P: BufferPool<Req = StripeReq>>(
     page_size: usize,
 ) {
     let _fd = FdGuard(conn_fd);
-    let _ = serve_request_s3(&pool, &handle, conn_fd, &backend_id, stripe_size, page_size).await;
+    let mut log = crate::obs::ReqLog::new("frontend.s3");
+    match serve_request_s3(
+        &pool,
+        &handle,
+        conn_fd,
+        &backend_id,
+        stripe_size,
+        page_size,
+        &mut log,
+    )
+    .await
+    {
+        Ok(()) => log.finish_ok(),
+        Err(()) => log.finish_err("connection error"),
+    }
 }
 
 /// The fallible S3 serve body. Returns `Err(())` on any I/O or pool
@@ -274,8 +288,10 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
     backend_id: &str,
     stripe_size: u64,
     page_size: usize,
+    log: &mut crate::obs::ReqLog,
 ) -> Result<(), ()> {
     let request_id = next_request_id();
+    log.str_field("req_id", &request_id);
 
     // 1. Read until the request head is complete (or the cap is hit).
     let mut buf: Vec<u8> = Vec::new();
@@ -297,6 +313,7 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
                 // answer with a GET-style XML 400 against the root.
                 let bytes = error_bytes(S3ErrorCode::InvalidRequest, "/", &request_id, false, None);
                 let _ = send_all(handle, conn_fd, bytes).await;
+                log.field("status", 400);
                 return Ok(());
             }
         }
@@ -306,6 +323,7 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
     // 2. Path is the request target with any query stripped; it is the
     // origin object id and the XML `<Resource>`.
     let path = split_query(req.target).0.to_string();
+    log.str_field("path", &path);
 
     // 3. Only GET and HEAD are served; anything else is 405. The method
     // here is neither GET nor HEAD on the error arm, so the body is
@@ -322,9 +340,11 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
                 None,
             );
             let _ = send_all(handle, conn_fd, bytes).await;
+            log.field("status", 405);
             return Ok(());
         }
     };
+    log.str_field("method", if is_head { "HEAD" } else { "GET" });
 
     // 4. Optional Range header. A malformed Range is a 400; an
     // unsatisfiable one is handled at resolve time as a 416.
@@ -340,6 +360,7 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
                     None,
                 );
                 let _ = send_all(handle, conn_fd, bytes).await;
+                log.field("status", 400);
                 return Ok(());
             }
         },
@@ -355,6 +376,7 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
         LenResult::NotFound => {
             let bytes = error_bytes(S3ErrorCode::NoSuchKey, &path, &request_id, is_head, None);
             let _ = send_all(handle, conn_fd, bytes).await;
+            log.field("status", 404);
             return Ok(());
         }
         LenResult::Other => {
@@ -366,6 +388,7 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
                 None,
             );
             let _ = send_all(handle, conn_fd, bytes).await;
+            log.field("status", 500);
             return Ok(());
         }
     };
@@ -387,6 +410,7 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
                     Some(object_len),
                 );
                 let _ = send_all(handle, conn_fd, bytes).await;
+                log.field("status", 416);
                 return Ok(());
             }
             Err(_) => {
@@ -398,6 +422,7 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
                     None,
                 );
                 let _ = send_all(handle, conn_fd, bytes).await;
+                log.field("status", 400);
                 return Ok(());
             }
         },
@@ -409,6 +434,8 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
     } else {
         full_head(len, &request_id)
     };
+    log.field("status", if range.is_some() { 206 } else { 200 })
+        .field("bytes", resolved.len());
     send_all(handle, conn_fd, head).await?;
 
     // 7b. HEAD carries no body: the head (with Content-Length /
@@ -417,57 +444,68 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
         return Ok(());
     }
 
-    // 8. Stream the body stripe-by-stripe out of the bufferpool.
+    // 8. Stream the body out of the bufferpool, pipelined across
+    // stripe boundaries.
     //
-    // Within each stripe we use the windowed read path so the pool
+    // The whole byte range is handed to the pool as one ordered list
+    // of per-stripe slices via the pipelined read path, so the pool
     // keeps many page fetches in flight ahead of the byte we are
-    // currently sending. The client send (`send_zc_fixed`) is
-    // strictly in order on the single TCP stream, but the fabric
-    // fetches of pages ahead of the cursor overlap with it, which is
-    // what lets a single large object saturate the RDMA fabric NIC.
-    // `usize::MAX` requests the full window: `read_windowed` clamps
-    // it to the pool's configured `max_inflight_pages` budget, so the
-    // prefetch depth is governed by that single knob.
-    for slice in stripe_set(resolved, stripe_size) {
-        let origin_ref = OriginRef {
-            backend_id: backend_id.to_string(),
-            origin_object_id: path.clone(),
-            stripe_idx: slice.stripe_idx,
-        };
-        let pool_req = StripeReq::new(origin_ref.stripe_key()).with_origin(origin_ref);
-        let mut rs = pool
-            .read_windowed(&pool_req, slice.intra_offset, slice.intra_len, usize::MAX)
-            .map_err(|_| ())?;
-        while let Some(page) = rs.next_page().await {
-            let page = page.map_err(|_| ())?;
-            let pr = page.page_ref();
-            let page_byte_offset = pr.page_idx as usize * page_size + pr.offset as usize;
-            let n = pr.len as usize;
-            // The PageGuard must stay alive until the SEND_ZC
-            // notification (when the kernel is done with the source
-            // page); awaiting here holds it across every partial send,
-            // then we drop it before the next `next_page` as the stream
-            // contract requires.
-            //
-            // SEND_ZC's CQE `res` is the count the kernel accepted,
-            // which can be short under socket-send-buffer pressure, so
-            // we loop advancing the byte offset until the whole page is
-            // on the wire. A zero count means the peer closed.
-            let mut sent_offset = page_byte_offset;
-            let mut remaining = n;
-            while remaining > 0 {
-                let sent = handle
-                    .send_zc_fixed(conn_fd, 0, sent_offset, remaining)
-                    .await
-                    .map_err(|_| ())?;
-                if sent == 0 {
-                    return Err(());
-                }
-                sent_offset += sent;
-                remaining -= sent;
+    // currently sending, spanning stripe boundaries. The client send
+    // (`send_zc_fixed`) is strictly in order on the single TCP stream,
+    // but the fabric/origin fetches of pages ahead of the cursor
+    // overlap with it, which is what lets a single large object
+    // saturate the RDMA fabric NIC and the origin download. Driving
+    // the slices through a single pipelined read (rather than draining
+    // each stripe's windowed read before the next) is what lets
+    // prefetch cross stripe boundaries instead of collapsing to one
+    // stripe's depth. `usize::MAX` requests the full window:
+    // `read_pipelined` clamps it to the pool's configured
+    // `max_inflight_pages` budget, so prefetch depth is governed by
+    // that single knob.
+    let plans: Vec<StripePlan<StripeReq>> = stripe_set(resolved, stripe_size)
+        .into_iter()
+        .map(|slice| {
+            let origin_ref = OriginRef {
+                backend_id: backend_id.to_string(),
+                origin_object_id: path.clone(),
+                stripe_idx: slice.stripe_idx,
+            };
+            StripePlan {
+                req: StripeReq::new(origin_ref.stripe_key()).with_origin(origin_ref),
+                intra_offset: slice.intra_offset,
+                intra_len: slice.intra_len,
             }
-            drop(page);
+        })
+        .collect();
+    let mut rs = pool.read_pipelined(plans, usize::MAX).map_err(|_| ())?;
+    while let Some(page) = rs.next_page().await {
+        let page = page.map_err(|_| ())?;
+        let pr = page.page_ref();
+        let page_byte_offset = pr.page_idx as usize * page_size + pr.offset as usize;
+        let n = pr.len as usize;
+        // The PageGuard must stay alive until the SEND_ZC notification
+        // (when the kernel is done with the source page); awaiting here
+        // holds it across every partial send, then we drop it before
+        // the next `next_page` as the stream contract requires.
+        //
+        // SEND_ZC's CQE `res` is the count the kernel accepted, which
+        // can be short under socket-send-buffer pressure, so we loop
+        // advancing the byte offset until the whole page is on the
+        // wire. A zero count means the peer closed.
+        let mut sent_offset = page_byte_offset;
+        let mut remaining = n;
+        while remaining > 0 {
+            let sent = handle
+                .send_zc_fixed(conn_fd, 0, sent_offset, remaining)
+                .await
+                .map_err(|_| ())?;
+            if sent == 0 {
+                return Err(());
+            }
+            sent_offset += sent;
+            remaining -= sent;
         }
+        drop(page);
     }
     Ok(())
 }
@@ -607,7 +645,7 @@ fn next_request_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bufferpool::{ReadStream, WindowedRead};
+    use crate::bufferpool::{PipelinedRead, ReadStream, WindowedRead};
     use crate::config::FrontendKind;
     use std::cell::RefCell;
 
@@ -754,6 +792,14 @@ mod tests {
             _len: u64,
             _window: usize,
         ) -> Result<WindowedRead<'p>, Error> {
+            Err(Error::from("mock pool has no data"))
+        }
+
+        fn read_pipelined<'p>(
+            &'p self,
+            _stripes: Vec<StripePlan<StripeReq>>,
+            _window: usize,
+        ) -> Result<PipelinedRead<'p>, Error> {
             Err(Error::from("mock pool has no data"))
         }
     }

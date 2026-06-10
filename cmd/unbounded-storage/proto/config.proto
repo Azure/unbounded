@@ -150,6 +150,7 @@ message BackendSpec {
 enum BackendKind {
   BACKEND_KIND_HTTP = 0;
   BACKEND_KIND_S3 = 1;
+  BACKEND_KIND_AZURE = 2;
 }
 
 message FrontendSpec {

@@ -699,7 +699,7 @@ jobs:
       - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends build-essential pkg-config ca-certificates curl
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config ca-certificates curl liburing-dev
 
       # The distro libfabric (1.x) predates the merge of the experimental
       # `net` provider into `tcp`, so it lacks a native FI_EP_RDM `tcp`
@@ -709,7 +709,7 @@ jobs:
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: tmp/libfabric
-          key: libfabric-${{ env.LIBFABRIC_VERSION }}-${{ matrix.arch }}-${{ runner.os }}
+          key: libfabric-${{ env.LIBFABRIC_VERSION }}-${{ matrix.arch }}-${{ runner.os }}-${{ hashFiles('Makefile') }}
 
       - name: Build libfabric
         run: make libfabric LIBFABRIC_VERSION="$LIBFABRIC_VERSION"
@@ -737,36 +737,10 @@ jobs:
       - name: Assemble tarball
         run: |
           set -euo pipefail
-          ARCH="${{ matrix.arch }}"
-          NAME="unbounded-storage-linux-${ARCH}"
-          STAGE="dist/${NAME}"
-
-          mkdir -p "${STAGE}/bin" "${STAGE}/lib"
-
-          cp bin/unbounded-storage "${STAGE}/bin/unbounded-storage"
-
-          libfound=0
-          for d in "tmp/libfabric/${LIBFABRIC_VERSION}/lib" "tmp/libfabric/${LIBFABRIC_VERSION}/lib64"; do
-            if [[ -d "$d" ]]; then
-              cp -a "$d"/libfabric.so* "${STAGE}/lib/" 2>/dev/null && libfound=1 || true
-            fi
-          done
-          if [[ "$libfound" -ne 1 ]]; then
-            echo "no libfabric runtime libraries were bundled" >&2
-            exit 1
-          fi
-
-          cat > "${STAGE}/run.sh" <<'EOF'
-          #!/usr/bin/env bash
-          set -euo pipefail
-          here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-          export LD_LIBRARY_PATH="${here}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-          exec "${here}/bin/unbounded-storage" "$@"
-          EOF
-          chmod +x "${STAGE}/run.sh"
-
-          tar -czf "dist/${NAME}.tar.gz" -C dist "${NAME}"
-          ( cd dist && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" )
+          make unbounded-storage-tarball \
+            STORAGE_TARBALL_ARCH="${{ matrix.arch }}" \
+            LIBFABRIC_VERSION="$LIBFABRIC_VERSION" \
+            STORAGE_DIST_DIR=dist
 
       # Match the supply-chain treatment of the other release artifacts: an
       # SPDX SBOM (as GoReleaser produces per archive) and a keyless cosign
