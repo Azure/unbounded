@@ -66,6 +66,12 @@ UNPING_CMD=./cmd/unping
 UNROUTE_BIN=bin/unroute
 UNROUTE_CMD=./cmd/unroute
 
+# Gantry (peer-to-peer OCI distribution)
+GANTRY_BIN=bin/gantry
+GANTRY_CMD=./cmd/gantry
+GANTRY_IMAGE ?= $(CONTAINER_REGISTRY)/gantry:$(VERSION)
+GANTRY_NAMESPACE ?= gantry
+
 # Rust binaries
 UNBOUNDED_STORAGE_BIN=bin/unbounded-storage
 UNBOUNDED_STORAGE_CRATE=./cmd/unbounded-storage
@@ -162,15 +168,15 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 # Frontend build toggle (dev builds produce unminified output with sourcemaps).
 REACT_DEV ?= false
 
-.PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check
+.PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check gantry gantry-build
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-manifests
-.PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-net-controller-local image-net-node-local images-local
+.PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
 .PHONY: unbounded-storage unbounded-storage-build unbounded-storage-smoke unbounded-storage-tarball unbounded-storage-push bench unbounded-storage-test unbounded-storage-check unbounded-storage-model-check libfabric
 
 ##@ General
 
-all: kubectl-unbounded forge machina machine-ops-controller unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute ## Build all binaries (default)
+all: kubectl-unbounded forge machina machine-ops-controller unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute gantry ## Build all binaries (default)
 
 help: ## Show this help
 	@echo ""
@@ -389,7 +395,19 @@ generate: install-protoc ## Run go generate for API types (deepcopy, CRDs) and p
 	PATH="$(PROTOC_DIR)/bin:$$PATH" $(GOCMD) generate ./...
 
 vulncheck: machina-manifests net-manifests ## Run govulncheck for known vulnerabilities
-	$(GOCMD) tool govulncheck ./...
+	@# GO-2024-3218 (libp2p/go-libp2p-kad-dht): all versions affected, no fix
+	@# available. Theoretical DHT content-censorship attack, not exploitable in
+	@# gantry's private-cluster deployment model. Tracked upstream at
+	@# https://github.com/advisories/GHSA-mqr9-hjr8-2m9w
+	@tmpf=$$(mktemp); \
+	$(GOCMD) tool govulncheck ./... > "$$tmpf" 2>&1; rc=$$?; \
+	cat "$$tmpf"; \
+	if [ $$rc -eq 0 ]; then rm -f "$$tmpf"; exit 0; fi; \
+	if grep -q 'affected by 1 vulnerability' "$$tmpf" && grep -q 'GO-2024-3218' "$$tmpf"; then \
+	  echo "vulncheck: only known-unfixable GO-2024-3218 found (accepted)"; \
+	  rm -f "$$tmpf"; exit 0; \
+	fi; \
+	rm -f "$$tmpf"; exit $$rc
 
 gomod: ## Tidy go.mod and go.sum
 	$(GOMOD) tidy
@@ -501,6 +519,13 @@ unroute-build: ## Build the unroute utility binary (no lint/test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(UNROUTE_BIN) $(UNROUTE_CMD)
 
 unroute: test unroute-build ## Build the unroute utility (implies test)
+
+##@ Gantry (peer-to-peer OCI distribution)
+
+gantry-build: ## Build the gantry binary (no lint/test)
+	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(GANTRY_BIN) $(GANTRY_CMD)
+
+gantry: test gantry-build ## Build gantry (implies test)
 
 ##@ Rust Binaries
 
@@ -843,6 +868,18 @@ metalman-oci: image-metalman-local ## Alias for image-metalman-local
 
 metalman-oci-push: metalman-oci ## Build and push the metalman container image
 	$(CONTAINER_ENGINE) push $(METALMAN_IMAGE)
+
+image-gantry-local: ## Build the gantry container image locally (single-arch)
+	$(CONTAINER_ENGINE) build \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
+		--build-arg BUILD_TIME=$(BUILD_TIME) \
+		-t gantry:$(VERSION) -t $(GANTRY_IMAGE) \
+		-f ./images/gantry/Containerfile .
+	$(call trivy-maybe,$(GANTRY_IMAGE))
+
+image-gantry-push: image-gantry-local ## Build and push the gantry container image
+	$(CONTAINER_ENGINE) push $(GANTRY_IMAGE)
 
 ##@ Orca
 

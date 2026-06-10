@@ -5,6 +5,7 @@ package cmd
 
 import (
 	"encoding/json"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -14,6 +15,11 @@ import (
 
 	"github.com/Azure/unbounded/internal/provision"
 )
+
+// testLogger returns a logger that silently drops all output.
+func testLogger() *slog.Logger {
+	return slog.New(slog.DiscardHandler)
+}
 
 func writeConfigFile(t *testing.T, cfg provision.UnboundedAgentConfig) string {
 	t.Helper()
@@ -58,7 +64,7 @@ func TestLoadConfig_FromFile(t *testing.T) {
 
 	t.Setenv(configFileEnv, path)
 
-	got, err := loadConfig()
+	got, err := loadConfig(testLogger())
 	require.NoError(t, err)
 
 	assert.Equal(t, "test-machine", got.MachineName)
@@ -79,7 +85,7 @@ func TestLoadConfig_BackfillsNodeName(t *testing.T) {
 
 	t.Setenv(configFileEnv, path)
 
-	got, err := loadConfig()
+	got, err := loadConfig(testLogger())
 	require.NoError(t, err)
 
 	assert.Equal(t, "configured-node", got.NodeName)
@@ -92,7 +98,7 @@ func TestLoadConfig_TrimsNodeIP(t *testing.T) {
 
 	t.Setenv(configFileEnv, path)
 
-	got, err := loadConfig()
+	got, err := loadConfig(testLogger())
 	require.NoError(t, err)
 
 	assert.Equal(t, "10.0.0.15", got.Kubelet.NodeIP)
@@ -105,7 +111,7 @@ func TestLoadConfig_FromFile_VersionWithoutPrefix(t *testing.T) {
 
 	t.Setenv(configFileEnv, path)
 
-	got, err := loadConfig()
+	got, err := loadConfig(testLogger())
 	require.NoError(t, err)
 	assert.Equal(t, "1.33.1", got.Cluster.Version)
 }
@@ -113,7 +119,7 @@ func TestLoadConfig_FromFile_VersionWithoutPrefix(t *testing.T) {
 func TestLoadConfig_FromFile_MissingFile(t *testing.T) {
 	t.Setenv(configFileEnv, "/tmp/does-not-exist-"+t.Name()+".json")
 
-	_, err := loadConfig()
+	_, err := loadConfig(testLogger())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "read agent config file")
 }
@@ -125,7 +131,7 @@ func TestLoadConfig_FromFile_InvalidJSON(t *testing.T) {
 
 	t.Setenv(configFileEnv, path)
 
-	_, err := loadConfig()
+	_, err := loadConfig(testLogger())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "decode agent config file")
 }
@@ -144,7 +150,7 @@ func TestLoadConfig_FromEnv(t *testing.T) {
 	t.Setenv("REGISTER_WITH_TAINTS", "dedicated=gpu:NoSchedule,workload=ml:PreferNoSchedule")
 	t.Setenv("AGENT_ATTEST_URL", "")
 
-	got, err := loadConfig()
+	got, err := loadConfig(testLogger())
 	require.NoError(t, err)
 
 	assert.Equal(t, "env-machine", got.MachineName)
@@ -170,27 +176,61 @@ func TestLoadConfig_FromEnv_NoLabels(t *testing.T) {
 	t.Setenv("NODE_LABELS", "")
 	t.Setenv("REGISTER_WITH_TAINTS", "")
 
-	got, err := loadConfig()
+	got, err := loadConfig(testLogger())
 	require.NoError(t, err)
 
 	assert.Empty(t, got.Kubelet.Labels)
 	assert.Empty(t, got.Kubelet.RegisterWithTaints)
 }
 
-func TestLoadConfig_FromEnv_MissingRequired(t *testing.T) {
+func TestLoadConfig_FromEnv_MachineNameOptional(t *testing.T) {
+	// MACHINA_MACHINE_NAME is optional: when unset, the machine name is
+	// resolved from AGENT_MACHINE_NAME (or the host hostname).
 	t.Setenv(configFileEnv, "")
 
-	// Set all required vars except MACHINA_MACHINE_NAME.
 	t.Setenv("KUBE_VERSION", "1.33.0")
 	t.Setenv("API_SERVER", "api.example.com:443")
 	t.Setenv("BOOTSTRAP_TOKEN", "tok.sec")
 	t.Setenv("CA_CERT_BASE64", "Y2E=")
 	t.Setenv("CLUSTER_DNS", "10.0.0.10")
 	t.Setenv("MACHINA_MACHINE_NAME", "")
+	t.Setenv("AGENT_MACHINE_NAME", "env-derived-machine")
 
-	_, err := loadConfig()
+	got, err := loadConfig(testLogger())
+	require.NoError(t, err)
+	assert.Equal(t, "env-derived-machine", got.MachineName)
+}
+
+func TestLoadConfig_FromEnv_StillRequiresOtherVars(t *testing.T) {
+	t.Setenv(configFileEnv, "")
+
+	// Set all required vars except KUBE_VERSION; MACHINA_MACHINE_NAME is now
+	// optional and must not be what causes the failure.
+	t.Setenv("MACHINA_MACHINE_NAME", "")
+	t.Setenv("AGENT_MACHINE_NAME", "env-derived-machine")
+	t.Setenv("KUBE_VERSION", "")
+	t.Setenv("API_SERVER", "api.example.com:443")
+	t.Setenv("BOOTSTRAP_TOKEN", "tok.sec")
+	t.Setenv("CA_CERT_BASE64", "Y2E=")
+	t.Setenv("CLUSTER_DNS", "10.0.0.10")
+
+	_, err := loadConfig(testLogger())
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "MACHINA_MACHINE_NAME")
+	assert.Contains(t, err.Error(), "KUBE_VERSION")
+}
+
+func TestLoadConfig_BackfillsMachineNameWhenMissing(t *testing.T) {
+	// A config file that omits MachineName must have it resolved at load time.
+	cfg := sampleConfig()
+	cfg.MachineName = ""
+	path := writeConfigFile(t, cfg)
+
+	t.Setenv(configFileEnv, path)
+	t.Setenv("AGENT_MACHINE_NAME", "file-derived-machine")
+
+	got, err := loadConfig(testLogger())
+	require.NoError(t, err)
+	assert.Equal(t, "file-derived-machine", got.MachineName)
 }
 
 func TestLoadConfig_FromEnv_InvalidLabels(t *testing.T) {
@@ -204,7 +244,7 @@ func TestLoadConfig_FromEnv_InvalidLabels(t *testing.T) {
 	t.Setenv("CLUSTER_DNS", "10.0.0.10")
 	t.Setenv("NODE_LABELS", "bad-label-no-equals")
 
-	_, err := loadConfig()
+	_, err := loadConfig(testLogger())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid NODE_LABELS entry")
 }
@@ -219,7 +259,7 @@ func TestLoadConfig_FilePreferredOverEnv(t *testing.T) {
 	t.Setenv("MACHINA_MACHINE_NAME", "env-machine-ignored")
 	t.Setenv("API_SERVER", "env-api-ignored")
 
-	got, err := loadConfig()
+	got, err := loadConfig(testLogger())
 	require.NoError(t, err)
 
 	assert.Equal(t, "test-machine", got.MachineName)
@@ -233,7 +273,7 @@ func TestLoadConfig_FromFile_NoTaints(t *testing.T) {
 
 	t.Setenv(configFileEnv, path)
 
-	got, err := loadConfig()
+	got, err := loadConfig(testLogger())
 	require.NoError(t, err)
 	assert.Empty(t, got.Kubelet.RegisterWithTaints)
 }
@@ -251,7 +291,7 @@ func TestLoadConfig_FromEnv_WithTaintsSingle(t *testing.T) {
 	t.Setenv("REGISTER_WITH_TAINTS", "dedicated=gpu:NoSchedule")
 	t.Setenv("AGENT_ATTEST_URL", "")
 
-	got, err := loadConfig()
+	got, err := loadConfig(testLogger())
 	require.NoError(t, err)
 
 	assert.Equal(t, []string{"dedicated=gpu:NoSchedule"}, got.Kubelet.RegisterWithTaints)
@@ -269,7 +309,7 @@ func TestLoadConfig_FromEnv_WithAttestURL(t *testing.T) {
 	// BOOTSTRAP_TOKEN is not set — attestation replaces it.
 	t.Setenv("BOOTSTRAP_TOKEN", "")
 
-	got, err := loadConfig()
+	got, err := loadConfig(testLogger())
 	require.NoError(t, err)
 
 	assert.Equal(t, "metal-node", got.MachineName)
@@ -290,7 +330,7 @@ func TestLoadConfig_FromEnv_NoTokenAndNoAttest(t *testing.T) {
 	t.Setenv("BOOTSTRAP_TOKEN", "")
 	t.Setenv("AGENT_ATTEST_URL", "")
 
-	_, err := loadConfig()
+	_, err := loadConfig(testLogger())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "BOOTSTRAP_TOKEN")
 }
@@ -316,7 +356,7 @@ func TestLoadConfig_FromFile_WithAttest(t *testing.T) {
 
 	t.Setenv(configFileEnv, path)
 
-	got, err := loadConfig()
+	got, err := loadConfig(testLogger())
 	require.NoError(t, err)
 
 	assert.Equal(t, "metal-node-file", got.MachineName)

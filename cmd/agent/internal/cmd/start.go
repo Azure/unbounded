@@ -36,7 +36,7 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 				"commit", version.GitCommit,
 			)
 
-			cfg, err := loadConfig()
+			cfg, err := loadConfig(cmdCtx.Logger)
 			if err != nil {
 				return err
 			}
