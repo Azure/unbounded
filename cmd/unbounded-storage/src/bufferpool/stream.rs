@@ -101,6 +101,29 @@ impl<'pool> ReadStream<'pool> {
     /// it before calling `next_page` again; this enforces the
     /// one-page-at-a-time contract at compile time.
     pub async fn next_page<'s>(&'s mut self) -> Option<Result<PageGuard<'s>, Error>> {
+        match self.next_page_parts().await? {
+            Ok((page_no, bytes, len, page_ref)) => {
+                // Clone the trait object for the guard. Coerce
+                // `'pool` to `'s` (covariant lifetime).
+                let src_for_guard: Rc<dyn StreamSrc + 's> = self.src.clone();
+                Some(Ok(PageGuard::new(src_for_guard, page_no, bytes, len, page_ref)))
+            }
+            Err(e) => Some(Err(e)),
+        }
+    }
+
+    /// Shared geometry + single-flight fetch for one page. Advances
+    /// the cursor and returns the raw page slice parts (the guard's
+    /// `Rc<dyn StreamSrc>` clone is layered on by the caller so the
+    /// guard's lifetime can be chosen per call site: borrowed `'s`
+    /// for [`ReadStream::next_page`] or `'static` for
+    /// [`ReadStream::next_page_owned`]). The returned `*const u8`
+    /// points into the pool's pinned backing and stays valid while
+    /// the slot is held (the caller's guard keeps `consumer_holds`
+    /// nonzero).
+    async fn next_page_parts(
+        &mut self,
+    ) -> Option<Result<(u64, *const u8, u32, PageRef), Error>> {
         if self.cursor >= self.end {
             return None;
         }
@@ -131,13 +154,8 @@ impl<'pool> ReadStream<'pool> {
             len: intra_len,
         };
 
-        // Clone the trait object for the guard. Coerce '`pool` to
-        // `'s` (covariant lifetime).
-        let src_for_guard: Rc<dyn StreamSrc + 's> = self.src.clone();
-        let guard = PageGuard::new(src_for_guard, page_no, bytes, intra_len, page_ref);
-
         self.cursor += intra_len as u64;
-        Some(Ok(guard))
+        Some(Ok((page_no, bytes, intra_len, page_ref)))
     }
 
     /// Test-only: returns the current cursor.
@@ -145,6 +163,33 @@ impl<'pool> ReadStream<'pool> {
     #[allow(dead_code)]
     pub(crate) fn cursor(&self) -> u64 {
         self.cursor
+    }
+}
+
+impl ReadStream<'static> {
+    /// Owned counterpart to [`ReadStream::next_page`]: yields a
+    /// `PageGuard<'static>` that does NOT borrow the stream, so the
+    /// caller may hold several pages of the same stripe at once and
+    /// may drop the `ReadStream` while guards are still live. This
+    /// is the cross-shard fan-out path: the stripe's owner shard
+    /// pins every page it fetches in a map keyed by a pin token and
+    /// keeps them pinned until the coordinator's SEND_ZC completes.
+    ///
+    /// Soundness of holding guards past the stream's own drop: the
+    /// guard keeps its slot's `consumer_holds` nonzero, so
+    /// `decrement_stream` (run when this `ReadStream` drops) sees the
+    /// slot as non-recyclable and retains its pinned page; the page
+    /// is only returned to the free list when the last guard drops.
+    /// Holding multiple guards is sound because distinct `page_no`s
+    /// map to distinct `PageSlot`s, each with its own hold count.
+    pub async fn next_page_owned(&mut self) -> Option<Result<PageGuard<'static>, Error>> {
+        match self.next_page_parts().await? {
+            Ok((page_no, bytes, len, page_ref)) => {
+                let src_for_guard: Rc<dyn StreamSrc + 'static> = self.src.clone();
+                Some(Ok(PageGuard::new(src_for_guard, page_no, bytes, len, page_ref)))
+            }
+            Err(e) => Some(Err(e)),
+        }
     }
 }
 

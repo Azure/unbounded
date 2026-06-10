@@ -104,7 +104,7 @@ fn heap_backing(page_size: usize, page_count: usize) -> Backing {
         base: owner.ptr,
         page_size,
         page_count,
-        _own: Box::new(owner),
+        keepalive: std::sync::Arc::new(owner),
     }
 }
 
@@ -785,7 +785,7 @@ fn rejects_bad_backing() {
         base: 0x1000 as *mut u8,
         page_size: 0,
         page_count: 1,
-        _own: Box::new(()),
+        keepalive: std::sync::Arc::new(()),
     };
     let t = TransportRc(Rc::new(MockTransport::new(
         backing.base,

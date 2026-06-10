@@ -870,7 +870,7 @@ mod tests {
             base,
             page_size,
             page_count,
-            _own: Box::new(()),
+            keepalive: std::sync::Arc::new(()),
         }
     }
     use std::future::Future;

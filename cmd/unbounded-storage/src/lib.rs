@@ -5,6 +5,7 @@ pub mod backend;
 pub mod bufferpool;
 pub mod config;
 pub mod fabric;
+pub mod fanout;
 pub mod frontend;
 pub mod http;
 pub mod io;

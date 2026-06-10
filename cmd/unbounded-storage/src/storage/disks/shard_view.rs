@@ -392,7 +392,7 @@ mod tests {
             base,
             page_size: 4096,
             page_count: pages,
-            _own: Box::new(()),
+            keepalive: std::sync::Arc::new(()),
         };
         (buf, backing)
     }

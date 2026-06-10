@@ -78,6 +78,14 @@ pub struct ShardLayer {
     /// without tripping the process-wide [`crate::SHUTDOWN`]. Each shard
     /// ORs it into its run-loop predicate.
     layer_stop: Arc<AtomicBool>,
+    /// Shared Drop carriers for every shard's backing allocation. Held
+    /// here so each mapping outlives all shard threads: a coordinator
+    /// shard's io_uring ring registers peer backings as `SEND_ZC`
+    /// sources, and those rings are only provably gone once every shard
+    /// thread has joined. Dropped last in [`teardown_shard_layer`],
+    /// strictly after all joins, so no ring ever references unmapped
+    /// memory.
+    _backing_keepalives: Vec<Arc<dyn Send + Sync>>,
 }
 
 /// Bring up a shard layer from `config` on the runtime in `deps`,
@@ -112,13 +120,26 @@ pub fn spawn_shard_layer(
     let (fingers, node_to_peer) = crate::build_routing(config);
 
     let (ready_tx, ready_rx) = mpsc::channel::<crate::ShardReady>();
+    // Phase-B rendezvous: each shard reports here once it has registered
+    // every peer's backing and built its fan-out surface. Kept separate
+    // from `ready_tx` so the layer can wait for the second rendezvous
+    // (peer registration) after broadcasting the full peer set.
+    let (phaseb_tx, phaseb_rx) = mpsc::channel::<crate::PhaseBReport>();
     let mut joins = Vec::with_capacity(worker_count);
     let mut control_senders = Vec::with_capacity(worker_count);
+    // Per-shard senders for broadcasting the assembled peer set in phase
+    // B. Dropping these unblocks any shard parked on `peer_rx.recv()`
+    // when bring-up fails before the broadcast.
+    let mut peer_txs: Vec<mpsc::Sender<Arc<Vec<crate::PeerPublish>>>> =
+        Vec::with_capacity(worker_count);
 
     for (i, (worker, dev_name)) in deps.workers.iter().enumerate() {
         let widx = WorkerIdx(u16::try_from(i).expect("worker index fits in u16"));
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<config::ShardCommand>();
         control_senders.push((widx, ctrl_tx));
+        let (peer_tx, peer_rx) = mpsc::channel::<Arc<Vec<crate::PeerPublish>>>();
+        peer_txs.push(peer_tx);
+        let phaseb_tx = phaseb_tx.clone();
 
         let worker = worker.clone();
         let dev_name = dev_name.clone();
@@ -155,6 +176,8 @@ pub fn spawn_shard_layer(
                         frontend_specs,
                         backend_specs,
                         ctrl_rx,
+                        peer_rx,
+                        phaseb_tx,
                         layer_stop,
                     );
                 });
@@ -163,6 +186,10 @@ pub fn spawn_shard_layer(
         joins.push(handle);
     }
     drop(ready_tx);
+    // The layer keeps no phase-B sender of its own: collection below is
+    // bounded by the number of shards that came up, and each live shard
+    // holds its sender, so this never closes the channel prematurely.
+    drop(phaseb_tx);
 
     // Bounded readiness collection: read exactly one message per spawned
     // thread. Shards that come up park holding their sender, so they
@@ -170,11 +197,17 @@ pub fn spawn_shard_layer(
     // failure surfaces here.
     let mut descriptors = Vec::new();
     let mut shard_fabrics = Vec::new();
+    let mut publishes = Vec::new();
     let mut errors = Vec::new();
     for _ in 0..joins.len() {
         match ready_rx.recv() {
-            Ok(crate::ShardReady::Up { descriptor, fabric }) => {
+            Ok(crate::ShardReady::Up {
+                descriptor,
+                fabric,
+                publish,
+            }) => {
                 shard_fabrics.push((descriptor.worker_idx, fabric));
+                publishes.push((descriptor.worker_idx, publish));
                 descriptors.push(descriptor);
             }
             Ok(crate::ShardReady::Failed(err)) => {
@@ -190,11 +223,74 @@ pub fn spawn_shard_layer(
     if !errors.is_empty() {
         // Retire any shards that did come up so a partially-built layer
         // never leaks threads, then surface the failures to the caller.
+        // Dropping the peer senders unblocks any up-shard parked on
+        // `peer_rx.recv()` so it can exit and be joined.
+        drop(peer_txs);
         layer_stop.store(true, Ordering::Relaxed);
         for h in joins.into_iter().rev() {
             let _ = h.join();
         }
         return Err(errors);
+    }
+
+    // Assemble the broadcast peer set: sort the up-shards by worker index
+    // so `shard_index` (the position here) matches the `PoolGroup`
+    // ordering and `stripe_key_to_shard`, then hand every shard the full
+    // list. Each shard locates its own entry by worker index, registers
+    // the others' backings, and reports phase-B readiness below.
+    publishes.sort_by_key(|(widx, _)| widx.0);
+    // Retain every shard's backing Drop carrier for the layer's whole
+    // life. Split out here as the `ShardPublish` values are consumed
+    // into the broadcast `PeerPublish` set (which deliberately carries
+    // only base/len, not ownership).
+    let mut backing_keepalives: Vec<Arc<dyn Send + Sync>> = Vec::with_capacity(publishes.len());
+    let peer_list: Arc<Vec<crate::PeerPublish>> = Arc::new(
+        publishes
+            .into_iter()
+            .enumerate()
+            .map(|(shard_index, (worker_idx, publish))| {
+                backing_keepalives.push(publish.backing_keepalive);
+                crate::PeerPublish {
+                    shard_index,
+                    worker_idx,
+                    backing_base: publish.backing_base,
+                    backing_len: publish.backing_len,
+                    channel: publish.fetch_channel,
+                }
+            })
+            .collect(),
+    );
+    let up_count = peer_list.len();
+    for tx in &peer_txs {
+        // A send error means that shard died after phase A; it will be
+        // surfaced as a missing/closed phase-B report below.
+        let _ = tx.send(peer_list.clone());
+    }
+
+    // Phase-B collection: every up-shard reports exactly once (the
+    // `PhaseBGuard` guarantees this even on early return or panic), so
+    // this is bounded by `up_count`.
+    let mut phaseb_errors = Vec::new();
+    for _ in 0..up_count {
+        match phaseb_rx.recv() {
+            Ok(crate::PhaseBReport::Ready(_)) => {}
+            Ok(crate::PhaseBReport::Failed(err)) => {
+                eprintln!("shard phase-B failed: {err}");
+                phaseb_errors.push(err);
+            }
+            Err(_) => {
+                phaseb_errors
+                    .push("shard thread exited without reporting phase-B readiness".to_string());
+                break;
+            }
+        }
+    }
+    if !phaseb_errors.is_empty() {
+        layer_stop.store(true, Ordering::Relaxed);
+        for h in joins.into_iter().rev() {
+            let _ = h.join();
+        }
+        return Err(phaseb_errors);
     }
 
     let mut shard_state = Vec::with_capacity(shard_fabrics.len());
@@ -236,6 +332,7 @@ pub fn spawn_shard_layer(
         control: ShardControlGroup::new(control_senders),
         _pool_group: pool_group,
         layer_stop,
+        _backing_keepalives: backing_keepalives,
     })
 }
 
@@ -248,6 +345,7 @@ pub fn teardown_shard_layer(layer: ShardLayer) {
         control,
         _pool_group,
         layer_stop,
+        _backing_keepalives,
     } = layer;
     layer_stop.store(true, Ordering::Relaxed);
     for h in joins.into_iter().rev() {
@@ -260,6 +358,11 @@ pub fn teardown_shard_layer(layer: ShardLayer) {
     drop(control);
     drop(shard_state);
     drop(_pool_group);
+    // Free every shard's backing only now: all shard threads (and thus
+    // every io_uring ring that may still reference a peer's pages as a
+    // `SEND_ZC` source) have joined above, so no mapping is unmapped
+    // out from under a live ring.
+    drop(_backing_keepalives);
 }
 
 /// The binary's [`ConfigApplyTarget`]: owns the live shard layer and

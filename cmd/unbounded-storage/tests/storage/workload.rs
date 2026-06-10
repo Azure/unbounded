@@ -423,7 +423,7 @@ async fn open_local(
             base: pool_base,
             page_size,
             page_count: pool_pages,
-            _own: Box::new(()),
+            keepalive: std::sync::Arc::new(()),
         })
         .map_err(|e| format!("register: {e}"))?;
     Ok(Rc::new(local))

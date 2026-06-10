@@ -29,7 +29,8 @@
 //! Linux-gated because serving depends on the io_uring
 //! [`NetHandle`](crate::ring::NetHandle).
 
-use std::future::Future;
+use std::collections::VecDeque;
+use std::future::{Future, poll_fn};
 use std::net::SocketAddr;
 use std::os::fd::RawFd;
 use std::pin::Pin;
@@ -39,10 +40,13 @@ use std::task::{Context, Poll, Waker};
 use ::http::header::{ACCEPT_RANGES, CONNECTION, CONTENT_LENGTH, CONTENT_RANGE};
 use ::http::{Response, StatusCode};
 
-use crate::bufferpool::{BufferPool, ReadStream, StripePlan};
+use crate::bufferpool::{BufferPool, ReadStream, StripeKey, StripePlan};
 use crate::config::{FrontendKind, FrontendSpec};
+use crate::fanout::{FanoutTable, FetchChannel, FetchReply, Owner};
 use crate::frontend::FrontendError;
-use crate::frontend::range::{ByteRange, RangeError, ResolvedRange, full_object, stripe_set};
+use crate::frontend::range::{
+    ByteRange, RangeError, ResolvedRange, StripeSlice, full_object, stripe_set,
+};
 use crate::http::{
     FdGuard, HttpRequest, MAX_HEADER_BYTES, Method, ParseError, RECV_CHUNK, bind_listener,
     send_all, serialize_response_head, split_query,
@@ -127,6 +131,7 @@ pub struct HttpDriver<P: BufferPool<Req = StripeReq> + 'static> {
     backend_id: String,
     stripe_size: u64,
     page_size: usize,
+    fanout: Rc<FanoutTable>,
     accept_fut: Pin<Box<dyn Future<Output = std::io::Result<RawFd>>>>,
     conns: Vec<Pin<Box<dyn Future<Output = ()>>>>,
     waker: Waker,
@@ -136,7 +141,9 @@ impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
     /// Build a serving engine over a bound `listen_fd`.
     ///
     /// `stripe_size` and `page_size` come from the shard's pool
-    /// geometry.
+    /// geometry. `fanout` is this shard's view of the stripe-ownership
+    /// ring; for single-shard deployments it routes every stripe to the
+    /// local pool.
     pub fn new(
         pool: Rc<P>,
         handle: NetHandle,
@@ -144,6 +151,7 @@ impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
         backend_id: String,
         stripe_size: u64,
         page_size: usize,
+        fanout: Rc<FanoutTable>,
     ) -> Self {
         let accept_fut = Box::pin(handle.accept(listen_fd));
         Self {
@@ -153,6 +161,7 @@ impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
             backend_id,
             stripe_size,
             page_size,
+            fanout,
             accept_fut,
             conns: Vec::new(),
             waker: noop_waker(),
@@ -195,6 +204,7 @@ impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
                             self.backend_id.clone(),
                             self.stripe_size,
                             self.page_size,
+                            Rc::clone(&self.fanout),
                         );
                         self.conns.push(Box::pin(serve));
                     }
@@ -249,6 +259,7 @@ async fn serve_connection<P: BufferPool<Req = StripeReq>>(
     backend_id: String,
     stripe_size: u64,
     page_size: usize,
+    fanout: Rc<FanoutTable>,
 ) {
     let _fd = FdGuard(conn_fd);
     let mut log = crate::obs::ReqLog::new("frontend.http");
@@ -259,6 +270,7 @@ async fn serve_connection<P: BufferPool<Req = StripeReq>>(
         &backend_id,
         stripe_size,
         page_size,
+        &fanout,
         &mut log,
     )
     .await
@@ -278,6 +290,7 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
     backend_id: &str,
     stripe_size: u64,
     page_size: usize,
+    fanout: &Rc<FanoutTable>,
     log: &mut crate::obs::ReqLog,
 ) -> Result<(), ()> {
     // 1. Read until the request head is complete (or the cap is hit).
@@ -376,68 +389,292 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
         return Ok(());
     }
 
-    // 8. Stream the body out of the bufferpool, pipelined across
-    // stripe boundaries.
-    //
-    // The whole byte range is handed to the pool as one ordered list
-    // of per-stripe slices via the pipelined read path, so the pool
-    // keeps many page fetches in flight ahead of the byte we are
-    // currently sending, spanning stripe boundaries. The client send
-    // (`send_zc_fixed`) is strictly in order on the single TCP stream,
-    // but the fabric/origin fetches of pages ahead of the cursor
-    // overlap with it, which is what lets a single large object
-    // saturate the RDMA fabric NIC and the origin download. Driving
-    // the slices through a single pipelined read (rather than draining
-    // each stripe's windowed read before the next) is what lets
-    // prefetch cross stripe boundaries instead of collapsing to one
-    // stripe's depth. `usize::MAX` requests the full window:
-    // `read_pipelined` clamps it to the pool's configured
-    // `max_inflight_pages` budget, so prefetch depth is governed by
-    // that single knob.
-    let plans: Vec<StripePlan<StripeReq>> = stripe_set(resolved, stripe_size)
-        .into_iter()
-        .map(|slice| {
-            let origin_ref = OriginRef {
-                backend_id: backend_id.to_string(),
-                origin_object_id: path.clone(),
-                stripe_idx: slice.stripe_idx,
-            };
-            StripePlan {
-                req: StripeReq::new(origin_ref.stripe_key()).with_origin(origin_ref),
-                intra_offset: slice.intra_offset,
-                intra_len: slice.intra_len,
-            }
-        })
-        .collect();
-    let mut rs = pool.read_pipelined(plans, usize::MAX).map_err(|_| ())?;
-    while let Some(page) = rs.next_page().await {
-        let page = page.map_err(|_| ())?;
-        let pr = page.page_ref();
-        let page_byte_offset = pr.page_idx as usize * page_size + pr.offset as usize;
-        let n = pr.len as usize;
-        // The PageGuard must stay alive until the SEND_ZC notification
-        // (when the kernel is done with the source page); awaiting here
-        // holds it across every partial send, then we drop it before
-        // the next `next_page` as the stream contract requires.
-        //
-        // SEND_ZC's CQE `res` is the count the kernel accepted, which
-        // can be short under socket-send-buffer pressure, so we loop
-        // advancing the byte offset until the whole page is on the
-        // wire. A zero count means the peer closed.
-        let mut sent_offset = page_byte_offset;
-        let mut remaining = n;
-        while remaining > 0 {
-            let sent = handle
-                .send_zc_fixed(conn_fd, 0, sent_offset, remaining)
-                .await
-                .map_err(|_| ())?;
-            if sent == 0 {
-                return Err(());
-            }
-            sent_offset += sent;
-            remaining -= sent;
+    // 8. Stream the body, fanning each stripe out to its content-address
+    // owner shard (or the local pool when this shard owns it).
+    stream_body(
+        pool,
+        handle,
+        fanout,
+        conn_fd,
+        backend_id,
+        &path,
+        page_size,
+        resolved,
+        stripe_size,
+    )
+    .await
+}
+
+/// Type-erased cross-shard fetch future. Holds the channel round-trip to
+/// a peer shard's [`FetchService`](crate::fanout::FetchService) and
+/// resolves to the owner-side page locations (or a pool error).
+type FetchFut = Pin<Box<dyn Future<Output = Result<FetchReply, crate::bufferpool::Error>>>>;
+
+/// One stripe's place in the in-order send window. The window is drained
+/// strictly front-to-back so bytes go onto the single TCP stream in
+/// object order, while later stripes' fetches overlap with the head's
+/// send.
+enum Ticket {
+    /// This shard owns the stripe; stream it from the local pool at the
+    /// head of the window (deferred so local NVMe reads do not block the
+    /// remote kicks behind them).
+    Local { slice: StripeSlice },
+    /// A peer shard owns the stripe. `fut` is already kicked (its fetch
+    /// command is in flight to the owner); `buf_index` is the owner's
+    /// registered backing region and `channel` releases the owner's pin
+    /// once the bytes are on the wire. `slice` is retained so a
+    /// transient [`Error::Busy`](crate::bufferpool::Error::Busy) reply
+    /// (the owner pool was momentarily out of free pages) can be
+    /// re-dispatched without losing the stripe's place in object order.
+    Remote {
+        fut: FetchFut,
+        buf_index: u16,
+        channel: FetchChannel,
+        slice: StripeSlice,
+    },
+}
+
+/// Build the content-addressed key and pool request for one stripe slice.
+fn stripe_request(backend_id: &str, path: &str, slice: StripeSlice) -> (StripeKey, StripeReq) {
+    let origin_ref = OriginRef {
+        backend_id: backend_id.to_string(),
+        origin_object_id: path.to_string(),
+        stripe_idx: slice.stripe_idx,
+    };
+    let key = origin_ref.stripe_key();
+    let req = StripeReq::new(key).with_origin(origin_ref);
+    (key, req)
+}
+
+/// Cooperatively yield once, returning control to the shard loop so
+/// other futures (and other shards' progress) can advance before this
+/// one is re-polled. Used to space out retries of a transiently busy
+/// remote fetch instead of hot-spinning.
+async fn yield_now() {
+    let mut yielded = false;
+    poll_fn(|cx| {
+        if yielded {
+            Poll::Ready(())
+        } else {
+            yielded = true;
+            // Wake so executors that only re-poll woken tasks (the DST
+            // scheduler) reschedule us; the production shard loop
+            // re-polls every tick regardless.
+            cx.waker().wake_by_ref();
+            Poll::Pending
         }
-        drop(page);
+    })
+    .await;
+}
+
+/// Send `len` bytes from registered fixed buffer `buf_index` starting at
+/// `offset`, looping over short `SEND_ZC` completions. `Err(())` on a
+/// zero-length completion (peer closed) or ring error.
+async fn send_region(
+    handle: &NetHandle,
+    conn_fd: RawFd,
+    buf_index: u16,
+    offset: usize,
+    len: usize,
+) -> Result<(), ()> {
+    let mut sent_offset = offset;
+    let mut remaining = len;
+    while remaining > 0 {
+        let sent = handle
+            .send_zc_fixed(conn_fd, buf_index, sent_offset, remaining)
+            .await
+            .map_err(|_| ())?;
+        if sent == 0 {
+            return Err(());
+        }
+        sent_offset += sent;
+        remaining -= sent;
+    }
+    Ok(())
+}
+
+/// Route one stripe to its owner and, for remote owners, kick the fetch
+/// so its command reaches the owner shard before we start sending the
+/// stripes ahead of it. A single poll is enough: `FetchChannel::fetch`
+/// enqueues the command on its first poll, and the shard loop re-polls
+/// this serve future every tick thereafter, so the owner progresses
+/// concurrently on its own core.
+async fn dispatch_ticket(
+    fanout: &Rc<FanoutTable>,
+    backend_id: &str,
+    path: &str,
+    slice: StripeSlice,
+) -> Ticket {
+    let (key, req) = stripe_request(backend_id, path, slice);
+    match fanout.owner_of(&key) {
+        Owner::Local => Ticket::Local { slice },
+        Owner::Peer(peer) => {
+            let buf_index = peer.buf_index;
+            let channel = peer.channel.clone();
+            let fetch_channel = channel.clone();
+            let intra_offset = slice.intra_offset;
+            let intra_len = slice.intra_len;
+            let mut fut: FetchFut =
+                Box::pin(async move { fetch_channel.fetch(req, intra_offset, intra_len).await });
+            poll_fn(|cx| {
+                let _ = fut.as_mut().poll(cx);
+                Poll::Ready(())
+            })
+            .await;
+            Ticket::Remote {
+                fut,
+                buf_index,
+                channel,
+                slice,
+            }
+        }
+    }
+}
+
+/// Stream the resolved byte range to the client, in object order, with
+/// per-stripe ownership fan-out.
+///
+/// Single-shard deployments keep the original behavior: one pipelined
+/// local read across every stripe so the pool prefetches across stripe
+/// boundaries. Multi-shard deployments dispatch a bounded window of
+/// stripes ahead of the send cursor; remote stripes are kicked to their
+/// owner shards (which fetch and pin pages on their own cores) while the
+/// head stripe is being sent, so a single TCP connection drives all
+/// shards' NICs.
+#[allow(clippy::too_many_arguments)]
+async fn stream_body<P: BufferPool<Req = StripeReq>>(
+    pool: &Rc<P>,
+    handle: &NetHandle,
+    fanout: &Rc<FanoutTable>,
+    conn_fd: RawFd,
+    backend_id: &str,
+    path: &str,
+    page_size: usize,
+    resolved: ResolvedRange,
+    stripe_size: u64,
+) -> Result<(), ()> {
+    let slices = stripe_set(resolved, stripe_size);
+
+    if fanout.shard_count() <= 1 {
+        let plans: Vec<StripePlan<StripeReq>> = slices
+            .into_iter()
+            .map(|slice| {
+                let (_key, req) = stripe_request(backend_id, path, slice);
+                StripePlan {
+                    req,
+                    intra_offset: slice.intra_offset,
+                    intra_len: slice.intra_len,
+                }
+            })
+            .collect();
+        let mut rs = pool.read_pipelined(plans, usize::MAX).map_err(|_| ())?;
+        while let Some(page) = rs.next_page().await {
+            let page = page.map_err(|_| ())?;
+            let pr = page.page_ref();
+            let offset = pr.page_idx as usize * page_size + pr.offset as usize;
+            send_region(handle, conn_fd, 0, offset, pr.len as usize).await?;
+            drop(page);
+        }
+        return Ok(());
+    }
+
+    const WINDOW: usize = 8;
+    let mut next = 0usize;
+    let mut window: VecDeque<Ticket> = VecDeque::new();
+    while next < slices.len() && window.len() < WINDOW {
+        window.push_back(dispatch_ticket(fanout, backend_id, path, slices[next]).await);
+        next += 1;
+    }
+
+    let local_plan = |slice: StripeSlice| {
+        let (_key, req) = stripe_request(backend_id, path, slice);
+        StripePlan {
+            req,
+            intra_offset: slice.intra_offset,
+            intra_len: slice.intra_len,
+        }
+    };
+
+    while let Some(ticket) = window.pop_front() {
+        match ticket {
+            Ticket::Local { slice } => {
+                // Coalesce a maximal run of contiguous local stripes into
+                // one pipelined read so the pool prefetches across their
+                // boundaries, matching the single-shard pipeline depth
+                // instead of stalling one stripe at a time. Remote
+                // tickets between locals break the run because their
+                // bytes must go on the wire in object order.
+                let mut plans = vec![local_plan(slice)];
+                while matches!(window.front(), Some(Ticket::Local { .. })) {
+                    if let Some(Ticket::Local { slice }) = window.pop_front() {
+                        plans.push(local_plan(slice));
+                    }
+                }
+                let mut rs = pool.read_pipelined(plans, usize::MAX).map_err(|_| ())?;
+                while let Some(page) = rs.next_page().await {
+                    let page = page.map_err(|_| ())?;
+                    let pr = page.page_ref();
+                    let offset = pr.page_idx as usize * page_size + pr.offset as usize;
+                    send_region(handle, conn_fd, 0, offset, pr.len as usize).await?;
+                    drop(page);
+                }
+            }
+            Ticket::Remote {
+                fut,
+                buf_index,
+                channel,
+                slice,
+            } => {
+                let reply = match fut.await {
+                    Ok(reply) => reply,
+                    // Transient owner-side page pressure: the owner pool
+                    // refused a non-blocking head allocation rather than
+                    // parking (which could deadlock across shards). Yield
+                    // so we do not hot-spin while the owner drains other
+                    // coordinators' pins, then re-dispatch this same
+                    // stripe at the head of the window so object order is
+                    // preserved. Forward progress holds because every
+                    // owner always replies in bounded time and releases
+                    // its pins, so retries eventually succeed.
+                    Err(crate::bufferpool::Error::Busy) => {
+                        yield_now().await;
+                        let retry = dispatch_ticket(fanout, backend_id, path, slice).await;
+                        window.push_front(retry);
+                        continue;
+                    }
+                    Err(_) => return Err(()),
+                };
+                // Send every page in stripe order from the owner's
+                // backing, then release the owner's pin. The pin must
+                // outlive the final SEND_ZC notification (each
+                // `send_region` resolves on its notification CQE), so we
+                // release only after the loop. Release even on a send
+                // error so a dropped client does not leak the owner pin.
+                let mut result = Ok(());
+                for ploc in &reply.pages {
+                    if send_region(
+                        handle,
+                        conn_fd,
+                        buf_index,
+                        ploc.page_byte_offset as usize,
+                        ploc.len as usize,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        result = Err(());
+                        break;
+                    }
+                }
+                channel.release(reply.pin_token);
+                result?;
+            }
+        }
+
+        while next < slices.len() && window.len() < WINDOW {
+            window.push_back(dispatch_ticket(fanout, backend_id, path, slices[next]).await);
+            next += 1;
+        }
     }
     Ok(())
 }
@@ -754,6 +991,7 @@ mod tests {
             "primary".to_string(),
             4 * 1024 * 1024,
             2 * 1024 * 1024,
+            Rc::new(FanoutTable::new(0, vec![None])),
         );
         // No client has connected: accept is pending, no conns, so the
         // engine reports no work and stays idle.

@@ -710,6 +710,6 @@ fn heap_backing(page_size: usize, page_count: usize) -> Backing {
         base: owner.ptr,
         page_size,
         page_count,
-        _own: Box::new(owner),
+        keepalive: std::sync::Arc::new(owner),
     }
 }

@@ -95,10 +95,35 @@ impl FreeList {
         }
     }
 
-    /// Try to grab a free page without parking.
-    #[allow(dead_code)]
-    pub fn try_alloc(&self) -> Option<u32> {
-        self.inner.borrow_mut().free.pop()
+    /// Non-blocking allocation for a *head* fetch that must never park
+    /// on the free list.
+    ///
+    /// This is the admission primitive for cross-shard (remote) reads:
+    /// a coordinator on another shard pins whole stripes in this pool
+    /// across a network round trip, so a remote head that parked on
+    /// [`FreeList::alloc`] could sit blocked while the very coordinator
+    /// owed the page is itself stalled behind another owner's pins,
+    /// forming a cross-shard hold-and-wait cycle. Returning `None`
+    /// instead (surfaced to the caller as a transient `Error::Busy`)
+    /// keeps remote admission fail-fast: the coordinator retries later
+    /// rather than holding pins while blocked.
+    ///
+    /// Unlike [`FreeList::try_alloc_spare`] it keeps no reserve (a head
+    /// is the real consumer, not speculation, so it may legitimately
+    /// take the last free page). It still yields to parked waiters: if
+    /// any blocking head is queued on [`FreeList::alloc`] it returns
+    /// `None` rather than jumping ahead, preserving FIFO fairness and
+    /// the local-head priority the deadlock-freedom argument relies on.
+    /// Because a remote head never parks, it always completes (with a
+    /// page or `Busy`) in bounded time and releases its pins, so the
+    /// cross-shard wait graph stays acyclic.
+    pub fn try_alloc_head(&self) -> Option<u32> {
+        let mut g = self.inner.borrow_mut();
+        if g.waiters.is_empty() {
+            g.free.pop()
+        } else {
+            None
+        }
     }
 
     /// Non-blocking allocation for speculative (prefetch) use that

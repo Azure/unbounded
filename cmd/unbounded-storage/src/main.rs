@@ -19,6 +19,7 @@ use unbounded_storage::bufferpool::{Pool, PoolConfig, ShardDescriptor, StripeKey
 use unbounded_storage::config::{self, BackendSpec, Config, FrontendKind, FrontendSpec};
 use unbounded_storage::fabric::PeerId;
 use unbounded_storage::fabric::{self, Fabric, Provider};
+use unbounded_storage::fanout::{FanoutPeer, FanoutTable, FetchChannel, FetchService};
 use unbounded_storage::frontend::{HttpDriver, HttpFrontend, S3Driver, S3Frontend};
 use unbounded_storage::p2p::{
     FingerTable, FingerTableConfig, NodeId, PeerEntry, RecursiveHandler, RoutedTransport,
@@ -397,6 +398,8 @@ fn run_shard(
     frontend_specs: Arc<Vec<FrontendSpec>>,
     backend_specs: Arc<Vec<BackendSpec>>,
     ctrl_rx: mpsc::Receiver<config::ShardCommand>,
+    peer_rx: mpsc::Receiver<Arc<Vec<PeerPublish>>>,
+    phaseb_tx: mpsc::Sender<PhaseBReport>,
     layer_stop: Arc<AtomicBool>,
 ) {
     // Default to the loopback device when no HCA is bound to this
@@ -496,6 +499,22 @@ fn run_shard(
     // the socket ring and the pool share; the `HttpBackend` memcpys
     // origin bytes directly into pages carved from this base.
     let backing_base = backing.base;
+
+    // Total registered length of the backing, captured before
+    // `Pool::new` moves it. Peers register `(backing_base, backing_len)`
+    // on their own socket rings so they can `SEND_ZC` from this shard's
+    // pinned pages.
+    let backing_len = backing.page_size * backing.page_count;
+
+    // Shared Drop carrier for this shard's backing allocation, captured
+    // before `Pool::new` moves the `Backing`. Published to the layer so
+    // it can keep the mapping alive until every shard thread has joined:
+    // a peer coordinator's socket ring registers this region as a
+    // `SEND_ZC` source, and that ring is only guaranteed torn down once
+    // the peer's thread joins. Freeing the backing when this shard's
+    // `Pool` drops (which happens inside this thread, before the layer
+    // joins anyone) would leave a peer ring pointing at unmapped memory.
+    let backing_keepalive = backing.keepalive();
 
     // Stripe geometry per backend id, shared (behind an `Rc`) with the
     // frontend registry and the control-drain hook so a live backend
@@ -754,6 +773,85 @@ fn run_shard(
         shard_loop.add_tick_hook(move || socket.borrow().progress());
     }
 
+    // Cross-shard fan-out channel. This shard publishes the sender half
+    // (so peer coordinators can request stripes it owns) and keeps the
+    // receiver half to drive its own fetch service below.
+    let (fetch_channel, fetch_rx) = FetchChannel::new();
+
+    // PHASE A: announce readiness, publishing our backing region and
+    // fetch channel, then block until the layer broadcasts the full peer
+    // set. Bring-up is two-phase because registering a peer's backing
+    // re-registers the socket ring's whole fixed-buffer table, which is
+    // only safe while the ring is quiescent (no I/O in flight) - i.e.
+    // before the serve loop starts. A broadcast `Err` means the layer
+    // hit a bring-up failure on another shard and tore down before
+    // publishing; exit cleanly (locals drop in reverse declaration order,
+    // `fabric` last, matching the success path's drop ordering).
+    let _ = tx.send(ShardReady::Up {
+        descriptor: ShardDescriptor {
+            worker_idx: widx,
+            numa: worker.numa,
+        },
+        fabric: fabric.clone(),
+        publish: ShardPublish {
+            backing_base: backing_base as usize,
+            backing_len,
+            fetch_channel,
+            backing_keepalive,
+        },
+    });
+    let peers = match peer_rx.recv() {
+        Ok(peers) => peers,
+        Err(_) => return,
+    };
+
+    // From here on this shard owes the layer exactly one PhaseB report.
+    // The guard sends `Failed` on any early return or panic so the
+    // layer's bounded Phase-B collection never hangs waiting on a shard
+    // that aborted (mirroring `report_on_panic` for Phase A).
+    let mut phaseb_guard = PhaseBGuard::new(widx, phaseb_tx);
+
+    // PHASE B: register every peer shard's backing on our socket ring
+    // (recording the fixed-buffer index each lands at) and assemble the
+    // routing table. The ring is still quiescent here.
+    let own_shard_index = peers
+        .iter()
+        .position(|p| p.worker_idx == widx)
+        .expect("own shard present in broadcast peer set");
+    let shard_count = peers.len();
+    let mut routed: Vec<Option<FanoutPeer>> = (0..shard_count).map(|_| None).collect();
+    for peer in peers.iter() {
+        if peer.shard_index == own_shard_index {
+            continue;
+        }
+        let buf_index = match socket
+            .borrow()
+            .register_region_indexed(peer.backing_base as *mut u8, peer.backing_len)
+        {
+            Ok(idx) => idx,
+            Err(e) => {
+                phaseb_guard.report_failed(format!(
+                    "worker={}: register peer shard {} backing: {e}",
+                    widx.0, peer.shard_index,
+                ));
+                return;
+            }
+        };
+        routed[peer.shard_index] = Some(FanoutPeer {
+            channel: peer.channel.clone(),
+            buf_index,
+        });
+    }
+    let fanout = Rc::new(FanoutTable::new(own_shard_index, routed));
+
+    // Owner-side fetch service: serves stripe requests this shard owns by
+    // pinning pages in its backing and replying with their byte offsets.
+    // Registered as a tick hook so it shares the shard's cooperative loop.
+    {
+        let mut fetch_service = FetchService::new(pool.clone(), fetch_rx, page_size);
+        shard_loop.add_tick_hook(move || fetch_service.progress());
+    }
+
     // Shard-local registry of running frontend drivers, seeded with every
     // configured frontend. A single permanent tick hook (registered
     // below) drives whichever drivers are live, and the control-drain
@@ -764,6 +862,7 @@ fn run_shard(
     let frontend_ctx = FrontendBuildCtx {
         pool: pool.clone(),
         handle: NetHandle::new(socket.clone()),
+        fanout: fanout.clone(),
         geometry: geometry.clone(),
         page_size,
     };
@@ -875,13 +974,9 @@ fn run_shard(
         shard_loop.add_tick_hook(move || frontend_registry.progress());
     }
 
-    let _ = tx.send(ShardReady::Up {
-        descriptor: ShardDescriptor {
-            worker_idx: widx,
-            numa: worker.numa,
-        },
-        fabric: fabric.clone(),
-    });
+    // PHASE B complete: peers registered, fan-out and frontend drivers
+    // built. Report readiness so the layer can finish bring-up.
+    phaseb_guard.report_ready();
 
     // Drive the shard's cooperative future set until shutdown. The loop
     // busy-polls socket I/O and frontend work while active and idles
@@ -1036,16 +1131,13 @@ fn build_routing(config: &Config) -> (Arc<FingerTable>, Arc<HashMap<NodeId, Peer
     (Arc::new(fingers), Arc::new(node_to_peer))
 }
 
-/// Hash a `StripeKey` into a shard index. The first eight bytes of
-/// the 32-byte key are interpreted as a little-endian `u64`; that
-/// distributes uniformly under a content-addressed key (which is
-/// already a hash) and avoids pulling in a hash crate. The modulus
-/// is the shard count; `shard_count` is asserted non-zero by
-/// `PoolGroup::new`.
+/// Hash a `StripeKey` into a shard index. Delegates to the library
+/// [`unbounded_storage::fanout::owner_shard`] so the binary's
+/// `PoolGroup` router and the library frontend's fan-out path share one
+/// ownership function. The modulus is the shard count; `shard_count` is
+/// asserted non-zero by `PoolGroup::new`.
 fn stripe_key_to_shard(key: &StripeKey, shard_count: usize) -> usize {
-    let bytes = &key.0[..8];
-    let h = u64::from_le_bytes(bytes.try_into().expect("8 bytes"));
-    (h as usize) % shard_count
+    unbounded_storage::fanout::owner_shard(key, shard_count)
 }
 
 /// Validate and log the configured backends.
@@ -1099,6 +1191,11 @@ impl ShardFrontendDriver {
 struct FrontendBuildCtx {
     pool: Rc<ShardPool>,
     handle: NetHandle,
+    /// Per-shard cross-shard routing surface. The HTTP serve path
+    /// consults it to fan each stripe out to its owner shard (or serve
+    /// locally). Shared behind an `Rc` so cloning the context stays
+    /// cheap.
+    fanout: Rc<FanoutTable>,
     /// Backend id -> stripe size, shared (and live-updated) with the
     /// control-drain hook so a frontend brought up after a backend
     /// stripe change sees the new geometry. A frontend's stripe size is
@@ -1144,6 +1241,7 @@ impl FrontendBuildCtx {
                     spec.backend.clone(),
                     stripe_size,
                     self.page_size,
+                    self.fanout.clone(),
                 )))
             }
             FrontendKind::S3 => {
@@ -1236,8 +1334,94 @@ enum ShardReady {
     Up {
         descriptor: ShardDescriptor,
         fabric: Arc<Fabric>,
+        /// Cross-shard fan-out endpoints this shard exposes: its
+        /// registered backing region and the channel to its fetch
+        /// service. The layer collects these from every shard and
+        /// broadcasts the full set back so each shard can register its
+        /// peers' backings and build its [`FanoutTable`].
+        publish: ShardPublish,
     },
     Failed(String),
+}
+
+/// Phase-A publication from one shard: the backing region other shards
+/// must register to `SEND_ZC` from this shard's pinned pages, plus the
+/// channel to this shard's [`FetchService`]. The base is shipped as a
+/// `usize` because the raw `*mut u8` is `!Send`; it is re-cast to a
+/// pointer by the peer that registers it.
+struct ShardPublish {
+    backing_base: usize,
+    backing_len: usize,
+    fetch_channel: FetchChannel,
+    /// Shared Drop carrier for this shard's backing allocation. The
+    /// layer retains it (in [`shard_layer::ShardLayer`]) and frees it
+    /// only after every shard thread has joined, so a peer
+    /// coordinator's still-live socket ring never references unmapped
+    /// pages during teardown. Not forwarded into [`PeerPublish`]: peers
+    /// only need the region's base/len to register it, not ownership.
+    backing_keepalive: Arc<dyn Send + Sync>,
+}
+
+/// One entry in the broadcast peer list every shard receives in phase B.
+/// `shard_index` is the position in the worker-index-sorted shard order,
+/// matching [`stripe_key_to_shard`] and the process `PoolGroup` so
+/// ownership indices are consistent across the data path.
+struct PeerPublish {
+    shard_index: usize,
+    worker_idx: WorkerIdx,
+    backing_base: usize,
+    backing_len: usize,
+    channel: FetchChannel,
+}
+
+/// Phase-B readiness a shard reports after registering its peers'
+/// backings and building its fan-out surface. Separate from
+/// [`ShardReady`] so the layer can wait for the second rendezvous (peer
+/// registration) independently of the first (fabric/pool bring-up).
+enum PhaseBReport {
+    Ready(WorkerIdx),
+    Failed(String),
+}
+
+/// RAII guard ensuring a shard that has entered phase B reports exactly
+/// once. `report_ready`/`report_failed` send the terminal report and
+/// disarm; if the shard returns early or panics before reporting, `Drop`
+/// sends `Failed` so the layer's bounded phase-B collection never hangs.
+struct PhaseBGuard {
+    widx: WorkerIdx,
+    tx: mpsc::Sender<PhaseBReport>,
+    reported: bool,
+}
+
+impl PhaseBGuard {
+    fn new(widx: WorkerIdx, tx: mpsc::Sender<PhaseBReport>) -> Self {
+        Self {
+            widx,
+            tx,
+            reported: false,
+        }
+    }
+
+    fn report_ready(&mut self) {
+        self.reported = true;
+        let _ = self.tx.send(PhaseBReport::Ready(self.widx));
+    }
+
+    fn report_failed(&mut self, msg: String) {
+        self.reported = true;
+        let _ = self.tx.send(PhaseBReport::Failed(msg));
+    }
+}
+
+impl Drop for PhaseBGuard {
+    fn drop(&mut self) {
+        if !self.reported {
+            let _ = self.tx.send(PhaseBReport::Failed(format!(
+                "worker={}: aborted during phase B bring-up",
+                self.widx.0
+            )));
+        }
+    }
 }
 
 /// Per-role worker counts derived from a [`Plan`]; used for the
