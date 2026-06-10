@@ -106,7 +106,13 @@ impl<'pool> ReadStream<'pool> {
                 // Clone the trait object for the guard. Coerce
                 // `'pool` to `'s` (covariant lifetime).
                 let src_for_guard: Rc<dyn StreamSrc + 's> = self.src.clone();
-                Some(Ok(PageGuard::new(src_for_guard, page_no, bytes, len, page_ref)))
+                Some(Ok(PageGuard::new(
+                    src_for_guard,
+                    page_no,
+                    bytes,
+                    len,
+                    page_ref,
+                )))
             }
             Err(e) => Some(Err(e)),
         }
@@ -121,9 +127,7 @@ impl<'pool> ReadStream<'pool> {
     /// points into the pool's pinned backing and stays valid while
     /// the slot is held (the caller's guard keeps `consumer_holds`
     /// nonzero).
-    async fn next_page_parts(
-        &mut self,
-    ) -> Option<Result<(u64, *const u8, u32, PageRef), Error>> {
+    async fn next_page_parts(&mut self) -> Option<Result<(u64, *const u8, u32, PageRef), Error>> {
         if self.cursor >= self.end {
             return None;
         }
@@ -186,7 +190,13 @@ impl ReadStream<'static> {
         match self.next_page_parts().await? {
             Ok((page_no, bytes, len, page_ref)) => {
                 let src_for_guard: Rc<dyn StreamSrc + 'static> = self.src.clone();
-                Some(Ok(PageGuard::new(src_for_guard, page_no, bytes, len, page_ref)))
+                Some(Ok(PageGuard::new(
+                    src_for_guard,
+                    page_no,
+                    bytes,
+                    len,
+                    page_ref,
+                )))
             }
             Err(e) => Some(Err(e)),
         }

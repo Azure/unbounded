@@ -34,6 +34,7 @@ use unbounded_storage::storage::disks::{
 use unbounded_storage::topology::{Host, Plan, PlanConfig, Role, Worker};
 
 use unbounded_storage::memory::{BackingKind, BackingRequest, allocate};
+use unbounded_storage::metrics;
 
 mod shard_layer;
 
@@ -115,6 +116,8 @@ fn main() -> ExitCode {
 
     unbounded_storage::obs::init_from_env();
 
+    metrics::init();
+
     #[cfg(feature = "profiling")]
     {
         use unbounded_storage::profiling;
@@ -152,6 +155,10 @@ fn main() -> ExitCode {
     let startup = config.startup();
     let memory = startup.memory();
     let fabric_cfg = startup.fabric();
+    // The metrics exporter bind address is a startup-fixed knob; capture
+    // it now while `startup` borrows `config`, before `config` is moved
+    // into the controller below. An empty string disables the exporter.
+    let metrics_bind = startup.metrics().bind.clone();
     let backing_kind = if memory.no_hugepages {
         BackingKind::Heap
     } else {
@@ -322,6 +329,26 @@ fn main() -> ExitCode {
     // tracks only take effect on restart.
     let mut controller = config::ConfigController::new(target, Arc::new(config));
 
+    // Start the Prometheus exporter once the controller exists, so it can
+    // publish the live config-version gauges. A bind failure is logged
+    // but non-fatal: the daemon serves data without metrics rather than
+    // refusing to start. The thread parks off the pinned shard cores and
+    // exits when `SHUTDOWN` is set.
+    let metrics_exporter = if metrics_bind.is_empty() {
+        None
+    } else {
+        match metrics::spawn(&metrics_bind, controller.config_versions(), &SHUTDOWN) {
+            Ok(handle) => {
+                eprintln!("metrics: exporter listening on {metrics_bind}");
+                Some(handle)
+            }
+            Err(e) => {
+                eprintln!("metrics: exporter disabled: {e}");
+                None
+            }
+        }
+    };
+
     // Watch the config file and drive each update through the
     // controller until shutdown. Every apply is in place; an apply error
     // is logged and the process keeps serving on the last-good config.
@@ -373,6 +400,13 @@ fn main() -> ExitCode {
     }
     drop(disk_channels);
     disk_registry.drain();
+
+    // The exporter polls `SHUTDOWN` on its accept loop; join it last so a
+    // late scrape can still observe the final config versions during
+    // teardown. Bounded by the accept poll interval.
+    if let Some(handle) = metrics_exporter {
+        let _ = handle.join();
+    }
 
     exit_code
 }
@@ -977,6 +1011,7 @@ fn run_shard(
     // PHASE B complete: peers registered, fan-out and frontend drivers
     // built. Report readiness so the layer can finish bring-up.
     phaseb_guard.report_ready();
+    metrics::shards_delta(1);
 
     // Drive the shard's cooperative future set until shutdown. The loop
     // busy-polls socket I/O and frontend work while active and idles
@@ -986,6 +1021,8 @@ fn run_shard(
         || SHUTDOWN.load(Ordering::Acquire) || layer_stop.load(Ordering::Acquire),
         Duration::from_micros(100),
     );
+
+    metrics::shards_delta(-1);
 
     // Drop order matters:
     //   1. `shard_loop` first - clears tick hooks and futures, releasing
@@ -1238,6 +1275,7 @@ impl FrontendBuildCtx {
                     self.pool.clone(),
                     self.handle.clone(),
                     listen_fd,
+                    Rc::from(spec.id.as_str()),
                     spec.backend.clone(),
                     stripe_size,
                     self.page_size,
@@ -1254,6 +1292,7 @@ impl FrontendBuildCtx {
                     self.pool.clone(),
                     self.handle.clone(),
                     listen_fd,
+                    Rc::from(spec.id.as_str()),
                     spec.backend.clone(),
                     stripe_size,
                     self.page_size,

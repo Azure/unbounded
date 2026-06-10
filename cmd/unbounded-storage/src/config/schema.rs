@@ -77,6 +77,11 @@ impl Config {
         if topology.tcp_fallback_threads == 0 {
             topology.tcp_fallback_threads = 1;
         }
+
+        // Metrics: the exporter is opt-in, so an empty bind (the proto3
+        // zero value) is the intended "disabled" default and is left as
+        // is. Materialize the section so the accessor never panics.
+        startup.metrics.get_or_insert_with(MetricsCfg::default);
     }
 
     /// P2p section. Panics if called before [`Config::apply_defaults`]
@@ -109,6 +114,11 @@ impl StartupCfg {
     pub fn topology(&self) -> &TopologyCfg {
         self.topology.as_ref().expect("topology section populated")
     }
+
+    /// Metrics section. Valid after [`Config::apply_defaults`].
+    pub fn metrics(&self) -> &MetricsCfg {
+        self.metrics.as_ref().expect("metrics section populated")
+    }
 }
 
 #[cfg(test)]
@@ -127,6 +137,14 @@ mod tests {
         assert!(c.disks.is_empty());
         assert!(c.backends.is_empty());
         assert!(c.frontends.is_empty());
+    }
+
+    #[test]
+    fn metrics_section_defaults_to_disabled() {
+        let mut c: Config = toml::from_str("").unwrap();
+        c.apply_defaults();
+        // The exporter is opt-in: the bind stays empty unless configured.
+        assert_eq!(c.startup().metrics().bind, "");
     }
 
     #[test]

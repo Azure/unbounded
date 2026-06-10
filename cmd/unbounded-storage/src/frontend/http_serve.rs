@@ -47,6 +47,7 @@ use crate::frontend::FrontendError;
 use crate::frontend::range::{
     ByteRange, RangeError, ResolvedRange, StripeSlice, full_object, stripe_set,
 };
+use crate::frontend::serve_metrics::{ConnGuard, ReqOutcome};
 use crate::http::{
     FdGuard, HttpRequest, MAX_HEADER_BYTES, Method, ParseError, RECV_CHUNK, bind_listener,
     send_all, serialize_response_head, split_query,
@@ -128,6 +129,7 @@ pub struct HttpDriver<P: BufferPool<Req = StripeReq> + 'static> {
     pool: Rc<P>,
     handle: NetHandle,
     listen_fd: RawFd,
+    frontend_id: Rc<str>,
     backend_id: String,
     stripe_size: u64,
     page_size: usize,
@@ -148,6 +150,7 @@ impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
         pool: Rc<P>,
         handle: NetHandle,
         listen_fd: RawFd,
+        frontend_id: Rc<str>,
         backend_id: String,
         stripe_size: u64,
         page_size: usize,
@@ -158,6 +161,7 @@ impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
             pool,
             handle,
             listen_fd,
+            frontend_id,
             backend_id,
             stripe_size,
             page_size,
@@ -201,6 +205,7 @@ impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
                             Rc::clone(&self.pool),
                             self.handle.clone(),
                             fd,
+                            Rc::clone(&self.frontend_id),
                             self.backend_id.clone(),
                             self.stripe_size,
                             self.page_size,
@@ -256,14 +261,18 @@ async fn serve_connection<P: BufferPool<Req = StripeReq>>(
     pool: Rc<P>,
     handle: NetHandle,
     conn_fd: RawFd,
+    frontend_id: Rc<str>,
     backend_id: String,
     stripe_size: u64,
     page_size: usize,
     fanout: Rc<FanoutTable>,
 ) {
     let _fd = FdGuard(conn_fd);
+    let _conn = ConnGuard::new();
     let mut log = crate::obs::ReqLog::new("frontend.http");
-    match serve_request(
+    let start = std::time::Instant::now();
+    let mut outcome = ReqOutcome::default();
+    let result = serve_request(
         &pool,
         &handle,
         conn_fd,
@@ -272,9 +281,11 @@ async fn serve_connection<P: BufferPool<Req = StripeReq>>(
         page_size,
         &fanout,
         &mut log,
+        &mut outcome,
     )
-    .await
-    {
+    .await;
+    outcome.record(&frontend_id, start.elapsed().as_secs_f64());
+    match result {
         Ok(()) => log.finish_ok(),
         Err(()) => log.finish_err("connection error"),
     }
@@ -292,6 +303,7 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
     page_size: usize,
     fanout: &Rc<FanoutTable>,
     log: &mut crate::obs::ReqLog,
+    outcome: &mut ReqOutcome,
 ) -> Result<(), ()> {
     // 1. Read until the request head is complete (or the cap is hit).
     let mut buf: Vec<u8> = Vec::new();
@@ -311,6 +323,7 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
             Err(_) => {
                 let _ = send_all(handle, conn_fd, status_line_response(400)).await;
                 log.field("status", 400);
+                outcome.status = 400;
                 return Ok(());
             }
         }
@@ -325,9 +338,11 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
         _ => {
             let _ = send_all(handle, conn_fd, status_line_response(405)).await;
             log.field("status", 405);
+            outcome.status = 405;
             return Ok(());
         }
     };
+    outcome.method = if is_head { "HEAD" } else { "GET" };
     log.str_field("method", if is_head { "HEAD" } else { "GET" });
 
     // 3. Path is the request target with any query stripped.
@@ -341,6 +356,7 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
             Err(_) => {
                 let _ = send_all(handle, conn_fd, status_line_response(400)).await;
                 log.field("status", 400);
+                outcome.status = 400;
                 return Ok(());
             }
         },
@@ -363,11 +379,13 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
             Err(RangeError::Unsatisfiable { object_len }) => {
                 let _ = send_all(handle, conn_fd, unsatisfiable_response(object_len)).await;
                 log.field("status", 416);
+                outcome.status = 416;
                 return Ok(());
             }
             Err(_) => {
                 let _ = send_all(handle, conn_fd, status_line_response(400)).await;
                 log.field("status", 400);
+                outcome.status = 400;
                 return Ok(());
             }
         },
@@ -379,6 +397,10 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
     } else {
         full_head(len)
     };
+    outcome.status = if range.is_some() { 206 } else { 200 };
+    // HEAD carries no body, so no body bytes are streamed to the client;
+    // only count the body length for requests that actually send one.
+    outcome.bytes = if is_head { 0 } else { resolved.len() };
     log.field("status", if range.is_some() { 206 } else { 200 })
         .field("bytes", resolved.len());
     send_all(handle, conn_fd, head).await?;
@@ -988,6 +1010,7 @@ mod tests {
             Rc::new(MockPool),
             handle,
             listen_fd,
+            Rc::from("primary"),
             "primary".to_string(),
             4 * 1024 * 1024,
             2 * 1024 * 1024,

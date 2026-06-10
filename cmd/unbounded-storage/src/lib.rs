@@ -10,6 +10,7 @@ pub mod frontend;
 pub mod http;
 pub mod io;
 pub mod memory;
+pub mod metrics;
 pub mod obs;
 pub mod p2p;
 #[cfg(feature = "profiling")]

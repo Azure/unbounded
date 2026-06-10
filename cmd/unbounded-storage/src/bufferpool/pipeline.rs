@@ -274,7 +274,10 @@ impl<'pool> PipelinedRead<'pool> {
         let page_no = geom.first_page + k;
         let page_start = page_no * self.page_size;
         let lo = std::cmp::max(page_start, geom.intra_offset);
-        let hi = std::cmp::min(page_start + self.page_size, geom.intra_offset + geom.intra_len);
+        let hi = std::cmp::min(
+            page_start + self.page_size,
+            geom.intra_offset + geom.intra_len,
+        );
         let intra_off = (lo - page_start) as u32;
         let intra_len = (hi - lo) as u32;
         (s, page_no, intra_off, intra_len)

@@ -361,9 +361,11 @@ where
         let prev = shared_for_handler.inflight.fetch_add(1, Ordering::AcqRel);
         if prev >= max_inflight {
             shared_for_handler.inflight.fetch_sub(1, Ordering::AcqRel);
+            crate::metrics::fabric_rpc_served(crate::metrics::Outcome::Err);
             let _ = reject_overloaded(&shared_for_handler, src_addr, header.request_id);
             return;
         }
+        crate::metrics::fabric_inflight_delta(1);
 
         let shared_for_job = shared_for_handler.clone();
         let handler_for_job = handler_for_handler.clone();
@@ -376,11 +378,13 @@ where
                 src_addr,
             );
             shared_for_job.inflight.fetch_sub(1, Ordering::AcqRel);
+            crate::metrics::fabric_inflight_delta(-1);
         });
         if shared_for_handler.queue.push(job).is_err() {
             // Queue closed (server shutting down): the job never runs, so
             // release the in-flight reservation it would have decremented.
             shared_for_handler.inflight.fetch_sub(1, Ordering::AcqRel);
+            crate::metrics::fabric_inflight_delta(-1);
         }
     });
     let ctx = slot.into_raw();
@@ -421,6 +425,8 @@ fn run_worker<R, H>(
         return;
     }
 
+    let started = std::time::Instant::now();
+
     let mut log = Some({
         let mut l = crate::obs::ReqLog::new("fabric.serve");
         l.field("peer", src_addr)
@@ -458,6 +464,8 @@ fn run_worker<R, H>(
                 l.finish_err("local backing not registered");
             }
 
+            crate::metrics::fabric_rpc_served(crate::metrics::Outcome::Err);
+            crate::metrics::fabric_rpc_duration(started.elapsed().as_secs_f64());
             return;
         }
     };
@@ -484,6 +492,8 @@ fn run_worker<R, H>(
                 l.finish_err("server shutting down");
             }
 
+            crate::metrics::fabric_rpc_served(crate::metrics::Outcome::Err);
+            crate::metrics::fabric_rpc_duration(started.elapsed().as_secs_f64());
             return;
         }
         match stream.as_mut().poll_next(&mut task_cx) {
@@ -511,6 +521,8 @@ fn run_worker<R, H>(
                                 .finish_err(format!("write_page: {e}"));
                         }
 
+                        crate::metrics::fabric_rpc_served(crate::metrics::Outcome::Err);
+                        crate::metrics::fabric_rpc_duration(started.elapsed().as_secs_f64());
                         return;
                     }
                 }
@@ -522,6 +534,8 @@ fn run_worker<R, H>(
                     l.field("written", next_idx).finish_err(e);
                 }
 
+                crate::metrics::fabric_rpc_served(crate::metrics::Outcome::Err);
+                crate::metrics::fabric_rpc_duration(started.elapsed().as_secs_f64());
                 return;
             }
             std::task::Poll::Ready(None) => {
@@ -537,6 +551,10 @@ fn run_worker<R, H>(
                     l.field("written", next_idx).finish_ok();
                 }
 
+                let pages = next_idx as u64;
+                crate::metrics::fabric_written(pages, pages * shared.page_size as u64);
+                crate::metrics::fabric_rpc_served(crate::metrics::Outcome::Ok);
+                crate::metrics::fabric_rpc_duration(started.elapsed().as_secs_f64());
                 return;
             }
             std::task::Poll::Pending => {

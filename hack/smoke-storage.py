@@ -200,6 +200,7 @@ class _LocalNode(_Node):
     def __init__(self, args: list[str], log_path: Path) -> None:
         self.label = f"storage process {args}"
         self.log_path = log_path
+        self._stopped = False
         # Owned by this node so stop() can close it; the forwarding thread
         # writes to it for the life of the process.
         self.log_file = open(log_path, "w")  # noqa: SIM115 - intentionally long-lived
@@ -215,6 +216,11 @@ class _LocalNode(_Node):
         ).start()
 
     def stop(self) -> None:
+        # Idempotent: the scenario's `finally` and the atexit `cleanup` both
+        # tear nodes down, so stop() can be called more than once per node.
+        if self._stopped:
+            return
+        self._stopped = True
         try:
             os.killpg(self.proc.pid, signal.SIGTERM)
         except OSError:
@@ -563,6 +569,7 @@ def write_config(
     origin_addr: str,
     frontend_bind: str,
     fabric_listen: str,
+    metrics_bind: str,
 ) -> None:
     # The config schema is proto3-native: enum fields are plain integer
     # discriminants and byte sizes are plain integer byte counts (see
@@ -618,6 +625,11 @@ bytes_per_shard = {BYTES_PER_SHARD}
 [startup.fabric]
 listen_addr = "{fabric_listen}"
 
+[startup.metrics]
+# Expose the Prometheus exporter on a dedicated control-plane port so the
+# smoke test can scrape /metrics and assert request counters advanced.
+bind = "{metrics_bind}"
+
 [startup.topology]
 disable_rdma = true
 """
@@ -663,6 +675,34 @@ def fetch(url: str, timeout: int = 30) -> tuple[int, bytes]:
             time.sleep(1)
     die(f"GET {url} did not succeed within {timeout}s: {last_err}")
     raise AssertionError("unreachable")
+
+
+def scrape_metric_sum(url: str, name: str, timeout: int = 30) -> float:
+    """Scrape Prometheus text from *url* and sum all samples of *name*.
+
+    Sums across every label-set series whose metric name matches *name*
+    (ignoring comment/HELP/TYPE lines), so a counter split across labels
+    like `frontend_requests_total{frontend="fe",method="GET",status="200"}`
+    is totaled. Dies if the endpoint never responds.
+    """
+    status, body = fetch(url, timeout)
+    if status != 200:
+        die(f"GET {url} returned status {status}, expected 200")
+    total = 0.0
+    text = body.decode("utf-8", "replace")
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        # "<name>{labels} <value>" or "<name> <value>"
+        head, _, value = line.rpartition(" ")
+        metric = head.split("{", 1)[0]
+        if metric == name:
+            try:
+                total += float(value)
+            except ValueError:
+                continue
+    return total
 
 
 # ============================================================================
@@ -728,7 +768,8 @@ def run_scenario(kind: str, origin_addr: str, object_path: str, origin: Any) -> 
     nodes: list[_Node] = []
     fab_a, fab_b = free_port(), free_port()
     fe_a, fe_b = free_port(), free_port()
-    log(f"Ports: fabric=({fab_a},{fab_b}) frontends=({fe_a},{fe_b})")
+    met_a, met_b = free_port(), free_port()
+    log(f"Ports: fabric=({fab_a},{fab_b}) frontends=({fe_a},{fe_b}) metrics=({met_a},{met_b})")
 
     log("Writing node configs")
     cfg1 = TMPDIR / f"{kind}-node1.toml"
@@ -743,6 +784,7 @@ def run_scenario(kind: str, origin_addr: str, object_path: str, origin: Any) -> 
         origin_addr=origin_addr,
         frontend_bind=f"127.0.0.1:{fe_a}",
         fabric_listen=f"127.0.0.1:{fab_a}",
+        metrics_bind=f"127.0.0.1:{met_a}",
     )
     write_config(
         cfg2,
@@ -754,6 +796,7 @@ def run_scenario(kind: str, origin_addr: str, object_path: str, origin: Any) -> 
         origin_addr=origin_addr,
         frontend_bind=f"127.0.0.1:{fe_b}",
         fabric_listen=f"127.0.0.1:{fab_b}",
+        metrics_bind=f"127.0.0.1:{met_b}",
     )
 
     try:
@@ -795,6 +838,26 @@ def run_scenario(kind: str, origin_addr: str, object_path: str, origin: Any) -> 
                 f"the {kind} backend was not exercised"
             )
         log(f"  stub origin served {len(gets)} backend GET(s)")
+
+        # Scrape each node's Prometheus exporter and assert the frontend
+        # request counter advanced. Each frontend served exactly one direct
+        # GET above, so its node's exporter must report at least one
+        # frontend_requests_total sample with a non-zero total. This proves
+        # the metrics subsystem (registry, instrumentation, and the
+        # dedicated std::net exporter thread) is wired end to end in the
+        # real binary.
+        metric = "unbounded_storage_frontend_requests_total"
+        for label, met_port in (("A", met_a), ("B", met_b)):
+            url = f"http://127.0.0.1:{met_port}/metrics"
+            log(f"Scraping metrics from node {label} ({url})")
+            count = scrape_metric_sum(url, metric)
+            if count < 1:
+                die(
+                    f"node {label} reported {metric}={count}, expected >= 1; "
+                    "metrics exporter not wired correctly"
+                )
+            log(f"  node {label} reports {metric}={count}")
+
         log(f"  {kind} scenario PASSED")
     finally:
         log(f"  Tearing down {kind} ring")

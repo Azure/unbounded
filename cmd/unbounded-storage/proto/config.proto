@@ -33,6 +33,13 @@ message StartupCfg {
   MemoryCfg memory = 1;
   FabricCfg fabric = 2;
   TopologyCfg topology = 3;
+  MetricsCfg metrics = 4;
+}
+
+message MetricsCfg {
+  // Listen address for the Prometheus metrics exporter (e.g.
+  // "0.0.0.0:9100"). "" -> exporter disabled.
+  string bind = 1;
 }
 
 message MemoryCfg {

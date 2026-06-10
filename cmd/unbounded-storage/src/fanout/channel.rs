@@ -342,8 +342,7 @@ mod tests {
         fn drop_fn(p: *const ()) {
             unsafe { drop(Arc::from_raw(p as *const AtomicBool)) };
         }
-        static VTABLE: RawWakerVTable =
-            RawWakerVTable::new(clone, wake, wake_by_ref, drop_fn);
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop_fn);
         let raw = RawWaker::new(Arc::into_raw(flag) as *const (), &VTABLE);
         unsafe { Waker::from_raw(raw) }
     }

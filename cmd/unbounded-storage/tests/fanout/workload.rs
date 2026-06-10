@@ -196,14 +196,14 @@ fn client_strategy() -> impl Strategy<Value = ClientSpec> {
 fn fetch_strategy() -> impl Strategy<Value = FetchSpec> {
     // Offsets / lengths are normalized against the stripe length in
     // `run_workload`, so the strategy stays independent of geometry.
-    (0u8..=255u8, 0u64..=4096, 1u64..=4096, 0u32..=4).prop_map(
-        |(key_idx, offset, len, hold)| FetchSpec {
+    (0u8..=255u8, 0u64..=4096, 1u64..=4096, 0u32..=4).prop_map(|(key_idx, offset, len, hold)| {
+        FetchSpec {
             key_idx,
             offset,
             len,
             hold,
-        },
-    )
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -414,7 +414,9 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
                             continue;
                         }
                         Err(e) => {
-                            outcomes.borrow_mut().push(FetchOutcome::Err(format!("{e}")));
+                            outcomes
+                                .borrow_mut()
+                                .push(FetchOutcome::Err(format!("{e}")));
                             break None;
                         }
                     }

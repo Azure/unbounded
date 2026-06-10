@@ -105,6 +105,7 @@ where
             blockstore,
             _r: PhantomData,
         });
+        crate::metrics::bufferpool_pages_added(page_count_u32 as i64);
         Ok(Self { inner })
     }
 
@@ -294,12 +295,7 @@ where
     /// the page is itself blocked behind another owner, forming a
     /// cross-shard hold-and-wait deadlock. `Busy` is transient: the
     /// coordinator re-dispatches the fetch after yielding.
-    pub fn read_owned(
-        &self,
-        req: &R,
-        offset: u64,
-        len: u64,
-    ) -> Result<ReadStream<'static>, Error> {
+    pub fn read_owned(&self, req: &R, offset: u64, len: u64) -> Result<ReadStream<'static>, Error> {
         let (src, end) = self.admit_stream(req, offset, len, true)?;
         Ok(ReadStream::new(src, offset, end, self.inner.page_size))
     }
@@ -444,6 +440,7 @@ where
         let cur = self.inner.inflight_prefetch_pages.get();
         if cur < effective {
             self.inner.inflight_prefetch_pages.set(cur + 1);
+            crate::metrics::bufferpool_prefetch_delta(1);
             true
         } else {
             false
@@ -455,6 +452,9 @@ where
         self.inner
             .inflight_prefetch_pages
             .set(cur.saturating_sub(1));
+        if cur > 0 {
+            crate::metrics::bufferpool_prefetch_delta(-1);
+        }
     }
 }
 
@@ -714,6 +714,7 @@ where
             }
             Action::Error(e) => return Err(e),
             Action::Park => {
+                crate::metrics::bufferpool_coalesced();
                 // `ParkOnSlot` pre-bumps `consumer_holds` so the
                 // leader's `PageGuard` drop cannot recycle the slot
                 // between wake and re-poll. The hold is transferred
@@ -825,7 +826,23 @@ where
                 .await;
 
                 let hit = match fetch_result {
-                    Ok(h) => h,
+                    Ok(h) => {
+                        crate::metrics::bufferpool_request(if h {
+                            crate::metrics::Lookup::Hit
+                        } else {
+                            crate::metrics::Lookup::Miss
+                        });
+                        // A blockstore hit satisfied the RAM miss from
+                        // local disk. The peer/origin sources are
+                        // recorded inside `Transport::bulk_get` on the
+                        // miss path, where that distinction is known.
+                        if h {
+                            crate::metrics::bufferpool_miss_source(
+                                crate::metrics::MissSource::Disk,
+                            );
+                        }
+                        h
+                    }
                     Err(e) => {
                         let wakers = take_loading_wakers(&slot);
                         *slot.state.borrow_mut() = SlotState::Error(e.clone());

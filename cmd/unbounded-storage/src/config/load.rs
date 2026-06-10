@@ -99,6 +99,9 @@ pub enum ConfigError {
         frontend_id: String,
         value: i32,
     },
+    InvalidMetricsBind {
+        bind: String,
+    },
 }
 
 impl fmt::Display for ConfigError {
@@ -212,6 +215,9 @@ impl fmt::Display for ConfigError {
                 f,
                 "frontend {frontend_id:?}: kind {value} is not a valid value (0 = http, 1 = s3)"
             ),
+            ConfigError::InvalidMetricsBind { bind } => {
+                write!(f, "metrics bind {bind:?} is not a valid socket address")
+            }
         }
     }
 }
@@ -434,6 +440,16 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
             });
         }
     }
+
+    // The metrics exporter bind is optional; when set it must parse as a
+    // socket address (an empty value disables the exporter).
+    let metrics_bind = &cfg.startup().metrics().bind;
+    if !metrics_bind.is_empty() && metrics_bind.parse::<SocketAddr>().is_err() {
+        return Err(ConfigError::InvalidMetricsBind {
+            bind: metrics_bind.clone(),
+        });
+    }
+
     Ok(())
 }
 
@@ -919,6 +935,29 @@ backend = "b"
             load(f.path()),
             Err(ConfigError::InvalidFrontendBind { .. })
         ));
+    }
+
+    #[test]
+    fn accepts_valid_metrics_bind() {
+        let f = write_cfg("[startup.metrics]\nbind = \"0.0.0.0:9100\"\n");
+        let cfg = load(f.path()).expect("valid metrics bind loads");
+        assert_eq!(cfg.startup().metrics().bind, "0.0.0.0:9100");
+    }
+
+    #[test]
+    fn empty_metrics_bind_is_allowed() {
+        let f = write_cfg("");
+        let cfg = load(f.path()).expect("absent metrics section loads");
+        assert_eq!(cfg.startup().metrics().bind, "");
+    }
+
+    #[test]
+    fn rejects_invalid_metrics_bind() {
+        let f = write_cfg("[startup.metrics]\nbind = \"not-an-addr\"\n");
+        match load(f.path()) {
+            Err(ConfigError::InvalidMetricsBind { bind }) if bind == "not-an-addr" => {}
+            other => panic!("expected InvalidMetricsBind, got {other:?}"),
+        }
     }
 
     #[test]

@@ -58,22 +58,25 @@ fn assert_bytes_match(report: &RunReport) -> Result<(), TestCaseError> {
 fn assert_pagelocs_cover(report: &RunReport) -> Result<(), TestCaseError> {
     let backing_bytes = (report.total_pool_pages * report.page_size) as u64;
     for (i, o) in report.outcomes.iter().enumerate() {
-        if let FetchOutcome::Ok {
-            page_locs, len, ..
-        } = o
-        {
+        if let FetchOutcome::Ok { page_locs, len, .. } = o {
             let covered: u64 = page_locs.iter().map(|(_, l)| *l as u64).sum();
             prop_assert_eq!(
-                covered, *len,
+                covered,
+                *len,
                 "fetch {} pagelocs cover {} bytes, expected {}",
-                i, covered, len,
+                i,
+                covered,
+                len,
             );
             for (off, l) in page_locs {
                 prop_assert!(*l > 0, "fetch {} has an empty PageLoc", i);
                 prop_assert!(
                     off + *l as u64 <= backing_bytes,
                     "fetch {} PageLoc {}+{} exceeds backing {}",
-                    i, off, l, backing_bytes,
+                    i,
+                    off,
+                    l,
+                    backing_bytes,
                 );
             }
         }
@@ -91,12 +94,15 @@ fn assert_pagelocs_cover(report: &RunReport) -> Result<(), TestCaseError> {
 /// under fault injection too.
 fn assert_no_pin_leak(report: &RunReport) -> Result<(), TestCaseError> {
     prop_assert_eq!(
-        report.free_pages_at_end, report.total_pool_pages,
+        report.free_pages_at_end,
+        report.total_pool_pages,
         "pages leaked: free={} expected {}",
-        report.free_pages_at_end, report.total_pool_pages,
+        report.free_pages_at_end,
+        report.total_pool_pages,
     );
     prop_assert_eq!(
-        report.inflight_entries_at_end, 0,
+        report.inflight_entries_at_end,
+        0,
         "inflight stripe-fetches not drained: {} entries",
         report.inflight_entries_at_end,
     );
@@ -147,7 +153,8 @@ fn assert_shutdown_send_errors(report: &RunReport) -> Result<(), TestCaseError> 
 fn assert_busy_only_under_pressure(report: &RunReport) -> Result<(), TestCaseError> {
     if !report.tight_pool {
         prop_assert_eq!(
-            report.busy_retries, 0,
+            report.busy_retries,
+            0,
             "{} Busy retries on a generously sized pool",
             report.busy_retries,
         );

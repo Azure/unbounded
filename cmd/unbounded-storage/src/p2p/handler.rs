@@ -375,8 +375,12 @@ where
         let page_size = self.scratch.backing.page_size;
         let target = stripe_to_ring(self.key);
         match classify(&self.fingers, target, self.hops_remaining) {
-            Route::HopLimit => Err(RecursiveHandlerError::HopLimitExceeded),
+            Route::HopLimit => {
+                crate::metrics::p2p_hop_limit_exceeded();
+                Err(RecursiveHandlerError::HopLimitExceeded)
+            }
             Route::Owner => {
+                crate::metrics::p2p_request(crate::metrics::Disposition::Local);
                 let idx = self
                     .scratch
                     .take_zeroed()
@@ -387,6 +391,7 @@ where
                 Ok(self.clamped_page(idx, page_size))
             }
             Route::Forward => {
+                crate::metrics::p2p_request(crate::metrics::Disposition::Forward);
                 let idx = self
                     .scratch
                     .take_zeroed()

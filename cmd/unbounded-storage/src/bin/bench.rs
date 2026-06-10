@@ -81,7 +81,6 @@ use unbounded_storage::topology::{Host, Nvme, Plan, PlanConfig, Role};
 #[path = "bench/transport.rs"]
 mod transport;
 
-
 const _: () = assert!(HUGEPAGE_2MB == 2 * 1024 * 1024);
 
 /// User-data page size used by the bench, in bytes.

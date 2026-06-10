@@ -485,6 +485,7 @@ mod tests {
         Hca {
             dev_name: dev.to_string(),
             pci_bdf: Some(bdf.to_string()),
+            pcie_root: None,
             numa,
             ports_active: active,
         }
@@ -494,6 +495,7 @@ mod tests {
         Nvme {
             dev_name: dev.to_string(),
             pci_bdf: Some(bdf.to_string()),
+            pcie_root: None,
             numa,
         }
     }
@@ -859,6 +861,7 @@ mod tests {
         host.nics.push(Nic {
             dev_name: "eth0".to_string(),
             pci_bdf: Some("0000:01:00.0".to_string()),
+            pcie_root: None,
             numa: Some(0),
             rx_queues: 4,
             msi_irqs: vec![10, 11],

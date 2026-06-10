@@ -41,7 +41,7 @@ use crate::storage::singleflight::{Acquire, Singleflight};
 use crate::storage::traits::{PageChecksum, Xxh3Checksum};
 use crate::storage::types::{Lba, PageKey};
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct EngineConfig {
     /// Cache page size, in bytes. Default 2 MiB. Must be a
     /// multiple of [`Self::btree_page_bytes`].
@@ -103,6 +103,11 @@ pub struct EngineConfig {
     /// per terabyte. Production should leave this false so partial
     /// recovery still runs when the meta slots are corrupted.
     pub skip_recovery_scan_if_no_meta: bool,
+    /// Stable identifier for this disk, used as the `disk` label on
+    /// the engine's Prometheus metrics. Empty when unset (e.g. in
+    /// tests and benchmarks); production wiring sets it from the
+    /// `DiskSpec` id.
+    pub disk_id: String,
 }
 
 impl Default for EngineConfig {
@@ -121,6 +126,7 @@ impl Default for EngineConfig {
             btree_scratch_pages: 64,
             bypass_admission: false,
             skip_recovery_scan_if_no_meta: false,
+            disk_id: String::new(),
         }
     }
 }
@@ -268,7 +274,7 @@ impl<B: BlockDevice> StorageEngine<B> {
             cfg.admission_sketch_multiplier.max(1) as u32,
         ));
         let singleflight = Arc::new(Singleflight::new(cfg.singleflight_shards.max(1)));
-        Ok(Self {
+        let engine = Self {
             device,
             allocator,
             refcount,
@@ -286,7 +292,9 @@ impl<B: BlockDevice> StorageEngine<B> {
             pending_free: Mutex::new(Vec::new()),
             mutator_queue: Arc::new(MutatorQueue::new()),
             metrics: EngineMetrics::new(),
-        })
+        };
+        engine.publish_usage_gauges();
+        Ok(engine)
     }
 
     /// Borrow the underlying block device. Used by `LocalStorage`
@@ -340,6 +348,11 @@ impl<B: BlockDevice> StorageEngine<B> {
 
     fn metric<F: FnOnce(&mut EngineMetricsInner)>(&self, f: F) {
         f(&mut self.metrics.inner.lock().unwrap())
+    }
+
+    /// The `disk` label for this engine's Prometheus metrics.
+    fn disk(&self) -> &str {
+        &self.cfg.disk_id
     }
 
     fn n_pages(&self, byte_len: u32) -> u64 {
@@ -469,6 +482,9 @@ impl<B: BlockDevice> StorageEngine<B> {
                 let _ = self.refcount.reset(lba.0);
             }
             self.metric(|m| m.evictions += victim_runs.len() as u64);
+            for _ in &victim_runs {
+                crate::metrics::storage_eviction(self.disk());
+            }
         })
     }
 }
@@ -551,6 +567,7 @@ impl<B: BlockDevice> StorageEngine<B> {
             Ok(Some(e)) => e,
             Ok(None) | Err(_) => {
                 self.metric(|m| m.misses += 1);
+                crate::metrics::storage_lookup(crate::metrics::Lookup::Miss);
                 return Ok(false);
             }
         };
@@ -559,6 +576,7 @@ impl<B: BlockDevice> StorageEngine<B> {
             Ok(g) => g,
             Err(_) => {
                 self.metric(|m| m.misses += 1);
+                crate::metrics::storage_lookup(crate::metrics::Lookup::Miss);
                 return Ok(false);
             }
         };
@@ -571,8 +589,19 @@ impl<B: BlockDevice> StorageEngine<B> {
                 m.misses += 1;
                 m.read_io_errors += 1;
             });
+            crate::metrics::storage_disk_op(
+                self.disk(),
+                crate::metrics::DiskOp::Read,
+                crate::metrics::Outcome::Err,
+            );
+            crate::metrics::storage_lookup(crate::metrics::Lookup::Miss);
             return Ok(false);
         }
+        crate::metrics::storage_disk_op(
+            self.disk(),
+            crate::metrics::DiskOp::Read,
+            crate::metrics::Outcome::Ok,
+        );
 
         let cs = Xxh3Checksum::checksum_of(dst_buf);
         if cs.0 != entry.data_checksum.0 {
@@ -580,12 +609,14 @@ impl<B: BlockDevice> StorageEngine<B> {
                 m.misses += 1;
                 m.checksum_misses += 1;
             });
+            crate::metrics::storage_lookup(crate::metrics::Lookup::Miss);
             return Ok(false);
         }
 
         self.lru.touch(entry.lba);
         self.admission.record_frequency(&pk);
         self.metric(|m| m.hits += 1);
+        crate::metrics::storage_lookup(crate::metrics::Lookup::Hit);
         Ok(true)
     }
 
@@ -606,6 +637,7 @@ impl<B: BlockDevice> StorageEngine<B> {
 
         if !self.cfg.bypass_admission && !self.admission.should_admit(&pk) {
             self.metric(|m| m.rejected_by_filter += 1);
+            crate::metrics::storage_admission_rejected(self.disk());
             return Ok(());
         }
 
@@ -657,10 +689,20 @@ impl<B: BlockDevice> StorageEngine<B> {
             // still records the IO error in metrics for the
             // operator-facing snapshot.
             self.metric(|m| m.write_io_errors += 1);
+            crate::metrics::storage_disk_op(
+                self.disk(),
+                crate::metrics::DiskOp::Write,
+                crate::metrics::Outcome::Err,
+            );
             let _ = self.allocator.free_range(lba, n_pages);
             leader.abandon();
             return Err(bufferpool::Error::Io(io_errno(&e)));
         }
+        crate::metrics::storage_disk_op(
+            self.disk(),
+            crate::metrics::DiskOp::Write,
+            crate::metrics::Outcome::Ok,
+        );
 
         let cs = Xxh3Checksum::checksum_of(src_buf);
         let entry = LeafEntry {
@@ -814,7 +856,10 @@ impl<B: BlockDevice> StorageEngine<B> {
         let ok = if mutations.is_empty() {
             true
         } else {
-            self.btree.apply_batch(mutations).await.is_ok()
+            let started = std::time::Instant::now();
+            let res = self.btree.apply_batch(mutations).await.is_ok();
+            crate::metrics::storage_btree_commit_duration(started.elapsed().as_secs_f64());
+            res
         };
 
         for (i, req) in batch.into_iter().enumerate() {
@@ -833,6 +878,22 @@ impl<B: BlockDevice> StorageEngine<B> {
             };
             done.set(outcome);
         }
+
+        self.publish_usage_gauges();
+    }
+
+    /// Publishes the per-disk capacity/used byte gauges from the
+    /// allocator's current page accounting. Cheap; called after each
+    /// commit batch and once at open so the gauges reflect on-disk
+    /// occupancy without a render-time pull (the engine is per-shard
+    /// `!Send`, so a global pull gauge cannot reach it).
+    fn publish_usage_gauges(&self) {
+        // The allocator works in device LBAs sized `btree_page_bytes`,
+        // not cache pages (`page_size_bytes`), so the byte conversion
+        // must use the LBA size to avoid overstating occupancy.
+        let lba = self.cfg.btree_page_bytes as i64;
+        crate::metrics::storage_capacity_bytes(self.disk(), self.allocator.capacity() as i64 * lba);
+        crate::metrics::storage_used_bytes(self.disk(), self.allocator.used_pages() as i64 * lba);
     }
 }
 

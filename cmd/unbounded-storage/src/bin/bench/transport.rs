@@ -79,11 +79,12 @@ use std::time::{Duration, Instant};
 use clap::{Args, Subcommand, ValueEnum};
 
 use unbounded_storage::bufferpool::{
-    BlockStore, BufferPool, Error as PoolError, NullBlockStore, PageRef, Pool, PoolConfig, StripeKey,
+    BlockStore, BufferPool, Error as PoolError, NullBlockStore, PageRef, Pool, PoolConfig,
+    StripeKey,
 };
 use unbounded_storage::fabric::{
-    ConnectionSpec, Fabric, FabricTransport, PeerId, PoolHandler, Provider,
-    RpcServerHandle, StaticPeer, apply_tcp_env_defaults, defaults_for,
+    ConnectionSpec, Fabric, FabricTransport, PeerId, PoolHandler, Provider, RpcServerHandle,
+    StaticPeer, apply_tcp_env_defaults, defaults_for,
 };
 use unbounded_storage::memory::{Backing, BackingKind, BackingRequest, HUGEPAGE_2MB, allocate};
 use unbounded_storage::runtime::{
@@ -348,12 +349,18 @@ fn fill_byte(key: &StripeKey) -> u8 {
 /// distinct CPUs or `--no-pin` is set.
 fn build_runtime(no_pin: bool, needed: usize) -> (Arc<dyn Threading>, String) {
     if no_pin {
-        return (DefaultRuntime::new(needed), "unpinned (DefaultRuntime, --no-pin)".to_string());
+        return (
+            DefaultRuntime::new(needed),
+            "unpinned (DefaultRuntime, --no-pin)".to_string(),
+        );
     }
     let host = Host::discover();
     if host.cpus.is_empty() {
         eprintln!("bench: sysfs topology empty (no CPUs visible); running unpinned");
-        return (DefaultRuntime::new(needed), "unpinned (no sysfs topology)".to_string());
+        return (
+            DefaultRuntime::new(needed),
+            "unpinned (no sysfs topology)".to_string(),
+        );
     }
     // Ask the planner for RDMA progress + a couple of handler CPUs and a
     // TCP fallback so we get disjoint, NUMA-local cores on both RDMA and
@@ -409,7 +416,8 @@ fn new_fabric(
     cfg.max_inflight = common.inflight;
     cfg.rpc_posted_recvs = common.posted_recvs;
     cfg.progress_threads = common.progress_threads;
-    cfg.validate().map_err(|e| format!("fabric config invalid: {e}"))?;
+    cfg.validate()
+        .map_err(|e| format!("fabric config invalid: {e}"))?;
     let fabric = Fabric::new(cfg).map_err(|e| format!("Fabric::new failed: {e}"))?;
     Ok(Arc::new(fabric))
 }
@@ -418,13 +426,18 @@ fn new_fabric(
 /// tcp the self-address is a sockaddr blob rendered as `ip:port`; for
 /// verbs it is the raw libfabric address rendered as lowercase hex.
 fn wire_addr_of(fabric: &Fabric, provider: Provider) -> Result<String, String> {
-    let raw = fabric.self_address().map_err(|e| format!("self_address failed: {e}"))?;
+    let raw = fabric
+        .self_address()
+        .map_err(|e| format!("self_address failed: {e}"))?;
     let addr = match provider {
         Provider::Tcp => decode_sockaddr_to_string(&raw),
         Provider::Verbs => hex_encode(&raw),
     };
     if addr.is_empty() {
-        return Err(format!("could not stringify self-address ({} bytes)", raw.len()));
+        return Err(format!(
+            "could not stringify self-address ({} bytes)",
+            raw.len()
+        ));
     }
     Ok(addr)
 }
@@ -511,7 +524,11 @@ fn start_server(
         .map_err(|e| format!("start_rpc_server failed: {e}"))?;
 
     let wire_addr = wire_addr_of(&fabric, common.provider.to_fabric())?;
-    Ok(ServerEndpoint { fabric, wire_addr, _rpc: rpc })
+    Ok(ServerEndpoint {
+        fabric,
+        wire_addr,
+        _rpc: rpc,
+    })
 }
 
 // ---------------------------------------------------------------------
@@ -539,7 +556,13 @@ struct WorkerStat {
 
 impl WorkerStat {
     fn new() -> Self {
-        Self { ops: 0, bytes: 0, errors: 0, lat: Vec::with_capacity(LATENCY_RING), lat_pos: 0 }
+        Self {
+            ops: 0,
+            bytes: 0,
+            errors: 0,
+            lat: Vec::with_capacity(LATENCY_RING),
+            lat_pos: 0,
+        }
     }
 
     fn record(&mut self, bytes: u64, latency: Duration) {
@@ -599,11 +622,19 @@ fn run_client_workload(
             let _ = tx.send(res);
         }),
     );
-    let shard_result = rx.recv().map_err(|_| "client shard thread died".to_string())?;
+    let shard_result = rx
+        .recv()
+        .map_err(|_| "client shard thread died".to_string())?;
     let _ = handle.join();
     let (elapsed, stats) = shard_result?;
 
-    let mut report = ClientReport { elapsed, ops: 0, bytes: 0, errors: 0, latencies: Vec::new() };
+    let mut report = ClientReport {
+        elapsed,
+        ops: 0,
+        bytes: 0,
+        errors: 0,
+        latencies: Vec::new(),
+    };
     for s in stats {
         report.ops += s.ops;
         report.bytes += s.bytes;
@@ -636,8 +667,9 @@ fn client_shard(
         return Ok((Duration::ZERO, Vec::new()));
     }
 
-    let stats: Vec<Rc<RefCell<WorkerStat>>> =
-        (0..workers).map(|_| Rc::new(RefCell::new(WorkerStat::new()))).collect();
+    let stats: Vec<Rc<RefCell<WorkerStat>>> = (0..workers)
+        .map(|_| Rc::new(RefCell::new(WorkerStat::new())))
+        .collect();
     let per_worker_ops = max_ops.map(|n| n.div_ceil(workers as u64).max(1));
 
     // Drive every worker on the shard's cooperative future-set loop, the
@@ -668,7 +700,12 @@ fn client_shard(
 
     let out: Vec<WorkerStat> = stats
         .into_iter()
-        .map(|s| Rc::try_unwrap(s).ok().expect("worker stat still shared").into_inner())
+        .map(|s| {
+            Rc::try_unwrap(s)
+                .ok()
+                .expect("worker stat still shared")
+                .into_inner()
+        })
         .collect();
     Ok((elapsed, out))
 }
@@ -770,7 +807,9 @@ fn verify_client(pool: &Rc<ClientPool>) -> Result<(), String> {
 
         let (first, uniform, total) = observed;
         if total != page_len {
-            return Err(format!("verify key {i}: fetched {total} bytes, expected {page_len}"));
+            return Err(format!(
+                "verify key {i}: fetched {total} bytes, expected {page_len}"
+            ));
         }
         match first {
             Some(b) if b == expect && uniform => {}
@@ -847,8 +886,12 @@ fn run_client(args: ClientArgs) -> Result<(), String> {
     let client = new_fabric(&args.common, Arc::clone(&runtime), FABRIC_WORKER_IDX)?;
     let client_addr = wire_addr_of(&client, provider)?;
 
-    let stream = TcpStream::connect(&args.server_control_addr)
-        .map_err(|e| format!("connect to server control {} failed: {e}", args.server_control_addr))?;
+    let stream = TcpStream::connect(&args.server_control_addr).map_err(|e| {
+        format!(
+            "connect to server control {} failed: {e}",
+            args.server_control_addr
+        )
+    })?;
     let server_addr = handshake_client(stream, &client_addr)?;
     client
         .add_connection(ConnectionSpec {
@@ -886,12 +929,16 @@ fn run_client(args: ClientArgs) -> Result<(), String> {
 /// client's. Both peers write before reading; the payloads are tiny and
 /// fit the socket buffer so this cannot deadlock.
 fn handshake_server(stream: TcpStream, my_addr: &str) -> Result<String, String> {
-    let mut writer = stream.try_clone().map_err(|e| format!("clone control stream: {e}"))?;
+    let mut writer = stream
+        .try_clone()
+        .map_err(|e| format!("clone control stream: {e}"))?;
     writeln!(writer, "{my_addr}").map_err(|e| format!("write self addr: {e}"))?;
     writer.flush().ok();
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
-    reader.read_line(&mut line).map_err(|e| format!("read peer addr: {e}"))?;
+    reader
+        .read_line(&mut line)
+        .map_err(|e| format!("read peer addr: {e}"))?;
     let addr = line.trim().to_string();
     if addr.is_empty() {
         return Err("peer sent empty address".to_string());
@@ -901,12 +948,16 @@ fn handshake_server(stream: TcpStream, my_addr: &str) -> Result<String, String> 
 
 /// Client side of the control handshake: symmetric to the server.
 fn handshake_client(stream: TcpStream, my_addr: &str) -> Result<String, String> {
-    let mut writer = stream.try_clone().map_err(|e| format!("clone control stream: {e}"))?;
+    let mut writer = stream
+        .try_clone()
+        .map_err(|e| format!("clone control stream: {e}"))?;
     writeln!(writer, "{my_addr}").map_err(|e| format!("write self addr: {e}"))?;
     writer.flush().ok();
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
-    reader.read_line(&mut line).map_err(|e| format!("read peer addr: {e}"))?;
+    reader
+        .read_line(&mut line)
+        .map_err(|e| format!("read peer addr: {e}"))?;
     let addr = line.trim().to_string();
     if addr.is_empty() {
         return Err("server sent empty address".to_string());

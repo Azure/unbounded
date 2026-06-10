@@ -92,6 +92,40 @@ pub(super) fn read_pci_bdf(uevent_path: &Path) -> Option<String> {
     None
 }
 
+/// Identify the PCIe root port a device sits behind. The
+/// `bus/pci/devices/<bdf>` symlink resolves to the device's full sysfs
+/// path, e.g. `../../devices/pci0000:00/0000:00:01.0/0000:01:00.0`; the
+/// segment directly beneath the host bridge (`pciDDDD:BB`) is the root
+/// port. Two devices that share a root port are on the same PCIe
+/// complex and can be co-scheduled. Returns `None` when the symlink is
+/// absent or the path exposes no host-bridge segment, so callers
+/// degrade to NUMA-only locality.
+pub(super) fn pcie_root_port(sys_root: &Path, bdf: &str) -> Option<String> {
+    let link = sys_root.join("bus/pci/devices").join(bdf);
+    let target = fs::read_link(&link).ok()?;
+    let mut segments = target.components().filter_map(|c| match c {
+        std::path::Component::Normal(s) => s.to_str(),
+        _ => None,
+    });
+    // Advance past the host-bridge segment; the next segment is the
+    // root port directly beneath it.
+    for segment in segments.by_ref() {
+        if is_host_bridge(segment) {
+            return segments.next().map(|s| s.to_string());
+        }
+    }
+    None
+}
+
+/// Host bridges are named `pciDDDD:BB` (domain:bus) and so contain a
+/// colon but no function suffix, unlike endpoint BDFs `DDDD:BB:DD.F`.
+fn is_host_bridge(segment: &str) -> bool {
+    match segment.strip_prefix("pci") {
+        Some(rest) => rest.contains(':') && !rest.contains('.'),
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,6 +198,63 @@ mod tests {
     fn read_pci_bdf_missing_file_returns_none() {
         let root = staging_root();
         assert!(read_pci_bdf(&root.join("nope")).is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn link_pci(root: &Path, bdf: &str, target: &str) {
+        let link = root.join("bus/pci/devices").join(bdf);
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(target, &link).unwrap();
+    }
+
+    #[test]
+    fn pcie_root_port_walks_to_segment_below_host_bridge() {
+        let root = staging_root();
+        link_pci(
+            &root,
+            "0000:01:00.0",
+            "../../devices/pci0000:00/0000:00:01.0/0000:01:00.0",
+        );
+        assert_eq!(
+            pcie_root_port(&root, "0000:01:00.0").as_deref(),
+            Some("0000:00:01.0")
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pcie_root_port_handles_switch_hierarchy() {
+        let root = staging_root();
+        // Endpoint behind a switch: root port is still the segment
+        // directly beneath the host bridge.
+        link_pci(
+            &root,
+            "0000:03:00.0",
+            "../../devices/pci0000:00/0000:00:02.0/0000:01:00.0/0000:02:01.0/0000:03:00.0",
+        );
+        assert_eq!(
+            pcie_root_port(&root, "0000:03:00.0").as_deref(),
+            Some("0000:00:02.0")
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pcie_root_port_missing_symlink_returns_none() {
+        let root = staging_root();
+        assert!(pcie_root_port(&root, "0000:01:00.0").is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pcie_root_port_no_host_bridge_returns_none() {
+        let root = staging_root();
+        link_pci(
+            &root,
+            "0000:01:00.0",
+            "../../devices/virtual/foo/0000:01:00.0",
+        );
+        assert!(pcie_root_port(&root, "0000:01:00.0").is_none());
         let _ = fs::remove_dir_all(&root);
     }
 

@@ -23,7 +23,10 @@ use crate::fanout::FetchChannel;
 /// content-addressed key (which is already a hash) and avoids pulling
 /// in a hash crate. `shard_count` must be non-zero.
 pub fn owner_shard(key: &StripeKey, shard_count: usize) -> usize {
-    debug_assert!(shard_count > 0, "owner_shard requires a non-zero shard count");
+    debug_assert!(
+        shard_count > 0,
+        "owner_shard requires a non-zero shard count"
+    );
     let bytes = &key.0[..8];
     let h = u64::from_le_bytes(bytes.try_into().expect("8 bytes"));
     (h as usize) % shard_count

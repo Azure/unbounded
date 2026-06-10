@@ -71,6 +71,7 @@ impl Inner {
             Some(w.waker)
         } else {
             self.free.push(page);
+            crate::metrics::bufferpool_free_delta(1);
             None
         }
     }
@@ -120,7 +121,11 @@ impl FreeList {
     pub fn try_alloc_head(&self) -> Option<u32> {
         let mut g = self.inner.borrow_mut();
         if g.waiters.is_empty() {
-            g.free.pop()
+            let page = g.free.pop();
+            if page.is_some() {
+                crate::metrics::bufferpool_free_delta(-1);
+            }
+            page
         } else {
             None
         }
@@ -153,7 +158,11 @@ impl FreeList {
     pub fn try_alloc_spare(&self, reserve: usize) -> Option<u32> {
         let mut g = self.inner.borrow_mut();
         if g.waiters.is_empty() && g.free.len() > reserve {
-            g.free.pop()
+            let page = g.free.pop();
+            if page.is_some() {
+                crate::metrics::bufferpool_free_delta(-1);
+            }
+            page
         } else {
             None
         }
@@ -311,6 +320,7 @@ impl<'a> Future for AllocFuture<'a> {
         // ahead of us; otherwise we would starve parked heads.
         if this.id.is_none() && g.waiters.is_empty() {
             if let Some(p) = g.free.pop() {
+                crate::metrics::bufferpool_free_delta(-1);
                 return Poll::Ready(p);
             }
         }
