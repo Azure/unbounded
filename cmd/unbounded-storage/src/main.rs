@@ -114,6 +114,19 @@ fn main() -> ExitCode {
 
     unbounded_storage::obs::init_from_env();
 
+    #[cfg(feature = "profiling")]
+    {
+        use unbounded_storage::profiling;
+
+        match profiling::ProfilingConfig::from_env() {
+            Ok(cfg) => {
+                profiling::install_signal_handler();
+                profiling::spawn(cfg, || SHUTDOWN.load(Ordering::Acquire));
+            }
+            Err(e) => eprintln!("profiling: disabled: {e}"),
+        }
+    }
+
     fabric::apply_tcp_env_defaults();
 
     let (config_path, config_explicit) = match cli.config.as_ref() {

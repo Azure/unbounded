@@ -11,6 +11,8 @@ pub mod io;
 pub mod memory;
 pub mod obs;
 pub mod p2p;
+#[cfg(feature = "profiling")]
+pub mod profiling;
 pub mod ring;
 pub mod runtime;
 pub mod storage;
