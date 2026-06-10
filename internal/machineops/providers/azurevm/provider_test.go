@@ -204,8 +204,11 @@ func TestPrepareReplacementVM(t *testing.T) {
 			ProvisioningState: toPtr("Succeeded"),
 			OSProfile:         &armcompute.OSProfile{RequireGuestProvisionSignal: toPtr(true)},
 			StorageProfile: &armcompute.StorageProfile{OSDisk: &armcompute.OSDisk{
-				Name:        toPtr("old-osdisk"),
-				ManagedDisk: &armcompute.ManagedDiskParameters{},
+				Name: toPtr("old-osdisk"),
+				ManagedDisk: &armcompute.ManagedDiskParameters{
+					ID:                 toPtr("/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/disks/old-osdisk"),
+					StorageAccountType: toPtr(armcompute.StorageAccountTypesPremiumLRS),
+				},
 			}},
 		},
 	}
@@ -223,6 +226,8 @@ func TestPrepareReplacementVM(t *testing.T) {
 	require.Nil(t, replacement.Properties.OSProfile.RequireGuestProvisionSignal)
 	require.Equal(t, armcompute.DiskCreateOptionTypesFromImage, *replacement.Properties.StorageProfile.OSDisk.CreateOption)
 	require.NotNil(t, replacement.Properties.StorageProfile.OSDisk.ManagedDisk)
+	require.Nil(t, replacement.Properties.StorageProfile.OSDisk.ManagedDisk.ID)
+	require.Equal(t, armcompute.StorageAccountTypesPremiumLRS, *replacement.Properties.StorageProfile.OSDisk.ManagedDisk.StorageAccountType)
 	require.Equal(t, "vm1-osdisk-123", *replacement.Properties.StorageProfile.OSDisk.Name)
 }
 

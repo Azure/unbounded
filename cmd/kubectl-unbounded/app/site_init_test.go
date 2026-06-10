@@ -14,9 +14,11 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
@@ -259,6 +261,59 @@ func TestEnsureControllersAreRunningWrapsMachineOpsFailure(t *testing.T) {
 	require.ErrorIs(t, err, machineOpsErr)
 	require.ErrorContains(t, err, "installing machine-ops controller for site site-a")
 	require.Equal(t, []string{"machina", "machine-ops"}, calls)
+}
+
+func TestEnsureClusterInfoAppliesStandardKubePublicConfigMap(t *testing.T) {
+	t.Parallel()
+
+	kubeCli := fake.NewClientset()
+	h := &siteInitHandler{
+		kubeCli: kubeCli,
+		kubeConfig: &rest.Config{
+			Host: "https://api.example.com:6443",
+			TLSClientConfig: rest.TLSClientConfig{
+				CAData: []byte("test-ca"),
+			},
+		},
+	}
+
+	err := h.ensureClusterInfo(context.Background())
+	require.NoError(t, err)
+
+	cm, err := kubeCli.CoreV1().ConfigMaps(metav1.NamespacePublic).Get(context.Background(), "cluster-info", metav1.GetOptions{})
+	require.NoError(t, err)
+
+	cfg, err := clientcmd.RESTConfigFromKubeConfig([]byte(cm.Data["kubeconfig"]))
+	require.NoError(t, err)
+	require.Equal(t, "https://api.example.com:6443", cfg.Host)
+	require.Equal(t, []byte("test-ca"), cfg.CAData)
+}
+
+func TestClusterInfoKubeconfigReadsCAFile(t *testing.T) {
+	t.Parallel()
+
+	caFile := filepath.Join(t.TempDir(), "ca.crt")
+	require.NoError(t, os.WriteFile(caFile, []byte("file-ca"), 0o600))
+
+	data, err := clusterInfoKubeconfig(&rest.Config{
+		Host: "https://api.example.com:6443",
+		TLSClientConfig: rest.TLSClientConfig{
+			CAFile: caFile,
+		},
+	})
+	require.NoError(t, err)
+
+	cfg, err := clientcmd.RESTConfigFromKubeConfig(data)
+	require.NoError(t, err)
+	require.Equal(t, "https://api.example.com:6443", cfg.Host)
+	require.Equal(t, []byte("file-ca"), cfg.CAData)
+}
+
+func TestClusterInfoKubeconfigRequiresCAData(t *testing.T) {
+	t.Parallel()
+
+	_, err := clusterInfoKubeconfig(&rest.Config{Host: "https://api.example.com:6443"})
+	require.EqualError(t, err, "kubernetes CA data is required")
 }
 
 func newControllerInstallTestHandler(machina, machineOps componentInstaller) *siteInitHandler {
