@@ -140,6 +140,8 @@ KUBECTL_UNBOUNDED_LDFLAGS=$(STAMP_LDFLAGS) -X github.com/Azure/unbounded/cmd/kub
 # Container images for the net controller and node agent.
 NET_CONTROLLER_IMAGE ?= $(CONTAINER_REGISTRY)/unbounded-net-controller:$(VERSION)
 NET_NODE_IMAGE       ?= $(CONTAINER_REGISTRY)/unbounded-net-node:$(VERSION)
+NET_CONTROLLER_IMAGE_PULL_POLICY ?= Always
+NET_NODE_IMAGE_PULL_POLICY       ?= Always
 
 # CNI plugins version baked into the net-node image. Keep in sync with the
 # defaults in images/net-{node,controller}/Dockerfile and the workflow envs.
@@ -817,6 +819,8 @@ machine-ops-controller-oci-push: machine-ops-controller-oci ## Build and push th
 	$(CONTAINER_ENGINE) push $(MACHINE_OPS_CONTROLLER_IMAGE)
 
 MACHINA_NAMESPACE ?= unbounded-kube
+MACHINA_API_SERVER_ENDPOINT ?=
+MACHINA_IMAGE_PULL_POLICY ?= Always
 MACHINA_MANIFEST_TEMPLATES_DIR := deploy/machina
 MACHINA_MANIFEST_RENDERED_DIR  := deploy/machina/rendered
 MACHINE_OPS_NAMESPACE ?= unbounded-kube
@@ -832,7 +836,9 @@ machina-manifests: ## Render machina deployment manifests into deploy/machina/re
 		--templates-dir $(MACHINA_MANIFEST_TEMPLATES_DIR) \
 		--output-dir $(MACHINA_MANIFEST_RENDERED_DIR) \
 		--set Namespace=$(MACHINA_NAMESPACE) \
-		--set ControllerImage=$(MACHINA_IMAGE)
+		--set ControllerImage=$(MACHINA_IMAGE) \
+		--set ControllerImagePullPolicy=$(MACHINA_IMAGE_PULL_POLICY) \
+		--set APIServerEndpoint=$(MACHINA_API_SERVER_ENDPOINT)
 	@cp $(MACHINA_MANIFEST_TEMPLATES_DIR)/crd/*.yaml $(MACHINA_MANIFEST_RENDERED_DIR)/crd/
 	@echo "Rendered machina manifests into $(MACHINA_MANIFEST_RENDERED_DIR) (image: $(MACHINA_IMAGE))"
 
@@ -1091,6 +1097,8 @@ net-manifests: ## Render net manifests into $(NET_MANIFEST_RENDERED_DIR)
 		--set Namespace=$(NET_NAMESPACE) \
 		--set ControllerImage=$(NET_CONTROLLER_IMAGE) \
 		--set NodeImage=$(NET_NODE_IMAGE) \
+		--set ControllerImagePullPolicy=$(NET_CONTROLLER_IMAGE_PULL_POLICY) \
+		--set NodeImagePullPolicy=$(NET_NODE_IMAGE_PULL_POLICY) \
 		--set ForceNotLeader=$(NET_FORCE_NOT_LEADER) \
 		--set AzureTenantID=$(NET_AZURE_TENANT_ID) \
 		--set ApiserverURL=$(NET_APISERVER_URL)

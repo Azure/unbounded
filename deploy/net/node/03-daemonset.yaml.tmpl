@@ -41,7 +41,7 @@ spec:
         # Install CNI plugins to host
         - name: install-cni-plugins
           image: {{ .NodeImage }}
-          imagePullPolicy: Always
+          imagePullPolicy: {{ default "Always" .NodeImagePullPolicy }}
           command:
             - /usr/local/bin/node-agent-init.sh
           volumeMounts:
@@ -54,7 +54,7 @@ spec:
       containers:
         - name: node
           image: {{ .NodeImage }}
-          imagePullPolicy: Always
+          imagePullPolicy: {{ default "Always" .NodeImagePullPolicy }}
           env:
             - name: LOG_LEVEL
               valueFrom:
