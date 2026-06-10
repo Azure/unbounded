@@ -84,6 +84,14 @@ kube-proxy can set network sysctls, while the rest of `/proc/sys` stays
 read-only. Cgroups v2 is forced inside the container to ensure consistent
 behavior regardless of the systemd version in the rootfs.
 
+The default `systemd-nspawn@.service` launcher may still show flags such as
+`--network-veth`. Those flags come from the systemd template, but the generated
+`.nspawn` file is written to the trusted `/etc/systemd/nspawn/` directory and
+the template runs with `--settings=override`. As a result, the generated
+`VirtualEthernet=no` setting is authoritative and the machine shares the host
+network namespace. Host interfaces, host firewall and routing rules, and
+loopback listeners are therefore visible from inside the nspawn machine.
+
 When NVIDIA GPUs are detected on the host, the agent automatically bind-mounts
 the GPU device nodes (e.g. `/dev/nvidia0`, `/dev/nvidiactl`) and the host's
 driver libraries into the container, and grants the necessary cgroup device

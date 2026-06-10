@@ -1,6 +1,7 @@
 # Build artifacts
 bin/
 !cmd/unbounded-storage/src/bin/
+/gantry
 /dist/
 build/
 inventory.db
