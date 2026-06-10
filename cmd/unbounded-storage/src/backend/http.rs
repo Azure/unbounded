@@ -8,7 +8,7 @@
 //! transport: `http://` is plaintext, `https://` runs a TLS 1.3
 //! handshake (OpenSSL) and enables kernel TLS so the body still lands
 //! zero-copy in the destination pages (the kernel decrypts in place).
-//! The record-aware recv path lives in [`super::conn`].
+//! The record-aware recv path lives in [`crate::tls`].
 //!
 //! This is the cold path, so it is deliberately simple: one TCP
 //! connection per fetch (`Connection: close`, no pooling), and one heap
@@ -46,12 +46,11 @@ use crate::bufferpool::{BulkRef, Error, PageRef, PageStream};
 use crate::http::{Method, ResponseHead, StatusCode, serialize_request};
 use crate::ring::{NetHandle, SockAddr};
 use crate::storage::{ObjectMetadata, StripeReq};
+use crate::tls::TlsContext;
 
 use super::Backend;
-use super::conn;
 use super::limiter::FetchLimiter;
 use super::origin_ring::OriginRing;
-use super::tls::TlsContext;
 
 /// Origin backend that fetches stripe byte ranges from an HTTP/1.1
 /// origin server (plaintext `http://` or kernel-TLS `https://`) into
@@ -413,10 +412,7 @@ async fn fetch(
     // Drive the TLS handshake (and enable kTLS) before any request bytes
     // when this is an `https://` backend. `is_tls` then switches the
     // record-aware recv path on for every read on this socket.
-    let is_tls = tls.is_some();
-    if let Some(tls) = &tls {
-        tls.handshake(&handle, conn.fd, &sni_host).await?;
-    }
+    let is_tls = crate::tls::maybe_handshake(&tls, &handle, conn.fd, &sni_host).await?;
 
     let request = format_get_request(&path, &host, start, start + len - 1)?;
     handle.send(conn.fd, request).await.map_err(io_to_err)?;
@@ -435,7 +431,7 @@ async fn fetch(
                 h.content_range_start(),
             );
         }
-        let chunk = conn::recv_chunk(&handle, conn.fd, is_tls).await?;
+        let chunk = crate::tls::recv_chunk(&handle, conn.fd, is_tls).await?;
         if chunk.is_empty() {
             return Err(Error::from(
                 "http backend: connection closed before response headers complete",
@@ -515,8 +511,8 @@ async fn fetch(
         // Pool reserves for this fetch across every await here; the
         // backend is shard-pinned so no other thread touches it. The
         // destination stays reserved until this future resolves.
-        let n_recv = conn::recv_fixed(&handle, conn.fd, is_tls, page_byte_off, recv_len)
-            .await?;
+        let n_recv =
+            crate::tls::recv_fixed(&handle, conn.fd, is_tls, page_byte_off, recv_len).await?;
         if n_recv == 0 {
             // EOF. With a known length this is a truncation; for the
             // close-delimited case it is the normal end of the body.
@@ -573,10 +569,7 @@ async fn fetch_metadata(
 
     // See `fetch`: handshake (and kTLS enable) before the request, then
     // `is_tls` switches the record-aware recv path on.
-    let is_tls = tls.is_some();
-    if let Some(tls) = &tls {
-        tls.handshake(&handle, conn.fd, &sni_host).await?;
-    }
+    let is_tls = crate::tls::maybe_handshake(&tls, &handle, conn.fd, &sni_host).await?;
 
     let request = format_head_request(&path, &host)?;
     handle.send(conn.fd, request).await.map_err(io_to_err)?;
@@ -596,7 +589,7 @@ async fn fetch_metadata(
                 "http backend: metadata HEAD response head exceeds 64 KiB",
             ));
         }
-        let chunk = conn::recv_chunk(&handle, conn.fd, is_tls).await?;
+        let chunk = crate::tls::recv_chunk(&handle, conn.fd, is_tls).await?;
         if chunk.is_empty() {
             return Err(Error::from(
                 "http backend: connection closed before metadata HEAD headers complete",

@@ -7,7 +7,7 @@
 //! fills the destination bufferpool pages. An `http://` endpoint uses
 //! plaintext HTTP/1.1; an `https://` endpoint uses TLS 1.3 driven by
 //! OpenSSL with kernel TLS (kTLS) so the body still lands zero-copy in
-//! the registered backing, with record-aware recv in [`super::conn`].
+//! the registered backing, with record-aware recv in [`crate::tls`].
 //!
 //! It mirrors the S3 backend's fetch/length structure and shares its
 //! cold-path simplicity (one TCP connection per fetch, one heap copy of
@@ -35,12 +35,11 @@ use crate::bufferpool::{BulkRef, Error, PageRef, PageStream};
 use crate::http::{Method, ResponseHead, StatusCode, serialize_request};
 use crate::ring::{NetHandle, SockAddr};
 use crate::storage::{ObjectMetadata, StripeReq};
+use crate::tls::TlsContext;
 
 use super::Backend;
-use super::conn;
 use super::limiter::FetchLimiter;
 use super::origin_ring::OriginRing;
-use super::tls::TlsContext;
 
 /// The pinned `x-ms-version` REST API version sent on every Azure Blob
 /// request. Azure requires this header to select the wire semantics of
@@ -346,10 +345,7 @@ async fn fetch(
     // ring).
     handle.connect(conn.fd, origin).await.map_err(io_to_err)?;
 
-    let is_tls = tls.is_some();
-    if let Some(tls) = &tls {
-        tls.handshake(&handle, conn.fd, &sni_host).await?;
-    }
+    let is_tls = crate::tls::maybe_handshake(&tls, &handle, conn.fd, &sni_host).await?;
 
     let request = format_get_request(&path, &host, start, start + len - 1)?;
     handle.send(conn.fd, request).await.map_err(io_to_err)?;
@@ -366,7 +362,7 @@ async fn fetch(
                 h.content_range_start(),
             );
         }
-        let chunk = conn::recv_chunk(&handle, conn.fd, is_tls).await?;
+        let chunk = crate::tls::recv_chunk(&handle, conn.fd, is_tls).await?;
         if chunk.is_empty() {
             return Err(Error::from(
                 "azure backend: connection closed before response headers complete",
@@ -443,7 +439,8 @@ async fn fetch(
         // Pool reserves for this fetch across every await here; the
         // backend is shard-pinned so no other thread touches it. The
         // destination stays reserved until this future resolves.
-        let n_recv = conn::recv_fixed(&handle, conn.fd, is_tls, page_byte_off, recv_len).await?;
+        let n_recv =
+            crate::tls::recv_fixed(&handle, conn.fd, is_tls, page_byte_off, recv_len).await?;
         if n_recv == 0 {
             // EOF. With a known length this is a truncation; for the
             // close-delimited case it is the normal end of the body.
@@ -494,10 +491,7 @@ async fn fetch_metadata(
     // ring).
     handle.connect(conn.fd, origin).await.map_err(io_to_err)?;
 
-    let is_tls = tls.is_some();
-    if let Some(tls) = &tls {
-        tls.handshake(&handle, conn.fd, &sni_host).await?;
-    }
+    let is_tls = crate::tls::maybe_handshake(&tls, &handle, conn.fd, &sni_host).await?;
 
     let request = format_head_request(&path, &host)?;
     handle.send(conn.fd, request).await.map_err(io_to_err)?;
@@ -515,7 +509,7 @@ async fn fetch_metadata(
                 "azure backend: metadata HEAD response head exceeds 64 KiB",
             ));
         }
-        let chunk = conn::recv_chunk(&handle, conn.fd, is_tls).await?;
+        let chunk = crate::tls::recv_chunk(&handle, conn.fd, is_tls).await?;
         if chunk.is_empty() {
             return Err(Error::from(
                 "azure backend: connection closed before metadata HEAD headers complete",

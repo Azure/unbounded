@@ -35,9 +35,7 @@ use std::task::{Context, Poll};
 
 use io_uring::{opcode, types};
 
-use super::core::{
-    OpFut, OpResource, RecvQuarantine, RingCore, RingSetup, Slot, check_res,
-};
+use super::core::{OpFut, OpResource, RecvQuarantine, RingCore, RingSetup, Slot, check_res};
 
 /// TLS `application_data` record type (RFC 8446). Plaintext bytes the
 /// kernel hands back as ordinary payload also default to this.
@@ -377,7 +375,11 @@ impl NetworkRing {
     /// registered region. `buf_index` 0 is this shard's own backing;
     /// indices 1..N are peer shards' backings registered via
     /// [`Self::register_region_indexed`] for cross-shard zero-copy send.
-    pub(crate) fn fixed_ptr(&self, buf_index: u16, page_byte_offset: usize) -> io::Result<*const u8> {
+    pub(crate) fn fixed_ptr(
+        &self,
+        buf_index: u16,
+        page_byte_offset: usize,
+    ) -> io::Result<*const u8> {
         match self.core.registered_base(buf_index) {
             Some(base) => Ok(unsafe { base.as_ptr().add(page_byte_offset) as *const u8 }),
             None => Err(io::Error::from_raw_os_error(libc::EINVAL)),

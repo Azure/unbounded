@@ -1,13 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Client-side TLS for the origin backends, built on OpenSSL 3 with
+//! Client-side TLS context and handshake, built on OpenSSL 3 with
 //! kernel TLS (kTLS).
 //!
 //! The handshake runs in userspace over the caller-owned socket fd, but
 //! we set `SSL_OP_ENABLE_KTLS` so OpenSSL hands the negotiated keys to
 //! the kernel (`setsockopt(SOL_TLS, ...)`). After a successful handshake
-//! the kernel performs the symmetric crypto, so the backend keeps using
+//! the kernel performs the symmetric crypto, so a caller keeps using
 //! plain io_uring `send`/`recv_fixed_msg` against the same fd: the body
 //! lands decrypted directly in the registered backing (zero copy
 //! preserved). We assert both kTLS directions actually engaged and fail
@@ -27,12 +27,13 @@
 use std::ffi::CString;
 use std::fmt;
 use std::os::fd::RawFd;
+use std::rc::Rc;
 
-use super::tls_ffi;
+use super::ffi;
 use crate::bufferpool::Error;
 use crate::ring::NetHandle;
 
-/// Per-backend TLS knobs derived from the backend config.
+/// Per-connection TLS knobs derived from the caller's config.
 #[derive(Debug, Clone, Default)]
 pub struct TlsConfig {
     /// Optional path to a PEM CA bundle to trust in addition to the
@@ -44,18 +45,19 @@ pub struct TlsConfig {
     pub insecure_skip_verify: bool,
 }
 
-/// A configured client `SSL_CTX`, shared by every connection a backend
-/// makes. Shard-pinned: a backend and its `TlsContext` live on one
-/// thread, so the raw `SSL_CTX` pointer is never touched concurrently.
+/// A configured client `SSL_CTX`, shared by every connection a caller
+/// makes. Shard-pinned: a `TlsContext` and the backend that owns it live
+/// on one thread, so the raw `SSL_CTX` pointer is never touched
+/// concurrently.
 pub struct TlsContext {
-    ctx: *mut tls_ffi::SSL_CTX,
+    ctx: *mut ffi::SSL_CTX,
     verify: bool,
 }
 
 // SAFETY: the same shard-pinned justification as the backends. The
-// `SSL_CTX` is only used from the single thread that owns the backend;
-// the Send + Sync bounds exist solely so the backend can satisfy the
-// `Backend: Send + Sync` supertrait.
+// `SSL_CTX` is only used from the single thread that owns the context;
+// the Send + Sync bounds exist solely so a backend holding a
+// `TlsContext` can satisfy the `Backend: Send + Sync` supertrait.
 unsafe impl Send for TlsContext {}
 unsafe impl Sync for TlsContext {}
 
@@ -65,12 +67,12 @@ impl TlsContext {
         // SAFETY: OpenSSL 3 self-initializes on first use; every call
         // below is a standard libssl entry point with checked returns.
         unsafe {
-            let method = tls_ffi::TLS_client_method();
+            let method = ffi::TLS_client_method();
             if method.is_null() {
                 return Err(ssl_error("TLS_client_method returned null"));
             }
 
-            let ctx = tls_ffi::SSL_CTX_new(method);
+            let ctx = ffi::SSL_CTX_new(method);
             if ctx.is_null() {
                 return Err(ssl_error("SSL_CTX_new returned null"));
             }
@@ -78,34 +80,32 @@ impl TlsContext {
             // From here on, free the ctx on any error.
             let guard = CtxGuard { ctx };
 
-            if tls_ffi::ub_ssl_ctx_set_min_proto_version(ctx, tls_ffi::ub_tls1_2_version()) != 1 {
+            if ffi::ub_ssl_ctx_set_min_proto_version(ctx, ffi::ub_tls1_2_version()) != 1 {
                 return Err(ssl_error("SSL_CTX_set_min_proto_version failed"));
             }
 
             // Ask OpenSSL to enable kernel TLS for connections from this
             // context. The actual engagement is asserted post-handshake.
-            tls_ffi::ub_ssl_ctx_set_options(ctx, tls_ffi::ub_ssl_op_enable_ktls());
+            ffi::ub_ssl_ctx_set_options(ctx, ffi::ub_ssl_op_enable_ktls());
 
             let verify = !config.insecure_skip_verify;
             if verify {
-                tls_ffi::SSL_CTX_set_verify(ctx, tls_ffi::SSL_VERIFY_PEER, None);
-                if tls_ffi::SSL_CTX_set_default_verify_paths(ctx) != 1 {
+                ffi::SSL_CTX_set_verify(ctx, ffi::SSL_VERIFY_PEER, None);
+                if ffi::SSL_CTX_set_default_verify_paths(ctx) != 1 {
                     return Err(ssl_error("SSL_CTX_set_default_verify_paths failed"));
                 }
                 if let Some(path) = config.ca_cert_path.as_deref() {
-                    let c_path = CString::new(path)
-                        .map_err(|_| Error::transport(TlsError("ca_cert_path contains NUL".into())))?;
-                    if tls_ffi::SSL_CTX_load_verify_locations(
-                        ctx,
-                        c_path.as_ptr(),
-                        std::ptr::null(),
-                    ) != 1
+                    let c_path = CString::new(path).map_err(|_| {
+                        Error::transport(TlsError("ca_cert_path contains NUL".into()))
+                    })?;
+                    if ffi::SSL_CTX_load_verify_locations(ctx, c_path.as_ptr(), std::ptr::null())
+                        != 1
                     {
                         return Err(ssl_error("SSL_CTX_load_verify_locations failed"));
                     }
                 }
             } else {
-                tls_ffi::SSL_CTX_set_verify(ctx, tls_ffi::SSL_VERIFY_NONE, None);
+                ffi::SSL_CTX_set_verify(ctx, ffi::SSL_VERIFY_NONE, None);
             }
 
             guard.disarm();
@@ -123,7 +123,7 @@ impl TlsContext {
 
         // SAFETY: `ssl` is freed by `SslGuard` on every path. `fd` is
         // owned by the caller for the duration of the handshake.
-        let ssl = unsafe { tls_ffi::SSL_new(self.ctx) };
+        let ssl = unsafe { ffi::SSL_new(self.ctx) };
         if ssl.is_null() {
             return Err(ssl_error("SSL_new returned null"));
         }
@@ -131,48 +131,55 @@ impl TlsContext {
 
         // SAFETY: standard libssl client setup on a fresh SSL object.
         unsafe {
-            if tls_ffi::SSL_set_fd(ssl.ssl, fd) != 1 {
+            if ffi::SSL_set_fd(ssl.ssl, fd) != 1 {
                 return Err(ssl_error("SSL_set_fd failed"));
             }
-            if tls_ffi::ub_ssl_set_tlsext_host_name(ssl.ssl, c_host.as_ptr()) != 1 {
+            if ffi::ub_ssl_set_tlsext_host_name(ssl.ssl, c_host.as_ptr()) != 1 {
                 return Err(ssl_error("SSL_set_tlsext_host_name failed"));
             }
-            if self.verify && tls_ffi::SSL_set1_host(ssl.ssl, c_host.as_ptr()) != 1 {
+            if self.verify && ffi::SSL_set1_host(ssl.ssl, c_host.as_ptr()) != 1 {
                 return Err(ssl_error("SSL_set1_host failed"));
             }
-            tls_ffi::SSL_set_connect_state(ssl.ssl);
+            ffi::SSL_set_connect_state(ssl.ssl);
         }
 
         set_nonblocking(fd)?;
 
         loop {
+            // OpenSSL requires the thread's error queue to be empty
+            // before the I/O call so SSL_get_error classifies this
+            // attempt's result reliably; stale entries from an earlier
+            // handshake on this shard thread would otherwise be
+            // misreported as a protocol error.
+            unsafe { ffi::ERR_clear_error() };
+
             // SAFETY: ssl is valid; SSL_connect drives the handshake
             // against the non-blocking fd.
-            let ret = unsafe { tls_ffi::SSL_connect(ssl.ssl) };
+            let ret = unsafe { ffi::SSL_connect(ssl.ssl) };
             if ret == 1 {
                 break;
             }
-            let err = unsafe { tls_ffi::SSL_get_error(ssl.ssl, ret) };
+            let err = unsafe { ffi::SSL_get_error(ssl.ssl, ret) };
             match err {
-                tls_ffi::SSL_ERROR_WANT_READ => {
+                ffi::SSL_ERROR_WANT_READ => {
                     handle
                         .poll_ready(fd, libc::POLLIN as u32)
                         .await
                         .map_err(Error::transport)?;
                 }
-                tls_ffi::SSL_ERROR_WANT_WRITE => {
+                ffi::SSL_ERROR_WANT_WRITE => {
                     handle
                         .poll_ready(fd, libc::POLLOUT as u32)
                         .await
                         .map_err(Error::transport)?;
                 }
-                tls_ffi::SSL_ERROR_SYSCALL => {
+                ffi::SSL_ERROR_SYSCALL => {
                     return Err(ssl_error("TLS handshake failed (syscall/connection error)"));
                 }
-                tls_ffi::SSL_ERROR_ZERO_RETURN => {
+                ffi::SSL_ERROR_ZERO_RETURN => {
                     return Err(ssl_error("TLS handshake failed (peer closed connection)"));
                 }
-                tls_ffi::SSL_ERROR_SSL => {
+                ffi::SSL_ERROR_SSL => {
                     return Err(ssl_error("TLS handshake failed (protocol error)"));
                 }
                 _ => {
@@ -182,8 +189,8 @@ impl TlsContext {
         }
 
         if self.verify {
-            let result = unsafe { tls_ffi::SSL_get_verify_result(ssl.ssl) };
-            if result != tls_ffi::X509_V_OK {
+            let result = unsafe { ffi::SSL_get_verify_result(ssl.ssl) };
+            if result != ffi::X509_V_OK {
                 return Err(Error::transport(TlsError(format!(
                     "certificate verification failed (X509 code {result})"
                 ))));
@@ -193,8 +200,8 @@ impl TlsContext {
         // Refuse to proceed unless the kernel actually took over crypto
         // in both directions; otherwise the zero-copy data path would be
         // silently wrong.
-        let send_ok = unsafe { tls_ffi::ub_ssl_ktls_send_enabled(ssl.ssl) } == 1;
-        let recv_ok = unsafe { tls_ffi::ub_ssl_ktls_recv_enabled(ssl.ssl) } == 1;
+        let send_ok = unsafe { ffi::ub_ssl_ktls_send_enabled(ssl.ssl) } == 1;
+        let recv_ok = unsafe { ffi::ub_ssl_ktls_recv_enabled(ssl.ssl) } == 1;
         if !send_ok || !recv_ok {
             return Err(Error::transport(TlsError(format!(
                 "kernel TLS not engaged (tx={send_ok}, rx={recv_ok}); \
@@ -209,17 +216,36 @@ impl TlsContext {
     }
 }
 
+/// Drive the TLS handshake when `tls` is set, returning whether the
+/// connection is now TLS. A `None` context is a plaintext origin: no
+/// handshake runs and `false` is returned. Centralizes the
+/// `is_some()` + conditional-handshake pattern the origin backends
+/// (`http`, `s3`, `azure`) repeat for every fetch.
+pub(crate) async fn maybe_handshake(
+    tls: &Option<Rc<TlsContext>>,
+    handle: &NetHandle,
+    fd: RawFd,
+    sni_host: &str,
+) -> Result<bool, Error> {
+    if let Some(tls) = tls {
+        tls.handshake(handle, fd, sni_host).await?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 impl Drop for TlsContext {
     fn drop(&mut self) {
         // SAFETY: `ctx` was produced by SSL_CTX_new and is freed once.
-        unsafe { tls_ffi::SSL_CTX_free(self.ctx) };
+        unsafe { ffi::SSL_CTX_free(self.ctx) };
     }
 }
 
 /// Frees an `SSL_CTX` unless disarmed. Used to unwind a partially
 /// configured context on error during `TlsContext::new`.
 struct CtxGuard {
-    ctx: *mut tls_ffi::SSL_CTX,
+    ctx: *mut ffi::SSL_CTX,
 }
 
 impl CtxGuard {
@@ -231,19 +257,19 @@ impl CtxGuard {
 impl Drop for CtxGuard {
     fn drop(&mut self) {
         // SAFETY: only reached on the error path; ctx is a live SSL_CTX.
-        unsafe { tls_ffi::SSL_CTX_free(self.ctx) };
+        unsafe { ffi::SSL_CTX_free(self.ctx) };
     }
 }
 
 /// Frees an `SSL` on drop. The fd is owned elsewhere (no-close BIO).
 struct SslGuard {
-    ssl: *mut tls_ffi::SSL,
+    ssl: *mut ffi::SSL,
 }
 
 impl Drop for SslGuard {
     fn drop(&mut self) {
         // SAFETY: ssl is a live SSL object freed exactly once here.
-        unsafe { tls_ffi::SSL_free(self.ssl) };
+        unsafe { ffi::SSL_free(self.ssl) };
     }
 }
 
@@ -275,13 +301,17 @@ fn ssl_error(context: &str) -> Error {
     // SAFETY: ERR_get_error / ERR_error_string_n are thread-safe reads
     // of the OpenSSL error queue.
     let detail = unsafe {
-        let code = tls_ffi::ERR_get_error();
+        let code = ffi::ERR_get_error();
         if code == 0 {
             String::new()
         } else {
             let mut buf = [0i8; 256];
-            tls_ffi::ERR_error_string_n(code, buf.as_mut_ptr(), buf.len());
-            let bytes = buf.iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect::<Vec<u8>>();
+            ffi::ERR_error_string_n(code, buf.as_mut_ptr(), buf.len());
+            let bytes = buf
+                .iter()
+                .take_while(|&&c| c != 0)
+                .map(|&c| c as u8)
+                .collect::<Vec<u8>>();
             String::from_utf8_lossy(&bytes).into_owned()
         }
     };

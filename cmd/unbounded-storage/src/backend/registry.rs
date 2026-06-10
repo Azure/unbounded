@@ -32,12 +32,12 @@ use crate::bufferpool::{BulkRef, Error, PageRef, PageStream};
 use crate::config::reconcile::BackendReconcileTarget;
 use crate::config::{BackendSpec, backend_spec};
 use crate::storage::StripeReq;
+use crate::tls::{TlsConfig, TlsContext};
 
 use super::{
     AzureBackend, Backend, FakeBackend, HttpBackend, OriginBackend, OriginRing, OriginStream,
     S3Backend,
 };
-use super::tls::{TlsConfig, TlsContext};
 use super::url::parse_endpoint;
 
 /// The build context a registry needs to (re)construct an
@@ -124,11 +124,11 @@ impl BuildCtx {
     /// Build one [`OriginBackend`] from `spec`, selecting the concrete
     /// origin implementation by [`BackendSpec::config`]. Real origin URLs
     /// are parsed as `scheme://host[:port]` values. The authority
-    /// (`host:port`, port defaulted from the scheme) is resolved to an
-    /// origin address and carried as the `Host:` header. The bare host is
-    /// used for TLS SNI/certificate verification. For an `https` URL a
-    /// shared [`TlsContext`] is built from the backend's TLS knobs and
-    /// handed to the backend; `http` URLs pass `None` and stay plaintext.
+    /// (`host:port`, port defaulted from the scheme) is resolved to an origin
+    /// address. The `Host:` header carries the host with any non-default port;
+    /// the bare host is used for TLS SNI/certificate verification. For an
+    /// `https` URL a shared [`TlsContext`] is built from the backend's TLS knobs
+    /// and handed to the backend; `http` URLs pass `None` and stay plaintext.
     fn build(&self, spec: &BackendSpec) -> io::Result<OriginBackend> {
         match spec.config.as_ref() {
             Some(backend_spec::Config::Http(cfg)) => {
@@ -232,8 +232,8 @@ fn build_origin_endpoint(
     };
 
     Ok(OriginEndpoint {
-        authority: authority.clone(),
-        host: authority,
+        authority,
+        host: url.host_header(),
         sni_host: url.host,
         tls,
     })
@@ -407,7 +407,8 @@ mod tests {
         let reg = registry(&[]);
         assert_eq!(reg.len(), 0);
 
-        reg.add(&http_spec("a", "http://127.0.0.1:1")).expect("add a");
+        reg.add(&http_spec("a", "http://127.0.0.1:1"))
+            .expect("add a");
         assert!(reg.contains("a"));
         assert_eq!(reg.len(), 1);
 

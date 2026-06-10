@@ -4,13 +4,13 @@
  *
  * Minimal C shim for the unbounded-storage OpenSSL/kTLS client.
  *
- * Several OpenSSL entry points the backend needs are exposed only as
+ * Several OpenSSL entry points the TLS module needs are exposed only as
  * preprocessor macros over `SSL_ctrl`/`SSL_CTX_ctrl` (for example
  * `SSL_CTX_set_options`, `SSL_CTX_set_min_proto_version`,
  * `SSL_set_tlsext_host_name`) or as macros over `BIO_ctrl`
  * (`BIO_get_ktls_send`/`BIO_get_ktls_recv`). Macros have no exported
  * symbols, so Rust FFI cannot call them directly. This shim is the only
- * piece of C the backend module ships; everything else is Rust.
+ * piece of C the tls module ships; everything else is Rust.
  *
  * The shim also hides a couple of OpenSSL constants
  * (`SSL_OP_ENABLE_KTLS`, `TLS1_2_VERSION`) behind plain functions so the
@@ -40,8 +40,8 @@ long ub_ssl_set_tlsext_host_name(SSL *ssl, const char *name) {
  * BIO_get_ktls_send/BIO_get_ktls_recv are macros over BIO_ctrl. They
  * return 1 only when the kernel TLS data path is actually engaged for
  * that direction (correct cipher negotiated, kernel `tls` ULP active).
- * The backend asserts both are 1 after the handshake; otherwise it
- * would silently fall back to a non-zero-copy userspace path, which we
+ * The handshake asserts both are 1 afterwards; otherwise it would
+ * silently fall back to a non-zero-copy userspace path, which we
  * refuse.
  */
 int ub_ssl_ktls_send_enabled(SSL *ssl) {

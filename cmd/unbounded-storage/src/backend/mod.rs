@@ -31,15 +31,6 @@ mod azure;
 #[cfg(target_os = "linux")]
 mod fake;
 
-#[cfg(target_os = "linux")]
-mod tls;
-
-#[cfg(target_os = "linux")]
-mod tls_ffi;
-
-#[cfg(target_os = "linux")]
-mod conn;
-
 use std::sync::Arc;
 
 use crate::bufferpool::{BulkRef, PageRef, PageStream, Req};
@@ -69,9 +60,6 @@ pub use azure::AzureBackend;
 
 #[cfg(target_os = "linux")]
 pub use fake::{FakeBackend, FakeFetchStream};
-
-#[cfg(target_os = "linux")]
-pub use tls::{TlsConfig, TlsContext};
 
 /// Origin fetch surface, sibling to `bufferpool::Transport`. A
 /// `Backend` resolves a `BulkRef` from an authoritative origin (as

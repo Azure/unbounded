@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 
 //! Hand-written OpenSSL FFI declarations plus shim externs for the
-//! macro-only entry points compiled in `src/backend/tls_shim.c`.
+//! macro-only entry points compiled in `src/tls/shim.c`.
 //!
 //! The surface is deliberately minimal: enough to drive a client TLS
 //! handshake over a caller-owned socket fd and to enable kernel TLS so
@@ -61,8 +61,9 @@ unsafe extern "C" {
 
     pub fn ERR_get_error() -> c_ulong;
     pub fn ERR_error_string_n(e: c_ulong, buf: *mut c_char, len: usize);
+    pub fn ERR_clear_error();
 
-    // Macro-only entry points exported via src/backend/tls_shim.c.
+    // Macro-only entry points exported via src/tls/shim.c.
     pub fn ub_ssl_ctx_set_options(ctx: *mut SSL_CTX, op: c_ulong) -> c_ulong;
     pub fn ub_ssl_ctx_set_min_proto_version(ctx: *mut SSL_CTX, version: c_int) -> c_int;
     pub fn ub_ssl_set_tlsext_host_name(ssl: *mut SSL, name: *const c_char) -> c_long;

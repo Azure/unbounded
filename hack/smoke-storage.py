@@ -85,23 +85,35 @@ STORAGE_PREFIX = os.environ.get("SMOKE_STORAGE_PREFIX", "/opt/unbounded-storage"
 STORAGE_TARBALL = os.environ.get("SMOKE_STORAGE_TARBALL", "")
 
 
-def _openssl_bin() -> str:
+def _openssl_bin() -> tuple[str, dict[str, str]]:
     """Locate the openssl(1) CLI to use for cert generation.
 
     Prefer the bundled OpenSSL (tmp/openssl/<ver>/bin/openssl) so it matches the
     libcrypto/libssl this test runs against. The system CLI is built against a
     different ABI and SEGFAULTs if it loads our bundled libs via
     LD_LIBRARY_PATH, so it must not be used here. Falls back to PATH `openssl`.
+
+    Returns the binary path plus the environment it must run with. The bundled
+    CLI is dynamically linked against the bundled libssl/libcrypto (>=3.5); the
+    runner's system libs (3.0.x) lack the required symbol versions, so the
+    bundled `lib` dir must be put ahead of the system libs via LD_LIBRARY_PATH
+    or the binary fails to load. The system CLI needs no such override.
     """
     candidates = sorted(REPO_ROOT.glob("tmp/openssl/*/bin/openssl"), reverse=True)
     for c in candidates:
         if c.is_file():
-            return str(c)
+            env = dict(os.environ)
+            libdir = c.parent.parent / "lib"
+            existing = env.get("LD_LIBRARY_PATH", "")
+            env["LD_LIBRARY_PATH"] = (
+                f"{libdir}:{existing}" if existing else str(libdir)
+            )
+            return str(c), env
 
-    return "openssl"
+    return "openssl", dict(os.environ)
 
 
-OPENSSL_BIN = _openssl_bin()
+OPENSSL_BIN, OPENSSL_ENV = _openssl_bin()
 
 # Self-signed cert/key for the HTTPS origin, generated once at startup.
 # The cert carries `subjectAltName=DNS:localhost` (and IP:127.0.0.1) so the
@@ -621,7 +633,9 @@ def generate_tls_cert() -> None:
         "-addext",
         "basicConstraints=critical,CA:TRUE",
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, check=False, env=OPENSSL_ENV
+    )
     if result.returncode != 0:
         die(f"openssl cert generation failed: {result.stderr}")
 

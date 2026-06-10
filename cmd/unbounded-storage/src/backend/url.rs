@@ -5,14 +5,23 @@
 //!
 //! A backend URL is a value of the form
 //! `scheme://host[:port][/path]` where `scheme` is `http` or `https`.
-//! This is intentionally a tiny hand-rolled parser rather than a
-//! dependency on the `url` crate: backends only need the scheme (to
+//! Parsing of the authority (host, optional port, optional userinfo,
+//! IPv6 brackets, and any trailing path/query/fragment) is delegated to
+//! [`http::Uri`] from the `http` crate, which the backends already
+//! depend on, rather than re-implementing URL parsing or pulling in the
+//! `url` crate. `http::Uri` is permissive in ways a config value must
+//! not be, so this is a thin wrapper that enforces the strict rules:
+//! the scheme must be `http` or `https`, the host must be non-empty, and
+//! a present port must be a valid `u16` (`http::Uri` silently ignores an
+//! out-of-range or non-numeric port). Backends only need the scheme (to
 //! decide TLS), the host (for DNS resolution, TLS SNI, and the `Host:`
 //! header), and the port (defaulted from the scheme when absent). The
-//! path component is accepted and ignored; object paths are derived
-//! from the request, not the endpoint.
+//! path component is accepted and ignored; object paths are derived from
+//! the request, not the endpoint.
 
 use std::fmt;
+
+use ::http::Uri;
 
 /// Transport scheme of a backend URL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +64,20 @@ impl EndpointUrl {
     pub fn authority(&self) -> String {
         format!("{}:{}", self.host, self.port)
     }
+
+    /// Value for the HTTP `Host:` header. The default port for the
+    /// scheme is omitted so a default-port endpoint sends the canonical
+    /// bare host (`example.com`, not `example.com:443`); virtual-hosted
+    /// origins (S3, Azure Blob, CDN front ends) that route on the bare
+    /// server name reject or mis-route a redundant default port. A
+    /// non-default port is retained, as the peer expects it.
+    pub fn host_header(&self) -> String {
+        if self.port == self.scheme.default_port() {
+            self.host.clone()
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
+    }
 }
 
 /// Error returned when a backend URL string is not valid.
@@ -90,6 +113,9 @@ impl std::error::Error for UrlError {}
 /// Parse a backend `url` string into an [`EndpointUrl`].
 pub fn parse_endpoint(url: &str) -> Result<EndpointUrl, UrlError> {
     let (scheme_str, rest) = url.split_once("://").ok_or(UrlError::MissingScheme)?;
+    if rest.is_empty() {
+        return Err(UrlError::EmptyHost);
+    }
 
     let scheme = match scheme_str.to_ascii_lowercase().as_str() {
         "http" => Scheme::Http,
@@ -97,58 +123,56 @@ pub fn parse_endpoint(url: &str) -> Result<EndpointUrl, UrlError> {
         other => return Err(UrlError::UnsupportedScheme(other.to_string())),
     };
 
-    // Strip any path, query, or fragment; only the authority matters.
-    let authority = rest
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or("")
-        .trim_end_matches('.');
+    // http::Uri handles userinfo, IPv6 brackets, and path/query/fragment
+    // stripping. It rejects an empty host outright (parse error), which we
+    // surface as `EmptyHost`.
+    let uri: Uri = url.parse().map_err(|_| UrlError::EmptyHost)?;
+    let authority = uri.authority().ok_or(UrlError::EmptyHost)?;
 
-    // Drop optional userinfo (`user:pass@host`); anonymous origins only.
-    let authority = match authority.rsplit_once('@') {
-        Some((_, host_port)) => host_port,
-        None => authority,
-    };
+    let raw_host = authority.host();
+    if raw_host.is_empty() {
+        return Err(UrlError::EmptyHost);
+    }
 
-    let (host, port) = split_host_port(authority, scheme)?;
+    // http::Uri keeps the brackets on an IPv6 literal; strip them so the
+    // host is a bare name usable for DNS, TLS SNI, and the Host header.
+    let host = raw_host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(raw_host)
+        .trim_end_matches('.')
+        .to_string();
 
     if host.is_empty() {
         return Err(UrlError::EmptyHost);
     }
 
-    Ok(EndpointUrl {
-        scheme,
-        host: host.to_string(),
-        port,
-    })
+    let port = resolve_port(authority.as_str(), raw_host, scheme)?;
+
+    Ok(EndpointUrl { scheme, host, port })
 }
 
-/// Split an authority into host and port, honoring `[ipv6]:port`
-/// bracket form and defaulting the port from the scheme.
-fn split_host_port(authority: &str, scheme: Scheme) -> Result<(&str, u16), UrlError> {
-    if let Some(after_bracket) = authority.strip_prefix('[') {
-        // Bracketed IPv6 literal: `[host]` or `[host]:port`.
-        let (host, tail) = after_bracket
-            .split_once(']')
-            .ok_or_else(|| UrlError::InvalidPort(authority.to_string()))?;
-        let port = match tail.strip_prefix(':') {
-            Some(p) => parse_port(p)?,
-            None if tail.is_empty() => scheme.default_port(),
-            None => return Err(UrlError::InvalidPort(authority.to_string())),
-        };
-        return Ok((host, port));
-    }
+/// Resolve the URL port from an `http::Uri` authority.
+///
+/// `http::Uri` treats an out-of-range or non-numeric port as absent
+/// (`port_u16()` returns `None`), so a typo'd port would silently fall
+/// back to the scheme default. Detect a present-but-invalid port from
+/// the raw authority string and reject it instead. `authority` is the
+/// `[userinfo@]host[:port]` string and `raw_host` is its host component
+/// with IPv6 brackets still attached, so the substring after the host is
+/// the literal `:port` (or empty when no port is given).
+fn resolve_port(authority: &str, raw_host: &str, scheme: Scheme) -> Result<u16, UrlError> {
+    let host_port = match authority.rsplit_once('@') {
+        Some((_, hp)) => hp,
+        None => authority,
+    };
 
-    match authority.rsplit_once(':') {
-        Some((host, p)) => Ok((host, parse_port(p)?)),
-        None => Ok((authority, scheme.default_port())),
+    match host_port[raw_host.len()..].strip_prefix(':') {
+        Some(p) => p
+            .parse::<u16>()
+            .map_err(|_| UrlError::InvalidPort(p.to_string())),
+        None => Ok(scheme.default_port()),
     }
-}
-
-/// Parse a non-empty port string into a `u16`.
-fn parse_port(p: &str) -> Result<u16, UrlError> {
-    p.parse::<u16>()
-        .map_err(|_| UrlError::InvalidPort(p.to_string()))
 }
 
 #[cfg(test)]
@@ -177,6 +201,31 @@ mod tests {
         let u = parse_endpoint("https://s3.us-east-1.amazonaws.com:8443").unwrap();
         assert_eq!(u.host, "s3.us-east-1.amazonaws.com");
         assert_eq!(u.port, 8443);
+    }
+
+    #[test]
+    fn host_header_omits_default_port() {
+        // Default ports are dropped so the Host header stays canonical
+        // and virtual-hosted origins route on the bare server name.
+        let u = parse_endpoint("https://s3.example.com").unwrap();
+        assert_eq!(u.authority(), "s3.example.com:443");
+        assert_eq!(u.host_header(), "s3.example.com");
+
+        let u = parse_endpoint("http://origin.example.com").unwrap();
+        assert_eq!(u.host_header(), "origin.example.com");
+
+        // An explicitly written default port is also collapsed.
+        let u = parse_endpoint("https://s3.example.com:443").unwrap();
+        assert_eq!(u.host_header(), "s3.example.com");
+    }
+
+    #[test]
+    fn host_header_retains_non_default_port() {
+        let u = parse_endpoint("https://minio.local:9000").unwrap();
+        assert_eq!(u.host_header(), "minio.local:9000");
+
+        let u = parse_endpoint("http://origin.example.com:8080").unwrap();
+        assert_eq!(u.host_header(), "origin.example.com:8080");
     }
 
     #[test]

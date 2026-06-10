@@ -127,15 +127,16 @@ is the manual override.
 
 ### OpenSSL dependency
 
-The origin backends (`src/backend/{http,s3,azure}.rs`) speak TLS to
-`https://` origins via OpenSSL with kernel TLS (kTLS), so the negotiated
-body lands decrypted directly in the registered backing (zero copy). The
-C `tls_shim.c` is compiled against the OpenSSL headers by `build.rs` via
-pkg-config, and the binary loads `libssl.so`/`libcrypto.so` at runtime.
+The shared `tls` module (`src/tls/`) speaks TLS to `https://` origins via
+OpenSSL with kernel TLS (kTLS), so the negotiated body lands decrypted
+directly in the registered backing (zero copy). The origin backends
+(`src/backend/{http,s3,azure}.rs`) drive it. The C `src/tls/shim.c` is
+compiled against the OpenSSL headers by `build.rs` via pkg-config, and the
+binary loads `libssl.so`/`libcrypto.so` at runtime.
 
 kTLS receive on TLS 1.3 requires OpenSSL >= 3.5: OpenSSL 3.0.x only
 engages kTLS for the send direction on 1.3, so the receive-offload
-assertion in `src/backend/tls.rs` fails against the common system 3.0.x.
+assertion in `src/tls/context.rs` fails against the common system 3.0.x.
 The Makefile therefore builds a pinned OpenSSL from source, mirroring
 libfabric:
 

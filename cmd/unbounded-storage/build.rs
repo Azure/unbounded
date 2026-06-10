@@ -49,7 +49,7 @@ fn main() {
         .expect("pkg-config could not locate `openssl` (try setting OPENSSL_PKG_CONFIG_PATH)");
 
     let mut tls_build = cc::Build::new();
-    tls_build.file("src/backend/tls_shim.c");
+    tls_build.file("src/tls/shim.c");
     for p in &openssl.include_paths {
         tls_build.include(p);
     }
@@ -58,8 +58,8 @@ fn main() {
     generate_config_schema();
 
     println!("cargo:rerun-if-changed=src/fabric/shim.c");
-    println!("cargo:rerun-if-changed=src/backend/tls_shim.c");
     println!("cargo:rerun-if-changed=../../api/unbounded-storage/config.proto");
+    println!("cargo:rerun-if-changed=src/tls/shim.c");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=LIBFABRIC_PKG_CONFIG_PATH");
     println!("cargo:rerun-if-env-changed=OPENSSL_PKG_CONFIG_PATH");
