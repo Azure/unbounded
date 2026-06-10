@@ -99,6 +99,19 @@ func (nspawnNodeOperator) FindActiveMachine(log *slog.Logger) (*ActiveMachine, e
 			return nil, fmt.Errorf("decode applied config %s: %w", path, err)
 		}
 
+		// MachineName must be resolved before the node name because
+		// BackfillNodeName falls back to MachineName. The applied config is
+		// normally persisted with a name already set, so this is usually a
+		// no-op; it covers configs written by older agents or hand-edited.
+		source, err := cfg.BackfillMachineName()
+		if err != nil {
+			return nil, fmt.Errorf("backfill applied config machine name %s: %w", path, err)
+		}
+
+		if source != "config" {
+			log.Info("resolved unbounded MachineName", "name", cfg.MachineName, "source", source)
+		}
+
 		if err := cfg.BackfillNodeName(); err != nil {
 			return nil, fmt.Errorf("backfill applied config node name %s: %w", path, err)
 		}

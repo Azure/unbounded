@@ -193,7 +193,7 @@ func buildBootstrapRESTConfig(cfg *provision.AgentConfig) (*rest.Config, error) 
 }
 
 // registerMachine ensures a Machine CR exists for this node. If the CR
-// already exists, it is left untouched. Otherwise a minimal CR is created
+// already exists, it is left untouched. Otherwise, a minimal CR is created
 // from the applied config. This supports dynamic environments where a
 // Machine CR may not have been pre-created by machina.
 func registerMachine(ctx context.Context, log *slog.Logger, c client.Client, cfg *provision.AgentConfig) error {

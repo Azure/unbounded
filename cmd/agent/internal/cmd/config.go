@@ -6,6 +6,7 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 
@@ -27,7 +28,7 @@ func requiredEnv(n string) (string, error) {
 // UNBOUNDED_AGENT_CONFIG_FILE.  When that variable is unset the function falls
 // back to the legacy per-field environment variables so that existing
 // deployments keep working without changes.
-func loadConfig() (*provision.UnboundedAgentConfig, error) {
+func loadConfig(log *slog.Logger) (*provision.UnboundedAgentConfig, error) {
 	var (
 		cfg *provision.UnboundedAgentConfig
 		err error
@@ -43,7 +44,7 @@ func loadConfig() (*provision.UnboundedAgentConfig, error) {
 		return nil, err
 	}
 
-	if err := normalizeConfig(cfg); err != nil {
+	if err := normalizeConfig(log, cfg); err != nil {
 		return nil, err
 	}
 
@@ -51,13 +52,26 @@ func loadConfig() (*provision.UnboundedAgentConfig, error) {
 }
 
 // normalizeConfig applies common fixups regardless of how the config was loaded.
-func normalizeConfig(cfg *provision.UnboundedAgentConfig) error {
+func normalizeConfig(log *slog.Logger, cfg *provision.UnboundedAgentConfig) error {
 	cfg.Cluster.Version = strings.TrimPrefix(cfg.Cluster.Version, "v")
 	cfg.Kubelet.NodeIP = strings.TrimSpace(cfg.Kubelet.NodeIP)
 
 	// FIXME: should we set the scheme in machina side?
 	if !strings.HasPrefix(cfg.Kubelet.ApiServer, "https://") {
 		cfg.Kubelet.ApiServer = "https://" + cfg.Kubelet.ApiServer
+	}
+
+	// MachineName must be resolved before the node name because
+	// BackfillNodeName falls back to MachineName as its final option.
+	source, err := cfg.BackfillMachineName()
+	if err != nil {
+		return fmt.Errorf("backfill machine name: %w", err)
+	}
+
+	// Only log when the name was derived (not already present in the config)
+	// to avoid noise on every config load.
+	if source != "config" {
+		log.Info("resolved unbounded MachineName", "name", cfg.MachineName, "source", source)
 	}
 
 	if err := cfg.BackfillNodeName(); err != nil {
@@ -86,10 +100,9 @@ func loadConfigFromFile(path string) (*provision.UnboundedAgentConfig, error) {
 // variables.  This preserves backward compatibility for callers that have not
 // yet switched to the JSON config file.
 func loadConfigFromEnv() (*provision.UnboundedAgentConfig, error) {
-	machineName, err := requiredEnv("MACHINA_MACHINE_NAME")
-	if err != nil {
-		return nil, err
-	}
+	// MACHINA_MACHINE_NAME is optional: when unset, normalizeConfig resolves
+	// the machine name from AGENT_MACHINE_NAME or the host hostname.
+	machineName := strings.TrimSpace(os.Getenv("MACHINA_MACHINE_NAME"))
 
 	kubeVersion, err := requiredEnv("KUBE_VERSION")
 	if err != nil {

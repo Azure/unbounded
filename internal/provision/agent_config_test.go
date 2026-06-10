@@ -119,7 +119,8 @@ func TestAgentConfig_EmptyFields(t *testing.T) {
 	var parsed map[string]interface{}
 	require.NoError(t, json.Unmarshal(data, &parsed))
 
-	require.Equal(t, "", parsed["MachineName"])
+	// MachineName has omitempty so should be absent from a zero-value config.
+	require.NotContains(t, parsed, "MachineName")
 
 	cluster := parsed["Cluster"].(map[string]interface{})
 	require.Equal(t, "", cluster["CaCertBase64"])

@@ -245,3 +245,25 @@ func TestResolveMachine_UsesConfigNodeName(t *testing.T) {
 	assert.Equal(t, "kube1", got.NodeStart.MachineName)
 	assert.Equal(t, "machine-1", got.NodeStart.KubeMachineName)
 }
+
+func TestResolveMachine_BackfillsKubeMachineName(t *testing.T) {
+	// A config without an explicit MachineName must still resolve a non-empty
+	// KubeMachineName via the defensive backfill in ResolveMachine.
+	t.Setenv("AGENT_MACHINE_NAME", "resolved-machine")
+
+	cfg := &config.AgentConfig{
+		Cluster: config.AgentClusterConfig{
+			CaCertBase64: "Y2EtYnl0ZXM=",
+		},
+		Kubelet: config.AgentKubeletConfig{
+			ApiServer: "https://api.example.com",
+		},
+	}
+
+	got, err := ResolveMachine(discardLogger(), cfg, "kube1", nil)
+	require.NoError(t, err)
+
+	assert.Equal(t, "resolved-machine", cfg.MachineName)
+	assert.Equal(t, "resolved-machine", got.NodeStart.KubeMachineName)
+	assert.Equal(t, "kube1", got.NodeStart.MachineName)
+}
