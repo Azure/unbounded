@@ -31,7 +31,14 @@ down before the next.
 
 Pure Python 3 standard library; no pytest. Run directly:
 
-    python3 hack/smoke-storage.py
+    sudo python3 hack/smoke-storage.py
+
+Root is required: the harness reserves 2 MiB hugepages on the host (the
+daemon's default shard backing) and raises RLIMIT_MEMLOCK so the storage
+processes can pin their io_uring buffers.
+
+By default the two `unbounded-storage` processes per scenario are spawned
+directly as child processes (the local-development path, unchanged).
 """
 
 from __future__ import annotations
@@ -40,6 +47,7 @@ import atexit
 import http.server
 import os
 import resource
+import shutil
 import signal
 import socket
 import struct
@@ -59,7 +67,14 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TMPDIR = Path(tempfile.mkdtemp(prefix="smoke-storage-"))
-BINARY = REPO_ROOT / "bin" / "unbounded-storage"
+BINARY = Path(
+    os.environ.get("SMOKE_STORAGE_BINARY", str(REPO_ROOT / "bin" / "unbounded-storage"))
+)
+
+USE_SYSTEMD = os.environ.get("SMOKE_STORAGE_SYSTEMD", "0") == "1"
+INSTALL_SCRIPT = REPO_ROOT / "hack" / "scripts" / "install-unbounded-storage.sh"
+STORAGE_PREFIX = os.environ.get("SMOKE_STORAGE_PREFIX", "/opt/unbounded-storage")
+STORAGE_TARBALL = os.environ.get("SMOKE_STORAGE_TARBALL", "")
 
 # The objects served by the stub origin and requested through the
 # frontends, one per scenario. The S3 path is path-style (`/bucket/key`)
@@ -91,9 +106,29 @@ STRIPE_SIZE = 4 * 1024 * 1024  # 4 MiB; the 1 GiB object spans 256 stripes
 # plain bytes; 2 GiB, multiple of the 4096-byte page size; holds all stripes of one node
 DISK_SIZE = 2 * 1024 * 1024 * 1024
 
+# Hugepage backing. The daemon defaults to `backing_kind = "hugepage2_mb"`,
+# so the smoke test exercises that real path by reserving 2 MiB hugepages on
+# the host up front (rather than passing `--no-hugepages` to fall back to the
+# heap). `bytes_per_shard` is pinned so the reservation below is exact.
+HUGEPAGE_SIZE = 2 * 1024 * 1024  # 2 MiB; matches memory::HUGEPAGE_2MB
+BYTES_PER_SHARD = 128 * 1024 * 1024  # matches StorageCfg default; pinned for exactness
+RPC_SCRATCH_PAGES = 8  # matches main.rs RPC_SCRATCH_PAGES
+NODES_PER_SCENARIO = 2
+
+# Hugepages one shard needs: pool backing + scratch, each rounded up.
+_HP_PER_SHARD = (BYTES_PER_SHARD + HUGEPAGE_SIZE - 1) // HUGEPAGE_SIZE + RPC_SCRATCH_PAGES
+# Total for a scenario's two concurrent nodes, plus 50% headroom for any
+# allocator rounding / transient double-counting during teardown overlap.
+HUGEPAGES_NEEDED = _HP_PER_SHARD * NODES_PER_SCENARIO
+HUGEPAGES_RESERVE = HUGEPAGES_NEEDED + HUGEPAGES_NEEDED // 2
+
+NR_HUGEPAGES_PATH = Path("/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages")
+FREE_HUGEPAGES_PATH = Path("/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages")
+
 DEVNULL = subprocess.DEVNULL
 
-_procs: list[subprocess.Popen[Any]] = []
+# Every node brought up across all scenarios, for global teardown/log dump.
+_nodes: list[_Node] = []
 
 # ============================================================================
 # LOGGING & UTILITIES
@@ -112,14 +147,9 @@ def die(msg: str) -> None:
 
 
 def dump_logs() -> None:
-    """Best-effort dump of each spawned process's log on failure."""
-    for p in sorted(TMPDIR.glob("*.log")):
-        log(f"  --- {p.name} ---")
-        try:
-            sys.stderr.write(p.read_text())
-            sys.stderr.flush()
-        except OSError as e:
-            log(f"  (failed to read {p.name}: {e})")
+    """Best-effort dump of each node's log on failure."""
+    for node in _nodes:
+        node.dump_log()
     log("  --- end logs ---")
 
 
@@ -134,8 +164,26 @@ def free_port() -> int:
 
 
 # ============================================================================
-# PROCESS SPAWNING & MONITORING
+# NODE MANAGEMENT (subprocess or systemd)
 # ============================================================================
+
+
+class _Node:
+    """A single running storage node.
+
+    Two implementations back this interface: `_LocalNode` spawns the binary
+    directly as a child process (default, local development), and
+    `_SystemdNode` installs and runs it as a systemd unit through the
+    installer script (CI). The rest of the harness only uses this interface.
+    """
+
+    label: str
+
+    def stop(self) -> None:
+        raise NotImplementedError
+
+    def dump_log(self) -> None:
+        raise NotImplementedError
 
 
 def _forward_lines(stream: Any, log_file: Any) -> None:
@@ -146,47 +194,152 @@ def _forward_lines(stream: Any, log_file: Any) -> None:
         sys.stderr.flush()
 
 
-def spawn(args: list[str], log_path: Path) -> subprocess.Popen[Any]:
-    """Start a background process, teeing its output to *log_path* and stderr."""
-    log_file = open(log_path, "w")  # noqa: SIM115 - intentionally long-lived
-    proc = subprocess.Popen(
-        args,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        start_new_session=True,
-    )
-    threading.Thread(
-        target=_forward_lines, args=(proc.stdout, log_file), daemon=True
-    ).start()
-    _procs.append(proc)
-    return proc
+class _LocalNode(_Node):
+    """A node spawned as a direct child process, teed to a log file + stderr."""
 
+    def __init__(self, args: list[str], log_path: Path) -> None:
+        self.label = f"storage process {args}"
+        self.log_path = log_path
+        # Owned by this node so stop() can close it; the forwarding thread
+        # writes to it for the life of the process.
+        self.log_file = open(log_path, "w")  # noqa: SIM115 - intentionally long-lived
+        self.proc: subprocess.Popen[Any] = subprocess.Popen(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+        threading.Thread(
+            target=_forward_lines, args=(self.proc.stdout, self.log_file), daemon=True
+        ).start()
 
-def check_procs(procs: list[subprocess.Popen[Any]]) -> None:
-    """Die if any of *procs* (the current scenario's processes) has exited."""
-    for proc in procs:
-        ret = proc.poll()
-        if ret is not None:
-            die(f"storage process {proc.args} exited early with code {ret}")
-
-
-def terminate(procs: list[subprocess.Popen[Any]]) -> None:
-    """Stop a scenario's processes, escalating SIGTERM to SIGKILL."""
-    for proc in procs:
+    def stop(self) -> None:
         try:
-            os.killpg(proc.pid, signal.SIGTERM)
+            os.killpg(self.proc.pid, signal.SIGTERM)
         except OSError:
             pass
-    for proc in procs:
         try:
-            proc.wait(timeout=5)
+            self.proc.wait(timeout=5)
         except (OSError, subprocess.TimeoutExpired):
             try:
-                os.killpg(proc.pid, signal.SIGKILL)
-                proc.wait(timeout=5)
+                os.killpg(self.proc.pid, signal.SIGKILL)
+                self.proc.wait(timeout=5)
             except (OSError, subprocess.TimeoutExpired):
                 pass
+        # The process is gone (or unkillable); the forwarding thread is a
+        # daemon reading a now-closed pipe, so flush best-effort and release
+        # the log file handle.
+        try:
+            self.log_file.flush()
+            os.fsync(self.log_file.fileno())
+        except OSError:
+            pass
+        try:
+            self.log_file.close()
+        except OSError:
+            pass
+
+    def dump_log(self) -> None:
+        log(f"  --- {self.log_path.name} ---")
+        try:
+            sys.stderr.write(self.log_path.read_text())
+            sys.stderr.flush()
+        except OSError as e:
+            log(f"  (failed to read {self.log_path.name}: {e})")
+
+
+class _SystemdNode(_Node):
+    """A node installed and run as a systemd unit via the installer script.
+
+    Installing the unit (and starting it via `systemctl enable --now`) is the
+    installer's job; this class drives the same script CI ships, then manages
+    the resulting unit's teardown and log capture. Output goes to the journal,
+    so `dump_log` shells out to journalctl.
+    """
+
+    def __init__(self, unit: str, cfg: Path) -> None:
+        self.unit = unit
+        self.label = f"systemd unit {unit}"
+        env = dict(os.environ)
+        env.update(
+            {
+                "SERVICE_NAME": unit,
+                # The installer puts `--config <CONFIG_PATH>` on the ExecStart
+                # line itself, so point it at this node's config rather than
+                # passing a second `--config` via STORAGE_ARGS (which the
+                # daemon rejects as a repeated argument).
+                "CONFIG_PATH": str(cfg),
+                "LOCAL_TARBALL": STORAGE_TARBALL,
+                "VERSION": "local",
+                # Give each node its own prefix so concurrent installs do not
+                # race on a shared releases/ dir and `current` symlink (each
+                # install does rm -rf + recreate of that directory).
+                "PREFIX": f"{STORAGE_PREFIX}/{unit}",
+            }
+        )
+        log(f"  Installing {unit} via {INSTALL_SCRIPT.name}")
+        try:
+            subprocess.run(["bash", str(INSTALL_SCRIPT)], env=env, check=True)
+        except subprocess.CalledProcessError as e:
+            die(f"installer failed for {unit} (exit {e.returncode})")
+
+    def stop(self) -> None:
+        # Stop, disable, and remove the transient unit so repeated/local runs
+        # do not accumulate leftover services. The journal is retained, so
+        # dump_log still works after removal.
+        subprocess.run(
+            ["systemctl", "stop", self.unit],
+            stdout=DEVNULL,
+            stderr=DEVNULL,
+        )
+        subprocess.run(
+            ["systemctl", "disable", self.unit],
+            stdout=DEVNULL,
+            stderr=DEVNULL,
+        )
+        unit_path = f"/etc/systemd/system/{self.unit}.service"
+        try:
+            os.remove(unit_path)
+        except FileNotFoundError:
+            # Already removed (or never written); nothing to clean up.
+            pass
+        except OSError as e:
+            log(f"  (failed to remove unit file {unit_path}: {e})")
+        subprocess.run(
+            ["systemctl", "daemon-reload"],
+            stdout=DEVNULL,
+            stderr=DEVNULL,
+        )
+
+    def dump_log(self) -> None:
+        log(f"  --- journalctl -u {self.unit} ---")
+        subprocess.run(
+            ["journalctl", "--no-pager", "-u", self.unit],
+            stdout=sys.stderr,
+            stderr=sys.stderr,
+        )
+
+
+def start_node(kind: str, idx: int, cfg: Path, log_path: Path) -> _Node:
+    """Bring up node *idx* of scenario *kind*, registering it for teardown.
+
+    Dispatches to systemd or a direct subprocess based on USE_SYSTEMD; both
+    run `unbounded-storage --config <cfg>`, letting the config's hugepage
+    backing take effect (the harness reserves the hugepages up front).
+    """
+    if USE_SYSTEMD:
+        node: _Node = _SystemdNode(f"unbounded-storage-smoke-{kind}-{idx}", cfg)
+    else:
+        node = _LocalNode([str(BINARY), "--config", str(cfg)], log_path)
+    _nodes.append(node)
+    return node
+
+
+def terminate(nodes: list[_Node]) -> None:
+    """Stop a scenario's nodes."""
+    for node in nodes:
+        node.stop()
 
 
 # ============================================================================
@@ -202,15 +355,114 @@ def cleanup() -> None:
         return
     _cleaning_up = True
     log("Cleaning up...")
-    terminate(_procs)
-    import shutil
-
+    terminate(_nodes)
+    restore_hugepages()
     shutil.rmtree(TMPDIR, ignore_errors=True)
 
 
 def _sigint_handler(sig: int, frame: Any) -> None:
     cleanup()
     sys.exit(1)
+
+
+# ============================================================================
+# HUGEPAGE RESERVATION
+# ============================================================================
+_orig_nr_hugepages: int | None = None
+
+
+def _read_int(path: Path) -> int | None:
+    try:
+        return int(path.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def reserve_hugepages() -> None:
+    """Ensure at least `HUGEPAGES_RESERVE` free 2 MiB hugepages.
+
+    The daemon backs its shards with 2 MiB hugepages (`backing_kind =
+    "hugepage2_mb"`), so reserve them on the host before any storage process
+    starts. Reads the current `nr_hugepages` (saved for restore), bumps the
+    pool if needed, then asks the kernel to compact memory and re-checks the
+    free count. Dies with an actionable message if the host cannot back the
+    pages, since the storage processes would otherwise fail their hugetlb
+    mmap one by one with a less obvious error.
+    """
+    global _orig_nr_hugepages
+
+    if not NR_HUGEPAGES_PATH.exists():
+        die(
+            "host does not expose 2 MiB hugepages "
+            f"({NR_HUGEPAGES_PATH} missing); cannot run the hugepage smoke test"
+        )
+
+    current = _read_int(NR_HUGEPAGES_PATH)
+    if current is None:
+        die(f"could not read {NR_HUGEPAGES_PATH}")
+    _orig_nr_hugepages = current
+
+    free = _read_int(FREE_HUGEPAGES_PATH) or 0
+    log(
+        f"Hugepages: need {HUGEPAGES_NEEDED} (reserving {HUGEPAGES_RESERVE}); "
+        f"host has nr={current} free={free}"
+    )
+    if free >= HUGEPAGES_NEEDED:
+        log("  enough free hugepages already; leaving the pool as-is")
+        # Nothing to restore: we did not change the pool.
+        _orig_nr_hugepages = None
+        return
+
+    target = max(current, HUGEPAGES_RESERVE)
+    log(f"  raising nr_hugepages {current} -> {target}")
+    try:
+        NR_HUGEPAGES_PATH.write_text(f"{target}\n")
+    except OSError as e:
+        die(
+            f"failed to set nr_hugepages={target} ({e}); "
+            "run under sudo so the harness can reserve hugepages"
+        )
+
+    # The kernel may not satisfy the full request from fragmented memory on
+    # the first try. Nudge it with a compaction pass and re-read.
+    free = _read_int(FREE_HUGEPAGES_PATH) or 0
+    if free < HUGEPAGES_NEEDED:
+        compact = Path("/proc/sys/vm/compact_memory")
+        if compact.exists():
+            try:
+                compact.write_text("1\n")
+                time.sleep(1)
+            except OSError as e:
+                # Compaction is a best-effort nudge; if it fails we still fall
+                # through to the retry write and the final free-page check.
+                log(f"  (memory compaction failed, continuing: {e})")
+            NR_HUGEPAGES_PATH.write_text(f"{target}\n")
+            free = _read_int(FREE_HUGEPAGES_PATH) or 0
+
+    got = _read_int(NR_HUGEPAGES_PATH) or 0
+    log(f"  nr_hugepages now {got}, free {free}")
+    if free < HUGEPAGES_NEEDED:
+        die(
+            f"only {free} free 2 MiB hugepages after reserving (need "
+            f"{HUGEPAGES_NEEDED}); host memory may be too fragmented. "
+            "Free memory or reserve hugepages at boot, then retry."
+        )
+
+
+def restore_hugepages() -> None:
+    """Restore `nr_hugepages` to the value captured by `reserve_hugepages`.
+
+    Only reads `_orig_nr_hugepages`; `cleanup()` is guarded by `_cleaning_up`
+    so this runs at most once per process, and a no-op when the pool was left
+    untouched (`_orig_nr_hugepages is None`).
+    """
+    if _orig_nr_hugepages is None:
+        return
+    try:
+        NR_HUGEPAGES_PATH.write_text(f"{_orig_nr_hugepages}\n")
+        log(f"Restored nr_hugepages -> {_orig_nr_hugepages}")
+    except OSError as e:
+        log(f"  (could not restore nr_hugepages to {_orig_nr_hugepages}: {e})")
 
 
 # ============================================================================
@@ -318,9 +570,10 @@ def write_config(
     # `kind` string to the BackendKind/FrontendKind discriminant.
     #
     # Startup-fixed knobs live in the `[startup]` section of the config:
-    # the fabric listen address, heap backing (no_hugepages), and forcing
-    # the libfabric tcp provider (disable_rdma) even on hosts that expose
-    # an unusable RDMA HCA in sysfs. They only take effect at process
+    # the fabric listen address, the per-shard hugepage backing size
+    # (bytes_per_shard, leaving the daemon's hugepage default in place), and
+    # forcing the libfabric tcp provider (disable_rdma) even on hosts that
+    # expose an unusable RDMA HCA in sysfs. They only take effect at process
     # start and are intentionally not part of the dynamic reload path.
     kind_int = {"http": 0, "s3": 1}[kind]
     path.write_text(
@@ -356,7 +609,11 @@ bind = "{frontend_bind}"
 backend = "origin"
 
 [startup.memory]
-no_hugepages = true
+# Back shards with 2 MiB hugepages (the daemon default, so no_hugepages is
+# left unset) and exercise the real hugetlb path. The harness reserves these
+# on the host before any node starts; bytes_per_shard is pinned to match that
+# reservation.
+bytes_per_shard = {BYTES_PER_SHARD}
 
 [startup.fabric]
 listen_addr = "{fabric_listen}"
@@ -372,13 +629,10 @@ disable_rdma = true
 # ============================================================================
 
 
-def wait_port(
-    host: str, port: int, procs: list[subprocess.Popen[Any]], timeout: int = 60
-) -> None:
+def wait_port(host: str, port: int, timeout: int = 60) -> None:
     """Wait until a TCP connect to host:port succeeds."""
     log(f"  Waiting for {host}:{port} to accept connections...")
     for elapsed in range(timeout):
-        check_procs(procs)
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(1)
         try:
@@ -394,14 +648,11 @@ def wait_port(
     die(f"Timed out waiting for {host}:{port}")
 
 
-def fetch(
-    url: str, procs: list[subprocess.Popen[Any]], timeout: int = 30
-) -> tuple[int, bytes]:
+def fetch(url: str, timeout: int = 30) -> tuple[int, bytes]:
     """GET *url*, retrying briefly while the frontend warms up."""
     deadline = time.monotonic() + timeout
     last_err: Exception | None = None
     while time.monotonic() < deadline:
-        check_procs(procs)
         try:
             with urllib.request.urlopen(url, timeout=10) as resp:
                 return resp.status, resp.read()
@@ -474,7 +725,7 @@ def run_scenario(kind: str, origin_addr: str, object_path: str, origin: Any) -> 
     log("")
     log(f"=== Scenario: {kind} frontend + {kind} backend ===")
 
-    procs: list[subprocess.Popen[Any]] = []
+    nodes: list[_Node] = []
     fab_a, fab_b = free_port(), free_port()
     fe_a, fe_b = free_port(), free_port()
     log(f"Ports: fabric=({fab_a},{fab_b}) frontends=({fe_a},{fe_b})")
@@ -506,38 +757,15 @@ def run_scenario(kind: str, origin_addr: str, object_path: str, origin: Any) -> 
     )
 
     try:
-        log("Spawning two unbounded-storage processes")
-        # Every startup-fixed knob now lives in each node's config file's
-        # `[startup]` section (fabric listen address, heap backing, and
-        # forcing the libfabric tcp provider), so the only CLI argument is
-        # the config path.
-        procs.append(
-            spawn(
-                [
-                    str(BINARY),
-                    "--config",
-                    str(cfg1),
-                ],
-                TMPDIR / f"{kind}-node1.log",
-            )
-        )
-        procs.append(
-            spawn(
-                [
-                    str(BINARY),
-                    "--config",
-                    str(cfg2),
-                ],
-                TMPDIR / f"{kind}-node2.log",
-            )
-        )
+        log("Bringing up two unbounded-storage nodes")
+        nodes.append(start_node(kind, 1, cfg1, TMPDIR / f"{kind}-node1.log"))
+        nodes.append(start_node(kind, 2, cfg2, TMPDIR / f"{kind}-node2.log"))
 
-        wait_port("127.0.0.1", fe_a, procs)
-        wait_port("127.0.0.1", fe_b, procs)
+        wait_port("127.0.0.1", fe_a)
+        wait_port("127.0.0.1", fe_b)
         # Give the fabric peers a moment to dial each other before routing.
         log("  Letting fabric peers establish...")
         time.sleep(3)
-        check_procs(procs)
 
         # Scope the origin GET assertion to this scenario's requests.
         origin.requests = []
@@ -545,7 +773,7 @@ def run_scenario(kind: str, origin_addr: str, object_path: str, origin: Any) -> 
         corrupt: dict[str, set[int]] = {}
         for label, fe_port in (("A", fe_a), ("B", fe_b)):
             log(f"Fetching object through frontend {label}")
-            status, body = fetch(f"http://127.0.0.1:{fe_port}{object_path}", procs)
+            status, body = fetch(f"http://127.0.0.1:{fe_port}{object_path}")
             if status != 200:
                 die(f"frontend {label} returned status {status}, expected 200")
             if body != BODY:
@@ -560,9 +788,7 @@ def run_scenario(kind: str, origin_addr: str, object_path: str, origin: Any) -> 
 
         # The stub origin must have been hit, proving traffic traversed
         # frontend -> storage stack -> {kind} backend -> origin.
-        gets = [
-            r for r in origin.requests if r[0] == "GET" and r[1] == object_path
-        ]
+        gets = [r for r in origin.requests if r[0] == "GET" and r[1] == object_path]
         if not gets:
             die(
                 f"stub origin received no GET for {object_path}; "
@@ -572,7 +798,7 @@ def run_scenario(kind: str, origin_addr: str, object_path: str, origin: Any) -> 
         log(f"  {kind} scenario PASSED")
     finally:
         log(f"  Tearing down {kind} ring")
-        terminate(procs)
+        terminate(nodes)
 
 
 # ============================================================================
@@ -584,11 +810,15 @@ def main() -> None:
     signal.signal(signal.SIGINT, _sigint_handler)
     atexit.register(cleanup)
 
-    if not BINARY.exists():
-        die(
-            f"{BINARY} not found; build it first with "
-            "`make unbounded-storage-build`"
-        )
+    if USE_SYSTEMD:
+        # systemd mode installs from the prebuilt release tarball; the binary
+        # comes from inside it, not from BINARY.
+        if not STORAGE_TARBALL:
+            die("SMOKE_STORAGE_SYSTEMD=1 requires SMOKE_STORAGE_TARBALL to be set")
+        if not Path(STORAGE_TARBALL).is_file():
+            die(f"SMOKE_STORAGE_TARBALL {STORAGE_TARBALL} not found")
+    elif not BINARY.exists():
+        die(f"{BINARY} not found; build it first with `make unbounded-storage-build`")
 
     # io_uring registers fixed buffers; raise the memlock limit so the
     # storage processes (which inherit our limits) can pin their pages.
@@ -598,6 +828,10 @@ def main() -> None:
         )
     except (ValueError, OSError) as e:
         log(f"  (could not raise RLIMIT_MEMLOCK: {e}; continuing)")
+
+    # The daemon backs its shards with 2 MiB hugepages; reserve them on the
+    # host before any storage process starts so the hugetlb mmap succeeds.
+    reserve_hugepages()
 
     origin_port = free_port()
     origin_addr = f"127.0.0.1:{origin_port}"
