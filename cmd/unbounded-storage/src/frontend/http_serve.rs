@@ -8,9 +8,10 @@
 //! 1. **The factory** ([`HttpFrontend`]): validates a
 //!    [`FrontendSpec`](crate::config::FrontendSpec) and binds a
 //!    `SO_REUSEPORT` listening socket via `libc` so every shard can
-//!    accept on the same port. It does not implement the `Frontend`
-//!    trait: the concrete bufferpool type is only nameable in the
-//!    binary (Phase E), so the binary calls this directly.
+//!    accept on the same port. It exposes plain inherent methods
+//!    (`from_spec`, `bind_listener`) rather than a trait: the concrete
+//!    bufferpool type is only nameable in the binary, so the binary
+//!    builds and drives it directly.
 //! 2. **The serving engine** ([`HttpDriver`]): a per-shard,
 //!    cooperatively-driven engine generic over the bufferpool `P`. It
 //!    owns an internal future set (one persistent accept future plus
@@ -38,7 +39,7 @@ use std::task::{Context, Poll, Waker};
 use ::http::header::{ACCEPT_RANGES, CONNECTION, CONTENT_LENGTH, CONTENT_RANGE};
 use ::http::{Response, StatusCode};
 
-use crate::bufferpool::{BufferPool, ReadStream};
+use crate::bufferpool::{BufferPool, ReadStream, StripePlan};
 use crate::config::{FrontendKind, FrontendSpec};
 use crate::frontend::FrontendError;
 use crate::frontend::range::{ByteRange, RangeError, ResolvedRange, full_object, stripe_set};
@@ -48,14 +49,13 @@ use crate::http::{
 };
 use crate::ring::NetHandle;
 use crate::runtime::noop_waker;
-use crate::storage::{OriginRef, StripeReq};
+use crate::storage::{ObjectMetadata, OriginRef, StripeReq};
 
 /// HTTP serving frontend factory. Built once per [`FrontendSpec`];
 /// holds only the immutable configuration distilled from the spec.
 ///
-/// Unlike the old S3 stub this does not implement the `Frontend` trait:
-/// the per-shard [`HttpDriver`] is generic over the concrete bufferpool
-/// type, which is only nameable in the binary, so Phase E binds the
+/// The per-shard [`HttpDriver`] is generic over the concrete bufferpool
+/// type, which is only nameable in the binary, so the binary binds the
 /// listener via [`HttpFrontend::bind_listener`] and constructs the
 /// driver directly.
 pub struct HttpFrontend {
@@ -68,7 +68,7 @@ impl HttpFrontend {
     /// Construct from a [`FrontendSpec`], validating the kind and
     /// parsing the bind address.
     pub fn from_spec(spec: &FrontendSpec) -> Result<Self, FrontendError> {
-        if spec.kind != FrontendKind::Http {
+        if spec.kind() != FrontendKind::Http {
             return Err(FrontendError::UnsupportedKind("non-http frontend kind"));
         }
         let bind = spec
@@ -220,7 +220,24 @@ impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
     }
 }
 
-/// Serve one accepted connection end-to-end, then close its fd.
+impl<P: BufferPool<Req = StripeReq> + 'static> Drop for HttpDriver<P> {
+    /// Close the listen fd the driver owns. The driver is the sole owner
+    /// of this `SO_REUSEPORT` listener (the embedder hands it the fd from
+    /// `bind_listener` and never touches it again), so dropping the
+    /// driver (on shard shutdown or a live frontend removal) must close
+    /// it or the fd leaks. The accept future borrows only the fd number,
+    /// not ownership, so closing here is sound once the driver is gone.
+    fn drop(&mut self) {
+        if self.listen_fd >= 0 {
+            // SAFETY: `listen_fd` was returned by `bind_listener` and is
+            // owned exclusively by this driver; it is closed exactly once.
+            unsafe {
+                libc::close(self.listen_fd);
+            }
+        }
+    }
+}
+
 ///
 /// Owns everything it needs so the future is `'static` and can live in
 /// the driver's future set across ticks. All paths close `conn_fd` via
@@ -298,11 +315,10 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
     };
 
     // 5. Resolve object length by reading the object's dedicated
-    // length entry through the pool. The HTTP backend fills it from
+    // metadata entry through the pool. The HTTP backend fills it from
     // an origin HEAD on a miss; local-disk and peer hits skip the
-    // origin entirely. The payload is the byte length as a
-    // little-endian u64 in the first 8 bytes of the entry's page.
-    let len = read_object_length(pool, backend_id, &path)
+    // origin entirely.
+    let len = read_object_length(pool, backend_id, &path, page_size)
         .await
         .map_err(|_| ())?;
 
@@ -336,82 +352,89 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
         return Ok(());
     }
 
-    // 8. Stream the body stripe-by-stripe out of the bufferpool.
+    // 8. Stream the body out of the bufferpool, pipelined across
+    // stripe boundaries.
     //
-    // Within each stripe we use the windowed read path so the pool
+    // The whole byte range is handed to the pool as one ordered list
+    // of per-stripe slices via the pipelined read path, so the pool
     // keeps many page fetches in flight ahead of the byte we are
-    // currently sending. The client send (`send_zc_fixed`) is
-    // strictly in order on the single TCP stream, but the fabric
-    // fetches of pages ahead of the cursor overlap with it, which is
-    // what lets a single large object saturate the RDMA fabric NIC.
-    // `usize::MAX` requests the full window: `read_windowed` clamps
-    // it to the pool's configured `max_inflight_pages` budget, so the
-    // prefetch depth is governed by that single knob.
-    for slice in stripe_set(resolved, stripe_size) {
-        let origin_ref = OriginRef {
-            backend_id: backend_id.to_string(),
-            origin_object_id: path.clone(),
-            stripe_idx: slice.stripe_idx,
-        };
-        let pool_req = StripeReq::new(origin_ref.stripe_key()).with_origin(origin_ref);
-        let mut rs = pool
-            .read_windowed(&pool_req, slice.intra_offset, slice.intra_len, usize::MAX)
-            .map_err(|_| ())?;
-        while let Some(page) = rs.next_page().await {
-            let page = page.map_err(|_| ())?;
-            let pr = page.page_ref();
-            let page_byte_offset = pr.page_idx as usize * page_size + pr.offset as usize;
-            let n = pr.len as usize;
-            // The PageGuard must stay alive until the SEND_ZC
-            // notification (when the kernel is done with the source
-            // page); awaiting here holds it across every partial send,
-            // then we drop it before the next `next_page` as the stream
-            // contract requires.
-            //
-            // SEND_ZC's CQE `res` is the count the kernel accepted,
-            // which can be short under socket-send-buffer pressure, so
-            // we loop advancing the byte offset until the whole page is
-            // on the wire. A zero count means the peer closed.
-            let mut sent_offset = page_byte_offset;
-            let mut remaining = n;
-            while remaining > 0 {
-                let sent = handle
-                    .send_zc_fixed(conn_fd, 0, sent_offset, remaining)
-                    .await
-                    .map_err(|_| ())?;
-                if sent == 0 {
-                    return Err(());
-                }
-                sent_offset += sent;
-                remaining -= sent;
+    // currently sending, spanning stripe boundaries. The client send
+    // (`send_zc_fixed`) is strictly in order on the single TCP stream,
+    // but the fabric/origin fetches of pages ahead of the cursor
+    // overlap with it, which is what lets a single large object
+    // saturate the RDMA fabric NIC and the origin download. Driving
+    // the slices through a single pipelined read (rather than draining
+    // each stripe's windowed read before the next) is what lets
+    // prefetch cross stripe boundaries instead of collapsing to one
+    // stripe's depth. `usize::MAX` requests the full window:
+    // `read_pipelined` clamps it to the pool's configured
+    // `max_inflight_pages` budget, so prefetch depth is governed by
+    // that single knob.
+    let plans: Vec<StripePlan<StripeReq>> = stripe_set(resolved, stripe_size)
+        .into_iter()
+        .map(|slice| {
+            let origin_ref = OriginRef {
+                backend_id: backend_id.to_string(),
+                origin_object_id: path.clone(),
+                stripe_idx: slice.stripe_idx,
+            };
+            StripePlan {
+                req: StripeReq::new(origin_ref.stripe_key()).with_origin(origin_ref),
+                intra_offset: slice.intra_offset,
+                intra_len: slice.intra_len,
             }
-            drop(page);
+        })
+        .collect();
+    let mut rs = pool.read_pipelined(plans, usize::MAX).map_err(|_| ())?;
+    while let Some(page) = rs.next_page().await {
+        let page = page.map_err(|_| ())?;
+        let pr = page.page_ref();
+        let page_byte_offset = pr.page_idx as usize * page_size + pr.offset as usize;
+        let n = pr.len as usize;
+        // The PageGuard must stay alive until the SEND_ZC notification
+        // (when the kernel is done with the source page); awaiting here
+        // holds it across every partial send, then we drop it before
+        // the next `next_page` as the stream contract requires.
+        //
+        // SEND_ZC's CQE `res` is the count the kernel accepted, which
+        // can be short under socket-send-buffer pressure, so we loop
+        // advancing the byte offset until the whole page is on the
+        // wire. A zero count means the peer closed.
+        let mut sent_offset = page_byte_offset;
+        let mut remaining = n;
+        while remaining > 0 {
+            let sent = handle
+                .send_zc_fixed(conn_fd, 0, sent_offset, remaining)
+                .await
+                .map_err(|_| ())?;
+            if sent == 0 {
+                return Err(());
+            }
+            sent_offset += sent;
+            remaining -= sent;
         }
+        drop(page);
     }
     Ok(())
 }
 
 /// Resolve an object's length by reading its dedicated content-addressed
-/// length entry through the pool. The entry's single page carries the
-/// byte length as a little-endian u64 in its first 8 bytes; the HTTP
-/// backend fills it from an origin `HEAD` on a miss, while local-disk
-/// and peer hits avoid the origin entirely.
+/// metadata entry through the pool. The entry's single page carries the
+/// object's [`ObjectMetadata`]; the HTTP backend fills it from an origin
+/// `HEAD` on a miss, while local-disk and peer hits avoid the origin
+/// entirely. The whole page is read (a zero-copy borrow) and decoded.
 async fn read_object_length<P: BufferPool<Req = StripeReq>>(
     pool: &Rc<P>,
     backend_id: &str,
     path: &str,
+    page_size: usize,
 ) -> Result<u64, ()> {
-    let origin_ref = OriginRef::length_entry(backend_id, path);
+    let origin_ref = OriginRef::metadata_entry(backend_id, path);
     let req = StripeReq::new(origin_ref.stripe_key()).with_origin(origin_ref);
-    let mut rs: ReadStream = pool.read(&req, 0, 8).await.map_err(|_| ())?;
+    let mut rs: ReadStream = pool.read(&req, 0, page_size as u64).await.map_err(|_| ())?;
     let page = rs.next_page().await.ok_or(())?.map_err(|_| ())?;
-    let bytes = page.as_slice();
-    if bytes.len() < 8 {
-        return Err(());
-    }
-    let mut le = [0u8; 8];
-    le.copy_from_slice(&bytes[..8]);
-    Ok(u64::from_le_bytes(le))
+    let meta = ObjectMetadata::decode(page.as_slice()).map_err(|_| ())?;
+    Ok(meta.length)
 }
 
 /// Format the `200 OK` head for serving a whole object.
@@ -472,14 +495,14 @@ fn status_line_response(status: u16) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bufferpool::{Error, ReadStream, WindowedRead};
+    use crate::bufferpool::{Error, PipelinedRead, ReadStream, WindowedRead};
     use crate::frontend::range::StripeSlice;
     use std::cell::RefCell;
 
     fn spec(id: &str, bind: &str) -> FrontendSpec {
         FrontendSpec {
             id: id.to_string(),
-            kind: FrontendKind::Http,
+            kind: FrontendKind::Http as i32,
             bind: bind.to_string(),
             backend: "primary".to_string(),
         }
@@ -632,17 +655,17 @@ mod tests {
     }
 
     #[test]
-    fn length_entry_request_is_well_formed() {
+    fn metadata_entry_request_is_well_formed() {
         use crate::bufferpool::Req;
-        use crate::storage::{LENGTH_STRIPE_IDX, stripe_key};
+        use crate::storage::{METADATA_STRIPE_IDX, stripe_key};
 
-        let origin_ref = OriginRef::length_entry("primary", "/o");
-        assert!(origin_ref.is_length_entry());
+        let origin_ref = OriginRef::metadata_entry("primary", "/o");
+        assert!(origin_ref.is_metadata_entry());
 
         let req = StripeReq::new(origin_ref.stripe_key()).with_origin(origin_ref);
-        assert!(req.origin().unwrap().is_length_entry());
-        assert_eq!(req.key(), stripe_key("primary", "/o", LENGTH_STRIPE_IDX));
-        assert_eq!(LENGTH_STRIPE_IDX, u64::MAX);
+        assert!(req.origin().unwrap().is_metadata_entry());
+        assert_eq!(req.key(), stripe_key("primary", "/o", METADATA_STRIPE_IDX));
+        assert_eq!(METADATA_STRIPE_IDX, u64::MAX);
     }
 
     /// A mock pool whose `read` never constructs a `ReadStream` (that
@@ -670,6 +693,14 @@ mod tests {
             _len: u64,
             _window: usize,
         ) -> Result<WindowedRead<'p>, Error> {
+            Err(Error::from("mock pool has no data"))
+        }
+
+        fn read_pipelined<'p>(
+            &'p self,
+            _stripes: Vec<StripePlan<StripeReq>>,
+            _window: usize,
+        ) -> Result<PipelinedRead<'p>, Error> {
             Err(Error::from("mock pool has no data"))
         }
     }
@@ -705,9 +736,5 @@ mod tests {
         assert!(!driver.progress());
         assert_eq!(driver.conn_count(), 0);
         assert!(driver.is_idle());
-
-        unsafe {
-            libc::close(listen_fd);
-        }
     }
 }

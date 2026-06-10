@@ -47,9 +47,9 @@ serves/relays stripes to and from peer nodes over a libfabric RDMA fabric.
 - **NUMA locality everywhere.** Memory backings, fabric memory regions, and disk
   engines are all allocated on, and pinned to, the NUMA node of the CPU that
   uses them.
-- **Hot-reloadable configuration.** Peers and disks reconcile into the running
-  process when `config.toml` changes; only the backing memory, fabric, and
-  topology plan are fixed at startup.
+- **Hot-reloadable configuration.** Peers, disks, backends, and frontends
+  reconcile into the running process when `config.toml` changes; only the
+  backing memory, fabric, and topology plan are fixed at startup.
 - **Content addressing.** Stripes are keyed by a 32-byte `StripeKey` derived
   from a checksum, so data is immutable and freely cacheable/relayable.
 
@@ -86,17 +86,41 @@ The daemon's `main` wires every subsystem together. The default config path is
 
 ### CLI (clap derive)
 
-- `--config <PATH>` - optional. A missing **default** path is non-fatal (falls
-  back to a built-in `Config::default()`); a missing **explicit** path is fatal.
-- `--no-hugepages` - overrides `[storage] backing_kind` to `Heap`.
-- `--bytes-per-shard <BYTES>` - bare integer = bytes; `K`/`M`/`G` suffixes are
-  powers of 1024; zero is rejected. CLI overrides config.
+`--config <PATH>` is the only command-line option. A missing **default**
+path is non-fatal (falls back to a built-in `Config::default()`); a
+missing **explicit** path is fatal. Everything else - both the
+dynamically reloadable cluster state and the startup-fixed settings - is
+read from the config file.
+
+The startup-fixed settings (collected into `StartupSettings`: the fabric
+endpoint and thread pools, per-shard memory sizing, and CPU-topology
+selection) live in the config's `[startup]` section. They are read once
+at process start and cannot change without a restart, so they are
+excluded from the live-reload diff.
+
+- `[startup.memory]` - `no_hugepages` (allocate per-shard backing from
+  the heap instead of 2 MiB hugepages) and `bytes_per_shard` (u64 bytes,
+  no suffix; `0` -> 128 MiB).
+- `[startup.fabric]` - `listen_addr` (default `0.0.0.0:0`),
+  `progress_threads` (2), `progress_poll_us` (10),
+  `rpc_worker_threads` (4), `max_inflight` (1024) - the per-shard fabric
+  endpoint, thread pools, and in-flight cap.
+- `[startup.topology]` - `rdma_progress_per_hca` (1),
+  `rdma_handlers_per_hca` (4), `tcp_fallback_threads` (1), and the
+  toggles `use_smt_siblings`, `ignore_isolated`, `include_node_cpu0`,
+  `allow_inactive_port`, `disable_rdma` - feed `startup_to_plan_config`,
+  which builds the `topology::PlanConfig` consumed by `Plan::for_host`.
+  The toggles default off; the three "negative" plan fields
+  (`respect_isolated`, `exclude_node_cpu0`, `require_active_port`) are
+  inverted from the corresponding config field so the historical "on"
+  behavior is the default.
 
 ### Startup sequence
 
-1. Load and validate config; apply CLI overrides.
+1. Load and validate config; build `StartupSettings` from the config's
+   `[startup]` section.
 2. `Host::discover()` reads hardware from sysfs.
-3. `Plan::for_host(&host, topology_cfg_to_plan_config(...))` computes the CPU/
+3. `Plan::for_host(&host, &settings.plan_config)` computes the CPU/
    role assignment. `RoleCounts::from_plan` tallies roles (RDMA progress and
    RDMA handler roles are counted; `NvmeIoUring`/`NetworkShard` are currently
    vestigial).
@@ -108,9 +132,10 @@ The daemon's `main` wires every subsystem together. The default config path is
    must stay in sync).
 6. A `DiskChannelDirectory` (Arc) is created before shards as the hot-swap
    publication surface for disk channels.
-7. Read-only shared state (`Arc<FabricCfg>`, `Arc<Vec<FrontendSpec>>`,
-   `Arc<Vec<BackendSpec>>`) and routing (`build_routing` -> `Arc<FingerTable>`
-   plus `Arc<HashMap<NodeId, PeerId>>`) are constructed once and shared across
+7. Read-only shared state (`Arc<Vec<FrontendSpec>>`, `Arc<Vec<BackendSpec>>`;
+   startup-fixed fabric settings come from the config `[startup]` section via
+   `StartupSettings`) and routing (`build_routing` -> `Arc<FingerTable>` plus
+   `Arc<HashMap<NodeId, PeerId>>`) are constructed once and shared across
    shards.
 8. Each shard is spawned with `rt.spawn_pinned(widx, name, Box<FnOnce>)`. The
    `!Send` shard objects are constructed **inside** `run_shard`, after pinning.
@@ -161,14 +186,17 @@ per-shard `!Send` object graph:
    register it as its own fabric MR and its own `LiveShardLocalStore` (a
    `PageRef` resolves through exactly one backing's geometry, so scratch needs a
    distinct store). Build a `RecursiveHandler` and start the fabric RPC server.
-6. **Frontend.** In v1 a shard hosts at most one frontend (the first spec;
-   extras are logged and skipped). Bind the listener with `SO_REUSEPORT` and
-   build an `HttpDriver`.
-7. **Tick loop.** Register tick hooks (socket-ring `progress()`, and the
-   frontend driver's `progress()`), report `Up`, and run
-   `shard_loop.run_until_with(|| SHUTDOWN.load(Acquire), 100us)` - busy-poll
-   when active, sleep 100us when idle. The fabric and pool self-drive on their
-   own threads.
+6. **Frontends.** A shard hosts a `FrontendRegistry` of any number of
+   frontends keyed by id. Each spec binds its listener with `SO_REUSEPORT` and
+   builds an `HttpDriver`/`S3Driver`; the registry can add and remove frontends
+   in place on a live config apply (a removed driver's `Drop` closes its
+   listener fd).
+7. **Tick loop.** Register tick hooks (socket-ring `progress()`, the
+   control-drain hook that reconciles backends/frontends/routing from applied
+   configs, and the frontend registry's `progress()`), report `Up`, and run
+   `shard_loop.run_until_with(|| SHUTDOWN.load(Acquire) || layer_stop, 100us)` -
+   busy-poll when active, sleep 100us when idle. The fabric and pool self-drive
+   on their own threads.
 
 Drop order at shard exit is critical: `shard_loop -> pool -> socket ->
 rpc_server -> fabric` (fabric last; it joins progress threads, closes the
@@ -387,15 +415,21 @@ These are symmetric twins around the buffer pool.
   destination pages, one page at a time (contrast `Transport`, which pulls from
   a peer). `HttpBackend` (Linux) memcpys origin bytes into pages carved from the
   backing and holds an `Rc<socket>`. `NullBackend` is the no-op.
-- `Frontend` (client side): a factory (`start_on_shard`) that binds a listener
-  once per shard with `SO_REUSEPORT` and returns a `Driver`. `Driver::progress`
-  is a tick hook (returning `true` to stay hot); the socket ring's `progress()`
-  is a **separate** tick hook. `HttpDriver`/`HttpFrontend` (Linux) multiplex
-  many connection futures. `range.rs` handles HTTP byte ranges and maps them to
-  stripe sets (`ByteRange`, `ResolvedRange`, `StripeSlice`, `full_object`,
-  `stripe_set`).
-- `FrontendRegistry`/`DiskRegistry` share a string-keyed registry pattern that
-  rejects duplicate ids.
+- Frontend (client side): concrete `HttpFrontend`/`S3Frontend` (Linux), built
+  from a `FrontendSpec` via `from_spec`, that bind a listener once per shard with
+  `SO_REUSEPORT` (`bind_listener`) and produce a per-shard `HttpDriver`/`S3Driver`.
+  A driver's inherent `progress()` is a tick hook (returning `true` to stay hot);
+  the socket ring's `progress()` is a **separate** tick hook. The drivers
+  multiplex many connection futures. `range.rs` handles HTTP byte ranges and maps
+  them to stripe sets (`ByteRange`, `ResolvedRange`, `StripeSlice`, `full_object`,
+  `stripe_set`). The concrete frontend/driver types are generic over the
+  bufferpool, which is only nameable in the binary, so they expose plain inherent
+  methods rather than a trait.
+- The live set of per-shard frontend drivers is held by the binary's
+  `FrontendRegistry` (in `main.rs`), keyed by id; it implements
+  `config::reconcile::FrontendReconcileTarget` so frontends are added/removed in
+  place on a config apply. This mirrors the `DiskRegistry`/`BackendRegistry`
+  string-keyed reconcile pattern.
 
 ### 7.9 `http/` - the wire codec
 
@@ -482,37 +516,76 @@ path-sorted for stable hashing; `drain()` clears channels before handles.
 re-registers buffers when it observes a swap (`current_or_replay`).
 
 **Stripe keys**: `stripe_key` derives the 32-byte content-addressed key;
-`LENGTH_STRIPE_IDX` and `OriginRef`/`StripeReq` describe the request shape.
+`METADATA_STRIPE_IDX` and `OriginRef`/`StripeReq` describe the request shape.
+The metadata entry (sentinel `METADATA_STRIPE_IDX`) carries an
+`ObjectMetadata` blob (object length plus a small pass-through KV set)
+encoded into its page, rather than object data.
 
-### 7.11 `config/` - typed, validated, hot-reloadable TOML
+### 7.11 `config/` - typed, validated, hot-reloadable schema
 
-Every level uses `deny_unknown_fields`. On a successful reparse the peer set and
-disk set are swapped in place **without a restart**; backing memory, fabric, and
-the topology plan are only built at startup.
+The schema is defined by `proto/config.proto` (prost-generated, with
+serde `Deserialize` derived on each message so a TOML file still loads)
+and is proto3-native: enum fields are plain integers, byte sizes are
+plain integer byte counts, and any field left at its proto3 zero value is
+promoted to the documented default by `Config::apply_defaults`. The TOML
+loader is strict (`deny_unknown_fields`), so a typo'd key fails loudly at
+parse time, and `validate` rejects enum integers outside their defined
+values. Protobuf is used here purely as the schema IDL (the prost-generated
+structs replace hand-written ones); the on-disk config format and the only
+load path are TOML, and the config file is the sole configuration interface
+for the foreseeable future. The top-level `version` field is an opaque,
+operator-assigned config version: the controller seeds it at startup and
+tracks the latest-known, latest-applied, and startup config versions
+(`ConfigVersionStatus`), plumbed through ready to be published as gauge
+metrics (not yet exposed). The startup config version is pinned to the
+config realized at process start and never advances; it lags the applied
+version whenever a later config changes a `[startup]`-only knob that a
+restart has not yet picked up. On a successful reparse the dynamically
+reloadable sections are
+reconciled in place on the live shard layer **without a restart**: the
+peer/disk/routing surfaces and each shard's backend and frontend
+registries are all updated without tearing the shard layer down. Backing
+memory, the topology plan, and the fabric max in-flight knob are fixed at
+startup (sourced from the config `[startup]` section, see the CLI
+section), not reloadable config fields.
 
-TOML sections (all optional, each falling back to defaults):
+Sections (all optional, each falling back to defaults):
 
-- `[fabric]` - `listen_addr` (`"0.0.0.0:0"`), `max_inflight` (1024),
-  `progress_threads` (2), `progress_poll_us` (10).
-- `[storage]` - `bytes_per_shard` (`"128M"`), `backing_kind`
-  (`"hugepage_2mb"` | `"heap"`).
-- `[topology]` - mirrors the `PlanConfig` knobs.
+- `version` - top-level opaque `u64` config version (0 = unversioned).
+- `[p2p]` - `local_node_id`, `local_labels`, `fingers_per_node` (100),
+  and an optional `[p2p.routing_plan]` (`fingers`, `successor`,
+  `predecessor`). When `routing_plan` is present the node skips the
+  global finger-table build and uses exactly the listed neighbor ids
+  (each must be a `[[peers]]` id, none may be `local_node_id`). This is
+  "disjoint discovery": a node is told only its direct routing neighbors
+  rather than the full cluster, yet routes identically to the global
+  build (see `designs/storage-disjoint-routing-parity.md`).
+- `[startup]` - startup-fixed knobs, read once at process start and
+  excluded from the live-reload diff: `[startup.memory]`
+  (`no_hugepages`, `bytes_per_shard`), `[startup.fabric]` (`listen_addr`,
+  `progress_threads`, `progress_poll_us`, `rpc_worker_threads`,
+  `max_inflight`), and `[startup.topology]` (`rdma_progress_per_hca`,
+  `rdma_handlers_per_hca`, `tcp_fallback_threads`, `use_smt_siblings`,
+  `ignore_isolated`, `include_node_cpu0`, `allow_inactive_port`,
+  `disable_rdma`). `startup_to_plan_config` inverts the negative plan
+  fields so the historical defaults hold. See the CLI section for the
+  per-field defaults.
 - `[[peers]]` - `id` (unique `u64`, doubles as both `NodeId` and `PeerId`),
-  `transport` (`"tcp"` | `"rdma"`), `address` (a `host:port` `SocketAddr` for
-  tcp, or a lowercase even-length hex raw libfabric address for rdma),
-  `hca_numa` (optional), and `labels`.
-- `[[disks]]` - `path` (unique), `kind` (`"nvme"` default | `"block"` |
-  `"file"`), `numa` (optional), `queue_depth` (optional), plus `size`,
+  `transport` (`0` = tcp | `1` = rdma), `address` (a `host:port`
+  `SocketAddr` for tcp, or a lowercase even-length hex raw libfabric
+  address for rdma), `hca_numa` (optional), and `labels`.
+- `[[disks]]` - `path` (unique), `kind` (`0` = nvme default | `1` = block |
+  `2` = file), `numa` (optional), `queue_depth` (optional), plus `size`,
   `page_size_bytes`, `bypass_admission`, and `skip_recovery_scan_if_no_meta`
   (the same four extra fields that disk reconcile treats as drift, see 7.10).
-- frontends/backends specs, plus `p2p` (`local_node_id`, `local_labels`,
-  `fingers_per_node`).
+- frontends/backends specs.
 
 The watcher (`notify`-based) emits `ConfigUpdate`s; main's
 `wait_for_shutdown_with_updates` reconciles peers (remove + add on address/numa
-drift, via a `last_applied` cache) and disks, republishes the channel snapshot
-each update, logs `config gen=N ...`, and sets `SHUTDOWN` if the watcher
-disconnects. Note that frontends are **not** currently hot-reapplied.
+drift, via a `last_applied` cache), disks, and - by broadcasting the applied
+config to every shard - each shard's backend and frontend registries plus the
+routing snapshot. It republishes the channel snapshot each update, logs
+`config gen=N ...`, and sets `SHUTDOWN` if the watcher disconnects.
 
 ## 8. Concurrency Model Summary
 

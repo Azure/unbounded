@@ -8,9 +8,12 @@
 use std::collections::HashSet;
 
 use proptest::prelude::*;
-use unbounded_storage::p2p::NodeId;
+use unbounded_storage::p2p::{NodeId, RingId, splitmix64};
 
-use crate::p2p::workload::{ClientSpec, RunReport, Workload, run_workload, workload_strategy};
+use crate::p2p::mocks::{P2pSimCfg, RouteOutcome, SimCluster};
+use crate::p2p::workload::{
+    ClientSpec, RunReport, Workload, build_peers, run_workload, workload_strategy,
+};
 
 // ---------------------------------------------------------------------------
 // Invariants.
@@ -157,6 +160,16 @@ fn assert_hops_bounded(report: &RunReport, faults_enabled: bool) -> Result<(), T
 // Proptest entry.
 // ---------------------------------------------------------------------------
 
+/// Reduce a [`RouteOutcome`] to a comparable key (variant tag,
+/// terminal node, hop count) so two clusters' routing decisions can
+/// be compared for exact equality.
+fn route_key(outcome: &RouteOutcome) -> (u8, NodeId, u32) {
+    match outcome {
+        RouteOutcome::Reached { hops, terminal } => (0, *terminal, *hops),
+        RouteOutcome::Stalled { hops, terminal } => (1, *terminal, *hops),
+        RouteOutcome::OutOfBudget { hops, terminal } => (2, *terminal, *hops),
+    }
+}
 proptest! {
     #![proptest_config(ProptestConfig {
         cases: 256,
@@ -173,6 +186,48 @@ proptest! {
         assert_incomplete_fraction_bounded(&report, &w_for_assert)?;
         assert_no_cycle(&report)?;
         assert_hops_bounded(&report, faults_enabled)?;
+    }
+
+    /// Disjoint-discovery same-path guard. A cluster where every node
+    /// is configured with ONLY its selected neighbors (via
+    /// `FingerTable::from_explicit`) must route every lookup along the
+    /// byte-identical path as the globally-built cluster. We assert
+    /// this directly: for every (start node, target) pair the
+    /// fault-free reference walk produces the same terminal and the
+    /// same hop count under both constructions. This is the core
+    /// correctness claim of disjoint peer discovery - same path
+    /// through the p2p topology without global knowledge.
+    #[test]
+    fn disjoint_routing_matches_global(w in workload_strategy()) {
+        let peers = build_peers(&w);
+        prop_assume!(!peers.is_empty());
+
+        let global = SimCluster::new(peers.clone(), w.k, P2pSimCfg::new());
+        let disjoint = SimCluster::new_disjoint(peers.clone(), w.k, P2pSimCfg::new());
+        let cap = w.peer_count as u32 + 8;
+
+        // Sweep a spread of ring targets (each peer's own ring id plus
+        // splitmix-derived positions between them) from every start.
+        let mut targets: Vec<RingId> = peers.iter().map(|p| p.ring).collect();
+        for i in 0..(w.peer_count as u64 * 4) {
+            targets.push(RingId(splitmix64(i.wrapping_mul(0x100_0001))));
+        }
+
+        for start in peers.iter().map(|p| p.node) {
+            for &target in &targets {
+                let g = route_key(&global.route(start, target, cap));
+                let d = route_key(&disjoint.route(start, target, cap));
+                prop_assert_eq!(
+                    g,
+                    d,
+                    "routing diverged from {:?} to {:?}: global={:?} disjoint={:?}",
+                    start,
+                    target,
+                    g,
+                    d,
+                );
+            }
+        }
     }
 }
 

@@ -30,21 +30,22 @@ use serde::{Deserialize, Serialize};
 
 use crate::bufferpool::{Req, StripeKey};
 
-/// Reserved sentinel `stripe_idx` for an object's length entry.
+/// Reserved sentinel `stripe_idx` for an object's metadata entry.
 ///
-/// A length entry is a dedicated content-addressed entry that stores
-/// the object's byte length as a little-endian `u64` in the first 8
-/// bytes of its page, instead of object data. It reuses the same key
-/// machinery as data stripes, identified by this sentinel index.
+/// A metadata entry is a dedicated content-addressed entry that stores
+/// the object's [`ObjectMetadata`](crate::storage::ObjectMetadata) (its
+/// byte length plus a small key/value set) instead of object data. It
+/// reuses the same key machinery as data stripes, identified by this
+/// sentinel index.
 ///
 /// A real data stripe is `byte_offset / stripe_size_bytes` and can
 /// never reach `u64::MAX` (an object cannot have `2^64` stripes), so
-/// there is no collision between a length entry and any data stripe.
+/// there is no collision between a metadata entry and any data stripe.
 ///
 /// The backend recognizes this sentinel and fills the entry by issuing
 /// a `HEAD` against the origin to learn its length, rather than doing a
 /// ranged `GET` for object bytes.
-pub const LENGTH_STRIPE_IDX: u64 = u64::MAX;
+pub const METADATA_STRIPE_IDX: u64 = u64::MAX;
 
 /// Identifies the origin object a stripe belongs to.
 ///
@@ -74,18 +75,19 @@ impl OriginRef {
         }
     }
 
-    /// Construct an [`OriginRef`] naming the object's length entry: a
-    /// dedicated content-addressed entry that stores the object's byte
-    /// length rather than data, identified by the reserved sentinel
-    /// [`LENGTH_STRIPE_IDX`].
-    pub fn length_entry(
+    /// Construct an [`OriginRef`] naming the object's metadata entry: a
+    /// dedicated content-addressed entry that stores the object's
+    /// [`ObjectMetadata`](crate::storage::ObjectMetadata) rather than
+    /// data, identified by the reserved sentinel
+    /// [`METADATA_STRIPE_IDX`].
+    pub fn metadata_entry(
         backend_id: impl Into<String>,
         origin_object_id: impl Into<String>,
     ) -> Self {
         Self {
             backend_id: backend_id.into(),
             origin_object_id: origin_object_id.into(),
-            stripe_idx: LENGTH_STRIPE_IDX,
+            stripe_idx: METADATA_STRIPE_IDX,
         }
     }
 
@@ -118,11 +120,11 @@ impl OriginRef {
         stripe_key(&self.backend_id, &self.origin_object_id, self.stripe_idx)
     }
 
-    /// Whether this reference names an object's length entry rather
+    /// Whether this reference names an object's metadata entry rather
     /// than a data stripe, i.e. its `stripe_idx` is the reserved
-    /// sentinel [`LENGTH_STRIPE_IDX`].
-    pub fn is_length_entry(&self) -> bool {
-        self.stripe_idx == LENGTH_STRIPE_IDX
+    /// sentinel [`METADATA_STRIPE_IDX`].
+    pub fn is_metadata_entry(&self) -> bool {
+        self.stripe_idx == METADATA_STRIPE_IDX
     }
 }
 
@@ -292,28 +294,28 @@ mod tests {
     }
 
     #[test]
-    fn length_entry_uses_sentinel_index() {
-        let le = OriginRef::length_entry("b", "obj");
-        assert_eq!(le.stripe_idx, LENGTH_STRIPE_IDX);
-        assert!(le.is_length_entry());
-        assert!(!OriginRef::new("b", "obj", 0).is_length_entry());
+    fn metadata_entry_uses_sentinel_index() {
+        let me = OriginRef::metadata_entry("b", "obj");
+        assert_eq!(me.stripe_idx, METADATA_STRIPE_IDX);
+        assert!(me.is_metadata_entry());
+        assert!(!OriginRef::new("b", "obj", 0).is_metadata_entry());
     }
 
     #[test]
-    fn length_entry_key_is_deterministic() {
-        let a = OriginRef::length_entry("b", "obj");
-        let b = OriginRef::length_entry("b", "obj");
+    fn metadata_entry_key_is_deterministic() {
+        let a = OriginRef::metadata_entry("b", "obj");
+        let b = OriginRef::metadata_entry("b", "obj");
         assert_eq!(a.stripe_key(), b.stripe_key());
-        // The length entry rides the same keying machinery as a data
+        // The metadata entry rides the same keying machinery as a data
         // stripe at the sentinel index.
         assert_eq!(a.stripe_key(), stripe_key("b", "obj", u64::MAX));
     }
 
     #[test]
-    fn length_entry_key_distinct_from_data_stripes() {
-        let le = OriginRef::length_entry("b", "obj").stripe_key();
+    fn metadata_entry_key_distinct_from_data_stripes() {
+        let me = OriginRef::metadata_entry("b", "obj").stripe_key();
         for idx in [0u64, 1, 2, 1000] {
-            assert_ne!(le, OriginRef::new("b", "obj", idx).stripe_key());
+            assert_ne!(me, OriginRef::new("b", "obj", idx).stripe_key());
         }
     }
 

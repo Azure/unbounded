@@ -271,6 +271,7 @@ help: ## Show this help
 	@echo "  orca-kind-down | orca-down       Delete the kind cluster"
 	@echo "  orca-reset                       Rebuild image and rolling-restart Orca on kind"
 	@echo "  orca-inttest                     Run orca integration tests (Docker required)"
+	@echo "  storage-inttest                  Run unbounded-storage -> orca -> Garage integration test (Docker + sudo)"
 	@echo ""
 	@echo "Documentation:"
 	@echo "  docs-serve                       Start local Hugo dev server"
@@ -562,7 +563,7 @@ bench: $(LIBFABRIC_STAMP) ## Build the bench tool (excluded from images)
 TLA_TOOLS_JAR ?= tmp/tla2tools.jar
 TLA_TOOLS_VERSION ?= v1.8.0
 TLA_TOOLS_URL ?= https://github.com/tlaplus/tlaplus/releases/download/$(TLA_TOOLS_VERSION)/tla2tools.jar
-TLA_TOOLS_SHA256 ?= 71546dff3897a01b0ee4fa64135d9f5e9384d2b7e47b3cc20a16b655b0eb4f86
+TLA_TOOLS_SHA256 ?= 237332bdcc79a35c7d26efa7b82c77c85c2744591c5598673a8a45085ff2a4fb
 
 # Root directory holding the TLA+ models.  Each subdirectory contains exactly
 # one <Name>.tla plus a matching <Name>.cfg and is model-checked by a per-model
@@ -877,6 +878,27 @@ else
 orca-inttest: ## Run orca integration tests (Garage + Azurite via testcontainers; requires Docker)
 	$(GOTEST) -tags=integrationtest -race -count=1 -timeout 15m ./internal/orca/inttest/...
 endif
+
+# storage-inttest runs the unbounded-storage -> orca -> Garage
+# integration test. It builds the libfabric-linked unbounded-storage
+# binary and an integrationtest+storageboundary test binary (compiled as
+# the current user so the Go caches stay user-owned), then runs that
+# binary under sudo: it needs CAP_SYS_RESOURCE to raise RLIMIT_MEMLOCK
+# for the storage children's io_uring pinned buffers. LD_LIBRARY_PATH is
+# re-injected past sudo's env scrubbing so the spawned binaries find the
+# pinned libfabric. The -test.run filter keeps it scoped to the storage
+# boundary test alone (the rest of the orca integration suite is compiled
+# into the binary but never executed). Requires Docker (Garage + Azurite
+# via testcontainers).
+.PHONY: storage-inttest
+STORAGE_INTTEST_BIN := $(CURDIR)/tmp/storage-inttest.test
+
+storage-inttest: libfabric unbounded-storage-build ## Run the unbounded-storage -> orca -> Garage integration test (Docker + sudo)
+	@mkdir -p $(CURDIR)/tmp
+	$(GOTEST) -tags=integrationtest,storageboundary -c -o $(STORAGE_INTTEST_BIN) ./internal/orca/inttest/
+	sudo -E env "PATH=$$PATH" "LD_LIBRARY_PATH=$(LIBFABRIC_PREFIX)/lib" \
+		$(STORAGE_INTTEST_BIN) -test.v -test.timeout 30m -test.run '^TestStorageBoundaryThroughOrca$$'
+
 
 image-net-controller-local: net-frontend resources/cni-plugins-linux-$(HOST_GOARCH)-$(CNI_PLUGINS_VERSION).tgz ## Build the unbounded-net-controller image locally (single-arch)
 	$(CONTAINER_ENGINE) build \

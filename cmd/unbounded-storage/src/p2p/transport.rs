@@ -36,30 +36,27 @@ use crate::backend::Backend;
 use crate::bufferpool::{BulkRef, Error, PageRef, PageStream, Req, Transport};
 use crate::fabric::Result as FabResult;
 use crate::fabric::{Fabric, FabricTransport, MrHandle, PeerId};
-use crate::p2p::{FingerRouter, FingerTable, NodeId, stripe_to_ring};
+use crate::p2p::{FingerRouter, FingerTable, NodeId, RoutingHandle, stripe_to_ring};
 
 /// Transport that selects the first hop per request by finger-table
 /// ownership: the local origin `Backend` when this node owns the
 /// stripe, otherwise the fabric peer path.
 pub struct RoutedTransport<R, B: Backend<Req = R>> {
     fabric_transport: FabricTransport<R, FingerRouter>,
-    fingers: Arc<FingerTable>,
-    /// Retained alongside `fingers` as the canonical record of the
-    /// routing surface this transport was built from. The active
-    /// `node -> peer` resolution happens inside the inner
-    /// `FabricTransport`'s `FingerRouter` clone; this copy keeps the
-    /// two views co-located for inspection and future re-routing.
-    #[allow(dead_code)]
-    node_to_peer: Arc<HashMap<NodeId, PeerId>>,
+    /// Shared, live-reloadable routing surface. The inner
+    /// `FabricTransport`'s `FingerRouter` shares this same handle, so a
+    /// peer-set republish through any clone updates both the
+    /// local-ownership pre-check below and the fabric routing at once.
+    routing: RoutingHandle,
     backend: B,
     _marker: PhantomData<fn() -> R>,
 }
 
 impl<R, B: Backend<Req = R>> RoutedTransport<R, B> {
-    /// Build a routed transport. Constructs the inner
-    /// `FabricTransport` with a `FingerRouter` over the same
-    /// `fingers` / `node_to_peer` used for the local-ownership
-    /// pre-check.
+    /// Build a routed transport over a freshly-seeded routing surface.
+    /// The transport owns its own [`RoutingHandle`]; use
+    /// [`Self::with_routing`] to share one with other consumers for
+    /// live reload.
     pub fn new(
         fabric: Arc<Fabric>,
         mr: MrHandle,
@@ -68,12 +65,32 @@ impl<R, B: Backend<Req = R>> RoutedTransport<R, B> {
         node_to_peer: Arc<HashMap<NodeId, PeerId>>,
         backend: B,
     ) -> FabResult<Self> {
-        let router = FingerRouter::new(fingers.clone(), node_to_peer.clone());
+        Self::with_routing(
+            fabric,
+            mr,
+            page_size,
+            RoutingHandle::new(fingers, node_to_peer),
+            backend,
+        )
+    }
+
+    /// Build a routed transport that shares `routing` with other
+    /// consumers. Constructs the inner `FabricTransport` with a
+    /// `FingerRouter` over a clone of the same handle, so the
+    /// local-ownership pre-check and the fabric routing always agree
+    /// and reload together.
+    pub fn with_routing(
+        fabric: Arc<Fabric>,
+        mr: MrHandle,
+        page_size: usize,
+        routing: RoutingHandle,
+        backend: B,
+    ) -> FabResult<Self> {
+        let router = FingerRouter::from_handle(routing.clone());
         let fabric_transport = FabricTransport::new(fabric, mr, router, page_size)?;
         Ok(Self {
             fabric_transport,
-            fingers,
-            node_to_peer,
+            routing,
             backend,
             _marker: PhantomData,
         })
@@ -87,7 +104,11 @@ impl<R, B: Backend<Req = R>> RoutedTransport<R, B> {
     where
         R: Req,
     {
-        self.fingers.next_hop(stripe_to_ring(req.key())).is_none()
+        self.routing
+            .snapshot()
+            .fingers
+            .next_hop(stripe_to_ring(req.key()))
+            .is_none()
     }
 }
 

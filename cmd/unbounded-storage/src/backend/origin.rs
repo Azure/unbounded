@@ -4,8 +4,9 @@
 //! Enum dispatch over the concrete origin backends.
 //!
 //! The node configures exactly one origin tier per `backend_id`, but
-//! that tier may be a plaintext HTTP origin ([`HttpBackend`]) or an
-//! S3-compatible origin ([`S3Backend`]). Rather than box the backend
+//! that tier may be a plaintext HTTP origin ([`HttpBackend`]), an
+//! S3-compatible origin ([`S3Backend`]), or an Azure Blob origin
+//! ([`AzureBackend`]). Rather than box the backend
 //! behind `dyn Backend` (which the [`Backend`] trait's generic
 //! associated `Stream<'a>` type forbids without erasing the stream),
 //! [`OriginBackend`] is a static enum the embedder selects at
@@ -19,14 +20,37 @@ use std::task::{Context, Poll};
 use crate::bufferpool::{BulkRef, Error, PageRef, PageStream};
 use crate::storage::StripeReq;
 
-use super::{Backend, HttpBackend, S3Backend};
+use super::{AzureBackend, Backend, HttpBackend, S3Backend};
 
-/// One configured origin tier: either a plaintext HTTP origin or an
-/// S3-compatible origin. Implements [`Backend`] by delegating to the
-/// inner backend and wrapping its stream in [`OriginStream`].
+/// One configured origin tier: a plaintext HTTP origin, an
+/// S3-compatible origin, or an Azure Blob origin. Implements [`Backend`]
+/// by delegating to the inner backend and wrapping its stream in
+/// [`OriginStream`].
 pub enum OriginBackend {
     Http(HttpBackend),
     S3(S3Backend),
+    Azure(AzureBackend),
+}
+
+impl OriginBackend {
+    /// Owned-stream variant of [`Backend::bulk_get`]. Delegates to the
+    /// inner backend's `fetch_stream`, which borrows nothing from the
+    /// backend, so the returned [`OriginStream`] is `'static`. This is
+    /// what lets a [`super::registry::BackendRegistry`] serve a fetch
+    /// from a backend it holds behind an `Arc`/`ArcSwap` without the
+    /// temporary `Arc` guard having to outlive the stream.
+    pub fn fetch_stream(
+        &self,
+        req: &StripeReq,
+        src: BulkRef,
+        dsts: &[PageRef],
+    ) -> OriginStream<'static> {
+        match self {
+            OriginBackend::Http(b) => OriginStream::Http(b.fetch_stream(req, src, dsts)),
+            OriginBackend::S3(b) => OriginStream::S3(b.fetch_stream(req, src, dsts)),
+            OriginBackend::Azure(b) => OriginStream::Azure(b.fetch_stream(req, src, dsts)),
+        }
+    }
 }
 
 impl Backend for OriginBackend {
@@ -39,9 +63,15 @@ impl Backend for OriginBackend {
         src: BulkRef,
         dsts: &'a [PageRef],
     ) -> Self::Stream<'a> {
+        // NB: this cannot delegate to the inherent `fetch_stream`, which
+        // returns `OriginStream<'static>`: `OriginStream<'a>` projects
+        // each inner backend's associated `Stream<'a>` and so is
+        // invariant in `'a`, which blocks the `'static -> 'a` coercion.
+        // The inner `bulk_get`s build the correctly-lifetimed stream.
         match self {
             OriginBackend::Http(b) => OriginStream::Http(b.bulk_get(req, src, dsts)),
             OriginBackend::S3(b) => OriginStream::S3(b.bulk_get(req, src, dsts)),
+            OriginBackend::Azure(b) => OriginStream::Azure(b.bulk_get(req, src, dsts)),
         }
     }
 }
@@ -52,6 +82,7 @@ impl Backend for OriginBackend {
 pub enum OriginStream<'a> {
     Http(<HttpBackend as Backend>::Stream<'a>),
     S3(<S3Backend as Backend>::Stream<'a>),
+    Azure(<AzureBackend as Backend>::Stream<'a>),
 }
 
 impl PageStream for OriginStream<'_> {
@@ -65,6 +96,7 @@ impl PageStream for OriginStream<'_> {
         match self.get_mut() {
             OriginStream::Http(s) => Pin::new(s).poll_next(cx),
             OriginStream::S3(s) => Pin::new(s).poll_next(cx),
+            OriginStream::Azure(s) => Pin::new(s).poll_next(cx),
         }
     }
 }

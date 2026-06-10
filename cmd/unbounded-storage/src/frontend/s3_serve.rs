@@ -33,7 +33,7 @@ use std::task::{Context, Poll, Waker};
 use ::http::header::{ACCEPT_RANGES, CONNECTION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE};
 use ::http::{Response, StatusCode};
 
-use crate::bufferpool::{BufferPool, Error};
+use crate::bufferpool::{BufferPool, Error, StripePlan};
 use crate::config::{FrontendKind, FrontendSpec};
 use crate::frontend::FrontendError;
 use crate::frontend::range::{ByteRange, RangeError, ResolvedRange, full_object, stripe_set};
@@ -44,7 +44,7 @@ use crate::http::{
 };
 use crate::ring::NetHandle;
 use crate::runtime::noop_waker;
-use crate::storage::{OriginRef, StripeReq};
+use crate::storage::{ObjectMetadata, OriginRef, StripeReq};
 
 /// The `x-amz-request-id` response header name. Present on every
 /// response (success and error) so clients and proxies can correlate.
@@ -58,8 +58,8 @@ static REQUEST_ID_SEQ: AtomicU64 = AtomicU64::new(1);
 /// S3 serving frontend factory. Built once per [`FrontendSpec`]; holds
 /// only the immutable configuration distilled from the spec.
 ///
-/// Like [`HttpFrontend`](crate::frontend::HttpFrontend) it does not
-/// implement the `Frontend` trait: the per-shard [`S3Driver`] is
+/// Like [`HttpFrontend`](crate::frontend::HttpFrontend) it exposes plain
+/// inherent methods rather than a trait: the per-shard [`S3Driver`] is
 /// generic over the concrete bufferpool type, which is only nameable in
 /// the binary, so the binary binds the listener via
 /// [`S3Frontend::bind_listener`] and constructs the driver directly.
@@ -78,7 +78,7 @@ impl S3Frontend {
     /// [`FrontendError::UnsupportedKind`], so a misrouted spec fails
     /// loudly rather than being served by the wrong engine.
     pub fn from_spec(spec: &FrontendSpec) -> Result<Self, FrontendError> {
-        if spec.kind != FrontendKind::S3 {
+        if spec.kind() != FrontendKind::S3 {
             return Err(FrontendError::UnsupportedKind("non-s3 frontend kind"));
         }
         let bind = spec
@@ -228,6 +228,24 @@ impl<P: BufferPool<Req = StripeReq> + 'static> S3Driver<P> {
     }
 }
 
+impl<P: BufferPool<Req = StripeReq> + 'static> Drop for S3Driver<P> {
+    /// Close the listen fd the driver owns. The driver is the sole owner
+    /// of this `SO_REUSEPORT` listener (the embedder hands it the fd from
+    /// `bind_listener` and never touches it again), so dropping the
+    /// driver (on shard shutdown or a live frontend removal) must close
+    /// it or the fd leaks. The accept future borrows only the fd number,
+    /// not ownership, so closing here is sound once the driver is gone.
+    fn drop(&mut self) {
+        if self.listen_fd >= 0 {
+            // SAFETY: `listen_fd` was returned by `bind_listener` and is
+            // owned exclusively by this driver; it is closed exactly once.
+            unsafe {
+                libc::close(self.listen_fd);
+            }
+        }
+    }
+}
+
 /// Serve one accepted connection end-to-end, then close its fd.
 ///
 /// Owns everything it needs so the future is `'static` and can live in
@@ -332,7 +350,7 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
     // (404 NoSuchKey) from any other failure (500 InternalError). Unlike
     // the plain HTTP frontend, a length-read failure is never a silently
     // dropped connection.
-    let len = match read_object_length_s3(pool, backend_id, &path).await {
+    let len = match read_object_length_s3(pool, backend_id, &path, page_size).await {
         LenResult::Len(l) => l,
         LenResult::NotFound => {
             let bytes = error_bytes(S3ErrorCode::NoSuchKey, &path, &request_id, is_head, None);
@@ -399,57 +417,68 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
         return Ok(());
     }
 
-    // 8. Stream the body stripe-by-stripe out of the bufferpool.
+    // 8. Stream the body out of the bufferpool, pipelined across
+    // stripe boundaries.
     //
-    // Within each stripe we use the windowed read path so the pool
+    // The whole byte range is handed to the pool as one ordered list
+    // of per-stripe slices via the pipelined read path, so the pool
     // keeps many page fetches in flight ahead of the byte we are
-    // currently sending. The client send (`send_zc_fixed`) is
-    // strictly in order on the single TCP stream, but the fabric
-    // fetches of pages ahead of the cursor overlap with it, which is
-    // what lets a single large object saturate the RDMA fabric NIC.
-    // `usize::MAX` requests the full window: `read_windowed` clamps
-    // it to the pool's configured `max_inflight_pages` budget, so the
-    // prefetch depth is governed by that single knob.
-    for slice in stripe_set(resolved, stripe_size) {
-        let origin_ref = OriginRef {
-            backend_id: backend_id.to_string(),
-            origin_object_id: path.clone(),
-            stripe_idx: slice.stripe_idx,
-        };
-        let pool_req = StripeReq::new(origin_ref.stripe_key()).with_origin(origin_ref);
-        let mut rs = pool
-            .read_windowed(&pool_req, slice.intra_offset, slice.intra_len, usize::MAX)
-            .map_err(|_| ())?;
-        while let Some(page) = rs.next_page().await {
-            let page = page.map_err(|_| ())?;
-            let pr = page.page_ref();
-            let page_byte_offset = pr.page_idx as usize * page_size + pr.offset as usize;
-            let n = pr.len as usize;
-            // The PageGuard must stay alive until the SEND_ZC
-            // notification (when the kernel is done with the source
-            // page); awaiting here holds it across every partial send,
-            // then we drop it before the next `next_page` as the stream
-            // contract requires.
-            //
-            // SEND_ZC's CQE `res` is the count the kernel accepted,
-            // which can be short under socket-send-buffer pressure, so
-            // we loop advancing the byte offset until the whole page is
-            // on the wire. A zero count means the peer closed.
-            let mut sent_offset = page_byte_offset;
-            let mut remaining = n;
-            while remaining > 0 {
-                let sent = handle
-                    .send_zc_fixed(conn_fd, 0, sent_offset, remaining)
-                    .await
-                    .map_err(|_| ())?;
-                if sent == 0 {
-                    return Err(());
-                }
-                sent_offset += sent;
-                remaining -= sent;
+    // currently sending, spanning stripe boundaries. The client send
+    // (`send_zc_fixed`) is strictly in order on the single TCP stream,
+    // but the fabric/origin fetches of pages ahead of the cursor
+    // overlap with it, which is what lets a single large object
+    // saturate the RDMA fabric NIC and the origin download. Driving
+    // the slices through a single pipelined read (rather than draining
+    // each stripe's windowed read before the next) is what lets
+    // prefetch cross stripe boundaries instead of collapsing to one
+    // stripe's depth. `usize::MAX` requests the full window:
+    // `read_pipelined` clamps it to the pool's configured
+    // `max_inflight_pages` budget, so prefetch depth is governed by
+    // that single knob.
+    let plans: Vec<StripePlan<StripeReq>> = stripe_set(resolved, stripe_size)
+        .into_iter()
+        .map(|slice| {
+            let origin_ref = OriginRef {
+                backend_id: backend_id.to_string(),
+                origin_object_id: path.clone(),
+                stripe_idx: slice.stripe_idx,
+            };
+            StripePlan {
+                req: StripeReq::new(origin_ref.stripe_key()).with_origin(origin_ref),
+                intra_offset: slice.intra_offset,
+                intra_len: slice.intra_len,
             }
-            drop(page);
+        })
+        .collect();
+    let mut rs = pool.read_pipelined(plans, usize::MAX).map_err(|_| ())?;
+    while let Some(page) = rs.next_page().await {
+        let page = page.map_err(|_| ())?;
+        let pr = page.page_ref();
+        let page_byte_offset = pr.page_idx as usize * page_size + pr.offset as usize;
+        let n = pr.len as usize;
+        // The PageGuard must stay alive until the SEND_ZC notification
+        // (when the kernel is done with the source page); awaiting here
+        // holds it across every partial send, then we drop it before
+        // the next `next_page` as the stream contract requires.
+        //
+        // SEND_ZC's CQE `res` is the count the kernel accepted, which
+        // can be short under socket-send-buffer pressure, so we loop
+        // advancing the byte offset until the whole page is on the
+        // wire. A zero count means the peer closed.
+        let mut sent_offset = page_byte_offset;
+        let mut remaining = n;
+        while remaining > 0 {
+            let sent = handle
+                .send_zc_fixed(conn_fd, 0, sent_offset, remaining)
+                .await
+                .map_err(|_| ())?;
+            if sent == 0 {
+                return Err(());
+            }
+            sent_offset += sent;
+            remaining -= sent;
         }
+        drop(page);
     }
     Ok(())
 }
@@ -458,7 +487,7 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
 /// distinction the S3 frontend acts on: a missing origin object maps to
 /// a 404, every other failure to a 500.
 enum LenResult {
-    /// The length entry resolved to this byte length.
+    /// The metadata entry resolved to this byte length.
     Len(u64),
     /// The origin reported the object does not exist
     /// ([`Error::OriginNotFound`]).
@@ -468,7 +497,7 @@ enum LenResult {
 }
 
 /// Resolve an object's length by reading its dedicated content-addressed
-/// length entry through the pool, preserving an
+/// metadata entry through the pool, preserving an
 /// [`Error::OriginNotFound`] as [`LenResult::NotFound`].
 ///
 /// This is the S3 frontend's own variant of
@@ -480,10 +509,11 @@ async fn read_object_length_s3<P: BufferPool<Req = StripeReq>>(
     pool: &Rc<P>,
     backend_id: &str,
     path: &str,
+    page_size: usize,
 ) -> LenResult {
-    let origin_ref = OriginRef::length_entry(backend_id, path);
+    let origin_ref = OriginRef::metadata_entry(backend_id, path);
     let req = StripeReq::new(origin_ref.stripe_key()).with_origin(origin_ref);
-    let mut rs = match pool.read(&req, 0, 8).await {
+    let mut rs = match pool.read(&req, 0, page_size as u64).await {
         Ok(rs) => rs,
         Err(Error::OriginNotFound) => return LenResult::NotFound,
         Err(_) => return LenResult::Other,
@@ -494,13 +524,10 @@ async fn read_object_length_s3<P: BufferPool<Req = StripeReq>>(
         Some(Err(_)) => return LenResult::Other,
         None => return LenResult::Other,
     };
-    let bytes = page.as_slice();
-    if bytes.len() < 8 {
-        return LenResult::Other;
+    match ObjectMetadata::decode(page.as_slice()) {
+        Ok(meta) => LenResult::Len(meta.length),
+        Err(_) => LenResult::Other,
     }
-    let mut le = [0u8; 8];
-    le.copy_from_slice(&bytes[..8]);
-    LenResult::Len(u64::from_le_bytes(le))
 }
 
 /// Format the `200 OK` head for serving a whole object.
@@ -591,14 +618,14 @@ fn next_request_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bufferpool::{ReadStream, WindowedRead};
+    use crate::bufferpool::{PipelinedRead, ReadStream, WindowedRead};
     use crate::config::FrontendKind;
     use std::cell::RefCell;
 
     fn spec(id: &str, bind: &str) -> FrontendSpec {
         FrontendSpec {
             id: id.to_string(),
-            kind: FrontendKind::S3,
+            kind: FrontendKind::S3 as i32,
             bind: bind.to_string(),
             backend: "primary".to_string(),
         }
@@ -618,7 +645,7 @@ mod tests {
     #[test]
     fn from_spec_rejects_non_s3_kind() {
         let mut s = spec("f", "127.0.0.1:9000");
-        s.kind = FrontendKind::Http;
+        s.kind = FrontendKind::Http as i32;
         assert!(matches!(
             S3Frontend::from_spec(&s),
             Err(FrontendError::UnsupportedKind(_))
@@ -740,6 +767,14 @@ mod tests {
         ) -> Result<WindowedRead<'p>, Error> {
             Err(Error::from("mock pool has no data"))
         }
+
+        fn read_pipelined<'p>(
+            &'p self,
+            _stripes: Vec<StripePlan<StripeReq>>,
+            _window: usize,
+        ) -> Result<PipelinedRead<'p>, Error> {
+            Err(Error::from("mock pool has no data"))
+        }
     }
 
     #[test]
@@ -773,9 +808,5 @@ mod tests {
         assert!(!driver.progress());
         assert_eq!(driver.conn_count(), 0);
         assert!(driver.is_idle());
-
-        unsafe {
-            libc::close(listen_fd);
-        }
     }
 }
