@@ -103,9 +103,9 @@ func (nspawnNodeOperator) FindActiveMachine(log *slog.Logger) (*ActiveMachine, e
 		// BackfillNodeName falls back to MachineName. The applied config is
 		// normally persisted with a name already set, so this is usually a
 		// no-op; it covers configs written by older agents or hand-edited.
-		source, err := cfg.BackfillMachineName()
+		source, err := provision.ResolveMachineName(&cfg)
 		if err != nil {
-			return nil, fmt.Errorf("backfill applied config machine name %s: %w", path, err)
+			return nil, fmt.Errorf("resolve applied config machine name %s: %w", path, err)
 		}
 
 		if source != "config" {

@@ -31,7 +31,7 @@ import (
 // agent library. Platform-specific extensions (e.g. attestation, cloud
 // provider identity) should be defined in the consuming application.
 type AgentConfig struct {
-	MachineName string `json:"MachineName,omitempty"`
+	MachineName string `json:"MachineName"`
 	// NodeName is the Kubernetes Node name used by kubelet and host-side
 	// daemon watches. During goal-state resolution this field is backfilled
 	// once. Resolution prefers an explicitly configured value, then a valid
@@ -47,73 +47,6 @@ type AgentConfig struct {
 	// "ghcr.io/org/repo:tag") used to bootstrap the machine rootfs.
 	// When empty the agent falls back to debootstrap.
 	OCIImage string `json:"OCIImage,omitempty"`
-}
-
-// machineNameEnv is the environment variable that overrides the resolved
-// MachineName when the config does not set one. It lets a single bootstrap
-// payload (e.g. cloud-init for an Azure VMSS or AWS Auto Scaling group) be
-// reused across many instances, each resolving its own name at startup.
-const machineNameEnv = "AGENT_MACHINE_NAME"
-
-// BackfillMachineName resolves and stores the MachineName once. It returns the
-// source of the resolved value ("config", "env", or "hostname") so callers can
-// log the resolution; the source is "config" when an explicit value was already
-// present. Resolution order:
-//  1. An explicit, valid MachineName already in the config is kept as-is.
-//  2. The AGENT_MACHINE_NAME environment variable.
-//  3. The host hostname.
-//
-// Values resolved from the environment or the hostname are normalized (trimmed
-// and lowercased) before validation. Callers must invoke BackfillMachineName
-// before BackfillNodeName because the latter falls back to MachineName.
-func (a *AgentConfig) BackfillMachineName() (string, error) {
-	if name := strings.TrimSpace(a.MachineName); name != "" {
-		if !isValidNodeName(name) {
-			return "", fmt.Errorf("machine name %q is not a valid Kubernetes node name", a.MachineName)
-		}
-
-		a.MachineName = name
-
-		return "config", nil
-	}
-
-	if env := strings.TrimSpace(os.Getenv(machineNameEnv)); env != "" {
-		name, err := normalizeDerivedMachineName(env)
-		if err != nil {
-			return "", fmt.Errorf("%s: %w", machineNameEnv, err)
-		}
-
-		a.MachineName = name
-
-		return "env", nil
-	}
-
-	hostname, err := os.Hostname()
-	if err != nil {
-		return "", fmt.Errorf("resolve machine name from hostname: %w", err)
-	}
-
-	name, err := normalizeDerivedMachineName(hostname)
-	if err != nil {
-		return "", fmt.Errorf("hostname: %w", err)
-	}
-
-	a.MachineName = name
-
-	return "hostname", nil
-}
-
-// normalizeDerivedMachineName trims and lowercases a machine name derived from
-// the environment or the host hostname, then validates it as a Kubernetes node
-// name (DNS-1123 subdomain). It is kept separate from BackfillMachineName so it
-// can be unit-tested without depending on os.Hostname.
-func normalizeDerivedMachineName(name string) (string, error) {
-	normalized := strings.ToLower(strings.TrimSpace(name))
-	if !isValidNodeName(normalized) {
-		return "", fmt.Errorf("derived machine name %q is not a valid Kubernetes node name", name)
-	}
-
-	return normalized, nil
 }
 
 // BackfillNodeName resolves and stores the Kubernetes Node name once. An

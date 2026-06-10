@@ -562,14 +562,14 @@ func TestManualBootstrapHandler_BuildAgentConfig_EmptyMachineName(t *testing.T) 
 	require.NoError(t, err)
 	require.Empty(t, cfg.MachineName)
 
-	// The marshalled config must omit the MachineName key entirely so the
-	// agent resolves it on the host at startup.
+	// The agent resolves the name on the host at startup; the marshalled
+	// config carries an empty MachineName.
 	data, err := json.Marshal(cfg)
 	require.NoError(t, err)
 
 	var parsed map[string]any
 	require.NoError(t, json.Unmarshal(data, &parsed))
-	require.NotContains(t, parsed, "MachineName")
+	require.Equal(t, "", parsed["MachineName"])
 }
 
 func TestManualBootstrapHandler_RenderScript_EmptyMachineName(t *testing.T) {
@@ -598,9 +598,9 @@ func TestManualBootstrapHandler_RenderScript_EmptyMachineName(t *testing.T) {
 	script, err := h.renderScript(cfg)
 	require.NoError(t, err)
 
-	// Header indicates runtime resolution and the JSON omits the key.
+	// Header indicates runtime resolution and the JSON carries an empty name.
 	require.Contains(t, script, "Machine:      (resolved at runtime)")
-	require.NotContains(t, script, `"MachineName"`)
+	require.Contains(t, script, `"MachineName": ""`)
 	requireValidBashSyntax(t, script)
 }
 
@@ -632,7 +632,7 @@ func TestManualBootstrapHandler_RenderCloudInit_EmptyMachineName(t *testing.T) {
 
 	require.True(t, strings.HasPrefix(output, "#cloud-config\n"))
 	require.Contains(t, output, "Machine:      (resolved at runtime)")
-	require.NotContains(t, output, `"MachineName"`)
+	require.Contains(t, output, `"MachineName": ""`)
 }
 
 func TestManualBootstrapHandler_Execute_EmptyMachineName(t *testing.T) {
@@ -664,7 +664,7 @@ func TestManualBootstrapHandler_Execute_EmptyMachineName(t *testing.T) {
 	script := buf.String()
 	require.Contains(t, script, "#!/bin/bash")
 	require.Contains(t, script, "Machine:      (resolved at runtime)")
-	require.NotContains(t, script, `"MachineName"`)
+	require.Contains(t, script, `"MachineName": ""`)
 }
 
 // ---------------------------------------------------------------------------

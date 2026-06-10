@@ -62,10 +62,12 @@ func normalizeConfig(log *slog.Logger, cfg *provision.UnboundedAgentConfig) erro
 	}
 
 	// MachineName must be resolved before the node name because
-	// BackfillNodeName falls back to MachineName as its final option.
-	source, err := cfg.BackfillMachineName()
+	// BackfillNodeName falls back to MachineName as its final option. The
+	// resolution lives in internal/provision (not the shared pkg/agent
+	// library) so it is not imposed on external consumers.
+	source, err := provision.ResolveMachineName(&cfg.AgentConfig)
 	if err != nil {
-		return fmt.Errorf("backfill machine name: %w", err)
+		return fmt.Errorf("resolve machine name: %w", err)
 	}
 
 	// Only log when the name was derived (not already present in the config)

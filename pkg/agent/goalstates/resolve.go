@@ -29,14 +29,6 @@ type MachineGoalState struct {
 // resolves the complete goal state for the named nspawn machine from an agent
 // config.
 func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName string, downloads *DownloadOverrides) (*MachineGoalState, error) {
-	// Defensively ensure the Kubernetes Machine name is resolved. Normal
-	// callers backfill during config load, so this is usually a no-op; it
-	// guarantees KubeMachineName is never empty for any future caller that
-	// bypasses the standard load paths.
-	if _, err := cfg.BackfillMachineName(); err != nil {
-		return nil, fmt.Errorf("backfill machine name: %w", err)
-	}
-
 	kernel, err := hostKernel()
 	if err != nil {
 		return nil, fmt.Errorf("get host kernel: %w", err)
