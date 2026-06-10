@@ -29,7 +29,9 @@ type ClusterInfo struct {
 	ProviderLabels map[string]string
 }
 
-// ResolveClusterInfo resolves cluster bootstrap details for HostReplace.
+// ResolveClusterInfo resolves cluster bootstrap details for HostReplace. When
+// apiServerEndpoint is empty, it uses the standard kube-public/cluster-info
+// ConfigMap so the default manifests stay cluster-agnostic.
 func ResolveClusterInfo(ctx context.Context, apiServerEndpoint string, k kubernetes.Interface) (*ClusterInfo, error) {
 	apiServerEndpoint = strings.TrimSpace(apiServerEndpoint)
 	caCert := ""

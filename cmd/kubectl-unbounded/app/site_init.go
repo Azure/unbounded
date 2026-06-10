@@ -194,7 +194,7 @@ func (h *siteInitHandler) execute(ctx context.Context) error {
 	}
 
 	if err := h.ensureControllersAreRunning(ctx); err != nil {
-		return err
+		return fmt.Errorf("ensuring controllers for site %s: %w", h.name, err)
 	}
 
 	return nil

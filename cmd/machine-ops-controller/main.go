@@ -33,9 +33,8 @@ import (
 )
 
 const (
-	controllerName                 = "machine-ops-controller"
-	scopeFallbackName              = "scope"
-	defaultMaxConcurrentReconciles = 1
+	controllerName    = "machine-ops-controller"
+	scopeFallbackName = "scope"
 
 	errSiteProviderPair = "--site and --provider must be set together"
 )
@@ -60,7 +59,7 @@ func main() {
 	cmd.Flags().BoolVar(&cfg.leaderElection, "leader-elect", true, "Enable leader election")
 	cmd.Flags().StringVar(&cfg.leaderElectionNamespace, "leader-elect-namespace", "unbounded-kube", "Namespace for the leader election lease")
 	cmd.Flags().StringVar(&cfg.credentialSecretNamespace, "credential-secret-namespace", "unbounded-kube", "Namespace containing MachineOperationCredential referenced Secrets")
-	cmd.Flags().IntVar(&cfg.maxConcurrentReconciles, "max-concurrent-reconciles", defaultMaxConcurrentReconciles, "Maximum concurrent MachineOperation reconciles")
+	cmd.Flags().IntVar(&cfg.maxConcurrentReconciles, "max-concurrent-reconciles", 10, "Maximum concurrent MachineOperation reconciles")
 	cmd.Flags().StringVar(&cfg.apiServerEndpoint, "api-server-endpoint", "", "Kubernetes API server endpoint used in host replacement bootstrap config")
 	cmd.Flags().StringVar(&cfg.siteName, "site", "", "Site name this controller should operate on")
 	cmd.Flags().StringVar(&cfg.providerName, "provider", "", "Provider name this controller should operate on")

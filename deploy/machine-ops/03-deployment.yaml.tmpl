@@ -52,7 +52,7 @@ spec:
             - --leader-elect=true
             - --leader-elect-namespace={{ default "unbounded-kube" .Namespace }}
             - --credential-secret-namespace={{ default "unbounded-kube" .Namespace }}
-            - --max-concurrent-reconciles={{ default "1" .MaxConcurrentReconciles }}
+            - --max-concurrent-reconciles={{ default "10" .MaxConcurrentReconciles }}
             {{- if .Provider }}
             - --provider={{ .Provider }}
             {{- end }}
