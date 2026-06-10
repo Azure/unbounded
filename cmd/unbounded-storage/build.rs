@@ -38,12 +38,31 @@ fn main() {
     }
     fabric_build.warnings(true).compile("unbounded_fabric_shim");
 
+    // OpenSSL drives the backend client TLS handshake and enables kernel
+    // TLS; the shim exposes its macro-only entry points to Rust. TLS 1.3
+    // kTLS receive offload needs OpenSSL >= 3.5, so the Makefile pins one
+    // under tmp/ and points us at it via OPENSSL_PKG_CONFIG_PATH.
+    prepend_pkg_config_path("OPENSSL_PKG_CONFIG_PATH");
+
+    let openssl = pkg_config::Config::new()
+        .probe("openssl")
+        .expect("pkg-config could not locate `openssl` (try setting OPENSSL_PKG_CONFIG_PATH)");
+
+    let mut tls_build = cc::Build::new();
+    tls_build.file("src/backend/tls_shim.c");
+    for p in &openssl.include_paths {
+        tls_build.include(p);
+    }
+    tls_build.warnings(true).compile("unbounded_tls_shim");
+
     generate_config_schema();
 
     println!("cargo:rerun-if-changed=src/fabric/shim.c");
+    println!("cargo:rerun-if-changed=src/backend/tls_shim.c");
     println!("cargo:rerun-if-changed=../../api/unbounded-storage/config.proto");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=LIBFABRIC_PKG_CONFIG_PATH");
+    println!("cargo:rerun-if-env-changed=OPENSSL_PKG_CONFIG_PATH");
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
 }
 

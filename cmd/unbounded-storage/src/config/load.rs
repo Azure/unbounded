@@ -72,6 +72,13 @@ pub enum ConfigError {
     MissingBackendConfig(String),
     MissingFrontendConfig(String),
     EmptyBackendUrl(String),
+    InvalidBackendUrl {
+        backend_name: String,
+        url: String,
+        reason: String,
+    },
+    ConflictingTlsConfig(String),
+    PlaintextTlsConfig(String),
     EmptyFrontendAddr(String),
     StripeSizeNotPowerOfTwo {
         backend_name: String,
@@ -172,6 +179,19 @@ impl fmt::Display for ConfigError {
             ConfigError::EmptyBackendUrl(name) => {
                 write!(f, "backend {name:?}: url must not be empty")
             }
+            ConfigError::InvalidBackendUrl {
+                backend_name,
+                url,
+                reason,
+            } => write!(f, "backend {backend_name:?}: invalid url {url:?}: {reason}"),
+            ConfigError::ConflictingTlsConfig(name) => write!(
+                f,
+                "backend {name:?}: ca_cert_path and insecure_skip_verify are mutually exclusive"
+            ),
+            ConfigError::PlaintextTlsConfig(name) => write!(
+                f,
+                "backend {name:?}: ca_cert_path and insecure_skip_verify require an https url"
+            ),
             ConfigError::EmptyFrontendAddr(id) => {
                 write!(f, "frontend {id:?}: addr must not be empty")
             }
@@ -277,15 +297,30 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
         }
         let stripe_size_bytes = match b.config.as_ref() {
             Some(backend_spec::Config::Http(cfg)) => {
-                validate_backend_url(&b.name, &cfg.url)?;
+                validate_backend_url(
+                    &b.name,
+                    &cfg.url,
+                    &cfg.ca_cert_path,
+                    cfg.insecure_skip_verify,
+                )?;
                 cfg.stripe_size_bytes.unwrap_or(0)
             }
             Some(backend_spec::Config::S3(cfg)) => {
-                validate_backend_url(&b.name, &cfg.url)?;
+                validate_backend_url(
+                    &b.name,
+                    &cfg.url,
+                    &cfg.ca_cert_path,
+                    cfg.insecure_skip_verify,
+                )?;
                 cfg.stripe_size_bytes.unwrap_or(0)
             }
             Some(backend_spec::Config::Azure(cfg)) => {
-                validate_backend_url(&b.name, &cfg.url)?;
+                validate_backend_url(
+                    &b.name,
+                    &cfg.url,
+                    &cfg.ca_cert_path,
+                    cfg.insecure_skip_verify,
+                )?;
                 cfg.stripe_size_bytes.unwrap_or(0)
             }
             Some(backend_spec::Config::Fake(cfg)) => cfg.stripe_size_bytes.unwrap_or(0),
@@ -365,9 +400,25 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
     Ok(())
 }
 
-fn validate_backend_url(backend_name: &str, url: &str) -> Result<(), ConfigError> {
+fn validate_backend_url(
+    backend_name: &str,
+    url: &str,
+    ca_cert_path: &Option<String>,
+    insecure_skip_verify: bool,
+) -> Result<(), ConfigError> {
     if url.is_empty() {
         return Err(ConfigError::EmptyBackendUrl(backend_name.to_string()));
+    }
+    let parsed = crate::backend::url::parse_endpoint(url).map_err(|e| ConfigError::InvalidBackendUrl {
+        backend_name: backend_name.to_string(),
+        url: url.to_string(),
+        reason: e.to_string(),
+    })?;
+    if ca_cert_path.is_some() && insecure_skip_verify {
+        return Err(ConfigError::ConflictingTlsConfig(backend_name.to_string()));
+    }
+    if !parsed.scheme.is_tls() && (ca_cert_path.is_some() || insecure_skip_verify) {
+        return Err(ConfigError::PlaintextTlsConfig(backend_name.to_string()));
     }
 
     Ok(())
@@ -1136,6 +1187,57 @@ name = "synthetic"
     }
 
     #[test]
+    fn rejects_backend_url_without_scheme() {
+        let s = r#"
+[[backends]]
+name = "b"
+
+[backends.config.http]
+url = "origin.example.com:443"
+"#;
+        let f = write_cfg(s);
+        match load(f.path()) {
+            Err(ConfigError::InvalidBackendUrl { backend_name, .. }) if backend_name == "b" => {}
+            other => panic!("expected InvalidBackendUrl, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_conflicting_tls_config() {
+        let s = r#"
+[[backends]]
+name = "b"
+
+[backends.config.http]
+url = "https://e"
+ca_cert_path = "/etc/ca.pem"
+insecure_skip_verify = true
+"#;
+        let f = write_cfg(s);
+        match load(f.path()) {
+            Err(ConfigError::ConflictingTlsConfig(name)) if name == "b" => {}
+            other => panic!("expected ConflictingTlsConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_tls_config_on_plaintext_url() {
+        let s = r#"
+[[backends]]
+name = "b"
+
+[backends.config.http]
+url = "http://e"
+insecure_skip_verify = true
+"#;
+        let f = write_cfg(s);
+        match load(f.path()) {
+            Err(ConfigError::PlaintextTlsConfig(name)) if name == "b" => {}
+            other => panic!("expected PlaintextTlsConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn rejects_non_power_of_two_stripe_size() {
         let s = r#"
 [[backends]]
@@ -1332,12 +1434,12 @@ addr = "0.0.0.0:9000"
 name = "s3"
 
 [backends.config.s3]
-url = "s3.example.com:443"
+url = "https://s3.example.com:443"
 "#;
         let f = write_cfg(s);
         let cfg = load(f.path()).expect("load should succeed");
         assert_eq!(cfg.backends[0].kind_name(), "s3");
-        assert_eq!(cfg.backends[0].url(), Some("s3.example.com:443"));
+        assert_eq!(cfg.backends[0].url(), Some("https://s3.example.com:443"));
     }
 
     #[test]
@@ -1347,7 +1449,7 @@ url = "s3.example.com:443"
 name = "azure"
 
 [backends.config.azure]
-url = "acct.blob.core.windows.net:443"
+url = "https://acct.blob.core.windows.net:443"
 "#;
         let f = write_cfg(s);
         let cfg = load(f.path()).expect("load should succeed");

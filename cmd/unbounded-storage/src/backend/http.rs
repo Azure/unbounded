@@ -3,8 +3,12 @@
 
 //! HTTP origin backend. [`HttpBackend`] is the cache-miss origin tier:
 //! when a read misses all the way through the P2P cache, it fetches the
-//! stripe's byte range from a plaintext HTTP/1.1 origin server and
-//! fills the destination bufferpool pages.
+//! stripe's byte range from an HTTP/1.1 origin server and fills the
+//! destination bufferpool pages. The origin endpoint URL selects the
+//! transport: `http://` is plaintext, `https://` runs a TLS 1.3
+//! handshake (OpenSSL) and enables kernel TLS so the body still lands
+//! zero-copy in the destination pages (the kernel decrypts in place).
+//! The record-aware recv path lives in [`super::conn`].
 //!
 //! This is the cold path, so it is deliberately simple: one TCP
 //! connection per fetch (`Connection: close`, no pooling), and one heap
@@ -14,12 +18,12 @@
 //!
 //! ## Address resolution and the `Host` header
 //!
-//! [`HttpBackend::resolve_origin`] resolves the configured `host:port`
-//! endpoint to a single IPv4 [`SockAddr`] at startup (DNS at bring-up is
-//! fine). IPv6-only origins are unsupported in v1 and surface as an
-//! error. The `Host:` header sent on each request is rendered from the
-//! resolved IPv4 address; a hostname-bearing `Host:` would require
-//! carrying the original string, which v1 does not.
+//! [`HttpBackend::resolve_origin`] resolves the endpoint URL's authority
+//! to a single IPv4 [`SockAddr`] at startup (DNS at bring-up is fine).
+//! IPv6-only origins are unsupported in v1 and surface as an error. The
+//! `Host:` header and the TLS SNI/certificate hostname are carried as
+//! owned strings derived from the configured URL, not re-rendered from
+//! the resolved address.
 //!
 //! ## Future optimizations (not in v1)
 //!
@@ -33,6 +37,7 @@
 use std::future::Future;
 use std::os::fd::RawFd;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::task::{Context, Poll};
 
 use ::http::header::{CONNECTION, HOST, RANGE};
@@ -43,11 +48,14 @@ use crate::ring::{NetHandle, SockAddr};
 use crate::storage::{ObjectMetadata, StripeReq};
 
 use super::Backend;
+use super::conn;
 use super::limiter::FetchLimiter;
 use super::origin_ring::OriginRing;
+use super::tls::TlsContext;
 
-/// Origin backend that fetches stripe byte ranges from a plaintext
-/// HTTP/1.1 origin server into bufferpool pages.
+/// Origin backend that fetches stripe byte ranges from an HTTP/1.1
+/// origin server (plaintext `http://` or kernel-TLS `https://`) into
+/// bufferpool pages.
 ///
 /// Shard-pinned: the [`OriginRing`] and the raw `backing_base` pointer
 /// are only ever touched on the owning shard thread that built this
@@ -58,6 +66,15 @@ use super::origin_ring::OriginRing;
 pub struct HttpBackend {
     ring: OriginRing,
     origin: SockAddr,
+    /// Authority sent in the `Host:` header (`host` or `host:port`),
+    /// derived from the configured endpoint URL.
+    host: String,
+    /// Hostname (no port) used for TLS SNI and certificate verification.
+    /// Empty on a plaintext (`http://`) backend.
+    sni_host: String,
+    /// TLS context when the endpoint is `https://`; `None` for plaintext.
+    /// Shared (`Rc`) across the fetch futures this backend spawns.
+    tls: Option<Rc<TlsContext>>,
     backend_id: String,
     stripe_size: u64,
     page_size: usize,
@@ -80,6 +97,9 @@ impl HttpBackend {
     pub fn new(
         ring: OriginRing,
         origin: SockAddr,
+        host: String,
+        sni_host: String,
+        tls: Option<Rc<TlsContext>>,
         backend_id: String,
         stripe_size: u64,
         page_size: usize,
@@ -89,6 +109,9 @@ impl HttpBackend {
         Self {
             ring,
             origin,
+            host,
+            sni_host,
+            tls,
             backend_id,
             stripe_size,
             page_size,
@@ -157,11 +180,9 @@ impl HttpBackend {
             return HttpFetchStream::immediate_error("http backend: request missing origin");
         };
         let path = origin.origin_object_id.clone();
-        let host = self
-            .origin
-            .as_ipv4()
-            .map(|(ip, port)| format!("{ip}:{port}"))
-            .unwrap_or_else(|| "origin".to_string());
+        let host = self.host.clone();
+        let sni_host = self.sni_host.clone();
+        let tls = self.tls.clone();
 
         let dsts_owned = dsts.to_vec();
         let handle = match self.ring.handle() {
@@ -191,6 +212,8 @@ impl HttpBackend {
                         handle,
                         origin_addr,
                         host,
+                        sni_host,
+                        tls,
                         path,
                         dsts_owned.clone(),
                         backing_base,
@@ -221,6 +244,8 @@ impl HttpBackend {
                     handle,
                     origin_addr,
                     host,
+                    sni_host,
+                    tls,
                     path,
                     start,
                     len,
@@ -349,6 +374,8 @@ async fn fetch(
     handle: NetHandle,
     origin: SockAddr,
     host: String,
+    sni_host: String,
+    tls: Option<Rc<TlsContext>>,
     path: String,
     start: u64,
     len: u64,
@@ -383,6 +410,14 @@ async fn fetch(
     // own slot.
     handle.connect(conn.fd, origin).await.map_err(io_to_err)?;
 
+    // Drive the TLS handshake (and enable kTLS) before any request bytes
+    // when this is an `https://` backend. `is_tls` then switches the
+    // record-aware recv path on for every read on this socket.
+    let is_tls = tls.is_some();
+    if let Some(tls) = &tls {
+        tls.handshake(&handle, conn.fd, &sni_host).await?;
+    }
+
     let request = format_get_request(&path, &host, start, start + len - 1)?;
     handle.send(conn.fd, request).await.map_err(io_to_err)?;
 
@@ -400,7 +435,7 @@ async fn fetch(
                 h.content_range_start(),
             );
         }
-        let chunk = recv_chunk(&handle, conn.fd).await?;
+        let chunk = conn::recv_chunk(&handle, conn.fd, is_tls).await?;
         if chunk.is_empty() {
             return Err(Error::from(
                 "http backend: connection closed before response headers complete",
@@ -480,10 +515,8 @@ async fn fetch(
         // Pool reserves for this fetch across every await here; the
         // backend is shard-pinned so no other thread touches it. The
         // destination stays reserved until this future resolves.
-        let n_recv = handle
-            .recv_fixed(conn.fd, 0, page_byte_off, recv_len)
-            .await
-            .map_err(io_to_err)?;
+        let n_recv = conn::recv_fixed(&handle, conn.fd, is_tls, page_byte_off, recv_len)
+            .await?;
         if n_recv == 0 {
             // EOF. With a known length this is a truncation; for the
             // close-delimited case it is the normal end of the body.
@@ -516,6 +549,8 @@ async fn fetch_metadata(
     handle: NetHandle,
     origin: SockAddr,
     host: String,
+    sni_host: String,
+    tls: Option<Rc<TlsContext>>,
     path: String,
     dsts: Vec<PageRef>,
     backing_base: *mut u8,
@@ -536,6 +571,13 @@ async fn fetch_metadata(
     // sound (the op futures self-pump on their own thread's ring).
     handle.connect(conn.fd, origin).await.map_err(io_to_err)?;
 
+    // See `fetch`: handshake (and kTLS enable) before the request, then
+    // `is_tls` switches the record-aware recv path on.
+    let is_tls = tls.is_some();
+    if let Some(tls) = &tls {
+        tls.handshake(&handle, conn.fd, &sni_host).await?;
+    }
+
     let request = format_head_request(&path, &host)?;
     handle.send(conn.fd, request).await.map_err(io_to_err)?;
 
@@ -554,7 +596,7 @@ async fn fetch_metadata(
                 "http backend: metadata HEAD response head exceeds 64 KiB",
             ));
         }
-        let chunk = recv_chunk(&handle, conn.fd).await?;
+        let chunk = conn::recv_chunk(&handle, conn.fd, is_tls).await?;
         if chunk.is_empty() {
             return Err(Error::from(
                 "http backend: connection closed before metadata HEAD headers complete",
@@ -777,14 +819,6 @@ fn zero_fill_pages_from(
         page_start = page_end;
     }
     Ok(())
-}
-
-/// Receive one chunk from `fd` through the origin ring. The
-/// [`NetHandle`] recv future self-pumps its own ring's progress hook
-/// while awaiting.
-async fn recv_chunk(handle: &NetHandle, fd: RawFd) -> Result<Vec<u8>, Error> {
-    const RECV_CHUNK: usize = 64 * 1024;
-    handle.recv(fd, RECV_CHUNK).await.map_err(io_to_err)
 }
 
 /// Compute the absolute origin byte range for a stripe sub-range. The

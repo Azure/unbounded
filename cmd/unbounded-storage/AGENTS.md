@@ -125,6 +125,33 @@ completion-dependent test. Pinning `127.0.0.1:0` keeps both fabrics on
 `lo`. If you hit these timeouts on an older checkout, `FI_TCP_IFACE=lo`
 is the manual override.
 
+### OpenSSL dependency
+
+The origin backends (`src/backend/{http,s3,azure}.rs`) speak TLS to
+`https://` origins via OpenSSL with kernel TLS (kTLS), so the negotiated
+body lands decrypted directly in the registered backing (zero copy). The
+C `tls_shim.c` is compiled against the OpenSSL headers by `build.rs` via
+pkg-config, and the binary loads `libssl.so`/`libcrypto.so` at runtime.
+
+kTLS receive on TLS 1.3 requires OpenSSL >= 3.5: OpenSSL 3.0.x only
+engages kTLS for the send direction on 1.3, so the receive-offload
+assertion in `src/backend/tls.rs` fails against the common system 3.0.x.
+The Makefile therefore builds a pinned OpenSSL from source, mirroring
+libfabric:
+
+- `make openssl` downloads and installs the pinned `OPENSSL_VERSION`
+  (see the Makefile default, >= 3.5) under `tmp/openssl/<version>/`,
+  configured with `enable-ktls`. It is a no-op once built; remove
+  `tmp/openssl` to force a rebuild.
+- The `unbounded-storage-*` targets depend on it and export
+  `OPENSSL_PKG_CONFIG_PATH` and `LD_LIBRARY_PATH` (bundled prefix first,
+  ahead of the system 3.0.x with the same soname) for `cargo`
+  automatically, so prefer the Makefile targets over raw `cargo`.
+- The bundled `tmp/openssl/<version>/bin/openssl` CLI must be used with
+  the bundled libs; the system CLI is built against 3.0.x and segfaults
+  if it loads the bundled libs via `LD_LIBRARY_PATH`. `hack/smoke-storage.py`
+  picks the bundled CLI automatically for its cert generation.
+
 ## Testing patterns
 
 There are three distinct in-process test styles in this crate plus an
@@ -294,12 +321,17 @@ make unbounded-storage-smoke
 ```
 
 - The target depends on `unbounded-storage-build`, so it builds
-  libfabric and the release binary first, then runs the harness.
+  libfabric, OpenSSL, and the release binary first, then runs the
+  harness.
 - `sudo` is required because the processes pin io_uring buffers and the
   harness raises `RLIMIT_MEMLOCK` (needs `CAP_SYS_RESOURCE`). The target
-  runs the harness under `sudo` and re-applies the libfabric runtime
-  path (`LD_LIBRARY_PATH`) explicitly, because `sudo` strips `LD_*` even
-  with `-E`.
+  runs the harness under `sudo` and re-applies the libfabric and OpenSSL
+  runtime paths (`LD_LIBRARY_PATH`) explicitly, because `sudo` strips
+  `LD_*` even with `-E`. The bundled OpenSSL path is included ahead of
+  the system libraries so it wins over the system 3.0.x of the same
+  soname.
+- The `https` scenario exercises TLS 1.3 + kTLS against a stub origin,
+  proving the bundled OpenSSL engages kTLS in both directions.
 
 When to run it:
 

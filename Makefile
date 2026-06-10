@@ -106,10 +106,24 @@ LIBFABRIC_PREFIX ?= $(CURDIR)/tmp/libfabric/$(LIBFABRIC_VERSION)
 LIBFABRIC_PKG_CONFIG_PATH := $(LIBFABRIC_PREFIX)/lib/pkgconfig
 LIBFABRIC_STAMP := $(LIBFABRIC_PREFIX)/.installed
 LIBFABRIC_URL ?= https://github.com/ofiwg/libfabric/releases/download/v$(LIBFABRIC_VERSION)/libfabric-$(LIBFABRIC_VERSION).tar.bz2
+
+# OpenSSL is built from source because the backend's kernel-TLS receive
+# path requires kTLS offload for the RX direction on TLS 1.3, which
+# OpenSSL only wires up in 3.5+. Distro packages ship 3.0.x (which skips
+# BIO_set_ktls for the read side on 1.3), so we pin a recent release and
+# install it under tmp/ (gitignored). Override OPENSSL_* to use a system
+# install.
+OPENSSL_VERSION ?= 3.5.1
+OPENSSL_PREFIX ?= $(CURDIR)/tmp/openssl/$(OPENSSL_VERSION)
+OPENSSL_PKG_CONFIG_PATH := $(OPENSSL_PREFIX)/lib/pkgconfig
+OPENSSL_STAMP := $(OPENSSL_PREFIX)/.installed
+OPENSSL_URL ?= https://github.com/openssl/openssl/releases/download/openssl-$(OPENSSL_VERSION)/openssl-$(OPENSSL_VERSION).tar.gz
+
 # Environment prefix that points cargo's build.rs (pkg-config) and the
-# resulting binaries at the pinned libfabric.
+# resulting binaries at the pinned libfabric and OpenSSL.
 CARGO_FABRIC_ENV = LIBFABRIC_PKG_CONFIG_PATH=$(LIBFABRIC_PKG_CONFIG_PATH) \
-	LD_LIBRARY_PATH=$(LIBFABRIC_PREFIX)/lib$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}
+	OPENSSL_PKG_CONFIG_PATH=$(OPENSSL_PKG_CONFIG_PATH) \
+	LD_LIBRARY_PATH=$(LIBFABRIC_PREFIX)/lib:$(OPENSSL_PREFIX)/lib$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}
 
 # Release tarball packaging for unbounded-storage. ARCH defaults to the
 # host (normalized to Go-style names) and can be overridden for CI matrix
@@ -191,7 +205,7 @@ REACT_DEV ?= false
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-manifests
 .PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
-.PHONY: unbounded-storage unbounded-storage-build unbounded-storage-smoke unbounded-storage-tarball unbounded-storage-push unbounded-storage-test unbounded-storage-check unbounded-storage-model-check libfabric
+.PHONY: unbounded-storage unbounded-storage-build unbounded-storage-smoke unbounded-storage-tarball unbounded-storage-push bench unbounded-storage-test unbounded-storage-check unbounded-storage-model-check libfabric openssl
 .PHONY: unbounded-storage-supervisor unbounded-storage-supervisor-build unbounded-storage-supervisor-manifests image-unbounded-storage-supervisor-local image-unbounded-storage-supervisor-push
 
 ##@ General
@@ -252,6 +266,7 @@ help: ## Show this help
 	@echo "  unbounded-storage-model-check    Run TLC on all unbounded-storage TLA+ models"
 	@echo "  unbounded-storage-model-check-<model>  Run TLC on one model (e.g. copy-on-write)"
 	@echo "  libfabric                        Build/install the pinned libfabric from source"
+	@echo "  openssl                          Build/install the pinned OpenSSL from source"
 	@echo ""
 	@echo "Container Images (local, single-arch):"
 	@echo "  image-inventory-all-local        Build all local inventory container images"
@@ -586,13 +601,33 @@ $(LIBFABRIC_STAMP):
 
 libfabric: $(LIBFABRIC_STAMP) ## Build/install the pinned libfabric ($(LIBFABRIC_VERSION)) from source
 
-unbounded-storage-check: $(LIBFABRIC_STAMP) ## Run cargo check for unbounded-storage
+# Build and install the pinned OpenSSL from source (once). Mirrors the
+# libfabric stamp pattern; remove tmp/openssl to force a rebuild. We need
+# >=3.5 for TLS 1.3 kTLS receive offload. `enable-ktls` turns on kernel
+# TLS support; install_sw installs libs+headers and install_ssldirs installs
+# the default openssl.cnf (needed by the `openssl` CLI and libcrypto default
+# config load); both skip the man pages.
+$(OPENSSL_STAMP):
+	@echo "Building openssl $(OPENSSL_VERSION) -> $(OPENSSL_PREFIX)"
+	@rm -rf $(CURDIR)/tmp/openssl/src
+	@mkdir -p $(CURDIR)/tmp/openssl/src
+	@curl -fsSL $(OPENSSL_URL) | tar -xz -C $(CURDIR)/tmp/openssl/src --strip-components=1
+	cd $(CURDIR)/tmp/openssl/src && ./Configure --prefix=$(OPENSSL_PREFIX) --libdir=lib \
+		enable-ktls shared no-tests no-docs
+	$(MAKE) -C $(CURDIR)/tmp/openssl/src -j$$(nproc)
+	$(MAKE) -C $(CURDIR)/tmp/openssl/src install_sw install_ssldirs
+	@rm -rf $(CURDIR)/tmp/openssl/src
+	@touch $(OPENSSL_STAMP)
+
+openssl: $(OPENSSL_STAMP) ## Build/install the pinned OpenSSL ($(OPENSSL_VERSION)) from source
+
+unbounded-storage-check: $(LIBFABRIC_STAMP) $(OPENSSL_STAMP) ## Run cargo check for unbounded-storage
 	$(CARGO_FABRIC_ENV) $(CARGO) check --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --locked --all-targets
 
-unbounded-storage-test: $(LIBFABRIC_STAMP) ## Run cargo tests for unbounded-storage (includes the profiling feature so it always compiles)
+unbounded-storage-test: $(LIBFABRIC_STAMP) $(OPENSSL_STAMP) ## Run cargo tests for unbounded-storage (includes the profiling feature so it always compiles)
 	$(CARGO_FABRIC_ENV) $(CARGO) test --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --locked --all-targets --features profiling
 
-unbounded-storage-build: $(LIBFABRIC_STAMP) ## Build the unbounded-storage binary (no test; UNBOUNDED_STORAGE_PROFILING=1 adds the CPU profiler)
+unbounded-storage-build: $(LIBFABRIC_STAMP) $(OPENSSL_STAMP) ## Build the unbounded-storage binary (no test; UNBOUNDED_STORAGE_PROFILING=1 adds the CPU profiler)
 	$(CARGO_FABRIC_ENV) $(CARGO) build --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --release --locked $(UNBOUNDED_STORAGE_CARGO_FEATURES)
 	@mkdir -p $(dir $(UNBOUNDED_STORAGE_BIN))
 	cp $(UNBOUNDED_STORAGE_CRATE)/target/release/unbounded-storage $(UNBOUNDED_STORAGE_BIN)
@@ -601,7 +636,7 @@ unbounded-storage: unbounded-storage-test unbounded-storage-build ## Build the u
 
 unbounded-storage-smoke: unbounded-storage-build ## Run the end-to-end smoke test (requires sudo for hugepages/memlock)
 	sudo -E env "PATH=$$PATH" \
-		"LD_LIBRARY_PATH=$(LIBFABRIC_PREFIX)/lib$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" \
+		"LD_LIBRARY_PATH=$(LIBFABRIC_PREFIX)/lib:$(OPENSSL_PREFIX)/lib$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" \
 		python3 hack/smoke-storage.py
 
 unbounded-storage-tarball: unbounded-storage-build ## Package unbounded-storage + libfabric into a release tarball ($(STORAGE_TARBALL))
@@ -644,6 +679,18 @@ unbounded-storage-tarball: unbounded-storage-build ## Package unbounded-storage 
 		echo "       install liburing development files on the build host and retry." >&2; \
 		exit 1; \
 	fi
+	@libdir=$(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)/lib; \
+	sslfound=0; \
+	for d in $(OPENSSL_PREFIX)/lib $(OPENSSL_PREFIX)/lib64; do \
+		if [ -d "$$d" ] && cp -a "$$d"/libssl.so* "$$d"/libcrypto.so* "$$libdir"/ 2>/dev/null; then \
+			sslfound=1; \
+		fi; \
+	done; \
+	if [ "$$sslfound" -ne 1 ]; then \
+		echo "error: no libssl.so*/libcrypto.so* found under $(OPENSSL_PREFIX); kTLS origins need the pinned OpenSSL." >&2; \
+		exit 1; \
+	fi; \
+	echo "  bundled libssl/libcrypto from $(OPENSSL_PREFIX)"
 	tar -czf $(STORAGE_TARBALL) -C $(STORAGE_DIST_DIR) $(STORAGE_TARBALL_STEM)
 	cd $(STORAGE_DIST_DIR) && sha256sum $(STORAGE_TARBALL_STEM).tar.gz > $(STORAGE_TARBALL_STEM).tar.gz.sha256
 	@rm -rf $(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)
@@ -690,6 +737,11 @@ unbounded-storage-push: unbounded-storage-tarball ## Push the unbounded-storage 
 	@echo "  curl https://$(STORAGE_BLOB_ACCOUNT).blob.core.windows.net/$(STORAGE_BLOB_CONTAINER)/$(VERSION)/install.sh | bash -s -- https://$(STORAGE_BLOB_ACCOUNT).blob.core.windows.net/$(STORAGE_BLOB_CONTAINER)/$(VERSION)/$(STORAGE_TARBALL_STEM).tar.gz"
 	@echo "Generate a mesh config with:"
 	@echo "  curl https://$(STORAGE_BLOB_ACCOUNT).blob.core.windows.net/$(STORAGE_BLOB_CONTAINER)/$(VERSION)/gen-config.sh | bash"
+
+bench: $(LIBFABRIC_STAMP) $(OPENSSL_STAMP) ## Build the bench tool (excluded from images)
+	$(CARGO_FABRIC_ENV) $(CARGO) build --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --release --locked --bin bench
+	@mkdir -p $(dir $(UNBOUNDED_STORAGE_BIN))
+	cp $(UNBOUNDED_STORAGE_CRATE)/target/release/bench bin/bench
 
 # TLA+ tooling for the unbounded-storage models.
 # tla2tools.jar is fetched on demand into tmp/ (gitignored).  Override
@@ -1047,10 +1099,10 @@ endif
 .PHONY: storage-inttest
 STORAGE_INTTEST_BIN := $(CURDIR)/tmp/storage-inttest.test
 
-storage-inttest: libfabric unbounded-storage-build ## Run the unbounded-storage -> orca -> Garage integration test (Docker + sudo)
+storage-inttest: libfabric openssl unbounded-storage-build ## Run the unbounded-storage -> orca -> Garage integration test (Docker + sudo)
 	@mkdir -p $(CURDIR)/tmp
 	$(GOTEST) -tags=integrationtest,storageboundary -c -o $(STORAGE_INTTEST_BIN) ./internal/orca/inttest/
-	sudo -E env "PATH=$$PATH" "LD_LIBRARY_PATH=$(LIBFABRIC_PREFIX)/lib" \
+	sudo -E env "PATH=$$PATH" "LD_LIBRARY_PATH=$(LIBFABRIC_PREFIX)/lib:$(OPENSSL_PREFIX)/lib" \
 		$(STORAGE_INTTEST_BIN) -test.v -test.timeout 30m -test.run '^TestStorageBoundaryThroughOrca$$'
 
 

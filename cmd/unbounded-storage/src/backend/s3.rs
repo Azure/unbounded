@@ -3,8 +3,15 @@
 
 //! S3-compatible origin backend. [`S3Backend`] is the S3 sibling of
 //! [`HttpBackend`](super::HttpBackend): it fetches a stripe's byte range
-//! (or an object's length) from an S3-compatible origin over plaintext
-//! HTTP/1.1 and fills the destination bufferpool pages.
+//! (or an object's length) from an S3-compatible origin and fills the
+//! destination bufferpool pages.
+//!
+//! The origin scheme selects the transport: `http://` dials the origin
+//! in plaintext HTTP/1.1; `https://` performs a TLS 1.3 handshake via
+//! OpenSSL with kernel TLS (kTLS) so body bytes are decrypted straight
+//! into the registered backing (zero copy preserved). Record-aware recv
+//! lives in [`super::conn`]. The `Host:` header and SNI/cert hostname are
+//! carried as owned strings parsed from the configured endpoint URL.
 //!
 //! It mirrors the HTTP backend's fetch/length structure and shares its
 //! cold-path simplicity (one TCP connection per fetch, one heap copy of
@@ -22,6 +29,7 @@
 use std::future::Future;
 use std::os::fd::RawFd;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::task::{Context, Poll};
 
 use ::http::header::{CONNECTION, HOST, RANGE};
@@ -32,11 +40,15 @@ use crate::ring::{NetHandle, SockAddr};
 use crate::storage::{ObjectMetadata, StripeReq};
 
 use super::Backend;
+use super::conn;
 use super::limiter::FetchLimiter;
 use super::origin_ring::OriginRing;
+use super::tls::TlsContext;
 
 /// Origin backend that fetches stripe byte ranges from an
-/// S3-compatible origin into bufferpool pages over plaintext HTTP/1.1.
+/// S3-compatible origin into bufferpool pages. The endpoint scheme
+/// selects plaintext HTTP/1.1 (`http://`) or TLS 1.3 with kTLS
+/// (`https://`); see the module docs.
 ///
 /// Shard-pinned: the [`OriginRing`] and the raw `backing_base` pointer
 /// are only ever touched on the owning shard thread that built this
@@ -51,6 +63,12 @@ pub struct S3Backend {
     /// uses `origin` (the resolved IPv4), but the bucket's virtual-host
     /// name must travel in `Host:`.
     host: String,
+    /// Hostname (no port) used for SNI and certificate verification on
+    /// TLS connections. Empty for plaintext origins.
+    sni_host: String,
+    /// TLS context shared across fetches when the endpoint is `https://`;
+    /// `None` for plaintext origins.
+    tls: Option<Rc<TlsContext>>,
     backend_id: String,
     stripe_size: u64,
     page_size: usize,
@@ -75,6 +93,8 @@ impl S3Backend {
         ring: OriginRing,
         origin: SockAddr,
         host: String,
+        sni_host: String,
+        tls: Option<Rc<TlsContext>>,
         backend_id: String,
         stripe_size: u64,
         page_size: usize,
@@ -85,6 +105,8 @@ impl S3Backend {
             ring,
             origin,
             host,
+            sni_host,
+            tls,
             backend_id,
             stripe_size,
             page_size,
@@ -135,6 +157,8 @@ impl S3Backend {
         let backing_base = self.backing_base;
         let page_size = self.page_size;
         let host = self.host.clone();
+        let sni_host = self.sni_host.clone();
+        let tls = self.tls.clone();
 
         // A metadata entry is not a byte range of the object; it is a
         // synthetic one-page cache entry whose payload is the object's
@@ -155,6 +179,8 @@ impl S3Backend {
                         handle,
                         origin_addr,
                         host,
+                        sni_host,
+                        tls,
                         path,
                         dsts_owned.clone(),
                         backing_base,
@@ -185,6 +211,8 @@ impl S3Backend {
                     handle,
                     origin_addr,
                     host,
+                    sni_host,
+                    tls,
                     path,
                     start,
                     len,
@@ -304,6 +332,8 @@ async fn fetch(
     handle: NetHandle,
     origin: SockAddr,
     host: String,
+    sni_host: String,
+    tls: Option<Rc<TlsContext>>,
     path: String,
     start: u64,
     len: u64,
@@ -334,6 +364,11 @@ async fn fetch(
     // ring).
     handle.connect(conn.fd, origin).await.map_err(io_to_err)?;
 
+    let is_tls = tls.is_some();
+    if let Some(tls) = &tls {
+        tls.handshake(&handle, conn.fd, &sni_host).await?;
+    }
+
     let request = format_get_request(&path, &host, start, start + len - 1)?;
     handle.send(conn.fd, request).await.map_err(io_to_err)?;
 
@@ -349,7 +384,7 @@ async fn fetch(
                 h.content_range_start(),
             );
         }
-        let chunk = recv_chunk(&handle, conn.fd).await?;
+        let chunk = conn::recv_chunk(&handle, conn.fd, is_tls).await?;
         if chunk.is_empty() {
             return Err(Error::from(
                 "s3 backend: connection closed before response headers complete",
@@ -426,10 +461,7 @@ async fn fetch(
         // Pool reserves for this fetch across every await here; the
         // backend is shard-pinned so no other thread touches it. The
         // destination stays reserved until this future resolves.
-        let n_recv = handle
-            .recv_fixed(conn.fd, 0, page_byte_off, recv_len)
-            .await
-            .map_err(io_to_err)?;
+        let n_recv = conn::recv_fixed(&handle, conn.fd, is_tls, page_byte_off, recv_len).await?;
         if n_recv == 0 {
             // EOF. With a known length this is a truncation; for the
             // close-delimited case it is the normal end of the body.
@@ -457,6 +489,8 @@ async fn fetch_metadata(
     handle: NetHandle,
     origin: SockAddr,
     host: String,
+    sni_host: String,
+    tls: Option<Rc<TlsContext>>,
     path: String,
     dsts: Vec<PageRef>,
     backing_base: *mut u8,
@@ -478,6 +512,11 @@ async fn fetch_metadata(
     // ring).
     handle.connect(conn.fd, origin).await.map_err(io_to_err)?;
 
+    let is_tls = tls.is_some();
+    if let Some(tls) = &tls {
+        tls.handshake(&handle, conn.fd, &sni_host).await?;
+    }
+
     let request = format_head_request(&path, &host)?;
     handle.send(conn.fd, request).await.map_err(io_to_err)?;
 
@@ -494,7 +533,7 @@ async fn fetch_metadata(
                 "s3 backend: metadata HEAD response head exceeds 64 KiB",
             ));
         }
-        let chunk = recv_chunk(&handle, conn.fd).await?;
+        let chunk = conn::recv_chunk(&handle, conn.fd, is_tls).await?;
         if chunk.is_empty() {
             return Err(Error::from(
                 "s3 backend: connection closed before metadata HEAD headers complete",
@@ -714,14 +753,6 @@ fn zero_fill_pages_from(
         page_start = page_end;
     }
     Ok(())
-}
-
-/// Receive one chunk from `fd` through the origin ring. The
-/// [`NetHandle`] recv future self-pumps its own ring's progress hook
-/// while awaiting.
-async fn recv_chunk(handle: &NetHandle, fd: RawFd) -> Result<Vec<u8>, Error> {
-    const RECV_CHUNK: usize = 64 * 1024;
-    handle.recv(fd, RECV_CHUNK).await.map_err(io_to_err)
 }
 
 /// Compute the absolute origin byte range for a stripe sub-range. The
