@@ -25,7 +25,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 
 use super::channel::{FetchChannelReceiver, FetchCommand, FetchReply, PageLoc, ReplySlot};
 use crate::bufferpool::{BlockStore, Error, PageGuard, Pool, Transport};
@@ -66,6 +66,12 @@ where
     next_token: u64,
     in_flight: Vec<Inflight>,
     disconnected: bool,
+    /// Waker the in-flight fetch futures are polled with. This is the
+    /// owning shard's flag-flipping waker, so a cross-thread completion
+    /// (a disk reply or fabric event) that wakes a fetch sets the
+    /// shard's `wake_flag` and re-polls promptly, letting the shard park
+    /// while merely waiting instead of busy-spinning.
+    waker: Waker,
 }
 
 impl<T, S> FetchService<T, S>
@@ -75,11 +81,16 @@ where
 {
     /// Build a service over `pool`, draining `rx`. `page_size` is the
     /// pool's page size in bytes, used to turn a page's `(page_idx,
-    /// offset)` into an absolute byte offset within the backing.
+    /// offset)` into an absolute byte offset within the backing. `waker`
+    /// is the owning shard's flag-flipping waker (see
+    /// [`ShardLoop::waker`](crate::runtime::ShardLoop::waker)); in-flight
+    /// fetch futures are polled with it so cross-thread completions wake
+    /// the shard loop instead of relying on a busy-spin.
     pub fn new(
         pool: Rc<Pool<T, S, StripeReq>>,
         rx: FetchChannelReceiver,
         page_size: usize,
+        waker: Waker,
     ) -> Self {
         let (rx, service_alive) = rx.into_parts();
         Self {
@@ -91,26 +102,38 @@ where
             next_token: 0,
             in_flight: Vec::new(),
             disconnected: false,
+            waker,
         }
     }
 
     /// Advance the service once: admit any newly queued commands, then
     /// poll outstanding fetches and answer the ones that completed.
-    pub fn poll_once(&mut self, cx: &mut Context<'_>) {
-        self.drain_commands();
-        self.poll_in_flight(cx);
+    /// Returns whether it made progress this tick (admitted a command or
+    /// completed a fetch).
+    pub fn poll_once(&mut self, cx: &mut Context<'_>) -> bool {
+        let admitted = self.drain_commands();
+        let completed = self.poll_in_flight(cx);
+        admitted || completed
     }
 
-    /// Shard-loop tick hook: poll the service under a noop waker and
-    /// report whether work remains. Returns `true` while any fetch is
-    /// still resolving so the loop keeps spinning; newly arrived
-    /// cross-shard commands are picked up by the next `try_recv` within
-    /// the loop's idle interval.
+    /// Shard-loop tick hook: poll the service under the shard's waker and
+    /// report whether it did work this tick.
+    ///
+    /// Reports busy only when it actually made progress (a command was
+    /// admitted or a fetch completed), not merely because a fetch is
+    /// still resolving. While a fetch is in flight the shard loop is free
+    /// to park its idle interval; the fetch future is polled with the
+    /// shard's flag-flipping waker, so a cross-thread completion sets the
+    /// shard's `wake_flag` and triggers a prompt re-poll. Reporting
+    /// perpetual busyness instead would pin the shard thread at 100% CPU
+    /// and starve co-located threads (the fabric progress thread, the
+    /// origin) on a CPU-constrained host. Newly arrived cross-shard
+    /// commands are picked up by the next `try_recv` within the loop's
+    /// idle interval.
     pub fn progress(&mut self) -> bool {
-        let waker = crate::runtime::noop_waker();
+        let waker = self.waker.clone();
         let mut cx = Context::from_waker(&waker);
-        self.poll_once(&mut cx);
-        self.has_inflight()
+        self.poll_once(&mut cx)
     }
 
     /// True while any fetch is still resolving. The shard loop uses this
@@ -131,7 +154,8 @@ where
         self.service_alive.store(false, Ordering::Release);
     }
 
-    fn drain_commands(&mut self) {
+    fn drain_commands(&mut self) -> bool {
+        let mut admitted = false;
         loop {
             match self.rx.try_recv() {
                 Ok(FetchCommand::Fetch {
@@ -139,12 +163,16 @@ where
                     intra_offset,
                     intra_len,
                     reply,
-                }) => self.spawn_fetch(req, intra_offset, intra_len, reply),
+                }) => {
+                    self.spawn_fetch(req, intra_offset, intra_len, reply);
+                    admitted = true;
+                }
                 Ok(FetchCommand::Release { pin_token }) => {
                     // Dropping the guards unpins the pages; an unknown
                     // token (already released, or never issued) is a
                     // harmless no-op.
                     self.pins.remove(&pin_token);
+                    admitted = true;
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -153,6 +181,7 @@ where
                 }
             }
         }
+        admitted
     }
 
     fn spawn_fetch(
@@ -183,7 +212,8 @@ where
         self.in_flight.push(Inflight { reply, fut });
     }
 
-    fn poll_in_flight(&mut self, cx: &mut Context<'_>) {
+    fn poll_in_flight(&mut self, cx: &mut Context<'_>) -> bool {
+        let mut completed = false;
         let mut i = 0;
         while i < self.in_flight.len() {
             match self.in_flight[i].fut.as_mut().poll(cx) {
@@ -193,10 +223,12 @@ where
                     // same index next iteration without advancing.
                     let done = self.in_flight.swap_remove(i);
                     self.complete(done.reply, result);
+                    completed = true;
                 }
                 Poll::Pending => i += 1,
             }
         }
+        completed
     }
 
     fn complete(&mut self, reply: Arc<ReplySlot<FetchReply>>, result: FetchResult) {

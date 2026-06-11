@@ -327,7 +327,14 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
     );
 
     let (channel, rx) = FetchChannel::new();
-    let mut service = FetchService::new(pool.clone(), rx, w.page_size);
+    // The service is driven below via `poll_once` against each task's own
+    // poll Context, so the stored progress() waker is never used here.
+    let mut service = FetchService::new(
+        pool.clone(),
+        rx,
+        w.page_size,
+        unbounded_storage::runtime::noop_waker(),
+    );
 
     let mut exec = Executor::new(seed);
 

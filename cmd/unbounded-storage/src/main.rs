@@ -833,7 +833,8 @@ fn run_shard(
     // pinning pages in its backing and replying with their byte offsets.
     // Registered as a tick hook so it shares the shard's cooperative loop.
     {
-        let mut fetch_service = FetchService::new(pool.clone(), fetch_rx, page_size);
+        let mut fetch_service =
+            FetchService::new(pool.clone(), fetch_rx, page_size, shard_loop.waker());
         shard_loop.add_tick_hook(move || fetch_service.progress());
     }
 
