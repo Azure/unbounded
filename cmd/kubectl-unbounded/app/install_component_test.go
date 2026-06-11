@@ -836,7 +836,7 @@ func TestMaterializeEmbeddedMachineOpsFS(t *testing.T) {
 
 	rbac, err := os.ReadFile(filepath.Join(dir, "02-rbac.yaml"))
 	require.NoError(t, err)
-	require.Contains(t, string(rbac), "cluster-info")
+	require.NotContains(t, string(rbac), "cluster-info")
 	require.Contains(t, string(rbac), "aks-cluster-metadata")
 }
 

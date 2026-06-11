@@ -57,7 +57,7 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["configmaps"]
-    resourceNames: ["cluster-info", "kube-root-ca.crt", "aks-cluster-metadata"]
+    resourceNames: ["kube-root-ca.crt", "aks-cluster-metadata"]
     verbs: ["get"]
 
 ---

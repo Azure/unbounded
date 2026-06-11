@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
-	"os"
 	"text/template"
 
 	"github.com/spf13/cobra"
@@ -20,8 +19,6 @@ import (
 	v1 "k8s.io/client-go/applyconfigurations/core/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
-	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/Azure/unbounded/cmd/machina/machina/controller"
@@ -194,10 +191,6 @@ func (h *siteInitHandler) execute(ctx context.Context) error {
 
 	if err := h.ensureBootstrapToken(ctx); err != nil {
 		return fmt.Errorf("ensuring bootstrap token for site %s: %w", h.name, err)
-	}
-
-	if err := h.ensureClusterInfo(ctx); err != nil {
-		return fmt.Errorf("ensuring cluster-info for site %s: %w", h.name, err)
 	}
 
 	if err := h.ensureControllersAreRunning(ctx); err != nil {
@@ -442,75 +435,6 @@ func (h *siteInitHandler) ensureBootstrapToken(ctx context.Context) error {
 	}
 
 	return nil
-}
-
-func (h *siteInitHandler) ensureClusterInfo(ctx context.Context) error {
-	kubeconfig, err := clusterInfoKubeconfig(h.kubeConfig)
-	if err != nil {
-		return err
-	}
-
-	ao := metav1.ApplyOptions{
-		FieldManager: fieldManagerID,
-	}
-
-	cm := v1.ConfigMap("cluster-info", metav1.NamespacePublic).
-		WithData(map[string]string{
-			"kubeconfig": string(kubeconfig),
-		})
-
-	if err := kube.ApplyConfigMap(ctx, h.kubeCli, cm, ao); err != nil {
-		return fmt.Errorf("applying cluster-info ConfigMap: %w", err)
-	}
-
-	return nil
-}
-
-func clusterInfoKubeconfig(cfg *rest.Config) ([]byte, error) {
-	if cfg == nil {
-		return nil, errors.New("kubernetes config is required")
-	}
-
-	if isEmpty(cfg.Host) {
-		return nil, errors.New("kubernetes config host is required")
-	}
-
-	caData := cfg.CAData
-	if len(caData) == 0 && cfg.CAFile != "" {
-		var err error
-
-		caData, err = os.ReadFile(cfg.CAFile)
-		if err != nil {
-			return nil, fmt.Errorf("reading kubernetes CA file %s: %w", cfg.CAFile, err)
-		}
-	}
-
-	if len(caData) == 0 {
-		return nil, errors.New("kubernetes CA data is required")
-	}
-
-	clusterName := "cluster"
-	authName := "cluster-info"
-	contextName := "cluster-info"
-
-	return clientcmd.Write(clientcmdapi.Config{
-		Clusters: map[string]*clientcmdapi.Cluster{
-			clusterName: {
-				Server:                   cfg.Host,
-				CertificateAuthorityData: caData,
-			},
-		},
-		AuthInfos: map[string]*clientcmdapi.AuthInfo{
-			authName: {},
-		},
-		Contexts: map[string]*clientcmdapi.Context{
-			contextName: {
-				Cluster:  clusterName,
-				AuthInfo: authName,
-			},
-		},
-		CurrentContext: contextName,
-	})
 }
 
 func siteInitCommand() *cobra.Command {
