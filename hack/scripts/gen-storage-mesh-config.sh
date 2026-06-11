@@ -249,7 +249,7 @@ fi
 # ── emit the config ───────────────────────────────────────────────────────────
 
 # Sample sizing for the file-backed test disk and origin backend stripe.
-DISK_SIZE=$((256 * 1024 * 1024)) # 256 MiB
+DISK_SIZE=$((2 * 1024 * 1024 * 1024)) # 2 GiB
 STRIPE_SIZE=$((4 * 1024 * 1024)) # 4 MiB
 
 # Resolve where the config is written: a file path (default) or stdout ('-').
@@ -319,7 +319,11 @@ bind = "0.0.0.0:$OPT_FRONTEND_PORT"
 backend = "origin"
 
 [startup.fabric]
-listen_addr = "0.0.0.0:$OPT_PORT"
+# Bind the node's own routable IP, not 0.0.0.0. This must be the exact
+# address peers use to reach this node (their [[peers]] address == this
+# listen_addr); the libfabric tcp provider uses it both to bind and as its
+# connection-manager identity and does not come up on an INADDR_ANY bind.
+listen_addr = "$LOCAL_IP:$OPT_PORT"
 
 [startup.metrics]
 # Prometheus text-format exporter on GET /metrics. Bind 0.0.0.0 so an
