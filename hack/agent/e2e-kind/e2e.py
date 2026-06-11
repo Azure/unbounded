@@ -33,6 +33,7 @@ Subcommands (called as individual workflow steps):
     deploy-unbounded-net-controller    Deploy unbounded-net controller into Kind.
     start-machina-controller           Deploy the machina controller into Kind.
     validate-machina-controller        Verify machina creates an MCV.
+    validate-controllers-healthy       Verify controllers are not crashing or repeating errors.
     delete-machine-cr                  Delete the Machine CR.
     validate-machine-cr-created        Verify agent self-registered a Machine CR.
     validate-node-reboot-operation     Verify NodeReboot MachineOperation restarts the node.
@@ -302,6 +303,107 @@ def print_controller_logs(namespace: str, label: str) -> None:
         ],
         check=False,
     )
+
+
+def _normalize_controller_error_line(line: str) -> str:
+    """Normalize volatile fields in controller log lines before comparing."""
+
+    line = line.strip()
+    if not line:
+        return ""
+
+    parts = line.split(maxsplit=1)
+    if len(parts) == 2 and "/" in parts[0]:
+        line = parts[1]
+
+    line = re.sub(r"\b\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z?\b", "<ts>", line)
+    line = re.sub(r"\b[0-9a-f]{8,}\b", "<hex>", line)
+    return re.sub(r"\s+", " ", line)
+
+
+def _controller_logs(namespace: str, label: str, previous: bool = False) -> str:
+    args = [
+        KUBECTL, "logs", "-n", namespace, "--all-containers", "--prefix",
+        "-l", label,
+    ]
+    if previous:
+        args.insert(-2, "--previous")
+
+    result = subprocess.run(args, capture_output=True, text=True, check=False)
+    if result.returncode != 0 and not previous:
+        raise subprocess.CalledProcessError(result.returncode, args, result.stdout, result.stderr)
+
+    return result.stdout
+
+
+def _validate_controller_health(name: str, namespace: str, label: str) -> None:
+    log(f"Checking {name} controller pod health...")
+    pod_list = json.loads(kubectl_capture([
+        "get", "pods", "-n", namespace, "-l", label, "-o", "json",
+    ]))
+    pods = pod_list.get("items", [])
+    if not pods:
+        die(f"{name} controller has no pods matching {label}")
+
+    unhealthy: list[str] = []
+    for pod in pods:
+        pod_name = pod["metadata"]["name"]
+        phase = pod.get("status", {}).get("phase", "")
+        if phase != "Running":
+            unhealthy.append(f"{pod_name}: phase={phase}")
+
+        for status in pod.get("status", {}).get("containerStatuses", []):
+            container = status.get("name", "<unknown>")
+            restart_count = int(status.get("restartCount", 0))
+            if restart_count != 0:
+                unhealthy.append(f"{pod_name}/{container}: restartCount={restart_count}")
+
+            state = status.get("state", {})
+            waiting = state.get("waiting")
+            if waiting:
+                reason = waiting.get("reason", "")
+                if reason in {"CrashLoopBackOff", "Error"}:
+                    unhealthy.append(f"{pod_name}/{container}: waiting={reason}")
+
+            terminated = state.get("terminated")
+            if terminated and int(terminated.get("exitCode", 0)) != 0:
+                unhealthy.append(
+                    f"{pod_name}/{container}: terminated={terminated.get('reason', '')}"
+                )
+
+    if unhealthy:
+        print_controller_logs(namespace, label)
+        die(f"{name} controller unhealthy: {'; '.join(unhealthy)}")
+
+    log(f"Checking {name} controller logs for repeated errors...")
+    repeated_errors: dict[str, int] = {}
+    for line in _controller_logs(namespace, label).splitlines():
+        if not re.search(r"\b(error|fatal|panic)\b|level=error|\"level\":\"error\"", line, re.I):
+            continue
+
+        normalized = _normalize_controller_error_line(line)
+        if not normalized:
+            continue
+
+        repeated_errors[normalized] = repeated_errors.get(normalized, 0) + 1
+
+    repeated_errors = {
+        line: count for line, count in repeated_errors.items()
+        if count >= 3
+    }
+    if repeated_errors:
+        print_controller_logs(namespace, label)
+        details = "; ".join(
+            f"{count}x {line}" for line, count in sorted(repeated_errors.items())
+        )
+        die(f"{name} controller has repeating error logs: {details}")
+
+    previous_logs = _controller_logs(namespace, label, previous=True).strip()
+    if previous_logs:
+        print(previous_logs, flush=True)
+        die(f"{name} controller has previous container logs")
+
+    log(f"{name} controller is healthy")
 
 
 def active_nspawn_machine() -> str:
@@ -2198,6 +2300,22 @@ def start_machina_controller() -> None:
 
 
 # ---------------------------------------------------------------------------
+# validate-controllers-healthy
+# ---------------------------------------------------------------------------
+def validate_controllers_healthy() -> None:
+    """Verify e2e controllers are not crashing or repeating error logs."""
+
+    _validate_controller_health(
+        "unbounded-net",
+        "unbounded-net",
+        "app.kubernetes.io/name=unbounded-net-controller",
+    )
+    _validate_controller_health("machina", "unbounded-kube", "app=machina-controller")
+
+    log("Controllers are healthy")
+
+
+# ---------------------------------------------------------------------------
 # validate-machina-controller
 # ---------------------------------------------------------------------------
 def mcv_name(config_name: str, version: int) -> str:
@@ -2872,6 +2990,7 @@ COMMANDS: dict[str, Command] = {
     "deploy-unbounded-net-controller": _without_node_config(deploy_unbounded_net_controller),
     "start-machina-controller": _without_node_config(start_machina_controller),
     "validate-machina-controller": _without_node_config(validate_machina_controller),
+    "validate-controllers-healthy": _without_node_config(validate_controllers_healthy),
     "delete-machine-cr": _without_node_config(delete_machine_cr),
     "validate-machine-cr-created": validate_machine_cr_created,
     "validate-node-reboot-operation": _without_node_config(validate_node_reboot_operation),

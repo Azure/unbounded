@@ -18,3 +18,7 @@ runs:
     - name: Validate machina controller
       shell: bash
       run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-machina-controller
+
+    - name: Validate controller health
+      shell: bash
+      run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-controllers-healthy
