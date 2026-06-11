@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -75,10 +76,10 @@ func TestResolveRunConfigFromFlags(t *testing.T) {
 }
 
 func TestRunLoadDrivesRequests(t *testing.T) {
-	var hits int
+	var hits atomic.Int64
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits++
+		hits.Add(1)
 
 		if !strings.HasPrefix(r.URL.Path, "/soaks3/obj-") {
 			http.Error(w, "not found", http.StatusNotFound)
@@ -107,17 +108,17 @@ func TestRunLoadDrivesRequests(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if hits == 0 {
+	if hits.Load() == 0 {
 		t.Fatal("expected the stub frontend to receive requests")
 	}
 }
 
 func TestRunLoadRangeRead(t *testing.T) {
-	var sawRange bool
+	var sawRange atomic.Bool
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Range") != "" {
-			sawRange = true
+			sawRange.Store(true)
 
 			w.Header().Set("Content-Range", "bytes 0-7/1024")
 			w.WriteHeader(http.StatusPartialContent)
@@ -148,7 +149,7 @@ func TestRunLoadRangeRead(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !sawRange {
+	if !sawRange.Load() {
 		t.Fatal("expected ranged requests")
 	}
 }
