@@ -1,0 +1,13 @@
+---
+apiVersion: unbounded-cloud.io/v1alpha3
+kind: MachineConfiguration
+metadata:
+  name: default-{{ .SiteName }}
+  labels:
+    unbounded-cloud.io/site: "{{ .SiteName }}"
+spec:
+  priority: -1000
+  machineSelector:
+    matchLabels:
+      unbounded-cloud.io/site: "{{ .SiteName }}"
+  template: {}

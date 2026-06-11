@@ -178,6 +178,12 @@ func (h *siteInitHandler) execute(ctx context.Context) error {
 		return fmt.Errorf("installing machina controller for site %s: %w", h.name, err)
 	}
 
+	for _, siteName := range []string{"cluster", h.name} {
+		if err := h.ensureDefaultMachineConfiguration(ctx, siteName); err != nil {
+			return fmt.Errorf("ensuring default MachineConfiguration for site %s: %w", siteName, err)
+		}
+	}
+
 	return nil
 }
 
@@ -364,6 +370,13 @@ func (h *siteInitHandler) ensureUnboundedSite(ctx context.Context, cfg unbounded
 	}
 
 	return nil
+}
+
+func (h *siteInitHandler) ensureDefaultMachineConfiguration(ctx context.Context, siteName string) error {
+	return h.ensureUnboundedSite(ctx, unboundedSiteConfig{
+		SiteName:  siteName,
+		Manifests: []string{"machineconfiguration.yaml"},
+	})
 }
 
 func (h *siteInitHandler) ensureBootstrapToken(ctx context.Context) error {

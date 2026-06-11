@@ -160,3 +160,24 @@ func TestEnsureUnboundedSite_ManageCniPluginTrue(t *testing.T) {
 	assert.NotContains(t, rendered, "manageCniPlugin")
 	assert.Contains(t, rendered, "name: test-site")
 }
+
+func TestDefaultMachineConfigurationTemplate(t *testing.T) {
+	cfg := unboundedSiteConfig{
+		SiteName: "test-site",
+	}
+
+	content, err := siteTemplates.ReadFile("assets/unbounded-net-site/machineconfiguration.yaml")
+	require.NoError(t, err)
+
+	tmpl, err := template.New("machineconfiguration.yaml").Parse(string(content))
+	require.NoError(t, err)
+
+	var buf strings.Builder
+	require.NoError(t, tmpl.Execute(&buf, cfg))
+
+	rendered := buf.String()
+	assert.Contains(t, rendered, "kind: MachineConfiguration")
+	assert.Contains(t, rendered, "name: default-test-site")
+	assert.Contains(t, rendered, "priority: -1000")
+	assert.Contains(t, rendered, "unbounded-cloud.io/site: \"test-site\"")
+}
