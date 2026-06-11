@@ -295,6 +295,7 @@ help: ## Show this help
 	@echo "  orca-reset                       Rebuild image and rolling-restart Orca on kind"
 	@echo "  orca-inttest                     Run orca integration tests (Docker required)"
 	@echo "  storage-inttest                  Run unbounded-storage -> orca -> Garage integration test (Docker + sudo)"
+	@echo "  soaks3-inttest                   Run soaks3 integration test (Garage via testcontainers; Docker required)"
 	@echo ""
 	@echo "Documentation:"
 	@echo "  docs-serve                       Start local Hugo dev server"
@@ -1013,6 +1014,19 @@ storage-inttest: libfabric unbounded-storage-build ## Run the unbounded-storage 
 	$(GOTEST) -tags=integrationtest,storageboundary -c -o $(STORAGE_INTTEST_BIN) ./internal/orca/inttest/
 	sudo -E env "PATH=$$PATH" "LD_LIBRARY_PATH=$(LIBFABRIC_PREFIX)/lib" \
 		$(STORAGE_INTTEST_BIN) -test.v -test.timeout 30m -test.run '^TestStorageBoundaryThroughOrca$$'
+
+# soaks3-inttest mirrors the orca-inttest pattern: race detector in CI
+# (ubuntu-latest has gcc), no -race locally so developers without a C
+# toolchain can still run integration tests. Spins up a single-node
+# Garage S3 backend via testcontainers; requires Docker.
+.PHONY: soaks3-inttest
+ifdef CI
+soaks3-inttest: ## Run soaks3 integration test (Garage via testcontainers; requires Docker)
+	$(GOTEST) -tags=integrationtest -race -timeout 15m ./cmd/soaks3/inttest/...
+else
+soaks3-inttest: ## Run soaks3 integration test (Garage via testcontainers; requires Docker)
+	$(GOTEST) -tags=integrationtest -race -count=1 -timeout 15m ./cmd/soaks3/inttest/...
+endif
 
 
 image-net-controller-local: net-frontend resources/cni-plugins-linux-$(HOST_GOARCH)-$(CNI_PLUGINS_VERSION).tgz ## Build the unbounded-net-controller image locally (single-arch)
