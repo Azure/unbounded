@@ -12,14 +12,21 @@
 # Options:
 #       --context NAME       kubeconfig context (defaults to current context)
 #   -l, --selector SEL       node label selector passed to kubectl get nodes
-#       --local-node NAME    node this config is for (defaults to the first
-#                            node by sorted name)
+#                            (default: kubernetes.azure.com/mode=user,
+#                            unbounded-cloud.io/unbounded-net-gateway!=true --
+#                            user-mode nodes only, excluding net gateways)
+#       --local-node NAME    node this config is for (defaults to the local
+#                            machine's hostname)
 #       --port PORT          fabric / peer TCP port (default 7000)
 #       --frontend-port PORT frontend bind port (default 9000)
 #       --metrics-port PORT  Prometheus metrics exporter bind port (default 9100)
 #       --origin URL         backend origin endpoint
 #                            (default http://origin.example.invalid)
 #   -h, --help               Show this help and exit
+#
+# kubeconfig: kubectl's default kubeconfig is used. If it cannot reach the API
+# server, the script falls back to /var/lib/kubelet/kubeconfig (useful when
+# running directly on a cluster node).
 
 set -euo pipefail
 
@@ -46,7 +53,9 @@ require_cmd() {
 # ── argument parsing ──────────────────────────────────────────────────────────
 
 OPT_CONTEXT=""
-OPT_SELECTOR=""
+# Default to user-mode nodes only, excluding unbounded-net gateway nodes. The
+# "!=true" form also matches nodes lacking the gateway label entirely.
+OPT_SELECTOR="kubernetes.azure.com/mode=user,unbounded-cloud.io/unbounded-net-gateway!=true"
 OPT_LOCAL_NODE=""
 OPT_PORT="7000"
 OPT_FRONTEND_PORT="9000"
@@ -108,12 +117,42 @@ if [[ -n "$OPT_SELECTOR" ]]; then
 	KUBECTL_SEL_ARGS=(-l "$OPT_SELECTOR")
 fi
 
+# ── resolve a working kubeconfig ──────────────────────────────────────────────
+
+# Fall back to the kubelet's kubeconfig when the default one kubectl would use
+# can't reach the API server. This lets the script run on a cluster node that
+# has no admin kubeconfig of its own but does have /var/lib/kubelet/kubeconfig.
+KUBELET_KUBECONFIG="/var/lib/kubelet/kubeconfig"
+
+# Args identifying which kubeconfig to use; empty means kubectl's default
+# resolution ($KUBECONFIG or ~/.kube/config).
+KUBECTL_CFG_ARGS=()
+
+# Cheap API-server connectivity probe against the currently selected config.
+api_reachable() {
+	kubectl "${KUBECTL_CFG_ARGS[@]}" "${KUBECTL_CTX_ARGS[@]}" \
+		get --raw='/readyz' >/dev/null 2>&1
+}
+
+if ! api_reachable; then
+	if [[ -r "$KUBELET_KUBECONFIG" ]]; then
+		echo "warning: default kubeconfig cannot reach the API server; falling back to $KUBELET_KUBECONFIG" >&2
+		# The kubelet kubeconfig has its own context; an explicit --context from
+		# the default config won't exist there, so drop it for the fallback.
+		KUBECTL_CTX_ARGS=()
+		KUBECTL_CFG_ARGS=(--kubeconfig "$KUBELET_KUBECONFIG")
+		api_reachable || die "API server unreachable with both the default kubeconfig and $KUBELET_KUBECONFIG."
+	else
+		die "API server unreachable with the default kubeconfig and $KUBELET_KUBECONFIG is not readable."
+	fi
+fi
+
 # ── fetch node name / InternalIP pairs ────────────────────────────────────────
 
 # One "<name> <internal-ip>" line per node. Nodes without an InternalIP emit a
 # trailing-space line and are rejected below so a missing address fails loudly
 # rather than silently producing a peer with an empty address.
-NODE_LINES=$(kubectl "${KUBECTL_CTX_ARGS[@]}" get nodes "${KUBECTL_SEL_ARGS[@]}" \
+NODE_LINES=$(kubectl "${KUBECTL_CFG_ARGS[@]}" "${KUBECTL_CTX_ARGS[@]}" get nodes "${KUBECTL_SEL_ARGS[@]}" \
 	-o jsonpath='{range .items[*]}{.metadata.name}{" "}{range .status.addresses[?(@.type=="InternalIP")]}{.address}{end}{"\n"}{end}' |
 	grep -v '^[[:space:]]*$' |
 	sort)
@@ -134,18 +173,22 @@ NODE_COUNT="${#NAMES[@]}"
 
 # ── pick the local node ───────────────────────────────────────────────────────
 
-LOCAL_IDX=-1
-if [[ -n "$OPT_LOCAL_NODE" ]]; then
-	for i in "${!NAMES[@]}"; do
-		if [[ "${NAMES[$i]}" == "$OPT_LOCAL_NODE" ]]; then
-			LOCAL_IDX="$i"
-			break
-		fi
-	done
-	[[ "$LOCAL_IDX" -lt 0 ]] && die "node '$OPT_LOCAL_NODE' not found among the $NODE_COUNT selected node(s)."
-else
-	LOCAL_IDX=0
+# Default the local node to this machine's hostname when not given explicitly,
+# so the script picks the right peer config for the host it runs on.
+if [[ -z "$OPT_LOCAL_NODE" ]]; then
+	OPT_LOCAL_NODE="${HOSTNAME:-}"
+	[[ -z "$OPT_LOCAL_NODE" ]] && command -v hostname >/dev/null 2>&1 && OPT_LOCAL_NODE="$(hostname)"
+	[[ -z "$OPT_LOCAL_NODE" ]] && die "could not determine local hostname; pass --local-node <name> explicitly."
 fi
+
+LOCAL_IDX=-1
+for i in "${!NAMES[@]}"; do
+	if [[ "${NAMES[$i]}" == "$OPT_LOCAL_NODE" ]]; then
+		LOCAL_IDX="$i"
+		break
+	fi
+done
+[[ "$LOCAL_IDX" -lt 0 ]] && die "node '$OPT_LOCAL_NODE' not found among the $NODE_COUNT selected node(s)."
 
 LOCAL_NAME="${NAMES[$LOCAL_IDX]}"
 LOCAL_IP="${IPS[$LOCAL_IDX]}"

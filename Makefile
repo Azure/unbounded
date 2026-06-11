@@ -650,9 +650,18 @@ unbounded-storage-push: unbounded-storage-tarball ## Push the unbounded-storage 
 		--account-name $(STORAGE_BLOB_ACCOUNT) \
 		--account-key $(AZURE_STORAGE_KEY) \
 		--overwrite
+	@az storage blob upload \
+		--file hack/scripts/gen-storage-mesh-config.sh \
+		--container-name $(STORAGE_BLOB_CONTAINER) \
+		--name $(VERSION)/gen-config.sh \
+		--account-name $(STORAGE_BLOB_ACCOUNT) \
+		--account-key $(AZURE_STORAGE_KEY) \
+		--overwrite
 	@echo "Uploaded $(STORAGE_TARBALL_STEM).tar.gz to https://$(STORAGE_BLOB_ACCOUNT).blob.core.windows.net/$(STORAGE_BLOB_CONTAINER)/$(VERSION)/$(STORAGE_TARBALL_STEM).tar.gz"
 	@echo "Install with:"
 	@echo "  curl https://$(STORAGE_BLOB_ACCOUNT).blob.core.windows.net/$(STORAGE_BLOB_CONTAINER)/$(VERSION)/install.sh | bash -s -- https://$(STORAGE_BLOB_ACCOUNT).blob.core.windows.net/$(STORAGE_BLOB_CONTAINER)/$(VERSION)/$(STORAGE_TARBALL_STEM).tar.gz"
+	@echo "Generate a mesh config with:"
+	@echo "  curl https://$(STORAGE_BLOB_ACCOUNT).blob.core.windows.net/$(STORAGE_BLOB_CONTAINER)/$(VERSION)/gen-config.sh | bash"
 
 bench: $(LIBFABRIC_STAMP) ## Build the bench tool (excluded from images)
 	$(CARGO_FABRIC_ENV) $(CARGO) build --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --release --locked --bin bench
