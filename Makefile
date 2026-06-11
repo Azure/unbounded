@@ -140,8 +140,6 @@ KUBECTL_UNBOUNDED_LDFLAGS=$(STAMP_LDFLAGS) -X github.com/Azure/unbounded/cmd/kub
 # Container images for the net controller and node agent.
 NET_CONTROLLER_IMAGE ?= $(CONTAINER_REGISTRY)/unbounded-net-controller:$(VERSION)
 NET_NODE_IMAGE       ?= $(CONTAINER_REGISTRY)/unbounded-net-node:$(VERSION)
-NET_CONTROLLER_IMAGE_PULL_POLICY ?= Always
-NET_NODE_IMAGE_PULL_POLICY       ?= Always
 
 # CNI plugins version baked into the net-node image. Keep in sync with the
 # defaults in images/net-{node,controller}/Dockerfile and the workflow envs.
@@ -1095,8 +1093,6 @@ net-manifests: ## Render net manifests into $(NET_MANIFEST_RENDERED_DIR)
 		--set Namespace=$(NET_NAMESPACE) \
 		--set ControllerImage=$(NET_CONTROLLER_IMAGE) \
 		--set NodeImage=$(NET_NODE_IMAGE) \
-		--set ControllerImagePullPolicy=$(NET_CONTROLLER_IMAGE_PULL_POLICY) \
-		--set NodeImagePullPolicy=$(NET_NODE_IMAGE_PULL_POLICY) \
 		--set ForceNotLeader=$(NET_FORCE_NOT_LEADER) \
 		--set AzureTenantID=$(NET_AZURE_TENANT_ID) \
 		--set ApiserverURL=$(NET_APISERVER_URL)

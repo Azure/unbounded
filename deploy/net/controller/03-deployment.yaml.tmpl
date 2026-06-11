@@ -71,7 +71,7 @@ spec:
       containers:
         - name: controller
           image: {{ .ControllerImage }}
-          imagePullPolicy: {{ default "Always" .ControllerImagePullPolicy }}
+          imagePullPolicy: Always
           volumeMounts:
             - name: tmp
               mountPath: /tmp

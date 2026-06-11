@@ -2241,12 +2241,12 @@ def deploy_unbounded_net_controller() -> None:
         "make", "net-manifests",
         f"NET_CONTROLLER_IMAGE={NET_CONTROLLER_E2E_IMAGE}",
         "NET_NODE_IMAGE=unbounded-net-node:agent-e2e-unused",
-        "NET_CONTROLLER_IMAGE_PULL_POLICY=IfNotPresent",
         f"NET_APISERVER_URL={api_server}",
     ], cwd=str(REPO_ROOT))
 
     rendered = REPO_ROOT / "deploy" / "net" / "rendered"
     controller = rendered / "controller"
+    set_manifest_image_pull_policy(controller / "03-deployment.yaml", "IfNotPresent")
     log("Installing unbounded-net CRDs and controller manifests...")
     for crd_path in sorted((rendered / "crd").glob("*.yaml")):
         apply_manifest(crd_path)
