@@ -820,7 +820,6 @@ machine-ops-controller-oci-push: machine-ops-controller-oci ## Build and push th
 
 MACHINA_NAMESPACE ?= unbounded-kube
 MACHINA_API_SERVER_ENDPOINT ?=
-MACHINA_IMAGE_PULL_POLICY ?= Always
 MACHINA_MANIFEST_TEMPLATES_DIR := deploy/machina
 MACHINA_MANIFEST_RENDERED_DIR  := deploy/machina/rendered
 MACHINE_OPS_NAMESPACE ?= unbounded-kube
@@ -837,7 +836,6 @@ machina-manifests: ## Render machina deployment manifests into deploy/machina/re
 		--output-dir $(MACHINA_MANIFEST_RENDERED_DIR) \
 		--set Namespace=$(MACHINA_NAMESPACE) \
 		--set ControllerImage=$(MACHINA_IMAGE) \
-		--set ControllerImagePullPolicy=$(MACHINA_IMAGE_PULL_POLICY) \
 		--set APIServerEndpoint=$(MACHINA_API_SERVER_ENDPOINT)
 	@cp $(MACHINA_MANIFEST_TEMPLATES_DIR)/crd/*.yaml $(MACHINA_MANIFEST_RENDERED_DIR)/crd/
 	@echo "Rendered machina manifests into $(MACHINA_MANIFEST_RENDERED_DIR) (image: $(MACHINA_IMAGE))"

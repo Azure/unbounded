@@ -36,7 +36,7 @@ spec:
       containers:
         - name: machina-controller
           image: {{ default "ghcr.io/azure/machina:latest" .ControllerImage }}
-          imagePullPolicy: {{ default "Always" .ControllerImagePullPolicy }}
+          imagePullPolicy: Always
           args:
             - controller
             - --config=/etc/machina/config.yaml

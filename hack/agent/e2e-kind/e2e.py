@@ -283,6 +283,21 @@ def apply_manifest(path: Path) -> None:
     kubectl(["apply", "-f", str(path)])
 
 
+def set_manifest_image_pull_policy(path: Path, policy: str) -> None:
+    """Set the single imagePullPolicy in a rendered manifest."""
+
+    if not path.exists():
+        die(f"Manifest not found: {path}")
+
+    old = "imagePullPolicy: Always"
+    new = f"imagePullPolicy: {policy}"
+    contents = path.read_text()
+    if contents.count(old) != 1:
+        die(f"Expected exactly one '{old}' entry in {path}")
+
+    path.write_text(contents.replace(old, new, 1))
+
+
 def wait_for_rollout(namespace: str, resource: str, timeout: str = "180s") -> None:
     """Wait for a Kubernetes workload rollout."""
 
@@ -2275,11 +2290,11 @@ def start_machina_controller() -> None:
     run([
         "make", "machina-manifests",
         f"MACHINA_IMAGE={MACHINA_E2E_IMAGE}",
-        "MACHINA_IMAGE_PULL_POLICY=IfNotPresent",
         f"MACHINA_API_SERVER_ENDPOINT={api_server}",
     ], cwd=str(REPO_ROOT))
 
     rendered = REPO_ROOT / "deploy" / "machina" / "rendered"
+    set_manifest_image_pull_policy(rendered / "04-deployment.yaml", "IfNotPresent")
     log("Installing machina controller manifests...")
     for manifest_path in [
         rendered / "01-namespace.yaml",
