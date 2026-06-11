@@ -45,8 +45,11 @@ message MetricsCfg {
 message MemoryCfg {
   // Allocate per-shard backing from the heap instead of 2 MiB hugepages.
   bool no_hugepages = 1;
-  // Per-shard backing size in bytes. 0 -> 128 MiB.
-  uint64 bytes_per_shard = 2;
+  // Total backing pool across all serving shards, in bytes. Each serving
+  // shard is allocated `memory_total_bytes / serving_shard_count`,
+  // NUMA-local, so the host footprint stays fixed regardless of the
+  // auto-scaled serving-core count. 0 -> 128 MiB.
+  uint64 memory_total_bytes = 2;
 }
 
 message FabricCfg {
@@ -65,12 +68,12 @@ message FabricCfg {
 }
 
 message TopologyCfg {
-  // RDMA progress engines per HCA. 0 -> 1.
-  uint64 rdma_progress_per_hca = 1;
-  // RDMA completion handlers per HCA. 0 -> 4.
-  uint64 rdma_handlers_per_hca = 2;
-  // TCP-fallback threads when RDMA is unavailable. 0 -> 1.
-  uint64 tcp_fallback_threads = 3;
+  // Field numbers 1-3 (rdma_progress_per_hca, rdma_handlers_per_hca,
+  // tcp_fallback_threads) were removed when the legacy per-role planner
+  // was retired in favor of the three-class core planner. Reserved so
+  // the numbers and names are never reused.
+  reserved 1, 2, 3;
+  reserved "rdma_progress_per_hca", "rdma_handlers_per_hca", "tcp_fallback_threads";
   // Place shards on SMT sibling CPUs as well as physical cores.
   bool use_smt_siblings = 4;
   // Schedule shards onto isolcpus-isolated CPUs too. The proto3 false
@@ -84,6 +87,11 @@ message TopologyCfg {
   bool allow_inactive_port = 7;
   // Disable RDMA and force the libfabric tcp provider.
   bool disable_rdma = 8;
+  // Cap on the number of serving-shard CPUs to pin. 0 -> auto (claim
+  // every usable core left after storage and NIC-worker reservations).
+  uint64 serving_cores = 9;
+  // NIC-worker CPUs to pin per active HCA. 0 -> 4.
+  uint64 nic_workers = 10;
 }
 
 message P2pCfg {

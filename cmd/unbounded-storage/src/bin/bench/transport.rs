@@ -27,7 +27,7 @@
 //!   server replies with real RMA writes into the client MR.
 //! - **Thread pinning.** Client shards and fabric progress threads are
 //!   placed via the crate's [`PinnedRuntime`] using CPUs drawn from
-//!   `topology::Plan`, exactly like the daemon. When sysfs topology is
+//!   `topology::CorePlan`, exactly like the daemon. When sysfs topology is
 //!   unavailable (containers / dev hosts) it falls back to an unpinned
 //!   `DefaultRuntime` with a warning.
 //!
@@ -92,7 +92,7 @@ use unbounded_storage::runtime::{
     block_on_cooperative,
 };
 use unbounded_storage::storage::StripeReq;
-use unbounded_storage::topology::{Host, Plan, PlanConfig};
+use unbounded_storage::topology::{CorePlan, CorePlanConfig, Host};
 
 use crate::{
     LATENCY_RING, SHUTDOWN, format_duration, human_bytes, install_signal_handler, make_key,
@@ -344,7 +344,7 @@ fn fill_byte(key: &StripeKey) -> u8 {
 /// client shard. `needed` is the number of distinct worker slots the
 /// calling mode pins (see the `*_WORKER_IDX` constants): one per fabric
 /// plus one for the client shard. Prefers a `PinnedRuntime` whose CPUs
-/// come from `topology::Plan`, falling back to an unpinned
+/// come from `topology::CorePlan`, falling back to an unpinned
 /// `DefaultRuntime` with a warning when topology cannot supply `needed`
 /// distinct CPUs or `--no-pin` is set.
 fn build_runtime(no_pin: bool, needed: usize) -> (Arc<dyn Threading>, String) {
@@ -362,28 +362,35 @@ fn build_runtime(no_pin: bool, needed: usize) -> (Arc<dyn Threading>, String) {
             "unpinned (no sysfs topology)".to_string(),
         );
     }
-    // Ask the planner for RDMA progress + a couple of handler CPUs and a
-    // TCP fallback so we get disjoint, NUMA-local cores on both RDMA and
-    // non-RDMA hosts.
-    let cfg = PlanConfig {
-        rdma_progress_per_hca: 1,
-        rdma_handlers_per_hca: 2,
-        nvme_threads_per_drive: 0,
-        network_shards_per_nic: 0,
-        tcp_fallback_threads: 2,
-        ..Default::default()
-    };
-    let plan = Plan::for_host(&host, &cfg);
-    // Distinct CPUs in plan order; the planner already keeps them
-    // disjoint and cpu0-excluded.
+    // Ask the core planner for the host's disjoint, NUMA-local,
+    // cpu0-excluded cores. We pin one distinct CPU per worker slot,
+    // drawing from all three classes so both RDMA and non-RDMA hosts
+    // yield enough cores.
+    let plan = CorePlan::for_host(&host, &CorePlanConfig::default());
+    // Distinct CPUs in plan order across the three classes; the planner
+    // already keeps them disjoint and cpu0-excluded, so the dedup is a
+    // safety net that also preserves ordering.
     let mut specs: Vec<WorkerSpec> = Vec::new();
     let mut seen: Vec<u32> = Vec::new();
-    for w in &plan.workers {
-        if seen.contains(&w.cpu) {
-            continue;
+    for sc in &plan.storage_cores {
+        if !seen.contains(&sc.cpu) {
+            seen.push(sc.cpu);
+            specs.push(WorkerSpec::new(sc.cpu, sc.numa));
         }
-        seen.push(w.cpu);
-        specs.push(WorkerSpec::new(w.cpu, w.numa));
+    }
+    for group in &plan.nic_workers {
+        for w in &group.workers {
+            if !seen.contains(&w.cpu) {
+                seen.push(w.cpu);
+                specs.push(WorkerSpec::new(w.cpu, w.numa));
+            }
+        }
+    }
+    for s in &plan.serving_shards {
+        if !seen.contains(&s.cpu) {
+            seen.push(s.cpu);
+            specs.push(WorkerSpec::new(s.cpu, s.numa));
+        }
     }
     if specs.len() < needed {
         eprintln!(

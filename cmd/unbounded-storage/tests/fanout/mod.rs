@@ -7,5 +7,6 @@
 //! into the generic executor + PRNG.
 
 pub mod mocks;
+pub mod routing;
 pub mod tests;
 pub mod workload;

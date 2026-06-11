@@ -401,7 +401,7 @@ mod tests {
     fn replays_registration_after_directory_swap() {
         let t = DiskChannelDirectory::new();
         let core1 = Core::spawn();
-        t.apply_channels(vec![(PathBuf::from("/a"), core1.channel.clone())]);
+        t.apply_channels(vec![(PathBuf::from("/a"), core1.channel.clone(), None)]);
 
         let view = LiveShardLocalStore::new(t.clone());
         let (_buf, backing) = make_backing(8);
@@ -410,7 +410,7 @@ mod tests {
         assert_eq!(view.state.lock().unwrap().last_seen_generation, Some(gen1));
 
         let core2 = Core::spawn();
-        t.apply_channels(vec![(PathBuf::from("/b"), core2.channel.clone())]);
+        t.apply_channels(vec![(PathBuf::from("/b"), core2.channel.clone(), None)]);
         let gen2 = t.generation();
         assert_ne!(gen1, gen2);
         let _ = view.current_or_replay();
@@ -428,14 +428,14 @@ mod tests {
         // `CountingDevice`'s register counter.
         let t = DiskChannelDirectory::new();
         let core1 = Core::spawn();
-        t.apply_channels(vec![(PathBuf::from("/a"), core1.channel.clone())]);
+        t.apply_channels(vec![(PathBuf::from("/a"), core1.channel.clone(), None)]);
 
         let view = LiveShardLocalStore::new(t.clone());
         let (_buf_a, backing_a) = make_backing(4);
         view.register_backing(&backing_a).unwrap();
 
         let core2 = Core::spawn();
-        t.apply_channels(vec![(PathBuf::from("/b"), core2.channel.clone())]);
+        t.apply_channels(vec![(PathBuf::from("/b"), core2.channel.clone(), None)]);
 
         let (_buf_b, backing_b) = make_backing(4);
         view.register_backing(&backing_b).unwrap();
@@ -444,7 +444,7 @@ mod tests {
         // may itself register buffers, so snapshot the counter right
         // after the swap and measure the replay delta.
         let core3 = Core::spawn();
-        t.apply_channels(vec![(PathBuf::from("/c"), core3.channel.clone())]);
+        t.apply_channels(vec![(PathBuf::from("/c"), core3.channel.clone(), None)]);
         let baseline = core3.registers.load(Ordering::Relaxed);
         let _ = view.current_or_replay();
         // `register_buffer` is synchronous and round-trips through the
@@ -486,8 +486,8 @@ mod tests {
         let core0 = Core::spawn();
         let core1 = Core::spawn();
         t.apply_channels(vec![
-            (PathBuf::from("/a"), core0.channel.clone()),
-            (PathBuf::from("/b"), core1.channel.clone()),
+            (PathBuf::from("/a"), core0.channel.clone(), None),
+            (PathBuf::from("/b"), core1.channel.clone(), None),
         ]);
 
         let view = LiveShardLocalStore::new(t.clone());
@@ -530,7 +530,7 @@ mod tests {
         // gracefully with `ENXIO` rather than panic the storage core.
         let t = DiskChannelDirectory::new();
         let core = Core::spawn();
-        t.apply_channels(vec![(PathBuf::from("/a"), core.channel.clone())]);
+        t.apply_channels(vec![(PathBuf::from("/a"), core.channel.clone(), None)]);
 
         let view = LiveShardLocalStore::new(t.clone());
         let dst = PageRef {

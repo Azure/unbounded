@@ -109,14 +109,15 @@ DISK_SIZE = 2 * 1024 * 1024 * 1024
 # Hugepage backing. The daemon defaults to `backing_kind = "hugepage2_mb"`,
 # so the smoke test exercises that real path by reserving 2 MiB hugepages on
 # the host up front (rather than passing `--no-hugepages` to fall back to the
-# heap). `bytes_per_shard` is pinned so the reservation below is exact.
+# heap). `memory_total_bytes` is pinned so the reservation below is exact.
 HUGEPAGE_SIZE = 2 * 1024 * 1024  # 2 MiB; matches memory::HUGEPAGE_2MB
-BYTES_PER_SHARD = 128 * 1024 * 1024  # matches StorageCfg default; pinned for exactness
+MEMORY_TOTAL_BYTES = 128 * 1024 * 1024  # matches StorageCfg default; pinned for exactness
 RPC_SCRATCH_PAGES = 8  # matches main.rs RPC_SCRATCH_PAGES
 NODES_PER_SCENARIO = 2
 
-# Hugepages one shard needs: pool backing + scratch, each rounded up.
-_HP_PER_SHARD = (BYTES_PER_SHARD + HUGEPAGE_SIZE - 1) // HUGEPAGE_SIZE + RPC_SCRATCH_PAGES
+# Hugepages the per-node pool backing needs: the whole memory_total_bytes
+# pool (split across the node's serving shards) plus scratch, each rounded up.
+_HP_PER_SHARD = (MEMORY_TOTAL_BYTES + HUGEPAGE_SIZE - 1) // HUGEPAGE_SIZE + RPC_SCRATCH_PAGES
 # Total for a scenario's two concurrent nodes, plus 50% headroom for any
 # allocator rounding / transient double-counting during teardown overlap.
 HUGEPAGES_NEEDED = _HP_PER_SHARD * NODES_PER_SCENARIO
@@ -578,7 +579,7 @@ def write_config(
     #
     # Startup-fixed knobs live in the `[startup]` section of the config:
     # the fabric listen address, the per-shard hugepage backing size
-    # (bytes_per_shard, leaving the daemon's hugepage default in place), and
+    # (memory_total_bytes, leaving the daemon's hugepage default in place), and
     # forcing the libfabric tcp provider (disable_rdma) even on hosts that
     # expose an unusable RDMA HCA in sysfs. They only take effect at process
     # start and are intentionally not part of the dynamic reload path.
@@ -618,9 +619,9 @@ backend = "origin"
 [startup.memory]
 # Back shards with 2 MiB hugepages (the daemon default, so no_hugepages is
 # left unset) and exercise the real hugetlb path. The harness reserves these
-# on the host before any node starts; bytes_per_shard is pinned to match that
+# on the host before any node starts; memory_total_bytes is pinned to match that
 # reservation.
-bytes_per_shard = {BYTES_PER_SHARD}
+memory_total_bytes = {MEMORY_TOTAL_BYTES}
 
 [startup.fabric]
 listen_addr = "{fabric_listen}"
@@ -632,6 +633,16 @@ bind = "{metrics_bind}"
 
 [startup.topology]
 disable_rdma = true
+# Cap the smoke test at two serving shards so it exercises the shared
+# per-node endpoint with more than one shard. A node advertises one static
+# address (its `listen_addr`) to its peers, so it binds exactly one inbound
+# fabric endpoint on that fixed port; `plan_fabric_units` maps every serving
+# shard onto that single shared endpoint (per-node for tcp, per-HCA for
+# verbs). Binding one endpoint per shard instead would make every shard past
+# the first collide on the port (`fi_endpoint` -> EADDRINUSE). The cap is a
+# ceiling, not a floor: a runner with only one usable serving core degrades
+# to a single shard and still passes.
+serving_cores = 2
 """
     )
 

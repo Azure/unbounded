@@ -16,5 +16,7 @@ mod service;
 pub use channel::{
     FetchChannel, FetchChannelReceiver, FetchCommand, FetchReply, PageLoc, ReplySlot,
 };
-pub use router::{FanoutPeer, FanoutTable, Owner, owner_shard};
+pub use router::{
+    FanoutPeer, FanoutTable, NumaShardTable, Owner, ShardPick, numa_local_shard, owner_shard,
+};
 pub use service::FetchService;

@@ -160,6 +160,9 @@ struct Metrics {
     p2p_requests: IntCounterVec,
     p2p_hop_limit_exceeded: IntCounter,
 
+    // Fan-out routing.
+    fanout_cross_numa_fetches: IntCounter,
+
     // Fabric RPC.
     fabric_rpc_served: IntCounterVec,
     fabric_rpc_duration: Histogram,
@@ -296,6 +299,11 @@ impl Metrics {
         let p2p_hop_limit_exceeded = IntCounter::new(
             "unbounded_storage_p2p_hop_limit_exceeded_total",
             "Routed requests dropped because the hop limit was exceeded.",
+        )?;
+
+        let fanout_cross_numa_fetches = IntCounter::new(
+            "unbounded_storage_fanout_cross_numa_fetches_total",
+            "Fetches whose serving shard was not on the backing drive's NUMA node (the node has no serving shard, or the drive is unpinned / its node is unknown).",
         )?;
 
         let fabric_rpc_served = IntCounterVec::new(
@@ -437,6 +445,7 @@ impl Metrics {
             bufferpool_prefetch_inflight_pages,
             p2p_requests,
             p2p_hop_limit_exceeded,
+            fanout_cross_numa_fetches,
             fabric_rpc_served,
             fabric_rpc_duration,
             fabric_rpc_inflight,
@@ -479,6 +488,7 @@ impl Metrics {
             Box::new(self.bufferpool_prefetch_inflight_pages.clone()),
             Box::new(self.p2p_requests.clone()),
             Box::new(self.p2p_hop_limit_exceeded.clone()),
+            Box::new(self.fanout_cross_numa_fetches.clone()),
             Box::new(self.fabric_rpc_served.clone()),
             Box::new(self.fabric_rpc_duration.clone()),
             Box::new(self.fabric_rpc_inflight.clone()),
@@ -599,6 +609,14 @@ pub fn p2p_request(disposition: Disposition) {
 pub fn p2p_hop_limit_exceeded() {
     if let Some(m) = metrics() {
         m.p2p_hop_limit_exceeded.inc();
+    }
+}
+
+/// Record a fetch whose serving shard was not on the backing drive's
+/// NUMA node (no co-located shard, or an unpinned / unknown-node drive).
+pub fn fanout_cross_numa_fetch() {
+    if let Some(m) = metrics() {
+        m.fanout_cross_numa_fetches.inc();
     }
 }
 

@@ -528,7 +528,7 @@ async fn dispatch_ticket(
     slice: StripeSlice,
 ) -> Ticket {
     let (key, req) = stripe_request(backend_id, path, slice);
-    match fanout.owner_of(&key) {
+    match fanout.owner_of(&key, slice.intra_offset) {
         Owner::Local => Ticket::Local { slice },
         Owner::Peer(peer) => {
             let buf_index = peer.buf_index;
@@ -779,7 +779,9 @@ fn status_line_response(status: u16) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::bufferpool::{Error, PipelinedRead, ReadStream, WindowedRead};
+    use crate::fanout::NumaShardTable;
     use crate::frontend::range::StripeSlice;
+    use crate::storage::disks::DiskChannelDirectory;
     use std::cell::RefCell;
 
     fn spec(id: &str, bind: &str) -> FrontendSpec {
@@ -1014,7 +1016,12 @@ mod tests {
             "primary".to_string(),
             4 * 1024 * 1024,
             2 * 1024 * 1024,
-            Rc::new(FanoutTable::new(0, vec![None])),
+            Rc::new(FanoutTable::new(
+                0,
+                vec![None],
+                NumaShardTable::from_shards([(0, None)]),
+                DiskChannelDirectory::new(),
+            )),
         );
         // No client has connected: accept is pending, no conns, so the
         // engine reports no work and stays idle.

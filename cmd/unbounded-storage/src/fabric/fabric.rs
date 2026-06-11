@@ -60,6 +60,21 @@ pub(crate) struct FabricInner {
     /// offsets; verbs typically uses virtual addresses. The remote base
     /// advertised in an RPC request header is derived from this.
     pub(crate) mr_virt_addr: bool,
+    /// The provider's negotiated `domain_attr->threading` mode (the raw
+    /// `enum fi_threading` discriminant). A single shared per-HCA domain
+    /// is posted to concurrently by multiple serving shards while
+    /// NIC-worker threads progress completions, which is only sound
+    /// without external serialization when the provider negotiated
+    /// `FI_THREAD_SAFE`. Captured here so callers can verify the mode
+    /// (see `is_thread_safe`) and so bring-up warns loudly on a weaker
+    /// mode rather than racing silently.
+    threading: i32,
+    /// The provider's negotiated `domain_attr->mr_cnt`: the maximum
+    /// number of memory regions registrable against this domain, or 0
+    /// when the provider advertises no fixed limit. Used by
+    /// `check_shared_domain_capacity` to verify the expected per-domain
+    /// registrations fit before they are attempted.
+    domain_mr_cnt: usize,
     /// One progress thread per CQ. Dropped before the CQ/EP/AV/domain/fabric
     /// teardown in `FabricInner::drop` so the threads join before we
     /// close their CQs.
@@ -152,6 +167,23 @@ impl Fabric {
         // it is a 0-based offset into the MR.
         let mr_mode = unsafe { ffi::ub_fi_info_mr_mode(info) };
         let mr_virt_addr = (mr_mode & ffi::FI_MR_VIRT_ADDR) != 0;
+
+        // Negotiated domain threading model and MR capacity. A shared
+        // per-HCA domain is driven concurrently by multiple shard cores,
+        // so we require FI_THREAD_SAFE; warn (do not fail) on a weaker
+        // mode so the fallback of gating posts through NIC-worker threads
+        // can be applied without bricking otherwise-working providers.
+        let threading = unsafe { ffi::ub_fi_info_threading(info) };
+        let domain_mr_cnt = unsafe { ffi::ub_fi_info_mr_cnt(info) };
+        let thread_safe = unsafe { ffi::ub_fi_thread_safe_value() };
+        if threading != thread_safe {
+            eprintln!(
+                "warning: libfabric provider '{prov_name}' negotiated threading mode {threading} \
+                 (FI_THREAD_SAFE is {thread_safe}); a shared per-HCA domain posted to from \
+                 multiple shard cores requires FI_THREAD_SAFE. Outbound posting must be \
+                 serialized through a NIC-worker thread until this is resolved."
+            );
+        }
 
         // From here on we accumulate libfabric resources and must
         // release them on any error path. We do that by building
@@ -259,6 +291,8 @@ impl Fabric {
                     mrs: RwLock::new(Vec::new()),
                     next_mr_key: AtomicU64::new(0),
                     mr_virt_addr,
+                    threading,
+                    domain_mr_cnt,
                     progress,
                     progress_cqs: cq_raw,
                     completions,
@@ -325,6 +359,66 @@ impl Fabric {
     pub(crate) fn mr_uses_virtual_addr(&self) -> bool {
         self.inner.mr_virt_addr
     }
+
+    /// The provider's negotiated `domain_attr->threading` mode (raw
+    /// `enum fi_threading` discriminant).
+    pub fn threading_mode(&self) -> i32 {
+        self.inner.threading
+    }
+
+    /// Whether the negotiated domain threading mode is `FI_THREAD_SAFE`,
+    /// i.e. the domain may be posted to concurrently from multiple
+    /// threads without external serialization. When false, a single
+    /// shared per-HCA domain must funnel outbound posting through a
+    /// single NIC-worker thread.
+    pub fn is_thread_safe(&self) -> bool {
+        self.inner.threading == unsafe { ffi::ub_fi_thread_safe_value() }
+    }
+
+    /// The provider's negotiated maximum number of memory regions for
+    /// this domain, or 0 when the provider advertises no fixed limit.
+    pub fn domain_mr_limit(&self) -> usize {
+        self.inner.domain_mr_cnt
+    }
+
+    /// Verify that `expected_registrations` memory regions can be
+    /// registered against this (potentially shared) domain and log the
+    /// negotiated threading mode and MR capacity for diagnosis.
+    ///
+    /// When many serving shards share one per-HCA domain, each shard
+    /// registers its pool backing against the domain and the domain
+    /// holds a single shared RPC scratch region, so the per-domain MR
+    /// count is `shards + 1` and grows with the shard count. Providers
+    /// cap the number of MRs per domain (`domain_attr->mr_cnt`);
+    /// exceeding it makes a later `fi_mr_reg` fail at bring-up. This
+    /// surfaces the risk up front. A reported limit of 0 means "no fixed
+    /// limit", in which case no warning is emitted. Returns true when the
+    /// expected count exceeds a non-zero limit.
+    pub fn check_shared_domain_capacity(&self, expected_registrations: usize) -> bool {
+        let limit = self.inner.domain_mr_cnt;
+        let safe = self.is_thread_safe();
+        eprintln!(
+            "fabric '{}': domain threading={} (thread_safe={}), mr_cnt limit={} (0=unlimited), \
+             expected MR registrations={}",
+            self.inner.cfg.device_name, self.inner.threading, safe, limit, expected_registrations,
+        );
+        let exceeded = mr_capacity_exceeds(limit, expected_registrations);
+        if exceeded {
+            eprintln!(
+                "warning: expected {expected_registrations} MR registrations exceed the \
+                 provider's per-domain limit of {limit}; reduce shards per HCA or split the \
+                 shared domain."
+            );
+        }
+        exceeded
+    }
+}
+
+/// Whether `expected` memory-region registrations exceed a per-domain
+/// `limit`. A `limit` of 0 means the provider advertises no fixed cap,
+/// so nothing can exceed it.
+fn mr_capacity_exceeds(limit: usize, expected: usize) -> bool {
+    limit != 0 && expected > limit
 }
 
 /// Probe whether `provider`'s libfabric provider can satisfy this
@@ -549,5 +643,69 @@ mod tests {
             tcp_provider_available(),
             "provider_available(Tcp) must match the local tcp probe",
         );
+    }
+
+    #[test]
+    fn thread_safe_value_is_fi_thread_safe() {
+        // FI_THREAD_SAFE is enum discriminant 1 in libfabric's
+        // `enum fi_threading`. Sourcing it from C (rather than
+        // hardcoding) keeps `is_thread_safe` correct against the
+        // installed headers; assert the contract here. This is a pure
+        // constant-returning shim call, so it needs no provider.
+        assert_eq!(unsafe { ffi::ub_fi_thread_safe_value() }, 1);
+    }
+
+    #[test]
+    fn mr_capacity_exceeds_respects_zero_and_limit() {
+        // Zero means "no fixed limit": nothing exceeds it.
+        assert!(!mr_capacity_exceeds(0, 0));
+        assert!(!mr_capacity_exceeds(0, 1_000_000));
+        // Under and at the limit are fine; over the limit trips.
+        assert!(!mr_capacity_exceeds(8, 0));
+        assert!(!mr_capacity_exceeds(8, 8));
+        assert!(mr_capacity_exceeds(8, 9));
+    }
+
+    #[test]
+    fn fabric_reports_thread_safe_and_capacity_or_skip() {
+        if std::env::var_os("FABRIC_SKIP_FFI").is_some() {
+            eprintln!("FABRIC_SKIP_FFI set; skipping libfabric threading/capacity test");
+            return;
+        }
+        if !tcp_provider_available() {
+            eprintln!("libfabric tcp provider unavailable; skipping threading/capacity test");
+            return;
+        }
+
+        let rt: std::sync::Arc<dyn crate::runtime::Threading> = DefaultRuntime::new(1);
+        let mut cfg = defaults_for("lo", rt, WorkerIdx(0));
+        cfg.provider = Provider::Tcp;
+        cfg.progress_threads = 1;
+        cfg.max_inflight = 16;
+        cfg.listen = true;
+        cfg.listen_addr = Some("127.0.0.1:0".to_string());
+
+        let fabric = Fabric::new(cfg).expect("Fabric::new should succeed for tcp loopback");
+
+        // The tcp RDM provider supports FI_THREAD_SAFE; we request it in
+        // hints, so it must be negotiated for the shared-domain design to
+        // hold. This is the early validation the plan flags as the
+        // highest-risk unknown.
+        assert!(
+            fabric.is_thread_safe(),
+            "tcp provider negotiated threading mode {} but FI_THREAD_SAFE is required",
+            fabric.threading_mode(),
+        );
+
+        // The capacity check must not flag a tiny expected count. A
+        // provider reporting no fixed limit (0) never flags; a provider
+        // with a real limit must comfortably exceed two registrations.
+        let limit = fabric.domain_mr_limit();
+        assert!(
+            !fabric.check_shared_domain_capacity(2),
+            "two registrations must fit the domain mr_cnt limit of {limit}",
+        );
+
+        drop(fabric);
     }
 }

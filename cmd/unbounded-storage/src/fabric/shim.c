@@ -108,7 +108,15 @@ int ub_fi_getname(struct fid *fid, void *addr, size_t *addrlen) {
  *                         | FI_MR_ALLOCATED | FI_MR_PROV_KEY
  *   domain_attr.av_type   = FI_AV_TABLE
  *   domain_attr.control_progress / data_progress = FI_PROGRESS_MANUAL
+ *   domain_attr.threading = FI_THREAD_SAFE
  *   fabric_attr.prov_name = strdup(prov_name) when non-NULL
+ *
+ * FI_THREAD_SAFE is requested because a single shared per-HCA domain is
+ * driven concurrently by multiple serving shards posting outbound RMA
+ * from their own cores while NIC-worker threads progress completions.
+ * The tcp and verbs RDM providers both support FI_THREAD_SAFE; if a
+ * provider negotiates a weaker mode the Rust side detects it via
+ * `ub_fi_info_threading` and warns at bring-up.
  *
  * The returned pointer must be freed with fi_freeinfo when the
  * caller is done with it.
@@ -128,6 +136,7 @@ struct fi_info *ub_fi_build_hints(const char *prov_name) {
         hints->domain_attr->av_type = FI_AV_TABLE;
         hints->domain_attr->control_progress = FI_PROGRESS_MANUAL;
         hints->domain_attr->data_progress = FI_PROGRESS_MANUAL;
+        hints->domain_attr->threading = FI_THREAD_SAFE;
     }
     if (prov_name && hints->fabric_attr) {
         /* libfabric frees prov_name with `free(3)` inside fi_freeinfo. */
@@ -163,6 +172,45 @@ int ub_fi_info_mr_mode(struct fi_info *info) {
         return 0;
     }
     return info->domain_attr->mr_mode;
+}
+
+/*
+ * The negotiated `domain_attr->threading` the provider selected,
+ * returned as the raw `enum fi_threading` discriminant. The Rust side
+ * compares it against `ub_fi_thread_safe_value()` to decide whether a
+ * single shared domain may be posted to concurrently from multiple
+ * shard cores without external serialization. Returns FI_THREAD_UNSPEC
+ * (0) when the info or its domain_attr is NULL.
+ */
+int ub_fi_info_threading(struct fi_info *info) {
+    if (!info || !info->domain_attr) {
+        return FI_THREAD_UNSPEC;
+    }
+    return (int)info->domain_attr->threading;
+}
+
+/*
+ * The `enum fi_threading` value for FI_THREAD_SAFE. Exposed as a
+ * function so the Rust side never hardcodes the enum discriminant,
+ * which keeps it correct if libfabric ever renumbers the enum.
+ */
+int ub_fi_thread_safe_value(void) {
+    return (int)FI_THREAD_SAFE;
+}
+
+/*
+ * The provider's negotiated `domain_attr->mr_cnt`: the maximum number
+ * of memory regions that may be registered against this domain. A
+ * value of 0 means the provider reports no fixed limit. Used at
+ * bring-up to check that the expected per-domain MR registrations
+ * (each shard registers its pool backing plus an RPC scratch region)
+ * fit within the shared per-HCA domain's capacity.
+ */
+size_t ub_fi_info_mr_cnt(struct fi_info *info) {
+    if (!info || !info->domain_attr) {
+        return 0;
+    }
+    return info->domain_attr->mr_cnt;
 }
 
 /*
