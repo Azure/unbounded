@@ -123,72 +123,8 @@ fn collapse_smt(host: &Host, cpus: &[u32]) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::topology::{Cpu, Hca, Host, NumaNode};
-    use std::collections::{BTreeMap, BTreeSet};
-
-    /// Builds a `Host` snapshot directly without touching sysfs.
-    /// `nodes` is `(numa_id, cpu_ids, smt_groups)` where `smt_groups`
-    /// is a list of sibling sets that cover the CPUs on that node;
-    /// pass an empty Vec for "every CPU is its own group".
-    fn fake_host(
-        nodes: Vec<(u16, Vec<u32>, Vec<Vec<u32>>)>,
-        isolated: Vec<u32>,
-        hcas: Vec<Hca>,
-    ) -> Host {
-        let isolated: BTreeSet<u32> = isolated.into_iter().collect();
-        let mut cpus: BTreeMap<u32, Cpu> = BTreeMap::new();
-        let mut numa_nodes = Vec::new();
-
-        for (numa_id, cpu_ids, smt_groups) in nodes {
-            let groups = if smt_groups.is_empty() {
-                cpu_ids.iter().map(|c| vec![*c]).collect::<Vec<_>>()
-            } else {
-                smt_groups
-            };
-
-            for cpu in &cpu_ids {
-                let siblings = groups
-                    .iter()
-                    .find(|g| g.contains(cpu))
-                    .cloned()
-                    .unwrap_or_else(|| vec![*cpu]);
-                cpus.insert(
-                    *cpu,
-                    Cpu {
-                        id: *cpu,
-                        numa: Some(numa_id),
-                        smt_siblings: siblings,
-                        isolated: isolated.contains(cpu),
-                    },
-                );
-            }
-
-            numa_nodes.push(NumaNode {
-                id: numa_id,
-                cpus: cpu_ids,
-            });
-        }
-
-        numa_nodes.sort_by_key(|n| n.id);
-        Host {
-            cpus,
-            numa_nodes,
-            hcas,
-            nvmes: vec![],
-            nics: vec![],
-            isolated,
-        }
-    }
-
-    fn hca(dev: &str, bdf: &str, numa: Option<u16>, active: bool) -> Hca {
-        Hca {
-            dev_name: dev.to_string(),
-            pci_bdf: Some(bdf.to_string()),
-            pcie_root: None,
-            numa,
-            ports_active: active,
-        }
-    }
+    use crate::topology::testutil::{fake_host, hca};
+    use std::collections::BTreeSet;
 
     fn filters() -> Filters {
         Filters {
@@ -241,7 +177,7 @@ mod tests {
 
     #[test]
     fn build_node_pool_excludes_cpu0() {
-        let host = fake_host(vec![(0, (0..8).collect(), vec![])], vec![], vec![]);
+        let host = fake_host(vec![(0, (0..8).collect(), vec![])], vec![], vec![], vec![]);
         let pool = build_node_pool(&host, 0, &filters());
         assert_eq!(pool, vec![1, 2, 3, 4, 5, 6, 7]);
     }
@@ -250,7 +186,12 @@ mod tests {
     fn build_node_pool_respects_isolated() {
         // isolcpus wins over cpu0 exclusion: only the isolated cpus
         // survive, even cpu0 if it is isolated.
-        let host = fake_host(vec![(0, (0..8).collect(), vec![])], vec![0, 3, 5], vec![]);
+        let host = fake_host(
+            vec![(0, (0..8).collect(), vec![])],
+            vec![0, 3, 5],
+            vec![],
+            vec![],
+        );
         let pool = build_node_pool(&host, 0, &filters());
         assert_eq!(pool, vec![0, 3, 5]);
     }
@@ -261,7 +202,7 @@ mod tests {
         // per pair survives. cpu0 is excluded before collapse, so the
         // (0,8) pair's surviving representative is 8.
         let smt: Vec<Vec<u32>> = (0..8).map(|c| vec![c, c + 8]).collect();
-        let host = fake_host(vec![(0, (0..16).collect(), smt)], vec![], vec![]);
+        let host = fake_host(vec![(0, (0..16).collect(), smt)], vec![], vec![], vec![]);
         let pool = build_node_pool(&host, 0, &filters());
         let set: BTreeSet<u32> = pool.iter().copied().collect();
         // No SMT pair fully present.
@@ -280,7 +221,7 @@ mod tests {
     #[test]
     fn build_node_pool_keeps_smt_when_requested() {
         let smt: Vec<Vec<u32>> = (0..4).map(|c| vec![c, c + 4]).collect();
-        let host = fake_host(vec![(0, (0..8).collect(), smt)], vec![], vec![]);
+        let host = fake_host(vec![(0, (0..8).collect(), smt)], vec![], vec![], vec![]);
         let mut f = filters();
         f.use_smt_siblings = true;
         let pool = build_node_pool(&host, 0, &f);
@@ -296,6 +237,7 @@ mod tests {
         let host = fake_host(
             vec![(0, (0..4).collect(), vec![]), (1, (4..8).collect(), vec![])],
             vec![4, 5, 6, 7],
+            vec![],
             vec![],
         );
         let pool = build_node_pool(&host, 0, &filters());
