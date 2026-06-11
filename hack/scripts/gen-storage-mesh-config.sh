@@ -16,6 +16,7 @@
 #                            node by sorted name)
 #       --port PORT          fabric / peer TCP port (default 7000)
 #       --frontend-port PORT frontend bind port (default 9000)
+#       --metrics-port PORT  Prometheus metrics exporter bind port (default 9100)
 #       --origin URL         backend origin endpoint
 #                            (default http://origin.example.invalid)
 #   -h, --help               Show this help and exit
@@ -49,6 +50,7 @@ OPT_SELECTOR=""
 OPT_LOCAL_NODE=""
 OPT_PORT="7000"
 OPT_FRONTEND_PORT="9000"
+OPT_METRICS_PORT="9100"
 OPT_ORIGIN="http://origin.example.invalid"
 
 while [[ $# -gt 0 ]]; do
@@ -73,6 +75,10 @@ while [[ $# -gt 0 ]]; do
 		OPT_FRONTEND_PORT="$2"
 		shift 2
 		;;
+	--metrics-port)
+		OPT_METRICS_PORT="$2"
+		shift 2
+		;;
 	--origin)
 		OPT_ORIGIN="$2"
 		shift 2
@@ -88,6 +94,7 @@ require_cmd kubectl "Install kubectl: https://kubernetes.io/docs/tasks/tools/"
 
 [[ "$OPT_PORT" =~ ^[0-9]+$ ]] || die "--port must be a number (got '$OPT_PORT')."
 [[ "$OPT_FRONTEND_PORT" =~ ^[0-9]+$ ]] || die "--frontend-port must be a number (got '$OPT_FRONTEND_PORT')."
+[[ "$OPT_METRICS_PORT" =~ ^[0-9]+$ ]] || die "--metrics-port must be a number (got '$OPT_METRICS_PORT')."
 
 # ── kubectl context args ──────────────────────────────────────────────────────
 
@@ -207,4 +214,10 @@ backend = "origin"
 
 [startup.fabric]
 listen_addr = "0.0.0.0:$OPT_PORT"
+
+[startup.metrics]
+# Prometheus text-format exporter on GET /metrics. Bind 0.0.0.0 so an
+# in-cluster scraper (e.g. AKS managed Prometheus) can reach it across the
+# network; an empty bind disables the exporter.
+bind = "0.0.0.0:$OPT_METRICS_PORT"
 EOF
