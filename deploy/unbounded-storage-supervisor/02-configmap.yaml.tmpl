@@ -1,0 +1,62 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: unbounded-storage-config
+  namespace: {{ default "unbounded-kube" .Namespace }}
+  labels:
+    app.kubernetes.io/name: unbounded-storage-supervisor
+    app.kubernetes.io/component: storage
+# Cluster-wide startup-fixed daemon settings, one data key per property.
+# Values are the daemon's documented defaults (see
+# cmd/unbounded-storage/proto/config.proto and src/config/schema.rs). Keys use
+# the dotted proto/TOML field path; when mounted as a volume each key projects
+# to a like-named file holding its value, which the run supervisor renders into
+# the host config.toml.
+#
+# Only startup-fixed (restart-required) settings live here. Per-node sections
+# (version bumps, [[peers]], [[disks]], p2p.local_node_id, p2p.routing_plan,
+# [[backends]], [[frontends]]) are intentionally excluded: they cannot be shared
+# across every node in the DaemonSet and are injected per-node elsewhere.
+data:
+  # Operator-assigned config version (opaque counter; 0 means unversioned).
+  version: "0"
+
+  # [startup.memory]
+  # Allocate per-shard backing from the heap instead of 2 MiB hugepages.
+  startup.memory.no_hugepages: "false"
+  # Per-shard backing size in bytes (128 MiB).
+  startup.memory.bytes_per_shard: "134217728"
+
+  # [startup.fabric]
+  # Per-shard fabric listen address (":0" picks a free port).
+  startup.fabric.listen_addr: "0.0.0.0:0"
+  # libfabric progress threads per shard.
+  startup.fabric.progress_threads: "2"
+  # Progress-thread busy-poll budget in microseconds.
+  startup.fabric.progress_poll_us: "10"
+  # Fabric RPC worker threads per shard.
+  startup.fabric.rpc_worker_threads: "4"
+  # Max in-flight fabric operations per shard (back-pressure limit).
+  startup.fabric.max_inflight: "1024"
+
+  # [startup.topology]
+  # RDMA progress engines per HCA.
+  startup.topology.rdma_progress_per_hca: "1"
+  # RDMA completion handlers per HCA.
+  startup.topology.rdma_handlers_per_hca: "4"
+  # TCP-fallback threads when RDMA is unavailable.
+  startup.topology.tcp_fallback_threads: "1"
+  # Place shards on SMT sibling CPUs as well as physical cores.
+  startup.topology.use_smt_siblings: "false"
+  # Schedule shards onto isolcpus-isolated CPUs too.
+  startup.topology.ignore_isolated: "false"
+  # Allow placing a shard on each NUMA node's CPU 0.
+  startup.topology.include_node_cpu0: "false"
+  # Use HCA ports that are not in the active state.
+  startup.topology.allow_inactive_port: "false"
+  # Disable RDMA and force the libfabric tcp provider.
+  startup.topology.disable_rdma: "false"

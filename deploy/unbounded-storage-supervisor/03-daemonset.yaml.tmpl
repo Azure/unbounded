@@ -1,0 +1,114 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: unbounded-storage-supervisor
+  namespace: {{ default "unbounded-kube" .Namespace }}
+  labels:
+    app.kubernetes.io/name: unbounded-storage-supervisor
+    app.kubernetes.io/component: storage
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: unbounded-storage-supervisor
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 100%
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: unbounded-storage-supervisor
+        app.kubernetes.io/component: storage
+    spec:
+      # The supervisor installs and supervises a host-level daemon, so it needs
+      # broad host access.
+      hostPID: true
+      # Tolerate all taints - storage must be available on every node.
+      tolerations:
+        - operator: Exists
+      priorityClassName: system-node-critical
+      initContainers:
+        # Install (or upgrade) the unbounded-storage daemon on the host. It
+        # writes the release tree under /opt/unbounded-storage and the systemd
+        # unit under /etc/systemd/system, then drives systemctl in the host's
+        # namespaces via the nsenter wrapper configured in SYSTEMCTL.
+        - name: install
+          image: {{ .Image }}
+          imagePullPolicy: Always
+          args:
+            - install
+          env:
+            # Writes land at their real host-absolute locations because the
+            # host paths are mounted at the same paths inside the container.
+            - name: HOST_ROOT
+              value: "/"
+            # Run systemctl in the host's namespaces (requires hostPID for the
+            # PID 1 target and a privileged container).
+            - name: SYSTEMCTL
+              value: "nsenter -t 1 -m -u -i -n -p systemctl"
+          volumeMounts:
+            - name: storage-prefix
+              mountPath: /opt/unbounded-storage
+            - name: systemd-units
+              mountPath: /etc/systemd/system
+          securityContext:
+            allowPrivilegeEscalation: true
+            runAsUser: 0
+            privileged: true
+      containers:
+        # Supervise the installed daemon for the lifetime of the pod.
+        - name: run
+          image: {{ .Image }}
+          imagePullPolicy: Always
+          args:
+            - run
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          volumeMounts:
+            - name: storage-config
+              mountPath: /etc/unbounded-storage
+            # Startup-tuning defaults projected one file per property. The run
+            # supervisor reads these and renders the host config.toml; it is a
+            # separate path from the host config mount above so they never
+            # overlay each other.
+            - name: config-source
+              mountPath: /etc/unbounded-storage-source
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: true
+            runAsUser: 0
+            privileged: true
+      volumes:
+        - name: storage-prefix
+          hostPath:
+            path: /opt/unbounded-storage
+            type: DirectoryOrCreate
+        - name: systemd-units
+          hostPath:
+            path: /etc/systemd/system
+            type: Directory
+        - name: storage-config
+          hostPath:
+            path: /etc/unbounded-storage
+            type: DirectoryOrCreate
+        - name: config-source
+          configMap:
+            name: unbounded-storage-config
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
