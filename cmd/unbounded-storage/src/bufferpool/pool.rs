@@ -105,6 +105,7 @@ where
             blockstore,
             _r: PhantomData,
         });
+        crate::metrics::bufferpool_pages_added(page_count_u32 as i64);
         Ok(Self { inner })
     }
 
@@ -154,7 +155,7 @@ where
         offset: u64,
         len: u64,
     ) -> Result<ReadStream<'p>, Error> {
-        let (src, end) = self.admit_stream(req, offset, len)?;
+        let (src, end) = self.admit_stream(req, offset, len, false)?;
         Ok(ReadStream::new(src, offset, end, self.inner.page_size))
     }
 
@@ -174,7 +175,7 @@ where
         len: u64,
         window: usize,
     ) -> Result<WindowedRead<'p>, Error> {
-        let (src, end) = self.admit_stream(req, offset, len)?;
+        let (src, end) = self.admit_stream(req, offset, len, false)?;
         let max_inflight = self.inner.cfg.max_inflight_pages;
         let window = window.clamp(1, max_inflight.saturating_add(1));
         Ok(WindowedRead::new(
@@ -217,7 +218,7 @@ where
 
         let admit = move |s: usize| -> Result<Rc<dyn StreamSrc + 'p>, Error> {
             let (req, offset, len) = &admit_inputs[s];
-            let (src, _end) = self.admit_stream(req, *offset, *len)?;
+            let (src, _end) = self.admit_stream(req, *offset, *len, false)?;
             Ok(src)
         };
 
@@ -243,12 +244,13 @@ where
     /// `StripeFetch`, and builds the type-erased `StreamSrc` that
     /// owns an `Rc<R>` clone of the request. Returns the erased
     /// source and the exclusive end offset.
-    fn admit_stream<'p>(
-        &'p self,
+    fn admit_stream(
+        &self,
         req: &R,
         offset: u64,
         len: u64,
-    ) -> Result<(Rc<dyn StreamSrc + 'p>, u64), Error> {
+        nonblocking: bool,
+    ) -> Result<(Rc<dyn StreamSrc + 'static>, u64), Error> {
         let cur = self.inner.stream_count.get();
         if cur >= self.inner.cfg.max_concurrent_streams {
             return Err(Error::StreamLimit);
@@ -266,13 +268,36 @@ where
         fetch.borrow_mut().stream_refcount += 1;
 
         let end = offset.saturating_add(len);
-        let src: Rc<dyn StreamSrc + 'p> = Rc::new(StreamSrcImpl::new(
+        let src: Rc<dyn StreamSrc + 'static> = Rc::new(StreamSrcImpl::new(
             self.inner.clone(),
             Rc::new(req.clone()),
             key,
             fetch,
+            nonblocking,
         ));
         Ok((src, end))
+    }
+
+    /// Owned-guard read path for cross-shard fan-out. Unlike
+    /// [`BufferPool::read`], the returned [`ReadStream`] is `'static`
+    /// and yields `PageGuard<'static>` via
+    /// [`ReadStream::next_page_owned`], so a stripe's owner shard can
+    /// pin the pages it fetches and hold them past this stream's own
+    /// lifetime while the coordinator shard streams them to the
+    /// client over the network, releasing each pin only once its
+    /// zero-copy send completes.
+    ///
+    /// Because those pins are held across a cross-shard network round
+    /// trip, this path allocates its head page non-blockingly: if no
+    /// backing page is free without parking it returns [`Error::Busy`]
+    /// rather than queueing on the free list. A parked owned head
+    /// could otherwise pin a stripe while the remote coordinator owed
+    /// the page is itself blocked behind another owner, forming a
+    /// cross-shard hold-and-wait deadlock. `Busy` is transient: the
+    /// coordinator re-dispatches the fetch after yielding.
+    pub fn read_owned(&self, req: &R, offset: u64, len: u64) -> Result<ReadStream<'static>, Error> {
+        let (src, end) = self.admit_stream(req, offset, len, true)?;
+        Ok(ReadStream::new(src, offset, end, self.inner.page_size))
     }
 }
 
@@ -301,6 +326,15 @@ where
     /// not to outstanding guards, so we do it eagerly via
     /// `decrement_stream`.
     stream_decremented: Cell<bool>,
+    /// When set, this stream's head fetch must not park on the free
+    /// list: it allocates via `FreeList::try_alloc_head` and fails
+    /// fast with [`Error::Busy`] if no page is free. Set only by
+    /// [`Pool::read_owned`] (the cross-shard owned-guard path), where
+    /// a parked head could otherwise pin a stripe across a network
+    /// round trip and form a cross-shard hold-and-wait cycle. Local
+    /// (`read`/`read_windowed`/`read_pipelined`) streams leave it
+    /// false and park blocking as before.
+    nonblocking: bool,
 }
 
 impl<T, S, R> StreamSrcImpl<T, S, R>
@@ -314,6 +348,7 @@ where
         req: Rc<R>,
         key: StripeKey,
         fetch: Rc<RefCell<StripeFetch>>,
+        nonblocking: bool,
     ) -> Self {
         Self {
             inner,
@@ -321,6 +356,7 @@ where
             key,
             fetch,
             stream_decremented: Cell::new(false),
+            nonblocking,
         }
     }
 }
@@ -364,6 +400,7 @@ where
             self.req.clone(),
             page_no,
             speculative,
+            self.nonblocking,
         ))
     }
 
@@ -403,6 +440,7 @@ where
         let cur = self.inner.inflight_prefetch_pages.get();
         if cur < effective {
             self.inner.inflight_prefetch_pages.set(cur + 1);
+            crate::metrics::bufferpool_prefetch_delta(1);
             true
         } else {
             false
@@ -414,6 +452,9 @@ where
         self.inner
             .inflight_prefetch_pages
             .set(cur.saturating_sub(1));
+        if cur > 0 {
+            crate::metrics::bufferpool_prefetch_delta(-1);
+        }
     }
 }
 
@@ -629,6 +670,7 @@ async fn fetch_page<T, S, R>(
     req: Rc<R>,
     page_no: u64,
     speculative: bool,
+    nonblocking: bool,
 ) -> Result<u32, Error>
 where
     T: Transport<R> + 'static,
@@ -672,6 +714,7 @@ where
             }
             Action::Error(e) => return Err(e),
             Action::Park => {
+                crate::metrics::bufferpool_coalesced();
                 // `ParkOnSlot` pre-bumps `consumer_holds` so the
                 // leader's `PageGuard` drop cannot recycle the slot
                 // between wake and re-poll. The hold is transferred
@@ -718,7 +761,10 @@ where
                     // non-speculative (head) fetch blocks until a page
                     // frees; it is the only path that parks on the
                     // free list, which is what keeps prefetch from
-                    // starving any stream's head and deadlocking.
+                    // starving any stream's head and deadlocking. The
+                    // one exception is a `nonblocking` head (the
+                    // cross-shard owned-guard path), which also refuses
+                    // to park and fails fast with `Busy`; see below.
                     let pi = if speculative {
                         // Keep one reserve page free per active stream
                         // so every stream's head can always allocate
@@ -732,6 +778,20 @@ where
                         match inner.free.try_alloc_spare(reserve) {
                             Some(pi) => pi,
                             None => return Err(Error::PrefetchBackoff),
+                        }
+                    } else if nonblocking {
+                        // Cross-shard (owned-guard) head: must never
+                        // park on the free list, or it could pin this
+                        // stripe across a network round trip while the
+                        // owed coordinator is itself stalled behind
+                        // another owner's pins, a cross-shard
+                        // hold-and-wait cycle. Fail fast with `Busy`
+                        // (the coordinator retries) instead. Still
+                        // yields to parked local heads via
+                        // `try_alloc_head`, so it cannot starve them.
+                        match inner.free.try_alloc_head() {
+                            Some(pi) => pi,
+                            None => return Err(Error::Busy),
                         }
                     } else {
                         inner.free.alloc().await
@@ -766,7 +826,23 @@ where
                 .await;
 
                 let hit = match fetch_result {
-                    Ok(h) => h,
+                    Ok(h) => {
+                        crate::metrics::bufferpool_request(if h {
+                            crate::metrics::Lookup::Hit
+                        } else {
+                            crate::metrics::Lookup::Miss
+                        });
+                        // A blockstore hit satisfied the RAM miss from
+                        // local disk. The peer/origin sources are
+                        // recorded inside `Transport::bulk_get` on the
+                        // miss path, where that distinction is known.
+                        if h {
+                            crate::metrics::bufferpool_miss_source(
+                                crate::metrics::MissSource::Disk,
+                            );
+                        }
+                        h
+                    }
                     Err(e) => {
                         let wakers = take_loading_wakers(&slot);
                         *slot.state.borrow_mut() = SlotState::Error(e.clone());

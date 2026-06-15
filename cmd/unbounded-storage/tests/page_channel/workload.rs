@@ -389,7 +389,7 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
             let mut channels = Vec::with_capacity(devices_task.len());
             let mut ok = true;
             for (i, dev) in devices_task.iter().enumerate() {
-                let eng = match StorageEngine::open(dev.clone(), engine_cfg).await {
+                let eng = match StorageEngine::open(dev.clone(), engine_cfg.clone()).await {
                     Ok(e) => Arc::new(e),
                     Err(e) => {
                         outcomes

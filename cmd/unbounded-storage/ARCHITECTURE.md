@@ -98,38 +98,41 @@ selection) live in the config's `[startup]` section. They are read once
 at process start and cannot change without a restart, so they are
 excluded from the live-reload diff.
 
-- `[startup.memory]` - `no_hugepages` (allocate per-shard backing from
-  the heap instead of 2 MiB hugepages) and `bytes_per_shard` (u64 bytes,
-  no suffix; `0` -> 128 MiB).
+- `[startup.memory]` - `no_hugepages` (allocate shard backings from
+  the heap instead of 2 MiB hugepages) and `memory_total_bytes` (u64
+  bytes, no suffix; `0` -> 128 MiB) - the total backing pool, split
+  evenly across the serving shards so the host footprint stays fixed
+  regardless of the auto-scaled shard count.
 - `[startup.fabric]` - `listen_addr` (default `0.0.0.0:0`),
   `progress_threads` (2), `progress_poll_us` (10),
   `rpc_worker_threads` (4), `max_inflight` (1024) - the per-shard fabric
   endpoint, thread pools, and in-flight cap.
-- `[startup.topology]` - `rdma_progress_per_hca` (1),
-  `rdma_handlers_per_hca` (4), `tcp_fallback_threads` (1), and the
+- `[startup.topology]` - `serving_cores` (`0` = auto-fill every usable
+  CPU), `nic_workers` (fabric CPUs per active HCA, `0` -> 4), and the
   toggles `use_smt_siblings`, `ignore_isolated`, `include_node_cpu0`,
-  `allow_inactive_port`, `disable_rdma` - feed `startup_to_plan_config`,
-  which builds the `topology::PlanConfig` consumed by `Plan::for_host`.
-  The toggles default off; the three "negative" plan fields
-  (`respect_isolated`, `exclude_node_cpu0`, `require_active_port`) are
-  inverted from the corresponding config field so the historical "on"
-  behavior is the default.
+  `allow_inactive_port`, `disable_rdma` - feed
+  `startup_to_core_plan_config`, which builds the `topology::CorePlanConfig`
+  consumed by `CorePlan::for_host`. The toggles default off; the three
+  "negative" plan fields (`respect_isolated`, `exclude_node_cpu0`,
+  `require_active_port`) are inverted from the corresponding config field
+  so the historical "on" behavior is the default.
 
 ### Startup sequence
 
 1. Load and validate config; build `StartupSettings` from the config's
    `[startup]` section.
 2. `Host::discover()` reads hardware from sysfs.
-3. `Plan::for_host(&host, &settings.plan_config)` computes the CPU/
-   role assignment. `RoleCounts::from_plan` tallies roles (RDMA progress and
-   RDMA handler roles are counted; `NvmeIoUring`/`NetworkShard` are currently
-   vestigial).
-4. `progress: Vec<Worker>` is filtered to `Role::RdmaProgress` workers. **One
-   shard thread is spawned per RDMA-progress worker.** If empty, the daemon
-   exits with failure.
-5. A `PinnedRuntime::from_plan` is built over the retained workers;
-   `WorkerIdx(i)` indexes the i-th retained worker (the filter and the index
-   must stay in sync).
+3. `CorePlan::for_host(&host, &settings.core_plan_config)` partitions the
+   host's usable CPUs into three disjoint, NUMA-local classes: one
+   `StorageCore` per NVMe drive, `nic_workers` `NicWorker`s per active HCA,
+   and a `ServingShard` on every remaining CPU (optionally capped by
+   `serving_cores`).
+4. **One shard thread is spawned per `ServingShard`.** If the host yields no
+   serving shards, the daemon exits with failure. With no usable HCA the
+   NIC-worker class is simply empty and the shards serve over the
+   loopback/TCP path.
+5. A `PinnedRuntime` is built over the planned CPUs so `WorkerIdx(i)` pins the
+   i-th worker thread to its assigned core and NUMA node.
 6. A `DiskChannelDirectory` (Arc) is created before shards as the hot-swap
    publication surface for disk channels.
 7. Read-only shared state (`Arc<Vec<FrontendSpec>>`, `Arc<Vec<BackendSpec>>`;
@@ -265,21 +268,24 @@ it a simple loop to drive work without an async runtime.
 
 - `Host::discover()` reads CPUs, NUMA nodes, HCAs (`Hca`), NICs (`Nic`), and
   NVMe drives (`Nvme`) from sysfs.
-- `Plan::for_host(&host, &PlanConfig)` allocates disjoint, NUMA-local CPUs to
-  roles, scheduling the most constrained roles first (NVMe io_uring), then RDMA
-  progress, then RDMA handlers; an exhausted pool spills into a per-node
-  oversubscription pool.
-- `Role` variants: `RdmaProgress{hca}`, `RdmaHandler{hca}`, `NvmeIoUring{nvme}`,
-  `NetworkShard{nic}`. A `Worker` carries `{ cpu, numa, role }`.
-- `PlanConfig` knobs (defaults): `rdma_progress_per_hca` (1),
-  `rdma_handlers_per_hca` (4), `nvme_threads_per_drive` (2),
-  `network_shards_per_nic` (0), `use_smt_siblings` (false),
-  `respect_isolated` (true), `exclude_node_cpu0` (true),
+- `CorePlan::for_host(&host, &CorePlanConfig)` partitions the host's usable
+  CPUs into three disjoint, NUMA-local classes, scheduled most-constrained
+  first: a `StorageCore` per NVMe drive, then `nic_workers` `NicWorker`s per
+  active HCA (grouped into a `NicWorkerGroup` per HCA), then a `ServingShard`
+  on every remaining CPU. Each CPU is handed out at most once; an exhausted
+  pool oversubscribes rather than panicking. The shared CPU/HCA filtering
+  engine (SMT collapse, isolcpus, cpu0 exclusion, active-port gating) lives in
+  `topology/filters.rs`.
+- `CorePlanConfig` knobs (defaults): `nic_workers` (4 per active HCA),
+  `serving_cores` (`None` = claim every remaining CPU), `use_smt_siblings`
+  (false), `respect_isolated` (true), `exclude_node_cpu0` (true),
   `require_node_type_ca` (true, currently a no-op), `require_active_port`
-  (true), `tcp_fallback_threads` (1), and `disable_rdma` (force TCP even when
-  HCAs exist - an escape hatch for unusable verbs).
-- Key accessors consumed by main: `plan.rdma_progress()` and
-  `plan.disk_cpu_slots()`.
+  (true), and `disable_rdma` (drop every HCA so no NIC-worker group is placed
+  and serving shards serve over loopback/TCP - the escape hatch for unusable
+  verbs).
+- Key fields consumed by main: `plan.serving_shards` (one shard thread each),
+  `plan.nic_workers` (the fabric worker groups), and `plan.storage_cores`,
+  which main maps to one `DiskCpuSlot` per NVMe drive.
 
 ### 7.3 `memory/` - NUMA-local backings
 
@@ -562,14 +568,14 @@ Sections (all optional, each falling back to defaults):
   build (see `designs/storage-disjoint-routing-parity.md`).
 - `[startup]` - startup-fixed knobs, read once at process start and
   excluded from the live-reload diff: `[startup.memory]`
-  (`no_hugepages`, `bytes_per_shard`), `[startup.fabric]` (`listen_addr`,
+  (`no_hugepages`, `memory_total_bytes`), `[startup.fabric]` (`listen_addr`,
   `progress_threads`, `progress_poll_us`, `rpc_worker_threads`,
-  `max_inflight`), and `[startup.topology]` (`rdma_progress_per_hca`,
-  `rdma_handlers_per_hca`, `tcp_fallback_threads`, `use_smt_siblings`,
-  `ignore_isolated`, `include_node_cpu0`, `allow_inactive_port`,
-  `disable_rdma`). `startup_to_plan_config` inverts the negative plan
-  fields so the historical defaults hold. See the CLI section for the
-  per-field defaults.
+  `max_inflight`), and `[startup.topology]` (`serving_cores`,
+  `nic_workers`, `use_smt_siblings`, `ignore_isolated`,
+  `include_node_cpu0`, `allow_inactive_port`, `disable_rdma`).
+  `startup_to_core_plan_config` inverts the negative plan fields so the
+  historical defaults hold. See the CLI section for the per-field
+  defaults.
 - `[[peers]]` - `id` (unique `u64`, doubles as both `NodeId` and `PeerId`),
   `transport` (`0` = tcp | `1` = rdma), `address` (a `host:port`
   `SocketAddr` for tcp, or a lowercase even-length hex raw libfabric
@@ -591,7 +597,7 @@ routing snapshot. It republishes the channel snapshot each update, logs
 
 | Layer | Threading | Notes |
 |-------|-----------|-------|
-| Shard | One pinned OS thread per `RdmaProgress` worker | Owns `!Send` pool, transport, frontend, RPC handler |
+| Shard | One pinned OS thread per `ServingShard` | Owns `!Send` pool, transport, frontend, RPC handler |
 | Shard loop | Cooperative tick hooks, noop waker | Busy-poll active, sleep 100us idle |
 | Fabric progress | One pinned thread per CQ | Self-driving |
 | Fabric RPC serve | One dedicated OS thread per in-flight request | Synchronous noop-waker drive |

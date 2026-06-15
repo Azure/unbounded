@@ -32,7 +32,9 @@ use crate::config::reconcile::BackendReconcileTarget;
 use crate::config::{BackendKind, BackendSpec};
 use crate::storage::StripeReq;
 
-use super::{Backend, AzureBackend, HttpBackend, OriginBackend, OriginRing, OriginStream, S3Backend};
+use super::{
+    AzureBackend, Backend, HttpBackend, OriginBackend, OriginRing, OriginStream, S3Backend,
+};
 
 /// The build context a registry needs to (re)construct an
 /// [`OriginBackend`] from a [`BackendSpec`]. Captured once per registry

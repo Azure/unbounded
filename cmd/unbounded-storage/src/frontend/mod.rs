@@ -38,6 +38,9 @@ mod http_serve;
 #[cfg(target_os = "linux")]
 mod s3_serve;
 
+#[cfg(target_os = "linux")]
+mod serve_metrics;
+
 pub use range::{ByteRange, RangeError, ResolvedRange, StripeSlice, full_object, stripe_set};
 pub use s3_xml::{S3ErrorCode, error_xml, xml_escape};
 
