@@ -1,0 +1,19 @@
+---
+# Metrics Service: ClusterIP exposing the Prometheus /metrics endpoint so
+# scrapers can reach the soaks3 read-load driver.
+apiVersion: v1
+kind: Service
+metadata:
+  name: soaks3
+  namespace: {{ default "soaks3" .Namespace }}
+  labels:
+    app.kubernetes.io/name: soaks3
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: soaks3
+  ports:
+    - name: metrics
+      port: 9300
+      targetPort: metrics
+      protocol: TCP

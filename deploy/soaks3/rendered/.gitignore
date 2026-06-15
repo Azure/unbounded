@@ -1,0 +1,3 @@
+# rendered manifests are gitignored; produced by `make soaks3-manifests`.
+*
+!.gitignore

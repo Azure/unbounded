@@ -1,0 +1,58 @@
+---
+# soaks3 read-load driver. Runs `soaks3 run` against an unbounded-storage S3
+# frontend and exposes a Prometheus /metrics endpoint on port 9300.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: soaks3
+  namespace: {{ default "soaks3" .Namespace }}
+  labels:
+    app.kubernetes.io/name: soaks3
+spec:
+  replicas: {{ default "1" .Replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: soaks3
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: soaks3
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9300"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: soaks3
+      containers:
+        - name: soaks3
+          image: {{ default "ghcr.io/azure/soaks3:main" .Image | quote }}
+          imagePullPolicy: {{ default "Always" .ImagePullPolicy }}
+          args:
+            - run
+            - --endpoint={{ default "http://unbounded-storage.unbounded-kube.svc:9000" .Endpoint }}
+            - --bucket={{ default "soaks3" .Bucket }}
+            - --key-prefix={{ default "soaks3/" .KeyPrefix }}
+            - --count={{ default "1000" .Count }}
+            - --object-size={{ default "4MiB" .ObjectSize }}
+            - --concurrency={{ default "32" .Concurrency }}
+            - --duration={{ default "0" .Duration }}
+            - --metrics-addr=:9300
+          ports:
+            - containerPort: 9300
+              name: metrics
+              protocol: TCP
+          resources:
+            requests:
+              cpu: {{ default "100m" .ResourceCPURequest }}
+              memory: {{ default "128Mi" .ResourceMemoryRequest }}
+            limits:
+              cpu: {{ default "1" .ResourceCPULimit }}
+              memory: {{ default "256Mi" .ResourceMemoryLimit }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65534
+            capabilities:
+              drop:
+                - ALL

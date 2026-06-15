@@ -52,3 +52,32 @@ soaks3 run \
 soaks3 run --manifest ./data/manifest.json --range-read --range-size 64KiB --rate 500
 ```
 
+## Container image and in-cluster deployment
+
+`soaks3` is developer tooling, so its image is never built for tagged releases.
+The image is only published on demand via the `unbounded container images`
+workflow (`.github/workflows/images.yaml`): trigger it manually
+(`workflow_dispatch` with `image: soaks3`) or push an `images/soaks3/<version>`
+tag. Both publish `ghcr.io/<owner>/soaks3:<tag>`.
+
+Build the image locally with:
+
+```bash
+make image-soaks3-local          # build ghcr.io/azure/soaks3:<version>
+make image-soaks3-push           # build and push
+```
+
+Deploy manifests live under `deploy/soaks3/` and are **not** applied by any
+default deploy flow or bundled into `release-manifests`. Render them on demand
+and apply by hand against a throwaway/dev cluster:
+
+```bash
+make soaks3-manifests SOAKS3_IMAGE=ghcr.io/azure/soaks3:dev
+kubectl apply -f deploy/soaks3/rendered/
+```
+
+The rendered Deployment runs `soaks3 run` and exposes Prometheus metrics on
+port `9300` (also fronted by a ClusterIP Service). Adjust the endpoint, bucket,
+and data-set flags via the `--set Key=Value` knobs documented in
+`deploy/soaks3/03-deployment.yaml.tmpl`.
+

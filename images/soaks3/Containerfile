@@ -1,0 +1,56 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# Build stage
+# Pin the builder to BUILDPLATFORM so the Go toolchain runs natively on the
+# host even when targeting a foreign TARGETPLATFORM.
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26.4-trixie AS builder
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    make \
+    gcc \
+    git \
+    ca-certificates \
+    && apt-get clean
+
+ENV CGO_ENABLED=0
+ENV GOPATH=/go
+ENV GOTOOLCHAIN=auto
+ENV PATH=$PATH:/go/bin
+
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY ../../ .
+
+ARG TARGETOS
+ARG TARGETARCH
+
+ARG VERSION=dev
+ARG GIT_COMMIT=
+ARG BUILD_TIME=
+RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    make soaks3-build VERSION=${VERSION} ${GIT_COMMIT:+GIT_COMMIT=${GIT_COMMIT}} ${BUILD_TIME:+BUILD_TIME=${BUILD_TIME}}
+
+# Runtime stage
+FROM ubuntu:noble
+
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /unbounded/bin
+
+COPY --from=builder /src/bin/soaks3 /unbounded/bin/soaks3
+
+ENV PATH="/unbounded/bin:${PATH}"
+
+WORKDIR /unbounded
+
+# 9300 = Prometheus /metrics endpoint exposed by `soaks3 run`.
+EXPOSE 9300
+
+ENTRYPOINT ["/unbounded/bin/soaks3"]

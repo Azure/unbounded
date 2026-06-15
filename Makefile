@@ -72,6 +72,17 @@ GANTRY_CMD=./cmd/gantry
 GANTRY_IMAGE ?= $(CONTAINER_REGISTRY)/gantry:$(VERSION)
 GANTRY_NAMESPACE ?= gantry
 
+# soaks3 (S3 load generator, developer tooling only). The image is never built
+# for tagged releases; it is published only on demand via the images.yaml
+# workflow (workflow_dispatch / images/soaks3/<version> tag). The deploy
+# manifests are intentionally absent from the release-manifests bundle.
+SOAKS3_BIN=bin/soaks3
+SOAKS3_CMD=./cmd/soaks3
+SOAKS3_IMAGE ?= $(CONTAINER_REGISTRY)/soaks3:$(VERSION)
+SOAKS3_NAMESPACE ?= soaks3
+SOAKS3_MANIFEST_TEMPLATES_DIR := deploy/soaks3
+SOAKS3_MANIFEST_RENDERED_DIR  := deploy/soaks3/rendered
+
 # Rust binaries
 UNBOUNDED_STORAGE_BIN=bin/unbounded-storage
 UNBOUNDED_STORAGE_CRATE=./cmd/unbounded-storage
@@ -267,6 +278,8 @@ help: ## Show this help
 	@echo "  metalman-oci-push                Build metalman image and push"
 	@echo "  image-orca-local                 Build orca image"
 	@echo "  orca-oci-push                    Build orca image and push"
+	@echo "  image-soaks3-local               Build soaks3 dev image (developer tooling)"
+	@echo "  image-soaks3-push                Build and push soaks3 dev image"
 	@echo ""
 	@echo "Net Frontend:"
 	@echo "  net-frontend                     Build frontend into \$$(NET_FRONTEND_DIST_DIR) (cached)"
@@ -296,6 +309,12 @@ help: ## Show this help
 	@echo "  orca-inttest                     Run orca integration tests (Docker required)"
 	@echo "  storage-inttest                  Run unbounded-storage -> orca -> Garage integration test (Docker + sudo)"
 	@echo "  soaks3-inttest                   Run soaks3 integration test (Garage via testcontainers; Docker required)"
+	@echo ""
+	@echo "soaks3 (S3 load generator, developer tooling; not part of releases):"
+	@echo "  soaks3 | soaks3-build            Build soaks3 binary (with/without lint/test)"
+	@echo "  image-soaks3-local               Build soaks3 dev container image"
+	@echo "  image-soaks3-push                Build and push soaks3 dev container image"
+	@echo "  soaks3-manifests                 Render soaks3 dev manifests into deploy/soaks3/rendered"
 	@echo ""
 	@echo "Documentation:"
 	@echo "  docs-serve                       Start local Hugo dev server"
@@ -1014,6 +1033,37 @@ storage-inttest: libfabric unbounded-storage-build ## Run the unbounded-storage 
 	$(GOTEST) -tags=integrationtest,storageboundary -c -o $(STORAGE_INTTEST_BIN) ./internal/orca/inttest/
 	sudo -E env "PATH=$$PATH" "LD_LIBRARY_PATH=$(LIBFABRIC_PREFIX)/lib" \
 		$(STORAGE_INTTEST_BIN) -test.v -test.timeout 30m -test.run '^TestStorageBoundaryThroughOrca$$'
+
+##@ soaks3 (S3 load generator, developer tooling)
+
+.PHONY: soaks3 soaks3-build soaks3-manifests image-soaks3-local image-soaks3-push
+
+soaks3-build: ## Build the soaks3 binary (no lint/test)
+	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(SOAKS3_BIN) $(SOAKS3_CMD)
+
+soaks3: test soaks3-build ## Build soaks3 (implies test)
+
+soaks3-manifests: ## Render soaks3 dev manifests into deploy/soaks3/rendered
+	@mkdir -p $(SOAKS3_MANIFEST_RENDERED_DIR)
+	@find $(SOAKS3_MANIFEST_RENDERED_DIR) -mindepth 1 -not -name .gitignore -delete 2>/dev/null || true
+	$(GOCMD) run ./hack/cmd/render-manifests \
+		--templates-dir $(SOAKS3_MANIFEST_TEMPLATES_DIR) \
+		--output-dir $(SOAKS3_MANIFEST_RENDERED_DIR) \
+		--set Namespace=$(SOAKS3_NAMESPACE) \
+		--set Image=$(SOAKS3_IMAGE)
+	@echo "Rendered soaks3 manifests into $(SOAKS3_MANIFEST_RENDERED_DIR) (image: $(SOAKS3_IMAGE))"
+
+image-soaks3-local: ## Build the soaks3 container image locally (single-arch)
+	$(CONTAINER_ENGINE) build \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
+		--build-arg BUILD_TIME=$(BUILD_TIME) \
+		-t soaks3:$(VERSION) -t $(SOAKS3_IMAGE) \
+		-f ./images/soaks3/Containerfile .
+	$(call trivy-maybe,$(SOAKS3_IMAGE))
+
+image-soaks3-push: image-soaks3-local ## Build and push the soaks3 container image
+	$(CONTAINER_ENGINE) push $(SOAKS3_IMAGE)
 
 # soaks3-inttest mirrors the orca-inttest pattern: race detector in CI
 # (ubuntu-latest has gcc), no -race locally so developers without a C
