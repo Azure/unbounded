@@ -42,7 +42,7 @@ notices:
       - Copyright (c) Microsoft Corporation.
     license:
       - name: MIT License
-        link: https://github.com/Azure/azure-sdk-for-go/blob/sdk/azcore/v1.21.1/LICENSE.txt
+        link: https://github.com/Azure/azure-sdk-for-go/blob/sdk/azcore/v1.22.0/LICENSE.txt
   - dependency: github.com/Azure/azure-sdk-for-go/sdk/azidentity
     ecosystem: go
     copyright:
