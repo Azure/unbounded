@@ -111,22 +111,29 @@ func (m *metrics) serve(addr string) *http.Server {
 	return srv
 }
 
-// snapshot captures cumulative counters at a point in time.
+// snapshot captures cumulative counters at a point in time, including the
+// cumulative latency histogram so callers can derive interval-scoped
+// percentiles by differencing two snapshots.
 type snapshot struct {
 	requests int64
 	errors   int64
 	bytes    int64
 	at       time.Time
+	latency  latencyBuckets
 }
 
 // snapshot returns the current cumulative totals.
 func (m *metrics) snapshot() snapshot {
-	return snapshot{
+	s := snapshot{
 		requests: m.reqTotal.Load(),
 		errors:   m.errTotal.Load(),
 		bytes:    m.byteTotal.Load(),
 		at:       time.Now(),
 	}
+
+	m.sketch.readInto(&s.latency)
+
+	return s
 }
 
 // report prints an interval line describing the delta between prev and the
@@ -146,13 +153,18 @@ func (m *metrics) report(prev snapshot) snapshot {
 	rps := float64(dReq) / elapsed
 	throughput := float64(dBytes) / elapsed
 
+	// Percentiles over just this interval's observations, derived from the
+	// difference of the cumulative histograms, so the reported latency
+	// tracks recent behavior rather than the whole-run aggregate.
+	lat := cur.latency.sub(&prev.latency)
+
 	fmt.Printf("[soaks3] %6.0f req/s  %10s/s  errors=%d  p50=%s p95=%s p99=%s\n",
 		rps,
 		humanize.IBytes(uint64(throughput)),
 		dErr,
-		m.sketch.quantile(0.50),
-		m.sketch.quantile(0.95),
-		m.sketch.quantile(0.99),
+		lat.quantile(0.50),
+		lat.quantile(0.95),
+		lat.quantile(0.99),
 	)
 
 	return cur
@@ -237,12 +249,49 @@ func (s *latencySketch) record(d time.Duration) {
 	s.mu.Unlock()
 }
 
-// quantile returns the approximate q-quantile (0..1) as a Duration.
-func (s *latencySketch) quantile(q float64) time.Duration {
+// readInto copies the current cumulative histogram into dst under the lock.
+func (s *latencySketch) readInto(dst *latencyBuckets) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	dst.buckets = s.buckets
+	dst.count = s.count
+	s.mu.Unlock()
+}
 
-	if s.count == 0 {
+// quantile returns the approximate q-quantile (0..1) of all observations so
+// far as a Duration.
+func (s *latencySketch) quantile(q float64) time.Duration {
+	var b latencyBuckets
+
+	s.readInto(&b)
+
+	return b.quantile(q)
+}
+
+// latencyBuckets is a point-in-time copy of a latency histogram. Differencing
+// two copies yields the observations recorded in the interval between them,
+// which is how the periodic reporter computes interval-scoped percentiles.
+type latencyBuckets struct {
+	buckets [sketchBucketCount]uint64
+	count   uint64
+}
+
+// sub returns the histogram of observations recorded between prev and b.
+func (b *latencyBuckets) sub(prev *latencyBuckets) latencyBuckets {
+	var d latencyBuckets
+
+	for i := range b.buckets {
+		d.buckets[i] = b.buckets[i] - prev.buckets[i]
+	}
+
+	d.count = b.count - prev.count
+
+	return d
+}
+
+// quantile returns the approximate q-quantile (0..1) of the observations in b
+// as a Duration.
+func (b *latencyBuckets) quantile(q float64) time.Duration {
+	if b.count == 0 {
 		return 0
 	}
 
@@ -254,21 +303,21 @@ func (s *latencySketch) quantile(q float64) time.Duration {
 		q = 1
 	}
 
-	target := uint64(q * float64(s.count))
+	target := uint64(q * float64(b.count))
 	if target == 0 {
 		target = 1
 	}
 
 	var cum uint64
 
-	for idx, c := range s.buckets {
+	for idx, c := range b.buckets {
 		cum += c
 		if cum >= target {
 			return time.Duration(bucketValue(idx)) * time.Microsecond
 		}
 	}
 
-	return time.Duration(bucketValue(len(s.buckets)-1)) * time.Microsecond
+	return time.Duration(bucketValue(len(b.buckets)-1)) * time.Microsecond
 }
 
 // bucketIndex maps a microsecond value to its log-linear bucket.

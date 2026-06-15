@@ -136,6 +136,17 @@ func runSeed(ctx context.Context, opts *seedOptions) error {
 		return err
 	}
 
+	// If seeding was interrupted, the on-disk tree only holds a subset of
+	// the objects. Writing a manifest that claims the full count would make
+	// a later `run --manifest` request never-seeded keys (all 404s for the
+	// missing tail), so bail out before writing it.
+	if err := ctx.Err(); err != nil {
+		fmt.Printf("[soaks3] interrupted after %d/%d objects; manifest not written\n",
+			written.Load(), count)
+
+		return err
+	}
+
 	manifestPath := filepath.Join(opts.outDir, manifestName)
 	if err := writeManifest(manifestPath, manifest{
 		Count:      count,
@@ -149,7 +160,7 @@ func runSeed(ctx context.Context, opts *seedOptions) error {
 	fmt.Printf("[soaks3] seeded %d objects in %s (manifest: %s)\n",
 		written.Load(), time.Since(start).Round(time.Millisecond), manifestPath)
 
-	return ctx.Err()
+	return nil
 }
 
 // seedObjects writes all objects concurrently and returns the count written.
