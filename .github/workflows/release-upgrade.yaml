@@ -45,9 +45,13 @@ name: release upgrade
 # --------------
 # The target cluster is configured via the `unbounded-stable` GitHub
 # Environment, which provides:
-#   - secret KUBECONFIG          (raw kubeconfig file contents)
+#   - secret KUBECONFIG                 (raw kubeconfig file contents)
 #   - vars   SITE_NAME, CLUSTER_NODE_CIDR, CLUSTER_POD_CIDR,
-#            SITE_NODE_CIDR, SITE_POD_CIDR, MANAGE_CNI_PLUGIN
+#            SITE_NODE_CIDR, SITE_POD_CIDR, MANAGE_CNI_PLUGIN,
+#            ORCA_AZURE_ACCOUNT, ORCA_AZURE_CONTAINER,
+#            ORCA_AZURE_ENDPOINT
+#   - cluster Secret unbounded-kube/orca-credentials for confidential
+#     Orca values (Azure account key and Garage S3 credentials)
 #
 # To redirect this workflow at a different cluster: create a new
 # Environment (e.g. `unbounded-canary`), set its secrets/vars, change
@@ -449,6 +453,124 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------------------
+  # Deploy Orca (the OCI regional cache) to the integration cluster.
+  #
+  # Orca is deployed separately from the core net/machina manifests: on
+  # unbounded-stable it is a long-running integration-test workload, not
+  # part of the shippable release tarball. release.yaml DOES build and
+  # push the Orca image (<registry>/orca:<tag>), but its manifests plus
+  # the test-only Garage cachestore are deployed here from hack/orca via
+  # hack/orca/deploy-stable.sh.
+  #
+  # Origin is real Azure Blob storage; cachestore is an in-cluster
+  # single-node Garage backed by a PVC. Confidential values (Azure
+  # account key, Garage S3 keys) come from a pre-created orca-credentials
+  # Secret that this workflow never creates or overwrites; the
+  # non-confidential Azure account details come from Environment vars.
+  #
+  # Unlike the #235 machina-config workaround, this job reads its tooling
+  # from the deployed TAG checkout (no sparse-checkout of the default
+  # branch). Re-deploying Orca onto a tag that predates this tooling is
+  # not supported - acceptable for a forward-looking integration cluster.
+  # ---------------------------------------------------------------------------
+  deploy-orca:
+    needs: [resolve, deploy]
+    if: github.repository == 'Azure/unbounded'
+    runs-on: ubuntu-latest
+    environment: unbounded-stable
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+      REGISTRY: ghcr.io/${{ github.repository_owner }}
+      ORCA_AZURE_ACCOUNT: ${{ vars.ORCA_AZURE_ACCOUNT }}
+      ORCA_AZURE_CONTAINER: ${{ vars.ORCA_AZURE_CONTAINER }}
+      ORCA_AZURE_ENDPOINT: ${{ vars.ORCA_AZURE_ENDPOINT }}
+    steps:
+      - name: Validate Orca environment configuration
+        run: |
+          set -euo pipefail
+          missing=()
+          for v in ORCA_AZURE_ACCOUNT ORCA_AZURE_CONTAINER; do
+            if [[ -z "${!v}" ]]; then
+              missing+=("$v")
+            fi
+          done
+          if (( ${#missing[@]} > 0 )); then
+            echo "::error::Missing required Environment variables: ${missing[*]}"
+            echo "::error::Configure with hack/scripts/setup-deploy-environment.sh"
+            exit 1
+          fi
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          # Orca deploy tooling (hack/orca/) is read from the deployed
+          # tag, not the default branch. It is present in every release
+          # cut after this tooling landed.
+          ref: ${{ needs.resolve.outputs.tag }}
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@829323503d1be3d00ca8346e5391ca0b07a9ab0d # v5.1.0
+
+      - name: Write kubeconfig
+        env:
+          KUBECONFIG_CONTENT: ${{ secrets.KUBECONFIG }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${KUBECONFIG_CONTENT}" ]]; then
+            echo "::error::Environment secret KUBECONFIG is empty"
+            exit 1
+          fi
+          umask 077
+          printf '%s' "$KUBECONFIG_CONTENT" > "$RUNNER_TEMP/kubeconfig"
+          echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
+
+      - name: Verify cluster connectivity
+        run: |
+          set -euo pipefail
+          kubectl version
+          kubectl cluster-info
+
+      - name: Verify orca-credentials Secret exists
+        run: |
+          set -euo pipefail
+          if ! kubectl -n unbounded-kube get secret orca-credentials >/dev/null 2>&1; then
+            echo "::error::Secret orca-credentials not found in unbounded-kube; pre-create it with ORCA_AZUREBLOB_ACCOUNT_KEY, ORCA_CACHESTORE_S3_ACCESS_KEY, ORCA_CACHESTORE_S3_SECRET_KEY"
+            exit 1
+          fi
+
+      - name: Deploy Orca
+        run: |
+          set -euo pipefail
+          IMAGE="${REGISTRY,,}/orca:${TAG}"
+          echo "Deploying Orca image: ${IMAGE}"
+          ./hack/orca/deploy-stable.sh \
+            --image "${IMAGE}" \
+            --azure-account "${ORCA_AZURE_ACCOUNT}" \
+            --azure-container "${ORCA_AZURE_CONTAINER}" \
+            --azure-endpoint "${ORCA_AZURE_ENDPOINT}"
+
+      - name: Summarize Orca deploy
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo "## Orca deploy"
+            echo ""
+            echo "- Tag: \`${TAG}\`"
+            echo "- Image: \`${REGISTRY,,}/orca:${TAG}\`"
+            echo "- Environment: \`unbounded-stable\`"
+            echo ""
+            echo '```'
+            kubectl -n unbounded-kube get deploy orca -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
+            kubectl -n unbounded-kube get deploy garage -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
   # Discover smoke tests to run after deploy. Lists hack/release/smoke/*.sh
   # and emits a JSON matrix. If the directory is absent or has no scripts,
   # has_tasks is false and the smoke-tests job is skipped (GitHub Actions
@@ -521,10 +643,11 @@ jobs:
           fi
 
   # ---------------------------------------------------------------------------
-  # Smoke tests. Runs ONCE per deploy. Each task must complete within the
-  # per-task timeout (15 minutes by default below). Long-running validation
-  # is NOT this job's responsibility - rely on the cluster's monitoring
-  # for that.
+  # Smoke tests. Runs ONCE per deploy, after the core release deploy and
+  # Orca integration deploy have both completed. Each task must complete
+  # within the per-task timeout (15 minutes by default below). Long-running
+  # validation is NOT this job's responsibility - rely on the cluster's
+  # monitoring for that.
   #
   # Not to be confused with hack/smoke-metalman.py / hack/smoke-storage.py,
   # which are component-level smoke tests used by CI workflows. Those run
@@ -552,7 +675,7 @@ jobs:
   # See hack/release/smoke/core-namespaces-ready.sh as a template.
   # ---------------------------------------------------------------------------
   smoke-tests:
-    needs: [resolve, deploy, smoke-discover]
+    needs: [resolve, deploy, deploy-orca, smoke-discover]
     if: needs.smoke-discover.outputs.has_tasks == 'true'
     runs-on: ubuntu-latest
     environment: unbounded-stable
