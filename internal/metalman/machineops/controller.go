@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -71,6 +72,7 @@ type Reconciler struct {
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machineoperations/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machines,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machines/status,verbs=get
+// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list
 
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
@@ -543,6 +545,19 @@ func (r *Reconciler) advanceReplace(ctx context.Context, machine *v1alpha3.Machi
 		machine.Status.Operations.RebootCounter >= target.TargetOperations.RebootCounter &&
 		machine.Status.Operations.RepaveCounter >= target.TargetOperations.RepaveCounter &&
 		apimeta.IsStatusConditionTrue(machine.Status.Conditions, v1alpha3.MachineConditionRepaved) {
+		nodeName := nodeNameForMachine(machine)
+		var node corev1.Node
+		if err := r.Get(ctx, client.ObjectKey{Name: nodeName}, &node); err != nil {
+			if apierrors.IsNotFound(err) {
+				target.Stage = v1alpha3.OperationStageWaitingNode
+				target.Message = fmt.Sprintf("waiting for Node %s to exist", nodeName)
+
+				return targetChange{target: target}
+			}
+
+			return targetChange{target: target, err: fmt.Errorf("get Node %s: %w", nodeName, err)}
+		}
+
 		return completeTarget(target, "HostReplace completed", now)
 	}
 
@@ -550,6 +565,14 @@ func (r *Reconciler) advanceReplace(ctx context.Context, machine *v1alpha3.Machi
 	target.Message = "waiting for PXE repave to complete"
 
 	return targetChange{target: target}
+}
+
+func nodeNameForMachine(machine *v1alpha3.Machine) string {
+	if machine.Spec.Kubernetes != nil && machine.Spec.Kubernetes.NodeRef != nil && machine.Spec.Kubernetes.NodeRef.Name != "" {
+		return machine.Spec.Kubernetes.NodeRef.Name
+	}
+
+	return machine.Name
 }
 
 func computeReplaceTargets(machine *v1alpha3.Machine) *v1alpha3.OperationsStatus {

@@ -171,6 +171,124 @@ func TestNoOpWithoutPendingRepave(t *testing.T) {
 	}
 }
 
+func TestCloudInitTimeoutRetriesCompletedRepave(t *testing.T) {
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-cloudinit-timeout", Namespace: "default"},
+		Spec: v1alpha3.MachineSpec{
+			Operations: &v1alpha3.OperationsSpec{
+				RebootCounter: 1,
+				RepaveCounter: 1,
+			},
+		},
+		Status: v1alpha3.MachineStatus{
+			Operations: &v1alpha3.OperationsStatus{
+				RebootCounter: 1,
+				RepaveCounter: 1,
+			},
+			Conditions: []metav1.Condition{
+				{
+					Type:   v1alpha3.MachineConditionRepaved,
+					Status: metav1.ConditionTrue,
+					Reason: "Succeeded",
+				},
+				{
+					Type:   v1alpha3.MachineConditionCloudInitDone,
+					Status: metav1.ConditionUnknown,
+					Reason: "TimedOut",
+				},
+			},
+		},
+	}
+
+	scheme := testScheme(t)
+	fc := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(node).
+		WithStatusSubresource(node).
+		Build()
+
+	reconciler := &Reconciler{Client: fc}
+	ctx := t.Context()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "node-cloudinit-timeout", Namespace: "default"}}
+
+	_, err := reconciler.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	var updated v1alpha3.Machine
+	if err := fc.Get(ctx, req.NamespacedName, &updated); err != nil {
+		t.Fatal(err)
+	}
+
+	if updated.Status.Operations.RebootCounter != 0 {
+		t.Fatalf("expected rebootCounter=0 after cloud-init timeout retry, got %d", updated.Status.Operations.RebootCounter)
+	}
+
+	if updated.Status.Operations.RepaveCounter != 0 {
+		t.Fatalf("expected repaveCounter=0 after cloud-init timeout retry, got %d", updated.Status.Operations.RepaveCounter)
+	}
+
+	repavedCond := meta.FindStatusCondition(updated.Status.Conditions, v1alpha3.MachineConditionRepaved)
+	if repavedCond != nil {
+		t.Fatalf("expected Repaved condition to be removed, got %+v", repavedCond)
+	}
+
+	cloudInitCond := meta.FindStatusCondition(updated.Status.Conditions, v1alpha3.MachineConditionCloudInitDone)
+	if cloudInitCond != nil {
+		t.Fatalf("expected CloudInitDone condition to be removed, got %+v", cloudInitCond)
+	}
+}
+
+func TestCloudInitTimeoutDoesNotRetryPendingRepaveAgain(t *testing.T) {
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-cloudinit-pending", Namespace: "default"},
+		Spec: v1alpha3.MachineSpec{
+			Operations: &v1alpha3.OperationsSpec{
+				RebootCounter: 1,
+				RepaveCounter: 1,
+			},
+		},
+		Status: v1alpha3.MachineStatus{
+			Operations: &v1alpha3.OperationsStatus{},
+			Conditions: []metav1.Condition{
+				{
+					Type:   v1alpha3.MachineConditionCloudInitDone,
+					Status: metav1.ConditionUnknown,
+					Reason: "TimedOut",
+				},
+			},
+		},
+	}
+
+	scheme := testScheme(t)
+	fc := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(node).
+		WithStatusSubresource(node).
+		Build()
+
+	reconciler := &Reconciler{Client: fc}
+	ctx := t.Context()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "node-cloudinit-pending", Namespace: "default"}}
+
+	_, err := reconciler.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	var updated v1alpha3.Machine
+	if err := fc.Get(ctx, req.NamespacedName, &updated); err != nil {
+		t.Fatal(err)
+	}
+
+	if updated.Status.Operations.RebootCounter != 0 {
+		t.Fatalf("expected rebootCounter unchanged at 0, got %d", updated.Status.Operations.RebootCounter)
+	}
+
+	if updated.Status.Operations.RepaveCounter != 0 {
+		t.Fatalf("expected repaveCounter unchanged at 0, got %d", updated.Status.Operations.RepaveCounter)
+	}
+}
+
 func TestNoOpWhenRepaveSucceeded(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-succeeded", Namespace: "default"},
