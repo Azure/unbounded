@@ -2,7 +2,8 @@
 // Licensed under the MIT License.
 
 // notice generates and verifies the project's NOTICE file from the direct
-// dependencies declared in go.mod and frontend/package.json.
+// dependencies declared in go.mod and frontend/package.json, plus third-party
+// assets vendored directly into the repo (hack/cmd/notice/vendored-assets.yaml).
 //
 // Subcommands:
 //
@@ -24,6 +25,7 @@ import (
 	"github.com/Azure/unbounded/hack/cmd/notice/internal/gomod"
 	"github.com/Azure/unbounded/hack/cmd/notice/internal/notice"
 	"github.com/Azure/unbounded/hack/cmd/notice/internal/npm"
+	"github.com/Azure/unbounded/hack/cmd/notice/internal/vendored"
 )
 
 // collectors is the explicit list of ecosystems the tool knows about. To
@@ -32,6 +34,7 @@ func collectors() []notice.Collector {
 	return []notice.Collector{
 		gomod.New(),
 		npm.New(),
+		vendored.New(),
 	}
 }
 
@@ -68,7 +71,7 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `Usage: notice <subcommand> [flags]
 
 Subcommands:
-  generate   Render NOTICE from go.mod and frontend/package.json.
+  generate   Render NOTICE from go.mod, frontend/package.json, and vendored-assets.yaml.
   check      Verify on-disk NOTICE matches what would be rendered.
 
 Common flags (defaults shown):

@@ -1,0 +1,25 @@
+# Attribution for third-party assets vendored directly into the repository
+# (not pulled through go.mod or npm). Consumed by hack/cmd/notice via the
+# "vendored" collector and rendered into NOTICE. Run `make notice` after edits.
+#
+# Currently covers the web assets embedded into the dashboard binary under
+# internal/dashboard/server/static/assets.
+assets:
+  - dependency: bootstrap
+    copyright:
+      - Copyright (c) 2011-2024 The Bootstrap Authors
+    license:
+      - name: MIT License
+        link: https://github.com/twbs/bootstrap/blob/v5.3.3/LICENSE
+  - dependency: htmx.org
+    copyright:
+      - Copyright (c) 2020 Big Sky Software
+    license:
+      - name: BSD 2-Clause "Simplified" License
+        link: https://github.com/bigskysoftware/htmx/blob/v2.0.3/LICENSE
+  - dependency: htmx-ext-sse
+    copyright:
+      - Copyright (c) 2020 Big Sky Software
+    license:
+      - name: BSD 2-Clause "Simplified" License
+        link: https://github.com/bigskysoftware/htmx-extensions/blob/main/LICENSE

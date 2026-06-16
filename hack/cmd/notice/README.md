@@ -1,7 +1,9 @@
 # notice
 
 Generates and verifies the project's `NOTICE` file from the direct dependencies
-declared in `go.mod` and `frontend/package.json`.
+declared in `go.mod` and `frontend/package.json`, plus third-party assets
+vendored directly into the repository and listed in
+`hack/cmd/notice/vendored-assets.yaml`.
 
 ## Usage
 
@@ -42,6 +44,8 @@ hack/cmd/notice/
     gomod/                 # Collector for go.mod direct deps; Go vanity-domain
                            # repo-base heuristics.
     npm/                   # Collector for frontend/package.json direct deps.
+    vendored/              # Collector for repo-vendored assets declared in
+                           # hack/cmd/notice/vendored-assets.yaml.
     testutil/              # WriteTree + canonical license-text fixtures.
 ```
 
