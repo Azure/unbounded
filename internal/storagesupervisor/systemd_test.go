@@ -85,41 +85,41 @@ func TestRenderUnit(t *testing.T) {
 	cfg := Config{
 		Repo:        "Azure/unbounded-kube",
 		Prefix:      "/opt/unbounded-storage",
-		ConfigPath:  "/etc/unbounded-storage/config.toml",
+		ConfigPath:  "/etc/unbounded-storage/config.binpb",
 		ServiceName: "unbounded-storage",
 		PoolBytes:   defaultPoolBytes,
 	}
 
 	unit := renderUnit(cfg)
 
-	assert.Contains(t, unit, "ExecStart=/opt/unbounded-storage/current/bin/unbounded-storage --config /etc/unbounded-storage/config.toml")
+	assert.Contains(t, unit, "ExecStart=/opt/unbounded-storage/current/bin/unbounded-storage --config /etc/unbounded-storage/config.binpb")
 	assert.Contains(t, unit, "Environment=LD_LIBRARY_PATH=/opt/unbounded-storage/current/lib")
 	assert.Contains(t, unit, "Documentation=https://github.com/Azure/unbounded-kube")
 	assert.Contains(t, unit, "LimitMEMLOCK=infinity")
 	assert.Contains(t, unit, "Restart=always")
 	assert.Contains(t, unit, "WantedBy=multi-user.target")
 	// No extra storage args appended.
-	assert.NotContains(t, unit, "config.toml --")
+	assert.NotContains(t, unit, "config.binpb --")
 }
 
 func TestRenderUnitWithStorageArgs(t *testing.T) {
 	cfg := Config{
 		Repo:        "Azure/unbounded-kube",
 		Prefix:      "/opt/unbounded-storage",
-		ConfigPath:  "/etc/unbounded-storage/config.toml",
+		ConfigPath:  "/etc/unbounded-storage/config.binpb",
 		StorageArgs: "--log-level debug",
 	}
 
 	unit := renderUnit(cfg)
 
-	assert.Contains(t, unit, "ExecStart=/opt/unbounded-storage/current/bin/unbounded-storage --config /etc/unbounded-storage/config.toml --log-level debug")
+	assert.Contains(t, unit, "ExecStart=/opt/unbounded-storage/current/bin/unbounded-storage --config /etc/unbounded-storage/config.binpb --log-level debug")
 }
 
 func TestRenderUnitHugepageOverride(t *testing.T) {
 	cfg := Config{
 		Repo:       "Azure/unbounded-kube",
 		Prefix:     "/opt/unbounded-storage",
-		ConfigPath: "/etc/unbounded-storage/config.toml",
+		ConfigPath: "/etc/unbounded-storage/config.binpb",
 		PoolBytes:  defaultPoolBytes,
 		Hugepages:  256,
 	}
@@ -133,7 +133,7 @@ func TestWriteUnit(t *testing.T) {
 	cfg := Config{
 		Repo:        "Azure/unbounded-kube",
 		Prefix:      "/opt/unbounded-storage",
-		ConfigPath:  "/etc/unbounded-storage/config.toml",
+		ConfigPath:  "/etc/unbounded-storage/config.binpb",
 		ServiceName: "unbounded-storage",
 		PoolBytes:   defaultPoolBytes,
 		HostRoot:    hostRoot,

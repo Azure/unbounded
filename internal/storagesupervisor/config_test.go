@@ -17,7 +17,7 @@ func clearConfigEnv(t *testing.T) {
 
 	for _, name := range []string{
 		"REPO", "VERSION", "PREFIX", "SERVICE_NAME", "CONFIG_PATH",
-		"STORAGE_ARGS", "HOST_ROOT", "SYSTEMCTL", "SOURCE", "LOCAL_TARBALL",
+		"CONFIG_SOURCE_DIR", "STORAGE_ARGS", "HOST_ROOT", "SYSTEMCTL", "SOURCE", "LOCAL_TARBALL",
 		"NO_ENABLE", "ARCH", "POOL_BYTES", "HUGEPAGES",
 	} {
 		t.Setenv(name, "")
@@ -36,6 +36,7 @@ func TestLoadConfigDefaults(t *testing.T) {
 	assert.Equal(t, defaultPrefix, cfg.Prefix)
 	assert.Equal(t, defaultServiceName, cfg.ServiceName)
 	assert.Equal(t, defaultConfigPath, cfg.ConfigPath)
+	assert.Equal(t, defaultSourceDir, cfg.SourceDir)
 	assert.Equal(t, defaultHostRoot, cfg.HostRoot)
 	assert.Equal(t, []string{"systemctl"}, cfg.Systemctl)
 	assert.Equal(t, "amd64", cfg.Arch)
@@ -51,7 +52,8 @@ func TestLoadConfigOverrides(t *testing.T) {
 	t.Setenv("VERSION", "v1.2.3")
 	t.Setenv("PREFIX", "/srv/storage")
 	t.Setenv("SERVICE_NAME", "mystorage")
-	t.Setenv("CONFIG_PATH", "/etc/mystorage/cfg.toml")
+	t.Setenv("CONFIG_PATH", "/etc/mystorage/cfg.binpb")
+	t.Setenv("CONFIG_SOURCE_DIR", "/etc/mystorage-source")
 	t.Setenv("STORAGE_ARGS", "--verbose --foo bar")
 	t.Setenv("HOST_ROOT", "/host")
 	t.Setenv("SYSTEMCTL", "nsenter -t 1 -m systemctl")
@@ -67,7 +69,8 @@ func TestLoadConfigOverrides(t *testing.T) {
 	assert.Equal(t, "v1.2.3", cfg.Version)
 	assert.Equal(t, "/srv/storage", cfg.Prefix)
 	assert.Equal(t, "mystorage", cfg.ServiceName)
-	assert.Equal(t, "/etc/mystorage/cfg.toml", cfg.ConfigPath)
+	assert.Equal(t, "/etc/mystorage/cfg.binpb", cfg.ConfigPath)
+	assert.Equal(t, "/etc/mystorage-source", cfg.SourceDir)
 	assert.Equal(t, "--verbose --foo bar", cfg.StorageArgs)
 	assert.Equal(t, "/host", cfg.HostRoot)
 	assert.Equal(t, []string{"nsenter", "-t", "1", "-m", "systemctl"}, cfg.Systemctl)

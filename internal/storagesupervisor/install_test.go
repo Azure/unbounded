@@ -24,7 +24,7 @@ func fileModeConfig(t *testing.T, hostRoot, archive string) Config {
 		Version:     "v1.0.0",
 		Prefix:      "/opt/unbounded-storage",
 		ServiceName: "unbounded-storage",
-		ConfigPath:  "/etc/unbounded-storage/config.toml",
+		ConfigPath:  "/etc/unbounded-storage/config.binpb",
 		Arch:        "amd64",
 		PoolBytes:   defaultPoolBytes,
 		Source:      archive,

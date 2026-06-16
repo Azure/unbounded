@@ -25,7 +25,8 @@ const (
 	defaultVersion     = "latest"
 	defaultPrefix      = "/opt/unbounded-storage"
 	defaultServiceName = "unbounded-storage"
-	defaultConfigPath  = "/etc/unbounded-storage/config.toml"
+	defaultConfigPath  = "/etc/unbounded-storage/config.binpb"
+	defaultSourceDir   = "/etc/unbounded-storage-source"
 	defaultSystemctl   = "systemctl"
 	defaultHostRoot    = "/"
 
@@ -60,8 +61,15 @@ type Config struct {
 	Prefix string
 	// ServiceName is the systemd service name (without the .service suffix).
 	ServiceName string
-	// ConfigPath is the host-absolute path to the daemon config file.
+	// ConfigPath is the host-absolute path to the daemon config file. The
+	// daemon selects its decoder by extension: a ".binpb" path (the default)
+	// is decoded as binary protobuf, which is what the run supervisor renders;
+	// any other extension is parsed as strict TOML.
 	ConfigPath string
+	// SourceDir is the host/container path where the cluster ConfigMap is
+	// projected one file per dotted key. The run supervisor reads these and
+	// renders ConfigPath; install does not use it.
+	SourceDir string
 	// StorageArgs are extra arguments appended to the daemon ExecStart line.
 	StorageArgs string
 	// Arch is the normalized target architecture ("amd64" or "arm64").
@@ -102,6 +110,7 @@ func LoadConfig() (Config, error) {
 		Prefix:      envOr("PREFIX", defaultPrefix),
 		ServiceName: envOr("SERVICE_NAME", defaultServiceName),
 		ConfigPath:  envOr("CONFIG_PATH", defaultConfigPath),
+		SourceDir:   envOr("CONFIG_SOURCE_DIR", defaultSourceDir),
 		StorageArgs: os.Getenv("STORAGE_ARGS"),
 		HostRoot:    envOr("HOST_ROOT", defaultHostRoot),
 		Systemctl:   strings.Fields(envOr("SYSTEMCTL", defaultSystemctl)),

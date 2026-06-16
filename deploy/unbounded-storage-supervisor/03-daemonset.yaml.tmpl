@@ -79,7 +79,7 @@ spec:
             - name: storage-config
               mountPath: /etc/unbounded-storage
             # Startup-tuning defaults projected one file per property. The run
-            # supervisor reads these and renders the host config.toml; it is a
+            # supervisor reads these and renders the host config.binpb; it is a
             # separate path from the host config mount above so they never
             # overlay each other.
             - name: config-source

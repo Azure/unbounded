@@ -11,8 +11,6 @@
 //     unbounded-storage daemon on the host.
 //   - run: the runtime-container role. It supervises the installed daemon for
 //     the lifetime of the pod.
-//
-// Both subcommands are scaffolding for now and will be built out later.
 package main
 
 import (
@@ -78,22 +76,25 @@ func installCmd() *cobra.Command {
 	}
 }
 
-// runCmd is the runtime-container entrypoint. For now it is a stub that blocks
-// until the process is signaled; it will later supervise the daemon.
+// runCmd is the runtime-container entrypoint. It loads configuration from the
+// environment, renders the projected ConfigMap into the daemon's config file,
+// and supervises it (re-rendering on change) until the process is signaled.
 func runCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "run",
 		Short: "Supervise the installed unbounded-storage daemon",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			slog.Info("hello from unbounded-storage-supervisor run", "version", version.String())
+			slog.Info("unbounded-storage-supervisor run", "version", version.String())
+
+			cfg, err := storagesupervisor.LoadConfig()
+			if err != nil {
+				return err
+			}
 
 			ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 			defer stop()
 
-			<-ctx.Done()
-			slog.Info("shutting down")
-
-			return nil
+			return storagesupervisor.Run(ctx, cfg)
 		},
 	}
 }
