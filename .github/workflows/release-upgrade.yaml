@@ -453,7 +453,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------------------
-  # Deploy Orca (the OCI regional cache) to the integration cluster.
+  # Deploy Orca (the origin cache) to the integration cluster.
   #
   # Orca is deployed separately from the core net/machina manifests: on
   # unbounded-stable it is a long-running integration-test workload, not
