@@ -1,0 +1,11 @@
+{{- /*
+Copyright (c) Microsoft Corporation.
+Licensed under the MIT License.
+*/ -}}
+{{define "title"}}Error{{end}}
+{{define "content"}}
+<div class="alert alert-danger">
+  <h1 class="h4">{{.Data.Title}}</h1>
+  <p class="mb-0">{{.Data.Message}}</p>
+</div>
+{{end}}

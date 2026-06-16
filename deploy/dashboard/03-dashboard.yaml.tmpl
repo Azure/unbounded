@@ -1,0 +1,92 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: unbounded-dashboard
+  namespace: {{ default "unbounded-dashboard" .Namespace }}
+  labels:
+    app.kubernetes.io/name: unbounded-dashboard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: unbounded-dashboard
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: unbounded-dashboard
+    spec:
+      serviceAccountName: unbounded-dashboard
+      containers:
+        - name: dashboard
+          image: {{ default "ghcr.io/azure/dashboard:latest" .DashboardImage | quote }}
+          imagePullPolicy: {{ default "IfNotPresent" .ImagePullPolicy }}
+          args:
+            - --addr=:8080
+            - --modules-config=/etc/unbounded-dashboard/modules.yaml
+            # Prototype default: authorization disabled. Switch to --auth-mode=sar
+            # (and ensure the ClusterRole in 01-rbac is bound) to enforce RBAC.
+            - --auth-mode=none
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65534
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: modules
+              mountPath: /etc/unbounded-dashboard
+              readOnly: true
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        - name: modules
+          configMap:
+            name: unbounded-dashboard-modules
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: unbounded-dashboard
+  namespace: {{ default "unbounded-dashboard" .Namespace }}
+  labels:
+    app.kubernetes.io/name: unbounded-dashboard
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: unbounded-dashboard
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP

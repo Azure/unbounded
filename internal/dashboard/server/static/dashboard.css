@@ -1,0 +1,24 @@
+/*
+ * Copyright (c) Microsoft Corporation.
+ * Licensed under the MIT License.
+ *
+ * Minimal Unbounded identity layer on top of Bootstrap 5. Status colours map
+ * to the contract.Health classifications used across all modules.
+ */
+
+.ub-navbar {
+  background-color: #1b2a4a;
+}
+
+.ub-navbar .navbar-brand {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.card .display-6 {
+  font-weight: 600;
+}
+
+.breadcrumb {
+  --bs-breadcrumb-divider: '>';
+}

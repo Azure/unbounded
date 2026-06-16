@@ -1,0 +1,60 @@
+{{- /*
+Copyright (c) Microsoft Corporation.
+Licensed under the MIT License.
+*/ -}}
+{{define "title"}}{{.Data.Detail.Title}}{{end}}
+{{define "content"}}
+<nav aria-label="breadcrumb">
+  <ol class="breadcrumb">
+    <li class="breadcrumb-item"><a href="/modules/{{.Data.ModuleID}}">{{.Data.ModuleTitle}}</a></li>
+    <li class="breadcrumb-item"><a href="/modules/{{.Data.ModuleID}}/resources/{{.Data.Detail.Kind}}">{{.Data.Detail.Kind}}</a></li>
+    <li class="breadcrumb-item active">{{.Data.Detail.Name}}</li>
+  </ol>
+</nav>
+<div class="d-flex align-items-center mb-4">
+  <h1 class="h3 mb-0">{{.Data.Detail.Title}}</h1>
+  <span class="ms-3">{{template "badge" .Data.Detail.Health}}</span>
+</div>
+
+{{- range .Data.Detail.Sections}}
+<div class="card mb-3">
+  <div class="card-header">{{.Title}}</div>
+  <ul class="list-group list-group-flush">
+    {{- range .Fields}}
+    <li class="list-group-item d-flex justify-content-between">
+      <span class="text-muted">{{.Label}}</span>
+      <span class="text-{{healthClass .Health}}">{{.Value}}</span>
+    </li>
+    {{- end}}
+  </ul>
+</div>
+{{- end}}
+
+{{- if .Data.Detail.Actions}}
+<h2 class="h5 mt-4">Actions</h2>
+{{- range .Data.Detail.Actions}}
+<form class="card mb-3" method="post" action="/modules/{{$.Data.ModuleID}}/actions/{{.ID}}">
+  <div class="card-body">
+    <h3 class="h6">{{.Title}}</h3>
+    {{- if .Description}}<p class="text-muted small">{{.Description}}</p>{{end}}
+    <input type="hidden" name="_return" value="/modules/{{$.Data.ModuleID}}/resources/{{$.Data.Detail.Kind}}/{{$.Data.Detail.Name}}">
+    {{- range .Fields}}
+    <div class="mb-2">
+      <label class="form-label">{{.Label}}</label>
+      {{- if eq .Type "select"}}
+      <select class="form-select" name="{{.Name}}">
+        {{- range .Options}}<option value="{{.}}">{{.}}</option>{{end}}
+      </select>
+      {{- else if eq .Type "checkbox"}}
+      <input class="form-check-input d-block" type="checkbox" name="{{.Name}}" value="true">
+      {{- else}}
+      <input class="form-control" type="{{if .Type}}{{.Type}}{{else}}text{{end}}" name="{{.Name}}" value="{{.Default}}"{{if .Required}} required{{end}}>
+      {{- end}}
+    </div>
+    {{- end}}
+    <button class="btn btn-primary btn-sm" type="submit">{{.Title}}</button>
+  </div>
+</form>
+{{- end}}
+{{- end}}
+{{end}}

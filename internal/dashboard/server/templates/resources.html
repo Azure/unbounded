@@ -1,0 +1,43 @@
+{{- /*
+Copyright (c) Microsoft Corporation.
+Licensed under the MIT License.
+*/ -}}
+{{define "title"}}{{.Data.List.Title}}{{end}}
+{{define "content"}}
+<nav aria-label="breadcrumb">
+  <ol class="breadcrumb">
+    <li class="breadcrumb-item"><a href="/modules/{{.Data.ModuleID}}">{{.Data.ModuleTitle}}</a></li>
+    <li class="breadcrumb-item active">{{.Data.List.Title}}</li>
+  </ol>
+</nav>
+<h1 class="h3 mb-4">{{.Data.List.Title}}</h1>
+{{- if not .Data.List.Rows}}
+<div class="alert alert-secondary">No resources of this kind.</div>
+{{- else}}
+<table class="table table-hover">
+  <thead>
+    <tr>
+      <th></th>
+      {{- range .Data.List.Columns}}<th>{{.Title}}</th>{{end}}
+    </tr>
+  </thead>
+  <tbody>
+    {{- $kind := .Data.List.Kind}}
+    {{- $mod := .Data.ModuleID}}
+    {{- $cols := .Data.List.Columns}}
+    {{- range .Data.List.Rows}}
+    <tr>
+      <td>{{template "badge" .Health}}</td>
+      {{- $row := .}}
+      {{- range $cols}}
+      <td>
+        {{- if eq .Key "name"}}<a href="/modules/{{$mod}}/resources/{{$kind}}/{{$row.Name}}">{{index $row.Cells .Key}}</a>
+        {{- else}}{{index $row.Cells .Key}}{{end}}
+      </td>
+      {{- end}}
+    </tr>
+    {{- end}}
+  </tbody>
+</table>
+{{- end}}
+{{end}}

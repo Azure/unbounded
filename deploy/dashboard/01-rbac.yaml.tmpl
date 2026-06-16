@@ -1,0 +1,43 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: unbounded-dashboard
+  namespace: {{ default "unbounded-dashboard" .Namespace }}
+  labels:
+    app.kubernetes.io/name: unbounded-dashboard
+
+---
+# ClusterRole allowing the dashboard to perform SubjectAccessReviews. This is
+# required when running with --auth-mode=sar so the dashboard can delegate
+# authorization decisions to Kubernetes RBAC. It is harmless (unused) in the
+# default --auth-mode=none prototype configuration.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: unbounded-dashboard
+  labels:
+    app.kubernetes.io/name: unbounded-dashboard
+rules:
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["subjectaccessreviews"]
+    verbs: ["create"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: unbounded-dashboard
+  labels:
+    app.kubernetes.io/name: unbounded-dashboard
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: unbounded-dashboard
+subjects:
+  - kind: ServiceAccount
+    name: unbounded-dashboard
+    namespace: {{ default "unbounded-dashboard" .Namespace }}

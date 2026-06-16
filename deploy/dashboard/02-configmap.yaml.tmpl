@@ -1,0 +1,19 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+---
+# Static module registry consumed by the dashboard. For the prototype it points
+# at the bundled example module. Real components (net, storage, gantry, ...) are
+# added here as additional entries; runtime discovery is a future evolution.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: unbounded-dashboard-modules
+  namespace: {{ default "unbounded-dashboard" .Namespace }}
+  labels:
+    app.kubernetes.io/name: unbounded-dashboard
+data:
+  modules.yaml: |
+    modules:
+      - id: example
+        baseURL: http://dashboard-example.{{ default "unbounded-dashboard" .Namespace }}.svc:8090/dashboard/v1

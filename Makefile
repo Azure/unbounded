@@ -72,6 +72,21 @@ GANTRY_CMD=./cmd/gantry
 GANTRY_IMAGE ?= $(CONTAINER_REGISTRY)/gantry:$(VERSION)
 GANTRY_NAMESPACE ?= gantry
 
+# Dashboard (management dashboard prototype) and its example module.
+DASHBOARD_BIN=bin/dashboard
+DASHBOARD_CMD=./cmd/dashboard
+DASHBOARD_IMAGE ?= $(CONTAINER_REGISTRY)/dashboard:$(VERSION)
+DASHBOARD_EXAMPLE_BIN=bin/dashboard-example
+DASHBOARD_EXAMPLE_CMD=./cmd/dashboard-example
+DASHBOARD_EXAMPLE_IMAGE ?= $(CONTAINER_REGISTRY)/dashboard-example:$(VERSION)
+DASHBOARD_NAMESPACE ?= unbounded-dashboard
+DASHBOARD_MANIFEST_TEMPLATES_DIR := deploy/dashboard
+DASHBOARD_MANIFEST_RENDERED_DIR  := deploy/dashboard/rendered
+# Local quickstart (make dashboard-run) knobs.
+DASHBOARD_ADDR ?= :8080
+DASHBOARD_EXAMPLE_ADDR ?= :8090
+DASHBOARD_AUTH_MODE ?= none
+
 # Rust binaries
 UNBOUNDED_STORAGE_BIN=bin/unbounded-storage
 UNBOUNDED_STORAGE_CRATE=./cmd/unbounded-storage
@@ -180,6 +195,7 @@ REACT_DEV ?= false
 
 .PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check gantry gantry-build
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-manifests
+.PHONY: dashboard dashboard-build dashboard-example dashboard-example-build dashboard-run dashboard-manifests image-dashboard-local image-dashboard-push image-dashboard-example-local image-dashboard-example-push
 .PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
 .PHONY: unbounded-storage unbounded-storage-build unbounded-storage-smoke unbounded-storage-tarball unbounded-storage-push bench unbounded-storage-test unbounded-storage-check unbounded-storage-model-check libfabric
@@ -229,6 +245,9 @@ help: ## Show this help
 	@echo "  unbounded-net-routeplan-debug    Build net routeplan debug tool"
 	@echo "  unping                           Build unping health-check utility"
 	@echo "  unroute                          Build unroute eBPF inspection utility"
+	@echo "  dashboard | dashboard-build      Build the management dashboard (prototype)"
+	@echo "  dashboard-example                Build the example dashboard module (prototype)"
+	@echo "  dashboard-run                    Run dashboard + example locally (http://localhost:8080)"
 	@echo ""
 	@echo "Rust Binaries:"
 	@echo "  unbounded-storage | unbounded-storage-build  Build unbounded-storage (with/without test)"
@@ -537,6 +556,63 @@ gantry-build: ## Build the gantry binary (no lint/test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(GANTRY_BIN) $(GANTRY_CMD)
 
 gantry: test gantry-build ## Build gantry (implies test)
+
+##@ Dashboard (management dashboard prototype)
+
+dashboard-build: ## Build the dashboard binary (no lint/test)
+	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(DASHBOARD_BIN) $(DASHBOARD_CMD)
+
+dashboard: test dashboard-build ## Build the dashboard (implies test)
+
+dashboard-example-build: ## Build the dashboard-example module binary (no lint/test)
+	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(DASHBOARD_EXAMPLE_BIN) $(DASHBOARD_EXAMPLE_CMD)
+
+dashboard-example: test dashboard-example-build ## Build the dashboard-example module (implies test)
+
+dashboard-run: dashboard-build dashboard-example-build ## Run dashboard + example locally (foreground; Ctrl-C to stop)
+	@mkdir -p tmp/dashboard
+	@printf 'modules:\n  - id: example\n    baseURL: http://127.0.0.1%s/dashboard/v1\n' "$(DASHBOARD_EXAMPLE_ADDR)" > tmp/dashboard/modules.yaml
+	@echo "Starting dashboard-example on $(DASHBOARD_EXAMPLE_ADDR) and dashboard on $(DASHBOARD_ADDR)"
+	@echo "Open http://localhost$(DASHBOARD_ADDR)  (Ctrl-C to stop both)"
+	@$(DASHBOARD_EXAMPLE_BIN) --addr=$(DASHBOARD_EXAMPLE_ADDR) & \
+		example_pid=$$!; \
+		trap 'kill $$example_pid 2>/dev/null' EXIT INT TERM; \
+		$(DASHBOARD_BIN) --addr=$(DASHBOARD_ADDR) --modules-config=tmp/dashboard/modules.yaml --auth-mode=$(DASHBOARD_AUTH_MODE)
+
+image-dashboard-local: ## Build the dashboard container image locally (single-arch)
+	$(CONTAINER_ENGINE) build \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
+		--build-arg BUILD_TIME=$(BUILD_TIME) \
+		-t dashboard:$(VERSION) -t $(DASHBOARD_IMAGE) \
+		-f ./images/dashboard/Containerfile .
+	$(call trivy-maybe,$(DASHBOARD_IMAGE))
+
+image-dashboard-push: image-dashboard-local ## Build and push the dashboard container image
+	$(CONTAINER_ENGINE) push $(DASHBOARD_IMAGE)
+
+image-dashboard-example-local: ## Build the dashboard-example container image locally (single-arch)
+	$(CONTAINER_ENGINE) build \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
+		--build-arg BUILD_TIME=$(BUILD_TIME) \
+		-t dashboard-example:$(VERSION) -t $(DASHBOARD_EXAMPLE_IMAGE) \
+		-f ./images/dashboard-example/Containerfile .
+	$(call trivy-maybe,$(DASHBOARD_EXAMPLE_IMAGE))
+
+image-dashboard-example-push: image-dashboard-example-local ## Build and push the dashboard-example container image
+	$(CONTAINER_ENGINE) push $(DASHBOARD_EXAMPLE_IMAGE)
+
+dashboard-manifests: ## Render dashboard prototype manifests into deploy/dashboard/rendered
+	@mkdir -p $(DASHBOARD_MANIFEST_RENDERED_DIR)
+	@find $(DASHBOARD_MANIFEST_RENDERED_DIR) -mindepth 1 -not -name .gitignore -delete 2>/dev/null || true
+	$(GOCMD) run ./hack/cmd/render-manifests \
+		--templates-dir $(DASHBOARD_MANIFEST_TEMPLATES_DIR) \
+		--output-dir $(DASHBOARD_MANIFEST_RENDERED_DIR) \
+		--set Namespace=$(DASHBOARD_NAMESPACE) \
+		--set DashboardImage=$(DASHBOARD_IMAGE) \
+		--set ExampleImage=$(DASHBOARD_EXAMPLE_IMAGE)
+	@echo "Rendered dashboard manifests into $(DASHBOARD_MANIFEST_RENDERED_DIR)"
 
 ##@ Rust Binaries
 
