@@ -23,6 +23,9 @@ rules:
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["get", "create", "update"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
   # Bootstrap token creation (scoped to metalman-bootstrap SA)
   - apiGroups: [""]
     resources: ["serviceaccounts/token"]
