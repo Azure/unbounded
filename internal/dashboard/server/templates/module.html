@@ -1,0 +1,52 @@
+{{- /*
+Copyright (c) Microsoft Corporation.
+Licensed under the MIT License.
+*/ -}}
+{{define "title"}}{{.Data.Manifest.Title}}{{end}}
+{{define "content"}}
+<div class="d-flex align-items-center mb-4">
+  <h1 class="h3 mb-0">{{.Data.Manifest.Title}}</h1>
+  {{- if .Data.Summary}}<span class="ms-3">{{template "badge" .Data.Summary.Health}}</span>{{end}}
+</div>
+
+{{- if .Data.Error}}
+<div class="alert alert-danger">Module unreachable: {{.Data.Error}}</div>
+{{- else}}
+
+{{- with .Data.Summary}}
+{{- if .Message}}<p class="lead">{{.Message}}</p>{{end}}
+
+<div class="row mb-4"
+  {{- if $.Data.Stream}} hx-ext="sse" sse-connect="{{$.Data.Stream}}"{{end}}>
+  {{- range .Metrics}}
+  <div class="col-md-3 mb-3">
+    <div class="card text-center border-{{healthClass .Health}}">
+      <div class="card-body">
+        <div class="display-6">{{.Value}}{{if .Unit}} <small class="text-muted fs-6">{{.Unit}}</small>{{end}}</div>
+        <div class="text-muted">{{.Label}}</div>
+      </div>
+    </div>
+  </div>
+  {{- end}}
+</div>
+
+{{- range .Alerts}}
+<div class="alert alert-{{healthClass .Health}}">
+  <strong>{{.Title}}</strong>
+  {{- if .Detail}} - {{.Detail}}{{end}}
+  {{- if .Source}}<span class="float-end small text-muted">{{.Source}}</span>{{end}}
+</div>
+{{- end}}
+{{- end}}
+
+{{- if .Data.Manifest.ResourceKinds}}
+<h2 class="h5 mt-4">Resources</h2>
+<ul class="list-inline">
+  {{- range .Data.Manifest.ResourceKinds}}
+  <li class="list-inline-item"><a class="btn btn-outline-primary btn-sm" href="/modules/{{$.Data.Manifest.ID}}/resources/{{.Kind}}">{{.Title}}</a></li>
+  {{- end}}
+</ul>
+{{- end}}
+
+{{- end}}
+{{end}}

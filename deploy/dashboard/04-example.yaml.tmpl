@@ -1,0 +1,77 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+---
+# The example module is a self-contained component used to exercise and
+# demonstrate the dashboard mechanics. It carries no Kubernetes dependencies and
+# keeps all state in memory.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dashboard-example
+  namespace: {{ default "unbounded-dashboard" .Namespace }}
+  labels:
+    app.kubernetes.io/name: dashboard-example
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: dashboard-example
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: dashboard-example
+    spec:
+      containers:
+        - name: dashboard-example
+          image: {{ default "ghcr.io/azure/dashboard-example:latest" .ExampleImage | quote }}
+          imagePullPolicy: {{ default "IfNotPresent" .ImagePullPolicy }}
+          args:
+            - --addr=:8090
+            - --base-path=/dashboard/v1
+          ports:
+            - name: http
+              containerPort: 8090
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65534
+            capabilities:
+              drop:
+                - ALL
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dashboard-example
+  namespace: {{ default "unbounded-dashboard" .Namespace }}
+  labels:
+    app.kubernetes.io/name: dashboard-example
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: dashboard-example
+  ports:
+    - name: http
+      port: 8090
+      targetPort: http
+      protocol: TCP

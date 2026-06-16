@@ -1,0 +1,31 @@
+{{- /*
+Copyright (c) Microsoft Corporation.
+Licensed under the MIT License.
+*/ -}}
+{{define "title"}}Overview{{end}}
+{{define "content"}}
+<h1 class="h3 mb-4">Cluster Overview</h1>
+{{- if not .Data.Modules}}
+<div class="alert alert-secondary">No modules are registered.</div>
+{{- end}}
+<div class="row">
+  {{- range .Data.Modules}}
+  <div class="col-md-4 mb-4">
+    <div class="card h-100">
+      <div class="card-body">
+        <h5 class="card-title">
+          <a href="/modules/{{.ID}}">{{.Title}}</a>
+          {{template "badge" .Health}}
+        </h5>
+        <p class="card-text text-muted">{{.Description}}</p>
+        {{- if .Error}}
+        <p class="text-danger small mb-0">unreachable: {{.Error}}</p>
+        {{- else}}
+        <p class="card-text mb-0">{{.Message}}</p>
+        {{- end}}
+      </div>
+    </div>
+  </div>
+  {{- end}}
+</div>
+{{end}}

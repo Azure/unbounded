@@ -1,0 +1,4 @@
+# Rendered dashboard manifests are produced by `make dashboard-manifests` and
+# are not tracked. Keep this directory present for the rendered output.
+*
+!.gitignore

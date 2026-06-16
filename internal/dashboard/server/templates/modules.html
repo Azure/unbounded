@@ -1,0 +1,25 @@
+{{- /*
+Copyright (c) Microsoft Corporation.
+Licensed under the MIT License.
+*/ -}}
+{{define "title"}}Modules{{end}}
+{{define "content"}}
+<h1 class="h3 mb-4">Installed Modules</h1>
+<table class="table table-striped">
+  <thead>
+    <tr><th>ID</th><th>Title</th><th>Capabilities</th><th>Status</th></tr>
+  </thead>
+  <tbody>
+    {{- range .Data.Modules}}
+    <tr>
+      <td><a href="/modules/{{.ID}}">{{.ID}}</a></td>
+      <td>{{.Title}}</td>
+      <td>
+        {{- range .Capabilities}}<span class="badge text-bg-secondary me-1">{{.}}</span>{{end}}
+      </td>
+      <td>{{if .Error}}<span class="text-danger">unreachable</span>{{else}}{{template "badge" .Health}}{{end}}</td>
+    </tr>
+    {{- end}}
+  </tbody>
+</table>
+{{end}}
