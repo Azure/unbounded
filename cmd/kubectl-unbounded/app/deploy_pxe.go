@@ -30,13 +30,15 @@ import (
 var MetalmanImage = "metalman:latest"
 
 const (
-	deployPXENamespace = "unbounded-kube"
+	deployPXENamespace       = "unbounded-kube"
+	deployPXEDefaultReplicas = 1
 )
 
 // deployPXEParams holds the values needed to build the PXE Deployment.
 type deployPXEParams struct {
-	Site  string
-	Image string
+	Site     string
+	Image    string
+	Replicas int32
 }
 
 // buildPXEDeployment constructs the Deployment apply configuration for the
@@ -51,7 +53,7 @@ func buildPXEDeployment(p deployPXEParams) *acappsv1.DeploymentApplyConfiguratio
 	return acappsv1.Deployment(name, deployPXENamespace).
 		WithLabels(labels).
 		WithSpec(acappsv1.DeploymentSpec().
-			WithReplicas(1).
+			WithReplicas(p.Replicas).
 			WithStrategy(acappsv1.DeploymentStrategy().
 				WithType(appsv1.RollingUpdateDeploymentStrategyType).
 				WithRollingUpdate(acappsv1.RollingUpdateDeployment().
@@ -153,6 +155,7 @@ type deployPXEHandler struct {
 	kubeconfigPath string
 	site           string
 	image          string
+	replicas       int32
 }
 
 func (h *deployPXEHandler) execute(ctx context.Context) error {
@@ -168,8 +171,9 @@ func (h *deployPXEHandler) execute(ctx context.Context) error {
 	}
 
 	deploy := buildPXEDeployment(deployPXEParams{
-		Site:  h.site,
-		Image: h.image,
+		Site:     h.site,
+		Image:    h.image,
+		Replicas: h.replicas,
 	})
 
 	result, err := clientset.AppsV1().Deployments(deployPXENamespace).Apply(
@@ -203,6 +207,7 @@ unbounded-kube namespace.`,
 	cmd.Flags().StringVar(&handler.kubeconfigPath, "kubeconfig", "", "Path to kubeconfig file")
 	cmd.Flags().StringVar(&handler.site, "site", "", "Site name (required; scopes the PXE instance to machines labeled unbounded-cloud.io/site=<site>)")
 	cmd.Flags().StringVar(&handler.image, "image", MetalmanImage, "Container image for the PXE deployment")
+	cmd.Flags().Int32Var(&handler.replicas, "replicas", deployPXEDefaultReplicas, "Number of PXE Deployment replicas")
 
 	if err := cmd.MarkFlagRequired("site"); err != nil {
 		panic(err)
